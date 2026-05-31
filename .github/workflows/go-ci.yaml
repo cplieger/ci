@@ -1,9 +1,11 @@
 name: Go CI
 
-# Reusable Go-library CI. Call from a repo with:
+# Reusable Go CI. Call from a repo with:
 #   jobs: { ci: { uses: cplieger/ci/.github/workflows/go-ci.yaml@v1 } }
-# Library-tuned: omits deadcode/punused (they flag a library's exported API
-# as "unused") and Dockerfile/hadolint (libraries ship no image).
+# Library-tuned by default: omits deadcode/punused (they flag a library's
+# exported API as "unused") and Dockerfile/hadolint (libraries ship no image).
+# Set `app: true` to enable app-specific checks (deadcode, punused,
+# fieldalignment, dependency-review, and optionally hadolint).
 
 on:
   workflow_call:
@@ -12,15 +14,29 @@ on:
         description: Path to the go.mod that pins the Go version.
         type: string
         default: go.mod
+      app:
+        description: Enable app-mode checks (deadcode, punused, fieldalignment, dependency-review).
+        type: boolean
+        default: false
+      working-directory:
+        description: Working directory for Go commands (e.g. 'web' for monorepos).
+        type: string
+        default: '.'
+      dockerfile-lint:
+        description: Run hadolint Dockerfile validation.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-
 
 jobs:
   validate:
     runs-on: ubuntu-24.04
     timeout-minutes: 8
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -46,8 +62,16 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           go install github.com/rhysd/actionlint/cmd/actionlint@latest
 
+      - name: Install app tools
+        if: ${{ inputs.app }}
+        run: |
+          go install golang.org/x/tools/cmd/deadcode@latest
+          go install golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@latest
+          go install github.com/bep/punused@latest
+
       - name: Workflows (actionlint)
         continue-on-error: true
+        working-directory: .
         run: ( actionlint -color ) || { echo "actionlint" >> /tmp/_ci_failures; exit 1; }
 
       - name: Vet
@@ -70,12 +94,53 @@ jobs:
         continue-on-error: true
         run: ( go mod verify ) || { echo "go mod verify" >> /tmp/_ci_failures; exit 1; }
 
+      - name: Dead code (deadcode)
+        if: ${{ inputs.app }}
+        continue-on-error: true
+        run: |
+          (
+            deadcode -test ./...
+          ) || { echo "deadcode" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Field alignment
+        if: ${{ inputs.app }}
+        continue-on-error: true
+        run: |
+          (
+            fieldalignment ./...
+          ) || { echo "fieldalignment" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Unused exported symbols (punused)
+        if: ${{ inputs.app }}
+        continue-on-error: true
+        run: |
+          (
+            output=$(punused ./... 2>&1 | grep -v "file already closed" || true)
+            if [ -n "$output" ]; then echo "$output"; exit 1; fi
+          ) || { echo "punused" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Validate Dockerfile
+        if: ${{ inputs.dockerfile-lint }}
+        continue-on-error: true
+        run: |
+          (
+            docker run --rm -i hadolint/hadolint:2.12.0 \
+              hadolint --ignore DL3018 - < Dockerfile
+          ) || { echo "hadolint" >> /tmp/_ci_failures; exit 1; }
+
       - name: Scan for secrets
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
           GITLEAKS_ENABLE_SUMMARY: "false"
+
+      - name: Dependency review
+        if: ${{ inputs.app && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
 
       - name: Check results
         if: always()

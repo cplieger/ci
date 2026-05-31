@@ -16,7 +16,7 @@ runs:
       shell: bash
       run: |
         # renovate: datasource=github-releases depName=orhun/git-cliff
-        CLIFF_VERSION=v2.10.1
+        CLIFF_VERSION=v2.13.1
         curl -fsSL --retry 3 \
           "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
           | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"

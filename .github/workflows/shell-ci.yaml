@@ -1,0 +1,85 @@
+name: Shell CI
+
+# Reusable shell/Docker CI. Call from a repo with:
+#   jobs: { ci: { uses: cplieger/ci/.github/workflows/shell-ci.yaml@v1 } }
+
+on:
+  workflow_call:
+    inputs:
+      shellcheck-paths:
+        description: Paths to pass to shellcheck.
+        type: string
+        default: "./*.sh"
+      hadolint-ignores:
+        description: Comma-separated hadolint rules to ignore (each passed as --ignore).
+        type: string
+        default: "DL3018"
+      dockerfile:
+        description: Path to the Dockerfile to lint.
+        type: string
+        default: "./Dockerfile"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install actionlint
+        run: |
+          # renovate: datasource=github-releases depName=rhysd/actionlint
+          VERSION=v1.7.12
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/${VERSION}/actionlint_${VERSION#v}_linux_amd64.tar.gz" \
+            | tar -xzf - -C /tmp actionlint
+          sudo mv /tmp/actionlint /usr/local/bin/actionlint
+
+      - name: Lint workflows (actionlint)
+        continue-on-error: true
+        run: |
+          (
+            actionlint -color
+          ) || { echo "Lint workflows (actionlint)" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Lint shell scripts
+        continue-on-error: true
+        run: |
+          (
+            shellcheck -x -S info ${{ inputs.shellcheck-paths }}
+          ) || { echo "Lint shell scripts" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Validate Dockerfile
+        continue-on-error: true
+        run: |
+          (
+            IGNORE_FLAGS=""
+            IFS=',' read -ra RULES <<< "${{ inputs.hadolint-ignores }}"
+            for rule in "${RULES[@]}"; do
+              IGNORE_FLAGS="${IGNORE_FLAGS} --ignore ${rule}"
+            done
+            # shellcheck disable=SC2086
+            docker run --rm -i hadolint/hadolint:2.12.0 \
+              hadolint ${IGNORE_FLAGS} - < ${{ inputs.dockerfile }}
+          ) || { echo "Validate Dockerfile" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Scan for secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_ENABLE_SUMMARY: "false"
+
+      - name: Check results
+        if: always()
+        run: |
+          if [ -f /tmp/_ci_failures ]; then
+            echo "::error::Failed validation steps:"
+            sort -u /tmp/_ci_failures >&2
+            exit 1
+          fi
+          echo "All validation steps passed"
