@@ -42,7 +42,7 @@ jobs:
 
       - name: Compute version
         id: ver
-        uses: cplieger/ci/actions/git-cliff-version@8f09bcd5f8ac39bc5059f4c45d3fcb10a1a3b23a # v1
+        uses: cplieger/ci/actions/git-cliff-version@f024f691d9c2fcbaff3c74231a4cb25126630056 # v1
 
       - name: No release needed
         if: steps.ver.outputs.release != 'true'
