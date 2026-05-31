@@ -96,7 +96,7 @@ jobs:
 
       - name: Compute SemVer tag
         id: prep
-        uses: cplieger/ci/actions/git-cliff-version@v1
+        uses: cplieger/ci/actions/git-cliff-version@8f09bcd5f8ac39bc5059f4c45d3fcb10a1a3b23a # v1
 
       - name: Derive version tags
         id: ver
