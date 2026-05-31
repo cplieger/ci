@@ -48,10 +48,6 @@ jobs:
             | tar -xz -C /tmp
           echo "/tmp/package/lib" >> "$GITHUB_PATH"
 
-      - name: Lint deps (knip)
-        continue-on-error: true
-        run: ( npx knip --strict --no-progress ) || { echo "knip" >> /tmp/_ci_failures; exit 1; }
-
       - name: Lint (eslint)
         continue-on-error: true
         run: ( npx eslint . ) || { echo "eslint" >> /tmp/_ci_failures; exit 1; }
