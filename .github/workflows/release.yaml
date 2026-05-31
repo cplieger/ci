@@ -48,16 +48,16 @@ jobs:
         if: steps.ver.outputs.release != 'true'
         run: echo "No conventional-commit bump since the last tag; skipping release."
 
-      - name: Publish to npm + JSR
+      - name: Publish to npm + JSR (OIDC)
         if: steps.ver.outputs.release == 'true' && inputs.target == 'ts'
         working-directory: ${{ inputs.working-directory }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npm ci || npm install
-          npm version "${{ steps.ver.outputs.version }}" --no-git-tag-version
-          npm publish --provenance --access public
-          npx jsr publish
+          npm install -g npm@latest   # OIDC trusted publishing needs npm >= 11.5.1
+          ver="${{ steps.ver.outputs.version }}"; ver="${ver#v}"
+          npm pkg set version="$ver"
+          node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='$ver';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
+          npm publish --access public   # tokenless OIDC; provenance auto
+          npx jsr publish               # tokenless OIDC (repo linked); provenance auto
 
       - name: Tag + GitHub Release
         if: steps.ver.outputs.release == 'true'
