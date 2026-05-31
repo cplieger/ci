@@ -1,0 +1,33 @@
+# Canonical shared files → consumer repos (synced as PRs by sync.yaml).
+# TODO: confirm the repo list as library repos are created.
+
+group:
+  # Go libraries + tool: lint, changelog, editor configs.
+  - repos: |
+      cplieger/health
+      cplieger/metrics
+      cplieger/auth
+      cplieger/vterm
+      cplieger/wiregen
+    files:
+      - .golangci.yaml
+      - cliff.toml
+      - .editorconfig
+
+  # TypeScript libraries: lint/format bases (imported by each repo's own
+  # eslint.config.mjs), changelog, editor config.
+  - repos: |
+      cplieger/reactive
+      cplieger/actions
+      cplieger/vterm
+    files:
+      - source: configs/eslint.config.base.mjs
+        dest: eslint.config.base.mjs
+      - source: configs/prettier.json
+        dest: .prettierrc.json
+      - source: configs/stylelint.json
+        dest: .stylelintrc.json
+      - source: configs/htmlvalidate.json
+        dest: .htmlvalidate.json
+      - .editorconfig
+      - cliff.toml

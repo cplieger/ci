@@ -1,0 +1,89 @@
+name: TS CI
+
+# Reusable TypeScript-library CI for build-less ESM packages. Call with:
+#   jobs: { ci: { uses: cplieger/ci/.github/workflows/ts-ci.yaml@v1, with: { working-directory: "." } } }
+# Uses the runner's Node + tsgo (matches the apps' build-less pipeline).
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory holding package.json / tsconfig.
+        type: string
+        default: "."
+      web-lint:
+        description: Run stylelint + html-validate (libraries shipping CSS/HTML).
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: npm ci || npm install --no-save --loglevel=warn
+
+      - name: Install tsgo
+        run: |
+          # renovate: datasource=npm depName=@typescript/native-preview
+          TSGO_VERSION=7.0.0-dev.20260527.2
+          curl -fsSL \
+            "https://registry.npmjs.org/@typescript/native-preview-linux-x64/-/native-preview-linux-x64-${TSGO_VERSION}.tgz" \
+            | tar -xz -C /tmp
+          echo "/tmp/package/lib" >> "$GITHUB_PATH"
+
+      - name: Lint deps (knip)
+        continue-on-error: true
+        run: ( npx knip --strict --no-progress ) || { echo "knip" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Lint (eslint)
+        continue-on-error: true
+        run: ( npx eslint . ) || { echo "eslint" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Typecheck (tsgo)
+        continue-on-error: true
+        run: ( npm run typecheck && npm run typecheck:tests ) || { echo "typecheck" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Test (vitest)
+        continue-on-error: true
+        run: ( npm test ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Format (prettier)
+        continue-on-error: true
+        run: ( npx prettier --check . ) || { echo "prettier" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Lint web (CSS/HTML)
+        if: ${{ inputs.web-lint }}
+        continue-on-error: true
+        run: |
+          (
+            npx stylelint "**/*.css" --config .stylelintrc.json
+            find . -name "*.html" -not -path "./node_modules/*" -print0 \
+              | xargs -0 --no-run-if-empty npx html-validate
+          ) || { echo "web-lint" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Check results
+        if: always()
+        run: |
+          if [ -f /tmp/_ci_failures ]; then
+            echo "::error::Failed validation steps:"
+            sort -u /tmp/_ci_failures >&2
+            exit 1
+          fi
+          echo "All validation steps passed"

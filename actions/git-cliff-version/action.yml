@@ -1,0 +1,31 @@
+name: git-cliff version
+description: Install git-cliff and compute the next SemVer from conventional commits.
+
+outputs:
+  version:
+    description: Next version tag (e.g. v1.3.0).
+    value: ${{ steps.compute.outputs.version }}
+  release:
+    description: "true when commits since the last tag warrant a release."
+    value: ${{ steps.compute.outputs.release }}
+
+runs:
+  using: composite
+  steps:
+    - id: compute
+      shell: bash
+      run: |
+        # renovate: datasource=github-releases depName=orhun/git-cliff
+        CLIFF_VERSION=v2.10.1
+        curl -fsSL --retry 3 \
+          "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
+          | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+        NEXT="$(git cliff --bumped-version 2>/dev/null)"
+        LATEST="$(git describe --tags --abbrev=0 2>/dev/null || echo "")"
+        if [ -z "$NEXT" ] || [ "$NEXT" = "$LATEST" ]; then
+          echo "release=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "release=true" >> "$GITHUB_OUTPUT"
+        fi
+        echo "version=$NEXT" >> "$GITHUB_OUTPUT"
+        echo "Computed version: ${NEXT:-<none>} (latest tag: ${LATEST:-<none>})"

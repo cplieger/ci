@@ -1,0 +1,69 @@
+name: Release
+
+# Reusable release workflow. Triggered by the caller on push to main:
+#   jobs: { release: { uses: cplieger/ci/.github/workflows/release.yaml@v1, with: { target: go } } }
+# Go module  -> tag + GitHub Release (the tag is what `go get` resolves).
+# TS package -> publish to npm + JSR (co-equal) + tag + GitHub Release.
+# Version is computed from conventional commits by git-cliff; no bump -> no-op.
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "go | ts"
+        type: string
+        required: true
+      working-directory:
+        description: Package dir for the TS target.
+        type: string
+        default: "."
+    secrets:
+      NPM_TOKEN:
+        description: Optional. Omit when using npm OIDC trusted publishing.
+        required: false
+
+permissions:
+  contents: write # create the tag + GitHub Release
+  id-token: write # OIDC provenance for npm + JSR (tokenless)
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: ver
+        uses: cplieger/ci/actions/git-cliff-version@v1
+
+      - name: No release needed
+        if: steps.ver.outputs.release != 'true'
+        run: echo "No conventional-commit bump since the last tag; skipping release."
+
+      - name: Publish to npm + JSR
+        if: steps.ver.outputs.release == 'true' && inputs.target == 'ts'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm ci || npm install
+          npm version "${{ steps.ver.outputs.version }}" --no-git-tag-version
+          npm publish --provenance --access public
+          npx jsr publish
+
+      - name: Tag + GitHub Release
+        if: steps.ver.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git cliff --latest --strip header > NOTES.md
+          gh release create "${{ steps.ver.outputs.version }}" \
+            --title "${{ steps.ver.outputs.version }}" --notes-file NOTES.md

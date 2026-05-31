@@ -1,0 +1,39 @@
+name: Sync shared files
+
+# Propagates the canonical config files in this repo to consumer repos as PRs,
+# for tools that have no native remote-config support (golangci-lint, git-cliff,
+# editorconfig, eslint/prettier/stylelint bases). Renovate-extends handles
+# renovate.json natively, so it is not synced here.
+#
+# Requires a SYNC_PAT secret: a fine-grained PAT with Contents:write +
+# Pull-requests:write on the target repos.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".golangci.yaml"
+      - "cliff.toml"
+      - ".editorconfig"
+      - "configs/**"
+      - ".github/sync.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Sync files to consumer repos
+        uses: BetaHuhn/repo-file-sync-action@v1
+        with:
+          GH_PAT: ${{ secrets.SYNC_PAT }}
+          CONFIG_PATH: .github/sync.yml
+          COMMIT_PREFIX: "chore(sync):"
+          PR_LABELS: dependencies

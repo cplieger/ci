@@ -1,0 +1,86 @@
+# cplieger/ci
+
+Shared CI/CD for the `cplieger` repos: reusable GitHub Actions workflows, a
+composite versioning action, canonical lint/format configs, and a Renovate
+preset. One source of truth — consumer repos reference it instead of carrying
+duplicate copies.
+
+> Pin every reference to a tag (`@v1`). Tag this repo `v1` after the first
+> commit so consumers can resolve `@v1`.
+
+## Reusable workflows
+
+| Workflow | Purpose |
+|---|---|
+| `.github/workflows/go-ci.yaml` | Go-library checks: vet, golangci-lint, race tests, govulncheck, fieldalignment, gitleaks |
+| `.github/workflows/ts-ci.yaml` | Build-less TS checks: knip, eslint, tsgo typecheck, vitest, prettier (+ optional web-lint) |
+| `.github/workflows/release.yaml` | git-cliff version → (TS) npm + JSR publish → tag + GitHub Release |
+
+### Consume in a Go library
+
+```yaml
+# .github/workflows/ci.yaml
+name: CI
+on: { pull_request: { branches: [main] }, push: { branches: [main] } }
+jobs:
+  ci:
+    uses: cplieger/ci/.github/workflows/go-ci.yaml@v1
+```
+
+```yaml
+# .github/workflows/release.yaml
+name: Release
+on: { push: { branches: [main] }, workflow_dispatch: {} }
+jobs:
+  release:
+    uses: cplieger/ci/.github/workflows/release.yaml@v1
+    with: { target: go }
+```
+
+### Consume in a TypeScript library
+
+```yaml
+jobs:
+  ci:
+    uses: cplieger/ci/.github/workflows/ts-ci.yaml@v1
+    with: { working-directory: "." } # or web-lint: true for CSS/HTML
+  release:
+    uses: cplieger/ci/.github/workflows/release.yaml@v1
+    with: { target: ts }
+```
+
+Publishing uses **OIDC trusted publishing** for npm and JSR — no token needed
+once the package is linked to its repo on npmjs.com / jsr.io. (Optionally pass a
+`NPM_TOKEN` secret instead.) `release.yaml` requires `id-token: write`, which it
+declares itself.
+
+## Renovate preset
+
+Replace each repo's `renovate.json` with a one-liner — Renovate fetches the
+preset (`default.json`) natively:
+
+```json
+{ "extends": ["github>cplieger/ci"] }
+```
+
+## Canonical configs (synced)
+
+Tools without remote-config support get their config pushed here as PRs by
+`sync.yaml` (see `.github/sync.yml` for the repo↔file mapping):
+
+| File | Consumed by |
+|---|---|
+| `.golangci.yaml` | Go repos (golangci-lint) |
+| `cliff.toml` | all (git-cliff changelog/version) |
+| `.editorconfig` | all |
+| `configs/eslint.config.base.mjs` | TS repos — `import base from "./eslint.config.base.mjs"` |
+| `configs/prettier.json`, `configs/stylelint.json`, `configs/htmlvalidate.json` | TS repos |
+
+Syncing needs a `SYNC_PAT` repo secret (fine-grained PAT, Contents:write +
+Pull-requests:write on the targets).
+
+## Composite action
+
+`actions/git-cliff-version` installs git-cliff and outputs `version` + a
+`release` boolean from conventional commits. Used by `release.yaml`; callable
+directly if needed.
