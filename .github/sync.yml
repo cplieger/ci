@@ -9,6 +9,9 @@ group:
       cplieger/auth
       cplieger/vterm
       cplieger/wiregen
+      cplieger/ssrf
+      cplieger/httpx
+      cplieger/atomicfile
     files:
       - .golangci.yaml
       - cliff.toml
