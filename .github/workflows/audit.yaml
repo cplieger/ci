@@ -1,0 +1,26 @@
+name: Audit
+
+# Weekly cross-public-repo compliance audit. Uses the job token (sufficient for
+# public repos); set an AUDIT_PAT secret to also cover private repos later.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run cross-repo audit
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT || github.token }}
+        run: |
+          { echo '```'; python3 scripts/audit.py; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"

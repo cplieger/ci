@@ -84,3 +84,19 @@ Pull-requests:write on the targets).
 `actions/git-cliff-version` installs git-cliff and outputs `version` + a
 `release` boolean from conventional commits. Used by `release.yaml`; callable
 directly if needed.
+
+## Cross-repo audit
+
+`scripts/audit.py` lists every public `cplieger` repo and checks shared-standard
+compliance (license, default branch, CI wired to `cplieger/ci`, renovate preset;
+description + topics as warnings). Repos that have adopted the standard must pass
+the hard checks; legacy repos are reported for visibility only.
+
+```
+gh auth login        # once
+python3 scripts/audit.py
+```
+
+`.github/workflows/audit.yaml` runs it weekly (and on demand) and writes the
+table to the run summary. It uses the job token for public repos; add an
+`AUDIT_PAT` secret to extend coverage to private repos.
