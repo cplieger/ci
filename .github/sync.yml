@@ -17,6 +17,22 @@ group:
       - cliff.toml
       - .editorconfig
 
+  # Legacy Go repos: lint + editor config only (no cliff.toml — they use
+  # divergent stable-1.x cliff.toml).
+  - repos: |
+      cplieger/cert-converter
+      cplieger/plex-exporter
+      cplieger/plex-language-sync
+      cplieger/registry-stats
+      cplieger/docker-fclones-scheduler
+      cplieger/tautulli-remap
+      cplieger/subflux
+      cplieger/vibecli
+      cplieger/vibekit
+    files:
+      - .golangci.yaml
+      - .editorconfig
+
   # TypeScript libraries: lint/format bases (imported by each repo's own
   # eslint.config.mjs), changelog, editor config.
   - repos: |
