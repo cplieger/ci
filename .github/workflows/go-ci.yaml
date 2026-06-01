@@ -29,7 +29,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   validate:
@@ -132,12 +131,14 @@ jobs:
           ) || { echo "hadolint" >> /tmp/_ci_failures; exit 1; }
 
       - name: Scan for secrets
-        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
-          GITLEAKS_ENABLE_SUMMARY: "false"
-          GITLEAKS_ENABLE_COMMENTS: "false"
+        continue-on-error: true
+        run: |
+          (
+            # renovate: datasource=github-releases depName=gitleaks/gitleaks
+            VERSION=v8.24.3
+            curl -fsSL --retry 3 "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz" | tar -xzf - -C /tmp gitleaks
+            /tmp/gitleaks dir . --no-banner --redact --exit-code 1
+          ) || { echo "Scan for secrets" >> /tmp/_ci_failures; exit 1; }
 
       - name: Dependency review
         if: ${{ inputs.app && github.event_name == 'pull_request' }}
