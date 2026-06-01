@@ -124,8 +124,10 @@ jobs:
         continue-on-error: true
         run: |
           (
+            df="Dockerfile"
+            [ -f "$df" ] || df="${GITHUB_WORKSPACE}/Dockerfile"
             docker run --rm -i hadolint/hadolint:2.12.0 \
-              hadolint --ignore DL3018 - < Dockerfile
+              hadolint --ignore DL3018 - < "$df"
           ) || { echo "hadolint" >> /tmp/_ci_failures; exit 1; }
 
       - name: Scan for secrets
