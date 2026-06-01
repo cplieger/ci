@@ -17,14 +17,16 @@ group:
       - cliff.toml
       - .editorconfig
 
-  # Legacy Go repos: lint + editor config only (no cliff.toml — they use
-  # divergent stable-1.x cliff.toml).
+  # Go apps: lint + editor config only. Each keeps its own cliff.toml — the
+  # [bump] track differs (stable apps 1.x, alpha apps 0.x) so the shared
+  # cliff.toml is intentionally not synced here.
   - repos: |
       cplieger/cert-converter
       cplieger/plex-exporter
       cplieger/plex-language-sync
       cplieger/registry-stats
       cplieger/docker-fclones-scheduler
+      cplieger/docker-age
       cplieger/tautulli-remap
       cplieger/subflux
       cplieger/vibecli
@@ -50,3 +52,15 @@ group:
         dest: .htmlvalidate.json
       - .editorconfig
       - cliff.toml
+
+  # Docker image repos (shell-based builds): editor config only. Each keeps
+  # its own stable-1.x cliff.toml (the shared cliff.toml is the 0.x alpha one).
+  - repos: |
+      cplieger/docker-smtp-relay
+      cplieger/docker-nut-upsd
+      cplieger/docker-radvd
+      cplieger/docker-keepalived
+      cplieger/docker-caddy
+      cplieger/docker-static-web
+    files:
+      - .editorconfig
