@@ -50,7 +50,11 @@ jobs:
         continue-on-error: true
         run: |
           (
-            shellcheck -x -S info ${{ inputs.shellcheck-paths }}
+            if [ "${{ inputs.shellcheck-paths }}" = "/dev/null" ]; then
+              echo "shellcheck: skipped (no shell scripts)"
+            else
+              shellcheck -x -S info ${{ inputs.shellcheck-paths }}
+            fi
           ) || { echo "Lint shell scripts" >> /tmp/_ci_failures; exit 1; }
 
       - name: Validate Dockerfile
