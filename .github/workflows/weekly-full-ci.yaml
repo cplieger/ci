@@ -6,8 +6,9 @@ name: Weekly central CI
 # * Full validate + fuzz: dispatched for PRIVATE repos (public already runs the
 #   full CI on push/PR). CodeQL is public-only (runs on PR) so it is not dispatched.
 #
-# Requires WEEKLY_CI_PAT: a fine-grained PAT with Actions: read & write on the
-# repos (the job's GITHUB_TOKEN cannot dispatch workflows in other repositories).
+# Requires the CI_SCHEDULE secret on this repo: the fine-grained "CI-schedule"
+# PAT with Actions: read & write on all repos (the job's GITHUB_TOKEN cannot
+# dispatch workflows in other repositories).
 
 on:
   schedule:
@@ -22,12 +23,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      GH_TOKEN: ${{ secrets.WEEKLY_CI_PAT }}
+      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
     steps:
       - name: Guard token
         run: |
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::WEEKLY_CI_PAT not set — cannot dispatch cross-repo workflows."
+            echo "::error::CI_SCHEDULE secret not set — cannot dispatch cross-repo workflows."
             exit 1
           fi
 
