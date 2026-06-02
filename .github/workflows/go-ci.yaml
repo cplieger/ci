@@ -86,6 +86,25 @@ jobs:
         continue-on-error: true
         run: ( go test -count=1 -race ./... ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
+      - name: Fuzz (go test -fuzz)
+        # Light CI fuzzes public repos only (saves Actions minutes on private
+        # repos); the weekly scheduled run fuzzes every repo, including private.
+        if: ${{ github.event_name == 'schedule' || github.event.repository.private == false }}
+        continue-on-error: true
+        run: |
+          (
+            ft=25s; [ "${{ github.event_name }}" = "schedule" ] && ft=180s
+            rc=0
+            for pkg in $(go list ./...); do
+              for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep -E '^Fuzz' || true); do
+                echo "::group::fuzz ${fn} (${pkg}) ${ft}"
+                go test -run='^$' -fuzz="^${fn}$" -fuzztime="${ft}" "$pkg" || rc=1
+                echo "::endgroup::"
+              done
+            done
+            exit $rc
+          ) || { echo "fuzz" >> /tmp/_ci_failures; exit 1; }
+
       - name: Govulncheck
         continue-on-error: true
         run: ( govulncheck ./... ) || { echo "govulncheck" >> /tmp/_ci_failures; exit 1; }
