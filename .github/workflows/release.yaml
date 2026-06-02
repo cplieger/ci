@@ -130,7 +130,7 @@ jobs:
 
       - name: Compute SemVer tag
         id: prep
-        uses: cplieger/ci/actions/git-cliff-version@e69f2cbaa1ee46d48cbabf7d0858ae46720152ef # v1
+        uses: cplieger/ci/actions/git-cliff-version@98c2f685fa19abbbc43735b1108bfd53d30e65e0 # v1
 
       - name: No release needed
         if: steps.prep.outputs.release != 'true'
@@ -363,7 +363,7 @@ jobs:
 
       - name: Compute version
         id: ver
-        uses: cplieger/ci/actions/git-cliff-version@e69f2cbaa1ee46d48cbabf7d0858ae46720152ef # v1
+        uses: cplieger/ci/actions/git-cliff-version@98c2f685fa19abbbc43735b1108bfd53d30e65e0 # v1
 
       - name: No release needed
         if: steps.ver.outputs.release != 'true'
@@ -404,7 +404,7 @@ jobs:
 
       - name: Compute version
         id: ver
-        uses: cplieger/ci/actions/git-cliff-version@e69f2cbaa1ee46d48cbabf7d0858ae46720152ef # v1
+        uses: cplieger/ci/actions/git-cliff-version@98c2f685fa19abbbc43735b1108bfd53d30e65e0 # v1
 
       - name: No release needed
         if: steps.ver.outputs.release != 'true'
@@ -440,7 +440,7 @@ jobs:
 
       - name: Compute version
         id: ver
-        uses: cplieger/ci/actions/git-cliff-version@e69f2cbaa1ee46d48cbabf7d0858ae46720152ef # v1
+        uses: cplieger/ci/actions/git-cliff-version@98c2f685fa19abbbc43735b1108bfd53d30e65e0 # v1
 
       - name: Publish subpackage to npm + JSR
         if: steps.ver.outputs.release == 'true'
