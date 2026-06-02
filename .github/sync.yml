@@ -34,8 +34,8 @@ group:
       - source: .github/workflow-templates/codeql.yml
         dest: .github/workflows/codeql.yml
 
-  # Go apps: lint + editor config + codeql + ci + security (no release — apps
-  # build images via their own build.yaml).
+  # Go apps (no web frontend): lint + editor config + ci + codeql + security
+  # (no release — apps build images via their own build.yaml).
   - repos: |
       cplieger/cert-converter
       cplieger/plex-exporter
@@ -44,14 +44,26 @@ group:
       cplieger/docker-fclones-scheduler
       cplieger/docker-age
       cplieger/tautulli-remap
+    files:
+      - .golangci.yaml
+      - .editorconfig
+      - source: .github/workflow-templates/ci-go.yml
+        dest: .github/workflows/ci.yaml
+      - source: .github/workflow-templates/codeql.yml
+        dest: .github/workflows/codeql.yml
+      - source: .github/workflow-templates/security.yml
+        dest: .github/workflows/security.yml
+
+  # Go apps WITH a web frontend (static-src): they keep their own multi-job
+  # ci.yaml (go + web), so ci.yaml is NOT synced — only lint/editor + codeql +
+  # security.
+  - repos: |
       cplieger/subflux
       cplieger/vibecli
       cplieger/vibekit
     files:
       - .golangci.yaml
       - .editorconfig
-      - source: .github/workflow-templates/ci-go.yml
-        dest: .github/workflows/ci.yaml
       - source: .github/workflow-templates/codeql.yml
         dest: .github/workflows/codeql.yml
       - source: .github/workflow-templates/security.yml
