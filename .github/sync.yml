@@ -14,21 +14,23 @@ group:
       - .golangci.yaml
       - cliff.toml
       - .editorconfig
-      - source: .github/workflow-templates/codeql-go.yml
+      - source: .github/workflow-templates/codeql.yml
         dest: .github/workflows/codeql.yml
       - source: .github/workflow-templates/security-fs.yml
         dest: .github/workflows/security.yml
       - source: .github/workflow-templates/release-go.yml
         dest: .github/workflows/release.yaml
 
-  # vterm is cross-language (Go + TS); synced for Go lint/editor only, no
-  # workflow callers (handled manually).
+  # vterm is cross-language (Go + TS); synced for Go lint/editor only +
+  # universal CodeQL caller (auto-detect handles Go+TS).
   - repos: |
       cplieger/vterm
     files:
       - .golangci.yaml
       - cliff.toml
       - .editorconfig
+      - source: .github/workflow-templates/codeql.yml
+        dest: .github/workflows/codeql.yml
 
   # Go apps: lint + editor config + codeql + security-image (no release — apps
   # build images via their own build.yaml).
@@ -46,7 +48,7 @@ group:
     files:
       - .golangci.yaml
       - .editorconfig
-      - source: .github/workflow-templates/codeql-go.yml
+      - source: .github/workflow-templates/codeql.yml
         dest: .github/workflows/codeql.yml
       - source: .github/workflow-templates/security-image.yml
         dest: .github/workflows/security.yml
@@ -67,7 +69,7 @@ group:
         dest: .htmlvalidate.json
       - .editorconfig
       - cliff.toml
-      - source: .github/workflow-templates/codeql-ts.yml
+      - source: .github/workflow-templates/codeql.yml
         dest: .github/workflows/codeql.yml
       - source: .github/workflow-templates/security-fs.yml
         dest: .github/workflows/security.yml
