@@ -58,10 +58,11 @@ jobs:
         run: ( npm test ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
       - name: Fuzz (fast-check)
-        # Public repos fuzz in the normal validate flow; private repos skip it on
-        # push/PR (light CI) and run it in the weekly scheduled full CI. fast-check
-        # property tests run in the test step above; *.fuzz.test.ts are deep targets.
-        if: ${{ github.event.repository.private == false || github.event_name == 'schedule' }}
+        # Public repos fuzz on push/PR (full CI). Private repos skip it on push/PR
+        # (light CI) and run it via the central weekly dispatch (workflow_dispatch)
+        # or any schedule. fast-check property tests run in the test step above;
+        # *.fuzz.test.ts are the deep targets.
+        if: ${{ github.event.repository.private == false || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         continue-on-error: true
         run: |
           (

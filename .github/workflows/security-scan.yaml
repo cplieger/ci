@@ -22,6 +22,10 @@ on:
 
 jobs:
   trivy:
+    # Private repos: skipped on push/PR (light CI); run only via the central
+    # weekly dispatch / schedule, as a Trivy gate (SARIF upload is public-only —
+    # see below — because code scanning needs Advanced Security). Public: always.
+    if: ${{ github.event.repository.private == false || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -70,14 +74,15 @@ jobs:
           output: 'trivy-image.sarif'
 
       - name: Upload SARIF — filesystem
-        if: always() && (inputs.scan-type == 'fs' || inputs.scan-type == 'both') && hashFiles('trivy-fs.sarif') != ''
+        # SARIF upload to code scanning needs Advanced Security → public repos only.
+        if: always() && github.event.repository.private == false && (inputs.scan-type == 'fs' || inputs.scan-type == 'both') && hashFiles('trivy-fs.sarif') != ''
         uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
         with:
           sarif_file: 'trivy-fs.sarif'
           category: 'trivy-fs'
 
       - name: Upload SARIF — image
-        if: always() && (inputs.scan-type == 'image' || inputs.scan-type == 'both') && hashFiles('trivy-image.sarif') != ''
+        if: always() && github.event.repository.private == false && (inputs.scan-type == 'image' || inputs.scan-type == 'both') && hashFiles('trivy-image.sarif') != ''
         uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
         with:
           sarif_file: 'trivy-image.sarif'
