@@ -15,10 +15,6 @@ on:
         description: 'Trivy severity levels'
         type: string
         default: 'HIGH,CRITICAL'
-      scan-type:
-        description: 'Scan type: fs, image, or both'
-        type: string
-        default: 'both'
 
 jobs:
   trivy:
@@ -31,12 +27,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Resolve profile
+        id: profile
+        run: |
+          set -euo pipefail
+          if [ -f Dockerfile ]; then echo 'image=true' >> "$GITHUB_OUTPUT"; else echo 'image=false' >> "$GITHUB_OUTPUT"; fi
+
       - name: Set up Docker Buildx
-        if: inputs.scan-type == 'image' || inputs.scan-type == 'both'
+        if: ${{ steps.profile.outputs.image == 'true' }}
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Build image (no push)
-        if: inputs.scan-type == 'image' || inputs.scan-type == 'both'
+        if: ${{ steps.profile.outputs.image == 'true' }}
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: ${{ inputs.build-context }}
@@ -48,7 +50,6 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Trivy filesystem scan
-        if: inputs.scan-type == 'fs' || inputs.scan-type == 'both'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
@@ -59,7 +60,7 @@ jobs:
           output: 'trivy-fs.sarif'
 
       - name: Trivy image scan
-        if: inputs.scan-type == 'image' || inputs.scan-type == 'both'
+        if: ${{ steps.profile.outputs.image == 'true' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: 'ci-scan:latest'
@@ -70,14 +71,14 @@ jobs:
           output: 'trivy-image.sarif'
 
       - name: Upload SARIF — filesystem
-        if: always() && (inputs.scan-type == 'fs' || inputs.scan-type == 'both') && hashFiles('trivy-fs.sarif') != ''
+        if: ${{ always() && hashFiles('trivy-fs.sarif') != '' && github.event.repository.private == false }}
         uses: github/codeql-action/upload-sarif@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
         with:
           sarif_file: 'trivy-fs.sarif'
           category: 'trivy-fs'
 
       - name: Upload SARIF — image
-        if: always() && (inputs.scan-type == 'image' || inputs.scan-type == 'both') && hashFiles('trivy-image.sarif') != ''
+        if: ${{ always() && steps.profile.outputs.image == 'true' && hashFiles('trivy-image.sarif') != '' && github.event.repository.private == false }}
         uses: github/codeql-action/upload-sarif@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
         with:
           sarif_file: 'trivy-image.sarif'
