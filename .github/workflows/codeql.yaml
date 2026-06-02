@@ -1,41 +1,60 @@
 name: CodeQL
 
-# Reusable CodeQL analysis. Uses build-mode: none (source extraction) so it
-# works regardless of where go.mod lives (root or a subdir like web/) and
-# without needing the project to build (avoids go:embed/build prerequisites).
-
 on:
   workflow_call:
     inputs:
-      languages:
-        type: string
-        default: 'go'
-        description: 'Languages to analyze'
       queries:
         type: string
         default: 'security-extended,security-and-quality'
         description: 'CodeQL query suites'
+      languages:
+        type: string
+        default: ''
+        description: 'Optional comma-separated override; empty = auto-detect'
 
 jobs:
+  detect:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      languages: ${{ steps.langs.outputs.languages }}
+    steps:
+      - name: Detect languages
+        id: langs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPLICIT: ${{ inputs.languages }}
+        run: |
+          set -euo pipefail
+          if [ -n "${EXPLICIT}" ]; then langs=$(printf '%s' "${EXPLICIT}" | jq -R 'split(",")|map(gsub("^ +| +$";""))|unique'); else langs=$(gh api "repos/${GITHUB_REPOSITORY}/languages" --jq '[ keys[] | {Go:"go",JavaScript:"javascript-typescript",TypeScript:"javascript-typescript",Python:"python",Ruby:"ruby"}[.] // empty ] | unique'); fi
+          echo "languages=${langs}" >> "$GITHUB_OUTPUT"; echo "detected: ${langs}"
+
   analyze:
+    needs: detect
+    if: needs.detect.outputs.languages != '' && needs.detect.outputs.languages != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       security-events: write
       contents: read
       actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(needs.detect.outputs.languages) }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        uses: github/codeql-action/init@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
         with:
-          languages: ${{ inputs.languages }}
+          languages: ${{ matrix.language }}
           build-mode: none
           queries: ${{ inputs.queries }}
 
       - name: Analyze
-        uses: github/codeql-action/analyze@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        uses: github/codeql-action/analyze@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
         with:
-          category: "/language:${{ inputs.languages }}"
+          category: "/language:${{ matrix.language }}"
