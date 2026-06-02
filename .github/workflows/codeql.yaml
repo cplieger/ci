@@ -18,6 +18,8 @@ on:
 
 jobs:
   analyze:
+    # CodeQL/code-scanning needs Advanced Security on private repos; skip there so this caller is universally deployable.
+    if: ${{ github.event.repository.private == false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

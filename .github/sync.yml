@@ -1,13 +1,11 @@
 # Canonical shared files → consumer repos (synced as PRs by sync.yaml).
-# TODO: confirm the repo list as library repos are created.
 
 group:
-  # Go libraries + tool: lint, changelog, editor configs.
+  # Go libraries: lint, changelog, editor configs + workflow callers.
   - repos: |
       cplieger/health
       cplieger/metrics
       cplieger/auth
-      cplieger/vterm
       cplieger/wiregen
       cplieger/ssrf
       cplieger/httpx
@@ -16,10 +14,24 @@ group:
       - .golangci.yaml
       - cliff.toml
       - .editorconfig
+      - source: .github/workflow-templates/codeql-go.yml
+        dest: .github/workflows/codeql.yml
+      - source: .github/workflow-templates/security-fs.yml
+        dest: .github/workflows/security.yml
+      - source: .github/workflow-templates/release-go.yml
+        dest: .github/workflows/release.yaml
 
-  # Go apps: lint + editor config only. Each keeps its own cliff.toml — the
-  # [bump] track differs (stable apps 1.x, alpha apps 0.x) so the shared
-  # cliff.toml is intentionally not synced here.
+  # vterm is cross-language (Go + TS); synced for Go lint/editor only, no
+  # workflow callers (handled manually).
+  - repos: |
+      cplieger/vterm
+    files:
+      - .golangci.yaml
+      - cliff.toml
+      - .editorconfig
+
+  # Go apps: lint + editor config + codeql + security-image (no release — apps
+  # build images via their own build.yaml).
   - repos: |
       cplieger/cert-converter
       cplieger/plex-exporter
@@ -34,12 +46,36 @@ group:
     files:
       - .golangci.yaml
       - .editorconfig
+      - source: .github/workflow-templates/codeql-go.yml
+        dest: .github/workflows/codeql.yml
+      - source: .github/workflow-templates/security-image.yml
+        dest: .github/workflows/security.yml
 
-  # TypeScript libraries: lint/format bases (imported by each repo's own
-  # eslint.config.mjs), changelog, editor config.
+  # TypeScript libraries: lint/format bases, changelog, editor config +
+  # workflow callers (excludes vterm — cross-language).
   - repos: |
       cplieger/reactive
       cplieger/actions
+    files:
+      - source: configs/eslint.config.base.mjs
+        dest: eslint.config.base.mjs
+      - source: configs/prettier.json
+        dest: .prettierrc.json
+      - source: configs/stylelint.json
+        dest: .stylelintrc.json
+      - source: configs/htmlvalidate.json
+        dest: .htmlvalidate.json
+      - .editorconfig
+      - cliff.toml
+      - source: .github/workflow-templates/codeql-ts.yml
+        dest: .github/workflows/codeql.yml
+      - source: .github/workflow-templates/security-fs.yml
+        dest: .github/workflows/security.yml
+      - source: .github/workflow-templates/release-ts.yml
+        dest: .github/workflows/release.yaml
+
+  # vterm TS configs only (cross-language; no workflow callers synced).
+  - repos: |
       cplieger/vterm
     files:
       - source: configs/eslint.config.base.mjs
@@ -53,8 +89,7 @@ group:
       - .editorconfig
       - cliff.toml
 
-  # Docker image repos (shell-based builds): editor config only. Each keeps
-  # its own stable-1.x cliff.toml (the shared cliff.toml is the 0.x alpha one).
+  # Docker image repos (shell-based builds): editor config + security-image.
   - repos: |
       cplieger/docker-smtp-relay
       cplieger/docker-nut-upsd
@@ -64,3 +99,5 @@ group:
       cplieger/docker-static-web
     files:
       - .editorconfig
+      - source: .github/workflow-templates/security-image.yml
+        dest: .github/workflows/security.yml
