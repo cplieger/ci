@@ -68,9 +68,9 @@ jobs:
           FUZZ_RUNS: ${{ github.event_name == 'schedule' && '10000' || '1000' }}
         run: |
           (
-            files=$(git ls-files '*.fuzz.test.ts' '*.fuzz.test.js')
-            if [ -n "$files" ]; then
-              npx vitest run $files
+            mapfile -t files < <(git ls-files '*.fuzz.test.ts' '*.fuzz.test.js')
+            if [ "${#files[@]}" -gt 0 ]; then
+              npx vitest run "${files[@]}"
             else
               echo "No *.fuzz.test.ts targets; fast-check property tests already ran in the test step."
             fi
