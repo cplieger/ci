@@ -18,5 +18,3 @@ permissions:
 jobs:
   scan:
     uses: cplieger/ci/.github/workflows/security-scan.yaml@v1
-    with:
-      scan-type: "fs"
