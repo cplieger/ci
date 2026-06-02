@@ -51,7 +51,7 @@ jobs:
         uses: github/codeql-action/init@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
         with:
           languages: ${{ matrix.language }}
-          build-mode: none
+          build-mode: ${{ matrix.language == 'go' && 'autobuild' || 'none' }}
           queries: ${{ inputs.queries }}
 
       - name: Analyze
