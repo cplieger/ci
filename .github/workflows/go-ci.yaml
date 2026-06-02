@@ -84,6 +84,25 @@ jobs:
         continue-on-error: true
         run: ( go test -count=1 -race ./... ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
+      - name: Fuzz (go test -fuzz)
+        # Public repos fuzz on push/PR (full CI). Private repos skip it on push/PR
+        # (light CI) and run it via the central weekly dispatch (workflow_dispatch)
+        # or any schedule. Targets auto-detected — a no-op when nothing to fuzz.
+        if: ${{ github.event.repository.private == false || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        continue-on-error: true
+        run: |
+          (
+            rc=0
+            for pkg in $(go list ./...); do
+              for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep -E '^Fuzz' || true); do
+                echo "::group::fuzz ${fn} (${pkg})"
+                go test -run='^$' -fuzz="^${fn}$" -fuzztime=20s "$pkg" || rc=1
+                echo "::endgroup::"
+              done
+            done
+            exit $rc
+          ) || { echo "fuzz" >> /tmp/_ci_failures; exit 1; }
+
       - name: Govulncheck
         continue-on-error: true
         run: ( govulncheck ./... ) || { echo "govulncheck" >> /tmp/_ci_failures; exit 1; }
