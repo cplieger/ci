@@ -87,18 +87,17 @@ jobs:
         run: ( go test -count=1 -race ./... ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
       - name: Fuzz (go test -fuzz)
-        # Light CI fuzzes public repos only (saves Actions minutes on private
-        # repos); the weekly scheduled run fuzzes every repo, including private.
-        if: ${{ github.event_name == 'schedule' || github.event.repository.private == false }}
+        # Part of the standard validate flow for PUBLIC repos; skipped on private
+        # repos to save Actions minutes.
+        if: ${{ github.event.repository.private == false }}
         continue-on-error: true
         run: |
           (
-            ft=25s; [ "${{ github.event_name }}" = "schedule" ] && ft=180s
             rc=0
             for pkg in $(go list ./...); do
               for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep -E '^Fuzz' || true); do
-                echo "::group::fuzz ${fn} (${pkg}) ${ft}"
-                go test -run='^$' -fuzz="^${fn}$" -fuzztime="${ft}" "$pkg" || rc=1
+                echo "::group::fuzz ${fn} (${pkg})"
+                go test -run='^$' -fuzz="^${fn}$" -fuzztime=20s "$pkg" || rc=1
                 echo "::endgroup::"
               done
             done

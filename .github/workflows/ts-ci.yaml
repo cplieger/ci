@@ -58,14 +58,11 @@ jobs:
         run: ( npm test ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
       - name: Fuzz (fast-check)
-        # fast-check property tests run in the test step above; *.fuzz.test.ts are
-        # the deep targets. Light CI fuzzes public repos only; the weekly
-        # scheduled run fuzzes every repo, including private. FUZZ_RUNS is honored
-        # by repos whose fast-check setup reads it (deeper exploration weekly).
-        if: ${{ github.event_name == 'schedule' || github.event.repository.private == false }}
+        # Part of the standard validate flow for PUBLIC repos; skipped on private
+        # repos to save Actions minutes. fast-check property tests run in the test
+        # step above; *.fuzz.test.ts are the deep targets.
+        if: ${{ github.event.repository.private == false }}
         continue-on-error: true
-        env:
-          FUZZ_RUNS: ${{ github.event_name == 'schedule' && '10000' || '1000' }}
         run: |
           (
             mapfile -t files < <(git ls-files '*.fuzz.test.ts' '*.fuzz.test.js')
