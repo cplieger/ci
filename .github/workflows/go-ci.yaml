@@ -87,9 +87,9 @@ jobs:
         run: ( go test -count=1 -race ./... ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
       - name: Fuzz (go test -fuzz)
-        # Part of the standard validate flow for PUBLIC repos; skipped on private
-        # repos to save Actions minutes.
-        if: ${{ github.event.repository.private == false }}
+        # Public repos fuzz in the normal validate flow; private repos skip it on
+        # push/PR (light CI) and run it in the weekly scheduled full CI.
+        if: ${{ github.event.repository.private == false || github.event_name == 'schedule' }}
         continue-on-error: true
         run: |
           (
