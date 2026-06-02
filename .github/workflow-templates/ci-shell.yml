@@ -11,4 +11,4 @@ on:
 
 jobs:
   ci:
-    uses: cplieger/ci/.github/workflows/shell-ci.yaml@v1
+    uses: cplieger/ci/.github/workflows/shell-ci.yaml@e69f2cbaa1ee46d48cbabf7d0858ae46720152ef # v1

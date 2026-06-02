@@ -9,6 +9,6 @@ permissions:
 
 jobs:
   release:
-    uses: cplieger/ci/.github/workflows/release.yaml@v1
+    uses: cplieger/ci/.github/workflows/release.yaml@e69f2cbaa1ee46d48cbabf7d0858ae46720152ef # v1
     with:
       target: go
