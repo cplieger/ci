@@ -58,6 +58,7 @@ jobs:
           fi
           body=$(jq -nc --arg r "${REASON}" '{ref:"refs/heads/main",reason:$r}')
           sig="sha256=$(printf '%s' "${body}" | openssl dgst -sha256 -hmac "${SECRET}" | sed 's/^.*= *//')"
+          echo "debug-sig: ${sig}"
           for n in 1 2 3; do
             code=$(curl -fsS -o /tmp/body -w '%{http_code}' \
               -X POST \
