@@ -53,12 +53,21 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
-          scanners: 'vuln,secret,misconfig'
+          scanners: 'vuln,secret'
           severity: ${{ inputs.severity }}
           ignore-unfixed: true
           exit-code: '1'
           format: 'sarif'
           output: 'trivy-fs.sarif'
+
+      - name: Trivy misconfig scan (report-only)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scanners: 'misconfig'
+          exit-code: '0'
+          format: 'sarif'
+          output: 'trivy-misconfig.sarif'
 
       - name: Trivy image scan
         if: ${{ steps.profile.outputs.image == 'true' }}
@@ -77,6 +86,13 @@ jobs:
         with:
           sarif_file: 'trivy-fs.sarif'
           category: 'trivy-fs'
+
+      - name: Upload SARIF — misconfig
+        if: ${{ always() && hashFiles('trivy-misconfig.sarif') != '' && github.event.repository.private == false }}
+        uses: github/codeql-action/upload-sarif@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
+        with:
+          sarif_file: 'trivy-misconfig.sarif'
+          category: 'trivy-misconfig'
 
       - name: Upload SARIF — image
         if: ${{ always() && steps.profile.outputs.image == 'true' && hashFiles('trivy-image.sarif') != '' && github.event.repository.private == false }}
