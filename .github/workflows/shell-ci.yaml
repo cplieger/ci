@@ -53,7 +53,16 @@ jobs:
             if [ "${{ inputs.shellcheck-paths }}" = "/dev/null" ]; then
               echo "shellcheck: skipped (no shell scripts)"
             else
-              shellcheck -x -S info ${{ inputs.shellcheck-paths }}
+              # Expand the glob safely; if it matches no real files, skip
+              # (avoids 'openBinaryFile: does not exist' on the literal pattern).
+              shopt -s nullglob
+              files=( ${{ inputs.shellcheck-paths }} )
+              shopt -u nullglob
+              if [ ${#files[@]} -eq 0 ]; then
+                echo "shellcheck: no files matched ${{ inputs.shellcheck-paths }} — skipping"
+              else
+                shellcheck -x -S info "${files[@]}"
+              fi
             fi
           ) || { echo "Lint shell scripts" >> /tmp/_ci_failures; exit 1; }
 
