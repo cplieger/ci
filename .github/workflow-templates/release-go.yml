@@ -1,14 +1,20 @@
 name: Release
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: write
   id-token: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release:
     uses: cplieger/ci/.github/workflows/release.yaml@2c6289a7dee062be6411c1cd0d3ab4f784d75f1e # v1
-    with:
-      target: go
+    secrets: inherit
