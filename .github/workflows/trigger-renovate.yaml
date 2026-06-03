@@ -60,7 +60,7 @@ jobs:
           sig="sha256=$(printf '%s' "${body}" | openssl dgst -sha256 -hmac "${SECRET}" | sed 's/^.*= *//')"
           echo "debug-sig: ${sig}"
           for n in 1 2 3; do
-            code=$(curl -sS -o /tmp/body -w '%{http_code}' \
+            code=$(curl -fsS -o /tmp/body -w '%{http_code}' \
               -X POST \
               -H "X-Hub-Signature-256: ${sig}" \
               -H 'X-GitHub-Event: push' \
@@ -74,6 +74,5 @@ jobs:
             sleep $((n * 5))
           done
           echo "::error::Komodo webhook failed after 3 attempts (last http=${code:-unknown})"
-          cat /tmp/body 2>/dev/null; echo
           cat /tmp/body 2>/dev/null || true
           exit 1
