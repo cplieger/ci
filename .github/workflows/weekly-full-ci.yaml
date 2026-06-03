@@ -43,7 +43,7 @@ jobs:
           | while read -r repo; do
               if gh workflow view security.yml -R "cplieger/${repo}" >/dev/null 2>&1; then
                 echo "→ security: ${repo}"
-                gh workflow run security.yml -R "cplieger/${repo}" \
+                gh workflow run security.yml -R "cplieger/${repo}" --ref main \
                   || echo "::warning::security dispatch failed for ${repo}"
               fi
             done
@@ -56,7 +56,7 @@ jobs:
           | while read -r repo; do
               if gh workflow view ci.yaml -R "cplieger/${repo}" >/dev/null 2>&1; then
                 echo "→ full ci: ${repo}"
-                gh workflow run ci.yaml -R "cplieger/${repo}" \
+                gh workflow run ci.yaml -R "cplieger/${repo}" --ref main \
                   || echo "::warning::ci dispatch failed for ${repo}"
               fi
             done
