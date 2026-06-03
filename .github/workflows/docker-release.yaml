@@ -278,23 +278,4 @@ jobs:
           repository: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}
           readme-filepath: README.md
 
-      - name: Trigger Renovate
-        # Fire-and-forget signal to cplieger/ci/trigger-renovate.yaml, which
-        # POSTs to Komodo's "Trigger Renovate" webhook. Komodo starts the
-        # one-shot borgcube-renovate stack, which scans cplieger/* and opens
-        # digest-bump PRs (replacing the previous homelab repository_dispatch
-        # → update-image.yaml flow that fought branch protection on main).
-        # The Komodo secret stays in cplieger/ci; consumers only need a small
-        # cross-repo dispatch PAT (CI_SCHEDULE) with Actions:write on
-        # cplieger/ci. The legacy `notify-repo` input is now ignored — kept
-        # for backward compatibility with the docker repos' build.yaml callers.
-        if: ${{ github.ref == 'refs/heads/main' }}
-        env:
-          GH_TOKEN: ${{ secrets.HOMELAB_DISPATCH_TOKEN }}
-        run: |
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::warning::HOMELAB_DISPATCH_TOKEN not set — skipping Renovate trigger."
-            exit 0
-          fi
-          gh workflow run trigger-renovate.yaml -R cplieger/ci \
-            -f reason="${{ github.repository }}@${{ steps.ver.outputs.version }}"
+
