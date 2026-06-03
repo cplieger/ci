@@ -83,25 +83,12 @@ jobs:
         continue-on-error: true
         run: |
           (
-            # Make stylelint cross-file aware: add importFrom for every CSS file
-            # so rules like no-unknown-custom-properties and no-unknown-animations
-            # can see :root vars and @keyframes defined in sibling files (the
-            # browser merges them at runtime; stylelint otherwise treats each
-            # file in isolation).
-            # Use absolute paths in importFrom because stylelint resolves relative
-            # paths against the config file's location (/tmp/...) rather than the
-            # working directory.
-            mapfile -t css_files < <(find "$PWD" -name "*.css" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" | sort)
-            if [ ${#css_files[@]} -gt 0 ]; then
-              import_json=$(printf '%s\0' "${css_files[@]}" | jq -Rs 'split("\u0000") | map(select(length > 0))')
-              jq --argjson imp "$import_json" '. + {
-                rules: ((.rules // {}) + {
-                  "no-unknown-custom-properties": [true, {"importFrom": $imp}],
-                  "no-unknown-animations": [true, {"importFrom": $imp}]
-                })
-              }' .stylelintrc.json > /tmp/stylelintrc.combined.json
-              npx stylelint "**/*.css" --config /tmp/stylelintrc.combined.json
-            fi
+            # Note: no-unknown-custom-properties and no-unknown-animations are
+            # disabled in the centralized stylelintrc because they require
+            # cross-file awareness that stylelint doesn't reliably support
+            # (no-unknown-custom-properties is deprecated upstream and even
+            # importFrom doesn't fully work for multi-file CSS projects).
+            npx stylelint "**/*.css" --config .stylelintrc.json
             find . -name "*.html" -not -path "./node_modules/*" -print0 \
               | xargs -0 --no-run-if-empty npx html-validate
           ) || { echo "web-lint" >> /tmp/_ci_failures; exit 1; }
