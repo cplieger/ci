@@ -5,11 +5,11 @@ name: Central CI scheduler
 #   commit-based, and security.yml has no push trigger — the schedule is the only
 #   freshness lever for main). Public -> Trivy + SARIF code-scanning alerts;
 #   private -> Trivy gate only (SARIF auto-skipped, see security-scan.yaml).
-# * Full validate + fuzz: dispatched for ALL repos WEEKLY. Random fuzzing is
-#   non-deterministic, so it no longer runs on push/PR (which runs only the
-#   deterministic seed corpus via the Test step); the weekly dispatch is where
-#   random fuzz exploration happens. CodeQL is public-only (runs on PR) so it is
-#   not dispatched.
+# * Full validate + fuzz: dispatched for ALL repos WEEKLY for deeper fuzz
+#   exploration. Public repos also fuzz on push/PR (shift-left); private repos
+#   are light on push/PR and rely on this weekly run. Fuzzing is non-deterministic
+#   by design — finds get committed to testdata/fuzz/ as deterministic seeds.
+#   CodeQL is public-only (runs on PR) so it is not dispatched.
 #
 # Requires the CI_SCHEDULE secret on this repo: the fine-grained "CI-schedule"
 # PAT with Actions: read & write on all repos (the job's GITHUB_TOKEN cannot

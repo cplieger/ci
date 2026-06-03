@@ -58,11 +58,11 @@ jobs:
         run: ( npm test ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
       - name: Fuzz (fast-check)
-        # Random fuzzing is non-deterministic, so it must NOT gate push/PR. The
-        # fast-check property tests in the Test step already run every push/PR
-        # (deterministic). Deep *.fuzz.test.ts exploration runs only on the
-        # schedule / central weekly dispatch.
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        # Fuzzing is intentionally non-deterministic: a push/PR failing because
+        # the fuzzer found a new input is a real bug caught early. Public repos
+        # fuzz on push/PR (shift-left); the central weekly dispatch fuzzes every
+        # repo for deeper exploration. *.fuzz.test.ts are the deep targets.
+        if: ${{ github.event.repository.private == false || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         continue-on-error: true
         run: |
           (
