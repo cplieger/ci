@@ -459,7 +459,22 @@ jobs:
 
       - name: Compute version
         id: ver
-        uses: cplieger/ci/actions/git-cliff-version@2c6289a7dee062be6411c1cd0d3ab4f784d75f1e # v1
+        run: |
+          # Subpackage piggybacks on the version computed by the parent job
+          # (docker/ts/go) which already created a git tag in this workflow run.
+          # Re-running git-cliff here would say 'no bump needed' since the tag
+          # was just created, and the subpackage would never publish on the
+          # same run as the parent. Use the just-created tag instead.
+          git fetch --tags --force origin 2>/dev/null || true
+          LATEST="$(git tag --points-at HEAD --sort=-v:refname | head -1)"
+          if [ -n "$LATEST" ]; then
+            echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "Subpackage will publish at $LATEST (from parent job's tag)."
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "No tag at HEAD — parent did not release; skipping subpackage."
+          fi
 
       - name: Publish subpackage to npm + JSR
         if: steps.ver.outputs.release == 'true'
