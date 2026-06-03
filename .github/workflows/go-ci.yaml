@@ -85,10 +85,13 @@ jobs:
         run: ( go test -count=1 -race ./... ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
       - name: Fuzz (go test -fuzz)
-        # Public repos fuzz on push/PR (full CI). Private repos skip it on push/PR
-        # (light CI) and run it via the central weekly dispatch (workflow_dispatch)
-        # or any schedule. Targets auto-detected — a no-op when nothing to fuzz.
-        if: ${{ github.event.repository.private == false || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        # Random fuzzing is non-deterministic, so it must NOT gate push/PR — it
+        # would flake whenever it discovers a new failing input. The seed corpus
+        # (the deterministic regression guard) already runs in the Test step on
+        # every push/PR. Random exploration runs only on the schedule / central
+        # weekly dispatch; new finds are added to the seed corpus, which then
+        # gates deterministically. Targets auto-detected — a no-op when none.
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         continue-on-error: true
         run: |
           (
