@@ -83,7 +83,22 @@ jobs:
         continue-on-error: true
         run: |
           (
-            npx stylelint "**/*.css" --config .stylelintrc.json
+            # Make stylelint cross-file aware: add importFrom for every CSS file
+            # so rules like no-unknown-custom-properties and no-unknown-animations
+            # can see :root vars and @keyframes defined in sibling files (the
+            # browser merges them at runtime; stylelint otherwise treats each
+            # file in isolation).
+            mapfile -t css_files < <(find . -name "*.css" -not -path "./node_modules/*" -not -path "./.git/*" -not -path "./dist/*" | sort)
+            if [ ${#css_files[@]} -gt 0 ]; then
+              import_json=$(printf '%s\0' "${css_files[@]}" | jq -Rs 'split("\u0000") | map(select(length > 0))')
+              jq --argjson imp "$import_json" '. + {
+                rules: ((.rules // {}) + {
+                  "no-unknown-custom-properties": [true, {"importFrom": $imp}],
+                  "no-unknown-animations": [true, {"importFrom": $imp}]
+                })
+              }' .stylelintrc.json > /tmp/stylelintrc.combined.json
+              npx stylelint "**/*.css" --config /tmp/stylelintrc.combined.json
+            fi
             find . -name "*.html" -not -path "./node_modules/*" -print0 \
               | xargs -0 --no-run-if-empty npx html-validate
           ) || { echo "web-lint" >> /tmp/_ci_failures; exit 1; }
