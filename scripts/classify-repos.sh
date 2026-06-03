@@ -78,11 +78,14 @@ for repo in ${repo_names}; do
     can_release=true
   fi
 
-  # Cliff tier: check latest tag
+  # Cliff tier: default to stable. Only fall back to alpha when the repo is
+  # explicitly mid-0.x (latest tag is v0.x). This way fresh/untagged repos get
+  # the stable policy so their first release naturally bumps to v1.0.0 instead
+  # of being trapped at v0.1.0 by alpha's no-major-bump rule.
   latest_tag=$(api "repos/${OWNER}/${repo}/tags" --jq '.[0].name // ""' 2>/dev/null || echo "")
-  cliff_tier="alpha"
-  if [[ "${latest_tag}" == v1.* || "${latest_tag}" == v[2-9].* || "${latest_tag}" == v[0-9][0-9].* ]]; then
-    cliff_tier="stable"
+  cliff_tier="stable"
+  if [[ "${latest_tag}" == v0.* ]]; then
+    cliff_tier="alpha"
   fi
 
   LANG["${repo}"]="${lang}"
