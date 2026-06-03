@@ -389,7 +389,7 @@ jobs:
           npm pkg set version="$ver"
           node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
           npm publish --access public --provenance
-          npx jsr publish
+          npx jsr publish --allow-dirty
 
       - name: Tag + GitHub Release
         if: steps.ver.outputs.release == 'true'
@@ -470,4 +470,4 @@ jobs:
           npm pkg set version="$ver"
           node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
           npm publish --access public --provenance
-          npx jsr publish
+          npx jsr publish --allow-dirty
