@@ -24,7 +24,7 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -86,21 +86,27 @@ jobs:
 
       - name: Fuzz (go test -fuzz)
         # Fuzzing is intentionally non-deterministic: a push/PR failing because
-        # the fuzzer found a new input is a real bug caught early. go test -fuzz
-        # writes the minimized input to testdata/fuzz/, so the find isn't lost —
-        # commit it as a seed and it becomes a deterministic regression. Public
-        # repos fuzz on push/PR (shift-left); the central weekly dispatch fuzzes
-        # every repo for deeper exploration. Targets auto-detected — a no-op when
-        # nothing to fuzz.
+        # the fuzzer found a new input is a real bug caught early, and go test
+        # -fuzz writes the minimized input to testdata/fuzz/ where it gets
+        # captured as a deterministic seed (the seed corpus runs every PR via
+        # the Test step). Tiered budget so PR feedback stays fast:
+        #   * push/PR (public)  -> 2s/target (~5s on tiny repos, ~3min on the
+        #     largest ~100-target repo). Catches shallow regressions early.
+        #   * schedule/dispatch -> 20s/target. Deep exploration; the central
+        #     weekly run fans this out to every repo.
+        # Targets auto-detected — a no-op when nothing to fuzz.
         if: ${{ github.event.repository.private == false || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         continue-on-error: true
+        env:
+          FUZZ_TIME: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '20s' || '2s' }}
         run: |
           (
             rc=0
+            echo "fuzz budget per target: ${FUZZ_TIME}"
             for pkg in $(go list ./...); do
               for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep -E '^Fuzz' || true); do
                 echo "::group::fuzz ${fn} (${pkg})"
-                go test -run='^$' -fuzz="^${fn}$" -fuzztime=20s "$pkg" || rc=1
+                go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME}" "$pkg" || rc=1
                 echo "::endgroup::"
               done
             done
