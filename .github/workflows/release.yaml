@@ -40,8 +40,6 @@ on:
         type: boolean
         default: false
     secrets:
-      NPM_TOKEN:
-        required: false
       DOCKERHUB_USERNAME:
         required: false
       DOCKERHUB_TOKEN:
@@ -378,17 +376,16 @@ jobs:
       - name: Publish to npm + JSR
         if: steps.ver.outputs.release == 'true'
         env:
-          # NODE_AUTH_TOKEN is the bootstrap auth path; once trusted publishers
-          # are configured per package on npmjs.com, we can drop this and rely
-          # on OIDC alone (--provenance still attaches the OIDC attestation).
-          # JSR uses GitHub OIDC directly via id-token: write — no token needed.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # No NODE_AUTH_TOKEN — both NPM and JSR publish via GitHub OIDC.
+          # NPM: trusted publisher configured at npmjs.com pointing to this
+          #      workflow + repo (auto-attaches provenance attestation).
+          # JSR: trusted publisher configured at jsr.io at the scope level.
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           ver="${VERSION#v}"
           npm pkg set version="$ver"
           node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-          npm publish --access public --provenance
+          npm publish --access public
           npx jsr publish --allow-dirty
 
       - name: Tag + GitHub Release
@@ -461,7 +458,7 @@ jobs:
       - name: Publish subpackage to npm + JSR
         if: steps.ver.outputs.release == 'true'
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # OIDC-only: trusted publishers configured at npmjs.com + jsr.io.
           VERSION: ${{ steps.ver.outputs.version }}
           SUBDIR: ${{ matrix.dir }}
         working-directory: ${{ matrix.dir }}
@@ -469,5 +466,5 @@ jobs:
           ver="${VERSION#v}"
           npm pkg set version="$ver"
           node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-          npm publish --access public --provenance
+          npm publish --access public
           npx jsr publish --allow-dirty
