@@ -383,9 +383,15 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           ver="${VERSION#v}"
+          pkg="$(npm pkg get name | tr -d '\"')"
           npm pkg set version="$ver"
           node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-          npm publish --access public
+          # Skip NPM if version already exists (bootstrap-friendly).
+          if npm view "$pkg@$ver" version >/dev/null 2>&1; then
+            echo "::notice::npm: $pkg@$ver already published — skipping"
+          else
+            npm publish --access public
+          fi
           npx jsr publish --allow-dirty
 
       - name: Tag + GitHub Release
@@ -464,7 +470,13 @@ jobs:
         working-directory: ${{ matrix.dir }}
         run: |
           ver="${VERSION#v}"
+          pkg="$(npm pkg get name | tr -d '\"')"
           npm pkg set version="$ver"
           node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-          npm publish --access public
+          # Skip NPM if version already exists (bootstrap-friendly).
+          if npm view "$pkg@$ver" version >/dev/null 2>&1; then
+            echo "::notice::npm: $pkg@$ver already published — skipping"
+          else
+            npm publish --access public
+          fi
           npx jsr publish --allow-dirty
