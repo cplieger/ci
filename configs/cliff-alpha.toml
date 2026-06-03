@@ -37,6 +37,14 @@ commit_parsers = [
   { message = "^docs", skip = true },
   { message = "^style", skip = true },
   { message = "^test", skip = true },
+  # `fuzz:` adds fuzz tests — same shape as test:, no runtime impact.
+  { message = "^fuzz", skip = true },
+  # `lint:` is mechanical lint --fix application; doesn't change behavior.
+  { message = "^lint", skip = true },
+  # `debug:` is throw-away debugging code; doesn't warrant a release.
+  { message = "^debug", skip = true },
+  # Auto-generated git merge commit subjects (rebase/merge artifacts).
+  { message = "^[Mm]erge ", skip = true },
   # Real changes — bump per cliff.
   { message = "^feat", group = "Added" },
   { message = "^fix", group = "Fixed" },
