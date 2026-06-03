@@ -52,8 +52,8 @@ jobs:
           REASON: ${{ inputs.reason }}
         run: |
           set -euo pipefail
-          if [ -z "${URL:-}" ] || [ -z "${SECRET:-}" ]; then
-            echo "::error::KOMODO_RENOVATE_WEBHOOK_URL and KOMODO_RENOVATE_WEBHOOK_SECRET must be set as repo secrets on cplieger/ci."
+          if [ -z "${URL:-}" ]; then
+            echo "::error::KOMODO_RENOVATE_WEBHOOK_URL must be set as repo secrets on cplieger/ci."
             exit 1
           fi
           body=$(jq -nc --arg r "${REASON}" '{ref:"refs/heads/main",reason:$r}')
