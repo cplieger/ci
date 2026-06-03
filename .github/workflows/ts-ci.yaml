@@ -88,7 +88,10 @@ jobs:
             # can see :root vars and @keyframes defined in sibling files (the
             # browser merges them at runtime; stylelint otherwise treats each
             # file in isolation).
-            mapfile -t css_files < <(find . -name "*.css" -not -path "./node_modules/*" -not -path "./.git/*" -not -path "./dist/*" | sort)
+            # Use absolute paths in importFrom because stylelint resolves relative
+            # paths against the config file's location (/tmp/...) rather than the
+            # working directory.
+            mapfile -t css_files < <(find "$PWD" -name "*.css" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" | sort)
             if [ ${#css_files[@]} -gt 0 ]; then
               import_json=$(printf '%s\0' "${css_files[@]}" | jq -Rs 'split("\u0000") | map(select(length > 0))')
               jq --argjson imp "$import_json" '. + {
