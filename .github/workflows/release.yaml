@@ -361,6 +361,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
       - name: Compute version
         id: ver
         uses: cplieger/ci/actions/git-cliff-version@2c6289a7dee062be6411c1cd0d3ab4f784d75f1e # v1
@@ -369,16 +375,20 @@ jobs:
         if: steps.ver.outputs.release != 'true'
         run: echo "No conventional-commit bump since the last tag; skipping release."
 
-      - name: Publish to npm + JSR (OIDC)
+      - name: Publish to npm + JSR
         if: steps.ver.outputs.release == 'true'
         env:
+          # NODE_AUTH_TOKEN is the bootstrap auth path; once trusted publishers
+          # are configured per package on npmjs.com, we can drop this and rely
+          # on OIDC alone (--provenance still attaches the OIDC attestation).
+          # JSR uses GitHub OIDC directly via id-token: write — no token needed.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          npm install -g npm@latest
           ver="${VERSION#v}"
           npm pkg set version="$ver"
           node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-          npm publish --access public
+          npm publish --access public --provenance
           npx jsr publish
 
       - name: Tag + GitHub Release
@@ -438,6 +448,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
       - name: Compute version
         id: ver
         uses: cplieger/ci/actions/git-cliff-version@2c6289a7dee062be6411c1cd0d3ab4f784d75f1e # v1
@@ -445,13 +461,13 @@ jobs:
       - name: Publish subpackage to npm + JSR
         if: steps.ver.outputs.release == 'true'
         env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ steps.ver.outputs.version }}
           SUBDIR: ${{ matrix.dir }}
         working-directory: ${{ matrix.dir }}
         run: |
-          npm install -g npm@latest
           ver="${VERSION#v}"
           npm pkg set version="$ver"
           node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-          npm publish --access public
+          npm publish --access public --provenance
           npx jsr publish
