@@ -85,13 +85,14 @@ jobs:
         run: ( go test -count=1 -race ./... ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
       - name: Fuzz (go test -fuzz)
-        # Random fuzzing is non-deterministic, so it must NOT gate push/PR — it
-        # would flake whenever it discovers a new failing input. The seed corpus
-        # (the deterministic regression guard) already runs in the Test step on
-        # every push/PR. Random exploration runs only on the schedule / central
-        # weekly dispatch; new finds are added to the seed corpus, which then
-        # gates deterministically. Targets auto-detected — a no-op when none.
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        # Fuzzing is intentionally non-deterministic: a push/PR failing because
+        # the fuzzer found a new input is a real bug caught early. go test -fuzz
+        # writes the minimized input to testdata/fuzz/, so the find isn't lost —
+        # commit it as a seed and it becomes a deterministic regression. Public
+        # repos fuzz on push/PR (shift-left); the central weekly dispatch fuzzes
+        # every repo for deeper exploration. Targets auto-detected — a no-op when
+        # nothing to fuzz.
+        if: ${{ github.event.repository.private == false || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         continue-on-error: true
         run: |
           (
