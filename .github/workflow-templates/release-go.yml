@@ -16,5 +16,5 @@ concurrency:
 
 jobs:
   release:
-    uses: cplieger/ci/.github/workflows/release.yaml@2c6289a7dee062be6411c1cd0d3ab4f784d75f1e # v1
+    uses: cplieger/ci/.github/workflows/release.yaml@4e0a6937409828785a87d9eba577315d6cce50e0 # v1
     secrets: inherit
