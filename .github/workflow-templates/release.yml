@@ -30,5 +30,5 @@ permissions:
 
 jobs:
   release:
-    uses: cplieger/ci/.github/workflows/release.yaml@9f235de8f9e3b9d66d96f1e7a86d62f90da3db9b # placeholder — bumped after self-push
+    uses: cplieger/ci/.github/workflows/release.yaml@9f235de8f9e3b9d66d96f1e7a86d62f90da3db9b # main
     secrets: inherit
