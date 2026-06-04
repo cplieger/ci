@@ -107,3 +107,38 @@ jobs:
     needs: detect
     if: ${{ needs.detect.outputs.run_shell == 'true' }}
     uses: cplieger/ci/.github/workflows/shell-ci.yaml@5131053dbe9ad6c35ec18e29a17b14a037d16cc6 # main
+
+  # Aggregator — emits a single `ci / validate` check name that branch
+  # protection rules can target (preserves the check name from the previous
+  # per-type templates so existing branch-protection rules keep working
+  # without per-repo updates).
+  validate:
+    needs: [detect, go, ts, web, shell]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Aggregate CI dispatch results
+        env:
+          DETECT: ${{ needs.detect.result }}
+          GO: ${{ needs.go.result }}
+          TS: ${{ needs.ts.result }}
+          WEB: ${{ needs.web.result }}
+          SHELL: ${{ needs.shell.result }}
+        run: |
+          # detect must always succeed (it gates everything else)
+          if [ "$DETECT" != "success" ]; then
+            echo "::error::detect job did not succeed: $DETECT"
+            exit 1
+          fi
+          # Each dispatched job must be either success (it ran and passed)
+          # or skipped (auto-detect said it wasn't applicable).
+          for pair in "go=$GO" "ts=$TS" "web=$WEB" "shell=$SHELL"; do
+            name="${pair%%=*}"; result="${pair##*=}"
+            if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+              echo "::error::$name job: $result"
+              exit 1
+            fi
+            echo "  $name: $result"
+          done
+          echo "All dispatched CI jobs passed (or skipped per auto-detect)"
