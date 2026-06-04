@@ -85,20 +85,18 @@ jobs:
         run: ( go test -count=1 -race ./... ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
       - name: Fuzz (go test -fuzz)
-        # Fuzzing is intentionally non-deterministic: a push/PR failing because
-        # the fuzzer found a new input is a real bug caught early, and go test
-        # -fuzz writes the minimized input to testdata/fuzz/ where it gets
-        # captured as a deterministic seed (the seed corpus runs every PR via
-        # the Test step). Tiered budget so PR feedback stays fast:
-        #   * push/PR (public)  -> 2s/target (~5s on tiny repos, ~3min on the
-        #     largest ~100-target repo). Catches shallow regressions early.
-        #   * schedule/dispatch -> 20s/target. Deep exploration; the central
-        #     weekly run fans this out to every repo.
+        # Fuzzing is intentionally non-deterministic. To keep PR/push CI fast
+        # and deterministic, fuzz runs ONLY on the weekly central scheduler
+        # (cplieger/ci/.github/workflows/weekly-full-ci.yaml dispatches ci.yaml
+        # on every repo Mondays 03:30 UTC) and on manual workflow_dispatch.
+        # Find a counterexample? `go test -fuzz` writes the minimized input
+        # to testdata/fuzz/ — commit it as a deterministic seed; the regular
+        # `Test (race)` step exercises the seed corpus on every PR.
         # Targets auto-detected — a no-op when nothing to fuzz.
-        if: ${{ github.event.repository.private == false || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         continue-on-error: true
         env:
-          FUZZ_TIME: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '30s' || '5s' }}
+          FUZZ_TIME: 30s
         run: |
           (
             rc=0
