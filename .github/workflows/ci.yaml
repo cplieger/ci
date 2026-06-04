@@ -88,17 +88,17 @@ jobs:
   go:
     needs: detect
     if: ${{ needs.detect.outputs.run_go == 'true' }}
-    uses: cplieger/ci/.github/workflows/go-ci.yaml@17b699a97542f07b55e6b576456044731954c6fd # main
+    uses: cplieger/ci/.github/workflows/go-ci.yaml@9bcd7e4bac95791a6e9de16ad60bd9ffe91af073 # main
 
   ts:
     needs: detect
     if: ${{ needs.detect.outputs.run_ts == 'true' }}
-    uses: cplieger/ci/.github/workflows/ts-ci.yaml@17b699a97542f07b55e6b576456044731954c6fd # main
+    uses: cplieger/ci/.github/workflows/ts-ci.yaml@9bcd7e4bac95791a6e9de16ad60bd9ffe91af073 # main
 
   web:
     needs: detect
     if: ${{ needs.detect.outputs.run_web == 'true' }}
-    uses: cplieger/ci/.github/workflows/ts-ci.yaml@17b699a97542f07b55e6b576456044731954c6fd # main
+    uses: cplieger/ci/.github/workflows/ts-ci.yaml@9bcd7e4bac95791a6e9de16ad60bd9ffe91af073 # main
     with:
       working-directory: ${{ needs.detect.outputs.web_dir }}
       web-lint: true
@@ -106,4 +106,4 @@ jobs:
   shell:
     needs: detect
     if: ${{ needs.detect.outputs.run_shell == 'true' }}
-    uses: cplieger/ci/.github/workflows/shell-ci.yaml@17b699a97542f07b55e6b576456044731954c6fd # main
+    uses: cplieger/ci/.github/workflows/shell-ci.yaml@9bcd7e4bac95791a6e9de16ad60bd9ffe91af073 # main
