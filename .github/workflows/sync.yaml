@@ -41,9 +41,39 @@ jobs:
         timeout-minutes: 5
 
       - name: Sync files to consumer repos
+        id: sync
         uses: BetaHuhn/repo-file-sync-action@8b92be3375cf1d1b0cd579af488a9255572e4619 # v1
         with:
           GH_PAT: ${{ secrets.SYNC_PAT }}
           CONFIG_PATH: .github/sync.yml
           COMMIT_PREFIX: "chore(sync):"
           PR_LABELS: dependencies
+
+      - name: Enable auto-merge on sync PRs
+        # Each sync PR is a routine SHA / config bump; once the consumer
+        # repo's CI passes there's no human review needed. Use GitHub's
+        # native auto-merge so PRs land as soon as required checks go
+        # green (squash-merge to keep main history flat). If a consumer
+        # repo has no required checks, the PR merges immediately.
+        if: steps.sync.outputs.pull_request_urls != ''
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          # pull_request_urls is a JSON array string like '["url1","url2",...]'.
+          urls='${{ steps.sync.outputs.pull_request_urls }}'
+          echo "$urls" | python3 -c '
+          import json, subprocess, sys
+          for url in json.loads(sys.stdin.read()):
+              print(f"Enabling auto-merge on: {url}")
+              # --auto requires the PR to be in a state where auto-merge is
+              # accepted (typically: branch protection enabled). If it errors,
+              # log and continue rather than failing the whole sync run.
+              r = subprocess.run(
+                  ["gh", "pr", "merge", "--auto", "--squash", "--delete-branch", url],
+                  capture_output=True, text=True
+              )
+              if r.returncode != 0:
+                  print(f"  WARN: {r.stderr.strip()}", flush=True)
+              else:
+                  print(f"  ok: {r.stdout.strip()}", flush=True)
+          '
