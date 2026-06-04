@@ -1,50 +1,44 @@
-# Unified auto-detecting release workflow.
-# Detects the project type at the repo root (precedence: Dockerfile > jsr.json > go.mod)
-# and runs the appropriate release pipeline. After the primary release, if any first-level
-# subdirectory contains a jsr.json, it publishes that subpackage to npm+JSR as well.
+# Unified release pipeline for all cplieger consumer repos.
+#
+# Single entry point. Consumer repos call this workflow on every push to main;
+# all routing decisions are made centrally:
+#
+#   detect job    →  Compute cliff version, detect repo type
+#                    (docker/go/ts), find TS subpackages, identify which paths
+#                    actually changed (vs. excluded test/lint/docs), and resolve
+#                    per-repo policy overrides (registries, platforms, sbom).
+#
+#   docker job    →  Delegates to docker-release.yaml when type=docker AND
+#                    non-excluded paths changed. docker-release.yaml itself
+#                    handles build/sign/SBOM/release using the values we pass.
+#
+#   go job        →  Tag + GitHub Release for type=go (root module). No build
+#                    step — `go install <repo>@<tag>` fetches by tag.
+#
+#   ts job        →  npm + JSR publish + tag + GitHub Release for type=ts
+#                    (root TS lib).
+#
+#   subpackage    →  Matrix over `*/jsr.json` subpackages where the subpackage
+#                    dir had non-excluded changes; npm + JSR publish per dir.
+#                    Used by hybrid repos (e.g., vterm: Go module at root +
+#                    web/ TS subpackage).
+#
+# Path-change detection uses central exclusion patterns (see "Detect changed
+# paths" step) — opinionated and tight by default. Tests, lint configs, docs,
+# generated bundles, CI metadata are all ignored. If only excluded paths
+# changed, no rebuild/republish is triggered even if cliff would bump the
+# version (rare edge case: a `feat:` commit that only touches README).
+#
+# Per-repo policy is centralized in the "Resolve repo policy" step — no
+# per-repo config files. To change a repo's settings, edit this workflow.
 name: Release
 
 on:
   workflow_call:
-    inputs:
-      image-name:
-        description: "Image name (without registry prefix). Defaults to repo name."
-        type: string
-        default: ${{ github.event.repository.name }}
-      registries:
-        description: "Comma-separated registries to push to (ghcr,dockerhub)."
-        type: string
-        default: "ghcr,dockerhub"
-      platforms:
-        description: "Platforms to build for (docker)."
-        type: string
-        default: "linux/amd64,linux/arm64"
-      dockerfile:
-        description: "Path to the Dockerfile."
-        type: string
-        default: "./Dockerfile"
-      syft-config:
-        description: "Path to a .syft.yaml config for anchore/sbom-action. Empty = none."
-        type: string
-        default: ""
-      sbom-from:
-        description: "'image' scans the pushed image; 'path' extracts binary to /tmp/sbom-src first."
-        type: string
-        default: "image"
-      notify-repo:
-        description: "Repository (owner/name) to send a repository_dispatch to. Empty = skip."
-        type: string
-        default: ""
-      skip-build-guard:
-        description: "When true, skip the build if the head commit is by renovate[bot] and contains [skip-build]."
-        type: boolean
-        default: false
     secrets:
       DOCKERHUB_USERNAME:
         required: false
       DOCKERHUB_TOKEN:
-        required: false
-      HOMELAB_DISPATCH_TOKEN:
         required: false
 
 permissions:
@@ -55,42 +49,56 @@ permissions:
   security-events: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  # ─── Detection ───────────────────────────────────────────────────────────────
   detect:
     runs-on: ubuntu-24.04
-    timeout-minutes: 2
+    timeout-minutes: 3
     outputs:
-      type: ${{ steps.detect.outputs.type }}
-      subpackages: ${{ steps.detect.outputs.subpackages }}
+      type: ${{ steps.type.outputs.type }}
+      subpackages: ${{ steps.type.outputs.subpackages }}
+      subpackages_to_publish: ${{ steps.changes.outputs.subpackages_to_publish }}
       version: ${{ steps.cliff.outputs.version }}
       release: ${{ steps.cliff.outputs.release }}
+      root_changed: ${{ steps.changes.outputs.root_changed }}
+      registries: ${{ steps.policy.outputs.registries }}
+      platforms: ${{ steps.policy.outputs.platforms }}
+      sbom_from: ${{ steps.policy.outputs.sbom_from }}
+      syft_config: ${{ steps.policy.outputs.syft_config }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
 
-      - name: Compute version (single source of truth for all release jobs)
+      - name: Compute version (cliff)
         id: cliff
-        uses: cplieger/ci/actions/git-cliff-version@2c6289a7dee062be6411c1cd0d3ab4f784d75f1e # v1
+        uses: cplieger/ci/actions/git-cliff-version@2191488446fe35b75a3da9b1de7dde3ba9f9f9ec # main
 
-      - name: Detect release type
-        id: detect
+      - name: Detect type + subpackages
+        id: type
         run: |
+          # Type precedence: Dockerfile > jsr.json > go.mod. A repo that has
+          # multiple of these signals (e.g., docker-age has Dockerfile + go.mod)
+          # is treated as docker; the go.mod is for the binary inside the image
+          # and isn't a separately released module.
           if [ -f Dockerfile ]; then
-            echo "type=docker" >> "$GITHUB_OUTPUT"
+            TYPE=docker
           elif [ -f jsr.json ]; then
-            echo "type=ts" >> "$GITHUB_OUTPUT"
+            TYPE=ts
           elif [ -f go.mod ]; then
-            echo "type=go" >> "$GITHUB_OUTPUT"
+            TYPE=go
           else
-            echo "type=none" >> "$GITHUB_OUTPUT"
+            TYPE=none
           fi
-          # Find first-level subdirectories with jsr.json (subpackages) as JSON array
+          echo "type=$TYPE" >> "$GITHUB_OUTPUT"
+
+          # Find first-level subdirectories with jsr.json (subpackages).
+          # Only one repo currently uses this (vterm/web/), but the mechanism
+          # is generic — any repo with a Go/Docker root + a TS lib in a subdir
+          # gets unified releases via this matrix.
           SUBS="[]"
           for d in */; do
             if [ -f "${d}jsr.json" ]; then
@@ -98,263 +106,256 @@ jobs:
             fi
           done
           echo "subpackages=$SUBS" >> "$GITHUB_OUTPUT"
+          echo "type=$TYPE  subpackages=$SUBS"
 
-  # ─── Docker image build + push ──────────────────────────────────────────────
+      - name: Detect changed paths
+        id: changes
+        env:
+          BEFORE: ${{ github.event.before }}
+          HEAD: ${{ github.sha }}
+          SUBPACKAGES_JSON: ${{ steps.type.outputs.subpackages }}
+        run: |
+          # Determine the set of files that materially changed in this push.
+          # - For push events with a known `before` SHA: git diff before..HEAD.
+          # - For workflow_dispatch, initial branch creation, or unreachable
+          #   `before` (force-push): treat all tracked files as "changed" so
+          #   the run proceeds (loose default; tighter behaviors can be added
+          #   later if needed).
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "::notice::No before SHA — treating all tracked files as changed"
+            CHANGED=$(git ls-files)
+          elif ! CHANGED=$(git diff --name-only "$BEFORE..$HEAD" 2>/dev/null); then
+            echo "::notice::git diff failed (force push or unreachable history) — treating all tracked files as changed"
+            CHANGED=$(git ls-files)
+          fi
+
+          # Central exclusion patterns. Tight by default: anything that doesn't
+          # ship in the artifact (tests, lint configs, generated bundles, docs,
+          # CI metadata) is excluded. To loosen, remove entries from this array.
+          # The patterns use extended regex (grep -E).
+          EXCLUDE_PATTERNS=(
+            # Editor / formatter / linter configs
+            '(^|/)\.editorconfig$'
+            '(^|/)\.gitignore$'
+            '(^|/)\.gitattributes$'
+            '(^|/)\.dockerignore$'
+            '(^|/)\.prettierrc(\.json|\.yaml|\.toml)?$'
+            '(^|/)\.prettierignore$'
+            '(^|/)\.htmlvalidate\.json$'
+            '(^|/)\.stylelintrc\.json$'
+            '(^|/)eslint\.config\.(mjs|js|cjs)$'
+            '(^|/)eslint\.config\.base\.mjs$'
+            '(^|/)vitest\.config\.(ts|js)$'
+            '(^|/)tsconfig\.(test|tests|node)\.json$'
+            '(^|/)knip\.json$'
+            '(^|/)stryker\.config\.json$'
+            '(^|/)\.golangci\.(yaml|yml)$'
+
+            # Docs and license
+            '\.md$'
+            '(^|/)LICENSE$'
+
+            # CI / security tooling configs
+            '(^|/)cliff\.toml$'
+            '^renovate\.json$'
+            '(^|/)\.gitleaks\.toml$'
+            '(^|/)\.codeql-suppressions\.yaml$'
+            '(^|/)\.trivyignore$'
+            '(^|/)\.syft\.yaml$'
+            '^\.github/'
+
+            # Go test code
+            '_test\.go$'
+            '(^|/)testdata/'
+            '(^|/)testsupport/'
+            '(^|/)testcerts/'
+            '(^|/)authtest/'
+
+            # TS test code
+            '\.test\.ts$'
+            '\.spec\.ts$'
+            '\.fuzz\.test\.ts$'
+            '\.property\.test\.ts$'
+            '(^|/)__test-helpers__/'
+            '(^|/)__snapshots__/'
+            '(^|/)test-stubs/'
+            '(^|/)fc-strict-setup\.ts$'
+
+            # Generated / vendored output
+            '(^|/)dist/'
+            '(^|/)coverage/'
+            '(^|/)node_modules/'
+            '(^|/)static/[^/]+\.js$'
+            '(^|/)static/[^/]+\.js\.map$'
+            '(^|/)static/style\.css$'
+            '(^|/)static/vendor/'
+
+            # Dev convenience / manual test scripts
+            '^compose\.yaml$'
+            '^test-validate\.sh$'
+            '(^|/)setup-tools\.test\.sh$'
+            '^tests/'
+          )
+          # Join patterns with | for a single grep -E invocation.
+          EXCLUDE_RE=$(IFS='|'; echo "${EXCLUDE_PATTERNS[*]}")
+
+          # Filter: keep only paths that DON'T match any exclude pattern.
+          if [ -z "$CHANGED" ]; then
+            SIGNIFICANT=""
+          else
+            SIGNIFICANT=$(echo "$CHANGED" | grep -Ev "$EXCLUDE_RE" || true)
+          fi
+
+          # Determine root_changed (any significant file outside all subpackage
+          # dirs) and which subpackages changed.
+          ROOT_CHANGED=false
+          declare -A SUBPKG_CHANGED
+          mapfile -t SUBPACKAGES < <(echo "$SUBPACKAGES_JSON" | jq -r '.[]')
+          for s in "${SUBPACKAGES[@]}"; do
+            SUBPKG_CHANGED["$s"]=false
+          done
+
+          if [ -n "$SIGNIFICANT" ]; then
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              in_subpkg=false
+              for s in "${SUBPACKAGES[@]}"; do
+                if [[ "$f" == "$s/"* ]]; then
+                  SUBPKG_CHANGED["$s"]=true
+                  in_subpkg=true
+                  break
+                fi
+              done
+              if ! $in_subpkg; then
+                ROOT_CHANGED=true
+              fi
+            done <<< "$SIGNIFICANT"
+          fi
+
+          SUBS_TO_PUBLISH="[]"
+          for s in "${SUBPACKAGES[@]}"; do
+            if [ "${SUBPKG_CHANGED[$s]}" = "true" ]; then
+              SUBS_TO_PUBLISH=$(echo "$SUBS_TO_PUBLISH" | jq -c --arg v "$s" '. + [$v]')
+            fi
+          done
+
+          {
+            echo "root_changed=$ROOT_CHANGED"
+            echo "subpackages_to_publish=$SUBS_TO_PUBLISH"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Change detection summary"
+            echo ""
+            echo "**Before:** \`$BEFORE\`"
+            echo "**Head:** \`$HEAD\`"
+            echo ""
+            echo "**Significant paths:**"
+            echo '```'
+            echo "${SIGNIFICANT:-(none — only excluded paths changed)}"
+            echo '```'
+            echo ""
+            echo "**Outputs:**"
+            echo "- root_changed: $ROOT_CHANGED"
+            echo "- subpackages_to_publish: $SUBS_TO_PUBLISH"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve repo policy
+        id: policy
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          # Per-repo policy overrides. Centralized here, NOT per-repo config.
+          # When you need to change a repo's release behavior, edit this step.
+          #
+          # Defaults:
+          #   registries  = "ghcr,dockerhub" (push to both)
+          #   platforms   = "linux/amd64,linux/arm64" (multi-arch)
+          #   sbom_from   = "image" (scan published image)
+          #   syft_config = ".syft.yaml" if file exists at root, else ""
+          REGISTRIES="ghcr,dockerhub"
+          PLATFORMS="linux/amd64,linux/arm64"
+          SBOM_FROM="image"
+
+          case "$REPO_NAME" in
+            # GHCR-only (no Docker Hub mirror).
+            docker-caddy|docker-age|docker-keepalived|docker-static-web|docker-radvd|subflux|vibecli|vibekit)
+              REGISTRIES="ghcr" ;;
+          esac
+
+          case "$REPO_NAME" in
+            # arm64-only (amd64 build is currently broken or untested).
+            docker-nut-upsd|docker-smtp-relay)
+              PLATFORMS="linux/arm64" ;;
+          esac
+
+          case "$REPO_NAME" in
+            # SBOM from extracted binary path (image-level scan misses static
+            # Go deps for these builds).
+            vibecli|vibekit)
+              SBOM_FROM="path" ;;
+          esac
+
+          # Auto-detect a checked-in syft config at repo root.
+          if [ -f .syft.yaml ]; then
+            SYFT_CONFIG=".syft.yaml"
+          else
+            SYFT_CONFIG=""
+          fi
+
+          {
+            echo "registries=$REGISTRIES"
+            echo "platforms=$PLATFORMS"
+            echo "sbom_from=$SBOM_FROM"
+            echo "syft_config=$SYFT_CONFIG"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS sbom_from=$SBOM_FROM syft_config='$SYFT_CONFIG'"
+
+  # ─── Docker image build + sign + SBOM + release (delegated) ────────────────
   docker:
     needs: detect
-    if: needs.detect.outputs.type == 'docker' && !( inputs.skip-build-guard && github.event.head_commit.author.name == 'renovate[bot]' && contains(github.event.head_commit.message, '[skip-build]') )
+    if: ${{ needs.detect.outputs.type == 'docker' && needs.detect.outputs.root_changed == 'true' }}
+    uses: cplieger/ci/.github/workflows/docker-release.yaml@2191488446fe35b75a3da9b1de7dde3ba9f9f9ec # placeholder — bumped after self-push
+    with:
+      version: ${{ needs.detect.outputs.version }}
+      release-needed: ${{ needs.detect.outputs.release }}
+      registries: ${{ needs.detect.outputs.registries }}
+      platforms: ${{ needs.detect.outputs.platforms }}
+      sbom-from: ${{ needs.detect.outputs.sbom_from }}
+      syft-config: ${{ needs.detect.outputs.syft_config }}
+    secrets: inherit
+
+  # ─── Go module release (tag + GitHub Release; `go install` fetches by tag) ─
+  go:
+    needs: detect
+    if: ${{ needs.detect.outputs.type == 'go' && needs.detect.outputs.root_changed == 'true' && needs.detect.outputs.release == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      IMAGE_NAME: ${{ github.repository_owner }}/${{ inputs.image-name }}
-      REGISTRY: ghcr.io
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Log in to Docker Hub
-        if: contains(inputs.registries, 'dockerhub')
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: No release needed
-        if: needs.detect.outputs.release != 'true'
-        run: echo "No conventional-commit bump since the last tag; skipping release."
-
-      - name: Derive version tags
-        if: needs.detect.outputs.release == 'true'
-        id: ver
-        env:
-          RAW_VERSION: ${{ needs.detect.outputs.version }}
-        run: |
-          VERSION="${RAW_VERSION#v}"
-          MAJOR="${VERSION%%.*}"
-          MINOR="${VERSION%.*}"
-          {
-            echo "version=v${VERSION}"
-            echo "major=v${MAJOR}"
-            echo "minor=v${MINOR}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Extract metadata (GHCR + Docker Hub)
-        if: needs.detect.outputs.release == 'true' && contains(inputs.registries, 'dockerhub')
-        id: meta-dual
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
-        with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            docker.io/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,format=long,priority=500
-            type=raw,value=latest,priority=400
-            type=raw,value=${{ steps.ver.outputs.major }},priority=300
-            type=raw,value=${{ steps.ver.outputs.minor }},priority=200
-            type=raw,value=${{ steps.ver.outputs.version }},priority=100
-
-      - name: Extract metadata (GHCR only)
-        if: needs.detect.outputs.release == 'true' && !contains(inputs.registries, 'dockerhub')
-        id: meta-ghcr
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
-        with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,format=long,priority=500
-            type=raw,value=latest,priority=400
-            type=raw,value=${{ steps.ver.outputs.major }},priority=300
-            type=raw,value=${{ steps.ver.outputs.minor }},priority=200
-            type=raw,value=${{ steps.ver.outputs.version }},priority=100
-
-      - name: Build and push
-        if: needs.detect.outputs.release == 'true'
-        id: push
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          file: ${{ inputs.dockerfile }}
-          platforms: ${{ inputs.platforms }}
-          push: true
-          provenance: true
-          tags: ${{ steps.meta-dual.outputs.tags || steps.meta-ghcr.outputs.tags }}
-          labels: ${{ steps.meta-dual.outputs.labels || steps.meta-ghcr.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Extract binary for SBOM
-        if: needs.detect.outputs.release == 'true' && inputs.sbom-from == 'path'
-        env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-          IMAGE_NAME_SHORT: ${{ inputs.image-name }}
-        run: |
-          docker pull "$IMAGE_REF"
-          CID=$(docker create "$IMAGE_REF")
-          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
-          mkdir -p /tmp/sbom-src
-          docker cp "$CID:/app/${IMAGE_NAME_SHORT}" "/tmp/sbom-src/${IMAGE_NAME_SHORT}"
-
-      - name: Trivy scan published image
-        if: needs.detect.outputs.release == 'true'
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-          format: 'sarif'
-          output: 'trivy-image.sarif'
-          severity: 'HIGH,CRITICAL'
-          ignore-unfixed: true
-
-      - name: Upload Trivy SARIF
-        if: needs.detect.outputs.release == 'true' && always()
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
-        with:
-          sarif_file: 'trivy-image.sarif'
-          category: 'trivy-image-build'
-
-      - name: Generate SBOM (from image)
-        if: needs.detect.outputs.release == 'true' && inputs.sbom-from == 'image' && inputs.syft-config == ''
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-          format: spdx-json
-          output-file: sbom.spdx.json
-          upload-release-assets: false
-
-      - name: Generate SBOM (from image, with syft config)
-        if: needs.detect.outputs.release == 'true' && inputs.sbom-from == 'image' && inputs.syft-config != ''
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-          format: spdx-json
-          output-file: sbom.spdx.json
-          upload-release-assets: false
-          config: ${{ inputs.syft-config }}
-
-      - name: Generate SBOM (from path)
-        if: needs.detect.outputs.release == 'true' && inputs.sbom-from == 'path'
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          path: /tmp/sbom-src
-          format: spdx-json
-          output-file: sbom.spdx.json
-          upload-release-assets: false
-
-      - name: Install Cosign
-        if: needs.detect.outputs.release == 'true'
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
-      - name: Sign GHCR image
-        if: needs.detect.outputs.release == 'true'
-        env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-        run: cosign sign --yes "$IMAGE_REF"
-
-      - name: Attest SBOM to GHCR
-        if: needs.detect.outputs.release == 'true'
-        env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-        run: |
-          cosign attest --yes \
-            --predicate sbom.spdx.json \
-            --type spdxjson \
-            "$IMAGE_REF"
-
-      - name: Generate release notes
-        if: needs.detect.outputs.release == 'true'
-        run: git-cliff --latest --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
-
-      - name: Sign Docker Hub image
-        if: needs.detect.outputs.release == 'true' && contains(inputs.registries, 'dockerhub')
-        env:
-          IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-        run: cosign sign --yes "$IMAGE_REF"
-
-      - name: Attest SBOM to Docker Hub
-        if: needs.detect.outputs.release == 'true' && contains(inputs.registries, 'dockerhub')
-        env:
-          IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-        run: |
-          cosign attest --yes \
-            --predicate sbom.spdx.json \
-            --type spdxjson \
-            "$IMAGE_REF"
-
-      - name: Create release
-        if: needs.detect.outputs.release == 'true'
+      - name: Tag + GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
-          gh release create "$VERSION" \
-            --title "$VERSION" \
-            --notes-file RELEASE_NOTES.md \
-            sbom.spdx.json
+          # Install git-cliff (version compute already happened in detect, but
+          # we need the binary here for `git cliff --latest` to render notes).
+          CLIFF_VERSION=v2.13.1
+          curl -fsSL --retry 3 \
+            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+          git cliff --latest --strip header > NOTES.md
+          gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
 
-      - name: Sync description to Docker Hub
-        if: needs.detect.outputs.release == 'true' && contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main'
-        continue-on-error: true
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          REPO_DESC: ${{ github.event.repository.description }}
-          IMAGE_NAME_SHORT: ${{ inputs.image-name }}
-        run: |
-          TOKEN=$(curl -fsSL "https://hub.docker.com/v2/users/login/" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n --arg u "$DOCKERHUB_USERNAME" --arg p "$DOCKERHUB_TOKEN" \
-              '{username: $u, password: $p}')" | jq -r .token)
-          curl -fsSL -X PATCH \
-            "https://hub.docker.com/v2/repositories/${DOCKERHUB_USERNAME}/${IMAGE_NAME_SHORT}/" \
-            -H "Authorization: Bearer ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n --arg d "$REPO_DESC" '{description: $d}')" >/dev/null
-
-      - name: Push README to Docker Hub
-        if: needs.detect.outputs.release == 'true' && contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main'
-        continue-on-error: true
-        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}
-          readme-filepath: README.md
-
-      - name: Notify homelab
-        if: needs.detect.outputs.release == 'true' && inputs.notify-repo != '' && github.ref == 'refs/heads/main'
-        env:
-          DISPATCH_TOKEN: ${{ secrets.HOMELAB_DISPATCH_TOKEN }}
-          NOTIFY_REPO: ${{ inputs.notify-repo }}
-          FULL_IMAGE: ${{ env.IMAGE_NAME }}
-          VERSION: ${{ needs.detect.outputs.version }}
-          DIGEST: ${{ steps.push.outputs.digest }}
-        run: |
-          curl -fsSL -X POST \
-            -H "Authorization: token ${DISPATCH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${NOTIFY_REPO}/dispatches" \
-            -d "$(jq -n --arg img "$FULL_IMAGE" --arg tag "$VERSION" --arg dig "$DIGEST" \
-              '{event_type:"image-update",client_payload:{image:$img,tag:$tag,digest:$dig}}')"
-
-  # ─── TypeScript (npm + JSR) publish ─────────────────────────────────────────
+  # ─── TypeScript library release (npm + JSR + tag + GitHub Release) ─────────
   ts:
     needs: detect
-    if: needs.detect.outputs.type == 'ts'
+    if: ${{ needs.detect.outputs.type == 'ts' && needs.detect.outputs.root_changed == 'true' && needs.detect.outputs.release == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -369,12 +370,7 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: No release needed
-        if: needs.detect.outputs.release != 'true'
-        run: echo "No conventional-commit bump since the last tag; skipping release."
-
       - name: Publish to npm + JSR
-        if: needs.detect.outputs.release == 'true'
         env:
           # No NODE_AUTH_TOKEN — both NPM and JSR publish via GitHub OIDC.
           # NPM: trusted publisher configured at npmjs.com pointing to this
@@ -395,12 +391,10 @@ jobs:
           npx jsr publish --allow-dirty
 
       - name: Tag + GitHub Release
-        if: needs.detect.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
-          # Install git-cliff (not pre-installed since version computation moved to detect job)
           CLIFF_VERSION=v2.13.1
           curl -fsSL --retry 3 \
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
@@ -408,49 +402,21 @@ jobs:
           git cliff --latest --strip header > NOTES.md
           gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
 
-  # ─── Go module release ──────────────────────────────────────────────────────
-  go:
-    needs: detect
-    if: needs.detect.outputs.type == 'go'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 0
-
-      - name: No release needed
-        if: needs.detect.outputs.release != 'true'
-        run: echo "No conventional-commit bump since the last tag; skipping release."
-
-      - name: Tag + GitHub Release
-        if: needs.detect.outputs.release == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.detect.outputs.version }}
-        run: |
-          # Install git-cliff (not pre-installed since version computation moved to detect job)
-          CLIFF_VERSION=v2.13.1
-          curl -fsSL --retry 3 \
-            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          git cliff --latest --strip header > NOTES.md
-          gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
-
-  # ─── Subpackage publish (first-level subdirs with jsr.json) ─────────────────
+  # ─── Subpackage publish (matrix over `*/jsr.json` dirs that changed) ───────
   subpackage:
-    needs:
-      - detect
-      - docker
-      - ts
-      - go
-    if: always() && needs.detect.outputs.subpackages != '[]' && (needs.docker.result == 'success' || needs.docker.result == 'skipped') && (needs.ts.result == 'success' || needs.ts.result == 'skipped') && (needs.go.result == 'success' || needs.go.result == 'skipped')
+    needs: [detect, docker, ts, go]
+    if: |
+      always()
+      && needs.detect.outputs.subpackages_to_publish != '[]'
+      && needs.detect.outputs.release == 'true'
+      && (needs.docker.result == 'success' || needs.docker.result == 'skipped')
+      && (needs.ts.result == 'success' || needs.ts.result == 'skipped')
+      && (needs.go.result == 'success' || needs.go.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     strategy:
       matrix:
-        dir: ${{ fromJSON(needs.detect.outputs.subpackages) }}
+        dir: ${{ fromJSON(needs.detect.outputs.subpackages_to_publish) }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -463,20 +429,16 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-
       - name: Publish subpackage to npm + JSR
-        if: needs.detect.outputs.release == 'true'
+        working-directory: ${{ matrix.dir }}
         env:
           # OIDC-only: trusted publishers configured at npmjs.com + jsr.io.
           VERSION: ${{ needs.detect.outputs.version }}
-          SUBDIR: ${{ matrix.dir }}
-        working-directory: ${{ matrix.dir }}
         run: |
           ver="${VERSION#v}"
           pkg="$(npm pkg get name | tr -d '\"')"
           npm pkg set version="$ver"
           node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-          # Skip NPM if version already exists (bootstrap-friendly).
           if npm view "$pkg@$ver" version >/dev/null 2>&1; then
             echo "::notice::npm: $pkg@$ver already published — skipping"
           else

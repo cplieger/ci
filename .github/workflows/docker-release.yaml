@@ -1,22 +1,29 @@
-# Reusable Docker build, sign, attest, and release workflow.
+# Reusable Docker build/sign/SBOM/release workflow.
 #
-# Builds multi-platform images on native GitHub-hosted runners — no QEMU.
-# Default runner mapping (override via `platforms` input):
-#   linux/amd64 → ubuntu-24.04
-#   linux/arm64 → ubuntu-24.04-arm
+# This workflow is exclusively called by cplieger/ci/.github/workflows/release.yaml
+# (the unified central pipeline). It does NOT run cliff or detect changes — those
+# decisions are made centrally and passed in as `version` + `release-needed`.
 #
-# Three-job pipeline:
-#   prepare        : compute version + matrix + tag metadata (x64)
-#   build (matrix) : per-platform native build, push by digest
-#   finalize       : assemble multi-arch manifest, cosign + SBOM + Trivy + release
-#
-# Covers GHCR-only and GHCR+DockerHub variants via the `registries` input.
-
+# Pipeline:
+#   1. prepare:  derive tags from `version`, build per-arch matrix, run metadata-action
+#   2. build:    matrix over linux/amd64+linux/arm64 on native runners (no QEMU);
+#                push each arch by digest, upload digest artifact
+#   3. finalize: download digests → assemble multi-arch manifest via imagetools
+#                → cosign sign+attest → SBOM → Trivy → GitHub Release (gated on
+#                `release-needed`) → Docker Hub README/description sync
 name: Docker Release
 
 on:
   workflow_call:
     inputs:
+      version:
+        description: "SemVer tag computed by the caller (e.g. v1.2.3). Required."
+        type: string
+        required: true
+      release-needed:
+        description: "Whether to create a GitHub Release (cliff bump warranted). 'true' or 'false'."
+        type: string
+        required: true
       image-name:
         description: "Image name (without registry prefix). Defaults to repo name."
         type: string
@@ -26,7 +33,7 @@ on:
         type: string
         default: "ghcr,dockerhub"
       platforms:
-        description: "Linux platforms to build for. Each is mapped to a native runner."
+        description: "Platforms to build for (linux/amd64,linux/arm64)."
         type: string
         default: "linux/amd64,linux/arm64"
       dockerfile:
@@ -38,13 +45,9 @@ on:
         type: string
         default: ""
       sbom-from:
-        description: "'image' scans the pushed manifest list; 'path' extracts binary to /tmp/sbom-src first."
+        description: "'image' scans the pushed image; 'path' extracts binary to /tmp/sbom-src first."
         type: string
         default: "image"
-      skip-build-guard:
-        description: "When true, skip the build if the head commit is by renovate[bot] and contains [skip-build]."
-        type: boolean
-        default: false
     secrets:
       DOCKERHUB_USERNAME:
         required: false
@@ -54,38 +57,29 @@ on:
 env:
   IMAGE_NAME: ${{ github.repository_owner }}/${{ inputs.image-name }}
   REGISTRY: ghcr.io
+  BUILDX_VERSION: v0.30.1
   COSIGN_VERSION: v3.0.6
-  BUILDX_VERSION: v0.34.1
 
 jobs:
   prepare:
-    if: ${{ !inputs.skip-build-guard || !(github.event.head_commit.author.name == 'renovate[bot]' && contains(github.event.head_commit.message, '[skip-build]')) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 3
     permissions:
       contents: read
     outputs:
-      version: ${{ steps.ver.outputs.version }}
-      release: ${{ steps.prep.outputs.release }}
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
       meta-json: ${{ steps.meta.outputs.json }}
       matrix: ${{ steps.matrix.outputs.matrix }}
+      version: ${{ steps.tags.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 0
-
-      - name: Compute SemVer tag
-        id: prep
-        uses: cplieger/ci/actions/git-cliff-version@4e0a6937409828785a87d9eba577315d6cce50e0 # v1
-
       - name: Derive version tags
-        id: ver
+        id: tags
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
         run: |
-          VERSION="${{ steps.prep.outputs.version }}"
-          VERSION="${VERSION#v}"
+          # Strip leading 'v' for arithmetic, then re-emit each tier with 'v' prefix.
+          VERSION="${VERSION_INPUT#v}"
           MAJOR="${VERSION%%.*}"
           MINOR="${VERSION%.*}"
           {
@@ -128,9 +122,9 @@ jobs:
           tags: |
             type=sha,format=long,priority=500
             type=raw,value=latest,priority=400
-            type=raw,value=${{ steps.ver.outputs.major }},priority=300
-            type=raw,value=${{ steps.ver.outputs.minor }},priority=200
-            type=raw,value=${{ steps.ver.outputs.version }},priority=100
+            type=raw,value=${{ steps.tags.outputs.major }},priority=300
+            type=raw,value=${{ steps.tags.outputs.minor }},priority=200
+            type=raw,value=${{ steps.tags.outputs.version }},priority=100
 
       - name: Extract metadata (GHCR only)
         if: ${{ !contains(inputs.registries, 'dockerhub') }}
@@ -142,9 +136,9 @@ jobs:
           tags: |
             type=sha,format=long,priority=500
             type=raw,value=latest,priority=400
-            type=raw,value=${{ steps.ver.outputs.major }},priority=300
-            type=raw,value=${{ steps.ver.outputs.minor }},priority=200
-            type=raw,value=${{ steps.ver.outputs.version }},priority=100
+            type=raw,value=${{ steps.tags.outputs.major }},priority=300
+            type=raw,value=${{ steps.tags.outputs.minor }},priority=200
+            type=raw,value=${{ steps.tags.outputs.version }},priority=100
 
       - name: Consolidate metadata outputs
         id: meta
@@ -156,8 +150,8 @@ jobs:
           GHCR_LABELS: ${{ steps.meta-ghcr.outputs.labels }}
           GHCR_JSON: ${{ steps.meta-ghcr.outputs.json }}
         run: |
-          # Pick whichever metadata variant ran (only one of the two
-          # `if:`-gated steps above produces output for a given run).
+          # Pick whichever metadata variant ran (only one of the two `if:`-gated
+          # steps above produces output for a given run).
           if [ -n "$DUAL_TAGS" ]; then
             TAGS="$DUAL_TAGS"; LABELS="$DUAL_LABELS"; JSON="$DUAL_JSON"
           else
@@ -426,23 +420,24 @@ jobs:
             --type spdxjson \
             "$IMAGE_REF"
 
-      - name: Install git-cliff
-        # Reuse the same composite action prepare uses; this also computes a
-        # version output we ignore (only the binary install matters here).
-        uses: cplieger/ci/actions/git-cliff-version@330a5a25fd3847ef97ea8286ff73c3d3ebf9f198 # v1
-
       - name: Generate release notes
-        run: git-cliff --latest --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
+        if: ${{ inputs.release-needed == 'true' }}
+        run: |
+          # Install git-cliff (only when we're actually creating a release).
+          CLIFF_VERSION=v2.13.1
+          curl -fsSL --retry 3 \
+            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+          git-cliff --latest --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
 
       - name: Create release
-        # Only create a GitHub Release when cliff says a version bump is
-        # warranted (feat/fix/sec etc. since the last tag). Pure
-        # chore/ci/docs pushes still build + push images but reuse the
+        # Only create a GitHub Release when the caller signaled a version bump.
+        # Pure chore/ci/docs pushes still build + push images but reuse the
         # existing tag — gh release create would error otherwise.
-        if: ${{ needs.prepare.outputs.release == 'true' }}
+        if: ${{ inputs.release-needed == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION: ${{ inputs.version }}
         run: |
           gh release create "$VERSION" \
             --title "$VERSION" \
