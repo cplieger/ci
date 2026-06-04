@@ -316,7 +316,7 @@ jobs:
   docker:
     needs: detect
     if: ${{ needs.detect.outputs.type == 'docker' && needs.detect.outputs.root_changed == 'true' }}
-    uses: cplieger/ci/.github/workflows/docker-release.yaml@9f235de8f9e3b9d66d96f1e7a86d62f90da3db9b # main
+    uses: cplieger/ci/.github/workflows/docker-release.yaml@48c4a4e7f1c5f03d99976dd00c21b336ecd658a2 # main
     with:
       version: ${{ needs.detect.outputs.version }}
       release-needed: ${{ needs.detect.outputs.release }}
