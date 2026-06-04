@@ -205,14 +205,16 @@ if [[ ${#ci_repos[@]} -gt 0 ]]; then
 EOF
 fi
 
-# .golangci.yaml — Go-having repos
+# .golangci.yaml + .gremlins.yaml — Go-having repos
 if [[ ${#golangci_repos[@]} -gt 0 ]]; then
   echo ""
-  echo "  # .golangci.yaml (Go-having repos)"
+  echo "  # Go-tooling configs (Go-having repos)"
   emit_repos golangci_repos
   cat << 'EOF'
     files:
       - .golangci.yaml
+      - source: configs/gremlins.yaml
+        dest: .gremlins.yaml
 EOF
 fi
 

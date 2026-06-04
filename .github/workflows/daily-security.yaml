@@ -1,0 +1,69 @@
+# Daily security scan across all cplieger consumer repos.
+# Pattern C: matrix + max-parallel cap owned here.
+#
+# Schedule:           Daily 03:00 UTC
+# Concurrency cap:    4 jobs in parallel — security is brief (~3 min/repo);
+#                     low cap is fine and leaves the rest of the 20-slot
+#                     budget for ad-hoc work
+# What it does:       Dispatches `security.yml` (the synced consumer security
+#                     workflow) on every consumer repo. Trivy fs scan on all
+#                     repos; Trivy image scan additionally on Dockerfile
+#                     repos. Auto-detected by `security.yml`.
+name: Daily security scan
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # daily 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-security
+  cancel-in-progress: false
+
+jobs:
+  fanout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.fanout.outputs.matrix }}
+    steps:
+      - name: Discover repos with security.yml
+        id: fanout
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+        run: |
+          set -euo pipefail
+          repos=$(gh repo list cplieger --limit 300 --json name,isArchived --jq '
+            [.[] | select(.isArchived == false) | .name] | .[]
+          ')
+          REPOS=()
+          for r in $repos; do
+            if gh workflow view security.yml -R "cplieger/${r}" >/dev/null 2>&1; then
+              REPOS+=("$r")
+            fi
+          done
+          matrix=$(printf '%s\n' "${REPOS[@]}" | jq -R . | jq -s -c '[.[] | {repo: .}]')
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Total repos: $(echo "$matrix" | jq 'length')"
+
+  dispatch:
+    needs: fanout
+    if: ${{ needs.fanout.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4   # security scan is brief; cap low to free slots for ad-hoc work
+      matrix:
+        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+    steps:
+      - name: Trigger security.yml on cplieger/${{ matrix.repo }}
+        run: |
+          gh workflow run security.yml -R "cplieger/${{ matrix.repo }}" --ref main

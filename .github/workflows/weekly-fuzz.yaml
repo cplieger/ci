@@ -1,0 +1,179 @@
+# Weekly fuzz exploration across all Go-having cplieger consumer repos.
+# Pattern C: matrix + max-parallel cap owned here, not via cross-repo
+# workflow_dispatch. One place to manage the fleet-wide fuzz schedule and
+# the issue-creation/auto-close logic for findings.
+#
+# Schedule:           Wednesdays 22:00 UTC (mid-week off-peak; different day
+#                     from gremlins-Sunday and security-daily so they never
+#                     fight for the 20-slot account budget)
+# Concurrency cap:    6 jobs in parallel (≥4 slots reserved for ad-hoc work)
+# Fuzz budget:        2 minutes per target — accumulates exploration depth
+#                     across weeks since each run starts from the existing
+#                     testdata/fuzz/ corpus
+# Reporting:          Per-finding GitHub issue in the consumer repo. Opens
+#                     when fuzz writes a new failing seed; auto-closes when
+#                     the seed gets committed to testdata/fuzz/. Idempotent
+#                     across runs.
+name: Weekly fuzz
+
+on:
+  schedule:
+    - cron: "0 22 * * 3"   # Wednesday 22:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-fuzz
+  cancel-in-progress: false
+
+jobs:
+  fanout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.fanout.outputs.matrix }}
+    steps:
+      - name: Discover Go-having repos with fuzz targets
+        id: fanout
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+        run: |
+          set -euo pipefail
+          repos=$(gh repo list cplieger --limit 300 --json name,isArchived --jq '
+            [.[] | select(.isArchived == false) | .name] | .[]
+          ')
+          REPOS=()
+          for r in $repos; do
+            gh api "/repos/cplieger/${r}/contents/go.mod" --silent 2>/dev/null || continue
+            # Heuristic: if any *_test.go file contains "func Fuzz", include.
+            has_fuzz=$(gh api "/repos/cplieger/${r}/git/trees/main?recursive=1" \
+              --jq '[.tree[] | select(.type=="blob" and (.path | test("_test\\.go$")))] | length' 2>/dev/null)
+            if [ "${has_fuzz:-0}" -gt 0 ]; then
+              REPOS+=("$r")
+            fi
+          done
+          matrix=$(printf '%s\n' "${REPOS[@]}" | jq -R . | jq -s -c '[.[] | {repo: .}]')
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Total repos: $(echo "$matrix" | jq 'length')"
+
+  run:
+    needs: fanout
+    if: ${{ needs.fanout.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240   # generous: 100 targets × 2m + overhead = ~3.5h
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+      FUZZ_TIME: 2m
+    steps:
+      - name: Clone target repo
+        run: gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v6.0.0
+        with:
+          go-version-file: target/go.mod
+          cache: false
+
+      - name: Run fuzz on every target
+        continue-on-error: true
+        working-directory: target
+        run: |
+          : > /tmp/fuzz-output.log
+          rc=0
+          echo "fuzz budget per target: ${FUZZ_TIME}"
+          for pkg in $(go list ./...); do
+            for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep -E '^Fuzz' || true); do
+              echo "::group::fuzz ${fn} (${pkg})"
+              go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME}" "$pkg" 2>&1 | tee -a /tmp/fuzz-output.log || rc=1
+              echo "::endgroup::"
+            done
+          done
+          # Surface findings (non-fatal — issue creation in next step).
+          grep -c "Failing input written to" /tmp/fuzz-output.log || true
+
+      - name: Open / update issues for findings
+        if: always()
+        working-directory: target
+        env:
+          REPO: cplieger/${{ matrix.repo }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -s /tmp/fuzz-output.log ] || { echo "no fuzz output"; exit 0; }
+          findings=$(awk '
+            /Failing input written to testdata\/fuzz\// {
+              match($0, /testdata\/fuzz\/[^[:space:]]+/);
+              path = substr($0, RSTART, RLENGTH);
+              n = split(path, parts, "/");
+              hash = parts[n];
+              target = parts[n-1];
+              printf "%s|%s|%s\n", target, hash, path;
+            }
+          ' /tmp/fuzz-output.log | sort -u)
+          [ -z "$findings" ] && { echo "no committable findings"; exit 0; }
+
+          echo "$findings" | while IFS='|' read -r target hash path; do
+            title="[fuzz] ${target} regression — ${hash}"
+            existing=$(gh issue list --repo "$REPO" --state open --search "${title} in:title" \
+              --json number,title --jq '.[] | select(.title == "'"$title"'") | .number' | head -1)
+            seed_size=$(wc -c < "$path" 2>/dev/null || echo 0)
+            seed_preview=$(head -c 500 "$path" 2>/dev/null | base64 | head -c 800)
+            body=$(cat <<EOF
+          **Target**: \`${target}\`
+          **Reproducer hash**: \`${hash}\`
+          **Found in**: ${RUN_URL}
+
+          **Reproduce locally:**
+
+          \`\`\`bash
+          go test -run='^${target}\$/${hash}' ./...
+          \`\`\`
+
+          **Seed file**: \`${path}\` (${seed_size} bytes, base64 preview):
+
+          \`\`\`
+          ${seed_preview}
+          \`\`\`
+
+          ---
+
+          Auto-created by the weekly fuzz run. Auto-closes when the seed file at
+          \`${path}\` is committed to the repo (becomes a deterministic regression
+          test in the seed corpus → exercised by every PR's \`Test (race)\` step).
+          EOF
+            )
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$REPO" --body "Recurred in ${RUN_URL}" >/dev/null
+              echo "  updated #${existing}: ${title}"
+            else
+              gh issue create --repo "$REPO" --title "$title" --body "$body" \
+                --label fuzz-finding,auto-generated >/dev/null
+              echo "  created: ${title}"
+            fi
+          done
+
+      - name: Auto-close fuzz issues whose seed was committed
+        if: always()
+        working-directory: target
+        env:
+          REPO: cplieger/${{ matrix.repo }}
+        run: |
+          gh issue list --repo "$REPO" --state open --label fuzz-finding --limit 100 \
+            --json number,title --jq '.[] | "\(.number)|\(.title)"' | while IFS='|' read -r n title; do
+            target=$(echo "$title" | sed -nE 's|^\[fuzz\] ([A-Za-z][A-Za-z0-9_]*) regression .+$|\1|p')
+            hash=$(echo "$title" | sed -nE 's|^.+ — ([a-f0-9]+)$|\1|p')
+            [ -z "$target" ] || [ -z "$hash" ] && continue
+            if find testdata/fuzz -path "*/${target}/${hash}" -print -quit 2>/dev/null | grep -q .; then
+              gh issue close "$n" --repo "$REPO" \
+                --comment "Closed automatically: seed at \`testdata/fuzz/${target}/${hash}\` was committed → now part of the deterministic regression corpus." >/dev/null
+              echo "  closed #${n}"
+            fi
+          done

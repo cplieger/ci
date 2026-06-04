@@ -17,7 +17,6 @@ on:
 
 permissions:
   contents: read
-  issues: write   # forwarded to go-ci.yaml's weekly fuzz-finding issue creator
 
 jobs:
   ci:
