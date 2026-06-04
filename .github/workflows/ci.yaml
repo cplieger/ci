@@ -88,7 +88,7 @@ jobs:
   go:
     needs: detect
     if: ${{ needs.detect.outputs.run_go == 'true' }}
-    uses: cplieger/ci/.github/workflows/go-ci.yaml@a11d032fed6e0e9c7f7bf76438a41b9020e03851 # main
+    uses: cplieger/ci/.github/workflows/go-ci.yaml@0859dd1eb6457508a3ca1236d1507a895a7f562e # main
 
   ts:
     needs: detect
