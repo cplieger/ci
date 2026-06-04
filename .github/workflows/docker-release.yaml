@@ -414,17 +414,13 @@ jobs:
             --type spdxjson \
             "$IMAGE_REF"
 
+      - name: Install git-cliff
+        # Reuse the same composite action prepare uses; this also computes a
+        # version output we ignore (only the binary install matters here).
+        uses: cplieger/ci/actions/git-cliff-version@330a5a25fd3847ef97ea8286ff73c3d3ebf9f198 # v1
+
       - name: Generate release notes
-        run: |
-          # Reuse the cliff binary installed by the prepare job's
-          # git-cliff-version action — but that ran in a different job, so
-          # download fresh here. Same logic as in actions/git-cliff-version.
-          # renovate: datasource=github-releases depName=orhun/git-cliff
-          CLIFF_VERSION=v2.13.1
-          curl -fsSL --retry 3 \
-            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          git-cliff --latest --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
+        run: git-cliff --latest --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
 
       - name: Create release
         env:
