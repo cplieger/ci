@@ -98,7 +98,7 @@ jobs:
         if: ${{ github.event.repository.private == false || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         continue-on-error: true
         env:
-          FUZZ_TIME: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '20s' || '2s' }}
+          FUZZ_TIME: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '30s' || '5s' }}
         run: |
           (
             rc=0
