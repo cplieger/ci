@@ -20,6 +20,8 @@ on:
 
 permissions:
   contents: read
+  issues: write  # needed by the weekly fuzz run to open/comment/close GitHub issues
+                 # for fuzz findings — see "Report fuzz findings as GitHub issues" step.
 
 jobs:
   validate:
@@ -101,15 +103,119 @@ jobs:
           (
             rc=0
             echo "fuzz budget per target: ${FUZZ_TIME}"
+            : > /tmp/fuzz-output.log
             for pkg in $(go list ./...); do
               for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep -E '^Fuzz' || true); do
                 echo "::group::fuzz ${fn} (${pkg})"
-                go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME}" "$pkg" || rc=1
+                go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME}" "$pkg" 2>&1 | tee -a /tmp/fuzz-output.log || rc=1
                 echo "::endgroup::"
               done
             done
             exit $rc
           ) || { echo "fuzz" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Report fuzz findings as GitHub issues
+        # Idempotent: open a GitHub issue per (target, hash) finding, comment on
+        # recurrence, no-op if no findings or if a matching issue is already open.
+        # Only "Failing input written to testdata/fuzz/..." entries are reported
+        # (those are reproducible bugs); transient "context deadline exceeded"
+        # timeouts are skipped (they're flaky inputs that don't get a seed file).
+        if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -s /tmp/fuzz-output.log ] || { echo "no fuzz output captured"; exit 0; }
+
+          # Extract (target, hash, path) tuples for findings that wrote a seed file.
+          findings=$(awk '
+            /Failing input written to testdata\/fuzz\// {
+              match($0, /testdata\/fuzz\/[^[:space:]]+/);
+              path = substr($0, RSTART, RLENGTH);
+              n = split(path, parts, "/");
+              hash = parts[n];
+              target = parts[n-1];
+              printf "%s|%s|%s\n", target, hash, path;
+            }
+          ' /tmp/fuzz-output.log | sort -u)
+
+          if [ -z "$findings" ]; then
+            echo "no committable fuzz findings (any FAILs were transient deadline-exceeded timeouts)"
+            exit 0
+          fi
+
+          echo "$findings" | while IFS='|' read -r target hash path; do
+            title="[fuzz] ${target} regression — ${hash}"
+            existing=$(gh issue list --repo "$REPO" --state open --search "${title} in:title" --json number,title \
+              --jq '.[] | select(.title == "'"$title"'") | .number' | head -1)
+
+            seed_size=$(wc -c < "$path" 2>/dev/null || echo 0)
+            seed_preview=$(head -c 500 "$path" 2>/dev/null | base64 | head -c 800)
+
+            body=$(cat <<BODY
+          **Target**: \`${target}\`
+          **Reproducer hash**: \`${hash}\`
+          **Found in**: ${RUN_URL}
+
+          **Reproduce locally:**
+
+          \`\`\`bash
+          go test -run='^${target}\$/${hash}' ./...
+          \`\`\`
+
+          **Seed file**: \`${path}\` (${seed_size} bytes, base64 preview):
+
+          \`\`\`
+          ${seed_preview}
+          \`\`\`
+
+          ---
+
+          This issue is auto-created by the weekly fuzz run. It will be auto-closed by a
+          subsequent weekly run when:
+
+          - the seed file at \`${path}\` is committed to the repo (the input becomes a
+            deterministic regression test in the seed corpus → PR's \`Test (race)\` step
+            will catch it on every push), OR
+          - the failure no longer reproduces.
+          BODY
+          )
+
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$REPO" --body "Recurred in ${RUN_URL}" >/dev/null
+              echo "  updated existing issue #${existing}: ${title}"
+            else
+              gh issue create --repo "$REPO" --title "$title" --body "$body" \
+                --label fuzz-finding,auto-generated >/dev/null
+              echo "  created new issue: ${title}"
+            fi
+          done
+
+      - name: Auto-close fuzz issues whose seed has been committed
+        # Each weekly run, list open fuzz-finding issues; for each, parse the
+        # seed path from the title (hash portion) and check the repo for that
+        # file at HEAD. If present, the seed is now in the deterministic corpus
+        # and the issue can be closed.
+        if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh issue list --repo "$REPO" --state open --label fuzz-finding --limit 100 \
+            --json number,title --jq '.[] | "\(.number)|\(.title)"' | while IFS='|' read -r n title; do
+            # title format: "[fuzz] <target> regression — <hash>"
+            target=$(echo "$title" | sed -nE 's|^\[fuzz\] ([A-Za-z][A-Za-z0-9_]*) regression .+$|\1|p')
+            hash=$(echo "$title" | sed -nE 's|^.+ — ([a-f0-9]+)$|\1|p')
+            [ -z "$target" ] || [ -z "$hash" ] && continue
+
+            # Find any testdata/fuzz/<target>/<hash> file (target may live under any package).
+            if find testdata/fuzz -path "*/${target}/${hash}" -print -quit 2>/dev/null | grep -q .; then
+              gh issue close "$n" --repo "$REPO" \
+                --comment "Closed automatically: seed at \`testdata/fuzz/${target}/${hash}\` was committed and is now part of the deterministic regression corpus." >/dev/null
+              echo "  closed #${n}: seed committed for ${target}/${hash}"
+            fi
+          done
 
       - name: Govulncheck
         continue-on-error: true
