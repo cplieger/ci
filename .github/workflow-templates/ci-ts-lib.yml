@@ -14,6 +14,6 @@ permissions:
 
 jobs:
   ci:
-    uses: cplieger/ci/.github/workflows/ts-ci.yaml@2eaa3359c4d601496b2168cf4f8a474cd5a1c74b # v1
+    uses: cplieger/ci/.github/workflows/ts-ci.yaml@49ec4be725bc5117be1181418964b0df22bd87d8 # v1
     with:
       working-directory: "."
