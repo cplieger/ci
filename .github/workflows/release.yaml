@@ -75,7 +75,7 @@ jobs:
 
       - name: Compute version (cliff)
         id: cliff
-        uses: cplieger/ci/actions/git-cliff-version@7325de0a1725cfec5ace8b34c52ead7260b836e5 # main
+        uses: cplieger/ci/actions/git-cliff-version@5131053dbe9ad6c35ec18e29a17b14a037d16cc6 # main
 
       - name: Detect type + subpackages
         id: type
@@ -310,7 +310,7 @@ jobs:
   docker:
     needs: detect
     if: ${{ needs.detect.outputs.type == 'docker' && needs.detect.outputs.root_changed == 'true' }}
-    uses: cplieger/ci/.github/workflows/docker-release.yaml@7325de0a1725cfec5ace8b34c52ead7260b836e5 # main
+    uses: cplieger/ci/.github/workflows/docker-release.yaml@5131053dbe9ad6c35ec18e29a17b14a037d16cc6 # main
     with:
       version: ${{ needs.detect.outputs.version }}
       release-needed: ${{ needs.detect.outputs.release }}
