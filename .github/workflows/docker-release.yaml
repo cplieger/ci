@@ -66,6 +66,7 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      release: ${{ steps.prep.outputs.release }}
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
       meta-json: ${{ steps.meta.outputs.json }}
@@ -434,6 +435,11 @@ jobs:
         run: git-cliff --latest --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
 
       - name: Create release
+        # Only create a GitHub Release when cliff says a version bump is
+        # warranted (feat/fix/sec etc. since the last tag). Pure
+        # chore/ci/docs pushes still build + push images but reuse the
+        # existing tag — gh release create would error otherwise.
+        if: ${{ needs.prepare.outputs.release == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
