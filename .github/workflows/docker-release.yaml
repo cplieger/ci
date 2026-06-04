@@ -311,10 +311,18 @@ jobs:
           done
 
           # --metadata-file captures the index digest deterministically.
+          # Format (per Docker docs): { "containerimage.descriptor": { "digest": "sha256:...", ... }, "image.name": "..." }
+          # Note: this is different from build-push-action's metadata which uses
+          # a flat "containerimage.digest" key.
           # shellcheck disable=SC2086
           docker buildx imagetools create --metadata-file /tmp/manifest-meta.json $tag_args $src_args
 
-          digest=$(jq -r '."containerimage.digest"' /tmp/manifest-meta.json)
+          digest=$(jq -r '."containerimage.descriptor".digest' /tmp/manifest-meta.json)
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "::error::Failed to extract manifest digest from imagetools metadata"
+            cat /tmp/manifest-meta.json
+            exit 1
+          fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Manifest digest: $digest"
 
