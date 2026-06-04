@@ -398,10 +398,13 @@ jobs:
         run: cosign sign --yes --recursive "$IMAGE_REF"
 
       - name: Attest SBOM to GHCR
+        # NOTE: cosign attest does not support --recursive (that's a sign-only
+        # flag). The attestation is scoped to the manifest list digest;
+        # verifiers resolve through the index to find the attestation.
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
-          cosign attest --yes --recursive \
+          cosign attest --yes \
             --predicate sbom.spdx.json \
             --type spdxjson \
             "$IMAGE_REF"
@@ -417,7 +420,7 @@ jobs:
         env:
           IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
-          cosign attest --yes --recursive \
+          cosign attest --yes \
             --predicate sbom.spdx.json \
             --type spdxjson \
             "$IMAGE_REF"
