@@ -119,42 +119,19 @@ jobs:
           # Gremlins exits 0 on success regardless of efficacy (we set
           # threshold=0). It exits non-zero only on internal errors.
           gremlins unleash --output /tmp/gremlins-out.json . || echo "::warning::gremlins reported non-zero (continuing)"
-
-          # Parse the JSON to extract aggregate counts. Format from gremlins:
-          #   {"mutants":[{"status":"KILLED|LIVED|NOT_COVERED|RUNNABLE|TIMED_OUT|NOT_VIABLE", ...}]}
           if [ ! -s /tmp/gremlins-out.json ]; then
-            echo "::warning::no gremlins output — emitting zeros"
-            echo '{"killed":0,"lived":0,"not_covered":0,"timed_out":0,"not_viable":0,"runnable":0,"efficacy":0,"mutant_coverage":0}' > /tmp/gremlins-summary.json
-          else
-            jq '
-              .mutants // [] | reduce .[] as $m ({killed:0,lived:0,not_covered:0,timed_out:0,not_viable:0};
-                if   $m.status == "KILLED"      then .killed      += 1
-                elif $m.status == "LIVED"       then .lived       += 1
-                elif $m.status == "NOT_COVERED" then .not_covered += 1
-                elif $m.status == "TIMED_OUT"   then .timed_out   += 1
-                elif $m.status == "NOT_VIABLE"  then .not_viable  += 1
-                else . end)
-              | . + {
-                  runnable: (.killed + .lived + .timed_out),
-                  efficacy: (if (.killed + .lived + .timed_out) > 0
-                             then ((.killed + .timed_out) * 1000 / (.killed + .lived + .timed_out) | round / 10)
-                             else 0 end),
-                  mutant_coverage: (if (.killed + .lived + .not_covered + .timed_out) > 0
-                             then ((.killed + .lived + .timed_out) * 1000 / (.killed + .lived + .not_covered + .timed_out) | round / 10)
-                             else 0 end)
-                }
-            ' /tmp/gremlins-out.json > /tmp/gremlins-summary.json
+            echo "::warning::no gremlins output — emitting empty mutants list"
+            echo '{"mutants":[]}' > /tmp/gremlins-out.json
           fi
-          cat /tmp/gremlins-summary.json
 
-      - name: Upload per-attempt summary
+      - name: Upload full mutants.json (artifact, 90-day retention)
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gremlins-${{ matrix.repo }}-${{ matrix.attempt }}
-          path: /tmp/gremlins-summary.json
+          path: /tmp/gremlins-out.json
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 90
 
   aggregate:
     needs: [fanout, run]
