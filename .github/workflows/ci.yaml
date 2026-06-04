@@ -88,17 +88,17 @@ jobs:
   go:
     needs: detect
     if: ${{ needs.detect.outputs.run_go == 'true' }}
-    uses: cplieger/ci/.github/workflows/go-ci.yaml@5131053dbe9ad6c35ec18e29a17b14a037d16cc6 # main
+    uses: cplieger/ci/.github/workflows/go-ci.yaml@3489ced291df9d513710fcb47b93cf486c37850d # main
 
   ts:
     needs: detect
     if: ${{ needs.detect.outputs.run_ts == 'true' }}
-    uses: cplieger/ci/.github/workflows/ts-ci.yaml@5131053dbe9ad6c35ec18e29a17b14a037d16cc6 # main
+    uses: cplieger/ci/.github/workflows/ts-ci.yaml@3489ced291df9d513710fcb47b93cf486c37850d # main
 
   web:
     needs: detect
     if: ${{ needs.detect.outputs.run_web == 'true' }}
-    uses: cplieger/ci/.github/workflows/ts-ci.yaml@5131053dbe9ad6c35ec18e29a17b14a037d16cc6 # main
+    uses: cplieger/ci/.github/workflows/ts-ci.yaml@3489ced291df9d513710fcb47b93cf486c37850d # main
     with:
       working-directory: ${{ needs.detect.outputs.web_dir }}
       web-lint: true
@@ -106,7 +106,7 @@ jobs:
   shell:
     needs: detect
     if: ${{ needs.detect.outputs.run_shell == 'true' }}
-    uses: cplieger/ci/.github/workflows/shell-ci.yaml@5131053dbe9ad6c35ec18e29a17b14a037d16cc6 # main
+    uses: cplieger/ci/.github/workflows/shell-ci.yaml@3489ced291df9d513710fcb47b93cf486c37850d # main
 
   # Aggregator — emits a single `ci / validate` check name that branch
   # protection rules can target (preserves the check name from the previous
