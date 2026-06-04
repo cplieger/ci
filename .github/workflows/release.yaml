@@ -284,12 +284,6 @@ jobs:
           esac
 
           case "$REPO_NAME" in
-            # arm64-only (amd64 build is currently broken or untested).
-            docker-nut-upsd|docker-smtp-relay)
-              PLATFORMS="linux/arm64" ;;
-          esac
-
-          case "$REPO_NAME" in
             # SBOM from extracted binary path (image-level scan misses static
             # Go deps for these builds).
             vibecli|vibekit)
