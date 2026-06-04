@@ -1,5 +1,17 @@
 # Reusable Docker build, sign, attest, and release workflow.
+#
+# Builds multi-platform images on native GitHub-hosted runners — no QEMU.
+# Default runner mapping (override via `platforms` input):
+#   linux/amd64 → ubuntu-24.04
+#   linux/arm64 → ubuntu-24.04-arm
+#
+# Three-job pipeline:
+#   prepare        : compute version + matrix + tag metadata (x64)
+#   build (matrix) : per-platform native build, push by digest
+#   finalize       : assemble multi-arch manifest, cosign + SBOM + Trivy + release
+#
 # Covers GHCR-only and GHCR+DockerHub variants via the `registries` input.
+
 name: Docker Release
 
 on:
@@ -14,7 +26,7 @@ on:
         type: string
         default: "ghcr,dockerhub"
       platforms:
-        description: "Platforms to build for."
+        description: "Linux platforms to build for. Each is mapped to a native runner."
         type: string
         default: "linux/amd64,linux/arm64"
       dockerfile:
@@ -26,13 +38,9 @@ on:
         type: string
         default: ""
       sbom-from:
-        description: "'image' scans the pushed image; 'path' extracts binary to /tmp/sbom-src first."
+        description: "'image' scans the pushed manifest list; 'path' extracts binary to /tmp/sbom-src first."
         type: string
         default: "image"
-      notify-repo:
-        description: "Repository (owner/name) to send a repository_dispatch to. Empty = skip."
-        type: string
-        default: ""
       skip-build-guard:
         description: "When true, skip the build if the head commit is by renovate[bot] and contains [skip-build]."
         type: boolean
@@ -42,54 +50,35 @@ on:
         required: false
       DOCKERHUB_TOKEN:
         required: false
-      HOMELAB_DISPATCH_TOKEN:
-        required: false
 
 env:
   IMAGE_NAME: ${{ github.repository_owner }}/${{ inputs.image-name }}
   REGISTRY: ghcr.io
+  COSIGN_VERSION: v3.0.6
+  BUILDX_VERSION: v0.34.1
 
 jobs:
-  build:
+  prepare:
     if: ${{ !inputs.skip-build-guard || !(github.event.head_commit.author.name == 'renovate[bot]' && contains(github.event.head_commit.message, '[skip-build]')) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 5
     permissions:
-      contents: write
-      packages: write
-      id-token: write
-      attestations: write
-      security-events: write
-
+      contents: read
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
+      meta-json: ${{ steps.meta.outputs.json }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Log in to Docker Hub
-        if: ${{ contains(inputs.registries, 'dockerhub') }}
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Compute SemVer tag
         id: prep
-        uses: cplieger/ci/actions/git-cliff-version@2c6289a7dee062be6411c1cd0d3ab4f784d75f1e # v1
+        uses: cplieger/ci/actions/git-cliff-version@4e0a6937409828785a87d9eba577315d6cce50e0 # v1
 
       - name: Derive version tags
         id: ver
@@ -103,6 +92,29 @@ jobs:
             echo "major=v${MAJOR}"
             echo "minor=v${MINOR}"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Compute build matrix
+        id: matrix
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          # Map each platform to a native GitHub-hosted runner.
+          # linux/arm* → ubuntu-24.04-arm; everything else → ubuntu-24.04.
+          # Emit a JSON array consumed by the build job's strategy.matrix.
+          matrix='[]'
+          IFS=','
+          for p in $PLATFORMS; do
+            p=$(echo "$p" | xargs)
+            case "$p" in
+              linux/arm*) runner="ubuntu-24.04-arm" ;;
+              *)          runner="ubuntu-24.04" ;;
+            esac
+            name="${p//\//-}"
+            matrix=$(jq -c --arg p "$p" --arg r "$runner" --arg n "$name" \
+              '. + [{platform: $p, runner: $r, name: $n}]' <<<"$matrix")
+          done
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Matrix: $matrix"
 
       - name: Extract metadata (GHCR + Docker Hub)
         if: ${{ contains(inputs.registries, 'dockerhub') }}
@@ -133,35 +145,184 @@ jobs:
             type=raw,value=${{ steps.ver.outputs.minor }},priority=200
             type=raw,value=${{ steps.ver.outputs.version }},priority=100
 
-      - name: Build and push
-        id: push
+      - name: Consolidate metadata outputs
+        id: meta
+        env:
+          DUAL_TAGS: ${{ steps.meta-dual.outputs.tags }}
+          DUAL_LABELS: ${{ steps.meta-dual.outputs.labels }}
+          DUAL_JSON: ${{ steps.meta-dual.outputs.json }}
+          GHCR_TAGS: ${{ steps.meta-ghcr.outputs.tags }}
+          GHCR_LABELS: ${{ steps.meta-ghcr.outputs.labels }}
+          GHCR_JSON: ${{ steps.meta-ghcr.outputs.json }}
+        run: |
+          # Pick whichever metadata variant ran (only one of the two
+          # `if:`-gated steps above produces output for a given run).
+          if [ -n "$DUAL_TAGS" ]; then
+            TAGS="$DUAL_TAGS"; LABELS="$DUAL_LABELS"; JSON="$DUAL_JSON"
+          else
+            TAGS="$GHCR_TAGS"; LABELS="$GHCR_LABELS"; JSON="$GHCR_JSON"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+            echo "labels<<EOF"
+            echo "$LABELS"
+            echo "EOF"
+            echo "json<<EOF"
+            echo "$JSON"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Log in to Docker Hub
+        if: ${{ contains(inputs.registries, 'dockerhub') }}
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: ${{ inputs.dockerfile }}
-          platforms: ${{ inputs.platforms }}
-          push: true
+          platforms: ${{ matrix.platform }}
+          labels: ${{ needs.prepare.outputs.labels }}
           provenance: true
-          tags: ${{ steps.meta-dual.outputs.tags || steps.meta-ghcr.outputs.tags }}
-          labels: ${{ steps.meta-dual.outputs.labels || steps.meta-ghcr.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # push-by-digest writes the per-arch image to GHCR (and Docker Hub
+          # if logged in) under a digest-only ref — no human-readable tags
+          # at this stage. The finalize job assembles the multi-arch manifest
+          # at the user-facing tags by referencing these digests.
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
-      - name: Extract binary for SBOM
-        if: ${{ inputs.sbom-from == 'path' }}
-        env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+      - name: Export digest
         run: |
-          docker pull "$IMAGE_REF"
-          CID=$(docker create "$IMAGE_REF")
-          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
-          mkdir -p /tmp/sbom-src
-          docker cp "$CID:/app/${{ inputs.image-name }}" /tmp/sbom-src/${{ inputs.image-name }}
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          # Filename = matrix.name (e.g. linux-amd64); content = the digest.
+          echo "$digest" > "/tmp/digests/${{ matrix.name }}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4.6.0
+        with:
+          name: digests-${{ matrix.name }}
+          path: /tmp/digests/${{ matrix.name }}
+          if-no-files-found: error
+          retention-days: 1
+
+  finalize:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+      version: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Download digests
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4.2.1
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Log in to Docker Hub
+        if: ${{ contains(inputs.registries, 'dockerhub') }}
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        id: manifest
+        env:
+          TAGS: ${{ needs.prepare.outputs.tags }}
+        run: |
+          # Build the imagetools args:
+          #   one -t per user-facing tag (latest, vMAJ, vMAJ.MIN, vMAJ.MIN.PATCH, sha-...)
+          #   one source per per-arch digest pushed in the matrix step
+          # imagetools writes a manifest list (a.k.a. OCI image index) at every -t
+          # tag, all pointing at the same set of per-arch images.
+          tag_args=""
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            tag_args="$tag_args -t $tag"
+          done <<< "$TAGS"
+
+          src_args=""
+          for f in /tmp/digests/*; do
+            d=$(cat "$f")
+            src_args="$src_args ${REGISTRY}/${IMAGE_NAME}@${d}"
+          done
+
+          # --metadata-file captures the index digest deterministically.
+          # shellcheck disable=SC2086
+          docker buildx imagetools create --metadata-file /tmp/manifest-meta.json $tag_args $src_args
+
+          digest=$(jq -r '."containerimage.digest"' /tmp/manifest-meta.json)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Manifest digest: $digest"
 
       - name: Trivy scan published image
+        continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
           format: 'sarif'
           output: 'trivy-image.sarif'
           severity: 'HIGH,CRITICAL'
@@ -175,11 +336,26 @@ jobs:
           sarif_file: 'trivy-image.sarif'
           category: 'trivy-image-build'
 
+      - name: Extract binary for SBOM (path mode)
+        if: ${{ inputs.sbom-from == 'path' }}
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+        run: |
+          # path-mode SBOM: pull the multi-arch image (Docker resolves to the
+          # finalize-job's host arch, amd64), extract /app/<image-name>, then
+          # syft scans the binary directly. Used by Go apps where syft on the
+          # image misses the static binary's deps.
+          docker pull "$IMAGE_REF"
+          CID=$(docker create "$IMAGE_REF")
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+          mkdir -p /tmp/sbom-src
+          docker cp "$CID:/app/${{ inputs.image-name }}" /tmp/sbom-src/${{ inputs.image-name }}
+
       - name: Generate SBOM (from image)
         if: ${{ inputs.sbom-from == 'image' && inputs.syft-config == '' }}
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
           upload-release-assets: false
@@ -188,7 +364,7 @@ jobs:
         if: ${{ inputs.sbom-from == 'image' && inputs.syft-config != '' }}
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
           upload-release-assets: false
@@ -205,45 +381,55 @@ jobs:
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
 
-      - name: Sign GHCR image
+      - name: Sign GHCR manifest (recursive — covers per-arch images too)
         env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-        run: cosign sign --yes "$IMAGE_REF"
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+        run: cosign sign --yes --recursive "$IMAGE_REF"
 
       - name: Attest SBOM to GHCR
         env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
-          cosign attest --yes \
+          cosign attest --yes --recursive \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            "$IMAGE_REF"
+
+      - name: Sign Docker Hub manifest (recursive)
+        if: ${{ contains(inputs.registries, 'dockerhub') }}
+        env:
+          IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+        run: cosign sign --yes --recursive "$IMAGE_REF"
+
+      - name: Attest SBOM to Docker Hub
+        if: ${{ contains(inputs.registries, 'dockerhub') }}
+        env:
+          IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+        run: |
+          cosign attest --yes --recursive \
             --predicate sbom.spdx.json \
             --type spdxjson \
             "$IMAGE_REF"
 
       - name: Generate release notes
         run: |
+          # Reuse the cliff binary installed by the prepare job's
+          # git-cliff-version action — but that ran in a different job, so
+          # download fresh here. Same logic as in actions/git-cliff-version.
+          # renovate: datasource=github-releases depName=orhun/git-cliff
+          CLIFF_VERSION=v2.13.1
+          curl -fsSL --retry 3 \
+            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
           git-cliff --latest --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
-
-      - name: Sign Docker Hub image
-        if: ${{ contains(inputs.registries, 'dockerhub') }}
-        env:
-          IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-        run: cosign sign --yes "$IMAGE_REF"
-
-      - name: Attest SBOM to Docker Hub
-        if: ${{ contains(inputs.registries, 'dockerhub') }}
-        env:
-          IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-        run: |
-          cosign attest --yes \
-            --predicate sbom.spdx.json \
-            --type spdxjson \
-            "$IMAGE_REF"
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           gh release create "$VERSION" \
             --title "$VERSION" \
@@ -277,5 +463,3 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}
           readme-filepath: README.md
-
-
