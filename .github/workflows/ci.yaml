@@ -1,0 +1,109 @@
+# Unified CI pipeline. Single entry point for all releaseable consumer repos.
+#
+# Mirrors the unified release.yaml architecture: a thin caller in each consumer
+# repo invokes this meta workflow, which auto-detects the repo's surfaces and
+# dispatches to the right reusable workflow. No per-repo config files; no
+# per-type templates.
+#
+# Detection (all independent — a hybrid repo runs multiple jobs in parallel):
+#   - has go.mod              → `go` job:    go-ci.yaml at root
+#   - has jsr.json at root    → `ts` job:    ts-ci.yaml at root (no web-lint)
+#   - has Dockerfile          → `shell` job: shell-ci.yaml (actionlint + hadolint
+#                                            + shellcheck nullglob-safe + gitleaks)
+#   - has nested web frontend → `web` job:   ts-ci.yaml at the detected dir,
+#                                            web-lint=true (HTML+CSS lints)
+#
+# Web-frontend nested directory probe order:
+#   static-src/  →  web/  →  internal/server/static-src/
+# First match (with package.json or jsr.json inside) wins. New patterns can be
+# added to the array below — adding a path is centralized, not per-repo.
+name: CI
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      run_go: ${{ steps.detect.outputs.run_go }}
+      run_ts: ${{ steps.detect.outputs.run_ts }}
+      run_web: ${{ steps.detect.outputs.run_web }}
+      run_shell: ${{ steps.detect.outputs.run_shell }}
+      web_dir: ${{ steps.detect.outputs.web_dir }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Detect repo surfaces
+        id: detect
+        run: |
+          run_go=false
+          run_ts=false
+          run_web=false
+          run_shell=false
+          web_dir=""
+
+          [ -f go.mod ] && run_go=true
+          [ -f jsr.json ] && run_ts=true
+          [ -f Dockerfile ] && run_shell=true
+
+          # Probe known nested web-frontend locations. First hit wins.
+          # Add new paths centrally if a future repo introduces a different
+          # layout — no per-repo override needed.
+          for d in \
+            "static-src" \
+            "web" \
+            "internal/server/static-src" \
+          ; do
+            if [ -d "$d" ] && { [ -f "$d/package.json" ] || [ -f "$d/jsr.json" ]; }; then
+              web_dir="$d"
+              run_web=true
+              break
+            fi
+          done
+
+          {
+            echo "run_go=$run_go"
+            echo "run_ts=$run_ts"
+            echo "run_web=$run_web"
+            echo "run_shell=$run_shell"
+            echo "web_dir=$web_dir"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## CI dispatch"
+            echo ""
+            echo "| Surface | Detected | Path |"
+            echo "|---|---|---|"
+            echo "| go    | $run_go | . |"
+            echo "| ts    | $run_ts | . |"
+            echo "| web   | $run_web | ${web_dir:-—} |"
+            echo "| shell | $run_shell | . |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  go:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_go == 'true' }}
+    uses: cplieger/ci/.github/workflows/go-ci.yaml@17b699a97542f07b55e6b576456044731954c6fd # main
+
+  ts:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_ts == 'true' }}
+    uses: cplieger/ci/.github/workflows/ts-ci.yaml@17b699a97542f07b55e6b576456044731954c6fd # main
+
+  web:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_web == 'true' }}
+    uses: cplieger/ci/.github/workflows/ts-ci.yaml@17b699a97542f07b55e6b576456044731954c6fd # main
+    with:
+      working-directory: ${{ needs.detect.outputs.web_dir }}
+      web-lint: true
+
+  shell:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_shell == 'true' }}
+    uses: cplieger/ci/.github/workflows/shell-ci.yaml@17b699a97542f07b55e6b576456044731954c6fd # main

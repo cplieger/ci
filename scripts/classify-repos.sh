@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # classify-repos.sh — Auto-discover and profile all cplieger repos,
 # outputting a .github/sync.yml for repo-file-sync-action.
+#
+# Note: per-type ci.yaml templates (ci-go, ci-shell, ci-ts-lib) were retired
+# in favor of a single unified ci.yml that targets the central detect-and-
+# dispatch ci.yaml workflow in cplieger/ci. ALL releaseable repos receive
+# the same ci.yaml; the central workflow auto-detects surfaces (go.mod /
+# jsr.json / Dockerfile / nested web frontend) and runs the right jobs in
+# parallel. No more bespoke per-repo ci.yaml.
 set -euo pipefail
 
 OWNER="cplieger"
@@ -103,17 +110,14 @@ done
 # --- Generate sync.yml ---
 
 # Collect repos into groups
-go_ci=()       # go repos without web frontend -> ci-go.yml
-go_web=()      # go repos WITH web frontend -> no ci.yaml sync
-ts_repos=()    # ts repos -> ci-ts-lib.yml
-shell_repos=() # shell repos -> ci-shell.yml
+ci_repos=()        # ALL releaseable repos -> unified ci.yml
 codeql_repos=()
 security_repos=()
-release_repos=()    # all releasable repos (unified auto-detect)
+release_repos=()
 cliff_stable=()
 cliff_alpha=()
 golangci_repos=()  # all go repos get .golangci.yaml
-ts_config_repos=() # ts repos get eslint/prettier/stylelint/htmlvalidate
+ts_config_repos=() # ts repos + go-cross-language repos get eslint/prettier/stylelint/htmlvalidate
 
 for repo in ${repo_names}; do
   [[ "${repo}" == "ci" ]] && continue
@@ -128,24 +132,20 @@ for repo in ${repo_names}; do
     codeql_repos+=("${repo}")
   fi
 
-  # CI caller
-  case "${lang}" in
-    go)
-      golangci_repos+=("${repo}")
-      if [[ "${IS_WEB[${repo}]}" == "true" ]]; then
-        go_web+=("${repo}")
-      else
-        go_ci+=("${repo}")
-      fi
-      ;;
-    ts)
-      ts_repos+=("${repo}")
-      ts_config_repos+=("${repo}")
-      ;;
-    shell)
-      shell_repos+=("${repo}")
-      ;;
-  esac
+  # Unified CI + golangci config
+  if [[ "${CAN_RELEASE[${repo}]}" == "true" ]]; then
+    ci_repos+=("${repo}")
+  fi
+
+  # .golangci.yaml: any repo with Go code (lang=go)
+  if [[ "${lang}" == "go" ]]; then
+    golangci_repos+=("${repo}")
+  fi
+
+  # TS lint configs: pure-TS repos
+  if [[ "${lang}" == "ts" ]]; then
+    ts_config_repos+=("${repo}")
+  fi
 
   # Release: all releasable repos (unified auto-detect handles type)
   if [[ "${CAN_RELEASE[${repo}]}" == "true" ]]; then
@@ -160,14 +160,12 @@ for repo in ${repo_names}; do
   fi
 done
 
-# Also handle cross-language repos (go + ts like vterm): add ts configs
+# Cross-language Go repos that ALSO have TS surfaces (e.g. vterm: go.mod + web/jsr.json,
+# vibekit/vibecli/subflux: go.mod + static-src/) — also need TS lint configs.
 for repo in ${repo_names}; do
   [[ "${repo}" == "ci" ]] && continue
   if [[ "${LANG[${repo}]:-}" == "go" ]]; then
-    if [[ "${HAS_JSR[${repo}]:-}" == "true" || "${HAS_PKG[${repo}]:-}" == "true" ]]; then
-      ts_config_repos+=("${repo}")
-    elif [[ "${IS_WEB[${repo}]:-}" == "true" ]]; then
-      # Cross-language: Go repo with web/ subdir containing TS (e.g. vterm)
+    if [[ "${HAS_JSR[${repo}]:-}" == "true" || "${HAS_PKG[${repo}]:-}" == "true" || "${IS_WEB[${repo}]:-}" == "true" ]]; then
       ts_config_repos+=("${repo}")
     fi
   fi
@@ -191,75 +189,37 @@ cat << 'HEADER'
 group:
 HEADER
 
-# Go CI repos (no web frontend): golangci + editorconfig + ci-go + codeql + security + release
-if [[ ${#go_ci[@]} -gt 0 ]]; then
-  echo "  # Go repos (standard CI)"
-  emit_repos go_ci
+# Unified CI (all releaseable repos): ci.yml + codeql + security
+if [[ ${#ci_repos[@]} -gt 0 ]]; then
+  echo "  # Unified CI (auto-detects go/ts/web/shell surfaces)"
+  emit_repos ci_repos
+  cat << 'EOF'
+    files:
+      - .editorconfig
+      - source: .github/workflow-templates/ci.yml
+        dest: .github/workflows/ci.yaml
+      - source: .github/workflow-templates/codeql.yml
+        dest: .github/workflows/codeql.yml
+      - source: .github/workflow-templates/security.yml
+        dest: .github/workflows/security.yml
+EOF
+fi
+
+# .golangci.yaml — Go-having repos
+if [[ ${#golangci_repos[@]} -gt 0 ]]; then
+  echo ""
+  echo "  # .golangci.yaml (Go-having repos)"
+  emit_repos golangci_repos
   cat << 'EOF'
     files:
       - .golangci.yaml
-      - .editorconfig
-      - source: .github/workflow-templates/ci-go.yml
-        dest: .github/workflows/ci.yaml
-      - source: .github/workflow-templates/codeql.yml
-        dest: .github/workflows/codeql.yml
-      - source: .github/workflow-templates/security.yml
-        dest: .github/workflows/security.yml
-EOF
-fi
-
-# Go web frontend repos: golangci + editorconfig + codeql + security (NO ci.yaml)
-if [[ ${#go_web[@]} -gt 0 ]]; then
-  echo ""
-  echo "  # Go repos (web frontend — bespoke ci.yaml)"
-  emit_repos go_web
-  cat << 'EOF'
-    files:
-      - .golangci.yaml
-      - .editorconfig
-      - source: .github/workflow-templates/codeql.yml
-        dest: .github/workflows/codeql.yml
-      - source: .github/workflow-templates/security.yml
-        dest: .github/workflows/security.yml
-EOF
-fi
-
-# TS repos
-if [[ ${#ts_repos[@]} -gt 0 ]]; then
-  echo ""
-  echo "  # TypeScript repos"
-  emit_repos ts_repos
-  cat << 'EOF'
-    files:
-      - .editorconfig
-      - source: .github/workflow-templates/ci-ts-lib.yml
-        dest: .github/workflows/ci.yaml
-      - source: .github/workflow-templates/codeql.yml
-        dest: .github/workflows/codeql.yml
-      - source: .github/workflow-templates/security.yml
-        dest: .github/workflows/security.yml
-EOF
-fi
-
-# Shell repos
-if [[ ${#shell_repos[@]} -gt 0 ]]; then
-  echo ""
-  echo "  # Shell/Docker repos"
-  emit_repos shell_repos
-  cat << 'EOF'
-    files:
-      - .editorconfig
-      - source: .github/workflow-templates/ci-shell.yml
-        dest: .github/workflows/ci.yaml
-      - source: .github/workflow-templates/security.yml
-        dest: .github/workflows/security.yml
 EOF
 fi
 
 # TS config files (eslint, prettier, stylelint, htmlvalidate) for ts + cross-language
 if [[ ${#ts_config_repos[@]} -gt 0 ]]; then
   echo ""
-  echo "  # TypeScript lint/format configs"
+  echo "  # TypeScript lint/format configs (TS-having repos, including hybrids)"
   emit_repos ts_config_repos
   cat << 'EOF'
     files:

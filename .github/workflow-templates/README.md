@@ -1,14 +1,12 @@
 # Workflow Templates
 
-Canonical thin-caller workflows, synced into consumer repos by type via `.github/sync.yml`.
+Canonical thin-caller workflows, synced into consumer repos via `.github/sync.yml`.
 
-## Sync-managed (uniform across repos of the same type)
+## Sync-managed (uniform across all releaseable repos)
 
-- **ci-go.yml** — Go CI caller (profile auto-detected: app-mode + hadolint activate based on repo contents)
-- **security.yml** — Trivy scans (fs always; image when Dockerfile present — auto-detected)
-- **codeql.yml** — CodeQL analysis (languages auto-detected)
-- **release.yml** — Unified release caller. One template for ALL releaseable repos (Docker, Go, TS, hybrid). The central `release.yaml` reusable workflow detects the repo type, classifies which paths changed, and dispatches to the right downstream branch (Docker build/sign/publish, Go tag, TS publish to npm+JSR, or any combination for hybrid repos with subpackages). Per-repo policy overrides (registries, platforms, sbom mode) live centrally in that workflow's `Resolve repo policy` step — never in consumer repos.
+- **ci.yml** — Unified CI caller. The central `ci.yaml` reusable workflow auto-detects repo surfaces (`go.mod` / `jsr.json` / `Dockerfile` / nested web frontend at `static-src/` or `web/` or `internal/server/static-src/`) and dispatches to the right reusable workflows in parallel. Hybrid repos (Go + TS web frontend) get both jobs running automatically — no per-repo configuration. To extend the auto-detection (new web-frontend path pattern, new language type), edit `cplieger/ci/.github/workflows/ci.yaml`.
+- **codeql.yml** — CodeQL analysis (languages auto-detected by GitHub).
+- **security.yml** — Trivy scans (fs always; image when Dockerfile present — auto-detected).
+- **release.yml** — Unified release caller. Mirrors the same architecture as `ci.yml`: the central `release.yaml` reusable workflow detects release type and dispatches to docker / go / ts / subpackage branches.
 
-## Not synced (per-repo customization expected)
-
-- **ci-ts-lib.yml / ci-shell.yml** — CI callers that vary per repo (extra web jobs, working-directory overrides, custom shellcheck-paths, etc.). Bootstrap new repos by copying the matching `ci-*.yml` to `.github/workflows/ci.yaml`.
+The previous per-type CI templates (`ci-go.yml`, `ci-shell.yml`, `ci-ts-lib.yml`) were removed in favor of the unified `ci.yml`. There is no longer a "bespoke per-repo ci.yaml" tier.
