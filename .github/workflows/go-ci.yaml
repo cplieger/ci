@@ -24,7 +24,7 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 240
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -96,7 +96,7 @@ jobs:
         if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         continue-on-error: true
         env:
-          FUZZ_TIME: 30s
+          FUZZ_TIME: 2m
         run: |
           (
             rc=0
