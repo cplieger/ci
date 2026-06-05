@@ -82,21 +82,21 @@ jobs:
 
       - name: Upload SARIF — filesystem
         if: ${{ always() && hashFiles('trivy-fs.sarif') != '' && github.event.repository.private == false }}
-        uses: github/codeql-action/upload-sarif@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
         with:
           sarif_file: 'trivy-fs.sarif'
           category: 'trivy-fs'
 
       - name: Upload SARIF — misconfig
         if: ${{ always() && hashFiles('trivy-misconfig.sarif') != '' && github.event.repository.private == false }}
-        uses: github/codeql-action/upload-sarif@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
         with:
           sarif_file: 'trivy-misconfig.sarif'
           category: 'trivy-misconfig'
 
       - name: Upload SARIF — image
         if: ${{ always() && steps.profile.outputs.image == 'true' && hashFiles('trivy-image.sarif') != '' && github.event.repository.private == false }}
-        uses: github/codeql-action/upload-sarif@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
         with:
           sarif_file: 'trivy-image.sarif'
           category: 'trivy-image'
