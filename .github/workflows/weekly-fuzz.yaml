@@ -78,7 +78,7 @@ jobs:
         run: gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
 
       - name: Set up Go
-        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: target/go.mod
           cache: false
@@ -88,11 +88,12 @@ jobs:
         working-directory: target
         run: |
           : > /tmp/fuzz-output.log
+          rc=0
           echo "fuzz budget per target: ${FUZZ_TIME}"
           for pkg in $(go list ./...); do
             for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep -E '^Fuzz' || true); do
               echo "::group::fuzz ${fn} (${pkg})"
-              go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME}" "$pkg" 2>&1 | tee -a /tmp/fuzz-output.log || true
+              go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME}" "$pkg" 2>&1 | tee -a /tmp/fuzz-output.log || rc=1
               echo "::endgroup::"
             done
           done
