@@ -1,0 +1,116 @@
+# Canonical ruff config for cplieger Python repos.
+# Source of truth: cplieger/ci  →  configs/ruff.toml
+# Synced to consumer repos as `ruff.toml` by scripts/classify-repos.sh.
+# DO NOT edit the synced copies; edit here and let the sync workflow propagate.
+# Seeded from the tools repo's tuned config. Reference: https://docs.astral.sh/ruff/configuration/
+
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+  ".git",
+  "node_modules",
+  "__pycache__",
+]
+
+[lint]
+# Maximum strictness: enable every rule category, then opt out of noisy ones.
+select = ["ALL"]
+ignore = [
+  # Documentation rules — too noisy for utility scripts.
+  "D",        # pydocstyle (missing module/class/function docstrings)
+  "ANN",      # flake8-annotations (require type hints everywhere)
+  "COM812",   # trailing comma — conflicts with formatter
+  "ISC001",   # implicit-str-concat — conflicts with formatter
+  # Bandit subprocess rules — these scripts call CLI tools deliberately.
+  "S101",     # assert is fine in helper scripts
+  "S603",     # subprocess-without-shell-equals-true (we use shell=False already)
+  "S607",     # start-process-with-partial-path (we use PATH lookup intentionally)
+  # Try/except style — verbose for short scripts.
+  "TRY003",   # long exception messages
+  "TRY300",   # else-after-return-in-try
+  "EM101",    # raw-string-in-exception (verbose for one-off errors)
+  "EM102",    # f-string-in-exception (same)
+  # Magic-number — ubiquitous in pipeline scripts.
+  "PLR2004",
+  # Function complexity — helper scripts are intentionally linear.
+  "PLR0911",  # too-many-return-statements
+  "PLR0912",  # too-many-branches
+  "PLR0913",  # too-many-arguments
+  "PLR0915",  # too-many-statements
+  "C901",     # mccabe complexity
+  # FBT001/2 — boolean-trap is fine for CLI flag wiring.
+  "FBT001",
+  "FBT002",
+  # T201 — print() is the intended output for these scripts.
+  "T201",
+  # Misc opinions that don't apply here.
+  "FIX",      # flake8-fixme (block on TODO/FIXME comments)
+  "TD",       # flake8-todos (require structured todos)
+  "ERA",      # eradicate (commented-out code) — false positives on docs
+  # Quote rules — handled by the formatter (quote-style = "single").
+  "Q000",     # inline-quotes (formatter enforces single)
+  "Q003",     # avoidable-escaped-quote (formatter handles)
+  # Pathlib migration — os.path is idiomatic in these CLI scripts; mass migration adds churn.
+  "PTH",
+  # printf-style formatting — acceptable in utility scripts.
+  "UP031",
+  # List-comprehension rewrite — style preference, not a bug.
+  "PERF401",
+  # Non-lowercase variable names — scripts use UPPER for pseudo-constants.
+  "N806",
+  # subprocess.run without check= — scripts inspect returncode intentionally.
+  "PLW1510",
+  # Unused function arguments — required by callback/interface signatures.
+  "ARG001",
+  # Loop variable overwritten — common pattern in transform loops.
+  "PLW2901",
+  # Import not at top-level — conditional/deferred imports are intentional.
+  "PLC0415",
+  # Ambiguous variable names (l, O, I) — context makes them clear.
+  "E741",
+  # Blind exception — scripts intentionally catch-all for resilience.
+  "BLE001",
+  # Unused loop variable — acceptable in counting/iteration patterns.
+  "B007",
+  # Hardcoded /tmp paths — acceptable in build/CI scripts.
+  "S108",
+  # open() without context manager — acceptable for short-lived scripts.
+  "SIM115",
+  # Use contextlib.suppress — style preference.
+  "SIM105",
+  # Line too long — formatter handles what it can; residuals are URLs/long strings.
+  "E501",
+  # Collapsible if — readability preference in complex conditionals.
+  "SIM102",
+  # try-except-continue — intentional resilience in batch processing.
+  "S112",
+  # shell=True in subprocess — these scripts build shell pipelines intentionally.
+  "S602",
+  # Ambiguous unicode chars in comments — intentional (e.g., × symbol).
+  "RUF003",
+  # Use specific rule codes in type: ignore — not always feasible.
+  "PGH003",
+  # dict iteration without .items() — acceptable when only keys needed.
+  "PLC0206",
+  # list() copy vs list.copy — style preference.
+  "PERF402",
+  # datetime.now() without tz — scripts run locally, tz not needed.
+  "DTZ005",
+]
+
+[lint.per-file-ignores]
+# Test/example files can be more relaxed.
+"**/test_*.py" = ["S", "PLR", "ARG"]
+# The tools CI parser intentionally uses globals + dynamic dispatch.
+"scripts/_ci_local.py" = ["PLW0603"]
+# Maintenance scripts open hardcoded-HTTPS registry API URLs; the urlopen
+# scheme is constant, so S310 (permitted-scheme audit) is a false positive.
+"dockerhub_cleanup.py" = ["S310"]
+"ghcr_cleanup.py" = ["S310"]
+
+[format]
+quote-style = "single"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "lf"
+docstring-code-format = true
