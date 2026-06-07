@@ -177,7 +177,7 @@ jobs:
               | .efficacy_mean        |= ((. * 10) | round / 10)
               | .efficacy_stddev      |= ((. * 10) | round / 10)
               | .mutant_coverage_mean |= ((. * 10) | round / 10)
-            ' artifacts/gremlins-${repo}-*/gremlins-summary.json)
+            ' artifacts/gremlins-"${repo}"-*/gremlins-summary.json)
             echo "  stats: $stats"
 
             mean=$(echo "$stats" | jq -r '.efficacy_mean')
