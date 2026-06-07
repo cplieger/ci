@@ -101,12 +101,8 @@ ignore = [
 [lint.per-file-ignores]
 # Test/example files can be more relaxed.
 "**/test_*.py" = ["S", "PLR", "ARG"]
-# The tools CI parser intentionally uses globals + dynamic dispatch.
-"scripts/_ci_local.py" = ["PLW0603"]
-# Maintenance scripts open hardcoded-HTTPS registry API URLs; the urlopen
-# scheme is constant, so S310 (permitted-scheme audit) is a false positive.
-"dockerhub_cleanup.py" = ["S310"]
-"ghcr_cleanup.py" = ["S310"]
+# The CI parser intentionally uses globals + dynamic dispatch.
+"_ci_local.py" = ["PLW0603"]
 
 [format]
 quote-style = "single"
