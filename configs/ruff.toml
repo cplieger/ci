@@ -5,7 +5,7 @@
 # Seeded from the tools repo's tuned config. Reference: https://docs.astral.sh/ruff/configuration/
 
 line-length = 100
-target-version = "py311"
+target-version = "py314"
 extend-exclude = [
   ".git",
   "node_modules",
