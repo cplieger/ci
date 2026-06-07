@@ -39,7 +39,7 @@ for repo in ${repo_names}; do
   # Get root tree entries
   tree_json=$(api "repos/${OWNER}/${repo}/git/trees/HEAD?recursive=0" --jq '.tree[].path' 2>/dev/null || echo "")
 
-  has_gomod=false; has_jsr=false; has_pkg=false; has_dockerfile=false; is_web=false
+  has_gomod=false; has_jsr=false; has_pkg=false; has_dockerfile=false; is_web=false; has_pyproject=false
 
   while IFS= read -r entry; do
     case "${entry}" in
@@ -47,6 +47,7 @@ for repo in ${repo_names}; do
       jsr.json) has_jsr=true ;;
       package.json) has_pkg=true ;;
       Dockerfile) has_dockerfile=true ;;
+      pyproject.toml) has_pyproject=true ;;
       static-src|web) is_web=true ;;
     esac
   done <<< "${tree_json}"
@@ -71,6 +72,8 @@ for repo in ${repo_names}; do
     lang="ts"
   elif [[ "${has_dockerfile}" == "true" ]]; then
     lang="shell"
+  elif [[ "${has_pyproject}" == "true" ]]; then
+    lang="python"
   fi
 
   # Has code (for codeql): go or ts repos
@@ -118,11 +121,20 @@ cliff_stable=()
 cliff_alpha=()
 golangci_repos=()  # all go repos get .golangci.yaml
 ts_config_repos=() # ts repos + go-cross-language repos get eslint/prettier/stylelint/htmlvalidate
+python_repos=()    # python repos (pyproject.toml) -> ruff.toml + .editorconfig only
 
 for repo in ${repo_names}; do
   [[ "${repo}" == "ci" ]] && continue
   lang="${LANG[${repo}]:-none}"
   [[ "${lang}" == "none" ]] && continue
+
+  # Python repos (e.g. the tools methodology repo): lint baseline only —
+  # ruff + .editorconfig. Not releaseable, not compiled, so no ci.yml/codeql/
+  # release/cliff; they keep their own bespoke ci.yaml.
+  if [[ "${lang}" == "python" ]]; then
+    python_repos+=("${repo}")
+    continue
+  fi
 
   # Security: ALL repos with any detectable content
   security_repos+=("${repo}")
@@ -215,6 +227,20 @@ if [[ ${#golangci_repos[@]} -gt 0 ]]; then
       - .golangci.yaml
       - source: configs/gremlins.yaml
         dest: .gremlins.yaml
+EOF
+fi
+
+# Python repos (pyproject.toml): canonical ruff config + editorconfig.
+# Lint baseline only — these repos are not releaseable and keep a bespoke ci.yaml.
+if [[ ${#python_repos[@]} -gt 0 ]]; then
+  echo ""
+  echo "  # Python repos (ruff + editorconfig; bespoke ci.yaml)"
+  emit_repos python_repos
+  cat << 'EOF'
+    files:
+      - .editorconfig
+      - source: configs/ruff.toml
+        dest: ruff.toml
 EOF
 fi
 
