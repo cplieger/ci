@@ -183,7 +183,7 @@ jobs:
           # Single-line echo (not a heredoc): heredocs in GHA run blocks break
           # silently when YAML dedent shifts the terminator. JSON on one line is
           # valid and indentation-proof.
-          echo '{"default":true,"MD003":{"style":"atx"},"MD004":{"style":"dash"},"MD007":{"indent":2},"MD013":false,"MD024":{"siblings_only":true},"MD025":{"front_matter_title":""},"MD029":{"style":"ordered"},"MD033":false,"MD035":{"style":"---"},"MD040":false,"MD041":false,"MD046":{"style":"fenced"},"MD048":{"style":"backtick"},"MD049":{"style":"underscore"},"MD050":{"style":"asterisk"},"MD056":false,"MD060":false}' > "$RUNNER_TEMP/.markdownlint.json"
+          echo '{"default":true,"MD003":{"style":"atx"},"MD004":{"style":"dash"},"MD007":{"indent":2},"MD010":{"code_blocks":false},"MD013":false,"MD024":{"siblings_only":true},"MD025":{"front_matter_title":""},"MD029":{"style":"ordered"},"MD033":{"allowed_elements":["br","details","summary","sub","sup","img","div","a","p","kbd","picture","source"]},"MD035":{"style":"---"},"MD040":false,"MD041":false,"MD045":true,"MD046":{"style":"fenced"},"MD048":{"style":"backtick"},"MD049":{"style":"underscore"},"MD050":{"style":"asterisk"},"MD059":true}' > "$RUNNER_TEMP/.markdownlint.json"
 
       - name: Lint Markdown
         run: |
