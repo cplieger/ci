@@ -208,6 +208,7 @@ if [[ ${#ci_repos[@]} -gt 0 ]]; then
   cat << 'EOF'
     files:
       - .editorconfig
+      - .gitattributes
       - source: .github/workflow-templates/ci.yml
         dest: .github/workflows/ci.yaml
       - source: .github/workflow-templates/codeql.yml
@@ -239,6 +240,7 @@ if [[ ${#python_repos[@]} -gt 0 ]]; then
   cat << 'EOF'
     files:
       - .editorconfig
+      - .gitattributes
       - source: configs/ruff.toml
         dest: ruff.toml
 EOF

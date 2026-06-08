@@ -15,6 +15,7 @@ on:
       - ".golangci.yaml"
       - "cliff.toml"
       - ".editorconfig"
+      - ".gitattributes"
       - "configs/**"
       - ".github/sync.yml"
       - "scripts/classify-repos.sh"
