@@ -97,9 +97,9 @@ formatters:
       extra-rules: true
     gci:
       # Deterministic import grouping: standard -> third-party -> local
-      # module. `localmodule` auto-reads the module path from each repo's
-      # go.mod, so this is uniform across the fleet (apps whose module is
-      # e.g. `vibekit` and libs whose module is `github.com/cplieger/x`).
+      # module (folded by gofumpt into the third-party group). A separate
+      # gci `localmodule`/`prefix` section is intentionally NOT used: gofumpt
+      # never emits a distinct local-import group, so it would never converge.
       # goimports is intentionally NOT enabled: it conflicts with gci on
       # ordering, and its only unique capability (add/remove imports) is
       # moot in CI — the Go compiler already rejects unused/missing
@@ -107,7 +107,6 @@ formatters:
       sections:
         - standard
         - default
-        - localmodule
       custom-order: true
   exclusions:
     # Generated files are auto-excluded (default generated: lax).
