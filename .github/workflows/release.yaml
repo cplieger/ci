@@ -190,6 +190,23 @@ jobs:
             '(^|/)static/style\.css$'
             '(^|/)static/vendor/'
 
+            # Dependency lockfiles — dev/build artifacts, never shipped to
+            # npm/JSR consumers (npm publish omits the lockfile; consumers
+            # resolve from package.json ranges). Verified not consumed by any
+            # repo Dockerfile, so excluding them is safe across docker/go/ts
+            # types. This stops Renovate "Lock File Maintenance"
+            # (chore(deps): lock file maintenance) — which touches only the
+            # lockfile — from flipping root_changed=true and triggering a
+            # spurious npm/JSR publish or image rebuild. A real runtime dep
+            # bump also changes package.json (not excluded), so genuine
+            # releases still fire.
+            '(^|/)package-lock\.json$'
+            '(^|/)npm-shrinkwrap\.json$'
+            '(^|/)yarn\.lock$'
+            '(^|/)pnpm-lock\.yaml$'
+            '(^|/)bun\.lockb$'
+            '(^|/)bun\.lock$'
+
             # Dev convenience / manual test scripts
             '^compose\.yaml$'
             '^test-validate\.sh$'
