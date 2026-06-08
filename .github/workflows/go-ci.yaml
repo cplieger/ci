@@ -49,11 +49,28 @@ jobs:
 
       - name: Install golangci-lint
         run: |
+          set -euo pipefail
           # renovate: datasource=github-releases depName=golangci/golangci-lint
           VERSION=v2.12.2
-          curl -fsSL --retry 3 \
-            "https://raw.githubusercontent.com/golangci/golangci-lint/${VERSION}/install.sh" \
-            | sh -s -- -b /usr/local/bin "${VERSION}"
+          # install.sh downloads the release tarball from GitHub internally,
+          # and that fetch intermittently returns HTTP 504. `curl --retry` only
+          # covers downloading install.sh itself, not install.sh's own internal
+          # download — so retry the whole install with exponential backoff.
+          attempt=1
+          max=5
+          delay=5
+          until curl -fsSL --retry 3 \
+                  "https://raw.githubusercontent.com/golangci/golangci-lint/${VERSION}/install.sh" \
+                | sh -s -- -b /usr/local/bin "${VERSION}"; do
+            if [ "${attempt}" -ge "${max}" ]; then
+              echo "::error::golangci-lint install failed after ${max} attempts"
+              exit 1
+            fi
+            echo "::warning::golangci-lint install attempt ${attempt}/${max} failed; retrying in ${delay}s"
+            sleep "${delay}"
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+          done
 
       - name: Install tools
         run: |
