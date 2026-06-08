@@ -37,6 +37,10 @@ jobs:
       web_dir: ${{ steps.detect.outputs.web_dir }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Full history so we can diff against the PR base / previous push
+          # tip to decide whether any code (non-docs) files changed.
+          fetch-depth: 0
 
       - name: Detect repo surfaces
         id: detect
@@ -47,24 +51,71 @@ jobs:
           run_shell=false
           web_dir=""
 
-          [ -f go.mod ] && run_go=true
-          [ -f jsr.json ] && run_ts=true
-          [ -f Dockerfile ] && run_shell=true
+          # --- Did any non-docs (code) file change? ---
+          # The consumer ci.yaml no longer uses paths-ignore: a required status
+          # check (ci / validate) can never be satisfied when the workflow is
+          # skipped by a path filter (GitHub leaves it pending forever). So the
+          # workflow always runs, and the markdown lint always runs, but the
+          # heavy language jobs are gated here on a real code change. A docs-only
+          # change runs detect + markdown + validate only — cheap, and the
+          # required check still reports. On anything we can't diff (manual
+          # dispatch, first push to a branch, shallow base) we fail safe and
+          # treat it as a code change so the full battery runs.
+          code_changed=true
+          changed=""
+          diffed=false
+          case "${{ github.event_name }}" in
+            pull_request)
+              base="${{ github.event.pull_request.base.sha }}"
+              if git cat-file -e "${base}^{commit}" 2> /dev/null; then
+                changed=$(git diff --name-only "$base" HEAD)
+                diffed=true
+              fi
+              ;;
+            push)
+              before="${{ github.event.before }}"
+              if [ -n "$before" ] \
+                && [ "$before" != "0000000000000000000000000000000000000000" ] \
+                && git cat-file -e "${before}^{commit}" 2> /dev/null; then
+                changed=$(git diff --name-only "$before" "${{ github.sha }}")
+                diffed=true
+              fi
+              ;;
+          esac
 
-          # Probe known nested web-frontend locations. First hit wins.
-          # Add new paths centrally if a future repo introduces a different
-          # layout — no per-repo override needed.
-          for d in \
-            "static-src" \
-            "web" \
-            "internal/server/static-src" \
-          ; do
-            if [ -d "$d" ] && { [ -f "$d/package.json" ] || [ -f "$d/jsr.json" ]; }; then
-              web_dir="$d"
-              run_web=true
-              break
+          # With a diff in hand, code changed only when some path is NOT a doc
+          # file (or blank line). grep -qvE exits 0 iff such a line exists — no
+          # subshell-scope or heredoc pitfalls. Without a diff (manual dispatch,
+          # first push, shallow base) we keep the fail-safe default of true.
+          if [ "$diffed" = "true" ]; then
+            if printf '%s\n' "$changed" \
+              | grep -qvE '(\.md$|^LICENSE$|^\.gitignore$|^[[:space:]]*$)'; then
+              code_changed=true
+            else
+              code_changed=false
             fi
-          done
+          fi
+
+          if [ "$code_changed" = "true" ]; then
+            [ -f go.mod ] && run_go=true
+            [ -f jsr.json ] && run_ts=true
+            [ -f Dockerfile ] && run_shell=true
+
+            # Probe known nested web-frontend locations. First hit wins.
+            # Add new paths centrally if a future repo introduces a different
+            # layout — no per-repo override needed.
+            for d in \
+              "static-src" \
+              "web" \
+              "internal/server/static-src" \
+            ; do
+              if [ -d "$d" ] && { [ -f "$d/package.json" ] || [ -f "$d/jsr.json" ]; }; then
+                web_dir="$d"
+                run_web=true
+                break
+              fi
+            done
+          fi
 
           {
             echo "run_go=$run_go"
@@ -79,10 +130,13 @@ jobs:
             echo ""
             echo "| Surface | Detected | Path |"
             echo "|---|---|---|"
-            echo "| go    | $run_go | . |"
-            echo "| ts    | $run_ts | . |"
-            echo "| web   | $run_web | ${web_dir:-—} |"
-            echo "| shell | $run_shell | . |"
+            echo "| go       | $run_go | . |"
+            echo "| ts       | $run_ts | . |"
+            echo "| web      | $run_web | ${web_dir:-—} |"
+            echo "| shell    | $run_shell | . |"
+            echo "| markdown | true (always) | . |"
+            echo ""
+            echo "code_changed: $code_changed"
           } >> "$GITHUB_STEP_SUMMARY"
 
   go:
@@ -108,12 +162,40 @@ jobs:
     if: ${{ needs.detect.outputs.run_shell == 'true' }}
     uses: cplieger/ci/.github/workflows/shell-ci.yaml@6659f08fc7f512ad4ae4bc9a27b257ea423a433a # v2
 
+  # Markdown lint always runs (every repo has at least a README). Inline rather
+  # than a separate reusable workflow so it needs no self-referencing pinned tag
+  # and no per-repo config sync — the canonical rule set lives here. Mirrors the
+  # rule set used by cplieger/.kiro's own markdown lint.
+  markdown:
+    needs: detect
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install markdownlint-cli2
+        run: |
+          # renovate: datasource=npm depName=markdownlint-cli2
+          npm install -g markdownlint-cli2@0.18.1
+
+      - name: Write markdownlint config
+        run: |
+          # Single-line echo (not a heredoc): heredocs in GHA run blocks break
+          # silently when YAML dedent shifts the terminator. JSON on one line is
+          # valid and indentation-proof.
+          echo '{"default":true,"MD003":{"style":"atx"},"MD004":{"style":"dash"},"MD007":{"indent":2},"MD013":false,"MD024":{"siblings_only":true},"MD025":{"front_matter_title":""},"MD029":{"style":"ordered"},"MD033":false,"MD035":{"style":"---"},"MD040":false,"MD041":false,"MD046":{"style":"fenced"},"MD048":{"style":"backtick"},"MD049":{"style":"underscore"},"MD050":{"style":"asterisk"},"MD056":false,"MD060":false}' > "$RUNNER_TEMP/.markdownlint.json"
+
+      - name: Lint Markdown
+        run: |
+          markdownlint-cli2 --config "$RUNNER_TEMP/.markdownlint.json" \
+            "**/*.md" "#node_modules" "#.git"
+
   # Aggregator — emits a single `ci / validate` check name that branch
   # protection rules can target (preserves the check name from the previous
   # per-type templates so existing branch-protection rules keep working
   # without per-repo updates).
   validate:
-    needs: [detect, go, ts, web, shell]
+    needs: [detect, go, ts, web, shell, markdown]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 1
@@ -125,6 +207,7 @@ jobs:
           TS: ${{ needs.ts.result }}
           WEB: ${{ needs.web.result }}
           SHELL: ${{ needs.shell.result }}
+          MARKDOWN: ${{ needs.markdown.result }}
         run: |
           # detect must always succeed (it gates everything else)
           if [ "$DETECT" != "success" ]; then
@@ -132,8 +215,10 @@ jobs:
             exit 1
           fi
           # Each dispatched job must be either success (it ran and passed)
-          # or skipped (auto-detect said it wasn't applicable).
-          for pair in "go=$GO" "ts=$TS" "web=$WEB" "shell=$SHELL"; do
+          # or skipped (auto-detect said it wasn't applicable). markdown always
+          # runs, so it must be success (skipped only if detect failed, caught
+          # above).
+          for pair in "go=$GO" "ts=$TS" "web=$WEB" "shell=$SHELL" "markdown=$MARKDOWN"; do
             name="${pair%%=*}"; result="${pair##*=}"
             if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
               echo "::error::$name job: $result"
