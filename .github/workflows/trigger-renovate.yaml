@@ -24,10 +24,12 @@ name: Trigger Renovate
 # (the one-shot Renovate container) which scans cplieger/* and opens
 # digest-bump PRs against the consumer repos.
 #
-# Token: GH_TOKEN below must carry `admin:repo_hook` (classic PAT) or
-# fine-grained "Webhooks: read and write" on cplieger/ci — the hooks +
-# deliveries + redeliver endpoints all require it. The default GITHUB_TOKEN
-# cannot be granted this scope, so a PAT secret is mandatory.
+# Token: GH_TOKEN below is RENOVATE_HOOK_PAT, a fine-grained PAT scoped to
+# ONLY cplieger/ci with Metadata: Read + Webhooks: Read and write — the hooks,
+# deliveries, and redeliver endpoints all require Webhooks access. The default
+# GITHUB_TOKEN cannot be granted this scope, so a dedicated PAT secret is
+# mandatory. Kept separate from CI_SCHEDULE so webhook-admin is confined to one
+# repo rather than the whole fleet that CI_SCHEDULE can reach.
 
 on:
   workflow_dispatch:
@@ -54,7 +56,7 @@ jobs:
     steps:
       - name: Redeliver Komodo push webhook (GitHub-native, via Hookshot)
         env:
-          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          GH_TOKEN: ${{ secrets.RENOVATE_HOOK_PAT }}
           REPO: ${{ github.repository }}
           REASON: ${{ inputs.reason }}
         run: |
