@@ -114,6 +114,7 @@ jobs:
           BEFORE: ${{ github.event.before }}
           HEAD: ${{ github.sha }}
           SUBPACKAGES_JSON: ${{ steps.type.outputs.subpackages }}
+          REPO_TYPE: ${{ steps.type.outputs.type }}
         run: |
           # Determine the set of files that materially changed in this push.
           # - For push events with a known `before` SHA: git diff before..HEAD.
@@ -197,9 +198,10 @@ jobs:
             # types. This stops Renovate "Lock File Maintenance"
             # (chore(deps): lock file maintenance) — which touches only the
             # lockfile — from flipping root_changed=true and triggering a
-            # spurious npm/JSR publish or image rebuild. A real runtime dep
-            # bump also changes package.json (not excluded), so genuine
-            # releases still fire.
+            # spurious npm/JSR publish or image rebuild. package.json itself
+            # is NOT excluded here; it gets type-aware handling in the
+            # "Refine package.json significance" step below (dev-only changes
+            # never ship, so they must not trigger a build/release).
             '(^|/)package-lock\.json$'
             '(^|/)npm-shrinkwrap\.json$'
             '(^|/)yarn\.lock$'
@@ -221,6 +223,41 @@ jobs:
             SIGNIFICANT=""
           else
             SIGNIFICANT=$(echo "$CHANGED" | grep -Ev "$EXCLUDE_RE" || true)
+          fi
+
+          # Refine package.json significance (type-aware). package.json is the
+          # one file that is both a dev artifact (devDependencies, scripts) and,
+          # for TS libs, the published manifest. A blanket exclude would let a
+          # real runtime-dep / exports / files change ship without republishing;
+          # leaving it fully significant lets a devDependency bump mint a
+          # spurious release (the bug this fixes). So:
+          #
+          #   docker / go : NO build artifact reads package.json (web-UI images
+          #                 pin TS deps as Dockerfile ARGs + tsgo; verified no
+          #                 Dockerfile references package.json). Drop every
+          #                 package.json from the significant set outright.
+          #   ts          : package.json IS the published tarball manifest, but
+          #                 devDependencies never ship. Keep it significant only
+          #                 when a non-devDependencies field changed. Compare
+          #                 before/after with devDependencies stripped; if equal,
+          #                 the change was dev-only — drop it. Applies to root
+          #                 and subpackage package.json alike.
+          if [ -n "$SIGNIFICANT" ] && echo "$SIGNIFICANT" | grep -qE '(^|/)package\.json$'; then
+            if [ "$REPO_TYPE" = "docker" ] || [ "$REPO_TYPE" = "go" ]; then
+              SIGNIFICANT=$(echo "$SIGNIFICANT" | grep -Ev '(^|/)package\.json$' || true)
+              echo "::notice::$REPO_TYPE repo — package.json is dev-only here, dropped from significance"
+            elif [ "$REPO_TYPE" = "ts" ] && [ -n "$BEFORE" ] \
+                 && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+              while IFS= read -r pj; do
+                [ -z "$pj" ] && continue
+                b=$(git show "$BEFORE:$pj" 2>/dev/null | jq -S 'del(.devDependencies)' 2>/dev/null || echo "")
+                h=$(git show "$HEAD:$pj"   2>/dev/null | jq -S 'del(.devDependencies)' 2>/dev/null || echo "")
+                if [ -n "$b" ] && [ "$b" = "$h" ]; then
+                  SIGNIFICANT=$(echo "$SIGNIFICANT" | grep -vxF "$pj" || true)
+                  echo "::notice::$pj changed only in devDependencies — not significant"
+                fi
+              done < <(echo "$SIGNIFICANT" | grep -E '(^|/)package\.json$')
+            fi
           fi
 
           # Determine root_changed (any significant file outside all subpackage
