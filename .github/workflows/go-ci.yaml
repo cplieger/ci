@@ -109,6 +109,42 @@ jobs:
         continue-on-error: true
         run: ( go mod verify ) || { echo "go mod verify" >> /tmp/_ci_failures; exit 1; }
 
+      # Drift guard for wiregen-generated files (committed TS/Go emitted by a
+      # `go run ./<gen>` command). Self-configuring: no-op unless the repo
+      # actually has a generator that imports github.com/cplieger/wiregen.
+      # Report-only: it regenerates into the runner's ephemeral tree and
+      # fails if the committed output differs; it never writes back.
+      - name: Wiregen drift
+        continue-on-error: true
+        run: |
+          (
+            # 1+3. Detect + dynamically discover generator entrypoints: any
+            # `package main` directory that imports cplieger/wiregen.
+            gens=$(grep -rlZ --include='*.go' 'cplieger/wiregen' . 2>/dev/null \
+              | xargs -0 -r -n1 dirname | sort -u \
+              | while IFS= read -r d; do
+                  grep -qE '^package main$' "$d"/*.go 2>/dev/null && echo "$d" || true
+                done) || true
+            if [ -z "$gens" ]; then
+              echo "wiregen: no generator command imports the library; skipping"
+              exit 0
+            fi
+            # 2. Regenerate from the Go source of truth.
+            for d in $gens; do
+              echo "wiregen: go run ./$d"
+              go run "./$d"
+            done
+            # Compare regenerated output against the committed tree
+            # (catches modified + added files via the staged index).
+            git add -A
+            if ! git diff --cached --quiet; then
+              echo "::error::wiregen output is stale; re-run the generator(s) above and commit the result"
+              git --no-pager diff --cached --stat
+              exit 1
+            fi
+            echo "wiregen: generated files up to date"
+          ) || { echo "wiregen drift" >> /tmp/_ci_failures; exit 1; }
+
       - name: Dead code (deadcode)
         if: ${{ steps.profile.outputs.app == 'true' }}
         continue-on-error: true
