@@ -332,8 +332,10 @@ jobs:
           SBOM_FROM="image"
 
           case "$REPO_NAME" in
-            # GHCR-only (no Docker Hub mirror).
-            docker-caddy|docker-age|docker-keepalived|docker-static-web|docker-radvd|subflux|vibecli|vibekit)
+            # GHCR-only (no Docker Hub mirror). Pre-1.0 apps not yet mirrored
+            # to Docker Hub. The docker-* infra images (caddy, age, keepalived,
+            # static-web, radvd) graduated to dual-publish once they hit 1.0.
+            subflux|vibecli|vibekit)
               REGISTRIES="ghcr" ;;
           esac
 
