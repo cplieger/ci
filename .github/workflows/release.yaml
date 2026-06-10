@@ -436,6 +436,11 @@ jobs:
           else
             npm publish --access public
           fi
+          # deno's `jsr publish` uses BYONM, so runtime deps (e.g.
+          # @cplieger/actions -> @cplieger/reactive) must already be in
+          # node_modules; the npm publish above does not install them.
+          # Install (without touching the lockfile) before publishing to JSR.
+          npm install --no-save
           npx jsr publish --allow-dirty
 
       - name: Tag + GitHub Release
@@ -492,4 +497,9 @@ jobs:
           else
             npm publish --access public
           fi
+          # deno's `jsr publish` uses BYONM, so runtime deps (e.g.
+          # @cplieger/actions -> @cplieger/reactive) must already be in
+          # node_modules; the npm publish above does not install them.
+          # Install (without touching the lockfile) before publishing to JSR.
+          npm install --no-save
           npx jsr publish --allow-dirty
