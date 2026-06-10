@@ -142,17 +142,17 @@ jobs:
   go:
     needs: detect
     if: ${{ needs.detect.outputs.run_go == 'true' }}
-    uses: cplieger/ci/.github/workflows/go-ci.yaml@f49d6484b28f23883fd0fb4a4effd1df6f972eb1 # v2
+    uses: cplieger/ci/.github/workflows/go-ci.yaml@2a1a6602f9d06ef47a10312e768ccf91cee2a545 # v2
 
   ts:
     needs: detect
     if: ${{ needs.detect.outputs.run_ts == 'true' }}
-    uses: cplieger/ci/.github/workflows/ts-ci.yaml@f49d6484b28f23883fd0fb4a4effd1df6f972eb1 # v2
+    uses: cplieger/ci/.github/workflows/ts-ci.yaml@2a1a6602f9d06ef47a10312e768ccf91cee2a545 # v2
 
   web:
     needs: detect
     if: ${{ needs.detect.outputs.run_web == 'true' }}
-    uses: cplieger/ci/.github/workflows/ts-ci.yaml@f49d6484b28f23883fd0fb4a4effd1df6f972eb1 # v2
+    uses: cplieger/ci/.github/workflows/ts-ci.yaml@2a1a6602f9d06ef47a10312e768ccf91cee2a545 # v2
     with:
       working-directory: ${{ needs.detect.outputs.web_dir }}
       web-lint: true
@@ -160,7 +160,7 @@ jobs:
   shell:
     needs: detect
     if: ${{ needs.detect.outputs.run_shell == 'true' }}
-    uses: cplieger/ci/.github/workflows/shell-ci.yaml@f49d6484b28f23883fd0fb4a4effd1df6f972eb1 # v2
+    uses: cplieger/ci/.github/workflows/shell-ci.yaml@2a1a6602f9d06ef47a10312e768ccf91cee2a545 # v2
 
   # Markdown lint always runs (every repo has at least a README). Inline rather
   # than a separate reusable workflow so it needs no self-referencing pinned tag
