@@ -283,6 +283,36 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Ensure Docker Hub repository exists
+        if: ${{ contains(inputs.registries, 'dockerhub') }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          # buildx imagetools create cannot auto-create a Docker Hub repository,
+          # so the first-ever dual-publish to a brand-new repo fails with HTTP
+          # 400 ("unexpected status from PUT ... blobs/uploads"). docker push
+          # auto-creates the repo; imagetools does not. Pre-create it (public,
+          # idempotent) so the first manifest push succeeds.
+          namespace="${IMAGE_NAME%%/*}"
+          name="${IMAGE_NAME#*/}"
+          jwt=$(curl -fsS --retry 3 -H 'Content-Type: application/json' \
+            -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}" \
+            https://hub.docker.com/v2/users/login/ | jq -r '.token')
+          if [ -z "$jwt" ] || [ "$jwt" = "null" ]; then
+            echo "::error::Docker Hub login failed during repository pre-create"; exit 1
+          fi
+          code=$(curl -sS -o /tmp/dhrepo.json -w '%{http_code}' -X POST \
+            -H "Authorization: JWT ${jwt}" -H 'Content-Type: application/json' \
+            -d "{\"namespace\":\"${namespace}\",\"name\":\"${name}\",\"is_private\":false}" \
+            https://hub.docker.com/v2/repositories/)
+          case "$code" in
+            201) echo "Created docker.io/${namespace}/${name}" ;;
+            400|409) echo "docker.io/${namespace}/${name} already exists (HTTP ${code})" ;;
+            *) echo "::warning::Unexpected HTTP ${code} for docker.io/${namespace}/${name}"; cat /tmp/dhrepo.json 2>/dev/null || true ;;
+          esac
+
       - name: Create multi-arch manifest
         id: manifest
         env:
