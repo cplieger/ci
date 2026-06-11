@@ -177,6 +177,13 @@ jobs:
           (
             df="Dockerfile"
             [ -f "$df" ] || df="${GITHUB_WORKSPACE}/Dockerfile"
+            # Pre-pull hadolint with retry: anonymous Docker Hub pulls on
+            # shared runner IPs intermittently time out ("context deadline
+            # exceeded"), which otherwise fails the Dockerfile-lint step.
+            for attempt in 1 2 3; do
+              docker pull -q hadolint/hadolint:2.12.0 && break
+              echo "hadolint pull ${attempt}/3 failed; retrying" >&2; sleep $((attempt * 5))
+            done
             docker run --rm -i hadolint/hadolint:2.12.0 \
               hadolint --ignore DL3018 - < "$df"
           ) || { echo "hadolint" >> /tmp/_ci_failures; exit 1; }
