@@ -45,9 +45,11 @@ Special handling:
 """
 
 import argparse
+import atexit
 import contextlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -353,6 +355,44 @@ def _resolve_value(tok, step_outputs, caller_inputs):
 # ---------------------------------------------------------------------------
 # Run a "Resolve profile" step and capture its outputs
 # ---------------------------------------------------------------------------
+# GitHub Actions runner environment parity
+# ---------------------------------------------------------------------------
+# Workflow `run:` steps assume the standard runner-provided env vars exist.
+# The most load-bearing locally is $RUNNER_TEMP — a guaranteed-writable scratch
+# dir the markdown job (and others) write configs into. Steps execute under
+# `bash -eu`, so a missing var aborts with "unbound variable" rather than
+# failing the actual check. Synthesize the vars locally so ci-local mirrors CI.
+_RUNNER_TEMP_DIR = None
+
+
+def _runner_temp_dir() -> str:
+    """Lazily create the stand-in for $RUNNER_TEMP and clean it up at exit.
+
+    Real CI guarantees $RUNNER_TEMP is an existing, writable directory; mirror
+    that here with a single per-run temp dir reused across all steps.
+    """
+    global _RUNNER_TEMP_DIR
+    if _RUNNER_TEMP_DIR is None or not Path(_RUNNER_TEMP_DIR).is_dir():
+        _RUNNER_TEMP_DIR = tempfile.mkdtemp(prefix='ci-local-runner-temp-')
+        atexit.register(
+            lambda d=_RUNNER_TEMP_DIR: shutil.rmtree(d, ignore_errors=True)
+        )
+    return _RUNNER_TEMP_DIR
+
+
+def apply_runner_env(env: dict, cwd: Path) -> dict:
+    """Augment env (in place) with the GitHub Actions runner vars that workflow
+    steps rely on. Uses setdefault so a real Actions environment (or an explicit
+    step `env:`) always wins. Returns env for chaining."""
+    env.setdefault('RUNNER_TEMP', _runner_temp_dir())
+    env.setdefault('RUNNER_OS', 'Linux')
+    env.setdefault('RUNNER_ARCH', 'X64')
+    env.setdefault('GITHUB_WORKSPACE', str(cwd))
+    env.setdefault('CI', 'true')
+    return env
+
+
+# ---------------------------------------------------------------------------
 
 
 def run_profile_step(step, cwd):
@@ -373,6 +413,7 @@ def run_profile_step(step, cwd):
         env['GITHUB_OUTPUT'] = output_file
         # Provide GITHUB_WORKSPACE as the target dir
         env['GITHUB_WORKSPACE'] = str(cwd)
+        apply_runner_env(env, cwd)
 
         proc = subprocess.run(
             ['timeout', '10', 'bash', '-eu', '-o', 'pipefail', '-c', run_script],
@@ -418,6 +459,13 @@ def classify_step(step):
         return 'UNKNOWN', name, f'uses: {action_ref}'
 
     if 'run' in step:
+        # GitHub-Actions job-result aggregators reference needs.<job>.result,
+        # which only resolves in the Actions DAG. Locally the ${{ }} stays a
+        # literal string and the guard always fails — SKIP like other GHA-only
+        # steps instead of reporting a false failure.
+        env_blob = ' '.join(str(v) for v in (step.get('env') or {}).values())
+        if re.search(r'needs\.\w+\.result', step['run'] + ' ' + env_blob):
+            return 'SKIP', name, 'GitHub-only job-result aggregation (needs.*.result)'
         # Project-scoped npm installs (npm install / npm ci / npm install --no-save)
         # MUST run locally for version parity with CI. CI does a fresh install
         # on every run from package.json's semver ranges; our cached
@@ -459,6 +507,36 @@ def rewrite_hadolint_docker(cmd: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# markdownlint-cli2 gitignore parity
+# ---------------------------------------------------------------------------
+# CI lints a fresh checkout — only git-tracked files exist. Locally the working
+# tree may carry gitignored .md files (generated reports under .code-review/,
+# scratch notes, vendored docs) that CI never sees, producing false failures.
+# Rewrite the `**/*.md` recursive glob to the explicit git-tracked .md list so
+# ci-local lints exactly the fileset CI's checkout would.
+MARKDOWNLINT_GLOB_RE = re.compile(r'(["\']?)\*\*/\*\.md\1')
+
+
+def rewrite_markdownlint_gitignore(cmd: str, cwd: Path) -> str:
+    """Replace the markdownlint-cli2 `**/*.md` glob with git-tracked .md files."""
+    if 'markdownlint-cli2' not in cmd or not MARKDOWNLINT_GLOB_RE.search(cmd):
+        return cmd
+    try:
+        out = subprocess.run(
+            ['git', '-C', str(cwd), 'ls-files', '*.md'],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return cmd  # not a git repo or git unavailable; leave the glob as-is
+    files = [shlex.quote(f) for f in out.split('\n') if f.strip()]
+    if not files:
+        return cmd
+    return MARKDOWNLINT_GLOB_RE.sub(' '.join(files), cmd)
+
+
+# ---------------------------------------------------------------------------
 # Step execution
 # ---------------------------------------------------------------------------
 
@@ -470,6 +548,7 @@ def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
     env = os.environ.copy()
     for k, v in (step.get('env') or {}).items():
         env[k] = str(v)
+    apply_runner_env(env, cwd)
 
     if kind == 'SKIP':
         return True, gray('SKIP')
@@ -483,6 +562,7 @@ def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
     else:  # EXEC
         cmd = step['run']
         cmd = rewrite_hadolint_docker(cmd)
+        cmd = rewrite_markdownlint_gitignore(cmd, cwd)
 
     if dry_run:
         return True, blue('DRY')
@@ -949,7 +1029,7 @@ def run_codeql_for_job(jobname, steps, target: Path, dry_run: bool):
 def run_codeql_analysis(target: Path, languages, queries, dry_run, source_root=None):
     """Build a CodeQL DB, analyze it, filter findings through suppressions."""
     src = source_root or target
-    info = {'PASS': 0, 'FAIL': 0, 'DRY': 0, 'label': 'CodeQL'}
+    info = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'label': 'CodeQL'}
 
     print(
         f'  {blue("CODEQL")} analyze (lang={languages}, queries={queries or "default"}, root={src})'
@@ -957,12 +1037,12 @@ def run_codeql_analysis(target: Path, languages, queries, dry_run, source_root=N
 
     if not shutil.which('codeql'):
         print(
-            f'    → {red("FAIL")} codeql binary not found on PATH '
-            f'(install via tools.json or `apt`/manual)'
+            f'    → {gray("SKIP")} codeql binary not on PATH; analysis runs in '
+            f'CI (install locally via tools.json, or pass --no-codeql to silence)'
         )
-        info['FAIL'] += 1
-        info['label'] = 'CodeQL (codeql binary missing)'
-        return False, info
+        info['SKIP'] += 1
+        info['label'] = 'CodeQL (skipped — binary not installed)'
+        return True, info
 
     if dry_run:
         info['DRY'] += 1
