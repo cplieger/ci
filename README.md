@@ -2,7 +2,6 @@
 
 [![Lint](https://github.com/cplieger/ci/actions/workflows/lint.yaml/badge.svg)](https://github.com/cplieger/ci/actions/workflows/lint.yaml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/ci/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/ci)
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 
 Shared CI/CD for the `cplieger` repos: reusable GitHub Actions workflows, a
 composite versioning action, canonical lint/format configs, and a Renovate
@@ -92,7 +91,7 @@ The unified-CI group also syncs three workflows into each consumer repo:
 See [`BADGES.md`](BADGES.md) for the canonical badge block per repo type (Go
 lib, TS lib, hybrid, Docker image). The rule of thumb: prefer dynamic badges,
 never hardcode a version (the base-image badge is name-only), and keep one
-License style and order across the fleet. The badge row is per-repo (not
+badge order across the fleet. The badge row is per-repo (not
 synced) because it carries per-repo URLs.
 
 ## Composite action
