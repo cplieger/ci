@@ -209,6 +209,7 @@ if [[ ${#ci_repos[@]} -gt 0 ]]; then
     files:
       - .editorconfig
       - .gitattributes
+      - LICENSE
       - source: .github/workflow-templates/ci.yml
         dest: .github/workflows/ci.yaml
       - source: .github/workflow-templates/codeql.yml
