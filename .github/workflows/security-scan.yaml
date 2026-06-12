@@ -27,6 +27,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      - name: Accept documented misconfig false-positives (fleet-wide)
+        # DS-0002 (no USER): distroless images bake in nonroot UID 65534; some
+        # apps legitimately require root. DS-0026 (no HEALTHCHECK): healthchecks
+        # are defined in compose, not the Dockerfile. Ephemeral (not committed
+        # to consumer repos); Trivy auto-loads .trivyignore from the workdir.
+        run: printf '%s\n' AVD-DS-0002 AVD-DS-0026 DS-0002 DS-0026 > .trivyignore
+
       - name: Resolve profile
         id: profile
         run: |
