@@ -2,7 +2,7 @@
 
 This repo is the shared CI/CD source of truth: the reusable workflows, composite
 action, canonical lint configs, and Renovate preset that every other `cplieger`
-repo (around 30 of them) consumes instead of duplicating. Changes here ripple
+repo consumes instead of duplicating. Changes here ripple
 outward, so the conventions below are about not breaking downstream.
 
 ## Repository layout
@@ -95,7 +95,7 @@ bash scripts/classify-repos.sh    # prints a regenerated sync.yml to stdout
 ## Changing this repo affects every consumer
 
 A breaking change to a reusable workflow, the composite action, or a synced
-config lands in all ~30 consumer repos the moment the `vX` tag moves (workflows)
+config lands in every consumer repo the moment the `vX` tag moves (workflows)
 or the sync PR auto-merges (configs). Treat the reusable workflow inputs and the
 `validate` aggregate check name as a public API:
 
