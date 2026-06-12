@@ -63,6 +63,14 @@ jobs:
           set -euo pipefail
           echo "Reason: ${REASON}"
 
+          # Fail fast with an actionable message when the PAT secret is missing
+          # or empty. Without this, gh exits 4 with a generic "set the GH_TOKEN
+          # environment variable" error that hides the real cause (the secret).
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::RENOVATE_HOOK_PAT secret is missing or empty on ${REPO}. Set it to a fine-grained PAT scoped to cplieger/ci with Metadata: Read + Webhooks: Read and write."
+            exit 1
+          fi
+
           # Locate the active push webhook that targets the Komodo procedure
           # listener. There is exactly one today, but match by URL so a future
           # extra webhook can't be picked by accident.
