@@ -34,6 +34,7 @@ jobs:
       run_ts: ${{ steps.detect.outputs.run_ts }}
       run_web: ${{ steps.detect.outputs.run_web }}
       run_shell: ${{ steps.detect.outputs.run_shell }}
+      run_docker: ${{ steps.detect.outputs.run_docker }}
       web_dir: ${{ steps.detect.outputs.web_dir }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -49,6 +50,7 @@ jobs:
           run_ts=false
           run_web=false
           run_shell=false
+          run_docker=false
           web_dir=""
 
           # --- Did any non-docs (code) file change? ---
@@ -100,6 +102,7 @@ jobs:
             [ -f go.mod ] && run_go=true
             [ -f jsr.json ] && run_ts=true
             [ -f Dockerfile ] && run_shell=true
+            [ -f Dockerfile ] && run_docker=true
 
             # Probe known nested web-frontend locations. First hit wins.
             # Add new paths centrally if a future repo introduces a different
@@ -122,6 +125,7 @@ jobs:
             echo "run_ts=$run_ts"
             echo "run_web=$run_web"
             echo "run_shell=$run_shell"
+            echo "run_docker=$run_docker"
             echo "web_dir=$web_dir"
           } >> "$GITHUB_OUTPUT"
 
@@ -134,6 +138,7 @@ jobs:
             echo "| ts       | $run_ts | . |"
             echo "| web      | $run_web | ${web_dir:-—} |"
             echo "| shell    | $run_shell | . |"
+            echo "| docker   | $run_docker | . |"
             echo "| markdown | true (always) | . |"
             echo ""
             echo "code_changed: $code_changed"
@@ -161,6 +166,35 @@ jobs:
     needs: detect
     if: ${{ needs.detect.outputs.run_shell == 'true' }}
     uses: cplieger/ci/.github/workflows/shell-ci.yaml@469da1f600119cff4ed9b4674687cb5a4158b01f # v2
+
+  # Build-ability gate. Before this job, a consumer's required `ci / validate`
+  # never built the image — image builds happened only in the non-required
+  # Security workflow (security-scan.yaml) and post-merge in Release. A
+  # Dockerfile that fails to build (e.g. a package pin that doesn't exist in the
+  # base image's repo) could therefore merge green and only surface when Release
+  # failed. This job builds the image at PR time (single-arch, no push, no scan)
+  # so a broken Dockerfile fails the required check. It is purely "does it
+  # build" — vulnerability scanning stays advisory in security-scan.yaml so a
+  # base-image CVE never blocks a merge or release.
+  docker:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_docker == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build image (no push, no scan)
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   # Markdown lint always runs (every repo has at least a README). Inline rather
   # than a separate reusable workflow so it needs no self-referencing pinned tag
@@ -195,7 +229,7 @@ jobs:
   # per-type templates so existing branch-protection rules keep working
   # without per-repo updates).
   validate:
-    needs: [detect, go, ts, web, shell, markdown]
+    needs: [detect, go, ts, web, shell, docker, markdown]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 1
@@ -207,6 +241,7 @@ jobs:
           TS: ${{ needs.ts.result }}
           WEB: ${{ needs.web.result }}
           SHELL: ${{ needs.shell.result }}
+          DOCKER: ${{ needs.docker.result }}
           MARKDOWN: ${{ needs.markdown.result }}
         run: |
           # detect must always succeed (it gates everything else)
@@ -218,7 +253,7 @@ jobs:
           # or skipped (auto-detect said it wasn't applicable). markdown always
           # runs, so it must be success (skipped only if detect failed, caught
           # above).
-          for pair in "go=$GO" "ts=$TS" "web=$WEB" "shell=$SHELL" "markdown=$MARKDOWN"; do
+          for pair in "go=$GO" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "markdown=$MARKDOWN"; do
             name="${pair%%=*}"; result="${pair##*=}"
             if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
               echo "::error::$name job: $result"

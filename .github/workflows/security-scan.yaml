@@ -49,14 +49,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Trivy filesystem scan
+      # All Trivy scans here are ADVISORY (exit-code 0): they upload SARIF to
+      # the Security tab (and drive the OpenSSF/vuln badges) but never fail the
+      # check or block a merge. CVEs in the base image are frequently outside
+      # the maintainer's immediate control (no upstream fix yet, or not yet
+      # picked up), so gating merges/releases on them is the wrong lever.
+      # Build-ability — the only thing fully in our control — is gated by the
+      # required `ci / validate` check (the `docker` job in the meta ci.yaml),
+      # not here.
+      - name: Trivy filesystem scan (advisory)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scanners: 'vuln,secret'
           severity: ${{ inputs.severity }}
           ignore-unfixed: true
-          exit-code: '1'
+          exit-code: '0'
           format: 'sarif'
           output: 'trivy-fs.sarif'
 
@@ -69,14 +77,14 @@ jobs:
           format: 'sarif'
           output: 'trivy-misconfig.sarif'
 
-      - name: Trivy image scan
+      - name: Trivy image scan (advisory)
         if: ${{ steps.profile.outputs.image == 'true' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: 'ci-scan:latest'
           severity: ${{ inputs.severity }}
           ignore-unfixed: true
-          exit-code: '1'
+          exit-code: '0'
           format: 'sarif'
           output: 'trivy-image.sarif'
 
