@@ -15,8 +15,7 @@ suffix for versioned modules, e.g. `metrics/v2`).
    **name only** (`Alpine`, `Caddy`, `Distroless`, `scratch`) — never a patch
    version. Renovate bumps the `Dockerfile` `FROM` constantly; a version in the
    badge silently rots. The exact pin lives in the `Dockerfile` + the SBOM.
-3. **One style, one order.** Same License badge everywhere (linked, `.svg`,
-   capital `License`). Same per-type order (below). CI badge first.
+3. **One style, one order.** Same per-type order (below). CI badge first.
 4. **Every badge earns its place.** No decorative badges; each communicates
    build health, where to get it, docs, or security posture.
 
@@ -29,7 +28,6 @@ suffix for versioned modules, e.g. `metrics/v2`).
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/MODPATH.svg)](https://pkg.go.dev/github.com/cplieger/MODPATH)
 [![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/REPO)](https://goreportcard.com/report/github.com/cplieger/REPO)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 ```
 
 `Go Reference` uses `MODPATH` (with the `/v2` suffix if any); `Go Report Card`
@@ -42,7 +40,6 @@ always uses the bare `REPO`.
 [![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
 [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 ```
 
 ### Hybrid Go + TS library (e.g. vterm)
@@ -53,7 +50,6 @@ always uses the bare `REPO`.
 [![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
 [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 ```
 
 ### Docker image
@@ -65,7 +61,6 @@ always uses the bare `REPO`.
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 ```
 
 - `CONTAINER` is the GHCR package name (often `REPO`, but some differ, e.g.
