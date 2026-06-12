@@ -2,7 +2,50 @@
 # Re-run the script (or let the daily sync workflow do it) to regenerate.
 
 group:
-  # Go repos (standard CI)
+  # Unified CI (auto-detects go/ts/web/shell surfaces)
+  - repos: |
+      cplieger/actions
+      cplieger/atomicfile
+      cplieger/auth
+      cplieger/cert-converter
+      cplieger/db-dumper
+      cplieger/docker-age
+      cplieger/docker-caddy
+      cplieger/docker-fclones-scheduler
+      cplieger/docker-keepalived
+      cplieger/docker-nut-upsd
+      cplieger/docker-radvd
+      cplieger/docker-renovate-scheduler
+      cplieger/docker-rsync-scheduler
+      cplieger/docker-smtp-relay
+      cplieger/docker-static-web
+      cplieger/health
+      cplieger/httpx
+      cplieger/metrics
+      cplieger/plex-exporter
+      cplieger/plex-language-sync
+      cplieger/reactive
+      cplieger/registry-stats
+      cplieger/ssrf
+      cplieger/subflux
+      cplieger/tautulli-remap
+      cplieger/vibecli
+      cplieger/vibekit
+      cplieger/vterm
+      cplieger/wiregen
+    files:
+      - .editorconfig
+      - .gitattributes
+      - source: .github/workflow-templates/ci.yml
+        dest: .github/workflows/ci.yaml
+      - source: .github/workflow-templates/codeql.yml
+        dest: .github/workflows/codeql.yml
+      - source: .github/workflow-templates/security.yml
+        dest: .github/workflows/security.yml
+      - source: .github/workflow-templates/scorecard.yml
+        dest: .github/workflows/scorecard.yml
+
+  # Go-tooling configs (Go-having repos)
   - repos: |
       cplieger/atomicfile
       cplieger/auth
@@ -10,6 +53,8 @@ group:
       cplieger/db-dumper
       cplieger/docker-age
       cplieger/docker-fclones-scheduler
+      cplieger/docker-renovate-scheduler
+      cplieger/docker-rsync-scheduler
       cplieger/health
       cplieger/httpx
       cplieger/metrics
@@ -17,61 +62,27 @@ group:
       cplieger/plex-language-sync
       cplieger/registry-stats
       cplieger/ssrf
-      cplieger/tautulli-remap
-      cplieger/wiregen
-    files:
-      - .golangci.yaml
-      - .editorconfig
-      - source: .github/workflow-templates/ci-go.yml
-        dest: .github/workflows/ci.yaml
-      - source: .github/workflow-templates/codeql.yml
-        dest: .github/workflows/codeql.yml
-      - source: .github/workflow-templates/security.yml
-        dest: .github/workflows/security.yml
-
-  # Go repos (web frontend — bespoke ci.yaml)
-  - repos: |
       cplieger/subflux
+      cplieger/tautulli-remap
       cplieger/vibecli
       cplieger/vibekit
       cplieger/vterm
+      cplieger/wiregen
     files:
       - .golangci.yaml
-      - .editorconfig
-      - source: .github/workflow-templates/codeql.yml
-        dest: .github/workflows/codeql.yml
-      - source: .github/workflow-templates/security.yml
-        dest: .github/workflows/security.yml
+      - source: configs/gremlins.yaml
+        dest: .gremlins.yaml
 
-  # TypeScript repos
+  # Python repos (ruff + editorconfig; bespoke ci.yaml)
   - repos: |
-      cplieger/actions
-      cplieger/reactive
+      cplieger/.kiro
     files:
       - .editorconfig
-      - source: .github/workflow-templates/ci-ts-lib.yml
-        dest: .github/workflows/ci.yaml
-      - source: .github/workflow-templates/codeql.yml
-        dest: .github/workflows/codeql.yml
-      - source: .github/workflow-templates/security.yml
-        dest: .github/workflows/security.yml
+      - .gitattributes
+      - source: configs/ruff.toml
+        dest: ruff.toml
 
-  # Shell/Docker repos
-  - repos: |
-      cplieger/docker-caddy
-      cplieger/docker-keepalived
-      cplieger/docker-nut-upsd
-      cplieger/docker-radvd
-      cplieger/docker-smtp-relay
-      cplieger/docker-static-web
-    files:
-      - .editorconfig
-      - source: .github/workflow-templates/ci-shell.yml
-        dest: .github/workflows/ci.yaml
-      - source: .github/workflow-templates/security.yml
-        dest: .github/workflows/security.yml
-
-  # TypeScript lint/format configs
+  # TypeScript lint/format configs (TS-having repos, including hybrids)
   - repos: |
       cplieger/actions
       cplieger/reactive
@@ -102,6 +113,8 @@ group:
       cplieger/docker-keepalived
       cplieger/docker-nut-upsd
       cplieger/docker-radvd
+      cplieger/docker-renovate-scheduler
+      cplieger/docker-rsync-scheduler
       cplieger/docker-smtp-relay
       cplieger/docker-static-web
       cplieger/health
@@ -124,6 +137,9 @@ group:
 
   # Cliff config (stable — v1.x+)
   - repos: |
+      cplieger/actions
+      cplieger/atomicfile
+      cplieger/auth
       cplieger/cert-converter
       cplieger/db-dumper
       cplieger/docker-age
@@ -132,31 +148,30 @@ group:
       cplieger/docker-keepalived
       cplieger/docker-nut-upsd
       cplieger/docker-radvd
+      cplieger/docker-renovate-scheduler
+      cplieger/docker-rsync-scheduler
       cplieger/docker-smtp-relay
       cplieger/docker-static-web
+      cplieger/health
+      cplieger/httpx
+      cplieger/metrics
       cplieger/plex-exporter
       cplieger/plex-language-sync
+      cplieger/reactive
       cplieger/registry-stats
+      cplieger/ssrf
       cplieger/tautulli-remap
+      cplieger/vterm
+      cplieger/wiregen
     files:
       - source: configs/cliff-stable.toml
         dest: cliff.toml
 
   # Cliff config (alpha — v0.x or no tags)
   - repos: |
-      cplieger/actions
-      cplieger/atomicfile
-      cplieger/auth
-      cplieger/health
-      cplieger/httpx
-      cplieger/metrics
-      cplieger/reactive
-      cplieger/ssrf
       cplieger/subflux
       cplieger/vibecli
       cplieger/vibekit
-      cplieger/vterm
-      cplieger/wiregen
     files:
       - source: configs/cliff-alpha.toml
         dest: cliff.toml
