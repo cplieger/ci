@@ -147,17 +147,17 @@ jobs:
   go:
     needs: detect
     if: ${{ needs.detect.outputs.run_go == 'true' }}
-    uses: cplieger/ci/.github/workflows/go-ci.yaml@469da1f600119cff4ed9b4674687cb5a4158b01f # v2
+    uses: cplieger/ci/.github/workflows/go-ci.yaml@a28f3730fec44be2e29e687e779dd7d43520771c # v2
 
   ts:
     needs: detect
     if: ${{ needs.detect.outputs.run_ts == 'true' }}
-    uses: cplieger/ci/.github/workflows/ts-ci.yaml@469da1f600119cff4ed9b4674687cb5a4158b01f # v2
+    uses: cplieger/ci/.github/workflows/ts-ci.yaml@a28f3730fec44be2e29e687e779dd7d43520771c # v2
 
   web:
     needs: detect
     if: ${{ needs.detect.outputs.run_web == 'true' }}
-    uses: cplieger/ci/.github/workflows/ts-ci.yaml@469da1f600119cff4ed9b4674687cb5a4158b01f # v2
+    uses: cplieger/ci/.github/workflows/ts-ci.yaml@a28f3730fec44be2e29e687e779dd7d43520771c # v2
     with:
       working-directory: ${{ needs.detect.outputs.web_dir }}
       web-lint: true
@@ -165,7 +165,7 @@ jobs:
   shell:
     needs: detect
     if: ${{ needs.detect.outputs.run_shell == 'true' }}
-    uses: cplieger/ci/.github/workflows/shell-ci.yaml@469da1f600119cff4ed9b4674687cb5a4158b01f # v2
+    uses: cplieger/ci/.github/workflows/shell-ci.yaml@a28f3730fec44be2e29e687e779dd7d43520771c # v2
 
   # Build-ability gate. Before this job, a consumer's required `ci / validate`
   # never built the image — image builds happened only in the non-required
