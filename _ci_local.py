@@ -86,7 +86,11 @@ KNOWN_USES = {
     'github/codeql-action/upload-sarif': ('SKIP', 'SARIF upload; GitHub-only'),
     'aquasecurity/trivy-action': (
         'LOCAL',
-        'trivy fs --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .',
+        # Advisory in CI (every trivy step pins exit-code: 0; findings go to the
+        # Security tab, never gate a merge/release). Mirror that locally with
+        # --exit-code 0 so a HIGH/CRITICAL finding prints but does not fail the
+        # local run, matching CI semantics.
+        'trivy fs --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 .',
     ),
     'docker/setup-buildx-action': ('SKIP', 'buildx assumed available with local Docker'),
     'docker/build-push-action': (
@@ -164,6 +168,12 @@ def resolve_reusable_workflow(uses_ref, target):
       1. Sibling checkout: <repo-root>/../ci/.github/workflows/<X>.yaml
       2. gh api fetch (timeout-wrapped)
       3. None (caller falls back to autodetect)
+
+    Caveat: the sibling-checkout path resolves to the LOCAL `ci/` working tree,
+    ignoring the pinned `@sha` in `uses:`. So ci-local validates against the
+    current (possibly unreleased) workflow source, not the exact SHA a
+    consumer's CI runs. Intended for developing the ci repo; a minor fidelity
+    caveat for consumers whose pinned SHA lags `main`.
     """
     m = REUSABLE_RE.match(uses_ref)
     if not m:
@@ -380,15 +390,40 @@ def _runner_temp_dir() -> str:
     return _RUNNER_TEMP_DIR
 
 
+def _restore_file_bytes(path: Path, data, existed: bool):
+    """atexit restorer to keep ci-local side-effect-free on the working tree.
+
+    Restores `path` to its pre-run bytes when it existed, or removes a file the
+    run created. Best-effort; never raises (runs at interpreter shutdown).
+    """
+    try:
+        if existed:
+            path.write_bytes(data)
+        elif path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
 def apply_runner_env(env: dict, cwd: Path) -> dict:
     """Augment env (in place) with the GitHub Actions runner vars that workflow
     steps rely on. Uses setdefault so a real Actions environment (or an explicit
     step `env:`) always wins. Returns env for chaining."""
-    env.setdefault('RUNNER_TEMP', _runner_temp_dir())
+    rt = _runner_temp_dir()
+    env.setdefault('RUNNER_TEMP', rt)
     env.setdefault('RUNNER_OS', 'Linux')
     env.setdefault('RUNNER_ARCH', 'X64')
     env.setdefault('GITHUB_WORKSPACE', str(cwd))
     env.setdefault('CI', 'true')
+    # GitHub-runner file sinks. Steps routinely append to these
+    # (`>> "$GITHUB_ENV"`, `>> "$GITHUB_STEP_SUMMARY"`, `>> "$GITHUB_OUTPUT"`);
+    # under `bash -eu` an unset one is an "unbound variable" error that fails the
+    # step — and for the detect profile step it silently discards the outputs it
+    # already wrote (rc!=0 path). Point them at writable per-run temp files so the
+    # redirects succeed. `setdefault` lets run_profile_step's explicit
+    # GITHUB_OUTPUT win.
+    for _sink in ('GITHUB_STEP_SUMMARY', 'GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_OUTPUT'):
+        env.setdefault(_sink, os.path.join(rt, _sink.lower()))
     return env
 
 
@@ -453,6 +488,23 @@ def classify_step(step):
 
     if 'uses' in step:
         action_ref = step['uses'].split('@', 1)[0].strip()
+        # Build-ability gate: CI's required `docker` job builds the image via
+        # docker/build-push-action (no push). Mirror it locally with
+        # `docker build` (same context/file/target, default = final stage) so a
+        # Dockerfile that won't build fails the local run too. SKIP loudly when
+        # docker isn't on PATH rather than pretending the gate ran.
+        if action_ref == 'docker/build-push-action':
+            if not shutil.which('docker'):
+                return 'SKIP', name, 'docker not on PATH; build-ability gate NOT exercised locally'
+            with_ = step.get('with') or {}
+            context = str(with_.get('context', '.')).strip() or '.'
+            dockerfile = str(with_.get('file', 'Dockerfile')).strip() or 'Dockerfile'
+            target_stage = str(with_.get('target', '')).strip()
+            cmd = f'docker build -f {shlex.quote(dockerfile)}'
+            if target_stage:
+                cmd += f' --target {shlex.quote(target_stage)}'
+            cmd += f' {shlex.quote(context)}'
+            return 'LOCAL', name, cmd
         if action_ref in KNOWN_USES:
             kind, detail = KNOWN_USES[action_ref]
             return kind, name, detail
@@ -605,7 +657,7 @@ def autodetect_steps(target: Path):
                 {'name': 'Verify dependencies', 'run': 'go mod verify'},
                 {'name': 'Vet', 'run': 'go vet ./...'},
                 {'name': 'Lint', 'run': 'golangci-lint run --timeout=5m ./...'},
-                {'name': 'Test', 'run': 'go test -count=1 -short ./...'},
+                {'name': 'Test', 'run': 'go test -race -count=1 ./...'},
             ]
         )
 
@@ -613,7 +665,7 @@ def autodetect_steps(target: Path):
         steps.append(
             {
                 'name': 'Validate Dockerfile',
-                'run': 'hadolint --ignore DL3018 --ignore DL3008 --ignore DL4006 Dockerfile',
+                'run': 'hadolint --ignore DL3018 Dockerfile',
             }
         )
 
@@ -664,41 +716,125 @@ def load_workflow_raw(path: Path):
 # ---------------------------------------------------------------------------
 
 
-def expand_reusable_jobs(jobs_dict, target):
-    """Given a raw workflow's jobs dict, expand any reusable-workflow callers.
+WEB_DIR_PROBE = ('static-src', 'web', 'internal/server/static-src')
 
-    Returns list of (jobname, steps, working_dir, caller_inputs) tuples.
-    Jobs with inline steps are returned as-is (caller_inputs=None).
-    """
+
+def detect_web_dir(target):
+    """Mirror the meta ci.yaml detect web-frontend probe: first of static-src/,
+    web/, internal/server/static-src/ that contains package.json or jsr.json."""
+    for d in WEB_DIR_PROBE:
+        p = target / d
+        if p.is_dir() and ((p / 'package.json').is_file() or (p / 'jsr.json').is_file()):
+            return d
+    return None
+
+
+def compute_local_detect(target):
+    """Reproduce the meta ci.yaml `detect` job's surface outputs from local file
+    presence. ci-local always runs the applicable surfaces (it mirrors CI's
+    fail-safe "treat as code change" path; there is no docs-only skip locally)."""
+    web = detect_web_dir(target)
+    has_dockerfile = (target / 'Dockerfile').is_file()
+    return {
+        'run_go': 'true' if (target / 'go.mod').is_file() else 'false',
+        'run_ts': 'true' if (target / 'jsr.json').is_file() else 'false',
+        'run_web': 'true' if web else 'false',
+        'run_shell': 'true' if has_dockerfile else 'false',
+        'run_docker': 'true' if has_dockerfile else 'false',
+        'web_dir': web or '',
+    }
+
+
+def job_applies_locally(jobname, target):
+    """Gate an expanded (recursed) job by local surface detection, mirroring the
+    meta ci.yaml job-level `if: needs.detect.outputs.run_X`. The surface is the
+    meta job component (second path segment, e.g. 'go' in 'ci/go/test')."""
+    parts = jobname.split('/')
+    meta = parts[1] if len(parts) > 1 else parts[0]
+    det = compute_local_detect(target)
+    gate = {
+        'go': det['run_go'],
+        'ts': det['run_ts'],
+        'web': det['run_web'],
+        'shell': det['run_shell'],
+        'docker': det['run_docker'],
+    }.get(meta)
+    return True if gate is None else gate == 'true'
+
+
+def _resolve_with_value(value, inputs, target, strip_unknown=False):
+    """Resolve ${{ inputs.X }} (from caller inputs) and
+    ${{ needs.<job>.outputs.X }} (from local detect, e.g. web_dir) in a `with:`
+    value, a working-directory, or a `run:` script body. Non-strings pass
+    through. With strip_unknown=True (used for run-script bodies), any other
+    ${{ ... }} expression is replaced with '' so bash doesn't hit a "bad
+    substitution" error on an expression GitHub would have substituted."""
+    if not isinstance(value, str):
+        return value
+
+    def repl(m):
+        inner = m.group(1).strip()
+        im = re.match(r'inputs\.([\w-]+)$', inner)
+        if im:
+            return str(inputs.get(im.group(1), ''))
+        nm = re.match(r'needs\.\w+\.outputs\.([\w-]+)$', inner)
+        if nm:
+            return str(compute_local_detect(target).get(nm.group(1), ''))
+        return '' if strip_unknown else m.group(0)
+
+    return re.sub(r'\$\{\{\s*(.+?)\s*\}\}', repl, value)
+
+
+def _expand_job(jobname, job, caller_inputs, target, depth=0):
+    """Expand one job into terminal (jobname, steps, working_dir, caller_inputs)
+    tuples, recursing through nested reusable-workflow callers (consumer ci.yaml
+    -> meta ci.yaml -> go-ci/ts-ci/shell-ci/...). `caller_inputs` is None only
+    for a plain inline job that never came from a reusable workflow."""
+    uses = job.get('uses', '')
+    if uses and REUSABLE_RE.match(uses) and depth < 6:
+        resolved = resolve_reusable_workflow(uses, target)
+        if resolved is None:
+            print(
+                f'  {yellow("WARN")} could not resolve reusable workflow: {uses}; '
+                f'falling back to autodetect for job "{jobname}"',
+                file=sys.stderr,
+            )
+            return [(jobname, autodetect_steps(target), '.', None)]
+        # Seed inputs with the reusable's declared workflow_call defaults (PyYAML
+        # parses a bare `on:` key as boolean True), then let the caller's `with:`
+        # override them. This gives steps concrete input values (e.g. the
+        # security scan's `file: ${{ inputs.dockerfile }}` -> ./Dockerfile).
+        on_block = resolved.get('on')
+        if on_block is None:
+            on_block = resolved.get(True)
+        wc_inputs = ((on_block or {}).get('workflow_call') or {}).get('inputs') or {}
+        merged = {}
+        for iname, ispec in wc_inputs.items():
+            if isinstance(ispec, dict) and 'default' in ispec:
+                merged[iname] = ispec['default']
+        for k, v in (job.get('with') or {}).items():
+            merged[k] = _resolve_with_value(v, caller_inputs or {}, target)
+        out = []
+        for rjob_name, rjob in (resolved.get('jobs') or {}).items():
+            out.extend(_expand_job(f'{jobname}/{rjob_name}', rjob, merged, target, depth + 1))
+        return out
+
+    # Terminal: a job with inline steps.
+    steps = job.get('steps') or []
+    run_defaults = (job.get('defaults') or {}).get('run') or {}
+    wd = _resolve_with_value(run_defaults.get('working-directory', '.'), caller_inputs or {}, target)
+    return [(jobname, steps, wd or '.', caller_inputs)]
+
+
+def expand_reusable_jobs(jobs_dict, target):
+    """Expand reusable-workflow callers to (jobname, steps, working_dir,
+    caller_inputs) tuples, recursing through nested callers. A consumer's thin
+    `ci` job -> the meta ci.yaml -> the per-surface go-ci/ts-ci/web/shell-ci
+    workflows, whose steps are what actually gate. caller_inputs is None only for
+    plain inline jobs (autodetect-fallback / non-reusable)."""
     result = []
     for jobname, job in jobs_dict.items():
-        uses = job.get('uses', '')
-        if uses and REUSABLE_RE.match(uses):
-            caller_inputs = job.get('with') or {}
-            resolved = resolve_reusable_workflow(uses, target)
-            if resolved is None:
-                print(
-                    f'  {yellow("WARN")} could not resolve reusable workflow: {uses}; '
-                    f'falling back to autodetect for job "{jobname}"',
-                    file=sys.stderr,
-                )
-                result.append((jobname, autodetect_steps(target), '.', None))
-                continue
-            # Extract jobs from the resolved workflow
-            resolved_jobs = resolved.get('jobs') or {}
-            for rjob_name, rjob in resolved_jobs.items():
-                steps = rjob.get('steps') or []
-                # Determine working directory from defaults or inputs
-                wd = '.'
-                defaults = rjob.get('defaults') or {}
-                run_defaults = defaults.get('run') or {}
-                wd_expr = run_defaults.get('working-directory', '.')
-                # Resolve ${{ inputs.working-directory }} from caller inputs
-                wd = _resolve_input_expr(wd_expr, caller_inputs)
-                result.append((f'{jobname}/{rjob_name}', steps, wd, caller_inputs))
-        else:
-            steps = job.get('steps') or []
-            result.append((jobname, steps, '.', None))
+        result.extend(_expand_job(jobname, job, None, target, 0))
     return result
 
 
@@ -764,17 +900,30 @@ def process_reusable_steps(steps, target, working_dir, caller_inputs, dry_run, i
                 counters['SKIP'] += 1
                 continue
 
-        # Classify the step normally
-        kind, _sname, detail = classify_step(step)
-
-        # Build the effective step with resolved working-directory
+        # Build the effective step first: resolve ${{ inputs.* }} / ${{ needs.* }}
+        # in `with:` values and working-directory BEFORE classification, so steps
+        # like docker/build-push-action receive concrete file/context paths
+        # instead of literal `${{ inputs.dockerfile }}`.
         eff_step = dict(step)
+        if isinstance(step.get('with'), dict):
+            eff_step['with'] = {
+                k: _resolve_with_value(v, caller_inputs, target) for k, v in step['with'].items()
+            }
+        if isinstance(step.get('run'), str):
+            # CI substitutes ${{ }} before the shell sees it; mirror that for
+            # inputs/needs and strip any other expression so bash doesn't fail
+            # with "bad substitution" on a literal `${{ ... }}` in the script.
+            eff_step['run'] = _resolve_with_value(
+                step['run'], caller_inputs, target, strip_unknown=True
+            )
         if step_wd and step_wd != '.':
             eff_step['working-directory'] = step_wd
         elif 'working-directory' not in step and working_dir != '.':
             eff_step['working-directory'] = working_dir
         elif 'working-directory' in eff_step:
             eff_step['working-directory'] = step_wd or None
+
+        kind, _sname, detail = classify_step(eff_step)
 
         wd = eff_step.get('working-directory')
         wd_str = f' [cwd={wd}]' if wd else ''
@@ -1335,6 +1484,14 @@ def process_workflow_file(wf_path, target, dry_run, ignore_unknown, no_codeql):
         expanded = expand_reusable_jobs(jobs_dict, target)
         for jobname, steps, working_dir, caller_inputs in expanded:
             print(f'--- job: {jobname} ---')
+            if not job_applies_locally(jobname, target):
+                print(f'  {gray("SKIP")} (surface not present locally)')
+                print()
+                continue
+            if not steps:
+                print(f'  {gray("SKIP")} (no steps to run)')
+                print()
+                continue
             if caller_inputs is not None:
                 # This came from a reusable workflow — use if-evaluation
                 ok, counters, failed = process_reusable_steps(
@@ -1478,6 +1635,29 @@ def main():
                     f'node_modules/ dir(s) (mirrors CI fresh-checkout state; '
                     f'workflow re-installs them)'
                 )
+
+    # Keep ci-local side-effect-free on the working tree (mirrors the
+    # node_modules cleanup above). Two CI steps mutate tracked files and would
+    # otherwise leave a local diff: the security scan does
+    # `printf ... > .trivyignore` (trivy auto-loads it from the workdir), and the
+    # Go wiregen-drift step does `git add -A` (staging the whole tree). Snapshot
+    # both and restore at exit via atexit, so a timeout, exception, or Ctrl-C
+    # between here and the end still restores them.
+    if not args.plan_only:
+        ti_path = target / '.trivyignore'
+        ti_existed = ti_path.exists()
+        ti_saved = ti_path.read_bytes() if ti_existed else None
+        atexit.register(_restore_file_bytes, ti_path, ti_saved, ti_existed)
+
+        gi = subprocess.run(
+            ['git', '-C', str(target), 'rev-parse', '--absolute-git-dir'],
+            capture_output=True,
+            text=True,
+        )
+        if gi.returncode == 0:
+            index_path = Path(gi.stdout.strip()) / 'index'
+            if index_path.is_file():
+                atexit.register(_restore_file_bytes, index_path, index_path.read_bytes(), True)
 
     grand_counters = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0}
     grand_failed = []
