@@ -218,6 +218,8 @@ if [[ ${#ci_repos[@]} -gt 0 ]]; then
         dest: .github/workflows/security.yml
       - source: .github/workflow-templates/scorecard.yml
         dest: .github/workflows/scorecard.yml
+      - source: configs/renovate.json
+        dest: renovate.json
 EOF
 fi
 

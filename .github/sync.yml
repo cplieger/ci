@@ -45,6 +45,8 @@ group:
         dest: .github/workflows/security.yml
       - source: .github/workflow-templates/scorecard.yml
         dest: .github/workflows/scorecard.yml
+      - source: configs/renovate.json
+        dest: renovate.json
 
   # Go-tooling configs (Go-having repos)
   - repos: |
