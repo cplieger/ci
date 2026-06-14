@@ -438,12 +438,21 @@ jobs:
           else
             npm publish --access public
           fi
-          # deno's `jsr publish` uses BYONM, so runtime deps (e.g.
-          # @cplieger/actions -> @cplieger/reactive) must already be in
-          # node_modules; the npm publish above does not install them.
-          # Install (without touching the lockfile) before publishing to JSR.
-          npm install --no-save
-          npx jsr publish --allow-dirty
+          # Skip JSR if the version already exists. JSR has no overwrite and
+          # `jsr publish` errors on a duplicate, which would wedge a re-run
+          # after a partial/cancelled release (npm can publish but the run
+          # dies before tagging). Mirror of the npm guard above.
+          if curl -fsSL "https://jsr.io/${pkg}/meta.json" \
+               | jq -e --arg v "$ver" '.versions[$v]' >/dev/null 2>&1; then
+            echo "::notice::jsr: $pkg@$ver already published — skipping"
+          else
+            # deno's `jsr publish` uses BYONM, so runtime deps (e.g.
+            # @cplieger/actions -> @cplieger/reactive) must already be in
+            # node_modules; the npm publish above does not install them.
+            # Install (without touching the lockfile) before publishing to JSR.
+            npm install --no-save
+            npx jsr publish --allow-dirty
+          fi
 
       - name: Tag + GitHub Release
         env:
@@ -499,9 +508,17 @@ jobs:
           else
             npm publish --access public
           fi
-          # deno's `jsr publish` uses BYONM, so runtime deps (e.g.
-          # @cplieger/actions -> @cplieger/reactive) must already be in
-          # node_modules; the npm publish above does not install them.
-          # Install (without touching the lockfile) before publishing to JSR.
-          npm install --no-save
-          npx jsr publish --allow-dirty
+          # Skip JSR if the version already exists (mirror of the npm guard);
+          # keeps a re-run after a partial/cancelled release from wedging on
+          # a duplicate `jsr publish`.
+          if curl -fsSL "https://jsr.io/${pkg}/meta.json" \
+               | jq -e --arg v "$ver" '.versions[$v]' >/dev/null 2>&1; then
+            echo "::notice::jsr: $pkg@$ver already published — skipping"
+          else
+            # deno's `jsr publish` uses BYONM, so runtime deps (e.g.
+            # @cplieger/actions -> @cplieger/reactive) must already be in
+            # node_modules; the npm publish above does not install them.
+            # Install (without touching the lockfile) before publishing to JSR.
+            npm install --no-save
+            npx jsr publish --allow-dirty
+          fi
