@@ -75,7 +75,10 @@ jobs:
 
       - name: Compute version (cliff)
         id: cliff
-        uses: cplieger/ci/actions/git-cliff-version@f3e8b6046090f35e9db83d9b7dc41d69adafd608 # v2
+        # Local ref (not an @sha pin): resolves to git-cliff-version at the
+        # SAME commit a consumer pinned this release.yaml to, so internal
+        # self-references never lag behind a fix to this repo.
+        uses: ./actions/git-cliff-version
 
       - name: Detect type + subpackages
         id: type
@@ -366,7 +369,11 @@ jobs:
   docker:
     needs: detect
     if: ${{ needs.detect.outputs.type == 'docker' && needs.detect.outputs.root_changed == 'true' }}
-    uses: cplieger/ci/.github/workflows/docker-release.yaml@f3e8b6046090f35e9db83d9b7dc41d69adafd608 # v2
+    # Local ref (not an @sha pin): docker-release.yaml resolves to the SAME
+    # commit a consumer pinned this release.yaml to, so a fix to
+    # docker-release.yaml reaches consumers on the next release.yaml bump
+    # without a second internal-pin bump + tag cycle.
+    uses: ./.github/workflows/docker-release.yaml
     with:
       version: ${{ needs.detect.outputs.version }}
       release-needed: ${{ needs.detect.outputs.release }}
