@@ -8,87 +8,170 @@ suffix for versioned modules, e.g. `metrics/v2`).
 
 ## Principles
 
-1. **Dynamic over static.** Prefer badges that read live state (CI, release,
-   pkg.go.dev, npm, JSR, Go Report Card, OpenSSF, image size) over hand-written
-   values. A hand-written value is a future stale value.
+1. **Dynamic over static.** Prefer badges that read live state (pkg.go.dev,
+   npm, JSR, Go Report Card, OpenSSF, image size, coverage, mutation) over
+   hand-written values. A hand-written value is a future stale value.
 2. **No hardcoded versions in a badge.** The base-image badge carries the base
    **name only** (`Alpine`, `Caddy`, `Distroless`, `scratch`) — never a patch
    version. Renovate bumps the `Dockerfile` `FROM` constantly; a version in the
    badge silently rots. The exact pin lives in the `Dockerfile` + the SBOM.
-3. **One style, one order.** Same per-type order (below). CI badge first.
-4. **Every badge earns its place.** No decorative badges; each communicates
-   build health, where to get it, docs, or security posture.
+3. **No CI or release badge.** Both were dropped fleet-wide:
+   - **CI**: a workflow status badge tracks the latest run on the *default
+     branch*. With required PR checks + auto-merge, nothing lands on `main`
+     until it is already green, so the badge is a near-permanent green
+     decoration that conveys nothing. Red would be a rare flake, not a signal a
+     consumer can act on.
+   - **Release/version**: redundant on every surface a consumer actually reads.
+     GitHub shows it in the sidebar; Docker Hub shows the latest tag on the
+     page; pkg.go.dev / npm / JSR all surface the version natively. The Go
+     Reference / npm / JSR badges already carry version-to-docs.
+4. **One style, one order.** Same per-type order (below). Group as
+   identity/version → quality → security/supply-chain.
+5. **Every badge earns its place, and the row has a credibility cliff.** No
+   decorative badges; each communicates where to get it, docs, code quality, or
+   security posture. Past ~8 badges a row reads as a trophy case and people stop
+   trusting any single badge — keep rows at 8 or under and prune hard.
 
 ## Blocks by repo type
 
 ### Go library
 
 ```markdown
-[![CI](https://github.com/cplieger/REPO/actions/workflows/ci.yaml/badge.svg)](https://github.com/cplieger/REPO/actions/workflows/ci.yaml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/MODPATH.svg)](https://pkg.go.dev/github.com/cplieger/MODPATH)
+[![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/REPO)](https://github.com/cplieger/REPO/blob/main/go.mod)
 [![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/REPO)](https://goreportcard.com/report/github.com/cplieger/REPO)
-[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
+[![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
+[![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
 ```
 
 `Go Reference` uses `MODPATH` (with the `/v2` suffix if any); `Go Report Card`
-always uses the bare `REPO`.
+and `Go version` always use the bare `REPO`. Omit the **Mutation** badge on
+repos below the weekly-gremlins size threshold (≈200 LOC of non-test Go) — they
+get no mutation run, so the badge would read `invalid`.
 
 ### TypeScript library
 
 ```markdown
-[![CI](https://github.com/cplieger/REPO/actions/workflows/ci.yaml/badge.svg)](https://github.com/cplieger/REPO/actions/workflows/ci.yaml)
 [![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
 [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
-[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
+[![Node version](https://img.shields.io/node/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
+[![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
 ```
+
+The **Node version** badge reads `engines.node` from the published npm package,
+so `package.json` must declare `engines.node` or the badge shows
+`node | not specified`. No **Mutation** badge — gremlins is Go-only (there is no
+Stryker equivalent wired up).
 
 ### Hybrid Go + TS library (e.g. vterm)
 
 ```markdown
-[![CI](.../ci.yaml/badge.svg)](...)
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/REPO.svg)](https://pkg.go.dev/github.com/cplieger/REPO)
 [![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
 [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
-[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
+[![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/REPO)](https://github.com/cplieger/REPO/blob/main/go.mod)
+[![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/REPO)](https://goreportcard.com/report/github.com/cplieger/REPO)
+[![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
 ```
 
-### Docker image
+8 badges — at the cliff. The single Node-version badge is dropped here (the lib
+is Go-first); add it back only if the TS surface is the primary one. Coverage
+and the Mutation badge reflect whichever surface `coverage.yaml` / gremlins
+measure on the repo (Go, for vterm).
+
+### Docker image (built from Go source in this repo)
 
 ```markdown
-[![CI](https://github.com/cplieger/REPO/actions/workflows/ci.yaml/badge.svg)](https://github.com/cplieger/REPO/actions/workflows/ci.yaml)
-[![GitHub release](https://img.shields.io/github/v/release/cplieger/REPO)](https://github.com/cplieger/REPO/releases)
 [![Image Size](https://ghcr-badge.egpl.dev/cplieger/REPO/size)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER)
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO)
-[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
+[![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/REPO)](https://goreportcard.com/report/github.com/cplieger/REPO)
+[![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
+[![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
+[![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/REPO/releases)
 ```
 
-- The **Coverage** row applies only to images **built from Go source in this
-  repo** (they publish a `coverage.json` via the synced `coverage.yml`). Omit
-  it for thin upstream-wrapper images (`docker-caddy`, `docker-keepalived`,
-  `docker-nut-upsd`, `docker-radvd`, `docker-smtp-relay`, `docker-static-web`),
-  which have no statement coverage.
+### Docker image (thin upstream wrapper, no Go source)
 
+```markdown
+[![Image Size](https://ghcr-badge.egpl.dev/cplieger/REPO/size)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER)
+![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
+![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
+[![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/REPO/releases)
+```
+
+- The **Test coverage** and **Mutation** rows apply only to images **built from
+  Go source in this repo**. Omit both for thin upstream-wrapper images
+  (`docker-caddy`, `docker-keepalived`, `docker-nut-upsd`, `docker-radvd`,
+  `docker-smtp-relay`, `docker-static-web`), which have no statement coverage
+  and no mutation run.
 - `CONTAINER` is the GHCR package name (often `REPO`, but some differ, e.g.
   `fclones`, `nut-upsd`, `smtp-relay`).
 - `base` is **name-only**: `Alpine` (`0D597F`, `logo=alpinelinux`), `Caddy`
   (`1F88C0`, `logo=caddy`), `Distroless` / `distroless%2Fstatic` (`4285F4` /
   `2496ED`, `logo=google` / `logo=docker`), `scratch` (`2496ED`,
-  `logo=docker`), `renovate%2Frenovate` (`1A1F6C`).
+  `logo=docker`), `renovate%2Frenovate` (`1A1F6C`). Where the image runs as a
+  non-root user on a base whose name does not already imply it (Alpine, Caddy,
+  scratch), encode that in the base label (e.g. `base: Alpine (rootless)`)
+  rather than adding a separate badge — distroless `nonroot` variants already
+  say it in the name.
 - Image Size uses `ghcr-badge.egpl.dev` (a third-party service; GHCR has no
   first-party shields support — [badges/shields#5594]). It is the one external
   dependency in the badge row; self-hostable from `eggplants/ghcr-badge` if
   that service ever degrades.
 
 [badges/shields#5594]: https://github.com/badges/shields/issues/5594
+
+## Test coverage badge wiring
+
+The **Test coverage** badge reads a shields `endpoint` JSON published to an
+orphan `badges` branch in each repo by the synced `coverage.yml` workflow (which
+calls `cplieger/ci`'s reusable `coverage.yaml`). It runs on push to `main`,
+measures real statement coverage (Go: `go test -coverpkg=./...`, which includes
+classic, `rapid` property, and fuzz-seed tests; TS: vitest v8), and force-pushes
+`coverage.json` to the `badges` branch using the built-in `GITHUB_TOKEN` — **no
+external service and no per-repo secret**. The badge label is `Test coverage`
+(set in `coverage.yaml`, not the README — the `[![Test coverage]…]` alt text is
+cosmetic; the visible label comes from the endpoint JSON). The badge shows
+`invalid` until the first run on `main` publishes the file. Only the Go/TS repos
+receive `coverage.yml`.
+
+Publishing goes through `scripts/publish-badge.sh`, which **preserves sibling
+badge files** on the branch (so `coverage.json` and `mutation.json` coexist
+instead of clobbering each other — see below).
+
+## Mutation badge wiring
+
+The **Mutation** badge reads `mutation.json` from the same orphan `badges`
+branch. It is published by the `badge` job in `cplieger/ci`'s
+`weekly-gremlins.yaml`, which runs gremlins (Go mutation testing) across every
+Go-having repo above ≈200 LOC of non-test Go, three times each, on a weekly
+schedule (Sundays 22:00 UTC). `scripts/gremlins-aggregate.py --badge-file`
+computes the mean efficacy (kill rate) from the per-attempt artifacts and
+`scripts/publish-badge.sh` force-pushes `mutation.json` alongside
+`coverage.json`. Colour bands are tuned lower than coverage (≥85 brightgreen,
+≥70 green, ≥50 yellow, ≥30 orange, else red), because a healthy suite kills most
+but rarely all runnable mutants (equivalent mutants form a noise floor). The
+badge links to the per-repo `gremlins-tracker` issue, which carries the rolling
+12-week history and the current live-mutant list. It shows `invalid` until the
+first weekly run publishes the file, and updates weekly (not per-push — mutation
+testing is too expensive for the PR path).
+
+`scripts/publish-badge.sh` requires a token with `contents:write` on the target
+repo. Coverage uses the consumer's own `GITHUB_TOKEN` (it runs in-repo);
+weekly-gremlins runs in `cplieger/ci` and pushes cross-repo, so it uses the
+`CI_SCHEDULE` PAT (which already clones consumers and edits their tracker
+issues).
 
 ## OpenSSF Scorecard wiring
 
@@ -100,18 +183,6 @@ on every public consumer repo (added to the unified-CI group in
 within the 20-job account concurrency cap. The badge shows `no data` until the
 first run on `main` completes after the workflow lands.
 
-## Coverage badge wiring
-
-The **Coverage** badge reads a shields `endpoint` JSON published to an orphan
-`badges` branch in each repo by the synced `coverage.yml` workflow (which calls
-`cplieger/ci`'s reusable `coverage.yaml`). It runs on push to `main`, measures
-real statement coverage (Go: `go test -coverpkg=./...`, which includes classic,
-`rapid` property, and fuzz-seed tests; TS: vitest v8), and force-pushes
-`coverage.json` to the `badges` branch using the built-in `GITHUB_TOKEN` — **no
-external service and no per-repo secret**. The badge shows `coverage | invalid`
-until the first run on `main` publishes the file. Only the Go/TS repos receive
-`coverage.yml` (the sync group excludes shell/Dockerfile-only repos).
-
 ## OpenSSF Best Practices badge
 
 The **OpenSSF Best Practices** badge links the repo to its entry on the
@@ -119,6 +190,21 @@ metal-tier badge program (`bestpractices.dev`). `PROJECT_ID` is **per repo**
 (it is the numeric project id, not synced); fill it in from the repo's entry.
 The badge image reflects the live tiered status (in-progress / passing / silver
 / gold).
+
+## SBOM badge
+
+The **SBOM** badge (image repos only) links to the published software bill of
+materials. Every image release produces a syft SPDX-JSON SBOM
+(`anchore/sbom-action`, `format: spdx-json`) and publishes it two ways: a
+`cosign attest --type spdxjson` attestation on the GHCR (and Docker Hub) image,
+and a signed `sbom.spdx.json` (+ `sbom.spdx.json.sigstore.json`) asset on the
+GitHub Release. The badge therefore links to the repo's **Releases** page (where
+the SBOM is a named, signed, downloadable asset) — not `/attestations`, which is
+empty because the flow uses cosign registry attestations, not GitHub-native
+`actions/attest-*`. Label is `SPDX` (the format actually produced), not
+CycloneDX. Verified present on every image repo's latest release before adding.
+Libraries omit it — their `go.mod` / `package-lock.json` *is* the bill of
+materials.
 
 ## Notes
 
@@ -130,3 +216,8 @@ The badge image reflects the live tiered status (in-progress / passing / silver
   (`docker/pulls`, `docker/image-size`, `docker/v`). We standardize on the GHCR
   size badge instead, because GHCR is the primary registry and the same badge
   works for the GHCR-only repos (`subflux`, `vibecli`, `vibekit`).
+- **License** and **Code of Conduct** badges were considered for Docker Hub
+  (which lacks the GitHub chrome that surfaces both) and rejected: they would
+  render redundantly on the GitHub copy of the README, and version/license are
+  one click away on the linked GitHub repo. Keeping image rows at ≤8 uniform
+  badges won out over Docker Hub legibility.

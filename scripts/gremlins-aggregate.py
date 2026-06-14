@@ -122,6 +122,24 @@ def safe_div(a: float, b: float) -> float:
     return (a / b) if b else 0.0
 
 
+def badge_color(efficacy: float) -> str:
+    """Shields color for a mutation efficacy (kill rate, 0..100).
+
+    Bands are tuned lower than coverage: a healthy suite kills most but rarely
+    all runnable mutants (equivalent mutants form a noise floor), so 70%+ is
+    already strong and 85%+ is excellent.
+    """
+    if efficacy >= 85:
+        return "brightgreen"
+    if efficacy >= 70:
+        return "green"
+    if efficacy >= 50:
+        return "yellow"
+    if efficacy >= 30:
+        return "orange"
+    return "red"
+
+
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
@@ -517,6 +535,9 @@ def main() -> int:
                    help="Path to existing issue body (or omit if creating fresh)")
     p.add_argument("--regression-marker-file", type=Path, default=None,
                    help="Write 'true' or 'false' here for the workflow to read")
+    p.add_argument("--badge-file", type=Path, default=None,
+                   help="Write a shields `endpoint` JSON (label 'mutation', "
+                        "message '<efficacy_mean>%') here for the README badge")
     args = p.parse_args()
 
     attempt_files = sorted(args.artifacts_dir.glob(f"gremlins-{args.repo}-*/gremlins-out.json"))
@@ -527,6 +548,21 @@ def main() -> int:
           f"cov={agg['mutant_coverage_mean']} live={agg['live_count']} "
           f"buckets={ {k: len(v) for k, v in agg['live_buckets'].items()} }",
           file=sys.stderr)
+
+    # Emit the README badge endpoint JSON (one line) if requested. Skipped when
+    # there were no parseable attempts, so a failed run never overwrites a good
+    # badge with "0%".
+    if args.badge_file and agg["attempts"] > 0:
+        eff = agg["efficacy_mean"]
+        badge = {
+            "schemaVersion": 1,
+            "label": "mutation",
+            "message": f"{eff}%",
+            "color": badge_color(eff),
+        }
+        args.badge_file.write_text(json.dumps(badge))
+        print(f"[{args.repo}] wrote badge {args.badge_file}: {eff}% ({badge['color']})",
+              file=sys.stderr)
 
     existing = ""
     if args.existing_body_file and args.existing_body_file.exists():
