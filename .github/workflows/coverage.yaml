@@ -80,19 +80,17 @@ jobs:
           else color=red
           fi
 
-          work=$(mktemp -d)
           # Single-line printf (NOT a heredoc): heredocs in GHA run blocks break
           # when YAML dedent shifts the terminator. JSON on one line is safe.
-          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PCT" "$color" > "$work/coverage.json"
+          # Label is "Test coverage" (paired with the README badge alt text).
+          json=$(printf '{"schemaVersion":1,"label":"Test coverage","message":"%s%%","color":"%s"}' "$PCT" "$color")
 
-          cd "$work"
-          git init -q
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add coverage.json
-          git commit -qm "chore: coverage ${PCT}%"
-          # The badges branch is machine-managed and holds only this file, so a
-          # force-push of a fresh single commit keeps it from accumulating
-          # history. GITHUB_TOKEN (contents: write) can push to the same repo.
-          git push -q -f "https://x-access-token:${TOKEN}@github.com/${REPO}.git" HEAD:badges
+          # Publish via the shared sibling-preserving helper so coverage.json
+          # and mutation.json coexist on the orphan `badges` branch instead of
+          # clobbering each other (see scripts/publish-badge.sh). GITHUB_TOKEN
+          # (contents: write) can push to the same repo.
+          curl -fsSL --retry 3 \
+            "https://raw.githubusercontent.com/cplieger/ci/main/scripts/publish-badge.sh" \
+            -o /tmp/publish-badge.sh
+          bash /tmp/publish-badge.sh "$REPO" "$TOKEN" coverage.json "$json"
           echo "published coverage badge: ${PCT}% (${color})"

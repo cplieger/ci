@@ -133,6 +133,55 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
+  # Publish the per-repo mutation badge to each consumer's orphan `badges`
+  # branch. Independent of the `aggregate` (issue-tracker) job below, so a
+  # tracker-issue failure never blocks the README badge — and vice versa. Reads
+  # the same per-attempt artifacts and reuses scripts/gremlins-aggregate.py's
+  # parser (the trusted efficacy formula) plus scripts/publish-badge.sh (the
+  # sibling-preserving publisher shared with coverage.yaml).
+  badge:
+    needs: [fanout, run]
+    if: always() && needs.fanout.outputs.matrix != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout ci (for scripts/)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Download all per-attempt artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: gremlins-*
+
+      - name: Compute + publish mutation badge per repo
+        env:
+          # CI_SCHEDULE must carry contents:write on consumer repos (it already
+          # clones them and edits their tracker issues). The push targets each
+          # repo's orphan `badges` branch, alongside coverage.json.
+          TOKEN: ${{ secrets.CI_SCHEDULE }}
+        run: |
+          set -euo pipefail
+          REPOS=$(find artifacts -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sed -E 's/^gremlins-(.+)-[0-9]+$/\1/' | sort -u)
+          for repo in $REPOS; do
+            echo "::group::$repo"
+            python3 scripts/gremlins-aggregate.py \
+              --repo "$repo" \
+              --artifacts-dir artifacts \
+              --week "$(date -u +%Y-%m-%d)" \
+              --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              --badge-file "/tmp/mutation-${repo}.json" >/dev/null
+            if [ -s "/tmp/mutation-${repo}.json" ]; then
+              bash scripts/publish-badge.sh \
+                "cplieger/${repo}" "$TOKEN" mutation.json "$(cat "/tmp/mutation-${repo}.json")"
+            else
+              echo "::warning::no badge JSON for ${repo} (no parseable attempts) — skipping"
+            fi
+            echo "::endgroup::"
+          done
+
   aggregate:
     needs: [fanout, run]
     if: always() && needs.fanout.outputs.matrix != '[]'
