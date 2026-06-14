@@ -76,7 +76,34 @@ group:
       - source: configs/gremlins.yaml
         dest: .gremlins.yaml
 
-  # Python repos (ruff + editorconfig; bespoke ci.yaml)
+  # Coverage badge (Go/TS repos — measurable statement coverage)
+  - repos: |
+      cplieger/actions
+      cplieger/atomicfile
+      cplieger/auth
+      cplieger/cert-converter
+      cplieger/docker-age
+      cplieger/docker-fclones-scheduler
+      cplieger/docker-renovate-scheduler
+      cplieger/docker-rsync-scheduler
+      cplieger/health
+      cplieger/httpx
+      cplieger/metrics
+      cplieger/pg-autodump
+      cplieger/plex-exporter
+      cplieger/plex-language-sync
+      cplieger/reactive
+      cplieger/registry-stats
+      cplieger/ssrf
+      cplieger/subflux
+      cplieger/tautulli-remap
+      cplieger/vibecli
+      cplieger/vibekit
+      cplieger/vterm
+      cplieger/wiregen
+    files:
+      - source: .github/workflow-templates/coverage.yml
+        dest: .github/workflows/coverage.yml
   - repos: |
       cplieger/.kiro
     files:
