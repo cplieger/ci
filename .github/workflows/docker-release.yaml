@@ -213,7 +213,12 @@ jobs:
           file: ${{ inputs.dockerfile }}
           platforms: ${{ matrix.platform }}
           labels: ${{ needs.prepare.outputs.labels }}
-          provenance: true
+          # mode=max records the full build definition + base64 Dockerfile for
+          # richer SLSA provenance on these public images (min omits the build
+          # steps/source). mode=max embeds build-arg VALUES — secret mounts
+          # (RUN --mount=type=secret) are never included, so never pass secrets
+          # via build-args; this workflow passes none.
+          provenance: mode=max
           # push-by-digest writes the per-arch image to GHCR (and Docker Hub
           # if logged in) under a digest-only ref — no human-readable tags
           # at this stage. The finalize job assembles the multi-arch manifest
