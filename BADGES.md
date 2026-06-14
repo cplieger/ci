@@ -27,7 +27,9 @@ suffix for versioned modules, e.g. `metrics/v2`).
 [![CI](https://github.com/cplieger/REPO/actions/workflows/ci.yaml/badge.svg)](https://github.com/cplieger/REPO/actions/workflows/ci.yaml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/MODPATH.svg)](https://pkg.go.dev/github.com/cplieger/MODPATH)
 [![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/REPO)](https://goreportcard.com/report/github.com/cplieger/REPO)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
 ```
 
 `Go Reference` uses `MODPATH` (with the `/v2` suffix if any); `Go Report Card`
@@ -39,7 +41,9 @@ always uses the bare `REPO`.
 [![CI](https://github.com/cplieger/REPO/actions/workflows/ci.yaml/badge.svg)](https://github.com/cplieger/REPO/actions/workflows/ci.yaml)
 [![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
 [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
 ```
 
 ### Hybrid Go + TS library (e.g. vterm)
@@ -49,7 +53,9 @@ always uses the bare `REPO`.
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/REPO.svg)](https://pkg.go.dev/github.com/cplieger/REPO)
 [![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
 [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
 ```
 
 ### Docker image
@@ -60,8 +66,16 @@ always uses the bare `REPO`.
 [![Image Size](https://ghcr-badge.egpl.dev/cplieger/REPO/size)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER)
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
 ```
+
+- The **Coverage** row applies only to images **built from Go source in this
+  repo** (they publish a `coverage.json` via the synced `coverage.yml`). Omit
+  it for thin upstream-wrapper images (`docker-caddy`, `docker-keepalived`,
+  `docker-nut-upsd`, `docker-radvd`, `docker-smtp-relay`, `docker-static-web`),
+  which have no statement coverage.
 
 - `CONTAINER` is the GHCR package name (often `REPO`, but some differ, e.g.
   `fclones`, `nut-upsd`, `smtp-relay`).
@@ -85,6 +99,26 @@ on every public consumer repo (added to the unified-CI group in
 `scripts/classify-repos.sh`). It is push-triggered (no weekly cron) to stay
 within the 20-job account concurrency cap. The badge shows `no data` until the
 first run on `main` completes after the workflow lands.
+
+## Coverage badge wiring
+
+The **Coverage** badge reads a shields `endpoint` JSON published to an orphan
+`badges` branch in each repo by the synced `coverage.yml` workflow (which calls
+`cplieger/ci`'s reusable `coverage.yaml`). It runs on push to `main`, measures
+real statement coverage (Go: `go test -coverpkg=./...`, which includes classic,
+`rapid` property, and fuzz-seed tests; TS: vitest v8), and force-pushes
+`coverage.json` to the `badges` branch using the built-in `GITHUB_TOKEN` — **no
+external service and no per-repo secret**. The badge shows `coverage | invalid`
+until the first run on `main` publishes the file. Only the Go/TS repos receive
+`coverage.yml` (the sync group excludes shell/Dockerfile-only repos).
+
+## OpenSSF Best Practices badge
+
+The **OpenSSF Best Practices** badge links the repo to its entry on the
+metal-tier badge program (`bestpractices.dev`). `PROJECT_ID` is **per repo**
+(it is the numeric project id, not synced); fill it in from the repo's entry.
+The badge image reflects the live tiered status (in-progress / passing / silver
+/ gold).
 
 ## Notes
 

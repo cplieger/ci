@@ -192,9 +192,28 @@ jobs:
           context: .
           file: ./Dockerfile
           push: false
-          load: false
+          load: true
+          tags: ci-smoke:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Runtime image smoke test, opt-in per repo (runs only when
+      # tests/image-smoke.sh exists). Build-time smoke tests live inside the
+      # Dockerfile (a `test` stage the final stage depends on — used by the
+      # thin wrapper images). This step instead runs the *assembled* image and
+      # probes it, catching failures the build can't see: a broken `//go:embed`
+      # frontend, a missing runtime dependency, a server that never binds its
+      # port, or a broken HEALTHCHECK. The script receives the loaded image ref
+      # and owns run + probe + teardown. Used by the HTTP-serving apps.
+      #
+      # Advisory for now (continue-on-error): these run the real image and a
+      # few apps have boot-time quirks still being tuned. Promote to blocking
+      # (drop continue-on-error) once they are reliably green across the
+      # serving apps.
+      - name: Image smoke test (advisory)
+        if: ${{ hashFiles('tests/image-smoke.sh') != '' }}
+        continue-on-error: true
+        run: sh tests/image-smoke.sh ci-smoke:latest
 
   # Markdown lint always runs (every repo has at least a README). Inline rather
   # than a separate reusable workflow so it needs no self-referencing pinned tag
