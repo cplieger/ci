@@ -461,16 +461,22 @@ jobs:
           git-cliff --latest --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
 
       - name: Sign SBOM for release assets (keyless)
-        # Attach a cosign signature + certificate next to the SBOM so the
-        # GitHub Release carries a signed artifact. OpenSSF Scorecard
-        # Signed-Releases scans release assets for *.sig; the GHCR image and
+        # Attach a cosign Sigstore bundle next to the SBOM so the GitHub
+        # Release carries a signed artifact. OpenSSF Scorecard's
+        # Signed-Releases check scans release assets for known signature
+        # suffixes (.sig, .sigstore, .sigstore.json, etc.); the GHCR image and
         # attestation signatures above live in the registry and are invisible
         # to it.
+        #
+        # cosign v3 turns --new-bundle-format and --use-signing-config on by
+        # default, which deprecates (and ignores) --output-signature /
+        # --output-certificate and makes --bundle required. The single
+        # .sigstore.json bundle carries the signature, certificate, and Rekor
+        # inclusion proof, and Scorecard recognizes the .sigstore.json suffix.
         if: ${{ inputs.release-needed == 'true' }}
         run: |
           cosign sign-blob --yes sbom.spdx.json \
-            --output-signature sbom.spdx.json.sig \
-            --output-certificate sbom.spdx.json.pem
+            --bundle sbom.spdx.json.sigstore.json
 
       - name: Create release
         # Only create a GitHub Release when the caller signaled a version bump.
@@ -484,7 +490,7 @@ jobs:
           gh release create "$VERSION" \
             --title "$VERSION" \
             --notes-file RELEASE_NOTES.md \
-            sbom.spdx.json sbom.spdx.json.sig sbom.spdx.json.pem
+            sbom.spdx.json sbom.spdx.json.sigstore.json
 
       - name: Sync description to Docker Hub
         if: ${{ contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main' }}
