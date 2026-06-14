@@ -144,20 +144,26 @@ jobs:
             echo "code_changed: $code_changed"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # The four sub-CI workflows below use local refs (uses: ./...), not @sha
+  # pins. GitHub resolves a local reusable-workflow ref to the SAME commit a
+  # consumer pinned ci.yaml to, so a fix to go-ci/ts-ci/shell-ci reaches
+  # consumers on their next ci.yaml bump — no second internal-pin bump + tag
+  # cycle. (A local COMPOSITE ACTION, by contrast, resolves against the
+  # consumer's checkout and 404s — those must stay owner/repo/path@sha.)
   go:
     needs: detect
     if: ${{ needs.detect.outputs.run_go == 'true' }}
-    uses: cplieger/ci/.github/workflows/go-ci.yaml@203f6e69bcb5973ec62184eedce55495f7a8b202 # v2
+    uses: ./.github/workflows/go-ci.yaml
 
   ts:
     needs: detect
     if: ${{ needs.detect.outputs.run_ts == 'true' }}
-    uses: cplieger/ci/.github/workflows/ts-ci.yaml@203f6e69bcb5973ec62184eedce55495f7a8b202 # v2
+    uses: ./.github/workflows/ts-ci.yaml
 
   web:
     needs: detect
     if: ${{ needs.detect.outputs.run_web == 'true' }}
-    uses: cplieger/ci/.github/workflows/ts-ci.yaml@203f6e69bcb5973ec62184eedce55495f7a8b202 # v2
+    uses: ./.github/workflows/ts-ci.yaml
     with:
       working-directory: ${{ needs.detect.outputs.web_dir }}
       web-lint: true
@@ -165,7 +171,7 @@ jobs:
   shell:
     needs: detect
     if: ${{ needs.detect.outputs.run_shell == 'true' }}
-    uses: cplieger/ci/.github/workflows/shell-ci.yaml@203f6e69bcb5973ec62184eedce55495f7a8b202 # v2
+    uses: ./.github/workflows/shell-ci.yaml
 
   # Build-ability gate. Before this job, a consumer's required `ci / validate`
   # never built the image — image builds happened only in the non-required
