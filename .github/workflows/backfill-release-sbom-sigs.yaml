@@ -1,0 +1,119 @@
+# On-demand backfill: sign the SBOM asset on existing GitHub releases that
+# predate the cosign-v3 signing fix, so OpenSSF Scorecard's Signed-Releases
+# check sees a recognized signature (.sigstore.json) next to sbom.spdx.json.
+#
+# This does NOT rebuild or touch any container image — it signs the
+# already-published sbom.spdx.json bytes and uploads the .sigstore.json
+# bundle beside it. Registry images already carry cosign manifest signatures
+# and SBOM/provenance attestations from their original build.
+#
+# Keyless (Fulcio) signing uses this workflow's GitHub Actions OIDC identity.
+# Cross-repo release-asset reads/uploads use SYNC_PAT (Contents:write on
+# targets); GITHUB_TOKEN is scoped to this repo only.
+name: Backfill release SBOM signatures
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Comma-separated repo names (owner cplieger), or 'all' for the docker-image fleet."
+        required: false
+        default: "all"
+      limit:
+        description: "Max releases per repo to scan (newest first)."
+        required: false
+        default: "10"
+      dry_run:
+        description: "Report what would be signed without uploading."
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # keyless cosign signing
+
+concurrency:
+  group: backfill-sbom-sigs
+  cancel-in-progress: false
+
+env:
+  COSIGN_VERSION: v3.0.6
+  # The docker-image fleet (repos that publish via docker-release.yaml).
+  FLEET: >-
+    docker-age docker-caddy docker-keepalived docker-nut-upsd docker-radvd
+    docker-smtp-relay docker-static-web docker-fclones-scheduler
+    docker-rsync-scheduler docker-renovate-scheduler cert-converter
+    plex-language-sync plex-exporter tautulli-remap registry-stats subflux
+    vibekit vibecli pg-autodump
+
+jobs:
+  backfill:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Sign and upload missing SBOM signatures
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          INPUT_REPOS: ${{ inputs.repos }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "${INPUT_REPOS}" = "all" ]; then
+            repos="${FLEET}"
+          else
+            repos="$(echo "${INPUT_REPOS}" | tr ',' ' ')"
+          fi
+          work="$(mktemp -d)"
+          signed=0
+          skipped=0
+          for repo in ${repos}; do
+            echo "::group::cplieger/${repo}"
+            tags="$(gh release list -R "cplieger/${repo}" --limit "${INPUT_LIMIT}" \
+              --json tagName --jq '.[].tagName' 2>/dev/null || true)"
+            if [ -z "${tags}" ]; then
+              echo "no releases found"
+              echo "::endgroup::"
+              continue
+            fi
+            for tag in ${tags}; do
+              assets="$(gh release view "${tag}" -R "cplieger/${repo}" \
+                --json assets --jq '.assets[].name' 2>/dev/null || true)"
+              case "${assets}" in
+                *sbom.spdx.json*) : ;;
+                *)
+                  echo "${tag}: no sbom.spdx.json asset, skip"
+                  skipped=$((skipped + 1))
+                  continue
+                  ;;
+              esac
+              if printf '%s\n' "${assets}" | grep -qE '\.(sig|pem|sigstore\.json)$'; then
+                echo "${tag}: already has a signature asset, skip"
+                skipped=$((skipped + 1))
+                continue
+              fi
+              d="${work}/${repo}/${tag}"
+              mkdir -p "${d}"
+              gh release download "${tag}" -R "cplieger/${repo}" \
+                --pattern sbom.spdx.json --dir "${d}"
+              if [ "${INPUT_DRY_RUN}" = "true" ]; then
+                echo "${tag}: WOULD sign + upload sbom.spdx.json.sigstore.json"
+                signed=$((signed + 1))
+                continue
+              fi
+              cosign sign-blob --yes "${d}/sbom.spdx.json" \
+                --bundle "${d}/sbom.spdx.json.sigstore.json"
+              gh release upload "${tag}" -R "cplieger/${repo}" \
+                "${d}/sbom.spdx.json.sigstore.json"
+              echo "${tag}: signed + uploaded sbom.spdx.json.sigstore.json"
+              signed=$((signed + 1))
+            done
+            echo "::endgroup::"
+          done
+          echo "Done. signed=${signed} skipped=${skipped} dry_run=${INPUT_DRY_RUN}"
