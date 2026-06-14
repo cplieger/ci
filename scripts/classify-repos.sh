@@ -236,6 +236,20 @@ if [[ ${#golangci_repos[@]} -gt 0 ]]; then
 EOF
 fi
 
+# Coverage badge workflow — Go/TS repos only (they have measurable statement
+# coverage; shell/Dockerfile-only repos do not). Publishes a shields endpoint
+# badge to an orphan `badges` branch. See coverage.yaml.
+if [[ ${#codeql_repos[@]} -gt 0 ]]; then
+  echo ""
+  echo "  # Coverage badge (Go/TS repos — measurable statement coverage)"
+  emit_repos codeql_repos
+  cat << 'EOF'
+    files:
+      - source: .github/workflow-templates/coverage.yml
+        dest: .github/workflows/coverage.yml
+EOF
+fi
+
 # Python repos (pyproject.toml): canonical ruff config + editorconfig.
 # Lint baseline only — these repos are not releaseable and keep a bespoke ci.yaml.
 if [[ ${#python_repos[@]} -gt 0 ]]; then
