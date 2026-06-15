@@ -71,7 +71,9 @@ jobs:
             sha=$(git -C scan rev-parse HEAD)
             # Count fuzz targets (proxy for `go test -list '^Fuzz'`; exact count
             # is recomputed per shard at run time, this only sizes the matrix).
-            count=$(grep -rhE '^func Fuzz' --include='*_test.go' scan 2>/dev/null | wc -l | tr -d ' ')
+            # `|| true`: grep exits 1 when a Go repo has tests but no fuzz funcs,
+            # which pipefail+set -e would otherwise treat as fatal.
+            count=$(grep -rhE '^func Fuzz' --include='*_test.go' scan 2>/dev/null | wc -l | tr -d ' ' || true)
             if [ "${count:-0}" -eq 0 ]; then
               echo "  skip ${r}: no fuzz targets"
               continue
