@@ -163,22 +163,28 @@ jobs:
           # repo's orphan `badges` branch, alongside coverage.json.
           TOKEN: ${{ secrets.CI_SCHEDULE }}
         run: |
-          set -euo pipefail
+          # No `set -e` at loop scope: one repo's failure (e.g. a transient
+          # push 403) must not abort the whole fleet. Each repo runs in a
+          # guarded subshell; failures warn and continue.
+          set -uo pipefail
           REPOS=$(find artifacts -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sed -E 's/^gremlins-(.+)-[0-9]+$/\1/' | sort -u)
           for repo in $REPOS; do
             echo "::group::$repo"
-            python3 scripts/gremlins-aggregate.py \
-              --repo "$repo" \
-              --artifacts-dir artifacts \
-              --week "$(date -u +%Y-%m-%d)" \
-              --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-              --badge-file "/tmp/mutation-${repo}.json" >/dev/null
-            if [ -s "/tmp/mutation-${repo}.json" ]; then
-              bash scripts/publish-badge.sh \
-                "cplieger/${repo}" "$TOKEN" mutation.json "$(cat "/tmp/mutation-${repo}.json")"
-            else
-              echo "::warning::no badge JSON for ${repo} (no parseable attempts) — skipping"
-            fi
+            (
+              set -e
+              python3 scripts/gremlins-aggregate.py \
+                --repo "$repo" \
+                --artifacts-dir artifacts \
+                --week "$(date -u +%Y-%m-%d)" \
+                --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+                --badge-file "/tmp/mutation-${repo}.json" >/dev/null
+              if [ -s "/tmp/mutation-${repo}.json" ]; then
+                bash scripts/publish-badge.sh \
+                  "cplieger/${repo}" "$TOKEN" mutation.json "$(cat "/tmp/mutation-${repo}.json")"
+              else
+                echo "::warning::no badge JSON for ${repo} (no parseable attempts) — skipping"
+              fi
+            ) || echo "::warning::badge publish failed for ${repo} — continuing with remaining repos"
             echo "::endgroup::"
           done
 
@@ -200,150 +206,70 @@ jobs:
 
       - name: Aggregate + update tracker issue per repo
         run: |
-          set -euo pipefail
-          # Discover repos from artifact directory names: gremlins-<repo>-<attempt>
+          # Delegate stats + body generation to scripts/gremlins-aggregate.py —
+          # the same parser the `badge` job trusts. It reads each attempt's
+          # gremlins-out.json (the artifact the `run` job actually uploads),
+          # computes mean/stddev/coverage, rolls the 12-week history forward
+          # (preserving free-form notes), renders the frequency-bucketed live
+          # mutants, and writes a regression marker. No `set -e` at loop scope:
+          # one repo's failure must not abort the fleet — each runs in a guarded
+          # subshell that warns and continues.
+          set -uo pipefail
           REPOS=$(find artifacts -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sed -E 's/^gremlins-(.+)-[0-9]+$/\1/' | sort -u)
           WEEK_ENDING=$(date -u +%Y-%m-%d)
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          title="Gremlins mutation testing tracker"
 
           for repo in $REPOS; do
             echo "::group::$repo"
+            (
+              set -e
+              R="cplieger/${repo}"
 
-            # Compute mean + stddev across the N attempts.
-            stats=$(jq -s '
-              {
-                attempts:     length,
-                killed_mean:  (map(.killed) | add / length),
-                lived_mean:   (map(.lived) | add / length),
-                runnable_mean:(map(.runnable) | add / length),
-                efficacy_mean:(map(.efficacy) | add / length),
-                efficacy_stddev:
-                  (if length > 1
-                   then ((map(.efficacy) | (. as $v | (add / length) as $m | (map(($m - .) * ($m - .)) | add / length | sqrt)) ))
-                   else 0 end),
-                mutant_coverage_mean: (map(.mutant_coverage) | add / length),
-                live_mutants_max: (map(.lived) | max)
-              }
-              | .efficacy_mean        |= ((. * 10) | round / 10)
-              | .efficacy_stddev      |= ((. * 10) | round / 10)
-              | .mutant_coverage_mean |= ((. * 10) | round / 10)
-            ' artifacts/gremlins-"${repo}"-*/gremlins-summary.json)
-            echo "  stats: $stats"
+              # The tracker issue references these labels; create them if absent
+              # (idempotent — the consumer repo may never have had them).
+              gh label create gremlins-tracker -R "$R" -c 5319e7 -d "Gremlins mutation testing tracker" 2>/dev/null || true
+              gh label create auto-generated -R "$R" -c ededed -d "Maintained by automation" 2>/dev/null || true
+              gh label create mutation-regression -R "$R" -c b60205 -d "Mutation efficacy regression" 2>/dev/null || true
 
-            mean=$(echo "$stats" | jq -r '.efficacy_mean')
-            stddev=$(echo "$stats" | jq -r '.efficacy_stddev')
-            cov=$(echo "$stats" | jq -r '.mutant_coverage_mean')
-            live=$(echo "$stats" | jq -r '.live_mutants_max')
+              issue_num=$(gh issue list -R "$R" --state open \
+                --label gremlins-tracker --search "$title in:title" \
+                --json number,title --jq '.[] | select(.title == "'"$title"'") | .number' | head -1)
 
-            # Find or create the tracker issue.
-            title="Gremlins mutation testing tracker"
-            issue_num=$(gh issue list --repo "cplieger/${repo}" --state open \
-              --label gremlins-tracker --search "$title in:title" \
-              --json number,title --jq '.[] | select(.title == "'"$title"'") | .number' | head -1)
-
-            new_row="| ${WEEK_ENDING} | ${mean}% | ±${stddev}% | ${cov}% | ${live} | "
-
-            if [ -n "$issue_num" ]; then
-              # Fetch existing body, parse history table, prepend new row, trim to 12.
-              existing_body=$(gh issue view "$issue_num" --repo "cplieger/${repo}" --json body --jq .body)
-              prev_mean=$(echo "$existing_body" | awk '
-                /<!-- gremlins-data -->/ {flag=1; next}
-                /<!-- \/gremlins-data -->/ {flag=0}
-                flag && /^\| 20[0-9]+/ {gsub(/[%|]/, ""); print $4; exit}
-              ')
-              if [ -n "$prev_mean" ]; then
-                delta=$(awk "BEGIN { printf \"%+.1f\", ${mean} - ${prev_mean} }")
-                new_row="${new_row}${delta}% |"
-              else
-                new_row="${new_row}— |"
+              existing_args=()
+              if [ -n "$issue_num" ]; then
+                gh issue view "$issue_num" -R "$R" --json body --jq .body > "/tmp/existing-${repo}.md"
+                existing_args=(--existing-body-file "/tmp/existing-${repo}.md")
               fi
 
-              # Build new body: replace content between sentinels.
-              new_block=$(cat <<EOF
-          <!-- gremlins-data -->
-          | Week ending | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ vs prev |
-          |---|---|---|---|---|---|
-          ${new_row}
-          $(echo "$existing_body" | awk '
-            /<!-- gremlins-data -->/ {flag=1; next}
-            /<!-- \/gremlins-data -->/ {flag=0; next}
-            flag && /^\| 20[0-9]+/ {print}
-          ' | head -11)
-          <!-- /gremlins-data -->
-          EOF
-              )
+              python3 scripts/gremlins-aggregate.py \
+                --repo "$repo" \
+                --artifacts-dir artifacts \
+                --week "$WEEK_ENDING" \
+                --run-url "$RUN_URL" \
+                --regression-marker-file "/tmp/regression-${repo}.txt" \
+                "${existing_args[@]}" \
+                > "/tmp/body-${repo}.md"
 
-              # Replace the sentinel-bounded block in the body.
-              python3 - "$existing_body" "$new_block" "$WEEK_ENDING" "$mean" "$stddev" "$cov" <<'PY' > /tmp/new-body.md
-          import re, sys
-          body, new_block, week, mean, stddev, cov = sys.argv[1:7]
-          pat = re.compile(r'<!-- gremlins-data -->.*?<!-- /gremlins-data -->', re.DOTALL)
-          if pat.search(body):
-              body = pat.sub(new_block, body)
-          else:
-              body = body.rstrip() + '\n\n' + new_block + '\n'
-          # Update the "This week" line if present.
-          body = re.sub(r'\*\*This week\*\*:[^\n]*',
-                        f'**This week**: {mean}% efficacy (±{stddev}% across 3 runs), {cov}% mutant coverage. Last update: {week}',
-                        body)
-          print(body)
-          PY
-              gh issue edit "$issue_num" --repo "cplieger/${repo}" --body-file /tmp/new-body.md >/dev/null
-              echo "  updated tracker issue #${issue_num}"
-            else
-              # Create new tracker issue.
-              cat > /tmp/new-body.md <<EOF
-          # Gremlins mutation testing tracker
-
-          Auto-updated weekly by [\`cplieger/ci/.github/workflows/weekly-gremlins.yaml\`](https://github.com/cplieger/ci/blob/main/.github/workflows/weekly-gremlins.yaml).
-          Updates the table below every Monday around 02:00 UTC.
-
-          **This week**: ${mean}% efficacy (±${stddev}% across 3 runs), ${cov}% mutant coverage. Last update: ${WEEK_ENDING}
-
-          ## Rolling 12-week history
-
-          <!-- gremlins-data -->
-          | Week ending | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ vs prev |
-          |---|---|---|---|---|---|
-          ${new_row}— |
-          <!-- /gremlins-data -->
-
-          ## How to read
-
-          - **Mean efficacy**: % of runnable mutants killed by the test suite, averaged across 3 runs
-          - **Stddev**: variance across runs — high stddev (>3%) signals flaky tests
-          - **Mutant coverage**: % of mutants reached by the test suite (test depth)
-          - **Live mutants**: count that survived all 3 runs (real test gaps)
-
-          The 'mutation-regression' label is added when this week's mean drops >5%
-          below the 12-week rolling mean.
-
-          ## Free-form notes
-
-          Add anything below — won't be touched by the auto-updater.
-          EOF
-              gh issue create --repo "cplieger/${repo}" \
-                --title "$title" \
-                --label gremlins-tracker,auto-generated \
-                --body-file /tmp/new-body.md >/dev/null
-              echo "  created new tracker issue"
-            fi
-
-            # Regression alert: if mean is >5% below the trailing 12-week mean,
-            # add the regression label; otherwise remove it if previously set.
-            if [ -n "${issue_num:-}" ]; then
-              hist_mean=$(echo "$existing_body" | awk -v RS='\n' '
-                /<!-- gremlins-data -->/ {flag=1; next}
-                /<!-- \/gremlins-data -->/ {flag=0}
-                flag && /^\| 20[0-9]+/ { gsub(/[%|]/, ""); sum += $4; n++ }
-                END { if (n > 0) print sum/n }
-              ')
-              if [ -n "$hist_mean" ] && awk "BEGIN { exit !($mean < $hist_mean - 5) }"; then
-                gh issue edit "$issue_num" --repo "cplieger/${repo}" --add-label mutation-regression >/dev/null
-                echo "  flagged regression: ${mean}% < (${hist_mean}% - 5)"
+              if [ -n "$issue_num" ]; then
+                gh issue edit "$issue_num" -R "$R" --body-file "/tmp/body-${repo}.md" >/dev/null
+                echo "  updated tracker issue #${issue_num}"
               else
-                gh issue edit "$issue_num" --repo "cplieger/${repo}" --remove-label mutation-regression >/dev/null 2>&1 || true
+                url=$(gh issue create -R "$R" \
+                  --title "$title" \
+                  --label gremlins-tracker,auto-generated \
+                  --body-file "/tmp/body-${repo}.md")
+                issue_num="${url##*/}"
+                echo "  created tracker issue #${issue_num}"
               fi
-            fi
 
+              # Apply or clear the regression label from the python marker.
+              if [ -n "$issue_num" ] && [ "$(cat "/tmp/regression-${repo}.txt" 2>/dev/null)" = "true" ]; then
+                gh issue edit "$issue_num" -R "$R" --add-label mutation-regression >/dev/null
+                echo "  flagged mutation-regression"
+              elif [ -n "$issue_num" ]; then
+                gh issue edit "$issue_num" -R "$R" --remove-label mutation-regression >/dev/null 2>&1 || true
+              fi
+            ) || echo "::warning::aggregate failed for ${repo} — continuing with remaining repos"
             echo "::endgroup::"
           done
