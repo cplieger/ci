@@ -54,6 +54,22 @@ git config user.name 'github-actions[bot]'
 git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 git add -A
 git commit -qm "chore: update ${FILE}"
-git push -q -f "$URL" HEAD:badges
+
+# Force-push the single squashed commit. GitHub intermittently rejects a
+# force-push to an orphan branch with a transient server-side
+# "remote: fatal error in commit_refs" (observed on the weekly gremlins run
+# turning red even though every other repo published fine). Retry with a short
+# backoff before giving up so one flaky push doesn't fail the whole job.
+attempt=1
+max_attempts=4
+until git push -q -f "$URL" HEAD:badges; do
+  if [ "$attempt" -ge "$max_attempts" ]; then
+    echo "push to ${REPO}@badges failed after ${attempt} attempts" >&2
+    exit 1
+  fi
+  echo "push to ${REPO}@badges failed (attempt ${attempt}/${max_attempts}); retrying" >&2
+  sleep $(( attempt * 3 ))
+  attempt=$(( attempt + 1 ))
+done
 
 echo "published ${FILE} to ${REPO}@badges ($(find . -maxdepth 1 -name '*.json' -printf '%f ' 2>/dev/null))"
