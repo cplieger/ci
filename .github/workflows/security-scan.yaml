@@ -16,6 +16,9 @@ on:
         type: string
         default: 'HIGH,CRITICAL'
 
+permissions:
+  contents: read
+
 jobs:
   trivy:
     runs-on: ubuntu-24.04

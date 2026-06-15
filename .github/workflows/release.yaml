@@ -41,12 +41,11 @@ on:
       DOCKERHUB_TOKEN:
         required: false
 
+# Top-level is read-only (OpenSSF Scorecard Token-Permissions); each job below
+# declares the exact write scopes it needs. The docker job forwards them to the
+# called docker-release.yaml, whose own jobs scope them further.
 permissions:
-  contents: write
-  packages: write
-  id-token: write
-  attestations: write
-  security-events: write
+  contents: read
 
 concurrency:
   group: release-${{ github.repository }}-${{ github.ref }}
@@ -371,6 +370,12 @@ jobs:
   docker:
     needs: detect
     if: ${{ needs.detect.outputs.type == 'docker' && needs.detect.outputs.root_changed == 'true' }}
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
     # Local ref (not an @sha pin): docker-release.yaml resolves to the SAME
     # commit a consumer pinned this release.yaml to, so a fix to
     # docker-release.yaml reaches consumers on the next release.yaml bump
@@ -391,6 +396,8 @@ jobs:
     if: ${{ needs.detect.outputs.type == 'go' && needs.detect.outputs.root_changed == 'true' && needs.detect.outputs.release == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -417,6 +424,9 @@ jobs:
     if: ${{ needs.detect.outputs.type == 'ts' && needs.detect.outputs.root_changed == 'true' && needs.detect.outputs.release == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -487,6 +497,9 @@ jobs:
       && (needs.go.result == 'success' || needs.go.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       matrix:
         dir: ${{ fromJSON(needs.detect.outputs.subpackages_to_publish) }}

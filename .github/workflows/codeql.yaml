@@ -12,6 +12,9 @@ on:
         default: ''
         description: 'Optional comma-separated override; empty = auto-detect'
 
+permissions:
+  contents: read
+
 jobs:
   detect:
     if: github.event.repository.private == false
