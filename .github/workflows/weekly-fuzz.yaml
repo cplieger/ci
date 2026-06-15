@@ -6,10 +6,20 @@
 # Schedule:           Wednesdays 22:00 UTC (mid-week off-peak; different day
 #                     from gremlins-Sunday and security-daily so they never
 #                     fight for the 20-slot account budget)
-# Concurrency cap:    6 jobs in parallel (≥4 slots reserved for ad-hoc work)
+# Concurrency cap:    6 jobs in parallel (>=4 slots reserved for ad-hoc work)
 # Fuzz budget:        2 minutes per target — accumulates exploration depth
 #                     across weeks since each run starts from the existing
-#                     testdata/fuzz/ corpus
+#                     testdata/fuzz/ corpus. The 2m/target budget is fixed:
+#                     large repos are SHARDED across runners rather than
+#                     having their per-target time cut.
+# Dynamic sharding:   fanout counts each repo's fuzz targets and computes
+#                     shards = ceil(targets x 2m / SHARD_BUDGET). A repo that
+#                     fits the budget runs on one runner; a repo that would
+#                     overrun the 6h hosted-runner ceiling is split across N
+#                     runners, each fuzzing a deterministic round-robin slice
+#                     of the targets. Scales to any target count. The per-repo
+#                     `report` job then consolidates every shard's findings
+#                     into one issue-management pass.
 # Reporting:          Per-finding GitHub issue in the consumer repo. Opens
 #                     when fuzz writes a new failing seed; auto-closes when
 #                     the seed gets committed to testdata/fuzz/. Idempotent
@@ -23,6 +33,7 @@ on:
 
 permissions:
   contents: read
+  # Issue ops happen in CONSUMER repos via CI_SCHEDULE PAT, not GITHUB_TOKEN.
 
 concurrency:
   group: weekly-fuzz
@@ -31,51 +42,82 @@ concurrency:
 jobs:
   fanout:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     outputs:
-      matrix: ${{ steps.fanout.outputs.matrix }}
+      shard_matrix: ${{ steps.fanout.outputs.shard_matrix }}
+      repo_matrix: ${{ steps.fanout.outputs.repo_matrix }}
     steps:
-      - name: Discover Go-having repos with fuzz targets
+      - name: Discover fuzz targets and compute per-repo shard counts
         id: fanout
         env:
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          # Per-target fuzz time in seconds (mirrors FUZZ_TIME=2m in the fuzz job).
+          FUZZ_TIME_SECONDS: "120"
+          # Max fuzzing seconds per shard. 4h leaves ~2h headroom under the 6h
+          # hosted-runner ceiling for clone + build + baseline-coverage overhead.
+          SHARD_BUDGET_SECONDS: "14400"
         run: |
           set -euo pipefail
           repos=$(gh repo list cplieger --limit 300 --json name,isArchived --jq '
             [.[] | select(.isArchived == false) | .name] | .[]
           ')
-          REPOS=()
+
+          shard_matrix='[]'
+          repo_matrix='[]'
           for r in $repos; do
             gh api "/repos/cplieger/${r}/contents/go.mod" --silent 2>/dev/null || continue
-            # Heuristic: if any *_test.go file contains "func Fuzz", include.
-            has_fuzz=$(gh api "/repos/cplieger/${r}/git/trees/main?recursive=1" \
-              --jq '[.tree[] | select(.type=="blob" and (.path | test("_test\\.go$")))] | length' 2>/dev/null)
-            if [ "${has_fuzz:-0}" -gt 0 ]; then
-              REPOS+=("$r")
+            rm -rf scan
+            gh repo clone "cplieger/${r}" scan -- --depth 1 2>/dev/null || continue
+            sha=$(git -C scan rev-parse HEAD)
+            # Count fuzz targets (proxy for `go test -list '^Fuzz'`; exact count
+            # is recomputed per shard at run time, this only sizes the matrix).
+            count=$(grep -rhE '^func Fuzz' --include='*_test.go' scan 2>/dev/null | wc -l | tr -d ' ')
+            if [ "${count:-0}" -eq 0 ]; then
+              echo "  skip ${r}: no fuzz targets"
+              continue
             fi
+            # shards = ceil(count * FUZZ_TIME_SECONDS / SHARD_BUDGET_SECONDS), >= 1
+            shards=$(( (count * FUZZ_TIME_SECONDS + SHARD_BUDGET_SECONDS - 1) / SHARD_BUDGET_SECONDS ))
+            [ "$shards" -lt 1 ] && shards=1
+            echo "  include ${r}: ${count} target(s) -> ${shards} shard(s) @ ${sha:0:12}"
+            repo_matrix=$(printf '%s' "$repo_matrix" | jq -c --arg r "$r" --arg s "$sha" '. + [{repo: $r, sha: $s}]')
+            for i in $(seq 0 $((shards - 1))); do
+              shard_matrix=$(printf '%s' "$shard_matrix" | jq -c \
+                --arg r "$r" --arg s "$sha" --argjson sh "$i" --argjson tot "$shards" \
+                '. + [{repo: $r, sha: $s, shard: $sh, shards: $tot}]')
+            done
           done
-          matrix=$(printf '%s\n' "${REPOS[@]}" | jq -R . | jq -s -c '[.[] | {repo: .}]')
-          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
-          echo "Total repos: $(echo "$matrix" | jq 'length')"
+          rm -rf scan
 
-  run:
+          {
+            echo "shard_matrix=${shard_matrix}"
+            echo "repo_matrix=${repo_matrix}"
+          } >> "$GITHUB_OUTPUT"
+          echo "shards: $(printf '%s' "$shard_matrix" | jq 'length'), repos: $(printf '%s' "$repo_matrix" | jq 'length')"
+
+  fuzz:
     needs: fanout
-    if: ${{ needs.fanout.outputs.matrix != '[]' }}
+    if: ${{ needs.fanout.outputs.shard_matrix != '[]' }}
     strategy:
       fail-fast: false
       max-parallel: 6
       matrix:
-        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
+        include: ${{ fromJSON(needs.fanout.outputs.shard_matrix) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 240   # generous: 100 targets × 2m + overhead = ~3.5h
+    # 4h fuzz budget per shard + clone/build/baseline overhead, under the 6h cap.
+    timeout-minutes: 350
     permissions:
       contents: read
     env:
       GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
       FUZZ_TIME: 2m
     steps:
-      - name: Clone target repo
-        run: gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
+      - name: Clone target repo at pinned SHA
+        run: |
+          set -euo pipefail
+          gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
+          git -C target fetch --depth 1 origin "${{ matrix.sha }}"
+          git -C target checkout --quiet "${{ matrix.sha }}"
 
       - name: Set up Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
@@ -83,48 +125,119 @@ jobs:
           go-version-file: target/go.mod
           cache: false
 
-      - name: Run fuzz on every target
-        continue-on-error: true
-        working-directory: target
-        run: |
-          : > /tmp/fuzz-output.log
-          echo "fuzz budget per target: ${FUZZ_TIME}"
-          for pkg in $(go list ./...); do
-            for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep -E '^Fuzz' || true); do
-              echo "::group::fuzz ${fn} (${pkg})"
-              go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME}" "$pkg" 2>&1 | tee -a /tmp/fuzz-output.log || true
-              echo "::endgroup::"
-            done
-          done
-          # Surface findings (non-fatal — issue creation in next step).
-          grep -c "Failing input written to" /tmp/fuzz-output.log || true
-
-      - name: Open / update issues for findings
-        if: always()
+      - name: Run this shard's fuzz targets
         working-directory: target
         env:
-          REPO: cplieger/${{ matrix.repo }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ matrix.shards }}
         run: |
-          [ -s /tmp/fuzz-output.log ] || { echo "no fuzz output"; exit 0; }
-          findings=$(awk '
-            /Failing input written to testdata\/fuzz\// {
-              match($0, /testdata\/fuzz\/[^[:space:]]+/);
-              path = substr($0, RSTART, RLENGTH);
-              n = split(path, parts, "/");
-              hash = parts[n];
-              target = parts[n-1];
-              printf "%s|%s|%s\n", target, hash, path;
-            }
-          ' /tmp/fuzz-output.log | sort -u)
-          [ -z "$findings" ] && { echo "no committable findings"; exit 0; }
+          set -uo pipefail
+          : > "$GITHUB_WORKSPACE/findings.txt"
+          # Deterministic global target list: `go list ./...` is import-path
+          # sorted and `go test -list` order is stable for a fixed commit, so
+          # every shard of this repo sees the identical ordered list and the
+          # round-robin slice below partitions it without overlap or gaps.
+          targets=()
+          for pkg in $(go list ./...); do
+            for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep -E '^Fuzz' || true); do
+              targets+=("${pkg}|${fn}")
+            done
+          done
+          total=${#targets[@]}
+          echo "repo has ${total} fuzz target(s); shard ${SHARD}/${SHARDS}, ${FUZZ_TIME}/target"
+          idx=0
+          ran=0
+          for entry in "${targets[@]}"; do
+            if [ $(( idx % SHARDS )) -eq "$SHARD" ]; then
+              pkg="${entry%%|*}"
+              fn="${entry##*|}"
+              echo "::group::fuzz ${fn} (${pkg})"
+              out=$(go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME}" "$pkg" 2>&1) || true
+              printf '%s\n' "$out"
+              rel=$(printf '%s\n' "$out" | sed -nE 's@.*Failing input written to (testdata/fuzz/[^[:space:]]+).*@\1@p' | head -1)
+              if [ -n "$rel" ]; then
+                # The seed exists on THIS runner but not in the report job's
+                # clone (it isn't committed yet), so capture its size + base64
+                # preview here and carry them through the artifact. Fields:
+                # fuzzname|hash|repo-relative-path|size|base64-preview.
+                dir=$(go list -f '{{.Dir}}' "$pkg")
+                seed="${dir}/${rel}"
+                size=$(wc -c < "$seed" 2>/dev/null || echo 0)
+                preview=$(head -c 500 "$seed" 2>/dev/null | base64 -w0 2>/dev/null | head -c 800 || true)
+                printf '%s|%s|%s|%s|%s\n' "$fn" "$(basename "$rel")" "${dir#"$PWD"/}/${rel}" "$size" "$preview" \
+                  >> "$GITHUB_WORKSPACE/findings.txt"
+              fi
+              echo "::endgroup::"
+              ran=$((ran + 1))
+            fi
+            idx=$((idx + 1))
+          done
+          echo "ran ${ran} target(s); findings: $(wc -l < "$GITHUB_WORKSPACE/findings.txt")"
 
-          echo "$findings" | while IFS='|' read -r target hash path; do
+      - name: Upload shard findings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-findings-${{ matrix.repo }}-shard${{ matrix.shard }}
+          path: findings.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  report:
+    needs: [fanout, fuzz]
+    if: ${{ always() && needs.fanout.outputs.repo_matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJSON(needs.fanout.outputs.repo_matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+      REPO: cplieger/${{ matrix.repo }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Clone target repo at pinned SHA
+        run: |
+          set -euo pipefail
+          gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
+          git -C target fetch --depth 1 origin "${{ matrix.sha }}"
+          git -C target checkout --quiet "${{ matrix.sha }}"
+
+      - name: Download this repo's shard findings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: shard-findings
+          pattern: fuzz-findings-${{ matrix.repo }}-shard*
+
+      - name: Open / update issues and auto-close committed seeds
+        working-directory: target
+        run: |
+          set -uo pipefail
+          # Consolidate findings from every shard of this repo into one list.
+          merged=/tmp/findings.txt
+          : > "$merged"
+          find "$GITHUB_WORKSPACE/shard-findings" -name findings.txt -exec cat {} + 2>/dev/null | sort -u > "$merged" || true
+          echo "consolidated $(wc -l < "$merged") finding(s) for ${REPO}"
+
+          # Create a label, tolerating "already exists" but surfacing real
+          # errors (e.g. the PAT lacking issues:write) as a failure.
+          ensure_label() {
+            local name="$1" color="$2" desc="$3" err
+            err=$(gh label create "$name" -R "$REPO" -c "$color" -d "$desc" 2>&1) && return 0
+            printf '%s' "$err" | grep -qi "already exists" && return 0
+            echo "  label create failed for ${name}: ${err}" >&2
+            return 1
+          }
+
+          while IFS='|' read -r target hash path size preview; do
+            [ -z "$target" ] && continue
             title="[fuzz] ${target} regression — ${hash}"
             existing=$(gh issue list --repo "$REPO" --state open --search "${title} in:title" \
               --json number,title --jq '.[] | select(.title == "'"$title"'") | .number' | head -1)
-            seed_size=$(wc -c < "$path" 2>/dev/null || echo 0)
-            seed_preview=$(head -c 500 "$path" 2>/dev/null | base64 | head -c 800)
             body=$(cat <<EOF
           **Target**: \`${target}\`
           **Reproducer hash**: \`${hash}\`
@@ -136,10 +249,10 @@ jobs:
           go test -run='^${target}\$/${hash}' ./...
           \`\`\`
 
-          **Seed file**: \`${path}\` (${seed_size} bytes, base64 preview):
+          **Seed file**: \`${path}\` (${size} bytes, base64 preview):
 
           \`\`\`
-          ${seed_preview}
+          ${preview}
           \`\`\`
 
           ---
@@ -153,26 +266,23 @@ jobs:
               gh issue comment "$existing" --repo "$REPO" --body "Recurred in ${RUN_URL}" >/dev/null
               echo "  updated #${existing}: ${title}"
             else
+              ensure_label fuzz-finding b60205 "Fuzz-discovered regression" || true
+              ensure_label auto-generated ededed "Maintained by automation" || true
               gh issue create --repo "$REPO" --title "$title" --body "$body" \
                 --label fuzz-finding,auto-generated >/dev/null
               echo "  created: ${title}"
             fi
-          done
+          done < "$merged"
 
-      - name: Auto-close fuzz issues whose seed was committed
-        if: always()
-        working-directory: target
-        env:
-          REPO: cplieger/${{ matrix.repo }}
-        run: |
+          # Auto-close fuzz issues whose seed was committed to the corpus.
           gh issue list --repo "$REPO" --state open --label fuzz-finding --limit 100 \
             --json number,title --jq '.[] | "\(.number)|\(.title)"' | while IFS='|' read -r n title; do
             target=$(echo "$title" | sed -nE 's|^\[fuzz\] ([A-Za-z][A-Za-z0-9_]*) regression .+$|\1|p')
             hash=$(echo "$title" | sed -nE 's|^.+ — ([a-f0-9]+)$|\1|p')
-            [ -z "$target" ] || [ -z "$hash" ] && continue
+            { [ -z "$target" ] || [ -z "$hash" ]; } && continue
             if find testdata/fuzz -path "*/${target}/${hash}" -print -quit 2>/dev/null | grep -q .; then
-              gh issue close "$n" --repo "$REPO" \
-                --comment "Closed automatically: seed at \`testdata/fuzz/${target}/${hash}\` was committed → now part of the deterministic regression corpus." >/dev/null
+              msg="Closed automatically: seed \`testdata/fuzz/${target}/${hash}\` was committed; now part of the deterministic regression corpus."
+              gh issue close "$n" --repo "$REPO" --comment "$msg" >/dev/null
               echo "  closed #${n}"
             fi
           done
