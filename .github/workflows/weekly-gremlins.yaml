@@ -31,7 +31,6 @@ concurrency:
 jobs:
   fanout:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
     steps:
@@ -80,7 +79,6 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
     permissions:
       contents: read
     env:
@@ -160,7 +158,6 @@ jobs:
     needs: [fanout, run]
     if: always() && needs.fanout.outputs.matrix != '[]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -225,7 +222,6 @@ jobs:
     needs: [fanout, run]
     if: always() && needs.fanout.outputs.matrix != '[]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
     permissions:
       contents: read
     env:
