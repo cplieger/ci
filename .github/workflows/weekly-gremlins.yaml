@@ -105,23 +105,40 @@ jobs:
             | tar -xz -C /tmp gremlins
           sudo mv /tmp/gremlins /usr/local/bin/
 
-      - name: Sync central .gremlins.yaml if repo doesn't have one
+      - name: Sync central .gremlins.yaml (authoritative for the weekly run)
         run: |
-          cd target
-          if [ ! -f .gremlins.yaml ]; then
-            curl -fsSL "https://raw.githubusercontent.com/cplieger/ci/main/configs/gremlins.yaml" -o .gremlins.yaml
-          fi
+          # Always overwrite with the central policy so the weekly run uses the
+          # canonical exclude-list regardless of what each consumer has
+          # committed. The committed per-repo copies (kept in sync by
+          # sync.yaml, for local `gremlins unleash`) may lag; the fleet run must
+          # not. "centralization is the point" — see configs/gremlins.yaml.
+          curl -fsSL "https://raw.githubusercontent.com/cplieger/ci/main/configs/gremlins.yaml" \
+            -o target/.gremlins.yaml
 
       - name: Run gremlins (attempt ${{ matrix.attempt }})
-        continue-on-error: true
         working-directory: target
         run: |
-          # Gremlins exits 0 on success regardless of efficacy (we set
-          # threshold=0). It exits non-zero only on internal errors.
-          gremlins unleash --output /tmp/gremlins-out.json . || echo "::warning::gremlins reported non-zero (continuing)"
+          set -uo pipefail
+          # gremlins exits 0 on success regardless of efficacy (threshold=0);
+          # a non-zero exit means an internal error (invalid config, build
+          # failure, …). Surface that as a RED cell instead of swallowing it —
+          # fail-fast is off, so one bad repo doesn't cancel the others, and the
+          # upload step (if: always()) still ships an artifact downstream.
+          rc=0
+          gremlins unleash --output /tmp/gremlins-out.json . || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            # Overwrite any partial output with an error marker so the badge /
+            # aggregate jobs SKIP this attempt (load_run returns None on a file
+            # with no "files" key) rather than publishing a misleading 0%.
+            echo '{"gremlins_error": true}' > /tmp/gremlins-out.json
+            echo "::error::gremlins failed for ${{ matrix.repo }} (attempt ${{ matrix.attempt }}), exit ${rc}"
+            exit "$rc"
+          fi
           if [ ! -s /tmp/gremlins-out.json ]; then
-            echo "::warning::no gremlins output — emitting empty mutants list"
-            echo '{"mutants":[]}' > /tmp/gremlins-out.json
+            # Defensive: a clean exit with no file means "no mutants" — a
+            # minimal {"files":[]} parses as a 0-mutant result (load_run fills
+            # the rest with zeros).
+            echo '{"files":[]}' > /tmp/gremlins-out.json
           fi
 
       - name: Upload full mutants.json (artifact, 90-day retention)
@@ -158,35 +175,51 @@ jobs:
 
       - name: Compute + publish mutation badge per repo
         env:
-          # CI_SCHEDULE must carry contents:write on consumer repos (it already
-          # clones them and edits their tracker issues). The push targets each
-          # repo's orphan `badges` branch, alongside coverage.json.
+          # CI_SCHEDULE must carry contents:write on consumer repos. The push
+          # targets each repo's orphan `badges` branch, alongside coverage.json.
           TOKEN: ${{ secrets.CI_SCHEDULE }}
         run: |
-          # No `set -e` at loop scope: one repo's failure (e.g. a transient
-          # push 403) must not abort the whole fleet. Each repo runs in a
-          # guarded subshell; failures warn and continue.
+          # Explicit per-command error handling (NOT `set -e` inside a subshell:
+          # bash ignores errexit for a `( … ) || …` subshell, which is why an
+          # earlier version reported success while every repo failed). Each repo
+          # is isolated; a failure warns, sets had_failure, and the loop
+          # continues so healthy repos still publish. The job then exits red if
+          # anything failed, so the run never goes green on a real failure.
           set -uo pipefail
           REPOS=$(find artifacts -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sed -E 's/^gremlins-(.+)-[0-9]+$/\1/' | sort -u)
+          WEEK=$(date -u +%Y-%m-%d)
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          publish_one() {
+            local repo="$1"
+            local badge="/tmp/mutation-${repo}.json"
+            python3 scripts/gremlins-aggregate.py \
+              --repo "$repo" --artifacts-dir artifacts --week "$WEEK" \
+              --run-url "$RUN_URL" --badge-file "$badge" >/dev/null || return 1
+            # The script only writes the badge when at least one attempt parsed,
+            # so a repo whose every attempt errored is skipped (its red comes
+            # from the run job) instead of overwriting a good badge with 0%.
+            if [ ! -s "$badge" ]; then
+              echo "  no parseable attempts for ${repo} — leaving existing badge untouched"
+              return 0
+            fi
+            bash scripts/publish-badge.sh \
+              "cplieger/${repo}" "$TOKEN" mutation.json "$(cat "$badge")" || return 1
+          }
+
+          had_failure=0
           for repo in $REPOS; do
             echo "::group::$repo"
-            (
-              set -e
-              python3 scripts/gremlins-aggregate.py \
-                --repo "$repo" \
-                --artifacts-dir artifacts \
-                --week "$(date -u +%Y-%m-%d)" \
-                --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-                --badge-file "/tmp/mutation-${repo}.json" >/dev/null
-              if [ -s "/tmp/mutation-${repo}.json" ]; then
-                bash scripts/publish-badge.sh \
-                  "cplieger/${repo}" "$TOKEN" mutation.json "$(cat "/tmp/mutation-${repo}.json")"
-              else
-                echo "::warning::no badge JSON for ${repo} (no parseable attempts) — skipping"
-              fi
-            ) || echo "::warning::badge publish failed for ${repo} — continuing with remaining repos"
+            if ! publish_one "$repo"; then
+              echo "::warning::badge publish failed for ${repo} — continuing"
+              had_failure=1
+            fi
             echo "::endgroup::"
           done
+          if [ "$had_failure" -ne 0 ]; then
+            echo "::error::one or more mutation-badge publishes failed"
+            exit 1
+          fi
 
   aggregate:
     needs: [fanout, run]
@@ -198,6 +231,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
     steps:
+      - name: Checkout ci (for scripts/)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
       - name: Download all per-attempt artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -208,68 +244,87 @@ jobs:
         run: |
           # Delegate stats + body generation to scripts/gremlins-aggregate.py —
           # the same parser the `badge` job trusts. It reads each attempt's
-          # gremlins-out.json (the artifact the `run` job actually uploads),
-          # computes mean/stddev/coverage, rolls the 12-week history forward
-          # (preserving free-form notes), renders the frequency-bucketed live
-          # mutants, and writes a regression marker. No `set -e` at loop scope:
-          # one repo's failure must not abort the fleet — each runs in a guarded
-          # subshell that warns and continues.
+          # gremlins-out.json, computes mean/stddev/coverage, rolls the 12-week
+          # history forward (preserving free-form notes), renders the
+          # frequency-bucketed live mutants, and writes regression + attempts
+          # markers. Explicit per-command error handling (NOT `set -e` in a
+          # `( … ) || …` subshell, which bash neuters): each repo is isolated,
+          # failures warn and set had_failure, and the job exits red at the end
+          # if anything failed.
           set -uo pipefail
           REPOS=$(find artifacts -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sed -E 's/^gremlins-(.+)-[0-9]+$/\1/' | sort -u)
           WEEK_ENDING=$(date -u +%Y-%m-%d)
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           title="Gremlins mutation testing tracker"
 
+          # Create a label, tolerating "already exists" but surfacing real
+          # errors (e.g. the PAT lacking issues:write) as a failure.
+          ensure_label() {
+            local name="$1" repo="$2" color="$3" desc="$4" err
+            err=$(gh label create "$name" -R "$repo" -c "$color" -d "$desc" 2>&1) && return 0
+            printf '%s' "$err" | grep -qi "already exists" && return 0
+            echo "  label create failed for ${name}: ${err}" >&2
+            return 1
+          }
+
+          process_repo() {
+            local repo="$1" R="cplieger/$1" issue_num att url existing_args=()
+
+            issue_num=$(gh issue list -R "$R" --state open --label gremlins-tracker \
+              --search "$title in:title" --json number,title \
+              --jq '.[] | select(.title == "'"$title"'") | .number' 2>/dev/null | head -1) || true
+
+            if [ -n "$issue_num" ]; then
+              gh issue view "$issue_num" -R "$R" --json body --jq .body > "/tmp/existing-${repo}.md" || return 1
+              existing_args=(--existing-body-file "/tmp/existing-${repo}.md")
+            fi
+
+            python3 scripts/gremlins-aggregate.py \
+              --repo "$repo" --artifacts-dir artifacts --week "$WEEK_ENDING" --run-url "$RUN_URL" \
+              --regression-marker-file "/tmp/regression-${repo}.txt" \
+              --attempts-marker-file "/tmp/attempts-${repo}.txt" \
+              "${existing_args[@]}" > "/tmp/body-${repo}.md" || return 1
+
+            att=$(cat "/tmp/attempts-${repo}.txt" 2>/dev/null || echo 0)
+            if [ "$att" -eq 0 ]; then
+              echo "  no parseable attempts for ${repo} — leaving the tracker issue untouched"
+              return 0
+            fi
+
+            if [ -z "$issue_num" ]; then
+              ensure_label gremlins-tracker "$R" 5319e7 "Gremlins mutation testing tracker" || return 1
+              ensure_label auto-generated "$R" ededed "Maintained by automation" || return 1
+              ensure_label mutation-regression "$R" b60205 "Mutation efficacy regression" || return 1
+              url=$(gh issue create -R "$R" --title "$title" \
+                --label gremlins-tracker,auto-generated --body-file "/tmp/body-${repo}.md") || return 1
+              issue_num="${url##*/}"
+              echo "  created tracker issue #${issue_num}"
+            else
+              gh issue edit "$issue_num" -R "$R" --body-file "/tmp/body-${repo}.md" >/dev/null || return 1
+              echo "  updated tracker issue #${issue_num}"
+            fi
+
+            # Toggle the regression label from the python marker (ensure it
+            # exists first — the issue may predate the label).
+            ensure_label mutation-regression "$R" b60205 "Mutation efficacy regression" || return 1
+            if [ "$(cat "/tmp/regression-${repo}.txt" 2>/dev/null)" = "true" ]; then
+              gh issue edit "$issue_num" -R "$R" --add-label mutation-regression >/dev/null || return 1
+              echo "  flagged mutation-regression"
+            else
+              gh issue edit "$issue_num" -R "$R" --remove-label mutation-regression >/dev/null 2>&1 || true
+            fi
+          }
+
+          had_failure=0
           for repo in $REPOS; do
             echo "::group::$repo"
-            (
-              set -e
-              R="cplieger/${repo}"
-
-              # The tracker issue references these labels; create them if absent
-              # (idempotent — the consumer repo may never have had them).
-              gh label create gremlins-tracker -R "$R" -c 5319e7 -d "Gremlins mutation testing tracker" 2>/dev/null || true
-              gh label create auto-generated -R "$R" -c ededed -d "Maintained by automation" 2>/dev/null || true
-              gh label create mutation-regression -R "$R" -c b60205 -d "Mutation efficacy regression" 2>/dev/null || true
-
-              issue_num=$(gh issue list -R "$R" --state open \
-                --label gremlins-tracker --search "$title in:title" \
-                --json number,title --jq '.[] | select(.title == "'"$title"'") | .number' | head -1)
-
-              existing_args=()
-              if [ -n "$issue_num" ]; then
-                gh issue view "$issue_num" -R "$R" --json body --jq .body > "/tmp/existing-${repo}.md"
-                existing_args=(--existing-body-file "/tmp/existing-${repo}.md")
-              fi
-
-              python3 scripts/gremlins-aggregate.py \
-                --repo "$repo" \
-                --artifacts-dir artifacts \
-                --week "$WEEK_ENDING" \
-                --run-url "$RUN_URL" \
-                --regression-marker-file "/tmp/regression-${repo}.txt" \
-                "${existing_args[@]}" \
-                > "/tmp/body-${repo}.md"
-
-              if [ -n "$issue_num" ]; then
-                gh issue edit "$issue_num" -R "$R" --body-file "/tmp/body-${repo}.md" >/dev/null
-                echo "  updated tracker issue #${issue_num}"
-              else
-                url=$(gh issue create -R "$R" \
-                  --title "$title" \
-                  --label gremlins-tracker,auto-generated \
-                  --body-file "/tmp/body-${repo}.md")
-                issue_num="${url##*/}"
-                echo "  created tracker issue #${issue_num}"
-              fi
-
-              # Apply or clear the regression label from the python marker.
-              if [ -n "$issue_num" ] && [ "$(cat "/tmp/regression-${repo}.txt" 2>/dev/null)" = "true" ]; then
-                gh issue edit "$issue_num" -R "$R" --add-label mutation-regression >/dev/null
-                echo "  flagged mutation-regression"
-              elif [ -n "$issue_num" ]; then
-                gh issue edit "$issue_num" -R "$R" --remove-label mutation-regression >/dev/null 2>&1 || true
-              fi
-            ) || echo "::warning::aggregate failed for ${repo} — continuing with remaining repos"
+            if ! process_repo "$repo"; then
+              echo "::warning::aggregate failed for ${repo} — continuing"
+              had_failure=1
+            fi
             echo "::endgroup::"
           done
+          if [ "$had_failure" -ne 0 ]; then
+            echo "::error::one or more tracker-issue updates failed"
+            exit 1
+          fi

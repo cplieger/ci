@@ -105,12 +105,15 @@ def mutant_key(m: dict) -> tuple:
 
 def mutant_label(m: dict) -> str:
     pos = m.get("position") or m.get("relative_position") or {}
-    file = m.get("file") or pos.get("file") or "?"
     row = pos.get("row") or pos.get("line") or "?"
     typ = m.get("type") or m.get("mutator") or m.get("mutator_name") or "?"
-    cur = m.get("current_token") or m.get("token_old") or "?"
-    new = m.get("new_token") or m.get("token_new") or "?"
-    return f"L{row} — {typ}: `{cur}` → `{new}`"
+    # gremlins v0.6.0's JSON carries no before/after tokens; only render the
+    # arrow when an older/richer schema supplies them.
+    cur = m.get("current_token") or m.get("token_old")
+    new = m.get("new_token") or m.get("token_new")
+    if cur and new:
+        return f"L{row} — {typ}: `{cur}` → `{new}`"
+    return f"L{row} — {typ}"
 
 
 def file_of(m: dict) -> str:
@@ -143,6 +146,59 @@ def badge_color(efficacy: float) -> str:
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
+def load_run(path: Path):
+    """Parse one gremlins `--output` JSON into (mutants, summary).
+
+    gremlins v0.6.0 layout:
+        {"go_module": ..., "test_efficacy": 81.8, "mutations_coverage": 78.5,
+         "mutants_total": 11, "mutants_killed": 9, "mutants_lived": 2,
+         "mutants_not_viable": 0, "mutants_not_covered": 3,
+         "files": [{"file_name": "calc.go",
+                    "mutations": [{"type": "...", "status": "LIVED",
+                                   "line": 10, "column": 11}]}]}
+
+    Returns None for anything that isn't a real gremlins result (e.g. the
+    {"gremlins_error": true} marker the workflow writes when a run fails, or a
+    truncated/invalid file). The discriminator is the presence of the "files"
+    key — present on every genuine result, absent on the error marker. Skipped
+    runs don't count toward `attempts`, so a repo whose every attempt errored
+    publishes nothing instead of a misleading 0%.
+
+    Each mutation is normalised to the shape the rest of this module already
+    expects ({"status", "type", "position": {"file", "row", "column"}}) so the
+    cross-run bucketing in aggregate() is unchanged. Per-run efficacy and
+    coverage are read straight from gremlins' own top-level fields rather than
+    recomputed, so the numbers always match what gremlins reports.
+    """
+    try:
+        with open(path) as fp:
+            data = json.load(fp)
+    except (json.JSONDecodeError, FileNotFoundError):
+        return None
+    if not isinstance(data, dict) or "files" not in data:
+        return None
+
+    muts = []
+    for fe in data.get("files") or []:
+        fname = fe.get("file_name")
+        for m in fe.get("mutations") or []:
+            muts.append({
+                "status": (m.get("status") or "").upper().replace(" ", "_"),
+                "type": m.get("type"),
+                "position": {"file": fname, "row": m.get("line"), "column": m.get("column")},
+            })
+    summary = {
+        "efficacy": float(data.get("test_efficacy") or 0.0),
+        "mutant_coverage": float(data.get("mutations_coverage") or 0.0),
+        "killed": int(data.get("mutants_killed") or 0),
+        "lived": int(data.get("mutants_lived") or 0),
+        "not_covered": int(data.get("mutants_not_covered") or 0),
+        "not_viable": int(data.get("mutants_not_viable") or 0),
+        "total": int(data.get("mutants_total") or 0),
+    }
+    return muts, summary
+
+
 def aggregate(attempt_files: list[Path]) -> dict:
     """Cross-reference mutants across N runs.
 
@@ -156,15 +212,15 @@ def aggregate(attempt_files: list[Path]) -> dict:
         flaky:           list of mutant detail dicts (LIVED in some, KILLED in others)
         live_count:      len(confirmed_live)
     """
-    runs = []
+    runs = []        # list of normalised mutant lists, one per parseable attempt
+    summaries = []   # gremlins' own per-attempt efficacy/coverage/counts
     for f in attempt_files:
-        try:
-            with open(f) as fp:
-                data = json.load(fp)
-        except (json.JSONDecodeError, FileNotFoundError):
+        loaded = load_run(f)
+        if loaded is None:
             continue
-        muts = data.get("mutants", []) or []
+        muts, summary = loaded
         runs.append(muts)
+        summaries.append(summary)
 
     if not runs:
         return {
@@ -173,34 +229,25 @@ def aggregate(attempt_files: list[Path]) -> dict:
             "efficacy_mean": 0.0,
             "efficacy_stddev": 0.0,
             "mutant_coverage_mean": 0.0,
-            "confirmed_live": [],
-            "flaky": [],
+            "live_buckets": {},
             "live_count": 0,
+            "n_runs": 0,
         }
 
-    # Per-run aggregate counts
+    # Per-run figures come straight from gremlins' own top-level fields, so the
+    # rolling history matches what gremlins reports (TIMED_OUT is already folded
+    # into killed by gremlins' efficacy calculation).
     per_attempt = []
-    for run in runs:
-        counts = {"killed": 0, "lived": 0, "not_covered": 0, "timed_out": 0, "not_viable": 0}
-        for m in run:
-            s = (m.get("status") or "").upper()
-            if s == "KILLED":
-                counts["killed"] += 1
-            elif s == "LIVED":
-                counts["lived"] += 1
-            elif s == "NOT_COVERED":
-                counts["not_covered"] += 1
-            elif s == "TIMED_OUT":
-                counts["timed_out"] += 1
-            elif s == "NOT_VIABLE":
-                counts["not_viable"] += 1
-        runnable = counts["killed"] + counts["lived"] + counts["timed_out"]
-        # Treat TIMED_OUT as a "killed" outcome (mutation made the test hang
-        # → effectively detected, even if not via assertion).
-        eff = round(safe_div((counts["killed"] + counts["timed_out"]) * 100, runnable), 1)
-        cov_denom = runnable + counts["not_covered"]
-        cov = round(safe_div(runnable * 100, cov_denom), 1)
-        per_attempt.append({**counts, "runnable": runnable, "efficacy": eff, "mutant_coverage": cov})
+    for s in summaries:
+        per_attempt.append({
+            "killed": s["killed"],
+            "lived": s["lived"],
+            "not_covered": s["not_covered"],
+            "not_viable": s["not_viable"],
+            "runnable": s["killed"] + s["lived"],
+            "efficacy": round(s["efficacy"], 1),
+            "mutant_coverage": round(s["mutant_coverage"], 1),
+        })
 
     efficacies = [a["efficacy"] for a in per_attempt]
     eff_mean = round(statistics.mean(efficacies), 1)
@@ -538,6 +585,10 @@ def main() -> int:
     p.add_argument("--badge-file", type=Path, default=None,
                    help="Write a shields `endpoint` JSON (label 'mutation', "
                         "message '<efficacy_mean>%') here for the README badge")
+    p.add_argument("--attempts-marker-file", type=Path, default=None,
+                   help="Write the count of parseable attempts here. The "
+                        "workflow reads it to skip publishing for a repo whose "
+                        "every attempt failed (0) instead of emitting a 0%% badge.")
     args = p.parse_args()
 
     attempt_files = sorted(args.artifacts_dir.glob(f"gremlins-{args.repo}-*/gremlins-out.json"))
@@ -546,8 +597,12 @@ def main() -> int:
     agg = aggregate(attempt_files)
     print(f"[{args.repo}] efficacy={agg['efficacy_mean']}±{agg['efficacy_stddev']} "
           f"cov={agg['mutant_coverage_mean']} live={agg['live_count']} "
+          f"attempts={agg['attempts']} "
           f"buckets={ {k: len(v) for k, v in agg['live_buckets'].items()} }",
           file=sys.stderr)
+
+    if args.attempts_marker_file:
+        args.attempts_marker_file.write_text(str(agg["attempts"]))
 
     # Emit the README badge endpoint JSON (one line) if requested. Skipped when
     # there were no parseable attempts, so a failed run never overwrites a good
