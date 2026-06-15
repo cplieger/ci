@@ -56,16 +56,17 @@ get no mutation run, so the badge would read `invalid`.
 ```markdown
 [![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
 [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
-[![Node version](https://img.shields.io/node/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
 ```
 
-The **Node version** badge reads `engines.node` from the published npm package,
-so `package.json` must declare `engines.node` or the badge shows
-`node | not specified`. No **Mutation** badge — gremlins is Go-only (there is no
-Stryker equivalent wired up).
+No **Node version** badge. It read `engines.node` from the published npm
+package, so unless `package.json` declared `engines.node` it rendered
+`node | not specified` — and even when populated it links to the same npm
+package page as the npm badge, so it fails principle #5 (every badge earns its
+place). Dropped fleet-wide (`actions`, `reactive`). No **Mutation** badge either
+— gremlins is Go-only (there is no Stryker equivalent wired up).
 
 ### Hybrid Go + TS library (e.g. vterm)
 
@@ -76,14 +77,18 @@ Stryker equivalent wired up).
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/REPO)](https://github.com/cplieger/REPO/blob/main/go.mod)
 [![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/REPO)](https://goreportcard.com/report/github.com/cplieger/REPO)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
+[![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
 ```
 
-8 badges — at the cliff. The single Node-version badge is dropped here (the lib
-is Go-first); add it back only if the TS surface is the primary one. Coverage
-and the Mutation badge reflect whichever surface `coverage.yaml` / gremlins
-measure on the repo (Go, for vterm).
+9 badges — one over the soft cap, the one deliberate exception to the ≤8 rule.
+A hybrid lib carries both ecosystems' identity badges (Go Reference + npm + JSR)
+*and* earns a Mutation badge (gremlins runs on its Go surface), so dropping the
+Node-version badge (now gone fleet-wide) gets it to 9, not 8. The single
+Node-version badge is not re-added here. Coverage and the Mutation badge reflect
+whichever surface `coverage.yaml` / gremlins measure on the repo (Go, for
+vterm).
 
 ### Docker image (built from Go source in this repo)
 
