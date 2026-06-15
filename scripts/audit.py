@@ -19,7 +19,7 @@ import subprocess
 import sys
 
 OWNER = "cplieger"
-PRESET = "github>cplieger/ci"
+PRESET = "github>cplieger/.github"
 REUSABLE = "cplieger/ci/.github/workflows"
 HARD = ["license", "main", "ci", "renovate"]
 SOFT = ["desc", "topics"]

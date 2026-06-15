@@ -23,4 +23,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.AUDIT_PAT || github.token }}
         run: |
-          { echo '```'; python3 scripts/audit.py; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/audit.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          status=${PIPESTATUS[0]}
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
