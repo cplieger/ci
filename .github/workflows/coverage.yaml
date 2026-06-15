@@ -84,8 +84,9 @@ jobs:
 
           # Single-line printf (NOT a heredoc): heredocs in GHA run blocks break
           # when YAML dedent shifts the terminator. JSON on one line is safe.
-          # Label is "Test coverage" (paired with the README badge alt text).
-          json=$(printf '{"schemaVersion":1,"label":"Test coverage","message":"%s%%","color":"%s"}' "$PCT" "$color")
+          # Label is lowercase "test coverage" to match the other shields
+          # badges (e.g. the "mutation" endpoint), which render lowercase labels.
+          json=$(printf '{"schemaVersion":1,"label":"test coverage","message":"%s%%","color":"%s"}' "$PCT" "$color")
 
           # Publish via the shared sibling-preserving helper so coverage.json
           # and mutation.json coexist on the orphan `badges` branch instead of
