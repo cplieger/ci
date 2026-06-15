@@ -39,6 +39,12 @@ jobs:
             | tar -xzf - -C /tmp actionlint
           sudo mv /tmp/actionlint /usr/local/bin/actionlint
 
+      # Soft-gate block: each step below runs to completion (continue-on-error)
+      # and records its own name to /tmp/_ci_failures on failure; the final
+      # "Check results" step fails the job if that file exists. CONTRACT: any
+      # step added to this block MUST end with
+      #   || { echo "<step name>" >> /tmp/_ci_failures; exit 1; }
+      # or its failure is silently tolerated by continue-on-error.
       - name: Lint workflows (actionlint)
         continue-on-error: true
         run: |
