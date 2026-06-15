@@ -152,17 +152,32 @@ jobs:
             '(^|/)eslint\.config\.base\.mjs$'
             '(^|/)vitest\.config\.(ts|js)$'
             '(^|/)tsconfig\.(test|tests|node)\.json$'
+            # Base tsconfig.json: root-anchored ONLY. In the Go+web docker repos
+            # a nested static-src/tsconfig.json is a tsgo build input (it
+            # compiles the web client that main.go then embeds), so it MUST
+            # trigger a rebuild — do NOT broaden this to (^|/). Pure-TS libs
+            # (actions, reactive) and TS subpackages keep their base tsconfig
+            # at root.
+            '^tsconfig\.json$'
             '(^|/)knip\.json$'
             '(^|/)stryker\.config\.json$'
             '(^|/)\.golangci\.(yaml|yml)$'
+            # Gremlins (Go mutation testing) config — synced fleet-wide from
+            # cplieger/ci into every Go repo, like .golangci. Dev-only; never
+            # COPY'd/embedded into any artifact.
+            '(^|/)\.gremlins\.(yaml|yml)$'
 
             # Docs and license
             '\.md$'
             '(^|/)LICENSE$'
+            # Grafana dashboards — committed for manual UI import (per the
+            # dashboards-imported-via-UI convention), never COPY'd/embedded
+            # into any image or served from one.
+            '(^|/)grafana-dashboard\.json$'
 
             # CI / security tooling configs
             '(^|/)cliff\.toml$'
-            '^renovate\.json$'
+            '(^|/)renovate\.json$'
             '(^|/)\.gitleaks\.toml$'
             '(^|/)\.codeql-suppressions\.yaml$'
             '(^|/)\.trivyignore$'
@@ -219,6 +234,39 @@ jobs:
             '(^|/)setup-tools\.test\.sh$'
             '^tests/'
           )
+
+          # Derive additional exclusions from cplieger/ci's sync manifest, in
+          # ADDITION to the manual list above. Every file the sync workflow
+          # pushes into consumer repos (sync.yml `dest:` paths) is a shared
+          # config — editor/lint/CI/changelog tooling — never a build input or
+          # shipped artifact. So a `chore(sync):` PR touching only these must
+          # not flip root_changed and trigger a rebuild/republish. Reading the
+          # manifest here means the NEXT newly-synced tool config (the next
+          # .gremlins.yaml) is excluded automatically, without editing the list
+          # above. Fetched from main: the synced set is monotonic and uniformly
+          # non-shipping, so a newer manifest can only ever exclude MORE shared
+          # configs — it can never cause a missed release. Best-effort: any
+          # fetch/parse failure leaves the manual patterns in force (fail toward
+          # over-building, never toward a silently missed build). Paths are
+          # anchored as literal full-path matches (^path$); a synced config that
+          # doesn't exist in this repo simply never matches.
+          SYNC_URL="https://raw.githubusercontent.com/cplieger/ci/main/.github/sync.yml"
+          if SYNC_YML=$(curl -fsSL --retry 2 --max-time 15 "$SYNC_URL" 2>/dev/null) \
+             && command -v yq >/dev/null 2>&1; then
+            DERIVED=0
+            while IFS= read -r dest; do
+              [ -z "$dest" ] && continue
+              esc=$(printf '%s' "$dest" | sed 's/[].[(){}^$*+?|]/\\&/g')
+              EXCLUDE_PATTERNS+=("^${esc}$")
+              DERIVED=$((DERIVED + 1))
+            done < <(printf '%s' "$SYNC_YML" | yq -o=json '.' 2>/dev/null \
+                       | jq -r '.group[].files[] | if type=="string" then . else .dest end' 2>/dev/null \
+                       | sort -u)
+            echo "::notice::Derived $DERIVED sync-managed exclusion(s) from cplieger/ci sync.yml"
+          else
+            echo "::notice::sync.yml unavailable or yq missing — manual exclusion list only"
+          fi
+
           # Join patterns with | for a single grep -E invocation.
           EXCLUDE_RE=$(IFS='|'; echo "${EXCLUDE_PATTERNS[*]}")
 
