@@ -16,8 +16,8 @@ suffix for versioned modules, e.g. `metrics/v2`).
    version. Renovate bumps the `Dockerfile` `FROM` constantly; a version in the
    badge silently rots. The exact pin lives in the `Dockerfile` + the SBOM.
 3. **No CI or release badge.** Both were dropped fleet-wide:
-   - **CI**: a workflow status badge tracks the latest run on the *default
-     branch*. With required PR checks + auto-merge, nothing lands on `main`
+   - **CI**: a workflow status badge tracks the latest run on the _default
+     branch_. With required PR checks + auto-merge, nothing lands on `main`
      until it is already green, so the badge is a near-permanent green
      decoration that conveys nothing. Red would be a rare flake, not a signal a
      consumer can act on.
@@ -203,7 +203,7 @@ the SBOM is a named, signed, downloadable asset) — not `/attestations`, which 
 empty because the flow uses cosign registry attestations, not GitHub-native
 `actions/attest-*`. Label is `SPDX` (the format actually produced), not
 CycloneDX. Verified present on every image repo's latest release before adding.
-Libraries omit it — their `go.mod` / `package-lock.json` *is* the bill of
+Libraries omit it — their `go.mod` / `package-lock.json` _is_ the bill of
 materials.
 
 ## Notes
