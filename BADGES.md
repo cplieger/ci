@@ -84,7 +84,7 @@ place). Dropped fleet-wide (`actions`, `reactive`). No **Mutation** badge either
 
 9 badges — one over the soft cap, the one deliberate exception to the ≤8 rule.
 A hybrid lib carries both ecosystems' identity badges (Go Reference + npm + JSR)
-*and* earns a Mutation badge (gremlins runs on its Go surface), so dropping the
+_and_ earns a Mutation badge (gremlins runs on its Go surface), so dropping the
 Node-version badge (now gone fleet-wide) gets it to 9, not 8. The single
 Node-version badge is not re-added here. Coverage and the Mutation badge reflect
 whichever surface `coverage.yaml` / gremlins measure on the repo (Go, for
