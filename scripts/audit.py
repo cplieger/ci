@@ -27,7 +27,6 @@ import base64
 import json
 import subprocess
 import sys
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 OWNER = "cplieger"

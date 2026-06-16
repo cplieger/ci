@@ -12,6 +12,11 @@
 #                                            + shellcheck nullglob-safe + gitleaks)
 #   - has nested web frontend → `web` job:   ts-ci.yaml at the detected dir,
 #                                            web-lint=true (HTML+CSS lints)
+#   - has *.py                → `python` job: ruff check (inline canonical config)
+#   - tooling/docs repo       → `scripts` job: actionlint + shellcheck (inline).
+#     (no go.mod/jsr.json/      Targets pure tooling/docs repos (cplieger/ci,
+#      Dockerfile) + *.sh or    cplieger/.github); Docker repos lint shell +
+#      workflow files          workflows via shell-ci.yaml instead.
 #
 # Web-frontend nested directory probe order:
 #   static-src/  →  web/  →  internal/server/static-src/
@@ -35,6 +40,8 @@ jobs:
       run_web: ${{ steps.detect.outputs.run_web }}
       run_shell: ${{ steps.detect.outputs.run_shell }}
       run_docker: ${{ steps.detect.outputs.run_docker }}
+      run_python: ${{ steps.detect.outputs.run_python }}
+      run_scripts: ${{ steps.detect.outputs.run_scripts }}
       web_dir: ${{ steps.detect.outputs.web_dir }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -51,6 +58,8 @@ jobs:
           run_web=false
           run_shell=false
           run_docker=false
+          run_python=false
+          run_scripts=false
           web_dir=""
 
           # --- Did any non-docs (code) file change? ---
@@ -118,6 +127,22 @@ jobs:
                 break
               fi
             done
+
+            # Python: any *.py → ruff lint (inline canonical config, same
+            # rationale as the markdown job).
+            if [ -n "$(find . -name '*.py' -not -path './.git/*' -print -quit)" ]; then
+              run_python=true
+            fi
+
+            # Scripts: pure tooling/docs repos only (no go.mod/jsr.json/
+            # Dockerfile — Go/TS/Docker repos lint via their own jobs). Fires on
+            # shell scripts or workflow files → actionlint + shellcheck.
+            if [ ! -f Dockerfile ] && [ ! -f go.mod ] && [ ! -f jsr.json ]; then
+              if [ -n "$(find . -name '*.sh' -not -path './.git/*' -print -quit)" ] \
+                || [ -n "$(find .github/workflows -name '*.y*ml' -print -quit 2> /dev/null)" ]; then
+                run_scripts=true
+              fi
+            fi
           fi
 
           {
@@ -126,6 +151,8 @@ jobs:
             echo "run_web=$run_web"
             echo "run_shell=$run_shell"
             echo "run_docker=$run_docker"
+            echo "run_python=$run_python"
+            echo "run_scripts=$run_scripts"
             echo "web_dir=$web_dir"
           } >> "$GITHUB_OUTPUT"
 
@@ -139,6 +166,8 @@ jobs:
             echo "| web      | $run_web | ${web_dir:-—} |"
             echo "| shell    | $run_shell | . |"
             echo "| docker   | $run_docker | . |"
+            echo "| python   | $run_python | . |"
+            echo "| scripts  | $run_scripts | . |"
             echo "| markdown | true (always) | . |"
             echo ""
             echo "code_changed: $code_changed"
@@ -249,12 +278,80 @@ jobs:
           markdownlint-cli2 --config "$RUNNER_TEMP/.markdownlint.json" \
             "**/*.md" "#node_modules" "#.git"
 
+  # Python lint (ruff). Inline + canonical config, same rationale as markdown:
+  # no self-referencing pinned tag, no per-repo config sync. Fires on any *.py
+  # (e.g. cplieger/ci's audit.py + scripts/*.py).
+  python:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_python == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install ruff
+        run: |
+          # renovate: datasource=pypi depName=ruff
+          pipx install ruff==0.15.16
+
+      - name: Lint Python (ruff check)
+        run: ruff check --output-format github .
+
+  # Shell + workflow lint for pure tooling/docs repos (Docker repos get this via
+  # shell-ci.yaml). Soft-gated like shell-ci.yaml: each step records its name to
+  # /tmp/_ci_failures on failure and the final step fails the job if any did.
+  scripts:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_scripts == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install actionlint
+        run: |
+          # renovate: datasource=github-releases depName=rhysd/actionlint
+          VERSION=v1.7.12
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/${VERSION}/actionlint_${VERSION#v}_linux_amd64.tar.gz" \
+            | tar -xzf - -C /tmp actionlint
+          sudo mv /tmp/actionlint /usr/local/bin/actionlint
+
+      - name: Lint workflows (actionlint)
+        continue-on-error: true
+        run: |
+          (
+            actionlint -color
+          ) || { echo "Lint workflows (actionlint)" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Lint shell scripts (shellcheck)
+        continue-on-error: true
+        run: |
+          (
+            files=$(find . -name '*.sh' -not -path './.git/*')
+            if [ -z "$files" ]; then
+              echo "shellcheck: no *.sh found — skipping"
+            else
+              # shellcheck disable=SC2086
+              shellcheck -x -S info $files
+            fi
+          ) || { echo "Lint shell scripts (shellcheck)" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Check results
+        if: always()
+        run: |
+          if [ -f /tmp/_ci_failures ]; then
+            echo "::error::Failed validation steps:"
+            sort -u /tmp/_ci_failures >&2
+            exit 1
+          fi
+          echo "All validation steps passed"
+
   # Aggregator — emits a single `ci / validate` check name that branch
   # protection rules can target (preserves the check name from the previous
   # per-type templates so existing branch-protection rules keep working
   # without per-repo updates).
   validate:
-    needs: [detect, go, ts, web, shell, docker, markdown]
+    needs: [detect, go, ts, web, shell, docker, markdown, python, scripts]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 1
@@ -268,6 +365,8 @@ jobs:
           SHELL: ${{ needs.shell.result }}
           DOCKER: ${{ needs.docker.result }}
           MARKDOWN: ${{ needs.markdown.result }}
+          PYTHON: ${{ needs.python.result }}
+          SCRIPTS: ${{ needs.scripts.result }}
         run: |
           # detect must always succeed (it gates everything else)
           if [ "$DETECT" != "success" ]; then
@@ -278,7 +377,7 @@ jobs:
           # or skipped (auto-detect said it wasn't applicable). markdown always
           # runs, so it must be success (skipped only if detect failed, caught
           # above).
-          for pair in "go=$GO" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "markdown=$MARKDOWN"; do
+          for pair in "go=$GO" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"; do
             name="${pair%%=*}"; result="${pair##*=}"
             if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
               echo "::error::$name job: $result"

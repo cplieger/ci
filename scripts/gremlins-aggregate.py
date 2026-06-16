@@ -66,7 +66,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
 import statistics
 import sys
