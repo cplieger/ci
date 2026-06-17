@@ -2,9 +2,9 @@ name: Go CI
 
 # Reusable Go CI. Call from a repo with:
 #   jobs: { ci: { uses: cplieger/ci/.github/workflows/go-ci.yaml@v1 } }
-# Profile is auto-detected: app-mode (deadcode, punused, fieldalignment,
-# dependency-review) activates when a `main` package exists; hadolint runs
-# when a Dockerfile is present.
+# Profile is auto-detected: app-mode (deadcode, punused, dependency-review)
+# activates when a `main` package exists; fieldalignment runs on every repo
+# (libraries included); hadolint runs when a Dockerfile is present.
 
 on:
   workflow_call:
@@ -76,12 +76,12 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           go install github.com/rhysd/actionlint/cmd/actionlint@latest
+          go install golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@latest
 
       - name: Install app tools
         if: ${{ steps.profile.outputs.app == 'true' }}
         run: |
           go install golang.org/x/tools/cmd/deadcode@latest
-          go install golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@latest
           go install github.com/bep/punused@latest
 
       # Soft-gate block: each step below runs to completion (continue-on-error)
@@ -160,7 +160,6 @@ jobs:
           ) || { echo "deadcode" >> /tmp/_ci_failures; exit 1; }
 
       - name: Field alignment
-        if: ${{ steps.profile.outputs.app == 'true' }}
         continue-on-error: true
         run: |
           (
