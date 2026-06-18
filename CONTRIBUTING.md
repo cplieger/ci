@@ -17,7 +17,8 @@ outward, so the conventions below are about not breaking downstream.
     workflows.
   - `release.yaml` — unified release (git-cliff version → publish → tag →
     GitHub Release).
-  - `lint.yaml` — this repo's _own_ CI; runs `actionlint` on push/PR to `main`.
+  - `self-ci.yaml` — this repo's _own_ CI; calls the meta `ci.yaml` via a local
+    `./` ref (markdown + python + actionlint/shellcheck) on push/PR to `main`.
   - `move-major-tag.yaml`, `sync.yaml`, `audit.yaml`, and the scheduled
     security/fuzz/gremlins jobs.
 - `.github/workflow-templates/` — thin caller workflows synced verbatim into
