@@ -94,10 +94,9 @@ jobs:
           cache: false
 
       - name: Install gremlins
-        env:
-          # renovate: datasource=github-releases depName=go-gremlins/gremlins
-          VERSION: v0.6.0
         run: |
+          # renovate: datasource=github-releases depName=go-gremlins/gremlins
+          VERSION=v0.6.0
           curl -fsSL --retry 3 \
             "https://github.com/go-gremlins/gremlins/releases/download/${VERSION}/gremlins_${VERSION#v}_linux_amd64.tar.gz" \
             | tar -xz -C /tmp gremlins

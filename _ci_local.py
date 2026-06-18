@@ -230,7 +230,8 @@ def evaluate_step_if(expr, step_outputs, caller_inputs=None):
       - inputs.<k> -> from caller_inputs
       - && , ||, ! prefix, ${{ }} wrapping
       - always() -> TRUE
-      - hashFiles(...) != '' -> TRUE (assume file exists)
+      - hashFiles(...) != '' -> resolved against the real filesystem
+        (empty string when no glob matches, a hash otherwise — GHA semantics)
     """
     if caller_inputs is None:
         caller_inputs = {}
@@ -351,9 +352,21 @@ def _resolve_value(tok, step_outputs, caller_inputs):
     if tok == 'github.event_name':
         return 'workflow_dispatch'  # local = full run (not PR)
 
-    # hashFiles(...) — assume file exists
-    if tok.startswith('hashFiles('):
-        return 'somehash'
+    # hashFiles(...) — resolve against the real filesystem. GitHub Actions'
+    # hashFiles returns an empty string when no file matches the glob(s) and a
+    # hash otherwise, so a step guarded by `if: hashFiles('x') != ''` runs only
+    # when x exists. Mirror that locally: the opt-in `tests/image-smoke.sh`
+    # step (advisory) must SKIP when the repo ships no image-smoke script,
+    # exactly as it does in CI — assuming the file always exists made the local
+    # run try `sh tests/image-smoke.sh` and fail rc=127 on every docker-* repo.
+    if tok.startswith('hashFiles(') and tok.endswith(')'):
+        args = tok[len('hashFiles(') : -1]
+        patterns = [a.strip().strip('\'"') for a in args.split(',') if a.strip()]
+        base = Path.cwd()
+        for pat in patterns:
+            if any(p.is_file() for p in base.glob(pat)):
+                return 'somehash'
+        return ''
 
     # always()
     if tok == 'always()':

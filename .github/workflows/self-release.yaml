@@ -1,0 +1,262 @@
+# Self-release: auto-tag this reusable-workflow repo so tool bumps and workflow
+# fixes actually reach consumers.
+#
+# THE PROBLEM THIS SOLVES
+# -----------------------
+# Consumers pin the reusable workflows by SHA behind a moving major tag
+# (`uses: cplieger/ci/.github/workflows/<wf>.yaml@<sha> # v2`). Renovate tracks
+# the `# v2` comment and bumps the pinned SHA only when the `v2` tag MOVES.
+# `move-major-tag.yaml` moves `v2`/`v2.Y` only when a `vX.Y.Z` tag is pushed.
+# Nothing created that tag automatically, so Renovate-fresh tool pins on `main`
+# (markdownlint, ruff, golangci-lint, git-cliff, …) sat untagged forever and
+# never propagated. This workflow cuts that tag.
+#
+# WHAT TRIGGERS A BUMP (the precision gate)
+# -----------------------------------------
+# The tag-move lever only matters for CHANNEL 2 — the reusable workflows and
+# composite actions consumers reference by SHA. Channel 1 files (templates,
+# configs, .golangci.yaml, cliff.toml, …) reach consumers independently via
+# sync.yaml and must NOT cut a tag (doing so would fan out ~27 no-op Renovate
+# digest PRs across the fleet, burning CI credits for nothing).
+#
+# So we cut a tag only when a PROPAGATABLE file changed since the last release
+# tag — i.e. a consumed reusable workflow or a composite action. The PATH GATE
+# (not the commit type) is the authoritative release decision for this repo:
+# git-cliff computes the bump LEVEL (breaking→major, feat→minor, else→patch),
+# but if cliff declines a skip-typed-but-propagatable change (e.g. a `ci:` edit
+# to go-ci.yaml), we force a patch bump so it still propagates. This closes the
+# false-negative class where a workflow fix typed `ci:`/`chore:` would never
+# reach consumers.
+#
+# The path gate is a directory-include MINUS a known internal-only exclude
+# list, so it fails SAFE: a newly added reusable workflow auto-propagates
+# (no silent stagnation), while a forgotten new internal workflow only ever
+# causes one harmless extra bump (noticed via the needless PRs, then added to
+# INTERNAL_WORKFLOWS below). See .kiro steering "ci.md → Updating and
+# propagating" for the two-channel model. Version policy lives in the dedicated
+# .github/cliff-ci.toml (full-semver tag_pattern so the moving v2/v2.Y tags
+# don't confuse the version base; not synced to consumers).
+name: Self-release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Cut a tag even if the path gate finds no propagatable change (version still computed by cliff, patch-bumped if cliff declines)."
+        type: boolean
+        default: false
+
+# Top-level read-only (OpenSSF Scorecard Token-Permissions). The tag push and
+# GitHub Release use RELEASE_PAT, not GITHUB_TOKEN, because a tag pushed with
+# GITHUB_TOKEN does NOT trigger move-major-tag.yaml (GitHub suppresses workflow
+# runs from events created by the default token) and GITHUB_TOKEN cannot carry
+# the `workflows` permission a workflow-touching ref push requires.
+permissions:
+  contents: read
+
+# Serialize so two quick pushes can't race to compute/push the same tag.
+concurrency:
+  group: self-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify release token
+        env:
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_PAT:-}" ]; then
+            echo "::error::RELEASE_PAT secret is missing or empty. Set it to a fine-grained PAT scoped to cplieger/ci with Contents: write + Workflows: write (the tag commit touches .github/workflows/, and the push must trigger move-major-tag.yaml — neither is possible with GITHUB_TOKEN)."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          # Read-only default token, and do NOT persist it: the untrusted
+          # git-cliff binary downloaded below must never run with a write-capable
+          # credential in git config. RELEASE_PAT is materialized only in the
+          # push step's env (one-shot auth header), after the binary has run.
+          persist-credentials: false
+
+      - name: Install git-cliff
+        env:
+          # renovate: datasource=github-releases depName=orhun/git-cliff
+          CLIFF_VERSION: v2.13.1
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 \
+            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+          git-cliff --version
+
+      - name: Decide whether to cut a tag
+        id: gate
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+          CLIFF_CONFIG: .github/cliff-ci.toml
+        run: |
+          set -euo pipefail
+
+          # Latest FULL semver tag. The --match glob mirrors the dedicated
+          # config's tag_pattern: it ignores the moving vX / vX.Y tags that
+          # move-major-tag.yaml keeps co-located on the release commit.
+          LAST_TAG="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || echo "")"
+
+          # Next version from conventional commits, using the CI-dedicated config
+          # (full-semver tag_pattern). Mirrors git-cliff-version's error handling:
+          # a non-zero exit or empty output is a hard failure, never a silent skip.
+          if ! NEXT="$(git cliff --bumped-version --config "$CLIFF_CONFIG" 2>/tmp/cliff.err)"; then
+            echo "::error::git cliff --bumped-version failed:"
+            sed 's/^/  /' /tmp/cliff.err >&2 || true
+            exit 1
+          fi
+          if [ -z "$NEXT" ]; then
+            echo "::error::git cliff returned an empty version with no error"
+            exit 1
+          fi
+
+          # Bootstrap: no prior release tag => release whatever cliff computed.
+          if [ -z "$LAST_TAG" ]; then
+            echo "No prior vX.Y.Z tag found; bootstrapping first release (${NEXT})."
+            echo "cut=true" >> "$GITHUB_OUTPUT"
+            echo "version=${NEXT}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --- Path gate: did any PROPAGATABLE (Channel 2) file change since the
+          # last release? Channel 2 = the reusable workflows + composite actions
+          # consumers reference by SHA. Channel 1 (templates, configs) reaches
+          # consumers via sync.yaml independently and must NOT cut a tag. The gate
+          # is the AUTHORITATIVE release decision for this repo (not the commit
+          # type), so a skip-typed but propagatable change still propagates. ---
+          PROPAGATABLE=false
+          MATCHED=""
+          if [ "${FORCE:-false}" = "true" ]; then
+            PROPAGATABLE=true
+            MATCHED="(workflow_dispatch force)"
+            echo "Manual force=true; bypassing path gate."
+          else
+            # Internal-only workflows live under .github/workflows/ but are NOT
+            # consumed by SHA from any consumer (they run inside the ci repo).
+            # Editing them must NOT cut a tag. The gate is a directory-include
+            # MINUS this list, so it fails SAFE: a NEW reusable workflow
+            # auto-propagates, while a forgotten new internal one only costs one
+            # harmless extra bump (noticed via the needless PRs, then added here).
+            INTERNAL_WORKFLOWS="audit.yaml daily-security.yaml move-major-tag.yaml scorecard.yml self-ci.yaml self-release.yaml sync.yaml trigger-renovate.yaml weekly-fuzz.yaml weekly-gremlins.yaml backfill-release-sbom-sigs.yaml"
+
+            is_internal() {
+              local base="$1"
+              for w in $INTERNAL_WORKFLOWS; do
+                [ "$base" = "$w" ] && return 0
+              done
+              return 1
+            }
+
+            CHANGED="$(git diff --name-only "${LAST_TAG}..HEAD")"
+            echo "Changed files since ${LAST_TAG}:"
+            echo "$CHANGED" | awk '{ print "  " $0 }'
+
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              case "$f" in
+                actions/*)
+                  PROPAGATABLE=true; MATCHED="$f"; break ;;
+                .github/workflows/*)
+                  base="${f#.github/workflows/}"
+                  if ! is_internal "$base"; then
+                    PROPAGATABLE=true; MATCHED="$f"; break
+                  fi
+                  ;;
+              esac
+            done <<< "$CHANGED"
+          fi
+
+          if [ "$PROPAGATABLE" != "true" ]; then
+            echo "Only Channel-1 / internal / docs changes since ${LAST_TAG}; these reach consumers via sync.yaml (or not at all). No tag needed."
+            echo "cut=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Propagatable. If cliff declined to bump (all commits since the tag are
+          # skip-typed, e.g. ci:/chore:), force a patch bump so the propagatable
+          # change still reaches consumers — the path gate, not the commit type,
+          # is authoritative here. (Strip any pre-release suffix defensively.)
+          if [ "$NEXT" = "$LAST_TAG" ]; then
+            base="${LAST_TAG#v}"
+            IFS=. read -r MA MI PA <<< "$base"
+            PA_NUM="${PA%%[!0-9]*}"
+            NEXT="v${MA}.${MI}.$((PA_NUM + 1))"
+            echo "cliff declined to bump (skip-typed commits) but ${MATCHED} is propagatable; forcing patch bump to ${NEXT}."
+          else
+            echo "Propagatable change (${MATCHED}); cliff bumped ${LAST_TAG} -> ${NEXT}."
+          fi
+
+          # Defensive: cliff bases off the same tag the gate diffs from, so a
+          # non-forward version should be unreachable — but never move a tag
+          # backward (move-major-tag would drag v2/v2.Y down with it).
+          if [ "$NEXT" = "$LAST_TAG" ] || \
+             [ "$(printf '%s\n%s\n' "$LAST_TAG" "$NEXT" | sort -V | tail -1)" != "$NEXT" ]; then
+            echo "::error::Computed version ${NEXT} is not strictly greater than ${LAST_TAG}; refusing to cut."
+            exit 1
+          fi
+
+          # A MAJOR bump cuts vN+1; consumers pinned to the old major's digest
+          # do NOT auto-follow and stay frozen until manually repointed.
+          if [ "${NEXT%%.*}" != "${LAST_TAG%%.*}" ]; then
+            echo "::warning::${NEXT} is a MAJOR bump over ${LAST_TAG}. Consumers pinned to ${LAST_TAG%%.*} will NOT auto-update — repoint their '# v' pins manually."
+          fi
+
+          echo "cut=true" >> "$GITHUB_OUTPUT"
+          echo "version=${NEXT}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push release tag
+        if: steps.gate.outputs.cut == 'true'
+        env:
+          VERSION: ${{ steps.gate.outputs.version }}
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            echo "::notice::Tag ${VERSION} already exists; nothing to push."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${VERSION}" -m "Release ${VERSION}"
+          # Scope the write-capable PAT to just this push: set the auth header in
+          # local git config (kept out of process args and the remote URL), push,
+          # then remove it. Mirrors actions/checkout's own credential mechanism.
+          AUTH="$(printf 'x-access-token:%s' "$RELEASE_PAT" | base64 | tr -d '\n')"
+          git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic ${AUTH}"
+          trap 'git config --unset-all "http.https://github.com/.extraheader" || true' EXIT
+          git push origin "refs/tags/${VERSION}"
+          echo "Pushed ${VERSION}; move-major-tag.yaml will propagate vX / vX.Y."
+
+      - name: Create GitHub Release
+        if: steps.gate.outputs.cut == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+          VERSION: ${{ steps.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            echo "::notice::Release ${VERSION} already exists; skipping."
+            exit 0
+          fi
+          # git-cliff was installed earlier; use the same CI-dedicated config.
+          git cliff --latest --strip header --config .github/cliff-ci.toml > /tmp/RELEASE_NOTES.md || true
+          if [ ! -s /tmp/RELEASE_NOTES.md ]; then
+            echo "Automated release of reusable workflows + composite actions." > /tmp/RELEASE_NOTES.md
+          fi
+          gh release create "${VERSION}" \
+            --title "${VERSION}" \
+            --notes-file /tmp/RELEASE_NOTES.md

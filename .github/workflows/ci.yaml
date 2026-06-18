@@ -264,7 +264,8 @@ jobs:
       - name: Install markdownlint-cli2
         run: |
           # renovate: datasource=npm depName=markdownlint-cli2
-          npm install -g markdownlint-cli2@0.18.1
+          VERSION=0.22.1
+          npm install -g "markdownlint-cli2@${VERSION}"
 
       - name: Write markdownlint config
         run: |
@@ -292,7 +293,8 @@ jobs:
       - name: Install ruff
         run: |
           # renovate: datasource=pypi depName=ruff
-          pipx install ruff==0.15.16
+          VERSION=0.15.17
+          pipx install "ruff==${VERSION}"
 
       - name: Lint Python (ruff check)
         run: ruff check --output-format github .

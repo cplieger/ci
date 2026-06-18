@@ -3,3 +3,7 @@
 **/.judgement/
 **/.refactor/
 **/.steering-maintenance/
+
+# Python bytecode cache (e.g. from running _ci_local.py / scripts locally)
+__pycache__/
+*.pyc
