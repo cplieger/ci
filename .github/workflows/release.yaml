@@ -79,7 +79,7 @@ jobs:
         # resolves against the CONSUMER's checked-out workspace, not this
         # repo, so it 404s when release.yaml is called from another repo. This
         # action's content is stable, so pin-lag is a non-issue here.
-        uses: cplieger/ci/actions/git-cliff-version@efa70ad71d758f06f052bd2b9b275be947f770cc # v2
+        uses: cplieger/ci/actions/git-cliff-version@d8d87a66590ba931ebe0910fcd4e46d90fa8673c # v2
 
       - name: Detect type + subpackages
         id: type
