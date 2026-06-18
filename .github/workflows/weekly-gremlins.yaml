@@ -138,6 +138,22 @@ jobs:
           avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
           cap_mb=$(( avail_kb * 90 / 100 / 1024 ))
           echo "gremlins memory cap: ${cap_mb} MiB (90% of ${avail_kb} KiB MemAvailable)"
+          # Graceful OOM recovery. The cgroup cap alone is not enough: with the
+          # default (#CPU) workers, a runaway mutant's test — multiplied across
+          # workers — drives the cgroup past its cap and the OOM-killer reaps
+          # gremlins/the agent, losing the whole run (the subflux/docker-age 0%
+          # case). So also (a) halve the workers to cut peak concurrency, and
+          # (b) give each test a GOMEMLIMIT of its share of the cap, so a gradual
+          # runaway dies with a clean Go "out of memory" fatal — gremlins records
+          # it as killed and continues — before the cgroup OOM-killer can fire.
+          # workers * GOMEMLIMIT stays under the cap, so the combined footprint
+          # cannot trip the cgroup either. (Validated locally: subflux + docker-age
+          # complete instead of producing 0%.)
+          nproc_n=$(nproc)
+          workers=$(( nproc_n > 2 ? nproc_n / 2 : 1 ))
+          gomem_mb=$(( cap_mb * 8 / 10 / workers ))
+          [ "$gomem_mb" -lt 1024 ] && gomem_mb=1024
+          echo "gremlins workers=${workers}, GOMEMLIMIT=${gomem_mb}MiB per test"
           rc=0
           if command -v systemd-run >/dev/null 2>&1; then
             sudo systemd-run --scope --quiet \
@@ -145,10 +161,11 @@ jobs:
               -p "MemoryMax=${cap_mb}M" -p "MemorySwapMax=0" \
               --working-directory="$PWD" \
               --setenv=HOME="$HOME" --setenv=PATH="$PATH" --setenv=GOTOOLCHAIN=local \
-              gremlins unleash --output /tmp/gremlins-out.json . || rc=$?
+              --setenv=GOMEMLIMIT="${gomem_mb}MiB" \
+              gremlins unleash --workers "${workers}" --output /tmp/gremlins-out.json . || rc=$?
           else
-            echo "::warning::systemd-run unavailable — running gremlins without a memory cap"
-            gremlins unleash --output /tmp/gremlins-out.json . || rc=$?
+            echo "::warning::systemd-run unavailable — running gremlins without a memory cgroup cap"
+            GOMEMLIMIT="${gomem_mb}MiB" gremlins unleash --workers "${workers}" --output /tmp/gremlins-out.json . || rc=$?
           fi
           if [ "$rc" -ne 0 ]; then
             # Overwrite any partial output with an error marker so the badge /
