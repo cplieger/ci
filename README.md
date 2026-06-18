@@ -14,11 +14,11 @@ duplicate copies.
 
 ## Reusable workflows
 
-| Workflow | Purpose |
-|---|---|
-| `.github/workflows/go-ci.yaml` | Go-library checks: vet, golangci-lint, race tests, govulncheck, fieldalignment, gitleaks |
-| `.github/workflows/ts-ci.yaml` | Build-less TS checks: knip, eslint, tsgo typecheck, vitest, prettier (+ optional web-lint) |
-| `.github/workflows/release.yaml` | git-cliff version → (TS) npm + JSR publish → tag + GitHub Release |
+| Workflow                         | Purpose                                                                                    |
+| -------------------------------- | ------------------------------------------------------------------------------------------ |
+| `.github/workflows/go-ci.yaml`   | Go-library checks: vet, golangci-lint, race tests, govulncheck, fieldalignment, gitleaks   |
+| `.github/workflows/ts-ci.yaml`   | Build-less TS checks: knip, eslint, tsgo typecheck, vitest, prettier (+ optional web-lint) |
+| `.github/workflows/release.yaml` | git-cliff version → (TS) npm + JSR publish → tag + GitHub Release                          |
 
 ### Consume in a Go library
 
@@ -72,13 +72,13 @@ preset (`default.json`) natively:
 Tools without remote-config support get their config pushed here as PRs by
 `sync.yaml` (see `.github/sync.yml` for the repo↔file mapping):
 
-| File | Consumed by |
-|---|---|
-| `.golangci.yaml` | Go repos (golangci-lint) |
-| `cliff.toml` | all (git-cliff changelog/version) |
-| `.editorconfig` | all |
-| `configs/eslint.config.base.mjs` | TS repos — `import base from "./eslint.config.base.mjs"` |
-| `configs/prettier.json`, `configs/stylelint.json`, `configs/htmlvalidate.json` | TS repos |
+| File                                                                           | Consumed by                                              |
+| ------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| `.golangci.yaml`                                                               | Go repos (golangci-lint)                                 |
+| `cliff.toml`                                                                   | all (git-cliff changelog/version)                        |
+| `.editorconfig`                                                                | all                                                      |
+| `configs/eslint.config.base.mjs`                                               | TS repos — `import base from "./eslint.config.base.mjs"` |
+| `configs/prettier.json`, `configs/stylelint.json`, `configs/htmlvalidate.json` | TS repos                                                 |
 
 Syncing needs a `SYNC_PAT` repo secret (fine-grained PAT, Contents:write +
 Pull-requests:write on the targets).

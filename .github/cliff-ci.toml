@@ -1,0 +1,78 @@
+# Dedicated git-cliff config for THIS repo's self-release workflow
+# (.github/workflows/self-release.yaml). It is NOT synced to consumers — the
+# fleet config is configs/cliff-stable.toml (synced as cliff.toml). Kept
+# separate so ci's self-versioning policy can diverge from the fleet without
+# touching the shared config, and so editing it never triggers sync.yaml (which
+# watches cliff.toml / configs/** — this path matches neither).
+#
+# Two deliberate differences from the fleet (cliff-stable.toml) config:
+#
+#   1. tag_pattern matches FULL semver only (vX.Y.Z). move-major-tag.yaml keeps
+#      the moving major/minor tags (v2, v2.Y) co-located on the SAME commit as
+#      the release tag. The fleet pattern "v[0-9].*" matches all three, making
+#      the version base ambiguous in this repo specifically. Restricting to full
+#      semver makes git-cliff bump unambiguously from the real release tag.
+#
+#   2. protect_breaking_commits = true, so a breaking change bumps major even if
+#      its commit type would otherwise be skipped. A major bump (v3) intentionally
+#      does NOT auto-propagate to consumers pinned at v2 (Renovate follows the v2
+#      digest, not v3) — exactly the gate we want for breaking changes.
+#
+# Commit-type -> bump is identical to the fleet config otherwise. Note the
+# self-release workflow treats the PATH GATE (not the commit type) as
+# authoritative for whether to release, and force-patches when cliff declines a
+# skip-typed-but-propagatable change, so this config only governs the bump LEVEL.
+[bump]
+features_always_bump_minor = true
+breaking_always_bump_major = true
+# Only relevant in the (dead today) bootstrap case where no vX.Y.Z tag exists;
+# matches the fleet config so a from-scratch run wouldn't drop to v0.x.
+initial_tag = "v1.0.0"
+
+[changelog]
+header = ""
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }}\
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+# Breaking changes always count toward the bump even under a skip-typed prefix.
+protect_breaking_commits = true
+# Full semver only — deliberately excludes the moving v2 / v2.Y tags that
+# move-major-tag.yaml maintains on the release commit.
+tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+"
+
+commit_parsers = [
+  # Order matters: more-specific patterns first.
+  { message = "^release:", skip = true },
+  # devDeps don't ship to consumers (Renovate tags them `devdeps`); skip.
+  { message = "^chore\\(devdeps\\)", skip = true },
+  # Runtime/action/dependency bumps DO release — must precede the ^chore skip.
+  { message = "^chore\\(deps\\)", group = "Dependencies" },
+  # Pure-meta commit types: skip = true reliably excludes them from the bump
+  # (no_increment_regex does not, due to a patch-fallback bug in cliff v2.13.1).
+  { message = "^chore", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^docs", skip = true },
+  { message = "^style", skip = true },
+  { message = "^test", skip = true },
+  { message = "^fuzz", skip = true },
+  { message = "^lint", skip = true },
+  { message = "^debug", skip = true },
+  { message = "^[Mm]erge ", skip = true },
+  # Real changes — bump per cliff.
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^sec", group = "Security" },
+  { message = "^refactor|^perf", group = "Changed" },
+  { message = ".*", group = "Changed" },
+]

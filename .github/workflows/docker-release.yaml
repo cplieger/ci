@@ -464,6 +464,7 @@ jobs:
         if: ${{ inputs.release-needed == 'true' }}
         run: |
           # Install git-cliff (only when we're actually creating a release).
+          # renovate: datasource=github-releases depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
           curl -fsSL --retry 3 \
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \

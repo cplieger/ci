@@ -459,6 +459,7 @@ jobs:
         run: |
           # Install git-cliff (version compute already happened in detect, but
           # we need the binary here for `git cliff --latest` to render notes).
+          # renovate: datasource=github-releases depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
           curl -fsSL --retry 3 \
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
@@ -526,6 +527,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
+          # renovate: datasource=github-releases depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
           curl -fsSL --retry 3 \
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
