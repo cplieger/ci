@@ -1,6 +1,5 @@
 # cplieger/ci
 
-[![Lint](https://github.com/cplieger/ci/actions/workflows/lint.yaml/badge.svg)](https://github.com/cplieger/ci/actions/workflows/lint.yaml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/ci/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/ci)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13201/badge)](https://www.bestpractices.dev/projects/13201)
 
