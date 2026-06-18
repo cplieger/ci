@@ -123,50 +123,35 @@ jobs:
           # fail-fast is off, so one bad repo doesn't cancel the others, and the
           # upload step (if: always()) still ships an artifact downstream.
           #
-          # Memory containment: mutating loop bounds is gremlins' whole job, so
-          # a mutant can turn a bounded loop into an unbounded allocation. With
-          # no cap, that runaway test exhausts the ~16 GB runner, the OS
-          # OOM-killer takes the runner agent, and the job dies "received a
-          # shutdown signal" — deterministically, at the same mutant every
-          # attempt (this is what killed vibekit 1/2/3). Run gremlins in a
-          # cgroup capped at 90% of MemAvailable (leftover-for-gremlins minus a
-          # 10% gap for the OS + agent). The cgroup OOM-killer then kills only
-          # the runaway TEST process; gremlins records it as a normal result
-          # and continues, and the agent — outside the cgroup with its 10%
-          # headroom — keeps its heartbeat. Validated in a 16 GB container: a
-          # mutant spiked to the cap, oom_kill=1, gremlins still exited 0.
+          # Memory containment via GOMEMLIMIT, not a cgroup. Mutating a loop
+          # bound is gremlins' whole job, so a mutant can turn a bounded loop
+          # into an unbounded allocation. The earlier `systemd-run --scope`
+          # MemoryMax cgroup was broken two ways: (1) when the kernel OOM-kills
+          # a process inside the scope, systemd tears down the ENTIRE scope —
+          # gremlins included — so the whole run is lost (systemd/systemd#25376;
+          # the "OOM-killer reaps only the runaway test, gremlins continues"
+          # assumption was wrong); and (2) gremlins' end-of-run summary +
+          # `--output` JSON write did not survive the scope, so subflux and
+          # docker-age shipped an empty {"files":[]} — THAT was the 0%/no-data,
+          # not an OOM (docker-age is far too small to OOM a 13 GB cap, yet it
+          # reported 0% all the same). Instead, give each test process a
+          # GOMEMLIMIT: a runaway hits Go's soft limit and dies with a clean
+          # "out of memory" fatal that gremlins records as KILLED and keeps
+          # going — the per-mutant memory sandbox that PIT/Stryker/Infection
+          # use. Budget = 80% of MemAvailable split across the workers, with the
+          # worker count capped so each test keeps >=~2 GiB (too small a
+          # GOMEMLIMIT makes healthy tests GC-thrash into false timeouts). Even
+          # all workers running a runaway at once stays under RAM, so the kernel
+          # OOM-killer never fires.
           avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
-          cap_mb=$(( avail_kb * 90 / 100 / 1024 ))
-          echo "gremlins memory cap: ${cap_mb} MiB (90% of ${avail_kb} KiB MemAvailable)"
-          # Graceful OOM recovery. The cgroup cap alone is not enough: with the
-          # default (#CPU) workers, a runaway mutant's test — multiplied across
-          # workers — drives the cgroup past its cap and the OOM-killer reaps
-          # gremlins/the agent, losing the whole run (the subflux/docker-age 0%
-          # case). So also (a) halve the workers to cut peak concurrency, and
-          # (b) give each test a GOMEMLIMIT of its share of the cap, so a gradual
-          # runaway dies with a clean Go "out of memory" fatal — gremlins records
-          # it as killed and continues — before the cgroup OOM-killer can fire.
-          # workers * GOMEMLIMIT stays under the cap, so the combined footprint
-          # cannot trip the cgroup either. (Validated locally: subflux + docker-age
-          # complete instead of producing 0%.)
+          cap_mb=$(( avail_kb * 80 / 100 / 1024 ))
           nproc_n=$(nproc)
-          workers=$(( nproc_n > 2 ? nproc_n / 2 : 1 ))
-          gomem_mb=$(( cap_mb * 8 / 10 / workers ))
-          [ "$gomem_mb" -lt 1024 ] && gomem_mb=1024
-          echo "gremlins workers=${workers}, GOMEMLIMIT=${gomem_mb}MiB per test"
+          max_by_mem=$(( cap_mb / 2048 )); [ "$max_by_mem" -lt 1 ] && max_by_mem=1
+          workers=$(( nproc_n < max_by_mem ? nproc_n : max_by_mem ))
+          gomem_mb=$(( cap_mb / workers ))
+          echo "gremlins workers=${workers}, GOMEMLIMIT=${gomem_mb}MiB per test (budget ${cap_mb} MiB of ${avail_kb} KiB avail)"
           rc=0
-          if command -v systemd-run >/dev/null 2>&1; then
-            sudo systemd-run --scope --quiet \
-              --uid="$(id -u)" --gid="$(id -g)" \
-              -p "MemoryMax=${cap_mb}M" -p "MemorySwapMax=0" \
-              --working-directory="$PWD" \
-              --setenv=HOME="$HOME" --setenv=PATH="$PATH" --setenv=GOTOOLCHAIN=local \
-              --setenv=GOMEMLIMIT="${gomem_mb}MiB" \
-              gremlins unleash --workers "${workers}" --output /tmp/gremlins-out.json . || rc=$?
-          else
-            echo "::warning::systemd-run unavailable — running gremlins without a memory cgroup cap"
-            GOMEMLIMIT="${gomem_mb}MiB" gremlins unleash --workers "${workers}" --output /tmp/gremlins-out.json . || rc=$?
-          fi
+          GOMEMLIMIT="${gomem_mb}MiB" gremlins unleash --workers "${workers}" --output /tmp/gremlins-out.json . || rc=$?
           if [ "$rc" -ne 0 ]; then
             # Overwrite any partial output with an error marker so the badge /
             # aggregate jobs SKIP this attempt (load_run returns None on a file
