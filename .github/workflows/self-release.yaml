@@ -161,6 +161,30 @@ jobs:
               return 1
             }
 
+            # Renovate periodically rewrites this repo's OWN SHA self-pins
+            # (`uses: cplieger/ci/...@<40-hex> # vN`) when the moving major tag
+            # advances. Six such pins exist: five under workflow-templates/
+            # (Channel 1, propagated by sync.yaml and NOT matched by this gate's
+            # globs) and one consumed reusable-workflow pin, release.yaml's
+            # git-cliff-version composite action. That last one edits a Channel-2
+            # file yet changes no behaviour; cutting a tag for it advances vN,
+            # which makes Renovate bump the self-pin again, an unbounded
+            # tag -> sync -> digest loop across every consumer (~99% of all fleet
+            # CI runs were this churn). So a propagatable file counts as changed
+            # ONLY if it differs beyond its cplieger/ci self-pin digest: compare
+            # the file at the last tag against HEAD with those SHAs normalised to
+            # a placeholder. Fails SAFE: an unreadable revision (file added or
+            # removed since the tag, or any git error) is treated as a real
+            # change so a genuine release still propagates.
+            has_real_change() {
+              local f="$1" old new
+              if ! old="$(git show "${LAST_TAG}:$f" 2>/dev/null)"; then return 0; fi
+              if ! new="$(git show "HEAD:$f" 2>/dev/null)"; then return 0; fi
+              old="$(printf '%s' "$old" | sed -E 's#(cplieger/ci/[^@[:space:]]+)@[0-9a-f]{7,40}#\1@PIN#g')"
+              new="$(printf '%s' "$new" | sed -E 's#(cplieger/ci/[^@[:space:]]+)@[0-9a-f]{7,40}#\1@PIN#g')"
+              [ "$old" != "$new" ]
+            }
+
             CHANGED="$(git diff --name-only "${LAST_TAG}..HEAD")"
             echo "Changed files since ${LAST_TAG}:"
             echo "$CHANGED" | awk '{ print "  " $0 }'
@@ -169,11 +193,17 @@ jobs:
               [ -z "$f" ] && continue
               case "$f" in
                 actions/*)
-                  PROPAGATABLE=true; MATCHED="$f"; break ;;
+                  if has_real_change "$f"; then
+                    PROPAGATABLE=true; MATCHED="$f"; break
+                  fi
+                  echo "  skip: $f changed only its cplieger/ci self-pin digest" ;;
                 .github/workflows/*)
                   base="${f#.github/workflows/}"
                   if ! is_internal "$base"; then
-                    PROPAGATABLE=true; MATCHED="$f"; break
+                    if has_real_change "$f"; then
+                      PROPAGATABLE=true; MATCHED="$f"; break
+                    fi
+                    echo "  skip: $f changed only its cplieger/ci self-pin digest"
                   fi
                   ;;
               esac
