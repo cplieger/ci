@@ -230,7 +230,11 @@ jobs:
           load: true
           tags: ci-smoke:latest
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Cache producer for the shared `buildkit` scope (the advisory
+          # security scan reads from it). Keep exporting, but ignore-error so a
+          # transient GHA cache-backend 504 on export can't fail the REQUIRED
+          # build-ability gate — the image has already built by export time.
+          cache-to: type=gha,mode=max,ignore-error=true
 
       # Runtime image smoke test, opt-in per repo (runs only when
       # tests/image-smoke.sh exists). Build-time smoke tests live inside the
