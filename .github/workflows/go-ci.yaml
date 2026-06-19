@@ -74,15 +74,27 @@ jobs:
 
       - name: Install tools
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          go install github.com/rhysd/actionlint/cmd/actionlint@latest
-          go install golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@latest
+          set -euo pipefail
+          # renovate: datasource=go depName=golang.org/x/vuln
+          GOVULNCHECK_VERSION=v1.4.0
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          # renovate: datasource=go depName=github.com/rhysd/actionlint
+          ACTIONLINT_VERSION=v1.7.12
+          go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+          # renovate: datasource=go depName=golang.org/x/tools
+          XTOOLS_VERSION=v0.46.0
+          go install "golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@${XTOOLS_VERSION}"
 
       - name: Install app tools
         if: ${{ steps.profile.outputs.app == 'true' }}
         run: |
-          go install golang.org/x/tools/cmd/deadcode@latest
-          go install github.com/bep/punused@latest
+          set -euo pipefail
+          # renovate: datasource=go depName=golang.org/x/tools
+          XTOOLS_VERSION=v0.46.0
+          go install "golang.org/x/tools/cmd/deadcode@${XTOOLS_VERSION}"
+          # renovate: datasource=go depName=github.com/bep/punused
+          PUNUSED_VERSION=v0.5.0
+          go install "github.com/bep/punused@${PUNUSED_VERSION}"
 
       # Soft-gate block: each step below runs to completion (continue-on-error)
       # and records its own name to /tmp/_ci_failures on failure; the final
