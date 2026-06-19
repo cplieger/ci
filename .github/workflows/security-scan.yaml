@@ -56,8 +56,13 @@ jobs:
           push: false
           load: true
           tags: ci-scan:latest
+          # Pure cache consumer — no cache-to by design. This throwaway scan
+          # build reads the layers the required build-ability gate (ci.yaml
+          # `docker` job) exports to the same default `buildkit` scope. It must
+          # not ALSO export: a redundant mode=max push to the flaky GHA cache
+          # backend clobbers the gate's cache and can 504, failing this
+          # otherwise-advisory job (which is exactly what happened).
           cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       # All Trivy scans here are ADVISORY (exit-code 0): they upload SARIF to
       # the Security tab (and drive the OpenSSF/vuln badges) but never fail the

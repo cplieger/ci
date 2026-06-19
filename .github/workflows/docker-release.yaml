@@ -231,7 +231,12 @@ jobs:
           outputs: |
             type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          # ignore-error: the per-arch image is already pushed by digest (see
+          # `outputs` above) before the cache export runs, so a transient GHA
+          # cache-backend 504 on export must not fail the release. The cache is
+          # a build-speed optimization, never a release deliverable. Per-arch
+          # scope keeps the amd64/arm64 builds from clobbering each other.
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }},ignore-error=true
 
       - name: Export digest
         run: |
