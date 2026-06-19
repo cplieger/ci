@@ -1,0 +1,27 @@
+# Self-CodeQL: run CodeQL on the ci repo's OWN code — the Python helpers
+# (audit.py, scripts/*.py, _ci_local.py), the JS, and the workflows themselves
+# via CodeQL's "actions" pack — using the same reusable workflow shipped to
+# consumers, through a local `./` ref so it tracks this commit (no tag/bump
+# cycle, mirroring self-ci.yaml). This closes the OpenSSF Scorecard SAST
+# finding: the repo shipped a CodeQL workflow to consumers but never ran it on
+# itself. Internal-only (no consumer references it by SHA), so it is listed in
+# self-release.yaml's INTERNAL_WORKFLOWS and must NOT cut a propagating tag.
+name: Self-CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    uses: ./.github/workflows/codeql.yaml
