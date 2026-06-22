@@ -18,16 +18,16 @@ Body format:
 
     # Gremlins mutation testing tracker
 
-    Auto-updated by [weekly-gremlins.yaml](...). Last update: 2026-06-08.
+    Auto-updated by [weekly-gremlins.yaml](...). Last update: 2026-06-08 14:30.
 
     **This week**: 78.4% efficacy (±2.1% across 3 runs), 92.3% mutant coverage.
     **Trend**: ↗ +1.2% from 12-week mean (77.2%).
 
     ## Rolling 12-week history
     <!-- gremlins-data -->
-    | Week ending | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |
+    | Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |
     |---|---|---|---|---|---|
-    | 2026-06-08 | 78.4% | ±2.1% | 92.3% | 47 | +1.2% |
+    | 2026-06-08 14:30 | 78.4% | ±2.1% | 92.3% | 47 | +1.2% |
     | ... 11 more |
     <!-- /gremlins-data -->
 
@@ -306,7 +306,7 @@ Last update: {week_ending}
 """
 
 DATA_BLOCK_TPL = """<!-- gremlins-data -->
-| Week ending | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |
+| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |
 |---|---|---|---|---|---|
 {rows}
 <!-- /gremlins-data -->"""

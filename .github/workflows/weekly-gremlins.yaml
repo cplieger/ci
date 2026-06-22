@@ -211,7 +211,7 @@ jobs:
           # anything failed, so the run never goes green on a real failure.
           set -uo pipefail
           REPOS=$(find artifacts -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sed -E 's/^gremlins-(.+)-[0-9]+$/\1/' | sort -u)
-          WEEK=$(date -u +%Y-%m-%d)
+          WEEK=$(date -u +'%Y-%m-%d %H:%M')
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
           publish_one() {
@@ -276,7 +276,7 @@ jobs:
           # if anything failed.
           set -uo pipefail
           REPOS=$(find artifacts -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sed -E 's/^gremlins-(.+)-[0-9]+$/\1/' | sort -u)
-          WEEK_ENDING=$(date -u +%Y-%m-%d)
+          WEEK_ENDING=$(date -u +'%Y-%m-%d %H:%M')
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           title="Gremlins mutation testing tracker"
 
