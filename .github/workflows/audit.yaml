@@ -1,7 +1,10 @@
 name: Audit
 
-# Weekly cross-public-repo compliance audit. Uses the job token (sufficient for
-# public repos); set an AUDIT_PAT secret to also cover private repos later.
+# Weekly cross-repo compliance audit. The merge-model checks read fields that
+# the GitHub API only exposes to a CLASSIC PAT with the 'repo' scope — a
+# fine-grained PAT does NOT serialize them, even with Administration:read.
+# Set AUDIT_PAT to a classic 'repo'-scope PAT. Without it the audit aborts
+# (exit 2) with a clear diagnostic rather than flagging the whole fleet.
 
 on:
   schedule:

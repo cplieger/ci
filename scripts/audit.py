@@ -13,8 +13,12 @@ branch, description (presence + <=100 chars), and topics.
 
 Exits non-zero if ANY repo has a HARD failure; warnings never fail the run.
 
-Requires `gh` authenticated with admin on the repos: branch protection and the
-security endpoints need admin, and private repos need a token with repo scope.
+Requires `gh` authenticated with a CLASSIC PAT carrying the 'repo' scope: the
+merge-model fields (allow_merge_commit etc.) are only serialized onto the repo
+object for a classic-scope token. A fine-grained PAT does NOT expose them even
+with Administration:read and an owner role, and the default GITHUB_TOKEN is
+under-scoped — in both cases the audit aborts (exit 2) rather than emit false
+negatives.
 
 Run:
   scripts/audit.py                  # full fleet (public + private)
@@ -90,6 +94,14 @@ def collect(meta):
     s["private"] = bool(repo.get("private"))
     branch = repo.get("default_branch") or "main"
     s["default_branch"] = branch
+    # The merge-model fields are only serialized onto the repo object for a
+    # token with the classic `repo` scope. A fine-grained PAT — even one with
+    # Administration:read and an admin role (permissions.admin=true) — does NOT
+    # expose them, so they come back absent (-> None) and the audit would
+    # report the whole fleet as non-compliant. Key the guard off actual field
+    # presence, NOT permissions.admin, so a fine-grained token is correctly
+    # detected as under-scoped rather than trusted.
+    s["admin_visible"] = "allow_merge_commit" in repo
     for k in ("allow_merge_commit", "allow_squash_merge", "allow_rebase_merge",
               "allow_auto_merge", "delete_branch_on_merge",
               "has_wiki", "has_projects", "has_issues", "has_discussions"):
@@ -234,6 +246,23 @@ def main():
     if args.dump:
         with open(args.dump, "w", encoding="utf-8") as fh:
             json.dump(settings, fh, indent=2, sort_keys=True)
+
+    # Permission guard: the merge-model, branch-protection, and security checks
+    # need a token with admin read across the fleet. If NO repo returned
+    # admin-scoped fields, the token is under-scoped (e.g. the default
+    # GITHUB_TOKEN instead of AUDIT_PAT) — abort rather than flag every repo as
+    # non-compliant, which would be a false-negative storm masking real drift.
+    if settings and not any(s["admin_visible"] for s in settings):
+        sys.stderr.write(
+            "ERROR: no repo returned the merge-model fields (allow_merge_commit "
+            "etc.). The audit token is under-scoped.\n"
+            "These fields are only exposed to a CLASSIC PAT with the 'repo' "
+            "scope. A fine-grained PAT does NOT serialize them, even with "
+            "Administration:read and an owner role. Set the AUDIT_PAT secret to "
+            "a classic PAT with 'repo' scope. The default GITHUB_TOKEN also "
+            "cannot read these fields.\n"
+        )
+        sys.exit(2)
 
     hard_total, warn_total, clean = 0, 0, 0
     print(f"GOVERNANCE COMPLIANCE — {len(settings)} repos "
