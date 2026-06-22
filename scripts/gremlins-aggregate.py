@@ -25,7 +25,7 @@ Body format:
 
     ## Rolling 12-week history
     <!-- gremlins-data -->
-    | Week ending | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ vs prev |
+    | Week ending | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |
     |---|---|---|---|---|---|
     | 2026-06-08 | 78.4% | ±2.1% | 92.3% | 47 | +1.2% |
     | ... 11 more |
@@ -306,7 +306,7 @@ Last update: {week_ending}
 """
 
 DATA_BLOCK_TPL = """<!-- gremlins-data -->
-| Week ending | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ vs prev |
+| Week ending | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |
 |---|---|---|---|---|---|
 {rows}
 <!-- /gremlins-data -->"""
@@ -463,7 +463,10 @@ def update_history_block(existing: str, new_row: str, mean_for_trend: float) -> 
     # Compute delta on this row
     delta = mean_for_trend - prev_mean if rows else 0.0
     delta_str = f"{delta:+.1f}%" if rows else "—"
-    new_row_with_delta = new_row.rstrip("|").rstrip() + f" {delta_str} |"
+    # new_row already ends in " |" (its closing Live-mutants cell). Append the
+    # delta as its OWN cell — do NOT strip the trailing pipe, or the delta fuses
+    # into the Live-mutants column and the row loses a column (see issue #4).
+    new_row_with_delta = new_row.rstrip() + f" {delta_str} |"
 
     rows.insert(0, new_row_with_delta)
     rows = rows[:ROLLING_WEEKS]
