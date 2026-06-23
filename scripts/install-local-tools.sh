@@ -13,20 +13,31 @@
 # `git -C <ci> pull` to pick up Renovate bumps. Some drift between runs (and
 # between local and CI) is expected and fine.
 #
-# COVERS (the tools the `ci / validate` gate installs):
-#   - Renovate-pinned, exact version: golangci-lint, gitleaks (release
-#     binaries), ruff (pipx), markdownlint-cli2 (npm)
-#   - every `go install <pkg>@<ver>` line in go-ci.yaml, replayed verbatim so
-#     the version matches CI (currently @latest): govulncheck, actionlint,
-#     fieldalignment, deadcode, punused
+# COVERS (the tools the `ci / validate` gate + advisory security scan run):
+#   - Renovate-pinned, exact version: golangci-lint, gitleaks, trivy, hadolint
+#     (release binaries), ruff (pipx), markdownlint-cli2 (npm), tsgo (npm tarball)
+#   - best-effort LATEST (no CI pin exists to read): shellcheck. CI uses the
+#     ubuntu-24.04 runner's preinstalled copy, which floats with the runner
+#     image, so there is nothing to pin against; the newest stable release is
+#     the closest local proxy (tag resolved live from the GitHub API).
+#   - every `go install <pkg>@<ver>` line in go-ci.yaml; the version is pinned in
+#     a shell var (e.g. GOVULNCHECK_VERSION=v1.4.0) which this script resolves:
+#     govulncheck, actionlint, fieldalignment, deadcode, punused
+#   Versions are always read live from the workflows, never hardcoded here: the
+#   `# renovate: ... depName=X` + `VERSION` pins for most tools; trivy from the
+#   security-scan.yaml TRIVY_VERSION pin; hadolint from its `hadolint/hadolint:
+#   <tag>` image reference (it runs in CI as a Docker image, not a VERSION pin).
 # NOT covered (install via your package manager, or not part of local validate):
-#   - not installed by CI here: shellcheck, hadolint
-#   - release- or niche-only: git-cliff, gremlins, tsgo
+#   - release- or niche-only: git-cliff (release), gremlins (weekly mutation)
+#   - project-local TS devdeps run via `npm ci` (eslint, prettier, vitest,
+#     stylelint, html-validate, knip), pinned per-repo in package-lock.json
+#   - supply-chain/scan actions that don't run locally: cosign, syft, CodeQL
 #
-# INSTALL TARGETS: Go tools via `go install` (Go bin dir); golangci-lint and
-# gitleaks into $BIN_DIR (default ~/.local/bin); ruff via pipx; markdownlint-cli2
-# via npm -g. $BIN_DIR and the Go bin dir must precede /usr/bin on PATH so these
-# shadow any distro packages.
+# INSTALL TARGETS: Go tools via `go install` (Go bin dir); golangci-lint,
+# gitleaks, trivy, hadolint, shellcheck into $BIN_DIR (default ~/.local/bin);
+# ruff via pipx; markdownlint-cli2 via npm -g; tsgo extracted to <bindir>/../lib
+# and symlinked into $BIN_DIR. $BIN_DIR and the Go bin dir must precede /usr/bin
+# on PATH so these shadow any distro packages (e.g. a distro trivy in /usr/bin).
 #
 # USAGE: scripts/install-local-tools.sh
 # ENV:   BIN_DIR  override the binary install dir (default ~/.local/bin)
@@ -100,15 +111,48 @@ install_gitleaks() {
 }
 
 # install_go_tools: replay every `go install <pkg>@<ver>` from go-ci.yaml so the
-# locally installed Go helper tools match CI exactly (CI uses @latest for these
-# today; if it ever pins them, this follows automatically).
+# locally installed Go helper tools match CI exactly. go-ci.yaml pins each tool's
+# version in a shell variable (e.g. `GOVULNCHECK_VERSION=v1.4.0`) and installs it
+# as `go install "<pkg>@${GOVULNCHECK_VERSION}"`. We replay that: build a map of
+# the workflow's `<NAME>=<value>` assignments, then for each go-install spec strip
+# the quotes the YAML left on the token and resolve the `${VAR}` version reference
+# against that map. A bare literal version (`@v1.2.3` / `@latest`) passes through
+# unchanged, so the un-pinned form still works.
 install_go_tools() {
-  local goci="$WF_DIR/go-ci.yaml" spec name
+  local goci="$WF_DIR/go-ci.yaml" spec name ver verpart varname line trimmed k v
   [ -f "$goci" ] || { bad "go-tools" "go-ci.yaml not found"; return; }
   command -v go >/dev/null 2>&1 || { bad "go-tools" "go not found"; return; }
+
+  # Map every clean `<identifier>=<value>` assignment in the workflow (captures
+  # the *_VERSION pins; skips `echo 'app=true'`-style lines whose key holds
+  # spaces). Value is taken up to the first whitespace, dropping inline comments.
+  local -A vers=()
+  while IFS= read -r line; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"   # strip leading indentation
+    case "$trimmed" in
+      [A-Za-z_]*=*)
+        k="${trimmed%%=*}"
+        case "$k" in
+          *[!A-Za-z0-9_]*) ;;                      # key holds spaces/punct -> not an assignment
+          *) v="${trimmed#*=}"; v="${v%%[[:space:]]*}"; [ -n "$v" ] && vers["$k"]="$v" ;;
+        esac
+        ;;
+    esac
+  done < "$goci"
+
   while IFS= read -r spec; do
     [ -n "$spec" ] || continue
-    name="${spec##*/}"   # last path segment, e.g. govulncheck@latest
+    spec="${spec%\"}"; spec="${spec#\"}"          # strip the quotes YAML left on the token
+    spec="${spec%\'}"; spec="${spec#\'}"
+    verpart="${spec##*@}"
+    if [ "${verpart:0:1}" = '$' ]; then           # version is a ${VAR}/$VAR reference
+      varname="${verpart#\$}"; varname="${varname#\{}"; varname="${varname%\}}"
+      ver="${vers[$varname]:-}"
+      name="${spec%@*}"; name="${name##*/}"
+      [ -n "$ver" ] || { bad "$name" "unresolved version var \$$varname"; continue; }
+      spec="${spec%@*}@${ver}"
+    fi
+    name="${spec##*/}"   # last path segment, e.g. govulncheck@v1.4.0
     name="${name%@*}"    # drop @version
     if go install "$spec" >/dev/null 2>&1; then
       ok "$name" "${spec##*@}" "go install"
@@ -146,6 +190,110 @@ install_markdownlint() {
   fi
 }
 
+install_trivy() {
+  local want cur arch
+  want="$(pin_version aquasecurity/trivy)"
+  [ -n "$want" ] || { bad trivy "no pin found"; return; }
+  cur="$(trivy --version 2>/dev/null | semver || true)"
+  [ "$cur" = "${want#v}" ] && { skip trivy "$want"; return; }
+  case "$(uname -m)" in
+    x86_64 | amd64) arch=64bit ;;
+    aarch64 | arm64) arch=ARM64 ;;
+    *) bad trivy "unsupported arch $(uname -m)"; return ;;
+  esac
+  mkdir -p "$BIN_DIR"
+  if curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/${want}/trivy_${want#v}_Linux-${arch}.tar.gz" \
+       | tar -xzf - -C "$BIN_DIR" trivy 2>/dev/null; then
+    ok trivy "$want" "-> $BIN_DIR"
+  else
+    bad trivy "download failed"
+  fi
+}
+
+# install_hadolint: hadolint runs in CI as a pinned Docker image
+# (hadolint/hadolint:<tag> in go-ci.yaml + shell-ci.yaml), not a
+# `# renovate: ... VERSION=` line, so read the tag directly rather than via
+# pin_version. Install the matching release binary so local Dockerfile lint
+# applies the same rule set as the gate.
+install_hadolint() {
+  local want cur arch
+  want="$(grep -hoE 'hadolint/hadolint:[0-9]+\.[0-9]+\.[0-9]+' "$WF_DIR"/*.yaml 2>/dev/null | head -n1 | sed 's/.*://')"
+  [ -n "$want" ] || { bad hadolint "no pin found"; return; }
+  cur="$(hadolint --version 2>/dev/null | semver || true)"
+  [ "$cur" = "$want" ] && { skip hadolint "$want"; return; }
+  case "$(uname -m)" in
+    x86_64 | amd64) arch=x86_64 ;;
+    aarch64 | arm64) arch=arm64 ;;
+    *) bad hadolint "unsupported arch $(uname -m)"; return ;;
+  esac
+  mkdir -p "$BIN_DIR"
+  if curl -fsSL "https://github.com/hadolint/hadolint/releases/download/v${want}/hadolint-Linux-${arch}" -o "$BIN_DIR/hadolint" \
+       && chmod +x "$BIN_DIR/hadolint"; then
+    ok hadolint "$want" "-> $BIN_DIR"
+  else
+    bad hadolint "download failed"
+  fi
+}
+
+# install_tsgo: the TypeScript native-preview typecheck binary. CI installs it
+# out-of-band from the npm registry (it is deliberately NOT a repo
+# devDependency) and puts package/lib on PATH. Mirror that: extract the platform
+# tarball to a stable lib dir and symlink the tsgo binary into $BIN_DIR. The
+# pinned version carries a `-dev.<date>` suffix, so compare the full string
+# (not semver()).
+install_tsgo() {
+  local want cur arch libdir tmp pkg
+  want="$(pin_version @typescript/native-preview)"
+  [ -n "$want" ] || { bad tsgo "no pin found"; return; }
+  cur="$(tsgo --version 2>/dev/null | grep -oE '[0-9][0-9A-Za-z.-]*' | head -n1 || true)"
+  [ "$cur" = "$want" ] && { skip tsgo "$want"; return; }
+  case "$(uname -m)" in
+    x86_64 | amd64) arch=x64 ;;
+    aarch64 | arm64) arch=arm64 ;;
+    *) bad tsgo "unsupported arch $(uname -m)"; return ;;
+  esac
+  pkg="native-preview-linux-${arch}"
+  libdir="$(dirname "$BIN_DIR")/lib/tsgo-native"
+  tmp="$(mktemp -d)"
+  if curl -fsSL "https://registry.npmjs.org/@typescript/${pkg}/-/${pkg}-${want}.tgz" \
+       | tar -xzf - -C "$tmp" 2>/dev/null && [ -x "$tmp/package/lib/tsgo" ]; then
+    rm -rf "$libdir"
+    mkdir -p "$(dirname "$libdir")" "$BIN_DIR"
+    mv "$tmp/package/lib" "$libdir"
+    ln -sf "$libdir/tsgo" "$BIN_DIR/tsgo"
+    ok tsgo "$want" "-> $BIN_DIR"
+  else
+    bad tsgo "download failed"
+  fi
+  rm -rf "$tmp"
+}
+
+# install_shellcheck: CI does not pin shellcheck — it uses the ubuntu-24.04
+# runner's preinstalled copy, which floats with the runner image — so there is
+# no pin to read. Best effort per the maintainer's call: track the newest
+# stable release (the closest local proxy to the runner's). The tag is resolved
+# live from the GitHub API rather than a workflow pin.
+install_shellcheck() {
+  local want cur arch
+  want="$(curl -fsSL "https://api.github.com/repos/koalaman/shellcheck/releases/latest" 2>/dev/null \
+    | grep -oE '"tag_name": *"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')"
+  [ -n "$want" ] || { bad shellcheck "could not resolve latest tag"; return; }
+  cur="$(shellcheck --version 2>/dev/null | awk '/^version:/ {print $2}' || true)"
+  [ "$cur" = "${want#v}" ] && { skip shellcheck "$want"; return; }
+  case "$(uname -m)" in
+    x86_64 | amd64) arch=x86_64 ;;
+    aarch64 | arm64) arch=aarch64 ;;
+    *) bad shellcheck "unsupported arch $(uname -m)"; return ;;
+  esac
+  mkdir -p "$BIN_DIR"
+  if curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${want}/shellcheck-${want}.linux.${arch}.tar.xz" \
+       | tar -xJf - -C "$BIN_DIR" --strip-components=1 "shellcheck-${want}/shellcheck" 2>/dev/null; then
+    ok shellcheck "$want" "-> $BIN_DIR"
+  else
+    bad shellcheck "download failed"
+  fi
+}
+
 main() {
   printf 'Installing CI-pinned dev tools (pins from %s)\n' "$WF_DIR"
   printf '  bin dir: %s\n\n' "$BIN_DIR"
@@ -153,8 +301,12 @@ main() {
   install_golangci_lint
   install_go_tools
   install_gitleaks
+  install_hadolint
+  install_shellcheck
+  install_trivy
   install_ruff
   install_markdownlint
+  install_tsgo
 
   printf 'tool               version    status\n'
   printf '%s\n' "${SUMMARY[@]}"
