@@ -59,6 +59,8 @@ env:
   REGISTRY: ghcr.io
   BUILDX_VERSION: v0.34.1
   COSIGN_VERSION: v3.0.6
+  # renovate: datasource=github-releases depName=aquasecurity/trivy
+  TRIVY_VERSION: v0.71.2
 
 # Top-level read-only (OpenSSF Scorecard Token-Permissions); each job below
 # declares the write scopes it needs (build/finalize push, sign, attest, release).
@@ -370,6 +372,7 @@ jobs:
         continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
+          version: ${{ env.TRIVY_VERSION }}
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
           format: 'sarif'
           output: 'trivy-image.sarif'

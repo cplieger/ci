@@ -19,6 +19,15 @@ on:
 permissions:
   contents: read
 
+# Trivy binary version, pinned so local scans match what CI runs:
+# cplieger/ci's scripts/install-local-tools.sh reads this same pin via
+# `pin_version aquasecurity/trivy`. Without an explicit version the
+# trivy-action installs its own baked-in default (v0.70.0 at the pinned SHA),
+# which silently drifts from the binary other workflows install directly.
+env:
+  # renovate: datasource=github-releases depName=aquasecurity/trivy
+  TRIVY_VERSION: v0.71.2
+
 jobs:
   trivy:
     runs-on: ubuntu-24.04
@@ -75,6 +84,7 @@ jobs:
       - name: Trivy filesystem scan (advisory)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
+          version: ${{ env.TRIVY_VERSION }}
           scan-type: fs
           scanners: 'vuln,secret'
           severity: ${{ inputs.severity }}
@@ -86,6 +96,7 @@ jobs:
       - name: Trivy misconfig scan (report-only)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
+          version: ${{ env.TRIVY_VERSION }}
           scan-type: fs
           scanners: 'misconfig'
           exit-code: '0'
@@ -96,6 +107,7 @@ jobs:
         if: ${{ steps.profile.outputs.image == 'true' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
+          version: ${{ env.TRIVY_VERSION }}
           image-ref: 'ci-scan:latest'
           severity: ${{ inputs.severity }}
           ignore-unfixed: true
