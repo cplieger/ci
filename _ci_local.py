@@ -206,16 +206,29 @@ def _first_cmd_line(cmd):
     return lines[0] if lines else ''
 
 
+# Per-process path for the cross-step soft-gate marker.  Using a PID-unique
+# path means parallel ci-local runs (e.g. running all repos concurrently) each
+# maintain their own isolated failure list instead of sharing /tmp/_ci_failures
+# and cross-contaminating each other's "Check results" steps.
+_CI_FAILURES_PATH = f'/tmp/_ci_failures_{os.getpid()}'
+
+# Per-step wall-clock cap (seconds). CI's own job timeout is 15-20 min; this is
+# a local guard against a genuinely hung step. Sized to clear the slowest real
+# step in the fleet — wiregen's `go test -race ./...` runs ~317s standalone, so
+# 300s produced a false timeout. 600s covers it with margin under light load.
+_STEP_TIMEOUT_SECS = 600
+
+
 def _clear_failure_marker():
     """Remove the cross-step soft-gate marker before a job runs.
 
-    go-ci/shell-ci steps append failures to /tmp/_ci_failures and the job's
+    go-ci/shell-ci steps append failures to _CI_FAILURES_PATH and the job's
     'Check results' step reads it. In CI each job has its own /tmp; locally all
     jobs share one, so the marker MUST be cleared per-job — otherwise a real
     failure in one job (e.g. go's fieldalignment) makes a sibling job's Check
     results (e.g. shell) fail too, a phantom cascade CI never produces."""
     with contextlib.suppress(FileNotFoundError):
-        os.unlink('/tmp/_ci_failures')
+        os.unlink(_CI_FAILURES_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +636,15 @@ def classify_step(step):
             cmd = f'docker build -f {shlex.quote(dockerfile)}'
             if target_stage:
                 cmd += f' --target {shlex.quote(target_stage)}'
+            # Preserve the image tag(s) so a downstream smoke-test step that runs
+            # `docker run <tag>` can find the just-built image. CI tags via the
+            # `tags:` input (e.g. ci-smoke:latest); without -t locally the build
+            # produces a dangling image and the smoke step fails with "Unable to
+            # find image".
+            for tag in str(with_.get('tags', '')).replace(',', '\n').splitlines():
+                tag = tag.strip()
+                if tag:
+                    cmd += f' -t {shlex.quote(tag)}'
             cmd += f' {shlex.quote(context)}'
             return 'LOCAL', name, cmd
         if action_ref in KNOWN_USES:
@@ -679,7 +701,134 @@ def rewrite_hadolint_docker(cmd: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# markdownlint-cli2 gitignore parity
+# Gitleaks curl-download rewrite
+# ---------------------------------------------------------------------------
+# CI downloads gitleaks to the fixed /tmp/gitleaks path and runs it.  When
+# multiple ci-local processes run in parallel every one of them tries to
+# overwrite that binary simultaneously, which bash rejects with "Text file
+# busy".  If gitleaks is already on PATH (installed via install-local-tools.sh)
+# skip the download entirely and call the local binary directly.
+_GITLEAKS_CURL_RE = re.compile(
+    r'^\s*(#[^\n]*\n\s*)?VERSION=[^\n]+\n\s*'  # optional comment + VERSION=
+    r'curl\s[^\n]+gitleaks[^\n]+\n\s*'          # curl … | tar … gitleaks
+    r'/tmp/gitleaks\b',                          # /tmp/gitleaks invocation
+    re.MULTILINE,
+)
+_GITLEAKS_PATH_RE = re.compile(r'/tmp/gitleaks\b')
+
+
+def rewrite_gitleaks_download(cmd: str) -> str:
+    """If gitleaks is on PATH, replace the curl-download+run sequence.
+
+    Strips the VERSION= line, the curl | tar extraction, and rewrites the
+    /tmp/gitleaks invocation to just `gitleaks`.  Works even when the three
+    lines are the entire step (the common case in go-ci / shell-ci).
+
+    Also rewrites `gitleaks dir .` to `gitleaks detect --source .`: in CI the
+    fresh checkout has no gitignored files so `dir` and `detect` are equivalent,
+    but locally `dir` scans everything including gitignored dirs (.code-review/,
+    *.dec files, etc.) producing false positives that CI never sees.
+    """
+    if not shutil.which('gitleaks') or '/tmp/gitleaks' not in cmd:
+        return cmd
+    lines = cmd.splitlines(keepends=True)
+    result = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].rstrip()
+        # Skip renovate comment + VERSION= line before a gitleaks curl line
+        if (
+            stripped.lstrip().startswith('# renovate')
+            and i + 1 < len(lines)
+            and 'VERSION=' in lines[i + 1]
+        ):
+            # Peek ahead: if the VERSION line is followed by a gitleaks curl, skip both
+            if i + 2 < len(lines) and 'gitleaks' in lines[i + 2] and 'curl' in lines[i + 2]:
+                i += 2  # skip comment and VERSION=
+                continue
+        if 'VERSION=' in stripped and i + 1 < len(lines):
+            nxt = lines[i + 1].rstrip()
+            if 'gitleaks' in nxt and 'curl' in nxt:
+                i += 2  # skip VERSION= and curl line
+                continue
+        if 'curl' in stripped and 'gitleaks' in stripped and '/tmp' in stripped:
+            i += 1  # skip curl download line
+            continue
+        # Rewrite /tmp/gitleaks to gitleaks
+        line = _GITLEAKS_PATH_RE.sub('gitleaks', lines[i])
+        # Rewrite `gitleaks dir .` → `gitleaks detect --source .` for gitignore parity:
+        # CI runs in a fresh checkout (no gitignored files), so `dir` and `detect`
+        # are equivalent there.  Locally, `dir` scans everything including gitignored
+        # dirs (.code-review/, *.dec) which produce false positives CI never sees.
+        line = re.sub(r'\bgitleaks\s+dir\s+\.', 'gitleaks detect --source .', line)
+        result.append(line)
+        i += 1
+    return ''.join(result)
+
+
+# ---------------------------------------------------------------------------
+# Per-process /tmp/_ci_failures rewrite
+# ---------------------------------------------------------------------------
+# go-ci and shell-ci workflows hardcode /tmp/_ci_failures as the soft-gate
+# marker file.  Replace it in every command string with the per-process path so
+# parallel ci-local invocations don't cross-contaminate each other's results.
+def rewrite_ci_failures_path(cmd: str) -> str:
+    """Replace the hardcoded /tmp/_ci_failures with the per-process path."""
+    return cmd.replace('/tmp/_ci_failures', _CI_FAILURES_PATH)
+
+
+# ---------------------------------------------------------------------------
+# Trivy filesystem-scan gitignore parity
+# ---------------------------------------------------------------------------
+# CI runs `trivy fs` against a fresh checkout — only git-tracked files exist.
+# Locally the working tree carries gitignored files trivy will happily scan:
+# decrypted secrets (homelab's *.env.dec), .code-review/ artifacts, node_modules.
+# Trivy's secret scanner then flags e.g. apps/<app>/.env.dec (a deliberately
+# decrypted, gitignored secret) and the run fails with a finding CI never sees.
+# Mirror CI by injecting --skip-files / --skip-dirs for everything git ignores
+# under the scan dir. `git ls-files --directory` collapses fully-ignored dirs to
+# a single entry, keeping the flag list compact.
+_TRIVY_FS_RE = re.compile(r'\btrivy\s+(?:fs|filesystem)\b')
+
+
+def rewrite_trivy_gitignore(cmd: str, cwd: Path) -> str:
+    """Inject --skip-files/--skip-dirs for gitignored paths into a trivy fs run.
+
+    Makes the local filesystem scan see the same fileset CI does (tracked only),
+    so a gitignored decrypted secret or scratch artifact can't produce a finding
+    that the gate never would.
+    """
+    if not _TRIVY_FS_RE.search(cmd) or not shutil.which('git'):
+        return cmd
+    try:
+        out = subprocess.run(
+            ['git', 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory'],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return cmd
+    if out.returncode != 0:
+        return cmd
+    dirs, files = [], []
+    for entry in out.stdout.splitlines():
+        entry = entry.strip()
+        if not entry:
+            continue
+        (dirs if entry.endswith('/') else files).append(entry.rstrip('/'))
+    if not dirs and not files:
+        return cmd
+    inject = ''
+    if dirs:
+        inject += f" --skip-dirs {shlex.quote(','.join(dirs))}"
+    if files:
+        inject += f" --skip-files {shlex.quote(','.join(files))}"
+    # Insert right after the `trivy fs` / `trivy filesystem` token. Repeated
+    # --skip-dirs is fine (trivy unions them), so an existing --skip-dirs in the
+    # command is preserved.
+    return _TRIVY_FS_RE.sub(lambda m: m.group(0) + inject, cmd, count=1)
 # ---------------------------------------------------------------------------
 # CI lints a fresh checkout — only git-tracked files exist. Locally the working
 # tree may carry gitignored .md files (generated reports under .code-review/,
@@ -742,13 +891,16 @@ def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
         cmd = step['run']
         cmd = rewrite_hadolint_docker(cmd)
         cmd = rewrite_markdownlint_gitignore(cmd, cwd)
+        cmd = rewrite_gitleaks_download(cmd)
+        cmd = rewrite_trivy_gitignore(cmd, cwd)
+        cmd = rewrite_ci_failures_path(cmd)
 
     if dry_run:
         return StepResult(True, blue('DRY'), 0, cmd, '', 'dry')
 
     try:
         proc = subprocess.run(
-            ['timeout', '300', 'bash', '-eu', '-o', 'pipefail', '-c', cmd],
+            ['timeout', str(_STEP_TIMEOUT_SECS), 'bash', '-eu', '-o', 'pipefail', '-c', cmd],
             cwd=str(cwd),
             env=env,
             capture_output=True,
@@ -774,7 +926,7 @@ def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
     if rc == 127:
         return StepResult(True, yellow('MISSING (tool not on PATH)'), 127, cmd, output, 'missing')
     if rc == 124:
-        return StepResult(False, red('FAIL (timed out at 300s)'), 124, cmd, output, 'fail')
+        return StepResult(False, red(f'FAIL (timed out at {_STEP_TIMEOUT_SECS}s)'), 124, cmd, output, 'fail')
     return StepResult(False, red(f'FAIL (rc={rc})'), rc, cmd, output, 'fail')
 
 
@@ -1190,9 +1342,19 @@ def process_reusable_steps(
                 (jobname, name, f'`{tool}` not on PATH (exit 127) — CI has it; install to check locally')
             )
         else:  # fail
-            counters['FAIL'] += 1
-            overall_ok = False
-            failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
+            # continue-on-error: true makes a step advisory in CI — its failure
+            # is recorded but never fails the job/gate. Mirror that locally:
+            # report under not_validated instead of failing the run. The image
+            # smoke test is the main user of this.
+            if step.get('continue-on-error') in (True, 'true'):
+                counters['MISSING'] += 1
+                REPORT.not_validated.append(
+                    (jobname, name, f'advisory step failed (continue-on-error; non-blocking in CI) — rc={res.rc}')
+                )
+            else:
+                counters['FAIL'] += 1
+                overall_ok = False
+                failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
 
     return overall_ok, counters, failed_steps
 
@@ -1388,16 +1550,16 @@ def run_codeql_for_job(jobname, steps, target: Path, dry_run: bool):
         if kind == 'UNKNOWN':
             counters['SKIP'] += 1
             continue
-        ok, status = run_step(kind, name, detail, s, target, dry_run)
-        if dry_run:
+        res = run_step(kind, name, detail, s, target, dry_run)
+        if dry_run or res.outcome == 'dry':
             counters['DRY'] += 1
-        elif ok:
+        elif res.ok:
             counters['PASS'] += 1
-            print(f'    → {status}')
+            print(f'    → {res.status}')
         else:
             counters['FAIL'] += 1
             failed.append(name)
-            print(f'    → {status}')
+            print(f'    → {res.status}')
 
     if languages is None:
         return True, counters, failed
@@ -1691,9 +1853,17 @@ def run_workflow_steps(jobs, target: Path, dry_run: bool, ignore_unknown: bool):
                     (jobname, name, f'`{tool}` not on PATH (exit 127) — CI has it; install to check locally')
                 )
             else:  # fail
-                counters['FAIL'] += 1
-                overall_ok = False
-                failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
+                # continue-on-error: true makes a step advisory in CI — mirror
+                # that locally (report, don't fail the run).
+                if eff_step.get('continue-on-error') in (True, 'true'):
+                    counters['MISSING'] += 1
+                    REPORT.not_validated.append(
+                        (jobname, name, f'advisory step failed (continue-on-error; non-blocking in CI) — rc={res.rc}')
+                    )
+                else:
+                    counters['FAIL'] += 1
+                    overall_ok = False
+                    failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
         print()
 
     return overall_ok, counters, failed_steps
@@ -1939,9 +2109,8 @@ def main():
 
     # Clear failure marker
     if not args.plan_only:
-        marker = '/tmp/_ci_failures'
         with contextlib.suppress(FileNotFoundError):
-            os.unlink(marker)
+            os.unlink(_CI_FAILURES_PATH)
 
     # Pre-run node_modules cleanup
     if not args.plan_only and not args.no_clean_node_modules:
