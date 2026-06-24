@@ -46,7 +46,7 @@ fi
 
 # Add or replace just our file (single-line JSON; never a heredoc — heredoc
 # terminators break under GHA run-step YAML dedent).
-printf '%s\n' "$JSON" > "${stage}/${FILE}"
+printf '%s\n' "$JSON" >"${stage}/${FILE}"
 
 cd "$stage"
 git init -q
@@ -68,8 +68,8 @@ until git push -q -f "$URL" HEAD:badges; do
     exit 1
   fi
   echo "push to ${REPO}@badges failed (attempt ${attempt}/${max_attempts}); retrying" >&2
-  sleep $(( attempt * 3 ))
-  attempt=$(( attempt + 1 ))
+  sleep $((attempt * 3))
+  attempt=$((attempt + 1))
 done
 
 echo "published ${FILE} to ${REPO}@badges ($(find . -maxdepth 1 -name '*.json' -printf '%f ' 2>/dev/null))"
