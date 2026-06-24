@@ -15,11 +15,13 @@
 #
 # COVERS (the tools the `ci / validate` gate + advisory security scan run):
 #   - Renovate-pinned, exact version: golangci-lint, gitleaks, trivy, hadolint
-#     (release binaries), ruff (pipx), markdownlint-cli2 (npm), tsgo (npm tarball)
-#   - best-effort LATEST (no CI pin exists to read): shellcheck. CI uses the
-#     ubuntu-24.04 runner's preinstalled copy, which floats with the runner
-#     image, so there is nothing to pin against; the newest stable release is
-#     the closest local proxy (tag resolved live from the GitHub API).
+#     (release binaries), shfmt (release binary), ruff (pipx),
+#     markdownlint-cli2 (npm), tsgo (npm tarball)
+#   - best-effort LATEST (no CI pin exists to read): shellcheck, yamllint. CI
+#     uses the ubuntu-24.04 runner's preinstalled shellcheck (floats with the
+#     runner image) and a bare `pip install yamllint` (unpinned), so there is
+#     nothing to pin against; the newest release / latest pipx build is the
+#     closest local proxy.
 #   - every `go install <pkg>@<ver>` line in go-ci.yaml; the version is pinned in
 #     a shell var (e.g. GOVULNCHECK_VERSION=v1.4.0) which this script resolves:
 #     govulncheck, actionlint, fieldalignment, deadcode, punused
@@ -384,6 +386,58 @@ install_shellcheck() {
   fi
 }
 
+# install_shfmt: the shell formatter run by the meta CI scripts job and the
+# homelab/.kiro bespoke CI. Pinned via `# renovate: ... depName=mvdan/sh` +
+# VERSION in the workflows; install the matching single-file release binary.
+install_shfmt() {
+  local want cur arch
+  want="$(pin_version mvdan/sh)"
+  [ -n "$want" ] || {
+    bad shfmt "no pin found"
+    return
+  }
+  cur="$(shfmt --version 2>/dev/null | sed 's/^v//' || true)"
+  [ "$cur" = "${want#v}" ] && {
+    skip shfmt "$want"
+    return
+  }
+  case "$(uname -m)" in
+    x86_64 | amd64) arch=amd64 ;;
+    aarch64 | arm64) arch=arm64 ;;
+    *)
+      bad shfmt "unsupported arch $(uname -m)"
+      return
+      ;;
+  esac
+  mkdir -p "$BIN_DIR"
+  if curl -fsSL "https://github.com/mvdan/sh/releases/download/${want}/shfmt_${want}_linux_${arch}" -o "$BIN_DIR/shfmt" \
+    && chmod +x "$BIN_DIR/shfmt"; then
+    ok shfmt "$want" "-> $BIN_DIR"
+  else
+    bad shfmt "download failed"
+  fi
+}
+
+# install_yamllint: the YAML linter run by the meta CI scripts job and the
+# homelab/.kiro bespoke CI. CI installs it unpinned (`pip install yamllint`), so
+# there is no version to read — best-effort, same rationale as shellcheck. Skip
+# when already present (presence is enough absent a pin).
+install_yamllint() {
+  command -v pipx >/dev/null 2>&1 || {
+    bad yamllint "pipx not found"
+    return
+  }
+  if command -v yamllint >/dev/null 2>&1; then
+    skip yamllint "$(yamllint --version 2>/dev/null | semver || echo present)"
+    return
+  fi
+  if pipx install yamllint >/dev/null 2>&1; then
+    ok yamllint "latest" "pipx"
+  else
+    bad yamllint "pipx failed"
+  fi
+}
+
 main() {
   printf 'Installing CI-pinned dev tools (pins from %s)\n' "$WF_DIR"
   printf '  bin dir: %s\n\n' "$BIN_DIR"
@@ -393,6 +447,8 @@ main() {
   install_gitleaks
   install_hadolint
   install_shellcheck
+  install_shfmt
+  install_yamllint
   install_trivy
   install_ruff
   install_markdownlint
