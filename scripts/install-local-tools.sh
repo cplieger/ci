@@ -71,19 +71,28 @@ pin_version() {
 # semver: extract the first X.Y.Z from stdin (a tool's --version output).
 semver() { grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1; }
 
-ok()   { SUMMARY+=("$(printf '  %-18s %-10s %s' "$1" "$2" "${3:-installed}")"); }
+ok() { SUMMARY+=("$(printf '  %-18s %-10s %s' "$1" "$2" "${3:-installed}")"); }
 skip() { SUMMARY+=("$(printf '  %-18s %-10s %s' "$1" "$2" "already current")"); }
-bad()  { SUMMARY+=("$(printf '  %-18s %-10s %s' "$1" "-" "FAILED: ${2:-}")"); FAILED+=("$1"); }
+bad() {
+  SUMMARY+=("$(printf '  %-18s %-10s %s' "$1" "-" "FAILED: ${2:-}")")
+  FAILED+=("$1")
+}
 
 install_golangci_lint() {
   local want cur
   want="$(pin_version golangci/golangci-lint)"
-  [ -n "$want" ] || { bad golangci-lint "no pin found"; return; }
+  [ -n "$want" ] || {
+    bad golangci-lint "no pin found"
+    return
+  }
   cur="$(golangci-lint version 2>/dev/null | semver || true)"
-  [ "$cur" = "${want#v}" ] && { skip golangci-lint "$want"; return; }
+  [ "$cur" = "${want#v}" ] && {
+    skip golangci-lint "$want"
+    return
+  }
   mkdir -p "$BIN_DIR"
   if curl -fsSL "https://raw.githubusercontent.com/golangci/golangci-lint/${want}/install.sh" \
-       | sh -s -- -b "$BIN_DIR" "$want" >/dev/null 2>&1; then
+    | sh -s -- -b "$BIN_DIR" "$want" >/dev/null 2>&1; then
     ok golangci-lint "$want" "-> $BIN_DIR"
   else
     bad golangci-lint "install.sh failed"
@@ -93,17 +102,26 @@ install_golangci_lint() {
 install_gitleaks() {
   local want cur arch
   want="$(pin_version gitleaks/gitleaks)"
-  [ -n "$want" ] || { bad gitleaks "no pin found"; return; }
+  [ -n "$want" ] || {
+    bad gitleaks "no pin found"
+    return
+  }
   cur="$(gitleaks version 2>/dev/null | semver || true)"
-  [ "$cur" = "${want#v}" ] && { skip gitleaks "$want"; return; }
+  [ "$cur" = "${want#v}" ] && {
+    skip gitleaks "$want"
+    return
+  }
   case "$(uname -m)" in
     x86_64 | amd64) arch=x64 ;;
     aarch64 | arm64) arch=arm64 ;;
-    *) bad gitleaks "unsupported arch $(uname -m)"; return ;;
+    *)
+      bad gitleaks "unsupported arch $(uname -m)"
+      return
+      ;;
   esac
   mkdir -p "$BIN_DIR"
   if curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/${want}/gitleaks_${want#v}_linux_${arch}.tar.gz" \
-       | tar -xzf - -C "$BIN_DIR" gitleaks 2>/dev/null; then
+    | tar -xzf - -C "$BIN_DIR" gitleaks 2>/dev/null; then
     ok gitleaks "$want" "-> $BIN_DIR"
   else
     bad gitleaks "download failed"
@@ -120,40 +138,58 @@ install_gitleaks() {
 # unchanged, so the un-pinned form still works.
 install_go_tools() {
   local goci="$WF_DIR/go-ci.yaml" spec name ver verpart varname line trimmed k v
-  [ -f "$goci" ] || { bad "go-tools" "go-ci.yaml not found"; return; }
-  command -v go >/dev/null 2>&1 || { bad "go-tools" "go not found"; return; }
+  [ -f "$goci" ] || {
+    bad "go-tools" "go-ci.yaml not found"
+    return
+  }
+  command -v go >/dev/null 2>&1 || {
+    bad "go-tools" "go not found"
+    return
+  }
 
   # Map every clean `<identifier>=<value>` assignment in the workflow (captures
   # the *_VERSION pins; skips `echo 'app=true'`-style lines whose key holds
   # spaces). Value is taken up to the first whitespace, dropping inline comments.
   local -A vers=()
   while IFS= read -r line; do
-    trimmed="${line#"${line%%[![:space:]]*}"}"   # strip leading indentation
+    trimmed="${line#"${line%%[![:space:]]*}"}" # strip leading indentation
     case "$trimmed" in
       [A-Za-z_]*=*)
         k="${trimmed%%=*}"
         case "$k" in
-          *[!A-Za-z0-9_]*) ;;                      # key holds spaces/punct -> not an assignment
-          *) v="${trimmed#*=}"; v="${v%%[[:space:]]*}"; [ -n "$v" ] && vers["$k"]="$v" ;;
+          *[!A-Za-z0-9_]*) ;; # key holds spaces/punct -> not an assignment
+          *)
+            v="${trimmed#*=}"
+            v="${v%%[[:space:]]*}"
+            [ -n "$v" ] && vers["$k"]="$v"
+            ;;
         esac
         ;;
     esac
-  done < "$goci"
+  done <"$goci"
 
   while IFS= read -r spec; do
     [ -n "$spec" ] || continue
-    spec="${spec%\"}"; spec="${spec#\"}"          # strip the quotes YAML left on the token
-    spec="${spec%\'}"; spec="${spec#\'}"
+    spec="${spec%\"}"
+    spec="${spec#\"}" # strip the quotes YAML left on the token
+    spec="${spec%\'}"
+    spec="${spec#\'}"
     verpart="${spec##*@}"
-    if [ "${verpart:0:1}" = '$' ]; then           # version is a ${VAR}/$VAR reference
-      varname="${verpart#\$}"; varname="${varname#\{}"; varname="${varname%\}}"
+    if [ "${verpart:0:1}" = '$' ]; then # version is a ${VAR}/$VAR reference
+      varname="${verpart#\$}"
+      varname="${varname#\{}"
+      varname="${varname%\}}"
       ver="${vers[$varname]:-}"
-      name="${spec%@*}"; name="${name##*/}"
-      [ -n "$ver" ] || { bad "$name" "unresolved version var \$$varname"; continue; }
+      name="${spec%@*}"
+      name="${name##*/}"
+      [ -n "$ver" ] || {
+        bad "$name" "unresolved version var \$$varname"
+        continue
+      }
       spec="${spec%@*}@${ver}"
     fi
-    name="${spec##*/}"   # last path segment, e.g. govulncheck@v1.4.0
-    name="${name%@*}"    # drop @version
+    name="${spec##*/}" # last path segment, e.g. govulncheck@v1.4.0
+    name="${name%@*}"  # drop @version
     if go install "$spec" >/dev/null 2>&1; then
       ok "$name" "${spec##*@}" "go install"
     else
@@ -165,10 +201,19 @@ install_go_tools() {
 install_ruff() {
   local want cur
   want="$(pin_version ruff)"
-  [ -n "$want" ] || { bad ruff "no pin found"; return; }
+  [ -n "$want" ] || {
+    bad ruff "no pin found"
+    return
+  }
   cur="$(ruff --version 2>/dev/null | semver || true)"
-  [ "$cur" = "$want" ] && { skip ruff "$want"; return; }
-  command -v pipx >/dev/null 2>&1 || { bad ruff "pipx not found"; return; }
+  [ "$cur" = "$want" ] && {
+    skip ruff "$want"
+    return
+  }
+  command -v pipx >/dev/null 2>&1 || {
+    bad ruff "pipx not found"
+    return
+  }
   if pipx install --force "ruff==${want}" >/dev/null 2>&1; then
     ok ruff "$want" "pipx"
   else
@@ -179,10 +224,19 @@ install_ruff() {
 install_markdownlint() {
   local want cur
   want="$(pin_version markdownlint-cli2)"
-  [ -n "$want" ] || { bad markdownlint-cli2 "no pin found"; return; }
+  [ -n "$want" ] || {
+    bad markdownlint-cli2 "no pin found"
+    return
+  }
   cur="$(markdownlint-cli2 --version 2>/dev/null | semver || true)"
-  [ "$cur" = "$want" ] && { skip markdownlint-cli2 "$want"; return; }
-  command -v npm >/dev/null 2>&1 || { bad markdownlint-cli2 "npm not found"; return; }
+  [ "$cur" = "$want" ] && {
+    skip markdownlint-cli2 "$want"
+    return
+  }
+  command -v npm >/dev/null 2>&1 || {
+    bad markdownlint-cli2 "npm not found"
+    return
+  }
   if npm install -g "markdownlint-cli2@${want}" >/dev/null 2>&1; then
     ok markdownlint-cli2 "$want" "npm -g"
   else
@@ -193,17 +247,26 @@ install_markdownlint() {
 install_trivy() {
   local want cur arch
   want="$(pin_version aquasecurity/trivy)"
-  [ -n "$want" ] || { bad trivy "no pin found"; return; }
+  [ -n "$want" ] || {
+    bad trivy "no pin found"
+    return
+  }
   cur="$(trivy --version 2>/dev/null | semver || true)"
-  [ "$cur" = "${want#v}" ] && { skip trivy "$want"; return; }
+  [ "$cur" = "${want#v}" ] && {
+    skip trivy "$want"
+    return
+  }
   case "$(uname -m)" in
     x86_64 | amd64) arch=64bit ;;
     aarch64 | arm64) arch=ARM64 ;;
-    *) bad trivy "unsupported arch $(uname -m)"; return ;;
+    *)
+      bad trivy "unsupported arch $(uname -m)"
+      return
+      ;;
   esac
   mkdir -p "$BIN_DIR"
   if curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/${want}/trivy_${want#v}_Linux-${arch}.tar.gz" \
-       | tar -xzf - -C "$BIN_DIR" trivy 2>/dev/null; then
+    | tar -xzf - -C "$BIN_DIR" trivy 2>/dev/null; then
     ok trivy "$want" "-> $BIN_DIR"
   else
     bad trivy "download failed"
@@ -218,17 +281,26 @@ install_trivy() {
 install_hadolint() {
   local want cur arch
   want="$(grep -hoE 'hadolint/hadolint:[0-9]+\.[0-9]+\.[0-9]+' "$WF_DIR"/*.yaml 2>/dev/null | head -n1 | sed 's/.*://')"
-  [ -n "$want" ] || { bad hadolint "no pin found"; return; }
+  [ -n "$want" ] || {
+    bad hadolint "no pin found"
+    return
+  }
   cur="$(hadolint --version 2>/dev/null | semver || true)"
-  [ "$cur" = "$want" ] && { skip hadolint "$want"; return; }
+  [ "$cur" = "$want" ] && {
+    skip hadolint "$want"
+    return
+  }
   case "$(uname -m)" in
     x86_64 | amd64) arch=x86_64 ;;
     aarch64 | arm64) arch=arm64 ;;
-    *) bad hadolint "unsupported arch $(uname -m)"; return ;;
+    *)
+      bad hadolint "unsupported arch $(uname -m)"
+      return
+      ;;
   esac
   mkdir -p "$BIN_DIR"
   if curl -fsSL "https://github.com/hadolint/hadolint/releases/download/v${want}/hadolint-Linux-${arch}" -o "$BIN_DIR/hadolint" \
-       && chmod +x "$BIN_DIR/hadolint"; then
+    && chmod +x "$BIN_DIR/hadolint"; then
     ok hadolint "$want" "-> $BIN_DIR"
   else
     bad hadolint "download failed"
@@ -244,19 +316,28 @@ install_hadolint() {
 install_tsgo() {
   local want cur arch libdir tmp pkg
   want="$(pin_version @typescript/native-preview)"
-  [ -n "$want" ] || { bad tsgo "no pin found"; return; }
+  [ -n "$want" ] || {
+    bad tsgo "no pin found"
+    return
+  }
   cur="$(tsgo --version 2>/dev/null | grep -oE '[0-9][0-9A-Za-z.-]*' | head -n1 || true)"
-  [ "$cur" = "$want" ] && { skip tsgo "$want"; return; }
+  [ "$cur" = "$want" ] && {
+    skip tsgo "$want"
+    return
+  }
   case "$(uname -m)" in
     x86_64 | amd64) arch=x64 ;;
     aarch64 | arm64) arch=arm64 ;;
-    *) bad tsgo "unsupported arch $(uname -m)"; return ;;
+    *)
+      bad tsgo "unsupported arch $(uname -m)"
+      return
+      ;;
   esac
   pkg="native-preview-linux-${arch}"
   libdir="$(dirname "$BIN_DIR")/lib/tsgo-native"
   tmp="$(mktemp -d)"
   if curl -fsSL "https://registry.npmjs.org/@typescript/${pkg}/-/${pkg}-${want}.tgz" \
-       | tar -xzf - -C "$tmp" 2>/dev/null && [ -x "$tmp/package/lib/tsgo" ]; then
+    | tar -xzf - -C "$tmp" 2>/dev/null && [ -x "$tmp/package/lib/tsgo" ]; then
     rm -rf "$libdir"
     mkdir -p "$(dirname "$libdir")" "$BIN_DIR"
     mv "$tmp/package/lib" "$libdir"
@@ -277,17 +358,26 @@ install_shellcheck() {
   local want cur arch
   want="$(curl -fsSL "https://api.github.com/repos/koalaman/shellcheck/releases/latest" 2>/dev/null \
     | grep -oE '"tag_name": *"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')"
-  [ -n "$want" ] || { bad shellcheck "could not resolve latest tag"; return; }
+  [ -n "$want" ] || {
+    bad shellcheck "could not resolve latest tag"
+    return
+  }
   cur="$(shellcheck --version 2>/dev/null | awk '/^version:/ {print $2}' || true)"
-  [ "$cur" = "${want#v}" ] && { skip shellcheck "$want"; return; }
+  [ "$cur" = "${want#v}" ] && {
+    skip shellcheck "$want"
+    return
+  }
   case "$(uname -m)" in
     x86_64 | amd64) arch=x86_64 ;;
     aarch64 | arm64) arch=aarch64 ;;
-    *) bad shellcheck "unsupported arch $(uname -m)"; return ;;
+    *)
+      bad shellcheck "unsupported arch $(uname -m)"
+      return
+      ;;
   esac
   mkdir -p "$BIN_DIR"
   if curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${want}/shellcheck-${want}.linux.${arch}.tar.xz" \
-       | tar -xJf - -C "$BIN_DIR" --strip-components=1 "shellcheck-${want}/shellcheck" 2>/dev/null; then
+    | tar -xJf - -C "$BIN_DIR" --strip-components=1 "shellcheck-${want}/shellcheck" 2>/dev/null; then
     ok shellcheck "$want" "-> $BIN_DIR"
   else
     bad shellcheck "download failed"
