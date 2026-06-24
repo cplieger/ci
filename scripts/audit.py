@@ -7,9 +7,15 @@ compliance report against the documented standard in
 with N/A handling where a setting cannot apply (e.g. GitHub Advanced Security
 features on free private repos).
 
-Checks cover merge model, repo features, branch protection, vulnerability
-reporting, secret/code scanning, CI wiring, Renovate preset, license, default
-branch, description (presence + <=100 chars), and topics.
+Checks cover merge model, repo features, branch protection, rulesets
+(unexpected custom rulesets + bypass-actor drift), vulnerability reporting,
+secret/code scanning, CI wiring, Renovate preset, license, default branch,
+description (presence + <=100 chars), and topics.
+
+Branch protection is the documented fleet standard (classic protection); any
+custom repository ruleset is treated as drift, and an Integration bypass actor
+on any ruleset is a HARD failure (it is the stale-decommissioned-app rot class
+— e.g. a former hosted-Renovate GitHub App left able to bypass protection).
 
 Exits non-zero if ANY repo has a HARD failure; warnings never fail the run.
 
@@ -37,6 +43,10 @@ OWNER = "cplieger"
 PRESET = "github>cplieger/.github"
 REUSABLE = "cplieger/ci/.github/workflows"
 INFRA = {".github", "ci"}  # they define the standard; CI-wiring check is N/A for them
+# GitHub auto-creates and manages this ruleset when code-scanning merge
+# protection is enabled. It is not user-authored, so it is whitelisted from the
+# "unexpected custom ruleset" check. Every other ruleset is drift.
+MANAGED_RULESETS = {"code-scanning-merge-protection"}
 
 # Documented governance standard (repo-governance.md).
 # HARD merge-model settings: any deviation fails the audit (exit 1). These have
@@ -137,6 +147,23 @@ def collect(meta):
         s["required_checks"] = []
         s["strict"] = s["enforce_admins"] = s["allow_force_pushes"] = s["allow_deletions"] = None
 
+    # Repository rulesets. The fleet standard is classic branch protection, so
+    # any non-managed ruleset is drift. The bypass-actor list is the precise
+    # surface that classic-protection checks miss: a decommissioned GitHub App
+    # (e.g. the former hosted-Renovate app) can linger as an Integration bypass
+    # actor that nothing else flags. The list endpoint returns only id/name/
+    # enforcement, so each ruleset is fetched in detail for its bypass_actors.
+    s["custom_rulesets"] = []
+    s["ruleset_bypass_actors"] = []  # (ruleset_name, actor_type, actor_id)
+    rulesets = gh_json("api", f"repos/{OWNER}/{name}/rulesets")
+    for rs in rulesets if isinstance(rulesets, list) else []:
+        rname = rs.get("name", "")
+        full = gh_json("api", f"repos/{OWNER}/{name}/rulesets/{rs.get('id')}") or {}
+        if rname not in MANAGED_RULESETS:
+            s["custom_rulesets"].append({"name": rname, "enforcement": full.get("enforcement")})
+        for a in full.get("bypass_actors") or []:
+            s["ruleset_bypass_actors"].append((rname, a.get("actor_type"), a.get("actor_id")))
+
     wf = gh_json("api", f"repos/{OWNER}/{name}/contents/.github/workflows")
     wf_names = {f["name"] for f in wf} if isinstance(wf, list) else set()
     s["has_codeql"] = bool({"codeql.yml", "codeql.yaml"} & wf_names)
@@ -184,6 +211,22 @@ def compliance(s):
             warn.append("allow_force_pushes=on (want off)")
         if s["allow_deletions"]:
             warn.append("allow_deletions=on (want off)")
+
+    # Rulesets. Classic protection is the standard, so any custom ruleset is
+    # drift (warn). A bypass actor weakens whatever ruleset carries it (warn);
+    # an Integration bypass actor is a HARD failure — it is the stale-app rot
+    # class (a decommissioned GitHub App left able to bypass protection, which
+    # the GitHub API also refuses to rewrite on a user-owned repo, so it festers
+    # invisibly until something like a history rewrite trips over it).
+    for rs in s.get("custom_rulesets") or []:
+        warn.append(f"unexpected custom ruleset '{rs['name']}' ({rs['enforcement']}) "
+                    "(standard is classic branch protection)")
+    for rname, atype, aid in s.get("ruleset_bypass_actors") or []:
+        if atype == "Integration":
+            hard.append(f"ruleset '{rname}' has an Integration bypass actor (id {aid}) "
+                        "— likely a stale/decommissioned app; remove it")
+        else:
+            warn.append(f"ruleset '{rname}' has a bypass actor ({atype} id {aid})")
 
     if not s["vuln_alerts"]:
         hard.append("dependabot vulnerability alerts off (want on)")
