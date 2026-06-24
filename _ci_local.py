@@ -54,6 +54,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import namedtuple
 from pathlib import Path
 
 try:
@@ -156,16 +157,122 @@ def gray(s):
 
 
 # ---------------------------------------------------------------------------
+# Agent-facing run report
+# ---------------------------------------------------------------------------
+# The (ok, counters, failed) plumbing drives the exit code; this module-level
+# accumulator carries the richer, consolidated context the end-of-run summary
+# needs so an agent reading the tail can see — without scrolling — what ran,
+# what did NOT run locally (and why), and exactly what to fix.
+
+# A real, fixable failure: a step that ran and exited non-zero.
+Failure = namedtuple('Failure', 'job step rc cmd output')
+
+# One executed step's result. outcome ∈ {pass, fail, missing, skip, unknown, dry}.
+# `missing` = exit 127 (the tool isn't on PATH locally): a local-environment gap,
+# NOT a code failure — CI has the tool, so it does not fail the local run.
+StepResult = namedtuple('StepResult', 'ok status rc cmd output outcome')
+
+
+class RunReport:
+    """Cross-workflow accumulator for the agent-facing summary."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.failures = []       # list[Failure] — ran and failed; fix these
+        self.not_validated = []  # list[(job, step, reason)] — CI checks NOT exercised locally
+        self.ran_jobs = []       # jobnames that executed >=1 real step locally
+        self.skipped_jobs = []   # list[(job, reason)] — gated off / no local steps
+
+
+REPORT = RunReport()
+
+
+def _tail(text, n):
+    """Last n non-empty-trimmed lines of text, for compact failure echoes."""
+    lines = text.rstrip('\n').splitlines()
+    return lines[-n:] if len(lines) > n else lines
+
+
+def _first_cmd_line(cmd):
+    """First meaningful line of a (possibly multi-line) run block — a compact
+    reproduce hint. Skips shell-wrapper noise like a lone `(` so a soft-gate
+    step `( tool ./... ) || {...}` shows `tool ./...`, not `(`."""
+    lines = [ln.strip() for ln in cmd.strip().splitlines() if ln.strip()]
+    for s in lines:
+        if s not in ('(', ')', '{', '}'):
+            return s
+    return lines[0] if lines else ''
+
+
+def _clear_failure_marker():
+    """Remove the cross-step soft-gate marker before a job runs.
+
+    go-ci/shell-ci steps append failures to /tmp/_ci_failures and the job's
+    'Check results' step reads it. In CI each job has its own /tmp; locally all
+    jobs share one, so the marker MUST be cleared per-job — otherwise a real
+    failure in one job (e.g. go's fieldalignment) makes a sibling job's Check
+    results (e.g. shell) fail too, a phantom cascade CI never produces."""
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink('/tmp/_ci_failures')
+
+
+# ---------------------------------------------------------------------------
 # Reusable workflow resolution
 # ---------------------------------------------------------------------------
+# Two `uses:` forms call a reusable workflow ci-local must expand:
+#   1. `cplieger/ci/.github/workflows/<X>.yaml@<ref>` — a consumer's thin
+#      ci.yaml calling the meta ci.yaml.
+#   2. `./.github/workflows/<X>.yaml` — a LOCAL ref. The meta ci.yaml dispatches
+#      to the per-surface sub-workflows (go-ci/ts-ci/shell-ci) this way rather
+#      than pinning cplieger/ci@sha, so a sub-workflow fix reaches consumers on
+#      their next meta-ci.yaml bump without a second internal-pin + tag cycle.
+#      GitHub resolves a local ref against the same commit/repo the calling
+#      workflow lives in — and these refs appear ONLY inside cplieger/ci
+#      workflows, so locally they resolve against the sibling `ci/` checkout.
+# BOTH must expand: if the local ./ form is left unresolved, the `go`/`shell`
+# jobs collapse to zero steps and ci-local silently skips the ENTIRE Go and
+# shell suites — including the standalone `fieldalignment ./...` step that
+# golangci-lint's `_test.go` govet exclusion never covers.
 REUSABLE_RE = re.compile(r'^cplieger/ci/\.github/workflows/(.+\.ya?ml)@(.+)$')
+LOCAL_REUSABLE_RE = re.compile(r'^\./(\.github/workflows/.+\.ya?ml)$')
 
 
-def resolve_reusable_workflow(uses_ref, target):
+def is_reusable_ref(uses_ref):
+    """True if `uses_ref` is a reusable-workflow call ci-local can expand
+    (the cplieger/ci@sha form or a local ./ ref)."""
+    return bool(uses_ref) and bool(
+        REUSABLE_RE.match(uses_ref) or LOCAL_REUSABLE_RE.match(uses_ref)
+    )
+
+
+def _ci_repo_root(target):
+    """Locate the sibling cplieger/ci checkout (…/ci) next to the target repo.
+
+    Walks up from target to the nearest git repo root, then takes its `ci`
+    sibling. Both the cplieger/ci@sha form and local ./ refs (which appear only
+    in ci-repo workflows) resolve against this checkout.
+    """
+    repo_root = target
+    while repo_root != repo_root.parent:
+        if (repo_root / '.git').exists():
+            break
+        repo_root = repo_root.parent
+    return repo_root.parent / 'ci'
+
+
+def resolve_reusable_workflow(uses_ref, target, parent_ref=None):
     """Resolve a reusable workflow `uses:` to its parsed YAML content.
 
+    Handles both the `cplieger/ci/.github/workflows/<X>.yaml@<ref>` form and the
+    local `./.github/workflows/<X>.yaml` form (resolved against the sibling ci/
+    checkout, since local refs appear only in ci-repo workflows). `parent_ref`
+    carries the calling workflow's pinned ref so the gh-api fallback can fetch a
+    local ref at the same commit GitHub would.
+
     Lookup order:
-      1. Sibling checkout: <repo-root>/../ci/.github/workflows/<X>.yaml
+      1. Sibling checkout: <repo-root>/../ci/<path>
       2. gh api fetch (timeout-wrapped)
       3. None (caller falls back to autodetect)
 
@@ -176,28 +283,28 @@ def resolve_reusable_workflow(uses_ref, target):
     caveat for consumers whose pinned SHA lags `main`.
     """
     m = REUSABLE_RE.match(uses_ref)
-    if not m:
+    lm = LOCAL_REUSABLE_RE.match(uses_ref)
+    if m:
+        rel_path = f'.github/workflows/{m.group(1)}'
+        ref = m.group(2)
+    elif lm:
+        rel_path = lm.group(1)
+        ref = parent_ref  # local ref: fetch at the calling workflow's commit
+    else:
         return None
-    filename = m.group(1)
-    ref = m.group(2)
 
-    # 1. Sibling checkout (local ci repo)
-    # Walk up from target to find repo root (has .git)
-    repo_root = target
-    while repo_root != repo_root.parent:
-        if (repo_root / '.git').exists():
-            break
-        repo_root = repo_root.parent
-    sibling = repo_root.parent / 'ci' / '.github' / 'workflows' / filename
+    # 1. Sibling checkout (local ci repo).
+    sibling = _ci_repo_root(target) / rel_path
     if sibling.is_file():
         with open(sibling) as f:
             return yaml.safe_load(f)
 
-    # 2. gh api fetch
-    if shutil.which('gh'):
+    # 2. gh api fetch (needs a ref; a local ref with no known parent_ref can't
+    # be fetched, so it falls through to None -> autodetect).
+    if ref and shutil.which('gh'):
         try:
             cmd = (
-                f'timeout 15 gh api "repos/cplieger/ci/contents/.github/workflows/{filename}'
+                f'timeout 15 gh api "repos/cplieger/ci/contents/{rel_path}'
                 f'?ref={ref}" --jq .content | base64 -d'
             )
             proc = subprocess.run(
@@ -607,7 +714,15 @@ def rewrite_markdownlint_gitignore(cmd: str, cwd: Path) -> str:
 
 
 def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
-    """Execute a step. Return (passed: bool, status_label: str)."""
+    """Execute a step. Returns a StepResult.
+
+    Captures combined stdout+stderr so failures can be replayed in the summary.
+    Output is echoed inline only for fail/missing steps (a passing step's output
+    is noise for an agent scanning for problems). A 127 exit (command not on
+    PATH) is classified `missing` — the tool isn't installed locally, which is a
+    local-environment gap rather than a code failure, so it must not fail the run
+    (CI has the tool); the summary lists it under NOT VALIDATED LOCALLY instead.
+    """
     wd = step.get('working-directory')
     cwd = base_cwd / wd if wd else base_cwd
     env = os.environ.copy()
@@ -616,11 +731,10 @@ def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
     apply_runner_env(env, cwd)
 
     if kind == 'SKIP':
-        return True, gray('SKIP')
+        return StepResult(True, gray('SKIP'), 0, '', '', 'skip')
 
     if kind == 'UNKNOWN':
-        print(f'  {red("UNKNOWN")} action — {detail}', file=sys.stderr)
-        return False, red('UNKNOWN')
+        return StepResult(False, red('UNKNOWN'), 0, '', detail, 'unknown')
 
     if kind == 'LOCAL':
         cmd = detail
@@ -630,20 +744,38 @@ def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
         cmd = rewrite_markdownlint_gitignore(cmd, cwd)
 
     if dry_run:
-        return True, blue('DRY')
+        return StepResult(True, blue('DRY'), 0, cmd, '', 'dry')
 
     try:
         proc = subprocess.run(
             ['timeout', '300', 'bash', '-eu', '-o', 'pipefail', '-c', cmd],
             cwd=str(cwd),
             env=env,
+            capture_output=True,
+            text=True,
         )
-        if proc.returncode == 0:
-            return True, green('PASS')
-        return False, red(f'FAIL (rc={proc.returncode})')
     except FileNotFoundError as e:
-        print(f'  {red("ERR")} {e}', file=sys.stderr)
-        return False, red('ERR')
+        return StepResult(False, red('ERR'), 127, cmd, str(e), 'missing')
+
+    output = (proc.stdout or '') + (proc.stderr or '')
+    rc = proc.returncode
+
+    if rc == 0:
+        return StepResult(True, green('PASS'), 0, cmd, output, 'pass')
+
+    # Echo the failing output inline (last 40 lines) so it's visible at the
+    # point of failure, not only in the summary.
+    body = _tail(output, 40)
+    for line in body:
+        print(f'      {line}')
+    if len(output.rstrip('\n').splitlines()) > 40:
+        print(f'      {gray("... (output trimmed; full tail in summary)")}')
+
+    if rc == 127:
+        return StepResult(True, yellow('MISSING (tool not on PATH)'), 127, cmd, output, 'missing')
+    if rc == 124:
+        return StepResult(False, red('FAIL (timed out at 300s)'), 124, cmd, output, 'fail')
+    return StepResult(False, red(f'FAIL (rc={rc})'), rc, cmd, output, 'fail')
 
 
 # ---------------------------------------------------------------------------
@@ -742,18 +874,76 @@ def detect_web_dir(target):
     return None
 
 
+def _has_file_anywhere(target, pattern):
+    """True if any working-tree file matches `pattern` under target (ignoring
+    .git). Non-git fallback for surface detection."""
+    for p in target.rglob(pattern):
+        rel = p.relative_to(target)
+        if rel.parts and rel.parts[0] == '.git':
+            continue
+        return True
+    return False
+
+
+def _has_tracked_file(target, *pathspecs):
+    """True if git tracks any file matching the pathspecs under target.
+
+    CI's detect job runs `find` on a FRESH CHECKOUT — only git-tracked files
+    exist on the runner. Mirror that: a gitignored working-tree file (e.g. a
+    scratch *.py under .code-review/) must NOT flip a surface on, or ci-local
+    would run a job CI skips. Falls back to a working-tree walk when target is
+    not a git repo / git is unavailable."""
+    try:
+        out = subprocess.run(
+            ['git', '-C', str(target), 'ls-files', '-z', '--', *pathspecs],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return bool(out.replace('\x00', '').strip())
+    except (OSError, subprocess.CalledProcessError):
+        for ps in pathspecs:
+            if '/' in ps:
+                if any(target.glob(ps)):
+                    return True
+            elif _has_file_anywhere(target, ps):
+                return True
+        return False
+
+
 def compute_local_detect(target):
     """Reproduce the meta ci.yaml `detect` job's surface outputs from local file
     presence. ci-local always runs the applicable surfaces (it mirrors CI's
-    fail-safe "treat as code change" path; there is no docs-only skip locally)."""
+    fail-safe "treat as code change" path; there is no docs-only skip locally).
+    File globs (*.py / *.sh / workflows) are checked against git-tracked files so
+    a gitignored scratch file can't flip a surface CI's fresh checkout wouldn't
+    see."""
     web = detect_web_dir(target)
     has_dockerfile = (target / 'Dockerfile').is_file()
+    has_gomod = (target / 'go.mod').is_file()
+    has_jsr = (target / 'jsr.json').is_file()
+
+    # Python: any tracked *.py → ruff job, same as the meta ci.yaml find.
+    run_python = _has_tracked_file(target, '*.py')
+
+    # Scripts: pure tooling/docs repos ONLY (no go.mod/jsr.json/Dockerfile —
+    # Go/TS/Docker repos lint shell + workflows via their own jobs). Fires on any
+    # tracked *.sh or workflow file. Mirrors the meta ci.yaml gate exactly so
+    # ci-local doesn't run the scripts job on a Go/Docker repo where CI skips it.
+    run_scripts = False
+    if not has_dockerfile and not has_gomod and not has_jsr:
+        run_scripts = _has_tracked_file(
+            target, '*.sh', '.github/workflows/*.yml', '.github/workflows/*.yaml'
+        )
+
     return {
-        'run_go': 'true' if (target / 'go.mod').is_file() else 'false',
-        'run_ts': 'true' if (target / 'jsr.json').is_file() else 'false',
+        'run_go': 'true' if has_gomod else 'false',
+        'run_ts': 'true' if has_jsr else 'false',
         'run_web': 'true' if web else 'false',
         'run_shell': 'true' if has_dockerfile else 'false',
         'run_docker': 'true' if has_dockerfile else 'false',
+        'run_python': 'true' if run_python else 'false',
+        'run_scripts': 'true' if run_scripts else 'false',
         'web_dir': web or '',
     }
 
@@ -761,18 +951,25 @@ def compute_local_detect(target):
 def job_applies_locally(jobname, target):
     """Gate an expanded (recursed) job by local surface detection, mirroring the
     meta ci.yaml job-level `if: needs.detect.outputs.run_X`. The surface is the
-    meta job component (second path segment, e.g. 'go' in 'ci/go/test')."""
-    parts = jobname.split('/')
-    meta = parts[1] if len(parts) > 1 else parts[0]
+    first path segment matching a known gated surface (go/ts/web/shell/docker/
+    python/scripts); markdown and the detect/validate scaffolding have no gate and
+    always run, like CI. Position-independent so it works whether the meta is
+    reached via a consumer (jobnames like `ci/go/validate`) or run directly on the
+    ci repo, where the meta is the top-level workflow (`go/validate`)."""
     det = compute_local_detect(target)
-    gate = {
+    gate_map = {
         'go': det['run_go'],
         'ts': det['run_ts'],
         'web': det['run_web'],
         'shell': det['run_shell'],
         'docker': det['run_docker'],
-    }.get(meta)
-    return True if gate is None else gate == 'true'
+        'python': det['run_python'],
+        'scripts': det['run_scripts'],
+    }
+    for seg in jobname.split('/'):
+        if seg in gate_map:
+            return gate_map[seg] == 'true'
+    return True  # markdown / detect / validate scaffolding — always runs
 
 
 def _resolve_with_value(value, inputs, target, strip_unknown=False):
@@ -798,14 +995,16 @@ def _resolve_with_value(value, inputs, target, strip_unknown=False):
     return re.sub(r'\$\{\{\s*(.+?)\s*\}\}', repl, value)
 
 
-def _expand_job(jobname, job, caller_inputs, target, depth=0):
+def _expand_job(jobname, job, caller_inputs, target, depth=0, parent_ref=None):
     """Expand one job into terminal (jobname, steps, working_dir, caller_inputs)
     tuples, recursing through nested reusable-workflow callers (consumer ci.yaml
     -> meta ci.yaml -> go-ci/ts-ci/shell-ci/...). `caller_inputs` is None only
-    for a plain inline job that never came from a reusable workflow."""
+    for a plain inline job that never came from a reusable workflow. `parent_ref`
+    is the calling workflow's pinned ref, threaded so a nested local `./` ref can
+    be fetched at the same commit when no sibling ci/ checkout exists."""
     uses = job.get('uses', '')
-    if uses and REUSABLE_RE.match(uses) and depth < 6:
-        resolved = resolve_reusable_workflow(uses, target)
+    if is_reusable_ref(uses) and depth < 6:
+        resolved = resolve_reusable_workflow(uses, target, parent_ref=parent_ref)
         if resolved is None:
             print(
                 f'  {yellow("WARN")} could not resolve reusable workflow: {uses}; '
@@ -813,6 +1012,10 @@ def _expand_job(jobname, job, caller_inputs, target, depth=0):
                 file=sys.stderr,
             )
             return [(jobname, autodetect_steps(target), '.', None)]
+        # A cplieger/ci@<ref> caller sets the ref for its whole subtree; a nested
+        # local ./ ref inherits it (it lives in the same repo at the same commit).
+        m = REUSABLE_RE.match(uses)
+        child_ref = m.group(2) if m else parent_ref
         # Seed inputs with the reusable's declared workflow_call defaults (PyYAML
         # parses a bare `on:` key as boolean True), then let the caller's `with:`
         # override them. This gives steps concrete input values (e.g. the
@@ -829,7 +1032,11 @@ def _expand_job(jobname, job, caller_inputs, target, depth=0):
             merged[k] = _resolve_with_value(v, caller_inputs or {}, target)
         out = []
         for rjob_name, rjob in (resolved.get('jobs') or {}).items():
-            out.extend(_expand_job(f'{jobname}/{rjob_name}', rjob, merged, target, depth + 1))
+            out.extend(
+                _expand_job(
+                    f'{jobname}/{rjob_name}', rjob, merged, target, depth + 1, child_ref
+                )
+            )
         return out
 
     # Terminal: a job with inline steps.
@@ -869,18 +1076,25 @@ def _resolve_input_expr(expr, inputs):
 # ---------------------------------------------------------------------------
 
 
-def process_reusable_steps(steps, target, working_dir, caller_inputs, dry_run, ignore_unknown):
+def process_reusable_steps(
+    jobname, steps, target, working_dir, caller_inputs, dry_run, ignore_unknown
+):
     """Process steps from a resolved reusable workflow.
 
     Runs the profile step first to capture outputs, then evaluates if-conditions.
-    Returns (ok, counters, failed_steps).
+    Returns (ok, counters, failed_steps). `jobname` is used to attribute
+    failures and not-validated notes in the agent-facing summary.
     """
-    counters = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0}
+    counters = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0, 'MISSING': 0}
     failed_steps = []
     overall_ok = True
     step_outputs = {}  # {step_id: {key: value}}
 
     base_cwd = target / working_dir if working_dir != '.' else target
+
+    # Each job gets a fresh soft-gate marker, mirroring CI's per-job /tmp.
+    if not dry_run:
+        _clear_failure_marker()
 
     for step in steps:
         step_id = step.get('id', '')
@@ -954,22 +1168,31 @@ def process_reusable_steps(steps, target, working_dir, caller_inputs, dry_run, i
             continue
         if kind == 'UNKNOWN':
             counters['UNKNOWN'] += 1
+            REPORT.not_validated.append(
+                (jobname, name, f'unrecognized action — not run locally ({detail})')
+            )
             if not ignore_unknown:
                 overall_ok = False
-                failed_steps.append(name)
+                failed_steps.append(Failure(jobname, name, 0, '', detail))
             continue
 
-        ok, status = run_step(kind, name, detail, eff_step, target, dry_run)
-        if dry_run:
+        res = run_step(kind, name, detail, eff_step, target, dry_run)
+        if res.outcome == 'dry':
             counters['DRY'] += 1
-        elif ok:
+            continue
+        print(f'    → {res.status}')
+        if res.outcome == 'pass':
             counters['PASS'] += 1
-            print(f'    → {status}')
-        else:
+        elif res.outcome == 'missing':
+            counters['MISSING'] += 1
+            tool = res.cmd.split()[0] if res.cmd else name
+            REPORT.not_validated.append(
+                (jobname, name, f'`{tool}` not on PATH (exit 127) — CI has it; install to check locally')
+            )
+        else:  # fail
             counters['FAIL'] += 1
             overall_ok = False
-            failed_steps.append(name)
-            print(f'    → {status}')
+            failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
 
     return overall_ok, counters, failed_steps
 
@@ -1204,6 +1427,9 @@ def run_codeql_analysis(target: Path, languages, queries, dry_run, source_root=N
         )
         info['SKIP'] += 1
         info['label'] = 'CodeQL (skipped — binary not installed)'
+        REPORT.not_validated.append(
+            ('codeql', f'analyze ({languages})', 'codeql binary not on PATH — runs in CI')
+        )
         return True, info
 
     if dry_run:
@@ -1403,15 +1629,31 @@ def clean_stale_node_modules(target: Path):
 
 def run_workflow_steps(jobs, target: Path, dry_run: bool, ignore_unknown: bool):
     """Run a non-CodeQL workflow's jobs/steps. Returns (overall_ok, counters, failed)."""
-    counters = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0}
+    counters = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0, 'MISSING': 0}
     failed_steps = []
     overall_ok = True
 
     for jobname, steps in jobs:
+        # Each job gets a fresh soft-gate marker, mirroring CI's per-job /tmp.
+        if not dry_run:
+            _clear_failure_marker()
         print(f'--- job: {jobname} ---')
         for step in steps:
-            kind, name, detail = classify_step(step)
-            wd = step.get('working-directory')
+            # Resolve/strip GitHub expressions in the run body, mirroring the
+            # reusable-step path: bash can't expand `${{ github.event_name }}`
+            # (a "bad substitution" abort under `bash -eu`), so a plain workflow
+            # whose steps reference GHA context — e.g. the meta ci.yaml's detect
+            # step, parsed directly when ci-local runs on the ci repo itself —
+            # would spuriously FAIL. `needs.*.outputs.*` resolves from local
+            # detect; any other expression is stripped, matching CI's substitution.
+            eff_step = step
+            if isinstance(step.get('run'), str) and '${{' in step['run']:
+                eff_step = dict(step)
+                eff_step['run'] = _resolve_with_value(
+                    step['run'], {}, target, strip_unknown=True
+                )
+            kind, name, detail = classify_step(eff_step)
+            wd = eff_step.get('working-directory')
             wd_str = f' [cwd={wd}]' if wd else ''
             tag = {
                 'EXEC': blue('EXEC'),
@@ -1427,22 +1669,31 @@ def run_workflow_steps(jobs, target: Path, dry_run: bool, ignore_unknown: bool):
                 continue
             if kind == 'UNKNOWN':
                 counters['UNKNOWN'] += 1
+                REPORT.not_validated.append(
+                    (jobname, name, f'unrecognized action — not run locally ({detail})')
+                )
                 if not ignore_unknown:
                     overall_ok = False
-                    failed_steps.append(name)
+                    failed_steps.append(Failure(jobname, name, 0, '', detail))
                 continue
 
-            ok, status = run_step(kind, name, detail, step, target, dry_run)
-            if dry_run:
+            res = run_step(kind, name, detail, eff_step, target, dry_run)
+            if res.outcome == 'dry':
                 counters['DRY'] += 1
-            elif ok:
+                continue
+            print(f'    → {res.status}')
+            if res.outcome == 'pass':
                 counters['PASS'] += 1
-                print(f'    → {status}')
-            else:
+            elif res.outcome == 'missing':
+                counters['MISSING'] += 1
+                tool = res.cmd.split()[0] if res.cmd else name
+                REPORT.not_validated.append(
+                    (jobname, name, f'`{tool}` not on PATH (exit 127) — CI has it; install to check locally')
+                )
+            else:  # fail
                 counters['FAIL'] += 1
                 overall_ok = False
-                failed_steps.append(name)
-                print(f'    → {status}')
+                failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
         print()
 
     return overall_ok, counters, failed_steps
@@ -1453,7 +1704,7 @@ def process_workflow_file(wf_path, target, dry_run, ignore_unknown, no_codeql):
 
     Returns (ok, counters, failed_steps).
     """
-    grand_counters = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0}
+    grand_counters = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0, 'MISSING': 0}
     grand_failed = []
     grand_ok = True
 
@@ -1491,7 +1742,7 @@ def process_workflow_file(wf_path, target, dry_run, ignore_unknown, no_codeql):
         return grand_ok, grand_counters, grand_failed
 
     # Check for reusable workflow calls and expand them
-    has_reusable = any(REUSABLE_RE.match(job.get('uses', '')) for job in jobs_dict.values())
+    has_reusable = any(is_reusable_ref(job.get('uses', '')) for job in jobs_dict.values())
 
     if has_reusable:
         expanded = expand_reusable_jobs(jobs_dict, target)
@@ -1499,22 +1750,25 @@ def process_workflow_file(wf_path, target, dry_run, ignore_unknown, no_codeql):
             print(f'--- job: {jobname} ---')
             if not job_applies_locally(jobname, target):
                 print(f'  {gray("SKIP")} (surface not present locally)')
+                REPORT.skipped_jobs.append((jobname, 'surface not present locally'))
                 print()
                 continue
             if not steps:
                 print(f'  {gray("SKIP")} (no steps to run)')
+                REPORT.skipped_jobs.append((jobname, 'no steps to run'))
                 print()
                 continue
             if caller_inputs is not None:
                 # This came from a reusable workflow — use if-evaluation
                 ok, counters, failed = process_reusable_steps(
-                    steps, target, working_dir, caller_inputs, dry_run, ignore_unknown
+                    jobname, steps, target, working_dir, caller_inputs, dry_run, ignore_unknown
                 )
             else:
                 # Autodetect fallback
                 ok, counters, failed = run_workflow_steps(
                     [(jobname, steps)], target, dry_run, ignore_unknown
                 )
+            REPORT.ran_jobs.append(jobname)
             if not ok:
                 grand_ok = False
             for k, v in counters.items():
@@ -1534,12 +1788,83 @@ def process_workflow_file(wf_path, target, dry_run, ignore_unknown, no_codeql):
     return grand_ok, grand_counters, grand_failed
 
 
+def print_run_summary(counters, failures, ok, plan_only):
+    """Print the consolidated, agent-facing end-of-run summary.
+
+    Three sections an agent can act on without scrolling the full log:
+      FAILED               — steps that ran and exited non-zero (what to fix).
+      NOT VALIDATED LOCALLY — CI checks with no local result (codeql, a tool not
+                             on PATH, an unrecognized action): a local PASS does
+                             NOT cover these.
+      skipped              — surfaces absent from this repo (CI skips them too).
+    """
+    print('=== summary ===')
+    parts = [
+        f'{green("passed")} {counters.get("PASS", 0)}',
+        f'{red("failed")} {counters.get("FAIL", 0)}',
+        f'skipped {counters.get("SKIP", 0)}',
+    ]
+    if counters.get('MISSING'):
+        parts.append(f'{yellow("missing-tool")} {counters["MISSING"]}')
+    if counters.get('UNKNOWN'):
+        parts.append(f'unknown {counters["UNKNOWN"]}')
+    if plan_only and counters.get('DRY'):
+        parts.append(f'planned {counters["DRY"]}')
+    print('  ' + '   '.join(parts))
+
+    if failures:
+        print(f'\n{red("FAILED")} (ran and exited non-zero — fix these):')
+        for i, item in enumerate(failures, 1):
+            if isinstance(item, Failure):
+                print(f'  [{i}] {item.job} › {item.step}  (rc={item.rc})')
+                if item.cmd:
+                    cmd_line = _first_cmd_line(item.cmd)
+                    if cmd_line:
+                        print(f'      cmd: {cmd_line}')
+                tail = _tail(item.output, 12)
+                if tail:
+                    print('      out:')
+                    for line in tail:
+                        print(f'        {line}')
+            else:
+                print(f'  [{i}] {item}')
+
+    if REPORT.not_validated:
+        print(f'\n{yellow("NOT VALIDATED LOCALLY")} (CI runs these; no local result):')
+        for job, step, reason in REPORT.not_validated:
+            print(f'  - {job} › {step}: {reason}')
+
+    skipped_surfaces = [j for j, r in REPORT.skipped_jobs if r == 'surface not present locally']
+    if skipped_surfaces:
+        print(f'\n{gray("skipped (surface not present in this repo — CI skips them too):")}')
+        print('  ' + ', '.join(skipped_surfaces))
+
+    print()
+    if plan_only:
+        print(f'{blue("RESULT: plan only")} (no execution)')
+        return
+    if ok:
+        line = green('RESULT: PASS')
+        notes = []
+        if counters.get('MISSING'):
+            notes.append(f'{counters["MISSING"]} tool(s) missing locally')
+        if REPORT.not_validated:
+            notes.append(f'{len(REPORT.not_validated)} check(s) not validated locally')
+        if notes:
+            line += f' — {"; ".join(notes)} (see above)'
+        print(line)
+    else:
+        print(f'{red("RESULT: FAIL")} — {len(failures)} step(s) failed (see FAILED above)')
+
+
 def main():
     # Ensure print() output flushes promptly
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except AttributeError:
         pass
+
+    REPORT.reset()
 
     ap = argparse.ArgumentParser(
         description=__doc__.split('\n\n')[0],
@@ -1672,7 +1997,7 @@ def main():
             if index_path.is_file():
                 atexit.register(_restore_file_bytes, index_path, index_path.read_bytes(), True)
 
-    grand_counters = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0}
+    grand_counters = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0, 'MISSING': 0}
     grand_failed = []
     grand_ok = True
     ran_codeql_workflow = False
@@ -1750,12 +2075,8 @@ def main():
                 print()
 
     # Summary
-    print('=== summary ===')
-    print('  ' + '  '.join(f'{k}={v}' for k, v in grand_counters.items() if v))
-    if grand_failed:
-        print(f'\n{red("failed:")}')
-        for s in grand_failed:
-            print(f'  - {s}')
+    print()
+    print_run_summary(grand_counters, grand_failed, grand_ok, args.plan_only)
 
     sys.exit(0 if grand_ok else 1)
 
