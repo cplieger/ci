@@ -225,7 +225,7 @@ def _clear_failure_marker():
     go-ci/shell-ci steps append failures to _CI_FAILURES_PATH and the job's
     'Check results' step reads it. In CI each job has its own /tmp; locally all
     jobs share one, so the marker MUST be cleared per-job — otherwise a real
-    failure in one job (e.g. go's fieldalignment) makes a sibling job's Check
+    failure in one job (e.g. go's golangci-lint) makes a sibling job's Check
     results (e.g. shell) fail too, a phantom cascade CI never produces."""
     with contextlib.suppress(FileNotFoundError):
         os.unlink(_CI_FAILURES_PATH)
@@ -246,8 +246,8 @@ def _clear_failure_marker():
 #      workflows, so locally they resolve against the sibling `ci/` checkout.
 # BOTH must expand: if the local ./ form is left unresolved, the `go`/`shell`
 # jobs collapse to zero steps and ci-local silently skips the ENTIRE Go and
-# shell suites — including the standalone `fieldalignment ./...` step that
-# golangci-lint's `_test.go` govet exclusion never covers.
+# shell suites — vet, golangci-lint (the `govet: enable-all` fieldalignment
+# authority), race tests, govulncheck, secret scan — with no error to flag it.
 REUSABLE_RE = re.compile(r'^cplieger/ci/\.github/workflows/(.+\.ya?ml)@(.+)$')
 LOCAL_REUSABLE_RE = re.compile(r'^\./(\.github/workflows/.+\.ya?ml)$')
 
