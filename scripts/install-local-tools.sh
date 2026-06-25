@@ -24,7 +24,7 @@
 #     closest local proxy.
 #   - every `go install <pkg>@<ver>` line in go-ci.yaml; the version is pinned in
 #     a shell var (e.g. GOVULNCHECK_VERSION=v1.4.0) which this script resolves:
-#     govulncheck, actionlint, fieldalignment, deadcode, punused
+#     govulncheck, actionlint, deadcode, punused
 #   Versions are always read live from the workflows, never hardcoded here: the
 #   `# renovate: ... depName=X` + `VERSION` pins for most tools; trivy from the
 #   security-scan.yaml TRIVY_VERSION pin; hadolint from its `hadolint/hadolint:

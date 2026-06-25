@@ -15,7 +15,7 @@ duplicate copies.
 
 | Workflow                         | Purpose                                                                                    |
 | -------------------------------- | ------------------------------------------------------------------------------------------ |
-| `.github/workflows/go-ci.yaml`   | Go-library checks: vet, golangci-lint, race tests, govulncheck, fieldalignment, gitleaks   |
+| `.github/workflows/go-ci.yaml`   | Go-library checks: vet, golangci-lint, race tests, govulncheck, gitleaks                   |
 | `.github/workflows/ts-ci.yaml`   | Build-less TS checks: knip, eslint, tsgo typecheck, vitest, prettier (+ optional web-lint) |
 | `.github/workflows/release.yaml` | git-cliff version → (TS) npm + JSR publish → tag + GitHub Release                          |
 

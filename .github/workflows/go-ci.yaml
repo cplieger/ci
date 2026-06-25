@@ -3,8 +3,10 @@ name: Go CI
 # Reusable Go CI. Call from a repo with:
 #   jobs: { ci: { uses: cplieger/ci/.github/workflows/go-ci.yaml@v1 } }
 # Profile is auto-detected: app-mode (deadcode, punused, dependency-review)
-# activates when a `main` package exists; fieldalignment runs on every repo
-# (libraries included); hadolint runs when a Dockerfile is present.
+# activates when a `main` package exists; hadolint runs when a Dockerfile is
+# present. (fieldalignment is enforced by golangci-lint via `govet: enable-all`
+# on non-test code — the synced .golangci.yaml excludes _test.go — not a
+# standalone step.)
 
 on:
   workflow_call:
@@ -81,9 +83,6 @@ jobs:
           # renovate: datasource=go depName=github.com/rhysd/actionlint
           ACTIONLINT_VERSION=v1.7.12
           go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
-          # renovate: datasource=go depName=golang.org/x/tools
-          XTOOLS_VERSION=v0.47.0
-          go install "golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@${XTOOLS_VERSION}"
 
       - name: Install app tools
         if: ${{ steps.profile.outputs.app == 'true' }}
@@ -170,13 +169,6 @@ jobs:
           (
             deadcode -test ./...
           ) || { echo "deadcode" >> /tmp/_ci_failures; exit 1; }
-
-      - name: Field alignment
-        continue-on-error: true
-        run: |
-          (
-            fieldalignment ./...
-          ) || { echo "fieldalignment" >> /tmp/_ci_failures; exit 1; }
 
       - name: Unused exported symbols (punused)
         if: ${{ steps.profile.outputs.app == 'true' }}
