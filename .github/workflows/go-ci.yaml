@@ -82,7 +82,7 @@ jobs:
           ACTIONLINT_VERSION=v1.7.12
           go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
           # renovate: datasource=go depName=golang.org/x/tools
-          XTOOLS_VERSION=v0.46.0
+          XTOOLS_VERSION=v0.47.0
           go install "golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@${XTOOLS_VERSION}"
 
       - name: Install app tools
@@ -90,7 +90,7 @@ jobs:
         run: |
           set -euo pipefail
           # renovate: datasource=go depName=golang.org/x/tools
-          XTOOLS_VERSION=v0.46.0
+          XTOOLS_VERSION=v0.47.0
           go install "golang.org/x/tools/cmd/deadcode@${XTOOLS_VERSION}"
           # renovate: datasource=go depName=github.com/bep/punused
           PUNUSED_VERSION=v0.5.0
