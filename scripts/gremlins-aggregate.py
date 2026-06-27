@@ -128,12 +128,12 @@ def badge_color(efficacy: float) -> str:
     """Shields color for a mutation efficacy (kill rate, 0..100).
 
     Bands are tuned lower than coverage: a healthy suite kills most but rarely
-    all runnable mutants (equivalent mutants form a noise floor), so 70%+ is
-    already strong and 85%+ is excellent.
+    all runnable mutants (equivalent mutants form a noise floor), so 75%+ is
+    strong and 85%+ is excellent.
     """
     if efficacy >= 85:
         return "brightgreen"
-    if efficacy >= 70:
+    if efficacy >= 75:
         return "green"
     if efficacy >= 50:
         return "yellow"
