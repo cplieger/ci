@@ -7,9 +7,14 @@
 #                     from gremlins-Sunday and security-daily so they never
 #                     fight for the 20-slot account budget)
 # Concurrency cap:    6 jobs in parallel (>=4 slots reserved for ad-hoc work)
-# Fuzz budget:        2 minutes per target — accumulates exploration depth
-#                     across weeks since each run starts from the existing
-#                     testdata/fuzz/ corpus. The 2m/target budget is fixed:
+# Fuzz budget:        2 minutes per target. Each run starts ONLY from the
+#                     committed testdata/fuzz/ seed corpus: the runner is
+#                     ephemeral and setup-go runs with cache:false, so the
+#                     coverage-guided corpus Go builds during the run is
+#                     discarded. Exploration does NOT accumulate depth
+#                     run-to-run; the only persistent growth is a failing seed
+#                     a human commits (which becomes a deterministic regression
+#                     in testdata/fuzz/). The 2m/target budget is fixed:
 #                     large repos are SHARDED across runners rather than
 #                     having their per-target time cut.
 # Dynamic sharding:   fanout counts each repo's fuzz targets and computes
