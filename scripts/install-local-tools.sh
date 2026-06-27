@@ -22,6 +22,12 @@
 #     runner image) and a bare `pip install yamllint` (unpinned), so there is
 #     nothing to pin against; the newest release / latest pipx build is the
 #     closest local proxy.
+#   - standalone complexity binaries (no CI pin to read): gocyclo, gocognit,
+#     installed @latest. The `ci / validate` gate runs cyclomatic + cognitive
+#     complexity INSIDE golangci-lint (the gocyclo + gocognit linters); these
+#     standalone binaries are the `-avg` tools the test-review agent and local
+#     measurement use (`gocyclo -avg .`, `gocognit -avg .`), which golangci
+#     does not expose.
 #   - every `go install <pkg>@<ver>` line in go-ci.yaml; the version is pinned in
 #     a shell var (e.g. GOVULNCHECK_VERSION=v1.4.0) which this script resolves:
 #     govulncheck, actionlint, deadcode, punused
@@ -198,6 +204,30 @@ install_go_tools() {
       bad "$name" "go install failed"
     fi
   done < <(grep -oE 'go install [^[:space:]]+@[^[:space:]]+' "$goci" | awk '{print $3}')
+}
+
+# install_complexity_tools: standalone gocyclo + gocognit. These are NOT gate
+# tools; the `ci / validate` gate runs cyclomatic AND cognitive complexity
+# inside golangci-lint (installed above). These binaries are what the
+# test-review agent and local measurement use for the per-package AVERAGE
+# (`gocyclo -avg .`, `gocognit -avg .`), which golangci does not report. No CI
+# pin exists to read (they live in no workflow), so install @latest: the
+# complexity algorithms are stable and these never drive the gate.
+install_complexity_tools() {
+  command -v go >/dev/null 2>&1 || {
+    bad "gocyclo/gocognit" "go not found"
+    return
+  }
+  if go install github.com/fzipp/gocyclo/cmd/gocyclo@latest >/dev/null 2>&1; then
+    ok gocyclo "latest" "go install"
+  else
+    bad gocyclo "go install failed"
+  fi
+  if go install github.com/uudashr/gocognit/cmd/gocognit@latest >/dev/null 2>&1; then
+    ok gocognit "latest" "go install"
+  else
+    bad gocognit "go install failed"
+  fi
 }
 
 install_ruff() {
@@ -444,6 +474,7 @@ main() {
 
   install_golangci_lint
   install_go_tools
+  install_complexity_tools
   install_gitleaks
   install_hadolint
   install_shellcheck
