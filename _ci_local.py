@@ -708,12 +708,6 @@ def rewrite_hadolint_docker(cmd: str) -> str:
 # overwrite that binary simultaneously, which bash rejects with "Text file
 # busy".  If gitleaks is already on PATH (installed via install-local-tools.sh)
 # skip the download entirely and call the local binary directly.
-_GITLEAKS_CURL_RE = re.compile(
-    r'^\s*(#[^\n]*\n\s*)?VERSION=[^\n]+\n\s*'  # optional comment + VERSION=
-    r'curl\s[^\n]+gitleaks[^\n]+\n\s*'          # curl … | tar … gitleaks
-    r'/tmp/gitleaks\b',                          # /tmp/gitleaks invocation
-    re.MULTILINE,
-)
 _GITLEAKS_PATH_RE = re.compile(r'/tmp/gitleaks\b')
 
 
@@ -2032,6 +2026,8 @@ def main():
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except AttributeError:
+        # Python < 3.7 has no TextIOWrapper.reconfigure; prompt flushing is
+        # best-effort, so fall through without it.
         pass
 
     REPORT.reset()
