@@ -106,21 +106,6 @@ jobs:
       - name: Clone target repo
         run: gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
 
-      - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
-        with:
-          go-version-file: target/go.mod
-          cache: false
-
-      - name: Install gremlins
-        run: |
-          # renovate: datasource=github-releases depName=go-gremlins/gremlins
-          VERSION=v0.6.0
-          curl -fsSL --retry 3 \
-            "https://github.com/go-gremlins/gremlins/releases/download/${VERSION}/gremlins_${VERSION#v}_linux_amd64.tar.gz" \
-            | tar -xz -C /tmp gremlins
-          sudo mv /tmp/gremlins /usr/local/bin/
-
       - name: Sync central .gremlins.yaml (authoritative for the weekly run)
         run: |
           # Always overwrite with the central policy so the weekly run uses the
@@ -132,72 +117,90 @@ jobs:
             -o target/.gremlins.yaml
 
       - name: Run gremlins (attempt ${{ matrix.attempt }})
-        working-directory: target
         run: |
           set -uo pipefail
-          # gremlins exits 0 on success regardless of efficacy (threshold=0);
-          # a non-zero exit means an internal error (invalid config, build
-          # failure, …). Surface that as a RED cell instead of swallowing it —
-          # fail-fast is off, so one bad repo doesn't cancel the others, and the
-          # upload step (if: always()) still ships an artifact downstream.
+          # gremlins exits 0 on success regardless of efficacy (threshold=0); a
+          # non-zero exit means an internal error (bad config, build failure, …).
+          # Surface that as a RED cell — fail-fast is off, so one bad repo doesn't
+          # cancel the others, and the upload step (if: always()) still ships an
+          # artifact downstream.
           #
-          # Memory containment via GOMEMLIMIT, not a cgroup. Mutating a loop
-          # bound is gremlins' whole job, so a mutant can turn a bounded loop
-          # into an unbounded allocation. The earlier `systemd-run --scope`
-          # MemoryMax cgroup was broken two ways: (1) when the kernel OOM-kills
-          # a process inside the scope, systemd tears down the ENTIRE scope —
-          # gremlins included — so the whole run is lost (systemd/systemd#25376;
-          # the "OOM-killer reaps only the runaway test, gremlins continues"
-          # assumption was wrong); and (2) gremlins' end-of-run summary +
-          # `--output` JSON write did not survive the scope, so subflux and
-          # docker-age shipped an empty {"files":[]} — THAT was the 0%/no-data,
-          # not an OOM (docker-age is far too small to OOM a 13 GB cap, yet it
-          # reported 0% all the same). Instead, give each test process a
-          # GOMEMLIMIT: a runaway hits Go's soft limit and dies with a clean
-          # "out of memory" fatal that gremlins records as KILLED and keeps
-          # going — the per-mutant memory sandbox that PIT/Stryker/Infection
-          # use. Budget = 80% of MemAvailable. CRITICAL: the per-worker reserve
-          # must cover BOTH the test's Go heap (bounded by GOMEMLIMIT) AND the
-          # `go test` compile+link toolchain, which GOMEMLIMIT does NOT bound.
-          # The earlier formula reserved only 2 GiB/worker (heap only) and let
-          # nproc pick the worker count, so a standard 4-core/16 GB runner ran 4
-          # workers. Four concurrent compile+link+test cycles over a deep
-          # dependency graph (subflux/internal/subsync) peaked >13.5 GiB and the
-          # kernel OOM-killed the runner ("received a shutdown signal", every
-          # subflux shard, nondeterministically at 33/38/81 min). One worker over
-          # the same code peaks at <0.6 GiB, so this is purely a parallelism
-          # overcommit, not a runaway mutant. Fix: reserve heap + toolchain per
-          # worker so the worker count is bounded by real memory, not core count,
-          # and the run auto-scales up on bigger runners.
+          # MEMORY CONTAINMENT VIA A DOCKER CGROUP. Mutation is precisely the act
+          # of turning a bounded size/loop into an unbounded one, so some mutant
+          # WILL allocate without limit (a boundary mutant on a make() size, an
+          # append in a now-infinite loop, …). Measured on subflux: a single
+          # worker hit ~14 GiB on one internal/server mutant. GOMEMLIMIT is a
+          # SOFT heap target and does not stop a single large LIVE allocation, so
+          # it cannot prevent this; worker count is irrelevant (1 worker OOMs
+          # just the same). Run bare on the host, that runaway trips the kernel
+          # OOM-killer on the whole VM, which nondeterministically reaps either
+          # the test (run continues) or the runner agent (job dies, "received a
+          # shutdown signal") — every subflux shard failed this way at 33/38/81
+          # min, at 4 AND at 2 workers.
+          #
+          # Fix: run gremlins INSIDE a container capped at 80% of MemAvailable. A
+          # runaway now busts the CONTAINER cgroup, whose OOM-killer reaps the
+          # biggest task (the runaway test) while gremlins keeps going and
+          # records it (verified: a 1- and 2-worker capped run survive the ~14
+          # GiB mutant and complete). The runner agent lives OUTSIDE the
+          # container, so the worst case is a clean step failure, never a runner
+          # shutdown. Workers are bounded by memory (heap + compile/link
+          # toolchain per worker): 2 on a 16 GB runner — low enough that the
+          # OOM-killer's victim is unambiguous — and auto-scaling on bigger
+          # runners (where the runaway simply fits under the larger cap).
+          # renovate: datasource=github-releases depName=go-gremlins/gremlins
+          GREMLINS_VERSION=v0.6.0
+
+          # Go toolchain image from the target's go.mod (a `toolchain` line wins
+          # over the `go` line); fall back to the minor tag if the patch tag is
+          # missing, then to a sane default.
+          gover=$(grep -oP '^(toolchain go|go )\K[0-9]+\.[0-9]+(\.[0-9]+)?' target/go.mod | tail -1)
+          image="golang:${gover:-1.26}"
+          docker pull "$image" 2>/dev/null || { image="golang:${gover%.*}"; docker pull "$image"; }
+
+          # Memory-aware sizing, computed on the host and passed into the
+          # container. cap_mb is BOTH the container memory ceiling and the budget
+          # the worker count derives from; reserve heap + toolchain per worker.
           avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
           cap_mb=$(( avail_kb * 80 / 100 / 1024 ))
           nproc_n=$(nproc)
-          toolchain_mb=2048   # go compile+link RSS per concurrent worker (not capped by GOMEMLIMIT)
-          heap_min_mb=2048    # GOMEMLIMIT floor; too low makes healthy tests GC-thrash into false timeouts
+          toolchain_mb=2048   # go compile+link RSS per worker (not bounded by GOMEMLIMIT)
+          heap_min_mb=2048    # GOMEMLIMIT floor; lower makes healthy tests GC-thrash into false timeouts
           per_worker_mb=$(( toolchain_mb + heap_min_mb ))
           max_by_mem=$(( cap_mb / per_worker_mb )); [ "$max_by_mem" -lt 1 ] && max_by_mem=1
           workers=$(( nproc_n < max_by_mem ? nproc_n : max_by_mem ))
-          # Heap share = budget minus the toolchain reservation for every
-          # concurrent worker, split across workers (never below the floor). This
-          # keeps workers*(heap+toolchain) <= cap_mb, so even all workers hitting
-          # a runaway at once stays under RAM and the OOM-killer never fires.
           gomem_mb=$(( (cap_mb - workers * toolchain_mb) / workers ))
           [ "$gomem_mb" -lt "$heap_min_mb" ] && gomem_mb=$heap_min_mb
-          echo "gremlins workers=${workers} (nproc=${nproc_n}, mem-cap=${max_by_mem}), GOMEMLIMIT=${gomem_mb}MiB/test, budget=${cap_mb}MiB of ${avail_kb}KiB, toolchain-reserve=${toolchain_mb}MiB/worker"
+          echo "image=${image} workers=${workers} (nproc=${nproc_n}, mem-cap=${max_by_mem})"
+          echo "GOMEMLIMIT=${gomem_mb}MiB container=${cap_mb}MiB (MemAvailable=${avail_kb}KiB)"
+
           rc=0
-          GOMEMLIMIT="${gomem_mb}MiB" gremlins unleash --workers "${workers}" --output /tmp/gremlins-out.json . || rc=$?
+          docker run --rm \
+            --memory="${cap_mb}m" --memory-swap="${cap_mb}m" \
+            -v "${PWD}/target":/work -w /work \
+            -e GOMEMLIMIT="${gomem_mb}MiB" \
+            -e GREMLINS_VERSION="${GREMLINS_VERSION}" \
+            -e WORKERS="${workers}" \
+            "${image}" bash -euo pipefail -c '
+              curl -fsSL --retry 3 \
+                "https://github.com/go-gremlins/gremlins/releases/download/${GREMLINS_VERSION}/gremlins_${GREMLINS_VERSION#v}_linux_amd64.tar.gz" \
+                | tar -xz -C /usr/local/bin gremlins
+              gremlins unleash --workers "${WORKERS}" --output /work/gremlins-out.json .
+            ' || rc=$?
+
+          # Hand the result to the badge/aggregate jobs, which read /tmp.
           if [ "$rc" -ne 0 ]; then
-            # Overwrite any partial output with an error marker so the badge /
-            # aggregate jobs SKIP this attempt (load_run returns None on a file
-            # with no "files" key) rather than publishing a misleading 0%.
+            # Error marker so they SKIP this attempt (load_run returns None on a
+            # file with no "files" key) instead of publishing a misleading 0%.
             echo '{"gremlins_error": true}' > /tmp/gremlins-out.json
             echo "::error::gremlins failed for ${{ matrix.repo }} (attempt ${{ matrix.attempt }}), exit ${rc}"
             exit "$rc"
           fi
-          if [ ! -s /tmp/gremlins-out.json ]; then
-            # Defensive: a clean exit with no file means "no mutants" — a
-            # minimal {"files":[]} parses as a 0-mutant result (load_run fills
-            # the rest with zeros).
+          if [ -s target/gremlins-out.json ]; then
+            sudo cp target/gremlins-out.json /tmp/gremlins-out.json
+          else
+            # Defensive: clean exit, no file => "no mutants"; a minimal
+            # {"files":[]} parses as a 0-mutant result (load_run zero-fills).
             echo '{"files":[]}' > /tmp/gremlins-out.json
           fi
 
