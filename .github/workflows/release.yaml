@@ -20,7 +20,7 @@
 #
 #   subpackage    →  Matrix over `*/jsr.json` subpackages where the subpackage
 #                    dir had non-excluded changes; npm + JSR publish per dir.
-#                    Used by hybrid repos (e.g., vterm: Go module at root +
+#                    Used by hybrid repos (e.g., web-terminal-engine: Go module at root +
 #                    web/ TS subpackage).
 #
 # Path-change detection uses central exclusion patterns (see "Detect changed
@@ -100,7 +100,7 @@ jobs:
           echo "type=$TYPE" >> "$GITHUB_OUTPUT"
 
           # Find first-level subdirectories with jsr.json (subpackages).
-          # Only one repo currently uses this (vterm/web/), but the mechanism
+          # Only one repo currently uses this (web-terminal-engine/web/), but the mechanism
           # is generic — any repo with a Go/Docker root + a TS lib in a subdir
           # gets unified releases via this matrix.
           SUBS="[]"
@@ -166,6 +166,9 @@ jobs:
             # cplieger/ci into every Go repo, like .golangci. Dev-only; never
             # COPY'd/embedded into any artifact.
             '(^|/)\.gremlins\.(yaml|yml)$'
+            # Ruff (Python lint/format) config, synced from cplieger/ci to the
+            # Python repo (.kiro). Dev-only; never shipped.
+            '(^|/)ruff\.toml$'
 
             # Docs and license
             '\.md$'
@@ -235,37 +238,16 @@ jobs:
             '^tests/'
           )
 
-          # Derive additional exclusions from cplieger/ci's sync manifest, in
-          # ADDITION to the manual list above. Every file the sync workflow
-          # pushes into consumer repos (sync.yml `dest:` paths) is a shared
-          # config — editor/lint/CI/changelog tooling — never a build input or
-          # shipped artifact. So a `chore(sync):` PR touching only these must
-          # not flip root_changed and trigger a rebuild/republish. Reading the
-          # manifest here means the NEXT newly-synced tool config (the next
-          # .gremlins.yaml) is excluded automatically, without editing the list
-          # above. Fetched from main: the synced set is monotonic and uniformly
-          # non-shipping, so a newer manifest can only ever exclude MORE shared
-          # configs — it can never cause a missed release. Best-effort: any
-          # fetch/parse failure leaves the manual patterns in force (fail toward
-          # over-building, never toward a silently missed build). Paths are
-          # anchored as literal full-path matches (^path$); a synced config that
-          # doesn't exist in this repo simply never matches.
-          SYNC_URL="https://raw.githubusercontent.com/cplieger/ci/main/.github/sync.yml"
-          if SYNC_YML=$(curl -fsSL --retry 2 --max-time 15 "$SYNC_URL" 2>/dev/null) \
-             && command -v yq >/dev/null 2>&1; then
-            DERIVED=0
-            while IFS= read -r dest; do
-              [ -z "$dest" ] && continue
-              esc=$(printf '%s' "$dest" | sed 's/[].[(){}^$*+?|]/\\&/g')
-              EXCLUDE_PATTERNS+=("^${esc}$")
-              DERIVED=$((DERIVED + 1))
-            done < <(printf '%s' "$SYNC_YML" | yq -o=json '.' 2>/dev/null \
-                       | jq -r '.group[].files[] | if type=="string" then . else .dest end' 2>/dev/null \
-                       | sort -u)
-            echo "::notice::Derived $DERIVED sync-managed exclusion(s) from cplieger/ci sync.yml"
-          else
-            echo "::notice::sync.yml unavailable or yq missing — manual exclusion list only"
-          fi
+          # The array above is the authoritative exclusion list. It already
+          # covers every file cplieger/ci syncs into consumer repos (editor,
+          # lint, CI, and changelog configs), plus tests, generated output, and
+          # lockfiles: shared, non-shipping config that a chore(sync): or
+          # Renovate commit must not turn into a rebuild/republish. When a NEW
+          # synced config type is added, add its path to the array above in the
+          # same change. (Previously auto-derived by fetching cplieger/ci's
+          # sync.yml at runtime; that manifest is no longer committed, the sync
+          # workflow generates it on the fly, so the exclusions are kept
+          # explicit here.)
 
           # Join patterns with | for a single grep -E invocation.
           EXCLUDE_RE=$(IFS='|'; echo "${EXCLUDE_PATTERNS[*]}")

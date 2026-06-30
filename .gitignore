@@ -7,3 +7,8 @@
 # Python bytecode cache (e.g. from running _ci_local.py / scripts locally)
 __pycache__/
 *.pyc
+
+# Runtime-generated sync manifest. classify-repos.sh emits this fresh on every
+# sync.yaml run (and feeds it straight to repo-file-sync-action), so it is never
+# committed; a committed copy only drifts against the live repo set.
+.github/sync.yml

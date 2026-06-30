@@ -17,7 +17,6 @@ on:
       - ".editorconfig"
       - ".gitattributes"
       - "configs/**"
-      - ".github/sync.yml"
       - "scripts/classify-repos.sh"
       - ".github/workflow-templates/**"
   schedule:
@@ -35,6 +34,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      # Regenerate the repo↔file manifest fresh on every run, then hand it
+      # straight to the sync action below via CONFIG_PATH. The file is
+      # gitignored and never committed: it's a build artifact, and a committed
+      # copy only drifts against the live repo set (auto-discovered here via
+      # gh repo list). classify-repos.sh is the source of truth.
       - name: Auto-classify repos
         env:
           GH_TOKEN: ${{ secrets.SYNC_PAT }}
