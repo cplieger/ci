@@ -368,6 +368,48 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Manifest digest: $digest"
 
+      - name: Publish image-size badge
+        # Self-published size badge, mirroring the coverage badge: sum the
+        # linux/amd64 compressed (download) layer sizes of the just-pushed
+        # manifest and publish a shields `endpoint` JSON to the orphan `badges`
+        # branch, alongside coverage.json / mutation.json (publish-badge.sh
+        # preserves siblings). Replaces the retired third-party
+        # ghcr-badge.egpl.dev service (suspended 2026), so the badge has no
+        # external dependency. Ungated on release-needed: the image is
+        # rebuilt+pushed on every significant change, so the size refreshes
+        # whenever it can actually change. Best-effort (continue-on-error) — a
+        # badge hiccup must never fail a release.
+        continue-on-error: true
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ github.token }}
+        run: |
+          # imagetools reads the registry directly (no pull); buildx is already
+          # logged in to GHCR. The repo path is IMAGE_REF minus its @digest.
+          base="${IMAGE_REF%@*}"
+          amd64=$(docker buildx imagetools inspect --raw "$IMAGE_REF" \
+            | jq -r 'first(.manifests[]? | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest) // empty')
+          if [ -z "$amd64" ]; then
+            echo "::warning::no linux/amd64 sub-manifest found; skipping size badge"
+            exit 0
+          fi
+          bytes=$(docker buildx imagetools inspect --raw "${base}@${amd64}" \
+            | jq '[.layers[].size] | add // 0')
+          if [ -z "$bytes" ] || [ "$bytes" = "0" ] || [ "$bytes" = "null" ]; then
+            echo "::warning::could not sum layer sizes; skipping size badge"
+            exit 0
+          fi
+          mb=$(awk "BEGIN { printf \"%.1f\", ${bytes} / 1048576 }")
+          # Single-line JSON (never a heredoc — GHA YAML dedent breaks heredoc
+          # terminators). Neutral blue: a size is informational, not good/bad.
+          json=$(printf '{"schemaVersion":1,"label":"image size","message":"%s MB","color":"blue"}' "$mb")
+          curl -fsSL --retry 3 \
+            "https://raw.githubusercontent.com/cplieger/ci/main/scripts/publish-badge.sh" \
+            -o /tmp/publish-badge.sh
+          bash /tmp/publish-badge.sh "$REPO" "$TOKEN" size.json "$json"
+          echo "published image-size badge: ${mb} MB"
+
       - name: Trivy scan published image
         continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
