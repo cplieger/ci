@@ -93,7 +93,7 @@ vterm).
 ### Docker image (built from Go source in this repo)
 
 ```markdown
-[![Image Size](https://ghcr-badge.egpl.dev/cplieger/REPO/size)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER)
+[![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/size.json)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER)
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO)
 [![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/REPO)](https://goreportcard.com/report/github.com/cplieger/REPO)
@@ -107,7 +107,7 @@ vterm).
 ### Docker image (thin upstream wrapper, no Go source)
 
 ```markdown
-[![Image Size](https://ghcr-badge.egpl.dev/cplieger/REPO/size)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER)
+[![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/size.json)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER)
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
@@ -120,8 +120,12 @@ vterm).
   (`docker-caddy`, `docker-keepalived`, `docker-nut-upsd`, `docker-radvd`,
   `docker-smtp-relay`, `docker-static-web`), which have no statement coverage
   and no mutation run.
-- `CONTAINER` is the GHCR package name (often `REPO`, but some differ, e.g.
-  `fclones`, `nut-upsd`, `smtp-relay`).
+- `CONTAINER` is the GHCR package name. It equals `REPO` for every current
+  image repo (the image is pushed as `ghcr.io/cplieger/REPO`), so the link is
+  `pkgs/container/REPO`. Earlier revisions listed short names (`fclones`,
+  `nut-upsd`, `smtp-relay`) for `docker-fclones-scheduler` / `docker-nut-upsd` /
+  `docker-smtp-relay`, but no such packages exist — those links 404. Use the
+  repo name.
 - `base` is **name-only**: `Alpine` (`0D597F`, `logo=alpinelinux`), `Caddy`
   (`1F88C0`, `logo=caddy`), `Distroless` / `distroless%2Fstatic` (`4285F4` /
   `2496ED`, `logo=google` / `logo=docker`), `scratch` (`2496ED`,
@@ -130,10 +134,12 @@ vterm).
   scratch), encode that in the base label (e.g. `base: Alpine (rootless)`)
   rather than adding a separate badge — distroless `nonroot` variants already
   say it in the name.
-- Image Size uses `ghcr-badge.egpl.dev` (a third-party service; GHCR has no
-  first-party shields support — [badges/shields#5594]). It is the one external
-  dependency in the badge row; self-hostable from `eggplants/ghcr-badge` if
-  that service ever degrades.
+- Image Size reads a self-published `size.json` from the orphan `badges` branch
+  (see "Image size badge wiring" below), so it has **no external dependency**.
+  The previous third-party service (`ghcr-badge.egpl.dev`) was suspended in 2026
+  and broke every size badge at once; GHCR still has no first-party shields
+  support ([badges/shields#5594]), which is why we publish the value ourselves
+  rather than point at another hosted service.
 
 [badges/shields#5594]: https://github.com/badges/shields/issues/5594
 
@@ -178,6 +184,25 @@ weekly-gremlins runs in `cplieger/ci` and pushes cross-repo, so it uses the
 `CI_SCHEDULE` PAT (which already clones consumers and edits their tracker
 issues).
 
+## Image size badge wiring
+
+The **Image Size** badge (image repos only) reads `size.json` from the same
+orphan `badges` branch as coverage/mutation. It is published by the
+`docker-release.yaml` finalize job on every image build, so it refreshes
+whenever the image is actually rebuilt (a source change, a base-image bump, or a
+release) — the same "publish on every build" model as the coverage badge. The
+job sums the compressed (download) layer sizes of the `linux/amd64` sub-manifest
+of the just-pushed image (`docker buildx imagetools inspect --raw`, no pull) and
+publishes `{"label":"image size","message":"<N> MB"}` through
+`scripts/publish-badge.sh` (sibling-preserving, so it coexists with
+`coverage.json` / `mutation.json`) using the consumer's own `GITHUB_TOKEN`
+(finalize already has `contents: write`). amd64 is reported by convention (the
+size a typical consumer pulls); arm64 differs by a few percent. The step is
+`continue-on-error` — a badge hiccup never fails a release. The badge shows
+`invalid` until the first build after this wiring landed publishes the file
+(a one-time backfill seeded the existing repos so they didn't wait for a
+release). No external service and no per-repo secret.
+
 ## OpenSSF Scorecard wiring
 
 The badge reads `api.scorecard.dev`, populated by `ossf/scorecard-action`
@@ -218,9 +243,10 @@ materials.
   add a Renovate `customManager` to bump the badge literal in lockstep with the
   `Dockerfile` `FROM` — do **not** hand-write it.
 - For dual-published images, shields offers first-party Docker Hub badges
-  (`docker/pulls`, `docker/image-size`, `docker/v`). We standardize on the GHCR
-  size badge instead, because GHCR is the primary registry and the same badge
-  works for the GHCR-only repos (`subflux`, `vibecli`, `vibekit`).
+  (`docker/pulls`, `docker/image-size`, `docker/v`). We use the self-published
+  GHCR size badge instead, because GHCR is the primary registry, the same badge
+  works for the GHCR-only repos (`subflux`, `vibecli`, `vibekit`), and a
+  self-published value depends on no third-party service.
 - **License** and **Code of Conduct** badges were considered for Docker Hub
   (which lacks the GitHub chrome that surfaces both) and rejected: they would
   render redundantly on the GitHub copy of the README, and version/license are
