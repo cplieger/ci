@@ -69,7 +69,8 @@ preset (`default.json`) natively:
 ## Canonical configs (synced)
 
 Tools without remote-config support get their config pushed here as PRs by
-`sync.yaml` (see `.github/sync.yml` for the repo↔file mapping):
+`sync.yaml` (the repo↔file mapping is generated at sync time by
+`scripts/classify-repos.sh`, not committed):
 
 | File                                                                           | Consumed by                                              |
 | ------------------------------------------------------------------------------ | -------------------------------------------------------- |

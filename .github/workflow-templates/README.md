@@ -1,6 +1,7 @@
 # Workflow Templates
 
-Canonical thin-caller workflows, synced into consumer repos via `.github/sync.yml`.
+Canonical thin-caller workflows, synced into consumer repos by `sync.yaml` (the
+repo↔file mapping is generated at sync time by `scripts/classify-repos.sh`).
 
 ## Sync-managed (uniform across all releaseable repos)
 

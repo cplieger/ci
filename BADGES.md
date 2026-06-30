@@ -68,7 +68,7 @@ package page as the npm badge, so it fails principle #5 (every badge earns its
 place). Dropped fleet-wide (`actions`, `reactive`). No **Mutation** badge either
 — gremlins is Go-only (there is no Stryker equivalent wired up).
 
-### Hybrid Go + TS library (e.g. vterm)
+### Hybrid Go + TS library (e.g. web-terminal-engine)
 
 ```markdown
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/REPO.svg)](https://pkg.go.dev/github.com/cplieger/REPO)
@@ -88,7 +88,7 @@ _and_ earns a Mutation badge (gremlins runs on its Go surface), so dropping the
 Node-version badge (now gone fleet-wide) gets it to 9, not 8. The single
 Node-version badge is not re-added here. Coverage and the Mutation badge reflect
 whichever surface `coverage.yaml` / gremlins measure on the repo (Go, for
-vterm).
+web-terminal-engine).
 
 ### Docker image (built from Go source in this repo)
 

@@ -177,7 +177,7 @@ for repo in ${repo_names}; do
   fi
 done
 
-# Cross-language Go repos that ALSO have TS surfaces (e.g. vterm: go.mod + web/jsr.json,
+# Cross-language Go repos that ALSO have TS surfaces (e.g. web-terminal-engine: go.mod + web/jsr.json,
 # vibekit/vibecli/subflux: go.mod + static-src/) — also need TS lint configs.
 for repo in ${repo_names}; do
   [[ "${repo}" == "ci" ]] && continue
