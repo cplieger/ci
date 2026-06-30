@@ -89,12 +89,19 @@ jobs:
         continue-on-error: true
         run: |
           (
-            # Note: no-unknown-custom-properties and no-unknown-animations are
-            # disabled in the centralized stylelintrc because they require
-            # cross-file awareness that stylelint doesn't reliably support
-            # (no-unknown-custom-properties is deprecated upstream and even
-            # importFrom doesn't fully work for multi-file CSS projects).
-            npx stylelint "**/*.css" --config .stylelintrc.json
+            # The stylelint config is synced to the repo root (.stylelintrc.json),
+            # but this job runs in the web dir (inputs.working-directory), so
+            # resolve it by absolute path and set --config-basedir to the cwd so
+            # `extends: stylelint-config-standard` resolves from the web dir's
+            # node_modules. --allow-empty-input lets a web dir with no source CSS
+            # (a thin consumer whose styles come from a shared package, e.g.
+            # vibecli) pass instead of erroring on no match. Cross-file rules
+            # (custom properties, animations) resolve via the config's
+            # `referenceFiles` glob.
+            npx stylelint "**/*.css" \
+              --config "${GITHUB_WORKSPACE}/.stylelintrc.json" \
+              --config-basedir . \
+              --allow-empty-input
             find . -name "*.html" -not -path "./node_modules/*" -print0 \
               | xargs -0 --no-run-if-empty npx html-validate
           ) || { echo "web-lint" >> /tmp/_ci_failures; exit 1; }
