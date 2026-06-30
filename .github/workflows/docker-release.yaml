@@ -543,12 +543,20 @@ jobs:
         # Only create a GitHub Release when the caller signaled a version bump.
         # Pure chore/ci/docs pushes still build + push images but reuse the
         # existing tag — gh release create would error otherwise.
+        #
+        # --target pins the tag to $GITHUB_SHA, the commit that triggered this
+        # run (and that the image was built from). Without it, gh creates the
+        # tag at the default branch's current HEAD, so a push landing during the
+        # multi-arch build attaches the release to an unrelated later commit —
+        # the image carries the trigger commit's revision but the git tag points
+        # elsewhere.
         if: ${{ inputs.release-needed == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
         run: |
           gh release create "$VERSION" \
+            --target "$GITHUB_SHA" \
             --title "$VERSION" \
             --notes-file RELEASE_NOTES.md \
             sbom.spdx.json sbom.spdx.json.sigstore.json
