@@ -440,13 +440,17 @@ jobs:
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
           # Install git-cliff (version compute already happened in detect, but
-          # we need the binary here for `git cliff --latest` to render notes).
+          # we need the binary here to render the release notes).
           # renovate: datasource=github-releases depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
           curl -fsSL --retry 3 \
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          git cliff --latest --strip header > NOTES.md
+          # --unreleased --tag renders the commits since the last tag as
+          # $VERSION. The new tag does NOT exist yet (the gh release create
+          # below creates it), so a bare `--latest` would render the PREVIOUS
+          # release's notes instead of this one's.
+          git cliff --unreleased --tag "$VERSION" --strip header > NOTES.md
           # --target pins the tag to the commit that triggered this run, not the
           # branch tip. Without it, gh creates the tag at the default branch's
           # current HEAD, which races a push landing during the run and can
@@ -518,7 +522,11 @@ jobs:
           curl -fsSL --retry 3 \
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          git cliff --latest --strip header > NOTES.md
+          # --unreleased --tag renders the commits since the last tag as
+          # $VERSION. The new tag does NOT exist yet (the gh release create
+          # below creates it), so a bare `--latest` would render the PREVIOUS
+          # release's notes instead of this one's.
+          git cliff --unreleased --tag "$VERSION" --strip header > NOTES.md
           # --target pins the tag to the commit that triggered this run, not the
           # branch tip. Without it, gh creates the tag at the default branch's
           # current HEAD, which races a push landing during the run and can
