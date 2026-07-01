@@ -512,6 +512,8 @@ jobs:
 
       - name: Generate release notes
         if: ${{ inputs.release-needed == 'true' }}
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           # Install git-cliff (only when we're actually creating a release).
           # renovate: datasource=github-releases depName=orhun/git-cliff
@@ -519,7 +521,11 @@ jobs:
           curl -fsSL --retry 3 \
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          git-cliff --latest --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
+          # --unreleased --tag renders the commits since the last tag as
+          # $VERSION. The tag does NOT exist yet (the finalize gh release
+          # create below makes it), so a bare `--latest` would render the
+          # PREVIOUS release's notes instead of this one's.
+          git-cliff --unreleased --tag "$VERSION" --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
 
       - name: Sign SBOM for release assets (keyless)
         # Attach a cosign Sigstore bundle next to the SBOM so the GitHub
