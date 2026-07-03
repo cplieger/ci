@@ -306,7 +306,7 @@ jobs:
   # Config + tooling/docs lint for repos with no go.mod/jsr.json/Dockerfile
   # (Docker/Go/TS repos get shell + workflow lint via their own jobs). This is
   # the surface for IaC / methodology / config repos (cplieger/ci, .github, and
-  # the private homelab + .kiro), so it covers their full bespoke battery:
+  # the private repos), so it covers their full bespoke battery:
   # workflows, shell (lint + format), YAML, TOML, and secret scanning. Soft-gated
   # like shell-ci.yaml: each step records its name to /tmp/_ci_failures on
   # failure and the final step fails the job if any did.
@@ -373,7 +373,7 @@ jobs:
       # yamllint: honour a repo-local config when present (e.g. .kiro's
       # .yamllint.yaml), else fall back to a relaxed default with a 150-char
       # line cap. Non-strict, so line-length etc. surface as warnings (exit 0),
-      # not failures — matching the homelab/.kiro bespoke behaviour.
+      # not failures — matching the private repos' bespoke behaviour.
       - name: Lint YAML (yamllint)
         continue-on-error: true
         run: |

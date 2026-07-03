@@ -4,7 +4,7 @@ name: Audit
 # the GitHub API only exposes to a CLASSIC PAT with the 'repo' scope — a
 # fine-grained PAT does NOT serialize them, even with Administration:read.
 # Set AUDIT_PAT to a classic 'repo'-scope PAT. Without it the audit aborts
-# (exit 2) with a clear diagnostic rather than flagging the whole fleet.
+# (exit 2) with a clear diagnostic rather than flagging every repo.
 
 on:
   schedule:

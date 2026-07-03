@@ -162,7 +162,7 @@ jobs:
             '(^|/)knip\.json$'
             '(^|/)stryker\.config\.json$'
             '(^|/)\.golangci\.(yaml|yml)$'
-            # Gremlins (Go mutation testing) config — synced fleet-wide from
+            # Gremlins (Go mutation testing) config — synced across the repos from
             # cplieger/ci into every Go repo, like .golangci. Dev-only; never
             # COPY'd/embedded into any artifact.
             '(^|/)\.gremlins\.(yaml|yml)$'

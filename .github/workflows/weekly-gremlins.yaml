@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Comma/space-separated repo names to limit the run (for testing a fix). Empty runs the full fleet."
+        description: "Comma/space-separated repo names to limit the run (for testing a fix). Empty runs against all cplieger repos."
         required: false
         default: ""
 
@@ -51,7 +51,7 @@ jobs:
 
           # Optional manual filter: the workflow_dispatch 'only' input limits the
           # matrix to named repos (fast iteration when validating a fix). The
-          # scheduled run leaves it empty and covers the full fleet.
+          # scheduled run leaves it empty and covers all cplieger repos.
           ONLY="${{ github.event.inputs.only }}"
           if [ -n "$ONLY" ]; then
             wanted=" $(echo "$ONLY" | tr ',' ' ') "
@@ -111,7 +111,7 @@ jobs:
           # Always overwrite with the central policy so the weekly run uses the
           # canonical exclude-list regardless of what each consumer has
           # committed. The committed per-repo copies (kept in sync by
-          # sync.yaml, for local `gremlins unleash`) may lag; the fleet run must
+          # sync.yaml, for local `gremlins unleash`) may lag; the shared run must
           # not. "centralization is the point" — see configs/gremlins.yaml.
           curl -fsSL "https://raw.githubusercontent.com/cplieger/ci/main/configs/gremlins.yaml" \
             -o target/.gremlins.yaml
