@@ -1,7 +1,7 @@
 # Contributing to cplieger/ci
 
 This repo is the shared CI/CD source of truth: the reusable workflows, composite
-action, canonical lint configs, and Renovate preset that every other `cplieger`
+action, and canonical lint configs that every other `cplieger`
 repo consumes instead of duplicating. Changes here ripple
 outward, so the conventions below are about not breaking downstream.
 
@@ -34,8 +34,8 @@ outward, so the conventions below are about not breaking downstream.
   `htmlvalidate.json`, `gremlins.yaml`, `ruff.toml`, `cliff-stable.toml`,
   `cliff-alpha.toml`). Root-level `.golangci.yaml`, `cliff.toml`,
   `.editorconfig`, and `.gitattributes` are synced too.
-- `default.json` — the Renovate preset (extended via
-  `{ "extends": ["github>cplieger/ci"] }`).
+- The Renovate preset is **not** in this repo; it lives in `cplieger/.github`
+  (`default.json`) and is extended via `{ "extends": ["github>cplieger/.github"] }`.
 - `ci-local.sh` / `_ci_local.py` — the local mirror of the CI battery.
 - `scripts/` — `audit.py` (cross-repo compliance), `classify-repos.sh` (sync
   map generator), `gremlins-aggregate.py`.
@@ -53,7 +53,8 @@ travels:
   bump.
 - **Lint/format configs** have no remote-config mechanism, so `sync.yaml` pushes
   them into each consumer as a PR (and enables auto-merge once that repo's CI is
-  green). It needs the `SYNC_PAT` secret. `sync.yaml` first regenerates
+  green). It needs the `SYNC_PAT` secret (fine-grained PAT, Contents:write +
+  Pull-requests:write on the targets). `sync.yaml` first regenerates
   `.github/sync.yml` by running `classify-repos.sh` (the file is gitignored,
   never committed), then runs the file-sync action.
 - **The Renovate preset** (`default.json`) is fetched natively by Renovate from
@@ -127,6 +128,23 @@ or the sync PR auto-merges (configs). Treat the reusable workflow inputs and the
   `continue-on-error: true`, append failures to `/tmp/_ci_failures`, and fail in
   a final `Check results` step. Keep that pattern when adding a step so one
   failure doesn't mask the rest.
+
+## Cross-repo audit
+
+`scripts/audit.py` lists every public `cplieger` repo and checks shared-standard
+compliance (license, default branch, CI wired to `cplieger/ci`, Renovate preset
+`github>cplieger/.github`; description + topics as warnings). Repos that have
+adopted the standard must pass the hard checks; legacy repos are reported for
+visibility only.
+
+```bash
+gh auth login        # once
+python3 scripts/audit.py
+```
+
+`.github/workflows/audit.yaml` runs it weekly (and on demand) and writes the
+table to the run summary. It uses the job token for public repos; add an
+`AUDIT_PAT` secret to extend coverage to private repos.
 
 ## Commits and PRs
 
