@@ -1,14 +1,14 @@
 name: Trigger Renovate
 
-# Fires the Komodo "Trigger Renovate" procedure by asking GitHub to REDELIVER
-# this repo's GitHub->Komodo push webhook through GitHub's own delivery
+# Fires the downstream orchestrator's "Trigger Renovate" procedure by asking
+# GitHub to REDELIVER this repo's push webhook through GitHub's own delivery
 # infrastructure (Hookshot).
 #
-# Why not curl the Komodo endpoint from the runner? Cloudflare blocks
-# Actions-runner egress to komodo.cplieger.com (observed: HTTP 403 on every
+# Why not curl the orchestrator endpoint from the runner? Cloudflare blocks
+# Actions-runner egress to that endpoint (observed: HTTP 403 on every
 # attempt) while allowing GitHub Hookshot source ranges. The previous curl
-# implementation therefore never reached Komodo. This mirrors how build
-# releases reach Komodo: `gh release create` fires the native `release`
+# implementation therefore never reached the orchestrator. This mirrors how
+# build releases reach the orchestrator: `gh release create` fires the native `release`
 # webhook, delivered by Hookshot, authenticated by the secret configured on
 # the GitHub webhook itself. We reuse the same model — the webhook secret
 # stays on the GitHub webhook config (GitHub signs + delivers); this workflow
@@ -20,8 +20,8 @@ name: Trigger Renovate
 #     `gh workflow run trigger-renovate.yaml -R cplieger/ci -f reason=...`
 #     after a successful main-branch image push (see docker-release.yaml).
 #
-# Komodo procedure on the receiving end runs StartStack borgcube-renovate
-# (the one-shot Renovate container) which scans cplieger/* and opens
+# The orchestrator's procedure on the receiving end starts the one-shot
+# Renovate container/stack, which scans cplieger/* and opens
 # digest-bump PRs against the consumer repos.
 #
 # Token: GH_TOKEN below is RENOVATE_HOOK_PAT, a fine-grained PAT scoped to
@@ -29,7 +29,7 @@ name: Trigger Renovate
 # deliveries, and redeliver endpoints all require Webhooks access. The default
 # GITHUB_TOKEN cannot be granted this scope, so a dedicated PAT secret is
 # mandatory. Kept separate from CI_SCHEDULE so webhook-admin is confined to one
-# repo rather than the whole fleet that CI_SCHEDULE can reach.
+# repo rather than all the repos that CI_SCHEDULE can reach.
 
 on:
   workflow_dispatch:
@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Redeliver Komodo push webhook (GitHub-native, via Hookshot)
+      - name: Redeliver push webhook (GitHub-native, via Hookshot)
         env:
           GH_TOKEN: ${{ secrets.RENOVATE_HOOK_PAT }}
           REPO: ${{ github.repository }}
@@ -71,13 +71,13 @@ jobs:
             exit 1
           fi
 
-          # Locate the active push webhook that targets the Komodo procedure
-          # listener. There is exactly one today, but match by URL so a future
+          # Locate the active push webhook that targets the orchestrator's
+          # procedure listener. There is exactly one today, but match by URL so a future
           # extra webhook can't be picked by accident.
           hook_id=$(gh api "repos/${REPO}/hooks" --jq \
             '[.[] | select(.active and (.events | index("push")) and (.config.url | test("/listener/github/procedure/")))][0].id // empty')
           if [ -z "${hook_id}" ]; then
-            echo "::error::No active Komodo push webhook found on ${REPO}."
+            echo "::error::No active push webhook found on ${REPO}."
             exit 1
           fi
           echo "hook_id=${hook_id}"

@@ -4,7 +4,7 @@
 #
 # Usage:
 #   bash ci-local.sh                  # run from repo root
-#   bash ci-local.sh --path apps/age  # restrict to a subdirectory (homelab)
+#   bash ci-local.sh --path apps/age  # restrict to a subdirectory (a private repo)
 #   bash ci-local.sh --plan-only      # show plan, no execution
 #   bash ci-local.sh --workflow PATH  # use a different workflow file
 #   bash ci-local.sh --ignore-unknown # don't fail on unrecognized actions

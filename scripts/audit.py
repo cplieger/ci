@@ -12,7 +12,7 @@ Checks cover merge model, repo features, branch protection, rulesets
 secret/code scanning, CI wiring, Renovate preset, license, default branch,
 description (presence + <=100 chars), and topics.
 
-Branch protection is the documented fleet standard (classic protection); any
+Branch protection is the documented standard (classic protection); any
 custom repository ruleset is treated as drift, and an Integration bypass actor
 on any ruleset is a HARD failure (it is the stale-decommissioned-app rot class
 — e.g. a former hosted-Renovate GitHub App left able to bypass protection).
@@ -27,7 +27,7 @@ under-scoped — in both cases the audit aborts (exit 2) rather than emit false
 negatives.
 
 Run:
-  scripts/audit.py                  # full fleet (public + private)
+  scripts/audit.py                  # all repos (public + private)
   scripts/audit.py --visibility public
   scripts/audit.py --dump out.json  # also write raw collected settings as JSON
 """
@@ -108,7 +108,7 @@ def collect(meta):
     # token with the classic `repo` scope. A fine-grained PAT — even one with
     # Administration:read and an admin role (permissions.admin=true) — does NOT
     # expose them, so they come back absent (-> None) and the audit would
-    # report the whole fleet as non-compliant. Key the guard off actual field
+    # report all repos as non-compliant. Key the guard off actual field
     # presence, NOT permissions.admin, so a fine-grained token is correctly
     # detected as under-scoped rather than trusted.
     s["admin_visible"] = "allow_merge_commit" in repo
@@ -147,7 +147,7 @@ def collect(meta):
         s["required_checks"] = []
         s["strict"] = s["enforce_admins"] = s["allow_force_pushes"] = s["allow_deletions"] = None
 
-    # Repository rulesets. The fleet standard is classic branch protection, so
+    # Repository rulesets. The standard is classic branch protection, so
     # any non-managed ruleset is drift. The bypass-actor list is the precise
     # surface that classic-protection checks miss: a decommissioned GitHub App
     # (e.g. the former hosted-Renovate app) can linger as an Integration bypass
@@ -200,7 +200,7 @@ def compliance(s):
         hard.append("no branch protection on default branch")
     else:
         # App repos surface 'ci / validate' (the cplieger/ci meta job); repos
-        # with a local CI (homelab, .kiro) surface a bare 'validate'. Accept either.
+        # with a local CI surface a bare 'validate'. Accept either.
         if not any("validate" in (c or "") for c in (s["required_checks"] or [])):
             hard.append(f"required checks={s['required_checks']} (want a 'validate' check)")
         if s["strict"]:
@@ -269,7 +269,7 @@ def compliance(s):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="cplieger fleet governance audit")
+    ap = argparse.ArgumentParser(description="cplieger governance audit")
     ap.add_argument("--visibility", choices=["all", "public", "private"], default="all")
     ap.add_argument("--dump", metavar="PATH", help="write raw collected settings as JSON")
     args = ap.parse_args()
@@ -291,7 +291,7 @@ def main():
             json.dump(settings, fh, indent=2, sort_keys=True)
 
     # Permission guard: the merge-model, branch-protection, and security checks
-    # need a token with admin read across the fleet. If NO repo returned
+    # need a token with admin read across the cplieger repos. If NO repo returned
     # admin-scoped fields, the token is under-scoped (e.g. the default
     # GITHUB_TOKEN instead of AUDIT_PAT) — abort rather than flag every repo as
     # non-compliant, which would be a false-negative storm masking real drift.

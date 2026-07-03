@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       repos:
-        description: "Comma-separated repo names (owner cplieger), or 'all' for the docker-image fleet."
+        description: "Comma-separated repo names (owner cplieger), or 'all' for the docker-image repos."
         required: false
         default: "all"
       limit:
@@ -39,7 +39,7 @@ concurrency:
 
 env:
   COSIGN_VERSION: v3.0.6
-  # The docker-image fleet (repos that publish via docker-release.yaml).
+  # The docker-image repos that publish via docker-release.yaml.
   FLEET: >-
     docker-age docker-caddy docker-keepalived docker-nut-upsd docker-radvd
     docker-smtp-relay docker-static-web docker-fclones-scheduler

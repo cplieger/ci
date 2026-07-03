@@ -1,6 +1,6 @@
 # Weekly fuzz exploration across all Go-having cplieger consumer repos.
 # Pattern C: matrix + max-parallel cap owned here, not via cross-repo
-# workflow_dispatch. One place to manage the fleet-wide fuzz schedule and
+# workflow_dispatch. One place to manage the shared fuzz schedule and
 # the issue-creation/auto-close logic for findings.
 #
 # Schedule:           Wednesdays 22:00 UTC (mid-week off-peak; different day

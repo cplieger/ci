@@ -1,15 +1,15 @@
 # Dedicated git-cliff config for THIS repo's self-release workflow
 # (.github/workflows/self-release.yaml). It is NOT synced to consumers — the
-# fleet config is configs/cliff-stable.toml (synced as cliff.toml). Kept
-# separate so ci's self-versioning policy can diverge from the fleet without
+# shared config is configs/cliff-stable.toml (synced as cliff.toml). Kept
+# separate so ci's self-versioning policy can diverge from the other cplieger repos without
 # touching the shared config, and so editing it never triggers sync.yaml (which
 # watches cliff.toml / configs/** — this path matches neither).
 #
-# Two deliberate differences from the fleet (cliff-stable.toml) config:
+# Two deliberate differences from the shared (cliff-stable.toml) config:
 #
 #   1. tag_pattern matches FULL semver only (vX.Y.Z). move-major-tag.yaml keeps
 #      the moving major/minor tags (v2, v2.Y) co-located on the SAME commit as
-#      the release tag. The fleet pattern "v[0-9].*" matches all three, making
+#      the release tag. The shared config's pattern "v[0-9].*" matches all three, making
 #      the version base ambiguous in this repo specifically. Restricting to full
 #      semver makes git-cliff bump unambiguously from the real release tag.
 #
@@ -18,7 +18,7 @@
 #      does NOT auto-propagate to consumers pinned at v2 (Renovate follows the v2
 #      digest, not v3) — exactly the gate we want for breaking changes.
 #
-# Commit-type -> bump is identical to the fleet config otherwise. Note the
+# Commit-type -> bump is identical to the shared config otherwise. Note the
 # self-release workflow treats the PATH GATE (not the commit type) as
 # authoritative for whether to release, and force-patches when cliff declines a
 # skip-typed-but-propagatable change, so this config only governs the bump LEVEL.
@@ -26,7 +26,7 @@
 features_always_bump_minor = true
 breaking_always_bump_major = true
 # Only relevant in the (dead today) bootstrap case where no vX.Y.Z tag exists;
-# matches the fleet config so a from-scratch run wouldn't drop to v0.x.
+# matches the shared config so a from-scratch run wouldn't drop to v0.x.
 initial_tag = "v1.0.0"
 
 [changelog]

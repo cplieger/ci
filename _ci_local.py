@@ -214,7 +214,7 @@ _CI_FAILURES_PATH = f'/tmp/_ci_failures_{os.getpid()}'
 
 # Per-step wall-clock cap (seconds). CI's own job timeout is 15-20 min; this is
 # a local guard against a genuinely hung step. Sized to clear the slowest real
-# step in the fleet — wiregen's `go test -race ./...` runs ~317s standalone, so
+# step across the cplieger repos — wiregen's `go test -race ./...` runs ~317s standalone, so
 # 300s produced a false timeout. 600s covers it with margin under light load.
 _STEP_TIMEOUT_SECS = 600
 
@@ -776,7 +776,7 @@ def rewrite_ci_failures_path(cmd: str) -> str:
 # ---------------------------------------------------------------------------
 # CI runs `trivy fs` against a fresh checkout — only git-tracked files exist.
 # Locally the working tree carries gitignored files trivy will happily scan:
-# decrypted secrets (homelab's *.env.dec), .code-review/ artifacts, node_modules.
+# decrypted secrets (a private repo's *.env.dec), .code-review/ artifacts, node_modules.
 # Trivy's secret scanner then flags e.g. apps/<app>/.env.dec (a deliberately
 # decrypted, gitignored secret) and the run fails with a finding CI never sees.
 # Mirror CI by injecting --skip-files / --skip-dirs for everything git ignores

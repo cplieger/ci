@@ -17,7 +17,7 @@
 # composite actions consumers reference by SHA. Channel 1 files (templates,
 # configs, .golangci.yaml, cliff.toml, …) reach consumers independently via
 # sync.yaml and must NOT cut a tag (doing so would fan out ~27 no-op Renovate
-# digest PRs across the fleet, burning CI credits for nothing).
+# digest PRs across the cplieger repos, burning CI credits for nothing).
 #
 # So we cut a tag only when a PROPAGATABLE file changed since the last release
 # tag — i.e. a consumed reusable workflow or a composite action. The PATH GATE
@@ -169,7 +169,7 @@ jobs:
             # git-cliff-version composite action. That last one edits a Channel-2
             # file yet changes no behaviour; cutting a tag for it advances vN,
             # which makes Renovate bump the self-pin again, an unbounded
-            # tag -> sync -> digest loop across every consumer (~99% of all fleet
+            # tag -> sync -> digest loop across every consumer (~99% of all cplieger-repo
             # CI runs were this churn). So a propagatable file counts as changed
             # ONLY if it differs beyond its cplieger/ci self-pin digest: compare
             # the file at the last tag against HEAD with those SHAs normalised to

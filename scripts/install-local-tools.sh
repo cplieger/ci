@@ -417,7 +417,7 @@ install_shellcheck() {
 }
 
 # install_shfmt: the shell formatter run by the meta CI scripts job and the
-# homelab/.kiro bespoke CI. Pinned via `# renovate: ... depName=mvdan/sh` +
+# the private repos' bespoke CI. Pinned via `# renovate: ... depName=mvdan/sh` +
 # VERSION in the workflows; install the matching single-file release binary.
 install_shfmt() {
   local want cur arch
@@ -449,7 +449,7 @@ install_shfmt() {
 }
 
 # install_yamllint: the YAML linter run by the meta CI scripts job and the
-# homelab/.kiro bespoke CI. CI installs it unpinned (`pip install yamllint`), so
+# the private repos' bespoke CI. CI installs it unpinned (`pip install yamllint`), so
 # there is no version to read — best-effort, same rationale as shellcheck. Skip
 # when already present (presence is enough absent a pin).
 install_yamllint() {
