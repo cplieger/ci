@@ -268,7 +268,7 @@ jobs:
       - name: Install markdownlint-cli2
         run: |
           # renovate: datasource=npm depName=markdownlint-cli2
-          VERSION=0.22.1
+          VERSION=0.23.0
           npm install -g "markdownlint-cli2@${VERSION}"
 
       - name: Write markdownlint config
