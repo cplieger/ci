@@ -99,7 +99,15 @@ jobs:
             for pr in $(gh pr list --repo "cplieger/${repo}" --head repo-sync/ci/default \
                 --state open --json number -q '.[].number'); do
               echo "Enabling auto-merge on cplieger/${repo}#${pr}"
-              gh pr merge --auto --squash --delete-branch "cplieger/${repo}#${pr}" || \
-                echo "  WARN: failed to enable auto-merge on cplieger/${repo}#${pr}"
+              # gh pr merge needs --repo plus a bare PR number: it does NOT
+              # accept the OWNER/REPO#NUMBER shorthand (it reads that as a
+              # branch name and fails "no pull requests found for branch"),
+              # which silently left every sync PR without auto-merge. Fall
+              # back to a direct squash-merge when auto-merge can't be enabled
+              # because the PR is already mergeable (GitHub refuses --auto on a
+              # PR that is already in a clean, merge-ready state).
+              gh pr merge --auto --squash --delete-branch --repo "cplieger/${repo}" "${pr}" || \
+                gh pr merge --squash --delete-branch --repo "cplieger/${repo}" "${pr}" || \
+                echo "  WARN: failed to merge cplieger/${repo}#${pr}"
             done
           done
