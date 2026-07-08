@@ -95,7 +95,7 @@ jobs:
             # `extends: stylelint-config-standard` resolves from the web dir's
             # node_modules. --allow-empty-input lets a web dir with no source CSS
             # (a thin consumer whose styles come from a shared package, e.g.
-            # vibecli) pass instead of erroring on no match. Cross-file rules
+            # web-terminal-kiro) pass instead of erroring on no match. Cross-file rules
             # (custom properties, animations) resolve via the config's
             # `referenceFiles` glob.
             npx stylelint "**/*.css" \

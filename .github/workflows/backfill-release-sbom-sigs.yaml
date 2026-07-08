@@ -45,7 +45,7 @@ env:
     docker-smtp-relay docker-static-web docker-fclones-scheduler
     docker-rsync-scheduler docker-renovate-scheduler cert-converter
     plex-language-sync plex-exporter tautulli-remap registry-stats subflux
-    vibekit vibecli pg-autodump
+    vibekit web-terminal-kiro pg-autodump
 
 jobs:
   backfill:
