@@ -7,9 +7,12 @@ on:
   workflow_call:
     inputs:
       shellcheck-paths:
-        description: Paths to pass to shellcheck.
+        description: >-
+          Shell files to lint. "auto" (default) discovers every *.sh in the repo
+          (nested included) via find, matching the ci.yaml `scripts` job. Pass an
+          explicit glob to override, or "/dev/null" to skip shellcheck.
         type: string
-        default: "./*.sh"
+        default: "auto"
       hadolint-ignores:
         description: Comma-separated hadolint rules to ignore (each passed as --ignore).
         type: string
@@ -25,7 +28,7 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -38,6 +41,14 @@ jobs:
           curl -fsSL "https://github.com/rhysd/actionlint/releases/download/${VERSION}/actionlint_${VERSION#v}_linux_amd64.tar.gz" \
             | tar -xzf - -C /tmp actionlint
           sudo mv /tmp/actionlint /usr/local/bin/actionlint
+
+      - name: Install shfmt
+        run: |
+          # renovate: datasource=github-releases depName=mvdan/sh
+          VERSION=v3.13.1
+          sudo curl -fsSL -o /usr/local/bin/shfmt \
+            "https://github.com/mvdan/sh/releases/download/${VERSION}/shfmt_${VERSION}_linux_amd64"
+          sudo chmod +x /usr/local/bin/shfmt
 
       # Soft-gate block: each step below runs to completion (continue-on-error)
       # and records its own name to /tmp/_ci_failures on failure; the final
@@ -58,9 +69,19 @@ jobs:
           (
             if [ "${{ inputs.shellcheck-paths }}" = "/dev/null" ]; then
               echo "shellcheck: skipped (no shell scripts)"
+            elif [ "${{ inputs.shellcheck-paths }}" = "auto" ]; then
+              # Discover every *.sh in the repo (nested included), matching the
+              # ci.yaml `scripts` job. -x follows `source`d files.
+              files=$(find . -name '*.sh' -not -path './.git/*')
+              if [ -z "$files" ]; then
+                echo "shellcheck: no *.sh found — skipping"
+              else
+                # shellcheck disable=SC2086
+                shellcheck -x -S info $files
+              fi
             else
-              # Expand the glob safely; if it matches no real files, skip
-              # (avoids 'openBinaryFile: does not exist' on the literal pattern).
+              # Explicit override glob. Expand safely; if it matches no real
+              # files, skip (avoids 'openBinaryFile: does not exist').
               shopt -s nullglob
               files=( ${{ inputs.shellcheck-paths }} )
               shopt -u nullglob
@@ -71,6 +92,22 @@ jobs:
               fi
             fi
           ) || { echo "Lint shell scripts" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Format check shell scripts (shfmt)
+        continue-on-error: true
+        run: |
+          (
+            # Every *.sh (nested included), matching the ci.yaml `scripts` job.
+            # Flags per shell.md: 2-space indent, indent switch cases, binary
+            # ops may start a line. NOT -sr (the gate does not enforce it).
+            files=$(find . -name '*.sh' -not -path './.git/*')
+            if [ -z "$files" ]; then
+              echo "shfmt: no *.sh found — skipping"
+            else
+              # shellcheck disable=SC2086
+              shfmt -d -i 2 -ci -bn $files
+            fi
+          ) || { echo "Format check shell scripts (shfmt)" >> /tmp/_ci_failures; exit 1; }
 
       - name: Validate Dockerfile
         continue-on-error: true

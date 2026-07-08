@@ -13,7 +13,7 @@ Modes:
     Restrict validation to a subdirectory of the current repo. If the
     subdir contains its own `.github/workflows/ci.yaml` (or validate.yaml
     legacy), that workflow runs; otherwise falls back to autodetect mode (Go suite +
-    hadolint + shellcheck + gitleaks based on what's in SUBDIR).
+    hadolint + shellcheck + shfmt + gitleaks based on what's in SUBDIR).
 
   --plan-only:
     Print the plan without executing anything.
@@ -933,14 +933,20 @@ def autodetect_steps(target: Path):
     """Build a synthetic step list when no workflow is available.
 
     Mirrors the common patterns across the user's repos: Go suite if go.mod
-    is present, hadolint if Dockerfile present, shellcheck for any *.sh,
-    gitleaks always.
+    is present, hadolint if Dockerfile present, shellcheck + shfmt for any
+    *.sh (nested included), gitleaks always.
     """
     steps = []
 
     has_gomod = (target / 'go.mod').is_file()
     has_dockerfile = (target / 'Dockerfile').is_file()
-    sh_files = sorted(p.name for p in target.glob('*.sh'))
+    # Every *.sh in the tree (nested included), matching shell-ci.yaml and the
+    # meta ci.yaml `scripts` job — not just root-level scripts.
+    sh_files = [
+        p
+        for p in target.rglob('*.sh')
+        if not any(part in ('.git', 'node_modules') for part in p.relative_to(target).parts)
+    ]
 
     if has_gomod:
         steps.extend(
@@ -961,11 +967,30 @@ def autodetect_steps(target: Path):
         )
 
     if sh_files:
-        files_arg = ' '.join(sh_files)
+        # find-based discovery + flags identical to shell-ci.yaml: shellcheck
+        # (-x -S info) and shfmt (2-space, indent switch cases, binary-next-line).
         steps.append(
             {
-                'name': 'Lint shell scripts',
-                'run': f'shellcheck -x -S info {files_arg}',
+                'name': 'Lint shell scripts (shellcheck)',
+                'run': (
+                    "files=$(find . -name '*.sh' -not -path './.git/*')\n"
+                    'if [ -n "$files" ]; then\n'
+                    '  # shellcheck disable=SC2086\n'
+                    '  shellcheck -x -S info $files\n'
+                    'fi'
+                ),
+            }
+        )
+        steps.append(
+            {
+                'name': 'Format check shell scripts (shfmt)',
+                'run': (
+                    "files=$(find . -name '*.sh' -not -path './.git/*')\n"
+                    'if [ -n "$files" ]; then\n'
+                    '  # shellcheck disable=SC2086\n'
+                    '  shfmt -d -i 2 -ci -bn $files\n'
+                    'fi'
+                ),
             }
         )
 
