@@ -143,7 +143,10 @@ install_gitleaks() {
 # the workflow's `<NAME>=<value>` assignments, then for each go-install spec strip
 # the quotes the YAML left on the token and resolve the `${VAR}` version reference
 # against that map. A bare literal version (`@v1.2.3` / `@latest`) passes through
-# unchanged, so the un-pinned form still works.
+# unchanged, so the un-pinned form still works. Each `go install` runs under
+# GOTOOLCHAIN=auto so a tool whose module requires a newer Go than the local base
+# toolchain still builds (auto fetches the needed toolchain on demand) — matching
+# CI, where setup-go installs the go.mod version and GOTOOLCHAIN is unset (auto).
 install_go_tools() {
   local goci="$WF_DIR/go-ci.yaml" spec name ver verpart varname line trimmed k v
   [ -f "$goci" ] || {
@@ -198,7 +201,7 @@ install_go_tools() {
     fi
     name="${spec##*/}" # last path segment, e.g. govulncheck@v1.4.0
     name="${name%@*}"  # drop @version
-    if go install "$spec" >/dev/null 2>&1; then
+    if GOTOOLCHAIN=auto go install "$spec" >/dev/null 2>&1; then
       ok "$name" "${spec##*@}" "go install"
     else
       bad "$name" "go install failed"
@@ -218,12 +221,13 @@ install_complexity_tools() {
     bad "gocyclo/gocognit" "go not found"
     return
   }
-  if go install github.com/fzipp/gocyclo/cmd/gocyclo@latest >/dev/null 2>&1; then
+  # GOTOOLCHAIN=auto: build even when the base Go lags the tool's go.mod (see install_go_tools).
+  if GOTOOLCHAIN=auto go install github.com/fzipp/gocyclo/cmd/gocyclo@latest >/dev/null 2>&1; then
     ok gocyclo "latest" "go install"
   else
     bad gocyclo "go install failed"
   fi
-  if go install github.com/uudashr/gocognit/cmd/gocognit@latest >/dev/null 2>&1; then
+  if GOTOOLCHAIN=auto go install github.com/uudashr/gocognit/cmd/gocognit@latest >/dev/null 2>&1; then
     ok gocognit "latest" "go install"
   else
     bad gocognit "go install failed"
@@ -468,6 +472,24 @@ install_yamllint() {
   fi
 }
 
+# advise_gotoolchain: the go installs above self-heal a base/toolchain version
+# skew via GOTOOLCHAIN=auto, but local *repo* builds do not. With
+# GOTOOLCHAIN=local (Fedora bakes this default into its Go build) a
+# `go build`/`go test` in a repo whose go.mod pins a newer Go than the base
+# toolchain fails instead of fetching it, unlike CI (setup-go installs the
+# go.mod version) and the Docker builds (GOTOOLCHAIN=auto). Warn so the dev box
+# can match; do not rewrite the user's global setting from a shared installer.
+advise_gotoolchain() {
+  command -v go >/dev/null 2>&1 || return 0
+  [ "$(go env GOTOOLCHAIN 2>/dev/null)" = local ] || return 0
+  local base
+  base="$(go env GOVERSION 2>/dev/null)"
+  printf '\nNote: GOTOOLCHAIN=local (base %s). Local go build / go test in a repo\n' "$base"
+  printf '  whose go.mod pins a newer Go fails instead of fetching it, unlike CI\n'
+  printf '  (setup-go installs the go.mod version) and the Docker builds. To match:\n'
+  printf '    go env -w GOTOOLCHAIN=auto\n'
+}
+
 main() {
   printf 'Installing CI-pinned dev tools (pins from %s)\n' "$WF_DIR"
   printf '  bin dir: %s\n\n' "$BIN_DIR"
@@ -487,6 +509,8 @@ main() {
 
   printf 'tool               version    status\n'
   printf '%s\n' "${SUMMARY[@]}"
+
+  advise_gotoolchain
 
   if [ "${#FAILED[@]}" -gt 0 ]; then
     printf '\nWARNING: %d tool(s) not installed: %s\n' "${#FAILED[@]}" "${FAILED[*]}"
