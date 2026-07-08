@@ -4,7 +4,10 @@ name: Audit
 # the GitHub API only exposes to a CLASSIC PAT with the 'repo' scope — a
 # fine-grained PAT does NOT serialize them, even with Administration:read.
 # Set AUDIT_PAT to a classic 'repo'-scope PAT. Without it the audit aborts
-# (exit 2) with a clear diagnostic rather than flagging every repo.
+# (exit 2) with a clear diagnostic rather than flagging every repo. The same
+# classic 'repo' scope also reads repo webhooks, which the deploy-trigger
+# webhook check needs; AUDIT_WEBHOOK_HOST supplies the orchestrator host for it
+# (when unset, that one check is skipped rather than failing every repo).
 
 on:
   schedule:
@@ -25,6 +28,10 @@ jobs:
       - name: Run cross-repo audit
         env:
           GH_TOKEN: ${{ secrets.AUDIT_PAT || github.token }}
+          # Host of the self-hosted deploy-trigger orchestrator (private infra,
+          # so it is a secret, not hardcoded in this public repo). When absent
+          # the audit skips the per-repo webhook check instead of failing.
+          AUDIT_WEBHOOK_HOST: ${{ secrets.AUDIT_WEBHOOK_HOST }}
         run: |
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           python3 scripts/audit.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
