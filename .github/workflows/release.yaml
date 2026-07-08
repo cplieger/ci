@@ -434,6 +434,41 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify module path matches major version
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          # Go semantic import versioning: a module released at v2+ MUST carry
+          # its major in the module path (.../v2, .../v3). git-cliff bumps the
+          # major on a feat!:/BREAKING CHANGE: commit, but adding the /vN suffix
+          # to go.mod (and rewriting internal imports) is a separate manual step
+          # that is easy to forget. The gap is invisible until the first v2+
+          # consumer runs `go get .../vN` and hits "module path must match major
+          # version". Fail the release here so a broken v2+ tag is never cut.
+          ver="${VERSION#v}"
+          major="${ver%%.*}"
+          case "$major" in
+            '' | *[!0-9]*)
+              echo "::notice::'$VERSION' has no numeric major — skipping module-path check"
+              exit 0 ;;
+          esac
+          if [ "$major" -lt 2 ]; then
+            echo "v$major needs no /vN module-path suffix — ok ($VERSION)"
+            exit 0
+          fi
+          modpath=$(awk '$1=="module"{print $2; exit}' go.mod)
+          if [ -z "$modpath" ]; then
+            echo "::error::no module directive found in go.mod"
+            exit 1
+          fi
+          case "$modpath" in
+            */v"$major")
+              echo "ok: module path '$modpath' matches major v$major ($VERSION)" ;;
+            *)
+              echo "::error::go.mod module path '$modpath' must end in /v$major to release $VERSION (Go semantic import versioning). Add the /v$major suffix to the module directive and rewrite internal imports, then re-release."
+              exit 1 ;;
+          esac
+
       - name: Tag + GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
