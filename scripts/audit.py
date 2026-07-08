@@ -10,7 +10,9 @@ features on free private repos).
 Checks cover merge model, repo features, branch protection, rulesets
 (unexpected custom rulesets + bypass-actor drift), vulnerability reporting,
 secret/code scanning, CI wiring, Renovate preset, license, default branch,
-description (presence + <=100 chars), and topics.
+description (presence + <=100 chars), topics, and the per-repo deploy-trigger
+webhook that reaches the self-hosted orchestrator (only when AUDIT_WEBHOOK_HOST
+is set — the host is private infra, injected via env, never hardcoded here).
 
 Branch protection is the documented standard (classic protection); any
 custom repository ruleset is treated as drift, and an Integration bypass actor
@@ -35,6 +37,7 @@ Run:
 import argparse
 import base64
 import json
+import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +46,13 @@ OWNER = "cplieger"
 PRESET = "github>cplieger/.github"
 REUSABLE = "cplieger/ci/.github/workflows"
 INFRA = {".github", "ci"}  # they define the standard; CI-wiring check is N/A for them
+# Host of the self-hosted deploy/dependency orchestrator that each repo pings
+# via a per-repo webhook (a release, or a push on infra repos, reaches it so the
+# change redeploys / re-runs dependency updates). It is private infrastructure,
+# so it is injected via the AUDIT_WEBHOOK_HOST env/secret rather than hardcoded
+# in this public repo. When unset, the webhook check is skipped entirely so a
+# local run without the secret does not report every repo as non-compliant.
+WEBHOOK_HOST = os.environ.get("AUDIT_WEBHOOK_HOST", "").strip()
 # GitHub auto-creates and manages this ruleset when code-scanning merge
 # protection is enabled. It is not user-authored, so it is whitelisted from the
 # "unexpected custom ruleset" check. Every other ruleset is drift.
@@ -176,6 +186,30 @@ def collect(meta):
                   ("renovate.json", "org-inherited-config.json", "default.json"))
     s["renovate_preset"] = (PRESET in ren) or (name == ".github")
     s["adopted"] = s["ci_wired"] or s["renovate_preset"]
+
+    # Deploy-trigger webhook. Read repo hooks and look for an active one pointing
+    # at the orchestrator host. webhook_readable distinguishes "no matching hook"
+    # (readable, empty/other hooks) from "could not read hooks" (token lacks the
+    # classic 'repo'/hook scope) so the latter is a global skip, not per-repo
+    # false failures. Only meaningful when WEBHOOK_HOST is set.
+    s["webhook_readable"] = False
+    s["webhook_present"] = False
+    s["webhook_has_secret"] = False
+    s["webhook_bad_delivery"] = None
+    if WEBHOOK_HOST:
+        hooks = gh_json("api", f"repos/{OWNER}/{name}/hooks")
+        if isinstance(hooks, list):
+            s["webhook_readable"] = True
+            for h in hooks:
+                cfg = h.get("config") or {}
+                if WEBHOOK_HOST not in (cfg.get("url") or "") or not h.get("active"):
+                    continue
+                s["webhook_present"] = True
+                if cfg.get("secret"):
+                    s["webhook_has_secret"] = True
+                code = (h.get("last_response") or {}).get("code")
+                if isinstance(code, int) and code >= 400:
+                    s["webhook_bad_delivery"] = code
     return s
 
 
@@ -265,6 +299,22 @@ def compliance(s):
     if not s["topics"]:
         warn.append("no topics")
 
+    # Deploy-trigger webhook. Enforced only when the host is configured AND this
+    # repo's hooks were readable (see collect); an unreadable token is handled as
+    # a global skip in main(), not as per-repo failures. Every non-archived repo
+    # is expected to reach the orchestrator: a missing hook means releases never
+    # propagate; a hook without a secret is rejected (the orchestrator validates
+    # an HMAC signature over the payload), which is a silent, deploy-breaking gap.
+    if WEBHOOK_HOST and s["webhook_readable"]:
+        if not s["webhook_present"]:
+            hard.append("no deploy-trigger webhook (releases won't reach the orchestrator)")
+        elif not s["webhook_has_secret"]:
+            hard.append("deploy-trigger webhook has no secret "
+                        "(the orchestrator rejects unsigned deliveries)")
+        elif s["webhook_bad_delivery"]:
+            warn.append(f"deploy-trigger webhook last delivery failed "
+                        f"(HTTP {s['webhook_bad_delivery']})")
+
     return hard, warn
 
 
@@ -312,6 +362,17 @@ def main():
           f"(visibility={args.visibility})")
     print("Legend: [HARD] blocks compliance · [warn] advisory · "
           "GHAS scanning N/A on free private repos\n")
+
+    # Deploy-trigger webhook check status. When the host is configured but no
+    # repo's hooks were readable, the token is under-scoped for the hook endpoint
+    # (needs classic 'repo' or admin:repo_hook) — surface it instead of silently
+    # skipping. When the host is unset, the check does not run at all.
+    if not WEBHOOK_HOST:
+        print("Note: deploy-trigger webhook check skipped (AUDIT_WEBHOOK_HOST unset).\n")
+    elif not any(s["webhook_readable"] for s in settings):
+        print("WARNING: AUDIT_WEBHOOK_HOST is set but no repo's webhooks were "
+              "readable; the deploy-trigger webhook check was skipped. The audit "
+              "token needs the classic 'repo' scope (or admin:repo_hook).\n")
     for s in settings:
         hard, warn = compliance(s)
         tag = "infra" if s["infra"] else ("priv" if s["private"] else "pub")
