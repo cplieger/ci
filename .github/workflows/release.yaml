@@ -369,14 +369,14 @@ jobs:
             # GHCR-only (no Docker Hub mirror). Pre-1.0 apps not yet mirrored
             # to Docker Hub. The docker-* infra images (caddy, age, keepalived,
             # static-web, radvd) graduated to dual-publish once they hit 1.0.
-            subflux|vibecli|vibekit)
+            subflux|vibekit)
               REGISTRIES="ghcr" ;;
           esac
 
           case "$REPO_NAME" in
             # SBOM from extracted binary path (image-level scan misses static
             # Go deps for these builds).
-            vibecli|vibekit)
+            web-terminal-kiro|vibekit)
               SBOM_FROM="path" ;;
           esac
 
