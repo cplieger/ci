@@ -11,8 +11,8 @@
 #
 # When invoked with --path SUBDIR, the script tries to use that subdirectory's
 # own `.github/workflows/ci.yaml` if present; otherwise it falls back to
-# autodetect mode (Go suite + hadolint + shellcheck + gitleaks based on what
-# files are in SUBDIR).
+# autodetect mode (Go suite + hadolint + shellcheck + shfmt + gitleaks based on
+# what files are in SUBDIR).
 
 set -o pipefail
 
