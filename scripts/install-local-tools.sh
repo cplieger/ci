@@ -16,7 +16,7 @@
 # COVERS (the tools the `ci / validate` gate + advisory security scan run):
 #   - Renovate-pinned, exact version: golangci-lint, gitleaks, trivy, hadolint
 #     (release binaries), shfmt (release binary), ruff (pipx),
-#     markdownlint-cli2 (npm), tsgo (npm tarball)
+#     markdownlint-cli2 (npm)
 #   - best-effort LATEST (no CI pin exists to read): shellcheck, yamllint. CI
 #     uses the ubuntu-24.04 runner's preinstalled shellcheck (floats with the
 #     runner image) and a bare `pip install yamllint` (unpinned), so there is
@@ -37,15 +37,16 @@
 #   <tag>` image reference (it runs in CI as a Docker image, not a VERSION pin).
 # NOT covered (install via your package manager, or not part of local validate):
 #   - release- or niche-only: git-cliff (release), gremlins (weekly mutation)
-#   - project-local TS devdeps run via `npm ci` (eslint, prettier, vitest,
-#     stylelint, html-validate, knip), pinned per-repo in package-lock.json
+#   - project-local TS devdeps run via `npm ci` (the native `tsc` via each
+#     repo's @typescript/native alias, plus eslint, prettier, vitest, stylelint,
+#     html-validate, knip), pinned per-repo in package-lock.json
 #   - supply-chain/scan actions that don't run locally: cosign, syft, CodeQL
 #
 # INSTALL TARGETS: Go tools via `go install` (Go bin dir); golangci-lint,
 # gitleaks, trivy, hadolint, shellcheck into $BIN_DIR (default ~/.local/bin);
-# ruff via pipx; markdownlint-cli2 via npm -g; tsgo extracted to <bindir>/../lib
-# and symlinked into $BIN_DIR. $BIN_DIR and the Go bin dir must precede /usr/bin
-# on PATH so these shadow any distro packages (e.g. a distro trivy in /usr/bin).
+# ruff via pipx; markdownlint-cli2 via npm -g. $BIN_DIR and the Go bin dir must
+# precede /usr/bin on PATH so these shadow any distro packages (e.g. a distro
+# trivy in /usr/bin).
 #
 # USAGE: scripts/install-local-tools.sh
 # ENV:   BIN_DIR  override the binary install dir (default ~/.local/bin)
@@ -343,48 +344,6 @@ install_hadolint() {
   fi
 }
 
-# install_tsgo: the TypeScript native-preview typecheck binary. CI installs it
-# out-of-band from the npm registry (it is deliberately NOT a repo
-# devDependency) and puts package/lib on PATH. Mirror that: extract the platform
-# tarball to a stable lib dir and symlink the tsgo binary into $BIN_DIR. The
-# pinned version carries a `-dev.<date>` suffix, so compare the full string
-# (not semver()).
-install_tsgo() {
-  local want cur arch libdir tmp pkg
-  want="$(pin_version @typescript/native-preview)"
-  [ -n "$want" ] || {
-    bad tsgo "no pin found"
-    return
-  }
-  cur="$(tsgo --version 2>/dev/null | grep -oE '[0-9][0-9A-Za-z.-]*' | head -n1 || true)"
-  [ "$cur" = "$want" ] && {
-    skip tsgo "$want"
-    return
-  }
-  case "$(uname -m)" in
-    x86_64 | amd64) arch=x64 ;;
-    aarch64 | arm64) arch=arm64 ;;
-    *)
-      bad tsgo "unsupported arch $(uname -m)"
-      return
-      ;;
-  esac
-  pkg="native-preview-linux-${arch}"
-  libdir="$(dirname "$BIN_DIR")/lib/tsgo-native"
-  tmp="$(mktemp -d)"
-  if curl -fsSL "https://registry.npmjs.org/@typescript/${pkg}/-/${pkg}-${want}.tgz" \
-    | tar -xzf - -C "$tmp" 2>/dev/null && [ -x "$tmp/package/lib/tsgo" ]; then
-    rm -rf "$libdir"
-    mkdir -p "$(dirname "$libdir")" "$BIN_DIR"
-    mv "$tmp/package/lib" "$libdir"
-    ln -sf "$libdir/tsgo" "$BIN_DIR/tsgo"
-    ok tsgo "$want" "-> $BIN_DIR"
-  else
-    bad tsgo "download failed"
-  fi
-  rm -rf "$tmp"
-}
-
 # install_shellcheck: CI does not pin shellcheck — it uses the ubuntu-24.04
 # runner's preinstalled copy, which floats with the runner image — so there is
 # no pin to read. Best effort per the maintainer's call: track the newest
@@ -505,7 +464,6 @@ main() {
   install_trivy
   install_ruff
   install_markdownlint
-  install_tsgo
 
   printf 'tool               version    status\n'
   printf '%s\n' "${SUMMARY[@]}"
