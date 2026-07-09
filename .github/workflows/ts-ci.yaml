@@ -84,6 +84,106 @@ jobs:
         continue-on-error: true
         run: ( npx prettier --check . ) || { echo "prettier" >> /tmp/_ci_failures; exit 1; }
 
+      # Verify every bare-specifier value-import in the shippable front-end
+      # source has a key in the page's <script type="importmap">. The browser
+      # resolves bare specifiers only via that map, so an unmapped one aborts
+      # module loading at runtime (blank / stuck-loading UI) while tsgo + eslint
+      # stay green — they resolve against node_modules, not the map. Scans from
+      # the git root (independent of this job's working-directory); a detected
+      # frontend with no importmap just no-ops. Gated on web-lint so it runs for
+      # the meta CI `web` job (app frontends) only — root-level TS libraries are
+      # excluded, since their only importmap is a dev scaffold, not a shipped
+      # page contract.
+      - name: Import map coverage
+        if: ${{ inputs.web-lint }}
+        continue-on-error: true
+        env:
+          IMPORTMAP_CHECK: |
+            const { readFileSync, readdirSync } = require("node:fs");
+            const { join, relative } = require("node:path");
+            const { execSync } = require("node:child_process");
+            let root;
+            try {
+              root = execSync("git rev-parse --show-toplevel", { encoding: "utf8" }).trim();
+            } catch {
+              root = process.cwd();
+            }
+            const SKIP = new Set([
+              "node_modules", ".git", "dist", "coverage", ".vitest-cache",
+              "vendor", "__test-helpers__", "__snapshots__", "testdata", "test-stubs",
+            ]);
+            const walk = (dir, test, out = []) => {
+              let entries;
+              try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+              for (const e of entries) {
+                const p = join(dir, e.name);
+                if (e.isDirectory()) { if (!SKIP.has(e.name)) walk(p, test, out); }
+                else if (test(e.name)) out.push(p);
+              }
+              return out;
+            };
+            const keys = new Set();
+            let mapCount = 0;
+            for (const f of walk(root, (n) => n.endsWith(".html"))) {
+              const m = readFileSync(f, "utf8").match(/<script type="importmap">(.*?)<\/script>/s);
+              if (!m) continue;
+              let parsed;
+              try { parsed = JSON.parse(m[1]); }
+              catch (err) {
+                console.error(`::error file=${relative(root, f)}::invalid importmap JSON: ${err.message}`);
+                process.exit(1);
+              }
+              for (const k of Object.keys(parsed.imports || {})) keys.add(k);
+              mapCount++;
+            }
+            if (mapCount === 0) {
+              console.log('No <script type="importmap"> found; skipping import-map coverage check.');
+              process.exit(0);
+            }
+            const RELATIVE = /^[./]/;
+            const bareSpecs = (src) => {
+              const specs = new Set();
+              const patterns = [
+                /\b(?:import|export)\b(?!\s+type\b)[^'";]*?\bfrom\s*["']([^"']+)["']/g,
+                /\bimport\s+["']([^"']+)["']/g,
+                /\bimport\s*\(\s*["']([^"']+)["']/g,
+              ];
+              for (const re of patterns) {
+                for (const m of src.matchAll(re)) {
+                  const s = m[1];
+                  if (s && !RELATIVE.test(s) && !s.endsWith(".css")) specs.add(s);
+                }
+              }
+              return specs;
+            };
+            const shippable = (n) =>
+              n.endsWith(".ts") && !n.endsWith(".d.ts") && !n.endsWith(".test.ts") &&
+              !n.endsWith(".spec.ts") && n !== "vitest.config.ts" && n !== "fc-strict-setup.ts";
+            const tsFiles = walk(root, shippable);
+            const violations = [];
+            for (const f of tsFiles) {
+              const src = readFileSync(f, "utf8");
+              for (const spec of bareSpecs(src)) {
+                if (!keys.has(spec)) {
+                  const idx = src.indexOf(spec);
+                  const line = idx >= 0 ? src.slice(0, idx).split("\n").length : 0;
+                  violations.push(`${relative(root, f)}:${line}: "${spec}" not in any import map`);
+                }
+              }
+            }
+            if (violations.length) {
+              console.error("::error::Bare import(s) missing from the page import map(s):");
+              for (const v of violations) console.error("  " + v);
+              console.error('Add the key to the served HTML <script type="importmap"> (and vendor the target at build).');
+              process.exit(1);
+            }
+            console.log(`import-map coverage OK (${keys.size} keys / ${mapCount} map(s), ${tsFiles.length} source files).`);
+        run: |
+          (
+            printf '%s' "$IMPORTMAP_CHECK" > "${RUNNER_TEMP:-/tmp}/importmap-check.cjs"
+            node "${RUNNER_TEMP:-/tmp}/importmap-check.cjs"
+          ) || { echo "Import map coverage" >> /tmp/_ci_failures; exit 1; }
+
       - name: Lint web (CSS/HTML)
         if: ${{ inputs.web-lint }}
         continue-on-error: true
