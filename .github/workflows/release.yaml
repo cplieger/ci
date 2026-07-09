@@ -153,7 +153,7 @@ jobs:
             '(^|/)vitest\.config\.(ts|js)$'
             '(^|/)tsconfig\.(test|tests|node)\.json$'
             # Base tsconfig.json: root-anchored ONLY. In the Go+web docker repos
-            # a nested static-src/tsconfig.json is a tsgo build input (it
+            # a nested static-src/tsconfig.json is a tsc build input (it
             # compiles the web client that main.go then embeds), so it MUST
             # trigger a rebuild — do NOT broaden this to (^|/). Pure-TS libs
             # (actions, reactive) and TS subpackages keep their base tsconfig
@@ -267,7 +267,7 @@ jobs:
           # spurious release (the bug this fixes). So:
           #
           #   docker / go : NO build artifact reads package.json (web-UI images
-          #                 pin TS deps as Dockerfile ARGs + tsgo; verified no
+          #                 pin TS deps as Dockerfile ARGs + tsc; verified no
           #                 Dockerfile references package.json). Drop every
           #                 package.json from the significant set outright.
           #   ts          : package.json IS the published tarball manifest, but

@@ -2,7 +2,8 @@ name: TS CI
 
 # Reusable TypeScript-library CI for build-less ESM packages. Call with:
 #   jobs: { ci: { uses: cplieger/ci/.github/workflows/ts-ci.yaml@v1, with: { working-directory: "." } } }
-# Uses the runner's Node + tsgo (matches the apps' build-less pipeline).
+# Uses the runner's Node + the native `tsc` each repo pins via its
+# `@typescript/native` devDependency (matches the apps' build-less pipeline).
 
 on:
   workflow_call:
@@ -36,15 +37,6 @@ jobs:
       - name: Install deps
         run: npm ci || npm install --no-save --loglevel=warn
 
-      - name: Install tsgo
-        run: |
-          # renovate: datasource=npm depName=@typescript/native-preview
-          TSGO_VERSION=7.0.0-dev.20260527.2
-          curl -fsSL \
-            "https://registry.npmjs.org/@typescript/native-preview-linux-x64/-/native-preview-linux-x64-${TSGO_VERSION}.tgz" \
-            | tar -xz -C /tmp
-          echo "/tmp/package/lib" >> "$GITHUB_PATH"
-
       # Soft-gate block: each step below runs to completion (continue-on-error)
       # and records its own name to /tmp/_ci_failures on failure; the final
       # "Check results" step fails the job if that file exists. CONTRACT: any
@@ -55,7 +47,7 @@ jobs:
         continue-on-error: true
         run: ( npx eslint . ) || { echo "eslint" >> /tmp/_ci_failures; exit 1; }
 
-      - name: Typecheck (tsgo)
+      - name: Typecheck (tsc)
         continue-on-error: true
         run: ( npm run typecheck && npm run typecheck:tests ) || { echo "typecheck" >> /tmp/_ci_failures; exit 1; }
 
@@ -87,7 +79,7 @@ jobs:
       # Verify every bare-specifier value-import in the shippable front-end
       # source has a key in the page's <script type="importmap">. The browser
       # resolves bare specifiers only via that map, so an unmapped one aborts
-      # module loading at runtime (blank / stuck-loading UI) while tsgo + eslint
+      # module loading at runtime (blank / stuck-loading UI) while tsc + eslint
       # stay green — they resolve against node_modules, not the map. Scans from
       # the git root (independent of this job's working-directory); a detected
       # frontend with no importmap just no-ops. Gated on web-lint so it runs for
