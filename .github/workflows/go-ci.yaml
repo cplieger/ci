@@ -89,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           # renovate: datasource=go depName=golang.org/x/tools
-          XTOOLS_VERSION=v0.47.0
+          XTOOLS_VERSION=v0.48.0
           go install "golang.org/x/tools/cmd/deadcode@${XTOOLS_VERSION}"
           # renovate: datasource=go depName=github.com/bep/punused
           PUNUSED_VERSION=v0.5.0
