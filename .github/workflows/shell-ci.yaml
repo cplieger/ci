@@ -50,6 +50,19 @@ jobs:
             "https://github.com/mvdan/sh/releases/download/${VERSION}/shfmt_${VERSION}_linux_amd64"
           sudo chmod +x /usr/local/bin/shfmt
 
+      - name: Install shellcheck
+        run: |
+          # The runner's preinstalled shellcheck false-positives SC2317 on
+          # trap-invoked functions (fixed in 0.11.0: SC2317 is "less spammy for
+          # nested ones"). Pin it like the linters above so the gate matches
+          # local tooling and stays reproducible.
+          # renovate: datasource=github-releases depName=koalaman/shellcheck
+          VERSION=v0.11.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${VERSION}/shellcheck-${VERSION}.linux.x86_64.tar.gz" \
+            | tar -xzf - -C /tmp "shellcheck-${VERSION}/shellcheck"
+          sudo mv "/tmp/shellcheck-${VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+
       # Soft-gate block: each step below runs to completion (continue-on-error)
       # and records its own name to /tmp/_ci_failures on failure; the final
       # "Check results" step fails the job if that file exists. CONTRACT: any
