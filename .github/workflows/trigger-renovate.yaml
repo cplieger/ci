@@ -21,8 +21,17 @@ name: Trigger Renovate
 #     after a successful main-branch image push (see docker-release.yaml).
 #
 # The orchestrator's procedure on the receiving end starts the one-shot
-# Renovate container/stack, which scans cplieger/* and opens
-# digest-bump PRs against the consumer repos.
+# Renovate container/stack.
+#
+# SCOPE (intentional, do not "fix"): this one-shot run bumps the `homelab` repo
+# ONLY. It does NOT touch the standalone cplieger/* app/library repos that
+# consume cplieger/ci's reusable workflows by SHA. Those are handled by the
+# RESIDENT renovate container (homelab apps/renovate, RENOVATE_AUTODISCOVER over
+# cplieger/*), fired hourly by the Ofelia `renovate` job, so a cplieger/ci tag
+# move reaches the fleet on that hourly cadence, not through this action. To
+# expedite a fleet-wide digest bump, run the resident container directly:
+#   ssh borgcube 'sudo -n docker exec --user 12021:0 renovate \
+#     /usr/local/bin/docker-renovate-scheduler run'
 #
 # Token: GH_TOKEN below is RENOVATE_HOOK_PAT, a fine-grained PAT scoped to
 # ONLY cplieger/ci with Metadata: Read + Webhooks: Read and write — the hooks,
