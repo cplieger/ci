@@ -26,16 +26,26 @@
 #   SMOKE_RUN_ARGS   extra `docker run` args (env, tmpfs, ...) as a word-split
 #                    string, e.g. "-e FOO=bar --tmpfs /input". Values must not
 #                    contain spaces (these are controlled test configs).
+#
+# The harness also exports $SMOKE_DIR (this script's own absolute directory)
+# before sourcing the .conf, so an app that needs a config/fixture file on disk
+# can bind-mount a committed fixture dir, e.g.:
+#   SMOKE_RUN_ARGS="-e SYNC_INTERVAL=off -v ${SMOKE_DIR}/fixtures:/config:ro"
 set -eu
 
 IMG="${1:?usage: image-smoke.sh <image-ref>}"
+
+# Absolute directory of this script (also holds image-smoke.conf and any per-app
+# fixtures). Exposed to the .conf as $SMOKE_DIR so a .conf can bind-mount a
+# committed fixture dir with an absolute source path (docker -v requires one).
+SMOKE_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
 # Per-app config lives beside this script (repo-local, NOT synced). Pre-set the
 # knobs so `set -u` is safe and a repo with no .conf still runs with defaults.
 SMOKE_APP_NAME=""
 SMOKE_TIMEOUT=""
 SMOKE_RUN_ARGS=""
-CONF="$(dirname "$0")/image-smoke.conf"
+CONF="$SMOKE_DIR/image-smoke.conf"
 if [ -f "$CONF" ]; then
   # shellcheck disable=SC1090  # per-app config path, resolved at runtime
   . "$CONF"
