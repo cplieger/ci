@@ -11,11 +11,11 @@ truth — consumer repos reference it instead of carrying duplicate copies.
 
 ## Reusable workflows
 
-| Workflow                         | Purpose                                                                                    |
-| -------------------------------- | ------------------------------------------------------------------------------------------ |
-| `.github/workflows/go-ci.yaml`   | Go-library checks: vet, golangci-lint, race tests, govulncheck, gitleaks                   |
-| `.github/workflows/ts-ci.yaml`   | Build-less TS checks: knip, eslint, tsc typecheck, vitest, prettier (+ optional web-lint)  |
-| `.github/workflows/release.yaml` | git-cliff version → (TS) npm + JSR publish → tag + GitHub Release                          |
+| Workflow                         | Purpose                                                                                             |
+| -------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `.github/workflows/go-ci.yaml`   | Go-library checks: vet, golangci-lint, race tests, govulncheck, gitleaks                            |
+| `.github/workflows/ts-ci.yaml`   | Build-less TS checks: eslint, tsc typecheck, vitest, prettier, version parity (+ optional web-lint) |
+| `.github/workflows/release.yaml` | git-cliff version → (TS) npm + JSR publish → tag + GitHub Release                                   |
 
 ### Consume in a Go library
 
