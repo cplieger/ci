@@ -27,6 +27,7 @@ declare -A IS_WEB      # has static-src or web dir alongside go.mod
 declare -A CLIFF_TIER  # stable|alpha
 declare -A HAS_CODE    # for codeql decision
 declare -A CAN_RELEASE # has go.mod or jsr.json or Dockerfile
+declare -A HAS_SMOKE   # has tests/image-smoke.conf (opt-in to the shared image-smoke harness)
 
 repo_names=$(echo "${repos_json}" | jq -r '.[].name' | sort)
 
@@ -45,6 +46,7 @@ for repo in ${repo_names}; do
   has_dockerfile=false
   is_web=false
   has_pyproject=false
+  has_smoke=false
 
   while IFS= read -r entry; do
     case "${entry}" in
@@ -65,6 +67,16 @@ for repo in ${repo_names}; do
     if [[ "${deep_check}" -gt 0 ]]; then
       is_web=true
     fi
+  fi
+
+  # An app opts into the shared image-smoke harness by committing
+  # tests/image-smoke.conf; the canonical harness (configs/image-smoke.sh) then
+  # syncs to its tests/image-smoke.sh. tests/ is below the root tree, so this
+  # needs the recursive listing.
+  smoke_check=$(api "repos/${OWNER}/${repo}/git/trees/HEAD?recursive=1" \
+    --jq '[.tree[].path | select(. == "tests/image-smoke.conf")] | length' 2>/dev/null || echo "0")
+  if [[ "${smoke_check}" -gt 0 ]]; then
+    has_smoke=true
   fi
 
   # Classify language
@@ -110,6 +122,7 @@ for repo in ${repo_names}; do
   CLIFF_TIER["${repo}"]="${cliff_tier}"
   HAS_CODE["${repo}"]="${has_code}"
   CAN_RELEASE["${repo}"]="${can_release}"
+  HAS_SMOKE["${repo}"]="${has_smoke}"
 
   >&2 printf "  classified: %-30s lang=%-5s web=%-5s cliff=%-6s release=%s\n" \
     "${repo}" "${lang}" "${is_web}" "${cliff_tier}" "${can_release}"
@@ -127,6 +140,7 @@ cliff_alpha=()
 golangci_repos=()  # all go repos get .golangci.yaml
 ts_config_repos=() # ts repos + go-cross-language repos get eslint/prettier/stylelint/htmlvalidate
 python_repos=()    # python repos (pyproject.toml) -> ruff.toml + .editorconfig only
+smoke_repos=()     # repos that opted into the shared image-smoke harness (tests/image-smoke.conf)
 
 for repo in ${repo_names}; do
   [[ "${repo}" == "ci" ]] && continue
@@ -167,6 +181,11 @@ for repo in ${repo_names}; do
   # Release: all releasable repos (unified auto-detect handles type)
   if [[ "${CAN_RELEASE[${repo}]}" == "true" ]]; then
     release_repos+=("${repo}")
+  fi
+
+  # Image-smoke harness: repos that opted in with tests/image-smoke.conf
+  if [[ "${HAS_SMOKE[${repo}]:-}" == "true" ]]; then
+    smoke_repos+=("${repo}")
   fi
 
   # Cliff tier
@@ -252,6 +271,20 @@ if [[ ${#codeql_repos[@]} -gt 0 ]]; then
     files:
       - source: .github/workflow-templates/coverage.yml
         dest: .github/workflows/coverage.yml
+EOF
+fi
+
+# Image-smoke harness — repos that opted in by committing tests/image-smoke.conf.
+# The canonical harness (configs/image-smoke.sh) syncs to tests/image-smoke.sh;
+# the per-app tests/image-smoke.conf (name/timeout/run-args) stays repo-owned.
+if [[ ${#smoke_repos[@]} -gt 0 ]]; then
+  echo ""
+  echo "  # Image-smoke harness (repos with a tests/image-smoke.conf opt-in)"
+  emit_repos smoke_repos
+  cat <<'EOF'
+    files:
+      - source: configs/image-smoke.sh
+        dest: tests/image-smoke.sh
 EOF
 fi
 
