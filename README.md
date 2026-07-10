@@ -79,7 +79,7 @@ Tools without remote-config support get their config pushed here as PRs by
 | `.editorconfig`                                                                | all                                                      |
 | `configs/eslint.config.base.mjs`                                               | TS repos — `import base from "./eslint.config.base.mjs"` |
 | `configs/prettier.json`, `configs/stylelint.json`, `configs/htmlvalidate.json` | TS repos                                                 |
-| `configs/image-smoke.sh`                                                       | image repos that opt in with `tests/image-smoke.conf` — synced to `tests/image-smoke.sh` (canonical runtime smoke harness) |
+| `configs/image-smoke.sh`                                                       | image repos opting in via `tests/image-smoke.conf`       |
 
 The unified-CI group also syncs four workflows into each consumer repo:
 `.github/workflows/{ci,codeql,security,scorecard}.yml`. `scorecard.yml`
