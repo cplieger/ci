@@ -718,10 +718,13 @@ def rewrite_gitleaks_download(cmd: str) -> str:
     /tmp/gitleaks invocation to just `gitleaks`.  Works even when the three
     lines are the entire step (the common case in go-ci / shell-ci).
 
-    Also rewrites `gitleaks dir .` to `gitleaks detect --source .`: in CI the
-    fresh checkout has no gitignored files so `dir` and `detect` are equivalent,
-    but locally `dir` scans everything including gitignored dirs (.code-review/,
-    *.dec files, etc.) producing false positives that CI never sees.
+    The `gitleaks dir .` command is preserved verbatim (NOT rewritten to
+    `detect`). `dir` scans the working-tree filesystem exactly like CI and
+    already honours .gitignore, so gitignored dirs (node_modules, .code-review/,
+    *.dec files) are skipped and never produce local-only false positives.
+    Rewriting to `detect --source .` would instead scan the full git history and
+    flag already-removed/redacted historical secrets that CI's filesystem scan
+    never sees (the wtk `routes_test.go` false positive, 2026-07).
     """
     if not shutil.which('gitleaks') or '/tmp/gitleaks' not in cmd:
         return cmd
@@ -748,13 +751,11 @@ def rewrite_gitleaks_download(cmd: str) -> str:
         if 'curl' in stripped and 'gitleaks' in stripped and '/tmp' in stripped:
             i += 1  # skip curl download line
             continue
-        # Rewrite /tmp/gitleaks to gitleaks
+        # Rewrite /tmp/gitleaks to the PATH binary; keep `dir .` as-is so the local
+        # scan matches CI (filesystem, .gitignore-respecting). Do NOT rewrite to
+        # `detect --source .` — that scans full git history and flags already-removed
+        # historical secrets CI's `dir` scan never sees.
         line = _GITLEAKS_PATH_RE.sub('gitleaks', lines[i])
-        # Rewrite `gitleaks dir .` → `gitleaks detect --source .` for gitignore parity:
-        # CI runs in a fresh checkout (no gitignored files), so `dir` and `detect`
-        # are equivalent there.  Locally, `dir` scans everything including gitignored
-        # dirs (.code-review/, *.dec) which produce false positives CI never sees.
-        line = re.sub(r'\bgitleaks\s+dir\s+\.', 'gitleaks detect --source .', line)
         result.append(line)
         i += 1
     return ''.join(result)
