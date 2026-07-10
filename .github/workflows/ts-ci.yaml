@@ -76,6 +76,34 @@ jobs:
         continue-on-error: true
         run: ( npx prettier --check . ) || { echo "prettier" >> /tmp/_ci_failures; exit 1; }
 
+      # Version parity: the committed `version` in package.json and its sibling
+      # jsr.json are placeholders that the release pipeline overwrites from the
+      # git tag at publish time (see release.yaml), so the value never reaches
+      # consumers; the two must still agree in-repo. A drift (e.g. package.json
+      # 1.0.0 vs jsr.json 0.1.0) is a committed-state defect: it misleads a
+      # reader about the package version and signals a manifest edit that
+      # touched one file but not the other. Scans from the git root (independent
+      # of working-directory) so it covers a root-level library and a subpackage
+      # layout alike (e.g. web-terminal-engine's web/). No jsr.json => no-op.
+      - name: Version parity (package.json == jsr.json)
+        continue-on-error: true
+        run: |
+          (
+            cd "$(git rev-parse --show-toplevel)"
+            rc=0
+            while IFS= read -r jsr; do
+              pkg="${jsr%jsr.json}package.json"
+              [ -f "$pkg" ] || continue
+              jv=$(jq -r '.version // ""' "$jsr")
+              pv=$(jq -r '.version // ""' "$pkg")
+              if [ "$jv" != "$pv" ]; then
+                echo "::error file=${jsr}::version mismatch: ${pkg}=${pv:-<none>} vs ${jsr}=${jv:-<none>}. The two manifests must carry the same version (it is overwritten from the git tag at publish, but must agree in-repo)."
+                rc=1
+              fi
+            done < <(git ls-files | grep -E '(^|/)jsr\.json$')
+            exit $rc
+          ) || { echo "version parity" >> /tmp/_ci_failures; exit 1; }
+
       # Verify every bare-specifier value-import in the shippable front-end
       # source has a key in the page's <script type="importmap">. The browser
       # resolves bare specifiers only via that map, so an unmapped one aborts
