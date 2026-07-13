@@ -719,12 +719,17 @@ def rewrite_gitleaks_download(cmd: str) -> str:
     lines are the entire step (the common case in go-ci / shell-ci).
 
     The `gitleaks dir .` command is preserved verbatim (NOT rewritten to
-    `detect`). `dir` scans the working-tree filesystem exactly like CI and
-    already honours .gitignore, so gitignored dirs (node_modules, .code-review/,
-    *.dec files) are skipped and never produce local-only false positives.
+    `detect`). `dir` scans the working-tree filesystem exactly like CI.
     Rewriting to `detect --source .` would instead scan the full git history and
     flag already-removed/redacted historical secrets that CI's filesystem scan
     never sees (the wtk `routes_test.go` false positive, 2026-07).
+
+    NOTE: `dir` does NOT honour .gitignore — it walks the raw filesystem, so a
+    gitignored scratch path (.code-review/ report artifacts, *.dec decrypted
+    secrets, node_modules) IS scanned and can raise local-only findings CI's
+    fresh checkout never sees (the webhttp .code-review false positives, 2026-07).
+    `rewrite_gitleaks_gitignore` (applied next) restores gitignore parity by
+    allowlisting exactly what git ignores, mirroring `rewrite_trivy_gitignore`.
     """
     if not shutil.which('gitleaks') or '/tmp/gitleaks' not in cmd:
         return cmd
@@ -752,13 +757,83 @@ def rewrite_gitleaks_download(cmd: str) -> str:
             i += 1  # skip curl download line
             continue
         # Rewrite /tmp/gitleaks to the PATH binary; keep `dir .` as-is so the local
-        # scan matches CI (filesystem, .gitignore-respecting). Do NOT rewrite to
+        # scan matches CI (a working-tree filesystem scan). gitignore parity is
+        # restored separately by rewrite_gitleaks_gitignore. Do NOT rewrite to
         # `detect --source .` — that scans full git history and flags already-removed
         # historical secrets CI's `dir` scan never sees.
         line = _GITLEAKS_PATH_RE.sub('gitleaks', lines[i])
         result.append(line)
         i += 1
     return ''.join(result)
+
+
+# ---------------------------------------------------------------------------
+# Gitleaks gitignore parity
+# ---------------------------------------------------------------------------
+# `gitleaks dir` walks the raw filesystem and does NOT honour .gitignore. CI runs
+# it against a fresh checkout (git-tracked files only); locally the working tree
+# also carries gitignored scratch CI never sees — .code-review/ report artifacts,
+# a private repo's *.dec decrypted secrets, node_modules — and gitleaks happily
+# scans them, raising findings the gate never would (the webhttp .code-review
+# false positives, 2026-07). gitleaks has no --skip-dirs/--exclude flag (trivy
+# does), so mirror the trivy parity fix through the one lever gitleaks offers: a
+# generated config that extends the default ruleset (useDefault=true, so every
+# default rule still fires on scanned files) and allowlists exactly the paths git
+# ignores. Delivered inline via GITLEAKS_CONFIG_TOML so no temp file is needed.
+# Allowlisting a gitignored path cannot hide a shipped secret — a secret in a
+# gitignored file is not in the repo CI checks out.
+_GITLEAKS_DIR_RE = re.compile(r'((?:\S+/)?gitleaks)\s+dir\b')
+_GITLEAKS_CONFIG_FLAG_RE = re.compile(r'(?:^|\s)(?:-c|--config)(?:=|\s)')
+
+
+def rewrite_gitleaks_gitignore(cmd: str, cwd: Path) -> str:
+    """Allowlist gitignored paths in a `gitleaks dir` run so it matches CI's fileset.
+
+    CI scans a fresh checkout (tracked files only); locally the working tree
+    carries gitignored scratch gitleaks would otherwise flag. Skips a command
+    that already pins its own config (-c/--config, or a repo .gitleaks.toml) so
+    an explicit configuration is never overridden.
+    """
+    if not _GITLEAKS_DIR_RE.search(cmd) or not shutil.which('gitleaks') or not shutil.which('git'):
+        return cmd
+    # Never override an explicit config (flag or repo-local .gitleaks.toml).
+    if _GITLEAKS_CONFIG_FLAG_RE.search(cmd) or (cwd / '.gitleaks.toml').is_file():
+        return cmd
+    try:
+        out = subprocess.run(
+            ['git', 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory'],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return cmd
+    if out.returncode != 0:
+        return cmd
+    regexes = []
+    for entry in out.stdout.splitlines():
+        entry = entry.strip()
+        if not entry:
+            continue
+        if entry.endswith('/'):
+            regexes.append('^' + re.escape(entry))  # directory: everything under it
+        else:
+            regexes.append('^' + re.escape(entry) + '$')  # exact file
+    if not regexes:
+        return cmd
+    import json
+
+    paths = ', '.join(json.dumps(rx) for rx in regexes)
+    config = (
+        '[extend]\n'
+        'useDefault = true\n\n'
+        '[[allowlists]]\n'
+        'description = "ci-local: skip git-ignored paths (gitignore parity)"\n'
+        f'paths = [{paths}]\n'
+    )
+    env_assign = 'GITLEAKS_CONFIG_TOML=' + shlex.quote(config) + ' '
+    return _GITLEAKS_DIR_RE.sub(lambda m: env_assign + m.group(0), cmd, count=1)
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +962,7 @@ def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
         cmd = rewrite_hadolint_docker(cmd)
         cmd = rewrite_markdownlint_gitignore(cmd, cwd)
         cmd = rewrite_gitleaks_download(cmd)
+        cmd = rewrite_gitleaks_gitignore(cmd, cwd)
         cmd = rewrite_trivy_gitignore(cmd, cwd)
         cmd = rewrite_ci_failures_path(cmd)
 
