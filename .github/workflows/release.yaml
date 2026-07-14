@@ -70,6 +70,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Compute version (cliff)
@@ -432,6 +435,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Verify module path matches major version
@@ -505,6 +511,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Setup Node.js
@@ -544,7 +553,11 @@ jobs:
             # node_modules; the npm publish above does not install them.
             # Install (without touching the lockfile) before publishing to JSR.
             npm install --no-save
-            npx jsr publish --allow-dirty
+            # Pin the jsr CLI: a bare `npx jsr` fetches whatever is latest at
+            # publish time — the one floating executable on the release path.
+            # renovate: datasource=npm depName=jsr
+            JSR_VERSION=0.14.3
+            npx -y "jsr@${JSR_VERSION}" publish --allow-dirty
           fi
 
       - name: Tag + GitHub Release
@@ -590,6 +603,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Setup Node.js
@@ -625,5 +641,9 @@ jobs:
             # node_modules; the npm publish above does not install them.
             # Install (without touching the lockfile) before publishing to JSR.
             npm install --no-save
-            npx jsr publish --allow-dirty
+            # Pin the jsr CLI: a bare `npx jsr` fetches whatever is latest at
+            # publish time — the one floating executable on the release path.
+            # renovate: datasource=npm depName=jsr
+            JSR_VERSION=0.14.3
+            npx -y "jsr@${JSR_VERSION}" publish --allow-dirty
           fi

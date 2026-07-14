@@ -18,7 +18,9 @@ outward, so the conventions below are about not breaking downstream.
   - `release.yaml` — unified release (git-cliff version → publish → tag →
     GitHub Release).
   - `self-ci.yaml` — this repo's _own_ CI; calls the meta `ci.yaml` via a local
-    `./` ref (markdown + python + actionlint/shellcheck) on push/PR to `main`.
+    `./` ref on push/PR to `main`. For this repo that dispatches the `markdown`,
+    `python` (ruff), and `scripts` (actionlint, shellcheck, shfmt, yamllint,
+    zizmor, TOML validation, gitleaks) jobs.
   - `move-major-tag.yaml`, `sync.yaml`, `audit.yaml`, and the scheduled
     security/fuzz/gremlins jobs.
 - `.github/workflow-templates/` — thin caller workflows synced verbatim into
@@ -29,16 +31,25 @@ outward, so the conventions below are about not breaking downstream.
   truth.
 - `actions/git-cliff-version/` — composite action: installs git-cliff and
   outputs `version` + a `release` boolean. Consumed by `release.yaml`.
+- `actions/publish-badge/` — composite action: publishes a shields endpoint
+  JSON to the orphan `badges` branch (preserving sibling badges). Consumed by
+  `coverage.yaml`, `docker-release.yaml`, and `weekly-gremlins.yaml`.
 - `configs/` — canonical configs without native remote-config support
   (`eslint.config.base.mjs`, `prettier.json`, `stylelint.json`,
-  `htmlvalidate.json`, `gremlins.yaml`, `ruff.toml`, `cliff-stable.toml`,
-  `cliff-alpha.toml`). Root-level `.golangci.yaml`, `cliff.toml`,
-  `.editorconfig`, and `.gitattributes` are synced too.
+  `htmlvalidate.json`, `gremlins.yaml`, `ruff.toml`, `renovate.json`,
+  `image-smoke.sh`, `cliff-stable.toml`, `cliff-alpha.toml` — the last two sync
+  to consumers as `cliff.toml`, tiered by latest tag). Root-level
+  `.golangci.yaml`, `.editorconfig`, `.gitattributes`, and `LICENSE` are synced
+  too.
 - The Renovate preset is **not** in this repo; it lives in `cplieger/.github`
   (`default.json`) and is extended via `{ "extends": ["github>cplieger/.github"] }`.
 - `ci-local.sh` / `_ci_local.py` — the local mirror of the CI battery.
 - `scripts/` — `audit.py` (cross-repo compliance), `classify-repos.sh` (sync
-  map generator), `gremlins-aggregate.py`.
+  map generator), `sync-files.py` (the sync engine that pushes the mapped
+  files into consumers as PRs), `gremlins-aggregate.py` (mutation tracker
+  issues), and `install-local-tools.sh` (installs the CI-pinned tool versions
+  locally). The badge-branch writer lives with its action at
+  `actions/publish-badge/publish-badge.sh`.
 
 ## How changes reach consumer repos
 
@@ -56,23 +67,29 @@ travels:
   green). It needs the `SYNC_PAT` secret (fine-grained PAT, Contents:write +
   Pull-requests:write on the targets). `sync.yaml` first regenerates
   `.github/sync.yml` by running `classify-repos.sh` (the file is gitignored,
-  never committed), then runs the file-sync action.
+  never committed), then runs the in-house sync engine
+  (`scripts/sync-files.py` — it replaced the unmaintained
+  BetaHuhn/repo-file-sync-action; test locally with `--dry-run`, limit targets
+  with `--only`).
 - **The Renovate preset** (`default.json`) is fetched natively by Renovate from
   each consumer's one-line `extends`; no sync needed.
 
 ## Validating locally
 
-This repo's own CI is just `actionlint`, so run it before pushing any workflow
-or composite-action change:
+This repo's own CI (`self-ci.yaml`) runs the meta battery on itself: markdown
+lint, ruff over the Python helpers, and the `scripts` job (actionlint,
+shellcheck, shfmt, yamllint, zizmor, TOML validation, gitleaks). Replay the
+whole thing locally before pushing:
+
+```bash
+bash ci-local.sh   # from this repo's root
+```
+
+Or run the two most load-bearing linters directly after a workflow or
+composite-action change:
 
 ```bash
 actionlint
-```
-
-Markdown (this file, the README) is linted in CI by `markdownlint-cli2`. Run it
-locally with the same rule set the `markdown` job in `ci.yaml` writes inline:
-
-```bash
 markdownlint-cli2 "**/*.md" "#node_modules" "#.git"
 ```
 
@@ -124,27 +141,29 @@ or the sync PR auto-merges (configs). Treat the reusable workflow inputs and the
   git-cliff, actionlint, markdownlint-cli2). Let Renovate bump them; only edit
   by hand when changing the pinning itself.
 - **The per-language workflows collect failures instead of failing fast.**
-  `go-ci.yaml` and `shell-ci.yaml` run every check with
+  `go-ci.yaml`, `ts-ci.yaml`, and `shell-ci.yaml` run every check with
   `continue-on-error: true`, append failures to `/tmp/_ci_failures`, and fail in
   a final `Check results` step. Keep that pattern when adding a step so one
   failure doesn't mask the rest.
 
 ## Cross-repo audit
 
-`scripts/audit.py` lists every public `cplieger` repo and checks shared-standard
-compliance (license, default branch, CI wired to `cplieger/ci`, Renovate preset
-`github>cplieger/.github`; description + topics as warnings). Repos that have
-adopted the standard must pass the hard checks; legacy repos are reported for
-visibility only.
+`scripts/audit.py` audits every non-archived `cplieger` repo (public + private)
+against the governance standard: hard failures (merge model, default branch,
+branch protection with the `validate` check, CI wired to `cplieger/ci`, deploy
+webhook, …) block compliance; soft warnings (repo features, Renovate preset,
+description/topics, scanning toggles) are advisory. Known-accepted deviations
+are encoded in the script's `ACCEPTED` table so a clean fleet reports clean.
 
 ```bash
-gh auth login        # once
+gh auth login        # once (needs a CLASSIC PAT with repo scope)
 python3 scripts/audit.py
 ```
 
 `.github/workflows/audit.yaml` runs it weekly (and on demand) and writes the
-table to the run summary. It uses the job token for public repos; add an
-`AUDIT_PAT` secret to extend coverage to private repos.
+table to the run summary. The `AUDIT_PAT` secret must be a classic PAT —
+fine-grained PATs don't serialize the merge-model fields; the script aborts
+rather than emit false negatives.
 
 ## Commits and PRs
 

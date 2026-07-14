@@ -46,6 +46,9 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
           # Full history so we can diff against the PR base / previous push
           # tip to decide whether any code (non-docs) files changed.
           fetch-depth: 0
@@ -218,6 +221,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -254,16 +261,57 @@ jobs:
         continue-on-error: true
         run: sh tests/image-smoke.sh ci-smoke:latest
 
+  # arm64 build-ability gate. Same rationale as the amd64 `docker` job: without
+  # it, an arch-specific Dockerfile break (a hardcoded amd64 download URL, a
+  # wrong `uname -m` case, a base image without an arm64 manifest) merges green
+  # and only surfaces when Release builds the arm64 leg on a native runner.
+  # Build only — the smoke test runs once, on amd64. Public repos only: arm
+  # hosted runners are free for public repos; a free-plan private repo's job
+  # would queue forever and block the required check (every Dockerfile
+  # consumer is public today).
+  docker-arm64:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_docker == 'true' && github.event.repository.private == false }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build image (arm64, no push, no scan)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ci-smoke-arm64:latest
+          # Distinct cache scope: the default `buildkit` scope carries the
+          # amd64 layers (docker job + security scan); mixing arches in one
+          # scope would evict each other.
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64,ignore-error=true
+
   # Markdown lint always runs (every repo has at least a README). Inline rather
   # than a separate reusable workflow so it needs no self-referencing pinned tag
-  # and no per-repo config sync — the canonical rule set lives here. Mirrors the
-  # rule set used by cplieger/.kiro's own markdown lint.
+  # and no per-repo config sync — the canonical rule set for consumer repos
+  # lives here (it deliberately differs from cplieger/.kiro's own
+  # .markdownlint.json, which is tuned for steering docs: e.g. MD033 here
+  # allows a curated element list instead of disabling the rule).
   markdown:
     needs: detect
     runs-on: ubuntu-24.04
     timeout-minutes: 4
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Install markdownlint-cli2
         run: |
@@ -293,6 +341,10 @@ jobs:
     timeout-minutes: 4
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Install ruff
         run: |
@@ -305,11 +357,12 @@ jobs:
 
   # Config + tooling/docs lint for repos with no go.mod/jsr.json/Dockerfile
   # (Docker/Go/TS repos get shell + workflow lint via their own jobs). This is
-  # the surface for IaC / methodology / config repos (cplieger/ci, .github, and
-  # the private repos), so it covers their full bespoke battery:
-  # workflows, shell (lint + format), YAML, TOML, and secret scanning. Soft-gated
-  # like shell-ci.yaml: each step records its name to /tmp/_ci_failures on
-  # failure and the final step fails the job if any did.
+  # the surface for the tooling repos that call the meta workflow (cplieger/ci,
+  # cplieger/.github — the private repos run their own bespoke ci.yaml and do
+  # not come through here), so it covers their full battery: workflows
+  # (actionlint + zizmor), shell (lint + format), YAML, TOML, and secret
+  # scanning. Soft-gated like shell-ci.yaml: each step records its name to
+  # /tmp/_ci_failures on failure and the final step fails the job if any did.
   scripts:
     needs: detect
     if: ${{ needs.detect.outputs.run_scripts == 'true' }}
@@ -317,6 +370,10 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Install actionlint
         run: |
@@ -327,7 +384,28 @@ jobs:
           sudo mv /tmp/actionlint /usr/local/bin/actionlint
 
       - name: Install yamllint
-        run: pip install -q --break-system-packages yamllint
+        run: |
+          # renovate: datasource=pypi depName=yamllint
+          VERSION=1.38.0
+          pip install -q --break-system-packages "yamllint==${VERSION}"
+
+      - name: Install zizmor
+        run: |
+          # renovate: datasource=pypi depName=zizmor
+          VERSION=1.26.1
+          pipx install "zizmor==${VERSION}"
+
+      - name: Install shellcheck
+        run: |
+          # The runner's preinstalled shellcheck false-positives SC2317 on
+          # trap-invoked functions (fixed in 0.11.0). Pin it like shell-ci.yaml
+          # so the gate matches local tooling and stays reproducible.
+          # renovate: datasource=github-releases depName=koalaman/shellcheck
+          VERSION=v0.11.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${VERSION}/shellcheck-${VERSION}.linux.x86_64.tar.gz" \
+            | tar -xzf - -C /tmp "shellcheck-${VERSION}/shellcheck"
+          sudo mv "/tmp/shellcheck-${VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
 
       - name: Install shfmt
         run: |
@@ -343,6 +421,17 @@ jobs:
           (
             actionlint -color
           ) || { echo "Lint workflows (actionlint)" >> /tmp/_ci_failures; exit 1; }
+
+      # Workflow security audit (template injection, credential persistence,
+      # cache poisoning, unpinned refs, …). Offline mode: no GitHub API calls,
+      # so no token and no rate-limit flakes. Repo-level suppressions with
+      # rationale live in .github/zizmor.yml.
+      - name: Audit workflows (zizmor)
+        continue-on-error: true
+        run: |
+          (
+            zizmor --no-online-audits .
+          ) || { echo "Audit workflows (zizmor)" >> /tmp/_ci_failures; exit 1; }
 
       - name: Lint shell scripts (shellcheck)
         continue-on-error: true
@@ -423,7 +512,7 @@ jobs:
   # per-type templates so existing branch-protection rules keep working
   # without per-repo updates).
   validate:
-    needs: [detect, go, ts, web, shell, docker, markdown, python, scripts]
+    needs: [detect, go, ts, web, shell, docker, docker-arm64, markdown, python, scripts]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 1
@@ -436,6 +525,7 @@ jobs:
           WEB: ${{ needs.web.result }}
           SHELL: ${{ needs.shell.result }}
           DOCKER: ${{ needs.docker.result }}
+          DOCKER_ARM64: ${{ needs.docker-arm64.result }}
           MARKDOWN: ${{ needs.markdown.result }}
           PYTHON: ${{ needs.python.result }}
           SCRIPTS: ${{ needs.scripts.result }}
@@ -449,7 +539,7 @@ jobs:
           # or skipped (auto-detect said it wasn't applicable). markdown always
           # runs, so it must be success (skipped only if detect failed, caught
           # above).
-          for pair in "go=$GO" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"; do
+          for pair in "go=$GO" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"; do
             name="${pair%%=*}"; result="${pair##*=}"
             if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
               echo "::error::$name job: $result"

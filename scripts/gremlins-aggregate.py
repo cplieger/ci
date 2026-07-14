@@ -330,8 +330,8 @@ LEGEND = """## How to read
 - **Stddev**: variance across runs — high stddev (>3%) signals flaky tests
 - **Mutant coverage**: % of mutants reached by the test suite (test depth)
 
-The "Current live mutants" section is bucketed by **how many of the {N} runs the
-mutant LIVED in**:
+The "Current live mutants" section is bucketed by **how many of the N runs the
+mutant LIVED in** (N = attempts that week, normally 3):
 
 - **Rare flake (1/N)**: a mutant your tests usually KILL but occasionally let
   through. **Most actionable** — almost always means a flaky test that's not
@@ -498,7 +498,7 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
     live_count = agg["live_count"]
 
     new_row = f"| {week} | {eff_mean}% | ±{eff_stddev}% | {cov_mean}% | {live_count} |"
-    history_block, prev_mean = update_history_block(existing, new_row, eff_mean)
+    history_block, _prev_mean = update_history_block(existing, new_row, eff_mean)
 
     # Get all historical means for trend marker.
     history_means = []

@@ -14,11 +14,11 @@ name: Trigger Renovate
 # stays on the GitHub webhook config (GitHub signs + delivers); this workflow
 # only asks GitHub to resend the most recent main-branch push delivery.
 #
-# Two ways to fire:
-#   * workflow_dispatch  — manual launch button in this repo's Actions tab.
-#   * cross-repo dispatch — every cplieger/* docker build pipeline runs
-#     `gh workflow run trigger-renovate.yaml -R cplieger/ci -f reason=...`
-#     after a successful main-branch image push (see docker-release.yaml).
+# The only trigger is workflow_dispatch — a manual launch button in this
+# repo's Actions tab (`gh workflow run trigger-renovate.yaml -R cplieger/ci
+# -f reason="<why>"`). An earlier plan to auto-dispatch this from every docker
+# build pipeline was never wired (and is not needed: image pushes reach the
+# orchestrator through their own release webhook).
 #
 # The orchestrator's procedure on the receiving end starts the one-shot
 # Renovate container/stack.

@@ -1,0 +1,14 @@
+# Lint this repo's own Python (scripts/*.py, _ci_local.py) with the same
+# canonical config consumer repos receive via sync. `extend` avoids a drifting
+# duplicate: edit configs/ruff.toml only. Without this file, the meta CI
+# python job linted this repo with ruff's minimal defaults instead of the
+# fleet ruleset.
+extend = "configs/ruff.toml"
+
+[lint.extend-per-file-ignores]
+# The CI parser intentionally uses globals + dynamic dispatch (PLW0603),
+# passes StepResult's leading bool positionally (FBT003), and uses `›` as a
+# deliberate job›step separator in terminal output (RUF001). Repo-local
+# ignores: this file only exists here, so they don't belong in the synced
+# canonical config.
+"_ci_local.py" = ["PLW0603", "FBT003", "RUF001"]

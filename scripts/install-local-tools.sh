@@ -15,13 +15,10 @@
 #
 # COVERS (the tools the `ci / validate` gate + advisory security scan run):
 #   - Renovate-pinned, exact version: golangci-lint, gitleaks, trivy, hadolint
-#     (release binaries), shfmt (release binary), ruff (pipx),
-#     markdownlint-cli2 (npm)
-#   - best-effort LATEST (no CI pin exists to read): shellcheck, yamllint. CI
-#     uses the ubuntu-24.04 runner's preinstalled shellcheck (floats with the
-#     runner image) and a bare `pip install yamllint` (unpinned), so there is
-#     nothing to pin against; the newest release / latest pipx build is the
-#     closest local proxy.
+#     (release binaries), shfmt + the shellcheck binary (release binaries; CI
+#     pins the latter since the SC2317 runner false-positive fix), ruff, zizmor
+#     (pipx), yamllint (pipx), markdownlint-cli2 (npm). Every one of these is
+#     pinned in a workflow next to a `# renovate:` comment.
 #   - standalone complexity binaries (no CI pin to read): gocyclo, gocognit,
 #     installed @latest. The `ci / validate` gate runs cyclomatic + cognitive
 #     complexity INSIDE golangci-lint (the gocyclo + gocognit linters); these
@@ -29,12 +26,11 @@
 #     measurement use (`gocyclo -avg .`, `gocognit -avg .`), which golangci
 #     does not expose.
 #   - every `go install <pkg>@<ver>` line in go-ci.yaml; the version is pinned in
-#     a shell var (e.g. GOVULNCHECK_VERSION=v1.4.0) which this script resolves:
+#     a shell var (e.g. GOVULNCHECK_VERSION=v1.6.0) which this script resolves:
 #     govulncheck, actionlint, deadcode, punused
-#   Versions are always read live from the workflows, never hardcoded here: the
-#   `# renovate: ... depName=X` + `VERSION` pins for most tools; trivy from the
-#   security-scan.yaml TRIVY_VERSION pin; hadolint from its `hadolint/hadolint:
-#   <tag>` image reference (it runs in CI as a Docker image, not a VERSION pin).
+#   Versions are always read live from the workflows, never hardcoded here,
+#   via the `# renovate: ... depName=X` + `VERSION` pins (hadolint's pin is the
+#   HADOLINT_VERSION var feeding its `hadolint/hadolint:<tag>` docker-run).
 # NOT covered (install via your package manager, or not part of local validate):
 #   - release- or niche-only: git-cliff (release), gremlins (weekly mutation)
 #   - project-local TS devdeps run via `npm ci` (the native `tsc` via each
@@ -310,14 +306,15 @@ install_trivy() {
   fi
 }
 
-# install_hadolint: hadolint runs in CI as a pinned Docker image
-# (hadolint/hadolint:<tag> in go-ci.yaml + shell-ci.yaml), not a
-# `# renovate: ... VERSION=` line, so read the tag directly rather than via
-# pin_version. Install the matching release binary so local Dockerfile lint
-# applies the same rule set as the gate.
+# install_hadolint: hadolint runs in CI as a Docker image whose tag is pinned
+# by the HADOLINT_VERSION var next to a `# renovate: datasource=docker` comment
+# in shell-ci.yaml — readable via pin_version like every other tool. Install
+# the matching release binary so local Dockerfile lint applies the same rule
+# set as the gate.
 install_hadolint() {
   local want cur arch
-  want="$(grep -hoE 'hadolint/hadolint:[0-9]+\.[0-9]+\.[0-9]+' "$WF_DIR"/*.yaml 2>/dev/null | head -n1 | sed 's/.*://')"
+  want="$(pin_version hadolint/hadolint)"
+  want="${want#v}" # docker tag carries no v prefix; normalize anyway
   [ -n "$want" ] || {
     bad hadolint "no pin found"
     return
@@ -344,17 +341,14 @@ install_hadolint() {
   fi
 }
 
-# install_shellcheck: CI does not pin shellcheck — it uses the ubuntu-24.04
-# runner's preinstalled copy, which floats with the runner image — so there is
-# no pin to read. Best effort per the maintainer's call: track the newest
-# stable release (the closest local proxy to the runner's). The tag is resolved
-# live from the GitHub API rather than a workflow pin.
+# install_shellcheck: pinned in shell-ci.yaml AND the meta ci.yaml scripts job
+# (the runner's preinstalled copy false-positives SC2317, so CI installs its
+# own); read the pin like every other tool.
 install_shellcheck() {
   local want cur arch
-  want="$(curl -fsSL "https://api.github.com/repos/koalaman/shellcheck/releases/latest" 2>/dev/null \
-    | grep -oE '"tag_name": *"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')"
+  want="$(pin_version koalaman/shellcheck)"
   [ -n "$want" ] || {
-    bad shellcheck "could not resolve latest tag"
+    bad shellcheck "no pin found"
     return
   }
   cur="$(shellcheck --version 2>/dev/null | awk '/^version:/ {print $2}' || true)"
@@ -412,22 +406,55 @@ install_shfmt() {
 }
 
 # install_yamllint: the YAML linter run by the meta CI scripts job and the
-# the private repos' bespoke CI. CI installs it unpinned (`pip install yamllint`), so
-# there is no version to read — best-effort, same rationale as shellcheck. Skip
-# when already present (presence is enough absent a pin).
+# private repos' bespoke CI. Pinned in the scripts job next to a
+# `# renovate: datasource=pypi` comment; install the exact version.
 install_yamllint() {
+  local want cur
+  want="$(pin_version yamllint)"
+  [ -n "$want" ] || {
+    bad yamllint "no pin found"
+    return
+  }
+  cur="$(yamllint --version 2>/dev/null | semver || true)"
+  [ "$cur" = "$want" ] && {
+    skip yamllint "$want"
+    return
+  }
   command -v pipx >/dev/null 2>&1 || {
     bad yamllint "pipx not found"
     return
   }
-  if command -v yamllint >/dev/null 2>&1; then
-    skip yamllint "$(yamllint --version 2>/dev/null | semver || echo present)"
-    return
-  fi
-  if pipx install yamllint >/dev/null 2>&1; then
-    ok yamllint "latest" "pipx"
+  if pipx install --force "yamllint==${want}" >/dev/null 2>&1; then
+    ok yamllint "$want" "pipx"
   else
     bad yamllint "pipx failed"
+  fi
+}
+
+# install_zizmor: the GitHub Actions security auditor run by the meta CI
+# scripts job (soft-gated). Pinned there next to a `# renovate:
+# datasource=pypi` comment; install the exact version so local ci-local runs
+# match the gate.
+install_zizmor() {
+  local want cur
+  want="$(pin_version zizmor)"
+  [ -n "$want" ] || {
+    bad zizmor "no pin found"
+    return
+  }
+  cur="$(zizmor --version 2>/dev/null | semver || true)"
+  [ "$cur" = "$want" ] && {
+    skip zizmor "$want"
+    return
+  }
+  command -v pipx >/dev/null 2>&1 || {
+    bad zizmor "pipx not found"
+    return
+  }
+  if pipx install --force "zizmor==${want}" >/dev/null 2>&1; then
+    ok zizmor "$want" "pipx"
+  else
+    bad zizmor "pipx failed"
   fi
 }
 
@@ -461,6 +488,7 @@ main() {
   install_shellcheck
   install_shfmt
   install_yamllint
+  install_zizmor
   install_trivy
   install_ruff
   install_markdownlint

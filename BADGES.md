@@ -65,7 +65,15 @@ package, so unless `package.json` declared `engines.node` it rendered
 `node | not specified` — and even when populated it links to the same npm
 package page as the npm badge, so it fails principle #5 (every badge earns its
 place). Dropped org-wide (`actions`, `reactive`). No **Mutation** badge either
-— gremlins is Go-only (there is no Stryker equivalent wired up).
+— gremlins is Go-only. The TS counterpart is `weekly-stryker.yaml`
+(Saturdays), which publishes a **mutation (TS)** badge as `mutation-ts.json`
+on the same `badges` branch for any package dir that opts in by committing a
+`stryker.config.*` plus the `@stryker-mutator/core` + `vitest-runner`
+devDependencies (same colour bands as the Go badge):
+
+```markdown
+[![Mutation (TS)](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation-ts.json)](https://github.com/cplieger/REPO)
+```
 
 ### Hybrid Go + TS library (e.g. web-terminal-engine)
 
@@ -153,7 +161,7 @@ cosmetic; the visible label comes from the endpoint JSON). The badge shows
 `invalid` until the first run on `main` publishes the file. Only the Go/TS repos
 receive `coverage.yml`.
 
-Publishing goes through `scripts/publish-badge.sh`, which **preserves sibling
+Publishing goes through `actions/publish-badge/publish-badge.sh`, which **preserves sibling
 badge files** on the branch (so `coverage.json` and `mutation.json` coexist
 instead of clobbering each other — see below).
 
@@ -165,16 +173,16 @@ branch. It is published by the `badge` job in `cplieger/ci`'s
 Go-having repo above ≈200 LOC of non-test Go, three times each, on a weekly
 schedule (Sundays 22:00 UTC). `scripts/gremlins-aggregate.py --badge-file`
 computes the mean efficacy (kill rate) from the per-attempt artifacts and
-`scripts/publish-badge.sh` force-pushes `mutation.json` alongside
+`actions/publish-badge/publish-badge.sh` force-pushes `mutation.json` alongside
 `coverage.json`. Colour bands are tuned lower than coverage (≥85 brightgreen,
-≥70 green, ≥50 yellow, ≥30 orange, else red), because a healthy suite kills most
+≥75 green, ≥50 yellow, ≥30 orange, else red), because a healthy suite kills most
 but rarely all runnable mutants (equivalent mutants form a noise floor). The
 badge links to the per-repo `gremlins-tracker` issue, which carries the rolling
 12-week history and the current live-mutant list. It shows `invalid` until the
 first weekly run publishes the file, and updates weekly (not per-push — mutation
 testing is too expensive for the PR path).
 
-`scripts/publish-badge.sh` requires a token with `contents:write` on the target
+`actions/publish-badge/publish-badge.sh` requires a token with `contents:write` on the target
 repo. Coverage uses the consumer's own `GITHUB_TOKEN` (it runs in-repo);
 weekly-gremlins runs in `cplieger/ci` and pushes cross-repo, so it uses the
 `CI_SCHEDULE` PAT (which already clones consumers and edits their tracker
@@ -190,7 +198,7 @@ release) — the same "publish on every build" model as the coverage badge. The
 job sums the compressed (download) layer sizes of the `linux/amd64` sub-manifest
 of the just-pushed image (`docker buildx imagetools inspect --raw`, no pull) and
 publishes `{"label":"image size","message":"<N> MB"}` through
-`scripts/publish-badge.sh` (sibling-preserving, so it coexists with
+`actions/publish-badge/publish-badge.sh` (sibling-preserving, so it coexists with
 `coverage.json` / `mutation.json`) using the consumer's own `GITHUB_TOKEN`
 (finalize already has `contents: write`). amd64 is reported by convention (the
 size a typical consumer pulls); arm64 differs by a few percent. The step is

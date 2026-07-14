@@ -1,0 +1,40 @@
+# zizmor configuration for this repo's own workflow audit (the meta ci.yaml
+# `scripts` job runs `zizmor --no-online-audits .` as a soft-gated step).
+# Every suppression below carries its rationale; anything NOT listed here is a
+# real finding and fails the gate.
+
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # Same-owner composite actions (cplieger/ci/actions/publish-badge) may
+        # be tag-pinned: a brand-new action cannot know its own merge-commit
+        # SHA in advance (chicken-and-egg), so it bootstraps as @v2 and
+        # Renovate's pinDigest pass converts it to a SHA pin on its next sweep.
+        # The tag is owner-controlled, so the moving-tag risk is self-contained.
+        "cplieger/*": ref-pin
+        # Everyone else stays hash-pinned (the repo standard).
+        "*": hash-pin
+
+  secrets-inherit:
+    ignore:
+      # release.yaml forwards `secrets: inherit` to its OWN docker-release.yaml
+      # via a local ./ ref — same repo, same trust domain. The only secrets in
+      # play are DOCKERHUB_USERNAME/TOKEN, which docker-release genuinely needs.
+      - release.yaml
+
+  cache-poisoning:
+    ignore:
+      # docker-release's per-arch build jobs read/write `scope=<arch>` GHA
+      # caches. GitHub's cache scoping already prevents a PR branch from
+      # poisoning main's cache (branch caches are only readable downstream,
+      # never by main), and release builds run from main only.
+      - docker-release.yaml
+
+  adhoc-packages:
+    ignore:
+      # The scripts job installs its linters (ruff via pipx, yamllint via pip,
+      # zizmor via pipx) at run time — each is version-pinned next to a
+      # `# renovate:` comment, which is this repo's standard pinning pattern
+      # (same class as the curl-installed binaries zizmor doesn't flag).
+      - ci.yaml

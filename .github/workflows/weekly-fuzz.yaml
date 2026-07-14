@@ -44,6 +44,12 @@ concurrency:
   group: weekly-fuzz
   cancel-in-progress: false
 
+env:
+  # Per-target fuzz budget in seconds — the single knob. The fanout job sizes
+  # shards from it and the fuzz job passes it to -fuzztime, so the two can't
+  # drift apart.
+  FUZZ_TIME_SECONDS: "120"
+
 jobs:
   fanout:
     runs-on: ubuntu-24.04
@@ -56,8 +62,6 @@ jobs:
         id: fanout
         env:
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
-          # Per-target fuzz time in seconds (mirrors FUZZ_TIME=2m in the fuzz job).
-          FUZZ_TIME_SECONDS: "120"
           # Max fuzzing seconds per shard. 4h leaves ~2h headroom under the 6h
           # hosted-runner ceiling for clone + build + baseline-coverage overhead.
           SHARD_BUDGET_SECONDS: "14400"
@@ -117,7 +121,6 @@ jobs:
       contents: read
     env:
       GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
-      FUZZ_TIME: 2m
     steps:
       - name: Clone target repo at pinned SHA
         run: |
@@ -151,7 +154,7 @@ jobs:
             done
           done
           total=${#targets[@]}
-          echo "repo has ${total} fuzz target(s); shard ${SHARD}/${SHARDS}, ${FUZZ_TIME}/target"
+          echo "repo has ${total} fuzz target(s); shard ${SHARD}/${SHARDS}, ${FUZZ_TIME_SECONDS}s/target"
           idx=0
           ran=0
           for entry in "${targets[@]}"; do
@@ -159,7 +162,7 @@ jobs:
               pkg="${entry%%|*}"
               fn="${entry##*|}"
               echo "::group::fuzz ${fn} (${pkg})"
-              out=$(go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME}" "$pkg" 2>&1) || true
+              out=$(go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME_SECONDS}s" "$pkg" 2>&1) || true
               printf '%s\n' "$out"
               rel=$(printf '%s\n' "$out" | sed -nE 's@.*Failing input written to (testdata/fuzz/[^[:space:]]+).*@\1@p' | head -1)
               if [ -n "$rel" ]; then
@@ -171,7 +174,12 @@ jobs:
                 seed="${dir}/${rel}"
                 size=$(wc -c < "$seed" 2>/dev/null || echo 0)
                 preview=$(head -c 500 "$seed" 2>/dev/null | base64 -w0 2>/dev/null | head -c 800 || true)
-                printf '%s|%s|%s|%s|%s\n' "$fn" "$(basename "$rel")" "${dir#"$PWD"/}/${rel}" "$size" "$preview" \
+                # Repo-relative seed path. For the ROOT package dir == $PWD, so
+                # the plain ${dir#"$PWD"/} prefix-strip would not match (no
+                # trailing slash) and leak an absolute runner path into the
+                # issue body; strip the two parts separately instead.
+                rel_dir="${dir#"$PWD"}"; rel_dir="${rel_dir#/}"
+                printf '%s|%s|%s|%s|%s\n' "$fn" "$(basename "$rel")" "${rel_dir:+$rel_dir/}${rel}" "$size" "$preview" \
                   >> "$GITHUB_WORKSPACE/findings.txt"
               fi
               echo "::endgroup::"
@@ -287,8 +295,13 @@ jobs:
             target=$(echo "$title" | sed -nE 's|^\[fuzz\] ([A-Za-z][A-Za-z0-9_]*) regression .+$|\1|p')
             hash=$(echo "$title" | sed -nE 's|^.+ — ([a-f0-9]+)$|\1|p')
             { [ -z "$target" ] || [ -z "$hash" ]; } && continue
-            if find testdata/fuzz -path "*/${target}/${hash}" -print -quit 2>/dev/null | grep -q .; then
-              msg="Closed automatically: seed \`testdata/fuzz/${target}/${hash}\` was committed; now part of the deterministic regression corpus."
+            # Search the WHOLE tree: seed corpora live at the package level
+            # (e.g. internal/foo/testdata/fuzz/...), not only at the repo root.
+            # A root-only `find testdata/fuzz` never matched non-root packages,
+            # leaving their issues open forever despite the committed seed.
+            seedpath=$(find . -path "*/testdata/fuzz/${target}/${hash}" -print -quit 2>/dev/null)
+            if [ -n "$seedpath" ]; then
+              msg="Closed automatically: seed \`${seedpath#./}\` was committed; now part of the deterministic regression corpus."
               gh issue close "$n" --repo "$REPO" --comment "$msg" >/dev/null
               echo "  closed #${n}"
             fi

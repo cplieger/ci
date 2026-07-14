@@ -1,12 +1,13 @@
 name: Go CI
 
-# Reusable Go CI. Call from a repo with:
-#   jobs: { ci: { uses: cplieger/ci/.github/workflows/go-ci.yaml@v1 } }
-# Profile is auto-detected: app-mode (deadcode, punused, dependency-review)
-# activates when a `main` package exists; hadolint runs when a Dockerfile is
-# present. (fieldalignment is enforced by golangci-lint via `govet: enable-all`
-# on non-test code — the synced .golangci.yaml excludes _test.go — not a
-# standalone step.)
+# Reusable Go CI. Called by the meta ci.yaml's `go` job; consumers pin the
+# meta workflow via `@<sha> # v2`.
+# Profile is auto-detected: app-mode (deadcode, punused) activates when a
+# `main` package exists. Dockerfile lint (hadolint) is NOT here: the meta
+# ci.yaml dispatches shell-ci.yaml for every repo with a Dockerfile, and that
+# is where hadolint runs. (fieldalignment is enforced by golangci-lint via
+# `govet: enable-all` on non-test code — the synced .golangci.yaml excludes
+# _test.go — not a standalone step.)
 
 on:
   workflow_call:
@@ -34,6 +35,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Setup Go
@@ -47,7 +51,6 @@ jobs:
         run: |
           set -euo pipefail
           if go list -f '{{.Name}}' ./... 2>/dev/null | grep -qx main; then echo 'app=true' >> "$GITHUB_OUTPUT"; else echo 'app=false' >> "$GITHUB_OUTPUT"; fi
-          if [ -f Dockerfile ]; then echo 'dockerfile=true' >> "$GITHUB_OUTPUT"; else echo 'dockerfile=false' >> "$GITHUB_OUTPUT"; fi
 
       - name: Install golangci-lint
         run: |
@@ -179,24 +182,6 @@ jobs:
             if [ -n "$output" ]; then echo "$output"; exit 1; fi
           ) || { echo "punused" >> /tmp/_ci_failures; exit 1; }
 
-      - name: Validate Dockerfile
-        if: ${{ steps.profile.outputs.dockerfile == 'true' }}
-        continue-on-error: true
-        run: |
-          (
-            df="Dockerfile"
-            [ -f "$df" ] || df="${GITHUB_WORKSPACE}/Dockerfile"
-            # Pre-pull hadolint with retry: anonymous Docker Hub pulls on
-            # shared runner IPs intermittently time out ("context deadline
-            # exceeded"), which otherwise fails the Dockerfile-lint step.
-            for attempt in 1 2 3; do
-              docker pull -q hadolint/hadolint:2.12.0 && break
-              echo "hadolint pull ${attempt}/3 failed; retrying" >&2; sleep $((attempt * 5))
-            done
-            docker run --rm -i hadolint/hadolint:2.12.0 \
-              hadolint --ignore DL3018 - < "$df"
-          ) || { echo "hadolint" >> /tmp/_ci_failures; exit 1; }
-
       - name: Scan for secrets
         continue-on-error: true
         run: |
@@ -207,9 +192,14 @@ jobs:
             /tmp/gitleaks dir . --no-banner --redact --exit-code 1
           ) || { echo "Scan for secrets" >> /tmp/_ci_failures; exit 1; }
 
+      # PR-time dependency vulnerability review. Runs for libraries and apps
+      # alike (a vulnerable dep in a library propagates to every consumer).
+      # Hard step (no continue-on-error): a `uses:` step can't append to
+      # /tmp/_ci_failures, so soft-gating it would silently tolerate its
+      # failure. Public repos only — the dependency-review API needs the
+      # dependency graph, which private repos on the free plan don't expose.
       - name: Dependency review
-        if: ${{ steps.profile.outputs.app == 'true' && github.event_name == 'pull_request' }}
-        continue-on-error: true
+        if: ${{ github.event_name == 'pull_request' && github.event.repository.private == false }}
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
