@@ -2,8 +2,13 @@ name: Sync shared files
 
 # Propagates the canonical config files in this repo to consumer repos as PRs,
 # for tools that have no native remote-config support (golangci-lint, git-cliff,
-# editorconfig, eslint/prettier/stylelint bases). Renovate-extends handles
-# renovate.json natively, so it is not synced here.
+# editorconfig, eslint/prettier/stylelint bases), plus the workflow templates
+# and the one-liner renovate.json preset shim (configs/renovate.json).
+#
+# The sync engine is the in-house scripts/sync-files.py (it replaced
+# BetaHuhn/repo-file-sync-action, unmaintained since 2024 — no third-party
+# code holds the fleet-wide write PAT anymore). Same contract as before:
+# branch repo-sync/ci/default, chore(sync) commits, `dependencies` label.
 #
 # Requires a SYNC_PAT secret: a fine-grained PAT with Contents:write +
 # Pull-requests:write on the target repos.
@@ -13,9 +18,9 @@ on:
     branches: [main]
     paths:
       - ".golangci.yaml"
-      - "cliff.toml"
       - ".editorconfig"
       - ".gitattributes"
+      - "LICENSE"
       - "configs/**"
       - "scripts/classify-repos.sh"
       - ".github/workflow-templates/**"
@@ -26,13 +31,12 @@ on:
 permissions:
   contents: read
 
-# The sync action force-pushes the same repo-sync/ci/default branch across
+# The sync engine force-pushes the same repo-sync/ci/default branch across
 # every consumer repo. Two overlapping runs (e.g. two pushes to main within
-# seconds of each other) race on that branch and fail with "cannot lock ref"
-# / duplicate-PR errors partway through the repo list, stranding any PRs
-# already created without auto-merge enabled. Queue instead of running in
-# parallel; cancel-in-progress is unsafe here since a cancelled mid-loop run
-# leaves partial state, so let each run finish before the next starts.
+# seconds of each other) would race on that branch and duplicate PRs partway
+# through the repo list. Queue instead of running in parallel;
+# cancel-in-progress is unsafe here since a cancelled mid-loop run leaves
+# partial state, so let each run finish before the next starts.
 concurrency:
   group: sync-shared-files
   cancel-in-progress: false
@@ -44,6 +48,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       # Regenerate the repo↔file manifest fresh on every run, then hand it
       # straight to the sync action below via CONFIG_PATH. The file is
@@ -56,14 +64,15 @@ jobs:
         run: bash scripts/classify-repos.sh > .github/sync.yml
         timeout-minutes: 5
 
+      # In-house engine: shallow-clones each target, copies the mapped files,
+      # commits `chore(sync): …` on repo-sync/ci/default, force-pushes, and
+      # ensures an open labelled PR (closing stale empty ones). Failure
+      # isolation per repo; exits non-zero at the end if any repo failed.
       - name: Sync files to consumer repos
-        id: sync
-        uses: BetaHuhn/repo-file-sync-action@8b92be3375cf1d1b0cd579af488a9255572e4619 # v1
-        with:
-          GH_PAT: ${{ secrets.SYNC_PAT }}
-          CONFIG_PATH: .github/sync.yml
-          COMMIT_PREFIX: "chore(sync):"
-          PR_LABELS: dependencies
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: python3 scripts/sync-files.py --manifest .github/sync.yml
+        timeout-minutes: 15
 
       - name: Enable auto-merge on sync PRs
         # Each sync PR is a routine SHA / config bump; once the consumer

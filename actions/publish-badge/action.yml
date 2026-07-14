@@ -1,0 +1,40 @@
+name: publish-badge
+description: >-
+  Publish or update one shields `endpoint` JSON on a repo's orphan `badges`
+  branch, preserving sibling badge files (coverage.json, mutation.json,
+  size.json coexist instead of clobbering each other on force-push). Wraps
+  publish-badge.sh in this directory. Referenced by coverage.yaml and
+  docker-release.yaml as cplieger/ci/actions/publish-badge@<sha> — a composite
+  action MUST be pinned by ref (a local ./ path would resolve against the
+  consumer's checkout and 404); Renovate keeps the pin current. This replaced
+  fetching the script from raw.githubusercontent.com/…/main at run time, which
+  executed whatever HEAD held instead of the version the consumer pinned.
+
+inputs:
+  repo:
+    description: Target owner/repo, e.g. cplieger/atomicfile.
+    required: true
+  token:
+    description: Token with contents:write on the target repo.
+    required: true
+  filename:
+    description: Badge file to write, e.g. coverage.json | mutation.json | size.json.
+    required: true
+  json:
+    description: Full one-line shields endpoint JSON for the badge.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Publish badge
+      shell: bash
+      env:
+        # Inputs travel via env, never inline ${{ }} in the script body, so a
+        # value can't expand into shell code (template injection).
+        BADGE_REPO: ${{ inputs.repo }}
+        BADGE_TOKEN: ${{ inputs.token }}
+        BADGE_FILE: ${{ inputs.filename }}
+        BADGE_JSON: ${{ inputs.json }}
+      # GITHUB_ACTION_PATH is set by the runner to this action's directory.
+      run: bash "${GITHUB_ACTION_PATH}/publish-badge.sh" "$BADGE_REPO" "$BADGE_TOKEN" "$BADGE_FILE" "$BADGE_JSON"

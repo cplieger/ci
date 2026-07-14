@@ -1,7 +1,8 @@
 name: Shell CI
 
-# Reusable shell/Docker CI. Call from a repo with:
-#   jobs: { ci: { uses: cplieger/ci/.github/workflows/shell-ci.yaml@v1 } }
+# Reusable shell/Docker CI. Called by the meta ci.yaml's `shell` job for every
+# repo with a Dockerfile (the single home of hadolint — go-ci deliberately does
+# not duplicate it); consumers pin the meta workflow via `@<sha> # v2`.
 
 on:
   workflow_call:
@@ -32,6 +33,9 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Install actionlint
@@ -78,11 +82,15 @@ jobs:
 
       - name: Lint shell scripts
         continue-on-error: true
+        env:
+          # Via env, never inline ${{ }} in the script body, so the input can't
+          # expand into shell code (template injection).
+          SHELLCHECK_PATHS: ${{ inputs.shellcheck-paths }}
         run: |
           (
-            if [ "${{ inputs.shellcheck-paths }}" = "/dev/null" ]; then
+            if [ "$SHELLCHECK_PATHS" = "/dev/null" ]; then
               echo "shellcheck: skipped (no shell scripts)"
-            elif [ "${{ inputs.shellcheck-paths }}" = "auto" ]; then
+            elif [ "$SHELLCHECK_PATHS" = "auto" ]; then
               # Discover every *.sh in the repo (nested included), matching the
               # ci.yaml `scripts` job. -x follows `source`d files.
               files=$(find . -name '*.sh' -not -path './.git/*')
@@ -93,13 +101,15 @@ jobs:
                 shellcheck -x -S info $files
               fi
             else
-              # Explicit override glob. Expand safely; if it matches no real
-              # files, skip (avoids 'openBinaryFile: does not exist').
+              # Explicit override glob. Expand safely (deliberate word-split +
+              # glob); if it matches no real files, skip (avoids
+              # 'openBinaryFile: does not exist').
               shopt -s nullglob
-              files=( ${{ inputs.shellcheck-paths }} )
+              # shellcheck disable=SC2206
+              files=( $SHELLCHECK_PATHS )
               shopt -u nullglob
               if [ ${#files[@]} -eq 0 ]; then
-                echo "shellcheck: no files matched ${{ inputs.shellcheck-paths }} — skipping"
+                echo "shellcheck: no files matched ${SHELLCHECK_PATHS} — skipping"
               else
                 shellcheck -x -S info "${files[@]}"
               fi
@@ -124,16 +134,28 @@ jobs:
 
       - name: Validate Dockerfile
         continue-on-error: true
+        env:
+          # Via env, never inline ${{ }} in the script body (template injection).
+          HADOLINT_IGNORES: ${{ inputs.hadolint-ignores }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
         run: |
           (
+            # renovate: datasource=docker depName=hadolint/hadolint
+            HADOLINT_VERSION=2.12.0
             IGNORE_FLAGS=""
-            IFS=',' read -ra RULES <<< "${{ inputs.hadolint-ignores }}"
+            IFS=',' read -ra RULES <<< "$HADOLINT_IGNORES"
             for rule in "${RULES[@]}"; do
               IGNORE_FLAGS="${IGNORE_FLAGS} --ignore ${rule}"
             done
+            # Pre-pull with retry: anonymous Docker Hub pulls on shared runner
+            # IPs intermittently time out ("context deadline exceeded").
+            for attempt in 1 2 3; do
+              docker pull -q "hadolint/hadolint:${HADOLINT_VERSION}" && break
+              echo "hadolint pull ${attempt}/3 failed; retrying" >&2; sleep $((attempt * 5))
+            done
             # shellcheck disable=SC2086
-            docker run --rm -i hadolint/hadolint:2.12.0 \
-              hadolint ${IGNORE_FLAGS} - < ${{ inputs.dockerfile }}
+            docker run --rm -i "hadolint/hadolint:${HADOLINT_VERSION}" \
+              hadolint ${IGNORE_FLAGS} - < "$DOCKERFILE"
           ) || { echo "Validate Dockerfile" >> /tmp/_ci_failures; exit 1; }
 
       - name: Scan for secrets

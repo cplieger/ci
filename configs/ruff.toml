@@ -101,8 +101,6 @@ ignore = [
 [lint.per-file-ignores]
 # Test/example files can be more relaxed.
 "**/test_*.py" = ["S", "PLR", "ARG"]
-# The CI parser intentionally uses globals + dynamic dispatch.
-"_ci_local.py" = ["PLW0603"]
 
 [format]
 quote-style = "single"

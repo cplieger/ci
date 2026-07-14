@@ -54,8 +54,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections import namedtuple
 from pathlib import Path
+from typing import NamedTuple
 
 try:
     import yaml
@@ -94,10 +94,8 @@ KNOWN_USES = {
         'trivy fs --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 .',
     ),
     'docker/setup-buildx-action': ('SKIP', 'buildx assumed available with local Docker'),
-    'docker/build-push-action': (
-        'SKIP',
-        'image build skipped locally; run docker build manually if needed',
-    ),
+    # docker/build-push-action is handled by a special case in classify_step
+    # (rewritten to a local `docker build`), so it has no entry here.
     'docker/login-action': ('SKIP', 'registry login not needed locally'),
     'docker/metadata-action': ('SKIP', 'metadata derivation skipped locally'),
     'actions/upload-artifact': ('SKIP', 'artifact upload skipped locally'),
@@ -165,12 +163,24 @@ def gray(s):
 # what did NOT run locally (and why), and exactly what to fix.
 
 # A real, fixable failure: a step that ran and exited non-zero.
-Failure = namedtuple('Failure', 'job step rc cmd output')
+class Failure(NamedTuple):
+    job: str
+    step: str
+    rc: int
+    cmd: str
+    output: str
+
 
 # One executed step's result. outcome ∈ {pass, fail, missing, skip, unknown, dry}.
 # `missing` = exit 127 (the tool isn't on PATH locally): a local-environment gap,
 # NOT a code failure — CI has the tool, so it does not fail the local run.
-StepResult = namedtuple('StepResult', 'ok status rc cmd output outcome')
+class StepResult(NamedTuple):
+    ok: bool
+    status: str
+    rc: int
+    cmd: str
+    output: str
+    outcome: str
 
 
 class RunReport:
@@ -1211,6 +1221,10 @@ def job_applies_locally(jobname, target):
         'web': det['run_web'],
         'shell': det['run_shell'],
         'docker': det['run_docker'],
+        # The arm64 build-ability leg never runs locally: a cross-arch build
+        # needs qemu/binfmt, and the native `docker` job above already
+        # exercises the build-ability gate on this machine's arch.
+        'docker-arm64': 'false',
         'python': det['run_python'],
         'scripts': det['run_scripts'],
     }
@@ -1437,20 +1451,19 @@ def process_reusable_steps(
             REPORT.not_validated.append(
                 (jobname, name, f'`{tool}` not on PATH (exit 127) — CI has it; install to check locally')
             )
-        else:  # fail
-            # continue-on-error: true makes a step advisory in CI — its failure
-            # is recorded but never fails the job/gate. Mirror that locally:
-            # report under not_validated instead of failing the run. The image
-            # smoke test is the main user of this.
-            if step.get('continue-on-error') in (True, 'true'):
-                counters['MISSING'] += 1
-                REPORT.not_validated.append(
-                    (jobname, name, f'advisory step failed (continue-on-error; non-blocking in CI) — rc={res.rc}')
-                )
-            else:
-                counters['FAIL'] += 1
-                overall_ok = False
-                failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
+        # continue-on-error: true makes a step advisory in CI — its failure
+        # is recorded but never fails the job/gate. Mirror that locally:
+        # report under not_validated instead of failing the run. The image
+        # smoke test is the main user of this.
+        elif step.get('continue-on-error') in (True, 'true'):
+            counters['MISSING'] += 1
+            REPORT.not_validated.append(
+                (jobname, name, f'advisory step failed (continue-on-error; non-blocking in CI) — rc={res.rc}')
+            )
+        else:
+            counters['FAIL'] += 1
+            overall_ok = False
+            failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
 
     return overall_ok, counters, failed_steps
 
@@ -1948,18 +1961,17 @@ def run_workflow_steps(jobs, target: Path, dry_run: bool, ignore_unknown: bool):
                 REPORT.not_validated.append(
                     (jobname, name, f'`{tool}` not on PATH (exit 127) — CI has it; install to check locally')
                 )
-            else:  # fail
-                # continue-on-error: true makes a step advisory in CI — mirror
-                # that locally (report, don't fail the run).
-                if eff_step.get('continue-on-error') in (True, 'true'):
-                    counters['MISSING'] += 1
-                    REPORT.not_validated.append(
-                        (jobname, name, f'advisory step failed (continue-on-error; non-blocking in CI) — rc={res.rc}')
-                    )
-                else:
-                    counters['FAIL'] += 1
-                    overall_ok = False
-                    failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
+            # continue-on-error: true makes a step advisory in CI — mirror
+            # that locally (report, don't fail the run).
+            elif eff_step.get('continue-on-error') in (True, 'true'):
+                counters['MISSING'] += 1
+                REPORT.not_validated.append(
+                    (jobname, name, f'advisory step failed (continue-on-error; non-blocking in CI) — rc={res.rc}')
+                )
+            else:
+                counters['FAIL'] += 1
+                overall_ok = False
+                failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
         print()
 
     return overall_ok, counters, failed_steps

@@ -36,6 +36,7 @@ concurrency:
 jobs:
   fanout:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
     steps:
@@ -43,6 +44,9 @@ jobs:
         id: fanout
         env:
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          # Injected via env (not inline ${{ }} in the script) so a crafted
+          # dispatch input can't expand into shell code (template injection).
+          ONLY: ${{ github.event.inputs.only }}
         run: |
           set -euo pipefail
           repos=$(gh repo list cplieger --limit 300 --json name,isArchived --jq '
@@ -52,8 +56,7 @@ jobs:
           # Optional manual filter: the workflow_dispatch 'only' input limits the
           # matrix to named repos (fast iteration when validating a fix). The
           # scheduled run leaves it empty and covers all cplieger repos.
-          ONLY="${{ github.event.inputs.only }}"
-          if [ -n "$ONLY" ]; then
+          if [ -n "${ONLY:-}" ]; then
             wanted=" $(echo "$ONLY" | tr ',' ' ') "
             filtered=""
             for r in $repos; do
@@ -98,11 +101,21 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 350
     permissions:
       contents: read
     env:
       GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
     steps:
+      # Checkout FIRST: actions/checkout cleans the workspace, so it must not
+      # run after the target clone below.
+      - name: Checkout ci (for configs/)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
       - name: Clone target repo
         run: gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
 
@@ -113,8 +126,9 @@ jobs:
           # committed. The committed per-repo copies (kept in sync by
           # sync.yaml, for local `gremlins unleash`) may lag; the shared run must
           # not. "centralization is the point" — see configs/gremlins.yaml.
-          curl -fsSL "https://raw.githubusercontent.com/cplieger/ci/main/configs/gremlins.yaml" \
-            -o target/.gremlins.yaml
+          # Copied from this run's own checkout (same commit as the workflow),
+          # not fetched from raw main at run time.
+          cp configs/gremlins.yaml target/.gremlins.yaml
 
       - name: Run gremlins (attempt ${{ matrix.attempt }})
         run: |
@@ -217,17 +231,24 @@ jobs:
   # branch. Independent of the `aggregate` (issue-tracker) job below, so a
   # tracker-issue failure never blocks the README badge — and vice versa. Reads
   # the same per-attempt artifacts and reuses scripts/gremlins-aggregate.py's
-  # parser (the trusted efficacy formula) plus scripts/publish-badge.sh (the
-  # sibling-preserving publisher shared with coverage.yaml).
+  # parser (the trusted efficacy formula) plus the sibling-preserving publisher
+  # script bundled with the publish-badge composite action (called directly
+  # here — this job loops repos inside one step, where a `uses:` per repo is
+  # not possible).
   badge:
     needs: [fanout, run]
     if: always() && needs.fanout.outputs.matrix != '[]'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
       - name: Checkout ci (for scripts/)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Download all per-attempt artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -265,7 +286,7 @@ jobs:
               echo "  no parseable attempts for ${repo} — leaving existing badge untouched"
               return 0
             fi
-            bash scripts/publish-badge.sh \
+            bash actions/publish-badge/publish-badge.sh \
               "cplieger/${repo}" "$TOKEN" mutation.json "$(cat "$badge")" || return 1
           }
 
@@ -287,6 +308,7 @@ jobs:
     needs: [fanout, run]
     if: always() && needs.fanout.outputs.matrix != '[]'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
     env:
@@ -294,6 +316,10 @@ jobs:
     steps:
       - name: Checkout ci (for scripts/)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Download all per-attempt artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

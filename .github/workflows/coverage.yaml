@@ -28,6 +28,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Detect surface
         id: d
@@ -60,17 +64,18 @@ jobs:
       - name: Measure TS coverage
         if: ${{ steps.d.outputs.kind == 'ts' }}
         run: |
-          npm ci || npm install --no-save --loglevel=warn
+          # Strict npm ci (no npm-install fallback): a drifted lockfile should
+          # fail loudly here exactly as it does in ts-ci.yaml.
+          npm ci
           npx vitest run --coverage --coverage.provider=v8 --coverage.reporter=json-summary
           pct=$(node -e "process.stdout.write(String(require('./coverage/coverage-summary.json').total.statements.pct))")
           echo "PCT=${pct}" >> "$GITHUB_ENV"
 
-      - name: Publish coverage badge
+      - name: Render badge JSON
+        id: badge
         if: ${{ steps.d.outputs.kind != 'none' }}
         env:
           PCT: ${{ env.PCT }}
-          REPO: ${{ github.repository }}
-          TOKEN: ${{ github.token }}
         run: |
           # Color thresholds (integer part only).
           pct_int=${PCT%.*}
@@ -86,14 +91,20 @@ jobs:
           # when YAML dedent shifts the terminator. JSON on one line is safe.
           # Label is lowercase "test coverage" to match the other shields
           # badges (e.g. the "mutation" endpoint), which render lowercase labels.
-          json=$(printf '{"schemaVersion":1,"label":"test coverage","message":"%s%%","color":"%s"}' "$PCT" "$color")
+          printf 'json={"schemaVersion":1,"label":"test coverage","message":"%s%%","color":"%s"}\n' \
+            "$PCT" "$color" >> "$GITHUB_OUTPUT"
+          echo "coverage badge: ${PCT}% (${color})"
 
-          # Publish via the shared sibling-preserving helper so coverage.json
-          # and mutation.json coexist on the orphan `badges` branch instead of
-          # clobbering each other (see scripts/publish-badge.sh). GITHUB_TOKEN
-          # (contents: write) can push to the same repo.
-          curl -fsSL --retry 3 \
-            "https://raw.githubusercontent.com/cplieger/ci/main/scripts/publish-badge.sh" \
-            -o /tmp/publish-badge.sh
-          bash /tmp/publish-badge.sh "$REPO" "$TOKEN" coverage.json "$json"
-          echo "published coverage badge: ${PCT}% (${color})"
+      # Publish via the shared sibling-preserving composite action so
+      # coverage.json and mutation.json coexist on the orphan `badges` branch
+      # instead of clobbering each other. GITHUB_TOKEN (contents: write) can
+      # push to the same repo. The @v2 ref is converted to a SHA pin by
+      # Renovate's pinDigest pass after each tag move.
+      - name: Publish coverage badge
+        if: ${{ steps.d.outputs.kind != 'none' }}
+        uses: cplieger/ci/actions/publish-badge@v2 # v2
+        with:
+          repo: ${{ github.repository }}
+          token: ${{ github.token }}
+          filename: coverage.json
+          json: ${{ steps.badge.outputs.json }}

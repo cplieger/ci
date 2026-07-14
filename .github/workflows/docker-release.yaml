@@ -57,7 +57,12 @@ on:
 env:
   IMAGE_NAME: ${{ github.repository_owner }}/${{ inputs.image-name }}
   REGISTRY: ghcr.io
+  # renovate: datasource=github-releases depName=docker/buildx
   BUILDX_VERSION: v0.34.1
+  # A cosign MAJOR is a breaking change even when the bump looks routine
+  # (v2→v3 flipped sign-blob defaults and broke release SBOM signing) — majors
+  # are not auto-merged; read the changelog before approving.
+  # renovate: datasource=github-releases depName=sigstore/cosign
   COSIGN_VERSION: v3.0.6
   # renovate: datasource=github-releases depName=aquasecurity/trivy
   TRIVY_VERSION: v0.71.2
@@ -192,6 +197,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -241,11 +250,14 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.name }},ignore-error=true
 
       - name: Export digest
+        env:
+          # Via env, never inline ${{ }} in the script body (template injection).
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH_NAME: ${{ matrix.name }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
           # Filename = matrix.name (e.g. linux-amd64); content = the digest.
-          echo "$digest" > "/tmp/digests/${{ matrix.name }}"
+          echo "$DIGEST" > "/tmp/digests/${ARCH_NAME}"
 
       - name: Upload digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -272,6 +284,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Download digests
@@ -368,22 +383,21 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Manifest digest: $digest"
 
-      - name: Publish image-size badge
+      - name: Render image-size badge JSON
         # Self-published size badge, mirroring the coverage badge: sum the
         # linux/amd64 compressed (download) layer sizes of the just-pushed
         # manifest and publish a shields `endpoint` JSON to the orphan `badges`
-        # branch, alongside coverage.json / mutation.json (publish-badge.sh
-        # preserves siblings). Replaces the retired third-party
+        # branch, alongside coverage.json / mutation.json (the publish-badge
+        # action preserves siblings). Replaces the retired third-party
         # ghcr-badge.egpl.dev service (suspended 2026), so the badge has no
         # external dependency. Ungated on release-needed: the image is
         # rebuilt+pushed on every significant change, so the size refreshes
         # whenever it can actually change. Best-effort (continue-on-error) — a
         # badge hiccup must never fail a release.
+        id: sizebadge
         continue-on-error: true
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
-          REPO: ${{ github.repository }}
-          TOKEN: ${{ github.token }}
         run: |
           # imagetools reads the registry directly (no pull); buildx is already
           # logged in to GHCR. The repo path is IMAGE_REF minus its @digest.
@@ -403,12 +417,21 @@ jobs:
           mb=$(awk "BEGIN { printf \"%.1f\", ${bytes} / 1048576 }")
           # Single-line JSON (never a heredoc — GHA YAML dedent breaks heredoc
           # terminators). Neutral blue: a size is informational, not good/bad.
-          json=$(printf '{"schemaVersion":1,"label":"image size","message":"%s MB","color":"blue"}' "$mb")
-          curl -fsSL --retry 3 \
-            "https://raw.githubusercontent.com/cplieger/ci/main/scripts/publish-badge.sh" \
-            -o /tmp/publish-badge.sh
-          bash /tmp/publish-badge.sh "$REPO" "$TOKEN" size.json "$json"
-          echo "published image-size badge: ${mb} MB"
+          printf 'json={"schemaVersion":1,"label":"image size","message":"%s MB","color":"blue"}\n' \
+            "$mb" >> "$GITHUB_OUTPUT"
+          echo "image-size badge: ${mb} MB"
+
+      # The @v2 ref is converted to a SHA pin by Renovate's pinDigest pass
+      # after each tag move.
+      - name: Publish image-size badge
+        if: ${{ steps.sizebadge.outputs.json != '' }}
+        continue-on-error: true
+        uses: cplieger/ci/actions/publish-badge@v2 # v2
+        with:
+          repo: ${{ github.repository }}
+          token: ${{ github.token }}
+          filename: size.json
+          json: ${{ steps.sizebadge.outputs.json }}
 
       - name: Trivy scan published image
         continue-on-error: true
@@ -433,6 +456,8 @@ jobs:
         if: ${{ inputs.sbom-from == 'path' }}
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+          # Via env, never inline ${{ }} in the script body (template injection).
+          BIN_NAME: ${{ inputs.image-name }}
         run: |
           # path-mode SBOM: pull the multi-arch image (Docker resolves to the
           # finalize-job's host arch, amd64), extract /app/<image-name>, then
@@ -442,7 +467,7 @@ jobs:
           CID=$(docker create "$IMAGE_REF")
           trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
           mkdir -p /tmp/sbom-src
-          docker cp "$CID:/app/${{ inputs.image-name }}" /tmp/sbom-src/${{ inputs.image-name }}
+          docker cp "$CID:/app/${BIN_NAME}" "/tmp/sbom-src/${BIN_NAME}"
 
       - name: Generate SBOM (from image)
         if: ${{ inputs.sbom-from == 'image' && inputs.syft-config == '' }}
@@ -574,13 +599,15 @@ jobs:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           REPO_DESC: ${{ github.event.repository.description }}
+          # Via env, never inline ${{ }} in the script body (template injection).
+          IMAGE_NAME_INPUT: ${{ inputs.image-name }}
         run: |
           TOKEN=$(curl -fsSL "https://hub.docker.com/v2/users/login/" \
             -H "Content-Type: application/json" \
             -d "$(jq -n --arg u "$DOCKERHUB_USERNAME" --arg p "$DOCKERHUB_TOKEN" \
               '{username: $u, password: $p}')" | jq -r .token)
           curl -fsSL -X PATCH \
-            "https://hub.docker.com/v2/repositories/${DOCKERHUB_USERNAME}/${{ inputs.image-name }}/" \
+            "https://hub.docker.com/v2/repositories/${DOCKERHUB_USERNAME}/${IMAGE_NAME_INPUT}/" \
             -H "Authorization: Bearer ${TOKEN}" \
             -H "Content-Type: application/json" \
             -d "$(jq -n --arg d "$REPO_DESC" '{description: $d}')" >/dev/null

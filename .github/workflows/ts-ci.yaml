@@ -1,8 +1,11 @@
 name: TS CI
 
-# Reusable TypeScript-library CI for build-less ESM packages. Call with:
-#   jobs: { ci: { uses: cplieger/ci/.github/workflows/ts-ci.yaml@v1, with: { working-directory: "." } } }
-# Uses the runner's Node + the native `tsc` each repo pins via its
+# Reusable TypeScript-library CI for build-less ESM packages. Called by the
+# meta ci.yaml (`ts` job at the root, `web` job at a nested frontend dir with
+# web-lint: true); consumers pin the meta workflow via `@<sha> # v2`.
+# Node is pinned below to the same major release.yaml publishes with, so the
+# tested and published environments match (and the version doesn't drift
+# silently with runner-image updates). `tsc` comes from each repo's own
 # `@typescript/native` devDependency (matches the apps' build-less pipeline).
 
 on:
@@ -32,10 +35,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
           fetch-depth: 0
 
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          # Keep in step with release.yaml's Setup Node.js (same major), so CI
+          # tests on the Node that publishes.
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      # Strict `npm ci` — no `npm install` fallback. The fallback silently
+      # papered over a package.json/package-lock.json drift, so lockfile
+      # integrity was never actually asserted; a drifted lockfile should fail
+      # here and be regenerated in the PR.
       - name: Install deps
-        run: npm ci || npm install --no-save --loglevel=warn
+        run: npm ci
 
       # Soft-gate block: each step below runs to completion (continue-on-error)
       # and records its own name to /tmp/_ci_failures on failure; the final
@@ -51,6 +70,20 @@ jobs:
         continue-on-error: true
         run: ( npm run typecheck && npm run typecheck:tests ) || { echo "typecheck" >> /tmp/_ci_failures; exit 1; }
 
+      # Unused dependencies / exports / files (knip). Config-gated: runs only
+      # where a knip config is committed (the repo opts in), via the repo's own
+      # pinned knip devDependency — no network install, no floating version.
+      - name: Unused deps/exports (knip)
+        continue-on-error: true
+        run: |
+          (
+            if [ -f knip.json ] || [ -f knip.jsonc ] || [ -f knip.config.ts ] || [ -f knip.config.js ]; then
+              npx --no-install knip
+            else
+              echo "no knip config; skipping"
+            fi
+          ) || { echo "knip" >> /tmp/_ci_failures; exit 1; }
+
       - name: Test (vitest)
         continue-on-error: true
         run: ( npm test ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
@@ -58,8 +91,9 @@ jobs:
       - name: Fuzz (fast-check)
         # Fuzzing is intentionally non-deterministic: a push/PR failing because
         # the fuzzer found a new input is a real bug caught early. Public repos
-        # fuzz on push/PR (shift-left); the central weekly dispatch fuzzes every
-        # repo for deeper exploration. *.fuzz.test.ts are the deep targets.
+        # fuzz on push/PR (shift-left) at the budget configured in each test;
+        # private repos only on manual dispatch. (The central weekly-fuzz.yaml
+        # is Go-only — there is no deep weekly TS fuzz run.)
         if: ${{ github.event.repository.private == false || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         continue-on-error: true
         run: |
@@ -103,6 +137,34 @@ jobs:
             done < <(git ls-files | grep -E '(^|/)jsr\.json$')
             exit $rc
           ) || { echo "version parity" >> /tmp/_ci_failures; exit 1; }
+
+      # Workflow lint + secret scan for pure-TS repos. Root-gated: hybrid repos
+      # (Go + web frontend) already run both via their go job at the repo root,
+      # so the nested `web` invocation skips them instead of duplicating.
+      - name: Install actionlint
+        if: ${{ inputs.working-directory == '.' }}
+        run: |
+          # renovate: datasource=github-releases depName=rhysd/actionlint
+          VERSION=v1.7.12
+          curl -fsSL --retry 3 "https://github.com/rhysd/actionlint/releases/download/${VERSION}/actionlint_${VERSION#v}_linux_amd64.tar.gz" \
+            | tar -xzf - -C /tmp actionlint
+          sudo mv /tmp/actionlint /usr/local/bin/actionlint
+
+      - name: Workflows (actionlint)
+        if: ${{ inputs.working-directory == '.' }}
+        continue-on-error: true
+        run: ( actionlint -color ) || { echo "actionlint" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Scan for secrets
+        if: ${{ inputs.working-directory == '.' }}
+        continue-on-error: true
+        run: |
+          (
+            # renovate: datasource=github-releases depName=gitleaks/gitleaks
+            VERSION=v8.30.1
+            curl -fsSL --retry 3 "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz" | tar -xzf - -C /tmp gitleaks
+            /tmp/gitleaks dir . --no-banner --redact --exit-code 1
+          ) || { echo "Scan for secrets" >> /tmp/_ci_failures; exit 1; }
 
       # Verify every bare-specifier value-import in the shippable front-end
       # source has a key in the page's <script type="importmap">. The browser
@@ -225,6 +287,17 @@ jobs:
             find . -name "*.html" -not -path "./node_modules/*" -print0 \
               | xargs -0 --no-run-if-empty npx html-validate
           ) || { echo "web-lint" >> /tmp/_ci_failures; exit 1; }
+
+      # PR-time dependency vulnerability review (npm manifests). Hard step (no
+      # continue-on-error): a `uses:` step can't append to /tmp/_ci_failures,
+      # so soft-gating it would silently tolerate its failure. Public repos
+      # only — the dependency-review API needs the dependency graph, which
+      # private repos on the free plan don't expose.
+      - name: Dependency review
+        if: ${{ inputs.working-directory == '.' && github.event_name == 'pull_request' && github.event.repository.private == false }}
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
 
       - name: Check results
         if: always()

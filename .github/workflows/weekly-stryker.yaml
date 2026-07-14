@@ -1,0 +1,212 @@
+# Weekly TS mutation testing across cplieger consumer repos — the Stryker
+# counterpart to weekly-gremlins.yaml (Go). Pattern C: this workflow owns the
+# matrix and the max-parallel cap; runs happen here, not via cross-repo
+# dispatch.
+#
+# Opt-in contract (per TS package dir, e.g. repo root or static-src/):
+#   1. commit a stryker.config.json (mutate globs, thresholds, vitest runner)
+#   2. add the devDependencies the config needs:
+#        @stryker-mutator/core + @stryker-mutator/vitest-runner
+#        (+ @stryker-mutator/typescript-checker when `checkers` is used)
+# The fanout discovers configs automatically; a dir whose devDeps are missing
+# is SKIPPED with an actionable notice instead of failing, so the runner can
+# ship ahead of repo enrollment and light up as repos opt in.
+#
+# Schedule:     Saturdays 22:00 UTC (own slot: gremlins Sun 22:00, fuzz
+#               Wed 22:00, security daily 03:00 — never fighting the same
+#               20-slot budget window)
+# Runs:         1 per package dir (no 3-attempt averaging: Stryker+vitest on
+#               these small TS surfaces is far more deterministic than Go
+#               mutants under -race; revisit if flakiness appears)
+# Reporting:    mutation score to the run summary + a `mutation-ts.json`
+#               shields endpoint on the consumer's orphan `badges` branch
+#               (sibling-preserving publisher, coexists with coverage.json /
+#               mutation.json). Colour bands match the Go mutation badge.
+#               Stryker itself exits non-zero when the score drops below the
+#               config's `thresholds.break`, which fails that matrix entry —
+#               red is a real regression signal, but nothing blocks consumer
+#               merges (internal weekly job, not a required check).
+name: Weekly stryker
+
+on:
+  schedule:
+    - cron: "0 22 * * 6"   # Saturday 22:00 UTC
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Comma/space-separated repo names to limit the run (for testing). Empty runs against all cplieger repos."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  # Badge pushes happen in CONSUMER repos via the CI_SCHEDULE PAT.
+
+concurrency:
+  group: weekly-stryker
+  cancel-in-progress: false
+
+jobs:
+  fanout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.fanout.outputs.matrix }}
+    steps:
+      - name: Discover TS package dirs with a stryker config
+        id: fanout
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          # Injected via env (not inline ${{ }} in the script) so a crafted
+          # dispatch input can't expand into shell code (template injection).
+          ONLY: ${{ github.event.inputs.only }}
+        run: |
+          set -euo pipefail
+          repos=$(gh repo list cplieger --limit 300 --json name,isArchived --jq '
+            [.[] | select(.isArchived == false) | .name] | .[]
+          ')
+
+          if [ -n "${ONLY:-}" ]; then
+            wanted=" $(echo "$ONLY" | tr ',' ' ') "
+            filtered=""
+            for r in $repos; do
+              case "$wanted" in *" $r "*) filtered="$filtered $r" ;; esac
+            done
+            repos="$filtered"
+            echo "manual 'only' filter active -> ${repos:-<none matched>}"
+          fi
+
+          matrix='[]'
+          for r in $repos; do
+            rm -rf scan
+            gh repo clone "cplieger/${r}" scan -- --depth 1 2>/dev/null || continue
+            sha=$(git -C scan rev-parse HEAD)
+            while IFS= read -r cfg; do
+              dir=$(dirname "${cfg#scan/}")
+              echo "  include ${r}:${dir} @ ${sha:0:12}"
+              matrix=$(printf '%s' "$matrix" | jq -c \
+                --arg r "$r" --arg s "$sha" --arg d "$dir" \
+                '. + [{repo: $r, sha: $s, dir: $d}]')
+            done < <(find scan -maxdepth 4 -name 'stryker.config.*' -not -path '*/node_modules/*' | sort)
+          done
+          rm -rf scan
+
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Total entries: $(printf '%s' "$matrix" | jq 'length')"
+
+  run:
+    needs: fanout
+    if: ${{ needs.fanout.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3   # CPU-heavy; small fleet today — leaves the budget free
+      matrix:
+        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+    steps:
+      # Checkout FIRST (actions/checkout cleans the workspace): brings the
+      # sibling-preserving badge publisher bundled with actions/publish-badge.
+      - name: Checkout ci (for the badge publisher)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # the badge push authenticates via CI_SCHEDULE inside the script.
+          persist-credentials: false
+
+      - name: Clone target repo at pinned SHA
+        run: |
+          set -euo pipefail
+          gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
+          git -C target fetch --depth 1 origin "${{ matrix.sha }}"
+          git -C target checkout --quiet "${{ matrix.sha }}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          # Keep in step with ts-ci.yaml / release.yaml (same major).
+          node-version: '24'
+
+      - name: Run stryker
+        id: stryker
+        working-directory: target/${{ matrix.dir }}
+        env:
+          ENTRY: ${{ matrix.repo }}:${{ matrix.dir }}
+        run: |
+          set -uo pipefail
+          npm ci
+
+          # Enrollment gate: config present but the Stryker devDeps missing →
+          # skip with an actionable notice (the runner ships ahead of repo
+          # enrollment), never a red herring failure.
+          if ! npx --no-install stryker --version >/dev/null 2>&1; then
+            msg="${ENTRY}: stryker.config.* present but @stryker-mutator/core is not a devDependency — skipping."
+            echo "::notice::${msg} Enroll: npm i -D @stryker-mutator/core @stryker-mutator/vitest-runner"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --reporters json overrides the config's html/clear-text reporters
+          # for CI; progress keeps the log alive under the job timeout.
+          rc=0
+          npx --no-install stryker run --reporters json,progress || rc=$?
+
+          # Locate the schema report (jsonReporter default:
+          # reports/mutation/mutation.json; tolerate overridden fileNames).
+          report=$(grep -rls '"schemaVersion"' reports/ 2>/dev/null | head -1 || true)
+          if [ -z "$report" ]; then
+            echo "::error::${ENTRY}: stryker produced no JSON report (exit ${rc})"
+            exit "${rc:-1}"
+          fi
+
+          # Mutation score per mutation-testing-elements metrics:
+          # detected (Killed+Timeout) / valid (detected + Survived+NoCoverage).
+          # python -c, never a heredoc — heredoc terminators break under GHA
+          # YAML dedent (repo-wide convention).
+          score=$(python3 -c "
+          import json, sys
+          from collections import Counter
+          data = json.load(open(sys.argv[1]))
+          c = Counter(m['status'] for f in data.get('files', {}).values() for m in f.get('mutants', []))
+          detected = c['Killed'] + c['Timeout']
+          valid = detected + c['Survived'] + c['NoCoverage']
+          print(f'{detected / valid * 100:.1f}' if valid else '0.0')
+          " "$report")
+          echo "score=${score}" >> "$GITHUB_OUTPUT"
+          echo "### ${ENTRY}: mutation score ${score}% (stryker exit ${rc})" >> "$GITHUB_STEP_SUMMARY"
+
+          # Propagate a below-break-threshold failure AFTER capturing the
+          # score, so the badge step below still publishes the (low) number.
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish mutation-ts badge
+        if: ${{ steps.stryker.outputs.skipped != 'true' && steps.stryker.outputs.score != '' }}
+        env:
+          TOKEN: ${{ secrets.CI_SCHEDULE }}
+          SCORE: ${{ steps.stryker.outputs.score }}
+          REPO: cplieger/${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          # Colour bands match the Go mutation badge (gremlins-aggregate.py).
+          int=${SCORE%.*}; : "${int:=0}"
+          if [ "$int" -ge 85 ]; then color=brightgreen
+          elif [ "$int" -ge 75 ]; then color=green
+          elif [ "$int" -ge 50 ]; then color=yellow
+          elif [ "$int" -ge 30 ]; then color=orange
+          else color=red
+          fi
+          json=$(printf '{"schemaVersion":1,"label":"mutation (TS)","message":"%s%%","color":"%s"}' "$SCORE" "$color")
+          bash actions/publish-badge/publish-badge.sh "$REPO" "$TOKEN" mutation-ts.json "$json"
+
+      - name: Surface below-threshold score
+        if: ${{ steps.stryker.outputs.rc != '' && steps.stryker.outputs.rc != '0' }}
+        env:
+          RC: ${{ steps.stryker.outputs.rc }}
+          ENTRY: ${{ matrix.repo }}:${{ matrix.dir }}
+        run: |
+          echo "::error::${ENTRY}: mutation score fell below the config's thresholds.break (stryker exit ${RC})"
+          exit 1

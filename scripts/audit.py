@@ -19,7 +19,22 @@ custom repository ruleset is treated as drift, and an Integration bypass actor
 on any ruleset is a HARD failure (it is the stale-decommissioned-app rot class
 — e.g. a former hosted-Renovate GitHub App left able to bypass protection).
 
-Exits non-zero if ANY repo has a HARD failure; warnings never fail the run.
+Robustness: every GitHub API call retries transient failures (rate limits,
+5xx) with backoff, and a definitive 404 is distinguished from an API error —
+a flaky call can therefore never manufacture a false HARD failure (observed
+2026-07: a transient contents-read failure reported a correctly-wired repo as
+"CI not wired"). If a call still fails after retries, the affected check is
+skipped and reported as [error]; the run exits 2 (infra trouble), never 1
+(compliance), for API errors alone.
+
+Known-accepted deviations live in the ACCEPTED table below with a reason;
+they are suppressed from the report (counted, not listed) so the steady-state
+fleet reports clean and any NEW warning is signal, not noise. Cosmetic checks
+(license, description, topics) apply to public repos only — private repos
+have no audience for them.
+
+Exit codes: 0 = compliant; 1 = at least one HARD failure; 2 = usage/infra
+(under-scoped token, or API errors that prevented a full audit).
 
 Requires `gh` authenticated with a CLASSIC PAT carrying the 'repo' scope: the
 merge-model fields (allow_merge_commit etc.) are only serialized onto the repo
@@ -38,8 +53,10 @@ import argparse
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 OWNER = "cplieger"
@@ -57,6 +74,19 @@ WEBHOOK_HOST = os.environ.get("AUDIT_WEBHOOK_HOST", "").strip()
 # protection is enabled. It is not user-authored, so it is whitelisted from the
 # "unexpected custom ruleset" check. Every other ruleset is drift.
 MANAGED_RULESETS = {"code-scanning-merge-protection"}
+
+# Known-accepted deviations from the standard: {repo: {warning-prefix: reason}}.
+# A warning whose text starts with a listed prefix is suppressed from the
+# report (counted under "accepted", not listed), so the steady-state fleet
+# reports clean and a new warning stands out. Every entry needs a reason;
+# remove entries when the deviation is fixed.
+ACCEPTED = {
+    "homelab": {
+        "renovate preset not extended":
+            "deliberate: standalone renovate.json consumed directly by the "
+            "resident Renovate container (not the fleet preset)",
+    },
+}
 
 # Documented governance standard (repo-governance.md).
 # HARD merge-model settings: any deviation fails the audit (exit 1). These have
@@ -80,8 +110,44 @@ def gh(*args):
     return subprocess.run(["gh", *args], capture_output=True, text=True)
 
 
+# Sentinel: the API call kept failing transiently after retries. Distinct from
+# None (definitive absence, e.g. HTTP 404) so a flaky call can never be
+# mistaken for "the thing is missing" and manufacture a false HARD failure.
+API_ERROR = object()
+
+
+def gh_retry(*args, tries=4):
+    """Run gh, retrying transient failures with exponential backoff.
+
+    Returns (result, definitive). definitive=True means the outcome can be
+    trusted: success, or a real 4xx (404 absence, 403 permission). False means
+    the call still failed after all retries for a transient-looking reason
+    (rate limit, 5xx, network) and MUST NOT be interpreted as absence.
+    """
+    delay, r = 2, None
+    for attempt in range(tries):
+        r = gh(*args)
+        if r.returncode == 0:
+            return r, True
+        stderr = r.stderr or ""
+        m = re.search(r"HTTP (\d{3})", stderr)
+        code = int(m.group(1)) if m else None
+        rate_limited = "rate limit" in stderr.lower()
+        transient = rate_limited or code is None or code >= 500 or code == 429
+        if not transient:
+            return r, True  # definitive 4xx — absence or permission; trust it
+        if attempt < tries - 1:
+            time.sleep(delay)
+            delay *= 2
+    return r, False
+
+
 def gh_json(*args):
-    r = gh(*args)
+    """Parsed JSON on success; None on definitive absence; API_ERROR on a
+    transient failure that survived retries."""
+    r, definitive = gh_retry(*args)
+    if not definitive:
+        return API_ERROR
     if r.returncode != 0:
         return None
     try:
@@ -90,15 +156,23 @@ def gh_json(*args):
         return None
 
 
-def api_status_ok(path):
-    """For endpoints that signal via HTTP status (204 enabled -> rc 0, 404 -> rc !=0)."""
-    return gh("api", path).returncode == 0
+def api_status(path):
+    """(ok, definitive) for endpoints that signal via HTTP status
+    (204 enabled -> rc 0, 404 disabled -> rc != 0)."""
+    r, definitive = gh_retry("api", path)
+    return r.returncode == 0, definitive
 
 
 def file_text(repo, path):
-    r = gh("api", f"repos/{OWNER}/{repo}/contents/{path}", "--jq", ".content")
-    if r.returncode != 0:
+    """Decoded file content; '' when the file is definitively absent;
+    None on an API error (unknown — do not treat as absent)."""
+    r, definitive = gh_retry(
+        "api", f"repos/{OWNER}/{repo}/contents/{path}", "--jq", ".content"
+    )
+    if not definitive:
         return None
+    if r.returncode != 0:
+        return ""
     try:
         return base64.b64decode("".join(r.stdout.split())).decode("utf-8", "replace")
     except (ValueError, UnicodeError):
@@ -106,10 +180,23 @@ def file_text(repo, path):
 
 
 def collect(meta):
-    """Gather the full governance-relevant settings surface for one repo."""
+    """Gather the full governance-relevant settings surface for one repo.
+
+    s["errors"] records every check whose API reads failed transiently after
+    retries; compliance() skips those checks instead of failing them, and
+    main() reports them as [error] with exit 2.
+    """
     name = meta["name"]
-    s = {"name": name, "infra": name in INFRA}
-    repo = gh_json("api", f"repos/{OWNER}/{name}") or {}
+    s = {"name": name, "infra": name in INFRA, "errors": [], "fatal": False}
+    repo = gh_json("api", f"repos/{OWNER}/{name}")
+    if repo is API_ERROR:
+        # Without the repo object there is nothing meaningful to audit.
+        s["errors"].append("repo settings unreadable (API)")
+        s["fatal"] = True
+        s.update({"visibility": None, "private": bool(meta.get("visibility") == "private"),
+                  "admin_visible": False})
+        return s
+    repo = repo or {}
     s["visibility"] = repo.get("visibility")
     s["private"] = bool(repo.get("private"))
     branch = repo.get("default_branch") or "main"
@@ -138,12 +225,25 @@ def collect(meta):
     s["secret_scanning_push_protection"] = (sa.get("secret_scanning_push_protection") or {}).get("status")
     s["dependabot_security_updates"] = (sa.get("dependabot_security_updates") or {}).get("status")
 
-    s["vuln_alerts"] = api_status_ok(f"repos/{OWNER}/{name}/vulnerability-alerts")
-    pvr = gh_json("api", f"repos/{OWNER}/{name}/private-vulnerability-reporting") or {}
-    s["private_vuln_reporting"] = pvr.get("enabled")
+    ok, definitive = api_status(f"repos/{OWNER}/{name}/vulnerability-alerts")
+    s["vuln_alerts"] = ok if definitive else None
+    if not definitive:
+        s["errors"].append("vulnerability-alerts unreadable (API)")
+
+    pvr = gh_json("api", f"repos/{OWNER}/{name}/private-vulnerability-reporting")
+    if pvr is API_ERROR:
+        s["private_vuln_reporting"] = None
+        s["errors"].append("private-vulnerability-reporting unreadable (API)")
+    else:
+        s["private_vuln_reporting"] = bool((pvr or {}).get("enabled"))
 
     prot = gh_json("api", f"repos/{OWNER}/{name}/branches/{branch}/protection")
-    s["has_protection"] = isinstance(prot, dict) and "url" in prot
+    if prot is API_ERROR:
+        prot = None
+        s["has_protection"] = None
+        s["errors"].append("branch protection unreadable (API)")
+    else:
+        s["has_protection"] = isinstance(prot, dict) and "url" in prot
     if s["has_protection"]:
         rsc = prot.get("required_status_checks") or {}
         contexts = list(rsc.get("contexts") or [])
@@ -166,26 +266,48 @@ def collect(meta):
     s["custom_rulesets"] = []
     s["ruleset_bypass_actors"] = []  # (ruleset_name, actor_type, actor_id)
     rulesets = gh_json("api", f"repos/{OWNER}/{name}/rulesets")
+    if rulesets is API_ERROR:
+        rulesets = []
+        s["errors"].append("rulesets unreadable (API)")
     for rs in rulesets if isinstance(rulesets, list) else []:
         rname = rs.get("name", "")
-        full = gh_json("api", f"repos/{OWNER}/{name}/rulesets/{rs.get('id')}") or {}
+        full = gh_json("api", f"repos/{OWNER}/{name}/rulesets/{rs.get('id')}")
+        if full is API_ERROR:
+            s["errors"].append(f"ruleset '{rname}' unreadable (API)")
+            continue
+        full = full or {}
         if rname not in MANAGED_RULESETS:
             s["custom_rulesets"].append({"name": rname, "enforcement": full.get("enforcement")})
         for a in full.get("bypass_actors") or []:
             s["ruleset_bypass_actors"].append((rname, a.get("actor_type"), a.get("actor_id")))
 
     wf = gh_json("api", f"repos/{OWNER}/{name}/contents/.github/workflows")
-    wf_names = {f["name"] for f in wf} if isinstance(wf, list) else set()
-    s["has_codeql"] = bool({"codeql.yml", "codeql.yaml"} & wf_names)
-    s["has_security_scan"] = bool({"security.yml", "security.yaml"} & wf_names)
-    s["has_scorecard"] = bool({"scorecard.yml", "scorecard.yaml"} & wf_names)
+    if wf is API_ERROR:
+        s["has_codeql"] = s["has_security_scan"] = s["has_scorecard"] = None
+        s["errors"].append("workflow listing unreadable (API)")
+    else:
+        wf_names = {f["name"] for f in wf} if isinstance(wf, list) else set()
+        s["has_codeql"] = bool({"codeql.yml", "codeql.yaml"} & wf_names)
+        s["has_security_scan"] = bool({"security.yml", "security.yaml"} & wf_names)
+        s["has_scorecard"] = bool({"scorecard.yml", "scorecard.yaml"} & wf_names)
 
-    ci_txt = file_text(name, ".github/workflows/ci.yaml") or ""
-    s["ci_wired"] = REUSABLE in ci_txt
-    ren = "".join(file_text(name, p) or "" for p in
-                  ("renovate.json", "org-inherited-config.json", "default.json"))
-    s["renovate_preset"] = (PRESET in ren) or (name == ".github")
-    s["adopted"] = s["ci_wired"] or s["renovate_preset"]
+    ci_txt = file_text(name, ".github/workflows/ci.yaml")
+    if ci_txt is None:
+        s["ci_wired"] = None  # unknown — never report "not wired" on an API error
+        s["errors"].append("ci.yaml unreadable (API)")
+    else:
+        s["ci_wired"] = REUSABLE in ci_txt
+
+    ren_parts = [file_text(name, p) for p in
+                 ("renovate.json", "org-inherited-config.json", "default.json")]
+    if any(PRESET in (p or "") for p in ren_parts) or name == ".github":
+        s["renovate_preset"] = True
+    elif any(p is None for p in ren_parts):
+        s["renovate_preset"] = None  # unknown — a read failed and none matched
+        s["errors"].append("renovate config unreadable (API)")
+    else:
+        s["renovate_preset"] = False
+    s["adopted"] = bool(s["ci_wired"]) or bool(s["renovate_preset"])
 
     # Deploy-trigger webhook. Read repo hooks and look for an active one pointing
     # at the orchestrator host. webhook_readable distinguishes "no matching hook"
@@ -198,6 +320,9 @@ def collect(meta):
     s["webhook_bad_delivery"] = None
     if WEBHOOK_HOST:
         hooks = gh_json("api", f"repos/{OWNER}/{name}/hooks")
+        if hooks is API_ERROR:
+            hooks = None
+            s["errors"].append("webhooks unreadable (API)")
         if isinstance(hooks, list):
             s["webhook_readable"] = True
             for h in hooks:
@@ -214,8 +339,16 @@ def collect(meta):
 
 
 def compliance(s):
-    """Return (hard_failures, warnings) for one repo's settings dict."""
+    """Return (hard_failures, warnings, accepted) for one repo's settings dict.
+
+    Checks whose underlying API read failed (value None + an s["errors"]
+    entry) are skipped — an API error must never masquerade as
+    non-compliance. `accepted` holds warnings matched by the ACCEPTED table:
+    known, documented deviations that would otherwise be permanent noise.
+    """
     hard, warn = [], []
+    if s.get("fatal"):
+        return hard, warn, []
 
     for k, exp in GOV_HARD.items():
         if s.get(k) != exp:
@@ -227,12 +360,14 @@ def compliance(s):
     if s["default_branch"] != "main":
         hard.append(f"default_branch={s['default_branch']} (want main)")
 
-    if s["license"] is None:
+    # License: public repos only — a private personal repo has no audience
+    # that needs a license grant.
+    if not s["private"] and s["license"] is None:
         (hard if s["adopted"] else warn).append("license missing")
 
-    if not s["has_protection"]:
+    if s["has_protection"] is False:
         hard.append("no branch protection on default branch")
-    else:
+    elif s["has_protection"]:
         # App repos surface 'ci / validate' (the cplieger/ci meta job); repos
         # with a local CI surface a bare 'validate'. Accept either.
         if not any("validate" in (c or "") for c in (s["required_checks"] or [])):
@@ -262,10 +397,10 @@ def compliance(s):
         else:
             warn.append(f"ruleset '{rname}' has a bypass actor ({atype} id {aid})")
 
-    if not s["vuln_alerts"]:
+    if s["vuln_alerts"] is False:
         hard.append("dependabot vulnerability alerts off (want on)")
     # Private vulnerability reporting is a public-repo feature; N/A on private.
-    if not s["private"] and not s["private_vuln_reporting"]:
+    if not s["private"] and s["private_vuln_reporting"] is False:
         hard.append("private vulnerability reporting off (want on)")
     if s["dependabot_security_updates"] == "enabled":
         hard.append("dependabot security UPDATES on (want off; Renovate owns deps)")
@@ -273,31 +408,39 @@ def compliance(s):
     # Secret scanning / push protection: free on public repos; needs GHAS on
     # private (N/A on the free plan), so only enforced on public repos.
     if not s["private"]:
-        if s["secret_scanning"] != "enabled":
+        if s["secret_scanning"] != "enabled":  # noqa: S105 — API state, not a password
             warn.append("secret scanning off (want on)")
-        if s["secret_scanning_push_protection"] != "enabled":
+        if s["secret_scanning_push_protection"] != "enabled":  # noqa: S105 — API state
             warn.append("secret scanning push protection off (want on)")
 
-    # Scanning workflows arrive via sync for adopted repos; scorecard is public-only.
-    if s["adopted"] and not s["infra"]:
-        if not s["has_codeql"]:
+    # Scanning workflows arrive via sync for adopted repos; codeql + scorecard
+    # are public-only features (CodeQL needs GHAS on private repos, Scorecard
+    # only evaluates public repos), so both are N/A on private ones.
+    if s["adopted"] and not s["infra"] and not s["private"]:
+        if s["has_codeql"] is False:
             warn.append("codeql.yml missing")
-        if not s["has_security_scan"]:
+        if s["has_security_scan"] is False:
             warn.append("security.yml missing")
-        if not s["private"] and not s["has_scorecard"]:
+        if s["has_scorecard"] is False:
             warn.append("scorecard.yml missing")
 
-    if not s["infra"] and s["adopted"] and not s["ci_wired"]:
+    # ci_wired is None when the contents read failed (already an [error]);
+    # only a DEFINITIVE "file exists without the reusable ref / file absent"
+    # is a hard failure.
+    if not s["infra"] and s["adopted"] and s["ci_wired"] is False:
         hard.append("CI not wired to cplieger/ci")
-    if not s["renovate_preset"]:
+    if s["renovate_preset"] is False:
         warn.append("renovate preset not extended")
 
-    if not s["desc_present"]:
-        warn.append("description empty")
-    elif s["desc_len"] > 100:
-        warn.append(f"description {s['desc_len']} chars (>100; Docker Hub short-desc limit)")
-    if not s["topics"]:
-        warn.append("no topics")
+    # Description + topics: public repos only — discovery metadata has no
+    # audience on a private repo.
+    if not s["private"]:
+        if not s["desc_present"]:
+            warn.append("description empty")
+        elif s["desc_len"] > 100:
+            warn.append(f"description {s['desc_len']} chars (>100; Docker Hub short-desc limit)")
+        if not s["topics"]:
+            warn.append("no topics")
 
     # Deploy-trigger webhook. Enforced only when the host is configured AND this
     # repo's hooks were readable (see collect); an unreadable token is handled as
@@ -315,7 +458,17 @@ def compliance(s):
             warn.append(f"deploy-trigger webhook last delivery failed "
                         f"(HTTP {s['webhook_bad_delivery']})")
 
-    return hard, warn
+    # Filter known-accepted deviations (warnings only — a HARD failure is
+    # never silently acceptable) so the steady-state report is clean.
+    rules = ACCEPTED.get(s["name"], {})
+    kept, accepted = [], []
+    for w in warn:
+        if any(w.startswith(prefix) for prefix in rules):
+            accepted.append(w)
+        else:
+            kept.append(w)
+
+    return hard, kept, accepted
 
 
 def main():
@@ -324,8 +477,9 @@ def main():
     ap.add_argument("--dump", metavar="PATH", help="write raw collected settings as JSON")
     args = ap.parse_args()
 
-    r = gh("repo", "list", OWNER, "--limit", "200", "--json", "name,isArchived,visibility")
-    if r.returncode != 0:
+    r, definitive = gh_retry("repo", "list", OWNER, "--limit", "300",
+                             "--json", "name,isArchived,visibility")
+    if r.returncode != 0 or not definitive:
         sys.stderr.write(f"gh repo list failed: {r.stderr}\n")
         sys.exit(2)
     metas = [m for m in json.loads(r.stdout) if not m["isArchived"]]
@@ -339,6 +493,16 @@ def main():
     if args.dump:
         with open(args.dump, "w", encoding="utf-8") as fh:
             json.dump(settings, fh, indent=2, sort_keys=True)
+
+    # Total-outage guard: if not a single repo object could be read, this is
+    # network/API trouble, not a token problem — bail before the under-scope
+    # guard below misdiagnoses it.
+    if settings and all(s.get("fatal") for s in settings):
+        sys.stderr.write(
+            "ERROR: no repo could be read at all (API outage or network "
+            "failure). No compliance conclusions drawn.\n"
+        )
+        sys.exit(2)
 
     # Permission guard: the merge-model, branch-protection, and security checks
     # need a token with admin read across the cplieger repos. If NO repo returned
@@ -357,11 +521,12 @@ def main():
         )
         sys.exit(2)
 
-    hard_total, warn_total, clean = 0, 0, 0
+    hard_total, warn_total, accepted_total, error_total, clean = 0, 0, 0, 0, 0
     print(f"GOVERNANCE COMPLIANCE — {len(settings)} repos "
           f"(visibility={args.visibility})")
-    print("Legend: [HARD] blocks compliance · [warn] advisory · "
-          "GHAS scanning N/A on free private repos\n")
+    print("Legend: [HARD] blocks compliance · [warn] advisory · [error] API "
+          "read failed (check skipped) · GHAS scanning N/A on free private "
+          "repos · accepted deviations suppressed (see ACCEPTED)\n")
 
     # Deploy-trigger webhook check status. When the host is configured but no
     # repo's hooks were readable, the token is under-scoped for the hook endpoint
@@ -374,9 +539,11 @@ def main():
               "readable; the deploy-trigger webhook check was skipped. The audit "
               "token needs the classic 'repo' scope (or admin:repo_hook).\n")
     for s in settings:
-        hard, warn = compliance(s)
+        hard, warn, accepted = compliance(s)
+        errors = s.get("errors") or []
+        accepted_total += len(accepted)
         tag = "infra" if s["infra"] else ("priv" if s["private"] else "pub")
-        if not hard and not warn:
+        if not hard and not warn and not errors:
             clean += 1
             continue
         print(f"{s['name']}  ({tag})")
@@ -386,12 +553,21 @@ def main():
         for w in warn:
             print(f"  [warn] {w}")
             warn_total += 1
+        for e in errors:
+            print(f"  [error] {e}")
+            error_total += 1
         print()
 
     print("-" * 60)
-    print(f"{clean} clean · {hard_total} hard failures · {warn_total} warnings")
+    print(f"{clean} clean · {hard_total} hard failures · {warn_total} warnings"
+          f" · {accepted_total} accepted deviations · {error_total} API errors")
     if hard_total:
         sys.exit(1)
+    if error_total:
+        # No compliance failures, but the audit could not fully verify some
+        # checks — infra trouble, not drift. Distinct exit code so the weekly
+        # run goes red for the right reason.
+        sys.exit(2)
 
 
 if __name__ == "__main__":

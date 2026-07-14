@@ -1,14 +1,20 @@
 # Daily security scan across all cplieger consumer repos.
-# Pattern C: matrix + max-parallel cap owned here.
 #
 # Schedule:           Daily 03:00 UTC
-# Concurrency cap:    4 jobs in parallel — security is brief (~3 min/repo);
-#                     low cap is fine and leaves the rest of the 20-slot
-#                     budget for ad-hoc work
 # What it does:       Dispatches `security.yml` (the synced consumer security
 #                     workflow) on every consumer repo. Trivy fs scan on all
 #                     repos; Trivy image scan additionally on Dockerfile
 #                     repos. Auto-detected by `security.yml`.
+# Concurrency note:   `gh workflow run` is fire-and-forget, so max-parallel
+#                     below paces only the DISPATCH calls, not the scans — the
+#                     ~28 dispatched security.yml runs start near-simultaneously
+#                     and compete for the account's 20 concurrent-job slots.
+#                     Accepted: each scan is brief (~3 min), the burst drains in
+#                     minutes, and 03:00 UTC is dead time for ad-hoc work. The
+#                     scans must run in each consumer repo (SARIF uploads target
+#                     the repo they run in), so pulling the work into this
+#                     matrix — the way weekly-gremlins bounds real work — is not
+#                     an option here.
 name: Daily security scan
 
 on:
