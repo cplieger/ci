@@ -39,7 +39,7 @@ concurrency:
 
 env:
   # renovate: datasource=github-releases depName=sigstore/cosign
-  COSIGN_VERSION: v3.0.6
+  COSIGN_VERSION: v3.1.1
   # HISTORICAL snapshot: the docker-image repos that had already released via
   # docker-release.yaml when the backfill ran (2026-06). Deliberately frozen —
   # repos released after the sign-blob fix (e.g. github-scout, seadex-scout)
