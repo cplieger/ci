@@ -141,7 +141,7 @@ jobs:
         run: |
           (
             # renovate: datasource=docker depName=hadolint/hadolint
-            HADOLINT_VERSION=2.12.0
+            HADOLINT_VERSION=v2.14.0
             IGNORE_FLAGS=""
             IFS=',' read -ra RULES <<< "$HADOLINT_IGNORES"
             for rule in "${RULES[@]}"; do
