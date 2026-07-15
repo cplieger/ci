@@ -26,6 +26,15 @@
 #               config's `thresholds.break`, which fails that matrix entry —
 #               red is a real regression signal, but nothing blocks consumer
 #               merges (internal weekly job, not a required check).
+# Tracker:      Per-repo `Stryker mutation testing tracker` issue (label
+#               stryker-tracker), the TS twin of the gremlins tracker:
+#               rolling 12-week score table inside <!-- stryker-data -->
+#               sentinels, surviving mutants bucketed Survived vs NoCoverage,
+#               free-form notes preserved. The `mutation-regression` label is
+#               toggled when this week's score drops >5% below the rolling
+#               mean. A repo whose run produced no parseable report is left
+#               untouched (no misleading 0% rows — the red matrix entry is
+#               the signal).
 name: Weekly stryker
 
 on:
@@ -131,6 +140,16 @@ jobs:
           # Keep in step with ts-ci.yaml / release.yaml (same major).
           node-version: '24'
 
+      - name: Compute artifact slug for this package dir
+        id: slug
+        env:
+          DIR: ${{ matrix.dir }}
+        run: |
+          # Artifact names cannot contain '/'; meta.json (below) is the
+          # authoritative repo/dir mapping — the slug is only for uniqueness.
+          if [ "$DIR" = "." ]; then slug=root; else slug=${DIR//\//_}; fi
+          echo "slug=${slug}" >> "$GITHUB_OUTPUT"
+
       - name: Run stryker
         id: stryker
         working-directory: target/${{ matrix.dir }}
@@ -177,11 +196,33 @@ jobs:
           print(f'{detected / valid * 100:.1f}' if valid else '0.0')
           " "$report")
           echo "score=${score}" >> "$GITHUB_OUTPUT"
+          echo "report=${report}" >> "$GITHUB_OUTPUT"
           echo "### ${ENTRY}: mutation score ${score}% (stryker exit ${rc})" >> "$GITHUB_STEP_SUMMARY"
 
           # Propagate a below-break-threshold failure AFTER capturing the
           # score, so the badge step below still publishes the (low) number.
           echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+
+      - name: Stage report for the tracker aggregate
+        if: ${{ steps.stryker.outputs.report != '' }}
+        env:
+          REPORT: ${{ steps.stryker.outputs.report }}
+          REPO: ${{ matrix.repo }}
+          DIR: ${{ matrix.dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/stage
+          cp "target/${DIR}/${REPORT}" /tmp/stage/mutation.json
+          jq -n --arg repo "$REPO" --arg dir "$DIR" '{repo: $repo, dir: $dir}' > /tmp/stage/meta.json
+
+      - name: Upload report (artifact, 90-day retention)
+        if: ${{ steps.stryker.outputs.report != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stryker-${{ matrix.repo }}-${{ steps.slug.outputs.slug }}
+          path: /tmp/stage
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Publish mutation-ts badge
         if: ${{ steps.stryker.outputs.skipped != 'true' && steps.stryker.outputs.score != '' }}
@@ -210,3 +251,125 @@ jobs:
         run: |
           echo "::error::${ENTRY}: mutation score fell below the config's thresholds.break (stryker exit ${RC})"
           exit 1
+
+  # Update the per-repo tracker issue — the TS twin of weekly-gremlins.yaml's
+  # aggregate job. Independent of the badge publish (which happens per matrix
+  # entry in `run`), so a tracker failure never blocks the badge and vice
+  # versa. Reads the staged report artifacts; a repo with no parseable report
+  # this week is left untouched (its red matrix entry is the signal).
+  aggregate:
+    needs: [fanout, run]
+    if: always() && needs.fanout.outputs.matrix != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+    steps:
+      - name: Checkout ci (for scripts/)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Download all report artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: stryker-*
+
+      - name: Aggregate + update tracker issue per repo
+        run: |
+          # Delegate stats + body generation to scripts/stryker-aggregate.py.
+          # It groups the staged reports by the repo named in each meta.json
+          # (artifact-name parsing is ambiguous — repo names and dir slugs
+          # both contain hyphens), aggregates multi-dir repos into one score,
+          # rolls the 12-week history forward (preserving free-form notes),
+          # renders the Survived/NoCoverage buckets, and writes regression +
+          # entries markers. Explicit per-command error handling (NOT `set -e`
+          # in a `( … ) || …` subshell, which bash neuters): each repo is
+          # isolated, failures warn and set had_failure, and the job exits red
+          # at the end if anything failed.
+          set -uo pipefail
+          REPOS=$(jq -r '.repo' artifacts/stryker-*/meta.json 2>/dev/null | sort -u || true)
+          if [ -z "$REPOS" ]; then
+            echo "no report artifacts this week — nothing to aggregate"
+            exit 0
+          fi
+          WEEK_ENDING=$(date -u +'%Y-%m-%d %H:%M')
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          title="Stryker mutation testing tracker"
+
+          # Create a label, tolerating "already exists" but surfacing real
+          # errors (e.g. the PAT lacking issues:write) as a failure.
+          ensure_label() {
+            local name="$1" repo="$2" color="$3" desc="$4" err
+            err=$(gh label create "$name" -R "$repo" -c "$color" -d "$desc" 2>&1) && return 0
+            printf '%s' "$err" | grep -qi "already exists" && return 0
+            echo "  label create failed for ${name}: ${err}" >&2
+            return 1
+          }
+
+          process_repo() {
+            local repo="$1" R="cplieger/$1" issue_num ent url existing_args=()
+
+            issue_num=$(gh issue list -R "$R" --state open --label stryker-tracker \
+              --search "$title in:title" --json number,title \
+              --jq '.[] | select(.title == "'"$title"'") | .number' 2>/dev/null | head -1) || true
+
+            if [ -n "$issue_num" ]; then
+              gh issue view "$issue_num" -R "$R" --json body --jq .body > "/tmp/existing-${repo}.md" || return 1
+              existing_args=(--existing-body-file "/tmp/existing-${repo}.md")
+            fi
+
+            python3 scripts/stryker-aggregate.py \
+              --repo "$repo" --artifacts-dir artifacts --week "$WEEK_ENDING" --run-url "$RUN_URL" \
+              --regression-marker-file "/tmp/regression-${repo}.txt" \
+              --entries-marker-file "/tmp/entries-${repo}.txt" \
+              "${existing_args[@]}" > "/tmp/body-${repo}.md" || return 1
+
+            ent=$(cat "/tmp/entries-${repo}.txt" 2>/dev/null || echo 0)
+            if [ "$ent" -eq 0 ]; then
+              echo "  no parseable reports for ${repo} — leaving the tracker issue untouched"
+              return 0
+            fi
+
+            if [ -z "$issue_num" ]; then
+              ensure_label stryker-tracker "$R" 1d76db "Stryker mutation testing tracker" || return 1
+              ensure_label auto-generated "$R" ededed "Maintained by automation" || return 1
+              ensure_label mutation-regression "$R" b60205 "Mutation efficacy regression" || return 1
+              url=$(gh issue create -R "$R" --title "$title" \
+                --label stryker-tracker,auto-generated --body-file "/tmp/body-${repo}.md") || return 1
+              issue_num="${url##*/}"
+              echo "  created tracker issue #${issue_num}"
+            else
+              gh issue edit "$issue_num" -R "$R" --body-file "/tmp/body-${repo}.md" >/dev/null || return 1
+              echo "  updated tracker issue #${issue_num}"
+            fi
+
+            # Toggle the regression label from the python marker (ensure it
+            # exists first — the issue may predate the label).
+            ensure_label mutation-regression "$R" b60205 "Mutation efficacy regression" || return 1
+            if [ "$(cat "/tmp/regression-${repo}.txt" 2>/dev/null)" = "true" ]; then
+              gh issue edit "$issue_num" -R "$R" --add-label mutation-regression >/dev/null || return 1
+              echo "  flagged mutation-regression"
+            else
+              gh issue edit "$issue_num" -R "$R" --remove-label mutation-regression >/dev/null 2>&1 || true
+            fi
+          }
+
+          had_failure=0
+          for repo in $REPOS; do
+            echo "::group::$repo"
+            if ! process_repo "$repo"; then
+              echo "::warning::aggregate failed for ${repo} — continuing"
+              had_failure=1
+            fi
+            echo "::endgroup::"
+          done
+          if [ "$had_failure" -ne 0 ]; then
+            echo "::error::one or more tracker-issue updates failed"
+            exit 1
+          fi
