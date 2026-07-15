@@ -397,6 +397,8 @@ jobs:
             # GHCR-only (no Docker Hub mirror). Pre-1.0 apps not yet mirrored
             # to Docker Hub. The docker-* infra images (caddy, age, keepalived,
             # static-web, radvd) graduated to dual-publish once they hit 1.0.
+            # Keep in sync with GHCR_ONLY in scripts/audit.py (it exempts
+            # these repos from the DOCKERHUB_* secrets check).
             subflux|vibekit)
               REGISTRIES="ghcr" ;;
           esac

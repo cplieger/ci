@@ -7,13 +7,24 @@ compliance report against the documented standard in
 with N/A handling where a setting cannot apply (e.g. GitHub Advanced Security
 features on free private repos).
 
-Checks cover merge model, repo features, branch protection (including phantom
-required contexts that no workflow ever reports), rulesets
-(unexpected custom rulesets + bypass-actor drift), vulnerability reporting,
-secret/code scanning, CI wiring, Renovate preset, license, default branch,
-description (presence + <=100 chars), topics, and the per-repo deploy-trigger
-webhook that reaches the self-hosted orchestrator (only when AUDIT_WEBHOOK_HOST
-is set — the host is private infra, injected via env, never hardcoded here).
+Checks cover merge model (including the squash-commit title/message
+defaults auto-merged PRs are squashed with), repo features (wiki, projects,
+issues, discussions, update-branch suggestion, web commit signoff), branch
+protection (a validate check pinned to the GitHub Actions app, phantom
+required contexts that no workflow ever reports, unexpected extra required
+checks, review/conversation-resolution/linear-history/signature/lock/
+push-restriction toggles), rulesets (unexpected custom rulesets +
+bypass-actor drift), Actions token defaults (read-only workflow permissions;
+workflows cannot approve PRs), vulnerability reporting, secret/code scanning,
+stray .github/dependabot.yml (Renovate owns dependency updates), CI wiring,
+coverage-workflow presence on Go/TS repos, Docker Hub dual-publish secrets on
+image repos, Renovate preset, license (present AND GPL-3.0), default branch,
+description (presence + <=100 chars), topics (at least 2), and the per-repo
+deploy-trigger webhook that reaches the self-hosted orchestrator — presence,
+signing secret, exact event set (push for the infra repos, release everywhere
+else), JSON payload, TLS verification on, and exactly one hook (only when
+AUDIT_WEBHOOK_HOST is set — the host is private infra, injected via env,
+never hardcoded here).
 
 Branch protection is the documented standard (classic protection); any
 custom repository ruleset is treated as drift, and an Integration bypass actor
@@ -47,6 +58,8 @@ negatives.
 Run:
   scripts/audit.py                  # all repos (public + private)
   scripts/audit.py --visibility public
+  scripts/audit.py --repo <name>    # one repo only (repeatable) — e.g. the
+                                    # bootstrap-repo skill's post-creation gate
   scripts/audit.py --dump out.json  # also write raw collected settings as JSON
 """
 
@@ -80,6 +93,20 @@ WEBHOOK_HOST = os.environ.get("AUDIT_WEBHOOK_HOST", "").strip()
 # protection is enabled. It is not user-authored, so it is whitelisted from the
 # "unexpected custom ruleset" check. Every other ruleset is drift.
 MANAGED_RULESETS = {"code-scanning-merge-protection"}
+# Repos whose deploy-trigger webhook fires on push@main instead of release:
+# the non-releaseable infra/config repos (repo-governance.md "Apply"). Every
+# other repo releases, so its hook must carry the release event or releases
+# silently never reach the orchestrator.
+PUSH_WEBHOOK_REPOS = {".github", ".kiro", "ci", "homelab"}
+# Image repos that publish to GHCR only (no Docker Hub mirror), so the
+# DOCKERHUB_* secrets check is N/A. MUST mirror the per-repo policy overrides
+# in .github/workflows/release.yaml (the `policy` step) — update both together.
+GHCR_ONLY = {"subflux", "vibekit"}
+# The required check every repo carries, and the GitHub App expected to report
+# it (15368 = GitHub Actions). A validate context restricted to a different
+# app — or to none (-1, any app may report it) — weakens the gate: an
+# arbitrary integration could satisfy the merge requirement.
+ACTIONS_APP_ID = 15368
 
 # Known-accepted deviations from the standard: {repo: {warning-prefix: reason}}.
 # A warning whose text starts with a listed prefix is suppressed from the
@@ -91,6 +118,16 @@ ACCEPTED = {
         "renovate preset not extended":
             "deliberate: standalone renovate.json consumed directly by the "
             "resident Renovate container (not the fleet preset)",
+    },
+    "docker-radvd": {
+        "unexpected extra required check 'smoke'":
+            "deliberate: repo-local smoke signal-contract job required in "
+            "addition to ci / validate (repo-governance.md, 2026-07)",
+    },
+    "web-terminal-server": {
+        "unexpected extra required check 'smoke'":
+            "deliberate: repo-local smoke signal-contract job required in "
+            "addition to ci / validate (same pattern as docker-radvd)",
     },
 }
 
@@ -106,10 +143,19 @@ GOV_HARD = {
     "allow_auto_merge": True,
 }
 # Repo-feature settings: advisory only (cosmetic), reported as warnings.
+# The squash-commit defaults matter because sync and Renovate PRs land as
+# auto-squash merges: COMMIT_OR_PR_TITLE keeps the conventional-commit subject
+# git-cliff builds the changelog from (single-commit PRs keep their commit
+# title; multi-commit PRs fall back to the PR title).
 GOV_SOFT = {
     "has_wiki": False,
     "has_projects": False,
     "has_issues": True,
+    "has_discussions": False,
+    "allow_update_branch": False,
+    "web_commit_signoff_required": False,
+    "squash_merge_commit_title": "COMMIT_OR_PR_TITLE",
+    "squash_merge_commit_message": "COMMIT_MESSAGES",
 }
 
 def gh(*args):
@@ -217,7 +263,9 @@ def collect(meta):
     s["admin_visible"] = "allow_merge_commit" in repo
     for k in ("allow_merge_commit", "allow_squash_merge", "allow_rebase_merge",
               "allow_auto_merge", "delete_branch_on_merge",
-              "has_wiki", "has_projects", "has_issues", "has_discussions"):
+              "has_wiki", "has_projects", "has_issues", "has_discussions",
+              "allow_update_branch", "web_commit_signoff_required",
+              "squash_merge_commit_title", "squash_merge_commit_message"):
         s[k] = repo.get(k)
     lic = repo.get("license")
     s["license"] = lic.get("spdx_id") if lic else None
@@ -255,13 +303,35 @@ def collect(meta):
         contexts = list(rsc.get("contexts") or [])
         contexts += [c.get("context") for c in (rsc.get("checks") or []) if c.get("context") not in contexts]
         s["required_checks"] = contexts
+        # context -> app_id, to verify the validate gate is pinned to the
+        # GitHub Actions app (a -1 / other-app pin lets any integration
+        # satisfy the merge requirement).
+        s["required_check_apps"] = {c.get("context"): c.get("app_id")
+                                    for c in (rsc.get("checks") or [])}
         s["strict"] = rsc.get("strict")
         s["enforce_admins"] = (prot.get("enforce_admins") or {}).get("enabled")
         s["allow_force_pushes"] = (prot.get("allow_force_pushes") or {}).get("enabled")
         s["allow_deletions"] = (prot.get("allow_deletions") or {}).get("enabled")
+        # The rest of the classic-protection surface. The standard sets none
+        # of these; presence/enabled is drift (and a locked branch, or an
+        # approving-review floor a single-maintainer account can never satisfy,
+        # is outright breakage — no one can self-approve a PR).
+        reviews = prot.get("required_pull_request_reviews")
+        s["required_reviews_present"] = reviews is not None
+        s["required_review_count"] = (reviews or {}).get("required_approving_review_count", 0)
+        s["required_conversation_resolution"] = (prot.get("required_conversation_resolution") or {}).get("enabled")
+        s["required_linear_history"] = (prot.get("required_linear_history") or {}).get("enabled")
+        s["required_signatures"] = (prot.get("required_signatures") or {}).get("enabled")
+        s["lock_branch"] = (prot.get("lock_branch") or {}).get("enabled")
+        s["push_restrictions"] = prot.get("restrictions") is not None
     else:
         s["required_checks"] = []
+        s["required_check_apps"] = {}
         s["strict"] = s["enforce_admins"] = s["allow_force_pushes"] = s["allow_deletions"] = None
+        s["required_reviews_present"] = s["push_restrictions"] = False
+        s["required_review_count"] = 0
+        s["required_conversation_resolution"] = s["required_linear_history"] = None
+        s["required_signatures"] = s["lock_branch"] = None
 
     # Phantom required contexts. Branch protection matches a required context
     # against reported check-run NAMES: for a reusable-workflow job that is
@@ -338,15 +408,68 @@ def collect(meta):
         for a in full.get("bypass_actors") or []:
             s["ruleset_bypass_actors"].append((rname, a.get("actor_type"), a.get("actor_id")))
 
+    # Actions token defaults. All synced workflows declare explicit
+    # `permissions:` blocks (zizmor gates that), so the repo-level default is
+    # defense-in-depth for repo-local extras — it should stay read-only. A
+    # GITHUB_TOKEN that can approve PRs is an attack-chain enabler on repos
+    # with auto-merge on: a malicious workflow could approve and land itself.
+    wperm = gh_json("api", f"repos/{OWNER}/{name}/actions/permissions/workflow")
+    if wperm is API_ERROR:
+        s["default_workflow_permissions"] = None
+        s["workflows_can_approve_prs"] = None
+        s["errors"].append("actions workflow permissions unreadable (API)")
+    else:
+        wperm = wperm or {}
+        s["default_workflow_permissions"] = wperm.get("default_workflow_permissions")
+        s["workflows_can_approve_prs"] = wperm.get("can_approve_pull_request_reviews")
+
     wf = gh_json("api", f"repos/{OWNER}/{name}/contents/.github/workflows")
     if wf is API_ERROR:
         s["has_codeql"] = s["has_security_scan"] = s["has_scorecard"] = None
+        s["has_coverage"] = None
         s["errors"].append("workflow listing unreadable (API)")
     else:
         wf_names = {f["name"] for f in wf} if isinstance(wf, list) else set()
         s["has_codeql"] = bool({"codeql.yml", "codeql.yaml"} & wf_names)
         s["has_security_scan"] = bool({"security.yml", "security.yaml"} & wf_names)
         s["has_scorecard"] = bool({"scorecard.yml", "scorecard.yaml"} & wf_names)
+        s["has_coverage"] = bool({"coverage.yml", "coverage.yaml"} & wf_names)
+
+    # Surface detection, mirroring scripts/classify-repos.sh: a root go.mod or
+    # package.json means measurable coverage (sync delivers coverage.yml), a
+    # root Dockerfile means the release pipeline publishes an image (and, for
+    # dual-publish repos, needs the Docker Hub secrets).
+    for probe_file, key in (("go.mod", "has_gomod"), ("package.json", "has_packagejson"),
+                            ("Dockerfile", "has_dockerfile")):
+        txt = file_text(name, probe_file)
+        if txt is None:
+            s[key] = None
+            s["errors"].append(f"{probe_file} probe unreadable (API)")
+        else:
+            s[key] = bool(txt)
+
+    # A committed dependabot.yml enables Dependabot VERSION update PRs, which
+    # compete with Renovate (the settings twin of the security-updates check).
+    dep_txt = file_text(name, ".github/dependabot.yml")
+    if dep_txt is None:
+        s["has_dependabot_yml"] = None
+        s["errors"].append("dependabot.yml probe unreadable (API)")
+    else:
+        s["has_dependabot_yml"] = bool(dep_txt)
+
+    # Docker Hub dual-publish secrets. Image repos (root Dockerfile) publish to
+    # GHCR + Docker Hub by default (release.yaml policy step; GHCR_ONLY lists
+    # the exceptions), and the Docker Hub login needs per-repo secrets —
+    # cplieger is a user account, so there are no org-level secrets. A missing
+    # secret fails the next release at the Docker Hub login step.
+    s["dockerhub_secrets"] = None
+    if s.get("has_dockerfile") and name not in GHCR_ONLY:
+        sec = gh_json("api", f"repos/{OWNER}/{name}/actions/secrets")
+        if isinstance(sec, dict) and "secrets" in sec:
+            names_ = {x.get("name") for x in sec.get("secrets") or []}
+            s["dockerhub_secrets"] = {"DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"} <= names_
+        else:
+            s["errors"].append("actions secrets unreadable (API)")
 
     ci_txt = file_text(name, ".github/workflows/ci.yaml")
     if ci_txt is None:
@@ -366,15 +489,15 @@ def collect(meta):
         s["renovate_preset"] = False
     s["adopted"] = bool(s["ci_wired"]) or bool(s["renovate_preset"])
 
-    # Deploy-trigger webhook. Read repo hooks and look for an active one pointing
-    # at the orchestrator host. webhook_readable distinguishes "no matching hook"
-    # (readable, empty/other hooks) from "could not read hooks" (token lacks the
-    # classic 'repo'/hook scope) so the latter is a global skip, not per-repo
-    # false failures. Only meaningful when WEBHOOK_HOST is set.
+    # Deploy-trigger webhook. Read repo hooks and collect every active one
+    # pointing at the orchestrator host, with the full config surface each
+    # carries (events, payload type, TLS verification, signing secret, last
+    # delivery). webhook_readable distinguishes "no matching hook" (readable,
+    # empty/other hooks) from "could not read hooks" (token lacks the classic
+    # 'repo'/hook scope) so the latter is a global skip, not per-repo false
+    # failures. Only meaningful when WEBHOOK_HOST is set.
     s["webhook_readable"] = False
-    s["webhook_present"] = False
-    s["webhook_has_secret"] = False
-    s["webhook_bad_delivery"] = None
+    s["webhooks"] = []
     if WEBHOOK_HOST:
         hooks = gh_json("api", f"repos/{OWNER}/{name}/hooks")
         if hooks is API_ERROR:
@@ -386,12 +509,14 @@ def collect(meta):
                 cfg = h.get("config") or {}
                 if WEBHOOK_HOST not in (cfg.get("url") or "") or not h.get("active"):
                     continue
-                s["webhook_present"] = True
-                if cfg.get("secret"):
-                    s["webhook_has_secret"] = True
                 code = (h.get("last_response") or {}).get("code")
-                if isinstance(code, int) and code >= 400:
-                    s["webhook_bad_delivery"] = code
+                s["webhooks"].append({
+                    "events": sorted(h.get("events") or []),
+                    "content_type": cfg.get("content_type"),
+                    "insecure_ssl": str(cfg.get("insecure_ssl", "")),
+                    "has_secret": bool(cfg.get("secret")),
+                    "bad_delivery": code if isinstance(code, int) and code >= 400 else None,
+                })
     return s
 
 
@@ -418,17 +543,38 @@ def compliance(s):
         hard.append(f"default_branch={s['default_branch']} (want main)")
 
     # License: public repos only — a private personal repo has no audience
-    # that needs a license grant.
-    if not s["private"] and s["license"] is None:
-        (hard if s["adopted"] else warn).append("license missing")
+    # that needs a license grant. The fleet standard is GPL-3.0, apps and
+    # libraries alike (the synced LICENSE); anything else is drift.
+    if not s["private"]:
+        if s["license"] is None:
+            (hard if s["adopted"] else warn).append("license missing")
+        elif s["license"] != "GPL-3.0":
+            warn.append(f"license {s['license']} (standard is GPL-3.0)")
 
     if s["has_protection"] is False:
         hard.append("no branch protection on default branch")
     elif s["has_protection"]:
         # App repos surface 'ci / validate' (the cplieger/ci meta job); repos
         # with a local CI surface a bare 'validate'. Accept either.
-        if not any("validate" in (c or "") for c in (s["required_checks"] or [])):
+        validate_ctxs = [c for c in (s["required_checks"] or []) if "validate" in (c or "")]
+        if not validate_ctxs:
             hard.append(f"required checks={s['required_checks']} (want a 'validate' check)")
+        # The validate gate must be pinned to the GitHub Actions app. An
+        # app_id of -1 (or another app) lets any integration report a
+        # 'validate' check and satisfy the merge requirement.
+        for ctx in validate_ctxs:
+            app = (s.get("required_check_apps") or {}).get(ctx)
+            if app != ACTIONS_APP_ID:
+                warn.append(f"required check '{ctx}' pinned to app_id={app} "
+                            f"(want {ACTIONS_APP_ID} = GitHub Actions)")
+        # The standard is exactly the validate gate. Any other required check
+        # is drift worth eyeballing — a typo'd or abandoned context is one
+        # workflow rename away from the phantom class below. Deliberate extras
+        # (docker-radvd's smoke job) live in ACCEPTED.
+        for ctx in s["required_checks"] or []:
+            if ctx not in validate_ctxs:
+                warn.append(f"unexpected extra required check '{ctx}' "
+                            "(standard is the validate gate alone)")
         # A required context that no recent commit ever reported is a phantom:
         # protection waits on it forever ("Expected"), blocking every PR while
         # all real checks are green. Judged only on complete data — when the
@@ -450,6 +596,29 @@ def compliance(s):
             warn.append("allow_force_pushes=on (want off)")
         if s["allow_deletions"]:
             warn.append("allow_deletions=on (want off)")
+        # Review requirements: a single-maintainer account can never
+        # self-approve, so an approving-review floor > 0 blocks every PR
+        # (auto-merge included) — breakage, not drift. The toggle with
+        # count=0 gates nothing but still deviates from the standard.
+        if s.get("required_review_count"):
+            hard.append(f"required approving reviews="
+                        f"{s['required_review_count']} — a single-maintainer "
+                        "repo cannot self-approve; every PR blocks (want off)")
+        elif s.get("required_reviews_present"):
+            warn.append("required_pull_request_reviews on (count=0, gates "
+                        "nothing; standard is off)")
+        if s.get("required_conversation_resolution"):
+            warn.append("required_conversation_resolution=on (want off)")
+        if s.get("required_linear_history"):
+            warn.append("required_linear_history=on (want off; the merge "
+                        "model already guarantees linear PR merges)")
+        if s.get("required_signatures"):
+            warn.append("required_signatures=on (want off; fleet commits "
+                        "are unsigned, so this would block every merge)")
+        if s.get("push_restrictions"):
+            warn.append("push restrictions set (standard is none)")
+        if s.get("lock_branch"):
+            hard.append("branch locked (read-only — nothing can merge; want unlocked)")
 
     # Rulesets. Classic protection is the standard, so any custom ruleset is
     # drift (warn). A bypass actor weakens whatever ruleset carries it (warn);
@@ -474,6 +643,20 @@ def compliance(s):
         hard.append("private vulnerability reporting off (want on)")
     if s["dependabot_security_updates"] == "enabled":
         hard.append("dependabot security UPDATES on (want off; Renovate owns deps)")
+    if s.get("has_dependabot_yml"):
+        warn.append("stray .github/dependabot.yml enables Dependabot version "
+                    "PRs (want absent; Renovate owns deps)")
+
+    # Actions token defaults. The workflows declare explicit `permissions:`
+    # blocks, so the read default is defense-in-depth for anything repo-local;
+    # PR-approval ability is a hard no — with auto-merge on, a workflow that
+    # can approve PRs can land its own code.
+    if s.get("default_workflow_permissions") not in (None, "read"):
+        warn.append(f"default workflow permissions="
+                    f"{s['default_workflow_permissions']} (want read)")
+    if s.get("workflows_can_approve_prs"):
+        hard.append("workflows can approve PRs (want off — with auto-merge "
+                    "enabled this lets a workflow land its own code)")
 
     # Secret scanning / push protection: free on public repos; needs GHAS on
     # private (N/A on the free plan), so only enforced on public repos.
@@ -493,6 +676,18 @@ def compliance(s):
             warn.append("security.yml missing")
         if s["has_scorecard"] is False:
             warn.append("scorecard.yml missing")
+        # Go/TS repos have measurable statement coverage; sync delivers
+        # coverage.yml to exactly those (classify-repos.sh), so a missing one
+        # means the sync PR never landed or was reverted.
+        if (s.get("has_gomod") or s.get("has_packagejson")) and s["has_coverage"] is False:
+            warn.append("coverage.yml missing (Go/TS repos publish a coverage badge)")
+
+    # Docker Hub dual-publish secrets: None = N/A (no root Dockerfile, a
+    # GHCR-only repo, or the read failed and was recorded as an [error]).
+    if s.get("dockerhub_secrets") is False:
+        hard.append("DOCKERHUB_USERNAME/DOCKERHUB_TOKEN secrets missing "
+                    "(dual-publish image repo — the next release fails at "
+                    "the Docker Hub login)")
 
     # ci_wired is None when the contents read failed (already an [error]);
     # only a DEFINITIVE "file exists without the reusable ref / file absent"
@@ -503,30 +698,54 @@ def compliance(s):
         warn.append("renovate preset not extended")
 
     # Description + topics: public repos only — discovery metadata has no
-    # audience on a private repo.
+    # audience on a private repo. The house standard is 2-4 topics.
     if not s["private"]:
         if not s["desc_present"]:
             warn.append("description empty")
         elif s["desc_len"] > 100:
             warn.append(f"description {s['desc_len']} chars (>100; Docker Hub short-desc limit)")
-        if not s["topics"]:
-            warn.append("no topics")
+        if len(s["topics"]) < 2:
+            warn.append(f"{len(s['topics'])} topics (want at least 2)")
 
     # Deploy-trigger webhook. Enforced only when the host is configured AND this
     # repo's hooks were readable (see collect); an unreadable token is handled as
     # a global skip in main(), not as per-repo failures. Every non-archived repo
     # is expected to reach the orchestrator: a missing hook means releases never
     # propagate; a hook without a secret is rejected (the orchestrator validates
-    # an HMAC signature over the payload), which is a silent, deploy-breaking gap.
+    # an HMAC signature over the payload); a hook subscribed to the wrong event
+    # never fires at all — each is a silent, deploy-breaking gap. The full
+    # config surface is checked: exact event set (push for the infra repos,
+    # release everywhere else), JSON payload, TLS verification on.
     if WEBHOOK_HOST and s["webhook_readable"]:
-        if not s["webhook_present"]:
+        hooks = s.get("webhooks") or []
+        want_event = "push" if s["name"] in PUSH_WEBHOOK_REPOS else "release"
+        if not hooks:
             hard.append("no deploy-trigger webhook (releases won't reach the orchestrator)")
-        elif not s["webhook_has_secret"]:
-            hard.append("deploy-trigger webhook has no secret "
-                        "(the orchestrator rejects unsigned deliveries)")
-        elif s["webhook_bad_delivery"]:
-            warn.append(f"deploy-trigger webhook last delivery failed "
-                        f"(HTTP {s['webhook_bad_delivery']})")
+        elif len(hooks) > 1:
+            warn.append(f"{len(hooks)} deploy-trigger webhooks (want exactly 1; "
+                        "duplicates double-fire the orchestrator)")
+        for h in hooks:
+            if not h["has_secret"]:
+                hard.append("deploy-trigger webhook has no secret "
+                            "(the orchestrator rejects unsigned deliveries)")
+            if want_event not in (h["events"] or []):
+                hard.append(f"deploy-trigger webhook events={h['events']} lack "
+                            f"'{want_event}' (it never fires, so deploys never "
+                            "trigger)")
+            elif set(h["events"]) != {want_event}:
+                warn.append(f"deploy-trigger webhook events={h['events']} "
+                            f"(want exactly ['{want_event}'])")
+            if h["insecure_ssl"] != "0":
+                hard.append(f"deploy-trigger webhook insecure_ssl="
+                            f"{h['insecure_ssl']!r} (TLS verification disabled; "
+                            "want '0')")
+            if h["content_type"] != "json":
+                warn.append(f"deploy-trigger webhook content_type="
+                            f"{h['content_type']} (want json; the orchestrator "
+                            "parses a JSON body)")
+            if h["bad_delivery"]:
+                warn.append(f"deploy-trigger webhook last delivery failed "
+                            f"(HTTP {h['bad_delivery']})")
 
     # Filter known-accepted deviations (warnings only — a HARD failure is
     # never silently acceptable) so the steady-state report is clean.
@@ -544,6 +763,10 @@ def compliance(s):
 def main():
     ap = argparse.ArgumentParser(description="cplieger governance audit")
     ap.add_argument("--visibility", choices=["all", "public", "private"], default="all")
+    ap.add_argument("--repo", action="append", metavar="NAME",
+                    help="audit only this repo (repeatable). The bootstrap-repo "
+                         "skill runs this against a freshly created repo as its "
+                         "settings gate.")
     ap.add_argument("--dump", metavar="PATH", help="write raw collected settings as JSON")
     args = ap.parse_args()
 
@@ -555,6 +778,15 @@ def main():
     metas = [m for m in json.loads(r.stdout) if not m["isArchived"]]
     if args.visibility != "all":
         metas = [m for m in metas if (m.get("visibility") or "").lower() == args.visibility]
+    if args.repo:
+        want = set(args.repo)
+        known = {m["name"] for m in metas}
+        unknown = sorted(want - known)
+        if unknown:
+            sys.stderr.write(f"error: unknown (or archived/filtered) repo(s): "
+                             f"{', '.join(unknown)}\n")
+            sys.exit(2)
+        metas = [m for m in metas if m["name"] in want]
     metas.sort(key=lambda m: m["name"])
 
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -592,8 +824,9 @@ def main():
         sys.exit(2)
 
     hard_total, warn_total, accepted_total, error_total, clean = 0, 0, 0, 0, 0
+    scope = f", repos={','.join(sorted(set(args.repo)))}" if args.repo else ""
     print(f"GOVERNANCE COMPLIANCE — {len(settings)} repos "
-          f"(visibility={args.visibility})")
+          f"(visibility={args.visibility}{scope})")
     print("Legend: [HARD] blocks compliance · [warn] advisory · [error] API "
           "read failed (check skipped) · GHAS scanning N/A on free private "
           "repos · accepted deviations suppressed (see ACCEPTED)\n")
