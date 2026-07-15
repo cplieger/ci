@@ -26,7 +26,21 @@ runs:
         # an explicit, logged failure. A zero exit with empty output (compute
         # produced nothing) is also treated as a hard failure rather than a
         # silent release=false.
-        if ! NEXT="$(git cliff --bumped-version 2>/tmp/cliff.err)"; then
+        #
+        # --unreleased anchors the version base at the actual latest tag.
+        # Without it, cliff derives the base from its post-filter release
+        # history: a tag whose entire commit window is filtered out (all
+        # commits excluded by exclude_paths or skip-typed — e.g. a legacy
+        # release minted purely from CI-pin bumps) vanishes from that model,
+        # so the base regresses to an older tag and the computed "next"
+        # version can equal an EXISTING tag at a different commit — which the
+        # release tag-create guard then refuses, failing the run. Verified on
+        # git-cliff v2.13.1: bare mode at a filtered-empty latest tag returns
+        # versions below `git describe`; --unreleased returns the latest tag
+        # itself (no unreleased commits -> release=false) and bumps past
+        # existing tags correctly when real commits are pending. Bootstrap
+        # (no tags) still falls back to [bump].initial_tag.
+        if ! NEXT="$(git cliff --unreleased --bumped-version 2>/tmp/cliff.err)"; then
           echo "::error::git-cliff --bumped-version failed:"
           sed 's/^/  /' /tmp/cliff.err >&2 || true
           exit 1
@@ -35,7 +49,12 @@ runs:
           echo "::error::git-cliff returned an empty version with no error"
           exit 1
         fi
-        LATEST="$(git describe --tags --abbrev=0 2>/dev/null || echo "")"
+        # --match constrains describe to the same tag universe as the consumer
+        # cliff.toml's tag_pattern ("v[0-9].*"), so the NEXT/LATEST comparison
+        # below never compares versions selected under two different rules
+        # (e.g. a non-release utility tag picked up by an unconstrained
+        # describe).
+        LATEST="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo "")"
         if [ "$NEXT" = "$LATEST" ]; then
           echo "release=false" >> "$GITHUB_OUTPUT"
         else

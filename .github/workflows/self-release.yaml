@@ -114,7 +114,16 @@ jobs:
           # Next version from conventional commits, using the CI-dedicated config
           # (full-semver tag_pattern). Mirrors git-cliff-version's error handling:
           # a non-zero exit or empty output is a hard failure, never a silent skip.
-          if ! NEXT="$(git cliff --bumped-version --config "$CLIFF_CONFIG" 2>/tmp/cliff.err)"; then
+          #
+          # --unreleased anchors cliff's version base at the actual latest
+          # tag (same reason as in actions/git-cliff-version): without it, a
+          # tag whose entire window is skip-typed — exactly what the force-
+          # patch fallback below mints for ci:/chore: workflow fixes —
+          # vanishes from cliff's post-filter release model, the base
+          # regresses to an older tag, and NEXT can come back BELOW
+          # LAST_TAG, tripping the strictly-greater guard into a hard
+          # failure on every subsequent propagatable release.
+          if ! NEXT="$(git cliff --unreleased --bumped-version --config "$CLIFF_CONFIG" 2>/tmp/cliff.err)"; then
             echo "::error::git cliff --bumped-version failed:"
             sed 's/^/  /' /tmp/cliff.err >&2 || true
             exit 1

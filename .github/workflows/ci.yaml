@@ -495,6 +495,24 @@ jobs:
             /tmp/gitleaks dir . --no-banner --redact --exit-code 1
           ) || { echo "Scan for secrets (gitleaks)" >> /tmp/_ci_failures; exit 1; }
 
+      # git-cliff semantics probe (opt-in by file presence; today only
+      # cplieger/ci ships it). The fleet's release boolean depends on
+      # UNDOCUMENTED git-cliff bump behaviors (see the probe's header); this
+      # step re-verifies them against the pinned binary and the shipped
+      # consumer cliff config, so a Renovate bump of the git-cliff pin (or a
+      # cliff-config edit) cannot merge if the new combination breaks the
+      # release-gate contract.
+      - name: Probe git-cliff bump semantics
+        continue-on-error: true
+        run: |
+          (
+            if [ -x scripts/test-cliff-bump-semantics.sh ]; then
+              ./scripts/test-cliff-bump-semantics.sh
+            else
+              echo "no cliff semantics probe in this repo - skipping"
+            fi
+          ) || { echo "Probe git-cliff bump semantics" >> /tmp/_ci_failures; exit 1; }
+
       - name: Check results
         if: always()
         run: |
