@@ -1,13 +1,19 @@
-# Daily security scan across all cplieger consumer repos.
+# Daily security scan across the public cplieger consumer repos.
 #
 # Schedule:           Daily 03:00 UTC
 # What it does:       Dispatches `security.yml` (the synced consumer security
-#                     workflow) on every consumer repo. Trivy fs scan on all
-#                     repos; Trivy image scan additionally on Dockerfile
+#                     workflow) on every PUBLIC consumer repo. Trivy fs scan on
+#                     all repos; Trivy image scan additionally on Dockerfile
 #                     repos. Auto-detected by `security.yml`.
+# Private repos:      Deliberately excluded. Public-repo Actions minutes are
+#                     free; private repos are the only consumers of the
+#                     account's included minutes, and both (homelab, .kiro)
+#                     run bespoke CI on their own weekly cadence (homelab's
+#                     security.yml has its own Mon 08:00 cron). A daily
+#                     central dispatch on top of that was pure redundant burn.
 # Concurrency note:   `gh workflow run` is fire-and-forget, so max-parallel
 #                     below paces only the DISPATCH calls, not the scans — the
-#                     ~28 dispatched security.yml runs start near-simultaneously
+#                     ~41 dispatched security.yml runs start near-simultaneously
 #                     and compete for the account's 20 concurrent-job slots.
 #                     Accepted: each scan is brief (~3 min), the burst drains in
 #                     minutes, and 03:00 UTC is dead time for ad-hoc work. The
@@ -36,14 +42,17 @@ jobs:
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
     steps:
-      - name: Discover repos with security.yml
+      - name: Discover public repos with security.yml
         id: fanout
         env:
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
         run: |
           set -euo pipefail
-          repos=$(gh repo list cplieger --limit 300 --json name,isArchived --jq '
-            [.[] | select(.isArchived == false) | .name] | .[]
+          # Public only (visibility rule, not a repo-name list): private repos
+          # draw the account's included minutes and own their scan cadence —
+          # see the "Private repos" note in the header.
+          repos=$(gh repo list cplieger --limit 300 --json name,isArchived,visibility --jq '
+            [.[] | select(.isArchived == false and .visibility == "PUBLIC") | .name] | .[]
           ')
           REPOS=()
           for r in $repos; do
