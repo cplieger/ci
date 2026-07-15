@@ -7,7 +7,8 @@ compliance report against the documented standard in
 with N/A handling where a setting cannot apply (e.g. GitHub Advanced Security
 features on free private repos).
 
-Checks cover merge model, repo features, branch protection, rulesets
+Checks cover merge model, repo features, branch protection (including phantom
+required contexts that no workflow ever reports), rulesets
 (unexpected custom rulesets + bypass-actor drift), vulnerability reporting,
 secret/code scanning, CI wiring, Renovate preset, license, default branch,
 description (presence + <=100 chars), topics, and the per-repo deploy-trigger
@@ -63,6 +64,11 @@ OWNER = "cplieger"
 PRESET = "github>cplieger/.github"
 REUSABLE = "cplieger/ci/.github/workflows"
 INFRA = {".github", "ci"}  # they define the standard; CI-wiring check is N/A for them
+# Repos with a deliberate repo-local CI instead of the reusable-workflow thin
+# caller: they validate surfaces the shared workflows don't cover and gate on a
+# bespoke `validate` job (which the branch-protection check accepts as the bare
+# 'validate' context). The CI-wiring check is N/A for them, same as INFRA.
+BESPOKE_CI = {".kiro", "homelab"}
 # Host of the self-hosted deploy/dependency orchestrator that each repo pings
 # via a per-repo webhook (a release, or a push on infra repos, reaches it so the
 # change redeploys / re-runs dependency updates). It is private infrastructure,
@@ -257,6 +263,57 @@ def collect(meta):
         s["required_checks"] = []
         s["strict"] = s["enforce_admins"] = s["allow_force_pushes"] = s["allow_deletions"] = None
 
+    # Phantom required contexts. Branch protection matches a required context
+    # against reported check-run NAMES: for a reusable-workflow job that is
+    # 'caller / nested' (e.g. 'ci / validate'), but for a plain workflow job it
+    # is the job name alone — the PR checks UI displays 'Workflow / job', which
+    # is NOT the context name. A context nothing ever reports blocks every PR
+    # forever as "Expected — waiting for status to be reported" while all real
+    # checks are green (bit docker-radvd PR #248, 2026-07: required as
+    # 'Smoke / smoke' what reports as 'smoke'). Verify every required context
+    # against names actually observed: on the default-branch HEAD first; only
+    # if something is still unobserved, escalate to the head commits of the 3
+    # most recently updated PRs (some repos run CI on PRs only, so their main
+    # HEAD carries no check runs) plus the HEAD's legacy combined status (a
+    # non-Actions integration would report there, not as a check run).
+    s["observed_checks"] = []
+    s["observed_complete"] = True
+    if s["required_checks"]:
+        names, complete = set(), True
+
+        def check_names(ref):
+            nonlocal complete
+            cr = gh_json("api",
+                         f"repos/{OWNER}/{name}/commits/{ref}/check-runs?per_page=100")
+            if cr is API_ERROR:
+                complete = False
+                return set()
+            return {c.get("name") for c in (cr or {}).get("check_runs") or []
+                    if c.get("name")}
+
+        names |= check_names(branch)
+        if not set(s["required_checks"]) <= names:
+            prs = gh_json("api", f"repos/{OWNER}/{name}/pulls"
+                                 "?state=all&sort=updated&direction=desc&per_page=3")
+            if prs is API_ERROR:
+                complete = False
+            else:
+                for pr in prs if isinstance(prs, list) else []:
+                    sha = (pr.get("head") or {}).get("sha")
+                    if sha:
+                        names |= check_names(sha)
+            st = gh_json("api", f"repos/{OWNER}/{name}/commits/{branch}/status")
+            if st is API_ERROR:
+                complete = False
+            else:
+                names |= {c.get("context") for c in (st or {}).get("statuses") or []
+                          if c.get("context")}
+        s["observed_checks"] = sorted(names)
+        s["observed_complete"] = complete
+        if not complete and not set(s["required_checks"]) <= names:
+            s["errors"].append("check-run names unreadable (API) — "
+                               "phantom-required-context check skipped")
+
     # Repository rulesets. The standard is classic branch protection, so
     # any non-managed ruleset is drift. The bypass-actor list is the precise
     # surface that classic-protection checks miss: a decommissioned GitHub App
@@ -372,6 +429,19 @@ def compliance(s):
         # with a local CI surface a bare 'validate'. Accept either.
         if not any("validate" in (c or "") for c in (s["required_checks"] or [])):
             hard.append(f"required checks={s['required_checks']} (want a 'validate' check)")
+        # A required context that no recent commit ever reported is a phantom:
+        # protection waits on it forever ("Expected"), blocking every PR while
+        # all real checks are green. Judged only on complete data — when the
+        # check-run reads failed, collect() already recorded an [error] and the
+        # check is skipped here.
+        if s.get("observed_complete"):
+            observed = set(s.get("observed_checks") or [])
+            for ctx in s["required_checks"] or []:
+                if ctx not in observed:
+                    hard.append(f"required context '{ctx}' never reported by any "
+                                "recent check run (phantom — blocks every PR as "
+                                "'Expected'; the context must equal the check-run "
+                                "name, e.g. 'smoke', not 'Smoke / smoke')")
         if s["strict"]:
             warn.append("branch protection strict=on (want off)")
         if s["enforce_admins"]:
@@ -426,8 +496,8 @@ def compliance(s):
 
     # ci_wired is None when the contents read failed (already an [error]);
     # only a DEFINITIVE "file exists without the reusable ref / file absent"
-    # is a hard failure.
-    if not s["infra"] and s["adopted"] and s["ci_wired"] is False:
+    # is a hard failure. Bespoke-CI repos are exempt by design (see BESPOKE_CI).
+    if not s["infra"] and s["name"] not in BESPOKE_CI and s["adopted"] and s["ci_wired"] is False:
         hard.append("CI not wired to cplieger/ci")
     if s["renovate_preset"] is False:
         warn.append("renovate preset not extended")
