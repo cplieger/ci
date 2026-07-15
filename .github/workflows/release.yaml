@@ -35,6 +35,20 @@ name: Release
 
 on:
   workflow_call:
+    inputs:
+      skip_if_unchanged:
+        description: >-
+          Give this run no-op-skip semantics: when the docker pipeline finds
+          the rebuilt image's package inventory identical to what :latest
+          already ships, every publish step is skipped (no tag moves, no
+          digest churn). Normally set via the consumer stub's
+          workflow_dispatch input by the scheduled staleness rebuild
+          (cplieger/ci rebuild-stale.yaml); push events keep today's
+          always-publish semantics. Docker-type repos only; go/ts releases
+          ignore it.
+        type: boolean
+        required: false
+        default: false
     secrets:
       DOCKERHUB_USERNAME:
         required: false
@@ -421,6 +435,16 @@ jobs:
       platforms: ${{ needs.detect.outputs.platforms }}
       sbom-from: ${{ needs.detect.outputs.sbom_from }}
       syft-config: ${{ needs.detect.outputs.syft_config }}
+      # Effective no-op-skip flag: an explicit workflow_call input (direct
+      # callers) OR the consumer stub's own workflow_dispatch input. The
+      # github context inside a reusable workflow is the CALLER's, so the
+      # stub's dispatch input is readable here without the stub forwarding it
+      # via `with:` (forwarding would break every consumer whose pinned SHA
+      # predates the input during the template-sync/Renovate-bump gap). Push
+      # events always evaluate false: github.event.inputs only exists on
+      # workflow_dispatch, so the push path keeps today's always-publish
+      # semantics.
+      skip-if-unchanged: ${{ inputs.skip_if_unchanged || github.event.inputs.skip_if_unchanged == 'true' }}
     secrets: inherit
 
   # ─── Go module release (tag + GitHub Release; `go install` fetches by tag) ─

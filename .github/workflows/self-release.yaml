@@ -151,7 +151,7 @@ jobs:
             # MINUS this list, so it fails SAFE: a NEW reusable workflow
             # auto-propagates, while a forgotten new internal one only costs one
             # harmless extra bump (noticed via the needless PRs, then added here).
-            INTERNAL_WORKFLOWS="audit.yaml daily-security.yaml move-major-tag.yaml scorecard.yml self-ci.yaml self-codeql.yml self-release.yaml sync.yaml trigger-renovate.yaml weekly-fuzz.yaml weekly-gremlins.yaml weekly-stryker.yaml backfill-release-sbom-sigs.yaml"
+            INTERNAL_WORKFLOWS="audit.yaml daily-security.yaml move-major-tag.yaml rebuild-stale.yaml scorecard.yml self-ci.yaml self-codeql.yml self-release.yaml sync.yaml trigger-renovate.yaml weekly-fuzz.yaml weekly-gremlins.yaml weekly-stryker.yaml backfill-release-sbom-sigs.yaml"
 
             is_internal() {
               local base="$1"

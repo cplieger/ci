@@ -11,6 +11,14 @@
 #   3. finalize: download digests → assemble multi-arch manifest via imagetools
 #                → cosign sign+attest → SBOM → Trivy → GitHub Release (gated on
 #                `release-needed`) → Docker Hub README/description sync
+#
+# When called with skip-if-unchanged=true (staleness-dispatched rebuilds only),
+# a no-change publish gate runs in finalize BEFORE the manifest is created: if
+# no release is warranted, the fresh image was built from the same source
+# revision as :latest, AND its package inventory is identical to the SBOM
+# attestation on :latest, every publish step is skipped, so a no-op rebuild
+# moves no tags and churns no digests. A skipped run still refreshes the
+# Trivy/SARIF scan and the shipped-versions summary. See the gate step.
 name: Docker Release
 
 on:
@@ -48,6 +56,17 @@ on:
         description: "'image' scans the pushed image; 'path' extracts binary to /tmp/sbom-src first."
         type: string
         default: "image"
+      skip-if-unchanged:
+        description: >-
+          When true (staleness-dispatched rebuilds only), compare the freshly
+          built image against ghcr.io/<image>:latest (source revision label
+          AND SBOM package inventory) and skip every publish step (manifest,
+          tags, signatures, attestations, Docker Hub, GitHub Release) when
+          both are identical. Never skips a warranted release
+          (release-needed=true). Fail-open: any fetch/parse problem publishes
+          normally.
+        type: boolean
+        default: false
     secrets:
       DOCKERHUB_USERNAME:
         required: false
@@ -66,6 +85,13 @@ env:
   COSIGN_VERSION: v3.1.1
   # renovate: datasource=github-releases depName=aquasecurity/trivy
   TRIVY_VERSION: v0.72.0
+  # syft for the no-change publish gate, pinned to the version bundled by the
+  # anchore/sbom-action pin below (v0.24.0 bundles syft v1.42.3) so the gate's
+  # fresh scan sees the same package inventory the attested baseline SBOM was
+  # generated with. Tuple-level compare tolerates small drift, and any
+  # mismatch fails open (publishes).
+  # renovate: datasource=github-releases depName=anchore/syft
+  SYFT_VERSION: v1.42.3
 
 # Top-level read-only (OpenSSF Scorecard Token-Permissions); each job below
 # declares the write scopes it needs (build/finalize push, sign, attest, release).
@@ -308,15 +334,238 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      # Installed here (not just before signing) because the no-change gate
+      # below needs cosign to download the baseline attestation BEFORE the
+      # manifest is created. Pure tool install; order is otherwise irrelevant.
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      # ─── No-change publish gate (staleness-dispatched rebuilds only) ──────
+      # Compares the package inventory (sorted SPDX name+versionInfo tuples)
+      # of the freshly built amd64 image against the SBOM attestation already
+      # on ghcr.io/<image>:latest. Identical inventory: every publish step
+      # below is skipped via `steps.nochange.outputs.skip`, so no tags move
+      # and no new manifest digest appears, and digest-pinned consumers see no
+      # churn from a no-op rebuild. Different inventory: publish proceeds and
+      # the tuple diff lands in the job summary.
+      #
+      # FAIL-OPEN by design: a missing baseline (first publish), an
+      # attestation fetch error, a tool download/registry failure, or an
+      # unparsable SBOM publishes normally and says why in the job summary.
+      # The gate only ever skips on positive proof: the source revision
+      # (org.opencontainers.image.revision, stamped by docker/metadata-action
+      # on every build) matches :latest AND the package inventory is
+      # identical — and never when the caller signaled a warranted release
+      # (release-needed=true). It never runs on push events
+      # (skip-if-unchanged defaults false), so the push path keeps today's
+      # always-publish semantics.
+      #
+      # Accepted limits (deliberate decisions, not bugs):
+      #   1. amd64-resolved SBOM: the comparison scans the amd64 per-arch
+      #      image (the attested baseline was itself generated from the
+      #      amd64-resolved index), so an arm64-ONLY package delta is
+      #      invisible to the gate. Alpine builds both arches from the same
+      #      aports revision, so versions track closely in practice.
+      #   2. Orphaned digests on skip: the per-arch images were already
+      #      pushed by digest during the build matrix, before any skip
+      #      decision could exist. A skipped publish leaves those digests
+      #      untagged in GHCR. Cosmetic: no tags move, nothing consumes them.
+      - name: No-change publish gate
+        id: nochange
+        if: ${{ inputs.skip-if-unchanged == true }}
+        env:
+          RELEASE_NEEDED: ${{ inputs.release-needed }}
+          SBOM_FROM: ${{ inputs.sbom-from }}
+          SYFT_CONFIG: ${{ inputs.syft-config }}
+          # Via env, never inline ${{ }} in the script body (template injection).
+          BIN_NAME: ${{ inputs.image-name }}
+        run: |
+          set -euo pipefail
+
+          # Everything below fails OPEN: emit skip=false with a reason, exit 0.
+          proceed() {
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## No-change publish gate"
+              echo ""
+              echo "**Publishing normally.** $1"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "gate: publishing normally: $1"
+            exit 0
+          }
+
+          # A warranted release must never be skipped: when the caller's
+          # detect job found unreleased conventional commits
+          # (release-needed=true), a version tag + GitHub Release is due
+          # regardless of the package inventory — e.g. a push release that
+          # failed after merge and is being retried by a staleness dispatch.
+          if [ "$RELEASE_NEEDED" = "true" ]; then
+            proceed "A release is warranted (release-needed=true); never skip a warranted release."
+          fi
+
+          # The comparison scans the amd64 per-arch image (accepted limit 1).
+          DIGEST_FILE=/tmp/digests/linux-amd64
+          if [ ! -f "$DIGEST_FILE" ]; then
+            proceed "No linux/amd64 digest in this build's platform set; the gate only understands amd64."
+          fi
+          AMD64_REF="${REGISTRY}/${IMAGE_NAME}@$(cat "$DIGEST_FILE")"
+          # Exported for the skip-path Trivy scan: on a skipped publish no
+          # manifest digest exists, so the scan targets this fresh amd64 image.
+          echo "amd64-ref=${AMD64_REF}" >> "$GITHUB_OUTPUT"
+
+          # Source-revision guard: package tuples describe the dependency
+          # inventory, not the application source, entrypoint, or copied
+          # config. A pending source change whose tuples happen to match
+          # :latest (an entrypoint fix, a Go change that moves no dependency)
+          # must still publish. docker/metadata-action's default labels stamp
+          # every build's config with org.opencontainers.image.revision
+          # (verified on the published images); allow a skip only when the
+          # fresh amd64 config and the :latest baseline carry the same
+          # revision. Missing labels or inspect errors publish (fail-open).
+          get_revision() {
+            # $1 = image ref. buildx resolves a bare manifest or a per-arch
+            # provenance index to a single config object; a multi-arch index
+            # yields a platform-keyed map. Handle both; empty on any failure.
+            docker buildx imagetools inspect "$1" --format '{{json .Image}}' 2>/dev/null \
+              | jq -r '
+                  ( if type == "object" and has("config") then .
+                    elif type == "object" then (.["linux/amd64"] // empty)
+                    else empty end )
+                  | .config.Labels["org.opencontainers.image.revision"] // empty' 2>/dev/null \
+              || true
+          }
+          FRESH_REV=$(get_revision "$AMD64_REF")
+          BASELINE_REV=$(get_revision "${REGISTRY}/${IMAGE_NAME}:latest")
+          if [ -z "$FRESH_REV" ] || [ -z "$BASELINE_REV" ]; then
+            proceed "Source revision label unavailable (fresh: '${FRESH_REV:-?}', :latest: '${BASELINE_REV:-?}'); cannot prove source equivalence."
+          fi
+          if [ "$FRESH_REV" != "$BASELINE_REV" ]; then
+            proceed "Source revision changed (${BASELINE_REV} -> ${FRESH_REV}); the tuple compare cannot see source/config changes."
+          fi
+
+          # Baseline: the SPDX SBOM attestation cosign attached to :latest on
+          # its last publish (GHCR only; the same digest goes to Docker Hub).
+          if ! cosign download attestation \
+              --predicate-type https://spdx.dev/Document \
+              "${REGISTRY}/${IMAGE_NAME}:latest" > /tmp/gate-attestations.jsonl 2>/tmp/gate-cosign.err; then
+            proceed "No baseline SBOM attestation on :latest (first publish, or fetch error: $(head -c 200 /tmp/gate-cosign.err | tr '\n' ' '))."
+          fi
+          if [ ! -s /tmp/gate-attestations.jsonl ]; then
+            proceed "Baseline attestation list for :latest is empty."
+          fi
+          # Most recent matching attestation is the last line; its payload is
+          # a base64 in-toto statement whose .predicate is the SPDX document.
+          # Two envelope shapes exist in the wild: the new sigstore bundle
+          # (cosign v3 attest default; payload at .dsseEnvelope.payload) and
+          # the legacy DSSE envelope (pre-v3 publishes; payload at .payload).
+          if ! tail -n 1 /tmp/gate-attestations.jsonl \
+              | jq -r '.dsseEnvelope.payload // .payload' | base64 -d \
+              | jq '.predicate' > /tmp/gate-baseline.spdx.json 2>/dev/null; then
+            proceed "Could not decode the baseline attestation payload."
+          fi
+
+          # Fresh side: SBOM of the just-built amd64 image, generated the same
+          # way the pipeline's attested SBOM is (image scan honoring the repo
+          # syft config, or path mode scanning the extracted binary). Tool
+          # download and image extraction run inside explicit fail-open
+          # guards: a transient CDN or registry hiccup must publish normally,
+          # never fail the release (the gate's declared contract).
+          if ! curl -fsSL --retry 3 \
+              "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VERSION#v}_linux_amd64.tar.gz" \
+              | tar xz -C /tmp syft; then
+            proceed "Could not install syft ${SYFT_VERSION} for the fresh scan."
+          fi
+          if [ "$SBOM_FROM" = "path" ]; then
+            # Trap registered before the container exists and guarded on CID:
+            # cleanup only ever targets a container this run actually created.
+            CID=""
+            trap 'if [ -n "$CID" ]; then docker rm -f "$CID" >/dev/null 2>&1 || true; fi' EXIT
+            if ! { docker pull -q "$AMD64_REF" \
+                && CID=$(docker create "$AMD64_REF") \
+                && mkdir -p /tmp/gate-sbom-src \
+                && docker cp "$CID:/app/${BIN_NAME}" "/tmp/gate-sbom-src/${BIN_NAME}"; }; then
+              proceed "Could not extract the binary from the fresh amd64 image (path mode)."
+            fi
+            SRC="dir:/tmp/gate-sbom-src"
+          else
+            SRC="registry:${AMD64_REF}"
+          fi
+          cfg_args=()
+          [ -n "$SYFT_CONFIG" ] && cfg_args=(-c "$SYFT_CONFIG")
+          if ! /tmp/syft ${cfg_args[@]+"${cfg_args[@]}"} -o spdx-json "$SRC" \
+              > /tmp/gate-fresh.spdx.json 2>/tmp/gate-syft.err; then
+            proceed "syft failed on the fresh image ($(head -c 200 /tmp/gate-syft.err | tr '\n' ' '))."
+          fi
+
+          # Tuple-level compare: sorted (name, versionInfo) pairs ONLY, never
+          # the raw JSON (document UUIDs and creation timestamps differ on
+          # every scan). The document root (the scanned image/dir itself; its
+          # versionInfo is the scanned manifest digest, which differs on every
+          # rebuild) must be excluded or the gate could never skip. syft
+          # links the root via a DESCRIBES relationship from SPDXRef-DOCUMENT
+          # (documentDescribes stays null); both spellings are handled.
+          tuples() {
+            jq -r '
+              ( [ .documentDescribes // [] | .[] ]
+                + [ .relationships[]?
+                    | select(.relationshipType == "DESCRIBES"
+                             and .spdxElementId == "SPDXRef-DOCUMENT")
+                    | .relatedSpdxElement ] ) as $roots
+              | [ .packages[]?
+                  | select(.SPDXID as $id | ($roots | index($id)) == null)
+                  | "\(.name)\t\(.versionInfo // "")" ]
+              | sort | unique | .[]' "$1"
+          }
+          if ! tuples /tmp/gate-baseline.spdx.json > /tmp/gate-tuples-prev; then
+            proceed "Could not extract package tuples from the baseline SBOM."
+          fi
+          if ! tuples /tmp/gate-fresh.spdx.json > /tmp/gate-tuples-new; then
+            proceed "Could not extract package tuples from the fresh SBOM."
+          fi
+          if [ ! -s /tmp/gate-tuples-new ]; then
+            proceed "Fresh SBOM contains no packages; refusing to skip on empty evidence."
+          fi
+
+          if diff -u /tmp/gate-tuples-prev /tmp/gate-tuples-new > /tmp/gate-tuples.diff; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "## No-change publish gate"
+              echo ""
+              echo "**Unchanged, publish skipped.** The rebuilt image's package inventory"
+              echo "($(wc -l < /tmp/gate-tuples-new) packages) is identical to the SBOM attestation on ${REGISTRY}/${IMAGE_NAME}:latest."
+              echo ""
+              echo "No tags moved, no manifest was created, no release was cut. The per-arch"
+              echo "digests pushed by the build matrix remain untagged in GHCR (accepted, cosmetic)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "gate: unchanged, publish skipped"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## No-change publish gate"
+              echo ""
+              echo "**Inventory changed, publishing.** Package tuple diff vs :latest:"
+              echo ""
+              echo '```diff'
+              head -n 100 /tmp/gate-tuples.diff
+              if [ "$(wc -l < /tmp/gate-tuples.diff)" -gt 100 ]; then
+                echo "(diff truncated at 100 lines)"
+              fi
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "gate: inventory changed, publishing"
+          fi
+
       - name: Log in to Docker Hub
-        if: ${{ contains(inputs.registries, 'dockerhub') }}
+        if: ${{ contains(inputs.registries, 'dockerhub') && steps.nochange.outputs.skip != 'true' }}
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Ensure Docker Hub repository exists
-        if: ${{ contains(inputs.registries, 'dockerhub') }}
+        if: ${{ contains(inputs.registries, 'dockerhub') && steps.nochange.outputs.skip != 'true' }}
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -345,7 +594,13 @@ jobs:
             *) echo "::warning::Unexpected HTTP ${code} for docker.io/${namespace}/${name}"; cat /tmp/dhrepo.json 2>/dev/null || true ;;
           esac
 
+      # From here on, every publish step is gated on the no-change gate:
+      # `steps.nochange.outputs.skip` is 'true' only when the gate ran (a
+      # staleness-dispatched rebuild) AND proved the inventory identical; on
+      # push events the gate is skipped, its output is empty, and everything
+      # below runs exactly as before.
       - name: Create multi-arch manifest
+        if: ${{ steps.nochange.outputs.skip != 'true' }}
         id: manifest
         env:
           TAGS: ${{ needs.prepare.outputs.tags }}
@@ -395,6 +650,7 @@ jobs:
         # whenever it can actually change. Best-effort (continue-on-error) — a
         # badge hiccup must never fail a release.
         id: sizebadge
+        if: ${{ steps.nochange.outputs.skip != 'true' }}
         continue-on-error: true
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
@@ -433,6 +689,7 @@ jobs:
           json: ${{ steps.sizebadge.outputs.json }}
 
       - name: Trivy scan published image
+        if: ${{ steps.nochange.outputs.skip != 'true' }}
         continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -443,8 +700,26 @@ jobs:
           severity: 'HIGH,CRITICAL'
           ignore-unfixed: true
 
+      # A skipped publish must NOT suppress vulnerability visibility: an
+      # unchanged package inventory is exactly when the vuln DB may have
+      # gained a new advisory for what :latest already ships. No manifest
+      # digest exists on the skip path, so scan the fresh amd64 per-arch
+      # image the gate compared (same content) and upload under the same
+      # category as the publish-path scan.
+      - name: Trivy scan fresh image (publish skipped)
+        if: ${{ steps.nochange.outputs.skip == 'true' }}
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          image-ref: ${{ steps.nochange.outputs.amd64-ref }}
+          format: 'sarif'
+          output: 'trivy-image.sarif'
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+
       - name: Upload Trivy SARIF
-        if: always()
+        if: ${{ always() }}
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
         with:
@@ -452,7 +727,7 @@ jobs:
           category: 'trivy-image-build'
 
       - name: Extract binary for SBOM (path mode)
-        if: ${{ inputs.sbom-from == 'path' }}
+        if: ${{ inputs.sbom-from == 'path' && steps.nochange.outputs.skip != 'true' }}
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
           # Via env, never inline ${{ }} in the script body (template injection).
@@ -469,7 +744,7 @@ jobs:
           docker cp "$CID:/app/${BIN_NAME}" "/tmp/sbom-src/${BIN_NAME}"
 
       - name: Generate SBOM (from image)
-        if: ${{ inputs.sbom-from == 'image' && inputs.syft-config == '' }}
+        if: ${{ inputs.sbom-from == 'image' && inputs.syft-config == '' && steps.nochange.outputs.skip != 'true' }}
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
@@ -478,7 +753,7 @@ jobs:
           upload-release-assets: false
 
       - name: Generate SBOM (from image, with syft config)
-        if: ${{ inputs.sbom-from == 'image' && inputs.syft-config != '' }}
+        if: ${{ inputs.sbom-from == 'image' && inputs.syft-config != '' && steps.nochange.outputs.skip != 'true' }}
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
@@ -488,7 +763,7 @@ jobs:
           config: ${{ inputs.syft-config }}
 
       - name: Generate SBOM (from path)
-        if: ${{ inputs.sbom-from == 'path' }}
+        if: ${{ inputs.sbom-from == 'path' && steps.nochange.outputs.skip != 'true' }}
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: /tmp/sbom-src
@@ -496,12 +771,49 @@ jobs:
           output-file: sbom.spdx.json
           upload-release-assets: false
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: ${{ env.COSIGN_VERSION }}
+      # Version surfacing: a shipped-package-versions table in the job summary
+      # on EVERY docker release run. Informational and best-effort (a summary
+      # hiccup must never fail a release). On a skipped publish no
+      # sbom.spdx.json is generated; the gate's own fresh scan
+      # (/tmp/gate-fresh.spdx.json) describes the same image, so the table is
+      # sourced from it instead.
+      - name: Shipped package versions summary
+        continue-on-error: true
+        env:
+          GATE_SKIPPED: ${{ steps.nochange.outputs.skip }}
+        run: |
+          set -euo pipefail
+          SBOM=sbom.spdx.json
+          if [ "$GATE_SKIPPED" = "true" ]; then
+            SBOM=/tmp/gate-fresh.spdx.json
+          fi
+          {
+            echo "## Shipped package versions"
+            echo ""
+            echo "| Package | Version |"
+            echo "|---|---|"
+            # Same tuple extraction as the no-change gate: exclude the SPDX
+            # document root (the image itself; syft links it via a DESCRIBES
+            # relationship), sort, dedupe. Capped at 400 rows to keep the
+            # summary bounded for module-heavy Go images.
+            jq -r '
+              ( [ .documentDescribes // [] | .[] ]
+                + [ .relationships[]?
+                    | select(.relationshipType == "DESCRIBES"
+                             and .spdxElementId == "SPDXRef-DOCUMENT")
+                    | .relatedSpdxElement ] ) as $roots
+              | [ .packages[]?
+                  | select(.SPDXID as $id | ($roots | index($id)) == null)
+                  | "| \(.name) | \(.versionInfo // "(none)") |" ]
+              | sort | unique
+              | if length > 400 then
+                  .[0:400] + ["", "(+ \(length - 400) more; the full inventory ships in sbom.spdx.json as registry attestation and release asset)"]
+                else . end
+              | .[]' "$SBOM"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Sign GHCR manifest (recursive — covers per-arch images too)
+        if: ${{ steps.nochange.outputs.skip != 'true' }}
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: cosign sign --yes --recursive "$IMAGE_REF"
@@ -510,6 +822,7 @@ jobs:
         # NOTE: cosign attest does not support --recursive (that's a sign-only
         # flag). The attestation is scoped to the manifest list digest;
         # verifiers resolve through the index to find the attestation.
+        if: ${{ steps.nochange.outputs.skip != 'true' }}
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
@@ -519,13 +832,13 @@ jobs:
             "$IMAGE_REF"
 
       - name: Sign Docker Hub manifest (recursive)
-        if: ${{ contains(inputs.registries, 'dockerhub') }}
+        if: ${{ contains(inputs.registries, 'dockerhub') && steps.nochange.outputs.skip != 'true' }}
         env:
           IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: cosign sign --yes --recursive "$IMAGE_REF"
 
       - name: Attest SBOM to Docker Hub
-        if: ${{ contains(inputs.registries, 'dockerhub') }}
+        if: ${{ contains(inputs.registries, 'dockerhub') && steps.nochange.outputs.skip != 'true' }}
         env:
           IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
@@ -535,7 +848,7 @@ jobs:
             "$IMAGE_REF"
 
       - name: Generate release notes
-        if: ${{ inputs.release-needed == 'true' }}
+        if: ${{ inputs.release-needed == 'true' && steps.nochange.outputs.skip != 'true' }}
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -564,7 +877,7 @@ jobs:
         # --output-certificate and makes --bundle required. The single
         # .sigstore.json bundle carries the signature, certificate, and Rekor
         # inclusion proof, and Scorecard recognizes the .sigstore.json suffix.
-        if: ${{ inputs.release-needed == 'true' }}
+        if: ${{ inputs.release-needed == 'true' && steps.nochange.outputs.skip != 'true' }}
         run: |
           cosign sign-blob --yes sbom.spdx.json \
             --bundle sbom.spdx.json.sigstore.json
@@ -580,7 +893,7 @@ jobs:
         # multi-arch build attaches the release to an unrelated later commit —
         # the image carries the trigger commit's revision but the git tag points
         # elsewhere.
-        if: ${{ inputs.release-needed == 'true' }}
+        if: ${{ inputs.release-needed == 'true' && steps.nochange.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
@@ -592,7 +905,7 @@ jobs:
             sbom.spdx.json sbom.spdx.json.sigstore.json
 
       - name: Sync description to Docker Hub
-        if: ${{ contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main' }}
+        if: ${{ contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main' && steps.nochange.outputs.skip != 'true' }}
         continue-on-error: true
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -612,7 +925,7 @@ jobs:
             -d "$(jq -n --arg d "$REPO_DESC" '{description: $d}')" >/dev/null
 
       - name: Push README to Docker Hub
-        if: ${{ contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main' }}
+        if: ${{ contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main' && steps.nochange.outputs.skip != 'true' }}
         continue-on-error: true
         uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
         with:
