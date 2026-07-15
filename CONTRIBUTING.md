@@ -46,9 +46,14 @@ outward, so the conventions below are about not breaking downstream.
 - `ci-local.sh` / `_ci_local.py` — the local mirror of the CI battery.
 - `scripts/` — `audit.py` (cross-repo compliance), `classify-repos.sh` (sync
   map generator), `sync-files.py` (the sync engine that pushes the mapped
-  files into consumers as PRs), `gremlins-aggregate.py` (mutation tracker
-  issues), and `install-local-tools.sh` (installs the CI-pinned tool versions
-  locally). The badge-branch writer lives with its action at
+  files into consumers as PRs), `gremlins-aggregate.py` and
+  `stryker-aggregate.py` (mutation tracker issues),
+  `test-cliff-bump-semantics.sh` (contract test for the git-cliff behaviors
+  the release gate relies on; runs in the scripts CI job, so a git-cliff pin
+  bump or cliff-config edit must keep it green), `backfill-release-notes.py`
+  (dry-run-first regeneration of historical release bodies under the current
+  cliff config), and `install-local-tools.sh` (installs the CI-pinned tool
+  versions locally). The badge-branch writer lives with its action at
   `actions/publish-badge/publish-badge.sh`.
 
 ## How changes reach consumer repos
@@ -175,7 +180,10 @@ rather than emit false negatives.
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/);
 git-cliff parses them for the changelog and version bump (`feat:`, `fix:`,
-`sec:`, `chore(deps):`; anything else lands under Changed). Branch from `main`,
+`sec:`, `chore(deps):` release; `chore:`, `ci:`, `docs:`, `test:` and friends
+are skipped, and commits that only touch non-shipping paths — workflows,
+docs, tests, lockfiles — are path-excluded from both the notes and the bump
+by the consumer `cliff.toml`). Branch from `main`,
 keep the change focused, and open a PR — never push to `main` directly.
 
 ## Conduct & security
