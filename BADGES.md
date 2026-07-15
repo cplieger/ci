@@ -56,6 +56,7 @@ get no mutation run, so the badge would read `invalid`.
 [![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
 [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
+[![Mutation (TS)](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation-ts.json)](https://github.com/cplieger/REPO/issues?q=label%3Astryker-tracker)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
 ```
@@ -64,16 +65,17 @@ No **Node version** badge. It read `engines.node` from the published npm
 package, so unless `package.json` declared `engines.node` it rendered
 `node | not specified` — and even when populated it links to the same npm
 package page as the npm badge, so it fails principle #5 (every badge earns its
-place). Dropped org-wide (`actions`, `reactive`). No **Mutation** badge either
-— gremlins is Go-only. The TS counterpart is `weekly-stryker.yaml`
-(Saturdays), which publishes a **mutation (TS)** badge as `mutation-ts.json`
-on the same `badges` branch for any package dir that opts in by committing a
-`stryker.config.*` plus the `@stryker-mutator/core` + `vitest-runner`
-devDependencies (same colour bands as the Go badge):
-
-```markdown
-[![Mutation (TS)](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation-ts.json)](https://github.com/cplieger/REPO)
-```
+place). Dropped org-wide (`actions`, `reactive`). The **Mutation (TS)** badge
+is the Stryker counterpart of the Go gremlins badge: `weekly-stryker.yaml`
+(Saturdays) publishes `mutation-ts.json` to the same `badges` branch for any
+package dir that opts in by committing a `stryker.config.*` plus the
+`@stryker-mutator/core` + `vitest-runner` devDependencies (same colour bands
+as the Go badge). It links to the repo's `stryker-tracker` issue — the weekly
+tracker with the rolling score history and surviving-mutant list, exactly like
+the Go badge links to `gremlins-tracker`. Include it only on repos that are
+actually enrolled; it reads `invalid` until the first Saturday run publishes
+the file. Currently all five TS libraries are enrolled (`actions`, `fetch`,
+`reactive`, `ui-primitives`, `web-terminal-ui`).
 
 ### Hybrid Go + TS library (e.g. web-terminal-engine)
 
@@ -81,19 +83,23 @@ devDependencies (same colour bands as the Go badge):
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/REPO.svg)](https://pkg.go.dev/github.com/cplieger/REPO)
 [![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
 [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
-[![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/REPO)](https://github.com/cplieger/REPO/blob/main/go.mod)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker)
+[![Mutation (TS)](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation-ts.json)](https://github.com/cplieger/REPO/issues?q=label%3Astryker-tracker)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
 ```
 
 8 badges, exactly at the soft cap. A hybrid lib carries both ecosystems'
-identity badges (Go Reference + npm + JSR) _and_ earns a Mutation badge
-(gremlins runs on its Go surface); dropping the Node-version badge (gone
-org-wide) keeps it at the ≤8 cap. The single Node-version badge is not
-re-added here. Coverage and the Mutation badge reflect whichever surface
-`coverage.yaml` / gremlins measure on the repo (Go, for web-terminal-engine).
+identity badges (Go Reference + npm + JSR) _and_ both surfaces' mutation
+badges (gremlins on the Go module, Stryker on the enrolled TS subpackage —
+each linking to its own tracker issue). To stay at the ≤8 cap it drops two
+badges the single-ecosystem blocks carry: the Node-version badge (gone
+org-wide) and the **Go version** badge — pkg.go.dev already shows the
+required Go version natively on the page the Go Reference badge links to, so
+it was the row's weakest occupant (principle #5). Coverage reflects
+whichever surface `coverage.yaml` measures on the repo (Go, for
+web-terminal-engine).
 
 ### Docker image (built from Go source in this repo)
 
@@ -124,6 +130,12 @@ re-added here. Coverage and the Mutation badge reflect whichever surface
   (`docker-caddy`, `docker-keepalived`, `docker-nut-upsd`, `docker-radvd`,
   `docker-smtp-relay`, `docker-static-web`), which have no statement coverage
   and no mutation run.
+- **No Mutation (TS) badge on image repos**, even where the app's web frontend
+  is Stryker-enrolled (`vibekit`, `subflux`, `web-terminal-kiro`): the row
+  already sits at the 8-badge cap, and an image README's audience is
+  deployers, not TS consumers — the weekly score lives in the repo's
+  `stryker-tracker` issue and the run summary instead. The frontends stay
+  enrolled in `weekly-stryker.yaml`; only the badge is omitted.
 - `CONTAINER` is the GHCR package name. It equals `REPO` for every current
   image repo (the image is pushed as `ghcr.io/cplieger/REPO`), so the link is
   `pkgs/container/REPO`. Earlier revisions listed short names (`fclones`,
