@@ -252,13 +252,11 @@ jobs:
       # port, or a broken HEALTHCHECK. The script receives the loaded image ref
       # and owns run + probe + teardown. Used by the HTTP-serving apps.
       #
-      # Advisory for now (continue-on-error): these run the real image and a
-      # few apps have boot-time quirks still being tuned. Promote to blocking
-      # (drop continue-on-error) once they are reliably green across the
-      # serving apps.
-      - name: Image smoke test (advisory)
+      # Blocking: promoted 2026-07 after the enrolled fleet showed a sustained
+      # green history. A red runtime smoke fails the docker job and with it
+      # the required `ci / validate` check.
+      - name: Image smoke test
         if: ${{ hashFiles('tests/image-smoke.sh') != '' }}
-        continue-on-error: true
         run: sh tests/image-smoke.sh ci-smoke:latest
 
   # arm64 build-ability gate. Same rationale as the amd64 `docker` job: without
