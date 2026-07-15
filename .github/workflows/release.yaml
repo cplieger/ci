@@ -190,6 +190,11 @@ jobs:
             # Docs and license
             '\.md$'
             '(^|/)LICENSE$'
+            # Recommended alert rules shipped as README-companion
+            # documentation (root-level alerts.yaml convention) — consumed by
+            # operators copy-pasting into their own monitoring stack, never
+            # by any Dockerfile or published package.
+            '^alerts\.yaml$'
             # Grafana dashboards — committed for manual UI import (per the
             # dashboards-imported-via-UI convention), never COPY'd/embedded
             # into any image or served from one.
@@ -265,6 +270,12 @@ jobs:
           # sync.yml at runtime; that manifest is no longer committed, the sync
           # workflow generates it on the fly, so the exclusions are kept
           # explicit here.)
+          #
+          # Counterpart: the consumer cliff.toml (configs/cliff-stable.toml /
+          # cliff-alpha.toml) carries an `exclude_paths` list so the RELEASE
+          # gate (version bump + notes) agrees with this BUILD gate. That list
+          # must stay a strict subset of this one — when removing a pattern
+          # here (making a path significant again), remove it there first.
 
           # Join patterns with | for a single grep -E invocation.
           EXCLUDE_RE=$(IFS='|'; echo "${EXCLUDE_PATTERNS[*]}")
