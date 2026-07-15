@@ -98,11 +98,11 @@ jobs:
       # Publish via the shared sibling-preserving composite action so
       # coverage.json and mutation.json coexist on the orphan `badges` branch
       # instead of clobbering each other. GITHUB_TOKEN (contents: write) can
-      # push to the same repo. The @v2 ref is converted to a SHA pin by
-      # Renovate's pinDigest pass after each tag move.
+      # push to the same repo. Renovate bumps the SHA pin after each tag
+      # move.
       - name: Publish coverage badge
         if: ${{ steps.d.outputs.kind != 'none' }}
-        uses: cplieger/ci/actions/publish-badge@v2 # v2
+        uses: cplieger/ci/actions/publish-badge@0f9e6bdc16cfd0297790b4771686849ffaeb02b4 # v2
         with:
           repo: ${{ github.repository }}
           token: ${{ github.token }}
