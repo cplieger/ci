@@ -516,11 +516,20 @@ jobs:
           # below creates it), so a bare `--latest` would render the PREVIOUS
           # release's notes instead of this one's.
           git cliff --unreleased --tag "$VERSION" --strip header > NOTES.md
-          # --target pins the tag to the commit that triggered this run, not the
-          # branch tip. Without it, gh creates the tag at the default branch's
-          # current HEAD, which races a push landing during the run and can
-          # attach the release to an unrelated later commit.
-          gh release create "$VERSION" --target "$GITHUB_SHA" --title "$VERSION" --notes-file NOTES.md
+          # Tag ref created first via the git data API, pinned to the trigger
+          # commit; release then attaches to the existing tag (no --target).
+          # `gh release create --target` tag-creation 403s for the integration
+          # token when a mid-run push moved main past $GITHUB_SHA (observed
+          # fleet-wide 2026-07-15); the git ref create has no head restriction.
+          if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
+            if [ "$EXISTING" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag ${VERSION} exists at ${EXISTING}, not ${GITHUB_SHA}; refusing."
+              exit 1
+            fi
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
+          fi
+          gh release view "$VERSION" >/dev/null 2>&1 || gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
 
   # ─── TypeScript library release (npm + JSR + tag + GitHub Release) ─────────
   ts:
@@ -599,11 +608,20 @@ jobs:
           # below creates it), so a bare `--latest` would render the PREVIOUS
           # release's notes instead of this one's.
           git cliff --unreleased --tag "$VERSION" --strip header > NOTES.md
-          # --target pins the tag to the commit that triggered this run, not the
-          # branch tip. Without it, gh creates the tag at the default branch's
-          # current HEAD, which races a push landing during the run and can
-          # attach the release to an unrelated later commit.
-          gh release create "$VERSION" --target "$GITHUB_SHA" --title "$VERSION" --notes-file NOTES.md
+          # Tag ref created first via the git data API, pinned to the trigger
+          # commit; release then attaches to the existing tag (no --target).
+          # `gh release create --target` tag-creation 403s for the integration
+          # token when a mid-run push moved main past $GITHUB_SHA (observed
+          # fleet-wide 2026-07-15); the git ref create has no head restriction.
+          if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
+            if [ "$EXISTING" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag ${VERSION} exists at ${EXISTING}, not ${GITHUB_SHA}; refusing."
+              exit 1
+            fi
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
+          fi
+          gh release view "$VERSION" >/dev/null 2>&1 || gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
 
   # ─── Subpackage publish (matrix over `*/jsr.json` dirs that changed) ───────
   subpackage:

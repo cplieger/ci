@@ -887,19 +887,38 @@ jobs:
         # Pure chore/ci/docs pushes still build + push images but reuse the
         # existing tag — gh release create would error otherwise.
         #
-        # --target pins the tag to $GITHUB_SHA, the commit that triggered this
-        # run (and that the image was built from). Without it, gh creates the
-        # tag at the default branch's current HEAD, so a push landing during the
-        # multi-arch build attaches the release to an unrelated later commit —
-        # the image carries the trigger commit's revision but the git tag points
-        # elsewhere.
+        # The tag ref is created FIRST via the git data API, pinned to
+        # $GITHUB_SHA (the commit this image was built from), and the release
+        # is then created against the existing tag with no --target. Letting
+        # `gh release create --target` create the tag is a race: when a push
+        # (sync PR, Renovate merge) lands on main during the multi-arch build,
+        # the Releases API rejects the integration token's tag-create at the
+        # now-non-head SHA with HTTP 403 "Resource not accessible by
+        # integration" (observed fleet-wide 2026-07-15; a git ref create has
+        # no such head restriction). Rerun-idempotent: an existing tag at the
+        # same SHA is reused, an existing tag elsewhere fails loudly (a tag is
+        # never moved), an existing release is left as-is.
         if: ${{ inputs.release-needed == 'true' && steps.nochange.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
         run: |
+          set -euo pipefail
+          if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
+            if [ "$EXISTING" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag ${VERSION} already exists at ${EXISTING}, but this run built ${GITHUB_SHA}; refusing to attach a release to a mismatched tag."
+              exit 1
+            fi
+            echo "Tag ${VERSION} already exists at ${GITHUB_SHA} (rerun); reusing it."
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
+          fi
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "::notice::Release ${VERSION} already exists; skipping creation."
+            exit 0
+          fi
           gh release create "$VERSION" \
-            --target "$GITHUB_SHA" \
             --title "$VERSION" \
             --notes-file RELEASE_NOTES.md \
             sbom.spdx.json sbom.spdx.json.sigstore.json
