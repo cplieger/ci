@@ -421,12 +421,11 @@ jobs:
             "$mb" >> "$GITHUB_OUTPUT"
           echo "image-size badge: ${mb} MB"
 
-      # The @v2 ref is converted to a SHA pin by Renovate's pinDigest pass
-      # after each tag move.
+      # Renovate bumps the SHA pin after each tag move.
       - name: Publish image-size badge
         if: ${{ steps.sizebadge.outputs.json != '' }}
         continue-on-error: true
-        uses: cplieger/ci/actions/publish-badge@v2 # v2
+        uses: cplieger/ci/actions/publish-badge@0f9e6bdc16cfd0297790b4771686849ffaeb02b4 # v2
         with:
           repo: ${{ github.repository }}
           token: ${{ github.token }}
