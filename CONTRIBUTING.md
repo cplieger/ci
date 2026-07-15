@@ -150,14 +150,20 @@ or the sync PR auto-merges (configs). Treat the reusable workflow inputs and the
 
 `scripts/audit.py` audits every non-archived `cplieger` repo (public + private)
 against the governance standard: hard failures (merge model, default branch,
-branch protection with the `validate` check, CI wired to `cplieger/ci`, deploy
-webhook, …) block compliance; soft warnings (repo features, Renovate preset,
-description/topics, scanning toggles) are advisory. Known-accepted deviations
-are encoded in the script's `ACCEPTED` table so a clean fleet reports clean.
+branch protection with the `validate` check pinned to GitHub Actions, phantom
+required contexts, review floors or locked branches, Actions tokens able to
+approve PRs, CI wired to `cplieger/ci`, registry publish secrets, the deploy
+webhook's presence/secret/event/TLS, …) block compliance; soft warnings (repo
+features, squash-commit defaults, protection toggles, workflow-permission
+defaults, stray `dependabot.yml`, Renovate preset, license/description/topics,
+scanning toggles, coverage workflow presence) are advisory. Known-accepted
+deviations are encoded in the script's `ACCEPTED` table so a clean fleet
+reports clean.
 
 ```bash
 gh auth login        # once (needs a CLASSIC PAT with repo scope)
 python3 scripts/audit.py
+python3 scripts/audit.py --repo <name>   # scope to one repo (repeatable)
 ```
 
 `.github/workflows/audit.yaml` runs it weekly (and on demand) and writes the
