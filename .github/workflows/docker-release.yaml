@@ -91,7 +91,7 @@ env:
   # generated with. Tuple-level compare tolerates small drift, and any
   # mismatch fails open (publishes).
   # renovate: datasource=github-releases depName=anchore/syft
-  SYFT_VERSION: v1.42.3
+  SYFT_VERSION: v1.46.0
 
 # Top-level read-only (OpenSSF Scorecard Token-Permissions); each job below
 # declares the write scopes it needs (build/finalize push, sign, attest, release).
