@@ -32,6 +32,19 @@ on:
         description: "Whether to create a GitHub Release (cliff bump warranted). 'true' or 'false'."
         type: string
         required: true
+      go-modules:
+        description: >-
+          JSON array of nested Go module release-lane dirs discovered by the
+          caller (release.yaml's detect job). Lane commits are excluded from
+          this image release's notes — they belong to the lane's own
+          <dir>/vX.Y.Z release. The default '[]' leaves rendering unchanged
+          for single-module repos. NOTE: a DEPLOYED docker repo should not
+          carry nested Go module lanes until its deploy-trigger webhook
+          filters slash-prefixed tags — a lane Release fires the repo's
+          release event and would redeploy the stack for a release that
+          changed no image (same-digest re-up, harmless but pointless).
+        type: string
+        default: "[]"
       image-name:
         description: "Image name (without registry prefix). Defaults to repo name."
         type: string
@@ -851,6 +864,7 @@ jobs:
         if: ${{ inputs.release-needed == 'true' && steps.nochange.outputs.skip != 'true' }}
         env:
           VERSION: ${{ inputs.version }}
+          GO_LANES_JSON: ${{ inputs.go-modules }}
         run: |
           # Install git-cliff (only when we're actually creating a release).
           # renovate: datasource=github-releases depName=orhun/git-cliff
@@ -858,11 +872,25 @@ jobs:
           curl -fsSL --retry 3 \
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+          # Lane-aware notes: when the caller discovered nested Go module
+          # lanes, scope this image release's notes to the root lane (root
+          # tag universe + lane commits excluded), or lane commits leak into
+          # the image release's notes (probe state J in
+          # scripts/test-cliff-bump-semantics.sh pins the flag semantics).
+          # No lanes -> no extra args -> unchanged.
+          LANE_ARGS=()
+          if [ -n "$GO_LANES_JSON" ] && [ "$GO_LANES_JSON" != "[]" ]; then
+            LANE_ARGS+=(--tag-pattern '^v[0-9]')
+            while IFS= read -r d; do
+              [ -z "$d" ] && continue
+              LANE_ARGS+=(--exclude-path "$d/**")
+            done < <(echo "$GO_LANES_JSON" | jq -r '.[]')
+          fi
           # --unreleased --tag renders the commits since the last tag as
           # $VERSION. The tag does NOT exist yet (the finalize gh release
           # create below makes it), so a bare `--latest` would render the
           # PREVIOUS release's notes instead of this one's.
-          git-cliff --unreleased --tag "$VERSION" --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
+          git-cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
 
       - name: Sign SBOM for release assets (keyless)
         # Attach a cosign Sigstore bundle next to the SBOM so the GitHub
