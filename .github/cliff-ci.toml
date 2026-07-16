@@ -48,8 +48,11 @@ split_commits = false
 # Breaking changes always count toward the bump even under a skip-typed prefix.
 protect_breaking_commits = true
 # Full semver only — deliberately excludes the moving v2 / v2.Y tags that
-# move-major-tag.yaml maintains on the release commit.
-tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+"
+# move-major-tag.yaml maintains on the release commit. Anchored for the same
+# reason as the shared configs: the pattern is a regex, and unanchored it
+# would also match a prefixed component tag (e.g. "sub/v1.2.3"), poisoning
+# the version base.
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+"
 
 commit_parsers = [
   # Order matters: more-specific patterns first.
