@@ -15,11 +15,17 @@ runs:
     - id: compute
       shell: bash
       run: |
-        # renovate: datasource=github-releases depName=orhun/git-cliff
+        # Version + tarball sha256 pinned as a pair; Renovate maintains both
+        # via the custom.git-cliff datasource (GitHub release-asset digest).
+        # Fail-closed: a tarball that does not match the reviewed pin never
+        # installs.
+        # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
         CLIFF_VERSION=v2.13.1
-        curl -fsSL --retry 3 \
-          "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
-          | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+        CLIFF_SHA256=9a1263f24e59a2f508c7b3d3283c9dea94a8bf697f96dbc18cc783cac6284546
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/git-cliff.tgz" \
+          "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
+        echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
+        tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
         # Capture stderr so a git-cliff failure surfaces a diagnostic instead
         # of an opaque non-zero exit. The `if !` puts the assignment in a
         # condition context (so -e doesn't fire) and routes a non-zero exit to
