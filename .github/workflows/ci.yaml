@@ -7,6 +7,11 @@
 #
 # Detection (all independent — a hybrid repo runs multiple jobs in parallel):
 #   - has go.mod              → `go` job:    go-ci.yaml at root
+#   - has nested */go.mod     → `go-nested`: go-ci.yaml per module dir (matrix;
+#                                            tracked files only, vendored trees
+#                                            pruned — nested modules are
+#                                            independent release lanes and
+#                                            root `./...` never crosses them)
 #   - has jsr.json at root    → `ts` job:    ts-ci.yaml at root (no web-lint)
 #   - has Dockerfile          → `shell` job: shell-ci.yaml (actionlint + hadolint
 #                                            + shellcheck nullglob-safe + gitleaks)
@@ -36,6 +41,8 @@ jobs:
     timeout-minutes: 2
     outputs:
       run_go: ${{ steps.detect.outputs.run_go }}
+      run_go_nested: ${{ steps.detect.outputs.run_go_nested }}
+      go_nested_dirs: ${{ steps.detect.outputs.go_nested_dirs }}
       run_ts: ${{ steps.detect.outputs.run_ts }}
       run_web: ${{ steps.detect.outputs.run_web }}
       run_shell: ${{ steps.detect.outputs.run_shell }}
@@ -57,6 +64,8 @@ jobs:
         id: detect
         run: |
           run_go=false
+          run_go_nested=false
+          go_nested_dirs="[]"
           run_ts=false
           run_web=false
           run_shell=false
@@ -116,6 +125,40 @@ jobs:
             [ -f Dockerfile ] && run_shell=true
             [ -f Dockerfile ] && run_docker=true
 
+            # Nested Go modules: each TRACKED <dir>/go.mod is an independent
+            # module (its own release lane in release.yaml), so each gets the
+            # full go-ci battery at its own directory — `go test ./...` at
+            # the root does NOT cross module boundaries, so without this a
+            # nested module's tests would silently never run. Discovery
+            # prunes vendored/generated trees (a committed node_modules can
+            # carry upstream go.mod files) and skips modules with no tracked
+            # .go files (a sentinel go.mod — e.g. `module web-ignore` keeping
+            # root tooling out of a TS subtree — has nothing to validate and
+            # would fail the battery). Unlike release.yaml's lane discovery,
+            # internal/ and dotless-path modules with real Go code ARE
+            # validated here — they compile and test like any module; they
+            # are only excluded from RELEASE lanes. Keep the filters in sync
+            # with release.yaml's gomodules step and
+            # scripts/test-lane-semantics.sh, which pins both. git pathspec
+            # '*/go.mod' matches any depth, never the root go.mod.
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              d=$(dirname "$f")
+              case "$d" in
+                *[!A-Za-z0-9._/-]*)
+                  echo "::error::nested go.mod dir '$d' contains characters outside [A-Za-z0-9._/-]"
+                  exit 1 ;;
+              esac
+              if [ -z "$(git ls-files "$d/*.go" | head -1)" ]; then
+                echo "nested module '$d': no tracked .go files - skipping validation"
+                continue
+              fi
+              go_nested_dirs=$(echo "$go_nested_dirs" | jq -c --arg v "$d" '. + [$v]')
+            done < <(git ls-files '*/go.mod' | grep -Ev '(^|/)(node_modules|vendor|testdata|static|dist)/' || true)
+            if [ "$go_nested_dirs" != "[]" ]; then
+              run_go_nested=true
+            fi
+
             # Probe known nested web-frontend locations. First hit wins.
             # Add new paths centrally if a future repo introduces a different
             # layout — no per-repo override needed.
@@ -150,6 +193,8 @@ jobs:
 
           {
             echo "run_go=$run_go"
+            echo "run_go_nested=$run_go_nested"
+            echo "go_nested_dirs=$go_nested_dirs"
             echo "run_ts=$run_ts"
             echo "run_web=$run_web"
             echo "run_shell=$run_shell"
@@ -165,6 +210,7 @@ jobs:
             echo "| Surface | Detected | Path |"
             echo "|---|---|---|"
             echo "| go       | $run_go | . |"
+            echo "| go-nested | $run_go_nested | $go_nested_dirs |"
             echo "| ts       | $run_ts | . |"
             echo "| web      | $run_web | ${web_dir:-—} |"
             echo "| shell    | $run_shell | . |"
@@ -186,6 +232,22 @@ jobs:
     needs: detect
     if: ${{ needs.detect.outputs.run_go == 'true' }}
     uses: ./.github/workflows/go-ci.yaml
+
+  # Nested Go modules (independent release lanes — see release.yaml's
+  # go-nested job): `go test ./...` at the root does not cross module
+  # boundaries, so each nested module runs the full go-ci battery at its own
+  # directory, pinned to its own go.mod's Go version.
+  go-nested:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_go_nested == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.detect.outputs.go_nested_dirs) }}
+    uses: ./.github/workflows/go-ci.yaml
+    with:
+      working-directory: ${{ matrix.dir }}
+      go-version-file: ${{ matrix.dir }}/go.mod
 
   ts:
     needs: detect
@@ -513,6 +575,24 @@ jobs:
             fi
           ) || { echo "Probe git-cliff bump semantics" >> /tmp/_ci_failures; exit 1; }
 
+      # Nested-module lane shell-semantics probe (opt-in by file presence).
+      # The cliff probe above pins the git-cliff side of the lane contract;
+      # this one pins the SHELL side (lane discovery eligibility, changed-path
+      # classification, module-path verification, version guards, escaping)
+      # that release.yaml and the meta ci.yaml embed inline — so an edit to
+      # the prune list or classification loop cannot merge if it breaks the
+      # pinned contract.
+      - name: Probe nested-lane shell semantics
+        continue-on-error: true
+        run: |
+          (
+            if [ -x scripts/test-lane-semantics.sh ]; then
+              ./scripts/test-lane-semantics.sh
+            else
+              echo "no lane semantics probe in this repo - skipping"
+            fi
+          ) || { echo "Probe nested-lane shell semantics" >> /tmp/_ci_failures; exit 1; }
+
       - name: Check results
         if: always()
         run: |
@@ -528,7 +608,7 @@ jobs:
   # per-type templates so existing branch-protection rules keep working
   # without per-repo updates).
   validate:
-    needs: [detect, go, ts, web, shell, docker, docker-arm64, markdown, python, scripts]
+    needs: [detect, go, go-nested, ts, web, shell, docker, docker-arm64, markdown, python, scripts]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 1
@@ -537,6 +617,7 @@ jobs:
         env:
           DETECT: ${{ needs.detect.result }}
           GO: ${{ needs.go.result }}
+          GO_NESTED: ${{ needs.go-nested.result }}
           TS: ${{ needs.ts.result }}
           WEB: ${{ needs.web.result }}
           SHELL: ${{ needs.shell.result }}
@@ -555,7 +636,7 @@ jobs:
           # or skipped (auto-detect said it wasn't applicable). markdown always
           # runs, so it must be success (skipped only if detect failed, caught
           # above).
-          for pair in "go=$GO" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"; do
+          for pair in "go=$GO" "go-nested=$GO_NESTED" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"; do
             name="${pair%%=*}"; result="${pair##*=}"
             if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
               echo "::error::$name job: $result"
