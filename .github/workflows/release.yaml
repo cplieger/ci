@@ -94,6 +94,9 @@ jobs:
       root_changed: ${{ steps.changes.outputs.root_changed }}
       go_modules: ${{ steps.gomodules.outputs.go_modules }}
       go_modules_to_release: ${{ steps.changes.outputs.go_modules_to_release }}
+      # finalize: a prior run tagged this exact commit but died before its
+      # GitHub Release; publish jobs repair the Release only (see the step).
+      finalize: ${{ steps.finalize.outputs.finalize }}
       registries: ${{ steps.policy.outputs.registries }}
       platforms: ${{ steps.policy.outputs.platforms }}
       sbom_from: ${{ steps.policy.outputs.sbom_from }}
@@ -548,6 +551,46 @@ jobs:
           echo "version=$NEXT" >> "$GITHUB_OUTPUT"
           echo "Lane-aware root version: ${NEXT} (latest root tag: ${LATEST:-<none>}; lanes: ${GO_LANES_JSON})"
 
+      - name: Detect finalize state
+        id: finalize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EFFECTIVE_RELEASE: ${{ steps.lanes.outputs.release || steps.cliff.outputs.release }}
+          EFFECTIVE_VERSION: ${{ steps.lanes.outputs.version || steps.cliff.outputs.version }}
+        run: |
+          # A prior run can create the version tag and then die before the
+          # GitHub Release lands (a transient API failure in exactly the
+          # window of the 2026-07-15 fleet incident class). On rerun the
+          # version compute sees NEXT == LATEST and reports release=false,
+          # so the publish jobs would skip and the missing Release could
+          # never be repaired by rerun — while re-cutting or moving the tag
+          # is forbidden (Go module versions and image provenance are
+          # immutable once published). Worse than a cosmetic gap: the deploy
+          # webhooks subscribe to the RELEASE event, so a wedged docker
+          # release is a published, signed image that never deploys.
+          #
+          # finalize=true when the computed version's tag already points at
+          # THIS commit and its GitHub Release is missing. The go/ts/docker
+          # jobs then run in finalize mode: repair the Release only (notes
+          # via --current, since the commits are no longer "unreleased";
+          # probe states K/L pin that rendering). They never re-tag — the
+          # exists-at-same-SHA guard already passes through — and never
+          # republish package registries (those steps are idempotent
+          # version-exists skips anyway). Same-SHA only, deliberately: after
+          # the branch moves on, notes and artifacts can no longer be
+          # reproduced faithfully from a newer checkout — re-run the
+          # original commit's workflow run instead (the natural repair path,
+          # which this step is what makes work).
+          FINALIZE=false
+          if [ "$EFFECTIVE_RELEASE" = "false" ] && [ -n "$EFFECTIVE_VERSION" ]; then
+            TAG_SHA=$(git rev-list -n1 "$EFFECTIVE_VERSION" 2>/dev/null || echo "")
+            if [ "$TAG_SHA" = "$GITHUB_SHA" ] && ! gh release view "$EFFECTIVE_VERSION" >/dev/null 2>&1; then
+              FINALIZE=true
+              echo "::notice::tag ${EFFECTIVE_VERSION} exists at this commit without a GitHub Release — finalize mode (repair the Release only)"
+            fi
+          fi
+          echo "finalize=$FINALIZE" >> "$GITHUB_OUTPUT"
+
       - name: Resolve repo policy
         id: policy
         env:
@@ -617,6 +660,7 @@ jobs:
       version: ${{ needs.detect.outputs.version }}
       release-needed: ${{ needs.detect.outputs.release }}
       go-modules: ${{ needs.detect.outputs.go_modules }}
+      finalize: ${{ needs.detect.outputs.finalize }}
       registries: ${{ needs.detect.outputs.registries }}
       platforms: ${{ needs.detect.outputs.platforms }}
       sbom-from: ${{ needs.detect.outputs.sbom_from }}
@@ -636,7 +680,11 @@ jobs:
   # ─── Go module release (tag + GitHub Release; `go install` fetches by tag) ─
   go:
     needs: detect
-    if: ${{ needs.detect.outputs.type == 'go' && needs.detect.outputs.root_changed == 'true' && needs.detect.outputs.release == 'true' }}
+    # finalize widens the gate so a rerun after a tag-created/Release-missing
+    # partial run can repair the Release (see detect's finalize step); the
+    # release==false + finalize==true combination changes only the notes
+    # rendering inside the Tag + GitHub Release step.
+    if: ${{ needs.detect.outputs.type == 'go' && needs.detect.outputs.root_changed == 'true' && (needs.detect.outputs.release == 'true' || needs.detect.outputs.finalize == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -690,6 +738,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect.outputs.version }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
+          FINALIZE: ${{ needs.detect.outputs.finalize }}
         run: |
           # Install git-cliff (version compute already happened in detect, but
           # we need the binary here to render the release notes).
@@ -713,8 +762,16 @@ jobs:
           # --unreleased --tag renders the commits since the last tag as
           # $VERSION. The new tag does NOT exist yet (the gh release create
           # below creates it), so a bare `--latest` would render the PREVIOUS
-          # release's notes instead of this one's.
-          git cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > NOTES.md
+          # release's notes instead of this one's. In FINALIZE mode the tag
+          # DOES exist (at this very commit — detect verified it), so those
+          # commits are no longer "unreleased": render the CURRENT release
+          # instead (probe states K/L pin that --current sees them, lane
+          # flags respected).
+          if [ "$FINALIZE" = "true" ]; then
+            git cliff --current "${LANE_ARGS[@]}" --strip header > NOTES.md
+          else
+            git cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > NOTES.md
+          fi
           # Tag ref created first via the git data API, pinned to the trigger
           # commit; release then attaches to the existing tag (no --target).
           # `gh release create --target` tag-creation 403s for the integration
@@ -733,7 +790,10 @@ jobs:
   # ─── TypeScript library release (npm + JSR + tag + GitHub Release) ─────────
   ts:
     needs: detect
-    if: ${{ needs.detect.outputs.type == 'ts' && needs.detect.outputs.root_changed == 'true' && needs.detect.outputs.release == 'true' }}
+    # finalize widens the gate exactly as in the go job; the npm/JSR publish
+    # steps are already idempotent version-exists skips, so a finalize rerun
+    # passes through them and repairs only the missing GitHub Release.
+    if: ${{ needs.detect.outputs.type == 'ts' && needs.detect.outputs.root_changed == 'true' && (needs.detect.outputs.release == 'true' || needs.detect.outputs.finalize == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -797,6 +857,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect.outputs.version }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
+          FINALIZE: ${{ needs.detect.outputs.finalize }}
         run: |
           # renovate: datasource=github-releases depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
@@ -814,10 +875,14 @@ jobs:
             done < <(echo "$GO_LANES_JSON" | jq -r '.[]')
           fi
           # --unreleased --tag renders the commits since the last tag as
-          # $VERSION. The new tag does NOT exist yet (the gh release create
-          # below creates it), so a bare `--latest` would render the PREVIOUS
-          # release's notes instead of this one's.
-          git cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > NOTES.md
+          # $VERSION (the tag does not exist yet on the publish path); in
+          # FINALIZE mode the tag exists at this commit, so render the
+          # CURRENT release instead (see the go job; probe states K/L).
+          if [ "$FINALIZE" = "true" ]; then
+            git cliff --current "${LANE_ARGS[@]}" --strip header > NOTES.md
+          else
+            git cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > NOTES.md
+          fi
           # Tag ref created first via the git data API, pinned to the trigger
           # commit; release then attaches to the existing tag (no --target).
           # `gh release create --target` tag-creation 403s for the integration

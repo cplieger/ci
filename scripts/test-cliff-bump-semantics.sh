@@ -39,8 +39,11 @@
 #      nested lane computes from its own <dir>/vX.Y.Z tag universe with
 #      first-release bootstrap via GIT_CLIFF__BUMP__INITIAL_TAG; notes are
 #      cross-lane clean in both directions; and finalize-mode --current
-#      rendering at a tagged HEAD stays lane-scoped (K). The lane discovery
-#      and classification SHELL semantics are pinned separately by
+#      rendering at a tagged HEAD stays lane-scoped for the LANE side (K)
+#      and the ROOT side (L — root+lane tags co-located, lane commits
+#      excluded, config excludes merged; this is the rendering the
+#      go/ts/docker finalize repair path uses). The lane discovery and
+#      classification SHELL semantics are pinned separately by
 #      scripts/test-lane-semantics.sh.
 #
 # Runs in the ci repo's `scripts` CI job (opt-in by file presence), so a
@@ -273,5 +276,17 @@ KNOTES="$(cd "$L" && "$CLIFF" --config "$CFG" --current --tag-pattern '^yamlenv/
 echo "$KNOTES" | grep -q "Lane feature for notes" || fail "K: --current finalize render missing the lane commit"
 echo "$KNOTES" | grep -q "Root fix for notes" && fail "K: --current finalize render leaked a root commit"
 echo "ok: K finalize render (--current at tagged HEAD, lane-scoped)"
+
+# ── State L: ROOT finalize render (--current with lane excludes) ─────────────
+# The root-lane counterpart of K: after a partial ROOT release (root tag
+# created at HEAD, GitHub Release missing), the go/ts/docker finalize path
+# renders the current ROOT release with the lane-aware flags. Root and lane
+# tags are co-located at HEAD here — the realistic both-lanes-released shape.
+git -C "$L" tag v9.9.9
+LNOTES2="$(cd "$L" && "$CLIFF" --config "$CFG" --current --tag-pattern '^v[0-9]' --exclude-path 'yamlenv/**' --strip header 2>/dev/null)"
+echo "$LNOTES2" | grep -q "Root fix for notes" || fail "L: root --current finalize render missing the root commit"
+echo "$LNOTES2" | grep -q "Lane feature for notes" && fail "L: root --current finalize render leaked a lane commit"
+echo "$LNOTES2" | grep -q "Readme-only edit" && fail "L: config exclude_paths not applied in root finalize render"
+echo "ok: L root finalize render (--current, lane commits excluded, config excludes merged)"
 
 echo "PASS: git-cliff $VERSION semantics match the fleet release-gate contract"
