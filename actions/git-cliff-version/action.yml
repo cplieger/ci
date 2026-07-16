@@ -17,7 +17,7 @@ runs:
       run: |
         # Version + tarball sha256 pinned as a pair; Renovate maintains both
         # via the custom.git-cliff datasource (GitHub release-asset digest).
-        # Fail-closed: a tarball that does not match the reviewed pin never
+        # Fail-closed: a tarball that does not match the committed pin never
         # installs.
         # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
         CLIFF_VERSION=v2.13.1
