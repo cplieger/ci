@@ -45,6 +45,17 @@ on:
           changed no image (same-digest re-up, harmless but pointless).
         type: string
         default: "[]"
+      finalize:
+        description: >-
+          'true' when the caller's detect job found this commit already
+          tagged at the computed version WITHOUT a GitHub Release (a prior
+          run died between tag creation and Release creation — the release
+          event never fired, so the deploy webhook never triggered). The
+          release steps then run despite release-needed=false, rendering
+          notes via --current and repairing only the missing Release; the
+          tag guard's exists-at-same-SHA path passes through untouched.
+        type: string
+        default: "false"
       image-name:
         description: "Image name (without registry prefix). Defaults to repo name."
         type: string
@@ -861,10 +872,18 @@ jobs:
             "$IMAGE_REF"
 
       - name: Generate release notes
-        if: ${{ inputs.release-needed == 'true' && steps.nochange.outputs.skip != 'true' }}
+        # finalize repairs a tag-created/Release-missing partial run: the
+        # release steps run despite release-needed=false. The no-change gate
+        # keeps precedence deliberately — it only ever sets skip=true on
+        # staleness-DISPATCHED rebuilds (skip-if-unchanged), never on the
+        # push-event rerun that repairs a wedge; if a dispatched rebuild
+        # meets a wedged repo, the repair simply waits for the next push
+        # rerun rather than attaching a Release to a skipped publish.
+        if: ${{ (inputs.release-needed == 'true' || inputs.finalize == 'true') && steps.nochange.outputs.skip != 'true' }}
         env:
           VERSION: ${{ inputs.version }}
           GO_LANES_JSON: ${{ inputs.go-modules }}
+          FINALIZE: ${{ inputs.finalize }}
         run: |
           # Install git-cliff (only when we're actually creating a release).
           # renovate: datasource=github-releases depName=orhun/git-cliff
@@ -887,10 +906,16 @@ jobs:
             done < <(echo "$GO_LANES_JSON" | jq -r '.[]')
           fi
           # --unreleased --tag renders the commits since the last tag as
-          # $VERSION. The tag does NOT exist yet (the finalize gh release
-          # create below makes it), so a bare `--latest` would render the
-          # PREVIOUS release's notes instead of this one's.
-          git-cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
+          # $VERSION (the tag does not exist yet on the publish path). In
+          # FINALIZE mode the tag exists at this very commit, so those
+          # commits are no longer "unreleased": render the CURRENT release
+          # instead (probe states K/L in scripts/test-cliff-bump-semantics.sh
+          # pin that rendering, lane flags respected).
+          if [ "$FINALIZE" = "true" ]; then
+            git-cliff --current "${LANE_ARGS[@]}" --strip header > RELEASE_NOTES.md || echo "Release ${VERSION}" > RELEASE_NOTES.md
+          else
+            git-cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
+          fi
 
       - name: Sign SBOM for release assets (keyless)
         # Attach a cosign Sigstore bundle next to the SBOM so the GitHub
@@ -905,7 +930,10 @@ jobs:
         # --output-certificate and makes --bundle required. The single
         # .sigstore.json bundle carries the signature, certificate, and Rekor
         # inclusion proof, and Scorecard recognizes the .sigstore.json suffix.
-        if: ${{ inputs.release-needed == 'true' && steps.nochange.outputs.skip != 'true' }}
+        # finalize: the repaired Release must carry the same signed SBOM
+        # assets a normal release would, so this step follows the widened
+        # gate (the SBOM was regenerated above from the published image).
+        if: ${{ (inputs.release-needed == 'true' || inputs.finalize == 'true') && steps.nochange.outputs.skip != 'true' }}
         run: |
           cosign sign-blob --yes sbom.spdx.json \
             --bundle sbom.spdx.json.sigstore.json
@@ -925,8 +953,10 @@ jobs:
         # integration" (observed fleet-wide 2026-07-15; a git ref create has
         # no such head restriction). Rerun-idempotent: an existing tag at the
         # same SHA is reused, an existing tag elsewhere fails loudly (a tag is
-        # never moved), an existing release is left as-is.
-        if: ${{ inputs.release-needed == 'true' && steps.nochange.outputs.skip != 'true' }}
+        # never moved), an existing release is left as-is. finalize mode
+        # (tag already at this SHA, Release missing) flows through the same
+        # guards: the tag is reused and only the Release is created.
+        if: ${{ (inputs.release-needed == 'true' || inputs.finalize == 'true') && steps.nochange.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
