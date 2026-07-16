@@ -616,6 +616,7 @@ jobs:
     with:
       version: ${{ needs.detect.outputs.version }}
       release-needed: ${{ needs.detect.outputs.release }}
+      go-modules: ${{ needs.detect.outputs.go_modules }}
       registries: ${{ needs.detect.outputs.registries }}
       platforms: ${{ needs.detect.outputs.platforms }}
       sbom-from: ${{ needs.detect.outputs.sbom_from }}
