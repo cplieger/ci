@@ -38,11 +38,10 @@ on:
           caller (release.yaml's detect job). Lane commits are excluded from
           this image release's notes — they belong to the lane's own
           <dir>/vX.Y.Z release. The default '[]' leaves rendering unchanged
-          for single-module repos. NOTE: a DEPLOYED docker repo should not
-          carry nested Go module lanes until its deploy-trigger webhook
-          filters slash-prefixed tags — a lane Release fires the repo's
-          release event and would redeploy the stack for a release that
-          changed no image (same-digest re-up, harmless but pointless).
+          for single-module repos. Operational note: a lane Release still
+          fires the repo's release webhook (GitHub hooks cannot filter by
+          tag pattern); see shared-libraries.md for what that implies for
+          deployed docker repos.
         type: string
         default: "[]"
       finalize:
@@ -50,10 +49,15 @@ on:
           'true' when the caller's detect job found this commit already
           tagged at the computed version WITHOUT a GitHub Release (a prior
           run died between tag creation and Release creation — the release
-          event never fired, so the deploy webhook never triggered). The
-          release steps then run despite release-needed=false, rendering
-          notes via --current and repairing only the missing Release; the
-          tag guard's exists-at-same-SHA path passes through untouched.
+          event never fired, so its consumers, e.g. the Komodo hook that
+          expedites a Renovate scan, missed it). The release steps then run
+          despite release-needed=false, rendering notes via --current and
+          repairing only the missing Release; the tag guard's
+          exists-at-same-SHA path passes through untouched. A finalize
+          rerun still REBUILDS and re-pushes the image like any rerun of
+          this workflow — accepted: tags simply move to the fresh build of
+          the same source, and the prior digests stay valid in the
+          registry.
         type: string
         default: "false"
       image-name:
@@ -401,6 +405,7 @@ jobs:
         if: ${{ inputs.skip-if-unchanged == true }}
         env:
           RELEASE_NEEDED: ${{ inputs.release-needed }}
+          FINALIZE: ${{ inputs.finalize }}
           SBOM_FROM: ${{ inputs.sbom-from }}
           SYFT_CONFIG: ${{ inputs.syft-config }}
           # Via env, never inline ${{ }} in the script body (template injection).
@@ -427,6 +432,18 @@ jobs:
           # failed after merge and is being retried by a staleness dispatch.
           if [ "$RELEASE_NEEDED" = "true" ]; then
             proceed "A release is warranted (release-needed=true); never skip a warranted release."
+          fi
+
+          # Neither must a wedge repair: in finalize mode the version tag
+          # exists without its GitHub Release, and the fresh rebuild of the
+          # same source would compare inventory-identical to :latest by
+          # construction — skipping here would defer the repair to the next
+          # real push, which on a stable repo can be months away while
+          # staleness dispatches come weekly. Proceeding publishes normally
+          # (tags move to the fresh build of the same source; accepted
+          # rerun semantics) and the release steps repair the Release.
+          if [ "$FINALIZE" = "true" ]; then
+            proceed "Finalize mode (tag exists without its GitHub Release); the repair must not be skipped."
           fi
 
           # The comparison scans the amd64 per-arch image (accepted limit 1).
@@ -873,25 +890,32 @@ jobs:
 
       - name: Generate release notes
         # finalize repairs a tag-created/Release-missing partial run: the
-        # release steps run despite release-needed=false. The no-change gate
-        # keeps precedence deliberately — it only ever sets skip=true on
-        # staleness-DISPATCHED rebuilds (skip-if-unchanged), never on the
-        # push-event rerun that repairs a wedge; if a dispatched rebuild
-        # meets a wedged repo, the repair simply waits for the next push
-        # rerun rather than attaching a Release to a skipped publish.
+        # release steps run despite release-needed=false (and the no-change
+        # gate above never skips a finalize run). Deliberately token-free:
+        # this step downloads and EXECUTES git-cliff, and an untrusted
+        # binary must never run with a credential in its environment; the
+        # gh/tagging calls live in the Create release step, which runs no
+        # downloaded code.
         if: ${{ (inputs.release-needed == 'true' || inputs.finalize == 'true') && steps.nochange.outputs.skip != 'true' }}
         env:
           VERSION: ${{ inputs.version }}
           GO_LANES_JSON: ${{ inputs.go-modules }}
           FINALIZE: ${{ inputs.finalize }}
         run: |
+          # Guard direct callers: release.yaml always passes well-formed
+          # JSON, but this workflow is callable on its own, and a malformed
+          # go-modules value would otherwise fail inside a process
+          # substitution jq that cannot fail the step — leaving the notes
+          # silently unscoped (lane commits leaking in).
+          if ! jq -e 'type == "array" and all(.[]; type == "string")' <<<"$GO_LANES_JSON" >/dev/null 2>&1; then
+            echo "::error::go-modules must be a JSON array of strings; got: ${GO_LANES_JSON}"
+            exit 1
+          fi
           # Install git-cliff (only when we're actually creating a release).
           # Version + tarball sha256 pinned as a pair; Renovate maintains both
           # via the custom.git-cliff datasource (GitHub release-asset digest).
-          # Fail-closed: a tarball that does not match the reviewed pin never
-          # installs — the binary runs against every repo's history, and the
-          # checkout already treats it as untrusted (persist-credentials is
-          # false everywhere it runs).
+          # Fail-closed: a tarball that does not match the committed pin never
+          # installs.
           # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
           CLIFF_SHA256=9a1263f24e59a2f508c7b3d3283c9dea94a8bf697f96dbc18cc783cac6284546
@@ -906,23 +930,30 @@ jobs:
           # scripts/test-cliff-bump-semantics.sh pins the flag semantics).
           # No lanes -> no extra args -> unchanged.
           LANE_ARGS=()
-          if [ -n "$GO_LANES_JSON" ] && [ "$GO_LANES_JSON" != "[]" ]; then
-            LANE_ARGS+=(--tag-pattern '^v[0-9]')
-            while IFS= read -r d; do
-              [ -z "$d" ] && continue
-              LANE_ARGS+=(--exclude-path "$d/**")
-            done < <(echo "$GO_LANES_JSON" | jq -r '.[]')
+          while IFS= read -r d; do
+            [ -z "$d" ] && continue
+            LANE_ARGS+=(--exclude-path "$d/**")
+          done < <(jq -r '.[]' <<<"$GO_LANES_JSON")
+          if [ "${#LANE_ARGS[@]}" -gt 0 ]; then
+            LANE_ARGS=(--tag-pattern '^v[0-9]' "${LANE_ARGS[@]}")
           fi
           # --unreleased --tag renders the commits since the last tag as
           # $VERSION (the tag does not exist yet on the publish path). In
           # FINALIZE mode the tag exists at this very commit, so those
           # commits are no longer "unreleased": render the CURRENT release
           # instead (probe states K/L in scripts/test-cliff-bump-semantics.sh
-          # pin that rendering, lane flags respected).
+          # pin that rendering, lane flags respected). The finalize branch
+          # has NO fallback on purpose: a repaired Release's body is
+          # permanent (nothing ever regenerates it), so baking a stub would
+          # trade a retryable job failure for a permanent notes gap. The
+          # publish branch keeps its fallback (fail-open notes on a fresh
+          # release, consistent with this workflow's other best-effort
+          # steps) but names the version instead of the often-wrong
+          # "Initial release".
           if [ "$FINALIZE" = "true" ]; then
-            git-cliff --current "${LANE_ARGS[@]}" --strip header > RELEASE_NOTES.md || echo "Release ${VERSION}" > RELEASE_NOTES.md
+            git-cliff --current "${LANE_ARGS[@]}" --strip header > RELEASE_NOTES.md
           else
-            git-cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > RELEASE_NOTES.md || echo "Initial release" > RELEASE_NOTES.md
+            git-cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > RELEASE_NOTES.md || echo "Release ${VERSION}" > RELEASE_NOTES.md
           fi
 
       - name: Sign SBOM for release assets (keyless)
@@ -980,10 +1011,29 @@ jobs:
             gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
               -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
           fi
-          if gh release view "$VERSION" >/dev/null 2>&1; then
+          # Release presence, status-aware: only a definitive HTTP 404
+          # proceeds to create; any other API failure fails the step
+          # (retryable) instead of risking a duplicate-create. The by-tag
+          # endpoint returns only PUBLISHED releases, so a DRAFT orphaned by
+          # a prior wedged asset upload (gh release create drafts first when
+          # assets are attached, publishes after the upload) reads as absent
+          # — correct, but the orphan must be deleted before re-creating or
+          # it accumulates in the UI while holding no tag ref.
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" >/dev/null 2>/tmp/relerr; then
             echo "::notice::Release ${VERSION} already exists; skipping creation."
             exit 0
+          elif ! grep -q 'HTTP 404' /tmp/relerr; then
+            echo "::error::could not determine whether Release ${VERSION} exists:"
+            cat /tmp/relerr
+            exit 1
           fi
+          gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq -r --arg v "$VERSION" '.[] | select(.draft and .tag_name == $v) | .id' \
+            | while IFS= read -r id; do
+                [ -z "$id" ] && continue
+                echo "::notice::deleting orphaned draft release ${id} for ${VERSION}"
+                gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
+              done
           gh release create "$VERSION" \
             --title "$VERSION" \
             --notes-file RELEASE_NOTES.md \

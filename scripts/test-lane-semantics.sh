@@ -259,4 +259,29 @@ chk "L-E3 deep path unchanged" "$(esc tools/gen)" "tools/gen"
 # shellcheck disable=SC2016 # literal $ is the point of the test
 chk "L-E4 dollar escaped" "$(esc 'a$b')" 'a\$b'
 
+# ── Workflow plumbing contract (lane-aware docker release notes) ─────────────
+# The cliff probe (states J/L in test-cliff-bump-semantics.sh) pins the FLAG
+# semantics; these checks pin the PLUMBING that delivers the flags to the
+# docker pipeline — a later edit that stops forwarding go_modules or drops
+# the LANE_ARGS expansion would keep every cliff state green while silently
+# unscoping image release notes.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RELEASE_YAML="$ROOT/.github/workflows/release.yaml"
+DOCKER_YAML="$ROOT/.github/workflows/docker-release.yaml"
+# shellcheck disable=SC2016 # the ${{ }} is a literal GitHub expression, not shell
+chk "L-F1 release.yaml forwards detect's go_modules to docker-release" \
+  "$(grep -c 'go-modules: ${{ needs.detect.outputs.go_modules }}' "$RELEASE_YAML")" "1"
+chk "L-F2 docker-release go-modules input defaults to '[]'" \
+  "$(grep -c 'default: "\[\]"' "$DOCKER_YAML")" "1"
+# shellcheck disable=SC2016 # literal single-quoted grep pattern, no expansion wanted
+chk "L-F3 both docker notes branches expand LANE_ARGS" \
+  "$(grep -c 'git-cliff .*"\${LANE_ARGS\[@\]}"' "$DOCKER_YAML")" "2"
+# An empty lane array must contribute ZERO argv words, keeping every
+# no-lane docker repo's git-cliff command argument-identical (same
+# expansion form the workflows use; bash >= 4.4 drops the empty array
+# under set -u).
+LANE_ARGS=()
+set -- git-cliff --unreleased --tag v1.2.3 "${LANE_ARGS[@]}" --strip header
+chk "L-F4 empty LANE_ARGS contributes zero argv words" "$#" "6"
+
 echo "PASS: nested-module lane shell semantics match the pinned contract (${PASS} checks)"

@@ -287,6 +287,21 @@ jobs:
           git push origin "refs/tags/${VERSION}"
           echo "Pushed ${VERSION}; move-major-tag.yaml will propagate vX / vX.Y."
 
+      - name: Render release notes
+        # Deliberately token-free: this step EXECUTES the downloaded
+        # git-cliff binary, which must never run with a credential in its
+        # environment (the same split as release.yaml's notes steps — and
+        # doubly so here, where the credential is a write-capable PAT).
+        # Runs after the tag push so --latest renders the new tag's window.
+        if: steps.gate.outputs.cut == 'true'
+        run: |
+          set -euo pipefail
+          # git-cliff was installed earlier; use the same CI-dedicated config.
+          git cliff --latest --strip header --config .github/cliff-ci.toml > /tmp/RELEASE_NOTES.md || true
+          if [ ! -s /tmp/RELEASE_NOTES.md ]; then
+            echo "Automated release of reusable workflows + composite actions." > /tmp/RELEASE_NOTES.md
+          fi
+
       - name: Create GitHub Release
         if: steps.gate.outputs.cut == 'true'
         env:
@@ -297,11 +312,6 @@ jobs:
           if gh release view "${VERSION}" >/dev/null 2>&1; then
             echo "::notice::Release ${VERSION} already exists; skipping."
             exit 0
-          fi
-          # git-cliff was installed earlier; use the same CI-dedicated config.
-          git cliff --latest --strip header --config .github/cliff-ci.toml > /tmp/RELEASE_NOTES.md || true
-          if [ ! -s /tmp/RELEASE_NOTES.md ]; then
-            echo "Automated release of reusable workflows + composite actions." > /tmp/RELEASE_NOTES.md
           fi
           gh release create "${VERSION}" \
             --title "${VERSION}" \

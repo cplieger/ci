@@ -64,14 +64,31 @@ fail() {
 
 # ── Pin consistency: every CLIFF_VERSION and CLIFF_SHA256 must agree ────────
 # The version and the tarball sha256 are pinned as a pair at every install
-# site (Renovate maintains both via the custom.git-cliff datasource); a site
-# whose version or digest drifts from the others is a review escape.
-PIN_FILES=(
-  "$ROOT/actions/git-cliff-version/action.yml"
-  "$ROOT/.github/workflows/release.yaml"
-  "$ROOT/.github/workflows/docker-release.yaml"
-  "$ROOT/.github/workflows/self-release.yaml"
+# site (Renovate maintains both via the custom.git-cliff datasource). Four
+# invariants, each catching a drift class the others cannot see:
+#   uniqueness    — a site whose version or digest disagrees with the rest
+#   site count    — a site added/removed without bumping EXPECTED_SITES
+#                   (forces conscious review of every install-site change;
+#                   symmetric pair removal fools a bare N_VER==N_SHA check)
+#   enforcement   — every site's `sha256sum -c` gate line still exists (a
+#                   deleted gate leaves both pin lines intact and the site
+#                   silently reverts to unverified install)
+#   manager shape — every site matches the Renovate customManager block
+#                   (annotation + adjacent version/sha lines; the regex
+#                   below MIRRORS cplieger/.github default.json's
+#                   custom.git-cliff manager — keep them in sync), so every
+#                   site actually auto-updates; a corrupted annotation or a
+#                   typoed depName would silently freeze that site (and a
+#                   wrong depName would also bypass the digest-only
+#                   no-automerge packageRule, which matches on depName)
+# The file list is DISCOVERED (any file under .github/ or actions/ carrying
+# a CLIFF_VERSION pin), so a new install site in a new file cannot hide
+# from these checks.
+EXPECTED_SITES=7
+mapfile -t PIN_FILES < <(
+  grep -rlE 'CLIFF_VERSION[=:]' "$ROOT/.github" "$ROOT/actions" | sort
 )
+[ "${#PIN_FILES[@]}" -ge 4 ] || fail "pin-file discovery found only ${#PIN_FILES[@]} files (expected the release/docker-release/self-release workflows + the composite action at minimum)"
 mapfile -t pins < <(
   grep -rhoE 'CLIFF_VERSION[=:] *"?v[0-9][0-9.]*' "${PIN_FILES[@]}" \
     | grep -oE 'v[0-9][0-9.]*' | sort -u
@@ -84,14 +101,33 @@ mapfile -t shas < <(
 )
 [ "${#shas[@]}" -eq 1 ] || fail "CLIFF_SHA256 pins disagree across workflows/action: ${shas[*]}"
 SHA256="${shas[0]}"
-# Pairing invariant: every version pin must have a well-formed sha pin beside
-# it. Uniqueness alone cannot see a site whose sha line is malformed or
-# missing — a 63-hex-char typo simply falls out of the {64} scan and the
-# remaining sites still "agree" (found by this probe's own negative test).
+# Per-class counts. N_SHA additionally guards well-formedness: a malformed
+# sha (63 hex chars) falls out of the {64} scan while the remaining sites
+# still "agree" on uniqueness (found by this probe's own negative test).
 N_VER=$(grep -rhoE 'CLIFF_VERSION[=:] *"?v[0-9][0-9.]*' "${PIN_FILES[@]}" | wc -l)
 N_SHA=$(grep -rhoE 'CLIFF_SHA256[=:] *"?[a-f0-9]{64}' "${PIN_FILES[@]}" | wc -l)
-[ "$N_VER" -eq "$N_SHA" ] || fail "CLIFF pin pairing broken: $N_VER version pins vs $N_SHA well-formed sha pins (a site's CLIFF_SHA256 is missing or malformed)"
-echo "pinned git-cliff: $VERSION / sha256 ${SHA256:0:12}… (consistent + paired across all $N_VER call sites)"
+N_GATE=$(grep -rh 'CLIFF_SHA256' "${PIN_FILES[@]}" | grep -c 'sha256sum -c' || true)
+N_ANNOT=$(grep -rh 'renovate: datasource=custom\.git-cliff depName=orhun/git-cliff' "${PIN_FILES[@]}" | grep -c . || true)
+[ "$N_VER" -eq "$EXPECTED_SITES" ] || fail "expected $EXPECTED_SITES CLIFF_VERSION pins, found $N_VER — a site was added or removed; review it, then update EXPECTED_SITES here"
+[ "$N_SHA" -eq "$EXPECTED_SITES" ] || fail "expected $EXPECTED_SITES well-formed CLIFF_SHA256 pins, found $N_SHA (a site's sha line is missing or malformed)"
+[ "$N_GATE" -eq "$EXPECTED_SITES" ] || fail "expected $EXPECTED_SITES 'sha256sum -c' gate lines referencing CLIFF_SHA256, found $N_GATE (a site installs without verifying)"
+[ "$N_ANNOT" -eq "$EXPECTED_SITES" ] || fail "expected $EXPECTED_SITES custom.git-cliff renovate annotations, found $N_ANNOT (a site will not auto-update, and a wrong depName bypasses the digest-only no-automerge rule)"
+# Structural check: the annotation and its version/sha lines must be
+# ADJACENT in the exact shape the Renovate manager matches — co-located
+# counts alone cannot see an annotation separated from its pins.
+N_BLOCKS=$(
+  python3 - "${PIN_FILES[@]}" <<'PY'
+import re, sys
+pat = re.compile(
+    r"#\s*renovate:\s*datasource=custom\.git-cliff\s+depName=orhun/git-cliff\s*\n"
+    r"\s*CLIFF_VERSION[=:]\s*['\"]?[^'\"\s]+['\"]?\s*\n"
+    r"\s*CLIFF_SHA256[=:]\s*['\"]?[a-f0-9]{64}"
+)
+print(sum(len(pat.findall(open(f, encoding="utf-8").read())) for f in sys.argv[1:]))
+PY
+)
+[ "$N_BLOCKS" -eq "$EXPECTED_SITES" ] || fail "expected $EXPECTED_SITES complete annotation+version+sha blocks (Renovate manager shape), found $N_BLOCKS"
+echo "pinned git-cliff: $VERSION / sha256 ${SHA256:0:12}… ($EXPECTED_SITES sites: consistent, paired, gated, manager-matched)"
 
 # ── Binary: reuse CLIFF_BIN if provided, else download the pinned release ───
 # The download verifies the SAME pinned digest the workflows enforce, so a

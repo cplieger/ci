@@ -517,7 +517,7 @@ jobs:
           # lane tag hijack the version string — probe state G's hazard).
           # Version + tarball sha256 pinned as a pair; Renovate maintains both
           # via the custom.git-cliff datasource (GitHub release-asset digest).
-          # Fail-closed: a tarball that does not match the reviewed pin never
+          # Fail-closed: a tarball that does not match the committed pin never
           # installs — the binary runs against every repo's history, and the
           # checkout already treats it as untrusted (persist-credentials is
           # false everywhere it runs).
@@ -573,9 +573,12 @@ jobs:
           # so the publish jobs would skip and the missing Release could
           # never be repaired by rerun — while re-cutting or moving the tag
           # is forbidden (Go module versions and image provenance are
-          # immutable once published). Worse than a cosmetic gap: the deploy
-          # webhooks subscribe to the RELEASE event, so a wedged docker
-          # release is a published, signed image that never deploys.
+          # immutable once published). Not just a cosmetic gap: the release
+          # EVENT never fires, so its consumers (the per-repo Komodo hook
+          # that expedites a Renovate scan) miss it, and the Release page
+          # with the changelog + signed SBOM assets is absent until
+          # repaired. Image deploys still land via the resident Renovate's
+          # hourly registry sweep — delayed, not lost.
           #
           # finalize=true when the computed version's tag already points at
           # THIS commit and its GitHub Release is missing. The go/ts/docker
@@ -583,18 +586,35 @@ jobs:
           # via --current, since the commits are no longer "unreleased";
           # probe states K/L pin that rendering). They never re-tag — the
           # exists-at-same-SHA guard already passes through — and never
-          # republish package registries (those steps are idempotent
-          # version-exists skips anyway). Same-SHA only, deliberately: after
-          # the branch moves on, notes and artifacts can no longer be
+          # touch package registries (the root ts publish step is gated on
+          # release=='true'; by step order a root tag can only exist after
+          # its registries already published). Same-SHA only, deliberately:
+          # after the branch moves on, notes and artifacts can no longer be
           # reproduced faithfully from a newer checkout — re-run the
           # original commit's workflow run instead (the natural repair path,
           # which this step is what makes work).
           FINALIZE=false
           if [ "$EFFECTIVE_RELEASE" = "false" ] && [ -n "$EFFECTIVE_VERSION" ]; then
             TAG_SHA=$(git rev-list -n1 "$EFFECTIVE_VERSION" 2>/dev/null || echo "")
-            if [ "$TAG_SHA" = "$GITHUB_SHA" ] && ! gh release view "$EFFECTIVE_VERSION" >/dev/null 2>&1; then
-              FINALIZE=true
-              echo "::notice::tag ${EFFECTIVE_VERSION} exists at this commit without a GitHub Release — finalize mode (repair the Release only)"
+            if [ "$TAG_SHA" = "$GITHUB_SHA" ]; then
+              # Status-aware absence check: only a definitive HTTP 404 means
+              # "no Release" (finalize); any other failure (auth, rate limit,
+              # transient 5xx) fails the job rather than guessing in either
+              # direction. The by-tag endpoint returns only PUBLISHED
+              # releases, so a DRAFT orphaned by a wedged asset upload (gh
+              # release create drafts first when assets are attached) also
+              # reads as missing; the docker create step deletes such drafts
+              # before re-creating.
+              if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${EFFECTIVE_VERSION}" >/dev/null 2>/tmp/relerr; then
+                echo "::notice::tag ${EFFECTIVE_VERSION} exists at this commit and its Release is present — nothing to repair"
+              elif grep -q 'HTTP 404' /tmp/relerr; then
+                FINALIZE=true
+                echo "::notice::tag ${EFFECTIVE_VERSION} exists at this commit without a GitHub Release — finalize mode (repair the Release only)"
+              else
+                echo "::error::could not determine whether Release ${EFFECTIVE_VERSION} exists:"
+                cat /tmp/relerr
+                exit 1
+              fi
             fi
           fi
           echo "finalize=$FINALIZE" >> "$GITHUB_OUTPUT"
@@ -741,21 +761,22 @@ jobs:
               exit 1 ;;
           esac
 
-      - name: Tag + GitHub Release
+      - name: Generate release notes
+        # Deliberately token-free: this step downloads and EXECUTES git-cliff,
+        # and an untrusted binary must never run with a credential in its
+        # environment (persist-credentials=false keeps it out of .git/config,
+        # but a step-level GH_TOKEN would still be readable by any child
+        # process). The gh/tagging calls live in the next step, which runs no
+        # downloaded code.
         env:
-          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect.outputs.version }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
           FINALIZE: ${{ needs.detect.outputs.finalize }}
         run: |
-          # Install git-cliff (version compute already happened in detect, but
-          # we need the binary here to render the release notes).
           # Version + tarball sha256 pinned as a pair; Renovate maintains both
           # via the custom.git-cliff datasource (GitHub release-asset digest).
-          # Fail-closed: a tarball that does not match the reviewed pin never
-          # installs — the binary runs against every repo's history, and the
-          # checkout already treats it as untrusted (persist-credentials is
-          # false everywhere it runs).
+          # Fail-closed: a tarball that does not match the committed pin never
+          # installs.
           # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
           CLIFF_SHA256=9a1263f24e59a2f508c7b3d3283c9dea94a8bf697f96dbc18cc783cac6284546
@@ -788,6 +809,12 @@ jobs:
           else
             git cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > NOTES.md
           fi
+
+      - name: Tag + GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
           # Tag ref created first via the git data API, pinned to the trigger
           # commit; release then attaches to the existing tag (no --target).
           # `gh release create --target` tag-creation 403s for the integration
@@ -831,6 +858,13 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Publish to npm + JSR
+        # release-only, never finalize: by step order a root tag can only
+        # exist after both registries already published, so a finalize rerun
+        # (or a hand-pushed tag at HEAD) has nothing to publish — running
+        # here anyway would push a package for a version compute that said
+        # release=false. The version-exists guards below stay as the
+        # belt-and-suspenders for reruns of the publish path itself.
+        if: ${{ needs.detect.outputs.release == 'true' }}
         env:
           # No NODE_AUTH_TOKEN — both NPM and JSR publish via GitHub OIDC.
           # NPM: trusted publisher configured at npmjs.com pointing to this
@@ -868,19 +902,18 @@ jobs:
             npx -y "jsr@${JSR_VERSION}" publish --allow-dirty
           fi
 
-      - name: Tag + GitHub Release
+      - name: Generate release notes
+        # Deliberately token-free — this step executes the downloaded
+        # git-cliff binary; see the go job's identical split.
         env:
-          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect.outputs.version }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
           FINALIZE: ${{ needs.detect.outputs.finalize }}
         run: |
           # Version + tarball sha256 pinned as a pair; Renovate maintains both
           # via the custom.git-cliff datasource (GitHub release-asset digest).
-          # Fail-closed: a tarball that does not match the reviewed pin never
-          # installs — the binary runs against every repo's history, and the
-          # checkout already treats it as untrusted (persist-credentials is
-          # false everywhere it runs).
+          # Fail-closed: a tarball that does not match the committed pin never
+          # installs.
           # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
           CLIFF_SHA256=9a1263f24e59a2f508c7b3d3283c9dea94a8bf697f96dbc18cc783cac6284546
@@ -907,6 +940,12 @@ jobs:
           else
             git cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > NOTES.md
           fi
+
+      - name: Tag + GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
           # Tag ref created first via the git data API, pinned to the trigger
           # commit; release then attaches to the existing tag (no --target).
           # `gh release create --target` tag-creation 403s for the integration
@@ -925,10 +964,17 @@ jobs:
   # ─── Subpackage publish (matrix over `*/jsr.json` dirs that changed) ───────
   subpackage:
     needs: [detect, docker, ts, go]
+    # finalize widens this gate too — the OPPOSITE asymmetry of the root ts
+    # job. Root ts registries publish BEFORE the root tag, so an existing
+    # tag proves they published and the finalize path skips them. This job
+    # publishes AFTER the root go/ts/docker job (needs-ordered), so a run
+    # that died between the root tag and here leaves the subpackage
+    # registries genuinely unpublished; a finalize rerun must pass through
+    # (the version-exists guards inside skip anything that did land).
     if: |
       always()
       && needs.detect.outputs.subpackages_to_publish != '[]'
-      && needs.detect.outputs.release == 'true'
+      && (needs.detect.outputs.release == 'true' || needs.detect.outputs.finalize == 'true')
       && (needs.docker.result == 'success' || needs.docker.result == 'skipped')
       && (needs.ts.result == 'success' || needs.ts.result == 'skipped')
       && (needs.go.result == 'success' || needs.go.result == 'skipped')
@@ -1029,7 +1075,7 @@ jobs:
         run: |
           # Version + tarball sha256 pinned as a pair; Renovate maintains both
           # via the custom.git-cliff datasource (GitHub release-asset digest).
-          # Fail-closed: a tarball that does not match the reviewed pin never
+          # Fail-closed: a tarball that does not match the committed pin never
           # installs — the binary runs against every repo's history, and the
           # checkout already treats it as untrusted (persist-credentials is
           # false everywhere it runs).
@@ -1133,10 +1179,12 @@ jobs:
           fi
           echo "ok: module path '$modpath' matches lane ${DIR} ($VERSION)"
 
-      - name: Tag + GitHub Release (lane)
+      - name: Generate lane release notes
+        # Deliberately token-free — this step executes the downloaded
+        # git-cliff binary (installed by the compute step above); see the
+        # go job's identical split.
         if: ${{ steps.lane.outputs.release == 'true' }}
         env:
-          GH_TOKEN: ${{ github.token }}
           DIR: ${{ matrix.dir }}
           VERSION: ${{ steps.lane.outputs.version }}
           FINALIZE: ${{ steps.lane.outputs.finalize }}
@@ -1156,6 +1204,13 @@ jobs:
               --tag-pattern "^${ESC}/v[0-9]" \
               --include-path "${DIR}/**" --strip header > NOTES.md
           fi
+
+      - name: Tag + GitHub Release (lane)
+        if: ${{ steps.lane.outputs.release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.lane.outputs.version }}
+        run: |
           # Tag ref via the git data API pinned to the trigger commit, with
           # the exists-at-different-SHA refuse guard (mirrors the root go
           # job; slash tags are ordinary multi-segment refs).
