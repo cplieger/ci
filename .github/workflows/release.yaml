@@ -21,7 +21,17 @@
 #   subpackage    →  Matrix over `*/jsr.json` subpackages where the subpackage
 #                    dir had non-excluded changes; npm + JSR publish per dir.
 #                    Used by hybrid repos (e.g., web-terminal-engine: Go module at root +
-#                    web/ TS subpackage).
+#                    web/ TS subpackage). Shares the ROOT version.
+#
+#   go-nested     →  Matrix over tracked nested Go modules (`<dir>/go.mod`)
+#                    whose dir had non-excluded changes. Each is an
+#                    independent release lane: own conventional-commit
+#                    version, own `<dir>/vX.Y.Z` tag + GitHub Release with
+#                    lane-scoped notes. Root version/notes are recomputed
+#                    lane-aware when lanes exist (the fleet-synced cliff
+#                    config cannot know per-repo lane dirs, so lane commits
+#                    would otherwise count toward the root bump — see the
+#                    detect job's recompute step).
 #
 # Path-change detection uses central exclusion patterns (see "Detect changed
 # paths" step) — opinionated and tight by default. Tests, lint configs, docs,
@@ -73,9 +83,17 @@ jobs:
       type: ${{ steps.type.outputs.type }}
       subpackages: ${{ steps.type.outputs.subpackages }}
       subpackages_to_publish: ${{ steps.changes.outputs.subpackages_to_publish }}
-      version: ${{ steps.cliff.outputs.version }}
-      release: ${{ steps.cliff.outputs.release }}
+      # version/release: the lane-aware recompute (steps.lanes) overrides the
+      # composite action's config-driven result whenever nested Go module
+      # lanes exist — the fleet-synced cliff config cannot know per-repo lane
+      # dirs, so without it lane commits count toward the ROOT version bump
+      # (see the recompute step). Empty-string-falsy fallback keeps
+      # single-module repos byte-identical.
+      version: ${{ steps.lanes.outputs.version || steps.cliff.outputs.version }}
+      release: ${{ steps.lanes.outputs.release || steps.cliff.outputs.release }}
       root_changed: ${{ steps.changes.outputs.root_changed }}
+      go_modules: ${{ steps.gomodules.outputs.go_modules }}
+      go_modules_to_release: ${{ steps.changes.outputs.go_modules_to_release }}
       registries: ${{ steps.policy.outputs.registries }}
       platforms: ${{ steps.policy.outputs.platforms }}
       sbom_from: ${{ steps.policy.outputs.sbom_from }}
@@ -129,12 +147,86 @@ jobs:
           echo "subpackages=$SUBS" >> "$GITHUB_OUTPUT"
           echo "type=$TYPE  subpackages=$SUBS"
 
+      - name: Detect nested Go modules
+        id: gomodules
+        run: |
+          # Nested Go modules — a TRACKED subdirectory go.mod — each get their
+          # own release lane: independent conventional-commit versioning and
+          # <dir>/vX.Y.Z tags (the go-nested job below). Works for any repo
+          # type; a repo without nested modules produces [] and nothing below
+          # changes behavior. Discovery prunes vendored/generated trees: a
+          # committed node_modules (e.g. subflux's embedded frontend deps) can
+          # carry upstream go.mod files that are not release lanes. git
+          # pathspec '*/go.mod' matches at any depth (git wildmatch '*'
+          # crosses slashes) but never the root go.mod.
+          #
+          # Eligibility filters (keep in sync with ci.yaml's detect step and
+          # scripts/test-lane-semantics.sh, which pins them):
+          #   - module path's first element must contain a dot: Go itself
+          #     never fetches a dotless path from the network, so a sentinel
+          #     go.mod (e.g. web-terminal-engine's `module web-ignore`, which
+          #     exists to keep root `go test ./...` out of a TS subtree) is
+          #     not a lane. This filter is what keeps the feature dormant on
+          #     repos that track sentinel modules.
+          #   - the dir must contain tracked .go files (a module with no Go
+          #     source releases nothing).
+          #   - RELEASE lanes skip dirs under internal/ (unimportable outside
+          #     the repo, so tags/Releases for them are noise; ci.yaml still
+          #     VALIDATES internal modules).
+          #   - dir names are restricted to [A-Za-z0-9._/-]: anything else is
+          #     not a valid Go module path element and would mis-scope the
+          #     glob/regex/tag machinery downstream — fail loud, not weird.
+          #   - overlapping lanes (one dir an ancestor of another) are
+          #     rejected: prefix classification would assign files to a
+          #     parent lane nondeterministically.
+          LANES="[]"
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            d=$(dirname "$f")
+            case "$d" in
+              *[!A-Za-z0-9._/-]*)
+                echo "::error::nested go.mod dir '$d' contains characters outside [A-Za-z0-9._/-]; not a valid Go module path element"
+                exit 1 ;;
+            esac
+            case "/$d/" in
+              */internal/*)
+                echo "::notice::nested module '$d' is under internal/ — validated by CI, not released"
+                continue ;;
+            esac
+            modpath=$(awk '$1=="module"{print $2; exit}' "$f")
+            case "${modpath%%/*}" in
+              *.*) : ;;
+              *)
+                echo "::notice::nested go.mod '$f' (module '${modpath:-<none>}') has a dotless first path element — a sentinel/local module, not a release lane"
+                continue ;;
+            esac
+            if [ -z "$(git ls-files "$d/*.go" | head -1)" ]; then
+              echo "::notice::nested module '$d' has no tracked .go files — not a release lane"
+              continue
+            fi
+            LANES=$(echo "$LANES" | jq -c --arg v "$d" '. + [$v]')
+          done < <(git ls-files '*/go.mod' | grep -Ev '(^|/)(node_modules|vendor|testdata|static|dist)/' || true)
+          # Reject overlapping lanes (ancestor/descendant pairs).
+          while IFS= read -r a; do
+            [ -z "$a" ] && continue
+            while IFS= read -r b; do
+              [ -z "$b" ] && continue
+              if [ "$a" != "$b" ] && [ "${b#"$a"/}" != "$b" ]; then
+                echo "::error::nested Go modules '$a' and '$b' overlap (one contains the other); restructure so lane dirs are disjoint"
+                exit 1
+              fi
+            done < <(echo "$LANES" | jq -r '.[]')
+          done < <(echo "$LANES" | jq -r '.[]')
+          echo "go_modules=$LANES" >> "$GITHUB_OUTPUT"
+          echo "nested Go module lanes: $LANES"
+
       - name: Detect changed paths
         id: changes
         env:
           BEFORE: ${{ github.event.before }}
           HEAD: ${{ github.sha }}
           SUBPACKAGES_JSON: ${{ steps.type.outputs.subpackages }}
+          GO_LANES_JSON: ${{ steps.gomodules.outputs.go_modules }}
           REPO_TYPE: ${{ steps.type.outputs.type }}
         run: |
           # Determine the set of files that materially changed in this push.
@@ -323,12 +415,19 @@ jobs:
           fi
 
           # Determine root_changed (any significant file outside all subpackage
-          # dirs) and which subpackages changed.
+          # dirs AND all nested Go module lane dirs) and which subpackages /
+          # lanes changed. A lane dir's changes belong to that lane's release,
+          # not the root's — the same classification the TS subpackages use.
           ROOT_CHANGED=false
           declare -A SUBPKG_CHANGED
+          declare -A LANE_CHANGED
           mapfile -t SUBPACKAGES < <(echo "$SUBPACKAGES_JSON" | jq -r '.[]')
+          mapfile -t GO_LANES < <(echo "$GO_LANES_JSON" | jq -r '.[]')
           for s in "${SUBPACKAGES[@]}"; do
             SUBPKG_CHANGED["$s"]=false
+          done
+          for l in "${GO_LANES[@]}"; do
+            LANE_CHANGED["$l"]=false
           done
 
           if [ -n "$SIGNIFICANT" ]; then
@@ -342,7 +441,15 @@ jobs:
                   break
                 fi
               done
-              if ! $in_subpkg; then
+              in_lane=false
+              for l in "${GO_LANES[@]}"; do
+                if [[ "$f" == "$l/"* ]]; then
+                  LANE_CHANGED["$l"]=true
+                  in_lane=true
+                  break
+                fi
+              done
+              if ! $in_subpkg && ! $in_lane; then
                 ROOT_CHANGED=true
               fi
             done <<< "$SIGNIFICANT"
@@ -355,9 +462,17 @@ jobs:
             fi
           done
 
+          GO_LANES_TO_RELEASE="[]"
+          for l in "${GO_LANES[@]}"; do
+            if [ "${LANE_CHANGED[$l]}" = "true" ]; then
+              GO_LANES_TO_RELEASE=$(echo "$GO_LANES_TO_RELEASE" | jq -c --arg v "$l" '. + [$v]')
+            fi
+          done
+
           {
             echo "root_changed=$ROOT_CHANGED"
             echo "subpackages_to_publish=$SUBS_TO_PUBLISH"
+            echo "go_modules_to_release=$GO_LANES_TO_RELEASE"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -374,7 +489,64 @@ jobs:
             echo "**Outputs:**"
             echo "- root_changed: $ROOT_CHANGED"
             echo "- subpackages_to_publish: $SUBS_TO_PUBLISH"
+            echo "- go_modules_to_release: $GO_LANES_TO_RELEASE"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Recompute lane-aware versions
+        id: lanes
+        if: ${{ steps.gomodules.outputs.go_modules != '[]' }}
+        env:
+          GO_LANES_JSON: ${{ steps.gomodules.outputs.go_modules }}
+        run: |
+          # With nested Go module lanes present, the composite action's
+          # config-driven compute above is not lane-safe: the fleet-synced
+          # cliff config cannot know this repo's lane dirs, so a lane-only
+          # commit (e.g. a yaml-dep feat in yamlenv/) would count toward the
+          # ROOT version bump and mint a spurious root release (verified on
+          # v2.13.1; probe state H pins it). Recompute the root version with
+          # per-repo CLI scoping: each lane's commits excluded via
+          # --exclude-path '<dir>/**' (CLI excludes MERGE with the config
+          # exclude_paths — probe state J pins that), plus the root tag
+          # universe stated explicitly via --tag-pattern '^v[0-9]' as
+          # defense-in-depth — the anchored pattern ships in the synced
+          # config, but this step must not depend on every consumer's
+          # cliff.toml being current (an unanchored stale copy would let a
+          # lane tag hijack the version string — probe state G's hazard).
+          # renovate: datasource=github-releases depName=orhun/git-cliff
+          CLIFF_VERSION=v2.13.1
+          curl -fsSL --retry 3 \
+            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+          ARGS=(--tag-pattern '^v[0-9]')
+          while IFS= read -r d; do
+            [ -z "$d" ] && continue
+            ARGS+=(--exclude-path "$d/**")
+          done < <(echo "$GO_LANES_JSON" | jq -r '.[]')
+          if ! NEXT="$(git cliff --unreleased --bumped-version "${ARGS[@]}" 2>/tmp/cliff.err)"; then
+            echo "::error::lane-aware git-cliff --bumped-version failed:"
+            sed 's/^/  /' /tmp/cliff.err >&2 || true
+            exit 1
+          fi
+          if [ -z "$NEXT" ]; then
+            echo "::error::lane-aware git-cliff returned an empty version with no error"
+            exit 1
+          fi
+          # Defense in depth: the root lane must never tag a lane-prefixed
+          # version. If this fires, the cliff contract changed under us.
+          case "$NEXT" in
+            v[0-9]*) : ;;
+            *)
+              echo "::error::lane-aware compute returned non-root version '$NEXT'; refusing"
+              exit 1 ;;
+          esac
+          LATEST="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo "")"
+          if [ "$NEXT" = "$LATEST" ]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Lane-aware root version: ${NEXT} (latest root tag: ${LATEST:-<none>}; lanes: ${GO_LANES_JSON})"
 
       - name: Resolve repo policy
         id: policy
@@ -516,6 +688,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect.outputs.version }}
+          GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
         run: |
           # Install git-cliff (version compute already happened in detect, but
           # we need the binary here to render the release notes).
@@ -524,11 +697,23 @@ jobs:
           curl -fsSL --retry 3 \
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+          # Lane-aware notes: when nested Go module lanes exist, scope the
+          # root notes to the root lane (root tag universe + lane commits
+          # excluded), or lane commits leak into the root release's notes
+          # (probe state J). No lanes -> no extra args -> unchanged.
+          LANE_ARGS=()
+          if [ -n "$GO_LANES_JSON" ] && [ "$GO_LANES_JSON" != "[]" ]; then
+            LANE_ARGS+=(--tag-pattern '^v[0-9]')
+            while IFS= read -r d; do
+              [ -z "$d" ] && continue
+              LANE_ARGS+=(--exclude-path "$d/**")
+            done < <(echo "$GO_LANES_JSON" | jq -r '.[]')
+          fi
           # --unreleased --tag renders the commits since the last tag as
           # $VERSION. The new tag does NOT exist yet (the gh release create
           # below creates it), so a bare `--latest` would render the PREVIOUS
           # release's notes instead of this one's.
-          git cliff --unreleased --tag "$VERSION" --strip header > NOTES.md
+          git cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > NOTES.md
           # Tag ref created first via the git data API, pinned to the trigger
           # commit; release then attaches to the existing tag (no --target).
           # `gh release create --target` tag-creation 403s for the integration
@@ -610,17 +795,28 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect.outputs.version }}
+          GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
         run: |
           # renovate: datasource=github-releases depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
           curl -fsSL --retry 3 \
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+          # Lane-aware notes when nested Go module lanes exist (see the go
+          # job's identical block; probe state J).
+          LANE_ARGS=()
+          if [ -n "$GO_LANES_JSON" ] && [ "$GO_LANES_JSON" != "[]" ]; then
+            LANE_ARGS+=(--tag-pattern '^v[0-9]')
+            while IFS= read -r d; do
+              [ -z "$d" ] && continue
+              LANE_ARGS+=(--exclude-path "$d/**")
+            done < <(echo "$GO_LANES_JSON" | jq -r '.[]')
+          fi
           # --unreleased --tag renders the commits since the last tag as
           # $VERSION. The new tag does NOT exist yet (the gh release create
           # below creates it), so a bare `--latest` would render the PREVIOUS
           # release's notes instead of this one's.
-          git cliff --unreleased --tag "$VERSION" --strip header > NOTES.md
+          git cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > NOTES.md
           # Tag ref created first via the git data API, pinned to the trigger
           # commit; release then attaches to the existing tag (no --target).
           # `gh release create --target` tag-creation 403s for the integration
@@ -702,3 +898,175 @@ jobs:
             JSR_VERSION=0.14.3
             npx -y "jsr@${JSR_VERSION}" publish --allow-dirty
           fi
+
+  # ─── Nested Go module lanes (matrix; independent <dir>/vX.Y.Z versions) ────
+  # Each tracked nested go.mod is its own release lane: its version is
+  # computed from ITS commits (conventional commits touching the lane dir)
+  # against ITS tag universe (<dir>/vX.Y.Z), fully independent of the root
+  # version — so a yaml-dep bump in a nested module never mints a root
+  # release, and a root release never re-tags an unchanged nested module.
+  # Only needs detect (nothing is shared with the root/docker/ts jobs; the
+  # lane has its own version). Consumers require the BARE semver
+  # (`go get repo/<dir>@vX.Y.Z`); the Go tooling maps it to this lane's
+  # `<dir>/vX.Y.Z` git tag (standard Go subdirectory-module tagging). Lane
+  # versions are computed here, not in detect: the matrix job checks out
+  # full history anyway, and this avoids plumbing a dir->version map through
+  # job outputs.
+  go-nested:
+    needs: detect
+    if: ${{ needs.detect.outputs.go_modules_to_release != '' && needs.detect.outputs.go_modules_to_release != '[]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.detect.outputs.go_modules_to_release) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Compute lane version
+        id: lane
+        env:
+          DIR: ${{ matrix.dir }}
+        run: |
+          # renovate: datasource=github-releases depName=orhun/git-cliff
+          CLIFF_VERSION=v2.13.1
+          curl -fsSL --retry 3 \
+            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+          # Lane scoping (probe state I): the lane's tag universe via
+          # --tag-pattern '^<dir>/v[0-9]' (dir regex-escaped), the lane's
+          # commit window via --include-path '<dir>/**', and first-release
+          # bootstrap via GIT_CLIFF__BUMP__INITIAL_TAG=<dir>/v1.0.0 (the
+          # config initial_tag is root-shaped and would fail the pattern).
+          ESC=$(printf '%s' "$DIR" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
+          if ! NEXT="$(GIT_CLIFF__BUMP__INITIAL_TAG="${DIR}/v1.0.0" git cliff \
+                --unreleased --bumped-version \
+                --tag-pattern "^${ESC}/v[0-9]" \
+                --include-path "${DIR}/**" 2>/tmp/cliff.err)"; then
+            echo "::error::lane git-cliff --bumped-version failed for ${DIR}:"
+            sed 's/^/  /' /tmp/cliff.err >&2 || true
+            exit 1
+          fi
+          if [ -z "$NEXT" ]; then
+            echo "::error::lane git-cliff returned an empty version for ${DIR}"
+            exit 1
+          fi
+          # The lane must never produce anything but its own prefixed semver.
+          case "$NEXT" in
+            "$DIR"/v[0-9]*) : ;;
+            *)
+              echo "::error::lane compute for '${DIR}' returned '${NEXT}' (not ${DIR}/vX.Y.Z); refusing"
+              exit 1 ;;
+          esac
+          # Release boolean, lane-scoped: `git describe --match` is a
+          # WHOLE-NAME glob, so the root's v* tags can never satisfy it.
+          #
+          # Publication is a resumable state machine, not a boolean: a prior
+          # run can have created the tag and then died before the GitHub
+          # Release (transient API failure). On rerun, NEXT == LATEST would
+          # read as "nothing to do" and the missing Release could never be
+          # repaired — and moving/re-cutting the tag is forbidden (Go module
+          # versions are immutable once published). So: publish when a new
+          # version is warranted, AND when the computed version's tag already
+          # sits at THIS commit but its GitHub Release is missing (finalize).
+          LATEST="$(git describe --tags --abbrev=0 --match "${DIR}/v[0-9]*" 2>/dev/null || echo "")"
+          PUBLISH=true
+          FINALIZE=false
+          if [ "$NEXT" = "$LATEST" ]; then
+            PUBLISH=false
+            TAG_SHA="$(git rev-list -n1 "$NEXT" 2>/dev/null || echo "")"
+            if [ "$TAG_SHA" = "$GITHUB_SHA" ]; then
+              # Tag exists at this very commit: finalize if the Release is
+              # missing (partial prior run); no-op if it exists.
+              FINALIZE=true
+              echo "::notice::lane ${DIR}: tag ${NEXT} already at this commit — finalize mode (repair a missing GitHub Release only)"
+            else
+              echo "::notice::lane ${DIR}: no release warranted (at ${LATEST})"
+            fi
+          fi
+          if [ "$PUBLISH" = "true" ] || [ "$FINALIZE" = "true" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "finalize=$FINALIZE" >> "$GITHUB_OUTPUT"
+          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Lane ${DIR}: version=${NEXT} publish=${PUBLISH} finalize=${FINALIZE} (latest lane tag: ${LATEST:-<none>})"
+
+      - name: Verify lane module path
+        if: ${{ steps.lane.outputs.release == 'true' }}
+        env:
+          DIR: ${{ matrix.dir }}
+          VERSION: ${{ steps.lane.outputs.version }}
+        run: |
+          # The nested module's path must be exactly
+          # github.com/<owner>/<repo>/<dir> (+ /vN for major >= 2, Go semantic
+          # import versioning — the root job's check, extended with the exact
+          # path assertion: a copy-pasted module directive would mint a tag
+          # the Go proxy can never serve for this import path.
+          modpath=$(awk '$1=="module"{print $2; exit}' "$DIR/go.mod")
+          if [ -z "$modpath" ]; then
+            echo "::error::no module directive found in ${DIR}/go.mod"
+            exit 1
+          fi
+          ver="${VERSION#"$DIR"/v}"
+          major="${ver%%.*}"
+          expected="github.com/${GITHUB_REPOSITORY}/${DIR}"
+          case "$major" in
+            '' | *[!0-9]*)
+              echo "::notice::'$VERSION' has no numeric major — applying the base-path rule only" ;;
+            *)
+              if [ "$major" -ge 2 ]; then
+                expected="${expected}/v${major}"
+              fi ;;
+          esac
+          if [ "$modpath" != "$expected" ]; then
+            echo "::error::${DIR}/go.mod module path '$modpath' must be '$expected' to release ${VERSION} (nested Go module lane). Fix the module directive (and internal imports for a /vN major), then re-release."
+            exit 1
+          fi
+          echo "ok: module path '$modpath' matches lane ${DIR} ($VERSION)"
+
+      - name: Tag + GitHub Release (lane)
+        if: ${{ steps.lane.outputs.release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIR: ${{ matrix.dir }}
+          VERSION: ${{ steps.lane.outputs.version }}
+          FINALIZE: ${{ steps.lane.outputs.finalize }}
+        run: |
+          # Lane-scoped notes: same flags as the version compute (probe
+          # state J — lane notes carry lane commits only). In finalize mode
+          # the tag already exists at HEAD, so the lane's commits are no
+          # longer "unreleased" — render the CURRENT (latest tagged) release
+          # instead (probe state K pins that --current sees them).
+          ESC=$(printf '%s' "$DIR" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
+          if [ "$FINALIZE" = "true" ]; then
+            git cliff --current \
+              --tag-pattern "^${ESC}/v[0-9]" \
+              --include-path "${DIR}/**" --strip header > NOTES.md
+          else
+            git cliff --unreleased --tag "$VERSION" \
+              --tag-pattern "^${ESC}/v[0-9]" \
+              --include-path "${DIR}/**" --strip header > NOTES.md
+          fi
+          # Tag ref via the git data API pinned to the trigger commit, with
+          # the exists-at-different-SHA refuse guard (mirrors the root go
+          # job; slash tags are ordinary multi-segment refs).
+          if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
+            if [ "$EXISTING" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag ${VERSION} exists at ${EXISTING}, not ${GITHUB_SHA}; refusing."
+              exit 1
+            fi
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
+          fi
+          gh release view "$VERSION" >/dev/null 2>&1 || gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md

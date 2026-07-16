@@ -27,6 +27,21 @@
 #   7. Tag-pattern anchoring: a prefixed component tag (yamlenv/v9.9.9) is
 #      invisible to the root version base — tag_pattern is a regex, and the
 #      pre-2026-07 unanchored pattern let such a tag hijack --bumped-version.
+#   8. Nested-module release lanes (states H/I/J/K): lane commits must not
+#      count toward the root bump — the synced config cannot know per-repo
+#      lane dirs, so the release pipeline excludes them via CLI
+#      --exclude-path (which MERGES with the config exclude_paths), and
+#      passes --tag-pattern '^v[0-9]' explicitly so the root version string
+#      stays lane-clean even under a stale UNANCHORED consumer config (the
+#      same explicit override now also ships in actions/git-cliff-version,
+#      covering orphaned lane tags after a lane dir is deleted); a tagless
+#      repo with lanes falls back to initial_tag, never empty (H4); the
+#      nested lane computes from its own <dir>/vX.Y.Z tag universe with
+#      first-release bootstrap via GIT_CLIFF__BUMP__INITIAL_TAG; notes are
+#      cross-lane clean in both directions; and finalize-mode --current
+#      rendering at a tagged HEAD stays lane-scoped (K). The lane discovery
+#      and classification SHELL semantics are pinned separately by
+#      scripts/test-lane-semantics.sh.
 #
 # Runs in the ci repo's `scripts` CI job (opt-in by file presence), so a
 # Renovate bump of the git-cliff pin re-verifies all of the above against the
@@ -163,5 +178,100 @@ assert_eq "$(bump "$B")" "v1.0.0" "F: bootstrap falls back to [bump].initial_tag
 git -C "$R" tag yamlenv/v9.9.9
 c src/main.go "fix: real fix with component tag present"
 assert_eq "$(bump "$R")" "v1.1.3" "G: prefixed component tag invisible to root version base"
+
+# ── Nested-module release lanes (the release.yaml go-nested contract) ───────
+# A lane repo: root module + one nested module dir ("yamlenv"), each with its
+# own tag universe. These states pin exactly the invocations release.yaml
+# uses — root recompute, lane compute, and both notes renders.
+L="$WORK/lanes"
+mkdir -p "$L"
+git -C "$L" init -q -b main
+git -C "$L" config user.email probe@ci.local
+git -C "$L" config user.name probe
+git -C "$L" config commit.gpgsign false
+lc() { # path message (lane repo commit)
+  mkdir -p "$L/$(dirname "$1")"
+  echo "x$RANDOM" >>"$L/$1"
+  git -C "$L" add -A
+  git -C "$L" commit -qm "$2"
+}
+lane_root_bump() { (cd "$L" && "$CLIFF" --config "$CFG" --unreleased --bumped-version --tag-pattern '^v[0-9]' --exclude-path 'yamlenv/**' 2>/dev/null); }
+lane_bump() { (cd "$L" && GIT_CLIFF__BUMP__INITIAL_TAG='yamlenv/v1.0.0' "$CLIFF" --config "$CFG" --unreleased --bumped-version --tag-pattern '^yamlenv/v[0-9]' --include-path 'yamlenv/**' 2>/dev/null); }
+
+# ── State H: lane commits never bump the root lane ──────────────────────────
+lc src/main.go "feat: initial"
+git -C "$L" tag v1.0.0
+git -C "$L" tag yamlenv/v1.0.0 # co-located: one push released both lanes
+lc yamlenv/y.go "feat: lane-only feature"
+assert_eq "$(lane_root_bump)" "v1.0.0" "H1: lane-only commits leave root at latest (release=false analog)"
+lc src/main.go "fix: root fix"
+assert_eq "$(lane_root_bump)" "v1.0.1" "H2: root bump ignores the lane feat (patch, not minor)"
+# Stale-config defense: under a deliberately UNANCHORED config (the
+# pre-2026-07 pattern), the explicit CLI --tag-pattern must still keep the
+# root version string lane-clean.
+sed 's/^tag_pattern = "\^v\[0-9\]"/tag_pattern = "v[0-9].*"/' "$CFG" >"$WORK/cliff-unanchored.toml"
+UNANCH="$(cd "$L" && "$CLIFF" --config "$WORK/cliff-unanchored.toml" --unreleased --bumped-version --tag-pattern '^v[0-9]' --exclude-path 'yamlenv/**' 2>/dev/null)"
+assert_eq "$UNANCH" "v1.0.1" "H3: CLI --tag-pattern overrides an unanchored stale config"
+
+# ── State I: nested lane computes from its own tag universe ──────────────────
+assert_eq "$(lane_bump)" "yamlenv/v1.1.0" "I1: lane bumps minor from its own tag; root commits invisible"
+git -C "$L" tag yamlenv/v1.1.0
+lc src/main.go "feat: root-only feature"
+assert_eq "$(lane_bump)" "yamlenv/v1.1.0" "I2: root-only commits leave lane at latest (release=false analog)"
+LB="$WORK/lane-boot"
+mkdir -p "$LB"
+git -C "$LB" init -q -b main
+git -C "$LB" config user.email probe@ci.local
+git -C "$LB" config user.name probe
+git -C "$LB" config commit.gpgsign false
+mkdir -p "$LB/src" "$LB/yamlenv"
+echo x >"$LB/src/main.go"
+git -C "$LB" add -A
+git -C "$LB" commit -qm "feat: initial"
+git -C "$LB" tag v1.0.0
+echo y >"$LB/yamlenv/y.go"
+git -C "$LB" add -A
+git -C "$LB" commit -qm "feat: introduce nested module"
+BOOT="$(cd "$LB" && GIT_CLIFF__BUMP__INITIAL_TAG='yamlenv/v1.0.0' "$CLIFF" --config "$CFG" --unreleased --bumped-version --tag-pattern '^yamlenv/v[0-9]' --include-path 'yamlenv/**' 2>/dev/null)"
+assert_eq "$BOOT" "yamlenv/v1.0.0" "I3: lane bootstrap via GIT_CLIFF__BUMP__INITIAL_TAG (no lane tag yet)"
+# H4 (root recompute in a repo with NO tags at all, lane commits only): must
+# fall back to the config initial_tag with exit 0, never emit empty/fail —
+# the release.yaml recompute step treats empty output as a hard error, so
+# this pins that the shape cannot produce it.
+NOTAG="$WORK/notag"
+mkdir -p "$NOTAG/yamlenv"
+git -C "$NOTAG" init -q -b main
+git -C "$NOTAG" config user.email probe@ci.local
+git -C "$NOTAG" config user.name probe
+git -C "$NOTAG" config commit.gpgsign false
+echo y >"$NOTAG/yamlenv/y.go"
+git -C "$NOTAG" add -A
+git -C "$NOTAG" commit -qm "feat: introduce lane in tagless repo"
+NOTAG_ROOT="$(cd "$NOTAG" && "$CLIFF" --config "$CFG" --unreleased --bumped-version --tag-pattern '^v[0-9]' --exclude-path 'yamlenv/**' 2>/dev/null)"
+assert_eq "$NOTAG_ROOT" "v1.0.0" "H4: tagless repo with lanes falls back to initial_tag (never empty)"
+
+# ── State J: notes are cross-lane clean, config excludes still merged ───────
+lc yamlenv/y.go "feat: lane feature for notes"
+lc src/main.go "fix: root fix for notes"
+lc README.md "fix: readme-only edit for notes"
+LNOTES="$(cd "$L" && "$CLIFF" --config "$CFG" --unreleased --tag 'yamlenv/v9.9.9' --tag-pattern '^yamlenv/v[0-9]' --include-path 'yamlenv/**' --strip header 2>/dev/null)"
+echo "$LNOTES" | grep -q "Lane feature for notes" || fail "J: lane notes missing the lane commit"
+echo "$LNOTES" | grep -q "Root fix for notes" && fail "J: lane notes leaked a root commit"
+RNOTES="$(cd "$L" && "$CLIFF" --config "$CFG" --unreleased --tag 'v9.9.9' --tag-pattern '^v[0-9]' --exclude-path 'yamlenv/**' --strip header 2>/dev/null)"
+echo "$RNOTES" | grep -q "Root fix for notes" || fail "J: root notes missing the root commit"
+echo "$RNOTES" | grep -q "Lane feature for notes" && fail "J: root notes leaked a lane commit"
+echo "$RNOTES" | grep -q "Readme-only edit" && fail "J: config exclude_paths not merged under CLI path flags"
+echo "ok: J notes cross-lane hygiene (lane/root separation + config excludes merged)"
+
+# ── State K: finalize-mode rendering (--current at a tagged HEAD) ────────────
+# After a partial lane release (tag created, GitHub Release creation failed),
+# the rerun repairs the Release. At that point the lane's commits are no
+# longer "unreleased", so the finalize path renders the CURRENT release with
+# the same lane scoping; this pins that --current sees the tagged commits.
+git -C "$L" tag yamlenv/v9.9.9 # the notes-round commits become the current lane release
+KNOTES="$(cd "$L" && "$CLIFF" --config "$CFG" --current --tag-pattern '^yamlenv/v[0-9]' --include-path 'yamlenv/**' --strip header 2>/dev/null)"
+echo "$KNOTES" | grep -q "Lane feature for notes" || fail "K: --current finalize render missing the lane commit"
+echo "$KNOTES" | grep -q "Root fix for notes" && fail "K: --current finalize render leaked a root commit"
+echo "ok: K finalize render (--current at tagged HEAD, lane-scoped)"
 
 echo "PASS: git-cliff $VERSION semantics match the fleet release-gate contract"

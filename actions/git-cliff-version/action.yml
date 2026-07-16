@@ -40,7 +40,14 @@ runs:
         # itself (no unreleased commits -> release=false) and bumps past
         # existing tags correctly when real commits are pending. Bootstrap
         # (no tags) still falls back to [bump].initial_tag.
-        if ! NEXT="$(git cliff --unreleased --bumped-version 2>/tmp/cliff.err)"; then
+        # --tag-pattern '^v[0-9]' is passed explicitly (CLI overrides config)
+        # so the ROOT version universe never depends on the consumer's synced
+        # cliff.toml being current: under a stale UNANCHORED config, a
+        # prefixed tag (a nested-module lane tag like yamlenv/v1.0.0, even an
+        # orphaned one left behind after a lane dir was deleted) would hijack
+        # --bumped-version into returning a lane-prefixed "root" version.
+        # Probe state H3 in cplieger/ci pins the override semantics.
+        if ! NEXT="$(git cliff --unreleased --bumped-version --tag-pattern '^v[0-9]' 2>/tmp/cliff.err)"; then
           echo "::error::git-cliff --bumped-version failed:"
           sed 's/^/  /' /tmp/cliff.err >&2 || true
           exit 1
