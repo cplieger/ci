@@ -24,6 +24,9 @@
 #   5. Bootstrap: no tags at all falls back to [bump].initial_tag.
 #   6. Section ordering: the <!-- N --> sort prefixes render Added before
 #      Fixed before Security before Dependencies, with no comment residue.
+#   7. Tag-pattern anchoring: a prefixed component tag (yamlenv/v9.9.9) is
+#      invisible to the root version base — tag_pattern is a regex, and the
+#      pre-2026-07 unanchored pattern let such a tag hijack --bumped-version.
 #
 # Runs in the ci repo's `scripts` CI job (opt-in by file presence), so a
 # Renovate bump of the git-cliff pin re-verifies all of the above against the
@@ -150,5 +153,15 @@ echo x >"$B/main.go"
 git -C "$B" add -A
 git -C "$B" commit -qm "feat: initial"
 assert_eq "$(bump "$B")" "v1.0.0" "F: bootstrap falls back to [bump].initial_tag"
+
+# ── State G: prefixed component tag must not poison the version base ────────
+# tag_pattern is a REGEX; unanchored ("v[0-9].*") it also matches a prefixed
+# tag like "yamlenv/v9.9.9" (a nested Go module / component release), and
+# --bumped-version then derives the ROOT next version from it (observed:
+# "yamlenv/v9.9.10"). The anchored pattern ("^v[0-9]") must keep such tags
+# invisible: the root lane bumps from its own latest vX.Y.Z only.
+git -C "$R" tag yamlenv/v9.9.9
+c src/main.go "fix: real fix with component tag present"
+assert_eq "$(bump "$R")" "v1.1.3" "G: prefixed component tag invisible to root version base"
 
 echo "PASS: git-cliff $VERSION semantics match the fleet release-gate contract"
