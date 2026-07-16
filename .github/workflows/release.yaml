@@ -515,11 +515,19 @@ jobs:
           # config, but this step must not depend on every consumer's
           # cliff.toml being current (an unanchored stale copy would let a
           # lane tag hijack the version string — probe state G's hazard).
-          # renovate: datasource=github-releases depName=orhun/git-cliff
+          # Version + tarball sha256 pinned as a pair; Renovate maintains both
+          # via the custom.git-cliff datasource (GitHub release-asset digest).
+          # Fail-closed: a tarball that does not match the reviewed pin never
+          # installs — the binary runs against every repo's history, and the
+          # checkout already treats it as untrusted (persist-credentials is
+          # false everywhere it runs).
+          # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
-          curl -fsSL --retry 3 \
-            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+          CLIFF_SHA256=9a1263f24e59a2f508c7b3d3283c9dea94a8bf697f96dbc18cc783cac6284546
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/git-cliff.tgz" \
+            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
           ARGS=(--tag-pattern '^v[0-9]')
           while IFS= read -r d; do
             [ -z "$d" ] && continue
@@ -742,11 +750,19 @@ jobs:
         run: |
           # Install git-cliff (version compute already happened in detect, but
           # we need the binary here to render the release notes).
-          # renovate: datasource=github-releases depName=orhun/git-cliff
+          # Version + tarball sha256 pinned as a pair; Renovate maintains both
+          # via the custom.git-cliff datasource (GitHub release-asset digest).
+          # Fail-closed: a tarball that does not match the reviewed pin never
+          # installs — the binary runs against every repo's history, and the
+          # checkout already treats it as untrusted (persist-credentials is
+          # false everywhere it runs).
+          # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
-          curl -fsSL --retry 3 \
-            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+          CLIFF_SHA256=9a1263f24e59a2f508c7b3d3283c9dea94a8bf697f96dbc18cc783cac6284546
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/git-cliff.tgz" \
+            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
           # Lane-aware notes: when nested Go module lanes exist, scope the
           # root notes to the root lane (root tag universe + lane commits
           # excluded), or lane commits leak into the root release's notes
@@ -859,11 +875,19 @@ jobs:
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
           FINALIZE: ${{ needs.detect.outputs.finalize }}
         run: |
-          # renovate: datasource=github-releases depName=orhun/git-cliff
+          # Version + tarball sha256 pinned as a pair; Renovate maintains both
+          # via the custom.git-cliff datasource (GitHub release-asset digest).
+          # Fail-closed: a tarball that does not match the reviewed pin never
+          # installs — the binary runs against every repo's history, and the
+          # checkout already treats it as untrusted (persist-credentials is
+          # false everywhere it runs).
+          # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
-          curl -fsSL --retry 3 \
-            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+          CLIFF_SHA256=9a1263f24e59a2f508c7b3d3283c9dea94a8bf697f96dbc18cc783cac6284546
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/git-cliff.tgz" \
+            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
           # Lane-aware notes when nested Go module lanes exist (see the go
           # job's identical block; probe state J).
           LANE_ARGS=()
@@ -1003,11 +1027,19 @@ jobs:
         env:
           DIR: ${{ matrix.dir }}
         run: |
-          # renovate: datasource=github-releases depName=orhun/git-cliff
+          # Version + tarball sha256 pinned as a pair; Renovate maintains both
+          # via the custom.git-cliff datasource (GitHub release-asset digest).
+          # Fail-closed: a tarball that does not match the reviewed pin never
+          # installs — the binary runs against every repo's history, and the
+          # checkout already treats it as untrusted (persist-credentials is
+          # false everywhere it runs).
+          # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
           CLIFF_VERSION=v2.13.1
-          curl -fsSL --retry 3 \
-            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar xz -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+          CLIFF_SHA256=9a1263f24e59a2f508c7b3d3283c9dea94a8bf697f96dbc18cc783cac6284546
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/git-cliff.tgz" \
+            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
           # Lane scoping (probe state I): the lane's tag universe via
           # --tag-pattern '^<dir>/v[0-9]' (dir regex-escaped), the lane's
           # commit window via --include-path '<dir>/**', and first-release

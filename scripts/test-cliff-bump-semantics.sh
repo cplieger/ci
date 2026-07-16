@@ -62,26 +62,48 @@ fail() {
   exit 1
 }
 
-# ── Pin consistency: every CLIFF_VERSION in the repo must agree ─────────────
+# ── Pin consistency: every CLIFF_VERSION and CLIFF_SHA256 must agree ────────
+# The version and the tarball sha256 are pinned as a pair at every install
+# site (Renovate maintains both via the custom.git-cliff datasource); a site
+# whose version or digest drifts from the others is a review escape.
+PIN_FILES=(
+  "$ROOT/actions/git-cliff-version/action.yml"
+  "$ROOT/.github/workflows/release.yaml"
+  "$ROOT/.github/workflows/docker-release.yaml"
+  "$ROOT/.github/workflows/self-release.yaml"
+)
 mapfile -t pins < <(
-  grep -rhoE 'CLIFF_VERSION[=:] *"?v[0-9][0-9.]*' \
-    "$ROOT/actions/git-cliff-version/action.yml" \
-    "$ROOT/.github/workflows/release.yaml" \
-    "$ROOT/.github/workflows/docker-release.yaml" \
-    "$ROOT/.github/workflows/self-release.yaml" \
+  grep -rhoE 'CLIFF_VERSION[=:] *"?v[0-9][0-9.]*' "${PIN_FILES[@]}" \
     | grep -oE 'v[0-9][0-9.]*' | sort -u
 )
 [ "${#pins[@]}" -eq 1 ] || fail "CLIFF_VERSION pins disagree across workflows/action: ${pins[*]}"
 VERSION="${pins[0]}"
-echo "pinned git-cliff: $VERSION (consistent across all call sites)"
+mapfile -t shas < <(
+  grep -rhoE 'CLIFF_SHA256[=:] *"?[a-f0-9]{64}' "${PIN_FILES[@]}" \
+    | grep -oE '[a-f0-9]{64}' | sort -u
+)
+[ "${#shas[@]}" -eq 1 ] || fail "CLIFF_SHA256 pins disagree across workflows/action: ${shas[*]}"
+SHA256="${shas[0]}"
+# Pairing invariant: every version pin must have a well-formed sha pin beside
+# it. Uniqueness alone cannot see a site whose sha line is malformed or
+# missing — a 63-hex-char typo simply falls out of the {64} scan and the
+# remaining sites still "agree" (found by this probe's own negative test).
+N_VER=$(grep -rhoE 'CLIFF_VERSION[=:] *"?v[0-9][0-9.]*' "${PIN_FILES[@]}" | wc -l)
+N_SHA=$(grep -rhoE 'CLIFF_SHA256[=:] *"?[a-f0-9]{64}' "${PIN_FILES[@]}" | wc -l)
+[ "$N_VER" -eq "$N_SHA" ] || fail "CLIFF pin pairing broken: $N_VER version pins vs $N_SHA well-formed sha pins (a site's CLIFF_SHA256 is missing or malformed)"
+echo "pinned git-cliff: $VERSION / sha256 ${SHA256:0:12}… (consistent + paired across all $N_VER call sites)"
 
 # ── Binary: reuse CLIFF_BIN if provided, else download the pinned release ───
+# The download verifies the SAME pinned digest the workflows enforce, so a
+# Renovate bump whose digest does not match the actual asset fails here, in
+# this repo's own PR gate, before it can reach any consumer.
 if [ -n "${CLIFF_BIN:-}" ]; then
   CLIFF="$CLIFF_BIN"
 else
-  curl -fsSL --retry 3 \
-    "https://github.com/orhun/git-cliff/releases/download/${VERSION}/git-cliff-${VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" \
-    | tar xz -C "$WORK" --strip-components=1 "git-cliff-${VERSION#v}/git-cliff"
+  curl -fsSL --retry 3 -o "$WORK/git-cliff.tgz" \
+    "https://github.com/orhun/git-cliff/releases/download/${VERSION}/git-cliff-${VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
+  echo "${SHA256}  ${WORK}/git-cliff.tgz" | sha256sum -c -
+  tar xzf "$WORK/git-cliff.tgz" -C "$WORK" --strip-components=1 "git-cliff-${VERSION#v}/git-cliff"
   CLIFF="$WORK/git-cliff"
 fi
 "$CLIFF" --version >/dev/null || fail "git-cliff binary unusable"
