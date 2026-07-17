@@ -712,7 +712,25 @@ jobs:
     # partial run can repair the Release (see detect's finalize step); the
     # release==false + finalize==true combination changes only the notes
     # rendering inside the Tag + GitHub Release step.
-    if: ${{ needs.detect.outputs.type == 'go' && needs.detect.outputs.root_changed == 'true' && (needs.detect.outputs.release == 'true' || needs.detect.outputs.finalize == 'true') }}
+    #
+    # A SUBPACKAGE-only publish also needs this job, not just root changes:
+    # the subpackage lane shares the ROOT version but owns no tagging, so a
+    # web-only release that skipped this job would publish npm/JSR at a
+    # version with no root tag. The NEXT subpackage-only release then
+    # recomputes the SAME version from the stale tag and its registry
+    # version-exists guards silently skip both publishes — the lane wedges
+    # green-but-unpublishable until a root change lands, which would then tag
+    # the burned version at a DIFFERENT commit than the registries shipped.
+    # Observed: web-terminal-engine npm/JSR 2.7.0 published from a web-only
+    # feat push with no v2.7.0 tag or Release (2026-07-16). Every step here is
+    # already idempotent and content-safe for a root-unchanged run (module-path
+    # check reads go.mod, tag/Release creation is guarded), and the subpackage
+    # job is needs-ordered after this one, restoring the tag-before-publish
+    # invariant its own comment documents. The ts/docker analogs of this seam
+    # are left as-is deliberately: no ts- or docker-type repo carries a
+    # subpackage today, and widening the docker gate would rebuild images on
+    # subpackage-only pushes.
+    if: ${{ needs.detect.outputs.type == 'go' && (needs.detect.outputs.root_changed == 'true' || needs.detect.outputs.subpackages_to_publish != '[]') && (needs.detect.outputs.release == 'true' || needs.detect.outputs.finalize == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
