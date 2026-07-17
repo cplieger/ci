@@ -110,7 +110,7 @@ env:
   # (v2→v3 flipped sign-blob defaults and broke release SBOM signing) — majors
   # are not auto-merged; read the changelog before approving.
   # renovate: datasource=github-releases depName=sigstore/cosign
-  COSIGN_VERSION: v3.1.1
+  COSIGN_VERSION: v3.1.2
   # renovate: datasource=github-releases depName=aquasecurity/trivy
   TRIVY_VERSION: v0.72.0
   # syft for the no-change publish gate, pinned to the version bundled by the
