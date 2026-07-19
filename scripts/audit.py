@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Cross-repo governance audit for the cplieger account.
 
-Polls every (non-archived) repo for its full settings surface and reports a
+Polls every non-archived, non-fork repo for its full settings surface and
+reports a
 compliance report against the documented standard in
 .kiro/steering/repo-governance.md, split into HARD failures and soft WARNINGS,
 with N/A handling where a setting cannot apply (e.g. GitHub Advanced Security
@@ -19,7 +20,12 @@ workflows cannot approve PRs), vulnerability reporting, secret/code scanning,
 stray .github/dependabot.yml (Renovate owns dependency updates), CI wiring,
 coverage-workflow presence on Go/TS repos, Docker Hub dual-publish secrets on
 image repos, Renovate preset, license (present AND GPL-3.0), default branch,
-description (presence + <=100 chars), topics (at least 2), and the per-repo
+description (presence + <=100 chars), topics (at least 2), the
+dependency-graph "Used by counter" package on public repos (it is pinned to
+one package and does NOT follow Go major-version module-path bumps or module
+renames — no REST/GraphQL surface exposes the Settings -> Advanced Security
+selection, so it is read from the public dependents page and the fix itself
+stays a manual dropdown click), and the per-repo
 deploy-trigger webhook that reaches the self-hosted orchestrator — presence,
 signing secret, exact event set (push for the infra repos, release everywhere
 else), JSON payload, TLS verification on, and exactly one hook (only when
@@ -71,6 +77,8 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 OWNER = "cplieger"
@@ -229,6 +237,64 @@ def file_text(repo, path):
         return base64.b64decode("".join(r.stdout.split())).decode("utf-8", "replace")
     except (ValueError, UnicodeError):
         return ""
+
+
+AUDIT_UA = "Mozilla/5.0 (compatible; cplieger-governance-audit)"
+
+
+def used_by_package_scrape(name):
+    """The package a repo's "Used by" counter currently represents, plus the
+    package set the counter could be switched to.
+
+    No REST or GraphQL surface exposes the "Used by counter" selection
+    (Settings -> Advanced Security; verified absent 2026-07), so both are read
+    from the public dependents page /<owner>/<repo>/network/dependents:
+
+    - current: the og:title meta names the selected package ('Network
+      Dependents · owner/repo · <package> repositories'; no third segment when
+      the repo publishes no package). og:title is the social-embed surface,
+      far more redesign-stable than the page markup.
+    - selectable: the package-switcher menu anchors (?package_id=...). Repos
+      with one package render no menu -> empty set. A Go app's /vN module
+      path is often never indexed at all (nothing imports an app), so the
+      "right" package may not exist to select — the caller must only flag
+      drift the settings dropdown can actually fix.
+
+    Returns (current, selectable, definitive). definitive=False means the
+    page could not be read — skip the check, never infer drift.
+    """
+    url = f"https://github.com/{OWNER}/{name}/network/dependents"
+    req = urllib.request.Request(url, headers={"User-Agent": AUDIT_UA})  # noqa: S310 — fixed https:// URL, host is github.com
+    delay = 5
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 — same fixed https URL
+                body = resp.read(512 * 1024).decode("utf-8", "replace")
+            m = re.search(r'property="og:title" content="Network Dependents '
+                          r'· [^"]+? · (.+?) repositories"', body)
+            names = set()
+            for mm in re.finditer(r'href="/[^"]+/network/dependents\?package_id='
+                                  r'[^"]+"[^>]*>(.*?)</a>', body, re.DOTALL):
+                # anchor bodies may nest tags; reduce to text before judging
+                text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", mm.group(1))).strip()
+                if text and not re.fullmatch(r"[\d,]+ Repositor(?:y|ies)", text):
+                    names.add(text)
+            return (m.group(1) if m else None), sorted(names), True
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None, [], True
+            if attempt < 2 and e.code in (429, 502, 503):
+                time.sleep(delay)
+                delay *= 3
+                continue
+            return None, [], False
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt < 2:
+                time.sleep(delay)
+                delay *= 3
+                continue
+            return None, [], False
+    return None, [], False
 
 
 def collect(meta):
@@ -439,14 +505,41 @@ def collect(meta):
     # package.json means measurable coverage (sync delivers coverage.yml), a
     # root Dockerfile means the release pipeline publishes an image (and, for
     # dual-publish repos, needs the Docker Hub secrets).
+    probe_texts = {}
     for probe_file, key in (("go.mod", "has_gomod"), ("package.json", "has_packagejson"),
                             ("Dockerfile", "has_dockerfile")):
         txt = file_text(name, probe_file)
+        probe_texts[probe_file] = txt
         if txt is None:
             s[key] = None
             s["errors"].append(f"{probe_file} probe unreadable (API)")
         else:
             s[key] = bool(txt)
+
+    # Used-by counter. Expected package = the root go.mod module path (Go
+    # majors move the path, which is exactly the drift being caught), else the
+    # npm package name (catches module/package renames); neither -> N/A. The
+    # current selection comes from the public dependents page (no API — see
+    # used_by_package_scrape). Public repos only: the counter has no audience
+    # on a private repo, and the page needs to be publicly rendered anyway.
+    m = re.search(r"^module\s+(\S+)", probe_texts.get("go.mod") or "", re.MULTILINE)
+    s["go_module"] = m.group(1) if m else None
+    s["expected_package"] = s["go_module"]
+    if not s["expected_package"] and probe_texts.get("package.json"):
+        try:
+            s["expected_package"] = (json.loads(probe_texts["package.json"]) or {}).get("name")
+        except json.JSONDecodeError:
+            pass
+    s["used_by_package"] = None
+    s["used_by_selectable"] = []
+    s["used_by_attempted"] = False
+    s["used_by_readable"] = False
+    if s["expected_package"] and not s["private"]:
+        s["used_by_attempted"] = True
+        pkg, selectable, definitive = used_by_package_scrape(name)
+        s["used_by_readable"] = definitive
+        s["used_by_package"] = pkg
+        s["used_by_selectable"] = selectable
 
     # A committed dependabot.yml enables Dependabot VERSION update PRs, which
     # compete with Renovate (the settings twin of the security-updates check).
@@ -706,6 +799,37 @@ def compliance(s):
             warn.append(f"description {s['desc_len']} chars (>100; Docker Hub short-desc limit)")
         if len(s["topics"]) < 2:
             warn.append(f"{len(s['topics'])} topics (want at least 2)")
+        # Used-by counter package: pinned per repo and never follows a Go
+        # /vN module-path bump or a module rename, so the sidebar keeps
+        # counting the stale package after every major. Only judged when the
+        # dependents page definitively named a package (used_by_package set)
+        # AND the expected package is actually in the switcher menu — a Go
+        # app's new /vN path is often never indexed (nothing imports an app),
+        # and warning about a package the dropdown cannot select is
+        # unactionable noise. An unreadable page is silently skipped — a
+        # scrape wobble must never manufacture drift, and this cosmetic check
+        # is not worth an [error]-tier red run.
+        exp = (s.get("expected_package") or "").lstrip("@")
+        selectable = {p.lstrip("@") for p in s.get("used_by_selectable") or []}
+        if (s.get("used_by_package") and exp
+                and s["used_by_package"].lstrip("@") != exp
+                and exp in selectable):
+            warn.append(f"used-by counter shows '{s['used_by_package']}' "
+                        f"(want '{s['expected_package']}'; no API — fix by "
+                        "hand: Settings -> Advanced Security -> Used by counter)")
+        # Module-path standard (go.md): a Go module lives at
+        # github.com/<owner>/<repo>, plus /vN once majors move. Anything else
+        # is unfetchable by Go tooling (module path must match the repo URL)
+        # and indexes a phantom dependency-graph package that the used-by
+        # counter then represents forever (the cert-watcher / age-decrypt /
+        # fclones-wrapper / vibecli class, caught 2026-07).
+        if s.get("go_module"):
+            want = f"github.com/{OWNER}/{s['name']}"
+            if not re.fullmatch(re.escape(want) + r"(/v\d+)?", s["go_module"]):
+                warn.append(f"go.mod module '{s['go_module']}' is not the repo "
+                            f"path (want '{want}' [+/vN]; unfetchable by Go "
+                            "tooling and indexes a phantom dependency-graph "
+                            "package)")
 
     # Deploy-trigger webhook. Enforced only when the host is configured AND this
     # repo's hooks were readable (see collect); an unreadable token is handled as
@@ -771,11 +895,16 @@ def main():
     args = ap.parse_args()
 
     r, definitive = gh_retry("repo", "list", OWNER, "--limit", "300",
-                             "--json", "name,isArchived,visibility")
+                             "--json", "name,isArchived,visibility,isFork")
     if r.returncode != 0 or not definitive:
         sys.stderr.write(f"gh repo list failed: {r.stderr}\n")
         sys.exit(2)
-    metas = [m for m in json.loads(r.stdout) if not m["isArchived"]]
+    all_metas = json.loads(r.stdout)
+    # Forks exist to carry upstream PRs: they keep upstream's merge model,
+    # branch protection, and go.mod module path, so the governance standard
+    # does not apply. Skipped with a visible note, never audited.
+    forks = sorted(m["name"] for m in all_metas if m.get("isFork") and not m["isArchived"])
+    metas = [m for m in all_metas if not m["isArchived"] and not m.get("isFork")]
     if args.visibility != "all":
         metas = [m for m in metas if (m.get("visibility") or "").lower() == args.visibility]
     if args.repo:
@@ -783,7 +912,7 @@ def main():
         known = {m["name"] for m in metas}
         unknown = sorted(want - known)
         if unknown:
-            sys.stderr.write(f"error: unknown (or archived/filtered) repo(s): "
+            sys.stderr.write(f"error: unknown (or archived/fork/filtered) repo(s): "
                              f"{', '.join(unknown)}\n")
             sys.exit(2)
         metas = [m for m in metas if m["name"] in want]
@@ -835,12 +964,22 @@ def main():
     # repo's hooks were readable, the token is under-scoped for the hook endpoint
     # (needs classic 'repo' or admin:repo_hook) — surface it instead of silently
     # skipping. When the host is unset, the check does not run at all.
+    if forks:
+        print(f"Note: {len(forks)} fork(s) skipped (upstream governance applies): "
+              f"{', '.join(forks)}\n")
     if not WEBHOOK_HOST:
         print("Note: deploy-trigger webhook check skipped (AUDIT_WEBHOOK_HOST unset).\n")
     elif not any(s["webhook_readable"] for s in settings):
         print("WARNING: AUDIT_WEBHOOK_HOST is set but no repo's webhooks were "
               "readable; the deploy-trigger webhook check was skipped. The audit "
               "token needs the classic 'repo' scope (or admin:repo_hook).\n")
+    # Used-by counter check status: when EVERY attempted dependents-page read
+    # failed, github.com HTML is unreachable from this network (throttled or
+    # blocked) — say so once instead of silently skipping fleet-wide.
+    attempted = [s for s in settings if s.get("used_by_attempted")]
+    if attempted and not any(s["used_by_readable"] for s in attempted):
+        print("Note: used-by counter check skipped (github.com dependents "
+              "pages unreadable from this network).\n")
     for s in settings:
         hard, warn, accepted = compliance(s)
         errors = s.get("errors") or []
