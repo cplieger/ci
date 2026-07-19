@@ -529,7 +529,9 @@ def collect(meta):
         try:
             s["expected_package"] = (json.loads(probe_texts["package.json"]) or {}).get("name")
         except json.JSONDecodeError:
-            pass
+            # malformed package.json: no npm name to expect; the used-by
+            # check skips this repo (expected_package stays None)
+            s["expected_package"] = None
     s["used_by_package"] = None
     s["used_by_selectable"] = []
     s["used_by_attempted"] = False
