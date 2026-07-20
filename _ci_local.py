@@ -796,6 +796,27 @@ def rewrite_gitleaks_download(cmd: str) -> str:
 _GITLEAKS_DIR_RE = re.compile(r'((?:\S+/)?gitleaks)\s+dir\b')
 _GITLEAKS_CONFIG_FLAG_RE = re.compile(r'(?:^|\s)(?:-c|--config)(?:=|\s)')
 
+# Relative --report-path values (gitleaks git/dir report writes). Absolute
+# (/...) and variable ($...) paths are left alone.
+_REPORT_PATH_RE = re.compile(r'--report-path[ =](["\']?)(?![/$])([^\s"\']+)\1')
+
+
+def rewrite_report_artifacts(cmd: str) -> str:
+    """Redirect relative report-file writes into $RUNNER_TEMP.
+
+    In CI these report files (security-scan's `--report-path
+    gitleaks-history.sarif`) land in a throwaway checkout and feed an
+    upload-sarif/upload-artifact step that ci-local SKIPs. Locally the same
+    write would land in the real working tree — and a leftover
+    gitleaks-history.sarif then false-fails every later `gitleaks dir`
+    working-tree scan (the SARIF quotes historical secret matches; observed
+    on envx and docker-keepalived). $RUNNER_TEMP always exists locally
+    (apply_runner_env) and is cleaned up at exit.
+    """
+    return _REPORT_PATH_RE.sub(
+        lambda m: f'--report-path "${{RUNNER_TEMP}}/{m.group(2)}"', cmd
+    )
+
 
 def rewrite_gitleaks_gitignore(cmd: str, cwd: Path) -> str:
     """Allowlist gitignored paths in a `gitleaks dir` run so it matches CI's fileset.
@@ -973,6 +994,7 @@ def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
         cmd = rewrite_gitleaks_download(cmd)
         cmd = rewrite_gitleaks_gitignore(cmd, cwd)
         cmd = rewrite_trivy_gitignore(cmd, cwd)
+        cmd = rewrite_report_artifacts(cmd)
         cmd = rewrite_ci_failures_path(cmd)
 
     if dry_run:
