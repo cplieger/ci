@@ -47,6 +47,7 @@ Special handling:
 import argparse
 import atexit
 import contextlib
+import json
 import os
 import re
 import shlex
@@ -1169,13 +1170,61 @@ def _has_tracked_file(target, *pathspecs):
         return False
 
 
+def _detect_go_nested_dirs(target):
+    """Mirror the meta ci.yaml detect job's nested-Go-module discovery: every
+    tracked `<dir>/go.mod` below the root (git pathspec '*/go.mod' never matches
+    the root go.mod), pruned of vendored/generated trees, and only when the dir
+    has tracked .go files (a sentinel go.mod — e.g. `module web-ignore` — has
+    nothing to validate). Keep the filters in sync with the meta detect step and
+    scripts/test-lane-semantics.sh. Returns a sorted list of dirs; empty when
+    git is unavailable (non-git trees have no tracked files to discover)."""
+    prune = re.compile(r'(^|/)(node_modules|vendor|testdata|static|dist)/')
+    try:
+        out = subprocess.run(
+            ['git', '-C', str(target), 'ls-files', '-z', '--', '*/go.mod'],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    dirs = []
+    for f in out.split('\x00'):
+        if not f.strip():
+            continue
+        if prune.search(f):
+            continue
+        d = os.path.dirname(f)
+        has_go = (
+            subprocess.run(
+                ['git', '-C', str(target), 'ls-files', '-z', '--', f'{d}/*.go'],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            .stdout.replace('\x00', '')
+            .strip()
+        )
+        if has_go:
+            dirs.append(d)
+    return sorted(dirs)
+
+
+_DETECT_CACHE = {}
+
+
 def compute_local_detect(target):
     """Reproduce the meta ci.yaml `detect` job's surface outputs from local file
     presence. ci-local always runs the applicable surfaces (it mirrors CI's
     fail-safe "treat as code change" path; there is no docs-only skip locally).
     File globs (*.py / *.sh / workflows) are checked against git-tracked files so
     a gitignored scratch file can't flip a surface CI's fresh checkout wouldn't
-    see."""
+    see. Memoized per target: it is consulted per job gate, per needs-output
+    resolution, and per matrix expansion, and the nested-module discovery costs
+    a git call per nested go.mod."""
+    cached = _DETECT_CACHE.get(str(target))
+    if cached is not None:
+        return cached
     web = detect_web_dir(target)
     has_dockerfile = (target / 'Dockerfile').is_file()
     has_gomod = (target / 'go.mod').is_file()
@@ -1194,8 +1243,14 @@ def compute_local_detect(target):
             target, '*.sh', '.github/workflows/*.yml', '.github/workflows/*.yaml'
         )
 
-    return {
+    go_nested_dirs = _detect_go_nested_dirs(target)
+
+    det = {
         'run_go': 'true' if has_gomod else 'false',
+        'run_go_nested': 'true' if go_nested_dirs else 'false',
+        # JSON string, matching the CI output shape (consumed via
+        # `fromJSON(needs.detect.outputs.go_nested_dirs)` in the matrix).
+        'go_nested_dirs': json.dumps(go_nested_dirs),
         'run_ts': 'true' if has_jsr else 'false',
         'run_web': 'true' if web else 'false',
         'run_shell': 'true' if has_dockerfile else 'false',
@@ -1204,6 +1259,8 @@ def compute_local_detect(target):
         'run_scripts': 'true' if run_scripts else 'false',
         'web_dir': web or '',
     }
+    _DETECT_CACHE[str(target)] = det
+    return det
 
 
 def job_applies_locally(jobname, target):
@@ -1217,6 +1274,11 @@ def job_applies_locally(jobname, target):
     det = compute_local_detect(target)
     gate_map = {
         'go': det['run_go'],
+        # Nested-module lanes: normally expanded per-dir by the matrix logic
+        # in _expand_job (zero instances when no nested modules exist), so
+        # this entry only fires on the unexpanded-fallback path (an
+        # unresolvable matrix). Exact segment match: 'go-nested' != 'go'.
+        'go-nested': det['run_go_nested'],
         'ts': det['run_ts'],
         'web': det['run_web'],
         'shell': det['run_shell'],
@@ -1264,6 +1326,40 @@ def _expand_job(jobname, job, caller_inputs, target, depth=0, parent_ref=None):
     for a plain inline job that never came from a reusable workflow. `parent_ref`
     is the calling workflow's pinned ref, threaded so a nested local `./` ref can
     be fetched at the same commit when no sibling ci/ checkout exists."""
+    # Single-axis strategy.matrix (the meta go-nested job: `dir:
+    # ${{ fromJSON(needs.detect.outputs.go_nested_dirs) }}`): expand one job
+    # instance per value, substituting `${{ matrix.<axis> }}` textually in the
+    # job's `with:` values — mirroring what CI's matrix does before the
+    # reusable workflow ever sees the inputs. Zero values = zero instances
+    # (the job simply doesn't run, matching CI's run_go_nested gate).
+    # Multi-axis or unresolvable matrices fall through unexpanded; the
+    # job_applies_locally gate then decides (fail-safe, current behavior).
+    matrix = (job.get('strategy') or {}).get('matrix') if isinstance(job, dict) else None
+    if isinstance(matrix, dict) and len(matrix) == 1 and '__matrix_expanded' not in job:
+        axis, spec = next(iter(matrix.items()))
+        values = _resolve_matrix_values(spec, target)
+        if values is not None:
+            out = []
+            for val in values:
+                inst = dict(job)
+                inst.pop('strategy', None)
+                inst['__matrix_expanded'] = True
+                if isinstance(job.get('with'), dict):
+                    inst['with'] = {
+                        k: v.replace(f'${{{{ matrix.{axis} }}}}', val) if isinstance(v, str) else v
+                        for k, v in job['with'].items()
+                    }
+                # Keep the instance name a single path segment (a dir value
+                # can contain '/', which would fabricate surface segments for
+                # job_applies_locally — e.g. a module dir named 'docker').
+                safe = val.replace('/', '~')
+                out.extend(
+                    _expand_job(
+                        f'{jobname}[{safe}]', inst, caller_inputs, target, depth, parent_ref
+                    )
+                )
+            return out
+
     uses = job.get('uses', '')
     if is_reusable_ref(uses) and depth < 6:
         resolved = resolve_reusable_workflow(uses, target, parent_ref=parent_ref)
@@ -1318,6 +1414,28 @@ def expand_reusable_jobs(jobs_dict, target):
     for jobname, job in jobs_dict.items():
         result.extend(_expand_job(jobname, job, None, target, 0))
     return result
+
+
+def _resolve_matrix_values(spec, target):
+    """Resolve a single matrix axis to a list of string values, or None when it
+    cannot be resolved locally. Handles a literal YAML list and the
+    `${{ fromJSON(needs.<job>.outputs.<key>) }}` shape (resolved from
+    compute_local_detect, which stores JSON strings for list outputs)."""
+    if isinstance(spec, list):
+        return [str(v) for v in spec]
+    if isinstance(spec, str):
+        m = re.fullmatch(
+            r'\s*\$\{\{\s*fromJSON\(\s*needs\.\w+\.outputs\.([\w-]+)\s*\)\s*\}\}\s*', spec
+        )
+        if m:
+            raw = compute_local_detect(target).get(m.group(1), '[]')
+            try:
+                vals = json.loads(raw)
+            except (TypeError, ValueError):
+                return None
+            if isinstance(vals, list):
+                return [str(v) for v in vals]
+    return None
 
 
 def _resolve_input_expr(expr, inputs):
@@ -1389,6 +1507,20 @@ def process_reusable_steps(
                 counters['SKIP'] += 1
                 continue
 
+        # A step consuming job-result context (the meta validate job's
+        # `${{ needs.<job>.result }}` aggregation) has no local equivalent:
+        # ci-local sequences the jobs itself and its own summary IS the
+        # aggregate. Running it with stripped (empty) results would
+        # false-fail, so skip it explicitly.
+        step_blob = ' '.join(
+            [str(v) for v in (step.get('env') or {}).values()] + [str(step.get('run', ''))]
+        )
+        if re.search(r'\$\{\{\s*needs\.[\w-]+\.result\s*\}\}', step_blob):
+            tag = gray('SKIP')
+            print(f"  {tag:<7} {name}  (aggregates CI job results; ci-local's summary covers this)")
+            counters['SKIP'] += 1
+            continue
+
         # Build the effective step first: resolve ${{ inputs.* }} / ${{ needs.* }}
         # in `with:` values and working-directory BEFORE classification, so steps
         # like docker/build-push-action receive concrete file/context paths
@@ -1397,6 +1529,20 @@ def process_reusable_steps(
         if isinstance(step.get('with'), dict):
             eff_step['with'] = {
                 k: _resolve_with_value(v, caller_inputs, target) for k, v in step['with'].items()
+            }
+        if isinstance(step.get('env'), dict):
+            # Step `env:` values carry inputs too (the injection-safe pattern:
+            # `SHELLCHECK_PATHS: ${{ inputs.shellcheck-paths }}` in shell-ci's
+            # soft-gate steps). CI substitutes ${{ }} before the process sees
+            # the variable; without this mirror the literal `${{ inputs.X }}`
+            # lands in the env and sends the step script down wrong branches
+            # (observed: shellcheck globbing `${{` as a filename, hadolint
+            # losing its --ignore list). strip_unknown mirrors CI for locally
+            # unresolvable context (secrets.*, github.*): empty string, never
+            # a literal `${{ ... }}`.
+            eff_step['env'] = {
+                k: _resolve_with_value(v, caller_inputs or {}, target, strip_unknown=True)
+                for k, v in step['env'].items()
             }
         if isinstance(step.get('run'), str):
             # CI substitutes ${{ }} before the shell sees it; mirror that for
