@@ -103,7 +103,7 @@ jobs:
       syft_config: ${{ steps.policy.outputs.syft_config }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # No step in this job pushes with checkout-persisted credentials;
           # do not leave the token in .git/config (zizmor: artipacked).
@@ -737,7 +737,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # No step in this job pushes with checkout-persisted credentials;
           # do not leave the token in .git/config (zizmor: artipacked).
@@ -862,7 +862,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # No step in this job pushes with checkout-persisted credentials;
           # do not leave the token in .git/config (zizmor: artipacked).
@@ -1006,7 +1006,7 @@ jobs:
         dir: ${{ fromJSON(needs.detect.outputs.subpackages_to_publish) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # No step in this job pushes with checkout-persisted credentials;
           # do not leave the token in .git/config (zizmor: artipacked).
@@ -1079,7 +1079,7 @@ jobs:
         dir: ${{ fromJSON(needs.detect.outputs.go_modules_to_release) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # No step in this job pushes with checkout-persisted credentials;
           # do not leave the token in .git/config (zizmor: artipacked).

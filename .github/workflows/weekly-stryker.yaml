@@ -121,7 +121,7 @@ jobs:
       # Checkout FIRST (actions/checkout cleans the workspace): brings the
       # sibling-preserving badge publisher bundled with actions/publish-badge.
       - name: Checkout ci (for the badge publisher)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # No step in this job pushes with checkout-persisted credentials;
           # the badge push authenticates via CI_SCHEDULE inside the script.
@@ -268,7 +268,7 @@ jobs:
       GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
     steps:
       - name: Checkout ci (for scripts/)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # No step in this job pushes with checkout-persisted credentials;
           # do not leave the token in .git/config (zizmor: artipacked).
