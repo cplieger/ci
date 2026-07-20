@@ -79,21 +79,13 @@ KNOWN_USES = {
     'gitleaks/gitleaks-action': ('LOCAL', 'gitleaks detect --source . --no-banner'),
     'tj-actions/changed-files': ('SKIP', 'changed-files derivation skipped; full tree assumed'),
     'actions/dependency-review-action': (
-        'SKIP',
-        'PR-only GitHub API; covered locally by govulncheck',
+        'NOLOCAL',
+        'PR-only GitHub dependency graph API; no faithful local equivalent',
     ),
-    'github/codeql-action/init': ('SKIP', 'CodeQL is GitHub-only; no local equivalent'),
-    'github/codeql-action/autobuild': ('SKIP', 'CodeQL build phase; GitHub-only'),
-    'github/codeql-action/analyze': ('SKIP', 'CodeQL analysis; GitHub-only'),
-    'github/codeql-action/upload-sarif': ('SKIP', 'SARIF upload; GitHub-only'),
-    'aquasecurity/trivy-action': (
-        'LOCAL',
-        # Advisory in CI (every trivy step pins exit-code: 0; findings go to the
-        # Security tab, never gate a merge/release). Mirror that locally with
-        # --exit-code 0 so a HIGH/CRITICAL finding prints but does not fail the
-        # local run, matching CI semantics.
-        'trivy fs --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 .',
-    ),
+    'github/codeql-action/init': ('SKIP', 'handled by the local CodeQL orchestrator'),
+    'github/codeql-action/autobuild': ('SKIP', 'handled by the local CodeQL orchestrator'),
+    'github/codeql-action/analyze': ('SKIP', 'handled by the local CodeQL orchestrator'),
+    'github/codeql-action/upload-sarif': ('SKIP', 'SARIF upload is GitHub-only'),
     'docker/setup-buildx-action': ('SKIP', 'buildx assumed available with local Docker'),
     # docker/build-push-action is handled by a special case in classify_step
     # (rewritten to a local `docker build`), so it has no entry here.
@@ -172,9 +164,13 @@ class Failure(NamedTuple):
     output: str
 
 
-# One executed step's result. outcome ∈ {pass, fail, missing, skip, unknown, dry}.
-# `missing` = exit 127 (the tool isn't on PATH locally): a local-environment gap,
-# NOT a code failure — CI has the tool, so it does not fail the local run.
+# One executed step's result. outcome ∈
+# {pass, fail, missing, unavailable, skip, unknown, dry}.
+# `missing` = a required local executable is absent; unlike an inherently
+# GitHub-only check, that is a failed local validation because CI installs it.
+# `unavailable` = the check cannot run faithfully on this host (for example an
+# arm64 build without an arm64-capable buildx worker); it is reported explicitly
+# under NOT VALIDATED LOCALLY rather than mislabeled as a CI-skipped surface.
 class StepResult(NamedTuple):
     ok: bool
     status: str
@@ -182,6 +178,11 @@ class StepResult(NamedTuple):
     cmd: str
     output: str
     outcome: str
+
+
+class CodeQLConfig(NamedTuple):
+    queries: str
+    languages: str
 
 
 class RunReport:
@@ -350,32 +351,33 @@ def resolve_reusable_workflow(uses_ref, target, parent_ref=None):
 # ---------------------------------------------------------------------------
 
 
-def evaluate_step_if(expr, step_outputs, caller_inputs=None):
+def evaluate_step_if(expr, step_outputs, caller_inputs=None, workspace=None):
     """Evaluate a GitHub Actions if-expression to True/False.
 
     Supports:
       - steps.<id>.outputs.<k> == 'true'/'false'
-      - github.event.repository.private == false  -> TRUE (local = full run)
-      - github.event_name == 'schedule'|'workflow_dispatch' -> TRUE
-      - github.event_name == 'pull_request' -> FALSE
+      - github.event.repository.private == false  -> TRUE (local = public)
+      - github.event_name == 'pull_request' -> TRUE
       - inputs.<k> -> from caller_inputs
       - && , ||, ! prefix, ${{ }} wrapping
       - always() -> TRUE
-      - hashFiles(...) != '' -> resolved against the real filesystem
-        (empty string when no glob matches, a hash otherwise — GHA semantics)
+      - hashFiles(...) != '' -> resolved against the checkout root
+        (empty string when no visible file matches, a hash otherwise)
     """
     if caller_inputs is None:
         caller_inputs = {}
+    if workspace is None:
+        workspace = Path.cwd()
 
     # Strip ${{ }} wrapper
     expr = expr.strip()
     if expr.startswith('${{') and expr.endswith('}}'):
         expr = expr[3:-2].strip()
 
-    return _eval_expr(expr, step_outputs, caller_inputs)
+    return _eval_expr(expr, step_outputs, caller_inputs, Path(workspace))
 
 
-def _eval_expr(expr, step_outputs, caller_inputs):
+def _eval_expr(expr, step_outputs, caller_inputs, workspace):
     """Recursive expression evaluator."""
     expr = expr.strip()
 
@@ -387,33 +389,37 @@ def _eval_expr(expr, step_outputs, caller_inputs):
     # Split on && and || respecting nesting
     parts = _split_logical(expr, '||')
     if len(parts) > 1:
-        return any(_eval_expr(p, step_outputs, caller_inputs) for p in parts)
+        return any(_eval_expr(p, step_outputs, caller_inputs, workspace) for p in parts)
 
     parts = _split_logical(expr, '&&')
     if len(parts) > 1:
-        return all(_eval_expr(p, step_outputs, caller_inputs) for p in parts)
+        return all(_eval_expr(p, step_outputs, caller_inputs, workspace) for p in parts)
 
     # Handle ! prefix
     if expr.startswith('!'):
-        return not _eval_expr(expr[1:].strip(), step_outputs, caller_inputs)
+        return not _eval_expr(expr[1:].strip(), step_outputs, caller_inputs, workspace)
 
     # Handle parentheses
     if expr.startswith('(') and expr.endswith(')'):
-        return _eval_expr(expr[1:-1], step_outputs, caller_inputs)
+        return _eval_expr(expr[1:-1], step_outputs, caller_inputs, workspace)
 
     # Handle comparison: X == Y or X != Y
     for op in ('!=', '=='):
         idx = expr.find(op)
         if idx >= 0:
-            lhs = _resolve_value(expr[:idx].strip(), step_outputs, caller_inputs)
-            rhs = _resolve_value(expr[idx + len(op) :].strip(), step_outputs, caller_inputs)
+            lhs = _resolve_value(
+                expr[:idx].strip(), step_outputs, caller_inputs, workspace
+            )
+            rhs = _resolve_value(
+                expr[idx + len(op) :].strip(), step_outputs, caller_inputs, workspace
+            )
             if op == '==':
                 return str(lhs) == str(rhs)
             return str(lhs) != str(rhs)
 
     # Handle hashFiles(...) != '' pattern — already handled by comparison above
     # Bare expression: resolve to truthy
-    val = _resolve_value(expr, step_outputs, caller_inputs)
+    val = _resolve_value(expr, step_outputs, caller_inputs, workspace)
     return bool(val) and str(val).lower() not in ('false', '0', '')
 
 
@@ -445,7 +451,7 @@ def _split_logical(expr, operator):
     return parts if len(parts) > 1 else [expr]
 
 
-def _resolve_value(tok, step_outputs, caller_inputs):
+def _resolve_value(tok, step_outputs, caller_inputs, workspace):
     """Resolve a tok to its value."""
     tok = tok.strip()
 
@@ -479,23 +485,20 @@ def _resolve_value(tok, step_outputs, caller_inputs):
     if tok == 'github.event.repository.private':
         return 'false'  # treat as public -> full run
 
-    # github.event_name
+    # github.event_name: local validation models the PR gate. The heavy battery
+    # still runs fail-safe even without a base SHA, but PR-only checks are
+    # surfaced instead of silently disappearing as they did under the former
+    # synthetic workflow_dispatch event.
     if tok == 'github.event_name':
-        return 'workflow_dispatch'  # local = full run (not PR)
+        return 'pull_request'
 
-    # hashFiles(...) — resolve against the real filesystem. GitHub Actions'
-    # hashFiles returns an empty string when no file matches the glob(s) and a
-    # hash otherwise, so a step guarded by `if: hashFiles('x') != ''` runs only
-    # when x exists. Mirror that locally: the opt-in `tests/image-smoke.sh`
-    # step (advisory) must SKIP when the repo ships no image-smoke script,
-    # exactly as it does in CI — assuming the file always exists made the local
-    # run try `sh tests/image-smoke.sh` and fail rc=127 on every docker-* repo.
+    # hashFiles(...) is always rooted at GITHUB_WORKSPACE, not the current
+    # step working directory or the shell that launched ci-local.
     if tok.startswith('hashFiles(') and tok.endswith(')'):
         args = tok[len('hashFiles(') : -1]
         patterns = [a.strip().strip('\'"') for a in args.split(',') if a.strip()]
-        base = Path.cwd()
         for pat in patterns:
-            if any(p.is_file() for p in base.glob(pat)):
+            if any(p.is_file() for p in workspace.glob(pat)):
                 return 'somehash'
         return ''
 
@@ -549,15 +552,19 @@ def _restore_file_bytes(path: Path, data, existed: bool):
         pass
 
 
-def apply_runner_env(env: dict, cwd: Path) -> dict:
-    """Augment env (in place) with the GitHub Actions runner vars that workflow
-    steps rely on. Uses setdefault so a real Actions environment (or an explicit
-    step `env:`) always wins. Returns env for chaining."""
+def apply_runner_env(env: dict, workspace: Path) -> dict:
+    """Add the stable GitHub-hosted runner variables used by validation steps.
+
+    `GITHUB_WORKSPACE` is always the checkout root. It must not follow a
+    nested job's process cwd: the web job intentionally runs in `static-src/`
+    while loading root-level lint configuration through GITHUB_WORKSPACE.
+    """
     rt = _runner_temp_dir()
     env.setdefault('RUNNER_TEMP', rt)
     env.setdefault('RUNNER_OS', 'Linux')
     env.setdefault('RUNNER_ARCH', 'X64')
-    env.setdefault('GITHUB_WORKSPACE', str(cwd))
+    env.setdefault('GITHUB_WORKSPACE', str(workspace))
+    env.setdefault('GITHUB_EVENT_NAME', 'pull_request')
     env.setdefault('CI', 'true')
     # GitHub-runner file sinks. Steps routinely append to these
     # (`>> "$GITHUB_ENV"`, `>> "$GITHUB_STEP_SUMMARY"`, `>> "$GITHUB_OUTPUT"`);
@@ -574,48 +581,107 @@ def apply_runner_env(env: dict, cwd: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def run_profile_step(step, cwd):
-    """Execute a profile step's `run:` block with GITHUB_OUTPUT capture.
+def _read_github_outputs(path):
+    """Parse simple `name=value` records written to GITHUB_OUTPUT."""
+    outputs = {}
+    if not path or not Path(path).is_file():
+        return outputs
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if '=' in line:
+                key, value = line.split('=', 1)
+                outputs[key] = value
+    return outputs
 
-    Returns dict of {key: value} from the output file.
+
+def predict_profile_outputs(step, cwd, workspace):
+    """Predict active profile-step outputs without running workflow code.
+
+    `--plan-only` promises no workflow execution, but later `if:` expressions
+    still need the outputs of the three profile shapes used by the CI suite.
     """
+    name = step.get('name') or ''
+    script = step.get('run') or ''
+    if name == 'Detect repo surfaces':
+        return compute_local_detect(workspace)
+    if 'go list' in script and 'app=true' in script:
+        for path in cwd.rglob('*.go'):
+            rel = path.relative_to(cwd)
+            if path.name.endswith('_test.go') or any(
+                part in ('.git', 'vendor', 'node_modules', 'testdata') for part in rel.parts
+            ):
+                continue
+            try:
+                if re.search(r'(?m)^package\s+main\s*$', path.read_text(errors='ignore')):
+                    return {'app': 'true'}
+            except OSError:
+                continue
+        return {'app': 'false'}
+    if '[ -f Dockerfile ]' in script and 'image=true' in script:
+        return {'image': 'true' if (cwd / 'Dockerfile').is_file() else 'false'}
+    return {}
+
+
+def run_profile_step(step, cwd, workspace):
+    """Execute an output-producing step and return (StepResult, outputs)."""
     run_script = step.get('run', '')
     if not run_script:
-        return {}
+        return StepResult(False, red('FAIL'), 1, '', 'empty profile step', 'fail'), {}
 
-    outputs = {}
+    output_file = None
     try:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tf:
             output_file = tf.name
 
         env = os.environ.copy()
+        for key, value in (step.get('env') or {}).items():
+            env[key] = str(value)
+        apply_runner_env(env, workspace)
         env['GITHUB_OUTPUT'] = output_file
-        # Provide GITHUB_WORKSPACE as the target dir
-        env['GITHUB_WORKSPACE'] = str(cwd)
-        apply_runner_env(env, cwd)
 
         proc = subprocess.run(
-            ['timeout', '10', 'bash', '-eu', '-o', 'pipefail', '-c', run_script],
+            [
+                'timeout',
+                '60',
+                'bash',
+                '--noprofile',
+                '--norc',
+                '-e',
+                '-o',
+                'pipefail',
+                '-c',
+                run_script,
+            ],
             cwd=str(cwd),
             env=env,
             capture_output=True,
             text=True,
         )
-
-        if proc.returncode == 0 and Path(output_file).is_file():
-            with open(output_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if '=' in line:
-                        k, v = line.split('=', 1)
-                        outputs[k] = v
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+        output = (proc.stdout or '') + (proc.stderr or '')
+        if proc.returncode == 0:
+            outputs = _read_github_outputs(output_file)
+            # Execute detect so its shell validation still fails locally when CI
+            # would fail, but report/use the same CI-visible inventory that job
+            # expansion uses. Raw `find` sees ignored editor/review artifacts
+            # which cannot exist in a fresh Actions checkout.
+            if step.get('name') == 'Detect repo surfaces':
+                outputs = compute_local_detect(workspace)
+            return (
+                StepResult(True, green('PASS'), 0, run_script, output, 'pass'),
+                outputs,
+            )
+        outcome = 'missing' if proc.returncode == 127 else 'fail'
+        status = yellow('MISSING (tool not on PATH)') if outcome == 'missing' else red(
+            f'FAIL (rc={proc.returncode})'
+        )
+        return StepResult(False, status, proc.returncode, run_script, output, outcome), {}
+    except OSError as exc:
+        return StepResult(False, red('ERR'), 127, run_script, str(exc), 'missing'), {}
     finally:
-        with contextlib.suppress(OSError):
-            os.unlink(output_file)
-
-    return outputs
+        if output_file:
+            with contextlib.suppress(OSError):
+                os.unlink(output_file)
 
 
 # ---------------------------------------------------------------------------
@@ -623,35 +689,71 @@ def run_profile_step(step, cwd):
 # ---------------------------------------------------------------------------
 
 
+def _truthy_action_input(value):
+    return str(value).strip().lower() in ('1', 'true', 'yes')
+
+
+def trivy_action_command(step):
+    """Translate the active trivy-action inputs to the equivalent CLI scan.
+
+    SARIF upload is GitHub-only, so local output stays on stdout, but scan type,
+    scanners, severity, unfixed policy, target, and advisory exit semantics all
+    match the action invocation.
+    """
+    with_ = step.get('with') or {}
+    image_ref = str(with_.get('image-ref', '')).strip()
+    scan_type = str(with_.get('scan-type', '')).strip()
+    if image_ref or scan_type in ('image', 'rootfs'):
+        subcommand = scan_type or 'image'
+        target = image_ref or str(with_.get('scan-ref', '.')).strip() or '.'
+    else:
+        subcommand = 'fs' if scan_type in ('', 'fs', 'filesystem') else scan_type
+        target = str(with_.get('scan-ref', '.')).strip() or '.'
+
+    args = ['trivy', subcommand]
+    scanners = str(with_.get('scanners', '')).strip()
+    severity = str(with_.get('severity', '')).strip()
+    exit_code = str(with_.get('exit-code', '0')).strip() or '0'
+    if scanners:
+        args.extend(['--scanners', scanners])
+    if severity:
+        args.extend(['--severity', severity])
+    if _truthy_action_input(with_.get('ignore-unfixed', False)):
+        args.append('--ignore-unfixed')
+    args.extend(['--exit-code', exit_code, target])
+    return shlex.join(args)
+
+
 def classify_step(step):
     """Return (kind, name, detail).
 
-    kind: 'EXEC' | 'LOCAL' | 'SKIP' | 'UNKNOWN'
+    kind: 'EXEC' | 'LOCAL' | 'NOLOCAL' | 'SKIP' | 'UNKNOWN'
     """
     name = step.get('name') or '(unnamed)'
 
     if 'uses' in step:
         action_ref = step['uses'].split('@', 1)[0].strip()
-        # Build-ability gate: CI's required `docker` job builds the image via
-        # docker/build-push-action (no push). Mirror it locally with
-        # `docker build` (same context/file/target, default = final stage) so a
-        # Dockerfile that won't build fails the local run too. SKIP loudly when
-        # docker isn't on PATH rather than pretending the gate ran.
+        if action_ref == 'aquasecurity/trivy-action':
+            return 'LOCAL', name, trivy_action_command(step)
+        # The required image gates use build-push-action. Native builds use the
+        # daemon builder; the arm64 twin uses buildx with an explicit platform.
+        # Platform availability is checked only when executing, so --plan-only
+        # remains side-effect free and still shows the complete required plan.
         if action_ref == 'docker/build-push-action':
-            if not shutil.which('docker'):
-                return 'SKIP', name, 'docker not on PATH; build-ability gate NOT exercised locally'
             with_ = step.get('with') or {}
             context = str(with_.get('context', '.')).strip() or '.'
             dockerfile = str(with_.get('file', 'Dockerfile')).strip() or 'Dockerfile'
             target_stage = str(with_.get('target', '')).strip()
-            cmd = f'docker build -f {shlex.quote(dockerfile)}'
+            platform = str(step.get('__platform', '')).strip()
+            if platform:
+                cmd = f'docker buildx build --platform {shlex.quote(platform)} --load'
+            else:
+                cmd = 'docker build'
+            cmd += f' -f {shlex.quote(dockerfile)}'
             if target_stage:
                 cmd += f' --target {shlex.quote(target_stage)}'
-            # Preserve the image tag(s) so a downstream smoke-test step that runs
-            # `docker run <tag>` can find the just-built image. CI tags via the
-            # `tags:` input (e.g. ci-smoke:latest); without -t locally the build
-            # produces a dangling image and the smoke step fails with "Unable to
-            # find image".
+            # Preserve tags so a downstream runtime smoke test can run the
+            # image produced by the required native build.
             for tag in str(with_.get('tags', '')).replace(',', '\n').splitlines():
                 tag = tag.strip()
                 if tag:
@@ -944,7 +1046,17 @@ def rewrite_markdownlint_gitignore(cmd: str, cwd: Path) -> str:
         return cmd
     try:
         out = subprocess.run(
-            ['git', '-C', str(cwd), 'ls-files', '*.md'],
+            [
+                'git',
+                '-C',
+                str(cwd),
+                'ls-files',
+                '--cached',
+                '--others',
+                '--exclude-standard',
+                '--',
+                '*.md',
+            ],
             capture_output=True,
             text=True,
             check=True,
@@ -962,73 +1074,126 @@ def rewrite_markdownlint_gitignore(cmd: str, cwd: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
-    """Execute a step. Returns a StepResult.
+_DOCKER_PLATFORM_CACHE = {}
 
-    Captures combined stdout+stderr so failures can be replayed in the summary.
-    Output is echoed inline only for fail/missing steps (a passing step's output
-    is noise for an agent scanning for problems). A 127 exit (command not on
-    PATH) is classified `missing` — the tool isn't installed locally, which is a
-    local-environment gap rather than a code failure, so it must not fail the run
-    (CI has the tool); the summary lists it under NOT VALIDATED LOCALLY instead.
-    """
+
+def docker_platform_available(platform):
+    """Return whether the active buildx worker can execute `platform`."""
+    cached = _DOCKER_PLATFORM_CACHE.get(platform)
+    if cached is not None:
+        return cached
+    if not shutil.which('docker'):
+        _DOCKER_PLATFORM_CACHE[platform] = False
+        return False
+    try:
+        proc = subprocess.run(
+            ['docker', 'buildx', 'inspect', '--bootstrap'],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _DOCKER_PLATFORM_CACHE[platform] = False
+        return False
+    supported = False
+    if proc.returncode == 0:
+        for line in proc.stdout.splitlines():
+            if line.strip().startswith('Platforms:'):
+                platforms = {item.strip() for item in line.split(':', 1)[1].split(',')}
+                supported = platform in platforms or any(
+                    item.startswith(f'{platform}/') for item in platforms
+                )
+                break
+    _DOCKER_PLATFORM_CACHE[platform] = supported
+    return supported
+
+
+def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
+    """Execute one translated workflow step and return its local result."""
     wd = step.get('working-directory')
     cwd = base_cwd / wd if wd else base_cwd
     env = os.environ.copy()
-    for k, v in (step.get('env') or {}).items():
-        env[k] = str(v)
-    apply_runner_env(env, cwd)
+    for key, value in (step.get('env') or {}).items():
+        env[key] = str(value)
+    apply_runner_env(env, base_cwd)
 
     if kind == 'SKIP':
         return StepResult(True, gray('SKIP'), 0, '', '', 'skip')
-
+    if kind == 'NOLOCAL':
+        return StepResult(True, yellow('NOT AVAILABLE LOCALLY'), 0, '', detail, 'unavailable')
     if kind == 'UNKNOWN':
         return StepResult(False, red('UNKNOWN'), 0, '', detail, 'unknown')
 
-    if kind == 'LOCAL':
-        cmd = detail
-    else:  # EXEC
-        cmd = step['run']
-        cmd = rewrite_hadolint_docker(cmd)
-        cmd = rewrite_markdownlint_gitignore(cmd, cwd)
-        cmd = rewrite_gitleaks_download(cmd)
-        cmd = rewrite_gitleaks_gitignore(cmd, cwd)
-        cmd = rewrite_trivy_gitignore(cmd, cwd)
-        cmd = rewrite_report_artifacts(cmd)
-        cmd = rewrite_ci_failures_path(cmd)
+    cmd = detail if kind == 'LOCAL' else step['run']
+    # Local action translations and literal run blocks share the same parity
+    # rewrites. Previously Trivy was translated to LOCAL after the rewrite path
+    # and therefore scanned gitignored files that do not exist in CI.
+    cmd = rewrite_hadolint_docker(cmd)
+    cmd = rewrite_markdownlint_gitignore(cmd, cwd)
+    cmd = rewrite_gitleaks_download(cmd)
+    cmd = rewrite_gitleaks_gitignore(cmd, cwd)
+    cmd = rewrite_trivy_gitignore(cmd, cwd)
+    cmd = rewrite_report_artifacts(cmd)
+    cmd = rewrite_ci_failures_path(cmd)
 
     if dry_run:
         return StepResult(True, blue('DRY'), 0, cmd, '', 'dry')
 
+    platform_match = re.search(r'\bdocker\s+buildx\s+build\s+--platform\s+(\S+)', cmd)
+    if platform_match and not docker_platform_available(platform_match.group(1)):
+        platform = platform_match.group(1)
+        reason = f'buildx worker does not advertise {platform}; CI runs this on a native runner'
+        return StepResult(True, yellow('NOT AVAILABLE LOCALLY'), 0, cmd, reason, 'unavailable')
+
     try:
         proc = subprocess.run(
-            ['timeout', str(_STEP_TIMEOUT_SECS), 'bash', '-eu', '-o', 'pipefail', '-c', cmd],
+            [
+                'timeout',
+                str(_STEP_TIMEOUT_SECS),
+                'bash',
+                '--noprofile',
+                '--norc',
+                '-e',
+                '-o',
+                'pipefail',
+                '-c',
+                cmd,
+            ],
             cwd=str(cwd),
             env=env,
             capture_output=True,
             text=True,
         )
-    except FileNotFoundError as e:
-        return StepResult(False, red('ERR'), 127, cmd, str(e), 'missing')
+    except FileNotFoundError as exc:
+        return StepResult(False, red('ERR'), 127, cmd, str(exc), 'missing')
 
     output = (proc.stdout or '') + (proc.stderr or '')
     rc = proc.returncode
-
     if rc == 0:
         return StepResult(True, green('PASS'), 0, cmd, output, 'pass')
 
-    # Echo the failing output inline (last 40 lines) so it's visible at the
-    # point of failure, not only in the summary.
     body = _tail(output, 40)
     for line in body:
         print(f'      {line}')
     if len(output.rstrip('\n').splitlines()) > 40:
         print(f'      {gray("... (output trimmed; full tail in summary)")}')
 
-    if rc == 127:
-        return StepResult(True, yellow('MISSING (tool not on PATH)'), 127, cmd, output, 'missing')
+    missing = rc == 127 or bool(
+        re.search(r'(?:command not found|failed to run command)', output, re.IGNORECASE)
+    )
+    if missing:
+        return StepResult(
+            False, yellow('MISSING (required tool not on PATH)'), rc, cmd, output, 'missing'
+        )
     if rc == 124:
-        return StepResult(False, red(f'FAIL (timed out at {_STEP_TIMEOUT_SECS}s)'), 124, cmd, output, 'fail')
+        return StepResult(
+            False,
+            red(f'FAIL (timed out at {_STEP_TIMEOUT_SECS}s)'),
+            124,
+            cmd,
+            output,
+            'fail',
+        )
     return StepResult(False, red(f'FAIL (rc={rc})'), rc, cmd, output, 'fail')
 
 
@@ -1144,12 +1309,13 @@ WEB_DIR_PROBE = ('static-src', 'web', 'internal/server/static-src')
 
 
 def detect_web_dir(target):
-    """Mirror the meta ci.yaml detect web-frontend probe: first of static-src/,
-    web/, internal/server/static-src/ that contains package.json or jsr.json."""
-    for d in WEB_DIR_PROBE:
-        p = target / d
-        if p.is_dir() and ((p / 'package.json').is_file() or (p / 'jsr.json').is_file()):
-            return d
+    """Mirror the meta CI frontend probe order using CI-visible files."""
+    for directory in WEB_DIR_PROBE:
+        path = target / directory
+        if path.is_dir() and _has_tracked_file(
+            target, f'{directory}/package.json', f'{directory}/jsr.json'
+        ):
+            return directory
     return None
 
 
@@ -1164,69 +1330,91 @@ def _has_file_anywhere(target, pattern):
     return False
 
 
-def _has_tracked_file(target, *pathspecs):
-    """True if git tracks any file matching the pathspecs under target.
+def _git_visible_files(target, *pathspecs):
+    """Return tracked and nonignored untracked files matching pathspecs.
 
-    CI's detect job runs `find` on a FRESH CHECKOUT — only git-tracked files
-    exist on the runner. Mirror that: a gitignored working-tree file (e.g. a
-    scratch *.py under .code-review/) must NOT flip a surface on, or ci-local
-    would run a job CI skips. Falls back to a working-tree walk when target is
-    not a git repo / git is unavailable."""
+    A local run should include files about to be committed while excluding
+    ignored scratch/build output that cannot exist in CI's checkout.
+    """
+    output = subprocess.run(
+        [
+            'git',
+            '-C',
+            str(target),
+            'ls-files',
+            '--cached',
+            '--others',
+            '--exclude-standard',
+            '-z',
+            '--',
+            *pathspecs,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return [
+        path
+        for path in output.split('\x00')
+        if path and (target / path).is_file()
+    ]
+
+
+def _has_tracked_file(target, *pathspecs):
+    """True when CI-visible inventory contains a matching file.
+
+    Despite the historical name, this includes nonignored untracked files so a
+    contributor validates a newly added surface before committing it. Ignored
+    files remain excluded. Falls back to a working-tree walk outside git repos.
+    """
     try:
-        out = subprocess.run(
-            ['git', '-C', str(target), 'ls-files', '-z', '--', *pathspecs],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-        return bool(out.replace('\x00', '').strip())
+        return any(path.strip() for path in _git_visible_files(target, *pathspecs))
     except (OSError, subprocess.CalledProcessError):
-        for ps in pathspecs:
-            if '/' in ps:
-                if any(target.glob(ps)):
+        for pathspec in pathspecs:
+            if '/' in pathspec:
+                if any(target.glob(pathspec)):
                     return True
-            elif _has_file_anywhere(target, ps):
+            elif _has_file_anywhere(target, pathspec):
                 return True
         return False
 
 
+def _has_root_file(target, filename):
+    """True when a root file is tracked or nonignored and untracked."""
+    try:
+        return filename in _git_visible_files(
+            target, f':(top,literal){filename}'
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return (target / filename).is_file()
+
+
 def _detect_go_nested_dirs(target):
     """Mirror the meta ci.yaml detect job's nested-Go-module discovery: every
-    tracked `<dir>/go.mod` below the root (git pathspec '*/go.mod' never matches
-    the root go.mod), pruned of vendored/generated trees, and only when the dir
-    has tracked .go files (a sentinel go.mod — e.g. `module web-ignore` — has
-    nothing to validate). Keep the filters in sync with the meta detect step and
-    scripts/test-lane-semantics.sh. Returns a sorted list of dirs; empty when
-    git is unavailable (non-git trees have no tracked files to discover)."""
+    CI-visible `<dir>/go.mod` below the root, pruned of vendored/generated
+    trees, and only when the dir has CI-visible .go files (a sentinel go.mod —
+    e.g. `module web-ignore` — has nothing to validate). Keep the filters in
+    sync with the meta detect step and scripts/test-lane-semantics.sh. Returns a
+    sorted list of dirs; empty when git is unavailable."""
     prune = re.compile(r'(^|/)(node_modules|vendor|testdata|static|dist)/')
     try:
-        out = subprocess.run(
-            ['git', '-C', str(target), 'ls-files', '-z', '--', '*/go.mod'],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
+        files = _git_visible_files(target, '*/go.mod')
     except (OSError, subprocess.CalledProcessError):
         return []
     dirs = []
-    for f in out.split('\x00'):
-        if not f.strip():
+    for filename in files:
+        if not filename.strip() or prune.search(filename):
             continue
-        if prune.search(f):
-            continue
-        d = os.path.dirname(f)
-        has_go = (
-            subprocess.run(
-                ['git', '-C', str(target), 'ls-files', '-z', '--', f'{d}/*.go'],
-                capture_output=True,
-                text=True,
-                check=False,
+        directory = os.path.dirname(filename)
+        try:
+            has_go = any(
+                path.strip()
+                for path in _git_visible_files(target, f'{directory}/*.go')
             )
-            .stdout.replace('\x00', '')
-            .strip()
-        )
+        except (OSError, subprocess.CalledProcessError):
+            has_go = False
         if has_go:
-            dirs.append(d)
+            dirs.append(directory)
     return sorted(dirs)
 
 
@@ -1237,18 +1425,17 @@ def compute_local_detect(target):
     """Reproduce the meta ci.yaml `detect` job's surface outputs from local file
     presence. ci-local always runs the applicable surfaces (it mirrors CI's
     fail-safe "treat as code change" path; there is no docs-only skip locally).
-    File globs (*.py / *.sh / workflows) are checked against git-tracked files so
-    a gitignored scratch file can't flip a surface CI's fresh checkout wouldn't
-    see. Memoized per target: it is consulted per job gate, per needs-output
-    resolution, and per matrix expansion, and the nested-module discovery costs
-    a git call per nested go.mod."""
+    Surface probes use tracked plus nonignored untracked files: newly added work
+    is validated before commit, while ignored scratch output cannot flip a lane.
+    Memoized per target because detection is used by gates and matrix expansion.
+    """
     cached = _DETECT_CACHE.get(str(target))
     if cached is not None:
         return cached
     web = detect_web_dir(target)
-    has_dockerfile = (target / 'Dockerfile').is_file()
-    has_gomod = (target / 'go.mod').is_file()
-    has_jsr = (target / 'jsr.json').is_file()
+    has_dockerfile = _has_root_file(target, 'Dockerfile')
+    has_gomod = _has_root_file(target, 'go.mod')
+    has_jsr = _has_root_file(target, 'jsr.json')
 
     # Python: any tracked *.py → ruff job, same as the meta ci.yaml find.
     run_python = _has_tracked_file(target, '*.py')
@@ -1303,10 +1490,10 @@ def job_applies_locally(jobname, target):
         'web': det['run_web'],
         'shell': det['run_shell'],
         'docker': det['run_docker'],
-        # The arm64 build-ability leg never runs locally: a cross-arch build
-        # needs qemu/binfmt, and the native `docker` job above already
-        # exercises the build-ability gate on this machine's arch.
-        'docker-arm64': 'false',
+        # The public arm64 gate is required whenever Docker is detected. It is
+        # planned locally and executed through buildx when the active worker
+        # advertises arm64; otherwise the summary reports it as NOT VALIDATED.
+        'docker-arm64': det['run_docker'],
         'python': det['run_python'],
         'scripts': det['run_scripts'],
     }
@@ -1316,24 +1503,39 @@ def job_applies_locally(jobname, target):
     return True  # markdown / detect / validate scaffolding — always runs
 
 
-def _resolve_with_value(value, inputs, target, strip_unknown=False):
-    """Resolve ${{ inputs.X }} (from caller inputs) and
-    ${{ needs.<job>.outputs.X }} (from local detect, e.g. web_dir) in a `with:`
-    value, a working-directory, or a `run:` script body. Non-strings pass
-    through. With strip_unknown=True (used for run-script bodies), any other
-    ${{ ... }} expression is replaced with '' so bash doesn't hit a "bad
-    substitution" error on an expression GitHub would have substituted."""
+def _resolve_with_value(value, inputs, target, strip_unknown=False, env=None):
+    """Resolve the GitHub expressions used by the active validation workflows.
+
+    Handles workflow-call inputs, detect-job outputs, workflow/job environment
+    values, and the small GitHub event context needed by the meta detect step.
+    Unknown expressions can be stripped before a run block reaches bash, just as
+    the Actions runner substitutes them before invoking the shell.
+    """
     if not isinstance(value, str):
         return value
+    env = env or {}
 
     def repl(m):
         inner = m.group(1).strip()
         im = re.match(r'inputs\.([\w-]+)$', inner)
         if im:
             return str(inputs.get(im.group(1), ''))
-        nm = re.match(r'needs\.\w+\.outputs\.([\w-]+)$', inner)
+        nm = re.match(r'needs\.[\w-]+\.outputs\.([\w-]+)$', inner)
         if nm:
             return str(compute_local_detect(target).get(nm.group(1), ''))
+        em = re.match(r'env\.([\w-]+)$', inner)
+        if em:
+            return str(env.get(em.group(1), ''))
+        if inner == 'github.event_name':
+            return 'pull_request'
+        if inner == 'github.event.repository.private':
+            return 'false'
+        # No PR base is available locally. Leaving it empty deliberately sends
+        # the meta detect script down its fail-safe full-battery path.
+        if inner in ('github.event.pull_request.base.sha', 'github.event.before'):
+            return ''
+        if inner == 'github.sha':
+            return ''
         return '' if strip_unknown else m.group(0)
 
     return re.sub(r'\$\{\{\s*(.+?)\s*\}\}', repl, value)
@@ -1479,95 +1681,50 @@ def _resolve_input_expr(expr, inputs):
 def process_reusable_steps(
     jobname, steps, target, working_dir, caller_inputs, dry_run, ignore_unknown
 ):
-    """Process steps from a resolved reusable workflow.
-
-    Runs the profile step first to capture outputs, then evaluates if-conditions.
-    Returns (ok, counters, failed_steps). `jobname` is used to attribute
-    failures and not-validated notes in the agent-facing summary.
-    """
+    """Process one terminal job from a resolved reusable workflow."""
     counters = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0, 'MISSING': 0}
     failed_steps = []
     overall_ok = True
-    step_outputs = {}  # {step_id: {key: value}}
-
+    step_outputs = {}
+    hard_failed = False
+    recorded_soft_failure = False
     base_cwd = target / working_dir if working_dir != '.' else target
 
-    # Each job gets a fresh soft-gate marker, mirroring CI's per-job /tmp.
     if not dry_run:
         _clear_failure_marker()
 
     for step in steps:
         step_id = step.get('id', '')
         name = step.get('name') or '(unnamed)'
+        if_expr = str(step.get('if', '') or '')
 
-        # Resolve input expressions in the step's working-directory
+        # GitHub implicitly applies success() to ordinary later steps after a
+        # hard failure. Explicit always() cleanup/aggregation still runs.
+        if hard_failed and 'always()' not in if_expr:
+            print(f'  {gray("SKIP"):<7} {name}  (previous hard step failed)')
+            counters['SKIP'] += 1
+            continue
+
         step_wd = step.get('working-directory', '')
         if step_wd:
             step_wd = _resolve_input_expr(step_wd, caller_inputs)
 
-        # Check if this is a profile/detect step that writes to GITHUB_OUTPUT
-        if step_id and 'run' in step and 'GITHUB_OUTPUT' in step.get('run', ''):
-            # Determine the cwd for running this step
-            run_cwd = target / step_wd if step_wd and step_wd != '.' else base_cwd
-            outputs = run_profile_step(step, run_cwd)
-            step_outputs[step_id] = outputs
-            tag = gray('DETECT')
-            out_str = ', '.join(f'{k}={v}' for k, v in outputs.items())
-            print(f'  {tag:<7} {name}  ({out_str})')
-            counters['SKIP'] += 1
-            continue
-
-        # Evaluate if-condition
-        if_expr = step.get('if', '')
-        if if_expr:
-            result = evaluate_step_if(if_expr, step_outputs, caller_inputs)
-            if not result:
-                tag = gray('SKIP')
-                print(f'  {tag:<7} {name}  (if: false)')
-                counters['SKIP'] += 1
-                continue
-
-        # A step consuming job-result context (the meta validate job's
-        # `${{ needs.<job>.result }}` aggregation) has no local equivalent:
-        # ci-local sequences the jobs itself and its own summary IS the
-        # aggregate. Running it with stripped (empty) results would
-        # false-fail, so skip it explicitly.
-        step_blob = ' '.join(
-            [str(v) for v in (step.get('env') or {}).values()] + [str(step.get('run', ''))]
-        )
-        if re.search(r'\$\{\{\s*needs\.[\w-]+\.result\s*\}\}', step_blob):
-            tag = gray('SKIP')
-            print(f"  {tag:<7} {name}  (aggregates CI job results; ci-local's summary covers this)")
-            counters['SKIP'] += 1
-            continue
-
-        # Build the effective step first: resolve ${{ inputs.* }} / ${{ needs.* }}
-        # in `with:` values and working-directory BEFORE classification, so steps
-        # like docker/build-push-action receive concrete file/context paths
-        # instead of literal `${{ inputs.dockerfile }}`.
         eff_step = dict(step)
+        if 'docker-arm64' in jobname.split('/'):
+            eff_step['__platform'] = 'linux/arm64'
         if isinstance(step.get('with'), dict):
             eff_step['with'] = {
-                k: _resolve_with_value(v, caller_inputs, target) for k, v in step['with'].items()
+                key: _resolve_with_value(value, caller_inputs, target)
+                for key, value in step['with'].items()
             }
         if isinstance(step.get('env'), dict):
-            # Step `env:` values carry inputs too (the injection-safe pattern:
-            # `SHELLCHECK_PATHS: ${{ inputs.shellcheck-paths }}` in shell-ci's
-            # soft-gate steps). CI substitutes ${{ }} before the process sees
-            # the variable; without this mirror the literal `${{ inputs.X }}`
-            # lands in the env and sends the step script down wrong branches
-            # (observed: shellcheck globbing `${{` as a filename, hadolint
-            # losing its --ignore list). strip_unknown mirrors CI for locally
-            # unresolvable context (secrets.*, github.*): empty string, never
-            # a literal `${{ ... }}`.
             eff_step['env'] = {
-                k: _resolve_with_value(v, caller_inputs or {}, target, strip_unknown=True)
-                for k, v in step['env'].items()
+                key: _resolve_with_value(
+                    value, caller_inputs or {}, target, strip_unknown=True
+                )
+                for key, value in step['env'].items()
             }
         if isinstance(step.get('run'), str):
-            # CI substitutes ${{ }} before the shell sees it; mirror that for
-            # inputs/needs and strip any other expression so bash doesn't fail
-            # with "bad substitution" on a literal `${{ ... }}` in the script.
             eff_step['run'] = _resolve_with_value(
                 step['run'], caller_inputs, target, strip_unknown=True
             )
@@ -1578,13 +1735,57 @@ def process_reusable_steps(
         elif 'working-directory' in eff_step:
             eff_step['working-directory'] = step_wd or None
 
-        kind, _sname, detail = classify_step(eff_step)
+        if if_expr and not evaluate_step_if(if_expr, step_outputs, caller_inputs, target):
+            print(f'  {gray("SKIP"):<7} {name}  (if: false)')
+            counters['SKIP'] += 1
+            continue
 
+        # Output-producing profile steps are real CI checks. Execute and surface
+        # their failures normally; in plan mode predict only the active profile
+        # shapes so no workflow command runs.
+        if step_id and 'run' in eff_step and 'GITHUB_OUTPUT' in eff_step.get('run', ''):
+            run_cwd = target / step_wd if step_wd and step_wd != '.' else base_cwd
+            if dry_run:
+                outputs = predict_profile_outputs(eff_step, run_cwd, target)
+                step_outputs[step_id] = outputs
+                out_str = ', '.join(f'{key}={value}' for key, value in outputs.items())
+                print(f'  {blue("DRY"):<7} {name}  ({out_str})')
+                counters['DRY'] += 1
+                continue
+            res, outputs = run_profile_step(eff_step, run_cwd, target)
+            step_outputs[step_id] = outputs
+            out_str = ', '.join(f'{key}={value}' for key, value in outputs.items())
+            suffix = f'  ({out_str})' if out_str else ''
+            print(f'  {blue("EXEC"):<7} {name}{suffix}')
+            print(f'    → {res.status}')
+            if res.outcome == 'pass':
+                counters['PASS'] += 1
+            else:
+                counters['FAIL'] += 1
+                overall_ok = False
+                hard_failed = True
+                failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
+            continue
+
+        step_blob = ' '.join(
+            [str(value) for value in (step.get('env') or {}).values()]
+            + [str(step.get('run', ''))]
+        )
+        if re.search(r'\$\{\{\s*needs\.[\w-]+\.result\s*\}\}', step_blob):
+            print(
+                f'  {gray("SKIP"):<7} {name}  '
+                "(aggregates CI job results; ci-local's summary covers this)"
+            )
+            counters['SKIP'] += 1
+            continue
+
+        kind, _step_name, detail = classify_step(eff_step)
         wd = eff_step.get('working-directory')
         wd_str = f' [cwd={wd}]' if wd else ''
         tag = {
             'EXEC': blue('EXEC'),
             'LOCAL': blue('LOCAL'),
+            'NOLOCAL': yellow('NOLOCAL'),
             'SKIP': gray('SKIP'),
             'UNKNOWN': red('UNKNOWN'),
         }.get(kind, kind)
@@ -1594,6 +1795,10 @@ def process_reusable_steps(
         if kind == 'SKIP':
             counters['SKIP'] += 1
             continue
+        if kind == 'NOLOCAL':
+            counters['MISSING'] += 1
+            REPORT.not_validated.append((jobname, name, detail))
+            continue
         if kind == 'UNKNOWN':
             counters['UNKNOWN'] += 1
             REPORT.not_validated.append(
@@ -1601,6 +1806,7 @@ def process_reusable_steps(
             )
             if not ignore_unknown:
                 overall_ok = False
+                hard_failed = True
                 failed_steps.append(Failure(jobname, name, 0, '', detail))
             continue
 
@@ -1611,25 +1817,45 @@ def process_reusable_steps(
         print(f'    → {res.status}')
         if res.outcome == 'pass':
             counters['PASS'] += 1
-        elif res.outcome == 'missing':
+            continue
+        if res.outcome == 'unavailable':
             counters['MISSING'] += 1
-            tool = res.cmd.split()[0] if res.cmd else name
-            REPORT.not_validated.append(
-                (jobname, name, f'`{tool}` not on PATH (exit 127) — CI has it; install to check locally')
-            )
-        # continue-on-error: true makes a step advisory in CI — its failure
-        # is recorded but never fails the job/gate. Mirror that locally:
-        # report under not_validated instead of failing the run. The image
-        # smoke test is the main user of this.
-        elif step.get('continue-on-error') in (True, 'true'):
-            counters['MISSING'] += 1
-            REPORT.not_validated.append(
-                (jobname, name, f'advisory step failed (continue-on-error; non-blocking in CI) — rc={res.rc}')
-            )
-        else:
+            REPORT.not_validated.append((jobname, name, res.output))
+            continue
+
+        soft_gate = step.get('continue-on-error') in (True, 'true')
+        records_failure = '/tmp/_ci_failures' in str(step.get('run', ''))
+        if res.outcome == 'missing':
             counters['FAIL'] += 1
             overall_ok = False
             failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
+            if not soft_gate:
+                hard_failed = True
+            else:
+                recorded_soft_failure = True
+            continue
+        if soft_gate and records_failure:
+            counters['FAIL'] += 1
+            overall_ok = False
+            recorded_soft_failure = True
+            failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
+            continue
+        if soft_gate:
+            counters['MISSING'] += 1
+            REPORT.not_validated.append(
+                (jobname, name, f'advisory step failed (non-blocking in CI) — rc={res.rc}')
+            )
+            continue
+
+        # The final Check results failure only aggregates already-recorded
+        # Option-A failures; keep the underlying checks in the summary instead
+        # of adding a duplicate aggregate failure.
+        overall_ok = False
+        if name == 'Check results' and recorded_soft_failure:
+            continue
+        counters['FAIL'] += 1
+        hard_failed = True
+        failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
 
     return overall_ok, counters, failed_steps
 
@@ -1678,6 +1904,50 @@ def is_codeql_reusable(jobs_dict):
     return False
 
 
+def _workflow_call_input_defaults(raw):
+    on_block = raw.get('on')
+    if on_block is None:
+        on_block = raw.get(True)
+    specs = ((on_block or {}).get('workflow_call') or {}).get('inputs') or {}
+    return {
+        name: spec.get('default', '')
+        for name, spec in specs.items()
+        if isinstance(spec, dict)
+    }
+
+
+def codeql_config_for_workflow(raw, jobs_dict, target):
+    """Resolve the language/query inputs for the active CodeQL workflow."""
+    for job in jobs_dict.values():
+        uses = job.get('uses', '')
+        if 'codeql.yaml' not in uses and 'codeql.yml' not in uses:
+            continue
+        resolved = resolve_reusable_workflow(uses, target)
+        if resolved is None:
+            return CodeQLConfig('security-extended,security-and-quality', '')
+        values = _workflow_call_input_defaults(resolved)
+        values.update(job.get('with') or {})
+        return CodeQLConfig(
+            str(values.get('queries', 'security-extended,security-and-quality')),
+            str(values.get('languages', '')),
+        )
+
+    # Direct processing of the reusable workflow (e.g. --workflow
+    # .github/workflows/codeql.yaml) uses its own workflow_call defaults.
+    if any(
+        (step.get('uses') or '').split('@', 1)[0] == 'github/codeql-action/init'
+        for job in jobs_dict.values()
+        for step in (job.get('steps') or [])
+    ):
+        values = _workflow_call_input_defaults(raw)
+        if values:
+            return CodeQLConfig(
+                str(values.get('queries', 'security-extended,security-and-quality')),
+                str(values.get('languages', '')),
+            )
+    return None
+
+
 def parse_sarif_alerts(sarif_path: Path):
     """Extract findings from a SARIF v2.1.0 file. Returns list of dicts."""
     with open(sarif_path) as f:
@@ -1718,67 +1988,15 @@ def parse_sarif_alerts(sarif_path: Path):
 
 
 def is_security_alert(alert) -> bool:
-    """Mirror CodeQL Action's failure threshold: tag 'security' AND severity >= 'medium'."""
+    """Return whether a SARIF result is a medium-or-higher security finding."""
     tags = alert.get('tags') or []
-    if not any(t == 'security' or t.startswith('security') for t in tags):
+    if not any(tag == 'security' or tag.startswith('security') for tag in tags):
         return False
-    sev = alert.get('severity', '')
+    severity = alert.get('severity', '')
     try:
-        return float(sev) >= 4.0
+        return float(severity) >= 4.0
     except ValueError:
         return alert.get('level') in ('error', 'warning')
-
-
-# ---------------------------------------------------------------------------
-# CodeQL suppression config (.codeql-suppressions.yaml)
-# ---------------------------------------------------------------------------
-
-
-def load_suppressions(target: Path):
-    """Load .codeql-suppressions.yaml from the repo root. Returns list of dicts."""
-    path = target / '.codeql-suppressions.yaml'
-    if not path.is_file():
-        return []
-    try:
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
-    except (yaml.YAMLError, OSError) as e:
-        print(f'  {yellow("WARN")} could not read {path.name}: {e}', file=sys.stderr)
-        return []
-    sups = data.get('suppressions') or []
-    valid = []
-    for s in sups:
-        if not isinstance(s, dict) or not s.get('reason'):
-            print(
-                f'  {yellow("WARN")} skipping suppression without a reason: {s}',
-                file=sys.stderr,
-            )
-            continue
-        if not (s.get('fingerprint') or s.get('path')):
-            print(
-                f'  {yellow("WARN")} skipping suppression with neither fingerprint nor path: {s}',
-                file=sys.stderr,
-            )
-            continue
-        valid.append(s)
-    return valid
-
-
-def is_suppressed(alert, suppressions):
-    """Return the matching suppression dict if alert is allowlisted, else None."""
-    for s in suppressions:
-        rule = s.get('rule')
-        if rule and rule != alert.get('rule'):
-            continue
-        fp = s.get('fingerprint')
-        if fp:
-            if fp == alert.get('fingerprint'):
-                return s
-            continue
-        sp = s.get('path')
-        if sp and sp == alert.get('path'):
-            return s
-    return None
 
 
 def run_codeql_for_job(jobname, steps, target: Path, dry_run: bool):
@@ -1847,7 +2065,7 @@ def run_codeql_for_job(jobname, steps, target: Path, dry_run: bool):
 
 
 def run_codeql_analysis(target: Path, languages, queries, dry_run, source_root=None):
-    """Build a CodeQL DB, analyze it, filter findings through suppressions."""
+    """Build and analyze one CodeQL database with Analyze-action exit semantics."""
     src = source_root or target
     info = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'label': 'CodeQL'}
 
@@ -1855,20 +2073,20 @@ def run_codeql_analysis(target: Path, languages, queries, dry_run, source_root=N
         f'  {blue("CODEQL")} analyze (lang={languages}, queries={queries or "default"}, root={src})'
     )
 
+    if dry_run:
+        info['DRY'] += 1
+        return True, info
+
     if not shutil.which('codeql'):
         print(
             f'    → {gray("SKIP")} codeql binary not on PATH; analysis runs in '
-            f'CI (install locally via tools.json, or pass --no-codeql to silence)'
+            f'CI (install it locally, or pass --no-codeql to skip explicitly)'
         )
         info['SKIP'] += 1
         info['label'] = 'CodeQL (skipped — binary not installed)'
         REPORT.not_validated.append(
             ('codeql', f'analyze ({languages})', 'codeql binary not on PATH — runs in CI')
         )
-        return True, info
-
-    if dry_run:
-        info['DRY'] += 1
         return True, info
 
     db_dir = Path('/tmp') / f'codeql-db-{os.getpid()}-{abs(hash(str(src))) % 100000}'
@@ -1879,15 +2097,20 @@ def run_codeql_analysis(target: Path, languages, queries, dry_run, source_root=N
         f'--language={languages} --source-root={src} --overwrite'
     )
     suites = []
+    # The action-facing language id is javascript-typescript; installed query
+    # suites retain the CodeQL CLI's `javascript-*` filename prefix.
+    suite_language = {
+        'javascript-typescript': 'javascript',
+    }.get(languages, languages)
     if queries:
-        for q in queries.split(','):
-            q = q.strip()
-            if not q:
+        for query in queries.split(','):
+            query = query.strip()
+            if not query:
                 continue
-            if '/' in q or q.endswith(('.qls', '.ql')):
-                suites.append(q)
+            if '/' in query or query.endswith(('.qls', '.ql')):
+                suites.append(query)
             else:
-                suites.append(f'{languages}-{q}.qls')
+                suites.append(f'{suite_language}-{query}.qls')
     suites_arg = ' '.join(suites)
     analyze_cmd = (
         f'timeout 300 codeql database analyze {db_dir} {suites_arg} '
@@ -1895,14 +2118,20 @@ def run_codeql_analysis(target: Path, languages, queries, dry_run, source_root=N
     )
 
     try:
-        proc = subprocess.run(['bash', '-eu', '-o', 'pipefail', '-c', create_cmd], cwd=str(src))
+        proc = subprocess.run(
+            ['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', create_cmd],
+            cwd=str(src),
+        )
         if proc.returncode != 0:
             info['FAIL'] += 1
             info['label'] = 'CodeQL database create'
             print(f'    → {red(f"FAIL (rc={proc.returncode})")} (database create)')
             return False, info
 
-        proc = subprocess.run(['bash', '-eu', '-o', 'pipefail', '-c', analyze_cmd], cwd=str(src))
+        proc = subprocess.run(
+            ['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', analyze_cmd],
+            cwd=str(src),
+        )
         if proc.returncode != 0:
             info['FAIL'] += 1
             info['label'] = 'CodeQL analyze'
@@ -1910,43 +2139,40 @@ def run_codeql_analysis(target: Path, languages, queries, dry_run, source_root=N
             return False, info
 
         alerts = parse_sarif_alerts(sarif_out)
-        suppressions = load_suppressions(target)
-        sec_alerts = [a for a in alerts if is_security_alert(a)]
-
-        active, suppressed = [], []
-        for a in sec_alerts:
-            match = is_suppressed(a, suppressions)
-            (suppressed if match else active).append((a, match))
-
-        if suppressed:
-            print(f'    {gray(f"({len(suppressed)} suppressed via .codeql-suppressions.yaml)")}')
-            for a, m in suppressed[:20]:
-                print(gray(f'      - {a["rule"]} | {a["path"]}:{a["line"]} — {m["reason"]}'))
-
-        if active:
-            info['FAIL'] += 1
-            info['label'] = f'CodeQL ({len(active)} security alerts)'
-            print(f'    → {red(f"FAIL ({len(active)} security alerts)")}')
-            for a, _ in active[:20]:
-                sev_str = f'sev={a["severity"]}' if a['severity'] else f'level={a["level"]}'
-                print(f'      {red(sev_str)} | {a["rule"]} | {a["path"]}:{a["line"]}')
-            if len(active) > 20:
-                print(f'      ... and {len(active) - 20} more')
-            return False, info
+        sec_alerts = [alert for alert in alerts if is_security_alert(alert)]
+        if sec_alerts:
+            # github/codeql-action/analyze uploads findings but does not fail the
+            # Analyze job merely because SARIF contains an alert. Preserve that
+            # exit contract locally while still surfacing the findings.
+            print(f'    {yellow(f"{len(sec_alerts)} security finding(s) (advisory)")}')
+            for alert in sec_alerts[:20]:
+                severity = (
+                    f'sev={alert["severity"]}'
+                    if alert['severity']
+                    else f'level={alert["level"]}'
+                )
+                print(
+                    f'      {yellow(severity)} | {alert["rule"]} | '
+                    f'{alert["path"]}:{alert["line"]}'
+                )
+            if len(sec_alerts) > 20:
+                print(f'      ... and {len(sec_alerts) - 20} more')
 
         info['PASS'] += 1
-        extra = []
-        if suppressed:
-            extra.append(f'{len(suppressed)} suppressed')
-        nonsec = len(alerts) - len(sec_alerts)
-        if nonsec:
-            extra.append(f'{nonsec} non-security ignored')
-        suffix = f' ({", ".join(extra)})' if extra else ' (no alerts)'
+        nonsecurity = len(alerts) - len(sec_alerts)
+        details = []
+        if sec_alerts:
+            details.append(f'{len(sec_alerts)} security advisory')
+        if nonsecurity:
+            details.append(f'{nonsecurity} non-security result')
+        suffix = f' ({", ".join(details)})' if details else ' (no alerts)'
         print(f'    → {green("PASS")}{suffix}')
         return True, info
     finally:
         if db_dir.exists():
             shutil.rmtree(db_dir, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            sarif_out.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -1964,8 +2190,10 @@ def discover_workflows(target: Path):
     if not workflow_dir.is_dir():
         return []
     found = []
-    # CI workflow: prefer ci.yaml.
-    for name in ('ci.yaml', 'ci.yml', 'validate.yaml', 'validate.yml'):
+    # In cplieger/ci itself, prefer the active self-caller so local expansion
+    # exercises the same wrapper GitHub invokes. Consumer repos have only
+    # ci.yaml, so their normal discovery is unchanged.
+    for name in ('self-ci.yaml', 'self-ci.yml', 'ci.yaml', 'ci.yml', 'validate.yaml', 'validate.yml'):
         p = workflow_dir / name
         if p.is_file():
             found.append(p)
@@ -1976,8 +2204,8 @@ def discover_workflows(target: Path):
         if p.is_file():
             found.append(p)
             break
-    # CodeQL workflow.
-    for name in ('codeql.yml', 'codeql.yaml'):
+    # CodeQL workflow; the ci repo's self caller is the active entry point.
+    for name in ('self-codeql.yml', 'self-codeql.yaml', 'codeql.yml', 'codeql.yaml'):
         p = workflow_dir / name
         if p.is_file():
             found.append(p)
@@ -2007,29 +2235,56 @@ def has_python_sources(target: Path):
 
 
 def has_js_ts_sources(target: Path):
-    """Return True if target contains JS/TS sources outside excluded dirs.
-
-    CodeQL's javascript-typescript extractor analyzes the whole tree at once
-    (like Python), so a single yes/no signal suffices.
-    """
+    """Return True if target contains JS/TS sources outside excluded dirs."""
     skip = {'node_modules', 'vendor', '.git', 'dist', 'build', 'out', '.next', 'coverage'}
     for ext in ('*.ts', '*.tsx', '*.js', '*.jsx', '*.mjs', '*.cjs'):
-        for p in target.rglob(ext):
-            if any(part in skip for part in p.relative_to(target).parts):
+        for path in target.rglob(ext):
+            if any(part in skip for part in path.relative_to(target).parts):
                 continue
             return True
     return False
 
 
-def workflow_installs_npm_packages(jobs):
-    """Return True if any step's `run:` script invokes `npm install` or `npm ci`."""
-    pat = re.compile(r'(?m)^\s*(npm|yarn|pnpm)\s+(install|ci)\b')
-    for _jobname, steps in jobs:
-        for s in steps:
-            run = s.get('run') or ''
-            if pat.search(run):
-                return True
-    return False
+def has_go_sources(target: Path):
+    skip = {'node_modules', 'vendor', 'testdata', '.git'}
+    return any(
+        not any(part in skip for part in path.relative_to(target).parts)
+        for path in target.rglob('*.go')
+    )
+
+
+def has_ruby_sources(target: Path):
+    skip = {'node_modules', 'vendor', '.git', 'dist', 'coverage'}
+    return any(
+        not any(part in skip for part in path.relative_to(target).parts)
+        for path in target.rglob('*.rb')
+    )
+
+
+def has_actions_sources(target: Path):
+    workflow_dir = target / '.github' / 'workflows'
+    return workflow_dir.is_dir() and any(
+        path.is_file() for pattern in ('*.yml', '*.yaml') for path in workflow_dir.glob(pattern)
+    )
+
+
+def detect_codeql_languages(target, explicit=''):
+    """Mirror codeql.yaml's language map, including the Actions pack."""
+    if explicit.strip():
+        return sorted({item.strip() for item in explicit.split(',') if item.strip()})
+    languages = []
+    if has_go_sources(target):
+        languages.append('go')
+    if has_js_ts_sources(target):
+        languages.append('javascript-typescript')
+    if has_python_sources(target):
+        languages.append('python')
+    if has_ruby_sources(target):
+        languages.append('ruby')
+    # The reusable workflow unconditionally unions ["actions"] into the API's
+    # detected languages. Keep that matrix leg even for a workflow-only repo.
+    languages.append('actions')
+    return sorted(set(languages))
 
 
 def clean_stale_node_modules(target: Path):
@@ -2063,82 +2318,21 @@ def clean_stale_node_modules(target: Path):
 
 
 def run_workflow_steps(jobs, target: Path, dry_run: bool, ignore_unknown: bool):
-    """Run a non-CodeQL workflow's jobs/steps. Returns (overall_ok, counters, failed)."""
-    counters = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0, 'MISSING': 0}
-    failed_steps = []
+    """Run plain/synthetic jobs through the same terminal-job engine."""
+    totals = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0, 'MISSING': 0}
+    failures = []
     overall_ok = True
-
     for jobname, steps in jobs:
-        # Each job gets a fresh soft-gate marker, mirroring CI's per-job /tmp.
-        if not dry_run:
-            _clear_failure_marker()
         print(f'--- job: {jobname} ---')
-        for step in steps:
-            # Resolve/strip GitHub expressions in the run body, mirroring the
-            # reusable-step path: bash can't expand `${{ github.event_name }}`
-            # (a "bad substitution" abort under `bash -eu`), so a plain workflow
-            # whose steps reference GHA context — e.g. the meta ci.yaml's detect
-            # step, parsed directly when ci-local runs on the ci repo itself —
-            # would spuriously FAIL. `needs.*.outputs.*` resolves from local
-            # detect; any other expression is stripped, matching CI's substitution.
-            eff_step = step
-            if isinstance(step.get('run'), str) and '${{' in step['run']:
-                eff_step = dict(step)
-                eff_step['run'] = _resolve_with_value(
-                    step['run'], {}, target, strip_unknown=True
-                )
-            kind, name, detail = classify_step(eff_step)
-            wd = eff_step.get('working-directory')
-            wd_str = f' [cwd={wd}]' if wd else ''
-            tag = {
-                'EXEC': blue('EXEC'),
-                'LOCAL': blue('LOCAL'),
-                'SKIP': gray('SKIP'),
-                'UNKNOWN': red('UNKNOWN'),
-            }[kind]
-            tail = f'  ({detail})' if detail else ''
-            print(f'  {tag:<7} {name}{wd_str}{tail}')
-
-            if kind == 'SKIP':
-                counters['SKIP'] += 1
-                continue
-            if kind == 'UNKNOWN':
-                counters['UNKNOWN'] += 1
-                REPORT.not_validated.append(
-                    (jobname, name, f'unrecognized action — not run locally ({detail})')
-                )
-                if not ignore_unknown:
-                    overall_ok = False
-                    failed_steps.append(Failure(jobname, name, 0, '', detail))
-                continue
-
-            res = run_step(kind, name, detail, eff_step, target, dry_run)
-            if res.outcome == 'dry':
-                counters['DRY'] += 1
-                continue
-            print(f'    → {res.status}')
-            if res.outcome == 'pass':
-                counters['PASS'] += 1
-            elif res.outcome == 'missing':
-                counters['MISSING'] += 1
-                tool = res.cmd.split()[0] if res.cmd else name
-                REPORT.not_validated.append(
-                    (jobname, name, f'`{tool}` not on PATH (exit 127) — CI has it; install to check locally')
-                )
-            # continue-on-error: true makes a step advisory in CI — mirror
-            # that locally (report, don't fail the run).
-            elif eff_step.get('continue-on-error') in (True, 'true'):
-                counters['MISSING'] += 1
-                REPORT.not_validated.append(
-                    (jobname, name, f'advisory step failed (continue-on-error; non-blocking in CI) — rc={res.rc}')
-                )
-            else:
-                counters['FAIL'] += 1
-                overall_ok = False
-                failed_steps.append(Failure(jobname, name, res.rc, res.cmd, res.output))
+        ok, counters, failed = process_reusable_steps(
+            jobname, steps, target, '.', {}, dry_run, ignore_unknown
+        )
+        overall_ok = overall_ok and ok
+        for key, value in counters.items():
+            totals[key] = totals.get(key, 0) + value
+        failures.extend(failed)
         print()
-
-    return overall_ok, counters, failed_steps
+    return overall_ok, totals, failures
 
 
 def process_workflow_file(wf_path, target, dry_run, ignore_unknown, no_codeql):
@@ -2157,28 +2351,26 @@ def process_workflow_file(wf_path, target, dry_run, ignore_unknown, no_codeql):
 
     jobs_dict = raw.get('jobs') or {}
 
-    # Check if this is a CodeQL workflow (reusable or inline)
+    # CodeQL's detect + matrix + action lifecycle is orchestrated locally as
+    # one CLI analysis per detected language. Preserve the reusable inputs, but
+    # do not try to execute matrix expressions as literal shell values.
     if is_codeql_workflow(jobs_dict):
         if no_codeql:
             print(f'  {gray("SKIP")} (--no-codeql)')
             return True, grand_counters, []
+        config = codeql_config_for_workflow(raw, jobs_dict, target)
+        if config is not None:
+            return config, grand_counters, []
 
-        # If it's a reusable codeql caller, fall through to synthetic codeql
-        # (the reusable codeql.yaml uses detect+matrix which we handle via
-        # the synthetic pass)
-        if is_codeql_reusable(jobs_dict):
-            # Signal to caller: use synthetic codeql instead
-            return None, grand_counters, []
-
-        # Inline codeql steps: use old handler
-        jobs = [(jn, j.get('steps') or []) for jn, j in jobs_dict.items()]
+        # Legacy static CodeQL workflows still use the direct-step handler.
+        jobs = [(job_name, job.get('steps') or []) for job_name, job in jobs_dict.items()]
         for jobname, steps in jobs:
             print(f'--- job: {jobname} (codeql) ---')
             ok, counters, failed = run_codeql_for_job(jobname, steps, target, dry_run)
             if not ok:
                 grand_ok = False
-            for k, v in counters.items():
-                grand_counters[k] = grand_counters.get(k, 0) + v
+            for key, value in counters.items():
+                grand_counters[key] = grand_counters.get(key, 0) + value
             grand_failed.extend(failed)
             print()
         return grand_ok, grand_counters, grand_failed
@@ -2200,16 +2392,15 @@ def process_workflow_file(wf_path, target, dry_run, ignore_unknown, no_codeql):
                 REPORT.skipped_jobs.append((jobname, 'no steps to run'))
                 print()
                 continue
-            if caller_inputs is not None:
-                # This came from a reusable workflow — use if-evaluation
-                ok, counters, failed = process_reusable_steps(
-                    jobname, steps, target, working_dir, caller_inputs, dry_run, ignore_unknown
-                )
-            else:
-                # Autodetect fallback
-                ok, counters, failed = run_workflow_steps(
-                    [(jobname, steps)], target, dry_run, ignore_unknown
-                )
+            ok, counters, failed = process_reusable_steps(
+                jobname,
+                steps,
+                target,
+                working_dir,
+                caller_inputs or {},
+                dry_run,
+                ignore_unknown,
+            )
             REPORT.ran_jobs.append(jobname)
             if not ok:
                 grand_ok = False
@@ -2246,8 +2437,8 @@ def print_run_summary(counters, failures, ok, plan_only):
         f'{red("failed")} {counters.get("FAIL", 0)}',
         f'skipped {counters.get("SKIP", 0)}',
     ]
-    if counters.get('MISSING'):
-        parts.append(f'{yellow("missing-tool")} {counters["MISSING"]}')
+    if REPORT.not_validated:
+        parts.append(f'{yellow("not-validated")} {len(REPORT.not_validated)}')
     if counters.get('UNKNOWN'):
         parts.append(f'unknown {counters["UNKNOWN"]}')
     if plan_only and counters.get('DRY'):
@@ -2288,8 +2479,6 @@ def print_run_summary(counters, failures, ok, plan_only):
     if ok:
         line = green('RESULT: PASS')
         notes = []
-        if counters.get('MISSING'):
-            notes.append(f'{counters["MISSING"]} tool(s) missing locally')
         if REPORT.not_validated:
             notes.append(f'{len(REPORT.not_validated)} check(s) not validated locally')
         if notes:
@@ -2390,24 +2579,20 @@ def main():
     if not args.plan_only and not args.no_clean_node_modules:
         will_install_npm = False
         for wf_path in workflow_paths:
-            jobs_for_check = load_workflow(wf_path)
-            if jobs_for_check and workflow_installs_npm_packages(jobs_for_check):
+            raw = load_workflow_raw(wf_path)
+            if not raw or is_codeql_workflow(raw.get('jobs') or {}):
+                continue
+            expanded = expand_reusable_jobs(raw.get('jobs') or {}, target)
+            if any(
+                re.search(
+                    r'(?m)^\s*(npm|yarn|pnpm)\s+(install|ci)\b',
+                    step.get('run') or '',
+                )
+                for _job, steps, _wd, _inputs in expanded
+                for step in steps
+            ):
                 will_install_npm = True
                 break
-            # Also check resolved reusable workflows for npm install
-            raw = load_workflow_raw(wf_path)
-            if raw:
-                for job in (raw.get('jobs') or {}).values():
-                    uses = job.get('uses', '')
-                    if uses and REUSABLE_RE.match(uses):
-                        resolved = resolve_reusable_workflow(uses, target)
-                        if resolved:
-                            for rjob in (resolved.get('jobs') or {}).values():
-                                for s in rjob.get('steps') or []:
-                                    run = s.get('run') or ''
-                                    if re.search(r'(?m)^\s*(npm|yarn|pnpm)\s+(install|ci)\b', run):
-                                        will_install_npm = True
-                                        break
         if will_install_npm:
             removed = clean_stale_node_modules(target)
             if removed:
@@ -2443,8 +2628,7 @@ def main():
     grand_counters = {'PASS': 0, 'FAIL': 0, 'SKIP': 0, 'DRY': 0, 'UNKNOWN': 0, 'MISSING': 0}
     grand_failed = []
     grand_ok = True
-    ran_codeql_workflow = False
-    use_synthetic_codeql = False
+    codeql_config = None
 
     if not workflow_paths:
         # Autodetect synthetic workflow
@@ -2463,59 +2647,44 @@ def main():
             print(f'{blue("workflow:")} {rel}')
             print()
 
-            ok, counters, failed = process_workflow_file(
+            result, counters, failed = process_workflow_file(
                 wf_path, target, args.plan_only, args.ignore_unknown, args.no_codeql
             )
 
-            if ok is None:
-                # Signal: reusable codeql -> use synthetic
-                use_synthetic_codeql = True
-                ran_codeql_workflow = True
+            if isinstance(result, CodeQLConfig):
+                codeql_config = result
                 continue
 
-            if 'codeql' in wf_path.name:
-                ran_codeql_workflow = True
-
-            if not ok:
+            if not result:
                 grand_ok = False
-            for k, v in counters.items():
-                grand_counters[k] = grand_counters.get(k, 0) + v
+            for key, value in counters.items():
+                grand_counters[key] = grand_counters.get(key, 0) + value
             grand_failed.extend(failed)
 
-    # Synthetic CodeQL pass
-    if not args.no_codeql and (use_synthetic_codeql or not ran_codeql_workflow):
-        codeql_targets = []
-        for mod in find_go_modules(target):
-            rel_str = str(mod.relative_to(target)) if mod != target else '.'
-            codeql_targets.append(('go', mod, rel_str))
-        if has_python_sources(target):
-            codeql_targets.append(('python', target, '.'))
-        if has_js_ts_sources(target):
-            codeql_targets.append(('javascript-typescript', target, '.'))
-
-        if codeql_targets:
-            print()
-            langs = sorted({lang for lang, _, _ in codeql_targets})
-            print(
-                f'{blue("synthetic codeql:")} {len(codeql_targets)} target(s) [{",".join(langs)}]'
+    # CodeQL runs only when the repository's discovered workflow calls it. The
+    # previous unconditional fallback analyzed private/bespoke repos whose
+    # GitHub Actions suite has no CodeQL workflow at all.
+    if not args.no_codeql and codeql_config is not None:
+        languages = detect_codeql_languages(target, codeql_config.languages)
+        print()
+        print(f'{blue("local codeql:")} {len(languages)} language job(s) [{",".join(languages)}]')
+        print()
+        for language in languages:
+            print(f'--- codeql: {language} ---')
+            ok, sub = run_codeql_analysis(
+                target,
+                language,
+                codeql_config.queries,
+                args.plan_only,
+                source_root=target,
             )
+            if not ok:
+                grand_ok = False
+            for key in ('PASS', 'FAIL', 'SKIP', 'DRY'):
+                grand_counters[key] = grand_counters.get(key, 0) + sub.get(key, 0)
+            if not ok:
+                grand_failed.append(f'{sub.get("label", "CodeQL")} [{language}]')
             print()
-            for lang, src, label in codeql_targets:
-                print(f'--- codeql: {lang}: {label} ---')
-                ok, sub = run_codeql_analysis(
-                    target,
-                    lang,
-                    'security-extended,security-and-quality',
-                    args.plan_only,
-                    source_root=src,
-                )
-                if not ok:
-                    grand_ok = False
-                for k in ('PASS', 'FAIL', 'DRY'):
-                    grand_counters[k] = grand_counters.get(k, 0) + sub.get(k, 0)
-                if not ok:
-                    grand_failed.append(f'{sub.get("label", "CodeQL")} [{lang}:{label}]')
-                print()
 
     # Summary
     print()
