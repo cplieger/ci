@@ -833,8 +833,6 @@ def rewrite_gitleaks_gitignore(cmd: str, cwd: Path) -> str:
             regexes.append('^' + re.escape(entry) + '$')  # exact file
     if not regexes:
         return cmd
-    import json
-
     paths = ', '.join(json.dumps(rx) for rx in regexes)
     config = (
         '[extend]\n'
@@ -1660,8 +1658,6 @@ def is_codeql_reusable(jobs_dict):
 
 def parse_sarif_alerts(sarif_path: Path):
     """Extract findings from a SARIF v2.1.0 file. Returns list of dicts."""
-    import json
-
     with open(sarif_path) as f:
         data = json.load(f)
     alerts = []
