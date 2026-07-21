@@ -231,6 +231,7 @@ jobs:
           SUBPACKAGES_JSON: ${{ steps.type.outputs.subpackages }}
           GO_LANES_JSON: ${{ steps.gomodules.outputs.go_modules }}
           REPO_TYPE: ${{ steps.type.outputs.type }}
+          CLIFF_RELEASE: ${{ steps.cliff.outputs.release }}
         run: |
           # Determine the set of files that materially changed in this push.
           # - For push events with a known `before` SHA: git diff before..HEAD.
@@ -244,6 +245,35 @@ jobs:
           elif ! CHANGED=$(git diff --name-only "$BEFORE..$HEAD" 2>/dev/null); then
             echo "::notice::git diff failed (force push or unreachable history) — treating all tracked files as changed"
             CHANGED=$(git ls-files)
+          fi
+
+          # Stranded-release repair (2026-07-21): when cliff owes a release
+          # (CLIFF_RELEASE=true) the push-range diff above can under-report —
+          # a releasable commit from an EARLIER push may still be untagged
+          # because its own run died (tag-create 403 after a workflow-touching
+          # push superseded it mid-build; see docker-release.yaml "Create
+          # release") or skipped (that push touched only excluded paths, the
+          # web-terminal-server 2026-07-19 stranding). This run's commit IS
+          # main's head (or a successor run's will be), so re-derive
+          # significance from the full unreleased range (last v* tag .. HEAD):
+          # the stranded content counts, the build/publish jobs fire, and the
+          # release lands from a run that still has ref-create rights.
+          # Publish idempotency absorbs any already-published subset
+          # (version-exists guards on npm/JSR, per-lane version compute,
+          # docker image overwrite at the same version tag). BEFORE moves to
+          # the tag so the package.json dev-deps refinement below compares
+          # against the released base, not the push base. When release=false
+          # this block is inert — the push-range semantics (and the no-op
+          # skip for docs/sync pushes) are unchanged.
+          if [ "$CLIFF_RELEASE" = "true" ]; then
+            if LATEST_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null); then
+              CHANGED=$(git diff --name-only "${LATEST_TAG}..${HEAD}")
+              BEFORE=$(git rev-parse "${LATEST_TAG}^{commit}")
+              echo "::notice::release due — deriving changed paths from ${LATEST_TAG}..HEAD (stranded-release repair range)"
+            else
+              echo "::notice::release due with no prior v* tag — treating all tracked files as changed"
+              CHANGED=$(git ls-files)
+            fi
           fi
 
           # Central exclusion patterns. Tight by default: anything that doesn't
