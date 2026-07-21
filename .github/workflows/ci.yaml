@@ -452,7 +452,7 @@ jobs:
       - name: Install zizmor
         run: |
           # renovate: datasource=pypi depName=zizmor
-          VERSION=1.27.0
+          VERSION=1.28.0
           pipx install "zizmor==${VERSION}"
 
       - name: Install shellcheck
