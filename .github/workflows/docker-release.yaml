@@ -984,17 +984,39 @@ jobs:
         #
         # The tag ref is created FIRST via the git data API, pinned to
         # $GITHUB_SHA (the commit this image was built from), and the release
-        # is then created against the existing tag with no --target. Letting
-        # `gh release create --target` create the tag is a race: when a push
-        # (sync PR, Renovate merge) lands on main during the multi-arch build,
-        # the Releases API rejects the integration token's tag-create at the
-        # now-non-head SHA with HTTP 403 "Resource not accessible by
-        # integration" (observed fleet-wide 2026-07-15; a git ref create has
-        # no such head restriction). Rerun-idempotent: an existing tag at the
-        # same SHA is reused, an existing tag elsewhere fails loudly (a tag is
-        # never moved), an existing release is left as-is. finalize mode
-        # (tag already at this SHA, Release missing) flows through the same
-        # guards: the tag is reused and only the Release is created.
+        # is then created against the existing tag with no --target (the
+        # Releases-API tag-create was the first casualty of the restriction
+        # below, observed fleet-wide 2026-07-15). Rerun-idempotent: an
+        # existing tag at the same SHA is reused, an existing tag elsewhere
+        # fails loudly (a tag is never moved), an existing release is left
+        # as-is. finalize mode (tag already at this SHA, Release missing)
+        # flows through the same guards: the tag is reused and only the
+        # Release is created.
+        #
+        # Supersession handoff (2026-07-21, probe-verified in a scratch repo):
+        # once a push that includes workflow-file changes lands on the branch
+        # past this run's commit, the integration token loses ref-CREATE
+        # entirely — REST and authenticated git push both return 403
+        # "Resource not accessible by integration", an existing ref at the
+        # same SHA does not whitelist it, and reruns keep the superseded
+        # GITHUB_SHA so they fail identically (web-terminal-kiro v2.1.0,
+        # 2026-07-21, two attempts). Ref DELETE and release-create on an
+        # existing tag keep working. Sync-PR bursts and Renovate ci-digest
+        # bumps are exactly such pushes, and the multi-arch build window is
+        # minutes wide, so this is a routine race for docker repos, not an
+        # anomaly. When tag-create fails AND the branch head has moved past
+        # this run, hand off instead of failing: the superseding push already
+        # queued its own release run (concurrency group, cancel-in-progress
+        # false), and the detect job's stranded-release repair range
+        # (release.yaml "Detect changed paths") makes that head run rebuild
+        # and release this content with full ref rights. Images this run
+        # pushed at the version tag are overwritten by the successor's build
+        # — same version, one commit later, one consistent provenance chain.
+        # A tag-create failure while this run is STILL at head is a real
+        # permission/API problem and stays a hard failure. The go/ts jobs
+        # keep no handoff on purpose: their tag windows are seconds wide, so
+        # a supersession 403 there is almost never this race and should stay
+        # loud (the repair range still recovers the release either way).
         if: ${{ (inputs.release-needed == 'true' || inputs.finalize == 'true') && steps.nochange.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1007,9 +1029,21 @@ jobs:
               exit 1
             fi
             echo "Tag ${VERSION} already exists at ${GITHUB_SHA} (rerun); reusing it."
-          else
-            gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
+          elif ! gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}" 2>/tmp/tagerr; then
+            cat /tmp/tagerr
+            BRANCH_HEAD=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" \
+              --jq .object.sha 2>/dev/null || echo "")
+            if [ -n "$BRANCH_HEAD" ] && [ "$BRANCH_HEAD" != "$GITHUB_SHA" ]; then
+              MSG="tag ${VERSION} not created: ${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${BRANCH_HEAD})"
+              MSG="${MSG} and the superseded run lost ref-create; handing off — the head run re-releases via the stranded-release repair range."
+              echo "::warning::${MSG}"
+              exit 0
+            fi
+            MSG="tag create for ${VERSION} failed while this run is still ${GITHUB_REF_NAME}'s head"
+            MSG="${MSG} — not the supersession race; investigate token permissions/API state."
+            echo "::error::${MSG}"
+            exit 1
           fi
           # Release presence, status-aware: only a definitive HTTP 404
           # proceeds to create; any other API failure fails the step
