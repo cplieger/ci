@@ -1,6 +1,6 @@
 # Canonical ruff config for cplieger Python repos.
 # Source of truth: cplieger/ci  →  configs/ruff.toml
-# Synced to consumer repos as `ruff.toml` by scripts/classify-repos.sh.
+# Synced to consumer repos as `ruff.toml` by scripts/classify-repos.py.
 # DO NOT edit the synced copies; edit here and let the sync workflow propagate.
 # Seeded from the tools repo's tuned config. Reference: https://docs.astral.sh/ruff/configuration/
 

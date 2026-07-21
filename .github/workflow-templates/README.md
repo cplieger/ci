@@ -1,7 +1,7 @@
 # Workflow Templates
 
 Canonical thin-caller workflows, synced into consumer repos by `sync.yaml` (the
-repo↔file mapping is generated at sync time by `scripts/classify-repos.sh`).
+repo↔file mapping is generated at sync time by `scripts/classify-repos.py`).
 
 ## Sync-managed (uniform across all releaseable repos)
 

@@ -1,4 +1,4 @@
-# OpenSSF Scorecard for cplieger/ci itself. (classify-repos.sh skips this repo
+# OpenSSF Scorecard for cplieger/ci itself. (classify-repos.py skips this repo
 # when generating sync.yml, so the consumer-side scorecard.yml is not synced
 # here — this is ci's own copy. Keep in step with
 # .github/workflow-templates/scorecard.yml.)

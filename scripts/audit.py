@@ -501,7 +501,7 @@ def collect(meta):
         s["has_scorecard"] = bool({"scorecard.yml", "scorecard.yaml"} & wf_names)
         s["has_coverage"] = bool({"coverage.yml", "coverage.yaml"} & wf_names)
 
-    # Surface detection, mirroring scripts/classify-repos.sh: a root go.mod or
+    # Surface detection, mirroring scripts/classify-repos.py: a root go.mod or
     # package.json means measurable coverage (sync delivers coverage.yml), a
     # root Dockerfile means the release pipeline publishes an image (and, for
     # dual-publish repos, needs the Docker Hub secrets).
@@ -772,7 +772,7 @@ def compliance(s):
         if s["has_scorecard"] is False:
             warn.append("scorecard.yml missing")
         # Go/TS repos have measurable statement coverage; sync delivers
-        # coverage.yml to exactly those (classify-repos.sh), so a missing one
+        # coverage.yml to exactly those (classify-repos.py), so a missing one
         # means the sync PR never landed or was reverted.
         if (s.get("has_gomod") or s.get("has_packagejson")) and s["has_coverage"] is False:
             warn.append("coverage.yml missing (Go/TS repos publish a coverage badge)")
