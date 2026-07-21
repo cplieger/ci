@@ -225,7 +225,7 @@ The badge reads `api.scorecard.dev`, populated by `ossf/scorecard-action`
 running with `publish_results: true`. That workflow is **synced org-wide**:
 `.github/workflow-templates/scorecard.yml` → `.github/workflows/scorecard.yml`
 on every public consumer repo (added to the unified-CI group in
-`scripts/classify-repos.sh`). It is push-triggered (no weekly cron) to stay
+`scripts/classify-repos.py`). It is push-triggered (no weekly cron) to stay
 within the 20-job account concurrency cap. The badge shows `no data` until the
 first run on `main` completes after the workflow lands.
 

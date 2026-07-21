@@ -8,7 +8,7 @@
 __pycache__/
 *.pyc
 
-# Runtime-generated sync manifest. classify-repos.sh emits this fresh on every
+# Runtime-generated sync manifest. classify-repos.py emits this fresh on every
 # sync.yaml run (and feeds it straight to repo-file-sync-action), so it is never
 # committed; a committed copy only drifts against the live repo set.
 .github/sync.yml

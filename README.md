@@ -76,7 +76,7 @@ and canonical lint/format configs. Each repo carries a synced one-liner
 
 Tools without remote-config support get their config pushed to consumers as
 PRs by `sync.yaml` (the repo↔file mapping is generated at sync time by
-`scripts/classify-repos.sh`, not committed):
+`scripts/classify-repos.py`, not committed):
 
 | Source (this repo)                                                                                               | Synced to                                            |
 |------------------------------------------------------------------------------------------------------------------|------------------------------------------------------|

@@ -22,7 +22,7 @@ on:
       - ".gitattributes"
       - "LICENSE"
       - "configs/**"
-      - "scripts/classify-repos.sh"
+      - "scripts/classify-repos.py"
       - ".github/workflow-templates/**"
   schedule:
     - cron: "0 2 * * *"
@@ -57,11 +57,11 @@ jobs:
       # straight to the sync action below via CONFIG_PATH. The file is
       # gitignored and never committed: it's a build artifact, and a committed
       # copy only drifts against the live repo set (auto-discovered here via
-      # gh repo list). classify-repos.sh is the source of truth.
+      # gh repo list). classify-repos.py is the source of truth.
       - name: Auto-classify repos
         env:
           GH_TOKEN: ${{ secrets.SYNC_PAT }}
-        run: bash scripts/classify-repos.sh > .github/sync.yml
+        run: python3 scripts/classify-repos.py > .github/sync.yml
         timeout-minutes: 5
 
       # In-house engine: shallow-clones each target, copies the mapped files,

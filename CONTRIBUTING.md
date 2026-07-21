@@ -26,7 +26,7 @@ outward, so the conventions below are about not breaking downstream.
 - `.github/workflow-templates/` — thin caller workflows synced verbatim into
   consumer repos. Each carries a `DO NOT EDIT` header because it is overwritten
   on the next sync.
-- `.github/sync.yml` is **not committed**: `scripts/classify-repos.sh` generates
+- `.github/sync.yml` is **not committed**: `scripts/classify-repos.py` generates
   it fresh at sync time (gitignored), so the script is the mapping's source of
   truth.
 - `actions/git-cliff-version/` — composite action: installs git-cliff and
@@ -44,7 +44,7 @@ outward, so the conventions below are about not breaking downstream.
 - The Renovate preset is **not** in this repo; it lives in `cplieger/.github`
   (`default.json`) and is extended via `{ "extends": ["github>cplieger/.github"] }`.
 - `ci-local.sh` / `_ci_local.py` — the local mirror of the CI battery.
-- `scripts/` — `audit.py` (cross-repo compliance), `classify-repos.sh` (sync
+- `scripts/` — `audit.py` (cross-repo compliance), `classify-repos.py` (sync
   map generator), `sync-files.py` (the sync engine that pushes the mapped
   files into consumers as PRs), `gremlins-aggregate.py` and
   `stryker-aggregate.py` (mutation tracker issues),
@@ -71,7 +71,7 @@ travels:
   them into each consumer as a PR (and enables auto-merge once that repo's CI is
   green). It needs the `SYNC_PAT` secret (fine-grained PAT, Contents:write +
   Pull-requests:write on the targets). `sync.yaml` first regenerates
-  `.github/sync.yml` by running `classify-repos.sh` (the file is gitignored,
+  `.github/sync.yml` by running `classify-repos.py` (the file is gitignored,
   never committed), then runs the in-house sync engine
   (`scripts/sync-files.py` — it replaced the unmaintained
   BetaHuhn/repo-file-sync-action; test locally with `--dry-run`, limit targets
@@ -109,12 +109,12 @@ bash ci-local.sh --plan-only  # show the resolved plan, execute nothing
 bash ci-local.sh --path SUBDIR
 ```
 
-If you change `audit.py` or `classify-repos.sh`, run them directly (both need
+If you change `audit.py` or `classify-repos.py`, run them directly (both need
 `gh` authenticated):
 
 ```bash
 python3 scripts/audit.py
-bash scripts/classify-repos.sh    # prints a regenerated sync.yml to stdout
+python3 scripts/classify-repos.py    # prints a regenerated sync.yml to stdout
 ```
 
 ## Changing this repo affects every consumer
@@ -135,7 +135,7 @@ or the sync PR auto-merges (configs). Treat the reusable workflow inputs and the
 ## Gotchas
 
 - **`.github/sync.yml` is not committed.** It's generated fresh at sync time by
-  `classify-repos.sh` (gitignored), so a stale committed copy can't drift out of
+  `classify-repos.py` (gitignored), so a stale committed copy can't drift out of
   sync with the live repo set. To change the mapping, edit the script.
 - **Don't edit synced files in a consumer repo.** Files carrying a
   `Synced from cplieger/ci … DO NOT EDIT` header (the workflow templates, the
