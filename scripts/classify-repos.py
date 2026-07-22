@@ -17,10 +17,13 @@ more bespoke per-repo ci.yaml.
 Auth: every GitHub read goes through the ambient `gh` CLI credentials
 (GH_TOKEN / SYNC_PAT in CI); no token handling here.
 
-Failure model (mirrors the bash): the initial `gh repo list` aborts the run
-on error or timeout (exit code propagated; 124 on timeout, like GNU timeout).
-Every per-repo API call instead degrades to a safe fallback — an unreadable
-repo classifies as lang=none and drops out of every group.
+Failure model: the initial `gh repo list` aborts the run on error or timeout
+(exit code propagated; 124 on timeout, like GNU timeout), and it aborts on
+hitting the --limit ceiling. Per-repo TREE reads degrade to a safe fallback —
+an unreadable repo classifies as lang=none and drops out of every group
+(mirrors the bash). The TAGS read is the exception and aborts on failure:
+misreading it does not degrade, it picks the WRONG cliff tier and the sync
+auto-merges the wrong cliff.toml (a hardening over the fail-open bash).
 
 Run:
   scripts/classify-repos.py > .github/sync.yml
@@ -132,16 +135,31 @@ def api_json(path):
 
 
 def tree_paths(repo, recursive):
-    """Paths in the repo's HEAD git tree ('0' = root entries, '1' = all)."""
+    """Paths in the repo's HEAD git tree.
+
+    NOTE: GitHub treats ANY `recursive` value — including 0 — as enabling
+    recursion, so every call here returns the FULL tree (the bash had the
+    same misconception). Classification stays correct because all root
+    checks are exact-path matches; collapsing to one tree call per repo is
+    a deliberate follow-up, not part of the fidelity port.
+    """
     data = api_json(f'repos/{OWNER}/{repo}/git/trees/HEAD?recursive={recursive}')
     if not isinstance(data, dict):
         return []
-    return [entry.get('path', '') for entry in data.get('tree', [])]
+    return [entry.get('path', '') for entry in data.get('tree') or [] if isinstance(entry, dict)]
 
 
 def latest_tag(repo):
-    """Name of the repo's newest tag, or '' (untagged repo or failed read)."""
+    """Name of the repo's newest tag: '' when untagged, None when the read
+    FAILED.
+
+    Failure must not classify: the bash treated a failed tags read as
+    untagged, so a transient API error on a live v0.x repo flipped it to
+    the stable cliff tier and the sync auto-merged the wrong cliff.toml.
+    """
     data = api_json(f'repos/{OWNER}/{repo}/tags')
+    if data is None:
+        return None
     if isinstance(data, list) and data and isinstance(data[0], dict):
         return data[0].get('name') or ''
     return ''
@@ -176,7 +194,10 @@ def discover_repos():
     if proc.returncode != 0:
         sys.exit(proc.returncode)  # stderr already passed through, like the bash
     repos = json.loads(proc.stdout)
-    return sorted(repo['name'] for repo in repos if repo.get('isArchived') is False)
+    names = sorted(repo['name'] for repo in repos if repo.get('isArchived') is False)
+    if len(repos) >= 300:
+        sys.exit('classify-repos: repo list hit the --limit 300 ceiling; raise the limit')
+    return names
 
 
 def classify(repo):
@@ -222,7 +243,12 @@ def classify(repo):
     # explicitly mid-0.x (latest tag is v0.x). This way fresh/untagged repos
     # get the stable policy so their first release naturally bumps to v1.0.0
     # instead of being trapped at v0.1.0 by alpha's no-major-bump rule.
-    cliff_tier = 'alpha' if latest_tag(repo).startswith('v0.') else 'stable'
+    tag = latest_tag(repo)
+    if tag is None:
+        sys.exit(
+            f'classify-repos: tags read failed for {repo}; aborting rather than guessing the cliff tier'
+        )
+    cliff_tier = 'alpha' if tag.startswith('v0.') else 'stable'
 
     can_release = has_gomod or has_jsr or has_dockerfile
     print(
