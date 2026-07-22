@@ -662,6 +662,8 @@ jobs:
           #   platforms   = "linux/amd64,linux/arm64" (multi-arch)
           #   sbom_from   = "image" (scan published image)
           #   syft_config = ".syft.yaml" if file exists at root, else ""
+          #                 (back-compat for repo-SPECIFIC syft needs only;
+          #                 the sbom-cataloger is centrally enabled — see below)
           REGISTRIES="ghcr,dockerhub"
           PLATFORMS="linux/amd64,linux/arm64"
           SBOM_FROM="image"
@@ -683,7 +685,13 @@ jobs:
               SBOM_FROM="path" ;;
           esac
 
-          # Auto-detect a checked-in syft config at repo root.
+          # Auto-detect a checked-in syft config at repo root. Back-compat
+          # hook for future repo-SPECIFIC syft needs; NOT required for the
+          # sbom-cataloger, which docker-release.yaml enables centrally for
+          # all image scans via SYFT_SELECT_CATALOGERS (SBOM policy belongs
+          # to the pipeline). Env overrides same-key config-file values in
+          # syft, so a repo .syft.yaml selecting +sbom-cataloger is
+          # redundant-but-harmless during the transition.
           if [ -f .syft.yaml ]; then
             SYFT_CONFIG=".syft.yaml"
           else

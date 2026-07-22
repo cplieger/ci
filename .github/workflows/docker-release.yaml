@@ -77,7 +77,11 @@ on:
         type: string
         default: "./Dockerfile"
       syft-config:
-        description: "Path to a .syft.yaml config for anchore/sbom-action. Empty = none."
+        description: >-
+          Path to a .syft.yaml config for anchore/sbom-action. Empty = none.
+          Back-compat hook for repo-SPECIFIC syft needs only — the
+          sbom-cataloger is enabled centrally for every scan via the
+          SYFT_SELECT_CATALOGERS env below and needs no per-repo config.
         type: string
         default: ""
       sbom-from:
@@ -120,6 +124,23 @@ env:
   # mismatch fails open (publishes).
   # renovate: datasource=github-releases depName=anchore/syft
   SYFT_VERSION: v1.49.0
+  # Central SBOM cataloger policy: enable syft's sbom-cataloger — NOT in its
+  # default image cataloger set — for EVERY syft scan in this workflow, so a
+  # CycloneDX fragment embedded in an image by a source-compiling repo (e.g.
+  # docker-nut-upsd) is inventoried without a per-repo .syft.yaml. Harmless
+  # for images without embedded fragments (the cataloger finds nothing).
+  # Workflow-level env reaches both the anchore/sbom-action steps (the action
+  # spawns syft with the step's process env) and the no-change gate's fresh
+  # syft run below. INVARIANT (load-bearing): the attested SBOM and the
+  # staleness gate's fresh scan MUST use identical cataloger policy — the
+  # gate compares package tuples between the two, and a one-sided cataloger
+  # would make every embedded-fragment image look permanently changed (or
+  # changes invisible). Precedence (per anchore's configuration rules: CLI >
+  # env > config file): this env var overrides a `select-catalogers` key in
+  # any repo .syft.yaml, so a repo file left over from the pre-central era
+  # (they carried exactly this value) is redundant but never conflicting;
+  # other keys in a repo config still apply.
+  SYFT_SELECT_CATALOGERS: "+sbom-cataloger"
 
 # Top-level read-only (OpenSSF Scorecard Token-Permissions); each job below
 # declares the write scopes it needs (build/finalize push, sign, attest, release).
@@ -509,7 +530,10 @@ jobs:
 
           # Fresh side: SBOM of the just-built amd64 image, generated the same
           # way the pipeline's attested SBOM is (image scan honoring the repo
-          # syft config, or path mode scanning the extracted binary). Tool
+          # syft config, or path mode scanning the extracted binary; the
+          # workflow-level SYFT_SELECT_CATALOGERS is inherited here too, so
+          # both sides of the tuple compare run the same cataloger policy —
+          # see the env block). Tool
           # download and image extraction run inside explicit fail-open
           # guards: a transient CDN or registry hiccup must publish normally,
           # never fail the release (the gate's declared contract).
@@ -887,6 +911,91 @@ jobs:
             --predicate sbom.spdx.json \
             --type spdxjson \
             "$IMAGE_REF"
+
+      # ─── OpenVEX attestations (opt-in per repo) ────────────────────────────
+      # Convention: a repo opts in by committing OpenVEX documents as
+      # vex/*.openvex.json; each is attested with --type openvex (predicate
+      # type https://openvex.dev/ns) using the same keyless/OIDC signing the
+      # SBOM attestation above uses, and — like the SBOM — scoped to the
+      # multi-arch manifest-list digest, never the per-arch digests (cosign
+      # attest has no --recursive; verifiers resolve through the index). No
+      # vex/ documents (the common case) = these steps skip.
+      - name: Attest OpenVEX to GHCR
+        if: ${{ steps.nochange.outputs.skip != 'true' && hashFiles('vex/*.openvex.json') != '' }}
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+        run: |
+          for f in vex/*.openvex.json; do
+            cosign attest --yes \
+              --predicate "$f" \
+              --type openvex \
+              "$IMAGE_REF"
+          done
+
+      - name: Attest OpenVEX to Docker Hub
+        if: ${{ contains(inputs.registries, 'dockerhub') && steps.nochange.outputs.skip != 'true' && hashFiles('vex/*.openvex.json') != '' }}
+        env:
+          IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+        run: |
+          for f in vex/*.openvex.json; do
+            cosign attest --yes \
+              --predicate "$f" \
+              --type openvex \
+              "$IMAGE_REF"
+          done
+
+      # Gate assertion: prove the OpenVEX attestations actually landed and
+      # carry the statements we just published. Two checks, both hard-fail:
+      #   1. cosign verify-attestation — cryptographic: at least one openvex
+      #      attestation on the GHCR manifest verifies against this pipeline's
+      #      keyless identity (docker-release.yaml's own OIDC job_workflow_ref;
+      #      regexp because the @ref varies with the consumer's pinned SHA).
+      #   2. Content: download the attestations (same dual envelope-shape
+      #      handling as the no-change gate — sigstore bundle vs legacy DSSE),
+      #      decode every predicate, and require every vulnerability id
+      #      stated in the source vex/ documents to appear. A silently
+      #      dropped or truncated statement fails the release loudly.
+      # GHCR only: the Docker Hub attestation is the same payload signed the
+      # same way (mirroring how the SBOM attestations are not re-verified
+      # per registry anywhere else in this workflow).
+      - name: Verify OpenVEX attestations on GHCR
+        if: ${{ steps.nochange.outputs.skip != 'true' && hashFiles('vex/*.openvex.json') != '' }}
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign verify-attestation --type openvex \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp '^https://github\.com/cplieger/ci/\.github/workflows/docker-release\.yaml@' \
+            "$IMAGE_REF" > /dev/null
+          # OpenVEX statements carry the vulnerability as an object with a
+          # `name` (spec >= v0.2.0) or a bare string (v0.0.1); handle both.
+          extract_ids() {
+            jq -r '.statements[]?.vulnerability
+                   | if type == "object" then (.name // ."@id") else . end
+                   | select(. != null)' "$@" | sort -u
+          }
+          extract_ids vex/*.openvex.json > /tmp/vex-want
+          if [ ! -s /tmp/vex-want ]; then
+            echo "::error::vex/ documents contain no vulnerability statements; refusing to pass an empty gate"
+            exit 1
+          fi
+          cosign download attestation \
+            --predicate-type https://openvex.dev/ns \
+            "$IMAGE_REF" > /tmp/vex-attestations.jsonl
+          : > /tmp/vex-predicates.json
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            printf '%s' "$line" | jq -r '.dsseEnvelope.payload // .payload' \
+              | base64 -d | jq '.predicate' >> /tmp/vex-predicates.json
+          done < /tmp/vex-attestations.jsonl
+          extract_ids /tmp/vex-predicates.json > /tmp/vex-got
+          MISSING=$(comm -23 /tmp/vex-want /tmp/vex-got)
+          if [ -n "$MISSING" ]; then
+            echo "::error::uploaded OpenVEX attestations are missing vulnerability ids: $(echo "$MISSING" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "verified OpenVEX attestations cover: $(tr '\n' ' ' < /tmp/vex-want)"
 
       - name: Generate release notes
         # finalize repairs a tag-created/Release-missing partial run: the
