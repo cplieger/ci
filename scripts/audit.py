@@ -289,7 +289,7 @@ def used_by_package_scrape(name):
     page could not be read — skip the check, never infer drift.
     """
     url = f"https://github.com/{OWNER}/{name}/network/dependents"
-    req = urllib.request.Request(url, headers={"User-Agent": AUDIT_UA})  # noqa: S310 — fixed https:// URL, host is github.com
+    req = urllib.request.Request(url, headers={"User-Agent": AUDIT_UA})  # fixed https:// URL, host is github.com
     delay = 5
     for attempt in range(3):
         try:
