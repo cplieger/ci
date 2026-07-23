@@ -19,6 +19,7 @@ ignore = [
   # Documentation rules — too noisy for utility scripts.
   "D",        # pydocstyle (missing module/class/function docstrings)
   "ANN",      # flake8-annotations (require type hints everywhere)
+  "CPY001",   # flake8-copyright (missing copyright notice) — not used on internal scripts
   "COM812",   # trailing comma — conflicts with formatter
   "ISC001",   # implicit-str-concat — conflicts with formatter
   # Bandit subprocess rules — these scripts call CLI tools deliberately.
@@ -37,6 +38,7 @@ ignore = [
   "PLR0912",  # too-many-branches
   "PLR0913",  # too-many-arguments
   "PLR0915",  # too-many-statements
+  "PLR0917",  # too-many-positional-arguments
   "C901",     # mccabe complexity
   # FBT001/2 — boolean-trap is fine for CLI flag wiring.
   "FBT001",
