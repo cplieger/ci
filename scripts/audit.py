@@ -25,7 +25,10 @@ dependency-graph "Used by counter" package on public repos (it is pinned to
 one package and does NOT follow Go major-version module-path bumps or module
 renames — no REST/GraphQL surface exposes the Settings -> Advanced Security
 selection, so it is read from the public dependents page and the fix itself
-stays a manual dropdown click), and the per-repo
+stays a manual dropdown click), the public docs standard (README presence,
+the canonical footer blocks + License-last order from public-docs.md /
+repo-governance.md, the 25,000-byte Docker Hub description ceiling on image
+repos, and the compose.yaml example), and the per-repo
 deploy-trigger webhook that reaches the self-hosted orchestrator — presence,
 signing secret, exact event set (push for the infra repos, release everywhere
 else), JSON payload, TLS verification on, and exactly one hook (only when
@@ -115,6 +118,28 @@ GHCR_ONLY = {"subflux", "vibekit"}
 # app — or to none (-1, any app may report it) — weakens the gate: an
 # arbitrary integration could satisfy the merge requirement.
 ACTIONS_APP_ID = 15368
+
+# Public docs standard (.kiro/steering/public-docs.md + repo-governance.md
+# "Canonical README footer"). The two footer blocks are matched as
+# whitespace-normalized substrings so a reflow never false-positives; the
+# TEXT itself must stay verbatim. `.github` is the documented exception
+# (AI note only, no Disclaimer). Docker Hub hard-caps the mirrored full
+# description at 25,000 bytes and the sync action truncates the overflow,
+# so an image-repo README above the cap ships a truncated Hub page (the
+# footer is what falls off) — that ceiling is a HARD check.
+FOOTER_DISCLAIMER = (
+    "This project is built with care and follows security best practices, "
+    "but it is intended for personal / self-hosted use. No guarantees of "
+    "fitness for production environments. Use at your own risk."
+)
+FOOTER_AI_NOTE = (
+    "This project was built with AI-assisted tooling using "
+    "[Claude](https://claude.com), [GPT](https://openai.com), and "
+    "[Kiro](https://kiro.dev). The human maintainer defines architecture, "
+    "supervises implementation, and makes all final decisions."
+)
+README_HARD_CAP = 25000  # Docker Hub full-description limit (bytes)
+README_WARN_CAP = 24000  # approach telemetry + margin for URL expansion
 
 # Known-accepted deviations from the standard: {repo: {warning-prefix: reason}}.
 # A warning whose text starts with a listed prefix is suppressed from the
@@ -566,6 +591,35 @@ def collect(meta):
         else:
             s["errors"].append("actions secrets unreadable (API)")
 
+    # Public docs standard. One contents read serves every README check:
+    # presence, the canonical footer blocks, License-last heading order, and
+    # the Docker Hub size ceiling (the `size` field is the raw byte size, so
+    # no decode round-trip can distort the cap check). Public repos only —
+    # reader-facing docs have no audience on a private repo.
+    s["readme_size"] = None
+    s["readme_text"] = None
+    s["compose_example"] = None
+    if not s["private"]:
+        rd = gh_json("api", f"repos/{OWNER}/{name}/contents/README.md")
+        if rd is API_ERROR:
+            s["errors"].append("README.md unreadable (API)")
+        elif isinstance(rd, dict) and rd.get("content") is not None:
+            s["readme_size"] = rd.get("size")
+            try:
+                s["readme_text"] = base64.b64decode(
+                    "".join(rd["content"].split())).decode("utf-8", "replace")
+            except (ValueError, UnicodeError):
+                s["readme_text"] = ""
+        else:
+            s["readme_size"] = 0
+            s["readme_text"] = ""  # definitively absent
+        if s.get("has_dockerfile"):
+            comp = file_text(name, "compose.yaml")
+            if comp is None:
+                s["errors"].append("compose.yaml probe unreadable (API)")
+            else:
+                s["compose_example"] = bool(comp)
+
     ci_txt = file_text(name, ".github/workflows/ci.yaml")
     if ci_txt is None:
         s["ci_wired"] = None  # unknown — never report "not wired" on an API error
@@ -832,6 +886,47 @@ def compliance(s):
                             f"path (want '{want}' [+/vN]; unfetchable by Go "
                             "tooling and indexes a phantom dependency-graph "
                             "package)")
+
+    # Public docs standard (public-docs.md). Presence is hard (a public repo
+    # without a README is broken for its audience). The footer blocks and
+    # License-last order are warnings: real drift, but aligned by the
+    # docs-review skill rather than blocking the audit. The image-repo size
+    # ceiling is hard because it is CURRENT breakage — Docker Hub truncates
+    # the mirrored description above 25,000 bytes, cutting the footer off the
+    # live Hub page. readme_text None means the read failed (already an
+    # [error]); '' means definitively absent.
+    if not s["private"] and s.get("readme_text") is not None:
+        txt = s["readme_text"]
+        if not txt.strip():
+            hard.append("README.md missing")
+        else:
+            norm = " ".join(txt.split())
+            if FOOTER_AI_NOTE not in norm:
+                warn.append("README missing the canonical AI-assistance note "
+                            "(verbatim block in repo-governance.md)")
+            if s["name"] != ".github":
+                if FOOTER_DISCLAIMER not in norm:
+                    warn.append("README missing the canonical Disclaimer block "
+                                "(verbatim block in repo-governance.md)")
+                headings = re.findall(r"^## +(.+?)\s*$", txt, re.MULTILINE)
+                if headings and headings[-1] != "License":
+                    warn.append(f"README's last section is '{headings[-1]}' "
+                                "(want License last — public-docs.md footer "
+                                "invariant)")
+            if s.get("has_dockerfile"):
+                size = s["readme_size"] if isinstance(s.get("readme_size"), int) \
+                    else len(txt.encode())
+                if size > README_HARD_CAP:
+                    hard.append(f"README {size} bytes exceeds Docker Hub's "
+                                f"{README_HARD_CAP}-byte description cap (the "
+                                "mirrored Hub page is truncated mid-document)")
+                elif size > README_WARN_CAP:
+                    warn.append(f"README {size} bytes nears Docker Hub's "
+                                f"{README_HARD_CAP}-byte description cap (run "
+                                "the public-docs.md overflow ladder)")
+        if s.get("compose_example") is False:
+            warn.append("compose.yaml example missing (image repos ship a "
+                        "reference compose — compose-examples.md)")
 
     # Deploy-trigger webhook. Enforced only when the host is configured AND this
     # repo's hooks were readable (see collect); an unreadable token is handled as
