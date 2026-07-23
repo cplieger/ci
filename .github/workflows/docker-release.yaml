@@ -1211,3 +1211,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}
           readme-filepath: README.md
+          # Expand relative in-repo links to absolute GitHub URLs in the Hub
+          # payload only — source READMEs stay relative (clone-friendly), and
+          # the Hub page stops 404ing README links (public-docs.md).
+          enable-url-completion: true
