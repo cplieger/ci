@@ -1038,6 +1038,62 @@ def rewrite_trivy_gitignore(cmd: str, cwd: Path) -> str:
 # Rewrite the `**/*.md` recursive glob to the explicit git-tracked .md list so
 # ci-local lints exactly the fileset CI's checkout would.
 MARKDOWNLINT_GLOB_RE = re.compile(r'(["\']?)\*\*/\*\.md\1')
+_STYLELINT_GLOB_RE = re.compile(r'(["\']?)\*\*/\*\.css\1')
+# The web-lint step feeds html-validate from a raw `find`, so parity means swapping
+# the whole producer rather than a glob. The replacement stays NUL-delimited so the
+# `xargs -0` on the other side of the pipe is untouched.
+_HTMLVALIDATE_FIND_RE = re.compile(
+    r'find\s+\.\s+-name\s+(["\']?)\*\.html\1(?:\s+-not\s+-path\s+\S+)*\s+-print0'
+)
+
+
+def rewrite_stylelint_gitignore(cmd: str, cwd: Path) -> str:
+    """Replace the web-lint stylelint `**/*.css` glob with CI-visible .css files.
+
+    stylelint honours neither .gitignore nor a config `ignoreFiles` here (the synced
+    configs/stylelint.json declares none), so the glob walks gitignored scratch a CI
+    checkout never contains: static-src/coverage/ lcov-report CSS, reports/mutation/,
+    .stryker-tmp/ sandbox copies, .code-review/ artifacts. That failed the local
+    web-lint gate on files CI cannot see -- the same parity break the gitleaks, trivy
+    and markdownlint rewrites above exist to close.
+
+    Unlike markdownlint's, an empty result is a real answer worth acting on: the CI
+    step passes --allow-empty-input precisely because a thin consumer's styles come
+    from a shared package, so a repo whose only CSS is gitignored must lint nothing
+    rather than fall back to the raw glob.
+    """
+    if 'stylelint' not in cmd or not _STYLELINT_GLOB_RE.search(cmd):
+        return cmd
+    try:
+        files = _git_visible_files(cwd, '*.css')
+    except (OSError, subprocess.CalledProcessError):
+        return cmd  # not a git repo or git unavailable; leave the glob as-is
+    if not files:
+        # Hand stylelint a pattern that matches nothing and let
+        # --allow-empty-input do its job.
+        return _STYLELINT_GLOB_RE.sub(shlex.quote('__ci_local_no_css__/*.css'), cmd)
+    return _STYLELINT_GLOB_RE.sub(' '.join(shlex.quote(f) for f in files), cmd)
+
+
+def rewrite_htmlvalidate_gitignore(cmd: str, cwd: Path) -> str:
+    """Replace the web-lint html-validate `find` producer with CI-visible .html files.
+
+    Same parity break as stylelint above, and wider in practice: the CI step's
+    `find . -name "*.html"` excludes only node_modules, so every Stryker sandbox and
+    review-scratch copy of index.html gets validated locally. Swapping the producer
+    for `git ls-files -z` keeps the NUL delimiting that the `xargs -0` downstream
+    expects, and leaves --no-run-if-empty to handle a repo with no HTML.
+    """
+    if 'html-validate' not in cmd or not _HTMLVALIDATE_FIND_RE.search(cmd):
+        return cmd
+    try:
+        _git_visible_files(cwd, '*.html')
+    except (OSError, subprocess.CalledProcessError):
+        return cmd  # not a git repo or git unavailable; leave the find as-is
+    return _HTMLVALIDATE_FIND_RE.sub(
+        'git ls-files -z --cached --others --exclude-standard -- ' + shlex.quote('*.html'),
+        cmd,
+    )
 
 
 def rewrite_markdownlint_gitignore(cmd: str, cwd: Path) -> str:
@@ -1130,6 +1186,8 @@ def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
     # and therefore scanned gitignored files that do not exist in CI.
     cmd = rewrite_hadolint_docker(cmd)
     cmd = rewrite_markdownlint_gitignore(cmd, cwd)
+    cmd = rewrite_stylelint_gitignore(cmd, cwd)
+    cmd = rewrite_htmlvalidate_gitignore(cmd, cwd)
     cmd = rewrite_gitleaks_download(cmd)
     cmd = rewrite_gitleaks_gitignore(cmd, cwd)
     cmd = rewrite_trivy_gitignore(cmd, cwd)
