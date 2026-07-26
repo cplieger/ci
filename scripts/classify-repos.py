@@ -76,29 +76,10 @@ PYTHON_FILES = """\
         dest: ruff.toml"""
 
 
-def ts_config_files(ts_dir):
-    """Emit the TS lint/format file block for a repo whose TS package lives in ts_dir.
-
-    The eslint base is the one config here that JavaScript IMPORTS, so it must land
-    beside the package.json whose node_modules holds its `@eslint/js` and
-    `typescript-eslint` deps. Node resolves a bare specifier from the importing
-    module's own directory upward, so a base at the repo root of a hybrid repo (TS
-    under static-src/, web/, internal/server/static-src/) cannot resolve its own
-    imports at all -- ERR_MODULE_NOT_FOUND before ESLint even starts. That is why
-    every hybrid used to carry a full COPY of the base instead of importing it,
-    which meant a canonical improvement updated a file with no reader. Syncing it
-    into ts_dir makes the import work, and fixes the base's
-    `tsconfigRootDir: import.meta.dirname` at the same time (from ts_dir it
-    resolves to the directory that actually holds tsconfig.json).
-
-    The other three are read by tools invoked with an explicit --config path from
-    the repo root (see ts-ci.yaml's web-lint step), so they stay at the root
-    regardless.
-    """
-    return f"""\
+TS_CONFIG_FILES = """\
     files:
       - source: configs/eslint.config.base.mjs
-        dest: {ts_dir}eslint.config.base.mjs
+        dest: eslint.config.base.mjs
       - source: configs/prettier.json
         dest: .prettierrc.json
       - source: configs/stylelint.json
@@ -237,31 +218,11 @@ def classify(repo):
     has_pyproject = 'pyproject.toml' in root
     is_web = 'static-src' in root or 'web' in root
 
-    # Where the TS package (and therefore node_modules) lives, as a sync dest
-    # prefix: '' for a root package.json, else 'static-src/' etc. Only the eslint
-    # base cares -- see ts_config_files() for why it must land beside the deps.
-    # Derived from signals already in hand, so this adds no API call.
-    ts_dir = ''
-    if not has_pkg:
-        if 'static-src' in root:
-            ts_dir = 'static-src/'
-        elif 'web' in root:
-            ts_dir = 'web/'
-
     # go.mod without a root web dir: check for deeper web indicators
     # (e.g. internal/server/static-src, a nested */web/* tree).
     if has_gomod and not is_web:
         deep = tree_paths(repo, '1')
         is_web = any('static-src' in path or '/web/' in path for path in deep)
-        # A nested TS package: take the SHALLOWEST package.json, which is the one
-        # ts-ci.yaml runs in. node_modules copies are never a candidate.
-        nested = [
-            path for path in deep if path.endswith('/package.json') and 'node_modules/' not in path
-        ]
-        if not has_pkg and nested:
-            shallowest = min(nested, key=lambda path: path.count('/'))
-            ts_dir = shallowest[: -len('package.json')]
-
     # An app opts into the shared image-smoke harness by committing
     # tests/image-smoke.conf; the canonical harness (configs/image-smoke.sh)
     # then syncs to its tests/image-smoke.sh. tests/ is below the root tree,
@@ -301,7 +262,6 @@ def classify(repo):
         'has_jsr': has_jsr,
         'has_pkg': has_pkg,
         'is_web': is_web,
-        'ts_dir': ts_dir,
         'cliff_tier': cliff_tier,
         'has_code': lang in ('go', 'ts'),  # codeql + coverage-badge set
         'can_release': can_release,  # go.mod, jsr.json, or Dockerfile
@@ -399,20 +359,7 @@ def main():
         SMOKE_FILES,
     )
     print_group('Python repos (ruff + editorconfig; bespoke ci.yaml)', python_repos, PYTHON_FILES)
-    # One group per distinct TS package location, because the eslint base's dest
-    # differs per repo (it must land beside that repo's node_modules). Repo order
-    # within each group is preserved; groups are emitted root-first, then the
-    # subdirectory ones in path order, so the manifest stays stable across runs.
-    ts_dirs = {}
-    for repo in ts_config_repos:
-        ts_dirs.setdefault(profiles[repo]['ts_dir'], []).append(repo)
-    for ts_dir in sorted(ts_dirs, key=lambda d: (d != '', d)):
-        where = 'root package.json' if ts_dir == '' else f'TS package in {ts_dir}'
-        print_group(
-            f'TypeScript lint/format configs ({where})',
-            ts_dirs[ts_dir],
-            ts_config_files(ts_dir),
-        )
+    print_group('TypeScript lint/format configs', ts_config_repos, TS_CONFIG_FILES)
     print_group('Release (unified auto-detect)', release_repos, RELEASE_FILES)
     print_group('Cliff config (stable — v1.x+)', cliff_stable, CLIFF_STABLE_FILES)
     print_group('Cliff config (alpha — v0.x or no tags)', cliff_alpha, CLIFF_ALPHA_FILES)
