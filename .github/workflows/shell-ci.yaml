@@ -158,6 +158,43 @@ jobs:
               hadolint ${IGNORE_FLAGS} - < "$DOCKERFILE"
           ) || { echo "Validate Dockerfile" >> /tmp/_ci_failures; exit 1; }
 
+      # Repo-provided shell unit tests (opt-in by file presence). Generalises the
+      # pattern the meta ci.yaml already uses for its own two probes
+      # (scripts/test-cliff-bump-semantics.sh, scripts/test-lane-semantics.sh),
+      # which are keyed to those exact filenames and so only ever run in
+      # cplieger/ci itself. A repo opts in by adding tests/shell/run.sh; every
+      # other repo skips, so this is inert until used.
+      #
+      # Presence is tested with -f and the runner is invoked through `bash`, NOT
+      # -x plus ./script as the two older probes do. Deliberate: those live in the
+      # repo that owns them, where a lost exec bit is noticed immediately, while
+      # this hook fans out to consumer repos where a file committed 100644 would
+      # make the whole suite skip SILENTLY and report the job green — a green run
+      # that tested nothing is the worst outcome available here, and the exec bit
+      # is an easy thing for a consumer to lose (it already happened once while
+      # this was being written). Nothing about running the suite needs it.
+      #
+      # It fills a real gap rather than adding ceremony. The shell-heavy images in
+      # this fleet carry their product logic in shell — an entrypoint plus its
+      # helpers — and the only shell testing that existed was tests/image-smoke.sh,
+      # which needs a built image and a running daemon and therefore cannot
+      # cheaply assert one function's edge cases. Boot paths that fail CLOSED are
+      # exactly what that gap hides: they are the branches a smoke test never
+      # reaches, because a healthy image never takes them.
+      #
+      # The suite runs BEFORE the secret scan and after the linters, so a test
+      # file is held to the same shellcheck/shfmt bar as the code it tests.
+      - name: Run shell unit tests
+        continue-on-error: true
+        run: |
+          (
+            if [ -f tests/shell/run.sh ]; then
+              bash tests/shell/run.sh
+            else
+              echo "no shell unit tests in this repo - skipping"
+            fi
+          ) || { echo "Run shell unit tests" >> /tmp/_ci_failures; exit 1; }
+
       - name: Scan for secrets
         continue-on-error: true
         run: |
