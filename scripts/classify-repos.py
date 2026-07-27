@@ -68,6 +68,19 @@ SMOKE_FILES = """\
       - source: configs/image-smoke.sh
         dest: tests/image-smoke.sh"""
 
+# The shell unit-test harness: the assert/extract library plus its own self-test.
+# Both are pure shared machinery with no repo-specific content, so they are synced;
+# tests/shell/run.sh stays REPO-OWNED because it is the hook's opt-in marker and
+# carries each repo's scope rationale, and the <area>_test.sh files are the repo's
+# own. Keeping run.sh out of the sync also avoids the bootstrap paradox of a marker
+# that only arrives once the repo already has it.
+SHELL_TEST_FILES = """\
+    files:
+      - source: configs/shell/lib.sh
+        dest: tests/shell/lib.sh
+      - source: configs/shell/harness_test.sh
+        dest: tests/shell/harness_test.sh"""
+
 PYTHON_FILES = """\
     files:
       - .editorconfig
@@ -227,7 +240,13 @@ def classify(repo):
     # tests/image-smoke.conf; the canonical harness (configs/image-smoke.sh)
     # then syncs to its tests/image-smoke.sh. tests/ is below the root tree,
     # so this needs the recursive listing.
-    has_smoke = 'tests/image-smoke.conf' in tree_paths(repo, '1')
+    # Both opt-ins read the same recursive listing, so the second costs no
+    # additional API call. A repo enrolls in the shell unit-test harness by
+    # committing tests/shell/run.sh -- the same file cplieger/ci's shell-ci hook
+    # looks for, so enrolment and execution cannot disagree.
+    deep_tree = tree_paths(repo, '1')
+    has_smoke = 'tests/image-smoke.conf' in deep_tree
+    has_shell_tests = 'tests/shell/run.sh' in deep_tree
 
     if has_gomod:
         lang = 'go'
@@ -266,6 +285,7 @@ def classify(repo):
         'has_code': lang in ('go', 'ts'),  # codeql + coverage-badge set
         'can_release': can_release,  # go.mod, jsr.json, or Dockerfile
         'has_smoke': has_smoke,
+        'has_shell_tests': has_shell_tests,
     }
 
 
@@ -298,6 +318,7 @@ def main():
     ts_config_repos = []  # ts repos + go-cross-language repos get the TS lint configs
     python_repos = []  # python repos (pyproject.toml) -> ruff.toml + .editorconfig only
     smoke_repos = []  # repos that opted into the shared image-smoke harness
+    shell_test_repos = []  # repos that opted into the shell unit-test harness
 
     for repo in repo_names:
         profile = profiles[repo]
@@ -323,6 +344,8 @@ def main():
             ts_config_repos.append(repo)
         if profile['has_smoke']:
             smoke_repos.append(repo)
+        if profile['has_shell_tests']:
+            shell_test_repos.append(repo)
         if profile['cliff_tier'] == 'stable':
             cliff_stable.append(repo)
         else:
@@ -357,6 +380,11 @@ def main():
         'Image-smoke harness (repos with a tests/image-smoke.conf opt-in)',
         smoke_repos,
         SMOKE_FILES,
+    )
+    print_group(
+        'Shell unit-test harness (repos with a tests/shell/run.sh opt-in)',
+        shell_test_repos,
+        SHELL_TEST_FILES,
     )
     print_group('Python repos (ruff + editorconfig; bespoke ci.yaml)', python_repos, PYTHON_FILES)
     print_group('TypeScript lint/format configs', ts_config_repos, TS_CONFIG_FILES)
