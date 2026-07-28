@@ -323,6 +323,23 @@ def main():
     for repo in repo_names:
         profile = profiles[repo]
         lang = profile['lang']
+
+        # Resolved BEFORE the lang gate below, deliberately. The shell unit-test
+        # harness is keyed on an explicit opt-in marker the repo committed on
+        # purpose (tests/shell/run.sh); language inference is the wrong gate for
+        # that. A repo can carry branching shell worth unit-testing and still
+        # classify as lang=none — homelab is exactly that shape: operational shell
+        # under apps/**/scripts and komodo/, with no root go.mod, jsr.json,
+        # package.json or Dockerfile to classify on. Without this it fell through
+        # the `continue` below and silently received nothing, which would have left
+        # it owning divergent copies of the very files sync exists to keep single.
+        #
+        # The image-smoke opt-in stays language-gated on purpose: it drives a built
+        # container image, so a repo that can meaningfully opt in necessarily has a
+        # Dockerfile and never classifies as lang=none.
+        if profile['has_shell_tests']:
+            shell_test_repos.append(repo)
+
         if lang == 'none':
             continue
 
@@ -344,8 +361,6 @@ def main():
             ts_config_repos.append(repo)
         if profile['has_smoke']:
             smoke_repos.append(repo)
-        if profile['has_shell_tests']:
-            shell_test_repos.append(repo)
         if profile['cliff_tier'] == 'stable':
             cliff_stable.append(repo)
         else:
