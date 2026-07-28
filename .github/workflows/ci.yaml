@@ -593,6 +593,31 @@ jobs:
             fi
           ) || { echo "Probe nested-lane shell semantics" >> /tmp/_ci_failures; exit 1; }
 
+      # Shell unit-test harness self-test (opt-in by file presence). The
+      # harness is CANONICAL in this repo (configs/shell/lib.sh) and synced
+      # into every adopting consumer's tests/shell/, so a defect in it lands
+      # in N repos at once. Without this step the self-test only ever executed
+      # AFTER sync propagated: a broken lib.sh merged green here, then turned
+      # each consumer's sync PR red — N repos' CI instead of this one PR,
+      # which is backwards from the point of centralising it. The consumer
+      # copies still run it in their own suite; this is the gate at the source.
+      #
+      # Gated on `-f` + `bash`, deliberately NOT the two probes' `-x` +
+      # `./script`: both harness files are tracked 100644 (they are synced as
+      # data, and nothing chmod +x's them on the way in), so an `-x` gate here
+      # would skip SILENTLY and report green — the exact failure the shell-ci
+      # hook's `-f` choice was made to avoid.
+      - name: Probe shell unit-test harness
+        continue-on-error: true
+        run: |
+          (
+            if [ -f configs/shell/harness_test.sh ]; then
+              bash configs/shell/harness_test.sh
+            else
+              echo "no shell test harness in this repo - skipping"
+            fi
+          ) || { echo "Probe shell unit-test harness" >> /tmp/_ci_failures; exit 1; }
+
       - name: Check results
         if: always()
         run: |
