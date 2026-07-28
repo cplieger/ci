@@ -123,7 +123,7 @@ env:
   # generated with. Tuple-level compare tolerates small drift, and any
   # mismatch fails open (publishes).
   # renovate: datasource=github-releases depName=anchore/syft
-  SYFT_VERSION: v1.49.0
+  SYFT_VERSION: v1.50.0
   # Central SBOM cataloger policy: enable syft's sbom-cataloger — NOT in its
   # default image cataloger set — for EVERY syft scan in this workflow, so a
   # CycloneDX fragment embedded in an image by a source-compiling repo (e.g.
