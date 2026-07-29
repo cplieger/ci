@@ -173,13 +173,110 @@ jobs:
             deadcode -test ./...
           ) || { echo "deadcode" >> /tmp/_ci_failures; exit 1; }
 
+      # punused finds unused EXPORTED symbols. It has exactly one release, v0.5.0
+      # (Jan 2022), so the pin is latest and nothing here gets fixed upstream.
+      # Two behaviors of that release dictate how it must be invoked, both read
+      # from its source (main.go, internal/lib/run.go) and measured on the fleet:
+      #
+      # 1. Its one optional argument is a gobwas glob of Go FILENAMES, compiled
+      #    with no separator argument so `*` crosses `/`, matched against each
+      #    file's module-relative path. The default is `**/*.go`, which requires
+      #    a literal `/` and therefore never scans the module-root package —
+      #    reported upstream as bep/punused#4. Worse, this step passed `./...`,
+      #    which matches no file at all, so it reported clean fleet-wide without
+      #    ever scanning a package.
+      # 2. A whole-module run under-reports SILENTLY. run.go's handleFile does
+      #    `symbols, err := DocumentSymbol(...)` and then, on error, constructs
+      #    an fmt.Errorf it never returns — so a file whose symbol request fails
+      #    is treated as symbol-less and skipped with no message and no effect on
+      #    the exit code. Only reference-lookup errors propagate (the rc=1
+      #    `close |1: file already closed` path; main.go also caps the run at a
+      #    2-minute context). Three consecutive runs on subflux: rc=0 with 118
+      #    findings and no message, then rc=1 with 119, twice — the clean-looking
+      #    run had scanned LESS.
+      #
+      # So the scan is per-directory: one invocation per directory holding
+      # tracked .go files, plus one per root-level file, unioned. Each run is
+      # small enough that neither failure mode bites (zero shard failures across
+      # every module in the fleet, where the whole-module run hid 29 findings on
+      # subflux and 48 on vibekit). Shards come from `git ls-files`, so untracked
+      # third-party Go is out of scope; punused itself skips only dot-directories
+      # while walking, and a `<dir>/*.go` glob still reaches deeper paths, hence
+      # the node_modules filter (npm packages that ship a Go port, e.g. flatted).
+      #
+      # A finding is adjudicated once, in the repo's committed `.punused-ignore`
+      # (module root; full-line `#` comments carry the reason). Entries match as
+      # literal substrings of the finding line, so a file path silences a whole
+      # generated file and a symbol signature silences one method. An entry that
+      # matches nothing is reported as a stale warning, never a failure — the
+      # scan is the thing that must not lie, and a truncated scan would turn
+      # stale-entry detection into flaky red.
       - name: Unused exported symbols (punused)
         if: ${{ steps.profile.outputs.app == 'true' }}
         continue-on-error: true
         run: |
           (
-            output=$(punused ./... 2>&1 | grep -v "file already closed" || true)
-            if [ -n "$output" ]; then echo "$output"; exit 1; fi
+            # Per-invocation temp files. A CI runner gets a private /tmp so a fixed
+            # path was harmless there, but ci-local.sh replays this step on a
+            # developer machine where several repos are linted at once (the
+            # code-review skill runs concurrent reviews of different apps by
+            # design). With a shared /tmp/_punused_raw those runs raced: one
+            # repo's `: >` truncate landed between another's write and its read,
+            # so repo A adjudicated repo B's findings against repo A's
+            # .punused-ignore. Observed 2026-07: a knell run reported
+            # seadex-scout's internal/anilist and internal/arrwalk symbols.
+            praw="$(mktemp -t punused_raw.XXXXXX)"
+            pfound="$(mktemp -t punused_found.XXXXXX)"
+            trap 'rm -f "$praw" "$pfound"' EXIT
+            for sub in $(git ls-files '*.go' | xargs -r -n1 dirname | sort -u); do
+              if [ "$sub" = "." ]; then
+                for f in $(git ls-files '*.go' | grep -v /); do
+                  punused "$f" >> "$praw" 2>&1 || true
+                done
+              else
+                punused "$sub/*.go" >> "$praw" 2>&1 || true
+              fi
+            done
+            grep -v 'file already closed' "$praw" \
+              | grep -v '/node_modules/' | sort -u | grep . > "$pfound" || true
+
+            pats=()
+            reasons=0
+            if [ -f .punused-ignore ]; then
+              while IFS= read -r l; do
+                case "$l" in
+                  '#'*) reasons=$((reasons + 1)); continue ;;
+                  '') continue ;;
+                esac
+                pats+=("$l")
+              done < .punused-ignore
+            fi
+            echo "punused: $(grep -c . "$pfound" || true) findings, ${#pats[@]} ignore entries ($reasons comment lines)"
+
+            used=()
+            unexpected=0
+            while IFS= read -r line; do
+              hit=""
+              for i in "${!pats[@]}"; do
+                case "$line" in *"${pats[$i]}"*) hit=1; used[i]=1; break ;; esac
+              done
+              if [ -z "$hit" ]; then
+                echo "::error::unused exported symbol: $line"
+                unexpected=$((unexpected + 1))
+              fi
+            done < "$pfound"
+
+            for i in "${!pats[@]}"; do
+              if [ -z "${used[i]:-}" ]; then
+                echo "::warning::stale .punused-ignore entry (matches nothing): ${pats[$i]}"
+              fi
+            done
+
+            if [ "$unexpected" -gt 0 ]; then
+              echo "::error::$unexpected unused exported symbol(s) not adjudicated."
+              echo "Delete the symbol, wire it up, or add it to .punused-ignore with a reason comment."
+              exit 1
+            fi
           ) || { echo "punused" >> /tmp/_ci_failures; exit 1; }
 
       - name: Scan for secrets
