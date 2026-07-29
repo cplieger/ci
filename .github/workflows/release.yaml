@@ -332,6 +332,12 @@ jobs:
             '(^|/)\.codeql-suppressions\.yaml$'
             '(^|/)\.trivyignore$'
             '(^|/)\.syft\.yaml$'
+            # punused adjudications for the go-ci unused-export gate. Repo-owned
+            # (unlike its siblings above it is not synced), read by go-ci relative
+            # to its working-directory so a nested module carries its own — hence
+            # (^|/). Dev-only: nothing COPYs or embeds it, so an adjudication-only
+            # commit changes no artifact.
+            '(^|/)\.punused-ignore$'
             '^\.github/'
 
             # Go test code
