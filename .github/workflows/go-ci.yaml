@@ -174,43 +174,49 @@ jobs:
           ) || { echo "deadcode" >> /tmp/_ci_failures; exit 1; }
 
       # punused finds unused EXPORTED symbols. It has exactly one release, v0.5.0
-      # (Jan 2022), so the pin is latest and nothing here gets fixed upstream.
-      # Two behaviors of that release dictate how it must be invoked, both read
-      # from its source (main.go, internal/lib/run.go) and measured on the fleet:
+      # (Jan 2022), so the pin is already latest and nothing below gets fixed
+      # upstream. Read the PINNED tag's source, not the default branch: v0.5.0
+      # caps a whole run at 30 SECONDS, where main.go on `main` says 2 minutes,
+      # and that budget is why this step is shaped the way it is.
+      #
+      # Three behaviors of v0.5.0 dictate the invocation, all measured on the
+      # fleet:
       #
       # 1. Its one optional argument is a gobwas glob of Go FILENAMES, compiled
       #    with no separator argument so `*` crosses `/`, matched against each
       #    file's module-relative path. The default is `**/*.go`, which requires
-      #    a literal `/` and therefore never scans the module-root package —
-      #    reported upstream as bep/punused#4. Worse, this step passed `./...`,
-      #    which matches no file at all, so it reported clean fleet-wide without
-      #    ever scanning a package.
-      # 2. A whole-module run under-reports SILENTLY. run.go's handleFile does
-      #    `symbols, err := DocumentSymbol(...)` and then, on error, constructs
-      #    an fmt.Errorf it never returns — so a file whose symbol request fails
-      #    is treated as symbol-less and skipped with no message and no effect on
-      #    the exit code. Only reference-lookup errors propagate (the rc=1
-      #    `close |1: file already closed` path; main.go also caps the run at a
-      #    2-minute context). Three consecutive runs on subflux: rc=0 with 118
-      #    findings and no message, then rc=1 with 119, twice — the clean-looking
-      #    run had scanned LESS.
+      #    a literal `/` and therefore never scans the module-root package --
+      #    reported upstream as bep/punused#4. Worse, this step used to pass
+      #    `./...`, which matches no file at all, so it reported clean fleet-wide
+      #    without ever scanning a package.
+      # 2. A run that exceeds the 30s context dies mid-read, and every later
+      #    write fails with `close |1: file already closed`. Filtering that line
+      #    (as this step used to) turns a truncated scan into a clean-looking
+      #    one, so it is now an ESCALATION TRIGGER rather than noise: the
+      #    directory is re-scanned one file at a time, where the budget is never
+      #    in play. Measured: vibekit's internal/api takes 24-27s as one
+      #    directory, i.e. it sits on the cliff edge and trips under load.
+      # 3. run.go's handleFile does `symbols, err := DocumentSymbol(...)` and, on
+      #    error, constructs an fmt.Errorf it never returns -- so a file whose
+      #    symbol request fails is skipped with no message and no effect on the
+      #    exit code. That one is undetectable from the output, which is the
+      #    other reason to keep each request small: a single file is the least
+      #    the tool can be asked to do. Accepted residual; it cannot be closed
+      #    from outside the tool.
       #
-      # So the scan is per-directory: one invocation per directory holding
-      # tracked .go files, plus one per root-level file, unioned. Each run is
-      # small enough that neither failure mode bites (zero shard failures across
-      # every module in the fleet, where the whole-module run hid 29 findings on
-      # subflux and 48 on vibekit). Shards come from `git ls-files`, so untracked
-      # third-party Go is out of scope; punused itself skips only dot-directories
-      # while walking, and a `<dir>/*.go` glob still reaches deeper paths, hence
-      # the node_modules filter (npm packages that ship a Go port, e.g. flatted).
+      # Shards come from `git ls-files`, so untracked third-party Go is out of
+      # scope. punused itself skips only dot-directories while walking, and a
+      # `<dir>/*.go` glob still reaches deeper paths, hence the node_modules
+      # filter (npm packages that ship a Go port, e.g. flatted).
       #
       # A finding is adjudicated once, in the repo's committed `.punused-ignore`
       # (module root; full-line `#` comments carry the reason). Entries match as
       # literal substrings of the finding line, so a file path silences a whole
-      # generated file and a symbol signature silences one method. An entry that
-      # matches nothing is reported as a stale warning, never a failure — the
-      # scan is the thing that must not lie, and a truncated scan would turn
-      # stale-entry detection into flaky red.
+      # generated file and a symbol signature silences one method. Never put
+      # file:line:col in an entry -- line numbers shift and the entry goes stale.
+      # An entry that matches nothing is reported as a stale warning, never a
+      # failure: the scan is the thing that must not lie, and an under-reporting
+      # scan would turn stale-entry detection into flaky red.
       - name: Unused exported symbols (punused)
         if: ${{ steps.profile.outputs.app == 'true' }}
         continue-on-error: true
@@ -226,19 +232,45 @@ jobs:
             # .punused-ignore. Observed 2026-07: a knell run reported
             # seadex-scout's internal/anilist and internal/arrwalk symbols.
             praw="$(mktemp -t punused_raw.XXXXXX)"
+            pshard="$(mktemp -t punused_shard.XXXXXX)"
             pfound="$(mktemp -t punused_found.XXXXXX)"
-            trap 'rm -f "$praw" "$pfound"' EXIT
+            trap 'rm -f "$praw" "$pshard" "$pfound"' EXIT
+            truncated=0
+
+            # scan <glob> [split-target] -- run one shard, escalating on a
+            # truncated run. `split-target` is the directory whose files get
+            # re-scanned individually; empty means this IS a single file and
+            # there is nothing left to split, so the scan is unreliable and the
+            # step fails rather than reporting a number it cannot stand behind.
+            scan() {
+              punused "$1" > "$pshard" 2>&1 || true
+              if grep -q 'file already closed' "$pshard"; then
+                if [ -z "${2:-}" ]; then
+                  echo "::error::punused exceeded its 30s budget on a single file ($1); this scan is incomplete and cannot be trusted"
+                  truncated=1
+                  return 0
+                fi
+                echo "::notice::punused truncated on $1; re-scanning its files individually"
+                for pf in $(git ls-files "$2/*.go"); do
+                  scan "$pf" ""
+                done
+                return 0
+              fi
+              grep -v 'file already closed' "$pshard" >> "$praw" || true
+            }
+
             for sub in $(git ls-files '*.go' | xargs -r -n1 dirname | sort -u); do
               if [ "$sub" = "." ]; then
                 for f in $(git ls-files '*.go' | grep -v /); do
-                  punused "$f" >> "$praw" 2>&1 || true
+                  scan "$f" ""
                 done
               else
-                punused "$sub/*.go" >> "$praw" 2>&1 || true
+                scan "$sub/*.go" "$sub"
               fi
             done
-            grep -v 'file already closed' "$praw" \
-              | grep -v '/node_modules/' | sort -u | grep . > "$pfound" || true
+            if [ "$truncated" -ne 0 ]; then exit 1; fi
+
+            grep -v '/node_modules/' "$praw" | sort -u | grep . > "$pfound" || true
 
             pats=()
             reasons=0
