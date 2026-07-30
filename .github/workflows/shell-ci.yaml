@@ -14,10 +14,27 @@ on:
           explicit glob to override, or "/dev/null" to skip shellcheck.
         type: string
         default: "auto"
+      # Default ignores, and why each one is off:
+      #   DL3018 — demands apk version pins. This fleet deliberately does not use
+      #     them: the base image's SHA digest is the reproducibility guarantee,
+      #     and an apk pin drifts independently of it and breaks on base bumps
+      #     (see docker-builds.md "Don't pin distro (apk) package versions").
+      #   DL3066 — demands a numeric uid in USER. Its premise is false for the
+      #     distroless bases we use, which ship an /etc/passwd containing
+      #     `nonroot`. The failure it guards against is Kubernetes
+      #     `runAsNonRoot`, where the kubelet cannot resolve a name from the
+      #     image; nothing here deploys to Kubernetes, and our compose files
+      #     already pass a numeric user. Upstream enabled it by default in
+      #     v2.15.0 against its own requester's suggestion, its author calls the
+      #     implementation "needs further work", and `USER ${ARG}` is an open
+      #     false positive (hadolint#1222) whose documented workaround is to
+      #     disable the rule. It also fires on every USER instruction, not just
+      #     the last, so a builder-stage `USER root` trips it. Revisit once
+      #     upstream settles.
       hadolint-ignores:
         description: Comma-separated hadolint rules to ignore (each passed as --ignore).
         type: string
-        default: "DL3018"
+        default: "DL3018,DL3066"
       dockerfile:
         description: Path to the Dockerfile to lint.
         type: string
