@@ -27,7 +27,7 @@
 #     does not expose.
 #   - every `go install <pkg>@<ver>` line in go-ci.yaml; the version is pinned in
 #     a shell var (e.g. GOVULNCHECK_VERSION=v1.6.0) which this script resolves:
-#     govulncheck, actionlint, deadcode, punused
+#     govulncheck, actionlint, deadcode, punused, gopls (punused's LSP server)
 #   Versions are always read live from the workflows, never hardcoded here,
 #   via the `# renovate: ... depName=X` + `VERSION` pins (hadolint's pin is the
 #   HADOLINT_VERSION var feeding its `hadolint/hadolint:<tag>` docker-run).

@@ -97,6 +97,18 @@ jobs:
           # renovate: datasource=go depName=github.com/bep/punused
           PUNUSED_VERSION=v0.5.0
           go install "github.com/bep/punused@${PUNUSED_VERSION}"
+          # punused drives an external gopls over LSP (sourcegraph/go-lsp client;
+          # it does NOT vendor the server), so gopls is a hard runtime dependency
+          # of the step below and has to be installed here. Its own module, hence
+          # its own pin. GOTOOLCHAIN=auto only for this install: setup-go pins
+          # GOTOOLCHAIN=local, and gopls tracks the Go release closely (v0.23.0
+          # requires go 1.26.0), so a future Renovate bump requiring a newer Go
+          # than a consumer's go.mod would fail the install. This repo has no Go
+          # app, so its own CI never runs this step -- the break would surface
+          # only after a tag propagated, in every consumer at once.
+          # renovate: datasource=go depName=golang.org/x/tools/gopls
+          GOPLS_VERSION=v0.23.0
+          GOTOOLCHAIN=auto go install "golang.org/x/tools/gopls@${GOPLS_VERSION}"
 
       # Soft-gate block: each step below runs to completion (continue-on-error)
       # and records its own name to /tmp/_ci_failures on failure; the final
@@ -196,6 +208,13 @@ jobs:
       #    directory is re-scanned one file at a time, where the budget is never
       #    in play. Measured: vibekit's internal/api takes 24-27s as one
       #    directory, i.e. it sits on the cliff edge and trips under load.
+      #    That string is NOT unique to the timeout, which is why the gopls
+      #    preflight below exists: punused prints the same line, instantly, for
+      #    every input when it cannot reach gopls at all. Read as truncation it
+      #    made a missing tool look like a fleet of files each blowing a 30s
+      #    budget in 1ms, and fleet CI stayed red for 50 hours on that reading
+      #    (2026-07-29 → 07-31). Check the cheap, unambiguous cause first and
+      #    let the ambiguous message mean only what is left.
       # 3. run.go's handleFile does `symbols, err := DocumentSymbol(...)` and, on
       #    error, constructs an fmt.Errorf it never returns -- so a file whose
       #    symbol request fails is skipped with no message and no effect on the
@@ -237,6 +256,15 @@ jobs:
             trap 'rm -f "$praw" "$pshard" "$pfound"' EXIT
             truncated=0
 
+            # Preflight: gopls is punused's LSP server, spawned per invocation.
+            # Absent or unrunnable, every scan below fails identically to a
+            # truncated run, so establish which world we are in before reading
+            # that ambiguous signal as truncation.
+            if ! gopls version >/dev/null 2>&1; then
+              echo "::error::gopls is not runnable; punused cannot scan anything (it drives gopls over LSP). Install it in the app-tools step."
+              exit 1
+            fi
+
             # scan <glob> [split-target] -- run one shard, escalating on a
             # truncated run. `split-target` is the directory whose files get
             # re-scanned individually; empty means this IS a single file and
@@ -246,7 +274,8 @@ jobs:
               punused "$1" > "$pshard" 2>&1 || true
               if grep -q 'file already closed' "$pshard"; then
                 if [ -z "${2:-}" ]; then
-                  echo "::error::punused exceeded its 30s budget on a single file ($1); this scan is incomplete and cannot be trusted"
+                  echo "::error::punused died mid-scan on a single file ($1), which cannot be split further; this scan cannot be trusted."
+                  echo "  gopls is known runnable (preflight passed), so its 30s budget is the likely cause. punused said: $(tr '\n' ' ' < "$pshard")"
                   truncated=1
                   return 0
                 fi
