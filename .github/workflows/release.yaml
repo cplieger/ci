@@ -425,32 +425,49 @@ jobs:
           # leaving it fully significant lets a devDependency bump mint a
           # spurious release (the bug this fixes). So:
           #
-          #   docker / go : NO build artifact reads package.json (web-UI images
-          #                 pin TS deps as Dockerfile ARGs + tsc; verified no
-          #                 Dockerfile references package.json). Drop every
-          #                 package.json from the significant set outright.
-          #   ts          : package.json IS the published tarball manifest, but
-          #                 devDependencies never ship. Keep it significant only
-          #                 when a non-devDependencies field changed. Compare
-          #                 before/after with devDependencies stripped; if equal,
-          #                 the change was dev-only — drop it. Applies to root
-          #                 and subpackage package.json alike.
+          # The question is not the REPO's type but whether THAT package.json is
+          # a published manifest:
+          #
+          #   published manifest : every `<subpkg>/package.json` for a declared TS
+          #                 subpackage, plus the root one in a ts repo. It is the
+          #                 npm tarball manifest, but devDependencies never ship,
+          #                 so keep it significant only when a
+          #                 non-devDependencies field changed (compare
+          #                 before/after with devDependencies stripped).
+          #   anything else : dev tooling. NO build artifact reads it (web-UI
+          #                 images pin TS deps as Dockerfile ARGs + tsc; verified
+          #                 no Dockerfile references package.json). Drop it.
+          #
+          # Keying on REPO_TYPE alone was wrong for a HYBRID repo: it is type=go
+          # because its ROOT is a Go module, while `web/package.json` is the npm
+          # manifest -- so the docker/go blanket drop made a subpackage-only
+          # change invisible and no release could ever publish that subpackage.
+          # keyenc hit it: its first release failed at npm for an unrelated
+          # reason, and afterwards no run could repair the missing publish
+          # because every commit touching web/ was dropped here.
           if [ -n "$SIGNIFICANT" ] && echo "$SIGNIFICANT" | grep -qE '(^|/)package\.json$'; then
-            if [ "$REPO_TYPE" = "docker" ] || [ "$REPO_TYPE" = "go" ]; then
-              SIGNIFICANT=$(echo "$SIGNIFICANT" | grep -Ev '(^|/)package\.json$' || true)
-              echo "::notice::$REPO_TYPE repo — package.json is dev-only here, dropped from significance"
-            elif [ "$REPO_TYPE" = "ts" ] && [ -n "$BEFORE" ] \
-                 && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
-              while IFS= read -r pj; do
-                [ -z "$pj" ] && continue
+            MANIFESTS=$(echo "$SUBPACKAGES_JSON" | jq -r '.[] | . + "/package.json"')
+            if [ "$REPO_TYPE" = "ts" ]; then
+              MANIFESTS=$(printf '%s\npackage.json\n' "$MANIFESTS")
+            fi
+            while IFS= read -r pj; do
+              [ -z "$pj" ] && continue
+              if ! printf '%s\n' "$MANIFESTS" | grep -qxF "$pj"; then
+                SIGNIFICANT=$(echo "$SIGNIFICANT" | grep -vxF "$pj" || true)
+                echo "::notice::$pj is not a published manifest — dropped from significance"
+                continue
+              fi
+              # A published manifest. With no BEFORE to diff against, fail OPEN
+              # (stay significant): a missed publish is worse than a spurious one.
+              if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
                 b=$(git show "$BEFORE:$pj" 2>/dev/null | jq -S 'del(.devDependencies)' 2>/dev/null || echo "")
                 h=$(git show "$HEAD:$pj"   2>/dev/null | jq -S 'del(.devDependencies)' 2>/dev/null || echo "")
                 if [ -n "$b" ] && [ "$b" = "$h" ]; then
                   SIGNIFICANT=$(echo "$SIGNIFICANT" | grep -vxF "$pj" || true)
                   echo "::notice::$pj changed only in devDependencies — not significant"
                 fi
-              done < <(echo "$SIGNIFICANT" | grep -E '(^|/)package\.json$')
-            fi
+              fi
+            done < <(echo "$SIGNIFICANT" | grep -E '(^|/)package\.json$')
           fi
 
           # Determine root_changed (any significant file outside all subpackage
