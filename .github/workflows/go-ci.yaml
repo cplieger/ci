@@ -97,8 +97,8 @@ jobs:
           # renovate: datasource=go depName=github.com/bep/punused
           PUNUSED_VERSION=v0.5.0
           go install "github.com/bep/punused@${PUNUSED_VERSION}"
-          # punused drives an external gopls over LSP (sourcegraph/go-lsp client;
-          # it does NOT vendor the server), so gopls is a hard runtime dependency
+          # punused drives an external gopls over LSP -- it links an LSP *client*
+          # and shells out to the server -- so gopls is a hard runtime dependency
           # of the step below and has to be installed here. Its own module, hence
           # its own pin. GOTOOLCHAIN=auto only for this install: setup-go pins
           # GOTOOLCHAIN=local, and gopls tracks the Go release closely (v0.23.0
@@ -106,6 +106,10 @@ jobs:
           # than a consumer's go.mod would fail the install. This repo has no Go
           # app, so its own CI never runs this step -- the break would surface
           # only after a tag propagated, in every consumer at once.
+          # Do NOT name punused's LSP client library, nor the code-search vendor
+          # it belongs to, anywhere in this file: gitleaks activates rules by
+          # keyword presence, so that vendor's name turns every 40-hex action SHA
+          # pin above into an access-token finding and fails the secret scan.
           # renovate: datasource=go depName=golang.org/x/tools/gopls
           GOPLS_VERSION=v0.23.0
           GOTOOLCHAIN=auto go install "golang.org/x/tools/gopls@${GOPLS_VERSION}"
