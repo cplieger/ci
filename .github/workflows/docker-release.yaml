@@ -116,7 +116,7 @@ env:
   # renovate: datasource=github-releases depName=sigstore/cosign
   COSIGN_VERSION: v3.1.2
   # renovate: datasource=github-releases depName=aquasecurity/trivy
-  TRIVY_VERSION: v0.72.0
+  TRIVY_VERSION: v0.73.0
   # syft for the no-change publish gate, pinned to the version bundled by the
   # anchore/sbom-action pin below (v0.24.0 bundles syft v1.42.3) so the gate's
   # fresh scan sees the same package inventory the attested baseline SBOM was
