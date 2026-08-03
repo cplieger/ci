@@ -49,8 +49,11 @@ jobs:
           ONLY: ${{ github.event.inputs.only }}
         run: |
           set -euo pipefail
-          repos=$(gh repo list cplieger --limit 300 --json name,isArchived --jq '
-            [.[] | select(.isArchived == false) | .name] | .[]
+          # Forks are excluded fleet-wide (same rule as scripts/audit.py): a fork
+          # carries UPSTREAM's code and tests, so its mutation score measures
+          # someone else's suite and its tracker issue would be unactionable.
+          repos=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
+            [.[] | select(.isArchived == false and .isFork == false) | .name] | .[]
           ')
 
           # Optional manual filter: the workflow_dispatch 'only' input limits the
