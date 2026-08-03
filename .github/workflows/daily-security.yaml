@@ -51,8 +51,11 @@ jobs:
           # Public only (visibility rule, not a repo-name list): private repos
           # draw the account's included minutes and own their scan cadence —
           # see the "Private repos" note in the header.
-          repos=$(gh repo list cplieger --limit 300 --json name,isArchived,visibility --jq '
-            [.[] | select(.isArchived == false and .visibility == "PUBLIC") | .name] | .[]
+          # Forks are excluded fleet-wide (same rule as scripts/audit.py): a fork
+          # carries UPSTREAM's code, so scanning it reports findings only upstream
+          # can fix while spending our daily budget.
+          repos=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork,visibility --jq '
+            [.[] | select(.isArchived == false and .isFork == false and .visibility == "PUBLIC") | .name] | .[]
           ')
           REPOS=()
           for r in $repos; do

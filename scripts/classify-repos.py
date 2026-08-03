@@ -181,11 +181,18 @@ def latest_tag(repo):
 
 
 def discover_repos():
-    """All non-archived cplieger repo names, byte-order sorted.
+    """All non-archived, non-fork cplieger repo names, byte-order sorted.
 
     The bash sorted with plain `sort`; on the ubuntu-24.04 sync runner
     (LANG=C.UTF-8) that is byte order, which Python's str sort matches
     regardless of the ambient locale.
+
+    Forks are excluded fleet-wide (same rule as audit.py): a fork's tree is
+    UPSTREAM's, so syncing our conventions into it rewrites code we do not own
+    (LICENSE included) and makes the fork diverge from the branch it exists to
+    track. Observed before this filter: cplieger/loki and cplieger/go-pkcs12
+    auto-merged our full CI/release workflow set, which then ran our pipelines
+    against upstream's monorepo on every push.
     """
     try:
         proc = subprocess.run(
@@ -197,7 +204,7 @@ def discover_repos():
                 '--limit',
                 '300',
                 '--json',
-                'name,isArchived,primaryLanguage',
+                'name,isArchived,isFork,primaryLanguage',
             ],
             check=False,
             stdout=subprocess.PIPE,
@@ -209,7 +216,11 @@ def discover_repos():
     if proc.returncode != 0:
         sys.exit(proc.returncode)  # stderr already passed through, like the bash
     repos = json.loads(proc.stdout)
-    names = sorted(repo['name'] for repo in repos if repo.get('isArchived') is False)
+    names = sorted(
+        repo['name']
+        for repo in repos
+        if repo.get('isArchived') is False and repo.get('isFork') is False
+    )
     if len(repos) >= 300:
         sys.exit('classify-repos: repo list hit the --limit 300 ceiling; raise the limit')
     return names

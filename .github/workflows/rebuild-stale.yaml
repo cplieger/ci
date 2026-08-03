@@ -75,8 +75,11 @@ jobs:
           #   INTERVAL_OVERRIDES[docker-keepalived]=3
           declare -A INTERVAL_OVERRIDES=()
 
-          repos=$(gh repo list cplieger --limit 300 --json name,isArchived --jq '
-            [.[] | select(.isArchived == false) | .name] | .[]
+          # Forks are excluded fleet-wide (same rule as scripts/audit.py): a fork
+          # publishes no cplieger image, so a staleness rebuild would dispatch a
+          # release pipeline against upstream's code.
+          repos=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
+            [.[] | select(.isArchived == false and .isFork == false) | .name] | .[]
           ')
 
           STALE=()

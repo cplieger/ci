@@ -67,8 +67,12 @@ jobs:
           SHARD_BUDGET_SECONDS: "14400"
         run: |
           set -euo pipefail
-          repos=$(gh repo list cplieger --limit 300 --json name,isArchived --jq '
-            [.[] | select(.isArchived == false) | .name] | .[]
+          # Forks are excluded fleet-wide (same rule as scripts/audit.py): a fork
+          # carries UPSTREAM's code, so fuzzing it spends the shared runner budget
+          # on targets we neither own nor can fix, and any finding would be filed
+          # against a repo whose issues are typically disabled.
+          repos=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
+            [.[] | select(.isArchived == false and .isFork == false) | .name] | .[]
           ')
 
           shard_matrix='[]'
@@ -237,6 +241,23 @@ jobs:
           : > "$merged"
           find "$GITHUB_WORKSPACE/shard-findings" -name findings.txt -exec cat {} + 2>/dev/null | sort -u > "$merged" || true
           echo "consolidated $(wc -l < "$merged") finding(s) for ${REPO}"
+
+          # A repo with issues disabled has nowhere to put a finding, and BOTH
+          # passes below would then abort the step ("has disabled issues", exit 1
+          # under the default `bash -e` shell) — reddening the whole weekly run
+          # even on a zero-finding repo. Excluding forks removes today's only
+          # such repo, but `issues` is a warn-level setting in the governance
+          # audit, so a first-party repo can reach this state too. A FAILED read
+          # falls through to the issue ops on purpose: better a loud failure than
+          # a silently dropped finding.
+          issues_enabled=$(gh repo view "$REPO" --json hasIssuesEnabled --jq '.hasIssuesEnabled') || {
+            echo "  could not read the issue setting for ${REPO}; attempting issue ops anyway" >&2
+            issues_enabled=true
+          }
+          if [ "$issues_enabled" != "true" ]; then
+            echo "::notice::${REPO} has issues disabled; skipping fuzz issue management ($(wc -l < "$merged") finding(s) remain in this run's artifacts)"
+            exit 0
+          fi
 
           # Create a label, tolerating "already exists" but surfacing real
           # errors (e.g. the PAT lacking issues:write) as a failure.
