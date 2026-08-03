@@ -147,6 +147,7 @@ jobs:
         run: |
           set -uo pipefail
           : > "$GITHUB_WORKSPACE/findings.txt"
+          : > "$GITHUB_WORKSPACE/broken.txt"
           # Deterministic global target list: `go list ./...` is import-path
           # sorted and `go test -list` order is stable for a fixed commit, so
           # every shard of this repo sees the identical ordered list and the
@@ -166,7 +167,7 @@ jobs:
               pkg="${entry%%|*}"
               fn="${entry##*|}"
               echo "::group::fuzz ${fn} (${pkg})"
-              out=$(go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME_SECONDS}s" "$pkg" 2>&1) || true
+              out=$(go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME_SECONDS}s" "$pkg" 2>&1) && status=0 || status=$?
               printf '%s\n' "$out"
               rel=$(printf '%s\n' "$out" | sed -nE 's@.*Failing input written to (testdata/fuzz/[^[:space:]]+).*@\1@p' | head -1)
               if [ -n "$rel" ]; then
@@ -185,6 +186,22 @@ jobs:
                 rel_dir="${dir#"$PWD"}"; rel_dir="${rel_dir#/}"
                 printf '%s|%s|%s|%s|%s\n' "$fn" "$(basename "$rel")" "${rel_dir:+$rel_dir/}${rel}" "$size" "$preview" \
                   >> "$GITHUB_WORKSPACE/findings.txt"
+              elif [ "$status" -ne 0 ]; then
+                # go test failed but wrote no reproducer, so the target never
+                # explored anything: it is BROKEN, not fuzzing. Two real shapes,
+                # neither of which writes testdata/fuzz/... — a committed seed or
+                # f.Add entry that already fails (the seed phase aborts before
+                # fuzzing starts), and a build failure in the package.
+                #
+                # This was silent until 2026-08: `|| true` discarded the exit
+                # status and the extraction above found no path, so the leg went
+                # green with no finding and no issue. vibekit's FuzzSetDebug
+                # panicked on seed#0 in every weekly run for weeks with zero
+                # signal anywhere. Fail the shard instead — a broken target is a
+                # process defect, so it fails closed rather than filing an issue
+                # that the seed-committed auto-close could never close.
+                printf '%s (%s)\n' "$fn" "$pkg" >> "$GITHUB_WORKSPACE/broken.txt"
+                echo "::error::${fn} (${pkg}) failed without writing a reproducer — broken seed corpus or build failure, see the group log"
               fi
               echo "::endgroup::"
               ran=$((ran + 1))
@@ -192,6 +209,12 @@ jobs:
             idx=$((idx + 1))
           done
           echo "ran ${ran} target(s); findings: $(wc -l < "$GITHUB_WORKSPACE/findings.txt")"
+
+          if [ -s "$GITHUB_WORKSPACE/broken.txt" ]; then
+            echo "broken target(s) in this shard:"
+            cat "$GITHUB_WORKSPACE/broken.txt"
+            exit 1
+          fi
 
       - name: Upload shard findings
         if: always()
@@ -255,7 +278,8 @@ jobs:
             issues_enabled=true
           }
           if [ "$issues_enabled" != "true" ]; then
-            echo "::notice::${REPO} has issues disabled; skipping fuzz issue management ($(wc -l < "$merged") finding(s) remain in this run's artifacts)"
+            n=$(wc -l < "$merged")
+            echo "::notice::${REPO} has issues disabled; skipped issue management (${n} finding(s) stay in this run's artifacts)"
             exit 0
           fi
 
