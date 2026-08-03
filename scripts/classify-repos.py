@@ -88,6 +88,21 @@ PYTHON_FILES = """\
       - source: configs/ruff.toml
         dest: ruff.toml"""
 
+# The sha256 integrity-pin recompute helper, invoked by Renovate's
+# postUpgradeTasks (rule in cplieger/.github's default.json) so a version bump
+# and its recomputed digest land in one commit. Keyed on a root Dockerfile
+# rather than a committed opt-in marker: the script is DECLARATIVE about what it
+# touches -- it acts only on `# repin: dep=... url=...` marker lines it finds --
+# so a repo with a Dockerfile and no markers receives an inert file, while a
+# marker opt-in would need the script present before it could be added (the same
+# bootstrap paradox that keeps tests/shell/run.sh out of the sync). Syncing it is
+# the point: five hand-maintained copies of one recompute routine is exactly the
+# divergence sync exists to prevent, and a wrong URL here fails a build closed.
+REPIN_FILES = """\
+    files:
+      - source: configs/repin-sha.sh
+        dest: scripts/repin-sha.sh"""
+
 
 TS_CONFIG_FILES = """\
     files:
@@ -286,6 +301,7 @@ def classify(repo):
         'can_release': can_release,  # go.mod, jsr.json, or Dockerfile
         'has_smoke': has_smoke,
         'has_shell_tests': has_shell_tests,
+        'has_dockerfile': has_dockerfile,
     }
 
 
@@ -319,6 +335,7 @@ def main():
     python_repos = []  # python repos (pyproject.toml) -> ruff.toml + .editorconfig only
     smoke_repos = []  # repos that opted into the shared image-smoke harness
     shell_test_repos = []  # repos that opted into the shell unit-test harness
+    repin_repos = []  # image repos: sha256-pin recompute helper (inert without markers)
 
     for repo in repo_names:
         profile = profiles[repo]
@@ -361,6 +378,8 @@ def main():
             ts_config_repos.append(repo)
         if profile['has_smoke']:
             smoke_repos.append(repo)
+        if profile['has_dockerfile']:
+            repin_repos.append(repo)
         if profile['cliff_tier'] == 'stable':
             cliff_stable.append(repo)
         else:
@@ -400,6 +419,11 @@ def main():
         'Shell unit-test harness (repos with a tests/shell/run.sh opt-in)',
         shell_test_repos,
         SHELL_TEST_FILES,
+    )
+    print_group(
+        'sha256 pin recompute helper (image repos; inert without # repin: markers)',
+        repin_repos,
+        REPIN_FILES,
     )
     print_group('Python repos (ruff + editorconfig; bespoke ci.yaml)', python_repos, PYTHON_FILES)
     print_group('TypeScript lint/format configs', ts_config_repos, TS_CONFIG_FILES)
