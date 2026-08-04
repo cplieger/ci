@@ -86,8 +86,14 @@ ignore = [
   "SIM102",
   # try-except-continue — intentional resilience in batch processing.
   "S112",
-  # shell=True in subprocess — these scripts build shell pipelines intentionally.
-  "S602",
+  # S602 (shell=True) is deliberately NOT ignored. It was, justified as "these
+  # scripts build shell pipelines intentionally", but a fleet measurement found
+  # exactly ONE shell=True call site against 23 files importing subprocess, so
+  # the global ignore was suppressing a high-signal rule to excuse one function.
+  # That site now carries an explained `# noqa: S602`. Any NEW shell=True fails
+  # lint, which is the point. S603/S607 stay ignored above: those fire on every
+  # deliberate arg-list invocation (39 findings across 18 files) and ruff's own
+  # docs call S603 prone to false positives.
   # Ambiguous unicode chars in comments — intentional (e.g., × symbol).
   "RUF003",
   # Use specific rule codes in type: ignore — not always feasible.

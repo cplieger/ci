@@ -840,6 +840,108 @@ jobs:
               exit 1 ;;
           esac
 
+      # API-compatibility check, PRE-TAG and report-only.
+      #
+      # WHY THIS EXISTS
+      # Our semver comes entirely from commit messages via git-cliff, never from
+      # the code's exported surface. So a `feat:` commit that renames an exported
+      # function mints a MINOR bump and breaks every consumer at the next
+      # `go get`. It compiles clean, passes vet, lint, tests, race, govulncheck
+      # and CodeQL, and nothing in the pipeline looks at the API surface. 17 repos
+      # in the fleet are consumed Go modules, so this is the one defect class that
+      # ships silently to every downstream at once.
+      #
+      # WHY PRE-TAG AND NOT AFTER
+      # A post-publish report is useless here: once the tag exists the module
+      # proxy has it and consumers resolve it. The check has to run while the
+      # version is still just a computed string, which is exactly here.
+      #
+      # WHY gorelease AND NOT apidiff
+      # apidiff answers "are these two versions compatible". gorelease answers
+      # the question that matters: "is THIS proposed version consistent with the
+      # change". It takes -version and adjudicates it, so it knows a breaking
+      # change under a minor bump is wrong while the same change under a major is
+      # correct.
+      #
+      # WHY REPORT-ONLY FOR NOW
+      # gorelease is explicitly experimental, and a false positive that blocks a
+      # release is worse than a missed report. It writes to the run summary and
+      # ci-triage reads it. The gate this graduates to is conditional, not
+      # blanket: fail only when gorelease reports an incompatible change AND the
+      # computed bump is not a major. A `feat!:` commit that mints a major passes
+      # that condition, so nothing deliberate is ever fought.
+      #
+      # SKIPPED FOR: apps (a root `package main` is not a consumed module) and
+      # major bumps (gorelease cannot compare across majors, and a major bump is
+      # a deliberate break, so silence there is correct behaviour).
+      #
+      # OPERATIONAL NOTE: gorelease refuses to run on a repo with uncommitted
+      # changes ("has uncommitted changes", exit non-zero). That is fine here
+      # because this job runs on a fresh checkout, but it is why the tool cannot
+      # be used to preview a release from a dirty working tree locally. Verified
+      # behaviour: on a clean checkout it prints "vX.Y.Z is a valid semantic
+      # version for this release" and exits 0, and exits non-zero with a reason
+      # when the proposed version does not fit the change.
+      - name: API compatibility (gorelease, report-only)
+        continue-on-error: true
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -uo pipefail
+
+          if ls ./*.go >/dev/null 2>&1 && grep -qE '^package main$' ./*.go 2>/dev/null; then
+            echo "::notice::root package is main (application, not a consumed module) - skipping API check"
+            exit 0
+          fi
+
+          ver="${VERSION#v}"
+          major="${ver%%.*}"
+          prev=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)
+          if [ -z "$prev" ]; then
+            echo "::notice::no previous tag - nothing to compare, skipping API check"
+            exit 0
+          fi
+          prev_major="${prev#v}"; prev_major="${prev_major%%.*}"
+          if [ "$major" != "$prev_major" ]; then
+            echo "::notice::major bump ${prev} -> ${VERSION}: a break is deliberate here, and gorelease cannot compare across majors - skipping"
+            exit 0
+          fi
+
+          # renovate: datasource=go depName=golang.org/x/exp
+          XEXP_VERSION=v0.0.0-20260727155853-b88d891fe743
+          GOTOOLCHAIN=auto go install "golang.org/x/exp/cmd/gorelease@${XEXP_VERSION}" || {
+            echo "::warning::gorelease install failed - skipping API check (report-only)"
+            exit 0
+          }
+
+          out="$RUNNER_TEMP/gorelease.txt"
+          # `|| rc=$?` rather than a bare `rc=$?` on the next line: this step
+          # runs under the runner's default `bash -e`, where an unguarded
+          # non-zero command exits the script IMMEDIATELY - which here would
+          # skip the summary write on exactly the incompatible-change case the
+          # step exists to report, leaving continue-on-error to mask a step
+          # that never said anything. The vacuous-gate class, in report form.
+          rc=0
+          "$(go env GOPATH)/bin/gorelease" -base="$prev" -version="$VERSION" > "$out" 2>&1 || rc=$?
+          {
+            echo "### API compatibility: ${prev} -> ${VERSION}"
+            echo ""
+            if [ "$rc" -eq 0 ]; then
+              echo "gorelease accepts ${VERSION} as consistent with the exported-surface changes."
+            else
+              echo "gorelease reports ${VERSION} is NOT the right version for these changes."
+              echo "Report-only today; read the detail below before the next release."
+            fi
+            echo ""
+            echo '```'
+            head -c 8000 "$out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::gorelease says ${VERSION} does not match the API change (report-only; see the run summary)"
+          fi
+          exit 0
+
       - name: Generate release notes
         # Deliberately token-free: this step downloads and EXECUTES git-cliff,
         # and an untrusted binary must never run with a credential in its

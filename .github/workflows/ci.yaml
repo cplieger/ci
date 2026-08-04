@@ -321,6 +321,20 @@ jobs:
         if: ${{ hashFiles('tests/image-smoke.sh') != '' }}
         run: sh tests/image-smoke.sh ci-smoke:latest
 
+      # NO browser step here, decided twice (2026-08). An earlier draft ran a
+      # repo's Playwright suite against the loaded image at this point,
+      # report-only. Removed: report-only with no named consumer is the
+      # "advisory stream nobody reads" the typos predicate exists to avoid, a
+      # browser run is the flakiest check class while npm ci + a chromium
+      # download tax every PR (~84% of which are Renovate/sync), and the failure
+      # class it hunted has a deterministic core that needs no JS execution: the
+      # served importmap's targets must exist in the built image. That core is a
+      # hard gate now — the smoke harness's smoke_verify hook (see
+      # configs/image-smoke.sh; web-terminal-kiro's tests/image-smoke.conf
+      # implements it with three curls). Browser suites stay repo-owned for
+      # local runs and the ui-qa skill; do not re-wire one here without a
+      # consumer for its report.
+
   # arm64 build-ability gate. Same rationale as the amd64 `docker` job: without
   # it, an arch-specific Dockerfile break (a hardcoded amd64 download URL, a
   # wrong `uname -m` case, a base image without an arm64 manifest) merges green
@@ -362,10 +376,92 @@ jobs:
   # lives here (it deliberately differs from cplieger/.kiro's own
   # .markdownlint.json, which is tuned for steering docs: e.g. MD033 here
   # allows a curated element list instead of disabling the rule).
+  # Repo-wide checks that depend on no language surface: workflow correctness
+  # (actionlint), workflow SECURITY (zizmor), and working-tree secrets
+  # (gitleaks). These previously lived in go-ci, ts-ci, shell-ci AND the scripts
+  # job, which meant a Docker+Go repo ran each of them TWICE while a repo with
+  # no detected surface got them only via scripts. Consolidated here so each
+  # runs exactly once, for every repo, with one place to maintain three pins.
+  #
+  # Soft-gated like the language jobs: every step records its name to
+  # /tmp/_ci_failures and the final step fails the job if that file exists, so
+  # one failing check does not hide the others. CONTRACT: any step added to the
+  # block below MUST end with
+  #   || { echo "<step name>" >> /tmp/_ci_failures; exit 1; }
+  repo:
+    needs: detect
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Install actionlint
+        run: |
+          # renovate: datasource=github-releases depName=rhysd/actionlint
+          VERSION=v1.7.12
+          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 5 \
+            "https://github.com/rhysd/actionlint/releases/download/${VERSION}/actionlint_${VERSION#v}_linux_amd64.tar.gz" \
+            | tar -xzf - -C /tmp actionlint
+          sudo mv /tmp/actionlint /usr/local/bin/actionlint
+
+      - name: Install zizmor
+        run: |
+          # renovate: datasource=pypi depName=zizmor
+          VERSION=1.29.0
+          pipx install "zizmor==${VERSION}"
+
+      - name: Workflows (actionlint)
+        continue-on-error: true
+        run: |
+          (
+            actionlint -color
+          ) || { echo "Workflows (actionlint)" >> /tmp/_ci_failures; exit 1; }
+
+      # Workflow SECURITY audit; actionlint above is a correctness linter and
+      # does not overlap. Offline mode: no GitHub API calls, so no token and no
+      # rate-limit flakes. A repo needing a suppression commits its own
+      # .github/zizmor.yml with the rationale; none is synced, because a
+      # fleet-wide scan measured 53/53 repos clean at the default persona.
+      - name: Audit workflows (zizmor)
+        continue-on-error: true
+        run: |
+          (
+            zizmor --no-online-audits .
+          ) || { echo "Audit workflows (zizmor)" >> /tmp/_ci_failures; exit 1; }
+
+      # Working-tree secret scan. The full-history pass is a separate advisory
+      # scan in security-scan.yaml: this one gates, so it stays fast and
+      # tree-scoped.
+      - name: Scan for secrets (gitleaks)
+        continue-on-error: true
+        run: |
+          (
+            # renovate: datasource=github-releases depName=gitleaks/gitleaks
+            VERSION=v8.30.1
+            curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 5 \
+              "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz" \
+              | tar -xzf - -C /tmp gitleaks
+            /tmp/gitleaks dir . --no-banner --redact --exit-code 1
+          ) || { echo "Scan for secrets (gitleaks)" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Check results
+        if: always()
+        run: |
+          if [ -f /tmp/_ci_failures ]; then
+            echo "::error::Failed validation steps:"
+            sort -u /tmp/_ci_failures >&2
+            exit 1
+          fi
+          echo "All validation steps passed"
+
   markdown:
     needs: detect
     runs-on: ubuntu-24.04
-    timeout-minutes: 4
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -390,6 +486,72 @@ jobs:
         run: |
           markdownlint-cli2 --config "$RUNNER_TEMP/.markdownlint.json" \
             "**/*.md" "#node_modules" "#.git"
+
+      # Spell check, OPT-IN by a committed `_typos.toml`. The predicate is the
+      # config file rather than a library/app taxonomy: a fleet measurement put
+      # the app repos at 57-145 findings each (ISO 639-2 language codes in the
+      # subtitle apps, deliberately misspelled release-name fixtures, product
+      # names) against near-zero in the libraries, so a repo opts in once it has
+      # adjudicated its own dictionary. Same repo-owned-marker idiom as
+      # tests/image-smoke.conf and tests/shell/run.sh. A repo without the config
+      # is SKIPPED, not advised: typos has no SARIF sink or tracker here, so an
+      # advisory run would write to a log nobody reads.
+      - name: Install typos
+        if: ${{ hashFiles('_typos.toml') != '' }}
+        run: |
+          # renovate: datasource=github-releases depName=crate-ci/typos
+          VERSION=v1.49.0
+          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 5 \
+            "https://github.com/crate-ci/typos/releases/download/${VERSION}/typos-${VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xzf - -C /tmp ./typos
+          sudo mv /tmp/typos /usr/local/bin/typos
+          typos --version
+
+      - name: Spell check (typos)
+        if: ${{ hashFiles('_typos.toml') != '' }}
+        run: typos --format brief
+
+      - name: Skip notice (typos)
+        if: ${{ hashFiles('_typos.toml') == '' }}
+        run: echo "::notice::typos skipped - commit a _typos.toml to enable the spell-check gate"
+
+      # Internal link + anchor check. OFFLINE only: this resolves relative links
+      # and, with --include-fragments, heading anchors. It never touches the
+      # network, so it cannot go red because a third party rotted a URL, which
+      # is what qualifies it to gate. External URL checking runs weekly and
+      # advisory instead (weekly-links.yaml). Measured scope fleet-wide is ~207
+      # fragment-bearing links, so this is a small deterministic check, not a
+      # backlog.
+      - name: Install lychee
+        run: |
+          # Tag is `lychee-vX.Y.Z` (the repo is a workspace and also tags
+          # lychee-lib-*), and the ASSET name carries no version. Both differ
+          # from the fleet's usual pattern; getting either wrong 404s.
+          # renovate: datasource=github-releases depName=lycheeverse/lychee
+          VERSION=v0.24.2
+          # The archive nests the binary one level deep in a target-named
+          # directory, hence --strip-components=1 rather than a bare member name.
+          curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 5 \
+            "https://github.com/lycheeverse/lychee/releases/download/lychee-${VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xzf - -C /tmp --strip-components=1 \
+              lychee-x86_64-unknown-linux-gnu/lychee
+          sudo mv /tmp/lychee /usr/local/bin/lychee
+          lychee --version
+
+      # Directory input + --hidden + --extensions, NOT a '**/*.md' glob, and NO
+      # --exclude-path .git. Both verified empirically before shipping: the
+      # glob crate never traverses hidden directories (so every .github/*.md
+      # was silently unchecked - a vacuous corner in a gate), and
+      # --exclude-path matches by PATH PREFIX, so excluding `.git` also
+      # swallows `.github/**`. `--extensions md` already keeps .git internals
+      # out of scope; node_modules stays excluded for local runs (CI never has
+      # one here, but ci-local does).
+      - name: Check internal links (lychee, offline)
+        run: |
+          lychee --offline --include-fragments --no-progress \
+            --hidden --extensions md \
+            --exclude-path node_modules \
+            .
 
   # Python lint (ruff). Inline + canonical config, same rationale as markdown:
   # no self-referencing pinned tag, no per-repo config sync. Fires on any *.py
@@ -435,25 +597,14 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
-      - name: Install actionlint
-        run: |
-          # renovate: datasource=github-releases depName=rhysd/actionlint
-          VERSION=v1.7.12
-          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/${VERSION}/actionlint_${VERSION#v}_linux_amd64.tar.gz" \
-            | tar -xzf - -C /tmp actionlint
-          sudo mv /tmp/actionlint /usr/local/bin/actionlint
+      # actionlint, zizmor and gitleaks moved to the always-run `repo` job:
+      # they are repo-wide and were duplicated across four jobs.
 
       - name: Install yamllint
         run: |
           # renovate: datasource=pypi depName=yamllint
           VERSION=1.38.0
           pip install -q --break-system-packages "yamllint==${VERSION}"
-
-      - name: Install zizmor
-        run: |
-          # renovate: datasource=pypi depName=zizmor
-          VERSION=1.29.0
-          pipx install "zizmor==${VERSION}"
 
       - name: Install shellcheck
         run: |
@@ -474,24 +625,6 @@ jobs:
           sudo curl -fsSL -o /usr/local/bin/shfmt \
             "https://github.com/mvdan/sh/releases/download/${VERSION}/shfmt_${VERSION}_linux_amd64"
           sudo chmod +x /usr/local/bin/shfmt
-
-      - name: Lint workflows (actionlint)
-        continue-on-error: true
-        run: |
-          (
-            actionlint -color
-          ) || { echo "Lint workflows (actionlint)" >> /tmp/_ci_failures; exit 1; }
-
-      # Workflow security audit (template injection, credential persistence,
-      # cache poisoning, unpinned refs, …). Offline mode: no GitHub API calls,
-      # so no token and no rate-limit flakes. Repo-level suppressions with
-      # rationale live in .github/zizmor.yml.
-      - name: Audit workflows (zizmor)
-        continue-on-error: true
-        run: |
-          (
-            zizmor --no-online-audits .
-          ) || { echo "Audit workflows (zizmor)" >> /tmp/_ci_failures; exit 1; }
 
       - name: Lint shell scripts (shellcheck)
         continue-on-error: true
@@ -546,16 +679,6 @@ jobs:
               tomllib.loads(p.read_text())
           "
           ) || { echo "Validate TOML" >> /tmp/_ci_failures; exit 1; }
-
-      - name: Scan for secrets (gitleaks)
-        continue-on-error: true
-        run: |
-          (
-            # renovate: datasource=github-releases depName=gitleaks/gitleaks
-            VERSION=v8.30.1
-            curl -fsSL --retry 3 "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz" | tar -xzf - -C /tmp gitleaks
-            /tmp/gitleaks dir . --no-banner --redact --exit-code 1
-          ) || { echo "Scan for secrets (gitleaks)" >> /tmp/_ci_failures; exit 1; }
 
       # git-cliff semantics probe (opt-in by file presence; today only
       # cplieger/ci ships it). The fleet's release boolean depends on
@@ -633,7 +756,7 @@ jobs:
   # per-type templates so existing branch-protection rules keep working
   # without per-repo updates).
   validate:
-    needs: [detect, go, go-nested, ts, web, shell, docker, docker-arm64, markdown, python, scripts]
+    needs: [detect, repo, go, go-nested, ts, web, shell, docker, docker-arm64, markdown, python, scripts]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 1
@@ -641,6 +764,7 @@ jobs:
       - name: Aggregate CI dispatch results
         env:
           DETECT: ${{ needs.detect.result }}
+          REPO: ${{ needs.repo.result }}
           GO: ${{ needs.go.result }}
           GO_NESTED: ${{ needs.go-nested.result }}
           TS: ${{ needs.ts.result }}
@@ -658,10 +782,10 @@ jobs:
             exit 1
           fi
           # Each dispatched job must be either success (it ran and passed)
-          # or skipped (auto-detect said it wasn't applicable). markdown always
-          # runs, so it must be success (skipped only if detect failed, caught
-          # above).
-          for pair in "go=$GO" "go-nested=$GO_NESTED" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"; do
+          # or skipped (auto-detect said it wasn't applicable). repo and markdown
+          # always run, so they must be success (skipped only if detect failed,
+          # caught above).
+          for pair in "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"; do
             name="${pair%%=*}"; result="${pair##*=}"
             if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
               echo "::error::$name job: $result"

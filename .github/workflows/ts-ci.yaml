@@ -138,33 +138,11 @@ jobs:
             exit $rc
           ) || { echo "version parity" >> /tmp/_ci_failures; exit 1; }
 
-      # Workflow lint + secret scan for pure-TS repos. Root-gated: hybrid repos
-      # (Go + web frontend) already run both via their go job at the repo root,
-      # so the nested `web` invocation skips them instead of duplicating.
-      - name: Install actionlint
-        if: ${{ inputs.working-directory == '.' }}
-        run: |
-          # renovate: datasource=github-releases depName=rhysd/actionlint
-          VERSION=v1.7.12
-          curl -fsSL --retry 3 "https://github.com/rhysd/actionlint/releases/download/${VERSION}/actionlint_${VERSION#v}_linux_amd64.tar.gz" \
-            | tar -xzf - -C /tmp actionlint
-          sudo mv /tmp/actionlint /usr/local/bin/actionlint
-
-      - name: Workflows (actionlint)
-        if: ${{ inputs.working-directory == '.' }}
-        continue-on-error: true
-        run: ( actionlint -color ) || { echo "actionlint" >> /tmp/_ci_failures; exit 1; }
-
-      - name: Scan for secrets
-        if: ${{ inputs.working-directory == '.' }}
-        continue-on-error: true
-        run: |
-          (
-            # renovate: datasource=github-releases depName=gitleaks/gitleaks
-            VERSION=v8.30.1
-            curl -fsSL --retry 3 "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz" | tar -xzf - -C /tmp gitleaks
-            /tmp/gitleaks dir . --no-banner --redact --exit-code 1
-          ) || { echo "Scan for secrets" >> /tmp/_ci_failures; exit 1; }
+      # actionlint, zizmor and gitleaks used to run here, root-gated so a hybrid
+      # repo's nested `web` invocation would not re-check what its go job had
+      # already done. All three are repo-wide checks with no TS dependency and
+      # now run exactly once in the meta ci.yaml `repo` job, so the root-gating
+      # dance is gone along with the duplication it worked around.
 
       # Verify every bare-specifier value-import in the shippable front-end
       # source has a key in the page's <script type="importmap">. The browser

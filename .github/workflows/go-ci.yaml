@@ -83,9 +83,11 @@ jobs:
           # renovate: datasource=go depName=golang.org/x/vuln
           GOVULNCHECK_VERSION=v1.6.0
           go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
-          # renovate: datasource=go depName=github.com/rhysd/actionlint
-          ACTIONLINT_VERSION=v1.7.12
-          go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+
+      # actionlint, zizmor and gitleaks are NOT installed here: they are
+      # repo-wide checks with no Go dependency, and they run exactly once in the
+      # meta ci.yaml `repo` job. They used to run here AND in shell-ci, so a
+      # Docker+Go repo scanned the same tree twice.
 
       - name: Install app tools
         if: ${{ steps.profile.outputs.app == 'true' }}
@@ -120,11 +122,6 @@ jobs:
       # step added to this block MUST end with
       #   || { echo "<step name>" >> /tmp/_ci_failures; exit 1; }
       # or its failure is silently tolerated by continue-on-error.
-      - name: Workflows (actionlint)
-        continue-on-error: true
-        working-directory: .
-        run: ( actionlint -color ) || { echo "actionlint" >> /tmp/_ci_failures; exit 1; }
-
       - name: Vet
         continue-on-error: true
         run: ( go vet ./... ) || { echo "vet" >> /tmp/_ci_failures; exit 1; }
@@ -343,16 +340,6 @@ jobs:
               exit 1
             fi
           ) || { echo "punused" >> /tmp/_ci_failures; exit 1; }
-
-      - name: Scan for secrets
-        continue-on-error: true
-        run: |
-          (
-            # renovate: datasource=github-releases depName=gitleaks/gitleaks
-            VERSION=v8.30.1
-            curl -fsSL --retry 3 "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz" | tar -xzf - -C /tmp gitleaks
-            /tmp/gitleaks dir . --no-banner --redact --exit-code 1
-          ) || { echo "Scan for secrets" >> /tmp/_ci_failures; exit 1; }
 
       # PR-time dependency vulnerability review. Runs for libraries and apps
       # alike (a vulnerable dep in a library propagates to every consumer).
