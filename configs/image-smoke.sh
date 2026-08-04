@@ -93,10 +93,10 @@ fi
 APP="${SMOKE_APP_NAME:-image}"
 TIMEOUT="${SMOKE_TIMEOUT:-120}"
 case "$TIMEOUT" in
-'' | *[!0-9]*)
-  printf 'FAIL: SMOKE_TIMEOUT must be a non-negative integer, got "%s"\n' "$TIMEOUT" >&2
-  exit 1
-  ;;
+  '' | *[!0-9]*)
+    printf 'FAIL: SMOKE_TIMEOUT must be a non-negative integer, got "%s"\n' "$TIMEOUT" >&2
+    exit 1
+    ;;
 esac
 NAME="smoke-${APP}-$$"
 
@@ -139,38 +139,38 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   fi
   status=$(docker inspect --format '{{ if .State.Health }}{{ .State.Health.Status }}{{ else }}no-healthcheck{{ end }}' "$NAME" 2>/dev/null || echo gone)
   case "$status" in
-  healthy)
-    # An app-specific post-start assertion (SMOKE_LOG_PATTERN) keeps waiting
-    # inside the same deadline: healthy alone does not prove a surface the
-    # HEALTHCHECK deliberately does not cover actually came up.
-    if [ -n "$SMOKE_LOG_PATTERN" ] && ! docker logs "$NAME" 2>&1 | grep -qF -- "$SMOKE_LOG_PATTERN"; then
-      sleep 1
-      continue
-    fi
-    # App-specific verification against the running container, once, after
-    # health. A failure is a real verdict, not a retry: health said up, so
-    # anything smoke_verify finds missing is missing from the image.
-    # shellcheck disable=SC2034  # consumed by the sourced .conf's smoke_verify
-    SMOKE_CONTAINER="$NAME"
-    if ! smoke_verify; then
-      printf 'FAIL: %s smoke_verify failed (see output above)\n' "$APP" >&2
+    healthy)
+      # An app-specific post-start assertion (SMOKE_LOG_PATTERN) keeps waiting
+      # inside the same deadline: healthy alone does not prove a surface the
+      # HEALTHCHECK deliberately does not cover actually came up.
+      if [ -n "$SMOKE_LOG_PATTERN" ] && ! docker logs "$NAME" 2>&1 | grep -qF -- "$SMOKE_LOG_PATTERN"; then
+        sleep 1
+        continue
+      fi
+      # App-specific verification against the running container, once, after
+      # health. A failure is a real verdict, not a retry: health said up, so
+      # anything smoke_verify finds missing is missing from the image.
+      # shellcheck disable=SC2034  # consumed by the sourced .conf's smoke_verify
+      SMOKE_CONTAINER="$NAME"
+      if ! smoke_verify; then
+        printf 'FAIL: %s smoke_verify failed (see output above)\n' "$APP" >&2
+        exit 1
+      fi
+      printf '%s image smoke: ok (healthy after %ss)\n' "$APP" "$(($(date +%s) - start))"
+      exit 0
+      ;;
+    unhealthy)
+      printf 'FAIL: %s reported unhealthy\n' "$APP" >&2
       exit 1
-    fi
-    printf '%s image smoke: ok (healthy after %ss)\n' "$APP" "$(($(date +%s) - start))"
-    exit 0
-    ;;
-  unhealthy)
-    printf 'FAIL: %s reported unhealthy\n' "$APP" >&2
-    exit 1
-    ;;
-  no-healthcheck)
-    printf 'FAIL: image has no HEALTHCHECK to assert against\n' >&2
-    exit 1
-    ;;
-  gone)
-    printf 'FAIL: %s container is gone\n' "$APP" >&2
-    exit 1
-    ;;
+      ;;
+    no-healthcheck)
+      printf 'FAIL: image has no HEALTHCHECK to assert against\n' >&2
+      exit 1
+      ;;
+    gone)
+      printf 'FAIL: %s container is gone\n' "$APP" >&2
+      exit 1
+      ;;
   esac
   sleep 1
 done
