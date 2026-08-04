@@ -52,6 +52,16 @@
 # scripts/test-cliff-bump-semantics.sh (skips the download).
 set -euo pipefail
 
+# Hermetic git: a developer's global config must not reach the probe's
+# throwaway repos. Found the hard way (2026-08): a workstation with
+# `tag.gpgsign true` turned every bare `git tag vX.Y.Z` below into a SIGNED
+# ANNOTATED tag, which opened an editor on the PTY and hung the probe under
+# `ci-local` — while CI, with no global config, stayed green. Pointing
+# GIT_CONFIG_GLOBAL/SYSTEM at /dev/null makes the probe see only per-repo
+# config, so the per-repo `commit.gpgsign false` lines become belt-and-braces
+# and no future global setting (aliases, hooks path, pagers) can leak in.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CFG="$ROOT/configs/cliff-stable.toml"
 WORK="$(mktemp -d /tmp/cliff-probe.XXXXXX)"

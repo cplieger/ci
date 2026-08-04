@@ -184,7 +184,7 @@ jobs:
             # Dockerfile — Go/TS/Docker repos lint via their own jobs). Fires on
             # shell scripts or workflow files → actionlint + shellcheck.
             if [ ! -f Dockerfile ] && [ ! -f go.mod ] && [ ! -f jsr.json ]; then
-              if [ -n "$(find . -name '*.sh' -not -path './.git/*' -print -quit)" ] \
+              if [ -n "$(find . -name '*.sh' -not -path './.git/*' -not -path '*/node_modules/*' -print -quit)" ] \
                 || [ -n "$(find .github/workflows -name '*.y*ml' -print -quit 2> /dev/null)" ]; then
                 run_scripts=true
               fi
@@ -630,7 +630,7 @@ jobs:
         continue-on-error: true
         run: |
           (
-            files=$(find . -name '*.sh' -not -path './.git/*')
+            files=$(find . -name '*.sh' -not -path './.git/*' -not -path '*/node_modules/*')
             if [ -z "$files" ]; then
               echo "shellcheck: no *.sh found - skipping"
             else
@@ -643,7 +643,7 @@ jobs:
         continue-on-error: true
         run: |
           (
-            files=$(find . -name '*.sh' -not -path './.git/*')
+            files=$(find . -name '*.sh' -not -path './.git/*' -not -path '*/node_modules/*')
             if [ -z "$files" ]; then
               echo "shfmt: no *.sh found - skipping"
             else
