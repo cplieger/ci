@@ -549,6 +549,9 @@ def _restore_file_bytes(path: Path, data, existed: bool):
         elif path.exists():
             path.unlink()
     except OSError:
+        # Best-effort by contract: this runs via atexit at interpreter
+        # shutdown, where raising would mask the run's real outcome. A file
+        # left restored-or-not is cosmetic; a crash here is not.
         pass
 
 
