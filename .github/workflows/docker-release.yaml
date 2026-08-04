@@ -753,6 +753,13 @@ jobs:
           filename: size.json
           json: ${{ steps.sizebadge.outputs.json }}
 
+      # `scanners` is pinned EXPLICITLY on both image scans below. Trivy's own
+      # default for an image target is [vuln,secret], so omitting it silently
+      # enabled secret scanning — correct, but only by accident. Image-layer
+      # secret detection is coverage nothing else provides: gitleaks scans git
+      # trees, so it never sees a secret introduced by a build ARG, a
+      # gitignored COPY, or the base image. Pinning the value keeps a future
+      # Trivy default change from removing it without anyone noticing.
       - name: Trivy scan published image
         if: ${{ steps.nochange.outputs.skip != 'true' }}
         continue-on-error: true
@@ -760,6 +767,7 @@ jobs:
         with:
           version: ${{ env.TRIVY_VERSION }}
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+          scanners: 'vuln,secret'
           format: 'sarif'
           output: 'trivy-image.sarif'
           severity: 'HIGH,CRITICAL'
@@ -778,6 +786,7 @@ jobs:
         with:
           version: ${{ env.TRIVY_VERSION }}
           image-ref: ${{ steps.nochange.outputs.amd64-ref }}
+          scanners: 'vuln,secret'
           format: 'sarif'
           output: 'trivy-image.sarif'
           severity: 'HIGH,CRITICAL'

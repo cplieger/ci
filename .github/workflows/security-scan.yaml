@@ -85,12 +85,20 @@ jobs:
       # Build-ability — the only thing fully in our control — is gated by the
       # required `ci / validate` check (the `docker` job in the meta ci.yaml),
       # not here.
+      # `secret` is deliberately ABSENT here: gitleaks already runs `dir .` over
+      # this same checkout as a required gate, and Trivy skips markdown by
+      # default, so its fs secret pass saw strictly less of the tree while
+      # publishing a duplicate alert stream to the same Security tab. The
+      # IMAGE scan below keeps secrets (see its comment) — that layer is the
+      # only one that looks inside a built image, which gitleaks never can.
+      # `license` is new and advisory: nothing else in the pipeline checks
+      # whether a transitive dependency's licence is compatible with GPL-3.0.
       - name: Trivy filesystem scan (advisory)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           version: ${{ env.TRIVY_VERSION }}
           scan-type: fs
-          scanners: 'vuln,secret'
+          scanners: 'vuln,license'
           severity: ${{ inputs.severity }}
           ignore-unfixed: true
           exit-code: '0'
@@ -107,12 +115,21 @@ jobs:
           format: 'sarif'
           output: 'trivy-misconfig.sarif'
 
+      # `scanners` is set EXPLICITLY rather than inherited. Trivy's own default
+      # for an image target is [vuln,secret], so omitting the key silently
+      # enabled secret scanning here — which is what we want, but only by
+      # accident. Image-layer secret detection is unique coverage: gitleaks
+      # scans git trees, so it never sees a secret that entered via a build
+      # ARG, a gitignored COPY, or the base image. Trivy also carries rule
+      # families gitleaks lacks (dockerconfig-secret, azure-*, maven-settings-*).
+      # Pinning the value keeps a future Trivy default change from removing it.
       - name: Trivy image scan (advisory)
         if: ${{ steps.profile.outputs.image == 'true' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           version: ${{ env.TRIVY_VERSION }}
           image-ref: 'ci-scan:latest'
+          scanners: 'vuln,secret'
           severity: ${{ inputs.severity }}
           ignore-unfixed: true
           exit-code: '0'

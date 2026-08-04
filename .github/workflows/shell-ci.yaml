@@ -53,15 +53,14 @@ jobs:
           # No step in this job pushes with checkout-persisted credentials;
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
-          fetch-depth: 0
+          # fetch-depth defaults to 1 again: the full clone existed only for the
+          # gitleaks step, which moved to the meta ci.yaml `repo` job. Nothing
+          # left in this job reads git history.
 
-      - name: Install actionlint
-        run: |
-          # renovate: datasource=github-releases depName=rhysd/actionlint
-          VERSION=v1.7.12
-          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/${VERSION}/actionlint_${VERSION#v}_linux_amd64.tar.gz" \
-            | tar -xzf - -C /tmp actionlint
-          sudo mv /tmp/actionlint /usr/local/bin/actionlint
+      # actionlint, zizmor and gitleaks are NOT installed here: they are
+      # repo-wide checks with no shell dependency, and they run exactly once in
+      # the meta ci.yaml `repo` job. They used to run here AND in go-ci, so a
+      # Docker+Go repo checked the same workflows and tree twice.
 
       - name: Install shfmt
         run: |
@@ -90,13 +89,6 @@ jobs:
       # step added to this block MUST end with
       #   || { echo "<step name>" >> /tmp/_ci_failures; exit 1; }
       # or its failure is silently tolerated by continue-on-error.
-      - name: Lint workflows (actionlint)
-        continue-on-error: true
-        run: |
-          (
-            actionlint -color
-          ) || { echo "Lint workflows (actionlint)" >> /tmp/_ci_failures; exit 1; }
-
       - name: Lint shell scripts
         continue-on-error: true
         env:
@@ -211,16 +203,6 @@ jobs:
               echo "no shell unit tests in this repo - skipping"
             fi
           ) || { echo "Run shell unit tests" >> /tmp/_ci_failures; exit 1; }
-
-      - name: Scan for secrets
-        continue-on-error: true
-        run: |
-          (
-            # renovate: datasource=github-releases depName=gitleaks/gitleaks
-            VERSION=v8.30.1
-            curl -fsSL --retry 3 "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz" | tar -xzf - -C /tmp gitleaks
-            /tmp/gitleaks dir . --no-banner --redact --exit-code 1
-          ) || { echo "Scan for secrets" >> /tmp/_ci_failures; exit 1; }
 
       - name: Check results
         if: always()

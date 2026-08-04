@@ -1,0 +1,274 @@
+# Weekly Go benchmark regression tracking across cplieger consumer repos.
+# Pattern C, like weekly-gremlins / weekly-fuzz / weekly-stryker: this workflow
+# owns the matrix and the max-parallel cap; runs happen here, not via cross-repo
+# dispatch.
+#
+# WHY THIS EXISTS
+# The fleet already had ~155 `func Benchmark` across 16 repos and NOTHING
+# executed any of them: a grep for -bench/-benchmem/benchstat across every
+# workflow in ci and all 55 repos returned zero. So a performance regression in
+# subflux's subsync aligner or vibekit's ACP translator landed silently. The
+# benchmarks were well built (size-parameterised, ReportAllocs, ResetTimer);
+# they were simply dead.
+#
+# THE STATISTICS, AND WHY THE REDUCER IS NOT OPTIONAL
+# github-action-benchmark performs NO aggregation: its Go extractor emits one
+# entry per output line and its alert comparator resolves the baseline by
+# first-match-on-name. Handing it raw `-count=10` output compares one arbitrary
+# sample against one arbitrary previous sample, ten times, which multiplies
+# false-alert odds by ten and writes ten duplicate-named points per benchmark.
+# scripts/bench-reduce.py therefore reduces to ONE median entry per benchmark
+# per metric first, and the action is used via its custom-tool path. It keeps
+# the chart and the branch history it is good at; it is not the estimator.
+#
+# Schedule:     Tuesdays 22:00 UTC. Own slot by design: gremlins Sun, fuzz Wed,
+#               stryker Sat, security daily 03:00, rebuild-stale daily 04:00.
+#               Two new runners (this and weekly-links) took the two free days
+#               so the 20-job account cap is never contested.
+# Threshold:    150%, report-only (fail-on-alert: false). Deliberately loose.
+#               Hosted-runner amplitude is documented at 10-20% and the target
+#               is an algorithmic regression (an O(n log n) aligner becoming
+#               O(n squared)), which shows up as multiples. A tight threshold on
+#               a non-gating check just trains everyone to ignore the tracker.
+#               Medians shrink the noise the threshold must clear, so this is
+#               conservative; tighten only against measured tracker history.
+# Storage:      each consumer's orphan `benchmarks` branch, written by the
+#               action's own git mode. NOT the `badges` branch: publish-badge.sh
+#               rebuilds that from root *.json only and force-pushes a squashed
+#               commit, so it would delete both a raw baseline and the action's
+#               chart files. `badges` stays Shields-JSON-only.
+# First run:    TWO bootstrap facts, verified against the action's v1.22.1 dist
+#               rather than its README. (1) The action does NOT create a missing
+#               data branch: its gh-repository path is clone + plain
+#               `git checkout <branch>`, no orphan fallback, so the run fails on
+#               a repo that has never enrolled. The "Ensure benchmarks branch"
+#               step below therefore creates the empty orphan branch, once,
+#               idempotently. (2) Alert comparison skips when the branch carries
+#               no previous suite, so the first data point publishes a baseline
+#               and alerts nothing - that part needs no bootstrap.
+# Scope:        starts at the four repos that SELL a cost bound (xmlx, jsonx,
+#               ssrf, httpx). xmlx and jsonx bound what untrusted input can cost
+#               and had no benchmarks at all until this landed, so their
+#               allocation-free claims were unverified by anything. Widen to all
+#               16 benchmark-carrying repos once the tracker is trusted.
+name: Weekly bench
+
+on:
+  schedule:
+    - cron: "0 22 * * 2"   # Tuesday 22:00 UTC
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Comma/space-separated repo names to limit the run. Empty uses the enrolled set."
+        required: false
+        default: ""
+      count:
+        description: "Samples per benchmark (default 10; lower only for smoke-testing the runner)."
+        required: false
+        default: "10"
+
+permissions:
+  contents: read
+  # Chart pushes happen in CONSUMER repos via the CI_SCHEDULE PAT.
+
+concurrency:
+  group: weekly-bench
+  cancel-in-progress: false
+
+jobs:
+  fanout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.fanout.outputs.matrix }}
+    steps:
+      - name: Discover Go repos carrying benchmarks
+        id: fanout
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          # Injected via env (never inline ${{ }} in the body) so a crafted
+          # dispatch input cannot expand into shell code.
+          ONLY: ${{ github.event.inputs.only }}
+        run: |
+          set -euo pipefail
+
+          # The enrolled set. Deliberately narrower than "every repo with a
+          # benchmark": prove the tracker is trusted on the cost-contract
+          # libraries before fanning out to subflux (49) and vibekit (40).
+          ENROLLED="xmlx jsonx ssrf httpx"
+
+          # Forks are excluded fleet-wide (same rule as scripts/audit.py): a
+          # fork's tree is UPSTREAM's, so its benchmarks measure someone else's
+          # code and its tracker issue would be unactionable.
+          live=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
+            [.[] | select(.isArchived == false and .isFork == false) | .name] | .[]
+          ')
+
+          repos=""
+          for r in $ENROLLED; do
+            case " $live " in *" $r "*) repos="$repos $r" ;; *)
+              echo "::warning::enrolled repo '$r' is not live (archived, fork, or renamed) - skipping" ;;
+            esac
+          done
+
+          if [ -n "${ONLY:-}" ]; then
+            wanted=" $(echo "$ONLY" | tr ',' ' ') "
+            filtered=""
+            for r in $repos; do
+              case "$wanted" in *" $r "*) filtered="$filtered $r" ;; esac
+            done
+            repos="$filtered"
+            echo "manual 'only' filter active -> ${repos:-<none matched>}"
+          fi
+
+          matrix='[]'
+          for r in $repos; do
+            rm -rf scan
+            gh repo clone "cplieger/${r}" scan -- --depth 1 2>/dev/null || {
+              echo "::warning::clone failed for ${r} - skipping"
+              continue
+            }
+            if [ ! -f scan/go.mod ]; then
+              echo "  skip ${r}: no go.mod"
+              continue
+            fi
+            # Only enrol a repo that actually has a benchmark to run. Without
+            # this the reducer would fail the leg on empty input, which is
+            # correct behaviour for a repo that SHOULD have benchmarks and a
+            # false alarm for one that never did.
+            n=$(grep -rl --include='*_test.go' 'func Benchmark' scan 2>/dev/null | wc -l)
+            if [ "$n" -eq 0 ]; then
+              echo "  skip ${r}: no benchmark functions"
+              continue
+            fi
+            sha=$(git -C scan rev-parse HEAD)
+            echo "  include ${r} @ ${sha:0:12} (${n} files with benchmarks)"
+            matrix=$(printf '%s' "$matrix" | jq -c \
+              --arg r "$r" --arg s "$sha" '. + [{repo: $r, sha: $s}]')
+          done
+          rm -rf scan
+
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Total entries: $(printf '%s' "$matrix" | jq 'length')"
+
+  run:
+    needs: fanout
+    if: ${{ needs.fanout.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4   # Own day; 4 leaves 16 of the 20-job cap free
+      matrix:
+        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+    steps:
+      # Checkout ci FIRST (actions/checkout cleans the workspace): this brings
+      # scripts/bench-reduce.py, which the consumer repo does not carry.
+      - name: Checkout ci (for the reducer)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # the chart push authenticates via CI_SCHEDULE below.
+          persist-credentials: false
+          path: _ci
+
+      - name: Checkout consumer at the discovered SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cplieger/${{ matrix.repo }}
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+          path: app
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: app/go.mod
+          cache: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # `-run='^$'` keeps the unit suite out of the timing. `-count` is the
+      # sample size the reducer takes a median over; 10 is benchstat's own
+      # documented minimum for a statistically meaningful sample.
+      - name: Run benchmarks
+        working-directory: app
+        env:
+          COUNT: ${{ github.event.inputs.count || '10' }}
+        run: |
+          set -euo pipefail
+          case "$COUNT" in
+            ''|*[!0-9]*) echo "::error::count must be a positive integer"; exit 1 ;;
+          esac
+          go test -run='^$' -bench=. -benchmem -count="$COUNT" ./... \
+            | tee "$RUNNER_TEMP/bench-raw.txt"
+
+      - name: Reduce to medians
+        run: |
+          set -euo pipefail
+          python3 _ci/scripts/bench-reduce.py "$RUNNER_TEMP/bench-raw.txt" \
+            > "$RUNNER_TEMP/bench.json"
+          echo "Entries: $(jq 'length' "$RUNNER_TEMP/bench.json")"
+
+      - name: Summary
+        run: |
+          {
+            echo "### ${{ matrix.repo }} benchmarks"
+            echo ""
+            echo "| Benchmark | Value | Unit | Spread |"
+            echo "|---|---|---|---|"
+            jq -r '.[] | "| \(.name) | \(.value) | \(.unit) | \(.range // "-") |"' \
+              "$RUNNER_TEMP/bench.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The action cannot bootstrap a missing data branch (verified in its
+      # v1.22.1 dist: gh-repository mode is clone + plain checkout, which fails
+      # on a branch that does not exist). Create the empty orphan branch once;
+      # every later run sees it and this becomes a no-op. Same bot identity the
+      # fleet's publish-badge composite uses for its orphan `badges` branch.
+      - name: Ensure benchmarks branch exists
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads \
+            "https://github.com/cplieger/${REPO}.git" benchmarks >/dev/null 2>&1; then
+            echo "benchmarks branch exists in ${REPO}"
+            exit 0
+          fi
+          tmp=$(mktemp -d)
+          git -C "$tmp" init -q -b benchmarks
+          git -C "$tmp" config user.name 'github-actions[bot]'
+          git -C "$tmp" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$tmp" commit -q --allow-empty -m 'ci: bootstrap benchmark data branch'
+          git -C "$tmp" push -q \
+            "https://x-access-token:${GH_TOKEN}@github.com/cplieger/${REPO}.git" \
+            benchmarks:benchmarks
+          rm -rf "$tmp"
+          echo "created empty benchmarks branch in ${REPO}"
+
+      # Publishes the median series to the consumer's orphan `benchmarks` branch
+      # and comments on a regression beyond the threshold. Report-only:
+      # fail-on-alert stays false, because a wall-clock regression on a shared
+      # runner is evidence to investigate, not proof the code got slower.
+      - name: Publish + compare
+        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
+        with:
+          tool: customSmallerIsBetter
+          output-file-path: ${{ runner.temp }}/bench.json
+          github-token: ${{ secrets.CI_SCHEDULE }}
+          gh-repository: github.com/cplieger/${{ matrix.repo }}
+          gh-pages-branch: benchmarks
+          benchmark-data-dir-path: .
+          auto-push: true
+          alert-threshold: "150%"
+          comment-on-alert: true
+          fail-on-alert: false
+          max-items-in-chart: 100

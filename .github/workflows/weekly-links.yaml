@@ -1,0 +1,210 @@
+# Weekly EXTERNAL link check across every public cplieger repo.
+#
+# WHY THIS IS SEPARATE FROM THE GATE
+# The meta ci.yaml `markdown` job runs `lychee --offline --include-fragments`,
+# which resolves relative links and heading anchors only. That is deterministic
+# and cannot go red unless someone changed a file, which is exactly what
+# qualifies it to BLOCK a merge.
+#
+# Checking external URLs is the opposite: a third party can rot a link
+# overnight, so a gate on it would redden a green pull request with nobody
+# having changed anything. Under the fleet's enforcement rule ("if a check can
+# go red without anyone changing the code or the checker, it must not gate")
+# external checking must be report-only, on a schedule, with a named consumer.
+# That consumer is the ci-triage skill, which reads the tracker issue below.
+#
+# Schedule:  Thursdays 22:00 UTC. Own slot: gremlins Sun, bench Tue, fuzz Wed,
+#            stryker Sat, security daily 03:00, rebuild-stale daily 04:00.
+# Reporting: per-repo `Broken external links` tracker issue (label
+#            broken-links), closed automatically when a run finds nothing.
+#            Idempotent: an existing issue is updated in place rather than
+#            duplicated, matching the gremlins/fuzz/stryker tracker convention.
+name: Weekly links
+
+on:
+  schedule:
+    - cron: "0 22 * * 4"   # Thursday 22:00 UTC
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Comma/space-separated repo names to limit the run. Empty runs all public repos."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  # Issue writes happen in CONSUMER repos via the CI_SCHEDULE PAT.
+
+concurrency:
+  group: weekly-links
+  cancel-in-progress: false
+
+jobs:
+  fanout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.fanout.outputs.matrix }}
+    steps:
+      - name: Discover public repos
+        id: fanout
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          # Injected via env (never inline ${{ }} in the body) so a crafted
+          # dispatch input cannot expand into shell code.
+          ONLY: ${{ github.event.inputs.only }}
+        run: |
+          set -euo pipefail
+          # Public only: a private repo's docs have no external readers to
+          # protect, and the two private repos check their own links in their
+          # bespoke weekly FULL battery. Forks excluded fleet-wide (a fork's
+          # docs are upstream's).
+          repos=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork,visibility --jq '
+            [.[] | select(.isArchived == false and .isFork == false and .visibility == "PUBLIC") | .name] | .[]
+          ')
+
+          if [ -n "${ONLY:-}" ]; then
+            wanted=" $(echo "$ONLY" | tr ',' ' ') "
+            filtered=""
+            for r in $repos; do
+              case "$wanted" in *" $r "*) filtered="$filtered $r" ;; esac
+            done
+            repos="$filtered"
+            echo "manual 'only' filter active -> ${repos:-<none matched>}"
+          fi
+
+          # Word-splitting is the point: $repos is a newline/space list built
+          # above, and each element becomes one matrix entry.
+          # shellcheck disable=SC2086
+          matrix=$(printf '%s\n' $repos | jq -R . | jq -sc '[{repo: .[]}] | map(.repo |= .)')
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Total entries: $(printf '%s' "$matrix" | jq 'length')"
+
+  run:
+    needs: fanout
+    if: ${{ needs.fanout.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4   # Own day; 4 leaves 16 of the 20-job cap free
+      matrix:
+        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+    steps:
+      - name: Checkout consumer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cplieger/${{ matrix.repo }}
+          persist-credentials: false
+          path: app
+
+      - name: Install lychee
+        run: |
+          # Tag is `lychee-vX.Y.Z` (the repo is a workspace and also tags
+          # lychee-lib-*), and the ASSET name carries no version. Both differ
+          # from the fleet's usual pattern; getting either wrong 404s.
+          # renovate: datasource=github-releases depName=lycheeverse/lychee
+          VERSION=v0.24.2
+          # The archive nests the binary one level deep in a target-named
+          # directory, hence --strip-components=1 rather than a bare member name.
+          curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 5 \
+            "https://github.com/lycheeverse/lychee/releases/download/lychee-${VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xzf - -C /tmp --strip-components=1 \
+              lychee-x86_64-unknown-linux-gnu/lychee
+          sudo mv /tmp/lychee /usr/local/bin/lychee
+
+      # `--cache` keeps a per-run cache so a URL referenced from twenty READMEs
+      # is fetched once. 429 and 5xx are accepted: a rate-limited or briefly
+      # down host is not a broken link, and treating it as one is what makes
+      # link checkers famous for crying wolf.
+      - name: Check external links
+        id: lychee
+        continue-on-error: true
+        working-directory: app
+        run: |
+          set -uo pipefail
+          # Directory input + --hidden + --extensions md, not a '**/*.md' glob:
+          # the glob never enters hidden dirs, and `--exclude-path .git` would
+          # swallow `.github/**` too (prefix match) - so the old shape silently
+          # skipped every PR template and workflow doc. Verified empirically;
+          # same rationale as the offline gate in the meta ci.yaml.
+          lychee --no-progress --cache --max-cache-age 1d \
+            --accept '200..=299,429,500..=599' \
+            --max-retries 3 --timeout 20 \
+            --hidden --extensions md \
+            --exclude-path node_modules \
+            --format markdown --output "$RUNNER_TEMP/links.md" \
+            . || echo "found=1" >> "$GITHUB_OUTPUT"
+
+      - name: Report
+        env:
+          REPO: ${{ matrix.repo }}
+          FOUND: ${{ steps.lychee.outputs.found }}
+        run: |
+          set -euo pipefail
+          title="Broken external links"
+          body_file="$RUNNER_TEMP/body.md"
+
+          # A repo with issues disabled must not fail the run: `issues` is only a
+          # warn-level setting in the governance audit, so a first-party repo can
+          # legitimately be in that state. Same guard weekly-fuzz carries, and for
+          # the same reason (a fork with issues off reddened the whole weekly run
+          # for two weeks before that guard existed).
+          issues_enabled=$(gh repo view "cplieger/${REPO}" --json hasIssuesEnabled \
+            --jq '.hasIssuesEnabled' 2>/dev/null || echo "true")
+          if [ "$issues_enabled" != "true" ]; then
+            echo "::notice::${REPO} has issues disabled; skipping issue management"
+            exit 0
+          fi
+
+          # `gh issue create --label` FAILS when the label does not exist, so it
+          # has to be created first. Tolerate "already exists" but surface a real
+          # error (a PAT missing issues:write) rather than swallowing it.
+          ensure_label() {
+            local name="$1" color="$2" desc="$3" err
+            err=$(gh label create "$name" -R "cplieger/${REPO}" -c "$color" -d "$desc" 2>&1) && return 0
+            printf '%s' "$err" | grep -qi "already exists" && return 0
+            echo "::warning::label create failed for ${name}: ${err}"
+            return 1
+          }
+
+          existing=$(gh issue list -R "cplieger/${REPO}" --label broken-links \
+            --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+
+          if [ "${FOUND:-0}" != "1" ]; then
+            echo "No broken external links in ${REPO}"
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" -R "cplieger/${REPO}" \
+                --comment "All external links resolve as of $(date -u +%Y-%m-%d). Closing." || true
+            fi
+            exit 0
+          fi
+
+          {
+            echo "Automated weekly external-link check. Report-only: this never blocks a merge."
+            echo ""
+            echo "A link here may be a genuine rot, a moved page, or a host that was"
+            echo "briefly unreachable. 429 and 5xx responses are already accepted, so"
+            echo "entries below are mostly 404s and DNS failures."
+            echo ""
+            echo "<!-- links-data -->"
+            head -c 60000 "$RUNNER_TEMP/links.md"
+            echo ""
+            echo "<!-- /links-data -->"
+            echo ""
+            echo "_Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}_"
+          } > "$body_file"
+
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" -R "cplieger/${REPO}" --body-file "$body_file"
+            echo "Updated issue #${existing} in ${REPO}"
+          else
+            ensure_label broken-links "d93f0b" "Automated weekly external-link check" || exit 0
+            gh issue create -R "cplieger/${REPO}" --title "$title" \
+              --label broken-links --body-file "$body_file" \
+              || echo "::warning::could not create issue in ${REPO}"
+          fi
