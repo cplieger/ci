@@ -218,7 +218,8 @@ jobs:
             };
             const shippable = (n) =>
               n.endsWith(".ts") && !n.endsWith(".d.ts") && !n.endsWith(".test.ts") &&
-              !n.endsWith(".spec.ts") && n !== "vitest.config.ts" && n !== "fc-strict-setup.ts";
+              !n.endsWith(".spec.ts") && n !== "vitest.config.ts" &&
+              n !== "playwright.config.ts" && n !== "fc-strict-setup.ts";
             const tsFiles = walk(root, shippable);
             const violations = [];
             for (const f of tsFiles) {
