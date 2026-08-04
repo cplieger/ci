@@ -15,6 +15,11 @@
 # loop, or the escaping cannot merge if it breaks the pinned contract.
 set -euo pipefail
 
+# Hermetic git, same rationale as test-cliff-bump-semantics.sh: a global
+# `tag.gpgsign true` (or any other workstation config) must not reach the
+# throwaway repos this probe builds.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
 PASS=0
 fail() {
   echo "FAIL: $*" >&2

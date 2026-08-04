@@ -27,7 +27,10 @@
 #     does not expose.
 #   - every `go install <pkg>@<ver>` line in go-ci.yaml; the version is pinned in
 #     a shell var (e.g. GOVULNCHECK_VERSION=v1.6.0) which this script resolves:
-#     govulncheck, actionlint, deadcode, punused, gopls (punused's LSP server)
+#     govulncheck, deadcode, punused, gopls (punused's LSP server); actionlint
+#     moved OUT of this set 2026-08 (now a curl-installed release binary,
+#     pinned in the meta ci.yaml repo job), and lychee + typos joined the
+#     curl set with the markdown-job gates
 #   Versions are always read live from the workflows, never hardcoded here,
 #   via the `# renovate: ... depName=X` + `VERSION` pins (hadolint's pin is the
 #   HADOLINT_VERSION var feeding its `hadolint/hadolint:<tag>` docker-run).
@@ -458,6 +461,106 @@ install_zizmor() {
   fi
 }
 
+# install_actionlint: the workflow linter run by the meta CI `repo` job. It
+# used to ride install_go_tools (a `go install` line in go-ci.yaml), but the
+# 2026-08 repo-job consolidation moved it to a curl-installed release binary in
+# ci.yaml — without this function the installer would silently stop tracking
+# its pin the next time Renovate bumps it.
+install_actionlint() {
+  local want cur arch
+  want="$(pin_version rhysd/actionlint)"
+  [ -n "$want" ] || {
+    bad actionlint "no pin found"
+    return
+  }
+  cur="$(actionlint --version 2>/dev/null | semver || true)"
+  [ "$cur" = "${want#v}" ] && {
+    skip actionlint "$want"
+    return
+  }
+  case "$(uname -m)" in
+    x86_64 | amd64) arch=amd64 ;;
+    aarch64 | arm64) arch=arm64 ;;
+    *)
+      bad actionlint "unsupported arch $(uname -m)"
+      return
+      ;;
+  esac
+  mkdir -p "$BIN_DIR"
+  if curl -fsSL "https://github.com/rhysd/actionlint/releases/download/${want}/actionlint_${want#v}_linux_${arch}.tar.gz" \
+    | tar -xzf - -C "$BIN_DIR" actionlint 2>/dev/null; then
+    ok actionlint "$want" "-> $BIN_DIR"
+  else
+    bad actionlint "download failed"
+  fi
+}
+
+# install_lychee: the offline link+anchor checker gating the meta CI markdown
+# job (2026-08). Two release-layout traps, both paid for when the CI step was
+# written: the tag is `lychee-vX.Y.Z` (the repo also tags lychee-lib-*), and
+# the archive nests the binary one level deep in a target-named directory,
+# hence --strip-components=1 rather than a bare member name.
+install_lychee() {
+  local want cur target
+  want="$(pin_version lycheeverse/lychee)"
+  [ -n "$want" ] || {
+    bad lychee "no pin found"
+    return
+  }
+  cur="$(lychee --version 2>/dev/null | semver || true)"
+  [ "$cur" = "${want#v}" ] && {
+    skip lychee "$want"
+    return
+  }
+  case "$(uname -m)" in
+    x86_64 | amd64) target=x86_64-unknown-linux-gnu ;;
+    aarch64 | arm64) target=aarch64-unknown-linux-gnu ;;
+    *)
+      bad lychee "unsupported arch $(uname -m)"
+      return
+      ;;
+  esac
+  mkdir -p "$BIN_DIR"
+  if curl -fsSL "https://github.com/lycheeverse/lychee/releases/download/lychee-${want}/lychee-${target}.tar.gz" \
+    | tar -xzf - -C "$BIN_DIR" --strip-components=1 "lychee-${target}/lychee" 2>/dev/null; then
+    ok lychee "$want" "-> $BIN_DIR"
+  else
+    bad lychee "download failed"
+  fi
+}
+
+# install_typos: the spell-check gate in the meta CI markdown job (2026-08),
+# opt-in per repo by a committed _typos.toml. Installed unconditionally so a
+# local run matches CI the day a repo opts in. The tar member is `./typos`.
+install_typos() {
+  local want cur target
+  want="$(pin_version crate-ci/typos)"
+  [ -n "$want" ] || {
+    bad typos "no pin found"
+    return
+  }
+  cur="$(typos --version 2>/dev/null | semver || true)"
+  [ "$cur" = "${want#v}" ] && {
+    skip typos "$want"
+    return
+  }
+  case "$(uname -m)" in
+    x86_64 | amd64) target=x86_64-unknown-linux-musl ;;
+    aarch64 | arm64) target=aarch64-unknown-linux-musl ;;
+    *)
+      bad typos "unsupported arch $(uname -m)"
+      return
+      ;;
+  esac
+  mkdir -p "$BIN_DIR"
+  if curl -fsSL "https://github.com/crate-ci/typos/releases/download/${want}/typos-${want}-${target}.tar.gz" \
+    | tar -xzf - -C "$BIN_DIR" ./typos 2>/dev/null; then
+    ok typos "$want" "-> $BIN_DIR"
+  else
+    bad typos "download failed"
+  fi
+}
+
 # advise_gotoolchain: the go installs above self-heal a base/toolchain version
 # skew via GOTOOLCHAIN=auto, but local *repo* builds do not. With
 # GOTOOLCHAIN=local (Fedora bakes this default into its Go build) a
@@ -484,6 +587,7 @@ main() {
   install_go_tools
   install_complexity_tools
   install_gitleaks
+  install_actionlint
   install_hadolint
   install_shellcheck
   install_shfmt
@@ -492,6 +596,8 @@ main() {
   install_trivy
   install_ruff
   install_markdownlint
+  install_lychee
+  install_typos
 
   printf 'tool               version    status\n'
   printf '%s\n' "${SUMMARY[@]}"

@@ -101,8 +101,11 @@ jobs:
               echo "shellcheck: skipped (no shell scripts)"
             elif [ "$SHELLCHECK_PATHS" = "auto" ]; then
               # Discover every *.sh in the repo (nested included), matching the
-              # ci.yaml `scripts` job. -x follows `source`d files.
-              files=$(find . -name '*.sh' -not -path './.git/*')
+              # ci.yaml `scripts` job. -x follows `source`d files. node_modules
+              # is excluded for LOCAL parity, not for CI: a CI checkout never
+              # has one, but ci-local runs in a working tree where npm ci has
+              # populated it (playwright-core ships .sh files that fail shfmt).
+              files=$(find . -name '*.sh' -not -path './.git/*' -not -path '*/node_modules/*')
               if [ -z "$files" ]; then
                 echo "shellcheck: no *.sh found — skipping"
               else
@@ -132,7 +135,7 @@ jobs:
             # Every *.sh (nested included), matching the ci.yaml `scripts` job.
             # Flags per shell.md: 2-space indent, indent switch cases, binary
             # ops may start a line. NOT -sr (the gate does not enforce it).
-            files=$(find . -name '*.sh' -not -path './.git/*')
+            files=$(find . -name '*.sh' -not -path './.git/*' -not -path '*/node_modules/*')
             if [ -z "$files" ]; then
               echo "shfmt: no *.sh found — skipping"
             else
