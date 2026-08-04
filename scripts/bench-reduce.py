@@ -103,7 +103,11 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    text = open(args.input, encoding='utf-8').read() if args.input else sys.stdin.read()
+    if args.input:
+        with open(args.input, encoding='utf-8') as fh:
+            text = fh.read()
+    else:
+        text = sys.stdin.read()
     entries = reduce_samples(parse(text))
 
     if not entries and not args.allow_empty:
