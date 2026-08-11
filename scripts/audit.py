@@ -19,7 +19,8 @@ bypass-actor drift), Actions token defaults (read-only workflow permissions;
 workflows cannot approve PRs), vulnerability reporting, secret/code scanning,
 stray .github/dependabot.yml (Renovate owns dependency updates), CI wiring,
 coverage-workflow presence on Go/TS repos, Docker Hub dual-publish secrets on
-image repos, Renovate preset, license (present AND GPL-3.0), default branch,
+image repos, Renovate preset, license (present AND matching the repo's
+category per licensing.md), default branch,
 description (presence + <=100 chars), topics (at least 2), the
 dependency-graph "Used by counter" package on public repos (it is pinned to
 one package and does NOT follow Go major-version module-path bumps or module
@@ -162,6 +163,48 @@ ACCEPTED = {
             "deliberate: repo-local smoke signal-contract job required in "
             "addition to ci / validate (same pattern as docker-radvd)",
     },
+}
+
+# Expected license per repo (licensing.md's four-license scheme, 2026-08).
+# Apache-2.0 is the default and covers every public repo not listed here:
+# importable libraries, wrappers whose core value is the upstream software they
+# package, and tooling/config/meta. The listed repos deviate for a stated
+# reason. A repo absent from this table is NOT unclassified — the default
+# applies — so a new repo needs an entry only when it is not Apache-2.0.
+#
+# Values are the spdx_id GitHub's licensee reports, which uses the legacy short
+# IDs. The repos themselves declare GPL-3.0-or-later / AGPL-3.0-or-later in
+# their READMEs and package.json; GitHub cannot distinguish the -only and
+# -or-later variants from the license text, so it reports GPL-3.0 / AGPL-3.0
+# and this table must match what the API returns, not what the repo declares.
+LICENSE_DEFAULT = "Apache-2.0"
+LICENSE_OVERRIDES = {
+    # The differentiated product. File-level copyleft asks for improvements
+    # back while keeping the component embeddable in a closed larger work.
+    "web-terminal-engine": "MPL-2.0",
+    "web-terminal-ui": "MPL-2.0",
+    # Thin hosts over the engine + ui. Permissive here would be a bypass
+    # around their copyleft: ship the already-wired app, change no covered
+    # file, publish nothing. So they are at least as protective as what they
+    # deploy.
+    "web-terminal-kiro": "MPL-2.0",
+    "web-terminal-server": "MPL-2.0",
+    # First-party applications. Nobody imports an app, so it never enters a
+    # consumer's dependency tree and copyleft costs no adoption.
+    "cert-converter": "GPL-3.0",
+    "github-scout": "GPL-3.0",
+    "knell": "GPL-3.0",
+    "plex-exporter": "GPL-3.0",
+    "plex-language-sync": "GPL-3.0",
+    "registry-stats": "GPL-3.0",
+    "seadex-scout": "GPL-3.0",
+    "tautulli-remap": "GPL-3.0",
+    # Network services a competitor could plausibly resell hosted, which is
+    # the only thing AGPL section 13 buys over GPL-3.0. Rationed to these two
+    # because section 13 is also what puts AGPL on corporate blocklists that
+    # GPL-3.0 escapes.
+    "subflux": "AGPL-3.0",
+    "vibekit": "AGPL-3.0",
 }
 
 # Documented governance standard (repo-governance.md).
@@ -692,13 +735,14 @@ def compliance(s):
         hard.append(f"default_branch={s['default_branch']} (want main)")
 
     # License: public repos only — a private personal repo has no audience
-    # that needs a license grant. The fleet standard is GPL-3.0, apps and
-    # libraries alike (the synced LICENSE); anything else is drift.
+    # that needs a license grant. The expected license is per-category, not
+    # fleet-wide: see LICENSE_OVERRIDES above and licensing.md for the rules.
     if not s["private"]:
+        want = LICENSE_OVERRIDES.get(s["name"], LICENSE_DEFAULT)
         if s["license"] is None:
             (hard if s["adopted"] else warn).append("license missing")
-        elif s["license"] != "GPL-3.0":
-            warn.append(f"license {s['license']} (standard is GPL-3.0)")
+        elif s["license"] != want:
+            warn.append(f"license {s['license']} (want {want})")
 
     if s["has_protection"] is False:
         hard.append("no branch protection on default branch")

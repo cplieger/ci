@@ -92,7 +92,8 @@ jobs:
       # IMAGE scan below keeps secrets (see its comment) — that layer is the
       # only one that looks inside a built image, which gitleaks never can.
       # `license` is new and advisory: nothing else in the pipeline checks
-      # whether a transitive dependency's licence is compatible with GPL-3.0.
+      # whether a transitive dependency's licence is compatible with the
+      # consuming repo's own (per-repo since 2026-08; see licensing.md).
       - name: Trivy filesystem scan (advisory)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:

@@ -39,8 +39,9 @@ outward, so the conventions below are about not breaking downstream.
   `htmlvalidate.json`, `gremlins.yaml`, `ruff.toml`, `renovate.json`,
   `image-smoke.sh`, `cliff-stable.toml`, `cliff-alpha.toml`; the last two sync
   to consumers as `cliff.toml`, tiered by latest tag). Root-level
-  `.golangci.yaml`, `.editorconfig`, `.gitattributes`, and `LICENSE` are synced
-  too.
+  `.golangci.yaml`, `.editorconfig`, and `.gitattributes` are synced
+  too. `LICENSE` is **not** synced: each repo's license depends on what the
+  repo is, so it is repo-owned.
 - The Renovate preset is **not** in this repo; it lives in `cplieger/.github`
   (`default.json`) and is extended via `{ "extends": ["github>cplieger/.github"] }`.
 - `ci-local.sh` / `_ci_local.py`: the local mirror of the CI battery.
