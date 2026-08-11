@@ -76,7 +76,7 @@ PRs by `sync.yaml`:
 
 | Source (this repo)                                                                                               | Synced to                                            |
 |------------------------------------------------------------------------------------------------------------------|------------------------------------------------------|
-| `.editorconfig`, `.gitattributes`, `LICENSE`, `configs/renovate.json`                                            | all releaseable repos                                |
+| `.editorconfig`, `.gitattributes`, `configs/renovate.json`                                                       | all releaseable repos                                |
 | `.golangci.yaml`, `configs/gremlins.yaml` (→ `.gremlins.yaml`)                                                   | Go repos                                             |
 | `configs/eslint.config.base.mjs`, `configs/prettier.json`, `configs/stylelint.json`, `configs/htmlvalidate.json` | TS repos (incl. hybrids)                             |
 | `configs/cliff-stable.toml` / `configs/cliff-alpha.toml` (→ `cliff.toml`)                                        | releaseable repos, tier by latest tag (v0.x → alpha) |
@@ -123,4 +123,4 @@ This project was built with AI-assisted tooling using [Claude](https://claude.co
 
 ## License
 
-GPL-3.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).

@@ -20,7 +20,6 @@ on:
       - ".golangci.yaml"
       - ".editorconfig"
       - ".gitattributes"
-      - "LICENSE"
       - "configs/**"
       - "scripts/classify-repos.py"
       - ".github/workflow-templates/**"

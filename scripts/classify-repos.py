@@ -40,7 +40,6 @@ CI_FILES = """\
     files:
       - .editorconfig
       - .gitattributes
-      - LICENSE
       - source: .github/workflow-templates/ci.yml
         dest: .github/workflows/ci.yaml
       - source: .github/workflow-templates/codeql.yml
@@ -204,7 +203,7 @@ def discover_repos():
 
     Forks are excluded fleet-wide (same rule as audit.py): a fork's tree is
     UPSTREAM's, so syncing our conventions into it rewrites code we do not own
-    (LICENSE included) and makes the fork diverge from the branch it exists to
+    and makes the fork diverge from the branch it exists to
     track. Observed before this filter: cplieger/loki and cplieger/go-pkcs12
     auto-merged our full CI/release workflow set, which then ran our pipelines
     against upstream's monorepo on every push.
