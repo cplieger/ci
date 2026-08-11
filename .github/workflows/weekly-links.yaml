@@ -19,6 +19,11 @@
 #            broken-links), closed automatically when a run finds nothing.
 #            Idempotent: an existing issue is updated in place rather than
 #            duplicated, matching the gremlins/fuzz/stryker tracker convention.
+# Exclusions: `.github/lychee.toml` in this repo, read via a second sparse
+#            checkout. Held centrally because the noise is fleet-uniform (one
+#            bot-blocked host reached 51 of the 52 repos that reported in the
+#            2026-08-07 run). An open issue is only worth reading while it
+#            means a link actually rotted.
 name: Weekly links
 
 on:
@@ -102,6 +107,17 @@ jobs:
           persist-credentials: false
           path: app
 
+      # The exclusion list is fleet-wide knowledge, so it lives here and is read
+      # from a second checkout rather than synced into 51 consumers. Sparse and
+      # cone-mode off: one file, no history of the rest of this repo.
+      - name: Checkout exclusion list
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/lychee.toml
+          sparse-checkout-cone-mode: false
+          path: ci
+
       - name: Install lychee
         run: |
           # Tag is `lychee-vX.Y.Z` (the repo is a workspace and also tags
@@ -120,7 +136,10 @@ jobs:
       # `--cache` keeps a per-run cache so a URL referenced from twenty READMEs
       # is fetched once. 429 and 5xx are accepted: a rate-limited or briefly
       # down host is not a broken link, and treating it as one is what makes
-      # link checkers famous for crying wolf.
+      # link checkers famous for crying wolf. `--config` adds the adjudicated
+      # exclusion list (see `.github/lychee.toml` for what is in it and why).
+      # It is passed explicitly rather than left to lychee's working-directory
+      # auto-discovery, which would read a file out of the consumer checkout.
       - name: Check external links
         id: lychee
         continue-on-error: true
@@ -133,6 +152,7 @@ jobs:
           # skipped every PR template and workflow doc. Verified empirically;
           # same rationale as the offline gate in the meta ci.yaml.
           lychee --no-progress --cache --max-cache-age 1d \
+            --config "$GITHUB_WORKSPACE/ci/.github/lychee.toml" \
             --accept '200..=299,429,500..=599' \
             --max-retries 3 --timeout 20 \
             --hidden --extensions md \
@@ -187,9 +207,12 @@ jobs:
           {
             echo "Automated weekly external-link check. Report-only: this never blocks a merge."
             echo ""
-            echo "A link here may be a genuine rot, a moved page, or a host that was"
-            echo "briefly unreachable. 429 and 5xx responses are already accepted, so"
-            echo "entries below are mostly 404s and DNS failures."
+            echo "Each entry below is a link a reader cannot open. Known false positives"
+            echo "are already filtered: 429 and 5xx are accepted, loopback URLs are"
+            echo "skipped, and hosts that block CI checkers are excluded in"
+            echo "[cplieger/ci .github/lychee.toml](https://github.com/cplieger/ci/blob/main/.github/lychee.toml)."
+            echo "So treat what remains as real. Fix the link in this repo; if the URL"
+            echo "does open in a browser, add it to that list with the reason."
             echo ""
             echo "<!-- links-data -->"
             head -c 60000 "$RUNNER_TEMP/links.md"
