@@ -1,0 +1,65 @@
+# Exclusion list for the weekly EXTERNAL link check (weekly-links.yaml).
+#
+# WHAT THIS FILE IS
+# An adjudication registry, not a convenience. Every entry below is a URL the
+# checker reports as broken and a human reader can open successfully. The
+# tracker issue is only useful while an OPEN issue means "a link rotted", so a
+# permanent false positive has to be excluded or the signal dies. Same role
+# `.punused-ignore` plays for unused-symbol findings, held centrally because
+# this noise is fleet-uniform rather than per-repo.
+#
+# Non-synced and ci-internal, like `.github/cliff-ci.toml`: it configures a
+# workflow in THIS repo and is never copied into consumers by sync.yaml.
+#
+# RULES FOR ADDING AN ENTRY
+# 1. Open the URL yourself first. A 404 is rot, and rot gets FIXED in the repo
+#    that carries the link. Excluding a 404 hides the one thing this job is for.
+# 2. Anchor the pattern (`^https://host/path`) and escape the dots. An
+#    unanchored `npmjs\.com` would also silence a genuinely dead registry URL.
+# 3. Scope it to the narrowest path that covers the noise, so a sibling URL on
+#    the same host is still checked.
+# 4. Record WHY, with the observed status code. An entry nobody can re-verify
+#    is indistinguishable from a mistake, and hosts change their minds.
+#
+# AUDIT THAT PRODUCED THIS LIST (2026-08-11, against the 2026-08-07 run)
+# The run checked 53 public repos and opened an issue in 52 of them: 69
+# reported failures, 68 of which a reader can open, and 1 genuine rot
+# (seadex-scout's Torznab link, fixed in that repo rather than excluded).
+# Re-verified with lychee 0.24.2, the pinned version: with this list, 51 of the
+# 52 go clean and seadex-scout still reports its 404.
+
+# Loopback is structurally uncheckable, never a real external link.
+# Three repos document the URL a reader opens after starting the container
+# (web-terminal-kiro :9848, vibekit :9847, web-terminal-server 127.0.0.1:7681).
+# No server listens in a CI runner, so the checker reports "Connection refused"
+# for documentation that is correct. `--exclude-loopback` is lychee's own flag
+# for this and covers localhost plus 127.0.0.0/8, so no regex has to.
+exclude_loopback = true
+
+exclude = [
+  # 403 to any datacenter IP, checked from both a lychee and a browser user
+  # agent, so it is Cloudflare bot protection rather than rot: the page loads
+  # in a real browser. It reached 51 of the 52 reporting repos on its own,
+  # because it sits in the canonical AI-note README footer
+  # (repo-governance.md) that nearly every repo carries. The two links beside
+  # it there, claude.com and kiro.dev, both return 200. Excluding one host
+  # beats rewriting that footer everywhere to a URL that is already correct.
+  '^https?://([^/]*\.)?openai\.com',
+
+  # 403 on the human-facing package page, in the 7 repos that link one. Every
+  # package resolves on registry.npmjs.org (checked 2026-08-11: actions 3.1.1,
+  # fetch 2.1.0, keyenc 1.0.1, reactive 1.2.5, ui-primitives 3.0.0,
+  # web-terminal-engine 3.8.0, web-terminal-ui 5.3.1), so the link is right and
+  # the block is npmjs.com's. Scoped to /package/ so any other npmjs.com URL,
+  # including the registry API, is still checked.
+  '^https://www\.npmjs\.com/package/',
+
+  # Connection failures and timeouts under the fanout, not rot: the URL returns
+  # 200 on a manual retry. It failed in only 5 of the 52 reporting repos while
+  # the same badge-viewer URL sits in nearly every repo's README, so a real
+  # outage would have failed all of them. The target is keyed by our own repo
+  # name and cannot rot on its own while the badge beside it still renders.
+  # Deliberately narrower than `--accept-timeouts`, which would forgive a
+  # timeout from every host and hide a genuinely dead one.
+  '^https://scorecard\.dev/viewer/',
+]
