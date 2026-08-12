@@ -199,9 +199,13 @@ jobs:
             -e GREMLINS_VERSION="${GREMLINS_VERSION}" \
             -e WORKERS="${workers}" \
             "${image}" bash -euo pipefail -c '
-              curl -fsSL --retry 3 \
-                "https://github.com/go-gremlins/gremlins/releases/download/${GREMLINS_VERSION}/gremlins_${GREMLINS_VERSION#v}_linux_amd64.tar.gz" \
-                | tar -xz -C /usr/local/bin gremlins
+              # File first, then extract: --retry does not cover a mid-transfer
+              # receive failure, and --retry-all-errors cannot retry into a pipe.
+              curl -fsSL --connect-timeout 10 --max-time 60 \
+                --retry 3 --retry-delay 5 --retry-all-errors \
+                -o /tmp/gremlins.tgz \
+                "https://github.com/go-gremlins/gremlins/releases/download/${GREMLINS_VERSION}/gremlins_${GREMLINS_VERSION#v}_linux_amd64.tar.gz"
+              tar -xzf /tmp/gremlins.tgz -C /usr/local/bin gremlins
               gremlins unleash --workers "${WORKERS}" --output /work/gremlins-out.json .
             ' || rc=$?
 

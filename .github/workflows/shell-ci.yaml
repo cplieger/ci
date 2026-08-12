@@ -62,11 +62,18 @@ jobs:
       # the meta ci.yaml `repo` job. They used to run here AND in go-ci, so a
       # Docker+Go repo checked the same workflows and tree twice.
 
+      # Both downloads in this file write to a FILE first and extract from it,
+      # rather than piping curl into tar: plain `--retry` does not cover a
+      # mid-transfer receive failure (curl exit 56), and `--retry-all-errors`,
+      # which does, is only safe when curl owns the output file — it resets a
+      # partial `-o` write before a retry, and cannot reset a pipe.
       - name: Install shfmt
         run: |
           # renovate: datasource=github-releases depName=mvdan/sh
           VERSION=v3.13.1
-          sudo curl -fsSL -o /usr/local/bin/shfmt \
+          sudo curl -fsSL --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            -o /usr/local/bin/shfmt \
             "https://github.com/mvdan/sh/releases/download/${VERSION}/shfmt_${VERSION}_linux_amd64"
           sudo chmod +x /usr/local/bin/shfmt
 
@@ -78,8 +85,11 @@ jobs:
           # local tooling and stays reproducible.
           # renovate: datasource=github-releases depName=koalaman/shellcheck
           VERSION=v0.11.0
-          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${VERSION}/shellcheck-${VERSION}.linux.x86_64.tar.gz" \
-            | tar -xzf - -C /tmp "shellcheck-${VERSION}/shellcheck"
+          curl -fsSL --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            -o "$RUNNER_TEMP/shellcheck.tgz" \
+            "https://github.com/koalaman/shellcheck/releases/download/${VERSION}/shellcheck-${VERSION}.linux.x86_64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/shellcheck.tgz" -C /tmp "shellcheck-${VERSION}/shellcheck"
           sudo mv "/tmp/shellcheck-${VERSION}/shellcheck" /usr/local/bin/shellcheck
           shellcheck --version
 

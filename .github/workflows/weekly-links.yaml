@@ -127,10 +127,15 @@ jobs:
           VERSION=v0.24.2
           # The archive nests the binary one level deep in a target-named
           # directory, hence --strip-components=1 rather than a bare member name.
-          curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 5 \
-            "https://github.com/lycheeverse/lychee/releases/download/lychee-${VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar -xzf - -C /tmp --strip-components=1 \
-              lychee-x86_64-unknown-linux-gnu/lychee
+          # File first, then extract: plain `--retry` does not cover a
+          # mid-transfer receive failure (curl exit 56), and the flag that does
+          # (`--retry-all-errors`) is only safe when curl owns the output file.
+          curl -fsSL --connect-timeout 10 --max-time 60 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            -o "$RUNNER_TEMP/lychee.tgz" \
+            "https://github.com/lycheeverse/lychee/releases/download/lychee-${VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf "$RUNNER_TEMP/lychee.tgz" -C /tmp --strip-components=1 \
+            lychee-x86_64-unknown-linux-gnu/lychee
           sudo mv /tmp/lychee /usr/local/bin/lychee
 
       # `--cache` keeps a per-run cache so a URL referenced from twenty READMEs

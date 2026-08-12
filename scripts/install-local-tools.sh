@@ -79,6 +79,30 @@ pin_version() {
 # semver: extract the first X.Y.Z from stdin (a tool's --version output).
 semver() { grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1; }
 
+# fetch_extract <url> <tar-arg>...: download an archive to a temp file, then
+# extract it by passing the temp file to tar with the given arguments (e.g.
+# `-xz -C "$BIN_DIR" gitleaks`). Returns non-zero if either half fails.
+#
+# WHY two steps instead of `curl ... | tar -xzf -`: plain `--retry` treats only
+# a timeout and a short list of HTTP codes as retryable, so a mid-transfer
+# receive failure (curl exit 56, "Connection died") gets no retry at all — the
+# class that reddened the CI markdown job on 2026-08-12. `--retry-all-errors`
+# covers it, but curl only resets partial output it owns via `-o`; it cannot
+# reset a pipe or a `>` redirect, so retrying into a pipe would replay bytes tar
+# has already consumed. Downloading to a file first is what makes the flag safe.
+fetch_extract() {
+  local url=$1
+  shift
+  local tmp rc=0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/install-local-tools.XXXXXX")" || return 1
+  curl -fsSL --connect-timeout 10 --max-time 120 \
+    --retry 3 --retry-delay 5 --retry-all-errors \
+    -o "$tmp" "$url" \
+    && tar -f "$tmp" "$@" || rc=$?
+  rm -f "$tmp"
+  return "$rc"
+}
+
 ok() { SUMMARY+=("$(printf '  %-18s %-10s %s' "$1" "$2" "${3:-installed}")"); }
 skip() { SUMMARY+=("$(printf '  %-18s %-10s %s' "$1" "$2" "already current")"); }
 bad() {
@@ -128,8 +152,8 @@ install_gitleaks() {
       ;;
   esac
   mkdir -p "$BIN_DIR"
-  if curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/${want}/gitleaks_${want#v}_linux_${arch}.tar.gz" \
-    | tar -xzf - -C "$BIN_DIR" gitleaks 2>/dev/null; then
+  if fetch_extract "https://github.com/gitleaks/gitleaks/releases/download/${want}/gitleaks_${want#v}_linux_${arch}.tar.gz" \
+    -xz -C "$BIN_DIR" gitleaks 2>/dev/null; then
     ok gitleaks "$want" "-> $BIN_DIR"
   else
     bad gitleaks "download failed"
@@ -301,8 +325,8 @@ install_trivy() {
       ;;
   esac
   mkdir -p "$BIN_DIR"
-  if curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/${want}/trivy_${want#v}_Linux-${arch}.tar.gz" \
-    | tar -xzf - -C "$BIN_DIR" trivy 2>/dev/null; then
+  if fetch_extract "https://github.com/aquasecurity/trivy/releases/download/${want}/trivy_${want#v}_Linux-${arch}.tar.gz" \
+    -xz -C "$BIN_DIR" trivy 2>/dev/null; then
     ok trivy "$want" "-> $BIN_DIR"
   else
     bad trivy "download failed"
@@ -368,8 +392,8 @@ install_shellcheck() {
       ;;
   esac
   mkdir -p "$BIN_DIR"
-  if curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${want}/shellcheck-${want}.linux.${arch}.tar.xz" \
-    | tar -xJf - -C "$BIN_DIR" --strip-components=1 "shellcheck-${want}/shellcheck" 2>/dev/null; then
+  if fetch_extract "https://github.com/koalaman/shellcheck/releases/download/${want}/shellcheck-${want}.linux.${arch}.tar.xz" \
+    -xJ -C "$BIN_DIR" --strip-components=1 "shellcheck-${want}/shellcheck" 2>/dev/null; then
     ok shellcheck "$want" "-> $BIN_DIR"
   else
     bad shellcheck "download failed"
@@ -487,8 +511,8 @@ install_actionlint() {
       ;;
   esac
   mkdir -p "$BIN_DIR"
-  if curl -fsSL "https://github.com/rhysd/actionlint/releases/download/${want}/actionlint_${want#v}_linux_${arch}.tar.gz" \
-    | tar -xzf - -C "$BIN_DIR" actionlint 2>/dev/null; then
+  if fetch_extract "https://github.com/rhysd/actionlint/releases/download/${want}/actionlint_${want#v}_linux_${arch}.tar.gz" \
+    -xz -C "$BIN_DIR" actionlint 2>/dev/null; then
     ok actionlint "$want" "-> $BIN_DIR"
   else
     bad actionlint "download failed"
@@ -521,8 +545,8 @@ install_lychee() {
       ;;
   esac
   mkdir -p "$BIN_DIR"
-  if curl -fsSL "https://github.com/lycheeverse/lychee/releases/download/lychee-${want}/lychee-${target}.tar.gz" \
-    | tar -xzf - -C "$BIN_DIR" --strip-components=1 "lychee-${target}/lychee" 2>/dev/null; then
+  if fetch_extract "https://github.com/lycheeverse/lychee/releases/download/lychee-${want}/lychee-${target}.tar.gz" \
+    -xz -C "$BIN_DIR" --strip-components=1 "lychee-${target}/lychee" 2>/dev/null; then
     ok lychee "$want" "-> $BIN_DIR"
   else
     bad lychee "download failed"
@@ -553,8 +577,8 @@ install_typos() {
       ;;
   esac
   mkdir -p "$BIN_DIR"
-  if curl -fsSL "https://github.com/crate-ci/typos/releases/download/${want}/typos-${want}-${target}.tar.gz" \
-    | tar -xzf - -C "$BIN_DIR" ./typos 2>/dev/null; then
+  if fetch_extract "https://github.com/crate-ci/typos/releases/download/${want}/typos-${want}-${target}.tar.gz" \
+    -xz -C "$BIN_DIR" ./typos 2>/dev/null; then
     ok typos "$want" "-> $BIN_DIR"
   else
     bad typos "download failed"
