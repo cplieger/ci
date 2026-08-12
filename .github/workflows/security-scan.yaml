@@ -191,7 +191,7 @@ jobs:
           # archive stays out of /tmp/gitleaks* so ci-local's rewrite of that
           # literal path cannot reach it.
           curl -fsSL --connect-timeout 10 --max-time 30 \
-            --retry 3 --retry-delay 5 --retry-all-errors \
+            --retry 7 --retry-max-time 150 --retry-all-errors \
             -o "$RUNNER_TEMP/gitleaks.tgz" \
             "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz"
           tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C /tmp gitleaks
