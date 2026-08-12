@@ -96,7 +96,7 @@ fetch_extract() {
   local tmp rc=0
   tmp="$(mktemp "${TMPDIR:-/tmp}/install-local-tools.XXXXXX")" || return 1
   curl -fsSL --connect-timeout 10 --max-time 120 \
-    --retry 3 --retry-delay 5 --retry-all-errors \
+    --retry 7 --retry-max-time 150 --retry-all-errors \
     -o "$tmp" "$url" \
     && tar -f "$tmp" "$@" || rc=$?
   rm -f "$tmp"

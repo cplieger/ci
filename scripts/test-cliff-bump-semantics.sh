@@ -146,7 +146,7 @@ echo "pinned git-cliff: $VERSION / sha256 ${SHA256:0:12}… ($EXPECTED_SITES sit
 if [ -n "${CLIFF_BIN:-}" ]; then
   CLIFF="$CLIFF_BIN"
 else
-  curl -fsSL --retry 3 --retry-all-errors -o "$WORK/git-cliff.tgz" \
+  curl -fsSL --retry 7 --retry-max-time 150 --retry-all-errors -o "$WORK/git-cliff.tgz" \
     "https://github.com/orhun/git-cliff/releases/download/${VERSION}/git-cliff-${VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
   echo "${SHA256}  ${WORK}/git-cliff.tgz" | sha256sum -c -
   tar xzf "$WORK/git-cliff.tgz" -C "$WORK" --strip-components=1 "git-cliff-${VERSION#v}/git-cliff"

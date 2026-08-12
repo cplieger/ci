@@ -408,12 +408,25 @@ jobs:
       # cover that class, but curl only resets partial output for `-o` — never
       # for a pipe or a `>` redirect — so on a pipe a retry would replay bytes
       # tar has already consumed. File first is what makes the flag safe.
+      #
+      # The window is 8 attempts over about 127 seconds: 7 retries on curl's
+      # default exponential backoff (1s, 2s, 4s … 64s), with --retry-max-time
+      # as the ceiling for the case where each attempt itself dies slowly and
+      # stacks --max-time. It replaced 3 retries at a fixed 5s delay, whose
+      # 15-second window is what failed on 2026-08-12: a GitHub release-asset
+      # brownout (HTTP 503 and exit 56, intermittent from 18:12 to past 21:21
+      # UTC, no status-page incident) reddened a job in all 17 sync PRs and
+      # this repo's own main CI, because all 4 attempts fell in one 15s hole.
+      # --retry-max-time gates only whether a retry STARTS, so the last wait
+      # can still finish past it; the retry COUNT sets the real ceiling.
+      # Cost: a genuinely wrong version pin takes about two minutes to fail
+      # instead of 15 seconds, since --retry-all-errors retries a 404 too.
       - name: Install actionlint
         run: |
           # renovate: datasource=github-releases depName=rhysd/actionlint
           VERSION=v1.7.12
           curl -fsSL --connect-timeout 10 --max-time 30 \
-            --retry 3 --retry-delay 5 --retry-all-errors \
+            --retry 7 --retry-max-time 150 --retry-all-errors \
             -o "$RUNNER_TEMP/actionlint.tgz" \
             "https://github.com/rhysd/actionlint/releases/download/${VERSION}/actionlint_${VERSION#v}_linux_amd64.tar.gz"
           tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C /tmp actionlint
@@ -458,7 +471,7 @@ jobs:
             # archive name would be rewritten too, dropping the tarball into the
             # working tree where the next `gitleaks dir` scan would read it.
             curl -fsSL --connect-timeout 10 --max-time 30 \
-              --retry 3 --retry-delay 5 --retry-all-errors \
+              --retry 7 --retry-max-time 150 --retry-all-errors \
               -o "$RUNNER_TEMP/gitleaks.tgz" \
               "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz"
             tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C /tmp gitleaks
@@ -519,7 +532,7 @@ jobs:
           # renovate: datasource=github-releases depName=crate-ci/typos
           VERSION=v1.49.0
           curl -fsSL --connect-timeout 10 --max-time 30 \
-            --retry 3 --retry-delay 5 --retry-all-errors \
+            --retry 7 --retry-max-time 150 --retry-all-errors \
             -o "$RUNNER_TEMP/typos.tgz" \
             "https://github.com/crate-ci/typos/releases/download/${VERSION}/typos-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
           tar -xzf "$RUNNER_TEMP/typos.tgz" -C /tmp ./typos
@@ -551,7 +564,7 @@ jobs:
           # The archive nests the binary one level deep in a target-named
           # directory, hence --strip-components=1 rather than a bare member name.
           curl -fsSL --connect-timeout 10 --max-time 60 \
-            --retry 3 --retry-delay 5 --retry-all-errors \
+            --retry 7 --retry-max-time 150 --retry-all-errors \
             -o "$RUNNER_TEMP/lychee.tgz" \
             "https://github.com/lycheeverse/lychee/releases/download/lychee-${VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz"
           tar -xzf "$RUNNER_TEMP/lychee.tgz" -C /tmp --strip-components=1 \
@@ -635,7 +648,7 @@ jobs:
           # renovate: datasource=github-releases depName=koalaman/shellcheck
           VERSION=v0.11.0
           curl -fsSL --connect-timeout 10 --max-time 30 \
-            --retry 3 --retry-delay 5 --retry-all-errors \
+            --retry 7 --retry-max-time 150 --retry-all-errors \
             -o "$RUNNER_TEMP/shellcheck.tgz" \
             "https://github.com/koalaman/shellcheck/releases/download/${VERSION}/shellcheck-${VERSION}.linux.x86_64.tar.gz"
           tar -xzf "$RUNNER_TEMP/shellcheck.tgz" -C /tmp "shellcheck-${VERSION}/shellcheck"
@@ -647,7 +660,7 @@ jobs:
           # renovate: datasource=github-releases depName=mvdan/sh
           VERSION=v3.13.1
           sudo curl -fsSL --connect-timeout 10 --max-time 30 \
-            --retry 3 --retry-delay 5 --retry-all-errors \
+            --retry 7 --retry-max-time 150 --retry-all-errors \
             -o /usr/local/bin/shfmt \
             "https://github.com/mvdan/sh/releases/download/${VERSION}/shfmt_${VERSION}_linux_amd64"
           sudo chmod +x /usr/local/bin/shfmt
