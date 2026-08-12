@@ -399,13 +399,24 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      # Every tool download in this file writes to a FILE first and extracts
+      # from it, rather than piping curl into tar. Two reasons, the first paid
+      # for on 2026-08-12: plain `--retry` treats only a timeout and a short
+      # list of HTTP codes as retryable, so a mid-transfer receive failure
+      # (curl exit 56, "Connection died") got no retry at all and reddened the
+      # markdown job on an unrelated Renovate PR. `--retry-all-errors` does
+      # cover that class, but curl only resets partial output for `-o` — never
+      # for a pipe or a `>` redirect — so on a pipe a retry would replay bytes
+      # tar has already consumed. File first is what makes the flag safe.
       - name: Install actionlint
         run: |
           # renovate: datasource=github-releases depName=rhysd/actionlint
           VERSION=v1.7.12
-          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 5 \
-            "https://github.com/rhysd/actionlint/releases/download/${VERSION}/actionlint_${VERSION#v}_linux_amd64.tar.gz" \
-            | tar -xzf - -C /tmp actionlint
+          curl -fsSL --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            -o "$RUNNER_TEMP/actionlint.tgz" \
+            "https://github.com/rhysd/actionlint/releases/download/${VERSION}/actionlint_${VERSION#v}_linux_amd64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C /tmp actionlint
           sudo mv /tmp/actionlint /usr/local/bin/actionlint
 
       - name: Install zizmor
@@ -442,9 +453,15 @@ jobs:
           (
             # renovate: datasource=github-releases depName=gitleaks/gitleaks
             VERSION=v8.30.1
-            curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 5 \
-              "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz" \
-              | tar -xzf - -C /tmp gitleaks
+            # The archive goes to $RUNNER_TEMP, not /tmp: ci-local rewrites the
+            # literal `/tmp/gitleaks` to the PATH binary, and a `/tmp/gitleaks*`
+            # archive name would be rewritten too, dropping the tarball into the
+            # working tree where the next `gitleaks dir` scan would read it.
+            curl -fsSL --connect-timeout 10 --max-time 30 \
+              --retry 3 --retry-delay 5 --retry-all-errors \
+              -o "$RUNNER_TEMP/gitleaks.tgz" \
+              "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz"
+            tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C /tmp gitleaks
             /tmp/gitleaks dir . --no-banner --redact --exit-code 1
           ) || { echo "Scan for secrets (gitleaks)" >> /tmp/_ci_failures; exit 1; }
 
@@ -501,9 +518,11 @@ jobs:
         run: |
           # renovate: datasource=github-releases depName=crate-ci/typos
           VERSION=v1.49.0
-          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 5 \
-            "https://github.com/crate-ci/typos/releases/download/${VERSION}/typos-${VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-            | tar -xzf - -C /tmp ./typos
+          curl -fsSL --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            -o "$RUNNER_TEMP/typos.tgz" \
+            "https://github.com/crate-ci/typos/releases/download/${VERSION}/typos-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          tar -xzf "$RUNNER_TEMP/typos.tgz" -C /tmp ./typos
           sudo mv /tmp/typos /usr/local/bin/typos
           typos --version
 
@@ -531,10 +550,12 @@ jobs:
           VERSION=v0.24.2
           # The archive nests the binary one level deep in a target-named
           # directory, hence --strip-components=1 rather than a bare member name.
-          curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 5 \
-            "https://github.com/lycheeverse/lychee/releases/download/lychee-${VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar -xzf - -C /tmp --strip-components=1 \
-              lychee-x86_64-unknown-linux-gnu/lychee
+          curl -fsSL --connect-timeout 10 --max-time 60 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            -o "$RUNNER_TEMP/lychee.tgz" \
+            "https://github.com/lycheeverse/lychee/releases/download/lychee-${VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf "$RUNNER_TEMP/lychee.tgz" -C /tmp --strip-components=1 \
+            lychee-x86_64-unknown-linux-gnu/lychee
           sudo mv /tmp/lychee /usr/local/bin/lychee
           lychee --version
 
@@ -613,8 +634,11 @@ jobs:
           # so the gate matches local tooling and stays reproducible.
           # renovate: datasource=github-releases depName=koalaman/shellcheck
           VERSION=v0.11.0
-          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${VERSION}/shellcheck-${VERSION}.linux.x86_64.tar.gz" \
-            | tar -xzf - -C /tmp "shellcheck-${VERSION}/shellcheck"
+          curl -fsSL --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            -o "$RUNNER_TEMP/shellcheck.tgz" \
+            "https://github.com/koalaman/shellcheck/releases/download/${VERSION}/shellcheck-${VERSION}.linux.x86_64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/shellcheck.tgz" -C /tmp "shellcheck-${VERSION}/shellcheck"
           sudo mv "/tmp/shellcheck-${VERSION}/shellcheck" /usr/local/bin/shellcheck
           shellcheck --version
 
@@ -622,7 +646,9 @@ jobs:
         run: |
           # renovate: datasource=github-releases depName=mvdan/sh
           VERSION=v3.13.1
-          sudo curl -fsSL -o /usr/local/bin/shfmt \
+          sudo curl -fsSL --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            -o /usr/local/bin/shfmt \
             "https://github.com/mvdan/sh/releases/download/${VERSION}/shfmt_${VERSION}_linux_amd64"
           sudo chmod +x /usr/local/bin/shfmt
 
