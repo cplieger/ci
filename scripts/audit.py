@@ -34,7 +34,8 @@ deploy-trigger webhook that reaches the self-hosted orchestrator — presence,
 signing secret, exact event set (push for the infra repos, release everywhere
 else), JSON payload, TLS verification on, and exactly one hook (only when
 AUDIT_WEBHOOK_HOST is set — the host is private infra, injected via env,
-never hardcoded here).
+never hardcoded here; and only for repos outside NO_DEPLOY_HOOK, which have no
+orchestrator relationship to check).
 
 Branch protection is the documented standard (classic protection); any
 custom repository ruleset is treated as drift, and an Integration bypass actor
@@ -93,7 +94,10 @@ INFRA = {".github", "ci"}  # they define the standard; CI-wiring check is N/A fo
 # caller: they validate surfaces the shared workflows don't cover and gate on a
 # bespoke `validate` job (which the branch-protection check accepts as the bare
 # 'validate' context). The CI-wiring check is N/A for them, same as INFRA.
-BESPOKE_CI = {".kiro", "homelab"}
+# AWS is a private workspace repo (markdown, Python, Office templates) with no
+# compiled surface for the shared workflows to act on; its `validate` job is a
+# lint plus secret plus data-boundary gate.
+BESPOKE_CI = {".kiro", "homelab", "AWS"}
 # Host of the self-hosted deploy/dependency orchestrator that each repo pings
 # via a per-repo webhook (a release, or a push on infra repos, reaches it so the
 # change redeploys / re-runs dependency updates). It is private infrastructure,
@@ -110,6 +114,20 @@ MANAGED_RULESETS = {"code-scanning-merge-protection"}
 # other repo releases, so its hook must carry the release event or releases
 # silently never reach the orchestrator.
 PUSH_WEBHOOK_REPOS = {".github", ".kiro", "ci", "homelab"}
+# Repos with NO orchestrator relationship at all, so no deploy-trigger webhook
+# is expected. Distinct from PUSH_WEBHOOK_REPOS, which only changes WHICH event
+# a hook must carry: a missing hook is still a HARD failure there, correctly, so
+# membership in that set cannot express "this repo should have none".
+#
+# The webhook check is a denylist by design (every repo needs a hook unless
+# named here), because that direction fails safe: a new app repo that genuinely
+# needs one is flagged rather than silently exempt. Adding a name is therefore a
+# deliberate statement that the repo neither deploys nor triggers dependency
+# runs, and the reason belongs in the comment below.
+#
+# AWS is a private work workspace. It ships nothing, cuts no release, and must
+# not point a webhook at the self-hosted orchestrator.
+NO_DEPLOY_HOOK = {"AWS"}
 # Image repos that publish to GHCR only (no Docker Hub mirror), so the
 # DOCKERHUB_* secrets check is N/A. MUST mirror the per-repo policy overrides
 # in .github/workflows/release.yaml (the `policy` step) — update both together.
@@ -981,7 +999,11 @@ def compliance(s):
     # never fires at all — each is a silent, deploy-breaking gap. The full
     # config surface is checked: exact event set (push for the infra repos,
     # release everywhere else), JSON payload, TLS verification on.
-    if WEBHOOK_HOST and s["webhook_readable"]:
+    # NO_DEPLOY_HOOK repos are skipped entirely rather than having only the
+    # "missing hook" branch suppressed: with no orchestrator relationship, a hook
+    # on one of them is not a misconfiguration to grade against an expected event,
+    # so every check in this block is meaningless for it.
+    if WEBHOOK_HOST and s["webhook_readable"] and s["name"] not in NO_DEPLOY_HOOK:
         hooks = s.get("webhooks") or []
         want_event = "push" if s["name"] in PUSH_WEBHOOK_REPOS else "release"
         if not hooks:
