@@ -288,6 +288,45 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      # BuildKit restores a cached RUN layer verbatim, so a Dockerfile's
+      # `apt-get upgrade` / `apk upgrade` stops re-running for as long as that
+      # layer stays in the GHA cache, and the image keeps shipping the packages
+      # that were current when the layer was FIRST built. Measured 2026-08-16:
+      # web-terminal-kiro v2.11.1 was built on 08-15 but carried an apt layer
+      # from 08-05, shipping util-linux/unzip/jq versions Debian had already
+      # issued security updates for. `rebuild-stale.yaml` cannot catch this —
+      # its clock resets on every release, so an actively released repo never
+      # reaches the staleness threshold at all.
+      #
+      # A Dockerfile opts in by declaring `ARG PKG_REFRESH` and REFERENCING it
+      # in its package layer; this step then feeds it today's UTC date, so that
+      # layer rebuilds at most once a day while every later build the same day
+      # still hits cache. The reference is load-bearing: BuildKit keys a RUN on
+      # the build args it actually consumes, so a merely-declared ARG would
+      # leave the stale layer in place.
+      #
+      # A repo with no such ARG gets no build-arg at all, which keeps BuildKit
+      # from warning about an unconsumed argument on the distroless/scratch
+      # images that ship no OS packages.
+      - name: Resolve OS package refresh key
+        id: pkgrefresh
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          if grep -qE '^[[:space:]]*ARG[[:space:]]+PKG_REFRESH' "$DOCKERFILE"; then
+            REFRESH="PKG_REFRESH=$(date -u +%Y-%m-%d)"
+            echo "Package layer opts in; passing ${REFRESH}"
+          else
+            REFRESH=""
+            echo "No PKG_REFRESH ARG in ${DOCKERFILE}; passing no build-arg."
+          fi
+          {
+            echo "build-args<<EOF"
+            echo "$REFRESH"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
@@ -315,11 +354,15 @@ jobs:
           file: ${{ inputs.dockerfile }}
           platforms: ${{ matrix.platform }}
           labels: ${{ needs.prepare.outputs.labels }}
+          # PKG_REFRESH (a UTC date) when the Dockerfile opts in, empty
+          # otherwise. See the "Resolve OS package refresh key" step above.
+          build-args: ${{ steps.pkgrefresh.outputs.build-args }}
           # mode=max records the full build definition + base64 Dockerfile for
           # richer SLSA provenance on these public images (min omits the build
           # steps/source). mode=max embeds build-arg VALUES — secret mounts
           # (RUN --mount=type=secret) are never included, so never pass secrets
-          # via build-args; this workflow passes none.
+          # via build-args; the only one this workflow passes is PKG_REFRESH,
+          # a date.
           provenance: mode=max
           # push-by-digest writes the per-arch image to GHCR (and Docker Hub
           # if logged in) under a digest-only ref — no human-readable tags
