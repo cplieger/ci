@@ -60,6 +60,29 @@ jobs:
         if: ${{ steps.profile.outputs.image == 'true' }}
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
+      # Without this the advisory scan reports on a phantom image: the build
+      # below is a pure cache consumer, so it would restore a months-old
+      # package layer and publish CVE findings for versions no published image
+      # actually ships (or miss ones it does). See docker-release.yaml's
+      # "Resolve OS package refresh key" step.
+      - name: Resolve OS package refresh key
+        id: pkgrefresh
+        if: ${{ steps.profile.outputs.image == 'true' }}
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          if grep -qE '^[[:space:]]*ARG[[:space:]]+PKG_REFRESH' "$DOCKERFILE"; then
+            REFRESH="PKG_REFRESH=$(date -u +%Y-%m-%d)"
+          else
+            REFRESH=""
+          fi
+          {
+            echo "build-args<<EOF"
+            echo "$REFRESH"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build image (no push)
         if: ${{ steps.profile.outputs.image == 'true' }}
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -69,6 +92,7 @@ jobs:
           push: false
           load: true
           tags: ci-scan:latest
+          build-args: ${{ steps.pkgrefresh.outputs.build-args }}
           # Pure cache consumer — no cache-to by design. This throwaway scan
           # build reads the layers the required build-ability gate (ci.yaml
           # `docker` job) exports to the same default `buildkit` scope. It must
