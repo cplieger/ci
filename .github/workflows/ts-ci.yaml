@@ -164,12 +164,10 @@ jobs:
       - name: Publish surface (registries ship exactly the public API)
         id: publish_surface
         continue-on-error: true
-        # Bootstrap ref: a brand-new composite action cannot be pinned to its own
-        # merge SHA in the commit that creates it. Pin this to the tag's commit
-        # SHA (keeping the `# v2` comment) as soon as the first tag exists —
-        # Renovate bumps an existing digest but does not do the initial tag->SHA
-        # conversion, and Scorecard/CodeQL raise unpinned-action alerts meanwhile.
-        uses: cplieger/ci/actions/publish-surface@v2 # v2
+        # Pinned to the v2.32.0 commit, the tag that first carried this action.
+        # Renovate bumps an existing digest when v2 moves; it does not do the
+        # initial tag-to-SHA conversion, which is why this is pinned by hand.
+        uses: cplieger/ci/actions/publish-surface@d0157f5733f5e126526a4c40b53d9dc2ba7f1c65 # v2
         with:
           package-dir: ${{ inputs.working-directory }}
 
