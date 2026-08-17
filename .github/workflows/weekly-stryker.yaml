@@ -92,7 +92,18 @@ jobs:
           for r in $repos; do
             rm -rf scan
             gh repo clone "cplieger/${r}" scan -- --depth 1 2>/dev/null || continue
-            sha=$(git -C scan rev-parse HEAD)
+            # `|| continue` above only catches a clone that EXITS non-zero. A
+            # clone that exits 0 leaving no resolvable HEAD reaches rev-parse,
+            # which exits 128 under `set -e` and kills the whole job — taking
+            # every other repo's matrix entry with it (2026-08-15: died one repo
+            # after web-terminal-engine, `run` skipped entirely, no repo
+            # mutation-tested that week). Replaying this loop over all 57 repos
+            # found no repo that reproduces it, so it is a transient clone and
+            # the right blast radius is one skipped repo, not the fleet.
+            if ! sha=$(git -C scan rev-parse HEAD 2>/dev/null); then
+              echo "::warning::${r}: clone left no resolvable HEAD — skipping this repo"
+              continue
+            fi
             while IFS= read -r cfg; do
               dir=$(dirname "${cfg#scan/}")
               echo "  include ${r}:${dir} @ ${sha:0:12}"
@@ -282,6 +293,18 @@ jobs:
         with:
           path: artifacts
           pattern: stryker-*
+
+      # stryker-aggregate.py is written against the release-current Python the
+      # scripts are authored on, and uses PEP 758 (`except A, B:`) which needs
+      # 3.14. ubuntu-24.04's own `python3` is 3.12, which rejects it at PARSE
+      # time — so every repo failed with `SyntaxError: multiple exception types
+      # must be parenthesized`, the job exited 1, and no repo ever received a
+      # tracker issue. Pin the interpreter rather than downgrading the script
+      # (same call weekly-bench.yaml makes for bench-reduce.py).
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
 
       - name: Aggregate + update tracker issue per repo
         run: |
