@@ -196,6 +196,7 @@ class RunReport:
         self.not_validated = []  # list[(job, step, reason)] — CI checks NOT exercised locally
         self.ran_jobs = []       # jobnames that executed >=1 real step locally
         self.skipped_jobs = []   # list[(job, reason)] — gated off / no local steps
+        self.version_drift = []  # list[ToolVersion] — local tool != the pin CI installs
 
 
 REPORT = RunReport()
@@ -216,6 +217,174 @@ def _first_cmd_line(cmd):
         if s not in ('(', ')', '{', '}'):
             return s
     return lines[0] if lines else ''
+
+
+# ---------------------------------------------------------------------------
+# Tool-version drift preflight
+# ---------------------------------------------------------------------------
+# Every `Install *` step is SKIPped by name (INSTALL_NAME_PATTERNS), so the
+# version CI pins is never the version that runs locally — the PATH binary is.
+# That is the one place local and remote diverge in BEHAVIOUR rather than
+# coverage, and it is silent: a lint rule added in the pinned release fails CI
+# while the older local binary reports clean. Measured 2026-08-17, three days
+# after four Renovate bumps landed here: ruff 0.16.1 against a pinned 0.16.3 (a
+# HARD gate), govulncheck v1.6.0 against v1.7.0, deadcode x/tools v0.48.0
+# against v0.49.0 — all three gating, all three green locally.
+#
+# So read the pins this run is about to skip past and compare them to what is
+# actually on PATH. Reporting is the whole job: a drift is a property of the
+# WORKSTATION, not of the change under test, so it must not fail the run and
+# punish the change for the machine's state. It gets its own summary section and
+# a qualifier on the RESULT line, and it names the one command that fixes it.
+
+
+class ToolVersion(NamedTuple):
+    tool: str      # binary name
+    pinned: str    # version the workflow installs
+    local: str     # version on PATH, or '' when unreadable
+    source: str    # where the pin was read from (renovate depName / go install pkg)
+
+
+# depName (or go-install package path) -> the binary it provides. A pin whose
+# depName is absent here is skipped rather than guessed at: a wrong mapping
+# would manufacture a drift warning, which costs more trust than a missed one.
+_PIN_BINARY = {
+    # `# renovate: depName=` pins in ci.yaml / go-ci.yaml / shell-ci.yaml.
+    'golangci/golangci-lint': 'golangci-lint',
+    'gitleaks/gitleaks': 'gitleaks',
+    'rhysd/actionlint': 'actionlint',
+    'zizmor': 'zizmor',
+    'markdownlint-cli2': 'markdownlint-cli2',
+    'crate-ci/typos': 'typos',
+    'lycheeverse/lychee': 'lychee',
+    'ruff': 'ruff',
+    'yamllint': 'yamllint',
+    'koalaman/shellcheck': 'shellcheck',
+    'mvdan/sh': 'shfmt',
+    'hadolint/hadolint': 'hadolint',
+    'aquasecurity/trivy': 'trivy',
+    # `go install <pkg>@<ver>` lines in go-ci.yaml.
+    'golang.org/x/vuln/cmd/govulncheck': 'govulncheck',
+    'golang.org/x/tools/cmd/deadcode': 'deadcode',
+    'github.com/bep/punused': 'punused',
+    'golang.org/x/tools/gopls': 'gopls',
+}
+
+# Go binaries built by `go install`: several (deadcode, gopls) reject
+# `--version`, and the module version is not in their output anyway. Read it out
+# of the build metadata the toolchain stamps into the binary instead.
+_GO_INSTALLED = {'govulncheck', 'deadcode', 'punused', 'gopls'}
+
+# `# renovate: ... depName=X` on one line, then a `[<PREFIX>_]VERSION=<value>`
+# assignment within the next few lines (they are separated by comments in
+# go-ci.yaml). Anchored to a line start so a mention inside prose cannot match.
+_RENOVATE_PIN_RE = re.compile(
+    r'^[^\S\n]*#[^\S\n]*renovate:[^\n]*\bdepName=(?P<dep>[^\s#]+)[^\n]*\n'
+    r'(?:[^\S\n]*(?:#[^\n]*)?\n){0,4}'
+    r'[^\S\n]*(?:\w+_)?VERSION=(?P<ver>[^\s#]+)',
+    re.MULTILINE,
+)
+_GO_INSTALL_RE = re.compile(r'go\s+install\s+"?(?P<pkg>[^\s"@]+)@(?P<ver>[^\s"]+)"?')
+_SEMVER_RE = re.compile(r'\b(\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?)\b')
+
+
+def _normalize_version(raw):
+    """Reduce a version string to a bare dotted number for comparison.
+
+    Handles the `v` prefix (`v2.12.2`), a `${VERSION#v}` style value, and the
+    surrounding prose in a `--version` line. Returns '' when nothing parses,
+    which the caller treats as unknown rather than as a mismatch.
+    """
+    if not raw:
+        return ''
+    match = _SEMVER_RE.search(str(raw).strip())
+    return match.group(1) if match else ''
+
+
+_LOCAL_VERSION_CACHE = {}
+
+
+def _local_tool_version(tool):
+    """Read the installed version of `tool`, or '' when absent or unreadable."""
+    if tool in _LOCAL_VERSION_CACHE:
+        return _LOCAL_VERSION_CACHE[tool]
+    version = ''
+    path = shutil.which(tool)
+    if path:
+        if tool in _GO_INSTALLED:
+            # `go version -m <bin>` prints a `mod <path> <version> <hash>` line.
+            argv, pattern = ['go', 'version', '-m', path], r'^\s+mod\s+\S+\s+(\S+)'
+        else:
+            argv, pattern = [tool, '--version'], None
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+            out = (proc.stdout or '') + (proc.stderr or '')
+            if pattern:
+                found = re.search(pattern, out, re.MULTILINE)
+                version = _normalize_version(found.group(1)) if found else ''
+            else:
+                version = _normalize_version(out)
+        except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+            version = ''
+    _LOCAL_VERSION_CACHE[tool] = version
+    return version
+
+
+def collect_pinned_versions(step_bodies):
+    """Map binary -> (pinned version, pin source) from the workflow run blocks.
+
+    `step_bodies` is every `run:` script this invocation is about to replay, so
+    the pins checked are exactly the pins this run skips installing — a tool
+    pinned in a workflow that does not apply to this repo is never reported.
+    """
+    pins = {}
+    for body in step_bodies:
+        if not body:
+            continue
+        for match in _RENOVATE_PIN_RE.finditer(body):
+            tool = _PIN_BINARY.get(match.group('dep'))
+            version = _normalize_version(match.group('ver'))
+            if tool and version:
+                pins.setdefault(tool, (version, f'depName={match.group("dep")}'))
+        for match in _GO_INSTALL_RE.finditer(body):
+            pkg = match.group('pkg')
+            tool = _PIN_BINARY.get(pkg)
+            version = _normalize_version(match.group('ver'))
+            if tool and version:
+                pins.setdefault(tool, (version, f'go install {pkg}'))
+    return pins
+
+
+def check_tool_versions(step_bodies):
+    """Record every PATH tool whose version differs from the pin CI installs.
+
+    An absent binary is NOT reported here: a step that needs a missing tool
+    already fails loudly through run_step's rc==127 handling, and warning about
+    a tool this repo's battery never invokes would be noise.
+    """
+    for tool, (pinned, source) in sorted(collect_pinned_versions(step_bodies).items()):
+        local = _local_tool_version(tool)
+        if local and local != pinned:
+            REPORT.version_drift.append(ToolVersion(tool, pinned, local, source))
+
+
+def _workflow_step_bodies(workflow_paths, target):
+    """Every `run:` script across the workflows this invocation will replay."""
+    bodies = []
+    for path in workflow_paths:
+        raw = load_workflow_raw(path)
+        if not raw:
+            continue
+        jobs = raw.get('jobs') or {}
+        try:
+            if is_codeql_workflow(jobs):
+                continue
+            expanded = expand_reusable_jobs(jobs, target)
+        except (OSError, subprocess.CalledProcessError, yaml.YAMLError):
+            continue
+        for _job, steps, _wd, _inputs in expanded:
+            bodies.extend(str(step.get('run', '')) for step in steps if step.get('run'))
+    return bodies
 
 
 # Per-process path for the cross-step soft-gate marker.  Using a PID-unique
@@ -1099,6 +1268,120 @@ def rewrite_htmlvalidate_gitignore(cmd: str, cwd: Path) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# find-producer, yamllint and TOML gitignore parity
+# ---------------------------------------------------------------------------
+# Three more steps walk the raw filesystem with no gitignore awareness of their
+# own and, until now, no parity rewrite. All three fail LOCAL-ONLY on scratch a
+# fresh CI checkout cannot contain (.code-review/ artifacts, _handoff/ notes,
+# *.dec decrypted secrets, coverage/, .stryker-tmp/ sandboxes, a venv's bin/):
+#
+#   shellcheck / shfmt  `find . -name '*.sh' -not -path './.git/*'
+#                        -not -path '*/node_modules/*'` — node_modules was
+#                        excluded for exactly this reason, but only node_modules.
+#   yamllint            `yamllint .` — yamllint has no VCS awareness at all, and
+#                        a YAML *syntax* error is error-level even under
+#                        `extends: relaxed`, so it fails the scripts job.
+#   Validate TOML       `pathlib.Path('.').rglob('*.toml')` skipping only .git —
+#                        not even node_modules, and it raises rather than reports.
+#
+# Tools that honour .gitignore natively need no rewrite and deliberately have
+# none: lychee, typos, ruff, prettier, zizmor (all verified 2026-08-17).
+_FIND_SH_RE = re.compile(
+    r"find\s+\.\s+-name\s+'\*\.sh'\s+-not\s+-path\s+'\./\.git/\*'"
+    r"(?:\s+-not\s+-path\s+'\*/node_modules/\*')?"
+)
+_YAMLLINT_DOT_RE = re.compile(r'(\byamllint\b(?:\s+-d\s+(?:"[^"]*"|\'[^\']*\'))?)\s+\.(?=\s|$)')
+_TOML_RGLOB_RE = re.compile(r"pathlib\.Path\('\.'\)\.rglob\('\*\.toml'\)")
+
+
+def _gitignored_entries(cwd: Path):
+    """Paths git ignores under cwd: dirs keep their trailing slash. [] on error."""
+    try:
+        out = subprocess.run(
+            ['git', 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory'],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return []
+    if out.returncode != 0:
+        return []
+    return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+
+
+def rewrite_find_sh_gitignore(cmd: str, cwd: Path) -> str:
+    """Swap the shellcheck/shfmt `find` producer for the CI-visible .sh fileset.
+
+    Both steps share one `find` (four invocation sites across ci.yaml and
+    shell-ci.yaml), and the surrounding script tests `[ -z "$files" ]`, so the
+    replacement must stay a newline-separated word list on stdout — `git
+    ls-files` gives exactly that. The `./` prefix is preserved because
+    shellcheck's `-x` source-following resolves relative to the reported path
+    and the workflow's own output lines read that way.
+    """
+    if not _FIND_SH_RE.search(cmd) or not shutil.which('git'):
+        return cmd
+    try:
+        files = _git_visible_files(cwd, '*.sh')
+    except (OSError, subprocess.CalledProcessError):
+        return cmd  # not a git repo or git unavailable; leave the find as-is
+    if not files:
+        # Keep the producer's empty-output contract so the step's own
+        # "no *.sh found — skipping" branch answers, rather than reverting to a
+        # raw walk that would re-introduce the gitignored files.
+        return _FIND_SH_RE.sub('true', cmd)
+    listing = '\n'.join(f'./{f}' for f in files)
+    return _FIND_SH_RE.sub(lambda _m: 'printf ' + shlex.quote('%s\n') + ' ' + shlex.quote(listing), cmd)
+
+
+def rewrite_yamllint_gitignore(cmd: str, cwd: Path) -> str:
+    """Give `yamllint .` the CI fileset by listing files instead of the tree.
+
+    yamllint's only ignore levers are config-file keys (`ignore`,
+    `ignore-from-file`), and the workflow's inline `-d "{extends: relaxed, ...}"`
+    declares neither — so passing an explicit file list is the one way to reach
+    parity without rewriting the caller's config. A repo WITH its own
+    `.yamllint*` is handled the same way: the file list changes which files are
+    read, never which rules apply, so the repo's config still governs.
+    """
+    if not _YAMLLINT_DOT_RE.search(cmd) or not shutil.which('git'):
+        return cmd
+    try:
+        files = _git_visible_files(cwd, '*.yaml', '*.yml')
+    except (OSError, subprocess.CalledProcessError):
+        return cmd
+    if not files:
+        # yamllint exits 1 on "No files to lint", so drop the invocation to a
+        # no-op rather than handing it an empty argument list.
+        return _YAMLLINT_DOT_RE.sub(
+            lambda _m: 'echo "yamllint: no CI-visible YAML — skipping"', cmd
+        )
+    return _YAMLLINT_DOT_RE.sub(
+        lambda m: m.group(1) + ' ' + ' '.join(shlex.quote(f) for f in files), cmd
+    )
+
+
+def rewrite_toml_gitignore(cmd: str, cwd: Path) -> str:
+    """Restrict the inline TOML validator's rglob to the CI-visible fileset.
+
+    The step is a `python3 -c` heredoc-ish block, so the rewrite substitutes the
+    iterable expression rather than the command: a literal list of paths keeps
+    the loop body (and its `'.git' in p.parts` guard, now redundant but
+    harmless) exactly as CI runs it.
+    """
+    if not _TOML_RGLOB_RE.search(cmd) or not shutil.which('git'):
+        return cmd
+    try:
+        files = _git_visible_files(cwd, '*.toml')
+    except (OSError, subprocess.CalledProcessError):
+        return cmd
+    literal = '[' + ', '.join(f'pathlib.Path({json.dumps(f)})' for f in files) + ']'
+    return _TOML_RGLOB_RE.sub(lambda _m: literal, cmd)
+
+
 def rewrite_markdownlint_gitignore(cmd: str, cwd: Path) -> str:
     """Replace the markdownlint-cli2 `**/*.md` glob with git-tracked .md files."""
     if 'markdownlint-cli2' not in cmd or not MARKDOWNLINT_GLOB_RE.search(cmd):
@@ -1191,6 +1474,9 @@ def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
     cmd = rewrite_markdownlint_gitignore(cmd, cwd)
     cmd = rewrite_stylelint_gitignore(cmd, cwd)
     cmd = rewrite_htmlvalidate_gitignore(cmd, cwd)
+    cmd = rewrite_find_sh_gitignore(cmd, cwd)
+    cmd = rewrite_yamllint_gitignore(cmd, cwd)
+    cmd = rewrite_toml_gitignore(cmd, cwd)
     cmd = rewrite_gitleaks_download(cmd)
     cmd = rewrite_gitleaks_gitignore(cmd, cwd)
     cmd = rewrite_trivy_gitignore(cmd, cwd)
@@ -2500,6 +2786,8 @@ def print_run_summary(counters, failures, ok, plan_only):
     ]
     if REPORT.not_validated:
         parts.append(f'{yellow("not-validated")} {len(REPORT.not_validated)}')
+    if REPORT.version_drift:
+        parts.append(f'{yellow("version-drift")} {len(REPORT.version_drift)}')
     if counters.get('UNKNOWN'):
         parts.append(f'unknown {counters["UNKNOWN"]}')
     if plan_only and counters.get('DRY'):
@@ -2523,6 +2811,20 @@ def print_run_summary(counters, failures, ok, plan_only):
             else:
                 print(f'  [{i}] {item}')
 
+    if REPORT.version_drift:
+        print(
+            f'\n{yellow("TOOL VERSION DRIFT")} '
+            '(these ran at the LOCAL version, CI gates at the pin — a pass here '
+            'does not mean CI passes):'
+        )
+        width = max(len(item.tool) for item in REPORT.version_drift)
+        for item in REPORT.version_drift:
+            print(
+                f'  - {item.tool:<{width}}  local {red(item.local)}  '
+                f'!= pinned {green(item.pinned)}   ({item.source})'
+            )
+        print('  Fix: bash <ci>/scripts/install-local-tools.sh')
+
     if REPORT.not_validated:
         print(f'\n{yellow("NOT VALIDATED LOCALLY")} (CI runs these; no local result):')
         for job, step, reason in REPORT.not_validated:
@@ -2540,6 +2842,11 @@ def print_run_summary(counters, failures, ok, plan_only):
     if ok:
         line = green('RESULT: PASS')
         notes = []
+        # Drift leads the qualifier list: it is the note that most directly
+        # means "this pass may not survive CI", and it is the one with a
+        # one-command fix.
+        if REPORT.version_drift:
+            notes.append(f'{len(REPORT.version_drift)} tool(s) at the wrong version')
         if REPORT.not_validated:
             notes.append(f'{len(REPORT.not_validated)} check(s) not validated locally')
         if notes:
@@ -2547,6 +2854,11 @@ def print_run_summary(counters, failures, ok, plan_only):
         print(line)
     else:
         print(f'{red("RESULT: FAIL")} — {len(failures)} step(s) failed (see FAILED above)')
+        if REPORT.version_drift:
+            print(
+                f'{yellow("note:")} {len(REPORT.version_drift)} tool(s) ran at the wrong '
+                'version; a failure above may be local-only (see TOOL VERSION DRIFT)'
+            )
 
 
 def main():
@@ -2601,6 +2913,15 @@ def main():
         help='Print the plan without executing.',
     )
     ap.add_argument(
+        '--no-version-check',
+        action='store_true',
+        help=(
+            'Skip the tool-version preflight that compares each PATH binary '
+            'against the version CI pins. The preflight only reports, never '
+            'fails, so this is for shaving a second off a scripted run.'
+        ),
+    )
+    ap.add_argument(
         '--ignore-unknown',
         action='store_true',
         help='Treat UNKNOWN steps as warnings instead of failures.',
@@ -2630,6 +2951,20 @@ def main():
     print(f'{blue("target:")}   {target.relative_to(cwd) if target != cwd else "."}')
     if args.plan_only:
         print(f'{yellow("--plan-only:")} no execution')
+
+    # Tool-version preflight. Runs in --plan-only too: a plan is exactly when a
+    # reader wants to know the battery will not use CI's versions. Never allowed
+    # to break the run — a probe failure means "unknown", not "mismatch".
+    if not args.no_version_check:
+        try:
+            check_tool_versions(_workflow_step_bodies(workflow_paths, target))
+        except Exception as exc:  # noqa: BLE001 - advisory preflight, never fatal
+            print(f'{yellow("WARN")} tool-version preflight failed: {exc}', file=sys.stderr)
+        if REPORT.version_drift:
+            print(
+                f'{yellow("version drift:")} {len(REPORT.version_drift)} tool(s) differ '
+                'from the CI pin (detail in the summary below)'
+            )
 
     # Clear failure marker
     if not args.plan_only:
