@@ -138,6 +138,51 @@ jobs:
             exit $rc
           ) || { echo "version parity" >> /tmp/_ci_failures; exit 1; }
 
+      # Publish surface: the file set each registry would upload must equal the
+      # transitive import closure of the `exports` entry points.
+      #
+      # These packages ship raw TypeScript, so the published artifact IS source
+      # and the consumer compiles it. That makes this job's own typecheck no
+      # evidence at all about the consumer: here vitest, fast-check, happy-dom
+      # and @types/node are installed, and there they are not.
+      #
+      # Paid for twice. @cplieger/web-terminal-ui@5.6.1 published a
+      # vitest-importing test setup file and broke every consumer's Docker build
+      # with TS2307; @cplieger/web-terminal-engine@3.10.4 shipped
+      # fast-check-importing test helpers to JSR, where they still sit. Both
+      # repos had correct-looking exclusion patterns. The surface was declared by
+      # hand in `files`, `jsr.json`, stryker `mutate`, the coverage exclude and a
+      # verify script all at once, and one new test-only file escaped five of the
+      # six lists.
+      #
+      # Deriving the set rather than linting the patterns is what makes this hold:
+      # once the SET is verified the patterns are correct whatever they say, no
+      # naming convention has to be remembered, and a new test-only file needs no
+      # list updated anywhere. Config-free, because `exports` is the only input
+      # and every publishable TS package declares one. A package with no
+      # `exports` map fails the step rather than passing silently.
+      - name: Publish surface (registries ship exactly the public API)
+        id: publish_surface
+        continue-on-error: true
+        # Bootstrap ref: a brand-new composite action cannot be pinned to its own
+        # merge SHA in the commit that creates it. Pin this to the tag's commit
+        # SHA (keeping the `# v2` comment) as soon as the first tag exists —
+        # Renovate bumps an existing digest but does not do the initial tag->SHA
+        # conversion, and Scorecard/CodeQL raise unpinned-action alerts meanwhile.
+        uses: cplieger/ci/actions/publish-surface@v2 # v2
+        with:
+          package-dir: ${{ inputs.working-directory }}
+
+      # This block's contract is a trailing
+      # `|| { echo "<name>" >> /tmp/_ci_failures; exit 1; }`, which a `uses:` step
+      # cannot carry inline. Record the outcome in a separate step so
+      # continue-on-error does not silently swallow a failure. No `exit 1` here:
+      # the marker file is what the final "Check results" step fails the job on,
+      # and exiting non-zero would abort the remaining soft-gate steps.
+      - name: Record publish-surface result
+        if: ${{ always() && steps.publish_surface.outcome == 'failure' }}
+        run: echo "publish surface" >> /tmp/_ci_failures
+
       # actionlint, zizmor and gitleaks used to run here, root-gated so a hybrid
       # repo's nested `web` invocation would not re-check what its go job had
       # already done. All three are repo-wide checks with no TS dependency and

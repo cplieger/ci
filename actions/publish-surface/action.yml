@@ -1,0 +1,30 @@
+name: publish-surface
+description: >-
+  Verify that every registry a build-less TypeScript package publishes to ships
+  exactly the transitive import closure of its `exports` entry points, and that
+  the closure reaches no undeclared package. Wraps publish-surface.py in this
+  directory. Referenced by ts-ci.yaml as cplieger/ci/actions/publish-surface@<sha>
+  — a composite action MUST be pinned by ref (a local ./ path would resolve
+  against the consumer's checkout and 404); Renovate keeps the pin current.
+
+  Bundled as an action rather than fetched at run time so the check is the
+  version the consumer pinned, matching publish-badge.
+
+inputs:
+  package-dir:
+    description: >-
+      Directory holding package.json, relative to the workspace. Passed
+      explicitly because a composite action's steps do not inherit the calling
+      job's `defaults.run.working-directory`.
+    required: false
+    default: "."
+
+runs:
+  using: composite
+  steps:
+    - name: Verify publish surface
+      shell: bash
+      working-directory: ${{ inputs.package-dir }}
+      # GITHUB_ACTION_PATH is set by the runner to this action's directory.
+      # --github emits ::error:: annotations so each finding lands on the run.
+      run: python3 "${GITHUB_ACTION_PATH}/publish-surface.py" --github
