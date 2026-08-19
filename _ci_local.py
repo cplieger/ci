@@ -2603,6 +2603,57 @@ def run_codeql_for_job(jobname, steps, target: Path, dry_run: bool):
     return ok, counters, failed
 
 
+_GO_MANIFESTS = ('go.mod', 'go.sum', 'go.work', 'go.work.sum')
+_MANIFEST_SKIP_DIRS = {'vendor', 'node_modules', '.git', '.stryker-tmp'}
+
+
+def snapshot_go_manifests(root: Path):
+    """Record every Go module manifest under root, keyed by path.
+
+    CodeQL's Go extractor AUTOBUILDS inside --source-root to resolve imports,
+    and that build rewrites go.mod/go.sum when it cannot resolve a module: it
+    does not consult `go.work`, which is gitignored in several repos here, so a
+    workspace-replaced dependency looks missing and gets dropped from the
+    manifest. The database is disposable; the caller's working tree is not, and
+    a local gate that silently edits tracked files is worse than no gate.
+
+    Measured on docker-renovate-scheduler: five replaced requires removed from
+    go.mod and twelve go.sum lines deleted, leaving a tree that no longer built.
+    """
+    snap = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _MANIFEST_SKIP_DIRS]
+        for name in filenames:
+            if name not in _GO_MANIFESTS:
+                continue
+            path = Path(dirpath) / name
+            try:
+                snap[path] = path.read_bytes()
+            except OSError:
+                # Unreadable now means we cannot promise to restore it; leaving
+                # it out is honest, and the caller reports what it did restore.
+                pass
+    return snap
+
+
+def restore_go_manifests(snapshot):
+    """Rewrite any manifest whose bytes changed. Returns the restored paths.
+
+    Byte comparison rather than a blanket rewrite, so a manifest the autobuild
+    left alone keeps its mtime and an unrelated uncommitted edit in the tree is
+    never clobbered.
+    """
+    restored = []
+    for path, original in snapshot.items():
+        try:
+            if path.read_bytes() != original:
+                path.write_bytes(original)
+                restored.append(path)
+        except OSError:
+            pass
+    return restored
+
+
 def run_codeql_analysis(target: Path, languages, queries, dry_run, source_root=None):
     """Build and analyze one CodeQL database with Analyze-action exit semantics."""
     src = source_root or target
@@ -2656,6 +2707,10 @@ def run_codeql_analysis(target: Path, languages, queries, dry_run, source_root=N
         f'--format=sarif-latest --output={sarif_out}'
     )
 
+    # Snapshot before the extractor runs, not after a failure is noticed: the
+    # rewrite happens during `database create`, so both exit paths need it back.
+    manifests = snapshot_go_manifests(Path(src)) if 'go' in languages.split(',') else {}
+
     try:
         proc = subprocess.run(
             ['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', create_cmd],
@@ -2708,6 +2763,11 @@ def run_codeql_analysis(target: Path, languages, queries, dry_run, source_root=N
         print(f'    → {green("PASS")}{suffix}')
         return True, info
     finally:
+        restored = restore_go_manifests(manifests)
+        if restored:
+            names = ', '.join(sorted(str(p.relative_to(src)) for p in restored))
+            note = f'restored {len(restored)} Go manifest(s) the CodeQL autobuild rewrote: {names}'
+            print(f'    {gray(note)}')
         if db_dir.exists():
             shutil.rmtree(db_dir, ignore_errors=True)
         with contextlib.suppress(OSError):
