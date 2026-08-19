@@ -288,7 +288,7 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       # Keyed identically to the release build so both share cache below the
       # package layer; see docker-release.yaml's "Resolve OS package refresh
@@ -374,7 +374,7 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       # See docker-release.yaml's "Resolve OS package refresh key" step.
       - name: Resolve OS package refresh key
