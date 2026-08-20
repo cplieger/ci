@@ -2,9 +2,8 @@
 """Cross-repo governance audit for the cplieger account.
 
 Polls every non-archived, non-fork repo for its full settings surface and
-reports a
-compliance report against the documented standard in
-.kiro/steering/repo-governance.md, split into HARD failures and soft WARNINGS,
+reports a compliance report against the documented governance standard,
+split into HARD failures and soft WARNINGS,
 with N/A handling where a setting cannot apply (e.g. GitHub Advanced Security
 features on free private repos).
 
@@ -138,9 +137,8 @@ GHCR_ONLY = {"subflux", "vibekit"}
 # arbitrary integration could satisfy the merge requirement.
 ACTIONS_APP_ID = 15368
 
-# Public docs standard (.kiro/steering/public-docs.md + repo-governance.md
-# "Canonical README footer"). The two footer blocks are matched as
-# whitespace-normalized substrings so a reflow never false-positives; the
+# Public docs standard ("Canonical README footer"). The two footer blocks are
+# matched as whitespace-normalized substrings so a reflow never false-positives; the
 # TEXT itself must stay verbatim. `.github` is the documented exception
 # (AI note only, no Disclaimer). Docker Hub hard-caps the mirrored full
 # description at 25,000 bytes and the sync action truncates the overflow,
