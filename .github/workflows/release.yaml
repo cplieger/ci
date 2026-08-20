@@ -908,7 +908,7 @@ jobs:
           fi
 
           # renovate: datasource=go depName=golang.org/x/exp
-          XEXP_VERSION=v0.0.0-20260820122028-d6e0b57b1a69
+          XEXP_VERSION=v0.0.0-20260820142414-ca536658362e
           GOTOOLCHAIN=auto go install "golang.org/x/exp/cmd/gorelease@${XEXP_VERSION}" || {
             echo "::warning::gorelease install failed - skipping API check (report-only)"
             exit 0
