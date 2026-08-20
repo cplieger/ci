@@ -245,7 +245,7 @@ jobs:
             # Per-invocation temp files. A CI runner gets a private /tmp so a fixed
             # path was harmless there, but ci-local.sh replays this step on a
             # developer machine where several repos are linted at once (the
-            # code-review skill runs concurrent reviews of different apps by
+            # app-review skill runs concurrent reviews of different apps by
             # design). With a shared /tmp/_punused_raw those runs raced: one
             # repo's `: >` truncate landed between another's write and its read,
             # so repo A adjudicated repo B's findings against repo A's
