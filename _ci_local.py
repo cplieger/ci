@@ -1123,7 +1123,7 @@ def rewrite_gitleaks_download(cmd: str) -> str:
     never sees (the wtk `routes_test.go` false positive, 2026-07).
 
     NOTE: `dir` does NOT honour .gitignore — it walks the raw filesystem, so a
-    gitignored scratch path (.code-review/ report artifacts, *.dec decrypted
+    gitignored scratch path (.app-review/ report artifacts, *.dec decrypted
     secrets, node_modules) IS scanned and can raise local-only findings CI's
     fresh checkout never sees (the webhttp .code-review false positives, 2026-07).
     `rewrite_gitleaks_gitignore` (applied next) restores gitignore parity by
@@ -1170,7 +1170,7 @@ def rewrite_gitleaks_download(cmd: str) -> str:
 # ---------------------------------------------------------------------------
 # `gitleaks dir` walks the raw filesystem and does NOT honour .gitignore. CI runs
 # it against a fresh checkout (git-tracked files only); locally the working tree
-# also carries gitignored scratch CI never sees — .code-review/ report artifacts,
+# also carries gitignored scratch CI never sees — .app-review/ report artifacts,
 # a private repo's *.dec decrypted secrets, node_modules — and gitleaks happily
 # scans them, raising findings the gate never would (the webhttp .code-review
 # false positives, 2026-07). gitleaks has no --skip-dirs/--exclude flag (trivy
@@ -1302,7 +1302,7 @@ def rewrite_ci_failures_path(cmd: str) -> str:
 # ---------------------------------------------------------------------------
 # CI runs `trivy fs` against a fresh checkout — only git-tracked files exist.
 # Locally the working tree carries gitignored files trivy will happily scan:
-# decrypted secrets (a private repo's *.env.dec), .code-review/ artifacts, node_modules.
+# decrypted secrets (a private repo's *.env.dec), .app-review/ artifacts, node_modules.
 # Trivy's secret scanner then flags e.g. apps/<app>/.env.dec (a deliberately
 # decrypted, gitignored secret) and the run fails with a finding CI never sees.
 # Mirror CI by injecting --skip-files / --skip-dirs for everything git ignores
@@ -1351,7 +1351,7 @@ def rewrite_trivy_gitignore(cmd: str, cwd: Path) -> str:
     return _TRIVY_FS_RE.sub(lambda m: m.group(0) + inject, cmd, count=1)
 # ---------------------------------------------------------------------------
 # CI lints a fresh checkout — only git-tracked files exist. Locally the working
-# tree may carry gitignored .md files (generated reports under .code-review/,
+# tree may carry gitignored .md files (generated reports under .app-review/,
 # scratch notes, vendored docs) that CI never sees, producing false failures.
 # Rewrite the `**/*.md` recursive glob to the explicit git-tracked .md list so
 # ci-local lints exactly the fileset CI's checkout would.
@@ -1371,7 +1371,7 @@ def rewrite_stylelint_gitignore(cmd: str, cwd: Path) -> str:
     stylelint honours neither .gitignore nor a config `ignoreFiles` here (the synced
     configs/stylelint.json declares none), so the glob walks gitignored scratch a CI
     checkout never contains: static-src/coverage/ lcov-report CSS, reports/mutation/,
-    .stryker-tmp/ sandbox copies, .code-review/ artifacts. That failed the local
+    .stryker-tmp/ sandbox copies, .app-review/ artifacts. That failed the local
     web-lint gate on files CI cannot see -- the same parity break the gitleaks, trivy
     and markdownlint rewrites above exist to close.
 
@@ -1419,7 +1419,7 @@ def rewrite_htmlvalidate_gitignore(cmd: str, cwd: Path) -> str:
 # ---------------------------------------------------------------------------
 # Three more steps walk the raw filesystem with no gitignore awareness of their
 # own and, until now, no parity rewrite. All three fail LOCAL-ONLY on scratch a
-# fresh CI checkout cannot contain (.code-review/ artifacts, _handoff/ notes,
+# fresh CI checkout cannot contain (.app-review/ artifacts, _handoff/ notes,
 # *.dec decrypted secrets, coverage/, .stryker-tmp/ sandboxes, a venv's bin/):
 #
 #   shellcheck / shfmt  `find . -name '*.sh' -not -path './.git/*'
