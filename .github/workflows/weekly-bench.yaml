@@ -38,13 +38,19 @@
 #               stryker Sat, security daily 03:00, rebuild-stale daily 04:00.
 #               Two new runners (this and weekly-links) took the two free days
 #               so the 20-job account cap is never contested.
-# Threshold:    150%, report-only (fail-on-alert: false). Deliberately loose.
-#               Hosted-runner amplitude is documented at 10-20% and the target
-#               is an algorithmic regression (an O(n log n) aligner becoming
-#               O(n squared)), which shows up as multiples. A tight threshold on
-#               a non-gating check just trains everyone to ignore the tracker.
-#               Medians shrink the noise the threshold must clear, so this is
-#               conservative; tighten only against measured tracker history.
+# Threshold:    150%, report-only (fail-on-alert: false). Deliberately loose,
+#               and now measured rather than asserted. `-count=10` over 38
+#               series in four repos (2026-08-21, scripts/bench-stability.py):
+#               ns/op spread is 8.60% median, 24.55% p90, 43.73% worst. At the
+#               median that puts a 150% alert 5.8 sigma out, so the tracker sees
+#               a regression of roughly 26% or worse and nothing finer - which
+#               is the intended target (an O(n log n) aligner becoming
+#               O(n squared) shows up as multiples). A tight threshold on a
+#               non-gating check just trains everyone to ignore the tracker.
+#               9 of the 38 series sit under 3 sigma from the threshold and so
+#               can alert on noise alone; they are listed under Scope. Re-run
+#               the measurement ON THE RUNNER before treating these figures as
+#               the runner's floor - they were taken on a loaded shared host.
 # Storage:      each consumer's orphan `benchmarks` branch, written by the
 #               action's own git mode. NOT the `badges` branch: publish-badge.sh
 #               rebuilds that from root *.json only and force-pushes a squashed
@@ -60,15 +66,67 @@
 #               no previous suite, so the first data point publishes a baseline
 #               and alerts nothing - that part needs no bootstrap.
 # Scope:        14 repos, 164 chart series. Widened from the original four on
-#               2026-08-21. The criterion is not "has a benchmark" - it is that
-#               the measured work is CPU-BOUND, PER-ITEM, and carries a cost
-#               claim a chart can falsify:
-#                 1. deterministic compute, no disk, no network, no sleep, no
-#                    wall-clock dependence, or the series is runner noise;
-#                 2. cost paid per item on a hot path, so a regression
-#                    compounds instead of costing one startup;
-#                 3. a cost claim (allocation-free, bounded, linear) that
-#                    nothing else in the repo verifies.
+#               2026-08-21. The criterion is not "has a benchmark", and it is
+#               NOT "is a library" either - see "Not a criterion" below. Three
+#               tests, and the last two are measurements, not arguments:
+#                 1. DETERMINISTIC COMPUTE. No disk, no network, no sleep, no
+#                    wall-clock dependence. This is the one structural test that
+#                    survived, because those are the CAUSES of a spread no
+#                    threshold can police. It is a property of the benchmark,
+#                    not of the repo.
+#                 2. A POLICEABLE SPREAD, measured with
+#                    scripts/bench-stability.py over `-count=10`: the alert
+#                    threshold must sit at least 3 sigma from the series' own
+#                    noise. Do not predict this from the code - measure it.
+#                    Across 5 million data points in Java and Go, Laaber,
+#                    Scheuner and Leitner found per-benchmark coefficients of
+#                    variation from 0.03% to over 100%
+#                    (doi.org/10.1007/s10664-019-09681-1), and their earlier
+#                    survey concluded outright that not all benchmarks are
+#                    useful for reliably discovering slowdowns.
+#                 3. ATTRIBUTABLE COMMITS. A weekly chart point covers a week of
+#                    commits, so a step is only actionable if few landed in the
+#                    BENCHMARKED PACKAGE that week. Measured over 90 days, every
+#                    enrolled repo is at or under 3.2 commits/week to its
+#                    benchmarked package (keyenc 0.1, xmlx 0.2, pathinside 0.2,
+#                    urlform 0.5, langtag 0.8, slogx 0.9, jsonx 0.9, ssrf 0.9,
+#                    runesafe 1.0, plex-language-sync/internal/streams 1.0,
+#                    metrics 1.4, web-terminal-engine/vt 2.6, httpx 3.2).
+#
+# Which metric gates what:
+#               The three series the reducer emits are NOT equally trustworthy,
+#               and this is the tracker's most useful property:
+#                 allocs/op  spread 0.00% on 38 of 38 series. EXACT. Any
+#                            movement is a real change at any magnitude.
+#                 B/op       0.00%; the two series that move at all move by 1
+#                            and 5 bytes out of 47 KB and 305 KB.
+#                 ns/op      8.60% median. Trend only.
+#               So allocation regressions are gate-grade and wall-clock ones are
+#               not. The consequence: allocation contracts belong in the repo's
+#               own test suite as testing.AllocsPerRun assertions, which run on
+#               every PR and fail at merge time - the five libraries enrolled in
+#               this widening carry 37 of them. The chart's allocation series is
+#               the BACKUP for drift nobody wrote a contract for, not the
+#               primary gate.
+#
+# Not a criterion: LIBRARY vs APP.
+#               It looks like it should be, and it was tested four ways on
+#               2026-08-21. Every test refuted it:
+#                 - Spread: plex-language-sync (an app) was the most stable of
+#                   the four repos measured - 7.5% median, 9.9% worst - while
+#                   slogx (a library) held the single noisiest series at 43.7%.
+#                 - Work per operation: Pearson r between log10(ns/op) and
+#                   spread was +0.01 across 38 series. Operation size predicts
+#                   nothing; the shared host dominates.
+#                 - Commit rate, repo-wide: the distributions overlap. A
+#                   library, web-terminal-engine, ran at 6.6/week against
+#                   plex-exporter's 2.8.
+#                 - Commit rate, scoped to the benchmarked package: the two apps
+#                   came out BETTER than two of the libraries (1.0 and 1.2
+#                   against httpx's 3.2 and web-terminal-engine/vt's 2.6).
+#               Judge a repo on the three tests above. Do not reintroduce a
+#               category rule; it has already been measured and it does not hold.
+#
 #               Enrolled: the four cost-contract libraries (xmlx, jsonx, ssrf,
 #               httpx) plus jsoncap (the JSON twin of xmlx, carved out of
 #               jsonx AFTER this workflow landed, so it matched the original
@@ -105,12 +163,35 @@
 #               - toolbelt, pinstall: install-time. wiregen: build-time.
 #               - webhttp: per-call cost is dominated by net/http itself and it
 #                 makes no cost claim of its own.
-#               - subflux (136 series) and vibekit (103): still deferred, and
-#                 the deferral is now quantitative - the two would add 239
-#                 series to 164, more than doubling the tracker before it has a
-#                 single week of history to calibrate the threshold against.
-#                 Enrol them once a real regression or a real false alert has
-#                 taught this tracker what its noise floor is.
+#               - subflux and vibekit: deferred on criterion 3, ATTRIBUTION -
+#                 8.2 and 14.2 source commits a week against 3.2 for the
+#                 noisiest enrolled repo. A weekly chart point in either would
+#                 cover 8 to 14 changes across the whole tree, so a step in the
+#                 chart identifies a week rather than a commit and nobody can
+#                 act on it. Series count (136 and 103) is a cost, not the
+#                 reason. The fix is not to enrol them as they are: give each a
+#                 small, deliberately chosen subset over its genuinely hot paths
+#                 and enrol that. This is the documented practice - an optimized
+#                 subset of a suite still detects most real application changes
+#                 (arxiv.org/abs/2212.09515), and selection by stability metric
+#                 cut Go suite runtime by up to 95.8% while still catching
+#                 regressions in CI (arxiv.org/abs/2501.12878).
+#
+# Known-noisy:  9 of the 38 measured ns/op series sit under 3 sigma from the
+#               150% threshold, so they can alert on noise alone. Worst first:
+#               slogx/ParseLevel (43.7%), xmlx/PreflightRejection.oversized_token
+#               (39.1%), urlform/RawQueryPairs.pairs_256 (28.1%),
+#               urlform/StdlibParseQuery.pairs_256 (24.6%),
+#               urlform/FoldHostASCII.lowercase_long (24.1%),
+#               xmlx/Preflight.elements_10 (22.5%), xmlx/BudgetCharge (21.6%),
+#               urlform/EqualASCIIFold.equal_mixed_case (20.4%),
+#               urlform/RawQueryNames.pairs_256 (18.3%). Their allocation series
+#               are unaffected and stay exact. Left in deliberately for one
+#               cycle: the first real tracker history is what should decide
+#               between giving each more work per operation and dropping the
+#               series, and that decision wants runner data rather than data
+#               from a loaded workstation. Re-measure with
+#               scripts/bench-stability.py before acting.
 name: Weekly bench
 
 on:
@@ -326,6 +407,30 @@ jobs:
             echo "|---|---|---|---|"
             jq -r '.[] | "| \(.name) | \(.value) | \(.unit) | \(.range // "-") |"' \
               "$RUNNER_TEMP/bench.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Per-series noise floor, measured on THIS runner from the samples the run
+      # already produced. The 150% alert threshold is only meaningful against
+      # that floor, and enrolment criterion 2 is stated in terms of it, so the
+      # data has to come from the runner rather than from a workstation. Costs
+      # nothing extra: it re-reads bench-raw.txt.
+      #
+      # Report-only, like every other verdict in this workflow. The script exits
+      # 1 when a series is too noisy for the threshold, which is information for
+      # a human reading the summary, not a reason to fail a leg that measured
+      # everything it was asked to measure.
+      - name: Stability
+        run: |
+          set -uo pipefail
+          {
+            echo ""
+            echo "<details><summary>${{ matrix.repo }} series stability</summary>"
+            echo ""
+            echo '```'
+            python3 _ci/scripts/bench-stability.py "$RUNNER_TEMP/bench-raw.txt" || true
+            echo '```'
+            echo ""
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # The action cannot bootstrap a missing data branch (verified in its
