@@ -186,12 +186,25 @@
 #               xmlx/Preflight.elements_10 (22.5%), xmlx/BudgetCharge (21.6%),
 #               urlform/EqualASCIIFold.equal_mixed_case (20.4%),
 #               urlform/RawQueryNames.pairs_256 (18.3%). Their allocation series
-#               are unaffected and stay exact. Left in deliberately for one
-#               cycle: the first real tracker history is what should decide
-#               between giving each more work per operation and dropping the
-#               series, and that decision wants runner data rather than data
-#               from a loaded workstation. Re-measure with
-#               scripts/bench-stability.py before acting.
+#               are unaffected and stay exact.
+#
+#               DO NOT rewrite these benchmarks. Two things were measured after
+#               the fact, and both say the benchmarks are not the problem:
+#                 - Most of the spread is ambient. Run alone at the same
+#                   benchtime instead of inside a loaded `-bench=.` sweep,
+#                   ParseLevel measured 4.6% rather than 43.7% and
+#                   oversized_token 13.2% rather than 39.1%.
+#                 - Spread falls as 1/sqrt(iterations per sample), so -benchtime
+#                   is a predictable global knob. ParseLevel: 11.1% at 100ms,
+#                   4.6% at 1s (the default), 2.5% at 3s. oversized_token: 13.2%
+#                   at 1s, 7.5% at 3s - almost exactly the 1/sqrt(3) the model
+#                   predicts.
+#               So the lever for sensitivity is `-benchtime`, fleet-wide, at a
+#               linear wall-time cost: at 3s the median series would sit near 3%,
+#               putting a 10% real regression at 3 sigma instead of the 26% the
+#               tracker can see today. That trade is worth making only against
+#               RUNNER data, which the Stability step below now collects on every
+#               leg. Measure there first, then tune the flag.
 name: Weekly bench
 
 on:
