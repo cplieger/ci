@@ -182,9 +182,34 @@ jobs:
         if: ${{ steps.profile.outputs.app == 'true' }}
         continue-on-error: true
         run: |
-          (
-            deadcode -test ./...
-          ) || { echo "deadcode" >> /tmp/_ci_failures; exit 1; }
+          # A CRASH is not a finding. deadcode panics with a nil *ssa.Function in
+          # go/callgraph/rta on any package whose build reaches an exported GENERIC
+          # method: go/types puts it in the type's MethodSet, ssa has no non-generic
+          # function for it, MethodValue returns nil, and visitFunc dereferences it
+          # (rta.go:262, produced at rta.go:435-437). Upstream: golang/go#80973 with
+          # CL 818580 open; x/tools v0.49.0 is BOTH our pin and the newest release,
+          # so there is no version to move to. Go 1.27 made math/rand/v2.(*Rand).N an
+          # exported generic method, so a ten-line program with no third-party code
+          # reproduces it -- this is a tool bug, not a repo defect, and it currently
+          # blocks every app consuming jsoncap, langtag or plexapi.
+          #
+          # So: a real finding still fails the gate. The panic warns and does not.
+          # REVERT THIS BLOCK once a release carrying CL 818580 is pinned; the check
+          # below is deliberately narrow so it stops matching when that happens.
+          set +e
+          out="$(deadcode -test ./... 2>&1)"
+          rc=$?
+          printf '%s\n' "$out"
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            if printf '%s' "$out" | grep -q 'go/callgraph/rta' \
+               && printf '%s' "$out" | grep -q 'nil pointer dereference'; then
+              echo "::warning::deadcode panicked in go/callgraph/rta (golang/go#80973, CL 818580 pending); treated as advisory, not a finding"
+            else
+              echo "deadcode" >> /tmp/_ci_failures
+              exit 1
+            fi
+          fi
 
       # punused finds unused EXPORTED symbols. It has exactly one release, v0.5.0
       # (Jan 2022), so the pin is already latest and nothing below gets fixed
