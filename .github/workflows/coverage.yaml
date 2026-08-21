@@ -102,7 +102,7 @@ jobs:
       # move.
       - name: Publish coverage badge
         if: ${{ steps.d.outputs.kind != 'none' }}
-        uses: cplieger/ci/actions/publish-badge@52c375ab0fe7575fe82979aeb93d46887925af31 # v2
+        uses: cplieger/ci/actions/publish-badge@a66dd3d4479d96bf77d84ed08b78651e2477d1f4 # v2
         with:
           repo: ${{ github.repository }}
           token: ${{ github.token }}
