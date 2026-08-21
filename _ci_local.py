@@ -2645,12 +2645,15 @@ def restore_go_manifests(snapshot):
     """
     restored = []
     for path, original in snapshot.items():
-        try:
+        # Best-effort per manifest, the same suppress the sarif unlink below
+        # uses: an unreadable or unwritable manifest leaves the tree as the
+        # autobuild left it and is reported as not restored, which is strictly
+        # better than failing a CodeQL run over a file the caller only ever
+        # tidies up.
+        with contextlib.suppress(OSError):
             if path.read_bytes() != original:
                 path.write_bytes(original)
                 restored.append(path)
-        except OSError:
-            pass
     return restored
 
 
