@@ -65,7 +65,7 @@
 #               idempotently. (2) Alert comparison skips when the branch carries
 #               no previous suite, so the first data point publishes a baseline
 #               and alerts nothing - that part needs no bootstrap.
-# Scope:        14 repos, 164 chart series. Widened from the original four on
+# Scope:        17 repos, 432 chart series. Widened from the original four on
 #               2026-08-21. The criterion is not "has a benchmark", and it is
 #               NOT "is a library" either - see "Not a criterion" below. Three
 #               tests, and the last two are measurements, not arguments:
@@ -84,14 +84,18 @@
 #                    (doi.org/10.1007/s10664-019-09681-1), and their earlier
 #                    survey concluded outright that not all benchmarks are
 #                    useful for reliably discovering slowdowns.
-#                 3. ATTRIBUTABLE COMMITS. A weekly chart point covers a week of
-#                    commits, so a step is only actionable if few landed in the
-#                    BENCHMARKED PACKAGE that week. Measured over 90 days, every
-#                    enrolled repo is at or under 3.2 commits/week to its
-#                    benchmarked package (keyenc 0.1, xmlx 0.2, pathinside 0.2,
-#                    urlform 0.5, langtag 0.8, slogx 0.9, jsonx 0.9, ssrf 0.9,
-#                    runesafe 1.0, plex-language-sync/internal/streams 1.0,
-#                    metrics 1.4, web-terminal-engine/vt 2.6, httpx 3.2).
+#                 3. ATTRIBUTABLE COMMITS, which sets the BENCHTIME rather than
+#                    admission. A weekly chart point covers a week of commits,
+#                    so a step is only as actionable as the number that landed
+#                    in the BENCHMARKED PACKAGE that week. Measured over 90
+#                    days: keyenc 0.1, xmlx 0.2, pathinside 0.2, urlform 0.5,
+#                    langtag 0.8, slogx 0.9, jsonx 0.9, ssrf 0.9, runesafe 1.0,
+#                    plex-language-sync/internal/streams 1.0,
+#                    plex-exporter/internal/server 1.2, metrics 1.4,
+#                    web-terminal-engine/vt 2.6, httpx 3.2, then subflux 8.2 and
+#                    vibekit 14.2. The last two are enrolled and run at a lower
+#                    benchtime, because sharpening a signal nobody can attribute
+#                    to a commit is not worth 3x the wall time.
 #
 # Which metric gates what:
 #               The three series the reducer emits are NOT equally trustworthy,
@@ -132,14 +136,14 @@
 #               jsonx AFTER this workflow landed, so it matched the original
 #               criterion and was simply never added), the five pure-compute
 #               libraries that got benchmarks written for this widening
-#               (runesafe, pathinside, keyenc, langtag, urlform), and the four
+#               (runesafe, pathinside, keyenc, langtag, urlform), the five
 #               CPU-bound repos whose benchmarks already existed (metrics,
-#               slogx, web-terminal-engine, plex-language-sync).
+#               slogx, web-terminal-engine, plex-language-sync, plex-exporter),
+#               and both large apps (subflux, vibekit).
 #
-# Next up:      plex-exporter QUALIFIES on all three tests and is deliberately
-#               NOT in the list yet. Its BenchmarkCollect is the nil-deref
-#               above, so enrolling it before that fix lands would fail the leg
-#               on the first run. Add it in the same change that lands the fix.
+#               plex-exporter's enrolment DEPENDS on the fix to its
+#               BenchmarkCollect nil-deref being on main. Land that first or its
+#               leg fails on the first run.
 #
 #               EXCLUDED, with the reason, so this is not re-litigated:
 #               - atomicfile, health, scheduler: every benchmark fsyncs, flocks
@@ -163,19 +167,17 @@
 #               - toolbelt, pinstall: install-time. wiregen: build-time.
 #               - webhttp: per-call cost is dominated by net/http itself and it
 #                 makes no cost claim of its own.
-#               - subflux and vibekit: deferred on criterion 3, ATTRIBUTION -
-#                 8.2 and 14.2 source commits a week against 3.2 for the
-#                 noisiest enrolled repo. A weekly chart point in either would
-#                 cover 8 to 14 changes across the whole tree, so a step in the
-#                 chart identifies a week rather than a commit and nobody can
-#                 act on it. Series count (136 and 103) is a cost, not the
-#                 reason. The fix is not to enrol them as they are: give each a
-#                 small, deliberately chosen subset over its genuinely hot paths
-#                 and enrol that. This is the documented practice - an optimized
-#                 subset of a suite still detects most real application changes
-#                 (arxiv.org/abs/2212.09515), and selection by stability metric
-#                 cut Go suite runtime by up to 95.8% while still catching
-#                 regressions in CI (arxiv.org/abs/2501.12878).
+#               NOT excluded, but worth knowing: subflux (136 series) and
+#               vibekit (103) are enrolled WHOLE rather than as a curated
+#               subset, which was a deliberate call against the documented
+#               practice - an optimized subset still detects most real
+#               application changes (arxiv.org/abs/2212.09515) and selection by
+#               stability metric cut Go suite runtime by up to 95.8% while still
+#               catching regressions (arxiv.org/abs/2501.12878). A subset stays
+#               acceptable and remains the fallback if either leg becomes
+#               unwieldy; whole suites were preferred because a subset is a
+#               second thing to maintain and to justify. Their weak attribution
+#               is handled by benchtime instead (see criterion 3).
 #
 # Known-noisy:  9 of the 38 measured ns/op series sit under 3 sigma from the
 #               150% threshold, so they can alert on noise alone. Worst first:
@@ -199,12 +201,13 @@
 #                   4.6% at 1s (the default), 2.5% at 3s. oversized_token: 13.2%
 #                   at 1s, 7.5% at 3s - almost exactly the 1/sqrt(3) the model
 #                   predicts.
-#               So the lever for sensitivity is `-benchtime`, fleet-wide, at a
-#               linear wall-time cost: at 3s the median series would sit near 3%,
-#               putting a 10% real regression at 3 sigma instead of the 26% the
-#               tracker can see today. That trade is worth making only against
-#               RUNNER data, which the Stability step below now collects on every
-#               leg. Measure there first, then tune the flag.
+#               APPLIED: benchtime is 3s for every repo except the two large
+#               apps, which stay at 1s (criterion 3). At 3s the median series
+#               should sit near 3%, putting a 10% regression at 3 sigma instead
+#               of the 26% the tracker saw at 1s. That projection comes from a
+#               loaded workstation, so the Stability step measures the real floor
+#               on every leg. Read it after the first run and re-tune with the
+#               `benchtime` dispatch input; do not rewrite a benchmark for this.
 name: Weekly bench
 
 on:
@@ -221,9 +224,9 @@ on:
         required: false
         default: "10"
       benchtime:
-        description: "go test -benchtime per sample (default 1s). Spread falls as 1/sqrt(iterations), so 3s buys about a 1.7x tighter series at 3x the wall time. Use this to tune sensitivity against the Stability report."
+        description: "go test -benchtime per sample. Empty uses the per-repo default (3s, or 1s for subflux and vibekit). Spread falls as 1/sqrt(iterations), so 3s buys about a 1.7x tighter series at 3x the wall time."
         required: false
-        default: "1s"
+        default: ""
 
 permissions:
   contents: read
@@ -234,11 +237,114 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A benchmark nobody runs has only ever been type-checked. `go test ./...`
+  # COMPILES a benchmark and never executes it without -bench, so an unenrolled
+  # benchmark can rot silently: measured 2026-08-21, plex-exporter's
+  # BenchmarkCollect nil-dereferenced on its first iteration and had since the
+  # commit that turned three plexapi fields into pointers. One of 24 repos.
+  #
+  # The enrolled repos are covered by the run job below, which executes their
+  # benchmarks for real. This job covers everything ELSE that carries a
+  # `func Benchmark`, at one iteration each, purely to prove the code still
+  # runs. It is deliberately weekly rather than per-PR: most PRs are small and
+  # do not touch a benchmark, so paying this on every push would buy the same
+  # protection at many times the cost.
+  #
+  # Self-maintaining by construction. It takes the enrolled set from the fanout
+  # job's output and subtracts it, so enrolling a repo removes it from here
+  # automatically and a new repo that gains its first benchmark is picked up
+  # with no edit. ONE job rather than a matrix: the work is about a second per
+  # repo, so per-leg checkout and toolchain setup would cost more than the
+  # tests do.
+  smoke:
+    needs: fanout
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Execute every unenrolled benchmark once
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          # From the fanout job, never restated here. Injected via env rather
+          # than inlined in the body so the value cannot expand into shell code.
+          ENROLLED: ${{ needs.fanout.outputs.enrolled }}
+        run: |
+          set -uo pipefail
+
+          # Forks are excluded fleet-wide (same rule as scripts/audit.py): a
+          # fork's tree is UPSTREAM's, so its benchmarks are someone else's.
+          live=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
+            [.[] | select(.isArchived == false and .isFork == false) | .name] | .[]
+          ')
+
+          broken=""
+          checked=0
+          skipped=0
+          for r in $live; do
+            case " $ENROLLED " in *" $r "*) continue ;; esac
+
+            rm -rf scan
+            if ! gh repo clone "cplieger/${r}" scan -- --depth 1 >/dev/null 2>&1; then
+              echo "::warning::clone failed for ${r} - skipping"
+              continue
+            fi
+            [ -f scan/go.mod ] || { skipped=$((skipped + 1)); continue; }
+            if ! grep -rq --include='*_test.go' 'func Benchmark' scan 2>/dev/null; then
+              skipped=$((skipped + 1))
+              continue
+            fi
+
+            n=$(grep -rh --include='*_test.go' -c 'func Benchmark' scan 2>/dev/null \
+              | awk '{s+=$1} END {print s+0}')
+            printf '%-28s %s benchmark(s): ' "$r" "$n"
+            checked=$((checked + 1))
+
+            # -benchtime=1x runs each benchmark exactly one iteration. This
+            # asserts nothing about speed and everything about the code still
+            # working, which is the whole point. GOWORK=off because a repo may
+            # carry an untracked go.work locally; a runner must resolve the
+            # versions go.mod pins.
+            if (cd scan && GOWORK=off go test -run='^$' -bench=. -benchtime=1x ./... \
+                > ../out.txt 2>&1); then
+              echo "ok"
+            else
+              echo "BROKEN"
+              broken="$broken $r"
+              {
+                echo "### ${r}: benchmark does not run"
+                echo ""
+                echo '```'
+                tail -40 ../out.txt
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          rm -rf scan out.txt
+
+          echo ""
+          echo "checked ${checked} unenrolled repo(s) with benchmarks; skipped ${skipped} without"
+
+          if [ -n "$broken" ]; then
+            # Fail closed. A benchmark that does not run is a process defect,
+            # not a finding, so it goes red with the reason rather than opening
+            # an issue nothing would ever close.
+            echo "::error::benchmarks fail to execute in:${broken}"
+            exit 1
+          fi
+
   fanout:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
+      # Published so the smoke job can subtract it. One source of truth for the
+      # enrolled set; a second literal would be a drift waiting to happen.
+      enrolled: ${{ steps.fanout.outputs.enrolled }}
     steps:
       - name: Discover Go repos carrying benchmarks
         id: fanout
@@ -256,7 +362,8 @@ jobs:
           ENROLLED="xmlx jsonx jsoncap ssrf httpx"                 # cost-contract libraries
           ENROLLED="$ENROLLED runesafe pathinside keyenc langtag urlform"   # pure-compute libraries
           ENROLLED="$ENROLLED metrics slogx web-terminal-engine"   # per-call hot paths
-          ENROLLED="$ENROLLED plex-language-sync"                  # CPU-bound app path
+          ENROLLED="$ENROLLED plex-language-sync plex-exporter"    # CPU-bound app paths
+          ENROLLED="$ENROLLED subflux vibekit"                     # the two large apps
 
           # Forks are excluded fleet-wide (same rule as scripts/audit.py): a
           # fork's tree is UPSTREAM's, so its benchmarks measure someone else's
@@ -334,6 +441,7 @@ jobs:
           rm -rf scan
 
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "enrolled=${ENROLLED}" >> "$GITHUB_OUTPUT"
           echo "Total entries: $(printf '%s' "$matrix" | jq 'length')"
 
           # An empty matrix skips the `run` job, which reports the leg green
@@ -351,10 +459,12 @@ jobs:
     if: ${{ needs.fanout.outputs.matrix != '[]' }}
     strategy:
       fail-fast: false
-      max-parallel: 4   # Own day; 4 leaves 16 of the 20-job cap free. 15 repos
-                        # is 4 waves at roughly 5 min a leg (the slowest,
-                        # urlform, is ~4.2 min of benchmarks at -count=10 plus
-                        # setup), so about 20 min wall for the whole run.
+      max-parallel: 4   # Own day; 4 leaves 16 of the 20-job cap free. 17 repos
+                        # is 5 waves, and the two large apps dominate: measured
+                        # at -count=10, subflux is 36 min and vibekit 36.5 at
+                        # their 1s benchtime, against about 12 min for the
+                        # slowest library at 3s. Roughly an hour of wall for the
+                        # run, all of it free (every repo here is public).
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
     runs-on: ubuntu-24.04
@@ -400,23 +510,46 @@ jobs:
       # how fine a regression the tracker can see at all: spread falls as
       # 1/sqrt(iterations per sample), so raising it tightens every series at
       # once. Both are validated before use because both reach a shell.
+      #
+      # The two large apps run at 1s where everything else runs at 3s, and the
+      # reason is attribution rather than budget. Their benchmarked code takes
+      # 8.2 and 14.2 commits a week against 3.2 for the noisiest library, so a
+      # finer detection threshold buys less there - you would resolve a 10%
+      # regression and still not know which of fourteen commits caused it.
+      # Spending 3x the wall time to sharpen a signal nobody can attribute is
+      # poor value. The budget agrees: measured at count=10, subflux is 36 min
+      # at 1s and 82 min at 3s, and the second does not fit the timeout.
       - name: Run benchmarks
         working-directory: app
         env:
           COUNT: ${{ github.event.inputs.count || '10' }}
-          BENCHTIME: ${{ github.event.inputs.benchtime || '1s' }}
+          BENCHTIME_INPUT: ${{ github.event.inputs.benchtime }}
+          REPO: ${{ matrix.repo }}
         run: |
           set -euo pipefail
           case "$COUNT" in
             ''|*[!0-9]*) echo "::error::count must be a positive integer"; exit 1 ;;
           esac
+
+          # A dispatch value overrides everything, including the per-repo
+          # default, so a one-off experiment can compare like with like across
+          # the whole matrix.
+          if [ -n "${BENCHTIME_INPUT:-}" ]; then
+            BENCHTIME="$BENCHTIME_INPUT"
+          else
+            case "$REPO" in
+              subflux|vibekit) BENCHTIME=1s ;;
+              *)               BENCHTIME=3s ;;
+            esac
+          fi
+
           # go test accepts a duration (1s, 500ms) or an exact iteration count
           # (100x). Anything else is rejected here rather than reaching go test,
-          # since this value arrives from a dispatch input.
+          # since this value can arrive from a dispatch input.
           case "$BENCHTIME" in
             *[!0-9smhx.]*|''|.|x) echo "::error::benchtime must be a duration (1s, 500ms) or an iteration count (100x)"; exit 1 ;;
           esac
-          echo "count=$COUNT benchtime=$BENCHTIME"
+          echo "repo=$REPO count=$COUNT benchtime=$BENCHTIME"
           go test -run='^$' -bench=. -benchmem \
             -count="$COUNT" -benchtime="$BENCHTIME" ./... \
             | tee "$RUNNER_TEMP/bench-raw.txt"
