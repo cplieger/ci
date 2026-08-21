@@ -65,15 +65,22 @@
 #               idempotently. (2) Alert comparison skips when the branch carries
 #               no previous suite, so the first data point publishes a baseline
 #               and alerts nothing - that part needs no bootstrap.
-# Scope:        17 repos, 432 chart series. Widened from the original four on
+# Scope:        18 repos, 429 chart series. Widened from the original four on
 #               2026-08-21. The criterion is not "has a benchmark", and it is
 #               NOT "is a library" either - see "Not a criterion" below. Three
 #               tests, and the last two are measurements, not arguments:
 #                 1. DETERMINISTIC COMPUTE. No disk, no network, no sleep, no
 #                    wall-clock dependence. This is the one structural test that
 #                    survived, because those are the CAUSES of a spread no
-#                    threshold can police. It is a property of the benchmark,
-#                    not of the repo.
+#                    threshold can police. It is a property of the BENCHMARK, not
+#                    of the repo, which is why it is enforced per benchmark with
+#                    `go test -skip` in the run job rather than by admitting or
+#                    refusing whole repos. Judge it by walking each benchmark's
+#                    TIMED region, never the whole function: a b.TempDir() in
+#                    setup costs nothing per iteration, and scanning whole bodies
+#                    over-reported the two large apps as 15 offenders where the
+#                    real number is 3. An in-process ServeHTTP with a recorder is
+#                    compute, not network.
 #                 2. A POLICEABLE SPREAD, measured with
 #                    scripts/bench-stability.py over `-count=10`: the alert
 #                    threshold must sit at least 3 sigma from the series' own
@@ -139,7 +146,12 @@
 #               (runesafe, pathinside, keyenc, langtag, urlform), the five
 #               CPU-bound repos whose benchmarks already existed (metrics,
 #               slogx, web-terminal-engine, plex-language-sync, plex-exporter),
-#               and both large apps (subflux, vibekit).
+#               both large apps (subflux, vibekit), and auth, whose two Argon2id
+#               benchmarks are skipped: their cost IS the security parameter, and
+#               a customSmallerIsBetter tracker alerts only on getting slower
+#               where the dangerous direction is faster. What remains is the
+#               per-request auth path, which is worth charting and is what made
+#               the repo enrollable once skipping existed.
 #
 #               plex-exporter's enrolment DEPENDS on the fix to its
 #               BenchmarkCollect nil-deref being on main. Land that first or its
@@ -149,15 +161,6 @@
 #               - atomicfile, health, scheduler: every benchmark fsyncs, flocks
 #                 or stats a file. The runner's shared disk sets the number, not
 #                 the code.
-#               - auth: BenchmarkHashPassword/VerifyPassword measure Argon2id,
-#                 whose cost is a TUNED SECURITY PARAMETER. The tracker is
-#                 customSmallerIsBetter, so it alerts only on getting slower -
-#                 and for Argon2id the dangerous direction is FASTER (a lowered
-#                 cost parameter), which it structurally cannot see. Enrolling
-#                 it would publish a series whose only alerts are deliberate
-#                 hardening. Revisit if the run ever gains a per-repo -bench
-#                 filter, which would let its middleware and ratelimit
-#                 benchmarks in without the KDF.
 #               - cert-converter, docker-age, docker-fclones-scheduler: one
 #                 IO-shaped benchmark each (PEM on disk, file decrypt, report
 #                 decode).
@@ -389,6 +392,7 @@ jobs:
           ENROLLED="$ENROLLED metrics slogx web-terminal-engine"   # per-call hot paths
           ENROLLED="$ENROLLED plex-language-sync plex-exporter"    # CPU-bound app paths
           ENROLLED="$ENROLLED subflux vibekit"                     # the two large apps
+          ENROLLED="$ENROLLED auth"                                # per-request auth path, KDF skipped
 
           # Forks are excluded fleet-wide (same rule as scripts/audit.py): a
           # fork's tree is UPSTREAM's, so its benchmarks measure someone else's
@@ -544,6 +548,15 @@ jobs:
       # Spending 3x the wall time to sharpen a signal nobody can attribute is
       # poor value. The budget agrees: measured at count=10, subflux is 36 min
       # at 1s and 82 min at 3s, and the second does not fit the timeout.
+      #
+      # SKIP is how criterion 1 is enforced on a repo that is otherwise a good
+      # candidate. `go test -skip` (Go 1.21+) matches benchmarks and sub-benchmark
+      # paths, so a single offending series can be dropped without touching the
+      # repo and without a positive -bench regex that would have to enumerate
+      # everything else. Every entry below names what it excludes and why, and
+      # each was found by walking the TIMED region of each benchmark rather than
+      # the whole function: a b.TempDir() in setup costs nothing per iteration,
+      # and scanning whole bodies over-reported this 15 to 7 to an actual 3.
       - name: Run benchmarks
         working-directory: app
         env:
@@ -574,10 +587,47 @@ jobs:
           case "$BENCHTIME" in
             *[!0-9smhx.]*|''|.|x) echo "::error::benchtime must be a duration (1s, 500ms) or an iteration count (100x)"; exit 1 ;;
           esac
-          echo "repo=$REPO count=$COUNT benchtime=$BENCHTIME"
-          go test -run='^$' -bench=. -benchmem \
-            -count="$COUNT" -benchtime="$BENCHTIME" ./... \
-            | tee "$RUNNER_TEMP/bench-raw.txt"
+
+          SKIP=""
+          case "$REPO" in
+            auth)
+              # Argon2id, whose cost IS the security parameter. The tracker is
+              # customSmallerIsBetter, so it alerts only on getting slower, and
+              # the dangerous direction here is FASTER (a lowered cost
+              # parameter), which it structurally cannot see. Its 19.9 MB/op is
+              # the memory parameter and would dominate every allocation series
+              # in the repo. The middleware and rate-limiter benchmarks that
+              # remain are the per-request path and are worth charting, which is
+              # what made this repo enrollable at all.
+              SKIP='BenchmarkHashPassword|BenchmarkVerifyPassword' ;;
+            subflux)
+              # HashFile reads the file under test on every iteration, and its
+              # numbers say so: 128KB measures SLOWER than 10MB, the same
+              # inverted signature that keeps atomicfile out entirely.
+              # concurrent_miss sleeps inside the timed loop - correct as a
+              # fixture, since the sleep is what lets coalescing be observed,
+              # and meaningless as a wall-clock series. Its hit and miss
+              # siblings stay.
+              SKIP='BenchmarkHashFile|BenchmarkCache_GetOrFetch/concurrent_miss' ;;
+            vibekit)
+              # Copies a file and then os.Remove's it inside the timed loop, so
+              # the series measures the filesystem. The ServeHTTP call in it is
+              # fine on its own - an in-process handler with a recorder is
+              # compute, not network, which is why the other handler benchmarks
+              # in this repo and in subflux stay.
+              SKIP='BenchmarkFileAction_Copy' ;;
+          esac
+
+          echo "repo=$REPO count=$COUNT benchtime=$BENCHTIME skip=${SKIP:-<none>}"
+          if [ -n "$SKIP" ]; then
+            go test -run='^$' -bench=. -benchmem -skip "$SKIP" \
+              -count="$COUNT" -benchtime="$BENCHTIME" ./... \
+              | tee "$RUNNER_TEMP/bench-raw.txt"
+          else
+            go test -run='^$' -bench=. -benchmem \
+              -count="$COUNT" -benchtime="$BENCHTIME" ./... \
+              | tee "$RUNNER_TEMP/bench-raw.txt"
+          fi
 
       - name: Reduce to medians
         run: |
