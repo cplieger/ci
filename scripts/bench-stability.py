@@ -199,7 +199,23 @@ def main() -> int:
                 f'  {c:>6.1f}% spread, {sigma_to_threshold(c, args.threshold):.1f} sigma  '
                 f'{label}/{name}  (median {med:,.0f} ns, {n} samples)'
             )
-        print('  Give each more work per operation, or drop it from the chart.')
+        print(
+            '  Raise -benchtime before rewriting any of these. Spread falls as\n'
+            '  1/sqrt(iterations per sample), so 3x the benchtime buys about a 1.7x\n'
+            '  tighter series across the WHOLE suite at a linear wall-time cost.\n'
+            "  Measured on two of the fleet's worst series: slogx/ParseLevel went\n"
+            '  11.1% -> 4.6% -> 2.5% at 100ms/1s/3s, and xmlx oversized_token went\n'
+            '  13.2% -> 7.5% at 1s/3s. Rewriting one benchmark fixes one series;\n'
+            '  the flag fixes all of them.'
+        )
+
+    print(
+        '\nRead this against how the samples were taken. A whole-suite run on a busy\n'
+        'host inflates every number here: the two series above measured 43.7% and\n'
+        '39.1% inside a loaded `-bench=.` sweep against 4.6% and 13.2% run alone at\n'
+        'the same benchtime. Ambient load is not the code under test, so compare a\n'
+        'series only against another run of the same shape.'
+    )
 
     if not args.quiet:
         print('\nNoisiest ns/op series:')
