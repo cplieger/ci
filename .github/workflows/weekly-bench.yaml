@@ -309,8 +309,15 @@ jobs:
             # working, which is the whole point. GOWORK=off because a repo may
             # carry an untracked go.work locally; a runner must resolve the
             # versions go.mod pins.
-            if (cd scan && GOWORK=off go test -run='^$' -bench=. -benchtime=1x ./... \
-                > ../out.txt 2>&1); then
+            #
+            # `go test -C` rather than a `cd` subshell: with a cd, the output
+            # redirect resolves relative to scan/ while the tail below resolves
+            # relative to here, so the diagnostic was written to one path and
+            # read from another. The job still failed correctly and the summary
+            # carried an empty code block, which is the worst shape for a red
+            # leg - it says something broke and not what.
+            if GOWORK=off go test -C scan -run='^$' -bench=. -benchtime=1x ./... \
+                > out.txt 2>&1; then
               echo "ok"
             else
               echo "BROKEN"
@@ -318,10 +325,28 @@ jobs:
               {
                 echo "### ${r}: benchmark does not run"
                 echo ""
+                # The cause FIRST, then the context collapsed. A fixed tail
+                # window is not enough on its own: packages that pass report
+                # after the one that panicked, and a goroutine dump is long, so
+                # the actual cause can fall outside the window. A red leg that
+                # does not say why is the exact failure this job exists to
+                # report, so the reason is pulled out by name.
                 echo '```'
-                tail -40 ../out.txt
+                grep -m4 -E 'panic:|--- FAIL|^FAIL|undefined:|cannot use' out.txt \
+                  || echo '(no recognised failure marker; see the full output below)'
                 echo '```'
+                echo ""
+                echo "<details><summary>full output, last 60 lines</summary>"
+                echo ""
+                echo '```'
+                tail -60 out.txt
+                echo '```'
+                echo ""
+                echo "</details>"
               } >> "$GITHUB_STEP_SUMMARY"
+              # Also to the job log, so the reason survives even if the summary
+              # write fails or is truncated.
+              grep -m4 -E 'panic:|--- FAIL|^FAIL' out.txt || tail -20 out.txt
             fi
           done
           rm -rf scan out.txt
