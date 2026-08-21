@@ -127,10 +127,12 @@ PUSH_WEBHOOK_REPOS = {".github", ".kiro", "ci", "homelab"}
 # AWS is a private work workspace. It ships nothing, cuts no release, and must
 # not point a webhook at the self-hosted orchestrator.
 NO_DEPLOY_HOOK = {"AWS"}
-# Image repos that publish to GHCR only (no Docker Hub mirror), so the
-# DOCKERHUB_* secrets check is N/A. MUST mirror the per-repo policy overrides
-# in .github/workflows/release.yaml (the `policy` step) — update both together.
-GHCR_ONLY = {"subflux", "vibekit"}
+# Every image repo (root Dockerfile) dual-publishes to GHCR + Docker Hub, so
+# every one of them needs the DOCKERHUB_* secrets. There is no GHCR-only
+# exemption set any more: subflux and vibekit were the last two, and their
+# carve-out outlived the intent by ~20 releases while both READMEs advertised a
+# Docker Hub image the pipeline had stopped pushing. A future exemption needs a
+# skip here AND a policy override in .github/workflows/release.yaml.
 # The required check every repo carries, and the GitHub App expected to report
 # it (15368 = GitHub Actions). A validate context restricted to a different
 # app — or to none (-1, any app may report it) — weakens the gate: an
@@ -636,13 +638,13 @@ def collect(meta):
     else:
         s["has_dependabot_yml"] = bool(dep_txt)
 
-    # Docker Hub dual-publish secrets. Image repos (root Dockerfile) publish to
-    # GHCR + Docker Hub by default (release.yaml policy step; GHCR_ONLY lists
-    # the exceptions), and the Docker Hub login needs per-repo secrets —
-    # cplieger is a user account, so there are no org-level secrets. A missing
-    # secret fails the next release at the Docker Hub login step.
+    # Docker Hub dual-publish secrets. Every image repo (root Dockerfile)
+    # publishes to GHCR + Docker Hub (release.yaml policy step), and the Docker
+    # Hub login needs per-repo secrets — cplieger is a user account, so there
+    # are no org-level secrets. A missing secret fails the next release at the
+    # Docker Hub login step.
     s["dockerhub_secrets"] = None
-    if s.get("has_dockerfile") and name not in GHCR_ONLY:
+    if s.get("has_dockerfile"):
         sec = gh_json("api", f"repos/{OWNER}/{name}/actions/secrets")
         if isinstance(sec, dict) and "secrets" in sec:
             names_ = {x.get("name") for x in sec.get("secrets") or []}

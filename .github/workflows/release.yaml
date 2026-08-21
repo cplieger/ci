@@ -691,15 +691,12 @@ jobs:
           PLATFORMS="linux/amd64,linux/arm64"
           SBOM_FROM="image"
 
-          case "$REPO_NAME" in
-            # GHCR-only (no Docker Hub mirror). Pre-1.0 apps not yet mirrored
-            # to Docker Hub. The docker-* infra images (caddy, age, keepalived,
-            # static-web, radvd) graduated to dual-publish once they hit 1.0.
-            # Keep in sync with GHCR_ONLY in scripts/audit.py (it exempts
-            # these repos from the DOCKERHUB_* secrets check).
-            subflux|vibekit)
-              REGISTRIES="ghcr" ;;
-          esac
+          # Every image repo dual-publishes; there is no GHCR-only set. The
+          # last two exemptions (subflux, vibekit) were removed 2026-08-21 —
+          # both had DOCKERHUB_* secrets and a README advertising a Docker Hub
+          # image, while this override had frozen that registry at v0.1.x since
+          # 2026-06-04. A new exemption needs a REGISTRIES="ghcr" arm here AND
+          # a matching skip in scripts/audit.py's DOCKERHUB_* secrets check.
 
           case "$REPO_NAME" in
             # SBOM from extracted binary path (image-level scan misses static
