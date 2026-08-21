@@ -43,7 +43,9 @@
 #               series in four repos (2026-08-21, scripts/bench-stability.py):
 #               ns/op spread is 8.60% median, 24.55% p90, 43.73% worst. At the
 #               median that puts a 150% alert 5.8 sigma out, so the tracker sees
-#               a regression of roughly 26% or worse and nothing finer - which
+#               a regression of MORE than about 26% and nothing finer (the
+#               action's comparison is a strict `ratio > threshold`, so exactly
+#               1.5x does not alert) - which
 #               is the intended target (an O(n log n) aligner becoming
 #               O(n squared) shows up as multiples). A tight threshold on a
 #               non-gating check just trains everyone to ignore the tracker.
@@ -81,16 +83,28 @@
 #                    over-reported the two large apps as 15 offenders where the
 #                    real number is 3. An in-process ServeHTTP with a recorder is
 #                    compute, not network.
-#                 2. A POLICEABLE SPREAD, measured with
-#                    scripts/bench-stability.py over `-count=10`: the alert
-#                    threshold must sit at least 3 sigma from the series' own
-#                    noise. Do not predict this from the code - measure it.
-#                    Across 5 million data points in Java and Go, Laaber,
+#                 2. A POLICEABLE SPREAD. Measure it, never predict it from the
+#                    code: across 5 million data points in Java and Go, Laaber,
 #                    Scheuner and Leitner found per-benchmark coefficients of
 #                    variation from 0.03% to over 100%
 #                    (doi.org/10.1007/s10664-019-09681-1), and their earlier
-#                    survey concluded outright that not all benchmarks are
-#                    useful for reliably discovering slowdowns.
+#                    survey concluded outright that not all benchmarks are useful
+#                    for reliably discovering slowdowns.
+#
+#                    THE STATISTIC IS NOT YET RIGHT, and this is a known defect
+#                    rather than a settled rule. scripts/bench-stability.py
+#                    reports the coefficient of variation over the 10 RAW samples.
+#                    What decides an alert is a ratio of two MEDIANS of 10, a week
+#                    apart. Those are different random variables, so the "sigma"
+#                    the script prints is not the sampling distribution of the
+#                    decision, and no admission verdict should rest on it. Two
+#                    independent adversarial reviews converged on this.
+#                    The durable statistic is the empirical distribution of
+#                    consecutive-median RATIOS for an unchanged tree, which needs
+#                    repeated runner runs to obtain; the raw output is now kept as
+#                    an artifact so those runs can be pooled. Until then the
+#                    script's numbers are descriptive, and its exit status is
+#                    advisory.
 #                 3. ATTRIBUTABLE COMMITS, which sets the BENCHTIME rather than
 #                    admission. A weekly chart point covers a week of commits,
 #                    so a step is only as actionable as the number that landed
@@ -107,8 +121,20 @@
 # Which metric gates what:
 #               The three series the reducer emits are NOT equally trustworthy,
 #               and this is the tracker's most useful property:
-#                 allocs/op  spread 0.00% on 38 of 38 series. EXACT. Any
-#                            movement is a real change at any magnitude.
+#                 allocs/op  spread 0.00% on 38 of 38 series: deterministic for
+#                            a path that allocates the same number of times on
+#                            every call, which is what these series measure.
+#                            NOT exact in general, and the earlier wording here
+#                            said exact. testing.AllocsPerRun and
+#                            BenchmarkResult.AllocsPerOp both divide as INTEGERS,
+#                            so an allocation happening less often than once per
+#                            run floors to zero: measured, a 64-byte allocation
+#                            on 1 call in 1000 reads 0 allocs/op and passes a
+#                            `== 0` contract. That defeats a zero-allocation
+#                            claim on an AMORTISED path (a buffer that grows
+#                            occasionally), which is exactly where it matters.
+#                            A contract whose claim is genuinely "never" wants
+#                            AllocsPerRun(1, f) or a MemStats delta.
 #                 B/op       0.00%; the two series that move at all move by 1
 #                            and 5 bytes out of 47 KB and 305 KB.
 #                 ns/op      8.60% median. Trend only.
@@ -199,18 +225,29 @@
 #                   benchtime instead of inside a loaded `-bench=.` sweep,
 #                   ParseLevel measured 4.6% rather than 43.7% and
 #                   oversized_token 13.2% rather than 39.1%.
-#                 - Spread falls as 1/sqrt(iterations per sample), so -benchtime
-#                   is a predictable global knob. ParseLevel: 11.1% at 100ms,
-#                   4.6% at 1s (the default), 2.5% at 3s. oversized_token: 13.2%
-#                   at 1s, 7.5% at 3s - almost exactly the 1/sqrt(3) the model
-#                   predicts.
+#                 - MEASURED on two series, benchtime buys a tighter series:
+#                   ParseLevel 11.1% at 100ms, 4.6% at 1s, 2.5% at 3s, and
+#                   oversized_token 13.2% at 1s to 7.5% at 3s, which is close to
+#                   the 1/sqrt(3) that averaging independent noise would predict.
+#                   Treat that as a fitted observation on two series, NOT as a
+#                   law: 1/sqrt(n) holds for independent samples, and ambient
+#                   load, GC, package contention and frequency scaling are
+#                   correlated. Earlier wording here stated it as a rule.
 #               APPLIED: benchtime is 3s for every repo except the two large
-#               apps, which stay at 1s (criterion 3). At 3s the median series
-#               should sit near 3%, putting a 10% regression at 3 sigma instead
-#               of the 26% the tracker saw at 1s. That projection comes from a
-#               loaded workstation, so the Stability step measures the real floor
-#               on every leg. Read it after the first run and re-tune with the
-#               `benchtime` dispatch input; do not rewrite a benchmark for this.
+#               apps, which stay at 1s (criterion 3). Measured after the change:
+#               slogx median 2.60% worst 13.39% with every series clear, urlform
+#               median 3.96% with 19 of 20 clear, xmlx median 10.33%. Those come
+#               from a loaded workstation, so the Stability step measures the real
+#               floor on every leg; read it after the first run and re-tune with
+#               the `benchtime` dispatch input rather than rewriting a benchmark.
+#
+#               AND KEEP THE STAKES IN VIEW: `comment-on-alert` is false, so a
+#               false alert notifies nobody. It appears in a job summary and in
+#               the stored series and that is all. Earlier wording here argued
+#               these two series from the risk of "crying wolf", which is a real
+#               concern when someone is paged and no concern at all when nothing
+#               is delivered. Neither series is worth a benchmark rewrite or a
+#               second action invocation at that price.
 name: Weekly bench
 
 on:
@@ -281,9 +318,19 @@ jobs:
 
           # Forks are excluded fleet-wide (same rule as scripts/audit.py): a
           # fork's tree is UPSTREAM's, so its benchmarks are someone else's.
-          live=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
+          if ! live=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
             [.[] | select(.isArchived == false and .isFork == false) | .name] | .[]
-          ')
+          '); then
+            echo "::error::repo discovery failed; refusing to report green having checked nothing"
+            exit 1
+          fi
+          if [ -z "$live" ]; then
+            # Without this the loop body never runs, checked stays 0, and the job
+            # exits 0 having verified nothing - the same vacuous green this job
+            # exists to catch in other people's benchmarks.
+            echo "::error::repo discovery returned no repositories"
+            exit 1
+          fi
 
           broken=""
           checked=0
@@ -292,8 +339,12 @@ jobs:
             case " $ENROLLED " in *" $r "*) continue ;; esac
 
             rm -rf scan
-            if ! gh repo clone "cplieger/${r}" scan -- --depth 1 >/dev/null 2>&1; then
-              echo "::warning::clone failed for ${r} - skipping"
+            # Bounded individually. This loop is serial over every unenrolled
+            # repo, so one wedged clone or module download would otherwise
+            # consume the job timeout and the log would not say which repo did
+            # it. 120s is generous for a --depth 1 clone.
+            if ! timeout 120 gh repo clone "cplieger/${r}" scan -- --depth 1 >/dev/null 2>&1; then
+              echo "::warning::clone failed or timed out for ${r} - skipping"
               continue
             fi
             [ -f scan/go.mod ] || { skipped=$((skipped + 1)); continue; }
@@ -319,7 +370,9 @@ jobs:
             # read from another. The job still failed correctly and the summary
             # carried an empty code block, which is the worst shape for a red
             # leg - it says something broke and not what.
-            if GOWORK=off go test -C scan -run='^$' -bench=. -benchtime=1x ./... \
+            # 300s covers a cold module download plus a one-iteration run of
+            # the largest suite in the fleet, which measures about 10s warm.
+            if GOWORK=off timeout 300 go test -C scan -run='^$' -bench=. -benchtime=1x ./... \
                 > out.txt 2>&1; then
               echo "ok"
             else
@@ -500,8 +553,11 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    env:
-      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+    # CI_SCHEDULE is a fleet-write PAT and it is deliberately NOT job-level env.
+    # This job runs `go test -bench` over code from 18 repositories, so a
+    # job-level token sits in the environment of a step that executes other
+    # people's benchmarks, any one of which could read it with os.Getenv. It is
+    # granted per step, to the two steps that push.
     steps:
       # Checkout ci FIRST (actions/checkout cleans the workspace): this brings
       # scripts/bench-reduce.py, which the consumer repo does not carry.
@@ -619,6 +675,33 @@ jobs:
           esac
 
           echo "repo=$REPO count=$COUNT benchtime=$BENCHTIME skip=${SKIP:-<none>}"
+
+          # A skip pattern that stops matching is a silent hole: the offending
+          # series returns to the chart and nothing says so. Checked per
+          # ALTERNATIVE rather than per pattern, which matters -
+          # `A|B/concurrent_miss` still matches A after B loses its
+          # sub-benchmarks, so a whole-pattern check passes in exactly the case it
+          # exists to catch.
+          #
+          # Grep against the sources rather than a discovery run, because a
+          # skipped benchmark is by definition absent from the output. This
+          # catches a renamed function or a renamed sub-benchmark, which is the
+          # real risk; it cannot see a sub-benchmark whose name is computed at
+          # runtime, and it warns rather than failing so a naming change never
+          # takes the whole leg down.
+          if [ -n "$SKIP" ]; then
+            printf '%s\n' "$SKIP" | tr '|' '\n' | while IFS= read -r alt; do
+              [ -n "$alt" ] || continue
+              fn=${alt%%/*}
+              sub=${alt#*/}
+              if ! grep -rq --include='*_test.go' "func ${fn}(" .; then
+                echo "::warning::skip pattern '${alt}' names ${fn}, which no *_test.go declares - the skip is dead and the series is back in the chart"
+              elif [ "$sub" != "$alt" ] && ! grep -rq --include='*_test.go' -- "$sub" .; then
+                echo "::warning::skip pattern '${alt}' matches ${fn} but its sub-benchmark '${sub}' appears nowhere - that half of the skip is dead"
+              fi
+            done
+          fi
+
           if [ -n "$SKIP" ]; then
             go test -run='^$' -bench=. -benchmem -skip "$SKIP" \
               -count="$COUNT" -benchtime="$BENCHTIME" ./... \
@@ -671,6 +754,28 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The raw samples are the only durable record of what this run actually
+      # measured, and criterion 2 cannot be settled without them. The chart keeps
+      # ONE median per series, so the ten samples behind it - and therefore the
+      # distribution of consecutive-median ratios that decides whether the 150%
+      # threshold is policeable at all - exist only in this job's filesystem and
+      # die with it. Keeping them lets several runs be pooled into one
+      # calibration instead of each run answering nothing.
+      #
+      # 90 days rather than the default 90-and-forget: long enough to pool a
+      # quarter of weekly runs, short enough that nobody is storing benchmark
+      # text forever.
+      - name: Keep the raw samples
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-raw-${{ matrix.repo }}
+          path: |
+            ${{ runner.temp }}/bench-raw.txt
+            ${{ runner.temp }}/bench.json
+          retention-days: 90
+          if-no-files-found: warn
+
       # The action cannot bootstrap a missing data branch (verified in its
       # v1.22.1 dist: gh-repository mode is clone + plain checkout, which fails
       # on a branch that does not exist). Create the empty orphan branch once;
@@ -679,6 +784,7 @@ jobs:
       - name: Ensure benchmarks branch exists
         env:
           REPO: ${{ matrix.repo }}
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
         run: |
           set -euo pipefail
           if git ls-remote --exit-code --heads \
