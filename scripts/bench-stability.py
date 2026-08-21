@@ -12,13 +12,33 @@ cplieger repos (38 ns/op series, `-count=10` on one host, 2026-08-21):
     B/op        0.00%, constant to within 1-5 bytes on the two that move
     ns/op       median 8.6%, p90 24.6%, worst 43.7%
 
-So the two allocation metrics are EXACT and any movement in them is a real
-change, while ns/op can only carry a trend. At the median 8.6% the 150%
-threshold sits about 6 standard deviations out, which is why the workflow
-catches algorithmic regressions (multiples) and nothing finer; at the worst
-43.7% it sits about 1.1 sigma out, where the series can alert on noise alone.
-A series in that state is worse than absent, because a tracker that cries wolf
-is a tracker everyone learns to ignore.
+A zero here means "the same count on every sample", which is not the same as
+"never allocates": testing.AllocsPerRun and BenchmarkResult.AllocsPerOp divide as
+INTEGERS, so an allocation occurring less often than once per run floors to zero.
+An amortised path that grows a buffer occasionally can therefore read 0.
+
+So the allocation metrics are stable where ns/op is not, and ns/op can only
+carry a trend.
+
+TWO LIMITS ON WHAT THIS SCRIPT CAN TELL YOU, both found by adversarial review
+after it shipped, and neither yet closed.
+
+First, the statistic is not the one that decides an alert. This reports the
+coefficient of variation over the RAW samples. The workflow publishes their
+MEDIAN, and the action alerts on a ratio between two medians a week apart. Those
+are different random variables, so the sigma figure below is a description of
+within-run spread and NOT the sampling distribution of the decision. It is
+useful for comparing series and for seeing benchtime work; it is not an
+admission test, and the exit status is advisory rather than a gate. The durable
+statistic is the empirical distribution of consecutive-median ratios over an
+unchanged tree, which needs repeated runs on the real runner to obtain.
+
+Second, a coefficient of variation assumes the spread is worth summarising by a
+standard deviation. Hosted-runner noise is spiky rather than gaussian, and NIST
+recommends a median absolute deviation or an interquartile range for
+long-tailed data (itl.nist.gov/div898/handbook/eda/section3/eda356.htm). MAD is
+reported alongside CoV for that reason; where the two disagree sharply, believe
+MAD and distrust any sigma derived from the standard deviation.
 
 The published literature says the same thing and says not to guess it: across
 5 million data points in Java and Go, Laaber, Scheuner and Leitner measured
@@ -73,6 +93,23 @@ def parse(text: str) -> dict[tuple[str, str], list[float]]:
     return samples
 
 
+def mad_pct(values: list[float]) -> float:
+    """Median absolute deviation, as a percentage of the median.
+
+    The robust companion to cov(). A standard deviation weights an outlier
+    quadratically, so one scheduling spike in ten samples moves CoV a long way;
+    MAD does not. NIST recommends it for long-tailed data. When MAD is small and
+    CoV is large, the series is quiet with occasional spikes, which is the shape
+    hosted-runner noise actually takes, and the CoV-derived sigma figure is then
+    pessimistic rather than wrong.
+    """
+    med = statistics.median(values)
+    if med == 0:
+        return 0.0
+    deviations = [abs(v - med) for v in values]
+    return statistics.median(deviations) / med * 100
+
+
 def cov(values: list[float]) -> float:
     """Coefficient of variation as a percentage.
 
@@ -113,6 +150,7 @@ def main() -> int:
     args = ap.parse_args()
 
     per_unit: dict[str, list[float]] = {}
+    per_unit_mad: dict[str, list[float]] = {}
     rows: list[tuple[float, str, str, str, int, float]] = []
     short: dict[str, int] = {}
 
@@ -131,6 +169,7 @@ def main() -> int:
                 continue
             c = cov(values)
             per_unit.setdefault(unit, []).append(c)
+            per_unit_mad.setdefault(unit, []).append(mad_pct(values))
             rows.append((c, label, name, unit, len(values), statistics.median(values)))
 
     if not rows:
@@ -154,7 +193,10 @@ def main() -> int:
             print(f'  ... and {len(short) - 5} more')
         print()
 
-    print(f'{"unit":<11}{"series":>7}{"median":>9}{"p90":>9}{"worst":>9}{"exact":>9}{"  verdict"}')
+    print(
+        f'{"unit":<11}{"series":>7}{"median":>9}{"p90":>9}{"worst":>9}'
+        f'{"medMAD":>9}{"exact":>9}{"  verdict"}'
+    )
     for unit in ('ns/op', 'B/op', 'allocs/op'):
         vals = sorted(per_unit.get(unit, []))
         if not vals:
@@ -162,10 +204,15 @@ def main() -> int:
         p90 = vals[min(int(len(vals) * 0.9), len(vals) - 1)]
         exact = sum(1 for v in vals if v == 0.0)
         med = statistics.median(vals)
-        verdict = 'gate-grade (exact)' if max(vals) == 0.0 else 'trend-only'
+        med_mad = statistics.median(per_unit_mad.get(unit, [0.0]))
+        # "stable across samples" rather than "exact": a zero here means every
+        # sample reported the same figure, which the integer division in
+        # AllocsPerOp can produce for a path that allocates rarely. See the module
+        # docstring.
+        verdict = 'stable across samples' if max(vals) == 0.0 else 'trend-only'
         print(
             f'{unit:<11}{len(vals):>7}{med:>8.2f}%{p90:>8.2f}%{max(vals):>8.2f}%'
-            f'{f"{exact}/{len(vals)}":>9}  {verdict}'
+            f'{med_mad:>8.2f}%{f"{exact}/{len(vals)}":>9}  {verdict}'
         )
 
     ns = [c for c, _, _, u, _, _ in rows if u == 'ns/op']
@@ -174,7 +221,12 @@ def main() -> int:
         s = sigma_to_threshold(med, args.threshold)
         print(
             f'\nAt the median ns/op spread of {med:.2f}%, a {args.threshold:.0f}% alert sits '
-            f'{s:.1f} sigma out.'
+            f'{s:.1f} sigma from the WITHIN-RUN spread.'
+        )
+        print(
+            '  Read that as a comparison between series, not as a pass mark. The alert '
+            'compares\n  two medians a week apart, which is a different quantity; see the '
+            'module docstring.'
         )
         print(
             f'  It can see a regression of about {med * MIN_SIGMA:.0f}% or worse '
@@ -191,8 +243,12 @@ def main() -> int:
     )
     if noisy:
         print(
-            f'\nTOO NOISY for a {args.threshold:.0f}% threshold '
-            f'(under {MIN_SIGMA:.0f} sigma, so these can alert on noise alone):'
+            f'\nWIDEST relative to a {args.threshold:.0f}% threshold '
+            f'(under {MIN_SIGMA:.0f} sigma of within-run spread). ADVISORY, not a '
+            f'verdict:\nthese are the series most likely to alert without a code '
+            f'change, ranked. Confirm\nagainst the MAD column above - a wide CoV '
+            f'with a narrow MAD is spikes, not drift -\nand against several runs '
+            f'before acting.'
         )
         for c, label, name, _unit, n, med in noisy:
             print(
@@ -224,6 +280,10 @@ def main() -> int:
         )[:10]:
             print(f'  {c:>6.1f}%  {label}/{name}  (median {med:,.0f} ns)')
 
+    # Non-zero so a human running this deliberately gets a signal, and so a
+    # future gate has something to key on. The workflow calls it with `|| true`
+    # BY DESIGN: the statistic is not yet the one that decides an alert, so it
+    # must not fail a leg that measured everything it was asked to measure.
     return 1 if noisy else 0
 
 

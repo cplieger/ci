@@ -80,10 +80,14 @@ def reduce_samples(
             'unit': unit,
             'value': round(median, 4),
         }
-        # `range` renders as an error bar in the action's chart. Only meaningful
-        # with more than one sample.
+        # `range` renders as an error bar in the action's chart, and the bar is
+        # drawn as value plus-or-minus this number. So the figure must be a HALF
+        # width, not the full spread: publishing max-min under a "±" label drew
+        # every bar at twice its real extent. Only meaningful with more than one
+        # sample.
         if len(values) > 1:
-            entry['range'] = f'± {round(max(values) - min(values), 4)}'
+            half_width = (max(values) - min(values)) / 2
+            entry['range'] = f'± {round(half_width, 4)}'
             entry['extra'] = f'{len(values)} samples, median'
         out.append(entry)
     return out
