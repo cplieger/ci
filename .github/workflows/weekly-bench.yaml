@@ -292,14 +292,44 @@ jobs:
       # and comments on a regression beyond the threshold. Report-only:
       # fail-on-alert stays false, because a wall-clock regression on a shared
       # runner is evidence to investigate, not proof the code got slower.
+      # GITHUB_REPOSITORY is overridden on PURPOSE, and the run is wrong without
+      # it. This is Pattern C, so the action executes in cplieger/ci while
+      # measuring someone else's code, and it resolves the repo it is acting on
+      # from `github.context.repo` — which @actions/github reads from
+      # GITHUB_REPOSITORY ahead of the event payload. Left at the default, all
+      # three of the action's context-derived behaviours name the wrong repo:
+      #   * the data point's commit, looked up as repos.getCommit(owner, repo,
+      #     ref). Verified on the pinned v1.22.1 dist (dist/src/extract.js:85).
+      #     The first bench run recorded a66dd3d, a cplieger/ci commit, in all
+      #     four consumers, so no chart could attribute a regression to the
+      #     change that caused it.
+      #   * the alert commit comment's target (dist/src/write.js:136), so an
+      #     xmlx regression would be commented onto a cplieger/ci commit.
+      #   * data.repoUrl on the generated chart page, which linked to ci.
+      # The `ref` input alone cannot fix this: it only selects a ref WITHIN
+      # whatever repo the context names, so passing the consumer's SHA without
+      # the override asks ci for an object it does not have and 404s.
+      #
+      # This is deliberately not a post-processing pass over data.js. Rewriting
+      # the action's own output would couple this workflow to that file's
+      # internal schema; the override drives the action through its documented
+      # `ref` input instead, so a future data-format change cannot break it.
+      # The push target is unaffected — `gh-repository` is explicit, so
+      # getCurrentRepoRemoteUrl (the only other context.repo reader) is never
+      # reached.
       - name: Publish + compare
         uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
+        env:
+          GITHUB_REPOSITORY: cplieger/${{ matrix.repo }}
         with:
           tool: customSmallerIsBetter
           output-file-path: ${{ runner.temp }}/bench.json
           github-token: ${{ secrets.CI_SCHEDULE }}
           gh-repository: github.com/cplieger/${{ matrix.repo }}
           gh-pages-branch: benchmarks
+          # Resolved against the overridden repo above, so the data point lands
+          # on the commit that was actually benchmarked.
+          ref: ${{ matrix.sha }}
           benchmark-data-dir-path: .
           auto-push: true
           alert-threshold: "150%"
