@@ -11,6 +11,19 @@
 # benchmarks were well built (size-parameterised, ReportAllocs, ResetTimer);
 # they were simply dead.
 #
+# A DEAD BENCHMARK IS NOT NECESSARILY A WORKING ONE
+# `go test ./...` COMPILES a benchmark and never runs it without -bench, so an
+# unenrolled benchmark has only ever been type-checked. Measured 2026-08-21 by
+# running `-run='^$' -bench=. -benchtime=1x` over all 24 benchmark-carrying
+# repos: plex-exporter's BenchmarkCollect nil-dereferenced on its first
+# iteration and had since the commit deleting that app's duplicate Plex wire
+# structs (Item.Player/Session/User became pointers on the shared plexapi.Item
+# and the hand-written fixture assigned straight through them). One of 24. So
+# before enrolling a repo, run that -benchtime=1x smoke over it: enrolment
+# turns a compile-only benchmark into a job that can fail the leg, and the
+# tracker's -run='^$' means no sibling test runs first to paper over a
+# fixture that depends on one.
+#
 # THE STATISTICS, AND WHY THE REDUCER IS NOT OPTIONAL
 # github-action-benchmark performs NO aggregation: its Go extractor emits one
 # entry per output line and its alert comparator resolves the baseline by
@@ -46,11 +59,58 @@
 #               idempotently. (2) Alert comparison skips when the branch carries
 #               no previous suite, so the first data point publishes a baseline
 #               and alerts nothing - that part needs no bootstrap.
-# Scope:        starts at the four repos that SELL a cost bound (xmlx, jsonx,
-#               ssrf, httpx). xmlx and jsonx bound what untrusted input can cost
-#               and had no benchmarks at all until this landed, so their
-#               allocation-free claims were unverified by anything. Widen to all
-#               16 benchmark-carrying repos once the tracker is trusted.
+# Scope:        14 repos, 164 chart series. Widened from the original four on
+#               2026-08-21. The criterion is not "has a benchmark" - it is that
+#               the measured work is CPU-BOUND, PER-ITEM, and carries a cost
+#               claim a chart can falsify:
+#                 1. deterministic compute, no disk, no network, no sleep, no
+#                    wall-clock dependence, or the series is runner noise;
+#                 2. cost paid per item on a hot path, so a regression
+#                    compounds instead of costing one startup;
+#                 3. a cost claim (allocation-free, bounded, linear) that
+#                    nothing else in the repo verifies.
+#               Enrolled: the four cost-contract libraries (xmlx, jsonx, ssrf,
+#               httpx) plus jsoncap (the JSON twin of xmlx, carved out of
+#               jsonx AFTER this workflow landed, so it matched the original
+#               criterion and was simply never added), the five pure-compute
+#               libraries that got benchmarks written for this widening
+#               (runesafe, pathinside, keyenc, langtag, urlform), and the four
+#               CPU-bound repos whose benchmarks already existed (metrics,
+#               slogx, web-terminal-engine, plex-language-sync).
+#
+# Next up:      plex-exporter QUALIFIES on all three tests and is deliberately
+#               NOT in the list yet. Its BenchmarkCollect is the nil-deref
+#               above, so enrolling it before that fix lands would fail the leg
+#               on the first run. Add it in the same change that lands the fix.
+#
+#               EXCLUDED, with the reason, so this is not re-litigated:
+#               - atomicfile, health, scheduler: every benchmark fsyncs, flocks
+#                 or stats a file. The runner's shared disk sets the number, not
+#                 the code.
+#               - auth: BenchmarkHashPassword/VerifyPassword measure Argon2id,
+#                 whose cost is a TUNED SECURITY PARAMETER. The tracker is
+#                 customSmallerIsBetter, so it alerts only on getting slower -
+#                 and for Argon2id the dangerous direction is FASTER (a lowered
+#                 cost parameter), which it structurally cannot see. Enrolling
+#                 it would publish a series whose only alerts are deliberate
+#                 hardening. Revisit if the run ever gains a per-repo -bench
+#                 filter, which would let its middleware and ratelimit
+#                 benchmarks in without the KDF.
+#               - cert-converter, docker-age, docker-fclones-scheduler: one
+#                 IO-shaped benchmark each (PEM on disk, file decrypt, report
+#                 decode).
+#               - arrapi, plexapi: network clients, RTT-dominated.
+#               - envx: parses the environment once at startup; a regression is
+#                 unobservable in production.
+#               - toolbelt, pinstall: install-time. wiregen: build-time.
+#               - webhttp: per-call cost is dominated by net/http itself and it
+#                 makes no cost claim of its own.
+#               - subflux (136 series) and vibekit (103): still deferred, and
+#                 the deferral is now quantitative - the two would add 239
+#                 series to 164, more than doubling the tracker before it has a
+#                 single week of history to calibrate the threshold against.
+#                 Enrol them once a real regression or a real false alert has
+#                 taught this tracker what its noise floor is.
 name: Weekly bench
 
 on:
@@ -92,10 +152,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The enrolled set. Deliberately narrower than "every repo with a
-          # benchmark": prove the tracker is trusted on the cost-contract
-          # libraries before fanning out to subflux (49) and vibekit (40).
-          ENROLLED="xmlx jsonx ssrf httpx"
+          # The enrolled set. The criterion and every exclusion are in the
+          # header block; keep the two in step when editing this list.
+          # Grouped by why each repo is here, not alphabetically.
+          ENROLLED="xmlx jsonx jsoncap ssrf httpx"                 # cost-contract libraries
+          ENROLLED="$ENROLLED runesafe pathinside keyenc langtag urlform"   # pure-compute libraries
+          ENROLLED="$ENROLLED metrics slogx web-terminal-engine"   # per-call hot paths
+          ENROLLED="$ENROLLED plex-language-sync"                  # CPU-bound app path
 
           # Forks are excluded fleet-wide (same rule as scripts/audit.py): a
           # fork's tree is UPSTREAM's, so its benchmarks measure someone else's
@@ -190,7 +253,10 @@ jobs:
     if: ${{ needs.fanout.outputs.matrix != '[]' }}
     strategy:
       fail-fast: false
-      max-parallel: 4   # Own day; 4 leaves 16 of the 20-job cap free
+      max-parallel: 4   # Own day; 4 leaves 16 of the 20-job cap free. 15 repos
+                        # is 4 waves at roughly 5 min a leg (the slowest,
+                        # urlform, is ~4.2 min of benchmarks at -count=10 plus
+                        # setup), so about 20 min wall for the whole run.
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
     runs-on: ubuntu-24.04
