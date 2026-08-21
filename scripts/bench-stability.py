@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Measure per-series benchmark stability, to decide enrolment on evidence.
+
+Why this exists
+---------------
+`weekly-bench.yaml` alerts at a fixed 150% threshold. That number is only
+meaningful against the NOISE FLOOR of each series, and the floor is a property
+of the individual benchmark, not of the repo it lives in. Measured across four
+cplieger repos (38 ns/op series, `-count=10` on one host, 2026-08-21):
+
+    allocs/op   coefficient of variation 0.00% on 38 of 38 series
+    B/op        0.00%, constant to within 1-5 bytes on the two that move
+    ns/op       median 8.6%, p90 24.6%, worst 43.7%
+
+So the two allocation metrics are EXACT and any movement in them is a real
+change, while ns/op can only carry a trend. At the median 8.6% the 150%
+threshold sits about 6 standard deviations out, which is why the workflow
+catches algorithmic regressions (multiples) and nothing finer; at the worst
+43.7% it sits about 1.1 sigma out, where the series can alert on noise alone.
+A series in that state is worse than absent, because a tracker that cries wolf
+is a tracker everyone learns to ignore.
+
+The published literature says the same thing and says not to guess it: across
+5 million data points in Java and Go, Laaber, Scheuner and Leitner measured
+per-benchmark coefficients of variation from 0.03% to over 100%
+(https://doi.org/10.1007/s10664-019-09681-1), and Laaber and Leitner found
+suites containing benchmarks at 50% or higher, concluding that not all
+benchmarks are useful for reliably discovering slowdowns. Bencher reports
+GitHub-hosted runners exceeding 30% variance against under 2% on bare metal
+(https://bencher.dev/docs/explanation/continuous-benchmarking/).
+
+Usage
+-----
+    go test -run='^$' -bench=. -benchmem -count=10 ./... > bench.txt
+    python3 bench-stability.py bench.txt              # one repo
+    python3 bench-stability.py *.txt --threshold 150  # several
+
+Exit status is 0 for a report and 1 when any series is too noisy for the
+threshold, so this can gate an enrolment change rather than only inform one.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import re
+import statistics
+import sys
+
+# Same shape bench-reduce.py parses, and the same GOMAXPROCS-suffix strip, so a
+# series named here is the series that reaches the chart.
+LINE = re.compile(r'^(Benchmark\S*)\s+(\d+)\s+(.*)$')
+METRIC = re.compile(r'([0-9.]+)\s+(ns/op|B/op|allocs/op)')
+
+# Below this many samples a coefficient of variation is not worth reporting.
+MIN_SAMPLES = 3
+
+# A threshold closer to the noise than this many standard deviations will fire
+# on noise. Three sigma is the conventional floor for calling a move real.
+MIN_SIGMA = 3.0
+
+
+def parse(text: str) -> dict[tuple[str, str], list[float]]:
+    """Collect every sample for each (benchmark, unit) pair."""
+    samples: dict[tuple[str, str], list[float]] = {}
+    for raw in text.splitlines():
+        m = LINE.match(raw.strip())
+        if not m:
+            continue
+        name = re.sub(r'-\d+$', '', m.group(1))
+        for value, unit in METRIC.findall(m.group(3)):
+            samples.setdefault((name, unit), []).append(float(value))
+    return samples
+
+
+def cov(values: list[float]) -> float:
+    """Coefficient of variation as a percentage.
+
+    A series whose mean is zero is a genuine constant (an allocation-free path),
+    which has no spread to express as a ratio; report 0 rather than dividing.
+    """
+    mean = statistics.fmean(values)
+    if mean == 0:
+        return 0.0
+    if len(values) < 2:
+        return 0.0
+    return statistics.stdev(values) / mean * 100
+
+
+def sigma_to_threshold(cov_pct: float, threshold_pct: float) -> float:
+    """How many standard deviations the alert threshold sits from the mean.
+
+    threshold_pct is the action's own alert-threshold percentage: 150 means the
+    alert fires at 1.5x, so the move it must clear is 50% of the mean.
+    """
+    if cov_pct == 0:
+        return math.inf
+    return (threshold_pct - 100) / cov_pct
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument('inputs', nargs='+', help='files of `go test -bench -count=N` output')
+    ap.add_argument(
+        '--threshold',
+        type=float,
+        default=150.0,
+        help="the workflow's alert-threshold percent (default 150)",
+    )
+    ap.add_argument('--quiet', action='store_true', help='summary only, no per-series table')
+    args = ap.parse_args()
+
+    per_unit: dict[str, list[float]] = {}
+    rows: list[tuple[float, str, str, str, int, float]] = []
+    short: dict[str, int] = {}
+
+    for path in args.inputs:
+        label = path.rsplit('/', 1)[-1].removesuffix('.txt')
+        with open(path, encoding='utf-8') as fh:
+            samples = parse(fh.read())
+        if not samples:
+            print(f'{path}: no Benchmark lines found', file=sys.stderr)
+            return 1
+        for (name, unit), values in sorted(samples.items()):
+            if len(values) < MIN_SAMPLES:
+                # Keyed by benchmark, not by (benchmark, unit), or every name
+                # repeats three times in the notice below.
+                short[f'{label}/{name}'] = len(values)
+                continue
+            c = cov(values)
+            per_unit.setdefault(unit, []).append(c)
+            rows.append((c, label, name, unit, len(values), statistics.median(values)))
+
+    if not rows:
+        n = len(short)
+        print(
+            f'None of the {n} benchmark(s) had at least {MIN_SAMPLES} samples, so no '
+            f'spread can be computed. Re-run with -count={MIN_SAMPLES} or higher '
+            f'(the tracker itself uses -count=10).',
+            file=sys.stderr,
+        )
+        return 1
+
+    if short and not args.quiet:
+        print(
+            f'Skipped {len(short)} benchmark(s) with fewer than {MIN_SAMPLES} samples '
+            f'(re-run with a larger -count):'
+        )
+        for name, n in sorted(short.items())[:5]:
+            print(f'  {name} ({n} sample(s))')
+        if len(short) > 5:
+            print(f'  ... and {len(short) - 5} more')
+        print()
+
+    print(f'{"unit":<11}{"series":>7}{"median":>9}{"p90":>9}{"worst":>9}{"exact":>9}{"  verdict"}')
+    for unit in ('ns/op', 'B/op', 'allocs/op'):
+        vals = sorted(per_unit.get(unit, []))
+        if not vals:
+            continue
+        p90 = vals[min(int(len(vals) * 0.9), len(vals) - 1)]
+        exact = sum(1 for v in vals if v == 0.0)
+        med = statistics.median(vals)
+        verdict = 'gate-grade (exact)' if max(vals) == 0.0 else 'trend-only'
+        print(
+            f'{unit:<11}{len(vals):>7}{med:>8.2f}%{p90:>8.2f}%{max(vals):>8.2f}%'
+            f'{f"{exact}/{len(vals)}":>9}  {verdict}'
+        )
+
+    ns = [c for c, _, _, u, _, _ in rows if u == 'ns/op']
+    if ns:
+        med = statistics.median(ns)
+        s = sigma_to_threshold(med, args.threshold)
+        print(
+            f'\nAt the median ns/op spread of {med:.2f}%, a {args.threshold:.0f}% alert sits '
+            f'{s:.1f} sigma out.'
+        )
+        print(
+            f'  It can see a regression of about {med * MIN_SIGMA:.0f}% or worse '
+            f'(3 sigma). Anything finer is inside the noise.'
+        )
+
+    noisy = sorted(
+        (
+            r
+            for r in rows
+            if r[3] == 'ns/op' and sigma_to_threshold(r[0], args.threshold) < MIN_SIGMA
+        ),
+        reverse=True,
+    )
+    if noisy:
+        print(
+            f'\nTOO NOISY for a {args.threshold:.0f}% threshold '
+            f'(under {MIN_SIGMA:.0f} sigma, so these can alert on noise alone):'
+        )
+        for c, label, name, _unit, n, med in noisy:
+            print(
+                f'  {c:>6.1f}% spread, {sigma_to_threshold(c, args.threshold):.1f} sigma  '
+                f'{label}/{name}  (median {med:,.0f} ns, {n} samples)'
+            )
+        print('  Give each more work per operation, or drop it from the chart.')
+
+    if not args.quiet:
+        print('\nNoisiest ns/op series:')
+        for c, label, name, _unit, _n, med in sorted(
+            (r for r in rows if r[3] == 'ns/op'), reverse=True
+        )[:10]:
+            print(f'  {c:>6.1f}%  {label}/{name}  (median {med:,.0f} ns)')
+
+    return 1 if noisy else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
