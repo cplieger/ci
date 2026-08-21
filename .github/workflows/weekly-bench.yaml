@@ -220,6 +220,10 @@ on:
         description: "Samples per benchmark (default 10; lower only for smoke-testing the runner)."
         required: false
         default: "10"
+      benchtime:
+        description: "go test -benchtime per sample (default 1s). Spread falls as 1/sqrt(iterations), so 3s buys about a 1.7x tighter series at 3x the wall time. Use this to tune sensitivity against the Stability report."
+        required: false
+        default: "1s"
 
 permissions:
   contents: read
@@ -391,17 +395,30 @@ jobs:
 
       # `-run='^$'` keeps the unit suite out of the timing. `-count` is the
       # sample size the reducer takes a median over; 10 is benchstat's own
-      # documented minimum for a statistically meaningful sample.
+      # documented minimum for a statistically meaningful sample. `-benchtime`
+      # sets the iterations inside each sample, and it is the knob that decides
+      # how fine a regression the tracker can see at all: spread falls as
+      # 1/sqrt(iterations per sample), so raising it tightens every series at
+      # once. Both are validated before use because both reach a shell.
       - name: Run benchmarks
         working-directory: app
         env:
           COUNT: ${{ github.event.inputs.count || '10' }}
+          BENCHTIME: ${{ github.event.inputs.benchtime || '1s' }}
         run: |
           set -euo pipefail
           case "$COUNT" in
             ''|*[!0-9]*) echo "::error::count must be a positive integer"; exit 1 ;;
           esac
-          go test -run='^$' -bench=. -benchmem -count="$COUNT" ./... \
+          # go test accepts a duration (1s, 500ms) or an exact iteration count
+          # (100x). Anything else is rejected here rather than reaching go test,
+          # since this value arrives from a dispatch input.
+          case "$BENCHTIME" in
+            *[!0-9smhx.]*|''|.|x) echo "::error::benchtime must be a duration (1s, 500ms) or an iteration count (100x)"; exit 1 ;;
+          esac
+          echo "count=$COUNT benchtime=$BENCHTIME"
+          go test -run='^$' -bench=. -benchmem \
+            -count="$COUNT" -benchtime="$BENCHTIME" ./... \
             | tee "$RUNNER_TEMP/bench-raw.txt"
 
       - name: Reduce to medians
