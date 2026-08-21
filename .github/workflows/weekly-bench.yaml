@@ -100,9 +100,16 @@ jobs:
           # Forks are excluded fleet-wide (same rule as scripts/audit.py): a
           # fork's tree is UPSTREAM's, so its benchmarks measure someone else's
           # code and its tracker issue would be unactionable.
+          # `tr` is load-bearing: jq emits one name per LINE, and the liveness
+          # test below is a space-delimited substring match. Without the
+          # flattening, `*" $r "*` never matches (a newline is not a space), so
+          # every enrolled repo was rejected as "not live", the matrix came out
+          # empty, the `run` job skipped, and the whole leg reported SUCCESS.
+          # It did that from the guard landing until 2026-08-21, which is why no
+          # repo ever grew a `benchmarks` branch.
           live=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
             [.[] | select(.isArchived == false and .isFork == false) | .name] | .[]
-          ')
+          ' | tr '\n' ' ')
 
           repos=""
           for r in $ENROLLED; do
@@ -110,6 +117,16 @@ jobs:
               echo "::warning::enrolled repo '$r' is not live (archived, fork, or renamed) - skipping" ;;
             esac
           done
+
+          # Fail closed when the whole enrolled set fails to resolve. ENROLLED
+          # is hardcoded, so "none of them are live" is a defect in this
+          # workflow or in discovery, never a legitimate weekly state - and it
+          # is the exact shape that made this leg vacuously green for weeks.
+          if [ -z "$repos" ]; then
+            echo "::error::no enrolled repo resolved against live discovery" \
+                 "(enrolled: ${ENROLLED}) - refusing to report a green leg"
+            exit 1
+          fi
 
           if [ -n "${ONLY:-}" ]; then
             wanted=" $(echo "$ONLY" | tr ',' ' ') "
@@ -141,7 +158,14 @@ jobs:
               echo "  skip ${r}: no benchmark functions"
               continue
             fi
-            sha=$(git -C scan rev-parse HEAD)
+            # Guarded for the same reason as weekly-stryker's copy: a clone that
+            # exits 0 with no resolvable HEAD makes rev-parse exit 128, and
+            # under `bash -e` that kills the fanout and every other repo's
+            # matrix entry with it. One skipped repo is the right blast radius.
+            if ! sha=$(git -C scan rev-parse HEAD 2>/dev/null); then
+              echo "::warning::cannot resolve HEAD for ${r} - skipping"
+              continue
+            fi
             echo "  include ${r} @ ${sha:0:12} (${n} files with benchmarks)"
             matrix=$(printf '%s' "$matrix" | jq -c \
               --arg r "$r" --arg s "$sha" '. + [{repo: $r, sha: $s}]')
@@ -150,6 +174,16 @@ jobs:
 
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
           echo "Total entries: $(printf '%s' "$matrix" | jq 'length')"
+
+          # An empty matrix skips the `run` job, which reports the leg green
+          # with nothing measured. Every remaining cause is worth a red run: a
+          # clone that failed, a repo that lost its benchmarks, or an `only`
+          # filter that matched no enrolled repo.
+          if [ "$(printf '%s' "$matrix" | jq 'length')" -eq 0 ]; then
+            echo "::error::matrix is empty after probing '${repos}'" \
+                 "- nothing would be benchmarked, failing instead of skipping"
+            exit 1
+          fi
 
   run:
     needs: fanout
