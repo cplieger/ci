@@ -303,6 +303,70 @@ jobs:
           benchmark-data-dir-path: .
           auto-push: true
           alert-threshold: "150%"
-          comment-on-alert: true
+          # comment-on-alert is OFF because the action cannot be told which repo
+          # to comment on: leaveComment resolves the target from
+          # github.context.repo (dist/src/write.js:136), which is cplieger/ci
+          # under Pattern C and is not overridable, since GitHub reserves the
+          # default GITHUB_* variables. So an alert about a consumer's
+          # performance would be filed as a commit comment on a cplieger/ci
+          # commit, where it is both misfiled and unread. summary-always puts
+          # the same comparison in this job's summary instead, which is where
+          # the run is already being looked at. Unlike the data point's commit,
+          # this one cannot be repaired afterwards - the comment is an API call,
+          # not a file.
+          comment-on-alert: false
+          summary-always: true
           fail-on-alert: false
           max-items-in-chart: 100
+
+      # The action stamps every data point with a cplieger/ci commit, because it
+      # resolves the repo it is acting on from github.context.repo and this
+      # workflow runs in ci while measuring a consumer. A chart whose points
+      # link to ci cannot attribute a regression to the change that caused it,
+      # which is the only reason the tracker exists, so the record is repaired
+      # here. Verified against the pinned v1.22.1 dist, not the README.
+      #
+      # Overriding GITHUB_REPOSITORY was tried first and CANNOT work (#494,
+      # reverted): GitHub reserves the default GITHUB_* variables, the runner's
+      # value wins at process level, and the step's rendered env block prints
+      # the override anyway, which makes the approach look verified when it is
+      # not. Passing the consumer's SHA as the action's `ref` without that
+      # redirect just asks ci for an object it does not have.
+      #
+      # bench-fix-attribution.py refuses to write unless the file is exactly the
+      # action's format and the newest entry carries this run's ci SHA, so a
+      # future format change fails this leg loudly instead of corrupting the
+      # series. Its round-trip is byte-identical, so a run that changes nothing
+      # produces no commit.
+      - name: Re-point the data point at the benchmarked commit
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          REPO: ${{ matrix.repo }}
+          SHA: ${{ matrix.sha }}
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+
+          git clone --quiet --depth 1 --branch benchmarks \
+            "https://x-access-token:${GH_TOKEN}@github.com/cplieger/${REPO}.git" \
+            "$work/data"
+          gh api "repos/cplieger/${REPO}/commits/${SHA}" > "$work/commit.json"
+
+          python3 _ci/scripts/bench-fix-attribution.py \
+            --data-file "$work/data/data.js" \
+            --expect-commit "$GITHUB_SHA" \
+            --commit-json "$work/commit.json" \
+            --repo-url "https://github.com/cplieger/${REPO}"
+
+          if git -C "$work/data" diff --quiet -- data.js; then
+            echo "data.js already correct - nothing to push"
+            exit 0
+          fi
+
+          git -C "$work/data" \
+            -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit --quiet -m "ci: attribute benchmark data to ${SHA}" -- data.js
+          git -C "$work/data" push --quiet origin benchmarks
+          echo "re-pointed ${REPO} benchmark data at ${SHA}"
