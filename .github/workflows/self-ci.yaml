@@ -18,3 +18,27 @@ permissions:
 jobs:
   ci:
     uses: ./.github/workflows/ci.yaml
+
+  # The two scripts that decide what mutation number every Go repo publishes
+  # weekly (scripts/gremlins-merge.py folds one gremlins result per Go module
+  # into the single per-attempt result the tracker/badge assume;
+  # scripts/gremlins-aggregate.py turns those into the issue body and badge).
+  # Nothing else executes them until Sunday 22:00 UTC, and the sibling stryker
+  # aggregate script sat broken here for weeks for exactly that reason — so run
+  # their probe on every push and PR. Not part of the `validate` check (that
+  # comes from the meta ci.yaml, which is consumer-facing); a failure here shows
+  # as a red check on the PR.
+  gremlins-scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Probe gremlins measurement scripts
+        run: python3 scripts/test-gremlins-scripts.py
