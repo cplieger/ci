@@ -56,6 +56,35 @@ jobs:
       - name: Install deps
         run: npm ci
 
+      # Vitest Browser Mode runs DOM tests in a real Chromium instead of a DOM
+      # emulator, which needs a browser binary plus the ~95 system libraries
+      # Chromium links against. Opt-in by the package's own
+      # `@vitest/browser-playwright` devDependency — the same
+      # presence-is-enrolment shape as the knip step above — so a package still
+      # on a DOM emulator, or with no DOM tests at all, pays nothing.
+      #
+      # Driven through the repo's own pinned `playwright` devDependency
+      # (`--no-install`), never a floating `npx playwright@latest`: the CLI and
+      # the library must be the same version or the browser build number the CLI
+      # downloads is not the one the library looks for.
+      #
+      # NOT `--only-shell`: the vitest configs opt into `channel: "chromium"`,
+      # Chromium's newer headless mode, which is the real browser rather than the
+      # separate headless-shell build, so a behavior verified in CI is the
+      # behavior a user gets.
+      #
+      # Placed OUTSIDE the soft-gate block below on purpose. This is setup, not a
+      # check: a browser that fails to install is a broken job, and letting the
+      # test step then run against a missing binary would report the failure
+      # against the wrong name.
+      - name: Install browser (vitest browser mode)
+        run: |
+          if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
+            npx --no-install playwright install --with-deps chromium
+          else
+            echo "no @vitest/browser-playwright devDependency; skipping browser install"
+          fi
+
       # Soft-gate block: each step below runs to completion (continue-on-error)
       # and records its own name to /tmp/_ci_failures on failure; the final
       # "Check results" step fails the job if that file exists. CONTRACT: any
