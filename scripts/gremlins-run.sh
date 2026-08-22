@@ -67,10 +67,41 @@ if [ "${WORKERS_MAX}" -gt 1 ]; then
   # timing out on a cold module cache.
   go mod download || echo "::warning::go mod download failed before the concurrency probe; letting gremlins report it"
 
-  if timeout "${PROBE_TIMEOUT}" go test -count=1 ./... >/tmp/probe-solo.log 2>&1; then
-    timeout "${PROBE_TIMEOUT}" go test -count=1 ./... >/tmp/probe-a.log 2>&1 &
+  # Probe in COPIES of the module tree, the way gremlins runs workers, for two
+  # reasons. First, the probe must not leave debris in the tree gremlins is
+  # about to mutate: a test that writes inside its own package directory would
+  # otherwise dirty /work/<module> before the run, and gremlins copies that tree
+  # to every worker. Second, two runs in ONE tree can collide over an in-tree
+  # path that would never collide under gremlins, where each worker has its own
+  # copy — a narrow window rather than a measured problem (a three-test fixture
+  # writing a fixed in-tree file did not reproduce it), but the copies close it
+  # for free. What the copies deliberately keep sharing is /tmp, because that is
+  # the actual hazard.
+  #
+  # The solo baseline runs in a copy too: a module that only builds in place (a
+  # relative `replace`, say) then fails the solo phase and skips the probe,
+  # instead of failing the concurrent phase and looking like interference.
+  probe_a=/tmp/probe-tree-a
+  probe_b=/tmp/probe-tree-b
+  mkdir -p "${probe_a}" "${probe_b}"
+  cp -a . "${probe_a}/"
+  cp -a . "${probe_b}/"
+
+  if (cd "${probe_a}" && timeout "${PROBE_TIMEOUT}" go test -count=1 ./...) >/tmp/probe-solo.log 2>&1; then
+    # Stagger the second run by a second. This is what makes the probe work:
+    # the failure mode is one process's CLEANUP landing inside another's poll or
+    # read, and two suites started together stay in near-lockstep, so their
+    # write/read/cleanup phases align instead of interleaving. Measured on two
+    # fixtures modelled on docker-rsync-scheduler (three tests creating,
+    # polling and removing a fixed /tmp marker): simultaneous starts detected
+    # the collision in 1 and 2 of 5 runs, a 1-second offset in 5 of 5 for both.
+    # Under gremlins the same rare window gets hit anyway, because it runs the
+    # suite once per mutant — hundreds of times, from workers that are never in
+    # step. The probe only gets one shot, so it has to buy its sensitivity.
+    (cd "${probe_a}" && timeout "${PROBE_TIMEOUT}" go test -count=1 ./...) >/tmp/probe-a.log 2>&1 &
     pa=$!
-    timeout "${PROBE_TIMEOUT}" go test -count=1 ./... >/tmp/probe-b.log 2>&1 &
+    sleep 1
+    (cd "${probe_b}" && timeout "${PROBE_TIMEOUT}" go test -count=1 ./...) >/tmp/probe-b.log 2>&1 &
     pb=$!
     ra=0
     wait "${pa}" || ra=$?
@@ -84,7 +115,7 @@ if [ "${WORKERS_MAX}" -gt 1 ]; then
     elif [ "${ra}" -ne 0 ] || [ "${rb}" -ne 0 ]; then
       workers=1
       export GOMEMLIMIT="${GOMEM_SOLO_MB}MiB"
-      echo "::warning::suite passes alone but fails when two copies run at once (exit ${ra}/${rb})"
+      echo "::warning::suite passes in one tree copy but fails when two copies run at once (exit ${ra}/${rb})"
       echo "::warning::forcing --workers 1: cross-worker interference reports false KILLs, not lost mutants"
       grep -hE "FAIL|panic:" /tmp/probe-a.log /tmp/probe-b.log | head -20 || true
     else
@@ -95,6 +126,7 @@ if [ "${WORKERS_MAX}" -gt 1 ]; then
     # coverage pass next and reports it as the error it is.
     echo "::warning::suite does not pass on its own; skipping the concurrency probe, keeping ${WORKERS_MAX} workers"
   fi
+  rm -rf "${probe_a}" "${probe_b}"
 fi
 
 echo "workers=${workers} GOMEMLIMIT=${GOMEMLIMIT} module=$(pwd)"
