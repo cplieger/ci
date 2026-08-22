@@ -234,8 +234,11 @@ def aggregate(attempt_files: list[Path]) -> dict:
         }
 
     # Per-run figures come straight from gremlins' own top-level fields, so the
-    # rolling history matches what gremlins reports (TIMED_OUT is already folded
-    # into killed by gremlins' efficacy calculation).
+    # rolling history matches what gremlins reports. Note what those fields do
+    # NOT include: gremlins counts `mutants_total` as killed+lived+not_viable and
+    # computes efficacy as killed/(killed+lived), so a TIMED OUT mutant appears
+    # in `files[]` but in neither the numerator nor the denominator — it is
+    # excluded, not folded into killed (gremlins internal/report).
     per_attempt = []
     for s in summaries:
         per_attempt.append({
