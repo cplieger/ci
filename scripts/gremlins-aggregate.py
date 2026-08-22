@@ -300,8 +300,7 @@ Auto-updated weekly by [`cplieger/ci/.github/workflows/weekly-gremlins.yaml`](ht
 Last update: {week_ending}
 
 **This week**: {eff_mean}% efficacy (±{eff_stddev}% across {attempts} runs), {cov_mean}% mutant coverage. {live_count} confirmed live mutant{plural}.
-{trend_line}
-
+{trend_line}{caution_lines}
 ## Rolling 12-week history
 """
 
@@ -345,6 +344,12 @@ mutant LIVED in** (N = attempts that week, normally 3):
 
 The `mutation-regression` label is added when this week's mean efficacy drops
 >5% below the rolling 12-week mean.
+
+A ⚠️ line under "This week" means the number describes the measurement, not the
+suite: either the attempts disagreed about which mutants survive (one verdict per
+disagreement is false), or the score jumped to a flawless 100% from a week with
+live mutants. Equivalent mutants are a permanent noise floor, so a reproducible
+100% is not something a test suite can reach.
 
 ## Free-form notes
 
@@ -489,6 +494,58 @@ def trend_marker(mean: float, history_means: list[float]) -> str:
     return f"**Trend**: {symbol} {delta:+.1f}% from {ROLLING_WEEKS}-week mean ({rolling:.1f}%)."
 
 
+def measurement_cautions(agg: dict, history_live_counts: list[int]) -> list[str]:
+    """Lines warning that this week's number measures the harness, not the suite.
+
+    Equivalent mutants — semantically-no-op mutations that no test can catch —
+    are a permanent noise floor on every repo, so a suite CANNOT reach a
+    reproducible 100%. Two shapes therefore mean "measurement failure", and both
+    are computable from data already in hand rather than needing a new alerting
+    path:
+
+    1. The attempts disagree about which mutants survive. A mutant reported
+       LIVED in one run and KILLED in another has one verdict that is false. It
+       can be a flaky test, and it can equally be cross-worker interference:
+       gremlins workers each get their own copy of the module tree but share the
+       container's /tmp, so a test bound to a fixed absolute path can delete a
+       marker another worker is polling for. Measured on
+       docker-rsync-scheduler: three provably equivalent live mutants, three
+       attempts, a DIFFERENT single survivor each time — six of nine verdicts
+       false.
+    2. A flawless week straight after a week with live mutants. Same repo's
+       2026-07-20 / 07-27 / 08-10 weeks each published 100.0% while its three
+       equivalent mutants were still there; the perfect score was the defect
+       hiding itself.
+    """
+    lines = []
+    n = agg["n_runs"]
+    unstable = sum(len(v) for k, v in (agg["live_buckets"] or {}).items() if 0 < k < n)
+    if n > 1 and unstable:
+        lines.append(
+            f"> ⚠️ **Verdicts disagree across attempts.** {unstable} mutant"
+            f"{'' if unstable == 1 else 's'} came back LIVED in some of the {n} runs and KILLED in "
+            "others, so one verdict per disagreement is false and the mean is partly noise. Either a "
+            "flaky test, or cross-worker interference in the runner — gremlins workers share one "
+            "`/tmp`, so a test bound to a fixed absolute path can delete a marker another worker is "
+            "polling for (the weekly runner probes for that and drops to `--workers 1` when it "
+            "reproduces). Equivalent mutants cannot all be killed, so a 100% attempt next to a "
+            "survivor in another attempt is a measurement failure, not a perfect score."
+        )
+    if (
+        agg["efficacy_mean"] >= 99.95
+        and agg["live_count"] == 0
+        and history_live_counts
+        and history_live_counts[0] > 0
+    ):
+        lines.append(
+            f"> ⚠️ **A jump to 100% efficacy.** Last week reported {history_live_counts[0]} live "
+            "mutant(s) and this week reports none. Absent a change to the tests, that is evidence of "
+            "a measurement failure rather than a fixed suite: equivalent mutants cannot all be "
+            "killed. Check the run's per-attempt logs before believing the score."
+        )
+    return lines
+
+
 def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> tuple[str, bool]:
     """Returns (new_body, regression_flag)."""
     # Build new rolling-history row.
@@ -500,8 +557,11 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
     new_row = f"| {week} | {eff_mean}% | ±{eff_stddev}% | {cov_mean}% | {live_count} |"
     history_block, _prev_mean = update_history_block(existing, new_row, eff_mean)
 
-    # Get all historical means for trend marker.
+    # Get all historical means for trend marker, plus each week's live-mutant
+    # count (column 5) — a week that drops from live mutants to a flawless 100%
+    # is the second measurement-failure shape (see measurement_cautions).
     history_means = []
+    history_live_counts = []
     if existing:
         m = re.search(r"<!-- gremlins-data -->(.*?)<!-- /gremlins-data -->", existing, re.DOTALL)
         if m:
@@ -513,8 +573,15 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
                             history_means.append(float(cells[1].rstrip("%")))
                         except ValueError:
                             continue
+                    if len(cells) >= 5:
+                        try:
+                            history_live_counts.append(int(cells[4]))
+                        except ValueError:
+                            pass
 
     trend_line = trend_marker(eff_mean, history_means)
+    cautions = measurement_cautions(agg, history_live_counts)
+    caution_lines = ("\n" + "\n".join(cautions) + "\n") if cautions else "\n"
 
     # Live mutants section, frequency-bucketed (rare-first, most actionable).
     live_block_inner, overflow = render_bucketed_live_mutants(
@@ -545,6 +612,7 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
         live_count=live_count,
         plural="" if live_count == 1 else "s",
         trend_line=trend_line,
+        caution_lines=caution_lines,
     )
 
     # Preserve any free-form notes outside the sentinel blocks.
