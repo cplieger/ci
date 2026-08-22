@@ -448,8 +448,35 @@ def render_bucketed_live_mutants(buckets: dict[int, list[dict]], n_runs: int, ca
     return "\n".join(parts), overflow_total
 
 
-def update_history_block(existing: str, new_row: str, mean_for_trend: float) -> tuple[str, float]:
-    """Update the rolling 12-week table block. Returns (block, prev_mean for delta)."""
+RUN_MARKER_RE = re.compile(r"<!--\s*run:(\d+)\s*-->")
+
+
+def run_id_of(run_url: str) -> str:
+    """The workflow run id from a run URL, or '' when it cannot be read.
+
+    The row's own timestamp cannot identify the run that wrote it: it is
+    `date -u` taken inside the aggregate step, so a retry stamps a different
+    time for the SAME run (measured: run 28756935137 wrote 2026-07-06 01:31 on
+    attempt 1 and 2026-07-07 23:28 on attempt 2). The id is what makes a
+    re-aggregate idempotent.
+    """
+    m = re.search(r"/runs/(\d+)", run_url or "")
+    return m.group(1) if m else ""
+
+
+def update_history_block(
+    existing: str, new_row: str, mean_for_trend: float, run_id: str = ""
+) -> tuple[str, float]:
+    """Update the rolling 12-week table block. Returns (block, prev_mean for delta).
+
+    A run contributes ONE row. This job is a dependent of `run` with
+    `if: always()`, so re-running a failed matrix entry re-runs it too, and
+    every such re-run used to prepend a second row for one run — 21 repos
+    gained one from run 28756935137. Both attempts aggregate the SAME artifacts
+    for every entry that did not re-run, so the extra row is one measurement
+    counted twice in the rolling mean. Rows carry their run id and a
+    re-aggregate REPLACES its own row rather than adding one.
+    """
     rows = []
     if existing:
         m = re.search(r"<!-- gremlins-data -->(.*?)<!-- /gremlins-data -->", existing, re.DOTALL)
@@ -457,6 +484,16 @@ def update_history_block(existing: str, new_row: str, mean_for_trend: float) -> 
             for line in m.group(1).splitlines():
                 if re.match(r"^\| 20\d{2}-", line):
                     rows.append(line.rstrip())
+
+    # Drop this run's own earlier row before computing the delta, so a retry
+    # compares against the PREVIOUS run rather than against itself. A row with
+    # no marker predates this scheme and is always kept.
+    if run_id:
+        rows = [
+            r
+            for r in rows
+            if (own := RUN_MARKER_RE.search(r)) is None or own.group(1) != run_id
+        ]
 
     prev_mean = 0.0
     if rows:
@@ -474,7 +511,12 @@ def update_history_block(existing: str, new_row: str, mean_for_trend: float) -> 
     # new_row already ends in " |" (its closing Live-mutants cell). Append the
     # delta as its OWN cell — do NOT strip the trailing pipe, or the delta fuses
     # into the Live-mutants column and the row loses a column (see issue #4).
+    # The run marker goes AFTER the closing pipe for the same reason: it must
+    # add a trailing cell, never shift an index a reader uses (cells[1] for the
+    # mean, cells[4] for the live count).
     new_row_with_delta = new_row.rstrip() + f" {delta_str} |"
+    if run_id:
+        new_row_with_delta += f" <!-- run:{run_id} -->"
 
     rows.insert(0, new_row_with_delta)
     rows = rows[:ROLLING_WEEKS]
@@ -563,7 +605,7 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
     live_count = agg["live_count"]
 
     new_row = f"| {week} | {eff_mean}% | ±{eff_stddev}% | {cov_mean}% | {live_count} |"
-    history_block, _prev_mean = update_history_block(existing, new_row, eff_mean)
+    history_block, _prev_mean = update_history_block(existing, new_row, eff_mean, run_id_of(run_url))
 
     # Split the history rows into cells once. The two readers below want
     # different things from them, and only one of the two is positional.

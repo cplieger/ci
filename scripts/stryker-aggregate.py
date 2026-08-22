@@ -224,8 +224,32 @@ def render_bucket(title: str, mutants: list[dict], cap: int, open_attr: str) -> 
     return block, overflow
 
 
-def update_history_block(existing: str, new_row_cells: str, score: float) -> str:
-    """Roll the 12-week table forward; delta computed vs the previous top row."""
+RUN_MARKER_RE = re.compile(r'<!--\s*run:(\d+)\s*-->')
+
+
+def run_id_of(run_url: str) -> str:
+    """The workflow run id from a run URL, or '' when it cannot be read.
+
+    The row's own timestamp cannot identify the run that wrote it: it is
+    `date -u` taken inside the aggregate step, so a retry stamps a different
+    minute for the SAME run. The id is what makes a re-aggregate idempotent.
+    """
+    m = re.search(r'/runs/(\d+)', run_url or '')
+    return m.group(1) if m else ''
+
+
+def update_history_block(existing: str, new_row_cells: str, score: float, run_id: str = '') -> str:
+    """Roll the 12-week table forward; delta computed vs the previous top row.
+
+    A run contributes ONE row. The aggregate job is a dependent of `run` with
+    `if: always()`, so re-running a failed matrix entry re-runs the aggregate
+    too, and every such re-run used to prepend a second row for one run: nine
+    repos gained a duplicate on 2026-08-22 (stryker run 32570714460) and 21 on
+    2026-07-07 (gremlins run 28756935137). Both attempts aggregate the SAME
+    artifacts for every entry that did not re-run, so the extra row is one
+    measurement counted twice in the rolling mean. Rows therefore carry their
+    run id and a re-aggregate REPLACES its own row rather than adding one.
+    """
     rows = []
     if existing:
         m = re.search(r'<!-- stryker-data -->(.*?)<!-- /stryker-data -->', existing, re.DOTALL)
@@ -233,6 +257,13 @@ def update_history_block(existing: str, new_row_cells: str, score: float) -> str
             for line in m.group(1).splitlines():
                 if re.match(r'^\| 20\d{2}-', line):
                     rows.append(line.rstrip())
+
+    # Drop this run's own earlier row before computing the delta, so a retry
+    # compares against the PREVIOUS run rather than against itself. A row with
+    # no marker predates this scheme and is always kept.
+    if run_id:
+        rows = [r for r in rows
+                if (own := RUN_MARKER_RE.search(r)) is None or own.group(1) != run_id]
 
     prev_score = None
     if rows:
@@ -246,7 +277,12 @@ def update_history_block(existing: str, new_row_cells: str, score: float) -> str
     delta_str = f'{score - prev_score:+.1f}%' if prev_score is not None else '—'
     # new_row_cells ends in " |"; append the delta as its OWN cell (the
     # gremlins tracker once fused it into the previous column — issue #4).
-    rows.insert(0, new_row_cells.rstrip() + f' {delta_str} |')
+    # The run marker goes AFTER the closing pipe, so it adds a trailing cell
+    # rather than shifting any index a reader uses (cells[1], cells[4]).
+    row = new_row_cells.rstrip() + f' {delta_str} |'
+    if run_id:
+        row += f' <!-- run:{run_id} -->'
+    rows.insert(0, row)
     rows = rows[:ROLLING_WEEKS]
     return DATA_BLOCK_TPL.format(rows='\n'.join(rows))
 
@@ -280,7 +316,7 @@ def build_body(week: str, agg: dict, run_url: str, existing: str) -> tuple[str, 
     score, cov, surviving = agg['score'], agg['mutant_coverage'], agg['surviving']
 
     new_row = f'| {week} | {score}% | {cov}% | {surviving} |'
-    history_block = update_history_block(existing, new_row, score)
+    history_block = update_history_block(existing, new_row, score, run_id_of(run_url))
     history = history_scores(existing)
     trend_line = trend_marker(score, history)
 
