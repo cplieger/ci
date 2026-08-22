@@ -586,7 +586,11 @@ def main() -> int:
                    help="Write 'true' or 'false' here for the workflow to read")
     p.add_argument("--badge-file", type=Path, default=None,
                    help="Write a shields `endpoint` JSON (label 'mutation', "
-                        "message '<efficacy_mean>%') here for the README badge")
+                        # Escaped: argparse validates help strings as %-format
+                        # templates (Python 3.14 raises ValueError on a bare %,
+                        # which took the whole script down before it parsed a
+                        # single argument — the runner is on 3.12 today).
+                        "message '<efficacy_mean>%%') here for the README badge")
     p.add_argument("--attempts-marker-file", type=Path, default=None,
                    help="Write the count of parseable attempts here. The "
                         "workflow reads it to skip publishing for a repo whose "
