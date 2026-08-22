@@ -122,8 +122,58 @@ jobs:
       - name: Clone target repo
         run: gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
 
-      - name: Sync central .gremlins.yaml (authoritative for the weekly run)
+      - name: Discover Go modules to measure
+        id: modules
         run: |
+          set -euo pipefail
+          # `gremlins unleash .` measures exactly ONE module: it gathers coverage
+          # with `go test -cover ./...` at the module root, then strips the module
+          # path off each coverage line to key blocks by repo-relative filename
+          # (gremlins internal/coverage: removeModuleFromPath). A NESTED module's
+          # packages carry a different module path AND cannot be run by a root
+          # `go test ./...` at all, so gremlins still ANALYSES their files (it
+          # walks the tree) but every mutant there comes back NOT COVERED
+          # regardless of that module's own suite. Measured on envx: `yamlenv`
+          # (own go.mod, own suite at 98.6% coverage) contributed 43 analysed /
+          # 43 uncovered / 0 killed / 0 lived, which is what made 41.4% the
+          # fleet's lowest mutant coverage — a module boundary, not a test suite.
+          #
+          # So run gremlins once per module and merge the results (see the run
+          # step). Cost: one extra gremlins pass per nested module, sequential
+          # inside the 350-minute job budget. Nested modules are rare and small
+          # in this fleet; a repo that grows a large one is the case to watch.
+          #
+          # Eligibility mirrors ci.yaml's detect step (VALIDATION semantics, not
+          # release-lane semantics): prune vendored/generated trees, require
+          # tracked .go files, and keep internal/ and dotless-path modules —
+          # they compile and test like any module, they are only excluded from
+          # release LANES. A sentinel go.mod with no Go source (web-terminal
+          # -engine's `module web-ignore`) has nothing to mutate and drops out on
+          # the tracked-.go-files filter. Keep in sync with ci.yaml's detect step.
+          MODULES="."
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            d=$(dirname "$f")
+            case "$d" in
+              *[!A-Za-z0-9._/-]*)
+                echo "::error::nested go.mod dir '$d' contains characters outside [A-Za-z0-9._/-]"
+                exit 1 ;;
+            esac
+            if [ -z "$(git -C target ls-files "$d/*.go" | head -1)" ]; then
+              echo "  skip:    ${d} (no tracked .go files — nothing to mutate)"
+              continue
+            fi
+            MODULES="${MODULES} ${d}"
+            echo "  measure: ${d} ($(awk '$1=="module"{print $2; exit}' "target/$f"))"
+          done < <(git -C target ls-files '*/go.mod' | grep -Ev '(^|/)(node_modules|vendor|testdata|static|dist)/' || true)
+          echo "modules=${MODULES}" >> "$GITHUB_OUTPUT"
+          echo "modules to measure: ${MODULES}"
+
+      - name: Sync central .gremlins.yaml (authoritative for the weekly run)
+        env:
+          MODULES: ${{ steps.modules.outputs.modules }}
+        run: |
+          set -euo pipefail
           # Always overwrite with the central policy so the weekly run uses the
           # canonical exclude-list regardless of what each consumer has
           # committed. The committed per-repo copies (kept in sync by
@@ -131,9 +181,42 @@ jobs:
           # not. "centralization is the point" — see configs/gremlins.yaml.
           # Copied from this run's own checkout (same commit as the workflow),
           # not fetched from raw main at run time.
-          cp configs/gremlins.yaml target/.gremlins.yaml
+          #
+          # One copy PER MODULE: gremlins resolves .gremlins.yaml from the module
+          # root of its working directory (its config search path ends at
+          # findModuleRoot()), so a nested module's run would otherwise fall
+          # through to gremlins' defaults and mutate files the central
+          # exclude-list rules out. Injecting per-repo entries into these copies
+          # is still not a thing we do — the exclusions stay central.
+          for m in $MODULES; do
+            cp configs/gremlins.yaml "target/${m}/.gremlins.yaml"
+          done
 
+      # MEMORY CONTAINMENT VIA A DOCKER CGROUP. Mutation is precisely the act of
+      # turning a bounded size/loop into an unbounded one, so some mutant WILL
+      # allocate without limit (a boundary mutant on a make() size, an append in
+      # a now-infinite loop, …). Measured on subflux: a single worker hit ~14 GiB
+      # on one internal/server mutant. GOMEMLIMIT is a SOFT heap target and does
+      # not stop a single large LIVE allocation, so it cannot prevent this;
+      # worker count is irrelevant (1 worker OOMs just the same). Run bare on the
+      # host, that runaway trips the kernel OOM-killer on the whole VM, which
+      # nondeterministically reaps either the test (run continues) or the runner
+      # agent (job dies, "received a shutdown signal") — every subflux shard
+      # failed this way at 33/38/81 min, at 4 AND at 2 workers.
+      #
+      # Fix: run gremlins INSIDE a container capped at 80% of MemAvailable. A
+      # runaway now busts the CONTAINER cgroup, whose OOM-killer reaps the
+      # biggest task (the runaway test) while gremlins keeps going and records it
+      # (verified: a 1- and 2-worker capped run survive the ~14 GiB mutant and
+      # complete). The runner agent lives OUTSIDE the container, so the worst
+      # case is a clean step failure, never a runner shutdown. Workers are
+      # bounded by memory (heap + compile/link toolchain per worker): 2 on a
+      # 16 GB runner — low enough that the OOM-killer's victim is unambiguous —
+      # and auto-scaling on bigger runners (where the runaway simply fits under
+      # the larger cap).
       - name: Run gremlins (attempt ${{ matrix.attempt }})
+        env:
+          MODULES: ${{ steps.modules.outputs.modules }}
         run: |
           set -uo pipefail
           # gremlins exits 0 on success regardless of efficacy (threshold=0); a
@@ -141,39 +224,8 @@ jobs:
           # Surface that as a RED cell — fail-fast is off, so one bad repo doesn't
           # cancel the others, and the upload step (if: always()) still ships an
           # artifact downstream.
-          #
-          # MEMORY CONTAINMENT VIA A DOCKER CGROUP. Mutation is precisely the act
-          # of turning a bounded size/loop into an unbounded one, so some mutant
-          # WILL allocate without limit (a boundary mutant on a make() size, an
-          # append in a now-infinite loop, …). Measured on subflux: a single
-          # worker hit ~14 GiB on one internal/server mutant. GOMEMLIMIT is a
-          # SOFT heap target and does not stop a single large LIVE allocation, so
-          # it cannot prevent this; worker count is irrelevant (1 worker OOMs
-          # just the same). Run bare on the host, that runaway trips the kernel
-          # OOM-killer on the whole VM, which nondeterministically reaps either
-          # the test (run continues) or the runner agent (job dies, "received a
-          # shutdown signal") — every subflux shard failed this way at 33/38/81
-          # min, at 4 AND at 2 workers.
-          #
-          # Fix: run gremlins INSIDE a container capped at 80% of MemAvailable. A
-          # runaway now busts the CONTAINER cgroup, whose OOM-killer reaps the
-          # biggest task (the runaway test) while gremlins keeps going and
-          # records it (verified: a 1- and 2-worker capped run survive the ~14
-          # GiB mutant and complete). The runner agent lives OUTSIDE the
-          # container, so the worst case is a clean step failure, never a runner
-          # shutdown. Workers are bounded by memory (heap + compile/link
-          # toolchain per worker): 2 on a 16 GB runner — low enough that the
-          # OOM-killer's victim is unambiguous — and auto-scaling on bigger
-          # runners (where the runaway simply fits under the larger cap).
           # renovate: datasource=github-releases depName=go-gremlins/gremlins
           GREMLINS_VERSION=v0.6.0
-
-          # Go toolchain image from the target's go.mod (a `toolchain` line wins
-          # over the `go` line); fall back to the minor tag if the patch tag is
-          # missing, then to a sane default.
-          gover=$(grep -oP '^(toolchain go|go )\K[0-9]+\.[0-9]+(\.[0-9]+)?' target/go.mod | tail -1)
-          image="golang:${gover:-1.26}"
-          docker pull "$image" 2>/dev/null || { image="golang:${gover%.*}"; docker pull "$image"; }
 
           # Memory-aware sizing, computed on the host and passed into the
           # container. cap_mb is BOTH the container memory ceiling and the budget
@@ -188,26 +240,39 @@ jobs:
           workers=$(( nproc_n < max_by_mem ? nproc_n : max_by_mem ))
           gomem_mb=$(( (cap_mb - workers * toolchain_mb) / workers ))
           [ "$gomem_mb" -lt "$heap_min_mb" ] && gomem_mb=$heap_min_mb
-          echo "image=${image} workers=${workers} (nproc=${nproc_n}, mem-cap=${max_by_mem})"
+          echo "workers=${workers} (nproc=${nproc_n}, mem-cap=${max_by_mem})"
           echo "GOMEMLIMIT=${gomem_mb}MiB container=${cap_mb}MiB (MemAvailable=${avail_kb}KiB)"
 
           rc=0
-          docker run --rm \
-            --memory="${cap_mb}m" --memory-swap="${cap_mb}m" \
-            -v "${PWD}/target":/work -w /work \
-            -e GOMEMLIMIT="${gomem_mb}MiB" \
-            -e GREMLINS_VERSION="${GREMLINS_VERSION}" \
-            -e WORKERS="${workers}" \
-            "${image}" bash -euo pipefail -c '
-              # File first, then extract: --retry does not cover a mid-transfer
-              # receive failure, and --retry-all-errors cannot retry into a pipe.
-              curl -fsSL --connect-timeout 10 --max-time 60 \
-                --retry 7 --retry-max-time 150 --retry-all-errors \
-                -o /tmp/gremlins.tgz \
-                "https://github.com/go-gremlins/gremlins/releases/download/${GREMLINS_VERSION}/gremlins_${GREMLINS_VERSION#v}_linux_amd64.tar.gz"
-              tar -xzf /tmp/gremlins.tgz -C /usr/local/bin gremlins
-              gremlins unleash --workers "${WORKERS}" --output /work/gremlins-out.json .
-            ' || rc=$?
+          MERGE_ARGS=()
+          for m in $MODULES; do
+            echo "::group::gremlins ${{ matrix.repo }} module ${m}"
+            # Go toolchain image from THAT module's go.mod (a `toolchain` line
+            # wins over the `go` line); fall back to the minor tag if the patch
+            # tag is missing, then to a sane default. Per module, because a
+            # nested module may require a newer Go than the root — ci.yaml pins
+            # each nested module to its own go.mod for the same reason.
+            gover=$(grep -oP '^(toolchain go|go )\K[0-9]+\.[0-9]+(\.[0-9]+)?' "target/${m}/go.mod" | tail -1)
+            image="golang:${gover:-1.26}"
+            docker pull "$image" 2>/dev/null || { image="golang:${gover%.*}"; docker pull "$image"; }
+            echo "image=${image}"
+
+            docker run --rm \
+              --memory="${cap_mb}m" --memory-swap="${cap_mb}m" \
+              -v "${PWD}/target":/work \
+              -v "${PWD}/scripts/gremlins-run.sh":/gremlins-run.sh:ro \
+              -w "/work/${m}" \
+              -e GREMLINS_VERSION="${GREMLINS_VERSION}" \
+              -e GOMEMLIMIT="${gomem_mb}MiB" \
+              -e WORKERS="${workers}" \
+              -e OUT="/work/${m}/gremlins-out.json" \
+              "${image}" bash /gremlins-run.sh || rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              break
+            fi
+            MERGE_ARGS+=(--module "${m}=target/${m}/gremlins-out.json")
+          done
 
           # Hand the result to the badge/aggregate jobs, which read /tmp.
           if [ "$rc" -ne 0 ]; then
@@ -217,12 +282,22 @@ jobs:
             echo "::error::gremlins failed for ${{ matrix.repo }} (attempt ${{ matrix.attempt }}), exit ${rc}"
             exit "$rc"
           fi
-          if [ -s target/gremlins-out.json ]; then
-            sudo cp target/gremlins-out.json /tmp/gremlins-out.json
-          else
-            # Defensive: clean exit, no file => "no mutants"; a minimal
-            # {"files":[]} parses as a 0-mutant result (load_run zero-fills).
-            echo '{"files":[]}' > /tmp/gremlins-out.json
+
+          # Fold the per-module results into the ONE result per attempt that
+          # gremlins-aggregate.py, the badge and the tracker issue are built on,
+          # so the repo keeps a single published number and that number covers
+          # every module. The script sums counters and re-derives the percentages
+          # with gremlins' own formulas (a mean of per-module percentages would
+          # let a 3-mutant module outweigh a 300-mutant one), drops the root
+          # run's uncovered copies of nested files, and refuses to write a number
+          # when an input's totals disagree with its own mutant list. A missing
+          # per-module file is a zero-mutant module — gremlins writes no report
+          # when it finds none, which is the "clean exit, no file" case this step
+          # used to handle inline.
+          if ! python3 scripts/gremlins-merge.py --out /tmp/gremlins-out.json "${MERGE_ARGS[@]}"; then
+            echo '{"gremlins_error": true}' > /tmp/gremlins-out.json
+            echo "::error::merging per-module gremlins results failed for ${{ matrix.repo }} (attempt ${{ matrix.attempt }})"
+            exit 1
           fi
 
       - name: Upload full mutants.json (artifact, 90-day retention)
