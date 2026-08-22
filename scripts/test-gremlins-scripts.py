@@ -380,6 +380,88 @@ def test_aggregate_consumes_merged_output(tmp: Path) -> None:
           detail=badge.read_text() if badge.exists() else 'missing')
 
 
+def test_aggregate_flags_disagreeing_verdicts(tmp: Path) -> None:
+    """docker-rsync-scheduler's signature: three attempts, three different survivors.
+
+    All three of its live mutants are equivalent, so none can be killed; each
+    attempt nonetheless reported a different single survivor and called the other
+    two killed. The mean is then noise, and a 100% week is a measurement failure
+    rather than a perfect score, so the body must say so.
+    """
+    art = tmp / 'artifacts-flaky'
+    survivors = ['a.go', 'b.go', 'c.go']
+    for attempt, lived_in in enumerate(survivors, start=1):
+        d = art / f'gremlins-rsync-{attempt}'
+        d.mkdir(parents=True)
+        files = [
+            (f, [('LIVED' if f == lived_in else 'KILLED', 'ARITHMETIC_BASE')])
+            for f in survivors
+        ]
+        (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', files)))
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), '--repo', 'rsync', '--artifacts-dir', str(art),
+         '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1'],
+        capture_output=True, text=True, check=False,
+    )
+    check('disagreeing verdicts: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
+    check('disagreeing verdicts: body carries the caution',
+          ok='Verdicts disagree' in proc.stdout, detail=proc.stdout[:600])
+    check('disagreeing verdicts: caution names the worker-interference cause',
+          ok='workers' in proc.stdout.lower())
+
+
+def test_aggregate_flags_sudden_perfect_week(tmp: Path) -> None:
+    """A jump from live mutants to a flawless 100% with no test change."""
+    art = tmp / 'artifacts-perfect'
+    for attempt in (1, 2, 3):
+        d = art / f'gremlins-rsync-{attempt}'
+        d.mkdir(parents=True)
+        (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
+            ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')]),
+        ])))
+    existing = tmp / 'existing.md'
+    existing.write_text(
+        '# Gremlins mutation testing tracker\n\n'
+        '## Rolling 12-week history\n'
+        '<!-- gremlins-data -->\n'
+        '| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |\n'
+        '|---|---|---|---|---|---|\n'
+        '| 2026-08-16 22:00 | 40.0% | ±0.0% | 100.0% | 3 | -0.0% |\n'
+        '<!-- /gremlins-data -->\n'
+    )
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), '--repo', 'rsync', '--artifacts-dir', str(art),
+         '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1',
+         '--existing-body-file', str(existing)],
+        capture_output=True, text=True, check=False,
+    )
+    check('sudden perfect week: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
+    check('sudden perfect week: body carries the caution',
+          ok='100%' in proc.stdout and 'measurement' in proc.stdout.lower(),
+          detail=proc.stdout[:600])
+    check('sudden perfect week: history row preserved', ok='2026-08-16 22:00' in proc.stdout)
+
+
+def test_aggregate_quiet_on_a_stable_week(tmp: Path) -> None:
+    """No caution when every attempt agrees and the score is not a jump to 100%."""
+    art = tmp / 'artifacts-stable'
+    for attempt in (1, 2, 3):
+        d = art / f'gremlins-stable-{attempt}'
+        d.mkdir(parents=True)
+        (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
+            ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY')]),
+        ])))
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), '--repo', 'stable', '--artifacts-dir', str(art),
+         '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1'],
+        capture_output=True, text=True, check=False,
+    )
+    check('stable week: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
+    check('stable week: no caution line',
+          ok='Verdicts disagree' not in proc.stdout and 'measurement failure' not in proc.stdout,
+          detail=proc.stdout[:400])
+
+
 def main() -> int:
     if not MERGE.exists() or not AGGREGATE.exists():
         print(f'missing script: {MERGE} / {AGGREGATE}')
@@ -394,6 +476,9 @@ def main() -> int:
         test_module_nested_in_nested,
         test_root_module_required,
         test_aggregate_consumes_merged_output,
+        test_aggregate_flags_disagreeing_verdicts,
+        test_aggregate_flags_sudden_perfect_week,
+        test_aggregate_quiet_on_a_stable_week,
     ]
     for t in tests:
         print(f'{t.__name__}:')
