@@ -442,6 +442,81 @@ def test_aggregate_flags_sudden_perfect_week(tmp: Path) -> None:
     check('sudden perfect week: history row preserved', ok='2026-08-16 22:00' in proc.stdout)
 
 
+def test_aggregate_never_names_an_older_week_as_last_week(tmp: Path) -> None:
+    """An unreadable newest row must silence the caution, not promote an older row.
+
+    The newest row here is the legacy fused-delta shape this repo wrote before
+    2026-06-22 (da611ef): five columns, with the efficacy delta inside the
+    live-mutants cell. Reading the live counts into a list and taking [0] would
+    skip that row and print the week BELOW it as "last week", so the caution
+    would name 7 live mutants for a week that reported none of them.
+    """
+    art = tmp / 'artifacts-legacy-row'
+    for attempt in (1, 2, 3):
+        d = art / f'gremlins-rsync-{attempt}'
+        d.mkdir(parents=True)
+        (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
+            ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')]),
+        ])))
+    existing = tmp / 'existing.md'
+    existing.write_text(
+        '# Gremlins mutation testing tracker\n\n'
+        '## Rolling 12-week history\n'
+        '<!-- gremlins-data -->\n'
+        '| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |\n'
+        '|---|---|---|---|---|---|\n'
+        '| 2026-08-16 22:00 | 40.0% | ±0.0% | 100.0% | 3 +28.5% |\n'
+        '| 2026-08-09 22:00 | 11.5% | ±0.0% | 100.0% | 7 | -0.0% |\n'
+        '<!-- /gremlins-data -->\n'
+    )
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), '--repo', 'rsync', '--artifacts-dir', str(art),
+         '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1',
+         '--existing-body-file', str(existing)],
+        capture_output=True, text=True, check=False,
+    )
+    check('unreadable newest row: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
+    check('unreadable newest row: caution does not name the older week',
+          ok='7 live mutant' not in proc.stdout, detail=proc.stdout[:800])
+    check('unreadable newest row: jump caution stays silent',
+          ok='jump to 100%' not in proc.stdout.lower(), detail=proc.stdout[:800])
+    check('unreadable newest row: both history rows preserved',
+          ok='2026-08-16 22:00' in proc.stdout and '2026-08-09 22:00' in proc.stdout)
+
+
+def test_aggregate_reads_last_week_from_the_newest_row(tmp: Path) -> None:
+    """With a readable newest row, the caution quotes THAT row's count."""
+    art = tmp / 'artifacts-newest-row'
+    for attempt in (1, 2, 3):
+        d = art / f'gremlins-rsync-{attempt}'
+        d.mkdir(parents=True)
+        (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
+            ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')]),
+        ])))
+    existing = tmp / 'existing.md'
+    existing.write_text(
+        '# Gremlins mutation testing tracker\n\n'
+        '## Rolling 12-week history\n'
+        '<!-- gremlins-data -->\n'
+        '| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |\n'
+        '|---|---|---|---|---|---|\n'
+        '| 2026-08-16 22:00 | 40.0% | ±0.0% | 100.0% | 3 | +28.5% |\n'
+        '| 2026-08-09 22:00 | 11.5% | ±0.0% | 100.0% | 7 | -0.0% |\n'
+        '<!-- /gremlins-data -->\n'
+    )
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), '--repo', 'rsync', '--artifacts-dir', str(art),
+         '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1',
+         '--existing-body-file', str(existing)],
+        capture_output=True, text=True, check=False,
+    )
+    check('newest row read: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
+    check('newest row read: caution quotes the newest row count',
+          ok='3 live mutant' in proc.stdout, detail=proc.stdout[:800])
+    check('newest row read: caution does not quote the older row count',
+          ok='7 live mutant' not in proc.stdout, detail=proc.stdout[:800])
+
+
 def test_aggregate_quiet_on_a_stable_week(tmp: Path) -> None:
     """No caution when every attempt agrees and the score is not a jump to 100%."""
     art = tmp / 'artifacts-stable'
@@ -478,6 +553,8 @@ def main() -> int:
         test_aggregate_consumes_merged_output,
         test_aggregate_flags_disagreeing_verdicts,
         test_aggregate_flags_sudden_perfect_week,
+        test_aggregate_never_names_an_older_week_as_last_week,
+        test_aggregate_reads_last_week_from_the_newest_row,
         test_aggregate_quiet_on_a_stable_week,
     ]
     for t in tests:

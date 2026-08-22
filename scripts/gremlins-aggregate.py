@@ -497,7 +497,7 @@ def trend_marker(mean: float, history_means: list[float]) -> str:
     return f"**Trend**: {symbol} {delta:+.1f}% from {ROLLING_WEEKS}-week mean ({rolling:.1f}%)."
 
 
-def measurement_cautions(agg: dict, history_live_counts: list[int]) -> list[str]:
+def measurement_cautions(agg: dict, prev_live_count: int | None) -> list[str]:
     """Lines warning that this week's number measures the harness, not the suite.
 
     Equivalent mutants — semantically-no-op mutations that no test can catch —
@@ -519,6 +519,11 @@ def measurement_cautions(agg: dict, history_live_counts: list[int]) -> list[str]
        2026-07-20 / 07-27 / 08-10 weeks each published 100.0% while its three
        equivalent mutants were still there; the perfect score was the defect
        hiding itself.
+
+    prev_live_count is last week's live-mutant count, or None when the newest
+    history row does not state a readable one. None is not zero: it means shape
+    2 cannot be graded, so that caution stays silent rather than naming a week
+    it did not measure.
     """
     lines = []
     n = agg["n_runs"]
@@ -537,11 +542,11 @@ def measurement_cautions(agg: dict, history_live_counts: list[int]) -> list[str]
     if (
         agg["efficacy_mean"] >= 99.95
         and agg["live_count"] == 0
-        and history_live_counts
-        and history_live_counts[0] > 0
+        and prev_live_count is not None
+        and prev_live_count > 0
     ):
         lines.append(
-            f"> ⚠️ **A jump to 100% efficacy.** Last week reported {history_live_counts[0]} live "
+            f"> ⚠️ **A jump to 100% efficacy.** Last week reported {prev_live_count} live "
             "mutant(s) and this week reports none. Absent a change to the tests, that is evidence of "
             "a measurement failure rather than a fixed suite: equivalent mutants cannot all be "
             "killed. Check the run's per-attempt logs before believing the score."
@@ -560,30 +565,48 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
     new_row = f"| {week} | {eff_mean}% | ±{eff_stddev}% | {cov_mean}% | {live_count} |"
     history_block, _prev_mean = update_history_block(existing, new_row, eff_mean)
 
-    # Get all historical means for trend marker, plus each week's live-mutant
-    # count (column 5) — a week that drops from live mutants to a flawless 100%
-    # is the second measurement-failure shape (see measurement_cautions).
-    history_means = []
-    history_live_counts = []
+    # Split the history rows into cells once. The two readers below want
+    # different things from them, and only one of the two is positional.
+    history_rows = []
     if existing:
         m = re.search(r"<!-- gremlins-data -->(.*?)<!-- /gremlins-data -->", existing, re.DOTALL)
         if m:
-            for line in m.group(1).splitlines():
-                if re.match(r"^\| 20\d{2}-", line):
-                    cells = [c.strip() for c in line.split("|") if c.strip()]
-                    if len(cells) >= 2:
-                        try:
-                            history_means.append(float(cells[1].rstrip("%")))
-                        except ValueError:
-                            continue
-                    if len(cells) >= 5:
-                        try:
-                            history_live_counts.append(int(cells[4]))
-                        except ValueError:
-                            pass
+            history_rows = [
+                [c.strip() for c in line.split("|") if c.strip()]
+                for line in m.group(1).splitlines()
+                if re.match(r"^\| 20\d{2}-", line)
+            ]
+
+    # Mean efficacy (column 2) feeds the trend marker, which takes a mean over
+    # the window. Order does not matter there, so an unreadable row drops out.
+    history_means = []
+    for cells in history_rows:
+        if len(cells) >= 2:
+            try:
+                history_means.append(float(cells[1].rstrip("%")))
+            except ValueError:
+                continue
+
+    # Live-mutant count (column 5) feeds the jump-to-100% caution, which names
+    # LAST week. That one IS positional: rows are newest-first
+    # (update_history_block inserts at 0), so read the first row or report
+    # unknown. Collecting the counts into a list and reading [0] instead would
+    # make an older week's number read as last week's every time the newest
+    # row's cell failed to parse.
+    prev_live_count = None
+    if history_rows and len(history_rows[0]) >= 5:
+        try:
+            prev_live_count = int(history_rows[0][4])
+        except ValueError:
+            # The newest row states no readable count, so the caution stays
+            # silent. Two shapes reach here: rows written before 2026-06-22
+            # (da611ef) fused the efficacy delta into this cell ("1 +28.5%"),
+            # and the cell split drops empty cells, so one blank column shifts
+            # every later index.
+            prev_live_count = None
 
     trend_line = trend_marker(eff_mean, history_means)
-    cautions = measurement_cautions(agg, history_live_counts)
+    cautions = measurement_cautions(agg, prev_live_count)
     caution_lines = ("\n" + "\n".join(cautions) + "\n") if cautions else "\n"
 
     # Live mutants section, frequency-bucketed (rare-first, most actionable).
