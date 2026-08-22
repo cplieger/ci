@@ -20,6 +20,7 @@ Run: python3 scripts/test-gremlins-scripts.py     (exit 0 = pass)
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -537,6 +538,58 @@ def test_aggregate_quiet_on_a_stable_week(tmp: Path) -> None:
           detail=proc.stdout[:400])
 
 
+def test_aggregate_rerun_replaces_its_own_row(tmp: Path) -> None:
+    """One run contributes ONE row, even when its aggregate runs twice.
+
+    This job is a dependent of `run` with `if: always()`, so re-running a failed
+    matrix entry re-runs the aggregate too. Both attempts aggregate the SAME
+    artifacts for every entry that did not re-run, so a second row is one
+    measurement counted twice in the rolling mean. Measured before the fix: run
+    28756935137 wrote 2026-07-06 01:31 and 2026-07-07 23:28 into 24 trackers,
+    and stryker run 32570714460 did the same to 9.
+    """
+    art = tmp / 'artifacts-rerun'
+    d = art / 'gremlins-rerun-1'
+    d.mkdir(parents=True)
+    (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
+        ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY')]),
+    ])))
+
+    def run(week: str, run_id: str, existing: Path | None) -> str:
+        args = [sys.executable, str(AGGREGATE), '--repo', 'rerun',
+                '--artifacts-dir', str(art), '--week', week,
+                '--run-url', f'https://github.com/cplieger/ci/actions/runs/{run_id}']
+        if existing:
+            args += ['--existing-body-file', str(existing)]
+        p = subprocess.run(args, capture_output=True, text=True, check=False)
+        check(f'rerun fixture: aggregate exits 0 ({week})', ok=p.returncode == 0,
+              detail=p.stderr[-400:])
+        return p.stdout
+
+    def rows(body: str) -> list[str]:
+        m = re.search(r'<!-- gremlins-data -->(.*?)<!-- /gremlins-data -->', body, re.DOTALL)
+        return [ln for ln in (m.group(1).splitlines() if m else []) if re.match(r'^\| 20', ln)]
+
+    first = tmp / 'b1.md'
+    first.write_text(run('2026-07-06 01:31', '28756935137', None))
+    check('rerun: attempt 1 writes one row', ok=len(rows(first.read_text())) == 1,
+          detail=str(rows(first.read_text())))
+
+    second = tmp / 'b2.md'
+    second.write_text(run('2026-07-07 23:28', '28756935137', first))
+    got = rows(second.read_text())
+    check('rerun: same run REPLACES its row rather than adding one', ok=len(got) == 1,
+          detail=str(got))
+    check('rerun: the retained row carries the later timestamp',
+          ok=bool(got) and '2026-07-07 23:28' in got[0], detail=str(got))
+
+    third = tmp / 'b3.md'
+    third.write_text(run('2026-08-21 15:35', '32460445600', second))
+    got3 = rows(third.read_text())
+    check('rerun: a DIFFERENT run appends, so real history still accumulates',
+          ok=len(got3) == 2, detail=str(got3))
+
+
 def main() -> int:
     if not MERGE.exists() or not AGGREGATE.exists():
         print(f'missing script: {MERGE} / {AGGREGATE}')
@@ -556,6 +609,7 @@ def main() -> int:
         test_aggregate_never_names_an_older_week_as_last_week,
         test_aggregate_reads_last_week_from_the_newest_row,
         test_aggregate_quiet_on_a_stable_week,
+        test_aggregate_rerun_replaces_its_own_row,
     ]
     for t in tests:
         print(f'{t.__name__}:')
