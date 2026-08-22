@@ -213,7 +213,9 @@ jobs:
       # bounded by memory (heap + compile/link toolchain per worker): 2 on a
       # 16 GB runner — low enough that the OOM-killer's victim is unambiguous —
       # and auto-scaling on bigger runners (where the runaway simply fits under
-      # the larger cap).
+      # the larger cap). Workers are ALSO bounded by whether the suite survives
+      # running beside itself; that half lives in scripts/gremlins-run.sh, which
+      # is where the probe that decides it runs.
       - name: Run gremlins (attempt ${{ matrix.attempt }})
         env:
           MODULES: ${{ steps.modules.outputs.modules }}
@@ -226,6 +228,7 @@ jobs:
           # artifact downstream.
           # renovate: datasource=github-releases depName=go-gremlins/gremlins
           GREMLINS_VERSION=v0.6.0
+          PROBE_TIMEOUT=600   # per probe phase; a slower suite stays unverified rather than throttled
 
           # Memory-aware sizing, computed on the host and passed into the
           # container. cap_mb is BOTH the container memory ceiling and the budget
@@ -240,8 +243,13 @@ jobs:
           workers=$(( nproc_n < max_by_mem ? nproc_n : max_by_mem ))
           gomem_mb=$(( (cap_mb - workers * toolchain_mb) / workers ))
           [ "$gomem_mb" -lt "$heap_min_mb" ] && gomem_mb=$heap_min_mb
-          echo "workers=${workers} (nproc=${nproc_n}, mem-cap=${max_by_mem})"
-          echo "GOMEMLIMIT=${gomem_mb}MiB container=${cap_mb}MiB (MemAvailable=${avail_kb}KiB)"
+          # Second candidate: the heap budget if the probe drops the run to one
+          # worker. Same formula, same cap — both computed here so ALL of the
+          # memory arithmetic stays in one place and the container only picks.
+          gomem_solo_mb=$(( cap_mb - toolchain_mb ))
+          [ "$gomem_solo_mb" -lt "$heap_min_mb" ] && gomem_solo_mb=$heap_min_mb
+          echo "workers<=${workers} (nproc=${nproc_n}, mem-cap=${max_by_mem})"
+          echo "GOMEMLIMIT=${gomem_mb}MiB (${gomem_solo_mb}MiB solo) container=${cap_mb}MiB (MemAvailable=${avail_kb}KiB)"
 
           rc=0
           MERGE_ARGS=()
@@ -263,8 +271,10 @@ jobs:
               -v "${PWD}/scripts/gremlins-run.sh":/gremlins-run.sh:ro \
               -w "/work/${m}" \
               -e GREMLINS_VERSION="${GREMLINS_VERSION}" \
-              -e GOMEMLIMIT="${gomem_mb}MiB" \
-              -e WORKERS="${workers}" \
+              -e WORKERS_MAX="${workers}" \
+              -e GOMEM_MAX_MB="${gomem_mb}" \
+              -e GOMEM_SOLO_MB="${gomem_solo_mb}" \
+              -e PROBE_TIMEOUT="${PROBE_TIMEOUT}" \
               -e OUT="/work/${m}/gremlins-out.json" \
               "${image}" bash /gremlins-run.sh || rc=$?
             echo "::endgroup::"

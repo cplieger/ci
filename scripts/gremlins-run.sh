@@ -5,16 +5,22 @@
 # allocation, and the container cgroup is what keeps the OOM-killer away from
 # the runner agent).
 #
-# It lives in a file rather than inline in the workflow so shellcheck lints it,
-# and so the per-module loop that calls it stays readable.
+# It lives in a file rather than inline in the workflow so shellcheck lints it —
+# the concurrency probe below has real control flow (background jobs, exit-code
+# triage), and an error in it would first surface at 22:00 on a Sunday, across
+# every Go repo in the fleet.
 #
 # Working directory: the module root (the workflow sets -w). Inputs, all env:
 #   GREMLINS_VERSION  release tag to download, e.g. v0.6.0
-#   WORKERS           worker count, derived from the container memory cap
+#   WORKERS_MAX       worker ceiling derived from the container memory cap
+#   GOMEM_MAX_MB      GOMEMLIMIT for WORKERS_MAX workers
+#   GOMEM_SOLO_MB     GOMEMLIMIT when the probe forces one worker
+#   PROBE_TIMEOUT     seconds per probe phase
 #   OUT               absolute path for gremlins' JSON result
 set -euo pipefail
 
-: "${GREMLINS_VERSION:?}" "${WORKERS:?}" "${OUT:?}"
+: "${GREMLINS_VERSION:?}" "${WORKERS_MAX:?}" "${GOMEM_MAX_MB:?}" "${GOMEM_SOLO_MB:?}"
+: "${PROBE_TIMEOUT:?}" "${OUT:?}"
 
 # File first, then extract: --retry does not cover a mid-transfer receive
 # failure, and --retry-all-errors cannot retry into a pipe.
@@ -24,5 +30,72 @@ curl -fsSL --connect-timeout 10 --max-time 60 \
   "https://github.com/go-gremlins/gremlins/releases/download/${GREMLINS_VERSION}/gremlins_${GREMLINS_VERSION#v}_linux_amd64.tar.gz"
 tar -xzf /tmp/gremlins.tgz -C /usr/local/bin gremlins
 
-echo "workers=${WORKERS} GOMEMLIMIT=${GOMEMLIMIT:-unset} module=$(pwd)"
-gremlins unleash --workers "${WORKERS}" --output "${OUT}" .
+# --- Concurrency probe -------------------------------------------------------
+# Each gremlins worker gets its own COPY of the module tree, but an absolute
+# path does not move with the copy and every worker shares this container's
+# /tmp. A test bound to a fixed global path therefore collides with a sibling
+# worker running a copy of that same test, and the damage is not a lost mutant
+# but a FALSE one: measured on docker-rsync-scheduler, whose three tests create
+# health.DefaultPath = /tmp/.healthy, one worker's cleanup deleted the marker
+# another was polling for. All three of its live mutants are provably
+# equivalent, yet each of three attempts named a DIFFERENT single survivor and
+# called the other two KILLED — six of nine verdicts false, and its 100.0%
+# weeks (2026-07-20, 07-27, 08-10) were measurement failures, because
+# equivalent mutants cannot all be killed.
+#
+# The condition is DETECTABLE, so it is detected instead of listed: run the
+# suite alone, then run two copies at once, and if it only fails the second way
+# this suite cannot share a filesystem with itself and gets --workers 1. Why not
+# a per-repo opt-out list — the obvious shape: a list keyed on "this repo's
+# tests currently bind /tmp/.healthy" keeps halving throughput long after the
+# test is fixed and silently misses the next repo that grows the same habit
+# (this repo has been bitten by exactly that kind of carve-out before). The
+# probe graduates itself: fix the test, and the next run goes back to full
+# workers with no edit here. It also catches what grepping the repo cannot —
+# the offending path is a const in a DEPENDENCY (cplieger/health), not a
+# literal in the repo under test.
+#
+# Detection is one-sided. A narrow race can pass the probe and still fake a
+# verdict, which is why gremlins-aggregate.py separately flags attempts that
+# disagree about which mutants survived. Cost is one extra suite run against a
+# mutation run that executes the suite once per mutant.
+workers="${WORKERS_MAX}"
+export GOMEMLIMIT="${GOMEM_MAX_MB}MiB"
+
+if [ "${WORKERS_MAX}" -gt 1 ]; then
+  # gremlins downloads modules itself; doing it here first keeps the probe from
+  # timing out on a cold module cache.
+  go mod download || echo "::warning::go mod download failed before the concurrency probe; letting gremlins report it"
+
+  if timeout "${PROBE_TIMEOUT}" go test -count=1 ./... >/tmp/probe-solo.log 2>&1; then
+    timeout "${PROBE_TIMEOUT}" go test -count=1 ./... >/tmp/probe-a.log 2>&1 &
+    pa=$!
+    timeout "${PROBE_TIMEOUT}" go test -count=1 ./... >/tmp/probe-b.log 2>&1 &
+    pb=$!
+    ra=0
+    wait "${pa}" || ra=$?
+    rb=0
+    wait "${pb}" || rb=$?
+
+    if [ "${ra}" = 124 ] || [ "${rb}" = 124 ]; then
+      # Unverified beats throttled: a suite too slow to probe is also a suite
+      # whose mutation run needs every worker it can get.
+      echo "::warning::concurrency probe timed out (>${PROBE_TIMEOUT}s); keeping ${WORKERS_MAX} workers unverified"
+    elif [ "${ra}" -ne 0 ] || [ "${rb}" -ne 0 ]; then
+      workers=1
+      export GOMEMLIMIT="${GOMEM_SOLO_MB}MiB"
+      echo "::warning::suite passes alone but fails when two copies run at once (exit ${ra}/${rb})"
+      echo "::warning::forcing --workers 1: cross-worker interference reports false KILLs, not lost mutants"
+      grep -hE "FAIL|panic:" /tmp/probe-a.log /tmp/probe-b.log | head -20 || true
+    else
+      echo "concurrency probe passed; keeping ${WORKERS_MAX} workers"
+    fi
+  else
+    # Not the probe's business to diagnose a red suite — gremlins fails its own
+    # coverage pass next and reports it as the error it is.
+    echo "::warning::suite does not pass on its own; skipping the concurrency probe, keeping ${WORKERS_MAX} workers"
+  fi
+fi
+
+echo "workers=${workers} GOMEMLIMIT=${GOMEMLIMIT} module=$(pwd)"
+gremlins unleash --workers "${workers}" --output "${OUT}" .
