@@ -39,6 +39,17 @@
 #   - project-local TS devdeps run via `npm ci` (the native `tsc` via each
 #     repo's @typescript/native alias, plus eslint, prettier, vitest, stylelint,
 #     html-validate, knip), pinned per-repo in package-lock.json
+#   - the Playwright BROWSER for a package on Vitest Browser Mode. `npm ci`
+#     installs the library, never the browser binary, and ci-local SKIPs
+#     ts-ci.yaml's "Install browser" step by name like every other install step,
+#     so a first local run of that package's suite fails inside "Test (vitest)"
+#     with a missing-executable error that reads like a test failure. Provision
+#     it once per machine, from the package dir so the pinned CLI picks its own
+#     matching browser build:
+#         npx --no-install playwright install chromium
+#     No --with-deps locally: a desktop already has the ~95 system libraries a
+#     bare runner does not. Not resolvable from this repo's pins, for the same
+#     reason as the TS devdeps above — the playwright version is per-package.
 #   - supply-chain/scan actions that don't run locally: cosign, syft, CodeQL
 #
 # INSTALL TARGETS: Go tools via `go install` (Go bin dir); golangci-lint,
