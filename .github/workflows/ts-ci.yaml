@@ -127,11 +127,42 @@ jobs:
         continue-on-error: true
         run: |
           (
-            mapfile -t files < <(git ls-files '*.fuzz.test.ts' '*.fuzz.test.js')
+            # `.fuzz` is a KIND marker and can sit anywhere left of `.test.ts`,
+            # because the suffix nearest `.test.ts` belongs to the vitest project
+            # matcher: a node-project include is `**/*.node.test.ts`, anchored on
+            # the end of the name, so a Node-side fuzz target must be spelled
+            # `<stem>.fuzz.node.test.ts` to reach the node project at all. The
+            # narrow `'*.fuzz.test.ts'` missed exactly that name. (It always
+            # matched `<stem>.node.fuzz.test.ts` — git pathspecs are wildmatch
+            # without WM_PATHNAME, so `*` crosses dots AND slashes — but that
+            # ordering lands the file in the BROWSER project, which is worse.)
+            mapfile -t files < <(git ls-files '*.fuzz*.test.ts' '*.fuzz*.test.js')
+
+            # An empty selection is legitimate — most consumers have no fuzz
+            # target — so emptiness cannot be the gate. What must fail is an
+            # empty selection with a fuzz-shaped file sitting next to it: the
+            # pathspec needs a literal `.` before `fuzz`, so `fuzz-corpus.test.ts`
+            # selects nothing and the else-branch below then PRINTS that property
+            # tests covered it and passes. Cast a wider net than the selector and
+            # fail on the difference.
+            missed=$(comm -13 \
+              <(git ls-files '*.fuzz*.test.ts' '*.fuzz*.test.js' | LC_ALL=C sort) \
+              <(git ls-files '*.test.ts' '*.test.js' | awk -F/ 'tolower($NF) ~ /fuzz/' | LC_ALL=C sort))
+            if [ -n "$missed" ]; then
+              echo "::error::fuzz-shaped test file(s) matched no fuzz selector and would be skipped silently:"
+              # Quoted + sed rather than an unquoted `printf '  %s\n' $missed`:
+              # the unquoted form relies on word splitting (SC2086, which
+              # actionlint's shellcheck pass rejects) and would glob-expand a
+              # filename containing `*`.
+              printf '%s\n' "$missed" | sed 's/^/  /'
+              echo "Rename to <stem>.fuzz.test.ts, or <stem>.fuzz.node.test.ts for a node-project target."
+              exit 1
+            fi
+
             if [ "${#files[@]}" -gt 0 ]; then
               npx vitest run "${files[@]}"
             else
-              echo "No *.fuzz.test.ts targets; fast-check property tests already ran in the test step."
+              echo "No *.fuzz*.test.ts targets; fast-check property tests already ran in the test step."
             fi
           ) || { echo "fuzz" >> /tmp/_ci_failures; exit 1; }
 
