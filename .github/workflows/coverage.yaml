@@ -12,6 +12,13 @@ name: Coverage
 # TS:  vitest v8 coverage (statements).
 # Only synced to Go/TS repos (the sync group excludes shell/Dockerfile-only
 # repos), so there is always a measurable surface.
+#
+# Two jobs, and the split is deliberate:
+#
+#   coverage            the badge. Surface detection is root-only and yields a
+#                       single `kind`, so it measures exactly one surface.
+#   coverage-ts-nested  a HYBRID repo's nested TypeScript surface, measured and
+#                       reported but NOT gated and NOT badged. See its header.
 
 on:
   workflow_call:
@@ -108,3 +115,166 @@ jobs:
           token: ${{ github.token }}
           filename: coverage.json
           json: ${{ steps.badge.outputs.json }}
+
+
+  # A hybrid repo — root `go.mod` plus a TypeScript package in a subdirectory —
+  # has a SECOND measurable surface that the badge job structurally cannot see.
+  # Its `Detect surface` step reads the repo ROOT and emits one `kind`, so a root
+  # `go.mod` classifies the whole repo as Go and the nested package is never
+  # measured. Consequence: subflux's coverage badge has always been a Go number,
+  # and its own per-file TypeScript coverage gate has never had an executor
+  # anywhere in CI — it looked configured and measured nothing.
+  #
+  # This job measures that surface and reports it. It deliberately does NOT gate:
+  #
+  #   - `continue-on-error: true` at JOB level, so nothing here can fail the
+  #     workflow run. That covers what no in-body guard can — a job timeout, a
+  #     runner OOM, a browser install that dies. A surface that has never been
+  #     measured has never been kept green either, so some of these packages
+  #     fail their own per-file thresholds on genuinely uncovered code, and a
+  #     gate would redden their main branch the day it landed. The count is
+  #     deliberately not recorded here: it moves as each package is worked, and
+  #     a number in a comment would be wrong within the week.
+  #   - its own job, so a browser-mode suite cannot eat the badge job's budget,
+  #     and so the badge path above is byte-for-byte unchanged.
+  #   - `contents: read`: no badge is published. The number goes to the job
+  #     summary.
+  #
+  # Deliberately left for follow-ups, because each is a decision rather than a
+  # mechanism: publishing a second `coverage-ts.json` badge (nothing reads it
+  # until each README is edited), and the opt-in that turns this into a gate once
+  # a package's own thresholds are green.
+  coverage-ts-nested:
+    runs-on: ubuntu-24.04
+    # Generous on purpose: this leg pays npm ci + a Chromium install + a
+    # browser-mode suite under coverage instrumentation on top of each other,
+    # and a timeout here would measure nothing rather than measure something
+    # slowly. Job-level continue-on-error is what makes an overrun contained
+    # instead of red — no in-body guard can catch a timeout.
+    timeout-minutes: 45
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes; do not leave the token in .git/config
+          # (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Detect nested TS surfaces
+        id: n
+        run: |
+          # Scoped to hybrid repos on purpose: a root `go.mod` is what makes the
+          # badge job's root-only `kind` wrong. A pure-TS repo's root surface is
+          # already measured there, so this job has nothing to add and exits.
+          dirs=""
+          if [ -f go.mod ]; then
+            # A nested TS surface is a tracked vitest config below the root with
+            # a package.json beside it. Both pathspecs are basename-exact: git
+            # pathspecs are wildmatch WITHOUT WM_PATHNAME, so `*` crosses dots
+            # and slashes and a bare '*vitest.config.*' would also match
+            # `myvitest.config.ts`.
+            while IFS= read -r cfg; do
+              [ -n "$cfg" ] || continue
+              d=$(dirname "$cfg")
+              [ "$d" = "." ] && continue
+              [ -f "$d/package.json" ] || continue
+              case " $dirs " in *" $d "*) continue ;; esac
+              dirs="${dirs:+$dirs }$d"
+            done < <(git ls-files 'vitest.config.*' '*/vitest.config.*' \
+              | grep -Ev '(^|/)(node_modules|vendor|dist)/' || true)
+          fi
+          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
+          if [ -z "$dirs" ]; then
+            echo "No nested TypeScript surface (not a hybrid repo, or no nested vitest config)."
+          else
+            echo "Nested TypeScript surface(s): $dirs"
+          fi
+
+      - name: Measure nested TS coverage (advisory)
+        if: ${{ steps.n.outputs.dirs != '' }}
+        env:
+          TS_DIRS: ${{ steps.n.outputs.dirs }}
+        run: |
+          summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          tmp="${RUNNER_TEMP:-/tmp}"
+          {
+            echo "## Nested TypeScript coverage (advisory)"
+            echo ""
+            echo "| Package dir | Statements | Per-file gate |"
+            echo "| --- | --- | --- |"
+          } >> "$summary"
+
+          read -r -a dirs <<< "$TS_DIRS"
+          for d in "${dirs[@]}"; do
+            [ -n "$d" ] || continue
+            pct=""
+            gate=""
+            log="$tmp/ts-cov-$(printf '%s' "$d" | tr / -).log"
+
+            if [ ! -f "$d/package-lock.json" ]; then
+              gate="not measured: no package-lock.json"
+              echo "::warning::$d has a vitest config but no package-lock.json; cannot install"
+            elif ! ( cd "$d" && npm ci ) > "$log" 2>&1; then
+              gate="not measured: npm ci failed"
+              echo "::warning::$d: npm ci failed"
+              tail -40 "$log"
+            else
+              # Vitest Browser Mode runs DOM tests in a real Chromium, so a
+              # browser-mode package measures NOTHING without one — and most of
+              # the fleet's nested TS packages are browser-mode, which would have
+              # made this whole leg vacuous. Enrolment is the package's own
+              # `@vitest/browser-playwright` devDependency, driven through its own
+              # pinned playwright CLI: the same presence-is-enrolment shape, and
+              # the same `--no-install` reasoning, as ts-ci.yaml's browser step.
+              browser_dep="const v=require('./package.json').devDependencies||{};"
+              browser_dep="$browser_dep process.exit(v['@vitest/browser-playwright']?0:1)"
+              if ( cd "$d" && node -e "$browser_dep" ); then
+                ( cd "$d" && npx --no-install playwright install --with-deps chromium ) >> "$log" 2>&1 \
+                  || echo "::warning::$d: browser install failed; the run below may measure nothing"
+              fi
+
+              # The exit status is captured for the GATE verdict only, never to
+              # decide whether a number exists: vitest writes
+              # coverage-summary.json BEFORE evaluating its thresholds, so a
+              # package failing its own per-file gate still leaves a complete,
+              # honest summary behind (measured on vitest 4.1.11).
+              rc=0
+              ( cd "$d" && npx vitest run --coverage --coverage.provider=v8 --coverage.reporter=json-summary ) >> "$log" 2>&1 || rc=$?
+              tail -60 "$log"
+
+              read_pct="const s=require('./coverage/coverage-summary.json');"
+              read_pct="$read_pct process.stdout.write(String(s.total.statements.pct))"
+              if pct=$( ( cd "$d" && node -e "$read_pct" ) 2>/dev/null ) \
+                && [ -n "$pct" ]; then
+                # A threshold line names the offending file last:
+                #   ERROR: Coverage for lines (0%) does not meet ... for src/b.ts
+                below=$(awk '/does not meet/ {print $NF}' "$log" | LC_ALL=C sort -u | wc -l | tr -d ' ')
+                if [ "$rc" -eq 0 ]; then
+                  gate="would pass"
+                elif [ "$below" -gt 0 ]; then
+                  gate="would fail: $below file(s) below threshold"
+                else
+                  gate="suite failed (not a coverage gate)"
+                  echo "::warning::$d: the vitest run failed for a reason other than a coverage threshold"
+                fi
+              else
+                pct=""
+                gate="not measured: no coverage summary produced"
+                echo "::warning::$d: vitest produced no coverage summary"
+              fi
+            fi
+
+            disp="—"
+            [ -n "$pct" ] && disp="${pct}%"
+            echo "| \`$d\` | $disp | $gate |" >> "$summary"
+            echo "nested TS coverage: $d statements=${pct:-n/a} gate=$gate"
+          done
+
+          {
+            echo ""
+            echo "Advisory: this measurement does not gate, and the \`coverage.json\`"
+            echo "badge on the \`badges\` branch is still the Go number."
+          } >> "$summary"
