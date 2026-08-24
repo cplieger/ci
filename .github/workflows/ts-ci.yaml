@@ -353,21 +353,50 @@ jobs:
         continue-on-error: true
         run: |
           (
+            # TWO INDEPENDENT GATES IN ONE STEP, so each records its own verdict
+            # into `rc` rather than relying on the subshell's exit status. Bash
+            # suppresses errexit for the whole left side of an `||`, and a nested
+            # `set -e` does NOT restore it (verified), so a plain command list
+            # here reports only its LAST command. Measured cost of the old form:
+            # stylelint failed to resolve its config on every web-terminal-engine
+            # run for at least four days and the step stayed green, because
+            # html-validate passed after it. `rc` also runs both linters, so one
+            # run reports both failures.
+            rc=0
+
             # The stylelint config is synced to the repo root (.stylelintrc.json),
             # but this job runs in the web dir (inputs.working-directory), so
             # resolve it by absolute path and set --config-basedir to the cwd so
             # `extends: stylelint-config-standard` resolves from the web dir's
-            # node_modules. --allow-empty-input lets a web dir with no source CSS
-            # (a thin consumer whose styles come from a shared package, e.g.
-            # web-terminal-kiro) pass instead of erroring on no match. Cross-file rules
-            # (custom properties, animations) resolve via the config's
-            # `referenceFiles` glob.
-            npx stylelint "**/*.css" \
-              --config "${GITHUB_WORKSPACE}/.stylelintrc.json" \
-              --config-basedir . \
-              --allow-empty-input
-            find . -name "*.html" -not -path "./node_modules/*" -print0 \
-              | xargs -0 --no-run-if-empty npx html-validate
+            # node_modules. Cross-file rules (custom properties, animations)
+            # resolve via the config's `referenceFiles` glob.
+            #
+            # A web dir with no source CSS skips stylelint outright, rather than
+            # running it and leaning on --allow-empty-input: that flag only
+            # forgives an empty GLOB, while `extends` above still has to resolve,
+            # so a package shipping no CSS would have to carry
+            # stylelint-config-standard to lint nothing.
+            #
+            # `git ls-files` decides whether there is CSS to lint, and it is what
+            # feeds html-validate, so build output (a coverage report's own CSS
+            # or HTML) cannot make a CSS-less package look like one that ships
+            # styles, and cannot hand html-validate a few dozen generated pages.
+            # stylelint keeps its own `**/*.css` glob once it runs, because the
+            # config's `referenceFiles` is a working-tree glob too and narrowing
+            # only the CLI input would be half a change.
+            if [ -n "$(git ls-files '*.css' | head -n 1)" ]; then
+              npx stylelint "**/*.css" \
+                --config "${GITHUB_WORKSPACE}/.stylelintrc.json" \
+                --config-basedir . \
+                --allow-empty-input || rc=1
+            else
+              echo "No CSS tracked under $(pwd); skipping stylelint."
+            fi
+
+            git ls-files -z '*.html' \
+              | xargs -0 --no-run-if-empty npx html-validate || rc=1
+
+            exit "$rc"
           ) || { echo "web-lint" >> /tmp/_ci_failures; exit 1; }
 
       # PR-time dependency vulnerability review (npm manifests). Hard step (no
