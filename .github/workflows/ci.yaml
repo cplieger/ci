@@ -641,7 +641,7 @@ jobs:
       - name: Install ruff
         run: |
           # renovate: datasource=pypi depName=ruff
-          VERSION=0.16.4
+          VERSION=0.16.5
           pipx install "ruff==${VERSION}"
 
       - name: Lint Python (ruff check)
