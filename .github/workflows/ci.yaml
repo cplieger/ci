@@ -566,7 +566,7 @@ jobs:
         if: ${{ hashFiles('_typos.toml') != '' }}
         run: |
           # renovate: datasource=github-releases depName=crate-ci/typos
-          VERSION=v1.49.0
+          VERSION=v1.49.1
           curl -fsSL --connect-timeout 10 --max-time 30 \
             --retry 7 --retry-max-time 150 --retry-all-errors \
             -o "$RUNNER_TEMP/typos.tgz" \
