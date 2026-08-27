@@ -74,6 +74,21 @@ jobs:
           # Strict npm ci (no npm-install fallback): a drifted lockfile should
           # fail loudly here exactly as it does in ts-ci.yaml.
           npm ci
+
+          # A Vitest Browser Mode suite measures nothing without a real
+          # Chromium, so enrol on the package's own
+          # `@vitest/browser-playwright` devDependency and drive its own pinned
+          # playwright CLI. ts-ci.yaml's browser step owns the reasoning for
+          # both the marker and `--no-install`; the nested job below is the
+          # same shape. Unlike there, a failed install fails this step, which
+          # is right: the badge must not publish a number measured without a
+          # browser.
+          if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
+            npx --no-install playwright install --with-deps chromium
+          else
+            echo "no @vitest/browser-playwright devDependency; skipping browser install"
+          fi
+
           npx vitest run --coverage --coverage.provider=v8 --coverage.reporter=json-summary
           pct=$(node -e "process.stdout.write(String(require('./coverage/coverage-summary.json').total.statements.pct))")
           echo "PCT=${pct}" >> "$GITHUB_ENV"
