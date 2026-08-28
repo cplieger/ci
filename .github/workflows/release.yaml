@@ -860,17 +860,28 @@ jobs:
       # change under a minor bump is wrong while the same change under a major is
       # correct.
       #
-      # WHY REPORT-ONLY FOR NOW
-      # gorelease is explicitly experimental, and a false positive that blocks a
-      # release is worse than a missed report. It writes to the run summary and
-      # ci-triage reads it. The gate this graduates to is conditional, not
-      # blanket: fail only when gorelease reports an incompatible change AND the
-      # computed bump is not a major. A `feat!:` commit that mints a major passes
-      # that condition, so nothing deliberate is ever fought.
+      # WHY THIS FAILS THE RELEASE
+      # It landed report-only (2026-08-04) to accumulate a false-positive rate
+      # before being trusted with a veto. That criterion turned out to be
+      # unsatisfiable by waiting: the job only runs on a library release whose
+      # ROOT module changed, and it skips itself on every major bump, so the
+      # lane fires a handful of times a month and is silent on precisely the
+      # releases most likely to trip it. No stream can accumulate, so the
+      # choice is gate or delete, and a silent warning nobody is paged for is
+      # the vacuous-gate class this repo exists to prevent.
+      #
+      # The conditional the original note reserved for graduation - fail only
+      # on an incompatible change that is NOT a major bump - is already
+      # structural rather than conditional: the major-bump case exits 0 before
+      # gorelease ever runs. A `feat!:` commit that mints a major is therefore
+      # never fought, and a bare `exit 1` is that gate, not a blanket one.
       #
       # SKIPPED FOR: apps (a root `package main` is not a consumed module) and
       # major bumps (gorelease cannot compare across majors, and a major bump is
-      # a deliberate break, so silence there is correct behaviour).
+      # a deliberate break, so silence there is correct behaviour). Also skipped,
+      # not failed, when the tool cannot be installed: an unavailable checker is
+      # an infrastructure fault, and failing releases for it would teach the
+      # fleet to ignore this step.
       #
       # OPERATIONAL NOTE: gorelease refuses to run on a repo with uncommitted
       # changes ("has uncommitted changes", exit non-zero). That is fine here
@@ -879,8 +890,7 @@ jobs:
       # behaviour: on a clean checkout it prints "vX.Y.Z is a valid semantic
       # version for this release" and exits 0, and exits non-zero with a reason
       # when the proposed version does not fit the change.
-      - name: API compatibility (gorelease, report-only)
-        continue-on-error: true
+      - name: API compatibility (gorelease)
         env:
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
@@ -907,7 +917,7 @@ jobs:
           # renovate: datasource=go depName=golang.org/x/exp
           XEXP_VERSION=v0.0.0-20260824195058-e88cd73687aa
           GOTOOLCHAIN=auto go install "golang.org/x/exp/cmd/gorelease@${XEXP_VERSION}" || {
-            echo "::warning::gorelease install failed - skipping API check (report-only)"
+            echo "::warning::gorelease install failed - skipping API check (infrastructure fault, not an API verdict)"
             exit 0
           }
 
@@ -927,7 +937,9 @@ jobs:
               echo "gorelease accepts ${VERSION} as consistent with the exported-surface changes."
             else
               echo "gorelease reports ${VERSION} is NOT the right version for these changes."
-              echo "Report-only today; read the detail below before the next release."
+              echo "This FAILS the release. Either the change is compatible and the"
+              echo "report is wrong (investigate with apidiff), or the version is wrong"
+              echo "and the commit that mints it needs a \`!\` to cut a major."
             fi
             echo ""
             echo '```'
@@ -935,7 +947,8 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$rc" -ne 0 ]; then
-            echo "::warning::gorelease says ${VERSION} does not match the API change (report-only; see the run summary)"
+            echo "::error::gorelease says ${VERSION} does not match the exported-surface change (see the run summary)"
+            exit 1
           fi
           exit 0
 
