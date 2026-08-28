@@ -191,6 +191,15 @@ jobs:
             fi
           fi
 
+          # A "no surface claimed this code change" assertion was written here
+          # and removed: it cannot fire. run_scripts is gated on a shell script
+          # OR a workflow file, and every consumer of this reusable workflow has
+          # a caller workflow in .github/workflows by definition, so a repo with
+          # none of go.mod/jsr.json/Dockerfile always claims scripts and a repo
+          # with one always claims that one. Measured across all 52 consumers:
+          # zero reach the state. The blind-detection case it was reaching for is
+          # DISCLOSED instead, by validate's ran/skipped accounting.
+
           {
             echo "run_go=$run_go"
             echo "run_go_nested=$run_go_nested"
@@ -860,12 +869,47 @@ jobs:
           # or skipped (auto-detect said it wasn't applicable). repo and markdown
           # always run, so they must be success (skipped only if detect failed,
           # caught above).
+          #
+          # A skipped job is NOT a failure — most repos skip most of these, every
+          # run, legitimately. But "success" and "skipped" are indistinguishable
+          # in the pass/fail verdict, so the count is disclosed instead: a run
+          # where the detection went blind and everything skipped reads
+          # differently from one where the battery actually ran. The accounting
+          # goes to the step summary next to the per-job list because that is the
+          # one page a reader opens off a green check.
+          ran=0
+          skipped=0
           for pair in "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"; do
             name="${pair%%=*}"; result="${pair##*=}"
             if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
               echo "::error::$name job: $result"
               exit 1
             fi
+            if [ "$result" = "skipped" ]; then
+              skipped=$((skipped + 1))
+            else
+              ran=$((ran + 1))
+            fi
             echo "  $name: $result"
           done
           echo "All dispatched CI jobs passed (or skipped per auto-detect)"
+          echo "ran $ran / skipped $skipped"
+          {
+            echo "## CI validate"
+            echo ""
+            echo "**ran $ran / skipped $skipped** (of 11 dispatched jobs; detect: $DETECT)"
+            echo ""
+            echo "| Job | Result |"
+            echo "|---|---|"
+            echo "| repo | $REPO |"
+            echo "| go | $GO |"
+            echo "| go-nested | $GO_NESTED |"
+            echo "| ts | $TS |"
+            echo "| web | $WEB |"
+            echo "| shell | $SHELL |"
+            echo "| docker | $DOCKER |"
+            echo "| docker-arm64 | $DOCKER_ARM64 |"
+            echo "| markdown | $MARKDOWN |"
+            echo "| python | $PYTHON |"
+            echo "| scripts | $SCRIPTS |"
+          } >> "$GITHUB_STEP_SUMMARY"
