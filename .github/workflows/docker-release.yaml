@@ -17,8 +17,10 @@
 # every other Trivy invocation is advisory. It sits in the build matrix so each
 # leg scans its own architecture and so `finalize`'s existing `needs: build`
 # enforces it — a red leg means no manifest is assembled and no user-facing tag
-# ever points at the image. Read the step's own comment before changing its
-# severity floor or its `ignore-unfixed` setting.
+# ever points at the image. It is a hard gate on ANY failure, so a red leg is not
+# by itself proof of a vulnerability. Read the step's own comment for what makes
+# it red and the remedy for each cause before changing its severity floor or its
+# `ignore-unfixed` setting.
 #
 # When called with skip-if-unchanged=true (staleness-dispatched rebuilds only),
 # a no-change publish gate runs in finalize BEFORE the manifest is created: if
@@ -372,10 +374,13 @@ jobs:
           # via build-args; the only one this workflow passes is PKG_REFRESH,
           # a date.
           provenance: mode=max
-          # push-by-digest writes the per-arch image to GHCR (and Docker Hub
-          # if logged in) under a digest-only ref — no human-readable tags
-          # at this stage. The finalize job assembles the multi-arch manifest
-          # at the user-facing tags by referencing these digests.
+          # push-by-digest writes the per-arch image under a digest-only ref, with
+          # no human-readable tags at this stage. The finalize job assembles the
+          # multi-arch manifest at the user-facing tags by referencing these
+          # digests. The destination is GHCR ONLY: an image exporter pushes to the
+          # registries named in `name`, and this names one. The Docker Hub login
+          # above grants credentials for finalize's own push; it does not add an
+          # exporter destination here.
           outputs: |
             type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.name }}
@@ -401,14 +406,14 @@ jobs:
       # filtered out of the stream it protects.
       #
       # WHY IN THE BUILD MATRIX AND NOT IN finalize
-      # Three properties fall out for free. Each leg scans its OWN architecture,
-      # so coverage is every platform built rather than the amd64 resolution the
-      # no-change gate and the post-publish scan both settle for. `finalize`
+      # Two properties fall out for free. Each leg scans its OWN architecture, so
+      # coverage is every platform built rather than the amd64 resolution the
+      # no-change gate and the post-publish scan both settle for. And `finalize`
       # already declares `needs: [prepare, build]`, so a red leg means finalize
       # never starts: no manifest is created, no tag moves, and the gate is
-      # structural rather than one more `if:` a later edit can drop. And it runs
-      # on the native runner that just built the image, so nothing is pulled
-      # across the network to scan it.
+      # structural rather than one more `if:` a later edit can drop. `fail-fast:
+      # false` does not weaken that — it lets the sibling leg finish, it does not
+      # make a failed matrix job succeed.
       #
       # WHAT IS ALREADY PUBLISHED WHEN THIS FIRES
       # The per-arch image itself, under a digest-only ref with no human-readable
@@ -416,20 +421,33 @@ jobs:
       # by digest to hand `finalize` something to assemble — and it is the same
       # accepted limit the no-change gate documents for orphaned digests. Nothing
       # a consumer resolves has moved: `latest` and `vX.Y.Z` are created in
-      # `finalize`, which does not run.
+      # `finalize`, which does not run. Note the image is pulled back from GHCR to
+      # be scanned: the build output is registry-only, with no `load: true`, so
+      # this step adds a registry READ immediately after a successful write.
       #
-      # THE FALSE-POSITIVE CLASS TO EXPECT
-      # `ignore-unfixed` filters on whether the vulnerability database records a
-      # fixed VERSION, not on whether the distribution has shipped a package
-      # carrying it. So a base image can be blocked for a fix no rebuild can yet
-      # obtain. That case is real and this step will fail on it; the remedy is a
-      # `.trivyignore` entry naming the CVE and the reason, not weakening the
-      # severity floor and not restoring `ignore-unfixed: false`.
+      # WHAT MAKES IT RED, AND THE REMEDY FOR EACH
+      # `ignore-unfixed` is `--ignore-status affected,will_not_fix,fix_deferred,
+      # end_of_life`: it keeps only status `fixed`, which Trivy defines as "fixed
+      # on this platform". So a finding here means the distribution has SHIPPED a
+      # fix for this package on this release, and three causes remain:
+      #   1. The usual one, and a true positive: the image carries the old package
+      #      because the base digest lags or a cached apk/apt layer was restored.
+      #      Remedy is a rebuild that really re-fetches — `PKG_REFRESH` (see
+      #      "Resolve OS package refresh key"), a base-digest bump, or for a Go
+      #      binary a dependency or toolchain bump. NOT a `.trivyignore`.
+      #   2. A feed data error: a wrong fixed-version range, a misidentified
+      #      package. This is the one `.trivyignore` case — add the CVE id with the
+      #      reason, and note that an ignore-only commit does not by itself rerun a
+      #      blocked release unless cliff still owes one; otherwise the daily
+      #      staleness dispatch or `gh workflow run release.yaml` re-triggers it.
+      #   3. The scan did not complete. This step is a hard gate on ANY failure,
+      #      including a Trivy install, DB fetch, or registry read, so a red leg
+      #      does not on its own prove the image is vulnerable — read the log
+      #      before acting on it.
       #
-      # Consequence for the staleness rebuilds: a repo whose published image
-      # carries a fixable HIGH/CRITICAL now goes red daily instead of skipping
-      # quietly. That is the signal, not noise — it says the image a reader pulls
-      # is vulnerable and the fix exists.
+      # Consequence for the staleness rebuilds: a repo in state 1 or 3 now goes red
+      # daily instead of skipping quietly, and a red run never resets the staleness
+      # clock, so it stays eligible for the next day's dispatch until it is fixed.
       - name: CVE release gate
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:

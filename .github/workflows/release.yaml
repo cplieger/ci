@@ -877,11 +877,14 @@ jobs:
       # never fought, and a bare `exit 1` is that gate, not a blanket one.
       #
       # SKIPPED FOR: apps (a root `package main` is not a consumed module) and
-      # major bumps (gorelease cannot compare across majors, and a major bump is
-      # a deliberate break, so silence there is correct behaviour). Also skipped,
-      # not failed, when the tool cannot be installed: an unavailable checker is
-      # an infrastructure fault, and failing releases for it would teach the
-      # fleet to ignore this step.
+      # major bumps (a major IS the deliberate break, so a report of one carries
+      # no information). Note the skip rests on that ground alone: gorelease CAN
+      # compare across majors, via a `-base` carrying the other module path
+      # (`-base=example.com/mod/v2@v2.5.2`, documented in its own doc comment), so
+      # "it cannot" would be a false reason for a correct decision. Also skipped,
+      # not failed, when the tool cannot be installed OR cannot run: an
+      # unavailable checker is an infrastructure fault, and failing releases for
+      # it would teach the fleet to ignore this step.
       #
       # OPERATIONAL NOTE: gorelease refuses to run on a repo with uncommitted
       # changes ("has uncommitted changes", exit non-zero). That is fine here
@@ -910,7 +913,7 @@ jobs:
           fi
           prev_major="${prev#v}"; prev_major="${prev_major%%.*}"
           if [ "$major" != "$prev_major" ]; then
-            echo "::notice::major bump ${prev} -> ${VERSION}: a break is deliberate here, and gorelease cannot compare across majors - skipping"
+            echo "::notice::major bump ${prev} -> ${VERSION}: a break is deliberate here, so a report carries no information - skipping"
             exit 0
           fi
 
@@ -930,26 +933,79 @@ jobs:
           # that never said anything. The vacuous-gate class, in report form.
           rc=0
           "$(go env GOPATH)/bin/gorelease" -base="$prev" -version="$VERSION" > "$out" 2>&1 || rc=$?
+
+          # Classify the exit before reporting anything. gorelease routes THREE
+          # outcomes through two non-zero codes, and the discriminator is the log
+          # prefix, verified against the pinned source (cmd/gorelease/gorelease.go):
+          #   - `main` sets `log.SetPrefix("gorelease: ")`, so every operational
+          #     failure reaches `log.Fatal(err)` and its stderr line starts with
+          #     that prefix. Module download, proxy reachability, a dirty tree, a
+          #     missing base, package loading: all of these, all exit 1.
+          #   - a genuine verdict is `os.Exit(1)` with NO log call: the report was
+          #     already written to stdout, so no line carries the prefix.
+          #   - a *usageError prints to stderr unprefixed and exits 2. That is this
+          #     step calling gorelease wrongly, so it is a workflow defect.
+          # Without this split a Go proxy outage failed the release while asserting
+          # an exported-surface break and telling the author to add a `!`.
+          verdict=api
+          if [ "$rc" -eq 0 ]; then
+            verdict=ok
+          elif [ "$rc" -eq 2 ]; then
+            verdict=usage
+          elif grep -q '^gorelease: ' "$out"; then
+            verdict=operational
+          fi
+
           {
             echo "### API compatibility: ${prev} -> ${VERSION}"
             echo ""
-            if [ "$rc" -eq 0 ]; then
-              echo "gorelease accepts ${VERSION} as consistent with the exported-surface changes."
-            else
-              echo "gorelease reports ${VERSION} is NOT the right version for these changes."
-              echo "This FAILS the release. Either the change is compatible and the"
-              echo "report is wrong (investigate with apidiff), or the version is wrong"
-              echo "and the commit that mints it needs a \`!\` to cut a major."
-            fi
+            case "$verdict" in
+              ok)
+                echo "gorelease accepts ${VERSION} as consistent with the exported-surface changes."
+                ;;
+              api)
+                echo "gorelease REJECTED ${VERSION} for these changes, and this FAILS the release."
+                echo "It reports either an incompatible exported-surface change under a"
+                echo "non-major bump or a release diagnostic (\`isSuccessful\` covers both)."
+                echo "So read the report below before assuming which: if the version is"
+                echo "wrong, the commit that mints it needs a \`!\` to cut a major; if the"
+                echo "change is compatible and the report is wrong, investigate with apidiff."
+                ;;
+              operational)
+                echo "**gorelease could not run, so the API surface was NOT checked.**"
+                echo "This is an operational fault, not a verdict on ${VERSION} — a proxy"
+                echo "or module-download failure, an unavailable base, or a load error."
+                echo "The release proceeds UNVERIFIED. A repo that reports this on every"
+                echo "release has a permanently disabled gate; treat a repeat as a defect."
+                ;;
+              usage)
+                echo "**gorelease rejected this step's own arguments (exit 2).**"
+                echo "That is a defect in this workflow, not a verdict on ${VERSION}."
+                ;;
+            esac
             echo ""
             echo '```'
             head -c 8000 "$out"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::gorelease says ${VERSION} does not match the exported-surface change (see the run summary)"
-            exit 1
-          fi
+
+          case "$verdict" in
+            api)
+              echo "::error::gorelease rejected ${VERSION} for these exported-surface changes (see the run summary)"
+              exit 1
+              ;;
+            usage)
+              echo "::error::gorelease usage error - this step invoked it wrongly (see the run summary)"
+              exit 1
+              ;;
+            operational)
+              # Fail OPEN, on the same reasoning as the install failure above: an
+              # unreachable checker is an infrastructure fault, and failing every
+              # release on one teaches the fleet to ignore this step.
+              echo "::warning::gorelease could not run; ${VERSION} published WITHOUT an API check (see the run summary)"
+              exit 0
+              ;;
+          esac
           exit 0
 
       - name: Generate release notes
