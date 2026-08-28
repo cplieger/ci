@@ -807,7 +807,7 @@ jobs:
       - name: Publish image-size badge
         if: ${{ steps.sizebadge.outputs.json != '' }}
         continue-on-error: true
-        uses: cplieger/ci/actions/publish-badge@6bc328eadc36cd5cdd6187174650a09d093da6c1 # v2
+        uses: cplieger/ci/actions/publish-badge@958ba5feedad58277b0089f1aeb239d49a6e7608 # v2
         with:
           repo: ${{ github.repository }}
           token: ${{ github.token }}
