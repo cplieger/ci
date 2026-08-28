@@ -352,7 +352,7 @@ jobs:
       # NO browser step here, decided twice (2026-08). An earlier draft ran a
       # repo's Playwright suite against the loaded image at this point,
       # report-only. Removed: report-only with no named consumer is the
-      # "advisory stream nobody reads" the typos predicate exists to avoid, a
+      # "advisory stream nobody reads" class this repo keeps deleting, a
       # browser run is the flakiest check class while npm ci + a chromium
       # download tax every PR (~84% of which are Renovate/sync), and the failure
       # class it hunted has a deterministic core that needs no JS execution: the
@@ -562,35 +562,19 @@ jobs:
           markdownlint-cli2 --config "$RUNNER_TEMP/.markdownlint.json" \
             "**/*.md" "#node_modules" "#.git"
 
-      # Spell check, OPT-IN by a committed `_typos.toml`. The predicate is the
-      # config file rather than a library/app taxonomy: a fleet measurement put
-      # the app repos at 57-145 findings each (ISO 639-2 language codes in the
-      # subtitle apps, deliberately misspelled release-name fixtures, product
-      # names) against near-zero in the libraries, so a repo opts in once it has
-      # adjudicated its own dictionary. Same repo-owned-marker idiom as
-      # tests/image-smoke.conf and tests/shell/run.sh. A repo without the config
-      # is SKIPPED, not advised: typos has no SARIF sink or tracker here, so an
-      # advisory run would write to a log nobody reads.
-      - name: Install typos
-        if: ${{ hashFiles('_typos.toml') != '' }}
-        run: |
-          # renovate: datasource=github-releases depName=crate-ci/typos
-          VERSION=v1.49.1
-          curl -fsSL --connect-timeout 10 --max-time 30 \
-            --retry 7 --retry-max-time 150 --retry-all-errors \
-            -o "$RUNNER_TEMP/typos.tgz" \
-            "https://github.com/crate-ci/typos/releases/download/${VERSION}/typos-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
-          tar -xzf "$RUNNER_TEMP/typos.tgz" -C /tmp ./typos
-          sudo mv /tmp/typos /usr/local/bin/typos
-          typos --version
-
-      - name: Spell check (typos)
-        if: ${{ hashFiles('_typos.toml') != '' }}
-        run: typos --format brief
-
-      - name: Skip notice (typos)
-        if: ${{ hashFiles('_typos.toml') == '' }}
-        run: echo "::notice::typos skipped - commit a _typos.toml to enable the spell-check gate"
+      # NO spell check here, decided 2026-08 after measuring it. A `typos` gate
+      # shipped opt-in by a committed `_typos.toml`, and no repo ever committed
+      # one, so it was skip-noticing across the whole fleet. Measuring what it
+      # WOULD have said settled it rather than the enrolment: 30 findings across
+      # four sampled repos, zero real. One class is structural and would recur
+      # forever - envx deliberately feeds `"ture"` to its parser as a
+      # malformed-input fixture, with a comment saying so - and the rest are
+      # correct English the dictionary does not carry (`mis-sized`). Adjudicating
+      # that with a shared config would mean allowlisting the fleet's own test
+      # vocabulary, which is a dictionary that grows on every new fixture and
+      # catches nothing. Per-repo `_typos.toml` files are the same cost paid 53
+      # times. Prose defects here are caught by review; do not re-wire a
+      # spell-checker without a finding it would have caught.
 
       # Internal link + anchor check. OFFLINE only: this resolves relative links
       # and, with --include-fragments, heading anchors. It never touches the

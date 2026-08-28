@@ -29,8 +29,8 @@
 #     a shell var (e.g. GOVULNCHECK_VERSION=v1.6.0) which this script resolves:
 #     govulncheck, deadcode, punused, gopls (punused's LSP server); actionlint
 #     moved OUT of this set 2026-08 (now a curl-installed release binary,
-#     pinned in the meta ci.yaml repo job), and lychee + typos joined the
-#     curl set with the markdown-job gates
+#     pinned in the meta ci.yaml repo job), and lychee joined the curl set with
+#     the markdown-job gates
 #   Versions are always read live from the workflows, never hardcoded here,
 #   via the `# renovate: ... depName=X` + `VERSION` pins (hadolint's pin is the
 #   HADOLINT_VERSION var feeding its `hadolint/hadolint:<tag>` docker-run).
@@ -564,38 +564,6 @@ install_lychee() {
   fi
 }
 
-# install_typos: the spell-check gate in the meta CI markdown job (2026-08),
-# opt-in per repo by a committed _typos.toml. Installed unconditionally so a
-# local run matches CI the day a repo opts in. The tar member is `./typos`.
-install_typos() {
-  local want cur target
-  want="$(pin_version crate-ci/typos)"
-  [ -n "$want" ] || {
-    bad typos "no pin found"
-    return
-  }
-  cur="$(typos --version 2>/dev/null | semver || true)"
-  [ "$cur" = "${want#v}" ] && {
-    skip typos "$want"
-    return
-  }
-  case "$(uname -m)" in
-    x86_64 | amd64) target=x86_64-unknown-linux-musl ;;
-    aarch64 | arm64) target=aarch64-unknown-linux-musl ;;
-    *)
-      bad typos "unsupported arch $(uname -m)"
-      return
-      ;;
-  esac
-  mkdir -p "$BIN_DIR"
-  if fetch_extract "https://github.com/crate-ci/typos/releases/download/${want}/typos-${want}-${target}.tar.gz" \
-    -xz -C "$BIN_DIR" ./typos 2>/dev/null; then
-    ok typos "$want" "-> $BIN_DIR"
-  else
-    bad typos "download failed"
-  fi
-}
-
 # advise_gotoolchain: the go installs above self-heal a base/toolchain version
 # skew via GOTOOLCHAIN=auto, but local *repo* builds do not. With
 # GOTOOLCHAIN=local (Fedora bakes this default into its Go build) a
@@ -632,7 +600,6 @@ main() {
   install_ruff
   install_markdownlint
   install_lychee
-  install_typos
 
   printf 'tool               version    status\n'
   printf '%s\n' "${SUMMARY[@]}"
