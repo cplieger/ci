@@ -70,7 +70,7 @@ jobs:
       - name: Install shfmt
         run: |
           # renovate: datasource=github-releases depName=mvdan/sh
-          VERSION=v3.13.1
+          VERSION=v3.14.0
           sudo curl -fsSL --connect-timeout 10 --max-time 30 \
             --retry 7 --retry-max-time 150 --retry-all-errors \
             -o /usr/local/bin/shfmt \
