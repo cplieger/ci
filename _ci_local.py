@@ -255,7 +255,6 @@ _PIN_BINARY = {
     'rhysd/actionlint': 'actionlint',
     'zizmor': 'zizmor',
     'markdownlint-cli2': 'markdownlint-cli2',
-    'crate-ci/typos': 'typos',
     'lycheeverse/lychee': 'lychee',
     'ruff': 'ruff',
     'yamllint': 'yamllint',
@@ -1432,7 +1431,7 @@ def rewrite_htmlvalidate_gitignore(cmd: str, cwd: Path) -> str:
 #                        not even node_modules, and it raises rather than reports.
 #
 # Tools that honour .gitignore natively need no rewrite and deliberately have
-# none: lychee, typos, ruff, prettier, zizmor (all verified 2026-08-17).
+# none: lychee, ruff, prettier, zizmor (all verified 2026-08-17).
 # Three command SHAPES exist across the fleet, because the two bespoke-CI repos
 # (.kiro, homelab) predate the shared workflow and quote differently:
 #   meta ci.yaml / shell-ci  files=$(find . -name '*.sh' … )      newline list
