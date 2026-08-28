@@ -7,10 +7,18 @@
 # Pipeline:
 #   1. prepare:  derive tags from `version`, build per-arch matrix, run metadata-action
 #   2. build:    matrix over linux/amd64+linux/arm64 on native runners (no QEMU);
-#                push each arch by digest, upload digest artifact
+#                push each arch by digest, GATE on fixable HIGH/CRITICAL CVEs,
+#                upload digest artifact
 #   3. finalize: download digests → assemble multi-arch manifest via imagetools
 #                → cosign sign+attest → SBOM → Trivy → GitHub Release (gated on
 #                `release-needed`) → Docker Hub README/description sync
+#
+# The CVE gate in step 2 is the one blocking vulnerability scan in this fleet;
+# every other Trivy invocation is advisory. It sits in the build matrix so each
+# leg scans its own architecture and so `finalize`'s existing `needs: build`
+# enforces it — a red leg means no manifest is assembled and no user-facing tag
+# ever points at the image. Read the step's own comment before changing its
+# severity floor or its `ignore-unfixed` setting.
 #
 # When called with skip-if-unchanged=true (staleness-dispatched rebuilds only),
 # a no-change publish gate runs in finalize BEFORE the manifest is created: if
@@ -378,6 +386,64 @@ jobs:
           # scope keeps the amd64/arm64 builds from clobbering each other.
           cache-to: type=gha,mode=max,scope=${{ matrix.name }},ignore-error=true
 
+      # ─── CVE release gate ─────────────────────────────────────────────────
+      # BLOCKS the release on a HIGH/CRITICAL vulnerability that already has a
+      # fix. Every other Trivy invocation in this fleet is advisory; this one is
+      # not, and the asymmetry is deliberate.
+      #
+      # WHY A GATE HERE WHEN CVE SCANS NEVER GATE ELSEWHERE
+      # The standing rule is that a check must not gate if it can go red without
+      # anyone changing the code or the checker — a CVE published overnight would
+      # otherwise redden a pull request whose author can do nothing about it. At
+      # release neither half of that harm model holds. The releaser is the actor,
+      # not a bystander, and `ignore-unfixed: true` means every finding reported
+      # here has a published fix by construction, so the rule's own premise is
+      # filtered out of the stream it protects.
+      #
+      # WHY IN THE BUILD MATRIX AND NOT IN finalize
+      # Three properties fall out for free. Each leg scans its OWN architecture,
+      # so coverage is every platform built rather than the amd64 resolution the
+      # no-change gate and the post-publish scan both settle for. `finalize`
+      # already declares `needs: [prepare, build]`, so a red leg means finalize
+      # never starts: no manifest is created, no tag moves, and the gate is
+      # structural rather than one more `if:` a later edit can drop. And it runs
+      # on the native runner that just built the image, so nothing is pulled
+      # across the network to scan it.
+      #
+      # WHAT IS ALREADY PUBLISHED WHEN THIS FIRES
+      # The per-arch image itself, under a digest-only ref with no human-readable
+      # tag (see `outputs` on the build step). That is unavoidable — buildx pushes
+      # by digest to hand `finalize` something to assemble — and it is the same
+      # accepted limit the no-change gate documents for orphaned digests. Nothing
+      # a consumer resolves has moved: `latest` and `vX.Y.Z` are created in
+      # `finalize`, which does not run.
+      #
+      # THE FALSE-POSITIVE CLASS TO EXPECT
+      # `ignore-unfixed` filters on whether the vulnerability database records a
+      # fixed VERSION, not on whether the distribution has shipped a package
+      # carrying it. So a base image can be blocked for a fix no rebuild can yet
+      # obtain. That case is real and this step will fail on it; the remedy is a
+      # `.trivyignore` entry naming the CVE and the reason, not weakening the
+      # severity floor and not restoring `ignore-unfixed: false`.
+      #
+      # Consequence for the staleness rebuilds: a repo whose published image
+      # carries a fixable HIGH/CRITICAL now goes red daily instead of skipping
+      # quietly. That is the signal, not noise — it says the image a reader pulls
+      # is vulnerable and the fix exists.
+      - name: CVE release gate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          # vuln only. Secret detection stays on the advisory post-publish scan:
+          # an image-layer secret finding needs a human read rather than a
+          # release veto, and a false positive there must not stop a release.
+          scanners: 'vuln'
+          format: 'table'
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'
+
       - name: Export digest
         env:
           # Via env, never inline ${{ }} in the script body (template injection).
@@ -387,7 +453,6 @@ jobs:
           mkdir -p /tmp/digests
           # Filename = matrix.name (e.g. linux-amd64); content = the digest.
           echo "$DIGEST" > "/tmp/digests/${ARCH_NAME}"
-
       - name: Upload digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -821,6 +886,16 @@ jobs:
       # trees, so it never sees a secret introduced by a build ARG, a
       # gitignored COPY, or the base image. Pinning the value keeps a future
       # Trivy default change from removing it without anyone noticing.
+      #
+      # These two stay ADVISORY, and they are no longer the only CVE layer: the
+      # `CVE release gate` in the build matrix blocks a fixable HIGH/CRITICAL
+      # before any tag moves, so anything reaching here has already passed that
+      # floor. What is left for these to do is exactly what a veto cannot: report
+      # the full picture to the Security tab — MEDIUM and below, unfixed
+      # vulnerabilities, image-layer secrets, and on the skip path an advisory
+      # that only appeared after the last publish. A finding here that the gate
+      # would also catch means the vulnerability database moved between the build
+      # and this step, which is information rather than a defect.
       - name: Trivy scan published image
         if: ${{ steps.nochange.outputs.skip != 'true' }}
         continue-on-error: true
