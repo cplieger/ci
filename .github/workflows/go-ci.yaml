@@ -147,19 +147,50 @@ jobs:
       # actually has a generator that imports github.com/cplieger/wiregen.
       # Report-only: it regenerates into the runner's ephemeral tree and
       # fails if the committed output differs; it never writes back.
+      #
+      # `*.gen.*` is wiregen's own output naming (its writer emits
+      # types/decoders/registry/constants/client.gen.ts; the endpoints emitter
+      # adds a paths.gen.go), and it is used for two things here: deciding
+      # whether the repo HAS generated output at all, and scoping the drift
+      # diff. A generator that emits a differently-named file needs this
+      # pathspec widened, or its drift goes unmeasured. The prune list matches
+      # the meta ci.yaml's nested-module discovery: a golden fixture under
+      # testdata/ is not shipped output, and treating it as such would fail the
+      # wiregen library's own repo, which has fixtures and no generator.
       - name: Wiregen drift
         continue-on-error: true
         run: |
           (
             # 1+3. Detect + dynamically discover generator entrypoints: any
-            # `package main` directory that imports cplieger/wiregen.
+            # `package main` directory that imports cplieger/wiregen. The
+            # package clause is matched with a trailing-token pattern, not
+            # `^package main$`: an anchored end-of-line misses
+            # `package main // wire codegen entry point`, so writing an
+            # ordinary trailing comment used to disable this whole check
+            # silently. `package mainly` and `package main_test` still do not
+            # match.
             gens=$(grep -rlZ --include='*.go' 'cplieger/wiregen' . 2>/dev/null \
               | xargs -0 -r -n1 dirname | sort -u \
               | while IFS= read -r d; do
-                  grep -qE '^package main$' "$d"/*.go 2>/dev/null && echo "$d" || true
+                  grep -qE '^package main([[:space:]]|$)' "$d"/*.go 2>/dev/null && echo "$d" || true
                 done) || true
+            genfiles=$(git ls-files '*.gen.*' \
+              | grep -Ev '(^|/)(node_modules|vendor|testdata|static|dist)/' || true)
             if [ -z "$gens" ]; then
-              echo "wiregen: no generator command imports the library; skipping"
+              # Tracked generated output with no generator to regenerate it is
+              # the exact state this check exists to catch: the discovery above
+              # is two greps, and either one can be defeated by an ordinary
+              # edit (an import moved behind a helper package, a build tag).
+              # Skipping there means the committed artifacts stop being
+              # compared against their source of truth with nothing going red.
+              # No generated files and no generator is the honest empty set and
+              # still skips.
+              if [ -n "$genfiles" ]; then
+                echo "::error::wiregen: the repo tracks generated files but no generator command was discovered, so nothing regenerated them and this drift check measured nothing. Either a package main directory stopped importing github.com/cplieger/wiregen directly (check for the import moving behind a helper package or a build tag), or these files are no longer generated and should be deleted or renamed off the *.gen.* pattern."
+                printf '%s\n' "$genfiles" | sed 's/^/  tracked generated file: /'
+                exit 1
+              fi
+              echo "wiregen: no generator command imports the library and no generated files are tracked; skipping"
               exit 0
             fi
             # 2. Regenerate from the Go source of truth.
@@ -168,14 +199,20 @@ jobs:
               go run "./$d"
             done
             # Compare regenerated output against the committed tree
-            # (catches modified + added files via the staged index).
-            git add -A
-            if ! git diff --cached --quiet; then
+            # (catches modified + added files via the staged index). Scoped to
+            # the generated-file pathspec, not the whole tree: an unscoped
+            # `git add -A` reports any unrelated uncommitted edit as stale
+            # generator output, naming files no generator ever wrote — noise in
+            # CI only in theory (the checkout is clean) but a routine false
+            # positive under the local ci-local mirror, which runs over the
+            # working tree.
+            git add -A -- '*.gen.*'
+            if ! git diff --cached --quiet -- '*.gen.*'; then
               echo "::error::wiregen output is stale; re-run the generator(s) above and commit the result"
-              git --no-pager diff --cached --stat
+              git --no-pager diff --cached --stat -- '*.gen.*'
               exit 1
             fi
-            echo "wiregen: generated files up to date"
+            echo "wiregen: generated files up to date ($(printf '%s\n' "$genfiles" | grep -c . || true) tracked)"
           ) || { echo "wiregen drift" >> /tmp/_ci_failures; exit 1; }
 
       - name: Dead code (deadcode)
