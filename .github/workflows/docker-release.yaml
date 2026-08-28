@@ -899,7 +899,7 @@ jobs:
 
       - name: Generate SBOM (from image)
         if: ${{ inputs.sbom-from == 'image' && inputs.syft-config == '' && steps.nochange.outputs.skip != 'true' }}
-        uses: anchore/sbom-action@aa80c8c5bd439a416a62804f2151ab38c671a638 # v0.24.1
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
           format: spdx-json
@@ -908,7 +908,7 @@ jobs:
 
       - name: Generate SBOM (from image, with syft config)
         if: ${{ inputs.sbom-from == 'image' && inputs.syft-config != '' && steps.nochange.outputs.skip != 'true' }}
-        uses: anchore/sbom-action@aa80c8c5bd439a416a62804f2151ab38c671a638 # v0.24.1
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
           format: spdx-json
@@ -918,7 +918,7 @@ jobs:
 
       - name: Generate SBOM (from path)
         if: ${{ inputs.sbom-from == 'path' && steps.nochange.outputs.skip != 'true' }}
-        uses: anchore/sbom-action@aa80c8c5bd439a416a62804f2151ab38c671a638 # v0.24.1
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: /tmp/sbom-src
           format: spdx-json
