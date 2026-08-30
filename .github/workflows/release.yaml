@@ -919,7 +919,27 @@ jobs:
 
           # renovate: datasource=go depName=golang.org/x/exp
           XEXP_VERSION=v0.0.0-20260824195058-e88cd73687aa
-          GOTOOLCHAIN=auto go install "golang.org/x/exp/cmd/gorelease@${XEXP_VERSION}" || {
+          # gorelease TYPE-CHECKS the target module, so its own binary must be
+          # built with a toolchain at least as new as that module's `go`
+          # directive. A bare GOTOOLCHAIN=auto resolves the minimum x/exp needs
+          # (go1.26.7 at this pin), NOT what the target needs, so a module on a
+          # newer Go cannot be loaded at all. `go<ver>+auto` sets that floor and
+          # still upgrades when x/exp asks for more.
+          #
+          # Measured on cplieger/scheduler v4.0.1 (`go 1.27.0`): rejected on two
+          # consecutive pushes and a dispatch, with the report reading `package
+          # requires newer Go version go1.27 (application built with go1.26)` for
+          # BOTH the base and the release version. It reproduced nowhere locally
+          # because a workstation's toolchain already satisfies the directive.
+          # Every repo here tracks the latest Go patch, so this reaches any
+          # library whose directive outruns x/exp's floor.
+          mod_go=$(go mod edit -json 2>/dev/null | sed -n 's/^[[:space:]]*"Go": "\([^"]*\)".*/\1/p' | head -1)
+          if [ -n "$mod_go" ]; then
+            TOOLCHAIN="go${mod_go}+auto"
+          else
+            TOOLCHAIN=auto
+          fi
+          GOTOOLCHAIN="$TOOLCHAIN" go install "golang.org/x/exp/cmd/gorelease@${XEXP_VERSION}" || {
             echo "::warning::gorelease install failed - skipping API check (infrastructure fault, not an API verdict)"
             exit 0
           }
@@ -947,12 +967,24 @@ jobs:
           #     step calling gorelease wrongly, so it is a workflow defect.
           # Without this split a Go proxy outage failed the release while asserting
           # an exported-surface break and telling the author to add a `!`.
+          #
+          # A LOAD failure is the fourth outcome and it reaches none of the three
+          # above: gorelease writes package errors into the REPORT and exits 1
+          # with no log call, so it is prefix-less exactly like a genuine verdict.
+          # Its own summary line is the discriminator. This must fail OPEN — the
+          # surface was never compared, so there is no verdict to enforce, and
+          # treating it as one told scheduler v4.0.1 to cut a major over a
+          # toolchain mismatch. Anchored to gorelease's exact sentence rather
+          # than to `errors in base version`, which also appears in the
+          # per-package body of a report that DID compare.
           verdict=api
           if [ "$rc" -eq 0 ]; then
             verdict=ok
           elif [ "$rc" -eq 2 ]; then
             verdict=usage
           elif grep -q '^gorelease: ' "$out"; then
+            verdict=operational
+          elif grep -qx 'Errors were found in one or more packages\.' "$out"; then
             verdict=operational
           fi
 
