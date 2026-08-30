@@ -142,14 +142,14 @@ jobs:
   #
   # This job measures that surface and reports it. It deliberately does NOT gate:
   #
-  #   - `continue-on-error: true` at JOB level, so nothing here can fail the
-  #     workflow run. That covers what no in-body guard can — a job timeout, a
-  #     runner OOM, a browser install that dies. A surface that has never been
-  #     measured has never been kept green either, so some of these packages
-  #     fail their own per-file thresholds on genuinely uncovered code, and a
-  #     gate would redden their main branch the day it landed. The count is
-  #     deliberately not recorded here: it moves as each package is worked, and
-  #     a number in a comment would be wrong within the week.
+  #   - `continue-on-error: true` at JOB level, so a FAILURE here cannot fail the
+  #     workflow run. A surface that has never been measured has never been kept
+  #     green either, so some of these packages fail their own per-file
+  #     thresholds on genuinely uncovered code, and a gate would redden their
+  #     main branch the day it landed. The count is deliberately not recorded
+  #     here: it moves as each package is worked, and a number in a comment
+  #     would be wrong within the week. It does NOT cover an overrun — see
+  #     `timeout-minutes` below.
   #   - its own job, so a browser-mode suite cannot eat the badge job's budget,
   #     and so the badge path above is byte-for-byte unchanged.
   #   - `contents: read`: no badge is published. The number goes to the job
@@ -164,8 +164,17 @@ jobs:
     # Generous on purpose: this leg pays npm ci + a Chromium install + a
     # browser-mode suite under coverage instrumentation on top of each other,
     # and a timeout here would measure nothing rather than measure something
-    # slowly. Job-level continue-on-error is what makes an overrun contained
-    # instead of red — no in-body guard can catch a timeout.
+    # slowly.
+    #
+    # An overrun IS red, and the job-level `continue-on-error` above does not
+    # change that: it downgrades a failure and says nothing about a
+    # cancellation, so a job that hits this bound reports `cancelled` and takes
+    # the RUN to `cancelled` with it. Measured on vibekit 2026-08-30, run
+    # 33319190015: job conclusion `cancelled`, run conclusion `cancelled`, 45
+    # such runs since this job landed. Containing an overrun instead needs an
+    # in-body `timeout` around the vitest call, which turns it into a step
+    # failure the flag does absorb; not done, because the one repo that hung was
+    # hanging on its own defect and a bound here would have hidden it.
     timeout-minutes: 45
     continue-on-error: true
     permissions:
