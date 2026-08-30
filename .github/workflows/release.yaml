@@ -989,20 +989,38 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # The report also goes to the LOG, not only to the step summary. A summary is
+          # reachable from a browser and from nothing else: it is absent from
+          # `gh run view --log` and from the check-run API, so the one artifact that
+          # explains a verdict is unreadable from a terminal exactly when the verdict
+          # needs investigating. Measured on cplieger/scheduler v4.0.1 — an `api`
+          # rejection that reproduced on two consecutive pushes and in none of five
+          # local configurations, including a fresh clone at the same commit with the
+          # pinned tool and the same base, where gorelease exits 0 and calls the version
+          # valid. Diagnosis stalled on not being able to read the report.
+          #
+          # Only for a non-ok verdict: on `ok` the report is one line nobody reads, and
+          # this step runs on every library release in the fleet.
+          if [ "$verdict" != ok ]; then
+            echo "::group::gorelease report (${prev} -> ${VERSION}, verdict: ${verdict})"
+            head -c 8000 "$out"
+            echo "::endgroup::"
+          fi
+
           case "$verdict" in
             api)
-              echo "::error::gorelease rejected ${VERSION} for these exported-surface changes (see the run summary)"
+              echo "::error::gorelease rejected ${VERSION} for these exported-surface changes (report above, and in the run summary)"
               exit 1
               ;;
             usage)
-              echo "::error::gorelease usage error - this step invoked it wrongly (see the run summary)"
+              echo "::error::gorelease usage error - this step invoked it wrongly (report above, and in the run summary)"
               exit 1
               ;;
             operational)
               # Fail OPEN, on the same reasoning as the install failure above: an
               # unreachable checker is an infrastructure fault, and failing every
               # release on one teaches the fleet to ignore this step.
-              echo "::warning::gorelease could not run; ${VERSION} published WITHOUT an API check (see the run summary)"
+              echo "::warning::gorelease could not run; ${VERSION} published WITHOUT an API check (report above, and in the run summary)"
               exit 0
               ;;
           esac
