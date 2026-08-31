@@ -523,6 +523,21 @@ jobs:
             /tmp/gitleaks dir . --no-banner --redact --exit-code 1
           ) || { echo "Scan for secrets (gitleaks)" >> /tmp/_ci_failures; exit 1; }
 
+      # A local action is available while this repository validates the commit
+      # that introduces it. Consumers use the released action because their
+      # checkout does not contain cplieger/ci's action directory.
+      - name: Comment ratio
+        if: ${{ github.repository == 'cplieger/ci' }}
+        continue-on-error: true
+        uses: ./actions/comment-audit
+
+      # Bootstrap at v2 because the action has no earlier commit to pin. Pin
+      # this reference to the first release commit after v2 moves.
+      - name: Comment ratio
+        if: ${{ github.repository != 'cplieger/ci' }}
+        continue-on-error: true
+        uses: cplieger/ci/actions/comment-audit@v2 # v2
+
       - name: Check results
         if: always()
         run: |
