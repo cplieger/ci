@@ -16,6 +16,16 @@ rules:
         # Everyone else stays hash-pinned (the repo standard).
         "*": hash-pin
 
+  self-repository:
+    ignore:
+      # actionlint v1.7.12 rejects GitHub's `$/...` syntax. Keep the
+      # workspace-relative form until actionlint supports the dedicated form;
+      # remove this ignore with that actionlint bump.
+      - ci.yaml
+      - release.yaml
+      - self-ci.yaml
+      - self-codeql.yml
+
   secrets-inherit:
     ignore:
       # release.yaml forwards `secrets: inherit` to its OWN docker-release.yaml
