@@ -1306,7 +1306,7 @@ jobs:
         # The renderer's own failures are already caught inside the action (empty
         # `path` output); this covers the action itself failing to resolve.
         continue-on-error: true
-        uses: cplieger/ci/actions/render-hub-overview@v2
+        uses: cplieger/ci/actions/render-hub-overview@e18b9a64157dea925d962be4265806b99e7f7680 # v2
         with:
           owner: ${{ github.repository_owner }}
           repo: ${{ github.event.repository.name }}
