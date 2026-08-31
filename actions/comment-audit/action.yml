@@ -1,0 +1,15 @@
+name: comment-audit
+description: >-
+  Fail when production and test source carries more than 0.55 comment lines per
+  code line, excluding documentation examples, configuration, and generated
+  artifacts.
+
+runs:
+  using: composite
+  steps:
+    - name: Measure source comment ratio
+      shell: bash
+      run: |
+        (
+          python3 "${GITHUB_ACTION_PATH}/comment-audit.py" --github
+        ) || { echo "Comment ratio" >> /tmp/_ci_failures; exit 1; }

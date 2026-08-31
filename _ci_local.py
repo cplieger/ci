@@ -713,6 +713,25 @@ def _split_logical(expr, operator):
     return parts if len(parts) > 1 else [expr]
 
 
+def _github_repository(workspace):
+    """Resolve github.repository for local workflow conditions."""
+    configured = os.environ.get('GITHUB_REPOSITORY', '').strip()
+    if configured:
+        return configured
+    result = subprocess.run(
+        ['git', 'remote', 'get-url', 'origin'],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        match = re.search(r'github\.com(?::|/)([^/]+/[^/]+?)(?:\.git)?$', result.stdout.strip())
+        if match:
+            return match.group(1)
+    return ''
+
+
 def _resolve_value(tok, step_outputs, caller_inputs, workspace):
     """Resolve a tok to its value."""
     tok = tok.strip()
@@ -746,6 +765,9 @@ def _resolve_value(tok, step_outputs, caller_inputs, workspace):
     # github.event.repository.private
     if tok == 'github.event.repository.private':
         return 'false'  # treat as public -> full run
+
+    if tok == 'github.repository':
+        return _github_repository(workspace)
 
     # github.event_name: local validation models the PR gate. The heavy battery
     # still runs fail-safe even without a base SHA, but PR-only checks are
@@ -1019,6 +1041,20 @@ def classify_step(step):
             # as package-dir), and ci-local already runs the step in it. Passing
             # the flag as well resolved static-src/static-src.
             return 'LOCAL', name, f'python3 {shlex.quote(str(script))} --github'
+        if action_ref in ('./actions/comment-audit', 'cplieger/ci/actions/comment-audit'):
+            script = _ci_repo_root(Path.cwd()) / 'actions/comment-audit/comment-audit.py'
+            if not script.is_file():
+                return (
+                    'NOLOCAL',
+                    name,
+                    'comment-audit.py not found in the sibling ci/ checkout',
+                )
+            command = f'python3 {shlex.quote(str(script))} --github'
+            return (
+                'LOCAL',
+                name,
+                f'( {command} ) || {{ echo "Comment ratio" >> /tmp/_ci_failures; exit 1; }}',
+            )
         # The required image gates use build-push-action. Native builds use the
         # daemon builder; the arm64 twin uses buildx with an explicit platform.
         # Platform availability is checked only when executing, so --plan-only
@@ -2362,7 +2398,10 @@ def process_reusable_steps(
             continue
 
         soft_gate = step.get('continue-on-error') in (True, 'true')
-        records_failure = '/tmp/_ci_failures' in str(step.get('run', ''))
+        records_failure = (
+            '/tmp/_ci_failures' in str(step.get('run', ''))
+            or '/tmp/_ci_failures' in detail
+        )
         if res.outcome == 'missing':
             counters['FAIL'] += 1
             overall_ok = False
