@@ -10,7 +10,7 @@
 #                push each arch by digest, upload digest artifact
 #   3. finalize: download digests → assemble multi-arch manifest via imagetools
 #                → cosign sign+attest → SBOM → Trivy → GitHub Release (gated on
-#                `release-needed`) → Docker Hub README/description sync
+#                `release-needed`) → Docker Hub overview/description sync
 #
 # EVERY vulnerability scan in this pipeline is advisory. A blocking `CVE release
 # gate` lived in step 2 for five hours on 2026-08-28 and was withdrawn on its
@@ -1291,16 +1291,42 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$(jq -n --arg d "$REPO_DESC" '{description: $d}')" >/dev/null
 
-      - name: Push README to Docker Hub
+      # Docker Hub caps a full description at 25,000 bytes and the publish step
+      # below truncates anything longer, which cut the end of the document. So
+      # the Hub gets a short generated overview (summary, pull, compose, links)
+      # instead of the whole README, and the README carries no byte budget.
+      # Bounded by construction: its two variable inputs are the README's marked
+      # summary region and compose.yaml, neither of which grows with the README.
+      - name: Render Docker Hub overview
+        id: hub-overview
         if: ${{ contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main' && steps.nochange.outputs.skip != 'true' }}
+        # Non-blocking, matching the push step below: syncing Hub docs has never
+        # gated a release, and this step runs AFTER the images are published, so
+        # failing the job here would strand a release over a documentation page.
+        # The renderer's own failures are already caught inside the action (empty
+        # `path` output); this covers the action itself failing to resolve.
+        continue-on-error: true
+        uses: cplieger/ci/actions/render-hub-overview@v2
+        with:
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}
+          ref: ${{ github.ref_name }}
+          output: ${{ runner.temp }}/hub-overview.md
+
+      - name: Push README to Docker Hub
+        # Gated on the render producing a file: a README with no summary markers
+        # fails the render closed, and skipping the push leaves the previous Hub
+        # page in place rather than replacing it with a broken one.
+        if: ${{ contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main' && steps.nochange.outputs.skip != 'true' && steps.hub-overview.outputs.path != '' }}
         continue-on-error: true
         uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}
-          readme-filepath: README.md
-          # Expand relative in-repo links to absolute GitHub URLs in the Hub
-          # payload only — source READMEs stay relative (clone-friendly), and
-          # the Hub page stops 404ing README links (public-docs.md).
-          enable-url-completion: true
+          readme-filepath: ${{ steps.hub-overview.outputs.path }}
+          # Off deliberately: the renderer already emits absolute GitHub URLs,
+          # and this option would resolve each anchor against the generated file
+          # as though it were README.md, which is the wrong target.
+          enable-url-completion: false

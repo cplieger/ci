@@ -157,8 +157,11 @@ FOOTER_AI_NOTE = (
     "[Kiro](https://kiro.dev). The human maintainer defines architecture, "
     "supervises implementation, and makes all final decisions."
 )
-README_HARD_CAP = 25000  # Docker Hub full-description limit (bytes)
-README_WARN_CAP = 24000  # approach telemetry + margin for URL expansion
+# Docker Hub gets a short generated overview page, not the README, so a README
+# carries no byte budget. What an image repo must have instead is the marker pair
+# the renderer extracts its summary from (ci/actions/render-hub-overview).
+HUB_MARKER_BEGIN = "<!-- hub-overview BEGIN -->"
+HUB_MARKER_END = "<!-- hub-overview END -->"
 
 # Known-accepted deviations from the standard: {repo: {warning-prefix: reason}}.
 # A warning whose text starts with a listed prefix is suppressed from the
@@ -654,10 +657,8 @@ def collect(meta):
 
     # Public docs standard. One contents read serves every README check:
     # presence, the canonical footer blocks, License-last heading order, and
-    # the Docker Hub size ceiling (the `size` field is the raw byte size, so
-    # no decode round-trip can distort the cap check). Public repos only —
-    # reader-facing docs have no audience on a private repo.
-    s["readme_size"] = None
+    # the Docker Hub overview markers. Public repos only — reader-facing docs
+    # have no audience on a private repo.
     s["readme_text"] = None
     s["compose_example"] = None
     if not s["private"]:
@@ -665,14 +666,12 @@ def collect(meta):
         if rd is API_ERROR:
             s["errors"].append("README.md unreadable (API)")
         elif isinstance(rd, dict) and rd.get("content") is not None:
-            s["readme_size"] = rd.get("size")
             try:
                 s["readme_text"] = base64.b64decode(
                     "".join(rd["content"].split())).decode("utf-8", "replace")
             except (ValueError, UnicodeError):
                 s["readme_text"] = ""
         else:
-            s["readme_size"] = 0
             s["readme_text"] = ""  # definitively absent
         if s.get("has_dockerfile"):
             comp = file_text(name, "compose.yaml")
@@ -952,11 +951,11 @@ def compliance(s):
     # Public docs standard (public-docs.md). Presence is hard (a public repo
     # without a README is broken for its audience). The footer blocks and
     # License-last order are warnings: real drift, but aligned by the
-    # docs-review skill rather than blocking the audit. The image-repo size
-    # ceiling is hard because it is CURRENT breakage — Docker Hub truncates
-    # the mirrored description above 25,000 bytes, cutting the footer off the
-    # live Hub page. readme_text None means the read failed (already an
-    # [error]); '' means definitively absent.
+    # docs-review skill rather than blocking the audit. The image-repo marker
+    # check is hard because a release cannot build the Docker Hub overview page
+    # without it, so the live Hub page silently stops being updated.
+    # readme_text None means the read failed (already an [error]); '' means
+    # definitively absent.
     if not s["private"] and s.get("readme_text") is not None:
         txt = s["readme_text"]
         if not txt.strip():
@@ -975,17 +974,14 @@ def compliance(s):
                     warn.append(f"README's last section is '{headings[-1]}' "
                                 "(want License last — public-docs.md footer "
                                 "invariant)")
-            if s.get("has_dockerfile"):
-                size = s["readme_size"] if isinstance(s.get("readme_size"), int) \
-                    else len(txt.encode())
-                if size > README_HARD_CAP:
-                    hard.append(f"README {size} bytes exceeds Docker Hub's "
-                                f"{README_HARD_CAP}-byte description cap (the "
-                                "mirrored Hub page is truncated mid-document)")
-                elif size > README_WARN_CAP:
-                    warn.append(f"README {size} bytes nears Docker Hub's "
-                                f"{README_HARD_CAP}-byte description cap (run "
-                                "the public-docs.md overflow ladder)")
+            if s.get("has_dockerfile") and not (
+                HUB_MARKER_BEGIN in txt and HUB_MARKER_END in txt
+            ):
+                hard.append(f"README carries no '{HUB_MARKER_BEGIN}' / "
+                            f"'{HUB_MARKER_END}' pair, so the release cannot "
+                            "build the Docker Hub overview page and the Hub "
+                            "listing stops being updated (public-docs.md "
+                            '"Docker Hub overview")')
         if s.get("compose_example") is False:
             warn.append("compose.yaml example missing (image repos ship a "
                         "reference compose — compose-examples.md)")
