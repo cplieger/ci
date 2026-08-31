@@ -531,12 +531,12 @@ jobs:
         continue-on-error: true
         uses: ./actions/comment-audit
 
-      # Bootstrap at v2 because the action has no earlier commit to pin. Pin
-      # this reference to the first release commit after v2 moves.
+      # The action pin points to the commit that introduced the action. Renovate
+      # moves it with the v2 tag after this workflow lands.
       - name: Comment ratio
         if: ${{ github.repository != 'cplieger/ci' }}
         continue-on-error: true
-        uses: cplieger/ci/actions/comment-audit@v2 # v2
+        uses: cplieger/ci/actions/comment-audit@783718bb171e8bf3c4316a844cbc0b1cf0f3dca5 # v2
 
       - name: Check results
         if: always()
