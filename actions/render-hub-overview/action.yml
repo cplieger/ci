@@ -1,0 +1,66 @@
+name: render-hub-overview
+description: >-
+  Render the short Docker Hub overview page for an image repo and print its
+  path. Wraps render-hub-overview.py in this directory, which reads the marked
+  summary region of the consumer's README plus its compose example and derives
+  everything else. Referenced by docker-release.yaml as
+  cplieger/ci/actions/render-hub-overview@<sha> — a composite action MUST be
+  pinned by ref (a local ./ path would resolve against the consumer's checkout
+  and 404); Renovate keeps the pin current. Exists because Docker Hub caps a
+  full description at 25,000 bytes: mirroring the whole README put every app
+  README under a byte budget unrelated to what the README is for, and the
+  publish action truncated the overflow, cutting the footer.
+
+inputs:
+  owner:
+    description: GitHub owner of the consumer repo, e.g. cplieger.
+    required: true
+  repo:
+    description: Consumer repo name, e.g. docker-radvd.
+    required: true
+  image:
+    description: Docker Hub image the page tells readers to pull, e.g. cplieger/docker-radvd.
+    required: true
+  ref:
+    description: Git ref the generated links point at (default main).
+    required: false
+    default: main
+  output:
+    description: Path to write the rendered page to.
+    required: false
+    default: hub-overview.md
+
+outputs:
+  path:
+    description: Path of the rendered page, empty when rendering failed.
+    value: ${{ steps.render.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Render Docker Hub overview
+      id: render
+      shell: bash
+      env:
+        # Inputs travel via env, never inline ${{ }} in the script body, so a
+        # value can't expand into shell code (template injection).
+        HUB_OWNER: ${{ inputs.owner }}
+        HUB_REPO: ${{ inputs.repo }}
+        HUB_IMAGE: ${{ inputs.image }}
+        HUB_REF: ${{ inputs.ref }}
+        HUB_OUTPUT: ${{ inputs.output }}
+      # Fails closed: on a missing marker pair the script exits 1 with an
+      # ::error:: and `path` stays empty, so the caller skips the Hub push and
+      # the previous page survives rather than being replaced by a broken one.
+      # GITHUB_ACTION_PATH is set by the runner to this action's directory.
+      run: |
+        if python3 "${GITHUB_ACTION_PATH}/render-hub-overview.py" \
+             --owner "$HUB_OWNER" \
+             --repo "$HUB_REPO" \
+             --image "$HUB_IMAGE" \
+             --ref "$HUB_REF" \
+             --output "$HUB_OUTPUT"; then
+          echo "path=$HUB_OUTPUT" >> "$GITHUB_OUTPUT"
+        else
+          echo "path=" >> "$GITHUB_OUTPUT"
+        fi

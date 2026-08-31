@@ -1,0 +1,129 @@
+# On-demand push of the generated Docker Hub overview page to every image repo.
+#
+# WHY THIS EXISTS RATHER THAN "WAIT FOR A RELEASE"
+# docker-release.yaml syncs a repo's Hub page on every genuine release, and that
+# covers steady state. It does NOT cover two cases:
+#
+#   * Adopting the overview page. Until a repo cuts its next release its Hub
+#     listing still shows the old full README, and a stable repo can go months
+#     without one (docker-keepalived has 14 releases in its lifetime).
+#   * Changing the renderer. A fleet-wide re-sync otherwise waits on 22
+#     independent release cadences.
+#
+# The daily staleness rebuild does not help either: every Hub step in
+# docker-release.yaml is gated on `nochange.skip != 'true'`, so a rebuild that
+# finds nothing changed deliberately leaves the Hub page alone.
+#
+# WHY NOT JUST DISPATCH EACH REPO'S release.yaml
+# That works and costs far more. A dispatch has no before-SHA, so every file
+# counts as changed and the docker job rebuilds, re-signs, re-attests and
+# re-scans a multi-arch image whose source did not change. The minutes are free
+# on public repos, but `:latest` gets a new digest for byte-identical content,
+# and homelab pins every image by digest — so 22 rebuilds produce 22 Renovate
+# digest-bump PRs on the one private repo that draws the included-minutes quota.
+# Rendering a page and PATCHing one API field costs seconds and moves no digest.
+#
+# NO SCHEDULE, deliberately. This is a backfill for a change someone just made,
+# and a recurring run would need a named consumer for its output. Releases own
+# steady state.
+name: Sync Docker Hub overviews
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Space/comma-separated repo names to limit the run. Empty runs every image repo."
+        required: false
+        default: ""
+      apply:
+        description: "Write to Docker Hub. Left off, the run renders every page and reports what would change."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-hub-overviews
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out ci (renderer + sync script)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Clone the image repos
+        env:
+          # Discovery needs a token that can list the account's repos; cloning
+          # does not, so the clones below go over anonymous HTTPS and no token
+          # is in scope while another repo's content lands on disk.
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          # Injected via env (never inline ${{ }} in the body) so a crafted
+          # dispatch input cannot expand into shell code.
+          ONLY: ${{ github.event.inputs.only }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hubsync
+
+          # Archived and fork repos are excluded fleet-wide (an archived repo is
+          # read-only and a fork's tree is upstream's).
+          mapfile -t candidates < <(
+            gh repo list cplieger --limit 200 --no-archived \
+              --json name,isFork,visibility \
+              --jq '.[] | select(.isFork == false and .visibility == "PUBLIC") | .name' \
+              | sort
+          )
+
+          want=""
+          if [ -n "${ONLY:-}" ]; then
+            want=" $(printf '%s' "$ONLY" | tr ',' ' ' | tr -s ' ') "
+          fi
+
+          count=0
+          for r in "${candidates[@]}"; do
+            if [ -n "$want" ]; then
+              case "$want" in
+                *" $r "*) ;;
+                *) continue ;;
+              esac
+            fi
+            # An image repo is one with a root Dockerfile. Checking via the API
+            # avoids cloning the ~30 library repos to discover they have none.
+            if ! gh api "repos/cplieger/$r/contents/Dockerfile" --silent >/dev/null 2>&1; then
+              continue
+            fi
+            git clone --quiet --depth 1 --single-branch \
+              "https://github.com/cplieger/$r.git" "/tmp/hubsync/$r"
+            count=$((count + 1))
+          done
+
+          echo "::notice::cloned ${count} image repo(s)"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no image repos matched; nothing to sync"
+            exit 1
+          fi
+
+      - name: Sync overviews to Docker Hub
+        env:
+          # Scoped to this step: the clone step above puts other repos' content
+          # on disk, and the Hub credentials have no business being in scope
+          # while that happens.
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          APPLY: ${{ github.event.inputs.apply }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKERHUB_TOKEN:-}" ] || [ -z "${DOCKERHUB_USERNAME:-}" ]; then
+            echo "::error::DOCKERHUB_USERNAME and DOCKERHUB_TOKEN must be set on cplieger/ci"
+            exit 1
+          fi
+          args=(--workspace /tmp/hubsync)
+          if [ "${APPLY}" = "true" ]; then
+            args+=(--apply)
+          fi
+          python3 scripts/sync-hub-overviews.py "${args[@]}"
