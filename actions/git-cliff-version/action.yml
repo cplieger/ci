@@ -20,8 +20,8 @@ runs:
         # Fail-closed: a tarball that does not match the committed pin never
         # installs.
         # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
-        CLIFF_VERSION=v2.13.1
-        CLIFF_SHA256=9a1263f24e59a2f508c7b3d3283c9dea94a8bf697f96dbc18cc783cac6284546
+        CLIFF_VERSION=v2.14.1
+        CLIFF_SHA256=dfe9bef0c7a00d05fafe78e6e591a1a280d39dd495b8066764db0a559acde67f
         curl -fsSL --retry 7 --retry-max-time 150 --retry-all-errors -o "$RUNNER_TEMP/git-cliff.tgz" \
           "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
         echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
