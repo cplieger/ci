@@ -77,6 +77,19 @@ GENERATED_HEADER = re.compile(
 )
 DO_NOT_EDIT = re.compile(r'\bdo not edit\b', re.IGNORECASE)
 EXAMPLE_NAME = re.compile(r'\.(?:example|sample)\.', re.IGNORECASE)
+# Destinations sync.yaml copies verbatim from cplieger/ci. A consumer does not
+# author these and must not edit its copy, so measuring them charges every
+# adopting repo for prose written here — where this gate does not even run
+# (cplieger/ci is in EXCLUDED_REPOSITORIES). Keyed on the consumer-side path
+# because that is the tree being audited; keep in step with the sync map in
+# scripts/classify-repos.py. eslint.config.base.mjs needs no entry: it is
+# already caught by config_or_example.
+SYNCED_PATHS = {
+    'tests/image-smoke.sh',
+    'tests/shell/lib.sh',
+    'tests/shell/harness_test.sh',
+    'scripts/repin-sha.sh',
+}
 HEREDOC_RE = re.compile(
     r"""(?<!<)<<-?\s*(?:
         \\(?P<escaped>[A-Za-z_][A-Za-z0-9_]*)
@@ -188,6 +201,10 @@ def exclusion(path: Path, text: str) -> str | None:
     header = '\n'.join(text.splitlines()[:10])
     if GENERATED_HEADER.search(header) and DO_NOT_EDIT.search(header):
         return 'generated/vendor'
+    # Before the test_source early-return: three of the four synced paths live
+    # under tests/, which that branch admits.
+    if path.as_posix() in SYNCED_PATHS:
+        return 'synced from cplieger/ci'
     if test_source(path):
         return None
     if parts & DOC_SEGMENTS:
