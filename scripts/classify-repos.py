@@ -1,29 +1,26 @@
 #!/usr/bin/env python3
 """Auto-discover and profile all cplieger repos, emitting .github/sync.yml.
 
-Python port of the retired classify-repos.sh, preserving its discovery
-filters, classification logic, cliff-tier selection, repo ordering, and YAML
-output byte-for-byte. The manifest goes to STDOUT (sync.yaml redirects it to
-.github/sync.yml — a gitignored runtime artifact, never committed); per-repo
-diagnostics go to stderr.
+Preserves classify-repos.sh's discovery filters, classification logic,
+cliff-tier selection, repo ordering, and YAML output byte-for-byte. The
+manifest goes to STDOUT (sync.yaml redirects it to .github/sync.yml — a
+gitignored runtime artifact, never committed); per-repo diagnostics go to
+stderr.
 
-Note: per-type ci.yaml templates (ci-go, ci-shell, ci-ts-lib) were retired in
-favor of a single unified ci.yml that targets the central detect-and-dispatch
-ci.yaml workflow in cplieger/ci. ALL releaseable repos receive the same
-ci.yaml; the central workflow auto-detects surfaces (go.mod / jsr.json /
-Dockerfile / nested web frontend) and runs the right jobs in parallel. No
-more bespoke per-repo ci.yaml.
+ALL releaseable repos receive the same ci.yaml: the central
+detect-and-dispatch workflow in cplieger/ci auto-detects surfaces (go.mod /
+jsr.json / Dockerfile / nested web frontend) and runs the right jobs itself,
+so there is no bespoke per-repo template.
 
 Auth: every GitHub read goes through the ambient `gh` CLI credentials
 (GH_TOKEN / SYNC_PAT in CI); no token handling here.
 
-Failure model: the initial `gh repo list` aborts the run on error or timeout
-(exit code propagated; 124 on timeout, like GNU timeout), and it aborts on
-hitting the --limit ceiling. Per-repo TREE reads degrade to a safe fallback —
-an unreadable repo classifies as lang=none and drops out of every group
-(mirrors the bash). The TAGS read is the exception and aborts on failure:
-misreading it does not degrade, it picks the WRONG cliff tier and the sync
-auto-merges the wrong cliff.toml (a hardening over the fail-open bash).
+Failure model: the initial `gh repo list` aborts on error, timeout (exit 124),
+or hitting the --limit ceiling. Per-repo TREE reads degrade to a safe
+fallback — an unreadable repo classifies as lang=none and drops out of every
+group. The TAGS read is the exception and aborts on failure instead: a
+misread there silently picks the wrong cliff tier and auto-merges the wrong
+cliff.toml.
 
 Run:
   scripts/classify-repos.py > .github/sync.yml
@@ -88,15 +85,11 @@ PYTHON_FILES = """\
         dest: ruff.toml"""
 
 # The sha256 integrity-pin recompute helper, invoked by Renovate's
-# postUpgradeTasks (rule in cplieger/.github's default.json) so a version bump
-# and its recomputed digest land in one commit. Keyed on a root Dockerfile
-# rather than a committed opt-in marker: the script is DECLARATIVE about what it
-# touches -- it acts only on `# repin: dep=... url=...` marker lines it finds --
-# so a repo with a Dockerfile and no markers receives an inert file, while a
-# marker opt-in would need the script present before it could be added (the same
-# bootstrap paradox that keeps tests/shell/run.sh out of the sync). Syncing it is
-# the point: five hand-maintained copies of one recompute routine is exactly the
-# divergence sync exists to prevent, and a wrong URL here fails a build closed.
+# postUpgradeTasks (cplieger/.github's default.json) so a version bump and its
+# recomputed digest land in one commit. Keyed on a root Dockerfile rather than
+# a committed opt-in marker, since the script only acts on `# repin: dep=...
+# url=...` marker lines it finds -- a Dockerfile with no markers just receives
+# an inert file, avoiding the bootstrap paradox tests/shell/run.sh also avoids.
 REPIN_FILES = """\
     files:
       - source: configs/repin-sha.sh
@@ -351,19 +344,15 @@ def main():
         profile = profiles[repo]
         lang = profile['lang']
 
-        # Resolved BEFORE the lang gate below, deliberately. The shell unit-test
-        # harness is keyed on an explicit opt-in marker the repo committed on
-        # purpose (tests/shell/run.sh); language inference is the wrong gate for
-        # that. A repo can carry branching shell worth unit-testing and still
-        # classify as lang=none — homelab is exactly that shape: operational shell
-        # under apps/**/scripts and komodo/, with no root go.mod, jsr.json,
-        # package.json or Dockerfile to classify on. Without this it fell through
-        # the `continue` below and silently received nothing, which would have left
-        # it owning divergent copies of the very files sync exists to keep single.
+        # Resolved BEFORE the lang gate below: the shell unit-test harness keys
+        # on an explicit opt-in marker (tests/shell/run.sh), not language, since
+        # a repo can carry branching shell worth testing while classifying
+        # lang=none — homelab is exactly that shape (no go.mod/jsr.json/
+        # package.json/Dockerfile). Skipping this check would silently drop it
+        # from the sync files it opted into.
         #
-        # The image-smoke opt-in stays language-gated on purpose: it drives a built
-        # container image, so a repo that can meaningfully opt in necessarily has a
-        # Dockerfile and never classifies as lang=none.
+        # image-smoke stays language-gated on purpose: it drives a built image,
+        # so an opter always has a Dockerfile and never classifies lang=none.
         if profile['has_shell_tests']:
             shell_test_repos.append(repo)
 

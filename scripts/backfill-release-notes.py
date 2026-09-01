@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Regenerate existing GitHub release bodies with the current cliff.toml.
 
-One-off maintenance tool for the release-notes noise cleanup: historical
-releases carry (a) CI-pin churn that the cliff `exclude_paths` filter now
-drops, and (b) off-by-one commit windows from the era when notes were
-rendered with `--latest` after tagging. Re-rendering every tag's true
-predecessor..tag range with the current config repairs both.
+Repairs historical releases carrying (a) CI-pin churn the cliff
+`exclude_paths` filter now drops, and (b) off-by-one commit windows from the
+era when notes were rendered with `--latest` after tagging, by re-rendering
+every tag's true predecessor..tag range against the current config.
 
 Scope guarantees:
     - Edits release BODIES only. Never touches git tags, release titles,
@@ -14,28 +13,28 @@ Scope guarantees:
       performs the edits.
     - Two-phase apply: ALL current bodies are fetched and saved verbatim to a
       freshly created --backup-dir (exclusive create; one <tag>.md per
-      release plus manifest.json recording repo, tag SHAs, body hashes, and
-      the config hash) BEFORE the first edit. `--restore <dir>` replays a
-      backup verbatim after checking it belongs to this repo.
+      release plus a manifest recording repo, tag SHAs, body hashes, and the
+      config hash) BEFORE the first edit. `--restore <dir>` replays a backup
+      verbatim after checking it belongs to this repo.
     - Optimistic concurrency: each body is re-fetched immediately before its
       edit and must equal the reviewed value; a drifted body is skipped.
     - Pair windows are validated: the predecessor must be an ancestor of the
-      tag (non-linear pairs are skipped with a warning), and every local tag
-      must match the remote tag SHA (stale/moved tags abort before any edit).
+      tag (non-linear pairs skip with a warning), and every local tag must
+      match the remote tag SHA (stale/moved tags abort before any edit).
     - The oldest release (no predecessor tag) is left untouched: bootstrap
-      bodies ("Initial release") are not regenerable from a commit range.
-    - A regenerated body that comes back empty (every commit in the range is
-      excluded) becomes a maintenance stub plus a collapsed list of the
-      policy-excluded commit subjects, rather than deleting the release.
-    - Draft releases and non-vX.Y.Z tags (e.g. prereleases) are skipped with
-      a notice; a skipped tag's window folds into the next stable tag's
-      regenerated range. More than 1000 releases aborts (no pagination).
+      bodies ("Initial release") aren't regenerable from a commit range.
+    - An empty regenerated body (every commit in range excluded) becomes a
+      maintenance stub plus a collapsed list of the excluded subjects,
+      rather than deleting the release.
+    - Draft releases and non-vX.Y.Z tags skip with a notice; a skipped tag's
+      window folds into the next stable tag's range. >1000 releases aborts
+      (no pagination).
 
 Run from (or point --repo-dir at) a local clone whose git remote is the
 GitHub repo; `gh` resolves the repo from the remote and must be authed.
-Requires Python 3.10+. Run AFTER the new cliff.toml has synced into the
-repo, or pass --config pointing at cplieger/ci's configs/cliff-stable.toml
-(or cliff-alpha.toml for pre-1.0 repos).
+Requires Python 3.10+. Run AFTER the new cliff.toml has synced into the repo,
+or pass --config pointing at cplieger/ci's configs/cliff-stable.toml (or
+cliff-alpha.toml for pre-1.0 repos).
 
 Usage:
     backfill-release-notes.py                        # dry-run, all releases

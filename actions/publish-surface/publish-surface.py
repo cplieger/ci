@@ -1,50 +1,36 @@
 #!/usr/bin/env python3
-"""Verify what a build-less TypeScript package publishes, from one computed truth.
+"""Verify a build-less TypeScript package publishes exactly its exports' import closure.
 
-These libraries ship raw TypeScript: `exports` points at `./src/*.ts`, so the
-published artifact IS source and a consumer compiles it. That makes the
-library's own green `tsc` run worthless as evidence about the consumer, because
-the library has vitest, fast-check, happy-dom and @types/node installed and the
-consumer has none of them.
+These libraries ship raw TypeScript, so the published artifact IS source and
+a consumer compiles it with none of the library's own devDependencies
+(vitest, fast-check, happy-dom, @types/node) installed — a green `tsc` run in
+the library proves nothing about the consumer.
 
-The published file set is therefore not something to declare; it is derivable.
-A package already enumerates its public API in `exports`, so the TypeScript it
-must publish is exactly the transitive import closure of those entry points.
-Every other .ts under src/ is test-only by construction, whatever it is named.
-That closure is the single source of truth this script computes, and it checks
-each registry's actual file set against it.
+The exports map already declares the public API, so the TypeScript that must
+be published is exactly the transitive import closure of those entry points;
+everything else under src/ is test-only by construction. Linting exclusion
+patterns instead of computing the closure is why they were wrong in six
+places at once for one missing file, so this script computes the set and
+checks each registry's real output against it via its own tooling
+(`npm pack --dry-run --json`, `jsr publish --dry-run`) rather than
+reimplementing glob semantics.
 
-Three failure classes, one `tsc --listFiles` pass over the entry points:
+Three failure classes, from one `tsc --listFiles` pass over the entry points:
 
-  leak       a .ts is published but unreachable from any declared export. This
-             is how @cplieger/web-terminal-ui@5.6.1 shipped a vitest-importing
-             test setup file and broke every consumer's Docker build, and how
-             @cplieger/web-terminal-engine@3.10.4 shipped fast-check-importing
-             test helpers to JSR. Both had correct-looking exclusion patterns.
-  missing    a .ts IS reachable from an export but is not published, so the
-             consumer resolves an export to a file that is not in the tarball.
-  undeclared the closure reaches a node_modules package that is neither a
-             dependency nor a peerDependency, so the consumer cannot resolve
-             it even though every published file is present and correct.
+  leak       published but unreachable from any export. How
+             @cplieger/web-terminal-ui@5.6.1 shipped a vitest-importing test
+             setup file and broke every consumer's Docker build, and how
+             @cplieger/web-terminal-engine@3.10.4 shipped fast-check test
+             helpers to JSR — both behind correct-looking exclusion patterns.
+  missing    reachable from an export but not published, so a consumer
+             resolves an export to a file the tarball does not contain.
+  undeclared the closure needs a node_modules package that is neither a
+             dependency nor a peerDependency.
 
-Why compute instead of lint the patterns: the exclusion lists are the thing
-that keeps being wrong, and they were wrong in six places at once for one
-missing file. Once the SET is verified, the patterns are correct whatever they
-say, so no naming convention has to be remembered and no list has to be
-updated when a new test-only file appears.
-
-Both registries are read from their own tooling rather than by reimplementing
-glob semantics, because a second implementation of the boundary is the defect
-this script exists to catch:
-
-  npm   `npm pack --dry-run --json`
-  JSR   `jsr publish --dry-run` (no credentials needed; also runs JSR's own
-        slow-types check as a free side effect)
-
-Exit status is 0 when every registry's .ts set equals the closure and every
-external edge is declared, 1 otherwise, with each offending path named. A
-package.json that publishes nothing (no `name`, or `private: true`) is skipped
-with a notice, because ts-ci also runs against app-frontend build manifests.
+Exit 0 when every registry's .ts set equals the closure and every external
+edge is declared; 1 otherwise, with each offending path named. A
+package.json publishing nothing (no `name`, or `private: true`) is skipped
+with a notice, since ts-ci also runs against app-frontend build manifests.
 
 Usage:
     publish-surface.py                     # check ./
@@ -68,8 +54,7 @@ JSR_FILE_LINE = re.compile(r'file://(/[^\s]*?)(?:\s+\([^)]*\))?\s*$')
 # A node_modules path segment -> owning package name, `@scope/name` aware.
 NODE_MODULES_PKG = re.compile(r'.*/node_modules/(?P<name>@[^/]+/[^/]+|[^/@][^/]*)/')
 
-# The pinned jsr CLI. Kept in step with the `JSR_VERSION` the release workflow
-# publishes with, so the checked surface is the published surface.
+# Pinned to match the release workflow's JSR_VERSION, so the checked surface is the published surface.
 # renovate: datasource=npm depName=jsr
 JSR_VERSION = '0.14.3'
 
@@ -136,23 +121,12 @@ def collect_export_targets(exports: object) -> list[str]:
 def publishable(pkg: dict) -> tuple[bool, str]:
     """Decide whether this package.json describes something that gets published.
 
-    ts-ci.yaml runs against two different populations. A root TS library
-    (reactive, web-terminal-ui) publishes to npm and JSR, and so does a library
-    whose package sits in a subdirectory, which arrives through the meta
-    workflow's `web` job exactly like an app frontend does — so `web-lint` is NOT
-    a usable discriminator, and gating on it would have excluded
-    web-terminal-engine, the repo that actually has a leak.
-
-    An app frontend (vibekit/static-src, web-terminal-kiro/static-src,
-    subflux/internal/server/static-src) has a package.json only to pin its build
-    dependencies. It is never published, and it declares no `name`, which npm
-    requires of anything publishable. That is the discriminator, and it is
-    exhaustive over the fleet: 7 named packages with exports, 3 nameless
-    frontends, nothing in between.
-
-    Deliberately NOT "has no exports map": a named package missing `exports` is a
-    publishable package whose public API is undeclared, and that fails closed in
-    entry_points rather than skipping quietly.
+    `name` is the discriminator, not directory location or `web-lint`: a
+    subdirectory library (web-terminal-engine) arrives through the same `web`
+    job as an app frontend, but only a frontend's package.json omits `name`
+    (it exists purely to pin build deps). Deliberately NOT "has no exports
+    map" — a named package missing `exports` fails closed in entry_points
+    instead of skipping quietly.
     """
     if pkg.get('private') is True:
         return False, 'package.json sets private: true, so nothing is published'
@@ -206,13 +180,9 @@ def entry_points(pkg: dict, pkg_dir: Path) -> tuple[list[Path], list[str]]:
 def resolve_tsc(pkg_dir: Path) -> Path:
     """Locate the repo's OWN pinned compiler, or refuse to run.
 
-    Deliberately not `npx --no-install tsc`, and not a PATH lookup. When the
-    package's node_modules is absent, npx falls through to the unrelated `tsc`
-    stub package on npm, which prints "This is not the tsc command you are
-    looking for" and exits non-zero. That is indistinguishable from the public
-    API failing to compile, so the check would report a false defect in a
-    package whose only problem is a missing `npm ci`. Fail closed instead: the
-    closure is only meaningful when computed by the compiler the repo pins.
+    Not `npx --no-install tsc` and not a PATH lookup: with node_modules
+    absent, npx falls through to an unrelated `tsc` stub package on npm,
+    reporting a false compile defect for a package that just needs `npm ci`.
     """
     for candidate in [pkg_dir, *pkg_dir.parents]:
         binary = candidate / 'node_modules' / '.bin' / 'tsc'
@@ -230,18 +200,13 @@ def resolve_tsc(pkg_dir: Path) -> Path:
 def compute_closure(pkg_dir: Path, entries: list[Path]) -> tuple[set[Path], set[str]]:
     """Return (local .ts closure, external package names) for the public API.
 
-    Uses the repo's own pinned `tsc` so the resolver, module settings and lib
-    match what the repo tests with. The generated config inherits the repo's
-    compilerOptions via `extends` (keeping `lib`, `strict` and `moduleResolution`
-    honest) and overrides only what must change:
-
-      files      the exports entry points, so the program IS the public graph
-      include    emptied, so the repo's `src/**/*.ts` glob does not drag in
-                 the very test-only files this check exists to find
-      types      emptied, which is the load-bearing override. It drops the
-                 automatic @types/* inclusion, so any node_modules path left
-                 in --listFiles is a real import edge rather than an ambient
-                 type, AND it reproduces the consumer, which has no @types/node.
+    Inherits the repo's own compilerOptions via `extends`, overriding only:
+    `files` to the export entry points (the program IS the public graph),
+    `include` emptied (so `src/**/*.ts` can't drag in the test-only files
+    this check exists to find), and `types` emptied — the load-bearing one,
+    since it drops automatic @types/* inclusion so a node_modules path left
+    in --listFiles is a real import edge, matching a consumer with no
+    @types/node.
     """
     tsconfig = pkg_dir / 'tsconfig.json'
     if not tsconfig.is_file():
