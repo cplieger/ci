@@ -1,52 +1,36 @@
 #!/usr/bin/env python3
 """Measure per-series benchmark stability, to decide enrolment on evidence.
 
-Why this exists
----------------
-`weekly-bench.yaml` alerts at a fixed 150% threshold. That number is only
-meaningful against the NOISE FLOOR of each series, and the floor is a property
-of the individual benchmark, not of the repo it lives in. Measured across four
-cplieger repos (38 ns/op series, `-count=10` on one host, 2026-08-21):
+`weekly-bench.yaml` alerts at a fixed 150% threshold, but that number is only
+meaningful against the NOISE FLOOR of each series, which is a property of the
+benchmark, not the repo. Measured across four repos (38 ns/op series,
+`-count=10`, one host, 2026-08-21): allocs/op and B/op CoV 0.00% on 38 of 38
+series (B/op constant to within 1-5 bytes on the two that move); ns/op median
+8.6%, p90 24.6%, worst 43.7%. A zero CoV means "same count every sample", not
+"never allocates" — `AllocsPerRun`/`AllocsPerOp` divide as INTEGERS, so an
+allocation occurring less than once per run floors to zero, and an amortised
+path (a buffer that grows occasionally) can read 0 there. So allocation
+metrics are stable where ns/op is not, and ns/op can only carry a trend.
 
-    allocs/op   coefficient of variation 0.00% on 38 of 38 series
-    B/op        0.00%, constant to within 1-5 bytes on the two that move
-    ns/op       median 8.6%, p90 24.6%, worst 43.7%
+Two limits on what this script can tell you, found by adversarial review after
+it shipped:
 
-A zero here means "the same count on every sample", which is not the same as
-"never allocates": testing.AllocsPerRun and BenchmarkResult.AllocsPerOp divide as
-INTEGERS, so an allocation occurring less often than once per run floors to zero.
-An amortised path that grows a buffer occasionally can therefore read 0.
+1. This reports CoV over the RAW samples; the workflow alerts on a ratio
+   between two weekly MEDIANS. Different random variables — the sigma below
+   describes within-run spread, not the sampling distribution of the actual
+   decision, so exit status is advisory. The durable statistic would be the
+   empirical distribution of consecutive-median ratios over an unchanged
+   tree, which needs repeated real-runner runs to obtain.
+2. CoV assumes the spread is worth summarising by a standard deviation.
+   Hosted-runner noise is spiky, not gaussian, and NIST recommends MAD or an
+   IQR for long-tailed data instead
+   (itl.nist.gov/div898/handbook/eda/section3/eda356.htm) — MAD is reported
+   alongside CoV for that reason; where they disagree sharply, believe MAD.
 
-So the allocation metrics are stable where ns/op is not, and ns/op can only
-carry a trend.
-
-TWO LIMITS ON WHAT THIS SCRIPT CAN TELL YOU, both found by adversarial review
-after it shipped, and neither yet closed.
-
-First, the statistic is not the one that decides an alert. This reports the
-coefficient of variation over the RAW samples. The workflow publishes their
-MEDIAN, and the action alerts on a ratio between two medians a week apart. Those
-are different random variables, so the sigma figure below is a description of
-within-run spread and NOT the sampling distribution of the decision. It is
-useful for comparing series and for seeing benchtime work; it is not an
-admission test, and the exit status is advisory rather than a gate. The durable
-statistic is the empirical distribution of consecutive-median ratios over an
-unchanged tree, which needs repeated runs on the real runner to obtain.
-
-Second, a coefficient of variation assumes the spread is worth summarising by a
-standard deviation. Hosted-runner noise is spiky rather than gaussian, and NIST
-recommends a median absolute deviation or an interquartile range for
-long-tailed data (itl.nist.gov/div898/handbook/eda/section3/eda356.htm). MAD is
-reported alongside CoV for that reason; where the two disagree sharply, believe
-MAD and distrust any sigma derived from the standard deviation.
-
-The published literature says the same thing and says not to guess it: across
-5 million data points in Java and Go, Laaber, Scheuner and Leitner measured
-per-benchmark coefficients of variation from 0.03% to over 100%
-(https://doi.org/10.1007/s10664-019-09681-1), and Laaber and Leitner found
-suites containing benchmarks at 50% or higher, concluding that not all
-benchmarks are useful for reliably discovering slowdowns. Bencher reports
-GitHub-hosted runners exceeding 30% variance against under 2% on bare metal
+Laaber, Scheuner and Leitner measured per-benchmark CoV from 0.03% to over
+100% across 5M Java/Go data points and found suites with benchmarks at 50%+
+(https://doi.org/10.1007/s10664-019-09681-1); Bencher reports hosted runners
+exceeding 30% variance against under 2% on bare metal
 (https://bencher.dev/docs/explanation/continuous-benchmarking/).
 
 Usage

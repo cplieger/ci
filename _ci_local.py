@@ -222,20 +222,10 @@ def _first_cmd_line(cmd):
 # ---------------------------------------------------------------------------
 # Tool-version drift preflight
 # ---------------------------------------------------------------------------
-# Every `Install *` step is SKIPped by name (INSTALL_NAME_PATTERNS), so the
-# version CI pins is never the version that runs locally — the PATH binary is.
-# That is the one place local and remote diverge in BEHAVIOUR rather than
-# coverage, and it is silent: a lint rule added in the pinned release fails CI
-# while the older local binary reports clean. Measured 2026-08-17, three days
-# after four Renovate bumps landed here: ruff 0.16.1 against a pinned 0.16.3 (a
-# HARD gate), govulncheck v1.6.0 against v1.7.0, deadcode x/tools v0.48.0
-# against v0.49.0 — all three gating, all three green locally.
-#
-# So read the pins this run is about to skip past and compare them to what is
-# actually on PATH. Reporting is the whole job: a drift is a property of the
-# WORKSTATION, not of the change under test, so it must not fail the run and
-# punish the change for the machine's state. It gets its own summary section and
-# a qualifier on the RESULT line, and it names the one command that fixes it.
+# Every `Install *` step is SKIPped by name, so the PATH binary runs, not
+# the version CI pins — a silent behaviour gap (measured 2026-08-17: ruff,
+# govulncheck and deadcode ran clean locally against a pin gating in CI).
+# Drift is a property of the WORKSTATION, so it only reports, never fails.
 
 
 class ToolVersion(NamedTuple):
@@ -245,9 +235,8 @@ class ToolVersion(NamedTuple):
     source: str    # where the pin was read from (renovate depName / go install pkg)
 
 
-# depName (or go-install package path) -> the binary it provides. A pin whose
-# depName is absent here is skipped rather than guessed at: a wrong mapping
-# would manufacture a drift warning, which costs more trust than a missed one.
+# depName (or go-install package path) -> binary. An absent depName is
+# skipped rather than guessed at — a wrong mapping costs more trust than a missed one.
 _PIN_BINARY = {
     # `# renovate: depName=` pins in ci.yaml / go-ci.yaml / shell-ci.yaml.
     'golangci/golangci-lint': 'golangci-lint',
@@ -480,16 +469,14 @@ def _workflow_env_chain(raw, target, depth=0, parent_ref=None, seen=None):
     return blocks
 
 
-# Per-process path for the cross-step soft-gate marker.  Using a PID-unique
-# path means parallel ci-local runs (e.g. running all repos concurrently) each
-# maintain their own isolated failure list instead of sharing /tmp/_ci_failures
-# and cross-contaminating each other's "Check results" steps.
+# PID-unique path for the cross-step soft-gate marker, so parallel ci-local
+# runs each keep an isolated failure list instead of cross-contaminating
+# each other's "Check results" steps via a shared /tmp/_ci_failures.
 _CI_FAILURES_PATH = f'/tmp/_ci_failures_{os.getpid()}'
 
-# Per-step wall-clock cap (seconds). CI's own job timeout is 15-20 min; this is
-# a local guard against a genuinely hung step. Sized to clear the slowest real
-# step across the cplieger repos — wiregen's `go test -race ./...` runs ~317s standalone, so
-# 300s produced a false timeout. 600s covers it with margin under light load.
+# Local guard against a hung step (CI's own job timeout is 15-20 min).
+# 600s clears the slowest real step (wiregen's `go test -race ./...`,
+# ~317s) with margin; 300s produced a false timeout.
 _STEP_TIMEOUT_SECS = 600
 
 
@@ -508,20 +495,11 @@ def _clear_failure_marker():
 # ---------------------------------------------------------------------------
 # Reusable workflow resolution
 # ---------------------------------------------------------------------------
-# Two `uses:` forms call a reusable workflow ci-local must expand:
-#   1. `cplieger/ci/.github/workflows/<X>.yaml@<ref>` — a consumer's thin
-#      ci.yaml calling the meta ci.yaml.
-#   2. `./.github/workflows/<X>.yaml` — a LOCAL ref. The meta ci.yaml dispatches
-#      to the per-surface sub-workflows (go-ci/ts-ci/shell-ci) this way rather
-#      than pinning cplieger/ci@sha, so a sub-workflow fix reaches consumers on
-#      their next meta-ci.yaml bump without a second internal-pin + tag cycle.
-#      GitHub resolves a local ref against the same commit/repo the calling
-#      workflow lives in — and these refs appear ONLY inside cplieger/ci
-#      workflows, so locally they resolve against the sibling `ci/` checkout.
-# BOTH must expand: if the local ./ form is left unresolved, the `go`/`shell`
-# jobs collapse to zero steps and ci-local silently skips the ENTIRE Go and
-# shell suites — vet, golangci-lint (the `govet: enable-all` fieldalignment
-# authority), race tests, govulncheck, secret scan — with no error to flag it.
+# ci-local must expand both forms: the `cplieger/ci/.github/workflows/<X>.yaml@<ref>`
+# consumer form, and a LOCAL `./.github/workflows/<X>.yaml` ref — how the meta
+# ci.yaml dispatches to go-ci/ts-ci/shell-ci, resolved against the sibling
+# `ci/` checkout. Leaving the local form unresolved silently collapses the
+# `go`/`shell` jobs to zero steps, skipping those suites with no error.
 REUSABLE_RE = re.compile(r'^cplieger/ci/\.github/workflows/(.+\.ya?ml)@(.+)$')
 LOCAL_REUSABLE_RE = re.compile(r'^\./(\.github/workflows/.+\.ya?ml)$')
 
@@ -550,24 +528,17 @@ def _ci_repo_root(target):
 
 
 def resolve_reusable_workflow(uses_ref, target, parent_ref=None):
-    """Resolve a reusable workflow `uses:` to its parsed YAML content.
+    """Resolve a `uses:` reusable-workflow ref to its parsed YAML.
 
-    Handles both the `cplieger/ci/.github/workflows/<X>.yaml@<ref>` form and the
-    local `./.github/workflows/<X>.yaml` form (resolved against the sibling ci/
-    checkout, since local refs appear only in ci-repo workflows). `parent_ref`
-    carries the calling workflow's pinned ref so the gh-api fallback can fetch a
-    local ref at the same commit GitHub would.
+    Handles the `cplieger/ci/.github/workflows/<X>.yaml@<ref>` form and the
+    local `./.github/workflows/<X>.yaml` form (only used inside ci-repo
+    workflows, resolved against the sibling ci/ checkout). Tries the sibling
+    checkout first, then a `gh api` fetch at `parent_ref`, else None (caller
+    falls back to autodetect).
 
-    Lookup order:
-      1. Sibling checkout: <repo-root>/../ci/<path>
-      2. gh api fetch (timeout-wrapped)
-      3. None (caller falls back to autodetect)
-
-    Caveat: the sibling-checkout path resolves to the LOCAL `ci/` working tree,
-    ignoring the pinned `@sha` in `uses:`. So ci-local validates against the
-    current (possibly unreleased) workflow source, not the exact SHA a
-    consumer's CI runs. Intended for developing the ci repo; a minor fidelity
-    caveat for consumers whose pinned SHA lags `main`.
+    Caveat: the sibling checkout is the LOCAL `ci/` working tree, not the
+    pinned `@sha` — so ci-local validates against current (possibly
+    unreleased) workflow source when a consumer's pin lags `main`.
     """
     m = REUSABLE_RE.match(uses_ref)
     lm = LOCAL_REUSABLE_RE.match(uses_ref)
@@ -580,7 +551,6 @@ def resolve_reusable_workflow(uses_ref, target, parent_ref=None):
     else:
         return None
 
-    # 1. Sibling checkout (local ci repo).
     sibling = _ci_repo_root(target) / rel_path
     if sibling.is_file():
         with open(sibling) as f:
@@ -616,22 +586,16 @@ def resolve_reusable_workflow(uses_ref, target, parent_ref=None):
 def evaluate_step_if(expr, step_outputs, caller_inputs=None, workspace=None):
     """Evaluate a GitHub Actions if-expression to True/False.
 
-    Supports:
-      - steps.<id>.outputs.<k> == 'true'/'false'
-      - github.event.repository.private == false  -> TRUE (local = public)
-      - github.event_name == 'pull_request' -> TRUE
-      - inputs.<k> -> from caller_inputs
-      - && , ||, ! prefix, ${{ }} wrapping
-      - always() -> TRUE
-      - hashFiles(...) != '' -> resolved against the checkout root
-        (empty string when no visible file matches, a hash otherwise)
+    Supports steps.*.outputs.*, inputs.*, &&/||/!, ${{ }} wrapping, always(),
+    and hashFiles(...) (resolved against the checkout root). Locally
+    github.event.repository.private is always false and github.event_name is
+    always 'pull_request'.
     """
     if caller_inputs is None:
         caller_inputs = {}
     if workspace is None:
         workspace = Path.cwd()
 
-    # Strip ${{ }} wrapper
     expr = expr.strip()
     if expr.startswith('${{') and expr.endswith('}}'):
         expr = expr[3:-2].strip()
@@ -643,12 +607,10 @@ def _eval_expr(expr, step_outputs, caller_inputs, workspace):
     """Recursive expression evaluator."""
     expr = expr.strip()
 
-    # Handle always()
     if expr == 'always()':
         return True
 
-    # Handle || (lowest precedence)
-    # Split on && and || respecting nesting
+    # || before && (lowest precedence first), each respecting nesting.
     parts = _split_logical(expr, '||')
     if len(parts) > 1:
         return any(_eval_expr(p, step_outputs, caller_inputs, workspace) for p in parts)
@@ -657,15 +619,12 @@ def _eval_expr(expr, step_outputs, caller_inputs, workspace):
     if len(parts) > 1:
         return all(_eval_expr(p, step_outputs, caller_inputs, workspace) for p in parts)
 
-    # Handle ! prefix
     if expr.startswith('!'):
         return not _eval_expr(expr[1:].strip(), step_outputs, caller_inputs, workspace)
 
-    # Handle parentheses
     if expr.startswith('(') and expr.endswith(')'):
         return _eval_expr(expr[1:-1], step_outputs, caller_inputs, workspace)
 
-    # Handle comparison: X == Y or X != Y
     for op in ('!=', '=='):
         idx = expr.find(op)
         if idx >= 0:
@@ -679,8 +638,7 @@ def _eval_expr(expr, step_outputs, caller_inputs, workspace):
                 return str(lhs) == str(rhs)
             return str(lhs) != str(rhs)
 
-    # Handle hashFiles(...) != '' pattern — already handled by comparison above
-    # Bare expression: resolve to truthy
+    # Bare expression: resolve to truthy.
     val = _resolve_value(expr, step_outputs, caller_inputs, workspace)
     return bool(val) and str(val).lower() not in ('false', '0', '')
 
@@ -733,38 +691,31 @@ def _github_repository(workspace):
 
 
 def _resolve_value(tok, step_outputs, caller_inputs, workspace):
-    """Resolve a tok to its value."""
     tok = tok.strip()
 
-    # Strip ${{ }} wrapper
     if tok.startswith('${{') and tok.endswith('}}'):
         tok = tok[3:-2].strip()
 
-    # String literal
     if (tok.startswith("'") and tok.endswith("'")) or (tok.startswith('"') and tok.endswith('"')):
         return tok[1:-1]
 
-    # Boolean literals
     if tok == 'true':
         return 'true'
     if tok == 'false':
         return 'false'
 
-    # steps.<id>.outputs.<key>
     m = re.match(r'steps\.(\w+)\.outputs\.(\w+)', tok)
     if m:
         step_id = m.group(1)
         key = m.group(2)
         return step_outputs.get(step_id, {}).get(key, '')
 
-    # inputs.<key>
     m = re.match(r'inputs\.(\S+)', tok)
     if m:
         return str(caller_inputs.get(m.group(1), ''))
 
-    # github.event.repository.private
     if tok == 'github.event.repository.private':
-        return 'false'  # treat as public -> full run
+        return 'false'  # local runs always treat the repo as public
 
     if tok == 'github.repository':
         return _github_repository(workspace)
@@ -786,7 +737,6 @@ def _resolve_value(tok, step_outputs, caller_inputs, workspace):
                 return 'somehash'
         return ''
 
-    # always()
     if tok == 'always()':
         return 'true'
 
@@ -794,15 +744,13 @@ def _resolve_value(tok, step_outputs, caller_inputs, workspace):
 
 
 # ---------------------------------------------------------------------------
-# Run a "Resolve profile" step and capture its outputs
-# ---------------------------------------------------------------------------
 # GitHub Actions runner environment parity
 # ---------------------------------------------------------------------------
-# Workflow `run:` steps assume the standard runner-provided env vars exist.
-# The most load-bearing locally is $RUNNER_TEMP — a guaranteed-writable scratch
-# dir the markdown job (and others) write configs into. Steps execute under
+# Workflow `run:` steps assume standard runner env vars exist. The most
+# load-bearing locally is $RUNNER_TEMP — a guaranteed-writable scratch dir
+# the markdown job (and others) write configs into. Steps execute under
 # `bash -eu`, so a missing var aborts with "unbound variable" rather than
-# failing the actual check. Synthesize the vars locally so ci-local mirrors CI.
+# failing the actual check; synthesize the vars locally so ci-local mirrors CI.
 _RUNNER_TEMP_DIR = None
 
 
@@ -948,10 +896,9 @@ def run_profile_step(step, cwd, workspace):
         output = (proc.stdout or '') + (proc.stderr or '')
         if proc.returncode == 0:
             outputs = _read_github_outputs(output_file)
-            # Execute detect so its shell validation still fails locally when CI
-            # would fail, but report/use the same CI-visible inventory that job
-            # expansion uses. Raw `find` sees ignored editor/review artifacts
-            # which cannot exist in a fresh Actions checkout.
+            # Still execute detect's shell validation, but report the same
+            # CI-visible inventory job expansion uses — a raw `find` would see
+            # ignored scratch that can't exist in a fresh Actions checkout.
             if step.get('name') == 'Detect repo surfaces':
                 outputs = compute_local_detect(workspace)
             return (
@@ -1093,14 +1040,11 @@ def classify_step(step):
         env_blob = ' '.join(str(v) for v in (step.get('env') or {}).values())
         if re.search(r'needs\.\w+\.result', step['run'] + ' ' + env_blob):
             return 'SKIP', name, 'GitHub-only job-result aggregation (needs.*.result)'
-        # Project-scoped npm installs (npm install / npm ci / npm install --no-save)
-        # MUST run locally for version parity with CI. CI does a fresh install
-        # on every run from package.json's semver ranges; our cached
-        # node_modules can drift from those ranges. Eslint rule sets, knip
-        # rule sets, and TS-eslint plugin versions all silently change
-        # between minor bumps, and parity-mode catches issues that local
-        # cached deps would miss. Don't apply the Install-name SKIP rule
-        # to these.
+        # npm install/ci MUST run locally for version parity: CI always
+        # installs fresh from package.json's semver ranges, while cached
+        # node_modules can drift (eslint/knip/ts-eslint rule sets change
+        # between minor bumps) — so these are exempt from the Install-name
+        # SKIP rule below.
         run_line = step['run'].lstrip()
         if re.match(r'^(npm|yarn|pnpm)\s+(install|ci)\b', run_line):
             return 'EXEC', name, ''
@@ -1147,22 +1091,13 @@ _GITLEAKS_PATH_RE = re.compile(r'/tmp/gitleaks\b')
 def rewrite_gitleaks_download(cmd: str) -> str:
     """If gitleaks is on PATH, replace the curl-download+run sequence.
 
-    Strips the VERSION= line, the curl | tar extraction, and rewrites the
-    /tmp/gitleaks invocation to just `gitleaks`.  Works even when the three
-    lines are the entire step (the common case in go-ci / shell-ci).
-
-    The `gitleaks dir .` command is preserved verbatim (NOT rewritten to
-    `detect`). `dir` scans the working-tree filesystem exactly like CI.
-    Rewriting to `detect --source .` would instead scan the full git history and
-    flag already-removed/redacted historical secrets that CI's filesystem scan
-    never sees (the wtk `routes_test.go` false positive, 2026-07).
-
-    NOTE: `dir` does NOT honour .gitignore — it walks the raw filesystem, so a
-    gitignored scratch path (.app-review/ report artifacts, *.dec decrypted
-    secrets, node_modules) IS scanned and can raise local-only findings CI's
-    fresh checkout never sees (the webhttp .code-review false positives, 2026-07).
-    `rewrite_gitleaks_gitignore` (applied next) restores gitignore parity by
-    allowlisting exactly what git ignores, mirroring `rewrite_trivy_gitignore`.
+    Strips the VERSION= line and the curl|tar extraction, and rewrites the
+    /tmp/gitleaks invocation to `gitleaks`. `gitleaks dir .` is preserved
+    verbatim, never rewritten to `detect`: `dir` scans the working tree like
+    CI's filesystem scan does, while `detect --source .` scans full git
+    history and flags already-removed secrets CI never sees (wtk
+    `routes_test.go` false positive, 2026-07). `dir` also ignores .gitignore,
+    so `rewrite_gitleaks_gitignore` (applied next) restores parity.
     """
     if not shutil.which('gitleaks') or '/tmp/gitleaks' not in cmd:
         return cmd
@@ -1189,11 +1124,7 @@ def rewrite_gitleaks_download(cmd: str) -> str:
         if 'curl' in stripped and 'gitleaks' in stripped and '/tmp' in stripped:
             i += 1  # skip curl download line
             continue
-        # Rewrite /tmp/gitleaks to the PATH binary; keep `dir .` as-is so the local
-        # scan matches CI (a working-tree filesystem scan). gitignore parity is
-        # restored separately by rewrite_gitleaks_gitignore. Do NOT rewrite to
-        # `detect --source .` — that scans full git history and flags already-removed
-        # historical secrets CI's `dir` scan never sees.
+        # Keep `dir .` as-is (see docstring); just point it at the PATH binary.
         line = _GITLEAKS_PATH_RE.sub('gitleaks', lines[i])
         result.append(line)
         i += 1
@@ -1203,18 +1134,11 @@ def rewrite_gitleaks_download(cmd: str) -> str:
 # ---------------------------------------------------------------------------
 # Gitleaks gitignore parity
 # ---------------------------------------------------------------------------
-# `gitleaks dir` walks the raw filesystem and does NOT honour .gitignore. CI runs
-# it against a fresh checkout (git-tracked files only); locally the working tree
-# also carries gitignored scratch CI never sees — .app-review/ report artifacts,
-# a private repo's *.dec decrypted secrets, node_modules — and gitleaks happily
-# scans them, raising findings the gate never would (the webhttp .code-review
-# false positives, 2026-07). gitleaks has no --skip-dirs/--exclude flag (trivy
-# does), so mirror the trivy parity fix through the one lever gitleaks offers: a
-# generated config that extends the default ruleset (useDefault=true, so every
-# default rule still fires on scanned files) and allowlists exactly the paths git
-# ignores. Delivered inline via GITLEAKS_CONFIG_TOML so no temp file is needed.
-# Allowlisting a gitignored path cannot hide a shipped secret — a secret in a
-# gitignored file is not in the repo CI checks out.
+# `gitleaks dir` ignores .gitignore and flags scratch CI's checkout never has
+# (webhttp .code-review false positives, 2026-07). No --skip-dirs flag exists,
+# so the fix is a generated config (useDefault=true) allowlisting exactly the
+# paths git ignores, via GITLEAKS_CONFIG_TOML — never a way to hide a shipped
+# secret, since one would already be tracked and CI would still catch it.
 _GITLEAKS_DIR_RE = re.compile(r'((?:\S+/)?gitleaks)\s+dir\b')
 _GITLEAKS_CONFIG_FLAG_RE = re.compile(r'(?:^|\s)(?:-c|--config)(?:=|\s)')
 
@@ -1226,14 +1150,12 @@ _REPORT_PATH_RE = re.compile(r'--report-path[ =](["\']?)(?![/$])([^\s"\']+)\1')
 def rewrite_report_artifacts(cmd: str) -> str:
     """Redirect relative report-file writes into $RUNNER_TEMP.
 
-    In CI these report files (security-scan's `--report-path
+    In CI these files (e.g. security-scan's `--report-path
     gitleaks-history.sarif`) land in a throwaway checkout and feed an
-    upload-sarif/upload-artifact step that ci-local SKIPs. Locally the same
-    write would land in the real working tree — and a leftover
-    gitleaks-history.sarif then false-fails every later `gitleaks dir`
-    working-tree scan (the SARIF quotes historical secret matches; observed
-    on envx and docker-keepalived). $RUNNER_TEMP always exists locally
-    (apply_runner_env) and is cleaned up at exit.
+    upload step ci-local skips. Locally they'd land in the real working
+    tree, and a leftover SARIF then false-fails every later `gitleaks dir`
+    scan by quoting historical secret matches (observed on envx and
+    docker-keepalived).
     """
     return _REPORT_PATH_RE.sub(
         lambda m: f'--report-path "${{RUNNER_TEMP}}/{m.group(2)}"', cmd
@@ -1243,13 +1165,11 @@ def rewrite_report_artifacts(cmd: str) -> str:
 def _split_command_lines(cmd: str):
     """Yield (index, line) for lines that are not pure shell comments.
 
-    A rewrite that splices text must never land inside a comment. `ci.yaml`'s
-    gitleaks step documents ci-local's own rewriting in a comment that contains
-    the literal words `gitleaks dir`, so a plain `sub(..., count=1)` hit the
-    COMMENT and spliced a multi-line TOML config into it — the config's newlines
-    escaped the comment and bash died with `unexpected EOF while looking for
-    matching '`, failing the secret-scan gate in every repo. The workflow
-    comment is correct and should stay; the matcher has to be the careful one.
+    A rewrite must never splice into a comment: ci.yaml's gitleaks step
+    documents this rewriting in a comment containing the literal words
+    `gitleaks dir`, so a plain `sub(..., count=1)` once spliced a multi-line
+    TOML config into that comment, breaking bash with an unterminated quote
+    and failing the secret-scan gate fleet-wide.
     """
     for index, line in enumerate(cmd.splitlines()):
         if line.lstrip().startswith('#'):
@@ -1335,14 +1255,11 @@ def rewrite_ci_failures_path(cmd: str) -> str:
 # ---------------------------------------------------------------------------
 # Trivy filesystem-scan gitignore parity
 # ---------------------------------------------------------------------------
-# CI runs `trivy fs` against a fresh checkout — only git-tracked files exist.
-# Locally the working tree carries gitignored files trivy will happily scan:
-# decrypted secrets (a private repo's *.env.dec), .app-review/ artifacts, node_modules.
-# Trivy's secret scanner then flags e.g. apps/<app>/.env.dec (a deliberately
-# decrypted, gitignored secret) and the run fails with a finding CI never sees.
-# Mirror CI by injecting --skip-files / --skip-dirs for everything git ignores
-# under the scan dir. `git ls-files --directory` collapses fully-ignored dirs to
-# a single entry, keeping the flag list compact.
+# CI runs `trivy fs` against a fresh checkout — tracked files only. Locally
+# the working tree also carries gitignored files (decrypted `*.env.dec`,
+# .app-review/, node_modules) that trivy's secret scanner happily flags,
+# failing on a finding CI never sees. Mirror CI by injecting
+# --skip-files/--skip-dirs for everything git ignores under the scan dir.
 _TRIVY_FS_RE = re.compile(r'\btrivy\s+(?:fs|filesystem)\b')
 
 
@@ -1380,9 +1297,8 @@ def rewrite_trivy_gitignore(cmd: str, cwd: Path) -> str:
         inject += f" --skip-dirs {shlex.quote(','.join(dirs))}"
     if files:
         inject += f" --skip-files {shlex.quote(','.join(files))}"
-    # Insert right after the `trivy fs` / `trivy filesystem` token. Repeated
-    # --skip-dirs is fine (trivy unions them), so an existing --skip-dirs in the
-    # command is preserved.
+    # Insert right after the `trivy fs`/`trivy filesystem` token; repeated
+    # --skip-dirs is fine since trivy unions them.
     return _TRIVY_FS_RE.sub(lambda m: m.group(0) + inject, cmd, count=1)
 # ---------------------------------------------------------------------------
 # CI lints a fresh checkout — only git-tracked files exist. Locally the working
@@ -1403,17 +1319,13 @@ _HTMLVALIDATE_FIND_RE = re.compile(
 def rewrite_stylelint_gitignore(cmd: str, cwd: Path) -> str:
     """Replace the web-lint stylelint `**/*.css` glob with CI-visible .css files.
 
-    stylelint honours neither .gitignore nor a config `ignoreFiles` here (the synced
-    configs/stylelint.json declares none), so the glob walks gitignored scratch a CI
-    checkout never contains: static-src/coverage/ lcov-report CSS, reports/mutation/,
-    .stryker-tmp/ sandbox copies, .app-review/ artifacts. That failed the local
-    web-lint gate on files CI cannot see -- the same parity break the gitleaks, trivy
-    and markdownlint rewrites above exist to close.
-
-    Unlike markdownlint's, an empty result is a real answer worth acting on: the CI
-    step passes --allow-empty-input precisely because a thin consumer's styles come
-    from a shared package, so a repo whose only CSS is gitignored must lint nothing
-    rather than fall back to the raw glob.
+    stylelint honours neither .gitignore nor a config `ignoreFiles` here, so
+    the glob walks gitignored scratch a CI checkout never contains
+    (coverage/, .stryker-tmp/, .app-review/), failing the gate on files CI
+    can't see. An empty result is real: the step passes --allow-empty-input
+    for a consumer whose styles come from a shared package, so a repo whose
+    only CSS is gitignored must lint nothing rather than fall back to the
+    raw glob.
     """
     if 'stylelint' not in cmd or not _STYLELINT_GLOB_RE.search(cmd):
         return cmd
@@ -1452,29 +1364,11 @@ def rewrite_htmlvalidate_gitignore(cmd: str, cwd: Path) -> str:
 # ---------------------------------------------------------------------------
 # find-producer, yamllint and TOML gitignore parity
 # ---------------------------------------------------------------------------
-# Three more steps walk the raw filesystem with no gitignore awareness of their
-# own and, until now, no parity rewrite. All three fail LOCAL-ONLY on scratch a
-# fresh CI checkout cannot contain (.app-review/ artifacts, _handoff/ notes,
-# *.dec decrypted secrets, coverage/, .stryker-tmp/ sandboxes, a venv's bin/):
-#
-#   shellcheck / shfmt  `find . -name '*.sh' -not -path './.git/*'
-#                        -not -path '*/node_modules/*'` — node_modules was
-#                        excluded for exactly this reason, but only node_modules.
-#   yamllint            `yamllint .` — yamllint has no VCS awareness at all, and
-#                        a YAML *syntax* error is error-level even under
-#                        `extends: relaxed`, so it fails the scripts job.
-#   Validate TOML       `pathlib.Path('.').rglob('*.toml')` skipping only .git —
-#                        not even node_modules, and it raises rather than reports.
-#
-# Tools that honour .gitignore natively need no rewrite and deliberately have
-# none: lychee, ruff, prettier, zizmor (all verified 2026-08-17).
-# Three command SHAPES exist across the fleet, because the two bespoke-CI repos
-# (.kiro, homelab) predate the shared workflow and quote differently:
-#   meta ci.yaml / shell-ci  files=$(find . -name '*.sh' … )      newline list
-#   .kiro, homelab           find . -name "*.sh" … -print0 | xargs -0 …   NUL list
-# So the pattern accepts either quote style and reports whether `-print0` was
-# used, and the replacement emits the matching separator. Getting this wrong is
-# silent: the rewrite simply does not fire and the tool walks the raw tree again.
+# shellcheck/shfmt's raw `find`, `yamllint .`, and the TOML validator's rglob
+# walk the filesystem with no gitignore awareness, failing LOCAL-ONLY on
+# scratch a checkout cannot contain (lychee/ruff/prettier/zizmor need no
+# rewrite). The `find` pattern accepts both fleet shapes — newline list, or
+# .kiro/homelab's NUL list via `-print0` — emitting the matching separator.
 _FIND_SH_RE = re.compile(
     r'find\s+\.\s+-name\s+[\'"]\*\.sh[\'"]'
     r'(?:\s+-not\s+-path\s+[\'"][^\'"]+[\'"])*'
@@ -1585,17 +1479,12 @@ def rewrite_yamllint_gitignore(cmd: str, cwd: Path) -> str:
 def rewrite_toml_gitignore(cmd: str, cwd: Path) -> str:
     """Restrict the inline TOML validator's rglob to the CI-visible fileset.
 
-    The step is a `python3 -c "<source>"` block, so the rewrite substitutes the
-    iterable expression rather than the command: a literal list of paths keeps
-    the loop body (and its `'.git' in p.parts` guard, now redundant but
-    harmless) exactly as CI runs it.
-
-    The literals MUST be single-quoted. The shell wraps the Python source in
-    DOUBLE quotes, so a `json.dumps` literal closed that string early and the
-    interpreter saw a bare `pathlib.Path(ok.toml)` -> NameError. A path carrying
-    a quote, backslash or newline is therefore not embeddable here at all; the
-    rewrite bails rather than emit source it cannot quote correctly, accepting a
-    raw walk for a filename no repo in this fleet has.
+    The step is a `python3 -c "<source>"` block, so the rewrite substitutes
+    the iterable expression, keeping the loop body exactly as CI runs it.
+    The literals MUST be single-quoted: the shell wraps the Python source in
+    DOUBLE quotes, so a `json.dumps` literal closes that string early and
+    raises NameError. A path with a quote, backslash or newline can't be
+    embedded safely, so the rewrite bails and leaves the raw walk.
     """
     if not shutil.which('git') or _match_on_command_line(_TOML_RGLOB_RE, cmd)[0] is None:
         return cmd
@@ -1694,9 +1583,8 @@ def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
         return StepResult(False, red('UNKNOWN'), 0, '', detail, 'unknown')
 
     cmd = detail if kind == 'LOCAL' else step['run']
-    # Local action translations and literal run blocks share the same parity
-    # rewrites. Previously Trivy was translated to LOCAL after the rewrite path
-    # and therefore scanned gitignored files that do not exist in CI.
+    # Local translations and literal run blocks share the same parity rewrites
+    # (previously applied after translation, so Trivy scanned gitignored files).
     cmd = rewrite_hadolint_docker(cmd)
     cmd = rewrite_markdownlint_gitignore(cmd, cwd)
     cmd = rewrite_stylelint_gitignore(cmd, cwd)
@@ -2122,14 +2010,12 @@ def _expand_job(jobname, job, caller_inputs, target, depth=0, parent_ref=None):
     for a plain inline job that never came from a reusable workflow. `parent_ref`
     is the calling workflow's pinned ref, threaded so a nested local `./` ref can
     be fetched at the same commit when no sibling ci/ checkout exists."""
-    # Single-axis strategy.matrix (the meta go-nested job: `dir:
-    # ${{ fromJSON(needs.detect.outputs.go_nested_dirs) }}`): expand one job
-    # instance per value, substituting `${{ matrix.<axis> }}` textually in the
-    # job's `with:` values — mirroring what CI's matrix does before the
-    # reusable workflow ever sees the inputs. Zero values = zero instances
-    # (the job simply doesn't run, matching CI's run_go_nested gate).
-    # Multi-axis or unresolvable matrices fall through unexpanded; the
-    # job_applies_locally gate then decides (fail-safe, current behavior).
+    # Single-axis strategy.matrix (the meta go-nested job's `dir:
+    # fromJSON(...)`): expand one job instance per value, substituting
+    # `${{ matrix.<axis> }}` textually in `with:` — mirroring what CI's
+    # matrix does before the reusable workflow sees the inputs. Zero values
+    # means zero instances. Multi-axis or unresolvable matrices fall through
+    # unexpanded; job_applies_locally then decides (fail-safe).
     matrix = (job.get('strategy') or {}).get('matrix') if isinstance(job, dict) else None
     if isinstance(matrix, dict) and len(matrix) == 1 and '__matrix_expanded' not in job:
         axis, spec = next(iter(matrix.items()))
@@ -2193,7 +2079,6 @@ def _expand_job(jobname, job, caller_inputs, target, depth=0, parent_ref=None):
             )
         return out
 
-    # Terminal: a job with inline steps.
     steps = job.get('steps') or []
     run_defaults = (job.get('defaults') or {}).get('run') or {}
     wd = _resolve_with_value(run_defaults.get('working-directory', '.'), caller_inputs or {}, target)
@@ -2453,7 +2338,6 @@ def is_codeql_workflow(jobs_raw):
       - raw jobs dict from YAML
     """
     if isinstance(jobs_raw, dict):
-        # Check for reusable codeql.yaml call
         for job in jobs_raw.values():
             uses = job.get('uses', '')
             if 'codeql.yaml' in uses or 'codeql.yml' in uses:
@@ -2463,7 +2347,6 @@ def is_codeql_workflow(jobs_raw):
                 if uses.split('@', 1)[0] == 'github/codeql-action/init':
                     return True
         return False
-    # List of (jobname, steps) tuples
     for _jobname, steps in jobs_raw:
         for s in steps:
             uses = s.get('uses', '')
@@ -2531,7 +2414,6 @@ def parse_sarif_alerts(sarif_path: Path):
         data = json.load(f)
     alerts = []
     for run in data.get('runs', []):
-        # Build a rule_id -> security-severity map from the driver's rules.
         rule_meta = {}
         driver = (run.get('tool') or {}).get('driver') or {}
         for r in driver.get('rules') or []:
@@ -2601,7 +2483,6 @@ def run_codeql_for_job(jobname, steps, target: Path, dry_run: bool):
         else:
             extra_steps.append(s)
 
-    # Replay non-codeql steps via the regular classifier
     for s in extra_steps:
         kind, name, detail = classify_step(s)
         tag = {
@@ -2838,13 +2719,12 @@ def discover_workflows(target: Path):
         if p.is_file():
             found.append(p)
             break
-    # Security workflow.
     for name in ('security.yml', 'security.yaml'):
         p = workflow_dir / name
         if p.is_file():
             found.append(p)
             break
-    # CodeQL workflow; the ci repo's self caller is the active entry point.
+    # The ci repo's self caller is the active CodeQL entry point.
     for name in ('self-codeql.yml', 'self-codeql.yaml', 'codeql.yml', 'codeql.yaml'):
         p = workflow_dir / name
         if p.is_file():
@@ -3015,7 +2895,6 @@ def process_workflow_file(wf_path, target, dry_run, ignore_unknown, no_codeql):
             print()
         return grand_ok, grand_counters, grand_failed
 
-    # Check for reusable workflow calls and expand them
     has_reusable = any(is_reusable_ref(job.get('uses', '')) for job in jobs_dict.values())
 
     if has_reusable:
@@ -3049,7 +2928,6 @@ def process_workflow_file(wf_path, target, dry_run, ignore_unknown, no_codeql):
             grand_failed.extend(failed)
             print()
     else:
-        # Plain workflow with inline steps
         jobs = [(jn, j.get('steps') or []) for jn, j in jobs_dict.items()]
         ok, counters, failed = run_workflow_steps(jobs, target, dry_run, ignore_unknown)
         if not ok:
@@ -3155,7 +3033,6 @@ def print_run_summary(counters, failures, ok, plan_only):
 
 
 def main():
-    # Ensure print() output flushes promptly
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except AttributeError:
@@ -3228,7 +3105,6 @@ def main():
         print(f'error: target not a directory: {target}', file=sys.stderr)
         sys.exit(2)
 
-    # Resolve workflow list
     workflow_paths = []
     if args.workflow:
         for w in args.workflow:
@@ -3262,7 +3138,6 @@ def main():
                 'from the CI pin (detail in the summary below)'
             )
 
-    # Clear failure marker
     if not args.plan_only:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(_CI_FAILURES_PATH)
@@ -3294,13 +3169,10 @@ def main():
                     f'workflow re-installs them)'
                 )
 
-    # Keep ci-local side-effect-free on the working tree (mirrors the
-    # node_modules cleanup above). Two CI steps mutate tracked files and would
-    # otherwise leave a local diff: the security scan does
-    # `printf ... > .trivyignore` (trivy auto-loads it from the workdir), and the
-    # Go wiregen-drift step does `git add -A` (staging the whole tree). Snapshot
-    # both and restore at exit via atexit, so a timeout, exception, or Ctrl-C
-    # between here and the end still restores them.
+    # Keep ci-local side-effect-free: the security scan writes .trivyignore
+    # (trivy auto-loads it) and the wiregen-drift step `git add -A`s the
+    # whole tree, so snapshot both and restore at exit via atexit — covering
+    # a timeout, exception, or Ctrl-C too.
     if not args.plan_only:
         ti_path = target / '.trivyignore'
         ti_existed = ti_path.exists()
@@ -3323,7 +3195,6 @@ def main():
     codeql_config = None
 
     if not workflow_paths:
-        # Autodetect synthetic workflow
         jobs = [('autodetect', autodetect_steps(target))]
         print(f'{yellow("autodetect mode")} — no ci/validate/codeql workflow in {target}')
         print()

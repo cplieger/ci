@@ -1,41 +1,30 @@
 #!/usr/bin/env python3
 """Render the Docker Hub overview page for an image repo.
 
-Docker Hub's full-description field is capped at 25,000 bytes server-side, and
-the publish action truncates anything larger, which silently cuts the end of the
-document. Mirroring a full README therefore put every app README under a byte
-budget that had nothing to do with what the README is for.
+Docker Hub caps the full description at 25,000 bytes server-side and the
+publish action truncates anything larger, silently cutting the document's
+end — so mirroring a full README put every README under a budget unrelated
+to what a README is for.
 
-This script builds a SHORT overview page instead: what the image is, how to pull
-and run it, and links to the real documentation on GitHub. Its length is bounded
-by construction, because neither of its two variable-length inputs grows when
-the README grows:
+This builds a SHORT page instead (what the image is, how to pull and run
+it, links to the real docs), bounded by construction since its two
+variable-length inputs — README.md's marked summary region and
+compose.yaml — don't grow when the README does. Nothing is committed:
+docker-release.yaml runs this at publish time and feeds the output
+straight to peter-evans/dockerhub-description, so there's no second
+document to keep current.
 
-    * the marked summary region of README.md (the tagline plus the first
-      section, per public-docs.md's pyramid)
-    * compose.yaml, the repo's reference example
-
-Everything else is derived: the repo name, the image name, the doc links and the
-README's own License section. The GitHub description is deliberately absent,
-because Docker Hub renders it as the separate short-description field above the
-overview, and the marked region already opens with the README's tagline.
-
-Nothing is committed. docker-release.yaml runs this at publish time and points
-peter-evans/dockerhub-description at the output, so there is no second document
-to keep current and no drift to detect.
-
-Relative links are rewritten to absolute GitHub URLs here rather than by the
-action's `enable-url-completion`, which cannot know that this page is not
-README.md and would resolve every anchor against the wrong file.
+Relative links are rewritten to absolute GitHub URLs here rather than via
+the action's `enable-url-completion`, which would resolve every anchor
+against README.md instead of this generated page.
 
 Usage:
-    render-hub-overview.py --repo-root . --owner cplieger --repo docker-radvd \\
+    render-hub-overview.py --repo-root . --owner cplieger --repo docker-radvd \
         --image cplieger/docker-radvd -o hub-overview.md
 
-Exits 1 with a diagnostic when the README carries no summary markers, so a
-release publishes the previous page instead of a truncated one. audit.py checks
-the markers for every image repo, which is where a missing pair is meant to
-surface.
+Exits 1 when the README carries no summary markers, so a release publishes
+the previous page rather than a truncated one; audit.py checks the markers
+for every image repo.
 """
 
 from __future__ import annotations
@@ -46,9 +35,8 @@ import re
 import sys
 from pathlib import Path
 
-# Docker Hub rejects a longer full description; the publish action truncates to
-# fit. A page built from the inputs above lands near 5 KB, so reaching this is a
-# defect in the summary region rather than a budget to manage.
+# A page built from these inputs lands near 5 KB, so reaching this cap is a
+# defect in the summary region, not a budget to manage.
 HUB_MAX_BYTES = 25000
 HUB_WARN_BYTES = 20000
 

@@ -1,48 +1,31 @@
 #!/usr/bin/env python3
 """Render the weekly benchmark tracker issue body for one repo.
 
-The third tracker in the house set, after gremlins and stryker. Same shape: one
-permanent issue per repo, body rewritten in place, machine regions delimited by
-HTML-comment sentinels, `## Free-form notes` preserved, decisions exported as
-marker files for the workflow's shell to act on. Pure body generator: no network,
-no gh CLI, no auth. Body on stdout, diagnostics on stderr.
+Third tracker in the house set, after gremlins and stryker: one permanent
+issue per repo, machine regions delimited by HTML-comment sentinels,
+`## Free-form notes` preserved, decisions exported as marker files for the
+workflow's shell. Pure body generator: no network, no gh CLI, no auth. Built
+because weekly-bench used to report a 1.5x regression only into a job summary
+nobody opens.
 
-Why this exists: weekly-bench measured benchmarks and reported a 1.5x regression
-only into a job summary nobody opens. Its four sibling weekly workflows all
-surface findings as a tracker issue, and that is the difference between a
-tracker that is correct and one that is noticed.
+Unlike gremlins/stryker, history is REGENERATED from the series every run
+rather than rolled forward from the issue's own rendered markdown (which is
+how stryker got a fused table column). The series lives durably in each
+consumer's orphan `benchmarks` branch and, since the attribution repair, each
+point names the commit it measured — only the free-form notes are read back
+out of the existing body.
 
-WHERE THE HISTORY COMES FROM, and why this differs from its siblings
+Thresholds are per metric because the metrics are not alike: `ns/op` is wall
+clock on a shared runner (10-20% amplitude), so it keeps the loose 1.5x the
+action's alert already uses — the target is an algorithmic regression, which
+shows up as a multiple. `B/op`/`allocs/op` are counted, not timed, so they
+don't move with runner load and get a tight 1.05x (the claim xmlx/jsonx are
+enrolled to defend). Crossing zero is its own case: allocation-free becoming
+allocating is the regression these libraries exist to prevent, and the ratio
+is undefined there anyway.
 
-gremlins and stryker keep their rolling table in the issue body, because a
-mutation report is an ephemeral artifact and the issue is the only store. That
-reason does not hold here: the benchmark series already lives durably in each
-consumer's orphan `benchmarks` branch, up to 100 points, and since the
-attribution repair each point names the commit it measured. So this script reads
-that series and REGENERATES the table every run instead of parsing its own
-previous output.
-
-That is deliberate and it removes a whole class of defect the siblings carry: the
-stryker tracker had to fix a fused table column caused by rolling its own
-rendered markdown forward, and a tracker that re-derives from data cannot drift
-from it. Only the free-form notes are read back out of the existing body.
-
-THRESHOLDS ARE PER METRIC, because the metrics are not alike
-
-  * ns/op is wall clock on a shared runner, whose amplitude is documented at
-    10-20%. A tight threshold there trains everyone to ignore the tracker, so it
-    keeps the 1.5x the workflow already configures for the action's own alert:
-    the target is an algorithmic regression, which shows up as a multiple.
-  * B/op and allocs/op are COUNTED, not timed. They do not move with runner
-    load, so a real increase is a real change and 1.5x would hide it entirely.
-    A library whose whole claim is that it does not allocate needs the tight
-    threshold, which is the claim xmlx and jsonx were enrolled to defend.
-  * Crossing zero is called out on its own. Allocation-free becoming
-    allocating is the regression these libraries exist to prevent, and it is
-    also the case where a ratio is undefined.
-
-Never closes the issue. The sibling sentinel query is `--state open`, so a closed
-tracker is invisible next week; a clean week renders an inline note instead.
+Never closes the issue — the sibling sentinel query is `--state open`, so a
+closed tracker is invisible next week; a clean week renders an inline note.
 """
 
 from __future__ import annotations

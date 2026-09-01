@@ -72,16 +72,11 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 MAX_LIVE_MUTANTS_INLINE = 50  # cap; remainder goes to artifact link
 ROLLING_WEEKS = 12
 REGRESSION_THRESHOLD_PCT = 5.0  # mean drops > 5% below rolling-mean → flag
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+
 def mutant_key(m: dict) -> tuple:
     """Stable identifier for a mutant across runs.
 
@@ -142,9 +137,7 @@ def badge_color(efficacy: float) -> str:
     return "red"
 
 
-# ---------------------------------------------------------------------------
-# Aggregation
-# ---------------------------------------------------------------------------
+
 def load_run(path: Path):
     """Parse one gremlins `--output` JSON into (mutants, summary).
 
@@ -256,7 +249,6 @@ def aggregate(attempt_files: list[Path]) -> dict:
     eff_stddev = round(statistics.pstdev(efficacies), 1) if len(efficacies) > 1 else 0.0
     cov_mean = round(statistics.mean([a["mutant_coverage"] for a in per_attempt]), 1)
 
-    # Cross-reference mutants: status across runs.
     by_key: dict[tuple, dict] = {}
     for run in runs:
         for m in run:
@@ -294,9 +286,7 @@ def aggregate(attempt_files: list[Path]) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Body generation
-# ---------------------------------------------------------------------------
+
 HEADER_TPL = """# Gremlins mutation testing tracker
 
 Auto-updated weekly by [`cplieger/ci/.github/workflows/weekly-gremlins.yaml`](https://github.com/cplieger/ci/blob/main/.github/workflows/weekly-gremlins.yaml).
@@ -598,7 +588,6 @@ def measurement_cautions(agg: dict, prev_live_count: int | None) -> list[str]:
 
 def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> tuple[str, bool]:
     """Returns (new_body, regression_flag)."""
-    # Build new rolling-history row.
     eff_mean = agg["efficacy_mean"]
     eff_stddev = agg["efficacy_stddev"]
     cov_mean = agg["mutant_coverage_mean"]
@@ -651,7 +640,6 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
     cautions = measurement_cautions(agg, prev_live_count)
     caution_lines = ("\n" + "\n".join(cautions) + "\n") if cautions else "\n"
 
-    # Live mutants section, frequency-bucketed (rare-first, most actionable).
     live_block_inner, overflow = render_bucketed_live_mutants(
         agg["live_buckets"], agg["n_runs"], MAX_LIVE_MUTANTS_INLINE
     )
@@ -670,7 +658,6 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
             f"<!-- /live-mutants -->"
         )
 
-    # Header
     header = HEADER_TPL.format(
         week_ending=week,
         eff_mean=eff_mean,
@@ -683,10 +670,8 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
         caution_lines=caution_lines,
     )
 
-    # Preserve any free-form notes outside the sentinel blocks.
     notes = ""
     if existing:
-        # Extract anything AFTER the legacy "## Free-form notes" section if present.
         m = re.search(r"## Free-form notes\s*\n(.*?)$", existing, re.DOTALL)
         if m:
             notes = m.group(1).strip()
@@ -701,15 +686,12 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
         + "\n## Free-form notes\n\n" + notes + "\n"
     )
 
-    # Regression flag.
     regression = bool(history_means) and (eff_mean < statistics.mean(history_means) - REGRESSION_THRESHOLD_PCT)
 
     return body, regression
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Aggregate weekly gremlins runs into the tracker issue body.")
     p.add_argument("--repo", required=True, help="repo name without owner")
