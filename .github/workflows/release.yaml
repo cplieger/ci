@@ -316,9 +316,17 @@ jobs:
             '\.md$'
             '(^|/)LICENSE$'
             # Recommended alert rules shipped as README-companion
-            # documentation (root-level alerts.yaml convention) — consumed by
-            # operators copy-pasting into their own monitoring stack, never
-            # by any Dockerfile or published package.
+            # documentation — consumed by operators copy-pasting into their own
+            # monitoring stack, never by any Dockerfile or published package.
+            #
+            # Two patterns, because the convention moved. A bundle now lives in
+            # an `alerts/` FOLDER, one file per expression language, because a
+            # ruler parses every expression in the file it loads and PromQL and
+            # LogQL are mutually unparseable: `promtool check rules` rejects the
+            # LogQL half and `lokitool rules lint` rejects the PromQL half, so a
+            # single mixed file loads in neither. The root form stays matched for
+            # as long as any repo has not migrated; drop it once none has.
+            '^alerts/'
             '^alerts\.yaml$'
             # Grafana dashboards — committed for manual UI import (per the
             # dashboards-imported-via-UI convention), never COPY'd/embedded
