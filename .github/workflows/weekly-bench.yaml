@@ -310,6 +310,17 @@ jobs:
       - name: Execute every unenrolled benchmark once
         env:
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          # setup-go exports GOTOOLCHAIN=local, and `go-version: stable` above
+          # resolves ONLY from actions/go-versions' manifest, which lags an
+          # upstream Go patch tag by hours while Renovate bumps every consumer's
+          # `go` directive inside that window. This job clones ~40 repos whose
+          # directives disagree with each other by design, so `go-version-file`
+          # is not available to it and no single pin can satisfy them: without
+          # `auto` every clone fails `go.mod requires go >= X (running X-1)`.
+          # Measured on go1.27.1, run 33573180820. The toolchain arrives as a
+          # checksum-verified module. Same workaround as go-ci.yaml's gopls
+          # install.
+          GOTOOLCHAIN: auto
           # From the fanout job, never restated here. Injected via env rather
           # than inlined in the body so the value cannot expand into shell code.
           ENROLLED: ${{ needs.fanout.outputs.enrolled }}
