@@ -434,6 +434,25 @@ jobs:
           #                 so keep it significant only when a
           #                 non-devDependencies field changed (compare
           #                 before/after with devDependencies stripped).
+          #
+          # `overrides` is stripped on the same footing as devDependencies, for
+          # a stronger reason than "it does not ship": it DOES ship in the
+          # tarball and is inert there. npm considers overrides only in the root
+          # package.json of the project being installed and ignores them inside
+          # an installed dependency, so a consumer resolves the same tree
+          # whatever a published manifest says here
+          # (https://docs.npmjs.com/cli/v11/configuring-npm/package-json).
+          # An overrides-only edit therefore cannot change any artifact, so it
+          # must not republish byte-identical source. Before this, the commit
+          # SCOPE was the only thing preventing that: `chore(devdeps)` is
+          # skipped by cliff so `release` stays false, but a mislabeled
+          # `fix:`/`feat:` carrying the same diff would have published. That is
+          # commit hygiene guarding a release gate, which is the wrong way
+          # round. Found 2026-09-02 while floating the transitive `qs` CVE
+          # override across 10 repos: 7 of them keep that override in a
+          # published manifest, either a ts root (`fetch`, `actions`,
+          # `reactive`, `ui-primitives`, `web-terminal-ui`) or a declared
+          # subpackage (`keyenc/web`, `web-terminal-engine/web`).
           #   anything else : dev tooling. NO build artifact reads it (web-UI
           #                 images pin TS deps as Dockerfile ARGs + tsc; verified
           #                 no Dockerfile references package.json). Drop it.
@@ -460,11 +479,11 @@ jobs:
               # A published manifest. With no BEFORE to diff against, fail OPEN
               # (stay significant): a missed publish is worse than a spurious one.
               if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
-                b=$(git show "$BEFORE:$pj" 2>/dev/null | jq -S 'del(.devDependencies)' 2>/dev/null || echo "")
-                h=$(git show "$HEAD:$pj"   2>/dev/null | jq -S 'del(.devDependencies)' 2>/dev/null || echo "")
+                b=$(git show "$BEFORE:$pj" 2>/dev/null | jq -S 'del(.devDependencies, .overrides)' 2>/dev/null || echo "")
+                h=$(git show "$HEAD:$pj"   2>/dev/null | jq -S 'del(.devDependencies, .overrides)' 2>/dev/null || echo "")
                 if [ -n "$b" ] && [ "$b" = "$h" ]; then
                   SIGNIFICANT=$(echo "$SIGNIFICANT" | grep -vxF "$pj" || true)
-                  echo "::notice::$pj changed only in devDependencies — not significant"
+                  echo "::notice::$pj changed only in devDependencies/overrides — not significant"
                 fi
               fi
             done < <(echo "$SIGNIFICANT" | grep -E '(^|/)package\.json$')
