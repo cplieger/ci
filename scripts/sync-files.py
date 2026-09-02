@@ -11,6 +11,8 @@ removes). Feature scope is deliberately the subset the fleet used:
     `chore(sync): ...`, force-push, ensure an open PR labelled `dependencies`
   * no diff -> no PR; a leftover open sync PR whose diff has evaporated
     (content landed some other way) is closed and its branch deleted
+  * forks are skipped by default (--allow-forks opts in); a fork's tree is
+    upstream's, so syncing into it rewrites code we do not own
   * failure isolation: one repo failing never aborts the rest; the run exits
     non-zero at the end if anything failed
 
@@ -34,6 +36,7 @@ Run:
 """
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -42,6 +45,7 @@ from pathlib import Path
 
 import yaml
 
+OWNER = "cplieger"
 BRANCH = "repo-sync/ci/default"
 COMMIT_SUBJECT = "chore(sync): synced file(s) with cplieger/ci"
 PR_TITLE = COMMIT_SUBJECT
@@ -188,6 +192,51 @@ def sync_repo(repo, dest_map, source_root, dry_run):
         return "changed"
 
 
+def fork_names():
+    """Names of every fork under OWNER, in one API call.
+
+    Fail closed: a target repo is only writable by this engine once it is known
+    NOT to be a fork, so an unreadable repo list aborts the run rather than
+    proceeding on an unverified manifest.
+    """
+    proc = run(
+        [
+            "gh", "repo", "list", OWNER,
+            "--limit", "300",
+            "--json", "name,isFork",
+        ],
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or f"gh exited {proc.returncode}"
+        sys.exit(f"sync-files: cannot read {OWNER}'s repo list, so forks cannot "
+                 f"be excluded — refusing to sync: {detail}")
+    repos = json.loads(proc.stdout)
+    if len(repos) >= 300:
+        sys.exit("sync-files: repo list hit the --limit 300 ceiling; raise the limit")
+    return {repo["name"] for repo in repos if repo.get("isFork")}
+
+
+def drop_forks(mapping):
+    """Remove fork targets from the mapping, naming each one dropped.
+
+    A fork's tree is UPSTREAM's, so syncing our conventions into it rewrites
+    code we do not own; the sync PR then auto-merges and our pipelines run
+    against upstream's monorepo on every push. classify-repos.py already
+    filters forks when it generates the manifest, but --manifest is an
+    argument, so the engine cannot assume the file it was handed was generated
+    that way. Second, independent gate on the same rule.
+    """
+    forks = fork_names()
+    kept = {}
+    for full_name, dest_map in mapping.items():
+        if full_name.split("/")[-1] in forks:
+            print(f"::notice::{full_name}: skipped, repo is a fork")
+            continue
+        kept[full_name] = dest_map
+    return kept
+
+
 def main():
     ap = argparse.ArgumentParser(description="cplieger file-sync engine")
     ap.add_argument("--manifest", default=".github/sync.yml",
@@ -198,6 +247,8 @@ def main():
                     help="report diffs only; no push, no PR, no close")
     ap.add_argument("--only", default="",
                     help="comma/space-separated repo names to limit the run")
+    ap.add_argument("--allow-forks", action="store_true",
+                    help="sync forks too (default: forks are skipped)")
     args = ap.parse_args()
 
     source_root = Path(args.source_dir).resolve()
@@ -205,6 +256,8 @@ def main():
     if args.only:
         wanted = {w.strip() for w in args.only.replace(",", " ").split() if w.strip()}
         mapping = {r: f for r, f in mapping.items() if r.split("/")[-1] in wanted}
+    if not args.allow_forks:
+        mapping = drop_forks(mapping)
 
     if not mapping:
         print("nothing to sync (empty mapping after filters)")
