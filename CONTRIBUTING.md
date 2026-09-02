@@ -75,7 +75,8 @@ Your change travels one of three independent propagation paths:
   Pull-requests:write on the targets). `sync.yaml` first regenerates
   `.github/sync.yml` by running `classify-repos.py`, then runs the in-house
   sync engine (`scripts/sync-files.py`; test locally with
-  `--dry-run`, limit targets with `--only`).
+  `--dry-run`, limit targets with `--only`). Forks are skipped: the generator
+  leaves them out of the manifest, and the engine checks again before it writes.
 - **The Renovate preset** (`default.json`) is fetched natively by Renovate from
   each consumer's one-line `extends`; no sync needed.
 
