@@ -331,6 +331,31 @@ def file_text(repo, path):
 AUDIT_UA = "Mozilla/5.0 (compatible; cplieger-governance-audit)"
 
 
+# dest-in-consumer -> canonical-in-this-repo, for the synced files that carry no
+# per-repo content and so must match their canonical exactly. Keyed on a root
+# Dockerfile, which is the same condition classify-repos.py uses to decide who
+# receives repin-sha.sh. Opt-in synced files (image-smoke.sh, shell/lib.sh) are
+# deliberately absent: a repo that never opted in has no copy, and "absent" must
+# not read as drift.
+SYNCED_BYTE_IDENTICAL = {"scripts/repin-sha.sh": "configs/repin-sha.sh"}
+
+_canonical_cache = {}
+
+
+def canonical_text(path):
+    """This repo's own copy of a synced canonical, read once per run.
+
+    Read through the API rather than off disk on purpose: the audit compares
+    against what is actually on ci's default branch, so a run from a feature
+    branch or a stale checkout cannot report the fleet as drifted against an
+    unpublished canonical.
+    """
+    if path not in _canonical_cache:
+        _canonical_cache[path] = file_text("ci", path)
+    return _canonical_cache[path]
+
+
+
 def used_by_package_scrape(name):
     """The package a repo's "Used by" counter currently represents, plus the
     package set the counter could be switched to.
@@ -655,6 +680,28 @@ def collect(meta):
         else:
             s["errors"].append("actions secrets unreadable (API)")
 
+    # Synced files that must be BYTE-IDENTICAL to their canonical. sync.yaml
+    # distributes them and nothing reported when a copy diverged, which is the gap
+    # this closes. The fleet's default branches were verified clean when this
+    # landed (2026-09-02, every Dockerfile repo byte-identical to
+    # configs/repin-sha.sh), so this is a detector for a class rather than a
+    # cleanup: the real instance was a comment-cleanup pass on a REVIEW branch
+    # that read the synced copy as local code and trimmed it 201 lines to 148.
+    # The next sync silently overwrites such an edit, so it is lost work either
+    # way, and nothing said so. Beware of reasoning from a local checkout here —
+    # several clones were many commits behind their remote, which looks exactly
+    # like fleet-wide drift and is not.
+    s["synced_drift"] = []
+    for dest, canon_path in SYNCED_BYTE_IDENTICAL.items():
+        if not s.get("has_dockerfile"):
+            continue
+        canon = canonical_text(canon_path)
+        got = file_text(name, dest)
+        if canon is None or got is None:
+            s["errors"].append(f"{dest} byte-identity probe unreadable (API)")
+        elif got and got != canon:
+            s["synced_drift"].append(dest)
+
     # Public docs standard. One contents read serves every README check:
     # presence, the canonical footer blocks, License-last heading order, and
     # the Docker Hub overview markers. Public repos only — reader-facing docs
@@ -760,6 +807,10 @@ def compliance(s):
             (hard if s["adopted"] else warn).append("license missing")
         elif s["license"] != want:
             warn.append(f"license {s['license']} (want {want})")
+
+    for dest in s.get("synced_drift") or []:
+        warn.append(f"{dest} differs from its canonical in cplieger/ci "
+                    "(synced file, edit the canonical — the next sync overwrites this copy)")
 
     if s["has_protection"] is False:
         hard.append("no branch protection on default branch")
