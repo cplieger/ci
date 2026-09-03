@@ -536,7 +536,7 @@ jobs:
       - name: Comment ratio
         if: ${{ github.repository != 'cplieger/ci' }}
         continue-on-error: true
-        uses: cplieger/ci/actions/comment-audit@9cb986791bbb56b00deb30f80904b81a2eac6add # v2
+        uses: cplieger/ci/actions/comment-audit@b899b20c6ed98b09df0a8a506f74092718eec445 # v2
 
       - name: Check results
         if: always()
