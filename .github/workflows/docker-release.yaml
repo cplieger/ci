@@ -430,6 +430,69 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      # ─── Version ownership gate: refuse a BACKWARD publish ────────────────
+      # Every non-skipped step below pushes the whole user-facing tag set —
+      # latest, vMAJ, vMAJ.MIN, vMAJ.MIN.PATCH — at inputs.version, then signs
+      # and attests an SBOM against it. So a run whose commit sits BEHIND the
+      # commit that version's git tag already names replaces a released image
+      # with an older build and certifies the older build at the released
+      # version. "Create release" below already refuses the same condition,
+      # but it runs at the END of this job, after every registry write has
+      # landed, so it protects the Release and not the registries.
+      #
+      # Reachable by RERUN, not by a race. The consumer stub serializes
+      # push-triggered release runs in a queued, no-cancel concurrency group,
+      # but a rerun rejoins after its successor finished, and `prepare` is not
+      # re-attempted — the rerun carries the version its first attempt
+      # computed against the older tag state. Measured 2026-09-04 on
+      # docker-renovate-scheduler: attempt 1 died on a transient
+      # cosign-installer download (curl exit 35), the next Renovate merge
+      # released v3.3.13 from its own commit, and a rerun 14 minutes later
+      # republished latest, v3, v3.3 and v3.3.13 on BOTH registries from the
+      # parent commit, cosign-signed, before the end-of-job guard refused the
+      # Release. The image the tag named and the commit the tag named then
+      # disagreed, with a valid signature over the wrong one.
+      #
+      # DIRECTION is the whole test, because publishing forward is normal
+      # here: a commit warranting no version bump still rebuilds and re-pushes
+      # the current version's tags, and the supersession handoff documented in
+      # "Create release" has a successor overwrite the same version one commit
+      # later on purpose. Equal, absent and forward all proceed; only backward
+      # is refused. Diverged histories and an unanswerable compare are refused
+      # too — the gate fails closed, and every case it refuses is a run that
+      # has nothing left to publish, so refusing costs no releasable content.
+      #
+      # Docker-only, like the handoff it complements. The go and ts lanes push
+      # no mutable registry tag: an npm/JSR publish is a version-exists
+      # idempotent skip, so a stale rerun there cannot overwrite a newer
+      # artifact.
+      - name: Version ownership gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
+            echo "::notice::${VERSION} is not tagged yet; publishing."
+            exit 0
+          fi
+          if [ "$EXISTING" = "$GITHUB_SHA" ]; then
+            echo "::notice::${VERSION} already names this commit; publishing."
+            exit 0
+          fi
+          STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${GITHUB_SHA}...${EXISTING}" \
+            --jq .status 2>/dev/null || echo "unknown")
+          if [ "$STATUS" = "behind" ]; then
+            echo "::notice::${VERSION} names ${EXISTING}, an ancestor of ${GITHUB_SHA}; publishing forward."
+            exit 0
+          fi
+          MSG="refusing to publish ${VERSION}: its tag names ${EXISTING} and this run built ${GITHUB_SHA}"
+          MSG="${MSG} (compare status: ${STATUS}). Publishing would overwrite the released image with an"
+          MSG="${MSG} older build and sign it at that version. The commit at ${EXISTING} already carries"
+          MSG="${MSG} this version, so a rerun has nothing to publish."
+          echo "::error::${MSG}"
+          exit 1
+
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -1189,7 +1252,10 @@ jobs:
         # fails loudly (a tag is never moved), an existing release is left
         # as-is. finalize mode (tag already at this SHA, Release missing)
         # flows through the same guards: the tag is reused and only the
-        # Release is created.
+        # Release is created. The "tag elsewhere" arm is a BACKSTOP now — the
+        # "Version ownership gate" at the top of this job refuses a backward
+        # publish before any registry write, so the only way to reach here is
+        # a tag that appeared mid-build, which the gate cannot see.
         #
         # Supersession handoff (2026-07-21, probe-verified in a scratch repo):
         # once a push that includes workflow-file changes lands on the branch
