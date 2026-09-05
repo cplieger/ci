@@ -130,7 +130,7 @@ env:
   # Note ci.yaml's build-ability job passes NO version input and so never
   # broke — which is why every PR stayed green while every release died.
   # renovate: datasource=github-releases depName=docker/buildx
-  BUILDX_VERSION: v0.36.1
+  BUILDX_VERSION: v0.37.0
   # A cosign MAJOR is a breaking change even when the bump looks routine
   # (v2→v3 flipped sign-blob defaults and broke release SBOM signing) — majors
   # are not auto-merged; read the changelog before approving.
