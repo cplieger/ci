@@ -520,6 +520,56 @@ jobs:
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
+      # Every Sigstore call in this job crosses a network hop cosign does not
+      # retry, and under cosign v3 there are three of them per signature:
+      # Fulcio for the certificate, Rekor for the log entry, and
+      # timestamp.sigstore.dev for the RFC 3161 timestamp the v3 bundle
+      # carries by default. cosign exposes no retry knob (--timeout bounds the
+      # whole operation and then gives up), so one reset connection fails the
+      # step — AFTER the manifest step already pushed latest/vMAJ/vMAJ.MIN/
+      # vMAJ.MIN.PATCH to both registries. Measured 2026-09-07 on
+      # docker-renovate-scheduler v3.3.20: the TSA answered `connection reset
+      # by peer`, and the version published to GHCR and Docker Hub unsigned,
+      # unattested, with no git tag and no GitHub Release. The one before it
+      # (2026-09-04, same repo) was the installer losing release-cosign.pub to
+      # the same class of reset, so this is a recurring shape rather than one
+      # bad day.
+      #
+      # Same exponential-backoff shape as go-ci.yaml's golangci-lint install:
+      # 5 attempts, 5s doubling to 40s, 75s of waiting in the worst case. It
+      # is a sourced shell function rather than a loop copied into each step
+      # because eight cosign invocations below need it.
+      #
+      # Retrying is safe because every operation here is additive: a digest
+      # can carry several signatures and several attestations, and verifiers
+      # accept the digest when ANY of them verifies. So a retry that follows a
+      # partial success leaves a duplicate, never a conflict.
+      #
+      # Deliberately NOT applied to the no-change gate's `cosign download
+      # attestation`: a missing baseline is a legitimate, expected failure
+      # there (first publish), so retrying would spend 75s on every image
+      # that has no attestation yet, and that call already fails open.
+      - name: Prepare Sigstore retry helper
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/sigstore-retry.sh" <<'SH'
+          retry_sigstore() {
+            _attempt=1
+            _max=5
+            _delay=5
+            until "$@"; do
+              if [ "$_attempt" -ge "$_max" ]; then
+                echo "::error::$1 failed after ${_max} attempts: $*"
+                return 1
+              fi
+              echo "::warning::$1 attempt ${_attempt}/${_max} failed; retrying in ${_delay}s"
+              sleep "$_delay"
+              _attempt=$((_attempt + 1))
+              _delay=$((_delay * 2))
+            done
+          }
+          SH
+
       # ─── No-change publish gate (staleness-dispatched rebuilds only) ──────
       # Compares the package inventory (sorted SPDX name+versionInfo tuples)
       # of the freshly built amd64 image against the SBOM attestation already
@@ -1033,7 +1083,10 @@ jobs:
         if: ${{ steps.nochange.outputs.skip != 'true' }}
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
-        run: cosign sign --yes --recursive "$IMAGE_REF"
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/sigstore-retry.sh"
+          retry_sigstore cosign sign --yes --recursive "$IMAGE_REF"
 
       - name: Attest SBOM to GHCR
         # NOTE: cosign attest does not support --recursive (that's a sign-only
@@ -1043,7 +1096,9 @@ jobs:
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
-          cosign attest --yes \
+          set -euo pipefail
+          . "$RUNNER_TEMP/sigstore-retry.sh"
+          retry_sigstore cosign attest --yes \
             --predicate sbom.spdx.json \
             --type spdxjson \
             "$IMAGE_REF"
@@ -1052,14 +1107,19 @@ jobs:
         if: ${{ contains(inputs.registries, 'dockerhub') && steps.nochange.outputs.skip != 'true' }}
         env:
           IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
-        run: cosign sign --yes --recursive "$IMAGE_REF"
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/sigstore-retry.sh"
+          retry_sigstore cosign sign --yes --recursive "$IMAGE_REF"
 
       - name: Attest SBOM to Docker Hub
         if: ${{ contains(inputs.registries, 'dockerhub') && steps.nochange.outputs.skip != 'true' }}
         env:
           IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
-          cosign attest --yes \
+          set -euo pipefail
+          . "$RUNNER_TEMP/sigstore-retry.sh"
+          retry_sigstore cosign attest --yes \
             --predicate sbom.spdx.json \
             --type spdxjson \
             "$IMAGE_REF"
@@ -1077,8 +1137,10 @@ jobs:
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/sigstore-retry.sh"
           for f in vex/*.openvex.json; do
-            cosign attest --yes \
+            retry_sigstore cosign attest --yes \
               --predicate "$f" \
               --type openvex \
               "$IMAGE_REF"
@@ -1089,8 +1151,10 @@ jobs:
         env:
           IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/sigstore-retry.sh"
           for f in vex/*.openvex.json; do
-            cosign attest --yes \
+            retry_sigstore cosign attest --yes \
               --predicate "$f" \
               --type openvex \
               "$IMAGE_REF"
@@ -1116,7 +1180,8 @@ jobs:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
           set -euo pipefail
-          cosign verify-attestation --type openvex \
+          . "$RUNNER_TEMP/sigstore-retry.sh"
+          retry_sigstore cosign verify-attestation --type openvex \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity-regexp '^https://github\.com/cplieger/ci/\.github/workflows/docker-release\.yaml@' \
             "$IMAGE_REF" > /dev/null
@@ -1132,9 +1197,15 @@ jobs:
             echo "::error::vex/ documents contain no vulnerability statements; refusing to pass an empty gate"
             exit 1
           fi
-          cosign download attestation \
-            --predicate-type https://openvex.dev/ns \
-            "$IMAGE_REF" > /tmp/vex-attestations.jsonl
+          # Redirect INSIDE a wrapper, not on the retry_sigstore call: the
+          # outer `>` truncates once, so a partial attempt's bytes would
+          # otherwise stay in the file ahead of the next attempt's output.
+          fetch_vex_attestations() {
+            cosign download attestation \
+              --predicate-type https://openvex.dev/ns \
+              "$IMAGE_REF" > /tmp/vex-attestations.jsonl
+          }
+          retry_sigstore fetch_vex_attestations
           : > /tmp/vex-predicates.json
           while IFS= read -r line; do
             [ -z "$line" ] && continue
@@ -1235,7 +1306,9 @@ jobs:
         # gate (the SBOM was regenerated above from the published image).
         if: ${{ (inputs.release-needed == 'true' || inputs.finalize == 'true') && steps.nochange.outputs.skip != 'true' }}
         run: |
-          cosign sign-blob --yes sbom.spdx.json \
+          set -euo pipefail
+          . "$RUNNER_TEMP/sigstore-retry.sh"
+          retry_sigstore cosign sign-blob --yes sbom.spdx.json \
             --bundle sbom.spdx.json.sigstore.json
 
       - name: Create release
