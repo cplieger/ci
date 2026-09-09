@@ -63,6 +63,26 @@ jobs:
       # presence-is-enrolment shape as the knip step above — so a package still
       # on a DOM emulator, or with no DOM tests at all, pays nothing.
       #
+      # NOT `--with-deps`, and that is the whole point of this step's shape: on
+      # `ubuntu-24.04` the runner image ALREADY carries every one of those
+      # libraries, so the flag's apt transaction installs nothing but 9 font
+      # packages (21.1 MB) — measured twice, `0 upgraded, 9 newly installed`,
+      # every entry a font. What it buys is CJK/Thai/Cyrillic glyph fallback,
+      # which no DOM assertion here reads; the Latin faces these suites lay out
+      # with (fonts-liberation, DejaVu) are preinstalled either way.
+      # What it COSTS is an unbounded-latency apt fetch on the critical path:
+      # 2026-09-09, azure.archive.ubuntu.com served those 21.1 MB at 23.2 kB/s
+      # and the fetch alone ran 15m10s, blowing the job ceiling and cancelling
+      # `ci / ts / validate` with every check already green. apt exposes no
+      # minimum-throughput knob (`Acquire::Retries` and `::Timeout` govern
+      # stalled connections, not slow ones), so a mirror that trickles cannot be
+      # bounded from here — the fix is to not reach for apt at all. The CDN
+      # download that remains is ~8s for all three artifacts.
+      #
+      # If a future runner image stops preinstalling those libraries, Chromium
+      # fails to launch at `browserType.launch` with a named missing .so, which
+      # is a loud failure in the step below rather than a silent wrong result.
+      #
       # Driven through the repo's own pinned `playwright` devDependency
       # (`--no-install`), never a floating `npx playwright@latest`: the CLI and
       # the library must be the same version or the browser build number the CLI
@@ -80,7 +100,7 @@ jobs:
       - name: Install browser (vitest browser mode)
         run: |
           if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
-            npx --no-install playwright install --with-deps chromium
+            npx --no-install playwright install chromium
           else
             echo "no @vitest/browser-playwright devDependency; skipping browser install"
           fi

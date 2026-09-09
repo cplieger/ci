@@ -79,12 +79,14 @@ jobs:
           # Chromium, so enrol on the package's own
           # `@vitest/browser-playwright` devDependency and drive its own pinned
           # playwright CLI. ts-ci.yaml's browser step owns the reasoning for
-          # both the marker and `--no-install`; the nested job below is the
-          # same shape. Unlike there, a failed install fails this step, which
-          # is right: the badge must not publish a number measured without a
-          # browser.
+          # the marker, `--no-install`, and the absence of `--with-deps` (the
+          # runner image already carries Chromium's libraries, so that flag adds
+          # only an unbounded-latency apt fetch for fonts nothing here reads);
+          # the nested job below is the same shape. Unlike there, a failed
+          # install fails this step, which is right: the badge must not publish
+          # a number measured without a browser.
           if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
-            npx --no-install playwright install --with-deps chromium
+            npx --no-install playwright install chromium
           else
             echo "no @vitest/browser-playwright devDependency; skipping browser install"
           fi
@@ -251,12 +253,13 @@ jobs:
               # the fleet's nested TS packages are browser-mode, which would have
               # made this whole leg vacuous. Enrolment is the package's own
               # `@vitest/browser-playwright` devDependency, driven through its own
-              # pinned playwright CLI: the same presence-is-enrolment shape, and
-              # the same `--no-install` reasoning, as ts-ci.yaml's browser step.
+              # pinned playwright CLI: the same presence-is-enrolment shape, the
+              # same `--no-install` reasoning, and the same omission of
+              # `--with-deps`, as ts-ci.yaml's browser step.
               browser_dep="const v=require('./package.json').devDependencies||{};"
               browser_dep="$browser_dep process.exit(v['@vitest/browser-playwright']?0:1)"
               if ( cd "$d" && node -e "$browser_dep" ); then
-                ( cd "$d" && npx --no-install playwright install --with-deps chromium ) >> "$log" 2>&1 \
+                ( cd "$d" && npx --no-install playwright install chromium ) >> "$log" 2>&1 \
                   || echo "::warning::$d: browser install failed; the run below may measure nothing"
               fi
 

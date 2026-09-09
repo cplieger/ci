@@ -47,9 +47,12 @@
 #     it once per machine, from the package dir so the pinned CLI picks its own
 #     matching browser build:
 #         npx --no-install playwright install chromium
-#     No --with-deps locally: a desktop already has the ~95 system libraries a
-#     bare runner does not. Not resolvable from this repo's pins, for the same
-#     reason as the TS devdeps above — the playwright version is per-package.
+#     No --with-deps, here or in CI: a desktop and the ubuntu-24.04 runner both
+#     already carry the ~95 system libraries Chromium links, so the flag only
+#     adds an apt fetch for glyph-fallback fonts (ts-ci.yaml's browser step
+#     records what that cost). Not resolvable from this repo's pins, for the
+#     same reason as the TS devdeps above — the playwright version is
+#     per-package.
 #   - supply-chain/scan actions that don't run locally: cosign, syft, CodeQL
 #
 # INSTALL TARGETS: Go tools via `go install` (Go bin dir); golangci-lint,
