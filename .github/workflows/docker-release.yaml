@@ -308,32 +308,46 @@ jobs:
       # its clock resets on every release, so an actively released repo never
       # reaches the staleness threshold at all.
       #
-      # A Dockerfile opts in by declaring `ARG PKG_REFRESH` and REFERENCING it
-      # in its package layer; this step then feeds it today's UTC date, so that
-      # layer rebuilds at most once a day while every later build the same day
-      # still hits cache. The reference is load-bearing: BuildKit keys a RUN on
-      # the build args it actually consumes, so a merely-declared ARG would
-      # leave the stale layer in place.
+      # A Dockerfile opts in to each build-arg by DECLARING it and REFERENCING
+      # it in the layer that needs it; a Dockerfile declaring neither gets no
+      # build-arg at all, which keeps BuildKit from warning about an unconsumed
+      # argument on the distroless/scratch images that ship no OS packages.
+      # The reference is load-bearing for both, for the same reason and with
+      # different consequences: BuildKit keys a RUN on the build args it
+      # actually consumes, so a merely-declared PKG_REFRESH leaves the stale
+      # layer in place, and a merely-declared BUILD_VERSION never reaches the
+      # command that stamps it.
       #
-      # A repo with no such ARG gets no build-arg at all, which keeps BuildKit
-      # from warning about an unconsumed argument on the distroless/scratch
-      # images that ship no OS packages.
-      - name: Resolve OS package refresh key
-        id: pkgrefresh
+      # PKG_REFRESH is today's UTC date, so a package layer rebuilds at most
+      # once a day while every later build the same day still hits cache.
+      # BUILD_VERSION is this release's tag; a build that receives none ships
+      # whatever fallback its own source declares, so a released image reports
+      # a version indistinguishable from a developer's local build.
+      - name: Resolve build args
+        id: buildargs
         env:
           DOCKERFILE: ${{ inputs.dockerfile }}
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if grep -qE '^[[:space:]]*ARG[[:space:]]+PKG_REFRESH' "$DOCKERFILE"; then
-            REFRESH="PKG_REFRESH=$(date -u +%Y-%m-%d)"
-            echo "Package layer opts in; passing ${REFRESH}"
+          declares() { grep -qE "^[[:space:]]*ARG[[:space:]]+$1([[:space:]=]|\$)" "$DOCKERFILE"; }
+          args=()
+          if declares PKG_REFRESH; then
+            args+=("PKG_REFRESH=$(date -u +%Y-%m-%d)")
+          fi
+          if declares BUILD_VERSION; then
+            args+=("BUILD_VERSION=${VERSION}")
+          fi
+          if [ "${#args[@]}" -eq 0 ]; then
+            echo "No opted-in ARG in ${DOCKERFILE}; passing no build-args."
           else
-            REFRESH=""
-            echo "No PKG_REFRESH ARG in ${DOCKERFILE}; passing no build-arg."
+            printf 'Passing %s\n' "${args[@]}"
           fi
           {
             echo "build-args<<EOF"
-            echo "$REFRESH"
+            if [ "${#args[@]}" -gt 0 ]; then
+              printf '%s\n' "${args[@]}"
+            fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -364,15 +378,16 @@ jobs:
           file: ${{ inputs.dockerfile }}
           platforms: ${{ matrix.platform }}
           labels: ${{ needs.prepare.outputs.labels }}
-          # PKG_REFRESH (a UTC date) when the Dockerfile opts in, empty
-          # otherwise. See the "Resolve OS package refresh key" step above.
-          build-args: ${{ steps.pkgrefresh.outputs.build-args }}
+          # One key=value per line for the args the Dockerfile opted in to,
+          # empty otherwise. See the "Resolve build args" step above.
+          build-args: ${{ steps.buildargs.outputs.build-args }}
           # mode=max records the full build definition + base64 Dockerfile for
           # richer SLSA provenance on these public images (min omits the build
-          # steps/source). mode=max embeds build-arg VALUES — secret mounts
-          # (RUN --mount=type=secret) are never included, so never pass secrets
-          # via build-args; the only one this workflow passes is PKG_REFRESH,
-          # a date.
+          # steps/source). mode=max embeds build-arg VALUES into the published
+          # attestation — secret mounts (RUN --mount=type=secret) are never
+          # included, so never pass secrets via build-args. The two this
+          # workflow passes are PKG_REFRESH, a date, and BUILD_VERSION, the
+          # release tag; both are as public as the image they describe.
           provenance: mode=max
           # push-by-digest writes the per-arch image under a digest-only ref, with
           # no human-readable tags at this stage. The finalize job assembles the
