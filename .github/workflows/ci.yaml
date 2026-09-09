@@ -824,6 +824,29 @@ jobs:
             fi
           ) || { echo "Probe shell unit-test harness" >> /tmp/_ci_failures; exit 1; }
 
+      # Comment-ratio gate probe (opt-in by file presence). The gate ships from
+      # this repo as actions/comment-audit and runs in every consumer, but it
+      # cannot run HERE: cplieger/ci is on the script's own denylist, so the
+      # variant of the repo job's "Comment ratio" step that this repo executes
+      # returns SKIP before reading a file. Without this probe the scanner has
+      # no executor at the source, and a defect in it merges green and then
+      # fails every consumer at once one tag later — the same shape as the
+      # harness self-test above, for the same reason.
+      #
+      # Gated on `-f` + `python3`, not the older probes' `-x` + `./script`, for
+      # the reason the harness step gives: an exec-bit gate skips silently and
+      # still reports green.
+      - name: Probe comment-ratio gate
+        continue-on-error: true
+        run: |
+          (
+            if [ -f scripts/test-comment-audit.py ]; then
+              python3 scripts/test-comment-audit.py
+            else
+              echo "no comment-ratio probe in this repo - skipping"
+            fi
+          ) || { echo "Probe comment-ratio gate" >> /tmp/_ci_failures; exit 1; }
+
       - name: Check results
         if: always()
         run: |
