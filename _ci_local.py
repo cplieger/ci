@@ -55,6 +55,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -816,17 +817,42 @@ def apply_runner_env(env: dict, workspace: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# `name<<DELIM` opens a multi-line GITHUB_OUTPUT record. The key excludes `=`
+# and `<` so a plain `key=value` payload can never be read as an opener.
+_GITHUB_OUTPUT_HEREDOC_RE = re.compile(r'^(?P<key>[^=<\s]+)<<(?P<delimiter>\S+)$')
+
+
 def _read_github_outputs(path):
-    """Parse simple `name=value` records written to GITHUB_OUTPUT."""
+    """Parse the `name=value` and `name<<DELIM` records written to GITHUB_OUTPUT.
+
+    The delimiter form is how a step publishes a MULTI-LINE value, and both
+    docker jobs use it for `build-args`. Reading only `name=value` did not merely
+    lose that output: each payload line parsed as a record of its own, so
+    `build-args` went missing while a phantom `PKG_REFRESH` key appeared in its
+    place.
+    """
     outputs = {}
     if not path or not Path(path).is_file():
         return outputs
     with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if '=' in line:
-                key, value = line.split('=', 1)
-                outputs[key] = value
+        lines = f.read().splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        index += 1
+        opener = _GITHUB_OUTPUT_HEREDOC_RE.match(line)
+        if opener:
+            key, delimiter = opener.group('key'), opener.group('delimiter')
+            body = []
+            while index < len(lines) and lines[index].strip() != delimiter:
+                body.append(lines[index])
+                index += 1
+            index += 1  # consume the closing delimiter
+            outputs[key] = '\n'.join(body)
+            continue
+        if '=' in line:
+            key, value = line.split('=', 1)
+            outputs[key] = value
     return outputs
 
 
@@ -855,6 +881,20 @@ def predict_profile_outputs(step, cwd, workspace):
         return {'app': 'false'}
     if '[ -f Dockerfile ]' in script and 'image=true' in script:
         return {'image': 'true' if (cwd / 'Dockerfile').is_file() else 'false'}
+    if 'build-args' in script and 'PKG_REFRESH' in script:
+        # The docker jobs' build-arg resolver. Predicting it keeps --plan-only's
+        # `docker build` line identical to the one execution runs. Only
+        # PKG_REFRESH is predicted, because it is the only arg whose value is
+        # derivable with no release context; a future opt-in arg is
+        # under-reported in the plan and still passed on execution.
+        dockerfile = cwd / str((step.get('env') or {}).get('DOCKERFILE') or 'Dockerfile')
+        try:
+            body = dockerfile.read_text(errors='ignore')
+        except OSError:
+            return {}
+        if not re.search(r'^\s*ARG\s+PKG_REFRESH(?:[\s=]|$)', body, re.MULTILINE):
+            return {'build-args': ''}
+        return {'build-args': f'PKG_REFRESH={datetime.now(UTC):%Y-%m-%d}'}
     return {}
 
 
@@ -1019,6 +1059,14 @@ def classify_step(step):
             cmd += f' -f {shlex.quote(dockerfile)}'
             if target_stage:
                 cmd += f' --target {shlex.quote(target_stage)}'
+            # build-args carries one key=value per line. Dropping them silently
+            # diverged the local build from the gate: a Dockerfile opting into
+            # PKG_REFRESH has its package layer refreshed daily in CI and served
+            # from cache here, and a later opt-in arg would go unexercised.
+            for line in str(with_.get('build-args', '')).splitlines():
+                build_arg = line.strip()
+                if build_arg:
+                    cmd += f' --build-arg {shlex.quote(build_arg)}'
             # Preserve tags so a downstream runtime smoke test can run the
             # image produced by the required native build.
             for tag in str(with_.get('tags', '')).replace(',', '\n').splitlines():
@@ -1965,17 +2013,21 @@ def job_applies_locally(jobname, target):
     return True  # markdown / detect / validate scaffolding — always runs
 
 
-def _resolve_with_value(value, inputs, target, strip_unknown=False, env=None):
+def _resolve_with_value(
+    value, inputs, target, strip_unknown=False, env=None, step_outputs=None
+):
     """Resolve the GitHub expressions used by the active validation workflows.
 
-    Handles workflow-call inputs, detect-job outputs, workflow/job environment
-    values, and the small GitHub event context needed by the meta detect step.
-    Unknown expressions can be stripped before a run block reaches bash, just as
-    the Actions runner substitutes them before invoking the shell.
+    Handles workflow-call inputs, detect-job outputs, EARLIER STEP outputs,
+    workflow/job environment values, and the small GitHub event context needed by
+    the meta detect step. Unknown expressions can be stripped before a run block
+    reaches bash, just as the Actions runner substitutes them before invoking the
+    shell.
     """
     if not isinstance(value, str):
         return value
     env = env or {}
+    step_outputs = step_outputs or {}
 
     def repl(m):
         inner = m.group(1).strip()
@@ -1985,6 +2037,12 @@ def _resolve_with_value(value, inputs, target, strip_unknown=False, env=None):
         nm = re.match(r'needs\.[\w-]+\.outputs\.([\w-]+)$', inner)
         if nm:
             return str(compute_local_detect(target).get(nm.group(1), ''))
+        # A `with:`/`env:`/`run:` value reading an earlier step's output — the
+        # docker jobs' `build-args: ${{ steps.pkgrefresh.outputs.build-args }}`.
+        # Without this the literal expression reached the translated command.
+        sm = re.match(r'steps\.([\w-]+)\.outputs\.([\w-]+)$', inner)
+        if sm:
+            return str(step_outputs.get(sm.group(1), {}).get(sm.group(2), ''))
         em = re.match(r'env\.([\w-]+)$', inner)
         if em:
             return str(env.get(em.group(1), ''))
@@ -2173,19 +2231,29 @@ def process_reusable_steps(
             eff_step['__platform'] = 'linux/arm64'
         if isinstance(step.get('with'), dict):
             eff_step['with'] = {
-                key: _resolve_with_value(value, caller_inputs, target)
+                key: _resolve_with_value(
+                    value, caller_inputs, target, step_outputs=step_outputs
+                )
                 for key, value in step['with'].items()
             }
         if isinstance(step.get('env'), dict):
             eff_step['env'] = {
                 key: _resolve_with_value(
-                    value, caller_inputs or {}, target, strip_unknown=True
+                    value,
+                    caller_inputs or {},
+                    target,
+                    strip_unknown=True,
+                    step_outputs=step_outputs,
                 )
                 for key, value in step['env'].items()
             }
         if isinstance(step.get('run'), str):
             eff_step['run'] = _resolve_with_value(
-                step['run'], caller_inputs, target, strip_unknown=True
+                step['run'],
+                caller_inputs,
+                target,
+                strip_unknown=True,
+                step_outputs=step_outputs,
             )
         if step_wd and step_wd != '.':
             eff_step['working-directory'] = step_wd
