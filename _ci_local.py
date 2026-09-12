@@ -1766,6 +1766,26 @@ def autodetect_steps(target: Path):
         )
         steps.append(
             {
+                'name': 'Lint image-smoke config',
+                'run': (
+                    'if [ -f tests/image-smoke.conf ]; then\n'
+                    '  shellcheck -s sh -S info -e SC2034 tests/image-smoke.conf\n'
+                    'fi'
+                ),
+            }
+        )
+        steps.append(
+            {
+                'name': 'Format check image-smoke config (shfmt)',
+                'run': (
+                    'if [ -f tests/image-smoke.conf ]; then\n'
+                    '  shfmt -d -ln posix -i 2 -ci -bn tests/image-smoke.conf\n'
+                    'fi'
+                ),
+            }
+        )
+        steps.append(
+            {
                 'name': 'Format check shell scripts (shfmt)',
                 'run': (
                     "files=$(find . -name '*.sh' -not -path './.git/*')\n"

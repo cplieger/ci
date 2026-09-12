@@ -138,6 +138,38 @@ jobs:
             fi
           ) || { echo "Lint shell scripts" >> /tmp/_ci_failures; exit 1; }
 
+      # A sourced fragment carries no shebang and so is invisible to the *.sh
+      # discovery above, which left every enrolled repo's smoke config unlinted.
+      # Reaching it through the harness's own `-x` does not work: shellcheck
+      # follows a sourced file to learn definitions and reports NO diagnostics
+      # for its contents (measured: a fragment with 3 findings yields 0). So
+      # lint it directly, with -s sh for the missing shebang and -e SC2034
+      # because the SMOKE_* knobs are consumed by the sourcing harness.
+      - name: Lint image-smoke config
+        continue-on-error: true
+        run: |
+          (
+            if [ -f tests/image-smoke.conf ]; then
+              shellcheck -s sh -S info -e SC2034 tests/image-smoke.conf
+            else
+              echo "shellcheck: no tests/image-smoke.conf — skipping"
+            fi
+          ) || { echo "Lint image-smoke config" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Format check image-smoke config (shfmt)
+        continue-on-error: true
+        run: |
+          (
+            if [ -f tests/image-smoke.conf ]; then
+              shfmt -d -ln posix -i 2 -ci -bn tests/image-smoke.conf
+            else
+              echo "shfmt: no tests/image-smoke.conf — skipping"
+            fi
+          ) || {
+            echo "Format check image-smoke config (shfmt)" >> /tmp/_ci_failures
+            exit 1
+          }
+
       - name: Format check shell scripts (shfmt)
         continue-on-error: true
         run: |
