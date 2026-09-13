@@ -53,6 +53,16 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      # stryker-aggregate.py uses PEP 758 (`except A, B:`), which needs Python
+      # 3.14, and ubuntu-24.04's own python3 is 3.12 and rejects it at PARSE
+      # time. weekly-stryker.yaml's aggregate job pins the same version for the
+      # same reason; without the pin here its probe fails on every case with a
+      # SyntaxError rather than on anything it is testing.
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
       - name: Probe gremlins measurement scripts
         run: python3 scripts/test-gremlins-scripts.py
 
