@@ -34,9 +34,10 @@ import argparse
 import datetime as dt
 import json
 import pathlib
-import re
 import statistics
 import sys
+
+import trackerlib
 
 PREFIX = 'window.BENCHMARK_DATA = '
 
@@ -66,13 +67,8 @@ Updated {week} UTC by [this run]({run_url}).
 Full series and charts: [`benchmarks` branch]({chart_url}).
 """
 
-DATA_BLOCK_TPL = """## Trend
-
-<!-- bench-data -->
-| Run | Commit | Benchmarks | Regressed | Improved |
-|---|---|---|---|---|
-{rows}
-<!-- /bench-data -->"""
+HISTORY_HEADER = """| Run | Commit | Benchmarks | Regressed | Improved |
+|---|---|---|---|---|"""
 
 LEGEND = """
 ## How to read this
@@ -227,14 +223,6 @@ def render_rows(points: list[dict], repo_url: str) -> str:
     return '\n'.join(rows)
 
 
-def carry_notes(existing: str) -> str:
-    if existing:
-        match = re.search(r'## Free-form notes\s*\n(.*?)$', existing, re.DOTALL)
-        if match and match.group(1).strip():
-            return match.group(1).strip()
-    return "Add anything below — won't be touched by the auto-updater."
-
-
 def build_body(
     data: dict, repo: str, week: str, run_url: str, existing: str
 ) -> tuple[str, bool, int]:
@@ -270,14 +258,18 @@ def build_body(
             run_url=run_url,
             chart_url=f'{repo_url}/tree/benchmarks',
         )
+        + '\n## Trend\n\n'
+        + trackerlib.sentinel_block(
+            'bench-data', HISTORY_HEADER + '\n' + render_rows(points, repo_url)
+        )
+        + '\n\n## Findings\n\n'
+        # removesuffix, not rstrip: a regressed-only week ends the block with a
+        # blank line, and the golden pins it.
+        + trackerlib.sentinel_block('bench-findings', findings.removesuffix('\n'))
         + '\n'
-        + DATA_BLOCK_TPL.format(rows=render_rows(points, repo_url))
-        + '\n\n## Findings\n\n<!-- bench-findings -->\n'
-        + findings
-        + '<!-- /bench-findings -->\n'
         + LEGEND.format(n=BASELINE_POINTS, tf=f'{TIME_FACTOR:g}', cf=f'{COUNT_FACTOR:g}')
         + '\n## Free-form notes\n\n'
-        + carry_notes(existing)
+        + trackerlib.preserve_notes(existing)
         + '\n'
     )
     return body, bool(verdict['regressed']), entries

@@ -108,13 +108,18 @@ jobs:
           path: app
 
       # The exclusion list is fleet-wide knowledge, so it lives here and is read
-      # from a second checkout rather than synced into 51 consumers. Sparse and
-      # cone-mode off: one file, no history of the rest of this repo.
-      - name: Checkout exclusion list
+      # from a second checkout rather than synced into 51 consumers; the same
+      # checkout brings the tracker scripts the Report step runs. Sparse and
+      # cone-mode off: these files, no history of the rest of this repo.
+      - name: Checkout exclusion list and tracker scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: .github/lychee.toml
+          sparse-checkout: |
+            .github/lychee.toml
+            scripts/links-body.py
+            scripts/tracker_issue.py
+            scripts/trackerlib.py
           sparse-checkout-cone-mode: false
           path: ci
 
@@ -165,74 +170,42 @@ jobs:
             --format markdown --output "$RUNNER_TEMP/links.md" \
             . || echo "found=1" >> "$GITHUB_OUTPUT"
 
+      # The issues-disabled guard, label creation and the fail-closed API
+      # handling are scripts/tracker_issue.py's; this step only decides between
+      # the clean and the findings branch.
       - name: Report
         env:
-          REPO: ${{ matrix.repo }}
+          REPO: cplieger/${{ matrix.repo }}
           FOUND: ${{ steps.lychee.outputs.found }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           title="Broken external links"
-          body_file="$RUNNER_TEMP/body.md"
-
-          # A repo with issues disabled must not fail the run: `issues` is only a
-          # warn-level setting in the governance audit, so a first-party repo can
-          # legitimately be in that state. Same guard weekly-fuzz carries, and for
-          # the same reason (a fork with issues off reddened the whole weekly run
-          # for two weeks before that guard existed).
-          issues_enabled=$(gh repo view "cplieger/${REPO}" --json hasIssuesEnabled \
-            --jq '.hasIssuesEnabled' 2>/dev/null || echo "true")
-          if [ "$issues_enabled" != "true" ]; then
-            echo "::notice::${REPO} has issues disabled; skipping issue management"
-            exit 0
-          fi
-
-          # `gh issue create --label` FAILS when the label does not exist, so it
-          # has to be created first. Tolerate "already exists" but surface a real
-          # error (a PAT missing issues:write) rather than swallowing it.
-          ensure_label() {
-            local name="$1" color="$2" desc="$3" err
-            err=$(gh label create "$name" -R "cplieger/${REPO}" -c "$color" -d "$desc" 2>&1) && return 0
-            printf '%s' "$err" | grep -qi "already exists" && return 0
-            echo "::warning::label create failed for ${name}: ${err}"
-            return 1
-          }
-
-          existing=$(gh issue list -R "cplieger/${REPO}" --label broken-links \
-            --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          tracker="$GITHUB_WORKSPACE/ci/scripts/tracker_issue.py"
 
           if [ "${FOUND:-0}" != "1" ]; then
             echo "No broken external links in ${REPO}"
-            if [ -n "$existing" ]; then
-              gh issue close "$existing" -R "cplieger/${REPO}" \
-                --comment "All external links resolve as of $(date -u +%Y-%m-%d). Closing." || true
-            fi
+            printf 'All external links resolve as of %s. Closing.\n' "$(date -u +%Y-%m-%d)" \
+              > "$RUNNER_TEMP/comment.md"
+            python3 "$tracker" --repo "$REPO" --label broken-links --title "$title" \
+              --mode close-when-clean --comment-file "$RUNNER_TEMP/comment.md"
             exit 0
           fi
 
-          {
-            echo "Automated weekly external-link check. Report-only: this never blocks a merge."
-            echo ""
-            echo "Each entry below is a link a reader cannot open. Known false positives"
-            echo "are already filtered: 429 and 5xx are accepted, loopback URLs are"
-            echo "skipped, and hosts that block CI checkers are excluded in"
-            echo "[cplieger/ci .github/lychee.toml](https://github.com/cplieger/ci/blob/main/.github/lychee.toml)."
-            echo "So treat what remains as real. Fix the link in this repo; if the URL"
-            echo "does open in a browser, add it to that list with the reason."
-            echo ""
-            echo "<!-- links-data -->"
-            head -c 60000 "$RUNNER_TEMP/links.md"
-            echo ""
-            echo "<!-- /links-data -->"
-            echo ""
-            echo "_Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}_"
-          } > "$body_file"
+          python3 "$GITHUB_WORKSPACE/ci/scripts/links-body.py" \
+            --report "$RUNNER_TEMP/links.md" --run-url "$RUN_URL" > "$RUNNER_TEMP/body.md"
+          python3 "$tracker" --repo "$REPO" --label broken-links --title "$title" \
+            --mode upsert --body-file "$RUNNER_TEMP/body.md"
 
-          if [ -n "$existing" ]; then
-            gh issue edit "$existing" -R "cplieger/${REPO}" --body-file "$body_file"
-            echo "Updated issue #${existing} in ${REPO}"
-          else
-            ensure_label broken-links "d93f0b" "Automated weekly external-link check" || exit 0
-            gh issue create -R "cplieger/${REPO}" --title "$title" \
-              --label broken-links --body-file "$body_file" \
-              || echo "::warning::could not create issue in ${REPO}"
-          fi
+  # `needs:` must list every other job in this workflow.
+  notify:
+    needs: [fanout, run]
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

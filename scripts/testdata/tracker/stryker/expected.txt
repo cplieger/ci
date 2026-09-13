@@ -1,0 +1,77 @@
+# Stryker mutation testing tracker
+
+Auto-updated weekly by [`cplieger/ci/.github/workflows/weekly-stryker.yaml`](https://github.com/cplieger/ci/blob/main/.github/workflows/weekly-stryker.yaml).
+Last update: 2026-09-14 22:30
+
+**This week**: 93.7% mutation score, 98.9% mutant coverage. 6 surviving mutants.
+**Trend**: ↗ +2.9% from 12-week mean (90.8%).
+
+## Rolling 12-week history
+<!-- stryker-data -->
+| Run (UTC) | Score | Mutant coverage | Surviving | Δ score |
+|---|---|---|---|---|
+| 2026-09-14 22:30 | 93.7% | 98.9% | 6 | -1.8% | <!-- run:34900000001 -->
+| 2026-09-13 15:16 | 95.5% | 99.8% | 26 | +6.2% | <!-- run:34764854810 -->
+| 2026-08-22 23:52 | 89.3% | 99.3% | 63 | +0.0% | <!-- run:32602099040 -->
+| 2026-08-22 17:06 | 89.3% | 99.3% | 63 | +0.0% |
+| 2026-08-22 12:46 | 89.3% | 99.3% | 63 | — |
+<!-- /stryker-data -->
+
+## Current surviving mutants (6, this week)
+<!-- live-mutants -->
+<details open>
+<summary>Survived — a test ran and missed it — 5</summary>
+
+### `src/bind-list.ts`
+- L92 — CallExpression → `;`
+- L103 — CallExpression → `;`
+
+### `src/collection.ts`
+- L113 — ConditionalExpression → `true`
+- L113 — EqualityOperator → `newIds.length >= 0`
+- L128 — ConditionalExpression → `false`
+
+</details>
+<details>
+<summary>No coverage — no test reaches it — 1</summary>
+
+### `src/collection.ts`
+- L128 — BlockStatement → `{}`
+
+</details>
+
+<!-- /live-mutants -->
+
+## How to read
+
+- **Score**: % of valid mutants detected (Killed + Timeout) out of detected +
+  Survived + NoCoverage — the mutation-testing-elements formula, same as the
+  README badge
+- **Mutant coverage**: % of valid mutants reached by at least one test
+- One Stryker run per package dir per week (deterministic enough on these TS
+  surfaces; no attempt averaging like the Go/gremlins tracker)
+
+The "Current surviving mutants" section is bucketed by status:
+
+- **Survived**: a test executed the mutant and still passed — the assertion
+  misses the behavior. Most actionable: strengthen the assertion or add a
+  case.
+- **No coverage**: no test reaches the mutated code at all. Add a test, or
+  accept the gap if the file is deliberately untested glue.
+
+The `mutation-regression` label is added when this week's score drops
+>5% below the rolling 12-week mean.
+
+## Free-form notes
+
+Add anything below — won't be touched by the auto-updater.
+
+### Superseded history (before the 2026-08-22 runner change)
+
+Rows measured before the runner change understate the suite and are kept here, outside the rolling window the trend reads.
+
+| Run (UTC) | Score | Mutant coverage | Surviving | Δ score |
+|---|---|---|---|---|
+| 2026-08-21 09:17 | 75.5% | 94.7% | 144 | +0.0% |
+| 2026-08-17 23:44 | 75.5% | 94.7% | 144 | — |
+

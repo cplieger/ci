@@ -27,7 +27,7 @@ duplicate copies.
 | `.github/workflows/security-scan.yaml`  | Trivy repo/config/image scans, advisory only; findings report to the Security tab, never block                                                              |
 
 Every other workflow in `.github/workflows/` is repo-internal automation
-(config sync, tag cutting, the weekly governance audit, scheduled
+(config sync, tag cutting, the daily governance audit, scheduled
 mutation/fuzz/security runs, staleness-gated image rebuilds, and this repo's
 own CI), not for consumers.
 

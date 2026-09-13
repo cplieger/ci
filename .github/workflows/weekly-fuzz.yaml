@@ -255,50 +255,36 @@ jobs:
           path: shard-findings
           pattern: fuzz-findings-${{ matrix.repo }}-shard*
 
+      - name: Checkout ci (for the tracker transport)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/tracker_issue.py
+          sparse-checkout-cone-mode: false
+          path: ci
+
+      # The issues-disabled guard, label creation and the fail-closed API
+      # handling are scripts/tracker_issue.py's. A failed write for one finding
+      # is recorded and the loop goes on, so every finding gets its issue and
+      # the step still ends red.
       - name: Open / update issues and auto-close committed seeds
         working-directory: target
         run: |
           set -uo pipefail
+          tracker="$GITHUB_WORKSPACE/ci/scripts/tracker_issue.py"
+          had_failure=0
+
           # Consolidate findings from every shard of this repo into one list.
           merged=/tmp/findings.txt
           : > "$merged"
           find "$GITHUB_WORKSPACE/shard-findings" -name findings.txt -exec cat {} + 2>/dev/null | sort -u > "$merged" || true
           echo "consolidated $(wc -l < "$merged") finding(s) for ${REPO}"
 
-          # A repo with issues disabled has nowhere to put a finding, and BOTH
-          # passes below would then abort the step ("has disabled issues", exit 1
-          # under the default `bash -e` shell) — reddening the whole weekly run
-          # even on a zero-finding repo. Excluding forks removes today's only
-          # such repo, but `issues` is a warn-level setting in the governance
-          # audit, so a first-party repo can reach this state too. A FAILED read
-          # falls through to the issue ops on purpose: better a loud failure than
-          # a silently dropped finding.
-          issues_enabled=$(gh repo view "$REPO" --json hasIssuesEnabled --jq '.hasIssuesEnabled') || {
-            echo "  could not read the issue setting for ${REPO}; attempting issue ops anyway" >&2
-            issues_enabled=true
-          }
-          if [ "$issues_enabled" != "true" ]; then
-            n=$(wc -l < "$merged")
-            echo "::notice::${REPO} has issues disabled; skipped issue management (${n} finding(s) stay in this run's artifacts)"
-            exit 0
-          fi
-
-          # Create a label, tolerating "already exists" but surfacing real
-          # errors (e.g. the PAT lacking issues:write) as a failure.
-          ensure_label() {
-            local name="$1" color="$2" desc="$3" err
-            err=$(gh label create "$name" -R "$REPO" -c "$color" -d "$desc" 2>&1) && return 0
-            printf '%s' "$err" | grep -qi "already exists" && return 0
-            echo "  label create failed for ${name}: ${err}" >&2
-            return 1
-          }
-
+          printf 'Recurred in %s\n' "$RUN_URL" > "$RUNNER_TEMP/recurred.md"
           while IFS='|' read -r target hash path size preview; do
             [ -z "$target" ] && continue
             title="[fuzz] ${target} regression — ${hash}"
-            existing=$(gh issue list --repo "$REPO" --state open --search "${title} in:title" \
-              --json number,title --jq '.[] | select(.title == "'"$title"'") | .number' | head -1)
-            body=$(cat <<EOF
+            cat > "$RUNNER_TEMP/finding.md" <<EOF
           **Target**: \`${target}\`
           **Reproducer hash**: \`${hash}\`
           **Found in**: ${RUN_URL}
@@ -321,22 +307,15 @@ jobs:
           \`${path}\` is committed to the repo (becomes a deterministic regression
           test in the seed corpus → exercised by every PR's \`Test (race)\` step).
           EOF
-            )
-            if [ -n "$existing" ]; then
-              gh issue comment "$existing" --repo "$REPO" --body "Recurred in ${RUN_URL}" >/dev/null
-              echo "  updated #${existing}: ${title}"
-            else
-              ensure_label fuzz-finding b60205 "Fuzz-discovered regression" || true
-              ensure_label auto-generated ededed "Maintained by automation" || true
-              gh issue create --repo "$REPO" --title "$title" --body "$body" \
-                --label fuzz-finding,auto-generated >/dev/null
-              echo "  created: ${title}"
-            fi
+            python3 "$tracker" --repo "$REPO" --label fuzz-finding --title "$title" \
+              --mode recur --body-file "$RUNNER_TEMP/finding.md" \
+              --comment-file "$RUNNER_TEMP/recurred.md" || had_failure=1
           done < "$merged"
 
           # Auto-close fuzz issues whose seed was committed to the corpus.
-          gh issue list --repo "$REPO" --state open --label fuzz-finding --limit 100 \
-            --json number,title --jq '.[] | "\(.number)|\(.title)"' | while IFS='|' read -r n title; do
+          python3 "$tracker" --repo "$REPO" --label fuzz-finding --mode list \
+            > "$RUNNER_TEMP/open-findings.tsv" || had_failure=1
+          while IFS=$'\t' read -r _ title; do
             target=$(echo "$title" | sed -nE 's|^\[fuzz\] ([A-Za-z][A-Za-z0-9_]*) regression .+$|\1|p')
             hash=$(echo "$title" | sed -nE 's|^.+ — ([a-f0-9]+)$|\1|p')
             { [ -z "$target" ] || [ -z "$hash" ]; } && continue
@@ -347,7 +326,26 @@ jobs:
             seedpath=$(find . -path "*/testdata/fuzz/${target}/${hash}" -print -quit 2>/dev/null)
             if [ -n "$seedpath" ]; then
               msg="Closed automatically: seed \`${seedpath#./}\` was committed; now part of the deterministic regression corpus."
-              gh issue close "$n" --repo "$REPO" --comment "$msg" >/dev/null
-              echo "  closed #${n}"
+              printf '%s\n' "$msg" > "$RUNNER_TEMP/closed.md"
+              python3 "$tracker" --repo "$REPO" --label fuzz-finding --title "$title" \
+                --mode close-when-clean --comment-file "$RUNNER_TEMP/closed.md" || had_failure=1
             fi
-          done
+          done < "$RUNNER_TEMP/open-findings.tsv"
+
+          if [ "$had_failure" -ne 0 ]; then
+            echo "::error::one or more issue operations failed for ${REPO}"
+            exit 1
+          fi
+
+  # `needs:` must list every other job in this workflow.
+  notify:
+    needs: [fanout, fuzz, report]
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

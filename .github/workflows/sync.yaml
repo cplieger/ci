@@ -119,3 +119,16 @@ jobs:
                 echo "  WARN: failed to merge cplieger/${repo}#${pr}"
             done
           done
+
+  # `needs:` must list every other job in this workflow.
+  notify:
+    needs: sync
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

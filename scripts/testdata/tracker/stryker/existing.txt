@@ -1,0 +1,101 @@
+# Stryker mutation testing tracker
+
+Auto-updated weekly by [`cplieger/ci/.github/workflows/weekly-stryker.yaml`](https://github.com/cplieger/ci/blob/main/.github/workflows/weekly-stryker.yaml).
+Last update: 2026-09-13 15:16
+
+**This week**: 95.5% mutation score, 99.8% mutant coverage. 26 surviving mutants.
+**Trend**: ↗ +28.5% from 12-week mean (67.0%).
+
+## Rolling 12-week history
+<!-- stryker-data -->
+| Run (UTC) | Score | Mutant coverage | Surviving | Δ score |
+|---|---|---|---|---|
+| 2026-09-13 15:16 | 95.5% | 99.8% | 26 | +6.2% | <!-- run:34764854810 -->
+| 2026-08-22 23:52 | 89.3% | 99.3% | 63 | +0.0% | <!-- run:32602099040 -->
+| 2026-08-22 17:06 | 89.3% | 99.3% | 63 | +0.0% |
+| 2026-08-22 12:46 | 89.3% | 99.3% | 63 | — |
+<!-- /stryker-data -->
+
+## Current surviving mutants (26, this week)
+<!-- live-mutants -->
+<details open>
+<summary>Survived — a test ran and missed it — 25</summary>
+
+### `src/bind-list.ts`
+- L92 — CallExpression → `;`
+- L103 — CallExpression → `;`
+
+### `src/bus.ts`
+- L62 — BooleanLiteral → `true`
+- L103 — ConditionalExpression → `true`
+- L105 — BooleanLiteral → `true`
+
+### `src/collection.ts`
+- L113 — ConditionalExpression → `true`
+- L113 — EqualityOperator → `newIds.length >= 0`
+- L128 — ConditionalExpression → `false`
+
+### `src/reconcile-tree.ts`
+- L137 — EqualityOperator → `cursor <= positional.length`
+- L161 — ConditionalExpression → `true`
+- L304 — ConditionalExpression → `true`
+- L316 — ConditionalExpression → `true`
+
+### `src/signal.ts`
+- L190 — ConditionalExpression → `true`
+- L195 — BlockStatement → `{}`
+- L218 — ConditionalExpression → `true`
+- L218 — BlockStatement → `{}`
+- L218 — EqualityOperator → `rollback === undefined`
+- L309 — ConditionalExpression → `true`
+- L352 — ConditionalExpression → `true`
+- L360 — ConditionalExpression → `true`
+- L386 — BlockStatement → `{}`
+- L493 — BlockStatement → `{}`
+- L538 — BooleanLiteral → `true`
+- L542 — BooleanLiteral → `false`
+- L590 — BooleanLiteral → `false`
+
+</details>
+<details>
+<summary>No coverage — no test reaches it — 1</summary>
+
+### `src/collection.ts`
+- L128 — BlockStatement → `{}`
+
+</details>
+
+<!-- /live-mutants -->
+
+## How to read
+
+- **Score**: % of valid mutants detected (Killed + Timeout) out of detected +
+  Survived + NoCoverage — the mutation-testing-elements formula, same as the
+  README badge
+- **Mutant coverage**: % of valid mutants reached by at least one test
+- One Stryker run per package dir per week (deterministic enough on these TS
+  surfaces; no attempt averaging like the Go/gremlins tracker)
+
+The "Current surviving mutants" section is bucketed by status:
+
+- **Survived**: a test executed the mutant and still passed — the assertion
+  misses the behavior. Most actionable: strengthen the assertion or add a
+  case.
+- **No coverage**: no test reaches the mutated code at all. Add a test, or
+  accept the gap if the file is deliberately untested glue.
+
+The `mutation-regression` label is added when this week's score drops
+>5% below the rolling 12-week mean.
+
+## Free-form notes
+
+Add anything below — won't be touched by the auto-updater.
+
+### Superseded history (before the 2026-08-22 runner change)
+
+Rows measured before the runner change understate the suite and are kept here, outside the rolling window the trend reads.
+
+| Run (UTC) | Score | Mutant coverage | Surviving | Δ score |
+|---|---|---|---|---|
+| 2026-08-21 09:17 | 75.5% | 94.7% | 144 | +0.0% |
+| 2026-08-17 23:44 | 75.5% | 94.7% | 144 | — |

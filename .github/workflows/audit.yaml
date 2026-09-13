@@ -1,6 +1,6 @@
 name: Audit
 
-# Weekly cross-repo compliance audit. The merge-model checks read fields that
+# Daily cross-repo compliance audit. The merge-model checks read fields that
 # the GitHub API only exposes to a CLASSIC PAT with the 'repo' scope — a
 # fine-grained PAT does NOT serialize them, even with Administration:read.
 # Set AUDIT_PAT to a classic 'repo'-scope PAT. Without it the audit aborts
@@ -11,7 +11,7 @@ name: Audit
 
 on:
   schedule:
-    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+    - cron: "0 5 * * *"   # daily 05:00 UTC, after the other daily jobs
   workflow_dispatch:
 
 permissions:
@@ -42,3 +42,16 @@ jobs:
           status=${PIPESTATUS[0]}
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+
+  # `needs:` must list every other job in this workflow.
+  notify:
+    needs: audit
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

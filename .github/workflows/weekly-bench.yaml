@@ -954,30 +954,8 @@ jobs:
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           TITLE='Benchmark regression tracker'
 
-          ensure_label() {
-            local name="$1" repo="$2" color="$3" desc="$4" err
-            err=$(gh label create "$name" -R "$repo" -c "$color" -d "$desc" 2>&1) && return 0
-            printf '%s' "$err" | grep -qi "already exists" && return 0
-            echo "  label create failed for ${name}: ${err}" >&2
-            return 1
-          }
-
           process_repo() {
-            local repo="$1" R="cplieger/$1" issue_num existing_args=() work
-
-            # `issues` is only a warn-level governance setting, so a first-party
-            # repo can legitimately have them off; that must not redden the run.
-            # Fail OPEN on an unreadable setting - a loud failure beats a
-            # silently dropped finding.
-            local issues_enabled
-            issues_enabled=$(gh repo view "$R" --json hasIssuesEnabled --jq '.hasIssuesEnabled') || {
-              echo "  could not read the issue setting for ${repo}; trying anyway" >&2
-              issues_enabled=true
-            }
-            if [ "$issues_enabled" != "true" ]; then
-              echo "::notice::${repo} has issues disabled; skipped tracker update"
-              return 0
-            fi
+            local repo="$1" R="cplieger/$1" work ent flag=off
 
             work=$(mktemp -d)
             if ! git clone --quiet --depth "$((12 + 1))" --branch benchmarks \
@@ -987,60 +965,32 @@ jobs:
               return 0
             fi
 
-            issue_num=$(gh issue list -R "$R" --state open --label bench-tracker \
-              --search "$TITLE in:title" --json number,title \
-              --jq '.[] | select(.title == "'"$TITLE"'") | .number' 2>/dev/null | head -1) || true
-
-            if [ -n "$issue_num" ]; then
-              gh issue view "$issue_num" -R "$R" --json body --jq .body \
-                > "/tmp/existing-${repo}.md" || { rm -rf "$work"; return 1; }
-              existing_args=(--existing-body-file "/tmp/existing-${repo}.md")
-            fi
+            python3 scripts/tracker_issue.py --repo "$R" --label bench-tracker --title "$TITLE" \
+              --mode fetch --body-file "/tmp/existing-${repo}.md" || { rm -rf "$work"; return 1; }
 
             python3 scripts/bench-aggregate.py \
               --repo "$repo" --data-file "$work/data/data.js" \
               --week "$WEEK" --run-url "$RUN_URL" \
               --regression-marker-file "/tmp/regression-${repo}.txt" \
               --entries-marker-file "/tmp/entries-${repo}.txt" \
-              "${existing_args[@]}" > "/tmp/body-${repo}.md" || { rm -rf "$work"; return 1; }
+              --existing-body-file "/tmp/existing-${repo}.md" > "/tmp/body-${repo}.md" || { rm -rf "$work"; return 1; }
             rm -rf "$work"
 
             # No parseable series means no honest tracker body. Leave the issue
             # exactly as it was rather than publishing an empty one; the red run
             # leg is the signal for that.
-            local ent
             ent=$(cat "/tmp/entries-${repo}.txt" 2>/dev/null || echo 0)
             if [ "$ent" -eq 0 ]; then
               echo "  no benchmarks in ${repo}'s newest point - leaving the issue untouched"
               return 0
             fi
 
-            if [ -z "$issue_num" ]; then
-              ensure_label bench-tracker "$R" 0e8a16 "Weekly benchmark tracker" || return 1
-              ensure_label auto-generated "$R" ededed "Maintained by automation" || return 1
-              ensure_label bench-regression "$R" b60205 "Benchmark regression" || return 1
-              local url
-              url=$(gh issue create -R "$R" --title "$TITLE" \
-                --label bench-tracker,auto-generated \
-                --body-file "/tmp/body-${repo}.md") || return 1
-              issue_num="${url##*/}"
-              echo "  created tracker issue #${issue_num}"
-            else
-              gh issue edit "$issue_num" -R "$R" \
-                --body-file "/tmp/body-${repo}.md" >/dev/null || return 1
-              echo "  updated tracker issue #${issue_num}"
-            fi
-
-            # Re-ensure: an issue can predate the label.
-            ensure_label bench-regression "$R" b60205 "Benchmark regression" || return 1
             if [ "$(cat "/tmp/regression-${repo}.txt" 2>/dev/null)" = "true" ]; then
-              gh issue edit "$issue_num" -R "$R" --add-label bench-regression >/dev/null || return 1
-              echo "  flagged bench-regression"
-            else
-              # Removing an absent label is not a failure.
-              gh issue edit "$issue_num" -R "$R" \
-                --remove-label bench-regression >/dev/null 2>&1 || true
+              flag=on
             fi
+            python3 scripts/tracker_issue.py --repo "$R" --label bench-tracker --title "$TITLE" \
+              --mode upsert --body-file "/tmp/body-${repo}.md" \
+              --flag-label bench-regression --flag "$flag" || return 1
             return 0
           }
 
@@ -1063,3 +1013,16 @@ jobs:
             echo "::error::one or more tracker-issue updates failed"
             exit 1
           fi
+
+  # `needs:` must list every other job in this workflow.
+  notify:
+    needs: [fanout, smoke, run, aggregate]
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

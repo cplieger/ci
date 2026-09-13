@@ -25,6 +25,16 @@ rules:
       - release.yaml
       - self-ci.yaml
       - self-codeql.yml
+      # The scheduled workflows calling notify-failure.yaml.
+      - audit.yaml
+      - daily-security.yaml
+      - rebuild-stale.yaml
+      - sync.yaml
+      - weekly-bench.yaml
+      - weekly-fuzz.yaml
+      - weekly-gremlins.yaml
+      - weekly-links.yaml
+      - weekly-stryker.yaml
 
   secrets-inherit:
     ignore:

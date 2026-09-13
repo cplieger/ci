@@ -12,3 +12,10 @@ extend = "configs/ruff.toml"
 # ignores: this file only exists here, so they don't belong in the synced
 # canonical config.
 "_ci_local.py" = ["PLW0603", "FBT003", "RUF001"]
+# The one importable module in scripts/ (the aggregators and links-body.py
+# import it). Its siblings escape INP001 through their shebang; a library
+# module has none, and scripts/ is not a package.
+"scripts/trackerlib.py" = ["INP001"]
+# scripts/test-*.py run under the stdlib unittest runner (no pytest here);
+# flake8-pytest-style reads its assertion methods as pytest misuse.
+"scripts/test-*.py" = ["PT"]

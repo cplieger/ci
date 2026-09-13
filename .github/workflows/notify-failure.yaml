@@ -1,0 +1,126 @@
+# Files a scheduled workflow's red result as ONE tracker issue per workflow.
+# A cron run has no pull request to block and no operator watching it, which
+# is how `Weekly stryker` stayed red for three consecutive weeks (2026-08-29
+# through 09-12) with nothing announcing it. The issue opens on the first red
+# run with the run link, gets a `Still failing.` comment on each later red run,
+# and is closed on the next green run. Label `weekly-ci-failure`, the same one
+# the private repos' inline `notify` jobs use, so one triage query reads both.
+#
+# This tracks the RUNNER failing. The result trackers some callers maintain
+# (`bench-tracker`, `broken-links`, `gremlins-tracker`, `stryker-tracker`)
+# describe the code under test, which is a different fact.
+#
+# Call it as the final job of a scheduled workflow with `needs:` on EVERY other
+# job and `if: always()`: the verdict is read from the run's job list, so a job
+# missing from `needs:` may still be running and is then invisible. The issue
+# writes go through scripts/tracker_issue.py from a checkout of this repo, so
+# the caller's job needs `contents: read` beside `actions: read` and
+# `issues: write`.
+name: Notify failure
+
+on:
+  workflow_call:
+    inputs:
+      workflow:
+        description: Workflow name for the issue title (the caller's github.workflow).
+        type: string
+        required: true
+      run-url:
+        description: URL of the calling run, linked from the issue and every comment.
+        type: string
+        required: true
+      details:
+        description: >-
+          Optional multi-line list of failed steps the caller collected itself
+          (the private carriers' marker file); appended to the jobs-API list.
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+jobs:
+  track:
+    # Schedule only. A dispatch run is interactive and a push or pull request
+    # run has the author watching it, so both already have a reader.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      # The jobs API needs actions:read on a private repo (anonymous on a
+      # public one); the caller's job must grant at least these three scopes.
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      # The transport lives in this repo. `repository:` is explicit so a caller
+      # in another repo still gets these scripts rather than its own tree.
+      - name: Checkout the tracker transport
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cplieger/ci
+          persist-credentials: false
+          sparse-checkout: scripts/tracker_issue.py
+          sparse-checkout-cone-mode: false
+          path: ci
+
+      - name: Track the scheduled result in an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ inputs.run-url }}
+          WORKFLOW: ${{ inputs.workflow }}
+          DETAILS: ${{ inputs.details }}
+          TITLE: Scheduled ${{ inputs.workflow }} run is failing
+        run: |
+          set -euo pipefail
+          label='weekly-ci-failure'
+          tracker="${GITHUB_WORKSPACE}/ci/scripts/tracker_issue.py"
+
+          jobs=$(gh api --paginate "repos/${GH_REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" \
+            --jq '.jobs[]' | jq -s .)
+          # This job is always in its own run's list, so an empty read is a
+          # failed read; acting on it would close the tracker as green.
+          if [ "$(jq length <<<"$jobs")" -eq 0 ]; then
+            echo "::error::the jobs API returned no jobs for run ${RUN_ID}; not touching the tracker"
+            exit 1
+          fi
+
+          # A timed-out job concludes `cancelled`, not `failure` (measured on
+          # a 15-minute cap), so anything but success or skipped is red.
+          red=$(jq -r '.[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped")
+            | "- \(.name): \(.conclusion)"
+              + ([.steps[]? | select(.conclusion == "failure") | .name] | if length > 0 then " (" + join(", ") + ")" else "" end)' \
+            <<<"$jobs")
+          running=$(jq '[.[] | select(.status != "completed")] | length' <<<"$jobs")
+          if [ "$running" -gt 1 ]; then
+            echo "::warning::${running} jobs are still running while this one reports; list every other job in the caller's needs:"
+          fi
+
+          if [ -z "$red" ]; then
+            printf 'The scheduled run is green again: %s\n' "$RUN_URL" >"${RUNNER_TEMP}/comment.md"
+            python3 "$tracker" --repo "$GH_REPO" --label "$label" --title "$TITLE" \
+              --mode close-when-clean --comment-file "${RUNNER_TEMP}/comment.md"
+            exit 0
+          fi
+
+          body="${RUNNER_TEMP}/issue-body.md"
+          {
+            printf 'Run: %s\n\nJobs that did not succeed:\n\n%s\n' "$RUN_URL" "$red"
+            if [ -n "$DETAILS" ]; then
+              printf '\nFailed steps reported by the caller:\n\n%s\n' "$DETAILS"
+            fi
+          } >"$body"
+          {
+            printf 'Still failing.\n\n'
+            cat "$body"
+          } >"${RUNNER_TEMP}/comment.md"
+          {
+            printf 'The scheduled **%s** run failed. Nothing else reports this ' "$WORKFLOW"
+            printf 'result, so this issue tracks it until a scheduled run is green again.\n\n'
+            cat "$body"
+          } >"${RUNNER_TEMP}/new-issue.md"
+          python3 "$tracker" --repo "$GH_REPO" --label "$label" --title "$TITLE" \
+            --mode recur --body-file "${RUNNER_TEMP}/new-issue.md" \
+            --comment-file "${RUNNER_TEMP}/comment.md"

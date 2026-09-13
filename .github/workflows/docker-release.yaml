@@ -11,6 +11,8 @@
 #   3. finalize: download digests → assemble multi-arch manifest via imagetools
 #                → cosign sign+attest → SBOM → Trivy → GitHub Release (gated on
 #                `release-needed`) → Docker Hub overview/description sync
+#   4. verify-publish: read the version tag back from GHCR and Docker Hub and
+#                fail the run unless it carries this run's manifest digest
 #
 # EVERY vulnerability scan in this pipeline is advisory. A blocking `CVE release
 # gate` lived in step 2 for five hours on 2026-08-28 and was withdrawn on its
@@ -1484,3 +1486,68 @@ jobs:
           # and this option would resolve each anchor against the generated file
           # as though it were README.md, which is the wrong target.
           enable-url-completion: false
+
+  # ─── Verify both registries serve this run's manifest at the version tag ──
+  # A green finalize is not proof the artifact is fetchable: the 2026-09-04
+  # rerun republished two registries and went red only at the Release step.
+  # The tag must exist and, when this run pushed a manifest, carry its index
+  # digest (content-addressed, so identical on both registries); the digest
+  # is empty only when the no-change gate skipped every publish step, and
+  # then the tag left in place from the previous publish is the expectation.
+  verify-publish:
+    needs: [prepare, finalize]
+    if: ${{ success() }}
+    runs-on: ubuntu-slim
+    timeout-minutes: 12
+    permissions: {}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      DIGEST: ${{ needs.finalize.outputs.digest }}
+      REGISTRIES: ${{ inputs.registries }}
+    steps:
+      - name: Verify published image
+        run: |
+          set -euo pipefail
+
+          # Anonymous pull token: every image here is public.
+          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors \
+            -o "$RUNNER_TEMP/ghcr-token.json" \
+            "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull"
+          token=$(jq -r .token "$RUNNER_TEMP/ghcr-token.json")
+
+          digest_of() { # <ghcr|hub>
+            case "$1" in
+              ghcr)
+                curl -fsSI --connect-timeout 10 --max-time 30 -H "Authorization: Bearer ${token}" \
+                  -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+                  "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/${VERSION}" |
+                  tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }' ;;
+              hub)
+                curl -fsSL --connect-timeout 10 --max-time 30 \
+                  "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${VERSION}" |
+                  jq -r '.digest // empty' ;;
+            esac
+          }
+
+          # Registries propagate in seconds to a couple of minutes: six
+          # tries, 20 s apart, then fail closed.
+          verify() { # <ghcr|hub> <label>
+            local source=$1 label=$2 got i
+            for i in 1 2 3 4 5 6; do
+              got=$(digest_of "$source" 2>/dev/null || true)
+              if [ -n "$got" ] && { [ -z "$DIGEST" ] || [ "$got" = "$DIGEST" ]; }; then
+                echo "ok: ${label} -> ${got}"
+                return 0
+              fi
+              [ "$i" -lt 6 ] && sleep 20
+            done
+            echo "::error::${label}: expected ${DIGEST:-any digest}, registry answered '${got:-nothing}'"
+            return 1
+          }
+
+          rc=0
+          verify ghcr "${REGISTRY}/${IMAGE_NAME}:${VERSION}" || rc=1
+          if [[ "$REGISTRIES" == *dockerhub* ]]; then
+            verify hub "docker.io/${IMAGE_NAME}:${VERSION}" || rc=1
+          fi
+          exit "$rc"
