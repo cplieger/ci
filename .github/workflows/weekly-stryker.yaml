@@ -233,15 +233,41 @@ jobs:
           # detected (Killed+Timeout) / valid (detected + Survived+NoCoverage).
           # python -c, never a heredoc — heredoc terminators break under GHA
           # YAML dedent (repo-wide convention).
-          score=$(python3 -c "
+          # Emits "<score> <detected> <valid>" so the zero-kill guard below can
+          # read the counts without a second parse of an 8 MB report. Split with
+          # a here-STRING, never a heredoc: a heredoc terminator breaks under
+          # GHA's YAML dedent (the convention this file already follows above).
+          metrics=$(python3 -c "
           import json, sys
           from collections import Counter
           data = json.load(open(sys.argv[1]))
           c = Counter(m['status'] for f in data.get('files', {}).values() for m in f.get('mutants', []))
           detected = c['Killed'] + c['Timeout']
           valid = detected + c['Survived'] + c['NoCoverage']
-          print(f'{detected / valid * 100:.1f}' if valid else '0.0')
+          print(f'{detected / valid * 100:.1f}' if valid else '0.0', detected, valid)
           " "$report")
+          read -r score detected valid <<< "$metrics"
+
+          # A run that killed NOTHING measured nothing, so it is a defect rather
+          # than a score. Refuse before publishing: a real suite kills some of
+          # its mutants, so 0 detected against thousands of valid ones means the
+          # harness never activated a mutant — and only vibekit sets
+          # `thresholds.break`, so everywhere else that sails through as a green
+          # run, a red 0.0% badge and a `mutation-regression` label on the
+          # tracker. Measured 2026-09-13 across 7 repos the moment the browser
+          # install let the dry run through: Killed=0 on every one of them,
+          # against real baselines of 74-100%, with `NoCoverage` in the tens —
+          # so coverage collection worked and only detection was dead.
+          #
+          # Guarded on `valid > 0` so a package that legitimately produces no
+          # mutants still reports 0.0% rather than failing.
+          if [ "${detected}" = "0" ] && [ "${valid}" -gt 0 ]; then
+            echo "${ENTRY}: no mutant was detected, so the harness never activated one." \
+              "Browser-mode suites are the open case; see weekly-stryker's zero-kill guard."
+            echo "::error::${ENTRY}: killed 0 of ${valid} mutants — measured nothing, no score published"
+            exit 1
+          fi
+
           echo "score=${score}" >> "$GITHUB_OUTPUT"
           echo "report=${report}" >> "$GITHUB_OUTPUT"
           echo "### ${ENTRY}: mutation score ${score}% (stryker exit ${rc})" >> "$GITHUB_STEP_SUMMARY"
