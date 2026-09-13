@@ -715,7 +715,23 @@ def main() -> int:
                         "every attempt failed (0) instead of emitting a 0%% badge.")
     args = p.parse_args()
 
-    attempt_files = sorted(args.artifacts_dir.glob(f"gremlins-{args.repo}-*/gremlins-out.json"))
+    # Attempts are matched by the meta.json each artifact carries, and searched at
+    # ANY depth: actions/download-artifact only creates the per-artifact directory
+    # when MORE THAN ONE artifact matched its pattern, so a run with a single
+    # matching artifact extracts flat and both the old
+    # `gremlins-{repo}-*/gremlins-out.json` glob and the directory-name parsing it
+    # depended on find nothing. A missing or unreadable meta.json means the file
+    # cannot be attributed to a repo, so it is skipped rather than guessed at.
+    attempt_files = []
+    for out_path in sorted(args.artifacts_dir.rglob("gremlins-out.json")):
+        try:
+            meta = json.loads((out_path.parent / "meta.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            print(f"[{args.repo}] no readable meta.json beside {out_path}; skipping",
+                  file=sys.stderr)
+            continue
+        if meta.get("repo") == args.repo:
+            attempt_files.append(out_path)
     print(f"[{args.repo}] found {len(attempt_files)} attempt files", file=sys.stderr)
 
     agg = aggregate(attempt_files)

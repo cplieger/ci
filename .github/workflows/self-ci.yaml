@@ -31,6 +31,14 @@ jobs:
   #   test-patch-vitest-runner-separator  the vitest-5 separator stopgap, whose
   #                                       value is entirely in refusing once
   #                                       upstream ships the real fix.
+  #   test-stryker-aggregate.py           stryker-aggregate.py's artifact-layout
+  #                                       contract, which had no probe at all
+  #                                       until a single-entry run silently
+  #                                       skipped every tracker issue.
+  #   test-discover-artifact-repos.sh     the artifact discovery all three weekly
+  #                                       jobs now share, whose two failure
+  #                                       directions are a silent skip and a
+  #                                       falsely red weekly run.
   # Not part of the `validate` check (that comes from the meta ci.yaml, which is
   # consumer-facing); a failure here shows as a red check on the PR.
   measurement-scripts:
@@ -50,3 +58,9 @@ jobs:
 
       - name: Probe the vitest-runner separator stopgap
         run: python3 scripts/test-patch-vitest-runner-separator.py
+
+      - name: Probe stryker aggregate artifact discovery
+        run: python3 scripts/test-stryker-aggregate.py
+
+      - name: Probe shared artifact-repo discovery
+        run: bash scripts/test-discover-artifact-repos.sh

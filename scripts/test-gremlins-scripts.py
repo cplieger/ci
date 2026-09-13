@@ -141,6 +141,21 @@ def test_single_module_is_identity(tmp: Path) -> None:
           ok=sorted(f['file_name'] for f in merged['files']) == ['other.go', 'thing.go'])
 
 
+def attempt_dir(art: Path, repo: str, attempt: int) -> Path:
+    """Stage one downloaded attempt artifact: the directory AND its meta.json.
+
+    The aggregate script attributes an attempt to a repo by reading the meta.json
+    the artifact carries, never by parsing the directory name, because
+    actions/download-artifact only creates that directory when more than one
+    artifact matched its pattern. Fixtures must carry the file for the same reason
+    the real upload does.
+    """
+    d = art / f'gremlins-{repo}-{attempt}'
+    d.mkdir(parents=True)
+    (d / 'meta.json').write_text(json.dumps({'repo': repo, 'attempt': str(attempt)}))
+    return d
+
+
 def test_upstream_fixture_roundtrips(tmp: Path) -> None:
     """The recompute must reproduce a REAL gremlins document, not just ours.
 
@@ -340,8 +355,7 @@ def test_aggregate_consumes_merged_output(tmp: Path) -> None:
     """
     art = tmp / 'artifacts'
     for attempt in (1, 2, 3):
-        d = art / f'gremlins-envx-{attempt}'
-        d.mkdir(parents=True)
+        d = attempt_dir(art, 'envx', attempt)
         root = result('github.com/cplieger/envx/v2', [
             ('envx.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY'),
                          ('LIVED', 'CONDITIONALS_NEGATION')]),
@@ -392,8 +406,7 @@ def test_aggregate_flags_disagreeing_verdicts(tmp: Path) -> None:
     art = tmp / 'artifacts-flaky'
     survivors = ['a.go', 'b.go', 'c.go']
     for attempt, lived_in in enumerate(survivors, start=1):
-        d = art / f'gremlins-rsync-{attempt}'
-        d.mkdir(parents=True)
+        d = attempt_dir(art, 'rsync', attempt)
         files = [
             (f, [('LIVED' if f == lived_in else 'KILLED', 'ARITHMETIC_BASE')])
             for f in survivors
@@ -415,8 +428,7 @@ def test_aggregate_flags_sudden_perfect_week(tmp: Path) -> None:
     """A jump from live mutants to a flawless 100% with no test change."""
     art = tmp / 'artifacts-perfect'
     for attempt in (1, 2, 3):
-        d = art / f'gremlins-rsync-{attempt}'
-        d.mkdir(parents=True)
+        d = attempt_dir(art, 'rsync', attempt)
         (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
             ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')]),
         ])))
@@ -454,8 +466,7 @@ def test_aggregate_never_names_an_older_week_as_last_week(tmp: Path) -> None:
     """
     art = tmp / 'artifacts-legacy-row'
     for attempt in (1, 2, 3):
-        d = art / f'gremlins-rsync-{attempt}'
-        d.mkdir(parents=True)
+        d = attempt_dir(art, 'rsync', attempt)
         (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
             ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')]),
         ])))
@@ -489,8 +500,7 @@ def test_aggregate_reads_last_week_from_the_newest_row(tmp: Path) -> None:
     """With a readable newest row, the caution quotes THAT row's count."""
     art = tmp / 'artifacts-newest-row'
     for attempt in (1, 2, 3):
-        d = art / f'gremlins-rsync-{attempt}'
-        d.mkdir(parents=True)
+        d = attempt_dir(art, 'rsync', attempt)
         (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
             ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')]),
         ])))
@@ -522,8 +532,7 @@ def test_aggregate_quiet_on_a_stable_week(tmp: Path) -> None:
     """No caution when every attempt agrees and the score is not a jump to 100%."""
     art = tmp / 'artifacts-stable'
     for attempt in (1, 2, 3):
-        d = art / f'gremlins-stable-{attempt}'
-        d.mkdir(parents=True)
+        d = attempt_dir(art, 'stable', attempt)
         (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
             ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY')]),
         ])))
@@ -549,8 +558,7 @@ def test_aggregate_rerun_replaces_its_own_row(tmp: Path) -> None:
     and stryker run 32570714460 did the same to 9.
     """
     art = tmp / 'artifacts-rerun'
-    d = art / 'gremlins-rerun-1'
-    d.mkdir(parents=True)
+    d = attempt_dir(art, 'rerun', 1)
     (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
         ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY')]),
     ])))
@@ -590,6 +598,96 @@ def test_aggregate_rerun_replaces_its_own_row(tmp: Path) -> None:
           ok=len(got3) == 2, detail=str(got3))
 
 
+def test_aggregate_reads_a_flat_single_artifact(tmp: Path) -> None:
+    """A run whose pattern matched ONE artifact extracts flat, and must still count.
+
+    actions/download-artifact documents that a single matched artifact is
+    "extracted directly to the specified path", so no per-artifact directory
+    exists. The old glob was `gremlins-{repo}-*/gremlins-out.json` and the old repo
+    discovery parsed those directory names, so this layout silently yielded zero
+    attempts, published no badge, updated no tracker issue and reported success.
+    """
+    art = tmp / 'artifacts'
+    art.mkdir(parents=True)
+    (art / 'meta.json').write_text(json.dumps({'repo': 'solo', 'attempt': '1'}))
+    (art / 'gremlins-out.json').write_text(
+        json.dumps(
+            result(
+                'github.com/cplieger/x/v2',
+                [('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY')])],
+            )
+        )
+    )
+    badge = tmp / 'badge.json'
+    marker = tmp / 'attempts.txt'
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), '--repo', 'solo', '--artifacts-dir', str(art),
+         '--week', '2026-09-13 22:00', '--run-url', 'https://example.invalid/run/1',
+         '--badge-file', str(badge), '--attempts-marker-file', str(marker)],
+        capture_output=True, text=True,
+    )
+    check('flat layout: aggregate exits 0', ok=proc.returncode == 0, detail=proc.stderr)
+    check('flat layout: the one attempt is found', ok='found 1 attempt files' in proc.stderr,
+          detail=proc.stderr)
+    check('flat layout: the attempts marker is 1',
+          ok=marker.is_file() and marker.read_text().strip() == '1')
+    check('flat layout: a badge is written', ok=badge.is_file() and badge.stat().st_size > 0)
+    check('flat layout: the body carries a row', ok='| 2026-09-13 22:00 |' in proc.stdout)
+
+
+def test_aggregate_skips_an_attempt_it_cannot_attribute(tmp: Path) -> None:
+    """No meta.json means the file cannot be tied to a repo, so it is not guessed at.
+
+    Attributing it by directory name is exactly the dependency that broke, and
+    counting it against the requested repo would put another repo's mutants in this
+    repo's tracker.
+    """
+    art = tmp / 'artifacts'
+    orphan = art / 'gremlins-solo-1'
+    orphan.mkdir(parents=True)
+    (orphan / 'gremlins-out.json').write_text(
+        json.dumps(result('github.com/cplieger/x/v2', [('a.go', [('KILLED', 'ARITHMETIC_BASE')])]))
+    )
+    badge = tmp / 'badge.json'
+    marker = tmp / 'attempts.txt'
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), '--repo', 'solo', '--artifacts-dir', str(art),
+         '--week', '2026-09-13 22:00', '--run-url', 'https://example.invalid/run/1',
+         '--badge-file', str(badge), '--attempts-marker-file', str(marker)],
+        capture_output=True, text=True,
+    )
+    check('unattributable attempt: aggregate exits 0', ok=proc.returncode == 0, detail=proc.stderr)
+    check('unattributable attempt: it is not counted',
+          ok='found 0 attempt files' in proc.stderr, detail=proc.stderr)
+    check('unattributable attempt: it says which file it skipped',
+          ok='no readable meta.json' in proc.stderr, detail=proc.stderr)
+    check('unattributable attempt: no badge is written, so a good one survives',
+          ok=not badge.is_file() or badge.stat().st_size == 0)
+
+
+def test_aggregate_ignores_another_repos_attempt(tmp: Path) -> None:
+    """Every artifact of the run is downloaded, so the repo filter is load-bearing."""
+    art = tmp / 'artifacts'
+    mine = attempt_dir(art, 'mine', 1)
+    (mine / 'gremlins-out.json').write_text(
+        json.dumps(result('github.com/cplieger/x/v2', [('a.go', [('KILLED', 'ARITHMETIC_BASE')])]))
+    )
+    theirs = attempt_dir(art, 'theirs', 1)
+    (theirs / 'gremlins-out.json').write_text(
+        json.dumps(result('github.com/cplieger/y/v2', [('b.go', [('LIVED', 'ARITHMETIC_BASE')])]))
+    )
+    marker = tmp / 'attempts.txt'
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), '--repo', 'mine', '--artifacts-dir', str(art),
+         '--week', '2026-09-13 22:00', '--run-url', 'https://example.invalid/run/1',
+         '--attempts-marker-file', str(marker)],
+        capture_output=True, text=True,
+    )
+    check('repo filter: aggregate exits 0', ok=proc.returncode == 0, detail=proc.stderr)
+    check('repo filter: only this repo\'s attempt is counted',
+          ok='found 1 attempt files' in proc.stderr, detail=proc.stderr)
+
+
 def main() -> int:
     if not MERGE.exists() or not AGGREGATE.exists():
         print(f'missing script: {MERGE} / {AGGREGATE}')
@@ -610,6 +708,9 @@ def main() -> int:
         test_aggregate_reads_last_week_from_the_newest_row,
         test_aggregate_quiet_on_a_stable_week,
         test_aggregate_rerun_replaces_its_own_row,
+        test_aggregate_reads_a_flat_single_artifact,
+        test_aggregate_skips_an_attempt_it_cannot_attribute,
+        test_aggregate_ignores_another_repos_attempt,
     ]
     for t in tests:
         print(f'{t.__name__}:')
