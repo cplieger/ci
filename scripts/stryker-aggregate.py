@@ -405,10 +405,14 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    # Entries are matched by meta.json content, not artifact-name parsing
-    # (repo names and dir slugs both contain hyphens).
+    # Entries are matched by meta.json CONTENT, not artifact-name parsing (repo
+    # names and dir slugs both contain hyphens). Searched at any depth, because
+    # actions/download-artifact only creates the per-artifact directory when
+    # MORE THAN ONE artifact matched its pattern: a run with exactly one
+    # reporting package dir extracts flat into the artifacts dir, and a
+    # fixed-depth `stryker-*/meta.json` glob silently finds nothing there.
     entry_dirs = []
-    for meta_path in sorted(args.artifacts_dir.glob('stryker-*/meta.json')):
+    for meta_path in sorted(args.artifacts_dir.rglob('meta.json')):
         try:
             meta = json.loads(meta_path.read_text())
         except OSError, json.JSONDecodeError:

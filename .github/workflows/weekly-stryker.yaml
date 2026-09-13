@@ -406,7 +406,9 @@ jobs:
           # isolated, failures warn and set had_failure, and the job exits red
           # at the end if anything failed.
           set -uo pipefail
-          REPOS=$(jq -r '.repo' artifacts/stryker-*/meta.json 2>/dev/null | sort -u || true)
+          # Repos come from the meta.json each artifact carries; the script owns
+          # why that is not a glob, and goes red on the layout defect itself.
+          REPOS=$(bash scripts/discover-artifact-repos.sh artifacts) || exit 1
           if [ -z "$REPOS" ]; then
             echo "no report artifacts this week — nothing to aggregate"
             exit 0

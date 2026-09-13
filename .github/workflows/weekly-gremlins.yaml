@@ -310,12 +310,31 @@ jobs:
             exit 1
           fi
 
+      # The artifact carries its own identity, because its NAME does not survive
+      # the transport: actions/download-artifact only creates the per-artifact
+      # directory when more than one artifact matched its pattern, so a run whose
+      # pattern matches exactly one artifact extracts flat and the repo name that
+      # used to be parsed out of the directory is simply gone. The same shape
+      # weekly-stryker.yaml already uses.
+      - name: Record which repo and attempt this artifact is
+        if: always()
+        env:
+          REPO: ${{ matrix.repo }}
+          ATTEMPT: ${{ matrix.attempt }}
+        run: |
+          jq -n --arg repo "$REPO" --arg attempt "$ATTEMPT" \
+            '{repo: $repo, attempt: $attempt}' > /tmp/meta.json
+
       - name: Upload full mutants.json (artifact, 90-day retention)
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gremlins-${{ matrix.repo }}-${{ matrix.attempt }}
-          path: /tmp/gremlins-out.json
+          # Both under /tmp, so the computed common ancestor puts each at the
+          # artifact root beside the other.
+          path: |
+            /tmp/gremlins-out.json
+            /tmp/meta.json
           if-no-files-found: warn
           retention-days: 90
 
@@ -361,7 +380,13 @@ jobs:
           # continues so healthy repos still publish. The job then exits red if
           # anything failed, so the run never goes green on a real failure.
           set -uo pipefail
-          REPOS=$(find artifacts -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sed -E 's/^gremlins-(.+)-[0-9]+$/\1/' | sort -u)
+          # Repos come from the meta.json each artifact carries; the script owns
+          # why that is not a glob, and goes red on the layout defect itself.
+          REPOS=$(bash scripts/discover-artifact-repos.sh artifacts) || exit 1
+          if [ -z "$REPOS" ]; then
+            echo "no attempt artifacts this week — no badge to publish"
+            exit 0
+          fi
           WEEK=$(date -u +'%Y-%m-%d %H:%M')
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
@@ -431,7 +456,12 @@ jobs:
           # failures warn and set had_failure, and the job exits red at the end
           # if anything failed.
           set -uo pipefail
-          REPOS=$(find artifacts -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sed -E 's/^gremlins-(.+)-[0-9]+$/\1/' | sort -u)
+          # Same discovery as the badge job above, for the same reason.
+          REPOS=$(bash scripts/discover-artifact-repos.sh artifacts) || exit 1
+          if [ -z "$REPOS" ]; then
+            echo "no attempt artifacts this week — nothing to aggregate"
+            exit 0
+          fi
           WEEK_ENDING=$(date -u +'%Y-%m-%d %H:%M')
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           title="Gremlins mutation testing tracker"
