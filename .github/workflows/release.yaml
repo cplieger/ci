@@ -33,6 +33,11 @@
 #                    would otherwise count toward the root bump — see the
 #                    detect job's recompute step).
 #
+#   verify-publish→  Reads every published artifact back from its registry
+#                    (Go proxy, npm, JSR) at the released version and fails
+#                    the run when one is absent. Docker images are verified
+#                    inside docker-release.yaml.
+#
 # Path-change detection uses central exclusion patterns (see "Detect changed
 # paths" step) — opinionated and tight by default. Tests, lint configs, docs,
 # generated bundles, CI metadata are all ignored. If only excluded paths
@@ -1547,3 +1552,103 @@ jobs:
             gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
           fi
           gh release view "$VERSION" >/dev/null 2>&1 || gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
+
+  # ─── Verify every registry this run published to ──────────────────────────
+  # A green publish job is not proof the artifact is fetchable. Each lane that
+  # ran is read back at the released version: the Go proxy for the root module
+  # and each nested lane, npm and JSR for the root package and each subpackage.
+  # The docker lane is verified inside docker-release.yaml, which holds the
+  # manifest digest.
+  verify-publish:
+    needs: [detect, docker, go, ts, subpackage, go-nested]
+    # A skipped dependency skips this job under the default success(), and a
+    # repo is one type so most lanes skip: run when none failed and at least
+    # one registry lane published.
+    if: |
+      always()
+      && !contains(needs.*.result, 'failure')
+      && !contains(needs.*.result, 'cancelled')
+      && (needs.go.result == 'success'
+          || needs.ts.result == 'success'
+          || needs.subpackage.result == 'success'
+          || needs.go-nested.result == 'success')
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify published artifacts
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          SUBPACKAGES_JSON: ${{ needs.detect.outputs.subpackages_to_publish }}
+          GO_LANES_JSON: ${{ needs.detect.outputs.go_modules_to_release }}
+          GO_RESULT: ${{ needs.go.result }}
+          TS_RESULT: ${{ needs.ts.result }}
+          SUBPACKAGE_RESULT: ${{ needs.subpackage.result }}
+          GO_NESTED_RESULT: ${{ needs.go-nested.result }}
+        run: |
+          set -euo pipefail
+          ver="${VERSION#v}"
+          rc=0
+
+          # Registries propagate in seconds to a couple of minutes: six tries,
+          # 20 s apart, then fail closed.
+          probe() { # <label> <url>
+            local label=$1 url=$2 i
+            for i in 1 2 3 4 5 6; do
+              if curl -fsSL --connect-timeout 10 --max-time 30 -o /dev/null "$url"; then
+                echo "ok: ${label}"
+                return 0
+              fi
+              [ "$i" -lt 6 ] && sleep 20
+            done
+            echo "::error::${label} is not published: ${url}"
+            return 1
+          }
+          # The proxy is lazy, so this GET is also what makes the module
+          # resolvable. Uppercase in a module path is `!lowercase` on the proxy.
+          probe_go() { # <go.mod> <vX.Y.Z>
+            local modpath
+            modpath=$(awk '$1=="module"{print $2; exit}' "$1" | sed 's/[A-Z]/!\L&/g')
+            probe "proxy.golang.org ${modpath}@$2" "https://proxy.golang.org/${modpath}/@v/$2.info"
+          }
+          probe_ts() { # <package.json>
+            local pkg
+            pkg=$(jq -r .name "$1")
+            probe "npm ${pkg}@${ver}" "https://registry.npmjs.org/${pkg}/${ver}" || rc=1
+            probe "jsr ${pkg}@${ver}" "https://jsr.io/${pkg}/${ver}_meta.json" || rc=1
+          }
+
+          if [ "$GO_RESULT" = "success" ]; then
+            probe_go go.mod "$VERSION" || rc=1
+          fi
+          if [ "$GO_NESTED_RESULT" = "success" ]; then
+            # A lane tags only when its own version moved, and the matrix
+            # cannot report per-lane versions; the lane tags at this commit
+            # say which lanes published and at what version.
+            while IFS= read -r d; do
+              [ -z "$d" ] && continue
+              while IFS= read -r tag; do
+                [ -z "$tag" ] && continue
+                probe_go "$d/go.mod" "${tag#"$d"/}" || rc=1
+              done < <(git tag --points-at HEAD --list "$d/v[0-9]*")
+            done < <(jq -r '.[]' <<<"$GO_LANES_JSON")
+          fi
+          if [ "$TS_RESULT" = "success" ]; then
+            probe_ts package.json
+          fi
+          if [ "$SUBPACKAGE_RESULT" = "success" ]; then
+            while IFS= read -r d; do
+              [ -z "$d" ] && continue
+              probe_ts "$d/package.json"
+            done < <(jq -r '.[]' <<<"$SUBPACKAGES_JSON")
+          fi
+          exit "$rc"

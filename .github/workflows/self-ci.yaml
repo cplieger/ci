@@ -74,3 +74,33 @@ jobs:
 
       - name: Probe shared artifact-repo discovery
         run: bash scripts/test-discover-artifact-repos.sh
+
+  # The issue transport every scheduled writer calls (scripts/tracker_issue.py)
+  # and the body skeleton the three aggregators share (scripts/trackerlib.py).
+  # Both run on the runner's default python3 in most callers and under a 3.14
+  # pin in weekly-bench/weekly-stryker, so the suite runs on both: the default
+  # interpreter first (the stryker golden skips itself there), then 3.14.
+  tracker-scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Probe the tracker transport (default python3)
+        run: python3 scripts/test-tracker-issue.py
+
+      - name: Probe the tracker bodies (default python3)
+        run: python3 scripts/test-tracker-body.py
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Probe the tracker bodies (python 3.14)
+        run: python3 scripts/test-tracker-body.py

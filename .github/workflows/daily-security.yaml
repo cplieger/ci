@@ -85,3 +85,16 @@ jobs:
       - name: Trigger security.yml on cplieger/${{ matrix.repo }}
         run: |
           gh workflow run security.yml -R "cplieger/${{ matrix.repo }}" --ref main
+
+  # `needs:` must list every other job in this workflow.
+  notify:
+    needs: [fanout, dispatch]
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

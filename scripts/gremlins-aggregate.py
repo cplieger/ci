@@ -60,21 +60,23 @@ Body format:
 
 The `<!-- gremlins-data -->` and `<!-- live-mutants -->` sentinel blocks are
 the only parts replaced; anything outside is preserved across updates so users
-can add notes without conflict.
+can add notes without conflict. The sentinel, history and notes mechanics are
+trackerlib's; this script renders the gremlins-specific prose around them.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import re
 import statistics
 import sys
 from collections import defaultdict
 from pathlib import Path
 
+import trackerlib
+
 MAX_LIVE_MUTANTS_INLINE = 50  # cap; remainder goes to artifact link
-ROLLING_WEEKS = 12
 REGRESSION_THRESHOLD_PCT = 5.0  # mean drops > 5% below rolling-mean → flag
+HISTORY_SENTINEL = "gremlins-data"
 
 
 def mutant_key(m: dict) -> tuple:
@@ -297,11 +299,8 @@ Last update: {week_ending}
 ## Rolling 12-week history
 """
 
-DATA_BLOCK_TPL = """<!-- gremlins-data -->
-| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |
-|---|---|---|---|---|---|
-{rows}
-<!-- /gremlins-data -->"""
+HISTORY_HEADER = """| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |
+|---|---|---|---|---|---|"""
 
 LIVE_BLOCK_TPL = """## Current live mutants{header_suffix}
 <!-- live-mutants -->
@@ -438,97 +437,6 @@ def render_bucketed_live_mutants(buckets: dict[int, list[dict]], n_runs: int, ca
     return "\n".join(parts), overflow_total
 
 
-RUN_MARKER_RE = re.compile(r"<!--\s*run:(\d+)\s*-->")
-
-
-def run_id_of(run_url: str) -> str:
-    """The workflow run id from a run URL, or '' when it cannot be read.
-
-    The row's own timestamp cannot identify the run that wrote it: it is
-    `date -u` taken inside the aggregate step, so a retry stamps a different
-    time for the SAME run (measured: run 28756935137 wrote 2026-07-06 01:31 on
-    attempt 1 and 2026-07-07 23:28 on attempt 2). The id is what makes a
-    re-aggregate idempotent.
-    """
-    m = re.search(r"/runs/(\d+)", run_url or "")
-    return m.group(1) if m else ""
-
-
-def update_history_block(
-    existing: str, new_row: str, mean_for_trend: float, run_id: str = ""
-) -> tuple[str, float]:
-    """Update the rolling 12-week table block. Returns (block, prev_mean for delta).
-
-    A run contributes ONE row. This job is a dependent of `run` with
-    `if: always()`, so re-running a failed matrix entry re-runs it too, and
-    every such re-run used to prepend a second row for one run — 21 repos
-    gained one from run 28756935137. Both attempts aggregate the SAME artifacts
-    for every entry that did not re-run, so the extra row is one measurement
-    counted twice in the rolling mean. Rows carry their run id and a
-    re-aggregate REPLACES its own row rather than adding one.
-    """
-    rows = []
-    if existing:
-        m = re.search(r"<!-- gremlins-data -->(.*?)<!-- /gremlins-data -->", existing, re.DOTALL)
-        if m:
-            for line in m.group(1).splitlines():
-                if re.match(r"^\| 20\d{2}-", line):
-                    rows.append(line.rstrip())
-
-    # Drop this run's own earlier row before computing the delta, so a retry
-    # compares against the PREVIOUS run rather than against itself. A row with
-    # no marker predates this scheme and is always kept.
-    if run_id:
-        rows = [
-            r
-            for r in rows
-            if (own := RUN_MARKER_RE.search(r)) is None or own.group(1) != run_id
-        ]
-
-    prev_mean = 0.0
-    if rows:
-        # Extract previous mean (column 2, format "78.4%")
-        first_row_cells = [c.strip() for c in rows[0].split("|") if c.strip()]
-        if len(first_row_cells) >= 2:
-            try:
-                prev_mean = float(first_row_cells[1].rstrip("%"))
-            except ValueError:
-                pass
-
-    # Compute delta on this row
-    delta = mean_for_trend - prev_mean if rows else 0.0
-    delta_str = f"{delta:+.1f}%" if rows else "—"
-    # new_row already ends in " |" (its closing Live-mutants cell). Append the
-    # delta as its OWN cell — do NOT strip the trailing pipe, or the delta fuses
-    # into the Live-mutants column and the row loses a column (see issue #4).
-    # The run marker goes AFTER the closing pipe for the same reason: it must
-    # add a trailing cell, never shift an index a reader uses (cells[1] for the
-    # mean, cells[4] for the live count).
-    new_row_with_delta = new_row.rstrip() + f" {delta_str} |"
-    if run_id:
-        new_row_with_delta += f" <!-- run:{run_id} -->"
-
-    rows.insert(0, new_row_with_delta)
-    rows = rows[:ROLLING_WEEKS]
-
-    block = DATA_BLOCK_TPL.format(rows="\n".join(rows))
-    return block, prev_mean
-
-
-def trend_marker(mean: float, history_means: list[float]) -> str:
-    if not history_means:
-        return ""
-    rolling = statistics.mean(history_means)
-    delta = mean - rolling
-    if abs(delta) < 0.5:
-        symbol = "→"
-    elif delta > 0:
-        symbol = "↗"
-    else:
-        symbol = "↘"
-    return f"**Trend**: {symbol} {delta:+.1f}% from {ROLLING_WEEKS}-week mean ({rolling:.1f}%)."
-
-
 def measurement_cautions(agg: dict, prev_live_count: int | None) -> list[str]:
     """Lines warning that this week's number measures the harness, not the suite.
 
@@ -594,29 +502,13 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
     live_count = agg["live_count"]
 
     new_row = f"| {week} | {eff_mean}% | ±{eff_stddev}% | {cov_mean}% | {live_count} |"
-    history_block, _prev_mean = update_history_block(existing, new_row, eff_mean, run_id_of(run_url))
-
-    # Split the history rows into cells once. The two readers below want
-    # different things from them, and only one of the two is positional.
-    history_rows = []
-    if existing:
-        m = re.search(r"<!-- gremlins-data -->(.*?)<!-- /gremlins-data -->", existing, re.DOTALL)
-        if m:
-            history_rows = [
-                [c.strip() for c in line.split("|") if c.strip()]
-                for line in m.group(1).splitlines()
-                if re.match(r"^\| 20\d{2}-", line)
-            ]
+    history_block = trackerlib.update_history_block(
+        existing, HISTORY_SENTINEL, HISTORY_HEADER, new_row, trackerlib.run_id_of(run_url)
+    )
 
     # Mean efficacy (column 2) feeds the trend marker, which takes a mean over
     # the window. Order does not matter there, so an unreadable row drops out.
-    history_means = []
-    for cells in history_rows:
-        if len(cells) >= 2:
-            try:
-                history_means.append(float(cells[1].rstrip("%")))
-            except ValueError:
-                continue
+    history_means = trackerlib.history_column(existing, HISTORY_SENTINEL, 1)
 
     # Live-mutant count (column 5) feeds the jump-to-100% caution, which names
     # LAST week. That one IS positional: rows are newest-first
@@ -624,6 +516,7 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
     # unknown. Collecting the counts into a list and reading [0] instead would
     # make an older week's number read as last week's every time the newest
     # row's cell failed to parse.
+    history_rows = trackerlib.history_rows(existing, HISTORY_SENTINEL)
     prev_live_count = None
     if history_rows and len(history_rows[0]) >= 5:
         try:
@@ -636,7 +529,7 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
             # every later index.
             prev_live_count = None
 
-    trend_line = trend_marker(eff_mean, history_means)
+    trend_line = trackerlib.trend_marker(eff_mean, history_means)
     cautions = measurement_cautions(agg, prev_live_count)
     caution_lines = ("\n" + "\n".join(cautions) + "\n") if cautions else "\n"
 
@@ -670,26 +563,17 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
         caution_lines=caution_lines,
     )
 
-    notes = ""
-    if existing:
-        m = re.search(r"## Free-form notes\s*\n(.*?)$", existing, re.DOTALL)
-        if m:
-            notes = m.group(1).strip()
-    if not notes:
-        notes = "Add anything below — won't be touched by the auto-updater."
-
     body = (
         header
         + history_block + "\n\n"
         + live_block + "\n\n"
         + LEGEND.rsplit("\n## Free-form notes", 1)[0]
-        + "\n## Free-form notes\n\n" + notes + "\n"
+        + "\n## Free-form notes\n\n" + trackerlib.preserve_notes(existing) + "\n"
     )
 
-    regression = bool(history_means) and (eff_mean < statistics.mean(history_means) - REGRESSION_THRESHOLD_PCT)
+    regression = trackerlib.regression(eff_mean, history_means, REGRESSION_THRESHOLD_PCT)
 
     return body, regression
-
 
 
 def main() -> int:

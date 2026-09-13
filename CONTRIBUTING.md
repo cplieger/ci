@@ -47,8 +47,15 @@ outward, so the conventions below are about not breaking downstream.
 - `ci-local.sh` / `_ci_local.py`: the local mirror of the CI battery.
 - `scripts/`: `audit.py` (cross-repo compliance), `classify-repos.py` (sync
   map generator), `sync-files.py` (the sync engine that pushes the mapped
-  files into consumers as PRs), `gremlins-aggregate.py` and
-  `stryker-aggregate.py` (mutation tracker issues),
+  files into consumers as PRs), `tracker_issue.py` (the one issue transport
+  every scheduled writer calls: it owns the issues-disabled guard, label
+  creation and the fail-closed API handling), `trackerlib.py` (the tracker
+  body skeleton: sentinel blocks, the rolling history table, notes carry-over)
+  with `gremlins-aggregate.py`, `stryker-aggregate.py`, `bench-aggregate.py`
+  and `links-body.py` rendering the per-tracker bodies on it,
+  `test-tracker-issue.py` and `test-tracker-body.py` (their tests; the golden
+  bodies under `scripts/testdata/tracker/` pin every rendered issue byte for
+  byte, so regenerate them only when a body change is intended),
   `test-cliff-bump-semantics.sh` (contract test for the git-cliff behaviors
   the release gate relies on; runs in the scripts CI job, so a git-cliff pin
   bump or cliff-config edit must keep it green), `test-lane-semantics.sh` (the
@@ -168,8 +175,9 @@ python3 scripts/audit.py
 python3 scripts/audit.py --repo <name>   # scope to one repo (repeatable)
 ```
 
-`.github/workflows/audit.yaml` runs it weekly (and on demand) and writes the
-table to the run summary. The `AUDIT_PAT` secret must be a classic PAT:
+`.github/workflows/audit.yaml` runs it daily (and on demand), writes the
+table to the run summary, and opens a `weekly-ci-failure` tracker issue when a
+scheduled run fails. The `AUDIT_PAT` secret must be a classic PAT:
 fine-grained PATs don't serialize the merge-model fields; the script aborts
 rather than emit false negatives.
 

@@ -1,0 +1,44 @@
+# Benchmark regression tracker
+
+Weekly medians for `pathinside`, compared against the median of the previous 6 runs.
+Updated 2026-09-09 01:32 UTC by [this run](https://github.com/cplieger/ci/actions/runs/34293039494).
+
+Full series and charts: [`benchmarks` branch](https://github.com/cplieger/ci/tree/benchmarks).
+
+## Trend
+
+<!-- bench-data -->
+| Run | Commit | Benchmarks | Regressed | Improved |
+|---|---|---|---|---|
+| 2026-09-09 00:22 | [`c7c2a56c`](https://github.com/cplieger/ci/commit/c7c2a56c10b85a4e0b5b155f46d75b4906546b04) | 51 | 0 | 0 |
+| 2026-09-02 00:16 | [`6af77310`](https://github.com/cplieger/pathinside/commit/6af773104bd454bf5ecd1c2553c71093e7578402) | 51 | 0 | 0 |
+| 2026-08-25 22:54 | [`e898450a`](https://github.com/cplieger/pathinside/commit/e898450afd9c69b3122826bb79a5aa8dc6e6ecc5) | 51 | 0 | 0 |
+<!-- /bench-data -->
+
+## Findings
+
+<!-- bench-findings -->
+No benchmark moved past its threshold this week. 🎉
+<!-- /bench-findings -->
+
+## How to read this
+
+Each run measures every `func Benchmark` in the repo, takes 10 samples, and
+reduces them to one median per benchmark per metric. A finding compares that
+median against the median of the previous 6 runs.
+
+| Metric | Flagged when | Why this threshold |
+|---|---|---|
+| `ns/op` | 1.5x slower | Wall clock on a shared runner varies 10-20% by itself, so only a multiple is evidence. The target is an algorithmic regression. |
+| `B/op`, `allocs/op` | 1.05x higher | Counted, not timed, so they do not move with runner load. A real increase is a real change. |
+| any | zero to non-zero | An allocation-free path that starts allocating. The ratio is undefined and the change is the point. |
+
+Nothing here gates a merge or fails a build. A flagged wall-clock finding is
+evidence to investigate, not proof the code got slower; check the `±` spread
+before believing a single run.
+
+## Free-form notes
+
+Add anything below — won't be touched by the auto-updater.
+
+`BenchmarkDegenerateInputs/containment_corpus` ns/op is the noisy series here; read it against the `±` spread.

@@ -401,10 +401,11 @@ jobs:
           # both contain hyphens), aggregates multi-dir repos into one score,
           # rolls the 12-week history forward (preserving free-form notes),
           # renders the Survived/NoCoverage buckets, and writes regression +
-          # entries markers. Explicit per-command error handling (NOT `set -e`
-          # in a `( … ) || …` subshell, which bash neuters): each repo is
-          # isolated, failures warn and set had_failure, and the job exits red
-          # at the end if anything failed.
+          # entries markers. The issue reads and writes go through
+          # scripts/tracker_issue.py. Explicit per-command error handling (NOT
+          # `set -e` in a `( … ) || …` subshell, which bash neuters): each repo
+          # is isolated, failures warn and set had_failure, and the job exits
+          # red at the end if anything failed.
           set -uo pipefail
           # Repos come from the meta.json each artifact carries; the script owns
           # why that is not a glob, and goes red on the layout defect itself.
@@ -417,33 +418,17 @@ jobs:
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           title="Stryker mutation testing tracker"
 
-          # Create a label, tolerating "already exists" but surfacing real
-          # errors (e.g. the PAT lacking issues:write) as a failure.
-          ensure_label() {
-            local name="$1" repo="$2" color="$3" desc="$4" err
-            err=$(gh label create "$name" -R "$repo" -c "$color" -d "$desc" 2>&1) && return 0
-            printf '%s' "$err" | grep -qi "already exists" && return 0
-            echo "  label create failed for ${name}: ${err}" >&2
-            return 1
-          }
-
           process_repo() {
-            local repo="$1" R="cplieger/$1" issue_num ent url existing_args=()
+            local repo="$1" R="cplieger/$1" ent flag=off
 
-            issue_num=$(gh issue list -R "$R" --state open --label stryker-tracker \
-              --search "$title in:title" --json number,title \
-              --jq '.[] | select(.title == "'"$title"'") | .number' 2>/dev/null | head -1) || true
-
-            if [ -n "$issue_num" ]; then
-              gh issue view "$issue_num" -R "$R" --json body --jq .body > "/tmp/existing-${repo}.md" || return 1
-              existing_args=(--existing-body-file "/tmp/existing-${repo}.md")
-            fi
+            python3 scripts/tracker_issue.py --repo "$R" --label stryker-tracker --title "$title" \
+              --mode fetch --body-file "/tmp/existing-${repo}.md" || return 1
 
             python3 scripts/stryker-aggregate.py \
               --repo "$repo" --artifacts-dir artifacts --week "$WEEK_ENDING" --run-url "$RUN_URL" \
               --regression-marker-file "/tmp/regression-${repo}.txt" \
               --entries-marker-file "/tmp/entries-${repo}.txt" \
-              "${existing_args[@]}" > "/tmp/body-${repo}.md" || return 1
+              --existing-body-file "/tmp/existing-${repo}.md" > "/tmp/body-${repo}.md" || return 1
 
             ent=$(cat "/tmp/entries-${repo}.txt" 2>/dev/null || echo 0)
             if [ "$ent" -eq 0 ]; then
@@ -451,28 +436,12 @@ jobs:
               return 0
             fi
 
-            if [ -z "$issue_num" ]; then
-              ensure_label stryker-tracker "$R" 1d76db "Stryker mutation testing tracker" || return 1
-              ensure_label auto-generated "$R" ededed "Maintained by automation" || return 1
-              ensure_label mutation-regression "$R" b60205 "Mutation efficacy regression" || return 1
-              url=$(gh issue create -R "$R" --title "$title" \
-                --label stryker-tracker,auto-generated --body-file "/tmp/body-${repo}.md") || return 1
-              issue_num="${url##*/}"
-              echo "  created tracker issue #${issue_num}"
-            else
-              gh issue edit "$issue_num" -R "$R" --body-file "/tmp/body-${repo}.md" >/dev/null || return 1
-              echo "  updated tracker issue #${issue_num}"
-            fi
-
-            # Toggle the regression label from the python marker (ensure it
-            # exists first — the issue may predate the label).
-            ensure_label mutation-regression "$R" b60205 "Mutation efficacy regression" || return 1
             if [ "$(cat "/tmp/regression-${repo}.txt" 2>/dev/null)" = "true" ]; then
-              gh issue edit "$issue_num" -R "$R" --add-label mutation-regression >/dev/null || return 1
-              echo "  flagged mutation-regression"
-            else
-              gh issue edit "$issue_num" -R "$R" --remove-label mutation-regression >/dev/null 2>&1 || true
+              flag=on
             fi
+            python3 scripts/tracker_issue.py --repo "$R" --label stryker-tracker --title "$title" \
+              --mode upsert --body-file "/tmp/body-${repo}.md" \
+              --flag-label mutation-regression --flag "$flag" || return 1
           }
 
           had_failure=0
@@ -488,3 +457,16 @@ jobs:
             echo "::error::one or more tracker-issue updates failed"
             exit 1
           fi
+
+  # `needs:` must list every other job in this workflow.
+  notify:
+    needs: [fanout, run, aggregate]
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

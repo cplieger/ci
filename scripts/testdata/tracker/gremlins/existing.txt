@@ -1,0 +1,92 @@
+# Gremlins mutation testing tracker
+
+Auto-updated weekly by [`cplieger/ci/.github/workflows/weekly-gremlins.yaml`](https://github.com/cplieger/ci/blob/main/.github/workflows/weekly-gremlins.yaml).
+Last update: 2026-09-07 08:51
+
+**This week**: 89.0% efficacy (±0.0% across 3 runs), 88.9% mutant coverage. 15 confirmed live mutants.
+**Trend**: ↗ +8.9% from 12-week mean (80.1%).
+
+## Rolling 12-week history
+<!-- gremlins-data -->
+| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |
+|---|---|---|---|---|---|
+| 2026-09-07 08:51 | 89.0% | ±0.0% | 88.9% | 15 | -0.4% | <!-- run:34067440955 -->
+| 2026-08-31 07:56 | 89.4% | ±0.0% | 90.4% | 12 | -0.1% | <!-- run:33344173658 -->
+| 2026-08-24 05:00 | 89.5% | ±0.0% | 90.5% | 12 | +10.8% | <!-- run:32670569584 -->
+| 2026-08-21 15:35 | 78.7% | ±0.3% | 90.8% | 25 | +0.1% |
+| 2026-08-17 04:29 | 78.6% | ±0.0% | 89.6% | 22 | +0.0% |
+| 2026-08-10 04:03 | 78.6% | ±0.0% | 89.6% | 22 | +0.2% |
+| 2026-07-27 04:17 | 78.4% | ±0.3% | 89.9% | 23 | +2.6% |
+| 2026-07-20 04:11 | 75.8% | ±0.0% | 90.1% | 22 | +4.0% |
+| 2026-07-13 02:16 | 71.8% | ±0.0% | 88.6% | 11 | — |
+<!-- /gremlins-data -->
+
+## Current live mutants (15, this week)
+<!-- live-mutants -->
+<details>
+<summary>Solid gap — LIVED in all 3 runs (known coverage hole) — 15</summary>
+
+### `exclusive.go`
+- L463 — CONDITIONALS_BOUNDARY
+- L494 — CONDITIONALS_BOUNDARY
+
+### `interval.go`
+- L85 — CONDITIONALS_BOUNDARY
+- L85 — CONDITIONALS_BOUNDARY
+- L199 — CONDITIONALS_BOUNDARY
+- L199 — CONDITIONALS_BOUNDARY
+- L202 — CONDITIONALS_BOUNDARY
+- L234 — CONDITIONALS_BOUNDARY
+
+### `loop.go`
+- L86 — CONDITIONALS_BOUNDARY
+- L86 — CONDITIONALS_BOUNDARY
+- L89 — CONDITIONALS_BOUNDARY
+
+### `slotfile.go`
+- L80 — CONDITIONALS_NEGATION
+
+### `stamp.go`
+- L99 — CONDITIONALS_NEGATION
+- L168 — CONDITIONALS_BOUNDARY
+
+### `trigger/server.go`
+- L82 — CONDITIONALS_NEGATION
+
+</details>
+
+<!-- /live-mutants -->
+
+## How to read
+
+- **Mean efficacy**: % of runnable mutants killed (or timed-out, treated as caught), averaged across the N runs
+- **Stddev**: variance across runs — high stddev (>3%) signals flaky tests
+- **Mutant coverage**: % of mutants reached by the test suite (test depth)
+
+The "Current live mutants" section is bucketed by **how many of the N runs the
+mutant LIVED in** (N = attempts that week, normally 3):
+
+- **Rare flake (1/N)**: a mutant your tests usually KILL but occasionally let
+  through. **Most actionable** — almost always means a flaky test that's not
+  reliable. Open the section to see the file:line; expect to fix the test, not
+  the production code.
+- **Weakly flaky (k/N for 1<k<N)**: tests catch this mutant inconsistently.
+  Less ideal than rare-flake but still worth investigating.
+- **Solid gap (N/N)**: every run lets this mutant through. Either there's no
+  test exercising the path, or the test asserts the wrong thing. Action: add a
+  test or strengthen an existing assertion.
+
+The `mutation-regression` label is added when this week's mean efficacy drops
+>5% below the rolling 12-week mean.
+
+A ⚠️ line under "This week" means the number describes the measurement, not the
+suite: either the attempts disagreed about which mutants survive (one verdict per
+disagreement is false), or the score jumped to a flawless 100% from a week with
+live mutants. Equivalent mutants are a permanent noise floor, so a reproducible
+100% is not something a test suite can reach.
+
+## Free-form notes
+
+Add anything below — won't be touched by the auto-updater.
+
+The two `interval.go` L85 survivors are equivalent mutants (boundary on a clamped index); leave them.
