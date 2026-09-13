@@ -19,16 +19,21 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yaml
 
-  # The two scripts that decide what mutation number every Go repo publishes
-  # weekly (scripts/gremlins-merge.py folds one gremlins result per Go module
-  # into the single per-attempt result the tracker/badge assume;
-  # scripts/gremlins-aggregate.py turns those into the issue body and badge).
-  # Nothing else executes them until Sunday 22:00 UTC, and the sibling stryker
-  # aggregate script sat broken here for weeks for exactly that reason — so run
-  # their probe on every push and PR. Not part of the `validate` check (that
-  # comes from the meta ci.yaml, which is consumer-facing); a failure here shows
-  # as a red check on the PR.
-  gremlins-scripts:
+  # The scripts that decide what mutation number a repo publishes weekly, none
+  # of which anything else executes until their own cron fires. The stryker
+  # aggregate script sat broken here for weeks for exactly that reason, so both
+  # probes run on every push and PR:
+  #   test-gremlins-scripts.py            gremlins-merge.py folds one gremlins
+  #                                       result per Go module into the single
+  #                                       per-attempt result the tracker/badge
+  #                                       assume; gremlins-aggregate.py turns
+  #                                       those into the issue body and badge.
+  #   test-patch-vitest-runner-separator  the vitest-5 separator stopgap, whose
+  #                                       value is entirely in refusing once
+  #                                       upstream ships the real fix.
+  # Not part of the `validate` check (that comes from the meta ci.yaml, which is
+  # consumer-facing); a failure here shows as a red check on the PR.
+  measurement-scripts:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -42,3 +47,6 @@ jobs:
 
       - name: Probe gremlins measurement scripts
         run: python3 scripts/test-gremlins-scripts.py
+
+      - name: Probe the vitest-runner separator stopgap
+        run: python3 scripts/test-patch-vitest-runner-separator.py

@@ -216,6 +216,21 @@ jobs:
             echo "no @vitest/browser-playwright devDependency; skipping browser install"
           fi
 
+          # STOPGAP (2026-09-13), and it is built to delete itself. Under vitest 5
+          # the runner filters each mutant's test run with a name pattern joined
+          # by a space while vitest matches on " > ", so zero tests run per
+          # mutant, every mutant survives trivially, and a suite that killed
+          # 91.67% publishes 0.00%. Patching the two joins restores the vitest 4
+          # number exactly; the script's docstring carries the measurement and the
+          # upstream PRs. It exits 3 once its anchor is gone, so the first run
+          # after upstream ships the fix goes RED HERE — that red is the signal to
+          # delete the script, this block, and the probe in self-ci.yaml, not to
+          # re-anchor anything. The zero-kill guard below stays the backstop.
+          if ! python3 "${GITHUB_WORKSPACE}/scripts/patch-vitest-runner-separator.py"; then
+            echo "::error::${ENTRY}: the vitest-5 separator stopgap refused to apply; upstream probably fixed it — delete the stopgap"
+            exit 1
+          fi
+
           # --reporters json overrides the config's html/clear-text reporters
           # for CI; progress keeps the log alive under the job timeout.
           rc=0
@@ -267,7 +282,10 @@ jobs:
           # specific: keyenc's node-mode suite scores 0.0% too. The fleet took
           # vitest 5 on 2026-09-06 (a `chore(devdeps)` bump), and
           # `@stryker-mutator/vitest-runner@10.0.0` — still the newest — declares
-          # `vitest: ">=2.0.0"`, so npm accepted it with no warning.
+          # `vitest: ">=2.0.0"`, so npm accepted it with no warning. The stopgap
+          # above patches that separator, so a 0-detected run now means EITHER the
+          # stopgap silently did nothing (read its output first) or a second cause
+          # exists; do not read it as the same known defect.
           #
           # Guarded on `valid > 0` so a package that legitimately produces no
           # mutants still reports 0.0% rather than failing.
