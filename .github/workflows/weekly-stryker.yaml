@@ -171,7 +171,17 @@ jobs:
           ENTRY: ${{ matrix.repo }}:${{ matrix.dir }}
         run: |
           set -uo pipefail
-          npm ci
+
+          # Explicit, because this block runs WITHOUT `set -e`: a failed
+          # `npm ci` otherwise falls through to the enrollment gate below,
+          # which finds no stryker binary, reports the dir as un-enrolled and
+          # exits 0 — a green matrix entry that mutation-tested nothing and
+          # blamed the repo for it. The two causes want opposite outcomes, so
+          # they are separated here rather than conflated one gate later.
+          if ! npm ci; then
+            echo "::error::${ENTRY}: npm ci failed"
+            exit 1
+          fi
 
           # Enrollment gate: config present but the Stryker devDeps missing →
           # skip with an actionable notice (the runner ships ahead of repo
@@ -181,6 +191,29 @@ jobs:
             echo "::notice::${msg} Enroll: npm i -D @stryker-mutator/core @stryker-mutator/vitest-runner"
             echo "skipped=true" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          # Vitest Browser Mode needs a real Chromium, and the fleet migrated
+          # its DOM suites to it on 2026-08-23 — which is the last time this
+          # workflow was green. Presence of the `@vitest/browser-playwright`
+          # devDependency is the enrolment marker (same shape as ts-ci.yaml and
+          # coverage.yaml), driven through the repo's OWN pinned `playwright`
+          # CLI (`--no-install`) so the browser build number it downloads is the
+          # one the library looks for. NOT `--with-deps`: ubuntu-24.04 already
+          # carries every shared library Chromium links, and that apt
+          # transaction is an unbounded-latency fetch on the critical path.
+          #
+          # Placed after the enrollment gate on purpose — a dir that skips
+          # stryker runs no tests, so it needs no browser. It is setup rather
+          # than a check, so a failed install fails the job here instead of
+          # surfacing as a stryker dry-run error against the wrong name.
+          if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
+            if ! npx --no-install playwright install chromium; then
+              echo "::error::${ENTRY}: playwright chromium install failed"
+              exit 1
+            fi
+          else
+            echo "no @vitest/browser-playwright devDependency; skipping browser install"
           fi
 
           # --reporters json overrides the config's html/clear-text reporters
