@@ -259,11 +259,21 @@ jobs:
           # against real baselines of 74-100%, with `NoCoverage` in the tens —
           # so coverage collection worked and only detection was dead.
           #
+          # ROOT CAUSE, found 2026-09-13 after this guard landed: the runner
+          # runs ZERO tests per mutant under vitest 5, so every mutant survives
+          # trivially. Same repo, same file, same command, only vitest differing
+          # — 4.1.11 killed 33 of 36 (91.67%, 1.00 tests per mutant), 5.0.0
+          # killed 0 of 36 (0.00%, 0.00 tests per mutant). It is NOT browser
+          # specific: keyenc's node-mode suite scores 0.0% too. The fleet took
+          # vitest 5 on 2026-09-06 (a `chore(devdeps)` bump), and
+          # `@stryker-mutator/vitest-runner@10.0.0` — still the newest — declares
+          # `vitest: ">=2.0.0"`, so npm accepted it with no warning.
+          #
           # Guarded on `valid > 0` so a package that legitimately produces no
           # mutants still reports 0.0% rather than failing.
           if [ "${detected}" = "0" ] && [ "${valid}" -gt 0 ]; then
             echo "${ENTRY}: no mutant was detected, so the harness never activated one." \
-              "Browser-mode suites are the open case; see weekly-stryker's zero-kill guard."
+              "vitest 5 + @stryker-mutator/vitest-runner 10 runs 0 tests per mutant; see this step's comment."
             echo "::error::${ENTRY}: killed 0 of ${valid} mutants — measured nothing, no score published"
             exit 1
           fi
