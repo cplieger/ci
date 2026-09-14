@@ -799,6 +799,24 @@ jobs:
             fi
           ) || { echo "Probe nested-lane shell semantics" >> /tmp/_ci_failures; exit 1; }
 
+      # verify-publish shell-semantics probe (opt-in by file presence). The
+      # release gate's registry read-back is pure shell that nothing else
+      # executes, and its function signatures are invisible to shellcheck: a
+      # probe/probe_ts arity drift once failed every TypeScript release under
+      # set -u with the linters clean. The probe EXTRACTS the step body out of
+      # release.yaml at runtime and drives it against a stub curl, so what is
+      # tested cannot drift away from what ships.
+      - name: Probe verify-publish shell semantics
+        continue-on-error: true
+        run: |
+          (
+            if [ -x scripts/test-verify-publish.sh ]; then
+              ./scripts/test-verify-publish.sh
+            else
+              echo "no verify-publish probe in this repo - skipping"
+            fi
+          ) || { echo "Probe verify-publish shell semantics" >> /tmp/_ci_failures; exit 1; }
+
       # Shell unit-test harness self-test (opt-in by file presence). The
       # harness is CANONICAL in this repo (configs/shell/lib.sh) and synced
       # into every adopting consumer's tests/shell/, so a defect in it lands
