@@ -34,9 +34,11 @@
 #                    detect job's recompute step).
 #
 #   verify-publish→  Reads every published artifact back from its registry
-#                    (Go proxy, npm, JSR) at the released version and fails
-#                    the run when one is absent. Docker images are verified
-#                    inside docker-release.yaml.
+#                    (Go proxy, npm, JSR) at the released version. npm and JSR
+#                    are pushed to, so an absence there fails the run. The Go
+#                    proxy is only mirrored FROM the git tag, so its probe warms
+#                    the module and warns; see the probe_go comment. Docker
+#                    images are verified inside docker-release.yaml.
 #
 # Path-change detection uses central exclusion patterns (see "Detect changed
 # paths" step) — opinionated and tight by default. Tests, lint configs, docs,
@@ -1615,10 +1617,32 @@ jobs:
           }
           # The proxy is lazy, so this GET is also what makes the module
           # resolvable. Uppercase in a module path is `!lowercase` on the proxy.
+          #
+          # Nothing is pushed here — a Go module is published by its git tag and
+          # the proxy mirrors it on request — so absence has two causes and the
+          # body says which. `unknown revision` means the proxy answered before
+          # it could see the tag and cached that for ~30 min, longer than these
+          # six tries can outwait, so it warns. Anything else is permanent: a
+          # module path disagreeing with the repo, or a module it cannot fetch.
           probe_go() { # <go.mod> <vX.Y.Z>
-            local modpath
-            modpath=$(awk '$1=="module"{print $2; exit}' "$1" | sed 's/[A-Z]/!\L&/g')
-            probe "proxy.golang.org ${modpath}@$2" "https://proxy.golang.org/${modpath}/@v/$2.info"
+            local modpath url body i
+            modpath=$(awk '$1=="module"{print $2; exit}' "$1" | tr -d '"' | sed 's/[A-Z]/!\L&/g')
+            url="https://proxy.golang.org/${modpath}/@v/$2.info"
+            for i in 1 2 3 4 5 6; do
+              if body=$(curl -sSL --fail-with-body --connect-timeout 10 --max-time 30 "$url" 2>&1); then
+                echo "ok: proxy.golang.org ${modpath}@$2"
+                return 0
+              fi
+              [ "$i" -lt 6 ] && sleep 20
+            done
+            case $body in
+              *"unknown revision"*)
+                echo "::warning::proxy.golang.org ${modpath}@$2 is not mirrored yet: ${url}"
+                return 0
+                ;;
+            esac
+            echo "::error::proxy.golang.org ${modpath}@$2 is not resolvable: ${body}"
+            return 1
           }
           probe_ts() { # <package.json>
             local pkg
