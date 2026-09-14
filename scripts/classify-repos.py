@@ -265,6 +265,15 @@ def classify(repo):
     deep_tree = tree_paths(repo, '1')
     has_smoke = 'tests/image-smoke.conf' in deep_tree
     has_shell_tests = 'tests/shell/run.sh' in deep_tree
+    # An artifact repo publishes its own build product from its own
+    # .github/workflows/publish.yaml, because the central release.yaml only
+    # covers go.mod/jsr.json/Dockerfile surfaces. It still needs the meta CI, so
+    # that file is the enrolment marker (presence-is-enrolment, like the two
+    # opt-ins above). It has to be a marker rather than "not releaseable":
+    # homelab, .kiro and AWS are also not releaseable and carry deliberately
+    # bespoke single-job CI that the meta workflow must never overwrite. None of
+    # them has a publish.yaml; tool-catalog and web-terminal-glyphs do.
+    has_publish = '.github/workflows/publish.yaml' in deep_tree
 
     if has_gomod:
         lang = 'go'
@@ -305,6 +314,7 @@ def classify(repo):
         'has_smoke': has_smoke,
         'has_shell_tests': has_shell_tests,
         'has_dockerfile': has_dockerfile,
+        'has_publish': has_publish,  # own publish.yaml -> meta CI without release.yaml
     }
 
 
@@ -329,6 +339,7 @@ def main():
 
     # --- Collect repos into groups ---
     ci_repos = []  # ALL releaseable repos -> unified ci.yml
+    artifact_ci_repos = []  # non-releaseable repos with their own publish.yaml
     codeql_repos = []  # go/ts repos (codeql + coverage badge)
     release_repos = []
     cliff_stable = []
@@ -355,6 +366,14 @@ def main():
         # so an opter always has a Dockerfile and never classifies lang=none.
         if profile['has_shell_tests']:
             shell_test_repos.append(repo)
+
+        # Resolved before the lang gate for the same reason: an artifact repo
+        # can classify lang=none (tool-catalog: no go.mod/Dockerfile/package.json)
+        # or lang=python (web-terminal-glyphs: pyproject.toml), and both of those
+        # early-out below. The can_release guard keeps the two CI_FILES groups
+        # disjoint -- a releaseable repo already gets them via ci_repos.
+        if profile['has_publish'] and not profile['can_release']:
+            artifact_ci_repos.append(repo)
 
         if lang == 'none':
             continue
@@ -402,6 +421,11 @@ def main():
         ci_repos,
         CI_FILES,
         lead_blank=False,
+    )
+    print_group(
+        'Unified CI for artifact repos (own publish.yaml, no central release.yaml)',
+        artifact_ci_repos,
+        CI_FILES,
     )
     print_group('Go-tooling configs (Go-having repos)', golangci_repos, GOLANGCI_FILES)
     print_group(
