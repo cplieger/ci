@@ -1509,32 +1509,35 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Anonymous pull token: every image here is public.
-          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors \
-            -o "$RUNNER_TEMP/ghcr-token.json" \
-            "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull"
-          token=$(jq -r .token "$RUNNER_TEMP/ghcr-token.json")
+          # Both registries are read through the distribution API with an
+          # anonymous pull token: every image here is public. Docker Hub's
+          # web API (hub.docker.com/v2/repositories) is an index that lagged
+          # the registry by over an hour on 2026-09-14 and failed five
+          # releases whose tags were already pullable, so it is not consulted.
+          pull_token() { # <name> <token url>
+            curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors \
+              -o "$RUNNER_TEMP/$1-token.json" "$2"
+            jq -r .token "$RUNNER_TEMP/$1-token.json"
+          }
+          ghcr_token=$(pull_token ghcr "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull")
+          hub_token=
+          if [[ "$REGISTRIES" == *dockerhub* ]]; then
+            hub_token=$(pull_token hub "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE_NAME}:pull")
+          fi
 
-          digest_of() { # <ghcr|hub>
-            case "$1" in
-              ghcr)
-                curl -fsSI --connect-timeout 10 --max-time 30 -H "Authorization: Bearer ${token}" \
-                  -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
-                  "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/${VERSION}" |
-                  tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }' ;;
-              hub)
-                curl -fsSL --connect-timeout 10 --max-time 30 \
-                  "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${VERSION}" |
-                  jq -r '.digest // empty' ;;
-            esac
+          digest_of() { # <registry host> <bearer token>
+            curl -fsSI --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $2" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://$1/v2/${IMAGE_NAME}/manifests/${VERSION}" |
+              tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }'
           }
 
           # Registries propagate in seconds to a couple of minutes: six
           # tries, 20 s apart, then fail closed.
-          verify() { # <ghcr|hub> <label>
-            local source=$1 label=$2 got i
+          verify() { # <registry host> <bearer token> <label>
+            local host=$1 token=$2 label=$3 got i
             for i in 1 2 3 4 5 6; do
-              got=$(digest_of "$source" 2>/dev/null || true)
+              got=$(digest_of "$host" "$token" 2>/dev/null || true)
               if [ -n "$got" ] && { [ -z "$DIGEST" ] || [ "$got" = "$DIGEST" ]; }; then
                 echo "ok: ${label} -> ${got}"
                 return 0
@@ -1546,8 +1549,8 @@ jobs:
           }
 
           rc=0
-          verify ghcr "${REGISTRY}/${IMAGE_NAME}:${VERSION}" || rc=1
+          verify "$REGISTRY" "$ghcr_token" "${REGISTRY}/${IMAGE_NAME}:${VERSION}" || rc=1
           if [[ "$REGISTRIES" == *dockerhub* ]]; then
-            verify hub "docker.io/${IMAGE_NAME}:${VERSION}" || rc=1
+            verify registry-1.docker.io "$hub_token" "docker.io/${IMAGE_NAME}:${VERSION}" || rc=1
           fi
           exit "$rc"
