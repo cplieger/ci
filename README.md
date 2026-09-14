@@ -14,17 +14,17 @@ duplicate copies.
 
 ## Reusable workflows
 
-| Workflow                                | Purpose                                                                                                                                                     |
-|-----------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `.github/workflows/ci.yaml`             | Meta CI entry point: detects repo surfaces (go.mod / jsr.json / web dir / Dockerfile / scripts) and dispatches the jobs below into one `ci / validate` gate |
-| `.github/workflows/go-ci.yaml`          | Go checks: vet, golangci-lint, race tests, govulncheck, deadcode/punused (apps), wiregen drift, gitleaks                                                    |
-| `.github/workflows/ts-ci.yaml`          | TS checks: eslint, tsc typecheck, vitest, prettier, knip, version parity, import-map coverage (+ optional `web-lint` for CSS/HTML)                          |
-| `.github/workflows/shell-ci.yaml`       | Shell/Docker checks: actionlint, shellcheck, shfmt, hadolint, gitleaks                                                                                      |
-| `.github/workflows/release.yaml`        | Auto-detects release type (Docker / TS / Go), computes the git-cliff version, publishes (npm + JSR via OIDC), tags + GitHub Release                         |
-| `.github/workflows/docker-release.yaml` | Multi-arch image build on native runners, Trivy scan, SBOM, cosign signing, release notes (called by `release.yaml`)                                        |
-| `.github/workflows/coverage.yaml`       | Go/TS coverage → shields endpoint badge on the orphan `badges` branch                                                                                       |
-| `.github/workflows/codeql.yaml`         | CodeQL with language auto-detect (public repos)                                                                                                             |
-| `.github/workflows/security-scan.yaml`  | Trivy repo/config/image scans, advisory only; findings report to the Security tab, never block                                                              |
+| Workflow | Purpose |
+| --- | --- |
+| `.github/workflows/ci.yaml` | Meta CI entry point: detects repo surfaces (go.mod / jsr.json / web dir / Dockerfile / scripts) and dispatches the jobs below into one `ci / validate` gate |
+| `.github/workflows/go-ci.yaml` | Go checks: vet, golangci-lint, race tests, govulncheck, deadcode/punused (apps), wiregen drift, gitleaks |
+| `.github/workflows/ts-ci.yaml` | TS checks: eslint, tsc typecheck, vitest, prettier, knip, version parity, import-map coverage (+ optional `web-lint` for CSS/HTML) |
+| `.github/workflows/shell-ci.yaml` | Shell/Docker checks: actionlint, shellcheck, shfmt, hadolint, gitleaks |
+| `.github/workflows/release.yaml` | Auto-detects release type (Docker / TS / Go), computes the git-cliff version, publishes (npm + JSR via OIDC), tags + GitHub Release |
+| `.github/workflows/docker-release.yaml` | Multi-arch image build on native runners, Trivy scan, SBOM, cosign signing, release notes (called by `release.yaml`) |
+| `.github/workflows/coverage.yaml` | Go/TS coverage → shields endpoint badge on the orphan `badges` branch |
+| `.github/workflows/codeql.yaml` | CodeQL with language auto-detect (public repos) |
+| `.github/workflows/security-scan.yaml` | Trivy repo/config/image scans, advisory only; findings report to the Security tab, never block |
 
 Every other workflow in `.github/workflows/` is repo-internal automation
 (config sync, tag cutting, the daily governance audit, scheduled
@@ -34,7 +34,7 @@ own CI), not for consumers.
 ## Consuming
 
 Consumer repos do **not** hand-write these callers: `sync.yaml` pushes the
-workflow templates (`.github/workflow-templates/`) into every releaseable repo
+workflow templates (`.github/workflow-templates/`) into each consumer repo
 as PRs. The synced CI caller is a thin shim; all logic stays central:
 
 ```yaml
@@ -74,19 +74,21 @@ natively):
 Tools without remote-config support get their config pushed to consumers as
 PRs by `sync.yaml`:
 
-| Source (this repo)                                                                                               | Synced to                                            |
-|------------------------------------------------------------------------------------------------------------------|------------------------------------------------------|
-| `.editorconfig`, `.gitattributes`, `configs/renovate.json`                                                       | all releaseable repos                                |
-| `.golangci.yaml`, `configs/gremlins.yaml` (→ `.gremlins.yaml`)                                                   | Go repos                                             |
-| `configs/eslint.config.base.mjs`, `configs/prettier.json`, `configs/stylelint.json`, `configs/htmlvalidate.json` | TS repos (incl. hybrids)                             |
-| `configs/cliff-stable.toml` / `configs/cliff-alpha.toml` (→ `cliff.toml`)                                        | releaseable repos, tier by latest tag (v0.x → alpha) |
-| `configs/ruff.toml` (→ `ruff.toml`)                                                                              | Python repos                                         |
-| `configs/image-smoke.sh` (→ `tests/image-smoke.sh`)                                                              | image repos opting in via `tests/image-smoke.conf`   |
+| Source (this repo) | Synced to |
+| --- | --- |
+| `.editorconfig`, `.gitattributes`, `configs/renovate.json` | releaseable repos, plus repos with their own `publish.yaml` |
+| `.golangci.yaml`, `configs/gremlins.yaml` (→ `.gremlins.yaml`) | Go repos |
+| `configs/eslint.config.base.mjs`, `configs/prettier.json`, `configs/stylelint.json`, `configs/htmlvalidate.json` | TS repos (incl. hybrids) |
+| `configs/cliff-stable.toml` / `configs/cliff-alpha.toml` (→ `cliff.toml`) | releaseable repos, tier by latest tag (v0.x → alpha) |
+| `configs/ruff.toml` (→ `ruff.toml`) | Python repos |
+| `configs/image-smoke.sh` (→ `tests/image-smoke.sh`) | image repos opting in via `tests/image-smoke.conf` |
 
-The unified-CI group also syncs six workflow files into each consumer repo:
-`ci.yaml`, `codeql.yml`, `security.yml`, `scorecard.yml`, `coverage.yml`, and
-`release.yaml`. `scorecard.yml` (OpenSSF Scorecard, self-contained) feeds the
-README OpenSSF badge.
+The unified-CI group syncs four workflow files: `ci.yaml`, `codeql.yml`,
+`security.yml`, and `scorecard.yml`. A second group syncs the same set to
+non-releaseable repos that publish from their own `publish.yaml`. `coverage.yml`
+(Go/TS repos) and `release.yaml` (releaseable repos) come from their own groups.
+`scorecard.yml` (OpenSSF Scorecard, self-contained) feeds the README OpenSSF
+badge.
 
 ## README badges
 
