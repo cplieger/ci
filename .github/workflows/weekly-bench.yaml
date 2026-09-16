@@ -553,11 +553,15 @@ jobs:
     strategy:
       fail-fast: false
       max-parallel: 4   # Own day; 4 leaves 16 of the 20-job cap free. 17 repos
-                        # is 5 waves, and the two large apps dominate: measured
-                        # at -count=10, subflux is 36 min and vibekit 36.5 at
-                        # their 1s benchtime, against about 12 min for the
-                        # slowest library at 3s. Roughly an hour of wall for the
-                        # run, all of it free (every repo here is public).
+                        # is 5 waves, and subflux dominates: measured at
+                        # -count=10, it is 36 min at its 1s benchtime, against
+                        # about 12 min for the slowest library at 3s. vibekit
+                        # read 36.5 here until 2026-09-16 and the figure was
+                        # never right: it needed about 77 min, because one
+                        # benchmark's per-op cost grew with b.N. Fixed in that
+                        # repo (25 min locally); re-read it off the next run.
+                        # Roughly an hour of wall for the run, all of it free
+                        # (every repo here is public).
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
     runs-on: ubuntu-24.04
