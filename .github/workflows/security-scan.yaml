@@ -102,7 +102,7 @@ jobs:
           cache-from: type=gha
 
       # All Trivy scans here are ADVISORY (exit-code 0): they upload SARIF to
-      # the Security tab (and drive the OpenSSF/vuln badges) but never fail the
+      # the Security tab but never fail the
       # check or block a merge. CVEs in the base image are frequently outside
       # the maintainer's immediate control (no upstream fix yet, or not yet
       # picked up), so gating merges/releases on them is the wrong lever.

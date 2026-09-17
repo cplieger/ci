@@ -27,7 +27,7 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
-# Top-level read-only (OpenSSF Scorecard Token-Permissions); the tag push uses
+# Top-level read-only (least privilege); the tag push uses
 # RELEASE_PAT instead, see the note above.
 permissions:
   contents: read

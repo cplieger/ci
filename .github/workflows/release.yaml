@@ -72,7 +72,7 @@ on:
       DOCKERHUB_TOKEN:
         required: false
 
-# Top-level is read-only (OpenSSF Scorecard Token-Permissions); each job below
+# Top-level is read-only (least privilege); each job below
 # declares the exact write scopes it needs. The docker job forwards them to the
 # called docker-release.yaml, whose own jobs scope them further.
 permissions:
@@ -308,7 +308,11 @@ jobs:
             # (actions, reactive) and TS subpackages keep their base tsconfig
             # at root.
             '^tsconfig\.json$'
-            '(^|/)knip\.json$'
+            # knip: all eight locations the tool itself loads
+            # (KNIP_CONFIG_LOCATIONS in knip/dist/constants.js). A repo that
+            # opted in on any form other than knip.json was rebuilding on a
+            # config-only commit.
+            '(^|/)(\.knip\.jsonc?|knip\.(jsonc?|[jt]s)|knip\.config\.[jt]s)$'
             '(^|/)stryker\.config\.json$'
             '(^|/)\.golangci\.(yaml|yml)$'
             # Gremlins (Go mutation testing) config — synced across the repos from

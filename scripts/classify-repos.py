@@ -42,22 +42,13 @@ CI_FILES = """\
       - source: .github/workflow-templates/codeql.yml
         dest: .github/workflows/codeql.yml
       - source: .github/workflow-templates/security.yml
-        dest: .github/workflows/security.yml
-      - source: .github/workflow-templates/scorecard.yml
-        dest: .github/workflows/scorecard.yml
-      - source: configs/renovate.json
-        dest: renovate.json"""
+        dest: .github/workflows/security.yml"""
 
 GOLANGCI_FILES = """\
     files:
       - .golangci.yaml
       - source: configs/gremlins.yaml
         dest: .gremlins.yaml"""
-
-COVERAGE_FILES = """\
-    files:
-      - source: .github/workflow-templates/coverage.yml
-        dest: .github/workflows/coverage.yml"""
 
 SMOKE_FILES = """\
     files:
@@ -309,7 +300,7 @@ def classify(repo):
         'has_pkg': has_pkg,
         'is_web': is_web,
         'cliff_tier': cliff_tier,
-        'has_code': lang in ('go', 'ts'),  # codeql + coverage-badge set
+        'has_code': lang in ('go', 'ts'),  # codeql set
         'can_release': can_release,  # go.mod, jsr.json, or Dockerfile
         'has_smoke': has_smoke,
         'has_shell_tests': has_shell_tests,
@@ -340,7 +331,7 @@ def main():
     # --- Collect repos into groups ---
     ci_repos = []  # ALL releaseable repos -> unified ci.yml
     artifact_ci_repos = []  # non-releaseable repos with their own publish.yaml
-    codeql_repos = []  # go/ts repos (codeql + coverage badge)
+    codeql_repos = []  # go/ts repos (codeql)
     release_repos = []
     cliff_stable = []
     cliff_alpha = []
@@ -428,11 +419,6 @@ def main():
         CI_FILES,
     )
     print_group('Go-tooling configs (Go-having repos)', golangci_repos, GOLANGCI_FILES)
-    print_group(
-        'Coverage badge (Go/TS repos — measurable statement coverage)',
-        codeql_repos,
-        COVERAGE_FILES,
-    )
     print_group(
         'Image-smoke harness (repos with a tests/image-smoke.conf opt-in)',
         smoke_repos,

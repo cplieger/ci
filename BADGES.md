@@ -9,8 +9,8 @@ suffix for versioned modules, e.g. `metrics/v2`).
 ## Principles
 
 1. **Dynamic over static.** Prefer badges that read live state (pkg.go.dev,
-   npm, JSR, OpenSSF, image size, coverage, mutation) over hand-written
-   values. A hand-written value is a future stale value.
+   npm, JSR, image size, mutation) over hand-written values. A hand-written
+   value is a future stale value.
 2. **No hardcoded versions in a badge.** The base-image badge carries the base
    **name only** (`Alpine`, `Caddy`, `Distroless`, `scratch`) — never a patch
    version. Renovate bumps the `Dockerfile` `FROM` constantly; a version in the
@@ -39,10 +39,7 @@ suffix for versioned modules, e.g. `metrics/v2`).
 ```markdown
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/MODPATH.svg)](https://pkg.go.dev/github.com/cplieger/MODPATH)
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/REPO)](https://github.com/cplieger/REPO/blob/main/go.mod)
-[![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
 ```
 
 `Go Reference` uses `MODPATH` (with the `/v2` suffix if any); `Go version`
@@ -55,10 +52,7 @@ get no mutation run, so the badge would read `invalid`.
 ```markdown
 [![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
 [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
-[![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
 [![Mutation (TS)](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation-ts.json)](https://github.com/cplieger/REPO/issues?q=label%3Astryker-tracker)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
 ```
 
 No **Node version** badge. It read `engines.node` from the published npm
@@ -83,23 +77,18 @@ the file. Currently all five TS libraries are enrolled (`actions`, `fetch`,
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/REPO.svg)](https://pkg.go.dev/github.com/cplieger/REPO)
 [![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
 [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
-[![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker)
 [![Mutation (TS)](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation-ts.json)](https://github.com/cplieger/REPO/issues?q=label%3Astryker-tracker)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
 ```
 
-8 badges, exactly at the soft cap. A hybrid lib carries both ecosystems'
+5 badges, well inside the soft cap. A hybrid lib carries both ecosystems'
 identity badges (Go Reference + npm + JSR) _and_ both surfaces' mutation
 badges (gremlins on the Go module, Stryker on the enrolled TS subpackage —
-each linking to its own tracker issue). To stay at the ≤8 cap it drops two
-badges the single-ecosystem blocks carry: the Node-version badge (gone
-org-wide) and the **Go version** badge — pkg.go.dev already shows the
-required Go version natively on the page the Go Reference badge links to, so
-it was the row's weakest occupant (principle #5). Coverage reflects
-whichever surface `coverage.yaml` measures on the repo (Go, for
-web-terminal-engine).
+each linking to its own tracker issue). It drops two badges the
+single-ecosystem blocks carry: the Node-version badge (gone org-wide) and the
+**Go version** badge — pkg.go.dev already shows the required Go version
+natively on the page the Go Reference badge links to, so it was the row's
+weakest occupant (principle #5).
 
 ### Docker image (built from Go source in this repo)
 
@@ -107,10 +96,7 @@ web-terminal-engine).
 [![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/size.json)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER)
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO)
-[![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/coverage.json)](https://github.com/cplieger/REPO/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
 [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/REPO/releases)
 ```
 
@@ -120,16 +106,13 @@ web-terminal-engine).
 [![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/size.json)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER)
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/PROJECT_ID/badge)](https://www.bestpractices.dev/projects/PROJECT_ID)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/REPO/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/REPO)
 [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/REPO/releases)
 ```
 
-- The **Test coverage** and **Mutation** rows apply only to images **built from
-  Go source in this repo**. Omit both for thin upstream-wrapper images
-  (`docker-caddy`, `docker-keepalived`, `docker-nut-upsd`, `docker-radvd`,
-  `docker-smtp-relay`, `docker-static-web`), which have no statement coverage
-  and no mutation run.
+- The **Mutation** row applies only to images **built from Go source in this
+  repo**. Omit it for thin upstream-wrapper images (`docker-caddy`,
+  `docker-keepalived`, `docker-nut-upsd`, `docker-radvd`,
+  `docker-smtp-relay`, `docker-static-web`), which have no mutation run.
 - **No Mutation (TS) badge on image repos**, even where the app's web frontend
   is Stryker-enrolled (`vibekit`, `subflux`, `web-terminal-kiro`): the row
   already sits at the 8-badge cap, and an image README's audience is
@@ -159,24 +142,6 @@ web-terminal-engine).
 
 [badges/shields#5594]: https://github.com/badges/shields/issues/5594
 
-## Test coverage badge wiring
-
-The **Test coverage** badge reads a shields `endpoint` JSON published to an
-orphan `badges` branch in each repo by the synced `coverage.yml` workflow (which
-calls `cplieger/ci`'s reusable `coverage.yaml`). It runs on push to `main`,
-measures real statement coverage (Go: `go test -coverpkg=./...`, which includes
-classic, `rapid` property, and fuzz-seed tests; TS: vitest v8), and force-pushes
-`coverage.json` to the `badges` branch using the built-in `GITHUB_TOKEN` — **no
-external service and no per-repo secret**. The badge label is `Test coverage`
-(set in `coverage.yaml`, not the README — the `[![Test coverage]…]` alt text is
-cosmetic; the visible label comes from the endpoint JSON). The badge shows
-`invalid` until the first run on `main` publishes the file. Only the Go/TS repos
-receive `coverage.yml`.
-
-Publishing goes through `actions/publish-badge/publish-badge.sh`, which **preserves sibling
-badge files** on the branch (so `coverage.json` and `mutation.json` coexist
-instead of clobbering each other — see below).
-
 ## Mutation badge wiring
 
 The **Mutation** badge reads `mutation.json` from the same orphan `badges`
@@ -186,8 +151,8 @@ Go-having repo above ≈200 LOC of non-test Go, three times each, on a weekly
 schedule (Sundays 22:00 UTC). `scripts/gremlins-aggregate.py --badge-file`
 computes the mean efficacy (kill rate) from the per-attempt artifacts and
 `actions/publish-badge/publish-badge.sh` force-pushes `mutation.json` alongside
-`coverage.json`. Colour bands are tuned lower than coverage (≥85 brightgreen,
-≥75 green, ≥50 yellow, ≥30 orange, else red), because a healthy suite kills most
+its sibling badge files. Colour bands are ≥85 brightgreen,
+≥75 green, ≥50 yellow, ≥30 orange, else red, because a healthy suite kills most
 but rarely all runnable mutants (equivalent mutants form a noise floor). The
 badge links to the per-repo `gremlins-tracker` issue, which carries the rolling
 12-week history and the current live-mutant list. It shows `invalid` until the
@@ -195,7 +160,7 @@ first weekly run publishes the file, and updates weekly (not per-push — mutati
 testing is too expensive for the PR path).
 
 `actions/publish-badge/publish-badge.sh` requires a token with `contents:write` on the target
-repo. Coverage uses the consumer's own `GITHUB_TOKEN` (it runs in-repo);
+repo. An in-repo publisher uses the consumer's own `GITHUB_TOKEN`;
 weekly-gremlins runs in `cplieger/ci` and pushes cross-repo, so it uses the
 `CI_SCHEDULE` PAT (which already clones consumers and edits their tracker
 issues).
@@ -203,39 +168,21 @@ issues).
 ## Image size badge wiring
 
 The **Image Size** badge (image repos only) reads `size.json` from the same
-orphan `badges` branch as coverage/mutation. It is published by the
+orphan `badges` branch as the mutation badge. It is published by the
 `docker-release.yaml` finalize job on every image build, so it refreshes
 whenever the image is actually rebuilt (a source change, a base-image bump, or a
-release) — the same "publish on every build" model as the coverage badge. The
+release). The
 job sums the compressed (download) layer sizes of the `linux/amd64` sub-manifest
 of the just-pushed image (`docker buildx imagetools inspect --raw`, no pull) and
 publishes `{"label":"image size","message":"<N> MB"}` through
 `actions/publish-badge/publish-badge.sh` (sibling-preserving, so it coexists with
-`coverage.json` / `mutation.json`) using the consumer's own `GITHUB_TOKEN`
+`mutation.json`) using the consumer's own `GITHUB_TOKEN`
 (finalize already has `contents: write`). amd64 is reported by convention (the
 size a typical consumer pulls); arm64 differs by a few percent. The step is
 `continue-on-error` — a badge hiccup never fails a release. The badge shows
 `invalid` until the first build after this wiring landed publishes the file
 (a one-time backfill seeded the existing repos so they didn't wait for a
 release). No external service and no per-repo secret.
-
-## OpenSSF Scorecard wiring
-
-The badge reads `api.scorecard.dev`, populated by `ossf/scorecard-action`
-running with `publish_results: true`. That workflow is **synced org-wide**:
-`.github/workflow-templates/scorecard.yml` → `.github/workflows/scorecard.yml`
-on every public consumer repo (added to the unified-CI group in
-`scripts/classify-repos.py`). It is push-triggered (no weekly cron) to stay
-within the 20-job account concurrency cap. The badge shows `no data` until the
-first run on `main` completes after the workflow lands.
-
-## OpenSSF Best Practices badge
-
-The **OpenSSF Best Practices** badge links the repo to its entry on the
-metal-tier badge program (`bestpractices.dev`). `PROJECT_ID` is **per repo**
-(it is the numeric project id, not synced); fill it in from the repo's entry.
-The badge image reflects the live tiered status (in-progress / passing / silver
-/ gold).
 
 ## SBOM badge
 
@@ -261,7 +208,7 @@ materials.
   validate` gate, so any badge form of it would be the green-decoration badge
   principle #3 rejects. A self-hosted instance (Go Report Card's own suggested
   successor) would reintroduce exactly the third-party dependency the
-  self-published coverage/size/mutation badges were built to avoid. golangci-lint
+  self-published size/mutation badges were built to avoid. golangci-lint
   is the successor Go Report Card itself points to, and it already gates every
   repo.
 - The **base-image version** problem is solved structurally (name-only), so it

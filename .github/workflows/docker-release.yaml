@@ -165,7 +165,7 @@ env:
   # other keys in a repo config still apply.
   SYFT_SELECT_CATALOGERS: "+sbom-cataloger"
 
-# Top-level read-only (OpenSSF Scorecard Token-Permissions); each job below
+# Top-level read-only (least privilege); each job below
 # declares the write scopes it needs (build/finalize push, sign, attest, release).
 permissions:
   contents: read
@@ -1307,17 +1307,15 @@ jobs:
 
       - name: Sign SBOM for release assets (keyless)
         # Attach a cosign Sigstore bundle next to the SBOM so the GitHub
-        # Release carries a signed artifact. OpenSSF Scorecard's
-        # Signed-Releases check scans release assets for known signature
-        # suffixes (.sig, .sigstore, .sigstore.json, etc.); the GHCR image and
-        # attestation signatures above live in the registry and are invisible
-        # to it.
+        # Release carries a signed artifact a consumer can verify without
+        # pulling the image: the GHCR image and attestation signatures above
+        # live in the registry, so a release-asset consumer never sees them.
         #
         # cosign v3 turns --new-bundle-format and --use-signing-config on by
         # default, which deprecates (and ignores) --output-signature /
         # --output-certificate and makes --bundle required. The single
-        # .sigstore.json bundle carries the signature, certificate, and Rekor
-        # inclusion proof, and Scorecard recognizes the .sigstore.json suffix.
+        # .sigstore.json bundle carries the signature, certificate and Rekor
+        # inclusion proof.
         # finalize: the repaired Release must carry the same signed SBOM
         # assets a normal release would, so this step follows the widened
         # gate (the SBOM was regenerated above from the published image).
