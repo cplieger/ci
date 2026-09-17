@@ -196,8 +196,8 @@ jobs:
           # Vitest Browser Mode needs a real Chromium, and the fleet migrated
           # its DOM suites to it on 2026-08-23 — which is the last time this
           # workflow was green. Presence of the `@vitest/browser-playwright`
-          # devDependency is the enrolment marker (same shape as ts-ci.yaml and
-          # coverage.yaml), driven through the repo's OWN pinned `playwright`
+          # devDependency is the enrolment marker (same shape as ts-ci.yaml),
+          # driven through the repo's OWN pinned `playwright`
           # CLI (`--no-install`) so the browser build number it downloads is the
           # one the library looks for. NOT `--with-deps`: ubuntu-24.04 already
           # carries every shared library Chromium links, and that apt

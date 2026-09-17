@@ -61,5 +61,4 @@ exclude = [
   # name and cannot rot on its own while the badge beside it still renders.
   # Deliberately narrower than `--accept-timeouts`, which would forgive a
   # timeout from every host and hide a genuinely dead one.
-  '^https://scorecard\.dev/viewer/',
 ]

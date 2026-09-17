@@ -1,8 +1,5 @@
 # cplieger/ci
 
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/ci/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/ci)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13201/badge)](https://www.bestpractices.dev/projects/13201)
-
 Shared CI/CD for the `cplieger` repos: reusable GitHub Actions workflows,
 composite actions, canonical lint/format configs, and a cross-repo governance
 audit. One source of truth: consumer repos reference it instead of carrying
@@ -22,7 +19,6 @@ duplicate copies.
 | `.github/workflows/shell-ci.yaml` | Shell/Docker checks: actionlint, shellcheck, shfmt, hadolint, gitleaks |
 | `.github/workflows/release.yaml` | Auto-detects release type (Docker / TS / Go), computes the git-cliff version, publishes (npm + JSR via OIDC), tags + GitHub Release |
 | `.github/workflows/docker-release.yaml` | Multi-arch image build on native runners, Trivy scan, SBOM, cosign signing, release notes (called by `release.yaml`) |
-| `.github/workflows/coverage.yaml` | Go/TS coverage → shields endpoint badge on the orphan `badges` branch |
 | `.github/workflows/codeql.yaml` | CodeQL with language auto-detect (public repos) |
 | `.github/workflows/security-scan.yaml` | Trivy repo/config/image scans, advisory only; findings report to the Security tab, never block |
 
@@ -83,12 +79,10 @@ PRs by `sync.yaml`:
 | `configs/ruff.toml` (→ `ruff.toml`) | Python repos |
 | `configs/image-smoke.sh` (→ `tests/image-smoke.sh`) | image repos opting in via `tests/image-smoke.conf` |
 
-The unified-CI group syncs four workflow files: `ci.yaml`, `codeql.yml`,
-`security.yml`, and `scorecard.yml`. A second group syncs the same set to
-non-releaseable repos that publish from their own `publish.yaml`. `coverage.yml`
-(Go/TS repos) and `release.yaml` (releaseable repos) come from their own groups.
-`scorecard.yml` (OpenSSF Scorecard, self-contained) feeds the README OpenSSF
-badge.
+The unified-CI group syncs three workflow files: `ci.yaml`, `codeql.yml`, and
+`security.yml`. A second group syncs the same set to non-releaseable repos that
+publish from their own `publish.yaml`. `release.yaml` (releaseable repos) comes
+from its own group.
 
 ## README badges
 
@@ -102,8 +96,8 @@ per-repo, not synced, because it carries per-repo URLs.
   `release` boolean from conventional commits. Used by `release.yaml`; callable
   directly.
 - `actions/publish-badge`: writes a shields.io endpoint JSON to the orphan
-  `badges` branch, preserving sibling badge files. Used by `coverage.yaml`,
-  `docker-release.yaml` (image size), and `weekly-gremlins.yaml` (mutation
+  `badges` branch, preserving sibling badge files. Used by
+  `docker-release.yaml` (image size) and `weekly-gremlins.yaml` (mutation
   score).
 
 ## Local tooling

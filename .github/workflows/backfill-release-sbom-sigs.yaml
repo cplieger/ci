@@ -1,6 +1,6 @@
 # On-demand backfill: sign the SBOM asset on existing GitHub releases that
-# predate the cosign-v3 signing fix, so OpenSSF Scorecard's Signed-Releases
-# check sees a recognized signature (.sigstore.json) next to sbom.spdx.json.
+# predate the cosign-v3 signing fix, so every release carries a verifiable
+# signature (.sigstore.json) next to sbom.spdx.json.
 #
 # This does NOT rebuild or touch any container image — it signs the
 # already-published sbom.spdx.json bytes and uploads the .sigstore.json

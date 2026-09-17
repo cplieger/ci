@@ -33,7 +33,7 @@ outward, so the conventions below are about not breaking downstream.
   outputs `version` + a `release` boolean. Consumed by `release.yaml`.
 - `actions/publish-badge/`: composite action that publishes a shields endpoint
   JSON to the orphan `badges` branch (preserving sibling badges). Consumed by
-  `coverage.yaml`, `docker-release.yaml`, and `weekly-gremlins.yaml`.
+  `docker-release.yaml` and `weekly-gremlins.yaml`.
 - `configs/`: canonical configs without native remote-config support
   (`eslint.config.base.mjs`, `prettier.json`, `stylelint.json`,
   `htmlvalidate.json`, `gremlins.yaml`, `ruff.toml`, `renovate.json`,

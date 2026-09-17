@@ -17,8 +17,8 @@ push-restriction toggles), rulesets (unexpected custom rulesets +
 bypass-actor drift), Actions token defaults (read-only workflow permissions;
 workflows cannot approve PRs), vulnerability reporting, secret/code scanning,
 stray .github/dependabot.yml (Renovate owns dependency updates), CI wiring,
-coverage-workflow presence on Go/TS repos, Docker Hub dual-publish secrets on
-image repos, Renovate preset, license (present AND matching the repo's
+the Renovate preset entry point on cplieger/.github,
+Docker Hub dual-publish secrets on image repos, license (present AND matching the repo's
 category per licensing.md), default branch,
 description (presence + <=100 chars), topics (at least 2), the
 dependency-graph "Used by counter" package on public repos (it is pinned to
@@ -170,9 +170,6 @@ HUB_MARKER_END = "<!-- hub-overview END -->"
 # remove entries when the deviation is fixed.
 ACCEPTED = {
     "homelab": {
-        "renovate preset not extended":
-            "deliberate: standalone renovate.json consumed directly by the "
-            "resident Renovate container (not the fleet preset)",
     },
     "docker-radvd": {
         "unexpected extra required check 'smoke'":
@@ -612,30 +609,26 @@ def collect(meta):
 
     wf = gh_json("api", f"repos/{OWNER}/{name}/contents/.github/workflows")
     if wf is API_ERROR:
-        s["has_codeql"] = s["has_security_scan"] = s["has_scorecard"] = None
-        s["has_coverage"] = None
+        s["has_codeql"] = s["has_security_scan"] = None
         s["errors"].append("workflow listing unreadable (API)")
     else:
         wf_names = {f["name"] for f in wf} if isinstance(wf, list) else set()
         s["has_codeql"] = bool({"codeql.yml", "codeql.yaml"} & wf_names)
         s["has_security_scan"] = bool({"security.yml", "security.yaml"} & wf_names)
-        s["has_scorecard"] = bool({"scorecard.yml", "scorecard.yaml"} & wf_names)
-        s["has_coverage"] = bool({"coverage.yml", "coverage.yaml"} & wf_names)
 
-    # Surface detection, mirroring scripts/classify-repos.py: a root go.mod or
-    # package.json means measurable coverage (sync delivers coverage.yml), a
-    # root Dockerfile means the release pipeline publishes an image (and, for
-    # dual-publish repos, needs the Docker Hub secrets).
+    # Surface detection, mirroring scripts/classify-repos.py: a root Dockerfile
+    # means the release pipeline publishes an image (and, for dual-publish
+    # repos, needs the Docker Hub secrets).
+    # go.mod and package.json are fetched for their TEXT (module path / package
+    # name below); only the Dockerfile's presence is graded.
     probe_texts = {}
-    for probe_file, key in (("go.mod", "has_gomod"), ("package.json", "has_packagejson"),
-                            ("Dockerfile", "has_dockerfile")):
+    for probe_file in ("go.mod", "package.json", "Dockerfile"):
         txt = file_text(name, probe_file)
         probe_texts[probe_file] = txt
         if txt is None:
-            s[key] = None
             s["errors"].append(f"{probe_file} probe unreadable (API)")
-        else:
-            s[key] = bool(txt)
+    dockerfile = probe_texts["Dockerfile"]
+    s["has_dockerfile"] = None if dockerfile is None else bool(dockerfile)
 
     # Used-by counter. Expected package = the root go.mod module path (Go
     # majors move the path, which is exactly the drift being caught), else the
@@ -741,16 +734,24 @@ def collect(meta):
     else:
         s["ci_wired"] = REUSABLE in ci_txt
 
-    ren_parts = [file_text(name, p) for p in
-                 ("renovate.json", "org-inherited-config.json", "default.json")]
-    if any(PRESET in (p or "") for p in ren_parts) or name == ".github":
-        s["renovate_preset"] = True
-    elif any(p is None for p in ren_parts):
-        s["renovate_preset"] = None  # unknown — a read failed and none matched
-        s["errors"].append("renovate config unreadable (API)")
+    # Renovate reaches every repo through inheritConfig, not a per-repo file:
+    # the scheduler sets inheritConfig + inheritConfigRepoName=cplieger/.github,
+    # so cplieger/.github/org-inherited-config.json is the ONE place the preset
+    # is referenced. The 61 per-repo shims were deleted in 2026-09; a repo
+    # holding one again is drift, not compliance. Only .github is graded, and it
+    # is graded HARD, because that single file is what delivers dependency
+    # updates fleet-wide and its absence is silent (requireConfig=optional means
+    # every repo would still be processed, just with no preset).
+    if name == ".github":
+        inherited = file_text(name, "org-inherited-config.json")
+        if inherited is None:
+            s["renovate_preset"] = None
+            s["errors"].append("org-inherited-config.json unreadable (API)")
+        else:
+            s["renovate_preset"] = PRESET in inherited
     else:
-        s["renovate_preset"] = False
-    s["adopted"] = bool(s["ci_wired"]) or bool(s["renovate_preset"])
+        s["renovate_preset"] = None  # N/A — nothing per-repo to grade
+    s["adopted"] = bool(s["ci_wired"]) or s["name"] in BESPOKE_CI
 
     # Deploy-trigger webhook. Read repo hooks and collect every active one
     # pointing at the orchestrator host, with the full config surface each
@@ -934,22 +935,13 @@ def compliance(s):
         if s["secret_scanning_push_protection"] != "enabled":  # noqa: S105 — API state
             warn.append("secret scanning push protection off (want on)")
 
-    # Scanning workflows arrive via sync for adopted repos; codeql + scorecard
-    # are public-only features (CodeQL needs GHAS on private repos, Scorecard
-    # only evaluates public repos), so both are N/A on private ones.
+    # Scanning workflows arrive via sync for adopted repos; CodeQL is a
+    # public-only feature (it needs GHAS on private repos), so it is N/A there.
     if s["adopted"] and not s["infra"] and not s["private"]:
         if s["has_codeql"] is False:
             warn.append("codeql.yml missing")
         if s["has_security_scan"] is False:
             warn.append("security.yml missing")
-        if s["has_scorecard"] is False:
-            warn.append("scorecard.yml missing")
-        # Go/TS repos have measurable statement coverage; sync delivers
-        # coverage.yml to exactly those (classify-repos.py), so a missing one
-        # means the sync PR never landed or was reverted.
-        if (s.get("has_gomod") or s.get("has_packagejson")) and s["has_coverage"] is False:
-            warn.append("coverage.yml missing (Go/TS repos publish a coverage badge)")
-
     # Docker Hub dual-publish secrets: None = N/A (no root Dockerfile, a
     # GHCR-only repo, or the read failed and was recorded as an [error]).
     if s.get("dockerhub_secrets") is False:
@@ -963,7 +955,8 @@ def compliance(s):
     if not s["infra"] and s["name"] not in BESPOKE_CI and s["adopted"] and s["ci_wired"] is False:
         hard.append("CI not wired to cplieger/ci")
     if s["renovate_preset"] is False:
-        warn.append("renovate preset not extended")
+        hard.append("org-inherited-config.json does not extend the preset "
+                    "(this file is what delivers Renovate to every repo)")
 
     # Description + topics: public repos only — discovery metadata has no
     # audience on a private repo. The house standard is 2-4 topics.
