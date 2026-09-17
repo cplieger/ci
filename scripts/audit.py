@@ -220,6 +220,13 @@ LICENSE_OVERRIDES = {
     "registry-stats": "GPL-3.0",
     "seadex-scout": "GPL-3.0",
     "tautulli-remap": "GPL-3.0",
+    # The deadset dead-code analyzers and their orchestrator: command-line tools
+    # run as separate processes, never linked, so the same rule applies. Their
+    # shared contract repository (deadset-spec) stays on the Apache-2.0 default
+    # so a third party can write a conforming analyzer freely.
+    "deadset-go": "GPL-3.0",
+    "deadset-ts": "GPL-3.0",
+    "deadset": "GPL-3.0",
     # Network services a competitor could plausibly resell hosted, which is
     # the only thing AGPL section 13 buys over GPL-3.0. Rationed to these two
     # because section 13 is also what puts AGPL on corporate blocklists that
