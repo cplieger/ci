@@ -35,7 +35,7 @@ concurrency:
 
 jobs:
   fanout:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
@@ -103,7 +103,7 @@ jobs:
       max-parallel: 6   # account budget: 20; leave >=4 for ad-hoc PR work
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 350
     permissions:
       contents: read
@@ -349,7 +349,7 @@ jobs:
   badge:
     needs: [fanout, run]
     if: always() && needs.fanout.outputs.matrix != '[]'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -424,7 +424,7 @@ jobs:
   aggregate:
     needs: [fanout, run]
     if: always() && needs.fanout.outputs.matrix != '[]'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read

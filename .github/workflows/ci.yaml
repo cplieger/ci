@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   detect:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 2
     outputs:
       run_go: ${{ steps.detect.outputs.run_go }}
@@ -288,7 +288,7 @@ jobs:
   docker:
     needs: detect
     if: ${{ needs.detect.outputs.run_docker == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -374,7 +374,7 @@ jobs:
   docker-arm64:
     needs: detect
     if: ${{ needs.detect.outputs.run_docker == 'true' && github.event.repository.private == false }}
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -435,7 +435,7 @@ jobs:
   #   || { echo "<step name>" >> /tmp/_ci_failures; exit 1; }
   repo:
     needs: detect
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -556,7 +556,7 @@ jobs:
 
   markdown:
     needs: detect
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -643,7 +643,7 @@ jobs:
   python:
     needs: detect
     if: ${{ needs.detect.outputs.run_python == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -672,7 +672,7 @@ jobs:
   scripts:
     needs: detect
     if: ${{ needs.detect.outputs.run_scripts == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -888,7 +888,7 @@ jobs:
   validate:
     needs: [detect, repo, go, go-nested, ts, web, shell, docker, docker-arm64, markdown, python, scripts]
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 1
     steps:
       - name: Aggregate CI dispatch results

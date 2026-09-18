@@ -57,7 +57,7 @@ concurrency:
 
 jobs:
   fanout:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
@@ -125,7 +125,7 @@ jobs:
       max-parallel: 3   # CPU-heavy; small fleet today — leaves the budget free
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     permissions:
       contents: read
@@ -361,7 +361,7 @@ jobs:
   aggregate:
     needs: [fanout, run]
     if: always() && needs.fanout.outputs.matrix != '[]'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
