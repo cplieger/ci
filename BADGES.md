@@ -31,15 +31,19 @@ suffix for versioned modules, e.g. `metrics/v2`).
    decorative badges; each communicates where to get it, docs, code quality, or
    security posture. Past ~8 badges a row reads as a trophy case and people stop
    trusting any single badge — keep rows at 8 or under and prune hard.
+6. **One source line.** Every badge in the row sits on the SAME Markdown line,
+   separated by a single space. GitHub collapses a single newline to a space, so
+   one-per-line looked identical there; Community Applications and other
+   renderers treat that newline as a hard break and stack the badges one per
+   row (measured 2026-09-18 on the seadex-scout listing). The blocks below are
+   written on one line for that reason; copy them as they are.
 
 ## Blocks by repo type
 
 ### Go library
 
 ```markdown
-[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/MODPATH.svg)](https://pkg.go.dev/github.com/cplieger/MODPATH)
-[![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/REPO)](https://github.com/cplieger/REPO/blob/main/go.mod)
-[![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/MODPATH.svg)](https://pkg.go.dev/github.com/cplieger/MODPATH) [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/REPO)](https://github.com/cplieger/REPO/blob/main/go.mod) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker)
 ```
 
 `Go Reference` uses `MODPATH` (with the `/v2` suffix if any); `Go version`
@@ -50,9 +54,7 @@ get no mutation run, so the badge would read `invalid`.
 ### TypeScript library
 
 ```markdown
-[![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
-[![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
-[![Mutation (TS)](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation-ts.json)](https://github.com/cplieger/REPO/issues?q=label%3Astryker-tracker)
+[![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO) [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO) [![Mutation (TS)](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation-ts.json)](https://github.com/cplieger/REPO/issues?q=label%3Astryker-tracker)
 ```
 
 No **Node version** badge. It read `engines.node` from the published npm
@@ -74,11 +76,7 @@ the file. Currently all five TS libraries are enrolled (`actions`, `fetch`,
 ### Hybrid Go + TS library (e.g. web-terminal-engine)
 
 ```markdown
-[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/REPO.svg)](https://pkg.go.dev/github.com/cplieger/REPO)
-[![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO)
-[![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO)
-[![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker)
-[![Mutation (TS)](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation-ts.json)](https://github.com/cplieger/REPO/issues?q=label%3Astryker-tracker)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/REPO.svg)](https://pkg.go.dev/github.com/cplieger/REPO) [![npm](https://img.shields.io/npm/v/@cplieger/REPO)](https://www.npmjs.com/package/@cplieger/REPO) [![JSR](https://jsr.io/badges/@cplieger/REPO)](https://jsr.io/@cplieger/REPO) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker) [![Mutation (TS)](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation-ts.json)](https://github.com/cplieger/REPO/issues?q=label%3Astryker-tracker)
 ```
 
 5 badges, well inside the soft cap. A hybrid lib carries both ecosystems'
@@ -93,20 +91,13 @@ weakest occupant (principle #5).
 ### Docker image (built from Go source in this repo)
 
 ```markdown
-[![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/size.json)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER)
-![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
-![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO)
-[![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker)
-[![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/REPO/releases)
+[![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/size.json)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER) ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue) ![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker) [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/REPO/releases)
 ```
 
 ### Docker image (thin upstream wrapper, no Go source)
 
 ```markdown
-[![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/size.json)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER)
-![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
-![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO)
-[![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/REPO/releases)
+[![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/size.json)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER) ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue) ![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO) [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/REPO/releases)
 ```
 
 - The **Mutation** row applies only to images **built from Go source in this
