@@ -9,8 +9,10 @@
 #   2. build:    matrix over linux/amd64+linux/arm64 on native runners (no QEMU);
 #                push each arch by digest, upload digest artifact
 #   3. finalize: download digests → assemble multi-arch manifest via imagetools
-#                → cosign sign+attest → SBOM → Trivy → GitHub Release (gated on
-#                `release-needed`) → Docker Hub overview/description sync
+#                → cosign sign+attest → SBOM → Trivy → dashboard OCI artifact
+#                (repos with a root grafana-dashboard.json) → GitHub Release
+#                (gated on `release-needed`; SBOM and dashboard assets) → Docker
+#                Hub overview/description sync
 #   4. verify-publish: read the version tag back from GHCR and Docker Hub and
 #                fail the run unless it carries this run's manifest digest
 #
@@ -182,6 +184,7 @@ jobs:
       meta-json: ${{ steps.meta.outputs.json }}
       matrix: ${{ steps.matrix.outputs.matrix }}
       version: ${{ steps.tags.outputs.version }}
+      major: ${{ steps.tags.outputs.major }}
     steps:
       - name: Derive version tags
         id: tags
@@ -438,6 +441,7 @@ jobs:
     outputs:
       digest: ${{ steps.manifest.outputs.digest }}
       version: ${{ needs.prepare.outputs.version }}
+      dashboard-digest: ${{ steps.dashboard-oci.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1237,6 +1241,60 @@ jobs:
           fi
           echo "verified OpenVEX attestations cover: $(tr '\n' ' ' < /tmp/vex-want)"
 
+      - name: Install oras
+        if: ${{ steps.nochange.outputs.skip != 'true' && hashFiles('grafana-dashboard.json') != '' }}
+        run: |
+          set -euo pipefail
+          # Version + tarball sha256 pinned as a pair; sha256sum -c refuses a tarball
+          # that does not match. Move both literals together: no manager bumps the
+          # sha alone.
+          # renovate: datasource=custom.oras depName=oras-project/oras
+          ORAS_VERSION=v1.3.4
+          ORAS_SHA256=f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
+          curl -fsSL --connect-timeout 10 --max-time 60 --retry 7 --retry-max-time 150 --retry-all-errors \
+            -o "$RUNNER_TEMP/oras.tgz" \
+            "https://github.com/oras-project/oras/releases/download/${ORAS_VERSION}/oras_${ORAS_VERSION#v}_linux_amd64.tar.gz"
+          echo "${ORAS_SHA256}  ${RUNNER_TEMP}/oras.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/oras.tgz" -C /usr/local/bin oras
+          oras version
+
+      - name: Publish dashboard OCI artifact
+        id: dashboard-oci
+        if: ${{ steps.nochange.outputs.skip != 'true' && hashFiles('grafana-dashboard.json') != '' }}
+        env:
+          # Via env, never inline ${{ }} in the script body (template injection).
+          VERSION: ${{ needs.prepare.outputs.version }}
+          MAJOR: ${{ needs.prepare.outputs.major }}
+          DASHBOARD_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/dashboard
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/sigstore-retry.sh"
+          # Consumers re-import by uid, so a file without a string uid is not a
+          # dashboard this pipeline may publish.
+          jq -e '.uid | strings | length > 0' grafana-dashboard.json >/dev/null \
+            || { echo "::error::grafana-dashboard.json is not a dashboard with a string uid"; exit 1; }
+          # oras-go stamps org.opencontainers.image.created=now unless the caller sets
+          # it, so without a fixed value every push (a finalize rerun included) mints a
+          # new manifest digest and moves both tags off the signed one. The commit
+          # time makes the manifest a pure function of its inputs.
+          created=$(git show -s --format=%cI "$GITHUB_SHA")
+          oras push --export-manifest "$RUNNER_TEMP/dashboard-manifest.json" \
+            --artifact-type application/vnd.grafana.dashboard.v1+json \
+            --annotation "org.opencontainers.image.created=${created}" \
+            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation "org.opencontainers.image.version=${VERSION}" \
+            "${DASHBOARD_REF}:${VERSION},${MAJOR}" \
+            grafana-dashboard.json:application/json
+          digest="sha256:$(sha256sum "$RUNNER_TEMP/dashboard-manifest.json" | cut -d' ' -f1)"
+          retry_sigstore cosign sign --yes "${DASHBOARD_REF}@${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Grafana dashboard"
+            echo ""
+            echo "OCI artifact \`${DASHBOARD_REF}:${VERSION}\` (also \`:${MAJOR}\`), digest \`${digest}\`, cosign-signed (keyless)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Generate release notes
         # finalize repairs a tag-created/Release-missing partial run: the
         # release steps run despite release-needed=false (and the no-change
@@ -1326,7 +1384,19 @@ jobs:
           retry_sigstore cosign sign-blob --yes sbom.spdx.json \
             --bundle sbom.spdx.json.sigstore.json
 
+      - name: Sign dashboard for release assets (keyless)
+        if: >-
+          ${{ (inputs.release-needed == 'true' || inputs.finalize == 'true')
+            && steps.nochange.outputs.skip != 'true' && hashFiles('grafana-dashboard.json') != '' }}
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/sigstore-retry.sh"
+          sha256sum grafana-dashboard.json > grafana-dashboard.json.sha256
+          retry_sigstore cosign sign-blob --yes grafana-dashboard.json \
+            --bundle grafana-dashboard.json.sigstore.json
+
       - name: Create release
+        id: release
         # Only create a GitHub Release when the caller signaled a version bump.
         # Pure chore/ci/docs pushes still build + push images but reuse the
         # existing tag — gh release create would error otherwise.
@@ -1407,6 +1477,8 @@ jobs:
           # it accumulates in the UI while holding no tag ref.
           if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" >/dev/null 2>/tmp/relerr; then
             echo "::notice::Release ${VERSION} already exists; skipping creation."
+            echo "reused=true" >> "$GITHUB_OUTPUT"
+            echo "published=true" >> "$GITHUB_OUTPUT"
             exit 0
           elif ! grep -q 'HTTP 404' /tmp/relerr; then
             echo "::error::could not determine whether Release ${VERSION} exists:"
@@ -1420,10 +1492,44 @@ jobs:
                 echo "::notice::deleting orphaned draft release ${id} for ${VERSION}"
                 gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
               done
+          ASSETS=(sbom.spdx.json sbom.spdx.json.sigstore.json)
+          # The two side files are written only by the dashboard sign step, which is
+          # gated on a root grafana-dashboard.json; keying on all three keeps this step
+          # file-presence-driven rather than repo-list-driven and never hands gh a
+          # path that is not there.
+          if [ -f grafana-dashboard.json ] && [ -f grafana-dashboard.json.sha256 ] && [ -f grafana-dashboard.json.sigstore.json ]; then
+            ASSETS+=(grafana-dashboard.json grafana-dashboard.json.sha256 grafana-dashboard.json.sigstore.json)
+          fi
           gh release create "$VERSION" \
             --title "$VERSION" \
             --notes-file RELEASE_NOTES.md \
-            sbom.spdx.json sbom.spdx.json.sigstore.json
+            "${ASSETS[@]}"
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify dashboard release assets
+        if: ${{ steps.release.outputs.published == 'true' && hashFiles('grafana-dashboard.json') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          REUSED: ${{ steps.release.outputs.reused }}
+        run: |
+          set -euo pipefail
+          # A rerun that found its Release already present moves the image tags
+          # to the fresh build; the dashboard assets follow for the same reason.
+          if [ "$REUSED" = "true" ]; then
+            gh release upload --clobber "$VERSION" \
+              grafana-dashboard.json grafana-dashboard.json.sha256 grafana-dashboard.json.sigstore.json
+          fi
+          # REST by-tag read, the same call the create step's presence check makes: gh release
+          # view bills GraphQL, whose secondary rate limit reads as "release not found".
+          have=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" --jq '.assets[].name')
+          for f in grafana-dashboard.json grafana-dashboard.json.sha256 grafana-dashboard.json.sigstore.json; do
+            grep -qx "$f" <<<"$have" || { echo "::error::release ${VERSION} is missing asset ${f}"; exit 1; }
+          done
+          {
+            echo ""
+            echo "Release assets: \`grafana-dashboard.json\`, \`grafana-dashboard.json.sha256\`, \`grafana-dashboard.json.sigstore.json\`."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Sync description to Docker Hub
         if: ${{ contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main' && steps.nochange.outputs.skip != 'true' }}
@@ -1502,6 +1608,7 @@ jobs:
       VERSION: ${{ needs.prepare.outputs.version }}
       DIGEST: ${{ needs.finalize.outputs.digest }}
       REGISTRIES: ${{ inputs.registries }}
+      DASHBOARD_DIGEST: ${{ needs.finalize.outputs.dashboard-digest }}
     steps:
       - name: Verify published image
         run: |
@@ -1550,5 +1657,29 @@ jobs:
           verify "$REGISTRY" "$ghcr_token" "${REGISTRY}/${IMAGE_NAME}:${VERSION}" || rc=1
           if [[ "$REGISTRIES" == *dockerhub* ]]; then
             verify registry-1.docker.io "$hub_token" "docker.io/${IMAGE_NAME}:${VERSION}" || rc=1
+          fi
+          # The artifact is a single OCI image manifest, so its own Accept and its
+          # own probe; the empty-digest "any digest" arm above is not extended to it,
+          # because an empty dashboard digest means nothing was pushed.
+          if [ -n "$DASHBOARD_DIGEST" ]; then
+            dash_token=$(pull_token dash "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}/dashboard:pull")
+            dash_digest_of() {
+              curl -fsSI --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $dash_token" \
+                -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+                "https://${REGISTRY}/v2/${IMAGE_NAME}/dashboard/manifests/${VERSION}" |
+                tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }'
+            }
+            got=
+            for i in 1 2 3 4 5 6; do
+              got=$(dash_digest_of 2>/dev/null || true)
+              [ "$got" = "$DASHBOARD_DIGEST" ] && break
+              [ "$i" -lt 6 ] && sleep 20
+            done
+            if [ "$got" = "$DASHBOARD_DIGEST" ]; then
+              echo "ok: ${REGISTRY}/${IMAGE_NAME}/dashboard:${VERSION} -> ${got}"
+            else
+              echo "::error::${REGISTRY}/${IMAGE_NAME}/dashboard:${VERSION}: expected ${DASHBOARD_DIGEST}, registry answered '${got:-nothing}'"
+              rc=1
+            fi
           fi
           exit "$rc"

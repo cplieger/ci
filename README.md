@@ -18,7 +18,7 @@ duplicate copies.
 | `.github/workflows/ts-ci.yaml` | TS checks: eslint, tsc typecheck, vitest, prettier, knip, version parity, import-map coverage (+ optional `web-lint` for CSS/HTML) |
 | `.github/workflows/shell-ci.yaml` | Shell/Docker checks: actionlint, shellcheck, shfmt, hadolint, gitleaks |
 | `.github/workflows/release.yaml` | Auto-detects release type (Docker / TS / Go), computes the git-cliff version, publishes (npm + JSR via OIDC), tags + GitHub Release |
-| `.github/workflows/docker-release.yaml` | Multi-arch image build on native runners, Trivy scan, SBOM, cosign signing, release notes (called by `release.yaml`) |
+| `.github/workflows/docker-release.yaml` | Multi-arch image build on native runners, Trivy scan, SBOM, cosign signing, dashboard release assets and OCI artifact (repos with a root `grafana-dashboard.json`), release notes (called by `release.yaml`) |
 | `.github/workflows/codeql.yaml` | CodeQL with language auto-detect (public repos) |
 | `.github/workflows/security-scan.yaml` | Trivy repo/config/image scans, advisory only; findings report to the Security tab, never block |
 
