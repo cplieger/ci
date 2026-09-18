@@ -483,11 +483,17 @@ jobs:
           VERSION=1.30.1
           pipx install "zizmor==${VERSION}"
 
+      # actionlint does not know the ubuntu-26.04 / ubuntu-26.04-arm labels
+      # (rhysd/actionlint#682), and no release carries them: v1.7.12 is the
+      # newest and main has been untouched since 2026-04-19, so a version bump
+      # is not the fix. The regex is scoped to those two labels, so a typo in
+      # any other label still fails. Delete the flag once a release ships #682.
       - name: Workflows (actionlint)
         continue-on-error: true
         run: |
           (
-            actionlint -color
+            actionlint -color \
+              -ignore 'label "ubuntu-26\.04(-arm)?" is unknown'
           ) || { echo "Workflows (actionlint)" >> /tmp/_ci_failures; exit 1; }
 
       # Workflow SECURITY audit; actionlint above is a correctness linter and
