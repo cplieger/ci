@@ -18,7 +18,7 @@ permissions:
 jobs:
   detect:
     if: github.event.repository.private == false
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       languages: ${{ steps.langs.outputs.languages }}
@@ -36,7 +36,7 @@ jobs:
   analyze:
     needs: detect
     if: needs.detect.outputs.languages != '' && needs.detect.outputs.languages != '[]'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       security-events: write

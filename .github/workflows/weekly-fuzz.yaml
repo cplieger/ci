@@ -52,7 +52,7 @@ env:
 
 jobs:
   fanout:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     outputs:
       shard_matrix: ${{ steps.fanout.outputs.shard_matrix }}
@@ -118,7 +118,7 @@ jobs:
       max-parallel: 6
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.shard_matrix) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # 4h fuzz budget per shard + clone/build/baseline overhead, under the 6h cap.
     timeout-minutes: 350
     permissions:
@@ -233,7 +233,7 @@ jobs:
       max-parallel: 6
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.repo_matrix) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read

@@ -84,7 +84,7 @@ concurrency:
 
 jobs:
   detect:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 3
     outputs:
       type: ${{ steps.type.outputs.type }}
@@ -827,7 +827,7 @@ jobs:
     # subpackage today, and widening the docker gate would rebuild images on
     # subpackage-only pushes.
     if: ${{ needs.detect.outputs.type == 'go' && (needs.detect.outputs.root_changed == 'true' || needs.detect.outputs.subpackages_to_publish != '[]') && (needs.detect.outputs.release == 'true' || needs.detect.outputs.finalize == 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: write
@@ -1180,7 +1180,7 @@ jobs:
     # steps are already idempotent version-exists skips, so a finalize rerun
     # passes through them and repairs only the missing GitHub Release.
     if: ${{ needs.detect.outputs.type == 'ts' && needs.detect.outputs.root_changed == 'true' && (needs.detect.outputs.release == 'true' || needs.detect.outputs.finalize == 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: write
@@ -1321,7 +1321,7 @@ jobs:
       && (needs.docker.result == 'success' || needs.docker.result == 'skipped')
       && (needs.ts.result == 'success' || needs.ts.result == 'skipped')
       && (needs.go.result == 'success' || needs.go.result == 'skipped')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -1394,7 +1394,7 @@ jobs:
   go-nested:
     needs: detect
     if: ${{ needs.detect.outputs.go_modules_to_release != '' && needs.detect.outputs.go_modules_to_release != '[]' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: write

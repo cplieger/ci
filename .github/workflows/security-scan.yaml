@@ -30,7 +30,7 @@ env:
 
 jobs:
   trivy:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -190,7 +190,7 @@ jobs:
   # scanning also covers pushes on public repos; this adds the gitleaks
   # ruleset and a scheduled full-history sweep (via daily-security).
   gitleaks-history:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read

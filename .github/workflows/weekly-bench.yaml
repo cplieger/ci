@@ -298,7 +298,7 @@ jobs:
   # tests do.
   smoke:
     needs: fanout
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - name: Setup Go
@@ -430,7 +430,7 @@ jobs:
           fi
 
   fanout:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
@@ -564,7 +564,7 @@ jobs:
                         # (every repo here is public).
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     permissions:
       contents: read
@@ -924,7 +924,7 @@ jobs:
   aggregate:
     needs: [fanout, run]
     if: ${{ always() && needs.fanout.outputs.matrix != '[]' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read

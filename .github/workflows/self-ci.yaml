@@ -42,7 +42,7 @@ jobs:
   # Not part of the `validate` check (that comes from the meta ci.yaml, which is
   # consumer-facing); a failure here shows as a red check on the PR.
   measurement-scripts:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -81,7 +81,7 @@ jobs:
   # pin in weekly-bench/weekly-stryker, so the suite runs on both: the default
   # interpreter first (the stryker golden skips itself there), then 3.14.
   tracker-scripts:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read

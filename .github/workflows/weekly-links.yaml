@@ -46,7 +46,7 @@ concurrency:
 
 jobs:
   fanout:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
@@ -93,7 +93,7 @@ jobs:
       max-parallel: 4   # Own day; 4 leaves 16 of the 20-job cap free
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read
