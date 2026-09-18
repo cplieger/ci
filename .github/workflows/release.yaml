@@ -339,10 +339,6 @@ jobs:
             # as long as any repo has not migrated; drop it once none has.
             '^alerts/'
             '^alerts\.yaml$'
-            # Grafana dashboards — committed for manual UI import (per the
-            # dashboards-imported-via-UI convention), never COPY'd/embedded
-            # into any image or served from one.
-            '(^|/)grafana-dashboard\.json$'
 
             # CI / security tooling configs
             '(^|/)cliff\.toml$'
