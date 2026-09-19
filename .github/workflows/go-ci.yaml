@@ -248,14 +248,12 @@ jobs:
             fi
           fi
 
-      # punused finds unused EXPORTED symbols. It has exactly one release, v0.5.0
-      # (Jan 2022), so the pin is already latest and nothing below gets fixed
-      # upstream. Read the PINNED tag's source, not the default branch: v0.5.0
-      # caps a whole run at 30 SECONDS, where main.go on `main` says 2 minutes,
-      # and that budget is why this step is shaped the way it is.
+      # punused finds unused EXPORTED symbols. v0.5.1 (2026-09) is the first
+      # release since v0.5.0 (Jan 2022) and carries bep/punused#6, so read the
+      # pinned tag's source. Its budget is 2 minutes there (30 SECONDS at
+      # v0.5.0), which is why the escalation below is now rare rather than routine.
       #
-      # Three behaviors of v0.5.0 dictate the invocation, all measured on the
-      # fleet:
+      # Three behaviors dictate the invocation, all measured on the fleet:
       #
       # 1. Its one optional argument is a gobwas glob of Go FILENAMES, compiled
       #    with no separator argument so `*` crosses `/`, matched against each
@@ -264,27 +262,39 @@ jobs:
       #    reported upstream as bep/punused#4. Worse, this step used to pass
       #    `./...`, which matches no file at all, so it reported clean fleet-wide
       #    without ever scanning a package.
-      # 2. A run that exceeds the 30s context dies mid-read, and every later
-      #    write fails with `close |1: file already closed`. Filtering that line
-      #    (as this step used to) turns a truncated scan into a clean-looking
-      #    one, so it is now an ESCALATION TRIGGER rather than noise: the
-      #    directory is re-scanned one file at a time, where the budget is never
-      #    in play. Measured: vibekit's internal/api takes 24-27s as one
-      #    directory, i.e. it sits on the cliff edge and trips under load.
-      #    That string is NOT unique to the timeout, which is why the gopls
-      #    preflight below exists: punused prints the same line, instantly, for
-      #    every input when it cannot reach gopls at all. Read as truncation it
-      #    made a missing tool look like a fleet of files each blowing a 30s
-      #    budget in 1ms, and fleet CI stayed red for 50 hours on that reading
-      #    (2026-07-29 → 07-31). Check the cheap, unambiguous cause first and
-      #    let the ambiguous message mean only what is left.
-      # 3. run.go's handleFile does `symbols, err := DocumentSymbol(...)` and, on
-      #    error, constructs an fmt.Errorf it never returns -- so a file whose
-      #    symbol request fails is skipped with no message and no effect on the
-      #    exit code. That one is undetectable from the output, which is the
-      #    other reason to keep each request small: a single file is the least
-      #    the tool can be asked to do. Accepted residual; it cannot be closed
-      #    from outside the tool.
+      # 2. A run that exceeds the context budget dies mid-read. Swallowing that
+      #    turns a truncated scan into a clean-looking one, so it is an
+      #    ESCALATION TRIGGER rather than noise: the directory is re-scanned one
+      #    file at a time, where the budget is never in play. The escalation is
+      #    strictly LESS complete than the scan it replaces (it enumerates
+      #    tracked files only), so rarer is better, which the 2m budget buys.
+      #
+      #    HISTORY, because it is why the preflight below exists: at v0.5.0 the
+      #    dying writes reported `close |1: file already closed`, and punused
+      #    printed that SAME line instantly for every input when it could not
+      #    reach gopls at all. Read as truncation, a missing tool looked like a
+      #    fleet of files each blowing a 30s budget in 1ms, and fleet CI stayed
+      #    red for 50 hours on that reading (2026-07-29 → 07-31). Preserving the
+      #    walk error separated the two -- truncation now says `context deadline
+      #    exceeded` -- so the preflight is a cheap early check rather than the
+      #    only disambiguator. Keep it: it names the cause in one line instead of
+      #    once per directory, and it still holds if the pin is rolled back.
+      # 3. FIXED upstream by the pin above, and the mechanism this comment used
+      #    to name was wrong: handleFile DOES return its `failed to get symbols`
+      #    error, and Run's deferred `err = r.Stop()` then overwrote it
+      #    unconditionally, so the whole walk error was discarded and the run
+      #    exited 0. A file whose symbol request failed was skipped with no
+      #    message. Keeping each request small is still right, for reason 2.
+      #
+      #    What is NOT fixed, and is the deepest hole in the tool: an LSP ERROR
+      #    REPLY decodes as an empty result, because gopls.go's `response` struct
+      #    has no `error` field. documentSymbol then yields zero symbols and the
+      #    file is skipped silently. Upstream of the above, so the fix cannot see
+      #    it. It also cannot be made fatal without reddening repos that have
+      #    done nothing wrong: a build-constrained file (`//go:build !linux`)
+      #    legitimately answers `no package metadata`, and nine such production
+      #    files across web-terminal-engine, vibekit and subflux are never
+      #    scanned today. Still a residual, now a NAMED one.
       #
       # Shards come from `git ls-files`, so untracked third-party Go is out of
       # scope. punused itself skips only dot-directories while walking, and a
@@ -333,12 +343,20 @@ jobs:
             # re-scanned individually; empty means this IS a single file and
             # there is nothing left to split, so the scan is unreliable and the
             # step fails rather than reporting a number it cannot stand behind.
+            # Truncation reports `context deadline exceeded` since v0.5.1;
+            # `close |1: file already closed` was v0.5.0's signature for
+            # truncation AND for an unstartable gopls, which is the ambiguity that
+            # made a missing binary read as every file blowing a 30s budget and held
+            # fleet CI red for 50 hours. Preserving the walk error separated them, so
+            # the old marker now means only the gopls case the preflight screens for.
+            # Both are matched: the pin can be rolled back to v0.5.0 without also
+            # having to remember to restore a marker.
             scan() {
               punused "$1" > "$pshard" 2>&1 || true
-              if grep -q 'file already closed' "$pshard"; then
+              if grep -q 'context deadline exceeded\|file already closed' "$pshard"; then
                 if [ -z "${2:-}" ]; then
                   echo "::error::punused died mid-scan on a single file ($1), which cannot be split further; this scan cannot be trusted."
-                  echo "  gopls is known runnable (preflight passed), so its 30s budget is the likely cause. punused said: $(tr '\n' ' ' < "$pshard")"
+                  echo "  gopls is known runnable (preflight passed), so the 2m budget is the likely cause. punused said: $(tr '\n' ' ' < "$pshard")"
                   truncated=1
                   return 0
                 fi
@@ -348,7 +366,7 @@ jobs:
                 done
                 return 0
               fi
-              grep -v 'file already closed' "$pshard" >> "$praw" || true
+              grep -v 'context deadline exceeded\|file already closed' "$pshard" >> "$praw" || true
             }
 
             for sub in $(git ls-files '*.go' | xargs -r -n1 dirname | sort -u); do
