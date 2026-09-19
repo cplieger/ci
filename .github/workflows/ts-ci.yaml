@@ -122,12 +122,51 @@ jobs:
       # Unused dependencies / exports / files (knip). Config-gated: runs only
       # where a knip config is committed (the repo opts in), via the repo's own
       # pinned knip devDependency — no network install, no floating version.
+      #
+      # The presence test must cover every location knip ITSELF loads, or a repo
+      # that opted in on another form passes locally and is skipped in CI with no
+      # annotation — the vacuous-gate class. The list is KNIP_CONFIG_LOCATIONS in
+      # knip/dist/constants.js (checked against knip 6.35.1) plus package.json#knip,
+      # which util/create-options.js merges over any config file it found. knip
+      # resolves each name with findFile(cwd, name), a plain join + isFile and NOT
+      # a find-up, so the working-directory scope below is the right one.
+      #
+      # Cycles need a SECOND invocation, and no single one can replace the pair.
+      # `cycles` is in knip's defaultExcludedIssueTypes, so a bare run never
+      # reports it; and `--include cycles` RESTRICTS the report to cycles rather
+      # than adding to the defaults, because get-included-issue-types.js only
+      # takes its additive branch when every included type is nsExports/nsTypes
+      # (checked against knip 6.35.1). So one run measures the defaults and the
+      # other measures cycles. Both are needed for a cycle to fail the gate: the
+      # config's `rules: { cycles: error }` promotes it from knip's only
+      # warn-level type, and this flag is what puts it in the report at all —
+      # measured, a real cycle with the rule alone exits 0 and reports nothing.
       - name: Unused deps/exports (knip)
         continue-on-error: true
         run: |
           (
-            if [ -f knip.json ] || [ -f knip.jsonc ] || [ -f knip.config.ts ] || [ -f knip.config.js ]; then
-              npx --no-install knip
+            enrolled=0
+            for cfg in knip.json knip.jsonc .knip.json .knip.jsonc \
+                       knip.ts knip.js knip.config.ts knip.config.js; do
+              if [ -f "$cfg" ]; then
+                enrolled=1
+                break
+              fi
+            done
+            if [ "$enrolled" -eq 0 ] &&
+               node -e 'process.exit(require("./package.json").knip ? 0 : 1)'; then
+              enrolled=1
+            fi
+            if [ "$enrolled" -eq 1 ]; then
+              # Collect both statuses rather than relying on errexit: this
+              # subshell is the left operand of `||`, which SUPPRESSES `set -e`
+              # inside it (measured on bash 5.2.37 under the runner's own
+              # `bash -e {0}`), so a bare two-command body would report only the
+              # LAST command's status and silently swallow a defaults finding.
+              rc=0
+              npx --no-install knip || rc=1
+              npx --no-install knip --include cycles || rc=1
+              [ "$rc" -eq 0 ]
             else
               echo "no knip config; skipping"
             fi
