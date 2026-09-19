@@ -108,6 +108,12 @@ KNOWN_USES = {
     'peter-evans/create-pull-request': ('SKIP', 'PR creation; CI-only, no local equivalent'),
 }
 
+# Referenced both as ./<dir> (in cplieger/ci) and cplieger/ci/<dir>@<sha> (in consumers).
+REPO_AUDIT_ACTIONS = {
+    'actions/comment-audit': ('comment-audit.py', 'Comment ratio'),
+    'actions/notice-audit': ('notice-audit.py', 'NOTICE audit'),
+}
+
 # Step name patterns indicating CI-only setup. Skipped locally.
 INSTALL_NAME_PATTERNS = [
     r'^install\b',
@@ -1028,19 +1034,21 @@ def classify_step(step):
             # as package-dir), and ci-local already runs the step in it. Passing
             # the flag as well resolved static-src/static-src.
             return 'LOCAL', name, f'python3 {shlex.quote(str(script))} --github'
-        if action_ref in ('./actions/comment-audit', 'cplieger/ci/actions/comment-audit'):
-            script = _ci_repo_root(Path.cwd()) / 'actions/comment-audit/comment-audit.py'
+        action_dir = action_ref.removeprefix('./').removeprefix('cplieger/ci/')
+        if action_dir in REPO_AUDIT_ACTIONS:
+            script_name, label = REPO_AUDIT_ACTIONS[action_dir]
+            script = _ci_repo_root(Path.cwd()) / action_dir / script_name
             if not script.is_file():
                 return (
                     'NOLOCAL',
                     name,
-                    'comment-audit.py not found in the sibling ci/ checkout',
+                    f'{script_name} not found in the sibling ci/ checkout',
                 )
             command = f'python3 {shlex.quote(str(script))} --github'
             return (
                 'LOCAL',
                 name,
-                f'( {command} ) || {{ echo "Comment ratio" >> /tmp/_ci_failures; exit 1; }}',
+                f'( {command} ) || {{ echo "{label}" >> /tmp/_ci_failures; exit 1; }}',
             )
         # The required image gates use build-push-action. Native builds use the
         # daemon builder; the arm64 twin uses buildx with an explicit platform.

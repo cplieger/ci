@@ -81,10 +81,14 @@ PYTHON_FILES = """\
 # a committed opt-in marker, since the script only acts on `# repin: dep=...
 # url=...` marker lines it finds -- a Dockerfile with no markers just receives
 # an inert file, avoiding the bootstrap paradox tests/shell/run.sh also avoids.
+# collect-licenses.sh rides the same group: it runs in the builder stage of a
+# Dockerfile that opts in by calling it, and is inert until then.
 REPIN_FILES = """\
     files:
       - source: configs/repin-sha.sh
-        dest: scripts/repin-sha.sh"""
+        dest: scripts/repin-sha.sh
+      - source: configs/collect-licenses.sh
+        dest: scripts/collect-licenses.sh"""
 
 
 TS_CONFIG_FILES = """\

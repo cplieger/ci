@@ -27,8 +27,16 @@ Three failure classes, from one `tsc --listFiles` pass over the entry points:
   undeclared the closure needs a node_modules package that is neither a
              dependency nor a peerDependency.
 
-Exit 0 when every registry's .ts set equals the closure and every external
-edge is declared; 1 otherwise, with each offending path named. A
+A fourth class, attribution, is independent of the closure: LICENSE and NOTICE
+must be in each registry's real file set, and the bytes npm packs must equal
+the package root copies (JSR's dry run lists the root files in place, so
+presence is the whole check there). Package root, not repo root: the repo
+job's notice-audit asserts the package root copies equal the repo root ones.
+npm would ship LICENSE by default and NOTICE never; JSR ships neither unless
+named, so both are listed explicitly.
+
+Exit 0 when every registry's .ts set equals the closure, every external
+edge is declared and both attribution files ship; 1 otherwise, with each offending path named. A
 package.json publishing nothing (no `name`, or `private: true`) is skipped
 with a notice, since ts-ci also runs against app-frontend build manifests.
 
@@ -45,11 +53,14 @@ import json
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 
 # `jsr publish --dry-run` prints one `file:///abs/path (size)` line per file.
 JSR_FILE_LINE = re.compile(r'file://(/[^\s]*?)(?:\s+\([^)]*\))?\s*$')
+
+ATTRIBUTION_FILES = ('LICENSE', 'NOTICE')
 
 # A node_modules path segment -> owning package name, `@scope/name` aware.
 NODE_MODULES_PKG = re.compile(r'.*/node_modules/(?P<name>@[^/]+/[^/]+|[^/@][^/]*)/')
@@ -281,16 +292,30 @@ def compute_closure(pkg_dir: Path, entries: list[Path]) -> tuple[set[Path], set[
     return local, external
 
 
-def npm_shipped(pkg_dir: Path) -> set[Path]:
-    """The exact file set `npm publish` would upload, from npm itself."""
-    proc = run(['npm', 'pack', '--dry-run', '--json'], cwd=pkg_dir)
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise SurfaceError(f'npm pack --json returned non-JSON: {exc}\n{proc.stdout}') from exc
-    if not payload or 'files' not in payload[0]:
-        raise SurfaceError(f'npm pack --json payload missing `files`: {proc.stdout[:400]}')
-    return {Path(entry['path']) for entry in payload[0]['files']}
+def npm_shipped(pkg_dir: Path) -> tuple[set[Path], dict[str, bytes]]:
+    """The exact file set `npm publish` would upload, plus the packed attribution bytes.
+
+    A real pack into a temp dir rather than `--dry-run`: the tarball is what
+    lets the attribution check compare shipped bytes to the package root copy.
+    """
+    with tempfile.TemporaryDirectory(prefix='publish-surface-') as tmp:
+        proc = run(['npm', 'pack', '--json', '--pack-destination', tmp], cwd=pkg_dir)
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise SurfaceError(f'npm pack --json returned non-JSON: {exc}\n{proc.stdout}') from exc
+        if not payload or 'files' not in payload[0] or 'filename' not in payload[0]:
+            raise SurfaceError(f'npm pack --json payload missing `files`: {proc.stdout[:400]}')
+        packed: dict[str, bytes] = {}
+        with tarfile.open(Path(tmp) / payload[0]['filename']) as tar:
+            for name in ATTRIBUTION_FILES:
+                try:
+                    member = tar.extractfile(f'package/{name}')
+                except KeyError:
+                    continue
+                if member is not None:
+                    packed[name] = member.read()
+    return {Path(entry['path']) for entry in payload[0]['files']}, packed
 
 
 def jsr_shipped(pkg_dir: Path) -> set[Path]:
@@ -365,6 +390,41 @@ def report(registry: str, closure: set[Path], shipped: set[Path]) -> list[str]:
     return findings
 
 
+def report_attribution(
+    registry: str, shipped: set[Path], pkg_dir: Path, packed: dict[str, bytes] | None
+) -> list[str]:
+    """LICENSE and NOTICE ship on this registry and match the package root copies.
+
+    `packed` holds the bytes the registry's tooling produced, keyed by file
+    name, when the tooling produces an artifact (npm); None when the tooling
+    lists the root files in place (JSR), where presence is the whole check.
+    """
+    where = {
+        'npm': 'package.json `files`',
+        'jsr': 'jsr.json `publish.include`',
+    }.get(registry, f'the {registry} publish surface')
+    findings: list[str] = []
+    for name in ATTRIBUTION_FILES:
+        source = pkg_dir / name
+        if not source.is_file():
+            findings.append(
+                f'{registry}: attribution: {name} is missing at the package root, so '
+                f'it cannot ship. Copy the repository root {name} to {pkg_dir}/.'
+            )
+            continue
+        if Path(name) not in shipped:
+            findings.append(
+                f'{registry}: attribution: {name} is not in the {registry} file set. '
+                f'List it in {where}; the license text must travel with every copy.'
+            )
+            continue
+        if packed is not None and packed.get(name) != source.read_bytes():
+            findings.append(
+                f'{registry}: attribution: the packed {name} differs from {pkg_dir}/{name}.'
+            )
+    return findings
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Verify the published file set equals the public API's import closure.",
@@ -412,15 +472,19 @@ def main() -> int:
 
         findings: list[str] = []
 
-        npm_set = ts_under_src(npm_shipped(pkg_dir))
+        npm_files, npm_packed = npm_shipped(pkg_dir)
+        npm_set = ts_under_src(npm_files)
         print(f'npm ships:    {len(npm_set)} .ts under src/')
         findings.extend(report('npm', closure, npm_set))
+        findings.extend(report_attribution('npm', npm_files, pkg_dir, npm_packed))
 
         has_jsr = (pkg_dir / 'jsr.json').is_file()
         if has_jsr and not args.skip_jsr:
-            jsr_set = ts_under_src(jsr_shipped(pkg_dir))
+            jsr_files = jsr_shipped(pkg_dir)
+            jsr_set = ts_under_src(jsr_files)
             print(f'jsr ships:    {len(jsr_set)} .ts under src/')
             findings.extend(report('jsr', closure, jsr_set))
+            findings.extend(report_attribution('jsr', jsr_files, pkg_dir, None))
         elif has_jsr:
             print('jsr ships:    skipped (--skip-jsr)')
         else:
@@ -449,7 +513,9 @@ def main() -> int:
         return 1
 
     if not findings:
-        print("\nOK: every registry publishes exactly the public API's closure.")
+        print(
+            "\nOK: every registry publishes exactly the public API's closure plus LICENSE and NOTICE."
+        )
         return 0
 
     print(f'\n{len(findings)} finding(s):', file=sys.stderr)

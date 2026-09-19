@@ -102,6 +102,15 @@ on:
         description: "'image' scans the pushed image; 'path' extracts binary to /tmp/sbom-src first."
         type: string
         default: "image"
+      image-licenses:
+        description: >-
+          SPDX expression for org.opencontainers.image.licenses, covering
+          everything the image ships (the caller's policy step resolves it per
+          repo). Empty keeps metadata-action's default, the repository's own
+          spdx_id. Set here, at build time, because a build-time --label
+          overrides a Dockerfile LABEL of the same key.
+        type: string
+        default: ""
       skip-if-unchanged:
         description: >-
           When true (staleness-dispatched rebuilds only), compare the freshly
@@ -238,6 +247,8 @@ jobs:
             type=raw,value=${{ steps.tags.outputs.major }},priority=300
             type=raw,value=${{ steps.tags.outputs.minor }},priority=200
             type=raw,value=${{ steps.tags.outputs.version }},priority=100
+          labels: |
+            ${{ inputs.image-licenses && format('org.opencontainers.image.licenses={0}', inputs.image-licenses) || '' }}
 
       - name: Extract metadata (GHCR only)
         if: ${{ !contains(inputs.registries, 'dockerhub') }}
@@ -252,6 +263,8 @@ jobs:
             type=raw,value=${{ steps.tags.outputs.major }},priority=300
             type=raw,value=${{ steps.tags.outputs.minor }},priority=200
             type=raw,value=${{ steps.tags.outputs.version }},priority=100
+          labels: |
+            ${{ inputs.image-licenses && format('org.opencontainers.image.licenses={0}', inputs.image-licenses) || '' }}
 
       - name: Consolidate metadata outputs
         id: meta
