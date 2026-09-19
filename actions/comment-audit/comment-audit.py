@@ -89,6 +89,7 @@ SYNCED_PATHS = {
     'tests/shell/lib.sh',
     'tests/shell/harness_test.sh',
     'scripts/repin-sha.sh',
+    'scripts/collect-licenses.sh',
 }
 HEREDOC_RE = re.compile(
     r"""(?<!<)<<-?\s*(?:
@@ -201,7 +202,7 @@ def exclusion(path: Path, text: str) -> str | None:
     header = '\n'.join(text.splitlines()[:10])
     if GENERATED_HEADER.search(header) and DO_NOT_EDIT.search(header):
         return 'generated/vendor'
-    # Before the test_source early-return: three of the four synced paths live
+    # Before the test_source early-return: three of the synced paths live
     # under tests/, which that branch admits.
     if path.as_posix() in SYNCED_PATHS:
         return 'synced from cplieger/ci'

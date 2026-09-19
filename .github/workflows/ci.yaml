@@ -544,6 +544,17 @@ jobs:
         continue-on-error: true
         uses: cplieger/ci/actions/comment-audit@b6e169c856fc7f3f851557ba238ae6bed0d57175 # v2
 
+      # No denylist, unlike comment-audit: a NOTICE is owed by every repo. The
+      # consumer-facing twin (a pinned `cplieger/ci/actions/notice-audit@<sha>`
+      # step guarded by `github.repository != 'cplieger/ci'`) lands in a second
+      # PR once a tag carries this directory: the runner resolves every `uses:`
+      # at job setup, before any `if:`, so a reference to an action that no
+      # reachable tag holds fails the whole job (ci.md "Composite actions").
+      - name: NOTICE audit
+        if: ${{ github.repository == 'cplieger/ci' }}
+        continue-on-error: true
+        uses: ./actions/notice-audit
+
       - name: Check results
         if: always()
         run: |
@@ -581,7 +592,7 @@ jobs:
       - name: Lint Markdown
         run: |
           markdownlint-cli2 --config "$RUNNER_TEMP/.markdownlint.json" \
-            "**/*.md" "#node_modules" "#.git"
+            "**/*.md" "#node_modules" "#.git" "#licenses"
 
       # NO spell check here, decided 2026-08 after measuring it. A `typos` gate
       # shipped opt-in by a committed `_typos.toml`, and no repo ever committed
@@ -870,6 +881,33 @@ jobs:
               echo "no comment-ratio probe in this repo - skipping"
             fi
           ) || { echo "Probe comment-ratio gate" >> /tmp/_ci_failures; exit 1; }
+
+      # The NOTICE gate does run here (no denylist), but only against this
+      # repo's own NOTICE; the probe is what exercises its refusals.
+      - name: Probe NOTICE gate
+        continue-on-error: true
+        run: |
+          (
+            if [ -f scripts/test-notice-audit.py ]; then
+              python3 scripts/test-notice-audit.py
+            else
+              echo "no NOTICE probe in this repo - skipping"
+            fi
+          ) || { echo "Probe NOTICE gate" >> /tmp/_ci_failures; exit 1; }
+
+      # configs/collect-licenses.sh runs in consumers' image builds and never
+      # in this repo, so its fail-closed contract is measured here or nowhere.
+      # Go is on the runner image; the fixture module needs no network.
+      - name: Probe license collector
+        continue-on-error: true
+        run: |
+          (
+            if [ -f scripts/test-collect-licenses.sh ]; then
+              bash scripts/test-collect-licenses.sh
+            else
+              echo "no license-collector probe in this repo - skipping"
+            fi
+          ) || { echo "Probe license collector" >> /tmp/_ci_failures; exit 1; }
 
       - name: Check results
         if: always()

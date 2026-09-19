@@ -214,6 +214,8 @@ def test_excluded_paths() -> None:
         'a.example.sh': 'config/example',
         'tests/image-smoke.sh': 'synced from cplieger/ci',
         'tests/shell/lib.sh': 'synced from cplieger/ci',
+        'scripts/repin-sha.sh': 'synced from cplieger/ci',
+        'scripts/collect-licenses.sh': 'synced from cplieger/ci',
     }
     for name, reason in cases.items():
         got = CA.exclusion(Path(name), '')
@@ -233,7 +235,7 @@ def test_generated_header_needs_both_markers() -> None:
 
 
 def test_synced_path_beats_the_test_directory_rule() -> None:
-    # Three of the four synced paths live under tests/, which the test-source
+    # Three of the synced paths live under tests/, which the test-source
     # branch admits — so their check has to come first or they are measured.
     check(
         'a synced path under tests/ is still excluded',

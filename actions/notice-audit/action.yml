@@ -1,0 +1,17 @@
+name: notice-audit
+description: >-
+  Fail when the root NOTICE is missing or departs from the three-line template
+  (repo name, `Copyright <year> cplieger`, repo URL, optionally one extra block
+  after one blank line), or when a published package root below the repo root
+  (a jsr.json, a named non-private package.json, a nested go.mod) does not carry
+  byte-identical copies of LICENSE and NOTICE.
+
+runs:
+  using: composite
+  steps:
+    - name: Audit NOTICE files
+      shell: bash
+      run: |
+        (
+          python3 "${GITHUB_ACTION_PATH}/notice-audit.py" --github
+        ) || { echo "NOTICE audit" >> /tmp/_ci_failures; exit 1; }

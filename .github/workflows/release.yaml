@@ -108,6 +108,7 @@ jobs:
       platforms: ${{ steps.policy.outputs.platforms }}
       sbom_from: ${{ steps.policy.outputs.sbom_from }}
       syft_config: ${{ steps.policy.outputs.syft_config }}
+      image_licenses: ${{ steps.policy.outputs.image_licenses }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -710,6 +711,7 @@ jobs:
         id: policy
         env:
           REPO_NAME: ${{ github.event.repository.name }}
+          REPO_SPDX_ID: ${{ github.event.repository.license.spdx_id }}
         run: |
           # Per-repo policy overrides. Centralized here, NOT per-repo config.
           # When you need to change a repo's release behavior, edit this step.
@@ -721,9 +723,47 @@ jobs:
           #   syft_config = ".syft.yaml" if file exists at root, else ""
           #                 (back-compat for repo-SPECIFIC syft needs only;
           #                 the sbom-cataloger is centrally enabled — see below)
+          #   image_licenses = the repo's own SPDX id, spelled -or-later for the
+          #                 GNU family (GitHub's spdx_id cannot express it)
           REGISTRIES="ghcr,dockerhub"
           PLATFORMS="linux/amd64,linux/arm64"
           SBOM_FROM="image"
+          case "$REPO_SPDX_ID" in
+            ''|NOASSERTION) IMAGE_LICENSES="" ;;
+            GPL-*|AGPL-*|LGPL-*) IMAGE_LICENSES="${REPO_SPDX_ID}-or-later" ;;
+            *) IMAGE_LICENSES="$REPO_SPDX_ID" ;;
+          esac
+
+          # org.opencontainers.image.licenses covers EVERYTHING in the image, so
+          # a wrapper carries its upstream's license too; a Go app whose deps
+          # are all permissive keeps its own id (attribution.md section 5).
+          # Per-entry evidence: ci-cd.md "Per-repo policy", image_licenses row.
+          case "$REPO_NAME" in
+            docker-rsync-scheduler)
+              IMAGE_LICENSES="Apache-2.0 AND GPL-3.0-or-later" ;;
+            docker-keepalived)
+              IMAGE_LICENSES="Apache-2.0 AND GPL-2.0-or-later" ;;
+            docker-nut-upsd)
+              IMAGE_LICENSES="Apache-2.0 AND GPL-2.0-or-later AND LGPL-2.1-or-later AND BSD-3-Clause AND MIT-CMU AND MIT" ;;
+            docker-renovate-scheduler)
+              IMAGE_LICENSES="Apache-2.0 AND AGPL-3.0-only" ;;
+            docker-smtp-relay)
+              IMAGE_LICENSES="Apache-2.0 AND (EPL-2.0 OR IPL-1.0)" ;;
+            docker-radvd)
+              IMAGE_LICENSES="Apache-2.0 AND BSD-4-Clause" ;;
+            docker-caddy)
+              IMAGE_LICENSES="Apache-2.0" ;;
+            docker-age)
+              IMAGE_LICENSES="Apache-2.0 AND BSD-3-Clause" ;;
+            docker-fclones-scheduler)
+              IMAGE_LICENSES="Apache-2.0 AND MIT" ;;
+            subflux)
+              IMAGE_LICENSES="AGPL-3.0-or-later AND GPL-2.0-or-later" ;;
+            vibekit)
+              IMAGE_LICENSES="AGPL-3.0-or-later AND OFL-1.1" ;;
+            web-terminal-kiro|web-terminal-server)
+              IMAGE_LICENSES="MPL-2.0 AND OFL-1.1" ;;
+          esac
 
           # Every image repo dual-publishes; there is no GHCR-only set. The
           # last two exemptions (subflux, vibekit) were removed 2026-08-21 —
@@ -757,9 +797,10 @@ jobs:
             echo "platforms=$PLATFORMS"
             echo "sbom_from=$SBOM_FROM"
             echo "syft_config=$SYFT_CONFIG"
+            echo "image_licenses=$IMAGE_LICENSES"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS sbom_from=$SBOM_FROM syft_config='$SYFT_CONFIG'"
+          echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS sbom_from=$SBOM_FROM syft_config='$SYFT_CONFIG' image_licenses='$IMAGE_LICENSES'"
 
   # ─── Docker image build + sign + SBOM + release (delegated) ────────────────
   docker:
@@ -785,6 +826,7 @@ jobs:
       platforms: ${{ needs.detect.outputs.platforms }}
       sbom-from: ${{ needs.detect.outputs.sbom_from }}
       syft-config: ${{ needs.detect.outputs.syft_config }}
+      image-licenses: ${{ needs.detect.outputs.image_licenses }}
       # Effective no-op-skip flag: an explicit workflow_call input (direct
       # callers) OR the consumer stub's own workflow_dispatch input. The
       # github context inside a reusable workflow is the CALLER's, so the

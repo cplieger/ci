@@ -341,7 +341,10 @@ AUDIT_UA = "Mozilla/5.0 (compatible; cplieger-governance-audit)"
 # receives repin-sha.sh. Opt-in synced files (image-smoke.sh, shell/lib.sh) are
 # deliberately absent: a repo that never opted in has no copy, and "absent" must
 # not read as drift.
-SYNCED_BYTE_IDENTICAL = {"scripts/repin-sha.sh": "configs/repin-sha.sh"}
+SYNCED_BYTE_IDENTICAL = {
+    "scripts/repin-sha.sh": "configs/repin-sha.sh",
+    "scripts/collect-licenses.sh": "configs/collect-licenses.sh",
+}
 
 _canonical_cache = {}
 
