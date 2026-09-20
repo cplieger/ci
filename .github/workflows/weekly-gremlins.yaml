@@ -76,7 +76,7 @@ jobs:
           GO_REPOS=()
           for r in $repos; do
             gh api "/repos/cplieger/${r}/contents/go.mod" --silent 2>/dev/null || continue
-            loc=$(gh api "/repos/cplieger/${r}/git/trees/main?recursive=1" \
+            loc=$(gh api "/repos/cplieger/${r}/git/trees/HEAD?recursive=1" \
               --jq '[.tree[] | select(.type=="blob" and (.path | test("\\.go$") and (test("_test\\.go$") | not)))] | map(.size // 0) | add // 0' 2>/dev/null)
             # Bytes ~ 50/line for typical Go; 200 LOC ≈ 10000 bytes
             if [ "${loc:-0}" -ge 10000 ]; then

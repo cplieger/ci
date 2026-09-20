@@ -1,49 +1,42 @@
-# Reusable Docker build/sign/SBOM/release workflow.
-#
-# This workflow is exclusively called by cplieger/ci/.github/workflows/release.yaml
-# (the unified central pipeline). It does NOT run cliff or detect changes — those
-# decisions are made centrally and passed in as `version` + `release-needed`.
-#
-# Pipeline:
-#   1. prepare:  derive tags from `version`, build per-arch matrix, run metadata-action
-#   2. build:    matrix over linux/amd64+linux/arm64 on native runners (no QEMU);
-#                push each arch by digest, upload digest artifact
-#   3. finalize: download digests → assemble multi-arch manifest via imagetools
-#                → cosign sign+attest → SBOM → Trivy → dashboard OCI artifact
-#                (repos with a root grafana-dashboard.json) → GitHub Release
-#                (gated on `release-needed`; SBOM and dashboard assets) → Docker
-#                Hub overview/description sync
-#   4. verify-publish: read the version tag back from GHCR and Docker Hub and
-#                fail the run unless it carries this run's manifest digest
-#
-# EVERY vulnerability scan in this pipeline is advisory. A blocking `CVE release
-# gate` lived in step 2 for five hours on 2026-08-28 and was withdrawn on its
-# first firing: `ignore-unfixed` proves a fix EXISTS, never that the releaser can
-# apply it, and these images are thin wrappers over third-party bases, so the
-# dominant finding is a fixable CVE in something we do not build. That is exactly
-# the shape the fleet's own rule forbids gating on — a check must not go red
-# without anyone changing the code or the checker. Do not re-add it without first
-# answering how a base-image finding gets fixed, since a veto that cannot be
-# satisfied blocks the release AND the stranded-release repair behind it.
-#
-# When called with skip-if-unchanged=true (staleness-dispatched rebuilds only),
-# a no-change publish gate runs in finalize BEFORE the manifest is created: if
-# no release is warranted, the fresh image was built from the same source
-# revision as :latest, AND its package inventory is identical to the SBOM
-# attestation on :latest, every publish step is skipped, so a no-op rebuild
-# moves no tags and churns no digests. A skipped run still refreshes the
-# Trivy/SARIF scan and the shipped-versions summary. See the gate step.
+# Reusable Docker publish workflow, called only by release.yaml, which passes
+# the channel, the version and whether a release is due. dev: build once on
+# native amd64 and arm64 runners, push to GHCR as `:<dev-version>`, `:dev` and
+# `:sha-<commit>`, sign, attest the SBOM, scan, create the dev git tag. stable:
+# no build; re-tag the digest the dev channel built for this commit (or for the
+# nearest ancestor with no shipped change since; else build from source and
+# say so) as `:vX.Y.Z`, `:vX.Y`, `:vX`, `:latest`, copy it to Docker Hub with
+# its referrers, re-scan, GitHub Release. Every vulnerability scan is advisory.
 name: Docker Release
 
 on:
   workflow_call:
     inputs:
-      version:
-        description: "SemVer tag computed by the caller (e.g. v1.2.3). Required."
+      channel:
+        description: "'dev' or 'stable', selected by the caller from the branch. Required."
         type: string
         required: true
+      version:
+        description: "Stable SemVer version computed by the caller (e.g. v1.2.3), on both channels. Required."
+        type: string
+        required: true
+      dev-version:
+        description: "The dev-channel tag for this build (e.g. v1.2.3-dev.4). Required on the dev channel."
+        type: string
+        default: ""
+      latest:
+        description: "The newest stable tag before this run, for the release-notes fallback. Empty when none."
+        type: string
+        default: ""
+      exclude-re:
+        description: >-
+          The caller's joined exclusion regex (grep -E). The stable channel
+          walks first-parent ancestors for a dev build to promote and accepts
+          one only when no path outside this regex changed since. Empty
+          accepts an exact `sha-<commit>` hit only.
+        type: string
+        default: ""
       release-needed:
-        description: "Whether to create a GitHub Release (cliff bump warranted). 'true' or 'false'."
+        description: "'true' when a new version is due (a dev tag on dev, a Release on stable)."
         type: string
         required: true
       go-modules:
@@ -62,16 +55,12 @@ on:
         description: >-
           'true' when the caller's detect job found this commit already
           tagged at the computed version WITHOUT a GitHub Release (a prior
-          run died between tag creation and Release creation — the release
-          event never fired, so its consumers, e.g. the Komodo hook that
-          expedites a Renovate scan, missed it). The release steps then run
-          despite release-needed=false, rendering notes via --current and
-          repairing only the missing Release; the tag guard's
-          exists-at-same-SHA path passes through untouched. A finalize
-          rerun still REBUILDS and re-pushes the image like any rerun of
-          this workflow — accepted: tags simply move to the fresh build of
-          the same source, and the prior digests stay valid in the
-          registry.
+          run died between tag creation and Release creation). Stable
+          channel only. The publish steps then run despite
+          release-needed=false: the image is promoted or rebuilt and re-tagged
+          like any rerun, the notes render via --current, the tag guard's
+          exists-at-same-SHA path passes through, and the missing Release is
+          created.
         type: string
         default: "false"
       image-name:
@@ -102,6 +91,13 @@ on:
         description: "'image' scans the pushed image; 'path' extracts binary to /tmp/sbom-src first."
         type: string
         default: "image"
+      promotion-note:
+        description: >-
+          A sentence appended to the stable release notes (the caller reads it
+          off the promoted commit's `promotion/soak-override` status). Empty
+          appends nothing.
+        type: string
+        default: ""
       image-licenses:
         description: >-
           SPDX expression for org.opencontainers.image.licenses, covering
@@ -111,17 +107,6 @@ on:
           overrides a Dockerfile LABEL of the same key.
         type: string
         default: ""
-      skip-if-unchanged:
-        description: >-
-          When true (staleness-dispatched rebuilds only), compare the freshly
-          built image against ghcr.io/<image>:latest (source revision label
-          AND SBOM package inventory) and skip every publish step (manifest,
-          tags, signatures, attestations, Docker Hub, GitHub Release) when
-          both are identical. Never skips a warranted release
-          (release-needed=true). Fail-open: any fetch/parse problem publishes
-          normally.
-        type: boolean
-        default: false
     secrets:
       DOCKERHUB_USERNAME:
         required: false
@@ -151,29 +136,11 @@ env:
   COSIGN_VERSION: v3.1.3
   # renovate: datasource=github-releases depName=aquasecurity/trivy
   TRIVY_VERSION: v0.75.0
-  # syft for the no-change publish gate, pinned to the version bundled by the
-  # anchore/sbom-action pin below (v0.24.0 bundles syft v1.42.3) so the gate's
-  # fresh scan sees the same package inventory the attested baseline SBOM was
-  # generated with. Tuple-level compare tolerates small drift, and any
-  # mismatch fails open (publishes).
-  # renovate: datasource=github-releases depName=anchore/syft
-  SYFT_VERSION: v1.52.0
-  # Central SBOM cataloger policy: enable syft's sbom-cataloger — NOT in its
-  # default image cataloger set — for EVERY syft scan in this workflow, so a
-  # CycloneDX fragment embedded in an image by a source-compiling repo (e.g.
-  # docker-nut-upsd) is inventoried without a per-repo .syft.yaml. Harmless
-  # for images without embedded fragments (the cataloger finds nothing).
-  # Workflow-level env reaches both the anchore/sbom-action steps (the action
-  # spawns syft with the step's process env) and the no-change gate's fresh
-  # syft run below. INVARIANT (load-bearing): the attested SBOM and the
-  # staleness gate's fresh scan MUST use identical cataloger policy — the
-  # gate compares package tuples between the two, and a one-sided cataloger
-  # would make every embedded-fragment image look permanently changed (or
-  # changes invisible). Precedence (per anchore's configuration rules: CLI >
-  # env > config file): this env var overrides a `select-catalogers` key in
-  # any repo .syft.yaml, so a repo file left over from the pre-central era
-  # (they carried exactly this value) is redundant but never conflicting;
-  # other keys in a repo config still apply.
+  # Central SBOM cataloger policy: syft's sbom-cataloger is NOT in its default
+  # image cataloger set, and a CycloneDX fragment embedded by a source-compiling
+  # image (docker-nut-upsd) is inventoried only with it. The action spawns syft
+  # with the step's process env; env outranks a `select-catalogers` key in a
+  # repo .syft.yaml (anchore precedence: CLI > env > config file).
   SYFT_SELECT_CATALOGERS: "+sbom-cataloger"
 
 # Top-level read-only (least privilege); each job below
@@ -184,7 +151,7 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-26.04
-    timeout-minutes: 3
+    timeout-minutes: 5
     permissions:
       contents: read
     outputs:
@@ -194,27 +161,94 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       version: ${{ steps.tags.outputs.version }}
       major: ${{ steps.tags.outputs.major }}
+      minor: ${{ steps.tags.outputs.minor }}
+      tag: ${{ steps.tags.outputs.tag }}
+      publish: ${{ steps.tags.outputs.publish }}
+      promote_digest: ${{ steps.promote.outputs.promote_digest }}
+      promote_source: ${{ steps.promote.outputs.promote_source }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
       - name: Derive version tags
         id: tags
         env:
+          CHANNEL: ${{ inputs.channel }}
           VERSION_INPUT: ${{ inputs.version }}
+          DEV_VERSION: ${{ inputs.dev-version }}
+          RELEASE_NEEDED: ${{ inputs.release-needed }}
+          FINALIZE: ${{ inputs.finalize }}
         run: |
+          set -euo pipefail
+          case "$CHANNEL" in
+            dev | stable) ;;
+            *)
+              echo "::error::channel must be 'dev' or 'stable', got '${CHANNEL}'"
+              exit 1
+              ;;
+          esac
           # Strip leading 'v' for arithmetic, then re-emit each tier with 'v' prefix.
           VERSION="${VERSION_INPUT#v}"
           MAJOR="${VERSION%%.*}"
           MINOR="${VERSION%.*}"
+          # `tag` is the one tag this run owns on its channel; `publish` is
+          # whether any registry write happens at all. On dev nothing is
+          # published unless a new dev version is due, so a rerun at an
+          # already-tagged commit cannot mint a second dev version for it.
+          if [ "$CHANNEL" = "dev" ]; then
+            if [ -z "$DEV_VERSION" ]; then
+              echo "::error::the dev channel needs the dev-version input"
+              exit 1
+            fi
+            TAG="$DEV_VERSION"
+            PUBLISH="$RELEASE_NEEDED"
+          else
+            TAG="v${VERSION}"
+            PUBLISH=false
+            if [ "$RELEASE_NEEDED" = "true" ] || [ "$FINALIZE" = "true" ]; then
+              PUBLISH=true
+            fi
+          fi
+          [ "$PUBLISH" = "true" ] || PUBLISH=false
+          # metadata-action tag rules per channel; the highest priority one
+          # becomes org.opencontainers.image.version, so the channel's own
+          # version tag leads on both channels.
+          if [ "$CHANNEL" = "dev" ]; then
+            META_TAGS=$(printf '%s\n' \
+              "type=raw,value=${TAG},priority=500" \
+              "type=raw,value=dev,priority=400" \
+              "type=sha,format=long,priority=100")
+          else
+            META_TAGS=$(printf '%s\n' \
+              "type=raw,value=v${VERSION},priority=500" \
+              "type=raw,value=latest,priority=400" \
+              "type=raw,value=v${MAJOR},priority=300" \
+              "type=raw,value=v${MINOR},priority=200" \
+              "type=sha,format=long,priority=100")
+          fi
           {
             echo "version=v${VERSION}"
             echo "major=v${MAJOR}"
             echo "minor=v${MINOR}"
+            echo "tag=${TAG}"
+            echo "publish=${PUBLISH}"
+            echo "meta_tags<<EOF"
+            echo "$META_TAGS"
+            echo "EOF"
           } >> "$GITHUB_OUTPUT"
+          echo "channel=${CHANNEL} tag=${TAG} publish=${PUBLISH}"
 
       - name: Compute build matrix
         id: matrix
         env:
           PLATFORMS: ${{ inputs.platforms }}
         run: |
+          set -euo pipefail
           # Map each platform to a native GitHub-hosted runner.
           # linux/arm* → ubuntu-24.04-arm; everything else → ubuntu-24.04.
           # Emit a JSON array consumed by the build job's strategy.matrix.
@@ -233,70 +267,95 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "Matrix: $matrix"
 
-      - name: Extract metadata (GHCR + Docker Hub)
-        if: ${{ contains(inputs.registries, 'dockerhub') }}
-        id: meta-dual
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            docker.io/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,format=long,priority=500
-            type=raw,value=latest,priority=400
-            type=raw,value=${{ steps.tags.outputs.major }},priority=300
-            type=raw,value=${{ steps.tags.outputs.minor }},priority=200
-            type=raw,value=${{ steps.tags.outputs.version }},priority=100
-          labels: |
-            ${{ inputs.image-licenses && format('org.opencontainers.image.licenses={0}', inputs.image-licenses) || '' }}
-
-      - name: Extract metadata (GHCR only)
-        if: ${{ !contains(inputs.registries, 'dockerhub') }}
-        id: meta-ghcr
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,format=long,priority=500
-            type=raw,value=latest,priority=400
-            type=raw,value=${{ steps.tags.outputs.major }},priority=300
-            type=raw,value=${{ steps.tags.outputs.minor }},priority=200
-            type=raw,value=${{ steps.tags.outputs.version }},priority=100
-          labels: |
-            ${{ inputs.image-licenses && format('org.opencontainers.image.licenses={0}', inputs.image-licenses) || '' }}
-
-      - name: Consolidate metadata outputs
-        id: meta
+      # The stable channel never rebuilds what the dev channel already built
+      # and soak-tested: this commit's `sha-<commit>` tag, or the nearest
+      # first-parent ancestor's when every path changed since is excluded from
+      # significance. Read through the anonymous distribution API (the images
+      # are public), so no registry login happens before anything is written.
+      - name: Resolve promoted digest
+        id: promote
+        if: ${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' }}
         env:
-          DUAL_TAGS: ${{ steps.meta-dual.outputs.tags }}
-          DUAL_LABELS: ${{ steps.meta-dual.outputs.labels }}
-          DUAL_JSON: ${{ steps.meta-dual.outputs.json }}
-          GHCR_TAGS: ${{ steps.meta-ghcr.outputs.tags }}
-          GHCR_LABELS: ${{ steps.meta-ghcr.outputs.labels }}
-          GHCR_JSON: ${{ steps.meta-ghcr.outputs.json }}
+          EXCLUDE_RE: ${{ inputs.exclude-re }}
         run: |
-          # Pick whichever metadata variant ran (only one of the two `if:`-gated
-          # steps above produces output for a given run).
-          if [ -n "$DUAL_TAGS" ]; then
-            TAGS="$DUAL_TAGS"; LABELS="$DUAL_LABELS"; JSON="$DUAL_JSON"
-          else
-            TAGS="$GHCR_TAGS"; LABELS="$GHCR_LABELS"; JSON="$GHCR_JSON"
+          set -euo pipefail
+          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors \
+            -o "$RUNNER_TEMP/ghcr-token.json" "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull"
+          token=$(jq -r .token "$RUNNER_TEMP/ghcr-token.json")
+          digest_of_sha() { # <commit> -> index digest of :sha-<commit>, or nothing
+            curl -fsSI --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/sha-$1" 2>/dev/null |
+              tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }'
+          }
+          # Every first-parent commit is judged on its own diff, not the
+          # endpoints': a shipped change that a later commit reverts leaves the
+          # trees equal, yet the ancestor's image names the wrong revision.
+          # package.json is never significant for a docker-type repo
+          # (release.yaml's refinement), so it joins the exclusions here.
+          walk_is_pure() { # <from> <to> -> 0 when no commit in from..to changes a shipped path
+            local c changed
+            while IFS= read -r c; do
+              [ -z "$c" ] && continue
+              changed=$(git diff --name-only "${c}^" "$c")
+              if [ -z "$changed" ]; then
+                echo "::notice::commit ${c} changes no file (a forced rebuild); building from source"
+                return 1
+              fi
+              if printf '%s\n' "$changed" | grep -Eqv "${EXCLUDE_RE}|(^|/)package\.json$"; then
+                echo "::notice::commit ${c} changes a shipped path; building from source"
+                return 1
+              fi
+            done < <(git rev-list --first-parent "$1..$2")
+            return 0
+          }
+          DIGEST=$(digest_of_sha "$GITHUB_SHA" || true)
+          SOURCE="$GITHUB_SHA"
+          # --max-count is promote.py's SOAK_WALK_COMMITS: the soak is never
+          # read from a build this walk could not reach.
+          if [ -z "$DIGEST" ] && [ -n "$EXCLUDE_RE" ]; then
+            while IFS= read -r c; do
+              [ -z "$c" ] && continue
+              d=$(digest_of_sha "$c" || true)
+              [ -z "$d" ] && continue
+              if walk_is_pure "$c" "$GITHUB_SHA"; then
+                DIGEST="$d"
+                SOURCE="$c"
+              fi
+              break
+            done < <(git rev-list --first-parent --skip=1 --max-count=200 "$GITHUB_SHA")
           fi
           {
-            echo "tags<<EOF"
-            echo "$TAGS"
-            echo "EOF"
-            echo "labels<<EOF"
-            echo "$LABELS"
-            echo "EOF"
-            echo "json<<EOF"
-            echo "$JSON"
-            echo "EOF"
+            echo "promote_digest=${DIGEST}"
+            echo "promote_source=${SOURCE}"
           } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Promotion"
+            echo ""
+            if [ -n "$DIGEST" ]; then
+              echo "Promoting the image the dev channel built for \`${SOURCE}\` (digest \`${DIGEST}\`); nothing is rebuilt."
+            else
+              echo "No dev build could be reused for \`${GITHUB_SHA}\`; the image builds from source."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "promote_digest=${DIGEST:-<none>} source=${SOURCE}"
 
+      - name: Extract metadata
+        if: ${{ steps.tags.outputs.publish == 'true' && steps.promote.outputs.promote_digest == '' }}
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: ${{ steps.tags.outputs.meta_tags }}
+          labels: |
+            ${{ inputs.image-licenses && format('org.opencontainers.image.licenses={0}', inputs.image-licenses) || '' }}
+
+  # Builds only when something is published and no dev digest is being
+  # promoted in its place.
   build:
     needs: prepare
+    if: ${{ needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.promote_digest == '' }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -316,36 +375,19 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
-      # BuildKit restores a cached RUN layer verbatim, so a Dockerfile's
-      # `apt-get upgrade` / `apk upgrade` stops re-running for as long as that
-      # layer stays in the GHA cache, and the image keeps shipping the packages
-      # that were current when the layer was FIRST built. Measured 2026-08-16:
-      # web-terminal-kiro v2.11.1 was built on 08-15 but carried an apt layer
-      # from 08-05, shipping util-linux/unzip/jq versions Debian had already
-      # issued security updates for. `rebuild-stale.yaml` cannot catch this —
-      # its clock resets on every release, so an actively released repo never
-      # reaches the staleness threshold at all.
-      #
-      # A Dockerfile opts in to each build-arg by DECLARING it and REFERENCING
-      # it in the layer that needs it; a Dockerfile declaring neither gets no
-      # build-arg at all, which keeps BuildKit from warning about an unconsumed
-      # argument on the distroless/scratch images that ship no OS packages.
-      # The reference is load-bearing for both, for the same reason and with
-      # different consequences: BuildKit keys a RUN on the build args it
-      # actually consumes, so a merely-declared PKG_REFRESH leaves the stale
-      # layer in place, and a merely-declared BUILD_VERSION never reaches the
-      # command that stamps it.
-      #
-      # PKG_REFRESH is today's UTC date, so a package layer rebuilds at most
-      # once a day while every later build the same day still hits cache.
-      # BUILD_VERSION is this release's tag; a build that receives none ships
-      # whatever fallback its own source declares, so a released image reports
-      # a version indistinguishable from a developer's local build.
+      # BuildKit restores a cached RUN layer verbatim, so a package layer keeps
+      # shipping the packages current when it was FIRST built; PKG_REFRESH is
+      # today's UTC date, so it rebuilds at most once a day. A Dockerfile opts
+      # in to each build-arg by declaring AND referencing it: BuildKit keys a
+      # RUN on the args it consumes, so a merely-declared PKG_REFRESH leaves
+      # the stale layer in place and a merely-declared BUILD_VERSION never
+      # reaches the command that stamps it. BUILD_VERSION is this run's tag on
+      # its channel (vX.Y.Z-dev.N on dev), never a dev build's future stable.
       - name: Resolve build args
         id: buildargs
         env:
           DOCKERFILE: ${{ inputs.dockerfile }}
-          VERSION: ${{ inputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           declares() { grep -qE "^[[:space:]]*ARG[[:space:]]+$1([[:space:]=]|\$)" "$DOCKERFILE"; }
@@ -354,7 +396,7 @@ jobs:
             args+=("PKG_REFRESH=$(date -u +%Y-%m-%d)")
           fi
           if declares BUILD_VERSION; then
-            args+=("BUILD_VERSION=${VERSION}")
+            args+=("BUILD_VERSION=${TAG}")
           fi
           if [ "${#args[@]}" -eq 0 ]; then
             echo "No opted-in ARG in ${DOCKERFILE}; passing no build-args."
@@ -381,13 +423,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Log in to Docker Hub
-        if: ${{ contains(inputs.registries, 'dockerhub') }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -410,10 +445,8 @@ jobs:
           # push-by-digest writes the per-arch image under a digest-only ref, with
           # no human-readable tags at this stage. The finalize job assembles the
           # multi-arch manifest at the user-facing tags by referencing these
-          # digests. The destination is GHCR ONLY: an image exporter pushes to the
-          # registries named in `name`, and this names one. The Docker Hub login
-          # above grants credentials for finalize's own push; it does not add an
-          # exporter destination here.
+          # digests. The destination is GHCR ONLY: Docker Hub receives a copy of
+          # the finished index at promotion, never a build.
           outputs: |
             type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.name }}
@@ -430,6 +463,7 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
           ARCH_NAME: ${{ matrix.name }}
         run: |
+          set -euo pipefail
           mkdir -p /tmp/digests
           # Filename = matrix.name (e.g. linux-amd64); content = the digest.
           echo "$DIGEST" > "/tmp/digests/${ARCH_NAME}"
@@ -441,19 +475,28 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Runs whether or not `build` did (a promotion has no build; a stable push
+  # with nothing to publish still refreshes the Docker Hub description).
   finalize:
     needs: [prepare, build]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.build.result != 'failure' && needs.build.result != 'cancelled' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: write
+      statuses: write
       packages: write
       id-token: write
       attestations: write
       security-events: write
+    env:
+      PUBLISH: ${{ needs.prepare.outputs.publish }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      PROMOTE_DIGEST: ${{ needs.prepare.outputs.promote_digest }}
     outputs:
       digest: ${{ steps.manifest.outputs.digest }}
       version: ${{ needs.prepare.outputs.version }}
+      tag: ${{ needs.prepare.outputs.tag }}
       dashboard-digest: ${{ steps.dashboard-oci.outputs.digest }}
     steps:
       - name: Checkout
@@ -464,46 +507,19 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      # ─── Version ownership gate: refuse a BACKWARD publish ────────────────
-      # Every non-skipped step below pushes the whole user-facing tag set —
-      # latest, vMAJ, vMAJ.MIN, vMAJ.MIN.PATCH — at inputs.version, then signs
-      # and attests an SBOM against it. So a run whose commit sits BEHIND the
-      # commit that version's git tag already names replaces a released image
-      # with an older build and certifies the older build at the released
-      # version. "Create release" below already refuses the same condition,
-      # but it runs at the END of this job, after every registry write has
-      # landed, so it protects the Release and not the registries.
-      #
-      # Reachable by RERUN, not by a race. The consumer stub serializes
-      # push-triggered release runs in a queued, no-cancel concurrency group,
-      # but a rerun rejoins after its successor finished, and `prepare` is not
-      # re-attempted — the rerun carries the version its first attempt
-      # computed against the older tag state. Measured 2026-09-04 on
-      # docker-renovate-scheduler: attempt 1 died on a transient
-      # cosign-installer download (curl exit 35), the next Renovate merge
-      # released v3.3.13 from its own commit, and a rerun 14 minutes later
-      # republished latest, v3, v3.3 and v3.3.13 on BOTH registries from the
-      # parent commit, cosign-signed, before the end-of-job guard refused the
-      # Release. The image the tag named and the commit the tag named then
-      # disagreed, with a valid signature over the wrong one.
-      #
-      # DIRECTION is the whole test, because publishing forward is normal
-      # here: a commit warranting no version bump still rebuilds and re-pushes
-      # the current version's tags, and the supersession handoff documented in
-      # "Create release" has a successor overwrite the same version one commit
-      # later on purpose. Equal, absent and forward all proceed; only backward
-      # is refused. Diverged histories and an unanswerable compare are refused
-      # too — the gate fails closed, and every case it refuses is a run that
-      # has nothing left to publish, so refusing costs no releasable content.
-      #
-      # Docker-only, like the handoff it complements. The go and ts lanes push
-      # no mutable registry tag: an npm/JSR publish is a version-exists
-      # idempotent skip, so a stale rerun there cannot overwrite a newer
-      # artifact.
+      # Refuse a BACKWARD publish: a rerun of an older run rejoins after its
+      # successor released, `prepare` is not re-attempted, and every publish
+      # step would push the channel's whole tag set from the older commit and
+      # sign it at the released version (measured 2026-09-04, docker-renovate-
+      # scheduler: a rerun republished v3.3.13 on both registries from the
+      # parent commit before the end-of-job tag guard refused). Direction is
+      # the test: equal, absent and forward proceed; backward, diverged and an
+      # unanswerable compare are refused, and each has nothing left to publish.
       - name: Version ownership gate
+        if: ${{ env.PUBLISH == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           if ! EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
@@ -528,6 +544,7 @@ jobs:
           exit 1
 
       - name: Download digests
+        if: ${{ needs.build.result == 'success' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: /tmp/digests
@@ -535,55 +552,34 @@ jobs:
           merge-multiple: true
 
       - name: Set up Docker Buildx
+        if: ${{ env.PUBLISH == 'true' }}
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           version: ${{ env.BUILDX_VERSION }}
 
       - name: Log in to GHCR
+        if: ${{ env.PUBLISH == 'true' }}
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      # Installed here (not just before signing) because the no-change gate
-      # below needs cosign to download the baseline attestation BEFORE the
-      # manifest is created. Pure tool install; order is otherwise irrelevant.
       - name: Install Cosign
+        if: ${{ env.PUBLISH == 'true' }}
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
-      # Every Sigstore call in this job crosses a network hop cosign does not
-      # retry, and under cosign v3 there are three of them per signature:
-      # Fulcio for the certificate, Rekor for the log entry, and
-      # timestamp.sigstore.dev for the RFC 3161 timestamp the v3 bundle
-      # carries by default. cosign exposes no retry knob (--timeout bounds the
-      # whole operation and then gives up), so one reset connection fails the
-      # step — AFTER the manifest step already pushed latest/vMAJ/vMAJ.MIN/
-      # vMAJ.MIN.PATCH to both registries. Measured 2026-09-07 on
-      # docker-renovate-scheduler v3.3.20: the TSA answered `connection reset
-      # by peer`, and the version published to GHCR and Docker Hub unsigned,
-      # unattested, with no git tag and no GitHub Release. The one before it
-      # (2026-09-04, same repo) was the installer losing release-cosign.pub to
-      # the same class of reset, so this is a recurring shape rather than one
-      # bad day.
-      #
-      # Same exponential-backoff shape as go-ci.yaml's golangci-lint install:
-      # 5 attempts, 5s doubling to 40s, 75s of waiting in the worst case. It
-      # is a sourced shell function rather than a loop copied into each step
-      # because eight cosign invocations below need it.
-      #
-      # Retrying is safe because every operation here is additive: a digest
-      # can carry several signatures and several attestations, and verifiers
-      # accept the digest when ANY of them verifies. So a retry that follows a
-      # partial success leaves a duplicate, never a conflict.
-      #
-      # Deliberately NOT applied to the no-change gate's `cosign download
-      # attestation`: a missing baseline is a legitimate, expected failure
-      # there (first publish), so retrying would spend 75s on every image
-      # that has no attestation yet, and that call already fails open.
+      # cosign retries none of its network calls and v3 makes three per
+      # signature (Fulcio, Rekor, the RFC 3161 timestamp), so one reset
+      # connection fails the step after the manifest is already pushed. The
+      # helper retries 5 times, 5s doubling to 40s, and is a sourced function
+      # because eight cosign invocations below need it. Retrying is safe: every
+      # operation is additive (a digest carries several signatures and any one
+      # verifies) and the oras copy to Docker Hub is idempotent by content.
       - name: Prepare Sigstore retry helper
+        if: ${{ env.PUBLISH == 'true' }}
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/sigstore-retry.sh" <<'SH'
@@ -604,342 +600,70 @@ jobs:
           }
           SH
 
-      # ─── No-change publish gate (staleness-dispatched rebuilds only) ──────
-      # Compares the package inventory (sorted SPDX name+versionInfo tuples)
-      # of the freshly built amd64 image against the SBOM attestation already
-      # on ghcr.io/<image>:latest. Identical inventory: every publish step
-      # below is skipped via `steps.nochange.outputs.skip`, so no tags move
-      # and no new manifest digest appears, and digest-pinned consumers see no
-      # churn from a no-op rebuild. Different inventory: publish proceeds and
-      # the tuple diff lands in the job summary.
-      #
-      # FAIL-OPEN by design: a missing baseline (first publish), an
-      # attestation fetch error, a tool download/registry failure, or an
-      # unparsable SBOM publishes normally and says why in the job summary.
-      # The gate only ever skips on positive proof: the source revision
-      # (org.opencontainers.image.revision, stamped by docker/metadata-action
-      # on every build) matches :latest AND the package inventory is
-      # identical — and never when the caller signaled a warranted release
-      # (release-needed=true). It never runs on push events
-      # (skip-if-unchanged defaults false), so the push path keeps today's
-      # always-publish semantics.
-      #
-      # Accepted limits (deliberate decisions, not bugs):
-      #   1. amd64-resolved SBOM: the comparison scans the amd64 per-arch
-      #      image (the attested baseline was itself generated from the
-      #      amd64-resolved index), so an arm64-ONLY package delta is
-      #      invisible to the gate. Alpine builds both arches from the same
-      #      aports revision, so versions track closely in practice.
-      #   2. Orphaned digests on skip: the per-arch images were already
-      #      pushed by digest during the build matrix, before any skip
-      #      decision could exist. A skipped publish leaves those digests
-      #      untagged in GHCR. Cosmetic: no tags move, nothing consumes them.
-      - name: No-change publish gate
-        id: nochange
-        if: ${{ inputs.skip-if-unchanged == true }}
-        env:
-          RELEASE_NEEDED: ${{ inputs.release-needed }}
-          FINALIZE: ${{ inputs.finalize }}
-          SBOM_FROM: ${{ inputs.sbom-from }}
-          SYFT_CONFIG: ${{ inputs.syft-config }}
-          # Via env, never inline ${{ }} in the script body (template injection).
-          BIN_NAME: ${{ inputs.image-name }}
-        run: |
-          set -euo pipefail
-
-          # Everything below fails OPEN: emit skip=false with a reason, exit 0.
-          proceed() {
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            {
-              echo "## No-change publish gate"
-              echo ""
-              echo "**Publishing normally.** $1"
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "gate: publishing normally: $1"
-            exit 0
-          }
-
-          # A warranted release must never be skipped: when the caller's
-          # detect job found unreleased conventional commits
-          # (release-needed=true), a version tag + GitHub Release is due
-          # regardless of the package inventory — e.g. a push release that
-          # failed after merge and is being retried by a staleness dispatch.
-          if [ "$RELEASE_NEEDED" = "true" ]; then
-            proceed "A release is warranted (release-needed=true); never skip a warranted release."
-          fi
-
-          # Neither must a wedge repair: in finalize mode the version tag
-          # exists without its GitHub Release, and the fresh rebuild of the
-          # same source would compare inventory-identical to :latest by
-          # construction — skipping here would defer the repair to the next
-          # real push, which on a stable repo can be months away while
-          # staleness dispatches come weekly. Proceeding publishes normally
-          # (tags move to the fresh build of the same source; accepted
-          # rerun semantics) and the release steps repair the Release.
-          if [ "$FINALIZE" = "true" ]; then
-            proceed "Finalize mode (tag exists without its GitHub Release); the repair must not be skipped."
-          fi
-
-          # The comparison scans the amd64 per-arch image (accepted limit 1).
-          DIGEST_FILE=/tmp/digests/linux-amd64
-          if [ ! -f "$DIGEST_FILE" ]; then
-            proceed "No linux/amd64 digest in this build's platform set; the gate only understands amd64."
-          fi
-          AMD64_REF="${REGISTRY}/${IMAGE_NAME}@$(cat "$DIGEST_FILE")"
-          # Exported for the skip-path Trivy scan: on a skipped publish no
-          # manifest digest exists, so the scan targets this fresh amd64 image.
-          echo "amd64-ref=${AMD64_REF}" >> "$GITHUB_OUTPUT"
-
-          # Source-revision guard: package tuples describe the dependency
-          # inventory, not the application source, entrypoint, or copied
-          # config. A pending source change whose tuples happen to match
-          # :latest (an entrypoint fix, a Go change that moves no dependency)
-          # must still publish. docker/metadata-action's default labels stamp
-          # every build's config with org.opencontainers.image.revision
-          # (verified on the published images); allow a skip only when the
-          # fresh amd64 config and the :latest baseline carry the same
-          # revision. Missing labels or inspect errors publish (fail-open).
-          get_revision() {
-            # $1 = image ref. buildx resolves a bare manifest or a per-arch
-            # provenance index to a single config object; a multi-arch index
-            # yields a platform-keyed map. Handle both; empty on any failure.
-            docker buildx imagetools inspect "$1" --format '{{json .Image}}' 2>/dev/null \
-              | jq -r '
-                  ( if type == "object" and has("config") then .
-                    elif type == "object" then (.["linux/amd64"] // empty)
-                    else empty end )
-                  | .config.Labels["org.opencontainers.image.revision"] // empty' 2>/dev/null \
-              || true
-          }
-          FRESH_REV=$(get_revision "$AMD64_REF")
-          BASELINE_REV=$(get_revision "${REGISTRY}/${IMAGE_NAME}:latest")
-          if [ -z "$FRESH_REV" ] || [ -z "$BASELINE_REV" ]; then
-            proceed "Source revision label unavailable (fresh: '${FRESH_REV:-?}', :latest: '${BASELINE_REV:-?}'); cannot prove source equivalence."
-          fi
-          if [ "$FRESH_REV" != "$BASELINE_REV" ]; then
-            proceed "Source revision changed (${BASELINE_REV} -> ${FRESH_REV}); the tuple compare cannot see source/config changes."
-          fi
-
-          # Baseline: the SPDX SBOM attestation cosign attached to :latest on
-          # its last publish (GHCR only; the same digest goes to Docker Hub).
-          if ! cosign download attestation \
-              --predicate-type https://spdx.dev/Document \
-              "${REGISTRY}/${IMAGE_NAME}:latest" > /tmp/gate-attestations.jsonl 2>/tmp/gate-cosign.err; then
-            proceed "No baseline SBOM attestation on :latest (first publish, or fetch error: $(head -c 200 /tmp/gate-cosign.err | tr '\n' ' '))."
-          fi
-          if [ ! -s /tmp/gate-attestations.jsonl ]; then
-            proceed "Baseline attestation list for :latest is empty."
-          fi
-          # Most recent matching attestation is the last line; its payload is
-          # a base64 in-toto statement whose .predicate is the SPDX document.
-          # Two envelope shapes exist in the wild: the new sigstore bundle
-          # (cosign v3 attest default; payload at .dsseEnvelope.payload) and
-          # the legacy DSSE envelope (pre-v3 publishes; payload at .payload).
-          if ! tail -n 1 /tmp/gate-attestations.jsonl \
-              | jq -r '.dsseEnvelope.payload // .payload' | base64 -d \
-              | jq '.predicate' > /tmp/gate-baseline.spdx.json 2>/dev/null; then
-            proceed "Could not decode the baseline attestation payload."
-          fi
-
-          # Fresh side: SBOM of the just-built amd64 image, generated the same
-          # way the pipeline's attested SBOM is (image scan honoring the repo
-          # syft config, or path mode scanning the extracted binary; the
-          # workflow-level SYFT_SELECT_CATALOGERS is inherited here too, so
-          # both sides of the tuple compare run the same cataloger policy —
-          # see the env block). Tool
-          # download and image extraction run inside explicit fail-open
-          # guards: a transient CDN or registry hiccup must publish normally,
-          # never fail the release (the gate's declared contract).
-          # File first, then extract. Plain `--retry` does not cover a
-          # mid-transfer receive failure (curl exit 56), and the flag that does
-          # (`--retry-all-errors`) is only safe when curl owns the output file:
-          # it resets a partial `-o` write before retrying, and cannot reset a
-          # pipe. Both halves stay inside the fail-open guard.
-          if ! { curl -fsSL --connect-timeout 10 --max-time 60 \
-                   --retry 7 --retry-max-time 150 --retry-all-errors \
-                   -o "$RUNNER_TEMP/syft.tgz" \
-                   "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VERSION#v}_linux_amd64.tar.gz" \
-                 && tar -xzf "$RUNNER_TEMP/syft.tgz" -C /tmp syft; }; then
-            proceed "Could not install syft ${SYFT_VERSION} for the fresh scan."
-          fi
-          if [ "$SBOM_FROM" = "path" ]; then
-            # Trap registered before the container exists and guarded on CID:
-            # cleanup only ever targets a container this run actually created.
-            CID=""
-            trap 'if [ -n "$CID" ]; then docker rm -f "$CID" >/dev/null 2>&1 || true; fi' EXIT
-            if ! { docker pull -q "$AMD64_REF" \
-                && CID=$(docker create "$AMD64_REF") \
-                && mkdir -p /tmp/gate-sbom-src \
-                && docker cp "$CID:/app/${BIN_NAME}" "/tmp/gate-sbom-src/${BIN_NAME}"; }; then
-              proceed "Could not extract the binary from the fresh amd64 image (path mode)."
-            fi
-            SRC="dir:/tmp/gate-sbom-src"
-          else
-            SRC="registry:${AMD64_REF}"
-          fi
-          cfg_args=()
-          [ -n "$SYFT_CONFIG" ] && cfg_args=(-c "$SYFT_CONFIG")
-          if ! /tmp/syft ${cfg_args[@]+"${cfg_args[@]}"} -o spdx-json "$SRC" \
-              > /tmp/gate-fresh.spdx.json 2>/tmp/gate-syft.err; then
-            proceed "syft failed on the fresh image ($(head -c 200 /tmp/gate-syft.err | tr '\n' ' '))."
-          fi
-
-          # Tuple-level compare: sorted (name, versionInfo) pairs ONLY, never
-          # the raw JSON (document UUIDs and creation timestamps differ on
-          # every scan). The document root (the scanned image/dir itself; its
-          # versionInfo is the scanned manifest digest, which differs on every
-          # rebuild) must be excluded or the gate could never skip. syft
-          # links the root via a DESCRIBES relationship from SPDXRef-DOCUMENT
-          # (documentDescribes stays null); both spellings are handled.
-          tuples() {
-            jq -r '
-              ( [ .documentDescribes // [] | .[] ]
-                + [ .relationships[]?
-                    | select(.relationshipType == "DESCRIBES"
-                             and .spdxElementId == "SPDXRef-DOCUMENT")
-                    | .relatedSpdxElement ] ) as $roots
-              | [ .packages[]?
-                  | select(.SPDXID as $id | ($roots | index($id)) == null)
-                  | "\(.name)\t\(.versionInfo // "")" ]
-              | sort | unique | .[]' "$1"
-          }
-          if ! tuples /tmp/gate-baseline.spdx.json > /tmp/gate-tuples-prev; then
-            proceed "Could not extract package tuples from the baseline SBOM."
-          fi
-          if ! tuples /tmp/gate-fresh.spdx.json > /tmp/gate-tuples-new; then
-            proceed "Could not extract package tuples from the fresh SBOM."
-          fi
-          if [ ! -s /tmp/gate-tuples-new ]; then
-            proceed "Fresh SBOM contains no packages; refusing to skip on empty evidence."
-          fi
-
-          if diff -u /tmp/gate-tuples-prev /tmp/gate-tuples-new > /tmp/gate-tuples.diff; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            {
-              echo "## No-change publish gate"
-              echo ""
-              echo "**Unchanged, publish skipped.** The rebuilt image's package inventory"
-              echo "($(wc -l < /tmp/gate-tuples-new) packages) is identical to the SBOM attestation on ${REGISTRY}/${IMAGE_NAME}:latest."
-              echo ""
-              echo "No tags moved, no manifest was created, no release was cut. The per-arch"
-              echo "digests pushed by the build matrix remain untagged in GHCR (accepted, cosmetic)."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "gate: unchanged, publish skipped"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            {
-              echo "## No-change publish gate"
-              echo ""
-              echo "**Inventory changed, publishing.** Package tuple diff vs :latest:"
-              echo ""
-              echo '```diff'
-              head -n 100 /tmp/gate-tuples.diff
-              if [ "$(wc -l < /tmp/gate-tuples.diff)" -gt 100 ]; then
-                echo "(diff truncated at 100 lines)"
-              fi
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "gate: inventory changed, publishing"
-          fi
-
-      - name: Log in to Docker Hub
-        if: ${{ contains(inputs.registries, 'dockerhub') && steps.nochange.outputs.skip != 'true' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Ensure Docker Hub repository exists
-        if: ${{ contains(inputs.registries, 'dockerhub') && steps.nochange.outputs.skip != 'true' }}
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-        run: |
-          # buildx imagetools create cannot auto-create a Docker Hub repository,
-          # so the first-ever dual-publish to a brand-new repo fails with HTTP
-          # 400 ("unexpected status from PUT ... blobs/uploads"). docker push
-          # auto-creates the repo; imagetools does not. Pre-create it (public,
-          # idempotent) so the first manifest push succeeds.
-          namespace="${IMAGE_NAME%%/*}"
-          name="${IMAGE_NAME#*/}"
-          jwt=$(curl -fsS --retry 3 -H 'Content-Type: application/json' \
-            -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}" \
-            https://hub.docker.com/v2/users/login/ | jq -r '.token')
-          if [ -z "$jwt" ] || [ "$jwt" = "null" ]; then
-            echo "::error::Docker Hub login failed during repository pre-create"; exit 1
-          fi
-          code=$(curl -sS -o /tmp/dhrepo.json -w '%{http_code}' -X POST \
-            -H "Authorization: JWT ${jwt}" -H 'Content-Type: application/json' \
-            -d "{\"namespace\":\"${namespace}\",\"name\":\"${name}\",\"is_private\":false}" \
-            https://hub.docker.com/v2/repositories/)
-          case "$code" in
-            201) echo "Created docker.io/${namespace}/${name}" ;;
-            400|409) echo "docker.io/${namespace}/${name} already exists (HTTP ${code})" ;;
-            *) echo "::warning::Unexpected HTTP ${code} for docker.io/${namespace}/${name}"; cat /tmp/dhrepo.json 2>/dev/null || true ;;
-          esac
-
-      # From here on, every publish step is gated on the no-change gate:
-      # `steps.nochange.outputs.skip` is 'true' only when the gate ran (a
-      # staleness-dispatched rebuild) AND proved the inventory identical; on
-      # push events the gate is skipped, its output is empty, and everything
-      # below runs exactly as before.
-      - name: Create multi-arch manifest
-        if: ${{ steps.nochange.outputs.skip != 'true' }}
+      # Build arm: assemble the multi-arch index at the channel tags from the
+      # per-arch digests. Promote arm: `imagetools create` with a single
+      # source is a carbon copy, so the stable tags point at the dev digest
+      # unchanged and the assertion below is what proves it.
+      - name: Publish channel tags on GHCR
+        if: ${{ env.PUBLISH == 'true' }}
         id: manifest
         env:
           TAGS: ${{ needs.prepare.outputs.tags }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          MAJOR: ${{ needs.prepare.outputs.major }}
+          MINOR: ${{ needs.prepare.outputs.minor }}
         run: |
-          # Build the imagetools args:
-          #   one -t per user-facing tag (latest, vMAJ, vMAJ.MIN, vMAJ.MIN.PATCH, sha-...)
-          #   one source per per-arch digest pushed in the matrix step
-          # imagetools writes a manifest list (a.k.a. OCI image index) at every -t
-          # tag, all pointing at the same set of per-arch images.
-          tag_args=""
-          while IFS= read -r tag; do
-            [ -z "$tag" ] && continue
-            tag_args="$tag_args -t $tag"
-          done <<< "$TAGS"
-
-          src_args=""
-          for f in /tmp/digests/*; do
-            d=$(cat "$f")
-            src_args="$src_args ${REGISTRY}/${IMAGE_NAME}@${d}"
-          done
-
-          # --metadata-file captures the index digest deterministically.
-          # Format (per Docker docs): { "containerimage.descriptor": { "digest": "sha256:...", ... }, "image.name": "..." }
-          # Note: this is different from build-push-action's metadata which uses
-          # a flat "containerimage.digest" key.
-          # shellcheck disable=SC2086
-          docker buildx imagetools create --metadata-file /tmp/manifest-meta.json $tag_args $src_args
-
+          set -euo pipefail
+          tag_args=()
+          if [ -n "$PROMOTE_DIGEST" ]; then
+            for tg in "$VERSION" "$MINOR" "$MAJOR" latest; do
+              tag_args+=(-t "${REGISTRY}/${IMAGE_NAME}:${tg}")
+            done
+            src_args=("${REGISTRY}/${IMAGE_NAME}@${PROMOTE_DIGEST}")
+            BUILT=false
+          else
+            while IFS= read -r tg; do
+              [ -z "$tg" ] && continue
+              tag_args+=(-t "$tg")
+            done <<<"$TAGS"
+            src_args=()
+            for f in /tmp/digests/*; do
+              src_args+=("${REGISTRY}/${IMAGE_NAME}@$(cat "$f")")
+            done
+            BUILT=true
+          fi
+          # --metadata-file captures the index digest deterministically:
+          # { "containerimage.descriptor": { "digest": "sha256:..." }, ... }
+          docker buildx imagetools create --metadata-file /tmp/manifest-meta.json "${tag_args[@]}" "${src_args[@]}"
           digest=$(jq -r '."containerimage.descriptor".digest' /tmp/manifest-meta.json)
           if [ -z "$digest" ] || [ "$digest" = "null" ]; then
             echo "::error::Failed to extract manifest digest from imagetools metadata"
             cat /tmp/manifest-meta.json
             exit 1
           fi
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          echo "Manifest digest: $digest"
+          if [ -n "$PROMOTE_DIGEST" ] && [ "$digest" != "$PROMOTE_DIGEST" ]; then
+            echo "::error::promotion changed the digest: dev build ${PROMOTE_DIGEST}, stable tags ${digest}; a promoted image must be byte-identical"
+            exit 1
+          fi
+          {
+            echo "digest=$digest"
+            echo "built=$BUILT"
+          } >> "$GITHUB_OUTPUT"
+          echo "Manifest digest: $digest (built=${BUILT})"
 
       - name: Render image-size badge JSON
-        # Self-published size badge, mirroring the coverage badge: sum the
-        # linux/amd64 compressed (download) layer sizes of the just-pushed
-        # manifest and publish a shields `endpoint` JSON to the orphan `badges`
-        # branch, alongside coverage.json / mutation.json (the publish-badge
-        # action preserves siblings). Replaces the retired third-party
-        # ghcr-badge.egpl.dev service (suspended 2026), so the badge has no
-        # external dependency. Ungated on release-needed: the image is
-        # rebuilt+pushed on every significant change, so the size refreshes
-        # whenever it can actually change. Best-effort (continue-on-error) — a
-        # badge hiccup must never fail a release.
+        # Self-published size badge: sum the linux/amd64 compressed (download)
+        # layer sizes of the published index and write a shields `endpoint`
+        # JSON to the orphan `badges` branch (the publish-badge action
+        # preserves siblings). Best-effort: a badge hiccup never fails a
+        # release.
         id: sizebadge
-        if: ${{ steps.nochange.outputs.skip != 'true' }}
+        if: ${{ env.PUBLISH == 'true' }}
         continue-on-error: true
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
+          set -euo pipefail
           # imagetools reads the registry directly (no pull); buildx is already
           # logged in to GHCR. The repo path is IMAGE_REF minus its @digest.
           base="${IMAGE_REF%@*}"
@@ -973,22 +697,15 @@ jobs:
           filename: size.json
           json: ${{ steps.sizebadge.outputs.json }}
 
-      # `scanners` is pinned EXPLICITLY on both image scans below. Trivy's own
-      # default for an image target is [vuln,secret], so omitting it silently
-      # enabled secret scanning — correct, but only by accident. Image-layer
-      # secret detection is coverage nothing else provides: gitleaks scans git
-      # trees, so it never sees a secret introduced by a build ARG, a
-      # gitignored COPY, or the base image. Pinning the value keeps a future
-      # Trivy default change from removing it without anyone noticing.
-      #
-      # These two are ADVISORY and are the only CVE layer. They own everything a
-      # veto could not: MEDIUM and below, unfixed vulnerabilities, image-layer
-      # secrets, and on the skip path an advisory that only appeared after the
-      # last publish. Findings reach the Security tab and drive the badges; a
-      # fixable HIGH in a base image is answered by a base-digest bump or
-      # `PKG_REFRESH`, on Renovate's clock, not by failing this run.
+      # ADVISORY, and the only CVE layer; a promotion re-scans the dev digest
+      # so a stable release carries a scan of its own date. A fixable HIGH in a
+      # base image is answered by a base-digest bump or `PKG_REFRESH`, never by
+      # failing this run. `scanners` is pinned explicitly: Trivy's image default
+      # is [vuln,secret], and image-layer secret detection (a build ARG, a
+      # gitignored COPY, the base image) is coverage gitleaks' git-tree scan
+      # cannot provide, so a Trivy default change must not silently drop it.
       - name: Trivy scan published image
-        if: ${{ steps.nochange.outputs.skip != 'true' }}
+        if: ${{ env.PUBLISH == 'true' }}
         continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -1000,27 +717,8 @@ jobs:
           severity: 'HIGH,CRITICAL'
           ignore-unfixed: true
 
-      # A skipped publish must NOT suppress vulnerability visibility: an
-      # unchanged package inventory is exactly when the vuln DB may have
-      # gained a new advisory for what :latest already ships. No manifest
-      # digest exists on the skip path, so scan the fresh amd64 per-arch
-      # image the gate compared (same content) and upload under the same
-      # category as the publish-path scan.
-      - name: Trivy scan fresh image (publish skipped)
-        if: ${{ steps.nochange.outputs.skip == 'true' }}
-        continue-on-error: true
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          version: ${{ env.TRIVY_VERSION }}
-          image-ref: ${{ steps.nochange.outputs.amd64-ref }}
-          scanners: 'vuln,secret'
-          format: 'sarif'
-          output: 'trivy-image.sarif'
-          severity: 'HIGH,CRITICAL'
-          ignore-unfixed: true
-
       - name: Upload Trivy SARIF
-        if: ${{ always() }}
+        if: ${{ always() && env.PUBLISH == 'true' }}
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
@@ -1028,12 +726,13 @@ jobs:
           category: 'trivy-image-build'
 
       - name: Extract binary for SBOM (path mode)
-        if: ${{ inputs.sbom-from == 'path' && steps.nochange.outputs.skip != 'true' }}
+        if: ${{ env.PUBLISH == 'true' && inputs.sbom-from == 'path' }}
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
           # Via env, never inline ${{ }} in the script body (template injection).
           BIN_NAME: ${{ inputs.image-name }}
         run: |
+          set -euo pipefail
           # path-mode SBOM: pull the multi-arch image (Docker resolves to the
           # finalize-job's host arch, amd64), extract /app/<image-name>, then
           # syft scans the binary directly. Used by Go apps where syft on the
@@ -1045,7 +744,7 @@ jobs:
           docker cp "$CID:/app/${BIN_NAME}" "/tmp/sbom-src/${BIN_NAME}"
 
       - name: Generate SBOM (from image)
-        if: ${{ inputs.sbom-from == 'image' && inputs.syft-config == '' && steps.nochange.outputs.skip != 'true' }}
+        if: ${{ env.PUBLISH == 'true' && inputs.sbom-from == 'image' && inputs.syft-config == '' }}
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
@@ -1054,7 +753,7 @@ jobs:
           upload-release-assets: false
 
       - name: Generate SBOM (from image, with syft config)
-        if: ${{ inputs.sbom-from == 'image' && inputs.syft-config != '' && steps.nochange.outputs.skip != 'true' }}
+        if: ${{ env.PUBLISH == 'true' && inputs.sbom-from == 'image' && inputs.syft-config != '' }}
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
@@ -1064,7 +763,7 @@ jobs:
           config: ${{ inputs.syft-config }}
 
       - name: Generate SBOM (from path)
-        if: ${{ inputs.sbom-from == 'path' && steps.nochange.outputs.skip != 'true' }}
+        if: ${{ env.PUBLISH == 'true' && inputs.sbom-from == 'path' }}
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: /tmp/sbom-src
@@ -1072,31 +771,22 @@ jobs:
           output-file: sbom.spdx.json
           upload-release-assets: false
 
-      # Version surfacing: a shipped-package-versions table in the job summary
-      # on EVERY docker release run. Informational and best-effort (a summary
-      # hiccup must never fail a release). On a skipped publish no
-      # sbom.spdx.json is generated; the gate's own fresh scan
-      # (/tmp/gate-fresh.spdx.json) describes the same image, so the table is
-      # sourced from it instead.
+      # A shipped-package-versions table in the job summary on every publish.
+      # Informational and best-effort (a summary hiccup never fails a release).
       - name: Shipped package versions summary
+        if: ${{ env.PUBLISH == 'true' }}
         continue-on-error: true
-        env:
-          GATE_SKIPPED: ${{ steps.nochange.outputs.skip }}
         run: |
           set -euo pipefail
           SBOM=sbom.spdx.json
-          if [ "$GATE_SKIPPED" = "true" ]; then
-            SBOM=/tmp/gate-fresh.spdx.json
-          fi
           {
             echo "## Shipped package versions"
             echo ""
             echo "| Package | Version |"
             echo "|---|---|"
-            # Same tuple extraction as the no-change gate: exclude the SPDX
-            # document root (the image itself; syft links it via a DESCRIBES
-            # relationship), sort, dedupe. Capped at 400 rows to keep the
-            # summary bounded for module-heavy Go images.
+            # Exclude the SPDX document root (the image itself; syft links it
+            # via a DESCRIBES relationship), sort, dedupe. Capped at 400 rows
+            # to keep the summary bounded for module-heavy Go images.
             jq -r '
               ( [ .documentDescribes // [] | .[] ]
                 + [ .relationships[]?
@@ -1113,8 +803,11 @@ jobs:
               | .[]' "$SBOM"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # A promoted digest already carries the dev build's signature and
+      # attestations (they are referrers of the digest, not of a tag), so only
+      # a fresh build signs.
       - name: Sign GHCR manifest (recursive — covers per-arch images too)
-        if: ${{ steps.nochange.outputs.skip != 'true' }}
+        if: ${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' }}
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
@@ -1126,30 +819,9 @@ jobs:
         # NOTE: cosign attest does not support --recursive (that's a sign-only
         # flag). The attestation is scoped to the manifest list digest;
         # verifiers resolve through the index to find the attestation.
-        if: ${{ steps.nochange.outputs.skip != 'true' }}
+        if: ${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' }}
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
-        run: |
-          set -euo pipefail
-          . "$RUNNER_TEMP/sigstore-retry.sh"
-          retry_sigstore cosign attest --yes \
-            --predicate sbom.spdx.json \
-            --type spdxjson \
-            "$IMAGE_REF"
-
-      - name: Sign Docker Hub manifest (recursive)
-        if: ${{ contains(inputs.registries, 'dockerhub') && steps.nochange.outputs.skip != 'true' }}
-        env:
-          IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
-        run: |
-          set -euo pipefail
-          . "$RUNNER_TEMP/sigstore-retry.sh"
-          retry_sigstore cosign sign --yes --recursive "$IMAGE_REF"
-
-      - name: Attest SBOM to Docker Hub
-        if: ${{ contains(inputs.registries, 'dockerhub') && steps.nochange.outputs.skip != 'true' }}
-        env:
-          IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/sigstore-retry.sh"
@@ -1167,7 +839,7 @@ jobs:
       # attest has no --recursive; verifiers resolve through the index). No
       # vex/ documents (the common case) = these steps skip.
       - name: Attest OpenVEX to GHCR
-        if: ${{ steps.nochange.outputs.skip != 'true' && hashFiles('vex/*.openvex.json') != '' }}
+        if: ${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' && hashFiles('vex/*.openvex.json') != '' }}
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
@@ -1180,36 +852,16 @@ jobs:
               "$IMAGE_REF"
           done
 
-      - name: Attest OpenVEX to Docker Hub
-        if: ${{ contains(inputs.registries, 'dockerhub') && steps.nochange.outputs.skip != 'true' && hashFiles('vex/*.openvex.json') != '' }}
-        env:
-          IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
-        run: |
-          set -euo pipefail
-          . "$RUNNER_TEMP/sigstore-retry.sh"
-          for f in vex/*.openvex.json; do
-            retry_sigstore cosign attest --yes \
-              --predicate "$f" \
-              --type openvex \
-              "$IMAGE_REF"
-          done
-
-      # Gate assertion: prove the OpenVEX attestations actually landed and
-      # carry the statements we just published. Two checks, both hard-fail:
-      #   1. cosign verify-attestation — cryptographic: at least one openvex
-      #      attestation on the GHCR manifest verifies against this pipeline's
-      #      keyless identity (docker-release.yaml's own OIDC job_workflow_ref;
-      #      regexp because the @ref varies with the consumer's pinned SHA).
-      #   2. Content: download the attestations (same dual envelope-shape
-      #      handling as the no-change gate — sigstore bundle vs legacy DSSE),
-      #      decode every predicate, and require every vulnerability id
-      #      stated in the source vex/ documents to appear. A silently
-      #      dropped or truncated statement fails the release loudly.
-      # GHCR only: the Docker Hub attestation is the same payload signed the
-      # same way (mirroring how the SBOM attestations are not re-verified
-      # per registry anywhere else in this workflow).
+      # Two hard-fail checks that the OpenVEX attestations landed: cosign
+      # verify-attestation against this pipeline's keyless identity (a regexp,
+      # because the @ref varies with the consumer's pinned SHA), then every
+      # vulnerability id in the source vex/ documents must appear in the
+      # downloaded predicates (both envelope shapes: the sigstore bundle cosign
+      # v3 writes and the legacy DSSE envelope), so a dropped or truncated
+      # statement fails loudly. GHCR only: Docker Hub receives a copy of the
+      # same referrers at promotion.
       - name: Verify OpenVEX attestations on GHCR
-        if: ${{ steps.nochange.outputs.skip != 'true' && hashFiles('vex/*.openvex.json') != '' }}
+        if: ${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' && hashFiles('vex/*.openvex.json') != '' }}
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
@@ -1255,7 +907,10 @@ jobs:
           echo "verified OpenVEX attestations cover: $(tr '\n' ' ' < /tmp/vex-want)"
 
       - name: Install oras
-        if: ${{ steps.nochange.outputs.skip != 'true' && hashFiles('grafana-dashboard.json') != '' }}
+        if: >-
+          ${{ env.PUBLISH == 'true'
+            && (hashFiles('grafana-dashboard.json') != ''
+                || (inputs.channel == 'stable' && contains(inputs.registries, 'dockerhub'))) }}
         run: |
           set -euo pipefail
           # Version + tarball sha256 pinned as a pair; sha256sum -c refuses a tarball
@@ -1271,11 +926,69 @@ jobs:
           tar -xzf "$RUNNER_TEMP/oras.tgz" -C /usr/local/bin oras
           oras version
 
+      - name: Log in to Docker Hub
+        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && contains(inputs.registries, 'dockerhub') }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Ensure Docker Hub repository exists
+        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && contains(inputs.registries, 'dockerhub') }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          # Docker Hub does not create a repository for every push path: the
+          # first-ever `imagetools create` to a brand-new repo failed with HTTP
+          # 400 ("unexpected status from PUT ... blobs/uploads") where `docker
+          # push` would have created it. Pre-create it (public, idempotent) so
+          # the first copy succeeds.
+          namespace="${IMAGE_NAME%%/*}"
+          name="${IMAGE_NAME#*/}"
+          jwt=$(curl -fsS --retry 3 -H 'Content-Type: application/json' \
+            -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}" \
+            https://hub.docker.com/v2/users/login/ | jq -r '.token')
+          if [ -z "$jwt" ] || [ "$jwt" = "null" ]; then
+            echo "::error::Docker Hub login failed during repository pre-create"; exit 1
+          fi
+          code=$(curl -sS -o /tmp/dhrepo.json -w '%{http_code}' -X POST \
+            -H "Authorization: JWT ${jwt}" -H 'Content-Type: application/json' \
+            -d "{\"namespace\":\"${namespace}\",\"name\":\"${name}\",\"is_private\":false}" \
+            https://hub.docker.com/v2/repositories/)
+          case "$code" in
+            201) echo "Created docker.io/${namespace}/${name}" ;;
+            400|409) echo "docker.io/${namespace}/${name} already exists (HTTP ${code})" ;;
+            *) echo "::warning::Unexpected HTTP ${code} for docker.io/${namespace}/${name}"; cat /tmp/dhrepo.json 2>/dev/null || true ;;
+          esac
+
+      # Docker Hub gets the finished GHCR index by digest-preserving copy, with
+      # its signatures and attestations as referrers (`oras copy --recursive`;
+      # `cosign copy` is deprecated at the pinned cosign and does not carry
+      # v3 bundle referrers). Nothing is ever built or signed against Docker
+      # Hub, so its digest equals GHCR's by construction.
+      - name: Copy image to Docker Hub
+        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && contains(inputs.registries, 'dockerhub') }}
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          MAJOR: ${{ needs.prepare.outputs.major }}
+          MINOR: ${{ needs.prepare.outputs.minor }}
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/sigstore-retry.sh"
+          retry_sigstore oras copy --recursive \
+            "${REGISTRY}/${IMAGE_NAME}:${VERSION}" "docker.io/${IMAGE_NAME}:${VERSION}"
+          retry_sigstore oras tag "docker.io/${IMAGE_NAME}:${VERSION}" "$MINOR" "$MAJOR" latest
+          echo "docker.io/${IMAGE_NAME}: ${VERSION}, ${MINOR}, ${MAJOR}, latest"
+
       - name: Publish dashboard OCI artifact
         id: dashboard-oci
-        if: ${{ steps.nochange.outputs.skip != 'true' && hashFiles('grafana-dashboard.json') != '' }}
+        if: ${{ env.PUBLISH == 'true' && hashFiles('grafana-dashboard.json') != '' }}
         env:
           # Via env, never inline ${{ }} in the script body (template injection).
+          CHANNEL: ${{ inputs.channel }}
           VERSION: ${{ needs.prepare.outputs.version }}
           MAJOR: ${{ needs.prepare.outputs.major }}
           DASHBOARD_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/dashboard
@@ -1291,13 +1004,21 @@ jobs:
           # new manifest digest and moves both tags off the signed one. The commit
           # time makes the manifest a pure function of its inputs.
           created=$(git show -s --format=%cI "$GITHUB_SHA")
+          # dev: the dev version only; stable: the version and its major.
+          if [ "$CHANNEL" = "dev" ]; then
+            REFS="${DASHBOARD_REF}:${TAG}"
+            SHOWN="\`${DASHBOARD_REF}:${TAG}\`"
+          else
+            REFS="${DASHBOARD_REF}:${VERSION},${MAJOR}"
+            SHOWN="\`${DASHBOARD_REF}:${VERSION}\` (also \`:${MAJOR}\`)"
+          fi
           oras push --export-manifest "$RUNNER_TEMP/dashboard-manifest.json" \
             --artifact-type application/vnd.grafana.dashboard.v1+json \
             --annotation "org.opencontainers.image.created=${created}" \
             --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
-            --annotation "org.opencontainers.image.version=${VERSION}" \
-            "${DASHBOARD_REF}:${VERSION},${MAJOR}" \
+            --annotation "org.opencontainers.image.version=${TAG}" \
+            "$REFS" \
             grafana-dashboard.json:application/json
           digest="sha256:$(sha256sum "$RUNNER_TEMP/dashboard-manifest.json" | cut -d' ' -f1)"
           retry_sigstore cosign sign --yes "${DASHBOARD_REF}@${digest}"
@@ -1305,23 +1026,26 @@ jobs:
           {
             echo "## Grafana dashboard"
             echo ""
-            echo "OCI artifact \`${DASHBOARD_REF}:${VERSION}\` (also \`:${MAJOR}\`), digest \`${digest}\`, cosign-signed (keyless)."
+            echo "OCI artifact ${SHOWN}, digest \`${digest}\`, cosign-signed (keyless)."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate release notes
-        # finalize repairs a tag-created/Release-missing partial run: the
-        # release steps run despite release-needed=false (and the no-change
-        # gate above never skips a finalize run). Deliberately token-free:
-        # this step downloads and EXECUTES git-cliff, and an untrusted
-        # binary must never run with a credential in its environment; the
-        # gh/tagging calls live in the Create release step, which runs no
-        # downloaded code.
-        if: ${{ (inputs.release-needed == 'true' || inputs.finalize == 'true') && steps.nochange.outputs.skip != 'true' }}
+        # Stable only (a dev build has no Release); finalize repairs a
+        # tag-created/Release-missing partial run despite release-needed=false.
+        # Deliberately token-free: this step downloads and EXECUTES git-cliff,
+        # and an untrusted binary must never run with a credential in its
+        # environment; the gh/tagging calls live in the Create release step,
+        # which runs no downloaded code.
+        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}
         env:
           VERSION: ${{ inputs.version }}
+          LATEST: ${{ inputs.latest }}
           GO_LANES_JSON: ${{ inputs.go-modules }}
           FINALIZE: ${{ inputs.finalize }}
+          RELEASE_NEEDED: ${{ inputs.release-needed }}
+          PROMOTION_NOTE: ${{ inputs.promotion-note }}
         run: |
+          set -euo pipefail
           # Guard direct callers: release.yaml always passes well-formed
           # JSON, but this workflow is callable on its own, and a malformed
           # go-modules value would otherwise fail inside a process
@@ -1343,37 +1067,41 @@ jobs:
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
           echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
           tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          # Lane-aware notes: when the caller discovered nested Go module
-          # lanes, scope this image release's notes to the root lane (root
-          # tag universe + lane commits excluded), or lane commits leak into
-          # the image release's notes (probe state J in
-          # scripts/test-cliff-bump-semantics.sh pins the flag semantics).
-          # No lanes -> no extra args -> unchanged.
-          LANE_ARGS=()
+          # The stable tag pattern is passed explicitly so the notes span
+          # everything since the last STABLE release whatever the consumer's
+          # synced cliff.toml says; lane commits are excluded (probe state J).
+          LANE_ARGS=(--tag-pattern '^v[0-9]+\.[0-9]+\.[0-9]+$')
           while IFS= read -r d; do
             [ -z "$d" ] && continue
             LANE_ARGS+=(--exclude-path "$d/**")
           done < <(jq -r '.[]' <<<"$GO_LANES_JSON")
-          if [ "${#LANE_ARGS[@]}" -gt 0 ]; then
-            LANE_ARGS=(--tag-pattern '^v[0-9]' "${LANE_ARGS[@]}")
-          fi
-          # --unreleased --tag renders the commits since the last tag as
-          # $VERSION (the tag does not exist yet on the publish path). In
-          # FINALIZE mode the tag exists at this very commit, so those
-          # commits are no longer "unreleased": render the CURRENT release
-          # instead (probe states K/L in scripts/test-cliff-bump-semantics.sh
-          # pin that rendering, lane flags respected). The finalize branch
-          # has NO fallback on purpose: a repaired Release's body is
-          # permanent (nothing ever regenerates it), so baking a stub would
-          # trade a retryable job failure for a permanent notes gap. The
-          # publish branch keeps its fallback (fail-open notes on a fresh
-          # release, consistent with this workflow's other best-effort
-          # steps) but names the version instead of the often-wrong
-          # "Initial release".
+          # --unreleased --tag renders the commits since the last stable tag
+          # as $VERSION. In FINALIZE mode the tag exists at this very commit,
+          # so render the CURRENT release instead (probe states K/L); that
+          # branch has no fallback because a repaired Release body is
+          # permanent. The publish branch fails open on a cliff error.
           if [ "$FINALIZE" = "true" ]; then
             git-cliff --current "${LANE_ARGS[@]}" --strip header > RELEASE_NOTES.md
           else
             git-cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > RELEASE_NOTES.md || echo "Release ${VERSION}" > RELEASE_NOTES.md
+          fi
+          # git-cliff drops a commit that changes no file, so a release made of
+          # a forced base-package rebuild alone renders nothing; list the
+          # commit subjects instead of publishing an empty body.
+          if [ "$RELEASE_NEEDED" = "true" ] && [ -z "$(tr -d '[:space:]' < RELEASE_NOTES.md)" ]; then
+            if [ -n "$LATEST" ]; then
+              range="${LATEST}..HEAD"
+            else
+              range="HEAD"
+            fi
+            {
+              echo "### Changes"
+              echo ""
+              git log --no-merges --format='- %s' "$range"
+            } > RELEASE_NOTES.md
+          fi
+          if [ -n "$PROMOTION_NOTE" ]; then
+            printf '\n%s\n' "$PROMOTION_NOTE" >> RELEASE_NOTES.md
           fi
 
       - name: Sign SBOM for release assets (keyless)
@@ -1390,7 +1118,7 @@ jobs:
         # finalize: the repaired Release must carry the same signed SBOM
         # assets a normal release would, so this step follows the widened
         # gate (the SBOM was regenerated above from the published image).
-        if: ${{ (inputs.release-needed == 'true' || inputs.finalize == 'true') && steps.nochange.outputs.skip != 'true' }}
+        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/sigstore-retry.sh"
@@ -1398,9 +1126,7 @@ jobs:
             --bundle sbom.spdx.json.sigstore.json
 
       - name: Sign dashboard for release assets (keyless)
-        if: >-
-          ${{ (inputs.release-needed == 'true' || inputs.finalize == 'true')
-            && steps.nochange.outputs.skip != 'true' && hashFiles('grafana-dashboard.json') != '' }}
+        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && hashFiles('grafana-dashboard.json') != '' }}
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/sigstore-retry.sh"
@@ -1408,78 +1134,87 @@ jobs:
           retry_sigstore cosign sign-blob --yes grafana-dashboard.json \
             --bundle grafana-dashboard.json.sigstore.json
 
+      # The tag ref is created via the git data API pinned to $GITHUB_SHA
+      # (`gh release create --target` 403s once the branch moved on, observed
+      # fleet-wide 2026-07-15); a tag at the same SHA is reused, one elsewhere
+      # refuses. Handoff (probe-verified 2026-07-21): after a push carrying
+      # workflow-file changes lands past this commit, the integration token
+      # loses ref-create entirely, so when tag-create fails AND the branch head
+      # has moved on, the run exits 0 and the head run's anchor range
+      # re-releases this content. Failing while still at head stays hard.
+      - name: Prepare tag-create helper
+        if: ${{ env.PUBLISH == 'true' }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/create-tag.sh" <<'SH'
+          CREATED_TAG=""
+          create_tag() { # <tag> -> 0 created (CREATED_TAG set) or reused, 2 handed off, 1 refused
+            if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$1" --jq .object.sha 2>/dev/null); then
+              if [ "$EXISTING" != "$GITHUB_SHA" ]; then
+                echo "::error::Tag $1 already exists at ${EXISTING}, but this run built ${GITHUB_SHA}; refusing to publish at a mismatched tag."
+                return 1
+              fi
+              echo "Tag $1 already exists at ${GITHUB_SHA} (rerun); reusing it."
+              return 0
+            fi
+            if gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/$1" -f sha="${GITHUB_SHA}" 2>/tmp/tagerr; then
+              CREATED_TAG="$1"
+              return 0
+            fi
+            cat /tmp/tagerr
+            BRANCH_HEAD=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha 2>/dev/null || echo "")
+            if [ -n "$BRANCH_HEAD" ] && [ "$BRANCH_HEAD" != "$GITHUB_SHA" ]; then
+              MSG="tag $1 not created: ${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${BRANCH_HEAD})"
+              MSG="${MSG} and the superseded run lost ref-create; handing off, the head run re-releases this content."
+              echo "::warning::${MSG}"
+              return 2
+            fi
+            MSG="tag create for $1 failed while this run is still ${GITHUB_REF_NAME}'s head"
+            MSG="${MSG}; not the supersession race, investigate token permissions/API state."
+            echo "::error::${MSG}"
+            return 1
+          }
+          SH
+
+      - name: Create dev tag
+        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'dev' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/create-tag.sh"
+          rc=0
+          create_tag "$TAG" || rc=$?
+          [ "$rc" -eq 2 ] && exit 0
+          [ "$rc" -eq 0 ] || exit "$rc"
+          # The audit reads this receipt: a dev tag has no Release to show
+          # that the pipeline, not a hand, created it. A tag without it would
+          # make a rerun compute release=false, so the tag this attempt
+          # created is deleted with the failed POST and a rerun makes both.
+          if ! gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=success -f context="release/tag/${TAG}" \
+            -f description="created by the dev release run" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
+            if [ "$CREATED_TAG" = "$TAG" ]; then
+              echo "::error::receipt for ${TAG} not recorded; deleting the tag this run created so a rerun recreates both"
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" >/dev/null
+            fi
+            exit 1
+          fi
+
       - name: Create release
         id: release
-        # Only create a GitHub Release when the caller signaled a version bump.
-        # Pure chore/ci/docs pushes still build + push images but reuse the
-        # existing tag — gh release create would error otherwise.
-        #
-        # The tag ref is created FIRST via the git data API, pinned to
-        # $GITHUB_SHA (the commit this image was built from), and the release
-        # is then created against the existing tag with no --target (the
-        # Releases-API tag-create was the first casualty of the restriction
-        # below, observed fleet-wide 2026-07-15). Rerun-idempotent: an
-        # existing tag at the same SHA is reused, an existing tag elsewhere
-        # fails loudly (a tag is never moved), an existing release is left
-        # as-is. finalize mode (tag already at this SHA, Release missing)
-        # flows through the same guards: the tag is reused and only the
-        # Release is created. The "tag elsewhere" arm is a BACKSTOP now — the
-        # "Version ownership gate" at the top of this job refuses a backward
-        # publish before any registry write, so the only way to reach here is
-        # a tag that appeared mid-build, which the gate cannot see.
-        #
-        # Supersession handoff (2026-07-21, probe-verified in a scratch repo):
-        # once a push that includes workflow-file changes lands on the branch
-        # past this run's commit, the integration token loses ref-CREATE
-        # entirely — REST and authenticated git push both return 403
-        # "Resource not accessible by integration", an existing ref at the
-        # same SHA does not whitelist it, and reruns keep the superseded
-        # GITHUB_SHA so they fail identically (web-terminal-kiro v2.1.0,
-        # 2026-07-21, two attempts). Ref DELETE and release-create on an
-        # existing tag keep working. Sync-PR bursts and Renovate ci-digest
-        # bumps are exactly such pushes, and the multi-arch build window is
-        # minutes wide, so this is a routine race for docker repos, not an
-        # anomaly. When tag-create fails AND the branch head has moved past
-        # this run, hand off instead of failing: the superseding push already
-        # queued its own release run (concurrency group, cancel-in-progress
-        # false), and the detect job's stranded-release repair range
-        # (release.yaml "Detect changed paths") makes that head run rebuild
-        # and release this content with full ref rights. Images this run
-        # pushed at the version tag are overwritten by the successor's build
-        # — same version, one commit later, one consistent provenance chain.
-        # A tag-create failure while this run is STILL at head is a real
-        # permission/API problem and stays a hard failure. The go/ts jobs
-        # keep no handoff on purpose: their tag windows are seconds wide, so
-        # a supersession 403 there is almost never this race and should stay
-        # loud (the repair range still recovers the release either way).
-        if: ${{ (inputs.release-needed == 'true' || inputs.finalize == 'true') && steps.nochange.outputs.skip != 'true' }}
+        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
-            if [ "$EXISTING" != "$GITHUB_SHA" ]; then
-              echo "::error::Tag ${VERSION} already exists at ${EXISTING}, but this run built ${GITHUB_SHA}; refusing to attach a release to a mismatched tag."
-              exit 1
-            fi
-            echo "Tag ${VERSION} already exists at ${GITHUB_SHA} (rerun); reusing it."
-          elif ! gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}" 2>/tmp/tagerr; then
-            cat /tmp/tagerr
-            BRANCH_HEAD=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" \
-              --jq .object.sha 2>/dev/null || echo "")
-            if [ -n "$BRANCH_HEAD" ] && [ "$BRANCH_HEAD" != "$GITHUB_SHA" ]; then
-              MSG="tag ${VERSION} not created: ${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${BRANCH_HEAD})"
-              MSG="${MSG} and the superseded run lost ref-create; handing off — the head run re-releases via the stranded-release repair range."
-              echo "::warning::${MSG}"
-              exit 0
-            fi
-            MSG="tag create for ${VERSION} failed while this run is still ${GITHUB_REF_NAME}'s head"
-            MSG="${MSG} — not the supersession race; investigate token permissions/API state."
-            echo "::error::${MSG}"
-            exit 1
-          fi
+          . "$RUNNER_TEMP/create-tag.sh"
+          rc=0
+          create_tag "$VERSION" || rc=$?
+          [ "$rc" -eq 2 ] && exit 0
+          [ "$rc" -eq 0 ] || exit "$rc"
           # Release presence, status-aware: only a definitive HTTP 404
           # proceeds to create; any other API failure fails the step
           # (retryable) instead of risking a duplicate-create. The by-tag
@@ -1544,8 +1279,10 @@ jobs:
             echo "Release assets: \`grafana-dashboard.json\`, \`grafana-dashboard.json.sha256\`, \`grafana-dashboard.json.sigstore.json\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The three Docker Hub description steps run on every stable-channel run,
+      # published or not, so a docs-only promotion still refreshes the page.
       - name: Sync description to Docker Hub
-        if: ${{ contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main' && steps.nochange.outputs.skip != 'true' }}
+        if: ${{ inputs.channel == 'stable' && contains(inputs.registries, 'dockerhub') }}
         continue-on-error: true
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -1554,6 +1291,7 @@ jobs:
           # Via env, never inline ${{ }} in the script body (template injection).
           IMAGE_NAME_INPUT: ${{ inputs.image-name }}
         run: |
+          set -euo pipefail
           TOKEN=$(curl -fsSL "https://hub.docker.com/v2/users/login/" \
             -H "Content-Type: application/json" \
             -d "$(jq -n --arg u "$DOCKERHUB_USERNAME" --arg p "$DOCKERHUB_TOKEN" \
@@ -1572,7 +1310,7 @@ jobs:
       # summary region and compose.yaml, neither of which grows with the README.
       - name: Render Docker Hub overview
         id: hub-overview
-        if: ${{ contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main' && steps.nochange.outputs.skip != 'true' }}
+        if: ${{ inputs.channel == 'stable' && contains(inputs.registries, 'dockerhub') }}
         # Non-blocking, matching the push step below: syncing Hub docs has never
         # gated a release, and this step runs AFTER the images are published, so
         # failing the job here would strand a release over a documentation page.
@@ -1591,7 +1329,7 @@ jobs:
         # Gated on the render producing a file: a README with no summary markers
         # fails the render closed, and skipping the push leaves the previous Hub
         # page in place rather than replacing it with a broken one.
-        if: ${{ contains(inputs.registries, 'dockerhub') && github.ref == 'refs/heads/main' && steps.nochange.outputs.skip != 'true' && steps.hub-overview.outputs.path != '' }}
+        if: ${{ inputs.channel == 'stable' && contains(inputs.registries, 'dockerhub') && steps.hub-overview.outputs.path != '' }}
         continue-on-error: true
         uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
         with:
@@ -1604,21 +1342,22 @@ jobs:
           # as though it were README.md, which is the wrong target.
           enable-url-completion: false
 
-  # ─── Verify both registries serve this run's manifest at the version tag ──
+  # ─── Verify every registry written serves this run's manifest at its tag ─
   # A green finalize is not proof the artifact is fetchable: the 2026-09-04
   # rerun republished two registries and went red only at the Release step.
-  # The tag must exist and, when this run pushed a manifest, carry its index
-  # digest (content-addressed, so identical on both registries); the digest
-  # is empty only when the no-change gate skipped every publish step, and
-  # then the tag left in place from the previous publish is the expectation.
+  # The channel tag must exist and carry this run's index digest
+  # (content-addressed, so identical on both registries). GHCR on both
+  # channels; Docker Hub on stable only, which is the only channel that
+  # writes it.
   verify-publish:
     needs: [prepare, finalize]
-    if: ${{ success() }}
+    if: ${{ always() && needs.prepare.outputs.publish == 'true' && needs.finalize.result == 'success' }}
     runs-on: ubuntu-slim
     timeout-minutes: 12
     permissions: {}
     env:
-      VERSION: ${{ needs.prepare.outputs.version }}
+      CHANNEL: ${{ inputs.channel }}
+      VERSION: ${{ needs.prepare.outputs.tag }}
       DIGEST: ${{ needs.finalize.outputs.digest }}
       REGISTRIES: ${{ inputs.registries }}
       DASHBOARD_DIGEST: ${{ needs.finalize.outputs.dashboard-digest }}
@@ -1639,7 +1378,7 @@ jobs:
           }
           ghcr_token=$(pull_token ghcr "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull")
           hub_token=
-          if [[ "$REGISTRIES" == *dockerhub* ]]; then
+          if [[ "$CHANNEL" == stable && "$REGISTRIES" == *dockerhub* ]]; then
             hub_token=$(pull_token hub "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE_NAME}:pull")
           fi
 
@@ -1668,7 +1407,7 @@ jobs:
 
           rc=0
           verify "$REGISTRY" "$ghcr_token" "${REGISTRY}/${IMAGE_NAME}:${VERSION}" || rc=1
-          if [[ "$REGISTRIES" == *dockerhub* ]]; then
+          if [ -n "$hub_token" ]; then
             verify registry-1.docker.io "$hub_token" "docker.io/${IMAGE_NAME}:${VERSION}" || rc=1
           fi
           # The artifact is a single OCI image manifest, so its own Accept and its

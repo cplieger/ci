@@ -1,0 +1,173 @@
+# Promote a repository's `main` to a commit on its `dev` branch: the one button
+# (and the daily 06:00 UTC schedule for machine-only deltas) that fast-forwards
+# `main`, after which the target repo's own release pipeline publishes the
+# stable channel. scripts/promote.py holds every check; this file holds the
+# credential boundary: the token that can move a main branch reaches exactly
+# one step, the one that updates the ref, and nothing else ever sees it.
+name: Promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository name (without the owner), e.g. knell."
+        type: string
+        required: true
+      target:
+        description: "Commit on dev to promote. Empty means the head of dev."
+        type: string
+        default: ""
+      dry_run:
+        description: "Run every check and render the pending changelog, but do not move main."
+        type: boolean
+        default: false
+      skip_soak:
+        description: "Skip the homelab/soak evidence check (a hotfix). Needs a reason."
+        type: boolean
+        default: false
+      reason:
+        description: "Why the soak check is skipped. Written into the run summary."
+        type: string
+        default: ""
+  schedule:
+    - cron: "0 6 * * *"   # daily 06:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Install git-cliff
+        run: |
+          set -euo pipefail
+          # The clones live outside the workspace so nothing here ever reads
+          # a consumer's files as this repo's.
+          echo "WORK_DIR=${RUNNER_TEMP}/promote" >> "$GITHUB_ENV"
+          # Version + tarball sha256 pinned as a pair; Renovate maintains both
+          # via the custom.git-cliff datasource (GitHub release-asset digest).
+          # Fail-closed: a tarball that does not match the committed pin never
+          # installs.
+          # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
+          CLIFF_VERSION=v2.14.2
+          CLIFF_SHA256=24f397c733add5390fdceee3a2088588ab0d5f944ce00d34cb7029b888cf2db4
+          curl -fsSL --retry 7 --retry-max-time 150 --retry-all-errors -o "$RUNNER_TEMP/git-cliff.tgz" \
+            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
+
+      - name: Plan
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ inputs.repo }}
+          TARGET: ${{ inputs.target }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SKIP_SOAK: ${{ inputs.skip_soak }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          args=(plan)
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            args+=(--scheduled)
+          else
+            args+=(--repo "$REPO")
+            [ -n "$TARGET" ] && args+=(--target "$TARGET")
+            [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
+            if [ "$SKIP_SOAK" = "true" ]; then
+              args+=(--skip-soak --reason "$REASON")
+            fi
+          fi
+          python3 scripts/promote.py --work-dir "$WORK_DIR" "${args[@]}"
+
+      # This repo's own cliff config renders the preview, never the clone's:
+      # git-cliff executes the config's template, and a consumer-authored one
+      # must not run here. Token-free for the same reason the release notes
+      # steps are: a downloaded binary runs over untrusted history.
+      - name: Render pending changelogs
+        run: |
+          set -euo pipefail
+          plan="$WORK_DIR/plan.json"
+          {
+            echo "## Pending changelogs"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          # One read per line, split by hand: a tab is IFS whitespace, so
+          # `read -r a b c d` collapses the empty last_stable of a first release
+          # and shifts the clone path into it.
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            repo=${line%%$'\t'*}
+            rest=${line#*$'\t'}
+            target=${rest%%$'\t'*}
+            rest=${rest#*$'\t'}
+            last=${rest%%$'\t'*}
+            clone=${rest#*$'\t'}
+            if [ -z "$clone" ] || [ ! -d "$clone" ]; then
+              echo "### ${repo}: no clone to render" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            if [ -n "$last" ]; then
+              range="${last}..${target}"
+              notes=$(git -C "$clone" cliff --config "$GITHUB_WORKSPACE/configs/cliff-stable.toml" \
+                --tag-pattern '^v[0-9]+\.[0-9]+\.[0-9]+$' "$range" --strip header 2>/dev/null || echo "(git-cliff failed)")
+            else
+              range="everything up to ${target}"
+              notes=$(git -C "$clone" cliff --config "$GITHUB_WORKSPACE/configs/cliff-stable.toml" \
+                --tag-pattern '^v[0-9]+\.[0-9]+\.[0-9]+$' --unreleased --strip header 2>/dev/null || echo "(git-cliff failed)")
+            fi
+            {
+              echo "### ${repo} (${range})"
+              echo ""
+              echo "${notes:-(no releasing commits; the stable release would carry no notes)}"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          done < <(jq -r '.[] | select(.decision != "skip") | [.repo, .target, .last_stable, .clone_dir] | @tsv' "$plan")
+
+      # The only step that can move a main branch, and the only place the
+      # promotion token is read. Nothing but this repo's own script runs here.
+      - name: Promote
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.PROMOTE_PAT }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/promote.py --work-dir "$WORK_DIR" apply --run-url "$RUN_URL"
+
+      - name: Report
+        if: ${{ always() && !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/promote.py --work-dir "$WORK_DIR" report --run-url "$RUN_URL"
+
+  # `needs:` must list every other job in this workflow.
+  notify:
+    needs: promote
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

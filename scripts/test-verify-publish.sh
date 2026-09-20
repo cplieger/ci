@@ -1,28 +1,11 @@
 #!/usr/bin/env bash
-# Regression probe for the verify-publish registry read-back contract that
-# release.yaml embeds inline (the `Verify published artifacts` step).
-#
-# That step is the only executor of its own shell, and its function signatures
-# are invisible to shellcheck: a signature change to `probe` once left
-# `probe_ts` on the old arity, so `url=$3` was unset and every npm/JSR read
-# died under `set -u` whether or not the package had published — breaking every
-# TypeScript release with the linters completely clean. It was caught by an
-# ad-hoc harness that was then discarded. This file is that harness, kept.
-#
-# What is pinned: the Go-proxy classification (a `unknown revision` negative
-# cache WARNS and keeps the release green; every other refusal stays a red
-# error), the six-tries retry loop, the npm/JSR pair and the exact URLs both
-# receive, the nested-lane discovery through `git tag --points-at HEAD`, and
-# that a warning can never mask a real failure in the same run.
-#
-# The step body is EXTRACTED from release.yaml at runtime and executed; the
-# script carries no copy, because a copy drifts and would have missed the very
-# bug above. PyYAML is available in the `scripts` CI job by step order: the
-# yamllint install earlier in the same job depends on it.
-#
-# Runs in the ci repo's `scripts` CI job (opt-in by file presence), so an edit
-# to the probe functions, the retry loop or the dispatch cannot merge if it
-# breaks the pinned contract. Local run: scripts/test-verify-publish.sh
+# Regression probe for release.yaml's `Verify published artifacts` step. The
+# body is EXTRACTED from the workflow at runtime and executed against stub
+# registries, never copied: a signature change to `probe` once left `probe_ts`
+# on the old arity, so `url=$3` was unset and every npm/JSR read died under
+# `set -u` with the linters clean. CONTRIBUTING.md lists what is pinned. Runs
+# in the ci repo's scripts CI job, where PyYAML is present by step order (the
+# yamllint install depends on it). Local run: scripts/test-verify-publish.sh
 set -euo pipefail
 
 # Hermetic git, same rationale as the sibling probes: a workstation
@@ -95,11 +78,12 @@ chk_has "V-P6 body retries six times" "$STEP_BODY" 'for i in 1 2 3 4 5 6'
 chk_has "V-P7 body discovers lane tags at HEAD" "$STEP_BODY" 'git tag --points-at HEAD'
 chk "V-P8 body parses under bash" \
   "$(bash -n "$WORK/step.sh" 2>/dev/null && echo ok || echo bad)" "ok"
-# Guard against an eighth env var arriving later: the cases would leave it
+# Guard against a ninth env var arriving later: the cases would leave it
 # unset, it would die under set -u, and that reads as a real refusal.
-chk "V-P9 step env is exactly the seven the cases populate" \
+chk "V-P9 step env is exactly the eight the cases populate" \
   "$(cat "$WORK/env-keys")" \
-  "GO_LANES_JSON
+  "CHANNEL
+GO_LANES_JSON
 GO_NESTED_RESULT
 GO_RESULT
 SUBPACKAGES_JSON
@@ -162,7 +146,7 @@ chmod 755 "$BIN/sleep" "$BIN/curl"
 
 # ── Case plumbing ────────────────────────────────────────────────────────────
 defaults() { # every case starts fully populated; an unset var dies under set -u
-  export VERSION=v1.2.3 SUBPACKAGES_JSON='[]' GO_LANES_JSON='[]'
+  export CHANNEL=stable VERSION=v1.2.3 SUBPACKAGES_JSON='[]' GO_LANES_JSON='[]'
   export GO_RESULT=skipped TS_RESULT=skipped SUBPACKAGE_RESULT=skipped GO_NESTED_RESULT=skipped
 }
 spec() { # <line>...
@@ -334,5 +318,48 @@ chk "V-E1 probe/probe_ts arity agrees: both registries reached, in order" \
 $JSR_URL"
 chk "V-E1 nothing else was requested" "$(lines "$CURL_LOG")" "2"
 chk "V-E1 the run passes" "$RC" "0"
+
+# ── V-F: the two channels ────────────────────────────────────────────────────
+D=$(casedir f1)
+pkgjson "$D"
+defaults
+export CHANNEL=dev VERSION=v1.3.0-dev.7 TS_RESULT=success
+spec "*registry.npmjs.org* 0 {}" "*jsr.io* 0 {}"
+run_step "$D"
+chk "V-F1 dev build probes npm at the dev version" \
+  "$(cat "$CURL_LOG")" "https://registry.npmjs.org/@cplieger/probe/1.3.0-dev.7"
+chk "V-F1 dev build never calls JSR" "$(grep -c jsr.io "$CURL_LOG" || true)" "0"
+chk "V-F1 the run passes" "$RC" "0"
+
+D=$(casedir f2)
+pkgjson "$D"
+defaults
+export CHANNEL=stable TS_RESULT=success
+spec "*registry.npmjs.org* 0 {}" "*jsr.io* 0 {}"
+run_step "$D"
+chk "V-F2 stable build probes npm then JSR, as before the channels" \
+  "$(cat "$CURL_LOG")" "$NPM_URL
+$JSR_URL"
+chk "V-F2 the run passes" "$RC" "0"
+
+# A promoted commit carries both a stable and a dev lane tag; each channel
+# must read back only its own.
+git -C "$LANE" tag yamlenv/v1.1.0-dev.2
+chk "V-F0 lane fixture carries both tag shapes at HEAD" \
+  "$(git -C "$LANE" tag --points-at HEAD --list 'yamlenv/v[0-9]*' | sort | tr '\n' ' ')" \
+  "yamlenv/v1.1.0 yamlenv/v1.1.0-dev.2 "
+defaults
+export CHANNEL=dev GO_NESTED_RESULT=success GO_LANES_JSON='["yamlenv"]'
+spec '*proxy.golang.org* 0 {"Version":"v1.1.0-dev.2"}'
+run_step "$LANE"
+chk "V-F3 dev lane probes only the dev lane tag" \
+  "$(sort -u "$CURL_LOG")" "https://proxy.golang.org/github.com/cplieger/probe/yamlenv/@v/v1.1.0-dev.2.info"
+chk "V-F3 the dev lane run passes" "$RC" "0"
+defaults
+export CHANNEL=stable GO_NESTED_RESULT=success GO_LANES_JSON='["yamlenv"]'
+spec '*proxy.golang.org* 0 {"Version":"v1.1.0"}'
+run_step "$LANE"
+chk "V-F4 stable lane probes only the stable lane tag" "$(sort -u "$CURL_LOG")" "$LANE_URL"
+chk "V-F4 the stable lane run passes" "$RC" "0"
 
 echo "PASS: verify-publish probe contract holds (${PASS} checks)"

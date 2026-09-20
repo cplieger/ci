@@ -28,6 +28,8 @@ rules:
       # The scheduled workflows calling notify-failure.yaml.
       - audit.yaml
       - daily-security.yaml
+      - ghcr-retention.yaml
+      - promote.yaml
       - rebuild-stale.yaml
       - sync.yaml
       - weekly-bench.yaml
@@ -47,8 +49,8 @@ rules:
     ignore:
       # docker-release's per-arch build jobs read/write `scope=<arch>` GHA
       # caches. GitHub's cache scoping already prevents a PR branch from
-      # poisoning main's cache (branch caches are only readable downstream,
-      # never by main), and release builds run from main only.
+      # poisoning a long-lived branch's cache (branch caches are only readable
+      # downstream), and release builds run from dev and main only.
       - docker-release.yaml
 
   adhoc-packages:

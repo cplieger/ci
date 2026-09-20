@@ -2,17 +2,11 @@
 # Regression probe for the nested-Go-module lane SHELL semantics that
 # release.yaml (detect: gomodules + changed-path classification, go-nested:
 # module-path verify + version guards + regex escaping) and ci.yaml (detect:
-# nested validation discovery) embed inline.
-#
-# The sibling probe (test-cliff-bump-semantics.sh) pins the git-cliff side of
-# the lane contract (states H/I/J/K); this one pins the bash side. The
-# function bodies below MIRROR the workflow snippets — when editing either,
-# update the other in the same change (the same keep-in-sync convention as
-# EXCLUDE_PATTERNS vs the consumer cliff.toml exclude_paths).
-#
-# Runs in the ci repo's `scripts` CI job (opt-in by file presence), so a
-# change to the prune list, the eligibility filters, the classification
-# loop, or the escaping cannot merge if it breaks the pinned contract.
+# nested validation discovery) embed inline. The classification step is
+# extracted from release.yaml and executed in fixture repos; the other
+# function bodies below MIRROR the workflow snippets, so when editing either
+# side update the other in the same change. Runs in the ci repo's `scripts`
+# CI job (opt-in by file presence).
 set -euo pipefail
 
 # Hermetic git, same rationale as test-cliff-bump-semantics.sh: a global
@@ -98,45 +92,25 @@ discover_ci() {
   echo "$DIRS"
 }
 
-# release.yaml detect/changes: root/subpackage/lane classification.
-classify() { # SIGNIFICANT on stdin; env SUBPACKAGES_JSON GO_LANES_JSON
-  local SIGNIFICANT ROOT_CHANGED=false f s l in_subpkg in_lane OUT="[]"
-  SIGNIFICANT=$(cat)
-  declare -A SUBPKG_CHANGED
-  declare -A LANE_CHANGED
-  mapfile -t SUBPACKAGES < <(echo "$SUBPACKAGES_JSON" | jq -r '.[]')
-  mapfile -t GO_LANES < <(echo "$GO_LANES_JSON" | jq -r '.[]')
-  for s in "${SUBPACKAGES[@]}"; do SUBPKG_CHANGED["$s"]=false; done
-  for l in "${GO_LANES[@]}"; do LANE_CHANGED["$l"]=false; done
-  if [ -n "$SIGNIFICANT" ]; then
-    while IFS= read -r f; do
-      [ -z "$f" ] && continue
-      in_subpkg=false
-      for s in "${SUBPACKAGES[@]}"; do
-        if [[ "$f" == "$s/"* ]]; then
-          # shellcheck disable=SC2034 # mirrors the workflow snippet verbatim; the workflow reads it
-          SUBPKG_CHANGED["$s"]=true
-          in_subpkg=true
-          break
-        fi
-      done
-      in_lane=false
-      for l in "${GO_LANES[@]}"; do
-        if [[ "$f" == "$l/"* ]]; then
-          LANE_CHANGED["$l"]=true
-          in_lane=true
-          break
-        fi
-      done
-      if ! $in_subpkg && ! $in_lane; then ROOT_CHANGED=true; fi
-    done <<<"$SIGNIFICANT"
-  fi
-  for l in "${GO_LANES[@]}"; do
-    if [ "${LANE_CHANGED[$l]}" = "true" ]; then
-      OUT=$(echo "$OUT" | jq -c --arg v "$l" '. + [$v]')
-    fi
-  done
-  echo "root=$ROOT_CHANGED lanes=$OUT"
+# release.yaml detect/changes is EXTRACTED and executed, not mirrored: the
+# classification reads git tags and diffs, which a mirror could only fake.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RELEASE_YAML="$ROOT/.github/workflows/release.yaml"
+python3 - "$RELEASE_YAML" "$WORK" <<'PY'
+import sys, yaml
+
+release, out = sys.argv[1], sys.argv[2]
+jobs = yaml.safe_load(open(release))["jobs"]
+step = next(s for s in jobs["detect"]["steps"] if s.get("name") == "Detect changed paths")
+open(f"{out}/changes.sh", "w").write(step["run"])
+PY
+classify() { # <channel> <anchor> <head> -> root=<bool> lanes=<json>; env SUBPACKAGES_JSON GO_LANES_JSON; run in a repo
+  : >"$WORK/out"
+  : >"$WORK/summary"
+  CHANNEL="$1" BEFORE="$2" ANCHOR_SHA="$2" HEAD="$3" REPO_TYPE=go \
+    GITHUB_OUTPUT="$WORK/out" GITHUB_STEP_SUMMARY="$WORK/summary" \
+    bash "$WORK/changes.sh" >"$WORK/changes.log" 2>&1 || echo "EXIT=$?"
+  echo "root=$(sed -n 's/^root_changed=//p' "$WORK/out") lanes=$(sed -n 's/^go_modules_to_release=//p' "$WORK/out")"
 }
 
 # go-nested: lane module-path verification.
@@ -234,14 +208,95 @@ put scratch/s.go "package scratch"
 chk "L-A7 untracked go.mod is not a lane" "$(cd "$R" && discover_release)" "[]"
 
 # ── Classification states ────────────────────────────────────────────────────
+# No lane carries a tag yet, so every lane is judged on the root range: its
+# first release is owed by whatever that range shows under it.
+commit() { # <message> <path>... -> sha; touches each path with a fresh line
+  local p
+  for p in "${@:2}"; do
+    mkdir -p "$R/$(dirname "$p")"
+    echo "$1" >>"$R/$p"
+  done
+  git -C "$R" add -A
+  git -C "$R" commit -qm "$1"
+  git -C "$R" rev-parse HEAD
+}
+mkrepo classify
+put go.mod "module github.com/cplieger/envx" "go 1.26.5"
+put yamlenv/go.mod "module github.com/cplieger/envx/yamlenv" "go 1.26.5"
+put tools/gen/go.mod "module github.com/cplieger/envx/tools/gen" "go 1.26.5"
+put web/jsr.json '{"name":"@o/web","version":"1.0.0"}'
 export SUBPACKAGES_JSON='["web"]'
 export GO_LANES_JSON='["yamlenv","tools/gen"]'
-chk "L-B1 lane-only change" "$(printf 'yamlenv/yamlenv.go\n' | classify)" 'root=false lanes=["yamlenv"]'
-chk "L-B2 root-only change" "$(printf 'envx.go\n' | classify)" 'root=true lanes=[]'
-chk "L-B3 mixed change" "$(printf 'envx.go\nyamlenv/go.mod\ntools/gen/x.go\n' | classify)" 'root=true lanes=["yamlenv","tools/gen"]'
-chk "L-B4 subpackage change is neither root nor lane" "$(printf 'web/index.ts\n' | classify)" 'root=false lanes=[]'
-chk "L-B5 lane prefix is dir-anchored (yamlenv2/ is root)" "$(printf 'yamlenv2/file.go\n' | classify)" 'root=true lanes=[]'
-chk "L-B6 empty significant set" "$(printf '' | classify)" 'root=false lanes=[]'
+K0=$(commit "feat: initial" envx.go yamlenv/yamlenv.go tools/gen/x.go web/index.ts yamlenv2/file.go)
+git -C "$R" tag v1.0.0 "$K0"
+K1=$(commit "fix: lane" yamlenv/yamlenv.go)
+K2=$(commit "fix: root" envx.go)
+K3=$(commit "fix: mixed" envx.go yamlenv/go.mod tools/gen/x.go)
+K4=$(commit "fix: web" web/index.ts)
+K5=$(commit "fix: root sibling" yamlenv2/file.go)
+K6=$(commit "docs: readme" README.md)
+cd "$R" || exit 1
+chk "L-B1 lane-only change" "$(classify dev "$K0" "$K1")" 'root=false lanes=["yamlenv"]'
+chk "L-B2 root-only change" "$(classify dev "$K1" "$K2")" 'root=true lanes=[]'
+chk "L-B3 mixed change" "$(classify dev "$K2" "$K3")" 'root=true lanes=["yamlenv","tools/gen"]'
+chk "L-B4 subpackage change is neither root nor lane" "$(classify dev "$K3" "$K4")" 'root=false lanes=[]'
+chk "L-B5 lane prefix is dir-anchored (yamlenv2/ is root)" "$(classify dev "$K4" "$K5")" 'root=true lanes=[]'
+chk "L-B6 empty significant set" "$(classify dev "$K5" "$K6")" 'root=false lanes=[]'
+cd "$WORK" || exit 1
+
+# ── Lane anchor states ───────────────────────────────────────────────────────
+# A lane with a tag on this channel is measured from that tag, not from the
+# root anchor, which ignores lane tags and so still predates a lane-only
+# release. compute.sh's nearest_tag is extracted and run on the same fixture,
+# so the lane job's anchor and detect's cannot disagree.
+awk '/^nearest_tag\(\) \{/,/^}/' "$ROOT/actions/git-cliff-version/compute.sh" >"$WORK/nearest_tag.sh"
+lane_anchor_of_compute() { # <channel> <lane> -> compute.sh's anchor_sha for the lane at HEAD; run in a repo
+  local esc pattern dev_pattern tag
+  esc=$(printf '%s' "$2" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
+  pattern="^${esc}/v[0-9]+\\.[0-9]+\\.[0-9]+\$"
+  dev_pattern="${pattern%\$}-dev\\.[0-9]+\$"
+  # The function body extracted above, not a script of its own.
+  # shellcheck source=/dev/null
+  . "$WORK/nearest_tag.sh"
+  if [ "$1" = dev ]; then
+    tag=$(nearest_tag "${pattern}|${dev_pattern}")
+  else
+    tag=$(nearest_tag "$pattern")
+  fi
+  [ -n "$tag" ] && git rev-list -n1 "$tag"
+}
+detect_lane_anchor() { # <lane> -> the anchor detect's notice line names for the lane
+  sed -n "s/^::notice::lane $1: deriving changed paths from \([0-9a-f]*\)\.\.HEAD.*/\1/p" "$WORK/changes.log"
+}
+mkrepo anchored
+put go.mod "module github.com/cplieger/envx" "go 1.26.5"
+put yamlenv/go.mod "module github.com/cplieger/envx/yamlenv" "go 1.26.5"
+export SUBPACKAGES_JSON='[]'
+export GO_LANES_JSON='["yamlenv"]'
+G_A=$(commit "feat: initial" main.go yamlenv/y.go README.md)
+git -C "$R" tag v1.0.0 "$G_A"
+git -C "$R" tag yamlenv/v1.0.0 "$G_A"
+G_B=$(commit "feat(yamlenv): lane change" yamlenv/y.go)
+cd "$R" || exit 1
+chk "L-G1 the lane change since its own tag is owed on dev" "$(classify dev "$G_A" "$G_B")" 'root=false lanes=["yamlenv"]'
+git tag yamlenv/v1.1.0-dev.1 "$G_B"
+G_C=$(commit "docs: readme only" README.md)
+chk "L-G2 a later docs-only commit does not republish the tagged lane" "$(classify dev "$G_A" "$G_C")" 'root=false lanes=[]'
+chk "L-G2 detect measured the lane from its own dev tag" "$(detect_lane_anchor yamlenv)" "$G_B"
+chk "L-G2 compute.sh's lane anchor is the same commit" "$(lane_anchor_of_compute dev yamlenv)" "$G_B"
+G_D=$(commit "fix: root only" main.go)
+chk "L-G3 a root-only commit above the lane tag releases the root alone" "$(classify dev "$G_A" "$G_D")" 'root=true lanes=[]'
+G_E=$(commit "fix(yamlenv): second lane change" yamlenv/y.go)
+chk "L-G4 a new lane change since the lane tag is owed again" "$(classify dev "$G_A" "$G_E")" 'root=true lanes=["yamlenv"]'
+chk "L-G5 on stable the dev tag is no anchor: the lane is owed since yamlenv/v1.0.0" "$(classify stable "$G_A" "$G_C")" 'root=false lanes=["yamlenv"]'
+chk "L-G5 compute.sh agrees on the stable anchor" "$(lane_anchor_of_compute stable yamlenv)" "$G_A"
+git tag yamlenv/v1.1.0-dev.2 "$G_E"
+G_F=$(commit "docs(yamlenv): lane readme" yamlenv/README.md)
+chk "L-G6 an excluded path under the lane is not a lane change" "$(classify dev "$G_A" "$G_F")" 'root=true lanes=[]'
+git tag yamlenv/v1.1.0 "$G_F"
+chk "L-G7 on stable a lane tag at this commit is emitted for the Release repair" "$(classify stable "$G_A" "$G_F")" 'root=true lanes=["yamlenv"]'
+chk "L-G7 on dev a lane tag at this commit has nothing to do" "$(classify dev "$G_A" "$G_F")" 'root=true lanes=[]'
+cd "$WORK" || exit 1
 
 # ── Module-path verification states ──────────────────────────────────────────
 chk "L-C1 v1 exact path ok" "$(verify_modpath yamlenv yamlenv/v1.2.3 github.com/cplieger/envx/yamlenv cplieger/envx)" "ok"
@@ -270,8 +325,6 @@ chk "L-E4 dollar escaped" "$(esc 'a$b')" 'a\$b'
 # docker pipeline — a later edit that stops forwarding go_modules or drops
 # the LANE_ARGS expansion would keep every cliff state green while silently
 # unscoping image release notes.
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RELEASE_YAML="$ROOT/.github/workflows/release.yaml"
 DOCKER_YAML="$ROOT/.github/workflows/docker-release.yaml"
 # shellcheck disable=SC2016 # the ${{ }} is a literal GitHub expression, not shell
 chk "L-F1 release.yaml forwards detect's go_modules to docker-release" \

@@ -30,6 +30,8 @@ import json
 import subprocess
 import sys
 
+import release_channels
+
 OWNER = 'cplieger'
 TIMEOUT = 10  # seconds per API call
 
@@ -167,19 +169,34 @@ def tree_paths(repo, recursive):
 
 
 def latest_tag(repo):
-    """Name of the repo's newest tag: '' when untagged, None when the read
-    FAILED.
+    """Name of the repo's newest STABLE tag (vX.Y.Z): '' when there is none,
+    None when the read FAILED.
 
     Failure must not classify: the bash treated a failed tags read as
     untagged, so a transient API error on a live v0.x repo flipped it to
     the stable cliff tier and the sync auto-merged the wrong cliff.toml.
+    A dev or lane tag is not a root version, so the listing pages past them.
     """
-    data = api_json(f'repos/{OWNER}/{repo}/tags')
-    if data is None:
+
+    def fetch(page):
+        data = api_json(
+            f'repos/{OWNER}/{repo}/tags?per_page={release_channels.TAG_PAGE_SIZE}&page={page}'
+        )
+        if data is None:
+            return None
+        if not isinstance(data, list):
+            return []
+        return [entry.get('name') or '' for entry in data if isinstance(entry, dict)]
+
+    try:
+        names = release_channels.collect_tags(fetch, want_stable=1)
+    except release_channels.TagListingTruncatedError as err:
+        sys.exit(
+            f'classify-repos: tags listing of {repo} truncated ({err}); aborting rather than guessing the cliff tier'
+        )
+    if names is None:
         return None
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        return data[0].get('name') or ''
-    return ''
+    return release_channels.newest_stable_tag(names)
 
 
 def discover_repos():

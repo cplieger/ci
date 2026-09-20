@@ -1,71 +1,15 @@
-# Unified release pipeline for all cplieger consumer repos.
-#
-# Single entry point. Consumer repos call this workflow on every push to main;
-# all routing decisions are made centrally:
-#
-#   detect job    →  Compute cliff version, detect repo type
-#                    (docker/go/ts), find TS subpackages, identify which paths
-#                    actually changed (vs. excluded test/lint/docs), and resolve
-#                    per-repo policy overrides (registries, platforms, sbom).
-#
-#   docker job    →  Delegates to docker-release.yaml when type=docker AND
-#                    non-excluded paths changed. docker-release.yaml itself
-#                    handles build/sign/SBOM/release using the values we pass.
-#
-#   go job        →  Tag + GitHub Release for type=go (root module). No build
-#                    step — `go install <repo>@<tag>` fetches by tag.
-#
-#   ts job        →  npm + JSR publish + tag + GitHub Release for type=ts
-#                    (root TS lib).
-#
-#   subpackage    →  Matrix over `*/jsr.json` subpackages where the subpackage
-#                    dir had non-excluded changes; npm + JSR publish per dir.
-#                    Used by hybrid repos (e.g., web-terminal-engine: Go module at root +
-#                    web/ TS subpackage). Shares the ROOT version.
-#
-#   go-nested     →  Matrix over tracked nested Go modules (`<dir>/go.mod`)
-#                    whose dir had non-excluded changes. Each is an
-#                    independent release lane: own conventional-commit
-#                    version, own `<dir>/vX.Y.Z` tag + GitHub Release with
-#                    lane-scoped notes. Root version/notes are recomputed
-#                    lane-aware when lanes exist (the fleet-synced cliff
-#                    config cannot know per-repo lane dirs, so lane commits
-#                    would otherwise count toward the root bump — see the
-#                    detect job's recompute step).
-#
-#   verify-publish→  Reads every published artifact back from its registry
-#                    (Go proxy, npm, JSR) at the released version. npm and JSR
-#                    are pushed to, so an absence there fails the run. The Go
-#                    proxy is only mirrored FROM the git tag, so its probe warms
-#                    the module and warns; see the probe_go comment. Docker
-#                    images are verified inside docker-release.yaml.
-#
-# Path-change detection uses central exclusion patterns (see "Detect changed
-# paths" step) — opinionated and tight by default. Tests, lint configs, docs,
-# generated bundles, CI metadata are all ignored. If only excluded paths
-# changed, no rebuild/republish is triggered even if cliff would bump the
-# version (rare edge case: a `feat:` commit that only touches README).
-#
-# Per-repo policy is centralized in the "Resolve repo policy" step — no
-# per-repo config files. To change a repo's settings, edit this workflow.
+# Unified release pipeline for all cplieger consumer repos, in two channels.
+# The branch is read in exactly one place, detect's `Select channel` step, and
+# the channel travels as data from there: a push to `dev` publishes the dev
+# channel (`vX.Y.Z-dev.N` tags, `:dev` images on GHCR, the npm `dev` dist-tag,
+# no GitHub Release); any other branch publishes the stable channel (`vX.Y.Z`,
+# GHCR + Docker Hub, npm + JSR, a GitHub Release). Path significance is the
+# EXCLUDE_PATTERNS list in detect, so a push touching only excluded paths
+# publishes nothing; per-repo policy is the "Resolve repo policy" step.
 name: Release
 
 on:
   workflow_call:
-    inputs:
-      skip_if_unchanged:
-        description: >-
-          Give this run no-op-skip semantics: when the docker pipeline finds
-          the rebuilt image's package inventory identical to what :latest
-          already ships, every publish step is skipped (no tag moves, no
-          digest churn). Normally set via the consumer stub's
-          workflow_dispatch input by the scheduled staleness rebuild
-          (cplieger/ci rebuild-stale.yaml); push events keep today's
-          always-publish semantics. Docker-type repos only; go/ts releases
-          ignore it.
-        type: boolean
-        required: false
-        default: false
     secrets:
       DOCKERHUB_USERNAME:
         required: false
@@ -87,23 +31,30 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 3
     outputs:
+      channel: ${{ steps.channel.outputs.channel }}
       type: ${{ steps.type.outputs.type }}
       subpackages: ${{ steps.type.outputs.subpackages }}
       subpackages_to_publish: ${{ steps.changes.outputs.subpackages_to_publish }}
-      # version/release: the lane-aware recompute (steps.lanes) overrides the
-      # composite action's config-driven result whenever nested Go module
-      # lanes exist — the fleet-synced cliff config cannot know per-repo lane
-      # dirs, so without it lane commits count toward the ROOT version bump
-      # (see the recompute step). Empty-string-falsy fallback keeps
-      # single-module repos byte-identical.
-      version: ${{ steps.lanes.outputs.version || steps.cliff.outputs.version }}
-      release: ${{ steps.lanes.outputs.release || steps.cliff.outputs.release }}
+      # version is the tag this run creates: the dev version on dev, the
+      # stable base on stable. base and dev_version are both exposed because
+      # docker-release derives vX / vX.Y from the base on either channel.
+      version: ${{ steps.select.outputs.version }}
+      release: ${{ steps.select.outputs.release }}
+      base: ${{ steps.select.outputs.base }}
+      dev_version: ${{ steps.select.outputs.dev_version }}
+      latest: ${{ steps.cliff.outputs.latest }}
+      exclude_re: ${{ steps.changes.outputs.exclude_re }}
       root_changed: ${{ steps.changes.outputs.root_changed }}
       go_modules: ${{ steps.gomodules.outputs.go_modules }}
       go_modules_to_release: ${{ steps.changes.outputs.go_modules_to_release }}
       # finalize: a prior run tagged this exact commit but died before its
-      # GitHub Release; publish jobs repair the Release only (see the step).
+      # GitHub Release; the publish jobs re-run for the tagged version and
+      # create the missing Release (see the step).
       finalize: ${{ steps.finalize.outputs.finalize }}
+      # promotion_note: the sentence the stable release notes carry when the
+      # promotion skipped the homelab soak (promote.py records the reason as a
+      # commit status on the promoted commit); empty otherwise.
+      promotion_note: ${{ steps.promotion.outputs.promotion_note }}
       registries: ${{ steps.policy.outputs.registries }}
       platforms: ${{ steps.policy.outputs.platforms }}
       sbom_from: ${{ steps.policy.outputs.sbom_from }}
@@ -118,18 +69,26 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Compute version (cliff)
-        id: cliff
-        # Absolute @sha pin (Renovate-managed via the # v2 comment). Unlike a
-        # local reusable workflow, a local composite action (`./actions/...`)
-        # resolves against the CONSUMER's checked-out workspace, not this
-        # repo, so it 404s when release.yaml is called from another repo. This
-        # action's content is stable, so pin-lag is a non-issue here.
-        uses: cplieger/ci/actions/git-cliff-version@51affb0eab0a80aa0711a6e7c7e0d1339e0c62f2 # v2
+      # The only place in the release pipeline that reads a branch name.
+      # Everything downstream, docker-release.yaml included, receives the
+      # channel as data, so a repo that has not adopted a dev branch keeps
+      # the stable behaviour on main unchanged.
+      - name: Select channel
+        id: channel
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" = "refs/heads/dev" ]; then
+            CHANNEL=dev
+          else
+            CHANNEL=stable
+          fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "Channel: $CHANNEL ($GITHUB_REF)"
 
       - name: Detect type + subpackages
         id: type
         run: |
+          set -euo pipefail
           # Type precedence: Dockerfile > jsr.json > go.mod. A repo that has
           # multiple of these signals (e.g., docker-age has Dockerfile + go.mod)
           # is treated as docker; the go.mod is for the binary inside the image
@@ -161,6 +120,7 @@ jobs:
       - name: Detect nested Go modules
         id: gomodules
         run: |
+          set -euo pipefail
           # Nested Go modules — a TRACKED subdirectory go.mod — each get their
           # own release lane: independent conventional-commit versioning and
           # <dir>/vX.Y.Z tags (the go-nested job below). Works for any repo
@@ -228,60 +188,64 @@ jobs:
               fi
             done < <(echo "$LANES" | jq -r '.[]')
           done < <(echo "$LANES" | jq -r '.[]')
-          echo "go_modules=$LANES" >> "$GITHUB_OUTPUT"
+          {
+            echo "go_modules=$LANES"
+            echo "exclude_paths<<EOF"
+            echo "$LANES" | jq -r '.[] | . + "/**"'
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
           echo "nested Go module lanes: $LANES"
+
+      # A composite action cannot be a local `./actions/...` ref here: that
+      # resolves against the CONSUMER's checkout and 404s. The action's channel
+      # outputs land in the same commit as this workflow, so the ref is the
+      # major tag until that commit's SHA exists (zizmor: cplieger/* ref-pin);
+      # Select version refuses an older action instead of publishing from
+      # empty outputs.
+      - name: Compute version (cliff)
+        id: cliff
+        uses: cplieger/ci/actions/git-cliff-version@v3
+        with:
+          channel: ${{ steps.channel.outputs.channel }}
+          exclude-paths: ${{ steps.gomodules.outputs.exclude_paths }}
 
       - name: Detect changed paths
         id: changes
         env:
           BEFORE: ${{ github.event.before }}
           HEAD: ${{ github.sha }}
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+          ANCHOR_SHA: ${{ steps.cliff.outputs.anchor_sha }}
           SUBPACKAGES_JSON: ${{ steps.type.outputs.subpackages }}
           GO_LANES_JSON: ${{ steps.gomodules.outputs.go_modules }}
           REPO_TYPE: ${{ steps.type.outputs.type }}
-          CLIFF_RELEASE: ${{ steps.cliff.outputs.release }}
         run: |
-          # Determine the set of files that materially changed in this push.
-          # - For push events with a known `before` SHA: git diff before..HEAD.
-          # - For workflow_dispatch, initial branch creation, or unreachable
-          #   `before` (force-push): treat all tracked files as "changed" so
-          #   the run proceeds (loose default; tighter behaviors can be added
-          #   later if needed).
+          set -euo pipefail
+          # The range is <anchor>..HEAD, the anchor being the channel's newest
+          # reachable tag: the previous push's tag on a routine push, which
+          # equals the push range; wider after a run that died before tagging
+          # or after untagged docs-only pushes, so their content still counts;
+          # on stable, everything since the last stable release. A dispatch
+          # (no `before`) keeps "every tracked file" so it stays the repair
+          # lever, and an unreachable `before` (force push) does the same.
+          RANGE_START=""
           if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
             echo "::notice::No before SHA — treating all tracked files as changed"
             CHANGED=$(git ls-files)
-          elif ! CHANGED=$(git diff --name-only "$BEFORE..$HEAD" 2>/dev/null); then
-            echo "::notice::git diff failed (force push or unreachable history) — treating all tracked files as changed"
-            CHANGED=$(git ls-files)
-          fi
-
-          # Stranded-release repair (2026-07-21): when cliff owes a release
-          # (CLIFF_RELEASE=true) the push-range diff above can under-report —
-          # a releasable commit from an EARLIER push may still be untagged
-          # because its own run died (tag-create 403 after a workflow-touching
-          # push superseded it mid-build; see docker-release.yaml "Create
-          # release") or skipped (that push touched only excluded paths, the
-          # web-terminal-server 2026-07-19 stranding). This run's commit IS
-          # main's head (or a successor run's will be), so re-derive
-          # significance from the full unreleased range (last v* tag .. HEAD):
-          # the stranded content counts, the build/publish jobs fire, and the
-          # release lands from a run that still has ref-create rights.
-          # Publish idempotency absorbs any already-published subset
-          # (version-exists guards on npm/JSR, per-lane version compute,
-          # docker image overwrite at the same version tag). BEFORE moves to
-          # the tag so the package.json dev-deps refinement below compares
-          # against the released base, not the push base. When release=false
-          # this block is inert — the push-range semantics (and the no-op
-          # skip for docs/sync pushes) are unchanged.
-          if [ "$CLIFF_RELEASE" = "true" ]; then
-            if LATEST_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null); then
-              CHANGED=$(git diff --name-only "${LATEST_TAG}..${HEAD}")
-              BEFORE=$(git rev-parse "${LATEST_TAG}^{commit}")
-              echo "::notice::release due — deriving changed paths from ${LATEST_TAG}..HEAD (stranded-release repair range)"
+          elif [ -n "$ANCHOR_SHA" ]; then
+            if CHANGED=$(git diff --name-only "$ANCHOR_SHA..$HEAD" 2>/dev/null); then
+              RANGE_START="$ANCHOR_SHA"
+              BEFORE="$ANCHOR_SHA"
+              echo "::notice::deriving changed paths from ${ANCHOR_SHA}..HEAD (newest tag on this channel)"
             else
-              echo "::notice::release due with no prior v* tag — treating all tracked files as changed"
+              echo "::notice::git diff from the anchor failed — treating all tracked files as changed"
               CHANGED=$(git ls-files)
             fi
+          elif CHANGED=$(git diff --name-only "$BEFORE..$HEAD" 2>/dev/null); then
+            RANGE_START="$BEFORE"
+          else
+            echo "::notice::git diff failed (force push or unreachable history) — treating all tracked files as changed"
+            CHANGED=$(git ls-files)
           fi
 
           # Central exclusion patterns. Tight by default: anything that doesn't
@@ -434,6 +398,21 @@ jobs:
             SIGNIFICANT=$(echo "$CHANGED" | grep -Ev "$EXCLUDE_RE" || true)
           fi
 
+          # A commit with no file changes exists only to force a build (the
+          # base-package rebuild), and git-cliff cannot see it, so it counts
+          # as a significant root change here.
+          EMPTY_COMMIT=""
+          if [ -z "$SIGNIFICANT" ] && [ -n "$RANGE_START" ]; then
+            while IFS= read -r c; do
+              [ -z "$c" ] && continue
+              if [ -z "$(git diff-tree --root --no-commit-id --name-only -r "$c")" ]; then
+                EMPTY_COMMIT="$c"
+                echo "::notice::commit ${c} changes no file; treating it as a significant root change"
+                break
+              fi
+            done < <(git rev-list --no-merges "$RANGE_START..$HEAD")
+          fi
+
           # Refine package.json significance (type-aware). package.json is the
           # one file that is both a dev artifact (devDependencies, scripts) and,
           # for TS libs, the published manifest. A blanket exclude would let a
@@ -512,15 +491,47 @@ jobs:
           ROOT_CHANGED=false
           declare -A SUBPKG_CHANGED
           declare -A LANE_CHANGED
+          declare -A LANE_ANCHOR
           mapfile -t SUBPACKAGES < <(echo "$SUBPACKAGES_JSON" | jq -r '.[]')
           mapfile -t GO_LANES < <(echo "$GO_LANES_JSON" | jq -r '.[]')
           for s in "${SUBPACKAGES[@]}"; do
             SUBPKG_CHANGED["$s"]=false
           done
+
+          # A lane's change set is measured from ITS newest channel tag, never
+          # the root's: the root anchor ignores lane tags, so after a lane-only
+          # release it still predates that release, and the next root or docs
+          # commit would read the lane's old change again and republish an
+          # unchanged lane. Same exact-regex nearest-tag rule as compute.sh's
+          # nearest_tag, so detect and the lane job agree on the anchor.
+          lane_anchor() { # <dir> -> commit of the lane's channel tag nearest HEAD, or nothing
+            local esc re name obj peeled commit
+            local -A tag_at=()
+            esc=$(printf '%s' "$1" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
+            re="^${esc}/v[0-9]+\\.[0-9]+\\.[0-9]+\$"
+            if [ "$CHANNEL" = dev ]; then
+              re="${re}|${re%\$}-dev\\.[0-9]+\$"
+            fi
+            while read -r name obj peeled; do
+              [[ $name =~ $re ]] || continue
+              tag_at["${peeled:-$obj}"]="$name"
+            done < <(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)')
+            [ "${#tag_at[@]}" -gt 0 ] || return 0
+            while read -r commit; do
+              if [ -n "${tag_at[$commit]:-}" ]; then
+                printf '%s' "$commit"
+                return 0
+              fi
+            done < <(git rev-list --topo-order "$HEAD")
+          }
           for l in "${GO_LANES[@]}"; do
             LANE_CHANGED["$l"]=false
+            LANE_ANCHOR["$l"]="$(lane_anchor "$l")"
           done
 
+          if [ -n "$EMPTY_COMMIT" ]; then
+            ROOT_CHANGED=true
+          fi
           if [ -n "$SIGNIFICANT" ]; then
             while IFS= read -r f; do
               [ -z "$f" ] && continue
@@ -535,8 +546,12 @@ jobs:
               in_lane=false
               for l in "${GO_LANES[@]}"; do
                 if [[ "$f" == "$l/"* ]]; then
-                  LANE_CHANGED["$l"]=true
                   in_lane=true
+                  # A lane without a tag on this channel has its first release
+                  # owed by whatever the root range shows under it.
+                  if [ -z "${LANE_ANCHOR[$l]}" ]; then
+                    LANE_CHANGED["$l"]=true
+                  fi
                   break
                 fi
               done
@@ -545,6 +560,26 @@ jobs:
               fi
             done <<< "$SIGNIFICANT"
           fi
+
+          # A lane with a tag on this channel is owed a release when a shipped
+          # path under it changed since that tag. On stable a lane tag at this
+          # commit is emitted too, so the lane job can run the Release repair
+          # the root runs in Detect finalize state.
+          for l in "${GO_LANES[@]}"; do
+            anchor="${LANE_ANCHOR[$l]}"
+            [ -n "$anchor" ] || continue
+            if [ "$anchor" = "$HEAD" ]; then
+              if [ "$CHANNEL" = stable ]; then
+                LANE_CHANGED["$l"]=true
+              fi
+              continue
+            fi
+            echo "::notice::lane ${l}: deriving changed paths from ${anchor}..HEAD (newest lane tag on this channel)"
+            lane_diff=$(git diff --name-only "$anchor..$HEAD" -- "$l/")
+            if [ -n "$lane_diff" ] && grep -Eqv "$EXCLUDE_RE" <<< "$lane_diff"; then
+              LANE_CHANGED["$l"]=true
+            fi
+          done
 
           SUBS_TO_PUBLISH="[]"
           for s in "${SUBPACKAGES[@]}"; do
@@ -564,6 +599,7 @@ jobs:
             echo "root_changed=$ROOT_CHANGED"
             echo "subpackages_to_publish=$SUBS_TO_PUBLISH"
             echo "go_modules_to_release=$GO_LANES_TO_RELEASE"
+            echo "exclude_re=$EXCLUDE_RE"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -575,6 +611,9 @@ jobs:
             echo "**Significant paths:**"
             echo '```'
             echo "${SIGNIFICANT:-(none — only excluded paths changed)}"
+            if [ -n "$EMPTY_COMMIT" ]; then
+              echo "(commit ${EMPTY_COMMIT} changes no file and counts as a root change)"
+            fi
             echo '```'
             echo ""
             echo "**Outputs:**"
@@ -583,104 +622,70 @@ jobs:
             echo "- go_modules_to_release: $GO_LANES_TO_RELEASE"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Recompute lane-aware versions
-        id: lanes
-        if: ${{ steps.gomodules.outputs.go_modules != '[]' }}
+      # The release decision is "a shipped path changed and this commit is
+      # not already tagged on this channel"; git-cliff only decides the bump
+      # level, and a level of "none" on a real change becomes a patch floor.
+      # A changed TS subpackage counts: it shares the root version, so its
+      # publish needs the root tag the go job creates, while the root image
+      # rebuilds on root_changed alone.
+      - name: Select version
+        id: select
         env:
-          GO_LANES_JSON: ${{ steps.gomodules.outputs.go_modules }}
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+          ROOT_CHANGED: ${{ steps.changes.outputs.root_changed }}
+          SUBPACKAGES_TO_PUBLISH: ${{ steps.changes.outputs.subpackages_to_publish }}
+          BASE: ${{ steps.cliff.outputs.base }}
+          DEV_VERSION: ${{ steps.cliff.outputs.dev_version }}
+          FLOOR_BASE: ${{ steps.cliff.outputs.floor_base }}
+          FLOOR_DEV_VERSION: ${{ steps.cliff.outputs.floor_dev_version }}
+          LATEST: ${{ steps.cliff.outputs.latest }}
+          ANCHOR_SHA: ${{ steps.cliff.outputs.anchor_sha }}
         run: |
-          # With nested Go module lanes present, the composite action's
-          # config-driven compute above is not lane-safe: the fleet-synced
-          # cliff config cannot know this repo's lane dirs, so a lane-only
-          # commit (e.g. a yaml-dep feat in yamlenv/) would count toward the
-          # ROOT version bump and mint a spurious root release (verified on
-          # v2.13.1; probe state H pins it). Recompute the root version with
-          # per-repo CLI scoping: each lane's commits excluded via
-          # --exclude-path '<dir>/**' (CLI excludes MERGE with the config
-          # exclude_paths — probe state J pins that), plus the root tag
-          # universe stated explicitly via --tag-pattern '^v[0-9]' as
-          # defense-in-depth — the anchored pattern ships in the synced
-          # config, but this step must not depend on every consumer's
-          # cliff.toml being current (an unanchored stale copy would let a
-          # lane tag hijack the version string — probe state G's hazard).
-          # Version + tarball sha256 pinned as a pair; Renovate maintains both
-          # via the custom.git-cliff datasource (GitHub release-asset digest).
-          # Fail-closed: a tarball that does not match the committed pin never
-          # installs — the binary runs against every repo's history, and the
-          # checkout already treats it as untrusted (persist-credentials is
-          # false everywhere it runs).
-          # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
-          CLIFF_VERSION=v2.14.2
-          CLIFF_SHA256=24f397c733add5390fdceee3a2088588ab0d5f944ce00d34cb7029b888cf2db4
-          curl -fsSL --retry 7 --retry-max-time 150 --retry-all-errors -o "$RUNNER_TEMP/git-cliff.tgz" \
-            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
-          echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
-          tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          ARGS=(--tag-pattern '^v[0-9]')
-          while IFS= read -r d; do
-            [ -z "$d" ] && continue
-            ARGS+=(--exclude-path "$d/**")
-          done < <(echo "$GO_LANES_JSON" | jq -r '.[]')
-          if ! NEXT="$(git cliff --unreleased --bumped-version "${ARGS[@]}" 2>/tmp/cliff.err)"; then
-            echo "::error::lane-aware git-cliff --bumped-version failed:"
-            sed 's/^/  /' /tmp/cliff.err >&2 || true
+          set -euo pipefail
+          if [ -z "$BASE" ]; then
+            echo "::error::git-cliff-version returned no base: the referenced action predates the channel outputs"
             exit 1
           fi
-          if [ -z "$NEXT" ]; then
-            echo "::error::lane-aware git-cliff returned an empty version with no error"
-            exit 1
+          RELEASE=false
+          if [ "$ANCHOR_SHA" != "$GITHUB_SHA" ]; then
+            if [ "$ROOT_CHANGED" = "true" ] || [ "$SUBPACKAGES_TO_PUBLISH" != "[]" ]; then
+              RELEASE=true
+            fi
           fi
-          # Defense in depth: the root lane must never tag a lane-prefixed
-          # version. If this fires, the cliff contract changed under us.
-          case "$NEXT" in
-            v[0-9]*) : ;;
-            *)
-              echo "::error::lane-aware compute returned non-root version '$NEXT'; refusing"
-              exit 1 ;;
-          esac
-          LATEST="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo "")"
-          if [ "$NEXT" = "$LATEST" ]; then
-            echo "release=false" >> "$GITHUB_OUTPUT"
+          if [ "$RELEASE" = "true" ] && [ "$BASE" = "$LATEST" ] && [ -n "$FLOOR_BASE" ]; then
+            echo "::notice::git-cliff proposes no bump for a shipped change; flooring ${BASE} to ${FLOOR_BASE}"
+            BASE="$FLOOR_BASE"
+            DEV_VERSION="$FLOOR_DEV_VERSION"
+          fi
+          if [ "$CHANNEL" = "dev" ]; then
+            VERSION="$DEV_VERSION"
           else
-            echo "release=true" >> "$GITHUB_OUTPUT"
+            VERSION="$BASE"
           fi
-          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
-          echo "Lane-aware root version: ${NEXT} (latest root tag: ${LATEST:-<none>}; lanes: ${GO_LANES_JSON})"
+          {
+            echo "version=$VERSION"
+            echo "release=$RELEASE"
+            echo "base=$BASE"
+            echo "dev_version=$DEV_VERSION"
+          } >> "$GITHUB_OUTPUT"
+          echo "Selected: channel=${CHANNEL} version=${VERSION} base=${BASE} release=${RELEASE} (latest stable: ${LATEST:-<none>})"
 
+      # Stable only: a dev build has no Release to repair. On stable a prior
+      # run can tag this commit and die before the Release; the compute then
+      # says release=false (anchor == HEAD) and nothing would ever repair it,
+      # while moving the tag is forbidden. finalize=true re-runs the publish
+      # jobs for the tagged version: the tag guard reuses the tag, npm and JSR
+      # skip an existing version, the image tags move to a rebuild of the
+      # same commit, and the missing Release gets --current notes (states K/L).
       - name: Detect finalize state
         id: finalize
+        if: ${{ steps.channel.outputs.channel == 'stable' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          EFFECTIVE_RELEASE: ${{ steps.lanes.outputs.release || steps.cliff.outputs.release }}
-          EFFECTIVE_VERSION: ${{ steps.lanes.outputs.version || steps.cliff.outputs.version }}
+          EFFECTIVE_RELEASE: ${{ steps.select.outputs.release }}
+          EFFECTIVE_VERSION: ${{ steps.select.outputs.version }}
         run: |
-          # A prior run can create the version tag and then die before the
-          # GitHub Release lands (a transient API failure in exactly the
-          # window of the 2026-07-15 fleet incident class). On rerun the
-          # version compute sees NEXT == LATEST and reports release=false,
-          # so the publish jobs would skip and the missing Release could
-          # never be repaired by rerun — while re-cutting or moving the tag
-          # is forbidden (Go module versions and image provenance are
-          # immutable once published). Not just a cosmetic gap: the release
-          # EVENT never fires, so its consumers (the per-repo Komodo hook
-          # that expedites a Renovate scan) miss it, and the Release page
-          # with the changelog + signed SBOM assets is absent until
-          # repaired. Image deploys still land via the resident Renovate's
-          # hourly registry sweep — delayed, not lost.
-          #
-          # finalize=true when the computed version's tag already points at
-          # THIS commit and its GitHub Release is missing. The go/ts/docker
-          # jobs then run in finalize mode: repair the Release only (notes
-          # via --current, since the commits are no longer "unreleased";
-          # probe states K/L pin that rendering). They never re-tag — the
-          # exists-at-same-SHA guard already passes through — and never
-          # touch package registries (the root ts publish step is gated on
-          # release=='true'; by step order a root tag can only exist after
-          # its registries already published). Same-SHA only, deliberately:
-          # after the branch moves on, notes and artifacts can no longer be
-          # reproduced faithfully from a newer checkout — re-run the
-          # original commit's workflow run instead (the natural repair path,
-          # which this step is what makes work).
+          set -euo pipefail
           FINALIZE=false
           if [ "$EFFECTIVE_RELEASE" = "false" ] && [ -n "$EFFECTIVE_VERSION" ]; then
             TAG_SHA=$(git rev-list -n1 "$EFFECTIVE_VERSION" 2>/dev/null || echo "")
@@ -697,7 +702,7 @@ jobs:
                 echo "::notice::tag ${EFFECTIVE_VERSION} exists at this commit and its Release is present — nothing to repair"
               elif grep -q 'HTTP 404' /tmp/relerr; then
                 FINALIZE=true
-                echo "::notice::tag ${EFFECTIVE_VERSION} exists at this commit without a GitHub Release — finalize mode (repair the Release only)"
+                echo "::notice::tag ${EFFECTIVE_VERSION} exists at this commit without a Release: finalize republishes it and creates the Release"
               else
                 echo "::error::could not determine whether Release ${EFFECTIVE_VERSION} exists:"
                 cat /tmp/relerr
@@ -707,12 +712,42 @@ jobs:
           fi
           echo "finalize=$FINALIZE" >> "$GITHUB_OUTPUT"
 
+      # Every promotion writes the `promotion/soak-override` status on the
+      # promoted commit before main moves: state success with the reason when
+      # the homelab soak was skipped, success with an empty description when it
+      # was not (so an older reason on the commit is retired), failure when the
+      # ref update failed. The stable release notes repeat the reason of the
+      # newest row by `updated_at` then `id` (the API documents no row order,
+      # two writes can share a second), only from a success. A read error
+      # warns rather than blocking the release; the run summary has the reason.
+      - name: Read promotion record
+        id: promotion
+        if: ${{ steps.channel.outputs.channel == 'stable' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTE=""
+          FILTER='[.statuses[]|select(.context=="promotion/soak-override")]|max_by([.updated_at,.id])|select(.state=="success").description // ""'
+          # The description is free text another writer posted; the runner
+          # rejects a key=value output holding a newline, so it is read as one line.
+          if REASON=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/status" --jq "$FILTER" 2>"$RUNNER_TEMP/promerr" | tr -d '\n\r'); then
+            if [ -n "$REASON" ]; then
+              NOTE="_Promoted without the homelab soak: ${REASON}_"
+            fi
+          else
+            echo "::warning::could not read the promotion record for ${GITHUB_SHA}: $(cat "$RUNNER_TEMP/promerr")"
+          fi
+          echo "promotion_note=$NOTE" >> "$GITHUB_OUTPUT"
+          echo "Promotion note: ${NOTE:-<none>}"
+
       - name: Resolve repo policy
         id: policy
         env:
           REPO_NAME: ${{ github.event.repository.name }}
           REPO_SPDX_ID: ${{ github.event.repository.license.spdx_id }}
         run: |
+          set -euo pipefail
           # Per-repo policy overrides. Centralized here, NOT per-repo config.
           # When you need to change a repo's release behavior, edit this step.
           #
@@ -803,11 +838,20 @@ jobs:
           echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS sbom_from=$SBOM_FROM syft_config='$SYFT_CONFIG' image_licenses='$IMAGE_LICENSES'"
 
   # ─── Docker image build + sign + SBOM + release (delegated) ────────────────
+  # On dev a build is due only when a new dev version is (root_changed and
+  # this commit untagged); on stable the job also runs with nothing to publish,
+  # because the Docker Hub description refreshes on every main push. A release
+  # owed to a subpackage alone (release=true, root_changed=false) builds no
+  # image on either channel.
   docker:
     needs: detect
-    if: ${{ needs.detect.outputs.type == 'docker' && needs.detect.outputs.root_changed == 'true' }}
+    if: |
+      needs.detect.outputs.type == 'docker'
+      && (needs.detect.outputs.channel == 'stable'
+          || (needs.detect.outputs.release == 'true' && needs.detect.outputs.root_changed == 'true'))
     permissions:
       contents: write
+      statuses: write
       packages: write
       id-token: write
       attestations: write
@@ -818,25 +862,20 @@ jobs:
     # without a second internal-pin bump + tag cycle.
     uses: ./.github/workflows/docker-release.yaml
     with:
-      version: ${{ needs.detect.outputs.version }}
-      release-needed: ${{ needs.detect.outputs.release }}
+      channel: ${{ needs.detect.outputs.channel }}
+      version: ${{ needs.detect.outputs.base }}
+      dev-version: ${{ needs.detect.outputs.dev_version }}
+      latest: ${{ needs.detect.outputs.latest }}
+      exclude-re: ${{ needs.detect.outputs.exclude_re }}
+      release-needed: ${{ (needs.detect.outputs.release == 'true' && needs.detect.outputs.root_changed == 'true') && 'true' || 'false' }}
       go-modules: ${{ needs.detect.outputs.go_modules }}
       finalize: ${{ needs.detect.outputs.finalize }}
+      promotion-note: ${{ needs.detect.outputs.promotion_note }}
       registries: ${{ needs.detect.outputs.registries }}
       platforms: ${{ needs.detect.outputs.platforms }}
       sbom-from: ${{ needs.detect.outputs.sbom_from }}
       syft-config: ${{ needs.detect.outputs.syft_config }}
       image-licenses: ${{ needs.detect.outputs.image_licenses }}
-      # Effective no-op-skip flag: an explicit workflow_call input (direct
-      # callers) OR the consumer stub's own workflow_dispatch input. The
-      # github context inside a reusable workflow is the CALLER's, so the
-      # stub's dispatch input is readable here without the stub forwarding it
-      # via `with:` (forwarding would break every consumer whose pinned SHA
-      # predates the input during the template-sync/Renovate-bump gap). Push
-      # events always evaluate false: github.event.inputs only exists on
-      # workflow_dispatch, so the push path keeps today's always-publish
-      # semantics.
-      skip-if-unchanged: ${{ inputs.skip_if_unchanged || github.event.inputs.skip_if_unchanged == 'true' }}
     secrets: inherit
 
   # ─── Go module release (tag + GitHub Release; `go install` fetches by tag) ─
@@ -869,6 +908,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
+      statuses: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -882,6 +922,7 @@ jobs:
         env:
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
+          set -euo pipefail
           # The root module's path must be exactly github.com/<owner>/<repo>,
           # plus /vN for major >= 2 (Go semantic import versioning). Both halves
           # are invisible until a consumer runs `go get`, and neither is fixable
@@ -979,7 +1020,9 @@ jobs:
       # when the proposed version does not fit the change.
       - name: API compatibility (gorelease)
         env:
-          VERSION: ${{ needs.detect.outputs.version }}
+          # The stable base on both channels: a dev build compared against the
+          # previous dev build would be refused for a legitimate minor.
+          VERSION: ${{ needs.detect.outputs.base }}
         run: |
           set -uo pipefail
 
@@ -990,9 +1033,9 @@ jobs:
 
           ver="${VERSION#v}"
           major="${ver%%.*}"
-          prev=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)
+          prev=$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
           if [ -z "$prev" ]; then
-            echo "::notice::no previous tag - nothing to compare, skipping API check"
+            echo "::notice::no previous stable tag - nothing to compare, skipping API check"
             exit 0
           fi
           prev_major="${prev#v}"; prev_major="${prev_major%%.*}"
@@ -1143,17 +1186,21 @@ jobs:
           exit 0
 
       - name: Generate release notes
-        # Deliberately token-free: this step downloads and EXECUTES git-cliff,
-        # and an untrusted binary must never run with a credential in its
+        # Stable only: a dev build creates no Release. Deliberately
+        # token-free: this step downloads and EXECUTES git-cliff, and an
+        # untrusted binary must never run with a credential in its
         # environment (persist-credentials=false keeps it out of .git/config,
         # but a step-level GH_TOKEN would still be readable by any child
         # process). The gh/tagging calls live in the next step, which runs no
         # downloaded code.
+        if: ${{ needs.detect.outputs.channel == 'stable' }}
         env:
           VERSION: ${{ needs.detect.outputs.version }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
           FINALIZE: ${{ needs.detect.outputs.finalize }}
+          PROMOTION_NOTE: ${{ needs.detect.outputs.promotion_note }}
         run: |
+          set -euo pipefail
           # Version + tarball sha256 pinned as a pair; Renovate maintains both
           # via the custom.git-cliff datasource (GitHub release-asset digest).
           # Fail-closed: a tarball that does not match the committed pin never
@@ -1165,13 +1212,12 @@ jobs:
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
           echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
           tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          # Lane-aware notes: when nested Go module lanes exist, scope the
-          # root notes to the root lane (root tag universe + lane commits
-          # excluded), or lane commits leak into the root release's notes
-          # (probe state J). No lanes -> no extra args -> unchanged.
-          LANE_ARGS=()
+          # The stable tag pattern is passed explicitly so the notes span
+          # everything since the last STABLE release whatever the consumer's
+          # synced cliff.toml says (a stale unanchored copy would stop at the
+          # last dev tag). Lane commits are excluded (probe state J).
+          LANE_ARGS=(--tag-pattern '^v[0-9]+\.[0-9]+\.[0-9]+$')
           if [ -n "$GO_LANES_JSON" ] && [ "$GO_LANES_JSON" != "[]" ]; then
-            LANE_ARGS+=(--tag-pattern '^v[0-9]')
             while IFS= read -r d; do
               [ -z "$d" ] && continue
               LANE_ARGS+=(--exclude-path "$d/**")
@@ -1190,17 +1236,24 @@ jobs:
           else
             git cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > NOTES.md
           fi
+          if [ -n "$PROMOTION_NOTE" ]; then
+            printf '\n%s\n' "$PROMOTION_NOTE" >> NOTES.md
+          fi
 
       - name: Tag + GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect.outputs.version }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
+          set -euo pipefail
           # Tag ref created first via the git data API, pinned to the trigger
           # commit; release then attaches to the existing tag (no --target).
           # `gh release create --target` tag-creation 403s for the integration
-          # token when a mid-run push moved main past $GITHUB_SHA (observed
-          # fleet-wide 2026-07-15); the git ref create has no head restriction.
+          # token when a mid-run push moved the branch past $GITHUB_SHA
+          # (observed fleet-wide 2026-07-15); the git ref create has no head
+          # restriction. A dev build gets the tag, its receipt and no Release.
+          CREATED=false
           if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
             if [ "$EXISTING" != "$GITHUB_SHA" ]; then
               echo "::error::Tag ${VERSION} exists at ${EXISTING}, not ${GITHUB_SHA}; refusing."
@@ -1208,6 +1261,25 @@ jobs:
             fi
           else
             gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
+            CREATED=true
+          fi
+          if [ "$CHANNEL" != "stable" ]; then
+            # The audit reads this receipt: a dev tag has no Release to show
+            # that the pipeline, not a hand, created it. A tag without it would
+            # make a rerun compute release=false, so the tag this attempt
+            # created is deleted with the failed POST and a rerun makes both.
+            if ! gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+              -f state=success -f context="release/tag/${VERSION}" \
+              -f description="created by the dev release run" \
+              -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
+              if [ "$CREATED" = true ]; then
+                echo "::error::receipt for ${VERSION} not recorded; deleting the tag this run created so a rerun recreates both"
+                gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}" >/dev/null
+              fi
+              exit 1
+            fi
+            echo "dev channel: tagged ${VERSION} with its receipt, no GitHub Release"
+            exit 0
           fi
           gh release view "$VERSION" >/dev/null 2>&1 || gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
 
@@ -1222,6 +1294,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      statuses: write
       id-token: write
     steps:
       - name: Checkout
@@ -1264,16 +1337,28 @@ jobs:
           #      workflow + repo (auto-attaches provenance attestation).
           # JSR: trusted publisher configured at jsr.io at the scope level.
           VERSION: ${{ needs.detect.outputs.version }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
+          set -euo pipefail
           ver="${VERSION#v}"
           pkg="$(npm pkg get name | tr -d '\"')"
           npm pkg set version="$ver"
           node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
+          # A dev build publishes under the `dev` dist-tag so `latest` stays
+          # on the stable channel; JSR carries stable versions only.
+          NPM_TAG_ARGS=()
+          if [ "$CHANNEL" != "stable" ]; then
+            NPM_TAG_ARGS=(--tag dev)
+          fi
           # Skip NPM if version already exists (bootstrap-friendly).
           if npm view "$pkg@$ver" version >/dev/null 2>&1; then
             echo "::notice::npm: $pkg@$ver already published — skipping"
           else
-            npm publish --access public
+            npm publish --access public "${NPM_TAG_ARGS[@]}"
+          fi
+          if [ "$CHANNEL" != "stable" ]; then
+            echo "dev channel: JSR not published"
+            exit 0
           fi
           # Skip JSR if the version already exists. JSR has no overwrite and
           # `jsr publish` errors on a duplicate, which would wedge a re-run
@@ -1291,13 +1376,16 @@ jobs:
           fi
 
       - name: Generate release notes
-        # Deliberately token-free — this step executes the downloaded
-        # git-cliff binary; see the go job's identical split.
+        # Stable only; deliberately token-free — this step executes the
+        # downloaded git-cliff binary; see the go job's identical split.
+        if: ${{ needs.detect.outputs.channel == 'stable' }}
         env:
           VERSION: ${{ needs.detect.outputs.version }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
           FINALIZE: ${{ needs.detect.outputs.finalize }}
+          PROMOTION_NOTE: ${{ needs.detect.outputs.promotion_note }}
         run: |
+          set -euo pipefail
           # Version + tarball sha256 pinned as a pair; Renovate maintains both
           # via the custom.git-cliff datasource (GitHub release-asset digest).
           # Fail-closed: a tarball that does not match the committed pin never
@@ -1309,11 +1397,10 @@ jobs:
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
           echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
           tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          # Lane-aware notes when nested Go module lanes exist (see the go
-          # job's identical block; probe state J).
-          LANE_ARGS=()
+          # Same flags as the go job's notes step: the stable tag pattern
+          # always, lane commits excluded (probe state J).
+          LANE_ARGS=(--tag-pattern '^v[0-9]+\.[0-9]+\.[0-9]+$')
           if [ -n "$GO_LANES_JSON" ] && [ "$GO_LANES_JSON" != "[]" ]; then
-            LANE_ARGS+=(--tag-pattern '^v[0-9]')
             while IFS= read -r d; do
               [ -z "$d" ] && continue
               LANE_ARGS+=(--exclude-path "$d/**")
@@ -1328,17 +1415,24 @@ jobs:
           else
             git cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > NOTES.md
           fi
+          if [ -n "$PROMOTION_NOTE" ]; then
+            printf '\n%s\n' "$PROMOTION_NOTE" >> NOTES.md
+          fi
 
       - name: Tag + GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect.outputs.version }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
+          set -euo pipefail
           # Tag ref created first via the git data API, pinned to the trigger
           # commit; release then attaches to the existing tag (no --target).
           # `gh release create --target` tag-creation 403s for the integration
-          # token when a mid-run push moved main past $GITHUB_SHA (observed
-          # fleet-wide 2026-07-15); the git ref create has no head restriction.
+          # token when a mid-run push moved the branch past $GITHUB_SHA
+          # (observed fleet-wide 2026-07-15); the git ref create has no head
+          # restriction. A dev build gets the tag, its receipt and no Release.
+          CREATED=false
           if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
             if [ "$EXISTING" != "$GITHUB_SHA" ]; then
               echo "::error::Tag ${VERSION} exists at ${EXISTING}, not ${GITHUB_SHA}; refusing."
@@ -1346,6 +1440,25 @@ jobs:
             fi
           else
             gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
+            CREATED=true
+          fi
+          if [ "$CHANNEL" != "stable" ]; then
+            # The audit reads this receipt: a dev tag has no Release to show
+            # that the pipeline, not a hand, created it. A tag without it would
+            # make a rerun compute release=false, so the tag this attempt
+            # created is deleted with the failed POST and a rerun makes both.
+            if ! gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+              -f state=success -f context="release/tag/${VERSION}" \
+              -f description="created by the dev release run" \
+              -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
+              if [ "$CREATED" = true ]; then
+                echo "::error::receipt for ${VERSION} not recorded; deleting the tag this run created so a rerun recreates both"
+                gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}" >/dev/null
+              fi
+              exit 1
+            fi
+            echo "dev channel: tagged ${VERSION} with its receipt, no GitHub Release"
+            exit 0
           fi
           gh release view "$VERSION" >/dev/null 2>&1 || gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
 
@@ -1394,15 +1507,27 @@ jobs:
         env:
           # OIDC-only: trusted publishers configured at npmjs.com + jsr.io.
           VERSION: ${{ needs.detect.outputs.version }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
+          set -euo pipefail
           ver="${VERSION#v}"
           pkg="$(npm pkg get name | tr -d '\"')"
           npm pkg set version="$ver"
           node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
+          # Same channel rule as the root ts job: `dev` dist-tag on dev, JSR
+          # on stable only.
+          NPM_TAG_ARGS=()
+          if [ "$CHANNEL" != "stable" ]; then
+            NPM_TAG_ARGS=(--tag dev)
+          fi
           if npm view "$pkg@$ver" version >/dev/null 2>&1; then
             echo "::notice::npm: $pkg@$ver already published — skipping"
           else
-            npm publish --access public
+            npm publish --access public "${NPM_TAG_ARGS[@]}"
+          fi
+          if [ "$CHANNEL" != "stable" ]; then
+            echo "dev channel: JSR not published"
+            exit 0
           fi
           # Skip JSR if the version already exists (mirror of the npm guard);
           # keeps a re-run after a partial/cancelled release from wedging on
@@ -1443,6 +1568,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
+      statuses: write
     strategy:
       fail-fast: false
       matrix:
@@ -1456,83 +1582,73 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Compute lane version
+      - name: Compute lane version (cliff)
+        id: lanecliff
+        uses: cplieger/ci/actions/git-cliff-version@v3
+        with:
+          channel: ${{ needs.detect.outputs.channel }}
+          lane: ${{ matrix.dir }}
+
+      # The lane's copy of detect's "Select version": detect emits the lane
+      # only when a shipped path under it changed since its own channel tag,
+      # so the anchor test alone decides the release here. On stable a lane
+      # tag already at HEAD without a Release is repaired (finalize), as for
+      # the root; a dev lane build has no Release to repair.
+      - name: Select lane version
         id: lane
         env:
+          GH_TOKEN: ${{ github.token }}
           DIR: ${{ matrix.dir }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
+          BASE: ${{ steps.lanecliff.outputs.base }}
+          DEV_VERSION: ${{ steps.lanecliff.outputs.dev_version }}
+          FLOOR_BASE: ${{ steps.lanecliff.outputs.floor_base }}
+          FLOOR_DEV_VERSION: ${{ steps.lanecliff.outputs.floor_dev_version }}
+          LATEST: ${{ steps.lanecliff.outputs.latest }}
+          ANCHOR_SHA: ${{ steps.lanecliff.outputs.anchor_sha }}
         run: |
-          # Version + tarball sha256 pinned as a pair; Renovate maintains both
-          # via the custom.git-cliff datasource (GitHub release-asset digest).
-          # Fail-closed: a tarball that does not match the committed pin never
-          # installs — the binary runs against every repo's history, and the
-          # checkout already treats it as untrusted (persist-credentials is
-          # false everywhere it runs).
-          # renovate: datasource=custom.git-cliff depName=orhun/git-cliff
-          CLIFF_VERSION=v2.14.2
-          CLIFF_SHA256=24f397c733add5390fdceee3a2088588ab0d5f944ce00d34cb7029b888cf2db4
-          curl -fsSL --retry 7 --retry-max-time 150 --retry-all-errors -o "$RUNNER_TEMP/git-cliff.tgz" \
-            "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
-          echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
-          tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          # Lane scoping (probe state I): the lane's tag universe via
-          # --tag-pattern '^<dir>/v[0-9]' (dir regex-escaped), the lane's
-          # commit window via --include-path '<dir>/**', and first-release
-          # bootstrap via GIT_CLIFF__BUMP__INITIAL_TAG=<dir>/v1.0.0 (the
-          # config initial_tag is root-shaped and would fail the pattern).
-          ESC=$(printf '%s' "$DIR" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
-          if ! NEXT="$(GIT_CLIFF__BUMP__INITIAL_TAG="${DIR}/v1.0.0" git cliff \
-                --unreleased --bumped-version \
-                --tag-pattern "^${ESC}/v[0-9]" \
-                --include-path "${DIR}/**" 2>/tmp/cliff.err)"; then
-            echo "::error::lane git-cliff --bumped-version failed for ${DIR}:"
-            sed 's/^/  /' /tmp/cliff.err >&2 || true
+          set -euo pipefail
+          if [ -z "$BASE" ]; then
+            echo "::error::git-cliff-version returned no base: the referenced action predates the channel outputs"
             exit 1
           fi
-          if [ -z "$NEXT" ]; then
-            echo "::error::lane git-cliff returned an empty version for ${DIR}"
-            exit 1
+          RELEASE=false
+          if [ "$ANCHOR_SHA" != "$GITHUB_SHA" ]; then
+            RELEASE=true
           fi
-          # The lane must never produce anything but its own prefixed semver.
-          case "$NEXT" in
-            "$DIR"/v[0-9]*) : ;;
-            *)
-              echo "::error::lane compute for '${DIR}' returned '${NEXT}' (not ${DIR}/vX.Y.Z); refusing"
-              exit 1 ;;
-          esac
-          # Release boolean, lane-scoped: `git describe --match` is a
-          # WHOLE-NAME glob, so the root's v* tags can never satisfy it.
-          #
-          # Publication is a resumable state machine, not a boolean: a prior
-          # run can have created the tag and then died before the GitHub
-          # Release (transient API failure). On rerun, NEXT == LATEST would
-          # read as "nothing to do" and the missing Release could never be
-          # repaired — and moving/re-cutting the tag is forbidden (Go module
-          # versions are immutable once published). So: publish when a new
-          # version is warranted, AND when the computed version's tag already
-          # sits at THIS commit but its GitHub Release is missing (finalize).
-          LATEST="$(git describe --tags --abbrev=0 --match "${DIR}/v[0-9]*" 2>/dev/null || echo "")"
-          PUBLISH=true
+          if [ "$RELEASE" = "true" ] && [ "$BASE" = "$LATEST" ] && [ -n "$FLOOR_BASE" ]; then
+            echo "::notice::lane ${DIR}: git-cliff proposes no bump for a shipped change; flooring ${BASE} to ${FLOOR_BASE}"
+            BASE="$FLOOR_BASE"
+            DEV_VERSION="$FLOOR_DEV_VERSION"
+          fi
+          if [ "$CHANNEL" = "dev" ]; then
+            VERSION="$DEV_VERSION"
+          else
+            VERSION="$BASE"
+          fi
           FINALIZE=false
-          if [ "$NEXT" = "$LATEST" ]; then
-            PUBLISH=false
-            TAG_SHA="$(git rev-list -n1 "$NEXT" 2>/dev/null || echo "")"
-            if [ "$TAG_SHA" = "$GITHUB_SHA" ]; then
-              # Tag exists at this very commit: finalize if the Release is
-              # missing (partial prior run); no-op if it exists.
+          if [ "$RELEASE" = "false" ] && [ "$CHANNEL" = "stable" ]; then
+            if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" >/dev/null 2>/tmp/relerr; then
+              echo "::notice::lane ${DIR}: ${VERSION} is tagged at this commit and its Release exists — nothing to do"
+            elif grep -q 'HTTP 404' /tmp/relerr; then
               FINALIZE=true
-              echo "::notice::lane ${DIR}: tag ${NEXT} already at this commit — finalize mode (repair a missing GitHub Release only)"
+              echo "::notice::lane ${DIR}: ${VERSION} is tagged at this commit without a Release — finalize mode"
             else
-              echo "::notice::lane ${DIR}: no release warranted (at ${LATEST})"
+              echo "::error::lane ${DIR}: could not determine whether Release ${VERSION} exists:"
+              cat /tmp/relerr
+              exit 1
             fi
           fi
-          if [ "$PUBLISH" = "true" ] || [ "$FINALIZE" = "true" ]; then
+          if [ "$RELEASE" = "true" ] || [ "$FINALIZE" = "true" ]; then
             echo "release=true" >> "$GITHUB_OUTPUT"
           else
             echo "release=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "finalize=$FINALIZE" >> "$GITHUB_OUTPUT"
-          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
-          echo "Lane ${DIR}: version=${NEXT} publish=${PUBLISH} finalize=${FINALIZE} (latest lane tag: ${LATEST:-<none>})"
+          {
+            echo "finalize=$FINALIZE"
+            echo "version=$VERSION"
+          } >> "$GITHUB_OUTPUT"
+          echo "Lane ${DIR}: channel=${CHANNEL} version=${VERSION} release=${RELEASE} finalize=${FINALIZE} (latest lane tag: ${LATEST:-<none>})"
 
       - name: Verify lane module path
         if: ${{ steps.lane.outputs.release == 'true' }}
@@ -1540,6 +1656,7 @@ jobs:
           DIR: ${{ matrix.dir }}
           VERSION: ${{ steps.lane.outputs.version }}
         run: |
+          set -euo pipefail
           # The nested module's path must be exactly
           # github.com/<owner>/<repo>/<dir> (+ /vN for major >= 2, Go semantic
           # import versioning — the root job's check, extended with the exact
@@ -1568,28 +1685,28 @@ jobs:
           echo "ok: module path '$modpath' matches lane ${DIR} ($VERSION)"
 
       - name: Generate lane release notes
-        # Deliberately token-free — this step executes the downloaded
-        # git-cliff binary (installed by the compute step above); see the
-        # go job's identical split.
-        if: ${{ steps.lane.outputs.release == 'true' }}
+        # Stable only. Deliberately token-free — this step executes the
+        # git-cliff binary the compute action installed; see the go job's
+        # identical split.
+        if: ${{ steps.lane.outputs.release == 'true' && needs.detect.outputs.channel == 'stable' }}
         env:
           DIR: ${{ matrix.dir }}
           VERSION: ${{ steps.lane.outputs.version }}
           FINALIZE: ${{ steps.lane.outputs.finalize }}
         run: |
-          # Lane-scoped notes: same flags as the version compute (probe
-          # state J — lane notes carry lane commits only). In finalize mode
-          # the tag already exists at HEAD, so the lane's commits are no
-          # longer "unreleased" — render the CURRENT (latest tagged) release
-          # instead (probe state K pins that --current sees them).
+          set -euo pipefail
+          # Lane-scoped notes with the lane's stable tag pattern (probe state
+          # J: lane commits only). In finalize mode the tag already exists at
+          # HEAD, so render the CURRENT release (probe state K).
           ESC=$(printf '%s' "$DIR" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
+          PATTERN="^${ESC}/v[0-9]+\\.[0-9]+\\.[0-9]+\$"
           if [ "$FINALIZE" = "true" ]; then
             git cliff --current \
-              --tag-pattern "^${ESC}/v[0-9]" \
+              --tag-pattern "$PATTERN" \
               --include-path "${DIR}/**" --strip header > NOTES.md
           else
             git cliff --unreleased --tag "$VERSION" \
-              --tag-pattern "^${ESC}/v[0-9]" \
+              --tag-pattern "$PATTERN" \
               --include-path "${DIR}/**" --strip header > NOTES.md
           fi
 
@@ -1598,10 +1715,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.lane.outputs.version }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
+          set -euo pipefail
           # Tag ref via the git data API pinned to the trigger commit, with
           # the exists-at-different-SHA refuse guard (mirrors the root go
-          # job; slash tags are ordinary multi-segment refs).
+          # job; slash tags are ordinary multi-segment refs). A dev lane
+          # build gets the tag, its receipt and no Release.
+          CREATED=false
           if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
             if [ "$EXISTING" != "$GITHUB_SHA" ]; then
               echo "::error::Tag ${VERSION} exists at ${EXISTING}, not ${GITHUB_SHA}; refusing."
@@ -1609,15 +1730,34 @@ jobs:
             fi
           else
             gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
+            CREATED=true
+          fi
+          if [ "$CHANNEL" != "stable" ]; then
+            # The audit reads this receipt: a dev tag has no Release to show
+            # that the pipeline, not a hand, created it. A tag without it would
+            # make a rerun compute release=false, so the tag this attempt
+            # created is deleted with the failed POST and a rerun makes both.
+            if ! gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+              -f state=success -f context="release/tag/${VERSION}" \
+              -f description="created by the dev release run" \
+              -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
+              if [ "$CREATED" = true ]; then
+                echo "::error::receipt for ${VERSION} not recorded; deleting the tag this run created so a rerun recreates both"
+                gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}" >/dev/null
+              fi
+              exit 1
+            fi
+            echo "dev channel: tagged ${VERSION} with its receipt, no GitHub Release"
+            exit 0
           fi
           gh release view "$VERSION" >/dev/null 2>&1 || gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
 
   # ─── Verify every registry this run published to ──────────────────────────
   # A green publish job is not proof the artifact is fetchable. Each lane that
   # ran is read back at the released version: the Go proxy for the root module
-  # and each nested lane, npm and JSR for the root package and each subpackage.
-  # The docker lane is verified inside docker-release.yaml, which holds the
-  # manifest digest.
+  # and each nested lane, npm (and JSR on stable) for the root package and
+  # each subpackage. The docker lane is verified inside docker-release.yaml,
+  # which holds the manifest digest.
   verify-publish:
     needs: [detect, docker, go, ts, subpackage, go-nested]
     # A skipped dependency skips this job under the default success(), and a
@@ -1646,6 +1786,7 @@ jobs:
 
       - name: Verify published artifacts
         env:
+          CHANNEL: ${{ needs.detect.outputs.channel }}
           VERSION: ${{ needs.detect.outputs.version }}
           SUBPACKAGES_JSON: ${{ needs.detect.outputs.subpackages_to_publish }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules_to_release }}
@@ -1701,11 +1842,24 @@ jobs:
             echo "::error::proxy.golang.org ${modpath}@$2 is not resolvable: ${body}"
             return 1
           }
+          # JSR receives the stable channel only, so a dev version is never
+          # there to read back.
           probe_ts() { # <package.json>
             local pkg
             pkg=$(jq -r .name "$1")
             probe "npm ${pkg}@${ver}" "https://registry.npmjs.org/${pkg}/${ver}" || rc=1
-            probe "jsr ${pkg}@${ver}" "https://jsr.io/${pkg}/${ver}_meta.json" || rc=1
+            if [ "$CHANNEL" = "stable" ]; then
+              probe "jsr ${pkg}@${ver}" "https://jsr.io/${pkg}/${ver}_meta.json" || rc=1
+            fi
+          }
+          # Only tags of this channel's shape: a stable and a dev lane tag can
+          # sit on one commit (a promotion of the commit the dev build tagged).
+          lane_tags_at_head() { # <dir>
+            if [ "$CHANNEL" = "stable" ]; then
+              git tag --points-at HEAD --list "$1/v[0-9]*" | grep -E "^$1/v[0-9]+\.[0-9]+\.[0-9]+\$" || true
+            else
+              git tag --points-at HEAD --list "$1/v[0-9]*-dev.*"
+            fi
           }
 
           if [ "$GO_RESULT" = "success" ]; then
@@ -1720,7 +1874,7 @@ jobs:
               while IFS= read -r tag; do
                 [ -z "$tag" ] && continue
                 probe_go "$d/go.mod" "${tag#"$d"/}" || rc=1
-              done < <(git tag --points-at HEAD --list "$d/v[0-9]*")
+              done < <(lane_tags_at_head "$d")
             done < <(jq -r '.[]' <<<"$GO_LANES_JSON")
           fi
           if [ "$TS_RESULT" = "success" ]; then

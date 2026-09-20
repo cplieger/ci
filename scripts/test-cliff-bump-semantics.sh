@@ -1,55 +1,11 @@
 #!/usr/bin/env bash
-# Regression probe for the git-cliff behaviors the fleet release gate depends on.
-#
-# The consumer cliff.toml (configs/cliff-stable.toml) uses exclude_paths to keep
-# non-shipping commits out of release notes AND out of the version bump, and
-# actions/git-cliff-version derives its release boolean from
-# `git cliff --unreleased --bumped-version`. Several of the behaviors this
-# stack relies on are UNDOCUMENTED upstream and sit in a known-buggy area
-# (git-cliff issues #816, #1570), so they are pinned here as executable
-# assertions instead of trusted:
-#
-#   1. exclude_paths glob semantics: bare patterns root-anchored, `**/` at any
-#      depth, commits touching both excluded and shipped paths still included.
-#   2. Version-base anchoring: `--unreleased --bumped-version` returns the
-#      latest tag when the unreleased set is fully excluded (release=false in
-#      the action), anchors on the latest tag even when that tag's own window
-#      is fully filtered (the bare-mode base-regression defect this replaced),
-#      and bumps past such tags without colliding with existing versions.
-#   3. Bump levels still honored through the filter (fix -> patch, feat -> minor).
-#   4. Behind-newer-tag state: at a checkout behind an existing newer tag,
-#      cliff anchors on the newest repo tag (NOT describe's reachable tag);
-#      the release job's tag-create guard turns the resulting release=true
-#      into a loud failure. Asserted so a behavior change is noticed.
-#   5. Bootstrap: no tags at all falls back to [bump].initial_tag.
-#   6. Section ordering: the <!-- N --> sort prefixes render Added before
-#      Fixed before Security before Dependencies, with no comment residue.
-#   7. Tag-pattern anchoring: a prefixed component tag (yamlenv/v9.9.9) is
-#      invisible to the root version base — tag_pattern is a regex, and the
-#      pre-2026-07 unanchored pattern let such a tag hijack --bumped-version.
-#   8. Nested-module release lanes (states H/I/J/K): lane commits must not
-#      count toward the root bump — the synced config cannot know per-repo
-#      lane dirs, so the release pipeline excludes them via CLI
-#      --exclude-path (which MERGES with the config exclude_paths), and
-#      passes --tag-pattern '^v[0-9]' explicitly so the root version string
-#      stays lane-clean even under a stale UNANCHORED consumer config (the
-#      same explicit override now also ships in actions/git-cliff-version,
-#      covering orphaned lane tags after a lane dir is deleted); a tagless
-#      repo with lanes falls back to initial_tag, never empty (H4); the
-#      nested lane computes from its own <dir>/vX.Y.Z tag universe with
-#      first-release bootstrap via GIT_CLIFF__BUMP__INITIAL_TAG; notes are
-#      cross-lane clean in both directions; and finalize-mode --current
-#      rendering at a tagged HEAD stays lane-scoped for the LANE side (K)
-#      and the ROOT side (L — root+lane tags co-located, lane commits
-#      excluded, config excludes merged; this is the rendering the
-#      go/ts/docker finalize repair path uses). The lane discovery and
-#      classification SHELL semantics are pinned separately by
-#      scripts/test-lane-semantics.sh.
-#
-# Runs in the ci repo's `scripts` CI job (opt-in by file presence), so a
-# Renovate bump of the git-cliff pin re-verifies all of the above against the
-# NEW binary before the bump can merge. Local run: CLIFF_BIN=/path/to/git-cliff
-# scripts/test-cliff-bump-semantics.sh (skips the download).
+# Regression probe for the git-cliff behaviours the release gate relies on and
+# upstream does not document (issues #816, #1570): exclude_paths globbing, the
+# --unreleased --bumped-version base anchoring, section ordering, the stable
+# tag_pattern, the nested-module lanes and the two release channels through
+# actions/git-cliff-version/compute.sh, as states A to R; CONTRIBUTING.md lists
+# them. Runs in the ci repo's scripts CI job, so a git-cliff pin bump re-runs
+# it against the new binary. CLIFF_BIN=/path/to/git-cliff skips the download.
 set -euo pipefail
 
 # Hermetic git: a developer's global config must not reach the probe's
@@ -94,11 +50,11 @@ fail() {
 # The file list is DISCOVERED (any file under .github/ or actions/ carrying
 # a CLIFF_VERSION pin), so a new install site in a new file cannot hide
 # from these checks.
-EXPECTED_SITES=7
+EXPECTED_SITES=6
 mapfile -t PIN_FILES < <(
   grep -rlE 'CLIFF_VERSION[=:]' "$ROOT/.github" "$ROOT/actions" | sort
 )
-[ "${#PIN_FILES[@]}" -ge 4 ] || fail "pin-file discovery found only ${#PIN_FILES[@]} files (expected the release/docker-release/self-release workflows + the composite action at minimum)"
+[ "${#PIN_FILES[@]}" -ge 5 ] || fail "pin-file discovery found only ${#PIN_FILES[@]} files (expected the release/docker-release/self-release/promote workflows + the composite action at minimum)"
 mapfile -t pins < <(
   grep -rhoE 'CLIFF_VERSION[=:] *"?v[0-9][0-9.]*' "${PIN_FILES[@]}" \
     | grep -oE 'v[0-9][0-9.]*' | sort -u
@@ -266,8 +222,12 @@ lc() { # path message (lane repo commit)
   git -C "$L" add -A
   git -C "$L" commit -qm "$2"
 }
-lane_root_bump() { (cd "$L" && "$CLIFF" --config "$CFG" --unreleased --bumped-version --tag-pattern '^v[0-9]' --exclude-path 'yamlenv/**' 2>/dev/null); }
-lane_bump() { (cd "$L" && GIT_CLIFF__BUMP__INITIAL_TAG='yamlenv/v1.0.0' "$CLIFF" --config "$CFG" --unreleased --bumped-version --tag-pattern '^yamlenv/v[0-9]' --include-path 'yamlenv/**' 2>/dev/null); }
+# The two tag patterns compute.sh passes: stable versions only, anchored at
+# both ends, so a lane tag and a -dev.N tag are both invisible to the base.
+ROOT_PAT='^v[0-9]+\.[0-9]+\.[0-9]+$'
+LANE_PAT='^yamlenv/v[0-9]+\.[0-9]+\.[0-9]+$'
+lane_root_bump() { (cd "$L" && "$CLIFF" --config "$CFG" --unreleased --bumped-version --tag-pattern "$ROOT_PAT" --exclude-path 'yamlenv/**' 2>/dev/null); }
+lane_bump() { (cd "$L" && GIT_CLIFF__BUMP__INITIAL_TAG='yamlenv/v1.0.0' "$CLIFF" --config "$CFG" --unreleased --bumped-version --tag-pattern "$LANE_PAT" --include-path 'yamlenv/**' 2>/dev/null); }
 
 # ── State H: lane commits never bump the root lane ──────────────────────────
 lc src/main.go "feat: initial"
@@ -280,8 +240,10 @@ assert_eq "$(lane_root_bump)" "v1.0.1" "H2: root bump ignores the lane feat (pat
 # Stale-config defense: under a deliberately UNANCHORED config (the
 # pre-2026-07 pattern), the explicit CLI --tag-pattern must still keep the
 # root version string lane-clean.
-sed 's/^tag_pattern = "\^v\[0-9\]"/tag_pattern = "v[0-9].*"/' "$CFG" >"$WORK/cliff-unanchored.toml"
-UNANCH="$(cd "$L" && "$CLIFF" --config "$WORK/cliff-unanchored.toml" --unreleased --bumped-version --tag-pattern '^v[0-9]' --exclude-path 'yamlenv/**' 2>/dev/null)"
+sed 's/^tag_pattern = .*/tag_pattern = "v[0-9].*"/' "$CFG" >"$WORK/cliff-unanchored.toml"
+# A sed that matched nothing would test the anchored config against itself.
+grep -q 'tag_pattern = .v\[0-9\]\.\*.' "$WORK/cliff-unanchored.toml" || fail "H3: the unanchored fixture config was not produced (sed matched no tag_pattern line)"
+UNANCH="$(cd "$L" && "$CLIFF" --config "$WORK/cliff-unanchored.toml" --unreleased --bumped-version --tag-pattern "$ROOT_PAT" --exclude-path 'yamlenv/**' 2>/dev/null)"
 assert_eq "$UNANCH" "v1.0.1" "H3: CLI --tag-pattern overrides an unanchored stale config"
 
 # ── State I: nested lane computes from its own tag universe ──────────────────
@@ -303,7 +265,7 @@ git -C "$LB" tag v1.0.0
 echo y >"$LB/yamlenv/y.go"
 git -C "$LB" add -A
 git -C "$LB" commit -qm "feat: introduce nested module"
-BOOT="$(cd "$LB" && GIT_CLIFF__BUMP__INITIAL_TAG='yamlenv/v1.0.0' "$CLIFF" --config "$CFG" --unreleased --bumped-version --tag-pattern '^yamlenv/v[0-9]' --include-path 'yamlenv/**' 2>/dev/null)"
+BOOT="$(cd "$LB" && GIT_CLIFF__BUMP__INITIAL_TAG='yamlenv/v1.0.0' "$CLIFF" --config "$CFG" --unreleased --bumped-version --tag-pattern "$LANE_PAT" --include-path 'yamlenv/**' 2>/dev/null)"
 assert_eq "$BOOT" "yamlenv/v1.0.0" "I3: lane bootstrap via GIT_CLIFF__BUMP__INITIAL_TAG (no lane tag yet)"
 # H4 (root recompute in a repo with NO tags at all, lane commits only): must
 # fall back to the config initial_tag with exit 0, never emit empty/fail —
@@ -318,17 +280,17 @@ git -C "$NOTAG" config commit.gpgsign false
 echo y >"$NOTAG/yamlenv/y.go"
 git -C "$NOTAG" add -A
 git -C "$NOTAG" commit -qm "feat: introduce lane in tagless repo"
-NOTAG_ROOT="$(cd "$NOTAG" && "$CLIFF" --config "$CFG" --unreleased --bumped-version --tag-pattern '^v[0-9]' --exclude-path 'yamlenv/**' 2>/dev/null)"
+NOTAG_ROOT="$(cd "$NOTAG" && "$CLIFF" --config "$CFG" --unreleased --bumped-version --tag-pattern "$ROOT_PAT" --exclude-path 'yamlenv/**' 2>/dev/null)"
 assert_eq "$NOTAG_ROOT" "v1.0.0" "H4: tagless repo with lanes falls back to initial_tag (never empty)"
 
 # ── State J: notes are cross-lane clean, config excludes still merged ───────
 lc yamlenv/y.go "feat: lane feature for notes"
 lc src/main.go "fix: root fix for notes"
 lc README.md "fix: readme-only edit for notes"
-LNOTES="$(cd "$L" && "$CLIFF" --config "$CFG" --unreleased --tag 'yamlenv/v9.9.9' --tag-pattern '^yamlenv/v[0-9]' --include-path 'yamlenv/**' --strip header 2>/dev/null)"
+LNOTES="$(cd "$L" && "$CLIFF" --config "$CFG" --unreleased --tag 'yamlenv/v9.9.9' --tag-pattern "$LANE_PAT" --include-path 'yamlenv/**' --strip header 2>/dev/null)"
 echo "$LNOTES" | grep -q "Lane feature for notes" || fail "J: lane notes missing the lane commit"
 echo "$LNOTES" | grep -q "Root fix for notes" && fail "J: lane notes leaked a root commit"
-RNOTES="$(cd "$L" && "$CLIFF" --config "$CFG" --unreleased --tag 'v9.9.9' --tag-pattern '^v[0-9]' --exclude-path 'yamlenv/**' --strip header 2>/dev/null)"
+RNOTES="$(cd "$L" && "$CLIFF" --config "$CFG" --unreleased --tag 'v9.9.9' --tag-pattern "$ROOT_PAT" --exclude-path 'yamlenv/**' --strip header 2>/dev/null)"
 echo "$RNOTES" | grep -q "Root fix for notes" || fail "J: root notes missing the root commit"
 echo "$RNOTES" | grep -q "Lane feature for notes" && fail "J: root notes leaked a lane commit"
 echo "$RNOTES" | grep -q "Readme-only edit" && fail "J: config exclude_paths not merged under CLI path flags"
@@ -340,7 +302,7 @@ echo "ok: J notes cross-lane hygiene (lane/root separation + config excludes mer
 # longer "unreleased", so the finalize path renders the CURRENT release with
 # the same lane scoping; this pins that --current sees the tagged commits.
 git -C "$L" tag yamlenv/v9.9.9 # the notes-round commits become the current lane release
-KNOTES="$(cd "$L" && "$CLIFF" --config "$CFG" --current --tag-pattern '^yamlenv/v[0-9]' --include-path 'yamlenv/**' --strip header 2>/dev/null)"
+KNOTES="$(cd "$L" && "$CLIFF" --config "$CFG" --current --tag-pattern "$LANE_PAT" --include-path 'yamlenv/**' --strip header 2>/dev/null)"
 echo "$KNOTES" | grep -q "Lane feature for notes" || fail "K: --current finalize render missing the lane commit"
 echo "$KNOTES" | grep -q "Root fix for notes" && fail "K: --current finalize render leaked a root commit"
 echo "ok: K finalize render (--current at tagged HEAD, lane-scoped)"
@@ -351,10 +313,123 @@ echo "ok: K finalize render (--current at tagged HEAD, lane-scoped)"
 # renders the current ROOT release with the lane-aware flags. Root and lane
 # tags are co-located at HEAD here — the realistic both-lanes-released shape.
 git -C "$L" tag v9.9.9
-LNOTES2="$(cd "$L" && "$CLIFF" --config "$CFG" --current --tag-pattern '^v[0-9]' --exclude-path 'yamlenv/**' --strip header 2>/dev/null)"
+LNOTES2="$(cd "$L" && "$CLIFF" --config "$CFG" --current --tag-pattern "$ROOT_PAT" --exclude-path 'yamlenv/**' --strip header 2>/dev/null)"
 echo "$LNOTES2" | grep -q "Root fix for notes" || fail "L: root --current finalize render missing the root commit"
 echo "$LNOTES2" | grep -q "Lane feature for notes" && fail "L: root --current finalize render leaked a lane commit"
 echo "$LNOTES2" | grep -q "Readme-only edit" && fail "L: config exclude_paths not applied in root finalize render"
 echo "ok: L root finalize render (--current, lane commits excluded, config excludes merged)"
+
+# ── Channel states: the action's compute.sh, run in fixture repos ────────────
+# compute.sh is the one owner of the tag universe, the dev counter and the
+# patch floor, so these states execute it rather than restate its arithmetic.
+ACTION="$ROOT/actions/git-cliff-version/compute.sh"
+[ -f "$ACTION" ] || fail "compute.sh not found at $ACTION"
+compute() { # <repo> <channel> [lane] [exclude-paths] -> populates OUT_* variables
+  local repo="$1" channel="$2" lane="${3:-}" excludes="${4:-}" outfile line
+  outfile="$(mktemp "$WORK/compute-out.XXXXXX")"
+  (
+    cd "$repo" && GIT_CLIFF_CONFIG="$CFG" CLIFF_BIN="$CLIFF" GITHUB_OUTPUT="$outfile" \
+      GITHUB_SHA="$(git rev-parse HEAD)" CHANNEL="$channel" LANE="$lane" EXCLUDE_PATHS="$excludes" \
+      bash "$ACTION" >/dev/null 2>&1
+  ) || fail "compute.sh failed in $repo (channel=$channel lane=${lane:-<none>})"
+  OUT_BASE="" OUT_DEV="" OUT_FLOOR_BASE="" OUT_FLOOR_DEV="" OUT_LATEST="" OUT_ANCHOR="" OUT_RELEASE=""
+  while IFS= read -r line; do
+    case "$line" in
+      base=*) OUT_BASE="${line#base=}" ;;
+      dev_version=*) OUT_DEV="${line#dev_version=}" ;;
+      floor_base=*) OUT_FLOOR_BASE="${line#floor_base=}" ;;
+      floor_dev_version=*) OUT_FLOOR_DEV="${line#floor_dev_version=}" ;;
+      latest=*) OUT_LATEST="${line#latest=}" ;;
+      anchor_sha=*) OUT_ANCHOR="${line#anchor_sha=}" ;;
+      release=*) OUT_RELEASE="${line#release=}" ;;
+    esac
+  done <"$outfile"
+  [ -n "$OUT_BASE" ] || fail "compute.sh wrote no base output in $repo"
+}
+mkfixture() { # <name> -> path
+  local d="$WORK/$1"
+  mkdir -p "$d"
+  git -C "$d" init -q -b main
+  git -C "$d" config user.email probe@ci.local
+  git -C "$d" config user.name probe
+  git -C "$d" config commit.gpgsign false
+  printf '%s\n' "$d"
+}
+fc() { # <repo> <path> <message>
+  mkdir -p "$1/$(dirname "$2")"
+  echo "x$RANDOM" >>"$1/$2"
+  git -C "$1" add -A
+  git -C "$1" commit -qm "$3"
+}
+
+# ── State M: a -dev.N tag is invisible to the stable base ───────────────────
+M=$(mkfixture chan-m)
+fc "$M" src/main.go "feat: initial"
+git -C "$M" tag v1.2.0
+fc "$M" src/a.go "feat: first dev build"
+git -C "$M" tag v1.3.0-dev.1
+fc "$M" src/b.go "feat: second change"
+compute "$M" stable
+assert_eq "$OUT_BASE" "v1.3.0" "M1: stable base ignores the v1.3.0-dev.1 tag"
+assert_eq "$OUT_LATEST" "v1.2.0" "M2: latest is the stable tag, not the dev tag"
+
+# ── State N: the dev counter continues from the existing <base>-dev.* tags ──
+git -C "$M" tag v1.3.0-dev.2
+git -C "$M" tag v1.4.0-dev.9 # decoy on another base
+compute "$M" dev
+assert_eq "$OUT_DEV" "v1.3.0-dev.3" "N1: dev version is base-dev.<count+1>, decoys on other bases ignored"
+assert_eq "$OUT_BASE" "v1.3.0" "N2: dev channel computes the same stable base"
+
+# ── State O: a base equal to latest gets a patch floor ──────────────────────
+O=$(mkfixture chan-o)
+fc "$O" src/main.go "feat: initial"
+git -C "$O" tag v1.3.1
+fc "$O" Dockerfile "chore: tidy"
+compute "$O" stable
+assert_eq "$OUT_BASE" "v1.3.1" "O1: cliff proposes no bump for a chore"
+assert_eq "$OUT_RELEASE" "false" "O2: base == latest reads release=false from the action"
+assert_eq "$OUT_FLOOR_BASE" "v1.3.2" "O3: floor_base is the patch bump of latest"
+assert_eq "$OUT_FLOOR_DEV" "v1.3.2-dev.1" "O4: floor_dev_version counts from zero on the floored base"
+
+# ── State P: the anchor follows the channel's tag universe ──────────────────
+compute "$M" dev
+assert_eq "$OUT_ANCHOR" "$(git -C "$M" rev-list -n1 v1.3.0-dev.2)" "P1: dev anchor is the newest reachable tag of any kind"
+compute "$M" stable
+assert_eq "$OUT_ANCHOR" "$(git -C "$M" rev-list -n1 v1.2.0)" "P2: stable anchor is the newest reachable stable tag"
+
+# ── State Q: a lane computes its own dev version ────────────────────────────
+Q=$(mkfixture chan-q)
+fc "$Q" src/main.go "feat: initial"
+mkdir -p "$Q/yamlenv"
+echo y >"$Q/yamlenv/y.go"
+git -C "$Q" add -A
+git -C "$Q" commit -qm "feat: introduce nested module"
+git -C "$Q" tag v1.0.0
+git -C "$Q" tag yamlenv/v1.0.0
+fc "$Q" yamlenv/y.go "feat: lane feature"
+compute "$Q" dev yamlenv
+assert_eq "$OUT_DEV" "yamlenv/v1.1.0-dev.1" "Q1: lane dev version carries the lane prefix"
+assert_eq "$OUT_LATEST" "yamlenv/v1.0.0" "Q2: lane latest is the lane's own stable tag"
+compute "$Q" stable "" 'yamlenv/**'
+assert_eq "$OUT_BASE" "v1.0.0" "Q3: with the lane dir excluded, the lane feat does not bump the root"
+compute "$Q" stable
+assert_eq "$OUT_BASE" "v1.1.0" "Q4: without the exclusion the same feat bumps the root (the exclude-paths input is load-bearing)"
+
+# ── State R: an rc tag at HEAD is outside both channels' tag universes ───────
+# A glob-shaped tag filter (v[0-9]*.[0-9]*.[0-9]*) admits v1.3.0-rc.1; it then
+# becomes the anchor at HEAD, the changed-path range is empty and the stable
+# release is suppressed while cliff still proposes v1.3.0.
+fc "$M" src/c.go "feat: third change"
+git -C "$M" tag v1.3.0-rc.1
+compute "$M" stable
+assert_eq "$OUT_BASE" "v1.3.0" "R1: stable base ignores the rc tag at HEAD"
+assert_eq "$OUT_LATEST" "v1.2.0" "R2: latest is still the exact stable tag, not the rc tag"
+assert_eq "$OUT_ANCHOR" "$(git -C "$M" rev-list -n1 v1.2.0)" "R3: stable anchor stays at v1.2.0 with an rc tag at HEAD"
+assert_eq "$OUT_RELEASE" "true" "R4: the stable release is not suppressed by the rc tag"
+compute "$M" dev
+assert_eq "$OUT_ANCHOR" "$(git -C "$M" rev-list -n1 v1.3.0-dev.2)" "R5: dev anchor skips the rc tag at HEAD for the newest dev tag"
+git -C "$M" tag v1.3.0-beta.2 "$(git -C "$M" rev-list -n1 v1.3.0-dev.2)"
+compute "$M" stable
+assert_eq "$OUT_LATEST" "v1.2.0" "R6: a beta tag beside the dev tag is invisible too"
 
 echo "PASS: git-cliff $VERSION semantics match the fleet release-gate contract"
