@@ -1238,6 +1238,18 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Install dependencies
+        # Strict `npm ci` from the lockfile, the same install ts-ci runs. Both
+        # publishes below need node_modules: `npm publish` runs a package's
+        # `prepack` (a package that emits JavaScript at publish compiles here,
+        # with the compiler from its devDependencies), and deno's `jsr publish`
+        # uses BYONM, so runtime deps (e.g. @cplieger/actions ->
+        # @cplieger/reactive) must already be present. Fails closed on a
+        # lockfile that disagrees with the manifest, as CI already does.
+        # Same gate as the publish step: a finalize rerun publishes nothing.
+        if: ${{ needs.detect.outputs.release == 'true' }}
+        run: npm ci
+
       - name: Publish to npm + JSR
         # release-only, never finalize: by step order a root tag can only
         # exist after both registries already published, so a finalize rerun
@@ -1271,11 +1283,6 @@ jobs:
                | jq -e --arg v "$ver" '.versions[$v]' >/dev/null 2>&1; then
             echo "::notice::jsr: $pkg@$ver already published — skipping"
           else
-            # deno's `jsr publish` uses BYONM, so runtime deps (e.g.
-            # @cplieger/actions -> @cplieger/reactive) must already be in
-            # node_modules; the npm publish above does not install them.
-            # Install (without touching the lockfile) before publishing to JSR.
-            npm install --no-save
             # Pin the jsr CLI: a bare `npx jsr` fetches whatever is latest at
             # publish time — the one floating executable on the release path.
             # renovate: datasource=npm depName=jsr
