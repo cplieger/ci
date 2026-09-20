@@ -84,7 +84,7 @@ jobs:
     steps:
       - name: Trigger security.yml on cplieger/${{ matrix.repo }}
         run: |
-          gh workflow run security.yml -R "cplieger/${{ matrix.repo }}" --ref main
+          gh workflow run security.yml -R "cplieger/${{ matrix.repo }}"
 
   # `needs:` must list every other job in this workflow.
   notify:

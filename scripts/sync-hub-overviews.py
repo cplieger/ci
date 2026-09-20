@@ -1,31 +1,17 @@
 #!/usr/bin/env python3
 """Push the generated Docker Hub overview page to every image repo, out of band.
 
-A release is the normal way each repo's Hub page gets refreshed, and it is not
-the only way: the page is a plain API field, so this script renders and PATCHes
-it directly. Two situations need that.
-
-    * Adopting the overview page at all. Until a repo cuts its next genuine
-      release its Hub listing still shows the old full README, and a stable repo
-      can go months without one.
-    * Changing the renderer. A fleet-wide re-sync otherwise waits on 22
-      independent release cadences.
-
-The daily stale-rebuild fan-out does NOT help: every Hub step in
-docker-release.yaml is gated on `nochange.skip != 'true'`, so a rebuild that
-finds nothing changed leaves the Hub page alone by design.
-
-Dry-run by default, like backfill-release-notes.py: it renders every page and
-reports what would change, and only `--apply` writes. Rendering happens from the
-local working tree, so run it on the tree you intend to publish.
-
-Credentials, in order: DOCKERHUB_TOKEN (with DOCKERHUB_USERNAME), else the
-`docker login` entry in ~/.docker/config.json. The token is never printed.
+The stable release writes each repo's Hub page; the page is a plain API field,
+so this script renders and PATCHes it directly when adopting the page or
+changing the renderer would otherwise wait on 22 release cadences. Dry-run by
+default: it reports what would change and only `--apply` writes. It renders
+from the local working tree, so run it on the tree you intend to publish.
+Credentials: DOCKERHUB_TOKEN with DOCKERHUB_USERNAME, else the `docker login`
+entry in ~/.docker/config.json; the token is never printed.
 
 Usage:
     sync-hub-overviews.py --workspace /workspace              # dry run, all repos
     sync-hub-overviews.py --only docker-radvd --apply         # one repo, for real
-    sync-hub-overviews.py --workspace /workspace --apply      # the whole fleet
 """
 
 from __future__ import annotations

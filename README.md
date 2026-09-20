@@ -17,15 +17,16 @@ duplicate copies.
 | `.github/workflows/go-ci.yaml` | Go checks: vet, golangci-lint, race tests, govulncheck, deadcode/punused (apps), wiregen drift, gitleaks |
 | `.github/workflows/ts-ci.yaml` | TS checks: eslint, tsc typecheck, vitest, prettier, knip, version parity, import-map coverage (+ optional `web-lint` for CSS/HTML) |
 | `.github/workflows/shell-ci.yaml` | Shell/Docker checks: actionlint, shellcheck, shfmt, hadolint, gitleaks |
-| `.github/workflows/release.yaml` | Auto-detects release type (Docker / TS / Go), computes the git-cliff version, publishes (npm + JSR via OIDC), tags + GitHub Release |
-| `.github/workflows/docker-release.yaml` | Multi-arch image build on native runners, Trivy scan, SBOM, cosign signing, dashboard release assets and OCI artifact (repos with a root `grafana-dashboard.json`), release notes (called by `release.yaml`) |
+| `.github/workflows/release.yaml` | Selects the channel from the branch (a push to `dev` publishes pre-release versions to GHCR and npm with no GitHub Release; a push to `main` publishes the stable release), auto-detects the release type (Docker / TS / Go), computes the git-cliff version, publishes (npm + JSR via OIDC), tags + GitHub Release |
+| `.github/workflows/docker-release.yaml` | On `dev`: multi-arch image build on native runners, Trivy scan, SBOM, cosign signing, dashboard OCI artifact (repos with a root `grafana-dashboard.json`), pushed to GHCR only. On `main`: re-tags the dev digest as the stable version, copies it to Docker Hub with its signatures, GitHub Release with the SBOM and dashboard assets (called by `release.yaml`) |
 | `.github/workflows/codeql.yaml` | CodeQL with language auto-detect (public repos) |
 | `.github/workflows/security-scan.yaml` | Trivy repo/config/image scans, advisory only; findings report to the Security tab, never block |
 
 Every other workflow in `.github/workflows/` is repo-internal automation
 (config sync, tag cutting, the daily governance audit, scheduled
-mutation/fuzz/security runs, staleness-gated image rebuilds, and this repo's
-own CI), not for consumers.
+mutation/fuzz/security runs, staleness-gated image rebuilds, the promotion of
+a repo's `main` to a soaked `dev` commit, GHCR retention for dev versions, and
+this repo's own CI), not for consumers.
 
 ## Consuming
 
@@ -92,9 +93,9 @@ per-repo, not synced, because it carries per-repo URLs.
 
 ## Composite actions
 
-- `actions/git-cliff-version`: installs git-cliff and outputs `version` + a
-  `release` boolean from conventional commits. Used by `release.yaml`; callable
-  directly.
+- `actions/git-cliff-version`: installs git-cliff and outputs the next stable
+  version, its dev-channel and patch-floor variants, and a `release` boolean
+  from conventional commits. Used by `release.yaml`; callable directly.
 - `actions/publish-badge`: writes a shields.io endpoint JSON to the orphan
   `badges` branch, preserving sibling badge files. Used by
   `docker-release.yaml` (image size) and `weekly-gremlins.yaml` (mutation

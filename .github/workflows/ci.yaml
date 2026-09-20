@@ -838,6 +838,23 @@ jobs:
             fi
           ) || { echo "Probe verify-publish shell semantics" >> /tmp/_ci_failures; exit 1; }
 
+      # docker-release promotion-path probe (opt-in by file presence): the
+      # channel tag and publish decision, the stable channel's digest walk
+      # (per-commit purity, so a reverted shipped change still rebuilds) and
+      # the BUILD_VERSION stamp. Same extract-and-execute shape as the probe
+      # above, for the same reason.
+      - name: Probe docker-release shell semantics
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          (
+            if [ -x scripts/test-docker-release.sh ]; then
+              ./scripts/test-docker-release.sh
+            else
+              echo "no docker-release probe in this repo - skipping"
+            fi
+          ) || { echo "Probe docker-release shell semantics" >> /tmp/_ci_failures; exit 1; }
+
       # Shell unit-test harness self-test (opt-in by file presence). The
       # harness is CANONICAL in this repo (configs/shell/lib.sh) and synced
       # into every adopting consumer's tests/shell/, so a defect in it lands

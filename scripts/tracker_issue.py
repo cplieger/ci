@@ -57,6 +57,7 @@ LABELS = {
     'fuzz-finding': ('b60205', 'Fuzz-discovered regression'),
     'gremlins-tracker': ('5319e7', 'Gremlins mutation testing tracker'),
     'mutation-regression': ('b60205', 'Mutation efficacy regression'),
+    'promotion-blocked': ('e99695', 'Automatic promotion to main is blocked'),
     'stryker-tracker': ('1d76db', 'Stryker mutation testing tracker'),
     'weekly-ci-failure': ('b60205', 'A scheduled CI run failed and needs triage'),
 }

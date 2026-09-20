@@ -1,31 +1,9 @@
 # On-demand push of the generated Docker Hub overview page to every image repo.
-#
-# WHY THIS EXISTS RATHER THAN "WAIT FOR A RELEASE"
-# docker-release.yaml syncs a repo's Hub page on every genuine release, and that
-# covers steady state. It does NOT cover two cases:
-#
-#   * Adopting the overview page. Until a repo cuts its next release its Hub
-#     listing still shows the old full README, and a stable repo can go months
-#     without one (docker-keepalived has 14 releases in its lifetime).
-#   * Changing the renderer. A fleet-wide re-sync otherwise waits on 22
-#     independent release cadences.
-#
-# The daily staleness rebuild does not help either: every Hub step in
-# docker-release.yaml is gated on `nochange.skip != 'true'`, so a rebuild that
-# finds nothing changed deliberately leaves the Hub page alone.
-#
-# WHY NOT JUST DISPATCH EACH REPO'S release.yaml
-# That works and costs far more. A dispatch has no before-SHA, so every file
-# counts as changed and the docker job rebuilds, re-signs, re-attests and
-# re-scans a multi-arch image whose source did not change. The minutes are free
-# on public repos, but `:latest` gets a new digest for byte-identical content,
-# and homelab pins every image by digest — so 22 rebuilds produce 22 Renovate
-# digest-bump PRs on the one private repo that draws the included-minutes quota.
-# Rendering a page and PATCHing one API field costs seconds and moves no digest.
-#
-# NO SCHEDULE, deliberately. This is a backfill for a change someone just made,
-# and a recurring run would need a named consumer for its output. Releases own
-# steady state.
+# The stable channel alone writes the Hub page, so adopting the page or changing
+# the renderer otherwise waits on 22 independent release cadences. Dispatching
+# each repo's release.yaml instead rebuilds, re-signs and re-scans an unchanged
+# image and moves its `:latest` digest, which the homelab pins. No schedule: a
+# recurring run would need a named consumer for its output.
 name: Sync Docker Hub overviews
 
 on:

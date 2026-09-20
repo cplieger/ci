@@ -104,3 +104,35 @@ jobs:
 
       - name: Probe the tracker bodies (python 3.14)
         run: python3 scripts/test-tracker-body.py
+
+  # The two-channel release scripts, on the runner's default python3 because
+  # that is what promote.yaml and ghcr-retention.yaml run them with:
+  # release_channels.py (tag shapes and repo tables), promote.py (the
+  # promotion checks), ghcr_retention.py (the dev-version selection),
+  # audit.py (the ruleset and webhook grading of both branch models) and the
+  # strict-mode scan of the release-channel workflows' run blocks.
+  release-channel-scripts:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      # test_workflow_shell.py parses the workflows; the runner's yamllint is a
+      # pipx install, so its PyYAML is not importable from the system python3.
+      - name: Install PyYAML
+        run: |
+          set -euo pipefail
+          # renovate: datasource=pypi depName=PyYAML
+          VERSION=6.0.3
+          pip install -q --break-system-packages "PyYAML==${VERSION}"
+
+      - name: Probe the release-channel scripts (default python3)
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
