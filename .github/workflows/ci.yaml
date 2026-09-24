@@ -542,7 +542,7 @@ jobs:
       - name: Comment ratio
         if: ${{ github.repository != 'cplieger/ci' }}
         continue-on-error: true
-        uses: cplieger/ci/actions/comment-audit@d4cc0c908e576a7f3a80f4aa85aa7034e8adca7c # v2
+        uses: cplieger/ci/actions/comment-audit@1cc06fdd7894a51dbe64f1aca38987374caf37d1 # v2
 
       # No denylist, unlike comment-audit: a NOTICE is owed by every repo.
       - name: NOTICE audit
@@ -557,7 +557,7 @@ jobs:
       - name: NOTICE audit
         if: ${{ github.repository != 'cplieger/ci' }}
         continue-on-error: true
-        uses: cplieger/ci/actions/notice-audit@d4cc0c908e576a7f3a80f4aa85aa7034e8adca7c # v2
+        uses: cplieger/ci/actions/notice-audit@1cc06fdd7894a51dbe64f1aca38987374caf37d1 # v2
 
       - name: Check results
         if: always()
