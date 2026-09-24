@@ -286,7 +286,7 @@ jobs:
         # Pinned to the v2.32.0 commit, the tag that first carried this action.
         # Renovate bumps an existing digest when v2 moves; it does not do the
         # initial tag-to-SHA conversion, which is why this is pinned by hand.
-        uses: cplieger/ci/actions/publish-surface@7188b73f4b9262539473c6e0e1e29174849e8a09 # v2
+        uses: cplieger/ci/actions/publish-surface@e4a9bf7bcd6e5d19ea9fc91a7f24dedd47946635 # v2
         with:
           package-dir: ${{ inputs.working-directory }}
 
