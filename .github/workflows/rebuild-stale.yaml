@@ -1,11 +1,11 @@
 # Base-package rebuilds for the image repos, daily at 04:00 UTC (sync holds
 # 02:00, daily-security 03:00). An image that installs OS packages at build
 # time picks up upstream fixes only when rebuilt; for each such repo whose
-# newest dev build is older than INTERVAL_DAYS this opens an auto-merging pull
-# request into `dev` carrying one empty `fix(deps)` commit. The merge is a
-# significant push (a commit that changes no file counts as one), and the
-# Dockerfile's PKG_REFRESH build-arg makes the new build re-run its package
-# layer instead of restoring it from cache.
+# newest build is older than INTERVAL_DAYS: on a dev-default repo, an
+# auto-merging pull request into `dev` carrying one empty `fix(deps)` commit
+# (a commit that changes no file is a significant push, and PKG_REFRESH makes
+# the build re-run its package layer); on a repo still on main, a release.yaml
+# dispatch with skip_if_unchanged, which its v2 pipeline's no-change gate reads.
 name: Rebuild stale images
 
 on:
@@ -71,10 +71,6 @@ jobs:
             if ! grep -qE 'apk (add|upgrade)|apt-get (install|upgrade)' <<<"$dockerfile"; then
               continue
             fi
-            if [ "$default_branch" != "dev" ]; then
-              echo "::notice::${r}: default branch is '${default_branch}', not dev; skipping until it adopts the dev channel"
-              continue
-            fi
             # The runs endpoint 404s when the repo has no release.yaml workflow;
             # such a repo is not a rebuild candidate. (A transient API error also
             # lands here and skips the repo for a day.)
@@ -105,7 +101,8 @@ jobs:
             done < <(jq -r '.workflow_runs[] | [(.id | tostring), .created_at] | @tsv' <<<"$runs")
 
             add_stale() { # <repo> <last> <age-days>
-              STALE=$(jq -c --arg r "$1" --arg l "$2" --arg a "$3" '. + [{repo: $r, last: $l, age_days: $a}]' <<<"$STALE")
+              STALE=$(jq -c --arg r "$1" --arg l "$2" --arg a "$3" --arg b "$default_branch" \
+                '. + [{repo: $r, last: $l, age_days: $a, branch: $b}]' <<<"$STALE")
             }
             if [ -z "$last" ]; then
               add_stale "$r" "none in 20 newest successes" "n/a"
@@ -135,7 +132,7 @@ jobs:
           count=$(jq length <<<"$STALE")
           {
             echo ""
-            echo "Opening a rebuild pull request in ${count} repo(s)."
+            echo "Rebuilding ${count} repo(s)."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Stale repos: ${count}"
 
@@ -152,14 +149,34 @@ jobs:
     permissions:
       contents: read
     env:
-      # SYNC_PAT: the same concern as the sync PRs, a machine pull request into
-      # dev. Nothing here runs the target repo's code.
-      GH_TOKEN: ${{ secrets.SYNC_PAT }}
       REPO: ${{ matrix.repo }}
       LAST: ${{ matrix.last }}
       AGE_DAYS: ${{ matrix.age_days }}
     steps:
+      - name: Dispatch release.yaml on cplieger/${{ matrix.repo }}
+        if: ${{ matrix.branch != 'dev' }}
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          set -euo pipefail
+          # A stub predating the input answers "unexpected inputs" (HTTP 422);
+          # only that rejection falls back to a plain, always-publishing dispatch.
+          if ! gh workflow run release.yaml -R "cplieger/${REPO}" --ref "$BRANCH" \
+              -f skip_if_unchanged=true 2>/tmp/dispatch.err; then
+            cat /tmp/dispatch.err
+            grep -qi "unexpected inputs" /tmp/dispatch.err
+            echo "::notice::cplieger/${REPO}: dispatch with skip_if_unchanged rejected; retrying without inputs"
+            gh workflow run release.yaml -R "cplieger/${REPO}" --ref "$BRANCH"
+          fi
+          echo "Dispatched release.yaml on cplieger/${REPO}"
+
       - name: Open a rebuild pull request on cplieger/${{ matrix.repo }}
+        if: ${{ matrix.branch == 'dev' }}
+        env:
+          # SYNC_PAT: the same concern as the sync PRs, a machine pull request
+          # into dev. Nothing here runs the target repo's code.
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
         run: |
           set -euo pipefail
           # Same fallback shape as sync.yaml: GitHub refuses --auto on a pull
