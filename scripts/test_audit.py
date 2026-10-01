@@ -92,6 +92,7 @@ def base_settings(name: str, default_branch: str) -> dict:
         'workflows_can_approve_prs': False,
         'has_codeql': True,
         'has_security_scan': True,
+        'publishes': True,
         'has_dockerfile': False,
         'go_module': None,
         'expected_package': None,
@@ -893,6 +894,40 @@ class Legacy(unittest.TestCase):
         s['webhooks'] = [hook(['registry_package'])]
         hard, _, _ = audit.compliance(s)
         self.assertTrue(any("lack 'release'" in h for h in hard), hard)
+
+    def public_main(self, name: str = 'httpx', publishes=True) -> dict:
+        s = legacy(name)
+        s['private'] = False
+        s['visibility'] = 'public'
+        s['publishes'] = publishes
+        return s
+
+    def stable_only_warning(self, s: dict) -> list:
+        _, warn, _ = audit.compliance(s)
+        return [w for w in warn if 'releases straight to the stable channel' in w]
+
+    def test_a_public_repo_still_releasing_from_main_is_named(self):
+        self.assertEqual(len(self.stable_only_warning(self.public_main())), 1)
+
+    def test_a_single_main_repo_is_not_named(self):
+        self.assertEqual(self.stable_only_warning(self.public_main('tool-catalog')), [])
+
+    def test_a_repo_without_a_release_workflow_is_not_named(self):
+        self.assertEqual(self.stable_only_warning(self.public_main(publishes=False)), [])
+
+    def test_an_unreadable_workflow_listing_names_nothing(self):
+        self.assertEqual(self.stable_only_warning(self.public_main(publishes=None)), [])
+
+    def test_a_private_repo_on_main_is_not_named(self):
+        s = self.public_main()
+        s['private'] = True
+        self.assertEqual(self.stable_only_warning(s), [])
+
+    def test_a_two_channel_repo_is_not_named(self):
+        s = two_channel()
+        s['private'] = False
+        s['publishes'] = True
+        self.assertEqual(self.stable_only_warning(s), [])
 
     def test_other_default_branch_is_hard(self):
         s = legacy()

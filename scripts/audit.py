@@ -861,12 +861,13 @@ def collect(meta):
 
     wf = gh_json("api", f"repos/{OWNER}/{name}/contents/.github/workflows")
     if wf is API_ERROR:
-        s["has_codeql"] = s["has_security_scan"] = None
+        s["has_codeql"] = s["has_security_scan"] = s["publishes"] = None
         s["errors"].append("workflow listing unreadable (API)")
     else:
         wf_names = {f["name"] for f in wf} if isinstance(wf, list) else set()
         s["has_codeql"] = bool({"codeql.yml", "codeql.yaml"} & wf_names)
         s["has_security_scan"] = bool({"security.yml", "security.yaml"} & wf_names)
+        s["publishes"] = bool({"release.yaml", "release.yml", "publish.yaml", "publish.yml"} & wf_names)
 
     # Surface detection, mirroring scripts/classify-repos.py: a root Dockerfile
     # means the release pipeline publishes an image (and, for dual-publish
@@ -1060,6 +1061,12 @@ def compliance(s):
         hard.append(f"default_branch=dev on a single-main repo (want main; {s['name']} publishes from main directly)")
     elif s["default_branch"] not in ("main", "dev"):
         hard.append(f"default_branch={s['default_branch']} (want dev, or main until the repo adopts the dev channel)")
+    # A bootstrap run sits on main for minutes and a forgotten repo sits there
+    # forever; the two look identical, so this names the repo instead of failing.
+    if (s["default_branch"] == "main" and not s["private"] and s.get("publishes")
+            and s["name"] not in release_channels.SINGLE_MAIN_REPOS):
+        warn.append("default branch is main, so every merge releases straight to the stable channel "
+                    "(adopt the dev channel, or list the repo in SINGLE_MAIN_REPOS)")
 
     # License: public repos only — a private personal repo has no audience
     # that needs a license grant. The expected license is per-category, not
