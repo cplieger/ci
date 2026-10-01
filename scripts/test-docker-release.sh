@@ -193,7 +193,7 @@ chk_has "D-V10 an unknown channel refuses" "$(run_step derive.sh)" "EXIT=1"
 # The highest-priority rule is what metadata-action writes into
 # org.opencontainers.image.version, so a build from source is labelled with
 # its version on either channel, never with `sha-<commit>`.
-top_rule() { sed -n '/^meta_tags<<EOF$/,/^EOF$/p' "$WORK/out" | grep -o 'type=[^,]*,[^,]*,priority=[0-9]*' | sort -t= -k4 -n -r | head -1 | sed 's/,priority=.*//'; }
+top_rule() { sed -n '/^meta_tags<<EOF$/,/^EOF$/p' "$WORK/out" | grep -o 'type=[^,]*,[^,]*,priority=[0-9]*' | awk -F',priority=' '$2 + 0 > max { max = $2 + 0; rule = $1 } END { print rule }'; }
 export CHANNEL=stable DEV_VERSION="" RELEASE_NEEDED=true FINALIZE=false
 run_step derive.sh >/dev/null
 chk "D-V11 the stable version tag has the highest priority" "$(top_rule)" "type=raw,value=v1.3.0"
