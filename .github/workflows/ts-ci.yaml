@@ -45,7 +45,7 @@ jobs:
         with:
           # Keep in step with release.yaml's Setup Node.js (same major), so CI
           # tests on the Node that publishes.
-          node-version: '24'
+          node-version: '26'
           cache: npm
           cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
 
