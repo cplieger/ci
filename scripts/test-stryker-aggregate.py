@@ -128,9 +128,9 @@ def case_flat_single_artifact(tmp: Path) -> None:
 def case_nested_multi_artifact(tmp: Path) -> None:
     """The N>1 layout must keep working, and multi-dir repos aggregate into one row."""
     art = tmp / 'artifacts'
-    stage(art, repo='vibekit', dirname='static-src', flat=False)
-    stage(art, repo='vibekit', dirname='web', flat=False)
-    proc, entries = aggregate(art, 'vibekit', tmp)
+    stage(art, repo='marotte', dirname='static-src', flat=False)
+    stage(art, repo='marotte', dirname='web', flat=False)
+    proc, entries = aggregate(art, 'marotte', tmp)
     check('nested layout: exits 0', ok=proc.returncode == 0, detail=proc.stderr)
     check(
         'nested layout: both reports are found',

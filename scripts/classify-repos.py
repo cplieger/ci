@@ -399,7 +399,7 @@ def main():
             cliff_alpha.append(repo)
 
     # Cross-language Go repos that ALSO have TS surfaces (e.g.
-    # web-terminal-engine: go.mod + web/jsr.json, vibekit/web-terminal-kiro/
+    # web-terminal-engine: go.mod + web/jsr.json, marotte/web-terminal-kiro/
     # subflux: go.mod + static-src/) — also need TS lint configs. Appended
     # after the pure-TS repos, in repo order, like the bash's second pass.
     for repo in repo_names:

@@ -51,9 +51,9 @@ meta "$root/flat/artifacts" reactive
 expect 'a flat single artifact is discovered' 'reactive' 0 "$root/flat/artifacts"
 
 # The N>1 layout, which is what the callers were written against.
-meta "$root/nested/artifacts/stryker-vibekit-static-src" vibekit
+meta "$root/nested/artifacts/stryker-marotte-static-src" marotte
 meta "$root/nested/artifacts/stryker-reactive-root" reactive
-expect 'nested artifacts are discovered and sorted' 'reactive,vibekit' 0 "$root/nested/artifacts"
+expect 'nested artifacts are discovered and sorted' 'marotte,reactive' 0 "$root/nested/artifacts"
 
 # Several attempts of one repo collapse to one name, so a caller loops once.
 meta "$root/dedup/artifacts/gremlins-envx-1" envx
