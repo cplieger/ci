@@ -11,3 +11,6 @@ __pycache__/
 # sync.yaml run (and feeds it straight to repo-file-sync-action), so it is never
 # committed; a committed copy only drifts against the live repo set.
 .github/sync.yml
+
+# Agent workflow scratch
+.agents/
