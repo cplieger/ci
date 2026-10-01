@@ -33,10 +33,26 @@ suffix for versioned modules, e.g. `metrics/v2`).
    trusting any single badge — keep rows at 8 or under and prune hard.
 6. **One source line.** Every badge in the row sits on the SAME Markdown line,
    separated by a single space. GitHub collapses a single newline to a space, so
-   one-per-line looked identical there; Community Applications and other
-   renderers treat that newline as a hard break and stack the badges one per
-   row (measured 2026-09-18 on the seadex-scout listing). The blocks below are
-   written on one line for that reason; copy them as they are.
+   one-per-line looks identical there, but a renderer with hard breaks enabled
+   turns each newline into a `<br>`. The blocks below are written on one line
+   for that reason; copy them as they are. **This principle does not explain a
+   stacked badge row** — that is principle 7, and a 2026-09-18 revision of this
+   text wrongly credited the newline for it.
+7. **Every badge is wrapped in a link.** A bare `![…](…)` renders as a BLOCK
+   element under any stylesheet built on Tailwind Preflight, which sets
+   `img { display: block }`, so an unlinked badge takes its own line and the
+   surrounding prose margin no matter what the Markdown source looks like.
+   Unraid's Community Applications is the fleet's live instance: its README
+   container restores inline flow for an image inside a link
+   (`[&_a_img]:inline-block`, `[&_a_img]:my-0`) and does nothing for a bare one.
+   Measured 2026-09-20 on the seadex-scout listing, whose row carried two bare
+   badges: the badge paragraph was 160px tall across 4 rows against a README
+   preview capped at `max-height: 40rem`, a quarter of everything a reader sees.
+   Wrapping those two in links took it to 24px on one row, reproduced in the
+   same stylesheet. So `Platforms` links to the GHCR package page (which lists
+   the manifest platforms it claims) and the base badge links to the repo's
+   `Dockerfile` (where the exact pin lives, per principle 2). Both are real
+   destinations, so this satisfies principle 5 rather than working around it.
 
 ## Blocks by repo type
 
@@ -91,13 +107,13 @@ weakest occupant (principle #5).
 ### Docker image (built from Go source in this repo)
 
 ```markdown
-[![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/size.json)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER) ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue) ![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker) [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/REPO/releases)
+[![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/size.json)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER) [![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER) [![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO)](https://github.com/cplieger/REPO/blob/main/Dockerfile) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/mutation.json)](https://github.com/cplieger/REPO/issues?q=label%3Agremlins-tracker) [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/REPO/releases)
 ```
 
 ### Docker image (thin upstream wrapper, no Go source)
 
 ```markdown
-[![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/size.json)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER) ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue) ![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO) [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/REPO/releases)
+[![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/REPO/badges/size.json)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER) [![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)](https://github.com/cplieger/REPO/pkgs/container/CONTAINER) [![base: NAME](https://img.shields.io/badge/base-NAME-COLOR?logo=LOGO)](https://github.com/cplieger/REPO/blob/main/Dockerfile) [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/REPO/releases)
 ```
 
 - The **Mutation** row applies only to images **built from Go source in this
@@ -116,6 +132,10 @@ weakest occupant (principle #5).
   `nut-upsd`, `smtp-relay`) for `docker-fclones-scheduler` / `docker-nut-upsd` /
   `docker-smtp-relay`, but no such packages exist — those links 404. Use the
   repo name.
+- Every badge in both blocks carries a link (principle 7). Where a repo splits
+  the base into two badges because its image is assembled from two upstreams
+  (`docker-caddy`'s `built from:` + `runtime:`), both link to the `Dockerfile`
+  — it is the one file that states either fact.
 - `base` is **name-only**: `Alpine` (`0D597F`, `logo=alpinelinux`), `Caddy`
   (`1F88C0`, `logo=caddy`), `Distroless` / `distroless%2Fstatic` (`4285F4` /
   `2496ED`, `logo=google` / `logo=docker`), `scratch` (`2496ED`,
