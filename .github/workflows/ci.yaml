@@ -596,7 +596,7 @@ jobs:
       - name: Lint Markdown
         run: |
           markdownlint-cli2 --config "$RUNNER_TEMP/.markdownlint.json" \
-            "**/*.md" "#node_modules" "#.git" "#licenses"
+            "**/*.md" "#node_modules" "#.git" "#licenses" "#**/testdata"
 
       # NO spell check here, decided 2026-08 after measuring it. A `typos` gate
       # shipped opt-in by a committed `_typos.toml`, and no repo ever committed
