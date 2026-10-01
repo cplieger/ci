@@ -276,7 +276,12 @@ of every lane (a pipeline-authored Release on a stable tag, a `release/tag/<tag>
 commit status on a dev tag; a tag whose commit is younger than two hours is
 not graded, and a repo with a workflow run live or ended within those two
 hours has no version tag graded that run, because the pipeline creates the
-tag before its receipt). The script's checks are the authoritative list.
+tag before its receipt). A public repo that still releases from a `main`
+default branch, and is not listed in `SINGLE_MAIN_REPOS` in
+`scripts/release_channels.py`, gets a warning naming it: a new repo passes
+through that state while it is bootstrapped, and a repo the cutover missed
+would otherwise stay there unnoticed. The script's checks are the
+authoritative list.
 Known-accepted deviations are encoded in its `ACCEPTED` table so a compliant
 repo set reports clean. Exit codes: 0 compliant, 1 at least one hard failure,
 2 usage or infrastructure (an under-scoped token, or API errors that kept a
