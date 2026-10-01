@@ -478,3 +478,53 @@ jobs:
             exit 1
           fi
           echo "All validation steps passed"
+
+  # The tests again on the oldest Node the package claims, read from its own
+  # `engines.node` floor (`>=24`, `>=24.3`, `^24`). `validate` runs on the Node
+  # that publishes, so without this a package promising an older Node is never
+  # run on it and an API only a newer Node has ships unnoticed. Tests only:
+  # lint, types and the published surface do not depend on the runtime. The job
+  # reads no publishing version, so it stays right when that version moves; a
+  # package with no `engines.node` skips it with a notice.
+  engines-floor:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Read the engines floor
+        id: floor
+        run: |
+          set -euo pipefail
+          range=$(node -e "process.stdout.write((require('./package.json').engines||{}).node||'')")
+          major=$(printf '%s' "$range" | sed -nE 's/^[[:space:]]*(>=|\^|~)?[[:space:]]*v?([0-9]+).*/\2/p')
+          if [ -z "$major" ]; then
+            echo "::notice::package.json declares no engines.node floor; nothing to test beyond the publishing Node"
+          else
+            echo "engines.node ${range}: testing on Node ${major}"
+          fi
+          echo "major=${major}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        if: steps.floor.outputs.major != ''
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.floor.outputs.major }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install deps
+        if: steps.floor.outputs.major != ''
+        run: npm ci
+
+      - name: Test (vitest) on the engines floor
+        if: steps.floor.outputs.major != ''
+        run: npm test
