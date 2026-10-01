@@ -33,6 +33,7 @@ DEPLOYED_IMAGE_REPOS = frozenset(
         'docker-smtp-relay',
         'github-scout',
         'knell',
+        'marotte',
         'pg-autodump',
         'plex-exporter',
         'plex-language-sync',
@@ -40,7 +41,6 @@ DEPLOYED_IMAGE_REPOS = frozenset(
         'seadex-scout',
         'subflux',
         'tautulli-remap',
-        'vibekit',
         'web-terminal-kiro',
         'web-terminal-server',
     }
