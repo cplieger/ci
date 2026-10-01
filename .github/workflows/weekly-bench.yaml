@@ -7,7 +7,7 @@
 # The fleet already had ~155 `func Benchmark` across 16 repos and NOTHING
 # executed any of them: a grep for -bench/-benchmem/benchstat across every
 # workflow in ci and all 55 repos returned zero. So a performance regression in
-# subflux's subsync aligner or vibekit's ACP translator landed silently. The
+# subflux's subsync aligner or marotte's ACP translator landed silently. The
 # benchmarks were well built (size-parameterised, ReportAllocs, ResetTimer);
 # they were simply dead.
 #
@@ -114,7 +114,7 @@
 #                    plex-language-sync/internal/streams 1.0,
 #                    plex-exporter/internal/server 1.2, metrics 1.4,
 #                    web-terminal-engine/vt 2.6, httpx 3.2, then subflux 8.2 and
-#                    vibekit 14.2. The last two are enrolled and run at a lower
+#                    marotte 14.2. The last two are enrolled and run at a lower
 #                    benchtime, because sharpening a signal nobody can attribute
 #                    to a commit is not worth 3x the wall time.
 #
@@ -172,7 +172,7 @@
 #               (runesafe, pathinside, keyenc, langtag, urlform), the five
 #               CPU-bound repos whose benchmarks already existed (metrics,
 #               slogx, web-terminal-engine, plex-language-sync, plex-exporter),
-#               both large apps (subflux, vibekit), and auth, whose two Argon2id
+#               both large apps (subflux, marotte), and auth, whose two Argon2id
 #               benchmarks are skipped: their cost IS the security parameter, and
 #               a customSmallerIsBetter tracker alerts only on getting slower
 #               where the dangerous direction is faster. What remains is the
@@ -197,7 +197,7 @@
 #               - webhttp: per-call cost is dominated by net/http itself and it
 #                 makes no cost claim of its own.
 #               NOT excluded, but worth knowing: subflux (136 series) and
-#               vibekit (103) are enrolled WHOLE rather than as a curated
+#               marotte (103) are enrolled WHOLE rather than as a curated
 #               subset, which was a deliberate call against the documented
 #               practice - an optimized subset still detects most real
 #               application changes (arxiv.org/abs/2212.09515) and selection by
@@ -264,7 +264,7 @@ on:
         required: false
         default: "10"
       benchtime:
-        description: "go test -benchtime per sample. Empty uses the per-repo default (3s, or 1s for subflux and vibekit). Spread falls as 1/sqrt(iterations), so 3s buys about a 1.7x tighter series at 3x the wall time."
+        description: "go test -benchtime per sample. Empty uses the per-repo default (3s, or 1s for subflux and marotte). Spread falls as 1/sqrt(iterations), so 3s buys about a 1.7x tighter series at 3x the wall time."
         required: false
         default: ""
 
@@ -455,7 +455,7 @@ jobs:
           ENROLLED="$ENROLLED runesafe pathinside keyenc langtag urlform"   # pure-compute libraries
           ENROLLED="$ENROLLED metrics slogx web-terminal-engine"   # per-call hot paths
           ENROLLED="$ENROLLED plex-language-sync plex-exporter"    # CPU-bound app paths
-          ENROLLED="$ENROLLED subflux vibekit"                     # the two large apps
+          ENROLLED="$ENROLLED subflux marotte"                     # the two large apps
           ENROLLED="$ENROLLED auth"                                # per-request auth path, KDF skipped
 
           # Forks are excluded fleet-wide (same rule as scripts/audit.py): a
@@ -555,7 +555,7 @@ jobs:
       max-parallel: 4   # Own day; 4 leaves 16 of the 20-job cap free. 17 repos
                         # is 5 waves, and subflux dominates: measured at
                         # -count=10, it is 36 min at its 1s benchtime, against
-                        # about 12 min for the slowest library at 3s. vibekit
+                        # about 12 min for the slowest library at 3s. marotte
                         # read 36.5 here until 2026-09-16 and the figure was
                         # never right: it needed about 77 min, because one
                         # benchmark's per-op cost grew with b.N. Fixed in that
@@ -647,7 +647,7 @@ jobs:
             BENCHTIME="$BENCHTIME_INPUT"
           else
             case "$REPO" in
-              subflux|vibekit) BENCHTIME=1s ;;
+              subflux|marotte) BENCHTIME=1s ;;
               *)               BENCHTIME=3s ;;
             esac
           fi
@@ -680,7 +680,7 @@ jobs:
               # and meaningless as a wall-clock series. Its hit and miss
               # siblings stay.
               SKIP='BenchmarkHashFile|BenchmarkCache_GetOrFetch/concurrent_miss' ;;
-            vibekit)
+            marotte)
               # Copies a file and then os.Remove's it inside the timed loop, so
               # the series measures the filesystem. The ServeHTTP call in it is
               # fine on its own - an in-process handler with a recorder is

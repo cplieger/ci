@@ -129,7 +129,7 @@ PUSH_WEBHOOK_REPOS = {".github", ".kiro", "ci", "homelab"}
 NO_DEPLOY_HOOK = {"AWS"}
 # Every image repo (root Dockerfile) dual-publishes to GHCR + Docker Hub, so
 # every one of them needs the DOCKERHUB_* secrets. There is no GHCR-only
-# exemption set any more: subflux and vibekit were the last two, and their
+# exemption set any more: subflux and marotte were the last two, and their
 # carve-out outlived the intent by ~20 releases while both READMEs advertised a
 # Docker Hub image the pipeline had stopped pushing. A future exemption needs a
 # skip here AND a policy override in .github/workflows/release.yaml.
@@ -229,7 +229,7 @@ LICENSE_OVERRIDES = {
     # because section 13 is also what puts AGPL on corporate blocklists that
     # GPL-3.0 escapes.
     "subflux": "AGPL-3.0",
-    "vibekit": "AGPL-3.0",
+    "marotte": "AGPL-3.0",
 }
 
 # Documented governance standard (repo-governance.md).

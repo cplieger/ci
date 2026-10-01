@@ -121,7 +121,7 @@ weakest occupant (principle #5).
   `docker-keepalived`, `docker-nut-upsd`, `docker-radvd`,
   `docker-smtp-relay`, `docker-static-web`), which have no mutation run.
 - **No Mutation (TS) badge on image repos**, even where the app's web frontend
-  is Stryker-enrolled (`vibekit`, `subflux`, `web-terminal-kiro`): the row
+  is Stryker-enrolled (`marotte`, `subflux`, `web-terminal-kiro`): the row
   already sits at the 8-badge cap, and an image README's audience is
   deployers, not TS consumers — the weekly score lives in the repo's
   `stryker-tracker` issue and the run summary instead. The frontends stay
@@ -229,7 +229,7 @@ materials.
 - For dual-published images, shields offers first-party Docker Hub badges
   (`docker/pulls`, `docker/image-size`, `docker/v`). We use the self-published
   GHCR size badge instead, because GHCR is the primary registry, the same badge
-  works for the GHCR-only repos (`subflux`, `vibekit`), and a
+  works for the GHCR-only repos (`subflux`, `marotte`), and a
   self-published value depends on no third-party service.
 - **License** and **Code of Conduct** badges were considered for Docker Hub
   (which lacks the GitHub chrome that surfaces both) and rejected: they would

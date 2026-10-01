@@ -195,7 +195,7 @@ jobs:
                 #
                 # This was silent until 2026-08: `|| true` discarded the exit
                 # status and the extraction above found no path, so the leg went
-                # green with no finding and no issue. vibekit's FuzzSetDebug
+                # green with no finding and no issue. marotte's FuzzSetDebug
                 # panicked on seed#0 in every weekly run for weeks with zero
                 # signal anywhere. Fail the shard instead — a broken target is a
                 # process defect, so it fails closed rather than filing an issue

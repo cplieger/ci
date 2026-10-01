@@ -266,7 +266,7 @@ jobs:
           # A run that killed NOTHING measured nothing, so it is a defect rather
           # than a score. Refuse before publishing: a real suite kills some of
           # its mutants, so 0 detected against thousands of valid ones means the
-          # harness never activated a mutant — and only vibekit sets
+          # harness never activated a mutant — and only marotte sets
           # `thresholds.break`, so everywhere else that sails through as a green
           # run, a red 0.0% badge and a `mutation-regression` label on the
           # tracker. Measured 2026-09-13 across 7 repos the moment the browser

@@ -30,7 +30,7 @@
 
 # Loopback is structurally uncheckable, never a real external link.
 # Three repos document the URL a reader opens after starting the container
-# (web-terminal-kiro :9848, vibekit :9847, web-terminal-server 127.0.0.1:7681).
+# (web-terminal-kiro :9848, marotte :9847, web-terminal-server 127.0.0.1:7681).
 # No server listens in a CI runner, so the checker reports "Connection refused"
 # for documentation that is correct. `--exclude-loopback` is lychee's own flag
 # for this and covers localhost plus 127.0.0.0/8, so no regex has to.

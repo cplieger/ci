@@ -759,14 +759,14 @@ jobs:
               IMAGE_LICENSES="Apache-2.0 AND MIT" ;;
             subflux)
               IMAGE_LICENSES="AGPL-3.0-or-later AND GPL-2.0-or-later" ;;
-            vibekit)
+            marotte)
               IMAGE_LICENSES="AGPL-3.0-or-later AND OFL-1.1" ;;
             web-terminal-kiro|web-terminal-server)
               IMAGE_LICENSES="MPL-2.0 AND OFL-1.1" ;;
           esac
 
           # Every image repo dual-publishes; there is no GHCR-only set. The
-          # last two exemptions (subflux, vibekit) were removed 2026-08-21 —
+          # last two exemptions (subflux, marotte) were removed 2026-08-21 —
           # both had DOCKERHUB_* secrets and a README advertising a Docker Hub
           # image, while this override had frozen that registry at v0.1.x since
           # 2026-06-04. A new exemption needs a REGISTRIES="ghcr" arm here AND
@@ -775,7 +775,7 @@ jobs:
           case "$REPO_NAME" in
             # SBOM from extracted binary path (image-level scan misses static
             # Go deps for these builds).
-            web-terminal-kiro|vibekit)
+            web-terminal-kiro|marotte)
               SBOM_FROM="path" ;;
           esac
 

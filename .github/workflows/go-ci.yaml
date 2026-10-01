@@ -293,7 +293,7 @@ jobs:
       #    it. It also cannot be made fatal without reddening repos that have
       #    done nothing wrong: a build-constrained file (`//go:build !linux`)
       #    legitimately answers `no package metadata`, and nine such production
-      #    files across web-terminal-engine, vibekit and subflux are never
+      #    files across web-terminal-engine, marotte and subflux are never
       #    scanned today. Still a residual, now a NAMED one.
       #
       # Shards come from `git ls-files`, so untracked third-party Go is out of
