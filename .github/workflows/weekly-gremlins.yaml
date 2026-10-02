@@ -533,3 +533,4 @@ jobs:
     with:
       workflow: ${{ github.workflow }}
       run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      scope: ${{ inputs.only }}

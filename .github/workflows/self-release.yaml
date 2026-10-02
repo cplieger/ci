@@ -316,3 +316,19 @@ jobs:
           gh release create "${VERSION}" \
             --title "${VERSION}" \
             --notes-file /tmp/RELEASE_NOTES.md
+
+  # `needs:` must list every other job in this workflow. The push-to-main
+  # trigger is a branch push, which notify-failure.yaml's track gate never
+  # reaches (the merging agent watches the post-merge run); a workflow_dispatch
+  # run gets the duration policy, so a short manual run files nothing.
+  notify:
+    needs: release
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

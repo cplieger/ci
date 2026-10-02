@@ -59,7 +59,7 @@ LABELS = {
     'mutation-regression': ('b60205', 'Mutation efficacy regression'),
     'promotion-blocked': ('e99695', 'Automatic promotion to main is blocked'),
     'stryker-tracker': ('1d76db', 'Stryker mutation testing tracker'),
-    'weekly-ci-failure': ('b60205', 'A scheduled CI run failed and needs triage'),
+    'weekly-ci-failure': ('b60205', 'An unwatched CI run failed and needs triage'),
 }
 DEFAULT_LABEL = ('ededed', 'Maintained by automation')
 
