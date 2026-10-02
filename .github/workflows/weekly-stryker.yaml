@@ -259,7 +259,16 @@ jobs:
           # --reporters json overrides the config's html/clear-text reporters
           # for CI; progress keeps the log alive under the job timeout.
           rc=0
-          npx --no-install stryker run --reporters json,progress || rc=$?
+          # GITHUB_ACTIONS=false on THIS command only: vitest appends its
+          # "github-actions" reporter when that variable is exactly "true", so
+          # every killed mutant's deliberate test failure would surface as a
+          # workflow error annotation on a green job. Nothing under
+          # @stryker-mutator reads the variable, and CI=true still marks the
+          # run as CI.
+          # Node 26's JSON.stringify fast path aborts with "Zone Allocation
+          # failed" on the checker's very large IPC message. Node rejects this
+          # flag in NODE_OPTIONS, so it sits here; remove it once Node fixes that.
+          GITHUB_ACTIONS=false node --no-json-stringify-fast-path node_modules/.bin/stryker run --reporters json,progress || rc=$?
 
           # Locate the schema report (jsonReporter default:
           # reports/mutation/mutation.json; tolerate overridden fileNames).
