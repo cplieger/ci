@@ -1,21 +1,26 @@
-# Files a scheduled workflow's red result as ONE tracker issue per workflow.
-# A cron run has no pull request to block and no operator watching it, which
-# is how `Weekly stryker` stayed red for three consecutive weeks (2026-08-29
-# through 09-12) with nothing announcing it. The issue opens on the first red
-# run with the run link, gets a `Still failing.` comment on each later red run,
-# and is closed on the next green run. Label `weekly-ci-failure`, the same one
-# the private repos' inline `notify` jobs use, so one triage query reads both.
+# Files an unwatched workflow's red result as ONE tracker issue per workflow.
+# A run that nobody watches to the end has no reader otherwise: a red X in the
+# Actions tab notifies no one, which is how `Weekly stryker` stayed red for
+# three consecutive weeks (2026-08-29 through 09-12) with nothing announcing it.
+#
+# Which runs count as unwatched is a decided policy (see the verdict below):
+# automated runs (schedule, and the tag push that automation fires) file on
+# failure; a manual run files only when it ran at least `watched-minutes`, the
+# length past which the person who started it has stopped watching; shorter
+# manual runs and every push/pull-request run are assumed watched and file
+# nothing. The issue closes only on a green run that covered everything on the
+# default branch. Label `weekly-ci-failure`, the same one the private repos'
+# inline `notify` jobs use, so one triage query reads both.
 #
 # This tracks the RUNNER failing. The result trackers some callers maintain
 # (`bench-tracker`, `broken-links`, `gremlins-tracker`, `stryker-tracker`)
 # describe the code under test, which is a different fact.
 #
-# Call it as the final job of a scheduled workflow with `needs:` on EVERY other
-# job and `if: always()`: the verdict is read from the run's job list, so a job
-# missing from `needs:` may still be running and is then invisible. The issue
-# writes go through scripts/tracker_issue.py from a checkout of this repo, so
-# the caller's job needs `contents: read` beside `actions: read` and
-# `issues: write`.
+# Call it as the final job of a workflow with `needs:` on EVERY other job and
+# `if: always()`: the verdict is read from the run's job list, so a job missing
+# from `needs:` may still be running and is then invisible. The issue writes go
+# through scripts/tracker_issue.py from a checkout of this repo, so the caller's
+# job needs `contents: read` beside `actions: read` and `issues: write`.
 name: Notify failure
 
 on:
@@ -36,14 +41,34 @@ on:
         type: string
         required: false
         default: ""
+      scope:
+        description: >-
+          The dispatch `only` value when the run was scoped to some repos, or
+          empty when it covered everything. A scoped run never closes the
+          tracker, because it did not run what it left out.
+        type: string
+        required: false
+        default: ""
+      watched-minutes:
+        description: >-
+          A manual run at least this many minutes long is assumed unwatched and
+          files on failure; a shorter one is assumed watched and files nothing.
+        type: number
+        required: false
+        default: 30
 
 permissions: {}
 
 jobs:
   track:
-    # Schedule only. A dispatch run is interactive and a push or pull request
-    # run has the author watching it, so both already have a reader.
-    if: github.event_name == 'schedule'
+    # Schedule, manual, and the automation-fired tag push can be unwatched. A
+    # push to a branch (main CI, post-merge) has the merging agent watching the
+    # post-merge run, and a pull request blocks its own merge, so both file
+    # nothing and are not even reached here.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref_type == 'tag')
     runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions:
@@ -64,7 +89,7 @@ jobs:
           sparse-checkout-cone-mode: false
           path: ci
 
-      - name: Track the scheduled result in an issue
+      - name: Track the result in an issue
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -72,7 +97,16 @@ jobs:
           RUN_URL: ${{ inputs.run-url }}
           WORKFLOW: ${{ inputs.workflow }}
           DETAILS: ${{ inputs.details }}
-          TITLE: Scheduled ${{ inputs.workflow }} run is failing
+          SCOPE: ${{ inputs.scope }}
+          WATCHED_MINUTES: ${{ inputs.watched-minutes }}
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          # Empty on a schedule event (its payload carries no repository object);
+          # a scheduled run always runs on the default branch, so the shell
+          # treats schedule as on-default without comparing.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TITLE: ${{ inputs.workflow }} run is failing
         run: |
           set -euo pipefail
           label='weekly-ci-failure'
@@ -98,16 +132,79 @@ jobs:
             echo "::warning::${running} jobs are still running while this one reports; list every other job in the caller's needs:"
           fi
 
+          # Duration of THIS attempt, from the run's own start, so a rerun is
+          # timed from when it started rather than from the first attempt.
+          started=$(gh api "repos/${GH_REPO}/actions/runs/${RUN_ID}" --jq '.run_started_at')
+          minutes=$(( ( $(date -u +%s) - $(date -u -d "$started" +%s) ) / 60 ))
+
+          full_scope=false
+          [ -z "$SCOPE" ] && full_scope=true
+          tag_push=false
+          [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ] && tag_push=true
+
+          # A scheduled run always runs on the default branch (and its event
+          # payload carries no repository to compare); a dispatch is on-default
+          # only when its branch ref equals the repo's default branch. Keyed on
+          # the DEFAULT branch, never a literal name: a v3 repo can default to
+          # `dev` and advance `main` only by a manual promote, so a run on `main`
+          # there is a non-default-branch run.
+          on_default=false
+          if [ "$EVENT" = schedule ]; then
+            on_default=true
+          elif [ "$REF_TYPE" = branch ] && [ -n "$DEFAULT_BRANCH" ] \
+            && [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then
+            on_default=true
+          fi
+
+          # A failing run opens or comments when nobody watches it to the
+          # end: an automated run, or a manual run at least WATCHED_MINUTES long.
+          files_on_red=false
+          if [ "$EVENT" = schedule ] || [ "$tag_push" = true ]; then
+            files_on_red=true
+          elif [ "$EVENT" = workflow_dispatch ] && [ "$on_default" = true ] \
+            && [ "$minutes" -ge "$WATCHED_MINUTES" ]; then
+            files_on_red=true
+          fi
+
+          # A green run closes only when it covered everything: an unscoped run
+          # on the default branch, or a tag push (its workflow's only trigger).
+          # A scoped run leaves an open issue open.
+          closes_on_green=false
+          if [ "$full_scope" = true ] && { [ "$tag_push" = true ] || { [ "$on_default" = true ] \
+            && { [ "$EVENT" = schedule ] || [ "$EVENT" = workflow_dispatch ]; }; }; }; then
+            closes_on_green=true
+          fi
+
+          case "$EVENT" in
+            schedule) when='scheduled' ;;
+            workflow_dispatch) when='manual' ;;
+            push) [ "$tag_push" = true ] && when='tag push' || when='push' ;;
+            *) when="$EVENT" ;;
+          esac
+          scope_line="full scope"
+          [ -n "$SCOPE" ] && scope_line="scoped to: ${SCOPE}"
+          context=$(printf '%s run on %s, %s, %d min' "$when" "${GITHUB_REF_NAME}" "$scope_line" "$minutes")
+
           if [ -z "$red" ]; then
-            printf 'The scheduled run is green again: %s\n' "$RUN_URL" >"${RUNNER_TEMP}/comment.md"
-            python3 "$tracker" --repo "$GH_REPO" --label "$label" --title "$TITLE" \
-              --mode close-when-clean --comment-file "${RUNNER_TEMP}/comment.md"
+            if [ "$closes_on_green" = true ]; then
+              printf 'The run is green again (%s): %s\n' "$context" "$RUN_URL" >"${RUNNER_TEMP}/comment.md"
+              python3 "$tracker" --repo "$GH_REPO" --label "$label" --title "$TITLE" \
+                --mode close-when-clean --comment-file "${RUNNER_TEMP}/comment.md"
+            else
+              echo "green, ${context}; did not cover everything, so the tracker is left as-is"
+            fi
+            exit 0
+          fi
+
+          if [ "$files_on_red" != true ]; then
+            echo "red, ${context}; assumed watched, so nothing is filed"
             exit 0
           fi
 
           body="${RUNNER_TEMP}/issue-body.md"
           {
-            printf 'Run: %s\n\nJobs that did not succeed:\n\n%s\n' "$RUN_URL" "$red"
+            printf 'Run: %s\n\nContext: %s\n\nJobs that did not succeed:\n\n%s\n' \
+              "$RUN_URL" "$context" "$red"
             if [ -n "$DETAILS" ]; then
               printf '\nFailed steps reported by the caller:\n\n%s\n' "$DETAILS"
             fi
@@ -117,8 +214,9 @@ jobs:
             cat "$body"
           } >"${RUNNER_TEMP}/comment.md"
           {
-            printf 'The scheduled **%s** run failed. Nothing else reports this ' "$WORKFLOW"
-            printf 'result, so this issue tracks it until a scheduled run is green again.\n\n'
+            printf 'The **%s** run failed and nobody was watching it to the end. ' "$WORKFLOW"
+            printf 'Nothing else reports this result, so this issue tracks it until a '
+            printf 'green run covers everything again.\n\n'
             cat "$body"
           } >"${RUNNER_TEMP}/new-issue.md"
           python3 "$tracker" --repo "$GH_REPO" --label "$label" --title "$TITLE" \

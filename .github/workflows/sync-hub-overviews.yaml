@@ -104,3 +104,19 @@ jobs:
             args+=(--apply)
           fi
           python3 scripts/sync-hub-overviews.py "${args[@]}"
+
+  # `needs:` must list every other job in this workflow. Dispatch-only, so a
+  # failure files only when the run was long enough to be unwatched; a scoped
+  # (`only=…`) run never closes the tracker.
+  notify:
+    needs: sync
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      scope: ${{ inputs.only }}

@@ -77,3 +77,18 @@ jobs:
           git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic ${AUTH}"
           trap 'git config --unset-all "http.https://github.com/.extraheader" || true' EXIT
           git push -f origin "refs/tags/${major}" "refs/tags/${minor}"
+
+  # `needs:` must list every other job in this workflow. This is an
+  # automation-fired tag push, so a failure files the tracker (rule: automated
+  # unwatched runs file); a green run never closes it (not a full-scope run).
+  notify:
+    needs: move-tags
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

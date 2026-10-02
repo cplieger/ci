@@ -10,6 +10,7 @@ Run: python3 scripts/test-tracker-issue.py     (exit 0 = pass)
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import stat
@@ -21,6 +22,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TRACKER = HERE / 'tracker_issue.py'
+NOTIFY_FAILURE = HERE.parent / '.github' / 'workflows' / 'notify-failure.yaml'
 
 STUB_GH = r"""#!/usr/bin/env python3
 import json, os, sys
@@ -447,6 +449,235 @@ class TrackerIssueTest(unittest.TestCase):
                 proc = self.run_tracker({}, *case)
                 self.assertEqual(proc.returncode, 2, proc.stderr)
                 self.assertEqual(self.calls(), [], 'argument errors never reach gh')
+
+
+def _extract_run_block(yaml_text: str, step_name: str) -> str:
+    """The dedented shell of the named step's `run: |` block, by text, not YAML.
+
+    The tracker-scripts job that runs this suite installs no PyYAML, so the
+    block is lifted with indentation arithmetic: find the step, then its
+    `run: |`, then collect the lines indented past it until the block ends.
+    """
+    lines = yaml_text.splitlines()
+    i = 0
+    while i < len(lines) and lines[i].strip() != f'- name: {step_name}':
+        i += 1
+    if i == len(lines):
+        raise AssertionError(f'step not found: {step_name!r}')
+    while i < len(lines) and lines[i].strip() != 'run: |':
+        i += 1
+    if i == len(lines):
+        raise AssertionError(f'no `run: |` under step {step_name!r}')
+    body_indent = (len(lines[i]) - len(lines[i].lstrip())) + 2
+    i += 1
+    body: list[str] = []
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() == '':
+            body.append('')
+        elif len(line) - len(line.lstrip()) >= body_indent:
+            body.append(line[body_indent:])
+        else:
+            break
+        i += 1
+    return '\n'.join(body)
+
+
+# The gate decision — open/comment, close, or nothing — lives in this shell,
+# not in tracker_issue.py, so it is exercised by running the real block against
+# a stub `gh` (jobs list + run_started_at) and a stub tracker that logs its argv.
+GATE_BLOCK = _extract_run_block(NOTIFY_FAILURE.read_text(), 'Track the result in an issue')
+
+GATE_STUB_GH = r"""#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+scenario = json.load(open(os.environ['GH_GATE_SCENARIO']))
+if not args or args[0] != 'api':
+    sys.stderr.write('gate stub gh: unexpected %r\n' % (args,))
+    sys.exit(2)
+url = next(a for a in args[1:] if not a.startswith('-'))
+jq = args[args.index('--jq') + 1] if '--jq' in args else ''
+if '/jobs' in url:
+    for job in scenario['jobs']:
+        sys.stdout.write(json.dumps(job) + '\n')
+elif jq == '.run_started_at':
+    sys.stdout.write(scenario['run_started_at'] + '\n')
+else:
+    sys.stderr.write('gate stub gh: unhandled url %s\n' % url)
+    sys.exit(2)
+"""
+
+GATE_STUB_TRACKER = r"""#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['GH_GATE_TRACKER_LOG'], 'a') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\n')
+"""
+
+SUCCESS_JOBS = [{'name': 'build', 'status': 'completed', 'conclusion': 'success', 'steps': []}]
+FAILED_JOBS = [
+    {'name': 'build', 'status': 'completed', 'conclusion': 'success', 'steps': []},
+    {
+        'name': 'test',
+        'status': 'completed',
+        'conclusion': 'failure',
+        'steps': [{'name': 'unit', 'conclusion': 'failure'}],
+    },
+]
+
+
+class GatePolicyTest(unittest.TestCase):
+    """The notify-failure.yaml gate: which runs open/comment, close, or file nothing."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix='tracker-gate-'))
+        bindir = self.tmp / 'bin'
+        bindir.mkdir()
+        stub = bindir / 'gh'
+        stub.write_text(GATE_STUB_GH)
+        stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        self.bindir = bindir
+        self.workspace = self.tmp / 'ws'
+        tracker_dir = self.workspace / 'ci' / 'scripts'
+        tracker_dir.mkdir(parents=True)
+        (tracker_dir / 'tracker_issue.py').write_text(GATE_STUB_TRACKER)
+        self.runner_temp = self.tmp / 'runner-temp'
+        self.runner_temp.mkdir()
+        self.scenario = self.tmp / 'gate-scenario.json'
+        self.tracker_log = self.tmp / 'tracker.log'
+
+    def run_gate(
+        self,
+        *,
+        event: str,
+        jobs: list[dict],
+        minutes_ago: int,
+        ref_type: str = 'branch',
+        ref_name: str = 'main',
+        default_branch: str = 'main',
+        scope: str = '',
+        watched_minutes: int = 30,
+    ) -> subprocess.CompletedProcess:
+        started = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=minutes_ago)
+        self.scenario.write_text(
+            json.dumps({'jobs': jobs, 'run_started_at': started.strftime('%Y-%m-%dT%H:%M:%SZ')})
+        )
+        self.tracker_log.write_text('')
+        # A schedule event carries no repository object, so DEFAULT_BRANCH is
+        # empty there, exactly as github.event.repository.default_branch resolves.
+        default = '' if event == 'schedule' else default_branch
+        env = {
+            **os.environ,
+            'PATH': f'{self.bindir}{os.pathsep}{os.environ["PATH"]}',
+            'GH_GATE_SCENARIO': str(self.scenario),
+            'GH_GATE_TRACKER_LOG': str(self.tracker_log),
+            'GITHUB_WORKSPACE': str(self.workspace),
+            'RUNNER_TEMP': str(self.runner_temp),
+            'GH_TOKEN': 'x',
+            'GH_REPO': 'cplieger/x',
+            'RUN_ID': '12345',
+            'RUN_URL': 'https://example/run',
+            'WORKFLOW': 'Weekly gremlins',
+            'DETAILS': '',
+            'SCOPE': scope,
+            'WATCHED_MINUTES': str(watched_minutes),
+            'EVENT': event,
+            'REF_TYPE': ref_type,
+            'REF_NAME': ref_name,
+            'GITHUB_REF_NAME': ref_name,
+            'DEFAULT_BRANCH': default,
+            'TITLE': 'Weekly gremlins run is failing',
+        }
+        return subprocess.run(
+            ['bash', '-c', GATE_BLOCK], capture_output=True, text=True, env=env, check=False
+        )
+
+    def tracker_mode(self) -> str | None:
+        """The --mode of the single tracker call, or None when nothing was filed."""
+        lines = self.tracker_log.read_text().splitlines()
+        if not lines:
+            return None
+        argv = json.loads(lines[-1])
+        return argv[argv.index('--mode') + 1]
+
+    def test_green_scoped_dispatch_does_not_close(self) -> None:
+        proc = self.run_gate(
+            event='workflow_dispatch', scope='reactive', jobs=SUCCESS_JOBS, minutes_ago=45
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNone(self.tracker_mode(), 'a scoped run never covered everything, so no close')
+
+    def test_failed_scoped_dispatch_opens(self) -> None:
+        proc = self.run_gate(
+            event='workflow_dispatch', scope='reactive', jobs=FAILED_JOBS, minutes_ago=45
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.tracker_mode(), 'recur', 'a long scoped failure is a real failure')
+
+    def test_failed_short_manual_files_nothing(self) -> None:
+        proc = self.run_gate(event='workflow_dispatch', jobs=FAILED_JOBS, minutes_ago=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNone(self.tracker_mode(), 'a short manual run is assumed watched')
+
+    def test_failed_full_long_dispatch_opens(self) -> None:
+        proc = self.run_gate(event='workflow_dispatch', jobs=FAILED_JOBS, minutes_ago=45)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.tracker_mode(), 'recur', 'a long full-scope failure is unwatched')
+
+    def test_schedule_failure_opens(self) -> None:
+        proc = self.run_gate(event='schedule', jobs=FAILED_JOBS, minutes_ago=5)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.tracker_mode(), 'recur')
+
+    def test_schedule_green_closes(self) -> None:
+        proc = self.run_gate(event='schedule', jobs=SUCCESS_JOBS, minutes_ago=5)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.tracker_mode(), 'close-when-clean')
+
+    def test_full_long_dispatch_green_closes(self) -> None:
+        proc = self.run_gate(event='workflow_dispatch', jobs=SUCCESS_JOBS, minutes_ago=45)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.tracker_mode(), 'close-when-clean')
+
+    def test_full_short_dispatch_green_closes(self) -> None:
+        # Closing is duration-independent: a green full-scope run covered
+        # everything whatever its length.
+        proc = self.run_gate(event='workflow_dispatch', jobs=SUCCESS_JOBS, minutes_ago=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.tracker_mode(), 'close-when-clean')
+
+    def test_dispatch_on_feature_branch_files_nothing(self) -> None:
+        proc = self.run_gate(
+            event='workflow_dispatch', ref_name='feature/x', jobs=FAILED_JOBS, minutes_ago=45
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNone(self.tracker_mode(), 'a non-default-branch run never touches the tracker')
+
+    def test_green_scoped_on_feature_branch_does_not_close(self) -> None:
+        proc = self.run_gate(
+            event='workflow_dispatch',
+            ref_name='feature/x',
+            scope='reactive',
+            jobs=SUCCESS_JOBS,
+            minutes_ago=45,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNone(self.tracker_mode())
+
+    def test_tag_push_failure_opens(self) -> None:
+        proc = self.run_gate(
+            event='push', ref_type='tag', ref_name='v2.1.3', jobs=FAILED_JOBS, minutes_ago=1
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.tracker_mode(), 'recur', 'an automation-fired tag push is unwatched')
+
+    def test_tag_push_green_closes(self) -> None:
+        proc = self.run_gate(
+            event='push', ref_type='tag', ref_name='v2.1.3', jobs=SUCCESS_JOBS, minutes_ago=1
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.tracker_mode(), 'close-when-clean', "a tag push is its workflow's whole run"
+        )
 
 
 if __name__ == '__main__':

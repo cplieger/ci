@@ -113,3 +113,17 @@ jobs:
           gh api --method POST \
             "repos/${REPO}/hooks/${hook_id}/deliveries/${delivery_id}/attempts"
           echo "::notice::Requested GitHub redelivery of delivery ${delivery_id} (reason=${REASON})"
+
+  # `needs:` must list every other job in this workflow. Dispatch-only, so a
+  # failure files only when the run was long enough to be unwatched.
+  notify:
+    needs: trigger
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
