@@ -67,12 +67,20 @@ jobs:
           SHARD_BUDGET_SECONDS: "14400"
         run: |
           set -euo pipefail
-          # Forks are excluded fleet-wide (same rule as scripts/audit.py): a fork
-          # carries UPSTREAM's code, so fuzzing it spends the shared runner budget
-          # on targets we neither own nor can fix, and any finding would be filed
-          # against a repo whose issues are typically disabled.
-          repos=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
-            [.[] | select(.isArchived == false and .isFork == false) | .name] | .[]
+          # One-shot clone auth, built once for the scan loop below. Passed as a
+          # top-level `git -c` (never `git clone --config`), so the token is not
+          # written into any scan/.git/config.
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          # Repo discovery over REST, not the GraphQL `gh repo list`: the fanout
+          # is a single point of failure for the whole run, and GraphQL shares a
+          # quota the per-repo reads and clones also draw, so a quota exhaustion
+          # there loses every repo at once. Forks are excluded (same rule as
+          # scripts/audit.py): a fork carries UPSTREAM's code, so fuzzing it
+          # spends the runner budget on targets we neither own nor can fix, and
+          # any finding would be filed against a repo whose issues are typically
+          # disabled.
+          repos=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
+            .[] | select(.archived == false and .fork == false) | .name
           ')
 
           shard_matrix='[]'
@@ -80,7 +88,16 @@ jobs:
           for r in $repos; do
             gh api "/repos/cplieger/${r}/contents/go.mod" --silent 2>/dev/null || continue
             rm -rf scan
-            gh repo clone "cplieger/${r}" scan -- --depth 1 2>/dev/null || continue
+            # Plain git clone over HTTPS draws no API quota, so a rate-limited
+            # run can still clone; resolving the repo through the gh CLI would
+            # spend GraphQL quota this run may already have exhausted. A clone
+            # that still fails is LOUD — a silent `|| continue` dropped the repo
+            # from the matrix with no trace.
+            if ! git -c "http.https://github.com/.extraheader=${auth}" \
+                clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
+              echo "::warning::clone failed for ${r} — dropping it from the fuzz matrix this week"
+              continue
+            fi
             sha=$(git -C scan rev-parse HEAD)
             # Count fuzz targets (proxy for `go test -list '^Fuzz'`; exact count
             # is recomputed per shard at run time, this only sizes the matrix).
@@ -129,8 +146,13 @@ jobs:
       - name: Clone target repo at pinned SHA
         run: |
           set -euo pipefail
-          gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
-          git -C target fetch --depth 1 origin "${{ matrix.sha }}"
+          # One-shot auth as a top-level `git -c` so a private target cannot
+          # break the clone and the token is not persisted into target/.git.
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=${auth}" \
+            clone --depth 1 "https://github.com/cplieger/${{ matrix.repo }}.git" target
+          git -c "http.https://github.com/.extraheader=${auth}" \
+            -C target fetch --depth 1 origin "${{ matrix.sha }}"
           git -C target checkout --quiet "${{ matrix.sha }}"
 
       - name: Set up Go
@@ -245,8 +267,13 @@ jobs:
       - name: Clone target repo at pinned SHA
         run: |
           set -euo pipefail
-          gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
-          git -C target fetch --depth 1 origin "${{ matrix.sha }}"
+          # One-shot auth as a top-level `git -c` so a private target cannot
+          # break the clone and the token is not persisted into target/.git.
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=${auth}" \
+            clone --depth 1 "https://github.com/cplieger/${{ matrix.repo }}.git" target
+          git -c "http.https://github.com/.extraheader=${auth}" \
+            -C target fetch --depth 1 origin "${{ matrix.sha }}"
           git -C target checkout --quiet "${{ matrix.sha }}"
 
       - name: Download this repo's shard findings

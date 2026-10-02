@@ -51,9 +51,8 @@ jobs:
           # Archived and fork repos are excluded fleet-wide (an archived repo is
           # read-only and a fork's tree is upstream's).
           mapfile -t candidates < <(
-            gh repo list cplieger --limit 200 --no-archived \
-              --json name,isFork,visibility \
-              --jq '.[] | select(.isFork == false and .visibility == "PUBLIC") | .name' \
+            gh api --paginate 'user/repos?per_page=100&affiliation=owner' \
+              --jq '.[] | select(.archived == false and .fork == false and .visibility == "public") | .name' \
               | sort
           )
 

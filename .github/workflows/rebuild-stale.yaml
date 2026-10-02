@@ -45,9 +45,11 @@ jobs:
 
           # Forks are excluded fleet-wide (same rule as scripts/audit.py): a fork
           # publishes no cplieger image.
-          repos=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork,defaultBranchRef --jq '
-            [.[] | select(.isArchived == false and .isFork == false)
-                 | [.name, (.defaultBranchRef.name // "")] | @tsv] | .[]
+          # REST rather than `gh repo list`: GraphQL quota is shared with every
+          # other token of the account owner and can be exhausted by unrelated load.
+          repos=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
+            .[] | select(.archived == false and .fork == false)
+                | [.name, (.default_branch // "")] | @tsv
           ')
 
           STALE='[]'
