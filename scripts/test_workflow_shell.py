@@ -21,10 +21,12 @@ COVERED = (
     '.github/workflows/rebuild-stale.yaml',
     'actions/git-cliff-version/action.yml',
 )
-# Steps the release-channel work added to workflows whose inherited blocks
-# are not held to the prologue; each is gated by name.
+# Named steps in workflows whose other blocks are not held to the prologue.
 COVERED_STEPS = (
     ('.github/workflows/ci.yaml', 'scripts', 'Probe docker-release shell semantics'),
+    ('.github/workflows/ci.yaml', 'scripts', 'Probe image-test slot'),
+    ('.github/workflows/ci.yaml', 'docker', 'Image smoke test'),
+    ('.github/workflows/ci.yaml', 'docker', 'Image test suite'),
     ('.github/workflows/self-ci.yaml', 'release-channel-scripts', 'Install PyYAML'),
     (
         '.github/workflows/self-ci.yaml',

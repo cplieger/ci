@@ -182,16 +182,6 @@ HUB_MARKER_END = "<!-- hub-overview END -->"
 ACCEPTED = {
     "homelab": {
     },
-    "docker-radvd": {
-        "unexpected extra required check 'smoke'":
-            "deliberate: repo-local smoke signal-contract job required in "
-            "addition to ci / validate (repo-governance.md, 2026-07)",
-    },
-    "web-terminal-server": {
-        "unexpected extra required check 'smoke'":
-            "deliberate: repo-local smoke signal-contract job required in "
-            "addition to ci / validate (same pattern as docker-radvd)",
-    },
 }
 
 # Expected license per repo (licensing.md's four-license scheme, 2026-08).
@@ -1134,7 +1124,7 @@ def compliance(s):
         # The standard is exactly the validate gate. Any other required check
         # is drift worth eyeballing — a typo'd or abandoned context is one
         # workflow rename away from the phantom class below. Deliberate extras
-        # (docker-radvd's smoke job) live in ACCEPTED.
+        # live in ACCEPTED.
         for ctx in s["required_checks"] or []:
             if ctx not in validate_ctxs:
                 warn.append(f"unexpected extra required check '{ctx}' "

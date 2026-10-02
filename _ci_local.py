@@ -590,11 +590,14 @@ def resolve_reusable_workflow(uses_ref, target, parent_ref=None):
 # ---------------------------------------------------------------------------
 
 
-def evaluate_step_if(expr, step_outputs, caller_inputs=None, workspace=None):
+def evaluate_step_if(
+    expr, step_outputs, caller_inputs=None, workspace=None, step_outcomes=None
+):
     """Evaluate a GitHub Actions if-expression to True/False.
 
-    Supports steps.*.outputs.*, inputs.*, &&/||/!, ${{ }} wrapping, always(),
-    and hashFiles(...) (resolved against the checkout root). Locally
+    Supports steps.*.outputs.*, steps.*.outcome, inputs.*, &&/||/!, ${{ }}
+    wrapping, always(), cancelled() and hashFiles(...) (resolved against the
+    checkout root). Locally a run is never cancelled,
     github.event.repository.private is always false and github.event_name is
     always 'pull_request'.
     """
@@ -607,46 +610,50 @@ def evaluate_step_if(expr, step_outputs, caller_inputs=None, workspace=None):
     if expr.startswith('${{') and expr.endswith('}}'):
         expr = expr[3:-2].strip()
 
-    return _eval_expr(expr, step_outputs, caller_inputs, Path(workspace))
+    ctx = (step_outputs, step_outcomes or {})
+    return _eval_expr(expr, ctx, caller_inputs, Path(workspace))
 
 
-def _eval_expr(expr, step_outputs, caller_inputs, workspace):
+def overrides_implicit_success(expr):
+    """Whether expr calls a status function, which drops GitHub's implicit success()."""
+    return re.search(r'\b(?:always|cancelled)\(\)', expr) is not None
+
+
+def _eval_expr(expr, ctx, caller_inputs, workspace):
     """Recursive expression evaluator."""
     expr = expr.strip()
 
     if expr == 'always()':
         return True
+    if expr == 'cancelled()':
+        return False
 
     # || before && (lowest precedence first), each respecting nesting.
     parts = _split_logical(expr, '||')
     if len(parts) > 1:
-        return any(_eval_expr(p, step_outputs, caller_inputs, workspace) for p in parts)
+        return any(_eval_expr(p, ctx, caller_inputs, workspace) for p in parts)
 
     parts = _split_logical(expr, '&&')
     if len(parts) > 1:
-        return all(_eval_expr(p, step_outputs, caller_inputs, workspace) for p in parts)
+        return all(_eval_expr(p, ctx, caller_inputs, workspace) for p in parts)
 
     if expr.startswith('!'):
-        return not _eval_expr(expr[1:].strip(), step_outputs, caller_inputs, workspace)
+        return not _eval_expr(expr[1:].strip(), ctx, caller_inputs, workspace)
 
     if expr.startswith('(') and expr.endswith(')'):
-        return _eval_expr(expr[1:-1], step_outputs, caller_inputs, workspace)
+        return _eval_expr(expr[1:-1], ctx, caller_inputs, workspace)
 
     for op in ('!=', '=='):
         idx = expr.find(op)
         if idx >= 0:
-            lhs = _resolve_value(
-                expr[:idx].strip(), step_outputs, caller_inputs, workspace
-            )
-            rhs = _resolve_value(
-                expr[idx + len(op) :].strip(), step_outputs, caller_inputs, workspace
-            )
+            lhs = _resolve_value(expr[:idx].strip(), ctx, caller_inputs, workspace)
+            rhs = _resolve_value(expr[idx + len(op) :].strip(), ctx, caller_inputs, workspace)
             if op == '==':
                 return str(lhs) == str(rhs)
             return str(lhs) != str(rhs)
 
     # Bare expression: resolve to truthy.
-    val = _resolve_value(expr, step_outputs, caller_inputs, workspace)
+    val = _resolve_value(expr, ctx, caller_inputs, workspace)
     return bool(val) and str(val).lower() not in ('false', '0', '')
 
 
@@ -697,7 +704,8 @@ def _github_repository(workspace):
     return ''
 
 
-def _resolve_value(tok, step_outputs, caller_inputs, workspace):
+def _resolve_value(tok, ctx, caller_inputs, workspace):
+    step_outputs, step_outcomes = ctx
     tok = tok.strip()
 
     if tok.startswith('${{') and tok.endswith('}}'):
@@ -716,6 +724,10 @@ def _resolve_value(tok, step_outputs, caller_inputs, workspace):
         step_id = m.group(1)
         key = m.group(2)
         return step_outputs.get(step_id, {}).get(key, '')
+
+    m = re.fullmatch(r'steps\.(\w+)\.outcome', tok)
+    if m:
+        return step_outcomes.get(m.group(1), '')
 
     m = re.match(r'inputs\.(\S+)', tok)
     if m:
@@ -746,6 +758,8 @@ def _resolve_value(tok, step_outputs, caller_inputs, workspace):
 
     if tok == 'always()':
         return 'true'
+    if tok == 'cancelled()':
+        return 'false'
 
     return tok
 
@@ -2231,6 +2245,7 @@ def process_reusable_steps(
     failed_steps = []
     overall_ok = True
     step_outputs = {}
+    step_outcomes = {}
     hard_failed = False
     recorded_soft_failure = False
     base_cwd = target / working_dir if working_dir != '.' else target
@@ -2242,10 +2257,12 @@ def process_reusable_steps(
         step_id = step.get('id', '')
         name = step.get('name') or '(unnamed)'
         if_expr = str(step.get('if', '') or '')
+        if step_id:
+            step_outcomes[step_id] = 'skipped'
 
         # GitHub implicitly applies success() to ordinary later steps after a
-        # hard failure. Explicit always() cleanup/aggregation still runs.
-        if hard_failed and 'always()' not in if_expr:
+        # hard failure, unless the step's if: calls a status function.
+        if hard_failed and not overrides_implicit_success(if_expr):
             print(f'  {gray("SKIP"):<7} {name}  (previous hard step failed)')
             counters['SKIP'] += 1
             continue
@@ -2290,7 +2307,9 @@ def process_reusable_steps(
         elif 'working-directory' in eff_step:
             eff_step['working-directory'] = step_wd or None
 
-        if if_expr and not evaluate_step_if(if_expr, step_outputs, caller_inputs, target):
+        if if_expr and not evaluate_step_if(
+            if_expr, step_outputs, caller_inputs, target, step_outcomes
+        ):
             print(f'  {gray("SKIP"):<7} {name}  (if: false)')
             counters['SKIP'] += 1
             continue
@@ -2303,6 +2322,7 @@ def process_reusable_steps(
             if dry_run:
                 outputs = predict_profile_outputs(eff_step, run_cwd, target)
                 step_outputs[step_id] = outputs
+                step_outcomes[step_id] = 'success'
                 out_str = ', '.join(f'{key}={value}' for key, value in outputs.items())
                 print(f'  {blue("DRY"):<7} {name}  ({out_str})')
                 counters['DRY'] += 1
@@ -2313,6 +2333,7 @@ def process_reusable_steps(
             suffix = f'  ({out_str})' if out_str else ''
             print(f'  {blue("EXEC"):<7} {name}{suffix}')
             print(f'    → {res.status}')
+            step_outcomes[step_id] = 'success' if res.outcome == 'pass' else 'failure'
             if res.outcome == 'pass':
                 counters['PASS'] += 1
             else:
@@ -2366,6 +2387,8 @@ def process_reusable_steps(
             continue
 
         res = run_step(kind, name, detail, eff_step, target, dry_run)
+        if step_id and res.outcome in ('dry', 'pass', 'fail', 'missing'):
+            step_outcomes[step_id] = 'failure' if res.outcome in ('fail', 'missing') else 'success'
         if res.outcome == 'dry':
             counters['DRY'] += 1
             continue

@@ -276,15 +276,11 @@ jobs:
     if: ${{ needs.detect.outputs.run_shell == 'true' }}
     uses: ./.github/workflows/shell-ci.yaml
 
-  # Build-ability gate. Before this job, a consumer's required `ci / validate`
-  # never built the image — image builds happened only in the non-required
-  # Security workflow (security-scan.yaml) and post-merge in Release. A
-  # Dockerfile that fails to build (e.g. a package pin that doesn't exist in the
-  # base image's repo) could therefore merge green and only surface when Release
-  # failed. This job builds the image at PR time (single-arch, no push, no scan)
-  # so a broken Dockerfile fails the required check. It is purely "does it
-  # build" — vulnerability scanning stays advisory in security-scan.yaml so a
-  # base-image CVE never blocks a merge or release.
+  # Builds the image at PR time (single-arch, no push, no scan) and runs the
+  # repo's image tests against it, so a Dockerfile that does not build or an
+  # image that does not work fails the required check. Vulnerability scanning
+  # stays advisory in security-scan.yaml, so a base-image CVE never blocks a
+  # merge or release.
   docker:
     needs: detect
     if: ${{ needs.detect.outputs.run_docker == 'true' }}
@@ -318,6 +314,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build image (no push, no scan)
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -333,41 +330,33 @@ jobs:
           # build-ability gate — the image has already built by export time.
           cache-to: type=gha,mode=max,ignore-error=true
 
-      # Runtime image smoke test, opt-in per repo (runs only when
-      # tests/image-smoke.sh exists). Build-time smoke tests live inside the
-      # Dockerfile (a `test` stage the final stage depends on — used by the
-      # thin wrapper images). This step instead runs the *assembled* image and
-      # probes it, catching failures the build can't see: a broken `//go:embed`
-      # frontend, a missing runtime dependency, a server that never binds its
-      # port, or a broken HEALTHCHECK. The script receives the loaded image ref
-      # and owns run + probe + teardown. Used by the HTTP-serving apps.
-      #
-      # Blocking: promoted 2026-07 after the enrolled fleet showed a sustained
-      # green history. A red runtime smoke fails the docker job and with it
-      # the required `ci / validate` check.
+      # Run through sh: the harness is tracked 100644 here and in every synced
+      # copy, so it cannot be executed directly.
       - name: Image smoke test
         if: ${{ hashFiles('tests/image-smoke.sh') != '' }}
-        run: sh tests/image-smoke.sh ci-smoke:latest
+        run: |
+          set -euo pipefail
+          sh tests/image-smoke.sh ci-smoke:latest
 
-      # NO browser step here, decided twice (2026-08). An earlier draft ran a
-      # repo's Playwright suite against the loaded image at this point,
-      # report-only. Removed: report-only with no named consumer is the
-      # "advisory stream nobody reads" class this repo keeps deleting, a
-      # browser run is the flakiest check class while npm ci + a chromium
-      # download tax every PR (~84% of which are Renovate/sync), and the failure
-      # class it hunted has a deterministic core that needs no JS execution: the
-      # served importmap's targets must exist in the built image. That core is a
-      # hard gate now — the smoke harness's smoke_verify hook (see
-      # configs/image-smoke.sh; web-terminal-kiro's tests/image-smoke.conf
-      # implements it with three curls). Browser suites stay repo-owned for
-      # local runs and the ui-qa skill; do not re-wire one here without a
-      # consumer for its report.
+      # Executed directly so its shebang picks the interpreter. Runs after a
+      # red harness so one run reports both verdicts; needs a built image.
+      - name: Image test suite
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && hashFiles('tests/image-test.sh') != '' }}
+        run: |
+          set -euo pipefail
+          if [ ! -x tests/image-test.sh ]; then
+            msg="tests/image-test.sh is not executable. CI runs it directly so its shebang picks the interpreter;"
+            msg="$msg commit it as mode 100755: git update-index --chmod=+x tests/image-test.sh"
+            echo "::error file=tests/image-test.sh::$msg"
+            exit 1
+          fi
+          ./tests/image-test.sh ci-smoke:latest
 
   # arm64 build-ability gate. Same rationale as the amd64 `docker` job: without
   # it, an arch-specific Dockerfile break (a hardcoded amd64 download URL, a
   # wrong `uname -m` case, a base image without an arm64 manifest) merges green
   # and only surfaces when Release builds the arm64 leg on a native runner.
-  # Build only — the smoke test runs once, on amd64. Public repos only: arm
+  # Build only — the image tests run once, on amd64. Public repos only: arm
   # hosted runners are free for public repos; a free-plan private repo's job
   # would queue forever and block the required check (every Dockerfile
   # consumer is public today).
@@ -854,6 +843,21 @@ jobs:
               echo "no docker-release probe in this repo - skipping"
             fi
           ) || { echo "Probe docker-release shell semantics" >> /tmp/_ci_failures; exit 1; }
+
+      # The docker job's two image-test steps are shell nothing else executes
+      # here; the probe extracts and runs them against fixture checkouts.
+      # Gated on `-f` + `bash` because an `-x` gate would skip silently.
+      - name: Probe image-test slot
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          (
+            if [ -f scripts/test-image-test-slot.sh ]; then
+              bash scripts/test-image-test-slot.sh
+            else
+              echo "no image-test slot probe in this repo - skipping"
+            fi
+          ) || { echo "Probe image-test slot" >> /tmp/_ci_failures; exit 1; }
 
       # Shell unit-test harness self-test (opt-in by file presence). The
       # harness is CANONICAL in this repo (configs/shell/lib.sh) and synced

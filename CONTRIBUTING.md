@@ -12,7 +12,13 @@ outward, so the conventions below are about not breaking downstream.
   - `ci.yaml`: meta detect-and-dispatch (`on: workflow_call`). Auto-detects a
     repo's surfaces (`go.mod` / `jsr.json` / `Dockerfile` / nested web frontend)
     and fans out to the language workflows below; the `validate` job is the
-    aggregate check name branch protection targets.
+    aggregate check name branch protection targets. A repo with a `Dockerfile`
+    gets a `docker` job that builds the image and runs two opt-in image tests
+    against it, both blocking: the synced harness `tests/image-smoke.sh`
+    (opted into by `tests/image-smoke.conf`), then a repo-owned
+    `tests/image-test.sh`, executed directly with the image ref as `$1`, which
+    runs even when the harness failed. The suite must be tracked executable; a
+    present but non-executable one fails the job with a message naming the fix.
   - `go-ci.yaml`, `ts-ci.yaml`, `shell-ci.yaml`: the per-language reusable
     workflows.
   - `release.yaml`: unified release (channel from the branch → git-cliff
@@ -85,7 +91,9 @@ outward, so the conventions below are about not breaking downstream.
   classification logic, same scripts-job opt-in), `test-docker-release.sh`
   (the same shape for `docker-release.yaml`'s promotion path: the channel tag,
   the digest walk and the `BUILD_VERSION` stamp, executed out of the workflow
-  file against a stub registry), `backfill-release-notes.py`
+  file against a stub registry), `test-image-test-slot.sh` (the same shape
+  for the meta `ci.yaml` docker job's two image-test steps, executed in
+  fixture checkouts), `backfill-release-notes.py`
   (dry-run-first regeneration of historical release bodies under the current
   cliff config), and `install-local-tools.sh` (installs the CI-pinned tool
   versions locally). The badge-branch writer lives with its action at
@@ -152,16 +160,16 @@ python3 scripts/classify-repos.py    # prints a regenerated sync.yml to stdout
 
 ## The shell probes and what each one pins
 
-Four probes in `scripts/` execute shell the release pipeline embeds or depends
-on; each runs in the `scripts` CI job when its file is present, so a change to
-the pinned behaviour cannot merge unnoticed. Their headers name the subject;
-the cases are here. `test-lane-semantics.sh` extracts the nested-module lane
-discovery and classification shell out of `release.yaml` and the meta
-`ci.yaml` and pins eligibility, changed-path classification (a lane with a
-tag on the channel is measured from that tag, so a later root or docs commit
-does not republish it, and its anchor is the one `compute.sh` computes),
-module-path verification, the version guards and the regex escaping; the
-other three follow.
+Five probes in `scripts/` execute shell the release pipeline or the docker job
+embeds or depends on; each runs in the `scripts` CI job when its file is
+present, so a change to the pinned behaviour cannot merge unnoticed. Their
+headers name the subject; the cases are here. `test-lane-semantics.sh`
+extracts the nested-module lane discovery and classification shell out of
+`release.yaml` and the meta `ci.yaml` and pins eligibility, changed-path
+classification (a lane with a tag on the channel is measured from that tag, so
+a later root or docs commit does not republish it, and its anchor is the one
+`compute.sh` computes), module-path verification, the version guards and the
+regex escaping; the other four follow.
 
 `test-cliff-bump-semantics.sh` (`CLIFF_BIN=/path/to/git-cliff` skips the
 download) pins git-cliff behaviours that upstream does not document and that
@@ -225,6 +233,24 @@ stable notes step; and the `release/tag/<tag>` receipt every dev tag step
 (docker, go, ts, lane) records for the audit, executed against a stub `gh`: a
 failed receipt POST deletes the tag the attempt created so a rerun makes both,
 and a tag that predated the attempt is never deleted.
+
+`test-image-test-slot.sh` extracts the docker job's `Image smoke test` and
+`Image test suite` steps from the meta `ci.yaml`, evaluates their `if:`
+expressions with `_ci_local.py`'s evaluator and runs their bodies under
+`bash -e` in fixture checkouts. It pins: each step runs only when its file is
+present and neither runs `continue-on-error`; the build (step id `build`)
+loads `ci-smoke:latest` and the harness then the suite follow it in that
+order; the suite's gate is `!cancelled()`, a successful build and the file, so
+a red harness does not skip it while a failed or skipped build does; a suite
+exiting 0 passes and receives exactly `ci-smoke:latest` as its one argument; a
+non-zero exit fails the step with that status; a mode 644 suite fails with the
+message naming `git update-index --chmod=+x` and never runs; the shebang picks
+the interpreter (a bash-only suite and a python3 suite both run, and a missing
+interpreter fails); the harness runs under `sh` at mode 644; the job's
+15-minute budget; and that `docker-arm64` runs no image test. The evaluator
+models a status function the way GitHub does: `always()` or `cancelled()` in
+an `if:` lets a step run after a failed one, and `steps.<id>.outcome` reads
+the recorded result.
 
 ## Changing this repo affects every consumer
 
