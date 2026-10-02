@@ -25,13 +25,18 @@ rules:
       - release.yaml
       - self-ci.yaml
       - self-codeql.yml
-      # The scheduled workflows calling notify-failure.yaml.
+      # The workflows calling notify-failure.yaml.
       - audit.yaml
+      - backfill-release-sbom-sigs.yaml
       - daily-security.yaml
       - ghcr-retention.yaml
+      - move-major-tag.yaml
       - promote.yaml
       - rebuild-stale.yaml
+      - self-release.yaml
+      - sync-hub-overviews.yaml
       - sync.yaml
+      - trigger-renovate.yaml
       - weekly-bench.yaml
       - weekly-fuzz.yaml
       - weekly-gremlins.yaml
