@@ -889,6 +889,19 @@ class Legacy(unittest.TestCase):
         _, warn, _ = audit.compliance(s)
         self.assertTrue(any("unexpected custom ruleset 'dev'" in w for w in warn), warn)
 
+    def test_a_required_smoke_check_is_drift_in_every_repo(self):
+        for name in ('docker-radvd', 'web-terminal-server'):
+            with self.subTest(repo=name):
+                s = legacy(name)
+                s['required_checks'] = ['ci / validate', 'smoke']
+                s['observed_checks'] = ['ci / validate', 'smoke']
+                _, warn, accepted = audit.compliance(s)
+                self.assertIn(
+                    "unexpected extra required check 'smoke' (standard is the validate gate alone)",
+                    warn,
+                )
+                self.assertEqual(accepted, [])
+
     def test_main_repo_release_hook_required(self):
         s = legacy('knell')
         s['webhooks'] = [hook(['registry_package'])]
