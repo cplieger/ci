@@ -71,11 +71,19 @@ jobs:
           ONLY: ${{ github.event.inputs.only }}
         run: |
           set -euo pipefail
-          # Forks are excluded fleet-wide (same rule as scripts/audit.py): a fork
-          # carries UPSTREAM's code and tests, so its mutation score measures
-          # someone else's suite and its tracker issue would be unactionable.
-          repos=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
-            [.[] | select(.isArchived == false and .isFork == false) | .name] | .[]
+          # One-shot clone auth, built once for the scan loop below. Passed as a
+          # top-level `git -c` (never `git clone --config`), so the token is not
+          # written into any scan/.git/config.
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          # Repo discovery over REST, not the GraphQL `gh repo list`: the fanout
+          # is a single point of failure for the whole run, and GraphQL shares a
+          # quota the per-repo clones also draw, so a quota exhaustion there
+          # loses every repo at once. Forks are excluded (same rule as
+          # scripts/audit.py): a fork carries UPSTREAM's code and tests, so its
+          # mutation score measures someone else's suite and its tracker issue
+          # would be unactionable.
+          repos=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
+            .[] | select(.archived == false and .fork == false) | .name
           ')
 
           if [ -n "${ONLY:-}" ]; then
@@ -91,15 +99,23 @@ jobs:
           matrix='[]'
           for r in $repos; do
             rm -rf scan
-            gh repo clone "cplieger/${r}" scan -- --depth 1 2>/dev/null || continue
-            # `|| continue` above only catches a clone that EXITS non-zero. A
-            # clone that exits 0 leaving no resolvable HEAD reaches rev-parse,
-            # which exits 128 under `set -e` and kills the whole job — taking
-            # every other repo's matrix entry with it (2026-08-15: died one repo
-            # after web-terminal-engine, `run` skipped entirely, no repo
-            # mutation-tested that week). Replaying this loop over all 57 repos
-            # found no repo that reproduces it, so it is a transient clone and
-            # the right blast radius is one skipped repo, not the fleet.
+            # Plain git clone over HTTPS draws no API quota, so a rate-limited
+            # run can still clone; resolving the repo through the gh CLI would
+            # spend GraphQL quota this run may already have exhausted. A failed
+            # clone is LOUD rather than a silent `|| continue` that dropped the
+            # repo with no trace.
+            if ! git -c "http.https://github.com/.extraheader=${auth}" \
+                clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
+              echo "::warning::${r}: clone failed — skipping this repo"
+              continue
+            fi
+            # The clone can still exit 0 leaving no resolvable HEAD, which reaches
+            # rev-parse; that exits 128 under `set -e` and would kill the whole
+            # job, taking every other repo's matrix entry with it (2026-08-15:
+            # died one repo after web-terminal-engine, `run` skipped entirely, no
+            # repo mutation-tested that week). Replaying this loop over all 57
+            # repos found no repo that reproduces it, so it is a transient clone
+            # and the right blast radius is one skipped repo, not every repo.
             if ! sha=$(git -C scan rev-parse HEAD 2>/dev/null); then
               echo "::warning::${r}: clone left no resolvable HEAD — skipping this repo"
               continue
@@ -126,7 +142,11 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 120
+    # Sized to measured work: web-terminal-ui's full run is ~3.3-4.4h on this
+    # runner (8696 mutants at ~44/min, 2026-09-27, no hang, 0.4% timeouts).
+    # 360 is the hosted-runner ceiling, so a package that outgrows this needs
+    # incremental mode or a narrower `mutate`, not a bigger number.
+    timeout-minutes: 345
     permissions:
       contents: read
     env:
@@ -144,8 +164,13 @@ jobs:
       - name: Clone target repo at pinned SHA
         run: |
           set -euo pipefail
-          gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
-          git -C target fetch --depth 1 origin "${{ matrix.sha }}"
+          # One-shot auth as a top-level `git -c` so a private target cannot
+          # break the clone and the token is not persisted into target/.git.
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=${auth}" \
+            clone --depth 1 "https://github.com/cplieger/${{ matrix.repo }}.git" target
+          git -c "http.https://github.com/.extraheader=${auth}" \
+            -C target fetch --depth 1 origin "${{ matrix.sha }}"
           git -C target checkout --quiet "${{ matrix.sha }}"
 
       - name: Setup Node.js

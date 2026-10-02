@@ -327,10 +327,16 @@ jobs:
         run: |
           set -uo pipefail
 
-          # Forks are excluded fleet-wide (same rule as scripts/audit.py): a
-          # fork's tree is UPSTREAM's, so its benchmarks are someone else's.
-          if ! live=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
-            [.[] | select(.isArchived == false and .isFork == false) | .name] | .[]
+          # One-shot clone auth, built once for the loop below (top-level
+          # `git -c`, never persisted into scan/.git/config).
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          # Repo discovery over REST, not the GraphQL `gh repo list`: GraphQL
+          # shares a quota the per-repo clones draw too, and this guard already
+          # fails the job closed when discovery returns nothing. Forks are
+          # excluded (same rule as scripts/audit.py): a fork's tree is
+          # UPSTREAM's, so its benchmarks are someone else's.
+          if ! live=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
+            .[] | select(.archived == false and .fork == false) | .name
           '); then
             echo "::error::repo discovery failed; refusing to report green having checked nothing"
             exit 1
@@ -353,8 +359,12 @@ jobs:
             # Bounded individually. This loop is serial over every unenrolled
             # repo, so one wedged clone or module download would otherwise
             # consume the job timeout and the log would not say which repo did
-            # it. 120s is generous for a --depth 1 clone.
-            if ! timeout 120 gh repo clone "cplieger/${r}" scan -- --depth 1 >/dev/null 2>&1; then
+            # it. 120s is generous for a --depth 1 clone. Plain git over HTTPS
+            # draws no API quota, so a rate-limited run can still clone; the gh
+            # CLI would resolve through GraphQL, whose quota this run may already
+            # have spent.
+            if ! timeout 120 git -c "http.https://github.com/.extraheader=${auth}" \
+                clone --depth 1 "https://github.com/cplieger/${r}.git" scan >/dev/null 2>&1; then
               echo "::warning::clone failed or timed out for ${r} - skipping"
               continue
             fi
@@ -448,6 +458,10 @@ jobs:
         run: |
           set -euo pipefail
 
+          # One-shot clone auth, built once for the loops below (top-level
+          # `git -c`, never persisted into scan/.git/config).
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+
           # The enrolled set. The criterion and every exclusion are in the
           # header block; keep the two in step when editing this list.
           # Grouped by why each repo is here, not alphabetically.
@@ -458,18 +472,16 @@ jobs:
           ENROLLED="$ENROLLED subflux marotte"                     # the two large apps
           ENROLLED="$ENROLLED auth"                                # per-request auth path, KDF skipped
 
-          # Forks are excluded fleet-wide (same rule as scripts/audit.py): a
-          # fork's tree is UPSTREAM's, so its benchmarks measure someone else's
-          # code and its tracker issue would be unactionable.
-          # `tr` is load-bearing: jq emits one name per LINE, and the liveness
-          # test below is a space-delimited substring match. Without the
-          # flattening, `*" $r "*` never matches (a newline is not a space), so
-          # every enrolled repo was rejected as "not live", the matrix came out
-          # empty, the `run` job skipped, and the whole leg reported SUCCESS.
-          # It did that from the guard landing until 2026-08-21, which is why no
-          # repo ever grew a `benchmarks` branch.
-          live=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
-            [.[] | select(.isArchived == false and .isFork == false) | .name] | .[]
+          # Repo discovery over REST, not the GraphQL `gh repo list`: GraphQL
+          # shares a quota the per-repo clones draw too, so a fanout failure
+          # loses the whole run. Forks are excluded (same rule as
+          # scripts/audit.py): a fork's tree is UPSTREAM's. `tr` is load-bearing:
+          # --jq emits one name per LINE and the liveness test below is a
+          # space-delimited substring match, so without the flattening `*" $r "*`
+          # never matches (a newline is not a space) and every enrolled repo is
+          # rejected as "not live", emptying the matrix and vacuously passing.
+          live=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
+            .[] | select(.archived == false and .fork == false) | .name
           ' | tr '\n' ' ')
 
           repos=""
@@ -502,10 +514,14 @@ jobs:
           matrix='[]'
           for r in $repos; do
             rm -rf scan
-            gh repo clone "cplieger/${r}" scan -- --depth 1 2>/dev/null || {
+            # Plain git clone over HTTPS draws no API quota, so a rate-limited
+            # run can still clone; the gh CLI would resolve through GraphQL,
+            # whose quota this run may already have spent.
+            if ! git -c "http.https://github.com/.extraheader=${auth}" \
+                clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
               echo "::warning::clone failed for ${r} - skipping"
               continue
-            }
+            fi
             if [ ! -f scan/go.mod ]; then
               echo "  skip ${r}: no go.mod"
               continue

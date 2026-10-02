@@ -49,11 +49,15 @@ jobs:
           ONLY: ${{ github.event.inputs.only }}
         run: |
           set -euo pipefail
-          # Forks are excluded fleet-wide (same rule as scripts/audit.py): a fork
-          # carries UPSTREAM's code and tests, so its mutation score measures
-          # someone else's suite and its tracker issue would be unactionable.
-          repos=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork --jq '
-            [.[] | select(.isArchived == false and .isFork == false) | .name] | .[]
+          # Repo discovery over REST, not the GraphQL `gh repo list`: the fanout
+          # is a single point of failure for the whole run, and GraphQL shares a
+          # quota the per-repo reads draw too, so a quota exhaustion there loses
+          # every repo at once. Forks are excluded (same rule as
+          # scripts/audit.py): a fork carries UPSTREAM's code and tests, so its
+          # mutation score measures someone else's suite and its tracker issue
+          # would be unactionable.
+          repos=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
+            .[] | select(.archived == false and .fork == false) | .name
           ')
 
           # Optional manual filter: the workflow_dispatch 'only' input limits the
@@ -120,7 +124,17 @@ jobs:
           persist-credentials: false
 
       - name: Clone target repo
-        run: gh repo clone "cplieger/${{ matrix.repo }}" target -- --depth 1
+        run: |
+          set -euo pipefail
+          # Plain git clone over HTTPS draws no API quota, so a rate-limited run
+          # can still clone; resolving the repo through the gh CLI would spend
+          # GraphQL quota this run may already have exhausted. One-shot auth as a
+          # top-level `git -c` (never `git clone --config`), so the token is NOT
+          # written into target/.git/config — this job bind-mounts the tree into
+          # a container that copies it to every gremlins worker.
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=${auth}" \
+            clone --depth 1 "https://github.com/cplieger/${{ matrix.repo }}.git" target
 
       - name: Discover Go modules to measure
         id: modules

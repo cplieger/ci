@@ -64,8 +64,10 @@ jobs:
           # protect, and the two private repos check their own links in their
           # bespoke weekly FULL battery. Forks excluded fleet-wide (a fork's
           # docs are upstream's).
-          repos=$(gh repo list cplieger --limit 300 --json name,isArchived,isFork,visibility --jq '
-            [.[] | select(.isArchived == false and .isFork == false and .visibility == "PUBLIC") | .name] | .[]
+          # REST rather than `gh repo list`: GraphQL quota is shared with every
+          # other token of the account owner and can be exhausted by unrelated load.
+          repos=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
+            .[] | select(.archived == false and .fork == false and .visibility == "public") | .name
           ')
 
           if [ -n "${ONLY:-}" ]; then

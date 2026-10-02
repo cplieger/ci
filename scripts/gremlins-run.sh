@@ -19,6 +19,14 @@
 #   OUT               absolute path for gremlins' JSON result
 set -euo pipefail
 
+# The clone is bind-mounted from the runner and owned by the runner uid, while
+# this container runs as root, so git refuses it as "dubious ownership" (exit
+# 128) and every `go build` a test runs fails under -buildvcs=auto. Trust every
+# path: the probe's cp -a copies keep the runner uid too, and gremlins' worker
+# copies live elsewhere. The config is the container's /root/.gitconfig, which
+# dies with --rm.
+git config --global --add safe.directory '*'
+
 : "${GREMLINS_VERSION:?}" "${WORKERS_MAX:?}" "${GOMEM_MAX_MB:?}" "${GOMEM_SOLO_MB:?}"
 : "${PROBE_TIMEOUT:?}" "${OUT:?}"
 
