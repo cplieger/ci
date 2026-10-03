@@ -223,13 +223,13 @@ jobs:
       # biggest task (the runaway test) while gremlins keeps going and records it
       # (verified: a 1- and 2-worker capped run survive the ~14 GiB mutant and
       # complete). The runner agent lives OUTSIDE the container, so the worst
-      # case is a clean step failure, never a runner shutdown. Workers are
-      # bounded by memory (heap + compile/link toolchain per worker): 2 on a
-      # 16 GB runner — low enough that the OOM-killer's victim is unambiguous —
-      # and auto-scaling on bigger runners (where the runaway simply fits under
-      # the larger cap). Workers are ALSO bounded by whether the suite survives
-      # running beside itself; that half lives in scripts/gremlins-run.sh, which
-      # is where the probe that decides it runs.
+      # case is a clean step failure, never a runner shutdown.
+      #
+      # Workers are bounded by CPUs and by memory (heap + compile/link toolchain
+      # per worker): 4 on the 4-vCPU 16 GB runner, where a runaway outweighs a
+      # healthy worker tenfold so the OOM-killer's victim stays unambiguous, and
+      # auto-scaled on bigger runners. They are also bounded by whether the
+      # suite survives running beside itself, which scripts/gremlins-run.sh probes.
       - name: Run gremlins (attempt ${{ matrix.attempt }})
         env:
           MODULES: ${{ steps.modules.outputs.modules }}
@@ -250,8 +250,8 @@ jobs:
           avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
           cap_mb=$(( avail_kb * 80 / 100 / 1024 ))
           nproc_n=$(nproc)
-          toolchain_mb=2048   # go compile+link RSS per worker (not bounded by GOMEMLIMIT)
-          heap_min_mb=2048    # GOMEMLIMIT floor; lower makes healthy tests GC-thrash into false timeouts
+          toolchain_mb=1024   # go compile+link RSS per worker (not bounded by GOMEMLIMIT); measured peak 0.98 GiB at GOGC=400
+          heap_min_mb=1024    # GOMEMLIMIT floor over the 0.61 GB measured test peak; lower GC-thrashes into false timeouts
           per_worker_mb=$(( toolchain_mb + heap_min_mb ))
           max_by_mem=$(( cap_mb / per_worker_mb )); [ "$max_by_mem" -lt 1 ] && max_by_mem=1
           workers=$(( nproc_n < max_by_mem ? nproc_n : max_by_mem ))
@@ -283,8 +283,10 @@ jobs:
               --memory="${cap_mb}m" --memory-swap="${cap_mb}m" \
               -v "${PWD}/target":/work \
               -v "${PWD}/scripts/gremlins-run.sh":/gremlins-run.sh:ro \
+              -v "${PWD}/scripts/gremlins-pkgname.patch":/gremlins-pkgname.patch:ro \
               -w "/work/${m}" \
               -e GREMLINS_VERSION="${GREMLINS_VERSION}" \
+              -e GREMLINS_PATCH=/gremlins-pkgname.patch \
               -e WORKERS_MAX="${workers}" \
               -e GOMEM_MAX_MB="${gomem_mb}" \
               -e GOMEM_SOLO_MB="${gomem_solo_mb}" \
