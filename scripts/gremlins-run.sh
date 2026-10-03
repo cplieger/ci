@@ -11,7 +11,8 @@
 # every Go repo in the fleet.
 #
 # Working directory: the module root (the workflow sets -w). Inputs, all env:
-#   GREMLINS_VERSION  release tag to download, e.g. v0.6.0
+#   GREMLINS_VERSION  release tag to build, e.g. v0.6.0
+#   GREMLINS_PATCH    absolute path of scripts/gremlins-pkgname.patch
 #   WORKERS_MAX       worker ceiling derived from the container memory cap
 #   GOMEM_MAX_MB      GOMEMLIMIT for WORKERS_MAX workers
 #   GOMEM_SOLO_MB     GOMEMLIMIT when the probe forces one worker
@@ -27,16 +28,63 @@ set -euo pipefail
 # dies with --rm.
 git config --global --add safe.directory '*'
 
-: "${GREMLINS_VERSION:?}" "${WORKERS_MAX:?}" "${GOMEM_MAX_MB:?}" "${GOMEM_SOLO_MB:?}"
-: "${PROBE_TIMEOUT:?}" "${OUT:?}"
+: "${GREMLINS_VERSION:?}" "${GREMLINS_PATCH:?}" "${WORKERS_MAX:?}"
+: "${GOMEM_MAX_MB:?}" "${GOMEM_SOLO_MB:?}" "${PROBE_TIMEOUT:?}" "${OUT:?}"
 
-# File first, then extract: --retry does not cover a mid-transfer receive
-# failure, and --retry-all-errors cannot retry into a pipe.
-curl -fsSL --connect-timeout 10 --max-time 60 \
-  --retry 7 --retry-max-time 150 --retry-all-errors \
-  -o /tmp/gremlins.tgz \
-  "https://github.com/go-gremlins/gremlins/releases/download/${GREMLINS_VERSION}/gremlins_${GREMLINS_VERSION#v}_linux_amd64.tar.gz"
-tar -xzf /tmp/gremlins.tgz -C /usr/local/bin gremlins
+retry() {
+  local delay=1 attempt
+  for attempt in 1 2 3 4 5 6 7 8; do
+    if "$@"; then
+      return 0
+    fi
+    [ "${attempt}" -eq 8 ] && break
+    echo "::warning::attempt ${attempt} of '$*' failed; retrying in ${delay}s" >&2
+    sleep "${delay}"
+    delay=$((delay * 2))
+  done
+  return 1
+}
+
+gremlins_src=/tmp/gremlins-src
+clone_gremlins() {
+  rm -rf "${gremlins_src}"
+  timeout 120 git -c advice.detachedHead=false \
+    -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+    clone --quiet --depth 1 --branch "${GREMLINS_VERSION}" \
+    https://github.com/go-gremlins/gremlins "${gremlins_src}"
+}
+
+# v0.6.0 tests a `package main` mutant against the module root's tests
+# (https://github.com/go-gremlins/gremlins/issues/268). Delete the patch and this
+# build once a pinned gremlins release contains the fix:
+# https://github.com/go-gremlins/gremlins/pull/306
+retry clone_gremlins
+if ! git -C "${gremlins_src}" apply --check "${GREMLINS_PATCH}"; then
+  echo "::error::scripts/gremlins-pkgname.patch no longer applies to gremlins ${GREMLINS_VERSION}: upstream has probably changed or fixed pkgName. Delete scripts/gremlins-pkgname.patch and this build step, and go back to the release download."
+  exit 1
+fi
+git -C "${gremlins_src}" apply "${GREMLINS_PATCH}"
+(
+  cd "${gremlins_src}"
+  retry timeout 300 go mod download
+  CGO_ENABLED=0 timeout 600 go build -trimpath \
+    -ldflags "-X main.version=${GREMLINS_VERSION#v}" \
+    -o /usr/local/bin/gremlins ./cmd/gremlins
+)
+
+# Compiler output does not depend on GOGC and -toolexec never wraps the test
+# binary, so no test sees a difference. It does shorten the coverage pass that
+# gremlins multiplies into the per-mutant timeout, by about 15% on a large module.
+emit_gogc_toolexec() {
+  cat <<'EOF'
+#!/bin/sh
+case "${1##*/}" in compile | link | vet) GOGC=400 && export GOGC ;; esac
+exec "$@"
+EOF
+}
+emit_gogc_toolexec >/usr/local/bin/gogc-toolexec
+chmod 0755 /usr/local/bin/gogc-toolexec
+export GOFLAGS="${GOFLAGS:+${GOFLAGS} }-toolexec=/usr/local/bin/gogc-toolexec"
 
 # --- Concurrency probe -------------------------------------------------------
 # Each gremlins worker gets its own COPY of the module tree, but an absolute
@@ -137,5 +185,5 @@ if [ "${WORKERS_MAX}" -gt 1 ]; then
   rm -rf "${probe_a}" "${probe_b}"
 fi
 
-echo "workers=${workers} GOMEMLIMIT=${GOMEMLIMIT} module=$(pwd)"
+echo "workers=${workers} GOMEMLIMIT=${GOMEMLIMIT} GOFLAGS=${GOFLAGS} module=$(pwd)"
 gremlins unleash --workers "${workers}" --output "${OUT}" .
