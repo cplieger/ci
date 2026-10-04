@@ -129,7 +129,7 @@ def ensure_pr(repo, changed):
         return
     body_lines = [
         "Synced from [cplieger/ci](https://github.com/cplieger/ci) by",
-        "`scripts/sync-files.py`. Files carrying a `DO NOT EDIT` header are",
+        "`scripts/sync-files.py`. Files carrying a `Synced from cplieger/ci` header are",
         "overwritten on every sync — change the canonical copy in cplieger/ci",
         "instead. Auto-merges once this repo's required checks pass.",
         "",
