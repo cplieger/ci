@@ -19,8 +19,8 @@ _spec = importlib.util.spec_from_file_location(
 classify = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(classify)
 
-# Keyed on the suffix, or on the whole name for dotfiles with none. A synced
-# format missing from both maps fails the test, so a new one gets a decision.
+# Keyed on the suffix, or on the whole name for dotfiles with none.
+# A synced format absent from both sets fails closed.
 COMMENT_MARKERS = {
     '.yml': '#',
     '.yaml': '#',
