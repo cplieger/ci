@@ -1,116 +1,79 @@
 # cplieger/ci
 
-Shared CI/CD for the `cplieger` repos: reusable GitHub Actions workflows,
-composite actions, canonical lint/format configs, and a cross-repo governance
-audit. One source of truth: consumer repos reference it instead of carrying
-duplicate copies.
+Reusable GitHub Actions workflows that lint, test, sign and release every cplieger repository. They are licensed under Apache-2.0, and any public repository can call them. The lint and versioning jobs read config files that a sync job copies only into cplieger repositories, so another repository copies those files first.
 
-> Pin every reusable-workflow reference to a **full commit SHA** with a release
-> tag comment, e.g. `@<40-hex-sha> # v2`. Renovate tracks the comment and
-> bumps the SHA when the major tag moves. Never pin to a branch.
+## What is here
 
-## Reusable workflows
+- One CI entry point, `ci.yaml`, that looks at what a repository contains and runs the matching Go, TypeScript, shell, Docker, Python and Markdown checks. Every result feeds one required check, `ci / validate`.
+- One release workflow, `release.yaml`, that computes the next version from conventional commits with git-cliff. It publishes a Docker image for `amd64` and `arm64` signed with cosign, npm and JSR packages, or a Go module tag.
+- Security scans with CodeQL, Trivy and gitleaks. Trivy and the full-history gitleaks scan report to the Security tab and never block a merge.
+- Lint, format and changelog configs for golangci-lint, ESLint, Prettier, Stylelint, html-validate, Ruff and git-cliff. A sync job copies them into each cplieger repository as pull requests.
+- Six composite actions, and `ci-local.sh`, which replays the CI checks on your machine.
 
-| Workflow | Purpose |
-| --- | --- |
-| `.github/workflows/ci.yaml` | Meta CI entry point: detects repo surfaces (go.mod / jsr.json / web dir / Dockerfile / scripts) and dispatches the jobs below into one `ci / validate` gate |
-| `.github/workflows/go-ci.yaml` | Go checks: vet, golangci-lint, race tests, govulncheck, deadcode/punused (apps), wiregen drift, gitleaks |
-| `.github/workflows/ts-ci.yaml` | TS checks: eslint, tsc typecheck, vitest, prettier, knip, version parity, import-map coverage (+ optional `web-lint` for CSS/HTML) |
-| `.github/workflows/shell-ci.yaml` | Shell/Docker checks: actionlint, shellcheck, shfmt, hadolint, gitleaks |
-| `.github/workflows/release.yaml` | Selects the channel from the branch (a push to `dev` publishes pre-release versions to GHCR and npm with no GitHub Release; a push to `main` publishes the stable release), auto-detects the release type (Docker / TS / Go), computes the git-cliff version, publishes (npm + JSR via OIDC), tags + GitHub Release |
-| `.github/workflows/docker-release.yaml` | On `dev`: multi-arch image build on native runners, Trivy scan, SBOM, cosign signing, dashboard OCI artifact (repos with a root `grafana-dashboard.json`), pushed to GHCR only. On `main`: re-tags the dev digest as the stable version, copies it to Docker Hub with its signatures, GitHub Release with the SBOM and dashboard assets (called by `release.yaml`) |
-| `.github/workflows/codeql.yaml` | CodeQL with language auto-detect (public repos) |
-| `.github/workflows/security-scan.yaml` | Trivy repo/config/image scans, advisory only; findings report to the Security tab, never block |
+[Reusable workflows](docs/workflows.md) lists what each workflow runs. [Synced files](docs/synced-files.md) lists every config and which repositories receive it.
 
-Every other workflow in `.github/workflows/` is repo-internal automation
-(config sync, tag cutting, the daily governance audit, scheduled
-mutation/fuzz/security runs, staleness-gated image rebuilds, the promotion of
-a repo's `main` to a soaked `dev` commit, GHCR retention for dev versions, and
-this repo's own CI), not for consumers.
+## How a repository calls it
 
-## Consuming
-
-Consumer repos do **not** hand-write these callers: `sync.yaml` pushes the
-workflow templates (`.github/workflow-templates/`) into each consumer repo
-as PRs. The synced CI caller is a thin shim; all logic stays central:
+A repository calls the CI entry point from a short workflow file:
 
 ```yaml
-# .github/workflows/ci.yaml (synced, DO NOT EDIT)
+# .github/workflows/ci.yaml
 jobs:
   ci:
-    uses: cplieger/ci/.github/workflows/ci.yaml@<sha> # v2
+    uses: cplieger/ci/.github/workflows/ci.yaml@<40-hex-sha> # v2
 ```
+
+Pin every reference to a full commit SHA with the tag in a comment, as above. Renovate reads the comment and updates the SHA when the tag moves. Never pin to a branch. To find the commit a tag points at, run `git ls-remote https://github.com/cplieger/ci refs/tags/v2`.
+
+Neither entry point takes inputs. `ci.yaml` picks its jobs from the files it finds, and [Reusable workflows](docs/workflows.md) lists which file starts which job. The release workflow picks the release type from the files at the repository root. A `Dockerfile` publishes an image, a `jsr.json` publishes to npm and JSR, and a `go.mod` gets a Go tag. When more than one is present, a `Dockerfile` wins over `jsr.json`, and `jsr.json` wins over `go.mod`. The calling job grants the permissions and passes the two Docker Hub secrets:
 
 ```yaml
-# .github/workflows/release.yaml (synced, DO NOT EDIT)
+# .github/workflows/release.yaml
 jobs:
   release:
-    uses: cplieger/ci/.github/workflows/release.yaml@<sha> # v2
-    secrets: inherit
+    permissions:
+      contents: write
+      statuses: write
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    uses: cplieger/ci/.github/workflows/release.yaml@<40-hex-sha> # v2
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 ```
 
-`release.yaml` takes no inputs: it auto-detects the release type from the repo
-surface (Dockerfile → image, `jsr.json` → npm + JSR, `go.mod` → Go tag).
-Publishing uses **OIDC trusted publishing** for npm and JSR (no registry
-tokens); the package just needs to be linked to its repo on npmjs.com /
-jsr.io. `release.yaml` declares the `id-token: write` permission itself.
+An image release pushes to GitHub Container Registry and to Docker Hub under the `DOCKERHUB_USERNAME` account, so an image repository needs both secrets. A Go or TypeScript repository can leave them unset. npm and JSR publishing uses OIDC trusted publishing, so no registry token is needed once the package is linked to its repository on npmjs.com and jsr.io.
 
-## Renovate preset
+## Versions and compatibility
 
-The Renovate preset lives in [`cplieger/.github`](https://github.com/cplieger/.github)
-as `default.json`, not in this repo. Each consumer repo carries a synced
-one-liner `renovate.json` that extends it (Renovate fetches the preset
-natively):
+Each release gets a `vX.Y.Z` tag, and the `vX` and `vX.Y` tags move to it. A breaking change starts a new major tag, and callers stay on their major tag until they change the pin. Pin `v2`, the line every cplieger repository uses. The `v3` line adds a dev channel to the release workflow. On `v3`, a push to a `dev` branch publishes pre-release versions with no GitHub Release.
 
-```json
-{ "extends": ["github>cplieger/.github"] }
-```
+## Using it outside the cplieger repositories
 
-## Canonical configs (synced)
+GitHub lets any public repository call a reusable workflow stored in a public repository, and the runner minutes are billed to the caller. These workflows assume more than the call, though:
 
-Tools without remote-config support get their config pushed to consumers as
-PRs by `sync.yaml`:
+- Versioning reads a `cliff.toml`, and the lint jobs read the synced configs. Copy them from `configs/` and the repository root.
+- The sync job, the daily settings audit and the scheduled mutation, fuzz and benchmark runs cover cplieger repositories only.
+- The release workflow sets the image license label and the SBOM source for the cplieger repositories it names. Any other repository gets the defaults, which are both registries, `amd64` and `arm64` images, and its own license in the label.
 
-| Source (this repo) | Synced to |
-| --- | --- |
-| `.editorconfig`, `.gitattributes`, `configs/renovate.json` | releaseable repos, plus repos with their own `publish.yaml` |
-| `.golangci.yaml`, `configs/gremlins.yaml` (→ `.gremlins.yaml`) | Go repos |
-| `configs/eslint.config.base.mjs`, `configs/prettier.json`, `configs/stylelint.json`, `configs/htmlvalidate.json` | TS repos (incl. hybrids) |
-| `configs/cliff-stable.toml` / `configs/cliff-alpha.toml` (→ `cliff.toml`) | releaseable repos, tier by latest tag (v0.x → alpha) |
-| `configs/ruff.toml` (→ `ruff.toml`) | Python repos |
-| `configs/image-smoke.sh` (→ `tests/image-smoke.sh`) | image repos opting in via `tests/image-smoke.conf` |
+Copying a workflow and adapting it is the other way to reuse one. To build your own, GitHub's [reusable workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows) are the built-in way. If you only need to keep files in step across your repositories, [repo-file-sync-action](https://github.com/BetaHuhn/repo-file-sync-action) opens a pull request in each target repository from a `sync.yml` list.
 
-The unified-CI group syncs three workflow files: `ci.yaml`, `codeql.yml`, and
-`security.yml`. A second group syncs the same set to non-releaseable repos that
-publish from their own `publish.yaml`. `release.yaml` (releaseable repos) comes
-from its own group.
+## Running the checks locally
 
-## README badges
+- `bash ci-local.sh`, from the root of a repository that calls `ci.yaml`, replays its CI checks. It reads the workflows from a `ci/` checkout beside the repository when one exists, and otherwise fetches them at the pinned commit with `gh`. `--path SUBDIR` limits the run to one folder, and `--plan-only` prints the plan without running it. Its summary lists every check it could not run on your machine, so a local pass with such checks is not a full CI pass.
+- `scripts/install-local-tools.sh` installs the tool versions CI pins, so local results match CI.
 
-See [`BADGES.md`](BADGES.md) for the canonical badge block per repo type (Go
-lib, TS lib, hybrid, Docker image) and the badge principles. The badge row is
-per-repo, not synced, because it carries per-repo URLs.
+## Documentation
 
-## Composite actions
-
-- `actions/git-cliff-version`: installs git-cliff and outputs the next stable
-  version, its dev-channel and patch-floor variants, and a `release` boolean
-  from conventional commits. Used by `release.yaml`; callable directly.
-- `actions/publish-badge`: writes a shields.io endpoint JSON to the orphan
-  `badges` branch, preserving sibling badge files. Used by
-  `docker-release.yaml` (image size) and `weekly-gremlins.yaml` (mutation
-  score).
-
-## Local tooling
-
-- `ci-local.sh [app-dir]`: replays the CI battery locally (mirrors the gate).
-- `scripts/install-local-tools.sh`: installs the CI-pinned tool versions
-  locally so local lint/scan results match CI.
+- [Reusable workflows](docs/workflows.md) says what each workflow and composite action runs, for anyone calling or copying one.
+- [Synced files](docs/synced-files.md) lists every synced config, where it lands and how Renovate gets its settings.
+- [README badges](BADGES.md) has the badge block each kind of cplieger repository carries.
 
 ## Contributing
 
-Issues and PRs are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
-conventions and how to run the checks locally.
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout, the conventions and how to run the checks locally.
 
 ## Disclaimer
 
