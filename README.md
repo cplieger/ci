@@ -73,7 +73,7 @@ Copying a workflow and adapting it is the other way to reuse one. To build your 
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout, the conventions and how to run the checks locally.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Disclaimer
 
