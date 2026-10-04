@@ -272,8 +272,8 @@ or the sync PR auto-merges (configs). Treat the reusable workflow inputs and the
 - **`.github/sync.yml` is not committed.** `classify-repos.py` regenerates it
   fresh at sync time (gitignored). To change the mapping, edit the script.
 - **Don't edit synced files in a consumer repo.** Files carrying a
-  `Synced from cplieger/ci … DO NOT EDIT` header (the workflow templates, the
-  configs) are overwritten on the next sync. Change the canonical copy here.
+  `Synced from cplieger/ci` header (the workflow templates, the configs) are
+  overwritten on the next sync. Change the canonical copy here.
 - **Tool versions are Renovate-pinned in place.** Reusable workflows and the
   composite actions pin tool versions as literals next to a
   `# renovate: datasource=… depName=…` comment (golangci-lint, gitleaks,
