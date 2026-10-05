@@ -182,6 +182,12 @@ HUB_MARKER_END = "<!-- hub-overview END -->"
 ACCEPTED = {
     "homelab": {
     },
+    "animap": {
+        # baseline.yaml runs on every pull request and fails one that adds an
+        # entry to checks/collision-baseline.json; required, so a new
+        # collision cannot be accepted by growing the baseline.
+        "unexpected extra required check 'shrink-only'": "the collision baseline may only shrink",
+    },
 }
 
 # Expected license per repo (licensing.md's four-license scheme, 2026-08).
