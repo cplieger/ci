@@ -949,6 +949,63 @@ class Legacy(unittest.TestCase):
         self.assertTrue(any(h.startswith('default_branch=master') for h in hard), hard)
 
 
+class ModulePath(unittest.TestCase):
+    def public(self, name: str, module: str, image: bool) -> dict:
+        s = legacy(name)
+        s['private'] = False
+        s['visibility'] = 'public'
+        s['has_dockerfile'] = image
+        s['go_module'] = module
+        return s
+
+    def module_warnings(self, s: dict) -> list:
+        _, warn, _ = audit.compliance(s)
+        return [w for w in warn if w.startswith('go.mod module')]
+
+    def test_an_image_repo_on_the_plain_path_is_clean(self):
+        s = self.public('docker-age', 'github.com/cplieger/docker-age', image=True)
+        self.assertEqual(self.module_warnings(s), [])
+
+    def test_an_image_repo_with_a_major_suffix_warns_to_drop_it(self):
+        s = self.public('docker-age', 'github.com/cplieger/docker-age/v4', image=True)
+        warn = self.module_warnings(s)
+        self.assertEqual(len(warn), 1, warn)
+        self.assertIn('carries a /vN suffix', warn[0])
+        self.assertIn('drop the suffix', warn[0])
+
+    def test_an_image_repo_naming_another_repo_warns(self):
+        s = self.public('docker-age', 'github.com/cplieger/age-decrypt', image=True)
+        warn = self.module_warnings(s)
+        self.assertEqual(len(warn), 1, warn)
+        self.assertIn("want 'github.com/cplieger/docker-age'", warn[0])
+
+    def test_a_library_with_a_major_suffix_is_clean(self):
+        s = self.public('toolbelt', 'github.com/cplieger/toolbelt/v3', image=False)
+        self.assertEqual(self.module_warnings(s), [])
+
+    def test_a_library_naming_another_repo_warns(self):
+        s = self.public('toolbelt', 'github.com/cplieger/tools/v3', image=False)
+        self.assertEqual(len(self.module_warnings(s)), 1)
+
+    def test_an_image_repo_has_no_used_by_package_to_expect(self):
+        self.assertIsNone(
+            audit.expected_used_by_package(
+                'github.com/cplieger/docker-age', '{"name": "web"}', image=True
+            )
+        )
+
+    def test_a_library_expects_its_module_path_then_its_npm_name(self):
+        self.assertEqual(
+            audit.expected_used_by_package('github.com/cplieger/toolbelt/v3', None, image=False),
+            'github.com/cplieger/toolbelt/v3',
+        )
+        self.assertEqual(
+            audit.expected_used_by_package(None, '{"name": "@cplieger/fetch"}', image=False),
+            '@cplieger/fetch',
+        )
+        self.assertIsNone(audit.expected_used_by_package(None, '{not json', image=False))
+
+
 class RulesetBodies(unittest.TestCase):
     def test_committed_bodies_match_the_documented_tables(self):
         dev_rules = {r['type'] for r in DEV_RULESET['rules']}
