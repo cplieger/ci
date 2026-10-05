@@ -243,6 +243,38 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "channel=${CHANNEL} tag=${TAG} publish=${PUBLISH}"
 
+      # An image app's root module keeps the plain repository path at every
+      # major: nothing imports an app, so a /vN suffix only moves its internal
+      # imports. Libraries take /vN, asserted by release.yaml's go job.
+      # Checked before any registry write or tag, on both channels.
+      - name: Verify root module path
+        if: ${{ steps.tags.outputs.publish == 'true' }}
+        run: |
+          set -euo pipefail
+          if [ ! -f go.mod ]; then
+            echo "no root go.mod; not a Go app, nothing to check"
+            exit 0
+          fi
+          modpath=$(awk '$1=="module"{print $2; exit}' go.mod)
+          expected="github.com/${GITHUB_REPOSITORY}"
+          case "$modpath" in
+            "$expected")
+              echo "ok: module path '$modpath' is the plain repository path"
+              ;;
+            '')
+              echo "::error::no module directive found in go.mod"
+              exit 1
+              ;;
+            "$expected"/v[0-9]*)
+              echo "::error::go.mod module path '$modpath' must be '$expected': drop the /vN suffix from go.mod and rewrite internal imports; apps use the plain module path at every major."
+              exit 1
+              ;;
+            *)
+              echo "::error::go.mod module path '$modpath' must be '$expected'; a module path must name its own repository or Go tooling cannot fetch it. Fix the module directive and internal imports, then re-release."
+              exit 1
+              ;;
+          esac
+
       - name: Compute build matrix
         id: matrix
         env:

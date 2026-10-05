@@ -4,7 +4,8 @@ Canonical badge blocks for `cplieger` repos. The README badge row is **not**
 synced (it carries per-repo URLs), so this is the reference to copy from when
 creating a repo or auditing an existing one. Replace `REPO` with the repo name
 and `MODPATH` with the Go module path (usually `REPO`, but a `/v2`-style major
-suffix for versioned modules, e.g. `metrics/v2`).
+suffix for versioned library modules, e.g. `metrics/v2`; an image app's module
+path is always the plain `REPO`).
 
 ## Principles
 

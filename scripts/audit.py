@@ -393,6 +393,27 @@ def canonical_text(path):
 
 
 
+def expected_used_by_package(go_module, package_json_text, *, image):
+    """The package a repo's "Used by" counter should represent, or None to
+    skip the check.
+
+    An image repo (root Dockerfile) is never imported, so its counter counts
+    nothing and is skipped. Otherwise the root go.mod module path (a library
+    major moves it, which is the drift being caught), else the npm package
+    name (catches renames); a malformed package.json names nothing.
+    """
+    if image:
+        return None
+    if go_module:
+        return go_module
+    if not package_json_text:
+        return None
+    try:
+        return (json.loads(package_json_text) or {}).get("name")
+    except json.JSONDecodeError:
+        return None
+
+
 def used_by_package_scrape(name):
     """The package a repo's "Used by" counter currently represents, plus the
     package set the counter could be switched to.
@@ -406,10 +427,10 @@ def used_by_package_scrape(name):
       the repo publishes no package). og:title is the social-embed surface,
       far more redesign-stable than the page markup.
     - selectable: the package-switcher menu anchors (?package_id=...). Repos
-      with one package render no menu -> empty set. A Go app's /vN module
-      path is often never indexed at all (nothing imports an app), so the
-      "right" package may not exist to select — the caller must only flag
-      drift the settings dropdown can actually fix.
+      with one package render no menu -> empty set. A library's new /vN
+      path is not indexed until something imports it, so the "right"
+      package may not exist to select yet — the caller must only flag drift
+      the settings dropdown can actually fix.
 
     Returns (current, selectable, definitive). definitive=False means the
     page could not be read — skip the check, never infer drift.
@@ -879,22 +900,13 @@ def collect(meta):
     dockerfile = probe_texts["Dockerfile"]
     s["has_dockerfile"] = None if dockerfile is None else bool(dockerfile)
 
-    # Used-by counter. Expected package = the root go.mod module path (Go
-    # majors move the path, which is exactly the drift being caught), else the
-    # npm package name (catches module/package renames); neither -> N/A. The
-    # current selection comes from the public dependents page (no API — see
-    # used_by_package_scrape). Public repos only: the counter has no audience
-    # on a private repo, and the page needs to be publicly rendered anyway.
+    # The current used-by selection comes from the public dependents page (no
+    # API — see used_by_package_scrape). Public repos only: the counter has no
+    # audience on a private repo, and the page needs to be publicly rendered.
     m = re.search(r"^module\s+(\S+)", probe_texts.get("go.mod") or "", re.MULTILINE)
     s["go_module"] = m.group(1) if m else None
-    s["expected_package"] = s["go_module"]
-    if not s["expected_package"] and probe_texts.get("package.json"):
-        try:
-            s["expected_package"] = (json.loads(probe_texts["package.json"]) or {}).get("name")
-        except json.JSONDecodeError:
-            # malformed package.json: no npm name to expect; the used-by
-            # check skips this repo (expected_package stays None)
-            s["expected_package"] = None
+    s["expected_package"] = expected_used_by_package(
+        s["go_module"], probe_texts.get("package.json"), image=bool(s["has_dockerfile"]))
     s["used_by_package"] = None
     s["used_by_selectable"] = []
     s["used_by_attempted"] = False
@@ -1266,16 +1278,15 @@ def compliance(s):
             warn.append(f"description {s['desc_len']} chars (>100; Docker Hub short-desc limit)")
         if len(s["topics"]) < 2:
             warn.append(f"{len(s['topics'])} topics (want at least 2)")
-        # Used-by counter package: pinned per repo and never follows a Go
-        # /vN module-path bump or a module rename, so the sidebar keeps
-        # counting the stale package after every major. Only judged when the
-        # dependents page definitively named a package (used_by_package set)
-        # AND the expected package is actually in the switcher menu — a Go
-        # app's new /vN path is often never indexed (nothing imports an app),
-        # and warning about a package the dropdown cannot select is
-        # unactionable noise. An unreadable page is silently skipped — a
-        # scrape wobble must never manufacture drift, and this cosmetic check
-        # is not worth an [error]-tier red run.
+        # Used-by counter package: pinned per repo and never follows a
+        # library's /vN module-path bump or a module rename, so the sidebar
+        # keeps counting the stale package after every major. Only judged when
+        # the dependents page definitively named a package (used_by_package
+        # set) AND the expected package is actually in the switcher menu —
+        # warning about a package the dropdown cannot select is unactionable
+        # noise. An unreadable page is silently skipped — a scrape wobble must
+        # never manufacture drift, and this cosmetic check is not worth an
+        # [error]-tier red run. Image repos carry no expected package.
         exp = (s.get("expected_package") or "").lstrip("@")
         selectable = {p.lstrip("@") for p in s.get("used_by_selectable") or []}
         if (s.get("used_by_package") and exp
@@ -1285,15 +1296,27 @@ def compliance(s):
                         f"(want '{s['expected_package']}'; no API — fix by "
                         "hand: Settings -> Advanced Security -> Used by counter)")
         # Module-path standard (go.md): a Go module lives at
-        # github.com/<owner>/<repo>, plus /vN once majors move. Anything else
-        # is unfetchable by Go tooling (module path must match the repo URL)
-        # and indexes a phantom dependency-graph package that the used-by
-        # counter then represents forever (the cert-watcher / age-decrypt /
+        # github.com/<owner>/<repo>; a library adds /vN once majors move, an
+        # image app never does. Anything else is unfetchable by Go tooling
+        # (module path must match the repo URL) and indexes a phantom
+        # dependency-graph package (the cert-watcher / age-decrypt /
         # fclones-wrapper / vibecli class, caught 2026-07).
         if s.get("go_module"):
             want = f"github.com/{OWNER}/{s['name']}"
-            if not re.fullmatch(re.escape(want) + r"(/v\d+)?", s["go_module"]):
-                warn.append(f"go.mod module '{s['go_module']}' is not the repo "
+            mod = s["go_module"]
+            if s.get("has_dockerfile"):
+                if re.fullmatch(re.escape(want) + r"/v\d+", mod):
+                    warn.append(f"go.mod module '{mod}' carries a /vN suffix "
+                                f"(want '{want}'; apps use the plain module "
+                                "path at every major — drop the suffix and "
+                                "rewrite internal imports)")
+                elif mod != want:
+                    warn.append(f"go.mod module '{mod}' is not the repo path "
+                                f"(want '{want}'; unfetchable by Go tooling "
+                                "and indexes a phantom dependency-graph "
+                                "package)")
+            elif not re.fullmatch(re.escape(want) + r"(/v\d+)?", mod):
+                warn.append(f"go.mod module '{mod}' is not the repo "
                             f"path (want '{want}' [+/vN]; unfetchable by Go "
                             "tooling and indexes a phantom dependency-graph "
                             "package)")

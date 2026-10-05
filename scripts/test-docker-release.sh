@@ -52,7 +52,11 @@ wf, release, out = sys.argv[1], sys.argv[2], sys.argv[3]
 jobs = yaml.safe_load(open(wf))["jobs"]
 rjobs = yaml.safe_load(open(release))["jobs"]
 wanted = {
-    "prepare": {"Derive version tags": "derive.sh", "Resolve promoted digest": "promote.sh"},
+    "prepare": {
+        "Derive version tags": "derive.sh",
+        "Verify root module path": "modpath.sh",
+        "Resolve promoted digest": "promote.sh",
+    },
     "build": {"Resolve build args": "buildargs.sh"},
     "finalize": {
         "Generate release notes": "notes.sh",
@@ -68,6 +72,7 @@ for job, steps in wanted.items():
             env = step.get("env", {})
             open(f"{out}/{steps[name]}.env", "w").write("\n".join(sorted(env)) + "\n")
             open(f"{out}/{steps[name]}.envmap", "w").write("".join(f"{k}={v}\n" for k, v in sorted(env.items())))
+            open(f"{out}/{steps[name]}.if", "w").write(str(step.get("if", "")))
 # The soak-override handoff: release.yaml reads the record and hands the
 # sentence to every stable notes step, docker-release included.
 step = next(s for s in rjobs["detect"]["steps"] if s.get("name") == "Read promotion record")
@@ -100,7 +105,7 @@ open(f"{out}/subpackage.needs", "w").write(" ".join(rjobs["subpackage"]["needs"]
 open(f"{out}/docker-release-needed.txt", "w").write(str(rjobs["docker"]["with"]["release-needed"]))
 PY
 
-for f in derive promote buildargs; do
+for f in derive modpath promote buildargs; do
   chk "D-P1 $f extracted" "$([ -s "$WORK/$f.sh" ] && echo yes || echo no)" "yes"
   chk "D-P2 $f is strict-mode" "$(head -1 "$WORK/$f.sh")" "set -euo pipefail"
   chk "D-P3 $f parses under bash" "$(bash -n "$WORK/$f.sh" 2>/dev/null && echo ok || echo bad)" "ok"
@@ -201,6 +206,30 @@ export CHANNEL=dev DEV_VERSION=v1.3.0-dev.4
 run_step derive.sh >/dev/null
 chk "D-V11 the dev version tag has the highest priority" "$(top_rule)" "type=raw,value=v1.3.0-dev.4"
 unset CHANNEL VERSION_INPUT DEV_VERSION RELEASE_NEEDED FINALIZE
+
+# ── Verify root module path ──────────────────────────────────────────────────
+# An image app keeps the plain repository path at every major.
+chk "D-M1 the module path check runs only when something publishes" \
+  "$(cat "$WORK/modpath.sh.if")" "\${{ steps.tags.outputs.publish == 'true' }}"
+APP="$WORK/modapp"
+mkdir -p "$APP"
+modpath_in() { # <go.mod body or ''> -> step output; no argument removes go.mod
+  rm -f "$APP/go.mod"
+  [ "$#" -eq 0 ] || printf '%s\n' "$1" >"$APP/go.mod"
+  (cd "$APP" && GITHUB_REPOSITORY=owner/app run_step modpath.sh)
+}
+out_mod=$(modpath_in 'module github.com/owner/app')
+chk "D-M2 the plain repository path passes" "$(printf '%s' "$out_mod" | grep -c '^EXIT=' || true)" "0"
+out_mod=$(modpath_in 'module github.com/owner/app/v4')
+chk "D-M3 a /vN suffix fails" "$(printf '%s' "$out_mod" | sed -n 's/^EXIT=//p')" "1"
+chk_has "D-M3 the /vN error names the fix" "$out_mod" "drop the /vN suffix from go.mod and rewrite internal imports; apps use the plain module path"
+out_mod=$(modpath_in 'module github.com/owner/other')
+chk "D-M4 another repository's path fails" "$(printf '%s' "$out_mod" | sed -n 's/^EXIT=//p')" "1"
+chk_has "D-M4 the error names the expected path" "$out_mod" "must be 'github.com/owner/app'"
+out_mod=$(modpath_in 'go 1.27')
+chk "D-M5 a go.mod with no module directive fails" "$(printf '%s' "$out_mod" | sed -n 's/^EXIT=//p')" "1"
+out_mod=$(modpath_in)
+chk "D-M6 a repo with no root go.mod passes" "$(printf '%s' "$out_mod" | grep -c '^EXIT=' || true)" "0"
 
 # ── Fixture repository for the digest walk ───────────────────────────────────
 # release.yaml's exclusion list, joined the way its detect step joins it.
