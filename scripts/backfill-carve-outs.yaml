@@ -1,0 +1,76 @@
+# Release bodies that carry text no commit contains. backfill-release-notes.py
+# skips each listed repo@tag in plan and apply (--include-carved overrides),
+# because regenerating one deletes the hand-written text.
+---
+carve_outs:
+  - repo: cplieger/web-terminal-engine
+    tag: v2.7.0
+    reason: 'provenance note: tag and Release backfilled by hand after the
+      subpackage lane published without a root tag (cplieger/ci#331); keeps its
+      `_(web)_` scope prefix'
+  - repo: cplieger/atomicfile
+    tag: v3.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/auth
+    tag: v4.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/cert-converter
+    tag: v2.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/docker-age
+    tag: v4.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/docker-fclones-scheduler
+    tag: v2.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/httpx
+    tag: v5.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/knell
+    tag: v2.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/langtag
+    tag: v2.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/pathinside
+    tag: v2.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/pg-autodump
+    tag: v2.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/pinstall
+    tag: v3.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/plex-exporter
+    tag: v3.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/plex-language-sync
+    tag: v2.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/plexapi
+    tag: v2.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/runesafe
+    tag: v2.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/scheduler
+    tag: v4.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/seadex-scout
+    tag: v2.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/web-terminal-engine
+    tag: v5.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/web-terminal-kiro
+    tag: v3.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/web-terminal-server
+    tag: v2.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/webhttp
+    tag: v2.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
+  - repo: cplieger/wiregen
+    tag: v3.0.0
+    reason: 'body repaired by hand on 2026-08-21 (migration text, rendering)'
