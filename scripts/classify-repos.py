@@ -401,7 +401,10 @@ def main():
             codeql_repos.append(repo)
         if profile['can_release']:
             ci_repos.append(repo)
-            release_repos.append(repo)
+            # Its own publish.yaml owns the repo's Releases; a synced release.yaml
+            # would cut code Releases marked latest over them.
+            if not profile['has_publish']:
+                release_repos.append(repo)
         if lang == 'go':
             golangci_repos.append(repo)
         if lang == 'ts':

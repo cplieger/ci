@@ -47,7 +47,7 @@ DEPLOYED_IMAGE_REPOS = frozenset(
 )
 
 # Repos that publish from `main` directly and never get a `dev` branch.
-SINGLE_MAIN_REPOS = frozenset({'ci', '.github', 'tool-catalog', 'unraid-templates'})
+SINGLE_MAIN_REPOS = frozenset({'animap', 'ci', '.github', 'tool-catalog', 'unraid-templates'})
 
 # Two-channel repos whose own .github/workflows/publish.yaml tags and releases
 # on a main push instead of the central release.yaml, so they have no dev
