@@ -29,10 +29,13 @@ Scope guarantees:
     - Draft releases and non-vX.Y.Z tags skip with a notice; a skipped tag's
       window folds into the next stable tag's range. >1000 releases aborts
       (no pagination).
+    - A release listed in --carve-outs (default: backfill-carve-outs.yaml
+      beside this script) carries hand-written text no commit contains, so it
+      is skipped in plan and apply with a notice; --include-carved overrides.
 
 Run from (or point --repo-dir at) a local clone whose git remote is the
 GitHub repo; `gh` resolves the repo from the remote and must be authed.
-Requires Python 3.10+. Run AFTER the new cliff.toml has synced into the repo,
+Requires Python 3.10+ and PyYAML. Run AFTER the new cliff.toml has synced into the repo,
 or pass --config pointing at cplieger/ci's configs/cliff-stable.toml (or
 cliff-alpha.toml for pre-1.0 repos).
 
@@ -59,6 +62,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
+
 if sys.version_info < (3, 10):  # noqa: UP036 - the guard IS the feature
     sys.exit('error: this script needs Python 3.10+')
 
@@ -69,6 +74,7 @@ STUB_BODY = (
 SEMVER_TAG = re.compile(r'^v(\d+)\.(\d+)\.(\d+)$')
 RELEASE_LIST_CAP = 1000
 MAX_STUB_SUBJECTS = 100
+CARVE_OUTS = Path(__file__).resolve().with_name('backfill-carve-outs.yaml')
 
 
 def run(
@@ -246,6 +252,50 @@ def restore(repo_dir: Path, backup_dir: Path) -> int:
     return 0
 
 
+def load_carve_outs(path: Path, repo: str) -> dict[str, str]:
+    """This repo's carved-out tags and their reasons; exits 2 naming a malformed file."""
+    try:
+        doc = yaml.safe_load(path.read_text(encoding='utf-8'))
+    except (OSError, yaml.YAMLError) as exc:
+        print(f'error: carve-out list {path}: {exc}', file=sys.stderr)
+        sys.exit(2)
+    entries = doc.get('carve_outs') if isinstance(doc, dict) else None
+    if not isinstance(entries, list):
+        print(f'error: carve-out list {path}: expected a `carve_outs:` list', file=sys.stderr)
+        sys.exit(2)
+    carved: dict[str, str] = {}
+    for index, entry in enumerate(entries, 1):
+        named, tag, reason = (
+            entry.get(k) if isinstance(entry, dict) else None for k in ('repo', 'tag', 'reason')
+        )
+        texts = all(isinstance(v, str) and v.strip() for v in (named, tag, reason))
+        if not texts or not SEMVER_TAG.match(tag):
+            print(
+                f'error: carve-out list {path}: entry {index} needs repo, a vX.Y.Z tag and a reason',
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if named == repo:
+            carved[tag] = reason
+    return carved
+
+
+def select_pairs(
+    pairs: list[tuple[str, str]], only: list[str], carved: dict[str, str], *, include_carved: bool
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """The (prev, tag) pairs to plan, and the (tag, reason) pairs carved out of them."""
+    selected: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str]] = []
+    for prev, tag in pairs:
+        if only and tag not in only:
+            continue
+        if tag in carved and not include_carved:
+            skipped.append((tag, carved[tag]))
+            continue
+        selected.append((prev, tag))
+    return selected, skipped
+
+
 @dataclass
 class Plan:
     tag: str
@@ -304,6 +354,17 @@ def main() -> int:
         metavar='DIR',
         help='restore bodies from a backup dir (checks its manifest) and exit',
     )
+    ap.add_argument(
+        '--carve-outs',
+        type=Path,
+        default=CARVE_OUTS,
+        help='releases whose bodies are hand-written (default: %(default)s)',
+    )
+    ap.add_argument(
+        '--include-carved',
+        action='store_true',
+        help='regenerate carved-out releases too (deletes their hand-written text)',
+    )
     args = ap.parse_args()
 
     repo_dir = Path(args.repo_dir).resolve()
@@ -316,6 +377,7 @@ def main() -> int:
 
     config = resolve_config(args.config, repo_dir, explicit=args.config != 'cliff.toml')
     repo = repo_identity(repo_dir)
+    carved = load_carve_outs(args.carve_outs, repo)
     tags = list_release_tags(repo_dir)
     if len(tags) < 2:
         print('nothing to do: fewer than two semver releases')
@@ -339,11 +401,12 @@ def main() -> int:
         return 2
 
     # Phase 1: compute and show the full plan (no writes).
+    selected, skipped = select_pairs(pairs, args.only, carved, include_carved=args.include_carved)
+    for tag, reason in skipped:
+        print(f'  skip {tag}: carved out ({reason})', file=sys.stderr)
     plans: list[Plan] = []
     unchanged = nonlinear = 0
-    for prev, tag in pairs:
-        if args.only and tag not in args.only:
-            continue
+    for prev, tag in selected:
         proc = run(['git', 'merge-base', '--is-ancestor', prev, tag], repo_dir, check=False)
         if proc.returncode != 0:
             print(
@@ -380,11 +443,14 @@ def main() -> int:
         print(
             f'DRY-RUN (use --apply to edit): {len(plans)} would change '
             f'({sum(p.is_stub for p in plans)} stubbed), {unchanged} unchanged, '
-            f'{nonlinear} skipped non-linear'
+            f'{nonlinear} skipped non-linear, {len(skipped)} carved out'
         )
         return 0
     if not plans:
-        print(f'nothing to apply: {unchanged} unchanged, {nonlinear} skipped non-linear')
+        print(
+            f'nothing to apply: {unchanged} unchanged, {nonlinear} skipped non-linear, '
+            f'{len(skipped)} carved out'
+        )
         return 0
 
     # Phase 2a: backup EVERYTHING before the first edit (exclusive dir create).
@@ -441,7 +507,8 @@ def main() -> int:
 
     print(
         f'\napplied: {applied} ({sum(p.is_stub for p in plans)} stubbed), '
-        f'{unchanged} unchanged, {nonlinear} skipped non-linear, {drifted} drifted'
+        f'{unchanged} unchanged, {nonlinear} skipped non-linear, {drifted} drifted, '
+        f'{len(skipped)} carved out'
     )
     print(f'backups: {backup_dir}  (restore with --restore {backup_dir})')
     return 0
