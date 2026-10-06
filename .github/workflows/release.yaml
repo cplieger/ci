@@ -52,7 +52,7 @@ jobs:
       # create the missing Release (see the step).
       finalize: ${{ steps.finalize.outputs.finalize }}
       # promotion_note: the sentence the stable release notes carry when the
-      # promotion skipped the homelab soak (promote.py records the reason as a
+      # promotion skipped the deployment soak (promote.py records the reason as a
       # commit status on the promoted commit); empty otherwise.
       promotion_note: ${{ steps.promotion.outputs.promotion_note }}
       registries: ${{ steps.policy.outputs.registries }}
@@ -714,7 +714,7 @@ jobs:
 
       # Every promotion writes the `promotion/soak-override` status on the
       # promoted commit before main moves: state success with the reason when
-      # the homelab soak was skipped, success with an empty description when it
+      # the deployment soak was skipped, success with an empty description when it
       # was not (so an older reason on the commit is retired), failure when the
       # ref update failed. The stable release notes repeat the reason of the
       # newest row by `updated_at` then `id` (the API documents no row order,
@@ -733,7 +733,7 @@ jobs:
           # rejects a key=value output holding a newline, so it is read as one line.
           if REASON=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/status" --jq "$FILTER" 2>"$RUNNER_TEMP/promerr" | tr -d '\n\r'); then
             if [ -n "$REASON" ]; then
-              NOTE="_Promoted without the homelab soak: ${REASON}_"
+              NOTE="_Promoted without the deployment soak check: ${REASON}_"
             fi
           else
             echo "::warning::could not read the promotion record for ${GITHUB_SHA}: $(cat "$RUNNER_TEMP/promerr")"
@@ -771,8 +771,7 @@ jobs:
 
           # org.opencontainers.image.licenses covers EVERYTHING in the image, so
           # a wrapper carries its upstream's license too; a Go app whose deps
-          # are all permissive keeps its own id (attribution.md section 5).
-          # Per-entry evidence: ci-cd.md "Per-repo policy", image_licenses row.
+          # are all permissive keeps its own id.
           case "$REPO_NAME" in
             docker-rsync-scheduler)
               IMAGE_LICENSES="Apache-2.0 AND GPL-3.0-or-later" ;;
@@ -962,62 +961,14 @@ jobs:
           fi
           echo "ok: module path '$modpath' matches '$expected' ($VERSION)"
 
-      # API-compatibility check, PRE-TAG and report-only.
-      #
-      # WHY THIS EXISTS
-      # Our semver comes entirely from commit messages via git-cliff, never from
-      # the code's exported surface. So a `feat:` commit that renames an exported
-      # function mints a MINOR bump and breaks every consumer at the next
-      # `go get`. It compiles clean, passes vet, lint, tests, race, govulncheck
-      # and CodeQL, and nothing in the pipeline looks at the API surface. 17 repos
-      # in the fleet are consumed Go modules, so this is the one defect class that
-      # ships silently to every downstream at once.
-      #
-      # WHY PRE-TAG AND NOT AFTER
-      # A post-publish report is useless here: once the tag exists the module
-      # proxy has it and consumers resolve it. The check has to run while the
-      # version is still just a computed string, which is exactly here.
-      #
-      # WHY gorelease AND NOT apidiff
-      # apidiff answers "are these two versions compatible". gorelease answers
-      # the question that matters: "is THIS proposed version consistent with the
-      # change". It takes -version and adjudicates it, so it knows a breaking
-      # change under a minor bump is wrong while the same change under a major is
-      # correct.
-      #
-      # WHY THIS FAILS THE RELEASE
-      # It landed report-only (2026-08-04) to accumulate a false-positive rate
-      # before being trusted with a veto. That criterion turned out to be
-      # unsatisfiable by waiting: the job only runs on a library release whose
-      # ROOT module changed, and it skips itself on every major bump, so the
-      # lane fires a handful of times a month and is silent on precisely the
-      # releases most likely to trip it. No stream can accumulate, so the
-      # choice is gate or delete, and a silent warning nobody is paged for is
-      # the vacuous-gate class this repo exists to prevent.
-      #
-      # The conditional the original note reserved for graduation - fail only
-      # on an incompatible change that is NOT a major bump - is already
-      # structural rather than conditional: the major-bump case exits 0 before
-      # gorelease ever runs. A `feat!:` commit that mints a major is therefore
-      # never fought, and a bare `exit 1` is that gate, not a blanket one.
-      #
-      # SKIPPED FOR: apps (a root `package main` is not a consumed module) and
-      # major bumps (a major IS the deliberate break, so a report of one carries
-      # no information). Note the skip rests on that ground alone: gorelease CAN
-      # compare across majors, via a `-base` carrying the other module path
-      # (`-base=example.com/mod/v2@v2.5.2`, documented in its own doc comment), so
-      # "it cannot" would be a false reason for a correct decision. Also skipped,
-      # not failed, when the tool cannot be installed OR cannot run: an
-      # unavailable checker is an infrastructure fault, and failing releases for
-      # it would teach the fleet to ignore this step.
-      #
-      # OPERATIONAL NOTE: gorelease refuses to run on a repo with uncommitted
-      # changes ("has uncommitted changes", exit non-zero). That is fine here
-      # because this job runs on a fresh checkout, but it is why the tool cannot
-      # be used to preview a release from a dirty working tree locally. Verified
-      # behaviour: on a clean checkout it prints "vX.Y.Z is a valid semantic
-      # version for this release" and exits 0, and exits non-zero with a reason
-      # when the proposed version does not fit the change.
+      # API-compatibility check, PRE-TAG, and it fails the release. Versions
+      # come from commit messages, so a `feat:` that renames an exported symbol
+      # mints a minor and breaks consumers while every other check stays green.
+      # It must run before the tag exists, since the proxy serves a tag at once.
+      # gorelease, not apidiff, because it judges the proposed -version against
+      # the change. Skipped for apps and major bumps (a major IS the break), and
+      # skipped rather than failed when the tool cannot install or run. It
+      # refuses a dirty tree, so it cannot preview a release from local edits.
       - name: API compatibility (gorelease)
         env:
           # The stable base on both channels: a dev build compared against the
@@ -1148,18 +1099,10 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # The report also goes to the LOG, not only to the step summary. A summary is
-          # reachable from a browser and from nothing else: it is absent from
-          # `gh run view --log` and from the check-run API, so the one artifact that
-          # explains a verdict is unreadable from a terminal exactly when the verdict
-          # needs investigating. Measured on cplieger/scheduler v4.0.1 — an `api`
-          # rejection that reproduced on two consecutive pushes and in none of five
-          # local configurations, including a fresh clone at the same commit with the
-          # pinned tool and the same base, where gorelease exits 0 and calls the version
-          # valid. Diagnosis stalled on not being able to read the report.
-          #
-          # Only for a non-ok verdict: on `ok` the report is one line nobody reads, and
-          # this step runs on every library release in the fleet.
+          # The report also goes to the LOG: a step summary is absent from
+          # `gh run view --log` and the check-run API, so a verdict would be
+          # unreadable from a terminal exactly when it needs investigating.
+          # Only for a non-ok verdict, since this step runs on every library release.
           if [ "$verdict" != ok ]; then
             echo "::group::gorelease report (${prev} -> ${VERSION}, verdict: ${verdict})"
             head -c 8000 "$out"
@@ -1178,7 +1121,7 @@ jobs:
             operational)
               # Fail OPEN, on the same reasoning as the install failure above: an
               # unreachable checker is an infrastructure fault, and failing every
-              # release on one teaches the fleet to ignore this step.
+              # release on one teaches every consumer repo to ignore this step.
               echo "::warning::gorelease could not run; ${VERSION} published WITHOUT an API check (report above, and in the run summary)"
               exit 0
               ;;
@@ -1250,9 +1193,9 @@ jobs:
           # Tag ref created first via the git data API, pinned to the trigger
           # commit; release then attaches to the existing tag (no --target).
           # `gh release create --target` tag-creation 403s for the integration
-          # token when a mid-run push moved the branch past $GITHUB_SHA
-          # (observed fleet-wide 2026-07-15); the git ref create has no head
-          # restriction. A dev build gets the tag, its receipt and no Release.
+          # token when a mid-run push moved the branch past $GITHUB_SHA; the git
+          # ref create has no head restriction. A dev build gets the tag, its
+          # receipt and no Release.
           CREATED=false
           if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
             if [ "$EXISTING" != "$GITHUB_SHA" ]; then
@@ -1431,9 +1374,9 @@ jobs:
           # Tag ref created first via the git data API, pinned to the trigger
           # commit; release then attaches to the existing tag (no --target).
           # `gh release create --target` tag-creation 403s for the integration
-          # token when a mid-run push moved the branch past $GITHUB_SHA
-          # (observed fleet-wide 2026-07-15); the git ref create has no head
-          # restriction. A dev build gets the tag, its receipt and no Release.
+          # token when a mid-run push moved the branch past $GITHUB_SHA; the git
+          # ref create has no head restriction. A dev build gets the tag, its
+          # receipt and no Release.
           CREATED=false
           if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
             if [ "$EXISTING" != "$GITHUB_SHA" ]; then

@@ -6,7 +6,7 @@
 # tracker issue is only useful while an OPEN issue means "a link rotted", so a
 # permanent false positive has to be excluded or the signal dies. Same role
 # `.punused-ignore` plays for unused-symbol findings, held centrally because
-# this noise is fleet-uniform rather than per-repo.
+# this noise is uniform across the cplieger repos rather than per-repo.
 #
 # Non-synced and ci-internal, like `.github/cliff-ci.toml`: it configures a
 # workflow in THIS repo and is never copied into consumers by sync.yaml.
@@ -41,7 +41,7 @@ exclude = [
   # agent, so it is Cloudflare bot protection rather than rot: the page loads
   # in a real browser. It reached 51 of the 52 reporting repos on its own,
   # because it sits in the canonical AI-note README footer
-  # (repo-governance.md) that nearly every repo carries. The two links beside
+  # that nearly every repo carries. The two links beside
   # it there, claude.com and kiro.dev, both return 200. Excluding one host
   # beats rewriting that footer everywhere to a URL that is already correct.
   '^https?://([^/]*\.)?openai\.com',

@@ -432,4 +432,4 @@ git -C "$M" tag v1.3.0-beta.2 "$(git -C "$M" rev-list -n1 v1.3.0-dev.2)"
 compute "$M" stable
 assert_eq "$OUT_LATEST" "v1.2.0" "R6: a beta tag beside the dev tag is invisible too"
 
-echo "PASS: git-cliff $VERSION semantics match the fleet release-gate contract"
+echo "PASS: git-cliff $VERSION semantics match the release-gate contract"

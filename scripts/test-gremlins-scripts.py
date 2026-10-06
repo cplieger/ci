@@ -112,7 +112,7 @@ def run_merge(tmp: Path, modules: list[tuple[str, dict | None]], out_name: str =
 def test_single_module_is_identity(tmp: Path) -> None:
     """A repo with no nested module must publish exactly what gremlins said.
 
-    ~40 of the fleet's repos are single-module, so this is the path the merge
+    ~40 cplieger repos are single-module, so this is the path the merge
     takes almost every time: it must not shift a single number.
     """
     root = result('github.com/cplieger/thing/v2', [

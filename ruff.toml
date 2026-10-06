@@ -2,7 +2,7 @@
 # canonical config consumer repos receive via sync. `extend` avoids a drifting
 # duplicate: edit configs/ruff.toml only. Without this file, the meta CI
 # python job linted this repo with ruff's minimal defaults instead of the
-# fleet ruleset.
+# shared ruleset.
 extend = "configs/ruff.toml"
 
 [lint.extend-per-file-ignores]

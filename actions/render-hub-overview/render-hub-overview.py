@@ -163,7 +163,7 @@ def render(args: argparse.Namespace) -> str:
         fail(
             f'{args.readme} carries no `{MARKER_BEGIN}` / `{MARKER_END}` pair. '
             'Wrap the tagline and the first section in them so the Docker Hub '
-            'overview can be built (public-docs.md "Docker Hub overview").'
+            'overview can be built.'
         )
     if not summary:
         fail(f'the {MARKER_BEGIN} region in {args.readme} is empty')

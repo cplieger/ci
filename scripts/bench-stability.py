@@ -243,7 +243,7 @@ def main() -> int:
             '  Raise -benchtime before rewriting any of these. Spread falls as\n'
             '  1/sqrt(iterations per sample), so 3x the benchtime buys about a 1.7x\n'
             '  tighter series across the WHOLE suite at a linear wall-time cost.\n'
-            "  Measured on two of the fleet's worst series: slogx/ParseLevel went\n"
+            '  Measured on two of the noisiest series: slogx/ParseLevel went\n'
             '  11.1% -> 4.6% -> 2.5% at 100ms/1s/3s, and xmlx oversized_token went\n'
             '  13.2% -> 7.5% at 1s/3s. Rewriting one benchmark fixes one series;\n'
             '  the flag fixes all of them.'

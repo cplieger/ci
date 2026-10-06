@@ -664,7 +664,7 @@ class Refusals(unittest.TestCase):
                 'defaultBranchRef': {'name': 'main'},
             },
             {
-                'name': 'homelab',
+                'name': 'infra',
                 'isArchived': False,
                 'isFork': False,
                 'visibility': 'PRIVATE',

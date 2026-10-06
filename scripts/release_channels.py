@@ -1,8 +1,8 @@
 """Tag shapes and repository tables shared by the two-channel release scripts.
 
-DEPLOYED_IMAGE_REPOS is owned by the homelab deployment inventory
-(`apps/*/compose.yaml` in cplieger/homelab): a repo joins when it is onboarded
-there and leaves when its deployment is removed; edit both together.
+DEPLOYED_IMAGE_REPOS is owned by the private deployment inventory in the
+private infrastructure repo: a repo joins when it is onboarded there and
+leaves when its deployment is removed; edit both together.
 """
 
 from __future__ import annotations

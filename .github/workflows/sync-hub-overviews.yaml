@@ -2,8 +2,8 @@
 # The stable channel alone writes the Hub page, so adopting the page or changing
 # the renderer otherwise waits on 22 independent release cadences. Dispatching
 # each repo's release.yaml instead rebuilds, re-signs and re-scans an unchanged
-# image and moves its `:latest` digest, which the homelab pins. No schedule: a
-# recurring run would need a named consumer for its output.
+# image and moves its `:latest` digest, which the private deployment pins. No
+# schedule: a recurring run would need a named consumer for its output.
 name: Sync Docker Hub overviews
 
 on:
@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/hubsync
 
-          # Archived and fork repos are excluded fleet-wide (an archived repo is
+          # Archived and fork repos are excluded org-wide (an archived repo is
           # read-only and a fork's tree is upstream's).
           mapfile -t candidates < <(
             gh api --paginate 'user/repos?per_page=100&affiliation=owner' \

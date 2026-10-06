@@ -11,7 +11,7 @@ from typing import ClassVar
 
 import audit
 
-HOST = 'komodo.example'
+HOST = 'orchestrator.example'
 DEV_RULESET = audit.expected_ruleset('dev')
 MAIN_RULESET = audit.expected_ruleset('main')
 

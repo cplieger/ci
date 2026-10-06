@@ -51,7 +51,7 @@ RUN_PAGES = 5
 # One issue title per failure class, so a scheduled target that moves from day
 # to day updates the same issue instead of opening a new one.
 BLOCKED_TITLES = {
-    'soak': 'Promotion blocked: unhealthy in the homelab',
+    'soak': 'Promotion blocked: unhealthy in the deployment soak',
     'evidence': 'Promotion blocked: the dev release run has not succeeded',
     'purity': 'Promotion blocked: a first-party dependency is pinned at a dev version',
     'ancestry': 'Promotion blocked: main is not an ancestor of dev',

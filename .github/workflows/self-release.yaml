@@ -1,41 +1,11 @@
-# Self-release: auto-tag this reusable-workflow repo so tool bumps and workflow
-# fixes actually reach consumers.
+# Self-release: cut a vX.Y.Z tag so move-major-tag.yaml moves `v2`/`v2.Y` and
+# Renovate bumps the SHA-pinned reusable workflows in consumer repos.
 #
-# THE PROBLEM THIS SOLVES
-# -----------------------
-# Consumers pin the reusable workflows by SHA behind a moving major tag
-# (`uses: cplieger/ci/.github/workflows/<wf>.yaml@<sha> # v2`). Renovate tracks
-# the `# v2` comment and bumps the pinned SHA only when the `v2` tag MOVES.
-# `move-major-tag.yaml` moves `v2`/`v2.Y` only when a `vX.Y.Z` tag is pushed.
-# Nothing created that tag automatically, so Renovate-fresh tool pins on `main`
-# (markdownlint, ruff, golangci-lint, git-cliff, …) sat untagged forever and
-# never propagated. This workflow cuts that tag.
-#
-# WHAT TRIGGERS A BUMP (the precision gate)
-# -----------------------------------------
-# The tag-move lever only matters for CHANNEL 2 — the reusable workflows and
-# composite actions consumers reference by SHA. Channel 1 files (templates,
-# configs, .golangci.yaml, cliff.toml, …) reach consumers independently via
-# sync.yaml and must NOT cut a tag (doing so would fan out ~27 no-op Renovate
-# digest PRs across the cplieger repos, burning CI credits for nothing).
-#
-# So we cut a tag only when a PROPAGATABLE file changed since the last release
-# tag — i.e. a consumed reusable workflow or a composite action. The PATH GATE
-# (not the commit type) is the authoritative release decision for this repo:
-# git-cliff computes the bump LEVEL (breaking→major, feat→minor, else→patch),
-# but if cliff declines a skip-typed-but-propagatable change (e.g. a `ci:` edit
-# to go-ci.yaml), we force a patch bump so it still propagates. This closes the
-# false-negative class where a workflow fix typed `ci:`/`chore:` would never
-# reach consumers.
-#
-# The path gate is a directory-include MINUS a known internal-only exclude
-# list, so it fails SAFE: a newly added reusable workflow auto-propagates
-# (no silent stagnation), while a forgotten new internal workflow only ever
-# causes one harmless extra bump (noticed via the needless PRs, then added to
-# INTERNAL_WORKFLOWS below). See .kiro steering "ci.md → Updating and
-# propagating" for the two-channel model. Version policy lives in the dedicated
-# .github/cliff-ci.toml (full-semver tag_pattern so the moving v2/v2.Y tags
-# don't confuse the version base; not synced to consumers).
+# The PATH GATE, not the commit type, decides a release: only a change to a
+# reusable workflow or composite action cuts a tag, forcing a patch when
+# git-cliff would skip a `ci:`/`chore:` edit. Files sync.yaml propagates must
+# not tag, or every consumer gets a no-op digest PR. The gate is a directory
+# include minus INTERNAL_WORKFLOWS, so a new reusable workflow fails safe.
 name: Self-release
 
 on:

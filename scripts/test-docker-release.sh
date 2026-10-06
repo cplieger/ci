@@ -394,7 +394,7 @@ rm -f "$GH_FAIL"
 printf 'hotfix for CVE-2026-1 in the base image\n' >"$GH_SPEC"
 out_record=$(GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" run_step record.sh)
 chk "D-S7 a recorded reason becomes the notes sentence" "$(out promotion_note)" \
-  "_Promoted without the homelab soak: hotfix for CVE-2026-1 in the base image_"
+  "_Promoted without the deployment soak check: hotfix for CVE-2026-1 in the base image_"
 : >"$GH_SPEC"
 GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" run_step record.sh >/dev/null
 chk "D-S8 no record means no sentence" "$(out promotion_note)" ""
@@ -408,7 +408,7 @@ rm -f "$GH_FAIL"
 printf 'first line\r\nsecond line\n' >"$GH_SPEC"
 GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" run_step record.sh >/dev/null
 chk "D-S13 a multi-line description becomes a one-line note" "$(out promotion_note)" \
-  "_Promoted without the homelab soak: first linesecond line_"
+  "_Promoted without the deployment soak check: first linesecond line_"
 chk "D-S13 the output file holds one line" "$(wc -l <"$WORK/out")" "1"
 rm -f "$BIN/gh"
 # The stub gh ignores --jq, so the filter itself is run through jq here.

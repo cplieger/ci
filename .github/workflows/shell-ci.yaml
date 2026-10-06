@@ -15,22 +15,12 @@ on:
         type: string
         default: "auto"
       # Default ignores, and why each one is off:
-      #   DL3018 — demands apk version pins. This fleet deliberately does not use
-      #     them: the base image's SHA digest is the reproducibility guarantee,
-      #     and an apk pin drifts independently of it and breaks on base bumps
-      #     (see docker-builds.md "Don't pin distro (apk) package versions").
-      #   DL3066 — demands a numeric uid in USER. Its premise is false for the
-      #     distroless bases we use, which ship an /etc/passwd containing
-      #     `nonroot`. The failure it guards against is Kubernetes
-      #     `runAsNonRoot`, where the kubelet cannot resolve a name from the
-      #     image; nothing here deploys to Kubernetes, and our compose files
-      #     already pass a numeric user. Upstream enabled it by default in
-      #     v2.15.0 against its own requester's suggestion, its author calls the
-      #     implementation "needs further work", and `USER ${ARG}` is an open
-      #     false positive (hadolint#1222) whose documented workaround is to
-      #     disable the rule. It also fires on every USER instruction, not just
-      #     the last, so a builder-stage `USER root` trips it. Revisit once
-      #     upstream settles.
+      #   DL3018 demands apk version pins: the base image's SHA digest is the
+      #     reproducibility guarantee, and an apk pin breaks on base bumps.
+      #   DL3066 demands a numeric uid in USER: the distroless bases ship
+      #     `nonroot` in /etc/passwd, nothing here runs Kubernetes runAsNonRoot,
+      #     and `USER ${ARG}` is an open false positive (hadolint#1222) whose
+      #     documented workaround is disabling the rule.
       hadolint-ignores:
         description: Comma-separated hadolint rules to ignore (each passed as --ignore).
         type: string
@@ -175,7 +165,7 @@ jobs:
         run: |
           (
             # Every *.sh (nested included), matching the ci.yaml `scripts` job.
-            # Flags per shell.md: 2-space indent, indent switch cases, binary
+            # Flags: 2-space indent, indent switch cases, binary
             # ops may start a line. NOT -sr (the gate does not enforce it).
             files=$(find . -name '*.sh' -not -path './.git/*' -not -path '*/node_modules/*')
             if [ -z "$files" ]; then
@@ -212,32 +202,12 @@ jobs:
               hadolint ${IGNORE_FLAGS} - < "$DOCKERFILE"
           ) || { echo "Validate Dockerfile" >> /tmp/_ci_failures; exit 1; }
 
-      # Repo-provided shell unit tests (opt-in by file presence). Generalises the
-      # pattern the meta ci.yaml already uses for its own two probes
-      # (scripts/test-cliff-bump-semantics.sh, scripts/test-lane-semantics.sh),
-      # which are keyed to those exact filenames and so only ever run in
-      # cplieger/ci itself. A repo opts in by adding tests/shell/run.sh; every
-      # other repo skips, so this is inert until used.
-      #
-      # Presence is tested with -f and the runner is invoked through `bash`, NOT
-      # -x plus ./script as the two older probes do. Deliberate: those live in the
-      # repo that owns them, where a lost exec bit is noticed immediately, while
-      # this hook fans out to consumer repos where a file committed 100644 would
-      # make the whole suite skip SILENTLY and report the job green — a green run
-      # that tested nothing is the worst outcome available here, and the exec bit
-      # is an easy thing for a consumer to lose (it already happened once while
-      # this was being written). Nothing about running the suite needs it.
-      #
-      # It fills a real gap rather than adding ceremony. The shell-heavy images in
-      # this fleet carry their product logic in shell — an entrypoint plus its
-      # helpers — and the only shell testing that existed was tests/image-smoke.sh,
-      # which needs a built image and a running daemon and therefore cannot
-      # cheaply assert one function's edge cases. Boot paths that fail CLOSED are
-      # exactly what that gap hides: they are the branches a smoke test never
-      # reaches, because a healthy image never takes them.
-      #
-      # The suite runs BEFORE the secret scan and after the linters, so a test
-      # file is held to the same shellcheck/shfmt bar as the code it tests.
+      # Repo-provided shell unit tests, opt-in by tests/shell/run.sh. They reach
+      # the fail-CLOSED boot branches an image smoke test never takes.
+      # Presence is tested with -f and the runner invoked through `bash`, not
+      # -x plus ./script: in a consumer repo a file committed 100644 would make
+      # the suite skip SILENTLY and report green. Runs after the linters, so a
+      # test file meets the same shellcheck/shfmt bar as the code it tests.
       - name: Run shell unit tests
         continue-on-error: true
         run: |

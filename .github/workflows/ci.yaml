@@ -404,23 +404,11 @@ jobs:
           cache-from: type=gha,scope=arm64
           cache-to: type=gha,mode=max,scope=arm64,ignore-error=true
 
-  # Markdown lint always runs (every repo has at least a README). Inline rather
-  # than a separate reusable workflow so it needs no self-referencing pinned tag
-  # and no per-repo config sync — the canonical rule set for consumer repos
-  # lives here (it deliberately differs from cplieger/.kiro's own
-  # .markdownlint.json, which is tuned for steering docs: e.g. MD033 here
-  # allows a curated element list instead of disabling the rule).
-  # Repo-wide checks that depend on no language surface: workflow correctness
-  # (actionlint), workflow SECURITY (zizmor), and working-tree secrets
-  # (gitleaks). These previously lived in go-ci, ts-ci, shell-ci AND the scripts
-  # job, which meant a Docker+Go repo ran each of them TWICE while a repo with
-  # no detected surface got them only via scripts. Consolidated here so each
-  # runs exactly once, for every repo, with one place to maintain three pins.
+  # Repo-wide checks that depend on no language surface: actionlint, zizmor
+  # and a working-tree gitleaks scan, run exactly once per repo.
   #
-  # Soft-gated like the language jobs: every step records its name to
-  # /tmp/_ci_failures and the final step fails the job if that file exists, so
-  # one failing check does not hide the others. CONTRACT: any step added to the
-  # block below MUST end with
+  # Soft-gated like the language jobs: one failing check does not hide the
+  # others. CONTRACT: any step added to the block below MUST end with
   #   || { echo "<step name>" >> /tmp/_ci_failures; exit 1; }
   repo:
     needs: detect
@@ -489,7 +477,7 @@ jobs:
       # does not overlap. Offline mode: no GitHub API calls, so no token and no
       # rate-limit flakes. A repo needing a suppression commits its own
       # .github/zizmor.yml with the rationale; none is synced, because a
-      # fleet-wide scan measured 53/53 repos clean at the default persona.
+      # scan of every consumer repo measured all clean at the default persona.
       - name: Audit workflows (zizmor)
         continue-on-error: true
         run: |
@@ -539,10 +527,8 @@ jobs:
         continue-on-error: true
         uses: ./actions/notice-audit
 
-      # Pinned to the v2.47.0 commit, the first tag carrying the action. It could
-      # not ride the PR that added the action: the runner resolves every `uses:`
-      # at job setup, before any `if:`, so a reference no reachable tag held
-      # failed the whole job (ci.md "Composite actions").
+      # The runner resolves every `uses:` at job setup, before any `if:`, so
+      # this consumer arm must pin a tag that already contains the action.
       - name: NOTICE audit
         if: ${{ github.repository != 'cplieger/ci' }}
         continue-on-error: true
@@ -558,6 +544,12 @@ jobs:
           fi
           echo "All validation steps passed"
 
+  # Markdown lint always runs (every repo has at least a README). Inline rather
+  # than a separate reusable workflow so it needs no self-referencing pinned tag
+  # and no per-repo config sync — the canonical rule set for consumer repos
+  # lives here (it differs from the private config repo's own
+  # .markdownlint.json: MD033 here allows a curated element list instead of
+  # disabling the rule).
   markdown:
     needs: detect
     runs-on: ubuntu-26.04
@@ -587,32 +579,25 @@ jobs:
           markdownlint-cli2 --config "$RUNNER_TEMP/.markdownlint.json" \
             "**/*.md" "#node_modules" "#.git" "#licenses" "#**/testdata"
 
-      # NO spell check here, decided 2026-08 after measuring it. A `typos` gate
-      # shipped opt-in by a committed `_typos.toml`, and no repo ever committed
-      # one, so it was skip-noticing across the whole fleet. Measuring what it
-      # WOULD have said settled it rather than the enrolment: 30 findings across
-      # four sampled repos, zero real. One class is structural and would recur
-      # forever - envx deliberately feeds `"ture"` to its parser as a
-      # malformed-input fixture, with a comment saying so - and the rest are
-      # correct English the dictionary does not carry (`mis-sized`). Adjudicating
-      # that with a shared config would mean allowlisting the fleet's own test
-      # vocabulary, which is a dictionary that grows on every new fixture and
-      # catches nothing. Per-repo `_typos.toml` files are the same cost paid 53
-      # times. Prose defects here are caught by review; do not re-wire a
-      # spell-checker without a finding it would have caught.
+      # NO spell check here. A `typos` run over four sampled repos found 30
+      # findings, zero real: one class is structural (envx deliberately feeds
+      # `"ture"` to its parser as a malformed-input fixture) and the rest are
+      # correct English the dictionary lacks (`mis-sized`). A shared allowlist
+      # would grow with every new fixture and catch nothing, and per-repo
+      # `_typos.toml` files pay that cost in every repo.
 
       # Internal link + anchor check. OFFLINE only: this resolves relative links
       # and, with --include-fragments, heading anchors. It never touches the
       # network, so it cannot go red because a third party rotted a URL, which
       # is what qualifies it to gate. External URL checking runs weekly and
-      # advisory instead (weekly-links.yaml). Measured scope fleet-wide is ~207
-      # fragment-bearing links, so this is a small deterministic check, not a
-      # backlog.
+      # advisory instead (weekly-links.yaml). Measured scope across the
+      # cplieger repos is ~207 fragment-bearing links, so this is a small
+      # deterministic check, not a backlog.
       - name: Install lychee
         run: |
           # Tag is `lychee-vX.Y.Z` (the repo is a workspace and also tags
           # lychee-lib-*), and the ASSET name carries no version. Both differ
-          # from the fleet's usual pattern; getting either wrong 404s.
+          # from the usual release-asset pattern; getting either wrong 404s.
           # renovate: datasource=github-releases depName=lycheeverse/lychee
           VERSION=v0.24.2
           # The archive nests the binary one level deep in a target-named
@@ -774,7 +759,7 @@ jobs:
           ) || { echo "Validate TOML" >> /tmp/_ci_failures; exit 1; }
 
       # git-cliff semantics probe (opt-in by file presence; today only
-      # cplieger/ci ships it). The fleet's release boolean depends on
+      # cplieger/ci ships it). Every consumer's release boolean depends on
       # UNDOCUMENTED git-cliff bump behaviors (see the probe's header); this
       # step re-verifies them against the pinned binary and the shipped
       # consumer cliff config, so a Renovate bump of the git-cliff pin (or a

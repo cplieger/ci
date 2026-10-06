@@ -1,29 +1,11 @@
-# Weekly EXTERNAL link check across every public cplieger repo.
-#
-# WHY THIS IS SEPARATE FROM THE GATE
-# The meta ci.yaml `markdown` job runs `lychee --offline --include-fragments`,
-# which resolves relative links and heading anchors only. That is deterministic
-# and cannot go red unless someone changed a file, which is exactly what
-# qualifies it to BLOCK a merge.
-#
-# Checking external URLs is the opposite: a third party can rot a link
-# overnight, so a gate on it would redden a green pull request with nobody
-# having changed anything. Under the fleet's enforcement rule ("if a check can
-# go red without anyone changing the code or the checker, it must not gate")
-# external checking must be report-only, on a schedule, with a named consumer.
-# That consumer is the ci-triage skill, which reads the tracker issue below.
-#
-# Schedule:  Thursdays 22:00 UTC. Own slot: gremlins Sun, bench Tue, fuzz Wed,
-#            stryker Sat, security daily 03:00, rebuild-stale daily 04:00.
-# Reporting: per-repo `Broken external links` tracker issue (label
-#            broken-links), closed automatically when a run finds nothing.
-#            Idempotent: an existing issue is updated in place rather than
-#            duplicated, matching the gremlins/fuzz/stryker tracker convention.
-# Exclusions: `.github/lychee.toml` in this repo, read via a second sparse
-#            checkout. Held centrally because the noise is fleet-uniform (one
-#            bot-blocked host reached 51 of the 52 repos that reported in the
-#            2026-08-07 run). An open issue is only worth reading while it
-#            means a link actually rotted.
+# Weekly EXTERNAL link check across every public cplieger repo, Thursdays
+# 22:00 UTC. Report-only on purpose: a third party can rot a link overnight,
+# and a check that can go red with nobody changing anything must not gate.
+# The meta ci.yaml `markdown` job's offline lychee run is the blocking half.
+# Reports to a per-repo `Broken external links` tracker issue (label
+# broken-links), updated in place and closed when a run finds nothing.
+# Exclusions live in this repo's `.github/lychee.toml`, read via a second
+# sparse checkout, because the noise is uniform across the repos.
 name: Weekly links
 
 on:
@@ -62,7 +44,7 @@ jobs:
           set -euo pipefail
           # Public only: a private repo's docs have no external readers to
           # protect, and the two private repos check their own links in their
-          # bespoke weekly FULL battery. Forks excluded fleet-wide (a fork's
+          # bespoke weekly FULL battery. Forks excluded org-wide (a fork's
           # docs are upstream's).
           # REST rather than `gh repo list`: GraphQL quota is shared with every
           # other token of the account owner and can be exhausted by unrelated load.
@@ -109,7 +91,7 @@ jobs:
           persist-credentials: false
           path: app
 
-      # The exclusion list is fleet-wide knowledge, so it lives here and is read
+      # The exclusion list is shared knowledge, so it lives here and is read
       # from a second checkout rather than synced into 51 consumers; the same
       # checkout brings the tracker scripts the Report step runs. Sparse and
       # cone-mode off: these files, no history of the rest of this repo.
@@ -129,7 +111,7 @@ jobs:
         run: |
           # Tag is `lychee-vX.Y.Z` (the repo is a workspace and also tags
           # lychee-lib-*), and the ASSET name carries no version. Both differ
-          # from the fleet's usual pattern; getting either wrong 404s.
+          # from the usual release-asset pattern; getting either wrong 404s.
           # renovate: datasource=github-releases depName=lycheeverse/lychee
           VERSION=v0.24.2
           # The archive nests the binary one level deep in a target-named

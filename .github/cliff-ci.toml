@@ -57,15 +57,12 @@ header = ""
 #    with no footer is named once, by its marker in the group list.
 #
 # 2. The footer is emitted as ORDINARY MARKDOWN, never quoted with `> `. A
-#    blockquote silently destroys pre-formatted content: measured through
-#    GitHub's own /markdown endpoint, an aligned env-var table inside `> ` comes
-#    back as `<p>` and the browser collapses its space runs, while the same text
-#    unquoted comes back as `<pre>` with the alignment intact. Worse, markdown's
-#    4-space code-block threshold applies AFTER the `> ` is stripped, so the
-#    author's indent depth decided whether a table survived (2 spaces became
-#    mush, 6 spaces became a code block) with nothing telling them which they
-#    picked. Unquoted, a fenced block in the commit footer reaches the reader as
-#    a fenced block. Authoring rules for footers are in git-commits.md.
+#    blockquote silently destroys pre-formatted content: through GitHub's
+#    /markdown endpoint an aligned table inside `> ` comes back as `<p>` with
+#    its space runs collapsed, and the 4-space code-block threshold applies
+#    AFTER the `> ` is stripped, so the author's indent depth silently decided
+#    whether a table survived. Unquoted, a fenced block in the commit footer
+#    reaches the reader as a fenced block.
 #
 # 3. `set_global` is required, and an attribute filter cannot replace it.
 #    breaking_description falls back to the SUBJECT when a commit has no

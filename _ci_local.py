@@ -1237,9 +1237,8 @@ def _split_command_lines(cmd: str):
 
     A rewrite must never splice into a comment: ci.yaml's gitleaks step
     documents this rewriting in a comment containing the literal words
-    `gitleaks dir`, so a plain `sub(..., count=1)` once spliced a multi-line
-    TOML config into that comment, breaking bash with an unterminated quote
-    and failing the secret-scan gate fleet-wide.
+    `gitleaks dir`, and splicing the multi-line TOML config there leaves bash
+    with an unterminated quote.
     """
     for index, line in enumerate(cmd.splitlines()):
         if line.lstrip().startswith('#'):
@@ -1437,8 +1436,8 @@ def rewrite_htmlvalidate_gitignore(cmd: str, cwd: Path) -> str:
 # shellcheck/shfmt's raw `find`, `yamllint .`, and the TOML validator's rglob
 # walk the filesystem with no gitignore awareness, failing LOCAL-ONLY on
 # scratch a checkout cannot contain (lychee/ruff/prettier/zizmor need no
-# rewrite). The `find` pattern accepts both fleet shapes — newline list, or
-# .kiro/homelab's NUL list via `-print0` — emitting the matching separator.
+# rewrite). The `find` pattern accepts both shapes — newline list, or the
+# private repos' NUL list via `-print0` — emitting the matching separator.
 _FIND_SH_RE = re.compile(
     r'find\s+\.\s+-name\s+[\'"]\*\.sh[\'"]'
     r'(?:\s+-not\s+-path\s+[\'"][^\'"]+[\'"])*'
@@ -1448,7 +1447,8 @@ _FIND_SH_RE = re.compile(
 # `yamllint .`, `yamllint -d "{...}" .` and `.kiro`'s `yamllint -c .yamllint.yaml .`
 # all match. Anchored at end-of-line to avoid swallowing a longer pipeline.
 _YAMLLINT_DOT_RE = re.compile(r'(\byamllint\b[^\n]*?)\s+\.(?=[^\S\n]*$)', re.MULTILINE)
-# Bare rglob, plus homelab's list-comprehension form over the same expression.
+# Bare rglob, plus the private infrastructure repo's list-comprehension form
+# over the same expression.
 _TOML_RGLOB_RE = re.compile(r"pathlib\.Path\('\.'\)\.rglob\('\*\.toml'\)")
 
 

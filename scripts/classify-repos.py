@@ -206,12 +206,10 @@ def discover_repos():
     (LANG=C.UTF-8) that is byte order, which Python's str sort matches
     regardless of the ambient locale.
 
-    Forks are excluded fleet-wide (same rule as audit.py): a fork's tree is
-    UPSTREAM's, so syncing our conventions into it rewrites code we do not own
-    and makes the fork diverge from the branch it exists to
-    track. Observed before this filter: cplieger/loki and cplieger/go-pkcs12
-    auto-merged our full CI/release workflow set, which then ran our pipelines
-    against upstream's monorepo on every push.
+    Forks are excluded org-wide (same rule as audit.py): a fork's tree is
+    UPSTREAM's, so syncing our conventions into it rewrites code we do not own,
+    runs our pipelines against upstream's code on every push, and makes the
+    fork diverge from the branch it exists to track.
     """
     try:
         proc = subprocess.run(
@@ -282,7 +280,7 @@ def classify(repo):
     # covers go.mod/jsr.json/Dockerfile surfaces. It still needs the meta CI, so
     # that file is the enrolment marker (presence-is-enrolment, like the two
     # opt-ins above). It has to be a marker rather than "not releaseable":
-    # homelab, .kiro and AWS are also not releaseable and carry deliberately
+    # the private repos are also not releaseable and carry deliberately
     # bespoke single-job CI that the meta workflow must never overwrite. None of
     # them has a publish.yaml; tool-catalog and web-terminal-glyphs do.
     has_publish = '.github/workflows/publish.yaml' in deep_tree
@@ -368,14 +366,9 @@ def main():
         lang = profile['lang']
 
         # Resolved BEFORE the lang gate below: the shell unit-test harness keys
-        # on an explicit opt-in marker (tests/shell/run.sh), not language, since
-        # a repo can carry branching shell worth testing while classifying
-        # lang=none — homelab is exactly that shape (no go.mod/jsr.json/
-        # package.json/Dockerfile). Skipping this check would silently drop it
-        # from the sync files it opted into.
-        #
-        # image-smoke stays language-gated on purpose: it drives a built image,
-        # so an opter always has a Dockerfile and never classifies lang=none.
+        # on an explicit opt-in marker (tests/shell/run.sh), not language, and
+        # a repo with branching shell can classify lang=none. image-smoke stays
+        # language-gated: it drives a built image, so an opter has a Dockerfile.
         if profile['has_shell_tests']:
             shell_test_repos.append(repo)
 
