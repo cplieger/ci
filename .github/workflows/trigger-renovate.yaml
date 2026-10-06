@@ -1,44 +1,12 @@
 name: Trigger Renovate
 
-# Fires the downstream orchestrator's "Trigger Renovate" procedure by asking
-# GitHub to REDELIVER this repo's push webhook through GitHub's own delivery
-# infrastructure (Hookshot).
-#
-# Why not curl the orchestrator endpoint from the runner? Cloudflare blocks
-# Actions-runner egress to that endpoint (observed: HTTP 403 on every
-# attempt) while allowing GitHub Hookshot source ranges. The previous curl
-# implementation therefore never reached the orchestrator. This mirrors how
-# build releases reach the orchestrator: `gh release create` fires the native `release`
-# webhook, delivered by Hookshot, authenticated by the secret configured on
-# the GitHub webhook itself. We reuse the same model — the webhook secret
-# stays on the GitHub webhook config (GitHub signs + delivers); this workflow
-# only asks GitHub to resend the most recent main-branch push delivery.
-#
-# The only trigger is workflow_dispatch — a manual launch button in this
-# repo's Actions tab (`gh workflow run trigger-renovate.yaml -R cplieger/ci
-# -f reason="<why>"`). An earlier plan to auto-dispatch this from every docker
-# build pipeline was never wired (and is not needed: image pushes reach the
-# orchestrator through their own release webhook).
-#
-# The orchestrator's procedure on the receiving end starts the one-shot
-# Renovate container/stack.
-#
-# SCOPE (intentional, do not "fix"): this one-shot run bumps the `homelab` repo
-# ONLY. It does NOT touch the standalone cplieger/* app/library repos that
-# consume cplieger/ci's reusable workflows by SHA. Those are handled by the
-# RESIDENT renovate container (homelab apps/renovate, RENOVATE_AUTODISCOVER over
-# cplieger/*), fired hourly by the Ofelia `renovate` job, so a cplieger/ci tag
-# move reaches the fleet on that hourly cadence, not through this action. To
-# expedite a fleet-wide digest bump, run the resident container directly:
-#   ssh borgcube 'sudo -n docker exec --user 12021:0 renovate \
-#     /usr/local/bin/docker-renovate-scheduler run'
-#
-# Token: GH_TOKEN below is RENOVATE_HOOK_PAT, a fine-grained PAT scoped to
-# ONLY cplieger/ci with Metadata: Read + Webhooks: Read and write — the hooks,
-# deliveries, and redeliver endpoints all require Webhooks access. The default
-# GITHUB_TOKEN cannot be granted this scope, so a dedicated PAT secret is
-# mandatory. Kept separate from CI_SCHEDULE so webhook-admin is confined to one
-# repo rather than all the repos that CI_SCHEDULE can reach.
+# Fires the orchestrator's "Trigger Renovate" procedure by asking GitHub to
+# REDELIVER this repo's latest main-branch push webhook through Hookshot. A
+# curl from the runner cannot work: Cloudflare blocks Actions-runner egress to
+# that endpoint (HTTP 403) while allowing Hookshot source ranges.
+# SCOPE: the one-shot run bumps the private infrastructure repo ONLY; every
+# other repo is served by the resident Renovate container's hourly run. RENOVATE_HOOK_PAT is a fine-grained PAT on cplieger/ci
+# only (Metadata: Read, Webhooks: Read and write), which GITHUB_TOKEN cannot get.
 
 on:
   workflow_dispatch:

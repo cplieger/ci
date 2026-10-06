@@ -43,7 +43,7 @@ jobs:
           #   INTERVAL_OVERRIDES[docker-keepalived]=3
           declare -A INTERVAL_OVERRIDES=()
 
-          # Forks are excluded fleet-wide (same rule as scripts/audit.py): a fork
+          # Forks are excluded org-wide (same rule as scripts/audit.py): a fork
           # publishes no cplieger image.
           # REST rather than `gh repo list`: GraphQL quota is shared with every
           # other token of the account owner and can be exhausted by unrelated load.

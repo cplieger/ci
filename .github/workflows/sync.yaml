@@ -1,16 +1,11 @@
 name: Sync shared files
 
 # Propagates the canonical config files in this repo to consumer repos as PRs,
-# for tools that have no native remote-config support (golangci-lint, git-cliff,
-# editorconfig, eslint/prettier/stylelint bases), plus the workflow templates
-# and the one-liner renovate.json preset shim (configs/renovate.json).
-#
-# The sync engine is the in-house scripts/sync-files.py (it replaced
-# BetaHuhn/repo-file-sync-action, unmaintained since 2024 — no third-party
-# code holds the fleet-wide write PAT anymore). Same contract as before:
-# branch repo-sync/ci/default, chore(sync) commits, `dependencies` label.
-#
-# Requires a SYNC_PAT secret: a fine-grained PAT with Contents:write +
+# for tools with no native remote-config support, plus the workflow templates
+# and the renovate.json preset shim (configs/renovate.json). The engine is the
+# in-house scripts/sync-files.py, so no third-party code holds the org-wide
+# write PAT. Contract: branch repo-sync/ci/default, chore(sync) commits,
+# `dependencies` label. SYNC_PAT is a fine-grained PAT with Contents:write and
 # Pull-requests:write on the target repos.
 
 on:

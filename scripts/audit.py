@@ -120,7 +120,7 @@ def _bypass_actor_set(ruleset):
     return {(a.get("actor_type"), a.get("actor_id"), a.get("bypass_mode"))
             for a in ruleset.get("bypass_actors") or []}
 # Repos whose deploy-trigger webhook fires on push@main instead of release:
-# the non-releaseable infra/config repos (repo-governance.md "Apply"). Every
+# the non-releaseable infra/config repos. Every
 # other repo releases, so its hook must carry the release event or releases
 # silently never reach the orchestrator.
 PUSH_WEBHOOK_REPOS = {".github", ".kiro", "ci", "homelab"}
@@ -176,7 +176,7 @@ HUB_MARKER_END = "<!-- hub-overview END -->"
 
 # Known-accepted deviations from the standard: {repo: {warning-prefix: reason}}.
 # A warning whose text starts with a listed prefix is suppressed from the
-# report (counted under "accepted", not listed), so the steady-state fleet
+# report (counted under "accepted", not listed), so the steady state
 # reports clean and a new warning stands out. Every entry needs a reason;
 # remove entries when the deviation is fixed.
 ACCEPTED = {
@@ -190,18 +190,11 @@ ACCEPTED = {
     },
 }
 
-# Expected license per repo (licensing.md's four-license scheme, 2026-08).
-# Apache-2.0 is the default and covers every public repo not listed here:
-# importable libraries, wrappers whose core value is the upstream software they
-# package, and tooling/config/meta. The listed repos deviate for a stated
-# reason. A repo absent from this table is NOT unclassified — the default
-# applies — so a new repo needs an entry only when it is not Apache-2.0.
-#
-# Values are the spdx_id GitHub's licensee reports, which uses the legacy short
-# IDs. The repos themselves declare GPL-3.0-or-later / AGPL-3.0-or-later in
-# their READMEs and package.json; GitHub cannot distinguish the -only and
-# -or-later variants from the license text, so it reports GPL-3.0 / AGPL-3.0
-# and this table must match what the API returns, not what the repo declares.
+# Expected license per repo. Apache-2.0 is the default for every public repo
+# not listed here, so a new repo needs an entry only when it deviates.
+# Values are the legacy short spdx_id GitHub's licensee reports: it cannot tell
+# -only from -or-later, so a repo declaring GPL-3.0-or-later reads as GPL-3.0
+# and this table must match what the API returns.
 LICENSE_DEFAULT = "Apache-2.0"
 LICENSE_OVERRIDES = {
     # The differentiated product. File-level copyleft asks for improvements
@@ -239,7 +232,7 @@ LICENSE_OVERRIDES = {
     "marotte": "AGPL-3.0",
 }
 
-# Documented governance standard (repo-governance.md).
+# Governance standard.
 # HARD merge-model settings: any deviation fails the audit (exit 1). These have
 # real consequences — stray merge-commit history, un-mergeable or non-auto-merging
 # PRs, lost branch hygiene.
@@ -384,7 +377,7 @@ def canonical_text(path):
 
     Read through the API rather than off disk on purpose: the audit compares
     against what is actually on ci's default branch, so a run from a feature
-    branch or a stale checkout cannot report the fleet as drifted against an
+    branch or a stale checkout cannot report every repo as drifted against an
     unpublished canonical.
     """
     if path not in _canonical_cache:
@@ -942,16 +935,11 @@ def collect(meta):
             s["errors"].append("actions secrets unreadable (API)")
 
     # Synced files that must be BYTE-IDENTICAL to their canonical. sync.yaml
-    # distributes them and nothing reported when a copy diverged, which is the gap
-    # this closes. The fleet's default branches were verified clean when this
-    # landed (2026-09-02, every Dockerfile repo byte-identical to
-    # configs/repin-sha.sh), so this is a detector for a class rather than a
-    # cleanup: the real instance was a comment-cleanup pass on a REVIEW branch
-    # that read the synced copy as local code and trimmed it 201 lines to 148.
-    # The next sync silently overwrites such an edit, so it is lost work either
-    # way, and nothing said so. Beware of reasoning from a local checkout here —
-    # several clones were many commits behind their remote, which looks exactly
-    # like fleet-wide drift and is not.
+    # distributes them and nothing else reports a diverged copy. The class it
+    # catches is a local edit to a synced copy (read as local code and trimmed),
+    # which the next sync silently overwrites. Judge drift from the remote, not
+    # a local checkout: a clone many commits behind looks exactly like drift in
+    # every repo and is not.
     s["synced_drift"] = []
     for dest, canon_path in SYNCED_BYTE_IDENTICAL.items():
         if not s.get("has_dockerfile"):
@@ -998,11 +986,11 @@ def collect(meta):
     # Renovate reaches every repo through inheritConfig, not a per-repo file:
     # the scheduler sets inheritConfig + inheritConfigRepoName=cplieger/.github,
     # so cplieger/.github/org-inherited-config.json is the ONE place the preset
-    # is referenced. The 61 per-repo shims were deleted in 2026-09; a repo
-    # holding one again is drift, not compliance. Only .github is graded, and it
-    # is graded HARD, because that single file is what delivers dependency
-    # updates fleet-wide and its absence is silent (requireConfig=optional means
-    # every repo would still be processed, just with no preset).
+    # is referenced; a per-repo shim is drift, not compliance. Only .github is
+    # graded, and it is graded HARD, because that single file is what delivers
+    # dependency updates to every repo and its absence is silent
+    # (requireConfig=optional means every repo would still be processed, just
+    # with no preset).
     if name == ".github":
         inherited = file_text(name, "org-inherited-config.json")
         if inherited is None:
@@ -1078,7 +1066,7 @@ def compliance(s):
 
     # License: public repos only — a private personal repo has no audience
     # that needs a license grant. The expected license is per-category, not
-    # fleet-wide: see LICENSE_OVERRIDES above and licensing.md for the rules.
+    # org-wide: see LICENSE_OVERRIDES above.
     if not s["private"]:
         want = LICENSE_OVERRIDES.get(s["name"], LICENSE_DEFAULT)
         if s["license"] is None:
@@ -1185,8 +1173,8 @@ def compliance(s):
             warn.append("required_linear_history=on (want off; the merge "
                         "model already guarantees linear PR merges)")
         if s.get("required_signatures"):
-            warn.append("required_signatures=on (want off; fleet commits "
-                        "are unsigned, so this would block every merge)")
+            warn.append("required_signatures=on. Set it to off: the commits "
+                        "are unsigned, so this would block every merge")
         if s.get("push_restrictions"):
             warn.append("push restrictions set (standard is none)")
         if s.get("lock_branch"):
@@ -1295,12 +1283,11 @@ def compliance(s):
             warn.append(f"used-by counter shows '{s['used_by_package']}' "
                         f"(want '{s['expected_package']}'; no API — fix by "
                         "hand: Settings -> Advanced Security -> Used by counter)")
-        # Module-path standard (go.md): a Go module lives at
+        # Module-path standard: a Go module lives at
         # github.com/<owner>/<repo>; a library adds /vN once majors move, an
         # image app never does. Anything else is unfetchable by Go tooling
         # (module path must match the repo URL) and indexes a phantom
-        # dependency-graph package (the cert-watcher / age-decrypt /
-        # fclones-wrapper / vibecli class, caught 2026-07).
+        # dependency-graph package.
         if s.get("go_module"):
             want = f"github.com/{OWNER}/{s['name']}"
             mod = s["go_module"]
@@ -1321,10 +1308,10 @@ def compliance(s):
                             "tooling and indexes a phantom dependency-graph "
                             "package)")
 
-    # Public docs standard (public-docs.md). Presence is hard (a public repo
+    # Public docs standard. Presence is hard (a public repo
     # without a README is broken for its audience). The footer blocks and
-    # License-last order are warnings: real drift, but aligned by the
-    # docs-review skill rather than blocking the audit. The image-repo marker
+    # License-last order are warnings: real drift, but aligned by hand
+    # rather than blocking the audit. The image-repo marker
     # check is hard because a release cannot build the Docker Hub overview page
     # without it, so the live Hub page silently stops being updated.
     # readme_text None means the read failed (already an [error]); '' means
@@ -1336,28 +1323,26 @@ def compliance(s):
         else:
             norm = " ".join(txt.split())
             if FOOTER_AI_NOTE not in norm:
-                warn.append("README missing the canonical AI-assistance note "
-                            "(verbatim block in repo-governance.md)")
+                warn.append("README missing the canonical AI-assistance note. "
+                            "Copy FOOTER_AI_NOTE exactly")
             if s["name"] != ".github":
                 if FOOTER_DISCLAIMER not in norm:
-                    warn.append("README missing the canonical Disclaimer block "
-                                "(verbatim block in repo-governance.md)")
+                    warn.append("README missing the canonical Disclaimer block. "
+                                "Copy FOOTER_DISCLAIMER exactly")
                 headings = re.findall(r"^## +(.+?)\s*$", txt, re.MULTILINE)
                 if headings and headings[-1] != "License":
-                    warn.append(f"README's last section is '{headings[-1]}' "
-                                "(want License last — public-docs.md footer "
-                                "invariant)")
+                    warn.append(f"README's last section is '{headings[-1]}'. "
+                                "Make License the last section")
             if s.get("has_dockerfile") and not (
                 HUB_MARKER_BEGIN in txt and HUB_MARKER_END in txt
             ):
                 hard.append(f"README carries no '{HUB_MARKER_BEGIN}' / "
                             f"'{HUB_MARKER_END}' pair, so the release cannot "
                             "build the Docker Hub overview page and the Hub "
-                            "listing stops being updated (public-docs.md "
-                            '"Docker Hub overview")')
+                            "listing stops being updated")
         if s.get("compose_example") is False:
-            warn.append("compose.yaml example missing (image repos ship a "
-                        "reference compose — compose-examples.md)")
+            warn.append("compose.yaml example missing. Every image repo "
+                        "ships a reference compose file")
 
     # Deploy-trigger webhook, graded only when the host is configured and this
     # repo's hooks were readable (an unreadable token is a global skip in main).
@@ -1428,9 +1413,7 @@ def main():
     ap = argparse.ArgumentParser(description="cplieger governance audit")
     ap.add_argument("--visibility", choices=["all", "public", "private"], default="all")
     ap.add_argument("--repo", action="append", metavar="NAME",
-                    help="audit only this repo (repeatable). The bootstrap-repo "
-                         "skill runs this against a freshly created repo as its "
-                         "settings gate.")
+                    help="audit only this repo. Pass it more than once for several repos")
     ap.add_argument("--dump", metavar="PATH", help="write raw collected settings as JSON")
     args = ap.parse_args()
 
@@ -1516,7 +1499,7 @@ def main():
               "token needs the classic 'repo' scope (or admin:repo_hook).\n")
     # Used-by counter check status: when EVERY attempted dependents-page read
     # failed, github.com HTML is unreachable from this network (throttled or
-    # blocked) — say so once instead of silently skipping fleet-wide.
+    # blocked) — say so once instead of silently skipping every repo.
     attempted = [s for s in settings if s.get("used_by_attempted")]
     if attempted and not any(s["used_by_readable"] for s in attempted):
         print("Note: used-by counter check skipped (github.com dependents "

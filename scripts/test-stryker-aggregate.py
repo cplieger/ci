@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """Pin stryker-aggregate.py's artifact-layout contract.
 
-This script decides what every enrolled TS package publishes each week, and until
-2026-09-13 it had no probe at all — which is the same gap that let it sit
-unparseable for weeks (`ci.md`, "weekly-stryker: two defects that discarded every
-run"). The specific contract pinned here is the one that broke:
+This script decides what every enrolled TS package publishes each week. The
+contract pinned here:
 
     actions/download-artifact only creates the per-artifact directory when MORE
     THAN ONE artifact matched its pattern. A run with exactly one reporting
     package dir extracts FLAT, so `artifacts/stryker-*/meta.json` finds nothing,
     no tracker issue is updated, and the job reports success.
 
-Measured live on 2026-09-13: a single-repo dispatch published a correct 95.5%
-badge and left the tracker issue untouched with the aggregate job green.
-
-Scoped to discovery on purpose. It is not a full suite for the score arithmetic or
-the body rendering; those are a separate piece of work.
+Scoped to discovery. It does not cover the score arithmetic or the body
+rendering.
 
 Run: python3 scripts/test-stryker-aggregate.py     (exit 0 = pass)
 """

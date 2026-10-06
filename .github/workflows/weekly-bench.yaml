@@ -1,253 +1,10 @@
 # Weekly Go benchmark regression tracking across cplieger consumer repos.
 # Pattern C, like weekly-gremlins / weekly-fuzz / weekly-stryker: this workflow
-# owns the matrix and the max-parallel cap; runs happen here, not via cross-repo
-# dispatch.
-#
-# WHY THIS EXISTS
-# The fleet already had ~155 `func Benchmark` across 16 repos and NOTHING
-# executed any of them: a grep for -bench/-benchmem/benchstat across every
-# workflow in ci and all 55 repos returned zero. So a performance regression in
-# subflux's subsync aligner or marotte's ACP translator landed silently. The
-# benchmarks were well built (size-parameterised, ReportAllocs, ResetTimer);
-# they were simply dead.
-#
-# A DEAD BENCHMARK IS NOT NECESSARILY A WORKING ONE
-# `go test ./...` COMPILES a benchmark and never runs it without -bench, so an
-# unenrolled benchmark has only ever been type-checked. Measured 2026-08-21 by
-# running `-run='^$' -bench=. -benchtime=1x` over all 24 benchmark-carrying
-# repos: plex-exporter's BenchmarkCollect nil-dereferenced on its first
-# iteration and had since the commit deleting that app's duplicate Plex wire
-# structs (Item.Player/Session/User became pointers on the shared plexapi.Item
-# and the hand-written fixture assigned straight through them). One of 24. So
-# before enrolling a repo, run that -benchtime=1x smoke over it: enrolment
-# turns a compile-only benchmark into a job that can fail the leg, and the
-# tracker's -run='^$' means no sibling test runs first to paper over a
-# fixture that depends on one.
-#
-# THE STATISTICS, AND WHY THE REDUCER IS NOT OPTIONAL
-# github-action-benchmark performs NO aggregation: its Go extractor emits one
-# entry per output line and its alert comparator resolves the baseline by
-# first-match-on-name. Handing it raw `-count=10` output compares one arbitrary
-# sample against one arbitrary previous sample, ten times, which multiplies
-# false-alert odds by ten and writes ten duplicate-named points per benchmark.
-# scripts/bench-reduce.py therefore reduces to ONE median entry per benchmark
-# per metric first, and the action is used via its custom-tool path. It keeps
-# the chart and the branch history it is good at; it is not the estimator.
-#
-# Schedule:     Tuesdays 22:00 UTC. Own slot by design: gremlins Sun, fuzz Wed,
-#               stryker Sat, security daily 03:00, rebuild-stale daily 04:00.
-#               Two new runners (this and weekly-links) took the two free days
-#               so the 20-job account cap is never contested.
-# Threshold:    150%, report-only (fail-on-alert: false). Deliberately loose,
-#               and now measured rather than asserted. `-count=10` over 38
-#               series in four repos (2026-08-21, scripts/bench-stability.py):
-#               ns/op spread is 8.60% median, 24.55% p90, 43.73% worst. At the
-#               median that puts a 150% alert 5.8 sigma out, so the tracker sees
-#               a regression of MORE than about 26% and nothing finer (the
-#               action's comparison is a strict `ratio > threshold`, so exactly
-#               1.5x does not alert) - which
-#               is the intended target (an O(n log n) aligner becoming
-#               O(n squared) shows up as multiples). A tight threshold on a
-#               non-gating check just trains everyone to ignore the tracker.
-#               9 of the 38 series sit under 3 sigma from the threshold and so
-#               can alert on noise alone; they are listed under Scope. Re-run
-#               the measurement ON THE RUNNER before treating these figures as
-#               the runner's floor - they were taken on a loaded shared host.
-# Storage:      each consumer's orphan `benchmarks` branch, written by the
-#               action's own git mode. NOT the `badges` branch: publish-badge.sh
-#               rebuilds that from root *.json only and force-pushes a squashed
-#               commit, so it would delete both a raw baseline and the action's
-#               chart files. `badges` stays Shields-JSON-only.
-# First run:    TWO bootstrap facts, verified against the action's v1.22.1 dist
-#               rather than its README. (1) The action does NOT create a missing
-#               data branch: its gh-repository path is clone + plain
-#               `git checkout <branch>`, no orphan fallback, so the run fails on
-#               a repo that has never enrolled. The "Ensure benchmarks branch"
-#               step below therefore creates the empty orphan branch, once,
-#               idempotently. (2) Alert comparison skips when the branch carries
-#               no previous suite, so the first data point publishes a baseline
-#               and alerts nothing - that part needs no bootstrap.
-# Scope:        18 repos, 429 chart series. Widened from the original four on
-#               2026-08-21. The criterion is not "has a benchmark", and it is
-#               NOT "is a library" either - see "Not a criterion" below. Three
-#               tests, and the last two are measurements, not arguments:
-#                 1. DETERMINISTIC COMPUTE. No disk, no network, no sleep, no
-#                    wall-clock dependence. This is the one structural test that
-#                    survived, because those are the CAUSES of a spread no
-#                    threshold can police. It is a property of the BENCHMARK, not
-#                    of the repo, which is why it is enforced per benchmark with
-#                    `go test -skip` in the run job rather than by admitting or
-#                    refusing whole repos. Judge it by walking each benchmark's
-#                    TIMED region, never the whole function: a b.TempDir() in
-#                    setup costs nothing per iteration, and scanning whole bodies
-#                    over-reported the two large apps as 15 offenders where the
-#                    real number is 3. An in-process ServeHTTP with a recorder is
-#                    compute, not network.
-#                 2. A POLICEABLE SPREAD. Measure it, never predict it from the
-#                    code: across 5 million data points in Java and Go, Laaber,
-#                    Scheuner and Leitner found per-benchmark coefficients of
-#                    variation from 0.03% to over 100%
-#                    (doi.org/10.1007/s10664-019-09681-1), and their earlier
-#                    survey concluded outright that not all benchmarks are useful
-#                    for reliably discovering slowdowns.
-#
-#                    THE STATISTIC IS NOT YET RIGHT, and this is a known defect
-#                    rather than a settled rule. scripts/bench-stability.py
-#                    reports the coefficient of variation over the 10 RAW samples.
-#                    What decides an alert is a ratio of two MEDIANS of 10, a week
-#                    apart. Those are different random variables, so the "sigma"
-#                    the script prints is not the sampling distribution of the
-#                    decision, and no admission verdict should rest on it. Two
-#                    independent adversarial reviews converged on this.
-#                    The durable statistic is the empirical distribution of
-#                    consecutive-median RATIOS for an unchanged tree, which needs
-#                    repeated runner runs to obtain; the raw output is now kept as
-#                    an artifact so those runs can be pooled. Until then the
-#                    script's numbers are descriptive, and its exit status is
-#                    advisory.
-#                 3. ATTRIBUTABLE COMMITS, which sets the BENCHTIME rather than
-#                    admission. A weekly chart point covers a week of commits,
-#                    so a step is only as actionable as the number that landed
-#                    in the BENCHMARKED PACKAGE that week. Measured over 90
-#                    days: keyenc 0.1, xmlx 0.2, pathinside 0.2, urlform 0.5,
-#                    langtag 0.8, slogx 0.9, jsonx 0.9, ssrf 0.9, runesafe 1.0,
-#                    plex-language-sync/internal/streams 1.0,
-#                    plex-exporter/internal/server 1.2, metrics 1.4,
-#                    web-terminal-engine/vt 2.6, httpx 3.2, then subflux 8.2 and
-#                    marotte 14.2. The last two are enrolled and run at a lower
-#                    benchtime, because sharpening a signal nobody can attribute
-#                    to a commit is not worth 3x the wall time.
-#
-# Which metric gates what:
-#               The three series the reducer emits are NOT equally trustworthy,
-#               and this is the tracker's most useful property:
-#                 allocs/op  spread 0.00% on 38 of 38 series: deterministic for
-#                            a path that allocates the same number of times on
-#                            every call, which is what these series measure.
-#                            NOT exact in general, and the earlier wording here
-#                            said exact. testing.AllocsPerRun and
-#                            BenchmarkResult.AllocsPerOp both divide as INTEGERS,
-#                            so an allocation happening less often than once per
-#                            run floors to zero: measured, a 64-byte allocation
-#                            on 1 call in 1000 reads 0 allocs/op and passes a
-#                            `== 0` contract. That defeats a zero-allocation
-#                            claim on an AMORTISED path (a buffer that grows
-#                            occasionally), which is exactly where it matters.
-#                            A contract whose claim is genuinely "never" wants
-#                            AllocsPerRun(1, f) or a MemStats delta.
-#                 B/op       0.00%; the two series that move at all move by 1
-#                            and 5 bytes out of 47 KB and 305 KB.
-#                 ns/op      8.60% median. Trend only.
-#               So allocation regressions are gate-grade and wall-clock ones are
-#               not. The consequence: allocation contracts belong in the repo's
-#               own test suite as testing.AllocsPerRun assertions, which run on
-#               every PR and fail at merge time - the five libraries enrolled in
-#               this widening carry 37 of them. The chart's allocation series is
-#               the BACKUP for drift nobody wrote a contract for, not the
-#               primary gate.
-#
-# Not a criterion: LIBRARY vs APP.
-#               It looks like it should be, and it was tested four ways on
-#               2026-08-21. Every test refuted it:
-#                 - Spread: plex-language-sync (an app) was the most stable of
-#                   the four repos measured - 7.5% median, 9.9% worst - while
-#                   slogx (a library) held the single noisiest series at 43.7%.
-#                 - Work per operation: Pearson r between log10(ns/op) and
-#                   spread was +0.01 across 38 series. Operation size predicts
-#                   nothing; the shared host dominates.
-#                 - Commit rate, repo-wide: the distributions overlap. A
-#                   library, web-terminal-engine, ran at 6.6/week against
-#                   plex-exporter's 2.8.
-#                 - Commit rate, scoped to the benchmarked package: the two apps
-#                   came out BETTER than two of the libraries (1.0 and 1.2
-#                   against httpx's 3.2 and web-terminal-engine/vt's 2.6).
-#               Judge a repo on the three tests above. Do not reintroduce a
-#               category rule; it has already been measured and it does not hold.
-#
-#               Enrolled: the four cost-contract libraries (xmlx, jsonx, ssrf,
-#               httpx) plus jsoncap (the JSON twin of xmlx, carved out of
-#               jsonx AFTER this workflow landed, so it matched the original
-#               criterion and was simply never added), the five pure-compute
-#               libraries that got benchmarks written for this widening
-#               (runesafe, pathinside, keyenc, langtag, urlform), the five
-#               CPU-bound repos whose benchmarks already existed (metrics,
-#               slogx, web-terminal-engine, plex-language-sync, plex-exporter),
-#               both large apps (subflux, marotte), and auth, whose two Argon2id
-#               benchmarks are skipped: their cost IS the security parameter, and
-#               a customSmallerIsBetter tracker alerts only on getting slower
-#               where the dangerous direction is faster. What remains is the
-#               per-request auth path, which is worth charting and is what made
-#               the repo enrollable once skipping existed.
-#
-#               plex-exporter's enrolment DEPENDS on the fix to its
-#               BenchmarkCollect nil-deref being on main. Land that first or its
-#               leg fails on the first run.
-#
-#               EXCLUDED, with the reason, so this is not re-litigated:
-#               - atomicfile, health, scheduler: every benchmark fsyncs, flocks
-#                 or stats a file. The runner's shared disk sets the number, not
-#                 the code.
-#               - cert-converter, docker-age, docker-fclones-scheduler: one
-#                 IO-shaped benchmark each (PEM on disk, file decrypt, report
-#                 decode).
-#               - arrapi, plexapi: network clients, RTT-dominated.
-#               - envx: parses the environment once at startup; a regression is
-#                 unobservable in production.
-#               - toolbelt, pinstall: install-time. wiregen: build-time.
-#               - webhttp: per-call cost is dominated by net/http itself and it
-#                 makes no cost claim of its own.
-#               NOT excluded, but worth knowing: subflux (136 series) and
-#               marotte (103) are enrolled WHOLE rather than as a curated
-#               subset, which was a deliberate call against the documented
-#               practice - an optimized subset still detects most real
-#               application changes (arxiv.org/abs/2212.09515) and selection by
-#               stability metric cut Go suite runtime by up to 95.8% while still
-#               catching regressions (arxiv.org/abs/2501.12878). A subset stays
-#               acceptable and remains the fallback if either leg becomes
-#               unwieldy; whole suites were preferred because a subset is a
-#               second thing to maintain and to justify. Their weak attribution
-#               is handled by benchtime instead (see criterion 3).
-#
-# Known-noisy:  9 of the 38 measured ns/op series sit under 3 sigma from the
-#               150% threshold, so they can alert on noise alone. Worst first:
-#               slogx/ParseLevel (43.7%), xmlx/PreflightRejection.oversized_token
-#               (39.1%), urlform/RawQueryPairs.pairs_256 (28.1%),
-#               urlform/StdlibParseQuery.pairs_256 (24.6%),
-#               urlform/FoldHostASCII.lowercase_long (24.1%),
-#               xmlx/Preflight.elements_10 (22.5%), xmlx/BudgetCharge (21.6%),
-#               urlform/EqualASCIIFold.equal_mixed_case (20.4%),
-#               urlform/RawQueryNames.pairs_256 (18.3%). Their allocation series
-#               are unaffected and stay exact.
-#
-#               DO NOT rewrite these benchmarks. Two things were measured after
-#               the fact, and both say the benchmarks are not the problem:
-#                 - Most of the spread is ambient. Run alone at the same
-#                   benchtime instead of inside a loaded `-bench=.` sweep,
-#                   ParseLevel measured 4.6% rather than 43.7% and
-#                   oversized_token 13.2% rather than 39.1%.
-#                 - MEASURED on two series, benchtime buys a tighter series:
-#                   ParseLevel 11.1% at 100ms, 4.6% at 1s, 2.5% at 3s, and
-#                   oversized_token 13.2% at 1s to 7.5% at 3s, which is close to
-#                   the 1/sqrt(3) that averaging independent noise would predict.
-#                   Treat that as a fitted observation on two series, NOT as a
-#                   law: 1/sqrt(n) holds for independent samples, and ambient
-#                   load, GC, package contention and frequency scaling are
-#                   correlated. Earlier wording here stated it as a rule.
-#               APPLIED: benchtime is 3s for every repo except the two large
-#               apps, which stay at 1s (criterion 3). Measured after the change:
-#               slogx median 2.60% worst 13.39% with every series clear, urlform
-#               median 3.96% with 19 of 20 clear, xmlx median 10.33%. Those come
-#               from a loaded workstation, so the Stability step measures the real
-#               floor on every leg; read it after the first run and re-tune with
-#               the `benchtime` dispatch input rather than rewriting a benchmark.
-#
-#               AND KEEP THE STAKES IN VIEW: `comment-on-alert` is false, so a
-#               false alert notifies nobody. It appears in a job summary and in
-#               the stored series and that is all. Earlier wording here argued
-#               these two series from the risk of "crying wolf", which is a real
-#               concern when someone is paged and no concern at all when nothing
-#               is delivered. Neither series is worth a benchmark rewrite or a
-#               second action invocation at that price.
+# owns the matrix and the max-parallel cap. Nothing else executes the repos'
+# `func Benchmark` suites, so without this a performance regression lands
+# silently. Tuesdays 22:00 UTC. Threshold 150%, report-only and deliberately
+# loose: allocs/op and B/op are deterministic and gate-grade, ns/op is trend
+# only, so allocation contracts belong in each repo's own AllocsPerRun tests.
 name: Weekly bench
 
 on:
@@ -379,20 +136,11 @@ jobs:
             printf '%-28s %s benchmark(s): ' "$r" "$n"
             checked=$((checked + 1))
 
-            # -benchtime=1x runs each benchmark exactly one iteration. This
-            # asserts nothing about speed and everything about the code still
-            # working, which is the whole point. GOWORK=off because a repo may
-            # carry an untracked go.work locally; a runner must resolve the
-            # versions go.mod pins.
-            #
-            # `go test -C` rather than a `cd` subshell: with a cd, the output
-            # redirect resolves relative to scan/ while the tail below resolves
-            # relative to here, so the diagnostic was written to one path and
-            # read from another. The job still failed correctly and the summary
-            # carried an empty code block, which is the worst shape for a red
-            # leg - it says something broke and not what.
-            # 300s covers a cold module download plus a one-iteration run of
-            # the largest suite in the fleet, which measures about 10s warm.
+            # -benchtime=1x runs each benchmark once: it asserts the code still
+            # works, nothing about speed. GOWORK=off so the runner resolves the
+            # versions go.mod pins. `go test -C`, not a `cd` subshell, keeps the
+            # output redirect and the tail below on the same path. 300s covers
+            # a cold module download plus the largest enrolled suite (~10s warm).
             if GOWORK=off timeout 300 go test -C scan -run='^$' -bench=. -benchtime=1x ./... \
                 > out.txt 2>&1; then
               echo "ok"
@@ -462,9 +210,14 @@ jobs:
           # `git -c`, never persisted into scan/.git/config).
           auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
 
-          # The enrolled set. The criterion and every exclusion are in the
-          # header block; keep the two in step when editing this list.
-          # Grouped by why each repo is here, not alphabetically.
+          # The enrolled set, by three criteria: (1) deterministic compute in the
+          # TIMED region (no disk, network, sleep or wall clock, enforced per
+          # series by SKIP in the run job), (2) a measured spread the 150%
+          # threshold can police, (3) attributable commits, which sets benchtime.
+          # LIBRARY vs APP is not a criterion. Excluded: atomicfile, health,
+          # scheduler, cert-converter, docker-age, docker-fclones-scheduler (IO),
+          # arrapi, plexapi (network), envx (startup only), toolbelt, pinstall,
+          # wiregen (install or build time), webhttp (net/http-dominated).
           ENROLLED="xmlx jsonx jsoncap ssrf httpx"                 # cost-contract libraries
           ENROLLED="$ENROLLED runesafe pathinside keyenc langtag urlform"   # pure-compute libraries
           ENROLLED="$ENROLLED metrics slogx web-terminal-engine"   # per-call hot paths
@@ -584,7 +337,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    # CI_SCHEDULE is a fleet-write PAT and it is deliberately NOT job-level env.
+    # CI_SCHEDULE is an org-wide write PAT and it is deliberately NOT job-level env.
     # This job runs `go test -bench` over code from 18 repositories, so a
     # job-level token sits in the environment of a step that executes other
     # people's benchmarks, any one of which could read it with os.Getenv. It is
@@ -743,6 +496,9 @@ jobs:
               | tee "$RUNNER_TEMP/bench-raw.txt"
           fi
 
+      # Not optional: github-action-benchmark does no aggregation and resolves
+      # its baseline by first match on name, so raw -count=10 output would
+      # compare one arbitrary sample against another ten times over.
       - name: Reduce to medians
         run: |
           set -euo pipefail
@@ -811,7 +567,7 @@ jobs:
       # v1.22.1 dist: gh-repository mode is clone + plain checkout, which fails
       # on a branch that does not exist). Create the empty orphan branch once;
       # every later run sees it and this becomes a no-op. Same bot identity the
-      # fleet's publish-badge composite uses for its orphan `badges` branch.
+      # publish-badge composite uses for its orphan `badges` branch.
       - name: Ensure benchmarks branch exists
         env:
           REPO: ${{ matrix.repo }}
@@ -834,8 +590,9 @@ jobs:
           rm -rf "$tmp"
           echo "created empty benchmarks branch in ${REPO}"
 
-      # Publishes the median series to the consumer's orphan `benchmarks` branch
-      # and comments on a regression beyond the threshold. Report-only:
+      # Publishes the median series to the consumer's orphan `benchmarks` branch,
+      # never `badges`: publish-badge.sh rebuilds that from root *.json and
+      # force-pushes, which would delete the series. Report-only:
       # fail-on-alert stays false, because a wall-clock regression on a shared
       # runner is evidence to investigate, not proof the code got slower.
       - name: Publish + compare

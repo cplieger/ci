@@ -43,7 +43,7 @@ path is always the plain `REPO`).
    element under any stylesheet built on Tailwind Preflight, which sets
    `img { display: block }`, so an unlinked badge takes its own line and the
    surrounding prose margin no matter what the Markdown source looks like.
-   Unraid's Community Applications is the fleet's live instance: its README
+   Unraid's Community Applications is a live instance. Its README
    container restores inline flow for an image inside a link
    (`[&_a_img]:inline-block`, `[&_a_img]:my-0`) and does nothing for a bare one.
    Measured 2026-09-20 on the seadex-scout listing, whose row carried two bare

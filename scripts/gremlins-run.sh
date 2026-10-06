@@ -1,23 +1,11 @@
 #!/usr/bin/env bash
 # One module's gremlins run, executed INSIDE the memory-capped container that
-# .github/workflows/weekly-gremlins.yaml starts (see that workflow for why the
-# container exists at all: a mutant can turn a bounded loop into an unbounded
-# allocation, and the container cgroup is what keeps the OOM-killer away from
-# the runner agent).
-#
-# It lives in a file rather than inline in the workflow so shellcheck lints it —
-# the concurrency probe below has real control flow (background jobs, exit-code
-# triage), and an error in it would first surface at 22:00 on a Sunday, across
-# every Go repo in the fleet.
-#
-# Working directory: the module root (the workflow sets -w). Inputs, all env:
-#   GREMLINS_VERSION  release tag to build, e.g. v0.6.0
-#   GREMLINS_PATCH    absolute path of scripts/gremlins-pkgname.patch
-#   WORKERS_MAX       worker ceiling derived from the container memory cap
-#   GOMEM_MAX_MB      GOMEMLIMIT for WORKERS_MAX workers
-#   GOMEM_SOLO_MB     GOMEMLIMIT when the probe forces one worker
-#   PROBE_TIMEOUT     seconds per probe phase
-#   OUT               absolute path for gremlins' JSON result
+# .github/workflows/weekly-gremlins.yaml starts. Runs from the module root.
+# Inputs, all env: GREMLINS_VERSION (release tag to build), GREMLINS_PATCH
+# (absolute path of scripts/gremlins-pkgname.patch), WORKERS_MAX (worker
+# ceiling from the memory cap), GOMEM_MAX_MB and GOMEM_SOLO_MB (GOMEMLIMIT for
+# WORKERS_MAX workers and for one forced worker), PROBE_TIMEOUT (seconds per
+# probe phase), OUT (absolute path for gremlins' JSON result).
 set -euo pipefail
 
 # The clone is bind-mounted from the runner and owned by the runner uid, while

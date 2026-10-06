@@ -101,23 +101,13 @@ jobs:
           # otherwise-advisory job (which is exactly what happened).
           cache-from: type=gha
 
-      # All Trivy scans here are ADVISORY (exit-code 0): they upload SARIF to
-      # the Security tab but never fail the
-      # check or block a merge. CVEs in the base image are frequently outside
-      # the maintainer's immediate control (no upstream fix yet, or not yet
-      # picked up), so gating merges/releases on them is the wrong lever.
-      # Build-ability — the only thing fully in our control — is gated by the
-      # required `ci / validate` check (the `docker` job in the meta ci.yaml),
-      # not here.
-      # `secret` is deliberately ABSENT here: gitleaks already runs `dir .` over
-      # this same checkout as a required gate, and Trivy skips markdown by
-      # default, so its fs secret pass saw strictly less of the tree while
-      # publishing a duplicate alert stream to the same Security tab. The
-      # IMAGE scan below keeps secrets (see its comment) — that layer is the
-      # only one that looks inside a built image, which gitleaks never can.
-      # `license` is new and advisory: nothing else in the pipeline checks
-      # whether a transitive dependency's licence is compatible with the
-      # consuming repo's own (per-repo since 2026-08; see licensing.md).
+      # All Trivy scans here are ADVISORY (exit-code 0): base-image CVEs are often
+      # outside the maintainer's control, and build-ability is gated by the
+      # required `ci / validate` check instead. `secret` is ABSENT: gitleaks runs
+      # `dir .` over this checkout as a required gate and Trivy skips markdown,
+      # so its fs pass saw less while duplicating alerts (the IMAGE scan below
+      # keeps secrets). `license` is advisory: nothing else checks whether a
+      # transitive dependency's licence is compatible with the consuming repo's.
       - name: Trivy filesystem scan (advisory)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:

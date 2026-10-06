@@ -140,30 +140,13 @@ jobs:
         id: modules
         run: |
           set -euo pipefail
-          # `gremlins unleash .` measures exactly ONE module: it gathers coverage
-          # with `go test -cover ./...` at the module root, then strips the module
-          # path off each coverage line to key blocks by repo-relative filename
-          # (gremlins internal/coverage: removeModuleFromPath). A NESTED module's
-          # packages carry a different module path AND cannot be run by a root
-          # `go test ./...` at all, so gremlins still ANALYSES their files (it
-          # walks the tree) but every mutant there comes back NOT COVERED
-          # regardless of that module's own suite. Measured on envx: `yamlenv`
-          # (own go.mod, own suite at 98.6% coverage) contributed 43 analysed /
-          # 43 uncovered / 0 killed / 0 lived, which is what made 41.4% the
-          # fleet's lowest mutant coverage — a module boundary, not a test suite.
-          #
-          # So run gremlins once per module and merge the results (see the run
-          # step). Cost: one extra gremlins pass per nested module, sequential
-          # inside the 350-minute job budget. Nested modules are rare and small
-          # in this fleet; a repo that grows a large one is the case to watch.
-          #
-          # Eligibility mirrors ci.yaml's detect step (VALIDATION semantics, not
-          # release-lane semantics): prune vendored/generated trees, require
-          # tracked .go files, and keep internal/ and dotless-path modules —
-          # they compile and test like any module, they are only excluded from
-          # release LANES. A sentinel go.mod with no Go source (web-terminal
-          # -engine's `module web-ignore`) has nothing to mutate and drops out on
-          # the tracked-.go-files filter. Keep in sync with ci.yaml's detect step.
+          # `gremlins unleash .` measures exactly ONE module: coverage comes
+          # from a root `go test -cover ./...`, which cannot reach a NESTED
+          # module, so every mutant there would read NOT COVERED. Run once per
+          # module and merge the results (see the run step). Eligibility mirrors
+          # ci.yaml's detect step (validation, not release-lane semantics):
+          # prune vendored/generated trees, require tracked .go files, keep
+          # internal/ and dotless-path modules. Keep the two in sync.
           MODULES="."
           while IFS= read -r f; do
             [ -z "$f" ] && continue

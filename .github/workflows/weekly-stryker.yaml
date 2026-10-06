@@ -138,7 +138,7 @@ jobs:
     if: ${{ needs.fanout.outputs.matrix != '[]' }}
     strategy:
       fail-fast: false
-      max-parallel: 3   # CPU-heavy; small fleet today — leaves the budget free
+      max-parallel: 3   # CPU-heavy; few enrolled repos today — leaves the budget free
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
     runs-on: ubuntu-26.04
@@ -218,20 +218,13 @@ jobs:
             exit 0
           fi
 
-          # Vitest Browser Mode needs a real Chromium, and the fleet migrated
-          # its DOM suites to it on 2026-08-23 — which is the last time this
-          # workflow was green. Presence of the `@vitest/browser-playwright`
-          # devDependency is the enrolment marker (same shape as ts-ci.yaml),
-          # driven through the repo's OWN pinned `playwright`
-          # CLI (`--no-install`) so the browser build number it downloads is the
-          # one the library looks for. NOT `--with-deps`: ubuntu-24.04 already
-          # carries every shared library Chromium links, and that apt
-          # transaction is an unbounded-latency fetch on the critical path.
-          #
-          # Placed after the enrollment gate on purpose — a dir that skips
-          # stryker runs no tests, so it needs no browser. It is setup rather
-          # than a check, so a failed install fails the job here instead of
-          # surfacing as a stryker dry-run error against the wrong name.
+          # Vitest Browser Mode needs a real Chromium, enrolled by the
+          # `@vitest/browser-playwright` devDependency (same marker as
+          # ts-ci.yaml) and installed through the repo's OWN pinned `playwright`
+          # CLI so the build number matches. NOT `--with-deps`: ubuntu-24.04
+          # already carries Chromium's shared libraries. After the enrolment
+          # gate, because a skipped dir runs no tests; a failed install fails
+          # here rather than as a misleading stryker dry-run error.
           if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
             if ! npx --no-install playwright install chromium; then
               echo "::error::${ENTRY}: playwright chromium install failed"
@@ -309,32 +302,14 @@ jobs:
           " "$report")
           read -r score detected valid <<< "$metrics"
 
-          # A run that killed NOTHING measured nothing, so it is a defect rather
-          # than a score. Refuse before publishing: a real suite kills some of
-          # its mutants, so 0 detected against thousands of valid ones means the
-          # harness never activated a mutant — and only marotte sets
-          # `thresholds.break`, so everywhere else that sails through as a green
-          # run, a red 0.0% badge and a `mutation-regression` label on the
-          # tracker. Measured 2026-09-13 across 7 repos the moment the browser
-          # install let the dry run through: Killed=0 on every one of them,
-          # against real baselines of 74-100%, with `NoCoverage` in the tens —
-          # so coverage collection worked and only detection was dead.
-          #
-          # ROOT CAUSE, found 2026-09-13 after this guard landed: the runner
-          # runs ZERO tests per mutant under vitest 5, so every mutant survives
-          # trivially. Same repo, same file, same command, only vitest differing
-          # — 4.1.11 killed 33 of 36 (91.67%, 1.00 tests per mutant), 5.0.0
-          # killed 0 of 36 (0.00%, 0.00 tests per mutant). It is NOT browser
-          # specific: keyenc's node-mode suite scores 0.0% too. The fleet took
-          # vitest 5 on 2026-09-06 (a `chore(devdeps)` bump), and
-          # `@stryker-mutator/vitest-runner@10.0.0` — still the newest — declares
-          # `vitest: ">=2.0.0"`, so npm accepted it with no warning. The stopgap
-          # above patches that separator, so a 0-detected run now means EITHER the
-          # stopgap silently did nothing (read its output first) or a second cause
-          # exists; do not read it as the same known defect.
-          #
-          # Guarded on `valid > 0` so a package that legitimately produces no
-          # mutants still reports 0.0% rather than failing.
+          # A run that killed NOTHING measured nothing: 0 detected against valid
+          # mutants means the harness never activated one, and without
+          # `thresholds.break` that would publish as a green run. Known cause:
+          # @stryker-mutator/vitest-runner 10 runs ZERO tests per mutant under
+          # vitest 5, and its `vitest: ">=2.0.0"` range accepts it silently. The
+          # stopgap above patches that, so a 0 here means the stopgap did
+          # nothing (read its output first) or a second cause exists. Guarded on
+          # `valid > 0` so a package with no mutants still reports 0.0%.
           if [ "${detected}" = "0" ] && [ "${valid}" -gt 0 ]; then
             echo "${ENTRY}: no mutant was detected, so the harness never activated one." \
               "vitest 5 + @stryker-mutator/vitest-runner 10 runs 0 tests per mutant; see this step's comment."

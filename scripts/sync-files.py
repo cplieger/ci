@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """In-house file-sync engine: push canonical files into consumer repos as PRs.
 
-Replaces BetaHuhn/repo-file-sync-action (unmaintained since 2024, and it held
-a fleet-wide write PAT — a supply-chain surface this first-party script
-removes). Feature scope is deliberately the subset the fleet used:
+First-party, so no third-party code holds the org-wide write PAT. Feature
+scope is deliberately the subset the cplieger repos need:
 
   * read the runtime manifest classify-repos.py generates (.github/sync.yml)
   * per target repo: shallow-clone, branch `repo-sync/ci/default` off the
@@ -16,14 +15,13 @@ removes). Feature scope is deliberately the subset the fleet used:
   * failure isolation: one repo failing never aborts the rest; the run exits
     non-zero at the end if anything failed
 
-NOT supported on purpose (the action offered these; the fleet never used
-them): templating, per-group commit messages, and orphan-file DELETION —
+NOT supported on purpose (no cplieger repo needs them): templating,
+per-group commit messages, and orphan-file DELETION —
 syncing only ever adds or updates files.
 
-Contract stability: the branch name, commit subject, PR title, and label all
-match what the action produced, so consumer history stays uniform and
-sync.yaml's separate auto-merge sweep (`gh pr list --head repo-sync/ci/default`)
-keeps working unchanged.
+Contract stability: the branch name, commit subject, PR title and label are
+fixed, so consumer history stays uniform and sync.yaml's separate auto-merge
+sweep (`gh pr list --head repo-sync/ci/default`) keeps working.
 
 Auth: uses the ambient `gh` credentials (GH_TOKEN / SYNC_PAT in CI). Git push
 authenticates through gh's credential helper wired repo-locally on each clone
