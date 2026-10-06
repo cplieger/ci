@@ -559,6 +559,24 @@ jobs:
         continue-on-error: true
         uses: cplieger/ci/actions/notice-audit@56c1cae76a0e258785beef4cbc5d8b31d08899de # v2
 
+      # The dashboard check comes from this workflow's own commit: a local `./`
+      # action resolves when its step starts, so it ships with the workflow and
+      # needs no pin of its own.
+      - name: Check out the dashboard check
+        if: ${{ hashFiles('grafana-dashboard.json') != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+          sparse-checkout: actions/dashboard-check
+
+      - name: Dashboard check
+        if: ${{ hashFiles('grafana-dashboard.json') != '' }}
+        continue-on-error: true
+        uses: ./.cplieger-ci/actions/dashboard-check
+
       - name: Check results
         if: always()
         run: |
@@ -912,6 +930,23 @@ jobs:
               echo "no license-collector probe in this repo - skipping"
             fi
           ) || { echo "Probe license collector" >> /tmp/_ci_failures; exit 1; }
+
+      # actions/dashboard-check runs only in repos that ship a dashboard, which
+      # this one does not, so its rules and its CUE vet are exercised here.
+      - name: Probe dashboard check
+        continue-on-error: true
+        run: |
+          (
+            if [ -f scripts/test_dashboard_check.py ]; then
+              bash actions/dashboard-check/install.sh "$RUNNER_TEMP/dashboard-check" \
+                && DASHBOARD_CHECK_CUE="$RUNNER_TEMP/dashboard-check/cue" \
+                  DASHBOARD_CHECK_SCHEMAS="$RUNNER_TEMP/dashboard-check" \
+                  python3 -m unittest -v scripts.test_dashboard_check scripts.test_dashboard_check_cli \
+                    scripts.test_dashboard_publish_gate scripts.test_ci_local
+            else
+              echo "no dashboard-check probe in this repo - skipping"
+            fi
+          ) || { echo "Probe dashboard check" >> /tmp/_ci_failures; exit 1; }
 
       - name: Check results
         if: always()

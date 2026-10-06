@@ -12,10 +12,15 @@ extend = "configs/ruff.toml"
 # ignores: this file only exists here, so they don't belong in the synced
 # canonical config.
 "_ci_local.py" = ["PLW0603", "FBT003", "RUF001"]
-# The one importable module in scripts/ (the aggregators and links-body.py
-# import it). Its siblings escape INP001 through their shebang; a library
-# module has none, and scripts/ is not a package.
+# The importable modules in scripts/: trackerlib (the aggregators and
+# links-body.py import it) and dashboard_check_fixtures (the dashboard-check
+# tests import it). Their siblings escape INP001 through their shebang; a
+# library module has none, and scripts/ is not a package.
 "scripts/trackerlib.py" = ["INP001"]
-# scripts/test-*.py run under the stdlib unittest runner (no pytest here);
-# flake8-pytest-style reads its assertion methods as pytest misuse.
+"scripts/dashboard_check_fixtures.py" = ["INP001"]
+# scripts/test-*.py and scripts/test_*.py run under the stdlib unittest runner
+# (no pytest here); flake8-pytest-style reads its assertion methods as pytest
+# misuse. The test_*.py modules are imported by `python3 -m unittest`, carry no
+# shebang, and scripts/ is not a package (INP001).
 "scripts/test-*.py" = ["PT"]
+"scripts/test_*.py" = ["PT", "INP001"]
