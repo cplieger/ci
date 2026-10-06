@@ -1282,17 +1282,32 @@ jobs:
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/sigstore-retry.sh"
-          # Consumers re-import by uid, so a file without a string uid is not a
-          # dashboard this pipeline may publish.
-          jq -e '.uid | strings | length > 0' grafana-dashboard.json >/dev/null \
-            || { echo "::error::grafana-dashboard.json is not a dashboard with a string uid"; exit 1; }
+          # Consumers re-import by identity: a classic dashboard's uid, a schema
+          # v2 resource's metadata.name. A file with neither is not published.
+          format=$(jq -r '
+            if type != "object" then "none"
+            elif (has("apiVersion") | not) and (.uid | type) == "string" and (.uid | length) > 0 then "v1"
+            elif (keys == ["apiVersion", "kind", "metadata", "spec"])
+              and .apiVersion == "dashboard.grafana.app/v2" and .kind == "Dashboard"
+              and (.metadata | type) == "object" and (.metadata | keys) == ["name"]
+              and (.metadata.name | type) == "string" and (.metadata.name | length) > 0
+              and (.spec | type) == "object" then "v2"
+            else "none" end' grafana-dashboard.json) || format=none
+          if [ "$format" = none ]; then
+            msg="grafana-dashboard.json is neither a classic dashboard (a string uid, no apiVersion)"
+            msg="$msg nor a schema v2 resource (exactly apiVersion dashboard.grafana.app/v2, kind Dashboard,"
+            msg="$msg a metadata holding only a name, and a spec object)"
+            echo "::error file=grafana-dashboard.json::$msg"
+            exit 1
+          fi
+          artifact_type="application/vnd.grafana.dashboard.${format}+json"
           # oras-go stamps org.opencontainers.image.created=now unless the caller sets
           # it, so without a fixed value every push (a finalize rerun included) mints a
           # new manifest digest and moves both tags off the signed one. The commit
           # time makes the manifest a pure function of its inputs.
           created=$(git show -s --format=%cI "$GITHUB_SHA")
           oras push --export-manifest "$RUNNER_TEMP/dashboard-manifest.json" \
-            --artifact-type application/vnd.grafana.dashboard.v1+json \
+            --artifact-type "$artifact_type" \
             --annotation "org.opencontainers.image.created=${created}" \
             --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
@@ -1306,6 +1321,8 @@ jobs:
             echo "## Grafana dashboard"
             echo ""
             echo "OCI artifact \`${DASHBOARD_REF}:${VERSION}\` (also \`:${MAJOR}\`), digest \`${digest}\`, cosign-signed (keyless)."
+            echo ""
+            echo "Artifact type \`${artifact_type}\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate release notes

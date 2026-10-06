@@ -1,0 +1,7 @@
+# actionlint v1.7.12 does not know the documented job.workflow_repository and
+# job.workflow_sha context properties (rhysd/actionlint#707). Delete this file
+# with the actionlint pin bump that includes that fix.
+paths:
+  .github/workflows/ci.yaml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined in object type \{check_run_id: number;'

@@ -114,6 +114,9 @@ REPO_AUDIT_ACTIONS = {
     'actions/notice-audit': ('notice-audit.py', 'NOTICE audit'),
 }
 
+DASHBOARD_CHECK_ACTION = 'actions/dashboard-check'
+DASHBOARD_CHECK_TOOLS = Path.home() / '.cache' / 'cplieger-ci' / 'dashboard-check'
+
 # Step name patterns indicating CI-only setup. Skipped locally.
 INSTALL_NAME_PATTERNS = [
     r'^install\b',
@@ -973,6 +976,28 @@ def _truthy_action_input(value):
     return str(value).strip().lower() in ('1', 'true', 'yes')
 
 
+def dashboard_check_command(step, name):
+    """Runs with no base copy: a local run has no pull request base to fetch."""
+    script = _ci_repo_root(Path.cwd()) / DASHBOARD_CHECK_ACTION / 'check.sh'
+    if not script.is_file():
+        return (
+            'NOLOCAL',
+            name,
+            'actions/dashboard-check/check.sh not found in the sibling ci/ checkout',
+        )
+    path = str((step.get('with') or {}).get('path') or 'grafana-dashboard.json')
+    command = (
+        f'DASHBOARD_PATH={shlex.quote(path)} BASE_REF= TOKEN= '
+        f'DASHBOARD_CHECK_TOOLS={shlex.quote(str(DASHBOARD_CHECK_TOOLS))} '
+        f'bash {shlex.quote(str(script))}'
+    )
+    return (
+        'LOCAL',
+        name,
+        f'( {command} ) || {{ echo "Dashboard check" >> /tmp/_ci_failures; exit 1; }}',
+    )
+
+
 def trivy_action_command(step):
     """Translate the active trivy-action inputs to the equivalent CLI scan.
 
@@ -1034,7 +1059,11 @@ def classify_step(step):
             # as package-dir), and ci-local already runs the step in it. Passing
             # the flag as well resolved static-src/static-src.
             return 'LOCAL', name, f'python3 {shlex.quote(str(script))} --github'
-        action_dir = action_ref.removeprefix('./').removeprefix('cplieger/ci/')
+        action_dir = (
+            action_ref.removeprefix('./').removeprefix('.cplieger-ci/').removeprefix('cplieger/ci/')
+        )
+        if action_dir == DASHBOARD_CHECK_ACTION:
+            return dashboard_check_command(step, name)
         if action_dir in REPO_AUDIT_ACTIONS:
             script_name, label = REPO_AUDIT_ACTIONS[action_dir]
             script = _ci_repo_root(Path.cwd()) / action_dir / script_name

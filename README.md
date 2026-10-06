@@ -18,7 +18,7 @@ duplicate copies.
 | `.github/workflows/ts-ci.yaml` | TS checks: eslint, tsc typecheck, vitest, prettier, knip, version parity, import-map coverage (+ optional `web-lint` for CSS/HTML) |
 | `.github/workflows/shell-ci.yaml` | Shell/Docker checks: actionlint, shellcheck, shfmt, hadolint, gitleaks |
 | `.github/workflows/release.yaml` | Auto-detects release type (Docker / TS / Go), computes the git-cliff version, publishes (npm + JSR via OIDC), tags + GitHub Release |
-| `.github/workflows/docker-release.yaml` | Multi-arch image build on native runners, Trivy scan, SBOM, cosign signing, dashboard release assets and OCI artifact (repos with a root `grafana-dashboard.json`), release notes (called by `release.yaml`) |
+| `.github/workflows/docker-release.yaml` | Multi-arch image build on native runners, Trivy scan, SBOM, cosign signing, dashboard release assets and OCI artifact (repos with a root `grafana-dashboard.json`), release notes (called by `release.yaml`). The dashboard artifact type ends in `dashboard.v1+json` for a classic file and `dashboard.v2+json` for schema v2 |
 | `.github/workflows/codeql.yaml` | CodeQL with language auto-detect (public repos) |
 | `.github/workflows/security-scan.yaml` | Trivy repo/config/image scans, advisory only; findings report to the Security tab, never block |
 
@@ -99,6 +99,7 @@ per-repo, not synced, because it carries per-repo URLs.
   `badges` branch, preserving sibling badge files. Used by
   `docker-release.yaml` (image size) and `weekly-gremlins.yaml` (mutation
   score).
+- `actions/dashboard-check`: checks a Grafana dashboard file. The meta `ci.yaml` runs it in every repo with a root `grafana-dashboard.json`. A `dashboard.grafana.app/v2` resource is vetted against Grafana 13.2's dashboard schema, fetched at a pinned commit and checksum. Its checks against the dashboard standard cover element references, a titled row for every panel, datasource variables, descriptions, no-value text, thresholds and plain wording. A classic dashboard passes with a notice, unless the base revision already holds a schema v2 copy.
 
 ## Local tooling
 
