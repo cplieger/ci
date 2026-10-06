@@ -1,67 +1,10 @@
 #!/usr/bin/env python3
-"""Aggregate weekly gremlins runs into the per-repo tracker issue body.
+"""Render a repo's weekly gremlins attempts into its tracker issue body.
 
-Inputs:
-    repo:           e.g. "atomicfile" (without owner)
-    artifacts_dir:  directory containing per-attempt subdirs like
-                    gremlins-<repo>-1/, gremlins-<repo>-2/, gremlins-<repo>-3/
-                    each holding gremlins-out.json (full mutant list).
-    week_ending:    YYYY-MM-DD
-    run_url:        URL of the current workflow run (for "see full report" link)
-    existing_body:  current issue body (or empty if creating fresh)
-
-Outputs:
-    Stdout:  the new issue body (markdown).
-    Stderr:  diagnostic lines.
-
-Body format:
-
-    # Gremlins mutation testing tracker
-
-    Auto-updated by [weekly-gremlins.yaml](...). Last update: 2026-06-08 14:30.
-
-    **This week**: 78.4% efficacy (±2.1% across 3 runs), 92.3% mutant coverage.
-    **Trend**: ↗ +1.2% from 12-week mean (77.2%).
-
-    ## Rolling 12-week history
-    <!-- gremlins-data -->
-    | Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |
-    |---|---|---|---|---|---|
-    | 2026-06-08 14:30 | 78.4% | ±2.1% | 92.3% | 47 | +1.2% |
-    | ... 11 more |
-    <!-- /gremlins-data -->
-
-    ## Current live mutants (47, this week)
-    <!-- live-mutants -->
-    <details>
-    <summary>Confirmed live (LIVED in all 3 runs) — 41</summary>
-
-    ### internal/auth/argon.go
-    - L42 — CONDITIONALS_BOUNDARY: `>` → `>=`
-    - L67 — ARITHMETIC_BASE: `+` → `-`
-
-    ...
-
-    </details>
-
-    <details>
-    <summary>Flaky (LIVED in some runs, KILLED in others) — 6</summary>
-    ...
-    </details>
-
-    Full report: [run artifacts](RUN_URL#artifacts).
-    <!-- /live-mutants -->
-
-    ## How to read
-    ...
-
-    ## Free-form notes
-    ...
-
-The `<!-- gremlins-data -->` and `<!-- live-mutants -->` sentinel blocks are
-the only parts replaced; anything outside is preserved across updates so users
-can add notes without conflict. The sentinel, history and notes mechanics are
-trackerlib's; this script renders the gremlins-specific prose around them.
+Reads each attempt's gremlins-out.json under --artifacts-dir and prints the new
+body on stdout, diagnostics on stderr. Only the `<!-- gremlins-data -->` and
+`<!-- live-mutants -->` sentinel blocks are replaced, so notes outside them
+survive; the sentinel and history mechanics are trackerlib's.
 """
 from __future__ import annotations
 
@@ -189,6 +132,8 @@ def load_run(path: Path):
         "not_covered": int(data.get("mutants_not_covered") or 0),
         "not_viable": int(data.get("mutants_not_viable") or 0),
         "total": int(data.get("mutants_total") or 0),
+        # gremlins-merge.py's attempt mode; absent reads as per-package.
+        "mode": data.get("mode") or "per-package",
     }
     return muts, summary
 
@@ -226,6 +171,7 @@ def aggregate(attempt_files: list[Path]) -> dict:
             "live_buckets": {},
             "live_count": 0,
             "n_runs": 0,
+            "mode": "per-package",
         }
 
     # Per-run figures come straight from gremlins' own top-level fields, so the
@@ -275,6 +221,7 @@ def aggregate(attempt_files: list[Path]) -> dict:
             live_buckets[lived_count].append(entry["detail"])
 
     total_live = sum(len(v) for v in live_buckets.values())
+    modes = {s["mode"] for s in summaries}
 
     return {
         "attempts": len(runs),
@@ -285,6 +232,7 @@ def aggregate(attempt_files: list[Path]) -> dict:
         "live_buckets": live_buckets,    # {lived_count: [mutant detail, ...]}
         "live_count": total_live,
         "n_runs": n_runs,
+        "mode": modes.pop() if len(modes) == 1 else "mixed",
     }
 
 
@@ -299,8 +247,8 @@ Last update: {week_ending}
 ## Rolling 12-week history
 """
 
-HISTORY_HEADER = """| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |
-|---|---|---|---|---|---|"""
+HISTORY_HEADER = """| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy | Mode |
+|---|---|---|---|---|---|---|"""
 
 LIVE_BLOCK_TPL = """## Current live mutants{header_suffix}
 <!-- live-mutants -->
@@ -317,9 +265,14 @@ LIVE_DETAILS_TPL = """<details>
 
 LEGEND = """## How to read
 
-- **Mean efficacy**: % of runnable mutants killed (or timed-out, treated as caught), averaged across the N runs
+- **Mean efficacy**: % of KILLED over KILLED + LIVED mutants, averaged across the N runs; TIMED OUT mutants count in neither
 - **Stddev**: variance across runs — high stddev (>3%) signals flaky tests
 - **Mutant coverage**: % of mutants reached by the test suite (test depth)
+- **Mode**: `per-package` runs each mutant against its own package's tests;
+  `integration` runs the whole module's suite with coverage credited across
+  packages, and is chosen each run when its measured cost fits a quarter of the
+  job's time cap. A row marked as switched starts a new baseline, so its score
+  jump is expected.
 
 The "Current live mutants" section is bucketed by **how many of the N runs the
 mutant LIVED in** (N = attempts that week, normally 3):
@@ -335,7 +288,7 @@ mutant LIVED in** (N = attempts that week, normally 3):
   test or strengthen an existing assertion.
 
 The `mutation-regression` label is added when this week's mean efficacy drops
->5% below the rolling 12-week mean.
+>5% below the rolling 12-week mean of the weeks run in the same mode.
 
 A ⚠️ line under "This week" means the number describes the measurement, not the
 suite: either the attempts disagreed about which mutants survive (one verdict per
@@ -437,35 +390,34 @@ def render_bucketed_live_mutants(buckets: dict[int, list[dict]], n_runs: int, ca
     return "\n".join(parts), overflow_total
 
 
-def measurement_cautions(agg: dict, prev_live_count: int | None) -> list[str]:
+def row_mode(cells: list[str]) -> str:
+    """A history row's mode; a row without a Mode cell reads as per-package.
+
+    Such a row may carry its run marker at cells[6] instead.
+    """
+    if len(cells) > 6 and not cells[6].startswith("<!--"):
+        return cells[6].split()[0]
+    return "per-package"
+
+
+def measurement_cautions(
+    agg: dict, prev_live_count: int | None, switched_from: str | None = None
+) -> list[str]:
     """Lines warning that this week's number measures the harness, not the suite.
 
-    Equivalent mutants — semantically-no-op mutations that no test can catch —
-    are a permanent noise floor on every repo, so a suite CANNOT reach a
-    reproducible 100%. Two shapes therefore mean "measurement failure", and both
-    are computable from data already in hand rather than needing a new alerting
-    path:
-
-    1. The attempts disagree about which mutants survive. A mutant reported
-       LIVED in one run and KILLED in another has one verdict that is false. It
-       can be a flaky test, and it can equally be cross-worker interference:
-       gremlins workers each get their own copy of the module tree but share the
-       container's /tmp, so a test bound to a fixed absolute path can delete a
-       marker another worker is polling for. Measured on
-       docker-rsync-scheduler: three provably equivalent live mutants, three
-       attempts, a DIFFERENT single survivor each time — six of nine verdicts
-       false.
-    2. A flawless week straight after a week with live mutants. Same repo's
-       2026-07-20 / 07-27 / 08-10 weeks each published 100.0% while its three
-       equivalent mutants were still there; the perfect score was the defect
-       hiding itself.
-
-    prev_live_count is last week's live-mutant count, or None when the newest
-    history row does not state a readable one. None is not zero: it means shape
-    2 cannot be graded, so that caution stays silent rather than naming a week
-    it did not measure.
+    Equivalent mutants make a reproducible 100% impossible, so two shapes are
+    measurement failures: attempts disagreeing about which mutants survive, and a
+    flawless week right after one with live mutants. prev_live_count is None when
+    last week's count is unreadable, which silences the second shape;
+    switched_from, last week's mode when it differs, replaces it with a note.
     """
     lines = []
+    if switched_from:
+        lines.append(
+            f"> 🔀 **Mode switched from {switched_from} to {agg['mode']}.** The mutants run and "
+            "the tests they run against changed, so a score jump this week is expected. The trend "
+            "and the `mutation-regression` label compare only weeks run in the same mode."
+        )
     n = agg["n_runs"]
     unstable = sum(len(v) for k, v in (agg["live_buckets"] or {}).items() if 0 < k < n)
     if n > 1 and unstable:
@@ -484,6 +436,7 @@ def measurement_cautions(agg: dict, prev_live_count: int | None) -> list[str]:
         and agg["live_count"] == 0
         and prev_live_count is not None
         and prev_live_count > 0
+        and not switched_from
     ):
         lines.append(
             f"> ⚠️ **A jump to 100% efficacy.** Last week reported {prev_live_count} live "
@@ -502,13 +455,25 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
     live_count = agg["live_count"]
 
     new_row = f"| {week} | {eff_mean}% | ±{eff_stddev}% | {cov_mean}% | {live_count} |"
+    run_id = trackerlib.run_id_of(run_url)
+    history_rows = trackerlib.history_rows(existing, HISTORY_SENTINEL, run_id)
+    mode = agg["mode"]
+    prev_mode = row_mode(history_rows[0]) if history_rows else mode
+    switched_from = prev_mode if prev_mode != mode else None
+    mode_cell = mode if switched_from is None else (
+        f"{mode} (switched from {switched_from}; score jump expected)"
+    )
     history_block = trackerlib.update_history_block(
-        existing, HISTORY_SENTINEL, HISTORY_HEADER, new_row, trackerlib.run_id_of(run_url)
+        existing, HISTORY_SENTINEL, HISTORY_HEADER, new_row, run_id, after_delta=mode_cell
     )
 
-    # Mean efficacy (column 2) feeds the trend marker, which takes a mean over
-    # the window. Order does not matter there, so an unreadable row drops out.
-    history_means = trackerlib.history_column(existing, HISTORY_SENTINEL, 1)
+    # Only same-mode rows feed the trend and regression mean: another mode runs
+    # other mutants against other tests, so a switch would read as a regression.
+    history_means = [
+        value
+        for cells in history_rows
+        if row_mode(cells) == mode and (value := trackerlib.percent_cell(cells, 1)) is not None
+    ]
 
     # Live-mutant count (column 5) feeds the jump-to-100% caution, which names
     # LAST week. That one IS positional: rows are newest-first
@@ -516,7 +481,6 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
     # unknown. Collecting the counts into a list and reading [0] instead would
     # make an older week's number read as last week's every time the newest
     # row's cell failed to parse.
-    history_rows = trackerlib.history_rows(existing, HISTORY_SENTINEL)
     prev_live_count = None
     if history_rows and len(history_rows[0]) >= 5:
         try:
@@ -530,7 +494,7 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
             prev_live_count = None
 
     trend_line = trackerlib.trend_marker(eff_mean, history_means)
-    cautions = measurement_cautions(agg, prev_live_count)
+    cautions = measurement_cautions(agg, prev_live_count, switched_from)
     caution_lines = ("\n" + "\n".join(cautions) + "\n") if cautions else "\n"
 
     live_block_inner, overflow = render_bucketed_live_mutants(
@@ -621,7 +585,7 @@ def main() -> int:
     agg = aggregate(attempt_files)
     print(f"[{args.repo}] efficacy={agg['efficacy_mean']}±{agg['efficacy_stddev']} "
           f"cov={agg['mutant_coverage_mean']} live={agg['live_count']} "
-          f"attempts={agg['attempts']} "
+          f"attempts={agg['attempts']} mode={agg['mode']} "
           f"buckets={ {k: len(v) for k, v in agg['live_buckets'].items()} }",
           file=sys.stderr)
 

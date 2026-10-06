@@ -9,9 +9,9 @@ Last update: 2026-09-14 22:30
 
 ## Rolling 12-week history
 <!-- gremlins-data -->
-| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |
-|---|---|---|---|---|---|
-| 2026-09-14 22:30 | 90.2% | ±0.9% | 88.9% | 15 | +1.2% | <!-- run:34900000001 -->
+| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy | Mode |
+|---|---|---|---|---|---|---|
+| 2026-09-14 22:30 | 90.2% | ±0.9% | 88.9% | 15 | +1.2% | per-package | <!-- run:34900000001 -->
 | 2026-09-07 08:51 | 89.0% | ±0.0% | 88.9% | 15 | -0.4% | <!-- run:34067440955 -->
 | 2026-08-31 07:56 | 89.4% | ±0.0% | 90.4% | 12 | -0.1% | <!-- run:33344173658 -->
 | 2026-08-24 05:00 | 89.5% | ±0.0% | 90.5% | 12 | +10.8% | <!-- run:32670569584 -->
@@ -75,9 +75,14 @@ Last update: 2026-09-14 22:30
 
 ## How to read
 
-- **Mean efficacy**: % of runnable mutants killed (or timed-out, treated as caught), averaged across the N runs
+- **Mean efficacy**: % of KILLED over KILLED + LIVED mutants, averaged across the N runs; TIMED OUT mutants count in neither
 - **Stddev**: variance across runs — high stddev (>3%) signals flaky tests
 - **Mutant coverage**: % of mutants reached by the test suite (test depth)
+- **Mode**: `per-package` runs each mutant against its own package's tests;
+  `integration` runs the whole module's suite with coverage credited across
+  packages, and is chosen each run when its measured cost fits a quarter of the
+  job's time cap. A row marked as switched starts a new baseline, so its score
+  jump is expected.
 
 The "Current live mutants" section is bucketed by **how many of the N runs the
 mutant LIVED in** (N = attempts that week, normally 3):
@@ -93,7 +98,7 @@ mutant LIVED in** (N = attempts that week, normally 3):
   test or strengthen an existing assertion.
 
 The `mutation-regression` label is added when this week's mean efficacy drops
->5% below the rolling 12-week mean.
+>5% below the rolling 12-week mean of the weeks run in the same mode.
 
 A ⚠️ line under "This week" means the number describes the measurement, not the
 suite: either the attempts disagreed about which mutants survive (one verdict per

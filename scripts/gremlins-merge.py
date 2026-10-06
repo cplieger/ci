@@ -98,6 +98,8 @@ DROPPABLE_STATUSES = {"NOT_COVERED", "SKIPPED"}
 # divergence is far larger than this.
 PCT_TOLERANCE = 0.01
 
+MODES = {"integration", "per-package"}
+
 
 def norm_status(status: str | None) -> str:
     """gremlins prints statuses with spaces ("NOT COVERED"); normalise to _."""
@@ -198,6 +200,17 @@ def load_module(dir_: str, path: Path) -> tuple[dict, bool]:
     return data, True
 
 
+def load_mode(path: Path) -> str:
+    """The mode scripts/gremlins-run.sh wrote beside a module's result; absent reads as per-package."""
+    mode_path = Path(f"{path}.mode")
+    if not mode_path.exists():
+        return "per-package"
+    mode = mode_path.read_text().strip()
+    if mode not in MODES:
+        raise SystemExit(f"{mode_path} names unknown mode {mode!r}")
+    return mode
+
+
 def deeper_dirs(dir_: str, all_dirs: list[str]) -> list[str]:
     """Module dirs strictly inside `dir_`, as module-relative prefixes.
 
@@ -266,13 +279,14 @@ def merge(modules: list[tuple[str, Path]]) -> dict:
             "mutants_not_viable": c["not_viable"],
             "mutants_timed_out": c["timed_out"],
             "dropped_nested_mutations": dropped,
+            "mode": load_mode(path),
         })
         merged_files += kept
         print(
             f"[{dir_}] module={data.get('go_module') or '?'} killed={c['killed']} lived={c['lived']} "
             f"not_covered={c['not_covered']} not_viable={c['not_viable']} timed_out={c['timed_out']} "
             f"efficacy={efficacy(c):.1f}% coverage={mutant_coverage(c):.1f}% "
-            f"dropped_nested={dropped}",
+            f"dropped_nested={dropped} mode={per_module[-1]['mode']}",
             file=sys.stderr,
         )
 
@@ -286,6 +300,7 @@ def merge(modules: list[tuple[str, Path]]) -> dict:
 
     tallied = counts_from_files(merged_files)
     c = tallied["counts"]
+    module_modes = {m["mode"] for m in per_module}
     return {
         "go_module": root_module_name,
         "test_efficacy": efficacy(c),
@@ -298,9 +313,9 @@ def merge(modules: list[tuple[str, Path]]) -> dict:
         "elapsed_time": 0.0,
         "mutator_statistics": tallied["stats"],
         "files": merged_files,
-        # Not part of gremlins' schema (readers ignore unknown keys): the
-        # per-module split, so the artifact says which module contributed what.
+        # Not part of gremlins' schema (readers ignore unknown keys).
         "modules": per_module,
+        "mode": module_modes.pop() if len(module_modes) == 1 else "mixed",
     }
 
 

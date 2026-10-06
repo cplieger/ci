@@ -1,18 +1,7 @@
-# Weekly mutation testing across all Go-having cplieger consumer repos.
-# Pattern C: this workflow owns the matrix and the max-parallel cap; runs
-# happen here (not via cross-repo workflow_dispatch) so we have one place
-# to (a) bound concurrency, (b) aggregate per-repo across N runs, and
-# (c) update the per-repo tracker issue body.
-#
-# Schedule:           Sundays 22:00 UTC (off-peak, finishes by ~02:00 Mon)
-# Concurrency cap:    6 jobs in parallel (account budget: 20; reserves >=4
-#                     for ad-hoc PR/sync/release work)
-# Runs per repo:      3 — averaged for trend stability + stddev measurement
-# Reporting:          Per-repo tracker issue, body updated with rolling
-#                     12-week table inside <!-- gremlins-data --> sentinels.
-#                     Free-form notes outside the sentinels are preserved.
-# Regression alert:   Adds 'mutation-regression' label to the tracker issue
-#                     when this week's mean drops >5% below the rolling mean.
+# Weekly mutation testing across all Go-having cplieger consumer repos. Runs
+# happen here rather than by cross-repo workflow_dispatch, so one place bounds
+# concurrency, aggregates each repo's attempts and updates its tracker issue;
+# scripts/gremlins-aggregate.py owns the tracker body and the regression label.
 name: Weekly gremlins
 
 on:
@@ -39,6 +28,10 @@ jobs:
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
+      # A job's timeout-minutes cannot read env
+      # (https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability);
+      # scripts/gremlins-run.sh sizes --integration against this same cap.
+      run_timeout_minutes: "350"
     steps:
       - name: Discover Go-having repos with non-trivial source
         id: fanout
@@ -108,7 +101,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 350
+    timeout-minutes: ${{ fromJSON(needs.fanout.outputs.run_timeout_minutes) }}
     permissions:
       contents: read
     env:
@@ -216,6 +209,7 @@ jobs:
       - name: Run gremlins (attempt ${{ matrix.attempt }})
         env:
           MODULES: ${{ steps.modules.outputs.modules }}
+          JOB_TIMEOUT_MINUTES: ${{ needs.fanout.outputs.run_timeout_minutes }}
         run: |
           set -uo pipefail
           # gremlins exits 0 on success regardless of efficacy (threshold=0); a
@@ -274,6 +268,7 @@ jobs:
               -e GOMEM_MAX_MB="${gomem_mb}" \
               -e GOMEM_SOLO_MB="${gomem_solo_mb}" \
               -e PROBE_TIMEOUT="${PROBE_TIMEOUT}" \
+              -e JOB_TIMEOUT_MINUTES="${JOB_TIMEOUT_MINUTES}" \
               -e OUT="/work/${m}/gremlins-out.json" \
               "${image}" bash /gremlins-run.sh || rc=$?
             echo "::endgroup::"

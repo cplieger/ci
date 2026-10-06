@@ -19,28 +19,10 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yaml
 
-  # The scripts that decide what mutation number a repo publishes weekly, none
-  # of which anything else executes until their own cron fires. The stryker
-  # aggregate script sat broken here for weeks for exactly that reason, so both
-  # probes run on every push and PR:
-  #   test-gremlins-scripts.py            gremlins-merge.py folds one gremlins
-  #                                       result per Go module into the single
-  #                                       per-attempt result the tracker/badge
-  #                                       assume; gremlins-aggregate.py turns
-  #                                       those into the issue body and badge.
-  #   test-patch-vitest-runner-separator  the vitest-5 separator stopgap, whose
-  #                                       value is entirely in refusing once
-  #                                       upstream ships the real fix.
-  #   test-stryker-aggregate.py           stryker-aggregate.py's artifact-layout
-  #                                       contract, which had no probe at all
-  #                                       until a single-entry run silently
-  #                                       skipped every tracker issue.
-  #   test-discover-artifact-repos.sh     the artifact discovery all three weekly
-  #                                       jobs now share, whose two failure
-  #                                       directions are a silent skip and a
-  #                                       falsely red weekly run.
-  # Not part of the `validate` check (that comes from the meta ci.yaml, which is
-  # consumer-facing); a failure here shows as a red check on the PR.
+  # Probes for the scripts behind each repo's weekly mutation number, which
+  # nothing else executes until their own cron fires. Not part of `validate`
+  # (that comes from the consumer-facing meta ci.yaml); a failure here shows as
+  # a red check on the PR.
   measurement-scripts:
     runs-on: ubuntu-26.04
     timeout-minutes: 5
