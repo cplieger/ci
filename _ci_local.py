@@ -114,6 +114,9 @@ REPO_AUDIT_ACTIONS = {
     'actions/notice-audit': ('notice-audit.py', 'NOTICE audit'),
 }
 
+DASHBOARD_CHECK_ACTION = 'actions/dashboard-check'
+DASHBOARD_CHECK_TOOLS = Path.home() / '.cache' / 'cplieger-ci' / 'dashboard-check'
+
 # Step name patterns indicating CI-only setup. Skipped locally.
 INSTALL_NAME_PATTERNS = [
     r'^install\b',
@@ -162,6 +165,7 @@ def gray(s):
 # needs so an agent reading the tail can see — without scrolling — what ran,
 # what did NOT run locally (and why), and exactly what to fix.
 
+
 # A real, fixable failure: a step that ran and exited non-zero.
 class Failure(NamedTuple):
     job: str
@@ -199,10 +203,10 @@ class RunReport:
         self.reset()
 
     def reset(self):
-        self.failures = []       # list[Failure] — ran and failed; fix these
+        self.failures = []  # list[Failure] — ran and failed; fix these
         self.not_validated = []  # list[(job, step, reason)] — CI checks NOT exercised locally
-        self.ran_jobs = []       # jobnames that executed >=1 real step locally
-        self.skipped_jobs = []   # list[(job, reason)] — gated off / no local steps
+        self.ran_jobs = []  # jobnames that executed >=1 real step locally
+        self.skipped_jobs = []  # list[(job, reason)] — gated off / no local steps
         self.version_drift = []  # list[ToolVersion] — local tool != the pin CI installs
 
 
@@ -234,10 +238,10 @@ def _first_cmd_line(cmd):
 
 
 class ToolVersion(NamedTuple):
-    tool: str      # binary name
-    pinned: str    # version the workflow installs
-    local: str     # version on PATH, or '' when unreadable
-    source: str    # where the pin was read from (renovate depName / go install pkg)
+    tool: str  # binary name
+    pinned: str  # version the workflow installs
+    local: str  # version on PATH, or '' when unreadable
+    source: str  # where the pin was read from (renovate depName / go install pkg)
 
 
 # depName (or go-install package path) -> binary. An absent depName is
@@ -328,7 +332,7 @@ def _local_tool_version(tool):
                 version = _normalize_version(found.group(1)) if found else ''
             else:
                 version = _normalize_version(out)
-        except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+        except OSError, subprocess.TimeoutExpired, subprocess.SubprocessError:
             version = ''
     _LOCAL_VERSION_CACHE[tool] = version
     return version
@@ -375,9 +379,7 @@ def collect_pinned_versions(step_bodies, env_blocks=()):
         # go-ci.yaml writes the pin as `DEADSET_VERSION=v1.10.0` and then
         # `go install ...@${DEADSET_VERSION}`, so the install line alone carries
         # no version. Resolve one step of indirection against the same body.
-        assignments = {
-            m.group('name'): m.group('value') for m in _SHELL_ASSIGN_RE.finditer(body)
-        }
+        assignments = {m.group('name'): m.group('value') for m in _SHELL_ASSIGN_RE.finditer(body)}
 
         def resolve(raw, _assignments=assignments):
             var = _SHELL_VAR_RE.match(raw.strip())
@@ -431,7 +433,7 @@ def collect_pin_sources(workflow_paths, target):
             if is_codeql_workflow(jobs):
                 continue
             expanded = expand_reusable_jobs(jobs, target)
-        except (OSError, subprocess.CalledProcessError, yaml.YAMLError):
+        except OSError, subprocess.CalledProcessError, yaml.YAMLError:
             continue
         contributed = False
         for jobname, steps, _wd, _inputs in expanded:
@@ -515,9 +517,7 @@ LOCAL_REUSABLE_RE = re.compile(r'^\./(\.github/workflows/.+\.ya?ml)$')
 def is_reusable_ref(uses_ref):
     """True if `uses_ref` is a reusable-workflow call ci-local can expand
     (the cplieger/ci@sha form or a local ./ ref)."""
-    return bool(uses_ref) and bool(
-        REUSABLE_RE.match(uses_ref) or LOCAL_REUSABLE_RE.match(uses_ref)
-    )
+    return bool(uses_ref) and bool(REUSABLE_RE.match(uses_ref) or LOCAL_REUSABLE_RE.match(uses_ref))
 
 
 def _ci_repo_root(target):
@@ -580,7 +580,7 @@ def resolve_reusable_workflow(uses_ref, target, parent_ref=None):
             )
             if proc.returncode == 0 and proc.stdout.strip():
                 return yaml.safe_load(proc.stdout)
-        except (subprocess.TimeoutExpired, OSError):
+        except subprocess.TimeoutExpired, OSError:
             pass
 
     return None
@@ -591,9 +591,7 @@ def resolve_reusable_workflow(uses_ref, target, parent_ref=None):
 # ---------------------------------------------------------------------------
 
 
-def evaluate_step_if(
-    expr, step_outputs, caller_inputs=None, workspace=None, step_outcomes=None
-):
+def evaluate_step_if(expr, step_outputs, caller_inputs=None, workspace=None, step_outcomes=None):
     """Evaluate a GitHub Actions if-expression to True/False.
 
     Supports steps.*.outputs.*, steps.*.outcome, inputs.*, &&/||/!, ${{ }}
@@ -782,9 +780,7 @@ def _runner_temp_dir() -> str:
     global _RUNNER_TEMP_DIR
     if _RUNNER_TEMP_DIR is None or not Path(_RUNNER_TEMP_DIR).is_dir():
         _RUNNER_TEMP_DIR = tempfile.mkdtemp(prefix='ci-local-runner-temp-')
-        atexit.register(
-            lambda d=_RUNNER_TEMP_DIR: shutil.rmtree(d, ignore_errors=True)
-        )
+        atexit.register(lambda d=_RUNNER_TEMP_DIR: shutil.rmtree(d, ignore_errors=True))
     return _RUNNER_TEMP_DIR
 
 
@@ -959,8 +955,10 @@ def run_profile_step(step, cwd, workspace):
                 outputs,
             )
         outcome = 'missing' if proc.returncode == 127 else 'fail'
-        status = yellow('MISSING (tool not on PATH)') if outcome == 'missing' else red(
-            f'FAIL (rc={proc.returncode})'
+        status = (
+            yellow('MISSING (tool not on PATH)')
+            if outcome == 'missing'
+            else red(f'FAIL (rc={proc.returncode})')
         )
         return StepResult(False, status, proc.returncode, run_script, output, outcome), {}
     except OSError as exc:
@@ -978,6 +976,28 @@ def run_profile_step(step, cwd, workspace):
 
 def _truthy_action_input(value):
     return str(value).strip().lower() in ('1', 'true', 'yes')
+
+
+def dashboard_check_command(step, name):
+    """Runs with no base copy: a local run has no pull request base to fetch."""
+    script = _ci_repo_root(Path.cwd()) / DASHBOARD_CHECK_ACTION / 'check.sh'
+    if not script.is_file():
+        return (
+            'NOLOCAL',
+            name,
+            'actions/dashboard-check/check.sh not found in the sibling ci/ checkout',
+        )
+    path = str((step.get('with') or {}).get('path') or 'grafana-dashboard.json')
+    command = (
+        f'DASHBOARD_PATH={shlex.quote(path)} BASE_REF= TOKEN= '
+        f'DASHBOARD_CHECK_TOOLS={shlex.quote(str(DASHBOARD_CHECK_TOOLS))} '
+        f'bash {shlex.quote(str(script))}'
+    )
+    return (
+        'LOCAL',
+        name,
+        f'( {command} ) || {{ echo "Dashboard check" >> /tmp/_ci_failures; exit 1; }}',
+    )
 
 
 def trivy_action_command(step):
@@ -1041,7 +1061,11 @@ def classify_step(step):
             # as package-dir), and ci-local already runs the step in it. Passing
             # the flag as well resolved static-src/static-src.
             return 'LOCAL', name, f'python3 {shlex.quote(str(script))} --github'
-        action_dir = action_ref.removeprefix('./').removeprefix('cplieger/ci/')
+        action_dir = (
+            action_ref.removeprefix('./').removeprefix('.cplieger-ci/').removeprefix('cplieger/ci/')
+        )
+        if action_dir == DASHBOARD_CHECK_ACTION:
+            return dashboard_check_command(step, name)
         if action_dir in REPO_AUDIT_ACTIONS:
             script_name, label = REPO_AUDIT_ACTIONS[action_dir]
             script = _ci_repo_root(Path.cwd()) / action_dir / script_name
@@ -1217,9 +1241,7 @@ def rewrite_report_artifacts(cmd: str) -> str:
     scan by quoting historical secret matches (observed on envx and
     docker-keepalived).
     """
-    return _REPORT_PATH_RE.sub(
-        lambda m: f'--report-path "${{RUNNER_TEMP}}/{m.group(2)}"', cmd
-    )
+    return _REPORT_PATH_RE.sub(lambda m: f'--report-path "${{RUNNER_TEMP}}/{m.group(2)}"', cmd)
 
 
 def _split_command_lines(cmd: str):
@@ -1350,12 +1372,14 @@ def rewrite_trivy_gitignore(cmd: str, cwd: Path) -> str:
         return cmd
     inject = ''
     if dirs:
-        inject += f" --skip-dirs {shlex.quote(','.join(dirs))}"
+        inject += f' --skip-dirs {shlex.quote(",".join(dirs))}'
     if files:
-        inject += f" --skip-files {shlex.quote(','.join(files))}"
+        inject += f' --skip-files {shlex.quote(",".join(files))}'
     # Insert right after the `trivy fs`/`trivy filesystem` token; repeated
     # --skip-dirs is fine since trivy unions them.
     return _TRIVY_FS_RE.sub(lambda m: m.group(0) + inject, cmd, count=1)
+
+
 # ---------------------------------------------------------------------------
 # CI lints a fresh checkout — only git-tracked files exist. Locally the working
 # tree may carry gitignored .md files (generated reports under .app-review/,
@@ -1387,7 +1411,7 @@ def rewrite_stylelint_gitignore(cmd: str, cwd: Path) -> str:
         return cmd
     try:
         files = _git_visible_files(cwd, '*.css')
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         return cmd  # not a git repo or git unavailable; leave the glob as-is
     if not files:
         # Hand stylelint a pattern that matches nothing and let
@@ -1409,7 +1433,7 @@ def rewrite_htmlvalidate_gitignore(cmd: str, cwd: Path) -> str:
         return cmd
     try:
         _git_visible_files(cwd, '*.html')
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         return cmd  # not a git repo or git unavailable; leave the find as-is
     return _HTMLVALIDATE_FIND_RE.sub(
         'git ls-files -z --cached --others --exclude-standard -- ' + shlex.quote('*.html'),
@@ -1484,7 +1508,7 @@ def rewrite_find_sh_gitignore(cmd: str, cwd: Path) -> str:
         return cmd
     try:
         files = _git_visible_files(cwd, '*.sh')
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         return cmd  # not a git repo or git unavailable; leave the find as-is
     if not files:
         # Keep the producer's empty-output contract so the step's own
@@ -1518,7 +1542,7 @@ def rewrite_yamllint_gitignore(cmd: str, cwd: Path) -> str:
         return cmd
     try:
         files = _git_visible_files(cwd, '*.yaml', '*.yml')
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         return cmd
     if not files:
         # yamllint exits 1 on "No files to lint", so drop the invocation to a
@@ -1547,9 +1571,9 @@ def rewrite_toml_gitignore(cmd: str, cwd: Path) -> str:
         return cmd
     try:
         files = _git_visible_files(cwd, '*.toml')
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         return cmd
-    if any(ch in f for f in files for ch in ('\'', '"', '\\', '\n')):
+    if any(ch in f for f in files for ch in ("'", '"', '\\', '\n')):
         return cmd
     literal = '[' + ', '.join(f"pathlib.Path('{f}')" for f in files) + ']'
     return _sub_on_command_lines(_TOML_RGLOB_RE, lambda _m: literal, cmd)
@@ -1576,7 +1600,7 @@ def rewrite_markdownlint_gitignore(cmd: str, cwd: Path) -> str:
             text=True,
             check=True,
         ).stdout
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         return cmd  # not a git repo or git unavailable; leave the glob as-is
     files = [shlex.quote(f) for f in out.split('\n') if f.strip()]
     if not files:
@@ -1607,7 +1631,7 @@ def docker_platform_available(platform):
             text=True,
             timeout=30,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         _DOCKER_PLATFORM_CACHE[platform] = False
         return False
     supported = False
@@ -1892,11 +1916,7 @@ def _git_visible_files(target, *pathspecs):
         text=True,
         check=True,
     ).stdout
-    return [
-        path
-        for path in output.split('\x00')
-        if path and (target / path).is_file()
-    ]
+    return [path for path in output.split('\x00') if path and (target / path).is_file()]
 
 
 def _has_tracked_file(target, *pathspecs):
@@ -1908,7 +1928,7 @@ def _has_tracked_file(target, *pathspecs):
     """
     try:
         return any(path.strip() for path in _git_visible_files(target, *pathspecs))
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         for pathspec in pathspecs:
             if '/' in pathspec:
                 if any(target.glob(pathspec)):
@@ -1921,10 +1941,8 @@ def _has_tracked_file(target, *pathspecs):
 def _has_root_file(target, filename):
     """True when a root file is tracked or nonignored and untracked."""
     try:
-        return filename in _git_visible_files(
-            target, f':(top,literal){filename}'
-        )
-    except (OSError, subprocess.CalledProcessError):
+        return filename in _git_visible_files(target, f':(top,literal){filename}')
+    except OSError, subprocess.CalledProcessError:
         return (target / filename).is_file()
 
 
@@ -1938,7 +1956,7 @@ def _detect_go_nested_dirs(target):
     prune = re.compile(r'(^|/)(node_modules|vendor|testdata|static|dist)/')
     try:
         files = _git_visible_files(target, '*/go.mod')
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         return []
     dirs = []
     for filename in files:
@@ -1946,11 +1964,8 @@ def _detect_go_nested_dirs(target):
             continue
         directory = os.path.dirname(filename)
         try:
-            has_go = any(
-                path.strip()
-                for path in _git_visible_files(target, f'{directory}/*.go')
-            )
-        except (OSError, subprocess.CalledProcessError):
+            has_go = any(path.strip() for path in _git_visible_files(target, f'{directory}/*.go'))
+        except OSError, subprocess.CalledProcessError:
             has_go = False
         if has_go:
             dirs.append(directory)
@@ -2047,9 +2062,7 @@ def job_applies_locally(jobname, target):
     return True  # markdown / detect / validate scaffolding — always runs
 
 
-def _resolve_with_value(
-    value, inputs, target, strip_unknown=False, env=None, step_outputs=None
-):
+def _resolve_with_value(value, inputs, target, strip_unknown=False, env=None, step_outputs=None):
     """Resolve the GitHub expressions used by the active validation workflows.
 
     Handles workflow-call inputs, detect-job outputs, EARLIER STEP outputs,
@@ -2165,15 +2178,15 @@ def _expand_job(jobname, job, caller_inputs, target, depth=0, parent_ref=None):
         out = []
         for rjob_name, rjob in (resolved.get('jobs') or {}).items():
             out.extend(
-                _expand_job(
-                    f'{jobname}/{rjob_name}', rjob, merged, target, depth + 1, child_ref
-                )
+                _expand_job(f'{jobname}/{rjob_name}', rjob, merged, target, depth + 1, child_ref)
             )
         return out
 
     steps = job.get('steps') or []
     run_defaults = (job.get('defaults') or {}).get('run') or {}
-    wd = _resolve_with_value(run_defaults.get('working-directory', '.'), caller_inputs or {}, target)
+    wd = _resolve_with_value(
+        run_defaults.get('working-directory', '.'), caller_inputs or {}, target
+    )
     return [(jobname, steps, wd or '.', caller_inputs)]
 
 
@@ -2204,7 +2217,7 @@ def _resolve_matrix_values(spec, target):
             raw = compute_local_detect(target).get(m.group(1), '[]')
             try:
                 vals = json.loads(raw)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 return None
             if isinstance(vals, list):
                 return [str(v) for v in vals]
@@ -2268,9 +2281,7 @@ def process_reusable_steps(
             eff_step['__platform'] = 'linux/arm64'
         if isinstance(step.get('with'), dict):
             eff_step['with'] = {
-                key: _resolve_with_value(
-                    value, caller_inputs, target, step_outputs=step_outputs
-                )
+                key: _resolve_with_value(value, caller_inputs, target, step_outputs=step_outputs)
                 for key, value in step['with'].items()
             }
         if isinstance(step.get('env'), dict):
@@ -2336,8 +2347,7 @@ def process_reusable_steps(
             continue
 
         step_blob = ' '.join(
-            [str(value) for value in (step.get('env') or {}).values()]
-            + [str(step.get('run', ''))]
+            [str(value) for value in (step.get('env') or {}).values()] + [str(step.get('run', ''))]
         )
         if re.search(r'\$\{\{\s*needs\.[\w-]+\.result\s*\}\}', step_blob):
             print(
@@ -2395,8 +2405,7 @@ def process_reusable_steps(
 
         soft_gate = step.get('continue-on-error') in (True, 'true')
         records_failure = (
-            '/tmp/_ci_failures' in str(step.get('run', ''))
-            or '/tmp/_ci_failures' in detail
+            '/tmp/_ci_failures' in str(step.get('run', '')) or '/tmp/_ci_failures' in detail
         )
         if res.outcome == 'missing':
             counters['FAIL'] += 1
@@ -2480,11 +2489,7 @@ def _workflow_call_input_defaults(raw):
     if on_block is None:
         on_block = raw.get(True)
     specs = ((on_block or {}).get('workflow_call') or {}).get('inputs') or {}
-    return {
-        name: spec.get('default', '')
-        for name, spec in specs.items()
-        if isinstance(spec, dict)
-    }
+    return {name: spec.get('default', '') for name, spec in specs.items() if isinstance(spec, dict)}
 
 
 def codeql_config_for_workflow(raw, jobs_dict, target):
@@ -2774,13 +2779,10 @@ def run_codeql_analysis(target: Path, languages, queries, dry_run, source_root=N
             print(f'    {yellow(f"{len(sec_alerts)} security finding(s) (advisory)")}')
             for alert in sec_alerts[:20]:
                 severity = (
-                    f'sev={alert["severity"]}'
-                    if alert['severity']
-                    else f'level={alert["level"]}'
+                    f'sev={alert["severity"]}' if alert['severity'] else f'level={alert["level"]}'
                 )
                 print(
-                    f'      {yellow(severity)} | {alert["rule"]} | '
-                    f'{alert["path"]}:{alert["line"]}'
+                    f'      {yellow(severity)} | {alert["rule"]} | {alert["path"]}:{alert["line"]}'
                 )
             if len(sec_alerts) > 20:
                 print(f'      ... and {len(sec_alerts) - 20} more')
@@ -2825,7 +2827,14 @@ def discover_workflows(target: Path):
     # In cplieger/ci itself, prefer the active self-caller so local expansion
     # exercises the same wrapper GitHub invokes. Consumer repos have only
     # ci.yaml, so their normal discovery is unchanged.
-    for name in ('self-ci.yaml', 'self-ci.yml', 'ci.yaml', 'ci.yml', 'validate.yaml', 'validate.yml'):
+    for name in (
+        'self-ci.yaml',
+        'self-ci.yml',
+        'ci.yaml',
+        'ci.yml',
+        'validate.yaml',
+        'validate.yml',
+    ):
         p = workflow_dir / name
         if p.is_file():
             found.append(p)

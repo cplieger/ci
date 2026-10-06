@@ -1,0 +1,34 @@
+name: dashboard-check
+description: >-
+  Fail when a Grafana dashboard file is not a valid dashboard.grafana.app/v2
+  resource meeting the dashboard standard: strict CUE vet against Grafana's
+  pinned dashboard schema, element references, layout, fields Grafana 13.2
+  does not render, datasource references, descriptions, no-value text,
+  thresholds and prose. A classic dashboard gets a notice and passes, unless the base
+  revision's copy is already schema v2.
+
+inputs:
+  path:
+    description: The dashboard file, relative to the repository root.
+    default: grafana-dashboard.json
+  base-ref:
+    description: >-
+      The revision whose copy pins the dashboard identity. Empty or all zeros
+      means no base.
+    default: ${{ github.event.pull_request.base.sha || github.event.before }}
+  token:
+    description: A token that can read the repository contents.
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the dashboard
+      shell: bash
+      env:
+        DASHBOARD_PATH: ${{ inputs.path }}
+        BASE_REF: ${{ inputs.base-ref }}
+        TOKEN: ${{ inputs.token }}
+      run: |
+        bash "${GITHUB_ACTION_PATH}/check.sh" \
+          || { echo "Dashboard check" >> /tmp/_ci_failures; exit 1; }
