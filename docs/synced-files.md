@@ -23,6 +23,8 @@ A synced file is overwritten on the next sync, so change it here, never in the r
 | `configs/shell/lib.sh`, `configs/shell/harness_test.sh` | `tests/shell/lib.sh`, `tests/shell/harness_test.sh` | repositories that commit a `tests/shell/run.sh` |
 | `configs/repin-sha.sh`, `configs/collect-licenses.sh` | `scripts/repin-sha.sh`, `scripts/collect-licenses.sh` | repositories with a root `Dockerfile` |
 
+`configs/prettier.json` sets `requirePragma` for `*.md` files, so Prettier formats a Markdown file only when it opens with `<!-- @format -->`. Prettier would otherwise pad every table column to the width of its widest cell, and the Markdown in these repositories keeps its tables compact.
+
 `LICENSE` is never synced. Each repository's license depends on what the repository is, so each one keeps its own.
 
 ## Renovate settings
