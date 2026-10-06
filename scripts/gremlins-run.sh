@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# One module's gremlins run, executed INSIDE the memory-capped container that
-# .github/workflows/weekly-gremlins.yaml starts. Runs from the module root.
-# Inputs, all env: GREMLINS_VERSION (release tag to build), GREMLINS_PATCH
-# (absolute path of scripts/gremlins-pkgname.patch), WORKERS_MAX (worker
-# ceiling from the memory cap), GOMEM_MAX_MB and GOMEM_SOLO_MB (GOMEMLIMIT for
-# WORKERS_MAX workers and for one forced worker), PROBE_TIMEOUT (seconds per
-# probe phase), OUT (absolute path for gremlins' JSON result).
+# One module's gremlins run inside the memory-capped container that
+# .github/workflows/weekly-gremlins.yaml starts, from the module root. Env:
+# GREMLINS_VERSION, GREMLINS_PATCH (absolute path of gremlins-pkgname.patch),
+# WORKERS_MAX, GOMEM_MAX_MB / GOMEM_SOLO_MB (GOMEMLIMIT for WORKERS_MAX workers /
+# one forced worker), PROBE_TIMEOUT (seconds per probe phase), OUT (result JSON),
+# and optional JOB_TIMEOUT_MINUTES (the run job's cap; unset keeps per-package).
+# Writes the chosen mode to "${OUT}.mode" for scripts/gremlins-merge.py.
 set -euo pipefail
 
 # The clone is bind-mounted from the runner and owned by the runner uid, while
@@ -18,6 +18,43 @@ git config --global --add safe.directory '*'
 
 : "${GREMLINS_VERSION:?}" "${GREMLINS_PATCH:?}" "${WORKERS_MAX:?}"
 : "${GOMEM_MAX_MB:?}" "${GOMEM_SOLO_MB:?}" "${PROBE_TIMEOUT:?}" "${OUT:?}"
+
+# gremlins budgets each mutant at coverage-pass time x this coefficient (default
+# 3: https://github.com/go-gremlins/gremlins/blob/v0.6.0/internal/engine/executor.go#L101).
+# The coverage pass has every CPU to itself and a mutant gets about 1/workers of
+# them, so a CPU-bound survivor would time out at the stock 3 and drop out of
+# efficacy.
+timeout_coefficient() {
+  printf '%s\n' "$((3 * $1))"
+}
+
+# integration_wanted SUITE_SECS MUTANTS WORKERS CAP_MINUTES prints the estimate
+# (suite x mutants / workers) against a quarter of the cap and succeeds when it
+# fits. Any missing or non-numeric input fails, keeping per-package mode.
+integration_wanted() {
+  [ "$#" -eq 4 ] || return 1
+  local n
+  for n in "$@"; do
+    case "${n}" in '' | 0?* | *[!0-9]*) return 1 ;; esac
+  done
+  [ "$3" -gt 0 ] || return 1
+  local estimate=$(($1 * $2 / $3)) budget=$(($4 * 60 / 4))
+  printf 'estimate=%ss budget=%ss\n' "${estimate}" "${budget}"
+  [ "${estimate}" -lt "${budget}" ]
+}
+
+# select_mode SUITE_SECS MUTANTS WORKERS prints the mode and logs it with its
+# inputs to stderr; an unset or empty JOB_TIMEOUT_MINUTES is an unmeasured cap.
+select_mode() {
+  local cap="${JOB_TIMEOUT_MINUTES:-}" mode=per-package sizing=
+  if sizing=$(integration_wanted "$1" "$2" "$3" "${cap}"); then
+    mode=integration
+  fi
+  local suite="${1:+$1s}" cap_text="${cap:+${cap}min}"
+  printf 'mode=%s (suite=%s mutants=%s workers=%s cap=%s%s)\n' "${mode}" \
+    "${suite:-unmeasured}" "${2:-unmeasured}" "$3" "${cap_text:-unmeasured}" "${sizing:+ ${sizing}}" >&2
+  printf '%s\n' "${mode}"
+}
 
 retry() {
   local delay=1 attempt
@@ -105,6 +142,8 @@ export GOFLAGS="${GOFLAGS:+${GOFLAGS} }-toolexec=/usr/local/bin/gogc-toolexec"
 # mutation run that executes the suite once per mutant.
 workers="${WORKERS_MAX}"
 export GOMEMLIMIT="${GOMEM_MAX_MB}MiB"
+suite_secs=
+mutants=
 
 if [ "${WORKERS_MAX}" -gt 1 ]; then
   # gremlins downloads modules itself; doing it here first keeps the probe from
@@ -131,7 +170,9 @@ if [ "${WORKERS_MAX}" -gt 1 ]; then
   cp -a . "${probe_a}/"
   cp -a . "${probe_b}/"
 
+  suite_start=$(date +%s)
   if (cd "${probe_a}" && timeout "${PROBE_TIMEOUT}" go test -count=1 ./...) >/tmp/probe-solo.log 2>&1; then
+    suite_secs=$(($(date +%s) - suite_start))
     # Stagger the second run by a second. This is what makes the probe work:
     # the failure mode is one process's CLEANUP landing inside another's poll or
     # read, and two suites started together stay in near-lockstep, so their
@@ -170,8 +211,31 @@ if [ "${WORKERS_MAX}" -gt 1 ]; then
     # coverage pass next and reports it as the error it is.
     echo "::warning::suite does not pass on its own; skipping the concurrency probe, keeping ${WORKERS_MAX} workers"
   fi
+
+  # --integration alone changes only which tests a mutant runs; --coverpkg ./...
+  # is what credits code that only another package's tests reach, which would
+  # otherwise stay NOT COVERED and never run
+  # (https://github.com/go-gremlins/gremlins/blob/v0.6.0/internal/coverage/coverage.go#L150).
+  # The dry run counts the mutants that pair would execute.
+  if [ -n "${suite_secs}" ]; then
+    if (cd "${probe_a}" && timeout "${PROBE_TIMEOUT}" gremlins unleash --dry-run --coverpkg ./... --output /tmp/gremlins-dry.json .) >/tmp/gremlins-dry.log 2>&1; then
+      mutants=$(grep --only-matching '"status":"RUNNABLE"' /tmp/gremlins-dry.json | wc --lines) || mutants=
+    else
+      printf '::warning::gremlins --dry-run failed; keeping per-package mode\n'
+      tail --lines=5 /tmp/gremlins-dry.log
+    fi
+  fi
   rm -rf "${probe_a}" "${probe_b}"
 fi
 
-echo "workers=${workers} GOMEMLIMIT=${GOMEMLIMIT} GOFLAGS=${GOFLAGS} module=$(pwd)"
-gremlins unleash --workers "${workers}" --output "${OUT}" .
+mode=$(select_mode "${suite_secs}" "${mutants}" "${workers}")
+mode_flags=()
+if [ "${mode}" = integration ]; then
+  mode_flags=(--integration --coverpkg ./...)
+fi
+
+coefficient=$(timeout_coefficient "${workers}")
+printf 'workers=%s timeout-coefficient=%s GOMEMLIMIT=%s GOFLAGS=%s module=%s\n' \
+  "${workers}" "${coefficient}" "${GOMEMLIMIT}" "${GOFLAGS}" "$(pwd)"
+gremlins unleash --workers "${workers}" --timeout-coefficient "${coefficient}" "${mode_flags[@]}" --output "${OUT}" .
+printf '%s\n' "${mode}" >"${OUT}.mode"

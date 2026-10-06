@@ -1,21 +1,10 @@
 #!/usr/bin/env python3
-"""Pin the contract of the gremlins measurement scripts.
+"""Pin the contract of the gremlins measurement scripts; exit 0 = pass.
 
-Two scripts decide what number every Go repo publishes each week, and neither
-has a caller that would notice a silent regression until the following Sunday:
-
-    gremlins-merge.py      folds one gremlins result per Go module into the
-                           single per-attempt result everything downstream
-                           assumes, so a repo with a nested module keeps ONE
-                           published number that covers every module.
-    gremlins-aggregate.py  turns the per-attempt results into the tracker-issue
-                           body, the rolling history and the README badge.
-
-The sibling stryker aggregate script sat broken for weeks in this repo because
-nothing executed it. This probe is what stops that repeating: run it and the
-whole path from "N gremlins JSONs" to "issue body + badge" is exercised.
-
-Run: python3 scripts/test-gremlins-scripts.py     (exit 0 = pass)
+gremlins-merge.py folds one result per Go module into one per-attempt result,
+gremlins-aggregate.py turns the attempts into the tracker body, history and
+badge, and gremlins-run.sh's coefficient and mode decision are extracted and
+run. Nothing else executes them before the weekly run publishes their number.
 """
 from __future__ import annotations
 
@@ -29,6 +18,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 MERGE = HERE / 'gremlins-merge.py'
 AGGREGATE = HERE / 'gremlins-aggregate.py'
+RUNNER = HERE / 'gremlins-run.sh'
 
 FAILURES: list[str] = []
 
@@ -89,13 +79,19 @@ def result(module: str, files: list[tuple[str, list[tuple[str, str]]]]) -> dict:
     }
 
 
-def run_merge(tmp: Path, modules: list[tuple[str, dict | None]], out_name: str = 'merged.json'):
-    """Write each module's JSON (None = no file at all) and merge them."""
+def run_merge(tmp: Path, modules: list[tuple[str, dict | None]], out_name: str = 'merged.json',
+              modes: dict[str, str] | None = None):
+    """Write each module's JSON (None = no file at all) and merge them.
+
+    modes: {dir: text} written as the `<result>.mode` file gremlins-run.sh leaves.
+    """
     args = []
     for dir_, data in modules:
         path = tmp / (f'{dir_.replace("/", "_")}-out.json' if dir_ != '.' else 'root-out.json')
         if data is not None:
             path.write_text(json.dumps(data))
+        if modes and dir_ in modes:
+            Path(f'{path}.mode').write_text(modes[dir_])
         args += ['--module', f'{dir_}={path}']
     out = tmp / out_name
     proc = subprocess.run(
@@ -688,9 +684,209 @@ def test_aggregate_ignores_another_repos_attempt(tmp: Path) -> None:
           ok='found 1 attempt files' in proc.stderr, detail=proc.stderr)
 
 
+def call_shell(name: str, *args: str, deps: tuple[str, ...] = (), prelude: str = '',
+               env: dict[str, str] | None = None) -> tuple[str, subprocess.CompletedProcess]:
+    """Run gremlins-run.sh's own `name` (after `prelude` and `deps`) under its shell options.
+
+    Returns the extracted `name` source, empty when it or a dep was not found.
+    """
+    text = RUNNER.read_text()
+    srcs = []
+    for fn in (*deps, name):
+        m = re.search(rf'^{fn}\(\) {{\n.*?^}}\n', text, re.MULTILINE | re.DOTALL)
+        srcs.append(m.group(0) if m else '')
+    body = prelude + '\n'.join(srcs)
+    proc = subprocess.run(
+        ['bash', '--norc', '--noprofile', '-c', f'set -euo pipefail\n{body}\n{name} "$@"',
+         name, *args],
+        capture_output=True, text=True, check=False, env=env,
+    )
+    return srcs[-1] if all(srcs) else '', proc
+
+
+def test_timeout_coefficient_scales_with_workers(_tmp: Path) -> None:
+    src, _ = call_shell('timeout_coefficient', '1')
+    check('coefficient: function extracted from gremlins-run.sh', ok=bool(src))
+    if not src:
+        return
+    for workers, want in (('4', '12'), ('2', '6'), ('1', '3')):
+        _, proc = call_shell('timeout_coefficient', workers)
+        check(f'coefficient: {workers} worker(s) -> {want}',
+              ok=proc.returncode == 0 and proc.stdout.strip() == want,
+              detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+
+
+def test_integration_decision(_tmp: Path) -> None:
+    src, _ = call_shell('integration_wanted', '1', '1', '1', '1')
+    check('integration: function extracted from gremlins-run.sh', ok=bool(src))
+    if not src:
+        return
+    _, proc = call_shell('integration_wanted', '60', '20', '4', '350')
+    check('integration: under a quarter of the cap -> integration', ok=proc.returncode == 0,
+          detail=f'rc={proc.returncode} err={proc.stderr!r}')
+    check('integration: prints the estimate and the budget',
+          ok=proc.stdout.strip() == 'estimate=300s budget=5250s', detail=repr(proc.stdout))
+    _, proc = call_shell('integration_wanted', '100', '419', '4', '350')
+    check('integration: over a quarter of the cap -> per-package', ok=proc.returncode == 1,
+          detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+    _, proc = call_shell('integration_wanted', '5250', '4', '4', '350')
+    check('integration: exactly a quarter of the cap -> per-package', ok=proc.returncode == 1,
+          detail=f'rc={proc.returncode} out={proc.stdout!r}')
+    _, proc = call_shell('integration_wanted', '60', '20', '1', '350')
+    check('integration: divides by the workers gremlins is given', ok=proc.returncode == 0
+          and proc.stdout.strip() == 'estimate=1200s budget=5250s', detail=repr(proc.stdout))
+    for label, args in (
+        ('suite unmeasured', ('', '20', '4', '350')),
+        ('dry run gave no count', ('60', '', '4', '350')),
+        ('cap missing', ('60', '20', '4', '')),
+        ('non-numeric count', ('60', '2O', '4', '350')),
+        ('leading zero, which bash would read as octal', ('60', '08', '4', '350')),
+        ('zero workers', ('60', '20', '0', '350')),
+        ('wrong arity', ('60', '20', '4')),
+    ):
+        _, proc = call_shell('integration_wanted', *args)
+        check(f'integration: measurement failed ({label}) -> per-package',
+              ok=proc.returncode == 1 and proc.stdout == '' and proc.stderr == '',
+              detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+
+
+def test_runner_mode_selection(_tmp: Path) -> None:
+    guards = ''.join(re.findall(r'^: "\$\{.*\n', RUNNER.read_text(), re.MULTILINE))
+    check('runner mode: env guards extracted from gremlins-run.sh', ok='OUT:?' in guards,
+          detail=repr(guards))
+    base = {'PATH': '/usr/bin:/bin', **dict.fromkeys((
+        'GREMLINS_VERSION', 'GREMLINS_PATCH', 'WORKERS_MAX', 'GOMEM_MAX_MB', 'GOMEM_SOLO_MB',
+        'PROBE_TIMEOUT', 'OUT'), 'x')}
+    src, proc = call_shell('select_mode', '60', '20', '4', deps=('integration_wanted',),
+                           prelude=guards, env=base)
+    check('runner mode: select_mode extracted from gremlins-run.sh', ok=bool(src))
+    check('runner mode: no cap passes the env guards and keeps per-package',
+          ok=proc.returncode == 0 and proc.stdout == 'per-package\n',
+          detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+    check('runner mode: no cap is logged as unmeasured',
+          ok=proc.stderr == 'mode=per-package (suite=60s mutants=20 workers=4 cap=unmeasured)\n',
+          detail=repr(proc.stderr))
+    _, proc = call_shell('select_mode', '60', '20', '4', deps=('integration_wanted',),
+                         prelude=guards, env={**base, 'JOB_TIMEOUT_MINUTES': ''})
+    check('runner mode: an empty cap keeps per-package',
+          ok=proc.returncode == 0 and proc.stdout == 'per-package\n',
+          detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+    _, proc = call_shell('select_mode', '60', '20', '4', deps=('integration_wanted',),
+                         prelude=guards, env={**base, 'JOB_TIMEOUT_MINUTES': '350'})
+    check('runner mode: under the cap -> integration, logged with its inputs',
+          ok=proc.returncode == 0 and proc.stdout == 'integration\n' and proc.stderr
+          == 'mode=integration (suite=60s mutants=20 workers=4 cap=350min estimate=300s '
+          'budget=5250s)\n', detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+    _, proc = call_shell('select_mode', '', '', '1', deps=('integration_wanted',),
+                         prelude=guards, env={**base, 'JOB_TIMEOUT_MINUTES': '350'})
+    check('runner mode: unmeasured suite -> per-package, logged as unmeasured',
+          ok=proc.returncode == 0 and proc.stdout == 'per-package\n' and proc.stderr
+          == 'mode=per-package (suite=unmeasured mutants=unmeasured workers=1 cap=350min)\n',
+          detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+
+
+def test_merge_records_the_mode(tmp: Path) -> None:
+    root = result('github.com/cplieger/envx/v2', [
+        ('envx.go', [('KILLED', 'ARITHMETIC_BASE')]),
+        ('yamlenv/yamlenv.go', [('NOT COVERED', 'ARITHMETIC_BASE')]),
+    ])
+    nested = result('github.com/cplieger/envx/yamlenv/v2', [
+        ('yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')]),
+    ])
+    _, merged = run_merge(tmp, [('.', root)], out_name='m1.json', modes={'.': 'integration\n'})
+    check('merge mode: one integration module -> integration',
+          ok=merged is not None and merged['mode'] == 'integration',
+          detail=str(merged and merged.get('mode')))
+    _, merged = run_merge(tmp, [('.', root), ('yamlenv', nested)], out_name='m2.json',
+                          modes={'.': 'integration\n', 'yamlenv': 'per-package\n'})
+    check('merge mode: modules that differ -> mixed',
+          ok=merged is not None and merged['mode'] == 'mixed'
+          and [m['mode'] for m in merged['modules']] == ['integration', 'per-package'],
+          detail=str(merged and merged.get('modules')))
+    for p in tmp.glob('*.mode'):
+        p.unlink()
+    _, merged = run_merge(tmp, [('.', root)], out_name='m3.json')
+    check('merge mode: no mode file -> per-package',
+          ok=merged is not None and merged['mode'] == 'per-package',
+          detail=str(merged and merged.get('mode')))
+    proc, _ = run_merge(tmp, [('.', root)], out_name='m4.json', modes={'.': 'sharded\n'})
+    check('merge mode: an unknown mode fails the attempt',
+          ok=proc.returncode != 0 and 'sharded' in proc.stderr, detail=proc.stderr[-300:])
+
+
+MODE_HISTORY = (
+    '# Gremlins mutation testing tracker\n\n'
+    '## Rolling 12-week history\n'
+    '<!-- gremlins-data -->\n'
+    '| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |\n'
+    '|---|---|---|---|---|---|\n'
+    '| 2026-09-27 22:00 | 90.0% | ±0.0% | 60.0% | 2 | +0.0% | <!-- run:3 -->\n'
+    '| 2026-09-20 22:00 | 90.0% | ±0.0% | 60.0% | 2 | — | <!-- run:2 -->\n'
+    '<!-- /gremlins-data -->\n'
+)
+
+
+def aggregate_week(tmp: Path, name: str, mode: str, files: list, existing: str,
+                   run_id: str) -> tuple[subprocess.CompletedProcess, str]:
+    art = tmp / f'art-{name}'
+    for attempt in (1, 2, 3):
+        doc = result('github.com/cplieger/x/v2', files)
+        doc['mode'] = mode
+        (attempt_dir(art, 'sw', attempt) / 'gremlins-out.json').write_text(json.dumps(doc))
+    body = tmp / f'existing-{name}.md'
+    body.write_text(existing)
+    marker = tmp / f'regression-{name}.txt'
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), '--repo', 'sw', '--artifacts-dir', str(art),
+         '--week', f'2026-10-{int(run_id):02d} 22:00', '--run-url',
+         f'https://github.com/cplieger/ci/actions/runs/{run_id}',
+         '--existing-body-file', str(body), '--regression-marker-file', str(marker)],
+        capture_output=True, text=True, check=False,
+    )
+    return proc, marker.read_text() if marker.exists() else ''
+
+
+def test_aggregate_marks_a_mode_switch(tmp: Path) -> None:
+    half = [('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY')])]
+    proc, flag = aggregate_week(tmp, 'control', 'per-package', half, MODE_HISTORY, '4')
+    check('mode switch: control week exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
+    check('mode switch: the same drop without a switch raises the label', ok=flag == 'true',
+          detail=flag)
+    check('mode switch: control row records per-package with no switch mark',
+          ok='| per-package | <!-- run:4 -->' in proc.stdout, detail=proc.stdout[:900])
+
+    proc, flag = aggregate_week(tmp, 'switch', 'integration', half, MODE_HISTORY, '4')
+    check('mode switch: switch week exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
+    check('mode switch: the row marks the switch and the expected jump',
+          ok='| integration (switched from per-package; score jump expected) | <!-- run:4 -->'
+          in proc.stdout, detail=proc.stdout[:900])
+    check('mode switch: the switch week does not raise the label', ok=flag == 'false', detail=flag)
+    check('mode switch: the header says why', ok='Mode switched from per-package to integration'
+          in proc.stdout, detail=proc.stdout[:900])
+
+    # Re-aggregating the same run must still see the switch, not its own row.
+    rerun, flag = aggregate_week(tmp, 'rerun', 'integration', half, proc.stdout, '4')
+    check('mode switch: a re-aggregate of the switch run keeps the mark',
+          ok='(switched from per-package; score jump expected) | <!-- run:4 -->' in rerun.stdout
+          and rerun.stdout.count('<!-- run:4 -->') == 1 and flag == 'false',
+          detail=rerun.stdout[:900])
+
+    after, flag = aggregate_week(tmp, 'after', 'integration', half, proc.stdout, '5')
+    check('mode switch: the next week in the new mode is unmarked',
+          ok='| integration | <!-- run:5 -->' in after.stdout, detail=after.stdout[:900])
+    check('mode switch: the next week compares only integration rows', ok=flag == 'false',
+          detail=flag)
+
+    perfect = [('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')])]
+    proc, _ = aggregate_week(tmp, 'perfect', 'integration', perfect, MODE_HISTORY, '4')
+    check('mode switch: a switch to 100% is not called a measurement failure',
+          ok='jump to 100%' not in proc.stdout.lower() and 'Mode switched' in proc.stdout,
+          detail=proc.stdout[:900])
+
+
 def main() -> int:
-    if not MERGE.exists() or not AGGREGATE.exists():
-        print(f'missing script: {MERGE} / {AGGREGATE}')
+    if not MERGE.exists() or not AGGREGATE.exists() or not RUNNER.exists():
+        print(f'missing script: {MERGE} / {AGGREGATE} / {RUNNER}')
         return 1
     tests = [
         test_single_module_is_identity,
@@ -711,6 +907,11 @@ def main() -> int:
         test_aggregate_reads_a_flat_single_artifact,
         test_aggregate_skips_an_attempt_it_cannot_attribute,
         test_aggregate_ignores_another_repos_attempt,
+        test_timeout_coefficient_scales_with_workers,
+        test_integration_decision,
+        test_runner_mode_selection,
+        test_merge_records_the_mode,
+        test_aggregate_marks_a_mode_switch,
     ]
     for t in tests:
         print(f'{t.__name__}:')

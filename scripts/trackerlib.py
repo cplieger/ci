@@ -61,8 +61,21 @@ def split_cells(row: str) -> list[str]:
     return [c.strip() for c in row.split('|') if c.strip()]
 
 
-def history_rows(existing: str, sentinel: str) -> list[list[str]]:
-    return [split_cells(row) for row in history_lines(existing, sentinel)]
+def history_rows(existing: str, sentinel: str, run_id: str = '') -> list[list[str]]:
+    return [split_cells(row) for row in prior_lines(existing, sentinel, run_id)]
+
+
+def prior_lines(existing: str, sentinel: str, run_id: str = '') -> list[str]:
+    """History rows written by runs other than `run_id`, newest first.
+
+    A re-aggregate's own earlier row is the same measurement, not history.
+    """
+    rows = history_lines(existing, sentinel)
+    if run_id:
+        rows = [
+            r for r in rows if (own := RUN_MARKER_RE.search(r)) is None or own.group(1) != run_id
+        ]
+    return rows
 
 
 def percent_cell(cells: list[str], index: int) -> float | None:
@@ -98,21 +111,16 @@ def update_history_block(
     new_row: str,
     run_id: str = '',
     keep: int = ROLLING_WEEKS,
+    after_delta: str = '',
 ) -> str:
     """Roll the history table forward by one run and render the sentinel block.
 
-    `new_row` carries every cell but the delta, computed on column 2 against the
-    previous newest row; `header` is the table's two header lines. A run
-    contributes ONE row: a re-run of the aggregate job (`if: always()` on the
-    `run` dependency) reads the SAME artifacts, so a second row would count one
-    measurement twice in the rolling mean. A re-aggregate replaces the row that
-    carries its run id; a row with no marker predates the scheme and is kept.
+    `new_row` carries every cell before the delta (column 2 against the previous
+    newest row); `after_delta`, when set, is one cell after it. A run contributes
+    ONE row: a re-run of the aggregate job reads the same artifacts, so its row
+    replaces the one carrying its run id instead of counting twice in the mean.
     """
-    rows = history_lines(existing, sentinel)
-    if run_id:
-        rows = [
-            r for r in rows if (own := RUN_MARKER_RE.search(r)) is None or own.group(1) != run_id
-        ]
+    rows = prior_lines(existing, sentinel, run_id)
 
     prev = percent_cell(split_cells(rows[0]), 1) if rows else None
     current = percent_cell(split_cells(new_row), 1)
@@ -120,8 +128,11 @@ def update_history_block(
 
     # The delta is its OWN cell and the run marker sits AFTER the closing pipe:
     # both must add a trailing cell, never shift an index a reader uses
-    # (cells[1] for the score, cells[4] for the gremlins live count).
+    # (cells[1] for the score, cells[4] for the gremlins live count, cells[6]
+    # for the gremlins mode).
     row = new_row.rstrip() + f' {delta_str} |'
+    if after_delta:
+        row += f' {after_delta} |'
     if run_id:
         row += f' <!-- run:{run_id} -->'
     rows.insert(0, row)
