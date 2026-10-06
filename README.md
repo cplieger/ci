@@ -50,6 +50,8 @@ An image release pushes to GitHub Container Registry and to Docker Hub under the
 
 Each release gets a `vX.Y.Z` tag, and the `vX` and `vX.Y` tags move to it. A breaking change starts a new major tag, and callers stay on their major tag until they change the pin. Pin `v2`, the line every cplieger repository uses. The `v3` line adds a dev channel to the release workflow. On `v3`, a push to a `dev` branch publishes pre-release versions with no GitHub Release.
 
+Both `v2` and `v3` get security fixes, and `v1` gets none, as the [security policy](SECURITY.md) states.
+
 ## Using it outside the cplieger repositories
 
 GitHub lets any public repository call a reusable workflow stored in a public repository, and the runner minutes are billed to the caller. These workflows assume more than the call, though:
