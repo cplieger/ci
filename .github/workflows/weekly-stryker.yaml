@@ -11,6 +11,8 @@
 # The fanout discovers configs automatically; a dir whose devDeps are missing
 # is SKIPPED with an actionable notice instead of failing, so the runner can
 # ship ahead of repo enrollment and light up as repos opt in.
+# Opt-out: a dir committing stryker.weekly.json = {"weekly": false} is skipped
+# on the scheduled run only; every workflow_dispatch still mutation-tests it.
 #
 # Schedule:     Saturdays 22:00 UTC (own slot: gremlins Sun 22:00, fuzz
 #               Wed 22:00, security daily 03:00 — never fighting the same
@@ -69,6 +71,7 @@ jobs:
           # Injected via env (not inline ${{ }} in the script) so a crafted
           # dispatch input can't expand into shell code (template injection).
           ONLY: ${{ github.event.inputs.only }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # One-shot clone auth, built once for the scan loop below. Passed as a
@@ -122,6 +125,16 @@ jobs:
             fi
             while IFS= read -r cfg; do
               dir=$(dirname "${cfg#scan/}")
+              # A sidecar, not a stryker.config key: Stryker warns on unknown keys.
+              weekly="$(dirname "$cfg")/stryker.weekly.json"
+              if [ "$EVENT" = schedule ] && [ -z "${ONLY:-}" ] && [ -f "$weekly" ]; then
+                if jq -e '. == {weekly: false}' "$weekly" >/dev/null 2>&1; then
+                  echo "::notice::${r}:${dir}: stryker.weekly.json sets weekly=false, so the scheduled run skips it. Dispatch with only=${r} to mutation-test it."
+                  continue
+                fi
+                # Malformed runs the dir: failing here would drop every repo's entry with it.
+                echo "::warning::${r}:${dir}: stryker.weekly.json is not exactly {\"weekly\": false}; mutation-testing the dir anyway"
+              fi
               echo "  include ${r}:${dir} @ ${sha:0:12}"
               matrix=$(printf '%s' "$matrix" | jq -c \
                 --arg r "$r" --arg s "$sha" --arg d "$dir" \
