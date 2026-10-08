@@ -75,6 +75,14 @@ git -C "$ROOT" show HEAD:.github/workflows/release.yaml >"$WORK/release-head.yam
 cp "$WORK/release-head.yaml" "$WORK/release.yaml-head"
 git -C "$ROOT" show HEAD:.github/workflows/docker-release.yaml >"$WORK/docker-release.yaml-head"
 git -C "$ROOT" show HEAD:.github/workflow-templates/release.yml >"$WORK/template-head.yml"
+# A committed tree is its own HEAD, so only the checks that need no older code can run.
+BASELINE_IS_TREE=false
+if cmp -s "$WORK/release-head.yaml" "$RELEASE_YAML" \
+  && cmp -s "$WORK/docker-release.yaml-head" "$ROOT/.github/workflows/docker-release.yaml" \
+  && cmp -s "$WORK/template-head.yml" "$TEMPLATE"; then
+  BASELINE_IS_TREE=true
+fi
+export BASELINE_IS_TREE
 python3 - "$RELEASE_YAML" "$WORK/release-head.yaml" "$TEMPLATE" "$WORK/template-head.yml" "$WORK" <<'PY'
 import json, os, re, sys, yaml
 
@@ -337,11 +345,21 @@ for key, job, name in (("go", "go", "Tag + GitHub Release"), ("ts", "ts", "Tag +
 facts["release-view-sites"] = " ".join(str(open(new.replace("release.yaml", wf)).read().count("gh release view"))
                                        for wf in ("release.yaml", "docker-release.yaml"))
 # A workflow cannot declare a job conditionally, so a legacy run's page lists every
-# job HEAD lacks; each must evaluate as skipped there.
+# job HEAD lacks; each must evaluate as skipped there. A committed tree has no older
+# HEAD to diff, so it checks the v3-only set W27 pins.
+V3_ONLY_JOBS = {
+    "release.yaml": ["barrier", "receipts", "renumber", "renumber-npm", "renumber-subpackages", "renumber-tag",
+                     "renumber-ts", "repair", "repair-assets", "repair-notes", "repair-publish", "repair-release"],
+    "docker-release.yaml": ["receipt", "repair-assets"],
+}
 legacy_new = {}
 for wf in ("release.yaml", "docker-release.yaml"):
+    n_jobs = yaml.safe_load(open(new.replace("release.yaml", wf)))["jobs"]
+    if os.environ["BASELINE_IS_TREE"] == "true":
+        legacy_new[wf] = sorted(n for n in V3_ONLY_JOBS[wf] if n in n_jobs)
+        continue
     h = yaml.safe_load(open(f"{out}/{wf}-head"))["jobs"]
-    legacy_new[wf] = sorted(n for n in yaml.safe_load(open(new.replace("release.yaml", wf)))["jobs"] if n not in h)
+    legacy_new[wf] = sorted(n for n in n_jobs if n not in h)
 facts["legacy-new-jobs"] = legacy_new
 lruns = {}
 for t in ("docker", "go", "ts", "none"):
@@ -372,9 +390,10 @@ channel_out() { # <head|new> <ref> <default branch> <mode> [private] [fork] -> t
 }
 for ref in refs/heads/main refs/heads/dev refs/heads/feature; do
   for mode in "" normal renumber junk; do
+    # Both sides drop the model keys: a pre-v3 HEAD emits neither, and a landed HEAD is this file.
     chk "C1 legacy ${ref#refs/heads/} mode='${mode}' matches HEAD" \
       "$(channel_out new "$ref" main "$mode" | grep -v -e '^release_model=' -e '^mode=')" \
-      "$(channel_out head "$ref" main "$mode")"
+      "$(channel_out head "$ref" main "$mode" | grep -v -e '^release_model=' -e '^mode=')"
     chk "C1 legacy ${ref#refs/heads/} mode='${mode}' adds legacy/normal" \
       "$(channel_out new "$ref" main "$mode" | grep -e '^release_model=' -e '^mode=' | tr '\n' ' ')" \
       "release_model=legacy mode=normal "
@@ -2578,6 +2597,7 @@ gh: HTTP 502"
     "::error::could not determine whether Release $rtag exists:
 gh: API rate limit exceeded for user ID 1. (HTTP 403)"
   chk "W26 and on an outage" "$(publish_site "$s" 502)" "1|$REF_S;$READ_S"
+  [ "$BASELINE_IS_TREE" = false ] || continue
   chk "W26 as HEAD's $s site decided a 200, a 404 and a draft of the tag" \
     "$(outcome "$s" 200 head), $(outcome "$s" 404 head), $(DRAFT=tag outcome "$s" 404 head)" \
     "0 none, 0 create, 0 none"
