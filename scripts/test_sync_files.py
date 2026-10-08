@@ -7,7 +7,6 @@ import importlib.util
 import json
 import os
 import pathlib
-import re
 import shutil
 import subprocess
 import sys
@@ -594,188 +593,30 @@ SOURCE_FILES = [
 ]
 
 
-class SyncSource(unittest.TestCase):
-    """A ci source repo whose commit holds baseline files and whose working tree
-    differs from it, served through a copy of the engine naming that commit."""
-
-    def setUp(self):
-        self.tmp = pathlib.Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.tmp)
-        src = self.tmp / 'src'
-        (src / 'configs').mkdir(parents=True)
+class CheckoutSource(unittest.TestCase):
+    def test_a_target_pinned_to_an_older_major_receives_the_checkout(self):
+        src = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, src)
+        (src / 'configs').mkdir()
         (src / 'templates').mkdir()
-        (src / '.editorconfig').write_text('baseline\n')
-        for name in ('ci.yml', 'release.yml'):
-            (src / 'templates' / name).write_text(f'baseline {name}\n')
-        (src / 'configs' / 'tool.sh').write_text('#!/bin/sh\necho baseline\n')
-        (src / 'configs' / 'tool.sh').chmod(0o755)
-        git('init', '-q', cwd=src)
-        git('add', '.', cwd=src)
-        git('commit', '-q', '-m', 'baseline', cwd=src)
-        self.sha = git('rev-parse', 'HEAD', cwd=src)
         (src / '.editorconfig').write_text('checkout\n')
         (src / 'configs' / 'tool.sh').write_text('#!/bin/sh\necho checkout\n')
+        (src / 'configs' / 'tool.sh').chmod(0o755)
         (src / 'configs' / 'new.json').write_text('{}\n')
-        self.src = src
-        self.engine = self.engine_with(f'{{2: {self.sha!r}}}')
-
-    def engine_with(self, sources):
-        engine = self.tmp / f'engine-{len(list(self.tmp.glob("engine-*")))}'
-        engine.mkdir()
-        text = (SCRIPTS / 'sync-files.py').read_text()
-        text, count = re.subn(
-            r'^SYNC_SOURCES = .*$', f'SYNC_SOURCES = {sources}', text, flags=re.MULTILINE
-        )
-        self.assertEqual(count, 1)
-        (engine / 'sync-files.py').write_text(text)
-        (engine / 'ghrest.py').symlink_to(SCRIPTS / 'ghrest.py')
-        return engine / 'sync-files.py'
-
-    def sync(self, workflows, engine=None, repos=('a',), files=SOURCE_FILES):
-        fixture = {'repos': list(repos), 'workflows': workflows, 'diff': {}}
-        manifest = {'group': [group(list(repos), files)]}
-        return run_sync(engine or self.engine, manifest, fixture, '--dry-run', source_dir=self.src)
-
-    def added(self, got, repo='cplieger/a', workflows=False):
-        return {
-            dest: (text, x)
-            for name, dest, text, x in got['added']
-            if name == repo and workflows == dest.startswith('.github/workflows/')
-        }
-
-    def test_a_v2_pinned_target_receives_the_v2_commit_while_the_checkout_differs(self):
-        workflows = {'ci.yaml': pin('# v2'), 'release.yaml': pin('# v2.50.1', 'release.yaml')}
-        got = self.sync({'cplieger/a': workflows})
-        self.assertEqual(got['rc'], 0, got['stdout'] + got['stderr'])
-        self.assertIn(f'  source: v2 at {self.sha[:12]}\n', got['stdout'])
-        self.assertEqual(
-            self.added(got),
-            {
-                '.editorconfig': ('baseline\n', False),
-                'scripts/tool.sh': ('#!/bin/sh\necho baseline\n', True),
-            },
-        )
-        self.assertEqual(
-            self.added(got, workflows=True),
-            {
-                '.github/workflows/ci.yaml': ('baseline ci.yml\n', False),
-                '.github/workflows/release.yaml': ('baseline release.yml\n', False),
-            },
-        )
-
-    def test_a_pin_in_a_workflow_the_sync_does_not_write_is_ignored(self):
-        workflows = {'ci.yaml': pin('# v2'), 'weekly.yaml': pin('# v3.2.1', 'notify-failure.yaml')}
-        got = self.sync({'cplieger/a': workflows})
-        self.assertEqual(got['rc'], 0, got['stdout'] + got['stderr'])
-        self.assertIn(f'  source: v2 at {self.sha[:12]}\n', got['stdout'])
-        got = self.sync({'cplieger/a': {'weekly.yaml': pin('# v3.2.1', 'notify-failure.yaml')}})
-        self.assertNotIn('source:', got['stdout'])
-        self.assertEqual(self.added(got)['.editorconfig'], ('checkout\n', False))
-
-    def test_a_file_absent_at_the_v2_commit_is_held_back_with_a_notice(self):
-        got = self.sync({'cplieger/a': {'ci.yaml': pin('# v2')}})
-        self.assertIn(
-            '::notice::cplieger/a: renovate.json held back (absent at the v2 sync source)\n',
-            got['stdout'],
-        )
-        self.assertNotIn('renovate.json', self.added(got))
-
-    def test_a_new_repository_takes_the_major_the_incoming_workflows_pin(self):
-        (self.src / 'templates' / 'release.yml').write_text(pin('# v2', 'release.yaml'))
-        baseline = {
-            '.editorconfig': ('baseline\n', False),
-            'scripts/tool.sh': ('#!/bin/sh\necho baseline\n', True),
-        }
-        for name, workflows in (('empty', {}), ('unpinned', {'ci.yaml': 'name: ci\n'})):
-            with self.subTest(name):
-                got = self.sync({'cplieger/a': workflows})
-                self.assertEqual(got['rc'], 0, got['stdout'] + got['stderr'])
-                self.assertIn(f'  source: v2 at {self.sha[:12]}\n', got['stdout'])
-                self.assertEqual(self.added(got), baseline)
-                self.assertEqual(
-                    self.added(got, workflows=True)['.github/workflows/release.yaml'],
-                    ('baseline release.yml\n', False),
-                )
-        (self.src / 'templates' / 'release.yml').write_text(pin('# v3', 'release.yaml'))
-        got = self.sync({})
-        self.assertIn('  source: checkout (pinned to v3)\n', got['stdout'])
-        self.assertEqual(self.added(got)['.editorconfig'], ('checkout\n', False))
-
-    def test_the_clones_own_pins_outrank_the_incoming_workflows(self):
-        (self.src / 'templates' / 'release.yml').write_text(pin('# v3', 'release.yaml'))
-        got = self.sync({'cplieger/a': {'ci.yaml': pin('# v2')}})
-        self.assertEqual(got['rc'], 0, got['stdout'] + got['stderr'])
-        self.assertIn(f'  source: v2 at {self.sha[:12]}\n', got['stdout'])
-        self.assertEqual(self.added(got)['.editorconfig'], ('baseline\n', False))
-
-    def test_a_target_receiving_no_workflow_keeps_the_checkout(self):
-        (self.src / 'templates' / 'release.yml').write_text(pin('# v2', 'release.yaml'))
-        files = ['.editorconfig', {'source': 'configs/tool.sh', 'dest': 'scripts/tool.sh'}]
-        got = self.sync({}, files=files)
+        for name in ('ci.yml', 'release.yml'):
+            (src / 'templates' / name).write_text(pin('# v3', name.replace('.yml', '.yaml')))
+        git('init', '-q', cwd=src)
+        workflows = {'ci.yaml': pin('# v2'), 'release.yaml': pin('# v2', 'release.yaml')}
+        fixture = {'repos': ['a'], 'workflows': {'cplieger/a': workflows}, 'diff': {}}
+        manifest = {'group': [group(['a'], SOURCE_FILES)]}
+        got = run_sync(SCRIPTS / 'sync-files.py', manifest, fixture, '--dry-run', source_dir=src)
         self.assertEqual(got['rc'], 0, got['stdout'] + got['stderr'])
         self.assertNotIn('source:', got['stdout'])
-        self.assertEqual(
-            self.added(got),
-            {
-                '.editorconfig': ('checkout\n', False),
-                'scripts/tool.sh': ('#!/bin/sh\necho checkout\n', True),
-            },
-        )
-
-    def test_a_current_major_pin_and_no_pin_receive_the_checkout(self):
-        want = {
-            '.editorconfig': ('checkout\n', False),
-            'scripts/tool.sh': ('#!/bin/sh\necho checkout\n', True),
-            'renovate.json': ('{}\n', False),
-        }
-        got = self.sync({'cplieger/a': {'ci.yaml': pin('# v3')}})
-        self.assertEqual(got['rc'], 0, got['stdout'] + got['stderr'])
-        self.assertIn('  source: checkout (pinned to v3)\n', got['stdout'])
-        self.assertEqual(self.added(got), want)
-        got = self.sync({})
-        self.assertEqual(got['rc'], 0, got['stdout'] + got['stderr'])
-        self.assertNotIn('source:', got['stdout'])
-        self.assertEqual(self.added(got), want)
-
-    def test_mixed_unknown_or_unnamed_majors_fail_only_that_target(self):
-        cases = {
-            'mixed': (
-                {'ci.yaml': pin('# v2'), 'release.yaml': pin('# v3', 'release.yaml')},
-                'pinned to several cplieger/ci majors: v2, v3',
-            ),
-            'older': ({'ci.yaml': pin('# v1')}, 'pinned to v1, which has no sync source'),
-            'newer': ({'ci.yaml': pin('# v4')}, 'pinned to v4, which has no sync source'),
-            'unnamed': ({'ci.yaml': pin('')}, 'a cplieger/ci pin names no major'),
-        }
-        for name, (workflows, message) in cases.items():
-            with self.subTest(name):
-                got = self.sync({'cplieger/a': workflows}, repos=('a', 'b'))
-                self.assertEqual(got['rc'], 1)
-                self.assertIn(f'::warning::cplieger/a: sync failed — {message}', got['stdout'])
-                self.assertIn('1 failed (cplieger/a)', got['stdout'])
-                self.assertEqual(self.added(got), {})
-                self.assertEqual(len(self.added(got, 'cplieger/b')), 3)
-
-    def test_a_tag_ref_names_its_major(self):
-        workflows = {
-            'ci.yaml': 'jobs:\n  ci:\n    uses: "cplieger/ci/.github/workflows/ci.yaml@v2"\n'
-        }
-        got = self.sync({'cplieger/a': workflows})
-        self.assertIn(f'  source: v2 at {self.sha[:12]}\n', got['stdout'])
-
-    def test_a_source_commit_missing_from_the_checkout_fails_the_target(self):
-        engine = self.engine_with(f'{{2: {"0" * 40!r}}}')
-        got = self.sync({'cplieger/a': {'ci.yaml': pin('# v2')}}, engine=engine)
-        self.assertEqual(got['rc'], 1)
-        self.assertIn('::warning::cplieger/a: sync failed — ', got['stdout'])
-        self.assertEqual(self.added(got), {})
-
-    def test_the_engine_names_a_full_commit_for_every_older_major(self):
-        sync = load_sync()
-        self.assertTrue(sync.SYNC_SOURCES)
-        for major, sha in sync.SYNC_SOURCES.items():
-            self.assertLess(major, sync.CURRENT_MAJOR)
-            self.assertRegex(sha, r'^[0-9a-f]{40}$')
+        added = {dest: (text, x) for name, dest, text, x in got['added'] if name == 'cplieger/a'}
+        self.assertEqual(added['.editorconfig'], ('checkout\n', False))
+        self.assertEqual(added['scripts/tool.sh'], ('#!/bin/sh\necho checkout\n', True))
+        self.assertEqual(added['renovate.json'], ('{}\n', False))
+        self.assertEqual(added['.github/workflows/release.yaml'][0], pin('# v3', 'release.yaml'))
 
 
 class Manifest(unittest.TestCase):
@@ -1118,11 +959,6 @@ class Workflow(unittest.TestCase):
         self.assertIn('scripts/sync-files.py --manifest .github/sync.yml --print-open-prs', body)
         self.assertNotIn('repo-sync/ci/default', body)
         self.assertNotIn('gh pr list', body)
-
-    def test_the_checkout_holds_every_older_major_sync_source(self):
-        doc = yaml.safe_load((ROOT / '.github' / 'workflows' / 'sync.yaml').read_text())
-        (checkout,) = [s for s in doc['jobs']['sync']['steps'] if s.get('name') == 'Checkout']
-        self.assertEqual(checkout['with']['fetch-depth'], 0)
 
 
 if __name__ == '__main__':

@@ -10,10 +10,6 @@ A repository whose default branch is `dev` gets one pull request per branch, fro
 
 A synced file is overwritten on the next sync, so change it here, never in the repository that received it. The workflow callers carry a `DO NOT EDIT` header that says so.
 
-A repository receives the files of the cplieger/ci major that its synced workflow files pin. A repository with none of them pinned yet, such as a new one, takes the major that the incoming workflow files pin. One pinned to the current major, or receiving no workflow file, gets the files as they are on `main`. A repository whose pins mix majors, or carry a pin that names no major, is not synced.
-
-A repository pinned to an older major gets its files from the commit that `SYNC_SOURCES` in `scripts/sync-files.py` names for that major. Its caller templates then pass only inputs its pinned workflows have. A file missing at that commit is held back. A fix to a synced file reaches older-major repositories only when `SYNC_SOURCES` moves to a commit of that major's line that carries it.
-
 ## What goes where
 
 | Source in this repository | Lands as | Received by |

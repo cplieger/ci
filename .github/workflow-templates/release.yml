@@ -3,14 +3,13 @@
 # cplieger/ci/.github/workflows/release.yaml; this file only calls it. The
 # central pipeline selects the channel from the branch it runs on (main is the
 # stable channel), computes the version, detects the repo type and the changed
-# paths, and publishes. This file triggers on main only until the pinned
-# pipeline is one that publishes a dev channel from a dev push. Per-repo
+# paths, and publishes; a push to dev publishes the dev channel. Per-repo
 # behaviour is the "Resolve repo policy" step there; no override surface here.
 name: Release
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
     inputs:
       # Read by the v2 pipeline's no-change gate through github.event.inputs
@@ -60,7 +59,7 @@ jobs:
       id-token: write
       attestations: write
       security-events: write
-    uses: cplieger/ci/.github/workflows/release.yaml@c9c218d713f221dabb8504141b1ab4501d5ba7af # v2
+    uses: cplieger/ci/.github/workflows/release.yaml@9fa8886bf87788a0d7627f7e1a3fa34ba6d8383e # v3
     # Forward only the two Docker Hub publish credentials the reusable pipeline
     # actually declares and consumes, rather than `secrets: inherit` (which
     # exposes every repo secret to the reusable-workflow trust boundary). Both
