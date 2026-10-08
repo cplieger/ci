@@ -233,29 +233,9 @@ LICENSE_OVERRIDES = {
     "marotte": "AGPL-3.0",
 }
 
-# HARD merge-model settings.
-GOV_HARD = {
-    "allow_merge_commit": False,
-    "allow_squash_merge": True,
-    "allow_rebase_merge": True,
-    "delete_branch_on_merge": True,
-    "allow_auto_merge": True,
-}
-# Advisory settings. Sync and Renovate PRs auto-squash, and COMMIT_OR_PR_TITLE
-# keeps the conventional subject git-cliff reads.
-GOV_SOFT = {
-    "has_wiki": False,
-    "has_projects": False,
-    "has_issues": True,
-    "has_discussions": False,
-    "allow_update_branch": False,
-    "web_commit_signoff_required": False,
-    "squash_merge_commit_title": "COMMIT_OR_PR_TITLE",
-    "squash_merge_commit_message": "COMMIT_MESSAGES",
-}
-# Squash only on a two-branch repo, where the PR title is the changelog line;
+# HARD merge model: squash only, the PR title as the changelog line, and
 # COMMIT_MESSAGES, since a BREAKING CHANGE quoted in a Renovate PR body cuts a major.
-GOV_HARD_TWO_BRANCH = {
+GOV_HARD = {
     "allow_merge_commit": False,
     "allow_squash_merge": True,
     "allow_rebase_merge": False,
@@ -264,13 +244,14 @@ GOV_HARD_TWO_BRANCH = {
     "squash_merge_commit_title": "PR_TITLE",
     "squash_merge_commit_message": "COMMIT_MESSAGES",
 }
-
-
-def merge_model(two_channel):
-    """(hard, soft) merge-model tables for a repo of that branch model."""
-    if not two_channel:
-        return GOV_HARD, GOV_SOFT
-    return GOV_HARD_TWO_BRANCH, {k: v for k, v in GOV_SOFT.items() if k not in GOV_HARD_TWO_BRANCH}
+GOV_SOFT = {
+    "has_wiki": False,
+    "has_projects": False,
+    "has_issues": True,
+    "has_discussions": False,
+    "allow_update_branch": False,
+    "web_commit_signoff_required": False,
+}
 
 
 def gh(*args):
@@ -1309,11 +1290,10 @@ def compliance(s):
         return hard, warn, []
 
     two_channel = bool(s.get("two_channel"))
-    gov_hard, gov_soft = merge_model(two_channel)
-    for k, exp in gov_hard.items():
+    for k, exp in GOV_HARD.items():
         if s.get(k) != exp:
             hard.append(f"{k}={s.get(k)} (want {exp})")
-    for k, exp in gov_soft.items():
+    for k, exp in GOV_SOFT.items():
         if s.get(k) != exp:
             warn.append(f"{k}={s.get(k)} (want {exp})")
 
