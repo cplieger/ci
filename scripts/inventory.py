@@ -68,12 +68,14 @@ def _sign(a, b) -> int:
 
 _NUM = re.compile(r'0|[1-9]\d*')
 _IDENT = re.compile(r'[0-9A-Za-z-]+')
+# The same arity as a prerelease key's (0, identifiers), and above every one of them.
+_NO_PRERELEASE = (1, ())
 
 
 def _prerelease(text: str | None):
     """Semver 2.0.0 precedence key (https://semver.org/#spec-item-11); None means no prerelease (ranks highest)."""
     if text is None:
-        return (1,)
+        return _NO_PRERELEASE
     key = []
     for ident in text.split('.'):
         if not _IDENT.fullmatch(ident):
@@ -117,7 +119,7 @@ def _go_semver_key(text: str):
     # prerelease, `+incompatible` is build metadata and does not order.
     m = _GO_SHORT.fullmatch(text)
     if m:
-        return (int(m[1]), int(m[2] or 0), 0, (1,))
+        return (int(m[1]), int(m[2] or 0), 0, _NO_PRERELEASE)
     if not text.startswith('v'):
         return None
     return _semver_key(text[1:])
