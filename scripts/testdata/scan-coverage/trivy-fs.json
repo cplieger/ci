@@ -1,0 +1,61 @@
+{
+ "SchemaVersion": 2,
+ "ArtifactName": "fs",
+ "ArtifactType": "filesystem",
+ "Results": [
+  {
+   "Target": "go.mod",
+   "Class": "lang-pkgs",
+   "Type": "gomod",
+   "Vulnerabilities": [
+    {
+     "VulnerabilityID": "CVE-2021-38561",
+     "PkgName": "golang.org/x/text",
+     "InstalledVersion": "v0.3.5",
+     "FixedVersion": "0.3.7",
+     "Status": "fixed",
+     "Severity": "HIGH"
+    },
+    {
+     "VulnerabilityID": "CVE-2022-32149",
+     "PkgName": "golang.org/x/text",
+     "InstalledVersion": "v0.3.5",
+     "FixedVersion": "0.3.8",
+     "Status": "fixed",
+     "Severity": "HIGH"
+    },
+    {
+     "VulnerabilityID": "CVE-2026-56852",
+     "PkgName": "golang.org/x/text",
+     "InstalledVersion": "v0.3.5",
+     "FixedVersion": "0.39.0",
+     "Status": "fixed",
+     "Severity": "HIGH"
+    }
+   ]
+  },
+  {
+   "Target": "package-lock.json",
+   "Class": "lang-pkgs",
+   "Type": "npm",
+   "Vulnerabilities": [
+    {
+     "VulnerabilityID": "CVE-2021-23337",
+     "PkgName": "lodash",
+     "InstalledVersion": "4.17.20",
+     "FixedVersion": "4.17.21",
+     "Status": "fixed",
+     "Severity": "HIGH"
+    },
+    {
+     "VulnerabilityID": "CVE-2026-4800",
+     "PkgName": "lodash",
+     "InstalledVersion": "4.17.20",
+     "FixedVersion": "4.18.0",
+     "Status": "fixed",
+     "Severity": "HIGH"
+    }
+   ]
+  }
+ ]
+}

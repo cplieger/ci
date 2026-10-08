@@ -85,7 +85,9 @@ jobs:
         with:
           repository: cplieger/ci
           persist-credentials: false
-          sparse-checkout: scripts/tracker_issue.py
+          sparse-checkout: |
+            scripts/tracker_issue.py
+            scripts/ghrest.py
           sparse-checkout-cone-mode: false
           path: ci
 

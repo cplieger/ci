@@ -1,0 +1,170 @@
+{
+ "daily-security.yaml": {
+  "dispatch-steps": [
+   {
+    "name": "Trigger security.yml on cplieger/${{ matrix.repo }}",
+    "run": "gh workflow run security.yml -R \"cplieger/${{ matrix.repo }}\"\n"
+   }
+  ],
+  "fanout-run": "set -euo pipefail\n# Public only (visibility rule, not a repo-name list): private repos\n# draw the account's included minutes and own their scan cadence \u2014\n# see the \"Private repos\" note in the header.\n# Forks are excluded org-wide (same rule as scripts/audit.py): a fork\n# carries UPSTREAM's code, so scanning it reports findings only upstream\n# can fix while spending our daily budget.\n# REST rather than `gh repo list`: GraphQL quota is shared with every\n# other token of the account owner and can be exhausted by unrelated load.\nrepos=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '\n  .[] | select(.archived == false and .fork == false and .visibility == \"public\") | .name\n')\nREPOS=()\nfor r in $repos; do\n  if gh workflow view security.yml -R \"cplieger/${r}\" >/dev/null 2>&1; then\n    REPOS+=(\"$r\")\n  fi\ndone\nmatrix=$(printf '%s\\n' \"${REPOS[@]}\" | jq -R . | jq -s -c '[.[] | {repo: .}]')\necho \"matrix=${matrix}\" >> \"$GITHUB_OUTPUT\"\necho \"Total repos: $(echo \"$matrix\" | jq 'length')\"\n"
+ },
+ "security-scan.yaml": {
+  "gitleaks-history": {
+   "permissions": {
+    "contents": "read",
+    "security-events": "write"
+   },
+   "runs-on": "ubuntu-26.04",
+   "steps": [
+    {
+     "name": "Checkout (full history)",
+     "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "with": {
+      "fetch-depth": 0,
+      "persist-credentials": false
+     }
+    },
+    {
+     "name": "Scan full git history (gitleaks, advisory)",
+     "run": "# renovate: datasource=github-releases depName=gitleaks/gitleaks\nVERSION=v8.30.1\n# File first, then extract: plain `--retry` does not cover a\n# mid-transfer receive failure (curl exit 56), and the flag that does\n# (`--retry-all-errors`) is unsafe on a pipe, because curl resets a\n# partial `-o` write before retrying and cannot reset a pipe. The\n# archive stays out of /tmp/gitleaks* so ci-local's rewrite of that\n# literal path cannot reach it.\ncurl -fsSL --connect-timeout 10 --max-time 30 \\\n  --retry 7 --retry-max-time 150 --retry-all-errors \\\n  -o \"$RUNNER_TEMP/gitleaks.tgz\" \\\n  \"https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz\"\ntar -xzf \"$RUNNER_TEMP/gitleaks.tgz\" -C /tmp gitleaks\n/tmp/gitleaks git . --no-banner --redact --exit-code 0 \\\n  --report-format sarif --report-path gitleaks-history.sarif\n"
+    },
+    {
+     "if": "${{ always() && hashFiles('gitleaks-history.sarif') != '' && github.event.repository.private == false }}",
+     "name": "Upload SARIF \u2014 gitleaks history",
+     "uses": "github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2",
+     "with": {
+      "category": "gitleaks-history",
+      "sarif_file": "gitleaks-history.sarif"
+     }
+    }
+   ],
+   "timeout-minutes": 15
+  },
+  "jobs": [
+   "gitleaks-history",
+   "trivy"
+  ],
+  "trivy": {
+   "permissions": {
+    "contents": "read",
+    "security-events": "write"
+   },
+   "runs-on": "ubuntu-26.04",
+   "steps": [
+    {
+     "name": "Checkout",
+     "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "with": {
+      "persist-credentials": false
+     }
+    },
+    {
+     "name": "Accept documented misconfig false-positives (all repos)",
+     "run": "printf '%s\\n' AVD-DS-0002 AVD-DS-0026 DS-0002 DS-0026 > .trivyignore"
+    },
+    {
+     "id": "profile",
+     "name": "Resolve profile",
+     "run": "set -euo pipefail\nif [ -f Dockerfile ]; then echo 'image=true' >> \"$GITHUB_OUTPUT\"; else echo 'image=false' >> \"$GITHUB_OUTPUT\"; fi\n"
+    },
+    {
+     "if": "${{ steps.profile.outputs.image == 'true' }}",
+     "name": "Set up Docker Buildx",
+     "uses": "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
+    },
+    {
+     "env": {
+      "DOCKERFILE": "${{ inputs.dockerfile }}"
+     },
+     "id": "pkgrefresh",
+     "if": "${{ steps.profile.outputs.image == 'true' }}",
+     "name": "Resolve OS package refresh key",
+     "run": "set -euo pipefail\nif grep -qE '^[[:space:]]*ARG[[:space:]]+PKG_REFRESH' \"$DOCKERFILE\"; then\n  REFRESH=\"PKG_REFRESH=$(date -u +%Y-%m-%d)\"\nelse\n  REFRESH=\"\"\nfi\n{\n  echo \"build-args<<EOF\"\n  echo \"$REFRESH\"\n  echo \"EOF\"\n} >> \"$GITHUB_OUTPUT\"\n"
+    },
+    {
+     "if": "${{ steps.profile.outputs.image == 'true' }}",
+     "name": "Build image (no push)",
+     "uses": "docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc",
+     "with": {
+      "build-args": "${{ steps.pkgrefresh.outputs.build-args }}",
+      "cache-from": "type=gha",
+      "context": "${{ inputs.build-context }}",
+      "file": "${{ inputs.dockerfile }}",
+      "load": true,
+      "push": false,
+      "tags": "ci-scan:latest"
+     }
+    },
+    {
+     "name": "Trivy filesystem scan (advisory)",
+     "uses": "aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25",
+     "with": {
+      "exit-code": "0",
+      "format": "sarif",
+      "ignore-unfixed": true,
+      "output": "trivy-fs.sarif",
+      "scan-type": "fs",
+      "scanners": "vuln,license",
+      "severity": "${{ inputs.severity }}",
+      "version": "${{ env.TRIVY_VERSION }}"
+     }
+    },
+    {
+     "name": "Trivy misconfig scan (report-only)",
+     "uses": "aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25",
+     "with": {
+      "exit-code": "0",
+      "format": "sarif",
+      "output": "trivy-misconfig.sarif",
+      "scan-type": "fs",
+      "scanners": "misconfig",
+      "version": "${{ env.TRIVY_VERSION }}"
+     }
+    },
+    {
+     "if": "${{ steps.profile.outputs.image == 'true' }}",
+     "name": "Trivy image scan (advisory)",
+     "uses": "aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25",
+     "with": {
+      "exit-code": "0",
+      "format": "sarif",
+      "ignore-unfixed": true,
+      "image-ref": "ci-scan:latest",
+      "output": "trivy-image.sarif",
+      "scanners": "vuln,secret",
+      "severity": "${{ inputs.severity }}",
+      "version": "${{ env.TRIVY_VERSION }}"
+     }
+    },
+    {
+     "if": "${{ always() && hashFiles('trivy-fs.sarif') != '' && github.event.repository.private == false }}",
+     "name": "Upload SARIF \u2014 filesystem",
+     "uses": "github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2",
+     "with": {
+      "category": "trivy-fs",
+      "sarif_file": "trivy-fs.sarif"
+     }
+    },
+    {
+     "if": "${{ always() && hashFiles('trivy-misconfig.sarif') != '' && github.event.repository.private == false }}",
+     "name": "Upload SARIF \u2014 misconfig",
+     "uses": "github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2",
+     "with": {
+      "category": "trivy-misconfig",
+      "sarif_file": "trivy-misconfig.sarif"
+     }
+    },
+    {
+     "if": "${{ always() && steps.profile.outputs.image == 'true' && hashFiles('trivy-image.sarif') != '' && github.event.repository.private == false }}",
+     "name": "Upload SARIF \u2014 image",
+     "uses": "github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2",
+     "with": {
+      "category": "trivy-image",
+      "sarif_file": "trivy-image.sarif"
+     }
+    }
+   ],
+   "timeout-minutes": 15
+  }
+ }
+}

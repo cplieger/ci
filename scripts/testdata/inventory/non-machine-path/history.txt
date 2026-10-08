@@ -1,0 +1,31 @@
+@@ commit B
+@@ file Dockerfile
+FROM alpine:3.24.2@sha256:1111111111111111111111111111111111111111111111111111111111111111
+# renovate: datasource=github-releases depName=example/tool
+ARG TOOL_VERSION=v1.0.0
+RUN echo "${TOOL_VERSION}"
+@@ file main.go
+package main
+@@ commit M parent B
+@@ file main.go
+package main
+
+// a hotfix written straight to main
+@@ commit M_dockerfile parent B
+@@ file Dockerfile
+FROM alpine:3.24.2@sha256:1111111111111111111111111111111111111111111111111111111111111111
+# renovate: datasource=github-releases depName=example/tool
+ARG TOOL_VERSION=v1.0.1
+RUN echo "${TOOL_VERSION}" --and-a-new-flag
+@@ commit M_pin parent B
+@@ file Dockerfile
+FROM alpine:3.24.2@sha256:1111111111111111111111111111111111111111111111111111111111111111
+# renovate: datasource=github-releases depName=example/tool
+ARG TOOL_VERSION=v1.0.1
+RUN echo "${TOOL_VERSION}"
+@@ commit T parent B
+@@ file Dockerfile
+FROM alpine:3.24.2@sha256:1111111111111111111111111111111111111111111111111111111111111111
+# renovate: datasource=github-releases depName=example/tool
+ARG TOOL_VERSION=v1.1.0
+RUN echo "${TOOL_VERSION}"

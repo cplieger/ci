@@ -1,0 +1,318 @@
+@@ commit B
+@@ file uv.lock
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "glyphs"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "requests" }]
+
+[package.dev-dependencies]
+dev = [{ name = "pytest" }]
+
+[[package]]
+name = "pytest"
+version = "8.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pytest-8.3.0.tar.gz", hash = "sha256:fixture-pytest-830" }
+
+[[package]]
+name = "requests"
+version = "2.32.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "urllib3" }]
+sdist = { url = "https://example.invalid/requests-2.32.3.tar.gz", hash = "sha256:fixture-requests-2323" }
+
+[[package]]
+name = "urllib3"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://example.invalid/urllib3-2.2.0-py3-none-any.whl", hash = "sha256:fixture-urllib3-220" }]
+@@ commit M parent B
+@@ file uv.lock
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "glyphs"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "requests" }]
+
+[package.dev-dependencies]
+dev = [{ name = "pytest" }]
+
+[[package]]
+name = "pytest"
+version = "8.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pytest-8.3.0.tar.gz", hash = "sha256:fixture-pytest-830" }
+
+[[package]]
+name = "requests"
+version = "2.32.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "urllib3" }]
+sdist = { url = "https://example.invalid/requests-2.32.4.tar.gz", hash = "sha256:fixture-requests-2324" }
+
+[[package]]
+name = "urllib3"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://example.invalid/urllib3-2.2.0-py3-none-any.whl", hash = "sha256:fixture-urllib3-220" }]
+@@ commit T parent B
+@@ file uv.lock
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "glyphs"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "requests" }]
+
+[package.dev-dependencies]
+dev = [{ name = "pytest" }]
+
+[[package]]
+name = "pytest"
+version = "8.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pytest-8.4.0.tar.gz", hash = "sha256:fixture-pytest-840" }
+
+[[package]]
+name = "requests"
+version = "2.33.0rc1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "urllib3" }]
+sdist = { url = "https://example.invalid/requests-2.33.0rc1.tar.gz", hash = "sha256:fixture-requests-2330rc1" }
+
+[[package]]
+name = "urllib3"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://example.invalid/urllib3-2.2.0-py3-none-any.whl", hash = "sha256:fixture-urllib3-220" }]
+@@ commit T_low parent B
+@@ file uv.lock
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "glyphs"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "requests" }]
+
+[package.dev-dependencies]
+dev = [{ name = "pytest" }]
+
+[[package]]
+name = "pytest"
+version = "8.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pytest-8.3.0.tar.gz", hash = "sha256:fixture-pytest-830" }
+
+[[package]]
+name = "requests"
+version = "2.32.4.dev1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "urllib3" }]
+sdist = { url = "https://example.invalid/requests-2.32.4.dev1.tar.gz", hash = "sha256:fixture-requests-2324dev1" }
+
+[[package]]
+name = "urllib3"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://example.invalid/urllib3-2.2.0-py3-none-any.whl", hash = "sha256:fixture-urllib3-220" }]
+@@ commit B_wheels parent B
+@@ file uv.lock
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "glyphs"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "requests" }]
+
+[package.dev-dependencies]
+dev = [{ name = "pytest" }]
+
+[[package]]
+name = "pytest"
+version = "8.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pytest-8.3.0.tar.gz", hash = "sha256:fixture-pytest-830" }
+
+[[package]]
+name = "requests"
+version = "2.32.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "urllib3" }]
+sdist = { url = "https://example.invalid/requests-2.32.3.tar.gz", hash = "sha256:fixture-requests-2323" }
+
+[[package]]
+name = "urllib3"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://example.invalid/urllib3-2.2.0-py3-none-any.whl", hash = "sha256:fixture-urllib3-220" },
+    { url = "https://example.invalid/urllib3-2.2.0-cp312-manylinux.whl", hash = "sha256:fixture-urllib3-220-linux" },
+]
+@@ commit M_wheels parent B_wheels
+@@ file uv.lock
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "glyphs"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "requests" }]
+
+[package.dev-dependencies]
+dev = [{ name = "pytest" }]
+
+[[package]]
+name = "pytest"
+version = "8.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pytest-8.3.0.tar.gz", hash = "sha256:fixture-pytest-830" }
+
+[[package]]
+name = "requests"
+version = "2.32.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "urllib3" }]
+sdist = { url = "https://example.invalid/requests-2.32.3.tar.gz", hash = "sha256:fixture-requests-2323" }
+
+[[package]]
+name = "urllib3"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://example.invalid/urllib3-2.2.0-py3-none-any.whl", hash = "sha256:fixture-urllib3-220" },
+    { url = "https://example.invalid/urllib3-2.2.0-cp312-manylinux.whl", hash = "sha256:fixture-urllib3-220-linux-rebuilt" },
+]
+@@ commit M_markers parent B
+@@ file uv.lock
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "glyphs"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "requests" }]
+
+[package.dev-dependencies]
+dev = [{ name = "pytest" }]
+
+[[package]]
+name = "pytest"
+version = "8.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pytest-8.3.0.tar.gz", hash = "sha256:fixture-pytest-830" }
+
+[[package]]
+name = "requests"
+version = "2.32.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "urllib3", marker = "sys_platform != 'emscripten'" }]
+sdist = { url = "https://example.invalid/requests-2.32.3.tar.gz", hash = "sha256:fixture-requests-2323" }
+
+[[package]]
+name = "urllib3"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://example.invalid/urllib3-2.2.0-py3-none-any.whl", hash = "sha256:fixture-urllib3-220" },
+]
+@@ commit B_opt parent B
+@@ file uv.lock
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "glyphs"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "requests" }]
+
+[package.optional-dependencies]
+fast = [{ name = "orjson" }]
+
+[package.dev-dependencies]
+dev = [{ name = "pytest" }]
+
+[[package]]
+name = "pytest"
+version = "8.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pytest-8.3.0.tar.gz", hash = "sha256:fixture-pytest-830" }
+
+[[package]]
+name = "requests"
+version = "2.32.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "urllib3" }]
+sdist = { url = "https://example.invalid/requests-2.32.3.tar.gz", hash = "sha256:fixture-requests-2323" }
+
+[[package]]
+name = "urllib3"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://example.invalid/urllib3-2.2.0-py3-none-any.whl", hash = "sha256:fixture-urllib3-220" },
+]
+
+[[package]]
+name = "orjson"
+version = "3.10.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/orjson-3.10.0.tar.gz", hash = "sha256:fixture-orjson-3100" }
+@@ commit M_opt parent B_opt
+@@ file uv.lock
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "glyphs"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "requests" }]
+
+[package.optional-dependencies]
+fast = [{ name = "orjson" }]
+
+[package.dev-dependencies]
+dev = [{ name = "pytest" }]
+
+[[package]]
+name = "pytest"
+version = "8.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pytest-8.3.0.tar.gz", hash = "sha256:fixture-pytest-830" }
+
+[[package]]
+name = "requests"
+version = "2.32.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "urllib3" }]
+sdist = { url = "https://example.invalid/requests-2.32.3.tar.gz", hash = "sha256:fixture-requests-2323" }
+
+[[package]]
+name = "urllib3"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://example.invalid/urllib3-2.2.0-py3-none-any.whl", hash = "sha256:fixture-urllib3-220" },
+]
+
+[[package]]
+name = "orjson"
+version = "3.10.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/orjson-3.10.1.tar.gz", hash = "sha256:fixture-orjson-3101" }

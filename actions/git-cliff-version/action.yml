@@ -20,6 +20,28 @@ inputs:
       version from the commits under it instead of the root version.
     required: false
     default: ""
+  release-model:
+    description: >-
+      'legacy' (today's arithmetic, the default) or 'two-branch': stable runs
+      publish the next patch above the highest stable tag unless their range
+      holds a pending promotion, dev builds and promotions the next minor or,
+      for a breaking range, the next major (the next minor below 1.0.0, where
+      cliff-alpha reads a breaking change as a minor).
+    required: false
+    default: legacy
+  pending-version:
+    description: >-
+      Two-branch, dev channel: the version of the lane's pending promotion
+      (`compute.sh pending-version`), which dev builds number above. Empty
+      when nothing is pending.
+    required: false
+    default: ""
+  pending-in-range:
+    description: >-
+      Two-branch, stable channel: 'true' when this run's range holds a pending
+      promotion for the lane, so it publishes the promotion's version.
+    required: false
+    default: "false"
 
 outputs:
   base:
@@ -35,7 +57,9 @@ outputs:
     description: The dev version of `floor_base`; empty when no stable tag exists.
     value: ${{ steps.compute.outputs.floor_dev_version }}
   latest:
-    description: Newest reachable stable tag; empty when there is none.
+    description: >-
+      Newest reachable stable tag (two-branch: the highest stable tag of the
+      lane over all refs); empty when there is none.
     value: ${{ steps.compute.outputs.latest }}
   anchor_sha:
     description: >-
@@ -48,6 +72,25 @@ outputs:
   release:
     description: "'true' when `base` differs from `latest`."
     value: ${{ steps.compute.outputs.release }}
+  release_model:
+    description: "'two-branch' under that model; empty under legacy."
+    value: ${{ steps.compute.outputs.release_model }}
+  h_tag:
+    description: Two-branch only; the highest existing stable tag of the lane.
+    value: ${{ steps.compute.outputs.h_tag }}
+  range_from:
+    description: >-
+      Two-branch only; the commit the change level was read from (`<it>..HEAD`),
+      empty for the whole history or a repair run at a tagged commit.
+    value: ${{ steps.compute.outputs.range_from }}
+  change_level:
+    description: Two-branch only; major, minor, patch or none over that range.
+    value: ${{ steps.compute.outputs.change_level }}
+  script:
+    description: >-
+      Path to compute.sh, for `bash <script> pending-version <commit> [lane]`
+      in a later step of the same job (git-cliff stays installed).
+    value: ${{ steps.compute.outputs.script }}
 
 runs:
   using: composite
@@ -74,7 +117,11 @@ runs:
         CHANNEL: ${{ inputs.channel }}
         EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
         LANE: ${{ inputs.lane }}
+        RELEASE_MODEL: ${{ inputs.release-model }}
+        PENDING_VERSION: ${{ inputs.pending-version }}
+        PENDING_IN_RANGE: ${{ inputs.pending-in-range }}
         CLIFF_BIN: git-cliff
       run: |
         set -euo pipefail
         bash "$GITHUB_ACTION_PATH/compute.sh"
+        echo "script=$GITHUB_ACTION_PATH/compute.sh" >>"$GITHUB_OUTPUT"

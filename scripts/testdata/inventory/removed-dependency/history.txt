@@ -1,0 +1,145 @@
+@@ commit B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/keep v1.0.0
+    example.com/old v1.0.0
+)
+@@ commit M parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/keep v1.1.0
+    example.com/old v1.0.1
+)
+@@ commit T parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require example.com/keep v1.1.0
+@@ commit M_added parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/keep v1.0.0
+    example.com/new v1.0.0 // indirect
+    example.com/old v1.0.0
+)
+@@ commit M_removed parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require example.com/keep v1.0.0
+@@ commit T_moved_on parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/keep v1.0.0
+    example.com/old v1.2.0
+)
+@@ commit T_moved_back parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/keep v1.0.0
+    example.com/old v0.9.0
+)
+@@ commit D_step parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/keep v1.0.5
+    example.com/old v1.0.0
+)
+@@ commit T_after_step parent D_step
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require example.com/keep v1.1.0
+@@ commit D_took_new parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/keep v1.0.0
+    example.com/new v1.0.0 // indirect
+    example.com/old v1.0.0
+)
+@@ commit T_dropped_new parent D_took_new
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/keep v1.0.0
+    example.com/old v1.0.0
+)
+@@ commit D_took_newer parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/keep v1.0.0
+    example.com/new v1.1.0 // indirect
+    example.com/old v1.0.0
+)
+@@ commit T_dropped_newer parent D_took_newer
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/keep v1.0.0
+    example.com/old v1.0.0
+)
+@@ commit D_took_older parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/keep v1.0.0
+    example.com/new v0.9.0 // indirect
+    example.com/old v1.0.0
+)
+@@ commit T_dropped_older parent D_took_older
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/keep v1.0.0
+    example.com/old v1.0.0
+)

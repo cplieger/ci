@@ -71,26 +71,36 @@ jobs:
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
+          case "${INPUT_LIMIT}" in
+            '' | *[!0-9]* | 0) echo "::error::limit must be a positive integer, got '${INPUT_LIMIT}'"; exit 1 ;;
+          esac
           if [ "${INPUT_REPOS}" = "all" ]; then
             repos="${FLEET}"
           else
             repos="$(echo "${INPUT_REPOS}" | tr ',' ' ')"
           fi
+          # Over REST, newest first: the GraphQL quota is shared by every token of
+          # the owner. A listing carries each release's assets, so one read per page.
+          per_page=$(( INPUT_LIMIT < 100 ? INPUT_LIMIT : 100 ))
+          paginate=()
+          [ "${INPUT_LIMIT}" -le 100 ] || paginate=(--paginate)
           work="$(mktemp -d)"
           signed=0
           skipped=0
           for repo in ${repos}; do
             echo "::group::cplieger/${repo}"
-            tags="$(gh release list -R "cplieger/${repo}" --limit "${INPUT_LIMIT}" \
-              --json tagName --jq '.[].tagName' 2>/dev/null || true)"
-            if [ -z "${tags}" ]; then
+            listing="$(gh api "${paginate[@]}" "repos/cplieger/${repo}/releases?per_page=${per_page}" \
+              --jq '.[] | {tag: .tag_name, immutable: (.immutable == true), assets: [.assets[] | {id, name}]} | @json' 2>/dev/null \
+              | head -n "${INPUT_LIMIT}" || true)"
+            if [ -z "${listing}" ]; then
               echo "no releases found"
               echo "::endgroup::"
               continue
             fi
-            for tag in ${tags}; do
-              assets="$(gh release view "${tag}" -R "cplieger/${repo}" \
-                --json assets --jq '.assets[].name' 2>/dev/null || true)"
+            # fd 3, so no command in the loop can consume the list from stdin.
+            while read -r release <&3; do
+              tag="$(jq -r .tag <<< "${release}")"
+              assets="$(jq -r '.assets[].name' <<< "${release}")"
               case "${assets}" in
                 *sbom.spdx.json*) : ;;
                 *)
@@ -104,10 +114,16 @@ jobs:
                 skipped=$((skipped + 1))
                 continue
               fi
+              if [ "$(jq -r .immutable <<< "${release}")" = "true" ]; then
+                echo "${tag}: immutable release, assets cannot be added"
+                skipped=$((skipped + 1))
+                continue
+              fi
               d="${work}/${repo}/${tag}"
               mkdir -p "${d}"
-              gh release download "${tag}" -R "cplieger/${repo}" \
-                --pattern sbom.spdx.json --dir "${d}"
+              id="$(jq -r '.assets[] | select(.name == "sbom.spdx.json") | .id' <<< "${release}")"
+              gh api -H 'Accept: application/octet-stream' \
+                "repos/cplieger/${repo}/releases/assets/${id}" > "${d}/sbom.spdx.json"
               if [ "${INPUT_DRY_RUN}" = "true" ]; then
                 echo "${tag}: WOULD sign + upload sbom.spdx.json.sigstore.json"
                 signed=$((signed + 1))
@@ -119,7 +135,7 @@ jobs:
                 "${d}/sbom.spdx.json.sigstore.json"
               echo "${tag}: signed + uploaded sbom.spdx.json.sigstore.json"
               signed=$((signed + 1))
-            done
+            done 3<<< "${listing}"
             echo "::endgroup::"
           done
           echo "Done. signed=${signed} skipped=${skipped} dry_run=${INPUT_DRY_RUN}"

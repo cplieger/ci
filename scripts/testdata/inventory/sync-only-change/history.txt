@@ -1,0 +1,23 @@
+@@ commit B
+@@ file .editorconfig
+root = true
+# v1
+@@ file main.go
+package main
+@@ commit M parent B
+@@ file .editorconfig
+root = true
+# v2
+@@ commit T_same parent B
+@@ file .editorconfig
+root = true
+# v2
+@@ commit T_canonical parent B
+@@ file .editorconfig
+root = true
+# v3
+@@ commit T_stale parent B
+@@ file main.go
+package main
+
+// human work only

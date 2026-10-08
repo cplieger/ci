@@ -1,124 +1,125 @@
 #!/usr/bin/env python3
-"""Auto-discover and profile all cplieger repos, emitting .github/sync.yml.
+"""Auto-discover and profile every cplieger repo, printing the sync manifest.
 
-Preserves classify-repos.sh's discovery filters, classification logic,
-cliff-tier selection, repo ordering, and YAML output byte-for-byte. The
-manifest goes to STDOUT (sync.yaml redirects it to .github/sync.yml — a
-gitignored runtime artifact, never committed); per-repo diagnostics go to
-stderr.
+The manifest (.github/sync.yml) goes to stdout, per-repo diagnostics to stderr.
+A two-branch repo (release_channels.is_two_branch) is classified once per base
+from that base's tree and its groups carry `base:`; every other repo from HEAD.
 
-ALL releaseable repos receive the same ci.yaml: the central
-detect-and-dispatch workflow in cplieger/ci auto-detects surfaces (go.mod /
-jsr.json / Dockerfile / nested web frontend) and runs the right jobs itself,
-so there is no bespoke per-repo template.
+Importable: `sync_owned_patterns()` is every path the sync can write, and
+`canonical_sources(repo)` maps each of them to its source here.
 
-Auth: every GitHub read goes through the ambient `gh` CLI credentials
-(GH_TOKEN / SYNC_PAT in CI); no token handling here.
-
-Failure model: the initial `gh repo list` aborts on error, timeout (exit 124),
-or hitting the --limit ceiling. Per-repo TREE reads degrade to a safe
-fallback — an unreadable repo classifies as lang=none and drops out of every
-group. The TAGS read is the exception and aborts on failure instead: a
-misread there silently picks the wrong cliff tier and auto-merges the wrong
-cliff.toml.
-
-Run:
-  scripts/classify-repos.py > .github/sync.yml
+Failure model: the repo listing aborts on an error, a timeout or the page cap;
+an unreadable tree drops that repo (or base) from every group; a failed
+tags read aborts, because a guessed cliff tier auto-merges the wrong cliff.toml.
 """
 
-import json
-import subprocess
 import sys
+from typing import NamedTuple
 
+import ghrest
 import release_channels
 
 OWNER = 'cplieger'
 TIMEOUT = 10  # seconds per API call
-
-CI_FILES = """\
-    files:
-      - .editorconfig
-      - .gitattributes
-      - source: .github/workflow-templates/ci.yml
-        dest: .github/workflows/ci.yaml
-      - source: .github/workflow-templates/codeql.yml
-        dest: .github/workflows/codeql.yml
-      - source: .github/workflow-templates/security.yml
-        dest: .github/workflows/security.yml"""
-
-GOLANGCI_FILES = """\
-    files:
-      - .golangci.yaml
-      - source: configs/gremlins.yaml
-        dest: .gremlins.yaml"""
-
-SMOKE_FILES = """\
-    files:
-      - source: configs/image-smoke.sh
-        dest: tests/image-smoke.sh"""
-
-# The shell unit-test harness: the assert/extract library plus its own self-test.
-# Both are pure shared machinery with no repo-specific content, so they are synced;
-# tests/shell/run.sh stays REPO-OWNED because it is the hook's opt-in marker and
-# carries each repo's scope rationale, and the <area>_test.sh files are the repo's
-# own. Keeping run.sh out of the sync also avoids the bootstrap paradox of a marker
-# that only arrives once the repo already has it.
-SHELL_TEST_FILES = """\
-    files:
-      - source: configs/shell/lib.sh
-        dest: tests/shell/lib.sh
-      - source: configs/shell/harness_test.sh
-        dest: tests/shell/harness_test.sh"""
-
-PYTHON_FILES = """\
-    files:
-      - .editorconfig
-      - .gitattributes
-      - source: configs/ruff.toml
-        dest: ruff.toml"""
-
-# The sha256 integrity-pin recompute helper, invoked by Renovate's
-# postUpgradeTasks (cplieger/.github's default.json) so a version bump and its
-# recomputed digest land in one commit. Keyed on a root Dockerfile rather than
-# a committed opt-in marker, since the script only acts on `# repin: dep=...
-# url=...` marker lines it finds -- a Dockerfile with no markers just receives
-# an inert file, avoiding the bootstrap paradox tests/shell/run.sh also avoids.
-# collect-licenses.sh rides the same group: it runs in the builder stage of a
-# Dockerfile that opts in by calling it, and is inert until then.
-REPIN_FILES = """\
-    files:
-      - source: configs/repin-sha.sh
-        dest: scripts/repin-sha.sh
-      - source: configs/collect-licenses.sh
-        dest: scripts/collect-licenses.sh"""
+REST = ghrest.Client(timeout=TIMEOUT)
+# A two-branch repo's groups follow every other group, one block per base in this order.
+BASES = ('dev', 'main')
 
 
-TS_CONFIG_FILES = """\
-    files:
-      - source: configs/eslint.config.base.mjs
-        dest: eslint.config.base.mjs
-      - source: configs/prettier.json
-        dest: .prettierrc.json
-      - source: configs/stylelint.json
-        dest: .stylelintrc.json
-      - source: configs/htmlvalidate.json
-        dest: .htmlvalidate.json"""
+class Group(NamedTuple):
+    """One manifest group: its comment line and its files, each a path synced
+    under its own name or a (source, dest) pair."""
+
+    comment: str
+    files: tuple
 
 
-RELEASE_FILES = """\
-    files:
-      - source: .github/workflow-templates/release.yml
-        dest: .github/workflows/release.yaml"""
-
-CLIFF_STABLE_FILES = """\
-    files:
-      - source: configs/cliff-stable.toml
-        dest: cliff.toml"""
-
-CLIFF_ALPHA_FILES = """\
-    files:
-      - source: configs/cliff-alpha.toml
-        dest: cliff.toml"""
+CI = Group(
+    'Unified CI (auto-detects go/ts/web/shell surfaces)',
+    (
+        '.editorconfig',
+        '.gitattributes',
+        ('.github/workflow-templates/ci.yml', '.github/workflows/ci.yaml'),
+        ('.github/workflow-templates/codeql.yml', '.github/workflows/codeql.yml'),
+        ('.github/workflow-templates/security.yml', '.github/workflows/security.yml'),
+    ),
+)
+ARTIFACT_CI = Group(
+    'Unified CI for artifact repos (own publish.yaml, no central release.yaml)', CI.files
+)
+GOLANGCI = Group(
+    'Go-tooling configs (Go-having repos)',
+    ('.golangci.yaml', ('configs/gremlins.yaml', '.gremlins.yaml')),
+)
+SMOKE = Group(
+    'Image-smoke harness (repos with a tests/image-smoke.conf opt-in)',
+    (('configs/image-smoke.sh', 'tests/image-smoke.sh'),),
+)
+# The assert/extract library and its self-test carry no repo-specific content,
+# so they sync; tests/shell/run.sh stays repo-owned because it is the opt-in
+# marker, and a synced marker could only arrive once the repo already had it.
+SHELL_TEST = Group(
+    'Shell unit-test harness (repos with a tests/shell/run.sh opt-in)',
+    (
+        ('configs/shell/lib.sh', 'tests/shell/lib.sh'),
+        ('configs/shell/harness_test.sh', 'tests/shell/harness_test.sh'),
+    ),
+)
+# Keyed on a root Dockerfile rather than an opt-in marker: both scripts are
+# inert until a Dockerfile calls them (repin-sha.sh acts only on `# repin:`
+# lines; collect-licenses.sh only when the builder stage runs it).
+REPIN = Group(
+    'sha256 pin recompute helper (image repos; inert without # repin: markers)',
+    (
+        ('configs/repin-sha.sh', 'scripts/repin-sha.sh'),
+        ('configs/collect-licenses.sh', 'scripts/collect-licenses.sh'),
+    ),
+)
+PYTHON = Group(
+    'Python repos (ruff + editorconfig; bespoke ci.yaml)',
+    ('.editorconfig', '.gitattributes', ('configs/ruff.toml', 'ruff.toml')),
+)
+TS_CONFIG = Group(
+    'TypeScript lint/format configs',
+    (
+        ('configs/eslint.config.base.mjs', 'eslint.config.base.mjs'),
+        ('configs/prettier.json', '.prettierrc.json'),
+        ('configs/stylelint.json', '.stylelintrc.json'),
+        ('configs/htmlvalidate.json', '.htmlvalidate.json'),
+    ),
+)
+RELEASE = Group(
+    'Release (unified auto-detect)',
+    (('.github/workflow-templates/release.yml', '.github/workflows/release.yaml'),),
+)
+CLIFF = {
+    'stable': Group(
+        'Cliff config (stable — v1.x+)', (('configs/cliff-stable.toml', 'cliff.toml'),)
+    ),
+    'alpha': Group(
+        'Cliff config (alpha — v0.x or no tags)', (('configs/cliff-alpha.toml', 'cliff.toml'),)
+    ),
+}
+TWO_BRANCH_RENOVATE = Group(
+    'Two-branch Renovate delta (repos whose default branch is dev)',
+    (('configs/renovate-two-branch.json', 'renovate.json'),),
+)
+# Emission order, for the single-branch block and for each base's; the key
+# names the list assign() fills.
+GROUPS = (
+    ('ci', CI),
+    ('artifact_ci', ARTIFACT_CI),
+    ('golangci', GOLANGCI),
+    ('smoke', SMOKE),
+    ('shell_test', SHELL_TEST),
+    ('repin', REPIN),
+    ('python', PYTHON),
+    ('ts_config', TS_CONFIG),
+    ('release', RELEASE),
+    ('cliff_stable', CLIFF['stable']),
+    ('cliff_alpha', CLIFF['alpha']),
+    ('two_branch_renovate', TWO_BRANCH_RENOVATE),
+)
 
 HEADER = """\
 # Auto-generated by scripts/classify-repos.py — DO NOT EDIT MANUALLY.
@@ -127,56 +128,75 @@ HEADER = """\
 group:"""
 
 
+class ClassifyError(RuntimeError):
+    """A read the classification depends on failed; nothing may be guessed from it."""
+
+
+def pairs(group):
+    """The group's files as (source, dest) pairs."""
+    return [(f, f) if isinstance(f, str) else f for f in group.files]
+
+
+def render_files(group):
+    lines = ['    files:']
+    for entry in group.files:
+        if isinstance(entry, str):
+            lines.append(f'      - {entry}')
+        else:
+            lines += [f'      - source: {entry[0]}', f'        dest: {entry[1]}']
+    return '\n'.join(lines)
+
+
+def sync_owned_patterns():
+    """Every consumer path any group can write, sorted; reads no API."""
+    return sorted({dest for _key, group in GROUPS for _source, dest in pairs(group)})
+
+
+def canonical_sources(repo):
+    """{dest: source path in this repo} for every sync-owned path, with
+    cliff.toml resolved by `repo`'s cliff tier. Raises ClassifyError when the
+    tags read fails."""
+    tier = cliff_tier(repo.split('/')[-1], strict=True)
+    sources = {}
+    for _key, group in GROUPS:
+        if group in CLIFF.values() and group is not CLIFF[tier]:
+            continue
+        sources.update((dest, source) for source, dest in pairs(group))
+    return sources
+
+
 def bool_str(value):
-    """Render a bool the way the bash script did ('true' / 'false')."""
     return 'true' if value else 'false'
 
 
 def api_json(path):
-    """One `gh api` GET with the per-call timeout; parsed JSON, or None.
-
-    Mirrors the bash `api()` wrapper's call sites, which all silenced stderr
-    and fell back on any failure (`2>/dev/null || echo ...`): a timeout, an
-    HTTP error, or an unparseable body yields None, never an abort.
-    """
+    """One GET with the per-call timeout, under ghrest's retry policy; parsed
+    JSON, or None on a timeout, an HTTP error or an unparseable body, never an abort."""
     try:
-        proc = subprocess.run(
-            ['gh', 'api', path], check=False, capture_output=True, text=True, timeout=TIMEOUT
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    if proc.returncode != 0:
-        return None
-    try:
-        return json.loads(proc.stdout)
-    except json.JSONDecodeError:
+        return REST.get(path)
+    except ghrest.ApiError:
         return None
 
 
-def tree_paths(repo, recursive):
-    """Paths in the repo's HEAD git tree.
+def tree_paths(repo, recursive, ref='HEAD'):
+    """Paths in the repo's git tree at `ref`; [] when unreadable.
 
-    NOTE: GitHub treats ANY `recursive` value — including 0 — as enabling
-    recursion, so every call here returns the FULL tree (the bash had the
-    same misconception). Classification stays correct because all root
-    checks are exact-path matches; collapsing to one tree call per repo is
-    a deliberate follow-up, not part of the fidelity port.
+    GitHub treats ANY `recursive` value, 0 included, as enabling recursion, so
+    every call returns the full tree; the root checks are exact-path matches,
+    so that stays correct.
     """
-    data = api_json(f'repos/{OWNER}/{repo}/git/trees/HEAD?recursive={recursive}')
+    data = api_json(f'repos/{OWNER}/{repo}/git/trees/{ref}?recursive={recursive}')
     if not isinstance(data, dict):
         return []
     return [entry.get('path', '') for entry in data.get('tree') or [] if isinstance(entry, dict)]
 
 
-def latest_tag(repo):
+def latest_tag(repo, strict=False):
     """Name of the repo's newest STABLE tag (vX.Y.Z): '' when there is none,
-    None when the read FAILED.
-
-    Failure must not classify: the bash treated a failed tags read as
-    untagged, so a transient API error on a live v0.x repo flipped it to
-    the stable cliff tier and the sync auto-merged the wrong cliff.toml.
-    A dev or lane tag is not a root version, so the listing pages past them.
-    """
+    None when the read FAILED. A dev or lane tag is not a root version, so the
+    listing pages past them; TagListingTruncatedError when it cannot. Under
+    `strict` a page that is not a list of objects with a string `name` failed;
+    otherwise it reads as the entries it has, which a main-default repo keeps."""
 
     def fetch(page):
         data = api_json(
@@ -184,74 +204,74 @@ def latest_tag(repo):
         )
         if data is None:
             return None
+        if strict:
+            shaped = isinstance(data, list) and all(
+                isinstance(e, dict) and isinstance(e.get('name'), str) and e['name'] for e in data
+            )
+            return [e['name'] for e in data] if shaped else None
         if not isinstance(data, list):
             return []
         return [entry.get('name') or '' for entry in data if isinstance(entry, dict)]
 
-    try:
-        names = release_channels.collect_tags(fetch, want_stable=1)
-    except release_channels.TagListingTruncatedError as err:
-        sys.exit(
-            f'classify-repos: tags listing of {repo} truncated ({err}); aborting rather than guessing the cliff tier'
-        )
+    names = release_channels.collect_tags(fetch, want_stable=1)
     if names is None:
         return None
     return release_channels.newest_stable_tag(names)
 
 
+def cliff_tier(repo, strict=False):
+    """'alpha' when the newest stable tag is v0.x, else 'stable' (so an untagged
+    repo's first release bumps to v1.0.0). ClassifyError when the tags read fails;
+    `strict` is latest_tag's."""
+    try:
+        tag = latest_tag(repo, strict)
+    except release_channels.TagListingTruncatedError as err:
+        msg = f'tags listing of {repo} truncated ({err}); aborting rather than guessing the cliff tier'
+        raise ClassifyError(msg) from None
+    if tag is None:
+        msg = f'tags read failed for {repo}; aborting rather than guessing the cliff tier'
+        raise ClassifyError(msg)
+    return 'alpha' if tag.startswith('v0.') else 'stable'
+
+
 def discover_repos():
-    """All non-archived, non-fork cplieger repo names, byte-order sorted.
+    """Every non-archived, non-fork cplieger repo as a REST-shaped repository
+    object (name, default_branch, visibility, fork, archived), byte-order sorted
+    by name.
 
-    The bash sorted with plain `sort`; on the ubuntu-24.04 sync runner
-    (LANG=C.UTF-8) that is byte order, which Python's str sort matches
-    regardless of the ambient locale.
-
-    Forks are excluded org-wide (same rule as audit.py): a fork's tree is
-    UPSTREAM's, so syncing our conventions into it rewrites code we do not own,
-    runs our pipelines against upstream's code on every push, and makes the
-    fork diverge from the branch it exists to track.
+    Forks are excluded (same rule as audit.py): a fork's tree is UPSTREAM's, so
+    syncing our conventions into it rewrites code we do not own.
     """
     try:
-        proc = subprocess.run(
-            [
-                'gh',
-                'repo',
-                'list',
-                OWNER,
-                '--limit',
-                '300',
-                '--json',
-                'name,isArchived,isFork,primaryLanguage',
-            ],
-            check=False,
-            stdout=subprocess.PIPE,
-            text=True,
-            timeout=TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        sys.exit(124)  # what `timeout N gh ...` exited with under set -e
-    if proc.returncode != 0:
-        sys.exit(proc.returncode)  # stderr already passed through, like the bash
-    repos = json.loads(proc.stdout)
-    names = sorted(
-        repo['name']
-        for repo in repos
-        if repo.get('isArchived') is False and repo.get('isFork') is False
+        repos = REST.pages('user/repos?affiliation=owner')
+    except ghrest.RequestTimeoutError:
+        sys.exit(124)  # what `timeout N gh ...` exits with under set -e
+    except ghrest.ApiError as err:
+        sys.exit(f'classify-repos: repo listing failed: {err}')
+    return sorted(
+        (
+            {
+                'name': repo['name'],
+                'default_branch': repo.get('default_branch') or '',
+                'visibility': str(repo.get('visibility') or '').lower(),
+                'fork': False,
+                'archived': False,
+            }
+            for repo in repos
+            if repo.get('archived') is False and repo.get('fork') is False
+        ),
+        key=lambda repo: repo['name'],
     )
-    if len(repos) >= 300:
-        sys.exit('classify-repos: repo list hit the --limit 300 ceiling; raise the limit')
-    return names
 
 
-def classify(repo):
-    """Profile one repo (surfaces, language, cliff tier), mirroring the bash.
+def classify(repo, ref='HEAD'):
+    """Profile the repo's surfaces and language from its tree at `ref`.
 
-    Makes the same API calls in the same order: root tree, a recursive tree
-    only for go.mod repos without a root-level web dir, a second recursive
-    tree for the image-smoke opt-in (kept separate so failure behavior stays
-    call-for-call identical), then the tags read.
+    Calls, in order: the root tree, a recursive tree only for go.mod repos
+    without a root-level web dir, then a second recursive tree for the opt-in
+    markers. The cliff tier is read separately (cliff_tier).
     """
-    root = tree_paths(repo, '0')
+    root = tree_paths(repo, '0', ref)
     has_gomod = 'go.mod' in root
     has_jsr = 'jsr.json' in root
     has_pkg = 'package.json' in root
@@ -259,30 +279,17 @@ def classify(repo):
     has_pyproject = 'pyproject.toml' in root
     is_web = 'static-src' in root or 'web' in root
 
-    # go.mod without a root web dir: check for deeper web indicators
-    # (e.g. internal/server/static-src, a nested */web/* tree).
+    # Deeper web indicators: internal/server/static-src, a nested */web/* tree.
     if has_gomod and not is_web:
-        deep = tree_paths(repo, '1')
+        deep = tree_paths(repo, '1', ref)
         is_web = any('static-src' in path or '/web/' in path for path in deep)
-    # An app opts into the shared image-smoke harness by committing
-    # tests/image-smoke.conf; the canonical harness (configs/image-smoke.sh)
-    # then syncs to its tests/image-smoke.sh. tests/ is below the root tree,
-    # so this needs the recursive listing.
-    # Both opt-ins read the same recursive listing, so the second costs no
-    # additional API call. A repo enrolls in the shell unit-test harness by
-    # committing tests/shell/run.sh -- the same file cplieger/ci's shell-ci hook
-    # looks for, so enrolment and execution cannot disagree.
-    deep_tree = tree_paths(repo, '1')
+    deep_tree = tree_paths(repo, '1', ref)
     has_smoke = 'tests/image-smoke.conf' in deep_tree
+    # The same file shell-ci.yaml runs, so enrolment and execution cannot disagree.
     has_shell_tests = 'tests/shell/run.sh' in deep_tree
-    # An artifact repo publishes its own build product from its own
-    # .github/workflows/publish.yaml, because the central release.yaml only
-    # covers go.mod/jsr.json/Dockerfile surfaces. It still needs the meta CI, so
-    # that file is the enrolment marker (presence-is-enrolment, like the two
-    # opt-ins above). It has to be a marker rather than "not releaseable":
-    # the private repos are also not releaseable and carry deliberately
-    # bespoke single-job CI that the meta workflow must never overwrite. None of
-    # them has a publish.yaml; tool-catalog and web-terminal-glyphs do.
+    # An artifact repo publishes from its own publish.yaml and still needs the
+    # meta CI. A marker, not "not releaseable": a repo that releases nothing may
+    # keep its own CI, which the sync must never overwrite.
     has_publish = '.github/workflows/publish.yaml' in deep_tree
 
     if has_gomod:
@@ -296,31 +303,13 @@ def classify(repo):
     else:
         lang = 'none'
 
-    # Cliff tier: default to stable. Only fall back to alpha when the repo is
-    # explicitly mid-0.x (latest tag is v0.x). This way fresh/untagged repos
-    # get the stable policy so their first release naturally bumps to v1.0.0
-    # instead of being trapped at v0.1.0 by alpha's no-major-bump rule.
-    tag = latest_tag(repo)
-    if tag is None:
-        sys.exit(
-            f'classify-repos: tags read failed for {repo}; aborting rather than guessing the cliff tier'
-        )
-    cliff_tier = 'alpha' if tag.startswith('v0.') else 'stable'
-
-    can_release = has_gomod or has_jsr or has_dockerfile
-    print(
-        f'  classified: {repo:<30} lang={lang:<5} web={bool_str(is_web):<5} '
-        f'cliff={cliff_tier:<6} release={bool_str(can_release)}',
-        file=sys.stderr,
-    )
     return {
+        'readable': bool(root),
         'lang': lang,
         'has_jsr': has_jsr,
         'has_pkg': has_pkg,
         'is_web': is_web,
-        'cliff_tier': cliff_tier,
-        'has_code': lang in ('go', 'ts'),  # codeql set
-        'can_release': can_release,  # go.mod, jsr.json, or Dockerfile
+        'can_release': has_gomod or has_jsr or has_dockerfile,
         'has_smoke': has_smoke,
         'has_shell_tests': has_shell_tests,
         'has_dockerfile': has_dockerfile,
@@ -328,7 +317,67 @@ def classify(repo):
     }
 
 
-def print_group(comment, repos, files, *, lead_blank=True):
+def log_profile(repo, profile, base=None):
+    line = (
+        f'  classified: {repo:<30} lang={profile["lang"]:<5} web={bool_str(profile["is_web"]):<5} '
+        f'cliff={profile["cliff_tier"]:<6} release={bool_str(profile["can_release"])}'
+    )
+    if base:
+        line += f' base={base}' + ('' if profile['readable'] else ' (tree unreadable, skipped)')
+    print(line, file=sys.stderr)
+
+
+def assign(repo_names, profiles):
+    """{group key: repos} over `repo_names` (in order) and their profiles."""
+    groups = {key: [] for key, _group in GROUPS}
+    for repo in repo_names:
+        profile = profiles[repo]
+        lang = profile['lang']
+
+        # Both opt-ins below resolve BEFORE the lang gate: a repo can carry
+        # tested shell or its own publish.yaml while classifying lang=none
+        # or lang=python.
+        if profile['has_shell_tests']:
+            groups['shell_test'].append(repo)
+        # can_release keeps the two CI groups disjoint.
+        if profile['has_publish'] and not profile['can_release']:
+            groups['artifact_ci'].append(repo)
+
+        if lang == 'none':
+            continue
+        # Lint baseline only; these repos keep their own bespoke ci.yaml.
+        if lang == 'python':
+            groups['python'].append(repo)
+            continue
+
+        if profile['can_release']:
+            groups['ci'].append(repo)
+            # Its own publish.yaml owns the repo's Releases; a synced release.yaml
+            # would cut code Releases marked latest over them.
+            if not profile['has_publish']:
+                groups['release'].append(repo)
+        if lang == 'go':
+            groups['golangci'].append(repo)
+        if lang == 'ts':
+            groups['ts_config'].append(repo)
+        if profile['has_smoke']:
+            groups['smoke'].append(repo)
+        if profile['has_dockerfile']:
+            groups['repin'].append(repo)
+        groups['cliff_stable' if profile['cliff_tier'] == 'stable' else 'cliff_alpha'].append(repo)
+
+    # Go repos that also have a TS surface need the TS configs too; appended
+    # after the pure-TS repos, in repo order.
+    for repo in repo_names:
+        profile = profiles[repo]
+        if profile['lang'] == 'go' and (
+            profile['has_jsr'] or profile['has_pkg'] or profile['is_web']
+        ):
+            groups['ts_config'].append(repo)
+    return groups
+
+
+def print_group(comment, repos, group, *, lead_blank=True, base=None):
     """Emit one sync.yml group (comment, repos block, file list) if non-empty."""
     if not repos:
         return
@@ -338,124 +387,48 @@ def print_group(comment, repos, files, *, lead_blank=True):
     print('  - repos: |')
     for repo in repos:
         print(f'      {OWNER}/{repo}')
-    print(files)
+    if base:
+        print(f'    base: {base}')
+    print(render_files(group))
 
 
 def main():
     # Skip the ci repo itself (it is the sync source, never a target).
-    repo_names = [name for name in discover_repos() if name != 'ci']
+    repos = [repo for repo in discover_repos() if repo['name'] != 'ci']
 
-    profiles = {repo: classify(repo) for repo in repo_names}
+    single = []
+    profiles = {}
+    per_base = {base: {} for base in BASES}
+    try:
+        for repo in repos:
+            name = repo['name']
+            if release_channels.is_two_branch(repo):
+                found = {base: classify(name, base) for base in BASES}
+                tier = cliff_tier(name, strict=True)
+                for base, profile in found.items():
+                    profile['cliff_tier'] = tier
+                    log_profile(name, profile, base)
+                    if profile['readable']:
+                        per_base[base][name] = profile
+            else:
+                profile = classify(name)
+                profile['cliff_tier'] = cliff_tier(name)
+                log_profile(name, profile)
+                single.append(name)
+                profiles[name] = profile
+    except ClassifyError as err:
+        sys.exit(f'classify-repos: {err}')
 
-    # --- Collect repos into groups ---
-    ci_repos = []  # ALL releaseable repos -> unified ci.yml
-    artifact_ci_repos = []  # non-releaseable repos with their own publish.yaml
-    codeql_repos = []  # go/ts repos (codeql)
-    release_repos = []
-    cliff_stable = []
-    cliff_alpha = []
-    golangci_repos = []  # all go repos get .golangci.yaml
-    ts_config_repos = []  # ts repos + go-cross-language repos get the TS lint configs
-    python_repos = []  # python repos (pyproject.toml) -> ruff.toml + .editorconfig only
-    smoke_repos = []  # repos that opted into the shared image-smoke harness
-    shell_test_repos = []  # repos that opted into the shell unit-test harness
-    repin_repos = []  # image repos: sha256-pin recompute helper (inert without markers)
-
-    for repo in repo_names:
-        profile = profiles[repo]
-        lang = profile['lang']
-
-        # Resolved BEFORE the lang gate below: the shell unit-test harness keys
-        # on an explicit opt-in marker (tests/shell/run.sh), not language, and
-        # a repo with branching shell can classify lang=none. image-smoke stays
-        # language-gated: it drives a built image, so an opter has a Dockerfile.
-        if profile['has_shell_tests']:
-            shell_test_repos.append(repo)
-
-        # Resolved before the lang gate for the same reason: an artifact repo
-        # can classify lang=none (tool-catalog: no go.mod/Dockerfile/package.json)
-        # or lang=python (web-terminal-glyphs: pyproject.toml), and both of those
-        # early-out below. The can_release guard keeps the two CI_FILES groups
-        # disjoint -- a releaseable repo already gets them via ci_repos.
-        if profile['has_publish'] and not profile['can_release']:
-            artifact_ci_repos.append(repo)
-
-        if lang == 'none':
-            continue
-
-        # Python repos (e.g. the tools methodology repo): lint baseline only —
-        # ruff + .editorconfig. Not releaseable, not compiled, so no ci.yml/
-        # codeql/release/cliff; they keep their own bespoke ci.yaml.
-        if lang == 'python':
-            python_repos.append(repo)
-            continue
-
-        if profile['has_code']:
-            codeql_repos.append(repo)
-        if profile['can_release']:
-            ci_repos.append(repo)
-            # Its own publish.yaml owns the repo's Releases; a synced release.yaml
-            # would cut code Releases marked latest over them.
-            if not profile['has_publish']:
-                release_repos.append(repo)
-        if lang == 'go':
-            golangci_repos.append(repo)
-        if lang == 'ts':
-            ts_config_repos.append(repo)
-        if profile['has_smoke']:
-            smoke_repos.append(repo)
-        if profile['has_dockerfile']:
-            repin_repos.append(repo)
-        if profile['cliff_tier'] == 'stable':
-            cliff_stable.append(repo)
-        else:
-            cliff_alpha.append(repo)
-
-    # Cross-language Go repos that ALSO have TS surfaces (e.g.
-    # web-terminal-engine: go.mod + web/jsr.json, marotte/web-terminal-kiro/
-    # subflux: go.mod + static-src/) — also need TS lint configs. Appended
-    # after the pure-TS repos, in repo order, like the bash's second pass.
-    for repo in repo_names:
-        profile = profiles[repo]
-        if profile['lang'] == 'go' and (
-            profile['has_jsr'] or profile['has_pkg'] or profile['is_web']
-        ):
-            ts_config_repos.append(repo)
-
-    # --- Generate sync.yml ---
     print(HEADER)
-    print_group(
-        'Unified CI (auto-detects go/ts/web/shell surfaces)',
-        ci_repos,
-        CI_FILES,
-        lead_blank=False,
-    )
-    print_group(
-        'Unified CI for artifact repos (own publish.yaml, no central release.yaml)',
-        artifact_ci_repos,
-        CI_FILES,
-    )
-    print_group('Go-tooling configs (Go-having repos)', golangci_repos, GOLANGCI_FILES)
-    print_group(
-        'Image-smoke harness (repos with a tests/image-smoke.conf opt-in)',
-        smoke_repos,
-        SMOKE_FILES,
-    )
-    print_group(
-        'Shell unit-test harness (repos with a tests/shell/run.sh opt-in)',
-        shell_test_repos,
-        SHELL_TEST_FILES,
-    )
-    print_group(
-        'sha256 pin recompute helper (image repos; inert without # repin: markers)',
-        repin_repos,
-        REPIN_FILES,
-    )
-    print_group('Python repos (ruff + editorconfig; bespoke ci.yaml)', python_repos, PYTHON_FILES)
-    print_group('TypeScript lint/format configs', ts_config_repos, TS_CONFIG_FILES)
-    print_group('Release (unified auto-detect)', release_repos, RELEASE_FILES)
-    print_group('Cliff config (stable — v1.x+)', cliff_stable, CLIFF_STABLE_FILES)
-    print_group('Cliff config (alpha — v0.x or no tags)', cliff_alpha, CLIFF_ALPHA_FILES)
+    groups = assign(single, profiles)
+    for index, (key, group) in enumerate(GROUPS):
+        print_group(group.comment, groups[key], group, lead_blank=index > 0)
+    for base in BASES:
+        names = sorted(per_base[base])
+        groups = assign(names, per_base[base])
+        groups['two_branch_renovate'] = names
+        for key, group in GROUPS:
+            print_group(f'{group.comment} (base: {base})', groups[key], group, base=base)
 
 
 if __name__ == '__main__':

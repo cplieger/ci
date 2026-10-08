@@ -26,16 +26,24 @@ Scope guarantees:
     - An empty regenerated body (every commit in range excluded) becomes a
       maintenance stub plus a collapsed list of the excluded subjects,
       rather than deleting the release.
+    - Nested Go module lanes are excluded from these root bodies, as
+      release.yaml renders them.
+    - `--release-model two-branch` renders each body through render-notes.sh
+      instead, the system-package diff read from the two releases' SBOM
+      assets when both carry one whose Sigstore bundle verifies (cosign) as
+      signed by this repository's release run at the tag's commit (or, for a
+      repaired Release, at a main commit up to the next stable tag), and the
+      updates merged through a Renovate security PR into main or dev marked.
     - Draft releases and non-vX.Y.Z tags skip with a notice; a skipped tag's
-      window folds into the next stable tag's range. >1000 releases aborts
-      (no pagination).
+      window folds into the next stable tag's range. More than 1000 releases
+      aborts rather than plan from a truncated list.
     - A release listed in --carve-outs (default: backfill-carve-outs.yaml
       beside this script) carries hand-written text no commit contains, so it
       is skipped in plan and apply with a notice; --include-carved overrides.
 
-Run from (or point --repo-dir at) a local clone whose git remote is the
-GitHub repo; `gh` resolves the repo from the remote and must be authed.
-Requires Python 3.10+ and PyYAML. Run AFTER the new cliff.toml has synced into the repo,
+Run from (or point --repo-dir at) a local clone whose `origin` remote is the
+GitHub repo; `gh` must be authed, and every GitHub call is REST.
+Requires Python 3.11+ and PyYAML. Run AFTER the new cliff.toml has synced into the repo,
 or pass --config pointing at cplieger/ci's configs/cliff-stable.toml (or
 cliff-alpha.toml for pre-1.0 repos).
 
@@ -44,6 +52,7 @@ Usage:
     backfill-release-notes.py --only v1.0.6 --only v1.0.7
     backfill-release-notes.py --config ../ci/configs/cliff-stable.toml
     backfill-release-notes.py --apply                # edit after reviewing
+    backfill-release-notes.py --release-model two-branch   # render-notes.sh bodies
     backfill-release-notes.py --restore .release-notes-backup/1752600000
 """
 
@@ -51,36 +60,60 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import functools
 import hashlib
 import itertools
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
-if sys.version_info < (3, 10):  # noqa: UP036 - the guard IS the feature
-    sys.exit('error: this script needs Python 3.10+')
+if sys.version_info < (3, 11):  # noqa: UP036 - the guard IS the feature
+    sys.exit('error: this script needs Python 3.11+')
+
+# Imported after the guard: inventory needs tomllib (3.11+).
+import ghrest
+from inventory import Repo
 
 STUB_BODY = (
     '_Maintenance release: this range contains no changes eligible for release notes '
     'under the current policy (CI/dependency plumbing, docs, or test-only changes)._'
 )
 SEMVER_TAG = re.compile(r'^v(\d+)\.(\d+)\.(\d+)$')
+GITHUB_REMOTE = re.compile(
+    r'(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+?)(?:\.git)?/?'
+)
 RELEASE_LIST_CAP = 1000
 MAX_STUB_SUBJECTS = 100
+SBOM_ASSET = 'sbom.spdx.json'
+SBOM_BUNDLE = f'{SBOM_ASSET}.sigstore.json'
+# The identity docker-release.yaml signs the SBOM asset with (keyless).
+SBOM_SIGNER = r'^https://github\.com/cplieger/ci/\.github/workflows/docker-release\.yaml@'
+SBOM_ISSUER = 'https://token.actions.githubusercontent.com'
+RENDER_NOTES = Path(__file__).resolve().parent / 'render-notes.sh'
+RELEASE_STATE = Path(__file__).resolve().parent / 'release-state.sh'
 CARVE_OUTS = Path(__file__).resolve().with_name('backfill-carve-outs.yaml')
 
 
 def run(
-    cmd: list[str], cwd: Path, *, check: bool = True, timeout: int = 120
+    cmd: list[str],
+    cwd: Path,
+    *,
+    check: bool = True,
+    timeout: int = 120,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(
+        cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env, check=False
+    )
     if check and proc.returncode != 0:
         print(f'error: {" ".join(cmd)} failed with rc={proc.returncode}', file=sys.stderr)
         print(proc.stderr.strip(), file=sys.stderr)
@@ -98,42 +131,55 @@ def sha256(text: str) -> str:
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
+def rest(call, *args):
+    """A ghrest call; any API failure exits 2 with its message, as a failed gh run does."""
+    try:
+        return call(*args)
+    except ghrest.ApiError as err:
+        print(f'error: {err}', file=sys.stderr)
+        sys.exit(2)
+
+
 def repo_identity(repo_dir: Path) -> str:
-    proc = run(['gh', 'repo', 'view', '--json', 'nameWithOwner'], repo_dir)
-    return json.loads(proc.stdout)['nameWithOwner']
-
-
-def list_release_tags(repo_dir: Path) -> list[str]:
-    """Published, non-draft, plain-semver release tags, sorted ascending."""
-    proc = run(
-        [
-            'gh',
-            'release',
-            'list',
-            '--limit',
-            str(RELEASE_LIST_CAP),
-            '--json',
-            'tagName,isDraft,isPrerelease',
-        ],
-        repo_dir,
-    )
-    entries = json.loads(proc.stdout)
-    if len(entries) >= RELEASE_LIST_CAP:
+    """`owner/name` of the `origin` remote, as GitHub names it (a renamed repository
+    answers with its current name)."""
+    url = run(['git', 'config', '--get', 'remote.origin.url'], repo_dir, check=False).stdout
+    m = GITHUB_REMOTE.fullmatch(url.strip())
+    if not m:
         print(
-            f'error: {len(entries)} releases returned (cap {RELEASE_LIST_CAP}); '
-            'refusing to proceed on a possibly-truncated list',
+            f'error: origin is not a github.com remote: {url.strip() or "(none)"}', file=sys.stderr
+        )
+        sys.exit(2)
+    return rest(ghrest.get, f'repos/{m[1]}')['full_name']
+
+
+def release_of(repo: str, tag: str) -> dict:
+    """The published release of `tag`, read fresh."""
+    return rest(ghrest.get, f'repos/{repo}/releases/tags/{urllib.parse.quote(tag, safe="")}')
+
+
+def list_release_tags(repo: str) -> list[str]:
+    """Published, non-draft, plain-semver release tags, sorted ascending."""
+    per_page = 100
+    try:
+        entries = ghrest.pages(
+            f'repos/{repo}/releases', per_page=per_page, cap=RELEASE_LIST_CAP // per_page
+        )
+    except ghrest.ApiError as err:
+        print(
+            f'error: {err}. Refusing to proceed on a possibly-truncated release list.',
             file=sys.stderr,
         )
         sys.exit(2)
     tags: list[tuple[int, int, int, str]] = []
     for entry in entries:
-        tag = entry['tagName']
-        if entry.get('isDraft'):
+        tag = entry['tag_name']
+        if entry.get('draft'):
             print(f'  skip {tag}: draft release', file=sys.stderr)
             continue
         m = SEMVER_TAG.match(tag)
         if not m:
-            kind = 'prerelease' if entry.get('isPrerelease') else 'non-semver tag'
+            kind = 'prerelease' if entry.get('prerelease') else 'non-semver tag'
             print(
                 f'  skip {tag}: {kind} (its window folds into the next stable tag)', file=sys.stderr
             )
@@ -177,12 +223,174 @@ def verify_tags(repo_dir: Path, tags: list[str]) -> dict[str, str]:
     return shas
 
 
-def render_range(repo_dir: Path, cliff_bin: str, config: Path, prev: str, tag: str) -> str:
+def lanes_at(repo_dir: Path, sha: str) -> list[str]:
+    """Nested Go module lanes at `sha`, which release.yaml gives their own releases."""
+    return Repo(str(repo_dir)).lanes(sha)
+
+
+def render_range(
+    repo_dir: Path, cliff_bin: str, config: Path, prev: str, tag: str, lanes: list[str]
+) -> str:
+    excludes = [arg for lane in lanes for arg in ('--exclude-path', f'{lane}/**')]
     proc = run(
-        [cliff_bin, '--config', str(config), '--strip', 'header', f'{prev}..{tag}'],
+        [cliff_bin, '--config', str(config), *excludes, '--strip', 'header', f'{prev}..{tag}'],
         repo_dir,
     )
     return proc.stdout.strip()
+
+
+def download_asset(repo: str, tag: str, name: str, target: Path) -> bool:
+    """Whether the release of `tag` has asset `name` and it was written to `target`."""
+    try:
+        release = ghrest.get(f'repos/{repo}/releases/tags/{urllib.parse.quote(tag, safe="")}')
+        ids = [a['id'] for a in release.get('assets') or [] if a.get('name') == name]
+        if not ids:
+            return False
+        path = f'repos/{repo}/releases/assets/{ids[0]}'
+        data = ghrest.DEFAULT.request('GET', path, headers=('Accept: application/octet-stream',))
+    except ghrest.ApiError as err:
+        print(f'  warning: {tag}: {name} could not be downloaded: {err}', file=sys.stderr)
+        return False
+    target.mkdir(parents=True, exist_ok=True)
+    (target / name).write_bytes(data.body)
+    return True
+
+
+def repair_signers(repo_dir: Path, sha: str) -> list[str]:
+    """The main commits after `sha` whose run may have repaired its Release: each first
+    parent up to and including the first one carrying another stable tag, since a repair
+    runs before any newer version publishes."""
+    tip = 'refs/remotes/origin/main'
+    if run(['git', 'rev-parse', '--verify', '-q', tip], repo_dir, check=False).returncode != 0:
+        tip = 'HEAD'
+    walk = run(
+        ['git', 'rev-list', '--first-parent', '--ancestry-path', '--reverse', f'{sha}..{tip}'],
+        repo_dir,
+    )
+    signers = []
+    for commit in walk.stdout.split():
+        signers.append(commit)
+        tags = run(['git', 'tag', '--points-at', commit], repo_dir).stdout.split()
+        if any(SEMVER_TAG.match(t) for t in tags):
+            break
+    return signers
+
+
+# Once per tag: a middle release is both pairs' side.
+@functools.cache
+def release_sbom(
+    repo_dir: Path, repo: str, tag: str, sha: str, dest: Path, cosign_bin: str
+) -> Path | None:
+    """The release's SBOM asset once its Sigstore bundle verifies as signed by a
+    docker-release.yaml run of `repo` at `sha` or, for a repaired Release, at one of
+    `repair_signers`, else None."""
+    target = dest / tag.replace('/', '_')
+    for asset in (SBOM_ASSET, SBOM_BUNDLE):
+        if not download_asset(repo, tag, asset, target):
+            if asset == SBOM_BUNDLE:
+                print(
+                    f'  warning: {tag} carries no {SBOM_BUNDLE}, so its SBOM is not used',
+                    file=sys.stderr,
+                )
+            return None
+    path = target / SBOM_ASSET
+    # Every consumer of docker-release.yaml signs under the same identity; the
+    # repository and commit extensions are what tie a bundle to this release.
+    for signer in [sha, *repair_signers(repo_dir, sha)]:
+        cmd = [
+            cosign_bin,
+            'verify-blob',
+            '--bundle',
+            str(target / SBOM_BUNDLE),
+            '--certificate-oidc-issuer',
+            SBOM_ISSUER,
+            '--certificate-identity-regexp',
+            SBOM_SIGNER,
+            '--certificate-github-workflow-repository',
+            repo,
+            '--certificate-github-workflow-sha',
+            signer,
+            str(path),
+        ]
+        try:
+            proc = run(cmd, repo_dir, check=False)
+        except FileNotFoundError:
+            print(f'error: {cosign_bin} not found. It verifies the SBOM assets.', file=sys.stderr)
+            sys.exit(2)
+        if proc.returncode == 0:
+            return path
+    print(
+        f'  warning: {tag}: {SBOM_ASSET} does not verify against its bundle, so its SBOM is not used',
+        file=sys.stderr,
+    )
+    return None
+
+
+def security_shas(repo_dir: Path, repo: str, prevs: list[str], scratch: Path) -> Path:
+    """A file of the merges of `repo`'s Renovate security PRs into main or dev
+    that can fall inside a range starting at one of `prevs`."""
+    floor = min(int(run(['git', 'log', '-1', '--format=%ct', p], repo_dir).stdout) for p in prevs)
+    proc = run(
+        ['bash', str(RELEASE_STATE), 'security-shas', str(floor)],
+        repo_dir,
+        env={**os.environ, 'GITHUB_REPOSITORY': repo},
+    )
+    path = scratch / 'security-shas'
+    path.write_text(proc.stdout, encoding='utf-8')
+    return path
+
+
+def render_two_branch(
+    repo_dir: Path,
+    cliff_bin: str,
+    cosign_bin: str,
+    config: Path,
+    repo: str,
+    prev: str,
+    tag: str,
+    tag_shas: dict[str, str],
+    lanes: list[str],
+    scratch: Path,
+    security: Path | None,
+) -> str:
+    """The body render-notes.sh gives `tag` under the two-branch release model."""
+    has_image = run(['git', 'cat-file', '-e', f'{tag}:Dockerfile'], repo_dir, check=False)
+    site = 'docker' if has_image.returncode == 0 else 'go'
+    out = scratch / f'{tag.replace("/", "_")}.md'
+    cmd = [
+        'bash',
+        str(RENDER_NOTES),
+        '--release-model',
+        'two-branch',
+        '--site',
+        site,
+        '--version',
+        tag,
+        '--release-commit',
+        tag,
+        '--repo',
+        repo,
+        '--config',
+        str(config),
+        '--go-lanes',
+        json.dumps(lanes),
+        '--out',
+        str(out),
+    ]
+    if security is not None:
+        cmd += ['--security-shas', str(security)]
+    if site == 'docker':
+        pair = (
+            release_sbom(repo_dir, repo, prev, tag_shas[prev], scratch, cosign_bin),
+            release_sbom(repo_dir, repo, tag, tag_shas[tag], scratch, cosign_bin),
+        )
+        if all(pair):
+            cmd += ['--sbom-prev', str(pair[0]), '--sbom-new', str(pair[1])]
+    # render-notes.sh refuses a token: git-cliff executes the repository's config.
+    env = {k: v for k, v in os.environ.items() if k not in {'GITHUB_TOKEN', 'GH_TOKEN'}}
+    env['CLIFF_BIN'] = cliff_bin
+    run(cmd, repo_dir, env=env)
+    return out.read_text(encoding='utf-8').strip()
 
 
 def excluded_subjects(repo_dir: Path, prev: str, tag: str) -> list[str]:
@@ -207,21 +415,14 @@ def stub_body(repo_dir: Path, prev: str, tag: str) -> str:
     return '\n'.join(lines)
 
 
-def fetch_body(repo_dir: Path, tag: str) -> str:
-    proc = run(['gh', 'release', 'view', tag, '--json', 'body'], repo_dir)
-    return json.loads(proc.stdout).get('body') or ''
+def fetch_body(repo: str, tag: str) -> str:
+    return release_of(repo, tag).get('body') or ''
 
 
-def edit_body(repo_dir: Path, tag: str, body: str) -> None:
-    with tempfile.NamedTemporaryFile(
-        'w', suffix='.md', delete=False, encoding='utf-8', newline=''
-    ) as tf:
-        tf.write(body)
-        notes_file = tf.name
-    try:
-        run(['gh', 'release', 'edit', tag, '--notes-file', notes_file], repo_dir)
-    finally:
-        Path(notes_file).unlink(missing_ok=True)
+def edit_body(repo: str, tag: str, body: str) -> None:
+    rest(
+        ghrest.send, 'PATCH', f'repos/{repo}/releases/{release_of(repo, tag)["id"]}', {'body': body}
+    )
 
 
 def restore(repo_dir: Path, backup_dir: Path) -> int:
@@ -247,7 +448,7 @@ def restore(repo_dir: Path, backup_dir: Path) -> int:
             )
             return 2
         print(f'restoring {tag}')
-        edit_body(repo_dir, tag, body)
+        edit_body(repo, tag, body)
     print(f'restored {len(manifest["entries"])} release bodies')
     return 0
 
@@ -323,6 +524,39 @@ def resolve_config(arg: str, repo_dir: Path, *, explicit: bool) -> Path:
     sys.exit(2)
 
 
+def regenerate(
+    args,
+    repo_dir: Path,
+    config: Path,
+    repo: str,
+    prev: str,
+    tag: str,
+    tag_shas: dict[str, str],
+    scratch: Path,
+    security: Path | None,
+) -> tuple[str, bool]:
+    """(the regenerated body, whether it is the maintenance stub)."""
+    lanes = lanes_at(repo_dir, tag)
+    if args.release_model == 'two-branch':
+        # Never empty: every backfilled tag has a predecessor, so a compare link.
+        body = render_two_branch(
+            repo_dir,
+            args.cliff_bin,
+            args.cosign_bin,
+            config,
+            repo,
+            prev,
+            tag,
+            tag_shas,
+            lanes,
+            scratch,
+            security,
+        )
+        return body, False
+    body = render_range(repo_dir, args.cliff_bin, config, prev, tag, lanes)
+    return (body, False) if body else (stub_body(repo_dir, prev, tag), True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -335,6 +569,17 @@ def main() -> int:
         'relative path against the current directory first',
     )
     ap.add_argument('--cliff-bin', default='git-cliff', help='git-cliff binary (default: PATH)')
+    ap.add_argument(
+        '--cosign-bin',
+        default='cosign',
+        help='cosign binary that verifies the SBOM assets under two-branch (default: PATH)',
+    )
+    ap.add_argument(
+        '--release-model',
+        choices=('legacy', 'two-branch'),
+        default='legacy',
+        help='two-branch renders through render-notes.sh, as a dev-default repo releases',
+    )
     ap.add_argument(
         '--only',
         action='append',
@@ -378,7 +623,7 @@ def main() -> int:
     config = resolve_config(args.config, repo_dir, explicit=args.config != 'cliff.toml')
     repo = repo_identity(repo_dir)
     carved = load_carve_outs(args.carve_outs, repo)
-    tags = list_release_tags(repo_dir)
+    tags = list_release_tags(repo)
     if len(tags) < 2:
         print('nothing to do: fewer than two semver releases')
         return 0
@@ -406,21 +651,29 @@ def main() -> int:
         print(f'  skip {tag}: carved out ({reason})', file=sys.stderr)
     plans: list[Plan] = []
     unchanged = nonlinear = 0
-    for prev, tag in selected:
-        proc = run(['git', 'merge-base', '--is-ancestor', prev, tag], repo_dir, check=False)
-        if proc.returncode != 0:
-            print(
-                f'!! {tag}: predecessor {prev} is not an ancestor (non-linear history) '
-                '- skipping this pair',
-                file=sys.stderr,
+    with tempfile.TemporaryDirectory(prefix='backfill-notes-') as tmp:
+        bodies = {}
+        todo = selected
+        security = (
+            security_shas(repo_dir, repo, [prev for prev, _ in todo], Path(tmp))
+            if args.release_model == 'two-branch'
+            else None
+        )
+        for prev, tag in todo:
+            proc = run(['git', 'merge-base', '--is-ancestor', prev, tag], repo_dir, check=False)
+            if proc.returncode != 0:
+                print(
+                    f'!! {tag}: predecessor {prev} is not an ancestor (non-linear history) '
+                    '- skipping this pair',
+                    file=sys.stderr,
+                )
+                nonlinear += 1
+                continue
+            bodies[prev, tag] = regenerate(
+                args, repo_dir, config, repo, prev, tag, tag_shas, Path(tmp), security
             )
-            nonlinear += 1
-            continue
-        new_body = render_range(repo_dir, args.cliff_bin, config, prev, tag)
-        is_stub = not new_body
-        if is_stub:
-            new_body = stub_body(repo_dir, prev, tag)
-        old_body = fetch_body(repo_dir, tag)
+    for (prev, tag), (new_body, is_stub) in bodies.items():
+        old_body = fetch_body(repo, tag)
         if normalize(old_body) == normalize(new_body):
             print(f'== {tag}: unchanged')
             unchanged += 1
@@ -486,7 +739,7 @@ def main() -> int:
     # Phase 2b: edit, with an optimistic re-check against concurrent changes.
     applied = drifted = 0
     for p in plans:
-        current = fetch_body(repo_dir, p.tag)
+        current = fetch_body(repo, p.tag)
         if current != p.old:
             print(
                 f'!! {p.tag}: body changed since review; skipping (re-run to pick it up)',
@@ -494,8 +747,8 @@ def main() -> int:
             )
             drifted += 1
             continue
-        edit_body(repo_dir, p.tag, p.new)
-        if normalize(fetch_body(repo_dir, p.tag)) != normalize(p.new):
+        edit_body(repo, p.tag, p.new)
+        if normalize(fetch_body(repo, p.tag)) != normalize(p.new):
             print(
                 f'error: post-edit verification failed for {p.tag}; STOPPING. '
                 f'Restore with: --restore {backup_dir}',

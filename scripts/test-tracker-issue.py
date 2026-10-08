@@ -1,61 +1,91 @@
 #!/usr/bin/env python3
 """Pin the contract of scripts/tracker_issue.py against a stub `gh`.
 
-The stub sits first on PATH, answers from a JSON scenario (issue setting, open
-issues, which commands fail and how) and appends every invocation's argv to a
-log, so each case asserts both what the transport wrote and what it did not.
+The stub sits first on PATH, answers `gh api -i` requests from a JSON scenario
+(issue setting, open issues, which requests fail and how) and appends every
+request's method, path and body to a log, so each case asserts both what the
+transport wrote and what it did not.
 
 Run: python3 scripts/test-tracker-issue.py     (exit 0 = pass)
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 TRACKER = HERE / 'tracker_issue.py'
 NOTIFY_FAILURE = HERE.parent / '.github' / 'workflows' / 'notify-failure.yaml'
 
+# Each request is logged as {op, method, path, body}; `op` names the route
+# (`GET issues`, `PATCH issue`, ...) so a case reads like the API it drives.
 STUB_GH = r"""#!/usr/bin/env python3
-import json, os, sys
+import json, os, re, sys
+from urllib.parse import parse_qs, urlsplit
 scenario = json.load(open(os.environ['GH_STUB_SCENARIO']))
 args = sys.argv[1:]
-with open(os.environ['GH_STUB_LOG'], 'a') as log:
-    log.write(json.dumps(args) + '\n')
-cmd = ' '.join(args[:2])
-if cmd in scenario.get('fail', {}):
-    sys.stderr.write(scenario['fail'][cmd] + '\n')
-    sys.exit(1)
-def opt(name):
-    return args[args.index(name) + 1] if name in args else None
-if cmd == 'repo view':
-    print('true' if scenario.get('issues_enabled', True) else 'false')
-elif cmd == 'issue list':
-    issues = scenario.get('open_issues', [])
-    if opt('--label'):
-        issues = [i for i in issues if opt('--label') in [l['name'] for l in i['labels']]]
-    if opt('--search'):
-        needle = opt('--search').removesuffix(' in:title')
-        issues = [i for i in issues if needle in i['title']]
-    fields = opt('--json').split(',')
-    print(json.dumps([{k: i[k] for k in fields} for i in issues]))
-elif cmd == 'issue create':
-    print(f"https://github.com/{opt('-R')}/issues/{scenario.get('next_number', 101)}")
-elif cmd == 'label create':
-    if args[2] in scenario.get('existing_labels', []):
-        sys.stderr.write(f'label with name "{args[2]}" already exists; use --force to update\n')
-        sys.exit(1)
-elif cmd not in ('issue edit', 'issue comment', 'issue close'):
-    sys.stderr.write(f'stub gh: unhandled {cmd}\n')
+if args[:2] != ['api', '-i']:
+    sys.stderr.write(f'stub gh: not a REST request {args}\n')
     sys.exit(2)
+method, path, i = 'GET', None, 2
+while i < len(args):
+    if args[i] in ('-X', '-H', '--input'):
+        if args[i] == '-X':
+            method = args[i + 1]
+        i += 2
+    else:
+        path, i = args[i], i + 1
+body = json.load(sys.stdin) if '--input' in args else None
+url = urlsplit(path)
+query = {k: v[0] for k, v in parse_qs(url.query).items()}
+routes = (
+    ('GET', r'repos/[^/]+/[^/]+', 'GET repo'),
+    ('GET', r'repos/[^/]+/[^/]+/issues', 'GET issues'),
+    ('POST', r'repos/[^/]+/[^/]+/issues', 'POST issues'),
+    ('POST', r'repos/[^/]+/[^/]+/labels', 'POST labels'),
+    ('PATCH', r'repos/[^/]+/[^/]+/issues/\d+', 'PATCH issue'),
+    ('POST', r'repos/[^/]+/[^/]+/issues/\d+/comments', 'POST comment'),
+    ('POST', r'repos/[^/]+/[^/]+/issues/\d+/labels', 'POST issue-labels'),
+    ('DELETE', r'repos/[^/]+/[^/]+/issues/\d+/labels/[^/]+', 'DELETE issue-label'),
+)
+op = next((name for m, rx, name in routes if m == method and re.fullmatch(rx, url.path)), None)
+with open(os.environ['GH_STUB_LOG'], 'a') as log:
+    log.write(json.dumps({'op': op, 'method': method, 'path': path, 'body': body}) + '\n')
+def answer(status, doc):
+    sys.stdout.write(f'HTTP/2.0 {status} Reason\nContent-Type: application/json\r\n\r\n')
+    sys.stdout.write(json.dumps(doc))
+    sys.exit(0 if status < 300 else 1)
+if op is None:
+    sys.stderr.write(f'stub gh: unhandled {method} {path}\n')
+    sys.exit(2)
+if op in scenario.get('fail', {}):
+    status, message = scenario['fail'][op]
+    answer(status, {'message': message})
+if op == 'GET repo':
+    answer(200, {'has_issues': scenario.get('issues_enabled', True)})
+if op == 'GET issues':
+    issues = scenario.get('open_issues', [])
+    if 'labels' in query:
+        issues = [i for i in issues if query['labels'] in [l['name'] for l in i['labels']]]
+    per_page, page = int(query.get('per_page', 30)), int(query.get('page', 1))
+    answer(200, issues[(page - 1) * per_page : page * per_page])
+if op == 'POST issues':
+    answer(201, {'number': scenario.get('next_number', 101)})
+if op == 'POST labels' and body['name'] in scenario.get('existing_labels', []):
+    answer(422, {'message': 'Validation Failed', 'errors': [{'code': 'already_exists'}]})
+answer(204 if method == 'DELETE' else 200, {})
 """
 
 TRACKER_ISSUE = {
@@ -74,11 +104,14 @@ FUZZ_ISSUE = {
     'labels': [{'name': 'fuzz-finding'}, {'name': 'auto-generated'}],
     'body': 'finding',
 }
+WRITES = ('POST issues', 'PATCH issue', 'POST comment', 'POST issue-labels', 'DELETE issue-label')
+LISTING = 'repos/cplieger/x/issues?state=open&labels=gremlins-tracker&per_page=100&page=1'
 
 
 class TrackerIssueTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix='tracker-issue-'))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         stub = self.tmp / 'bin' / 'gh'
         stub.parent.mkdir()
         stub.write_text(STUB_GH)
@@ -90,36 +123,56 @@ class TrackerIssueTest(unittest.TestCase):
         self.comment = self.tmp / 'comment.md'
         self.comment.write_text('Still failing.\n')
 
-    def run_tracker(self, scenario: dict, *args: str) -> subprocess.CompletedProcess:
-        self.scenario.write_text(json.dumps(scenario))
-        self.log.write_text('')
-        env = {
+    def stub_env(self) -> dict:
+        return {
             **os.environ,
             'PATH': f'{self.tmp / "bin"}{os.pathsep}{os.environ["PATH"]}',
             'GH_STUB_SCENARIO': str(self.scenario),
             'GH_STUB_LOG': str(self.log),
         }
+
+    def run_tracker(self, scenario: dict, *args: str) -> subprocess.CompletedProcess:
+        self.scenario.write_text(json.dumps(scenario))
+        self.log.write_text('')
         return subprocess.run(
             [sys.executable, str(TRACKER), '--repo', 'cplieger/x', *args],
             capture_output=True,
             text=True,
-            env=env,
+            env=self.stub_env(),
             check=False,
         )
 
-    def calls(self) -> list[list[str]]:
+    def run_in_process(self, scenario: dict, *args: str) -> tuple[int, str, list]:
+        """(exit code, stderr, sleeps) of main() in this process, so the retry
+        policy's back-off is recorded instead of slept."""
+        self.scenario.write_text(json.dumps(scenario))
+        self.log.write_text('')
+        sys.path.insert(0, str(HERE))
+        self.addCleanup(sys.path.remove, str(HERE))
+        import tracker_issue
+
+        sleeps, err = [], io.StringIO()
+        with (
+            mock.patch.dict(os.environ, self.stub_env()),
+            mock.patch.object(tracker_issue.ghrest.DEFAULT, 'sleep', sleeps.append),
+            contextlib.redirect_stderr(err),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            code = tracker_issue.main(['--repo', 'cplieger/x', *args])
+        return code, err.getvalue(), sleeps
+
+    def calls(self) -> list[dict]:
         return [json.loads(line) for line in self.log.read_text().splitlines()]
 
     def commands(self) -> list[str]:
-        return [' '.join(c[:2]) for c in self.calls()]
+        return [c['op'] for c in self.calls()]
 
     def writes(self) -> list[str]:
         """Issue writes only: label creation is idempotent and asserted separately."""
-        return [
-            c
-            for c in self.commands()
-            if c in ('issue create', 'issue edit', 'issue comment', 'issue close')
-        ]
+        return [c for c in self.commands() if c in WRITES]
+
+    def last(self, op: str) -> dict:
+        return [c for c in self.calls() if c['op'] == op][-1]
 
     def tracker_args(self, *extra: str) -> tuple[str, ...]:
         return ('--label', 'gremlins-tracker', '--title', TRACKER_ISSUE['title'], *extra)
@@ -133,11 +186,18 @@ class TrackerIssueTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(
             self.commands(),
-            ['repo view', 'issue list', 'label create', 'label create', 'issue create'],
+            ['GET repo', 'GET issues', 'POST labels', 'POST labels', 'POST issues'],
         )
-        created = self.calls()[-1]
-        self.assertEqual(created[created.index('--label') + 1], 'gremlins-tracker,auto-generated')
-        self.assertEqual(created[created.index('--body-file') + 1], str(self.body))
+        self.assertEqual(self.calls()[0]['path'], 'repos/cplieger/x')
+        self.assertEqual(self.calls()[1]['path'], LISTING)
+        self.assertEqual(
+            self.last('POST issues')['body'],
+            {
+                'title': TRACKER_ISSUE['title'],
+                'body': '# new body\n',
+                'labels': ['gremlins-tracker', 'auto-generated'],
+            },
+        )
         self.assertIn('created #101', proc.stdout)
 
     def test_upsert_edits_the_open_issue_found_by_label_and_title(self) -> None:
@@ -146,10 +206,10 @@ class TrackerIssueTest(unittest.TestCase):
             *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body)),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.writes(), ['issue edit'])
-        edit = self.calls()[-1]
-        self.assertEqual(edit[2], '42')
-        self.assertEqual(edit[edit.index('--body-file') + 1], str(self.body))
+        self.assertEqual(self.writes(), ['PATCH issue'])
+        edit = self.last('PATCH issue')
+        self.assertEqual(edit['path'], 'repos/cplieger/x/issues/42')
+        self.assertEqual(edit['body'], {'body': '# new body\n'})
 
     def test_upsert_ignores_a_same_label_issue_with_another_title(self) -> None:
         other = {**TRACKER_ISSUE, 'title': 'Something else entirely'}
@@ -158,7 +218,28 @@ class TrackerIssueTest(unittest.TestCase):
             *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body)),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.writes(), ['issue create'])
+        self.assertEqual(self.writes(), ['POST issues'])
+
+    def test_a_pull_request_with_the_title_is_not_the_issue(self) -> None:
+        pull = {**TRACKER_ISSUE, 'number': 5, 'pull_request': {'url': 'x'}}
+        proc = self.run_tracker(
+            {'open_issues': [pull]},
+            *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.writes(), ['POST issues'])
+
+    def test_more_than_one_page_of_open_issues_is_read(self) -> None:
+        filler = [{**TRACKER_ISSUE, 'number': 1000 + n, 'title': f'other {n}'} for n in range(120)]
+        proc = self.run_tracker(
+            {'open_issues': [*filler, TRACKER_ISSUE]},
+            *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        listings = [c['path'] for c in self.calls() if c['op'] == 'GET issues']
+        self.assertEqual(listings, [LISTING, LISTING.removesuffix('page=1') + 'page=2'])
+        self.assertEqual(self.writes(), ['PATCH issue'])
+        self.assertEqual(self.last('PATCH issue')['path'], 'repos/cplieger/x/issues/42')
 
     def test_upsert_flag_on_adds_the_label_once(self) -> None:
         flag = ('--flag-label', 'mutation-regression', '--flag', 'on')
@@ -167,22 +248,22 @@ class TrackerIssueTest(unittest.TestCase):
             *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body), *flag),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.writes(), ['issue edit', 'issue edit'])
-        add = self.calls()[-1]
-        self.assertEqual(add[add.index('--add-label') + 1], 'mutation-regression')
-        self.assertIn(
-            [
-                'label',
-                'create',
-                'mutation-regression',
-                '-R',
-                'cplieger/x',
-                '--color',
-                'b60205',
-                '--description',
-                'Mutation efficacy regression',
-            ],
-            self.calls(),
+        self.assertEqual(self.writes(), ['PATCH issue', 'POST issue-labels'])
+        add = self.last('POST issue-labels')
+        self.assertEqual(add['path'], 'repos/cplieger/x/issues/42/labels')
+        self.assertEqual(add['body'], {'labels': ['mutation-regression']})
+        self.assertEqual(
+            self.last('POST labels'),
+            {
+                'op': 'POST labels',
+                'method': 'POST',
+                'path': 'repos/cplieger/x/labels',
+                'body': {
+                    'name': 'mutation-regression',
+                    'color': 'b60205',
+                    'description': 'Mutation efficacy regression',
+                },
+            },
         )
 
         proc = self.run_tracker(
@@ -190,7 +271,7 @@ class TrackerIssueTest(unittest.TestCase):
             *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body), *flag),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.writes(), ['issue edit'], 'a present flag is not re-added')
+        self.assertEqual(self.writes(), ['PATCH issue'], 'a present flag is not re-added')
 
     def test_upsert_flag_off_removes_only_a_present_label(self) -> None:
         flag = ('--flag-label', 'mutation-regression', '--flag', 'off')
@@ -199,15 +280,18 @@ class TrackerIssueTest(unittest.TestCase):
             *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body), *flag),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        remove = self.calls()[-1]
-        self.assertEqual(remove[remove.index('--remove-label') + 1], 'mutation-regression')
+        self.assertEqual(self.writes(), ['PATCH issue', 'DELETE issue-label'])
+        self.assertEqual(
+            self.last('DELETE issue-label')['path'],
+            'repos/cplieger/x/issues/42/labels/mutation-regression',
+        )
 
         proc = self.run_tracker(
             {'open_issues': [TRACKER_ISSUE]},
             *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body), *flag),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.writes(), ['issue edit'], 'an absent flag is not removed')
+        self.assertEqual(self.writes(), ['PATCH issue'], 'an absent flag is not removed')
 
     def test_upsert_flag_on_at_creation_rides_the_create_call(self) -> None:
         proc = self.run_tracker(
@@ -224,11 +308,10 @@ class TrackerIssueTest(unittest.TestCase):
             ),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.writes(), ['issue create'])
-        created = self.calls()[-1]
+        self.assertEqual(self.writes(), ['POST issues'])
         self.assertEqual(
-            created[created.index('--label') + 1],
-            'gremlins-tracker,auto-generated,mutation-regression',
+            self.last('POST issues')['body']['labels'],
+            ['gremlins-tracker', 'auto-generated', 'mutation-regression'],
         )
 
     def test_extra_labels_are_added_on_create(self) -> None:
@@ -239,16 +322,16 @@ class TrackerIssueTest(unittest.TestCase):
             ),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        created = self.calls()[-1]
         self.assertEqual(
-            created[created.index('--label') + 1], 'gremlins-tracker,auto-generated,needs-triage'
+            self.last('POST issues')['body']['labels'],
+            ['gremlins-tracker', 'auto-generated', 'needs-triage'],
         )
 
     # --- recur ------------------------------------------------------------
 
-    def test_recur_comments_on_the_issue_found_by_title_search(self) -> None:
+    def test_recur_comments_on_the_issue_found_by_title(self) -> None:
         proc = self.run_tracker(
-            {'open_issues': [FUZZ_ISSUE]},
+            {'open_issues': [TRACKER_ISSUE, FUZZ_ISSUE]},
             '--label',
             'fuzz-finding',
             '--title',
@@ -261,13 +344,16 @@ class TrackerIssueTest(unittest.TestCase):
             str(self.comment),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.writes(), ['issue comment'])
-        listing = next(c for c in self.calls() if c[:2] == ['issue', 'list'])
-        self.assertNotIn('--label', listing, 'recur matches by title, not by label')
-        self.assertEqual(listing[listing.index('--search') + 1], f'{FUZZ_ISSUE["title"]} in:title')
-        comment = self.calls()[-1]
-        self.assertEqual(comment[2], '7')
-        self.assertEqual(comment[comment.index('--body-file') + 1], str(self.comment))
+        self.assertEqual(self.writes(), ['POST comment'])
+        listing = self.last('GET issues')['path']
+        self.assertEqual(
+            listing,
+            'repos/cplieger/x/issues?state=open&per_page=100&page=1',
+            'recur matches by title among every open issue, not by label or search',
+        )
+        comment = self.last('POST comment')
+        self.assertEqual(comment['path'], 'repos/cplieger/x/issues/7/comments')
+        self.assertEqual(comment['body'], {'body': 'Still failing.\n'})
 
     def test_recur_creates_when_the_title_is_new(self) -> None:
         proc = self.run_tracker(
@@ -284,9 +370,10 @@ class TrackerIssueTest(unittest.TestCase):
             str(self.comment),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.writes(), ['issue create'])
-        created = self.calls()[-1]
-        self.assertEqual(created[created.index('--label') + 1], 'fuzz-finding,auto-generated')
+        self.assertEqual(self.writes(), ['POST issues'])
+        self.assertEqual(
+            self.last('POST issues')['body']['labels'], ['fuzz-finding', 'auto-generated']
+        )
 
     # --- close-when-clean -------------------------------------------------
 
@@ -296,11 +383,20 @@ class TrackerIssueTest(unittest.TestCase):
             *self.tracker_args('--mode', 'close-when-clean', '--comment-file', str(self.comment)),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.writes(), ['issue close'])
-        close = self.calls()[-1]
-        self.assertEqual(close[2], '42')
-        self.assertEqual(close[close.index('--comment') + 1], 'Still failing.\n')
-        self.assertEqual(close[close.index('--reason') + 1], 'completed')
+        self.assertEqual(self.writes(), ['POST comment', 'PATCH issue'])
+        self.assertEqual(self.last('POST comment')['path'], 'repos/cplieger/x/issues/42/comments')
+        self.assertEqual(self.last('POST comment')['body'], {'body': 'Still failing.\n'})
+        close = self.last('PATCH issue')
+        self.assertEqual(close['path'], 'repos/cplieger/x/issues/42')
+        self.assertEqual(close['body'], {'state': 'closed', 'state_reason': 'completed'})
+
+    def test_a_failed_closing_comment_leaves_the_issue_open(self) -> None:
+        proc = self.run_tracker(
+            {'fail': {'POST comment': [422, 'Unprocessable']}, 'open_issues': [TRACKER_ISSUE]},
+            *self.tracker_args('--mode', 'close-when-clean', '--comment-file', str(self.comment)),
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn('PATCH issue', self.commands())
 
     def test_close_when_clean_without_an_issue_writes_nothing(self) -> None:
         proc = self.run_tracker(
@@ -356,7 +452,7 @@ class TrackerIssueTest(unittest.TestCase):
                     *self.tracker_args('--mode', mode, *extra),
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
-                self.assertEqual(self.commands(), ['repo view'])
+                self.assertEqual(self.commands(), ['GET repo'])
                 self.assertIn('::notice::cplieger/x has issues disabled', proc.stderr)
                 self.assertEqual(proc.stdout, '')
         self.assertEqual(out.read_text(), '', 'fetch leaves an empty file, not a stale body')
@@ -364,14 +460,14 @@ class TrackerIssueTest(unittest.TestCase):
     def test_a_failed_setting_read_falls_through_to_the_issue_ops(self) -> None:
         proc = self.run_tracker(
             {
-                'fail': {'repo view': 'HTTP 500: Internal Server Error'},
+                'fail': {'GET repo': [403, 'Resource not accessible by integration']},
                 'open_issues': [TRACKER_ISSUE],
             },
             *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body)),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn('attempting the issue ops anyway', proc.stderr)
-        self.assertEqual(self.writes(), ['issue edit'])
+        self.assertEqual(self.writes(), ['PATCH issue'])
 
     def test_missing_label_is_created_and_an_existing_one_is_silent(self) -> None:
         proc = self.run_tracker(
@@ -379,48 +475,51 @@ class TrackerIssueTest(unittest.TestCase):
             *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body)),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.writes(), ['issue create'])
+        self.assertEqual(self.writes(), ['POST issues'])
         self.assertEqual(proc.stderr, '', 'an "already exists" answer is not reported')
-        labels = [c for c in self.calls() if c[:2] == ['label', 'create']]
-        self.assertEqual([c[2] for c in labels], ['gremlins-tracker', 'auto-generated'])
-        self.assertEqual(labels[0][labels[0].index('--color') + 1], '5319e7')
+        labels = [c['body'] for c in self.calls() if c['op'] == 'POST labels']
+        self.assertEqual([b['name'] for b in labels], ['gremlins-tracker', 'auto-generated'])
+        self.assertEqual(labels[0]['color'], '5319e7')
 
     def test_a_real_label_create_failure_is_reported_and_the_create_still_runs(self) -> None:
         proc = self.run_tracker(
-            {'fail': {'label create': 'HTTP 403: Resource not accessible by integration'}},
+            {'fail': {'POST labels': [403, 'Resource not accessible by integration']}},
             *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body)),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("label 'gremlins-tracker' not created", proc.stderr)
-        self.assertEqual(self.writes(), ['issue create'])
+        self.assertEqual(self.writes(), ['POST issues'])
 
-    def test_a_502_on_the_lookup_exits_non_zero_and_writes_nothing(self) -> None:
-        for mode, extra in (
-            ('upsert', ('--body-file', str(self.body))),
-            ('recur', ('--body-file', str(self.body), '--comment-file', str(self.comment))),
-            ('close-when-clean', ('--comment-file', str(self.comment))),
-            ('fetch', ('--body-file', str(self.tmp / 'existing.md'))),
-            ('list', ()),
+    def test_a_502_on_the_lookup_is_retried_then_exits_non_zero_and_writes_nothing(self) -> None:
+        for mode, extra, listing in (
+            ('upsert', ('--body-file', str(self.body)), LISTING),
+            (
+                'recur',
+                ('--body-file', str(self.body), '--comment-file', str(self.comment)),
+                'repos/cplieger/x/issues?state=open&per_page=100&page=1',
+            ),
+            ('close-when-clean', ('--comment-file', str(self.comment)), LISTING),
+            ('fetch', ('--body-file', str(self.tmp / 'existing.md')), LISTING),
+            ('list', (), LISTING),
         ):
             with self.subTest(mode=mode):
-                proc = self.run_tracker(
-                    {
-                        'fail': {'issue list': 'HTTP 502: Bad Gateway'},
-                        'open_issues': [TRACKER_ISSUE],
-                    },
+                code, err, sleeps = self.run_in_process(
+                    {'fail': {'GET issues': [502, 'Bad Gateway']}, 'open_issues': [TRACKER_ISSUE]},
                     *self.tracker_args('--mode', mode, *extra),
                 )
-                self.assertEqual(proc.returncode, 1)
+                self.assertEqual(code, 1)
                 self.assertEqual(self.writes(), [])
-                self.assertIn('::error::cplieger/x: gh issue list failed: HTTP 502', proc.stderr)
+                self.assertEqual(self.commands().count('GET issues'), 4)
+                self.assertEqual(sleeps, [2, 4, 8])
+                self.assertIn(f'::error::cplieger/x: GET {listing}: HTTP 502 Bad Gateway', err)
 
     def test_a_failed_write_exits_non_zero(self) -> None:
         proc = self.run_tracker(
-            {'fail': {'issue edit': 'HTTP 502: Bad Gateway'}, 'open_issues': [TRACKER_ISSUE]},
+            {'fail': {'PATCH issue': [422, 'Validation Failed']}, 'open_issues': [TRACKER_ISSUE]},
             *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body)),
         )
         self.assertEqual(proc.returncode, 1)
-        self.assertIn('gh issue edit failed', proc.stderr)
+        self.assertIn('PATCH repos/cplieger/x/issues/42: HTTP 422 Validation Failed', proc.stderr)
 
     # --- argument contract ------------------------------------------------
 
@@ -449,6 +548,64 @@ class TrackerIssueTest(unittest.TestCase):
                 proc = self.run_tracker({}, *case)
                 self.assertEqual(proc.returncode, 2, proc.stderr)
                 self.assertEqual(self.calls(), [], 'argument errors never reach gh')
+
+    def test_the_reserved_labels_only_read_from_the_command_line(self) -> None:
+        for label, title in (
+            ('release-blocked', 'Release blocked'),
+            ('repo-audit', 'Repository audit findings'),
+        ):
+            self.assert_reserved(('--label', label, '--title', title))
+
+    def assert_reserved(self, reserved: tuple) -> None:
+        for mode in (
+            ('--mode', 'upsert', '--body-file', str(self.body)),
+            ('--mode', 'recur', '--body-file', str(self.body), '--comment-file', str(self.comment)),
+            ('--mode', 'close-when-clean', '--comment-file', str(self.comment)),
+        ):
+            with self.subTest(label=reserved[1], mode=mode[1]):
+                proc = self.run_tracker({}, *reserved, *mode)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn('reserved', proc.stderr)
+                self.assertEqual(self.calls(), [])
+        proc = self.run_tracker({}, *reserved, '--mode', 'fetch', '--body-file', str(self.body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_its_own_writer_may_close_under_the_reserved_label(self) -> None:
+        issue = {
+            **TRACKER_ISSUE,
+            'title': 'Release blocked',
+            'labels': [{'name': 'release-blocked'}],
+        }
+        self.scenario.write_text(json.dumps({'open_issues': [issue]}))
+        self.log.write_text('')
+        code = (
+            'import sys; sys.path.insert(0, sys.argv[1]); import tracker_issue; '
+            'sys.exit(tracker_issue.main(sys.argv[2:], allow_reserved=True))'
+        )
+        proc = subprocess.run(
+            [
+                sys.executable,
+                '-c',
+                code,
+                str(HERE),
+                '--repo',
+                'cplieger/x',
+                '--label',
+                'release-blocked',
+                '--title',
+                'Release blocked',
+                '--mode',
+                'close-when-clean',
+                '--comment-file',
+                str(self.comment),
+            ],
+            capture_output=True,
+            text=True,
+            env=self.stub_env(),
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.writes(), ['POST comment', 'PATCH issue'])
 
 
 def _extract_run_block(yaml_text: str, step_name: str) -> str:
@@ -530,6 +687,7 @@ class GatePolicyTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix='tracker-gate-'))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         bindir = self.tmp / 'bin'
         bindir.mkdir()
         stub = bindir / 'gh'

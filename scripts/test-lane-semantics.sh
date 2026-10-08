@@ -107,7 +107,7 @@ PY
 classify() { # <channel> <anchor> <head> -> root=<bool> lanes=<json>; env SUBPACKAGES_JSON GO_LANES_JSON; run in a repo
   : >"$WORK/out"
   : >"$WORK/summary"
-  CHANNEL="$1" BEFORE="$2" ANCHOR_SHA="$2" HEAD="$3" REPO_TYPE=go \
+  CI_TOOLS="$ROOT/scripts" CHANNEL="$1" BEFORE="$2" ANCHOR_SHA="$2" HEAD="$3" REPO_TYPE=go \
     GITHUB_OUTPUT="$WORK/out" GITHUB_STEP_SUMMARY="$WORK/summary" \
     bash "$WORK/changes.sh" >"$WORK/changes.log" 2>&1 || echo "EXIT=$?"
   echo "root=$(sed -n 's/^root_changed=//p' "$WORK/out") lanes=$(sed -n 's/^go_modules_to_release=//p' "$WORK/out")"
@@ -330,13 +330,18 @@ DOCKER_YAML="$ROOT/.github/workflows/docker-release.yaml"
 chk "L-F1 release.yaml forwards detect's go_modules to docker-release" \
   "$(grep -c 'go-modules: ${{ needs.detect.outputs.go_modules }}' "$RELEASE_YAML")" "1"
 chk "L-F2 docker-release go-modules input defaults to '[]'" \
-  "$(grep -c 'default: "\[\]"' "$DOCKER_YAML")" "1"
+  "$(awk '/^      go-modules:$/ { f = 1; next }
+    f && /^      [a-z-]+:$/ { exit }
+    f && $1 == "default:" { print $2; exit }' "$DOCKER_YAML")" '"[]"'
 # shellcheck disable=SC2016 # literal single-quoted grep pattern, no expansion wanted
-chk "L-F3 both docker notes branches expand LANE_ARGS" \
-  "$(grep -c 'git-cliff .*"\${LANE_ARGS\[@\]}"' "$DOCKER_YAML")" "2"
+chk "L-F3 the docker notes step hands the lanes to render-notes.sh" \
+  "$(grep -c -- '--go-lanes "$GO_LANES_JSON"' "$DOCKER_YAML")" "1"
+# shellcheck disable=SC2016 # literal single-quoted grep pattern, no expansion wanted
+chk "L-F3 and render-notes.sh scopes both models' git-cliff calls by them" \
+  "$(grep -c '"\${SCOPE_ARGS\[@\]}"' "$ROOT/scripts/render-notes.sh")" "2"
 # An empty lane array must contribute ZERO argv words, keeping every
 # no-lane docker repo's git-cliff command argument-identical (same
-# expansion form the workflows use; bash >= 4.4 drops the empty array
+# expansion form the renderer uses; bash >= 4.4 drops the empty array
 # under set -u).
 LANE_ARGS=()
 set -- git-cliff --unreleased --tag v1.2.3 "${LANE_ARGS[@]}" --strip header

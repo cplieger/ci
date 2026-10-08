@@ -2,8 +2,8 @@ name: Go CI
 
 # Reusable Go CI. Called by the meta ci.yaml's `go` job; consumers pin the
 # meta workflow via `@<sha> # v2`.
-# Profile is auto-detected: app-mode (deadcode, punused) activates when a
-# `main` package exists. Dockerfile lint (hadolint) is NOT here: the meta
+# The profile sets deadset's target kind: `application` when a `main` package
+# exists, `library` otherwise. Dockerfile lint (hadolint) is NOT here: the meta
 # ci.yaml dispatches shell-ci.yaml for every repo with a Dockerfile, and that
 # is where hadolint runs. (fieldalignment is enforced by golangci-lint via
 # `govet: enable-all` on non-test code — the synced .golangci.yaml excludes
@@ -83,38 +83,22 @@ jobs:
           # renovate: datasource=go depName=golang.org/x/vuln
           GOVULNCHECK_VERSION=v1.8.0
           go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          # deadset refuses an analyzer whose report schema it does not accept
+          # (exit 3), so a Contract major moves these two pins together, and
+          # ts-ci.yaml pins the same deadset. GOTOOLCHAIN=auto because setup-go
+          # pins GOTOOLCHAIN=local and either module may require a newer Go
+          # than the consumer's go.mod.
+          # renovate: datasource=go depName=github.com/cplieger/deadset
+          DEADSET_VERSION=v1.10.0
+          GOTOOLCHAIN=auto go install "github.com/cplieger/deadset/cmd/deadset@${DEADSET_VERSION}"
+          # renovate: datasource=go depName=github.com/cplieger/deadset-go
+          DEADSET_GO_VERSION=v1.25.0
+          GOTOOLCHAIN=auto go install "github.com/cplieger/deadset-go/cmd/deadset-go@${DEADSET_GO_VERSION}"
 
       # actionlint, zizmor and gitleaks are NOT installed here: they are
       # repo-wide checks with no Go dependency, and they run exactly once in the
       # meta ci.yaml `repo` job. They used to run here AND in shell-ci, so a
       # Docker+Go repo scanned the same tree twice.
-
-      - name: Install app tools
-        if: ${{ steps.profile.outputs.app == 'true' }}
-        run: |
-          set -euo pipefail
-          # renovate: datasource=go depName=golang.org/x/tools
-          XTOOLS_VERSION=v0.51.0
-          go install "golang.org/x/tools/cmd/deadcode@${XTOOLS_VERSION}"
-          # renovate: datasource=go depName=github.com/bep/punused
-          PUNUSED_VERSION=v0.5.1
-          go install "github.com/bep/punused@${PUNUSED_VERSION}"
-          # punused drives an external gopls over LSP -- it links an LSP *client*
-          # and shells out to the server -- so gopls is a hard runtime dependency
-          # of the step below and has to be installed here. Its own module, hence
-          # its own pin. GOTOOLCHAIN=auto only for this install: setup-go pins
-          # GOTOOLCHAIN=local, and gopls tracks the Go release closely (v0.23.0
-          # requires go 1.26.0), so a future Renovate bump requiring a newer Go
-          # than a consumer's go.mod would fail the install. This repo has no Go
-          # app, so its own CI never runs this step -- the break would surface
-          # only after a tag propagated, in every consumer at once.
-          # Do NOT name punused's LSP client library, nor the code-search vendor
-          # it belongs to, anywhere in this file: gitleaks activates rules by
-          # keyword presence, so that vendor's name turns every 40-hex action SHA
-          # pin above into an access-token finding and fails the secret scan.
-          # renovate: datasource=go depName=golang.org/x/tools/gopls
-          GOPLS_VERSION=v0.23.0
-          GOTOOLCHAIN=auto go install "golang.org/x/tools/gopls@${GOPLS_VERSION}"
 
       # Soft-gate block: each step below runs to completion (continue-on-error)
       # and records its own name to /tmp/_ci_failures on failure; the final
@@ -215,145 +199,50 @@ jobs:
             echo "wiregen: generated files up to date ($(printf '%s\n' "$genfiles" | grep -c . || true) tracked)"
           ) || { echo "wiregen drift" >> /tmp/_ci_failures; exit 1; }
 
-      - name: Dead code (deadcode)
-        if: ${{ steps.profile.outputs.app == 'true' }}
+      # Exit 1 is findings, 2 a refused configuration, 3 no answer (an
+      # analyzer missing, refused or failed). The module's own deadset.json
+      # outranks the --central kind, which is how a repo overrides the profile.
+      - name: Dead code (deadset)
         continue-on-error: true
-        run: |
-          # A CRASH is not a finding. deadcode panics with a nil *ssa.Function in
-          # go/callgraph/rta on any package whose build reaches an exported GENERIC
-          # method: go/types puts it in the type's MethodSet, ssa has no non-generic
-          # function for it, MethodValue returns nil, and visitFunc dereferences it
-          # (rta.go:262, produced at rta.go:435-437). Upstream: golang/go#80973 with
-          # CL 818580 open; x/tools v0.49.0 is BOTH our pin and the newest release,
-          # so there is no version to move to. Go 1.27 made math/rand/v2.(*Rand).N an
-          # exported generic method, so a ten-line program with no third-party code
-          # reproduces it -- this is a tool bug, not a repo defect, and it currently
-          # blocks every app consuming jsoncap, langtag or plexapi.
-          #
-          # So: a real finding still fails the gate. The panic warns and does not.
-          # REVERT THIS BLOCK once a release carrying CL 818580 is pinned; the check
-          # below is deliberately narrow so it stops matching when that happens.
-          set +e
-          out="$(deadcode -test ./... 2>&1)"
-          rc=$?
-          printf '%s\n' "$out"
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            if printf '%s' "$out" | grep -q 'go/callgraph/rta' \
-               && printf '%s' "$out" | grep -q 'nil pointer dereference'; then
-              echo "::warning::deadcode panicked in go/callgraph/rta (golang/go#80973, CL 818580 pending); treated as advisory, not a finding"
-            else
-              echo "deadcode" >> /tmp/_ci_failures
-              exit 1
-            fi
-          fi
-
-      # punused finds unused EXPORTED symbols (pinned v0.5.1, 2-minute budget).
-      # Its argument is a gobwas glob of module-relative FILENAMES where `*`
-      # crosses `/`: the default `**/*.go` skips the module root (bep/punused#4)
-      # and `./...` matches nothing, so shards come from `git ls-files`. A scan
-      # that blows the budget dies mid-read, so truncation ESCALATES to a
-      # per-file rescan instead of passing as clean. An LSP error reply still
-      # decodes as zero symbols and skips the file silently. Findings are
-      # adjudicated in the repo's `.punused-ignore` as literal substrings.
-      - name: Unused exported symbols (punused)
-        if: ${{ steps.profile.outputs.app == 'true' }}
-        continue-on-error: true
+        env:
+          APP_PROFILE: ${{ steps.profile.outputs.app }}
         run: |
           (
-            # Per-invocation temp files: ci-local.sh can replay this step for
-            # several repos at once, and each run must read only its own output.
-            praw="$(mktemp -t punused_raw.XXXXXX)"
-            pshard="$(mktemp -t punused_shard.XXXXXX)"
-            pfound="$(mktemp -t punused_found.XXXXXX)"
-            trap 'rm -f "$praw" "$pshard" "$pfound"' EXIT
-            truncated=0
-
-            # Preflight: gopls is punused's LSP server, spawned per invocation.
-            # Absent or unrunnable, every scan below fails identically to a
-            # truncated run, so establish which world we are in before reading
-            # that ambiguous signal as truncation.
-            if ! gopls version >/dev/null 2>&1; then
-              echo "::error::gopls is not runnable; punused cannot scan anything (it drives gopls over LSP). Install it in the app-tools step."
-              exit 1
-            fi
-
-            # scan <glob> [split-target] -- run one shard, escalating on a
-            # truncated run. `split-target` is the directory whose files get
-            # re-scanned individually; empty means this IS a single file, so the
-            # scan is unreliable and the step fails. Both markers are matched:
-            # `context deadline exceeded` is truncation since v0.5.1, and v0.5.0
-            # printed `close |1: file already closed` for truncation and an
-            # unstartable gopls alike, so the pin can roll back without a marker edit.
-            scan() {
-              punused "$1" > "$pshard" 2>&1 || true
-              if grep -q 'context deadline exceeded\|file already closed' "$pshard"; then
-                if [ -z "${2:-}" ]; then
-                  echo "::error::punused died mid-scan on a single file ($1), which cannot be split further; this scan cannot be trusted."
-                  echo "  gopls is known runnable (preflight passed), so the 2m budget is the likely cause. punused said: $(tr '\n' ' ' < "$pshard")"
-                  truncated=1
-                  return 0
-                fi
-                echo "::notice::punused truncated on $1; re-scanning its files individually"
-                for pf in $(git ls-files "$2/*.go"); do
-                  scan "$pf" ""
-                done
-                return 0
-              fi
-              grep -v 'context deadline exceeded\|file already closed' "$pshard" >> "$praw" || true
-            }
-
-            for sub in $(git ls-files '*.go' | xargs -r -n1 dirname | sort -u); do
-              if [ "$sub" = "." ]; then
-                for f in $(git ls-files '*.go' | grep -v /); do
-                  scan "$f" ""
-                done
-              else
-                scan "$sub/*.go" "$sub"
-              fi
-            done
-            if [ "$truncated" -ne 0 ]; then exit 1; fi
-
-            grep -v '/node_modules/' "$praw" | sort -u | grep . > "$pfound" || true
-
-            pats=()
-            reasons=0
-            if [ -f .punused-ignore ]; then
-              while IFS= read -r l; do
-                case "$l" in
-                  '#'*) reasons=$((reasons + 1)); continue ;;
-                  '') continue ;;
-                esac
-                pats+=("$l")
-              done < .punused-ignore
-            fi
-            echo "punused: $(grep -c . "$pfound" || true) findings, ${#pats[@]} ignore entries ($reasons comment lines)"
-
-            used=()
-            unexpected=0
-            while IFS= read -r line; do
-              hit=""
-              for i in "${!pats[@]}"; do
-                case "$line" in *"${pats[$i]}"*) hit=1; used[i]=1; break ;; esac
-              done
-              if [ -z "$hit" ]; then
-                echo "::error::unused exported symbol: $line"
-                unexpected=$((unexpected + 1))
-              fi
-            done < "$pfound"
-
-            for i in "${!pats[@]}"; do
-              if [ -z "${used[i]:-}" ]; then
-                echo "::warning::stale .punused-ignore entry (matches nothing): ${pats[$i]}"
-              fi
-            done
-
-            if [ "$unexpected" -gt 0 ]; then
-              echo "::error::$unexpected unused exported symbol(s) not adjudicated."
-              echo "Delete the symbol, wire it up, or add it to .punused-ignore with a reason comment."
-              exit 1
-            fi
-          ) || { echo "punused" >> /tmp/_ci_failures; exit 1; }
+            work="$(mktemp -d -t deadset.XXXXXX)" || exit 1
+            trap 'rm -rf "$work"' EXIT
+            kind=library
+            if [ "$APP_PROFILE" = true ]; then kind=application; fi
+            printf '{"target":{"kind":"%s"}}\n' "$kind" > "$work/central.json" || exit 1
+            # deadset-go loads packages with GOPROXY=off, so it reads only the
+            # module cache.
+            go mod download || exit 1
+            rc=0
+            deadset analyze --target=. --languages=go \
+              --central="$work/central.json" --run-dir="$work/run" || rc=$?
+            case "$rc" in
+              0) ;;
+              1)
+                echo "::error::deadset reported dead code, listed above. Delete it, wire it up, or adjudicate it with a deadset:ignore directive that names the code and the reason."
+                exit 1
+                ;;
+              2)
+                echo "::error::deadset refused the run (exit 2), so nothing was checked. The usage or configuration error is above."
+                exit 1
+                ;;
+              3)
+                echo "::error::deadset produced no answer (exit 3), so nothing was checked. An analyzer was missing, refused or failed, and its output is above."
+                exit 1
+                ;;
+              127)
+                echo "::error::deadset is not on PATH, so nothing was checked. scripts/install-local-tools.sh in cplieger/ci installs the pinned build."
+                exit 1
+                ;;
+              *)
+                echo "::error::deadset exited $rc, which is no verdict, so nothing was checked."
+                exit 1
+                ;;
+            esac
+          ) || { echo "deadset" >> /tmp/_ci_failures; exit 1; }
 
       # PR-time dependency vulnerability review. Runs for libraries and apps
       # alike (a vulnerable dep in a library propagates to every consumer).

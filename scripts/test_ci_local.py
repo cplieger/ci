@@ -53,5 +53,12 @@ class SuiteGate(unittest.TestCase):
         self.assertFalse(_ci_local.overrides_implicit_success("steps.build.outcome == 'success'"))
 
 
+class PullRequestPolicy(unittest.TestCase):
+    def test_the_pr_policy_job_is_not_planned_locally(self):
+        for jobname in ('pr-policy', 'ci/pr-policy'):
+            self.assertFalse(_ci_local.job_applies_locally(jobname, ROOT), jobname)
+        self.assertTrue(_ci_local.job_applies_locally('markdown', ROOT))
+
+
 if __name__ == '__main__':
     unittest.main()

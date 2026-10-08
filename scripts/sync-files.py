@@ -1,286 +1,470 @@
 #!/usr/bin/env python3
-"""In-house file-sync engine: push canonical files into consumer repos as PRs.
+"""File-sync engine: push canonical files from this checkout into consumer repos as PRs.
 
-First-party, so no third-party code holds the org-wide write PAT. Feature
-scope is deliberately the subset the cplieger repos need:
+Per manifest target (a repo, or a repo and a `base:`): clone, copy the mapped files from
+the commit sync_source picks by the target's pinned cplieger/ci major, commit
+`chore(sync): ...`, force-push `repo-sync/ci/default` (`repo-sync/ci/<base>` with --branch
+and --base), and keep one `dependencies` PR open. No diff, no PR; an open sync PR whose
+diff evaporated is closed. Files are only added or updated; forks are skipped unless
+--allow-forks. A failed target never stops the rest, and the exit is then non-zero.
 
-  * read the runtime manifest classify-repos.py generates (.github/sync.yml)
-  * per target repo: shallow-clone, branch `repo-sync/ci/default` off the
-    default branch, copy each mapped file from THIS checkout, commit
-    `chore(sync): ...`, force-push, ensure an open PR labelled `dependencies`
-  * no diff -> no PR; a leftover open sync PR whose diff has evaporated
-    (content landed some other way) is closed and its branch deleted
-  * forks are skipped by default (--allow-forks opts in); a fork's tree is
-    upstream's, so syncing into it rewrites code we do not own
-  * failure isolation: one repo failing never aborts the rest; the run exits
-    non-zero at the end if anything failed
-
-NOT supported on purpose (no cplieger repo needs them): templating,
-per-group commit messages, and orphan-file DELETION —
-syncing only ever adds or updates files.
-
-Contract stability: the branch name, commit subject, PR title and label are
-fixed, so consumer history stays uniform and sync.yaml's separate auto-merge
-sweep (`gh pr list --head repo-sync/ci/default`) keeps working.
-
-Auth: uses the ambient `gh` credentials (GH_TOKEN / SYNC_PAT in CI). Git push
-authenticates through gh's credential helper wired repo-locally on each clone
-— no token ever appears in a remote URL or in process output.
-
-Run:
-  scripts/sync-files.py --manifest .github/sync.yml            # real sync
-  scripts/sync-files.py --manifest .github/sync.yml --dry-run  # report only
-  scripts/sync-files.py ... --only atomicfile,httpx            # limit targets
+Auth: the ambient `gh` credentials over REST; git pushes through gh's credential helper,
+so no token reaches a remote URL or process output.
 """
 
 import argparse
-import json
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+import ghrest
 import yaml
 
-OWNER = "cplieger"
-BRANCH = "repo-sync/ci/default"
-COMMIT_SUBJECT = "chore(sync): synced file(s) with cplieger/ci"
+CURRENT_MAJOR = 3
+# A synced file passes inputs to, and is read by, the reusable workflows of the
+# consumer's pinned major, so an older pin gets that major's files whole. Moving
+# an entry is how a synced-file fix reaches those consumers; the commit must be
+# in the checkout (sync.yaml fetches full history).
+SYNC_SOURCES = {2: 'ce4127ad9858a7c1a2e256559e0f03430e92add6'}
+PIN = re.compile(
+    r'^[ \t]*-?[ \t]*uses:[ \t]*["\']?cplieger/ci/[^@\s"\']+@([^\s"\'#]+)["\']?[ \t]*(?:#[ \t]*(\S+))?',
+    re.MULTILINE,
+)
+
+OWNER = 'cplieger'
+BRANCH = 'repo-sync/ci/default'
+BASES = frozenset({'dev', 'main'})
+COMMIT_SUBJECT = 'chore(sync): synced file(s) with cplieger/ci'
 PR_TITLE = COMMIT_SUBJECT
-PR_LABEL = "dependencies"
-GIT_USER = "github-actions[bot]"
-GIT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com"
+PR_LABEL = 'dependencies'
+CLOSE_COMMENT = "Closing: the target branch already contains this sync's content."
+GIT_USER = 'github-actions[bot]'
+GIT_EMAIL = '41898282+github-actions[bot]@users.noreply.github.com'
 # Repo-local credential helper: git asks gh, gh uses GH_TOKEN/keyring. The
 # leading ! marks a shell-out helper; scoped to each clone, never global.
-CRED_HELPER = "!gh auth git-credential"
+CRED_HELPER = '!gh auth git-credential'
+
+
+class ManifestError(ValueError):
+    """The manifest names something the engine refuses to write."""
+
+
+class SourceError(ValueError):
+    """The target's cplieger/ci pins name no source this engine may sync from."""
 
 
 def run(args, cwd=None, check=True):
     """subprocess.run wrapper: captured text output, optional check."""
-    return subprocess.run(
-        args, cwd=cwd, check=check, capture_output=True, text=True
-    )
+    return subprocess.run(args, cwd=cwd, check=check, capture_output=True, text=True)
+
+
+def branch_for(base):
+    """The sync head for a base; release_channels.MAIN_SYNC_HEAD is the `main` one."""
+    return BRANCH if base is None else f'repo-sync/ci/{base}'
+
+
+def target_label(repo, base):
+    return repo if base is None else f'{repo} (base: {base})'
 
 
 def load_mapping(manifest_path):
-    """Manifest -> {repo: {dest: source}}. A repo in several groups gets the
-    union of their files; a duplicate dest keeps the LAST group's source
-    (groups are emitted most-generic-first by classify-repos.py)."""
-    cfg = yaml.safe_load(Path(manifest_path).read_text()) or {}
+    """Manifest -> {(repo, base or None): {dest: source}}. A target in several
+    groups gets the union of their files; a duplicate dest keeps the LAST
+    group's source (groups are emitted most-generic-first by classify-repos.py).
+    ManifestError on an unreadable manifest, one with no target, or a base other
+    than dev or main."""
+    try:
+        cfg = yaml.safe_load(Path(manifest_path).read_text())
+    except (OSError, yaml.YAMLError) as err:
+        msg = f'cannot read the manifest {manifest_path}: {err}'
+        raise ManifestError(msg) from None
+    groups = cfg.get('group') if isinstance(cfg, dict) else None
+    if not isinstance(groups, list) or not groups:
+        msg = f'{manifest_path} lists no sync group, so it is no classify-repos.py manifest'
+        raise ManifestError(msg)
     mapping = {}
-    for group in cfg.get("group", []):
-        repos = [r.strip() for r in (group.get("repos") or "").splitlines() if r.strip()]
-        files = group.get("files") or []
+    for group in groups:
+        if not isinstance(group, dict):
+            msg = f'{manifest_path}: a sync group is not a mapping: {group!r}'
+            raise ManifestError(msg)
+        repos = [r.strip() for r in (group.get('repos') or '').splitlines() if r.strip()]
+        base = group.get('base')
+        if base is not None and base not in BASES:
+            msg = f'unknown base {base!r} for {", ".join(repos)} (want one of {sorted(BASES)})'
+            raise ManifestError(msg)
+        files = group.get('files') or []
         for repo in repos:
-            dest_map = mapping.setdefault(repo, {})
+            dest_map = mapping.setdefault((repo, base), {})
             for entry in files:
                 if isinstance(entry, str):
                     dest_map[entry] = entry
                 else:
-                    dest_map[entry["dest"]] = entry["source"]
+                    dest_map[entry['dest']] = entry['source']
     return mapping
 
 
-def clone(repo, dest_dir):
-    """Shallow-clone the default branch with the gh credential helper wired
-    in repo-locally (covers private targets and the later push)."""
-    run([
-        "git", "-c", f"credential.helper={CRED_HELPER}",
-        "clone", "--quiet", "--depth", "1",
-        f"https://github.com/{repo}.git", str(dest_dir),
-    ])
-    run(["git", "config", "credential.helper", CRED_HELPER], cwd=dest_dir)
-    run(["git", "config", "user.name", GIT_USER], cwd=dest_dir)
-    run(["git", "config", "user.email", GIT_EMAIL], cwd=dest_dir)
+def target_key(target):
+    repo, base = target
+    return repo, base or ''
 
 
-def copy_files(source_root, clone_dir, dest_map):
-    """Copy sources into the clone; return the staged dest paths that differ."""
+def clone(repo, dest_dir, base):
+    """Shallow-clone the base (the default branch without one) with the gh
+    credential helper wired in repo-locally (covers private targets and the
+    later push)."""
+    branch = [] if base is None else ['--branch', base]
+    run(
+        [
+            'git',
+            '-c',
+            f'credential.helper={CRED_HELPER}',
+            'clone',
+            '--quiet',
+            '--depth',
+            '1',
+            *branch,
+            f'https://github.com/{repo}.git',
+            str(dest_dir),
+        ]
+    )
+    run(['git', 'config', 'credential.helper', CRED_HELPER], cwd=dest_dir)
+    run(['git', 'config', 'user.name', GIT_USER], cwd=dest_dir)
+    run(['git', 'config', 'user.email', GIT_EMAIL], cwd=dest_dir)
+
+
+def pinned_majors(paths):
+    """Every major the files at `paths` pin cplieger/ci to, read from each pin's
+    `# vN` comment or a `vN` ref; None stands for a pin that names no major. A path
+    that is no file is skipped."""
+    majors = set()
+    for path in paths:
+        if not path.is_file():
+            continue
+        for ref, comment in PIN.findall(path.read_text(errors='replace')):
+            label = re.match(r'v(\d+)', comment) or re.match(r'v(\d+)', ref)
+            majors.add(int(label[1]) if label else None)
+    return majors
+
+
+def sync_source(clone_dir, source_root, dest_map):
+    """The SYNC_SOURCES major whose commit the target's files come from, or None for
+    the checkout. The major is what the clone's copies of the workflows this sync
+    writes pin (a workflow the repository keeps may call another major), or, when none
+    is pinned yet, what the checkout's copies pin, so a new repository's first sync
+    never pairs older-major callers with current-major files. SourceError on a pin
+    without a major, on several majors, and on an older major with no source."""
+    workflows = sorted(dest for dest in dest_map if dest.startswith('.github/workflows/'))
+    majors = pinned_majors(clone_dir / dest for dest in workflows)
+    if not majors:
+        majors = pinned_majors(source_root / dest_map[dest] for dest in workflows)
+    if None in majors:
+        msg = 'a cplieger/ci pin names no major (want `@<sha> # vN`)'
+        raise SourceError(msg)
+    if len(majors) > 1:
+        names = ', '.join(f'v{major}' for major in sorted(majors))
+        msg = f'pinned to several cplieger/ci majors: {names}'
+        raise SourceError(msg)
+    if not majors:
+        return None
+    (major,) = majors
+    if major == CURRENT_MAJOR:
+        print(f'  source: checkout (pinned to v{major})')
+        return None
+    if major not in SYNC_SOURCES:
+        msg = f'pinned to v{major}, which has no sync source'
+        raise SourceError(msg)
+    print(f'  source: v{major} at {SYNC_SOURCES[major][:12]}')
+    return major
+
+
+def committed_file(source_root, sha, path):
+    """(git mode, bytes) of `path` at commit `sha` of the ci checkout, or None when
+    the commit has no such path."""
+    entry = run(['git', '-C', str(source_root), 'ls-tree', sha, '--', path]).stdout
+    if not entry:
+        return None
+    mode, kind, _oid = entry.partition('\t')[0].split()
+    if kind != 'blob' or mode not in ('100644', '100755'):
+        msg = f'source is not a regular file at {sha[:12]}: {path}'
+        raise FileNotFoundError(msg)
+    show = ['git', '-C', str(source_root), 'show', f'{sha}:{path}']
+    return mode, subprocess.run(show, check=True, capture_output=True).stdout
+
+
+def copy_files(source_root, clone_dir, dest_map, label, major=None):
+    """Copy sources into the clone, from the checkout or, with `major`, from
+    SYNC_SOURCES[major] (a file that commit lacks is held back); return the staged
+    dest paths that differ."""
+    written = []
     for dest, source in sorted(dest_map.items()):
-        src = source_root / source
-        if not src.is_file():
-            msg = f"source file missing in ci checkout: {source}"
-            raise FileNotFoundError(msg)
         target = clone_dir / dest
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(src, target)  # copies bytes + mode (x-bit survives)
-    run(["git", "add", "--", *sorted(dest_map)], cwd=clone_dir)
-    diff = run(
-        ["git", "diff", "--cached", "--name-only"], cwd=clone_dir
-    ).stdout.split()
+        if major is None:
+            src = source_root / source
+            if not src.is_file():
+                msg = f'source file missing in ci checkout: {source}'
+                raise FileNotFoundError(msg)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(src, target)  # copies bytes + mode (x-bit survives)
+        else:
+            blob = committed_file(source_root, SYNC_SOURCES[major], source)
+            if blob is None:
+                print(f'::notice::{label}: {dest} held back (absent at the v{major} sync source)')
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(blob[1])
+            target.chmod(0o755 if blob[0] == '100755' else 0o644)
+        written.append(dest)
+    if written:
+        run(['git', 'add', '--', *written], cwd=clone_dir)
+    diff = run(['git', 'diff', '--cached', '--name-only'], cwd=clone_dir).stdout.split()
     return sorted(diff)
 
 
-def open_pr_number(repo):
-    """Number of the open sync PR for this repo, or None."""
-    out = run([
-        "gh", "pr", "list", "-R", repo, "--head", BRANCH,
-        "--state", "open", "--json", "number", "--jq", ".[0].number",
-    ]).stdout.strip()
-    return int(out) if out else None
+def default_branch(clone_dir):
+    """The branch a clone without --branch checked out: the repo's default."""
+    return run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=clone_dir).stdout.strip()
 
 
-def ensure_pr(repo, changed):
-    """Create the sync PR if none is open; label failures are non-fatal."""
-    if open_pr_number(repo) is not None:
-        print("  PR already open; force-push refreshed it")
+def own_head(row, repo):
+    return ((row.get('head') or {}).get('repo') or {}).get('full_name') == repo
+
+
+def open_pulls(repo, base):
+    """The open sync pull requests of this target, newest first. A base target takes
+    only heads in this repository, because a fork's pull request can carry the same
+    name; a main-default target takes a head of that name from any repository."""
+    scope = '' if base is None else f'&base={base}'
+    rows = ghrest.pages(f'repos/{repo}/pulls?state=open&sort=created&direction=desc{scope}')
+    head = branch_for(base)
+    return [
+        row
+        for row in rows
+        if (row.get('head') or {}).get('ref') == head and (base is None or own_head(row, repo))
+    ]
+
+
+def open_pull(repo, base):
+    rows = open_pulls(repo, base)
+    return rows[0] if rows else None
+
+
+def add_label(repo, number):
+    """Label the PR when the repo has PR_LABEL; a missing label is never created, and a
+    failure is a warning, never a failed sync."""
+    try:
+        if ghrest.get_or_none(f'repos/{repo}/labels/{PR_LABEL}') is not None:
+            ghrest.send('POST', f'repos/{repo}/issues/{number}/labels', {'labels': [PR_LABEL]})
+    except ghrest.ApiError as err:
+        print(f'::warning::{repo}#{number}: label {PR_LABEL} was not applied: {err}')
+
+
+def ensure_pr(repo, base, into, changed):
+    """Open the sync PR into `into` unless one is open."""
+    if open_pull(repo, base) is not None:
+        print('  PR already open; force-push refreshed it')
         return
     body_lines = [
-        "Synced from [cplieger/ci](https://github.com/cplieger/ci) by",
-        "`scripts/sync-files.py`. Files carrying a `Synced from cplieger/ci` header are",
-        "overwritten on every sync — change the canonical copy in cplieger/ci",
+        'Synced from [cplieger/ci](https://github.com/cplieger/ci) by',
+        '`scripts/sync-files.py`. Files carrying a `Synced from cplieger/ci` header are',
+        'overwritten on every sync — change the canonical copy in cplieger/ci',
         "instead. Auto-merges once this repo's required checks pass.",
-        "",
-        "Files updated in this run:",
-        *[f"- `{path}`" for path in changed],
+        '',
+        'Files updated in this run:',
+        *[f'- `{path}`' for path in changed],
     ]
-    create = [
-        "gh", "pr", "create", "-R", repo, "--head", BRANCH,
-        "--title", PR_TITLE, "--body", "\n".join(body_lines),
-        "--label", PR_LABEL,
+    pr = ghrest.send(
+        'POST',
+        f'repos/{repo}/pulls',
+        {'title': PR_TITLE, 'head': branch_for(base), 'base': into, 'body': '\n'.join(body_lines)},
+    )
+    add_label(repo, pr['number'])
+    print(f'  opened PR: {pr["html_url"]}')
+
+
+def close_stale_pr(repo, base, row):
+    """No diff this run: close a leftover open sync PR whose content has since landed
+    on its target branch some other way. Each failed step is a warning; a fork's
+    head branch is not ours to delete."""
+    number, label = row['number'], target_label(repo, base)
+    steps = [
+        ('comment', 'POST', f'repos/{repo}/issues/{number}/comments', {'body': CLOSE_COMMENT}),
+        ('close', 'PATCH', f'repos/{repo}/pulls/{number}', {'state': 'closed'}),
     ]
-    result = run(create, check=False)
-    if result.returncode != 0 and "label" in (result.stderr or "").lower():
-        # Missing label must not block the sync; retry unlabelled.
-        result = run(create[:-2], check=False)
-    if result.returncode != 0:
-        msg = f"gh pr create failed: {result.stderr.strip()}"
-        raise RuntimeError(msg)
-    print(f"  opened PR: {result.stdout.strip()}")
+    if own_head(row, repo):
+        steps.append(
+            ('branch delete', 'DELETE', f'repos/{repo}/git/refs/heads/{branch_for(base)}', None)
+        )
+    for what, method, path, body in steps:
+        try:
+            ghrest.send(method, path, body)
+        except ghrest.ApiError as err:
+            # 422 is GitHub's answer for a ref that no longer exists.
+            if what != 'branch delete' or err.status != 422:
+                print(f'::warning::{label}: stale sync PR #{number}: {what} failed: {err}')
+    print(f'  closed stale sync PR #{number}')
 
 
-def close_stale_pr(repo):
-    """No diff this run: close a leftover open sync PR whose content has
-    since landed on main some other way (its diff is empty/obsolete)."""
-    number = open_pr_number(repo)
-    if number is None:
-        return
-    run([
-        "gh", "pr", "close", "-R", repo, str(number), "--delete-branch",
-        "--comment",
-        "Closing: the target branch already contains this sync's content.",
-    ], check=False)
-    print(f"  closed stale sync PR #{number}")
-
-
-def sync_repo(repo, dest_map, source_root, dry_run):
-    """Sync one repo. Returns 'changed', 'clean', or 'dry'."""
-    with tempfile.TemporaryDirectory(prefix="sync-") as tmp:
-        clone_dir = Path(tmp) / "repo"
-        clone(repo, clone_dir)
-        run(["git", "checkout", "--quiet", "-B", BRANCH], cwd=clone_dir)
-        changed = copy_files(source_root, clone_dir, dest_map)
+def sync_repo(repo, base, dest_map, source_root, dry_run):
+    """Sync one target. Returns 'changed', 'clean', or 'dry'."""
+    branch = branch_for(base)
+    with tempfile.TemporaryDirectory(prefix='sync-') as tmp:
+        clone_dir = Path(tmp) / 'repo'
+        clone(repo, clone_dir, base)
+        into = base if base is not None else default_branch(clone_dir)
+        run(['git', 'checkout', '--quiet', '-B', branch], cwd=clone_dir)
+        major = sync_source(clone_dir, source_root, dest_map)
+        changed = copy_files(source_root, clone_dir, dest_map, target_label(repo, base), major)
 
         if not changed:
-            print("  in sync (no diff)")
+            print('  in sync (no diff)')
             if not dry_run:
-                close_stale_pr(repo)
-            return "clean"
+                # A clean target is in sync whether or not its leftover PR can be read.
+                try:
+                    row = open_pull(repo, base)
+                except ghrest.ApiError as err:
+                    print(
+                        f'::warning::{target_label(repo, base)}: the open sync PR lookup failed: {err}'
+                    )
+                    return 'clean'
+                if row is not None:
+                    close_stale_pr(repo, base, row)
+            return 'clean'
 
-        print(f"  {len(changed)} file(s) differ: {', '.join(changed)}")
+        print(f'  {len(changed)} file(s) differ: {", ".join(changed)}')
         if dry_run:
-            return "dry"
+            return 'dry'
 
-        run(["git", "commit", "--quiet", "-m", COMMIT_SUBJECT], cwd=clone_dir)
+        run(['git', 'commit', '--quiet', '-m', COMMIT_SUBJECT], cwd=clone_dir)
         run(
-            ["git", "push", "--quiet", "--force", "origin", f"HEAD:refs/heads/{BRANCH}"],
+            ['git', 'push', '--quiet', '--force', 'origin', f'HEAD:refs/heads/{branch}'],
             cwd=clone_dir,
         )
-        ensure_pr(repo, changed)
-        return "changed"
+        ensure_pr(repo, base, into, changed)
+        return 'changed'
 
 
 def fork_names():
-    """Names of every fork under OWNER, in one API call.
+    """Names of every fork under OWNER.
 
     Fail closed: a target repo is only writable by this engine once it is known
     NOT to be a fork, so an unreadable repo list aborts the run rather than
     proceeding on an unverified manifest.
     """
-    proc = run(
-        [
-            "gh", "repo", "list", OWNER,
-            "--limit", "300",
-            "--json", "name,isFork",
-        ],
-        check=False,
-    )
-    if proc.returncode != 0:
-        detail = proc.stderr.strip() or f"gh exited {proc.returncode}"
-        sys.exit(f"sync-files: cannot read {OWNER}'s repo list, so forks cannot "
-                 f"be excluded — refusing to sync: {detail}")
-    repos = json.loads(proc.stdout)
-    if len(repos) >= 300:
-        sys.exit("sync-files: repo list hit the --limit 300 ceiling; raise the limit")
-    return {repo["name"] for repo in repos if repo.get("isFork")}
+    try:
+        repos = ghrest.pages('user/repos?affiliation=owner')
+    except ghrest.ApiError as err:
+        sys.exit(
+            f"sync-files: cannot read {OWNER}'s repo list, so forks cannot "
+            f'be excluded — refusing to sync: {err}'
+        )
+    return {repo['name'] for repo in repos if repo.get('fork')}
 
 
 def drop_forks(mapping):
     """Remove fork targets from the mapping, naming each one dropped.
 
-    A fork's tree is UPSTREAM's, so syncing our conventions into it rewrites
-    code we do not own; the sync PR then auto-merges and our pipelines run
-    against upstream's monorepo on every push. classify-repos.py already
-    filters forks when it generates the manifest, but --manifest is an
-    argument, so the engine cannot assume the file it was handed was generated
-    that way. Second, independent gate on the same rule.
+    classify-repos.py already filters forks, but --manifest is an argument, so
+    the engine cannot assume the file it was handed was generated that way.
     """
     forks = fork_names()
     kept = {}
-    for full_name, dest_map in mapping.items():
-        if full_name.split("/")[-1] in forks:
-            print(f"::notice::{full_name}: skipped, repo is a fork")
+    for target, dest_map in mapping.items():
+        full_name = target[0]
+        if full_name.split('/')[-1] in forks:
+            print(f'::notice::{target_label(*target)}: skipped, repo is a fork')
             continue
-        kept[full_name] = dest_map
+        kept[target] = dest_map
     return kept
 
 
+def print_open_prs(mapping):
+    """`<repo name> <number> <head> [<base>]` per open sync PR, for sync.yaml's sweep;
+    a target whose lookup fails is a warning on stderr and is skipped."""
+    for repo, base in sorted(mapping, key=target_key):
+        try:
+            rows = open_pulls(repo, base)
+        except ghrest.ApiError as err:
+            msg = f'::warning::{target_label(repo, base)}: the open sync PR lookup failed: {err}'
+            print(msg, file=sys.stderr)
+            continue
+        for row in rows:
+            fields = [repo.split('/')[-1], str(row['number']), branch_for(base)]
+            print(' '.join([*fields, *([base] if base else [])]))
+
+
 def main():
-    ap = argparse.ArgumentParser(description="cplieger file-sync engine")
-    ap.add_argument("--manifest", default=".github/sync.yml",
-                    help="repo↔file mapping (generated by classify-repos.py)")
-    ap.add_argument("--source-dir", default=".",
-                    help="root of the cplieger/ci checkout holding the sources")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="report diffs only; no push, no PR, no close")
-    ap.add_argument("--only", default="",
-                    help="comma/space-separated repo names to limit the run")
-    ap.add_argument("--allow-forks", action="store_true",
-                    help="sync forks too (default: forks are skipped)")
+    ap = argparse.ArgumentParser(description='cplieger file-sync engine')
+    ap.add_argument(
+        '--manifest',
+        default='.github/sync.yml',
+        help='repo↔file mapping (generated by classify-repos.py)',
+    )
+    ap.add_argument(
+        '--source-dir', default='.', help='root of the cplieger/ci checkout holding the sources'
+    )
+    ap.add_argument(
+        '--dry-run', action='store_true', help='report diffs only; no push, no PR, no close'
+    )
+    ap.add_argument('--only', default='', help='comma/space-separated repo names to limit the run')
+    ap.add_argument(
+        '--allow-forks', action='store_true', help='sync forks too (default: forks are skipped)'
+    )
+    ap.add_argument(
+        '--print-open-prs',
+        action='store_true',
+        help='print each open sync PR as "<repo> <number> <head> [<base>]" and exit',
+    )
     args = ap.parse_args()
 
     source_root = Path(args.source_dir).resolve()
-    mapping = load_mapping(args.manifest)
+    try:
+        mapping = load_mapping(args.manifest)
+    except ManifestError as err:
+        sys.exit(f'::error::sync-files: {err}')
+    if args.print_open_prs:
+        print_open_prs(mapping)
+        return
     if args.only:
-        wanted = {w.strip() for w in args.only.replace(",", " ").split() if w.strip()}
-        mapping = {r: f for r, f in mapping.items() if r.split("/")[-1] in wanted}
+        wanted = {w.strip() for w in args.only.replace(',', ' ').split() if w.strip()}
+        mapping = {t: f for t, f in mapping.items() if t[0].split('/')[-1] in wanted}
     if not args.allow_forks:
         mapping = drop_forks(mapping)
 
     if not mapping:
-        print("nothing to sync (empty mapping after filters)")
+        print('nothing to sync (empty mapping after filters)')
         return
 
-    counts = {"changed": 0, "clean": 0, "dry": 0}
+    counts = {'changed': 0, 'clean': 0, 'dry': 0}
     failures = []
-    for repo in sorted(mapping):
-        print(f"::group::{repo}")
+    for repo, base in sorted(mapping, key=target_key):
+        label = target_label(repo, base)
+        print(f'::group::{label}')
         try:
-            outcome = sync_repo(repo, mapping[repo], source_root, args.dry_run)
+            outcome = sync_repo(repo, base, mapping[repo, base], source_root, args.dry_run)
             counts[outcome] += 1
-        except (subprocess.CalledProcessError, RuntimeError, OSError) as exc:
-            detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
-            print(f"::warning::{repo}: sync failed — {detail}")
-            failures.append(repo)
-        print("::endgroup::")
+        except (subprocess.CalledProcessError, ghrest.ApiError, OSError, SourceError) as exc:
+            detail = (
+                exc.stderr.strip()
+                if isinstance(exc, subprocess.CalledProcessError) and exc.stderr
+                else str(exc)
+            )
+            print(f'::warning::{label}: sync failed — {detail}')
+            failures.append(label)
+        print('::endgroup::')
 
     total = len(mapping)
-    print(f"\n{total} repo(s): {counts['changed']} synced · "
-          f"{counts['clean']} already in sync · {counts['dry']} with pending diffs (dry-run) · "
-          f"{len(failures)} failed{' (' + ', '.join(failures) + ')' if failures else ''}")
+    noun = 'repo(s)' if all(base is None for _repo, base in mapping) else 'target(s)'
+    print(
+        f'\n{total} {noun}: {counts["changed"]} synced · '
+        f'{counts["clean"]} already in sync · {counts["dry"]} with pending diffs (dry-run) · '
+        f'{len(failures)} failed{" (" + ", ".join(failures) + ")" if failures else ""}'
+    )
     if failures:
         sys.exit(1)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

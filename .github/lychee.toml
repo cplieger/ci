@@ -5,8 +5,8 @@
 # checker reports as broken and a human reader can open successfully. The
 # tracker issue is only useful while an OPEN issue means "a link rotted", so a
 # permanent false positive has to be excluded or the signal dies. Same role
-# `.punused-ignore` plays for unused-symbol findings, held centrally because
-# this noise is uniform across the cplieger repos rather than per-repo.
+# a `deadset:ignore` directive plays for a dead-code finding, held centrally
+# because this noise is uniform across the cplieger repos rather than per-repo.
 #
 # Non-synced and ci-internal, like `.github/cliff-ci.toml`: it configures a
 # workflow in THIS repo and is never copied into consumers by sync.yaml.

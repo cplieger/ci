@@ -34,19 +34,10 @@ NO_COMMENT = {'.json'}
 
 
 def synced_sources() -> list[str]:
-    """Every source path named in a `*_FILES` sync block, bare or `source:` form."""
-    sources = []
-    for name in dir(classify):
-        block = getattr(classify, name)
-        if not (name.endswith('_FILES') and isinstance(block, str)):
-            continue
-        for line in block.splitlines():
-            entry = line.strip()
-            if entry.startswith('- source:'):
-                sources.append(entry.removeprefix('- source:').strip())
-            elif entry.startswith('- ') and ':' not in entry:
-                sources.append(entry.removeprefix('- ').strip())
-    return sorted(set(sources))
+    """Every source path any manifest group names."""
+    return sorted(
+        {source for _key, group in classify.GROUPS for source, _dest in classify.pairs(group)}
+    )
 
 
 def kind(source: str) -> str:
@@ -59,6 +50,7 @@ class SyncHeaders(unittest.TestCase):
         sources = synced_sources()
         self.assertIn('.editorconfig', sources)
         self.assertIn('configs/prettier.json', sources)
+        self.assertIn('configs/renovate-two-branch.json', sources)
         for source in sources:
             self.assertTrue((ROOT / source).is_file(), source)
 

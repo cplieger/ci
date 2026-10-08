@@ -1,0 +1,49 @@
+@@ commit B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/bar v1.2.0
+    example.com/foo v1.4.0
+)
+@@ file main.go
+package main
+
+func main() {}
+@@ commit M parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/bar v1.3.0
+    example.com/foo v1.4.0
+)
+@@ commit T parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/bar v1.3.0
+    example.com/foo/v2 v2.0.0
+)
+@@ file main.go
+package main
+
+// moved to foo/v2
+func main() {}
+@@ commit T_lag parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/bar v1.2.0
+    example.com/foo/v2 v2.0.0
+)

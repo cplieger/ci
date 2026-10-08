@@ -1,0 +1,191 @@
+@@ commit B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc v2.0.0+incompatible
+)
+
+replace example.com/a => example.com/a-fork v0.0.0-20260101000000-aaaaaaaaaaaa
+@@ commit M parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc v2.1.0+incompatible
+)
+
+replace example.com/a => example.com/a-fork v0.0.0-20260201000000-bbbbbbbbbbbb
+@@ commit T parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc v2.1.0+incompatible
+)
+
+replace example.com/a => example.com/a-fork v0.0.0-20260301000000-cccccccccccc
+@@ commit T_other_target parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc v2.1.0+incompatible
+)
+
+replace example.com/a => example.com/a-other v1.0.0
+@@ commit T_bad parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc master
+)
+
+replace example.com/a => example.com/a-fork v0.0.0-20260301000000-cccccccccccc
+@@ commit T_low parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc v2.0.0+incompatible
+)
+
+replace example.com/a => example.com/a-fork v0.0.0-20260301000000-cccccccccccc
+@@ commit M_fork parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc v2.0.0+incompatible
+)
+
+replace example.com/a => example.com/a-other v1.0.0
+@@ commit T_switch1 parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc v2.1.0+incompatible
+)
+
+replace example.com/a => example.com/a-other v1.0.0
+@@ commit T_switch parent T_switch1
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc v2.1.0+incompatible
+)
+
+replace example.com/a => example.com/a-third v1.0.0
+@@ commit M_bad parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc master
+)
+
+replace example.com/a => example.com/a-fork v0.0.0-20260101000000-aaaaaaaaaaaa
+@@ commit T_bad_same parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc master
+)
+
+replace example.com/a => example.com/a-fork v0.0.0-20260101000000-aaaaaaaaaaaa
+@@ commit M_malformed parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a
+    example.com/inc v2.1.0+incompatible
+)
+
+replace example.com/a => example.com/a-fork v0.0.0-20260101000000-aaaaaaaaaaaa
+@@ commit M_bad_added parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc v2.0.0+incompatible
+    example.com/new master
+)
+
+replace example.com/a => example.com/a-fork v0.0.0-20260101000000-aaaaaaaaaaaa
+@@ commit B_bad
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc master
+)
+@@ commit M_dropped parent B_bad
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require example.com/a v1.2.0
+@@ commit M_fixed parent B_bad
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+    example.com/a v1.2.0
+    example.com/inc v2.1.0+incompatible
+)
+@@ commit T_dropped parent B_bad
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require example.com/a v1.2.0

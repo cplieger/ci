@@ -104,6 +104,7 @@ jobs:
             scripts/links-body.py
             scripts/tracker_issue.py
             scripts/trackerlib.py
+            scripts/ghrest.py
           sparse-checkout-cone-mode: false
           path: ci
 

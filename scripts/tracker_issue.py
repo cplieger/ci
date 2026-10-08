@@ -3,19 +3,19 @@
 
 The weekly and daily workflows that file findings as issues (bench, fuzz,
 gremlins, links, stryker trackers and the notify-failure run tracker) all go
-through this script instead of carrying their own `gh issue` shell. One copy
-means one answer to the three questions the copies used to disagree on:
+through this script instead of carrying their own issue shell. One copy means
+one answer to the three questions the copies used to disagree on:
 
-- A repo with issues disabled never fails the run. Every mode reads
-  `hasIssuesEnabled` first and skips with a `::notice::` when it is false. A
-  FAILED read falls through to the issue ops: a loud failure beats a silently
-  dropped finding.
+- A repo with issues disabled never fails the run. Every mode reads the
+  repository's `has_issues` first and skips with a `::notice::` when it is
+  false. A FAILED read falls through to the issue ops: a loud failure beats a
+  silently dropped finding.
 - Labels are created on first use from the palette below, so a writer is
-  self-installing in any repo (`gh issue create --label` fails on a missing
-  label). `auto-generated` is always added to an issue this script creates.
-- Any other `gh` failure exits 1 with gh's stderr and writes nothing further.
-  Nothing is retried and nothing is swallowed; the caller decides whether the
-  repo's failure ends the run.
+  self-installing in any repo. `auto-generated` is always added to an issue
+  this script creates.
+- Any other API failure exits 1 with the error and writes nothing further,
+  once scripts/ghrest.py's retry policy has given up; nothing is swallowed. The
+  caller decides whether the repo's failure ends the run.
 
 Modes (`--mode`):
 
@@ -29,24 +29,24 @@ Modes (`--mode`):
     list              print `number<TAB>title` for each open issue with --label
 
 `fetch`, `upsert` and `close-when-clean` find the issue by --label plus exact
---title; `recur` by exact-title search (a finding's title is its identity, so
-the label is not part of the match). After `upsert` or `recur`,
-`--flag-label NAME --flag on|off` adds or removes NAME on the issue.
+--title; `recur` by exact title among every open issue (a finding's title is
+its identity, so the label is not part of the match). After `upsert` or
+`recur`, `--flag-label NAME --flag on|off` adds or removes NAME on the issue.
 
-Authentication is gh's: pass the token as GH_TOKEN in the environment. Runs on
-the runner's default python3 (3.12).
+Every call is REST (`gh api`). Authentication is gh's: pass the token as GH_TOKEN
+in the environment. Runs on the runner's default python3 (3.12).
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
+
+import ghrest
 
 ALWAYS_LABEL = 'auto-generated'
-LIST_LIMIT = '100'
 # (color, description) per label this transport creates. Unknown labels get
 # the neutral pair, so a caller's typo creates a grey label rather than failing.
 LABELS = {
@@ -57,60 +57,57 @@ LABELS = {
     'fuzz-finding': ('b60205', 'Fuzz-discovered regression'),
     'gremlins-tracker': ('5319e7', 'Gremlins mutation testing tracker'),
     'mutation-regression': ('b60205', 'Mutation efficacy regression'),
-    'promotion-blocked': ('e99695', 'Automatic promotion to main is blocked'),
+    'release-blocked': ('b60205', 'Something that reached main has not shipped'),
+    'repo-audit': ('d93f0b', 'Repository governance audit findings'),
     'stryker-tracker': ('1d76db', 'Stryker mutation testing tracker'),
     'weekly-ci-failure': ('b60205', 'An unwatched CI run failed and needs triage'),
 }
 DEFAULT_LABEL = ('ededed', 'Maintained by automation')
+# Each owned by one writer that calls main() with allow_reserved=True:
+# release-blocked by scripts/release_maintenance.py, repo-audit by
+# scripts/audit.py. The command line may only read issues under them.
+RESERVED_LABELS = frozenset({'release-blocked', 'repo-audit'})
+READ_MODES = frozenset({'fetch', 'list'})
 
 
 class GhError(Exception):
-    """A gh invocation this script cannot proceed past."""
+    """An API call this script cannot proceed past."""
 
 
-def gh(*args: str) -> str:
-    proc = subprocess.run(['gh', *args], capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        detail = proc.stderr.strip() or f'exit {proc.returncode}'
-        raise GhError(f'gh {" ".join(args[:2])} failed: {detail}')
-    return proc.stdout
+def api(method: str, path: str, body: dict | None = None):
+    try:
+        return ghrest.get(path) if method == 'GET' else ghrest.send(method, path, body)
+    except ghrest.ApiError as err:
+        raise GhError(str(err)) from None
 
 
 def issues_enabled(repo: str) -> bool:
-    proc = subprocess.run(
-        ['gh', 'repo', 'view', repo, '--json', 'hasIssuesEnabled', '--jq', '.hasIssuesEnabled'],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
+    try:
+        data = ghrest.get(f'repos/{repo}')
+    except ghrest.ApiError as err:
         print(
-            f'could not read the issue setting for {repo}; attempting the issue ops anyway: '
-            f'{proc.stderr.strip()}',
+            f'could not read the issue setting for {repo}; attempting the issue ops anyway: {err}',
             file=sys.stderr,
         )
         return True
-    return proc.stdout.strip() == 'true'
+    return isinstance(data, dict) and data.get('has_issues') is True
 
 
-def open_issues(repo: str, fields: str, label: str = '', search: str = '') -> list[dict]:
-    args = ['issue', 'list', '-R', repo, '--state', 'open', '--limit', LIST_LIMIT, '--json', fields]
+def open_issues(repo: str, label: str = '') -> list[dict]:
+    path = f'repos/{repo}/issues?state=open'
     if label:
-        args += ['--label', label]
-    if search:
-        args += ['--search', search]
-    return json.loads(gh(*args) or '[]')
+        path += f'&labels={quote(label, safe="")}'
+    try:
+        rows = ghrest.pages(path)
+    except ghrest.ApiError as err:
+        raise GhError(str(err)) from None
+    return [row for row in rows if 'pull_request' not in row]
 
 
-def find_open(
-    repo: str, title: str, label: str = '', fields: str = 'number,title,labels'
-) -> dict | None:
-    """The open issue with exactly `title`: within `label` when given, else by title search."""
-    if label:
-        candidates = open_issues(repo, fields, label=label)
-    else:
-        candidates = open_issues(repo, fields, search=f'{title} in:title')
-    for issue in candidates:
+def find_open(repo: str, title: str, label: str = '') -> dict | None:
+    """The open issue with exactly `title`: within `label` when given, else among
+    every open issue (the search API's 30-a-minute pool would throttle a fan-out)."""
+    for issue in open_issues(repo, label):
         if issue.get('title') == title:
             return issue
     return None
@@ -122,32 +119,26 @@ def label_names(issue: dict) -> set[str]:
 
 def ensure_label(repo: str, name: str) -> None:
     color, description = LABELS.get(name, DEFAULT_LABEL)
-    proc = subprocess.run(
-        ['gh', 'label', 'create', name, '-R', repo, '--color', color, '--description', description],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0 and 'already exists' not in proc.stderr:
-        print(f'label {name!r} not created in {repo}: {proc.stderr.strip()}', file=sys.stderr)
+    try:
+        ghrest.send(
+            'POST',
+            f'repos/{repo}/labels',
+            {'name': name, 'color': color, 'description': description},
+        )
+    except ghrest.ApiError as err:
+        if not (err.status == 422 and 'already_exists' in str(err)):
+            print(f'label {name!r} not created in {repo}: {err}', file=sys.stderr)
 
 
 def create(repo: str, title: str, labels: list[str], body_file: Path) -> int:
     for name in labels:
         ensure_label(repo, name)
-    url = gh(
-        'issue',
-        'create',
-        '-R',
-        repo,
-        '--title',
-        title,
-        '--label',
-        ','.join(labels),
-        '--body-file',
-        str(body_file),
-    ).strip()
-    number = int(url.rsplit('/', 1)[-1])
+    issue = api(
+        'POST',
+        f'repos/{repo}/issues',
+        {'title': title, 'body': body_file.read_text(), 'labels': labels},
+    )
+    number = issue['number']
     print(f'created #{number} in {repo}: {title}')
     return number
 
@@ -155,10 +146,10 @@ def create(repo: str, title: str, labels: list[str], body_file: Path) -> int:
 def set_flag(repo: str, number: int, current: set[str], flag_label: str, flag: str) -> None:
     if flag == 'on' and flag_label not in current:
         ensure_label(repo, flag_label)
-        gh('issue', 'edit', str(number), '-R', repo, '--add-label', flag_label)
+        api('POST', f'repos/{repo}/issues/{number}/labels', {'labels': [flag_label]})
         print(f'flagged #{number} {flag_label}')
     elif flag == 'off' and flag_label in current:
-        gh('issue', 'edit', str(number), '-R', repo, '--remove-label', flag_label)
+        api('DELETE', f'repos/{repo}/issues/{number}/labels/{quote(flag_label, safe="")}')
         print(f'unflagged #{number} {flag_label}')
 
 
@@ -170,8 +161,8 @@ def create_labels(args: argparse.Namespace) -> list[str]:
 
 
 def mode_fetch(args: argparse.Namespace) -> int:
-    issue = find_open(args.repo, args.title, label=args.label, fields='number,title,body')
-    args.body_file.write_text(issue['body'] if issue else '')
+    issue = find_open(args.repo, args.title, label=args.label)
+    args.body_file.write_text((issue.get('body') or '') if issue else '')
     print(f'fetched #{issue["number"]}' if issue else 'no open issue to fetch')
     return 0
 
@@ -180,7 +171,7 @@ def mode_upsert(args: argparse.Namespace) -> int:
     issue = find_open(args.repo, args.title, label=args.label)
     if issue:
         number, current = issue['number'], label_names(issue)
-        gh('issue', 'edit', str(number), '-R', args.repo, '--body-file', str(args.body_file))
+        api('PATCH', f'repos/{args.repo}/issues/{number}', {'body': args.body_file.read_text()})
         print(f'updated #{number} in {args.repo}')
     else:
         labels = create_labels(args)
@@ -194,7 +185,11 @@ def mode_recur(args: argparse.Namespace) -> int:
     issue = find_open(args.repo, args.title)
     if issue:
         number, current = issue['number'], label_names(issue)
-        gh('issue', 'comment', str(number), '-R', args.repo, '--body-file', str(args.comment_file))
+        api(
+            'POST',
+            f'repos/{args.repo}/issues/{number}/comments',
+            {'body': args.comment_file.read_text()},
+        )
         print(f'commented on #{number} in {args.repo}')
     else:
         labels = create_labels(args)
@@ -209,24 +204,15 @@ def mode_close_when_clean(args: argparse.Namespace) -> int:
     if not issue:
         print(f'no open issue to close in {args.repo}: {args.title}')
         return 0
-    comment = args.comment_file.read_text()
-    gh(
-        'issue',
-        'close',
-        str(issue['number']),
-        '-R',
-        args.repo,
-        '--reason',
-        'completed',
-        '--comment',
-        comment,
-    )
+    path = f'repos/{args.repo}/issues/{issue["number"]}'
+    api('POST', f'{path}/comments', {'body': args.comment_file.read_text()})
+    api('PATCH', path, {'state': 'closed', 'state_reason': 'completed'})
     print(f'closed #{issue["number"]} in {args.repo}')
     return 0
 
 
 def mode_list(args: argparse.Namespace) -> int:
-    for issue in open_issues(args.repo, 'number,title', label=args.label):
+    for issue in open_issues(args.repo, label=args.label):
         print(f'{issue["number"]}\t{issue["title"]}')
     return 0
 
@@ -244,7 +230,9 @@ NEEDS_COMMENT = {'recur', 'close-when-clean'}
 TAKES_FLAG = {'upsert', 'recur'}
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None, *, allow_reserved: bool = False
+) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -276,11 +264,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error('--flag-label and --flag go together')
     if args.flag_label and args.mode not in TAKES_FLAG:
         p.error(f'--flag-label applies to {", ".join(sorted(TAKES_FLAG))}, not {args.mode}')
+    if args.label in RESERVED_LABELS and args.mode not in READ_MODES and not allow_reserved:
+        p.error(
+            f'--label {args.label} is reserved for its own writer. Only fetch and list take it.'
+        )
     return args
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+def main(argv: list[str] | None = None, *, allow_reserved: bool = False) -> int:
+    args = parse_args(argv, allow_reserved=allow_reserved)
     if not issues_enabled(args.repo):
         subject = args.title or args.label
         print(

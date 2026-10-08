@@ -1,0 +1,297 @@
+@@ commit B
+@@ file package.json
+{ "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } }
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/qs": { "version": "6.11.0", "integrity": "sha512-fixture-qs-6110" }
+  }
+}
+@@ commit M parent B
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/qs": { "version": "6.11.2", "integrity": "sha512-fixture-qs-6112" }
+  }
+}
+@@ commit T parent B
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/express/node_modules/qs": { "version": "6.12.0", "integrity": "sha512-fixture-qs-6120" }
+  }
+}
+@@ commit B_two parent B
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-node_modules-express-5.1.0" },
+    "node_modules/minimatch": { "version": "9.0.5", "integrity": "sha512-fixture-node_modules-minimatch-9.0.5" },
+    "node_modules/y": { "version": "1.0.0", "integrity": "sha512-fixture-node_modules-y-1.0.0" },
+    "node_modules/y/node_modules/minimatch": { "version": "3.0.4", "integrity": "sha512-fixture-node_modules-y-node_modules-minimatch-3.0.4" }
+  }
+}
+@@ commit M_two parent B_two
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-node_modules-express-5.1.0" },
+    "node_modules/minimatch": { "version": "9.0.5", "integrity": "sha512-fixture-node_modules-minimatch-9.0.5" },
+    "node_modules/y": { "version": "1.0.0", "integrity": "sha512-fixture-node_modules-y-1.0.0" },
+    "node_modules/y/node_modules/minimatch": { "version": "3.1.2", "integrity": "sha512-fixture-node_modules-y-node_modules-minimatch-3.1.2" }
+  }
+}
+@@ commit T_two_fixed parent B_two
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-node_modules-express-5.1.0" },
+    "node_modules/minimatch": { "version": "9.0.5", "integrity": "sha512-fixture-node_modules-minimatch-9.0.5" },
+    "node_modules/y": { "version": "1.0.0", "integrity": "sha512-fixture-node_modules-y-1.0.0" },
+    "node_modules/y/node_modules/minimatch": { "version": "3.2.0", "integrity": "sha512-fixture-node_modules-y-node_modules-minimatch-3.2.0" }
+  }
+}
+@@ commit T_two_dedup parent B_two
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-node_modules-express-5.1.0" },
+    "node_modules/minimatch": { "version": "9.0.5", "integrity": "sha512-fixture-node_modules-minimatch-9.0.5" },
+    "node_modules/y": { "version": "1.0.0", "integrity": "sha512-fixture-node_modules-y-1.0.0" }
+  }
+}
+@@ commit T_two parent B_two
+@@ file src/index.js
+export {};
+@@ commit B_eq parent B
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/minimatch": { "version": "9.0.5", "integrity": "sha512-fixture-minimatch-905" },
+    "node_modules/y": { "version": "1.0.0", "integrity": "sha512-fixture-y-100" },
+    "node_modules/y/node_modules/minimatch": { "version": "3.0.4", "integrity": "sha512-fixture-minimatch-304" },
+    "node_modules/z": { "version": "1.0.0", "integrity": "sha512-fixture-z-100" },
+    "node_modules/z/node_modules/minimatch": { "version": "3.0.4", "integrity": "sha512-fixture-minimatch-304" }
+  }
+}
+@@ commit M_eq parent B_eq
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/minimatch": { "version": "9.0.5", "integrity": "sha512-fixture-minimatch-905" },
+    "node_modules/y": { "version": "1.0.0", "integrity": "sha512-fixture-y-100" },
+    "node_modules/y/node_modules/minimatch": { "version": "3.1.2", "integrity": "sha512-fixture-minimatch-312" },
+    "node_modules/z": { "version": "1.0.0", "integrity": "sha512-fixture-z-100" },
+    "node_modules/z/node_modules/minimatch": { "version": "3.0.4", "integrity": "sha512-fixture-minimatch-304" }
+  }
+}
+@@ commit T_eq parent B_eq
+@@ file src/index.js
+export {};
+@@ commit T_eq_carried parent B_eq
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/minimatch": { "version": "9.0.5", "integrity": "sha512-fixture-minimatch-905" },
+    "node_modules/y": { "version": "1.0.0", "integrity": "sha512-fixture-y-100" },
+    "node_modules/y/node_modules/minimatch": { "version": "3.1.2", "integrity": "sha512-fixture-minimatch-312" },
+    "node_modules/z": { "version": "1.0.0", "integrity": "sha512-fixture-z-100" },
+    "node_modules/z/node_modules/minimatch": { "version": "3.0.4", "integrity": "sha512-fixture-minimatch-304" }
+  }
+}
+@@ commit B_mixed parent B
+@@ file package.json
+{ "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0", "shared": "^1.0.0" } }
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0", "shared": "^1.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/express/node_modules/shared": { "version": "3.0.0", "integrity": "sha512-fixture-shared-300" },
+    "node_modules/shared": { "version": "1.0.0", "integrity": "sha512-fixture-shared-100" }
+  }
+}
+@@ commit M_mixed parent B_mixed
+@@ file package.json
+{ "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0", "shared": "^2.0.0" } }
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0", "shared": "^2.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/express/node_modules/shared": { "version": "3.0.0", "integrity": "sha512-fixture-shared-300" },
+    "node_modules/shared": { "version": "2.0.0", "integrity": "sha512-fixture-shared-200" }
+  }
+}
+@@ commit M_mixed_drop parent B_mixed
+@@ file package.json
+{ "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } }
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/shared": { "version": "3.0.0", "integrity": "sha512-fixture-shared-300" }
+  }
+}
+@@ commit B_dup parent B
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/y": { "version": "1.0.0", "integrity": "sha512-fixture-y-100" },
+    "node_modules/y/node_modules/minimatch": { "version": "3.0.4", "integrity": "sha512-fixture-minimatch-304" },
+    "node_modules/z": { "version": "1.0.0", "integrity": "sha512-fixture-z-100" },
+    "node_modules/z/node_modules/minimatch": { "version": "3.1.2", "integrity": "sha512-fixture-minimatch-312" }
+  }
+}
+@@ commit M_dup parent B_dup
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/y": { "version": "1.0.0", "integrity": "sha512-fixture-y-100" },
+    "node_modules/y/node_modules/minimatch": { "version": "3.1.2", "integrity": "sha512-fixture-minimatch-312" },
+    "node_modules/z": { "version": "1.0.0", "integrity": "sha512-fixture-z-100" },
+    "node_modules/z/node_modules/minimatch": { "version": "3.1.2", "integrity": "sha512-fixture-minimatch-312" }
+  }
+}
+@@ commit T_eq_other parent B_eq
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/minimatch": { "version": "9.0.5", "integrity": "sha512-fixture-minimatch-905" },
+    "node_modules/y": { "version": "1.0.0", "integrity": "sha512-fixture-y-100" },
+    "node_modules/y/node_modules/minimatch": { "version": "3.0.4", "integrity": "sha512-fixture-minimatch-304" },
+    "node_modules/z": { "version": "1.0.0", "integrity": "sha512-fixture-z-100" },
+    "node_modules/z/node_modules/minimatch": { "version": "3.0.5", "integrity": "sha512-fixture-minimatch-305" }
+  }
+}
+@@ commit T_eq_swapped parent B_eq
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/minimatch": { "version": "9.0.5", "integrity": "sha512-fixture-minimatch-905" },
+    "node_modules/y": { "version": "1.0.0", "integrity": "sha512-fixture-y-100" },
+    "node_modules/y/node_modules/minimatch": { "version": "3.0.4", "integrity": "sha512-fixture-minimatch-304" },
+    "node_modules/z": { "version": "1.0.0", "integrity": "sha512-fixture-z-100" },
+    "node_modules/z/node_modules/minimatch": { "version": "3.1.2", "integrity": "sha512-fixture-minimatch-312" }
+  }
+}
+@@ commit M_role_drop parent B_mixed
+@@ file package.json
+{ "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } }
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/shared": { "version": "4.0.0", "integrity": "sha512-fixture-shared-400" }
+  }
+}
+@@ commit M_role_mix parent B_mixed
+@@ file package.json
+{ "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } }
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/express/node_modules/shared": { "version": "3.1.0", "integrity": "sha512-fixture-shared-310" },
+    "node_modules/shared": { "version": "1.0.0", "integrity": "sha512-fixture-shared-100" }
+  }
+}
+@@ commit M_role_add parent M_role_drop
+@@ file package.json
+{ "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0", "shared": "^1.0.0" } }
+@@ file package-lock.json
+{
+  "name": "@cplieger/app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "@cplieger/app", "version": "1.0.0", "dependencies": { "express": "^5.0.0", "shared": "^1.0.0" } },
+    "node_modules/express": { "version": "5.1.0", "integrity": "sha512-fixture-express-510" },
+    "node_modules/express/node_modules/shared": { "version": "4.1.0", "integrity": "sha512-fixture-shared-410" },
+    "node_modules/shared": { "version": "1.0.0", "integrity": "sha512-fixture-shared-100" }
+  }
+}

@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
+import os
 import unittest
 from datetime import UTC, datetime, timedelta
+from unittest import mock
 
 import ghcr_retention as gr
+import promote
 
 NOW = datetime(2026, 9, 20, 5, 30, tzinfo=UTC)
 SHA = 'sha-' + 'f' * 40
@@ -80,6 +86,56 @@ class Selection(unittest.TestCase):
     def test_untagged_versions_are_ignored_by_selection(self):
         versions = [version(i, [], 400) for i in range(20)]
         self.assertEqual(gr.select_deletions(versions, NOW), [])
+
+
+class PromotedImages(unittest.TestCase):
+    """promote.yaml tags a promoted dev digest before main can name it."""
+
+    TAG = promote.promoted_tag('c' * 40)
+
+    def test_a_promoted_tag_takes_a_version_out_of_the_candidates(self):
+        for tags in (['v1.3.0-dev.7', SHA, self.TAG], [self.TAG]):
+            self.assertFalse(gr.is_candidate(version(1, tags, 400)), tags)
+
+    def test_a_run_keeps_an_aged_promoted_version_with_no_read_beyond_the_listings(self):
+        now = datetime.now(UTC)
+
+        def aged(vid, tags, days):
+            return {
+                'id': vid,
+                'created_at': (now - timedelta(days=days)).isoformat(),
+                'metadata': {'container': {'tags': tags}},
+            }
+
+        young = [aged(i, [f'v1.0.0-dev.{i}'], 1) for i in range(10)]
+        versions = [
+            *young,
+            aged(50, ['v0.9.0-dev.1', SHA, self.TAG], 60),
+            aged(51, ['v0.9.0-dev.2'], 61),
+        ]
+        calls = []
+
+        def gh(*args):
+            calls.append(args)
+            path = args[-1]
+            if path.startswith('users/cplieger/packages?'):
+                return json.dumps([[{'name': 'demo'}]])
+            if path.endswith('/demo/versions?per_page=100'):
+                return json.dumps([versions])
+            if args[:3] == ('api', '-X', 'DELETE'):
+                return ''
+            raise RuntimeError(f'gh {path} failed: HTTP 502')
+
+        with (
+            mock.patch.object(gr, 'gh', side_effect=gh),
+            mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            self.assertEqual(gr.main([]), 0)
+        deletes = [c[-1].rsplit('/', 1)[-1] for c in calls if c[:3] == ('api', '-X', 'DELETE')]
+        self.assertEqual(deletes, ['51'])
+        self.assertEqual(len(calls), 3, calls)
+        self.assertNotIn('| 50 |', out.getvalue())
 
 
 class Rendering(unittest.TestCase):

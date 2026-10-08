@@ -20,6 +20,14 @@ on:
         description: "Skip publishing when the rebuilt image is package-identical to :latest (used by the scheduled staleness rebuild)."
         type: boolean
         default: false
+      # Read by the two-branch pipeline through github.event.inputs, never
+      # `with:`, which a v2 pin does not declare. A stable run's dev barrier
+      # dispatches `renumber` on dev; a person never needs to.
+      mode:
+        description: "'renumber' re-tags dev's newest builds under fresh pre-release versions; 'normal' otherwise."
+        type: choice
+        options: [normal, renumber]
+        default: normal
 
 # Serialize release runs per repo. Two merges seconds apart otherwise race:
 # the losing run can 403 even on the git-refs tag create and strand a
@@ -44,6 +52,8 @@ permissions:
 jobs:
   release:
     permissions:
+      # The two-branch dev barrier dispatches dev release runs.
+      actions: write
       contents: write
       statuses: write
       packages: write

@@ -7,11 +7,12 @@ leaves when its deployment is removed; edit both together.
 
 from __future__ import annotations
 
+import json
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping
 
 STABLE_TAG_RE = re.compile(r'^v\d+\.\d+\.\d+$')
 DEV_TAG_RE = re.compile(r'^v\d+\.\d+\.\d+-dev\.\d+$')
@@ -50,20 +51,49 @@ DEPLOYED_IMAGE_REPOS = frozenset(
 SINGLE_MAIN_REPOS = frozenset({'animap', 'ci', '.github', 'tool-catalog', 'unraid-templates'})
 
 # Two-channel repos whose own .github/workflows/publish.yaml tags and releases
-# on a main push instead of the central release.yaml, so they have no dev
-# release run to read. Owned by the publish.yaml marker classify-repos.py keys
-# the artifact CI group on; a repo joins or leaves both together.
+# on a main push instead of the central release.yaml, so publish.yaml's runs
+# are the ones that show a release in flight. Owned by the publish.yaml marker
+# classify-repos.py keys the artifact CI group on; a repo joins or leaves both
+# together.
 OWN_PUBLISH_REPOS = frozenset({'web-terminal-glyphs'})
 
 # A commit merged from a pull request whose head branch starts with one of these
 # is a machine change; every other head, and a commit with no pull request, is human.
 MACHINE_HEAD_PREFIXES = ('renovate/', 'repo-sync/', 'rebuild/')
 
+# The only heads a two-branch repo's `main` takes, each with the content rule
+# scripts/intake.py applies to it. Sync has one branch per base, so it is exact.
+MAIN_INTAKE_PREFIXES = {'renovate/main-': 'renovate', 'rebuild/main-': 'rebuild'}
+MAIN_SYNC_HEAD = 'repo-sync/ci/main'
+
+# The two-branch preset's single `main` group (cplieger/.github two-branch.json
+# `groupName`) and the branch Renovate names it in multi-base mode: the base
+# joins branchPrefix, then the slugified group name.
+MAIN_GROUP_NAME = 'weekly dependencies'
+MAIN_GROUP_BRANCH = 'renovate/main-weekly-dependencies'
+
+# Renovate runs as this GitHub App bot. A Dependency Dashboard it opened under the
+# owner's token stays the owner's, and Renovate keeps editing it, so both authors count.
+RENOVATE_BOT_LOGIN = 'tribble-trouble[bot]'
+RENOVATE_AUTHORS = frozenset({'cplieger', RENOVATE_BOT_LOGIN})
+
+# The `security-<updateType>` labels the two-branch preset's vulnerabilityAlerts
+# writes that release-maintenance.yaml may merge unattended. An allowlist: other
+# rules also add `security`, and a major (`security-major`) waits for the owner.
+SECURITY_AUTOMERGE_LABELS = frozenset(
+    {'security-patch', 'security-minor', 'security-digest', 'security-pin', 'security-pinDigest'}
+)
+
 # The receipt a dev tag path leaves on its commit: a commit status in this
 # context, posted right after the tag ref. Stable tags need none because their
 # GitHub Release, authored by the Actions token, is the receipt.
 TAG_RECEIPT_PREFIX = 'release/tag/'
 RELEASE_AUTHORS = frozenset({'github-actions[bot]'})
+
+# The completion receipt of a two-branch stable publication: a commit status on
+# the tag's commit, posted once the lane's Release exists and its registry
+# readback passed. A tag alone is not proof; release-state.sh writes and reads it.
+COMPLETION_RECEIPT_PREFIX = 'release/complete/'
 
 # GitHub's tag listing pages at 100 and every dev tag is permanent, so a page
 # cap bounds the walk on a repo with thousands of dev builds.
@@ -83,6 +113,55 @@ def tag_receipt_context(tag: str) -> str:
 def has_tag_receipt(tag: str, statuses: Iterable[dict]) -> bool:
     """Whether `statuses` (a commit's combined statuses) carry the tag's receipt."""
     context = tag_receipt_context(tag)
+    return any(s.get('context') == context and s.get('state') == 'success' for s in statuses)
+
+
+def is_two_branch(repo: Mapping[str, Any]) -> bool:
+    """Whether a REST repository object is enrolled: public, not a fork, not
+    archived, outside SINGLE_MAIN_REPOS, default branch dev. A missing or
+    mistyped field reads as not enrolled."""
+    return (
+        repo.get('default_branch') == 'dev'
+        and repo.get('visibility') == 'public'
+        and repo.get('fork') is False
+        and repo.get('archived') is False
+        and isinstance(repo.get('name'), str)
+        and repo['name'] not in SINGLE_MAIN_REPOS
+    )
+
+
+def two_branch_names(lines: Iterable[str]) -> list[str]:
+    """The names of the REST repository objects, one JSON object per non-blank
+    line, that is_two_branch accepts; ValueError or TypeError on any other line."""
+    out = []
+    for line in lines:
+        if not line.strip():
+            continue
+        repo = json.loads(line)
+        if not isinstance(repo, dict):
+            raise TypeError(f'not a repository object: {line.strip()!r}')
+        if is_two_branch(repo):
+            out.append(repo['name'])
+    return out
+
+
+def main_intake_kind(head: str) -> str | None:
+    """`renovate`, `sync` or `rebuild` for a head `main` takes; None for any other head."""
+    if head == MAIN_SYNC_HEAD:
+        return 'sync'
+    for prefix, kind in MAIN_INTAKE_PREFIXES.items():
+        if head.startswith(prefix) and len(head) > len(prefix):
+            return kind
+    return None
+
+
+def completion_receipt_context(tag: str) -> str:
+    return COMPLETION_RECEIPT_PREFIX + tag
+
+
+def has_completion_receipt(tag: str, statuses: Iterable[dict]) -> bool:
+    """Whether `statuses` (a commit's statuses) carry the tag's completion receipt."""
+    context = completion_receipt_context(tag)
     return any(s.get('context') == context and s.get('state') == 'success' for s in statuses)
 
 
@@ -206,3 +285,11 @@ def collect_all_tags(
     lane has no earlier stop. None when a page read fails;
     TagListingTruncatedError when `page_cap` full pages did not end the listing."""
     return _collect_pages(fetch_page, lambda _names: False, page_cap, 'the end of the listing')
+
+
+if __name__ == '__main__':
+    import sys
+
+    if sys.argv[1:] != ['two-branch']:
+        sys.exit('usage: release_channels.py two-branch < REST repository objects, one per line')
+    print('\n'.join(two_branch_names(sys.stdin)))
