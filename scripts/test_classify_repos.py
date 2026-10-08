@@ -339,7 +339,7 @@ class TwoBranch(unittest.TestCase):
         )
         self.assertEqual(
             (ROOT / 'configs' / 'renovate-two-branch.json').read_text(),
-            '{"extends": ["github>cplieger/.github:two-branch"]}\n',
+            '{ "extends": ["github>cplieger/.github:two-branch"] }\n',
         )
 
     def test_the_sync_engine_reads_one_target_per_base(self):
