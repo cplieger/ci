@@ -75,7 +75,7 @@ jobs:
           # is not available to it and no single pin can satisfy them: without
           # `auto` every clone fails `go.mod requires go >= X (running X-1)`.
           # Measured on go1.27.1, run 33573180820. The toolchain arrives as a
-          # checksum-verified module. Same workaround as go-ci.yaml's gopls
+          # checksum-verified module. Same workaround as go-ci.yaml's deadset
           # install.
           GOTOOLCHAIN: auto
           # From the fanout job, never restated here. Injected via env rather

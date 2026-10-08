@@ -1,68 +1,12 @@
 #!/usr/bin/env bash
-#
-# install-local-tools.sh — install the CI-pinned dev tools locally so local
-# lint/scan runs match the cplieger/ci gate (ci.yaml / ci-local.sh).
-#
-# WHY: CI installs specific, Renovate-pinned tool versions (e.g. golangci-lint
-# v2.12.2). A local copy on a different version can disagree with the gate: a
-# newer or older golangci-lint flags or clears findings CI won't, so a local
-# "clean" run is not trustworthy. This installs the exact pinned versions.
-#
-# HOW: versions are read from the `# renovate:` pins in this repo's workflows,
-# the single source of truth, so nothing here hardcodes a version. Re-run after
-# `git -C <ci> pull` to pick up Renovate bumps. Some drift between runs (and
-# between local and CI) is expected and fine.
-#
-# COVERS (the tools the `ci / validate` gate + advisory security scan run):
-#   - Renovate-pinned, exact version: golangci-lint, gitleaks, trivy, hadolint
-#     (release binaries), shfmt + the shellcheck binary (release binaries; CI
-#     pins the latter since the SC2317 runner false-positive fix), ruff, zizmor
-#     (pipx), yamllint (pipx), markdownlint-cli2 (npm). Every one of these is
-#     pinned in a workflow next to a `# renovate:` comment.
-#   - standalone complexity binaries (no CI pin to read): gocyclo, gocognit,
-#     installed @latest. The `ci / validate` gate runs cyclomatic + cognitive
-#     complexity INSIDE golangci-lint (the gocyclo + gocognit linters); these
-#     standalone binaries are the `-avg` tools the test-review agent and local
-#     measurement use (`gocyclo -avg .`, `gocognit -avg .`), which golangci
-#     does not expose.
-#   - every `go install <pkg>@<ver>` line in go-ci.yaml; the version is pinned in
-#     a shell var (e.g. GOVULNCHECK_VERSION=v1.6.0) which this script resolves:
-#     govulncheck, deadcode, punused, gopls (punused's LSP server); actionlint
-#     moved OUT of this set 2026-08 (now a curl-installed release binary,
-#     pinned in the meta ci.yaml repo job), and lychee joined the curl set with
-#     the markdown-job gates
-#   Versions are always read live from the workflows, never hardcoded here,
-#   via the `# renovate: ... depName=X` + `VERSION` pins (hadolint's pin is the
-#   HADOLINT_VERSION var feeding its `hadolint/hadolint:<tag>` docker-run).
-# NOT covered (install via your package manager, or not part of local validate):
-#   - release- or niche-only: git-cliff (release), gremlins (weekly mutation)
-#   - project-local TS devdeps run via `npm ci` (the native `tsc` via each
-#     repo's @typescript/native alias, plus eslint, prettier, vitest, stylelint,
-#     html-validate, knip), pinned per-repo in package-lock.json
-#   - the Playwright BROWSER for a package on Vitest Browser Mode. `npm ci`
-#     installs the library, never the browser binary, and ci-local SKIPs
-#     ts-ci.yaml's "Install browser" step by name like every other install step,
-#     so a first local run of that package's suite fails inside "Test (vitest)"
-#     with a missing-executable error that reads like a test failure. Provision
-#     it once per machine, from the package dir so the pinned CLI picks its own
-#     matching browser build:
-#         npx --no-install playwright install chromium
-#     No --with-deps, here or in CI: a desktop and the ubuntu-24.04 runner both
-#     already carry the ~95 system libraries Chromium links, so the flag only
-#     adds an apt fetch for glyph-fallback fonts (ts-ci.yaml's browser step
-#     records what that cost). Not resolvable from this repo's pins, for the
-#     same reason as the TS devdeps above — the playwright version is
-#     per-package.
-#   - supply-chain/scan actions that don't run locally: cosign, syft, CodeQL
-#
-# INSTALL TARGETS: Go tools via `go install` (Go bin dir); golangci-lint,
-# gitleaks, trivy, hadolint, shellcheck into $BIN_DIR (default ~/.local/bin);
-# ruff via pipx; markdownlint-cli2 via npm -g. $BIN_DIR and the Go bin dir must
-# precede /usr/bin on PATH so these shadow any distro packages (e.g. a distro
-# trivy in /usr/bin).
-#
-# USAGE: scripts/install-local-tools.sh
-# ENV:   BIN_DIR  override the binary install dir (default ~/.local/bin)
+# install-local-tools.sh: install the dev tools at the versions cplieger/ci's
+# workflows pin, so a local lint or scan agrees with the gate. Each version is
+# read from a `# renovate:` pin or a `go install <pkg>@${VAR}` line under
+# .github/workflows; re-run after a Renovate bump lands there. Not covered: the
+# per-package npm devDependencies, and the browser of a Vitest Browser Mode
+# package (`npx --no-install playwright install chromium` in its directory).
+# USAGE: scripts/install-local-tools.sh. BIN_DIR (default ~/.local/bin) and the
+# Go bin dir must precede /usr/bin on PATH to shadow distro packages.
 
 set -euo pipefail
 
@@ -73,8 +17,9 @@ declare -a SUMMARY=()
 declare -a FAILED=()
 
 # pin_version <depName>: print the version literal pinned on the line after the
-# first `# renovate: ... depName=<depName>` comment across the workflows.
-# Uses index() (literal substring) so dots/slashes in depName are not regex.
+# first `# renovate: ... depName=<depName>` comment across the workflows, or
+# nothing (status 0) when none pins it, so the caller reports "no pin found".
+# index() matches literally, so the dots in a depName are no regex.
 pin_version() {
   awk -v dep="depName=$1" '
     FNR == 1 { found = 0 }
@@ -87,23 +32,17 @@ pin_version() {
       print v
       exit
     }
-  ' "$WF_DIR"/*.yaml 2>/dev/null
+  ' "$WF_DIR"/*.yaml 2>/dev/null || true
 }
 
 # semver: extract the first X.Y.Z from stdin (a tool's --version output).
 semver() { grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1; }
 
-# fetch_extract <url> <tar-arg>...: download an archive to a temp file, then
-# extract it by passing the temp file to tar with the given arguments (e.g.
-# `-xz -C "$BIN_DIR" gitleaks`). Returns non-zero if either half fails.
-#
-# WHY two steps instead of `curl ... | tar -xzf -`: plain `--retry` treats only
-# a timeout and a short list of HTTP codes as retryable, so a mid-transfer
-# receive failure (curl exit 56, "Connection died") gets no retry at all — the
-# class that reddened the CI markdown job on 2026-08-12. `--retry-all-errors`
-# covers it, but curl only resets partial output it owns via `-o`; it cannot
-# reset a pipe or a `>` redirect, so retrying into a pipe would replay bytes tar
-# has already consumed. Downloading to a file first is what makes the flag safe.
+# fetch_extract <url> <tar-arg>...: download an archive to a temp file, then run
+# tar on it with the given arguments. Returns non-zero if either half fails.
+# Never `curl | tar`: `--retry-all-errors` is what retries a mid-transfer receive
+# failure (curl exit 56), and curl can reset only output it owns via `-o`, so a
+# retry into a pipe would replay bytes tar already consumed.
 fetch_extract() {
   local url=$1
   shift
@@ -174,17 +113,11 @@ install_gitleaks() {
   fi
 }
 
-# install_go_tools: replay every `go install <pkg>@<ver>` from go-ci.yaml so the
-# locally installed Go helper tools match CI exactly. go-ci.yaml pins each tool's
-# version in a shell variable (e.g. `GOVULNCHECK_VERSION=v1.4.0`) and installs it
-# as `go install "<pkg>@${GOVULNCHECK_VERSION}"`. We replay that: build a map of
-# the workflow's `<NAME>=<value>` assignments, then for each go-install spec strip
-# the quotes the YAML left on the token and resolve the `${VAR}` version reference
-# against that map. A bare literal version (`@v1.2.3` / `@latest`) passes through
-# unchanged, so the un-pinned form still works. Each `go install` runs under
-# GOTOOLCHAIN=auto so a tool whose module requires a newer Go than the local base
-# toolchain still builds (auto fetches the needed toolchain on demand) — matching
-# CI, where setup-go installs the go.mod version and GOTOOLCHAIN is unset (auto).
+# install_go_tools: replay every `go install <pkg>@<ver>` of go-ci.yaml. Each
+# version is a `${VAR}` resolved against the workflow's `NAME=value` lines; a
+# literal `@v1.2.3` or `@latest` passes through. GOTOOLCHAIN=auto, as go-ci.yaml
+# sets on its own installs, lets a tool needing a newer Go than the local one
+# build anyway.
 install_go_tools() {
   local goci="$WF_DIR/go-ci.yaml" spec name ver verpart varname line trimmed k v
   [ -f "$goci" ] || {
@@ -196,9 +129,7 @@ install_go_tools() {
     return
   }
 
-  # Map every clean `<identifier>=<value>` assignment in the workflow (captures
-  # the *_VERSION pins; skips `echo 'app=true'`-style lines whose key holds
-  # spaces). Value is taken up to the first whitespace, dropping inline comments.
+  # A key holding punctuation (`echo 'app=true'`) is no assignment.
   local -A vers=()
   while IFS= read -r line; do
     trimmed="${line#"${line%%[![:space:]]*}"}" # strip leading indentation
@@ -247,13 +178,8 @@ install_go_tools() {
   done < <(grep -oE 'go install [^[:space:]]+@[^[:space:]]+' "$goci" | awk '{print $3}')
 }
 
-# install_complexity_tools: standalone gocyclo + gocognit. These are NOT gate
-# tools; the `ci / validate` gate runs cyclomatic AND cognitive complexity
-# inside golangci-lint (installed above). These binaries are what the
-# test-review agent and local measurement use for the per-package AVERAGE
-# (`gocyclo -avg .`, `gocognit -avg .`), which golangci does not report. No CI
-# pin exists to read (they live in no workflow), so install @latest: the
-# complexity algorithms are stable and these never drive the gate.
+# install_complexity_tools: gocyclo and gocognit for their `-avg` reports, which
+# golangci-lint does not give. No workflow pins them, so @latest.
 install_complexity_tools() {
   command -v go >/dev/null 2>&1 || {
     bad "gocyclo/gocognit" "go not found"
@@ -318,6 +244,29 @@ install_markdownlint() {
   fi
 }
 
+install_deadset_ts() {
+  local want cur
+  want="$(pin_version @cplieger/deadset-ts)"
+  [ -n "$want" ] || {
+    bad deadset-ts "no pin found"
+    return
+  }
+  cur="$(deadset-ts version 2>/dev/null | semver || true)"
+  [ "$cur" = "$want" ] && {
+    skip deadset-ts "$want"
+    return
+  }
+  command -v npm >/dev/null 2>&1 || {
+    bad deadset-ts "npm not found"
+    return
+  }
+  if npm install -g --ignore-scripts "@cplieger/deadset-ts@${want}" >/dev/null 2>&1; then
+    ok deadset-ts "$want" "npm -g"
+  else
+    bad deadset-ts "npm failed"
+  fi
+}
+
 install_trivy() {
   local want cur arch
   want="$(pin_version aquasecurity/trivy)"
@@ -347,11 +296,8 @@ install_trivy() {
   fi
 }
 
-# install_hadolint: hadolint runs in CI as a Docker image whose tag is pinned
-# by the HADOLINT_VERSION var next to a `# renovate: datasource=docker` comment
-# in shell-ci.yaml — readable via pin_version like every other tool. Install
-# the matching release binary so local Dockerfile lint applies the same rule
-# set as the gate.
+# install_hadolint: CI runs hadolint as a Docker image tagged HADOLINT_VERSION;
+# this installs the release binary of the same version.
 install_hadolint() {
   local want cur arch
   want="$(pin_version hadolint/hadolint)"
@@ -382,9 +328,6 @@ install_hadolint() {
   fi
 }
 
-# install_shellcheck: pinned in shell-ci.yaml AND the meta ci.yaml scripts job
-# (the runner's preinstalled copy false-positives SC2317, so CI installs its
-# own); read the pin like every other tool.
 install_shellcheck() {
   local want cur arch
   want="$(pin_version koalaman/shellcheck)"
@@ -414,9 +357,6 @@ install_shellcheck() {
   fi
 }
 
-# install_shfmt: the shell formatter run by the meta CI scripts job and the
-# the private repos' bespoke CI. Pinned via `# renovate: ... depName=mvdan/sh` +
-# VERSION in the workflows; install the matching single-file release binary.
 install_shfmt() {
   local want cur arch
   want="$(pin_version mvdan/sh)"
@@ -446,9 +386,6 @@ install_shfmt() {
   fi
 }
 
-# install_yamllint: the YAML linter run by the meta CI scripts job and the
-# private repos' bespoke CI. Pinned in the scripts job next to a
-# `# renovate: datasource=pypi` comment; install the exact version.
 install_yamllint() {
   local want cur
   want="$(pin_version yamllint)"
@@ -472,10 +409,6 @@ install_yamllint() {
   fi
 }
 
-# install_zizmor: the GitHub Actions security auditor run by the meta CI
-# scripts job (soft-gated). Pinned there next to a `# renovate:
-# datasource=pypi` comment; install the exact version so local ci-local runs
-# match the gate.
 install_zizmor() {
   local want cur
   want="$(pin_version zizmor)"
@@ -499,11 +432,6 @@ install_zizmor() {
   fi
 }
 
-# install_actionlint: the workflow linter run by the meta CI `repo` job. It
-# used to ride install_go_tools (a `go install` line in go-ci.yaml), but the
-# 2026-08 repo-job consolidation moved it to a curl-installed release binary in
-# ci.yaml — without this function the installer would silently stop tracking
-# its pin the next time Renovate bumps it.
 install_actionlint() {
   local want cur arch
   want="$(pin_version rhysd/actionlint)"
@@ -533,11 +461,8 @@ install_actionlint() {
   fi
 }
 
-# install_lychee: the offline link+anchor checker gating the meta CI markdown
-# job (2026-08). Two release-layout traps, both paid for when the CI step was
-# written: the tag is `lychee-vX.Y.Z` (the repo also tags lychee-lib-*), and
-# the archive nests the binary one level deep in a target-named directory,
-# hence --strip-components=1 rather than a bare member name.
+# install_lychee: the tag is `lychee-vX.Y.Z` (the repo also tags lychee-lib-*),
+# and the archive nests the binary in a target-named directory.
 install_lychee() {
   local want cur target
   want="$(pin_version lycheeverse/lychee)"
@@ -567,13 +492,9 @@ install_lychee() {
   fi
 }
 
-# advise_gotoolchain: the go installs above self-heal a base/toolchain version
-# skew via GOTOOLCHAIN=auto, but local *repo* builds do not. With
-# GOTOOLCHAIN=local (Fedora bakes this default into its Go build) a
-# `go build`/`go test` in a repo whose go.mod pins a newer Go than the base
-# toolchain fails instead of fetching it, unlike CI (setup-go installs the
-# go.mod version) and the Docker builds (GOTOOLCHAIN=auto). Warn so the dev box
-# can match; do not rewrite the user's global setting from a shared installer.
+# advise_gotoolchain: warn rather than rewrite the user's global setting. With
+# GOTOOLCHAIN=local, a repo whose go.mod needs a newer Go fails to build
+# instead of fetching that Go, unlike CI and the Docker builds.
 advise_gotoolchain() {
   command -v go >/dev/null 2>&1 || return 0
   [ "$(go env GOTOOLCHAIN 2>/dev/null)" = local ] || return 0
@@ -602,6 +523,7 @@ main() {
   install_trivy
   install_ruff
   install_markdownlint
+  install_deadset_ts
   install_lychee
 
   printf 'tool               version    status\n'
