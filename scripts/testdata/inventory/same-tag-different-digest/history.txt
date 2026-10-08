@@ -1,0 +1,199 @@
+@@ commit B
+@@ file Dockerfile
+FROM alpine:3.24.2@sha256:1111111111111111111111111111111111111111111111111111111111111111 AS build
+RUN echo build
+FROM build AS test
+FROM scratch
+COPY --from=build /out /
+@@ commit M parent B
+@@ file Dockerfile
+FROM alpine:3.24.2@sha256:2222222222222222222222222222222222222222222222222222222222222222 AS build
+RUN echo build
+FROM build AS test
+FROM scratch
+COPY --from=build /out /
+@@ commit T1 parent B
+@@ file Dockerfile
+FROM alpine:3.24.2@sha256:2222222222222222222222222222222222222222222222222222222222222222 AS build
+RUN echo build
+FROM build AS test
+FROM scratch
+COPY --from=build /out /
+@@ commit T parent T1
+@@ file Dockerfile
+FROM alpine:3.24.2@sha256:3333333333333333333333333333333333333333333333333333333333333333 AS build
+RUN echo build
+FROM build AS test
+FROM scratch
+COPY --from=build /out /
+@@ commit T_never parent B
+@@ file Dockerfile
+FROM alpine:3.24.2@sha256:3333333333333333333333333333333333333333333333333333333333333333 AS build
+RUN echo build
+FROM build AS test
+FROM scratch
+COPY --from=build /out /
+@@ commit T_moved parent B
+@@ delete Dockerfile
+@@ file Dockerfile.app
+FROM alpine:3.24.2@sha256:1111111111111111111111111111111111111111111111111111111111111111 AS build
+RUN echo build
+FROM build AS test
+FROM scratch
+COPY --from=build /out /
+@@ commit T_moved_fresh parent B
+@@ delete Dockerfile
+@@ file Dockerfile.app
+FROM alpine:3.24.2@sha256:2222222222222222222222222222222222222222222222222222222222222222 AS build
+RUN echo build
+FROM build AS test
+FROM scratch
+COPY --from=build /out /
+@@ commit T_deleted parent B
+@@ delete Dockerfile
+@@ file README.md
+No image any more.
+@@ commit M_add parent B
+@@ file Dockerfile.tools
+FROM golang:1.27.1@sha256:2222222222222222222222222222222222222222222222222222222222222222 AS tools
+RUN echo tools
+@@ commit T_add parent B
+@@ file Dockerfile.tools
+FROM golang:1.27.1@sha256:2222222222222222222222222222222222222222222222222222222222222222 AS tools
+RUN echo tools
+@@ commit T_add_stale parent B
+@@ file Dockerfile.tools
+FROM golang:1.27.0@sha256:1111111111111111111111111111111111111111111111111111111111111111 AS tools
+RUN echo tools
+@@ commit T_add_other parent B
+@@ file Dockerfile.tools
+FROM golang:1.27.1@sha256:2222222222222222222222222222222222222222222222222222222222222222 AS tools
+RUN echo other
+@@ commit T_add_moved_on parent T_add
+@@ file Dockerfile.tools
+FROM golang:1.27.2@sha256:3333333333333333333333333333333333333333333333333333333333333333 AS tools
+RUN echo other
+@@ commit B_del parent B
+@@ file Dockerfile.tools
+FROM golang:1.27.0@sha256:1111111111111111111111111111111111111111111111111111111111111111 AS tools
+RUN echo tools
+@@ commit T_del_kept parent B_del
+@@ file Dockerfile.tools
+FROM golang:1.27.2@sha256:3333333333333333333333333333333333333333333333333333333333333333 AS tools
+RUN echo tools
+@@ commit M_del parent B_del
+@@ delete Dockerfile.tools
+@@ commit T_del parent B_del
+@@ delete Dockerfile.tools
+@@ file README.md
+Tools image dropped.
+@@ commit B_sum
+@@ file Dockerfile
+# renovate: datasource=github-releases depName=owner/tool
+ARG TOOL_VERSION=v1.2.3
+ARG TOOL_SHA256_AMD64=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ARG TOOL_SHA256_ARM64=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+# renovate: datasource=github-tags depName=pkolaczk/fclones
+ARG FCLONES_VERSION=v0.35.0
+# repin: dep=pkolaczk/fclones url=https://example.invalid/{version}.tar.gz
+ARG FCLONES_SHA256=1111111111111111111111111111111111111111111111111111111111111111
+FROM scratch
+@@ commit M_sum parent B_sum
+@@ file Dockerfile
+# renovate: datasource=github-releases depName=owner/tool
+ARG TOOL_VERSION=v1.2.3
+ARG TOOL_SHA256_AMD64=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ARG TOOL_SHA256_ARM64=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+# renovate: datasource=github-tags depName=pkolaczk/fclones
+ARG FCLONES_VERSION=v0.35.0
+# repin: dep=pkolaczk/fclones url=https://example.invalid/{version}.tar.gz
+ARG FCLONES_SHA256=1111111111111111111111111111111111111111111111111111111111111111
+FROM scratch
+@@ commit M_sum_repin parent B_sum
+@@ file Dockerfile
+# renovate: datasource=github-releases depName=owner/tool
+ARG TOOL_VERSION=v1.2.3
+ARG TOOL_SHA256_AMD64=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ARG TOOL_SHA256_ARM64=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+# renovate: datasource=github-tags depName=pkolaczk/fclones
+ARG FCLONES_VERSION=v0.35.0
+# repin: dep=pkolaczk/fclones url=https://example.invalid/{version}.tar.gz
+ARG FCLONES_SHA256=2222222222222222222222222222222222222222222222222222222222222222
+FROM scratch
+@@ commit T_sum_stale parent B_sum
+@@ file Dockerfile
+# renovate: datasource=github-releases depName=owner/tool
+ARG TOOL_VERSION=v1.2.3
+ARG TOOL_SHA256_AMD64=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+ARG TOOL_SHA256_ARM64=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+# renovate: datasource=github-tags depName=pkolaczk/fclones
+ARG FCLONES_VERSION=v0.35.0
+# repin: dep=pkolaczk/fclones url=https://example.invalid/{version}.tar.gz
+ARG FCLONES_SHA256=1111111111111111111111111111111111111111111111111111111111111111
+FROM scratch
+@@ commit T_sum_carried parent B_sum
+@@ file Dockerfile
+# renovate: datasource=github-releases depName=owner/tool
+ARG TOOL_VERSION=v1.2.3
+ARG TOOL_SHA256_AMD64=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ARG TOOL_SHA256_ARM64=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+# renovate: datasource=github-tags depName=pkolaczk/fclones
+ARG FCLONES_VERSION=v0.35.0
+# repin: dep=pkolaczk/fclones url=https://example.invalid/{version}.tar.gz
+ARG FCLONES_SHA256=1111111111111111111111111111111111111111111111111111111111111111
+FROM scratch
+@@ commit T_sum_later parent T_sum_carried
+@@ file Dockerfile
+# renovate: datasource=github-releases depName=owner/tool
+ARG TOOL_VERSION=v1.2.3
+ARG TOOL_SHA256_AMD64=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ARG TOOL_SHA256_ARM64=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+# renovate: datasource=github-tags depName=pkolaczk/fclones
+ARG FCLONES_VERSION=v0.35.0
+# repin: dep=pkolaczk/fclones url=https://example.invalid/{version}.tar.gz
+ARG FCLONES_SHA256=1111111111111111111111111111111111111111111111111111111111111111
+FROM scratch
+@@ commit T_sum_other parent B_sum
+@@ file Dockerfile
+# renovate: datasource=github-releases depName=owner/tool
+ARG TOOL_VERSION=v1.2.3
+ARG TOOL_SHA256_AMD64=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ARG TOOL_SHA256_ARM64=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+# renovate: datasource=github-tags depName=pkolaczk/fclones
+ARG FCLONES_VERSION=v0.35.0
+# repin: dep=pkolaczk/fclones url=https://example.invalid/{version}.tar.gz
+ARG FCLONES_SHA256=1111111111111111111111111111111111111111111111111111111111111111
+FROM scratch
+@@ commit T_sum_bumped parent B_sum
+@@ file Dockerfile
+# renovate: datasource=github-releases depName=owner/tool
+ARG TOOL_VERSION=v1.3.0
+ARG TOOL_SHA256_AMD64=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+ARG TOOL_SHA256_ARM64=0000000000000000000000000000000000000000000000000000000000000000
+# renovate: datasource=github-tags depName=pkolaczk/fclones
+ARG FCLONES_VERSION=v0.36.0
+# repin: dep=pkolaczk/fclones url=https://example.invalid/{version}.tar.gz
+ARG FCLONES_SHA256=3333333333333333333333333333333333333333333333333333333333333333
+FROM scratch
+@@ commit M_sum_arrived parent B_sum
+@@ file Dockerfile
+# renovate: datasource=github-releases depName=owner/tool
+ARG TOOL_VERSION=v1.2.3
+ARG TOOL_SHA256_AMD64=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ARG TOOL_SHA256_ARM64=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ARG TOOL_SHA256_RISCV64=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+# renovate: datasource=github-tags depName=pkolaczk/fclones
+ARG FCLONES_VERSION=v0.35.0
+# repin: dep=pkolaczk/fclones url=https://example.invalid/{version}.tar.gz
+ARG FCLONES_SHA256=1111111111111111111111111111111111111111111111111111111111111111
+FROM scratch
+@@ commit M_sum_left parent B_sum
+@@ file Dockerfile
+# renovate: datasource=github-releases depName=owner/tool
+ARG TOOL_VERSION=v1.2.3
+ARG TOOL_SHA256_AMD64=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+# renovate: datasource=github-tags depName=pkolaczk/fclones
+ARG FCLONES_VERSION=v0.35.0
+# repin: dep=pkolaczk/fclones url=https://example.invalid/{version}.tar.gz
+ARG FCLONES_SHA256=1111111111111111111111111111111111111111111111111111111111111111
+FROM scratch

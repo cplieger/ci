@@ -2,10 +2,10 @@
 # the channel, the version and whether a release is due. dev: build once on
 # native amd64 and arm64 runners, push to GHCR as `:<dev-version>`, `:dev` and
 # `:sha-<commit>`, sign, attest the SBOM, scan, create the dev git tag. stable:
-# no build; re-tag the digest the dev channel built for this commit (or for the
-# nearest ancestor with no shipped change since; else build from source and
-# say so) as `:vX.Y.Z`, `:vX.Y`, `:vX`, `:latest`, copy it to Docker Hub with
-# its referrers, re-scan, GitHub Release. Every vulnerability scan is advisory.
+# tag `:vX.Y.Z`, `:vX.Y`, `:vX`, `:latest` on a promotion commit's trailer
+# digest (never a build), else on the dev digest promote-digest.sh picks, else
+# on a source build; copy to Docker Hub with referrers, re-scan, GitHub Release.
+# Every vulnerability scan is advisory.
 name: Docker Release
 
 on:
@@ -31,14 +31,16 @@ on:
         description: >-
           The caller's joined exclusion regex (grep -E). The stable channel
           walks first-parent ancestors for a dev build to promote and accepts
-          one only when no path outside this regex changed since. Empty
-          accepts an exact `sha-<commit>` hit only.
+          one only when no commit since changed a shipped path: under legacy a
+          path outside this regex, under two-branch a path
+          scripts/path-significance.sh counts. Empty accepts an exact
+          `sha-<commit>` hit only.
         type: string
         default: ""
       release-needed:
         description: "'true' when a new version is due (a dev tag on dev, a Release on stable)."
         type: string
-        required: true
+        default: "false"
       go-modules:
         description: >-
           JSON array of nested Go module release-lane dirs discovered by the
@@ -91,11 +93,44 @@ on:
         description: "'image' scans the pushed image; 'path' extracts binary to /tmp/sbom-src first."
         type: string
         default: "image"
-      promotion-note:
+      release-kind-note:
         description: >-
-          A sentence appended to the stable release notes (the caller reads it
-          off the promoted commit's `promotion/soak-override` status). Empty
-          appends nothing.
+          The sentence saying how this stable release was made (release.yaml's
+          release_kind_note), handed to the notes renderer. Empty adds nothing.
+        type: string
+        default: ""
+      release-model:
+        description: >-
+          'legacy' (default) or 'two-branch' (release.yaml's release_model).
+          two-branch re-tags a promotion commit's Promoted-Digest, inherits no
+          digest across a merge, renders the explicit-range notes with the
+          system-package diff, and records the completion receipt.
+        type: string
+        default: "legacy"
+      subpackages:
+        description: >-
+          Two-branch: JSON array of the declared TS subpackage dirs (release.yaml's
+          subpackages). A commit changing a subpackage's shipped manifest owes a
+          release, so its image is built from it rather than inherited.
+        type: string
+        default: "[]"
+      defer-receipt:
+        description: >-
+          Two-branch: leave the completion receipt to the caller, which records
+          it once the TS subpackages sharing this version are published too.
+        type: boolean
+        default: false
+      repair-tag:
+        description: >-
+          Two-branch repair: the stable tag whose missing Release needs its
+          assets. The call then builds and publishes nothing, and hands on the
+          tag's attested SBOM, the dashboard at its commit, and their signatures.
+        type: string
+        default: ""
+      security-shas:
+        description: >-
+          Space-separated merge commits of Renovate security pull requests
+          (release.yaml's security_shas), marked in two-branch notes.
         type: string
         default: ""
       image-licenses:
@@ -146,6 +181,7 @@ permissions:
 
 jobs:
   prepare:
+    if: ${{ inputs.repair-tag == '' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
@@ -295,72 +331,47 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "Matrix: $matrix"
 
-      # The stable channel never rebuilds what the dev channel already built
-      # and soak-tested: this commit's `sha-<commit>` tag, or the nearest
-      # first-parent ancestor's when every path changed since is excluded from
-      # significance. Read through the anonymous distribution API (the images
-      # are public), so no registry login happens before anything is written.
+      # The stable channel re-tags what the dev channel already built rather
+      # than rebuild it; promote-digest.sh decides which build that is. GHCR is
+      # read anonymously (the images are public), so no registry login happens
+      # before anything is written.
+      - name: Check out the ci source
+        if: ${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # Two-branch reuses an image only once its build signed and attested it.
+      - name: Install Cosign
+        if: ${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' && inputs.release-model == 'two-branch' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
       - name: Resolve promoted digest
         id: promote
         if: ${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           EXCLUDE_RE: ${{ inputs.exclude-re }}
+          RELEASE_MODEL: ${{ inputs.release-model }}
+          SUBPACKAGES_JSON: ${{ inputs.subpackages }}
         run: |
           set -euo pipefail
-          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors \
-            -o "$RUNNER_TEMP/ghcr-token.json" "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull"
-          token=$(jq -r .token "$RUNNER_TEMP/ghcr-token.json")
-          digest_of_sha() { # <commit> -> index digest of :sha-<commit>, or nothing
-            curl -fsSI --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $token" \
-              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
-              "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/sha-$1" 2>/dev/null |
-              tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }'
-          }
-          # Every first-parent commit is judged on its own diff, not the
-          # endpoints': a shipped change that a later commit reverts leaves the
-          # trees equal, yet the ancestor's image names the wrong revision.
-          # package.json is never significant for a docker-type repo
-          # (release.yaml's refinement), so it joins the exclusions here.
-          walk_is_pure() { # <from> <to> -> 0 when no commit in from..to changes a shipped path
-            local c changed
-            while IFS= read -r c; do
-              [ -z "$c" ] && continue
-              changed=$(git diff --name-only "${c}^" "$c")
-              if [ -z "$changed" ]; then
-                echo "::notice::commit ${c} changes no file (a forced rebuild); building from source"
-                return 1
-              fi
-              if printf '%s\n' "$changed" | grep -Eqv "${EXCLUDE_RE}|(^|/)package\.json$"; then
-                echo "::notice::commit ${c} changes a shipped path; building from source"
-                return 1
-              fi
-            done < <(git rev-list --first-parent "$1..$2")
-            return 0
-          }
-          DIGEST=$(digest_of_sha "$GITHUB_SHA" || true)
-          SOURCE="$GITHUB_SHA"
-          # --max-count is promote.py's SOAK_WALK_COMMITS: the soak is never
-          # read from a build this walk could not reach.
-          if [ -z "$DIGEST" ] && [ -n "$EXCLUDE_RE" ]; then
-            while IFS= read -r c; do
-              [ -z "$c" ] && continue
-              d=$(digest_of_sha "$c" || true)
-              [ -z "$d" ] && continue
-              if walk_is_pure "$c" "$GITHUB_SHA"; then
-                DIGEST="$d"
-                SOURCE="$c"
-              fi
-              break
-            done < <(git rev-list --first-parent --skip=1 --max-count=200 "$GITHUB_SHA")
-          fi
-          {
-            echo "promote_digest=${DIGEST}"
-            echo "promote_source=${SOURCE}"
-          } >> "$GITHUB_OUTPUT"
+          bash "$CI_TOOLS/promote-digest.sh" "$GITHUB_SHA" > "$RUNNER_TEMP/promote.out"
+          cat "$RUNNER_TEMP/promote.out" >> "$GITHUB_OUTPUT"
+          DIGEST=$(sed -n 's/^promote_digest=//p' "$RUNNER_TEMP/promote.out")
+          SOURCE=$(sed -n 's/^promote_source=//p' "$RUNNER_TEMP/promote.out")
+          VIA=$(sed -n 's/^promote_via=//p' "$RUNNER_TEMP/promote.out")
           {
             echo "## Promotion"
             echo ""
-            if [ -n "$DIGEST" ]; then
+            if [ "$VIA" = "trailer" ]; then
+              echo "Promoting the dev build this promotion commit records (digest \`${DIGEST}\`, promoted commit \`${SOURCE}\`); nothing is rebuilt."
+            elif [ -n "$DIGEST" ]; then
               echo "Promoting the image the dev channel built for \`${SOURCE}\` (digest \`${DIGEST}\`); nothing is rebuilt."
             else
               echo "No dev build could be reused for \`${GITHUB_SHA}\`; the image builds from source."
@@ -406,11 +417,11 @@ jobs:
       # BuildKit restores a cached RUN layer verbatim, so a package layer keeps
       # shipping the packages current when it was FIRST built; PKG_REFRESH is
       # today's UTC date, so it rebuilds at most once a day. A Dockerfile opts
-      # in to each build-arg by declaring AND referencing it: BuildKit keys a
-      # RUN on the args it consumes, so a merely-declared PKG_REFRESH leaves
-      # the stale layer in place and a merely-declared BUILD_VERSION never
-      # reaches the command that stamps it. BUILD_VERSION is this run's tag on
-      # its channel (vX.Y.Z-dev.N on dev), never a dev build's future stable.
+      # in by declaring the ARG in the stage that needs it: BuildKit puts a stage
+      # ARG's value in the environment and cache key of every later RUN of that
+      # stage, while a global ARG reaches FROM lines only. BUILD_VERSION is this
+      # run's tag on its channel (vX.Y.Z-dev.N on dev), never a dev build's
+      # future stable.
       - name: Resolve build args
         id: buildargs
         env:
@@ -444,12 +455,29 @@ jobs:
         with:
           version: ${{ env.BUILDX_VERSION }}
 
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # The build context is the workspace root, so the ci source leaves it.
+      - name: Move the ci source out of the build context
+        run: |
+          set -euo pipefail
+          mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
+
+      - name: Log in to GHCR
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          registry_login "$REGISTRY" "$REGISTRY_USERNAME"
 
       - name: Build and push by digest
         id: build
@@ -526,6 +554,7 @@ jobs:
       version: ${{ needs.prepare.outputs.version }}
       tag: ${{ needs.prepare.outputs.tag }}
       dashboard-digest: ${{ steps.dashboard-oci.outputs.digest }}
+      released: ${{ steps.release.outputs.published }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -534,6 +563,15 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Check out the ci source
+        if: ${{ env.PUBLISH == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
 
       # Refuse a BACKWARD publish: a rerun of an older run rejoins after its
       # successor released, `prepare` is not re-attempted, and every publish
@@ -587,11 +625,14 @@ jobs:
 
       - name: Log in to GHCR
         if: ${{ env.PUBLISH == 'true' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          registry_login "$REGISTRY" "$REGISTRY_USERNAME"
 
       - name: Install Cosign
         if: ${{ env.PUBLISH == 'true' }}
@@ -599,34 +640,18 @@ jobs:
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
-      # cosign retries none of its network calls and v3 makes three per
-      # signature (Fulcio, Rekor, the RFC 3161 timestamp), so one reset
-      # connection fails the step after the manifest is already pushed. The
-      # helper retries 5 times, 5s doubling to 40s, and is a sourced function
-      # because eight cosign invocations below need it. Retrying is safe: every
-      # operation is additive (a digest carries several signatures and any one
-      # verifies) and the oras copy to Docker Hub is idempotent by content.
-      - name: Prepare Sigstore retry helper
-        if: ${{ env.PUBLISH == 'true' }}
+      # Before any stable write: a re-tagged digest is never signed or attested
+      # again, so the build it promotes must have done both (release-state.sh).
+      - name: Verify the promoted build's signature and SBOM
+        if: ${{ env.PUBLISH == 'true' && inputs.release-model == 'two-branch' && env.PROMOTE_DIGEST != '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          EXCLUDE_RE: ${{ inputs.exclude-re }}
+          SUBPACKAGES_JSON: ${{ inputs.subpackages }}
+          PROMOTE_SOURCE: ${{ needs.prepare.outputs.promote_source }}
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/sigstore-retry.sh" <<'SH'
-          retry_sigstore() {
-            _attempt=1
-            _max=5
-            _delay=5
-            until "$@"; do
-              if [ "$_attempt" -ge "$_max" ]; then
-                echo "::error::$1 failed after ${_max} attempts: $*"
-                return 1
-              fi
-              echo "::warning::$1 attempt ${_attempt}/${_max} failed; retrying in ${_delay}s"
-              sleep "$_delay"
-              _attempt=$((_attempt + 1))
-              _delay=$((_delay * 2))
-            done
-          }
-          SH
+          bash "$CI_TOOLS/release-state.sh" provenance "${REGISTRY}/${IMAGE_NAME}@${PROMOTE_DIGEST}" "$PROMOTE_SOURCE"
 
       # Build arm: assemble the multi-arch index at the channel tags from the
       # per-arch digests. Promote arm: `imagetools create` with a single
@@ -745,8 +770,11 @@ jobs:
           severity: 'HIGH,CRITICAL'
           ignore-unfixed: true
 
+      # Skipped when the scan wrote nothing (it never ran, or died first), so an
+      # earlier failure is not followed by a missing-file error that reads as
+      # a second one.
       - name: Upload Trivy SARIF
-        if: ${{ always() && env.PUBLISH == 'true' }}
+        if: ${{ always() && env.PUBLISH == 'true' && hashFiles('trivy-image.sarif') != '' }}
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
@@ -837,11 +865,12 @@ jobs:
       - name: Sign GHCR manifest (recursive — covers per-arch images too)
         if: ${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
           set -euo pipefail
-          . "$RUNNER_TEMP/sigstore-retry.sh"
-          retry_sigstore cosign sign --yes --recursive "$IMAGE_REF"
+          . "$CI_TOOLS/retry.sh"
+          retry cosign sign --yes --recursive "$IMAGE_REF"
 
       - name: Attest SBOM to GHCR
         # NOTE: cosign attest does not support --recursive (that's a sign-only
@@ -849,11 +878,12 @@ jobs:
         # verifiers resolve through the index to find the attestation.
         if: ${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
           set -euo pipefail
-          . "$RUNNER_TEMP/sigstore-retry.sh"
-          retry_sigstore cosign attest --yes \
+          . "$CI_TOOLS/retry.sh"
+          retry cosign attest --yes \
             --predicate sbom.spdx.json \
             --type spdxjson \
             "$IMAGE_REF"
@@ -869,12 +899,13 @@ jobs:
       - name: Attest OpenVEX to GHCR
         if: ${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' && hashFiles('vex/*.openvex.json') != '' }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
           set -euo pipefail
-          . "$RUNNER_TEMP/sigstore-retry.sh"
+          . "$CI_TOOLS/retry.sh"
           for f in vex/*.openvex.json; do
-            retry_sigstore cosign attest --yes \
+            retry cosign attest --yes \
               --predicate "$f" \
               --type openvex \
               "$IMAGE_REF"
@@ -891,11 +922,12 @@ jobs:
       - name: Verify OpenVEX attestations on GHCR
         if: ${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' && hashFiles('vex/*.openvex.json') != '' }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
           set -euo pipefail
-          . "$RUNNER_TEMP/sigstore-retry.sh"
-          retry_sigstore cosign verify-attestation --type openvex \
+          . "$CI_TOOLS/retry.sh"
+          retry cosign verify-attestation --type openvex \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity-regexp '^https://github\.com/cplieger/ci/\.github/workflows/docker-release\.yaml@' \
             "$IMAGE_REF" > /dev/null
@@ -911,15 +943,15 @@ jobs:
             echo "::error::vex/ documents contain no vulnerability statements; refusing to pass an empty gate"
             exit 1
           fi
-          # Redirect INSIDE a wrapper, not on the retry_sigstore call: the
-          # outer `>` truncates once, so a partial attempt's bytes would
-          # otherwise stay in the file ahead of the next attempt's output.
+          # Redirect INSIDE a wrapper, not on the retry call: the outer `>`
+          # truncates once, so a partial attempt's bytes would otherwise stay
+          # in the file ahead of the next attempt's output.
           fetch_vex_attestations() {
             cosign download attestation \
               --predicate-type https://openvex.dev/ns \
               "$IMAGE_REF" > /tmp/vex-attestations.jsonl
           }
-          retry_sigstore fetch_vex_attestations
+          retry fetch_vex_attestations
           : > /tmp/vex-predicates.json
           while IFS= read -r line; do
             [ -z "$line" ] && continue
@@ -956,19 +988,25 @@ jobs:
 
       - name: Log in to Docker Hub
         if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && contains(inputs.registries, 'dockerhub') }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          REGISTRY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          registry_login docker.io "$REGISTRY_USERNAME"
 
       - name: Ensure Docker Hub repository exists
         if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && contains(inputs.registries, 'dockerhub') }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
           # Docker Hub does not create a repository for every push path: the
           # first-ever `imagetools create` to a brand-new repo failed with HTTP
           # 400 ("unexpected status from PUT ... blobs/uploads") where `docker
@@ -976,16 +1014,23 @@ jobs:
           # the first copy succeeds.
           namespace="${IMAGE_NAME%%/*}"
           name="${IMAGE_NAME#*/}"
-          jwt=$(curl -fsS --retry 3 -H 'Content-Type: application/json' \
-            -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}" \
-            https://hub.docker.com/v2/users/login/ | jq -r '.token')
-          if [ -z "$jwt" ] || [ "$jwt" = "null" ]; then
+          hub_jwt() {
+            curl -fsS --retry 3 -H 'Content-Type: application/json' \
+              -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}" \
+              https://hub.docker.com/v2/users/login/ | jq -er '.token | strings | select(length > 0)' >"$RUNNER_TEMP/hub-jwt"
+          }
+          if ! retry hub_jwt; then
             echo "::error::Docker Hub login failed during repository pre-create"; exit 1
           fi
-          code=$(curl -sS -o /tmp/dhrepo.json -w '%{http_code}' -X POST \
-            -H "Authorization: JWT ${jwt}" -H 'Content-Type: application/json' \
-            -d "{\"namespace\":\"${namespace}\",\"name\":\"${name}\",\"is_private\":false}" \
-            https://hub.docker.com/v2/repositories/)
+          jwt=$(cat "$RUNNER_TEMP/hub-jwt")
+          create_repo() {
+            curl -sS -o /tmp/dhrepo.json -w '%{http_code}' -X POST \
+              -H "Authorization: JWT ${jwt}" -H 'Content-Type: application/json' \
+              -d "{\"namespace\":\"${namespace}\",\"name\":\"${name}\",\"is_private\":false}" \
+              https://hub.docker.com/v2/repositories/ >"$RUNNER_TEMP/hub-create-code"
+          }
+          retry create_repo
+          code=$(cat "$RUNNER_TEMP/hub-create-code")
           case "$code" in
             201) echo "Created docker.io/${namespace}/${name}" ;;
             400|409) echo "docker.io/${namespace}/${name} already exists (HTTP ${code})" ;;
@@ -1000,21 +1045,23 @@ jobs:
       - name: Copy image to Docker Hub
         if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && contains(inputs.registries, 'dockerhub') }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           VERSION: ${{ needs.prepare.outputs.version }}
           MAJOR: ${{ needs.prepare.outputs.major }}
           MINOR: ${{ needs.prepare.outputs.minor }}
         run: |
           set -euo pipefail
-          . "$RUNNER_TEMP/sigstore-retry.sh"
-          retry_sigstore oras copy --recursive \
+          . "$CI_TOOLS/retry.sh"
+          retry oras copy --recursive \
             "${REGISTRY}/${IMAGE_NAME}:${VERSION}" "docker.io/${IMAGE_NAME}:${VERSION}"
-          retry_sigstore oras tag "docker.io/${IMAGE_NAME}:${VERSION}" "$MINOR" "$MAJOR" latest
+          retry oras tag "docker.io/${IMAGE_NAME}:${VERSION}" "$MINOR" "$MAJOR" latest
           echo "docker.io/${IMAGE_NAME}: ${VERSION}, ${MINOR}, ${MAJOR}, latest"
 
       - name: Publish dashboard OCI artifact
         id: dashboard-oci
         if: ${{ env.PUBLISH == 'true' && hashFiles('grafana-dashboard.json') != '' }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           # Via env, never inline ${{ }} in the script body (template injection).
           CHANNEL: ${{ inputs.channel }}
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -1022,7 +1069,7 @@ jobs:
           DASHBOARD_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/dashboard
         run: |
           set -euo pipefail
-          . "$RUNNER_TEMP/sigstore-retry.sh"
+          . "$CI_TOOLS/retry.sh"
           # Consumers re-import by uid, so a file without a string uid is not a
           # dashboard this pipeline may publish.
           jq -e '.uid | strings | length > 0' grafana-dashboard.json >/dev/null \
@@ -1049,13 +1096,51 @@ jobs:
             "$REFS" \
             grafana-dashboard.json:application/json
           digest="sha256:$(sha256sum "$RUNNER_TEMP/dashboard-manifest.json" | cut -d' ' -f1)"
-          retry_sigstore cosign sign --yes "${DASHBOARD_REF}@${digest}"
+          retry cosign sign --yes "${DASHBOARD_REF}@${digest}"
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           {
             echo "## Grafana dashboard"
             echo ""
             echo "OCI artifact ${SHOWN}, digest \`${digest}\`, cosign-signed (keyless)."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The System packages part diffs this release's SBOM against the one
+      # attested on the previous stable release's image, read only once its
+      # signature verifies as this repository's run of this workflow. Best-
+      # effort: a previous SBOM that cannot be read or verified leaves the part
+      # out.
+      - name: Fetch the previous release's SBOM
+        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && inputs.release-model == 'two-branch' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          EXCLUDE_RE: ${{ inputs.exclude-re }}
+          SUBPACKAGES_JSON: ${{ inputs.subpackages }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          PREV=$(bash "$CI_TOOLS/render-notes.sh" --release-model two-branch --site docker --version "$VERSION" --print-previous)
+          if [ -z "$PREV" ]; then
+            echo "::notice::No earlier stable release exists, so the notes carry no system-package diff."
+            exit 0
+          fi
+          if ! token=$(curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors \
+            "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull" | jq -r .token); then
+            token=""
+          fi
+          digest=$(curl -fsSI --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/${PREV}" 2>/dev/null |
+            tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }' || true)
+          if [ -z "$digest" ]; then
+            echo "::warning::${REGISTRY}/${IMAGE_NAME}:${PREV} is not readable, so the notes carry no system-package diff."
+            exit 0
+          fi
+          REF="${REGISTRY}/${IMAGE_NAME}@${digest}"
+          if ! why=$(bash "$CI_TOOLS/attested-sbom.sh" "$REF" "$PREV" "$RUNNER_TEMP/sbom-prev.spdx.json"); then
+            echo "::warning::The notes carry no system-package diff, because ${why}."
+            exit 0
+          fi
+          echo "previous SBOM: ${PREV} (${REF})"
 
       - name: Generate release notes
         # Stable only (a dev build has no Release); finalize repairs a
@@ -1066,24 +1151,17 @@ jobs:
         # which runs no downloaded code.
         if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          RELEASE_MODEL: ${{ inputs.release-model }}
           VERSION: ${{ inputs.version }}
           LATEST: ${{ inputs.latest }}
           GO_LANES_JSON: ${{ inputs.go-modules }}
           FINALIZE: ${{ inputs.finalize }}
           RELEASE_NEEDED: ${{ inputs.release-needed }}
-          PROMOTION_NOTE: ${{ inputs.promotion-note }}
+          KIND_NOTE: ${{ inputs.release-kind-note }}
+          SECURITY_SHAS: ${{ inputs.security-shas }}
         run: |
           set -euo pipefail
-          # Guard direct callers: release.yaml always passes well-formed
-          # JSON, but this workflow is callable on its own, and a malformed
-          # go-modules value would otherwise fail inside a process
-          # substitution jq that cannot fail the step — leaving the notes
-          # silently unscoped (lane commits leaking in).
-          if ! jq -e 'type == "array" and all(.[]; type == "string")' <<<"$GO_LANES_JSON" >/dev/null 2>&1; then
-            echo "::error::go-modules must be a JSON array of strings; got: ${GO_LANES_JSON}"
-            exit 1
-          fi
-          # Install git-cliff (only when we're actually creating a release).
           # Version + tarball sha256 pinned as a pair; Renovate maintains both
           # via the custom.git-cliff datasource (GitHub release-asset digest).
           # Fail-closed: a tarball that does not match the committed pin never
@@ -1095,42 +1173,24 @@ jobs:
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
           echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
           tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          # The stable tag pattern is passed explicitly so the notes span
-          # everything since the last STABLE release whatever the consumer's
-          # synced cliff.toml says; lane commits are excluded (probe state J).
-          LANE_ARGS=(--tag-pattern '^v[0-9]+\.[0-9]+\.[0-9]+$')
-          while IFS= read -r d; do
-            [ -z "$d" ] && continue
-            LANE_ARGS+=(--exclude-path "$d/**")
-          done < <(jq -r '.[]' <<<"$GO_LANES_JSON")
-          # --unreleased --tag renders the commits since the last stable tag
-          # as $VERSION. In FINALIZE mode the tag exists at this very commit,
-          # so render the CURRENT release instead (probe states K/L); that
-          # branch has no fallback because a repaired Release body is
-          # permanent. The publish branch fails open on a cliff error.
-          if [ "$FINALIZE" = "true" ]; then
-            git-cliff --current "${LANE_ARGS[@]}" --strip header > RELEASE_NOTES.md
-          else
-            git-cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > RELEASE_NOTES.md || echo "Release ${VERSION}" > RELEASE_NOTES.md
-          fi
-          # git-cliff drops a commit that changes no file, so a release made of
-          # a forced base-package rebuild alone renders nothing; list the
-          # commit subjects instead of publishing an empty body.
-          if [ "$RELEASE_NEEDED" = "true" ] && [ -z "$(tr -d '[:space:]' < RELEASE_NOTES.md)" ]; then
-            if [ -n "$LATEST" ]; then
-              range="${LATEST}..HEAD"
-            else
-              range="HEAD"
+          args=(--release-model "${RELEASE_MODEL:-legacy}" --site docker --version "$VERSION" --go-lanes "$GO_LANES_JSON"
+            --kind-note "$KIND_NOTE" --out RELEASE_NOTES.md)
+          if [ "${RELEASE_MODEL:-legacy}" = "two-branch" ]; then
+            tr ' ' '\n' <<<"$SECURITY_SHAS" > "$RUNNER_TEMP/security-shas"
+            args+=(--repo "$GITHUB_REPOSITORY" --release-commit "$GITHUB_SHA" --security-shas "$RUNNER_TEMP/security-shas")
+            if [ -s "$RUNNER_TEMP/sbom-prev.spdx.json" ]; then
+              args+=(--sbom-prev "$RUNNER_TEMP/sbom-prev.spdx.json" --sbom-new sbom.spdx.json)
             fi
-            {
-              echo "### Changes"
-              echo ""
-              git log --no-merges --format='- %s' "$range"
-            } > RELEASE_NOTES.md
+          else
+            args+=(--latest "$LATEST")
+            if [ "$FINALIZE" = "true" ]; then
+              args+=(--finalize)
+            fi
+            if [ "$RELEASE_NEEDED" = "true" ]; then
+              args+=(--release-needed)
+            fi
           fi
-          if [ -n "$PROMOTION_NOTE" ]; then
-            printf '\n%s\n' "$PROMOTION_NOTE" >> RELEASE_NOTES.md
-          fi
+          bash "$CI_TOOLS/render-notes.sh" "${args[@]}"
 
       - name: Sign SBOM for release assets (keyless)
         # Attach a cosign Sigstore bundle next to the SBOM so the GitHub
@@ -1147,19 +1207,23 @@ jobs:
         # assets a normal release would, so this step follows the widened
         # gate (the SBOM was regenerated above from the published image).
         if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
-          . "$RUNNER_TEMP/sigstore-retry.sh"
-          retry_sigstore cosign sign-blob --yes sbom.spdx.json \
+          . "$CI_TOOLS/retry.sh"
+          retry cosign sign-blob --yes sbom.spdx.json \
             --bundle sbom.spdx.json.sigstore.json
 
       - name: Sign dashboard for release assets (keyless)
         if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && hashFiles('grafana-dashboard.json') != '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
-          . "$RUNNER_TEMP/sigstore-retry.sh"
+          . "$CI_TOOLS/retry.sh"
           sha256sum grafana-dashboard.json > grafana-dashboard.json.sha256
-          retry_sigstore cosign sign-blob --yes grafana-dashboard.json \
+          retry cosign sign-blob --yes grafana-dashboard.json \
             --bundle grafana-dashboard.json.sigstore.json
 
       # The tag ref is created via the git data API pinned to $GITHUB_SHA
@@ -1250,10 +1314,13 @@ jobs:
           # assets are attached, publishes after the upload) reads as absent
           # — correct, but the orphan must be deleted before re-creating or
           # it accumulates in the UI while holding no tag ref.
-          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" >/dev/null 2>/tmp/relerr; then
+          if immutable=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" --jq .immutable 2>/tmp/relerr); then
             echo "::notice::Release ${VERSION} already exists; skipping creation."
-            echo "reused=true" >> "$GITHUB_OUTPUT"
-            echo "published=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "reused=true"
+              echo "immutable=${immutable}"
+              echo "published=true"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           elif ! grep -q 'HTTP 404' /tmp/relerr; then
             echo "::error::could not determine whether Release ${VERSION} exists:"
@@ -1287,11 +1354,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
           REUSED: ${{ steps.release.outputs.reused }}
+          IMMUTABLE: ${{ steps.release.outputs.immutable }}
         run: |
           set -euo pipefail
           # A rerun that found its Release already present moves the image tags
           # to the fresh build; the dashboard assets follow for the same reason.
-          if [ "$REUSED" = "true" ]; then
+          # An immutable Release refuses uploads, and the tag guard pins it to
+          # this commit, so its dashboard bytes are this build's already.
+          if [ "$REUSED" = "true" ] && [ "$IMMUTABLE" = "true" ]; then
+            echo "::notice::Release ${VERSION} is immutable, so its dashboard assets stay as first published."
+          elif [ "$REUSED" = "true" ]; then
             gh release upload --clobber "$VERSION" \
               grafana-dashboard.json grafana-dashboard.json.sha256 grafana-dashboard.json.sigstore.json
           fi
@@ -1306,29 +1378,8 @@ jobs:
             echo "Release assets: \`grafana-dashboard.json\`, \`grafana-dashboard.json.sha256\`, \`grafana-dashboard.json.sigstore.json\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # The three Docker Hub description steps run on every stable-channel run,
+      # The two Docker Hub description steps run on every stable-channel run,
       # published or not, so a docs-only promotion still refreshes the page.
-      - name: Sync description to Docker Hub
-        if: ${{ inputs.channel == 'stable' && contains(inputs.registries, 'dockerhub') }}
-        continue-on-error: true
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          REPO_DESC: ${{ github.event.repository.description }}
-          # Via env, never inline ${{ }} in the script body (template injection).
-          IMAGE_NAME_INPUT: ${{ inputs.image-name }}
-        run: |
-          set -euo pipefail
-          TOKEN=$(curl -fsSL "https://hub.docker.com/v2/users/login/" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n --arg u "$DOCKERHUB_USERNAME" --arg p "$DOCKERHUB_TOKEN" \
-              '{username: $u, password: $p}')" | jq -r .token)
-          curl -fsSL -X PATCH \
-            "https://hub.docker.com/v2/repositories/${DOCKERHUB_USERNAME}/${IMAGE_NAME_INPUT}/" \
-            -H "Authorization: Bearer ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n --arg d "$REPO_DESC" '{description: $d}')" >/dev/null
-
       # Docker Hub caps a full description at 25,000 bytes and the publish step
       # below truncates anything longer, which cut the end of the document. So
       # the Hub gets a short generated overview (summary, pull, compose, links)
@@ -1364,6 +1415,9 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}
           readme-filepath: ${{ steps.hub-overview.outputs.path }}
+          # The GitHub About line. The action omits the field when this is
+          # empty and truncates it to Hub's 100-byte limit with a warning.
+          short-description: ${{ github.event.repository.description }}
           # Off deliberately: the renderer already emits absolute GitHub URLs,
           # and this option would resolve each anchor against the generated file
           # as though it were README.md, which is the wrong target.
@@ -1380,8 +1434,10 @@ jobs:
     needs: [prepare, finalize]
     if: ${{ always() && needs.prepare.outputs.publish == 'true' && needs.finalize.result == 'success' }}
     runs-on: ubuntu-slim
-    timeout-minutes: 12
-    permissions: {}
+    timeout-minutes: 15
+    # The ci source checkout only; every registry read is anonymous.
+    permissions:
+      contents: read
     env:
       CHANNEL: ${{ inputs.channel }}
       VERSION: ${{ needs.prepare.outputs.tag }}
@@ -1389,9 +1445,20 @@ jobs:
       REGISTRIES: ${{ inputs.registries }}
       DASHBOARD_DIGEST: ${{ needs.finalize.outputs.dashboard-digest }}
     steps:
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       - name: Verify published image
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
 
           # Both registries are read through the distribution API with an
           # anonymous pull token: every image here is public. Docker Hub's
@@ -1409,56 +1476,166 @@ jobs:
             hub_token=$(pull_token hub "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE_NAME}:pull")
           fi
 
-          digest_of() { # <registry host> <bearer token>
-            curl -fsSI --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $2" \
-              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
-              "https://$1/v2/${IMAGE_NAME}/manifests/${VERSION}" |
+          # digest_of and serves are called through await_registry, which the
+          # linter cannot follow.
+          # shellcheck disable=SC2329
+          digest_of() { # <registry host> <bearer token> <repository> <accept>
+            curl -fsSI --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $2" -H "Accept: $4" \
+              "https://$1/v2/$3/manifests/${VERSION}" |
               tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }'
           }
-
-          # Registries propagate in seconds to a couple of minutes: six
-          # tries, 20 s apart, then fail closed.
-          verify() { # <registry host> <bearer token> <label>
-            local host=$1 token=$2 label=$3 got i
-            for i in 1 2 3 4 5 6; do
-              got=$(digest_of "$host" "$token" 2>/dev/null || true)
-              if [ -n "$got" ] && { [ -z "$DIGEST" ] || [ "$got" = "$DIGEST" ]; }; then
-                echo "ok: ${label} -> ${got}"
-                return 0
-              fi
-              [ "$i" -lt 6 ] && sleep 20
-            done
-            echo "::error::${label}: expected ${DIGEST:-any digest}, registry answered '${got:-nothing}'"
+          served="$RUNNER_TEMP/served-digest"
+          # shellcheck disable=SC2329
+          serves() { # <want, empty for any> <digest_of args...>; the digest read lands in $served
+            digest_of "${@:2}" >"$served" 2>/dev/null || true
+            [ -s "$served" ] && { [ -z "$1" ] || [ "$(cat "$served")" = "$1" ]; }
+          }
+          verify() { # <label> <want, empty for any> <digest_of args...>
+            local label=$1 want=$2 got
+            shift 2
+            if await_registry "$label" serves "$want" "$@"; then
+              echo "ok: ${label} -> $(cat "$served")"
+              return 0
+            fi
+            got=$(cat "$served")
+            echo "::error::${label}: expected ${want:-any digest}, registry answered '${got:-nothing}'"
             return 1
           }
 
+          INDEX='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
           rc=0
-          verify "$REGISTRY" "$ghcr_token" "${REGISTRY}/${IMAGE_NAME}:${VERSION}" || rc=1
+          verify "${REGISTRY}/${IMAGE_NAME}:${VERSION}" "$DIGEST" "$REGISTRY" "$ghcr_token" "$IMAGE_NAME" "$INDEX" || rc=1
           if [ -n "$hub_token" ]; then
-            verify registry-1.docker.io "$hub_token" "docker.io/${IMAGE_NAME}:${VERSION}" || rc=1
+            verify "docker.io/${IMAGE_NAME}:${VERSION}" "$DIGEST" registry-1.docker.io "$hub_token" "$IMAGE_NAME" "$INDEX" || rc=1
           fi
-          # The artifact is a single OCI image manifest, so its own Accept and its
-          # own probe; the empty-digest "any digest" arm above is not extended to it,
-          # because an empty dashboard digest means nothing was pushed.
+          # A single OCI image manifest, so its own Accept, and never the
+          # any-digest arm: an empty dashboard digest means nothing was pushed.
           if [ -n "$DASHBOARD_DIGEST" ]; then
             dash_token=$(pull_token dash "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}/dashboard:pull")
-            dash_digest_of() {
-              curl -fsSI --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $dash_token" \
-                -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
-                "https://${REGISTRY}/v2/${IMAGE_NAME}/dashboard/manifests/${VERSION}" |
-                tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }'
-            }
-            got=
-            for i in 1 2 3 4 5 6; do
-              got=$(dash_digest_of 2>/dev/null || true)
-              [ "$got" = "$DASHBOARD_DIGEST" ] && break
-              [ "$i" -lt 6 ] && sleep 20
-            done
-            if [ "$got" = "$DASHBOARD_DIGEST" ]; then
-              echo "ok: ${REGISTRY}/${IMAGE_NAME}/dashboard:${VERSION} -> ${got}"
-            else
-              echo "::error::${REGISTRY}/${IMAGE_NAME}/dashboard:${VERSION}: expected ${DASHBOARD_DIGEST}, registry answered '${got:-nothing}'"
-              rc=1
-            fi
+            verify "${REGISTRY}/${IMAGE_NAME}/dashboard:${VERSION}" "$DASHBOARD_DIGEST" \
+              "$REGISTRY" "$dash_token" "${IMAGE_NAME}/dashboard" application/vnd.oci.image.manifest.v1+json || rc=1
           fi
           exit "$rc"
+
+  # ─── Two-branch: the assets of a repaired Release ─────────────────────────
+  # release.yaml's repair publishes the Release; the signatures are made here
+  # because consumers verify them against this workflow's identity. The
+  # SBOM is the one attested to the published image, not a regeneration.
+  repair-assets:
+    if: ${{ inputs.repair-tag != '' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Check the Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          TAG: ${{ inputs.repair-tag }}
+        run: |
+          set -euo pipefail
+          state=$(bash "$CI_TOOLS/release-exists.sh" "$TAG")
+          echo "missing=$([ "$state" = absent ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          bash "$CI_TOOLS/release-state.sh" handoff-name repair-assets "$TAG" | sed 's/^/artifact=/' >> "$GITHUB_OUTPUT"
+
+      - name: Install Cosign
+        if: ${{ steps.release.outputs.missing == 'true' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Sign the release assets
+        if: ${{ steps.release.outputs.missing == 'true' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          TAG: ${{ inputs.repair-tag }}
+          EXCLUDE_RE: ${{ inputs.exclude-re }}
+          SUBPACKAGES_JSON: ${{ inputs.subpackages }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          out="$RUNNER_TEMP/assets"
+          mkdir -p "$out"
+          if ! digest=$(IMAGE="$IMAGE_NAME" bash "$CI_TOOLS/release-state.sh" release-digest "$TAG"); then
+            echo "::error::sbom.spdx.json is missing, because the image digest that ${TAG} published is unknown. ${TAG} is not published without it."
+            exit 1
+          fi
+          if ! why=$(bash "$CI_TOOLS/attested-sbom.sh" "${REGISTRY}/${IMAGE_NAME}@${digest}" "$TAG" "$out/sbom.spdx.json"); then
+            echo "::error::sbom.spdx.json is missing, because ${why}. ${TAG} is not published without it."
+            exit 1
+          fi
+          sign() {
+            if ! retry cosign sign-blob --yes "$1" --bundle "$1.sigstore.json"; then
+              echo "::error::$1.sigstore.json is missing, because cosign could not sign $1. ${TAG} is not published without it."
+              exit 1
+            fi
+          }
+          cd "$out"
+          sign sbom.spdx.json
+          commit=$(git -C "$GITHUB_WORKSPACE" rev-list -n1 "$TAG")
+          if git -C "$GITHUB_WORKSPACE" cat-file -e "${commit}:grafana-dashboard.json" 2>/dev/null; then
+            git -C "$GITHUB_WORKSPACE" show "${commit}:grafana-dashboard.json" > grafana-dashboard.json
+            sha256sum grafana-dashboard.json > grafana-dashboard.json.sha256
+            sign grafana-dashboard.json
+          fi
+
+      - name: Hand the assets on
+        if: ${{ steps.release.outputs.missing == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.release.outputs.artifact }}
+          path: ${{ runner.temp }}/assets/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ─── Two-branch: the image lane's completion receipt ──────────────────────
+  # Complete once its Release exists and verify-publish read every registry
+  # back; release.yaml's next run repairs any stable tag that lacks this
+  # receipt before publishing anything newer. Its own job, so the statuses
+  # scope never reaches a legacy run.
+  receipt:
+    needs: [prepare, finalize, verify-publish]
+    if: |
+      always() && needs.verify-publish.result == 'success' && !inputs.defer-receipt
+      && inputs.release-model == 'two-branch' && inputs.channel == 'stable' && needs.finalize.outputs.released == 'true'
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Record the completion receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          VERSION: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" receipt "$VERSION" "$GITHUB_SHA"

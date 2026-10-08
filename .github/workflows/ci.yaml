@@ -829,6 +829,68 @@ jobs:
             fi
           ) || { echo "Probe docker-release shell semantics" >> /tmp/_ci_failures; exit 1; }
 
+      # The release path-significance script and the ci-source checkout that
+      # ships it; `-f` + `bash`, so a non-executable file cannot skip silently.
+      - name: Probe release path significance
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          (
+            if [ -f scripts/test-path-significance.sh ]; then
+              bash scripts/test-path-significance.sh
+            else
+              echo "no path-significance probe in this repo - skipping"
+            fi
+          ) || { echo "Probe release path significance" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Probe reconciliation recogniser
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          (
+            if [ -f scripts/test-reconciliation.sh ]; then
+              bash scripts/test-reconciliation.sh
+            else
+              echo "no reconciliation probe in this repo - skipping"
+            fi
+          ) || { echo "Probe reconciliation recogniser" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Probe release notes renderer
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          (
+            if [ -f scripts/test-render-notes.sh ]; then
+              bash scripts/test-render-notes.sh
+            else
+              echo "no release notes probe in this repo - skipping"
+            fi
+          ) || { echo "Probe release notes renderer" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Probe release detect state machine
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          (
+            if [ -f scripts/test-release-detect.sh ]; then
+              bash scripts/test-release-detect.sh
+            else
+              echo "no release detect probe in this repo - skipping"
+            fi
+          ) || { echo "Probe release detect state machine" >> /tmp/_ci_failures; exit 1; }
+
+      - name: Probe two-branch release model end to end
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          (
+            if [ -f scripts/test-release-model.sh ]; then
+              bash scripts/test-release-model.sh
+            else
+              echo "no release model probe in this repo - skipping"
+            fi
+          ) || { echo "Probe two-branch release model end to end" >> /tmp/_ci_failures; exit 1; }
+
       # The docker job's two image-test steps are shell nothing else executes
       # here; the probe extracts and runs them against fixture checkouts.
       # Gated on `-f` + `bash` because an `-x` gate would skip silently.
@@ -929,12 +991,84 @@ jobs:
           fi
           echo "All validation steps passed"
 
+  # Two-branch repositories only, so validate sees `skipped` everywhere else:
+  # the PR title is the changelog line, and `main` takes machine heads only.
+  # Soft-gated like the jobs above.
+  pr-policy:
+    if: >-
+      ${{ github.event_name == 'pull_request' && github.event.repository.default_branch == 'dev'
+      && !github.event.repository.private && !github.event.repository.fork }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ github.base_ref == 'main' }}
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      # After the head checkout, which would clear it: the intake action of
+      # this workflow's own commit, as release.yaml's jobs take their scripts.
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Pull request title
+        id: title
+        continue-on-error: true
+        uses: ./.cplieger-ci/actions/intake
+        with:
+          check: title
+          title: ${{ github.event.pull_request.title }}
+
+      - name: Main intake
+        id: intake
+        if: ${{ github.base_ref == 'main' }}
+        continue-on-error: true
+        uses: ./.cplieger-ci/actions/intake
+        with:
+          check: intake
+          head-ref: ${{ github.head_ref }}
+          head-repo: ${{ github.event.pull_request.head.repo.full_name }}
+          base-sha: ${{ github.event.pull_request.base.sha }}
+          head-sha: ${{ github.event.pull_request.head.sha }}
+
+      # An action that fails before its body runs, or a failed source checkout
+      # that skips both, writes no marker, so each outcome is checked too.
+      - name: Check results
+        if: always()
+        env:
+          TITLE_OUTCOME: ${{ steps.title.outcome }}
+          INTAKE_OUTCOME: ${{ steps.intake.outcome }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ "$TITLE_OUTCOME" != success ]; then
+            echo "Pull request title" >> /tmp/_ci_failures
+          fi
+          if [ "$INTAKE_OUTCOME" != success ] && { [ "$BASE_REF" = main ] || [ "$INTAKE_OUTCOME" != skipped ]; }; then
+            echo "Pull request intake" >> /tmp/_ci_failures
+          fi
+          if [ -f /tmp/_ci_failures ]; then
+            echo "::error::Failed validation steps:"
+            sort -u /tmp/_ci_failures >&2
+            exit 1
+          fi
+          echo "All validation steps passed"
+
   # Aggregator — emits a single `ci / validate` check name that branch
   # protection rules can target (preserves the check name from the previous
   # per-type templates so existing branch-protection rules keep working
   # without per-repo updates).
   validate:
-    needs: [detect, repo, go, go-nested, ts, web, shell, docker, docker-arm64, markdown, python, scripts]
+    needs: [detect, repo, go, go-nested, ts, web, shell, docker, docker-arm64, markdown, python, scripts, pr-policy]
     if: always()
     runs-on: ubuntu-26.04
     timeout-minutes: 1
@@ -953,6 +1087,8 @@ jobs:
           MARKDOWN: ${{ needs.markdown.result }}
           PYTHON: ${{ needs.python.result }}
           SCRIPTS: ${{ needs.scripts.result }}
+          PR_POLICY: ${{ needs.pr-policy.result }}
+          TWO_BRANCH: ${{ github.event.repository.default_branch == 'dev' && !github.event.repository.private && !github.event.repository.fork }}
         run: |
           # detect must always succeed (it gates everything else)
           if [ "$DETECT" != "success" ]; then
@@ -973,7 +1109,13 @@ jobs:
           # one page a reader opens off a green check.
           ran=0
           skipped=0
-          for pair in "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"; do
+          set -- "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"
+          # pr-policy runs on two-branch repositories only, so only there is it
+          # counted and listed.
+          if [ "$TWO_BRANCH" = true ]; then
+            set -- "$@" "pr-policy=$PR_POLICY"
+          fi
+          for pair in "$@"; do
             name="${pair%%=*}"; result="${pair##*=}"
             if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
               echo "::error::$name job: $result"
@@ -991,19 +1133,11 @@ jobs:
           {
             echo "## CI validate"
             echo ""
-            echo "**ran $ran / skipped $skipped** (of 11 dispatched jobs; detect: $DETECT)"
+            echo "**ran $ran / skipped $skipped** (of $# dispatched jobs; detect: $DETECT)"
             echo ""
             echo "| Job | Result |"
             echo "|---|---|"
-            echo "| repo | $REPO |"
-            echo "| go | $GO |"
-            echo "| go-nested | $GO_NESTED |"
-            echo "| ts | $TS |"
-            echo "| web | $WEB |"
-            echo "| shell | $SHELL |"
-            echo "| docker | $DOCKER |"
-            echo "| docker-arm64 | $DOCKER_ARM64 |"
-            echo "| markdown | $MARKDOWN |"
-            echo "| python | $PYTHON |"
-            echo "| scripts | $SCRIPTS |"
+            for pair in "$@"; do
+              echo "| ${pair%%=*} | ${pair##*=} |"
+            done
           } >> "$GITHUB_STEP_SUMMARY"

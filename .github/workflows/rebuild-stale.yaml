@@ -1,11 +1,11 @@
 # Base-package rebuilds for the image repos, daily at 04:00 UTC (sync holds
 # 02:00, daily-security 03:00). An image that installs OS packages at build
-# time picks up upstream fixes only when rebuilt; for each such repo whose
-# newest build is older than INTERVAL_DAYS: on a dev-default repo, an
-# auto-merging pull request into `dev` carrying one empty `fix(deps)` commit
-# (a commit that changes no file is a significant push, and PKG_REFRESH makes
-# the build re-run its package layer); on a repo still on main, a release.yaml
-# dispatch with skip_if_unchanged, which its v2 pipeline's no-change gate reads.
+# time picks up upstream fixes only when rebuilt. A repo whose default branch
+# is dev gets, per channel whose published image (`:latest` for main, `:dev`
+# for dev) was built longer ago than INTERVAL_DAYS, an auto-merging pull request
+# into that branch carrying one empty `fix(deps)` commit; a repo still on main
+# whose newest docker build is that old gets a release.yaml dispatch with
+# skip_if_unchanged, which its v2 pipeline's no-change gate reads.
 name: Rebuild stale images
 
 on:
@@ -22,7 +22,7 @@ concurrency:
 
 env:
   # Default staleness threshold in days. Per-repo overrides live in the
-  # INTERVAL_OVERRIDES map inside the fanout step below.
+  # INTERVAL_OVERRIDES map in scripts/rebuild-stale.sh.
   INTERVAL_DAYS: "7"
 
 jobs:
@@ -32,111 +32,18 @@ jobs:
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Discover stale image repos
         id: fanout
         env:
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
         run: |
           set -euo pipefail
-
-          # Per-repo staleness overrides (days), keyed by repo name, e.g.
-          #   INTERVAL_OVERRIDES[docker-keepalived]=3
-          declare -A INTERVAL_OVERRIDES=()
-
-          # Forks are excluded org-wide (same rule as scripts/audit.py): a fork
-          # publishes no cplieger image.
-          # REST rather than `gh repo list`: GraphQL quota is shared with every
-          # other token of the account owner and can be exhausted by unrelated load.
-          repos=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
-            .[] | select(.archived == false and .fork == false)
-                | [.name, (.default_branch // "")] | @tsv
-          ')
-
-          STALE='[]'
-          now=$(date -u +%s)
-          {
-            echo "## Staleness decisions (default threshold: ${INTERVAL_DAYS}d)"
-            echo ""
-            echo "| Repo | Last successful docker build (UTC) | Age (days) | Threshold (days) | Decision |"
-            echo "|---|---|---|---|---|"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          while IFS=$'\t' read -r r default_branch; do
-            [ -z "$r" ] && continue
-            # Only an image whose Dockerfile installs packages at build time
-            # gains anything from a rebuild; a distroless or scratch image
-            # changes only when its pinned base digest does.
-            if ! dockerfile=$(gh api "repos/cplieger/${r}/contents/Dockerfile" --jq '.content' 2>/dev/null \
-                | base64 -d 2>/dev/null); then
-              continue
-            fi
-            if ! grep -qE 'apk (add|upgrade)|apt-get (install|upgrade)' <<<"$dockerfile"; then
-              continue
-            fi
-            # The runs endpoint 404s when the repo has no release.yaml workflow;
-            # such a repo is not a rebuild candidate. (A transient API error also
-            # lands here and skips the repo for a day.)
-            runs_url="repos/cplieger/${r}/actions/workflows/release.yaml/runs?branch=${default_branch}&status=success&per_page=20"
-            if ! runs=$(gh api "$runs_url" 2>/dev/null); then
-              echo "::notice::${r}: has a Dockerfile but no queryable release.yaml runs; skipping"
-              continue
-            fi
-            interval="${INTERVAL_OVERRIDES[$r]:-$INTERVAL_DAYS}"
-
-            # Walk the 20 newest successes (newest first) and take the first
-            # whose docker finalize job concluded success. The nested job is
-            # named "<stub> / docker / finalize"; match on the suffix so a
-            # renamed stub job stays covered.
-            last=""
-            while IFS=$'\t' read -r run_id created_at; do
-              [ -z "$run_id" ] && continue
-              if ! jobs=$(gh api "repos/cplieger/${r}/actions/runs/${run_id}/jobs?per_page=100" 2>/dev/null); then
-                continue
-              fi
-              if jq -e '[.jobs[]
-                          | select(.conclusion == "success")
-                          | select(.name | endswith(" / docker / finalize"))]
-                        | length > 0' >/dev/null <<<"$jobs"; then
-                last="$created_at"
-                break
-              fi
-            done < <(jq -r '.workflow_runs[] | [(.id | tostring), .created_at] | @tsv' <<<"$runs")
-
-            add_stale() { # <repo> <last> <age-days>
-              STALE=$(jq -c --arg r "$1" --arg l "$2" --arg a "$3" --arg b "$default_branch" \
-                '. + [{repo: $r, last: $l, age_days: $a, branch: $b}]' <<<"$STALE")
-            }
-            if [ -z "$last" ]; then
-              add_stale "$r" "none in 20 newest successes" "n/a"
-              echo "| ${r} | none in 20 newest successes | n/a | ${interval} | **rebuild** |" >> "$GITHUB_STEP_SUMMARY"
-              continue
-            fi
-            ts=$(date -u -d "$last" +%s 2>/dev/null) || ts=""
-            if [ -z "$ts" ]; then
-              add_stale "$r" "${last} (unparsable)" "n/a"
-              echo "| ${r} | ${last} (unparsable) | n/a | ${interval} | **rebuild** |" >> "$GITHUB_STEP_SUMMARY"
-              continue
-            fi
-            # Compare in seconds: flooring to whole days first would keep a
-            # repo "fresh" for up to a full extra day past the threshold.
-            age_secs=$(( now - ts ))
-            age_days=$(( age_secs / 86400 ))
-            if [ "$age_secs" -gt $(( interval * 86400 )) ]; then
-              add_stale "$r" "$last" "$age_days"
-              decision="**rebuild**"
-            else
-              decision="fresh"
-            fi
-            echo "| ${r} | ${last} | ${age_days} | ${interval} | ${decision} |" >> "$GITHUB_STEP_SUMMARY"
-          done <<<"$repos"
-
-          echo "matrix=${STALE}" >> "$GITHUB_OUTPUT"
-          count=$(jq length <<<"$STALE")
-          {
-            echo ""
-            echo "Rebuilding ${count} repo(s)."
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "Stale repos: ${count}"
+          bash scripts/rebuild-stale.sh fanout
 
   dispatch:
     needs: fanout
@@ -173,49 +80,35 @@ jobs:
           fi
           echo "Dispatched release.yaml on cplieger/${REPO}"
 
+      - name: Checkout
+        if: ${{ matrix.branch == 'dev' && !matrix.unreadable }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Open a rebuild pull request on cplieger/${{ matrix.repo }}
-        if: ${{ matrix.branch == 'dev' }}
+        if: ${{ matrix.branch == 'dev' && !matrix.unreadable }}
         env:
           # SYNC_PAT: the same concern as the sync PRs, a machine pull request
-          # into dev. Nothing here runs the target repo's code.
+          # into dev or main. Nothing here runs the target repo's code.
           GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          # A dev-default repo kept on one branch carries no base; its PR goes to dev.
+          BASE: ${{ matrix.base || 'dev' }}
+          CHANNEL: ${{ matrix.channel }}
         run: |
           set -euo pipefail
-          # Same fallback shape as sync.yaml: GitHub refuses --auto on a pull
-          # request that is already merge-ready. A pull request neither call
-          # accepts fails this row, so the tracker issue names it; the next
-          # run finds it open and asks again instead of leaving it by hand.
-          request_merge() { # <pr url>
-            gh pr merge --auto --squash --delete-branch -R "cplieger/${REPO}" "$1" \
-              || gh pr merge --squash --delete-branch -R "cplieger/${REPO}" "$1" \
-              || { echo "::error::cplieger/${REPO}: could not enable auto-merge on $1"; return 1; }
-          }
-          open=$(gh pr list -R "cplieger/${REPO}" --state open --json headRefName,url \
-            --jq '[.[] | select(.headRefName | startswith("rebuild/"))] | first | .url // ""')
-          if [ -n "$open" ]; then
-            echo "::notice::cplieger/${REPO}: ${open} is already open; asking for its merge again"
-            request_merge "$open"
-            exit 0
-          fi
-          head=$(gh api "repos/cplieger/${REPO}/git/ref/heads/dev" --jq .object.sha)
-          tree=$(gh api "repos/cplieger/${REPO}/git/commits/${head}" --jq .tree.sha)
-          # An empty commit: dev's own tree with dev's head as its parent.
-          commit=$(gh api -X POST "repos/cplieger/${REPO}/git/commits" \
-            -f message='fix(deps): rebuild against refreshed base packages' \
-            -f tree="$tree" -f 'parents[]='"$head" --jq .sha)
-          branch="rebuild/$(date -u +%Y%m%d)"
-          if gh api "repos/cplieger/${REPO}/git/ref/heads/${branch}" >/dev/null 2>&1; then
-            echo "::notice::cplieger/${REPO}: ${branch} already exists without an open pull request; moving it to the new commit"
-            gh api -X PATCH "repos/cplieger/${REPO}/git/refs/heads/${branch}" -f sha="$commit" -F force=true >/dev/null
-          else
-            gh api -X POST "repos/cplieger/${REPO}/git/refs" -f ref="refs/heads/${branch}" -f sha="$commit" >/dev/null
-          fi
-          body="The newest dev build of this image is ${AGE_DAYS} days old (built ${LAST})."
-          body="${body} Merging this empty commit rebuilds it against the base packages published since then; nothing else changes."
-          url=$(gh pr create -R "cplieger/${REPO}" --base dev --head "$branch" \
-            --title 'fix(deps): rebuild against refreshed base packages' --body "$body")
-          echo "Opened ${url}"
-          request_merge "$url"
+          bash scripts/rebuild-stale.sh stale-pr "$REPO" "$BASE" "$CHANNEL" "$AGE_DAYS" "$LAST"
+
+      - name: Report an unreadable image on cplieger/${{ matrix.repo }}
+        if: ${{ matrix.unreadable }}
+        env:
+          BASE: ${{ matrix.base }}
+          CHANNEL: ${{ matrix.channel }}
+          UNREADABLE: ${{ matrix.unreadable }}
+        run: |
+          set -euo pipefail
+          echo "::error::ghcr.io/cplieger/${REPO}:${CHANNEL} (${BASE}) did not read, so its age is unknown and nothing was rebuilt. ${UNREADABLE}"
+          exit 1
 
   # `needs:` must list every other job in this workflow.
   notify:

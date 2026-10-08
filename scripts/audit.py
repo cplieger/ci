@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
 """Cross-repo governance audit for the cplieger account.
 
-Grades every non-archived, non-fork repo against the governance standard as
-HARD failures and soft WARNINGS: merge model, branch protection or the dev and
-main rulesets, Actions token defaults, scanning, CI wiring, publish secrets,
-version-tag receipts, the deploy webhook and the public-repo cosmetics;
-CONTRIBUTING.md "Cross-repo audit" lists the surface. Deviations in the
-ACCEPTED table are counted, not listed, and a transient API failure skips its
-check as an [error] line rather than producing a finding.
+Grades every non-archived, non-fork repo against the governance standard as HARD
+failures and soft WARNINGS; compliance() owns the checks. ACCEPTED deviations are
+counted, not listed, and a failed API read is an [error] line, never a finding.
 
-Exit codes: 0 compliant; 1 at least one HARD failure; 2 usage or infra (an
-under-scoped token, or API errors that prevented a full audit).
-Needs `gh` authenticated with a CLASSIC PAT carrying the `repo` scope: a
-fine-grained PAT does not serialize the merge-model fields, so the audit aborts.
-Run: scripts/audit.py [--visibility public] [--repo <name>]... [--dump out.json]
+Exit codes: 0 compliant; 1 a HARD failure; 2 usage or infra (an under-scoped token,
+or API errors that prevented a full audit). Needs a CLASSIC PAT with the `repo`
+scope: a fine-grained PAT does not serialize the merge-model fields, so it aborts.
+--file-issues files a full run's --findings-out file as one `repo-audit` issue per
+public repo; it exits 1 when a repo failed to file and 2 on an unusable file.
 """
 
 import argparse
 import base64
+import functools
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -30,37 +30,27 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import ghrest
 import release_channels
+import tracker_issue
 
 OWNER = "cplieger"
 PRESET = "github>cplieger/.github"
 REUSABLE = "cplieger/ci/.github/workflows"
 INFRA = {".github", "ci"}  # they define the standard; CI-wiring check is N/A for them
-# Repos with a deliberate repo-local CI instead of the reusable-workflow thin
-# caller: they validate surfaces the shared workflows don't cover and gate on a
-# bespoke `validate` job (which the branch-protection check accepts as the bare
-# 'validate' context). The CI-wiring check is N/A for them, same as INFRA.
-# AWS is a private workspace repo (markdown, Python, Office templates) with no
-# compiled surface for the shared workflows to act on; its `validate` job is a
-# lint plus secret plus data-boundary gate.
+# Repos gating on a repo-local `validate` job instead of the reusable thin
+# caller; the CI-wiring check is N/A for them, as for INFRA.
 BESPOKE_CI = {".kiro", "homelab", "AWS"}
-# Host of the self-hosted deploy/dependency orchestrator that each repo pings
-# via a per-repo webhook (a release, or a push on infra repos, reaches it so the
-# change redeploys / re-runs dependency updates). It is private infrastructure,
-# so it is injected via the AUDIT_WEBHOOK_HOST env/secret rather than hardcoded
-# in this public repo. When unset, the webhook check is skipped entirely so a
-# local run without the secret does not report every repo as non-compliant.
+# The deploy orchestrator's host is private, so it comes from AUDIT_WEBHOOK_HOST;
+# unset, the webhook check is skipped so a local run does not fail every repo.
 WEBHOOK_HOST = os.environ.get("AUDIT_WEBHOOK_HOST", "").strip()
-# GitHub auto-creates and manages this ruleset when code-scanning merge
-# protection is enabled. It is not user-authored, so it is whitelisted from the
-# "unexpected custom ruleset" check. Every other ruleset is drift on a
-# single-main repo; a two-channel repo must carry exactly the two below.
+# GitHub creates and manages this ruleset for code-scanning merge protection,
+# so it is never drift.
 MANAGED_RULESETS = {"code-scanning-merge-protection"}
-RULESETS_DIR = Path(__file__).resolve().parent.parent / "configs" / "rulesets"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RULESETS_DIR = REPO_ROOT / "configs" / "rulesets"
 CHANNEL_RULESETS = ("dev", "main")
-# The deploy-trigger event a two-channel repo's hook must carry: a dev build
-# creates no GitHub Release, so the orchestrator learns about a new image from
-# the package push instead.
+# A dev build creates no Release, so a two-channel repo's hook fires on the package push.
 REGISTRY_EVENT = "registry_package"
 _expected_rulesets_cache = {}
 
@@ -82,9 +72,8 @@ def ruleset_matches(expected, actual):
     for key in ("enforcement", "target"):
         if actual.get(key) != expected.get(key):
             reasons.append(f"{key}={actual.get(key)!r} (want {expected.get(key)!r})")
-    # Both condition lists decide which branches the rules reach: an exclude
-    # naming the protected branch disables the ruleset while the include still
-    # matches, and a condition key other than ref_name changes the targeting.
+    # An exclude naming the branch disables the ruleset while the include still
+    # matches, and another condition key changes the targeting.
     want_cond = expected.get("conditions") or {}
     got_cond = actual.get("conditions") or {}
     if set(got_cond) != set(want_cond):
@@ -119,44 +108,68 @@ def ruleset_matches(expected, actual):
 def _bypass_actor_set(ruleset):
     return {(a.get("actor_type"), a.get("actor_id"), a.get("bypass_mode"))
             for a in ruleset.get("bypass_actors") or []}
-# Repos whose deploy-trigger webhook fires on push@main instead of release:
-# the non-releaseable infra/config repos. Every
-# other repo releases, so its hook must carry the release event or releases
-# silently never reach the orchestrator.
+
+
+@functools.cache
+def two_branch_renovate():
+    """(dest, parsed body) of the Renovate config classify-repos.py syncs into
+    every two-branch repo, read from this checkout."""
+    spec = importlib.util.spec_from_file_location(
+        "classify_repos", Path(__file__).with_name("classify-repos.py"))
+    classify = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(classify)
+    [(source, dest)] = classify.pairs(classify.TWO_BRANCH_RENOVATE)
+    with open(REPO_ROOT / source, encoding="utf-8") as fh:
+        return dest, json.load(fh)
+
+
+def collect_renovate_config(name, branch, s):
+    """The two-branch renovate.json on `branch` into s["renovate_json"]: its
+    text, '' on a 404, None with an error line on any other failure."""
+    dest, _ = two_branch_renovate()
+    s["renovate_json"] = None
+    body = gh_json_strict(f"repos/{OWNER}/{name}/contents/{dest}?ref={branch}")
+    if body is None:
+        s["renovate_json"] = ""
+        return
+    if body is API_ERROR or not isinstance(body, dict) or not isinstance(body.get("content"), str):
+        s["errors"].append(f"{dest} on {branch} unreadable (API), so not graded")
+        return
+    try:
+        content = base64.b64decode("".join(body["content"].split()), validate=True)
+        s["renovate_json"] = content.decode("utf-8")
+    except ValueError:
+        s["errors"].append(f"{dest} on {branch} unreadable (API), so not graded")
+
+
+def renovate_config_findings(text, branch):
+    """HARD findings for a two-branch repo's renovate.json `text` ('' when absent)."""
+    dest, want = two_branch_renovate()
+    shown = json.dumps(want)
+    if not text.strip():
+        return [f"{dest} missing on {branch} (want {shown}, which the ci sync writes)"]
+    try:
+        got = json.loads(text)
+    except json.JSONDecodeError:
+        return [f"{dest} on {branch} is not JSON (want {shown}, which the ci sync writes)"]
+    if got != want:
+        return [f"{dest} on {branch} is {json.dumps(got)} (want {shown}, which the ci sync writes)"]
+    return []
+
+
+# Non-releaseable repos whose deploy hook fires on push@main instead of release.
 PUSH_WEBHOOK_REPOS = {".github", ".kiro", "ci", "homelab"}
-# Repos with NO orchestrator relationship at all, so no deploy-trigger webhook
-# is expected. Distinct from PUSH_WEBHOOK_REPOS, which only changes WHICH event
-# a hook must carry: a missing hook is still a HARD failure there, correctly, so
-# membership in that set cannot express "this repo should have none".
-#
-# The webhook check is a denylist by design (every repo needs a hook unless
-# named here), because that direction fails safe: a new app repo that genuinely
-# needs one is flagged rather than silently exempt. Adding a name is therefore a
-# deliberate statement that the repo neither deploys nor triggers dependency
-# runs, and the reason belongs in the comment below.
-#
-# AWS is a private work workspace. It ships nothing, cuts no release, and must
-# not point a webhook at the self-hosted orchestrator.
+# Repos with no orchestrator relationship, so no deploy hook is graded; a
+# missing hook stays HARD everywhere else. A denylist, so a new repo that needs
+# a hook is flagged, and each entry says why it needs none: the one entry is a
+# private workspace that ships nothing.
 NO_DEPLOY_HOOK = {"AWS"}
-# Every image repo (root Dockerfile) dual-publishes to GHCR + Docker Hub, so
-# every one of them needs the DOCKERHUB_* secrets. There is no GHCR-only
-# exemption set any more: subflux and marotte were the last two, and their
-# carve-out outlived the intent by ~20 releases while both READMEs advertised a
-# Docker Hub image the pipeline had stopped pushing. A future exemption needs a
-# skip here AND a policy override in .github/workflows/release.yaml.
-# The required check every repo carries, and the GitHub App expected to report
-# it (15368 = GitHub Actions). A validate context restricted to a different
-# app — or to none (-1, any app may report it) — weakens the gate: an
-# arbitrary integration could satisfy the merge requirement.
+# The GitHub App that must report the validate check (15368 = GitHub Actions):
+# a context open to any app (-1) or pinned to another lets an integration satisfy it.
 ACTIONS_APP_ID = 15368
 
-# Public docs standard ("Canonical README footer"). The two footer blocks are
-# matched as whitespace-normalized substrings so a reflow never false-positives; the
-# TEXT itself must stay verbatim. `.github` is the documented exception
-# (AI note only, no Disclaimer). Docker Hub hard-caps the mirrored full
-# description at 25,000 bytes and the sync action truncates the overflow,
-# so an image-repo README above the cap ships a truncated Hub page (the
-# footer is what falls off) — that ceiling is a HARD check.
+# Matched as whitespace-normalized substrings, so a reflow passes but the text
+# must stay verbatim; `.github` carries the AI note only.
 FOOTER_DISCLAIMER = (
     "This project is built with care and follows security best practices, "
     "but it is intended for personal / self-hosted use. No guarantees of "
@@ -168,17 +181,13 @@ FOOTER_AI_NOTE = (
     "[Kiro](https://kiro.dev). The human maintainer defines architecture, "
     "supervises implementation, and makes all final decisions."
 )
-# Docker Hub gets a short generated overview page, not the README, so a README
-# carries no byte budget. What an image repo must have instead is the marker pair
-# the renderer extracts its summary from (ci/actions/render-hub-overview).
+# The pair the Docker Hub overview renderer (actions/render-hub-overview)
+# extracts an image repo's summary from.
 HUB_MARKER_BEGIN = "<!-- hub-overview BEGIN -->"
 HUB_MARKER_END = "<!-- hub-overview END -->"
 
-# Known-accepted deviations from the standard: {repo: {warning-prefix: reason}}.
-# A warning whose text starts with a listed prefix is suppressed from the
-# report (counted under "accepted", not listed), so the steady state
-# reports clean and a new warning stands out. Every entry needs a reason;
-# remove entries when the deviation is fixed.
+# {repo: {warning-prefix: reason}}: matching warnings are counted, not listed.
+# Every entry needs a reason; remove it once the deviation is fixed.
 ACCEPTED = {
     "homelab": {
     },
@@ -190,21 +199,17 @@ ACCEPTED = {
     },
 }
 
-# Expected license per repo. Apache-2.0 is the default for every public repo
-# not listed here, so a new repo needs an entry only when it deviates.
-# Values are the legacy short spdx_id GitHub's licensee reports: it cannot tell
-# -only from -or-later, so a repo declaring GPL-3.0-or-later reads as GPL-3.0
-# and this table must match what the API returns.
+# Expected spdx_id per repo; a repo not listed is Apache-2.0.
+# Values are what GitHub's licensee reports: it cannot tell -only from
+# -or-later, so a GPL-3.0-or-later repo reads GPL-3.0.
 LICENSE_DEFAULT = "Apache-2.0"
 LICENSE_OVERRIDES = {
     # The differentiated product. File-level copyleft asks for improvements
     # back while keeping the component embeddable in a closed larger work.
     "web-terminal-engine": "MPL-2.0",
     "web-terminal-ui": "MPL-2.0",
-    # Thin hosts over the engine + ui. Permissive here would be a bypass
-    # around their copyleft: ship the already-wired app, change no covered
-    # file, publish nothing. So they are at least as protective as what they
-    # deploy.
+    # Thin hosts over the engine and ui: permissive here would ship the wired
+    # app around their copyleft.
     "web-terminal-kiro": "MPL-2.0",
     "web-terminal-server": "MPL-2.0",
     # First-party applications. Nobody imports an app, so it never enters a
@@ -217,25 +222,18 @@ LICENSE_OVERRIDES = {
     "registry-stats": "GPL-3.0",
     "seadex-scout": "GPL-3.0",
     "tautulli-remap": "GPL-3.0",
-    # The deadset dead-code analyzers and their orchestrator: command-line tools
-    # run as separate processes, never linked, so the same rule applies. Their
-    # shared contract repository (deadset-spec) stays on the Apache-2.0 default
-    # so a third party can write a conforming analyzer freely.
+    # Separate-process tools, so the application rule applies; deadset-spec stays
+    # Apache-2.0 so anyone can write a conforming analyzer.
     "deadset-go": "GPL-3.0",
     "deadset-ts": "GPL-3.0",
     "deadset": "GPL-3.0",
-    # Network services a competitor could plausibly resell hosted, which is
-    # the only thing AGPL section 13 buys over GPL-3.0. Rationed to these two
-    # because section 13 is also what puts AGPL on corporate blocklists that
-    # GPL-3.0 escapes.
+    # Services a competitor could resell hosted, the one thing AGPL section 13
+    # adds; rationed because it also puts AGPL on corporate blocklists.
     "subflux": "AGPL-3.0",
     "marotte": "AGPL-3.0",
 }
 
-# Governance standard.
-# HARD merge-model settings: any deviation fails the audit (exit 1). These have
-# real consequences — stray merge-commit history, un-mergeable or non-auto-merging
-# PRs, lost branch hygiene.
+# HARD merge-model settings.
 GOV_HARD = {
     "allow_merge_commit": False,
     "allow_squash_merge": True,
@@ -243,11 +241,8 @@ GOV_HARD = {
     "delete_branch_on_merge": True,
     "allow_auto_merge": True,
 }
-# Repo-feature settings: advisory only (cosmetic), reported as warnings.
-# The squash-commit defaults matter because sync and Renovate PRs land as
-# auto-squash merges: COMMIT_OR_PR_TITLE keeps the conventional-commit subject
-# git-cliff builds the changelog from (single-commit PRs keep their commit
-# title; multi-commit PRs fall back to the PR title).
+# Advisory settings. Sync and Renovate PRs auto-squash, and COMMIT_OR_PR_TITLE
+# keeps the conventional subject git-cliff reads.
 GOV_SOFT = {
     "has_wiki": False,
     "has_projects": False,
@@ -258,112 +253,145 @@ GOV_SOFT = {
     "squash_merge_commit_title": "COMMIT_OR_PR_TITLE",
     "squash_merge_commit_message": "COMMIT_MESSAGES",
 }
+# Squash only on a two-branch repo, where the PR title is the changelog line;
+# COMMIT_MESSAGES, since a BREAKING CHANGE quoted in a Renovate PR body cuts a major.
+GOV_HARD_TWO_BRANCH = {
+    "allow_merge_commit": False,
+    "allow_squash_merge": True,
+    "allow_rebase_merge": False,
+    "delete_branch_on_merge": True,
+    "allow_auto_merge": True,
+    "squash_merge_commit_title": "PR_TITLE",
+    "squash_merge_commit_message": "COMMIT_MESSAGES",
+}
+
+
+def merge_model(two_channel):
+    """(hard, soft) merge-model tables for a repo of that branch model."""
+    if not two_channel:
+        return GOV_HARD, GOV_SOFT
+    return GOV_HARD_TWO_BRANCH, {k: v for k, v in GOV_SOFT.items() if k not in GOV_HARD_TWO_BRANCH}
+
 
 def gh(*args):
     return subprocess.run(["gh", *args], capture_output=True, text=True)
 
 
-# Sentinel: the API call kept failing transiently after retries. Distinct from
-# None (definitive absence, e.g. HTTP 404) so a flaky call can never be
-# mistaken for "the thing is missing" and manufacture a false HARD failure.
+# Every read runs through `gh`, so a test that fakes it drives the real policy.
+REST = ghrest.Client(run=lambda args, *_: gh(*args))
+
+
+# A read still failing transiently after retries; distinct from None (a
+# definitive absence) so a flaky call never manufactures a HARD failure.
 API_ERROR = object()
 
 
-def http_status(result):
-    """The HTTP status gh reported on stderr (`gh: Not Found (HTTP 404)`),
-    None when it reported none."""
-    m = re.search(r"HTTP (\d{3})", result.stderr or "")
-    return int(m.group(1)) if m else None
-
-
-def gh_retry(*args, tries=4):
-    """Run gh, retrying transient failures with exponential backoff.
-
-    Returns (result, definitive). definitive=True means the outcome can be
-    trusted: success, or a real 4xx (404 absence, 403 permission). False means
-    the call still failed after all retries for a transient-looking reason
-    (rate limit, 5xx, network) and MUST NOT be interpreted as absence.
+def gh_retry(path):
+    """One GET under ghrest's retry policy: (response, definitive), where the
+    response is the ghrest.ApiError when the read failed. definitive=True means
+    the outcome can be trusted: success, or a 4xx that is not a rate limit (404
+    absence, 403 permission). False means it still failed after the retries for
+    a transient reason (rate limit, 5xx, network) and MUST NOT be read as absence.
     """
-    delay, r = 2, None
-    for attempt in range(tries):
-        r = gh(*args)
-        if r.returncode == 0:
-            return r, True
-        stderr = r.stderr or ""
-        code = http_status(r)
-        rate_limited = "rate limit" in stderr.lower()
-        transient = rate_limited or code is None or code >= 500 or code == 429
-        if not transient:
-            return r, True  # definitive 4xx — absence or permission; trust it
-        if attempt < tries - 1:
-            time.sleep(delay)
-            delay *= 2
-    return r, False
+    try:
+        return REST.request("GET", path), True
+    except ghrest.ApiError as err:
+        return err, err.definitive
 
 
-def gh_json(*args):
-    """Parsed JSON on success; None on definitive absence; API_ERROR on a
-    transient failure that survived retries."""
-    r, definitive = gh_retry(*args)
+def gh_json(path):
+    """Parsed JSON on success; None on definitive absence or a body that is not
+    JSON; API_ERROR on a transient failure that survived retries."""
+    r, definitive = gh_retry(path)
     if not definitive:
         return API_ERROR
-    if r.returncode != 0:
+    if isinstance(r, ghrest.ApiError):
         return None
     try:
-        return json.loads(r.stdout)
-    except json.JSONDecodeError:
+        return json.loads(r.body)
+    except ValueError:
         return None
 
 
-def gh_json_strict(*args):
+def gh_json_strict(path):
     """Parsed JSON on success; None on an HTTP 404 alone; API_ERROR on every
     other failure, a success body that is not JSON or is JSON null included.
     For a read whose absence arm grades something: a 403 or 422 must not pass
     as absence, and neither may a null body."""
-    r, definitive = gh_retry(*args)
+    r, definitive = gh_retry(path)
     if not definitive:
         return API_ERROR
-    if r.returncode != 0:
-        return None if http_status(r) == 404 else API_ERROR
+    if isinstance(r, ghrest.ApiError):
+        return None if r.status == 404 else API_ERROR
     try:
-        body = json.loads(r.stdout)
-    except json.JSONDecodeError:
+        body = json.loads(r.body)
+    except ValueError:
         return API_ERROR
     return API_ERROR if body is None else body
 
 
 def api_status(path):
     """(ok, definitive) for endpoints that signal via HTTP status
-    (204 enabled -> rc 0, 404 disabled -> rc != 0)."""
-    r, definitive = gh_retry("api", path)
-    return r.returncode == 0, definitive
+    (204 enabled, 404 disabled)."""
+    r, definitive = gh_retry(path)
+    return not isinstance(r, ghrest.ApiError), definitive
 
 
 def file_text(repo, path):
     """Decoded file content; '' when the file is definitively absent;
-    None on an API error (unknown — do not treat as absent)."""
-    r, definitive = gh_retry(
-        "api", f"repos/{OWNER}/{repo}/contents/{path}", "--jq", ".content"
-    )
+    None on an API error or a body that is not a file (unknown — do not treat
+    as absent)."""
+    r, definitive = gh_retry(f"repos/{OWNER}/{repo}/contents/{path}")
     if not definitive:
         return None
-    if r.returncode != 0:
+    if isinstance(r, ghrest.ApiError):
         return ""
+    return decoded_file(r.body)
+
+
+# A file definitively absent (HTTP 404), for a read where an empty file and a
+# missing one grade differently.
+ABSENT = object()
+
+
+def present_file_text(repo, path):
+    """Decoded content of a present file ('' when it is empty); ABSENT on an
+    HTTP 404 alone; None on every other failure, including a body that is not
+    a base64 file that decodes, as for a file above 1 MB:
+    https://docs.github.com/rest/repos/contents#get-repository-content"""
+    r, definitive = gh_retry(f"repos/{OWNER}/{repo}/contents/{path}")
+    if not definitive:
+        return None
+    if isinstance(r, ghrest.ApiError):
+        return ABSENT if r.status == 404 else None
+    return decoded_file(r.body, strict=True)
+
+
+def decoded_file(raw, strict=False):
+    """A contents-API body's file text; None when the body is not a file. Content
+    that does not decode is '' (file_text's contract), or None when `strict`,
+    which also requires `encoding: base64` and refuses non-alphabet characters."""
     try:
-        return base64.b64decode("".join(r.stdout.split())).decode("utf-8", "replace")
+        body = json.loads(raw)
+    except ValueError:
+        return None
+    content = body.get("content") if isinstance(body, dict) else None
+    if not isinstance(content, str):
+        return None
+    if strict and body.get("encoding") != "base64":
+        return None
+    try:
+        decoded = base64.b64decode("".join(content.split()), validate=strict)
+        return decoded.decode("utf-8", "replace")
     except (ValueError, UnicodeError):
-        return ""
+        return None if strict else ""
 
 
 AUDIT_UA = "Mozilla/5.0 (compatible; cplieger-governance-audit)"
 
 
-# dest-in-consumer -> canonical-in-this-repo, for the synced files that carry no
-# per-repo content and so must match their canonical exactly. Keyed on a root
-# Dockerfile, which is the same condition classify-repos.py uses to decide who
-# receives repin-sha.sh. Opt-in synced files (image-smoke.sh, shell/lib.sh) are
-# deliberately absent: a repo that never opted in has no copy, and "absent" must
-# not read as drift.
+# Synced files with no per-repo content, keyed on a root Dockerfile as in
+# classify-repos.py. Opt-in synced files are absent: no copy is not drift.
 SYNCED_BYTE_IDENTICAL = {
     "scripts/repin-sha.sh": "configs/repin-sha.sh",
     "scripts/collect-licenses.sh": "configs/collect-licenses.sh",
@@ -408,25 +436,12 @@ def expected_used_by_package(go_module, package_json_text, *, image):
 
 
 def used_by_package_scrape(name):
-    """The package a repo's "Used by" counter currently represents, plus the
-    package set the counter could be switched to.
-
-    No REST or GraphQL surface exposes the "Used by counter" selection
-    (Settings -> Advanced Security; verified absent 2026-07), so both are read
-    from the public dependents page /<owner>/<repo>/network/dependents:
-
-    - current: the og:title meta names the selected package ('Network
-      Dependents · owner/repo · <package> repositories'; no third segment when
-      the repo publishes no package). og:title is the social-embed surface,
-      far more redesign-stable than the page markup.
-    - selectable: the package-switcher menu anchors (?package_id=...). Repos
-      with one package render no menu -> empty set. A library's new /vN
-      path is not indexed until something imports it, so the "right"
-      package may not exist to select yet — the caller must only flag drift
-      the settings dropdown can actually fix.
-
-    Returns (current, selectable, definitive). definitive=False means the
-    page could not be read — skip the check, never infer drift.
+    """(current, selectable, definitive) for the repo's "Used by" counter, scraped from
+    the public dependents page because no API exposes that setting. `current` is the
+    package og:title names (None when it names none), `selectable` the package-switcher
+    anchors (empty for a single package; an unindexed Go /vN path is often absent, so
+    flag only drift the dropdown can fix). definitive=False: the page was unreadable,
+    so skip the check and never infer drift.
     """
     url = f"https://github.com/{OWNER}/{name}/network/dependents"
     req = urllib.request.Request(url, headers={"User-Agent": AUDIT_UA})  # fixed https:// URL, host is github.com
@@ -464,9 +479,8 @@ def used_by_package_scrape(name):
 
 # How many of the newest tags of each shape are graded for provenance.
 PROVENANCE_TAGS = 5
-# Every publishing path creates the tag ref before its receipt (the Release or
-# the status), so a tag on a commit younger than this is not graded: an audit
-# overlapping a live release must not open a false failure issue.
+# Every publishing path creates the tag before its receipt, so a tag on a younger
+# commit is not graded: an audit overlapping a release must not fail it.
 RECEIPT_GRACE = timedelta(hours=2)
 
 
@@ -474,7 +488,7 @@ def tag_page_fetcher(name, sha_by_tag):
     """A page reader for release_channels.collect_all_tags that also records
     each tag's commit; None from a page means the API failed after retries."""
     def fetch(page):
-        tags = gh_json("api", f"repos/{OWNER}/{name}/tags?per_page={release_channels.TAG_PAGE_SIZE}&page={page}")
+        tags = gh_json(f"repos/{OWNER}/{name}/tags?per_page={release_channels.TAG_PAGE_SIZE}&page={page}")
         if tags is API_ERROR:
             return None
         names_ = []
@@ -503,10 +517,10 @@ def grade_stable_tags(tags, release_of):
     return without, hand_made
 
 
-def dev_tags_without_receipt(tagged, statuses_of):
-    """Dev tags whose commit carries no `release/tag/<tag>` success status.
-    `tagged` is [(tag, sha)]; `statuses_of(sha)` is the commit's status list,
-    API_ERROR when unreadable (the tag is then skipped)."""
+def tags_without_receipt(tagged, statuses_of, has_receipt=release_channels.has_tag_receipt):
+    """The tags of `tagged` ([(tag, sha)]) whose commit statuses fail
+    `has_receipt(tag, statuses)`. `statuses_of(sha)` is the commit's status
+    list, API_ERROR when unreadable (the tag is then skipped)."""
     missing = []
     for tag, sha in tagged:
         if not sha:
@@ -514,19 +528,23 @@ def dev_tags_without_receipt(tagged, statuses_of):
         statuses = statuses_of(sha)
         if statuses is API_ERROR:
             continue
-        if not release_channels.has_tag_receipt(tag, statuses):
+        if not has_receipt(tag, statuses):
             missing.append(tag)
     return missing
 
 
 def commit_date(name, sha):
-    """The committer date of `sha`, None when the response carries none,
-    API_ERROR when unreadable."""
-    data = gh_json("api", f"repos/{OWNER}/{name}/commits/{sha}")
+    """The committer date of `sha`; API_ERROR when unreadable or when the
+    response carries no parsable date, since the grace interval is then unknown."""
+    data = gh_json(f"repos/{OWNER}/{name}/commits/{sha}")
     if data is API_ERROR:
         return API_ERROR
     iso = (((data or {}).get("commit") or {}).get("committer") or {}).get("date")
-    return datetime.fromisoformat(iso) if iso else None
+    try:
+        date = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return API_ERROR
+    return date if date.tzinfo else API_ERROR
 
 
 def workflow_runs(path):
@@ -534,7 +552,7 @@ def workflow_runs(path):
     (a repo without the workflow file); API_ERROR on every other failure, a
     success body that is not a listing (an object carrying an integer
     `total_count` and a `workflow_runs` list) included."""
-    body = gh_json_strict("api", path)
+    body = gh_json_strict(path)
     if body is None or body is API_ERROR:
         return body
     if not isinstance(body, dict) or not isinstance(body.get("total_count"), int):
@@ -546,11 +564,12 @@ def workflow_runs(path):
 def release_in_flight(name, now):
     """Whether a run of the repo's tag-creating workflow is queued or in
     progress, or ended within RECEIPT_GRACE; API_ERROR when a read failed. The
-    commit's age cannot show this: a promotion tags a commit that soaked for a
-    day, so its tag is created outside the grace window and the receipt still
-    follows. Other workflows are not read: the daily security dispatch puts a
-    run inside the window in every repo, and it says nothing about a tag. A
-    404 on the listing is a repo without the workflow file: no run, graded."""
+    commit's age cannot show this: a renumbered dev build tags a commit made
+    long before, and a repaired stable tag gets its Release long after its
+    commit, so the receipt follows outside the grace window. Other workflows
+    are not read: the daily security dispatch puts a run inside the window in
+    every repo, and it says nothing about a tag. A 404 on the listing is a
+    repo without the workflow file: no run, graded."""
     workflow = "publish.yaml" if name in release_channels.OWN_PUBLISH_REPOS else "release.yaml"
     runs_path = f"repos/{OWNER}/{name}/actions/workflows/{workflow}/runs"
     for status in ("in_progress", "queued"):
@@ -591,18 +610,26 @@ def collect_version_tags(name, s, now=None):
         s["errors"].append("tags unreadable (API)")
         return
 
+    unreadable = set()
+
     def release_of(tag):
-        rel = gh_json("api", f"repos/{OWNER}/{name}/releases/tags/{tag}")
+        rel = gh_json(f"repos/{OWNER}/{name}/releases/tags/{tag}")
         if rel is API_ERROR:
             s["errors"].append(f"release for tag {tag} unreadable (API)")
+            unreadable.add(tag)
         return rel
 
     def statuses_of(sha):
-        data = gh_json("api", f"repos/{OWNER}/{name}/commits/{sha}/status")
+        data = gh_json(f"repos/{OWNER}/{name}/commits/{sha}/status?per_page=100")
         if data is API_ERROR:
             s["errors"].append(f"statuses of {sha[:12]} unreadable (API)")
             return API_ERROR
-        return (data or {}).get("statuses") or []
+        statuses = (data or {}).get("statuses") or []
+        total = (data or {}).get("total_count")
+        if isinstance(total, int) and total > len(statuses):
+            s["errors"].append(f"statuses of {sha[:12]} truncated at {len(statuses)}, so receipts not graded")
+            return API_ERROR
+        return statuses
 
     def settled(tags):
         """The tags of `tags` whose commit is more than RECEIPT_GRACE from now
@@ -617,25 +644,32 @@ def collect_version_tags(name, s, now=None):
             date = commit_date(name, sha)
             if date is API_ERROR:
                 s["errors"].append(f"commit of tag {tag} unreadable (API)")
-            elif date is not None and abs(now - date) < RECEIPT_GRACE:
+            elif abs(now - date) < RECEIPT_GRACE:
                 s["tags_in_grace"] += 1
             else:
                 kept.append(tag)
         return kept
 
-    # Each lane (the root and every nested Go module) is graded on its own
-    # newest tags, which is why the whole listing is read: a lane that has gone
-    # quiet sits below any page that satisfies the root counts.
+    # Each lane is graded on its own newest tags, so the whole listing is read.
     s["stable_tags_without_release"], s["hand_made_stable_tags"] = [], []
     s["dev_tags_without_receipt"] = []
+    s["stable_tags_without_receipt"] = []
     s["tags_in_grace"] = 0
     for _lane, (stable, dev) in sorted(release_channels.tags_by_lane(names_).items()):
-        without, hand_made = grade_stable_tags(settled(stable[:PROVENANCE_TAGS]), release_of)
+        graded = settled(stable[:PROVENANCE_TAGS])
+        without, hand_made = grade_stable_tags(graded, release_of)
         s["stable_tags_without_release"] += without
         s["hand_made_stable_tags"] += hand_made
-        s["dev_tags_without_receipt"] += dev_tags_without_receipt(
+        s["dev_tags_without_receipt"] += tags_without_receipt(
             [(t, sha_by_tag.get(t, "")) for t in settled(dev[:PROVENANCE_TAGS])], statuses_of
         )
+        # Only the highest: a receipt covers the history below it, so older
+        # tags (every one made before the receipt existed) carry none.
+        if stable and stable[0] in graded and stable[0] not in {*without, *hand_made, *unreadable}:
+            s["stable_tags_without_receipt"] += tags_without_receipt(
+                [(stable[0], sha_by_tag.get(stable[0], ""))], statuses_of,
+                release_channels.has_completion_receipt,
+            )
 
 
 def collect_rulesets(name, s):
@@ -645,16 +679,16 @@ def collect_rulesets(name, s):
     ruleset keys None, so compliance() grades no ruleset finding from a partial
     list; a present ruleset must never be reported missing off a flaky read."""
     s["custom_rulesets"] = []
-    s["ruleset_bypass_actors"] = []  # (ruleset_name, actor_type, actor_id)
+    s["ruleset_bypass_actors"] = []  # (ruleset_name, actor_type, actor_id, bypass_mode)
     s["rulesets_full"] = {}
-    rulesets = gh_json("api", f"repos/{OWNER}/{name}/rulesets")
+    rulesets = gh_json(f"repos/{OWNER}/{name}/rulesets")
     if rulesets is API_ERROR:
         s["errors"].append("rulesets unreadable (API); rulesets not graded")
         s["custom_rulesets"] = s["ruleset_bypass_actors"] = s["rulesets_full"] = None
         return
     for rs in rulesets if isinstance(rulesets, list) else []:
         rname = rs.get("name", "")
-        full = gh_json("api", f"repos/{OWNER}/{name}/rulesets/{rs.get('id')}")
+        full = gh_json(f"repos/{OWNER}/{name}/rulesets/{rs.get('id')}")
         if full is API_ERROR:
             s["errors"].append(f"ruleset '{rname}' unreadable (API); rulesets not graded")
             s["custom_rulesets"] = s["ruleset_bypass_actors"] = s["rulesets_full"] = None
@@ -664,7 +698,8 @@ def collect_rulesets(name, s):
         if rname not in MANAGED_RULESETS:
             s["custom_rulesets"].append({"name": rname, "enforcement": full.get("enforcement")})
         for a in full.get("bypass_actors") or []:
-            s["ruleset_bypass_actors"].append((rname, a.get("actor_type"), a.get("actor_id")))
+            s["ruleset_bypass_actors"].append(
+                (rname, a.get("actor_type"), a.get("actor_id"), a.get("bypass_mode")))
 
 
 def collect(meta):
@@ -676,7 +711,7 @@ def collect(meta):
     """
     name = meta["name"]
     s = {"name": name, "infra": name in INFRA, "errors": [], "fatal": False}
-    repo = gh_json("api", f"repos/{OWNER}/{name}")
+    repo = gh_json(f"repos/{OWNER}/{name}")
     if repo is API_ERROR:
         # Without the repo object there is nothing meaningful to audit.
         s["errors"].append("repo settings unreadable (API)")
@@ -689,14 +724,9 @@ def collect(meta):
     s["private"] = bool(repo.get("private"))
     branch = repo.get("default_branch") or "main"
     s["default_branch"] = branch
-    s["two_channel"] = branch == "dev"
-    # The merge-model fields are only serialized onto the repo object for a
-    # token with the classic `repo` scope. A fine-grained PAT — even one with
-    # Administration:read and an admin role (permissions.admin=true) — does NOT
-    # expose them, so they come back absent (-> None) and the audit would
-    # report all repos as non-compliant. Key the guard off actual field
-    # presence, NOT permissions.admin, so a fine-grained token is correctly
-    # detected as under-scoped rather than trusted.
+    s["two_channel"] = release_channels.is_two_branch(repo)
+    # Only a classic `repo`-scope token gets the merge-model fields; a fine-grained
+    # one, admin or not, gets none, so their presence is the guard.
     s["admin_visible"] = "allow_merge_commit" in repo
     for k in ("allow_merge_commit", "allow_squash_merge", "allow_rebase_merge",
               "allow_auto_merge", "delete_branch_on_merge",
@@ -721,14 +751,14 @@ def collect(meta):
     if not definitive:
         s["errors"].append("vulnerability-alerts unreadable (API)")
 
-    pvr = gh_json("api", f"repos/{OWNER}/{name}/private-vulnerability-reporting")
+    pvr = gh_json(f"repos/{OWNER}/{name}/private-vulnerability-reporting")
     if pvr is API_ERROR:
         s["private_vuln_reporting"] = None
         s["errors"].append("private-vulnerability-reporting unreadable (API)")
     else:
         s["private_vuln_reporting"] = bool((pvr or {}).get("enabled"))
 
-    prot = gh_json("api", f"repos/{OWNER}/{name}/branches/{branch}/protection")
+    prot = gh_json(f"repos/{OWNER}/{name}/branches/{branch}/protection")
     if prot is API_ERROR:
         prot = None
         s["has_protection"] = None
@@ -740,19 +770,14 @@ def collect(meta):
         contexts = list(rsc.get("contexts") or [])
         contexts += [c.get("context") for c in (rsc.get("checks") or []) if c.get("context") not in contexts]
         s["required_checks"] = contexts
-        # context -> app_id, to verify the validate gate is pinned to the
-        # GitHub Actions app (a -1 / other-app pin lets any integration
-        # satisfy the merge requirement).
+        # context -> app_id, for the validate gate's app pin.
         s["required_check_apps"] = {c.get("context"): c.get("app_id")
                                     for c in (rsc.get("checks") or [])}
         s["strict"] = rsc.get("strict")
         s["enforce_admins"] = (prot.get("enforce_admins") or {}).get("enabled")
         s["allow_force_pushes"] = (prot.get("allow_force_pushes") or {}).get("enabled")
         s["allow_deletions"] = (prot.get("allow_deletions") or {}).get("enabled")
-        # The rest of the classic-protection surface. The standard sets none
-        # of these; presence/enabled is drift (and a locked branch, or an
-        # approving-review floor a single-maintainer account can never satisfy,
-        # is outright breakage — no one can self-approve a PR).
+        # The standard sets none of these, so each is drift or, below, breakage.
         reviews = prot.get("required_pull_request_reviews")
         s["required_reviews_present"] = reviews is not None
         s["required_review_count"] = (reviews or {}).get("required_approving_review_count", 0)
@@ -770,12 +795,10 @@ def collect(meta):
         s["required_conversation_resolution"] = s["required_linear_history"] = None
         s["required_signatures"] = s["lock_branch"] = None
 
-    # A two-channel repo must carry no classic protection on main either: the
-    # main ruleset is what lets the promotion move the branch, and a classic
-    # rule beside it would block or confuse that.
+    # A two-channel repo's main is governed by its ruleset alone.
     s["main_protection"] = None
     if s["two_channel"]:
-        mprot = gh_json("api", f"repos/{OWNER}/{name}/branches/main/protection")
+        mprot = gh_json(f"repos/{OWNER}/{name}/branches/main/protection")
         if mprot is API_ERROR:
             s["errors"].append("main branch protection unreadable (API)")
         else:
@@ -794,28 +817,20 @@ def collect(meta):
             s["required_checks"] = [c.get("context") for c in checks if c.get("context")]
             s["required_check_apps"] = {c.get("context"): c.get("integration_id") for c in checks}
 
-    # Version tags: the newest of each shape must carry the pipeline's receipt
-    # (a bot-authored Release on stable, a release/tag status on dev), or a
-    # hand-made tag becomes git-cliff's version base.
+    # The newest tags of each shape need the pipeline's receipt, or a hand-made
+    # tag becomes git-cliff's version base.
     s["stable_tags_without_release"] = []
     s["hand_made_stable_tags"] = []
     s["dev_tags_without_receipt"] = []
     if s["two_channel"]:
         collect_version_tags(name, s)
 
-    # Phantom required contexts. Branch protection matches a required context
-    # against reported check-run NAMES: for a reusable-workflow job that is
-    # 'caller / nested' (e.g. 'ci / validate'), but for a plain workflow job it
-    # is the job name alone — the PR checks UI displays 'Workflow / job', which
-    # is NOT the context name. A context nothing ever reports blocks every PR
-    # forever as "Expected — waiting for status to be reported" while all real
-    # checks are green (bit docker-radvd PR #248, 2026-07: required as
-    # 'Smoke / smoke' what reports as 'smoke'). Verify every required context
-    # against names actually observed: on the default-branch HEAD first; only
-    # if something is still unobserved, escalate to the head commits of the 3
-    # most recently updated PRs (some repos run CI on PRs only, so their main
-    # HEAD carries no check runs) plus the HEAD's legacy combined status (a
-    # non-Actions integration would report there, not as a check run).
+    # Phantom required contexts: protection matches a context against check-run
+    # names ('ci / validate', or a plain job's bare name, never the UI's
+    # 'Workflow / job'), and one nothing reports blocks every PR as "Expected".
+    # Names come from the default-branch HEAD, then, while one is unseen, from
+    # the 3 newest PR heads (PR-only CI) and HEAD's combined status (a
+    # non-Actions integration).
     s["observed_checks"] = []
     s["observed_complete"] = True
     if s["required_checks"]:
@@ -823,8 +838,7 @@ def collect(meta):
 
         def check_names(ref):
             nonlocal complete
-            cr = gh_json("api",
-                         f"repos/{OWNER}/{name}/commits/{ref}/check-runs?per_page=100")
+            cr = gh_json(f"repos/{OWNER}/{name}/commits/{ref}/check-runs?per_page=100")
             if cr is API_ERROR:
                 complete = False
                 return set()
@@ -833,7 +847,7 @@ def collect(meta):
 
         names |= check_names(branch)
         if not set(s["required_checks"]) <= names:
-            prs = gh_json("api", f"repos/{OWNER}/{name}/pulls"
+            prs = gh_json(f"repos/{OWNER}/{name}/pulls"
                                  "?state=all&sort=updated&direction=desc&per_page=3")
             if prs is API_ERROR:
                 complete = False
@@ -842,7 +856,7 @@ def collect(meta):
                     sha = (pr.get("head") or {}).get("sha")
                     if sha:
                         names |= check_names(sha)
-            st = gh_json("api", f"repos/{OWNER}/{name}/commits/{branch}/status")
+            st = gh_json(f"repos/{OWNER}/{name}/commits/{branch}/status")
             if st is API_ERROR:
                 complete = False
             else:
@@ -854,12 +868,7 @@ def collect(meta):
             s["errors"].append("check-run names unreadable (API) — "
                                "phantom-required-context check skipped")
 
-    # Actions token defaults. All synced workflows declare explicit
-    # `permissions:` blocks (zizmor gates that), so the repo-level default is
-    # defense-in-depth for repo-local extras — it should stay read-only. A
-    # GITHUB_TOKEN that can approve PRs is an attack-chain enabler on repos
-    # with auto-merge on: a malicious workflow could approve and land itself.
-    wperm = gh_json("api", f"repos/{OWNER}/{name}/actions/permissions/workflow")
+    wperm = gh_json(f"repos/{OWNER}/{name}/actions/permissions/workflow")
     if wperm is API_ERROR:
         s["default_workflow_permissions"] = None
         s["workflows_can_approve_prs"] = None
@@ -869,7 +878,7 @@ def collect(meta):
         s["default_workflow_permissions"] = wperm.get("default_workflow_permissions")
         s["workflows_can_approve_prs"] = wperm.get("can_approve_pull_request_reviews")
 
-    wf = gh_json("api", f"repos/{OWNER}/{name}/contents/.github/workflows")
+    wf = gh_json(f"repos/{OWNER}/{name}/contents/.github/workflows")
     if wf is API_ERROR:
         s["has_codeql"] = s["has_security_scan"] = s["publishes"] = None
         s["errors"].append("workflow listing unreadable (API)")
@@ -879,11 +888,8 @@ def collect(meta):
         s["has_security_scan"] = bool({"security.yml", "security.yaml"} & wf_names)
         s["publishes"] = bool({"release.yaml", "release.yml", "publish.yaml", "publish.yml"} & wf_names)
 
-    # Surface detection, mirroring scripts/classify-repos.py: a root Dockerfile
-    # means the release pipeline publishes an image (and, for dual-publish
-    # repos, needs the Docker Hub secrets).
-    # go.mod and package.json are fetched for their TEXT (module path / package
-    # name below); only the Dockerfile's presence is graded.
+    # Surface probes as in classify-repos.py: go.mod and package.json are read for
+    # their text below, the Dockerfile for its presence.
     probe_texts = {}
     for probe_file in ("go.mod", "package.json", "Dockerfile"):
         txt = file_text(name, probe_file)
@@ -892,10 +898,10 @@ def collect(meta):
             s["errors"].append(f"{probe_file} probe unreadable (API)")
     dockerfile = probe_texts["Dockerfile"]
     s["has_dockerfile"] = None if dockerfile is None else bool(dockerfile)
+    s["root_manifests"] = {p: probe_texts[p] for p in ("go.mod", "package.json")}
 
-    # The current used-by selection comes from the public dependents page (no
-    # API — see used_by_package_scrape). Public repos only: the counter has no
-    # audience on a private repo, and the page needs to be publicly rendered.
+    # Used-by counter: the selection is scraped (no API), on public repos only;
+    # expected_used_by_package owns which package that should be.
     m = re.search(r"^module\s+(\S+)", probe_texts.get("go.mod") or "", re.MULTILINE)
     s["go_module"] = m.group(1) if m else None
     s["expected_package"] = expected_used_by_package(
@@ -920,26 +926,20 @@ def collect(meta):
     else:
         s["has_dependabot_yml"] = bool(dep_txt)
 
-    # Docker Hub dual-publish secrets. Every image repo (root Dockerfile)
-    # publishes to GHCR + Docker Hub (release.yaml policy step), and the Docker
-    # Hub login needs per-repo secrets — cplieger is a user account, so there
-    # are no org-level secrets. A missing secret fails the next release at the
-    # Docker Hub login step.
+    # Image repos dual-publish, and a user account has no org secrets, so each
+    # needs its own; a missing one fails the next release's Docker Hub login. A
+    # GHCR-only exemption needs a skip here and a REGISTRIES arm in release.yaml.
     s["dockerhub_secrets"] = None
     if s.get("has_dockerfile"):
-        sec = gh_json("api", f"repos/{OWNER}/{name}/actions/secrets")
+        sec = gh_json(f"repos/{OWNER}/{name}/actions/secrets")
         if isinstance(sec, dict) and "secrets" in sec:
             names_ = {x.get("name") for x in sec.get("secrets") or []}
             s["dockerhub_secrets"] = {"DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"} <= names_
         else:
             s["errors"].append("actions secrets unreadable (API)")
 
-    # Synced files that must be BYTE-IDENTICAL to their canonical. sync.yaml
-    # distributes them and nothing else reports a diverged copy. The class it
-    # catches is a local edit to a synced copy (read as local code and trimmed),
-    # which the next sync silently overwrites. Judge drift from the remote, not
-    # a local checkout: a clone many commits behind looks exactly like drift in
-    # every repo and is not.
+    # Synced copies that must be byte-identical to their canonical: an edit to
+    # one is lost on the next sync, so it is reported here first.
     s["synced_drift"] = []
     for dest, canon_path in SYNCED_BYTE_IDENTICAL.items():
         if not s.get("has_dockerfile"):
@@ -951,14 +951,11 @@ def collect(meta):
         elif got and got != canon:
             s["synced_drift"].append(dest)
 
-    # Public docs standard. One contents read serves every README check:
-    # presence, the canonical footer blocks, License-last heading order, and
-    # the Docker Hub overview markers. Public repos only — reader-facing docs
-    # have no audience on a private repo.
+    # One README read serves every docs check; public repos only.
     s["readme_text"] = None
     s["compose_example"] = None
     if not s["private"]:
-        rd = gh_json("api", f"repos/{OWNER}/{name}/contents/README.md")
+        rd = gh_json(f"repos/{OWNER}/{name}/contents/README.md")
         if rd is API_ERROR:
             s["errors"].append("README.md unreadable (API)")
         elif isinstance(rd, dict) and rd.get("content") is not None:
@@ -983,14 +980,8 @@ def collect(meta):
     else:
         s["ci_wired"] = REUSABLE in ci_txt
 
-    # Renovate reaches every repo through inheritConfig, not a per-repo file:
-    # the scheduler sets inheritConfig + inheritConfigRepoName=cplieger/.github,
-    # so cplieger/.github/org-inherited-config.json is the ONE place the preset
-    # is referenced; a per-repo shim is drift, not compliance. Only .github is
-    # graded, and it is graded HARD, because that single file is what delivers
-    # dependency updates to every repo and its absence is silent
-    # (requireConfig=optional means every repo would still be processed, just
-    # with no preset).
+    # Renovate reaches every repo through the inherited config in .github, so only
+    # that file is graded, HARD: without it every repo runs with no preset.
     if name == ".github":
         inherited = file_text(name, "org-inherited-config.json")
         if inherited is None:
@@ -1000,19 +991,16 @@ def collect(meta):
             s["renovate_preset"] = PRESET in inherited
     else:
         s["renovate_preset"] = None  # N/A — nothing per-repo to grade
+    if s["two_channel"]:
+        collect_renovate_config(name, branch, s)
     s["adopted"] = bool(s["ci_wired"]) or s["name"] in BESPOKE_CI
 
-    # Deploy-trigger webhook. Read repo hooks and collect every active one
-    # pointing at the orchestrator host, with the full config surface each
-    # carries (events, payload type, TLS verification, signing secret, last
-    # delivery). webhook_readable distinguishes "no matching hook" (readable,
-    # empty/other hooks) from "could not read hooks" (token lacks the classic
-    # 'repo'/hook scope) so the latter is a global skip, not per-repo false
-    # failures. Only meaningful when WEBHOOK_HOST is set.
+    # Every active hook pointing at the orchestrator, with the fields graded later;
+    # webhook_readable tells "no hook" from "hooks unreadable" (a global skip).
     s["webhook_readable"] = False
     s["webhooks"] = []
     if WEBHOOK_HOST:
-        hooks = gh_json("api", f"repos/{OWNER}/{name}/hooks")
+        hooks = gh_json(f"repos/{OWNER}/{name}/hooks")
         if hooks is API_ERROR:
             hooks = None
             s["errors"].append("webhooks unreadable (API)")
@@ -1033,6 +1021,281 @@ def collect(meta):
     return s
 
 
+GO_FIRST_PARTY = f"github.com/{OWNER}/"
+NPM_SCOPE = f"@{OWNER}/"
+NPM_DEPENDENCY_KEYS = (
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+)
+MANIFESTS = ("go.mod", "package.json")
+# Go skips testdata and directories starting with '.' or '_' when it walks a
+# module tree; vendor and node_modules hold other modules' manifests.
+SKIPPED_DIRS = ("vendor", "node_modules", "testdata")
+GO_MAJOR_SUFFIX = re.compile(r"v([2-9]|[1-9]\d+)")
+# One version or one caret, tilde or x-range: each pins a single major. A lower
+# bound alone admits every later major, so it never pins one behind.
+NPM_SINGLE_MAJOR = re.compile(r"[\^~=]?v?(\d+)(?:\.(?:\d+|[xX*])){0,2}(?:-[0-9A-Za-z.-]+)?")
+
+
+def manifest_paths(tree):
+    """The go.mod and package.json paths in a recursive tree listing that the
+    repository builds with."""
+    paths = []
+    for entry in tree:
+        *dirs, base = (entry.get("path") or "").split("/")
+        if entry.get("type") != "blob" or base not in MANIFESTS:
+            continue
+        if any(d in SKIPPED_DIRS or d.startswith((".", "_")) for d in dirs):
+            continue
+        paths.append("/".join([*dirs, base]))
+    return sorted(paths)
+
+
+def go_requirements(text):
+    """The module paths go.mod `text` requires, single-line and block forms,
+    minus those a replace directive points at a local directory."""
+    required, local, block = [], set(), None
+    for raw in text.splitlines():
+        line = raw.split("//", 1)[0].strip()
+        if not line:
+            continue
+        if block and line == ")":
+            block = None
+            continue
+        verb, rest = (block, line) if block else [*line.split(None, 1), ""][:2]
+        if rest == "(":
+            block = verb
+            continue
+        words = rest.split()
+        if verb == "require" and words:
+            required.append(words[0].strip('"'))
+        elif verb == "replace" and "=>" in words:
+            target = words[words.index("=>") + 1 :]
+            if target and target[0].strip('"').startswith(("./", "../", "/")):
+                local.add(words[0].strip('"'))
+    return [p for p in required if p not in local]
+
+
+def go_module_target(path):
+    """(repo, lane, major) a first-party module path names, major None below
+    v2, which carries no suffix; None for any other path."""
+    if not path.startswith(GO_FIRST_PARTY):
+        return None
+    repo, *rest = path[len(GO_FIRST_PARTY) :].split("/")
+    major = None
+    if rest and GO_MAJOR_SUFFIX.fullmatch(rest[-1]):
+        major = int(rest.pop()[1:])
+    return repo, "/".join(rest), major
+
+
+def npm_requirements(text):
+    """[(name, range)] of every first-party dependency in package.json
+    `text`; None when it is not a JSON object."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    found = []
+    for key in NPM_DEPENDENCY_KEYS:
+        deps = data.get(key)
+        for dep, spec in deps.items() if isinstance(deps, dict) else ():
+            if dep.startswith(NPM_SCOPE) and isinstance(spec, str) and (dep, spec) not in found:
+                found.append((dep, spec))
+    return found
+
+
+def npm_major(spec):
+    """The one major an npm range pins; None when it pins none, as a lower
+    bound alone, a compound range, an alias, a path or a URL do."""
+    m = NPM_SINGLE_MAJOR.fullmatch(spec.strip())
+    return int(m.group(1)) if m else None
+
+
+def latest_stable_majors(repo):
+    """{lane: latest stable major} from the repo's tag listing, the root lane
+    being ''; a string naming the failure when the listing is unusable."""
+    try:
+        tags = release_channels.collect_all_tags(tag_page_fetcher(repo, {}))
+    except release_channels.TagListingTruncatedError as err:
+        return f"tags of {repo} truncated ({err})"
+    if tags is None:
+        return f"tags of {repo} unreadable (API)"
+    return {
+        lane: release_channels.semver_key(stable[0].rsplit("/", 1)[-1])[0]
+        for lane, (stable, _dev) in release_channels.tags_by_lane(tags).items()
+        if stable
+    }
+
+
+class LatestMajors:
+    """latest_stable_majors per repo, read once per run however many
+    consumers, on however many threads, ask for it."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries = {}
+
+    def of(self, repo):
+        with self._lock:
+            entry = self._entries.setdefault(repo, {"lock": threading.Lock()})
+        with entry["lock"]:
+            if "value" not in entry:
+                entry["value"] = latest_stable_majors(repo)
+            return entry["value"]
+
+
+def manifest_tree(name, branch, s):
+    """The manifest paths on `branch`; [] for a repository without a commit;
+    None, with an error line, when the tree is unreadable or truncated."""
+    r, definitive = gh_retry(f"repos/{OWNER}/{name}/git/trees/{branch}?recursive=1")
+    if isinstance(r, ghrest.ApiError):
+        if definitive and r.status in (404, 409):
+            return []
+        s["errors"].append("file tree unreadable (API), so first-party majors not graded")
+        return None
+    try:
+        body = json.loads(r.body)
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or not isinstance(body.get("tree"), list):
+        s["errors"].append("file tree unreadable (API), so first-party majors not graded")
+        return None
+    if body.get("truncated"):
+        s["errors"].append("file tree truncated, so first-party majors not graded")
+        return None
+    return manifest_paths(body["tree"])
+
+
+def manifest_targets(path, text, s, repos):
+    """[(shown requirement, repo, lane, major)] of manifest `text` at `path`;
+    a requirement naming no repository of `repos` is an error line instead."""
+    targets = []
+    if path.rsplit("/", 1)[-1] == "go.mod":
+        for mod in go_requirements(text):
+            target = go_module_target(mod)
+            if target:
+                targets.append((mod, *target))
+    else:
+        deps = npm_requirements(text)
+        if deps is None:
+            s["errors"].append(f"{path} is not a JSON object, so its first-party majors not graded")
+            return []
+        for dep, spec in deps:
+            major = npm_major(spec)
+            if major is not None:
+                targets.append((f"{dep} {spec}", dep[len(NPM_SCOPE) :], "", major))
+    known = []
+    for target in targets:
+        if target[1] in repos:
+            known.append(target)
+        else:
+            s["errors"].append(f"{path}: requires {target[0]}, which names no {OWNER} repository")
+    return known
+
+
+def collect_first_party_majors(s, latest, repos):
+    """s["stale_majors"]: a warning line per first-party requirement on the
+    default branch whose major is below its module's latest stable one.
+    `latest` is the run's LatestMajors, `repos` every repository name the owner
+    has. A failed read is an error line and grades nothing it covers."""
+    s["stale_majors"] = []
+    paths = manifest_tree(s["name"], s["default_branch"], s)
+    root = s.get("root_manifests") or {}
+    for path in paths or []:
+        text = root.get(path)
+        if path in root and text is None:
+            continue  # collect() recorded the unreadable root file
+        if not text:
+            # file_text reads an undecodable body as '', so only a non-empty
+            # root read is reused.
+            text = present_file_text(s["name"], path)
+        if text is None or text is ABSENT:
+            s["errors"].append(f"{path} unreadable (API), so its first-party majors not graded")
+            continue
+        for shown, repo, lane, major in manifest_targets(path, text, s, repos):
+            majors = latest.of(repo)
+            if isinstance(majors, str):
+                s["errors"].append(f"{path}: {shown} not graded, because {majors}")
+                continue
+            newest = majors.get(lane)
+            # No suffix is a v0 or v1 path, current until a v2 exists.
+            required = 1 if major is None else major
+            if newest is not None and required < newest:
+                s["stale_majors"].append(f"{path}: requires {shown}, latest is v{newest}")
+
+
+IMMUTABLE_RELEASES_WARNING = (
+    "immutable releases are off (published release tags can still be moved or deleted)"
+)
+
+
+def collect_immutable_releases(s):
+    """s["immutable_releases"]: the setting of a repo that publishes Releases,
+    None when it publishes none or the read failed (an error line)."""
+    s["immutable_releases"] = None
+    if not s.get("publishes"):
+        return
+    body = gh_json_strict(f"repos/{OWNER}/{s['name']}/immutable-releases")
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    if isinstance(enabled, bool):
+        s["immutable_releases"] = enabled
+        return
+    # The docs give 404 for "disabled", yet the API answers 200 with
+    # enabled=false, and a 404 is also what a token without admin read gets:
+    # https://docs.github.com/rest/repos/repos#check-if-immutable-releases-are-enabled-for-a-repository
+    s["errors"].append("immutable-releases setting unreadable (API)")
+
+
+# GitHub's lookup order; the first file present is the only one it reads:
+# https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners#codeowners-file-location
+CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
+
+
+def wildcard_owners(text):
+    """The owners of a CODEOWNERS file's last `*` rule; [] when it has none.
+    The last matching rule wins, so a later `*` line replaces an earlier one."""
+    owners = []
+    for line in text.splitlines():
+        words = line.split("#", 1)[0].split()
+        if words and words[0] == "*":
+            owners = words[1:]
+    return owners
+
+
+def collect_codeowners(s):
+    """s["codeowners_wildcard"]: the path of the CODEOWNERS file GitHub uses
+    when its last `*` rule names the owner, else None. An unreadable file is an
+    error line, and an empty one ends the lookup: a later location cannot stand
+    in for either."""
+    s["codeowners_wildcard"] = None
+    for path in CODEOWNERS_PATHS:
+        text = present_file_text(s["name"], path)
+        if text is ABSENT:
+            continue
+        if text is None:
+            s["errors"].append(f"{path} unreadable (API)")
+        elif f"@{OWNER}" in (o.lower() for o in wildcard_owners(text)):
+            s["codeowners_wildcard"] = path
+        return
+
+
+def codeowners_warning(path):
+    return (
+        f"{path}: '*' requests review from @{OWNER} on every pull request, "
+        "bot-authored ones included"
+    )
+
+
+STABLE_ONLY_WARNING = (
+    "default branch is main, so every merge releases straight to the stable channel "
+    "(adopt the dev channel, or list the repo in SINGLE_MAIN_REPOS)"
+)
+
+
 def compliance(s):
     """Return (hard_failures, warnings, accepted) for one repo's settings dict.
 
@@ -1045,28 +1308,28 @@ def compliance(s):
     if s.get("fatal"):
         return hard, warn, []
 
-    for k, exp in GOV_HARD.items():
+    two_channel = bool(s.get("two_channel"))
+    gov_hard, gov_soft = merge_model(two_channel)
+    for k, exp in gov_hard.items():
         if s.get(k) != exp:
             hard.append(f"{k}={s.get(k)} (want {exp})")
-    for k, exp in GOV_SOFT.items():
+    for k, exp in gov_soft.items():
         if s.get(k) != exp:
             warn.append(f"{k}={s.get(k)} (want {exp})")
 
-    two_channel = bool(s.get("two_channel"))
-    if two_channel and s["name"] in release_channels.SINGLE_MAIN_REPOS:
+    if s["default_branch"] == "dev" and s["name"] in release_channels.SINGLE_MAIN_REPOS:
         hard.append(f"default_branch=dev on a single-main repo (want main; {s['name']} publishes from main directly)")
+    elif s["default_branch"] == "dev" and s["private"]:
+        hard.append("default_branch=dev on a private repo (want main, because the two-branch model enrols public repos only)")
     elif s["default_branch"] not in ("main", "dev"):
         hard.append(f"default_branch={s['default_branch']} (want dev, or main until the repo adopts the dev channel)")
     # A bootstrap run sits on main for minutes and a forgotten repo sits there
     # forever; the two look identical, so this names the repo instead of failing.
     if (s["default_branch"] == "main" and not s["private"] and s.get("publishes")
             and s["name"] not in release_channels.SINGLE_MAIN_REPOS):
-        warn.append("default branch is main, so every merge releases straight to the stable channel "
-                    "(adopt the dev channel, or list the repo in SINGLE_MAIN_REPOS)")
+        warn.append(STABLE_ONLY_WARNING)
 
-    # License: public repos only — a private personal repo has no audience
-    # that needs a license grant. The expected license is per-category, not
-    # org-wide: see LICENSE_OVERRIDES above.
+    # Public repos only; the expected license is per repo (LICENSE_OVERRIDES).
     if not s["private"]:
         want = LICENSE_OVERRIDES.get(s["name"], LICENSE_DEFAULT)
         if s["license"] is None:
@@ -1077,11 +1340,15 @@ def compliance(s):
     for dest in s.get("synced_drift") or []:
         warn.append(f"{dest} differs from its canonical in cplieger/ci "
                     "(synced file, edit the canonical — the next sync overwrites this copy)")
+    warn += s.get("stale_majors") or []
+    if s.get("immutable_releases") is False:
+        warn.append(IMMUTABLE_RELEASES_WARNING)
+    if s.get("codeowners_wildcard"):
+        warn.append(codeowners_warning(s["codeowners_wildcard"]))
 
     if two_channel:
-        # Rulesets replace classic protection here: a classic rule on either
-        # branch is not the standard, and one on main would block the fast-forward
-        # promotion the main ruleset's bypass exists to allow.
+        # Rulesets replace classic protection; a classic rule on main would also
+        # block the promotion's fast-forward through the main ruleset's bypass.
         if s["has_protection"]:
             hard.append("classic branch protection on dev (two-channel repos use the dev ruleset)")
         if s.get("main_protection"):
@@ -1111,35 +1378,31 @@ def compliance(s):
         for tag in s.get("dev_tags_without_receipt") or []:
             hard.append(f"dev tag {tag} carries no release/tag receipt on its commit (a hand-made "
                         "dev tag skews the -dev.N counter and the change anchor; delete it)")
+        for tag in s.get("stable_tags_without_receipt") or []:
+            hard.append(f"stable tag {tag} carries no {release_channels.completion_receipt_context(tag)} "
+                        "receipt on its commit, because its Release or registry readback did not finish. "
+                        "The next stable release run repairs it first, or rerun this one")
+        if s.get("renovate_json") is not None:
+            hard += renovate_config_findings(s["renovate_json"], s["default_branch"])
     elif s["has_protection"] is False:
         hard.append("no branch protection on default branch")
     elif s["has_protection"]:
-        # App repos surface 'ci / validate' (the cplieger/ci meta job); repos
-        # with a local CI surface a bare 'validate'. Accept either.
+        # 'ci / validate' from the meta workflow, or a bespoke CI's bare 'validate'.
         validate_ctxs = [c for c in (s["required_checks"] or []) if "validate" in (c or "")]
         if not validate_ctxs:
             hard.append(f"required checks={s['required_checks']} (want a 'validate' check)")
-        # The validate gate must be pinned to the GitHub Actions app. An
-        # app_id of -1 (or another app) lets any integration report a
-        # 'validate' check and satisfy the merge requirement.
+        # An unpinned app (-1) or another app could satisfy the gate.
         for ctx in validate_ctxs:
             app = (s.get("required_check_apps") or {}).get(ctx)
             if app != ACTIONS_APP_ID:
                 warn.append(f"required check '{ctx}' pinned to app_id={app} "
                             f"(want {ACTIONS_APP_ID} = GitHub Actions)")
-        # The standard is exactly the validate gate. Any other required check
-        # is drift worth eyeballing — a typo'd or abandoned context is one
-        # workflow rename away from the phantom class below. Deliberate extras
-        # live in ACCEPTED.
+        # The standard is the validate gate alone; deliberate extras go in ACCEPTED.
         for ctx in s["required_checks"] or []:
             if ctx not in validate_ctxs:
                 warn.append(f"unexpected extra required check '{ctx}' "
                             "(standard is the validate gate alone)")
-        # A required context that no recent commit ever reported is a phantom:
-        # protection waits on it forever ("Expected"), blocking every PR while
-        # all real checks are green. Judged only on complete data — when the
-        # check-run reads failed, collect() already recorded an [error] and the
-        # check is skipped here.
+        # A phantom context (see collect()), judged on complete reads only.
         if s.get("observed_complete"):
             observed = set(s.get("observed_checks") or [])
             for ctx in s["required_checks"] or []:
@@ -1156,10 +1419,8 @@ def compliance(s):
             warn.append("allow_force_pushes=on (want off)")
         if s["allow_deletions"]:
             warn.append("allow_deletions=on (want off)")
-        # Review requirements: a single-maintainer account can never
-        # self-approve, so an approving-review floor > 0 blocks every PR
-        # (auto-merge included) — breakage, not drift. The toggle with
-        # count=0 gates nothing but still deviates from the standard.
+        # No one can self-approve, so a review floor blocks every PR; the toggle at
+        # count 0 gates nothing but is still drift.
         if s.get("required_review_count"):
             hard.append(f"required approving reviews="
                         f"{s['required_review_count']} — a single-maintainer "
@@ -1180,14 +1441,10 @@ def compliance(s):
         if s.get("lock_branch"):
             hard.append("branch locked (read-only — nothing can merge; want unlocked)")
 
-    # Rulesets. On a single-main repo classic protection is the standard, so
-    # any custom ruleset is drift (warn); on a two-channel repo the dev and
-    # main rulesets are the standard (compared above) and only other names
-    # are drift. A bypass actor weakens whatever ruleset carries it (warn),
-    # except the RepositoryRole bypass the committed main body requires. An
-    # Integration bypass actor is a HARD failure everywhere: the stale-app rot
-    # class (a decommissioned GitHub App left able to bypass protection, which
-    # the GitHub API also refuses to rewrite on a user-owned repo).
+    # Rulesets: drift on a single-main repo, and on a two-channel repo any but
+    # the two compared above. A bypass actor warns unless the committed body
+    # lists it; an Integration bypass is HARD everywhere (a stale app the API
+    # cannot remove from a user-owned repo).
     expected_names = set(CHANNEL_RULESETS) if two_channel else set()
     for rs in s.get("custom_rulesets") or []:
         if rs["name"] in expected_names:
@@ -1195,11 +1452,12 @@ def compliance(s):
         standard = "the dev and main rulesets" if two_channel else "classic branch protection"
         warn.append(f"unexpected custom ruleset '{rs['name']}' ({rs['enforcement']}) "
                     f"(standard is {standard})")
-    for rname, atype, aid in s.get("ruleset_bypass_actors") or []:
+    for rname, atype, aid, mode in s.get("ruleset_bypass_actors") or []:
         if atype == "Integration":
             hard.append(f"ruleset '{rname}' has an Integration bypass actor (id {aid}) "
                         "— likely a stale/decommissioned app; remove it")
-        elif two_channel and rname == "main" and atype == "RepositoryRole":
+        elif (two_channel and rname in CHANNEL_RULESETS
+              and (atype, aid, mode) in _bypass_actor_set(expected_ruleset(rname))):
             continue
         else:
             warn.append(f"ruleset '{rname}' has a bypass actor ({atype} id {aid})")
@@ -1215,10 +1473,8 @@ def compliance(s):
         warn.append("stray .github/dependabot.yml enables Dependabot version "
                     "PRs (want absent; Renovate owns deps)")
 
-    # Actions token defaults. The workflows declare explicit `permissions:`
-    # blocks, so the read default is defense-in-depth for anything repo-local;
-    # PR-approval ability is a hard no — with auto-merge on, a workflow that
-    # can approve PRs can land its own code.
+    # The read default is defense in depth behind explicit `permissions:` blocks;
+    # with auto-merge on, a token that approves PRs lands its own code.
     if s.get("default_workflow_permissions") not in (None, "read"):
         warn.append(f"default workflow permissions="
                     f"{s['default_workflow_permissions']} (want read)")
@@ -1226,39 +1482,33 @@ def compliance(s):
         hard.append("workflows can approve PRs (want off — with auto-merge "
                     "enabled this lets a workflow land its own code)")
 
-    # Secret scanning / push protection: free on public repos; needs GHAS on
-    # private (N/A on the free plan), so only enforced on public repos.
+    # Free on public repos, GHAS on private ones.
     if not s["private"]:
         if s["secret_scanning"] != "enabled":  # noqa: S105 — API state, not a password
             warn.append("secret scanning off (want on)")
         if s["secret_scanning_push_protection"] != "enabled":  # noqa: S105 — API state
             warn.append("secret scanning push protection off (want on)")
 
-    # Scanning workflows arrive via sync for adopted repos; CodeQL is a
-    # public-only feature (it needs GHAS on private repos), so it is N/A there.
+    # Synced to adopted repos; CodeQL is public-only without GHAS.
     if s["adopted"] and not s["infra"] and not s["private"]:
         if s["has_codeql"] is False:
             warn.append("codeql.yml missing")
         if s["has_security_scan"] is False:
             warn.append("security.yml missing")
-    # Docker Hub dual-publish secrets: None = N/A (no root Dockerfile, a
-    # GHCR-only repo, or the read failed and was recorded as an [error]).
+    # None: no root Dockerfile, or the read failed (already an [error]).
     if s.get("dockerhub_secrets") is False:
         hard.append("DOCKERHUB_USERNAME/DOCKERHUB_TOKEN secrets missing "
                     "(dual-publish image repo — the next release fails at "
                     "the Docker Hub login)")
 
-    # ci_wired is None when the contents read failed (already an [error]);
-    # only a DEFINITIVE "file exists without the reusable ref / file absent"
-    # is a hard failure. Bespoke-CI repos are exempt by design (see BESPOKE_CI).
+    # ci_wired None is an unread file (already an [error]); BESPOKE_CI is exempt.
     if not s["infra"] and s["name"] not in BESPOKE_CI and s["adopted"] and s["ci_wired"] is False:
         hard.append("CI not wired to cplieger/ci")
     if s["renovate_preset"] is False:
         hard.append("org-inherited-config.json does not extend the preset "
                     "(this file is what delivers Renovate to every repo)")
 
-    # Description + topics: public repos only — discovery metadata has no
-    # audience on a private repo. The house standard is 2-4 topics.
+    # Public repos only; the house standard is 2-4 topics.
     if not s["private"]:
         if not s["desc_present"]:
             warn.append("description empty")
@@ -1266,15 +1516,9 @@ def compliance(s):
             warn.append(f"description {s['desc_len']} chars (>100; Docker Hub short-desc limit)")
         if len(s["topics"]) < 2:
             warn.append(f"{len(s['topics'])} topics (want at least 2)")
-        # Used-by counter package: pinned per repo and never follows a
-        # library's /vN module-path bump or a module rename, so the sidebar
-        # keeps counting the stale package after every major. Only judged when
-        # the dependents page definitively named a package (used_by_package
-        # set) AND the expected package is actually in the switcher menu —
-        # warning about a package the dropdown cannot select is unactionable
-        # noise. An unreadable page is silently skipped — a scrape wobble must
-        # never manufacture drift, and this cosmetic check is not worth an
-        # [error]-tier red run. Image repos carry no expected package.
+        # The counter never follows a /vN bump or a rename. Judged only when the
+        # page named a package and the expected one is selectable (a new /vN path
+        # is often never indexed); an unreadable page is skipped.
         exp = (s.get("expected_package") or "").lstrip("@")
         selectable = {p.lstrip("@") for p in s.get("used_by_selectable") or []}
         if (s.get("used_by_package") and exp
@@ -1283,10 +1527,8 @@ def compliance(s):
             warn.append(f"used-by counter shows '{s['used_by_package']}' "
                         f"(want '{s['expected_package']}'; no API — fix by "
                         "hand: Settings -> Advanced Security -> Used by counter)")
-        # Module-path standard: a Go module lives at
-        # github.com/<owner>/<repo>; a library adds /vN once majors move, an
-        # image app never does. Anything else is unfetchable by Go tooling
-        # (module path must match the repo URL) and indexes a phantom
+        # Module path: github.com/<owner>/<repo>, plus /vN for a library (never for an
+        # image app), else Go tooling cannot fetch it and it indexes a phantom
         # dependency-graph package.
         if s.get("go_module"):
             want = f"github.com/{OWNER}/{s['name']}"
@@ -1308,14 +1550,9 @@ def compliance(s):
                             "tooling and indexes a phantom dependency-graph "
                             "package)")
 
-    # Public docs standard. Presence is hard (a public repo
-    # without a README is broken for its audience). The footer blocks and
-    # License-last order are warnings: real drift, but aligned by hand
-    # rather than blocking the audit. The image-repo marker
-    # check is hard because a release cannot build the Docker Hub overview page
-    # without it, so the live Hub page silently stops being updated.
-    # readme_text None means the read failed (already an [error]); '' means
-    # definitively absent.
+    # README presence and the Hub markers are HARD (without the markers the Hub
+    # page stops updating); the footer and License-last are warnings.
+    # readme_text None is an unread file; '' is absent.
     if not s["private"] and s.get("readme_text") is not None:
         txt = s["readme_text"]
         if not txt.strip():
@@ -1344,12 +1581,8 @@ def compliance(s):
             warn.append("compose.yaml example missing. Every image repo "
                         "ships a reference compose file")
 
-    # Deploy-trigger webhook, graded only when the host is configured and this
-    # repo's hooks were readable (an unreadable token is a global skip in main).
-    # Each defect here is silent and deploy-breaking: a missing hook, a hook
-    # without the HMAC secret the orchestrator validates, or one subscribed to
-    # the wrong event never fires. NO_DEPLOY_HOOK repos have no orchestrator
-    # relationship, so nothing in this block applies to them.
+    # Each hook defect here is silent and stops deploys; NO_DEPLOY_HOOK repos have
+    # no orchestrator, and an unreadable token is a global skip in main().
     if WEBHOOK_HOST and s["webhook_readable"] and s["name"] not in NO_DEPLOY_HOOK:
         hooks = s.get("webhooks") or []
         if s["name"] in PUSH_WEBHOOK_REPOS:
@@ -1396,8 +1629,7 @@ def compliance(s):
                 warn.append(f"deploy-trigger webhook last delivery failed "
                             f"(HTTP {h['bad_delivery']})")
 
-    # Filter known-accepted deviations (warnings only — a HARD failure is
-    # never silently acceptable) so the steady-state report is clean.
+    # Only warnings can be accepted.
     rules = ACCEPTED.get(s["name"], {})
     kept, accepted = [], []
     for w in warn:
@@ -1409,25 +1641,231 @@ def compliance(s):
     return hard, kept, accepted
 
 
+# Warnings about one owner-level decision: printed for every repo but filed only
+# once some repo has adopted it, since filing earlier opens one issue per repo
+# for a single decision. Each predicate reads every discovered repo's meta and
+# every graded repo's settings, the same set on the full run that files.
+FILED_AFTER_ADOPTION = {
+    STABLE_ONLY_WARNING: lambda metas, _settings: any(
+        m.get("default_branch") == "dev" for m in metas
+    ),
+    IMMUTABLE_RELEASES_WARNING: lambda _metas, settings: any(
+        s.get("immutable_releases") is True for s in settings
+    ),
+}
+# A repo younger than this is graded and printed, but nothing is filed or
+# closed for it while it is still being set up.
+GRACE = timedelta(hours=24)
+ISSUE_LABEL = "repo-audit"
+ISSUE_TITLE = "Repository audit findings"
+
+
+def in_grace(created_at, now):
+    """True when the repo was created less than GRACE before `now`; None when
+    `created_at` is not a zoned ISO timestamp."""
+    if not isinstance(created_at, str):
+        return None
+    try:
+        created = datetime.fromisoformat(created_at)
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        return None
+    return now - created < GRACE
+
+
+def fenced(lines):
+    """`lines` inside a code fence longer than any backtick run they hold, so a
+    finding renders literally (an HTML comment in one would otherwise vanish)."""
+    longest = max((len(run) for line in lines for run in re.findall(r"`+", line)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return [fence + "text", *lines, fence]
+
+
+def run_url():
+    parts = [
+        os.environ.get(k, "") for k in ("GITHUB_SERVER_URL", "GITHUB_REPOSITORY", "GITHUB_RUN_ID")
+    ]
+    return "{}/{}/actions/runs/{}".format(*parts) if all(parts) else "a local run"
+
+
+ISSUE_INTRO = (
+    "Findings of the governance audit in cplieger/ci. This issue is updated on "
+    "each scheduled run and closed when the repository audits clean."
+)
+
+
+def issue_body(hard, warn, run):
+    lines = [ISSUE_INTRO, ""]
+    if hard:
+        lines += ["## HARD findings", "", *fenced([f"[HARD] {h}" for h in hard]), ""]
+    if warn:
+        lines += ["## Warnings", "", *fenced([f"[warn] {w}" for w in warn]), ""]
+    return "\n".join([*lines, f"Run: {run}", ""])
+
+
+def write_issue(name, mode, text):
+    """tracker_issue's exit code for one repo's `mode` (upsert or
+    close-when-clean) with `text` as the body or the closing comment."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "text.md"
+        path.write_text(text, encoding="utf-8")
+        flag = "--body-file" if mode == "upsert" else "--comment-file"
+        argv = [
+            *("--repo", f"{OWNER}/{name}", "--label", ISSUE_LABEL, "--title", ISSUE_TITLE),
+            *("--mode", mode, flag, str(path)),
+        ]
+        try:
+            return tracker_issue.main(argv, allow_reserved=True)
+        except Exception as err:  # one repo's failure must not stop the others
+            print(f"::error::{name}: {err}", file=sys.stderr)
+            return 1
+
+
+def load_findings(path):
+    """The findings dict --findings-out wrote; None, with the reason on stderr,
+    when it is unreadable or from a scoped run."""
+    try:
+        findings = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as err:
+        sys.stderr.write(f"error: findings file unreadable: {err}\n")
+        return None
+    except ValueError as err:
+        sys.stderr.write(f"error: findings file is not JSON: {err}\n")
+        return None
+    if not isinstance(findings, dict) or not isinstance(findings.get("repos"), list):
+        sys.stderr.write("error: findings file has no repos list\n")
+        return None
+    # A scoped run's file names only some repos, and the bootstrap gate's
+    # --repo run must never file.
+    if findings.get("scope") is not None or findings.get("visibility") != "all":
+        sys.stderr.write(
+            "error: the findings come from a scoped run (--repo or --visibility). "
+            "Only a full run files issues.\n"
+        )
+        return None
+    return findings
+
+
+def file_issues(path, dry_run):
+    """Open, update or close each graded repo's audit issue from a findings
+    file. Exit code: 0 done, 1 some repo failed to file, 2 unusable file."""
+    findings = load_findings(path)
+    if findings is None:
+        return 2
+    adoption = findings.get("adoption") or {}
+    held = {msg for msg in FILED_AFTER_ADOPTION if adoption.get(msg) is not True}
+    run = run_url()
+    counts = {
+        "upsert": 0,
+        "close-when-clean": 0,
+        "grace": 0,
+        "errors": 0,
+        "disabled": 0,
+        "private": 0,
+    }
+    failed = []
+    for row in findings["repos"]:
+        name = row["name"]
+        # Public repos only: the filing token is not known to write issues on
+        # private ones.
+        if row.get("visibility") != "public":
+            counts["private"] += 1
+            print(f"::notice::{name}: not public, so its findings stay in the run summary")
+            continue
+        if row.get("in_grace") is not False:
+            counts["grace"] += 1
+            print(f"{name}: skipped, created less than {GRACE // timedelta(hours=1)}h ago")
+            continue
+        # A partial read never opens, edits or closes an issue.
+        if row.get("errors") is not False:
+            counts["errors"] += 1
+            print(f"{name}: skipped, this run's read hit API errors (its issue is left as it is)")
+            continue
+        hard = row.get("hard") or []
+        warn = [w for w in row.get("warnings") or [] if w not in held]
+        mode = "upsert" if hard or warn else "close-when-clean"
+        counts[mode] += 1
+        if not row.get("has_issues"):
+            counts["disabled"] += 1
+        if dry_run:
+            note = "" if row.get("has_issues") else " (issues disabled, so the tracker skips it)"
+            print(f"{name}: would {mode} ({len(hard)} HARD, {len(warn)} warnings){note}")
+            continue
+        text = (
+            issue_body(hard, warn, run)
+            if mode == "upsert"
+            else f"The governance audit found nothing to report in {run}.\n"
+        )
+        if write_issue(name, mode, text) != 0:
+            failed.append(name)
+    print(
+        f"{'dry run: ' if dry_run else ''}{counts['upsert']} upsert · "
+        f"{counts['close-when-clean']} close-when-clean · {counts['grace']} in grace · "
+        f"{counts['errors']} skipped on API errors · {counts['disabled']} with issues disabled"
+        f" · {counts['private']} not public · {len(failed)} failed"
+    )
+    if failed:
+        sys.stderr.write(f"error: filing failed for {', '.join(failed)}\n")
+        return 1
+    return 0
+
+
+# The listing fields a repo's meta carries into collect() and the summary.
+DISCOVERED = (
+    "name",
+    "archived",
+    "fork",
+    "visibility",
+    "default_branch",
+    "created_at",
+    "has_issues",
+)
+
+
 def main():
     ap = argparse.ArgumentParser(description="cplieger governance audit")
     ap.add_argument("--visibility", choices=["all", "public", "private"], default="all")
     ap.add_argument("--repo", action="append", metavar="NAME",
                     help="audit only this repo. Pass it more than once for several repos")
     ap.add_argument("--dump", metavar="PATH", help="write raw collected settings as JSON")
+    ap.add_argument(
+        "--findings-out",
+        metavar="PATH",
+        help="write each graded repo's findings as JSON, for --file-issues",
+    )
+    ap.add_argument(
+        "--file-issues",
+        metavar="PATH",
+        help="open, update or close each repo's audit issue from a full run's "
+        "--findings-out file, then exit (needs a token that writes issues)",
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --file-issues: print each repo's planned action, write nothing",
+    )
     args = ap.parse_args()
+    if args.file_issues:
+        if args.repo or args.dump or args.findings_out or args.visibility != "all":
+            ap.error("--file-issues reads its findings file and takes no audit option")
+        sys.exit(file_issues(args.file_issues, args.dry_run))
+    if args.dry_run:
+        ap.error("--dry-run applies to --file-issues only")
 
-    r, definitive = gh_retry("repo", "list", OWNER, "--limit", "300",
-                             "--json", "name,isArchived,visibility,isFork")
-    if r.returncode != 0 or not definitive:
-        sys.stderr.write(f"gh repo list failed: {r.stderr}\n")
+    try:
+        all_metas = REST.pages("user/repos?affiliation=owner")
+    except ghrest.ApiError as err:
+        sys.stderr.write(f"repo listing failed: {err}\n")
         sys.exit(2)
-    all_metas = json.loads(r.stdout)
-    # Forks exist to carry upstream PRs: they keep upstream's merge model,
-    # branch protection, and go.mod module path, so the governance standard
-    # does not apply. Skipped with a visible note, never audited.
-    forks = sorted(m["name"] for m in all_metas if m.get("isFork") and not m["isArchived"])
-    metas = [m for m in all_metas if not m["isArchived"] and not m.get("isFork")]
+    # Forks keep upstream's governance, so they are listed and skipped.
+    forks = sorted(m["name"] for m in all_metas if m.get("fork") and not m["archived"])
+    metas = [
+        {k: m.get(k) for k in DISCOVERED}
+        for m in all_metas
+        if not m["archived"] and not m.get("fork")
+    ]
+    discovered = metas
     if args.visibility != "all":
         metas = [m for m in metas if (m.get("visibility") or "").lower() == args.visibility]
     if args.repo:
@@ -1440,17 +1878,28 @@ def main():
             sys.exit(2)
         metas = [m for m in metas if m["name"] in want]
     metas.sort(key=lambda m: m["name"])
+    latest = LatestMajors()
+    owned = {m["name"] for m in all_metas}
+
+    def audit_repo(meta):
+        s = collect(meta)
+        if not s.get("fatal"):
+            collect_first_party_majors(s, latest, owned)
+            collect_immutable_releases(s)
+            collect_codeowners(s)
+        return s
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        settings = list(pool.map(collect, metas))
+        settings = list(pool.map(audit_repo, metas))
+    adoption = {
+        msg: bool(adopted(discovered, settings)) for msg, adopted in FILED_AFTER_ADOPTION.items()
+    }
 
     if args.dump:
         with open(args.dump, "w", encoding="utf-8") as fh:
             json.dump(settings, fh, indent=2, sort_keys=True)
 
-    # Total-outage guard: if not a single repo object could be read, this is
-    # network/API trouble, not a token problem — bail before the under-scope
-    # guard below misdiagnoses it.
+    # No repo readable at all is an outage, not an under-scoped token.
     if settings and all(s.get("fatal") for s in settings):
         sys.stderr.write(
             "ERROR: no repo could be read at all (API outage or network "
@@ -1458,11 +1907,8 @@ def main():
         )
         sys.exit(2)
 
-    # Permission guard: the merge-model, branch-protection, and security checks
-    # need a token with admin read across the cplieger repos. If NO repo returned
-    # admin-scoped fields, the token is under-scoped (e.g. the default
-    # GITHUB_TOKEN instead of AUDIT_PAT) — abort rather than flag every repo as
-    # non-compliant, which would be a false-negative storm masking real drift.
+    # No repo exposing the merge-model fields means an under-scoped token: abort
+    # rather than flag every repo.
     if settings and not any(s["admin_visible"] for s in settings):
         sys.stderr.write(
             "ERROR: no repo returned the merge-model fields (allow_merge_commit "
@@ -1484,10 +1930,8 @@ def main():
           "read failed (check skipped) · GHAS scanning N/A on free private "
           "repos · accepted deviations suppressed (see ACCEPTED)\n")
 
-    # Deploy-trigger webhook check status. When the host is configured but no
-    # repo's hooks were readable, the token is under-scoped for the hook endpoint
-    # (needs classic 'repo' or admin:repo_hook) — surface it instead of silently
-    # skipping. When the host is unset, the check does not run at all.
+    # A set host with no readable hooks anywhere is an under-scoped token (it
+    # needs the classic 'repo' scope or admin:repo_hook).
     if forks:
         print(f"Note: {len(forks)} fork(s) skipped (upstream governance applies): "
               f"{', '.join(forks)}\n")
@@ -1497,9 +1941,7 @@ def main():
         print("WARNING: AUDIT_WEBHOOK_HOST is set but no repo's webhooks were "
               "readable; the deploy-trigger webhook check was skipped. The audit "
               "token needs the classic 'repo' scope (or admin:repo_hook).\n")
-    # Used-by counter check status: when EVERY attempted dependents-page read
-    # failed, github.com HTML is unreachable from this network (throttled or
-    # blocked) — say so once instead of silently skipping every repo.
+    # Every dependents page unreadable means github.com HTML is unreachable here.
     attempted = [s for s in settings if s.get("used_by_attempted")]
     if attempted and not any(s["used_by_readable"] for s in attempted):
         print("Note: used-by counter check skipped (github.com dependents "
@@ -1509,9 +1951,25 @@ def main():
         print(f"Note: version tags not graded on {len(deferred)} repo(s) with a workflow "
               f"run live or ended within {RECEIPT_GRACE // timedelta(hours=1)}h: "
               f"{', '.join(deferred)}\n")
-    for s in settings:
+    now = datetime.now(UTC)
+    rows = []
+    for meta, s in zip(metas, settings, strict=True):
         hard, warn, accepted = compliance(s)
+        grace = in_grace(meta.get("created_at"), now)
+        if grace is None:
+            s.setdefault("errors", []).append("creation time unreadable (listing), so nothing filed")
         errors = s.get("errors") or []
+        rows.append(
+            {
+                "name": s["name"],
+                "visibility": meta.get("visibility"),
+                "has_issues": meta.get("has_issues"),
+                "in_grace": bool(grace),
+                "errors": bool(errors),
+                "hard": hard,
+                "warnings": warn,
+            }
+        )
         accepted_total += len(accepted)
         tag = "infra" if s["infra"] else ("priv" if s["private"] else "pub")
         if not hard and not warn and not errors:
@@ -1533,13 +1991,22 @@ def main():
     print(f"{clean} clean · {hard_total} hard failures · {warn_total} warnings"
           f" · {accepted_total} accepted deviations · {error_total} API errors"
           f" · {grace_total} version tags younger than {RECEIPT_GRACE // timedelta(hours=1)}h"
-          " not graded")
+          " not graded"
+          f" · {sum(r['in_grace'] for r in rows)} repos in grace"
+          f" (created < {GRACE // timedelta(hours=1)}h, nothing filed)")
+    if args.findings_out:
+        findings = {
+            "scope": sorted(set(args.repo)) if args.repo else None,
+            "visibility": args.visibility,
+            "adoption": adoption,
+            "repos": rows,
+        }
+        with open(args.findings_out, "w", encoding="utf-8") as fh:
+            json.dump(findings, fh, indent=2, sort_keys=True)
     if hard_total:
         sys.exit(1)
     if error_total:
-        # No compliance failures, but the audit could not fully verify some
-        # checks — infra trouble, not drift. Distinct exit code so the weekly
-        # run goes red for the right reason.
+        # Exit 2: some checks could not be verified, which is infra, not drift.
         sys.exit(2)
 
 

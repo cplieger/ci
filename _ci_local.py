@@ -229,10 +229,8 @@ def _first_cmd_line(cmd):
 # ---------------------------------------------------------------------------
 # Tool-version drift preflight
 # ---------------------------------------------------------------------------
-# Every `Install *` step is SKIPped by name, so the PATH binary runs, not
-# the version CI pins — a silent behaviour gap (measured 2026-08-17: ruff,
-# govulncheck and deadcode ran clean locally against a pin gating in CI).
-# Drift is a property of the WORKSTATION, so it only reports, never fails.
+# Every `Install *` step is SKIPped, so the PATH binary runs instead of the pin.
+# Drift is the workstation's, so this only reports, never fails.
 
 
 class ToolVersion(NamedTuple):
@@ -258,17 +256,20 @@ _PIN_BINARY = {
     'mvdan/sh': 'shfmt',
     'hadolint/hadolint': 'hadolint',
     'aquasecurity/trivy': 'trivy',
-    # `go install <pkg>@<ver>` lines in go-ci.yaml.
+    '@cplieger/deadset-ts': 'deadset-ts',
+    # `go install <pkg>@<ver>` lines in go-ci.yaml and ts-ci.yaml.
     'golang.org/x/vuln/cmd/govulncheck': 'govulncheck',
-    'golang.org/x/tools/cmd/deadcode': 'deadcode',
-    'github.com/bep/punused': 'punused',
-    'golang.org/x/tools/gopls': 'gopls',
+    'github.com/cplieger/deadset/cmd/deadset': 'deadset',
+    'github.com/cplieger/deadset-go/cmd/deadset-go': 'deadset-go',
 }
 
-# Go binaries built by `go install`: several (deadcode, gopls) reject
-# `--version`, and the module version is not in their output anyway. Read it out
-# of the build metadata the toolchain stamps into the binary instead.
-_GO_INSTALLED = {'govulncheck', 'deadcode', 'punused', 'gopls'}
+# Go binaries built by `go install`: deadset and deadset-go reject `--version`,
+# and the module version is not in govulncheck's output. Read it out of the
+# build metadata the toolchain stamps into the binary instead.
+_GO_INSTALLED = {'govulncheck', 'deadset', 'deadset-go'}
+
+# Tools that print their version under a verb rather than `--version`.
+_VERSION_ARGV = {'deadset-ts': ['version']}
 
 # `# renovate: ... depName=X` on one line, then a `[<PREFIX>_]VERSION=<value>`
 # assignment within the next few lines (they are separated by comments in
@@ -280,7 +281,7 @@ _RENOVATE_PIN_RE = re.compile(
     re.MULTILINE,
 )
 _GO_INSTALL_RE = re.compile(r'go\s+install\s+"?(?P<pkg>[^\s"@]+)@(?P<ver>[^\s"]+)"?')
-# Plain `NAME=value` shell assignments, so a `go install pkg@${XTOOLS_VERSION}`
+# Plain `NAME=value` shell assignments, so a `go install pkg@${DEADSET_VERSION}`
 # line resolves to the version the sibling assignment sets.
 _SHELL_ASSIGN_RE = re.compile(r'^[^\S\n]*(?P<name>[A-Za-z_]\w*)=(?P<value>[^\s#]+)', re.MULTILINE)
 _SHELL_VAR_RE = re.compile(r'^\$\{?(?P<name>[A-Za-z_]\w*)\}?$')
@@ -318,7 +319,7 @@ def _local_tool_version(tool):
             # `go version -m <bin>` prints a `mod <path> <version> <hash>` line.
             argv, pattern = ['go', 'version', '-m', path], r'^\s+mod\s+\S+\s+(\S+)'
         else:
-            argv, pattern = [tool, '--version'], None
+            argv, pattern = [tool, *_VERSION_ARGV.get(tool, ['--version'])], None
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
             out = (proc.stdout or '') + (proc.stderr or '')
@@ -371,8 +372,8 @@ def collect_pinned_versions(step_bodies, env_blocks=()):
     for body in step_bodies:
         if not body:
             continue
-        # go-ci.yaml writes the pin as `XTOOLS_VERSION=v0.49.0` and then
-        # `go install ...@${XTOOLS_VERSION}`, so the install line alone carries
+        # go-ci.yaml writes the pin as `DEADSET_VERSION=v1.10.0` and then
+        # `go install ...@${DEADSET_VERSION}`, so the install line alone carries
         # no version. Resolve one step of indirection against the same body.
         assignments = {
             m.group('name'): m.group('value') for m in _SHELL_ASSIGN_RE.finditer(body)
@@ -392,9 +393,9 @@ def collect_pinned_versions(step_bodies, env_blocks=()):
             tool = _PIN_BINARY.get(pkg)
             version = _normalize_version(resolve(match.group('ver')))
             if tool and version:
-                # A go-install pin is more specific than a depName pin covering
-                # the same module (x/tools ships both deadcode and gopls), so it
-                # overwrites rather than setdefault's.
+                # A go-install pin names the binary's own package, which is
+                # more specific than a depName pin covering its whole module,
+                # so it overwrites rather than setdefault's.
                 pins[tool] = (version, f'go install {pkg}')
     return pins
 
@@ -767,11 +768,8 @@ def _resolve_value(tok, ctx, caller_inputs, workspace):
 # ---------------------------------------------------------------------------
 # GitHub Actions runner environment parity
 # ---------------------------------------------------------------------------
-# Workflow `run:` steps assume standard runner env vars exist. The most
-# load-bearing locally is $RUNNER_TEMP — a guaranteed-writable scratch dir
-# the markdown job (and others) write configs into. Steps execute under
-# `bash -eu`, so a missing var aborts with "unbound variable" rather than
-# failing the actual check; synthesize the vars locally so ci-local mirrors CI.
+# Steps run under `bash -eu`, so a runner variable they assume ($RUNNER_TEMP
+# above all) aborts them as unbound unless it is synthesized here.
 _RUNNER_TEMP_DIR = None
 
 
@@ -822,13 +820,8 @@ def apply_runner_env(env: dict, workspace: Path) -> dict:
     env.setdefault('GITHUB_WORKSPACE', str(workspace))
     env.setdefault('GITHUB_EVENT_NAME', 'pull_request')
     env.setdefault('CI', 'true')
-    # GitHub-runner file sinks. Steps routinely append to these
-    # (`>> "$GITHUB_ENV"`, `>> "$GITHUB_STEP_SUMMARY"`, `>> "$GITHUB_OUTPUT"`);
-    # under `bash -eu` an unset one is an "unbound variable" error that fails the
-    # step — and for the detect profile step it silently discards the outputs it
-    # already wrote (rc!=0 path). Point them at writable per-run temp files so the
-    # redirects succeed. `setdefault` lets run_profile_step's explicit
-    # GITHUB_OUTPUT win.
+    # Under `bash -eu` an unset sink fails the step and discards a profile
+    # step's outputs. `setdefault` lets run_profile_step's GITHUB_OUTPUT win.
     for _sink in ('GITHUB_STEP_SUMMARY', 'GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_OUTPUT'):
         env.setdefault(_sink, os.path.join(rt, _sink.lower()))
     return env
@@ -1112,7 +1105,7 @@ def classify_step(step):
             return 'SKIP', name, 'GitHub-only job-result aggregation (needs.*.result)'
         # npm install/ci MUST run locally for version parity: CI always
         # installs fresh from package.json's semver ranges, while cached
-        # node_modules can drift (eslint/knip/ts-eslint rule sets change
+        # node_modules can drift (eslint/ts-eslint rule sets change
         # between minor bumps) — so these are exempt from the Install-name
         # SKIP rule below.
         run_line = step['run'].lstrip()
@@ -1150,11 +1143,8 @@ def rewrite_hadolint_docker(cmd: str) -> str:
 # ---------------------------------------------------------------------------
 # Gitleaks curl-download rewrite
 # ---------------------------------------------------------------------------
-# CI downloads gitleaks to the fixed /tmp/gitleaks path and runs it.  When
-# multiple ci-local processes run in parallel every one of them tries to
-# overwrite that binary simultaneously, which bash rejects with "Text file
-# busy".  If gitleaks is already on PATH (installed via install-local-tools.sh)
-# skip the download entirely and call the local binary directly.
+# CI downloads gitleaks to a fixed /tmp path, which parallel ci-local runs
+# overwrite under each other ("Text file busy"), so a PATH gitleaks is used.
 _GITLEAKS_PATH_RE = re.compile(r'/tmp/gitleaks\b')
 
 
@@ -1324,11 +1314,8 @@ def rewrite_ci_failures_path(cmd: str) -> str:
 # ---------------------------------------------------------------------------
 # Trivy filesystem-scan gitignore parity
 # ---------------------------------------------------------------------------
-# CI runs `trivy fs` against a fresh checkout — tracked files only. Locally
-# the working tree also carries gitignored files (decrypted `*.env.dec`,
-# .app-review/, node_modules) that trivy's secret scanner happily flags,
-# failing on a finding CI never sees. Mirror CI by injecting
-# --skip-files/--skip-dirs for everything git ignores under the scan dir.
+# CI's `trivy fs` sees tracked files only, so everything git ignores under the
+# scan dir is passed as --skip-files/--skip-dirs.
 _TRIVY_FS_RE = re.compile(r'\btrivy\s+(?:fs|filesystem)\b')
 
 
@@ -2030,6 +2017,11 @@ def job_applies_locally(jobname, target):
     always run, like CI. Position-independent so it works whether the meta is
     reached via a consumer (jobnames like `ci/go/validate`) or run directly on the
     ci repo, where the meta is the top-level workflow (`go/validate`)."""
+    segments = jobname.split('/')
+    # pr-policy reads the pull request (title, head branch, base), which a local
+    # run does not have; CI skips it on every repo whose default branch is main.
+    if 'pr-policy' in segments:
+        return False
     det = compute_local_detect(target)
     gate_map = {
         'go': det['run_go'],
@@ -2049,7 +2041,7 @@ def job_applies_locally(jobname, target):
         'python': det['run_python'],
         'scripts': det['run_scripts'],
     }
-    for seg in jobname.split('/'):
+    for seg in segments:
         if seg in gate_map:
             return gate_map[seg] == 'true'
     return True  # markdown / detect / validate scaffolding — always runs

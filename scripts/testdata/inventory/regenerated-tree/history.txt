@@ -1,0 +1,61 @@
+@@ commit B
+@@ file Dockerfile
+FROM rust:1.99@sha256:4444444444444444444444444444444444444444444444444444444444444444 AS build
+# renovate: datasource=github-tags depName=pkolaczk/fclones digest=commit
+ARG FCLONES_REF=v0.34.0
+ARG FCLONES_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+COPY licenses/crates/ /licenses/crates/
+@@ file licenses/crates/MANIFEST
+aho-corasick 1.1.3
+libc 0.2.170
+@@ file licenses/crates/aho-corasick/LICENSE-MIT
+MIT
+@@ file licenses/crates/libc/LICENSE-MIT
+MIT
+@@ commit M parent B
+@@ file Dockerfile
+FROM rust:1.99@sha256:4444444444444444444444444444444444444444444444444444444444444444 AS build
+# renovate: datasource=github-tags depName=pkolaczk/fclones digest=commit
+ARG FCLONES_REF=v0.35.0
+ARG FCLONES_COMMIT=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+COPY licenses/crates/ /licenses/crates/
+@@ file licenses/crates/MANIFEST
+aho-corasick 1.1.3
+memchr 2.7.4
+@@ file licenses/crates/memchr/COPYING
+Unlicense OR MIT
+@@ delete licenses/crates/libc/LICENSE-MIT
+@@ commit T_same parent B
+@@ file Dockerfile
+FROM rust:1.99@sha256:4444444444444444444444444444444444444444444444444444444444444444 AS build
+# renovate: datasource=github-tags depName=pkolaczk/fclones digest=commit
+ARG FCLONES_REF=v0.35.0
+ARG FCLONES_COMMIT=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+COPY licenses/crates/ /licenses/crates/
+@@ file licenses/crates/MANIFEST
+aho-corasick 1.1.3
+memchr 2.7.4
+@@ file licenses/crates/memchr/COPYING
+Unlicense OR MIT
+@@ delete licenses/crates/libc/LICENSE-MIT
+@@ commit T_newer parent B
+@@ file Dockerfile
+FROM rust:1.99@sha256:4444444444444444444444444444444444444444444444444444444444444444 AS build
+# renovate: datasource=github-tags depName=pkolaczk/fclones digest=commit
+ARG FCLONES_REF=v0.36.0
+ARG FCLONES_COMMIT=cccccccccccccccccccccccccccccccccccccccc
+COPY licenses/crates/ /licenses/crates/
+@@ file licenses/crates/MANIFEST
+aho-corasick 1.1.4
+memchr 2.7.5
+@@ file licenses/crates/aho-corasick/LICENSE-MIT
+MIT, 2026
+@@ file licenses/crates/memchr/COPYING
+Unlicense OR MIT, 2026
+@@ delete licenses/crates/libc/LICENSE-MIT
+@@ commit T_stale parent B
+@@ file README.md
+dev never took the fclones bump
+@@ commit M_alone parent B
+@@ file licenses/crates/MANIFEST
+aho-corasick 1.1.3

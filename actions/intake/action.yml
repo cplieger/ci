@@ -1,0 +1,65 @@
+name: intake
+description: >-
+  Pull-request policy of a two-branch repository: what a machine head may merge
+  into main, and the title's conventional-commit form.
+
+inputs:
+  check:
+    description: "`intake` (the content rule of the head) or `title`."
+    required: true
+  title:
+    description: Pull request title (`title`).
+    default: ''
+  head-ref:
+    description: Head branch (`intake`).
+    default: ''
+  head-repo:
+    description: owner/name of the repository holding the head branch (`intake`).
+    default: ''
+  base-sha:
+    description: Base branch tip the pull request event names (`intake`).
+    default: ''
+  head-sha:
+    description: Head commit, present in the working directory's repository (`intake`).
+    default: ''
+  sync-owned:
+    description: >-
+      File of sync-owned paths and globs; empty reads the set classify-repos.py
+      publishes at this action's ref.
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # Every pull-request value reaches the script through env, never through
+    # an expression in the script text.
+    - name: Check pull request policy
+      shell: bash
+      env:
+        CHECK: ${{ inputs.check }}
+        PR_TITLE: ${{ inputs.title }}
+        HEAD_REF: ${{ inputs.head-ref }}
+        HEAD_REPO: ${{ inputs.head-repo }}
+        BASE_SHA: ${{ inputs.base-sha }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        SYNC_OWNED: ${{ inputs.sync-owned }}
+      run: |
+        set -euo pipefail
+        script="$GITHUB_ACTION_PATH/../../scripts/intake.py"
+        (
+          case "$CHECK" in
+            title) python3 "$script" title ;;
+            intake)
+              args=(--head-ref="$HEAD_REF" --head-repo="$HEAD_REPO" --repository="$GITHUB_REPOSITORY"
+                --base-sha="$BASE_SHA" --head-sha="$HEAD_SHA")
+              if [ -n "$SYNC_OWNED" ]; then
+                args+=(--sync-owned="$SYNC_OWNED")
+              fi
+              python3 "$script" intake "${args[@]}"
+              ;;
+            *)
+              echo "::error::intake: unknown check '$CHECK'"
+              exit 2
+              ;;
+          esac
+        ) || { echo "Pull request $CHECK" >> /tmp/_ci_failures; exit 1; }

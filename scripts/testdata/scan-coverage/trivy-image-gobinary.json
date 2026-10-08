@@ -1,0 +1,52 @@
+{
+ "SchemaVersion": 2,
+ "ArtifactName": "ghcr.io/cplieger/docker-age:v1.0.0",
+ "ArtifactType": "container_image",
+ "Results": [
+  {
+   "Target": "ghcr.io/cplieger/docker-age:v1.0.0 (debian 13.5)",
+   "Class": "os-pkgs",
+   "Type": "debian",
+   "Vulnerabilities": []
+  },
+  {
+   "Target": "age-decrypt",
+   "Class": "lang-pkgs",
+   "Type": "gobinary",
+   "Vulnerabilities": [
+    {
+     "VulnerabilityID": "CVE-2026-27145",
+     "PkgName": "stdlib",
+     "InstalledVersion": "v1.26.3",
+     "FixedVersion": "1.25.11, 1.26.4",
+     "Status": "fixed",
+     "Severity": "HIGH"
+    },
+    {
+     "VulnerabilityID": "CVE-2026-33818",
+     "PkgName": "stdlib",
+     "InstalledVersion": "v1.26.3",
+     "FixedVersion": "1.25.13, 1.26.6, 1.27.0-rc.3",
+     "Status": "fixed",
+     "Severity": "HIGH"
+    },
+    {
+     "VulnerabilityID": "CVE-2026-39828",
+     "PkgName": "golang.org/x/crypto",
+     "InstalledVersion": "v0.50.0",
+     "FixedVersion": "0.52.0",
+     "Status": "fixed",
+     "Severity": "HIGH"
+    },
+    {
+     "VulnerabilityID": "CVE-2026-39829",
+     "PkgName": "golang.org/x/crypto",
+     "InstalledVersion": "v0.50.0",
+     "FixedVersion": "0.52.0",
+     "Status": "fixed",
+     "Severity": "HIGH"
+    }
+   ]
+  }
+ ]
+}

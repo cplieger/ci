@@ -3,9 +3,9 @@
 # body is EXTRACTED from the workflow at runtime and executed against stub
 # registries, never copied: a signature change to `probe` once left `probe_ts`
 # on the old arity, so `url=$3` was unset and every npm/JSR read died under
-# `set -u` with the linters clean. CONTRIBUTING.md lists what is pinned. Runs
-# in the ci repo's scripts CI job, where PyYAML is present by step order (the
-# yamllint install depends on it). Local run: scripts/test-verify-publish.sh
+# `set -u` with the linters clean. Runs in the ci repo's scripts CI job, where
+# PyYAML is present by step order (the yamllint install depends on it). Local
+# run: scripts/test-verify-publish.sh
 set -euo pipefail
 
 # Hermetic git, same rationale as the sibling probes: a workstation
@@ -74,15 +74,18 @@ chk_has "V-P2 body defines probe()" "$STEP_BODY" 'probe() {'
 chk_has "V-P3 body defines probe_go()" "$STEP_BODY" 'probe_go() {'
 chk_has "V-P4 body defines probe_ts()" "$STEP_BODY" 'probe_ts() {'
 chk_has "V-P5 body is strict-mode" "$STEP_BODY" 'set -euo pipefail'
-chk_has "V-P6 body retries six times" "$STEP_BODY" 'for i in 1 2 3 4 5 6'
+# The needle is the literal source line, unexpanded.
+# shellcheck disable=SC2016
+chk_has "V-P6 body waits through the shared registry helper" "$STEP_BODY" '. "$CI_TOOLS/retry.sh"'
 chk_has "V-P7 body discovers lane tags at HEAD" "$STEP_BODY" 'git tag --points-at HEAD'
 chk "V-P8 body parses under bash" \
   "$(bash -n "$WORK/step.sh" 2>/dev/null && echo ok || echo bad)" "ok"
-# Guard against a ninth env var arriving later: the cases would leave it
+# Guard against a tenth env var arriving later: the cases would leave it
 # unset, it would die under set -u, and that reads as a real refusal.
-chk "V-P9 step env is exactly the eight the cases populate" \
+chk "V-P9 step env is exactly the nine the cases populate" \
   "$(cat "$WORK/env-keys")" \
   "CHANNEL
+CI_TOOLS
 GO_LANES_JSON
 GO_NESTED_RESULT
 GO_RESULT
@@ -96,10 +99,12 @@ VERSION"
 # would test the stub.
 BIN="$WORK/bin"
 mkdir -p "$BIN"
-export CURL_SPEC="$WORK/curl.spec" CURL_LOG="$WORK/curl.log"
+export CURL_SPEC="$WORK/curl.spec" CURL_LOG="$WORK/curl.log" SLEEP_LOG="$WORK/sleep.log"
 
+# Records each wait instead of taking it, so the schedule is assertable.
 cat >"$BIN/sleep" <<'SH'
 #!/bin/sh
+printf '%s\n' "$1" >>"$SLEEP_LOG"
 exit 0
 SH
 
@@ -122,6 +127,18 @@ for a in "$@"; do
   esac
 done
 printf '%s\n' "$URL" >>"$CURL_LOG"
+# CURL_SERVE_FROM=<n>: URLs matching CURL_SERVE_PAT answer 200 from their
+# n-th request on, the shape of a registry that is still propagating.
+if [ -n "${CURL_SERVE_PAT:-}" ]; then
+  case "$URL" in
+    $CURL_SERVE_PAT)
+      if [ "$(grep -cxF "$URL" "$CURL_LOG")" -ge "$CURL_SERVE_FROM" ]; then
+        [ -n "$OUT" ] && printf '{}\n' >"$OUT"
+        exit 0
+      fi
+      ;;
+  esac
+fi
 # `while read -r pat rc body`, never `while IFS= read -r ...`: IFS= disables
 # exactly the field splitting the three variables need, so the whole line
 # lands in pat, nothing ever matches, and every case reports the success path.
@@ -148,10 +165,13 @@ chmod 755 "$BIN/sleep" "$BIN/curl"
 defaults() { # every case starts fully populated; an unset var dies under set -u
   export CHANNEL=stable VERSION=v1.2.3 SUBPACKAGES_JSON='[]' GO_LANES_JSON='[]'
   export GO_RESULT=skipped TS_RESULT=skipped SUBPACKAGE_RESULT=skipped GO_NESTED_RESULT=skipped
+  export CI_TOOLS="$ROOT/scripts"
+  unset CURL_SERVE_PAT CURL_SERVE_FROM
 }
 spec() { # <line>...
   printf '%s\n' "$@" >"$CURL_SPEC"
   : >"$CURL_LOG"
+  : >"$SLEEP_LOG"
 }
 casedir() { # <name> -> path of a fresh fixture dir
   rm -rf "$WORK/case-$1"
@@ -194,7 +214,7 @@ run_step "$D"
 chk "V-A2 wrong module path stays red" "$RC" "1"
 chk_has "V-A2 wrong module path errors" "$OUT" "::error::proxy.golang.org"
 chk_lacks "V-A2 wrong module path does not warn" "$OUT" "::warning::"
-chk "V-A2 the proxy is tried six times" "$(lines "$CURL_LOG")" "6"
+chk "V-A2 the proxy is tried through the whole wait" "$(lines "$CURL_LOG")" "14"
 
 D=$(casedir a3)
 gomod "$D"
@@ -265,6 +285,45 @@ chk_has "V-C1 proxy only warns" "$OUT" "::warning::proxy.golang.org"
 chk_has "V-C1 npm carries the error" "$OUT" "::error::npm"
 chk_lacks "V-C1 proxy contributes no error" "$OUT" "::error::proxy.golang.org"
 
+# ── V-S: the wait's schedule and budget ──────────────────────────────────────
+D=$(casedir s1)
+pkgjson "$D"
+defaults
+export TS_RESULT=success
+spec "*registry.npmjs.org* 22 {}" "*jsr.io* 0 {}"
+run_step "$D"
+chk "V-S1 an absent artifact backs off 5 s doubling to a 60 s cap" \
+  "$(tr '\n' ' ' <"$SLEEP_LOG")" "5 10 20 40 60 60 60 60 60 60 60 60 45 "
+chk "V-S1 and gives up after exactly the 600 s budget" "$(awk '{ s += $1 } END { print s }' "$SLEEP_LOG")" "600"
+chk "V-S1 and fails closed" "$RC" "1"
+
+# npm served a published version two minutes after its publish succeeded:
+# the seventh request lands past a six-try, 100 s window.
+D=$(casedir s2)
+pkgjson "$D"
+defaults
+export TS_RESULT=success CURL_SERVE_PAT="*registry.npmjs.org*" CURL_SERVE_FROM=7
+spec "*registry.npmjs.org* 22 {}" "*jsr.io* 0 {}"
+run_step "$D"
+chk "V-S2 a version npm serves on the seventh request passes" "$RC" "0"
+chk "V-S2 after 195 s of waiting" "$(awk '{ s += $1 } END { print s }' "$SLEEP_LOG")" "195"
+chk_has "V-S2 the late answer is a notice" "$OUT" \
+  "::notice::npm @cplieger/probe@1.2.3 was served on attempt 7, after 195s of waiting"
+chk_lacks "V-S2 and no error" "$OUT" "::error::"
+
+# One budget for the step: a second absent artifact gets one try, so two
+# missing registries cannot outlast the job timeout.
+D=$(casedir s3)
+pkgjson "$D"
+defaults
+export TS_RESULT=success
+spec "*registry.npmjs.org* 22 {}" "*jsr.io* 22 {}"
+run_step "$D"
+chk "V-S3 the first absent artifact spends the budget" "$(grep -c registry.npmjs.org "$CURL_LOG")" "14"
+chk "V-S3 the second gets one try" "$(grep -c jsr.io "$CURL_LOG")" "1"
+chk "V-S3 and the step waits 600 s in all" "$(awk '{ s += $1 } END { print s }' "$SLEEP_LOG")" "600"
+chk_has "V-S3 both are refused" "$OUT" "::error::jsr @cplieger/probe@1.2.3 is not published"
+
 # ── V-D: nested Go lanes ─────────────────────────────────────────────────────
 # The lane loop reads `git tag --points-at HEAD`, so this needs a real repo
 # with a real lane tag, not a stub.
@@ -293,7 +352,7 @@ chk_has "V-D1 lane negative cache warns" "$OUT" \
   "::warning::proxy.golang.org github.com/cplieger/probe/yamlenv@v1.1.0"
 chk "V-D1 lane version is the tag with its dir prefix stripped" \
   "$(sort -u "$CURL_LOG")" "$LANE_URL"
-chk "V-D1 the lane is tried six times" "$(lines "$CURL_LOG")" "6"
+chk "V-D1 the lane is tried through the whole wait" "$(lines "$CURL_LOG")" "14"
 
 defaults
 export GO_NESTED_RESULT=success GO_LANES_JSON='["yamlenv"]'

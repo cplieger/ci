@@ -1,21 +1,17 @@
 #!/usr/bin/env bash
 # Regression probe for the git-cliff behaviours the release gate relies on and
 # upstream does not document (issues #816, #1570): exclude_paths globbing, the
-# --unreleased --bumped-version base anchoring, section ordering, the stable
-# tag_pattern, the nested-module lanes and the two release channels through
-# actions/git-cliff-version/compute.sh, as states A to R; CONTRIBUTING.md lists
-# them. Runs in the ci repo's scripts CI job, so a git-cliff pin bump re-runs
-# it against the new binary. CLIFF_BIN=/path/to/git-cliff skips the download.
+# --unreleased --bumped-version base anchoring, the stable tag_pattern, the
+# nested-module lanes and the channels of actions/git-cliff-version/compute.sh
+# (states A to R), the synced notes template (T0 to T4) and the two-branch
+# release model (S1 to S14). Runs in the scripts CI job, so a git-cliff pin
+# bump re-runs it against the new binary.
+# CLIFF_BIN=/path/to/git-cliff skips the download.
 set -euo pipefail
 
-# Hermetic git: a developer's global config must not reach the probe's
-# throwaway repos. Found the hard way (2026-08): a workstation with
-# `tag.gpgsign true` turned every bare `git tag vX.Y.Z` below into a SIGNED
-# ANNOTATED tag, which opened an editor on the PTY and hung the probe under
-# `ci-local` — while CI, with no global config, stayed green. Pointing
-# GIT_CONFIG_GLOBAL/SYSTEM at /dev/null makes the probe see only per-repo
-# config, so the per-repo `commit.gpgsign false` lines become belt-and-braces
-# and no future global setting (aliases, hooks path, pagers) can leak in.
+# Hermetic git: a global `tag.gpgsign true` turns each bare `git tag` below
+# into a signed tag that opens an editor and hangs the probe, so the probe
+# reads per-repo config only.
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -29,27 +25,13 @@ fail() {
 }
 
 # ── Pin consistency: every CLIFF_VERSION and CLIFF_SHA256 must agree ────────
-# The version and the tarball sha256 are pinned as a pair at every install
-# site (Renovate maintains both via the custom.git-cliff datasource). Four
-# invariants, each catching a drift class the others cannot see:
-#   uniqueness    — a site whose version or digest disagrees with the rest
-#   site count    — a site added/removed without bumping EXPECTED_SITES
-#                   (forces conscious review of every install-site change;
-#                   symmetric pair removal fools a bare N_VER==N_SHA check)
-#   enforcement   — every site's `sha256sum -c` gate line still exists (a
-#                   deleted gate leaves both pin lines intact and the site
-#                   silently reverts to unverified install)
-#   manager shape — every site matches the Renovate customManager block
-#                   (annotation + adjacent version/sha lines; the regex
-#                   below MIRRORS cplieger/.github default.json's
-#                   custom.git-cliff manager — keep them in sync), so every
-#                   site actually auto-updates; a corrupted annotation or a
-#                   typoed depName would silently freeze that site (and a
-#                   wrong depName would also bypass the digest-only
-#                   no-automerge packageRule, which matches on depName)
-# The file list is DISCOVERED (any file under .github/ or actions/ carrying
-# a CLIFF_VERSION pin), so a new install site in a new file cannot hide
-# from these checks.
+# Each install site pins version and tarball sha256 as a pair. Four checks,
+# each blind to the others' drift: uniqueness; site count (an added or removed
+# site must bump EXPECTED_SITES, which a symmetric pair removal would pass);
+# the `sha256sum -c` gate line per site; and the Renovate manager shape, whose
+# regex below mirrors cplieger/.github default.json's custom.git-cliff manager
+# (a broken annotation or depName freezes that site). Pin files are
+# discovered, so a new site in a new file cannot hide.
 EXPECTED_SITES=6
 mapfile -t PIN_FILES < <(
   grep -rlE 'CLIFF_VERSION[=:]' "$ROOT/.github" "$ROOT/actions" | sort
@@ -69,7 +51,7 @@ mapfile -t shas < <(
 SHA256="${shas[0]}"
 # Per-class counts. N_SHA additionally guards well-formedness: a malformed
 # sha (63 hex chars) falls out of the {64} scan while the remaining sites
-# still "agree" on uniqueness (found by this probe's own negative test).
+# still "agree" on uniqueness.
 N_VER=$(grep -rhoE 'CLIFF_VERSION[=:] *"?v[0-9][0-9.]*' "${PIN_FILES[@]}" | wc -l)
 N_SHA=$(grep -rhoE 'CLIFF_SHA256[=:] *"?[a-f0-9]{64}' "${PIN_FILES[@]}" | wc -l)
 N_GATE=$(grep -rh 'CLIFF_SHA256' "${PIN_FILES[@]}" | grep -c 'sha256sum -c' || true)
@@ -140,6 +122,8 @@ git -C "$R" tag v1.0.0
 c .github/workflows/ci.yaml "chore(deps): update ci digest to aaaaaaa"
 c README.md "fix: readme-only edit"
 c web/package-lock.json "chore(deps): lock file maintenance"
+c docs/images/header.webp "fix: refresh the header screenshot"
+c docs/detail.png "fix: crop the settings screenshot"
 assert_eq "$(bump "$R")" "v1.0.0" "A: excluded-only unreleased set anchors at latest tag"
 
 # ── State B: real changes among excluded ones -> patch bump + clean render ──
@@ -237,9 +221,8 @@ lc yamlenv/y.go "feat: lane-only feature"
 assert_eq "$(lane_root_bump)" "v1.0.0" "H1: lane-only commits leave root at latest (release=false analog)"
 lc src/main.go "fix: root fix"
 assert_eq "$(lane_root_bump)" "v1.0.1" "H2: root bump ignores the lane feat (patch, not minor)"
-# Stale-config defense: under a deliberately UNANCHORED config (the
-# pre-2026-07 pattern), the explicit CLI --tag-pattern must still keep the
-# root version string lane-clean.
+# Stale-config defense: under a deliberately UNANCHORED config, the explicit
+# CLI --tag-pattern must still keep the root version string lane-clean.
 sed 's/^tag_pattern = .*/tag_pattern = "v[0-9].*"/' "$CFG" >"$WORK/cliff-unanchored.toml"
 # A sed that matched nothing would test the anchored config against itself.
 grep -q 'tag_pattern = .v\[0-9\]\.\*.' "$WORK/cliff-unanchored.toml" || fail "H3: the unanchored fixture config was not produced (sed matched no tag_pattern line)"
@@ -319,20 +302,112 @@ echo "$LNOTES2" | grep -q "Lane feature for notes" && fail "L: root --current fi
 echo "$LNOTES2" | grep -q "Readme-only edit" && fail "L: config exclude_paths not applied in root finalize render"
 echo "ok: L root finalize render (--current, lane commits excluded, config excludes merged)"
 
+# ── Template states: the synced notes body under both modes ─────────────────
+# Both tier configs must render identically; only [bump] may differ.
+cmp -s <(sed '1,/^\[changelog\]/d' "$CFG") <(sed '1,/^\[changelog\]/d' "$ROOT/configs/cliff-alpha.toml") \
+  || fail "T0: cliff-stable.toml and cliff-alpha.toml differ outside [bump]"
+echo "ok: T0 both tier configs share [changelog] and [git]"
+N="$WORK/notes"
+mkdir -p "$N"
+git -C "$N" init -q -b main
+git -C "$N" config user.email probe@ci.local
+git -C "$N" config user.name probe
+git -C "$N" config commit.gpgsign false
+nc() { # path message (notes repo commit)
+  mkdir -p "$N/$(dirname "$1")"
+  echo "x$RANDOM" >>"$N/$1"
+  git -C "$N" add -A
+  git -C "$N" commit -qm "$2"
+}
+nc src/main.go "feat: initial"
+git -C "$N" tag v1.0.0
+nc src/a.go "fix: handle empty input (#2)"
+nc src/b.go "perf: faster scan (#3)"
+nc src/c.go "sec: escape the header (#4)"
+nc Dockerfile "chore(deps): update alpine docker tag to v3.24 (#5)"
+nc go.mod "fix(deps): update module example.com/dep to v1.2.0 (#6)"
+nc src/d.go "feat!: footerless break (#7)"
+nc src/e.go "feat(api)!: drop the v1 route (#8)
+
+BREAKING CHANGE: call /v2 instead"
+nc src/f.go "an unconventional subject (#9)"
+notes() { (cd "$N" && "$CLIFF" --config "$CFG" --unreleased --tag v2.0.0 --strip header 2>/dev/null); }
+want_v2='
+### Breaking changes
+
+#### Drop the v1 route (#8)
+
+Call /v2 instead
+
+### Added
+
+- [**breaking**] Footerless break (#7)
+
+### Fixed
+
+- Handle empty input (#2)
+
+### Security
+
+- Escape the header (#4)
+
+### Changed
+
+- Faster scan (#3)
+- An unconventional subject (#9)
+
+### Dependencies
+
+- Update alpine docker tag to v3.24 (#5)
+- Update module example.com/dep to v1.2.0 (#6)'
+assert_eq "$(notes)" "$want_v2" "T1: fix(deps) renders under Dependencies and a footer-bearing breaking commit renders once"
+for mode in "" v2 V3; do
+  assert_eq "$(CLIFF_NOTES_MODE="$mode" notes)" "$want_v2" "T2: CLIFF_NOTES_MODE='$mode' leaves the v2 body"
+done
+git -C "$N" tag v2.0.0
+nc go.mod "fix(deps): update module example.com/dep to v1.2.1 (#10)"
+assert_eq "$(cd "$N" && "$CLIFF" --config "$CFG" --unreleased --bumped-version 2>/dev/null)" "v2.0.1" "T3: a fix(deps) commit still bumps a patch"
+nc src/g.go "feat!: only a footer-bearing feature (#11)
+
+BREAKING CHANGE: migrate first"
+assert_eq "$(notes)" '
+### Breaking changes
+
+#### Only a footer-bearing feature (#11)
+
+Migrate first
+
+### Dependencies
+
+- Update module example.com/dep to v1.2.1 (#10)' "T4: a group left holding only a footer-bearing commit renders no heading"
+
 # ── Channel states: the action's compute.sh, run in fixture repos ────────────
 # compute.sh is the one owner of the tag universe, the dev counter and the
 # patch floor, so these states execute it rather than restate its arithmetic.
 ACTION="$ROOT/actions/git-cliff-version/compute.sh"
 [ -f "$ACTION" ] || fail "compute.sh not found at $ACTION"
 compute() { # <repo> <channel> [lane] [exclude-paths] -> populates OUT_* variables
-  local repo="$1" channel="$2" lane="${3:-}" excludes="${4:-}" outfile line
+  local repo="$1" channel="$2" lane="${3:-}" excludes="${4:-}" outfile
   outfile="$(mktemp "$WORK/compute-out.XXXXXX")"
   (
     cd "$repo" && GIT_CLIFF_CONFIG="$CFG" CLIFF_BIN="$CLIFF" GITHUB_OUTPUT="$outfile" \
       GITHUB_SHA="$(git rev-parse HEAD)" CHANNEL="$channel" LANE="$lane" EXCLUDE_PATHS="$excludes" \
       bash "$ACTION" >/dev/null 2>&1
   ) || fail "compute.sh failed in $repo (channel=$channel lane=${lane:-<none>})"
+  if [ -n "${COMPUTE_BASELINE:-}" ]; then
+    (
+      cd "$repo" && GIT_CLIFF_CONFIG="$CFG" CLIFF_BIN="$CLIFF" GITHUB_OUTPUT="$outfile.base" \
+        CHANNEL="$channel" LANE="$lane" EXCLUDE_PATHS="$excludes" bash "$COMPUTE_BASELINE" >/dev/null 2>&1
+    ) || fail "baseline compute.sh failed in $repo"
+    cmp -s "$outfile" "$outfile.base" || fail "compute.sh outputs differ from the baseline in $repo (channel=$channel lane=${lane:-<none>})"
+  fi
+  read_outputs "$outfile"
+  [ -n "$OUT_BASE" ] || fail "compute.sh wrote no base output in $repo"
+}
+read_outputs() { # <GITHUB_OUTPUT file> -> OUT_* variables
+  local line
   OUT_BASE="" OUT_DEV="" OUT_FLOOR_BASE="" OUT_FLOOR_DEV="" OUT_LATEST="" OUT_ANCHOR="" OUT_RELEASE=""
+  OUT_MODEL="" OUT_H_TAG="" OUT_FROM="" OUT_LEVEL=""
   while IFS= read -r line; do
     case "$line" in
       base=*) OUT_BASE="${line#base=}" ;;
@@ -342,9 +417,12 @@ compute() { # <repo> <channel> [lane] [exclude-paths] -> populates OUT_* variabl
       latest=*) OUT_LATEST="${line#latest=}" ;;
       anchor_sha=*) OUT_ANCHOR="${line#anchor_sha=}" ;;
       release=*) OUT_RELEASE="${line#release=}" ;;
+      release_model=*) OUT_MODEL="${line#release_model=}" ;;
+      h_tag=*) OUT_H_TAG="${line#h_tag=}" ;;
+      range_from=*) OUT_FROM="${line#range_from=}" ;;
+      change_level=*) OUT_LEVEL="${line#change_level=}" ;;
     esac
-  done <"$outfile"
-  [ -n "$OUT_BASE" ] || fail "compute.sh wrote no base output in $repo"
+  done <"$1"
 }
 mkfixture() { # <name> -> path
   local d="$WORK/$1"
@@ -431,5 +509,310 @@ assert_eq "$OUT_ANCHOR" "$(git -C "$M" rev-list -n1 v1.3.0-dev.2)" "R5: dev anch
 git -C "$M" tag v1.3.0-beta.2 "$(git -C "$M" rev-list -n1 v1.3.0-dev.2)"
 compute "$M" stable
 assert_eq "$OUT_LATEST" "v1.2.0" "R6: a beta tag beside the dev tag is invisible too"
+
+# ── Two-branch states: compute.sh under release-model two-branch ─────────────
+# Each fixture has a main and a dev branch; refs/remotes/origin/main stands in
+# for the remote-tracking ref a fetch-depth 0 checkout carries on a dev run.
+compute_tb() { # <repo> <channel> <pending-version> <pending-in-range> [lane] [exclude-paths]
+  local repo="$1" channel="$2" outfile
+  outfile="$(mktemp "$WORK/compute-out.XXXXXX")"
+  (
+    cd "$repo" && GIT_CLIFF_CONFIG="$CFG" CLIFF_BIN="$CLIFF" GITHUB_OUTPUT="$outfile" \
+      CHANNEL="$channel" PENDING_VERSION="$3" PENDING_IN_RANGE="$4" LANE="${5:-}" \
+      EXCLUDE_PATHS="${6:-}" RELEASE_MODEL=two-branch bash "$ACTION" >"$WORK/compute.log" 2>&1
+  ) || fail "two-branch compute.sh failed in $repo (channel=$channel pending=${3:-<none>} in-range=$4 lane=${5:-<none>}): $(cat "$WORK/compute.log")"
+  read_outputs "$outfile"
+  [ "$OUT_MODEL" = two-branch ] || fail "two-branch compute.sh did not report its model in $repo"
+}
+pending_of() { # <repo> <commit> [lane] [exclude-paths] -> the pending promotion's version
+  (
+    cd "$1" && GIT_CLIFF_CONFIG="$CFG" CLIFF_BIN="$CLIFF" EXCLUDE_PATHS="${4:-}" \
+      bash "$ACTION" pending-version "$2" ${3:+"$3"} 2>"$WORK/pending.log"
+  ) || fail "compute.sh pending-version $2 failed in $1: $(cat "$WORK/pending.log")"
+}
+refused() { # <label> <expected message fragment> <repo> <compute.sh args and env...>
+  local label="$1" want="$2" repo="$3" rc=0
+  shift 3
+  (cd "$repo" && env GIT_CLIFF_CONFIG="$CFG" CLIFF_BIN="$CLIFF" GITHUB_OUTPUT="$WORK/refused.out" \
+    "$@" >"$WORK/refused.log" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "$label: compute.sh accepted it"
+  grep -qF -- "$want" "$WORK/refused.log" || fail "$label: refusal does not say '$want': $(cat "$WORK/refused.log")"
+  echo "ok: $label -> refused (rc $rc)"
+}
+tb_fixture() { # <name> -> path; main holds "feat: initial" at v1.2.0, dev branches there
+  local d
+  d=$(mkfixture "$1")
+  fc "$d" src/main.go "feat: initial"
+  git -C "$d" tag v1.2.0
+  git -C "$d" branch dev
+  printf '%s\n' "$d"
+}
+publish_main() { git -C "$1" update-ref refs/remotes/origin/main refs/heads/main; }
+promote() { # <repo> <dev commit T> -> R: tree T, parents [main, T], main fast-forwarded to it
+  local r
+  r=$(git -C "$1" commit-tree "$2^{tree}" -p "$(git -C "$1" rev-parse main)" -p "$2" -m "release: promote dev into main")
+  git -C "$1" checkout -q main
+  git -C "$1" merge -q --ff-only "$r"
+  publish_main "$1"
+  printf '%s\n' "$r"
+}
+commit_of() { git -C "$1" rev-list -n1 "$2"; }
+
+# The action forwards every input compute.sh reads; an input it drops is inert.
+for pair in channel:CHANNEL exclude-paths:EXCLUDE_PATHS lane:LANE release-model:RELEASE_MODEL \
+  pending-version:PENDING_VERSION pending-in-range:PENDING_IN_RANGE; do
+  grep -qE "^  ${pair%%:*}:\$" "$ROOT/actions/git-cliff-version/action.yml" \
+    || fail "action.yml declares no '${pair%%:*}' input"
+  grep -qF "${pair#*:}: \${{ inputs.${pair%%:*} }}" "$ROOT/actions/git-cliff-version/action.yml" \
+    || fail "action.yml does not forward input '${pair%%:*}' as ${pair#*:}"
+done
+echo "ok: action.yml forwards every compute.sh input"
+
+# ── State S2: a dev build numbers above a main patch it cannot reach ─────────
+F=$(tb_fixture tb-floor)
+git -C "$F" checkout -q dev
+fc "$F" src/a.go "fix: a dev-only fix"
+git -C "$F" checkout -q main
+fc "$F" go.mod "fix(deps): update a module"
+git -C "$F" tag v1.2.1
+fc "$F" src/m.go "feat: a feature that reached main"
+publish_main "$F"
+git -C "$F" checkout -q dev
+! git -C "$F" merge-base --is-ancestor v1.2.1 dev || fail "S2 precondition: v1.2.1 must be unreachable from dev"
+compute_tb "$F" dev "" false
+assert_eq "$OUT_BASE" "v1.3.0" "S2a: a fixes-only dev build takes the next minor above the unreachable H"
+assert_eq "$OUT_DEV" "v1.3.0-dev.1" "S2b: the dev counter runs on the floored base"
+assert_eq "$OUT_H_TAG" "v1.2.1" "S2c: H is the highest stable tag over all refs"
+assert_eq "$OUT_LATEST" "v1.2.1" "S2d: latest is H's tag under two-branch"
+assert_eq "$OUT_FROM" "$(commit_of "$F" v1.2.1)" "S2e: with no promotion yet the range starts at H's commit"
+assert_eq "$OUT_LEVEL" "patch" "S2f: the range holds only the dev fix"
+
+# ── State S3: the patch cap on a main run with nothing pending ───────────────
+git -C "$F" checkout -q main
+compute_tb "$F" stable "" false
+assert_eq "$OUT_BASE" "v1.2.2" "S3a: a feat on main with nothing pending publishes the next patch only"
+assert_eq "$OUT_LEVEL" "minor" "S3b: the cap holds against the minor git-cliff read"
+assert_eq "$OUT_RELEASE" "true" "S3c: base differs from latest"
+git -C "$F" tag v1.2.2
+compute_tb "$F" stable "" false
+assert_eq "$OUT_BASE" "v1.2.2" "S3d: a stable run at a tagged commit repairs that version"
+assert_eq "$OUT_RELEASE" "false" "S3e: the repair run reads release=false, as legacy finalize does"
+
+# ── States S6, S4, S7, S1: a breaking promotion through its lifecycle ────────
+P=$(tb_fixture tb-promo)
+git -C "$P" checkout -q dev
+fc "$P" src/api.go "feat!: drop the v1 flags"
+fc "$P" src/b.go "fix: a dev fix"
+T=$(git -C "$P" rev-parse dev)
+git -C "$P" checkout -q main
+fc "$P" go.mod "fix(deps): update b module"
+git -C "$P" tag v1.2.1
+PR=$(promote "$P" "$T")
+compute_tb "$P" stable "" true
+assert_eq "$OUT_BASE" "v2.0.0" "S6a: a promoted feat! at R reserves the next major"
+assert_eq "$OUT_FROM" "$(commit_of "$P" v1.2.1)" "S6b: the promotion's range starts at the highest existing stable tag"
+assert_eq "$OUT_LEVEL" "major" "S6c: git-cliff read the breaking change"
+compute_tb "$P" stable "" false
+assert_eq "$OUT_BASE" "v1.2.2" "S6d: the same commit with nothing pending is a patch (pending-in-range is load-bearing)"
+assert_eq "$(pending_of "$P" "$PR")" "v2.0.0" "S4a: an untagged R's version is the promotion arithmetic over P..R"
+
+git -C "$P" checkout -q dev
+fc "$P" src/c.go "fix: a dev fix after the promotion"
+compute_tb "$P" dev "v2.0.0" false
+assert_eq "$OUT_BASE" "v2.1.0" "S4b: a dev build numbers above the untagged pending promotion"
+assert_eq "$OUT_DEV" "v2.1.0-dev.1" "S4c: its dev version"
+assert_eq "$OUT_FROM" "$PR" "S4d: the range starts at the newest reconciliation, newer than H's commit"
+assert_eq "$OUT_LEVEL" "patch" "S4e: the promoted feat! is not recounted"
+compute_tb "$P" dev "" false
+assert_eq "$OUT_BASE" "v1.3.0" "S4f: without the pending version the build would rank below the promotion"
+
+git -C "$P" checkout -q main
+fc "$P" Dockerfile "fix(deps): update alpine docker tag"
+publish_main "$P"
+compute_tb "$P" stable "" true
+assert_eq "$OUT_BASE" "v2.0.0" "S7a: a later S over an untagged R publishes the promoted major"
+assert_eq "$OUT_FROM" "$(commit_of "$P" v1.2.1)" "S7b: S's range still starts at the highest existing stable tag"
+
+git -C "$P" tag v2.0.0 "$PR"
+git -C "$P" checkout -q dev
+compute_tb "$P" dev "" false
+assert_eq "$OUT_BASE" "v2.1.0" "S1a: once R is tagged, the next dev build does not recount its feat!"
+assert_eq "$OUT_FROM" "$PR" "S1b: the range starts at R"
+git -C "$P" tag v2.0.1 main
+compute_tb "$P" dev "" false
+assert_eq "$OUT_FROM" "$(git -C "$P" rev-parse main)" "S1c: a main patch tagged after R moves the range start to it"
+assert_eq "$OUT_BASE" "v2.1.0" "S1d: the next minor above v2.0.1"
+
+# ── State S5: R tagged before its receipt keeps its tag's version ────────────
+V=$(tb_fixture tb-receipt)
+git -C "$V" checkout -q dev
+fc "$V" src/a.go "fix: a dev fix"
+VT=$(git -C "$V" rev-parse dev)
+git -C "$V" checkout -q main
+fc "$V" go.mod "fix(deps): update a module"
+git -C "$V" tag v1.2.1
+VR=$(promote "$V" "$VT")
+# The tag is authoritative where today's arithmetic would say v1.3.0: the
+# version was published, so it is never recomputed.
+git -C "$V" tag v2.0.0 "$VR"
+fc "$V" go.mod "fix(deps): update a module again"
+git -C "$V" tag v2.0.1
+publish_main "$V"
+assert_eq "$(pending_of "$V" "$VR")" "v2.0.0" "S5a: the lowest stable tag on R or a descendant is the pending version"
+git -C "$V" checkout -q dev
+fc "$V" src/b.go "fix: a dev fix after the promotion"
+compute_tb "$V" dev "v2.0.0" false
+assert_eq "$OUT_BASE" "v2.1.0" "S5b: the dev build numbers above it"
+
+# ── State S8: a fixes-only promotion publishes the next minor ───────────────
+X8=$(tb_fixture tb-fixes)
+git -C "$X8" checkout -q dev
+fc "$X8" src/a.go "fix: only a fix"
+X8T=$(git -C "$X8" rev-parse dev)
+X8R=$(promote "$X8" "$X8T")
+compute_tb "$X8" stable "" true
+assert_eq "$OUT_BASE" "v1.3.0" "S8a: a fixes-only promotion publishes the next minor"
+assert_eq "$OUT_LEVEL" "patch" "S8b: although git-cliff read a patch"
+assert_eq "$(pending_of "$X8" "$X8R")" "v1.3.0" "S8c: the pending helper agrees with the stable run at R"
+
+# ── State S9: each lane computes from its own H ─────────────────────────────
+L9=$(mkfixture tb-lanes)
+fc "$L9" src/main.go "feat: initial"
+fc "$L9" yamlenv/y.go "feat: introduce nested module"
+git -C "$L9" tag v1.0.0
+git -C "$L9" tag yamlenv/v1.0.0
+git -C "$L9" branch dev
+git -C "$L9" checkout -q dev
+fc "$L9" src/root.go "feat: a root-only feature"
+L9T=$(git -C "$L9" rev-parse dev)
+git -C "$L9" checkout -q main
+fc "$L9" yamlenv/go.mod "fix(deps): update a lane dependency"
+git -C "$L9" tag yamlenv/v1.0.1
+promote "$L9" "$L9T" >/dev/null
+compute_tb "$L9" stable "" true "" 'yamlenv/**'
+assert_eq "$OUT_BASE" "v1.1.0" "S9a: the root lane publishes the promotion's minor"
+compute_tb "$L9" stable "" false yamlenv
+assert_eq "$OUT_BASE" "yamlenv/v1.0.2" "S9b: the lane a root-only promotion left alone publishes its next patch"
+assert_eq "$OUT_H_TAG" "yamlenv/v1.0.1" "S9c: the lane's H is its own tag"
+git -C "$L9" checkout -q dev
+fc "$L9" yamlenv/y.go "fix: a lane fix on dev"
+compute_tb "$L9" dev "" false yamlenv
+assert_eq "$OUT_BASE" "yamlenv/v1.1.0" "S9d: a lane dev build takes the next minor above the lane's H"
+compute_tb "$L9" dev "v1.1.0" false "" 'yamlenv/**'
+assert_eq "$OUT_BASE" "v1.2.0" "S9e: the root dev build numbers above the root's pending promotion"
+assert_eq "$OUT_LEVEL" "none" "S9f: the lane fix is outside the root range"
+
+# ── State S10: release-model unset equals legacy on a two-branch history ─────
+# COMPUTE_BASELINE=<compute.sh> also compares every legacy run against it.
+legacy_run() { # <script> <repo> <tag> [VAR=value ...] -> output and log files named <tag>
+  local script="$1" repo="$2" tag="$3"
+  shift 3
+  : >"$WORK/$tag.out"
+  (cd "$repo" && env GIT_CLIFF_CONFIG="$CFG" CLIFF_BIN="$CLIFF" GITHUB_OUTPUT="$WORK/$tag.out" "$@" \
+    bash "$script" >"$WORK/$tag.log" 2>&1) || fail "S10: $script failed in $repo ($tag)"
+}
+s10_case() { # <label> <repo> <ref> <channel> [lane] [exclude-paths]
+  local label="$1" repo="$2" ref="$3" channel="$4" lane="${5:-}" excludes="${6:-}"
+  git -C "$repo" checkout -q "$ref"
+  legacy_run "$ACTION" "$repo" s10-unset CHANNEL="$channel" LANE="$lane" EXCLUDE_PATHS="$excludes"
+  legacy_run "$ACTION" "$repo" s10-junk CHANNEL="$channel" LANE="$lane" EXCLUDE_PATHS="$excludes" \
+    RELEASE_MODEL=legacy PENDING_VERSION=not-a-version PENDING_IN_RANGE=maybe
+  cmp -s "$WORK/s10-unset.out" "$WORK/s10-junk.out" || fail "S10 $label: legacy outputs depend on the two-branch inputs"
+  cmp -s "$WORK/s10-unset.log" "$WORK/s10-junk.log" || fail "S10 $label: legacy log depends on the two-branch inputs"
+  grep -q '^release_model=' "$WORK/s10-unset.out" && fail "S10 $label: legacy wrote a two-branch output"
+  if [ -n "${COMPUTE_BASELINE:-}" ]; then
+    legacy_run "$COMPUTE_BASELINE" "$repo" s10-base CHANNEL="$channel" LANE="$lane" EXCLUDE_PATHS="$excludes"
+    cmp -s "$WORK/s10-unset.out" "$WORK/s10-base.out" || fail "S10 $label: outputs differ from the baseline"
+    cmp -s "$WORK/s10-unset.log" "$WORK/s10-base.log" || fail "S10 $label: log differs from the baseline"
+  fi
+  read_outputs "$WORK/s10-unset.out"
+}
+s10_case main-stable "$P" main stable
+assert_eq "$OUT_BASE|$OUT_LATEST|$OUT_RELEASE" "v2.0.1|v2.0.1|false" "S10a: legacy stable at a tagged main head"
+s10_case dev-dev "$P" dev dev
+assert_eq "$OUT_BASE|$OUT_DEV|$OUT_LATEST" "v2.0.2|v2.0.2-dev.1|v1.2.0" "S10b: legacy dev on the same history"
+s10_case lane-stable "$L9" main stable yamlenv
+assert_eq "$OUT_BASE|$OUT_LATEST" "yamlenv/v1.0.1|yamlenv/v1.0.1" "S10c: legacy lane at main"
+s10_case root-dev "$L9" dev dev "" 'yamlenv/**'
+assert_eq "$OUT_BASE|$OUT_DEV" "v1.1.0|v1.1.0-dev.1" "S10d: legacy root on dev with the lane excluded"
+echo "ok: S10 legacy outputs and log are independent of the two-branch inputs${COMPUTE_BASELINE:+ and equal the baseline}"
+
+# ── State S11: refusals ─────────────────────────────────────────────────────
+refused "S11a: unknown release model" "release-model must be" "$P" CHANNEL=stable RELEASE_MODEL=both bash "$ACTION"
+refused "S11b: malformed pending version" "is not of the form" "$P" CHANNEL=dev RELEASE_MODEL=two-branch PENDING_VERSION=2.1.0 bash "$ACTION"
+refused "S11c: pending-in-range on a dev run" "describes a stable run" "$P" CHANNEL=dev RELEASE_MODEL=two-branch PENDING_IN_RANGE=true bash "$ACTION"
+refused "S11d: pending-in-range not a boolean" "must be 'true' or 'false'" "$P" CHANNEL=stable RELEASE_MODEL=two-branch PENDING_IN_RANGE=yes bash "$ACTION"
+git -C "$P" update-ref -d refs/remotes/origin/main
+refused "S11e: a dev run with no remote main" "needs refs/remotes/origin/main" "$P" CHANNEL=dev RELEASE_MODEL=two-branch bash "$ACTION"
+refused "S11f: pending-version of a commit that is not a reconciliation" "is not a reconciliation commit" "$P" bash "$ACTION" pending-version "$T"
+refused "S11g: unknown command" "unknown compute.sh command" "$P" bash "$ACTION" pending-versions "$PR"
+git -C "$X8" tag v1.1.9 "$X8T"
+refused "S11h: a stable tag inside the range" "sit inside" "$X8" CHANNEL=stable RELEASE_MODEL=two-branch PENDING_IN_RANGE=true bash "$ACTION"
+
+# ── State S12: a stable run older than H is refused (a re-run, say) ─────────
+Z=$(tb_fixture tb-stale)
+fc "$Z" go.mod "fix(deps): update a module"
+git -C "$Z" tag v1.2.1
+fc "$Z" src/a.go "fix: c1"
+ZC1=$(git -C "$Z" rev-parse HEAD)
+fc "$Z" src/b.go "fix: c2"
+git -C "$Z" tag v1.2.2
+git -C "$Z" checkout -q --detach "$ZC1"
+refused "S12a: a stable run at a commit H's commit is not an ancestor of" "which HEAD does not contain" \
+  "$Z" CHANNEL=stable RELEASE_MODEL=two-branch bash "$ACTION"
+refused "S12b: the same with a promotion in range" "which HEAD does not contain" \
+  "$Z" CHANNEL=stable RELEASE_MODEL=two-branch PENDING_IN_RANGE=true bash "$ACTION"
+git -C "$Z" checkout -q main
+compute_tb "$Z" stable "" false
+assert_eq "$OUT_BASE" "v1.2.2" "S12c: at H's own commit the run repairs H"
+
+# ── State S13: a tagless pending promotion is read up to R, never past it ────
+N13=$(mkfixture tb-tagless)
+fc "$N13" src/main.go "fix: initial"
+git -C "$N13" branch dev
+git -C "$N13" checkout -q dev
+fc "$N13" src/a.go "fix: a dev fix"
+N13R=$(promote "$N13" "$(git -C "$N13" rev-parse dev)")
+fc "$N13" src/b.go "feat!: a break after the promotion"
+cat >"$WORK/cliff-argv" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$WORK/cliff-argv.log"
+exec "$CLIFF" "\$@"
+SH
+chmod 755 "$WORK/cliff-argv"
+: >"$WORK/cliff-argv.log"
+N13_AHEAD=$(cd "$N13" && GIT_CLIFF_CONFIG="$CFG" CLIFF_BIN="$WORK/cliff-argv" bash "$ACTION" pending-version "$N13R" 2>"$WORK/pending.log") \
+  || fail "S13: pending-version failed: $(cat "$WORK/pending.log")"
+assert_eq "$(grep -c -- "--bump --context .* ${N13R}\$" "$WORK/cliff-argv.log")" "1" \
+  "S13a: with no stable tag git-cliff is still bounded by R"
+git -C "$N13" checkout -q --detach "$N13R"
+assert_eq "$N13_AHEAD" "$(pending_of "$N13" "$N13R")" "S13b: the version does not depend on how far the checkout is past R"
+compute_tb "$N13" stable "" true
+assert_eq "$OUT_BASE|$OUT_H_TAG|$OUT_RELEASE" "v1.0.0||true" "S13c: the tagless stable run at R publishes the initial tag"
+
+# ── State S14: below 1.0.0 on cliff-alpha a breaking range reserves a minor ──
+CFG_STABLE="$CFG"
+CFG="$ROOT/configs/cliff-alpha.toml"
+A14=$(mkfixture tb-alpha)
+fc "$A14" src/main.go "feat: initial"
+git -C "$A14" tag v0.3.0
+git -C "$A14" branch dev
+git -C "$A14" checkout -q dev
+fc "$A14" src/api.go "feat!: drop the old flags"
+A14T=$(git -C "$A14" rev-parse dev)
+git -C "$A14" checkout -q main
+fc "$A14" go.mod "fix(deps): update a module"
+git -C "$A14" tag v0.3.1
+publish_main "$A14"
+git -C "$A14" checkout -q dev
+compute_tb "$A14" dev "" false
+assert_eq "$OUT_BASE|$OUT_LEVEL" "v0.4.0|minor" "S14a: a breaking 0.x dev build takes the next minor, not 1.0.0"
+A14R=$(promote "$A14" "$A14T")
+compute_tb "$A14" stable "" true
+assert_eq "$OUT_BASE|$OUT_LEVEL" "v0.4.0|minor" "S14b: a breaking 0.x promotion publishes the next minor"
+assert_eq "$(pending_of "$A14" "$A14R")" "v0.4.0" "S14c: the pending helper agrees"
+CFG="$CFG_STABLE"
+compute_tb "$A14" stable "" true
+assert_eq "$OUT_BASE" "v1.0.0" "S14d: the same promotion on cliff-stable reserves the major (the config is load-bearing)"
 
 echo "PASS: git-cliff $VERSION semantics match the release-gate contract"

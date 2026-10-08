@@ -20,11 +20,18 @@ COVERED = (
     '.github/workflows/ghcr-retention.yaml',
     '.github/workflows/rebuild-stale.yaml',
     'actions/git-cliff-version/action.yml',
+    'actions/intake/action.yml',
 )
 # Named steps in workflows whose other blocks are not held to the prologue.
 COVERED_STEPS = (
     ('.github/workflows/ci.yaml', 'scripts', 'Probe docker-release shell semantics'),
     ('.github/workflows/ci.yaml', 'scripts', 'Probe image-test slot'),
+    ('.github/workflows/ci.yaml', 'scripts', 'Probe release path significance'),
+    ('.github/workflows/ci.yaml', 'scripts', 'Probe reconciliation recogniser'),
+    ('.github/workflows/ci.yaml', 'scripts', 'Probe release notes renderer'),
+    ('.github/workflows/ci.yaml', 'scripts', 'Probe release detect state machine'),
+    ('.github/workflows/ci.yaml', 'scripts', 'Probe two-branch release model end to end'),
+    ('.github/workflows/ci.yaml', 'pr-policy', 'Check results'),
     ('.github/workflows/ci.yaml', 'docker', 'Image smoke test'),
     ('.github/workflows/ci.yaml', 'docker', 'Image test suite'),
     ('.github/workflows/self-ci.yaml', 'release-channel-scripts', 'Install PyYAML'),

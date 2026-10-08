@@ -1,0 +1,85 @@
+# Hourly maintenance of `main` in every repository whose default branch is dev
+# (scripts/release_maintenance.py): merges the green, allowlisted Renovate
+# security pull requests on either branch, expedites the `main` group or opens a
+# rebuild for a fixable finding of the daily scan of `main`, and keeps one
+# `Release blocked` issue per repository. A repository whose default branch is
+# main is never read. Minute 23 keeps clear of Renovate's hourly run.
+name: Release maintenance
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Space/comma-separated repo names to limit the run. Empty runs every repository whose default branch is dev."
+        required: false
+        default: ""
+      dry_run:
+        description: "Plan and report without merging, ticking or writing any issue."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-maintenance
+  cancel-in-progress: false
+
+jobs:
+  maintain:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          ONLY: ${{ inputs.only }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_maintenance.py plan --out "$RUNNER_TEMP/plan.json" --only "$ONLY"
+
+      - name: Merge security pull requests and open rebuilds
+        env:
+          # SYNC_PAT: a merge by the workflow token would start no release run.
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=(merge --plan "$RUNNER_TEMP/plan.json" --out "$RUNNER_TEMP/merged.json")
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          python3 scripts/release_maintenance.py "${args[@]}"
+
+      - name: Report
+        if: ${{ always() && steps.plan.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          args=(report --plan "$RUNNER_TEMP/plan.json" --merged "$RUNNER_TEMP/merged.json"
+            --run-url "$RUN_URL" --summary "$GITHUB_STEP_SUMMARY")
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          python3 scripts/release_maintenance.py "${args[@]}"
+
+  # `needs:` must list every other job in this workflow.
+  notify:
+    needs: [maintain]
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      scope: ${{ inputs.only }}

@@ -1,0 +1,131 @@
+@@ commit B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require example.com/root v1.0.0
+@@ file main.go
+package main
+@@ file tools/go.mod
+module github.com/cplieger/app/tools
+
+go 1.27.1
+
+require example.com/lane v1.0.0
+@@ file tools/tools.go
+package tools
+@@ file internal/sub/go.mod
+module github.com/cplieger/app/internal/sub
+
+go 1.27.1
+@@ file internal/sub/sub.go
+package sub
+@@ file web/go.mod
+module web-ignore
+@@ commit M parent B
+@@ file tools/go.mod
+module github.com/cplieger/app/tools
+
+go 1.27.1
+
+require example.com/lane v1.0.1
+@@ commit T parent B
+@@ file tools/go.mod
+module github.com/cplieger/app/tools
+
+go 1.27.1
+
+require example.com/lane v1.1.0
+@@ commit B_sys parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+	example.com/root v1.0.0
+	example.com/sys v0.30.0
+)
+@@ file internal/sub/go.mod
+module github.com/cplieger/app/internal/sub
+
+go 1.27.1
+
+require example.com/sys v0.30.0
+@@ commit M_sys parent B_sys
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require (
+	example.com/root v1.0.0
+	example.com/sys v0.31.0
+)
+@@ commit T_sys parent B_sys
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require example.com/root v1.0.0
+@@ commit T_sys_lane parent T_sys
+@@ file tools/go.mod
+module github.com/cplieger/app/tools
+
+go 1.27.1
+
+require (
+	example.com/lane v1.0.0
+	example.com/sys v0.30.0
+)
+@@ commit T_sys_split parent T_sys
+@@ file internal/other/go.mod
+module github.com/cplieger/app/internal/other
+
+go 1.27.1
+
+require example.com/sys v0.30.0
+@@ commit T_sys_split_fresh parent T_sys
+@@ file internal/other/go.mod
+module github.com/cplieger/app/internal/other
+
+go 1.27.1
+
+require example.com/sys v0.31.0
+@@ commit B_indirect parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require example.com/root v1.0.0 // indirect
+@@ commit B_indirect_bump parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require example.com/root v1.1.0 // indirect
+@@ commit M_root_bump parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require example.com/root v1.1.0
+@@ commit T_root_newer parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require example.com/root v1.2.0
+@@ commit T_root_newer_indirect parent B
+@@ file go.mod
+module github.com/cplieger/app
+
+go 1.27.1
+
+require example.com/root v1.2.0 // indirect

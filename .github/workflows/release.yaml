@@ -3,8 +3,8 @@
 # the channel travels as data from there: a push to `dev` publishes the dev
 # channel (`vX.Y.Z-dev.N` tags, `:dev` images on GHCR, the npm `dev` dist-tag,
 # no GitHub Release); any other branch publishes the stable channel (`vX.Y.Z`,
-# GHCR + Docker Hub, npm + JSR, a GitHub Release). Path significance is the
-# EXCLUDE_PATTERNS list in detect, so a push touching only excluded paths
+# GHCR + Docker Hub, npm + JSR, a GitHub Release). Path significance is
+# scripts/path-significance.sh, so a push touching only excluded paths
 # publishes nothing; per-repo policy is the "Resolve repo policy" step.
 name: Release
 
@@ -29,12 +29,18 @@ concurrency:
 jobs:
   detect:
     runs-on: ubuntu-26.04
-    timeout-minutes: 3
+    # Two-branch detect also finds and numbers pending promotions and reads receipts.
+    timeout-minutes: >-
+      ${{ (github.event.repository.default_branch == 'dev' && !github.event.repository.private
+      && !github.event.repository.fork) && 5 || 3 }}
     outputs:
       channel: ${{ steps.channel.outputs.channel }}
+      # legacy | two-branch; every two-branch step and job keys on it.
+      release_model: ${{ steps.channel.outputs.release_model }}
+      mode: ${{ steps.channel.outputs.mode }}
       type: ${{ steps.type.outputs.type }}
       subpackages: ${{ steps.type.outputs.subpackages }}
-      subpackages_to_publish: ${{ steps.changes.outputs.subpackages_to_publish }}
+      subpackages_to_publish: ${{ steps.publish.outputs.subpackages_to_publish || steps.changes.outputs.subpackages_to_publish }}
       # version is the tag this run creates: the dev version on dev, the
       # stable base on stable. base and dev_version are both exposed because
       # docker-release derives vX / vX.Y from the base on either channel.
@@ -44,17 +50,26 @@ jobs:
       dev_version: ${{ steps.select.outputs.dev_version }}
       latest: ${{ steps.cliff.outputs.latest }}
       exclude_re: ${{ steps.changes.outputs.exclude_re }}
-      root_changed: ${{ steps.changes.outputs.root_changed }}
+      root_changed: ${{ steps.publish.outputs.root_changed || steps.changes.outputs.root_changed }}
       go_modules: ${{ steps.gomodules.outputs.go_modules }}
-      go_modules_to_release: ${{ steps.changes.outputs.go_modules_to_release }}
+      go_modules_to_release: ${{ steps.publish.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}
       # finalize: a prior run tagged this exact commit but died before its
       # GitHub Release; the publish jobs re-run for the tagged version and
       # create the missing Release (see the step).
       finalize: ${{ steps.finalize.outputs.finalize }}
-      # promotion_note: the sentence the stable release notes carry when the
-      # promotion skipped the deployment soak (promote.py records the reason as a
-      # commit status on the promoted commit); empty otherwise.
-      promotion_note: ${{ steps.promotion.outputs.promotion_note }}
+      # The root lane's release-kind line; empty under legacy.
+      release_kind_note: ${{ steps.pending.outputs.root_kind_note }}
+      # Two-branch only: per-lane state keyed '.' (root) or the lane dir, the
+      # lane matrix, the repairs owed (those completing TS subpackages, and
+      # the image's, apart) and the Renovate security merges.
+      lane_state: ${{ steps.number.outputs.state || steps.pending.outputs.state }}
+      lanes: ${{ steps.pending.outputs.lanes }}
+      in_range_any: ${{ steps.pending.outputs.in_range_any }}
+      repairs: ${{ steps.receipts.outputs.repairs }}
+      repair_publishes: ${{ steps.receipts.outputs.repair_publishes }}
+      repair_images: ${{ steps.receipts.outputs.repair_images }}
+      security_shas: ${{ steps.receipts.outputs.security_shas }}
+      exclude_paths: ${{ steps.gomodules.outputs.exclude_paths }}
       registries: ${{ steps.policy.outputs.registries }}
       platforms: ${{ steps.policy.outputs.platforms }}
       sbom_from: ${{ steps.policy.outputs.sbom_from }}
@@ -72,9 +87,18 @@ jobs:
       # The only place in the release pipeline that reads a branch name.
       # Everything downstream, docker-release.yaml included, receives the
       # channel as data, so a repo that has not adopted a dev branch keeps
-      # the stable behaviour on main unchanged.
+      # the stable behaviour on main unchanged. The release model is read
+      # here too: two-branch exactly when a public, non-fork repo's default
+      # branch is dev.
       - name: Select channel
         id: channel
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          REPO_FORK: ${{ github.event.repository.fork }}
+          # A dispatch input read off the event, never `with:` (a v2 pin
+          # declares no such input).
+          INPUT_MODE: ${{ github.event.inputs.mode }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_REF" = "refs/heads/dev" ]; then
@@ -84,6 +108,30 @@ jobs:
           fi
           echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
           echo "Channel: $CHANNEL ($GITHUB_REF)"
+          RELEASE_MODEL=legacy
+          MODE=normal
+          if [ "$DEFAULT_BRANCH" = dev ] && [ "$REPO_PRIVATE" != true ] && [ "$REPO_FORK" != true ]; then
+            RELEASE_MODEL=two-branch
+            case "$INPUT_MODE" in
+              '' | normal) ;;
+              renumber)
+                if [ "$CHANNEL" != dev ]; then
+                  echo "::error::mode=renumber renumbers dev builds. Dispatch it on dev, not on ${GITHUB_REF}."
+                  exit 1
+                fi
+                MODE=renumber
+                ;;
+              *)
+                echo "::error::unknown mode '${INPUT_MODE}' (normal or renumber)"
+                exit 1
+                ;;
+            esac
+          fi
+          {
+            echo "release_model=$RELEASE_MODEL"
+            echo "mode=$MODE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release model: $RELEASE_MODEL (default branch ${DEFAULT_BRANCH:-<unknown>}), mode: $MODE"
 
       - name: Detect type + subpackages
         id: type
@@ -196,22 +244,68 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "nested Go module lanes: $LANES"
 
-      # A composite action cannot be a local `./actions/...` ref here: that
-      # resolves against the CONSUMER's checkout and 404s. The action's channel
-      # outputs land in the same commit as this workflow, so the ref is the
-      # major tag until that commit's SHA exists (zizmor: cplieger/* ref-pin);
-      # Select version refuses an older action instead of publishing from
-      # empty outputs.
-      - name: Compute version (cliff)
-        id: cliff
-        uses: cplieger/ci/actions/git-cliff-version@v3
+      # Every job runs the scripts and actions of the commit this workflow
+      # runs from, checked out beside the consumer's tree: a `uses:` ref to
+      # this repository would run another commit's code under the caller's pin.
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # Two-branch only. Token-free: the steps up to Compute version run the
+      # repository's cliff config.
+      - name: Find pending promotions
+        id: pending
+        if: ${{ steps.channel.outputs.release_model == 'two-branch' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+          REPO_TYPE: ${{ steps.type.outputs.type }}
+          SUBPACKAGES_JSON: ${{ steps.type.outputs.subpackages }}
+          GO_LANES_JSON: ${{ steps.gomodules.outputs.go_modules }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" pending
+
+      # Numbering a promotion needs git-cliff, which the compute action
+      # installs; its own version outputs are not read.
+      - name: Install git-cliff for promotion numbering
+        id: cliff0
+        if: ${{ steps.pending.outputs.any == 'true' }}
+        uses: ./.cplieger-ci/actions/git-cliff-version
         with:
           channel: ${{ steps.channel.outputs.channel }}
           exclude-paths: ${{ steps.gomodules.outputs.exclude_paths }}
 
+      - name: Number pending promotions
+        id: number
+        if: ${{ steps.pending.outputs.any == 'true' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CLIFF_SCRIPT: ${{ steps.cliff0.outputs.script }}
+          STATE: ${{ steps.pending.outputs.state }}
+          EXCLUDE_PATHS: ${{ steps.gomodules.outputs.exclude_paths }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" number
+
+      - name: Compute version (cliff)
+        id: cliff
+        uses: ./.cplieger-ci/actions/git-cliff-version
+        with:
+          channel: ${{ steps.channel.outputs.channel }}
+          exclude-paths: ${{ steps.gomodules.outputs.exclude_paths }}
+          release-model: ${{ steps.channel.outputs.release_model }}
+          pending-version: ${{ steps.channel.outputs.channel == 'dev' && steps.number.outputs.root_version || '' }}
+          pending-in-range: ${{ steps.pending.outputs.root_in_range || 'false' }}
+
       - name: Detect changed paths
         id: changes
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           BEFORE: ${{ github.event.before }}
           HEAD: ${{ github.sha }}
           CHANNEL: ${{ steps.channel.outputs.channel }}
@@ -219,421 +313,47 @@ jobs:
           SUBPACKAGES_JSON: ${{ steps.type.outputs.subpackages }}
           GO_LANES_JSON: ${{ steps.gomodules.outputs.go_modules }}
           REPO_TYPE: ${{ steps.type.outputs.type }}
+          RELEASE_MODEL: ${{ steps.channel.outputs.release_model }}
         run: |
           set -euo pipefail
-          # The range is <anchor>..HEAD, the anchor being the channel's newest
-          # reachable tag: the previous push's tag on a routine push, which
-          # equals the push range; wider after a run that died before tagging
-          # or after untagged docs-only pushes, so their content still counts;
-          # on stable, everything since the last stable release. A dispatch
-          # (no `before`) keeps "every tracked file" so it stays the repair
-          # lever, and an unreachable `before` (force push) does the same.
-          RANGE_START=""
-          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-            echo "::notice::No before SHA — treating all tracked files as changed"
-            CHANGED=$(git ls-files)
-          elif [ -n "$ANCHOR_SHA" ]; then
-            if CHANGED=$(git diff --name-only "$ANCHOR_SHA..$HEAD" 2>/dev/null); then
-              RANGE_START="$ANCHOR_SHA"
-              BEFORE="$ANCHOR_SHA"
-              echo "::notice::deriving changed paths from ${ANCHOR_SHA}..HEAD (newest tag on this channel)"
-            else
-              echo "::notice::git diff from the anchor failed — treating all tracked files as changed"
-              CHANGED=$(git ls-files)
-            fi
-          elif CHANGED=$(git diff --name-only "$BEFORE..$HEAD" 2>/dev/null); then
-            RANGE_START="$BEFORE"
-          else
-            echo "::notice::git diff failed (force push or unreachable history) — treating all tracked files as changed"
-            CHANGED=$(git ls-files)
-          fi
+          bash "$CI_TOOLS/path-significance.sh"
 
-          # Central exclusion patterns. Tight by default: anything that doesn't
-          # ship in the artifact (tests, lint configs, generated bundles, docs,
-          # CI metadata) is excluded. To loosen, remove entries from this array.
-          # The patterns use extended regex (grep -E).
-          EXCLUDE_PATTERNS=(
-            # Editor / formatter / linter configs
-            '(^|/)\.editorconfig$'
-            '(^|/)\.gitignore$'
-            '(^|/)\.gitattributes$'
-            '(^|/)\.dockerignore$'
-            '(^|/)\.prettierrc(\.json|\.yaml|\.toml)?$'
-            '(^|/)\.prettierignore$'
-            '(^|/)\.htmlvalidate\.json$'
-            '(^|/)\.stylelintrc\.json$'
-            '(^|/)eslint\.config\.(mjs|js|cjs)$'
-            '(^|/)eslint\.config\.base\.mjs$'
-            '(^|/)vitest\.config\.(ts|js)$'
-            '(^|/)tsconfig\.(test|tests|node)\.json$'
-            # Base tsconfig.json: root-anchored ONLY. In the Go+web docker repos
-            # a nested static-src/tsconfig.json is a tsc build input (it
-            # compiles the web client that main.go then embeds), so it MUST
-            # trigger a rebuild — do NOT broaden this to (^|/). Pure-TS libs
-            # (actions, reactive) and TS subpackages keep their base tsconfig
-            # at root.
-            '^tsconfig\.json$'
-            # knip: all eight locations the tool itself loads
-            # (KNIP_CONFIG_LOCATIONS in knip/dist/constants.js). A repo that
-            # opted in on any form other than knip.json was rebuilding on a
-            # config-only commit.
-            '(^|/)(\.knip\.jsonc?|knip\.(jsonc?|[jt]s)|knip\.config\.[jt]s)$'
-            '(^|/)stryker\.config\.json$'
-            '(^|/)\.golangci\.(yaml|yml)$'
-            # Gremlins (Go mutation testing) config — synced across the repos from
-            # cplieger/ci into every Go repo, like .golangci. Dev-only; never
-            # COPY'd/embedded into any artifact.
-            '(^|/)\.gremlins\.(yaml|yml)$'
-            # Ruff (Python lint/format) config, synced from cplieger/ci to the
-            # Python repo (.kiro). Dev-only; never shipped.
-            '(^|/)ruff\.toml$'
-
-            # Docs and license
-            '\.md$'
-            '(^|/)LICENSE$'
-            # Recommended alert rules shipped as README-companion
-            # documentation — consumed by operators copy-pasting into their own
-            # monitoring stack, never by any Dockerfile or published package.
-            #
-            # Two patterns, because the convention moved. A bundle now lives in
-            # an `alerts/` FOLDER, one file per expression language, because a
-            # ruler parses every expression in the file it loads and PromQL and
-            # LogQL are mutually unparseable: `promtool check rules` rejects the
-            # LogQL half and `lokitool rules lint` rejects the PromQL half, so a
-            # single mixed file loads in neither. The root form stays matched for
-            # as long as any repo has not migrated; drop it once none has.
-            '^alerts/'
-            '^alerts\.yaml$'
-
-            # CI / security tooling configs
-            '(^|/)cliff\.toml$'
-            '(^|/)renovate\.json$'
-            '(^|/)\.gitleaks\.toml$'
-            '(^|/)\.codeql-suppressions\.yaml$'
-            '(^|/)\.trivyignore$'
-            '(^|/)\.syft\.yaml$'
-            # punused adjudications for the go-ci unused-export gate. Repo-owned
-            # (unlike its siblings above it is not synced), read by go-ci relative
-            # to its working-directory so a nested module carries its own — hence
-            # (^|/). Dev-only: nothing COPYs or embeds it, so an adjudication-only
-            # commit changes no artifact.
-            '(^|/)\.punused-ignore$'
-            '^\.github/'
-
-            # Go test code
-            '_test\.go$'
-            '(^|/)testdata/'
-            '(^|/)testsupport/'
-            '(^|/)testcerts/'
-            '(^|/)authtest/'
-
-            # TS test code
-            '\.test\.ts$'
-            '\.spec\.ts$'
-            '\.fuzz\.test\.ts$'
-            '\.property\.test\.ts$'
-            '(^|/)__test-helpers__/'
-            '(^|/)__snapshots__/'
-            '(^|/)test-stubs/'
-            '(^|/)fc-strict-setup\.ts$'
-
-            # Generated / vendored output
-            '(^|/)dist/'
-            '(^|/)coverage/'
-            '(^|/)node_modules/'
-            '(^|/)static/[^/]+\.js$'
-            '(^|/)static/[^/]+\.js\.map$'
-            '(^|/)static/style\.css$'
-            '(^|/)static/vendor/'
-
-            # Dependency lockfiles — dev/build artifacts, never shipped to
-            # npm/JSR consumers (npm publish omits the lockfile; consumers
-            # resolve from package.json ranges). Verified not consumed by any
-            # repo Dockerfile, so excluding them is safe across docker/go/ts
-            # types. This stops Renovate "Lock File Maintenance"
-            # (chore(deps): lock file maintenance) — which touches only the
-            # lockfile — from flipping root_changed=true and triggering a
-            # spurious npm/JSR publish or image rebuild. package.json itself
-            # is NOT excluded here; it gets type-aware handling in the
-            # "Refine package.json significance" step below (dev-only changes
-            # never ship, so they must not trigger a build/release).
-            '(^|/)package-lock\.json$'
-            '(^|/)npm-shrinkwrap\.json$'
-            '(^|/)yarn\.lock$'
-            '(^|/)pnpm-lock\.yaml$'
-            '(^|/)bun\.lockb$'
-            '(^|/)bun\.lock$'
-
-            # Dev convenience / manual test scripts
-            '^compose\.yaml$'
-            '^test-validate\.sh$'
-            '(^|/)setup-tools\.test\.sh$'
-            '^tests/'
-          )
-
-          # The array above is the authoritative exclusion list. It already
-          # covers every file cplieger/ci syncs into consumer repos (editor,
-          # lint, CI, and changelog configs), plus tests, generated output, and
-          # lockfiles: shared, non-shipping config that a chore(sync): or
-          # Renovate commit must not turn into a rebuild/republish. When a NEW
-          # synced config type is added, add its path to the array above in the
-          # same change. (Previously auto-derived by fetching cplieger/ci's
-          # sync.yml at runtime; that manifest is no longer committed, the sync
-          # workflow generates it on the fly, so the exclusions are kept
-          # explicit here.)
-          #
-          # Counterpart: the consumer cliff.toml (configs/cliff-stable.toml /
-          # cliff-alpha.toml) carries an `exclude_paths` list so the RELEASE
-          # gate (version bump + notes) agrees with this BUILD gate. That list
-          # must stay a strict subset of this one — when removing a pattern
-          # here (making a path significant again), remove it there first.
-
-          # Join patterns with | for a single grep -E invocation.
-          EXCLUDE_RE=$(IFS='|'; echo "${EXCLUDE_PATTERNS[*]}")
-
-          # Filter: keep only paths that DON'T match any exclude pattern.
-          if [ -z "$CHANGED" ]; then
-            SIGNIFICANT=""
-          else
-            SIGNIFICANT=$(echo "$CHANGED" | grep -Ev "$EXCLUDE_RE" || true)
-          fi
-
-          # A commit with no file changes exists only to force a build (the
-          # base-package rebuild), and git-cliff cannot see it, so it counts
-          # as a significant root change here.
-          EMPTY_COMMIT=""
-          if [ -z "$SIGNIFICANT" ] && [ -n "$RANGE_START" ]; then
-            while IFS= read -r c; do
-              [ -z "$c" ] && continue
-              if [ -z "$(git diff-tree --root --no-commit-id --name-only -r "$c")" ]; then
-                EMPTY_COMMIT="$c"
-                echo "::notice::commit ${c} changes no file; treating it as a significant root change"
-                break
-              fi
-            done < <(git rev-list --no-merges "$RANGE_START..$HEAD")
-          fi
-
-          # Refine package.json significance (type-aware). package.json is the
-          # one file that is both a dev artifact (devDependencies, scripts) and,
-          # for TS libs, the published manifest. A blanket exclude would let a
-          # real runtime-dep / exports / files change ship without republishing;
-          # leaving it fully significant lets a devDependency bump mint a
-          # spurious release (the bug this fixes). So:
-          #
-          # The question is not the REPO's type but whether THAT package.json is
-          # a published manifest:
-          #
-          #   published manifest : every `<subpkg>/package.json` for a declared TS
-          #                 subpackage, plus the root one in a ts repo. It is the
-          #                 npm tarball manifest, but devDependencies never ship,
-          #                 so keep it significant only when a
-          #                 non-devDependencies field changed (compare
-          #                 before/after with devDependencies stripped).
-          #
-          # `overrides` is stripped on the same footing as devDependencies, for
-          # a stronger reason than "it does not ship": it DOES ship in the
-          # tarball and is inert there. npm considers overrides only in the root
-          # package.json of the project being installed and ignores them inside
-          # an installed dependency, so a consumer resolves the same tree
-          # whatever a published manifest says here
-          # (https://docs.npmjs.com/cli/v11/configuring-npm/package-json).
-          # An overrides-only edit therefore cannot change any artifact, so it
-          # must not republish byte-identical source. Before this, the commit
-          # SCOPE was the only thing preventing that: `chore(devdeps)` is
-          # skipped by cliff so `release` stays false, but a mislabeled
-          # `fix:`/`feat:` carrying the same diff would have published. That is
-          # commit hygiene guarding a release gate, which is the wrong way
-          # round. Found 2026-09-02 while floating the transitive `qs` CVE
-          # override across 10 repos: 7 of them keep that override in a
-          # published manifest, either a ts root (`fetch`, `actions`,
-          # `reactive`, `ui-primitives`, `web-terminal-ui`) or a declared
-          # subpackage (`keyenc/web`, `web-terminal-engine/web`).
-          #   anything else : dev tooling. NO build artifact reads it (web-UI
-          #                 images pin TS deps as Dockerfile ARGs + tsc; verified
-          #                 no Dockerfile references package.json). Drop it.
-          #
-          # Keying on REPO_TYPE alone was wrong for a HYBRID repo: it is type=go
-          # because its ROOT is a Go module, while `web/package.json` is the npm
-          # manifest -- so the docker/go blanket drop made a subpackage-only
-          # change invisible and no release could ever publish that subpackage.
-          # keyenc hit it: its first release failed at npm for an unrelated
-          # reason, and afterwards no run could repair the missing publish
-          # because every commit touching web/ was dropped here.
-          if [ -n "$SIGNIFICANT" ] && echo "$SIGNIFICANT" | grep -qE '(^|/)package\.json$'; then
-            MANIFESTS=$(echo "$SUBPACKAGES_JSON" | jq -r '.[] | . + "/package.json"')
-            if [ "$REPO_TYPE" = "ts" ]; then
-              MANIFESTS=$(printf '%s\npackage.json\n' "$MANIFESTS")
-            fi
-            while IFS= read -r pj; do
-              [ -z "$pj" ] && continue
-              if ! printf '%s\n' "$MANIFESTS" | grep -qxF "$pj"; then
-                SIGNIFICANT=$(echo "$SIGNIFICANT" | grep -vxF "$pj" || true)
-                echo "::notice::$pj is not a published manifest — dropped from significance"
-                continue
-              fi
-              # A published manifest. With no BEFORE to diff against, fail OPEN
-              # (stay significant): a missed publish is worse than a spurious one.
-              if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
-                b=$(git show "$BEFORE:$pj" 2>/dev/null | jq -S 'del(.devDependencies, .overrides)' 2>/dev/null || echo "")
-                h=$(git show "$HEAD:$pj"   2>/dev/null | jq -S 'del(.devDependencies, .overrides)' 2>/dev/null || echo "")
-                if [ -n "$b" ] && [ "$b" = "$h" ]; then
-                  SIGNIFICANT=$(echo "$SIGNIFICANT" | grep -vxF "$pj" || true)
-                  echo "::notice::$pj changed only in devDependencies/overrides — not significant"
-                fi
-              fi
-            done < <(echo "$SIGNIFICANT" | grep -E '(^|/)package\.json$')
-          fi
-
-          # Determine root_changed (any significant file outside all subpackage
-          # dirs AND all nested Go module lane dirs) and which subpackages /
-          # lanes changed. A lane dir's changes belong to that lane's release,
-          # not the root's — the same classification the TS subpackages use.
-          ROOT_CHANGED=false
-          declare -A SUBPKG_CHANGED
-          declare -A LANE_CHANGED
-          declare -A LANE_ANCHOR
-          mapfile -t SUBPACKAGES < <(echo "$SUBPACKAGES_JSON" | jq -r '.[]')
-          mapfile -t GO_LANES < <(echo "$GO_LANES_JSON" | jq -r '.[]')
-          for s in "${SUBPACKAGES[@]}"; do
-            SUBPKG_CHANGED["$s"]=false
-          done
-
-          # A lane's change set is measured from ITS newest channel tag, never
-          # the root's: the root anchor ignores lane tags, so after a lane-only
-          # release it still predates that release, and the next root or docs
-          # commit would read the lane's old change again and republish an
-          # unchanged lane. Same exact-regex nearest-tag rule as compute.sh's
-          # nearest_tag, so detect and the lane job agree on the anchor.
-          lane_anchor() { # <dir> -> commit of the lane's channel tag nearest HEAD, or nothing
-            local esc re name obj peeled commit
-            local -A tag_at=()
-            esc=$(printf '%s' "$1" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
-            re="^${esc}/v[0-9]+\\.[0-9]+\\.[0-9]+\$"
-            if [ "$CHANNEL" = dev ]; then
-              re="${re}|${re%\$}-dev\\.[0-9]+\$"
-            fi
-            while read -r name obj peeled; do
-              [[ $name =~ $re ]] || continue
-              tag_at["${peeled:-$obj}"]="$name"
-            done < <(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)')
-            [ "${#tag_at[@]}" -gt 0 ] || return 0
-            while read -r commit; do
-              if [ -n "${tag_at[$commit]:-}" ]; then
-                printf '%s' "$commit"
-                return 0
-              fi
-            done < <(git rev-list --topo-order "$HEAD")
-          }
-          for l in "${GO_LANES[@]}"; do
-            LANE_CHANGED["$l"]=false
-            LANE_ANCHOR["$l"]="$(lane_anchor "$l")"
-          done
-
-          if [ -n "$EMPTY_COMMIT" ]; then
-            ROOT_CHANGED=true
-          fi
-          if [ -n "$SIGNIFICANT" ]; then
-            while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              in_subpkg=false
-              for s in "${SUBPACKAGES[@]}"; do
-                if [[ "$f" == "$s/"* ]]; then
-                  SUBPKG_CHANGED["$s"]=true
-                  in_subpkg=true
-                  break
-                fi
-              done
-              in_lane=false
-              for l in "${GO_LANES[@]}"; do
-                if [[ "$f" == "$l/"* ]]; then
-                  in_lane=true
-                  # A lane without a tag on this channel has its first release
-                  # owed by whatever the root range shows under it.
-                  if [ -z "${LANE_ANCHOR[$l]}" ]; then
-                    LANE_CHANGED["$l"]=true
-                  fi
-                  break
-                fi
-              done
-              if ! $in_subpkg && ! $in_lane; then
-                ROOT_CHANGED=true
-              fi
-            done <<< "$SIGNIFICANT"
-          fi
-
-          # A lane with a tag on this channel is owed a release when a shipped
-          # path under it changed since that tag. On stable a lane tag at this
-          # commit is emitted too, so the lane job can run the Release repair
-          # the root runs in Detect finalize state.
-          for l in "${GO_LANES[@]}"; do
-            anchor="${LANE_ANCHOR[$l]}"
-            [ -n "$anchor" ] || continue
-            if [ "$anchor" = "$HEAD" ]; then
-              if [ "$CHANNEL" = stable ]; then
-                LANE_CHANGED["$l"]=true
-              fi
-              continue
-            fi
-            echo "::notice::lane ${l}: deriving changed paths from ${anchor}..HEAD (newest lane tag on this channel)"
-            lane_diff=$(git diff --name-only "$anchor..$HEAD" -- "$l/")
-            if [ -n "$lane_diff" ] && grep -Eqv "$EXCLUDE_RE" <<< "$lane_diff"; then
-              LANE_CHANGED["$l"]=true
-            fi
-          done
-
-          SUBS_TO_PUBLISH="[]"
-          for s in "${SUBPACKAGES[@]}"; do
-            if [ "${SUBPKG_CHANGED[$s]}" = "true" ]; then
-              SUBS_TO_PUBLISH=$(echo "$SUBS_TO_PUBLISH" | jq -c --arg v "$s" '. + [$v]')
-            fi
-          done
-
-          GO_LANES_TO_RELEASE="[]"
-          for l in "${GO_LANES[@]}"; do
-            if [ "${LANE_CHANGED[$l]}" = "true" ]; then
-              GO_LANES_TO_RELEASE=$(echo "$GO_LANES_TO_RELEASE" | jq -c --arg v "$l" '. + [$v]')
-            fi
-          done
-
-          {
-            echo "root_changed=$ROOT_CHANGED"
-            echo "subpackages_to_publish=$SUBS_TO_PUBLISH"
-            echo "go_modules_to_release=$GO_LANES_TO_RELEASE"
-            echo "exclude_re=$EXCLUDE_RE"
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            echo "## Change detection summary"
-            echo ""
-            echo "**Before:** \`$BEFORE\`"
-            echo "**Head:** \`$HEAD\`"
-            echo ""
-            echo "**Significant paths:**"
-            echo '```'
-            echo "${SIGNIFICANT:-(none — only excluded paths changed)}"
-            if [ -n "$EMPTY_COMMIT" ]; then
-              echo "(commit ${EMPTY_COMMIT} changes no file and counts as a root change)"
-            fi
-            echo '```'
-            echo ""
-            echo "**Outputs:**"
-            echo "- root_changed: $ROOT_CHANGED"
-            echo "- subpackages_to_publish: $SUBS_TO_PUBLISH"
-            echo "- go_modules_to_release: $GO_LANES_TO_RELEASE"
-          } >> "$GITHUB_STEP_SUMMARY"
+      # Two-branch stable: a pending promotion in this run's range publishes
+      # its lanes whatever the triggering commit changed.
+      - name: Add pending promotions to the publication
+        id: publish
+        if: |
+          steps.channel.outputs.release_model == 'two-branch' && steps.channel.outputs.channel == 'stable'
+          && steps.pending.outputs.in_range_any == 'true'
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+          STATE: ${{ steps.pending.outputs.state }}
+          ROOT_CHANGED: ${{ steps.changes.outputs.root_changed }}
+          SUBPACKAGES_TO_PUBLISH: ${{ steps.changes.outputs.subpackages_to_publish }}
+          GO_MODULES_TO_RELEASE: ${{ steps.changes.outputs.go_modules_to_release }}
+          REPO_TYPE: ${{ steps.type.outputs.type }}
+          SUBPACKAGES_JSON: ${{ steps.type.outputs.subpackages }}
+          GO_LANES_JSON: ${{ steps.gomodules.outputs.go_modules }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" publish
 
       # The release decision is "a shipped path changed and this commit is
       # not already tagged on this channel"; git-cliff only decides the bump
-      # level, and a level of "none" on a real change becomes a patch floor.
-      # A changed TS subpackage counts: it shares the root version, so its
-      # publish needs the root tag the go job creates, while the root image
-      # rebuilds on root_changed alone.
+      # level, and a level of "none" on a real change becomes a patch floor
+      # (legacy only: two-branch compute never proposes the latest stable
+      # version for an untagged commit). A changed TS subpackage counts: it
+      # shares the root version, so its publish needs the root tag the go job
+      # creates, while the root image rebuilds on root_changed alone. A
+      # renumber run publishes nothing here; the renumber jobs tag it.
       - name: Select version
         id: select
         env:
           CHANNEL: ${{ steps.channel.outputs.channel }}
-          ROOT_CHANGED: ${{ steps.changes.outputs.root_changed }}
-          SUBPACKAGES_TO_PUBLISH: ${{ steps.changes.outputs.subpackages_to_publish }}
+          MODE: ${{ steps.channel.outputs.mode }}
+          ROOT_CHANGED: ${{ steps.publish.outputs.root_changed || steps.changes.outputs.root_changed }}
+          SUBPACKAGES_TO_PUBLISH: ${{ steps.publish.outputs.subpackages_to_publish || steps.changes.outputs.subpackages_to_publish }}
           BASE: ${{ steps.cliff.outputs.base }}
           DEV_VERSION: ${{ steps.cliff.outputs.dev_version }}
           FLOOR_BASE: ${{ steps.cliff.outputs.floor_base }}
@@ -643,7 +363,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$BASE" ]; then
-            echo "::error::git-cliff-version returned no base: the referenced action predates the channel outputs"
+            echo "::error::git-cliff-version returned no base"
             exit 1
           fi
           RELEASE=false
@@ -656,6 +376,10 @@ jobs:
             echo "::notice::git-cliff proposes no bump for a shipped change; flooring ${BASE} to ${FLOOR_BASE}"
             BASE="$FLOOR_BASE"
             DEV_VERSION="$FLOOR_DEV_VERSION"
+          fi
+          if [ "$MODE" = "renumber" ]; then
+            echo "::notice::Renumber mode builds and publishes nothing. The renumber jobs re-tag dev's newest build."
+            RELEASE=false
           fi
           if [ "$CHANNEL" = "dev" ]; then
             VERSION="$DEV_VERSION"
@@ -670,16 +394,17 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Selected: channel=${CHANNEL} version=${VERSION} base=${BASE} release=${RELEASE} (latest stable: ${LATEST:-<none>})"
 
-      # Stable only: a dev build has no Release to repair. On stable a prior
-      # run can tag this commit and die before the Release; the compute then
-      # says release=false (anchor == HEAD) and nothing would ever repair it,
-      # while moving the tag is forbidden. finalize=true re-runs the publish
+      # Legacy, stable only: a dev build has no Release to repair. On stable a
+      # prior run can tag this commit and die before the Release; the compute
+      # then says release=false (anchor == HEAD) and nothing would ever repair
+      # it, while moving the tag is forbidden. finalize=true re-runs the publish
       # jobs for the tagged version: the tag guard reuses the tag, npm and JSR
       # skip an existing version, the image tags move to a rebuild of the
       # same commit, and the missing Release gets --current notes (states K/L).
+      # Two-branch repairs by completion receipt instead (the repair jobs).
       - name: Detect finalize state
         id: finalize
-        if: ${{ steps.channel.outputs.channel == 'stable' }}
+        if: ${{ steps.channel.outputs.channel == 'stable' && steps.channel.outputs.release_model == 'legacy' }}
         env:
           GH_TOKEN: ${{ github.token }}
           EFFECTIVE_RELEASE: ${{ steps.select.outputs.release }}
@@ -712,34 +437,21 @@ jobs:
           fi
           echo "finalize=$FINALIZE" >> "$GITHUB_OUTPUT"
 
-      # Every promotion writes the `promotion/soak-override` status on the
-      # promoted commit before main moves: state success with the reason when
-      # the deployment soak was skipped, success with an empty description when it
-      # was not (so an older reason on the commit is retired), failure when the
-      # ref update failed. The stable release notes repeat the reason of the
-      # newest row by `updated_at` then `id` (the API documents no row order,
-      # two writes can share a second), only from a success. A read error
-      # warns rather than blocking the release; the run summary has the reason.
-      - name: Read promotion record
-        id: promotion
-        if: ${{ steps.channel.outputs.channel == 'stable' }}
+      # A tag alone does not prove a complete publication (tags precede the
+      # Release and the readback): the repair jobs complete each lane's
+      # highest stable tag that lacks its completion receipt before anything
+      # newer is published.
+      - name: Read release receipts
+        id: receipts
+        if: ${{ steps.channel.outputs.release_model == 'two-branch' && steps.channel.outputs.channel == 'stable' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          STATE: ${{ steps.number.outputs.state || steps.pending.outputs.state }}
+          REPO_TYPE: ${{ steps.type.outputs.type }}
         run: |
           set -euo pipefail
-          NOTE=""
-          FILTER='[.statuses[]|select(.context=="promotion/soak-override")]|max_by([.updated_at,.id])|select(.state=="success").description // ""'
-          # The description is free text another writer posted; the runner
-          # rejects a key=value output holding a newline, so it is read as one line.
-          if REASON=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/status" --jq "$FILTER" 2>"$RUNNER_TEMP/promerr" | tr -d '\n\r'); then
-            if [ -n "$REASON" ]; then
-              NOTE="_Promoted without the deployment soak check: ${REASON}_"
-            fi
-          else
-            echo "::warning::could not read the promotion record for ${GITHUB_SHA}: $(cat "$RUNNER_TEMP/promerr")"
-          fi
-          echo "promotion_note=$NOTE" >> "$GITHUB_OUTPUT"
-          echo "Promotion note: ${NOTE:-<none>}"
+          bash "$CI_TOOLS/release-state.sh" receipts
 
       - name: Resolve repo policy
         id: policy
@@ -836,18 +548,807 @@ jobs:
 
           echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS sbom_from=$SBOM_FROM syft_config='$SYFT_CONFIG' image_licenses='$IMAGE_LICENSES'"
 
+  # ─── Two-branch: repair each lane's unreceipted stable tag first ───────────
+  # A lane's tag follows its registry writes, so a failed run can leave only
+  # its Release, its readback and the TS subpackages (published after the root
+  # tag) missing. These jobs complete them at the tag's own commit and range in
+  # this run, with no dispatch, so the per-ref concurrency group cannot
+  # deadlock. A step reaches its job's later steps through GITHUB_PATH and
+  # GITHUB_ENV, so the job running the cliff config holds no write scope.
+  repair-notes:
+    needs: detect
+    if: ${{ needs.detect.outputs.repairs != '' && needs.detect.outputs.repairs != '[]' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.repairs) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Check the Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" handoff-name repair-notes "$TAG" | sed 's/^/artifact=/' >> "$GITHUB_OUTPUT"
+          state=$(bash "$CI_TOOLS/release-exists.sh" "$TAG")
+          if [ "$state" = present ]; then
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+            echo "${TAG} has its Release; reading it back"
+          else
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${TAG} has no Release, so its notes are rendered at its own commit"
+          fi
+
+      # Installs the pinned git-cliff; the computed version is not read.
+      - name: Install git-cliff
+        if: ${{ steps.release.outputs.missing == 'true' }}
+        uses: ./.cplieger-ci/actions/git-cliff-version
+        with:
+          lane: ${{ matrix.lane }}
+
+      # Token-free: renders with the repository's cliff config.
+      - name: Render the missing Release notes
+        if: ${{ steps.release.outputs.missing == 'true' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          SITE: ${{ matrix.site }}
+          LANE: ${{ matrix.lane }}
+          TAG: ${{ matrix.tag }}
+          COMMIT: ${{ matrix.commit }}
+          KIND_NOTE: ${{ matrix.kind_note }}
+          GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
+          SECURITY_SHAS: ${{ needs.detect.outputs.security_shas }}
+        run: |
+          set -euo pipefail
+          tr ' ' '\n' <<<"$SECURITY_SHAS" > "$RUNNER_TEMP/security-shas"
+          mkdir -p "$RUNNER_TEMP/notes"
+          args=(--release-model two-branch --site "$SITE" --version "$TAG" --release-commit "$COMMIT"
+            --kind-note "$KIND_NOTE" --repo "$GITHUB_REPOSITORY" --security-shas "$RUNNER_TEMP/security-shas"
+            --out "$RUNNER_TEMP/notes/NOTES.md")
+          if [ "$SITE" = lane ]; then
+            args+=(--lane "$LANE")
+          else
+            args+=(--go-lanes "$GO_LANES_JSON")
+          fi
+          bash "$CI_TOOLS/render-notes.sh" "${args[@]}"
+
+      - name: Hand the notes on
+        if: ${{ steps.release.outputs.missing == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.release.outputs.artifact }}
+          path: ${{ runner.temp }}/notes/NOTES.md
+          retention-days: 1
+          if-no-files-found: error
+
+  # An image's Release carries its signed SBOM and dashboard, and only
+  # docker-release.yaml's identity may sign them. The caller grants what that
+  # workflow's other jobs declare; the job that runs holds read and OIDC only.
+  repair-assets:
+    needs: detect
+    if: ${{ needs.detect.outputs.repair_images != '' && needs.detect.outputs.repair_images != '[]' }}
+    permissions:
+      contents: write
+      statuses: write
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.repair_images) }}
+    uses: ./.github/workflows/docker-release.yaml
+    with:
+      channel: stable
+      version: ${{ matrix.tag }}
+      release-model: two-branch
+      repair-tag: ${{ matrix.tag }}
+      exclude-re: ${{ needs.detect.outputs.exclude_re }}
+      subpackages: ${{ needs.detect.outputs.subpackages }}
+
+  # Checks out nothing and runs nothing from the repository.
+  repair-release:
+    needs: [detect, repair-notes, repair-assets]
+    if: |
+      !cancelled() && needs.repair-notes.result == 'success'
+      && (needs.repair-assets.result == 'success' || needs.repair-assets.result == 'skipped')
+      && needs.detect.outputs.repairs != '' && needs.detect.outputs.repairs != '[]'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.repairs) }}
+    steps:
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Check the Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" handoff-name repair-notes "$TAG" | sed 's/^/artifact=/' >> "$GITHUB_OUTPUT"
+          bash "$CI_TOOLS/release-state.sh" handoff-name repair-assets "$TAG" | sed 's/^/assets=/' >> "$GITHUB_OUTPUT"
+          state=$(bash "$CI_TOOLS/release-exists.sh" "$TAG")
+          echo "missing=$([ "$state" = absent ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the notes
+        if: ${{ steps.release.outputs.missing == 'true' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ steps.release.outputs.artifact }}
+          path: ${{ runner.temp }}/notes
+
+      - name: Fetch the assets
+        if: ${{ steps.release.outputs.missing == 'true' && matrix.site == 'docker' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ steps.release.outputs.assets }}
+          path: ${{ runner.temp }}/assets
+
+      # An image's Release is created with its assets, which gh does as a draft
+      # published after the upload, so it is never public without them; an
+      # immutable Release could not take them later.
+      - name: Publish the missing Release
+        if: ${{ steps.release.outputs.missing == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ matrix.tag }}
+          SITE: ${{ matrix.site }}
+        run: |
+          set -euo pipefail
+          if [ "$SITE" != docker ]; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes/NOTES.md"
+            exit 0
+          fi
+          cd "$RUNNER_TEMP/assets"
+          assets=(sbom.spdx.json sbom.spdx.json.sigstore.json)
+          dashboard=(grafana-dashboard.json grafana-dashboard.json.sha256 grafana-dashboard.json.sigstore.json)
+          for f in "${dashboard[@]}"; do
+            if [ -e "$f" ]; then
+              assets+=("${dashboard[@]}")
+              break
+            fi
+          done
+          for f in "${assets[@]}"; do
+            [ -s "$f" ] || { echo "::error::${f} is missing. ${TAG} is not published without it."; exit 1; }
+          done
+          # A draft left by an upload that died is not a Release by tag, so it would linger.
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq -r --arg v "$TAG" '.[] | select(.draft and .tag_name == $v) | .id' \
+            | while IFS= read -r id; do
+                [ -n "$id" ] || continue
+                echo "::notice::deleting orphaned draft release ${id} for ${TAG}"
+                gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
+              done
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes/NOTES.md" "${assets[@]}"
+          have=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.assets[].name')
+          for f in "${assets[@]}"; do
+            grep -qxF "$f" <<<"$have" || { echo "::error::Release ${TAG} is missing asset ${f}"; exit 1; }
+          done
+
+  repair-publish:
+    needs: [detect, repair-release]
+    if: ${{ needs.detect.outputs.repair_publishes != '' && needs.detect.outputs.repair_publishes != '[]' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.repair_publishes) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          registry-url: 'https://registry.npmjs.org'
+
+      # From the tag's own tree, through the subpackage job's script, so a
+      # version already published is left alone.
+      - name: Complete the subpackages
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          TAG: ${{ matrix.tag }}
+          COMMIT: ${{ matrix.commit }}
+          SUBPACKAGES: ${{ matrix.subpackages }}
+          # renovate: datasource=npm depName=jsr
+          JSR_VERSION: 0.14.3
+        run: |
+          set -euo pipefail
+          tree="$RUNNER_TEMP/at-tag"
+          git worktree add --quiet --detach "$tree" "$COMMIT"
+          while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            (cd "$tree/$d" && VERSION="$TAG" CHANNEL=stable bash "$CI_TOOLS/publish-subpackage.sh")
+          done < <(jq -r '.[]' <<<"$SUBPACKAGES")
+
+  # The job every publishing job waits on: skipped only when nothing is owed.
+  repair:
+    needs: [detect, repair-notes, repair-release, repair-publish]
+    if: ${{ !cancelled() && needs.detect.outputs.repairs != '' && needs.detect.outputs.repairs != '[]' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      statuses: write
+    env:
+      # renovate: datasource=github-releases depName=sigstore/cosign
+      COSIGN_VERSION: v3.1.3
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.repairs) }}
+    steps:
+      - name: Require the Release and the subpackages
+        env:
+          NOTES: ${{ needs.repair-notes.result }}
+          RELEASE: ${{ needs.repair-release.result }}
+          PUBLISH: ${{ needs.repair-publish.result }}
+        run: |
+          set -euo pipefail
+          if [ "$NOTES" != success ] || [ "$RELEASE" != success ] || { [ "$PUBLISH" != success ] && [ "$PUBLISH" != skipped ]; }; then
+            echo "::error::repair-notes ${NOTES}, repair-release ${RELEASE}, repair-publish ${PUBLISH}: no receipt is recorded and nothing publishes"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # The image readback proves the tag's digest by its signature.
+      - name: Install Cosign
+        if: ${{ matrix.site == 'docker' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Read back and record the receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          SITE: ${{ matrix.site }}
+          LANE: ${{ matrix.lane }}
+          TAG: ${{ matrix.tag }}
+          COMMIT: ${{ matrix.commit }}
+          SUBPACKAGES: ${{ matrix.subpackages || '[]' }}
+          IMAGE: ${{ github.repository_owner }}/${{ github.event.repository.name }}
+          REGISTRIES: ${{ needs.detect.outputs.registries }}
+          EXCLUDE_RE: ${{ needs.detect.outputs.exclude_re }}
+          SUBPACKAGES_JSON: ${{ needs.detect.outputs.subpackages }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" readback "$SITE" "$TAG" "$LANE"
+          bash "$CI_TOOLS/release-state.sh" receipt "$TAG" "$COMMIT"
+
+  # ─── Two-branch: hold a promotion's stable publish behind dev ──────────────
+  # A stable release must never outrank newer dev content: wait for the dev
+  # release runs, then renumber dev when its newest build would rank below
+  # the version this run publishes. Every publishing job needs it.
+  # release-state.sh barrier owns which runs it waits for and how the
+  # renumber run shares dev's concurrency group.
+  barrier:
+    needs: detect
+    if: |
+      needs.detect.outputs.release_model == 'two-branch' && needs.detect.outputs.channel == 'stable'
+      && needs.detect.outputs.in_range_any == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 160
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Hold for dev
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          STATE: ${{ needs.detect.outputs.lane_state }}
+          ROOT_VERSION: ${{ needs.detect.outputs.version }}
+          REPO_TYPE: ${{ needs.detect.outputs.type }}
+          IMAGE: ${{ github.repository_owner }}/${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          # A called workflow's GITHUB_WORKFLOW_REF names its caller, `<owner>/<repo>/<path>@<ref>`
+          # (https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations#github-context).
+          echo "caller workflow: $GITHUB_WORKFLOW_REF"
+          path="${GITHUB_WORKFLOW_REF%@*}"
+          case "$path" in
+            "$GITHUB_REPOSITORY"/.github/workflows/*) ;;
+            *)
+              echo "::error::GITHUB_WORKFLOW_REF names $GITHUB_WORKFLOW_REF, no workflow of $GITHUB_REPOSITORY, so the barrier has nothing to dispatch"
+              exit 1
+              ;;
+          esac
+          WORKFLOW="${path##*/}" bash "$CI_TOOLS/release-state.sh" barrier
+
+  # ─── Two-branch, dev, mode=renumber: re-tag dev's newest builds ────────────
+  # Dispatched by a stable run's barrier. Checks out each lane's newest dev
+  # build and computes its dev version there (now above the pending
+  # promotion); renumber-tag then tags that build with it, the image digest
+  # on GHCR and the commit. No image builds. This job runs the cliff config,
+  # so it holds no write scope. A TS root renumbers in renumber-ts and
+  # renumber-npm instead.
+  renumber:
+    needs: detect
+    if: ${{ needs.detect.outputs.mode == 'renumber' && needs.detect.outputs.lanes != '[]' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.lanes) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Check out the newest build
+        id: target
+        if: ${{ matrix.key != '.' || needs.detect.outputs.type != 'ts' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          LANE_KEY: ${{ matrix.key }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber-target
+
+      - name: Compute lane version (cliff)
+        id: cliff
+        if: ${{ steps.target.outputs.commit != '' }}
+        uses: ./.cplieger-ci/actions/git-cliff-version
+        with:
+          channel: dev
+          lane: ${{ matrix.lane }}
+          exclude-paths: ${{ matrix.lane == '' && needs.detect.outputs.exclude_paths || '' }}
+          release-model: two-branch
+          pending-version: ${{ fromJSON(needs.detect.outputs.lane_state)[matrix.key].version }}
+
+      - name: Hand the version on
+        id: handoff
+        if: ${{ steps.target.outputs.commit != '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: dev
+          LANE_KEY: ${{ matrix.key }}
+          DEV_VERSION: ${{ steps.cliff.outputs.dev_version }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber-handoff
+
+      # Every leg writes one, empty when it has nothing to renumber, so each
+      # renumber-tag leg finds its own.
+      - name: Write the handoff
+        id: write
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          LANE_KEY: ${{ matrix.key }}
+          VERSION: ${{ steps.handoff.outputs.version }}
+          COMMIT: ${{ steps.handoff.outputs.commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/handoff"
+          jq -n --arg version "$VERSION" --arg commit "$COMMIT" '{version: $version, commit: $commit}' > "$RUNNER_TEMP/handoff/handoff.json"
+          bash "$CI_TOOLS/release-state.sh" handoff-name renumber "$LANE_KEY" | sed 's/^/artifact=/' >> "$GITHUB_OUTPUT"
+
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.write.outputs.artifact }}
+          path: ${{ runner.temp }}/handoff/handoff.json
+          retention-days: 1
+          if-no-files-found: error
+
+  # Executes nothing from the repository: it reads the handoff as data and
+  # re-selects the build, refusing a newer one.
+  renumber-tag:
+    needs: [detect, renumber]
+    if: ${{ !cancelled() && needs.detect.outputs.mode == 'renumber' && needs.detect.outputs.lanes != '[]' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      statuses: write
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.lanes) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Name the handoff
+        id: name
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          LANE_KEY: ${{ matrix.key }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" handoff-name renumber "$LANE_KEY" | sed 's/^/artifact=/' >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ steps.name.outputs.artifact }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Read the handoff
+        id: handoff
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" handoff-read "$RUNNER_TEMP/handoff/handoff.json"
+
+      - name: Check out the numbered build
+        if: ${{ steps.handoff.outputs.commit != '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          LANE_KEY: ${{ matrix.key }}
+          EXPECT_COMMIT: ${{ steps.handoff.outputs.commit }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber-target
+
+      - name: Log in to GHCR
+        if: ${{ steps.handoff.outputs.commit != '' && matrix.key == '.' && needs.detect.outputs.type == 'docker' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          registry_login ghcr.io "$REGISTRY_USERNAME"
+
+      - name: Renumber
+        if: ${{ steps.handoff.outputs.commit != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: dev
+          LANE_KEY: ${{ matrix.key }}
+          DEV_VERSION: ${{ steps.handoff.outputs.version }}
+          REPO_TYPE: ${{ needs.detect.outputs.type }}
+          IMAGE: ${{ github.repository_owner }}/${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber
+
+  # A TS root's renumber, split so the job that runs the cliff config holds no
+  # OIDC and the one that publishes runs no cliff config. Not a matrix job:
+  # same-named matrix outputs are last-writer-wins, so the handoff would not
+  # be deterministic there.
+  renumber-ts:
+    needs: detect
+    if: ${{ needs.detect.outputs.mode == 'renumber' && needs.detect.outputs.type == 'ts' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      npm_version: ${{ steps.handoff.outputs.version }}
+      npm_commit: ${{ steps.handoff.outputs.commit }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Check out the newest build
+        id: target
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          LANE_KEY: .
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber-target
+
+      - name: Compute version (cliff)
+        id: cliff
+        if: ${{ steps.target.outputs.commit != '' }}
+        uses: ./.cplieger-ci/actions/git-cliff-version
+        with:
+          channel: dev
+          exclude-paths: ${{ needs.detect.outputs.exclude_paths }}
+          release-model: two-branch
+          pending-version: ${{ fromJSON(needs.detect.outputs.lane_state)['.'].version }}
+
+      - name: Hand the version on
+        id: handoff
+        if: ${{ steps.target.outputs.commit != '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: dev
+          LANE_KEY: .
+          DEV_VERSION: ${{ steps.cliff.outputs.dev_version }}
+          REPO_TYPE: ts
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber-handoff
+
+  # Publish the package under the new pre-release, then tag. Runs no cliff
+  # config; npm ci and npm publish run the package's lifecycle scripts under
+  # OIDC, as the ts job's publish does. It re-selects the build and refuses a
+  # newer one.
+  renumber-npm:
+    needs: [detect, renumber-ts]
+    if: ${{ needs.renumber-ts.outputs.npm_version != '' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      statuses: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # npm publish packs the workspace root, so the ci source leaves it.
+      - name: Move the ci source out of the package
+        run: |
+          set -euo pipefail
+          mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
+
+      - name: Check out the numbered build
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          LANE_KEY: .
+          EXPECT_COMMIT: ${{ needs.renumber-ts.outputs.npm_commit }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber-target
+
+      # npm publish runs the package's prepack: install as the ts job does.
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          npm ci
+
+      - name: Renumber
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          CHANNEL: dev
+          LANE_KEY: .
+          DEV_VERSION: ${{ needs.renumber-ts.outputs.npm_version }}
+          REPO_TYPE: ts
+          # The npm readback's wait (scripts/retry.sh), sized to end inside
+          # this job's timeout, which the barrier's renumber reserve counts.
+          REGISTRY_WAIT_SECONDS: 300
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber
+
+  # A subpackage shares the root's dev version and publishes from the root's
+  # build, so it follows the root renumber: each one the barrier would find
+  # without a dev build, or below the pending promotion, is published from
+  # that build under its newest dev tag. Runs no cliff config; npm publish
+  # runs the package's lifecycle scripts under OIDC, as the subpackage job's.
+  renumber-subpackages:
+    needs: [detect, renumber-tag, renumber-npm]
+    if: |
+      !cancelled() && needs.detect.outputs.mode == 'renumber' && needs.detect.outputs.subpackages != '[]'
+      && (needs.renumber-tag.result == 'success' || needs.renumber-tag.result == 'skipped')
+      && (needs.renumber-npm.result == 'success' || needs.renumber-npm.result == 'skipped')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Check out the newest build
+        id: target
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          LANE_KEY: .
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber-target
+
+      - name: Select the subpackages
+        id: plan
+        if: ${{ steps.target.outputs.commit != '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: dev
+          STATE: ${{ needs.detect.outputs.lane_state }}
+          REPO_TYPE: ${{ needs.detect.outputs.type }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber-subpackages
+
+      - name: Setup Node.js
+        if: ${{ steps.plan.outputs.dirs != '' && steps.plan.outputs.dirs != '[]' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish the subpackages
+        if: ${{ steps.plan.outputs.dirs != '' && steps.plan.outputs.dirs != '[]' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          VERSION: ${{ steps.plan.outputs.version }}
+          DIRS: ${{ steps.plan.outputs.dirs }}
+          CHANNEL: dev
+        run: |
+          set -euo pipefail
+          while IFS= read -r dir; do
+            (cd "$dir" && bash "$CI_TOOLS/publish-subpackage.sh")
+          done < <(jq -r '.[]' <<<"$DIRS")
+
   # ─── Docker image build + sign + SBOM + release (delegated) ────────────────
   # On dev a build is due only when a new dev version is (root_changed and
   # this commit untagged); on stable the job also runs with nothing to publish,
-  # because the Docker Hub description refreshes on every main push. A release
-  # owed to a subpackage alone (release=true, root_changed=false) builds no
-  # image on either channel.
+  # because the Docker Hub description refreshes on every main push. Under
+  # legacy a release owed to a subpackage alone (release=true,
+  # root_changed=false) builds no image; under two-branch it does, so the
+  # shared version has its image, tag and Release before the subpackage job.
   docker:
-    needs: detect
+    needs: [detect, repair, barrier]
     if: |
-      needs.detect.outputs.type == 'docker'
+      !cancelled() && needs.detect.result == 'success'
+      && (needs.repair.result == 'success' || needs.repair.result == 'skipped')
+      && (needs.barrier.result == 'success' || needs.barrier.result == 'skipped')
+      && needs.detect.outputs.type == 'docker'
       && (needs.detect.outputs.channel == 'stable'
-          || (needs.detect.outputs.release == 'true' && needs.detect.outputs.root_changed == 'true'))
+          || (needs.detect.outputs.release == 'true' && needs.detect.outputs.root_changed == 'true')
+          || (needs.detect.outputs.release == 'true' && needs.detect.outputs.release_model == 'two-branch'
+              && needs.detect.outputs.subpackages_to_publish != '[]'))
     permissions:
       contents: write
       statuses: write
@@ -866,10 +1367,17 @@ jobs:
       dev-version: ${{ needs.detect.outputs.dev_version }}
       latest: ${{ needs.detect.outputs.latest }}
       exclude-re: ${{ needs.detect.outputs.exclude_re }}
-      release-needed: ${{ (needs.detect.outputs.release == 'true' && needs.detect.outputs.root_changed == 'true') && 'true' || 'false' }}
+      release-needed: >-
+        ${{ (needs.detect.outputs.release == 'true' && (needs.detect.outputs.root_changed == 'true'
+        || (needs.detect.outputs.release_model == 'two-branch' && needs.detect.outputs.subpackages_to_publish != '[]')))
+        && 'true' || 'false' }}
       go-modules: ${{ needs.detect.outputs.go_modules }}
       finalize: ${{ needs.detect.outputs.finalize }}
-      promotion-note: ${{ needs.detect.outputs.promotion_note }}
+      release-model: ${{ needs.detect.outputs.release_model }}
+      subpackages: ${{ needs.detect.outputs.subpackages }}
+      defer-receipt: ${{ needs.detect.outputs.subpackages_to_publish != '[]' }}
+      release-kind-note: ${{ needs.detect.outputs.release_kind_note }}
+      security-shas: ${{ needs.detect.outputs.security_shas }}
       registries: ${{ needs.detect.outputs.registries }}
       platforms: ${{ needs.detect.outputs.platforms }}
       sbom-from: ${{ needs.detect.outputs.sbom_from }}
@@ -879,30 +1387,22 @@ jobs:
 
   # ─── Go module release (tag + GitHub Release; `go install` fetches by tag) ─
   go:
-    needs: detect
-    # finalize widens the gate so a rerun after a tag-created/Release-missing
-    # partial run can repair the Release (see detect's finalize step); the
-    # release==false + finalize==true combination changes only the notes
-    # rendering inside the Tag + GitHub Release step.
-    #
-    # A SUBPACKAGE-only publish also needs this job, not just root changes:
-    # the subpackage lane shares the ROOT version but owns no tagging, so a
-    # web-only release that skipped this job would publish npm/JSR at a
-    # version with no root tag. The NEXT subpackage-only release then
-    # recomputes the SAME version from the stale tag and its registry
-    # version-exists guards silently skip both publishes — the lane wedges
-    # green-but-unpublishable until a root change lands, which would then tag
-    # the burned version at a DIFFERENT commit than the registries shipped.
-    # Observed: web-terminal-engine npm/JSR 2.7.0 published from a web-only
-    # feat push with no v2.7.0 tag or Release (2026-07-16). Every step here is
-    # already idempotent and content-safe for a root-unchanged run (module-path
-    # check reads go.mod, tag/Release creation is guarded), and the subpackage
-    # job is needs-ordered after this one, restoring the tag-before-publish
-    # invariant its own comment documents. The ts/docker analogs of this seam
-    # are left as-is deliberately: no ts- or docker-type repo carries a
-    # subpackage today, and widening the docker gate would rebuild images on
-    # subpackage-only pushes.
-    if: ${{ needs.detect.outputs.type == 'go' && (needs.detect.outputs.root_changed == 'true' || needs.detect.outputs.subpackages_to_publish != '[]') && (needs.detect.outputs.release == 'true' || needs.detect.outputs.finalize == 'true') }}
+    needs: [detect, repair, barrier]
+    # finalize widens the gate so a rerun of a run that tagged but left no
+    # Release can repair it. A subpackage-only release needs this job too: the
+    # subpackage shares the root version but owns no tag, so skipping here
+    # publishes npm/JSR at a version with no root tag, and the next such
+    # release recomputes that burned version and skips both publishes. Every
+    # step is idempotent for a root-unchanged run, and the subpackage job runs
+    # after this one, so the tag precedes the publish. No ts-type repo has a
+    # subpackage; under two-branch the docker job carries the same rule.
+    if: |
+      !cancelled() && needs.detect.result == 'success'
+      && (needs.repair.result == 'success' || needs.repair.result == 'skipped')
+      && (needs.barrier.result == 'success' || needs.barrier.result == 'skipped')
+      && needs.detect.outputs.type == 'go'
+      && (needs.detect.outputs.root_changed == 'true' || needs.detect.outputs.subpackages_to_publish != '[]')
+      && (needs.detect.outputs.release == 'true' || needs.detect.outputs.finalize == 'true')
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
@@ -1128,6 +1628,15 @@ jobs:
           esac
           exit 0
 
+      - name: Check out the ci source
+        if: ${{ needs.detect.outputs.channel == 'stable' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       - name: Generate release notes
         # Stable only: a dev build creates no Release. Deliberately
         # token-free: this step downloads and EXECUTES git-cliff, and an
@@ -1138,10 +1647,13 @@ jobs:
         # downloaded code.
         if: ${{ needs.detect.outputs.channel == 'stable' }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          RELEASE_MODEL: ${{ needs.detect.outputs.release_model }}
           VERSION: ${{ needs.detect.outputs.version }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
           FINALIZE: ${{ needs.detect.outputs.finalize }}
-          PROMOTION_NOTE: ${{ needs.detect.outputs.promotion_note }}
+          KIND_NOTE: ${{ needs.detect.outputs.release_kind_note }}
+          SECURITY_SHAS: ${{ needs.detect.outputs.security_shas }}
         run: |
           set -euo pipefail
           # Version + tarball sha256 pinned as a pair; Renovate maintains both
@@ -1155,39 +1667,24 @@ jobs:
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
           echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
           tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          # The stable tag pattern is passed explicitly so the notes span
-          # everything since the last STABLE release whatever the consumer's
-          # synced cliff.toml says (a stale unanchored copy would stop at the
-          # last dev tag). Lane commits are excluded (probe state J).
-          LANE_ARGS=(--tag-pattern '^v[0-9]+\.[0-9]+\.[0-9]+$')
-          if [ -n "$GO_LANES_JSON" ] && [ "$GO_LANES_JSON" != "[]" ]; then
-            while IFS= read -r d; do
-              [ -z "$d" ] && continue
-              LANE_ARGS+=(--exclude-path "$d/**")
-            done < <(echo "$GO_LANES_JSON" | jq -r '.[]')
-          fi
-          # --unreleased --tag renders the commits since the last tag as
-          # $VERSION. The new tag does NOT exist yet (the gh release create
-          # below creates it), so a bare `--latest` would render the PREVIOUS
-          # release's notes instead of this one's. In FINALIZE mode the tag
-          # DOES exist (at this very commit — detect verified it), so those
-          # commits are no longer "unreleased": render the CURRENT release
-          # instead (probe states K/L pin that --current sees them, lane
-          # flags respected).
+          args=(--release-model "$RELEASE_MODEL" --site go --version "$VERSION" --go-lanes "$GO_LANES_JSON"
+            --kind-note "$KIND_NOTE" --out NOTES.md)
           if [ "$FINALIZE" = "true" ]; then
-            git cliff --current "${LANE_ARGS[@]}" --strip header > NOTES.md
-          else
-            git cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > NOTES.md
+            args+=(--finalize)
           fi
-          if [ -n "$PROMOTION_NOTE" ]; then
-            printf '\n%s\n' "$PROMOTION_NOTE" >> NOTES.md
+          if [ "$RELEASE_MODEL" = "two-branch" ]; then
+            tr ' ' '\n' <<<"$SECURITY_SHAS" > "$RUNNER_TEMP/security-shas"
+            args+=(--repo "$GITHUB_REPOSITORY" --release-commit "$GITHUB_SHA" --security-shas "$RUNNER_TEMP/security-shas")
           fi
+          bash "$CI_TOOLS/render-notes.sh" "${args[@]}"
 
       - name: Tag + GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
           CHANNEL: ${{ needs.detect.outputs.channel }}
+          RELEASE_MODEL: ${{ needs.detect.outputs.release_model }}
         run: |
           set -euo pipefail
           # Tag ref created first via the git data API, pinned to the trigger
@@ -1224,15 +1721,24 @@ jobs:
             echo "dev channel: tagged ${VERSION} with its receipt, no GitHub Release"
             exit 0
           fi
-          gh release view "$VERSION" >/dev/null 2>&1 || gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
+          if [ "$RELEASE_MODEL" = legacy ]; then set -- --count-drafts; fi
+          state=$(bash "$CI_TOOLS/release-exists.sh" "$@" "$VERSION")
+          if [ "$state" = absent ]; then
+            gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
+          fi
 
   # ─── TypeScript library release (npm + JSR + tag + GitHub Release) ─────────
   ts:
-    needs: detect
+    needs: [detect, repair, barrier]
     # finalize widens the gate exactly as in the go job; the npm/JSR publish
     # steps are already idempotent version-exists skips, so a finalize rerun
     # passes through them and repairs only the missing GitHub Release.
-    if: ${{ needs.detect.outputs.type == 'ts' && needs.detect.outputs.root_changed == 'true' && (needs.detect.outputs.release == 'true' || needs.detect.outputs.finalize == 'true') }}
+    if: |
+      !cancelled() && needs.detect.result == 'success'
+      && (needs.repair.result == 'success' || needs.repair.result == 'skipped')
+      && (needs.barrier.result == 'success' || needs.barrier.result == 'skipped')
+      && needs.detect.outputs.type == 'ts' && needs.detect.outputs.root_changed == 'true'
+      && (needs.detect.outputs.release == 'true' || needs.detect.outputs.finalize == 'true')
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
@@ -1320,15 +1826,27 @@ jobs:
             npx -y "jsr@${JSR_VERSION}" publish --allow-dirty
           fi
 
+      - name: Check out the ci source
+        if: ${{ needs.detect.outputs.channel == 'stable' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       - name: Generate release notes
         # Stable only; deliberately token-free — this step executes the
         # downloaded git-cliff binary; see the go job's identical split.
         if: ${{ needs.detect.outputs.channel == 'stable' }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          RELEASE_MODEL: ${{ needs.detect.outputs.release_model }}
           VERSION: ${{ needs.detect.outputs.version }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
           FINALIZE: ${{ needs.detect.outputs.finalize }}
-          PROMOTION_NOTE: ${{ needs.detect.outputs.promotion_note }}
+          KIND_NOTE: ${{ needs.detect.outputs.release_kind_note }}
+          SECURITY_SHAS: ${{ needs.detect.outputs.security_shas }}
         run: |
           set -euo pipefail
           # Version + tarball sha256 pinned as a pair; Renovate maintains both
@@ -1342,33 +1860,24 @@ jobs:
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
           echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
           tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          # Same flags as the go job's notes step: the stable tag pattern
-          # always, lane commits excluded (probe state J).
-          LANE_ARGS=(--tag-pattern '^v[0-9]+\.[0-9]+\.[0-9]+$')
-          if [ -n "$GO_LANES_JSON" ] && [ "$GO_LANES_JSON" != "[]" ]; then
-            while IFS= read -r d; do
-              [ -z "$d" ] && continue
-              LANE_ARGS+=(--exclude-path "$d/**")
-            done < <(echo "$GO_LANES_JSON" | jq -r '.[]')
-          fi
-          # --unreleased --tag renders the commits since the last tag as
-          # $VERSION (the tag does not exist yet on the publish path); in
-          # FINALIZE mode the tag exists at this commit, so render the
-          # CURRENT release instead (see the go job; probe states K/L).
+          args=(--release-model "$RELEASE_MODEL" --site ts --version "$VERSION" --go-lanes "$GO_LANES_JSON"
+            --kind-note "$KIND_NOTE" --out NOTES.md)
           if [ "$FINALIZE" = "true" ]; then
-            git cliff --current "${LANE_ARGS[@]}" --strip header > NOTES.md
-          else
-            git cliff --unreleased --tag "$VERSION" "${LANE_ARGS[@]}" --strip header > NOTES.md
+            args+=(--finalize)
           fi
-          if [ -n "$PROMOTION_NOTE" ]; then
-            printf '\n%s\n' "$PROMOTION_NOTE" >> NOTES.md
+          if [ "$RELEASE_MODEL" = "two-branch" ]; then
+            tr ' ' '\n' <<<"$SECURITY_SHAS" > "$RUNNER_TEMP/security-shas"
+            args+=(--repo "$GITHUB_REPOSITORY" --release-commit "$GITHUB_SHA" --security-shas "$RUNNER_TEMP/security-shas")
           fi
+          bash "$CI_TOOLS/render-notes.sh" "${args[@]}"
 
       - name: Tag + GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
           CHANNEL: ${{ needs.detect.outputs.channel }}
+          RELEASE_MODEL: ${{ needs.detect.outputs.release_model }}
         run: |
           set -euo pipefail
           # Tag ref created first via the git data API, pinned to the trigger
@@ -1405,22 +1914,29 @@ jobs:
             echo "dev channel: tagged ${VERSION} with its receipt, no GitHub Release"
             exit 0
           fi
-          gh release view "$VERSION" >/dev/null 2>&1 || gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
+          if [ "$RELEASE_MODEL" = legacy ]; then set -- --count-drafts; fi
+          state=$(bash "$CI_TOOLS/release-exists.sh" "$@" "$VERSION")
+          if [ "$state" = absent ]; then
+            gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
+          fi
 
   # ─── Subpackage publish (matrix over `*/jsr.json` dirs that changed) ───────
   subpackage:
-    needs: [detect, docker, ts, go]
+    needs: [detect, repair, barrier, docker, ts, go]
     # finalize widens this gate too — the OPPOSITE asymmetry of the root ts
     # job. Root ts registries publish BEFORE the root tag, so an existing
     # tag proves they published and the finalize path skips them. This job
     # publishes AFTER the root go/ts/docker job (needs-ordered), so a run
     # that died between the root tag and here leaves the subpackage
     # registries genuinely unpublished; a finalize rerun must pass through
-    # (the version-exists guards inside skip anything that did land).
+    # (the version-exists guards inside skip anything that did land). A
+    # failed repair or barrier skips the root jobs, so it is read directly.
     if: |
       always()
       && needs.detect.outputs.subpackages_to_publish != '[]'
       && (needs.detect.outputs.release == 'true' || needs.detect.outputs.finalize == 'true')
+      && (needs.repair.result == 'success' || needs.repair.result == 'skipped')
+      && (needs.barrier.result == 'success' || needs.barrier.result == 'skipped')
       && (needs.docker.result == 'success' || needs.docker.result == 'skipped')
       && (needs.ts.result == 'success' || needs.ts.result == 'skipped')
       && (needs.go.result == 'success' || needs.go.result == 'skipped')
@@ -1447,51 +1963,27 @@ jobs:
           node-version: '26'
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       - name: Publish subpackage to npm + JSR
         working-directory: ${{ matrix.dir }}
         env:
-          # OIDC-only: trusted publishers configured at npmjs.com + jsr.io.
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
           CHANNEL: ${{ needs.detect.outputs.channel }}
+          # Pin the jsr CLI: a bare `npx jsr` fetches whatever is latest at
+          # publish time.
+          # renovate: datasource=npm depName=jsr
+          JSR_VERSION: 0.14.3
         run: |
           set -euo pipefail
-          ver="${VERSION#v}"
-          pkg="$(npm pkg get name | tr -d '\"')"
-          npm pkg set version="$ver"
-          node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-          # Same channel rule as the root ts job: `dev` dist-tag on dev, JSR
-          # on stable only.
-          NPM_TAG_ARGS=()
-          if [ "$CHANNEL" != "stable" ]; then
-            NPM_TAG_ARGS=(--tag dev)
-          fi
-          if npm view "$pkg@$ver" version >/dev/null 2>&1; then
-            echo "::notice::npm: $pkg@$ver already published — skipping"
-          else
-            npm publish --access public "${NPM_TAG_ARGS[@]}"
-          fi
-          if [ "$CHANNEL" != "stable" ]; then
-            echo "dev channel: JSR not published"
-            exit 0
-          fi
-          # Skip JSR if the version already exists (mirror of the npm guard);
-          # keeps a re-run after a partial/cancelled release from wedging on
-          # a duplicate `jsr publish`.
-          if curl -fsSL "https://jsr.io/${pkg}/meta.json" \
-               | jq -e --arg v "$ver" '.versions[$v]' >/dev/null 2>&1; then
-            echo "::notice::jsr: $pkg@$ver already published — skipping"
-          else
-            # deno's `jsr publish` uses BYONM, so runtime deps (e.g.
-            # @cplieger/actions -> @cplieger/reactive) must already be in
-            # node_modules; the npm publish above does not install them.
-            # Install (without touching the lockfile) before publishing to JSR.
-            npm install --no-save
-            # Pin the jsr CLI: a bare `npx jsr` fetches whatever is latest at
-            # publish time — the one floating executable on the release path.
-            # renovate: datasource=npm depName=jsr
-            JSR_VERSION=0.14.3
-            npx -y "jsr@${JSR_VERSION}" publish --allow-dirty
-          fi
+          bash "$CI_TOOLS/publish-subpackage.sh"
 
   # ─── Nested Go module lanes (matrix; independent <dir>/vX.Y.Z versions) ────
   # Each tracked nested go.mod is its own release lane: its version is
@@ -1507,8 +1999,13 @@ jobs:
   # full history anyway, and this avoids plumbing a dir->version map through
   # job outputs.
   go-nested:
-    needs: detect
-    if: ${{ needs.detect.outputs.go_modules_to_release != '' && needs.detect.outputs.go_modules_to_release != '[]' }}
+    needs: [detect, repair, barrier]
+    if: |
+      !cancelled() && needs.detect.result == 'success'
+      && (needs.repair.result == 'success' || needs.repair.result == 'skipped')
+      && (needs.barrier.result == 'success' || needs.barrier.result == 'skipped')
+      && needs.detect.outputs.mode != 'renumber'
+      && needs.detect.outputs.go_modules_to_release != '' && needs.detect.outputs.go_modules_to_release != '[]'
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
@@ -1527,24 +2024,37 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       - name: Compute lane version (cliff)
         id: lanecliff
-        uses: cplieger/ci/actions/git-cliff-version@v3
+        uses: ./.cplieger-ci/actions/git-cliff-version
         with:
           channel: ${{ needs.detect.outputs.channel }}
           lane: ${{ matrix.dir }}
+          release-model: ${{ needs.detect.outputs.release_model }}
+          pending-version: ${{ needs.detect.outputs.channel == 'dev' && fromJSON(needs.detect.outputs.lane_state || '{}')[matrix.dir].version || '' }}
+          pending-in-range: ${{ fromJSON(needs.detect.outputs.lane_state || '{}')[matrix.dir].in_range && 'true' || 'false' }}
 
       # The lane's copy of detect's "Select version": detect emits the lane
       # only when a shipped path under it changed since its own channel tag,
-      # so the anchor test alone decides the release here. On stable a lane
-      # tag already at HEAD without a Release is repaired (finalize), as for
-      # the root; a dev lane build has no Release to repair.
+      # so the anchor test alone decides the release here. On a legacy stable
+      # run a lane tag already at HEAD without a Release is repaired
+      # (finalize), as for the root; two-branch repairs in the repair jobs, and
+      # a dev lane build has no Release to repair.
       - name: Select lane version
         id: lane
         env:
           GH_TOKEN: ${{ github.token }}
           DIR: ${{ matrix.dir }}
           CHANNEL: ${{ needs.detect.outputs.channel }}
+          RELEASE_MODEL: ${{ needs.detect.outputs.release_model }}
           BASE: ${{ steps.lanecliff.outputs.base }}
           DEV_VERSION: ${{ steps.lanecliff.outputs.dev_version }}
           FLOOR_BASE: ${{ steps.lanecliff.outputs.floor_base }}
@@ -1554,7 +2064,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$BASE" ]; then
-            echo "::error::git-cliff-version returned no base: the referenced action predates the channel outputs"
+            echo "::error::git-cliff-version returned no base"
             exit 1
           fi
           RELEASE=false
@@ -1572,7 +2082,7 @@ jobs:
             VERSION="$BASE"
           fi
           FINALIZE=false
-          if [ "$RELEASE" = "false" ] && [ "$CHANNEL" = "stable" ]; then
+          if [ "$RELEASE" = "false" ] && [ "$CHANNEL" = "stable" ] && [ "$RELEASE_MODEL" != "two-branch" ]; then
             if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" >/dev/null 2>/tmp/relerr; then
               echo "::notice::lane ${DIR}: ${VERSION} is tagged at this commit and its Release exists — nothing to do"
             elif grep -q 'HTTP 404' /tmp/relerr; then
@@ -1635,32 +2145,34 @@ jobs:
         # identical split.
         if: ${{ steps.lane.outputs.release == 'true' && needs.detect.outputs.channel == 'stable' }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          RELEASE_MODEL: ${{ needs.detect.outputs.release_model }}
           DIR: ${{ matrix.dir }}
           VERSION: ${{ steps.lane.outputs.version }}
           FINALIZE: ${{ steps.lane.outputs.finalize }}
+          KIND_NOTE: ${{ fromJSON(needs.detect.outputs.lane_state || '{}')[matrix.dir].kind_note }}
+          SECURITY_SHAS: ${{ needs.detect.outputs.security_shas }}
         run: |
           set -euo pipefail
-          # Lane-scoped notes with the lane's stable tag pattern (probe state
-          # J: lane commits only). In finalize mode the tag already exists at
-          # HEAD, so render the CURRENT release (probe state K).
-          ESC=$(printf '%s' "$DIR" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
-          PATTERN="^${ESC}/v[0-9]+\\.[0-9]+\\.[0-9]+\$"
+          args=(--release-model "$RELEASE_MODEL" --site lane --lane "$DIR" --version "$VERSION"
+            --kind-note "$KIND_NOTE" --out NOTES.md)
           if [ "$FINALIZE" = "true" ]; then
-            git cliff --current \
-              --tag-pattern "$PATTERN" \
-              --include-path "${DIR}/**" --strip header > NOTES.md
-          else
-            git cliff --unreleased --tag "$VERSION" \
-              --tag-pattern "$PATTERN" \
-              --include-path "${DIR}/**" --strip header > NOTES.md
+            args+=(--finalize)
           fi
+          if [ "$RELEASE_MODEL" = "two-branch" ]; then
+            tr ' ' '\n' <<<"$SECURITY_SHAS" > "$RUNNER_TEMP/security-shas"
+            args+=(--repo "$GITHUB_REPOSITORY" --release-commit "$GITHUB_SHA" --security-shas "$RUNNER_TEMP/security-shas")
+          fi
+          bash "$CI_TOOLS/render-notes.sh" "${args[@]}"
 
       - name: Tag + GitHub Release (lane)
         if: ${{ steps.lane.outputs.release == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           VERSION: ${{ steps.lane.outputs.version }}
           CHANNEL: ${{ needs.detect.outputs.channel }}
+          RELEASE_MODEL: ${{ needs.detect.outputs.release_model }}
         run: |
           set -euo pipefail
           # Tag ref via the git data API pinned to the trigger commit, with
@@ -1695,7 +2207,11 @@ jobs:
             echo "dev channel: tagged ${VERSION} with its receipt, no GitHub Release"
             exit 0
           fi
-          gh release view "$VERSION" >/dev/null 2>&1 || gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
+          if [ "$RELEASE_MODEL" = legacy ]; then set -- --count-drafts; fi
+          state=$(bash "$CI_TOOLS/release-exists.sh" "$@" "$VERSION")
+          if [ "$state" = absent ]; then
+            gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
+          fi
 
   # ─── Verify every registry this run published to ──────────────────────────
   # A green publish job is not proof the artifact is fetchable. Each lane that
@@ -1729,8 +2245,17 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       - name: Verify published artifacts
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           CHANNEL: ${{ needs.detect.outputs.channel }}
           VERSION: ${{ needs.detect.outputs.version }}
           SUBPACKAGES_JSON: ${{ needs.detect.outputs.subpackages_to_publish }}
@@ -1741,21 +2266,16 @@ jobs:
           GO_NESTED_RESULT: ${{ needs.go-nested.result }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
           ver="${VERSION#v}"
           rc=0
 
-          # Registries propagate in seconds to a couple of minutes: six tries,
-          # 20 s apart, then fail closed.
           probe() { # <label> <url>
-            local label=$1 url=$2 i
-            for i in 1 2 3 4 5 6; do
-              if curl -fsSL --connect-timeout 10 --max-time 30 -o /dev/null "$url"; then
-                echo "ok: ${label}"
-                return 0
-              fi
-              [ "$i" -lt 6 ] && sleep 20
-            done
-            echo "::error::${label} is not published: ${url}"
+            if await_registry "$1" curl -fsSL --connect-timeout 10 --max-time 30 -o /dev/null "$2"; then
+              echo "ok: $1"
+              return 0
+            fi
+            echo "::error::$1 is not published: $2"
             return 1
           }
           # The proxy is lazy, so this GET is also what makes the module
@@ -1764,20 +2284,24 @@ jobs:
           # Nothing is pushed here — a Go module is published by its git tag and
           # the proxy mirrors it on request — so absence has two causes and the
           # body says which. `unknown revision` means the proxy answered before
-          # it could see the tag and cached that for ~30 min, longer than these
-          # six tries can outwait, so it warns. Anything else is permanent: a
-          # module path disagreeing with the repo, or a module it cannot fetch.
+          # it could see the tag and caches that for up to ~30 min, which can
+          # outlast the wait, so it warns. Anything else is permanent: a module
+          # path disagreeing with the repo, or a module it cannot fetch.
+          proxy_body=$(mktemp)
+          # Called through await_registry, which the linter cannot follow.
+          # shellcheck disable=SC2329
+          proxy_get() { # <url>: the proxy's last answer, body and error, lands in $proxy_body
+            curl -sSL --fail-with-body --connect-timeout 10 --max-time 30 "$1" >"$proxy_body" 2>&1
+          }
           probe_go() { # <go.mod> <vX.Y.Z>
-            local modpath url body i
+            local modpath url body
             modpath=$(awk '$1=="module"{print $2; exit}' "$1" | tr -d '"' | sed 's/[A-Z]/!\L&/g')
             url="https://proxy.golang.org/${modpath}/@v/$2.info"
-            for i in 1 2 3 4 5 6; do
-              if body=$(curl -sSL --fail-with-body --connect-timeout 10 --max-time 30 "$url" 2>&1); then
-                echo "ok: proxy.golang.org ${modpath}@$2"
-                return 0
-              fi
-              [ "$i" -lt 6 ] && sleep 20
-            done
+            if await_registry "proxy.golang.org ${modpath}@$2" proxy_get "$url"; then
+              echo "ok: proxy.golang.org ${modpath}@$2"
+              return 0
+            fi
+            body=$(cat "$proxy_body")
             case $body in
               *"unknown revision"*)
                 echo "::warning::proxy.golang.org ${modpath}@$2 is not mirrored yet: ${url}"
@@ -1832,3 +2356,65 @@ jobs:
             done < <(jq -r '.[]' <<<"$SUBPACKAGES_JSON")
           fi
           exit "$rc"
+
+  # ─── Two-branch: record each stable lane's completion receipt ─────────────
+  # A stable publication is complete once its Release exists and
+  # verify-publish read it back; the next run's repair reads the receipt. Its
+  # own job, so the statuses scope never reaches a legacy run. The image
+  # lane's receipt is docker-release.yaml's, unless subpackages share its
+  # version: then it lands here, after they are read back too.
+  receipts:
+    needs: [detect, docker, go, ts, subpackage, go-nested, verify-publish]
+    if: |
+      always() && needs.verify-publish.result == 'success'
+      && needs.detect.outputs.release_model == 'two-branch' && needs.detect.outputs.channel == 'stable'
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Record completion receipts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          VERSION: ${{ needs.detect.outputs.version }}
+          GO_LANES_JSON: ${{ needs.detect.outputs.go_modules_to_release }}
+          GO_RESULT: ${{ needs.go.result }}
+          TS_RESULT: ${{ needs.ts.result }}
+          DOCKER_RESULT: ${{ needs.docker.result }}
+          SUBPACKAGE_RESULT: ${{ needs.subpackage.result }}
+          GO_NESTED_RESULT: ${{ needs.go-nested.result }}
+        run: |
+          set -euo pipefail
+          if [ "$GO_RESULT" = "success" ] || [ "$TS_RESULT" = "success" ]; then
+            bash "$CI_TOOLS/release-state.sh" receipt "$VERSION" "$(git rev-list -n1 "$VERSION")"
+          elif [ "$DOCKER_RESULT" = "success" ] && [ "$SUBPACKAGE_RESULT" = "success" ] \
+            && [ "$(git rev-list -n1 "$VERSION" 2>/dev/null)" = "$GITHUB_SHA" ]; then
+            bash "$CI_TOOLS/release-state.sh" receipt "$VERSION" "$GITHUB_SHA"
+          fi
+          if [ "$GO_NESTED_RESULT" = "success" ]; then
+            while IFS= read -r d; do
+              [ -z "$d" ] && continue
+              while IFS= read -r tag; do
+                [ -z "$tag" ] && continue
+                bash "$CI_TOOLS/release-state.sh" receipt "$tag" "$(git rev-list -n1 "$tag")"
+              done < <(git tag --points-at HEAD --list "$d/v[0-9]*" | grep -E "^$d/v[0-9]+\.[0-9]+\.[0-9]+\$" || true)
+            done < <(jq -r '.[]' <<<"$GO_LANES_JSON")
+          fi

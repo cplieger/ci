@@ -17,10 +17,16 @@ on:
 permissions:
   contents: read
 
+# Two runs filing at once could each create a repo's audit issue.
+concurrency:
+  group: audit
+  cancel-in-progress: false
+
 jobs:
   audit:
     runs-on: ubuntu-26.04
-    timeout-minutes: 10
+    # Room for one rate-limit wait (scripts/ghrest.py's max_wait) beside the reads.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,10 +44,26 @@ jobs:
           AUDIT_WEBHOOK_HOST: ${{ secrets.AUDIT_WEBHOOK_HOST }}
         run: |
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          python3 scripts/audit.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 scripts/audit.py --findings-out "$RUNNER_TEMP/audit-findings.json" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
           status=${PIPESTATUS[0]}
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+
+      # A second step because the issues are written with CI_SCHEDULE while the
+      # audit reads with AUDIT_PAT, and each token stays in its own step's env.
+      # It runs after a red audit too: HARD findings are what it files.
+      - name: File audit findings as issues
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+        run: |
+          set -euo pipefail
+          findings="$RUNNER_TEMP/audit-findings.json"
+          if [ -f "$findings" ]; then
+            python3 scripts/audit.py --file-issues "$findings"
+          else
+            echo "::notice::the audit stopped before grading and wrote no findings file, so no issue was opened, updated or closed"
+          fi
 
   # `needs:` must list every other job in this workflow.
   notify:

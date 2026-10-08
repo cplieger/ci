@@ -1,0 +1,165 @@
+{
+  "config": {
+    "protocol_version": "v1.0.0",
+    "scanner_name": "govulncheck",
+    "scanner_version": "v1.8.0",
+    "db": "https://vuln.go.dev",
+    "db_last_modified": "2026-10-01T20:24:15Z",
+    "go_version": "go1.27.0",
+    "scan_level": "symbol",
+    "scan_mode": "source"
+  }
+}
+{
+  "osv": {
+    "id": "GO-2021-0113",
+    "aliases": [
+      "CVE-2021-38561",
+      "GHSA-ppp9-7jff-5vj2"
+    ],
+    "summary": "Out-of-bounds read in golang.org/x/text/language"
+  }
+}
+{
+  "osv": {
+    "id": "GO-2022-1059",
+    "aliases": [
+      "CVE-2022-32149",
+      "GHSA-69ch-w2m2-3vjp"
+    ],
+    "summary": "Denial of service via crafted Accept-Language header in golang.org/x/text/language"
+  }
+}
+{
+  "osv": {
+    "id": "GO-2026-5970",
+    "aliases": [
+      "CVE-2026-56852"
+    ],
+    "summary": "Infinite loop on invalid input in golang.org/x/text"
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2021-0113",
+    "fixed_version": "v0.3.7",
+    "trace": [
+      {
+        "module": "golang.org/x/text",
+        "version": "v0.3.5"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2022-1059",
+    "fixed_version": "v0.3.8",
+    "trace": [
+      {
+        "module": "golang.org/x/text",
+        "version": "v0.3.5"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-5970",
+    "fixed_version": "v0.39.0",
+    "trace": [
+      {
+        "module": "golang.org/x/text",
+        "version": "v0.3.5"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2021-0113",
+    "fixed_version": "v0.3.7",
+    "trace": [
+      {
+        "module": "golang.org/x/text",
+        "version": "v0.3.5",
+        "package": "golang.org/x/text/language"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2022-1059",
+    "fixed_version": "v0.3.8",
+    "trace": [
+      {
+        "module": "golang.org/x/text",
+        "version": "v0.3.5",
+        "package": "golang.org/x/text/language"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2021-0113",
+    "fixed_version": "v0.3.7",
+    "trace": [
+      {
+        "module": "golang.org/x/text",
+        "version": "v0.3.5",
+        "package": "golang.org/x/text/language",
+        "function": "Parse",
+        "position": {
+          "filename": "language/parse.go",
+          "offset": 1121,
+          "line": 33,
+          "column": 6
+        }
+      },
+      {
+        "module": "example.com/probe",
+        "package": "example.com/probe",
+        "function": "main",
+        "position": {
+          "filename": "main.go",
+          "offset": 113,
+          "line": 11,
+          "column": 24
+        }
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-9001",
+    "fixed_version": "v1.27.1",
+    "trace": [
+      {
+        "module": "stdlib",
+        "version": "v1.27.0"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-9001",
+    "fixed_version": "v1.27.1",
+    "trace": [
+      {
+        "module": "stdlib",
+        "version": "v1.27.0",
+        "package": "net/http",
+        "function": "Get"
+      },
+      {
+        "module": "example.com/probe",
+        "package": "example.com/probe",
+        "function": "main"
+      }
+    ]
+  }
+}

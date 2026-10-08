@@ -1,10 +1,9 @@
-# Daily security scan across the public cplieger consumer repos, 03:00 UTC.
-# Dispatches each repo's synced `security.yml` (Trivy fs scan, plus an image
-# scan on Dockerfile repos). Private repos are excluded: they run their own
-# security CI weekly, and only they spend the account's included minutes.
-# `gh workflow run` is fire-and-forget, so max-parallel paces only the
-# dispatches and the scans burst against the 20-job account cap. The scans
-# must run in each repo because SARIF uploads target the repo they run in.
+# Daily 03:00 UTC: dispatches `security.yml` on every public, non-fork consumer
+# repo that has one, and also on `main` for a repo whose default branch is `dev`,
+# where security-scan.yaml scans the published `:latest`. max-parallel paces only
+# the dispatch calls: the dispatched runs start together and share the account's
+# concurrent-job slots. They cannot run in this matrix instead, because each SARIF
+# upload targets the repository its run belongs to.
 name: Daily security scan
 
 on:
@@ -26,6 +25,11 @@ jobs:
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Discover public repos with security.yml
         id: fanout
         env:
@@ -33,23 +37,29 @@ jobs:
         run: |
           set -euo pipefail
           # Public only (visibility rule, not a repo-name list): private repos
-          # draw the account's included minutes and own their scan cadence —
-          # see the "Private repos" note in the header.
-          # Forks are excluded org-wide (same rule as scripts/audit.py): a fork
-          # carries UPSTREAM's code, so scanning it reports findings only upstream
-          # can fix while spending our daily budget.
+          # draw the account's included minutes and run their own scans.
+          # Forks are excluded (same rule as scripts/audit.py): a fork carries
+          # UPSTREAM's code, so scanning it reports findings only upstream can fix.
           # REST rather than `gh repo list`: GraphQL quota is shared with every
           # other token of the account owner and can be exhausted by unrelated load.
-          repos=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
-            .[] | select(.archived == false and .fork == false and .visibility == "public") | .name
+          listing=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
+            .[] | select(.archived == false and .fork == false and .visibility == "public")
+                | {name, default_branch, visibility, fork, archived} | @json
           ')
-          REPOS=()
-          for r in $repos; do
+          repos=$(jq -r '"\(.name) \(.default_branch)"' <<< "$listing")
+          two_branch=" $(python3 scripts/release_channels.py two-branch <<< "$listing" | tr '\n' ' ') "
+          ROWS=()
+          # fd 3, so a gh that reads stdin cannot swallow the rest of the list.
+          while read -r r _ <&3; do
+            [ -n "$r" ] || continue
             if gh workflow view security.yml -R "cplieger/${r}" >/dev/null 2>&1; then
-              REPOS+=("$r")
+              ROWS+=("$(jq -nc --arg r "$r" '{repo: $r}')")
+              if [[ "$two_branch" == *" $r "* ]]; then
+                ROWS+=("$(jq -nc --arg r "$r" '{repo: $r, ref: "main"}')")
+              fi
             fi
-          done
-          matrix=$(printf '%s\n' "${REPOS[@]}" | jq -R . | jq -s -c '[.[] | {repo: .}]')
+          done 3<<< "$repos"
+          matrix=$(printf '%s\n' "${ROWS[@]}" | jq -s -c .)
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
           echo "Total repos: $(echo "$matrix" | jq 'length')"
 
@@ -69,8 +79,23 @@ jobs:
       GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
     steps:
       - name: Trigger security.yml on cplieger/${{ matrix.repo }}
+        if: ${{ !matrix.ref }}
+        env:
+          REPO: ${{ matrix.repo }}
         run: |
-          gh workflow run security.yml -R "cplieger/${{ matrix.repo }}"
+          set -euo pipefail
+          # gh resolves a missing --ref over GraphQL, whose quota every token of
+          # the account owner shares; REST names the default branch instead.
+          ref=$(gh api "repos/cplieger/${REPO}" --jq .default_branch)
+          [ -n "$ref" ] || { echo "::error::cplieger/${REPO} reports no default branch"; exit 1; }
+          gh workflow run security.yml -R "cplieger/${REPO}" --ref "$ref"
+
+      - name: Trigger security.yml on cplieger/${{ matrix.repo }} at ${{ matrix.ref }}
+        if: ${{ matrix.ref }}
+        env:
+          REPO: ${{ matrix.repo }}
+          REF: ${{ matrix.ref }}
+        run: gh workflow run security.yml -R "cplieger/${REPO}" --ref "$REF"
 
   # `needs:` must list every other job in this workflow.
   notify:

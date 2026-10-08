@@ -1,0 +1,7 @@
+@@ commit B
+@@ file Dockerfile
+FROM alpine:3.24.2@sha256:1111111111111111111111111111111111111111111111111111111111111111
+@@ commit M parent B
+@@ commit T parent B
+@@ file main.go
+package main

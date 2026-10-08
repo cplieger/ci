@@ -33,6 +33,7 @@ rules:
       - move-major-tag.yaml
       - promote.yaml
       - rebuild-stale.yaml
+      - release-maintenance.yaml
       - self-release.yaml
       - sync-hub-overviews.yaml
       - sync.yaml
@@ -65,3 +66,8 @@ rules:
       # `# renovate:` comment, which is this repo's standard pinning pattern
       # (same class as the curl-installed binaries zizmor doesn't flag).
       - ci.yaml
+      # ts-ci's deadset-ts install: one exact `# renovate:` npm pin, installed
+      # with --ignore-scripts. zizmor reads no ignore comment inside a run block,
+      # so this silences the rule for every step of ts-ci.yaml: review any new
+      # ad-hoc install there by hand.
+      - ts-ci.yaml

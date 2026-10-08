@@ -14,10 +14,12 @@ extend = "configs/ruff.toml"
 "_ci_local.py" = ["PLW0603", "FBT003", "RUF001"]
 # The importable modules in scripts/ (the aggregators and links-body.py import
 # trackerlib; promote.py, ghcr_retention.py, audit.py and classify-repos.py
-# import release_channels). Their siblings escape INP001 through their shebang;
-# a library module has none, and scripts/ is not a package.
+# import release_channels; the REST callers import ghrest). Their siblings escape
+# INP001 through their shebang; a library module has none, and scripts/ is not
+# a package.
 "scripts/trackerlib.py" = ["INP001"]
 "scripts/release_channels.py" = ["INP001"]
+"scripts/ghrest.py" = ["INP001"]
 # scripts/test-*.py and scripts/test_*.py run under the stdlib unittest runner
 # (no pytest here); flake8-pytest-style reads its assertion methods as pytest
 # misuse. The test_*.py modules are discovered by `unittest discover`, carry no
