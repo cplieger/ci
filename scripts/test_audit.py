@@ -147,7 +147,7 @@ def two_channel(name: str = 'httpx') -> dict:
             'archived': False,
         }
     )
-    s.update(audit.GOV_HARD_TWO_BRANCH)
+    s.update(audit.GOV_HARD)
     s['rulesets_full'] = {'dev': live(DEV_RULESET), 'main': live(MAIN_RULESET)}
     s['custom_rulesets'] = [
         {'name': 'dev', 'enforcement': 'active'},
@@ -1282,17 +1282,31 @@ class RulesetBodies(unittest.TestCase):
 
 
 class MainDefaultIdentity(unittest.TestCase):
-    """Main-default repos are graded exactly as before two-branch grading:
-    each recorded scenario's findings, errors and API reads, in order, are the
-    ones the baseline audit.py gave for it (testdata/audit/main-default.json)."""
+    """Main-default repos are graded as before two-branch grading apart from the
+    squash-only merge model: each recorded scenario's findings, errors and API
+    reads, in order, are the ones the baseline audit.py gave for it
+    (testdata/audit/main-default.json), with its merge-model lines regraded."""
 
     SCENARIOS: ClassVar[list] = json.loads(MAIN_DEFAULT.read_text(encoding='utf-8'))['scenarios']
+
+    @staticmethod
+    def squash_only(sc: dict) -> dict:
+        """The baseline's findings with its merge-model lines graded squash-only."""
+        repo = sc['answers'][f'repos/cplieger/{sc["meta"]["name"]}']
+        keys = set(audit.GOV_HARD) | set(audit.GOV_SOFT)
+        want = copy.deepcopy(sc['expected'])
+        for kind, table in (('hard', audit.GOV_HARD), ('warn', audit.GOV_SOFT)):
+            rest = [line for line in want[kind] if line.split('=', 1)[0] not in keys]
+            want[kind] = [
+                f'{k}={repo.get(k)} (want {v})' for k, v in table.items() if repo.get(k) != v
+            ] + rest
+        return want
 
     def test_every_recorded_scenario_grades_and_reads_as_the_baseline(self):
         self.assertGreaterEqual(len(self.SCENARIOS), 7)
         for sc in self.SCENARIOS:
             with self.subTest(sc['name']):
-                self.assertEqual(audit_over_answers(audit, sc), sc['expected'])
+                self.assertEqual(audit_over_answers(audit, sc), self.squash_only(sc))
 
     def test_the_scenarios_cover_the_merge_model_squash_only_would_reject(self):
         repos = [sc['answers'][f'repos/cplieger/{sc["meta"]["name"]}'] for sc in self.SCENARIOS]
@@ -1381,7 +1395,7 @@ def on_branch(path: str, branch: str) -> str:
     return path.replace('ref=main', f'ref={branch}')
 
 
-class TwoBranchMergeModel(unittest.TestCase):
+class SquashOnlyMergeModel(unittest.TestCase):
     def test_squash_only_with_the_pr_title_is_hard_on_a_two_channel_repo(self):
         for key, value in (
             ('allow_rebase_merge', True),
@@ -1396,25 +1410,26 @@ class TwoBranchMergeModel(unittest.TestCase):
                 s = two_channel()
                 s[key] = value
                 hard, warn, _ = audit.compliance(s)
-                want = audit.GOV_HARD_TWO_BRANCH[key]
+                want = audit.GOV_HARD[key]
                 self.assertEqual(hard, [f'{key}={value} (want {want})'])
                 self.assertFalse(any(w.startswith(f'{key}=') for w in warn), warn)
 
-    def test_a_main_default_repo_keeps_rebase_on_and_the_soft_squash_title(self):
+    def test_a_main_default_repo_is_graded_squash_only_too(self):
         s = legacy()
-        s['squash_merge_commit_title'] = 'PR_TITLE'
+        s['allow_rebase_merge'] = True
+        s['squash_merge_commit_title'] = 'COMMIT_OR_PR_TITLE'
         hard, warn, _ = audit.compliance(s)
-        self.assertEqual(hard, [])
-        self.assertIn('squash_merge_commit_title=PR_TITLE (want COMMIT_OR_PR_TITLE)', warn)
-        s = legacy()
-        s['allow_rebase_merge'] = False
-        hard, _, _ = audit.compliance(s)
-        self.assertEqual(hard, ['allow_rebase_merge=False (want True)'])
+        self.assertEqual(
+            hard,
+            [
+                'allow_rebase_merge=True (want False)',
+                'squash_merge_commit_title=COMMIT_OR_PR_TITLE (want PR_TITLE)',
+            ],
+        )
+        self.assertFalse(any(w.startswith(('allow_', 'squash_merge_')) for w in warn), warn)
 
-    def test_the_two_branch_tables_split_the_same_keys(self):
-        hard, soft = audit.merge_model(two_channel=True)
-        self.assertEqual(set(soft) & set(hard), set())
-        self.assertEqual(set(hard) | set(soft), set(audit.GOV_HARD) | set(audit.GOV_SOFT))
+    def test_the_hard_and_soft_tables_share_no_key(self):
+        self.assertEqual(set(audit.GOV_HARD) & set(audit.GOV_SOFT), set())
 
 
 class TwoBranchRulesets(unittest.TestCase):
