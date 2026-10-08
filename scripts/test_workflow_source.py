@@ -49,7 +49,8 @@ def uses_source(step: dict) -> bool:
         SOURCE in step.get('uses', '')
         or SOURCE in str(step.get('env', ''))
         or SOURCE in run
-        or 'CI_TOOLS' in run
+        # An expansion, not the `[$]CI_TOOLS/` pattern self-release greps workflows for.
+        or re.search(r'\$\{?CI_TOOLS\b', run) is not None
     )
 
 
@@ -104,6 +105,8 @@ class SourceCheckout(unittest.TestCase):
         self.assertTrue(uses_source({'run': f'python3 {SOURCE}/scripts/intake.py'}))
         # A job-level CI_TOOLS reaches the step only through its run body.
         self.assertTrue(uses_source({'run': '"$CI_TOOLS/release-state.sh" pending'}))
+        self.assertTrue(uses_source({'run': 'bash "${CI_TOOLS}/retry.sh" 3'}))
+        self.assertFalse(uses_source({'run': "grep -ohE '[$]CI_TOOLS/[A-Za-z0-9_.-]+' a.yaml"}))
         self.assertFalse(uses_source({'run': 'git fetch origin', 'with': {'path': SOURCE}}))
 
     def test_the_root_npm_publish_runs_with_the_source_moved_out_of_the_package(self):
