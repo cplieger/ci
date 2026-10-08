@@ -122,19 +122,36 @@ jobs:
       # required `ci / validate` check instead. `secret` is ABSENT: gitleaks runs
       # `dir .` over this checkout as a required gate and Trivy skips markdown,
       # so its fs pass saw less while duplicating alerts (the IMAGE scan below
-      # keeps secrets). `license` is advisory: nothing else checks whether a
-      # transitive dependency's licence is compatible with the consuming repo's.
+      # keeps secrets).
       - name: Trivy filesystem scan (advisory)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           version: ${{ env.TRIVY_VERSION }}
           scan-type: fs
-          scanners: 'vuln,license'
+          scanners: 'vuln'
           severity: ${{ inputs.severity }}
           ignore-unfixed: true
           exit-code: '0'
           format: 'sarif'
           output: 'trivy-fs.sarif'
+
+      # Nothing else surfaces dependency licence classifications.
+      # Its own step because trivy-action drops `severity` for SARIF unless
+      # limit-severities-for-sarif is set, and only licence findings want the
+      # filter: Trivy maps notice/permissive/unencumbered to LOW, so dropping
+      # LOW keeps forbidden, restricted, reciprocal and unknown licences
+      # (https://trivy.dev/latest/docs/scanner/license/).
+      - name: Trivy license scan (advisory)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: fs
+          scanners: 'license'
+          severity: 'UNKNOWN,MEDIUM,HIGH,CRITICAL'
+          limit-severities-for-sarif: true
+          exit-code: '0'
+          format: 'sarif'
+          output: 'trivy-license.sarif'
 
       - name: Trivy misconfig scan (report-only)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -193,6 +210,13 @@ jobs:
         with:
           sarif_file: 'trivy-fs.sarif'
           category: 'trivy-fs'
+
+      - name: Upload SARIF — license
+        if: ${{ always() && hashFiles('trivy-license.sarif') != '' && github.event.repository.private == false }}
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: 'trivy-license.sarif'
+          category: 'trivy-license'
 
       - name: Upload SARIF — misconfig
         if: ${{ always() && hashFiles('trivy-misconfig.sarif') != '' && github.event.repository.private == false }}
