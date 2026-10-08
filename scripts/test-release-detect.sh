@@ -75,14 +75,6 @@ git -C "$ROOT" show HEAD:.github/workflows/release.yaml >"$WORK/release-head.yam
 cp "$WORK/release-head.yaml" "$WORK/release.yaml-head"
 git -C "$ROOT" show HEAD:.github/workflows/docker-release.yaml >"$WORK/docker-release.yaml-head"
 git -C "$ROOT" show HEAD:.github/workflow-templates/release.yml >"$WORK/template-head.yml"
-# A committed tree is its own HEAD, so only the checks that need no older code can run.
-BASELINE_IS_TREE=false
-if cmp -s "$WORK/release-head.yaml" "$RELEASE_YAML" \
-  && cmp -s "$WORK/docker-release.yaml-head" "$ROOT/.github/workflows/docker-release.yaml" \
-  && cmp -s "$WORK/template-head.yml" "$TEMPLATE"; then
-  BASELINE_IS_TREE=true
-fi
-export BASELINE_IS_TREE
 python3 - "$RELEASE_YAML" "$WORK/release-head.yaml" "$TEMPLATE" "$WORK/template-head.yml" "$WORK" <<'PY'
 import json, os, re, sys, yaml
 
@@ -330,12 +322,12 @@ facts["tmpl-push"] = trig["push"]["branches"]
 facts["tmpl-inputs"] = sorted(trig["workflow_dispatch"]["inputs"])
 facts["tmpl-mode"] = trig["workflow_dispatch"]["inputs"]["mode"]
 facts["tmpl-with"] = "with" in t["jobs"]["release"]
-facts["tmpl-uses"] = t["jobs"]["release"]["uses"] == th["jobs"]["release"]["uses"]
+facts["tmpl-uses"] = bool(re.fullmatch(r"cplieger/ci/\.github/workflows/release\.yaml@[0-9a-f]{40}",
+                                       t["jobs"]["release"]["uses"])) and "# v3\n" in open(tmpl).read()
 facts["tmpl-perms"] = t["jobs"]["release"]["permissions"]
 for key, job, name in (("go", "go", "Tag + GitHub Release"), ("ts", "ts", "Tag + GitHub Release"),
                        ("lane", "go-nested", "Tag + GitHub Release (lane)")):
     open(f"{out}/publish-{key}.sh", "w").write(step(jobs, job, name)["run"])
-    open(f"{out}/publish-{key}-head.sh", "w").write(step(hjobs, job, name)["run"])
     names = [s.get("name") for s in jobs[job]["steps"]]
     ci_src = step(jobs, job, "Check out the ci source")
     facts[f"publish-tools:{key}"] = "|".join((
@@ -345,8 +337,7 @@ for key, job, name in (("go", "go", "Tag + GitHub Release"), ("ts", "ts", "Tag +
 facts["release-view-sites"] = " ".join(str(open(new.replace("release.yaml", wf)).read().count("gh release view"))
                                        for wf in ("release.yaml", "docker-release.yaml"))
 # A workflow cannot declare a job conditionally, so a legacy run's page lists every
-# job HEAD lacks; each must evaluate as skipped there. A committed tree has no older
-# HEAD to diff, so it checks the v3-only set W27 pins.
+# v3-only job; each must evaluate as skipped there.
 V3_ONLY_JOBS = {
     "release.yaml": ["barrier", "receipts", "renumber", "renumber-npm", "renumber-subpackages", "renumber-tag",
                      "renumber-ts", "repair", "repair-assets", "repair-notes", "repair-publish", "repair-release"],
@@ -355,11 +346,7 @@ V3_ONLY_JOBS = {
 legacy_new = {}
 for wf in ("release.yaml", "docker-release.yaml"):
     n_jobs = yaml.safe_load(open(new.replace("release.yaml", wf)))["jobs"]
-    if os.environ["BASELINE_IS_TREE"] == "true":
-        legacy_new[wf] = sorted(n for n in V3_ONLY_JOBS[wf] if n in n_jobs)
-        continue
-    h = yaml.safe_load(open(f"{out}/{wf}-head"))["jobs"]
-    legacy_new[wf] = sorted(n for n in n_jobs if n not in h)
+    legacy_new[wf] = sorted(n for n in V3_ONLY_JOBS[wf] if n in n_jobs)
 facts["legacy-new-jobs"] = legacy_new
 lruns = {}
 for t in ("docker", "go", "ts", "none"):
@@ -2521,9 +2508,6 @@ cat >"$RBIN/gh" <<'SH'
 #!/usr/bin/env bash
 # The tag exists at this commit; the by-tag Release read answers REL_READ,
 # and the release listing holds a draft of REL_DRAFT (or fails on "fail").
-# `release view` answers as gh does (found on a 200 or a draft of the tag,
-# else "release not found", which is also what it reports for exhausted
-# GraphQL) under REL_VIEW=gh, and is refused otherwise.
 printf '%s\n' "$*" >>"$REL_LOG"
 case "$*" in
   "api repos/o/app/git/ref/tags/$VERSION --jq .object.sha") echo "$GITHUB_SHA"; exit 0 ;;
@@ -2539,37 +2523,22 @@ case "$*" in
     if [ "${REL_DRAFT:-}" = fail ]; then echo 'gh: HTTP 502' >&2; exit 1; fi
     printf '%s\n' "$VERSION-dev.1" ${REL_DRAFT:+"$REL_DRAFT"}
     exit 0 ;;
-  "release view $VERSION")
-    [ "${REL_VIEW:-}" = gh ] || exit 9
-    [ "$REL_READ" = 200 ] && exit 0
-    [ "${REL_DRAFT:-}" = "$VERSION" ] && exit 0
-    echo 'release not found' >&2
-    exit 1 ;;
   "release create $VERSION --title $VERSION --notes-file NOTES.md") exit 0 ;;
 esac
 echo "stub: unexpected gh $*" >&2
 exit 22
 SH
 chmod 755 "$RBIN/gh"
-publish_site() { # <site> <read status> [head] -> rc|the gh calls joined by ';'; env MODEL (legacy), DRAFT
-  local d rc=0 rtag=v9.9.9 body="$WORK/publish-$1.sh" view="" draft="${DRAFT:-}"
+publish_site() { # <site> <read status> -> rc|the gh calls joined by ';'; env MODEL (legacy), DRAFT
+  local d rc=0 rtag=v9.9.9 body="$WORK/publish-$1.sh" draft="${DRAFT:-}"
   if [ "$1" = lane ]; then rtag=yamlenv/v9.9.9; fi
-  if [ "${3:-}" = head ]; then body="$WORK/publish-$1-head.sh" view=gh; fi
   if [ "$draft" = tag ]; then draft=$rtag; fi
   d=$(mktemp -d "$WORK/ps.XXXXXX")
   echo notes >"$d/NOTES.md"
   : >"$d/log"
-  (cd "$d" && PATH="$RBIN:$PATH" REL_LOG="$d/log" REL_READ="$2" REL_VIEW="$view" REL_DRAFT="$draft" GH_TOKEN=t GITHUB_REPOSITORY=o/app \
+  (cd "$d" && PATH="$RBIN:$PATH" REL_LOG="$d/log" REL_READ="$2" REL_DRAFT="$draft" GH_TOKEN=t GITHUB_REPOSITORY=o/app \
     GITHUB_SHA=c0ffee VERSION="$rtag" CHANNEL=stable RELEASE_MODEL="${MODEL:-legacy}" CI_TOOLS="$ROOT/scripts" bash -e "$body") >"$WORK/ps.log" 2>&1 || rc=$?
   echo "$rc|$(paste -sd ';' "$d/log")"
-}
-outcome() { # <site> <read status> [head] -> rc and whether a Release was created
-  local r
-  r=$(publish_site "$@")
-  case "$r" in
-    *"release create"*) echo "${r%%|*} create" ;;
-    *) echo "${r%%|*} none" ;;
-  esac
 }
 chk "W26 no workflow reads a Release through gh release view, which bills GraphQL" "$(fact '."release-view-sites"')" "0 0"
 for s in go ts lane; do
@@ -2597,12 +2566,6 @@ gh: HTTP 502"
     "::error::could not determine whether Release $rtag exists:
 gh: API rate limit exceeded for user ID 1. (HTTP 403)"
   chk "W26 and on an outage" "$(publish_site "$s" 502)" "1|$REF_S;$READ_S"
-  [ "$BASELINE_IS_TREE" = false ] || continue
-  chk "W26 as HEAD's $s site decided a 200, a 404 and a draft of the tag" \
-    "$(outcome "$s" 200 head), $(outcome "$s" 404 head), $(DRAFT=tag outcome "$s" 404 head)" \
-    "0 none, 0 create, 0 none"
-  chk "W26 and read a rate limit as no Release, creating one" "$(publish_site "$s" 403 head)" \
-    "0|$REF_S;release view $rtag;$CREATE_S"
 done
 REL_LOG="$WORK/rex.log" REL_READ=403 VERSION=v9.9.9 GITHUB_SHA=c0ffee PATH="$RBIN:$PATH" \
   bash "$ROOT/scripts/release-exists.sh" v9.9.9 >"$WORK/rex.out" 2>"$WORK/rex.err" || echo "EXIT=$?" >>"$WORK/rex.out"
@@ -2648,9 +2611,9 @@ chk "W12 and running no cliff config" "$(fact '."renumber-tag-steps" | join(",")
 chk "W12 after every leg of renumber, whose write scopes it alone holds" \
   "$(fact '."needs:renumber-tag" | join(" ")')|$(fact '."perms:renumber" | tojson')|$(fact '."perms:renumber-tag" | tojson')" \
   'detect renumber|{"contents":"read"}|{"contents":"write","statuses":"write","packages":"write"}'
-chk "T1 the caller still calls the pinned v2 pipeline" "$(fact '."tmpl-uses"')" "true"
-chk "T1 with no with: key a v2 pin would refuse" "$(fact '."tmpl-with"')" "false"
-chk "T1 and still triggers on main only" "$(fact '."tmpl-push" | join(" ")')" "main"
+chk "T1 the caller pins the v3 pipeline by full commit" "$(fact '."tmpl-uses"')" "true"
+chk "T1 with no with: key" "$(fact '."tmpl-with"')" "false"
+chk "T1 and triggers on main and dev" "$(fact '."tmpl-push" | join(" ")')" "main dev"
 chk "T2 the dispatch carries the mode beside skip_if_unchanged" "$(fact '."tmpl-inputs" | join(" ")')" "mode skip_if_unchanged"
 chk "T2 defaulting to normal" "$(fact '."tmpl-mode" | "\(.type) \(.default) \(.options | join(","))"')" "choice normal normal,renumber"
 chk "T3 the caller grants the barrier's dispatch" "$(fact '."tmpl-perms".actions')" "write"

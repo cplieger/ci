@@ -2,7 +2,7 @@
 """File-sync engine: push canonical files from this checkout into consumer repos as PRs.
 
 Per manifest target (a repo, or a repo and a `base:`): clone, copy the mapped files from
-the commit sync_source picks by the target's pinned cplieger/ci major, commit
+this checkout, commit
 `chore(sync): ...`, force-push `repo-sync/ci/default` (`repo-sync/ci/<base>` with --branch
 and --base), and keep one `dependencies` PR open. No diff, no PR; an open sync PR whose
 diff evaporated is closed. Files are only added or updated; forks are skipped unless
@@ -13,7 +13,6 @@ so no token reaches a remote URL or process output.
 """
 
 import argparse
-import re
 import shutil
 import subprocess
 import sys
@@ -22,17 +21,6 @@ from pathlib import Path
 
 import ghrest
 import yaml
-
-CURRENT_MAJOR = 3
-# A synced file passes inputs to, and is read by, the reusable workflows of the
-# consumer's pinned major, so an older pin gets that major's files whole. Moving
-# an entry is how a synced-file fix reaches those consumers; the commit must be
-# in the checkout (sync.yaml fetches full history).
-SYNC_SOURCES = {2: 'ce4127ad9858a7c1a2e256559e0f03430e92add6'}
-PIN = re.compile(
-    r'^[ \t]*-?[ \t]*uses:[ \t]*["\']?cplieger/ci/[^@\s"\']+@([^\s"\'#]+)["\']?[ \t]*(?:#[ \t]*(\S+))?',
-    re.MULTILINE,
-)
 
 OWNER = 'cplieger'
 BRANCH = 'repo-sync/ci/default'
@@ -50,10 +38,6 @@ CRED_HELPER = '!gh auth git-credential'
 
 class ManifestError(ValueError):
     """The manifest names something the engine refuses to write."""
-
-
-class SourceError(ValueError):
-    """The target's cplieger/ci pins name no source this engine may sync from."""
 
 
 def run(args, cwd=None, check=True):
@@ -135,87 +119,18 @@ def clone(repo, dest_dir, base):
     run(['git', 'config', 'user.email', GIT_EMAIL], cwd=dest_dir)
 
 
-def pinned_majors(paths):
-    """Every major the files at `paths` pin cplieger/ci to, read from each pin's
-    `# vN` comment or a `vN` ref; None stands for a pin that names no major. A path
-    that is no file is skipped."""
-    majors = set()
-    for path in paths:
-        if not path.is_file():
-            continue
-        for ref, comment in PIN.findall(path.read_text(errors='replace')):
-            label = re.match(r'v(\d+)', comment) or re.match(r'v(\d+)', ref)
-            majors.add(int(label[1]) if label else None)
-    return majors
-
-
-def sync_source(clone_dir, source_root, dest_map):
-    """The SYNC_SOURCES major whose commit the target's files come from, or None for
-    the checkout. The major is what the clone's copies of the workflows this sync
-    writes pin (a workflow the repository keeps may call another major), or, when none
-    is pinned yet, what the checkout's copies pin, so a new repository's first sync
-    never pairs older-major callers with current-major files. SourceError on a pin
-    without a major, on several majors, and on an older major with no source."""
-    workflows = sorted(dest for dest in dest_map if dest.startswith('.github/workflows/'))
-    majors = pinned_majors(clone_dir / dest for dest in workflows)
-    if not majors:
-        majors = pinned_majors(source_root / dest_map[dest] for dest in workflows)
-    if None in majors:
-        msg = 'a cplieger/ci pin names no major (want `@<sha> # vN`)'
-        raise SourceError(msg)
-    if len(majors) > 1:
-        names = ', '.join(f'v{major}' for major in sorted(majors))
-        msg = f'pinned to several cplieger/ci majors: {names}'
-        raise SourceError(msg)
-    if not majors:
-        return None
-    (major,) = majors
-    if major == CURRENT_MAJOR:
-        print(f'  source: checkout (pinned to v{major})')
-        return None
-    if major not in SYNC_SOURCES:
-        msg = f'pinned to v{major}, which has no sync source'
-        raise SourceError(msg)
-    print(f'  source: v{major} at {SYNC_SOURCES[major][:12]}')
-    return major
-
-
-def committed_file(source_root, sha, path):
-    """(git mode, bytes) of `path` at commit `sha` of the ci checkout, or None when
-    the commit has no such path."""
-    entry = run(['git', '-C', str(source_root), 'ls-tree', sha, '--', path]).stdout
-    if not entry:
-        return None
-    mode, kind, _oid = entry.partition('\t')[0].split()
-    if kind != 'blob' or mode not in ('100644', '100755'):
-        msg = f'source is not a regular file at {sha[:12]}: {path}'
-        raise FileNotFoundError(msg)
-    show = ['git', '-C', str(source_root), 'show', f'{sha}:{path}']
-    return mode, subprocess.run(show, check=True, capture_output=True).stdout
-
-
-def copy_files(source_root, clone_dir, dest_map, label, major=None):
-    """Copy sources into the clone, from the checkout or, with `major`, from
-    SYNC_SOURCES[major] (a file that commit lacks is held back); return the staged
-    dest paths that differ."""
+def copy_files(source_root, clone_dir, dest_map):
+    """Copy sources from the checkout into the clone; return the staged dest paths
+    that differ."""
     written = []
     for dest, source in sorted(dest_map.items()):
         target = clone_dir / dest
-        if major is None:
-            src = source_root / source
-            if not src.is_file():
-                msg = f'source file missing in ci checkout: {source}'
-                raise FileNotFoundError(msg)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(src, target)  # copies bytes + mode (x-bit survives)
-        else:
-            blob = committed_file(source_root, SYNC_SOURCES[major], source)
-            if blob is None:
-                print(f'::notice::{label}: {dest} held back (absent at the v{major} sync source)')
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(blob[1])
-            target.chmod(0o755 if blob[0] == '100755' else 0o644)
+        src = source_root / source
+        if not src.is_file():
+            msg = f'source file missing in ci checkout: {source}'
+            raise FileNotFoundError(msg)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, target)  # copies bytes + mode (x-bit survives)
         written.append(dest)
     if written:
         run(['git', 'add', '--', *written], cwd=clone_dir)
@@ -315,8 +230,7 @@ def sync_repo(repo, base, dest_map, source_root, dry_run):
         clone(repo, clone_dir, base)
         into = base if base is not None else default_branch(clone_dir)
         run(['git', 'checkout', '--quiet', '-B', branch], cwd=clone_dir)
-        major = sync_source(clone_dir, source_root, dest_map)
-        changed = copy_files(source_root, clone_dir, dest_map, target_label(repo, base), major)
+        changed = copy_files(source_root, clone_dir, dest_map)
 
         if not changed:
             print('  in sync (no diff)')
@@ -445,7 +359,7 @@ def main():
         try:
             outcome = sync_repo(repo, base, mapping[repo, base], source_root, args.dry_run)
             counts[outcome] += 1
-        except (subprocess.CalledProcessError, ghrest.ApiError, OSError, SourceError) as exc:
+        except (subprocess.CalledProcessError, ghrest.ApiError, OSError) as exc:
             detail = (
                 exc.stderr.strip()
                 if isinstance(exc, subprocess.CalledProcessError) and exc.stderr

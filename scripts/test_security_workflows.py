@@ -60,6 +60,18 @@ def workflow(name: str) -> dict:
     return yaml.safe_load((WORKFLOWS / name).read_text())
 
 
+def unpinned(node):
+    """The node with every `uses:` digest dropped: an action bump changes no step."""
+    if isinstance(node, dict):
+        return {
+            k: v.split('@', 1)[0] if k == 'uses' and isinstance(v, str) else unpinned(v)
+            for k, v in node.items()
+        }
+    if isinstance(node, list):
+        return [unpinned(v) for v in node]
+    return node
+
+
 def github(default: str, event: str, ref: str, *, private=False, fork=False) -> dict:
     return {
         'event_name': event,
@@ -118,8 +130,8 @@ def needs(published: str, image: str = 'true', platforms: str = '') -> dict:
 
 class SecurityScanForMainDefaultRepos(unittest.TestCase):
     def setUp(self):
-        self.wf = workflow('security-scan.yaml')
-        self.head = HEAD['security-scan.yaml']
+        self.wf = unpinned(workflow('security-scan.yaml'))
+        self.head = unpinned(HEAD['security-scan.yaml'])
 
     def test_every_run_today_resolves_head_s_profile_and_runs_head_s_steps(self):
         new, old = self.wf['jobs']['trivy'], self.head['trivy']
