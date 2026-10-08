@@ -49,12 +49,13 @@ class PublishGate(unittest.TestCase):
         for name, text in stubs.items():
             (bin_dir / name).write_text(text)
             (bin_dir / name).chmod(0o755)
-        (tmp / 'sigstore-retry.sh').write_text('retry_sigstore() { "$@"; }\n')
+        (tmp / 'retry.sh').write_text('retry() { "$@"; }\n')
         (tmp / 'grafana-dashboard.json').write_text(content)
         env = {
             'PATH': f'{bin_dir}:/usr/bin:/bin',
             'STUB_DIR': str(tmp),
             'RUNNER_TEMP': str(tmp),
+            'CI_TOOLS': str(tmp),
             'GITHUB_OUTPUT': str(tmp / 'output'),
             'GITHUB_STEP_SUMMARY': str(tmp / 'summary'),
             'GITHUB_SHA': 'a' * 40,

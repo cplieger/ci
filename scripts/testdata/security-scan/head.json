@@ -104,9 +104,23 @@
       "ignore-unfixed": true,
       "output": "trivy-fs.sarif",
       "scan-type": "fs",
-      "scanners": "vuln,license",
+      "scanners": "vuln",
       "severity": "${{ inputs.severity }}",
       "version": "${{ env.TRIVY_VERSION }}"
+     }
+    },
+    {
+     "name": "Trivy license scan (advisory)",
+     "uses": "aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25",
+     "with": {
+      "version": "${{ env.TRIVY_VERSION }}",
+      "scan-type": "fs",
+      "scanners": "license",
+      "severity": "UNKNOWN,MEDIUM,HIGH,CRITICAL",
+      "limit-severities-for-sarif": true,
+      "exit-code": "0",
+      "format": "sarif",
+      "output": "trivy-license.sarif"
      }
     },
     {
@@ -143,6 +157,15 @@
      "with": {
       "category": "trivy-fs",
       "sarif_file": "trivy-fs.sarif"
+     }
+    },
+    {
+     "name": "Upload SARIF \u2014 license",
+     "if": "${{ always() && hashFiles('trivy-license.sarif') != '' && github.event.repository.private == false }}",
+     "uses": "github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d",
+     "with": {
+      "sarif_file": "trivy-license.sarif",
+      "category": "trivy-license"
      }
     },
     {

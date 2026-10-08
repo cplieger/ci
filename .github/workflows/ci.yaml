@@ -534,10 +534,9 @@ jobs:
         continue-on-error: true
         uses: cplieger/ci/actions/notice-audit@c9c218d713f221dabb8504141b1ab4501d5ba7af # v2
 
-      # The dashboard check comes from this workflow's own commit: a local `./`
-      # action resolves when its step starts, so it ships with the workflow and
-      # needs no pin of its own.
-      - name: Check out the dashboard check
+      # The dashboard check comes from this workflow's own commit, so it needs
+      # no pin of its own.
+      - name: Check out the ci source
         if: ${{ hashFiles('grafana-dashboard.json') != '' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -545,7 +544,6 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
-          sparse-checkout: actions/dashboard-check
 
       - name: Dashboard check
         if: ${{ hashFiles('grafana-dashboard.json') != '' }}
