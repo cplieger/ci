@@ -127,7 +127,7 @@ jobs:
           DEADSET_VERSION=v1.10.0
           go install "github.com/cplieger/deadset/cmd/deadset@${DEADSET_VERSION}"
           # renovate: datasource=npm depName=@cplieger/deadset-ts
-          DEADSET_TS_VERSION=6.0.1
+          DEADSET_TS_VERSION=6.1.0
           npm install --global --ignore-scripts --no-audit --no-fund \
             "@cplieger/deadset-ts@${DEADSET_TS_VERSION}"
 
