@@ -60,7 +60,7 @@ jobs:
       id-token: write
       attestations: write
       security-events: write
-    uses: cplieger/ci/.github/workflows/release.yaml@c9c218d713f221dabb8504141b1ab4501d5ba7af # v2
+    uses: cplieger/ci/.github/workflows/release.yaml@9fa8886bf87788a0d7627f7e1a3fa34ba6d8383e # v3
     # Forward only the two Docker Hub publish credentials the reusable pipeline
     # actually declares and consumes, rather than `secrets: inherit` (which
     # exposes every repo secret to the reusable-workflow trust boundary). Both
