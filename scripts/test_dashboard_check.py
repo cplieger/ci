@@ -537,6 +537,19 @@ class HouseStandard(RuleCase):
         defaults(doc, 'panel-5')['min'] = 0
         self.assert_finding(doc, 'standard', 'change over time')
 
+    def test_at_start_subtraction_is_a_change(self):
+        doc = valid()
+        query = element(doc, 'panel-5')['data']['spec']['queries'][0]['spec']['query']['spec']
+        query['expr'] = 'sum(x{a="b"} - (x{a="b"} @ start()))'
+        defaults(doc, 'panel-5')['min'] = 0
+        self.assert_finding(doc, 'standard', 'change over time')
+
+    def test_at_start_without_subtraction_is_not_a_change(self):
+        doc = valid()
+        query = element(doc, 'panel-5')['data']['spec']['queries'][0]['spec']['query']['spec']
+        query['expr'] = 'x @ start()'
+        self.assert_finding(doc, 'standard', 'min: 0')
+
     def test_rejects_time_series_without_min_zero(self):
         doc = valid()
         del defaults(doc, 'panel-2')['min']

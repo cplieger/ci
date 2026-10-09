@@ -46,7 +46,11 @@ BANNED_AUTO_GRID_KEYS = (
     'maxHeightMode',
 )
 
-CHANGE_QUERY = re.compile(r'\b(i?delta|deriv)\(|-\s*first_over_time\(')
+# `x - (x @ start())` is the stable form of `x - first_over_time(x[..] @ start())`, which needs
+# Prometheus 3.14 or promql-experimental-functions.
+CHANGE_QUERY = re.compile(
+    r'\b(i?delta|deriv)\(|-\s*first_over_time\(|-\s*\(?\s*[A-Za-z_:][\w:]*(\{[^}]*\})?\s*@\s*start\(\)'
+)
 
 PROSE_CHARS = (
     ('\u2014', 'an em dash'),
