@@ -61,4 +61,15 @@ exclude = [
   # name and cannot rot on its own while the badge beside it still renders.
   # Deliberately narrower than `--accept-timeouts`, which would forgive a
   # timeout from every host and hide a genuinely dead one.
+
+  # 403 to any datacenter IP (checked 2026-10-09 with a browser user agent),
+  # Cloudflare bot protection rather than rot: the AniDB home page loads in a
+  # real browser. It is reported by animap and seadex-scout, the repos that
+  # name AniDB as a mapping source.
+  '^https://anidb\.net/?$',
+
+  # 404 by design: the placeholder repo in the release-maintenance dashboard
+  # fixtures (scripts/testdata). The PR numbers are invented test data that
+  # scripts/test_release_maintenance.py matches by text, so no real PR fits.
+  '^https://github\.com/cplieger/example/',
 ]
