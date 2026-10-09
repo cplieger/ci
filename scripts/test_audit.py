@@ -1243,15 +1243,15 @@ class RulesetBodies(unittest.TestCase):
                 'deletion',
             },
         )
-        self.assertEqual(DEV_RULESET['bypass_actors'], [])
         main_rules = [r['type'] for r in MAIN_RULESET['rules']]
         self.assertEqual(len(main_rules), len(set(main_rules)), main_rules)
         self.assertEqual(set(main_rules), dev_rules | {'creation'})
         self.assertNotIn('update', main_rules)
-        self.assertEqual(
-            MAIN_RULESET['bypass_actors'],
-            [{'actor_id': 5, 'actor_type': 'RepositoryRole', 'bypass_mode': 'always'}],
-        )
+        for ruleset in (DEV_RULESET, MAIN_RULESET):
+            self.assertEqual(
+                ruleset['bypass_actors'],
+                [{'actor_id': 5, 'actor_type': 'RepositoryRole', 'bypass_mode': 'always'}],
+            )
         self.assertEqual(
             json.dumps(DEV_RULESET['conditions']['ref_name']['include']), '["refs/heads/dev"]'
         )
@@ -1474,13 +1474,16 @@ class TwoBranchRulesets(unittest.TestCase):
         hard, warn = self.grade('main', lambda rs: None)
         self.assertEqual((hard, warn), ([], []))
 
-    def test_the_admin_bypass_on_dev_is_not_exempt(self):
-        admin = {'actor_type': 'RepositoryRole', 'actor_id': 5, 'bypass_mode': 'always'}
-        hard, warn = self.grade('dev', lambda rs: rs['bypass_actors'].append(admin))
+    def test_the_admin_bypass_on_dev_is_expected(self):
+        hard, warn = self.grade('dev', lambda rs: None)
+        self.assertFalse([h for h in hard if "ruleset 'dev'" in h], hard)
+        self.assertNotIn("ruleset 'dev' has a bypass actor (RepositoryRole id 5)", warn)
+
+    def test_a_dev_ruleset_without_the_admin_bypass_is_drift(self):
+        hard, _ = self.grade('dev', lambda rs: rs['bypass_actors'].clear())
         self.assertTrue(
             any("ruleset 'dev' differs" in h and 'bypass actors' in h for h in hard), hard
         )
-        self.assertIn("ruleset 'dev' has a bypass actor (RepositoryRole id 5)", warn)
 
     def test_collect_records_each_bypass_mode(self):
         rs = live(MAIN_RULESET)
