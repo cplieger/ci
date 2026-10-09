@@ -1,4 +1,4 @@
-"""Every bash `run:` block of the release-channel workflows opens with strict mode.
+"""Every bash `run:` block of the covered workflows opens with strict mode.
 
 GitHub's default bash invocation supplies errexit and pipefail but not nounset,
 and shellcheck does not report a missing prologue, so this is the only gate.
@@ -19,6 +19,7 @@ COVERED = (
     '.github/workflows/promote.yaml',
     '.github/workflows/ghcr-retention.yaml',
     '.github/workflows/rebuild-stale.yaml',
+    '.github/workflows/deadset-ci.yaml',
     'actions/git-cliff-version/action.yml',
     'actions/intake/action.yml',
 )

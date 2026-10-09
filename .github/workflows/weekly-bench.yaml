@@ -34,25 +34,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # A benchmark nobody runs has only ever been type-checked. `go test ./...`
-  # COMPILES a benchmark and never executes it without -bench, so an unenrolled
-  # benchmark can rot silently: measured 2026-08-21, plex-exporter's
-  # BenchmarkCollect nil-dereferenced on its first iteration and had since the
-  # commit that turned three plexapi fields into pointers. One of 24 repos.
-  #
-  # The enrolled repos are covered by the run job below, which executes their
-  # benchmarks for real. This job covers everything ELSE that carries a
-  # `func Benchmark`, at one iteration each, purely to prove the code still
-  # runs. It is deliberately weekly rather than per-PR: most PRs are small and
-  # do not touch a benchmark, so paying this on every push would buy the same
-  # protection at many times the cost.
-  #
-  # Self-maintaining by construction. It takes the enrolled set from the fanout
-  # job's output and subtracts it, so enrolling a repo removes it from here
-  # automatically and a new repo that gains its first benchmark is picked up
-  # with no edit. ONE job rather than a matrix: the work is about a second per
-  # repo, so per-leg checkout and toolchain setup would cost more than the
-  # tests do.
+  # `go test ./...` compiles a benchmark and never executes it, so an unenrolled
+  # one can rot unseen. This job runs every non-enrolled `func Benchmark` once,
+  # to prove it still runs; the enrolled set comes from fanout's output, so
+  # enrolment needs no edit here. One job rather than a matrix: the work is
+  # about a second per repo, less than a leg's checkout and toolchain setup.
   smoke:
     needs: fanout
     runs-on: ubuntu-26.04
@@ -71,12 +57,10 @@ jobs:
           # resolves ONLY from actions/go-versions' manifest, which lags an
           # upstream Go patch tag by hours while Renovate bumps every consumer's
           # `go` directive inside that window. This job clones ~40 repos whose
-          # directives disagree with each other by design, so `go-version-file`
-          # is not available to it and no single pin can satisfy them: without
-          # `auto` every clone fails `go.mod requires go >= X (running X-1)`.
-          # Measured on go1.27.1, run 33573180820. The toolchain arrives as a
-          # checksum-verified module. Same workaround as go-ci.yaml's deadset
-          # install.
+          # directives disagree by design, so no single pin satisfies them:
+          # without `auto` every clone fails `go.mod requires go >= X (running
+          # X-1)` (go1.27.1, run 33573180820). Same workaround as
+          # deadset-ci.yaml's Install deadset.
           GOTOOLCHAIN: auto
           # From the fanout job, never restated here. Injected via env rather
           # than inlined in the body so the value cannot expand into shell code.
@@ -321,16 +305,8 @@ jobs:
     if: ${{ needs.fanout.outputs.matrix != '[]' }}
     strategy:
       fail-fast: false
-      max-parallel: 4   # Own day; 4 leaves 16 of the 20-job cap free. 17 repos
-                        # is 5 waves, and subflux dominates: measured at
-                        # -count=10, it is 36 min at its 1s benchtime, against
-                        # about 12 min for the slowest library at 3s. marotte
-                        # read 36.5 here until 2026-09-16 and the figure was
-                        # never right: it needed about 77 min, because one
-                        # benchmark's per-op cost grew with b.N. Fixed in that
-                        # repo (25 min locally); re-read it off the next run.
-                        # Roughly an hour of wall for the run, all of it free
-                        # (every repo here is public).
+      max-parallel: 4   # Own day; leaves 16 of the 20-job cap free. subflux
+                        # dominates the waves at about 36 min (-count=10, 1s).
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
     runs-on: ubuntu-26.04
@@ -372,31 +348,14 @@ jobs:
         with:
           python-version: "3.14"
 
-      # `-run='^$'` keeps the unit suite out of the timing. `-count` is the
-      # sample size the reducer takes a median over; 10 is benchstat's own
-      # documented minimum for a statistically meaningful sample. `-benchtime`
-      # sets the iterations inside each sample, and it is the knob that decides
-      # how fine a regression the tracker can see at all: spread falls as
-      # 1/sqrt(iterations per sample), so raising it tightens every series at
-      # once. Both are validated before use because both reach a shell.
-      #
-      # The two large apps run at 1s where everything else runs at 3s, and the
-      # reason is attribution rather than budget. Their benchmarked code takes
-      # 8.2 and 14.2 commits a week against 3.2 for the noisiest library, so a
-      # finer detection threshold buys less there - you would resolve a 10%
-      # regression and still not know which of fourteen commits caused it.
-      # Spending 3x the wall time to sharpen a signal nobody can attribute is
-      # poor value. The budget agrees: measured at count=10, subflux is 36 min
-      # at 1s and 82 min at 3s, and the second does not fit the timeout.
-      #
-      # SKIP is how criterion 1 is enforced on a repo that is otherwise a good
-      # candidate. `go test -skip` (Go 1.21+) matches benchmarks and sub-benchmark
-      # paths, so a single offending series can be dropped without touching the
-      # repo and without a positive -bench regex that would have to enumerate
-      # everything else. Every entry below names what it excludes and why, and
-      # each was found by walking the TIMED region of each benchmark rather than
-      # the whole function: a b.TempDir() in setup costs nothing per iteration,
-      # and scanning whole bodies over-reported this 15 to 7 to an actual 3.
+      # `-run='^$'` keeps the unit suite out of the timing; `-count=10` is
+      # benchstat's minimum sample; `-benchtime` sets the iterations per sample,
+      # and spread falls as 1/sqrt of it. The two large apps run at 1s: they take
+      # many commits a week, so a finer threshold cannot be attributed, and subflux
+      # at 3s does not fit the timeout. SKIP (`go test -skip`) drops one offending
+      # series without a positive -bench regex; each entry names what it excludes,
+      # judged on the timed region only. Both values reach a shell, so both are
+      # validated.
       - name: Run benchmarks
         working-directory: app
         env:
@@ -460,19 +419,10 @@ jobs:
 
           echo "repo=$REPO count=$COUNT benchtime=$BENCHTIME skip=${SKIP:-<none>}"
 
-          # A skip pattern that stops matching is a silent hole: the offending
-          # series returns to the chart and nothing says so. Checked per
-          # ALTERNATIVE rather than per pattern, which matters -
-          # `A|B/concurrent_miss` still matches A after B loses its
-          # sub-benchmarks, so a whole-pattern check passes in exactly the case it
-          # exists to catch.
-          #
-          # Grep against the sources rather than a discovery run, because a
-          # skipped benchmark is by definition absent from the output. This
-          # catches a renamed function or a renamed sub-benchmark, which is the
-          # real risk; it cannot see a sub-benchmark whose name is computed at
-          # runtime, and it warns rather than failing so a naming change never
-          # takes the whole leg down.
+          # A skip alternative that stops matching silently returns its series to the
+          # chart, so each alternative is grepped in the sources (`A|B/x` still matches
+          # A after B/x is gone). A runtime-computed sub-benchmark name is invisible to
+          # this, so it warns rather than failing the leg.
           if [ -n "$SKIP" ]; then
             printf '%s\n' "$SKIP" | tr '|' '\n' | while IFS= read -r alt; do
               [ -n "$alt" ] || continue
@@ -517,16 +467,9 @@ jobs:
               "$RUNNER_TEMP/bench.json"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Per-series noise floor, measured on THIS runner from the samples the run
-      # already produced. The 150% alert threshold is only meaningful against
-      # that floor, and enrolment criterion 2 is stated in terms of it, so the
-      # data has to come from the runner rather than from a workstation. Costs
-      # nothing extra: it re-reads bench-raw.txt.
-      #
-      # Report-only, like every other verdict in this workflow. The script exits
-      # 1 when a series is too noisy for the threshold, which is information for
-      # a human reading the summary, not a reason to fail a leg that measured
-      # everything it was asked to measure.
+      # The noise floor per series, measured on this runner from bench-raw.txt,
+      # which is what the 150% alert threshold is judged against. Report-only: a
+      # noisy series is information for the summary, not a failed leg.
       - name: Stability
         run: |
           set -uo pipefail
@@ -541,17 +484,9 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # The raw samples are the only durable record of what this run actually
-      # measured, and criterion 2 cannot be settled without them. The chart keeps
-      # ONE median per series, so the ten samples behind it - and therefore the
-      # distribution of consecutive-median ratios that decides whether the 150%
-      # threshold is policeable at all - exist only in this job's filesystem and
-      # die with it. Keeping them lets several runs be pooled into one
-      # calibration instead of each run answering nothing.
-      #
-      # 90 days rather than the default 90-and-forget: long enough to pool a
-      # quarter of weekly runs, short enough that nobody is storing benchmark
-      # text forever.
+      # The chart keeps one median per series, so the raw samples are the only
+      # record of the distribution that decides whether the 150% threshold holds;
+      # 90 days pools a quarter of weekly runs into one calibration.
       - name: Keep the raw samples
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -606,41 +541,21 @@ jobs:
           benchmark-data-dir-path: .
           auto-push: true
           alert-threshold: "150%"
-          # comment-on-alert is OFF because the action cannot be told which repo
-          # to comment on: leaveComment resolves the target from
-          # github.context.repo (dist/src/write.js:136), which is cplieger/ci
-          # under Pattern C and is not overridable, since GitHub reserves the
-          # default GITHUB_* variables. So an alert about a consumer's
-          # performance would be filed as a commit comment on a cplieger/ci
-          # commit, where it is both misfiled and unread. summary-always puts
-          # the same comparison in this job's summary instead, which is where
-          # the run is already being looked at. Unlike the data point's commit,
-          # this one cannot be repaired afterwards - the comment is an API call,
-          # not a file.
+          # The action comments on github.context.repo (dist/src/write.js:136), which
+          # is cplieger/ci under Pattern C and cannot be overridden, so an alert would
+          # be misfiled on a ci commit. summary-always puts the comparison in this
+          # job's summary instead.
           comment-on-alert: false
           summary-always: true
           fail-on-alert: false
           max-items-in-chart: 100
 
-      # The action stamps every data point with a cplieger/ci commit, because it
-      # resolves the repo it is acting on from github.context.repo and this
-      # workflow runs in ci while measuring a consumer. A chart whose points
-      # link to ci cannot attribute a regression to the change that caused it,
-      # which is the only reason the tracker exists, so the record is repaired
-      # here. Verified against the pinned v1.22.1 dist, not the README.
-      #
-      # Overriding GITHUB_REPOSITORY was tried first and CANNOT work (#494,
-      # reverted): GitHub reserves the default GITHUB_* variables, the runner's
-      # value wins at process level, and the step's rendered env block prints
-      # the override anyway, which makes the approach look verified when it is
-      # not. Passing the consumer's SHA as the action's `ref` without that
-      # redirect just asks ci for an object it does not have.
-      #
-      # bench-fix-attribution.py refuses to write unless the file is exactly the
-      # action's format and the newest entry carries this run's ci SHA, so a
-      # future format change fails this leg loudly instead of corrupting the
-      # series. Its round-trip is byte-identical, so a run that changes nothing
-      # produces no commit.
+      # The action stamps each data point with the cplieger/ci commit it runs in
+      # (github.context.repo; GITHUB_REPOSITORY cannot be overridden, the runner
+      # reserves it), so the point is re-pointed at the benchmarked commit here.
+      # bench-fix-attribution.py refuses any file that is not exactly the pinned
+      # v1.22.1 format with this run's ci SHA newest, and round-trips byte-identical,
+      # so an unchanged run makes no commit.
       - name: Re-point the data point at the benchmarked commit
         env:
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
@@ -675,25 +590,11 @@ jobs:
           echo "re-pointed ${REPO} benchmark data at ${SHA}"
 
   # ─── Tracker issue per consumer (Pattern C, same shape as the siblings) ─────
-  # Before this job, a 1.5x regression reached a job summary and nothing else:
-  # the action's own alert comment had to be turned off, because it resolves the
-  # repo to comment on from github.context.repo, which is cplieger/ci here and is
-  # not overridable. The other four weekly workflows all surface findings as a
-  # per-repo tracker issue, and that is the difference between a tracker that is
-  # correct and one that is noticed.
-  #
-  # The TRACKER shape (gremlins, stryker, links) is right for benchmarks and the
-  # per-finding shape (fuzz) is not. A fuzz finding is a discrete defect closed
-  # by committing the seed that proves the fix; a benchmark is a continuous
-  # series with no such artifact, it re-measures to a different value every week,
-  # and fuzz already paid for hash-keyed titles minting duplicate issues for one
-  # defect. Nothing here would ever auto-close.
-  #
-  # Unlike its siblings this job re-reads each consumer's `benchmarks` branch
-  # rather than run-job artifacts, because for benchmarks a durable store already
-  # exists and holds the full series. bench-aggregate.py therefore REGENERATES
-  # the trend table from the data every week instead of rolling its own rendered
-  # markdown forward, which is how the stryker tracker once fused two columns.
+  # The action's alert comment is off (above), so this files a per-repo tracker
+  # issue like gremlins and stryker; a benchmark is a continuous series with no
+  # fixing artifact, so fuzz's per-finding shape would never auto-close. It reads
+  # each consumer's `benchmarks` branch, the durable full series, and regenerates
+  # the trend table weekly rather than rolling rendered markdown forward.
   aggregate:
     needs: [fanout, run]
     if: ${{ always() && needs.fanout.outputs.matrix != '[]' }}

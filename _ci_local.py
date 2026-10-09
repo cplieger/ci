@@ -1,48 +1,5 @@
 #!/usr/bin/env python3
-"""Local equivalent of `.github/workflows/ci.yaml` (or validate.yaml, legacy) — parse the workflow
-that runs in CI and execute each step in the local environment.
-
-Modes:
-
-  Default (no --path):
-    Run from the repo root. Reads `.github/workflows/ci.yaml` (or validate.yaml legacy),
-    classifies each step (EXEC, LOCAL, SKIP, UNKNOWN), and executes the
-    EXEC/LOCAL steps in order, honoring `working-directory:` and `env:`.
-
-  --path SUBDIR:
-    Restrict validation to a subdirectory of the current repo. If the
-    subdir contains its own `.github/workflows/ci.yaml` (or validate.yaml
-    legacy), that workflow runs; otherwise falls back to autodetect mode (Go suite +
-    hadolint + shellcheck + shfmt + gitleaks based on what's in SUBDIR).
-
-  --plan-only:
-    Print the plan without executing anything.
-
-  --workflow PATH:
-    Override the workflow file location (default
-    `.github/workflows/ci.yaml` or validate.yaml legacy).
-
-Step classification:
-
-  EXEC      `run:` block — executed verbatim with bash -c.
-  LOCAL     `uses:` action with a known local equivalent (e.g. gitleaks).
-  SKIP      `actions/checkout`, `actions/setup-*`, `tj-actions/changed-files`,
-            and any step whose name starts with "Install" or matches CI-only
-            tool-bootstrap patterns. Local environments have these tools.
-  UNKNOWN   `uses:` action we don't recognize. Surfaces as exit code 1
-            unless --ignore-unknown is passed.
-
-Special handling:
-
-  - Thin-caller workflows (job-level `uses: cplieger/ci/.github/workflows/<X>.yaml@<ref>`)
-    are resolved to the reusable workflow and its steps are executed locally.
-  - Reusable workflows with auto-detect gates (`steps.<id>.outputs.<k>`)
-    are evaluated by running the Resolve profile step locally.
-  - `docker run --rm -i hadolint/hadolint:<ver> hadolint ... - < Dockerfile`
-    — If `hadolint` is on PATH locally, the docker invocation is
-    rewritten to call the binary directly. Avoids needing a running
-    Docker daemon for a fast lint.
-"""
+"""Run a repository's CI workflow locally, step by step, the way CI runs it."""
 
 import argparse
 import atexit
@@ -261,7 +218,7 @@ _PIN_BINARY = {
     'hadolint/hadolint': 'hadolint',
     'aquasecurity/trivy': 'trivy',
     '@cplieger/deadset-ts': 'deadset-ts',
-    # `go install <pkg>@<ver>` lines in go-ci.yaml and ts-ci.yaml.
+    # `go install <pkg>@<ver>` lines in go-ci.yaml and deadset-ci.yaml.
     'golang.org/x/vuln/cmd/govulncheck': 'govulncheck',
     'github.com/cplieger/deadset/cmd/deadset': 'deadset',
     'github.com/cplieger/deadset-go/cmd/deadset-go': 'deadset-go',
@@ -285,7 +242,7 @@ _RENOVATE_PIN_RE = re.compile(
     re.MULTILINE,
 )
 _GO_INSTALL_RE = re.compile(r'go\s+install\s+"?(?P<pkg>[^\s"@]+)@(?P<ver>[^\s"]+)"?')
-# Plain `NAME=value` shell assignments, so a `go install pkg@${DEADSET_VERSION}`
+# Plain `NAME=value` shell assignments, so a `go install pkg@${GOVULNCHECK_VERSION}`
 # line resolves to the version the sibling assignment sets.
 _SHELL_ASSIGN_RE = re.compile(r'^[^\S\n]*(?P<name>[A-Za-z_]\w*)=(?P<value>[^\s#]+)', re.MULTILINE)
 _SHELL_VAR_RE = re.compile(r'^\$\{?(?P<name>[A-Za-z_]\w*)\}?$')
@@ -376,9 +333,10 @@ def collect_pinned_versions(step_bodies, env_blocks=()):
     for body in step_bodies:
         if not body:
             continue
-        # go-ci.yaml writes the pin as `DEADSET_VERSION=v1.10.0` and then
-        # `go install ...@${DEADSET_VERSION}`, so the install line alone carries
-        # no version. Resolve one step of indirection against the same body.
+        # go-ci.yaml writes the pin as `GOVULNCHECK_VERSION=v1.8.0` and then
+        # `go install ...@${GOVULNCHECK_VERSION}`, so the install line alone
+        # carries no version. Resolve one step of indirection against the same
+        # body; a variable set elsewhere (an `env:` pin) resolves to nothing here.
         assignments = {m.group('name'): m.group('value') for m in _SHELL_ASSIGN_RE.finditer(body)}
 
         def resolve(raw, _assignments=assignments):
@@ -448,14 +406,14 @@ def collect_pin_sources(workflow_paths, target):
         if contributed:
             # Workflow-level env belongs to every job in its file, and the pin
             # can sit on a RESOLVED reusable rather than the discovered caller
-            # (security-scan.yaml carries TRIVY_VERSION that way), so walk the
-            # `uses:` chain for those blocks too.
+            # (security-scan.yaml carries TRIVY_VERSION, deadset-ci.yaml the
+            # deadset pins), so walk the `uses:` chain for those blocks too.
             env_blocks.extend(_workflow_env_chain(raw, target))
     return bodies, env_blocks
 
 
-def _workflow_env_chain(raw, target, depth=0, parent_ref=None, seen=None):
-    """Top-level `env:` of a workflow and of every reusable it calls."""
+def _workflow_env_chain(raw, target, depth=0, parent_ref=None, seen=None, prefix=''):
+    """Top-level `env:` of a workflow and of every reusable an applying job calls."""
     if depth > 6:
         return []
     if seen is None:
@@ -463,11 +421,12 @@ def _workflow_env_chain(raw, target, depth=0, parent_ref=None, seen=None):
     blocks = []
     if isinstance(raw.get('env'), dict):
         blocks.append(raw['env'])
-    for job in (raw.get('jobs') or {}).values():
+    for job_name, job in (raw.get('jobs') or {}).items():
         if not isinstance(job, dict):
             continue
         uses = job.get('uses', '')
-        if not is_reusable_ref(uses) or uses in seen:
+        jobname = f'{prefix}/{job_name}' if prefix else str(job_name)
+        if not is_reusable_ref(uses) or uses in seen or not job_applies_locally(jobname, target):
             continue
         seen.add(uses)
         resolved = resolve_reusable_workflow(uses, target, parent_ref=parent_ref)
@@ -475,7 +434,7 @@ def _workflow_env_chain(raw, target, depth=0, parent_ref=None, seen=None):
             continue
         match = REUSABLE_RE.match(uses)
         child_ref = match.group(2) if match else parent_ref
-        blocks.extend(_workflow_env_chain(resolved, target, depth + 1, child_ref, seen))
+        blocks.extend(_workflow_env_chain(resolved, target, depth + 1, child_ref, seen, jobname))
     return blocks
 
 
@@ -536,17 +495,12 @@ def _ci_repo_root(target):
 
 
 def resolve_reusable_workflow(uses_ref, target, parent_ref=None):
-    """Resolve a `uses:` reusable-workflow ref to its parsed YAML.
+    """Resolve a `uses:` reusable-workflow ref to its parsed YAML, or None.
 
-    Handles the `cplieger/ci/.github/workflows/<X>.yaml@<ref>` form and the
-    local `./.github/workflows/<X>.yaml` form (only used inside ci-repo
-    workflows, resolved against the sibling ci/ checkout). Tries the sibling
-    checkout first, then a `gh api` fetch at `parent_ref`, else None (caller
-    falls back to autodetect).
-
-    Caveat: the sibling checkout is the LOCAL `ci/` working tree, not the
-    pinned `@sha` — so ci-local validates against current (possibly
-    unreleased) workflow source when a consumer's pin lags `main`.
+    Takes `cplieger/ci/.github/workflows/<X>.yaml@<ref>` and the local
+    `./.github/workflows/<X>.yaml`, read from the sibling ci/ checkout first,
+    then by `gh api` at `parent_ref`. The sibling is the local working tree, not
+    the pinned sha, so a lagging consumer is validated against newer source.
     """
     m = REUSABLE_RE.match(uses_ref)
     lm = LOCAL_REUSABLE_RE.match(uses_ref)
@@ -865,29 +819,76 @@ def _read_github_outputs(path):
     return outputs
 
 
+def _deadset_languages(cwd, nested=False):
+    """deadset-ci.yaml's Resolve target languages and the meta root-target rule;
+    the plan-parity and detect tests hold all three to the same fixtures."""
+    try:
+        configured = json.loads((cwd / 'deadset.json').read_text())['analysis']['languages']
+    except OSError, ValueError, KeyError, TypeError:
+        configured = None
+    if configured:
+        return set(configured)
+    if nested:
+        return {'go'}
+    names = set()
+    for root, dirs, files in os.walk(cwd):
+        # deadset's WalkDir records a symlink to a directory by name, where
+        # os.walk lists it among the directories.
+        links = {d for d in dirs if os.path.islink(os.path.join(root, d))}
+        names.update(files, links)
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in links
+            and d not in ('node_modules', 'testdata', 'vendor')
+            and not d.startswith('.')
+        ]
+    found = set()
+    if any(n == 'go.mod' or n.endswith('.go') for n in names):
+        found.add('go')
+    sources = any(n.endswith(('.ts', '.tsx', '.mts', '.cts')) for n in names)
+    if any(re.fullmatch(r'tsconfig.*\.json', n) for n in names) or (
+        sources and 'package.json' in names
+    ):
+        found.add('ts')
+    return found
+
+
+def _deadset_npm_dirs(cwd):
+    """Must match deadset-ci.yaml's Resolve target npm_dirs (the plan-parity test)."""
+    proc = subprocess.run(
+        ['git', '-C', str(cwd), 'ls-files', '--', ':(glob)**/package-lock.json'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    skip = re.compile(r'(^|/)(node_modules|testdata|vendor|\.[^/]*)/')
+    return [
+        os.path.dirname(lock) or '.'
+        for lock in proc.stdout.splitlines()
+        if lock and not skip.search(lock)
+    ]
+
+
 def predict_profile_outputs(step, cwd, workspace):
     """Predict active profile-step outputs without running workflow code.
 
     `--plan-only` promises no workflow execution, but later `if:` expressions
-    still need the outputs of the three profile shapes used by the CI suite.
+    still need the outputs of the profile steps the CI suite gates on.
     """
     name = step.get('name') or ''
     script = step.get('run') or ''
     if name == 'Detect repo surfaces':
         return compute_local_detect(workspace)
-    if 'go list' in script and 'app=true' in script:
-        for path in cwd.rglob('*.go'):
-            rel = path.relative_to(cwd)
-            if path.name.endswith('_test.go') or any(
-                part in ('.git', 'vendor', 'node_modules', 'testdata') for part in rel.parts
-            ):
-                continue
-            try:
-                if re.search(r'(?m)^package\s+main\s*$', path.read_text(errors='ignore')):
-                    return {'app': 'true'}
-            except OSError:
-                continue
-        return {'app': 'false'}
+    if name == 'Resolve target' and 'npm_dirs<<' in script:
+        languages = _deadset_languages(cwd, nested=cwd.resolve() != workspace.resolve())
+        ts = 'ts' in languages
+        return {
+            'work': '(planned)',
+            'go': 'true' if 'go' in languages else 'false',
+            'ts': 'true' if ts else 'false',
+            'npm_dirs': '\n'.join(_deadset_npm_dirs(cwd)) if ts else '',
+        }
     if '[ -f Dockerfile ]' in script and 'image=true' in script:
         return {'image': 'true' if (cwd / 'Dockerfile').is_file() else 'false'}
     if 'build-args' in script and 'PKG_REFRESH' in script:
@@ -1173,15 +1174,11 @@ _GITLEAKS_PATH_RE = re.compile(r'/tmp/gitleaks\b')
 
 
 def rewrite_gitleaks_download(cmd: str) -> str:
-    """If gitleaks is on PATH, replace the curl-download+run sequence.
+    """If gitleaks is on PATH, replace the curl-download+run sequence with it.
 
-    Strips the VERSION= line and the curl|tar extraction, and rewrites the
-    /tmp/gitleaks invocation to `gitleaks`. `gitleaks dir .` is preserved
-    verbatim, never rewritten to `detect`: `dir` scans the working tree like
-    CI's filesystem scan does, while `detect --source .` scans full git
-    history and flags already-removed secrets CI never sees (wtk
-    `routes_test.go` false positive, 2026-07). `dir` also ignores .gitignore,
-    so `rewrite_gitleaks_gitignore` (applied next) restores parity.
+    `gitleaks dir .` is kept, never `detect`: `detect --source .` scans git
+    history and flags removed secrets CI never sees. `dir` ignores .gitignore,
+    which `rewrite_gitleaks_gitignore` (applied next) restores.
     """
     if not shutil.which('gitleaks') or '/tmp/gitleaks' not in cmd:
         return cmd
@@ -1234,12 +1231,8 @@ _REPORT_PATH_RE = re.compile(r'--report-path[ =](["\']?)(?![/$])([^\s"\']+)\1')
 def rewrite_report_artifacts(cmd: str) -> str:
     """Redirect relative report-file writes into $RUNNER_TEMP.
 
-    In CI these files (e.g. security-scan's `--report-path
-    gitleaks-history.sarif`) land in a throwaway checkout and feed an
-    upload step ci-local skips. Locally they'd land in the real working
-    tree, and a leftover SARIF then false-fails every later `gitleaks dir`
-    scan by quoting historical secret matches (observed on envx and
-    docker-keepalived).
+    In CI they land in a throwaway checkout; locally a leftover SARIF in the
+    working tree false-fails every later `gitleaks dir` scan.
     """
     return _REPORT_PATH_RE.sub(lambda m: f'--report-path "${{RUNNER_TEMP}}/{m.group(2)}"', cmd)
 
@@ -1399,13 +1392,9 @@ _HTMLVALIDATE_FIND_RE = re.compile(
 def rewrite_stylelint_gitignore(cmd: str, cwd: Path) -> str:
     """Replace the web-lint stylelint `**/*.css` glob with CI-visible .css files.
 
-    stylelint honours neither .gitignore nor a config `ignoreFiles` here, so
-    the glob walks gitignored scratch a CI checkout never contains
-    (coverage/, .stryker-tmp/, .app-review/), failing the gate on files CI
-    can't see. An empty result is real: the step passes --allow-empty-input
-    for a consumer whose styles come from a shared package, so a repo whose
-    only CSS is gitignored must lint nothing rather than fall back to the
-    raw glob.
+    stylelint honours neither .gitignore nor `ignoreFiles` here, so the glob
+    walks gitignored scratch CI never sees. An empty list is real (the step
+    passes --allow-empty-input), never a fallback to the raw glob.
     """
     if 'stylelint' not in cmd or not _STYLELINT_GLOB_RE.search(cmd):
         return cmd
@@ -1497,12 +1486,9 @@ def _gitignored_entries(cwd: Path):
 def rewrite_find_sh_gitignore(cmd: str, cwd: Path) -> str:
     """Swap the shellcheck/shfmt `find` producer for the CI-visible .sh fileset.
 
-    Both steps share one `find` (four invocation sites across ci.yaml and
-    shell-ci.yaml), and the surrounding script tests `[ -z "$files" ]`, so the
-    replacement must stay a newline-separated word list on stdout — `git
-    ls-files` gives exactly that. The `./` prefix is preserved because
-    shellcheck's `-x` source-following resolves relative to the reported path
-    and the workflow's own output lines read that way.
+    The script tests `[ -z "$files" ]`, so the output stays a newline-separated
+    list on stdout; the `./` prefix stays because shellcheck `-x` resolves
+    sources relative to the reported path.
     """
     if not shutil.which('git') or _match_on_command_line(_FIND_SH_RE, cmd)[0] is None:
         return cmd
@@ -1531,12 +1517,9 @@ def rewrite_find_sh_gitignore(cmd: str, cwd: Path) -> str:
 def rewrite_yamllint_gitignore(cmd: str, cwd: Path) -> str:
     """Give `yamllint .` the CI fileset by listing files instead of the tree.
 
-    yamllint's only ignore levers are config-file keys (`ignore`,
-    `ignore-from-file`), and the workflow's inline `-d "{extends: relaxed, ...}"`
-    declares neither — so passing an explicit file list is the one way to reach
-    parity without rewriting the caller's config. A repo WITH its own
-    `.yamllint*` is handled the same way: the file list changes which files are
-    read, never which rules apply, so the repo's config still governs.
+    The inline `-d` config declares no `ignore`, yamllint's only ignore lever,
+    so a file list is the one way to parity. It changes which files are read,
+    never which rules apply, so a repository's own .yamllint still governs.
     """
     if not shutil.which('git') or _match_on_command_line(_YAMLLINT_DOT_RE, cmd)[0] is None:
         return cmd
@@ -1560,12 +1543,9 @@ def rewrite_yamllint_gitignore(cmd: str, cwd: Path) -> str:
 def rewrite_toml_gitignore(cmd: str, cwd: Path) -> str:
     """Restrict the inline TOML validator's rglob to the CI-visible fileset.
 
-    The step is a `python3 -c "<source>"` block, so the rewrite substitutes
-    the iterable expression, keeping the loop body exactly as CI runs it.
-    The literals MUST be single-quoted: the shell wraps the Python source in
-    DOUBLE quotes, so a `json.dumps` literal closes that string early and
-    raises NameError. A path with a quote, backslash or newline can't be
-    embedded safely, so the rewrite bails and leaves the raw walk.
+    The literals must be single-quoted: the shell wraps the Python source in
+    double quotes, so a `json.dumps` literal ends it early. A path holding a
+    quote, backslash or newline cannot be embedded, so the raw walk stays.
     """
     if not shutil.which('git') or _match_on_command_line(_TOML_RGLOB_RE, cmd)[0] is None:
         return cmd
@@ -2005,6 +1985,8 @@ def compute_local_detect(target):
         )
 
     go_nested_dirs = _detect_go_nested_dirs(target)
+    deadset_targets = ['.'] if _deadset_languages(Path(target)) else []
+    deadset_targets += go_nested_dirs
 
     det = {
         'run_go': 'true' if has_gomod else 'false',
@@ -2019,6 +2001,9 @@ def compute_local_detect(target):
         'run_python': 'true' if run_python else 'false',
         'run_scripts': 'true' if run_scripts else 'false',
         'web_dir': web or '',
+        'code_changed': 'true',
+        'run_deadset': 'true' if deadset_targets else 'false',
+        'deadset_targets': json.dumps(deadset_targets),
     }
     _DETECT_CACHE[str(target)] = det
     return det
@@ -2027,15 +2012,18 @@ def compute_local_detect(target):
 def job_applies_locally(jobname, target):
     """Gate an expanded (recursed) job by local surface detection, mirroring the
     meta ci.yaml job-level `if: needs.detect.outputs.run_X`. The surface is the
-    first path segment matching a known gated surface (go/ts/web/shell/docker/
-    python/scripts); markdown and the detect/validate scaffolding have no gate and
-    always run, like CI. Position-independent so it works whether the meta is
+    first path segment matching a known gated surface (go/ts/web/shell/deadset/
+    docker/python/scripts); markdown and the detect/validate scaffolding have no
+    gate and always run, like CI. Position-independent so it works whether the meta is
     reached via a consumer (jobnames like `ci/go/validate`) or run directly on the
     ci repo, where the meta is the top-level workflow (`go/validate`)."""
     segments = jobname.split('/')
     # pr-policy reads the pull request (title, head branch, base), which a local
     # run does not have; CI skips it on every repo whose default branch is main.
     if 'pr-policy' in segments:
+        return False
+    # The canary analyzes other repositories at pinned commits; only CI fetches them.
+    if 'deadset-canary' in segments:
         return False
     det = compute_local_detect(target)
     gate_map = {
@@ -2048,6 +2036,7 @@ def job_applies_locally(jobname, target):
         'ts': det['run_ts'],
         'web': det['run_web'],
         'shell': det['run_shell'],
+        'deadset': det['run_deadset'],
         'docker': det['run_docker'],
         # The public arm64 gate is required whenever Docker is detected. It is
         # planned locally and executed through buildx when the active worker
@@ -2119,10 +2108,16 @@ def _expand_job(jobname, job, caller_inputs, target, depth=0, parent_ref=None):
     # fromJSON(...)`): expand one job instance per value, substituting
     # `${{ matrix.<axis> }}` textually in `with:` — mirroring what CI's
     # matrix does before the reusable workflow sees the inputs. Zero values
-    # means zero instances. Multi-axis or unresolvable matrices fall through
-    # unexpanded; job_applies_locally then decides (fail-safe).
+    # means zero instances. Multi-axis, include/exclude or unresolvable
+    # matrices fall through unexpanded; job_applies_locally then decides
+    # (fail-safe).
     matrix = (job.get('strategy') or {}).get('matrix') if isinstance(job, dict) else None
-    if isinstance(matrix, dict) and len(matrix) == 1 and '__matrix_expanded' not in job:
+    if (
+        isinstance(matrix, dict)
+        and len(matrix) == 1
+        and not ({'include', 'exclude'} & matrix.keys())
+        and '__matrix_expanded' not in job
+    ):
         axis, spec = next(iter(matrix.items()))
         values = _resolve_matrix_values(spec, target)
         if values is not None:
@@ -2645,15 +2640,10 @@ _MANIFEST_SKIP_DIRS = {'vendor', 'node_modules', '.git', '.stryker-tmp'}
 def snapshot_go_manifests(root: Path):
     """Record every Go module manifest under root, keyed by path.
 
-    CodeQL's Go extractor AUTOBUILDS inside --source-root to resolve imports,
-    and that build rewrites go.mod/go.sum when it cannot resolve a module: it
-    does not consult `go.work`, which is gitignored in several repos here, so a
-    workspace-replaced dependency looks missing and gets dropped from the
-    manifest. The database is disposable; the caller's working tree is not, and
-    a local gate that silently edits tracked files is worse than no gate.
-
-    Measured on docker-renovate-scheduler: five replaced requires removed from
-    go.mod and twelve go.sum lines deleted, leaving a tree that no longer built.
+    CodeQL's Go extractor autobuilds inside --source-root without `go.work` and
+    rewrites go.mod/go.sum when a workspace-replaced module looks missing
+    (measured: five requires dropped, a tree that no longer built), so the
+    manifests are snapshotted for restoring and a local gate never edits them.
     """
     snap = {}
     for dirpath, dirnames, filenames in os.walk(root):
@@ -3024,6 +3014,12 @@ def process_workflow_file(wf_path, target, dry_run, ignore_unknown, no_codeql):
             if not job_applies_locally(jobname, target):
                 print(f'  {gray("SKIP")} (surface not present locally)')
                 REPORT.skipped_jobs.append((jobname, 'surface not present locally'))
+                if 'deadset-canary' in jobname.split('/') and _github_repository(target) == (
+                    'cplieger/ci'
+                ):
+                    REPORT.not_validated.append(
+                        (jobname, '(job)', 'reads other repositories at pinned commits; CI runs it')
+                    )
                 print()
                 continue
             if not steps:
@@ -3060,14 +3056,9 @@ def process_workflow_file(wf_path, target, dry_run, ignore_unknown, no_codeql):
 
 
 def print_run_summary(counters, failures, ok, plan_only):
-    """Print the consolidated, agent-facing end-of-run summary.
-
-    Three sections an agent can act on without scrolling the full log:
-      FAILED               — steps that ran and exited non-zero (what to fix).
-      NOT VALIDATED LOCALLY — CI checks with no local result (codeql, a tool not
-                             on PATH, an unrecognized action): a local PASS does
-                             NOT cover these.
-      skipped              — surfaces absent from this repo (CI skips them too).
+    """Print the end-of-run summary: FAILED (steps that exited non-zero),
+    NOT VALIDATED LOCALLY (CI checks with no local result, which a local PASS
+    does not cover) and skipped (surfaces absent from this repo).
     """
     print('=== summary ===')
     parts = [

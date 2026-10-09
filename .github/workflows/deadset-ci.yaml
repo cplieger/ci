@@ -1,0 +1,332 @@
+name: Dead code (deadset)
+
+# One deadset analysis of a target root. The languages come from the target's
+# deadset.json; without one, the repository root uses deadset's detection and a
+# nested Go module uses Go alone.
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: The analyzed root, relative to the repository root.
+        type: string
+        default: '.'
+      repository:
+        description: Another public repository to analyze instead of the caller's (the canary).
+        type: string
+        default: ''
+      ref:
+        description: The commit of `repository` to analyze.
+        type: string
+        default: ''
+      exit-code:
+        description: deadset's --exit-code, `on` or `off`.
+        type: string
+        default: 'on'
+
+permissions:
+  contents: read
+
+# deadset refuses an analyzer whose report schema it does not accept (exit 3),
+# so these pins only work as a set: the meta ci.yaml's deadset-canary job runs
+# this workflow over fixed repositories to prove each set before it ships.
+# Workflow-level so ci-local's version preflight reads them.
+env:
+  # renovate: datasource=go depName=github.com/cplieger/deadset
+  DEADSET_VERSION: v1.11.1
+  # renovate: datasource=go depName=github.com/cplieger/deadset-go
+  DEADSET_GO_VERSION: v1.27.1
+  # renovate: datasource=npm depName=@cplieger/deadset-ts
+  DEADSET_TS_VERSION: 6.1.0
+
+jobs:
+  analyze:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.target }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      # The languages are deadset's own choice, replayed so the job installs
+      # what that choice needs: analysis.languages from deadset.json, else the
+      # central file's, else deadset's detection by file name, which records
+      # every non-directory entry (commands.md "How languages are detected").
+      # A nested module's central file names go alone, because deadset-ts at
+      # the root already reads every tsconfig under it. A language whose setup
+      # cannot be derived fails here.
+      - name: Resolve target
+        id: target
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "$RUNNER_TEMP/deadset.XXXXXX")"
+          languages=""
+          if [ -f deadset.json ]; then
+            languages="$(jq -r '.analysis.languages // [] | join(",")' deadset.json 2>/dev/null || true)"
+          fi
+          languages_from="repository: deadset.json"
+          central_languages='[]'
+          if [ -z "$languages" ] && [ "$TARGET" != . ]; then
+            languages=go
+            languages_from="central: nested module"
+            central_languages='["go"]'
+          fi
+          if [ -z "$languages" ]; then
+            languages_from=detected
+            names="$(find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o \( -type f -o -type l \) -print | sed 's|.*/||')"
+            found=()
+            if grep -qxE 'go\.mod|.+\.go' <<<"$names"; then found+=(go); fi
+            if grep -qxE 'tsconfig.*\.json' <<<"$names" \
+              || { grep -qE '\.(ts|tsx|mts|cts)$' <<<"$names" && grep -qx 'package\.json' <<<"$names"; }; then
+              found+=(ts)
+            fi
+            languages="$(IFS=,; printf '%s' "${found[*]:-}")"
+          fi
+          go=false
+          ts=false
+          case ",$languages," in *,go,*) go=true ;; esac
+          case ",$languages," in *,ts,*) ts=true ;; esac
+          if [ "$go" = false ] && [ "$ts" = false ]; then
+            echo "::error::nothing to analyze at $TARGET: analysis.languages ($languages_from) is '${languages}', and this check analyzes go and ts."
+            exit 1
+          fi
+          if [ "$go" = true ] && [ ! -f go.mod ]; then
+            echo "::error::Go is in scope at $TARGET ($languages_from), but $TARGET has no go.mod to load it from. Add a root deadset.json whose analysis.languages leaves go out, or analyze the module at its own root."
+            exit 1
+          fi
+          npm_dirs=()
+          while IFS= read -r lock; do
+            case "/$lock" in
+              */node_modules/* | */testdata/* | */vendor/* | */.*/*) continue ;;
+            esac
+            if [ "$ts" = true ]; then npm_dirs+=("$(dirname "$lock")"); fi
+          done < <(git ls-files -- ':(glob)**/package-lock.json')
+          if [ "$ts" = true ] && [ "${#npm_dirs[@]}" -eq 0 ]; then
+            echo "::error::TypeScript is in scope at $TARGET ($languages_from), but no package-lock.json is tracked there, so its dependencies cannot be installed for deadset-ts. Commit the lockfile, or add a root deadset.json whose analysis.languages leaves ts out."
+            exit 1
+          fi
+          kind=library
+          if [ -f Dockerfile ]; then kind=application; fi
+          jq -n --arg kind "$kind" --argjson languages "$central_languages" \
+            '{target: {kind: $kind}} + if $languages == [] then {} else {analysis: {languages: $languages}} end' \
+            > "$work/central.json"
+          prefix=""
+          if [ "$TARGET" != . ]; then prefix="$TARGET/"; fi
+          go_sum=""
+          if [ "$go" = true ] && [ -f go.sum ]; then go_sum="${prefix}go.sum"; fi
+          {
+            echo "work=$work"
+            echo "go_sum=$go_sum"
+            echo "languages=$languages"
+            echo "languages_from=$languages_from"
+            echo "go=$go"
+            echo "ts=$ts"
+            echo "npm_dirs<<NPM_DIRS_END"
+            for d in "${npm_dirs[@]}"; do printf '%s\n' "$d"; done
+            echo "NPM_DIRS_END"
+            echo "lockfiles<<LOCKFILES_END"
+            for d in "${npm_dirs[@]}"; do
+              if [ "$d" = . ]; then
+                printf '%spackage-lock.json\n' "$prefix"
+              else
+                printf '%s%s/package-lock.json\n' "$prefix" "$d"
+              fi
+            done
+            echo "LOCKFILES_END"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        if: ${{ steps.target.outputs.go == 'true' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ inputs.target }}/go.mod
+          cache: ${{ steps.target.outputs.go_sum != '' }}
+          cache-dependency-path: ${{ steps.target.outputs.go_sum }}
+
+      - name: Setup Go (deadset only)
+        if: ${{ steps.target.outputs.go != 'true' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Setup Node.js
+        if: ${{ steps.target.outputs.ts == 'true' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: ${{ steps.target.outputs.lockfiles }}
+
+      # setup-go exports GOTOOLCHAIN=local, and deadset and deadset-go may need
+      # a newer Go than the target's go.mod or the `stable` manifest names.
+      - name: Install deadset
+        env:
+          GO: ${{ steps.target.outputs.go }}
+          TS: ${{ steps.target.outputs.ts }}
+        run: |
+          set -euo pipefail
+          export GOTOOLCHAIN=auto
+          echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
+          go install "github.com/cplieger/deadset/cmd/deadset@${DEADSET_VERSION}"
+          if [ "$GO" = true ]; then
+            go install "github.com/cplieger/deadset-go/cmd/deadset-go@${DEADSET_GO_VERSION}"
+          fi
+          if [ "$TS" = true ]; then
+            npm install --global --ignore-scripts --no-audit --no-fund \
+              "@cplieger/deadset-ts@${DEADSET_TS_VERSION}"
+          fi
+
+      # deadset-go loads packages with GOPROXY=off, and deadset-ts resolves
+      # imports through each project's node_modules. The `Install` name makes
+      # ci-local skip it, so a local run never rewrites a developer's tree.
+      - name: Install dependencies
+        env:
+          GO: ${{ steps.target.outputs.go }}
+          NPM_DIRS: ${{ steps.target.outputs.npm_dirs }}
+        run: |
+          set -euo pipefail
+          if [ "$GO" = true ]; then go mod download; fi
+          while IFS= read -r dir; do
+            if [ -z "$dir" ]; then continue; fi
+            echo "npm ci in $dir"
+            (cd "$dir" && npm ci --ignore-scripts --no-audit --no-fund)
+          done < <(printf '%s\n' "$NPM_DIRS")
+
+      # An npm package can ship Go source (flatted ships golang/pkg/flatted),
+      # and `./...` enters node_modules unless go.mod ignores it or a go.mod
+      # fences the npm project off. deadset reads deadset.json,
+      # deadset-ignore.json and deadset-edges.json at the target root only.
+      # Flags outrank deadset.json, so --formats, which the SARIF upload
+      # needs, is the one key a repository cannot set; any other flag would
+      # take a key from it.
+      - name: Dead code (deadset)
+        env:
+          TARGET: ${{ inputs.target }}
+          EXIT_CODE: ${{ inputs.exit-code }}
+          WORK: ${{ steps.target.outputs.work }}
+          LANGUAGES: ${{ steps.target.outputs.languages }}
+          LANGUAGES_FROM: ${{ steps.target.outputs.languages_from }}
+          GO: ${{ steps.target.outputs.go }}
+          NPM_DIRS: ${{ steps.target.outputs.npm_dirs }}
+        run: |
+          set -euo pipefail
+          if [ "$GO" = true ]; then
+            dirs="$(go list -e -find -f '{{.Dir}}' ./...)" || {
+              echo "::error::go list ./... failed at $TARGET, so nothing was checked. Its error is above."
+              exit 1
+            }
+            leaked="$(printf '%s\n' "$dirs" | grep -E '/node_modules(/|$)' || true)"
+            if [ -n "$leaked" ]; then
+              echo "::error::the Go module at $TARGET reaches into node_modules, so deadset-go would analyze Go code an npm package ships. Add an 'ignore ./<dir>/node_modules' line to go.mod (Go 1.25 or later), or a go.mod in the npm project to fence it off."
+              printf '%s\n' "$leaked" | sed 's/^/  /'
+              exit 1
+            fi
+          fi
+          misplaced=0
+          while IFS= read -r dir; do
+            if [ -z "$dir" ] || [ "$dir" = . ]; then continue; fi
+            for name in deadset.json deadset-ignore.json deadset-edges.json; do
+              if [ -n "$(git ls-files -- "$dir/$name")" ]; then
+                rel="$dir/$name"
+                if [ "$TARGET" != . ]; then rel="$TARGET/$rel"; fi
+                echo "::error file=$rel::$rel is never read: deadset reads $name at the target root, $TARGET, only. Move it there and make its paths relative to that root."
+                misplaced=1
+              fi
+            done
+          done < <(printf '%s\n' "$NPM_DIRS")
+          deadset print-config --target=. --central="$WORK/central.json" \
+            | jq -r --arg languages "$LANGUAGES" --arg from "$LANGUAGES_FROM" \
+              '"target.kind \(.target.kind) (\(.provenance["target.kind"])); analysis.languages \($languages) (\($from))"' \
+            || true
+          rc=0
+          deadset analyze --target=. --central="$WORK/central.json" --run-dir="$WORK/run" \
+            --formats=text,sarif --exit-code="$EXIT_CODE" || rc=$?
+          if { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; } && [ ! -s "$WORK/run/report.json.sarif" ]; then
+            echo "::error::deadset exited $rc but wrote no SARIF report to $WORK/run/report.json.sarif, though --formats=text,sarif asked for one, so its findings cannot reach code scanning."
+            exit 1
+          fi
+          case "$rc" in
+            0) ;;
+            1)
+              echo "::error::deadset reported dead code, listed above. Delete it, wire it up, or adjudicate it with a deadset:ignore directive that names the code and the reason."
+              exit 1
+              ;;
+            2)
+              echo "::error::deadset refused the run (exit 2), so nothing was checked. The usage or configuration error is above."
+              exit 1
+              ;;
+            3)
+              echo "::error::deadset produced no answer (exit 3), so nothing was checked. An analyzer was missing, refused or failed, and its output is above."
+              exit 1
+              ;;
+            4)
+              echo "::error::deadset left a cross-language finding pending (exit 4): a deadset-edges.json edge names a side no analyzer in this run reported, so the finding was neither confirmed nor cleared. Check that analysis.languages holds every language the edge spans."
+              exit 1
+              ;;
+            127)
+              echo "::error::deadset is not on PATH, so nothing was checked. scripts/install-local-tools.sh in cplieger/ci installs the pinned build."
+              exit 1
+              ;;
+            *)
+              echo "::error::deadset exited $rc, which is no verdict, so nothing was checked."
+              exit 1
+              ;;
+          esac
+          if [ "$misplaced" -ne 0 ]; then exit 1; fi
+
+      # upload-sarif applies `category:` only to a run with no automationDetails
+      # (populateRunAutomationDetails in https://github.com/github/codeql-action/blob/v4.38.3/src/upload-lib.ts),
+      # so deadset's per-language ids are dropped; its runs stay distinct
+      # analyses by driver name. An upload replaces its category's alerts, so
+      # a nested target gets its own category and repository-relative URIs.
+      - name: Prepare SARIF
+        id: sarif
+        if: ${{ !cancelled() && steps.target.outputs.work != '' }}
+        continue-on-error: true
+        env:
+          TARGET: ${{ inputs.target }}
+          WORK: ${{ steps.target.outputs.work }}
+        run: |
+          set -euo pipefail
+          sarif="$WORK/run/report.json.sarif"
+          if [ ! -f "$sarif" ]; then
+            echo "deadset wrote no SARIF report, so there is nothing to upload."
+            exit 0
+          fi
+          category=deadset
+          dir=""
+          if [ "$TARGET" != . ]; then
+            category="deadset/$TARGET"
+            dir="$TARGET/"
+          fi
+          jq --arg dir "$dir" '
+            (.. | objects | select(.uriBaseId == "%SRCROOT%" and (.uri | type) == "string") | .uri) |= "\($dir)\(.)"
+            | del(.runs[].automationDetails)
+          ' "$sarif" > "$WORK/upload.sarif"
+          {
+            echo "path=$WORK/upload.sarif"
+            echo "category=$category"
+          } >> "$GITHUB_OUTPUT"
+
+      # Code scanning on a private repository needs GitHub Advanced Security.
+      - name: Upload SARIF (deadset)
+        if: ${{ !cancelled() && steps.sarif.outputs.path != '' && inputs.repository == '' && !github.event.repository.private }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: ${{ steps.sarif.outputs.path }}
+          category: ${{ steps.sarif.outputs.category }}

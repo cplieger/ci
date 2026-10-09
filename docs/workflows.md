@@ -15,6 +15,7 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | `jsr.json` at the root | `ts` | `ts-ci.yaml` |
 | a `package.json` or `jsr.json` in `static-src/`, `web/` or `internal/server/static-src/` | `web` | `ts-ci.yaml` in the first folder found, with the CSS and HTML lints on |
 | a `Dockerfile` | `shell` | `shell-ci.yaml` |
+| Go or TypeScript that deadset detects, or a root `deadset.json` naming languages, or a `go-nested` module | `deadset` | `deadset-ci.yaml` at the repository root, and once per nested module folder |
 | a `Dockerfile` | `docker`, `docker-arm64` | an image build on `amd64`, and on `arm64` in public repositories, with no push and no scan |
 | `*.py` files | `python` | Ruff |
 | shell scripts or workflow files, and no `go.mod`, `jsr.json` or `Dockerfile` | `scripts` | shellcheck, shfmt, yamllint, a TOML check, and the probe scripts present in the repository |
@@ -26,18 +27,34 @@ After the `amd64` build, the `docker` job runs two optional image tests. The sha
 
 | Workflow | What it runs |
 | --- | --- |
-| `go-ci.yaml` | `go vet`, golangci-lint, `go test -race`, govulncheck, `go mod verify`, a wiregen drift check, deadset, dependency review on public pull requests |
-| `ts-ci.yaml` | `npm ci`, ESLint, `tsc`, deadset, knip for import cycles and undeclared dependencies, vitest, fast-check fuzz tests, Prettier, `package.json` and `jsr.json` version parity, a publish-surface check, dependency review |
+| `go-ci.yaml` | `go vet`, golangci-lint, `go test -race`, govulncheck, `go mod verify`, a wiregen drift check, dependency review on public pull requests |
+| `ts-ci.yaml` | `npm ci`, ESLint, `tsc`, knip for import cycles and undeclared dependencies, vitest, fast-check fuzz tests, Prettier, `package.json` and `jsr.json` version parity, a publish-surface check, dependency review |
 | `ts-ci.yaml` with `web-lint: true` | the above, plus Stylelint, html-validate and an import-map coverage check |
 | `shell-ci.yaml` | shellcheck, shfmt, hadolint, and `tests/shell/run.sh` when the repository has one |
 
 `ts-ci.yaml` also runs the tests again on the oldest Node major that `package.json` `engines.node` allows. A package with no `engines.node` skips that job with a notice.
 
-[deadset](https://github.com/cplieger/deadset) is the dead-code check of both language workflows. `go-ci.yaml` runs it with deadset-go on each Go module, and `ts-ci.yaml` runs it with deadset-ts on each TypeScript package. Any finding at `deny` severity fails the job, and so does a run that gives no answer, such as a missing or refused analyzer. To keep a symbol, put a `deadset:ignore` directive with its code and a reason on the line above it.
+In a TypeScript package with a knip configuration, `ts-ci.yaml` also runs [knip](https://knip.dev) for four checks that are not dead code. They are import cycles, imports of packages that `package.json` does not declare, binaries that `package.json` does not declare, and the same value exported twice. Unused code is left to the dead-code check. A cycle fails only when the configuration sets `"rules": { "cycles": "error" }`.
 
-Each run tells deadset whether the code is an application or a library. A Go module with a `main` package is an application, and so is a TypeScript package whose `package.json` has no `exports` map. Everything else is a library, and deadset then reports no unused export from its published API, because callers outside the repository may use it. A `deadset.json` at the module or package root overrides that choice and holds the rest of deadset's settings.
+## The dead-code check
 
-In a TypeScript package with a knip configuration, `ts-ci.yaml` also runs [knip](https://knip.dev) for four checks that are not dead code. They are import cycles, imports of packages that `package.json` does not declare, binaries that `package.json` does not declare, and the same value exported twice. Unused code is left to deadset. A cycle fails only when the configuration sets `"rules": { "cycles": "error" }`.
+`deadset-ci.yaml` runs [deadset](https://github.com/cplieger/deadset) at the repository root when deadset finds Go or TypeScript there, and once in each nested Go module folder. The root run covers every language deadset finds there, Go with deadset-go and TypeScript with deadset-ts, so deadset can match an edge that crosses from one language to the other. deadset-go stops at a nested module's `go.mod`, so each nested module gets its own run for its Go. deadset-ts at the root already reads every TypeScript project below it, nested modules included, so a nested run leaves TypeScript out.
+
+A run reads its settings from `deadset.json` at its root. Every key that file sets wins, except `reporters.formats`: the workflow always asks for text and SARIF. When the file leaves `target.kind` out, it is `application` if the folder has a `Dockerfile` and `library` otherwise. deadset then reports no unused export from a library's published API, because callers outside the repository may use it.
+
+The languages are the `analysis.languages` of `deadset.json`. When the file names none, a nested module's run takes Go alone, and the root run lets deadset detect them from file names, as its [commands page](https://github.com/cplieger/deadset/blob/HEAD/docs/commands.md#how-languages-are-detected) describes, so TypeScript test fixtures count too. A repository that holds fixtures in a language it does not ship lists its own languages. The workflow installs what each language needs, and fails before the analysis when it cannot:
+
+- Go needs a `go.mod` at the run's root.
+- TypeScript needs a committed `package-lock.json` for each npm project, outside `node_modules`, `testdata`, `vendor` and hidden folders.
+
+Any finding at `deny` severity fails the check. So does a run that gives no answer, such as a missing or refused analyzer, and a run that ends without writing its SARIF report. To keep a symbol, put a `deadset:ignore` directive with its code and a reason on the line above it. Two repository layouts fail the check on their own:
+
+- A Go module that reaches into an npm project's `node_modules` fails before deadset runs, because an npm package can ship Go source. Add an `ignore ./<folder>/node_modules` line to `go.mod` (Go 1.25 or later), or put a `go.mod` in the npm project to fence it off.
+- A `deadset.json`, `deadset-ignore.json` or `deadset-edges.json` in an npm project folder below the root is never read, so the check fails and names it. Move it to the root and make its paths relative to the root.
+
+Each run also writes SARIF and uploads it to code scanning, under the category `deadset`, or `deadset/<folder>` for a nested module. Each analyzer's findings stay a separate analysis inside that category. The upload needs `security-events: write`, which the synced `ci.yml` grants. It is skipped in private repositories, and a failed upload never fails the check.
+
+In `cplieger/ci` itself, a `deadset-canary` job runs the same workflow with the pinned deadset, deadset-go and deadset-ts over four public repositories at fixed commits, and ignores their findings. A version bump that makes deadset refuse a run or give no answer fails that job before a release carries it.
 
 ## The release workflow
 

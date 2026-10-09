@@ -751,7 +751,7 @@ class Workflow(unittest.TestCase):
             context('pull_request', default_branch, private=private, fork=fork), {}, []
         )
         for name, expr in step['env'].items():
-            if 'github.event.repository' in expr:
+            if 'needs.' not in expr:
                 env[name] = scope.render(expr)
                 continue
             job = re.fullmatch(r'\$\{\{ needs\.([\w-]+)\.result \}\}', expr)[1]
@@ -769,7 +769,7 @@ class Workflow(unittest.TestCase):
         proc, summary = self.aggregate()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn('pr-policy: skipped', proc.stdout)
-        self.assertIn('of 12 dispatched jobs', summary)
+        self.assertIn('of 13 dispatched jobs', summary)
         self.assertIn('| pr-policy | skipped |\n', summary)
 
     def test_validate_fails_on_a_failed_pr_policy(self):
@@ -785,9 +785,9 @@ class Workflow(unittest.TestCase):
                 proc, summary = self.aggregate('dev', go='success', **flags)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertNotIn('pr-policy', proc.stdout + summary)
-                self.assertIn('of 11 dispatched jobs', summary)
+                self.assertIn('of 12 dispatched jobs', summary)
 
-    def test_a_main_default_validate_reports_eleven_jobs_and_no_pr_policy(self):
+    def test_a_main_default_validate_reports_twelve_jobs_and_no_pr_policy(self):
         proc, summary = self.aggregate('main', go='success')
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn('pr-policy', proc.stdout)
@@ -800,6 +800,7 @@ class Workflow(unittest.TestCase):
                 ('ts', 'skipped'),
                 ('web', 'skipped'),
                 ('shell', 'skipped'),
+                ('deadset', 'skipped'),
                 ('docker', 'skipped'),
                 ('docker-arm64', 'skipped'),
                 ('markdown', 'success'),
@@ -810,7 +811,7 @@ class Workflow(unittest.TestCase):
         self.assertEqual(
             summary,
             '## CI validate\n\n'
-            '**ran 3 / skipped 8** (of 11 dispatched jobs; detect: success)\n\n'
+            '**ran 3 / skipped 9** (of 12 dispatched jobs; detect: success)\n\n'
             '| Job | Result |\n|---|---|\n' + rows,
         )
 

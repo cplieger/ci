@@ -113,40 +113,44 @@ install_gitleaks() {
   fi
 }
 
-# install_go_tools: replay every `go install <pkg>@<ver>` of go-ci.yaml. Each
-# version is a `${VAR}` resolved against the workflow's `NAME=value` lines; a
-# literal `@v1.2.3` or `@latest` passes through. GOTOOLCHAIN=auto, as go-ci.yaml
-# sets on its own installs, lets a tool needing a newer Go than the local one
-# build anyway.
+# The go-tools pins sit in go-ci.yaml and deadset-ci.yaml, as `NAME=value` or
+# `NAME: value` lines that a `go install <pkg>@${VAR}` reads. GOTOOLCHAIN=auto,
+# as deadset-ci.yaml's Install deadset sets, lets a tool needing a newer Go than
+# the local one build.
 install_go_tools() {
-  local goci="$WF_DIR/go-ci.yaml" spec name ver verpart varname line trimmed k v
-  [ -f "$goci" ] || {
-    bad "go-tools" "go-ci.yaml not found"
-    return
-  }
+  local spec name ver verpart varname line trimmed k v wf
+  local -a wfs=("$WF_DIR/go-ci.yaml" "$WF_DIR/deadset-ci.yaml")
+  for wf in "${wfs[@]}"; do
+    [ -f "$wf" ] || {
+      bad "go-tools" "${wf##*/} not found"
+      return
+    }
+  done
   command -v go >/dev/null 2>&1 || {
     bad "go-tools" "go not found"
     return
   }
 
-  # A key holding punctuation (`echo 'app=true'`) is no assignment.
+  # A key holding punctuation (`echo "work=$work"`) is no assignment.
   local -A vers=()
   while IFS= read -r line; do
     trimmed="${line#"${line%%[![:space:]]*}"}" # strip leading indentation
     case "$trimmed" in
-      [A-Za-z_]*=*)
-        k="${trimmed%%=*}"
+      [A-Za-z_]*=* | [A-Za-z_]*:\ *)
+        k="${trimmed%%[=:]*}"
         case "$k" in
           *[!A-Za-z0-9_]*) ;; # key holds spaces/punct -> not an assignment
           *)
-            v="${trimmed#*=}"
+            v="${trimmed#"$k"}"
+            v="${v#[=:]}"
+            v="${v#"${v%%[![:space:]]*}"}"
             v="${v%%[[:space:]]*}"
             [ -n "$v" ] && vers["$k"]="$v"
             ;;
         esac
         ;;
     esac
-  done <"$goci"
+  done < <(cat "${wfs[@]}")
 
   while IFS= read -r spec; do
     [ -n "$spec" ] || continue
@@ -175,7 +179,7 @@ install_go_tools() {
     else
       bad "$name" "go install failed"
     fi
-  done < <(grep -oE 'go install [^[:space:]]+@[^[:space:]]+' "$goci" | awk '{print $3}')
+  done < <(grep -ohE 'go install [^[:space:]]+@[^[:space:]]+' "${wfs[@]}" | awk '{print $3}')
 }
 
 # install_complexity_tools: gocyclo and gocognit for their `-avg` reports, which
