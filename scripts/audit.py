@@ -1209,28 +1209,6 @@ def collect_first_party_majors(s, latest, repos):
                 s["stale_majors"].append(f"{path}: requires {shown}, latest is v{newest}")
 
 
-IMMUTABLE_RELEASES_WARNING = (
-    "immutable releases are off (published release tags can still be moved or deleted)"
-)
-
-
-def collect_immutable_releases(s):
-    """s["immutable_releases"]: the setting of a repo that publishes Releases,
-    None when it publishes none or the read failed (an error line)."""
-    s["immutable_releases"] = None
-    if not s.get("publishes"):
-        return
-    body = gh_json_strict(f"repos/{OWNER}/{s['name']}/immutable-releases")
-    enabled = body.get("enabled") if isinstance(body, dict) else None
-    if isinstance(enabled, bool):
-        s["immutable_releases"] = enabled
-        return
-    # The docs give 404 for "disabled", yet the API answers 200 with
-    # enabled=false, and a 404 is also what a token without admin read gets:
-    # https://docs.github.com/rest/repos/repos#check-if-immutable-releases-are-enabled-for-a-repository
-    s["errors"].append("immutable-releases setting unreadable (API)")
-
-
 # GitHub's lookup order; the first file present is the only one it reads:
 # https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners#codeowners-file-location
 CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
@@ -1321,8 +1299,6 @@ def compliance(s):
         warn.append(f"{dest} differs from its canonical in cplieger/ci "
                     "(synced file, edit the canonical — the next sync overwrites this copy)")
     warn += s.get("stale_majors") or []
-    if s.get("immutable_releases") is False:
-        warn.append(IMMUTABLE_RELEASES_WARNING)
     if s.get("codeowners_wildcard"):
         warn.append(codeowners_warning(s["codeowners_wildcard"]))
 
@@ -1623,15 +1599,10 @@ def compliance(s):
 
 # Warnings about one owner-level decision: printed for every repo but filed only
 # once some repo has adopted it, since filing earlier opens one issue per repo
-# for a single decision. Each predicate reads every discovered repo's meta and
-# every graded repo's settings, the same set on the full run that files.
+# for a single decision. Each predicate reads every discovered repo's meta, the
+# same set on the full run that files.
 FILED_AFTER_ADOPTION = {
-    STABLE_ONLY_WARNING: lambda metas, _settings: any(
-        m.get("default_branch") == "dev" for m in metas
-    ),
-    IMMUTABLE_RELEASES_WARNING: lambda _metas, settings: any(
-        s.get("immutable_releases") is True for s in settings
-    ),
+    STABLE_ONLY_WARNING: lambda metas: any(m.get("default_branch") == "dev" for m in metas),
 }
 # A repo younger than this is graded and printed, but nothing is filed or
 # closed for it while it is still being set up.
@@ -1865,14 +1836,13 @@ def main():
         s = collect(meta)
         if not s.get("fatal"):
             collect_first_party_majors(s, latest, owned)
-            collect_immutable_releases(s)
             collect_codeowners(s)
         return s
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         settings = list(pool.map(audit_repo, metas))
     adoption = {
-        msg: bool(adopted(discovered, settings)) for msg, adopted in FILED_AFTER_ADOPTION.items()
+        msg: bool(adopted(discovered)) for msg, adopted in FILED_AFTER_ADOPTION.items()
     }
 
     if args.dump:

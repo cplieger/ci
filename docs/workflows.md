@@ -117,7 +117,7 @@ The daily settings audit holds a two-branch repository to squash merges titled b
 
 On its schedule and when started by hand, the audit files its findings as issues. Each public repository it grades that has issues turned on keeps one `Repository audit findings` issue, labelled `repo-audit`. The findings of any other repository stay in the run summary. The issue lists the repository's HARD findings and warnings. It is updated in place on each run and closed once the repository audits clean.
 
-A repository created less than 24 hours ago is graded but gets no issue yet. When a read for a repository fails, its issue is left as it is for that run. The warning that a repository still releases straight from `main` stays out of the issues until some repository uses `dev` as its default branch. The warning that a repository publishing Releases has GitHub's immutable releases turned off stays out of them until some repository has the setting on.
+A repository created less than 24 hours ago is graded but gets no issue yet. When a read for a repository fails, its issue is left as it is for that run. The warning that a repository still releases straight from `main` stays out of the issues until some repository uses `dev` as its default branch.
 
 `release-maintenance.yaml` runs every hour for two-branch repositories only. It merges a Renovate security pull request on `dev` or `main` when `ci / validate` is green and the pull request carries a patch, minor, digest or pin label.
 

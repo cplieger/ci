@@ -1872,14 +1872,14 @@ class IssueFiling(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def findings(self, *rows, adopted=False, scope=None, visibility='all', adoption=None) -> str:
+    def findings(self, *rows, adopted=False, scope=None, visibility='all') -> str:
         path = Path(self.tmp.name) / 'findings.json'
         path.write_text(
             json.dumps(
                 {
                     'scope': scope,
                     'visibility': visibility,
-                    'adoption': adoption or {audit.STABLE_ONLY_WARNING: adopted},
+                    'adoption': {audit.STABLE_ONLY_WARNING: adopted},
                     'repos': list(rows),
                 }
             ),
@@ -2009,32 +2009,6 @@ class IssueFiling(unittest.TestCase):
         [issue] = self.open_issues(fake, 'only')
         self.assertIn(f'[warn] {audit.STABLE_ONLY_WARNING}', issue['body'])
 
-    def test_the_immutable_releases_warning_is_held_until_a_repo_turns_it_on(self):
-        fake = FakeIssues()
-        fake.issues['only'] = [
-            {'number': 1, 'state': 'open', 'title': TITLE, 'body': 'b', 'labels': []}
-        ]
-        held = {audit.STABLE_ONLY_WARNING: True, audit.IMMUTABLE_RELEASES_WARNING: False}
-        path = self.findings(
-            row('both', warnings=[audit.IMMUTABLE_RELEASES_WARNING, '0 topics']),
-            row('only', warnings=[audit.IMMUTABLE_RELEASES_WARNING]),
-            adoption=held,
-        )
-        self.assertEqual(self.file(fake, path)[0], 0)
-        [both] = self.open_issues(fake, 'both')
-        self.assertNotIn('immutable releases', both['body'])
-        self.assertEqual(fake.issues['only'][0]['state'], 'closed', 'its only finding is held')
-
-    def test_the_immutable_releases_hold_ends_once_a_repo_has_it_on(self):
-        fake = FakeIssues()
-        adopted = {audit.STABLE_ONLY_WARNING: False, audit.IMMUTABLE_RELEASES_WARNING: True}
-        path = self.findings(
-            row('only', warnings=[audit.IMMUTABLE_RELEASES_WARNING]), adoption=adopted
-        )
-        self.assertEqual(self.file(fake, path)[0], 0)
-        [issue] = self.open_issues(fake, 'only')
-        self.assertIn(f'[warn] {audit.IMMUTABLE_RELEASES_WARNING}', issue['body'])
-
     def test_a_scoped_findings_file_is_refused_before_any_call(self):
         fake = FakeIssues()
         for scope, visibility in ((['httpx'], 'all'), (None, 'public')):
@@ -2133,11 +2107,7 @@ class FindingsOut(unittest.TestCase):
         audit.collect = lambda meta: copy.deepcopy(settings[meta['name']])
         audit.sys.argv = ['audit.py', '--findings-out', str(out_path), *argv]
         audit.tracker_issue.main = lambda *a, **k: filed.append(a) or 0
-        for phase in (
-            'collect_first_party_majors',
-            'collect_immutable_releases',
-            'collect_codeowners',
-        ):
+        for phase in ('collect_first_party_majors', 'collect_codeowners'):
             patch = unittest.mock.patch.object(audit, phase)
             patch.start()
             self.addCleanup(patch.stop)
@@ -2182,10 +2152,7 @@ class FindingsOut(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(findings['scope'], None)
         self.assertEqual(findings['visibility'], 'all')
-        self.assertEqual(
-            findings['adoption'],
-            {audit.STABLE_ONLY_WARNING: False, audit.IMMUTABLE_RELEASES_WARNING: False},
-        )
+        self.assertEqual(findings['adoption'], {audit.STABLE_ONLY_WARNING: False})
         self.assertEqual(
             findings['repos'],
             [
@@ -2205,10 +2172,7 @@ class FindingsOut(unittest.TestCase):
         settings = {'a': legacy('a'), 'b': legacy('b')}
         _, _, findings = self.run_main(listing, settings, '--repo', 'a')
         self.assertEqual(findings['scope'], ['a'])
-        self.assertEqual(
-            findings['adoption'],
-            {audit.STABLE_ONLY_WARNING: True, audit.IMMUTABLE_RELEASES_WARNING: False},
-        )
+        self.assertEqual(findings['adoption'], {audit.STABLE_ONLY_WARNING: True})
         self.assertEqual([r['name'] for r in findings['repos']], ['a'])
 
     def test_an_unreadable_creation_time_is_an_error_so_nothing_is_filed(self):
@@ -2229,119 +2193,6 @@ class FindingsOut(unittest.TestCase):
             audit.sys.argv = saved
         self.assertEqual(stop.exception.code, 2)
         self.assertIn('takes no audit option', err.getvalue())
-
-
-class ImmutableReleases(unittest.TestCase):
-    """A publishing repo's immutable-releases setting: a warning while it is
-    off, filed only once some graded repo has turned it on."""
-
-    PATH = 'repos/cplieger/httpx/immutable-releases'
-
-    def setUp(self):
-        self.asked = []
-        self.answer = {'enabled': True}
-        saved = (audit.gh, audit.REST.sleep)
-        audit.gh, audit.REST.sleep = self.fake_gh, lambda _seconds: None
-        self.addCleanup(setattr, audit, 'gh', saved[0])
-        self.addCleanup(setattr, audit.REST, 'sleep', saved[1])
-
-    def fake_gh(self, *args):
-        path = gh_path(args)
-        self.asked.append(path)
-        self.assertEqual(path, self.PATH, f'unexpected read {path}')
-        if isinstance(self.answer, int):
-            return gh_http(self.answer)
-        return gh_ok(self.answer)
-
-    def grade(self, **over) -> tuple[dict, list]:
-        s = legacy()
-        s.update(over)
-        audit.collect_immutable_releases(s)
-        _, warn, _ = audit.compliance(s)
-        return s, warn
-
-    def test_a_repo_with_the_setting_on_is_compliant(self):
-        s, warn = self.grade()
-        self.assertEqual((s['immutable_releases'], s['errors']), (True, []))
-        self.assertNotIn(audit.IMMUTABLE_RELEASES_WARNING, warn)
-        self.assertEqual(self.asked, [self.PATH])
-
-    def test_a_repo_with_the_setting_off_warns_with_the_held_line(self):
-        self.answer = {'enabled': False, 'enforced_by_owner': False}
-        s, warn = self.grade()
-        self.assertEqual((s['immutable_releases'], s['errors']), (False, []))
-        self.assertIn(
-            'immutable releases are off (published release tags can still be moved or deleted)',
-            warn,
-        )
-        self.assertIn(audit.IMMUTABLE_RELEASES_WARNING, audit.FILED_AFTER_ADOPTION)
-
-    def test_an_unreadable_setting_is_an_error_and_never_a_warning(self):
-        for answer in (404, 403, 502, {'enabled': 'false'}, {}, [], 'not json'):
-            with self.subTest(answer=answer):
-                self.answer = answer
-                s, warn = self.grade()
-                self.assertIsNone(s['immutable_releases'])
-                self.assertEqual(s['errors'], ['immutable-releases setting unreadable (API)'])
-                self.assertNotIn(audit.IMMUTABLE_RELEASES_WARNING, warn)
-
-    def test_a_repo_that_publishes_no_release_is_not_read(self):
-        for publishes in (False, None):
-            with self.subTest(publishes=publishes):
-                self.asked.clear()
-                s, warn = self.grade(publishes=publishes)
-                self.assertEqual((self.asked, s['immutable_releases'], s['errors']), ([], None, []))
-                self.assertNotIn(audit.IMMUTABLE_RELEASES_WARNING, warn)
-
-
-class ImmutableReleasesRun(unittest.TestCase):
-    """main() reads the setting of each graded repo and records whether any
-    has it on."""
-
-    def run_main(self, enabled: dict) -> tuple[str, dict]:
-        listing = [{**FindingsOut.meta(name), 'visibility': 'public'} for name in enabled]
-
-        def fake_gh(*args):
-            path = gh_path(args)
-            if path.startswith('user/repos?'):
-                return gh_ok(listing)
-            name = path.split('/')[2]
-            self.assertEqual(path, f'repos/cplieger/{name}/immutable-releases')
-            return gh_ok({'enabled': enabled[name]})
-
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        out_path = Path(tmp.name) / 'findings.json'
-        saved = (audit.gh, audit.collect, audit.sys.argv)
-        audit.gh, audit.collect = fake_gh, lambda meta: legacy(meta['name'])
-        audit.sys.argv = ['audit.py', '--findings-out', str(out_path)]
-        for phase in ('collect_first_party_majors', 'collect_codeowners'):
-            patch = unittest.mock.patch.object(audit, phase)
-            patch.start()
-            self.addCleanup(patch.stop)
-        out = io.StringIO()
-        try:
-            with redirect_stdout(out):
-                audit.main()
-        finally:
-            audit.gh, audit.collect, audit.sys.argv = saved
-        return out.getvalue(), json.loads(out_path.read_text())
-
-    def test_no_repo_with_the_setting_on_keeps_the_warning_held(self):
-        out, findings = self.run_main({'a': False, 'b': False})
-        self.assertFalse(findings['adoption'][audit.IMMUTABLE_RELEASES_WARNING])
-        self.assertIn(f'a  (priv)\n  [warn] {audit.IMMUTABLE_RELEASES_WARNING}\n', out)
-        self.assertEqual(
-            [r['warnings'] for r in findings['repos']],
-            [[audit.IMMUTABLE_RELEASES_WARNING], [audit.IMMUTABLE_RELEASES_WARNING]],
-        )
-
-    def test_one_repo_with_the_setting_on_ends_the_hold(self):
-        _, findings = self.run_main({'a': False, 'b': True})
-        self.assertTrue(findings['adoption'][audit.IMMUTABLE_RELEASES_WARNING])
-        self.assertEqual(
-            [r['warnings'] for r in findings['repos']], [[audit.IMMUTABLE_RELEASES_WARNING], []]
-        )
 
 
 CODEOWNERS_LINE = (
@@ -2507,10 +2358,9 @@ class Codeowners(unittest.TestCase):
         saved = (audit.gh, audit.collect, audit.sys.argv)
         audit.gh, audit.collect = fake_gh, lambda meta: legacy(meta['name'])
         audit.sys.argv = ['audit.py', '--findings-out', str(out_path)]
-        for phase in ('collect_first_party_majors', 'collect_immutable_releases'):
-            patch = unittest.mock.patch.object(audit, phase)
-            patch.start()
-            self.addCleanup(patch.stop)
+        patch = unittest.mock.patch.object(audit, 'collect_first_party_majors')
+        patch.start()
+        self.addCleanup(patch.stop)
         out = io.StringIO()
         try:
             with redirect_stdout(out):
@@ -2916,7 +2766,6 @@ class FirstPartyMajors(unittest.TestCase):
             {**FindingsOut.meta('httpx'), 'archived': True},
         ]
         self.answers['user/repos?affiliation=owner&per_page=100&page=1'] = listing
-        self.answers['repos/cplieger/consumer/immutable-releases'] = {'enabled': True}
         for path in audit.CODEOWNERS_PATHS:
             self.answers[f'repos/cplieger/consumer/contents/{path}'] = 404
         self.serve({'go.mod': go_mod('github.com/cplieger/httpx/v4 v4.0.0')}, {'httpx': ['v5.0.0']})
