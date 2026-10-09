@@ -21,7 +21,7 @@ from pathlib import Path
 
 OWNER = 'cplieger'
 COPYRIGHT_LINE = re.compile(rf'^Copyright [0-9]{{4}} {OWNER}$')
-SKIPPED_SEGMENTS = {'node_modules', 'vendor', 'testdata', '.git'}
+SKIPPED_SEGMENTS = {'node_modules', 'vendor', 'testdata', 'fixtures', '.git'}
 PACKAGE_MARKERS = {'jsr.json', 'package.json', 'go.mod'}
 
 
