@@ -309,7 +309,7 @@ class MetaJobs(unittest.TestCase):
             job['strategy']['matrix']['target'],
             '${{ fromJSON(needs.detect.outputs.deadset_targets) }}',
         )
-        self.assertIs(job['strategy']['fail-fast'], False)
+        self.assertIs(job['strategy']['fail-fast'], expr2=False)
         self.assertEqual(job['with'], {'target': '${{ matrix.target }}'})
 
     def test_no_language_workflow_runs_deadset(self):
@@ -328,7 +328,7 @@ class MetaJobs(unittest.TestCase):
         self.assertIn("github.repository == 'cplieger/ci'", job['if'])
         self.assertIn("needs.detect.outputs.code_changed == 'true'", job['if'])
         self.assertEqual(job['with']['exit-code'], 'off')
-        self.assertIs(job['strategy']['fail-fast'], False)
+        self.assertIs(job['strategy']['fail-fast'], expr2=False)
         include = job['strategy']['matrix']['include']
         for entry in include:
             self.assertRegex(entry['ref'], SHA)
@@ -929,10 +929,10 @@ class Sarif(Harness):
 
     def test_the_upload_never_gates_and_skips_where_it_cannot_land(self):
         prepare = analyze_step('Prepare SARIF')
-        self.assertIs(prepare['continue-on-error'], True)
+        self.assertIs(prepare['continue-on-error'], expr2=True)
         self.assertIn('!cancelled()', prepare['if'])
         upload = analyze_step('Upload SARIF (deadset)')
-        self.assertIs(upload['continue-on-error'], True)
+        self.assertIs(upload['continue-on-error'], expr2=True)
         action, _, pin = upload['uses'].partition('@')
         self.assertEqual(action, 'github/codeql-action/upload-sarif')
         self.assertRegex(pin, SHA)
@@ -984,7 +984,7 @@ class KnipStep(Harness):
         return self.run_body(workflow_step(TS_CI, KNIP_STEP)['run'], work, {'NPX_RC': rc})
 
     def test_the_step_is_soft_gated_and_runs_after_the_install(self):
-        self.assertIs(workflow_step(TS_CI, KNIP_STEP).get('continue-on-error'), True)
+        self.assertIs(workflow_step(TS_CI, KNIP_STEP).get('continue-on-error'), expr2=True)
         names = step_names(TS_CI)
         self.assertLess(names.index('Install deps'), names.index(KNIP_STEP))
 

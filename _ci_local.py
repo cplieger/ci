@@ -824,10 +824,10 @@ def _deadset_languages(cwd, nested=False):
     the plan-parity and detect tests hold all three to the same fixtures."""
     try:
         configured = json.loads((cwd / 'deadset.json').read_text())['analysis']['languages']
-        if configured:
-            return set(configured)
     except OSError, ValueError, KeyError, TypeError:
-        pass
+        configured = None
+    if configured:
+        return set(configured)
     if nested:
         return {'go'}
     names = set()
