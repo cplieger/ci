@@ -547,6 +547,10 @@ class Surfaces(unittest.TestCase):
             '.github/Dockerfile': None,
             'jsr.json': None,
             'main.go': None,
+            'webauthn/aaguids_source.go': 'go-source',
+            'aaguids_source.go': None,
+            'sub/webauthn/aaguids_source.go': None,
+            'webauthn/aaguids_gen.go': None,
             'notDockerfile.txt': None,
         }
         for path, want in rows.items():
@@ -768,6 +772,69 @@ KIRO_CLI_SHA256="{'e' * 64}"
 KIRO_CLI_SHA256_ARM64="{'f' * 64}" # kiro-cli 2.27.1
 export KIRO_CLI_VERSION
 """
+
+
+GO_SOURCE = f"""package webauthn
+
+//go:generate go run gen.go
+
+// renovate: datasource=git-refs depName=passkey-authenticator-aaguids packageName=https://example.invalid/aaguids branch=main
+const aaguidListCommit = "{'a' * 40}"
+
+// renovate: datasource=git-refs depName=other-list packageName=https://example.invalid/other branch=stable
+
+const otherListCommit = "{'c' * 40}"
+
+// renovate: datasource=git-refs depName=as-var packageName=https://example.invalid/v branch=main
+var asVar = "{'d' * 40}"
+
+const (
+\t// renovate: datasource=git-refs depName=in-block packageName=https://example.invalid/b branch=main
+\tinBlock = "{'d' * 40}"
+)
+
+func f() {{
+\t// renovate: datasource=git-refs depName=in-func packageName=https://example.invalid/f branch=main
+\tx = "{'d' * 40}"
+\t_ = x
+}}
+
+// renovate: datasource=github-tags depName=owner/tool
+const toolVersion = "v1.2.3"
+
+// renovate: datasource=git-refs depName=short packageName=https://example.invalid/s branch=main
+const shortCommit = "abc123"
+
+var fixture = "// renovate: datasource=git-refs depName=inside packageName=https://example.invalid/i branch=main\\nconst y = \\"{'d' * 40}\\""
+"""
+GO_SOURCE_PINS = [
+    ('git-refs', 'passkey-authenticator-aaguids', 'main', 'a' * 40, 'pin', ''),
+    ('git-refs', 'other-list', 'stable', 'c' * 40, 'pin', ''),
+]
+
+
+class GoSource(unittest.TestCase):
+    def records(self, text):
+        records, _ = inventory.parse_go_source('webauthn/aaguids_source.go', text)
+        return [(r.ecosystem, r.identity, r.value, r.digest, r.kind, r.versioning) for r in records]
+
+    def test_reads_only_the_shape_the_preset_manager_matches(self):
+        self.assertEqual(self.records(GO_SOURCE), GO_SOURCE_PINS)
+
+    def test_crlf_line_ends_read_the_same(self):
+        self.assertEqual(self.records(GO_SOURCE.replace('\n', '\r\n')), GO_SOURCE_PINS)
+
+    def test_skeleton_masks_every_recorded_value_and_nothing_else(self):
+        _, base = inventory.parse_go_source('x.go', GO_SOURCE)
+        for old, new in (('a' * 40, 'b' * 40), ('c' * 40, 'e' * 40)):
+            with self.subTest(old=old):
+                text = GO_SOURCE.replace(old, new)
+                self.assertNotEqual(text, GO_SOURCE)
+                self.assertEqual(inventory.parse_go_source('x.go', text)[1], base)
+        for old, new in (('d' * 40, 'f' * 40), ('v1.2.3', 'v1.3.0'), ('abc123', 'abc124')):
+            with self.subTest(old=old):
+                text = GO_SOURCE.replace(old, new)
+                self.assertNotEqual(inventory.parse_go_source('x.go', text)[1], base)
 
 
 class OtherSurfaces(unittest.TestCase):
@@ -1833,6 +1900,63 @@ class RegeneratedTree(FixtureCase):
         self.assertIsNone(inventory.regenerated_by('licenses/crates'))
         self.assertIsNone(inventory.regenerated_by('licenses/other/LICENSE'))
         self.assertIsNone(inventory.regenerated_by('web/licenses/crates/x'))
+        self.assertEqual(
+            inventory.regenerated_by('webauthn/aaguids_gen.go'), 'passkey-authenticator-aaguids'
+        )
+        self.assertIsNone(inventory.regenerated_by('webauthn/aaguids_gen.go.orig'))
+
+
+class GoSourcePin(FixtureCase):
+    fixture = 'go-source-pin'
+    source = 'webauthn/aaguids_source.go'
+
+    def test_records_match_what_renovate_extracts(self):
+        got = [r for r in self.fx.records('B') if r.file == self.source]
+        self.assertEqual(
+            got,
+            [
+                Record(
+                    '.',
+                    'git-refs',
+                    self.source,
+                    'passkey-authenticator-aaguids',
+                    'main',
+                    'a' * 40,
+                    kind='pin',
+                )
+            ],
+        )
+
+    def test_only_the_managed_go_source_is_a_surface(self):
+        self.assertEqual(self.fx.repo.surfaces(self.fx.sha['B']), ['go.mod', self.source])
+
+    def test_dev_carrying_the_bump_and_its_generated_files_dominates(self):
+        for target in ('T_same', 'T_newer'):
+            with self.subTest(target=target):
+                self.assertEqual(self.fx.dominance('B', 'M', target)['verdict'], 'pass')
+
+    def test_dev_without_the_bump_fails_on_the_pin(self):
+        result = self.fx.dominance('B', 'M', 'T_stale')
+        self.assertEqual(self.failing(result), [(self.source, 'passkey-authenticator-aaguids')])
+
+    def test_a_generated_file_changed_on_main_without_its_pin_fails_closed(self):
+        result = self.fx.dominance('B', 'M_alone', 'B')
+        self.assertEqual(
+            self.failing(result),
+            [
+                (
+                    'webauthn/aaguids_gen.go',
+                    'regenerated by passkey-authenticator-aaguids, changed on main without it',
+                )
+            ],
+        )
+
+    def test_diff_shows_the_commit_move(self):
+        (item,) = self.fx.diff('B', 'M')['direct']
+        self.assertEqual(
+            (item['identity'], item['from'], item['to']),
+            ('passkey-authenticator-aaguids', 'main (aaaaaaaaaaaa)', 'main (bbbbbbbbbbbb)'),
+        )
 
 
 class SyncOnlyChange(FixtureCase):

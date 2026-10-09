@@ -1,0 +1,70 @@
+@@ commit B
+@@ file go.mod
+module github.com/cplieger/auth
+
+go 1.27.1
+@@ file main.go
+package main
+@@ file internal/gen/gen_test.go
+package gen
+
+var src = "package p\n\n// renovate: marker\nconst c = \"x\"\n"
+@@ file webauthn/aaguids_source.go
+package webauthn
+
+// aaguidListCommit is the commit of the list aaguids_gen.go was generated from.
+// renovate: datasource=git-refs depName=passkey-authenticator-aaguids packageName=https://example.invalid/aaguids branch=main
+const aaguidListCommit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+@@ file webauthn/aaguids_gen.go
+// Source: https://example.invalid/aaguids/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/aaguid.json
+
+package webauthn
+@@ file webauthn/testdata/aaguid.json
+{}
+@@ commit M parent B
+@@ file webauthn/aaguids_source.go
+package webauthn
+
+// aaguidListCommit is the commit of the list aaguids_gen.go was generated from.
+// renovate: datasource=git-refs depName=passkey-authenticator-aaguids packageName=https://example.invalid/aaguids branch=main
+const aaguidListCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+@@ file webauthn/aaguids_gen.go
+// Source: https://example.invalid/aaguids/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/aaguid.json
+
+package webauthn
+@@ file webauthn/testdata/aaguid.json
+{"b": {}}
+@@ commit T_same parent B
+@@ file webauthn/aaguids_source.go
+package webauthn
+
+// aaguidListCommit is the commit of the list aaguids_gen.go was generated from.
+// renovate: datasource=git-refs depName=passkey-authenticator-aaguids packageName=https://example.invalid/aaguids branch=main
+const aaguidListCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+@@ file webauthn/aaguids_gen.go
+// Source: https://example.invalid/aaguids/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/aaguid.json
+
+package webauthn
+@@ file webauthn/testdata/aaguid.json
+{"b": {}}
+@@ commit T_newer parent T_same
+@@ file webauthn/aaguids_source.go
+package webauthn
+
+// aaguidListCommit is the commit of the list aaguids_gen.go was generated from.
+// renovate: datasource=git-refs depName=passkey-authenticator-aaguids packageName=https://example.invalid/aaguids branch=main
+const aaguidListCommit = "cccccccccccccccccccccccccccccccccccccccc"
+@@ file webauthn/aaguids_gen.go
+// Source: https://example.invalid/aaguids/cccccccccccccccccccccccccccccccccccccccc/aaguid.json
+
+package webauthn
+@@ file webauthn/testdata/aaguid.json
+{"c": {}}
+@@ commit T_stale parent B
+@@ file README.md
+dev never took the list bump
+@@ commit M_alone parent B
+@@ file webauthn/aaguids_gen.go
+// Source: hand-edited
+
+package webauthn
