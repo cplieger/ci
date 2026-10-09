@@ -57,46 +57,13 @@ jobs:
       - name: Install deps
         run: npm ci
 
-      # Vitest Browser Mode runs DOM tests in a real Chromium instead of a DOM
-      # emulator, which needs a browser binary plus the ~95 system libraries
-      # Chromium links against. Opt-in by the package's own
-      # `@vitest/browser-playwright` devDependency, so a package still on a DOM
-      # emulator, or with no DOM tests at all, pays nothing.
-      #
-      # NOT `--with-deps`, and that is the whole point of this step's shape: on
-      # `ubuntu-24.04` the runner image ALREADY carries every one of those
-      # libraries, so the flag's apt transaction installs nothing but 9 font
-      # packages (21.1 MB) — measured twice, `0 upgraded, 9 newly installed`,
-      # every entry a font. What it buys is CJK/Thai/Cyrillic glyph fallback,
-      # which no DOM assertion here reads; the Latin faces these suites lay out
-      # with (fonts-liberation, DejaVu) are preinstalled either way.
-      # What it COSTS is an unbounded-latency apt fetch on the critical path:
-      # 2026-09-09, azure.archive.ubuntu.com served those 21.1 MB at 23.2 kB/s
-      # and the fetch alone ran 15m10s, blowing the job ceiling and cancelling
-      # `ci / ts / validate` with every check already green. apt exposes no
-      # minimum-throughput knob (`Acquire::Retries` and `::Timeout` govern
-      # stalled connections, not slow ones), so a mirror that trickles cannot be
-      # bounded from here — the fix is to not reach for apt at all. The CDN
-      # download that remains is ~8s for all three artifacts.
-      #
-      # If a future runner image stops preinstalling those libraries, Chromium
-      # fails to launch at `browserType.launch` with a named missing .so, which
-      # is a loud failure in the step below rather than a silent wrong result.
-      #
-      # Driven through the repo's own pinned `playwright` devDependency
-      # (`--no-install`), never a floating `npx playwright@latest`: the CLI and
-      # the library must be the same version or the browser build number the CLI
-      # downloads is not the one the library looks for.
-      #
-      # NOT `--only-shell`: the vitest configs opt into `channel: "chromium"`,
-      # Chromium's newer headless mode, which is the real browser rather than the
-      # separate headless-shell build, so a behavior verified in CI is the
-      # behavior a user gets.
-      #
-      # Placed OUTSIDE the soft-gate block below on purpose. This is setup, not a
-      # check: a browser that fails to install is a broken job, and letting the
-      # test step then run against a missing binary would report the failure
-      # against the wrong name.
+      # Vitest Browser Mode needs a real Chromium; enrolment is the package's own
+      # `@vitest/browser-playwright` devDependency. No `--with-deps`: the runner
+      # image already carries Chromium's libraries, and the flag's apt fetch (fonts
+      # only) has no throughput bound, so a slow mirror can outlast the job. The
+      # repo's pinned `playwright` (`--no-install`) picks the browser build its
+      # library expects. Not `--only-shell`: the configs use `channel: "chromium"`.
+      # Setup, not a check, so it sits outside the soft-gate block.
       - name: Install browser (vitest browser mode)
         run: |
           if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
@@ -104,33 +71,6 @@ jobs:
           else
             echo "no @vitest/browser-playwright devDependency; skipping browser install"
           fi
-
-      # The deadset orchestrator is a Go command with no release binary.
-      - name: Setup Go (deadset)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: stable
-          cache: false
-
-      - name: Install deadset
-        run: |
-          set -euo pipefail
-          # setup-go exports GOTOOLCHAIN=local, and `stable` comes from a version
-          # manifest that can lag the Go release deadset or a package's own
-          # `go run` requires. Exporting auto restores go's own default for
-          # this step and every later one.
-          export GOTOOLCHAIN=auto
-          echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
-          # Pinned with go-ci.yaml's deadset. deadset refuses an analyzer whose
-          # report schema it does not accept (exit 3), so a Contract major
-          # moves both pins together.
-          # renovate: datasource=go depName=github.com/cplieger/deadset
-          DEADSET_VERSION=v1.11.1
-          go install "github.com/cplieger/deadset/cmd/deadset@${DEADSET_VERSION}"
-          # renovate: datasource=npm depName=@cplieger/deadset-ts
-          DEADSET_TS_VERSION=6.1.0
-          npm install --global --ignore-scripts --no-audit --no-fund \
-            "@cplieger/deadset-ts@${DEADSET_TS_VERSION}"
 
       # Soft-gate block: each step below runs to completion (continue-on-error)
       # and records its own name to /tmp/_ci_failures on failure; the final
@@ -145,49 +85,6 @@ jobs:
       - name: Typecheck (tsc)
         continue-on-error: true
         run: ( npm run typecheck && npm run typecheck:tests ) || { echo "typecheck" >> /tmp/_ci_failures; exit 1; }
-
-      # Exit 1 is findings, 2 a refused configuration, 3 no answer (an
-      # analyzer missing, refused or failed). A manifest `exports` map is a
-      # published API with callers outside this tree, which is deadset's
-      # `library` kind. The package's own deadset.json outranks --central.
-      - name: Dead code (deadset)
-        continue-on-error: true
-        run: |
-          (
-            work="$(mktemp -d -t deadset.XXXXXX)" || exit 1
-            trap 'rm -rf "$work"' EXIT
-            kind="$(node -e 'process.stdout.write(require("./package.json").exports ? "library" : "application")')" || {
-              echo "::error::deadset did not run: package.json could not be read to choose the target kind."
-              exit 1
-            }
-            printf '{"target":{"kind":"%s"}}\n' "$kind" > "$work/central.json" || exit 1
-            rc=0
-            deadset analyze --target=. --languages=ts \
-              --central="$work/central.json" --run-dir="$work/run" || rc=$?
-            case "$rc" in
-              0) ;;
-              1)
-                echo "::error::deadset reported dead code, listed above. Delete it, wire it up, or adjudicate it with a deadset:ignore directive that names the code and the reason."
-                exit 1
-                ;;
-              2)
-                echo "::error::deadset refused the run (exit 2), so nothing was checked. The usage or configuration error is above."
-                exit 1
-                ;;
-              3)
-                echo "::error::deadset produced no answer (exit 3), so nothing was checked. An analyzer was missing, refused or failed, and its output is above."
-                exit 1
-                ;;
-              127)
-                echo "::error::deadset is not on PATH, so nothing was checked. scripts/install-local-tools.sh in cplieger/ci installs the pinned build."
-                exit 1
-                ;;
-              *)
-                echo "::error::deadset exited $rc, which is no verdict, so nothing was checked."
-                exit 1
-                ;;
-            esac
-          ) || { echo "deadset" >> /tmp/_ci_failures; exit 1; }
 
       # Not dead code, which deadset owns: import cycles, imports and binaries
       # package.json does not declare, and duplicate exports. Gated on every
@@ -235,15 +132,9 @@ jobs:
         continue-on-error: true
         run: |
           (
-            # `.fuzz` is a KIND marker and can sit anywhere left of `.test.ts`,
-            # because the suffix nearest `.test.ts` belongs to the vitest project
-            # matcher: a node-project include is `**/*.node.test.ts`, anchored on
-            # the end of the name, so a Node-side fuzz target must be spelled
-            # `<stem>.fuzz.node.test.ts` to reach the node project at all. The
-            # narrow `'*.fuzz.test.ts'` missed exactly that name. (It always
-            # matched `<stem>.node.fuzz.test.ts` — git pathspecs are wildmatch
-            # without WM_PATHNAME, so `*` crosses dots AND slashes — but that
-            # ordering lands the file in the BROWSER project, which is worse.)
+            # `.fuzz` may sit anywhere left of `.test.ts`: the suffix nearest it is the
+            # vitest project matcher (`**/*.node.test.ts`), so a Node fuzz target is
+            # `<stem>.fuzz.node.test.ts`. A git pathspec `*` crosses dots and slashes.
             mapfile -t files < <(git ls-files '*.fuzz*.test.ts' '*.fuzz*.test.js')
 
             # An empty selection is legitimate — most consumers have no fuzz
@@ -278,15 +169,10 @@ jobs:
         continue-on-error: true
         run: ( npx prettier --check . ) || { echo "prettier" >> /tmp/_ci_failures; exit 1; }
 
-      # Version parity: the committed `version` in package.json and its sibling
-      # jsr.json are placeholders that the release pipeline overwrites from the
-      # git tag at publish time (see release.yaml), so the value never reaches
-      # consumers; the two must still agree in-repo. A drift (e.g. package.json
-      # 1.0.0 vs jsr.json 0.1.0) is a committed-state defect: it misleads a
-      # reader about the package version and signals a manifest edit that
-      # touched one file but not the other. Scans from the git root (independent
-      # of working-directory) so it covers a root-level library and a subpackage
-      # layout alike (e.g. web-terminal-engine's web/). No jsr.json => no-op.
+      # package.json and jsr.json versions are placeholders release.yaml overwrites
+      # from the tag, but they must agree in-repo: a drift misleads a reader and
+      # marks a manifest edit that touched one file. Scans from the git root so a
+      # root library and a subpackage (web/) are both covered; no jsr.json no-ops.
       - name: Version parity (package.json == jsr.json)
         continue-on-error: true
         run: |
@@ -307,28 +193,11 @@ jobs:
           ) || { echo "version parity" >> /tmp/_ci_failures; exit 1; }
 
       # Publish surface: the file set each registry would upload must equal the
-      # transitive import closure of the `exports` entry points.
-      #
-      # These packages ship raw TypeScript, so the published artifact IS source
-      # and the consumer compiles it. That makes this job's own typecheck no
-      # evidence at all about the consumer: here vitest, fast-check, happy-dom
-      # and @types/node are installed, and there they are not.
-      #
-      # Paid for twice. @cplieger/web-terminal-ui@5.6.1 published a
-      # vitest-importing test setup file and broke every consumer's Docker build
-      # with TS2307; @cplieger/web-terminal-engine@3.10.4 shipped
-      # fast-check-importing test helpers to JSR, where they still sit. Both
-      # repos had correct-looking exclusion patterns. The surface was declared by
-      # hand in `files`, `jsr.json`, stryker `mutate`, the coverage exclude and a
-      # verify script all at once, and one new test-only file escaped five of the
-      # six lists.
-      #
-      # Deriving the set rather than linting the patterns is what makes this hold:
-      # once the SET is verified the patterns are correct whatever they say, no
-      # naming convention has to be remembered, and a new test-only file needs no
-      # list updated anywhere. Config-free, because `exports` is the only input
-      # and every publishable TS package declares one. A package with no
-      # `exports` map fails the step rather than passing silently.
+      # transitive import closure of the `exports` entry points. These packages ship
+      # raw TypeScript, so a published test helper breaks the consumer's compile,
+      # and this job's own typecheck has the test dependencies installed. Deriving
+      # the set means no hand-kept pattern list can miss a file; a package with no
+      # `exports` map fails the step.
       - name: Publish surface (registries ship exactly the public API)
         id: publish_surface
         continue-on-error: true
@@ -346,22 +215,11 @@ jobs:
         if: ${{ always() && steps.publish_surface.outcome == 'failure' }}
         run: echo "publish surface" >> /tmp/_ci_failures
 
-      # actionlint, zizmor and gitleaks used to run here, root-gated so a hybrid
-      # repo's nested `web` invocation would not re-check what its go job had
-      # already done. All three are repo-wide checks with no TS dependency and
-      # now run exactly once in the meta ci.yaml `repo` job, so the root-gating
-      # dance is gone along with the duplication it worked around.
-
-      # Verify every bare-specifier value-import in the shippable front-end
-      # source has a key in the page's <script type="importmap">. The browser
-      # resolves bare specifiers only via that map, so an unmapped one aborts
-      # module loading at runtime (blank / stuck-loading UI) while tsc + eslint
-      # stay green — they resolve against node_modules, not the map. Scans from
-      # the git root (independent of this job's working-directory); a detected
-      # frontend with no importmap just no-ops. Gated on web-lint so it runs for
-      # the meta CI `web` job (app frontends) only — root-level TS libraries are
-      # excluded, since their only importmap is a dev scaffold, not a shipped
-      # page contract.
+      # Every bare-specifier value-import in shippable front-end source needs a key
+      # in the page's importmap: the browser resolves bare specifiers only through
+      # it, while tsc and eslint resolve through node_modules and stay green. Scans
+      # from the git root; no importmap no-ops. web-lint only: a library's
+      # importmap is a dev scaffold, not a shipped page contract.
       - name: Import map coverage
         if: ${{ inputs.web-lint }}
         continue-on-error: true
@@ -458,37 +316,16 @@ jobs:
         continue-on-error: true
         run: |
           (
-            # TWO INDEPENDENT GATES IN ONE STEP, so each records its own verdict
-            # into `rc` rather than relying on the subshell's exit status. Bash
-            # suppresses errexit for the whole left side of an `||`, and a nested
-            # `set -e` does NOT restore it (verified), so a plain command list
-            # here reports only its LAST command. Measured cost of the old form:
-            # stylelint failed to resolve its config on every web-terminal-engine
-            # run for at least four days and the step stayed green, because
-            # html-validate passed after it. `rc` also runs both linters, so one
-            # run reports both failures.
+            # Two gates in one step, each recording into `rc`: bash suppresses errexit
+            # on the left of `||` and a nested `set -e` does not restore it, so a plain
+            # list would report only its last command. Both linters always run.
             rc=0
 
-            # The stylelint config is synced to the repo root (.stylelintrc.json),
-            # but this job runs in the web dir (inputs.working-directory), so
-            # resolve it by absolute path and set --config-basedir to the cwd so
-            # `extends: stylelint-config-standard` resolves from the web dir's
-            # node_modules. Cross-file rules (custom properties, animations)
-            # resolve via the config's `referenceFiles` glob.
-            #
-            # A web dir with no source CSS skips stylelint outright, rather than
-            # running it and leaning on --allow-empty-input: that flag only
-            # forgives an empty GLOB, while `extends` above still has to resolve,
-            # so a package shipping no CSS would have to carry
-            # stylelint-config-standard to lint nothing.
-            #
-            # `git ls-files` decides whether there is CSS to lint, and it is what
-            # feeds html-validate, so build output (a coverage report's own CSS
-            # or HTML) cannot make a CSS-less package look like one that ships
-            # styles, and cannot hand html-validate a few dozen generated pages.
-            # stylelint keeps its own `**/*.css` glob once it runs, because the
-            # config's `referenceFiles` is a working-tree glob too and narrowing
-            # only the CLI input would be half a change.
+            # The synced root .stylelintrc.json is resolved by absolute path, with
+            # --config-basedir at this web dir so `extends` resolves from its
+            # node_modules. A web dir with no tracked CSS skips stylelint, since `extends`
+            # must resolve even for an empty glob. `git ls-files` decides that and feeds
+            # html-validate, so build output cannot pass for source.
             if [ -n "$(git ls-files '*.css' | head -n 1)" ]; then
               npx stylelint "**/*.css" \
                 --config "${GITHUB_WORKSPACE}/.stylelintrc.json" \

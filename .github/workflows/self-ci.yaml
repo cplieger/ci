@@ -1,8 +1,5 @@
-# Self-CI: the ci repo lints itself through its own meta workflow via a local
-# ref (`./` resolves to this same commit, so detection changes take effect here
-# immediately — no tag/bump cycle). For this repo the meta runs markdown +
-# python (audit.py, scripts/*.py) + scripts (actionlint + shellcheck) and emits
-# the `ci / validate` check. Supersedes the former lint.yaml (actionlint-only).
+# The ci repository validates itself through its own meta workflow by local
+# ref, so a change to detection takes effect in the same pull request.
 name: CI
 
 on:
@@ -17,6 +14,10 @@ permissions:
 
 jobs:
   ci:
+    # The meta workflow's deadset jobs request it; see its `deadset` job.
+    permissions:
+      contents: read
+      security-events: write
     uses: ./.github/workflows/ci.yaml
 
   # Probes for the scripts behind each repo's weekly mutation number, which

@@ -1,32 +1,6 @@
-# Unified CI pipeline. Single entry point for all releaseable consumer repos.
-#
-# Mirrors the unified release.yaml architecture: a thin caller in each consumer
-# repo invokes this meta workflow, which auto-detects the repo's surfaces and
-# dispatches to the right reusable workflow. No per-repo config files; no
-# per-type templates.
-#
-# Detection (all independent — a hybrid repo runs multiple jobs in parallel):
-#   - has go.mod              → `go` job:    go-ci.yaml at root
-#   - has nested */go.mod     → `go-nested`: go-ci.yaml per module dir (matrix;
-#                                            tracked files only, vendored trees
-#                                            pruned — nested modules are
-#                                            independent release lanes and
-#                                            root `./...` never crosses them)
-#   - has jsr.json at root    → `ts` job:    ts-ci.yaml at root (no web-lint)
-#   - has Dockerfile          → `shell` job: shell-ci.yaml (actionlint + hadolint
-#                                            + shellcheck nullglob-safe + gitleaks)
-#   - has nested web frontend → `web` job:   ts-ci.yaml at the detected dir,
-#                                            web-lint=true (HTML+CSS lints)
-#   - has *.py                → `python` job: ruff check (inline canonical config)
-#   - tooling/docs repo       → `scripts` job: actionlint + shellcheck (inline).
-#     (no go.mod/jsr.json/      Targets pure tooling/docs repos (cplieger/ci,
-#      Dockerfile) + *.sh or    cplieger/.github); Docker repos lint shell +
-#      workflow files          workflows via shell-ci.yaml instead.
-#
-# Web-frontend nested directory probe order:
-#   static-src/  →  web/  →  internal/server/static-src/
-# First match (with package.json or jsr.json inside) wins. New patterns can be
-# added to the array below — adding a path is centralized, not per-repo.
+# validate is the one required check: a job that detect skips counts as passed,
+# and every other job's failure fails it. The detect step owns the surface rules
+# and the web-frontend probe order.
 name: CI
 
 on:
@@ -50,6 +24,9 @@ jobs:
       run_python: ${{ steps.detect.outputs.run_python }}
       run_scripts: ${{ steps.detect.outputs.run_scripts }}
       web_dir: ${{ steps.detect.outputs.web_dir }}
+      code_changed: ${{ steps.detect.outputs.code_changed }}
+      run_deadset: ${{ steps.detect.outputs.run_deadset }}
+      deadset_targets: ${{ steps.detect.outputs.deadset_targets }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -73,17 +50,14 @@ jobs:
           run_python=false
           run_scripts=false
           web_dir=""
+          run_deadset=false
+          deadset_targets="[]"
 
           # --- Did any non-docs (code) file change? ---
-          # The consumer ci.yaml no longer uses paths-ignore: a required status
-          # check (ci / validate) can never be satisfied when the workflow is
-          # skipped by a path filter (GitHub leaves it pending forever). So the
-          # workflow always runs, and the markdown lint always runs, but the
-          # heavy language jobs are gated here on a real code change. A docs-only
-          # change runs detect + markdown + validate only — cheap, and the
-          # required check still reports. On anything we can't diff (manual
-          # dispatch, first push to a branch, shallow base) we fail safe and
-          # treat it as a code change so the full battery runs.
+          # A path filter on the caller would leave the required ci / validate pending
+          # forever, so the workflow always runs and the heavy jobs gate on this.
+          # Anything that cannot be diffed (a dispatch, a first push, a shallow base)
+          # counts as a code change.
           code_changed=true
           changed=""
           diffed=false
@@ -125,22 +99,13 @@ jobs:
             [ -f Dockerfile ] && run_shell=true
             [ -f Dockerfile ] && run_docker=true
 
-            # Nested Go modules: each TRACKED <dir>/go.mod is an independent
-            # module (its own release lane in release.yaml), so each gets the
-            # full go-ci battery at its own directory — `go test ./...` at
-            # the root does NOT cross module boundaries, so without this a
-            # nested module's tests would silently never run. Discovery
-            # prunes vendored/generated trees (a committed node_modules can
-            # carry upstream go.mod files) and skips modules with no tracked
-            # .go files (a sentinel go.mod — e.g. `module web-ignore` keeping
-            # root tooling out of a TS subtree — has nothing to validate and
-            # would fail the battery). Unlike release.yaml's lane discovery,
-            # internal/ and dotless-path modules with real Go code ARE
-            # validated here — they compile and test like any module; they
-            # are only excluded from RELEASE lanes. Keep the filters in sync
-            # with release.yaml's gomodules step and
-            # scripts/test-lane-semantics.sh, which pins both. git pathspec
-            # '*/go.mod' matches any depth, never the root go.mod.
+            # The root `./...` never crosses a nested module, so each tracked
+            # <dir>/go.mod with tracked .go files gets the battery at its own dir.
+            # Vendored trees are pruned (a committed node_modules carries go.mod files)
+            # and a sentinel go.mod with no .go files has nothing to validate. Unlike
+            # release.yaml's lanes, internal/ modules are validated here.
+            # scripts/test-lane-semantics.sh pins both filters; '*/go.mod' never matches
+            # the root go.mod.
             while IFS= read -r f; do
               [ -z "$f" ] && continue
               d=$(dirname "$f")
@@ -189,16 +154,30 @@ jobs:
                 run_scripts=true
               fi
             fi
-          fi
 
-          # A "no surface claimed this code change" assertion was written here
-          # and removed: it cannot fire. run_scripts is gated on a shell script
-          # OR a workflow file, and every consumer of this reusable workflow has
-          # a caller workflow in .github/workflows by definition, so a repo with
-          # none of go.mod/jsr.json/Dockerfile always claims scripts and a repo
-          # with one always claims that one. Measured across all 52 consumers:
-          # zero reach the state. The blind-detection case it was reaching for is
-          # DISCLOSED instead, by validate's ran/skipped accounting.
+            # The root is a dead-code target exactly when deadset finds a language
+            # there: deadset-ci.yaml's Resolve target replays the same rule, and a
+            # test runs both on one fixture set. deadset-go's `./...` stops at a
+            # nested module, so each one is its own target.
+            root_languages=""
+            if [ -f deadset.json ]; then
+              root_languages=$(jq -r '.analysis.languages // [] | join(",")' deadset.json 2> /dev/null || true)
+            fi
+            if [ -z "$root_languages" ]; then
+              names=$(find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o \( -type f -o -type l \) -print | sed 's|.*/||')
+              if grep -qxE 'go\.mod|.+\.go|tsconfig.*\.json' <<< "$names" \
+                || { grep -qE '\.(ts|tsx|mts|cts)$' <<< "$names" && grep -qx 'package\.json' <<< "$names"; }; then
+                root_languages=detected
+              fi
+            fi
+            if [ -n "$root_languages" ]; then
+              deadset_targets='["."]'
+            fi
+            deadset_targets=$(jq -cn --argjson a "$deadset_targets" --argjson b "$go_nested_dirs" '$a + $b')
+            if [ "$deadset_targets" != "[]" ]; then
+              run_deadset=true
+            fi
+          fi
 
           {
             echo "run_go=$run_go"
@@ -211,6 +190,9 @@ jobs:
             echo "run_python=$run_python"
             echo "run_scripts=$run_scripts"
             echo "web_dir=$web_dir"
+            echo "code_changed=$code_changed"
+            echo "run_deadset=$run_deadset"
+            echo "deadset_targets=$deadset_targets"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -226,6 +208,7 @@ jobs:
             echo "| docker   | $run_docker | . |"
             echo "| python   | $run_python | . |"
             echo "| scripts  | $run_scripts | . |"
+            echo "| deadset  | $run_deadset | $deadset_targets |"
             echo "| markdown | true (always) | . |"
             echo ""
             echo "code_changed: $code_changed"
@@ -275,6 +258,58 @@ jobs:
     needs: detect
     if: ${{ needs.detect.outputs.run_shell == 'true' }}
     uses: ./.github/workflows/shell-ci.yaml
+
+  # deadset-ci.yaml's analyze job uploads SARIF, and a called job requesting a
+  # permission its caller withholds fails the whole run at startup
+  # (https://github.com/orgs/community/discussions/87459), so every caller up
+  # the chain grants both scopes.
+  deadset:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_deadset == 'true' }}
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.detect.outputs.deadset_targets) }}
+    uses: ./.github/workflows/deadset-ci.yaml
+    with:
+      target: ${{ matrix.target }}
+
+  # The pinned deadset tools over one Go-only, one TypeScript-only, one mixed
+  # repository and one nested module, so a pin set that makes deadset refuse or
+  # give no answer fails here before a release carries it. `off` still fails
+  # exit 2 and 3; findings at the frozen commits do not. Refresh a ref only
+  # when its repository stops representing its shape.
+  deadset-canary:
+    needs: detect
+    if: ${{ github.repository == 'cplieger/ci' && needs.detect.outputs.code_changed == 'true' }}
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repository: cplieger/toolbelt
+            ref: be5ca9d079dcbf283cf78b029f17266b424fcd13
+            target: '.'
+          - repository: cplieger/actions
+            ref: b68763ca439c55fc9c425b249c0c1c356abcb268
+            target: '.'
+          - repository: cplieger/keyenc
+            ref: 10c129978fbaa619debc2a27ecf62c76d438cd76
+            target: '.'
+          - repository: cplieger/envx
+            ref: 742555f1312abdb307361e4c1873fea4b02ad5be
+            target: yamlenv
+    uses: ./.github/workflows/deadset-ci.yaml
+    with:
+      repository: ${{ matrix.repository }}
+      ref: ${{ matrix.ref }}
+      target: ${{ matrix.target }}
+      exit-code: 'off'
 
   # Builds the image at PR time (single-arch, no push, no scan) and runs the
   # repo's image tests against it, so a Dockerfile that does not build or an
@@ -421,28 +456,11 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
-      # Every tool download in this file writes to a FILE first and extracts
-      # from it, rather than piping curl into tar. Two reasons, the first paid
-      # for on 2026-08-12: plain `--retry` treats only a timeout and a short
-      # list of HTTP codes as retryable, so a mid-transfer receive failure
-      # (curl exit 56, "Connection died") got no retry at all and reddened the
-      # markdown job on an unrelated Renovate PR. `--retry-all-errors` does
-      # cover that class, but curl only resets partial output for `-o` — never
-      # for a pipe or a `>` redirect — so on a pipe a retry would replay bytes
-      # tar has already consumed. File first is what makes the flag safe.
-      #
-      # The window is 8 attempts over about 127 seconds: 7 retries on curl's
-      # default exponential backoff (1s, 2s, 4s … 64s), with --retry-max-time
-      # as the ceiling for the case where each attempt itself dies slowly and
-      # stacks --max-time. It replaced 3 retries at a fixed 5s delay, whose
-      # 15-second window is what failed on 2026-08-12: a GitHub release-asset
-      # brownout (HTTP 503 and exit 56, intermittent from 18:12 to past 21:21
-      # UTC, no status-page incident) reddened a job in all 17 sync PRs and
-      # this repo's own main CI, because all 4 attempts fell in one 15s hole.
-      # --retry-max-time gates only whether a retry STARTS, so the last wait
-      # can still finish past it; the retry COUNT sets the real ceiling.
-      # Cost: a genuinely wrong version pin takes about two minutes to fail
-      # instead of 15 seconds, since --retry-all-errors retries a 404 too.
+      # Downloads write to a file before extracting: --retry-all-errors retries a
+      # mid-transfer failure (curl exit 56), and curl resets partial output only for
+      # -o, never for a pipe into tar. 7 retries on curl's exponential backoff span
+      # about two minutes, enough to outlast a release-asset brownout; a wrong pin
+      # takes that long to fail too, since a 404 is retried.
       - name: Install actionlint
         run: |
           # renovate: datasource=github-releases depName=rhysd/actionlint
@@ -920,20 +938,10 @@ jobs:
             fi
           ) || { echo "Probe image-test slot" >> /tmp/_ci_failures; exit 1; }
 
-      # Shell unit-test harness self-test (opt-in by file presence). The
-      # harness is CANONICAL in this repo (configs/shell/lib.sh) and synced
-      # into every adopting consumer's tests/shell/, so a defect in it lands
-      # in N repos at once. Without this step the self-test only ever executed
-      # AFTER sync propagated: a broken lib.sh merged green here, then turned
-      # each consumer's sync PR red — N repos' CI instead of this one PR,
-      # which is backwards from the point of centralising it. The consumer
-      # copies still run it in their own suite; this is the gate at the source.
-      #
-      # Gated on `-f` + `bash`, deliberately NOT the two probes' `-x` +
-      # `./script`: both harness files are tracked 100644 (they are synced as
-      # data, and nothing chmod +x's them on the way in), so an `-x` gate here
-      # would skip SILENTLY and report green — the exact failure the shell-ci
-      # hook's `-f` choice was made to avoid.
+      # The harness (configs/shell/lib.sh) is synced into every adopting consumer,
+      # so its self-test runs here at the source rather than first in N sync PRs.
+      # Gated on `-f` + `bash`: the synced files are tracked 100644, so an `-x`
+      # gate would skip silently and report green.
       - name: Probe shell unit-test harness
         continue-on-error: true
         run: |
@@ -945,18 +953,9 @@ jobs:
             fi
           ) || { echo "Probe shell unit-test harness" >> /tmp/_ci_failures; exit 1; }
 
-      # Comment-ratio gate probe (opt-in by file presence). The gate ships from
-      # this repo as actions/comment-audit and runs in every consumer, but it
-      # cannot run HERE: cplieger/ci is on the script's own denylist, so the
-      # variant of the repo job's "Comment ratio" step that this repo executes
-      # returns SKIP before reading a file. Without this probe the scanner has
-      # no executor at the source, and a defect in it merges green and then
-      # fails every consumer at once one tag later — the same shape as the
-      # harness self-test above, for the same reason.
-      #
-      # Gated on `-f` + `python3`, not the older probes' `-x` + `./script`, for
-      # the reason the harness step gives: an exec-bit gate skips silently and
-      # still reports green.
+      # cplieger/ci is on the comment-audit script's own denylist, so this repo's
+      # "Comment ratio" step SKIPs and this probe is the scanner's only executor at
+      # the source. Gated on `-f` + `python3` for the harness step's reason.
       - name: Probe comment-ratio gate
         continue-on-error: true
         run: |
@@ -1099,7 +1098,7 @@ jobs:
   # per-type templates so existing branch-protection rules keep working
   # without per-repo updates).
   validate:
-    needs: [detect, repo, go, go-nested, ts, web, shell, docker, docker-arm64, markdown, python, scripts, pr-policy]
+    needs: [detect, repo, go, go-nested, ts, web, shell, deadset, deadset-canary, docker, docker-arm64, markdown, python, scripts, pr-policy]
     if: always()
     runs-on: ubuntu-26.04
     timeout-minutes: 1
@@ -1113,6 +1112,8 @@ jobs:
           TS: ${{ needs.ts.result }}
           WEB: ${{ needs.web.result }}
           SHELL: ${{ needs.shell.result }}
+          DEADSET: ${{ needs.deadset.result }}
+          DEADSET_CANARY: ${{ needs.deadset-canary.result }}
           DOCKER: ${{ needs.docker.result }}
           DOCKER_ARM64: ${{ needs.docker-arm64.result }}
           MARKDOWN: ${{ needs.markdown.result }}
@@ -1120,31 +1121,26 @@ jobs:
           SCRIPTS: ${{ needs.scripts.result }}
           PR_POLICY: ${{ needs.pr-policy.result }}
           TWO_BRANCH: ${{ github.event.repository.default_branch == 'dev' && !github.event.repository.private && !github.event.repository.fork }}
+          CI_REPO: ${{ github.repository == 'cplieger/ci' }}
         run: |
           # detect must always succeed (it gates everything else)
           if [ "$DETECT" != "success" ]; then
             echo "::error::detect job did not succeed: $DETECT"
             exit 1
           fi
-          # Each dispatched job must be either success (it ran and passed)
-          # or skipped (auto-detect said it wasn't applicable). repo and markdown
-          # always run, so they must be success (skipped only if detect failed,
-          # caught above).
-          #
-          # A skipped job is NOT a failure — most repos skip most of these, every
-          # run, legitimately. But "success" and "skipped" are indistinguishable
-          # in the pass/fail verdict, so the count is disclosed instead: a run
-          # where the detection went blind and everything skipped reads
-          # differently from one where the battery actually ran. The accounting
-          # goes to the step summary next to the per-job list because that is the
-          # one page a reader opens off a green check.
+          # Each dispatched job must succeed or be skipped by detection; repo and
+          # markdown always run. success and skipped pass alike, so the summary counts
+          # them, which exposes a blind detection that skipped everything.
           ran=0
           skipped=0
-          set -- "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "ts=$TS" "web=$WEB" "shell=$SHELL" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"
+          set -- "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "ts=$TS" "web=$WEB" "shell=$SHELL" "deadset=$DEADSET" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"
           # pr-policy runs on two-branch repositories only, so only there is it
           # counted and listed.
           if [ "$TWO_BRANCH" = true ]; then
             set -- "$@" "pr-policy=$PR_POLICY"
+          fi
+          if [ "$CI_REPO" = true ]; then
+            set -- "$@" "deadset-canary=$DEADSET_CANARY"
           fi
           for pair in "$@"; do
             name="${pair%%=*}"; result="${pair##*=}"
