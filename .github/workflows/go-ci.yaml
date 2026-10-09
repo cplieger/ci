@@ -1,7 +1,7 @@
 name: Go CI
 
 # Reusable Go CI. Called by the meta ci.yaml's `go` job; consumers pin the
-# meta workflow via `@<sha> # v2`.
+# meta workflow by SHA with a major-version comment.
 # The profile sets deadset's target kind: `application` when a `main` package
 # exists, `library` otherwise. Dockerfile lint (hadolint) is NOT here: the meta
 # ci.yaml dispatches shell-ci.yaml for every repo with a Dockerfile, and that

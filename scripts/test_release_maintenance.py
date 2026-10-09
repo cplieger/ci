@@ -653,13 +653,6 @@ class Blockers(unittest.TestCase):
         self.assertEqual((row['errors'], row['blockers']['late']), ([], []))
         self.assertNotIn(f'GET {P}/compare/{41:040d}...{MAIN_HEAD}', gh.called())
 
-    def test_a_repository_with_its_own_publish_workflow_ships_through_it(self):
-        repo = next(iter(rc.OWN_PUBLISH_REPOS))
-        path = f'GET repos/cplieger/{repo}/actions/workflows/publish.yaml/runs?branch=main&status=success&per_page=1'
-        gh = FakeGh({path: {'workflow_runs': []}})
-        self.assertIsNone(rm.Shipping(rm.Api(gh), repo).latest)
-        self.assertEqual(gh.called(), [path])
-
     def test_security_expedited_and_rebuild_pull_requests_get_three_hours(self):
         created = '2026-10-10T09:59:00Z'
         prs = [

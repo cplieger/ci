@@ -48,14 +48,9 @@ DEPLOYED_IMAGE_REPOS = frozenset(
 )
 
 # Repos that publish from `main` directly and never get a `dev` branch.
-SINGLE_MAIN_REPOS = frozenset({'animap', 'ci', '.github', 'tool-catalog', 'unraid-templates'})
-
-# Two-channel repos whose own .github/workflows/publish.yaml tags and releases
-# on a main push instead of the central release.yaml, so publish.yaml's runs
-# are the ones that show a release in flight. Owned by the publish.yaml marker
-# classify-repos.py keys the artifact CI group on; a repo joins or leaves both
-# together.
-OWN_PUBLISH_REPOS = frozenset({'web-terminal-glyphs'})
+SINGLE_MAIN_REPOS = frozenset(
+    {'animap', 'ci', '.github', 'tool-catalog', 'unraid-templates', 'web-terminal-glyphs'}
+)
 
 # A commit merged from a pull request whose head branch starts with one of these
 # is a machine change; every other head, and a commit with no pull request, is human.
