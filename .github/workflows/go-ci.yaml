@@ -92,7 +92,7 @@ jobs:
           DEADSET_VERSION=v1.11.0
           GOTOOLCHAIN=auto go install "github.com/cplieger/deadset/cmd/deadset@${DEADSET_VERSION}"
           # renovate: datasource=go depName=github.com/cplieger/deadset-go
-          DEADSET_GO_VERSION=v1.27.0
+          DEADSET_GO_VERSION=v1.27.1
           GOTOOLCHAIN=auto go install "github.com/cplieger/deadset-go/cmd/deadset-go@${DEADSET_GO_VERSION}"
 
       # actionlint, zizmor and gitleaks are NOT installed here: they are
