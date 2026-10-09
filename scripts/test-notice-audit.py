@@ -279,6 +279,7 @@ def test_non_publishing_manifests_are_not_roots(td: Path) -> None:
             'app/package.json': '{"name": "app", "private": true}',
             'internal/testdata/mod/go.mod': 'module fixture\n',
             'internal/testdata/mod/x.go': 'package fixture\n',
+            'corpus/fixtures/case/ts/target/package.json': '{"name": "case"}',
             'vendor/dep/go.mod': 'module dep\n',
             'vendor/dep/x.go': 'package dep\n',
             'web/go.mod': 'module web-ignore\n',
@@ -288,7 +289,7 @@ def test_non_publishing_manifests_are_not_roots(td: Path) -> None:
     )
     got = run_audit(td)
     check(
-        'nameless/private package.json, testdata/vendor go.mods and a .go-less go.mod '
+        'nameless/private package.json, testdata/vendor go.mods, a fixtures manifest and a .go-less go.mod '
         'are not package roots',
         ok=got.returncode == 0 and '0 published' in got.stdout,
         detail=got.stdout.strip(),
