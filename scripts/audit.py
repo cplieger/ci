@@ -636,7 +636,19 @@ def collect_version_tags(name, s, now=None):
     s["dev_tags_without_receipt"] = []
     s["stable_tags_without_receipt"] = []
     s["tags_in_grace"] = 0
-    for _lane, (stable, dev) in sorted(release_channels.tags_by_lane(names_).items()):
+    def lane_releases(lane):
+        """Whether `lane` still has a module on main, the branch stable runs
+        release from. Only a live lane gets its receipt repaired (release-state.sh
+        lane_keys), so a retired lane's last tag would stay a finding forever."""
+        if not lane:
+            return True
+        body = gh_json_strict(f"repos/{OWNER}/{name}/contents/{lane}/go.mod?ref=main")
+        if body is API_ERROR:
+            s["errors"].append(f"{lane}/go.mod on main unreadable (API), so its receipt not graded")
+            return False
+        return body is not None
+
+    for lane, (stable, dev) in sorted(release_channels.tags_by_lane(names_).items()):
         graded = settled(stable[:PROVENANCE_TAGS])
         without, hand_made = grade_stable_tags(graded, release_of)
         s["stable_tags_without_release"] += without
@@ -646,7 +658,8 @@ def collect_version_tags(name, s, now=None):
         )
         # Only the highest: a receipt covers the history below it, so older
         # tags (every one made before the receipt existed) carry none.
-        if stable and stable[0] in graded and stable[0] not in {*without, *hand_made, *unreadable}:
+        if (stable and stable[0] in graded and stable[0] not in {*without, *hand_made, *unreadable}
+                and lane_releases(lane)):
             s["stable_tags_without_receipt"] += tags_without_receipt(
                 [(stable[0], sha_by_tag.get(stable[0], ""))], statuses_of,
                 release_channels.has_completion_receipt,
