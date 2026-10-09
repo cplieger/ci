@@ -10,13 +10,12 @@ ${VERSION} not recorded; deleting the tag
 ${valid} mutants — measured nothing, no
 '{rname}' unreadable (API); rulesets not graded
 '{s['used_by_package']}' (want '{s['expected_package']}'; no API —
-(TLS verification disabled; want '0')
+(TLS verification disabled; want \'0\')
 (a forced rebuild); building from source
 (count=0, gates nothing; standard is off)
 (id {aid}) — likely a stale/decommissioned
 (want '{want}' [+/vN]; unfetchable by Go
 (want exactly 1; duplicates double-fire the
-(want off — with auto-merge
 (want off — with auto-merge enabled
 .go files — not a release
 NOT auto-update — repoint their '#
@@ -31,7 +30,7 @@ a stale/decommissioned app; remove it
 already published — skipping
 ancestor of ${GITHUB_SHA}; publishing forward.
 anchor failed — treating all tracked
-approving reviews={s['required_review_count']} — a single-maintainer repo
+approving reviews={s["required_review_count"]} — a single-maintainer repo
 at {path} — treating as 0
 attempt ${attempt}/${max} failed; retrying in ${delay}s
 before SHA — treating all tracked
@@ -40,7 +39,7 @@ changes no file; treating it as
 characters outside [A-Za-z0-9._/-]; not a valid
 clone failed — skipping this repo
 contains the other); restructure so lane
-content_type={h['content_type']} (want json; the orchestrator parses
+content_type={h["content_type"]} (want json; the orchestrator parses
 could not run; ${VERSION} published WITHOUT
 did not finish; rerun it or
 every major — drop the suffix
@@ -53,7 +52,7 @@ for ${r} — dropping it from
 for run ${RUN_ID}; not touching the
 found in input; did the run
 git-cliff config; the default resolves
-git-cliff's version base; delete both)
+git-cliff\'s version base; delete both)
 greater than ${LAST_TAG}; refusing to cut.
 gremlins --dry-run failed; keeping per-package mode\n
 has issues disabled; skipped {args.mode} for
@@ -95,11 +94,10 @@ published manifest — dropped from significance
 queryable release.yaml runs; skipping
 readable in '${meta}'; that artifact is
 refused to apply; upstream probably fixed
-repo (want main; {s['name']} publishes from
+repo (want main; {s["name"]} publishes from
 repo cannot self-approve; every PR blocks
 repo discovery failed; refusing to report
 report diffs only; no push, no
-required_linear_history=on (want off; the merge
 required_linear_history=on (want off; the merge model
 resolvable HEAD — skipping this repo
 rewrite internal imports; apps use the
@@ -127,9 +125,8 @@ to release $VERSION; a module path
 trigger move-major-tag.yaml — neither is possible
 under internal/ — validated by CI,
 unreachable history) — treating all tracked
-unreadable (API) —
 unreadable (API) — phantom-required-context check skipped
 with skip_if_unchanged rejected; retrying without inputs
 {remote[tag][:12]} on origin; refusing (stale or
-{s['desc_len']} chars (>100; Docker Hub short-desc
+{s["desc_len"]} chars (>100; Docker Hub short-desc
 {tsconfig}: not found; cannot inherit compiler

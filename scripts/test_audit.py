@@ -483,14 +483,13 @@ class TagProvenance(unittest.TestCase):
         repo: str,
         newest_ended: datetime | None = None,
         live: str = '',
-        workflow: str = 'release.yaml',
     ) -> dict:
         """The three reads of the repo's release workflow runs: nothing queued
         or in progress unless `live` names that status, the newest run ended
         three hours ago unless `newest_ended` says otherwise."""
         ended = newest_ended or self.NOW - timedelta(hours=3)
         run = {'status': 'completed', 'updated_at': ended.isoformat().replace('+00:00', 'Z')}
-        base = f'repos/cplieger/{repo}/actions/workflows/{workflow}/runs'
+        base = f'repos/cplieger/{repo}/actions/workflows/release.yaml/runs'
         return {
             f'{base}?status=in_progress&per_page=1': listing(
                 *([{'status': 'in_progress'}] if live == 'in_progress' else [])
@@ -804,17 +803,6 @@ class TagProvenance(unittest.TestCase):
         self.assertEqual(s['stable_tags_without_release'], ['v1.5.0'])
         self.assertFalse(any(a.startswith(f'{repo_wide}?') for a in asked), asked)
 
-    def test_an_own_publish_repo_is_deferred_on_its_publish_workflow(self):
-        tags = [{'name': 'v1.1.3', 'commit': {'sha': self.A}}]
-        answers = {
-            'repos/cplieger/web-terminal-glyphs/tags?per_page=100&page=1': tags,
-            **self.runs('web-terminal-glyphs', live='queued', workflow='publish.yaml'),
-        }
-        asked = []
-        s = self.collect('web-terminal-glyphs', answers, asked)
-        self.assertTrue(s['version_tags_deferred'])
-        self.assertTrue(all('/actions/workflows/publish.yaml/runs?' in a for a in asked), asked)
-
     def test_a_repo_without_the_workflow_file_is_graded(self):
         # A definitive 404 on the workflow's runs is no run, not an error.
         tags = [{'name': 'v1.5.0', 'commit': {'sha': self.A}}]
@@ -948,13 +936,6 @@ class TagProvenance(unittest.TestCase):
         s = self.collect('httpx', answers)
         self.assertEqual(s['stable_tags_without_release'], [])
         self.assertEqual(s['errors'], ['tag v1.4.0 carries no commit sha; not graded'])
-
-    def test_an_own_publish_repo_passes_on_its_own_release(self):
-        # web-terminal-glyphs tags and releases through its publish.yaml with
-        # the Actions token, so its Release carries the same author.
-        without, hand_made = audit.grade_stable_tags(['v1.1.2'], lambda tag: self.BOT)
-        self.assertEqual((without, hand_made), ([], []))
-        self.assertIn('web-terminal-glyphs', audit.release_channels.OWN_PUBLISH_REPOS)
 
     def receipt_answers(self, statuses_c, tags=None, **extra) -> dict:
         """v1.3.0 (commit C, the highest) and v1.2.0 (commit A), both with a
@@ -1659,7 +1640,9 @@ class TwoBranchRenovateConfig(unittest.TestCase):
             with self.subTest(reply=reply.stdout):
                 s, _ = self.collect_with(reply)
                 self.assertIsNone(s['renovate_json'])
-                self.assertEqual(s['errors'], ['renovate.json on dev unreadable (API), so not graded'])
+                self.assertEqual(
+                    s['errors'], ['renovate.json on dev unreadable (API), so not graded']
+                )
 
     def test_content_that_does_not_decode_is_an_error_not_a_finding(self):
         for name, content in (
@@ -1669,7 +1652,9 @@ class TwoBranchRenovateConfig(unittest.TestCase):
             with self.subTest(name):
                 s, _ = self.collect_with(gh_ok({'content': content}))
                 self.assertIsNone(s['renovate_json'])
-                self.assertEqual(s['errors'], ['renovate.json on dev unreadable (API), so not graded'])
+                self.assertEqual(
+                    s['errors'], ['renovate.json on dev unreadable (API), so not graded']
+                )
         body = {'content': base64.encodebytes(RENOVATE_JSON.encode()).decode()}
         s, _ = self.collect_with(gh_ok(body))
         self.assertEqual((s['renovate_json'], s['errors']), (RENOVATE_JSON, []))
@@ -1973,6 +1958,12 @@ class IssueFiling(unittest.TestCase):
         _, warn, _ = audit.compliance(s)
         self.assertIn(audit.STABLE_ONLY_WARNING, warn)
         self.assertIn(audit.STABLE_ONLY_WARNING, audit.FILED_AFTER_ADOPTION)
+
+    def test_web_terminal_glyphs_on_main_draws_no_stable_only_warning(self):
+        s = legacy('web-terminal-glyphs')
+        s.update({'private': False, 'visibility': 'public', 'publishes': True})
+        _, warn, _ = audit.compliance(s)
+        self.assertNotIn(audit.STABLE_ONLY_WARNING, warn)
 
     def test_a_second_run_updates_the_same_issue_in_place(self):
         fake = FakeIssues()
@@ -2675,7 +2666,9 @@ class FirstPartyMajors(unittest.TestCase):
             got,
             (
                 [],
-                ['go.mod: github.com/cplieger/httpx/v4 not graded, because tags of httpx unreadable (API)'],
+                [
+                    'go.mod: github.com/cplieger/httpx/v4 not graded, because tags of httpx unreadable (API)'
+                ],
             ),
         )
 
@@ -2760,7 +2753,10 @@ class FirstPartyMajors(unittest.TestCase):
     def test_an_unreadable_or_truncated_tree_grades_nothing(self):
         for tree, errors in (
             (500, ['file tree unreadable (API), so first-party majors not graded']),
-            ([{'path': 'go.mod'}], ['file tree unreadable (API), so first-party majors not graded']),
+            (
+                [{'path': 'go.mod'}],
+                ['file tree unreadable (API), so first-party majors not graded'],
+            ),
             ({'sha': 'a' * 40}, ['file tree unreadable (API), so first-party majors not graded']),
             (
                 {'tree': [], 'truncated': True},
@@ -2776,7 +2772,8 @@ class FirstPartyMajors(unittest.TestCase):
             with self.subTest(status=status):
                 got = self.grade({'tools/go.mod': status}, {})
                 self.assertEqual(
-                    got, ([], ['tools/go.mod unreadable (API), so its first-party majors not graded'])
+                    got,
+                    ([], ['tools/go.mod unreadable (API), so its first-party majors not graded']),
                 )
 
     def test_a_manifest_body_that_is_not_decodable_base64_is_an_error(self):

@@ -2,7 +2,8 @@ name: Shell CI
 
 # Reusable shell/Docker CI. Called by the meta ci.yaml's `shell` job for every
 # repo with a Dockerfile (the single home of hadolint — go-ci deliberately does
-# not duplicate it); consumers pin the meta workflow via `@<sha> # v2`.
+# not duplicate it); consumers pin the meta workflow by SHA with a
+# major-version comment.
 
 on:
   workflow_call:

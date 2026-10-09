@@ -291,9 +291,8 @@ class Shipping:
 
     def __init__(self, api: Api, repo: str):
         self.api, self.repo = api, repo
-        workflow = 'publish.yaml' if repo in rc.OWN_PUBLISH_REPOS else 'release.yaml'
         runs = api.get(
-            f'repos/{OWNER}/{repo}/actions/workflows/{workflow}/runs'
+            f'repos/{OWNER}/{repo}/actions/workflows/release.yaml/runs'
             '?branch=main&status=success&per_page=1'
         )['workflow_runs']
         self.latest = runs[0] if runs else None

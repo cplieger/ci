@@ -248,10 +248,6 @@ class Tables(unittest.TestCase):
     def test_single_main_repos_are_never_deployed_images(self):
         self.assertFalse(rc.SINGLE_MAIN_REPOS & rc.DEPLOYED_IMAGE_REPOS)
 
-    def test_own_publish_repos_are_two_channel_and_not_deployed(self):
-        self.assertFalse(rc.OWN_PUBLISH_REPOS & rc.SINGLE_MAIN_REPOS)
-        self.assertFalse(rc.OWN_PUBLISH_REPOS & rc.DEPLOYED_IMAGE_REPOS)
-
     def test_machine_prefixes_end_with_slash(self):
         for prefix in rc.MACHINE_HEAD_PREFIXES:
             self.assertTrue(prefix.endswith('/'), prefix)
