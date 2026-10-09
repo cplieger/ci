@@ -1,9 +1,0 @@
-{
-  "name": "Dispatch release.yaml on cplieger/${{ matrix.repo }}",
-  "if": "${{ matrix.branch != 'dev' }}",
-  "env": {
-    "GH_TOKEN": "${{ secrets.CI_SCHEDULE }}",
-    "BRANCH": "${{ matrix.branch }}"
-  },
-  "run": "set -euo pipefail\n# A stub predating the input answers \"unexpected inputs\" (HTTP 422);\n# only that rejection falls back to a plain, always-publishing dispatch.\nif ! gh workflow run release.yaml -R \"cplieger/${REPO}\" --ref \"$BRANCH\" \\\n    -f skip_if_unchanged=true 2>/tmp/dispatch.err; then\n  cat /tmp/dispatch.err\n  grep -qi \"unexpected inputs\" /tmp/dispatch.err\n  echo \"::notice::cplieger/${REPO}: dispatch with skip_if_unchanged rejected; retrying without inputs\"\n  gh workflow run release.yaml -R \"cplieger/${REPO}\" --ref \"$BRANCH\"\nfi\necho \"Dispatched release.yaml on cplieger/${REPO}\"\n"
-}

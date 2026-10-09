@@ -2614,7 +2614,7 @@ chk "W12 after every leg of renumber, whose write scopes it alone holds" \
 chk "T1 the caller pins the v3 pipeline by full commit" "$(fact '."tmpl-uses"')" "true"
 chk "T1 with no with: key" "$(fact '."tmpl-with"')" "false"
 chk "T1 and triggers on main and dev" "$(fact '."tmpl-push" | join(" ")')" "main dev"
-chk "T2 the dispatch carries the mode beside skip_if_unchanged" "$(fact '."tmpl-inputs" | join(" ")')" "mode skip_if_unchanged"
+chk "T2 the dispatch carries only the mode" "$(fact '."tmpl-inputs" | join(" ")')" "mode"
 chk "T2 defaulting to normal" "$(fact '."tmpl-mode" | "\(.type) \(.default) \(.options | join(","))"')" "choice normal normal,renumber"
 chk "T3 the caller grants the barrier's dispatch" "$(fact '."tmpl-perms".actions')" "write"
 

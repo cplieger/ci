@@ -332,10 +332,7 @@ jobs:
       - name: Publish surface (registries ship exactly the public API)
         id: publish_surface
         continue-on-error: true
-        # Pinned to the v2.32.0 commit, the tag that first carried this action.
-        # Renovate bumps an existing digest when v2 moves; it does not do the
-        # initial tag-to-SHA conversion, which is why this is pinned by hand.
-        uses: cplieger/ci/actions/publish-surface@c9c218d713f221dabb8504141b1ab4501d5ba7af # v2
+        uses: cplieger/ci/actions/publish-surface@b5c28aa5341aa41fa0795f698bd44d0e26ff299a # v3
         with:
           package-dir: ${{ inputs.working-directory }}
 

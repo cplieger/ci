@@ -88,9 +88,8 @@ EXCLUDE_PATTERNS=(
   # of the web client a Go binary embeds.
   '^tsconfig\.json$'
   '(^|/)deadset(-ignore|-edges)?\.json$'
-  # knip's configs, and the retired .punused-ignore repos carry until they delete it.
+  # knip's configs.
   '(^|/)(\.knip\.jsonc?|knip\.(jsonc?|[jt]s)|knip\.config\.[jt]s)$'
-  '(^|/)\.punused-ignore$'
   '(^|/)stryker\.config\.json$'
   '(^|/)\.golangci\.(yaml|yml)$'
   '(^|/)\.gremlins\.(yaml|yml)$'

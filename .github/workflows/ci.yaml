@@ -514,12 +514,10 @@ jobs:
         continue-on-error: true
         uses: ./actions/comment-audit
 
-      # The action pin points to the commit that introduced the action. Renovate
-      # moves it with the v2 tag after this workflow lands.
       - name: Comment ratio
         if: ${{ github.repository != 'cplieger/ci' }}
         continue-on-error: true
-        uses: cplieger/ci/actions/comment-audit@c9c218d713f221dabb8504141b1ab4501d5ba7af # v2
+        uses: cplieger/ci/actions/comment-audit@b5c28aa5341aa41fa0795f698bd44d0e26ff299a # v3
 
       # No denylist, unlike comment-audit: a NOTICE is owed by every repo.
       - name: NOTICE audit
@@ -532,7 +530,7 @@ jobs:
       - name: NOTICE audit
         if: ${{ github.repository != 'cplieger/ci' }}
         continue-on-error: true
-        uses: cplieger/ci/actions/notice-audit@c9c218d713f221dabb8504141b1ab4501d5ba7af # v2
+        uses: cplieger/ci/actions/notice-audit@b5c28aa5341aa41fa0795f698bd44d0e26ff299a # v3
 
       # The dashboard check comes from this workflow's own commit, so it needs
       # no pin of its own.

@@ -1,11 +1,9 @@
 # Base-package rebuilds for the image repos, daily at 04:00 UTC (sync holds
 # 02:00, daily-security 03:00). An image that installs OS packages at build
-# time picks up upstream fixes only when rebuilt. A repo whose default branch
-# is dev gets, per channel whose published image (`:latest` for main, `:dev`
-# for dev) was built longer ago than INTERVAL_DAYS, an auto-merging pull request
-# into that branch carrying one empty `fix(deps)` commit; a repo still on main
-# whose newest docker build is that old gets a release.yaml dispatch with
-# skip_if_unchanged, which its v2 pipeline's no-change gate reads.
+# time picks up upstream fixes only when rebuilt. A two-branch repo gets, per
+# channel whose published image (`:latest` for main, `:dev` for dev) was built
+# longer ago than INTERVAL_DAYS, an auto-merging pull request into that branch
+# carrying one empty `fix(deps)` commit.
 name: Rebuild stale images
 
 on:
@@ -62,38 +60,19 @@ jobs:
       LAST: ${{ matrix.last }}
       AGE_DAYS: ${{ matrix.age_days }}
     steps:
-      - name: Dispatch release.yaml on cplieger/${{ matrix.repo }}
-        if: ${{ matrix.branch != 'dev' }}
-        env:
-          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
-          BRANCH: ${{ matrix.branch }}
-        run: |
-          set -euo pipefail
-          # A stub predating the input answers "unexpected inputs" (HTTP 422);
-          # only that rejection falls back to a plain, always-publishing dispatch.
-          if ! gh workflow run release.yaml -R "cplieger/${REPO}" --ref "$BRANCH" \
-              -f skip_if_unchanged=true 2>/tmp/dispatch.err; then
-            cat /tmp/dispatch.err
-            grep -qi "unexpected inputs" /tmp/dispatch.err
-            echo "::notice::cplieger/${REPO}: dispatch with skip_if_unchanged rejected; retrying without inputs"
-            gh workflow run release.yaml -R "cplieger/${REPO}" --ref "$BRANCH"
-          fi
-          echo "Dispatched release.yaml on cplieger/${REPO}"
-
       - name: Checkout
-        if: ${{ matrix.branch == 'dev' && !matrix.unreadable }}
+        if: ${{ !matrix.unreadable }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Open a rebuild pull request on cplieger/${{ matrix.repo }}
-        if: ${{ matrix.branch == 'dev' && !matrix.unreadable }}
+        if: ${{ !matrix.unreadable }}
         env:
           # SYNC_PAT: the same concern as the sync PRs, a machine pull request
           # into dev or main. Nothing here runs the target repo's code.
           GH_TOKEN: ${{ secrets.SYNC_PAT }}
-          # A dev-default repo kept on one branch carries no base; its PR goes to dev.
-          BASE: ${{ matrix.base || 'dev' }}
+          BASE: ${{ matrix.base }}
           CHANNEL: ${{ matrix.channel }}
         run: |
           set -euo pipefail
