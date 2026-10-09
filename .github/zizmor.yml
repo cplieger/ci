@@ -9,7 +9,7 @@ rules:
       policies:
         # Same-owner composite actions (cplieger/ci/actions/publish-badge) may
         # be tag-pinned: a brand-new action cannot know its own merge-commit
-        # SHA in advance (chicken-and-egg), so it bootstraps as @v2 and
+        # SHA in advance (chicken-and-egg), so it bootstraps as @v3 and
         # Renovate's pinDigest pass converts it to a SHA pin on its next sweep.
         # The tag is owner-controlled, so the moving-tag risk is self-contained.
         "cplieger/*": ref-pin

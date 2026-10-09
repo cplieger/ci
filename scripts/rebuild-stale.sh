@@ -118,19 +118,11 @@ open_pr() { # <repo> <base> <reason>
   request_merge "$url"
 }
 
-stale_pr() { # <repo> <base> <tag, empty for a build-time row> <age-days> <built>
-  local what
-  if [ -z "$3" ]; then
-    what="The newest ${2} build of this image"
-  else
-    what="The \`:${3}\` image"
-  fi
+stale_pr() { # <repo> <base> <tag> <age-days> <built>
   if [ "$5" = "not published" ]; then
     open_pr "$1" "$2" "No \`:${3}\` image is published."
-  elif [ "$4" = n/a ]; then
-    open_pr "$1" "$2" "${what} has no usable build time (${5})."
   else
-    open_pr "$1" "$2" "${what} is ${4} days old (built ${5})."
+    open_pr "$1" "$2" "The \`:${3}\` image is ${4} days old (built ${5})."
   fi
 }
 
@@ -146,26 +138,25 @@ fanout() {
   .[] | select(.archived == false and .fork == false)
       | {name, default_branch, visibility, fork, archived} | @json
 ')
-  repos=$(jq -r '[.name, (.default_branch // "")] | @tsv' <<<"$listing")
-  two_branch=" $(python3 "$TOOLS/release_channels.py" two-branch <<<"$listing" | tr '\n' ' ') "
+  two_branch=$(python3 "$TOOLS/release_channels.py" two-branch <<<"$listing")
 
   STALE='[]'
   now=$(date -u +%s)
   {
     echo "## Staleness decisions (default threshold: ${INTERVAL_DAYS}d)"
     echo ""
-    echo "| Repo | Last successful docker build (UTC) | Age (days) | Threshold (days) | Decision |"
+    echo "| Repo | Image built (UTC) | Age (days) | Threshold (days) | Decision |"
     echo "|---|---|---|---|---|"
   } >>"$GITHUB_STEP_SUMMARY"
 
-  # A two-branch repo's channels age by the published image, because a promotion
-  # re-tags a dev digest and its run says nothing about when that image was built.
+  # A channel ages by its published image, because a promotion re-tags a dev
+  # digest and its run says nothing about when that image was built.
   two_branch_rows() { # <repo>
     local r=$1 base tag content dockerfile created rc ts age_secs age_days interval decision
     interval="${INTERVAL_OVERRIDES[$r]:-$INTERVAL_DAYS}"
     add_channel() { # <base> <tag> <last> <age-days> [unreadable reason]
       STALE=$(jq -c --arg r "$r" --arg base "$1" --arg tag "$2" --arg l "$3" --arg a "$4" --arg u "${5:-}" \
-        '. + [{repo: $r, base: $base, channel: $tag, last: $l, age_days: $a, branch: "dev"}
+        '. + [{repo: $r, base: $base, channel: $tag, last: $l, age_days: $a}
               + (if $u == "" then {} else {unreadable: $u} end)]' <<<"$STALE")
     }
     unreadable_channel() { # <base> <tag> <reason>
@@ -233,92 +224,20 @@ fanout() {
     done
   }
 
-  while IFS=$'\t' read -r r default_branch; do
+  while IFS= read -r r; do
     [ -z "$r" ] && continue
-    if [[ "$two_branch" == *" ${r} "* ]]; then
-      two_branch_rows "$r"
-      continue
-    fi
-    # Only an image whose Dockerfile installs packages at build time
-    # gains anything from a rebuild; a distroless or scratch image
-    # changes only when its pinned base digest does.
-    if ! dockerfile=$(gh api "repos/cplieger/${r}/contents/Dockerfile" --jq '.content' 2>/dev/null \
-      | base64 -d 2>/dev/null); then
-      continue
-    fi
-    if ! grep -qE 'apk (add|upgrade)|apt-get (install|upgrade)' <<<"$dockerfile"; then
-      continue
-    fi
-    # The runs endpoint 404s when the repo has no release.yaml workflow;
-    # such a repo is not a rebuild candidate. (A transient API error also
-    # lands here and skips the repo for a day.)
-    runs_url="repos/cplieger/${r}/actions/workflows/release.yaml/runs?branch=${default_branch}&status=success&per_page=20"
-    if ! runs=$(gh api "$runs_url" 2>/dev/null); then
-      echo "::notice::${r}: has a Dockerfile but no queryable release.yaml runs; skipping"
-      continue
-    fi
-    interval="${INTERVAL_OVERRIDES[$r]:-$INTERVAL_DAYS}"
-
-    # Walk the 20 newest successes (newest first) and take the first
-    # whose docker finalize job concluded success. The nested job is
-    # named "<stub> / docker / finalize"; match on the suffix so a
-    # renamed stub job stays covered.
-    last=""
-    while IFS=$'\t' read -r run_id created_at; do
-      [ -z "$run_id" ] && continue
-      if ! jobs=$(gh api "repos/cplieger/${r}/actions/runs/${run_id}/jobs?per_page=100" 2>/dev/null); then
-        continue
-      fi
-      if jq -e '[.jobs[]
-                  | select(.conclusion == "success")
-                  | select(.name | endswith(" / docker / finalize"))]
-                | length > 0' >/dev/null <<<"$jobs"; then
-        last="$created_at"
-        break
-      fi
-    done < <(jq -r '.workflow_runs[] | [(.id | tostring), .created_at] | @tsv' <<<"$runs")
-
-    add_stale() { # <repo> <last> <age-days>
-      STALE=$(jq -c --arg r "$1" --arg l "$2" --arg a "$3" --arg b "$default_branch" \
-        '. + [{repo: $r, last: $l, age_days: $a, branch: $b}]' <<<"$STALE")
-    }
-    if [ -z "$last" ]; then
-      add_stale "$r" "none in 20 newest successes" "n/a"
-      echo "| ${r} | none in 20 newest successes | n/a | ${interval} | **rebuild** |" >>"$GITHUB_STEP_SUMMARY"
-      continue
-    fi
-    ts=$(date -u -d "$last" +%s 2>/dev/null) || ts=""
-    if [ -z "$ts" ]; then
-      add_stale "$r" "${last} (unparsable)" "n/a"
-      echo "| ${r} | ${last} (unparsable) | n/a | ${interval} | **rebuild** |" >>"$GITHUB_STEP_SUMMARY"
-      continue
-    fi
-    # Compare in seconds: flooring to whole days first would keep a
-    # repo "fresh" for up to a full extra day past the threshold.
-    age_secs=$((now - ts))
-    age_days=$((age_secs / 86400))
-    if [ "$age_secs" -gt $((interval * 86400)) ]; then
-      add_stale "$r" "$last" "$age_days"
-      decision="**rebuild**"
-    else
-      decision="fresh"
-    fi
-    echo "| ${r} | ${last} | ${age_days} | ${interval} | ${decision} |" >>"$GITHUB_STEP_SUMMARY"
-  done <<<"$repos"
+    two_branch_rows "$r"
+  done <<<"$two_branch"
 
   echo "matrix=${STALE}" >>"$GITHUB_OUTPUT"
   count=$(jq '[.[] | select(.unreadable == null)] | length' <<<"$STALE")
   unreadable=$(jq '[.[] | select(.unreadable != null)] | length' <<<"$STALE")
   {
     echo ""
-    if jq -e 'any(.[]; has("base"))' >/dev/null <<<"$STALE"; then
-      echo "Rebuilding ${count} image(s)."
-    else
-      echo "Rebuilding ${count} repo(s)."
-    fi
+    echo "Rebuilding ${count} image(s)."
     [ "$unreadable" -eq 0 ] || echo "${unreadable} image(s) could not be read; each fails its dispatch row."
   } >>"$GITHUB_STEP_SUMMARY"
-  echo "Stale repos: ${count}"
+  echo "Stale images: ${count}"
 }
 
 case "${1:-}" in

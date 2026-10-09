@@ -183,11 +183,10 @@ RELEASE_MODEL=bogus BEFORE="$D6" HEAD="$D7" ANCHOR_SHA="" GITHUB_OUTPUT=/dev/nul
 chk "S11r an unknown RELEASE_MODEL is status 2" "$rc" "2"
 put deadset.json '{}'
 put web/deadset-ignore.json '[]'
-put .punused-ignore 'x'
 put web/knip.json '{}'
 put web/knip.config.ts 'export default {}'
 D8=$(commit "refactor: dead-code adjudications only")
-chk "S11d deadset, knip and punused configs ship nothing" "$(paths "$D7" "$D8")" 'false|[]|[]|[]'
+chk "S11d deadset and knip configs ship nothing" "$(paths "$D7" "$D8")" 'false|[]|[]|[]'
 
 # ── A ts repo: the root package.json is the published manifest ───────────────
 export REPO_TYPE=ts

@@ -20,7 +20,6 @@ SCRIPTS = pathlib.Path(__file__).resolve().parent
 ROOT = SCRIPTS.parent
 SCRIPT = SCRIPTS / 'rebuild-stale.sh'
 WORKFLOW = ROOT / '.github' / 'workflows' / 'rebuild-stale.yaml'
-TESTDATA = SCRIPTS / 'testdata' / 'rebuild-stale'
 
 sys.path.insert(0, str(SCRIPTS))
 import release_channels  # noqa: E402
@@ -159,9 +158,7 @@ APK_REFRESH = (
     'FROM alpine:3.24\nARG PKG_REFRESH=static\n'
     'RUN echo "refresh ${PKG_REFRESH}" && apk add --no-cache tini\n'
 )
-APT = 'FROM debian:13\nRUN apt-get install -y curl\n'
 SCRATCH = 'FROM scratch\nCOPY app /app\n'
-FINALIZED = {'jobs': [{'name': 'release / docker / finalize', 'conclusion': 'success'}]}
 
 
 def repo(name, default='main', **kw):
@@ -172,75 +169,6 @@ def repo(name, default='main', **kw):
         'archived': kw.get('archived', False),
         'fork': kw.get('fork', False),
     }
-
-
-def legacy(api, name, dockerfile, runs, branch='main'):
-    """A repo on HEAD's path: its Dockerfile, its release runs and their jobs."""
-    if dockerfile is not None:
-        api[f'GET repos/cplieger/{name}/contents/Dockerfile'] = {
-            'body': {'content': b64(dockerfile)}
-        }
-    if runs is None:
-        return
-    url = (
-        f'GET repos/cplieger/{name}/actions/workflows/release.yaml/runs'
-        f'?branch={branch}&status=success&per_page=20'
-    )
-    api[url] = {'body': {'workflow_runs': [{'id': rid, 'created_at': at} for rid, at, _ in runs]}}
-    for rid, _, jobs in runs:
-        if jobs is not None:
-            api[f'GET repos/cplieger/{name}/actions/runs/{rid}/jobs?per_page=100'] = {'body': jobs}
-
-
-def main_default_fixture() -> dict:
-    api: dict = {}
-    repos = [
-        repo('fresh-app'),
-        repo('stale-app'),
-        repo('edge-app'),
-        repo('past-edge-app'),
-        repo('nofinal-app'),
-        repo('baddate-app'),
-        repo('nodocker-app'),
-        repo('distroless-app'),
-        repo('noruns-app'),
-        repo('archived-app', archived=True),
-        repo('fork-app', fork=True),
-        repo('tool-catalog', 'dev'),
-    ]
-    legacy(api, 'fresh-app', APK, [(11, iso(NOW - 2 * DAY), FINALIZED)])
-    legacy(
-        api,
-        'stale-app',
-        APT,
-        [(21, iso(NOW - 12 * DAY), None), (22, iso(NOW - 13 * DAY), FINALIZED)],
-    )
-    legacy(api, 'edge-app', APK, [(31, iso(NOW - 7 * DAY), FINALIZED)])
-    legacy(api, 'past-edge-app', APK, [(32, iso(NOW - 7 * DAY - 1), FINALIZED)])
-    legacy(
-        api,
-        'nofinal-app',
-        APK,
-        [
-            (
-                41,
-                iso(NOW - DAY),
-                {
-                    'jobs': [
-                        {'name': 'release / docker / finalize', 'conclusion': 'failure'},
-                        {'name': 'release / docker / build', 'conclusion': 'success'},
-                    ]
-                },
-            )
-        ],
-    )
-    legacy(api, 'baddate-app', APK, [(51, 'not-a-date', FINALIZED)])
-    legacy(api, 'nodocker-app', None, [(61, iso(NOW), FINALIZED)])
-    legacy(api, 'distroless-app', SCRATCH, [(71, iso(NOW - 30 * DAY), FINALIZED)])
-    legacy(api, 'noruns-app', APK, None)
-    legacy(api, 'tool-catalog', APK, [(81, iso(NOW - 9 * DAY), FINALIZED)], branch='dev')
-    api['GET user/repos?per_page=100&affiliation=owner'] = {'body': repos}
-    return {'now': NOW, 'api': api}
 
 
 INDEX = 'application/vnd.oci.image.index.v1+json'
@@ -338,70 +266,6 @@ class Harness:
         return json.loads(line.removeprefix('matrix='))
 
 
-class MainDefaultIdentity(unittest.TestCase):
-    """Goldens generated from HEAD's inline fan-out body under these stubs."""
-
-    def test_fanout_matches_heads_inline_body_for_main_default_repos(self):
-        h = Harness(self)
-        res = h.run(['bash', str(SCRIPT), 'fanout'], main_default_fixture())
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual(h.summary.read_text(), (TESTDATA / 'main-default.summary.md').read_text())
-        self.assertEqual(h.output.read_text(), (TESTDATA / 'main-default.output').read_text())
-        self.assertEqual(res.stdout, (TESTDATA / 'main-default.stdout').read_text())
-        golden = [json.loads(x) for x in (TESTDATA / 'main-default.calls').read_text().splitlines()]
-        listing = golden[0][:-1]
-        self.assertEqual(h.calls()[0][:-1], listing)
-        self.assertEqual(h.calls()[1:], golden[1:])
-
-    def test_the_golden_covers_every_decision(self):
-        rows = {
-            r['repo']: r
-            for r in json.loads(
-                (TESTDATA / 'main-default.output').read_text().removeprefix('matrix=')
-            )
-        }
-        self.assertEqual(
-            sorted(rows),
-            ['baddate-app', 'nofinal-app', 'past-edge-app', 'stale-app', 'tool-catalog'],
-        )
-        self.assertEqual(rows['stale-app']['age_days'], '13')
-        self.assertEqual(rows['tool-catalog']['branch'], 'dev')
-        self.assertTrue(
-            all(set(r) == {'repo', 'last', 'age_days', 'branch'} for r in rows.values())
-        )
-        summary = (TESTDATA / 'main-default.summary.md').read_text()
-        self.assertIn('| fresh-app |', summary)
-        self.assertIn('| edge-app |', summary)
-        self.assertIn(
-            'noruns-app: has a Dockerfile but no queryable release.yaml runs',
-            (TESTDATA / 'main-default.stdout').read_text(),
-        )
-
-    def test_a_private_dev_default_repo_stays_on_the_runs_path(self):
-        fx = main_default_fixture()
-        listing = fx['api']['GET user/repos?per_page=100&affiliation=owner']['body']
-        for entry in listing:
-            if entry['name'] == 'stale-app':
-                entry.update({'default_branch': 'dev', 'visibility': 'private'})
-        h = Harness(self)
-        res = h.run(['bash', str(SCRIPT), 'fanout'], fx)
-        self.assertEqual(res.returncode, 0, res.stderr)
-        stale = [c for c in h.calls() if c[0] == 'gh' and 'cplieger/stale-app/' in c[2]]
-        self.assertIn(
-            'repos/cplieger/stale-app/actions/workflows/release.yaml/runs?branch=dev&status=success&per_page=20',
-            [c[2] for c in stale],
-        )
-        self.assertFalse([c for c in stale if '?ref=' in c[2]])
-        self.assertEqual([c for c in h.calls() if c[0] == 'curl'], [])
-
-    def test_a_single_main_repo_on_dev_stays_on_the_runs_path(self):
-        self.assertIn('tool-catalog', release_channels.SINGLE_MAIN_REPOS)
-        h = Harness(self)
-        h.run(['bash', str(SCRIPT), 'fanout'], main_default_fixture())
-        urls = [c[1] for c in h.calls() if c[0] == 'curl']
-        self.assertEqual(urls, [])
-
-
 class TwoBranchFanout(unittest.TestCase):
     def fanout(self, fx):
         h = Harness(self)
@@ -420,16 +284,38 @@ class TwoBranchFanout(unittest.TestCase):
                     'channel': 'latest',
                     'last': iso(NOW - 10 * DAY),
                     'age_days': '10',
-                    'branch': 'dev',
                 }
             ],
         )
         summary = h.summary.read_text()
+        self.assertIn('| Repo | Image built (UTC) | Age (days) |', summary)
         self.assertIn(
             f'| tb (main, :latest) | {iso(NOW - 10 * DAY)} | 10 | 7 | **rebuild** |', summary
         )
         self.assertIn(f'| tb (dev, :dev) | {iso(NOW - DAY)} | 1 | 7 | fresh |', summary)
         self.assertIn('Rebuilding 1 image(s).', summary)
+        self.assertIn('Stale images: 1', res.stdout)
+
+    def test_only_a_two_branch_repo_is_read(self):
+        self.assertIn('tool-catalog', release_channels.SINGLE_MAIN_REPOS)
+        fx = two_branch_fixture()
+        fx['api']['GET user/repos?per_page=100&affiliation=owner']['body'] += [
+            repo('main-app'),
+            repo('private-app', 'dev', visibility='private'),
+            repo('tool-catalog', 'dev'),
+            repo('archived-app', 'dev', archived=True),
+            repo('fork-app', 'dev', fork=True),
+        ]
+        h, res = self.fanout(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        read = {
+            c[2].split('/')[2]
+            for c in h.calls()
+            if c[:2] == ['gh', 'api'] and c[2].startswith('repos/cplieger/')
+        }
+        self.assertEqual(read, {'tb'})
+        self.assertTrue(all('cplieger/tb' in c[1] for c in h.calls() if c[0] == 'curl'))
+        self.assertEqual({r['repo'] for r in h.matrix()}, {'tb'})
 
     def test_both_channels_stale_give_two_rows_main_first(self):
         fx = two_branch_fixture()
@@ -576,7 +462,7 @@ class TwoBranchFanout(unittest.TestCase):
         }
         h, _ = self.fanout(fx)
         self.assertEqual(h.matrix(), [])
-        self.assertIn('Rebuilding 0 repo(s).', h.summary.read_text())
+        self.assertIn('Rebuilding 0 image(s).', h.summary.read_text())
 
     def test_an_install_counts_as_docker_runs_it(self):
         for text, candidate in (
@@ -1045,14 +931,6 @@ class StalePr(unittest.TestCase):
         self.assertEqual(
             self.body('dev', 'dev', 'n/a', 'not published'), 'No `:dev` image is published.'
         )
-        self.assertEqual(
-            self.body('main', 'latest', 'n/a', 'x (unparsable)'),
-            'The `:latest` image has no usable build time (x (unparsable)).',
-        )
-        self.assertEqual(
-            self.body('dev', '', '9', '2026-09-25T04:00:00Z'),
-            'The newest dev build of this image is 9 days old (built 2026-09-25T04:00:00Z).',
-        )
 
 
 def workflow() -> dict:
@@ -1068,35 +946,16 @@ def condition(st: dict, matrix: dict) -> bool:
     return scope.condition(st.get('if'))
 
 
-MAIN_ROW = {'repo': 'a', 'last': 'x', 'age_days': '9', 'branch': 'main'}
-DEV_ROW = {'repo': 'a', 'last': 'x', 'age_days': '9', 'branch': 'dev'}
-TB_ROW = {
-    'repo': 'tb',
-    'base': 'main',
-    'channel': 'latest',
-    'last': 'x',
-    'age_days': '9',
-    'branch': 'dev',
-}
+TB_ROW = {'repo': 'tb', 'base': 'main', 'channel': 'latest', 'last': 'x', 'age_days': '9'}
 BAD_ROW = {**TB_ROW, 'last': 'unreadable', 'age_days': 'n/a', 'unreadable': 'boom'}
 
 
 class Workflow(unittest.TestCase):
-    def test_the_dispatch_step_is_heads(self):
-        golden = json.loads((TESTDATA / 'dispatch-step.json').read_text())
-        dispatch = step(workflow()['jobs']['dispatch'], 'Dispatch release.yaml')
-        self.assertEqual(dispatch, golden)
-
     def test_each_row_kind_runs_exactly_its_steps(self):
         job = workflow()['jobs']['dispatch']
         names = [s['name'] for s in job['steps']]
         expect = {
-            'main': (MAIN_ROW, ['Dispatch release.yaml on cplieger/${{ matrix.repo }}']),
-            'dev': (
-                DEV_ROW,
-                ['Checkout', 'Open a rebuild pull request on cplieger/${{ matrix.repo }}'],
-            ),
-            'two-branch': (
+            'readable': (
                 TB_ROW,
                 ['Checkout', 'Open a rebuild pull request on cplieger/${{ matrix.repo }}'],
             ),
@@ -1107,9 +966,9 @@ class Workflow(unittest.TestCase):
                 ran = [n for n, s in zip(names, job['steps'], strict=True) if condition(s, row)]
                 self.assertEqual(ran, wanted)
 
-    def test_the_pr_steps_base_defaults_to_dev_for_a_row_without_one(self):
+    def test_the_pr_steps_base_is_the_rows(self):
         st = step(workflow()['jobs']['dispatch'], 'Open a rebuild pull request')
-        for row, base in ((DEV_ROW, 'dev'), (TB_ROW, 'main'), ({**TB_ROW, 'base': 'dev'}, 'dev')):
+        for row, base in ((TB_ROW, 'main'), ({**TB_ROW, 'base': 'dev'}, 'dev')):
             scope = workflow_replay.Scope({'matrix': row, 'secrets': {}}, {}, [])
             self.assertEqual(scope.render(st['env']['BASE']), base)
 

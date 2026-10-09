@@ -1,2 +1,0 @@
-::notice::noruns-app: has a Dockerfile but no queryable release.yaml runs; skipping
-Stale repos: 5
