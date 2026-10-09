@@ -1063,6 +1063,7 @@ class TagProvenance(unittest.TestCase):
                     'statuses': [{'context': 'release/tag/yamlenv/v1.1.0', 'state': 'success'}]
                 },
                 **self.commits('httpx', self.B),
+                'repos/cplieger/httpx/contents/yamlenv/go.mod?ref=main': {'type': 'file'},
             },
         )
         s = self.collect('httpx', answers)
@@ -1072,6 +1073,37 @@ class TagProvenance(unittest.TestCase):
         hard, _, _ = audit.compliance(s2)
         self.assertTrue(
             any('carries no release/complete/yamlenv/v1.1.0 receipt' in h for h in hard), hard
+        )
+
+    def retired_lane_answers(self, go_mod):
+        tags = [
+            {'name': 'yamlenv/v1.1.0', 'commit': {'sha': self.B}},
+            {'name': 'v1.3.0', 'commit': {'sha': self.C}},
+        ]
+        root_only = {'statuses': [{'context': 'release/complete/v1.3.0', 'state': 'success'}]}
+        return self.receipt_answers(
+            root_only,
+            tags=tags,
+            **{
+                'repos/cplieger/httpx/releases/tags/yamlenv/v1.1.0': self.BOT,
+                **self.commits('httpx', self.B),
+                'repos/cplieger/httpx/contents/yamlenv/go.mod?ref=main': go_mod,
+            },
+        )
+
+    def test_a_retired_lane_s_highest_tag_needs_no_receipt(self):
+        # The lane's module is gone from main, so no release run can repair it.
+        asked = []
+        s = self.collect('httpx', self.retired_lane_answers(None), asked)
+        self.assertEqual(s['stable_tags_without_receipt'], [])
+        self.assertEqual(s['errors'], [])
+        self.assertNotIn(f'repos/cplieger/httpx/commits/{self.B}/status?per_page=100', asked)
+
+    def test_an_unreadable_lane_module_is_an_error_not_a_missing_receipt(self):
+        s = self.collect('httpx', self.retired_lane_answers(audit.API_ERROR))
+        self.assertEqual(s['stable_tags_without_receipt'], [])
+        self.assertEqual(
+            s['errors'], ['yamlenv/go.mod on main unreadable (API), so its receipt not graded']
         )
 
     def test_a_truncated_status_list_is_an_error_not_a_missing_receipt(self):
