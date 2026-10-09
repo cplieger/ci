@@ -642,11 +642,20 @@ def collect_version_tags(name, s, now=None):
         lane_keys), so a retired lane's last tag would stay a finding forever."""
         if not lane:
             return True
+        unread = f"{lane}/go.mod on main unreadable (API), so its receipt is not graded"
         body = gh_json_strict(f"repos/{OWNER}/{name}/contents/{lane}/go.mod?ref=main")
         if body is API_ERROR:
-            s["errors"].append(f"{lane}/go.mod on main unreadable (API), so its receipt not graded")
+            s["errors"].append(unread)
             return False
-        return body is not None
+        if body is not None:
+            return True
+        # A missing ref also answers 404, so a repo without main must not read as retired.
+        branch = gh_json_strict(f"repos/{OWNER}/{name}/branches/main")
+        if branch is None:
+            s["errors"].append(f"{name} has no main branch, so the receipt of lane {lane} is not graded")
+        elif branch is API_ERROR:
+            s["errors"].append(unread)
+        return False
 
     for lane, (stable, dev) in sorted(release_channels.tags_by_lane(names_).items()):
         graded = settled(stable[:PROVENANCE_TAGS])

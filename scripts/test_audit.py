@@ -22,6 +22,7 @@ import audit
 import yaml
 
 HOST = 'deploy.example'
+MAIN_BRANCH = {'name': 'main'}
 DEV_RULESET = audit.expected_ruleset('dev')
 MAIN_RULESET = audit.expected_ruleset('main')
 MAIN_DEFAULT = Path(__file__).resolve().parent / 'testdata' / 'audit' / 'main-default.json'
@@ -1075,7 +1076,7 @@ class TagProvenance(unittest.TestCase):
             any('carries no release/complete/yamlenv/v1.1.0 receipt' in h for h in hard), hard
         )
 
-    def retired_lane_answers(self, go_mod):
+    def retired_lane_answers(self, go_mod, main=MAIN_BRANCH):
         tags = [
             {'name': 'yamlenv/v1.1.0', 'commit': {'sha': self.B}},
             {'name': 'v1.3.0', 'commit': {'sha': self.C}},
@@ -1088,6 +1089,7 @@ class TagProvenance(unittest.TestCase):
                 'repos/cplieger/httpx/releases/tags/yamlenv/v1.1.0': self.BOT,
                 **self.commits('httpx', self.B),
                 'repos/cplieger/httpx/contents/yamlenv/go.mod?ref=main': go_mod,
+                'repos/cplieger/httpx/branches/main': main,
             },
         )
 
@@ -1103,7 +1105,21 @@ class TagProvenance(unittest.TestCase):
         s = self.collect('httpx', self.retired_lane_answers(audit.API_ERROR))
         self.assertEqual(s['stable_tags_without_receipt'], [])
         self.assertEqual(
-            s['errors'], ['yamlenv/go.mod on main unreadable (API), so its receipt not graded']
+            s['errors'], ['yamlenv/go.mod on main unreadable (API), so its receipt is not graded']
+        )
+
+    def test_a_repo_without_main_is_an_error_not_a_retired_lane(self):
+        s = self.collect('httpx', self.retired_lane_answers(None, main=None))
+        self.assertEqual(s['stable_tags_without_receipt'], [])
+        self.assertEqual(
+            s['errors'], ['httpx has no main branch, so the receipt of lane yamlenv is not graded']
+        )
+
+    def test_an_unreadable_main_branch_is_an_error_not_a_retired_lane(self):
+        s = self.collect('httpx', self.retired_lane_answers(None, main=audit.API_ERROR))
+        self.assertEqual(s['stable_tags_without_receipt'], [])
+        self.assertEqual(
+            s['errors'], ['yamlenv/go.mod on main unreadable (API), so its receipt is not graded']
         )
 
     def test_a_truncated_status_list_is_an_error_not_a_missing_receipt(self):
