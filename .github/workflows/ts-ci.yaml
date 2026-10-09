@@ -124,7 +124,7 @@ jobs:
           # report schema it does not accept (exit 3), so a Contract major
           # moves both pins together.
           # renovate: datasource=go depName=github.com/cplieger/deadset
-          DEADSET_VERSION=v1.11.0
+          DEADSET_VERSION=v1.11.1
           go install "github.com/cplieger/deadset/cmd/deadset@${DEADSET_VERSION}"
           # renovate: datasource=npm depName=@cplieger/deadset-ts
           DEADSET_TS_VERSION=6.1.0

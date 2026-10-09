@@ -89,7 +89,7 @@ jobs:
           # pins GOTOOLCHAIN=local and either module may require a newer Go
           # than the consumer's go.mod.
           # renovate: datasource=go depName=github.com/cplieger/deadset
-          DEADSET_VERSION=v1.11.0
+          DEADSET_VERSION=v1.11.1
           GOTOOLCHAIN=auto go install "github.com/cplieger/deadset/cmd/deadset@${DEADSET_VERSION}"
           # renovate: datasource=go depName=github.com/cplieger/deadset-go
           DEADSET_GO_VERSION=v1.27.1
