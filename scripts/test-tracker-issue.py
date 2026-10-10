@@ -12,7 +12,7 @@ Run: python3 scripts/test-tracker-issue.py     (exit 0 = pass)
 from __future__ import annotations
 
 import contextlib
-import datetime
+import datetime as dt
 import io
 import json
 import os
@@ -715,7 +715,7 @@ class GatePolicyTest(unittest.TestCase):
         scope: str = '',
         watched_minutes: int = 30,
     ) -> subprocess.CompletedProcess:
-        started = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=minutes_ago)
+        started = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=minutes_ago)
         self.scenario.write_text(
             json.dumps({'jobs': jobs, 'run_started_at': started.strftime('%Y-%m-%dT%H:%M:%SZ')})
         )
