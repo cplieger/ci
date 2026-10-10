@@ -99,6 +99,8 @@ A collapsed Dependencies block follows. It lists what changed in `go.mod`, `pack
 
 It then writes a promotion commit whose tree is the `dev` commit's and whose parents are `main` and that commit. For an image, it next tags the promoted `dev` image `promoted-<promotion commit>` on GitHub Container Registry, and the cleanup of aged `dev` images never deletes an image with that tag. `main` moves to the promotion commit only after that tag exists and only if `main` has not moved since the checks. `dev` is never written. A dry run stops after the checks.
 
+Each run is named `Promote <repo>`, with `(dry run)` after a dry run. Runs for one repository run one at a time, and up to 100 can wait for their turn without any being cancelled. Runs for different repositories run in parallel.
+
 ## The security workflows
 
 - `codeql.yaml` runs CodeQL with the `security-extended` and `security-and-quality` query suites on public repositories. It detects the languages itself.

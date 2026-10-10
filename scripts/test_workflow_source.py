@@ -122,12 +122,13 @@ class SourceCheckout(unittest.TestCase):
 
 
 class ActionlintCarveOut(unittest.TestCase):
-    """The job.workflow_* ignore stays scoped to the files and properties that need it."""
+    """Each ignore stays scoped to the files and messages that need it."""
 
     def setUp(self):
         config = yaml.safe_load((ROOT / '.github/actionlint.yaml').read_text())
-        ((self.glob, rule),) = config['paths'].items()
+        ((self.glob, rule), (self.queue_glob, queue_rule)) = config['paths'].items()
         (self.pattern,) = rule['ignore']
+        (self.queue_pattern,) = queue_rule['ignore']
 
     def test_the_ignore_names_exactly_the_workflows_that_read_the_job_identity(self):
         listed = set(re.fullmatch(r'\.github/workflows/\{(.+)\}\.yaml', self.glob)[1].split(','))
@@ -142,6 +143,21 @@ class ActionlintCarveOut(unittest.TestCase):
         self.assertNotRegex(
             'property "workflow_sha" is not defined in object type {ref: string}', self.pattern
         )
+
+    def test_the_queue_ignore_names_exactly_the_workflows_that_queue(self):
+        def queues(doc):
+            groups = [doc.get('concurrency'), *(j.get('concurrency') for j in doc['jobs'].values())]
+            return any(isinstance(g, dict) and 'queue' in g for g in groups)
+
+        queued = {
+            f'.github/workflows/{p.name}'
+            for p in WORKFLOWS
+            if queues(yaml.safe_load(p.read_text()))
+        }
+        self.assertEqual({self.queue_glob}, queued)
+        message = 'unexpected key "queue" for "concurrency" section'
+        self.assertRegex(message, self.queue_pattern)
+        self.assertNotRegex(message.replace('queue', 'group'), self.queue_pattern)
 
 
 if __name__ == '__main__':

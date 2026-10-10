@@ -6,6 +6,7 @@
 # deletes, before move re-reads R and the tag and moves main.
 # PACKAGES_PAT reaches tag only; PROMOTE_PAT reaches create and move only.
 name: Promote
+run-name: Promote ${{ inputs.repo }}${{ inputs.dry_run && ' (dry run)' || '' }}
 
 on:
   workflow_dispatch:
@@ -26,9 +27,14 @@ on:
 permissions:
   contents: read
 
+# Every promotion write lands in the promoted repository, so runs queue per repository;
+# notify's shared tracker issue has a group of its own. Without queue: max a group keeps
+# one waiting run and cancels it when another queues
+# (https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
 concurrency:
-  group: promote
+  group: promote-${{ inputs.repo }}
   cancel-in-progress: false
+  queue: max
 
 env:
   # renovate: datasource=github-releases depName=aquasecurity/trivy
@@ -220,6 +226,12 @@ jobs:
   notify:
     needs: [snapshot, preview, apply, tag, move]
     if: always()
+    # Runs that create, update or close the shared tracker issue serialize here;
+    # ':' keeps this group distinct from every per-repository promotion group.
+    concurrency:
+      group: promote:notify
+      cancel-in-progress: false
+      queue: max
     permissions:
       actions: read
       contents: read
