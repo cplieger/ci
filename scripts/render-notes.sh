@@ -143,9 +143,7 @@ render() {
   prev=$(previous_stable_tag)
   range=$commit
   [ -z "$prev" ] || range="${prev}..${commit}"
-  # A consumer's synced cliff.toml can predate the unconditional sectioned body
-  # and still select it only under CLIFF_NOTES_MODE=v3.
-  changes=$(CLIFF_NOTES_MODE=v3 "$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" --strip header "$range")
+  changes=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" --strip header "$range")
   if [ -n "$prev" ]; then
     changes+=$'\n\n'"**Full changelog**: https://github.com/${REPO}/compare/${prev}...${VERSION}"
     local inv=(diff --git-dir . --from "$prev" --to "$commit" --lane "${LANE:-.}" --format markdown)
