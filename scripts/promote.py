@@ -402,7 +402,6 @@ def check_digest(
         text=True,
         check=False,
         env=token_free_env(
-            RELEASE_MODEL='two-branch',
             IMAGE_NAME=f'{OWNER}/{repo}',
             REGISTRY=REGISTRY,
             EXCLUDE_RE=sig.get('exclude_re', ''),
@@ -845,8 +844,6 @@ def render_lane_notes(clone: Path, repo: str, key: str, lane: dict, layout: Layo
     render = [
         'bash',
         str(SCRIPTS / 'render-notes.sh'),
-        '--release-model',
-        'two-branch',
         *site,
         '--version',
         lane['version'],

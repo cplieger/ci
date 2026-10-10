@@ -62,12 +62,100 @@ def release(tag, *assets, immutable=False):
     }
 
 
+def job_steps():
+    return yaml.safe_load(WORKFLOW.read_text())['jobs']['backfill']['steps']
+
+
+def step_named(name):
+    (step,) = [s for s in job_steps() if s.get('name', '').startswith(name)]
+    return step
+
+
+def resolve(repos, fleet='app other'):
+    """Runs the resolve step; returns the process and its `repos` output, or None."""
+    with tempfile.TemporaryDirectory() as name:
+        out = pathlib.Path(name) / 'output'
+        out.write_text('')
+        proc = subprocess.run(
+            ['bash', '-e', '-c', step_named('Resolve')['run']],
+            capture_output=True,
+            text=True,
+            cwd=name,
+            env={**os.environ, 'FLEET': fleet, 'INPUT_REPOS': repos, 'GITHUB_OUTPUT': str(out)},
+            check=False,
+        )
+        lines = out.read_text().splitlines()
+    assert len(lines) <= 1, lines
+    return proc, lines[0].removeprefix('repos=') if lines else None
+
+
+class ResolveStep(unittest.TestCase):
+    def test_all_is_the_frozen_list_and_names_are_trimmed_and_joined(self):
+        for given, want in (
+            ('all', 'app,other'),
+            ('app', 'app'),
+            (' app , docker-x.y_z ', 'app,docker-x.y_z'),
+        ):
+            with self.subTest(given=given):
+                proc, repos = resolve(given)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(repos, want)
+
+    def test_an_empty_list_fails_rather_than_minting_for_every_repo(self):
+        for given in ('', ' , ', ','):
+            with self.subTest(given=given):
+                proc, repos = resolve(given)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn('::error::no repository to backfill', proc.stdout)
+                self.assertIsNone(repos)
+
+    def test_a_name_github_would_not_allow_fails_before_the_mint(self):
+        for given in ('app,../x', 'other/app', 'a;b', '*', '$(id)', '.', 'app,..'):
+            with self.subTest(given=given):
+                proc, repos = resolve(given)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn('::error::not a repository name', proc.stdout)
+                self.assertIsNone(repos)
+
+
+class Authentication(unittest.TestCase):
+    def test_the_sign_step_alone_holds_an_app_token_scoped_to_the_resolved_repos(self):
+        self.assertNotIn('SYNC_PAT', WORKFLOW.read_text())
+        steps = job_steps()
+        names = [s['name'] for s in steps]
+        mint_at = names.index('Mint the App token')
+        self.assertEqual(names[mint_at - 1], 'Resolve the repositories')
+        self.assertEqual(names[mint_at + 1], 'Sign and upload missing SBOM signatures')
+        mint = steps[mint_at]
+        self.assertEqual(mint['id'], 'app-token')
+        self.assertRegex(mint['uses'], r'^actions/create-github-app-token@[0-9a-f]{40}$')
+        self.assertNotIn('continue-on-error', mint)
+        self.assertNotIn('if', mint)
+        self.assertEqual(
+            mint['with'],
+            {
+                'client-id': '${{ secrets.SYNC_APP_ID }}',
+                'private-key': '${{ secrets.SYNC_APP_PRIVATE_KEY }}',
+                'owner': 'cplieger',
+                'repositories': '${{ steps.targets.outputs.repos }}',
+                'permission-contents': 'write',
+                'permission-metadata': 'read',
+            },
+        )
+        self.assertEqual(steps[mint_at - 1]['id'], 'targets')
+        tokens = {s['name']: s['env']['GH_TOKEN'] for s in steps if 'GH_TOKEN' in s.get('env', {})}
+        self.assertEqual(
+            tokens,
+            {'Sign and upload missing SBOM signatures': '${{ steps.app-token.outputs.token }}'},
+        )
+        self.assertEqual(steps[mint_at + 1]['env']['REPOS'], '${{ steps.targets.outputs.repos }}')
+
+
 class SignStep(unittest.TestCase):
     def run_step(self, releases, repos='app', limit='10', dry_run='true'):
-        doc = yaml.safe_load(WORKFLOW.read_text())
-        (step,) = [
-            s for s in doc['jobs']['backfill']['steps'] if s.get('name', '').startswith('Sign')
-        ]
+        resolved, targets = resolve(repos)
+        self.assertEqual(resolved.returncode, 0, resolved.stdout)
+        step = step_named('Sign')
         with tempfile.TemporaryDirectory() as name:
             tmp = pathlib.Path(name)
             for tool, body in (('gh', GH_STUB), ('cosign', COSIGN_STUB)):
@@ -79,8 +167,7 @@ class SignStep(unittest.TestCase):
                 'PATH': f'{tmp}{os.pathsep}{os.environ["PATH"]}',
                 'STUB_LOG': str(tmp / 'log'),
                 'STUB_RELEASES': str(tmp / 'releases.json'),
-                'FLEET': 'app other',
-                'INPUT_REPOS': repos,
+                'REPOS': targets,
                 'INPUT_LIMIT': limit,
                 'INPUT_DRY_RUN': dry_run,
             }

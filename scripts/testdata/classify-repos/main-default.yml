@@ -92,29 +92,3 @@ group:
         dest: .stylelintrc.json
       - source: configs/htmlvalidate.json
         dest: .htmlvalidate.json
-
-  # Release (unified auto-detect)
-  - repos: |
-      cplieger/goapp
-      cplieger/gohybrid
-      cplieger/shellimg
-      cplieger/tslib
-    files:
-      - source: .github/workflow-templates/release.yml
-        dest: .github/workflows/release.yaml
-
-  # Cliff config (stable — v1.x+)
-  - repos: |
-      cplieger/goapp
-      cplieger/gohybrid
-    files:
-      - source: configs/cliff-stable.toml
-        dest: cliff.toml
-
-  # Cliff config (alpha — v0.x or no tags)
-  - repos: |
-      cplieger/shellimg
-      cplieger/tslib
-    files:
-      - source: configs/cliff-alpha.toml
-        dest: cliff.toml

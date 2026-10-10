@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -22,9 +23,9 @@ TESTDATA = SCRIPTS / 'testdata' / 'classify-repos'
 
 # Answers `gh api -i` with the fixture: the REST repo listing, tree and tag
 # reads (a missing key is a 404, `tags_fail` a 403, `tags_raw` a body answered
-# verbatim), and logs each argv.
+# verbatim, a `slow` tree half a second late), and logs each argv.
 GH_STUB = r"""#!/usr/bin/env python3
-import json, os, re, sys
+import json, os, re, sys, time
 fx = json.load(open(os.environ['GH_FIXTURE']))
 args = sys.argv[1:]
 with open(os.environ['GH_LOG'], 'a') as log:
@@ -36,12 +37,15 @@ def answer(status, doc):
 if args[:2] != ['api', '-i'] or len(args) != 3:
     sys.exit(f'gh stub: unexpected call {args}')
 path = args[2]
-m = re.fullmatch(r'user/repos\?affiliation=owner&per_page=(\d+)&page=(\d+)', path)
+m = re.fullmatch(r'installation/repositories\?per_page=(\d+)&page=(\d+)', path)
 if m:
     size, page = int(m[1]), int(m[2])
-    answer(200, fx['repos'][(page - 1) * size : page * size])
+    rows = fx['repos'][(page - 1) * size : page * size]
+    answer(200, {'total_count': len(fx['repos']), 'repositories': rows})
 m = re.fullmatch(r'repos/cplieger/([^/]+)/git/trees/([^?]+)\?recursive=[01]', path)
 if m:
+    if f'{m[1]}@{m[2]}' in fx.get('slow', []):
+        time.sleep(0.5)
     paths = fx['trees'].get(f'{m[1]}@{m[2]}')
     if paths is None:
         answer(404, {'message': 'Not Found'})
@@ -70,7 +74,8 @@ def repo(name, branch='main', *, archived=False, fork=False, visibility='public'
     }
 
 
-# Eight repos reaching every group, plus the ones discovery drops.
+# Eight repos reaching every single-branch group, plus the ones discovery drops.
+# No tags: a single-branch repo's are never read.
 MAIN_FIXTURE = {
     'repos': [
         repo('ci'),
@@ -96,11 +101,7 @@ MAIN_FIXTURE = {
         'pytool@HEAD': ['pyproject.toml'],
         'glyphs@HEAD': ['pyproject.toml', '.github/workflows/publish.yaml'],
     },
-    'tags': {
-        'goapp': ['v1.2.0', 'v1.1.0'],
-        'tslib': ['v0.3.0'],
-        'shellimg': ['v1.0.0-dev.3', 'v0.9.0', 'yamlenv/v2.0.0'],
-    },
+    'tags': {},
 }
 
 
@@ -182,6 +183,14 @@ def run_classify(script, fixture):
         gh.close()
 
 
+def calls_by_repo(calls):
+    """{repo name: its calls, in order} of a gh argv list."""
+    out = {}
+    for call in calls:
+        out.setdefault(call[-1].split('/')[2], []).append(call)
+    return out
+
+
 def manifest_dests(text):
     dests = set()
     for group in yaml.safe_load(text)['group']:
@@ -211,32 +220,62 @@ class MainDefault(unittest.TestCase):
         self.assertEqual(out, self.golden)
         self.assertNotIn('base:', out)
 
+    def test_a_single_branch_repo_gets_no_release_pipeline_and_no_tags_read(self):
+        fx = copy.deepcopy(MAIN_FIXTURE)
+        fx['tags_fail'] = [entry['name'] for entry in fx['repos']]
+        rc, out, err, calls = run_classify(SCRIPTS / 'classify-repos.py', fx)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([c for c in calls if '/tags?' in c[-1]], [])
+        dests = manifest_dests(out)
+        self.assertNotIn('.github/workflows/release.yaml', dests)
+        self.assertNotIn('cliff.toml', dests)
+        self.assertIn('.github/workflows/ci.yaml', dests)
+        self.assertNotIn('cliff=', err)
+        self.assertNotIn('release=', err)
+
     def test_the_api_calls_differ_only_by_the_rest_transport(self):
         # The golden records the gh-repo-list argv; the REST transport differs
-        # from it only in the listing call and the `-i` on every read.
+        # from it only in the listing call and the `-i` on every read. Repos are
+        # read concurrently, so only each repo's own calls keep an order.
         _rc, _out, _err, calls = run_classify(SCRIPTS / 'classify-repos.py', MAIN_FIXTURE)
         golden = [
             json.loads(line) for line in (TESTDATA / 'main-default.calls').read_text().splitlines()
         ]
-        listing = ['api', '-i', 'user/repos?affiliation=owner&per_page=100&page=1']
+        listing = ['api', '-i', 'installation/repositories?per_page=100&page=1']
         want = [listing if c[:2] == ['repo', 'list'] else ['api', '-i', *c[1:]] for c in golden]
-        self.assertEqual(calls, want)
+        self.assertEqual(calls[0], listing)
+        self.assertEqual(calls_by_repo(calls[1:]), calls_by_repo(want[1:]))
+        self.assertEqual(len(calls), len(want))
 
-    def test_a_failed_tags_read_aborts_with_the_repo_named(self):
-        fx = copy.deepcopy(MAIN_FIXTURE)
-        fx['tags_fail'] = ['tslib']
+    def test_one_tree_read_per_repo_and_base(self):
+        _rc, _out, _err, calls = run_classify(SCRIPTS / 'classify-repos.py', two_branch_fixture())
+        trees = [c[-1] for c in calls if '/git/trees/' in c[-1]]
+        self.assertEqual(len(trees), len(set(trees)), trees)
+        self.assertTrue(all(t.endswith('?recursive=1') for t in trees), trees)
+
+    def test_the_log_keeps_the_repo_order_however_the_reads_finish(self):
+        fx = two_branch_fixture()
+        fx['slow'] = ['edgeapp@dev']
+        _rc, _out, err, _calls = run_classify(SCRIPTS / 'classify-repos.py', fx)
+        names = [line.split()[1] for line in err.splitlines() if 'classified:' in line]
+        self.assertEqual(names, sorted(names))
+        self.assertEqual(names.count('edgeapp'), 2)
+
+    def test_a_failed_two_branch_tags_read_aborts_with_the_repo_named(self):
+        fx = two_branch_fixture()
+        fx['tags_fail'] = ['edgeapp']
         rc, out, err, _calls = run_classify(SCRIPTS / 'classify-repos.py', fx)
         self.assertEqual(rc, 1)
         self.assertEqual(out, '')
-        self.assertIn('classify-repos: tags read failed for tslib; aborting', err)
+        self.assertIn('classify-repos: tags read failed for edgeapp; aborting', err)
 
-    def test_a_truncated_tags_listing_aborts(self):
-        fx = copy.deepcopy(MAIN_FIXTURE)
-        fx['tags']['goapp'] = [f'v1.0.0-dev.{n}' for n in range(1, 2001)]
+    def test_a_truncated_two_branch_tags_listing_aborts(self):
+        fx = two_branch_fixture()
+        fx['tags']['edgeapp'] = [f'v1.0.0-dev.{n}' for n in range(1, 2001)]
         rc, out, err, _calls = run_classify(SCRIPTS / 'classify-repos.py', fx)
         self.assertEqual(rc, 1)
         self.assertEqual(out, '')
-        self.assertIn('classify-repos: tags listing of goapp truncated', err)
+        self.assertIn('classify-repos: tags listing of edgeapp truncated', err)
 
 
 class Discovery(unittest.TestCase):
@@ -268,6 +307,37 @@ class Discovery(unittest.TestCase):
             classify.discover_repos()
         self.assertIn('repo listing failed', str(caught.exception.code))
         self.assertIn('HTTP 401 Bad credentials', str(caught.exception.code))
+
+    def test_the_client_holds_on_the_shared_pacers_rate_limit_pause(self):
+        classify = load_classify()
+        self.assertEqual(classify.REST.pause, classify.PACER.pause)
+
+    def test_every_call_is_admitted_by_the_pacer_as_a_read(self):
+        import ghrest
+
+        ok = subprocess.CompletedProcess(['gh'], 0, b'HTTP/2.0 200 OK\n\r\n{}', b'')
+        with mock.patch.object(ghrest, 'run_process', lambda *_: ok):
+            classify = load_classify()
+        with mock.patch.object(classify.PACER, 'wait') as wait:
+            self.assertEqual(classify.REST.get('repos/cplieger/goapp'), {})
+        self.assertEqual([c.args for c in wait.call_args_list], [(False,)])
+
+    def test_the_repos_are_read_on_the_default_pool_of_several_workers(self):
+        classify = load_classify()
+        seen = []
+
+        def recorder(_items, _work, *workers, **kw):
+            seen.append((workers, kw))
+            return iter(())
+
+        with (
+            mock.patch.object(classify, 'discover_repos', return_value=[]),
+            mock.patch.object(classify.fanout, 'ordered', recorder),
+            mock.patch('sys.stdout', io.StringIO()),
+        ):
+            classify.main()
+        self.assertEqual(seen, [((), {})])
+        self.assertGreater(classify.fanout.ordered.__defaults__[0], 1)
 
     def test_a_listing_that_times_out_exits_124(self):
         classify = load_classify()
@@ -396,12 +466,12 @@ class WrongShapeTags(unittest.TestCase):
                 self.assertEqual(out, '')
                 self.assertIn('classify-repos: tags read failed for edgeapp; aborting', err)
 
-    def test_a_main_default_repo_reads_it_as_it_always_has(self):
+    def test_a_main_default_repo_never_reads_it(self):
         fx = copy.deepcopy(MAIN_FIXTURE)
         fx['tags_raw'] = {'tslib': {'message': 'not a list'}}
         rc, _out, err, _calls = run_classify(SCRIPTS / 'classify-repos.py', fx)
         self.assertEqual(rc, 0, err)
-        self.assertRegex(err, r'classified: tslib +lang=ts +web=false cliff=stable')
+        self.assertRegex(err, r'classified: tslib +lang=ts +web=false\n')
 
     def test_the_promotion_sources_raise(self):
         classify = load_classify()

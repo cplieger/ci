@@ -28,7 +28,7 @@
    [
     "config",
     "user.name",
-    "github-actions[bot]"
+    "tribble-trouble[bot]"
    ]
   ],
   [
@@ -36,7 +36,7 @@
    [
     "config",
     "user.email",
-    "41898282+github-actions[bot]@users.noreply.github.com"
+    "338123824+tribble-trouble[bot]@users.noreply.github.com"
    ]
   ],
   [
@@ -118,7 +118,7 @@
    [
     "config",
     "user.name",
-    "github-actions[bot]"
+    "tribble-trouble[bot]"
    ]
   ],
   [
@@ -126,7 +126,7 @@
    [
     "config",
     "user.email",
-    "41898282+github-actions[bot]@users.noreply.github.com"
+    "338123824+tribble-trouble[bot]@users.noreply.github.com"
    ]
   ],
   [
@@ -189,7 +189,7 @@
    [
     "config",
     "user.name",
-    "github-actions[bot]"
+    "tribble-trouble[bot]"
    ]
   ],
   [
@@ -197,7 +197,7 @@
    [
     "config",
     "user.email",
-    "41898282+github-actions[bot]@users.noreply.github.com"
+    "338123824+tribble-trouble[bot]@users.noreply.github.com"
    ]
   ],
   [
@@ -260,7 +260,7 @@
    [
     "config",
     "user.name",
-    "github-actions[bot]"
+    "tribble-trouble[bot]"
    ]
   ],
   [
@@ -268,7 +268,7 @@
    [
     "config",
     "user.email",
-    "41898282+github-actions[bot]@users.noreply.github.com"
+    "338123824+tribble-trouble[bot]@users.noreply.github.com"
    ]
   ],
   [
@@ -329,7 +329,7 @@
   [
    "api",
    "-i",
-   "user/repos?affiliation=owner&per_page=100&page=1"
+   "installation/repositories?per_page=100&page=1"
   ],
   [
    "api",

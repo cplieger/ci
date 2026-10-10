@@ -10,18 +10,26 @@ Importable: `sync_owned_patterns()` is every path the sync can write, and
 
 Failure model: the repo listing aborts on an error, a timeout or the page cap;
 an unreadable tree drops that repo (or base) from every group; a failed
-tags read aborts, because a guessed cliff tier auto-merges the wrong cliff.toml.
+tags read of a two-branch repo aborts, because a guessed cliff tier auto-merges
+the wrong cliff.toml. Every other repo gets no release pipeline, so its tags
+are never read. Repos are read concurrently (fanout.py); the output keeps the
+repo order.
 """
 
 import sys
 from typing import NamedTuple
 
+import fanout
 import ghrest
 import release_channels
 
 OWNER = 'cplieger'
 TIMEOUT = 10  # seconds per API call
-REST = ghrest.Client(timeout=TIMEOUT)
+# Reads only, so nothing is spaced; a rate-limit refusal holds every worker.
+PACER = ghrest.Pacer()
+REST = ghrest.Client(
+    run=ghrest.paced(ghrest.run_process, PACER), timeout=TIMEOUT, pause=PACER.pause
+)
 # A two-branch repo's groups follow every other group, one block per base in this order.
 BASES = ('dev', 'main')
 
@@ -96,9 +104,7 @@ CLIFF = {
     'stable': Group(
         'Cliff config (stable — v1.x+)', (('configs/cliff-stable.toml', 'cliff.toml'),)
     ),
-    'alpha': Group(
-        'Cliff config (alpha — v0.x or no tags)', (('configs/cliff-alpha.toml', 'cliff.toml'),)
-    ),
+    'alpha': Group('Cliff config (alpha — v0.x)', (('configs/cliff-alpha.toml', 'cliff.toml'),)),
 }
 TWO_BRANCH_RENOVATE = Group(
     'Two-branch Renovate delta (repos whose default branch is dev)',
@@ -156,7 +162,7 @@ def canonical_sources(repo):
     """{dest: source path in this repo} for every sync-owned path, with
     cliff.toml resolved by `repo`'s cliff tier. Raises ClassifyError when the
     tags read fails."""
-    tier = cliff_tier(repo.split('/')[-1], strict=True)
+    tier = cliff_tier(repo.split('/')[-1])
     sources = {}
     for _key, group in GROUPS:
         if group in CLIFF.values() and group is not CLIFF[tier]:
@@ -178,25 +184,19 @@ def api_json(path):
         return None
 
 
-def tree_paths(repo, recursive, ref='HEAD'):
-    """Paths in the repo's git tree at `ref`; [] when unreadable.
-
-    GitHub treats ANY `recursive` value, 0 included, as enabling recursion, so
-    every call returns the full tree; the root checks are exact-path matches,
-    so that stays correct.
-    """
-    data = api_json(f'repos/{OWNER}/{repo}/git/trees/{ref}?recursive={recursive}')
+def tree_paths(repo, ref='HEAD'):
+    """Every path in the repo's git tree at `ref`, recursively; [] when unreadable."""
+    data = api_json(f'repos/{OWNER}/{repo}/git/trees/{ref}?recursive=1')
     if not isinstance(data, dict):
         return []
     return [entry.get('path', '') for entry in data.get('tree') or [] if isinstance(entry, dict)]
 
 
-def latest_tag(repo, strict=False):
+def latest_tag(repo):
     """Name of the repo's newest STABLE tag (vX.Y.Z): '' when there is none,
-    None when the read FAILED. A dev or lane tag is not a root version, so the
-    listing pages past them; TagListingTruncatedError when it cannot. Under
-    `strict` a page that is not a list of objects with a string `name` failed;
-    otherwise it reads as the entries it has, which a main-default repo keeps."""
+    None when the read FAILED, a page that is not a list of objects with a
+    string `name` included. A dev or lane tag is not a root version, so the
+    listing pages past them; TagListingTruncatedError when it cannot."""
 
     def fetch(page):
         data = api_json(
@@ -204,14 +204,10 @@ def latest_tag(repo, strict=False):
         )
         if data is None:
             return None
-        if strict:
-            shaped = isinstance(data, list) and all(
-                isinstance(e, dict) and isinstance(e.get('name'), str) and e['name'] for e in data
-            )
-            return [e['name'] for e in data] if shaped else None
-        if not isinstance(data, list):
-            return []
-        return [entry.get('name') or '' for entry in data if isinstance(entry, dict)]
+        shaped = isinstance(data, list) and all(
+            isinstance(e, dict) and isinstance(e.get('name'), str) and e['name'] for e in data
+        )
+        return [e['name'] for e in data] if shaped else None
 
     names = release_channels.collect_tags(fetch, want_stable=1)
     if names is None:
@@ -219,12 +215,11 @@ def latest_tag(repo, strict=False):
     return release_channels.newest_stable_tag(names)
 
 
-def cliff_tier(repo, strict=False):
+def cliff_tier(repo):
     """'alpha' when the newest stable tag is v0.x, else 'stable' (so an untagged
-    repo's first release bumps to v1.0.0). ClassifyError when the tags read fails;
-    `strict` is latest_tag's."""
+    repo's first release bumps to v1.0.0). ClassifyError when the tags read fails."""
     try:
-        tag = latest_tag(repo, strict)
+        tag = latest_tag(repo)
     except release_channels.TagListingTruncatedError as err:
         msg = f'tags listing of {repo} truncated ({err}); aborting rather than guessing the cliff tier'
         raise ClassifyError(msg) from None
@@ -243,7 +238,9 @@ def discover_repos():
     syncing our conventions into it rewrites code we do not own.
     """
     try:
-        repos = REST.pages('user/repos?affiliation=owner')
+        # sync.yaml's App installation token cannot read user/repos; the App is
+        # installed on every repository of the account.
+        repos = REST.pages('installation/repositories', key='repositories')
     except ghrest.RequestTimeoutError:
         sys.exit(124)  # what `timeout N gh ...` exits with under set -e
     except ghrest.ApiError as err:
@@ -265,32 +262,29 @@ def discover_repos():
 
 
 def classify(repo, ref='HEAD'):
-    """Profile the repo's surfaces and language from its tree at `ref`.
+    """Profile the repo's surfaces and language from its tree at `ref`, read once.
 
-    Calls, in order: the root tree, a recursive tree only for go.mod repos
-    without a root-level web dir, then a second recursive tree for the opt-in
-    markers. The cliff tier is read separately (cliff_tier).
+    A root check is an exact-path match against the recursive listing; the
+    cliff tier is read separately (cliff_tier).
     """
-    root = tree_paths(repo, '0', ref)
-    has_gomod = 'go.mod' in root
-    has_jsr = 'jsr.json' in root
-    has_pkg = 'package.json' in root
-    has_dockerfile = 'Dockerfile' in root
-    has_pyproject = 'pyproject.toml' in root
-    is_web = 'static-src' in root or 'web' in root
+    tree = tree_paths(repo, ref)
+    has_gomod = 'go.mod' in tree
+    has_jsr = 'jsr.json' in tree
+    has_pkg = 'package.json' in tree
+    has_dockerfile = 'Dockerfile' in tree
+    has_pyproject = 'pyproject.toml' in tree
+    is_web = 'static-src' in tree or 'web' in tree
 
     # Deeper web indicators: internal/server/static-src, a nested */web/* tree.
     if has_gomod and not is_web:
-        deep = tree_paths(repo, '1', ref)
-        is_web = any('static-src' in path or '/web/' in path for path in deep)
-    deep_tree = tree_paths(repo, '1', ref)
-    has_smoke = 'tests/image-smoke.conf' in deep_tree
+        is_web = any('static-src' in path or '/web/' in path for path in tree)
+    has_smoke = 'tests/image-smoke.conf' in tree
     # The same file shell-ci.yaml runs, so enrolment and execution cannot disagree.
-    has_shell_tests = 'tests/shell/run.sh' in deep_tree
+    has_shell_tests = 'tests/shell/run.sh' in tree
     # An artifact repo publishes from its own publish.yaml and still needs the
     # meta CI. A marker, not "not releaseable": a repo that releases nothing may
     # keep its own CI, which the sync must never overwrite.
-    has_publish = '.github/workflows/publish.yaml' in deep_tree
+    has_publish = '.github/workflows/publish.yaml' in tree
 
     if has_gomod:
         lang = 'go'
@@ -304,7 +298,7 @@ def classify(repo, ref='HEAD'):
         lang = 'none'
 
     return {
-        'readable': bool(root),
+        'readable': bool(tree),
         'lang': lang,
         'has_jsr': has_jsr,
         'has_pkg': has_pkg,
@@ -318,17 +312,24 @@ def classify(repo, ref='HEAD'):
 
 
 def log_profile(repo, profile, base=None):
-    line = (
-        f'  classified: {repo:<30} lang={profile["lang"]:<5} web={bool_str(profile["is_web"]):<5} '
-        f'cliff={profile["cliff_tier"]:<6} release={bool_str(profile["can_release"])}'
-    )
+    """One stderr line; only a two-branch row (`base`) can release, so only it
+    reports a cliff tier and the release flag."""
+    line = f'  classified: {repo:<30} lang={profile["lang"]:<5} web='
     if base:
-        line += f' base={base}' + ('' if profile['readable'] else ' (tree unreadable, skipped)')
+        line += (
+            f'{bool_str(profile["is_web"]):<5} cliff={profile["cliff_tier"]:<6}'
+            f' release={bool_str(profile["can_release"])} base={base}'
+            + ('' if profile['readable'] else ' (tree unreadable, skipped)')
+        )
+    else:
+        line += bool_str(profile['is_web'])
     print(line, file=sys.stderr)
 
 
-def assign(repo_names, profiles):
-    """{group key: repos} over `repo_names` (in order) and their profiles."""
+def assign(repo_names, profiles, releasing):
+    """{group key: repos} over `repo_names` (in order) and their profiles. Only a
+    `releasing` (two-branch) population gets the release and cliff groups, and
+    only its profiles carry a cliff_tier."""
     groups = {key: [] for key, _group in GROUPS}
     for repo in repo_names:
         profile = profiles[repo]
@@ -354,7 +355,7 @@ def assign(repo_names, profiles):
             groups['ci'].append(repo)
             # Its own publish.yaml owns the repo's Releases; a synced release.yaml
             # would cut code Releases marked latest over them.
-            if not profile['has_publish']:
+            if releasing and not profile['has_publish']:
                 groups['release'].append(repo)
         if lang == 'go':
             groups['golangci'].append(repo)
@@ -364,7 +365,10 @@ def assign(repo_names, profiles):
             groups['smoke'].append(repo)
         if profile['has_dockerfile']:
             groups['repin'].append(repo)
-        groups['cliff_stable' if profile['cliff_tier'] == 'stable' else 'cliff_alpha'].append(repo)
+        if releasing:
+            groups['cliff_stable' if profile['cliff_tier'] == 'stable' else 'cliff_alpha'].append(
+                repo
+            )
 
     # Go repos that also have a TS surface need the TS configs too; appended
     # after the pure-TS repos, in repo order.
@@ -392,6 +396,19 @@ def print_group(comment, repos, group, *, lead_blank=True, base=None):
     print(render_files(group))
 
 
+def profile_repo(repo):
+    """[(base, profile)] of one discovered repo: one row per base, each carrying
+    its cliff tier, for a two-branch repo; else one row with base None and no
+    tier. ClassifyError when a two-branch repo's tier cannot be read."""
+    name = repo['name']
+    if not release_channels.is_two_branch(repo):
+        return [(None, classify(name))]
+    found = [(base, classify(name, base)) for base in BASES]
+    tier = cliff_tier(name)
+    for _base, profile in found:
+        profile['cliff_tier'] = tier
+    return found
+
 def main():
     # Skip the ci repo itself (it is the sync source, never a target).
     repos = [repo for repo in discover_repos() if repo['name'] != 'ci']
@@ -400,32 +417,25 @@ def main():
     profiles = {}
     per_base = {base: {} for base in BASES}
     try:
-        for repo in repos:
+        for repo, found in fanout.ordered(repos, profile_repo):
             name = repo['name']
-            if release_channels.is_two_branch(repo):
-                found = {base: classify(name, base) for base in BASES}
-                tier = cliff_tier(name, strict=True)
-                for base, profile in found.items():
-                    profile['cliff_tier'] = tier
-                    log_profile(name, profile, base)
-                    if profile['readable']:
-                        per_base[base][name] = profile
-            else:
-                profile = classify(name)
-                profile['cliff_tier'] = cliff_tier(name)
-                log_profile(name, profile)
-                single.append(name)
-                profiles[name] = profile
+            for base, profile in found:
+                log_profile(name, profile, base)
+                if base is None:
+                    single.append(name)
+                    profiles[name] = profile
+                elif profile['readable']:
+                    per_base[base][name] = profile
     except ClassifyError as err:
         sys.exit(f'classify-repos: {err}')
 
     print(HEADER)
-    groups = assign(single, profiles)
+    groups = assign(single, profiles, releasing=False)
     for index, (key, group) in enumerate(GROUPS):
         print_group(group.comment, groups[key], group, lead_blank=index > 0)
     for base in BASES:
         names = sorted(per_base[base])
-        groups = assign(names, per_base[base])
+        groups = assign(names, per_base[base], releasing=True)
         groups['two_branch_renovate'] = names
         for key, group in GROUPS:
             print_group(f'{group.comment} (base: {base})', groups[key], group, base=base)

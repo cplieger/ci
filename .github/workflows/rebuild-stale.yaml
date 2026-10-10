@@ -66,12 +66,28 @@ jobs:
         with:
           persist-credentials: false
 
+      # The App token, scoped to the target repository: a pull request the
+      # workflow token opens or merges would start no CI or release run.
+      # Nothing here runs the target repo's code. sync.yaml documents the
+      # App's secrets.
+      - name: Mint the App token
+        if: ${{ !matrix.unreadable }}
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          owner: cplieger
+          repositories: ${{ matrix.repo }}
+          permission-checks: read
+          permission-contents: write
+          permission-metadata: read
+          permission-pull-requests: write
+
       - name: Open a rebuild pull request on cplieger/${{ matrix.repo }}
         if: ${{ !matrix.unreadable }}
         env:
-          # SYNC_PAT: the same concern as the sync PRs, a machine pull request
-          # into dev or main. Nothing here runs the target repo's code.
-          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           BASE: ${{ matrix.base }}
           CHANNEL: ${{ matrix.channel }}
         run: |

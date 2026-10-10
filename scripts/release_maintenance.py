@@ -4,7 +4,7 @@
 Subcommands, run in this order by release-maintenance.yaml, each with its own token:
 
     plan    reads every repository and writes the plan; it writes nothing else.
-    merge   (SYNC_PAT) merges the planned pull requests at the head the plan read,
+    merge   (App token) merges the planned pull requests at the head the plan read,
             and opens the planned rebuild pull requests.
     report  (CI_SCHEDULE) ticks the dashboards, syncs each `Release blocked` issue,
             and exits 1 when any read or write failed.
@@ -124,13 +124,19 @@ class GhError(Exception):
     """A gh call that failed; the message carries the API's or gh's error."""
 
 
+class RateLimitedError(GhError):
+    """A gh command GitHub refused under a rate limit, so it says nothing about the
+    pull request it was aimed at."""
+
+
 def gh_command(run, args: list[str]) -> bytes:
-    """A non-API `gh` command through `run` (ghrest's process contract); GhError
-    on a non-zero exit."""
+    """A non-API `gh` command through `run` (ghrest's process contract); on a non-zero
+    exit RateLimitedError for a rate-limit refusal, else GhError."""
     proc = run(args, None)
     if proc.returncode != 0:
         detail = proc.stderr.decode(errors='replace').strip() or f'exit {proc.returncode}'
-        raise GhError(f'gh {" ".join(args[:3])}: {" ".join(detail.split())}')
+        error = RateLimitedError if ghrest.refused_by_rate_limit(proc) else GhError
+        raise error(f'gh {" ".join(args[:3])}: {" ".join(detail.split())}')
     return proc.stdout
 
 
@@ -143,9 +149,9 @@ class Api:
     on reads; every API failure is a GhError. `run` also carries the non-API
     commands (`command`), so one fake answers both."""
 
-    def __init__(self, run=ghrest.run_process):
+    def __init__(self, run=ghrest.run_process, pause=None):
         self.run = run
-        self.rest = ghrest.Client(run=run)
+        self.rest = ghrest.Client(run=run, pause=pause)
 
     @staticmethod
     def _call(fn, *args):
@@ -184,7 +190,14 @@ class Api:
         return self._call(self.rest.pages, path, key, PER_PAGE, PAGE_CAP, stop)
 
     def command(self, args: list[str]) -> bytes:
-        return gh_command(self.run, args)
+        """gh_command through `run`; a paced `run` refusing to wait out a rate-limit
+        pause is a RateLimitedError, and gh failing to start is a GhError."""
+        try:
+            return gh_command(self.run, args)
+        except ghrest.ApiError as err:
+            raise (RateLimitedError if err.rate_limited else GhError)(str(err)) from None
+        except OSError as err:
+            raise GhError(f'gh {" ".join(args[:3])}: gh did not run: {err}') from None
 
 
 def ts(value: str) -> dt.datetime:
@@ -1090,8 +1103,9 @@ def merge_checked(
     `security-major` when `labels` is given; then, with `arm`, arms auto-merge pinned to
     that head. GitHub refuses to arm a pull request that is already mergeable, and a
     direct merge (a squash pinned to that head, then the head branch deleted) also needs
-    every latest `ci / validate` from GitHub Actions green there: `main`'s ruleset lets
-    the owner credential bypass the check."""
+    every latest `ci / validate` from GitHub Actions green there: the rulesets exempt an
+    admin credential from the check. An arm refused by a rate limit leaves it open,
+    unless a re-read finds it merged."""
     if base not in ('dev', 'main'):
         raise ValueError(f'base must be dev or main, got {base!r}')
     pr = api.get(f'repos/{OWNER}/{repo}/pulls/{number}')
@@ -1116,6 +1130,11 @@ def merge_checked(
         try:
             run([*args, '--auto', '--match-head-commit', at])
             return 'armed'
+        except RateLimitedError as exc:
+            # `gh pr merge` is several requests, and the refused one can follow the merge.
+            if api.get(f'repos/{OWNER}/{repo}/pulls/{number}').get('merged_at'):
+                return 'merged'
+            return f'not merged: auto-merge was refused by a rate limit ({exc})'
         except GhError as exc:
             refused = f'auto-merge refused ({exc}) and '
     if not validate_green(api, repo, at):
@@ -1130,21 +1149,26 @@ def merge_checked(
     return 'merged'
 
 
-def cmd_merge_checked(args, api: Api) -> int:
+def report_merge_checked(
+    api: Api, repo: str, number: int, *, base: str, head: str = '', head_prefix: str = ''
+) -> bool:
+    """merge_checked through `api`, printing its one-line result; whether it armed or
+    merged the pull request."""
     try:
         result = merge_checked(
-            api,
-            args.repo,
-            args.number,
-            api.command,
-            base=args.base,
-            head=args.head,
-            head_prefix=args.head_prefix,
+            api, repo, number, api.command, base=base, head=head, head_prefix=head_prefix
         )
     except (GhError, *SHAPE_ERRORS) as exc:
         result = f'failed: {exc}'
-    print(f'cplieger/{args.repo}#{args.number}: {result}')
-    return 0 if result in ('armed', 'merged') else 1
+    print(f'cplieger/{repo}#{number}: {result}')
+    return result in ('armed', 'merged')
+
+
+def cmd_merge_checked(args, api: Api) -> int:
+    ok = report_merge_checked(
+        api, args.repo, args.number, base=args.base, head=args.head, head_prefix=args.head_prefix
+    )
+    return 0 if ok else 1
 
 
 def open_rebuild(repo: str, reason: str, run_script) -> str:

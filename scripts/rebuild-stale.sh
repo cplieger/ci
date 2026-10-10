@@ -76,8 +76,8 @@ open_pr() { # <repo> <base> <reason>
     ;;
   esac
   # The pull request is armed, or merged once GitHub refuses to arm a merge-ready one,
-  # only after a fresh read of its base and head: main's ruleset lets this owner
-  # credential bypass ci / validate, and a retargeted dev pull request would cross it.
+  # only after a fresh read of its base and head: a dev pull request retargeted to main
+  # must not merge there, and the rulesets exempt an admin credential from ci / validate.
   # One refused fails the run, so the tracker issue names it; the next run finds it
   # open and asks again instead of leaving it by hand.
   request_merge() { # <pr url>
@@ -87,7 +87,8 @@ open_pr() { # <repo> <base> <reason>
     return 1
   }
   # A fork's branch can carry any name, so only this repository's own heads count.
-  # Newest first, over REST: the GraphQL quota is shared by every token of the owner.
+  # Newest first, over REST: the App installation's GraphQL quota is shared with
+  # Renovate, which runs as the same App.
   open=$(gh api --paginate "repos/cplieger/${repo}/pulls?state=open&base=${base}&sort=created&direction=desc&per_page=100" \
     --jq ".[] | select(.head.repo.full_name == \"cplieger/${repo}\" and (.head.ref | startswith(\"rebuild/${base}-\"))) | .html_url")
   open=${open%%$'\n'*}

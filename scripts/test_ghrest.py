@@ -190,6 +190,22 @@ class RateLimit(unittest.TestCase):
         self.assertEqual(c.get('p'), {})
         self.assertEqual(sleeps, [ghrest.SECONDARY_WAIT])
 
+    def test_a_persisting_secondary_limit_without_timing_waits_twice_as_long_each_time(self):
+        limited = reply(403, {'message': 'You have exceeded a secondary rate limit.'})
+        paused = []
+        c, run, sleeps = client(limited, limited, limited, limited, pause=paused.append)
+        with self.assertRaises(ghrest.ApiError) as caught:
+            c.get('p')
+        wait = ghrest.SECONDARY_WAIT
+        self.assertEqual((len(run.calls), sleeps), (4, [wait, 2 * wait, 4 * wait]))
+        self.assertEqual(paused, [wait, 2 * wait, 4 * wait, 8 * wait])
+        self.assertIn(ghrest.utc(NOW + 8 * wait), str(caught.exception))
+        # Timing headers name the wait themselves, however many refusals came first.
+        timed = reply(429, {'message': 'x'}, {'Retry-After': '5'})
+        c, _, sleeps = client(limited, timed, reply(200, {}))
+        self.assertEqual(c.get('p'), {})
+        self.assertEqual(sleeps, [wait, 5])
+
     def test_a_rate_limited_post_is_retried(self):
         limited = reply(403, {'message': 'x'}, {'Retry-After': '3'})
         c, run, sleeps = client(limited, reply(201, {'number': 9}))
@@ -202,6 +218,34 @@ class RateLimit(unittest.TestCase):
         with self.assertRaises(ghrest.ApiError):
             c.get('p')
         self.assertEqual((len(run.calls), sleeps), (2, [400]))
+
+    def test_each_wait_is_reported_to_pause_before_it_is_taken(self):
+        events = []
+        limited = reply(429, {'message': 'x'}, {'Retry-After': '5'})
+        run = Script(limited, reply(200, {}))
+        c = ghrest.Client(
+            run=run,
+            sleep=lambda s: events.append(('sleep', s)),
+            now=lambda: NOW,
+            pause=lambda s: events.append(('pause', s)),
+        )
+        self.assertEqual(c.get('p'), {})
+        self.assertEqual(events, [('pause', 5), ('sleep', 5)])
+
+    def test_a_refusal_the_call_gives_up_on_is_still_reported_to_pause(self):
+        over_cap = reply(429, {'message': 'x'}, {'Retry-After': '700'})
+        last = reply(429, {'message': 'x'}, {'Retry-After': '30'})
+        for name, replies, tries, want in (
+            ('over the cap', [over_cap], 4, [700]),
+            ('the last attempt', [last], 1, [30]),
+        ):
+            with self.subTest(name):
+                paused = []
+                c, run, sleeps = client(*replies, pause=paused.append, tries=tries)
+                with self.assertRaises(ghrest.ApiError) as caught:
+                    c.get('p')
+                self.assertTrue(caught.exception.rate_limited)
+                self.assertEqual((paused, sleeps, len(run.calls)), (want, [], 1))
 
 
 class Pages(unittest.TestCase):

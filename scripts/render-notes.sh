@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Renders one released lane's notes for release.yaml and docker-release.yaml:
-#   --release-model legacy|two-branch --site docker|go|ts|lane --version V --out FILE
-#   [--release-commit SHA] [--lane DIR] [--go-lanes JSON] [--finalize] [--release-needed]
-#   [--latest TAG] [--kind-note TEXT] [--repo OWNER/NAME] [--sbom-prev F --sbom-new F]
+#   --site docker|go|ts|lane --version V --release-commit SHA --repo OWNER/NAME --out FILE
+#   [--lane DIR] [--go-lanes JSON] [--kind-note TEXT] [--sbom-prev F --sbom-new F]
 #   [--security-shas F] [--inventory PATH] [--config FILE]; --print-previous, without --out,
-#   prints the lane's previous stable tag by version (two-branch's range start) and stops.
-# legacy runs each site's main-default git-cliff line; two-branch renders previous..--release-commit
-# plus the dependency and package diffs. git-cliff executes the repo's cliff config: no token here.
+#   prints the lane's previous stable tag by version (the range start) and stops.
+# The notes cover previous..--release-commit plus the dependency and package diffs.
+# git-cliff executes the repo's cliff config: no token here.
 set -euo pipefail
 
 die() {
@@ -14,26 +13,22 @@ die() {
   exit 2
 }
 
-MODEL="" SITE="" VERSION="" OUT="" COMMIT="" LANE="" GO_LANES_JSON="[]"
-FINALIZE=false RELEASE_NEEDED=false PRINT_PREVIOUS=false LATEST="" KIND_NOTE="" REPO=""
+SITE="" VERSION="" OUT="" COMMIT="" LANE="" GO_LANES_JSON="[]"
+PRINT_PREVIOUS=false KIND_NOTE="" REPO=""
 SBOM_PREV="" SBOM_NEW="" SECURITY_SHAS="" CONFIG=""
 INVENTORY="$(dirname "$0")/inventory.py"
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --finalize) FINALIZE=true ;;
-    --release-needed) RELEASE_NEEDED=true ;;
     --print-previous) PRINT_PREVIOUS=true ;;
-    --release-model | --site | --version | --out | --release-commit | --lane | --go-lanes | --latest | --kind-note | --repo | --sbom-prev | --sbom-new | --security-shas | --inventory | --config)
+    --site | --version | --out | --release-commit | --lane | --go-lanes | --kind-note | --repo | --sbom-prev | --sbom-new | --security-shas | --inventory | --config)
       [ "$#" -ge 2 ] || die "$1 needs a value"
       case "$1" in
-        --release-model) MODEL=$2 ;;
         --site) SITE=$2 ;;
         --version) VERSION=$2 ;;
         --out) OUT=$2 ;;
         --release-commit) COMMIT=$2 ;;
         --lane) LANE=$2 ;;
         --go-lanes) GO_LANES_JSON=${2:-[]} ;;
-        --latest) LATEST=$2 ;;
         --kind-note) KIND_NOTE=$2 ;;
         --repo) REPO=$2 ;;
         --sbom-prev) SBOM_PREV=$2 ;;
@@ -49,7 +44,6 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-case "$MODEL" in legacy | two-branch) ;; *) die "--release-model must be legacy or two-branch, got '${MODEL}'" ;; esac
 case "$SITE" in docker | go | ts | lane) ;; *) die "--site must be docker, go, ts or lane, got '${SITE}'" ;; esac
 [ -n "$VERSION" ] || die "--version is required"
 [ -n "$OUT" ] || [ "$PRINT_PREVIOUS" = true ] || die "--out is required"
@@ -88,37 +82,6 @@ else
     SCOPE_ARGS+=(--exclude-path "$d/**")
   done < <(jq -r '.[]' <<<"$GO_LANES_JSON")
 fi
-
-legacy() {
-  if [ -n "$COMMIT" ] && [ "$(git rev-parse --verify "${COMMIT}^{commit}")" != "$(git rev-parse HEAD)" ]; then
-    die "legacy renders HEAD, and --release-commit ${COMMIT} is not HEAD"
-  fi
-  local args=(--tag-pattern "$PATTERN" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}")
-  # --unreleased --tag names the commits since the last tag $VERSION, whose tag
-  # does not exist yet; in finalize mode the tag already sits at HEAD, so those
-  # commits are the CURRENT release (cliff probe states K/L).
-  if [ "$FINALIZE" = true ]; then
-    "$CLIFF" --current "${args[@]}" --strip header >"$OUT"
-  elif [ "$SITE" = docker ]; then
-    "$CLIFF" --unreleased --tag "$VERSION" "${args[@]}" --strip header >"$OUT" || echo "Release ${VERSION}" >"$OUT"
-  else
-    "$CLIFF" --unreleased --tag "$VERSION" "${args[@]}" --strip header >"$OUT"
-  fi
-  # git-cliff drops a commit that changes no file, so an image release made of a
-  # forced base-package rebuild alone renders nothing.
-  if [ "$SITE" = docker ] && [ "$RELEASE_NEEDED" = true ] && [ -z "$(tr -d '[:space:]' <"$OUT")" ]; then
-    local range=HEAD
-    [ -z "$LATEST" ] || range="${LATEST}..HEAD"
-    {
-      echo "### Changes"
-      echo ""
-      git log --no-merges --format='- %s' "$range"
-    } >"$OUT"
-  fi
-  if [ -n "$KIND_NOTE" ]; then
-    printf '\n%s\n' "$KIND_NOTE" >>"$OUT"
-  fi
-}
 
 version_key() { # X.Y.Z -> fixed-width sortable key
   local IFS=. parts
@@ -168,9 +131,9 @@ def entries: roots as $r
     + ")</summary>\n\n" + (map(.line) | join("\n")) + "\n\n</details>"
   end'
 
-two_branch() {
-  [ -n "$COMMIT" ] || die "two-branch needs --release-commit"
-  [ -n "$REPO" ] || die "two-branch needs --repo"
+render() {
+  [ -n "$COMMIT" ] || die "--release-commit is required"
+  [ -n "$REPO" ] || die "--repo is required"
   printf '%s' "$VERSION" | grep -Eq "$PATTERN" || die "--version ${VERSION} is not a stable version of this lane"
   if [ "$SITE" != docker ] && [ -n "${SBOM_PREV}${SBOM_NEW}" ]; then
     die "--sbom-prev/--sbom-new are only valid with --site docker"
@@ -180,6 +143,8 @@ two_branch() {
   prev=$(previous_stable_tag)
   range=$commit
   [ -z "$prev" ] || range="${prev}..${commit}"
+  # A consumer's synced cliff.toml can predate the unconditional sectioned body
+  # and still select it only under CLIFF_NOTES_MODE=v3.
   changes=$(CLIFF_NOTES_MODE=v3 "$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" --strip header "$range")
   if [ -n "$prev" ]; then
     changes+=$'\n\n'"**Full changelog**: https://github.com/${REPO}/compare/${prev}...${VERSION}"
@@ -209,8 +174,6 @@ if [ "$PRINT_PREVIOUS" = true ]; then
   printf '%s' "$VERSION" | grep -Eq "$PATTERN" || die "--version ${VERSION} is not a stable version of this lane"
   previous_stable_tag
   echo
-elif [ "$MODEL" = legacy ]; then
-  legacy
 else
-  two_branch
+  render
 fi

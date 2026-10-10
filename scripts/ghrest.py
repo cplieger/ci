@@ -3,9 +3,10 @@
 Every outcome is read from the response `gh api -i` prints, on a non-2xx exit too:
 - 2xx returns; 404 raises NotFoundError; any other status raises ApiError.
 - A 429, or a 403 that is a rate limit, waits for `retry-after` or `x-ratelimit-reset`
-  (a minute with neither) while the call's total wait stays within `max_wait`, then
-  raises naming the UTC time the limit lifts. `GET /rate_limit` is never read: it
-  misreports the GraphQL pool.
+  (secondary_wait with neither) while the call's total wait stays within `max_wait`, then
+  raises naming the UTC time the limit lifts. A Client given `pause` reports every
+  rate-limit refusal there, one it gives up on too, so the threads sharing a Pacer
+  hold as well. `GET /rate_limit` is never read: it misreports the GraphQL pool.
 - A 5xx or a transport failure backs off 2, 4, 8 s for GET, PUT, PATCH and DELETE. A
   POST is retried only after a rate-limit refusal: a failed POST may have been applied.
 
@@ -17,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
 import time
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
@@ -26,6 +28,15 @@ IDEMPOTENT = frozenset({'GET', 'PUT', 'PATCH', 'DELETE'})
 # GitHub's rule when neither retry-after nor an exhausted primary limit says how
 # long: https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#exceeding-the-rate-limit
 SECONDARY_WAIT = 60
+
+
+def secondary_wait(refusals: int) -> int:
+    """Seconds to wait out a rate-limit refusal that names no time, after `refusals`
+    earlier refusals of the same call: GitHub asks for an exponentially increasing wait
+    while the limit persists:
+    https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#handle-rate-limit-errors-appropriately
+    """
+    return SECONDARY_WAIT * 2**refusals
 
 
 class ApiError(Exception):
@@ -62,6 +73,89 @@ def run_process(args, stdin=None, timeout=None) -> subprocess.CompletedProcess:
     return subprocess.run(
         ['gh', *args], input=stdin, capture_output=True, timeout=timeout, check=False
     )
+
+
+def is_write(args) -> bool:
+    """Whether a `gh <args>` call may write: an `api` call with a `-X` other than GET,
+    or any command that is not `api` (`gh pr merge` is one)."""
+    if args[:1] != ['api']:
+        return True
+    return '-X' in args and args[args.index('-X') + 1] != 'GET'
+
+
+def refused_by_rate_limit(proc) -> bool:
+    """Whether a failed non-API gh command (`gh pr merge`) was refused by a rate limit.
+    gh prints GitHub's message but none of its headers, so the message is all there is."""
+    err = proc.stderr if isinstance(proc.stderr, str) else (proc.stderr or b'').decode()
+    return proc.returncode != 0 and 'rate limit' in err.lower()
+
+
+class Pacer:
+    """Admission for the gh calls of every thread sharing it: writes start at least
+    `gap` seconds apart (0: no wait), and no call starts while a rate-limit `pause`
+    runs. GitHub asks for a second between mutating requests, and for no requests
+    until a limit lifts:
+    https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api
+    A call that would wait out more than `max_wait` of pause raises a rate-limited
+    ApiError instead, sending nothing.
+    """
+
+    def __init__(self, gap=0.0, sleep=time.sleep, clock=time.monotonic, max_wait=600):
+        self.gap, self.sleep, self.clock, self.max_wait = gap, sleep, clock, max_wait
+        # Held across a write's sleep, so writers queue; reads never take it.
+        self._writes = threading.Lock()
+        self._lock = threading.Lock()
+        self._next = 0.0
+        self._resume = 0.0
+
+    def pause(self, seconds) -> None:
+        """Hold every call for `seconds` from now, or until a longer pause ends."""
+        with self._lock:
+            self._resume = max(self._resume, self.clock() + seconds)
+
+    def _left(self, until) -> float:
+        with self._lock:
+            now = self.clock()
+            held = self._resume - now
+            if held > self.max_wait:
+                raise ApiError(
+                    None,
+                    f'every call is rate limited until {utc(time.time() + held)}',
+                    rate_limited=True,
+                    wait=held,
+                )
+            return max(until, self._resume) - now
+
+    def wait(self, write=True) -> None:
+        if not write:
+            while (left := self._left(0.0)) > 0:
+                self.sleep(left)
+            return
+        with self._writes:
+            while (left := self._left(self._next)) > 0:
+                self.sleep(left)
+            # From the clock, not the slot slept toward: a late wake still leaves
+            # the next writer a full gap.
+            self._next = self.clock() + self.gap
+
+
+def paced(run, pacer: Pacer, tries=3):
+    """`run` (run_process's contract) admitted by `pacer`, a write as a write; raises
+    the pacer's ApiError. A non-API command refused by a rate limit pauses `pacer` for
+    secondary_wait and is tried again, `tries` times in all; the last refusal is
+    returned, its pause still published. A retry repeats no write: `gh pr merge`, the one
+    command sent here, exits 0 on a pull request an earlier attempt already merged."""
+
+    def call(args, stdin=None, timeout=None):
+        for refusals in range(tries):
+            pacer.wait(is_write(args))
+            proc = run(args, stdin, timeout)
+            if args[:1] == ['api'] or not refused_by_rate_limit(proc):
+                return proc
+            pacer.pause(secondary_wait(refusals))
+        return proc
+
+    return call
 
 
 def parse(out: bytes) -> Response | None:
@@ -101,10 +195,17 @@ def error_detail(resp: Response) -> str:
 
 class Client:
     def __init__(
-        self, run=None, sleep=time.sleep, now=time.time, max_wait=600, tries=4, timeout=None
+        self,
+        run=None,
+        sleep=time.sleep,
+        now=time.time,
+        max_wait=600,
+        tries=4,
+        timeout=None,
+        pause=None,
     ):
         self.run = run or run_process
-        self.sleep, self.now = sleep, now
+        self.sleep, self.now, self.pause = sleep, now, pause
         self.max_wait, self.tries, self.timeout = max_wait, tries, timeout
 
     def request(self, method: str, path: str, body=None, headers=()) -> Response:
@@ -119,13 +220,17 @@ class Client:
         if body is not None:
             args += ['--input', '-']
             stdin = json.dumps(body).encode()
-        waited, backoff = 0, 2
+        waited, backoff, refusals = 0, 2, 0
         for attempt in range(1, self.tries + 1):
             try:
-                return self._once(method, path, args, stdin)
+                return self._once(method, path, args, stdin, refusals)
             except NotFoundError:
                 raise
             except ApiError as err:
+                # Before the raises below: a refusal this call gives up on still holds
+                # the other threads until GitHub's cooldown ends.
+                if err.rate_limited and self.pause is not None:
+                    self.pause(err.wait)
                 if attempt == self.tries:
                     raise
                 if err.rate_limited:
@@ -137,6 +242,7 @@ class Client:
                             rate_limited=True,
                         ) from None
                     waited += err.wait
+                    refusals += 1
                     self.sleep(err.wait)
                 elif method in IDEMPOTENT and (err.status is None or err.status >= 500):
                     self.sleep(backoff)
@@ -145,7 +251,7 @@ class Client:
                     raise
         raise AssertionError('unreachable')
 
-    def _once(self, method, path, args, stdin) -> Response:
+    def _once(self, method, path, args, stdin, refusals) -> Response:
         try:
             proc = self.run(args, stdin, self.timeout)
         except subprocess.TimeoutExpired:
@@ -174,7 +280,7 @@ class Client:
                 or 'rate limit' in detail.lower()
             )
         ):
-            wait, reset = self._rate_wait(resp.headers)
+            wait, reset = self._rate_wait(resp.headers, refusals)
             raise ApiError(
                 resp.status,
                 f'{where} rate limited until {utc(reset)}',
@@ -184,8 +290,9 @@ class Client:
             )
         raise ApiError(resp.status, f'{where} {detail}'.rstrip())
 
-    def _rate_wait(self, headers) -> tuple[int, int]:
-        """(seconds to wait, epoch second the limit lifts) from the refusal's headers."""
+    def _rate_wait(self, headers, refusals) -> tuple[int, int]:
+        """(seconds to wait, epoch second the limit lifts) from the refusal's headers;
+        `refusals` is how many of this call's earlier attempts were refused."""
         now = int(self.now())
         after = headers.get('retry-after', '')
         if after.isdigit():
@@ -193,7 +300,8 @@ class Client:
         reset = headers.get('x-ratelimit-reset', '')
         if headers.get('x-ratelimit-remaining') == '0' and reset.isdigit():
             return max(int(reset) - now, 1), int(reset)
-        return SECONDARY_WAIT, now + SECONDARY_WAIT
+        wait = secondary_wait(refusals)
+        return wait, now + wait
 
     def json_of(self, method: str, path: str, resp: Response) -> Any:
         if not resp.body.strip():

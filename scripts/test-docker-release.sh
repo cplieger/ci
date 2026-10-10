@@ -52,6 +52,7 @@ wf, release, out = sys.argv[1], sys.argv[2], sys.argv[3]
 jobs = yaml.safe_load(open(wf))["jobs"]
 rjobs = yaml.safe_load(open(release))["jobs"]
 wanted = {
+    "caller": {"Refuse a caller outside the two-branch model": "caller.sh"},
     "prepare": {
         "Derive version tags": "derive.sh",
         "Verify root module path": "modpath.sh",
@@ -105,6 +106,11 @@ gates = {
     "receipt-step-ifs": [s.get("if", "") for s in jobs["receipt"]["steps"]],
     "vp-perms": jobs["verify-publish"].get("permissions"),
     "prepare-if": str(jobs["prepare"].get("if", "")),
+    "prepare-needs": jobs["prepare"].get("needs"),
+    "caller-if": str(jobs["caller"].get("if", "")),
+    "caller-needs": jobs["caller"].get("needs"),
+    "caller-perms": jobs["caller"].get("permissions"),
+    "caller-steps": names("caller"),
     "ra-if": str(jobs["repair-assets"].get("if", "")),
     "ra-needs": jobs["repair-assets"].get("needs"),
     "ra-perms": jobs["repair-assets"].get("permissions"),
@@ -116,7 +122,6 @@ gates = {
     "released": jobs["finalize"]["outputs"].get("released"),
     "inputs": sorted(wf_inputs),
     "jobs": sorted(jobs),
-    "model-default": wf_inputs["release-model"]["default"],
     "soak": wf_text.lower().count("soak"),
     "token-env": sorted(
         k for s in jobs["finalize"]["steps"]
@@ -125,22 +130,30 @@ gates = {
     ),
 }
 import json
-# Which jobs a repair call starts: prepare is skipped, and a job runs only if its
-# condition survives that, read as the runner would for the shapes used here.
-skipped = {"prepare"}
-for name, job in jobs.items():
-    if name == "prepare":
-        continue
-    cond = " ".join(str(job.get("if", "")).split())
-    needs = job.get("needs") or []
-    needs = [needs] if isinstance(needs, str) else needs
-    if "always()" not in cond and "cancelled()" not in cond:
-        hit = any(n in skipped for n in needs)
-    else:
-        hit = any(f"needs.{n}.result == 'success'" in cond for n in skipped)
-    if hit or cond == "${{ inputs.repair-tag == '' }}":
-        skipped.add(name)
-gates["repair-call-runs"] = [n for n in jobs if n not in skipped]
+# Which jobs a call starts, in either mode and with the given jobs failing: a
+# job runs only if its condition survives the jobs that did not succeed, read
+# as the runner would for the shapes used here (jobs are listed after their needs).
+def call_runs(repair, failed=()):
+    other_mode = "${{ inputs.repair-tag == '' }}" if repair else "${{ inputs.repair-tag != '' }}"
+    down, ran = set(), []
+    for name, job in jobs.items():
+        cond = " ".join(str(job.get("if", "")).split())
+        needs = job.get("needs") or []
+        needs = [needs] if isinstance(needs, str) else needs
+        if "always()" not in cond and "cancelled()" not in cond:
+            hit = any(n in down for n in needs)
+        else:
+            hit = any(f"needs.{n}.result == 'success'" in cond for n in down)
+        if hit or cond == other_mode:
+            down.add(name)
+            continue
+        ran.append(name)
+        if name in failed:
+            down.add(name)
+    return ran
+gates["repair-call-runs"] = call_runs(True)
+gates["repair-call-runs-refused"] = call_runs(True, {"caller"})
+gates["release-call-runs-refused"] = call_runs(False, {"caller"})
 gates["sarif-if"] = step_if("finalize", "Upload Trivy SARIF")
 gates["build-steps"] = names("build")
 # Every registry login on the release path, both workflows.
@@ -178,7 +191,7 @@ template = yaml.safe_load(open(release.replace("workflows/release.yaml", "workfl
 perms["template/release"] = sorted(template["jobs"]["release"].get("permissions") or {})
 open(f"{out}/statuses-scope.txt", "w").write("".join(f"{job}={'statuses' in p}\n" for job, p in sorted(perms.items())))
 # The release decision: a subpackage-only change releases on both channels
-# through the root tag job; only two-branch builds the image for it (D-R10).
+# through the root tag job and builds the image for it (D-R10).
 for name, fname in (("Detect changed paths", "changes.sh"), ("Select version", "select.sh")):
     step = next(s for s in rjobs["detect"]["steps"] if s.get("name") == name)
     open(f"{out}/{fname}", "w").write(step["run"])
@@ -200,17 +213,16 @@ def ghx(expr, o):
 
 
 cases = {}
-for model in ("legacy", "two-branch"):
-    for channel in ("dev", "stable"):
-        for name, release, root, subs in (
-            ("sub", "true", "false", '["web"]'),
-            ("root", "true", "true", "[]"),
-            ("none", "false", "false", "[]"),
-        ):
-            o = {"type": "docker", "channel": channel, "release": release, "root_changed": root,
-                 "subpackages_to_publish": subs, "release_model": model}
-            d = rjobs["docker"]
-            cases[f"{model}/{channel}/{name}"] = f"{bool(ghx(d['if'], o))}|{ghx(d['with']['release-needed'], o)}"
+for channel in ("dev", "stable"):
+    for name, release, root, subs in (
+        ("sub", "true", "false", '["web"]'),
+        ("root", "true", "true", "[]"),
+        ("none", "false", "false", "[]"),
+    ):
+        o = {"type": "docker", "channel": channel, "release": release, "root_changed": root,
+             "subpackages_to_publish": subs}
+        d = rjobs["docker"]
+        cases[f"{channel}/{name}"] = f"{bool(ghx(d['if'], o))}|{ghx(d['with']['release-needed'], o)}"
 json.dump(cases, open(f"{out}/docker-gate.json", "w"))
 PY
 
@@ -219,9 +231,11 @@ for f in derive modpath promote buildargs; do
   chk "D-P2 $f is strict-mode" "$(head -1 "$WORK/$f.sh")" "set -euo pipefail"
   chk "D-P3 $f parses under bash" "$(bash -n "$WORK/$f.sh" 2>/dev/null && echo ok || echo bad)" "ok"
 done
-chk "D-P4 derive reads the five inputs" "$(tr '\n' ' ' <"$WORK/derive.sh.env")" \
-  "CHANNEL DEV_VERSION FINALIZE RELEASE_NEEDED VERSION_INPUT "
-chk "D-P5 promote reads the exclusion list, the model and the subpackages" "$(tr '\n' ' ' <"$WORK/promote.sh.env")" "CI_TOOLS EXCLUDE_RE RELEASE_MODEL SUBPACKAGES_JSON "
+chk "D-P4 derive reads the four inputs" "$(tr '\n' ' ' <"$WORK/derive.sh.env")" \
+  "CHANNEL DEV_VERSION RELEASE_NEEDED VERSION_INPUT "
+chk "D-P4 the caller check reads the event's repository alone" "$(cat "$WORK/caller.sh.envmap" | tr '\n' ' ')" \
+  'DEFAULT_BRANCH=${{ github.event.repository.default_branch }} REPO_FORK=${{ github.event.repository.fork }} REPO_PRIVATE=${{ github.event.repository.private }} '
+chk "D-P5 promote reads the exclusion list and the subpackages" "$(tr '\n' ' ' <"$WORK/promote.sh.env")" "CI_TOOLS EXCLUDE_RE SUBPACKAGES_JSON "
 chk "D-P5 the subpackages are the caller's declared list" "$(sed -n 's/^SUBPACKAGES_JSON=//p' "$WORK/promote.sh.envmap")" '${{ inputs.subpackages }}'
 chk_has "D-P5 promote runs the shared digest resolver" "$(cat "$WORK/promote.sh")" 'bash "$CI_TOOLS/promote-digest.sh" "$GITHUB_SHA"'
 chk "D-P6 build args read the channel tag" "$(tr '\n' ' ' <"$WORK/buildargs.sh.env")" "DOCKERFILE TAG "
@@ -235,12 +249,11 @@ chk "D-P7 BUILD_VERSION is fed from the channel tag" \
 gate() { jq -r "$1" "$WORK/gates.json"; }
 chk_has "D-P8 no metadata for a promoted digest" "$(gate '."meta-if"')" "steps.promote.outputs.promote_digest == ''"
 chk_has "D-P8 no build for a promoted digest" "$(gate '."build-if"')" "needs.prepare.outputs.promote_digest == ''"
-chk "D-P8 cosign reaches the digest walk on two-branch stable publishes only, before it runs" \
+chk "D-P8 cosign reaches the digest walk on stable publishes only, before it runs" \
   "$(gate '."prepare-cosign-if"')|$(gate '."prepare-cosign-order"')" \
-  "\${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' && inputs.release-model == 'two-branch' }}|true"
-chk "D-P9 the model defaults to legacy" "$(gate '."model-default"')" "legacy"
-chk "D-P9 the inputs carry the kind line, the model and the security merges, no promotion note" \
-  "$(gate '.inputs | map(select(test("note|model|security"))) | join(" ")')" "release-kind-note release-model security-shas"
+  "\${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' }}|true"
+chk "D-P9 the inputs carry the kind line and the security merges, no promotion note" \
+  "$(gate '.inputs | map(select(test("note|security"))) | join(" ")')" "release-kind-note security-shas"
 chk "D-P10 the workflow says nothing of a soak" "$(gate '.soak')" "0"
 
 # ── Stub curl: the anonymous GHCR token and manifest HEADs ───────────────────
@@ -362,7 +375,7 @@ out() { # <key> -> value from GITHUB_OUTPUT
 }
 
 # ── Derive version tags ──────────────────────────────────────────────────────
-export CHANNEL=dev VERSION_INPUT=v1.3.0 DEV_VERSION=v1.3.0-dev.4 RELEASE_NEEDED=true FINALIZE=false
+export CHANNEL=dev VERSION_INPUT=v1.3.0 DEV_VERSION=v1.3.0-dev.4 RELEASE_NEEDED=true
 run_step derive.sh >/dev/null
 chk "D-V1 dev tag is the dev version" "$(out tag)" "v1.3.0-dev.4"
 chk "D-V2 dev publishes when a version is due" "$(out publish)" "true"
@@ -373,14 +386,11 @@ chk "D-V4 dev rerun at a tagged commit publishes nothing" "$(out publish)" "fals
 DEV_VERSION=""
 RELEASE_NEEDED=true
 chk_has "D-V5 dev without dev-version refuses" "$(run_step derive.sh)" "EXIT=1"
-export CHANNEL=stable DEV_VERSION="" RELEASE_NEEDED=false FINALIZE=false
+export CHANNEL=stable DEV_VERSION="" RELEASE_NEEDED=false
 run_step derive.sh >/dev/null
 chk "D-V6 stable tag is the stable version" "$(out tag)" "v1.3.0"
 chk "D-V7 stable publishes nothing without a release" "$(out publish)" "false"
-FINALIZE=true
-run_step derive.sh >/dev/null
-chk "D-V8 stable finalize republishes" "$(out publish)" "true"
-FINALIZE=false RELEASE_NEEDED=true
+RELEASE_NEEDED=true
 run_step derive.sh >/dev/null
 chk "D-V9 stable release publishes" "$(out publish)" "true"
 chk_has "D-V9 stable meta tags carry latest" "$(sed -n '/^meta_tags<<EOF$/,/^EOF$/p' "$WORK/out")" "type=raw,value=latest"
@@ -390,13 +400,44 @@ chk_has "D-V10 an unknown channel refuses" "$(run_step derive.sh)" "EXIT=1"
 # org.opencontainers.image.version, so a build from source is labelled with
 # its version on either channel, never with `sha-<commit>`.
 top_rule() { sed -n '/^meta_tags<<EOF$/,/^EOF$/p' "$WORK/out" | grep -o 'type=[^,]*,[^,]*,priority=[0-9]*' | awk -F',priority=' '$2 + 0 > max { max = $2 + 0; rule = $1 } END { print rule }'; }
-export CHANNEL=stable DEV_VERSION="" RELEASE_NEEDED=true FINALIZE=false
+export CHANNEL=stable DEV_VERSION="" RELEASE_NEEDED=true
 run_step derive.sh >/dev/null
 chk "D-V11 the stable version tag has the highest priority" "$(top_rule)" "type=raw,value=v1.3.0"
 export CHANNEL=dev DEV_VERSION=v1.3.0-dev.4
 run_step derive.sh >/dev/null
 chk "D-V11 the dev version tag has the highest priority" "$(top_rule)" "type=raw,value=v1.3.0-dev.4"
-unset CHANNEL VERSION_INPUT DEV_VERSION RELEASE_NEEDED FINALIZE
+unset CHANNEL VERSION_INPUT DEV_VERSION RELEASE_NEEDED
+
+# ── The caller check, ahead of both modes ────────────────────────────────────
+caller_refused() { # <default branch> <private> <fork>
+  local said
+  said=$(DEFAULT_BRANCH=$1 REPO_PRIVATE=$2 REPO_FORK=$3 run_step caller.sh)
+  chk_has "D-V12 a caller with default branch '$1', private $2, fork $3 is refused" "$said" \
+    "::error::docker-release.yaml publishes only from a public, non-fork repository whose default branch is dev (this one: default branch ${1:-<unknown>}, private $2, fork $3)"
+  chk "D-V12 failing the step, having written no output" "$(tail -n1 <<<"$said")|$(wc -c <"$WORK/out" | tr -d ' ')" "EXIT=1|0"
+}
+caller_refused main false false
+caller_refused master false false
+caller_refused dev true false
+caller_refused dev false true
+caller_refused "" false false
+for ref in refs/heads/dev refs/heads/main; do
+  chk "D-V12 a public, non-fork caller whose default branch is dev passes on $ref" \
+    "$(GITHUB_REF=$ref DEFAULT_BRANCH=dev REPO_PRIVATE=false REPO_FORK=false run_step caller.sh)" ""
+done
+for ref in refs/heads/feature/probe refs/tags/v1.2.3 refs/pull/7/merge ""; do
+  said=$(GITHUB_REF=$ref DEFAULT_BRANCH=dev REPO_PRIVATE=false REPO_FORK=false run_step caller.sh)
+  chk_has "D-V12 a run on '${ref:-<unset>}' is refused" "$said" \
+    "::error::docker-release.yaml publishes only from refs/heads/dev or refs/heads/main, not ${ref:-<unknown>}."
+  chk "D-V12 failing the step on '${ref:-<unset>}', having written no output" \
+    "$(tail -n1 <<<"$said")|$(wc -c <"$WORK/out" | tr -d ' ')" "EXIT=1|0"
+done
+chk "D-V12 the check runs in both modes, first, holding no scope" \
+  "$(gate '."caller-if"')|$(gate '."caller-needs"')|$(gate '."caller-perms" | tojson')|$(gate '."caller-steps" | join(",")')" \
+  "|null|{}|Refuse a caller outside the two-branch model"
+chk "D-V12 and both modes need it" "$(gate '."prepare-needs"')|$(gate '."ra-needs"')" "caller|caller"
+chk "D-V12 so a refused release call starts nothing after it" "$(gate '."release-call-runs-refused" | join(" ")')" "caller"
+chk "D-V12 nor does a refused repair call" "$(gate '."repair-call-runs-refused" | join(" ")')" "caller"
 
 # ── Verify root module path ──────────────────────────────────────────────────
 # An image app keeps the plain repository path at every major.
@@ -452,7 +493,7 @@ chk "D-F1 the fixture holds seven distinct commits" \
 chk "D-F2 the empty commit changes no file" "$(git -C "$REPO" diff --name-only "${C_EMPTY}^" "$C_EMPTY")" ""
 chk "D-F3 the revert restores the built tree" "$(git -C "$REPO" diff --name-only "$C_BUILT" "$C_REVERT")" "README.md"
 
-PROMOTE_REPO="$REPO" WALK_MODEL=""
+PROMOTE_REPO="$REPO"
 promote_at() { # <head commit> <exclude re> [built commits...] -> runs the walk; prints digest|source
   local head="$1" re="$2" c
   shift 2
@@ -468,43 +509,39 @@ promote_at() { # <head commit> <exclude re> [built commits...] -> runs the walk;
     case " ${WALK_UNATTESTED:-} " in *" $c "*) continue ;; esac
     echo "verify-attestation sha256:${c:0:12}0000 $c" >>"$PROV_OK"
   done
-  (cd "$PROMOTE_REPO" && GITHUB_SHA="$head" EXCLUDE_RE="$re" RELEASE_MODEL="$WALK_MODEL" SUBPACKAGES_JSON="${WALK_SUBS-[]}" run_step promote.sh) >"$WORK/promote.log"
+  (cd "$PROMOTE_REPO" && GITHUB_SHA="$head" EXCLUDE_RE="$re" SUBPACKAGES_JSON="${WALK_SUBS-[]}" run_step promote.sh) >"$WORK/promote.log"
   printf '%s|%s' "$(out promote_digest)" "$(out promote_source)"
 }
 
-# A linear history walks the same under every model; '' is a direct caller.
-for WALK_MODEL in "" legacy two-branch; do
-  m="[${WALK_MODEL:-unset}]"
-  r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT" "$C_DOCS")
-  chk "D-W1 $m an exact sha- hit promotes this commit's own digest" "${r#*|}|$(out promote_via)" "$C_DOCS|exact"
-  r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")
-  chk "D-W2 $m a docs-only target inherits the ancestor's digest" "${r#*|}|$(out promote_via)" "$C_BUILT|ancestor"
-  chk_has "D-W2 $m summary names the promoted build" "$(cat "$WORK/summary")" "built for \`${C_BUILT}\`"
-  chk "D-W2 $m only two-branch asks whether the reused image was signed and attested" \
-    "$(cut -d' ' -f1 "$PROV_LOG" | tr '\n' ' ')" "$([ "$WALK_MODEL" != two-branch ] || echo 'verify verify-attestation ')"
-  r=$(promote_at "$C_SHIP" "$EXCLUDE_RE_FULL" "$C_BUILT")
-  chk "D-W3 $m a shipped change since builds from source" "${r%|*}" ""
-  chk_has "D-W3 $m the log names the shipped path" "$(cat "$WORK/promote.log")" "changes a shipped path"
-  r=$(promote_at "$C_REVERT" "$EXCLUDE_RE_FULL" "$C_BUILT")
-  chk "D-W4 $m a shipped change later reverted still builds from source" "${r%|*}" ""
-  chk "D-W4 $m the endpoint trees are equal, so only a per-commit walk can refuse" \
-    "$(git -C "$REPO" diff --name-only "$C_BUILT" "$C_REVERT" | grep -Ev "$EXCLUDE_RE_FULL" || true)" ""
-  r=$(promote_at "$C_DOCS2" "$EXCLUDE_RE_FULL" "$C_BUILT" "$C_REVERT")
-  chk "D-W5 $m docs on top of a rebuilt revert inherit the revert's digest" "${r#*|}" "$C_REVERT"
-  r=$(promote_at "$C_DOCS3" "$EXCLUDE_RE_FULL" "$C_REVERT")
-  chk "D-W6 $m an empty commit since (a forced rebuild) builds from source" "${r%|*}" ""
-  chk_has "D-W6 $m the log names the empty commit" "$(cat "$WORK/promote.log")" "changes no file"
-  r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL")
-  chk "D-W7 $m no dev build anywhere builds from source" "${r%|*}|$(out promote_via)" "|none"
-  chk_has "D-W7 $m summary says so" "$(cat "$WORK/summary")" "No dev build could be reused"
-  r=$(promote_at "$C_DOCS" "" "$C_BUILT")
-  chk "D-W8 $m an empty exclusion list accepts only an exact hit" "${r%|*}" ""
-  r=$(promote_at "$C_DOCS3" "$EXCLUDE_RE_FULL" "$C_BUILT" "$C_REVERT" "$C_DOCS3")
-  chk "D-W9 $m the exact hit wins over any ancestor" "${r#*|}" "$C_DOCS3"
-done
-# Under two-branch a reused image must be complete, or the provenance gate
-# before the first write would refuse it with nothing to fall back on.
-WALK_MODEL=two-branch WALK_UNSIGNED="$C_BUILT"
+r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT" "$C_DOCS")
+chk "D-W1 an exact sha- hit promotes this commit's own digest" "${r#*|}|$(out promote_via)" "$C_DOCS|exact"
+r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")
+chk "D-W2 a docs-only target inherits the ancestor's digest" "${r#*|}|$(out promote_via)" "$C_BUILT|ancestor"
+chk_has "D-W2 summary names the promoted build" "$(cat "$WORK/summary")" "built for \`${C_BUILT}\`"
+chk "D-W2 and asks whether the reused image was signed and attested" \
+  "$(cut -d' ' -f1 "$PROV_LOG" | tr '\n' ' ')" "verify verify-attestation "
+r=$(promote_at "$C_SHIP" "$EXCLUDE_RE_FULL" "$C_BUILT")
+chk "D-W3 a shipped change since builds from source" "${r%|*}" ""
+chk_has "D-W3 the log names the shipped path" "$(cat "$WORK/promote.log")" "changes a shipped path"
+r=$(promote_at "$C_REVERT" "$EXCLUDE_RE_FULL" "$C_BUILT")
+chk "D-W4 a shipped change later reverted still builds from source" "${r%|*}" ""
+chk "D-W4 the endpoint trees are equal, so only a per-commit walk can refuse" \
+  "$(git -C "$REPO" diff --name-only "$C_BUILT" "$C_REVERT" | grep -Ev "$EXCLUDE_RE_FULL" || true)" ""
+r=$(promote_at "$C_DOCS2" "$EXCLUDE_RE_FULL" "$C_BUILT" "$C_REVERT")
+chk "D-W5 docs on top of a rebuilt revert inherit the revert's digest" "${r#*|}" "$C_REVERT"
+r=$(promote_at "$C_DOCS3" "$EXCLUDE_RE_FULL" "$C_REVERT")
+chk "D-W6 an empty commit since (a forced rebuild) builds from source" "${r%|*}" ""
+chk_has "D-W6 the log names the empty commit" "$(cat "$WORK/promote.log")" "changes no file"
+r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL")
+chk "D-W7 no dev build anywhere builds from source" "${r%|*}|$(out promote_via)" "|none"
+chk_has "D-W7 summary says so" "$(cat "$WORK/summary")" "No dev build could be reused"
+r=$(promote_at "$C_DOCS" "" "$C_BUILT")
+chk "D-W8 an empty exclusion list accepts only an exact hit" "${r%|*}" ""
+r=$(promote_at "$C_DOCS3" "$EXCLUDE_RE_FULL" "$C_BUILT" "$C_REVERT" "$C_DOCS3")
+chk "D-W9 the exact hit wins over any ancestor" "${r#*|}" "$C_DOCS3"
+# A reused image must be complete, or the provenance gate before the first
+# write would refuse it with nothing to fall back on.
+WALK_UNSIGNED="$C_BUILT"
 r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")
 chk "D-W11 a pure commit over an image its run never signed builds from source" "$r|$(out promote_via)" "|$C_DOCS|none"
 chk_has "D-W11 naming the missing signature" "$(cat "$WORK/promote.log")" \
@@ -523,13 +560,6 @@ r=$(PROV_DOWN=1 promote_at "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")
 chk "D-W13 a cosign that cannot answer fails the step, neither reusing nor building" \
   "$r|$(sed -n 's/^EXIT=//p' "$WORK/promote.log")" "||1"
 chk "D-W13 after retrying" "$(grep -c '^verify ' "$PROV_LOG")" "5"
-WALK_MODEL=legacy WALK_UNSIGNED="$C_BUILT"
-r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")
-chk "D-W14 legacy reuses the same image unchanged, asking cosign nothing" "$r|$(out promote_via)|$(wc -l <"$PROV_LOG" | tr -d ' ')" \
-  "$(printf 'sha256:%s0000' "${C_BUILT:0:12}")|$C_BUILT|ancestor|0"
-WALK_UNSIGNED=""
-WALK_MODEL=""
-chk_has "D-W10 an unknown model is refused" "$(cd "$REPO" && GITHUB_SHA="$C_DOCS" EXCLUDE_RE="" RELEASE_MODEL=v3 run_step promote.sh)" "EXIT=1"
 
 # ── Two-branch: promotion commits on main ────────────────────────────────────
 # M0 built on main; dev's T1 changes main.go and T_D only docs; M1 is a main
@@ -571,20 +601,20 @@ printf '%s\n' "owner/app $D_T" "owner/other $D_OTHER" >"$PKGS"
 # shellcheck source=SCRIPTDIR/reconciliation.sh
 chk "D-M0 the fixture's promotions have the reconciliation shape" \
   "$(cd "$REC" && . "$ROOT/scripts/reconciliation.sh" && for c in "$R" "$R_D" "$S"; do is_reconciliation "$c" && echo y || echo n; done | tr -d '\n')" "yyn"
-PROMOTE_REPO="$REC" WALK_MODEL=two-branch
+PROMOTE_REPO="$REC"
 r=$(promote_at "$R" "$EXCLUDE_RE_FULL" "$M0" "$T1")
 chk "D-M1 a promotion commit re-tags its Promoted-Digest" "$r|$(out promote_via)" "$D_T|$T1|trailer"
 chk "D-M1 leaving its signature to the gate that refuses rather than builds (D-G)" "$(wc -l <"$PROV_LOG" | tr -d ' ')" "0"
 chk_has "D-M1 summary names the trailer" "$(cat "$WORK/summary")" "this promotion commit records (digest \`${D_T}\`, promoted commit \`${T1}\`)"
-out_m=$(cd "$REC" && GITHUB_SHA="$R_OTHER" EXCLUDE_RE="$EXCLUDE_RE_FULL" RELEASE_MODEL=two-branch run_step promote.sh)
+out_m=$(cd "$REC" && GITHUB_SHA="$R_OTHER" EXCLUDE_RE="$EXCLUDE_RE_FULL" run_step promote.sh)
 chk_has "D-M2 a digest of another image's package is refused" "$out_m" "is not in ghcr.io/owner/app"
 chk "D-M2 and fails the step with no digest" "$(printf '%s' "$out_m" | sed -n 's/^EXIT=//p')|$(out promote_digest)" "1|"
-out_m=$(cd "$REC" && GITHUB_SHA="$R_GONE" EXCLUDE_RE="$EXCLUDE_RE_FULL" RELEASE_MODEL=two-branch run_step promote.sh)
+out_m=$(cd "$REC" && GITHUB_SHA="$R_GONE" EXCLUDE_RE="$EXCLUDE_RE_FULL" run_step promote.sh)
 chk_has "D-M3 a digest retention deleted is refused, never built" "$out_m" "A promotion never builds from source"
 chk "D-M3 and fails the step" "$(printf '%s' "$out_m" | sed -n 's/^EXIT=//p')" "1"
-out_m=$(cd "$REC" && GITHUB_SHA="$R_BARE" EXCLUDE_RE="$EXCLUDE_RE_FULL" RELEASE_MODEL=two-branch run_step promote.sh)
+out_m=$(cd "$REC" && GITHUB_SHA="$R_BARE" EXCLUDE_RE="$EXCLUDE_RE_FULL" run_step promote.sh)
 chk_has "D-M3 a promotion without its trailer is refused" "$out_m" "no single well-formed Promoted-Digest trailer"
-out_m=$(cd "$REC" && CURL_DOWN=1 GITHUB_SHA="$R" EXCLUDE_RE="$EXCLUDE_RE_FULL" RELEASE_MODEL=two-branch run_step promote.sh)
+out_m=$(cd "$REC" && CURL_DOWN=1 GITHUB_SHA="$R" EXCLUDE_RE="$EXCLUDE_RE_FULL" run_step promote.sh)
 chk_has "D-M3 an unreadable registry is refused, never built" "$out_m" "could not read ghcr.io/owner/app@${D_T}"
 r=$(promote_at "$S" "$EXCLUDE_RE_FULL" "$M0" "$M1" "$T1")
 chk "D-M4 a later main commit over the untagged promotion builds from source" "${r%|*}|$(out promote_via)" "|none"
@@ -594,17 +624,11 @@ chk_has "D-M4 the log names the promotion as the merge crossed" "$(cat "$WORK/pr
 r=$(promote_at "$S" "$EXCLUDE_RE_FULL" "$M0" "$M1" "$T1" "$R")
 chk "D-M4 nor does it take the image R's interrupted run pushed as :sha-R" "${r%|*}|$(out promote_via)" "|none"
 chk_has "D-M4 naming the merge whose image it refused" "$(cat "$WORK/promote.log")" "the nearest image is the merge ${R}'s"
-sources_rec() { (cd "$REC" && RELEASE_MODEL=two-branch EXCLUDE_RE="$EXCLUDE_RE_FULL" SUBPACKAGES_JSON='[]' \
+sources_rec() { (cd "$REC" && EXCLUDE_RE="$EXCLUDE_RE_FULL" SUBPACKAGES_JSON='[]' \
   bash "$ROOT/scripts/promote-digest.sh" --sources "$1" 2>/dev/null | tr '\n' ' '); }
 chk "D-M4 and its signing window holds S alone, the commit that builds it" "$(sources_rec "$S")" "$S "
 r=$(promote_at "$S_D" "$EXCLUDE_RE_FULL" "$M0")
 chk "D-M5 a merge crossing stays impure even when every path it changed is excluded" "${r%|*}" ""
-WALK_MODEL=legacy
-r=$(promote_at "$S_D" "$EXCLUDE_RE_FULL" "$M0")
-chk "D-M5 where legacy's per-path walk inherits across it" "$r" "$(printf 'sha256:%s0000' "${M0:0:12}")|$M0"
-r=$(promote_at "$R" "$EXCLUDE_RE_FULL" "$M0" "$T1")
-chk "D-M6 legacy never reads a trailer" "$r|$(out promote_via)" "|$R|none"
-WALK_MODEL=two-branch
 EMPTY_ON_MAIN=$(git -C "$REC" commit-tree "${S_D}^{tree}" -p "$S_D" -m "fix(deps): rebuild against refreshed base packages")
 r=$(promote_at "$EMPTY_ON_MAIN" "$EXCLUDE_RE_FULL" "$S_D")
 chk "D-M7 an empty fix(deps) commit stays a forced rebuild" "${r%|*}" ""
@@ -623,7 +647,7 @@ chk "D-M8 a subpackage-only promotion owes the subpackage, not a root change" \
 r=$(promote_at "$R_W" "$EXCLUDE_RE_FULL" "$M0" "$T1")
 chk "D-M8 and its image re-tags the promoted dev digest" "$r|$(out promote_via)" "$D_T|$T_W|trailer"
 # A declared subpackage's shipped manifest owes a release (path-significance.sh),
-# so under two-branch that commit's image is built from it, never inherited;
+# so that commit's image is built from it, never inherited;
 # a devDependencies-only change and a docker repo's root package.json are not.
 SPK="$WORK/subpkg"
 git init -q -b main "$SPK"
@@ -637,7 +661,7 @@ changed_of() { git -C "$SPK" diff --name-only "$1^" "$1" | tr '\n' ,; }
 chk "D-M9 the fixture's commits each change what they claim" \
   "$(changed_of "$P_DEV") $(changed_of "$P_ROOT") $(changed_of "$P_DEP")" \
   "web/package-lock.json,web/package.json, package.json, web/package-lock.json,web/package.json,"
-PROMOTE_REPO="$SPK" WALK_MODEL=two-branch WALK_SUBS='["web"]'
+PROMOTE_REPO="$SPK" WALK_SUBS='["web"]'
 r=$(promote_at "$P_DEP" "$EXCLUDE_RE_FULL" "$P0")
 chk "D-M9 a release owed only to a subpackage's runtime dependency builds its image" "$r|$(out promote_via)" "|$P_DEP|none"
 chk_has "D-M9 naming the shipped change" "$(cat "$WORK/promote.log")" "commit ${P_DEP} changes a shipped path"
@@ -652,16 +676,14 @@ r=$(promote_at "$P_DEP" "$EXCLUDE_RE_FULL" "$P0")
 chk "D-M11 an undeclared package.json ships nothing, so the image carries over" "${r#*|}|$(out promote_via)" "$P0|ancestor"
 WALK_SUBS=''
 r=$(promote_at "$P_DEP" "$EXCLUDE_RE_FULL" "$P0")
-chk_has "D-M11 a two-branch walk without the subpackage list is refused" "$(cat "$WORK/promote.log")" "SUBPACKAGES_JSON must be the JSON array"
-WALK_MODEL=legacy WALK_SUBS='["web"]'
-r=$(promote_at "$P_DEP" "${EXCLUDE_RE_FULL}|(^|/)package-lock\.json\$" "$P0")
-chk "D-M12 legacy keeps every package.json image-pure" "${r#*|}|$(out promote_via)" "$P0|ancestor"
-sources() { (cd "$SPK" && RELEASE_MODEL=two-branch EXCLUDE_RE="$EXCLUDE_RE_FULL" SUBPACKAGES_JSON='["web"]' \
+chk_has "D-M11 a walk without the subpackage list is refused" "$(cat "$WORK/promote.log")" "SUBPACKAGES_JSON must be the JSON array"
+WALK_SUBS='["web"]'
+sources() { (cd "$SPK" && EXCLUDE_RE="$EXCLUDE_RE_FULL" SUBPACKAGES_JSON='["web"]' \
   bash "$ROOT/scripts/promote-digest.sh" --sources "$1" 2>/dev/null | tr '\n' ' '); }
 chk "D-M13 --sources stops at a shipped subpackage manifest" "$(sources "$P_DEP")" "$P_DEP "
 chk "D-M13 and walks the commits that carried the image" "$(sources "$P_ROOT")" "$P_ROOT $P_DEV $P0 "
 WALK_SUBS='[]'
-PROMOTE_REPO="$REPO" WALK_MODEL=""
+PROMOTE_REPO="$REPO"
 
 # ── Release decision on a subpackage-only change ─────────────────────────────
 # A Go root with a TS subpackage under web/: a change under web/ alone owes a
@@ -675,7 +697,7 @@ git -C "$SUB" tag v1.2.0 "$S_BASE"
 S_WEB=$(commit_in "$SUB" "feat(web): api" web/src/index.ts=v2)
 S_ROOT=$(commit_in "$SUB" "fix: main" main.go=v2)
 chk "D-R1 changes reads the subpackage list" "$(tr '\n' ' ' <"$WORK/changes.sh.env")" \
-  "ANCHOR_SHA BEFORE CHANNEL CI_TOOLS GO_LANES_JSON HEAD RELEASE_MODEL REPO_TYPE SUBPACKAGES_JSON "
+  "ANCHOR_SHA BEFORE CHANNEL CI_TOOLS GO_LANES_JSON HEAD REPO_TYPE SUBPACKAGES_JSON "
 chk "D-R1 select reads the subpackage list" "$(grep -c '^SUBPACKAGES_TO_PUBLISH$' "$WORK/select.sh.env")" "1"
 changes_at() { # <anchor> <head> -> root_changed|subpackages_to_publish
   (cd "$SUB" && CI_TOOLS="$ROOT/scripts" CHANNEL=stable BEFORE="$1" HEAD="$2" ANCHOR_SHA="$1" SUBPACKAGES_JSON='["web"]' GO_LANES_JSON='[]' REPO_TYPE=go \
@@ -684,7 +706,7 @@ changes_at() { # <anchor> <head> -> root_changed|subpackages_to_publish
 }
 select_at() { # <channel> <root_changed> <subpackages_to_publish> <anchor> <head> -> release|version
   CHANNEL="$1" MODE=normal ROOT_CHANGED="$2" SUBPACKAGES_TO_PUBLISH="$3" ANCHOR_SHA="$4" GITHUB_SHA="$5" \
-    BASE=v1.3.0 DEV_VERSION=v1.3.0-dev.1 FLOOR_BASE=v1.2.1 FLOOR_DEV_VERSION=v1.2.1-dev.1 LATEST=v1.2.0 \
+    BASE=v1.3.0 DEV_VERSION=v1.3.0-dev.1 LATEST=v1.2.0 \
     run_step select.sh >/dev/null
   printf '%s|%s' "$(out release)" "$(out version)"
 }
@@ -709,14 +731,12 @@ chk_has "D-R7 the subpackage job fires on release" "$(cat "$WORK/subpackage.if")
 chk "D-R7 the subpackage job has no channel condition" "$(grep -c 'channel' "$WORK/subpackage.if" || true)" "0"
 chk_has "D-R7 the subpackage job runs after the root tag job" "$(cat "$WORK/subpackage.needs")" "go"
 # The image job, evaluated: <docker job runs>|<release-needed> per
-# model/channel/outcome.
+# channel/outcome.
 dgate() { jq -r --arg k "$1" '.[$k]' "$WORK/docker-gate.json"; }
-chk "D-R9 legacy: a subpackage-only release builds no image on dev" "$(dgate legacy/dev/sub)" "False|false"
-chk "D-R9 nor publishes one on stable" "$(dgate legacy/stable/sub)" "True|false"
-chk "D-R9 and a root change still publishes on both" "$(dgate legacy/dev/root) $(dgate legacy/stable/root)" "True|true True|true"
-chk "D-R10 two-branch: a subpackage-only release builds the image on dev" "$(dgate two-branch/dev/sub)" "True|true"
-chk "D-R10 and publishes it on stable" "$(dgate two-branch/stable/sub)" "True|true"
-chk "D-R10 nothing owed publishes nothing" "$(dgate two-branch/dev/none) $(dgate two-branch/stable/none)" "False|false True|false"
+chk "D-R9 a root change publishes on both channels" "$(dgate dev/root) $(dgate stable/root)" "True|true True|true"
+chk "D-R10 a subpackage-only release builds the image on dev" "$(dgate dev/sub)" "True|true"
+chk "D-R10 and publishes it on stable" "$(dgate stable/sub)" "True|true"
+chk "D-R10 nothing owed publishes nothing" "$(dgate dev/none) $(dgate stable/none)" "False|false True|false"
 chk_has "D-R10 the subpackage publishes after the image's tag and Release" "$(cat "$WORK/subpackage.needs")" "docker"
 
 # ── Resolve build args ───────────────────────────────────────────────────────
@@ -742,9 +762,9 @@ chk "D-S1 the root kind line is the pending step's" "$(cat "$WORK/kind-output.tx
   '${{ steps.pending.outputs.root_kind_note }}'
 chk "D-S2 the docker job forwards the kind line" "$(jq -r '."release-kind-note"' "$WORK/docker-with.json")" \
   '${{ needs.detect.outputs.release_kind_note }}'
-chk "D-S2 and the model and the security merges, and no promotion note" \
-  "$(jq -r '[."release-model", ."security-shas", (has("promotion-note") | tostring)] | join(" ")' "$WORK/docker-with.json")" \
-  '${{ needs.detect.outputs.release_model }} ${{ needs.detect.outputs.security_shas }} false'
+chk "D-S2 and the security merges, and no promotion note" \
+  "$(jq -r '[."security-shas", (has("promotion-note") | tostring)] | join(" ")' "$WORK/docker-with.json")" \
+  '${{ needs.detect.outputs.security_shas }} false'
 chk "D-S3 docker notes read the kind-line input" "$(sed -n 's/^KIND_NOTE=//p' "$WORK/notes.sh.envmap")" \
   '${{ inputs.release-kind-note }}'
 for job in go ts; do
@@ -766,31 +786,23 @@ chmod 755 "$NBIN/sha256sum" "$NBIN/tar"
 notes_argv() { # env-prefixed: runs the notes step; prints its render-notes argv on one line
   rm -f "$WORK/rn-argv"
   PATH="$NBIN:$BIN:$PATH" CI_TOOLS="$RN_TOOLS" RUNNER_TEMP="$WORK" GITHUB_REPOSITORY=owner/app \
-    GITHUB_SHA=abc123 VERSION=v1.3.0 LATEST=v1.2.0 GO_LANES_JSON='["yamlenv"]' \
+    GITHUB_SHA=abc123 VERSION=v1.3.0 GO_LANES_JSON='["yamlenv"]' \
     bash "$WORK/notes.sh" >"$WORK/notes.log" 2>&1 || echo "EXIT=$?"
   [ -f "$WORK/rn-argv" ] && tr '\n' ' ' <"$WORK/rn-argv"
 }
-LEGACY_HEAD='--release-model legacy --site docker --version v1.3.0 --go-lanes ["yamlenv"] --kind-note  --out RELEASE_NOTES.md --latest v1.2.0'
-chk "D-N1 legacy publish keeps the latest tag and the subject fallback" \
-  "$(RELEASE_MODEL=legacy FINALIZE=false RELEASE_NEEDED=true KIND_NOTE="" SECURITY_SHAS="" notes_argv)" "$LEGACY_HEAD --release-needed "
-chk "D-N2 legacy finalize renders the current release" \
-  "$(RELEASE_MODEL=legacy FINALIZE=true RELEASE_NEEDED=false KIND_NOTE="" SECURITY_SHAS="" notes_argv)" "$LEGACY_HEAD --finalize "
-chk "D-N3 a caller passing no model renders legacy" \
-  "$(RELEASE_MODEL="" FINALIZE=false RELEASE_NEEDED=false KIND_NOTE="" SECURITY_SHAS="" notes_argv)" "$LEGACY_HEAD "
 rm -f "$WORK/sbom-prev.spdx.json"
-TWO_HEAD='--release-model two-branch --site docker --version v1.3.0 --go-lanes ["yamlenv"] --kind-note Promoted from `v1.3.0-dev.2` --out RELEASE_NOTES.md --repo owner/app --release-commit abc123'
-chk "D-N4 two-branch renders the explicit range with no fallback inputs and no SBOM pair without a previous one" \
-  "$(RELEASE_MODEL=two-branch FINALIZE=false RELEASE_NEEDED=true KIND_NOTE='Promoted from `v1.3.0-dev.2`' SECURITY_SHAS="aaa bbb" notes_argv)" \
-  "$TWO_HEAD --security-shas $WORK/security-shas "
+TWO_HEAD="--site docker --version v1.3.0 --go-lanes [\"yamlenv\"] --kind-note Promoted from \`v1.3.0-dev.2\` --repo owner/app --release-commit abc123 --security-shas $WORK/security-shas --out RELEASE_NOTES.md"
+chk "D-N4 the notes render the explicit range, with no SBOM pair without a previous one" \
+  "$(KIND_NOTE='Promoted from `v1.3.0-dev.2`' SECURITY_SHAS="aaa bbb" notes_argv)" "$TWO_HEAD "
 chk "D-N4 the security merges are one per line" "$(tr '\n' ' ' <"$WORK/security-shas")" "aaa bbb "
 printf '{}\n' >"$WORK/sbom-prev.spdx.json"
 chk "D-N5 a verified previous SBOM joins the new one" \
-  "$(RELEASE_MODEL=two-branch FINALIZE=false RELEASE_NEEDED=true KIND_NOTE='Promoted from `v1.3.0-dev.2`' SECURITY_SHAS="" notes_argv)" \
-  "$TWO_HEAD --security-shas $WORK/security-shas --sbom-prev $WORK/sbom-prev.spdx.json --sbom-new sbom.spdx.json "
+  "$(KIND_NOTE='Promoted from `v1.3.0-dev.2`' SECURITY_SHAS="" notes_argv)" \
+  "$TWO_HEAD --sbom-prev $WORK/sbom-prev.spdx.json --sbom-new sbom.spdx.json "
 rm -f "$WORK/sbom-prev.spdx.json"
 chk "D-N6 the notes and previous-SBOM steps hold no token" "$(gate '."token-env" | length')" "0"
 
-# ── Two-branch: the previous release's SBOM, verified before it is read ──────
+# ── The previous release's SBOM, verified before it is read ─────────────────
 # Stub cosign: verify-attestation exits COSIGN_VERIFY_RC (a transport error)
 # and otherwise prints COSIGN_VERIFIED (the attestations it verified) only for
 # a certificate "<repository> <commit>" line in COSIGN_SIGNED its flags
@@ -987,11 +999,11 @@ chk "D-Q11 a release owed to a subpackage's manifest was built at its own commit
 prev_sbom >/dev/null
 chk "D-Q11 where an undeclared package.json carried the earlier image" "$(prev_file)|$(asked)" "file|$TP2 $TP1 "
 : >"$TAGS"
-chk_has "D-Q7 runs on two-branch stable publishes only" "$(gate '."prevsbom-if"')" \
-  "env.PUBLISH == 'true' && inputs.channel == 'stable' && inputs.release-model == 'two-branch'"
+chk_has "D-Q7 runs on stable publishes only" "$(gate '."prevsbom-if"')" \
+  "env.PUBLISH == 'true' && inputs.channel == 'stable'"
 chk "D-Q7 after the new SBOM and before the notes" "$(gate '."prevsbom-order"')" "true"
 
-# ── Two-branch repair: the signed assets of a missing image Release ──────────
+# ── Repair: the signed assets of a missing image Release ─────────────────────
 attested() { # <tag> -> the script's exit status|its stdout, with the document in $WORK/att.out
   local rc=0 o
   rm -f "$WORK/att.out"
@@ -1081,9 +1093,9 @@ chk "D-A7 and handed on under the name repair-release fetches" "$(sed -n 's/^art
   "$(bash "$ROOT/scripts/release-state.sh" handoff-name repair-assets v2.0.0)"
 chk "D-A8 a repair call builds nothing: prepare, which every other job needs, runs only without a repair tag" \
   "$(gate '."prepare-if"')|$(gate '."repair-tag-default"')" "\${{ inputs.repair-tag == '' }}|"
-chk "D-A8 so a repair call runs repair-assets alone" "$(gate '."repair-call-runs" | join(" ")')" "repair-assets"
+chk "D-A8 so a repair call runs the caller check and repair-assets alone" "$(gate '."repair-call-runs" | join(" ")')" "caller repair-assets"
 chk "D-A8 and repair-assets only with one, reading and signing, in its own job" \
-  "$(gate '."ra-if"')|$(gate '."ra-needs"')|$(gate '."ra-perms" | tojson')" "\${{ inputs.repair-tag != '' }}|null|{\"contents\":\"read\",\"id-token\":\"write\"}"
+  "$(gate '."ra-if"')|$(gate '."ra-perms" | tojson')" "\${{ inputs.repair-tag != '' }}|{\"contents\":\"read\",\"id-token\":\"write\"}"
 chk "D-A8 checking the Release before installing, signing and uploading" "$(gate '."ra-steps" | join(",")')|$(gate '."ra-step-ifs" | unique | join(" ")')" \
   "Checkout,Check out the ci source,Check the Release,Install Cosign,Sign the release assets,Hand the assets on|\${{ steps.release.outputs.missing == 'true' }}"
 chk "D-A8 with the pinned cosign" "$(gate '."ra-cosign".uses')|$(gate '."ra-cosign".with."cosign-release"')" \
@@ -1091,7 +1103,7 @@ chk "D-A8 with the pinned cosign" "$(gate '."ra-cosign".uses')|$(gate '."ra-cosi
 chk "D-A8 uploading every file the step wrote, failing on none" \
   "$(gate '."ra-upload" | "\(.name)|\(.path)|\(."if-no-files-found")"')" '${{ steps.release.outputs.artifact }}|${{ runner.temp }}/assets/|error'
 
-# ── Two-branch: a promoted digest's signature and SBOM, before any write ─────
+# ── A promoted digest's signature and SBOM, before any write ─────────────────
 provenance() { # <source commit> -> runs the extracted step in the promotion fixture at T1's trailer digest; ok or refused
   : >"$PROV_LOG"
   (cd "$WORK/rec" && PATH="$PBIN:$BIN:$PATH" CI_TOOLS="$ROOT/scripts" GITHUB_REPOSITORY=owner/app REGISTRY=ghcr.io IMAGE_NAME=owner/app \
@@ -1112,8 +1124,8 @@ chk "D-G4 asking for this repository's run at the source, signature then SBOM" "
 printf '%s\n' "verify $D_T $M0" "verify-attestation $D_T $M0" >"$PROV_OK"
 chk "D-G5 a docs-only source carries the image its ancestor's run built" "$(provenance "$T_D")" "ok"
 chk "D-G5 asking the source first, then that ancestor" "$(sed 's/.*-sha \([0-9a-f]*\) .*/\1/' "$PROV_LOG" | tr '\n' ' ')" "$T_D $M0 $T_D $M0 "
-chk_has "D-G6 runs on two-branch publishes of a promoted digest only" "$(gate '."provenance-if"')" \
-  "env.PUBLISH == 'true' && inputs.release-model == 'two-branch' && env.PROMOTE_DIGEST != ''"
+chk_has "D-G6 runs on publishes of a promoted digest only" "$(gate '."provenance-if"')" \
+  "env.PUBLISH == 'true' && env.PROMOTE_DIGEST != ''"
 chk "D-G6 after cosign and the tools are in place, before every registry write" "$(gate '."before-provenance" | join("|")')" \
   "Checkout|Check out the ci source|Version ownership gate|Download digests|Set up Docker Buildx|Log in to GHCR|Install Cosign"
 chk "D-G6 the next step is the first write" "$(gate '."first-write"')" "Publish channel tags on GHCR"
@@ -1216,7 +1228,7 @@ for job in go ts go-nested; do
   chk "D-T15 the $job step exits 0" "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)" "0"
 done
 
-# ── Two-branch: the image lane's completion receipt ──────────────────────────
+# ── The image lane's completion receipt ──────────────────────────────────────
 : >"$GH_LOG"
 out_c=$(VERSION=v1.3.0 run_step receipt.sh)
 chk "D-C1 the receipt reads the Release, then posts on the release commit" \
@@ -1226,14 +1238,14 @@ chk "D-C1 and exits 0" "$(printf '%s' "$out_c" | grep -c '^EXIT=' || true)" "0"
 : >"$GH_LOG"
 out_c=$(GH_RELEASE_MISSING=1 VERSION=v1.3.0 run_step receipt.sh)
 chk "D-C2 no Release, no receipt" "$(grep -c '/statuses/' "$GH_LOG" || true)|$(printf '%s' "$out_c" | sed -n 's/^EXIT=//p')" "0|1"
-RECEIPT_GATE="always() && needs.verify-publish.result == 'success' && !inputs.defer-receipt && inputs.release-model == 'two-branch' && inputs.channel == 'stable' && needs.finalize.outputs.released == 'true'"
-chk "D-C3 the receipt is two-branch stable only, after a published Release, unless the caller defers it" "$(gate '."receipt-if"')" "$RECEIPT_GATE"
+RECEIPT_GATE="always() && needs.verify-publish.result == 'success' && !inputs.defer-receipt && inputs.channel == 'stable' && needs.finalize.outputs.released == 'true'"
+chk "D-C3 the receipt is stable only, after a published Release, unless the caller defers it" "$(gate '."receipt-if"')" "$RECEIPT_GATE"
 chk "D-C3 its steps carry no condition of their own" "$(gate '."receipt-step-ifs" | join("")')" ""
 chk "D-C3 released is the Release step's published flag" "$(gate '.released')" '${{ steps.release.outputs.published }}'
 chk "D-C4 after the readback, in a job of its own with the statuses scope" \
   "$(gate '."receipt-needs" | join(" ")')|$(gate '."receipt-perms" | to_entries | map("\(.key)=\(.value)") | join(" ")')" \
   "prepare finalize verify-publish|contents=read statuses=write"
-chk "D-C5 verify-publish, which legacy runs reach, holds only the read scope every caller grants" "$(gate '."vp-perms" | tojson')" '{"contents":"read"}'
+chk "D-C5 verify-publish holds only the read scope every caller grants" "$(gate '."vp-perms" | tojson')" '{"contents":"read"}'
 unset GITHUB_REPOSITORY GITHUB_SHA GITHUB_REF_NAME GITHUB_SERVER_URL GITHUB_RUN_ID
 rm -f "$BIN/gh"
 for job in go ts go-nested; do

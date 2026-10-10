@@ -2135,6 +2135,56 @@ class MergeChecked(unittest.TestCase):
         self.assertTrue(result.startswith('not merged'), result)
         self.assertEqual(gh.called(), [f'GET {P}/pulls/5'], 'a retargeted head is never armed')
 
+    def test_an_arm_refused_by_a_rate_limit_is_left_open_without_a_direct_merge(self):
+        green = {f'GET {P}/commits/{SHA}/{CHECKS}': checks((15368, 'completed', 'success'))}
+        gh = FakeGh({f'GET {P}/pulls/5': pr(5, 'repo-sync/ci/main'), **green})
+        limited = subprocess.CompletedProcess([], 1, b'', b'GraphQL: API rate limit exceeded')
+
+        def run(args, stdin=None, timeout=None):
+            return limited if args[0] == 'pr' else gh(args, stdin, timeout)
+
+        api = rm.Api(run)
+        result = rm.merge_checked(api, R, 5, run=api.command, base='main', head='repo-sync/ci/main')
+        self.assertTrue(result.startswith('not merged: auto-merge was refused by a rate limit'))
+        self.assertEqual(
+            gh.called(), [f'GET {P}/pulls/5'] * 2, 'a re-read, no check read, no direct merge'
+        )
+
+    def test_an_arm_refused_by_a_rate_limit_after_its_merge_reports_it_merged(self):
+        reads = [pr(5, 'repo-sync/ci/main'), pr(5, 'repo-sync/ci/main', merged='2026-10-10T03:00Z')]
+        gh = FakeGh({f'GET {P}/pulls/5': lambda _args, _stdin: reads.pop(0)})
+        limited = subprocess.CompletedProcess([], 1, b'', b'GraphQL: API rate limit exceeded')
+
+        def run(args, stdin=None, timeout=None):
+            return limited if args[0] == 'pr' else gh(args, stdin, timeout)
+
+        api = rm.Api(run)
+        result = rm.merge_checked(api, R, 5, run=api.command, base='main', head='repo-sync/ci/main')
+        self.assertEqual(result, 'merged')
+        self.assertEqual(gh.called(), [f'GET {P}/pulls/5'] * 2)
+
+    def test_a_command_failure_is_a_gh_error_and_a_rate_limit_its_own(self):
+        cases = (
+            ('rate limited', subprocess.CompletedProcess([], 1, b'', b'API rate limit exceeded')),
+            ('pacer refused', rm.ghrest.ApiError(None, 'held', rate_limited=True)),
+            ('refused', subprocess.CompletedProcess([], 1, b'', b'not mergeable')),
+            ('gh did not start', FileNotFoundError('gh')),
+        )
+        for name, answer in cases:
+            with self.subTest(name):
+
+                def run(_args, _stdin=None, _timeout=None, answer=answer):
+                    if isinstance(answer, BaseException):
+                        raise answer
+                    return answer
+
+                with self.assertRaises(rm.GhError) as caught:
+                    rm.Api(run).command(['pr', 'merge', '5'])
+                self.assertEqual(
+                    isinstance(caught.exception, rm.RateLimitedError),
+                    name.startswith(('rate', 'pacer')),
+                )
+
     def test_a_base_other_than_dev_or_main_is_refused_before_any_read(self):
         gh = FakeGh({})
         with self.assertRaises(ValueError):
@@ -2179,10 +2229,34 @@ class Workflow(unittest.TestCase):
 
     def test_each_secret_is_scoped_to_the_one_step_that_needs_it(self):
         text = WORKFLOW.read_text()
-        self.assertEqual(text.count('secrets.SYNC_PAT'), 1)
+        self.assertNotIn('SYNC_PAT', text)
+        self.assertEqual(text.count('secrets.SYNC_APP_PRIVATE_KEY'), 1)
+        mint = self.steps['Mint the App token']
+        self.assertEqual(mint['id'], 'app-token')
+        self.assertRegex(mint['uses'], r'^actions/create-github-app-token@[0-9a-f]{40}$')
+        self.assertNotIn('continue-on-error', mint)
+        self.assertNotIn('if', mint)
+        self.assertEqual(
+            mint['with'],
+            {
+                'client-id': '${{ secrets.SYNC_APP_ID }}',
+                'private-key': '${{ secrets.SYNC_APP_PRIVATE_KEY }}',
+                'owner': 'cplieger',
+                'permission-checks': 'read',
+                'permission-contents': 'write',
+                'permission-metadata': 'read',
+                'permission-pull-requests': 'write',
+                'permission-workflows': 'write',
+            },
+        )
         self.assertEqual(
             self.steps['Merge security pull requests and open rebuilds']['env']['GH_TOKEN'],
-            '${{ secrets.SYNC_PAT }}',
+            '${{ steps.app-token.outputs.token }}',
+        )
+        names = list(self.steps)
+        self.assertEqual(
+            names.index('Mint the App token') + 1,
+            names.index('Merge security pull requests and open rebuilds'),
         )
         self.assertEqual(self.steps['Plan']['env']['GH_TOKEN'], '${{ secrets.CI_SCHEDULE }}')
         self.assertEqual(self.steps['Report']['env']['GH_TOKEN'], '${{ secrets.CI_SCHEDULE }}')

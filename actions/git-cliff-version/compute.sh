@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Version arithmetic for the release channels, configured by environment
-# (CHANNEL, EXCLUDE_PATHS, LANE, CLIFF_BIN, RELEASE_MODEL; PENDING_VERSION and
-# PENDING_IN_RANGE under two-branch); results go to $GITHUB_OUTPUT.
+# (CHANNEL, EXCLUDE_PATHS, LANE, CLIFF_BIN, PENDING_VERSION, PENDING_IN_RANGE);
+# results go to $GITHUB_OUTPUT.
 # `compute.sh pending-version <commit> [lane]` prints a pending promotion's
 # version instead. Callers: action.yml, scripts/release-state.sh,
 # test-cliff-bump-semantics.sh.
@@ -28,19 +28,11 @@ CHANNEL="${CHANNEL:-stable}"
 EXCLUDE_PATHS="${EXCLUDE_PATHS:-}"
 LANE="${LANE:-}"
 CLIFF_BIN="${CLIFF_BIN:-git-cliff}"
-RELEASE_MODEL="${RELEASE_MODEL:-legacy}"
 
 case "$CHANNEL" in
   dev | stable) ;;
   *)
     echo "::error::channel must be 'dev' or 'stable', got '${CHANNEL}'"
-    exit 1
-    ;;
-esac
-case "$RELEASE_MODEL" in
-  legacy | two-branch) ;;
-  *)
-    echo "::error::release-model must be 'legacy' or 'two-branch', got '${RELEASE_MODEL}'"
     exit 1
     ;;
 esac
@@ -101,7 +93,7 @@ dev_version() { # base -> base-dev.<count of existing base-dev.* tags + 1>
   printf '%s-dev.%s' "$1" "$((n + 1))"
 }
 
-# ── Two-branch arithmetic: every version below matches PATTERN ──────────────
+# ── Every version below matches PATTERN ─────────────────────────────────────
 semver() { # <version> -> "X Y Z" in base 10
   local bare="${1#"$PREFIX"v}" major minor patch
   IFS=. read -r major minor patch <<<"$bare"
@@ -255,10 +247,8 @@ pending_version_of() { # <R> -> the version the pending promotion publishes
   fi
 }
 
-if [ -n "$PENDING_OF" ] || [ "$RELEASE_MODEL" = two-branch ]; then
-  # shellcheck source=SCRIPTDIR/../../scripts/reconciliation.sh
-  . "$(dirname -- "${BASH_SOURCE[0]}")/../../scripts/reconciliation.sh"
-fi
+# shellcheck source=SCRIPTDIR/../../scripts/reconciliation.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/../../scripts/reconciliation.sh"
 
 if [ -n "$PENDING_OF" ]; then
   if ! is_reconciliation "$PENDING_OF"; then
@@ -281,97 +271,81 @@ if [ -n "$ANCHOR_REF" ]; then
   ANCHOR_SHA="$(git rev-list -n1 "$ANCHOR_REF")"
 fi
 
-if [ "$RELEASE_MODEL" = two-branch ]; then
-  PENDING_VERSION="${PENDING_VERSION:-}"
-  PENDING_IN_RANGE="${PENDING_IN_RANGE:-false}"
-  case "$PENDING_IN_RANGE" in
-    false) ;;
-    true)
-      if [ "$CHANNEL" != stable ]; then
-        echo "::error::pending-in-range describes a stable run's range, but this run is on the ${CHANNEL} channel"
+PENDING_VERSION="${PENDING_VERSION:-}"
+PENDING_IN_RANGE="${PENDING_IN_RANGE:-false}"
+case "$PENDING_IN_RANGE" in
+  false) ;;
+  true)
+    if [ "$CHANNEL" != stable ]; then
+      echo "::error::pending-in-range describes a stable run's range, but this run is on the ${CHANNEL} channel"
+      exit 1
+    fi
+    ;;
+  *)
+    echo "::error::pending-in-range must be 'true' or 'false', got '${PENDING_IN_RANGE}'"
+    exit 1
+    ;;
+esac
+if [ -n "$PENDING_VERSION" ] && ! [[ $PENDING_VERSION =~ $PATTERN ]]; then
+  echo "::error::pending-version '${PENDING_VERSION}' is not of the form ${PREFIX}vX.Y.Z"
+  exit 1
+fi
+
+HEAD_SHA="$(git rev-parse HEAD)"
+H_TAG="" H_COMMIT="" HEAD_TAG=""
+while read -r name commit; do
+  if [ -z "$H_TAG" ] || version_gt "$name" "$H_TAG"; then
+    H_TAG="$name"
+    H_COMMIT="$commit"
+  fi
+  if [ "$commit" = "$HEAD_SHA" ] && { [ -z "$HEAD_TAG" ] || version_gt "$name" "$HEAD_TAG"; }; then
+    HEAD_TAG="$name"
+  fi
+done < <(stable_tags)
+# Every stable tag sits on main's history, so a stable HEAD that does not
+# contain H is an older commit (a re-run after a newer release): numbering it
+# above H would publish older content as the newest version.
+if [ "$CHANNEL" = stable ] && [ -n "$H_COMMIT" ] && ! git merge-base --is-ancestor "$H_COMMIT" HEAD; then
+  echo "::error::the highest stable tag ${H_TAG} is on ${H_COMMIT}, which HEAD does not contain, so an older commit is not published above it"
+  exit 1
+fi
+H="$H_TAG"
+if [ "$CHANNEL" = dev ] && [ -n "$PENDING_VERSION" ] && { [ -z "$H" ] || version_gt "$PENDING_VERSION" "$H"; }; then
+  H="$PENDING_VERSION"
+fi
+
+# A stable run at a tagged commit is the repair of that release: same version.
+if [ "$CHANNEL" = stable ] && [ -n "$HEAD_TAG" ]; then
+  RANGE_FROM=""
+  LEVEL=none
+  BASE="$HEAD_TAG"
+else
+  if [ "$PENDING_IN_RANGE" = true ]; then
+    RANGE_FROM="$H_COMMIT"
+  else
+    if [ "$CHANNEL" = dev ]; then
+      MAIN_REF=refs/remotes/origin/main
+      if ! git rev-parse --verify --quiet "${MAIN_REF}^{commit}" >/dev/null; then
+        echo "::error::a two-branch dev run needs ${MAIN_REF} to exclude promoted commits. Check out with fetch-depth: 0."
         exit 1
       fi
-      ;;
-    *)
-      echo "::error::pending-in-range must be 'true' or 'false', got '${PENDING_IN_RANGE}'"
-      exit 1
-      ;;
-  esac
-  if [ -n "$PENDING_VERSION" ] && ! [[ $PENDING_VERSION =~ $PATTERN ]]; then
-    echo "::error::pending-version '${PENDING_VERSION}' is not of the form ${PREFIX}vX.Y.Z"
-    exit 1
-  fi
-
-  HEAD_SHA="$(git rev-parse HEAD)"
-  H_TAG="" H_COMMIT="" HEAD_TAG=""
-  while read -r name commit; do
-    if [ -z "$H_TAG" ] || version_gt "$name" "$H_TAG"; then
-      H_TAG="$name"
-      H_COMMIT="$commit"
+    else
+      MAIN_REF=HEAD
     fi
-    if [ "$commit" = "$HEAD_SHA" ] && { [ -z "$HEAD_TAG" ] || version_gt "$name" "$HEAD_TAG"; }; then
-      HEAD_TAG="$name"
-    fi
-  done < <(stable_tags)
-  # Every stable tag sits on main's history, so a stable HEAD that does not
-  # contain H is an older commit (a re-run after a newer release): numbering it
-  # above H would publish older content as the newest version.
-  if [ "$CHANNEL" = stable ] && [ -n "$H_COMMIT" ] && ! git merge-base --is-ancestor "$H_COMMIT" HEAD; then
-    echo "::error::the highest stable tag ${H_TAG} is on ${H_COMMIT}, which HEAD does not contain, so an older commit is not published above it"
-    exit 1
+    # A promotion's commits are counted by the stable run that publishes it,
+    # never again by the runs after it.
+    RANGE_FROM="$(newer_on_chain "$MAIN_REF" "$H_COMMIT" "$(newest_reconciliation "$MAIN_REF")")"
   fi
-  H="$H_TAG"
-  if [ "$CHANNEL" = dev ] && [ -n "$PENDING_VERSION" ] && { [ -z "$H" ] || version_gt "$PENDING_VERSION" "$H"; }; then
-    H="$PENDING_VERSION"
-  fi
-
-  # A stable run at a tagged commit is the repair of that release: same version.
-  if [ "$CHANNEL" = stable ] && [ -n "$HEAD_TAG" ]; then
-    RANGE_FROM=""
-    LEVEL=none
-    BASE="$HEAD_TAG"
+  cliff_level "$RANGE_FROM" HEAD
+  if [ -z "$H" ]; then
+    BASE="$CLIFF_VERSION"
+  elif [ "$CHANNEL" = stable ] && [ "$PENDING_IN_RANGE" = false ]; then
+    BASE="$(patch_bump "$H")"
   else
-    if [ "$PENDING_IN_RANGE" = true ]; then
-      RANGE_FROM="$H_COMMIT"
-    else
-      if [ "$CHANNEL" = dev ]; then
-        MAIN_REF=refs/remotes/origin/main
-        if ! git rev-parse --verify --quiet "${MAIN_REF}^{commit}" >/dev/null; then
-          echo "::error::a two-branch dev run needs ${MAIN_REF} to exclude promoted commits. Check out with fetch-depth: 0."
-          exit 1
-        fi
-      else
-        MAIN_REF=HEAD
-      fi
-      # A promotion's commits are counted by the stable run that publishes it,
-      # never again by the runs after it.
-      RANGE_FROM="$(newer_on_chain "$MAIN_REF" "$H_COMMIT" "$(newest_reconciliation "$MAIN_REF")")"
-    fi
-    cliff_level "$RANGE_FROM" HEAD
-    if [ -z "$H" ]; then
-      BASE="$CLIFF_VERSION"
-    elif [ "$CHANNEL" = stable ] && [ "$PENDING_IN_RANGE" = false ]; then
-      BASE="$(patch_bump "$H")"
-    else
-      BASE="$(promotion_version "$H" "$LEVEL")"
-    fi
+    BASE="$(promotion_version "$H" "$LEVEL")"
   fi
-  LATEST="$H_TAG"
-else
-  # --unreleased anchors the base at the newest matching tag; without it a tag
-  # whose whole commit window is filtered out vanishes from cliff's release model
-  # and the base regresses to an older tag (verified on git-cliff 2.13.1).
-  if ! BASE="$("$CLIFF_BIN" --unreleased --bumped-version "${ARGS[@]}" 2>"$err")"; then
-    echo "::error::git-cliff --bumped-version failed:"
-    sed 's/^/  /' "$err" >&2 || true
-    exit 1
-  fi
-  if [ -z "$BASE" ]; then
-    echo "::error::git-cliff returned an empty version with no error"
-    exit 1
-  fi
-  LATEST="$REACHABLE_STABLE"
 fi
+LATEST="$H_TAG"
 case "$BASE" in
   "${PREFIX}"v[0-9]*) ;;
   *)
@@ -380,12 +354,6 @@ case "$BASE" in
     ;;
 esac
 
-FLOOR_BASE=""
-FLOOR_DEV_VERSION=""
-if [ -n "$LATEST" ]; then
-  FLOOR_BASE="$(patch_bump "$LATEST")"
-  FLOOR_DEV_VERSION="$(dev_version "$FLOOR_BASE")"
-fi
 DEV_VERSION="$(dev_version "$BASE")"
 if [ "$BASE" = "$LATEST" ]; then
   RELEASE=false
@@ -396,21 +364,12 @@ fi
 {
   echo "base=${BASE}"
   echo "dev_version=${DEV_VERSION}"
-  echo "floor_base=${FLOOR_BASE}"
-  echo "floor_dev_version=${FLOOR_DEV_VERSION}"
   echo "latest=${LATEST}"
   echo "anchor_sha=${ANCHOR_SHA}"
   echo "version=${BASE}"
   echo "release=${RELEASE}"
-  if [ "$RELEASE_MODEL" = two-branch ]; then
-    echo "release_model=two-branch"
-    echo "h_tag=${H_TAG}"
-    echo "range_from=${RANGE_FROM}"
-    echo "change_level=${LEVEL}"
-  fi
+  echo "h_tag=${H_TAG}"
+  echo "range_from=${RANGE_FROM}"
+  echo "change_level=${LEVEL}"
 } >>"$GITHUB_OUTPUT"
-if [ "$RELEASE_MODEL" = two-branch ]; then
-  echo "Computed version: ${BASE} (dev: ${DEV_VERSION}; H: ${H:-<none>}; highest stable tag: ${H_TAG:-<none>}; range: ${RANGE_FROM:-<root>}..HEAD; level: ${LEVEL}; channel: ${CHANNEL}; two-branch)"
-else
-  echo "Computed version: ${BASE} (dev: ${DEV_VERSION}; latest stable: ${LATEST:-<none>}; anchor: ${ANCHOR_SHA:-<none>}; channel: ${CHANNEL})"
-fi
+echo "Computed version: ${BASE} (dev: ${DEV_VERSION}; H: ${H:-<none>}; highest stable tag: ${H_TAG:-<none>}; range: ${RANGE_FROM:-<root>}..HEAD; level: ${LEVEL}; channel: ${CHANNEL})"

@@ -62,17 +62,17 @@ In `cplieger/ci` itself, a `deadset-canary` job runs the same workflow with the 
 
 Before it tags a release or pushes an image, the workflow checks the root `go.mod` module path. A library's path must be `github.com/<owner>/<repo>`, with a `/vN` suffix from major version 2 on. An image repository's path must be the plain `github.com/<owner>/<repo>` at every major version, because nothing imports an app. A repository with no root `go.mod` skips the check.
 
-On the `v3` line, the branch picks the channel. A push to `dev` publishes the dev channel, with `vX.Y.Z-dev.N` tags, `:dev` images on GitHub Container Registry, the npm `dev` dist-tag and no GitHub Release. A push to any other branch publishes the stable channel, with a `vX.Y.Z` tag, GitHub Container Registry and Docker Hub images, npm and JSR packages, and a GitHub Release. The `v2` line has no dev channel and publishes stable releases only.
+The branch picks the channel. A push to `dev` publishes the dev channel, with `vX.Y.Z-dev.N` tags, `:dev` images on GitHub Container Registry, the npm `dev` dist-tag and no GitHub Release. A push to `main` publishes the stable channel, with a `vX.Y.Z` tag, GitHub Container Registry and Docker Hub images, npm and JSR packages, and a GitHub Release. A run on any other branch, a tag or a pull request fails with an error and publishes nothing.
 
-On the `v3` line, the default branch also picks the release model. A repository whose default branch is `main` releases as this section describes. A public repository whose default branch is `dev` follows [the two-branch release model](#the-two-branch-release-model). A private repository or a fork keeps the first model, whatever its default branch.
+`release.yaml` publishes only from a public, non-fork repository whose default branch is `dev`, which follows [the two-branch release model](#the-two-branch-release-model). For any other caller its first job fails with an error, before anything is built or published. The sync gives a repository with only `main` no release workflow, and such a repository publishes, if at all, from its own workflow.
 
-`docker-release.yaml` is called by `release.yaml` and never directly. On the `v2` line, one run builds the image on native `amd64` and `arm64` runners and signs it with cosign. The same run attaches an SBOM, runs a Trivy scan, pushes the image to both registries and creates the GitHub Release. It also writes the Docker Hub overview page from the README. On the `v3` line the work splits by channel.
+`docker-release.yaml` is called by `release.yaml` and never directly. Its first job refuses the same callers, in a repair as in a release. Its work splits by channel.
 
 On the dev channel it builds the image on native `amd64` and `arm64` runners and pushes it to GitHub Container Registry. It signs the image with cosign, attaches an SBOM and runs a Trivy scan. A repository with a root `grafana-dashboard.json` also gets the dashboard pushed as an OCI artifact.
 
 On the stable channel it re-tags the image the dev channel built for that commit as `vX.Y.Z`, `vX.Y`, `vX` and `latest`. It copies the image to Docker Hub with its signatures and creates the GitHub Release with the SBOM and the dashboard. When no dev build matches, it builds from source and says so in the run summary. It also writes the Docker Hub overview page from the README.
 
-On the `v3` line, a job that runs a script or action from cplieger/ci first checks out cplieger/ci at the commit you pinned. The copy goes to `.cplieger-ci` beside your checkout and keeps no token on disk. So the commit you pin decides every line of cplieger/ci code the run executes. The `pr-policy` job of `ci.yaml` works the same way.
+A job that runs a script or action from cplieger/ci first checks out cplieger/ci at the commit you pinned. The copy goes to `.cplieger-ci` beside your checkout and keeps no token on disk. So the commit you pin decides every line of cplieger/ci code the run executes. The `pr-policy` job of `ci.yaml` works the same way.
 
 ## The two-branch release model
 
@@ -116,7 +116,7 @@ It then writes a promotion commit whose tree is the `dev` commit's and whose par
 
 | Action | What it does |
 | --- | --- |
-| `actions/git-cliff-version` | installs git-cliff and outputs the next stable version, its dev and patch-floor variants, and a `release` boolean. `release-model` selects the two-branch numbering. Callable directly |
+| `actions/git-cliff-version` | installs git-cliff and outputs the next stable version under the two-branch numbering, its dev variant, and a `release` boolean. Callable directly |
 | `actions/publish-badge` | writes one shields.io endpoint JSON to the repository's `badges` branch and keeps the other badge files there |
 | `actions/publish-surface` | checks that npm and JSR publish exactly the files the package's `exports` reach, and no undeclared package |
 | `actions/render-hub-overview` | builds the Docker Hub overview page from the README's marked summary and `compose.yaml` |
@@ -134,7 +134,7 @@ The daily settings audit holds a two-branch repository to squash merges titled b
 
 On its schedule and when started by hand, the audit files its findings as issues. Each public repository it grades that has issues turned on keeps one `Repository audit findings` issue, labelled `repo-audit`. The findings of any other repository stay in the run summary. The issue lists the repository's HARD findings and warnings. It is updated in place on each run and closed once the repository audits clean.
 
-A repository created less than 24 hours ago is graded but gets no issue yet. When a read for a repository fails, its issue is left as it is for that run. The warning that a repository still releases straight from `main` stays out of the issues until some repository uses `dev` as its default branch.
+A repository created less than 24 hours ago is graded but gets no issue yet. When a read for a repository fails, its issue is left as it is for that run. A public repository outside `SINGLE_MAIN_REPOS` whose default branch is `main` and which calls `release.yaml` is a HARD finding, because that workflow refuses it. One that publishes from its own `publish.yaml` is a warning until it is added to `SINGLE_MAIN_REPOS`.
 
 `release-maintenance.yaml` runs every hour for two-branch repositories only. It merges a Renovate security pull request on `dev` or `main` when `ci / validate` is green and the pull request carries a patch, minor, digest or pin label.
 

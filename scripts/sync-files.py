@@ -2,23 +2,35 @@
 """File-sync engine: push canonical files from this checkout into consumer repos as PRs.
 
 Per manifest target (a repo, or a repo and a `base:`): clone, copy the mapped files from
-this checkout, commit
-`chore(sync): ...`, force-push `repo-sync/ci/default` (`repo-sync/ci/<base>` with --branch
-and --base), and keep one `dependencies` PR open. No diff, no PR; an open sync PR whose
-diff evaporated is closed. Files are only added or updated; forks are skipped unless
---allow-forks. A failed target never stops the rest, and the exit is then non-zero.
+this checkout, commit `chore(sync): ...`, force-push `repo-sync/ci/default`
+(`repo-sync/ci/<base>` for a base target), and keep one `dependencies` PR open. No diff,
+no PR; an open sync PR whose diff evaporated is closed. Files are only added or updated;
+forks are skipped unless --allow-forks. A failed target never stops the rest, and the
+exit is then non-zero.
 
-Auth: the ambient `gh` credentials over REST; git pushes through gh's credential helper,
-so no token reaches a remote URL or process output.
+--arm-open-prs is sync.yaml's auto-merge sweep: over the same targets a sync would write
+(--only, forks skipped), it re-reads each target's open sync PRs and arms or merges each
+it finds, exiting non-zero when a found `base: main` PR was left open. A target whose
+lookup fails is warned and skipped.
+
+Targets run on --workers threads (fanout.py), each target's log printed whole in
+manifest order; with more than one worker, writes are paced (WRITE_GAP), and a rate-limit
+refusal holds every worker (ghrest.Pacer).
+
+Auth: a GitHub App installation token in GH_TOKEN, whose installation lists the repos;
+git pushes through gh's credential helper, so no token reaches a remote URL or process
+output.
 """
 
 import argparse
+import functools
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+import fanout
 import ghrest
 import yaml
 
@@ -29,11 +41,18 @@ COMMIT_SUBJECT = 'chore(sync): synced file(s) with cplieger/ci'
 PR_TITLE = COMMIT_SUBJECT
 PR_LABEL = 'dependencies'
 CLOSE_COMMENT = "Closing: the target branch already contains this sync's content."
-GIT_USER = 'github-actions[bot]'
-GIT_EMAIL = '41898282+github-actions[bot]@users.noreply.github.com'
+# The App whose installation token sync.yaml pushes with, so commit and push name one actor.
+GIT_USER = 'tribble-trouble[bot]'
+GIT_EMAIL = '338123824+tribble-trouble[bot]@users.noreply.github.com'
 # Repo-local credential helper: git asks gh, gh uses GH_TOKEN/keyring. The
 # leading ! marks a shell-out helper; scoped to each clone, never global.
 CRED_HELPER = '!gh auth git-credential'
+# Seconds between the starts of two writes once targets run concurrently (ghrest.Pacer
+# cites GitHub's rule); --workers 1 is the serial engine and spaces nothing.
+WRITE_GAP = 1.0
+PACER = ghrest.Pacer()
+RUN = ghrest.paced(ghrest.run_process, PACER)
+REST = ghrest.Client(run=RUN, pause=PACER.pause)
 
 
 class ManifestError(ValueError):
@@ -148,16 +167,14 @@ def own_head(row, repo):
 
 
 def open_pulls(repo, base):
-    """The open sync pull requests of this target, newest first. A base target takes
-    only heads in this repository, because a fork's pull request can carry the same
-    name; a main-default target takes a head of that name from any repository."""
+    """The open sync pull requests of this target, newest first: only heads in this
+    repository. A fork's pull request can carry the same branch name, and the sweep
+    arms or merges every row returned here with a write credential."""
     scope = '' if base is None else f'&base={base}'
-    rows = ghrest.pages(f'repos/{repo}/pulls?state=open&sort=created&direction=desc{scope}')
+    rows = REST.pages(f'repos/{repo}/pulls?state=open&sort=created&direction=desc{scope}')
     head = branch_for(base)
     return [
-        row
-        for row in rows
-        if (row.get('head') or {}).get('ref') == head and (base is None or own_head(row, repo))
+        row for row in rows if (row.get('head') or {}).get('ref') == head and own_head(row, repo)
     ]
 
 
@@ -170,8 +187,8 @@ def add_label(repo, number):
     """Label the PR when the repo has PR_LABEL; a missing label is never created, and a
     failure is a warning, never a failed sync."""
     try:
-        if ghrest.get_or_none(f'repos/{repo}/labels/{PR_LABEL}') is not None:
-            ghrest.send('POST', f'repos/{repo}/issues/{number}/labels', {'labels': [PR_LABEL]})
+        if REST.get_or_none(f'repos/{repo}/labels/{PR_LABEL}') is not None:
+            REST.send('POST', f'repos/{repo}/issues/{number}/labels', {'labels': [PR_LABEL]})
     except ghrest.ApiError as err:
         print(f'::warning::{repo}#{number}: label {PR_LABEL} was not applied: {err}')
 
@@ -190,7 +207,7 @@ def ensure_pr(repo, base, into, changed):
         'Files updated in this run:',
         *[f'- `{path}`' for path in changed],
     ]
-    pr = ghrest.send(
+    pr = REST.send(
         'POST',
         f'repos/{repo}/pulls',
         {'title': PR_TITLE, 'head': branch_for(base), 'base': into, 'body': '\n'.join(body_lines)},
@@ -201,20 +218,17 @@ def ensure_pr(repo, base, into, changed):
 
 def close_stale_pr(repo, base, row):
     """No diff this run: close a leftover open sync PR whose content has since landed
-    on its target branch some other way. Each failed step is a warning; a fork's
-    head branch is not ours to delete."""
+    on its target branch some other way. Each failed step is a warning. `row` comes
+    from open_pulls, so its head branch is this repository's to delete."""
     number, label = row['number'], target_label(repo, base)
     steps = [
         ('comment', 'POST', f'repos/{repo}/issues/{number}/comments', {'body': CLOSE_COMMENT}),
         ('close', 'PATCH', f'repos/{repo}/pulls/{number}', {'state': 'closed'}),
+        ('branch delete', 'DELETE', f'repos/{repo}/git/refs/heads/{branch_for(base)}', None),
     ]
-    if own_head(row, repo):
-        steps.append(
-            ('branch delete', 'DELETE', f'repos/{repo}/git/refs/heads/{branch_for(base)}', None)
-        )
     for what, method, path, body in steps:
         try:
-            ghrest.send(method, path, body)
+            REST.send(method, path, body)
         except ghrest.ApiError as err:
             # 422 is GitHub's answer for a ref that no longer exists.
             if what != 'branch delete' or err.status != 422:
@@ -260,6 +274,25 @@ def sync_repo(repo, base, dest_map, source_root, dry_run):
         return 'changed'
 
 
+def sync_target(target, dest_map, source_root, dry_run):
+    """sync_repo inside the target's log group; None when the target failed."""
+    repo, base = target
+    label = target_label(repo, base)
+    print(f'::group::{label}')
+    try:
+        return sync_repo(repo, base, dest_map, source_root, dry_run)
+    except (subprocess.CalledProcessError, ghrest.ApiError, OSError) as exc:
+        detail = (
+            exc.stderr.strip()
+            if isinstance(exc, subprocess.CalledProcessError) and exc.stderr
+            else str(exc)
+        )
+        print(f'::warning::{label}: sync failed — {detail}')
+        return None
+    finally:
+        print('::endgroup::')
+
+
 def fork_names():
     """Names of every fork under OWNER.
 
@@ -268,7 +301,8 @@ def fork_names():
     proceeding on an unverified manifest.
     """
     try:
-        repos = ghrest.pages('user/repos?affiliation=owner')
+        # The App token's listing (classify-repos.py discover_repos says why).
+        repos = REST.pages('installation/repositories', key='repositories')
     except ghrest.ApiError as err:
         sys.exit(
             f"sync-files: cannot read {OWNER}'s repo list, so forks cannot "
@@ -294,19 +328,108 @@ def drop_forks(mapping):
     return kept
 
 
-def print_open_prs(mapping):
-    """`<repo name> <number> <head> [<base>]` per open sync PR, for sync.yaml's sweep;
-    a target whose lookup fails is a warning on stderr and is skipped."""
-    for repo, base in sorted(mapping, key=target_key):
-        try:
-            rows = open_pulls(repo, base)
-        except ghrest.ApiError as err:
-            msg = f'::warning::{target_label(repo, base)}: the open sync PR lookup failed: {err}'
-            print(msg, file=sys.stderr)
-            continue
-        for row in rows:
-            fields = [repo.split('/')[-1], str(row['number']), branch_for(base)]
-            print(' '.join([*fields, *([base] if base else [])]))
+def sweep_lookup(target):
+    """The target's open sync PRs; none, after a warning, when the lookup failed."""
+    repo, base = target
+    try:
+        return open_pulls(repo, base)
+    except ghrest.ApiError as err:
+        print(f'::warning::{target_label(repo, base)}: the open sync PR lookup failed: {err}')
+        return []
+
+
+def delete_merged_head(repo, number):
+    """The branch delete `gh pr merge --delete-branch` makes; a 422 means the merge
+    already deleted it. The PR came from open_pulls, so its head is this repository's."""
+    try:
+        REST.send('DELETE', f'repos/{repo}/git/refs/heads/{BRANCH}')
+    except ghrest.ApiError as err:
+        if err.status != 422:
+            print(f'  WARN: merged {repo}#{number} but could not delete {BRANCH}: {err}')
+
+
+def merged(repo, number):
+    """Whether the pull request is merged; False when that cannot be read."""
+    try:
+        return bool((REST.get(f'repos/{repo}/pulls/{number}') or {}).get('merged_at'))
+    except ghrest.ApiError:
+        return False
+
+
+def arm_default(repo, number):
+    """Arm a main-default target's PR, else squash-merge it directly: GitHub refuses
+    --auto on a pull request that is already merge-ready. A rate-limit refusal is no
+    such answer, so it leaves the PR open unless a re-read finds it merged: `gh pr
+    merge` is several requests, and the refused one can follow the merge."""
+    # gh reads an OWNER/REPO#NUMBER shorthand as a branch name, hence --repo.
+    args = ['pr', 'merge', '--auto', '--squash', '--delete-branch', '--repo', repo, str(number)]
+    try:
+        auto = RUN(args)
+    except (ghrest.ApiError, OSError) as err:
+        print(f'  WARN: failed to merge {repo}#{number}: auto-merge did not run ({err})')
+        return
+    if auto.returncode == 0:
+        print(f'{repo}#{number}: armed')
+        return
+    refused = ' '.join(auto.stderr.decode(errors='replace').split()) or f'exit {auto.returncode}'
+    if ghrest.refused_by_rate_limit(auto):
+        if merged(repo, number):
+            print(f'{repo}#{number}: merged')
+            return
+        print(f'  WARN: failed to merge {repo}#{number}: auto-merge rate limited ({refused})')
+        return
+    try:
+        REST.send('PUT', f'repos/{repo}/pulls/{number}/merge', {'merge_method': 'squash'})
+    except ghrest.ApiError as err:
+        print(f'  WARN: failed to merge {repo}#{number}: auto-merge refused ({refused}) and {err}')
+        return
+    print(f'{repo}#{number}: merged')
+    delete_merged_head(repo, number)
+
+
+def arm(pr, merge_checked):
+    """Arm or merge one open sync PR; False only when a `base: main` target's PR was
+    left open (a main-default or `dev` refusal is a warning)."""
+    repo, base, number = pr
+    print(f'Enabling auto-merge on {repo}#{number}')
+    if base is None:
+        arm_default(repo, number)
+        return True
+    # A base target's PR is armed or merged only after merge_checked's fresh read of its
+    # base and head; merge_checked owns why.
+    name = repo.split('/')[-1]
+    head = branch_for(base)
+    if merge_checked(name, number, base=base, head=head):
+        return True
+    if base == 'dev':
+        print(f'  WARN: failed to merge {repo}#{number}')
+        return True
+    return False
+
+
+def arm_open_prs(mapping, workers):
+    """Arm or merge every open sync PR a fresh read finds; 1 when a found `base: main`
+    PR was left open, else 0. A target whose lookup fails is warned and skipped, and
+    does not change the exit."""
+    # Imported here, so an import-time break in its tracker modules stops only the
+    # sweep, never file propagation.
+    import release_maintenance
+
+    api = release_maintenance.Api(run=RUN, pause=PACER.pause)
+    merge_checked = functools.partial(release_maintenance.report_merge_checked, api)
+    targets = sorted(mapping, key=target_key)
+    prs = [
+        (repo, base, row['number'])
+        for (repo, base), rows in fanout.ordered(targets, sweep_lookup, workers)
+        for row in rows
+    ]
+    left_open = [
+        pr for pr, ok in fanout.ordered(prs, lambda pr: arm(pr, merge_checked), workers) if not ok
+    ]
+    if left_open:
+        print('::error::a sync pull request into main was left open, as the lines above show')
+        return 1
+    return 0
 
 
 def main():
@@ -327,25 +450,33 @@ def main():
         '--allow-forks', action='store_true', help='sync forks too (default: forks are skipped)'
     )
     ap.add_argument(
-        '--print-open-prs',
+        '--arm-open-prs',
         action='store_true',
-        help='print each open sync PR as "<repo> <number> <head> [<base>]" and exit',
+        help='arm or merge the open sync PRs of the selected targets, then exit',
+    )
+    ap.add_argument(
+        '--workers',
+        type=int,
+        default=fanout.WORKERS,
+        help=f'targets handled at once, 1 to {fanout.MAX_WORKERS} (default {fanout.WORKERS})',
     )
     args = ap.parse_args()
+    if not 1 <= args.workers <= fanout.MAX_WORKERS:
+        ap.error(f'--workers must be 1 to {fanout.MAX_WORKERS}')
+    PACER.gap = WRITE_GAP if args.workers > 1 else 0.0
 
     source_root = Path(args.source_dir).resolve()
     try:
         mapping = load_mapping(args.manifest)
     except ManifestError as err:
         sys.exit(f'::error::sync-files: {err}')
-    if args.print_open_prs:
-        print_open_prs(mapping)
-        return
     if args.only:
         wanted = {w.strip() for w in args.only.replace(',', ' ').split() if w.strip()}
         mapping = {t: f for t, f in mapping.items() if t[0].split('/')[-1] in wanted}
     if not args.allow_forks:
         mapping = drop_forks(mapping)
+    if args.arm_open_prs:
+        sys.exit(arm_open_prs(mapping, args.workers))
 
     if not mapping:
         print('nothing to sync (empty mapping after filters)')
@@ -353,21 +484,16 @@ def main():
 
     counts = {'changed': 0, 'clean': 0, 'dry': 0}
     failures = []
-    for repo, base in sorted(mapping, key=target_key):
-        label = target_label(repo, base)
-        print(f'::group::{label}')
-        try:
-            outcome = sync_repo(repo, base, mapping[repo, base], source_root, args.dry_run)
+    targets = sorted(mapping, key=target_key)
+    for target, outcome in fanout.ordered(
+        targets,
+        lambda t: sync_target(t, mapping[t], source_root, args.dry_run),
+        args.workers,
+    ):
+        if outcome is None:
+            failures.append(target_label(*target))
+        else:
             counts[outcome] += 1
-        except (subprocess.CalledProcessError, ghrest.ApiError, OSError) as exc:
-            detail = (
-                exc.stderr.strip()
-                if isinstance(exc, subprocess.CalledProcessError) and exc.stderr
-                else str(exc)
-            )
-            print(f'::warning::{label}: sync failed — {detail}')
-            failures.append(label)
-        print('::endgroup::')
 
     total = len(mapping)
     noun = 'repo(s)' if all(base is None for _repo, base in mapping) else 'target(s)'

@@ -6,8 +6,9 @@ name: Sync shared files
 # repo-sync/ci/dev plus repo-sync/ci/main for a dev-default one, which also
 # receives the two-branch renovate.json.
 #
-# Requires a SYNC_PAT secret: a fine-grained PAT with Contents:write +
-# Pull-requests:write on the target repos.
+# Authenticates as the tribble-trouble GitHub App, installed on every repo of
+# the account: secrets SYNC_APP_ID (the App ID) and SYNC_APP_PRIVATE_KEY. Its
+# pushes and merges start the consumers' workflows, which GITHUB_TOKEN's do not.
 
 on:
   push:
@@ -18,8 +19,10 @@ on:
       - ".gitattributes"
       - "configs/**"
       - "scripts/classify-repos.py"
+      - "scripts/fanout.py"
       - "scripts/ghrest.py"
       - "scripts/release_channels.py"
+      - "scripts/release_maintenance.py"
       - "scripts/sync-files.py"
       - ".github/workflow-templates/**"
   schedule:
@@ -51,6 +54,24 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      # One token for the whole job: it lives an hour and the job is capped at
+      # 15 minutes. If minting fails, classify and sync are skipped and the
+      # always() sweep fails on the missing manifest, so the run goes red.
+      - name: Mint the App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          # client-id also takes the numeric App ID (the action's lib/main.js
+          # hands it to @octokit/auth-app as appId); app-id is deprecated.
+          client-id: ${{ secrets.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          owner: cplieger
+          permission-checks: read
+          permission-contents: write
+          permission-metadata: read
+          permission-pull-requests: write
+          permission-workflows: write
+
       # Regenerate the repo↔file manifest fresh on every run, then hand it
       # straight to scripts/sync-files.py below via --manifest. The file is
       # gitignored and never committed: it's a build artifact, and a committed
@@ -58,17 +79,18 @@ jobs:
       # REST). classify-repos.py is the source of truth.
       - name: Auto-classify repos
         env:
-          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: python3 scripts/classify-repos.py > .github/sync.yml
         timeout-minutes: 5
 
       # In-house engine: shallow-clones each target, copies the mapped files,
       # commits `chore(sync): …` on its repo-sync/ci/* branch, force-pushes,
-      # and ensures an open labelled PR (closing stale empty ones). Failure
-      # isolation per target; exits non-zero at the end if any target failed.
+      # and ensures an open labelled PR (closing stale empty ones). Targets run
+      # concurrently with failure isolation per target; exits non-zero at the
+      # end if any target failed.
       - name: Sync files to consumer repos
         env:
-          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: python3 scripts/sync-files.py --manifest .github/sync.yml
         timeout-minutes: 15
 
@@ -76,60 +98,13 @@ jobs:
         # Sync PRs auto-merge once the consumer's required checks pass (at
         # once with none). always() plus a fresh REST sweep, rather than the
         # sync step's output, so a partial sync failure does not strand the
-        # PRs it did open without auto-merge.
+        # PRs it did open without auto-merge. Fails when a found two-branch
+        # sync PR into main was left open, or when the repo list the fork skip
+        # needs is unreadable; a failed PR lookup only warns.
         if: always()
         env:
-          GH_TOKEN: ${{ secrets.SYNC_PAT }}
-        run: |
-          # The branch delete `gh pr merge --delete-branch` makes: only this
-          # repository's own head, and 422 means the merge already deleted it.
-          delete_head() { # <repo> <pr> <head>
-            local owner err
-            if ! owner=$(gh api "repos/cplieger/$1/pulls/$2" --jq '.head.repo.full_name // ""'); then
-              echo "  WARN: merged cplieger/$1#$2 but could not read its head to delete it"
-              return 0
-            fi
-            [ "${owner}" = "cplieger/$1" ] || return 0
-            if ! err=$(gh api -X DELETE "repos/cplieger/$1/git/refs/heads/$3" 2>&1 >/dev/null); then
-              case "${err}" in
-                *"(HTTP 422)"*) ;;
-                *) echo "  WARN: merged cplieger/$1#$2 but could not delete $3: ${err}" ;;
-              esac
-            fi
-          }
-          prs=$(python3 scripts/sync-files.py --manifest .github/sync.yml --print-open-prs)
-          refused=0
-          # fd 3, so no command in the loop can consume the list from stdin.
-          while read -r repo pr head base <&3; do
-            [ -n "${repo}" ] || continue
-            echo "Enabling auto-merge on cplieger/${repo}#${pr}"
-            # A base target's pull request is armed or merged only after a fresh
-            # read of its base and head: main's ruleset lets this owner credential
-            # bypass ci / validate.
-            if [ "${base}" = main ]; then
-              python3 scripts/release_maintenance.py merge-checked "${repo}" "${pr}" --base main --head "${head}" || refused=1
-              continue
-            fi
-            if [ "${base}" = dev ]; then
-              python3 scripts/release_maintenance.py merge-checked "${repo}" "${pr}" --base dev --head "${head}" || \
-                echo "  WARN: failed to merge cplieger/${repo}#${pr}"
-              continue
-            fi
-            # gh pr merge needs --repo plus a bare PR number: it reads the
-            # OWNER/REPO#NUMBER shorthand as a branch name. Fall back to a
-            # direct squash-merge because GitHub refuses --auto on a PR that
-            # is already in a clean, merge-ready state.
-            gh pr merge --auto --squash --delete-branch --repo "cplieger/${repo}" "${pr}" && continue
-            if gh api -X PUT "repos/cplieger/${repo}/pulls/${pr}/merge" -f merge_method=squash >/dev/null; then
-              delete_head "${repo}" "${pr}" "${head}"
-            else
-              echo "  WARN: failed to merge cplieger/${repo}#${pr}"
-            fi
-          done 3<<< "${prs}"
-          if [ "${refused}" != 0 ]; then
-            echo "::error::a sync pull request into main was left open, as the lines above show"
-            exit 1
-          fi
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: python3 scripts/sync-files.py --manifest .github/sync.yml --arm-open-prs
 
   # `needs:` must list every other job in this workflow.
   notify:

@@ -48,11 +48,9 @@ An image release pushes to GitHub Container Registry and to Docker Hub under the
 
 ## Versions and compatibility
 
-Each release gets a `vX.Y.Z` tag, and the `vX` and `vX.Y` tags move to it. A breaking change starts a new major tag, and callers stay on their major tag until they change the pin. Pin `v3`, the current major line.
+Each release gets a `vX.Y.Z` tag, and the `vX` and `vX.Y` tags move to it. A breaking change starts a new major tag, and callers stay on their major tag until they change the pin. Pin `v3`, the current major line and the only one that gets fixes, as the [security policy](SECURITY.md) states.
 
-The `v3` line adds a dev channel to the release workflow. On `v3`, a push to a `dev` branch publishes pre-release versions with no GitHub Release. A public, non-fork repository whose default branch is `dev` also gets the [two-branch release model](docs/workflows.md#the-two-branch-release-model), where `main` publishes patches and a promotion from `dev`, started by hand, publishes the next minor or major. Merge such a repository's pull requests by squash, so each pull request title becomes one line in its release notes.
-
-Both `v2` and `v3` get security fixes, and `v1` gets none, as the [security policy](SECURITY.md) states.
+The release workflow publishes only from a public, non-fork repository whose default branch is `dev`, and for any other caller it fails in its first job, before anything is built or published. Such a repository follows the [two-branch release model](docs/workflows.md#the-two-branch-release-model). A push to `dev` publishes a pre-release with no GitHub Release, and `main` publishes patches. A promotion from `dev`, started by hand, publishes the next minor or major. Merge its pull requests by squash, so each pull request title becomes one line in its release notes.
 
 ## Using it outside the cplieger repositories
 

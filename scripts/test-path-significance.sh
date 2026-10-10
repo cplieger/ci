@@ -2,9 +2,6 @@
 # Regression probe for scripts/path-significance.sh and the ci-source
 # checkout that ships it. The workflow step body is EXTRACTED and executed in
 # fixture repositories, so the chain under test is the one that ships.
-#
-# PS_BASELINE=<file> also runs every release-mode fixture through that file
-# (an older inline step body) and requires identical outputs, summary and log.
 set -euo pipefail
 
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
@@ -50,7 +47,6 @@ changes = steps[names.index("Detect changed paths")]
 src = steps[names.index("Check out the ci source")]
 open(f"{out}/changes.sh", "w").write(changes["run"])
 open(f"{out}/changes.tools", "w").write(changes["env"]["CI_TOOLS"])
-open(f"{out}/changes.model", "w").write(changes["env"].get("RELEASE_MODEL", ""))
 open(f"{out}/src.with", "w").write(json.dumps(src["with"], sort_keys=True))
 open(f"{out}/src.order", "w").write(str(names.index("Check out the ci source") < names.index("Detect changed paths")))
 PY
@@ -62,8 +58,6 @@ chk "P1 at the workflow's own commit, beside the consumer's tree, without creden
   '{"path": ".cplieger-ci", "persist-credentials": false, "ref": "${{ job.workflow_sha }}", "repository": "${{ job.workflow_repository }}"}'
 # shellcheck disable=SC2016
 chk "P1 and hands the step that copy's scripts" "$(cat "$WORK/changes.tools")" '${{ github.workspace }}/.cplieger-ci/scripts'
-# shellcheck disable=SC2016
-chk "P1 and the release model detect selected" "$(cat "$WORK/changes.model")" '${{ steps.channel.outputs.release_model }}'
 TOOLS="$ROOT/scripts"
 
 # ── Fixture helpers ──────────────────────────────────────────────────────────
@@ -91,17 +85,6 @@ run_release() { # <body> -> outputs in $WORK/out, summary in $WORK/summary, log 
 release() {
   export CHANNEL="$2" BEFORE="$3" ANCHOR_SHA="$4" HEAD="$5"
   run_release "$WORK/changes.sh"
-  if [ -n "${PS_BASELINE:-}" ] && [ "${RELEASE_MODEL:-legacy}" = legacy ]; then
-    cp "$WORK/out" "$WORK/out.new"
-    cp "$WORK/summary" "$WORK/summary.new"
-    cp "$WORK/log" "$WORK/log.new"
-    run_release "$PS_BASELINE"
-    for k in out summary log; do
-      diff -u "$WORK/$k" "$WORK/$k.new" >&2 || fail "$1: $k differs from PS_BASELINE"
-    done
-    echo "ok: $1 matches PS_BASELINE byte for byte" >&2
-    echo "$1" >>"$WORK/baseline.matched"
-  fi
   grep -q '^EXIT=' "$WORK/log" && fail "$1: the step failed: $(cat "$WORK/log")"
   printf '%s|%s|%s' "$(sed -n 's/^root_changed=//p' "$WORK/out")" \
     "$(sed -n 's/^subpackages_to_publish=//p' "$WORK/out")" "$(sed -n 's/^go_modules_to_release=//p' "$WORK/out")"
@@ -171,16 +154,10 @@ git mv main.go testdata/main.go
 D7=$(commit "refactor: move the entrypoint into testdata")
 chk "S11r MODE=paths counts a shipped file moved under an excluded path" "$(paths "$D6" "$D7")" \
   'true|[]|[]|["main.go"]'
-chk "S11r legacy release mode sees only the excluded destination, as before" \
-  "$(RELEASE_MODEL=legacy release S11rl stable "$D6" "$D6" "$D7")" "false|[]|[]"
-chk "S11r two-branch release mode counts the shipped file that moved" \
-  "$(RELEASE_MODEL=two-branch release S11rt stable "$D6" "$D6" "$D7")" "true|[]|[]"
-chk "S11r so does a two-branch push range with no anchor" \
-  "$(RELEASE_MODEL=two-branch release S11rp dev "$D6" "" "$D7")" "true|[]|[]"
-rc=0
-RELEASE_MODEL=bogus BEFORE="$D6" HEAD="$D7" ANCHOR_SHA="" GITHUB_OUTPUT=/dev/null GITHUB_STEP_SUMMARY=/dev/null \
-  bash "$TOOLS/path-significance.sh" >/dev/null 2>&1 || rc=$?
-chk "S11r an unknown RELEASE_MODEL is status 2" "$rc" "2"
+chk "S11r release mode counts the shipped file that moved" \
+  "$(release S11rt stable "$D6" "$D6" "$D7")" "true|[]|[]"
+chk "S11r so does a push range with no anchor" \
+  "$(release S11rp dev "$D6" "" "$D7")" "true|[]|[]"
 put deadset.json '{}'
 put web/deadset-ignore.json '[]'
 put web/knip.json '{}'
@@ -265,13 +242,8 @@ git tag yamlenv/v1.0.2 "$H7"
 mkdir -p yamlenv/testdata
 git mv yamlenv/y.go yamlenv/testdata/y.go
 H8=$(commit "refactor(yamlenv): move the source under testdata")
-chk "S25 legacy release mode misses a lane file moved under an excluded path, as before" \
-  "$(RELEASE_MODEL=legacy release S25l stable "$H7" "$H7" "$H8")" 'false|[]|[]'
-chk "S25 two-branch release mode owes that lane a release from its own tag" \
-  "$(RELEASE_MODEL=two-branch release S25t stable "$H7" "$H7" "$H8")" 'false|[]|["yamlenv"]'
+chk "S25 a lane file moved under an excluded path owes that lane a release from its own tag" \
+  "$(release S25t stable "$H7" "$H7" "$H8")" 'false|[]|["yamlenv"]'
 cd "$WORK" || exit 1
 
-if [ -n "${PS_BASELINE:-}" ]; then
-  echo "PS_BASELINE: $(wc -l <"$WORK/baseline.matched" | tr -d ' ') release-mode runs identical to $PS_BASELINE"
-fi
 echo "PASS: path significance ($PASS checks)"

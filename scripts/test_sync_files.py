@@ -3,15 +3,19 @@ by stub `git` and `gh` binaries that log every call."""
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -94,9 +98,9 @@ parts = where.split('/')
 repo = '/'.join(parts[1:3])
 if f'{method} {where}' in fx.get('fail', {}):
     reply(fx['fail'][f'{method} {where}'], {'message': 'Resource not accessible by integration'})
-if (method, where) == ('GET', 'user/repos'):
+if (method, where) == ('GET', 'installation/repositories'):
     rows = [{'name': n, 'fork': n in fx.get('forks', [])} for n in fx['repos']]
-    reply(200, rows if q.get('page') == '1' else [])
+    reply(200, {'total_count': len(rows), 'repositories': rows if q.get('page') == '1' else []})
 if method == 'GET' and parts[3:] == ['pulls'] and query:
     rows = [r for r in fx.get('pulls', {}).get(repo, []) if q.get('base', r['base']['ref']) == r['base']['ref']]
     per, page = int(q['per_page']), int(q['page'])
@@ -147,7 +151,10 @@ def read_log(path):
 
 def run_sync(script, manifest, fixture, *extra, source_dir=ROOT):
     """{rc, stdout, stderr, git, gh, added} of one `script` run over a manifest dict;
-    `added` is each staged file as [repo, dest, text, executable]."""
+    `added` is each staged file as [repo, dest, text, executable]. One worker unless
+    `extra` names --workers, so the call logs keep the serial order."""
+    if '--workers' not in extra:
+        extra = (*extra, '--workers', '1')
     with tempfile.TemporaryDirectory() as name:
         tmp = pathlib.Path(name)
         env = install_stubs(tmp, fixture)
@@ -352,16 +359,18 @@ class MainDefault(unittest.TestCase):
         self.assertFalse([c for c in calls if 'labels' in c[1] and c[0] != 'GET'])
         self.assertNotIn('::warning::', got['stdout'])
 
-    def test_a_fork_pull_request_with_the_default_head_is_still_matched(self):
-        fork = listed('b', 5, 'repo-sync/ci/default', head_repo='someone/b')
-        fixture = {**MAIN_FIXTURE, 'pulls': {**MAIN_FIXTURE['pulls'], 'cplieger/b': [fork]}}
-        got = run_sync(SCRIPTS / 'sync-files.py', MAIN_MANIFEST, fixture)
+    def test_a_fork_pull_request_with_the_default_head_is_neither_reused_nor_closed(self):
+        pulls = {
+            **MAIN_FIXTURE['pulls'],
+            'cplieger/a': [listed('a', 6, 'repo-sync/ci/default', head_repo='someone/a')],
+            'cplieger/b': [listed('b', 5, 'repo-sync/ci/default', head_repo='someone/b')],
+        }
+        got = run_sync(SCRIPTS / 'sync-files.py', MAIN_MANIFEST, {**MAIN_FIXTURE, 'pulls': pulls})
         self.assertEqual(got['rc'], 0, got['stdout'])
-        writes = [c[:2] for c in api_calls(got['gh'], 'b') if c[0] != 'GET']
+        writes = [c[:2] for c in api_calls(got['gh']) if c[0] != 'GET']
         self.assertEqual(
             writes,
-            [('POST', 'repos/cplieger/b/issues/5/comments'), ('PATCH', 'repos/cplieger/b/pulls/5')],
-            "a fork's head branch is not this repository's to delete",
+            [('POST', 'repos/cplieger/a/pulls'), ('POST', 'repos/cplieger/a/issues/99/labels')],
         )
 
     def test_a_failed_close_step_is_a_warning(self):
@@ -386,7 +395,7 @@ class MainDefault(unittest.TestCase):
         self.assertIn('branch delete failed', got['stdout'])
 
     def test_an_unreadable_repo_list_refuses_to_sync(self):
-        fixture = {**MAIN_FIXTURE, 'fail': {'GET user/repos': 403}}
+        fixture = {**MAIN_FIXTURE, 'fail': {'GET installation/repositories': 403}}
         got = run_sync(SCRIPTS / 'sync-files.py', MAIN_MANIFEST, fixture)
         self.assertEqual(got['rc'], 1)
         self.assertIn('forks cannot be excluded — refusing to sync', got['stderr'])
@@ -526,11 +535,8 @@ class Mapping(unittest.TestCase):
         )
 
 
-class PrintOpenPrs(unittest.TestCase):
-    def run_print(self, fixture, manifest=TWO_BRANCH_MANIFEST):
-        return run_sync(SCRIPTS / 'sync-files.py', manifest, fixture, '--print-open-prs')
-
-    def test_one_line_per_open_sync_pull_request_through_the_engines_matching(self):
+class SweepLookups(unittest.TestCase):
+    def test_every_open_sync_pull_request_through_the_engines_matching(self):
         fixture = {
             'repos': [],
             'pulls': {
@@ -546,30 +552,190 @@ class PrintOpenPrs(unittest.TestCase):
                     listed('edge', 3, 'repo-sync/ci/default', 'dev'),
                 ],
             },
+            'api': pulls({11: 'dev', 12: 'main'}),
         }
-        got = self.run_print(fixture)
-        self.assertEqual(got['rc'], 0, got['stderr'])
+        proc, calls = run_sweep(TWO_BRANCH_MANIFEST, fixture)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(
-            got['stdout'],
-            'a 8 repo-sync/ci/default\na 6 repo-sync/ci/default\n'
-            'edge 11 repo-sync/ci/dev dev\nedge 12 repo-sync/ci/main main\n',
+            [line for line in proc.stdout.splitlines() if line.startswith('Enabling')],
+            [
+                'Enabling auto-merge on cplieger/a#8',
+                'Enabling auto-merge on cplieger/edge#11',
+                'Enabling auto-merge on cplieger/edge#12',
+            ],
         )
         self.assertEqual(
-            api_calls(got['gh']),
+            [api_call(c) for c in calls if '/pulls?' in c[-1]],
             [lookup('a'), lookup('edge', 'dev'), lookup('edge', 'main')],
         )
-        self.assertEqual(got['git'], [])
 
     def test_a_failed_lookup_is_a_warning_and_skips_only_that_target(self):
         fixture = {
             'repos': [],
             'pulls': {'cplieger/edge': [listed('edge', 12, 'repo-sync/ci/main', 'main')]},
+            'api': pulls({12: 'main'}),
             'fail': {'GET repos/cplieger/a/pulls': 403},
         }
-        got = self.run_print(fixture)
+        proc, _calls = run_sweep(TWO_BRANCH_MANIFEST, fixture)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn('::warning::cplieger/a: the open sync PR lookup failed: GET ', proc.stdout)
+        enabling = [line for line in proc.stdout.splitlines() if line.startswith('Enabling')]
+        self.assertEqual(enabling, ['Enabling auto-merge on cplieger/edge#12'])
+
+
+class Concurrent(unittest.TestCase):
+    """Several workers: the same output, calls, and exit as one."""
+
+    def both(self, manifest, fixture):
+        serial = run_sync(SCRIPTS / 'sync-files.py', manifest, fixture)
+        parallel = run_sync(SCRIPTS / 'sync-files.py', manifest, fixture, '--workers', '4')
+        return serial, parallel
+
+    def assert_same(self, serial, parallel):
+        self.assertEqual(parallel['rc'], serial['rc'])
+        self.assertEqual(parallel['stdout'], serial['stdout'])
+        for log in ('git', 'gh'):
+            key = json.dumps
+            self.assertEqual(sorted(parallel[log], key=key), sorted(serial[log], key=key), log)
+
+    def test_the_output_is_in_manifest_order_and_the_calls_are_the_serial_ones(self):
+        serial, parallel = self.both(TWO_BRANCH_MANIFEST, TWO_BRANCH_FIXTURE)
+        self.assertEqual(serial['rc'], 0, serial['stdout'] + serial['stderr'])
+        self.assert_same(serial, parallel)
+
+    def test_a_failed_target_fails_the_run_and_spares_the_others(self):
+        fixture = {**MAIN_FIXTURE, 'fail': {'GET repos/cplieger/a/pulls': 403}}
+        serial, parallel = self.both(MAIN_MANIFEST, fixture)
+        self.assertEqual(parallel['rc'], 1)
+        self.assertIn('1 failed (cplieger/a)', parallel['stdout'])
+        self.assertIn('  PR already open; force-push refreshed it', parallel['stdout'])
+        self.assert_same(serial, parallel)
+
+    def test_workers_outside_one_to_the_bound_are_refused_before_any_call(self):
+        for workers in ('0', '17'):
+            got = run_sync(
+                SCRIPTS / 'sync-files.py', MAIN_MANIFEST, MAIN_FIXTURE, '--workers', workers
+            )
+            self.assertEqual(got['rc'], 2, workers)
+            self.assertIn('--workers must be 1 to 16', got['stderr'])
+            self.assertEqual((got['git'], got['gh']), ([], []))
+
+    def test_every_client_holds_on_the_shared_pacers_rate_limit_pause(self):
+        sync = load_sync()
+        self.assertEqual(sync.REST.pause, sync.PACER.pause)
+        import release_maintenance
+
+        with mock.patch.object(release_maintenance, 'Api') as api:
+            self.assertEqual(sync.arm_open_prs({}, 1), 0)
+        self.assertEqual(api.call_args.kwargs, {'run': sync.RUN, 'pause': sync.PACER.pause})
+
+    def test_the_bound_itself_is_accepted(self):
+        got = run_sync(SCRIPTS / 'sync-files.py', MAIN_MANIFEST, MAIN_FIXTURE, '--workers', '16')
         self.assertEqual(got['rc'], 0, got['stderr'])
-        self.assertEqual(got['stdout'], 'edge 12 repo-sync/ci/main main\n')
-        self.assertIn('::warning::cplieger/a: the open sync PR lookup failed: GET ', got['stderr'])
+
+    def test_every_gh_call_is_admitted_by_the_pacer_a_write_as_a_write(self):
+        sync, answered = load_with_stub_gh(load_sync)
+        with mock.patch.object(sync.PACER, 'wait') as wait:
+            sync.REST.get('repos/cplieger/a')
+            sync.REST.send('POST', 'repos/cplieger/a/pulls', {})
+            sync.RUN(['pr', 'merge', '--auto', '7'])
+        self.assertEqual([c.args for c in wait.call_args_list], [(False,), (True,), (True,)])
+        self.assertEqual(len(answered), 3)
+
+    def test_writes_are_spaced_only_when_more_than_one_worker_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = pathlib.Path(tmp) / 'sync.yml'
+            manifest.write_text(yaml.safe_dump(MAIN_MANIFEST, sort_keys=False))
+            for workers, gap in (('1', 0.0), ('2', 1.0), ('16', 1.0)):
+                with self.subTest(workers=workers):
+                    sync = load_sync()
+                    argv = ['sync-files.py', '--manifest', str(manifest), '--only', 'none']
+                    argv += ['--allow-forks', '--workers', workers]
+                    out = io.StringIO()
+                    with mock.patch.object(sys, 'argv', argv), contextlib.redirect_stdout(out):
+                        sync.main()
+                    self.assertIn('nothing to sync', out.getvalue())
+                    self.assertEqual(sync.PACER.gap, gap)
+
+
+class ArmDefault(unittest.TestCase):
+    """A main-default arm in-process: only GitHub's refusal of --auto itself leads to the
+    direct merge; a refusal that says nothing about the pull request leaves it open."""
+
+    def arm(self, answer, now_merged=False):
+        sync = load_sync()
+
+        def run(_args, _stdin=None, _timeout=None):
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        out = io.StringIO()
+        reread = {'merged_at': '2026-10-10T00:00:00Z' if now_merged is True else None}
+        failed = now_merged if isinstance(now_merged, Exception) else None
+        with (
+            mock.patch.object(sync, 'RUN', run),
+            mock.patch.object(sync.REST, 'send') as send,
+            mock.patch.object(sync.REST, 'get', return_value=reread, side_effect=failed) as get,
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertTrue(sync.arm(('cplieger/a', None, 7), None))
+        self.reads = [c.args for c in get.call_args_list]
+        return [c.args[:2] for c in send.call_args_list], out.getvalue()
+
+    def test_a_rate_limited_or_unstarted_arm_leaves_the_pull_request_open(self):
+        import ghrest
+
+        for name, answer in (
+            ('rate limited', gh_failed(b'GraphQL: API rate limit exceeded for user ID 1.')),
+            ('cooldown past the cap', ghrest.ApiError(None, 'held', rate_limited=True)),
+            ('gh did not start', FileNotFoundError('gh')),
+        ):
+            with self.subTest(name):
+                sent, out = self.arm(answer)
+                self.assertEqual(sent, [])
+                self.assertIn('WARN: failed to merge cplieger/a#7', out)
+
+    def test_a_rate_limit_refusal_after_the_merge_reports_it_merged(self):
+        sent, out = self.arm(gh_failed(b'API rate limit exceeded'), now_merged=True)
+        self.assertEqual(sent, [])
+        self.assertEqual(self.reads, [('repos/cplieger/a/pulls/7',)])
+        self.assertEqual(out, 'Enabling auto-merge on cplieger/a#7\ncplieger/a#7: merged\n')
+        import ghrest
+
+        sent, out = self.arm(gh_failed(b'API rate limit exceeded'), ghrest.ApiError(403, 'held'))
+        self.assertEqual(sent, [])
+        self.assertIn('WARN: failed to merge cplieger/a#7: auto-merge rate limited', out)
+
+    def test_an_ordinary_refusal_still_falls_back_to_the_direct_merge(self):
+        sent, out = self.arm(gh_failed(b'Pull request is in clean status'))
+        self.assertEqual(
+            sent,
+            [
+                ('PUT', 'repos/cplieger/a/pulls/7/merge'),
+                ('DELETE', 'repos/cplieger/a/git/refs/heads/repo-sync/ci/default'),
+            ],
+        )
+        self.assertIn('cplieger/a#7: merged', out)
+
+
+def gh_failed(stderr):
+    return subprocess.CompletedProcess(['gh'], 1, b'', stderr)
+
+
+def load_with_stub_gh(load):
+    """(module, answered calls) of `load()` with ghrest.run_process stubbed to a 200
+    before the module captures it, so a call through its paced runner reaches no gh."""
+    import ghrest
+
+    answered = []
+
+    def stub(args, stdin=None, timeout=None):
+        answered.append(args)
+        return subprocess.CompletedProcess(['gh'], 0, b'HTTP/2.0 200 OK\n\r\n{}', b'')
+
+    with mock.patch.object(ghrest, 'run_process', stub):
+        return load(), answered
 
 
 def git(*args, cwd):
@@ -623,7 +789,7 @@ class Manifest(unittest.TestCase):
     def test_a_missing_or_empty_manifest_is_refused_in_every_mode(self):
         cases = (('empty file', ''), ('null', None), ('no groups', {'group': []}), ('a list', [1]))
         for name, manifest in cases:
-            for mode in ((), ('--print-open-prs',)):
+            for mode in ((), ('--arm-open-prs',)):
                 with self.subTest(name, mode=mode):
                     got = run_sync(SCRIPTS / 'sync-files.py', manifest, {'repos': []}, *mode)
                     self.assertEqual(got['rc'], 1)
@@ -643,7 +809,9 @@ def sweep_body():
     return step['run']
 
 
-def run_sweep(manifest, fixture):
+def run_sweep(manifest, fixture, workers=1, extra=()):
+    """(process, gh calls) of sync.yaml's sweep step, run as written plus --workers so
+    one worker keeps the serial call order, and plus `extra`."""
     with tempfile.TemporaryDirectory() as name:
         tmp = pathlib.Path(name)
         env = install_stubs(tmp, fixture)
@@ -651,8 +819,9 @@ def run_sweep(manifest, fixture):
         text = manifest if isinstance(manifest, str) else yaml.safe_dump(manifest, sort_keys=False)
         (tmp / '.github' / 'sync.yml').write_text(text)
         (tmp / 'scripts').symlink_to(SCRIPTS)
+        flags = ' '.join(['--workers', str(workers), *extra])
         proc = subprocess.run(
-            ['bash', '-e', '-c', sweep_body()],
+            ['bash', '-e', '-c', f'{sweep_body().rstrip()} {flags}'],
             capture_output=True,
             text=True,
             env=env,
@@ -688,6 +857,7 @@ def merges(calls):
 
 
 DIRECT = ('PUT', 'repos/cplieger/edge/pulls/12/merge', {'merge_method': 'squash', 'sha': 'headsha'})
+FORK_LIST = ('GET', 'installation/repositories?per_page=100&page=1', None)
 
 
 class Sweep(unittest.TestCase):
@@ -701,6 +871,7 @@ class Sweep(unittest.TestCase):
         self.assertEqual(
             [api_call(c) if c[0] == 'api' else c for c in calls],
             [
+                FORK_LIST,
                 lookup('a'),
                 lookup('b'),
                 [
@@ -759,32 +930,49 @@ class Sweep(unittest.TestCase):
     def test_a_main_default_refusal_falls_back_to_the_rest_direct_merge(self):
         manifest = {'group': [group(['a'], FILES)]}
         auto = ['pr', 'merge', '--auto', '--squash', '--delete-branch', '--repo', 'cplieger/a', '7']
-        direct = ['api', '-X', 'PUT', 'repos/cplieger/a/pulls/7/merge', '-f', 'merge_method=squash']
-        read = ['api', 'repos/cplieger/a/pulls/7', '--jq', '.head.repo.full_name // ""']
-        delete = ['api', '-X', 'DELETE', 'repos/cplieger/a/git/refs/heads/repo-sync/ci/default']
+        direct = [
+            'api', '-i', '-X', 'PUT', 'repos/cplieger/a/pulls/7/merge', '--input', '-',
+            '{"merge_method": "squash"}',
+        ]  # fmt: skip
+        delete = [
+            'api',
+            '-i',
+            '-X',
+            'DELETE',
+            'repos/cplieger/a/git/refs/heads/repo-sync/ci/default',
+        ]
         cases = (
-            ('merged', {'auto': True}, 'cplieger/a', [auto, direct, read, delete], False),
-            ('refused', {'auto': True, 'direct': True}, 'cplieger/a', [auto, direct], True),
-            ('a fork head', {'auto': True}, 'someone/a', [auto, direct, read], False),
+            ('merged', {'auto': True}, [auto, direct, delete], False),
+            ('refused', {'auto': True, 'direct': True}, [auto, direct], True),
         )
-        for name, fails, owner, want, warned in cases:
+        for name, fails, want, warned in cases:
             with self.subTest(name):
-                row = listed('a', 7, 'repo-sync/ci/default', head_repo=owner)
                 proc, calls = run_sweep(
                     manifest,
                     {
                         'repos': [],
-                        'pulls': {'cplieger/a': [row]},
-                        'api': {'repos/cplieger/a/pulls/7': row},
+                        'pulls': {'cplieger/a': [listed('a', 7, 'repo-sync/ci/default')]},
                         'merge_fails': fails,
                     },
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
-                self.assertEqual([c for c in calls if '/pulls?' not in c[-1]], want)
+                self.assertEqual([c for c in calls if '?' not in c[-1]], want)
                 self.assertEqual(
                     'WARN: failed to merge cplieger/a#7' in proc.stdout, warned, proc.stdout
                 )
                 self.assertNotIn('could not delete', proc.stdout)
+
+    def test_a_main_default_fork_pull_request_with_the_sync_head_is_never_merged(self):
+        manifest = {'group': [group(['a'], FILES)]}
+        fork = listed('a', 6, 'repo-sync/ci/default', head_repo='someone/a')
+        for fails in ({}, {'auto': True}):
+            with self.subTest(fails=fails):
+                proc, calls = run_sweep(
+                    manifest, {'repos': [], 'pulls': {'cplieger/a': [fork]}, 'merge_fails': fails}
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(merges(calls), [])
+                self.assertNotIn('Enabling auto-merge', proc.stdout)
 
     def test_a_main_default_branch_delete_tolerates_only_an_already_deleted_head(self):
         manifest = {'group': [group(['a'], FILES)]}
@@ -796,7 +984,6 @@ class Sweep(unittest.TestCase):
                     {
                         'repos': [],
                         'pulls': {'cplieger/a': [row]},
-                        'api': {'repos/cplieger/a/pulls/7': row},
                         'merge_fails': {'auto': True},
                         'fail': {
                             'DELETE repos/cplieger/a/git/refs/heads/repo-sync/ci/default': status
@@ -923,6 +1110,47 @@ class Sweep(unittest.TestCase):
                 got = [c[2] for c in calls if c[:2] == ['pr', 'merge'] and 'cplieger/edge' in c]
                 self.assertEqual(got, armed)
 
+    def scoped(self, extra=(), fail=None):
+        """(process, {repo: its gh calls}, other calls) of a sweep over a, b and the fork
+        e, each with an own open sync PR."""
+        fixture = {
+            'repos': ['a', 'b', 'e'],
+            'forks': ['e'],
+            'pulls': {f'cplieger/{r}': [listed(r, 7, 'repo-sync/ci/default')] for r in 'abe'},
+            'fail': fail or {},
+        }
+        manifest = {'group': [group(['a', 'b', 'e'], FILES)]}
+        proc, calls = run_sweep(manifest, fixture, extra=extra)
+        by_repo, other = {}, []
+        for call in calls:
+            repo = next((r for r in 'abe' if any(f'cplieger/{r}' in a for a in call)), None)
+            (by_repo.setdefault(repo, []) if repo else other).append(call)
+        return proc, by_repo, other
+
+    def test_the_sweep_writes_only_the_targets_a_sync_would(self):
+        for name, extra, swept in (
+            ('forks skipped', (), 'ab'),
+            ('only', ('--only', 'a'), 'a'),
+            ('forks allowed', ('--allow-forks',), 'abe'),
+        ):
+            with self.subTest(name):
+                proc, by_repo, other = self.scoped(extra)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(''.join(sorted(by_repo)), swept)
+                for repo in swept:
+                    self.assertIn(f'cplieger/{repo}#7: armed', proc.stdout)
+                fork_list = [] if '--allow-forks' in extra else [FORK_LIST]
+                self.assertEqual([api_call(c) for c in other], fork_list)
+                notice = '::notice::cplieger/e: skipped, repo is a fork'
+                self.assertEqual(notice in proc.stdout, 'e' not in swept and not extra)
+
+    def test_an_unreadable_repo_list_refuses_the_sweep_before_any_lookup(self):
+        proc, by_repo, other = self.scoped(fail={'GET installation/repositories': 403})
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('forks cannot be excluded', proc.stderr)
+        self.assertEqual(by_repo, {})
+        self.assertEqual([api_call(c) for c in other], [FORK_LIST])
+
     def test_an_unreadable_manifest_fails_the_step(self):
         proc, calls = run_sweep(
             {'group': [group(['edge'], FILES, base='other')]}, {'repos': [], 'pulls': {}}
@@ -940,6 +1168,34 @@ class Sweep(unittest.TestCase):
                 self.assertNotIn('Traceback', proc.stderr)
                 self.assertEqual(calls, [])
 
+    def test_several_workers_arm_the_same_pull_requests_in_the_same_order(self):
+        fixture = {
+            'repos': [],
+            'pulls': {
+                'cplieger/a': [listed('a', 7, 'repo-sync/ci/default')],
+                'cplieger/edge': [
+                    listed('edge', 11, 'repo-sync/ci/dev', 'dev'),
+                    listed('edge', 12, 'repo-sync/ci/main', 'main'),
+                ],
+            },
+            'api': {
+                **pulls({11: 'dev', 12: 'main'}),
+                'repos/cplieger/edge/pulls/12': {
+                    **pulls({12: 'main'})['repos/cplieger/edge/pulls/12'],
+                    'base': {'ref': 'dev'},
+                },
+            },
+        }
+        serial, serial_calls = run_sweep(TWO_BRANCH_MANIFEST, fixture)
+        parallel, parallel_calls = run_sweep(TWO_BRANCH_MANIFEST, fixture, workers=4)
+        self.assertEqual(serial.returncode, 1, serial.stdout + serial.stderr)
+        self.assertEqual(parallel.returncode, 1)
+        self.assertEqual(parallel.stdout, serial.stdout)
+        self.assertIn('cplieger/edge#11: armed', parallel.stdout)
+        self.assertIn('a sync pull request into main was left open', parallel.stdout)
+        key = json.dumps
+        self.assertEqual(sorted(parallel_calls, key=key), sorted(serial_calls, key=key))
+
 
 class Workflow(unittest.TestCase):
     def test_an_engine_change_reruns_the_sync(self):
@@ -950,15 +1206,105 @@ class Workflow(unittest.TestCase):
             'scripts/classify-repos.py',
             'scripts/sync-files.py',
             'scripts/release_channels.py',
+            'scripts/release_maintenance.py',
             'scripts/ghrest.py',
+            'scripts/fanout.py',
         ):
             self.assertIn(path, paths)
 
-    def test_the_sweep_reads_its_pull_requests_from_the_engine(self):
+    def test_the_sweep_is_the_engines(self):
         body = sweep_body()
-        self.assertIn('scripts/sync-files.py --manifest .github/sync.yml --print-open-prs', body)
-        self.assertNotIn('repo-sync/ci/default', body)
-        self.assertNotIn('gh pr list', body)
+        self.assertEqual(
+            body.strip(), 'python3 scripts/sync-files.py --manifest .github/sync.yml --arm-open-prs'
+        )
+        doc = yaml.safe_load((ROOT / '.github' / 'workflows' / 'sync.yaml').read_text())
+        (step,) = [
+            s
+            for s in doc['jobs']['sync']['steps']
+            if s.get('name') == 'Enable auto-merge on sync PRs'
+        ]
+        self.assertEqual(step['if'], 'always()')
+
+    def test_every_step_authenticates_with_the_app_token_minted_after_checkout(self):
+        text = (ROOT / '.github' / 'workflows' / 'sync.yaml').read_text()
+        self.assertNotIn('SYNC_PAT', text)
+        steps = yaml.safe_load(text)['jobs']['sync']['steps']
+        # Right after Checkout, so a failed mint leaves the always() sweep a
+        # checked-out tree to fail in on the missing manifest.
+        self.assertEqual([s['name'] for s in steps[:2]], ['Checkout', 'Mint the App token'])
+        mint = steps[1]
+        self.assertEqual(mint['id'], 'app-token')
+        self.assertRegex(mint['uses'], r'^actions/create-github-app-token@[0-9a-f]{40}$')
+        self.assertNotIn('continue-on-error', mint)
+        self.assertNotIn('if', mint)
+        self.assertEqual(
+            mint['with'],
+            {
+                'client-id': '${{ secrets.SYNC_APP_ID }}',
+                'private-key': '${{ secrets.SYNC_APP_PRIVATE_KEY }}',
+                'owner': 'cplieger',
+                'permission-checks': 'read',
+                'permission-contents': 'write',
+                'permission-metadata': 'read',
+                'permission-pull-requests': 'write',
+                'permission-workflows': 'write',
+            },
+        )
+        tokens = {s['name']: s['env']['GH_TOKEN'] for s in steps if 'GH_TOKEN' in s.get('env', {})}
+        self.assertEqual(
+            tokens,
+            dict.fromkeys(
+                (
+                    'Auto-classify repos',
+                    'Sync files to consumer repos',
+                    'Enable auto-merge on sync PRs',
+                ),
+                '${{ steps.app-token.outputs.token }}',
+            ),
+        )
+
+    def test_the_sync_and_sweep_steps_run_on_the_default_pool_of_several_workers(self):
+        import fanout
+        import release_maintenance
+
+        self.assertTrue(2 <= fanout.WORKERS <= fanout.MAX_WORKERS, fanout.WORKERS)
+        self.assertEqual(fanout.ordered.__defaults__, (fanout.WORKERS,))
+        doc = yaml.safe_load((ROOT / '.github' / 'workflows' / 'sync.yaml').read_text())
+        runs = {s.get('name'): s.get('run', '') for s in doc['jobs']['sync']['steps']}
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        (tmp / '.github').mkdir()
+        (tmp / '.github' / 'sync.yml').write_text(yaml.safe_dump(MAIN_MANIFEST, sort_keys=False))
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(tmp)
+        for name, fan_outs in (
+            ('Sync files to consumer repos', 1),
+            ('Enable auto-merge on sync PRs', 2),
+        ):
+            with self.subTest(name):
+                argv = shlex.split(runs[name])
+                self.assertEqual(argv[:2], ['python3', 'scripts/sync-files.py'])
+                self.assertNotIn('--workers', argv)
+                sync = load_sync()
+                seen = []
+
+                def recorder(_items, _work, workers, seen=seen):
+                    seen.append(workers)
+                    return iter(())
+
+                with (
+                    mock.patch.object(sys, 'argv', ['sync-files.py', *argv[2:]]),
+                    mock.patch.object(sync.fanout, 'ordered', recorder),
+                    mock.patch.object(sync, 'fork_names', return_value=set()),
+                    mock.patch.object(release_maintenance, 'Api'),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    try:
+                        sync.main()
+                    except SystemExit as stop:
+                        self.assertEqual(stop.code, 0)
+                self.assertEqual(seen, [fanout.WORKERS] * fan_outs)
+                self.assertEqual(sync.PACER.gap, sync.WRITE_GAP)
 
 
 if __name__ == '__main__':
