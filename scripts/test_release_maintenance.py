@@ -13,9 +13,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zipfile
 from pathlib import Path
-from unittest import mock
 
 import yaml
 
@@ -1524,7 +1524,7 @@ class Rebuild(unittest.TestCase):
         ):
             with (
                 self.subTest(text=text),
-                mock.patch('sys.stdin', io.StringIO(text)),
+                unittest.mock.patch('sys.stdin', io.StringIO(text)),
             ):
                 self.assertEqual(rm.main(['rebuild-refreshes']), code)
 
@@ -2088,7 +2088,7 @@ class MergeChecked(unittest.TestCase):
         for answer, warned in ((b'', False), (Status(422), False), (Status(403), True)):
             with (
                 self.subTest(delete=answer),
-                mock.patch('sys.stdout', new_callable=io.StringIO) as out,
+                unittest.mock.patch('sys.stdout', new_callable=io.StringIO) as out,
             ):
                 gh = FakeGh(
                     {
@@ -2123,8 +2123,8 @@ class MergeChecked(unittest.TestCase):
         )
         gh = FakeGh({f'GET {P}/pulls/5': pr(5, 'repo-sync/ci/main'), auto: b''})
         with (
-            mock.patch.object(rm, 'Api', return_value=rm.Api(gh)),
-            mock.patch('sys.stdout', new_callable=io.StringIO) as out,
+            unittest.mock.patch.object(rm, 'Api', return_value=rm.Api(gh)),
+            unittest.mock.patch('sys.stdout', new_callable=io.StringIO) as out,
         ):
             argv = ['merge-checked', R, '5', '--base', 'main', '--head', 'repo-sync/ci/main']
             self.assertEqual(rm.main(argv), 0)
@@ -2193,8 +2193,8 @@ class MergeChecked(unittest.TestCase):
 
     def test_a_read_failure_is_a_failed_merge(self):
         with (
-            mock.patch.object(rm, 'Api', return_value=rm.Api(FakeGh({}))),
-            mock.patch('sys.stdout', new_callable=io.StringIO) as out,
+            unittest.mock.patch.object(rm, 'Api', return_value=rm.Api(FakeGh({}))),
+            unittest.mock.patch('sys.stdout', new_callable=io.StringIO) as out,
         ):
             self.assertEqual(rm.main(['merge-checked', R, '5', '--base', 'dev', '--head', 'x']), 1)
         self.assertIn(f'cplieger/{R}#5: failed: unexpected call GET {P}/pulls/5', out.getvalue())
@@ -2208,7 +2208,7 @@ class MergeChecked(unittest.TestCase):
         ):
             with (
                 self.subTest(argv=argv),
-                mock.patch('sys.stderr', new_callable=io.StringIO),
+                unittest.mock.patch('sys.stderr', new_callable=io.StringIO),
                 self.assertRaises(SystemExit),
             ):
                 rm.main(argv)

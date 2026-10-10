@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
+import unittest.mock
 
 import yaml
 
@@ -155,7 +155,7 @@ class StubGh:
         }
 
     def patched(self):
-        return mock.patch.dict(os.environ, self.env())
+        return unittest.mock.patch.dict(os.environ, self.env())
 
     def calls(self):
         if not self.log.exists():
@@ -316,9 +316,9 @@ class Discovery(unittest.TestCase):
         import ghrest
 
         ok = subprocess.CompletedProcess(['gh'], 0, b'HTTP/2.0 200 OK\n\r\n{}', b'')
-        with mock.patch.object(ghrest, 'run_process', lambda *_: ok):
+        with unittest.mock.patch.object(ghrest, 'run_process', lambda *_: ok):
             classify = load_classify()
-        with mock.patch.object(classify.PACER, 'wait') as wait:
+        with unittest.mock.patch.object(classify.PACER, 'wait') as wait:
             self.assertEqual(classify.REST.get('repos/cplieger/goapp'), {})
         self.assertEqual([c.args for c in wait.call_args_list], [(False,)])
 
@@ -331,9 +331,9 @@ class Discovery(unittest.TestCase):
             return iter(())
 
         with (
-            mock.patch.object(classify, 'discover_repos', return_value=[]),
-            mock.patch.object(classify.fanout, 'ordered', recorder),
-            mock.patch('sys.stdout', io.StringIO()),
+            unittest.mock.patch.object(classify, 'discover_repos', return_value=[]),
+            unittest.mock.patch.object(classify.fanout, 'ordered', recorder),
+            unittest.mock.patch('sys.stdout', io.StringIO()),
         ):
             classify.main()
         self.assertEqual(seen, [((), {})])
@@ -519,7 +519,7 @@ class SyncOwnedSet(unittest.TestCase):
 
     def test_it_covers_every_dest_a_manifest_writes_and_reads_no_api(self):
         _rc, out, _err, _calls = run_classify(SCRIPTS / 'classify-repos.py', two_branch_fixture())
-        with mock.patch.object(subprocess, 'run', side_effect=AssertionError('API read')):
+        with unittest.mock.patch.object(subprocess, 'run', side_effect=AssertionError('API read')):
             owned = set(self.classify.sync_owned_patterns())
         self.assertLessEqual(manifest_dests(out), owned)
 

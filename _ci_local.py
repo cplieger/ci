@@ -535,6 +535,7 @@ def resolve_reusable_workflow(uses_ref, target, parent_ref=None):
             if proc.returncode == 0 and proc.stdout.strip():
                 return yaml.safe_load(proc.stdout)
         except subprocess.TimeoutExpired, OSError:
+            # Best effort: a slow or failed fetch falls through to autodetect.
             pass
 
     return None

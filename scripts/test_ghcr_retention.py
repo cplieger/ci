@@ -7,8 +7,8 @@ import io
 import json
 import os
 import unittest
+import unittest.mock
 from datetime import UTC, datetime, timedelta
-from unittest import mock
 
 import ghcr_retention as gr
 import promote
@@ -127,8 +127,8 @@ class PromotedImages(unittest.TestCase):
             raise RuntimeError(f'gh {path} failed: HTTP 502')
 
         with (
-            mock.patch.object(gr, 'gh', side_effect=gh),
-            mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}),
+            unittest.mock.patch.object(gr, 'gh', side_effect=gh),
+            unittest.mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}),
             contextlib.redirect_stdout(io.StringIO()) as out,
         ):
             self.assertEqual(gr.main([]), 0)

@@ -185,7 +185,7 @@ class SecurityScanPublishedMode(unittest.TestCase):
         out = profile(self.jobs['trivy'], PUBLISHED, dockerfile=True)
         self.assertEqual(out, {'image': 'true', 'published': 'true'})
         steps = running(self.jobs['trivy'], PUBLISHED, out)
-        self.assertTrue(set(PUBLISHED_STEPS) <= set(steps))
+        self.assertLessEqual(set(PUBLISHED_STEPS), set(steps))
         self.assertFalse(set(BUILD_STEPS) & set(steps))
         self.assertIn('Trivy filesystem scan (advisory)', steps)
 

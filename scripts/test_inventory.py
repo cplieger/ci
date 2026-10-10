@@ -14,7 +14,6 @@ import unittest
 from pathlib import Path
 
 import inventory
-from inventory import Record
 
 FIXTURES = Path(__file__).resolve().parent / 'testdata' / 'inventory'
 HEX1 = '1' * 64
@@ -94,7 +93,7 @@ class Fixture:
         self.repo = inventory.Repo(str(self.dir))
         self.sha = {c: self.repo.commit(c) for c in marks}
 
-    def records(self, commit: str, lane: str | None = None) -> list[Record]:
+    def records(self, commit: str, lane: str | None = None) -> list[inventory.Record]:
         return self.repo.records(self.sha[commit], lane)
 
     def dominance(self, base, main, target, owned=('.editorconfig',), canonical=None) -> dict:
@@ -282,14 +281,14 @@ class Comparators(unittest.TestCase):
 
 class Judge(unittest.TestCase):
     def rec(self, value, digest='', versioning='go-semver', kind='direct'):
-        return Record(
+        return inventory.Record(
             '.', 'go', 'go.mod', 'example.com/x', value, digest, kind=kind, versioning=versioning
         )
 
     @staticmethod
     def npm(*values):
         return [
-            Record('.', 'npm', 'package-lock.json', 'minimatch', v, versioning='semver')
+            inventory.Record('.', 'npm', 'package-lock.json', 'minimatch', v, versioning='semver')
             for v in values
         ]
 
@@ -317,7 +316,9 @@ class Judge(unittest.TestCase):
 
     def test_a_slot_main_added_may_be_absent_only_after_dev_held_a_carrier(self):
         m = self.rec('v1.1.0')
-        other = Record('.', 'go', 'go.mod', 'example.com/y', 'v1.1.0', versioning='go-semver')
+        other = inventory.Record(
+            '.', 'go', 'go.mod', 'example.com/y', 'v1.1.0', versioning='go-semver'
+        )
         self.assertEqual(
             inventory.judge([m], [], [], {(m.slot, m.state)}), ('ok', 'held on dev, then removed')
         )
@@ -462,7 +463,7 @@ class Judge(unittest.TestCase):
         self.assertEqual(self.judge([m], [self.rec('v1.2.0')], base=base), 'ok')
 
     def test_every_refusal_names_a_copy_in_another_role(self):
-        dev = Record(
+        dev = inventory.Record(
             '.', 'npm', 'package-lock.json', 'minimatch', '3.2.0', kind='dev', versioning='semver'
         )
         rows = [
@@ -1151,11 +1152,15 @@ class GroupedMajorMinorSplit(FixtureCase):
         self.assertEqual(
             self.fx.records('T'),
             [
-                Record('.', 'go', 'go.mod', 'example.com/bar', 'v1.3.0', '', 'direct', 'go-semver'),
-                Record(
+                inventory.Record(
+                    '.', 'go', 'go.mod', 'example.com/bar', 'v1.3.0', '', 'direct', 'go-semver'
+                ),
+                inventory.Record(
                     '.', 'go', 'go.mod', 'example.com/foo/v2', 'v2.0.0', '', 'direct', 'go-semver'
                 ),
-                Record('.', 'go', 'go.mod', 'go', '1.27.1', '', 'directive', 'go-version'),
+                inventory.Record(
+                    '.', 'go', 'go.mod', 'go', '1.27.1', '', 'directive', 'go-version'
+                ),
             ],
         )
 
@@ -1186,7 +1191,7 @@ class SameTagDifferentDigest(FixtureCase):
         self.assertEqual(
             self.fx.records('B'),
             [
-                Record(
+                inventory.Record(
                     '.',
                     'docker',
                     'Dockerfile',
@@ -1529,7 +1534,7 @@ class GoPseudoReplace(FixtureCase):
         self.assertEqual(
             replaces,
             [
-                Record(
+                inventory.Record(
                     '.',
                     'go',
                     'go.mod',
@@ -1630,7 +1635,7 @@ class NestedModule(FixtureCase):
         self.assertEqual(
             self.fx.records('M', 'tools'),
             [
-                Record(
+                inventory.Record(
                     'tools',
                     'go',
                     'tools/go.mod',
@@ -1640,7 +1645,7 @@ class NestedModule(FixtureCase):
                     'direct',
                     'go-semver',
                 ),
-                Record(
+                inventory.Record(
                     'tools', 'go', 'tools/go.mod', 'go', '1.27.1', '', 'directive', 'go-version'
                 ),
             ],
@@ -1706,7 +1711,7 @@ class TypeScriptSubpackage(FixtureCase):
         self.assertEqual(
             [r for r in self.fx.records('B') if r.file.startswith('web/')],
             [
-                Record(
+                inventory.Record(
                     '.',
                     'npm',
                     'web/package-lock.json',
@@ -1716,7 +1721,7 @@ class TypeScriptSubpackage(FixtureCase):
                     'direct',
                     'semver',
                 ),
-                Record(
+                inventory.Record(
                     '.',
                     'npm',
                     'web/package-lock.json',
@@ -1726,7 +1731,7 @@ class TypeScriptSubpackage(FixtureCase):
                     'indirect',
                     'semver',
                 ),
-                Record(
+                inventory.Record(
                     '.',
                     'npm-range',
                     'web/package.json',
@@ -1915,7 +1920,7 @@ class GoSourcePin(FixtureCase):
         self.assertEqual(
             got,
             [
-                Record(
+                inventory.Record(
                     '.',
                     'git-refs',
                     self.source,

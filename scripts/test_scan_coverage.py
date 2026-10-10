@@ -15,9 +15,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 from typing import ClassVar
-from unittest import mock
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
 TESTDATA = SCRIPTS / 'testdata' / 'scan-coverage'
@@ -290,10 +290,10 @@ class NotCovered(unittest.TestCase):
             ([], ['no component name resolves for /usr/share/sbom/widget.cdx.json']),
         )
         declared = {'docker-age': {'/usr/share/sbom/widget.cdx.json': ('widget',)}}
-        with mock.patch.dict(sc.FROM_SOURCE, declared):
+        with unittest.mock.patch.dict(sc.FROM_SOURCE, declared):
             self.assertEqual(self.components('docker-age', EMITTER_DOCKERFILE), (['widget'], []))
         other = {'docker-age': {'/usr/share/sbom/other.cdx.json': ('widget',)}}
-        with mock.patch.dict(sc.FROM_SOURCE, other):
+        with unittest.mock.patch.dict(sc.FROM_SOURCE, other):
             self.assertEqual(
                 self.components('docker-age', EMITTER_DOCKERFILE),
                 (['widget'], ['no component name resolves for /usr/share/sbom/widget.cdx.json']),
@@ -452,7 +452,7 @@ class NotCovered(unittest.TestCase):
                 self.assertEqual(got, want)
 
     def test_only_a_covered_component_leaves_the_list(self):
-        with mock.patch.object(sc, 'COVERED', frozenset({'nut'})):
+        with unittest.mock.patch.object(sc, 'COVERED', frozenset({'nut'})):
             self.assertEqual(
                 self.components('docker-nut-upsd', ''), (['libmodbus', 'net-snmp'], [])
             )
@@ -461,15 +461,15 @@ class NotCovered(unittest.TestCase):
 class Platforms(unittest.TestCase):
     def run_cmd(self):
         out = []
-        with mock.patch('builtins.print', side_effect=out.append):
+        with unittest.mock.patch('builtins.print', side_effect=out.append):
             rc = sc.cmd_platforms(SimpleNamespace(repo='demo'))
         return rc, out
 
     def test_each_platform_is_a_matrix_row_with_a_digest_ref(self):
         with (
-            mock.patch.object(promote, 'registry_token', return_value='t'),
-            mock.patch.object(promote, 'tag_digest', return_value='sha256:i') as tag,
-            mock.patch.object(
+            unittest.mock.patch.object(promote, 'registry_token', return_value='t'),
+            unittest.mock.patch.object(promote, 'tag_digest', return_value='sha256:i') as tag,
+            unittest.mock.patch.object(
                 promote,
                 'platforms',
                 return_value={'linux/arm64': 'sha256:b', 'linux/amd64': 'sha256:a'},
@@ -482,7 +482,7 @@ class Platforms(unittest.TestCase):
         self.assertEqual(json.loads(out[1].removeprefix('platforms=')), PLATFORMS)
 
     def test_an_unreadable_image_is_an_error_line_and_no_rows(self):
-        with mock.patch.object(
+        with unittest.mock.patch.object(
             promote,
             'registry_token',
             side_effect=promote.GhError('GET x: HTTP Error 404\nNot Found'),
@@ -613,8 +613,8 @@ class SignedSbom(unittest.TestCase):
             out = pathlib.Path(tmp) / 'sbom.json'
             boom = ValueError('cosign verify-attestation x: no signatures found')
             with (
-                mock.patch.object(sc, 'signed_sboms', side_effect=boom),
-                mock.patch('builtins.print') as printed,
+                unittest.mock.patch.object(sc, 'signed_sboms', side_effect=boom),
+                unittest.mock.patch('builtins.print') as printed,
             ):
                 rc = sc.main(['sbom', 'docker-nut-upsd', 'sha256:i', '--out', str(out)])
             self.assertEqual(rc, 0)

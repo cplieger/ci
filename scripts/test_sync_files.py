@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
+import unittest.mock
 
 import yaml
 
@@ -625,7 +625,7 @@ class Concurrent(unittest.TestCase):
         self.assertEqual(sync.REST.pause, sync.PACER.pause)
         import release_maintenance
 
-        with mock.patch.object(release_maintenance, 'Api') as api:
+        with unittest.mock.patch.object(release_maintenance, 'Api') as api:
             self.assertEqual(sync.arm_open_prs({}, 1), 0)
         self.assertEqual(api.call_args.kwargs, {'run': sync.RUN, 'pause': sync.PACER.pause})
 
@@ -635,7 +635,7 @@ class Concurrent(unittest.TestCase):
 
     def test_every_gh_call_is_admitted_by_the_pacer_a_write_as_a_write(self):
         sync, answered = load_with_stub_gh(load_sync)
-        with mock.patch.object(sync.PACER, 'wait') as wait:
+        with unittest.mock.patch.object(sync.PACER, 'wait') as wait:
             sync.REST.get('repos/cplieger/a')
             sync.REST.send('POST', 'repos/cplieger/a/pulls', {})
             sync.RUN(['pr', 'merge', '--auto', '7'])
@@ -652,7 +652,10 @@ class Concurrent(unittest.TestCase):
                     argv = ['sync-files.py', '--manifest', str(manifest), '--only', 'none']
                     argv += ['--allow-forks', '--workers', workers]
                     out = io.StringIO()
-                    with mock.patch.object(sys, 'argv', argv), contextlib.redirect_stdout(out):
+                    with (
+                        unittest.mock.patch.object(sys, 'argv', argv),
+                        contextlib.redirect_stdout(out),
+                    ):
                         sync.main()
                     self.assertIn('nothing to sync', out.getvalue())
                     self.assertEqual(sync.PACER.gap, gap)
@@ -674,9 +677,11 @@ class ArmDefault(unittest.TestCase):
         reread = {'merged_at': '2026-10-10T00:00:00Z' if now_merged is True else None}
         failed = now_merged if isinstance(now_merged, Exception) else None
         with (
-            mock.patch.object(sync, 'RUN', run),
-            mock.patch.object(sync.REST, 'send') as send,
-            mock.patch.object(sync.REST, 'get', return_value=reread, side_effect=failed) as get,
+            unittest.mock.patch.object(sync, 'RUN', run),
+            unittest.mock.patch.object(sync.REST, 'send') as send,
+            unittest.mock.patch.object(
+                sync.REST, 'get', return_value=reread, side_effect=failed
+            ) as get,
             contextlib.redirect_stdout(out),
         ):
             self.assertTrue(sync.arm(('cplieger/a', None, 7), None))
@@ -734,7 +739,7 @@ def load_with_stub_gh(load):
         answered.append(args)
         return subprocess.CompletedProcess(['gh'], 0, b'HTTP/2.0 200 OK\n\r\n{}', b'')
 
-    with mock.patch.object(ghrest, 'run_process', stub):
+    with unittest.mock.patch.object(ghrest, 'run_process', stub):
         return load(), answered
 
 
@@ -1293,10 +1298,10 @@ class Workflow(unittest.TestCase):
                     return iter(())
 
                 with (
-                    mock.patch.object(sys, 'argv', ['sync-files.py', *argv[2:]]),
-                    mock.patch.object(sync.fanout, 'ordered', recorder),
-                    mock.patch.object(sync, 'fork_names', return_value=set()),
-                    mock.patch.object(release_maintenance, 'Api'),
+                    unittest.mock.patch.object(sys, 'argv', ['sync-files.py', *argv[2:]]),
+                    unittest.mock.patch.object(sync.fanout, 'ordered', recorder),
+                    unittest.mock.patch.object(sync, 'fork_names', return_value=set()),
+                    unittest.mock.patch.object(release_maintenance, 'Api'),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
                     try:
