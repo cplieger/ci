@@ -1,7 +1,11 @@
 # actionlint v1.7.12 does not know the documented job.workflow_repository and
-# job.workflow_sha context properties (rhysd/actionlint#707). Delete this file
-# with the actionlint pin bump that includes that fix.
+# job.workflow_sha context properties (rhysd/actionlint#707), nor the concurrency
+# queue key (rhysd/actionlint#654). Delete each entry with the actionlint pin bump
+# that includes its fix.
 paths:
   .github/workflows/{ci,release,docker-release,security-scan}.yaml:
     ignore:
       - 'property "workflow_(repository|sha)" is not defined in object type \{check_run_id: number;'
+  .github/workflows/promote.yaml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'

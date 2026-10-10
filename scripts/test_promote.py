@@ -1283,6 +1283,20 @@ class Workflow(unittest.TestCase):
         jobs = set(self.doc['jobs']) - {'notify'}
         self.assertEqual(set(self.doc['jobs']['notify']['needs']), jobs)
 
+    def test_runs_queue_per_repository_and_notify_globally_and_carry_the_repo_name(self):
+        self.assertEqual(
+            self.doc['concurrency'],
+            {'group': 'promote-${{ inputs.repo }}', 'cancel-in-progress': False, 'queue': 'max'},
+        )
+        self.assertEqual(
+            self.doc['jobs']['notify']['concurrency'],
+            {'group': 'promote:notify', 'cancel-in-progress': False, 'queue': 'max'},
+        )
+        self.assertEqual(
+            self.doc['run-name'],
+            "Promote ${{ inputs.repo }}${{ inputs.dry_run && ' (dry run)' || '' }}",
+        )
+
 
 def cliff_bin() -> str:
     found = os.environ.get('CLIFF_BIN') or shutil.which('git-cliff') or ''
