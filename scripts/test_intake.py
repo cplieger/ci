@@ -8,9 +8,9 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+import unittest.mock
 from pathlib import Path
 from typing import ClassVar
-from unittest import mock
 
 import intake
 import inventory
@@ -104,7 +104,9 @@ class Fixture:
             argv.append(f'--sync-owned={extra.pop("sync_owned")}')
         assert not extra, extra
         out = []
-        with mock.patch('builtins.print', lambda *a, **_: out.append(' '.join(map(str, a)))):
+        with unittest.mock.patch(
+            'builtins.print', lambda *a, **_: out.append(' '.join(map(str, a)))
+        ):
             code = intake.main(argv)
         return code, '\n'.join(out)
 
@@ -448,7 +450,7 @@ class Sync(IntakeCase):
         )
         allowed = self.fx.change({'.editorconfig': 'x\n'})
         refused = self.fx.change({'cliff.toml': 'x\n'})
-        with mock.patch.object(intake, 'SCRIPTS', self.scratch):
+        with unittest.mock.patch.object(intake, 'SCRIPTS', self.scratch):
             self.assert_allowed(self.fx.run('repo-sync/ci/main', allowed))
             self.assert_refused(
                 self.fx.run('repo-sync/ci/main', refused), 'cliff.toml: not a sync-owned path'
@@ -459,7 +461,10 @@ class Sync(IntakeCase):
         for source in ('', 'SYNC = 1\n', 'def sync_owned_patterns():\n    return []\n'):
             if source:
                 (self.scratch / 'classify-repos.py').write_text(source)
-            with self.subTest(source=source), mock.patch.object(intake, 'SCRIPTS', self.scratch):
+            with (
+                self.subTest(source=source),
+                unittest.mock.patch.object(intake, 'SCRIPTS', self.scratch),
+            ):
                 code, out = self.fx.run('repo-sync/ci/main', head)
                 self.assertEqual(code, 2)
                 self.assertIn('sync-owned set', out)

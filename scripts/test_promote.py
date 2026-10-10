@@ -11,11 +11,11 @@ import subprocess
 import tempfile
 import types
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
-from unittest import mock
 
 import promote
 import workflow_replay
@@ -331,7 +331,7 @@ class Reconciliation(unittest.TestCase):
             fx = Fixture(tmp)
             m, t = go_repo(fx)
             with (
-                mock.patch.object(promote, 'RECONCILIATION_SUBJECT', 'release: promote'),
+                unittest.mock.patch.object(promote, 'RECONCILIATION_SUBJECT', 'release: promote'),
                 self.assertRaisesRegex(promote.GhError, 'does not recognise'),
             ):
                 promote.build_reconciliation(fx.src, m, t, '')
@@ -359,9 +359,9 @@ class Snapshot(unittest.TestCase):
             ['--work-dir', str(fx.work), 'snapshot', '--repo', repo, '--target', target]
         )
         with (
-            mock.patch.object(promote, 'gh_json', side_effect=gh_json),
-            mock.patch.object(promote, 'CLONE_URL', fx.url()),
-            mock.patch.dict(
+            unittest.mock.patch.object(promote, 'gh_json', side_effect=gh_json),
+            unittest.mock.patch.object(promote, 'CLONE_URL', fx.url()),
+            unittest.mock.patch.dict(
                 os.environ, {'GITHUB_OUTPUT': str(out), 'GITHUB_STEP_SUMMARY': os.devnull}
             ),
         ):
@@ -450,9 +450,11 @@ class Checks(unittest.TestCase):
             ]
         )
         with (
-            mock.patch.object(promote, 'CLONE_URL', fx.url()),
-            mock.patch.object(promote, 'load_classify', return_value=classify or fake_classify()),
-            mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': str(summary)}),
+            unittest.mock.patch.object(promote, 'CLONE_URL', fx.url()),
+            unittest.mock.patch.object(
+                promote, 'load_classify', return_value=classify or fake_classify()
+            ),
+            unittest.mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': str(summary)}),
         ):
             for p in patches:
                 p.start()
@@ -484,7 +486,9 @@ class Checks(unittest.TestCase):
             fx.g('checkout', '-q', 'main')
             fx.commit('fix(deps): bump', {'go.sum': 'x\n'})
             fx.publish()
-            with mock.patch.object(promote, 'run_checks', side_effect=AssertionError('checked')):
+            with unittest.mock.patch.object(
+                promote, 'run_checks', side_effect=AssertionError('checked')
+            ):
                 rc, plan, summary = self.run_check(fx, m, t)
         self.assertEqual((rc, plan), (1, None))
         self.assertIn('main moved since the snapshot', summary)
@@ -557,7 +561,7 @@ class Checks(unittest.TestCase):
             fx = Fixture(tmp)
             m, t = go_repo(fx)
             fx.publish()
-            with mock.patch.object(classify, 'api_json', return_value=None):
+            with unittest.mock.patch.object(classify, 'api_json', return_value=None):
                 rc, plan, summary = self.run_check(fx, m, t, classify=classify)
         self.assertEqual((rc, plan), (1, None))
         self.assertIn(
@@ -572,7 +576,7 @@ class Checks(unittest.TestCase):
             fx = Fixture(tmp)
             m, t = go_repo(fx)
             fx.publish()
-            with mock.patch.object(classify, 'api_json', return_value={'message': 'x'}):
+            with unittest.mock.patch.object(classify, 'api_json', return_value={'message': 'x'}):
                 rc, plan, summary = self.run_check(fx, m, t, classify=classify)
         self.assertEqual((rc, plan), (1, None))
         self.assertIn(
@@ -630,8 +634,8 @@ class Checks(unittest.TestCase):
                 return []
 
             patches = (
-                mock.patch.object(promote, 'check_digest', return_value=(DIGEST, [])),
-                mock.patch.object(promote, 'check_vulnerabilities', side_effect=vulns),
+                unittest.mock.patch.object(promote, 'check_digest', return_value=(DIGEST, [])),
+                unittest.mock.patch.object(promote, 'check_vulnerabilities', side_effect=vulns),
             )
             rc, plan, summary = self.run_check(fx, m, t, patches=patches)
         self.assertEqual(rc, 0, summary)
@@ -721,7 +725,7 @@ class RetainedDigest(unittest.TestCase):
             }
             repo = promote.inventory.Repo(str(fx.src))
             layout = promote.layout_of(repo, t)
-            with mock.patch.dict(os.environ, env):
+            with unittest.mock.patch.dict(os.environ, env):
                 sig = promote.path_significance(fx.src, b, t, layout)
                 got = promote.check_digest(fx.src, 'demo', t, layout, sig)
             return got, log.read_text() if log.exists() else '', b
@@ -766,11 +770,11 @@ class Vulnerabilities(unittest.TestCase):
                 return findings.get(ref.rsplit('@', 1)[1], set())
 
             with (
-                mock.patch.object(promote, 'wait_for_main_release', return_value=waited),
-                mock.patch.object(promote, 'registry_token', return_value='t'),
-                mock.patch.object(promote, 'tag_digest', side_effect=tag_digest),
-                mock.patch.object(promote, 'platforms', side_effect=platforms),
-                mock.patch.object(promote, 'trivy_findings', side_effect=scan),
+                unittest.mock.patch.object(promote, 'wait_for_main_release', return_value=waited),
+                unittest.mock.patch.object(promote, 'registry_token', return_value='t'),
+                unittest.mock.patch.object(promote, 'tag_digest', side_effect=tag_digest),
+                unittest.mock.patch.object(promote, 'platforms', side_effect=platforms),
+                unittest.mock.patch.object(promote, 'trivy_findings', side_effect=scan),
             ):
                 return promote.check_vulnerabilities(fx.src, 'demo', m, DIGEST), refs
 
@@ -853,7 +857,9 @@ class WaitForMainRelease(unittest.TestCase):
         calls = iter(answers)
         clock = iter(range(0, 10**6, promote.MAIN_RUN_POLL_SECONDS))
         slept = []
-        with mock.patch.object(promote, 'release_runs', side_effect=lambda repo, sha: next(calls)):
+        with unittest.mock.patch.object(
+            promote, 'release_runs', side_effect=lambda repo, sha: next(calls)
+        ):
             got = promote.wait_for_main_release(
                 'demo',
                 'm' * 40,
@@ -894,7 +900,9 @@ class Trivy(unittest.TestCase):
                 f"#!/bin/sh\nprintf '%s\\n' \"$@\" >{argv}\necho '{json.dumps(report)}'\n"
             )
             stub.chmod(0o755)
-            with mock.patch.dict(os.environ, {'TRIVY_BIN': str(stub), 'TRIVY_CACHE_DIR': '/db'}):
+            with unittest.mock.patch.dict(
+                os.environ, {'TRIVY_BIN': str(stub), 'TRIVY_CACHE_DIR': '/db'}
+            ):
                 got = promote.trivy_findings('ghcr.io/cplieger/demo@sha256:x')
             args = argv.read_text().split('\n')
         self.assertEqual(got, {('CVE-1', 'openssl')})
@@ -910,7 +918,7 @@ class Trivy(unittest.TestCase):
 
     def test_a_failed_scan_is_a_read_failure(self):
         with (
-            mock.patch.dict(os.environ, {'TRIVY_BIN': 'false'}),
+            unittest.mock.patch.dict(os.environ, {'TRIVY_BIN': 'false'}),
             self.assertRaises(promote.GhError),
         ):
             promote.trivy_findings('x')
@@ -929,7 +937,7 @@ class Platforms(unittest.TestCase):
                 {'digest': 'sha256:c', 'platform': {'os': 'unknown', 'architecture': 'unknown'}},
             ],
         }
-        with mock.patch.object(promote, 'registry_json', return_value=index):
+        with unittest.mock.patch.object(promote, 'registry_json', return_value=index):
             got = promote.platforms('demo', 'sha256:i', 't')
         self.assertEqual(got, {'linux/amd64': 'sha256:a', 'linux/arm64/v8': 'sha256:b'})
 
@@ -975,8 +983,8 @@ class Create(unittest.TestCase):
             out = Path(tmp) / 'out'
             out.write_text('')
             with (
-                mock.patch.object(promote, 'gh_send', side_effect=gh_send),
-                mock.patch.dict(os.environ, {'GITHUB_OUTPUT': str(out)}),
+                unittest.mock.patch.object(promote, 'gh_send', side_effect=gh_send),
+                unittest.mock.patch.dict(os.environ, {'GITHUB_OUTPUT': str(out)}),
             ):
                 rc = promote.cmd_create(promote.parse_args(['create', '--plan-file', str(plan)]))
             return rc, calls, out.read_text()
@@ -1038,7 +1046,7 @@ class FakeRegistry:
 
     @staticmethod
     def response(headers, body):
-        resp = mock.MagicMock()
+        resp = unittest.mock.MagicMock()
         resp.__enter__.return_value = resp
         resp.headers.items.return_value = list(headers.items())
         resp.read.return_value = body
@@ -1049,8 +1057,8 @@ class Tag(unittest.TestCase):
     def run_tag(self, registry, digest=None, env=None):
         args = ['tag', '--repo', 'demo', '--digest', digest or registry.digest, '--r', R_SHA]
         with (
-            mock.patch.object(promote.urllib.request, 'urlopen', side_effect=registry),
-            mock.patch.dict(
+            unittest.mock.patch.object(promote.urllib.request, 'urlopen', side_effect=registry),
+            unittest.mock.patch.dict(
                 os.environ, {'GHCR_TOKEN': 'pat', 'GITHUB_STEP_SUMMARY': os.devnull, **(env or {})}
             ),
         ):
@@ -1113,11 +1121,11 @@ class Move(unittest.TestCase):
         args = ['move', '--repo', 'demo', '--main', MAIN_SHA, '--target', TARGET_SHA]
         args += ['--digest', digest, '--r', R_SHA]
         with (
-            mock.patch.object(promote, 'gh_json', side_effect=gh_json),
-            mock.patch.object(promote, 'gh_send', side_effect=gh_send),
-            mock.patch.object(promote, 'registry_token', return_value='pull'),
-            mock.patch.object(promote, 'tag_digest', side_effect=tag_digest),
-            mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': os.devnull}),
+            unittest.mock.patch.object(promote, 'gh_json', side_effect=gh_json),
+            unittest.mock.patch.object(promote, 'gh_send', side_effect=gh_send),
+            unittest.mock.patch.object(promote, 'registry_token', return_value='pull'),
+            unittest.mock.patch.object(promote, 'tag_digest', side_effect=tag_digest),
+            unittest.mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': os.devnull}),
         ):
             rc = promote.cmd_move(promote.parse_args(args))
         return rc, sends
@@ -1337,8 +1345,8 @@ class Preview(unittest.TestCase):
             )
             env = {'GITHUB_STEP_SUMMARY': str(summary), 'CLIFF_BIN': cliff_bin(), 'GH_TOKEN': 'x'}
             with (
-                mock.patch.object(promote, 'CLONE_URL', fx.url()),
-                mock.patch.dict(os.environ, env),
+                unittest.mock.patch.object(promote, 'CLONE_URL', fx.url()),
+                unittest.mock.patch.dict(os.environ, env),
             ):
                 rc = promote.cmd_preview(args)
             text = summary.read_text() if summary.exists() else ''
@@ -1363,7 +1371,7 @@ class RestTransport(unittest.TestCase):
                 out = b'HTTP/2.0 422 Unprocessable\n\r\n{"message": "Reference already exists"}'
             return subprocess.CompletedProcess(args, 0 if b' 200 ' in out else 1, out, b'')
 
-        with mock.patch.object(promote.ghrest.DEFAULT, 'run', run):
+        with unittest.mock.patch.object(promote.ghrest.DEFAULT, 'run', run):
             self.assertEqual(promote.gh_json('repos/cplieger/x'), {'default_branch': 'dev'})
             with self.assertRaises(promote.GhError) as caught:
                 promote.gh_send('POST', 'repos/cplieger/x/git/refs', {'ref': 'refs/heads/r'})

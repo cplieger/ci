@@ -22,8 +22,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
-from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 TRACKER = HERE / 'tracker_issue.py'
@@ -153,8 +153,8 @@ class TrackerIssueTest(unittest.TestCase):
 
         sleeps, err = [], io.StringIO()
         with (
-            mock.patch.dict(os.environ, self.stub_env()),
-            mock.patch.object(tracker_issue.ghrest.DEFAULT, 'sleep', sleeps.append),
+            unittest.mock.patch.dict(os.environ, self.stub_env()),
+            unittest.mock.patch.object(tracker_issue.ghrest.DEFAULT, 'sleep', sleeps.append),
             contextlib.redirect_stderr(err),
             contextlib.redirect_stdout(io.StringIO()),
         ):

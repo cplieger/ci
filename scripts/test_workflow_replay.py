@@ -6,9 +6,9 @@ import json
 import shutil
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from typing import ClassVar
-from unittest import mock
 
 import workflow_replay as wr
 import yaml
@@ -103,7 +103,10 @@ class JobConditions(unittest.TestCase):
 
 class Steps(unittest.TestCase):
     def replay(self, workflow: dict, context: dict, *extra: str) -> tuple[int, dict]:
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(tempfile, 'tempdir', tmp):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            unittest.mock.patch.object(tempfile, 'tempdir', tmp),
+        ):
             wf, ctx, out = Path(tmp, 'w.yaml'), Path(tmp, 'c.json'), Path(tmp, 'o.json')
             wf.write_text(yaml.safe_dump(workflow))
             ctx.write_text(json.dumps(context))
@@ -228,7 +231,7 @@ class CiSource(unittest.TestCase):
         paths = {k: self.tmp / k for k in ('w.yaml', 'c.json', 'o.json')}
         paths['w.yaml'].write_text(yaml.safe_dump(wf))
         paths['c.json'].write_text(json.dumps(context or {}))
-        with mock.patch.object(tempfile, 'tempdir', str(self.tmp)):
+        with unittest.mock.patch.object(tempfile, 'tempdir', str(self.tmp)):
             rc = wr.main(
                 [
                     *('--workflow', str(paths['w.yaml']), '--job', 'j'),
