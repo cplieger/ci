@@ -265,23 +265,11 @@ class BackfillRenderTest(unittest.TestCase):
             json.dumps(bundle), encoding='utf-8'
         )
 
-    def test_legacy_is_the_default_and_excludes_lane_commits(self):
-        self.build(bump_dep=True)
-        out = self.backfill(cliff_out='### Fixed\n\n- Root fix (#2)\n')
-        self.assertIn('+### Fixed', out)
-        self.assertNotIn('Full changelog', out)
-        argv = self.cliff_argv()
-        self.assertIn('--exclude-path yamlenv/**', argv)
-        self.assertIn('v1.0.0..v1.1.0', argv)
-        self.assertNotIn('--tag v1.1.0', argv)
-
     def test_two_branch_renders_through_render_notes_with_both_sboms(self):
         self.build(bump_dep=True)
         self.release_sbom('v1.0.0', {'busybox': '1.0'})
         self.release_sbom('v1.1.0', {'busybox': '1.1'})
         out = self.backfill(
-            '--release-model',
-            'two-branch',
             cliff_out='### Fixed\n\n- Root fix (#2)\n',
             GH_TOKEN='a-token-render-notes-must-never-see',
         )
@@ -316,7 +304,7 @@ class BackfillRenderTest(unittest.TestCase):
         self.build(bump_dep=True)
         self.release_sbom('v1.0.0', {'busybox': '1.0'})
         self.release_sbom('v1.1.0', {'foreign-package': '9.9'}, repo='other/app')
-        out = self.backfill('--release-model', 'two-branch', cliff_out='')
+        out = self.backfill(cliff_out='')
         self.assertNotIn('System packages', out)
         self.assertNotIn('foreign-package', out)
 
@@ -326,7 +314,7 @@ class BackfillRenderTest(unittest.TestCase):
         self.release_sbom(
             'v1.1.0', {'foreign-package': '9.9'}, signed_at=self.git('rev-parse', 'v1.0.0')
         )
-        out = self.backfill('--release-model', 'two-branch', cliff_out='')
+        out = self.backfill(cliff_out='')
         self.assertNotIn('System packages', out)
         self.assertNotIn('foreign-package', out)
 
@@ -336,9 +324,7 @@ class BackfillRenderTest(unittest.TestCase):
         self.release_sbom('v1.0.0', {'busybox': '1.0'})
         self.release_sbom('v1.1.0', {'busybox': '1.1'}, signed_at=self.git('rev-parse', 'v1.2.0'))
         self.release_sbom('v1.2.0', {'busybox': '1.2'})
-        out = self.backfill(
-            '--release-model', 'two-branch', cliff_out='', FAKE_TAGS='v1.0.0 v1.1.0 v1.2.0'
-        )
+        out = self.backfill(cliff_out='', FAKE_TAGS='v1.0.0 v1.1.0 v1.2.0')
         self.assertIn('+- `busybox` 1.0 to 1.1', out)
         self.assertIn('+- `busybox` 1.1 to 1.2', out)
 
@@ -348,9 +334,7 @@ class BackfillRenderTest(unittest.TestCase):
         self.release_sbom('v1.0.0', {'busybox': '1.0'})
         self.release_sbom('v1.1.0', {'busybox': '1.1'}, signed_at=self.git('rev-parse', 'HEAD'))
         self.release_sbom('v1.2.0', {'busybox': '1.2'})
-        out = self.backfill(
-            '--release-model', 'two-branch', cliff_out='', FAKE_TAGS='v1.0.0 v1.1.0 v1.2.0'
-        )
+        out = self.backfill(cliff_out='', FAKE_TAGS='v1.0.0 v1.1.0 v1.2.0')
         self.assertNotIn('1.0 to 1.1', out)
         self.assertNotIn('1.1 to 1.2', out)
         verified = (self.tmp / 'cosign.argv').read_text(encoding='utf-8')
@@ -367,8 +351,6 @@ class BackfillRenderTest(unittest.TestCase):
         self.release_sbom('v1.1.0', {'busybox': '1.1'})
         self.release_sbom('v1.2.0', {'busybox': '1.2'})
         out = self.backfill(
-            '--release-model',
-            'two-branch',
             cliff_out='### Fixed\n\n- Root fix (#2)\n',
             FAKE_TAGS='v1.0.0 v1.1.0 v1.2.0',
         )
@@ -381,7 +363,7 @@ class BackfillRenderTest(unittest.TestCase):
         self.build(bump_dep=True)
         self.release_sbom('v1.0.0', {'busybox': '1.0'})
         self.release_sbom('v1.1.0', {'busybox': '1.1'}, shipped={'busybox': '6.6.6-forged'})
-        out = self.backfill('--release-model', 'two-branch', '--apply', cliff_out='')
+        out = self.backfill('--apply', cliff_out='')
         self.assertIn('applied v1.1.0', out)
         edited = (self.tmp / 'v1.1.0.edited.md').read_text(encoding='utf-8')
         self.assertIn('**Full changelog**', edited)
@@ -393,12 +375,12 @@ class BackfillRenderTest(unittest.TestCase):
         self.release_sbom('v1.0.0', {'busybox': '1.0'})
         self.release_sbom('v1.1.0', {'busybox': '1.1'})
         (self.tmp / 'v1.1.0.spdx.json.sigstore.json').unlink()
-        out = self.backfill('--release-model', 'two-branch', cliff_out='')
+        out = self.backfill(cliff_out='')
         self.assertNotIn('System packages', out)
 
     def test_two_branch_without_sboms_omits_the_package_part(self):
         self.build(bump_dep=True)
-        out = self.backfill('--release-model', 'two-branch', cliff_out='')
+        out = self.backfill(cliff_out='')
         self.assertIn('+**Full changelog**', out)
         self.assertNotIn('System packages', out)
 
@@ -425,21 +407,16 @@ class BackfillRenderTest(unittest.TestCase):
             ('renovate/main-weekly-dependencies', other, ['dependencies']),
             ('fix/not-renovate', other, ['security']),
         )
-        out = self.backfill('--release-model', 'two-branch', cliff_out='')
+        out = self.backfill(cliff_out='')
         self.assertIn('+- `example.com/dep` v1.0.0 to v1.1.0 (Go, security update)', out)
         self.assertIn('+- `example.com/other` v1.0.0 to v1.2.0 (Go)', out)
         reads = (self.tmp / 'gh-api.argv').read_text(encoding='utf-8')
         for base in ('main', 'dev'):
             self.assertIn(f'repos/owner/app/pulls?state=closed&base={base}&sort=updated', reads)
 
-    def test_legacy_reads_no_pull_requests(self):
-        self.build(bump_dep=True)
-        self.backfill(cliff_out='### Fixed\n\n- Root fix (#2)\n')
-        self.assertFalse((self.tmp / 'gh-api.argv').exists())
-
     def test_two_branch_compare_link_stands_in_for_an_empty_change_list(self):
         self.build(bump_dep=False)
-        out = self.backfill('--release-model', 'two-branch', cliff_out='\n')
+        out = self.backfill(cliff_out='\n')
         self.assertIn(
             '+**Full changelog**: https://github.com/owner/app/compare/v1.0.0...v1.1.0', out
         )
@@ -450,11 +427,31 @@ class BackfillRenderTest(unittest.TestCase):
         self.build(bump_dep=False)
         for tags in ('', 'v1.0.0', 'v1.0.0 v1.1.0-dev.1'):
             for only in ([], ['--only', 'v1.0.0']):
-                proc = self.backfill_proc(
-                    '--release-model', 'two-branch', *only, cliff_out='', FAKE_TAGS=tags
-                )
+                proc = self.backfill_proc(*only, cliff_out='', FAKE_TAGS=tags)
                 self.assertEqual(proc.returncode, 0, (tags, only, proc.stderr))
                 self.assertIn('nothing to do: fewer than two semver releases', proc.stdout)
+                self.assertNotIn('Traceback', proc.stderr)
+        self.assertFalse((self.tmp / 'gh-api.argv').exists())
+        self.assertFalse((self.tmp / 'cliff.argv').exists())
+
+    def test_two_branch_with_every_pair_carved_out_is_a_clean_no_op(self):
+        self.build(bump_dep=False)
+        carve_outs = self.tmp / 'carve-outs.yaml'
+        carve_outs.write_text(
+            'carve_outs:\n  - repo: owner/app\n    tag: v1.1.0\n    reason: hand-written\n',
+            encoding='utf-8',
+        )
+        for apply, summary in (
+            ([], 'DRY-RUN (use --apply to edit): 0 would change'),
+            (['--apply'], 'nothing to apply: 0 unchanged, 0 skipped non-linear, 1 carved out'),
+        ):
+            for only in ([], ['--only', 'v1.1.0']):
+                proc = self.backfill_proc(
+                    '--carve-outs', str(carve_outs), *apply, *only, cliff_out=''
+                )
+                self.assertEqual(proc.returncode, 0, (apply, only, proc.stderr))
+                self.assertIn('skip v1.1.0: carved out (hand-written)', proc.stderr)
+                self.assertIn(summary, proc.stdout)
                 self.assertNotIn('Traceback', proc.stderr)
         self.assertFalse((self.tmp / 'gh-api.argv').exists())
         self.assertFalse((self.tmp / 'cliff.argv').exists())
@@ -462,7 +459,7 @@ class BackfillRenderTest(unittest.TestCase):
     def test_two_branch_refuses_an_only_tag_with_no_predecessor_before_any_read(self):
         self.build(bump_dep=False)
         for tag in ('v9.9.9', 'v1.0.0'):
-            proc = self.backfill_proc('--release-model', 'two-branch', '--only', tag, cliff_out='')
+            proc = self.backfill_proc('--only', tag, cliff_out='')
             self.assertEqual(proc.returncode, 2, proc.stderr)
             self.assertIn(
                 f'error: --only tag(s) not in the backfillable set: {tag} (backfillable: v1.1.0)',
@@ -477,11 +474,15 @@ class BackfillRenderTest(unittest.TestCase):
         return [json.loads(line) for line in argv]
 
     def test_apply_patches_the_release_by_id_over_rest_and_reads_it_back(self):
-        self.build(bump_dep=True)
+        self.build(bump_dep=False)
         out = self.backfill('--apply', cliff_out='### Fixed\n\n- Root fix (#2)\n')
         self.assertIn('applied v1.1.0', out)
         edited = (self.tmp / 'v1.1.0.edited.md').read_text(encoding='utf-8')
-        self.assertEqual(edited, '### Fixed\n\n- Root fix (#2)')
+        self.assertEqual(
+            edited,
+            '### Fixed\n\n- Root fix (#2)\n\n'
+            '**Full changelog**: https://github.com/owner/app/compare/v1.0.0...v1.1.0',
+        )
         calls = self.rest_calls()
         self.assertEqual(calls[0], ['api', '-i', 'repos/owner/app'])
         self.assertEqual(calls[1], ['api', '-i', 'repos/owner/app/releases?per_page=100&page=1'])
@@ -490,7 +491,11 @@ class BackfillRenderTest(unittest.TestCase):
             patches, [['api', '-i', '-X', 'PATCH', 'repos/owner/app/releases/1001', '--input', '-']]
         )
         reads = [c for c in calls if c[-1] == 'repos/owner/app/releases/tags/v1.1.0']
-        self.assertEqual(len(reads), 4, 'the plan, the re-check, the edit and the read-back')
+        self.assertEqual(
+            len(reads),
+            5,
+            'the SBOM asset lookup, the plan, the re-check, the edit and the read-back',
+        )
         self.assertFalse([c for c in calls if c[:1] != ['api']], 'no GraphQL-backed gh command')
 
     def test_an_origin_that_is_not_github_is_refused_before_any_read(self):

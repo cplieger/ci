@@ -5,7 +5,9 @@
 # tag `:vX.Y.Z`, `:vX.Y`, `:vX`, `:latest` on a promotion commit's trailer
 # digest (never a build), else on the dev digest promote-digest.sh picks, else
 # on a source build; copy to Docker Hub with referrers, re-scan, GitHub Release.
-# Every vulnerability scan is advisory.
+# Every vulnerability scan is advisory. Like release.yaml, it refuses, in both
+# modes, a caller that is not a public, non-fork repository whose default
+# branch is `dev`.
 name: Docker Release
 
 on:
@@ -23,16 +25,11 @@ on:
         description: "The dev-channel tag for this build (e.g. v1.2.3-dev.4). Required on the dev channel."
         type: string
         default: ""
-      latest:
-        description: "The newest stable tag before this run, for the release-notes fallback. Empty when none."
-        type: string
-        default: ""
       exclude-re:
         description: >-
           The caller's joined exclusion regex (grep -E). The stable channel
           walks first-parent ancestors for a dev build to promote and accepts
-          one only when no commit since changed a shipped path: under legacy a
-          path outside this regex, under two-branch a path
+          one only when no commit since changed a path
           scripts/path-significance.sh counts. Empty accepts an exact
           `sha-<commit>` hit only.
         type: string
@@ -53,18 +50,6 @@ on:
           ignore a `release` payload whose tag_name contains `/`.
         type: string
         default: "[]"
-      finalize:
-        description: >-
-          'true' when the caller's detect job found this commit already
-          tagged at the computed version WITHOUT a GitHub Release (a prior
-          run died between tag creation and Release creation). Stable
-          channel only. The publish steps then run despite
-          release-needed=false: the image is promoted or rebuilt and re-tagged
-          like any rerun, the notes render via --current, the tag guard's
-          exists-at-same-SHA path passes through, and the missing Release is
-          created.
-        type: string
-        default: "false"
       image-name:
         description: "Image name (without registry prefix). Defaults to repo name."
         type: string
@@ -99,30 +84,22 @@ on:
           release_kind_note), handed to the notes renderer. Empty adds nothing.
         type: string
         default: ""
-      release-model:
-        description: >-
-          'legacy' (default) or 'two-branch' (release.yaml's release_model).
-          two-branch re-tags a promotion commit's Promoted-Digest, inherits no
-          digest across a merge, renders the explicit-range notes with the
-          system-package diff, and records the completion receipt.
-        type: string
-        default: "legacy"
       subpackages:
         description: >-
-          Two-branch: JSON array of the declared TS subpackage dirs (release.yaml's
+          JSON array of the declared TS subpackage dirs (release.yaml's
           subpackages). A commit changing a subpackage's shipped manifest owes a
           release, so its image is built from it rather than inherited.
         type: string
         default: "[]"
       defer-receipt:
         description: >-
-          Two-branch: leave the completion receipt to the caller, which records
+          Leave the completion receipt to the caller, which records
           it once the TS subpackages sharing this version are published too.
         type: boolean
         default: false
       repair-tag:
         description: >-
-          Two-branch repair: the stable tag whose missing Release needs its
+          Repair: the stable tag whose missing Release needs its
           assets. The call then builds and publishes nothing, and hands on the
           tag's attested SBOM, the dashboard at its commit, and their signatures.
         type: string
@@ -130,7 +107,7 @@ on:
       security-shas:
         description: >-
           Space-separated merge commits of Renovate security pull requests
-          (release.yaml's security_shas), marked in two-branch notes.
+          (release.yaml's security_shas), marked in the notes.
         type: string
         default: ""
       image-licenses:
@@ -180,7 +157,34 @@ permissions:
   contents: read
 
 jobs:
+  # A release (prepare) and a repair (repair-assets) both need this job, so no
+  # mode reads, signs or publishes for a refused caller.
+  caller:
+    runs-on: ubuntu-slim
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Refuse a caller outside the two-branch model
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          REPO_FORK: ${{ github.event.repository.fork }}
+        run: |
+          set -euo pipefail
+          if [ "$DEFAULT_BRANCH" != dev ] || [ "$REPO_PRIVATE" = true ] || [ "$REPO_FORK" = true ]; then
+            echo "::error::docker-release.yaml publishes only from a public, non-fork repository whose default branch is dev (this one: default branch ${DEFAULT_BRANCH:-<unknown>}, private ${REPO_PRIVATE:-<unknown>}, fork ${REPO_FORK:-<unknown>}). Make dev the default branch, or remove the release.yaml caller and publish from the repository's own workflow."
+            exit 1
+          fi
+          case "${GITHUB_REF:-}" in
+            refs/heads/dev | refs/heads/main) ;;
+            *)
+              echo "::error::docker-release.yaml publishes only from refs/heads/dev or refs/heads/main, not ${GITHUB_REF:-<unknown>}."
+              exit 1
+              ;;
+          esac
+
   prepare:
+    needs: caller
     if: ${{ inputs.repair-tag == '' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 5
@@ -214,7 +218,6 @@ jobs:
           VERSION_INPUT: ${{ inputs.version }}
           DEV_VERSION: ${{ inputs.dev-version }}
           RELEASE_NEEDED: ${{ inputs.release-needed }}
-          FINALIZE: ${{ inputs.finalize }}
         run: |
           set -euo pipefail
           case "$CHANNEL" in
@@ -238,15 +241,11 @@ jobs:
               exit 1
             fi
             TAG="$DEV_VERSION"
-            PUBLISH="$RELEASE_NEEDED"
           else
             TAG="v${VERSION}"
-            PUBLISH=false
-            if [ "$RELEASE_NEEDED" = "true" ] || [ "$FINALIZE" = "true" ]; then
-              PUBLISH=true
-            fi
           fi
-          [ "$PUBLISH" = "true" ] || PUBLISH=false
+          PUBLISH=false
+          [ "$RELEASE_NEEDED" != "true" ] || PUBLISH=true
           # metadata-action tag rules per channel; the highest priority one
           # becomes org.opencontainers.image.version, so the channel's own
           # version tag leads on both channels.
@@ -344,9 +343,9 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
-      # Two-branch reuses an image only once its build signed and attested it.
+      # An image is reused only once its build signed and attested it.
       - name: Install Cosign
-        if: ${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' && inputs.release-model == 'two-branch' }}
+        if: ${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' }}
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
@@ -357,7 +356,6 @@ jobs:
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           EXCLUDE_RE: ${{ inputs.exclude-re }}
-          RELEASE_MODEL: ${{ inputs.release-model }}
           SUBPACKAGES_JSON: ${{ inputs.subpackages }}
         run: |
           set -euo pipefail
@@ -643,7 +641,7 @@ jobs:
       # Before any stable write: a re-tagged digest is never signed or attested
       # again, so the build it promotes must have done both (release-state.sh).
       - name: Verify the promoted build's signature and SBOM
-        if: ${{ env.PUBLISH == 'true' && inputs.release-model == 'two-branch' && env.PROMOTE_DIGEST != '' }}
+        if: ${{ env.PUBLISH == 'true' && env.PROMOTE_DIGEST != '' }}
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           EXCLUDE_RE: ${{ inputs.exclude-re }}
@@ -1090,7 +1088,7 @@ jobs:
           fi
           artifact_type="application/vnd.grafana.dashboard.${format}+json"
           # oras-go stamps org.opencontainers.image.created=now unless the caller sets
-          # it, so without a fixed value every push (a finalize rerun included) mints a
+          # it, so without a fixed value every push (a rerun included) mints a
           # new manifest digest and moves both tags off the signed one. The commit
           # time makes the manifest a pure function of its inputs.
           created=$(git show -s --format=%cI "$GITHUB_SHA")
@@ -1127,7 +1125,7 @@ jobs:
       # effort: a previous SBOM that cannot be read or verified leaves the part
       # out.
       - name: Fetch the previous release's SBOM
-        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && inputs.release-model == 'two-branch' }}
+        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           EXCLUDE_RE: ${{ inputs.exclude-re }}
@@ -1135,7 +1133,7 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          PREV=$(bash "$CI_TOOLS/render-notes.sh" --release-model two-branch --site docker --version "$VERSION" --print-previous)
+          PREV=$(bash "$CI_TOOLS/render-notes.sh" --site docker --version "$VERSION" --print-previous)
           if [ -z "$PREV" ]; then
             echo "::notice::No earlier stable release exists, so the notes carry no system-package diff."
             exit 0
@@ -1160,21 +1158,15 @@ jobs:
           echo "previous SBOM: ${PREV} (${REF})"
 
       - name: Generate release notes
-        # Stable only (a dev build has no Release); finalize repairs a
-        # tag-created/Release-missing partial run despite release-needed=false.
-        # Deliberately token-free: this step downloads and EXECUTES git-cliff,
-        # and an untrusted binary must never run with a credential in its
-        # environment; the gh/tagging calls live in the Create release step,
-        # which runs no downloaded code.
+        # Stable only (a dev build has no Release). Deliberately token-free:
+        # this step downloads and EXECUTES git-cliff, and an untrusted binary
+        # must never run with a credential in its environment; the gh/tagging
+        # calls live in the Create release step, which runs no downloaded code.
         if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
-          RELEASE_MODEL: ${{ inputs.release-model }}
           VERSION: ${{ inputs.version }}
-          LATEST: ${{ inputs.latest }}
           GO_LANES_JSON: ${{ inputs.go-modules }}
-          FINALIZE: ${{ inputs.finalize }}
-          RELEASE_NEEDED: ${{ inputs.release-needed }}
           KIND_NOTE: ${{ inputs.release-kind-note }}
           SECURITY_SHAS: ${{ inputs.security-shas }}
         run: |
@@ -1190,22 +1182,12 @@ jobs:
             "https://github.com/orhun/git-cliff/releases/download/${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
           echo "${CLIFF_SHA256}  ${RUNNER_TEMP}/git-cliff.tgz" | sha256sum -c -
           tar xzf "$RUNNER_TEMP/git-cliff.tgz" -C /usr/local/bin --strip-components=1 "git-cliff-${CLIFF_VERSION#v}/git-cliff"
-          args=(--release-model "${RELEASE_MODEL:-legacy}" --site docker --version "$VERSION" --go-lanes "$GO_LANES_JSON"
-            --kind-note "$KIND_NOTE" --out RELEASE_NOTES.md)
-          if [ "${RELEASE_MODEL:-legacy}" = "two-branch" ]; then
-            tr ' ' '\n' <<<"$SECURITY_SHAS" > "$RUNNER_TEMP/security-shas"
-            args+=(--repo "$GITHUB_REPOSITORY" --release-commit "$GITHUB_SHA" --security-shas "$RUNNER_TEMP/security-shas")
-            if [ -s "$RUNNER_TEMP/sbom-prev.spdx.json" ]; then
-              args+=(--sbom-prev "$RUNNER_TEMP/sbom-prev.spdx.json" --sbom-new sbom.spdx.json)
-            fi
-          else
-            args+=(--latest "$LATEST")
-            if [ "$FINALIZE" = "true" ]; then
-              args+=(--finalize)
-            fi
-            if [ "$RELEASE_NEEDED" = "true" ]; then
-              args+=(--release-needed)
-            fi
+          tr ' ' '\n' <<<"$SECURITY_SHAS" > "$RUNNER_TEMP/security-shas"
+          args=(--site docker --version "$VERSION" --go-lanes "$GO_LANES_JSON" --kind-note "$KIND_NOTE"
+            --repo "$GITHUB_REPOSITORY" --release-commit "$GITHUB_SHA" --security-shas "$RUNNER_TEMP/security-shas"
+            --out RELEASE_NOTES.md)
+          if [ -s "$RUNNER_TEMP/sbom-prev.spdx.json" ]; then
+            args+=(--sbom-prev "$RUNNER_TEMP/sbom-prev.spdx.json" --sbom-new sbom.spdx.json)
           fi
           bash "$CI_TOOLS/render-notes.sh" "${args[@]}"
 
@@ -1220,9 +1202,6 @@ jobs:
         # --output-certificate and makes --bundle required. The single
         # .sigstore.json bundle carries the signature, certificate and Rekor
         # inclusion proof.
-        # finalize: the repaired Release must carry the same signed SBOM
-        # assets a normal release would, so this step follows the widened
-        # gate (the SBOM was regenerated above from the published image).
         if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
@@ -1534,11 +1513,12 @@ jobs:
           fi
           exit "$rc"
 
-  # ─── Two-branch: the assets of a repaired Release ─────────────────────────
+  # ─── The assets of a repaired Release ─────────────────────────────────────
   # release.yaml's repair publishes the Release; the signatures are made here
   # because consumers verify them against this workflow's identity. The
   # SBOM is the one attested to the published image, not a regeneration.
   repair-assets:
+    needs: caller
     if: ${{ inputs.repair-tag != '' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
@@ -1624,16 +1604,15 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # ─── Two-branch: the image lane's completion receipt ──────────────────────
+  # ─── The image lane's completion receipt ──────────────────────────────────
   # Complete once its Release exists and verify-publish read every registry
   # back; release.yaml's next run repairs any stable tag that lacks this
-  # receipt before publishing anything newer. Its own job, so the statuses
-  # scope never reaches a legacy run.
+  # receipt before publishing anything newer.
   receipt:
     needs: [prepare, finalize, verify-publish]
     if: |
       always() && needs.verify-publish.result == 'success' && !inputs.defer-receipt
-      && inputs.release-model == 'two-branch' && inputs.channel == 'stable' && needs.finalize.outputs.released == 'true'
+      && inputs.channel == 'stable' && needs.finalize.outputs.released == 'true'
     runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions:

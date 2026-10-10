@@ -933,15 +933,15 @@ def collect(meta):
 
     wf = gh_json(f'repos/{OWNER}/{name}/contents/.github/workflows')
     if wf is API_ERROR:
-        s['has_codeql'] = s['has_security_scan'] = s['publishes'] = None
+        s['has_codeql'] = s['has_security_scan'] = None
+        s['release_caller'] = s['own_publisher'] = None
         s['errors'].append('workflow listing unreadable (API)')
     else:
         wf_names = {f['name'] for f in wf} if isinstance(wf, list) else set()
         s['has_codeql'] = bool({'codeql.yml', 'codeql.yaml'} & wf_names)
         s['has_security_scan'] = bool({'security.yml', 'security.yaml'} & wf_names)
-        s['publishes'] = bool(
-            {'release.yaml', 'release.yml', 'publish.yaml', 'publish.yml'} & wf_names
-        )
+        s['release_caller'] = bool({'release.yaml', 'release.yml'} & wf_names)
+        s['own_publisher'] = bool({'publish.yaml', 'publish.yml'} & wf_names)
 
     # Surface probes as in classify-repos.py: go.mod and package.json are read for
     # their text below, the Dockerfile for its presence.
@@ -1327,12 +1327,6 @@ def codeowners_warning(path):
     )
 
 
-STABLE_ONLY_WARNING = (
-    'default branch is main, so every merge releases straight to the stable channel '
-    '(adopt the dev channel, or list the repo in SINGLE_MAIN_REPOS)'
-)
-
-
 def compliance(s):
     """Return (hard_failures, warnings, accepted) for one repo's settings dict.
 
@@ -1363,17 +1357,26 @@ def compliance(s):
         )
     elif s['default_branch'] not in ('main', 'dev'):
         hard.append(
-            f'default_branch={s["default_branch"]} (want dev, or main until the repo adopts the dev channel)'
+            f'default_branch={s["default_branch"]} (want dev, or main for a private or single-main repo)'
         )
-    # A bootstrap run sits on main for minutes and a forgotten repo sits there
-    # forever; the two look identical, so this names the repo instead of failing.
+    # A public main-default repo outside SINGLE_MAIN_REPOS: a release.yaml
+    # caller is HARD because release.yaml refuses it and so it publishes
+    # nothing; one publishing through its own publish.yaml only lacks the listing.
     if (
         s['default_branch'] == 'main'
         and not s['private']
-        and s.get('publishes')
         and s['name'] not in release_channels.SINGLE_MAIN_REPOS
     ):
-        warn.append(STABLE_ONLY_WARNING)
+        if s.get('release_caller'):
+            hard.append(
+                'default_branch=main with a release.yaml caller '
+                '(want dev, because release.yaml publishes only from a dev default)'
+            )
+        elif s.get('own_publisher'):
+            warn.append(
+                'default_branch=main publishing through its own publish.yaml '
+                '(list the repo in SINGLE_MAIN_REPOS)'
+            )
 
     # Public repos only; the expected license is per repo (LICENSE_OVERRIDES).
     if not s['private']:
@@ -1579,8 +1582,9 @@ def compliance(s):
             warn.append('codeql.yml missing')
         if s['has_security_scan'] is False:
             warn.append('security.yml missing')
-    # None: no root Dockerfile, or the read failed (already an [error]).
-    if s.get('dockerhub_secrets') is False:
+    # None: no root Dockerfile, or the read failed (already an [error]). Only a
+    # two-channel repo publishes an image: release.yaml refuses the rest.
+    if two_channel and s.get('dockerhub_secrets') is False:
         hard.append(
             'DOCKERHUB_USERNAME/DOCKERHUB_TOKEN secrets missing '
             '(dual-publish image repo — the next release fails at '
@@ -1759,13 +1763,6 @@ def compliance(s):
     return hard, kept, accepted
 
 
-# Warnings about one owner-level decision: printed for every repo but filed only
-# once some repo has adopted it, since filing earlier opens one issue per repo
-# for a single decision. Each predicate reads every discovered repo's meta, the
-# same set on the full run that files.
-FILED_AFTER_ADOPTION = {
-    STABLE_ONLY_WARNING: lambda metas: any(m.get('default_branch') == 'dev' for m in metas),
-}
 # A repo younger than this is graded and printed, but nothing is filed or
 # closed for it while it is still being set up.
 GRACE = timedelta(hours=24)
@@ -1866,8 +1863,6 @@ def file_issues(path, dry_run):
     findings = load_findings(path)
     if findings is None:
         return 2
-    adoption = findings.get('adoption') or {}
-    held = {msg for msg in FILED_AFTER_ADOPTION if adoption.get(msg) is not True}
     run = run_url()
     counts = {
         'upsert': 0,
@@ -1896,7 +1891,7 @@ def file_issues(path, dry_run):
             print(f"{name}: skipped, this run's read hit API errors (its issue is left as it is)")
             continue
         hard = row.get('hard') or []
-        warn = [w for w in row.get('warnings') or [] if w not in held]
+        warn = row.get('warnings') or []
         mode = 'upsert' if hard or warn else 'close-when-clean'
         counts[mode] += 1
         if not row.get('has_issues'):
@@ -1982,7 +1977,6 @@ def main():
         for m in all_metas
         if not m['archived'] and not m.get('fork')
     ]
-    discovered = metas
     if args.visibility != 'all':
         metas = [m for m in metas if (m.get('visibility') or '').lower() == args.visibility]
     if args.repo:
@@ -2008,7 +2002,6 @@ def main():
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         settings = list(pool.map(audit_repo, metas))
-    adoption = {msg: bool(adopted(discovered)) for msg, adopted in FILED_AFTER_ADOPTION.items()}
 
     if args.dump:
         with open(args.dump, 'w', encoding='utf-8') as fh:
@@ -2126,7 +2119,6 @@ def main():
         findings = {
             'scope': sorted(set(args.repo)) if args.repo else None,
             'visibility': args.visibility,
-            'adoption': adoption,
             'repos': rows,
         }
         with open(args.findings_out, 'w', encoding='utf-8') as fh:

@@ -1,4 +1,4 @@
-# Self-release: cut a vX.Y.Z tag so move-major-tag.yaml moves `v2`/`v2.Y` and
+# Self-release: cut a vX.Y.Z tag so move-major-tag.yaml moves `vX`/`vX.Y` and
 # Renovate bumps the SHA-pinned reusable workflows in consumer repos.
 #
 # The PATH GATE, not the commit type, decides a release: only a change to a
@@ -136,18 +136,13 @@ jobs:
           # move-major-tag.yaml keeps co-located on the release commit.
           LAST_TAG="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || echo "")"
 
-          # Next version from conventional commits, using the CI-dedicated config
-          # (full-semver tag_pattern). Mirrors git-cliff-version's error handling:
-          # a non-zero exit or empty output is a hard failure, never a silent skip.
-          #
-          # --unreleased anchors cliff's version base at the actual latest
-          # tag (same reason as in actions/git-cliff-version): without it, a
-          # tag whose entire window is skip-typed — exactly what the force-
-          # patch fallback below mints for ci:/chore: workflow fixes —
-          # vanishes from cliff's post-filter release model, the base
-          # regresses to an older tag, and NEXT can come back BELOW
-          # LAST_TAG, tripping the strictly-greater guard into a hard
-          # failure on every subsequent propagatable release.
+          # A non-zero exit or empty output is a hard failure, never a silent
+          # skip. --unreleased anchors cliff's base at the actual latest tag:
+          # without it, a tag whose entire window is skip-typed (what the
+          # force-patch fallback below mints for ci:/chore: fixes) vanishes
+          # from cliff's post-filter release model, the base regresses, and
+          # NEXT comes back BELOW LAST_TAG, failing the strictly-greater guard
+          # on every later propagatable release.
           if ! NEXT="$(git cliff --unreleased --bumped-version --config "$CLIFF_CONFIG" 2>/tmp/cliff.err)"; then
             echo "::error::git cliff --bumped-version failed:"
             sed 's/^/  /' /tmp/cliff.err >&2 || true
@@ -275,7 +270,7 @@ jobs:
 
           # Defensive: cliff bases off the same tag the gate diffs from, so a
           # non-forward version should be unreachable — but never move a tag
-          # backward (move-major-tag would drag v2/v2.Y down with it).
+          # backward (move-major-tag would drag vX/vX.Y down with it).
           if [ "$NEXT" = "$LAST_TAG" ] || \
              [ "$(printf '%s\n%s\n' "$LAST_TAG" "$NEXT" | sort -V | tail -1)" != "$NEXT" ]; then
             echo "::error::Computed version ${NEXT} is not strictly greater than ${LAST_TAG}; refusing to cut."

@@ -125,7 +125,9 @@
       "expected": {
         "accepted": [],
         "errors": [],
-        "hard": [],
+        "hard": [
+          "default_branch=main with a release.yaml caller (want dev, because release.yaml publishes only from a dev default)"
+        ],
         "reads": [
           "repos/cplieger/httpx",
           "repos/cplieger/httpx/vulnerability-alerts",
@@ -143,9 +145,7 @@
           "repos/cplieger/httpx/contents/.github/workflows/ci.yaml",
           "repos/cplieger/httpx/hooks"
         ],
-        "warn": [
-          "default branch is main, so every merge releases straight to the stable channel (adopt the dev channel, or list the repo in SINGLE_MAIN_REPOS)"
-        ]
+        "warn": []
       },
       "meta": {
         "name": "httpx"
@@ -282,6 +282,7 @@
         "accepted": [],
         "errors": [],
         "hard": [
+          "default_branch=main with a release.yaml caller (want dev, because release.yaml publishes only from a dev default)",
           "allow_merge_commit=True (want False)",
           "allow_rebase_merge=False (want True)"
         ],
@@ -304,8 +305,7 @@
         ],
         "warn": [
           "squash_merge_commit_title=PR_TITLE (want COMMIT_OR_PR_TITLE)",
-          "squash_merge_commit_message=PR_BODY (want COMMIT_MESSAGES)",
-          "default branch is main, so every merge releases straight to the stable channel (adopt the dev channel, or list the repo in SINGLE_MAIN_REPOS)"
+          "squash_merge_commit_message=PR_BODY (want COMMIT_MESSAGES)"
         ]
       },
       "meta": {
@@ -505,7 +505,8 @@
         "accepted": [],
         "errors": [],
         "hard": [
-          "ruleset 'main' has an Integration bypass actor (id 99) \u2014 likely a stale/decommissioned app; remove it"
+          "default_branch=main with a release.yaml caller (want dev, because release.yaml publishes only from a dev default)",
+          "ruleset 'main' has an Integration bypass actor (id 99) — likely a stale/decommissioned app; remove it"
         ],
         "reads": [
           "repos/cplieger/httpx",
@@ -527,7 +528,6 @@
           "repos/cplieger/httpx/hooks"
         ],
         "warn": [
-          "default branch is main, so every merge releases straight to the stable channel (adopt the dev channel, or list the repo in SINGLE_MAIN_REPOS)",
           "unexpected custom ruleset 'main' (active) (standard is classic branch protection)",
           "unexpected custom ruleset 'tags' (evaluate) (standard is classic branch protection)",
           "ruleset 'main' has a bypass actor (RepositoryRole id 5)",
@@ -691,7 +691,7 @@
         "accepted": [],
         "errors": [],
         "hard": [
-          "DOCKERHUB_USERNAME/DOCKERHUB_TOKEN secrets missing (dual-publish image repo \u2014 the next release fails at the Docker Hub login)",
+          "default_branch=main with a release.yaml caller (want dev, because release.yaml publishes only from a dev default)",
           "README carries no '<!-- hub-overview BEGIN -->' / '<!-- hub-overview END -->' pair, so the release cannot build the Docker Hub overview page and the Hub listing stops being updated",
           "deploy-trigger webhook has no secret (the orchestrator rejects unsigned deliveries)",
           "deploy-trigger webhook events=['registry_package'] lack 'release' (it never fires, so deploys never trigger)",
@@ -721,9 +721,8 @@
           "repos/cplieger/knell/hooks"
         ],
         "warn": [
-          "default branch is main, so every merge releases straight to the stable channel (adopt the dev channel, or list the repo in SINGLE_MAIN_REPOS)",
-          "scripts/repin-sha.sh differs from its canonical in cplieger/ci (synced file, edit the canonical \u2014 the next sync overwrites this copy)",
-          "go.mod module 'github.com/cplieger/knell/v5' carries a /vN suffix (want 'github.com/cplieger/knell'; apps use the plain module path at every major \u2014 drop the suffix and rewrite internal imports)",
+          "scripts/repin-sha.sh differs from its canonical in cplieger/ci (synced file, edit the canonical — the next sync overwrites this copy)",
+          "go.mod module 'github.com/cplieger/knell/v5' carries a /vN suffix (want 'github.com/cplieger/knell'; apps use the plain module path at every major — drop the suffix and rewrite internal imports)",
           "compose.yaml example missing. Every image repo ships a reference compose file",
           "deploy-trigger webhook content_type=form (want json; the orchestrator parses a JSON body)",
           "deploy-trigger webhook last delivery failed (HTTP 502)"
@@ -1160,7 +1159,7 @@
           "repos/cplieger/animap/hooks"
         ],
         "warn": [
-          "used-by counter shows 'github.com/cplieger/animap' (want 'github.com/cplieger/animap/v5'; no API \u2014 fix by hand: Settings -> Advanced Security -> Used by counter)"
+          "used-by counter shows 'github.com/cplieger/animap' (want 'github.com/cplieger/animap/v5'; no API — fix by hand: Settings -> Advanced Security -> Used by counter)"
         ]
       },
       "meta": {

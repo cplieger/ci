@@ -44,6 +44,16 @@ rules:
       - weekly-links.yaml
       - weekly-stryker.yaml
 
+  github-app:
+    ignore:
+      # These mint the App token for every repo of the account: sync.yaml
+      # writes to every sync target and release-maintenance.yaml to every
+      # two-branch repo its plan read. Each runs only this repo's scripts,
+      # never a target's code. The backfill and rebuild-stale.yaml scope their
+      # tokens to the repos they write instead.
+      - sync.yaml
+      - release-maintenance.yaml
+
   secrets-inherit:
     ignore:
       # release.yaml forwards `secrets: inherit` to its OWN docker-release.yaml

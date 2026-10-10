@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Regenerate existing GitHub release bodies with the current cliff.toml.
 
-Repairs historical releases carrying (a) CI-pin churn the cliff
-`exclude_paths` filter now drops, and (b) off-by-one commit windows from the
-era when notes were rendered with `--latest` after tagging, by re-rendering
-every tag's true predecessor..tag range against the current config.
+Re-renders every tag's predecessor..tag range through render-notes.sh, as
+release.yaml renders a new release.
 
 Scope guarantees:
     - Edits release BODIES only. Never touches git tags, release titles,
@@ -23,17 +21,13 @@ Scope guarantees:
       match the remote tag SHA (stale/moved tags abort before any edit).
     - The oldest release (no predecessor tag) is left untouched: bootstrap
       bodies ("Initial release") aren't regenerable from a commit range.
-    - An empty regenerated body (every commit in range excluded) becomes a
-      maintenance stub plus a collapsed list of the excluded subjects,
-      rather than deleting the release.
     - Nested Go module lanes are excluded from these root bodies, as
       release.yaml renders them.
-    - `--release-model two-branch` renders each body through render-notes.sh
-      instead, the system-package diff read from the two releases' SBOM
-      assets when both carry one whose Sigstore bundle verifies (cosign) as
-      signed by this repository's release run at the tag's commit (or, for a
-      repaired Release, at a main commit up to the next stable tag), and the
-      updates merged through a Renovate security PR into main or dev marked.
+    - The system-package diff is read from the two releases' SBOM assets when
+      both carry one whose Sigstore bundle verifies (cosign) as signed by this
+      repository's release run at the tag's commit (or, for a repaired
+      Release, at a main commit up to the next stable tag), and the updates
+      merged through a Renovate security PR into main or dev marked.
     - Draft releases and non-vX.Y.Z tags skip with a notice; a skipped tag's
       window folds into the next stable tag's range. More than 1000 releases
       aborts rather than plan from a truncated list.
@@ -52,7 +46,6 @@ Usage:
     backfill-release-notes.py --only v1.0.6 --only v1.0.7
     backfill-release-notes.py --config ../ci/configs/cliff-stable.toml
     backfill-release-notes.py --apply                # edit after reviewing
-    backfill-release-notes.py --release-model two-branch   # render-notes.sh bodies
     backfill-release-notes.py --restore .release-notes-backup/1752600000
 """
 
@@ -83,16 +76,11 @@ if sys.version_info < (3, 11):  # noqa: UP036 - the guard IS the feature
 import ghrest
 from inventory import Repo
 
-STUB_BODY = (
-    '_Maintenance release: this range contains no changes eligible for release notes '
-    'under the current policy (CI/dependency plumbing, docs, or test-only changes)._'
-)
 SEMVER_TAG = re.compile(r'^v(\d+)\.(\d+)\.(\d+)$')
 GITHUB_REMOTE = re.compile(
     r'(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+?)(?:\.git)?/?'
 )
 RELEASE_LIST_CAP = 1000
-MAX_STUB_SUBJECTS = 100
 SBOM_ASSET = 'sbom.spdx.json'
 SBOM_BUNDLE = f'{SBOM_ASSET}.sigstore.json'
 # The identity docker-release.yaml signs the SBOM asset with (keyless).
@@ -228,17 +216,6 @@ def lanes_at(repo_dir: Path, sha: str) -> list[str]:
     return Repo(str(repo_dir)).lanes(sha)
 
 
-def render_range(
-    repo_dir: Path, cliff_bin: str, config: Path, prev: str, tag: str, lanes: list[str]
-) -> str:
-    excludes = [arg for lane in lanes for arg in ('--exclude-path', f'{lane}/**')]
-    proc = run(
-        [cliff_bin, '--config', str(config), *excludes, '--strip', 'header', f'{prev}..{tag}'],
-        repo_dir,
-    )
-    return proc.stdout.strip()
-
-
 def download_asset(repo: str, tag: str, name: str, target: Path) -> bool:
     """Whether the release of `tag` has asset `name` and it was written to `target`."""
     try:
@@ -340,7 +317,7 @@ def security_shas(repo_dir: Path, repo: str, prevs: list[str], scratch: Path) ->
     return path
 
 
-def render_two_branch(
+def render(
     repo_dir: Path,
     cliff_bin: str,
     cosign_bin: str,
@@ -351,17 +328,16 @@ def render_two_branch(
     tag_shas: dict[str, str],
     lanes: list[str],
     scratch: Path,
-    security: Path | None,
+    security: Path,
 ) -> str:
-    """The body render-notes.sh gives `tag` under the two-branch release model."""
+    """The body render-notes.sh gives `tag`, never empty: every backfilled tag has a
+    predecessor, so a compare link."""
     has_image = run(['git', 'cat-file', '-e', f'{tag}:Dockerfile'], repo_dir, check=False)
     site = 'docker' if has_image.returncode == 0 else 'go'
     out = scratch / f'{tag.replace("/", "_")}.md'
     cmd = [
         'bash',
         str(RENDER_NOTES),
-        '--release-model',
-        'two-branch',
         '--site',
         site,
         '--version',
@@ -374,11 +350,11 @@ def render_two_branch(
         str(config),
         '--go-lanes',
         json.dumps(lanes),
+        '--security-shas',
+        str(security),
         '--out',
         str(out),
     ]
-    if security is not None:
-        cmd += ['--security-shas', str(security)]
     if site == 'docker':
         pair = (
             release_sbom(repo_dir, repo, prev, tag_shas[prev], scratch, cosign_bin),
@@ -391,28 +367,6 @@ def render_two_branch(
     env['CLIFF_BIN'] = cliff_bin
     run(cmd, repo_dir, env=env)
     return out.read_text(encoding='utf-8').strip()
-
-
-def excluded_subjects(repo_dir: Path, prev: str, tag: str) -> list[str]:
-    proc = run(['git', 'log', '--reverse', '--format=%s', f'{prev}..{tag}'], repo_dir)
-    return [s for s in proc.stdout.splitlines() if s.strip()]
-
-
-def stub_body(repo_dir: Path, prev: str, tag: str) -> str:
-    subjects = excluded_subjects(repo_dir, prev, tag)
-    shown = subjects[:MAX_STUB_SUBJECTS]
-    lines = [
-        STUB_BODY,
-        '',
-        '<details>',
-        '<summary>Commits in this range (all policy-excluded)</summary>',
-        '',
-    ]
-    lines += [f'- {s}' for s in shown]
-    if len(subjects) > len(shown):
-        lines.append(f'- (+ {len(subjects) - len(shown)} more)')
-    lines += ['', '</details>']
-    return '\n'.join(lines)
 
 
 def fetch_body(repo: str, tag: str) -> str:
@@ -503,7 +457,6 @@ class Plan:
     prev: str
     old: str
     new: str
-    is_stub: bool
 
 
 def resolve_config(arg: str, repo_dir: Path, *, explicit: bool) -> Path:
@@ -524,39 +477,6 @@ def resolve_config(arg: str, repo_dir: Path, *, explicit: bool) -> Path:
     sys.exit(2)
 
 
-def regenerate(
-    args,
-    repo_dir: Path,
-    config: Path,
-    repo: str,
-    prev: str,
-    tag: str,
-    tag_shas: dict[str, str],
-    scratch: Path,
-    security: Path | None,
-) -> tuple[str, bool]:
-    """(the regenerated body, whether it is the maintenance stub)."""
-    lanes = lanes_at(repo_dir, tag)
-    if args.release_model == 'two-branch':
-        # Never empty: every backfilled tag has a predecessor, so a compare link.
-        body = render_two_branch(
-            repo_dir,
-            args.cliff_bin,
-            args.cosign_bin,
-            config,
-            repo,
-            prev,
-            tag,
-            tag_shas,
-            lanes,
-            scratch,
-            security,
-        )
-        return body, False
-    body = render_range(repo_dir, args.cliff_bin, config, prev, tag, lanes)
-    return (body, False) if body else (stub_body(repo_dir, prev, tag), True)
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -572,13 +492,7 @@ def main() -> int:
     ap.add_argument(
         '--cosign-bin',
         default='cosign',
-        help='cosign binary that verifies the SBOM assets under two-branch (default: PATH)',
-    )
-    ap.add_argument(
-        '--release-model',
-        choices=('legacy', 'two-branch'),
-        default='legacy',
-        help='two-branch renders through render-notes.sh, as a dev-default repo releases',
+        help='cosign binary that verifies the SBOM assets (default: PATH)',
     )
     ap.add_argument(
         '--only',
@@ -651,36 +565,42 @@ def main() -> int:
         print(f'  skip {tag}: carved out ({reason})', file=sys.stderr)
     plans: list[Plan] = []
     unchanged = nonlinear = 0
-    with tempfile.TemporaryDirectory(prefix='backfill-notes-') as tmp:
-        bodies = {}
-        todo = selected
-        security = (
-            security_shas(repo_dir, repo, [prev for prev, _ in todo], Path(tmp))
-            if args.release_model == 'two-branch'
-            else None
-        )
-        for prev, tag in todo:
-            proc = run(['git', 'merge-base', '--is-ancestor', prev, tag], repo_dir, check=False)
-            if proc.returncode != 0:
-                print(
-                    f'!! {tag}: predecessor {prev} is not an ancestor (non-linear history) '
-                    '- skipping this pair',
-                    file=sys.stderr,
+    bodies: dict[tuple[str, str], str] = {}
+    # security_shas needs at least one predecessor to find its floor.
+    if selected:
+        with tempfile.TemporaryDirectory(prefix='backfill-notes-') as tmp:
+            security = security_shas(repo_dir, repo, [p for p, _ in selected], Path(tmp))
+            for prev, tag in selected:
+                proc = run(['git', 'merge-base', '--is-ancestor', prev, tag], repo_dir, check=False)
+                if proc.returncode != 0:
+                    print(
+                        f'!! {tag}: predecessor {prev} is not an ancestor (non-linear history) '
+                        '- skipping this pair',
+                        file=sys.stderr,
+                    )
+                    nonlinear += 1
+                    continue
+                bodies[prev, tag] = render(
+                    repo_dir,
+                    args.cliff_bin,
+                    args.cosign_bin,
+                    config,
+                    repo,
+                    prev,
+                    tag,
+                    tag_shas,
+                    lanes_at(repo_dir, tag),
+                    Path(tmp),
+                    security,
                 )
-                nonlinear += 1
-                continue
-            bodies[prev, tag] = regenerate(
-                args, repo_dir, config, repo, prev, tag, tag_shas, Path(tmp), security
-            )
-    for (prev, tag), (new_body, is_stub) in bodies.items():
+    for (prev, tag), new_body in bodies.items():
         old_body = fetch_body(repo, tag)
         if normalize(old_body) == normalize(new_body):
             print(f'== {tag}: unchanged')
             unchanged += 1
             continue
-        plans.append(Plan(tag=tag, prev=prev, old=old_body, new=new_body, is_stub=is_stub))
-        marker = '  [maintenance stub]' if is_stub else ''
-        print(f'== {tag}: {prev}..{tag}{marker}')
+        plans.append(Plan(tag=tag, prev=prev, old=old_body, new=new_body))
+        print(f'== {tag}: {prev}..{tag}')
         diff = difflib.unified_diff(
             normalize(old_body).splitlines(),
             new_body.splitlines(),
@@ -694,8 +614,7 @@ def main() -> int:
 
     if not args.apply:
         print(
-            f'DRY-RUN (use --apply to edit): {len(plans)} would change '
-            f'({sum(p.is_stub for p in plans)} stubbed), {unchanged} unchanged, '
+            f'DRY-RUN (use --apply to edit): {len(plans)} would change, {unchanged} unchanged, '
             f'{nonlinear} skipped non-linear, {len(skipped)} carved out'
         )
         return 0
@@ -759,8 +678,8 @@ def main() -> int:
         applied += 1
 
     print(
-        f'\napplied: {applied} ({sum(p.is_stub for p in plans)} stubbed), '
-        f'{unchanged} unchanged, {nonlinear} skipped non-linear, {drifted} drifted, '
+        f'\napplied: {applied}, {unchanged} unchanged, {nonlinear} skipped non-linear, '
+        f'{drifted} drifted, '
         f'{len(skipped)} carved out'
     )
     print(f'backups: {backup_dir}  (restore with --restore {backup_dir})')

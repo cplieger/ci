@@ -337,8 +337,8 @@ chk "L-F2 docker-release go-modules input defaults to '[]'" \
 chk "L-F3 the docker notes step hands the lanes to render-notes.sh" \
   "$(grep -c -- '--go-lanes "$GO_LANES_JSON"' "$DOCKER_YAML")" "1"
 # shellcheck disable=SC2016 # literal single-quoted grep pattern, no expansion wanted
-chk "L-F3 and render-notes.sh scopes both models' git-cliff calls by them" \
-  "$(grep -c '"\${SCOPE_ARGS\[@\]}"' "$ROOT/scripts/render-notes.sh")" "2"
+chk "L-F3 and render-notes.sh scopes its git-cliff call by them" \
+  "$(grep -c '"\${SCOPE_ARGS\[@\]}"' "$ROOT/scripts/render-notes.sh")" "1"
 # An empty lane array must contribute ZERO argv words, keeping every
 # no-lane docker repo's git-cliff command argument-identical (same
 # expansion form the renderer uses; bash >= 4.4 drops the empty array

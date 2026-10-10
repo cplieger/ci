@@ -105,7 +105,8 @@ def base_settings(name: str, default_branch: str) -> dict:
         'workflows_can_approve_prs': False,
         'has_codeql': True,
         'has_security_scan': True,
-        'publishes': True,
+        'release_caller': True,
+        'own_publisher': False,
         'has_dockerfile': False,
         'go_module': None,
         'expected_package': None,
@@ -163,7 +164,7 @@ def two_channel(name: str = 'httpx') -> dict:
     return s
 
 
-def legacy(name: str = 'httpx') -> dict:
+def main_only(name: str = 'httpx') -> dict:
     s = base_settings(name, 'main')
     s['has_protection'] = True
     s['required_checks'] = ['ci / validate']
@@ -1117,7 +1118,7 @@ class TagProvenance(unittest.TestCase):
         self.assertEqual(s['errors'], [f'statuses of {self.C[:12]} unreadable (API)'])
 
 
-class Legacy(unittest.TestCase):
+class MainOnly(unittest.TestCase):
     def setUp(self):
         self.saved_host = audit.WEBHOOK_HOST
         audit.WEBHOOK_HOST = HOST
@@ -1126,18 +1127,18 @@ class Legacy(unittest.TestCase):
         audit.WEBHOOK_HOST = self.saved_host
 
     def test_clean_main_repo_is_graded_as_before(self):
-        hard, warn, _ = audit.compliance(legacy())
+        hard, warn, _ = audit.compliance(main_only())
         self.assertEqual(hard, [])
         self.assertEqual(warn, [])
 
     def test_main_repo_without_protection_is_hard(self):
-        s = legacy()
+        s = main_only()
         s['has_protection'] = False
         hard, _, _ = audit.compliance(s)
         self.assertIn('no branch protection on default branch', hard)
 
     def test_main_repo_custom_ruleset_is_drift(self):
-        s = legacy()
+        s = main_only()
         s['custom_rulesets'] = [{'name': 'dev', 'enforcement': 'active'}]
         _, warn, _ = audit.compliance(s)
         self.assertTrue(any("unexpected custom ruleset 'dev'" in w for w in warn), warn)
@@ -1145,7 +1146,7 @@ class Legacy(unittest.TestCase):
     def test_a_required_smoke_check_is_drift_in_every_repo(self):
         for name in ('docker-radvd', 'web-terminal-server'):
             with self.subTest(repo=name):
-                s = legacy(name)
+                s = main_only(name)
                 s['required_checks'] = ['ci / validate', 'smoke']
                 s['observed_checks'] = ['ci / validate', 'smoke']
                 _, warn, accepted = audit.compliance(s)
@@ -1156,47 +1157,97 @@ class Legacy(unittest.TestCase):
                 self.assertEqual(accepted, [])
 
     def test_main_repo_release_hook_required(self):
-        s = legacy('knell')
+        s = main_only('knell')
         s['webhooks'] = [hook(['registry_package'])]
         hard, _, _ = audit.compliance(s)
         self.assertTrue(any("lack 'release'" in h for h in hard), hard)
 
-    def public_main(self, name: str = 'httpx', publishes=True) -> dict:
-        s = legacy(name)
+    def public_main(self, name: str = 'httpx', release_caller=True, own_publisher=False) -> dict:
+        s = main_only(name)
         s['private'] = False
         s['visibility'] = 'public'
-        s['publishes'] = publishes
+        s['release_caller'] = release_caller
+        s['own_publisher'] = own_publisher
         return s
 
-    def stable_only_warning(self, s: dict) -> list:
-        _, warn, _ = audit.compliance(s)
-        return [w for w in warn if 'releases straight to the stable channel' in w]
+    def main_findings(self, s: dict) -> tuple[list, list]:
+        hard, warn, _ = audit.compliance(s)
+        return (
+            [h for h in hard if h.startswith('default_branch=main')],
+            [w for w in warn if w.startswith('default_branch=main')],
+        )
 
-    def test_a_public_repo_still_releasing_from_main_is_named(self):
-        self.assertEqual(len(self.stable_only_warning(self.public_main())), 1)
+    def test_a_public_release_caller_on_main_is_hard(self):
+        self.assertEqual(
+            self.main_findings(self.public_main()),
+            (
+                [
+                    (
+                        'default_branch=main with a release.yaml caller '
+                        '(want dev, because release.yaml publishes only from a dev default)'
+                    )
+                ],
+                [],
+            ),
+        )
+
+    def test_a_public_own_publisher_on_main_outside_single_main_is_a_warning(self):
+        s = self.public_main(release_caller=False, own_publisher=True)
+        self.assertEqual(
+            self.main_findings(s),
+            (
+                [],
+                [
+                    (
+                        'default_branch=main publishing through its own publish.yaml '
+                        '(list the repo in SINGLE_MAIN_REPOS)'
+                    )
+                ],
+            ),
+        )
 
     def test_a_single_main_repo_is_not_named(self):
-        self.assertEqual(self.stable_only_warning(self.public_main('tool-catalog')), [])
+        for name in ('tool-catalog', 'web-terminal-glyphs'):
+            with self.subTest(repo=name):
+                s = self.public_main(name, own_publisher=True)
+                self.assertEqual(self.main_findings(s), ([], []))
 
-    def test_a_repo_without_a_release_workflow_is_not_named(self):
-        self.assertEqual(self.stable_only_warning(self.public_main(publishes=False)), [])
+    def test_a_repo_that_publishes_nothing_is_not_named(self):
+        self.assertEqual(self.main_findings(self.public_main(release_caller=False)), ([], []))
 
     def test_an_unreadable_workflow_listing_names_nothing(self):
-        self.assertEqual(self.stable_only_warning(self.public_main(publishes=None)), [])
+        s = self.public_main(release_caller=None, own_publisher=None)
+        self.assertEqual(self.main_findings(s), ([], []))
 
     def test_a_private_repo_on_main_is_not_named(self):
-        s = self.public_main()
+        s = self.public_main(own_publisher=True)
         s['private'] = True
-        self.assertEqual(self.stable_only_warning(s), [])
+        self.assertEqual(self.main_findings(s), ([], []))
 
     def test_a_two_channel_repo_is_not_named(self):
         s = two_channel()
-        s['private'] = False
-        s['publishes'] = True
-        self.assertEqual(self.stable_only_warning(s), [])
+        s['release_caller'] = True
+        hard, warn, _ = audit.compliance(s)
+        self.assertFalse(
+            [x for x in hard + warn if 'release.yaml caller' in x or 'publish.yaml' in x]
+        )
+
+    def test_dockerhub_secrets_are_owed_only_by_a_two_channel_image_repo(self):
+        line = (
+            'DOCKERHUB_USERNAME/DOCKERHUB_TOKEN secrets missing '
+            '(dual-publish image repo — the next release fails at the Docker Hub login)'
+        )
+        single = main_only()
+        single.update({'has_dockerfile': True, 'dockerhub_secrets': False})
+        self.assertNotIn(line, audit.compliance(single)[0])
+        image = two_channel()
+        image.update({'has_dockerfile': True, 'dockerhub_secrets': False})
+        self.assertIn(line, audit.compliance(image)[0])
+        image['dockerhub_secrets'] = True
+        self.assertNotIn(line, audit.compliance(image)[0])
 
     def test_other_default_branch_is_hard(self):
-        s = legacy()
+        s = main_only()
         s['default_branch'] = 'master'
         hard, _, _ = audit.compliance(s)
         self.assertTrue(any(h.startswith('default_branch=master') for h in hard), hard)
@@ -1204,7 +1255,7 @@ class Legacy(unittest.TestCase):
 
 class ModulePath(unittest.TestCase):
     def public(self, name: str, module: str, image: bool) -> dict:
-        s = legacy(name)
+        s = main_only(name)
         s['private'] = False
         s['visibility'] = 'public'
         s['has_dockerfile'] = image
@@ -1311,10 +1362,10 @@ class RulesetBodies(unittest.TestCase):
 
 
 class MainDefaultIdentity(unittest.TestCase):
-    """Main-default repos are graded as before two-branch grading apart from the
-    squash-only merge model: each recorded scenario's findings, errors and API
-    reads, in order, are the ones the baseline audit.py gave for it
-    (testdata/audit/main-default.json), with its merge-model lines regraded."""
+    """Main-default repos read the API as the baseline audit.py did: each recorded
+    scenario's findings, errors and reads, in order, are its `expected`
+    (testdata/audit/main-default.json), with its merge-model lines regraded
+    squash-only. A public release.yaml caller there is HARD."""
 
     SCENARIOS: ClassVar[list] = json.loads(MAIN_DEFAULT.read_text(encoding='utf-8'))['scenarios']
 
@@ -1444,7 +1495,7 @@ class SquashOnlyMergeModel(unittest.TestCase):
                 self.assertFalse(any(w.startswith(f'{key}=') for w in warn), warn)
 
     def test_a_main_default_repo_is_graded_squash_only_too(self):
-        s = legacy()
+        s = main_only()
         s['allow_rebase_merge'] = True
         s['squash_merge_commit_title'] = 'COMMIT_OR_PR_TITLE'
         hard, warn, _ = audit.compliance(s)
@@ -1905,14 +1956,13 @@ class IssueFiling(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def findings(self, *rows, adopted=False, scope=None, visibility='all') -> str:
+    def findings(self, *rows, scope=None, visibility='all') -> str:
         path = Path(self.tmp.name) / 'findings.json'
         path.write_text(
             json.dumps(
                 {
                     'scope': scope,
                     'visibility': visibility,
-                    'adoption': {audit.STABLE_ONLY_WARNING: adopted},
                     'repos': list(rows),
                 }
             ),
@@ -1951,19 +2001,6 @@ class IssueFiling(unittest.TestCase):
             },
             fake.labels,
         )
-
-    def test_the_held_warning_is_the_line_compliance_prints(self):
-        s = legacy()
-        s.update({'private': False, 'visibility': 'public', 'publishes': True})
-        _, warn, _ = audit.compliance(s)
-        self.assertIn(audit.STABLE_ONLY_WARNING, warn)
-        self.assertIn(audit.STABLE_ONLY_WARNING, audit.FILED_AFTER_ADOPTION)
-
-    def test_web_terminal_glyphs_on_main_draws_no_stable_only_warning(self):
-        s = legacy('web-terminal-glyphs')
-        s.update({'private': False, 'visibility': 'public', 'publishes': True})
-        _, warn, _ = audit.compliance(s)
-        self.assertNotIn(audit.STABLE_ONLY_WARNING, warn)
 
     def test_a_second_run_updates_the_same_issue_in_place(self):
         fake = FakeIssues()
@@ -2022,31 +2059,6 @@ class IssueFiling(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(fake.writes, [])
         self.assertIn('::notice::cplieger/httpx has issues disabled', err)
-
-    def test_the_stable_only_warning_is_held_back_until_a_repo_defaults_to_dev(self):
-        fake = FakeIssues()
-        fake.issues['only'] = [
-            {'number': 1, 'state': 'open', 'title': TITLE, 'body': 'b', 'labels': []}
-        ]
-        path = self.findings(
-            row('both', warnings=[audit.STABLE_ONLY_WARNING, '0 topics']),
-            row('only', warnings=[audit.STABLE_ONLY_WARNING]),
-            row('fresh', warnings=[audit.STABLE_ONLY_WARNING]),
-        )
-        self.file(fake, path)
-        [both] = self.open_issues(fake, 'both')
-        self.assertIn('[warn] 0 topics', both['body'])
-        self.assertNotIn('stable channel', both['body'])
-        self.assertEqual(fake.issues['only'][0]['state'], 'closed', 'its only finding is held')
-        self.assertEqual(fake.issues.get('fresh', []), [], 'nothing opened for it')
-
-    def test_the_hold_ends_once_any_repo_defaults_to_dev(self):
-        fake = FakeIssues()
-        self.file(
-            fake, self.findings(row('only', warnings=[audit.STABLE_ONLY_WARNING]), adopted=True)
-        )
-        [issue] = self.open_issues(fake, 'only')
-        self.assertIn(f'[warn] {audit.STABLE_ONLY_WARNING}', issue['body'])
 
     def test_a_scoped_findings_file_is_refused_before_any_call(self):
         fake = FakeIssues()
@@ -2178,7 +2190,7 @@ class FindingsOut(unittest.TestCase):
         }
 
     def test_each_graded_repo_is_recorded_with_its_lines_grace_and_errors(self):
-        broken, failing = legacy('broken'), legacy('failing')
+        broken, failing = main_only('broken'), main_only('failing')
         broken['has_protection'] = False
         failing['errors'] = ['vulnerability-alerts unreadable (API)']
         listing = [
@@ -2186,12 +2198,12 @@ class FindingsOut(unittest.TestCase):
             self.meta('failing'),
             {**self.meta('young', age=timedelta(hours=23, minutes=59)), 'has_issues': False},
         ]
-        settings = {'broken': broken, 'failing': failing, 'young': legacy('young')}
+        settings = {'broken': broken, 'failing': failing, 'young': main_only('young')}
         code, out, findings = self.run_main(listing, settings)
         self.assertEqual(code, 1)
         self.assertEqual(findings['scope'], None)
         self.assertEqual(findings['visibility'], 'all')
-        self.assertEqual(findings['adoption'], {audit.STABLE_ONLY_WARNING: False})
+        self.assertNotIn('adoption', findings)
         self.assertEqual(
             findings['repos'],
             [
@@ -2206,18 +2218,10 @@ class FindingsOut(unittest.TestCase):
         )
         self.assertIn(' · 1 repos in grace (created < 24h, nothing filed)', out)
 
-    def test_adoption_reads_every_discovered_repo_not_the_scoped_set(self):
-        listing = [self.meta('a'), self.meta('b', branch='dev')]
-        settings = {'a': legacy('a'), 'b': legacy('b')}
-        _, _, findings = self.run_main(listing, settings, '--repo', 'a')
-        self.assertEqual(findings['scope'], ['a'])
-        self.assertEqual(findings['adoption'], {audit.STABLE_ONLY_WARNING: True})
-        self.assertEqual([r['name'] for r in findings['repos']], ['a'])
-
     def test_an_unreadable_creation_time_is_an_error_so_nothing_is_filed(self):
         meta = self.meta('a')
         meta['created_at'] = None
-        code, out, findings = self.run_main([meta], {'a': legacy('a')})
+        code, out, findings = self.run_main([meta], {'a': main_only('a')})
         self.assertEqual(code, 2)
         self.assertEqual(findings['repos'][0]['errors'], True)
         self.assertIn('[error] creation time unreadable', out)
@@ -2267,7 +2271,7 @@ class Codeowners(unittest.TestCase):
         HTTP status its read fails with}); any other path is a 404."""
         self.files = files or {}
         self.asked.clear()
-        s = legacy()
+        s = main_only()
         audit.collect_codeowners(s)
         _, warn, _ = audit.compliance(s)
         return s, [w for w in warn if 'CODEOWNERS' in w]
@@ -2354,17 +2358,14 @@ class Codeowners(unittest.TestCase):
                 self.assertEqual(self.asked, self.read('.github/CODEOWNERS'))
 
     def test_the_warning_is_filed_without_waiting_for_adoption(self):
-        self.assertNotIn(CODEOWNERS_LINE, audit.FILED_AFTER_ADOPTION)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path = Path(tmp.name) / 'findings.json'
-        adoption = dict.fromkeys(audit.FILED_AFTER_ADOPTION, False)
         path.write_text(
             json.dumps(
                 {
                     'scope': None,
                     'visibility': 'all',
-                    'adoption': adoption,
                     'repos': [row('httpx', warnings=[CODEOWNERS_LINE])],
                 }
             ),
@@ -2395,7 +2396,7 @@ class Codeowners(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         out_path = Path(tmp.name) / 'findings.json'
         saved = (audit.gh, audit.collect, audit.sys.argv)
-        audit.gh, audit.collect = fake_gh, lambda meta: legacy(meta['name'])
+        audit.gh, audit.collect = fake_gh, lambda meta: main_only(meta['name'])
         audit.sys.argv = ['audit.py', '--findings-out', str(out_path)]
         patch = unittest.mock.patch.object(audit, 'collect_first_party_majors')
         patch.start()
@@ -2818,7 +2819,7 @@ class FirstPartyMajors(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         out_path = Path(tmp.name) / 'findings.json'
         saved = (audit.collect, audit.sys.argv)
-        audit.collect = lambda meta: legacy(meta['name'])
+        audit.collect = lambda meta: main_only(meta['name'])
         audit.sys.argv = ['audit.py', '--findings-out', str(out_path)]
         out = io.StringIO()
         try:

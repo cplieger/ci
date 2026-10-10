@@ -46,10 +46,24 @@ jobs:
           set -euo pipefail
           python3 scripts/release_maintenance.py plan --out "$RUNNER_TEMP/plan.json" --only "$ONLY"
 
+      # The App token, not the workflow token: a merge by the workflow token would
+      # start no release run. sync.yaml documents the App's secrets.
+      - name: Mint the App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          owner: cplieger
+          permission-checks: read
+          permission-contents: write
+          permission-metadata: read
+          permission-pull-requests: write
+          permission-workflows: write
+
       - name: Merge security pull requests and open rebuilds
         env:
-          # SYNC_PAT: a merge by the workflow token would start no release run.
-          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail

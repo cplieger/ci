@@ -8,8 +8,8 @@
 # and SBOM/provenance attestations from their original build.
 #
 # Keyless (Fulcio) signing uses this workflow's GitHub Actions OIDC identity.
-# Cross-repo release-asset reads/uploads use SYNC_PAT (Contents:write on
-# targets); GITHUB_TOKEN is scoped to this repo only.
+# Cross-repo release-asset reads/uploads use the App token sync.yaml documents
+# (Contents:write); GITHUB_TOKEN is scoped to this repo only.
 name: Backfill release SBOM signatures
 
 on:
@@ -63,10 +63,47 @@ jobs:
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
+      # Resolved before the mint, which scopes its token to exactly these. An
+      # empty list would mint for every repo of the account, so it fails here.
+      - name: Resolve the repositories
+        id: targets
+        env:
+          INPUT_REPOS: ${{ inputs.repos }}
+        run: |
+          set -euf -o pipefail
+          if [ "${INPUT_REPOS}" = "all" ]; then
+            names="${FLEET}"
+          else
+            names="$(printf '%s' "${INPUT_REPOS}" | tr ',' ' ')"
+          fi
+          repos=""
+          for repo in ${names}; do
+            case "${repo}" in
+              *[!A-Za-z0-9._-]* | . | ..) printf "::error::not a repository name: '%s'\n" "${repo}"; exit 1 ;;
+            esac
+            repos="${repos:+${repos},}${repo}"
+          done
+          if [ -z "${repos}" ]; then
+            echo "::error::no repository to backfill"
+            exit 1
+          fi
+          echo "repos=${repos}" >> "${GITHUB_OUTPUT}"
+
+      - name: Mint the App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          owner: cplieger
+          repositories: ${{ steps.targets.outputs.repos }}
+          permission-contents: write
+          permission-metadata: read
+
       - name: Sign and upload missing SBOM signatures
         env:
-          GH_TOKEN: ${{ secrets.SYNC_PAT }}
-          INPUT_REPOS: ${{ inputs.repos }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOS: ${{ steps.targets.outputs.repos }}
           INPUT_LIMIT: ${{ inputs.limit }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
@@ -74,20 +111,16 @@ jobs:
           case "${INPUT_LIMIT}" in
             '' | *[!0-9]* | 0) echo "::error::limit must be a positive integer, got '${INPUT_LIMIT}'"; exit 1 ;;
           esac
-          if [ "${INPUT_REPOS}" = "all" ]; then
-            repos="${FLEET}"
-          else
-            repos="$(echo "${INPUT_REPOS}" | tr ',' ' ')"
-          fi
-          # Over REST, newest first: the GraphQL quota is shared by every token of
-          # the owner. A listing carries each release's assets, so one read per page.
+          # Over REST, newest first: the App installation's GraphQL quota is shared
+          # with Renovate, which runs as the same App. A listing carries each
+          # release's assets, so one read per page.
           per_page=$(( INPUT_LIMIT < 100 ? INPUT_LIMIT : 100 ))
           paginate=()
           [ "${INPUT_LIMIT}" -le 100 ] || paginate=(--paginate)
           work="$(mktemp -d)"
           signed=0
           skipped=0
-          for repo in ${repos}; do
+          for repo in ${REPOS//,/ }; do
             echo "::group::cplieger/${repo}"
             listing="$(gh api "${paginate[@]}" "repos/cplieger/${repo}/releases?per_page=${per_page}" \
               --jq '.[] | {tag: .tag_name, immutable: (.immutable == true), assets: [.assets[] | {id, name}]} | @json' 2>/dev/null \

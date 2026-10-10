@@ -1,6 +1,6 @@
 # Messages whose text is at HEAD of main, one key per line (the text three words either side of
 # the semicolon or dash). Rewriting a message deletes its line here, and a line is added only for
-# a message whose text is at HEAD: one a wider reader first sees, or one kept for main-default output.
+# a message whose text is at HEAD that a wider reader first sees.
 ${EXISTING}, not ${GITHUB_SHA}; refusing.
 ${TAG} not recorded; deleting the tag
 ${VERSION} already exists; nothing to push.
@@ -21,10 +21,7 @@ ${valid} mutants — measured nothing, no
 NOT auto-update — repoint their '#
 PR as 'Expected'; the context must
 PRs (want absent; Renovate owns deps)
-Release exists — nothing to do
-a Release — finalize mode
 a reproducer — broken seed corpus
-a shipped change; flooring ${BASE} to
 a shipped path; building from source
 a stale/decommissioned app; remove it
 already published — skipping
@@ -59,7 +56,6 @@ has issues disabled; skipped {args.mode} for
 image repo — the next release
 image repos matched; nothing to sync
 in devDependencies/overrides — not significant
-is present — nothing to repair
 its gremlins JSON; repeatable
 its manifest hash; aborting
 linux/amd64 sub-manifest found; skipping size badge

@@ -957,7 +957,11 @@ class Workflow(unittest.TestCase):
         expect = {
             'readable': (
                 TB_ROW,
-                ['Checkout', 'Open a rebuild pull request on cplieger/${{ matrix.repo }}'],
+                [
+                    'Checkout',
+                    'Mint the App token',
+                    'Open a rebuild pull request on cplieger/${{ matrix.repo }}',
+                ],
             ),
             'unreadable': (BAD_ROW, ['Report an unreadable image on cplieger/${{ matrix.repo }}']),
         }
@@ -989,10 +993,31 @@ class Workflow(unittest.TestCase):
 
     def test_each_secret_reaches_only_its_steps(self):
         text = WORKFLOW.read_text()
-        self.assertEqual(text.count('secrets.SYNC_PAT'), 1)
+        self.assertNotIn('SYNC_PAT', text)
+        self.assertEqual(text.count('secrets.SYNC_APP_PRIVATE_KEY'), 1)
         jobs = workflow()['jobs']
+        mint = step(jobs['dispatch'], 'Mint the App token')
+        self.assertEqual(mint['if'], '${{ !matrix.unreadable }}')
+        self.assertEqual(mint['id'], 'app-token')
+        self.assertRegex(mint['uses'], r'^actions/create-github-app-token@[0-9a-f]{40}$')
+        self.assertNotIn('continue-on-error', mint)
+        self.assertEqual(
+            mint['with'],
+            {
+                'client-id': '${{ secrets.SYNC_APP_ID }}',
+                'private-key': '${{ secrets.SYNC_APP_PRIVATE_KEY }}',
+                'owner': 'cplieger',
+                'repositories': '${{ matrix.repo }}',
+                'permission-checks': 'read',
+                'permission-contents': 'write',
+                'permission-metadata': 'read',
+                'permission-pull-requests': 'write',
+            },
+        )
         pr_step = step(jobs['dispatch'], 'Open a rebuild pull request')
-        self.assertEqual(pr_step['env']['GH_TOKEN'], '${{ secrets.SYNC_PAT }}')
+        self.assertEqual(pr_step['env']['GH_TOKEN'], '${{ steps.app-token.outputs.token }}')
+        steps = jobs['dispatch']['steps']
+        self.assertLess(steps.index(mint), steps.index(pr_step))
         for name in ('fanout', 'dispatch'):
             self.assertNotIn('secrets.', json.dumps(jobs[name].get('env', {})))
         self.assertEqual(

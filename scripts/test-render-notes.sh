@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Probe for scripts/render-notes.sh against the pinned git-cliff and the synced
-# cliff config: legacy states L1 to L9 pin each site's bytes (the command lines
-# release.yaml and docker-release.yaml ran inline), two-branch states N1 to N13
-# the explicit-range notes with their dependency and system-package parts.
+# cliff config: states N1 to N15 pin the explicit-range notes with their
+# dependency and system-package parts.
 # CLIFF_BIN=/path/to/git-cliff skips the download.
 # shellcheck disable=SC2016 # the expected notes carry literal markdown backticks
 set -euo pipefail
@@ -76,122 +75,6 @@ refused() { # <label> <message fragment> <repo> <render-notes args...>
   ok "$label (rc $rc)"
 }
 
-# ── Legacy: the site command lines, byte for byte ───────────────────────────
-L="$WORK/legacy"
-new_repo "$L"
-c "$L" src/main.go "feat: initial"
-git -C "$L" tag v1.0.0
-git -C "$L" tag yamlenv/v1.0.0
-c "$L" src/a.go "fix: root fix (#2)"
-c "$L" yamlenv/y.go "feat: lane feature (#3)"
-c "$L" src/b.go "chore(deps): bump thing (#4)"
-c "$L" src/c.go "fix(deps): bump other (#5)"
-c "$L" src/d.go "feat!: breaking root (#6)
-
-BREAKING CHANGE: do the thing"
-c "$L" src/e.go "perf: faster (#7)"
-c "$L" yamlenv/z.go "fix: lane fix (#8)"
-LANES='["yamlenv"]'
-ROOT_NOTES='
-### Breaking changes
-
-#### Breaking root (#6)
-
-Do the thing
-
-### Fixed
-
-- Root fix (#2)
-
-### Changed
-
-- Faster (#7)
-
-### Dependencies
-
-- Bump thing (#4)
-- Bump other (#5)
-'
-
-for site in go ts docker; do
-  rn "$L" --release-model legacy --site "$site" --version v2.0.0 --go-lanes "$LANES" --latest v1.0.0
-  expect "L1 $site: lane commits excluded, Renovate lines kept, v2 groups" < <(printf '%s' "$ROOT_NOTES")
-done
-rn "$L" --release-model legacy --site go --version v2.0.0 --kind-note "A sentence."
-expect "L2 go: no lanes renders lane commits too, kind note appended last" <<'EOF'
-
-### Breaking changes
-
-#### Breaking root (#6)
-
-Do the thing
-
-### Added
-
-- Lane feature (#3)
-
-### Fixed
-
-- Root fix (#2)
-- Lane fix (#8)
-
-### Changed
-
-- Faster (#7)
-
-### Dependencies
-
-- Bump thing (#4)
-- Bump other (#5)
-
-A sentence.
-EOF
-rn "$L" --release-model legacy --site lane --lane yamlenv --version yamlenv/v1.1.0
-expect "L3 lane: lane commits only" <<'EOF'
-
-### Added
-
-- Lane feature (#3)
-
-### Fixed
-
-- Lane fix (#8)
-EOF
-git -C "$L" tag v2.0.0
-for site in go docker; do
-  rn "$L" --release-model legacy --site "$site" --version v2.0.0 --go-lanes "$LANES" --finalize
-  expect "L4 $site finalize: --current renders the tagged release" < <(printf '%s' "$ROOT_NOTES")
-done
-git -C "$L" commit -q --allow-empty -m "fix(deps): rebuild for base packages"
-rn "$L" --release-model legacy --site docker --version v2.0.1 --latest v2.0.0 --release-needed
-expect "L5 docker: an empty rebuild lists the subjects since latest" <<'EOF'
-### Changes
-
-- fix(deps): rebuild for base packages
-EOF
-rn "$L" --release-model legacy --site docker --version v2.0.1 --latest v2.0.0
-expect "L6 docker: no fallback when no release is needed" </dev/null
-rn "$L" --release-model legacy --site go --version v2.0.1 --release-needed
-expect "L7 go: the subject fallback is docker's only" </dev/null
-printf '#!/bin/sh\nexit 3\n' >"$WORK/cliff-fails"
-chmod +x "$WORK/cliff-fails"
-(cd "$L" && CLIFF_BIN="$WORK/cliff-fails" bash "$SCRIPT" --release-model legacy --site docker \
-  --version v2.0.1 --latest v2.0.0 --release-needed --kind-note "Kind." --out "$WORK/out") >/dev/null 2>&1 \
-  || fail "L8 docker publish must fail open on a git-cliff error"
-expect "L8 docker publish fails open on a git-cliff error" <<'EOF'
-Release v2.0.1
-
-Kind.
-EOF
-for args in "--site go" "--site docker --finalize" "--site lane --lane yamlenv"; do
-  # shellcheck disable=SC2086 # word-split on purpose
-  if (cd "$L" && CLIFF_BIN="$WORK/cliff-fails" bash "$SCRIPT" --release-model legacy $args \
-    --version v2.0.1 --out "$WORK/out") >/dev/null 2>&1; then
-    fail "L9 a git-cliff error must fail the $args render"
-  fi
-done
-ok "L9 every other legacy render fails on a git-cliff error"
-
 # ── Two-branch: a promotion R over main's patch, lanes, SBOMs ───────────────
 T="$WORK/two-branch"
 new_repo "$T"
@@ -235,7 +118,8 @@ git -C "$T" merge -q --ff-only "$R"
 STRAY=$(git -C "$T" commit-tree "$R^{tree}" -p "$R" -m "fix: a commit no release reaches")
 git -C "$T" tag v3.0.0 "$STRAY"
 
-TB=(--release-model two-branch --repo owner/app --release-commit "$R")
+LANES='["yamlenv"]'
+TB=(--repo owner/app --release-commit "$R")
 PROMOTED='Promoted from `v2.0.0-dev.3`'
 ROOT_V3='Promoted from `v2.0.0-dev.3`
 
@@ -277,13 +161,13 @@ Rename A to B
 '
 rn "$T" "${TB[@]}" --site go --version v2.0.0 --go-lanes "$LANES" --kind-note "$PROMOTED"
 expect "N1 promotion at a merge HEAD: kind line first, sections Security to Changed, Renovate lines hidden, breaking once, compare link, Dependencies" < <(printf '%s' "$ROOT_V3")
-rn "$T" "${TB[@]}" --site ts --version v2.0.0 --go-lanes "$LANES" --kind-note "$PROMOTED" --finalize
-expect "N2 finalize renders the same explicit range" < <(printf '%s' "$ROOT_V3")
+rn "$T" "${TB[@]}" --site ts --version v2.0.0 --go-lanes "$LANES" --kind-note "$PROMOTED"
+expect "N2 the ts site renders the same explicit range" < <(printf '%s' "$ROOT_V3")
 git -C "$T" tag v2.0.0 "$R"
 git -C "$T" tag yamlenv/v1.1.0 "$R"
-rn "$T" "${TB[@]}" --site go --version v2.0.0 --go-lanes "$LANES" --kind-note "$PROMOTED" --finalize
+rn "$T" "${TB[@]}" --site go --version v2.0.0 --go-lanes "$LANES" --kind-note "$PROMOTED"
 expect "N3 a tag at the release commit and a dev tag inside the range split nothing" < <(printf '%s' "$ROOT_V3")
-rn "$T" "${TB[@]}" --site lane --lane yamlenv --version yamlenv/v1.1.0 --finalize
+rn "$T" "${TB[@]}" --site lane --lane yamlenv --version yamlenv/v1.1.0
 expect "N4 lane: its own commits, its own previous tag, beside a co-located root tag" <<'EOF'
 ### Added
 
@@ -297,27 +181,21 @@ grep -qxF -- '- `example.com/dep` v1.0.1 to v1.2.0 (Go, security update)' "$WORK
   || fail "N5 an update merged from a security PR is not marked: $(cat "$WORK/out")"
 grep -qiE 'GHSA-|CVE-' "$WORK/out" && fail "N5 an advisory ID was rendered"
 ok "N5 an update from a security PR is marked, with no advisory ID"
-legacy_root=$(cd "$T" && CLIFF_BIN="$CLIFF" bash "$SCRIPT" --release-model legacy --site go \
-  --version v2.0.0 --go-lanes "$LANES" --finalize --out /dev/stdout 2>/dev/null)
-grep -qF 'Update module example.com/dep to v1.2.0 (#18)' <<<"$legacy_root" \
-  || fail "N6 legacy must keep the Renovate lines: $legacy_root"
-grep -qF 'Full changelog' <<<"$legacy_root" && fail "N6 legacy rendered a two-branch part"
-ok "N6 the v3 template switch is two-branch's alone"
 
 # A later main commit over the untagged promotion still renders all of it.
 git -C "$T" tag -d v2.0.0 yamlenv/v1.1.0 >/dev/null
 c "$T" go.sum "fix(deps): update module example.com/other to v1.0.1 (#23)"
 S=$(git -C "$T" rev-parse HEAD)
-rn "$T" --release-model two-branch --repo owner/app --release-commit "$S" --site go \
+rn "$T" --repo owner/app --release-commit "$S" --site go \
   --version v2.0.0 --go-lanes "$LANES" --kind-note "$PROMOTED"
 expect "N7 a later S over an untagged R: the same notes, its own Renovate line hidden" < <(printf '%s' "$ROOT_V3")
 
-# Hidden lines still count for the version: the template switch changes no parser.
+# Hidden lines still count for the version: the template hides them, the parser keeps them.
 git -C "$T" tag -d v3.0.0 >/dev/null
 git -C "$T" tag v2.0.0 "$R"
-bumped=$(cd "$T" && CLIFF_NOTES_MODE=v3 "$CLIFF" --tag-pattern '^v[0-9]+\.[0-9]+\.[0-9]+$' --unreleased --bumped-version 2>/dev/null)
-[ "$bumped" = v2.0.1 ] || fail "N8 a fix(deps)-only range must still bump a patch under v3, got '$bumped'"
-rn "$T" --release-model two-branch --repo owner/app --release-commit "$S" --site go --version v2.0.1 --go-lanes "$LANES"
+bumped=$(cd "$T" && "$CLIFF" --tag-pattern '^v[0-9]+\.[0-9]+\.[0-9]+$' --unreleased --bumped-version 2>/dev/null)
+[ "$bumped" = v2.0.1 ] || fail "N8 a fix(deps)-only range must still bump a patch, got '$bumped'"
+rn "$T" --repo owner/app --release-commit "$S" --site go --version v2.0.1 --go-lanes "$LANES"
 expect "N8 a Renovate-only range bumps a patch and renders only its compare link" <<'EOF'
 **Full changelog**: https://github.com/owner/app/compare/v2.0.0...v2.0.1
 EOF
@@ -339,9 +217,9 @@ sbom "$WORK/prev.spdx.json" sha256:aaaa busybox@1.37.0-r29 musl@1.2.5-r10 zlib@1
 sbom "$WORK/new.spdx.json" sha256:bbbb busybox@1.37.0-r30 musl@1.2.5-r10 libssl3@3.5.4-r0 ssl_client@1.37.0-r30
 git -C "$T" commit -q --allow-empty -m "fix(deps): rebuild for base packages (#24)"
 RB=$(git -C "$T" rev-parse HEAD)
-rn "$T" --release-model two-branch --repo owner/app --release-commit "$RB" --site docker --version v2.0.1 \
+rn "$T" --repo owner/app --release-commit "$RB" --site docker --version v2.0.1 \
   --kind-note 'Built from `main` for dependency and system-package updates' \
-  --sbom-prev "$WORK/prev.spdx.json" --sbom-new "$WORK/new.spdx.json" --release-needed --latest v2.0.0
+  --sbom-prev "$WORK/prev.spdx.json" --sbom-new "$WORK/new.spdx.json"
 expect "N9 a rebuild-only image release renders its packages, never the subjects" <<'EOF'
 Built from `main` for dependency and system-package updates
 
@@ -367,7 +245,7 @@ git -C "$B" tag v1.2.0
 c "$B" src/a.go "fix: two to nine (#2)"
 git -C "$B" tag v1.9.0
 c "$B" src/b.go "fix: after nine (#3)"
-rn "$B" --release-model two-branch --repo owner/boot --release-commit HEAD --site go --version v1.10.0
+rn "$B" --repo owner/boot --release-commit HEAD --site go --version v1.10.0
 expect "N10 the previous stable tag is chosen by version, not by name" <<'EOF'
 ### Fixed
 
@@ -378,7 +256,7 @@ EOF
 F="$WORK/first"
 new_repo "$F"
 c "$F" src/main.go "feat: initial (#1)"
-rn "$F" --release-model two-branch --repo owner/first --release-commit HEAD --site go --version v1.0.0
+rn "$F" --repo owner/first --release-commit HEAD --site go --version v1.0.0
 expect "N11 a first release has no compare link and no dependency diff" <<'EOF'
 ### Added
 
@@ -387,13 +265,13 @@ EOF
 
 refused "N12a an unstable version" "is not a stable version of this lane" "$T" "${TB[@]}" --site go --version v2.0.0-dev.1 --out "$WORK/out"
 refused "N12b a lane version without the lane prefix" "is not a stable version of this lane" "$T" "${TB[@]}" --site lane --lane yamlenv --version v1.1.0 --out "$WORK/out"
-refused "N12c two-branch without --repo" "needs --repo" "$T" --release-model two-branch --release-commit "$R" --site go --version v2.0.0 --out "$WORK/out"
-refused "N12d two-branch without --release-commit" "needs --release-commit" "$T" --release-model two-branch --repo owner/app --site go --version v2.0.0 --out "$WORK/out"
+refused "N12c no --repo" "--repo is required" "$T" --release-commit "$R" --site go --version v2.0.0 --out "$WORK/out"
+refused "N12d no --release-commit" "--release-commit is required" "$T" --repo owner/app --site go --version v2.0.0 --out "$WORK/out"
 refused "N12e SBOMs off the docker site" "only valid with --site docker" "$T" "${TB[@]}" --site go --version v2.0.0 --sbom-new "$WORK/new.spdx.json" --out "$WORK/out"
-refused "N12f an unknown model" "--release-model must be" "$T" --release-model v3 --site go --version v2.0.0 --out "$WORK/out"
-refused "N12g an unknown site" "--site must be" "$T" --release-model legacy --site npm --version v2.0.0 --out "$WORK/out"
+refused "N12f --release-model is not an argument" "unknown argument: --release-model" "$T" --release-model two-branch "${TB[@]}" --site go --version v2.0.0 --out "$WORK/out"
+refused "N12g an unknown site" "--site must be" "$T" "${TB[@]}" --site npm --version v2.0.0 --out "$WORK/out"
 rc=0
-(cd "$T" && GH_TOKEN=x bash "$SCRIPT" --release-model legacy --site go --version v2.0.0 --out "$WORK/out") >"$WORK/refused.log" 2>&1 || rc=$?
+(cd "$T" && GH_TOKEN=x bash "$SCRIPT" "${TB[@]}" --site go --version v2.0.0 --out "$WORK/out") >"$WORK/refused.log" 2>&1 || rc=$?
 if [ "$rc" -eq 0 ] || ! grep -qF "refusing to run with GITHUB_TOKEN or GH_TOKEN set" "$WORK/refused.log"; then
   fail "N12h a token in the environment was not refused: $(cat "$WORK/refused.log")"
 fi
@@ -404,22 +282,21 @@ sed -e '/^\[changelog\]/a postprocessors = [{ pattern = "^", replace_command = "
 grep -q "replace_command = \"env >>$WORK/cliff-env" "$WORK/hostile.toml" || fail "N12l the hostile config was not written"
 rm -f "$WORK/cliff-env"
 (cd "$T" && CLIFF_BIN="$CLIFF" ACTIONS_ID_TOKEN_REQUEST_URL=https://oidc.invalid ACTIONS_ID_TOKEN_REQUEST_TOKEN=probe-oidc \
-  bash "$SCRIPT" --release-model legacy --site go --version v2.0.0 --config "$WORK/hostile.toml" --out "$WORK/out") \
+  bash "$SCRIPT" "${TB[@]}" --site go --version v2.0.0 --config "$WORK/hostile.toml" --out "$WORK/out") \
   >"$WORK/rn.log" 2>&1 || fail "N12l render-notes failed: $(cat "$WORK/rn.log")"
 [ -s "$WORK/cliff-env" ] || fail "N12l the config's command never ran"
 if grep -q '^ACTIONS_ID_TOKEN_REQUEST_' "$WORK/cliff-env"; then
   fail "N12l the cliff config read the OIDC request pair"
 fi
 ok "N12l a cliff command runs without the OIDC request pair"
-refused "N12i legacy at a commit other than HEAD" "is not HEAD" "$T" --release-model legacy --site go --version v2.0.0 --release-commit "$R~1" --out "$WORK/out"
-refused "N12j malformed go lanes" "--go-lanes must be a JSON array" "$T" --release-model legacy --site go --version v2.0.0 --go-lanes '{"a":1}' --out "$WORK/out"
-refused "N12k a lane dir off the lane site" "--lane is only valid" "$T" --release-model legacy --site go --lane yamlenv --version v2.0.0 --out "$WORK/out"
+refused "N12j malformed go lanes" "--go-lanes must be a JSON array" "$T" "${TB[@]}" --site go --version v2.0.0 --go-lanes '{"a":1}' --out "$WORK/out"
+refused "N12k a lane dir off the lane site" "--lane is only valid" "$T" "${TB[@]}" --site go --lane yamlenv --version v2.0.0 --out "$WORK/out"
 
 # The range start the docker caller needs for the previous SBOM, from the same rule.
 prev_of() { # <repo> <args...> -> the printed previous tag, or EXIT=n
   local repo=$1
   shift
-  (cd "$repo" && CLIFF_BIN=/nonexistent bash "$SCRIPT" --release-model two-branch --print-previous "$@") 2>/dev/null || echo "EXIT=$?"
+  (cd "$repo" && CLIFF_BIN=/nonexistent bash "$SCRIPT" --print-previous "$@") 2>/dev/null || echo "EXIT=$?"
 }
 [ "$(prev_of "$B" --site docker --version v1.10.0)" = v1.9.0 ] || fail "N13a --print-previous must pick v1.9.0 by version"
 ok "N13a --print-previous picks the previous stable tag by version, running no git-cliff"
@@ -430,5 +307,22 @@ ok "N13b a first release prints no previous tag"
 ok "N13c a lane's previous tag is its own"
 [ "$(prev_of "$B" --site docker --version v1.10.0-dev.1)" = "EXIT=2" ] || fail "N13d an unstable version must be refused"
 ok "N13d --print-previous refuses a version that is not the lane's"
+
+printf '#!/bin/sh\nexit 3\n' >"$WORK/cliff-fails"
+chmod +x "$WORK/cliff-fails"
+for args in "--site go --version v2.0.0" "--site docker --version v2.0.0" "--site lane --lane yamlenv --version yamlenv/v1.1.0"; do
+  # shellcheck disable=SC2086 # word-split on purpose
+  if (cd "$T" && CLIFF_BIN="$WORK/cliff-fails" bash "$SCRIPT" "${TB[@]}" $args --out "$WORK/out") >/dev/null 2>&1; then
+    fail "N14 a git-cliff error must fail the $args render"
+  fi
+done
+ok "N14 a git-cliff error fails every site's render"
+
+printf '#!/bin/sh\necho "mode=${CLIFF_NOTES_MODE:-unset}"\n' >"$WORK/cliff-mode"
+chmod +x "$WORK/cliff-mode"
+(cd "$T" && CLIFF_BIN="$WORK/cliff-mode" bash "$SCRIPT" "${TB[@]}" --site go --version v2.0.0 --out "$WORK/out") \
+  >"$WORK/rn.log" 2>&1 || fail "N15 render-notes failed: $(cat "$WORK/rn.log")"
+grep -qx 'mode=v3' "$WORK/out" || fail "N15 git-cliff must run under CLIFF_NOTES_MODE=v3: $(cat "$WORK/out")"
+ok "N15 git-cliff runs under CLIFF_NOTES_MODE=v3, which an older synced cliff.toml gates the body on"
 
 echo "PASS: render-notes ($CHECKS checks)"

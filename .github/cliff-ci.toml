@@ -8,15 +8,15 @@
 # Two deliberate differences from the shared (cliff-stable.toml) config:
 #
 #   1. tag_pattern matches FULL semver only (vX.Y.Z). move-major-tag.yaml keeps
-#      the moving major/minor tags (v2, v2.Y) co-located on the SAME commit as
+#      the moving major/minor tags (vN, vN.Y) co-located on the SAME commit as
 #      the release tag. The shared config's pattern "v[0-9].*" matches all three, making
 #      the version base ambiguous in this repo specifically. Restricting to full
 #      semver makes git-cliff bump unambiguously from the real release tag.
 #
 #   2. protect_breaking_commits = true, so a breaking change bumps major even if
-#      its commit type would otherwise be skipped. A major bump (v3) intentionally
-#      does NOT auto-propagate to consumers pinned at v2 (Renovate follows the v2
-#      digest, not v3) — exactly the gate we want for breaking changes.
+#      its commit type would otherwise be skipped. A major bump (vN+1) intentionally
+#      does NOT auto-propagate to consumers pinned at vN (Renovate follows the vN
+#      digest, not vN+1) — exactly the gate we want for breaking changes.
 #
 # Commit-type -> bump is identical to the shared config otherwise. Note the
 # self-release workflow treats the PATH GATE (not the commit type) as
@@ -103,7 +103,7 @@ filter_unconventional = false
 split_commits = false
 # Breaking changes always count toward the bump even under a skip-typed prefix.
 protect_breaking_commits = true
-# Full semver only — deliberately excludes the moving v2 / v2.Y tags that
+# Full semver only — deliberately excludes the moving vN / vN.Y tags that
 # move-major-tag.yaml maintains on the release commit. Anchored for the same
 # reason as the shared configs: the pattern is a regex, and unanchored it
 # would also match a prefixed component tag (e.g. "sub/v1.2.3"), poisoning

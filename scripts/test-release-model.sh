@@ -520,64 +520,15 @@ run_release main lock
 chk "M27 a lockfile-only commit on main publishes nothing" "$(result)" ""
 chk "M27 no lane ships it" "$(detect root_changed)|$(detect go_modules_to_release)|$(detect release)" 'false|[]|false'
 
-# ── 13. a main-default repository keeps today's release ──────────────────────
-# RM_BASELINE=<dir>, a tree of an older revision of this repository (such as
-# `git archive HEAD`), also replays that tree's detect and go-nested before
-# each run and requires the same outputs and lane notes.
-export GH_DIR="$WORK/gh-legacy"
-mkdir -p "$GH_DIR"
-O="$WORK/legacy.git"
-git init -q --bare -b main "$O"
-L0=$(commit_on main "feat: initial" cliff.toml=@"$ROOT/configs/cliff-stable.toml" \
-  go.mod="$(gomod v1.2.0)" main.go='package main\n// v1' \
-  yamlenv/go.mod='module github.com/o/app/yamlenv\n\ngo 1.27' yamlenv/y.go='package yamlenv\n// v1')
-published v1.0.0 "$L0" no
-published yamlenv/v1.0.0 "$L0" no
-legacy_release() { # <label>; sets RUN to the run of this tree
-  local base="" k lane
-  if [ -n "${RM_BASELINE:-}" ]; then
-    DEFAULT_BRANCH=main TREE="$RM_BASELINE" NO_PUBLISH=1 run_release main "$1-baseline"
-    base=$RUN
-  fi
-  DEFAULT_BRANCH=main run_release main "$1"
-  [ -n "$base" ] || return 0
-  [ -f "$base.detect.json" ] || fail "L $1: the baseline refused: $(cat "$base.result")"
-  for k in $(jq -r '.outputs | keys[] | select(. != "promotion_note")' "$base.detect.json"); do
-    [ "$(jq -r --arg k "$k" '.outputs[$k]' "$base.detect.json")" = "$(jq -r --arg k "$k" '.outputs[$k]' "$RUN.detect.json")" ] \
-      || fail "L $1: detect output $k differs from RM_BASELINE: '$(jq -r --arg k "$k" '.outputs[$k]' "$base.detect.json")' != '$(jq -r --arg k "$k" '.outputs[$k]' "$RUN.detect.json")'"
-  done
-  [ "$(jq -r .outputs.promotion_note "$base.detect.json")" = "$(jq -r .outputs.release_kind_note "$RUN.detect.json")" ] \
-    || fail "L $1: the kind note differs from RM_BASELINE's promotion note"
-  for lane in "$base".lane-*.json; do
-    [ -e "$lane" ] || continue
-    lane=${lane#"$base".lane-}
-    [ "$(jq -S .steps.lane.outputs "$base.lane-$lane")" = "$(jq -S .steps.lane.outputs "$RUN.lane-$lane")" ] \
-      || fail "L $1: lane ${lane%.json} outputs differ from RM_BASELINE"
-    if [ -e "$base.lane-${lane%.json}.notes" ] || [ -e "$RUN.lane-${lane%.json}.notes" ]; then
-      cmp -s "$base.lane-${lane%.json}.notes" "$RUN.lane-${lane%.json}.notes" \
-        || fail "L $1: lane ${lane%.json} notes differ from RM_BASELINE"
-    fi
-  done
-  BASELINE_RUNS=$((${BASELINE_RUNS:-0} + 1))
-}
-commit_on main "fix: correct the root" main.go='package main\n// v2' >/dev/null
-legacy_release l1
-chk "L1 a root fix on a main-default repo is a patch" "$(result)|$(detect release_model)" "v1.0.1|legacy"
-commit_on main "feat(yamlenv): add a lane option" yamlenv/y.go='package yamlenv\n// v2' >/dev/null
-legacy_release l2
-chk "L2 a lane feature releases the lane alone" "$(result)" "yamlenv/v1.1.0"
-chk "L2 with its legacy notes" "$(tr '\n' '|' <"$RUN.lane-yamlenv.notes")" "|### Added||- Add a lane option|"
-commit_on main "docs: explain the flags" README.md='# app' >/dev/null
-legacy_release l3
-chk "L3 a docs-only commit publishes nothing" "$(result)|$(detect release)" "|false"
-commit_on main "feat: add a root flag" main.go='package main\n// v3' >/dev/null
-legacy_release l4
-chk "L4 a root feature is a minor" "$(result)" "v1.1.0"
-chk "L4 the run checked out the ci source and ran compute from it" \
+chk "M27 the run checked out the ci source and ran compute from it" \
   "$(jq -r '[.ran[] | select(test("ci source|Compute version"))] | join(",")' "$RUN.detect.json")" \
   "Check out the ci source (checkout: --actions-root),Compute version (cliff)"
-if [ -n "${RM_BASELINE:-}" ]; then
-  chk "L RM_BASELINE replayed beside every legacy run" "${BASELINE_RUNS:-0}" 4
-fi
+
+# ── 13. a main-default repository is refused ─────────────────────────────────
+commit_on main "fix: a main-only fix" main.go='package main\n// main-only' >/dev/null
+DEFAULT_BRANCH=main run_release main maindefault
+chk "M28 a main-default repository's release run is refused at detect" "$(result)" \
+  "refused: ::error::release.yaml publishes only from a public, non-fork repository whose default branch is dev (this one: default branch main, private <unknown>, fork <unknown>). Make dev the default branch, or remove the release.yaml caller and publish from the repository's own workflow."
+chk "M28 running no step after Select channel" "$(jq -r '.ran | join(",")' "$RUN.detect.json")" "Checkout (checkout: --cwd),Select channel"
 
 echo "PASS: two-branch release model end to end ($PASS checks)"

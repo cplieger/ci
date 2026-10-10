@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Shipped paths of a range per lane, for release.yaml detect and promotion.
 # MODE=release (default): env BEFORE HEAD ANCHOR_SHA CHANNEL REPO_TYPE
-#   SUBPACKAGES_JSON GO_LANES_JSON RELEASE_MODEL (legacy|two-branch, default
-#   legacy); writes root_changed, subpackages_to_publish, go_modules_to_release
-#   and exclude_re to $GITHUB_OUTPUT, and a summary.
+#   SUBPACKAGES_JSON GO_LANES_JSON; writes root_changed, subpackages_to_publish,
+#   go_modules_to_release and exclude_re to $GITHUB_OUTPUT, and a summary.
 # MODE=paths: env FROM TO REPO_TYPE SUBPACKAGES_JSON GO_LANES_JSON; the same
 #   keys plus `significant` (JSON array) on stdout. Tree diff FROM..TO only:
 #   no empty-commit rule, no lane tags, status 2 when the diff fails.
@@ -22,18 +21,9 @@ note() {
 }
 
 RANGE_START=""
-# Paths mode and two-branch release mode count both sides of a rename: a file
-# leaving a lane or moving under an excluded path still changed what the lane
-# ships, and a dev build skipped for it leaves a promotion nothing to re-tag.
-RENAMES=()
-case "${RELEASE_MODEL:-legacy}" in
-  legacy) ;;
-  two-branch) RENAMES=(--no-renames) ;;
-  *)
-    echo "::error::path-significance: unknown RELEASE_MODEL '${RELEASE_MODEL}'" >&2
-    exit 2
-    ;;
-esac
+# Every diff counts both sides of a rename (--no-renames): a file leaving a
+# lane or moving under an excluded path still changed what the lane ships, and
+# a dev build skipped for it leaves a promotion nothing to re-tag.
 # Release mode: the range is <anchor>..HEAD, the anchor being the channel's
 # newest reachable tag. A dispatch (no `before`) or an unreachable `before`
 # (force push) counts every tracked file, so a dispatch stays the repair lever.
@@ -51,7 +41,7 @@ elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000
   note "No before SHA — treating all tracked files as changed"
   CHANGED=$(git ls-files)
 elif [ -n "$ANCHOR_SHA" ]; then
-  if CHANGED=$(git diff "${RENAMES[@]}" --name-only "$ANCHOR_SHA..$HEAD" 2>/dev/null); then
+  if CHANGED=$(git diff --no-renames --name-only "$ANCHOR_SHA..$HEAD" 2>/dev/null); then
     RANGE_START="$ANCHOR_SHA"
     BEFORE="$ANCHOR_SHA"
     note "deriving changed paths from ${ANCHOR_SHA}..HEAD (newest tag on this channel)"
@@ -59,7 +49,7 @@ elif [ -n "$ANCHOR_SHA" ]; then
     note "git diff from the anchor failed — treating all tracked files as changed"
     CHANGED=$(git ls-files)
   fi
-elif CHANGED=$(git diff "${RENAMES[@]}" --name-only "$BEFORE..$HEAD" 2>/dev/null); then
+elif CHANGED=$(git diff --no-renames --name-only "$BEFORE..$HEAD" 2>/dev/null); then
   RANGE_START="$BEFORE"
 else
   note "git diff failed (force push or unreachable history) — treating all tracked files as changed"
@@ -299,7 +289,7 @@ for l in "${GO_LANES[@]}"; do
     continue
   fi
   note "lane ${l}: deriving changed paths from ${anchor}..HEAD (newest lane tag on this channel)"
-  lane_diff=$(git diff "${RENAMES[@]}" --name-only "$anchor..$HEAD" -- "$l/")
+  lane_diff=$(git diff --no-renames --name-only "$anchor..$HEAD" -- "$l/")
   if [ -n "$lane_diff" ] && grep -Eqv "$EXCLUDE_RE" <<<"$lane_diff"; then
     LANE_CHANGED["$l"]=true
   fi

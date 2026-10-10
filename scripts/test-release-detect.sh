@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Probe for release.yaml's two-branch state machine: the extracted detect steps
-# against HEAD's (legacy characterization), scripts/release-state.sh on fixture
-# histories (pending promotions, numbering, receipts and repair, the dev
+# Probe for release.yaml's two-branch state machine: the extracted detect steps,
+# scripts/release-state.sh on fixture histories (pending promotions, numbering, receipts and repair, the dev
 # barrier, renumber) with stub gh, curl and docker that refuse any argv they do
 # not expect, and the wiring of release.yaml and the caller template.
 # CLIFF_BIN=/path/to/git-cliff skips the download.
@@ -71,23 +70,17 @@ fi
 "$CLIFF" --version >/dev/null || fail "git-cliff binary unusable"
 
 # ── Extract the subjects ─────────────────────────────────────────────────────
-git -C "$ROOT" show HEAD:.github/workflows/release.yaml >"$WORK/release-head.yaml"
-cp "$WORK/release-head.yaml" "$WORK/release.yaml-head"
-git -C "$ROOT" show HEAD:.github/workflows/docker-release.yaml >"$WORK/docker-release.yaml-head"
-git -C "$ROOT" show HEAD:.github/workflow-templates/release.yml >"$WORK/template-head.yml"
-python3 - "$RELEASE_YAML" "$WORK/release-head.yaml" "$TEMPLATE" "$WORK/template-head.yml" "$WORK" <<'PY'
+python3 - "$RELEASE_YAML" "$TEMPLATE" "$WORK" <<'PY'
 import json, os, re, sys, yaml
 
-new, head, tmpl, tmpl_head, out = sys.argv[1:]
+new, tmpl, out = sys.argv[1:]
 jobs = yaml.safe_load(open(new))["jobs"]
-hjobs = yaml.safe_load(open(head))["jobs"]
 
 def step(js, job, name):
     return next(s for s in js[job]["steps"] if s.get("name") == name)
 
-for tag, js in (("new", jobs), ("head", hjobs)):
-    for name, f in (("Select channel", "channel"), ("Select version", "select")):
-        open(f"{out}/{f}-{tag}.sh", "w").write(step(js, "detect", name)["run"])
+for name, f in (("Select channel", "channel"), ("Select version", "select")):
+    open(f"{out}/{f}.sh", "w").write(step(jobs, "detect", name)["run"])
 open(f"{out}/select-env.txt", "w").write(" ".join(sorted(step(jobs, "detect", "Select version")["env"])))
 open(f"{out}/channel-env.json", "w").write(json.dumps(step(jobs, "detect", "Select channel").get("env", {})))
 vp = step(jobs, "receipts", "Record completion receipts")
@@ -96,10 +89,13 @@ open(f"{out}/receipt-step.sh", "w").write(vp["run"])
 facts = {}
 d = {s.get("name"): s for s in jobs["detect"]["steps"]}
 for name in ("Find pending promotions", "Install git-cliff for promotion numbering", "Number pending promotions",
-             "Read release receipts", "Detect finalize state"):
+             "Read release receipts"):
     facts[f"if:{name}"] = d[name].get("if", "")
 facts["cliff-with"] = d["Compute version (cliff)"]["with"]
 facts["names"] = [s.get("name") for s in jobs["detect"]["steps"]]
+facts["channel-continue"] = f'{str(d["Select channel"].get("continue-on-error", False)).lower()} {str(jobs["detect"].get("continue-on-error", False)).lower()}'
+facts["detect-status-ifs"] = [s.get("name") for s in jobs["detect"]["steps"][facts["names"].index("Select channel") + 1:]
+                              if re.search(r"always\(\)|failure\(\)|cancelled\(\)", str(s.get("if", "")))]
 for job in ("repair-notes", "repair-assets", "repair-release", "repair-publish", "repair", "barrier", "renumber", "renumber-tag", "renumber-ts", "renumber-npm", "renumber-subpackages", "docker", "go", "ts", "subpackage", "go-nested", "verify-publish", "receipts"):
     facts[f"needs:{job}"] = jobs[job].get("needs")
     facts[f"jobif:{job}"] = " ".join(str(jobs[job].get("if", "")).split())
@@ -115,18 +111,7 @@ facts["repair-cosign"] = jobs["repair"].get("env", {}).get("COSIGN_VERSION")
 facts["barrier-env"] = step(jobs, "barrier", "Hold for dev")["env"]
 open(f"{out}/barrier-step.sh", "w").write(step(jobs, "barrier", "Hold for dev")["run"])
 facts["barrier-timeout"] = jobs["barrier"]["timeout-minutes"]
-sys.path.insert(0, os.path.join(os.path.dirname(new), "..", "..", "scripts"))
-from workflow_replay import Scope  # noqa: E402
-
-for tag, js in (("new", jobs), ("head", hjobs)):
-    for branch in ("main", "dev"):
-        github = {"event": {"repository": {"default_branch": branch, "private": False, "fork": False}}}
-        timeout = Scope({"github": github}, {}, []).render(js["detect"]["timeout-minutes"])
-        facts[f"detect-timeout:{tag}:{branch}"] = timeout
-for flag in ("private", "fork"):
-    github = {"event": {"repository": {"default_branch": "dev", "private": False, "fork": False, flag: True}}}
-    facts[f"detect-timeout:new:dev-{flag}"] = Scope({"github": github}, {}, []).render(
-        jobs["detect"]["timeout-minutes"])
+facts["detect-timeout"] = jobs["detect"]["timeout-minutes"]
 facts["renumber-timeout"] = max(jobs["renumber"]["timeout-minutes"] + jobs["renumber-tag"]["timeout-minutes"],
                                jobs["renumber-ts"]["timeout-minutes"] + jobs["renumber-npm"]["timeout-minutes"]
                                ) + jobs["renumber-subpackages"]["timeout-minutes"]
@@ -204,14 +189,6 @@ for wf in ("release.yaml", "docker-release.yaml"):
         if perms.get("id-token") == "write" and any(runs_config(s) for s in job.get("steps", [])):
             census.append(f"{wf}:{name}")
 facts["oidc-config"] = sorted(census)
-hcensus = []
-for wf in ("release.yaml", "docker-release.yaml"):
-    w = yaml.safe_load(open(f"{out}/{wf}-head"))
-    for name, job in w["jobs"].items():
-        perms = job.get("permissions", w.get("permissions")) or {}
-        if perms.get("id-token") == "write" and any(runs_config(s) for s in job.get("steps", [])):
-            hcensus.append(f"{wf}:{name}")
-facts["oidc-config-head"] = sorted(hcensus)
 # A step can reach every later step of its job through GITHUB_PATH or
 # GITHUB_ENV, so a job that runs the cliff config is judged by every scope it
 # holds, not by which step is handed the token.
@@ -224,8 +201,6 @@ def write_config(w):
     return hits
 facts["write-config"] = sorted(f"{wf}:{n}" for wf in ("release.yaml", "docker-release.yaml")
                                for n in write_config(yaml.safe_load(open(new.replace("release.yaml", wf)))))
-facts["write-config-head"] = sorted(f"{wf}:{n}" for wf in ("release.yaml", "docker-release.yaml")
-                                    for n in write_config(yaml.safe_load(open(f"{out}/{wf}-head"))))
 
 # A job condition evaluated as the runner would, for the operators these use.
 def ev(expr, res, outs):
@@ -271,8 +246,7 @@ def simulate(gates, outs):
     return " ".join(n for n in writers if res[n] == "success")
 sim = {}
 for t in ("docker", "go", "ts"):
-    outs = {"type": t, "channel": "stable", "release_model": "two-branch", "mode": "normal", "release": "true",
-            "finalize": "false", "root_changed": "true", "subpackages_to_publish": '["web"]', "go_modules_to_release": '["yamlenv"]'}
+    outs = {"type": t, "channel": "stable", "mode": "normal", "release": "true", "root_changed": "true", "subpackages_to_publish": '["web"]', "go_modules_to_release": '["yamlenv"]'}
     for r, b in (("success", "success"), ("skipped", "skipped"), ("failure", "skipped"), ("skipped", "failure"), ("cancelled", "skipped")):
         sim[f"{t} repair={r} barrier={b}"] = simulate({"repair": r, "barrier": b}, outs)
 facts["gate-sim"] = sim
@@ -283,17 +257,6 @@ for tag_r, npm_r, mode, subs in (("success", "skipped", "renumber", '["web"]'), 
     res = {"detect": "success", "renumber-tag": tag_r, "renumber-npm": npm_r}
     rsub[f"{tag_r} {npm_r} {mode} {subs}"] = ev(jobs["renumber-subpackages"]["if"], res, {"mode": mode, "subpackages": subs})
 facts["rsub-gate"] = rsub
-# Legacy runs skip both gates, so the subpackage job must decide as HEAD's did.
-import itertools
-mism = []
-for d, ts_, g, rel, fin, subs in itertools.product(*[("success", "skipped", "failure", "cancelled")] * 3,
-                                                   ("true", "false"), ("true", "false"), ("[]", '["web"]')):
-    res = {"detect": "success", "repair": "skipped", "barrier": "skipped", "docker": d, "ts": ts_, "go": g}
-    outs = {"release": rel, "finalize": fin, "subpackages_to_publish": subs}
-    if ev(jobs["subpackage"]["if"], res, outs) != ev(hjobs["subpackage"]["if"], res, outs):
-        mism.append(f"{d}/{ts_}/{g}/{rel}/{fin}/{subs}")
-facts["subpkg-legacy-mismatch"] = mism
-facts["subpkg-legacy-cases"] = 4 ** 3 * 8
 # A matrix job's same-named outputs are last-writer-wins across its legs, so
 # no job may read a value off one.
 mcons = []
@@ -303,9 +266,8 @@ for wf in ("release.yaml", "docker-release.yaml"):
     matrixed = {n for n, j in w["jobs"].items() if "matrix" in (j.get("strategy") or {})}
     mcons += [f"{wf}:{n}" for n in sorted(set(re.findall(r"needs\.([A-Za-z0-9_-]+)\.outputs", open(path).read())) & matrixed)]
 facts["matrix-output-reads"] = mcons
-sp_new, sp_head = step(jobs, "subpackage", "Publish subpackage to npm + JSR"), step(hjobs, "subpackage", "Publish subpackage to npm + JSR")
+sp_new = step(jobs, "subpackage", "Publish subpackage to npm + JSR")
 open(f"{out}/subpkg-new.sh", "w").write(sp_new["run"])
-open(f"{out}/subpkg-head.sh", "w").write(sp_head["run"])
 facts["subpkg-env"] = sp_new["env"]
 facts["subpkg-steps"] = [s.get("name") for s in jobs["subpackage"]["steps"]]
 facts["docker-with"] = jobs["docker"]["with"]
@@ -316,7 +278,7 @@ src = open(new).read()
 facts["jsr-pins"] = sorted(set(re.findall(r"JSR_VERSION[=:] *([0-9.]+)", src)))
 facts["jsr-pin-sites"] = len(re.findall(r"# renovate: datasource=npm depName=jsr\n *JSR_VERSION[=:] *[0-9.]+", src))
 
-t, th = yaml.safe_load(open(tmpl)), yaml.safe_load(open(tmpl_head))
+t = yaml.safe_load(open(tmpl))
 trig = t.get("on", t.get(True))
 facts["tmpl-push"] = trig["push"]["branches"]
 facts["tmpl-inputs"] = sorted(trig["workflow_dispatch"]["inputs"])
@@ -333,30 +295,8 @@ for key, job, name in (("go", "go", "Tag + GitHub Release"), ("ts", "ts", "Tag +
     facts[f"publish-tools:{key}"] = "|".join((
         step(jobs, job, name)["env"].get("CI_TOOLS", ""), ci_src["with"]["path"],
         str(names.index("Check out the ci source") < names.index(name)), ci_src.get("if", "")))
-    facts[f"publish-model:{key}"] = step(jobs, job, name)["env"].get("RELEASE_MODEL", "")
 facts["release-view-sites"] = " ".join(str(open(new.replace("release.yaml", wf)).read().count("gh release view"))
                                        for wf in ("release.yaml", "docker-release.yaml"))
-# A workflow cannot declare a job conditionally, so a legacy run's page lists every
-# v3-only job; each must evaluate as skipped there.
-V3_ONLY_JOBS = {
-    "release.yaml": ["barrier", "receipts", "renumber", "renumber-npm", "renumber-subpackages", "renumber-tag",
-                     "renumber-ts", "repair", "repair-assets", "repair-notes", "repair-publish", "repair-release"],
-    "docker-release.yaml": ["receipt", "repair-assets"],
-}
-legacy_new = {}
-for wf in ("release.yaml", "docker-release.yaml"):
-    n_jobs = yaml.safe_load(open(new.replace("release.yaml", wf)))["jobs"]
-    legacy_new[wf] = sorted(n for n in V3_ONLY_JOBS[wf] if n in n_jobs)
-facts["legacy-new-jobs"] = legacy_new
-lruns = {}
-for t in ("docker", "go", "ts", "none"):
-    for subs in ("[]", '["web"]'):
-        outs = {"type": t, "channel": "stable", "release_model": "legacy", "mode": "normal", "release": "true",
-                "finalize": "false", "subpackages": subs, "subpackages_to_publish": subs}
-        res = {**{n: "success" for n in hjobs}, **{n: "skipped" for n in legacy_new["release.yaml"]}}
-        lruns[f"{t} {subs}"] = [n for n in legacy_new["release.yaml"] if ev(
-            re.sub(r"needs\.(?!detect\.)[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_]+", "''", str(jobs[n].get("if", ""))), res, outs)]
-facts["legacy-new-jobs-run"] = lruns
 facts["repair-tag-callers"] = sorted(n for n, j in jobs.items()
                                      if str(j.get("uses", "")).endswith("docker-release.yaml") and "repair-tag" in (j.get("with") or {}))
 facts["dr-repair-assets-if"] = " ".join(str(dr["jobs"]["repair-assets"]["if"]).split())
@@ -364,81 +304,75 @@ json.dump(facts, open(f"{out}/facts.json", "w"))
 PY
 fact() { jq -r "$1" "$WORK/facts.json"; }
 
-# ── Select channel: legacy outputs are HEAD's, plus the two model keys ──────
-channel_out() { # <head|new> <ref> <default branch> <mode> [private] [fork] -> the step's outputs, or EXIT=n
+# ── Select channel: the caller refusal, the channel and the mode ────────────
+channel_out() { # <ref> <default branch> <mode> [private] [fork] -> the step's outputs, or EXIT=n
+  local rc=0
   : >"$WORK/out"
-  GITHUB_REF="$2" DEFAULT_BRANCH="$3" INPUT_MODE="$4" REPO_PRIVATE="${5:-false}" REPO_FORK="${6:-false}" \
+  GITHUB_REF="$1" DEFAULT_BRANCH="$2" INPUT_MODE="$3" REPO_PRIVATE="${4:-false}" REPO_FORK="${5:-false}" \
     GITHUB_OUTPUT="$WORK/out" \
-    bash "$WORK/channel-$1.sh" >/dev/null 2>"$WORK/channel.err" || {
-    echo "EXIT=$?"
-    return 0
-  }
+    bash "$WORK/channel.sh" >"$WORK/channel.err" 2>&1 || rc=$?
   cat "$WORK/out"
+  [ "$rc" -eq 0 ] || echo "EXIT=$rc"
 }
-for ref in refs/heads/main refs/heads/dev refs/heads/feature; do
-  for mode in "" normal renumber junk; do
-    # Both sides drop the model keys: a pre-v3 HEAD emits neither, and a landed HEAD is this file.
-    chk "C1 legacy ${ref#refs/heads/} mode='${mode}' matches HEAD" \
-      "$(channel_out new "$ref" main "$mode" | grep -v -e '^release_model=' -e '^mode=')" \
-      "$(channel_out head "$ref" main "$mode" | grep -v -e '^release_model=' -e '^mode=')"
-    chk "C1 legacy ${ref#refs/heads/} mode='${mode}' adds legacy/normal" \
-      "$(channel_out new "$ref" main "$mode" | grep -e '^release_model=' -e '^mode=' | tr '\n' ' ')" \
-      "release_model=legacy mode=normal "
-  done
+REFUSAL="::error::release.yaml publishes only from a public, non-fork repository whose default branch is dev"
+refused_caller() { # <default branch> <private> <fork>
+  chk "C1 a caller with default branch '$1', private $2, fork $3 is refused before any output" \
+    "$(channel_out refs/heads/main "$1" "" "$2" "$3" | tr '\n' ' ')" "EXIT=1 "
+  chk_has "C1 naming what it needs and what it saw" "$(cat "$WORK/channel.err")" \
+    "$REFUSAL (this one: default branch ${1:-<unknown>}, private $2, fork $3)"
+}
+refused_caller main false false
+refused_caller master false false
+refused_caller dev true false
+refused_caller dev false true
+refused_caller "" false false
+chk "C2 a public dev-default repo's main push is stable" "$(channel_out refs/heads/main dev "" | tr '\n' ' ')" \
+  "channel=stable mode=normal "
+chk "C2 its dev push is dev" "$(channel_out refs/heads/dev dev normal | tr '\n' ' ')" "channel=dev mode=normal "
+chk "C2 renumber on dev" "$(channel_out refs/heads/dev dev renumber | tr '\n' ' ')" "channel=dev mode=renumber "
+for ref in refs/heads/feature/probe refs/heads/maint/v2 refs/tags/v1.2.3 refs/pull/7/merge ""; do
+  chk "C2 a run on '${ref:-<unset>}' is refused before any output" "$(channel_out "$ref" dev "" | tr '\n' ' ')" "EXIT=1 "
+  chk_has "C2 naming the two refs it accepts" "$(cat "$WORK/channel.err")" \
+    "::error::release.yaml publishes only from refs/heads/dev (the dev channel) or refs/heads/main (the stable channel), not ${ref:-<unknown>}."
 done
-chk "C2 a dev default branch selects two-branch" "$(channel_out new refs/heads/main dev "" | tr '\n' ' ')" \
-  "channel=stable release_model=two-branch mode=normal "
-chk "C2 renumber on dev" "$(channel_out new refs/heads/dev dev renumber | tr '\n' ' ')" \
-  "channel=dev release_model=two-branch mode=renumber "
-for flags in "true false" "false true"; do
-  # shellcheck disable=SC2086 # the two flags are two words
-  chk "C2 a private or forked dev-default repo stays legacy (private fork: ${flags})" \
-    "$(channel_out new refs/heads/main dev "" $flags | tr '\n' ' ')" "channel=stable release_model=legacy mode=normal "
-done
-chk "C3 renumber on main is refused" "$(channel_out new refs/heads/main dev renumber | tail -1)" "EXIT=1"
-chk "C3 an unknown mode is refused" "$(channel_out new refs/heads/dev dev junk | tail -1)" "EXIT=1"
+chk "C2 so no later detect step runs: Select channel and detect never continue on error" \
+  "$(fact '."channel-continue"')" "false false"
+chk "C2 and no later detect step runs on a failed one" "$(fact '."detect-status-ifs" | join(" ")')" ""
+chk "C3 renumber on main is refused" "$(channel_out refs/heads/main dev renumber | tail -1)" "EXIT=1"
+chk_has "C3 as a dev-only mode" "$(cat "$WORK/channel.err")" "mode=renumber renumbers dev builds"
+chk "C3 an unknown mode is refused" "$(channel_out refs/heads/dev dev junk | tail -1)" "EXIT=1"
+chk_has "C3 by name" "$(cat "$WORK/channel.err")" "unknown mode 'junk'"
 chk "C4 the mode is read off the event, never inputs" "$(jq -r .INPUT_MODE "$WORK/channel-env.json")" \
   '${{ github.event.inputs.mode }}'
 chk "C4 release.yaml reads no inputs.mode but the event's" \
   "$(grep -o '[a-z.]*inputs\.mode' "$RELEASE_YAML" | sort -u | tr '\n' ' ')" "github.event.inputs.mode "
-chk "C4 the model is read off the default branch" "$(jq -r .DEFAULT_BRANCH "$WORK/channel-env.json")" \
+chk "C4 the refusal reads the default branch" "$(jq -r .DEFAULT_BRANCH "$WORK/channel-env.json")" \
   '${{ github.event.repository.default_branch }}'
-chk "C4 and off the repository's visibility and fork flag" \
+chk "C4 and the repository's visibility and fork flag" \
   "$(jq -r '.REPO_PRIVATE + " " + .REPO_FORK' "$WORK/channel-env.json")" \
   '${{ github.event.repository.private }} ${{ github.event.repository.fork }}'
+chk "C4 every detect step follows Select channel" "$(fact '.names | index("Select channel")')" "1"
 
-# ── Select version: legacy outputs are HEAD's ───────────────────────────────
-select_out() { # <head|new> <channel> <mode> <root_changed> <subs> <anchor> <base> -> outputs
+# ── Select version: the release decision ─────────────────────────────────────
+select_out() { # <channel> <mode> <root_changed> <subs> <anchor> <base> -> outputs on one line
   : >"$WORK/out"
-  CHANNEL="$2" MODE="$3" ROOT_CHANGED="$4" SUBPACKAGES_TO_PUBLISH="$5" ANCHOR_SHA="$6" GITHUB_SHA=head \
-    BASE="$7" DEV_VERSION="$7-dev.1" FLOOR_BASE=v1.2.1 FLOOR_DEV_VERSION=v1.2.1-dev.1 LATEST=v1.2.0 \
-    GITHUB_OUTPUT="$WORK/out" bash "$WORK/select-$1.sh" >/dev/null 2>&1 || echo "EXIT=$?"
-  cat "$WORK/out"
+  CHANNEL="$1" MODE="$2" ROOT_CHANGED="$3" SUBPACKAGES_TO_PUBLISH="$4" ANCHOR_SHA="$5" GITHUB_SHA=head \
+    BASE="$6" DEV_VERSION="$6-dev.1" LATEST=v1.2.0 \
+    GITHUB_OUTPUT="$WORK/out" bash "$WORK/select.sh" >/dev/null 2>&1 || echo "EXIT=$?" >>"$WORK/out"
+  tr '\n' ' ' <"$WORK/out"
 }
-n=0
-for ch in stable dev; do
-  for rc in true false; do
-    for subs in '[]' '["web"]'; do
-      for anchor in head older; do
-        for base in v1.3.0 v1.2.0 ""; do
-          a=$(select_out new "$ch" normal "$rc" "$subs" "$anchor" "$base")
-          b=$(select_out head "$ch" normal "$rc" "$subs" "$anchor" "$base")
-          [ "$a" = "$b" ] || fail "C5 Select version differs from HEAD for $ch $rc $subs $anchor '$base': '$a' vs '$b'"
-          n=$((n + 1))
-        done
-      done
-    done
-  done
-done
-chk "C5 Select version equals HEAD's over the legacy grid" "$n" "48"
-chk "C6 renumber publishes nothing" "$(select_out new dev renumber true '[]' older v1.3.0 | sed -n 's/^release=//p')" "false"
-chk "C6 renumber still names the dev version" "$(select_out new dev renumber true '[]' older v1.3.0 | sed -n 's/^version=//p')" "v1.3.0-dev.1"
+chk "C5 a stable shipped change releases the base" "$(select_out stable normal true '[]' older v1.3.0)" \
+  "version=v1.3.0 release=true base=v1.3.0 dev_version=v1.3.0-dev.1 "
+chk "C5 a dev shipped change releases the dev version" "$(select_out dev normal true '[]' older v1.3.0)" \
+  "version=v1.3.0-dev.1 release=true base=v1.3.0 dev_version=v1.3.0-dev.1 "
+chk "C5 a changed subpackage alone releases" "$(select_out stable normal false '["web"]' older v1.3.0 | cut -d' ' -f2)" "release=true"
+chk "C5 nothing shipped releases nothing" "$(select_out stable normal false '[]' older v1.3.0 | cut -d' ' -f2)" "release=false"
+chk "C5 a commit already tagged on its channel releases nothing" "$(select_out stable normal true '["web"]' head v1.3.0 | cut -d' ' -f2)" "release=false"
+chk "C5 an empty base is refused" "$(select_out stable normal true '[]' older "")" "EXIT=1 "
+chk "C6 renumber publishes nothing" "$(select_out dev renumber true '[]' older v1.3.0 | cut -d' ' -f2)" "release=false"
+chk "C6 renumber still names the dev version" "$(select_out dev renumber true '[]' older v1.3.0 | cut -d' ' -f1)" "version=v1.3.0-dev.1"
 chk_has "C6 Select version reads the mode" "$(cat "$WORK/select-env.txt")" "MODE"
-chk "C7 a main-default detect keeps HEAD's timeout" "$(fact '."detect-timeout:new:main"')" "$(fact '."detect-timeout:head:main"')"
-chk "C7 the legacy detect timeout is 3 minutes" "$(fact '."detect-timeout:new:main"')" "3"
-chk "C7 a dev-default detect has 5 minutes" "$(fact '."detect-timeout:new:dev"')" "5"
-chk "C7 a private dev-default detect keeps 3 minutes" "$(fact '."detect-timeout:new:dev-private"')" "3"
-chk "C7 a forked dev-default detect keeps 3 minutes" "$(fact '."detect-timeout:new:dev-fork"')" "3"
+chk "C7 detect has 5 minutes" "$(fact '."detect-timeout"')" "5"
 
 # ── Stubs ────────────────────────────────────────────────────────────────────
 BIN="$WORK/bin"
@@ -750,7 +684,7 @@ chk "N1 the root promotion is numbered from its feature" "$(outkey root_version)
 chk "N1 a lane with nothing pending gets no version" "$(lane yamlenv version "$s")" ""
 compute_at() { # <pending-in-range> -> the stable version compute.sh selects at main's head
   : >"$WORK/cout"
-  (cd "$O" && CHANNEL=stable RELEASE_MODEL=two-branch PENDING_IN_RANGE="$1" EXCLUDE_PATHS='yamlenv/**' CLIFF_BIN="$CLIFF" \
+  (cd "$O" && CHANNEL=stable PENDING_IN_RANGE="$1" EXCLUDE_PATHS='yamlenv/**' CLIFF_BIN="$CLIFF" \
     GITHUB_OUTPUT="$WORK/cout" bash "$COMPUTE") >/dev/null 2>&1 || fail "compute.sh failed"
   sed -n 's/^base=//p' "$WORK/cout"
 }
@@ -815,7 +749,7 @@ chk "Q2 S's own diff ships nothing" "$(outkey root_changed)" "false"
 q_out=$(REPO_TYPE=go GO_LANES_JSON='[]' publish_at "$G" false '[]' '[]' "$GSTATE")
 chk "Q3 the pending promotion makes the root publish" "$q_out$(publish_sets)" 'true|[]|[]'
 q_rc=$(outkey root_changed)
-chk "Q3 and Select version releases S" "$(select_out new stable normal "$q_rc" '[]' "" v1.0.0 | sed -n 's/^release=//p')" "true"
+chk "Q3 and Select version releases S" "$(select_out stable normal "$q_rc" '[]' "" v1.0.0 | cut -d' ' -f2)" "release=true"
 
 # Two promotions past the root's stable tag, the first's run failed: R1 changed
 # only the web subpackage, R2 only the root. R2's run owes both.
@@ -978,7 +912,7 @@ printf '[{"context":"release/complete/v1.0.0","state":"success"}]\n' >"$GH_DIR/s
 SECURITY_SHAS=$(outkey security_shas)
 chk_has "R21 the dev security merge reaches the receipts output" "$SECURITY_SHAS" "$SSEC"
 tr ' ' '\n' <<<"$SECURITY_SHAS" >"$WORK/seam-shas"
-(cd "$SS" && CLIFF_BIN="$CLIFF" bash "$ROOT/scripts/render-notes.sh" --release-model two-branch --repo o/app \
+(cd "$SS" && CLIFF_BIN="$CLIFF" bash "$ROOT/scripts/render-notes.sh" --repo o/app \
   --release-commit "$SSR" --site go --version v1.1.0 --go-lanes '[]' --security-shas "$WORK/seam-shas" \
   --out "$WORK/seam-notes") >"$WORK/seam.log" 2>&1 || fail "seam render failed: $(cat "$WORK/seam.log")"
 chk "R21 and render-notes marks its update as a security update" \
@@ -1021,7 +955,8 @@ echo "$IMG_A $S1" >"$COSIGN_DIR/signed"
 chk "R7 a built tag signed at its own commit reads back from GHCR" "$(readback docker v1.1.0)" "ok"
 chk "R7 asking cosign for this repository's run at that commit" "$(cat "$COSIGN_DIR/log")" \
   "verify --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp ^https://github\.com/cplieger/ci/\.github/workflows/docker-release\.yaml@ --certificate-github-workflow-repository o/app --certificate-github-workflow-sha $S1 ghcr.io/o/app@$IMG_A"
-# A tag the v2 pipeline re-pushed from a later main commit that released nothing.
+# A stable tag published before its repository released from dev, re-pushed
+# from a later main commit that released nothing.
 echo "$IMG_A $R2" >"$COSIGN_DIR/signed"
 chk "R13 a tag re-pushed from a later main commit reads back" "$(readback docker v1.1.0)" "ok"
 chk "R13 asking for the tag's commit first, then the later one" \
@@ -1248,8 +1183,8 @@ sed -i '/jsr.io/d' "$HCURL/ok"
 chk "R18 a subpackage missing from JSR is not receipted either" "$(hreadback '["web"]')|$(receipted)" "refused|0"
 rm "$GH_DIR/release-v1.1.0"
 
-# The subpackage job publishes through the same script, as HEAD's inline step did.
-sp_run() { # <head|new> <channel> <npm has it: y|n> <jsr has it: y|n> -> the npm and npx calls, then jsr.json
+# The subpackage job publishes through the shared script.
+sp_run() { # <channel> <npm has it: y|n> <jsr has it: y|n> -> the npm and npx calls, then jsr.json
   local d c
   d=$(mktemp -d "$WORK/sp.XXXXXX")
   c="$d/curl"
@@ -1258,20 +1193,17 @@ sp_run() { # <head|new> <channel> <npm has it: y|n> <jsr has it: y|n> -> the npm
   printf '%s\n' '{"name":"@o/web","version":"0.0.0"}' >"$d/web/package.json"
   echo v5 >"$d/web/mod.ts"
   : >"$c/ok"
-  [ "$3" = n ] || echo "https://registry.npmjs.org/@o/web/2.0.0" >>"$c/ok"
-  [ "$4" = n ] || echo 'https://jsr.io/@o/web/meta.json {"versions":{"2.0.0":{}}}' >"$c/docs"
+  [ "$2" = n ] || echo "https://registry.npmjs.org/@o/web/2.0.0" >>"$c/ok"
+  [ "$3" = n ] || echo 'https://jsr.io/@o/web/meta.json {"versions":{"2.0.0":{}}}' >"$c/docs"
   : >"$SP_LOG"
-  (cd "$d/web" && PATH="$BIN2:$PATH" CURL_DIR="$c" VERSION=v2.0.0 CHANNEL="$2" CI_TOOLS="$ROOT/scripts" \
-    JSR_VERSION="$(fact '."subpkg-env".JSR_VERSION')" bash "$WORK/subpkg-$1.sh") >/dev/null 2>&1 || echo "EXIT=$?"
+  (cd "$d/web" && PATH="$BIN2:$PATH" CURL_DIR="$c" VERSION=v2.0.0 CHANNEL="$1" CI_TOOLS="$ROOT/scripts" \
+    JSR_VERSION="$(fact '."subpkg-env".JSR_VERSION')" bash "$WORK/subpkg-new.sh") >/dev/null 2>&1 || echo "EXIT=$?"
   cat "$SP_LOG" "$d/web/jsr.json"
 }
-for sp_case in "stable n n" "stable y y" "stable n y" "stable y n" "dev n n" "dev y n"; do
-  read -r sp_ch sp_npm sp_jsr <<<"$sp_case"
-  chk "R20 the subpackage publish matches HEAD's inline step ($sp_case)" \
-    "$(sp_run new "$sp_ch" "$sp_npm" "$sp_jsr")" "$(sp_run head "$sp_ch" "$sp_npm" "$sp_jsr")"
-done
-chk_has "R20 a stable publish still reaches JSR" "$(sp_run new stable n n)" "npx -y jsr@0.14.3 publish --allow-dirty @web"
-chk_lacks "R20 and the shared script runs to the end" "$(sp_run new stable n n)$(sp_run new dev n n)" "EXIT="
+chk_has "R20 a stable publish reaches npm" "$(sp_run stable n n)" "npm publish --access public @web"
+chk_has "R20 and JSR" "$(sp_run stable n n)" "npx -y jsr@0.14.3 publish --allow-dirty @web"
+chk_lacks "R20 a version both registries hold is published to neither" "$(sp_run stable y y)" "publish"
+chk_lacks "R20 and the shared script runs to the end" "$(sp_run stable n n)$(sp_run dev n n)" "EXIT="
 
 # ── The dev barrier ──────────────────────────────────────────────────────────
 rm -rf "$W"
@@ -1851,7 +1783,7 @@ git -C "$W" tag v1.1.0-dev.3 "$UF"
 UB=$(commit_in "$W" "feat!: an unbuilt break" main.go=v4)
 dev_compute() { # -> the dev version compute.sh selects at W's HEAD
   : >"$WORK/cout"
-  (cd "$W" && CHANNEL=dev RELEASE_MODEL=two-branch EXCLUDE_PATHS='yamlenv/**' CLIFF_BIN="$CLIFF" \
+  (cd "$W" && CHANNEL=dev EXCLUDE_PATHS='yamlenv/**' CLIFF_BIN="$CLIFF" \
     GITHUB_OUTPUT="$WORK/cout" bash "$COMPUTE") >/dev/null 2>&1 || fail "compute.sh failed in $W"
   sed -n 's/^dev_version=//p' "$WORK/cout"
 }
@@ -2212,34 +2144,31 @@ chk "U24 a dev build of that root commit leaves it alone" "$(zsub)" 'version=v1.
 rm -f "$CURL_DIR/docs"
 
 # ── Wiring ───────────────────────────────────────────────────────────────────
-TB="steps.channel.outputs.release_model == 'two-branch'"
-chk_has "W1 pending promotions are read under two-branch only" "$(fact '."if:Find pending promotions"')" "$TB"
+chk "W1 pending promotions are read on every run" "$(fact '."if:Find pending promotions"')" ""
 chk "W1 numbering runs only when something is pending" \
   "$(fact '."if:Install git-cliff for promotion numbering"')|$(fact '."if:Number pending promotions"')" \
   "\${{ steps.pending.outputs.any == 'true' }}|\${{ steps.pending.outputs.any == 'true' }}"
-chk_has "W1 receipts are read under two-branch stable only" "$(fact '."if:Read release receipts"')" "$TB && steps.channel.outputs.channel == 'stable'"
-chk_has "W2 legacy keeps the finalize repair" "$(fact '."if:Detect finalize state"')" "steps.channel.outputs.release_model == 'legacy'"
-chk "W3 the compute action reads the model" "$(fact '."cliff-with"."release-model"')" '${{ steps.channel.outputs.release_model }}'
-chk "W3 and the root's pending range" "$(fact '."cliff-with"."pending-in-range"')" "\${{ steps.pending.outputs.root_in_range || 'false' }}"
+chk "W1 receipts are read on stable runs" "$(fact '."if:Read release receipts"')" "\${{ steps.channel.outputs.channel == 'stable' }}"
+chk "W3 the compute action reads the root's pending range" "$(fact '."cliff-with"."pending-in-range"')" "\${{ steps.pending.outputs.root_in_range || 'false' }}"
 chk "W3 and the root's pending version on dev" "$(fact '."cliff-with"."pending-version"')" \
   "\${{ steps.channel.outputs.channel == 'dev' && steps.number.outputs.root_version || '' }}"
 chk "W3 pending promotions are numbered before the version" \
   "$(fact '.names | (index("Number pending promotions") < index("Compute version (cliff)"))')" "true"
 chk "W4 the lane compute reads its pending range" "$(fact '."lanecliff-with"."pending-in-range"')" \
   "\${{ fromJSON(needs.detect.outputs.lane_state || '{}')[matrix.dir].in_range && 'true' || 'false' }}"
-chk "W4 the lane select reads the model" "$(fact '."lane-select-env".RELEASE_MODEL')" '${{ needs.detect.outputs.release_model }}'
-lane_finalize() { # <model> -> finalize|gh calls of a stable lane run at a tagged HEAD
+lane_select() { # <anchor> -> release|version|gh calls of a stable lane run
   : >"$WORK/out"
   : >"$GH_LOG"
-  RELEASE_MODEL="$1" DIR=yamlenv CHANNEL=stable BASE=yamlenv/v9.9.9 DEV_VERSION=yamlenv/v9.9.9-dev.1 FLOOR_BASE="" \
-    FLOOR_DEV_VERSION="" LATEST=yamlenv/v9.9.9 ANCHOR_SHA=head GITHUB_SHA=head GITHUB_OUTPUT="$WORK/out" \
+  DIR=yamlenv CHANNEL=stable BASE=yamlenv/v9.9.9 DEV_VERSION=yamlenv/v9.9.9-dev.1 \
+    LATEST=yamlenv/v9.9.8 ANCHOR_SHA="$1" GITHUB_SHA=head GITHUB_OUTPUT="$WORK/out" \
     bash "$WORK/lane-select.sh" >/dev/null 2>&1 || echo "EXIT=$?"
-  printf '%s|%s' "$(outkey finalize)" "$(wc -l <"$GH_LOG")"
+  printf '%s|%s|%s' "$(outkey release)" "$(outkey version)" "$(wc -l <"$GH_LOG")"
 }
-chk "W4 a legacy lane run at a tagged HEAD repairs by finalize" "$(lane_finalize legacy)" "true|1"
-chk "W4 a two-branch lane run leaves it to the repair job" "$(lane_finalize two-branch)" "false|0"
-chk_has "W5 the barrier runs on two-branch stable runs with a promotion in range" "$(fact '."jobif:barrier"')" \
-  "needs.detect.outputs.release_model == 'two-branch' && needs.detect.outputs.channel == 'stable' && needs.detect.outputs.in_range_any == 'true'"
+chk "W4 a stable lane run past its tag releases the lane's base" "$(lane_select older)" "true|yamlenv/v9.9.9|0"
+chk "W4 at a tagged HEAD it releases nothing and leaves the Release to the repair job" "$(lane_select head)" "false|yamlenv/v9.9.9|0"
+chk "W4 and holds no token" "$(fact '."lane-select-env" | has("GH_TOKEN")')" "false"
+chk_has "W5 the barrier runs on stable runs with a promotion in range" "$(fact '."jobif:barrier"')" \
+  "needs.detect.outputs.channel == 'stable' && needs.detect.outputs.in_range_any == 'true'"
 chk "W5 and may dispatch" "$(fact '."perms:barrier".actions')" "write"
 chk_has "W6 renumber runs in renumber mode only" "$(fact '."jobif:renumber"')" "needs.detect.outputs.mode == 'renumber'"
 chk_has "W6 repair runs only on repairs owed" "$(fact '."jobif:repair"')" "needs.detect.outputs.repairs != '[]'"
@@ -2250,12 +2179,12 @@ for job in docker go ts go-nested; do
   chk_has "W7 $job runs when both were skipped" "$(fact ".\"jobif:$job\"")" "$GATE"
 done
 chk_has "W7 go-nested publishes nothing in renumber mode" "$(fact '."jobif:go-nested"')" "needs.detect.outputs.mode != 'renumber'"
-chk "W8 receipts are recorded under two-branch stable only, once verify-publish succeeded" "$(fact '."jobif:receipts"')" \
-  "always() && needs.verify-publish.result == 'success' && needs.detect.outputs.release_model == 'two-branch' && needs.detect.outputs.channel == 'stable'"
+chk "W8 receipts are recorded on stable runs only, once verify-publish succeeded" "$(fact '."jobif:receipts"')" \
+  "always() && needs.verify-publish.result == 'success' && needs.detect.outputs.channel == 'stable'"
 chk "W8 in a job after the readback, its steps unconditional" \
   "$(fact '."needs:receipts" | join(" ")')|$(fact '."receipts-step-ifs" | join("")')" "detect docker go ts subpackage go-nested verify-publish|"
 chk "W8 that job alone holds the statuses scope" "$(fact '."perms:receipts" | tojson')" '{"contents":"read","statuses":"write"}'
-chk "W8 verify-publish, which legacy runs reach, keeps a read-only token" "$(fact '."perms:verify-publish" | tojson')" '{"contents":"read"}'
+chk "W8 verify-publish keeps a read-only token" "$(fact '."perms:verify-publish" | tojson')" '{"contents":"read"}'
 chk "W8 and records no receipt itself" "$(fact '."vp-steps" | join(",")')" "Checkout,Check out the ci source,Verify published artifacts"
 chk "W13 a TS root's renumber publishes in its own job, with OIDC, once a version is handed on" \
   "$(fact '."jobif:renumber-npm"')|$(fact '."needs:renumber-npm" | join(" ")')|$(fact '."perms:renumber-npm"."id-token"')" \
@@ -2320,17 +2249,13 @@ chk "W16 every jsr CLI pin is one Renovate-tracked version" "$(fact '."jsr-pins"
 chk "W17 docker-release leaves the receipt to release.yaml when subpackages share the version" \
   "$(fact '."docker-with"."defer-receipt"')|$(fact '."dr-defer".default')" "\${{ needs.detect.outputs.subpackages_to_publish != '[]' }}|false"
 chk_has "W17 and its receipt job honours it" "$(fact '."dr-receipt-if"')" "&& !inputs.defer-receipt"
-chk "W18 no job this pipeline adds runs the cliff config while holding OIDC" \
-  "$(fact '."oidc-config" | join(" ")')" "$(fact '."oidc-config-head" | join(" ")')"
-chk "W18 those two are main-default's own ts and finalize jobs" "$(fact '."oidc-config-head" | join(" ")')" \
-  "docker-release.yaml:finalize release.yaml:ts"
+chk "W18 only the root ts and the image finalize jobs run the cliff config while holding OIDC" \
+  "$(fact '."oidc-config" | join(" ")')" "docker-release.yaml:finalize release.yaml:ts"
 chk "W18 the jobs that render, compute or read back hold no OIDC" \
   "$(fact '."perms:repair-notes" | tojson')|$(fact '."perms:repair" | tojson')|$(fact '."perms:renumber" | has("id-token")')|$(fact '."perms:renumber-ts" | tojson')" \
   '{"contents":"read"}|{"contents":"read","statuses":"write"}|false|{"contents":"read"}'
-chk "W18 nor does any job this pipeline adds hold a write scope a poisoned GITHUB_PATH could reach after the config" \
-  "$(fact '."write-config" | join(" ")')" "$(fact '."write-config-head" | join(" ")')"
-chk "W18 those are main-default's own publishing jobs" "$(fact '."write-config-head" | join(" ")')" \
-  "docker-release.yaml:finalize release.yaml:go release.yaml:go-nested release.yaml:ts"
+chk "W18 and only the publishing jobs hold a write scope a poisoned GITHUB_PATH could reach after the config" \
+  "$(fact '."write-config" | join(" ")')" "docker-release.yaml:finalize release.yaml:go release.yaml:go-nested release.yaml:ts"
 chk "W18 the repair renders to a file it hands on as an artifact of its own tag" \
   "$(fact '."repair-render-out"')|$(fact '."repair-upload".path')|$(fact '."repair-upload".name')|$(fact '."repair-fetch".name')" \
   'true|${{ runner.temp }}/notes/NOTES.md|${{ steps.release.outputs.artifact }}|${{ steps.release.outputs.artifact }}'
@@ -2378,8 +2303,6 @@ for t in docker go ts; do
   done
 done
 chk "W21 the subpackage job reads both gates itself" "$(fact '."needs:subpackage" | join(" ")')" "detect repair barrier docker ts go"
-chk "W21 legacy runs, which skip both gates, decide subpackages as HEAD did" \
-  "$(fact '."subpkg-legacy-mismatch" | join(" ")')|$(fact '."subpkg-legacy-cases"')" "|512"
 gate() { # <repair-notes result> <repair-release result> <repair-publish result> -> ok|refused
   NOTES=$1 RELEASE=$2 PUBLISH=$3 bash "$WORK/repair-gate.sh" >/dev/null 2>&1 && echo ok || echo refused
 }
@@ -2396,8 +2319,8 @@ chk "W24 repair-assets runs once per image repair, after detect alone" \
   "$(fact '."jobif:repair-assets"')|$(fact '."needs:repair-assets"')|$(fact '."repair-assets-call".matrix.include')" \
   "\${{ needs.detect.outputs.repair_images != '' && needs.detect.outputs.repair_images != '[]' }}|detect|\${{ fromJSON(needs.detect.outputs.repair_images) }}"
 chk "W24 by calling docker-release.yaml, whose identity signs release assets, in its repair mode" \
-  "$(fact '."repair-assets-call" | "\(.uses) \(.channel) \(."release-model") \(."repair-tag")"')" \
-  './.github/workflows/docker-release.yaml stable two-branch ${{ matrix.tag }}'
+  "$(fact '."repair-assets-call" | "\(.uses) \(.channel) \(."repair-tag")"')" \
+  './.github/workflows/docker-release.yaml stable ${{ matrix.tag }}'
 chk "W24 with the window inputs the tag's signing commits are read from" \
   "$(fact '."repair-assets-call" | "\(."exclude-re") \(.subpackages)"')" \
   '${{ needs.detect.outputs.exclude_re }} ${{ needs.detect.outputs.subpackages }}'
@@ -2506,8 +2429,7 @@ RBIN="$WORK/rbin"
 mkdir -p "$RBIN"
 cat >"$RBIN/gh" <<'SH'
 #!/usr/bin/env bash
-# The tag exists at this commit; the by-tag Release read answers REL_READ,
-# and the release listing holds a draft of REL_DRAFT (or fails on "fail").
+# The tag exists at this commit; the by-tag Release read answers REL_READ.
 printf '%s\n' "$*" >>"$REL_LOG"
 case "$*" in
   "api repos/o/app/git/ref/tags/$VERSION --jq .object.sha") echo "$GITHUB_SHA"; exit 0 ;;
@@ -2519,25 +2441,20 @@ case "$*" in
       *) echo "gh: HTTP $REL_READ" >&2 ;;
     esac
     exit 1 ;;
-  "api --paginate repos/o/app/releases?per_page=100 --jq .[] | select(.draft) | .tag_name")
-    if [ "${REL_DRAFT:-}" = fail ]; then echo 'gh: HTTP 502' >&2; exit 1; fi
-    printf '%s\n' "$VERSION-dev.1" ${REL_DRAFT:+"$REL_DRAFT"}
-    exit 0 ;;
   "release create $VERSION --title $VERSION --notes-file NOTES.md") exit 0 ;;
 esac
 echo "stub: unexpected gh $*" >&2
 exit 22
 SH
 chmod 755 "$RBIN/gh"
-publish_site() { # <site> <read status> -> rc|the gh calls joined by ';'; env MODEL (legacy), DRAFT
-  local d rc=0 rtag=v9.9.9 body="$WORK/publish-$1.sh" draft="${DRAFT:-}"
+publish_site() { # <site> <read status> -> rc|the gh calls joined by ';'
+  local d rc=0 rtag=v9.9.9 body="$WORK/publish-$1.sh"
   if [ "$1" = lane ]; then rtag=yamlenv/v9.9.9; fi
-  if [ "$draft" = tag ]; then draft=$rtag; fi
   d=$(mktemp -d "$WORK/ps.XXXXXX")
   echo notes >"$d/NOTES.md"
   : >"$d/log"
-  (cd "$d" && PATH="$RBIN:$PATH" REL_LOG="$d/log" REL_READ="$2" REL_DRAFT="$draft" GH_TOKEN=t GITHUB_REPOSITORY=o/app \
-    GITHUB_SHA=c0ffee VERSION="$rtag" CHANNEL=stable RELEASE_MODEL="${MODEL:-legacy}" CI_TOOLS="$ROOT/scripts" bash -e "$body") >"$WORK/ps.log" 2>&1 || rc=$?
+  (cd "$d" && PATH="$RBIN:$PATH" REL_LOG="$d/log" REL_READ="$2" GH_TOKEN=t GITHUB_REPOSITORY=o/app \
+    GITHUB_SHA=c0ffee VERSION="$rtag" CHANNEL=stable CI_TOOLS="$ROOT/scripts" bash -e "$body") >"$WORK/ps.log" 2>&1 || rc=$?
   echo "$rc|$(paste -sd ';' "$d/log")"
 }
 chk "W26 no workflow reads a Release through gh release view, which bills GraphQL" "$(fact '."release-view-sites"')" "0 0"
@@ -2546,21 +2463,11 @@ for s in go ts lane; do
   if [ "$s" = lane ]; then rtag=yamlenv/v9.9.9 gate=""; fi
   REF_S="api repos/o/app/git/ref/tags/$rtag --jq .object.sha" READ_S="api repos/o/app/releases/tags/$rtag"
   CREATE_S="release create $rtag --title $rtag --notes-file NOTES.md"
-  LIST_S="api --paginate repos/o/app/releases?per_page=100 --jq .[] | select(.draft) | .tag_name"
   chk "W26 the $s site runs the helper from the ci source it checked out first, on the stable path" \
     "$(fact ".\"publish-tools:$s\"")" "\${{ github.workspace }}/.cplieger-ci/scripts|.cplieger-ci|True|$gate"
-  chk "W26 the $s site reads the release model detect chose" "$(fact ".\"publish-model:$s\"")" '${{ needs.detect.outputs.release_model }}'
   chk "W26 the $s site leaves a present Release alone" "$(publish_site "$s" 200)" "0|$REF_S;$READ_S"
-  chk "W26 the $s site creates the Release on a 404 with no draft of the tag" "$(publish_site "$s" 404)" \
-    "0|$REF_S;$READ_S;$LIST_S;$CREATE_S"
-  chk "W26 and on a legacy run leaves a draft of the tag alone, as gh release view read one" \
-    "$(DRAFT=tag publish_site "$s" 404)" "0|$REF_S;$READ_S;$LIST_S"
-  chk "W26 failing, not creating, when the release listing cannot be read" "$(DRAFT=fail publish_site "$s" 404)" \
-    "1|$REF_S;$READ_S;$LIST_S"
-  chk_has "W26 naming the read" "$(cat "$WORK/ps.log")" "::error::could not determine whether Release $rtag exists:
-gh: HTTP 502"
-  chk "W26 a two-branch run publishes beside a draft, which is no Release there" \
-    "$(MODEL=two-branch DRAFT=tag publish_site "$s" 404)" "0|$REF_S;$READ_S;$CREATE_S"
+  chk "W26 the $s site creates the Release on a 404, reading no draft listing" "$(publish_site "$s" 404)" \
+    "0|$REF_S;$READ_S;$CREATE_S"
   chk "W26 the $s site fails on a rate limit and creates nothing" "$(publish_site "$s" 403)" "1|$REF_S;$READ_S"
   chk_has "W26 naming the read and the limit" "$(cat "$WORK/ps.log")" \
     "::error::could not determine whether Release $rtag exists:
@@ -2571,22 +2478,15 @@ REL_LOG="$WORK/rex.log" REL_READ=403 VERSION=v9.9.9 GITHUB_SHA=c0ffee PATH="$RBI
   bash "$ROOT/scripts/release-exists.sh" v9.9.9 >"$WORK/rex.out" 2>"$WORK/rex.err" || echo "EXIT=$?" >>"$WORK/rex.out"
 chk "W26 release-exists.sh reads a rate limit as no answer, on stdout nothing a caller could read as absent" \
   "$(cat "$WORK/rex.out")" "EXIT=1"
-chk "W27 a legacy run lists exactly these release.yaml jobs HEAD lacks" \
-  "$(fact '."legacy-new-jobs"."release.yaml" | join(" ")')" \
-  "barrier receipts renumber renumber-npm renumber-subpackages renumber-tag renumber-ts repair repair-assets repair-notes repair-publish repair-release"
-chk "W27 and these docker-release.yaml jobs" "$(fact '."legacy-new-jobs"."docker-release.yaml" | join(" ")')" "receipt repair-assets"
-for k in "docker []" 'docker ["web"]' "go []" "ts []" 'ts ["web"]' "none []"; do
-  chk "W27 every one is skipped on a legacy $k run" "$(fact ".\"legacy-new-jobs-run\".\"$k\" | join(\" \")")" ""
-done
 chk "W27 only repair-assets passes repair-tag, which docker-release.yaml's repair-assets job alone reads" \
   "$(fact '."repair-tag-callers" | join(" ")')|$(fact '."dr-repair-assets-if"')" "repair-assets|\${{ inputs.repair-tag != '' }}"
-chk_has "W27 and the docker receipt job needs a two-branch caller" "$(fact '."dr-receipt-if"')" "inputs.release-model == 'two-branch'"
+chk_has "W27 and the docker receipt job runs on stable alone" "$(fact '."dr-receipt-if"')" "&& inputs.channel == 'stable' &&"
 chk "W9 every git-cliff step is token-free" "$(fact '."token-free" | [.[] | length] | add')" "0"
 chk "W9 every notes site renders through render-notes.sh" "$(fact '.renders | [.[]] | all')" "true"
 chk "W10 the root kind line replaces the promotion note" "$(fact '.outputs | has("promotion_note")')|$(fact '.outputs.release_kind_note')" \
   'false|${{ steps.pending.outputs.root_kind_note }}'
-chk "W11 pending promotions join the publication on two-branch stable runs with one in range" "$(fact '."if:publish"')" \
-  "steps.channel.outputs.release_model == 'two-branch' && steps.channel.outputs.channel == 'stable' && steps.pending.outputs.in_range_any == 'true'"
+chk "W11 pending promotions join the publication on stable runs with one in range" "$(fact '."if:publish"')" \
+  "steps.channel.outputs.channel == 'stable' && steps.pending.outputs.in_range_any == 'true'"
 chk "W11 between the path diff and the release decision" "$(fact '."publish-after"')" "true"
 for key in root_changed subpackages_to_publish go_modules_to_release; do
   chk "W11 detect publishes the joined $key" "$(fact ".outputs.$key")" \

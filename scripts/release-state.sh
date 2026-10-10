@@ -422,9 +422,9 @@ verified_at() { # <image@digest> <commit> <signature|sbom>: 0 when docker-releas
   die "cosign could not verify $1 at $2: $(printf '%s' "$err" | tail -n 1)"
 }
 
-# The v2 pipeline re-pushes a version's tags from later commits that release
-# nothing, so a tag may be served by a build signed at a first-parent
-# descendant of its commit on HEAD's history, below the lane's next stable tag.
+# A stable tag published before its repository released from dev may be
+# served by a build signed at a later first-parent commit that re-pushed the
+# tag, so the window runs from the tag's commit up to the lane's next stable tag.
 publishing_window() { # <tag> <commit> -> the tag's commit, then each later commit that may have re-pushed the tag
   local c name
   printf '%s\n' "$2"
@@ -460,7 +460,7 @@ signed_in_window() { # <image@digest> <commits, one per line, in the order to as
 # docker-release.yaml run its source carries signed it and attested its SBOM.
 provenance_gap() { # <image@digest> <source commit> -> why the image is incomplete, nothing when complete; dies when cosign cannot tell
   local ref=$1 src=$2 window
-  window=$(RELEASE_MODEL=two-branch bash "$TOOLS/promote-digest.sh" --sources "$src") \
+  window=$(bash "$TOOLS/promote-digest.sh" --sources "$src") \
     || die "cannot tell which commits could have built ${ref}"
   if ! signed_in_window "$ref" "$window" signature; then
     printf '%s carries no signature from a docker-release.yaml run of %s at %s or an ancestor whose image it carries, because its build stopped before signing' \
@@ -495,9 +495,9 @@ signing_window() { # <tag> -> the commits whose docker-release.yaml run may have
   local commit
   commit=$(git rev-list -n1 "$1") || die "no tag ${1} in this checkout"
   if is_reconciliation "$commit"; then
-    RELEASE_MODEL=two-branch bash "$TOOLS/promote-digest.sh" --sources "${commit}^2" || return 1
+    bash "$TOOLS/promote-digest.sh" --sources "${commit}^2" || return 1
   else
-    RELEASE_MODEL=two-branch bash "$TOOLS/promote-digest.sh" --sources "$commit" || return 1
+    bash "$TOOLS/promote-digest.sh" --sources "$commit" || return 1
     window_order "$1" "$commit" | tail -n +2
   fi
 }
