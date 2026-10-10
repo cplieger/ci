@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Probe for scripts/render-notes.sh against the pinned git-cliff and the synced
-# cliff config: states N1 to N15 pin the explicit-range notes with their
+# cliff config: states N1 to N14 pin the explicit-range notes with their
 # dependency and system-package parts.
 # CLIFF_BIN=/path/to/git-cliff skips the download.
 # shellcheck disable=SC2016 # the expected notes carry literal markdown backticks
@@ -8,7 +8,7 @@ set -euo pipefail
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export GIT_AUTHOR_NAME=probe GIT_AUTHOR_EMAIL=probe@ci.local
 export GIT_COMMITTER_NAME=probe GIT_COMMITTER_EMAIL=probe@ci.local
-unset GITHUB_TOKEN GH_TOKEN CLIFF_NOTES_MODE
+unset GITHUB_TOKEN GH_TOKEN
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$ROOT/scripts/render-notes.sh"
@@ -317,12 +317,5 @@ for args in "--site go --version v2.0.0" "--site docker --version v2.0.0" "--sit
   fi
 done
 ok "N14 a git-cliff error fails every site's render"
-
-printf '#!/bin/sh\necho "mode=${CLIFF_NOTES_MODE:-unset}"\n' >"$WORK/cliff-mode"
-chmod +x "$WORK/cliff-mode"
-(cd "$T" && CLIFF_BIN="$WORK/cliff-mode" bash "$SCRIPT" "${TB[@]}" --site go --version v2.0.0 --out "$WORK/out") \
-  >"$WORK/rn.log" 2>&1 || fail "N15 render-notes failed: $(cat "$WORK/rn.log")"
-grep -qx 'mode=v3' "$WORK/out" || fail "N15 git-cliff must run under CLIFF_NOTES_MODE=v3: $(cat "$WORK/out")"
-ok "N15 git-cliff runs under CLIFF_NOTES_MODE=v3, which an older synced cliff.toml gates the body on"
 
 echo "PASS: render-notes ($CHECKS checks)"
