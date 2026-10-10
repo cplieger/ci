@@ -33,11 +33,11 @@ permissions:
 # Workflow-level so ci-local's version preflight reads them.
 env:
   # renovate: datasource=go depName=github.com/cplieger/deadset
-  DEADSET_VERSION: v1.11.1
+  DEADSET_VERSION: v1.12.0-dev.4
   # renovate: datasource=go depName=github.com/cplieger/deadset-go
-  DEADSET_GO_VERSION: v1.27.1
+  DEADSET_GO_VERSION: v1.28.0-dev.3
   # renovate: datasource=npm depName=@cplieger/deadset-ts
-  DEADSET_TS_VERSION: 6.1.0
+  DEADSET_TS_VERSION: 7.0.0-dev.2
 
 jobs:
   analyze:

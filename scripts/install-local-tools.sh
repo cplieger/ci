@@ -255,7 +255,8 @@ install_deadset_ts() {
     bad deadset-ts "no pin found"
     return
   }
-  cur="$(deadset-ts version 2>/dev/null | semver || true)"
+  # The pin can be a prerelease (7.0.0-dev.2), which semver would cut to 7.0.0.
+  cur="$(deadset-ts version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' | head -n1 || true)"
   [ "$cur" = "$want" ] && {
     skip deadset-ts "$want"
     return
