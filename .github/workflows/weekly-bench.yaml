@@ -346,7 +346,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version: "3.15"
 
       # `-run='^$'` keeps the unit suite out of the timing; `-count=10` is
       # benchstat's minimum sample; `-benchtime` sets the iterations per sample,
@@ -620,7 +620,7 @@ jobs:
       # ever been created. Author against 3.14, pin 3.14.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version: "3.15"
 
       - name: Update the tracker issue in each consumer
         run: |
