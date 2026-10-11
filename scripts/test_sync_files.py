@@ -246,11 +246,10 @@ MAIN_FIXTURE = {
         'cplieger/d': [listed('d', 9, 'repo-sync/ci/default')],
     },
 }
-# HEAD's sync pull request body, byte for byte: a main-default repo sees no change.
-HEAD_PR_BODY = (
-    'Synced from [cplieger/ci](https://github.com/cplieger/ci) by\n'
-    '`scripts/sync-files.py`. Files carrying a `Synced from cplieger/ci` header are\n'
-    'overwritten on every sync — change the canonical copy in cplieger/ci\n'
+PR_BODY = (
+    'Synced from [cplieger/ci](https://github.com/cplieger/ci) by '
+    '`scripts/sync-files.py`. Files carrying a `Synced from cplieger/ci` header are '
+    'overwritten on every sync, so change the canonical copy in cplieger/ci '
     "instead. Auto-merges once this repo's required checks pass.\n"
     '\n'
     'Files updated in this run:\n'
@@ -307,7 +306,7 @@ class MainDefault(unittest.TestCase):
                         'title': 'chore(sync): synced file(s) with cplieger/ci',
                         'head': 'repo-sync/ci/default',
                         'base': 'main',
-                        'body': HEAD_PR_BODY,
+                        'body': PR_BODY,
                     },
                 ),
                 ('POST', 'repos/cplieger/a/issues/99/labels', {'labels': ['dependencies']}),
@@ -321,6 +320,17 @@ class MainDefault(unittest.TestCase):
             ],
         )
         self.assertIn('  opened PR: https://github.com/cplieger/a/pull/99\n', got['stdout'])
+
+    def test_the_pull_request_body_is_unwrapped_and_has_no_em_dash(self):
+        got = run_sync(SCRIPTS / 'sync-files.py', MAIN_MANIFEST, MAIN_FIXTURE)
+        body = next(
+            c[2]['body']
+            for c in api_calls(got['gh'])
+            if c[:2] == ('POST', 'repos/cplieger/a/pulls')
+        )
+        intro, _files = body.split('\n\n')
+        self.assertNotIn('\n', intro)
+        self.assertNotIn('\u2014', body)
 
     def test_the_lookups_are_unscoped_and_the_base_is_the_clones_default_branch(self):
         fixture = {**MAIN_FIXTURE, 'default_branch': {'cplieger/a': 'trunk'}}

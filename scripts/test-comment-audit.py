@@ -323,9 +323,9 @@ def test_limit_boundary_is_inclusive(td: Path) -> None:
 def test_denylisted_repo_skips(td: Path) -> None:
     # Asserted as a literal set, not read from the module: iterating the module's
     # own value would make removing an entry invisible to this probe.
-    expected = {'cplieger/ci', 'cplieger/.kiro', 'cplieger/homelab', 'cplieger/.github'}
+    expected = {'cplieger/ci', 'cplieger/.github'}
     check(
-        'the denylist is exactly the four non-app repositories',
+        'the denylist is exactly the two infrastructure repositories',
         ok=expected == CA.EXCLUDED_REPOSITORIES,
         detail=str(sorted(CA.EXCLUDED_REPOSITORIES)),
     )

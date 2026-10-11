@@ -20,8 +20,6 @@ MARGIN = 1.1
 LIMIT = COMMENT_CEILING * MARGIN
 
 EXCLUDED_REPOSITORIES = {
-    'cplieger/.kiro',
-    'cplieger/homelab',
     'cplieger/.github',
     'cplieger/ci',
 }

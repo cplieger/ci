@@ -198,11 +198,14 @@ def ensure_pr(repo, base, into, changed):
     if open_pull(repo, base) is not None:
         print('  PR already open; force-push refreshed it')
         return
+    # GitHub renders a newline in a PR body as a line break: one line per paragraph.
     body_lines = [
-        'Synced from [cplieger/ci](https://github.com/cplieger/ci) by',
-        '`scripts/sync-files.py`. Files carrying a `Synced from cplieger/ci` header are',
-        'overwritten on every sync — change the canonical copy in cplieger/ci',
-        "instead. Auto-merges once this repo's required checks pass.",
+        (
+            'Synced from [cplieger/ci](https://github.com/cplieger/ci) by '
+            '`scripts/sync-files.py`. Files carrying a `Synced from cplieger/ci` header are '
+            'overwritten on every sync, so change the canonical copy in cplieger/ci '
+            "instead. Auto-merges once this repo's required checks pass."
+        ),
         '',
         'Files updated in this run:',
         *[f'- `{path}`' for path in changed],
