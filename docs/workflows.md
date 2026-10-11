@@ -32,6 +32,8 @@ After the `amd64` build, the `docker` job runs two optional image tests. The sha
 | `ts-ci.yaml` with `web-lint: true` | the above, plus Stylelint, html-validate and an import-map coverage check |
 | `shell-ci.yaml` | shellcheck, shfmt, hadolint, and `tests/shell/run.sh` when the repository has one |
 
+With `web-lint: true`, a package that declares a `lint:web` script in `package.json` runs that script in place of Stylelint and html-validate, so a local `npm run lint:web` is the same check. The script must lint every tracked CSS file with Stylelint and the synced `.stylelintrc.json`, lint every tracked HTML file with html-validate, and exit non-zero when either fails.
+
 `ts-ci.yaml` also runs the tests again on the oldest Node major that `package.json` `engines.node` allows. A package with no `engines.node` skips that job with a notice.
 
 In a TypeScript package with a knip configuration, `ts-ci.yaml` also runs [knip](https://knip.dev) for four checks that are not dead code. They are import cycles, imports of packages that `package.json` does not declare, binaries that `package.json` does not declare, and the same value exported twice. Unused code is left to the dead-code check. A cycle fails only when the configuration sets `"rules": { "cycles": "error" }`.

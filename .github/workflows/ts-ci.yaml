@@ -17,7 +17,7 @@ on:
         type: string
         default: "."
       web-lint:
-        description: Run stylelint + html-validate (libraries shipping CSS/HTML).
+        description: Run the package's lint:web script, or stylelint + html-validate without one (libraries shipping CSS/HTML).
         type: boolean
         default: false
 
@@ -316,6 +316,15 @@ jobs:
         continue-on-error: true
         run: |
           (
+            # A package declaring a `lint:web` script runs it instead, so CI and a local
+            # run are one command. CI then relies on it to lint every tracked CSS file
+            # with stylelint and the synced root .stylelintrc.json, every tracked HTML
+            # file with html-validate, and to exit non-zero when either fails.
+            if node -e "const s=require('./package.json').scripts||{}; process.exit(s['lint:web']?0:1)"; then
+              npm run lint:web
+              exit "$?"
+            fi
+
             # Two gates in one step, each recording into `rc`: bash suppresses errexit
             # on the left of `||` and a nested `set -e` does not restore it, so a plain
             # list would report only its last command. Both linters always run.
