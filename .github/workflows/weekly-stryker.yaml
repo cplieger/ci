@@ -8,6 +8,8 @@
 #   2. add the devDependencies the config needs:
 #        @stryker-mutator/core + @stryker-mutator/vitest-runner
 #        (+ @stryker-mutator/typescript-checker when `checkers` is used)
+#   3. optionally declare a `test:mutation` script running `stryker run`;
+#      the run step then calls it (see "Run stryker")
 # The fanout discovers configs automatically; a dir whose devDeps are missing
 # is SKIPPED with an actionable notice instead of failing, so the runner can
 # ship ahead of repo enrollment and light up as repos opt in.
@@ -247,16 +249,13 @@ jobs:
             echo "no @vitest/browser-playwright devDependency; skipping browser install"
           fi
 
-          # STOPGAP (2026-09-13), and it is built to delete itself. Under vitest 5
-          # the runner filters each mutant's test run with a name pattern joined
-          # by a space while vitest matches on " > ", so zero tests run per
-          # mutant, every mutant survives trivially, and a suite that killed
-          # 91.67% publishes 0.00%. Patching the two joins restores the vitest 4
-          # number exactly; the script's docstring carries the measurement and the
-          # upstream PRs. It exits 3 once its anchor is gone, so the first run
-          # after upstream ships the fix goes RED HERE — that red is the signal to
-          # delete the script, this block, and the probe in self-ci.yaml, not to
-          # re-anchor anything. The zero-kill guard below stays the backstop.
+          # STOPGAP, built to delete itself. Under vitest 5 the runner joins each
+          # mutant's test-name filter with a space while vitest matches on " > ",
+          # so zero tests run per mutant and every mutant survives; patching the
+          # two joins restores the vitest 4 score (measurement and upstream PRs in
+          # the script's docstring). Exit 3 means its anchor is gone: delete the
+          # script, this block and its probe in self-ci.yaml, never re-anchor.
+          # The zero-kill guard below stays the backstop.
           if ! python3 "${GITHUB_WORKSPACE}/scripts/patch-vitest-runner-separator.py"; then
             echo "::error::${ENTRY}: the vitest-5 separator stopgap refused to apply; upstream probably fixed it — delete the stopgap"
             exit 1
@@ -274,19 +273,26 @@ jobs:
             exit 1
           fi
 
-          # --reporters json overrides the config's html/clear-text reporters
-          # for CI; progress keeps the log alive under the job timeout.
+          # A declared `test:mutation` is the package's entry point, so the weekly
+          # and local runs are one command; it must run `stryker run`, which gets
+          # the flags after `--`. --reporters json overrides the config's
+          # reporters for CI; progress keeps the log alive under the job timeout.
           rc=0
-          # GITHUB_ACTIONS=false on THIS command only: vitest appends its
-          # "github-actions" reporter when that variable is exactly "true", so
-          # every killed mutant's deliberate test failure would surface as a
-          # workflow error annotation on a green job. Nothing under
-          # @stryker-mutator reads the variable, and CI=true still marks the
-          # run as CI.
-          # Node 26's JSON.stringify fast path aborts with "Zone Allocation
-          # failed" on the checker's very large IPC message. Node rejects this
-          # flag in NODE_OPTIONS, so it sits here; remove it once Node fixes that.
-          GITHUB_ACTIONS=false node --no-json-stringify-fast-path node_modules/.bin/stryker run --reporters json,progress || rc=$?
+          # GITHUB_ACTIONS=false on this command only: vitest adds its
+          # github-actions reporter when it is "true", so each killed mutant's
+          # test failure would annotate a green job. CI=true still marks CI.
+          # Node 26's JSON.stringify fast path aborts ("Zone Allocation failed")
+          # on the checker's very large IPC message, and Node refuses the flag in
+          # NODE_OPTIONS, so a declared script's node gets it from a preload.
+          # Remove both once Node fixes that.
+          if node -e "const s=require('./package.json').scripts||{}; process.exit(s['test:mutation']?0:1)"; then
+            preload="${RUNNER_TEMP}/no-json-stringify-fast-path.cjs"
+            printf '%s\n' "require('node:v8').setFlagsFromString('--no-json-stringify-fast-path');" > "$preload"
+            GITHUB_ACTIONS=false NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--require=${preload}" \
+              npm run test:mutation -- --reporters json,progress || rc=$?
+          else
+            GITHUB_ACTIONS=false node --no-json-stringify-fast-path node_modules/.bin/stryker run --reporters json,progress || rc=$?
+          fi
 
           # Locate the schema report (jsonReporter default:
           # reports/mutation/mutation.json; tolerate overridden fileNames).
@@ -298,12 +304,10 @@ jobs:
 
           # Mutation score per mutation-testing-elements metrics:
           # detected (Killed+Timeout) / valid (detected + Survived+NoCoverage).
-          # python -c, never a heredoc — heredoc terminators break under GHA
-          # YAML dedent (repo-wide convention).
-          # Emits "<score> <detected> <valid>" so the zero-kill guard below can
-          # read the counts without a second parse of an 8 MB report. Split with
-          # a here-STRING, never a heredoc: a heredoc terminator breaks under
-          # GHA's YAML dedent (the convention this file already follows above).
+          # Emits "<score> <detected> <valid>" so the zero-kill guard below reads
+          # the counts without a second parse of an 8 MB report. python -c and a
+          # here-string, never a heredoc: its terminator breaks under GHA's YAML
+          # dedent.
           metrics=$(python3 -c "
           import json, sys
           from collections import Counter

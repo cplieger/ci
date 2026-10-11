@@ -1382,12 +1382,6 @@ def rewrite_trivy_gitignore(cmd: str, cwd: Path) -> str:
 # ci-local lints exactly the fileset CI's checkout would.
 MARKDOWNLINT_GLOB_RE = re.compile(r'(["\']?)\*\*/\*\.md\1')
 _STYLELINT_GLOB_RE = re.compile(r'(["\']?)\*\*/\*\.css\1')
-# The web-lint step feeds html-validate from a raw `find`, so parity means swapping
-# the whole producer rather than a glob. The replacement stays NUL-delimited so the
-# `xargs -0` on the other side of the pipe is untouched.
-_HTMLVALIDATE_FIND_RE = re.compile(
-    r'find\s+\.\s+-name\s+(["\']?)\*\.html\1(?:\s+-not\s+-path\s+\S+)*\s+-print0'
-)
 
 
 def rewrite_stylelint_gitignore(cmd: str, cwd: Path) -> str:
@@ -1408,27 +1402,6 @@ def rewrite_stylelint_gitignore(cmd: str, cwd: Path) -> str:
         # --allow-empty-input do its job.
         return _STYLELINT_GLOB_RE.sub(shlex.quote('__ci_local_no_css__/*.css'), cmd)
     return _STYLELINT_GLOB_RE.sub(' '.join(shlex.quote(f) for f in files), cmd)
-
-
-def rewrite_htmlvalidate_gitignore(cmd: str, cwd: Path) -> str:
-    """Replace the web-lint html-validate `find` producer with CI-visible .html files.
-
-    Same parity break as stylelint above, and wider in practice: the CI step's
-    `find . -name "*.html"` excludes only node_modules, so every Stryker sandbox and
-    review-scratch copy of index.html gets validated locally. Swapping the producer
-    for `git ls-files -z` keeps the NUL delimiting that the `xargs -0` downstream
-    expects, and leaves --no-run-if-empty to handle a repo with no HTML.
-    """
-    if 'html-validate' not in cmd or not _HTMLVALIDATE_FIND_RE.search(cmd):
-        return cmd
-    try:
-        _git_visible_files(cwd, '*.html')
-    except OSError, subprocess.CalledProcessError:
-        return cmd  # not a git repo or git unavailable; leave the find as-is
-    return _HTMLVALIDATE_FIND_RE.sub(
-        'git ls-files -z --cached --others --exclude-standard -- ' + shlex.quote('*.html'),
-        cmd,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1650,7 +1623,6 @@ def run_step(kind, name, detail, step, base_cwd: Path, dry_run: bool):
     cmd = rewrite_hadolint_docker(cmd)
     cmd = rewrite_markdownlint_gitignore(cmd, cwd)
     cmd = rewrite_stylelint_gitignore(cmd, cwd)
-    cmd = rewrite_htmlvalidate_gitignore(cmd, cwd)
     cmd = rewrite_find_sh_gitignore(cmd, cwd)
     cmd = rewrite_yamllint_gitignore(cmd, cwd)
     cmd = rewrite_toml_gitignore(cmd, cwd)
