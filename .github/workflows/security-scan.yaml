@@ -384,7 +384,7 @@ jobs:
         run: |
           set -euo pipefail
           # renovate: datasource=go depName=golang.org/x/vuln
-          GOVULNCHECK_VERSION=v1.8.0
+          GOVULNCHECK_VERSION=v1.9.0
           go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
           mkdir -p govulncheck-reports
           : > govulncheck-reports/govulncheck-modules.tsv
