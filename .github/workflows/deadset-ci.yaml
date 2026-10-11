@@ -37,7 +37,7 @@ env:
   # renovate: datasource=go depName=github.com/cplieger/deadset-go
   DEADSET_GO_VERSION: v1.28.0
   # renovate: datasource=npm depName=@cplieger/deadset-ts
-  DEADSET_TS_VERSION: 7.0.1
+  DEADSET_TS_VERSION: 7.1.0
 
 jobs:
   analyze:
