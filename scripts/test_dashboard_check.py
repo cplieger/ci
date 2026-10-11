@@ -236,6 +236,43 @@ class Datasources(RuleCase):
         variable(doc, 'worker')['spec']['query']['datasource'] = {'name': 'P1809F7CD0C75ACF3'}
         self.assert_finding(doc, 'datasource', 'P1809F7CD0C75ACF3')
 
+    def test_accepts_a_panel_reading_the_dashboard_datasource(self):
+        doc = valid()
+        element(doc, 'panel-2')['data']['spec']['queries'][0]['spec']['query'] = {
+            'kind': 'DataQuery',
+            'group': 'datasource',
+            'version': 'v0',
+            'datasource': {'name': '-- Dashboard --'},
+            'spec': {'panelId': 1, 'withTransforms': False},
+        }
+        self.assert_clean(doc)
+
+    def test_rejects_the_dashboard_datasource_name_under_another_group(self):
+        doc = valid()
+        element(doc, 'panel-2')['data']['spec']['queries'][0]['spec']['query']['datasource'] = {
+            'name': '-- Dashboard --'
+        }
+        self.assert_finding(doc, 'datasource', '-- Dashboard --')
+
+    def test_rejects_a_literal_uid_under_the_dashboard_group(self):
+        doc = valid()
+        query = element(doc, 'panel-2')['data']['spec']['queries'][0]['spec']['query']
+        query['group'], query['datasource'] = 'datasource', {'name': 'mimir'}
+        self.assert_finding(doc, 'datasource', 'mimir')
+
+    def test_rejects_the_dashboard_datasource_with_a_pinned_uid(self):
+        doc = valid()
+        query = element(doc, 'panel-2')['data']['spec']['queries'][0]['spec']['query']
+        query['group'] = 'datasource'
+        query['datasource'] = {'name': '-- Dashboard --', 'uid': 'hard-coded-uid'}
+        self.assert_finding(doc, 'datasource', 'also holds uid')
+
+    def test_rejects_a_variable_reading_the_dashboard_datasource(self):
+        doc = valid()
+        variable(doc, 'worker')['spec']['query']['datasource'] = {'name': '-- Dashboard --'}
+        variable(doc, 'worker')['spec']['query']['group'] = 'datasource'
+        self.assert_finding(doc, 'datasource', '-- Dashboard --')
+
     def test_accepts_the_built_in_annotation(self):
         doc = valid()
         self.assertEqual(

@@ -30,6 +30,10 @@ CLOSED_SET_VARIABLES = {'QueryVariable', 'CustomVariable'}
 UNLABELLED_HIDE = {'hideVariable', 'hideLabel'}
 DATASOURCE_TAGS = {'loki', 'prometheus', 'mimir'}
 VARIABLE_REF = re.compile(r'^\$\{\w+\}$')
+# Grafana's built-in Dashboard data source, which reuses another panel's results and exists
+# on every install: plugin type "datasource", uid "-- Dashboard --" (v2 name), per
+# public/app/plugins/datasource/dashboard/plugin.json and isSharedDashboardQuery.
+DASHBOARD_DATASOURCE = ('datasource', '-- Dashboard --')
 TABLE_CELL_OVERRIDE = {
     'matcher': {'id': 'byRegexp', 'options': '.*'},
     'properties': [{'id': 'noValue', 'value': '-'}],
@@ -283,8 +287,10 @@ class Checker:
             else:
                 ids[pid] = name
 
-    def datasource(self, ref: object, where: str) -> None:
+    def datasource(self, ref: object, where: str, group: object = None) -> None:
         fix = 'reference the datasource variable: {"name": "${datasource}"}.'
+        if (group, ref) == (DASHBOARD_DATASOURCE[0], {'name': DASHBOARD_DATASOURCE[1]}):
+            return
         if ref is None:
             self.fail(where, 'datasource', 'the query has no datasource.', fix)
         elif isinstance(ref, str):
@@ -364,7 +370,7 @@ class Checker:
                 'fold it into the description.',
             )
         for i, query in enumerate(queries):
-            self.datasource(query.get('datasource'), f'{at} query {i}')
+            self.datasource(query.get('datasource'), f'{at} query {i}', query.get('group'))
 
         if not title.strip():
             self.fail(at, 'standard', 'the panel has no title.', 'give it a title in reader words.')
