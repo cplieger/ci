@@ -72,7 +72,7 @@ def base_settings(name: str, default_branch: str) -> dict:
         'license': None,
         'desc_present': True,
         'desc_len': 20,
-        'topics': ['a', 'b'],
+        'topics': ['a', 'b', 'c', 'd', 'e'],
         'secret_scanning': 'enabled',
         'secret_scanning_push_protection': 'enabled',
         'dependabot_security_updates': 'disabled',
@@ -121,9 +121,8 @@ def base_settings(name: str, default_branch: str) -> dict:
         'compose_example': None,
         'ci_wired': True,
         'renovate_preset': None,
-        'adopted': True,
         'webhook_readable': True,
-        'webhooks': [hook(['release'])],
+        'webhooks': [hook(['push'])],
     }
     s.update(audit.GOV_HARD)
     s.update(audit.GOV_SOFT)
@@ -1157,7 +1156,7 @@ class MainOnly(unittest.TestCase):
                 self.assertEqual(accepted, [])
 
     def test_main_repo_release_hook_required(self):
-        s = main_only('knell')
+        s = self.public_main('knell')
         s['webhooks'] = [hook(['registry_package'])]
         hard, _, _ = audit.compliance(s)
         self.assertTrue(any("lack 'release'" in h for h in hard), hard)
@@ -2830,6 +2829,84 @@ class FirstPartyMajors(unittest.TestCase):
         line = 'go.mod: requires github.com/cplieger/httpx/v4, latest is v5'
         self.assertIn(f'consumer  (priv)\n  [warn] {line}\n', out.getvalue())
         self.assertEqual(json.loads(out_path.read_text())['repos'][0]['warnings'], [line])
+
+
+def public_repo(name: str = 'httpx') -> dict:
+    s = main_only(name)
+    s['private'] = False
+    s['visibility'] = 'public'
+    s['license'] = audit.LICENSE_DEFAULT
+    return s
+
+
+class VisibilityDerivedRules(unittest.TestCase):
+    """Rules keyed on the private flag or INFRA, never on a private repo's name."""
+
+    def setUp(self):
+        self.saved_host = audit.WEBHOOK_HOST
+        audit.WEBHOOK_HOST = HOST
+
+    def tearDown(self):
+        audit.WEBHOOK_HOST = self.saved_host
+
+    def test_a_private_or_infra_repo_needs_a_push_hook(self):
+        for s in (main_only('notes'), public_repo('ci'), public_repo('.github')):
+            s['infra'] = s['name'] in audit.INFRA
+            with self.subTest(repo=s['name']):
+                s['webhooks'] = [hook(['release'])]
+                hard, _, _ = audit.compliance(s)
+                self.assertTrue(any("lack 'push'" in h for h in hard), hard)
+                s['webhooks'] = [hook(['push'])]
+                hard, _, _ = audit.compliance(s)
+                self.assertFalse(any('webhook' in h for h in hard), hard)
+
+    def test_a_public_app_repo_still_needs_a_release_hook(self):
+        s = public_repo('tool-catalog')
+        s['webhooks'] = [hook(['push'])]
+        hard, _, _ = audit.compliance(s)
+        self.assertTrue(any("lack 'release'" in h for h in hard), hard)
+
+    def test_ci_wiring_is_hard_only_for_a_public_non_infra_repo(self):
+        cases = [
+            (public_repo('httpx'), False, True),
+            (public_repo('httpx'), None, False),
+            (main_only('notes'), False, False),
+            (public_repo('ci'), False, False),
+        ]
+        for s, wired, want in cases:
+            s['infra'] = s['name'] in audit.INFRA
+            s['ci_wired'] = wired
+            with self.subTest(repo=s['name'], private=s['private'], wired=wired):
+                hard, _, _ = audit.compliance(s)
+                self.assertEqual('CI not wired to cplieger/ci' in hard, want, hard)
+
+    def test_a_public_repo_without_a_license_is_hard_whether_or_not_ci_is_wired(self):
+        for wired in (True, False):
+            s = public_repo()
+            s['license'] = None
+            s['ci_wired'] = wired
+            with self.subTest(wired=wired):
+                hard, warn, _ = audit.compliance(s)
+                self.assertIn('license missing', hard)
+                self.assertNotIn('license missing', warn)
+
+
+class Topics(unittest.TestCase):
+    def topic_warnings(self, s: dict, count: int) -> list:
+        s['topics'] = [f't{i}' for i in range(count)]
+        _, warn, _ = audit.compliance(s)
+        return [w for w in warn if 'topics' in w]
+
+    def test_a_public_repo_wants_five_to_ten_topics(self):
+        for count, want in ((0, True), (4, True), (5, False), (10, False), (11, True)):
+            with self.subTest(count=count):
+                got = self.topic_warnings(public_repo(), count)
+                self.assertEqual(got, [f'{count} topics (want 5-10)'] if want else [])
+
+    def test_a_private_repo_is_not_graded_on_topics(self):
+        for count in (0, 11):
+            with self.subTest(count=count):
+                self.assertEqual(self.topic_warnings(main_only(), count), [])
 
 
 if __name__ == '__main__':

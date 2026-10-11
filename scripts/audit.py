@@ -38,9 +38,6 @@ OWNER = 'cplieger'
 PRESET = 'github>cplieger/.github'
 REUSABLE = 'cplieger/ci/.github/workflows'
 INFRA = {'.github', 'ci'}  # they define the standard; CI-wiring check is N/A for them
-# Repos gating on a repo-local `validate` job instead of the reusable thin
-# caller; the CI-wiring check is N/A for them, as for INFRA.
-BESPOKE_CI = {'.kiro', 'homelab', 'AWS'}
 # The deploy orchestrator's host is private, so it comes from AUDIT_WEBHOOK_HOST;
 # unset, the webhook check is skipped so a local run does not fail every repo.
 WEBHOOK_HOST = os.environ.get('AUDIT_WEBHOOK_HOST', '').strip()
@@ -162,8 +159,6 @@ def renovate_config_findings(text, branch):
     return []
 
 
-# Non-releaseable repos whose deploy hook fires on push@main instead of release.
-PUSH_WEBHOOK_REPOS = {'.github', '.kiro', 'ci', 'homelab'}
 # Repos with no orchestrator relationship, so no deploy hook is graded; a
 # missing hook stays HARD everywhere else. A denylist, so a new repo that needs
 # a hook is flagged, and each entry says why it needs none: the one entry is a
@@ -194,7 +189,6 @@ HUB_MARKER_END = '<!-- hub-overview END -->'
 # {repo: {warning-prefix: reason}}: matching warnings are counted, not listed.
 # Every entry needs a reason; remove it once the deviation is fixed.
 ACCEPTED = {
-    'homelab': {},
     'animap': {
         # baseline.yaml runs on every pull request and fails one that adds an
         # entry to checks/collision-baseline.json; required, so a new
@@ -1050,7 +1044,6 @@ def collect(meta):
         s['renovate_preset'] = None  # N/A — nothing per-repo to grade
     if s['two_channel']:
         collect_renovate_config(name, branch, s)
-    s['adopted'] = bool(s['ci_wired']) or s['name'] in BESPOKE_CI
 
     # Every active hook pointing at the orchestrator, with the fields graded later;
     # webhook_readable tells "no hook" from "hooks unreadable" (a global skip).
@@ -1382,7 +1375,7 @@ def compliance(s):
     if not s['private']:
         want = LICENSE_OVERRIDES.get(s['name'], LICENSE_DEFAULT)
         if s['license'] is None:
-            (hard if s['adopted'] else warn).append('license missing')
+            hard.append('license missing')
         elif s['license'] != want:
             warn.append(f'license {s["license"]} (want {want})')
 
@@ -1576,8 +1569,8 @@ def compliance(s):
         if s['secret_scanning_push_protection'] != 'enabled':  # noqa: S105 — API state
             warn.append('secret scanning push protection off (want on)')
 
-    # Synced to adopted repos; CodeQL is public-only without GHAS.
-    if s['adopted'] and not s['infra'] and not s['private']:
+    # Synced to CI-wired repos; CodeQL is public-only without GHAS.
+    if s['ci_wired'] and not s['infra'] and not s['private']:
         if s['has_codeql'] is False:
             warn.append('codeql.yml missing')
         if s['has_security_scan'] is False:
@@ -1591,8 +1584,9 @@ def compliance(s):
             'the Docker Hub login)'
         )
 
-    # ci_wired None is an unread file (already an [error]); BESPOKE_CI is exempt.
-    if not s['infra'] and s['name'] not in BESPOKE_CI and s['adopted'] and s['ci_wired'] is False:
+    # ci_wired None is an unread file (already an [error]). A private repo may gate
+    # on a repo-local `validate` job instead of the reusable caller.
+    if not s['infra'] and not s['private'] and s['ci_wired'] is False:
         hard.append('CI not wired to cplieger/ci')
     if s['renovate_preset'] is False:
         hard.append(
@@ -1600,14 +1594,14 @@ def compliance(s):
             '(this file is what delivers Renovate to every repo)'
         )
 
-    # Public repos only; the house standard is 2-4 topics.
+    # Public repos only; the house standard is 5-10 topics.
     if not s['private']:
         if not s['desc_present']:
             warn.append('description empty')
         elif s['desc_len'] > 100:
             warn.append(f'description {s["desc_len"]} chars (>100; Docker Hub short-desc limit)')
-        if len(s['topics']) < 2:
-            warn.append(f'{len(s["topics"])} topics (want at least 2)')
+        if not 5 <= len(s['topics']) <= 10:
+            warn.append(f'{len(s["topics"])} topics (want 5-10)')
         # The counter never follows a /vN bump or a rename. Judged only when the
         # page named a package and the expected one is selectable (a new /vN path
         # is often never indexed); an unreadable page is skipped.
@@ -1693,7 +1687,9 @@ def compliance(s):
     # no orchestrator, and an unreadable token is a global skip in main().
     if WEBHOOK_HOST and s['webhook_readable'] and s['name'] not in NO_DEPLOY_HOOK:
         hooks = s.get('webhooks') or []
-        if s['name'] in PUSH_WEBHOOK_REPOS:
+        # release.yaml refuses a private caller and INFRA does not release
+        # through it, so their hooks fire on push@main.
+        if s['infra'] or s['private']:
             want_event = 'push'
         elif two_channel and s['name'] in release_channels.DEPLOYED_IMAGE_REPOS:
             want_event = REGISTRY_EVENT

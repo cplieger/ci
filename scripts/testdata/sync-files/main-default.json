@@ -344,7 +344,7 @@
    "repos/cplieger/a/pulls",
    "--input",
    "-",
-   "{\"title\": \"chore(sync): synced file(s) with cplieger/ci\", \"head\": \"repo-sync/ci/default\", \"base\": \"main\", \"body\": \"Synced from [cplieger/ci](https://github.com/cplieger/ci) by\\n`scripts/sync-files.py`. Files carrying a `Synced from cplieger/ci` header are\\noverwritten on every sync \\u2014 change the canonical copy in cplieger/ci\\ninstead. Auto-merges once this repo's required checks pass.\\n\\nFiles updated in this run:\\n- `.editorconfig`\"}"
+   "{\"title\": \"chore(sync): synced file(s) with cplieger/ci\", \"head\": \"repo-sync/ci/default\", \"base\": \"main\", \"body\": \"Synced from [cplieger/ci](https://github.com/cplieger/ci) by `scripts/sync-files.py`. Files carrying a `Synced from cplieger/ci` header are overwritten on every sync, so change the canonical copy in cplieger/ci instead. Auto-merges once this repo's required checks pass.\\n\\nFiles updated in this run:\\n- `.editorconfig`\"}"
   ],
   [
    "api",

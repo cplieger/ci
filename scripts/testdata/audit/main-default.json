@@ -36,7 +36,10 @@
           "squash_merge_commit_title": "COMMIT_OR_PR_TITLE",
           "topics": [
             "go",
-            "http"
+            "http",
+            "library",
+            "networking",
+            "self-hosted"
           ],
           "visibility": "public",
           "web_commit_signoff_required": false
@@ -192,7 +195,10 @@
           "squash_merge_commit_title": "PR_TITLE",
           "topics": [
             "go",
-            "http"
+            "http",
+            "library",
+            "networking",
+            "self-hosted"
           ],
           "visibility": "public",
           "web_commit_signoff_required": false
@@ -353,7 +359,10 @@
           "squash_merge_commit_title": "COMMIT_OR_PR_TITLE",
           "topics": [
             "go",
-            "http"
+            "http",
+            "library",
+            "networking",
+            "self-hosted"
           ],
           "visibility": "public",
           "web_commit_signoff_required": false
@@ -585,7 +594,10 @@
           "squash_merge_commit_title": "COMMIT_OR_PR_TITLE",
           "topics": [
             "go",
-            "http"
+            "http",
+            "library",
+            "networking",
+            "self-hosted"
           ],
           "visibility": "public",
           "web_commit_signoff_required": false
@@ -773,7 +785,10 @@
           "squash_merge_commit_title": "COMMIT_OR_PR_TITLE",
           "topics": [
             "go",
-            "http"
+            "http",
+            "library",
+            "networking",
+            "self-hosted"
           ],
           "visibility": "public",
           "web_commit_signoff_required": false
@@ -922,7 +937,10 @@
           "squash_merge_commit_title": "COMMIT_OR_PR_TITLE",
           "topics": [
             "go",
-            "http"
+            "http",
+            "library",
+            "networking",
+            "self-hosted"
           ],
           "visibility": "private",
           "web_commit_signoff_required": false
@@ -968,7 +986,7 @@
               "url": "https://deploy.example/hook"
             },
             "events": [
-              "release"
+              "push"
             ],
             "last_response": {
               "code": 200
@@ -1049,7 +1067,10 @@
           "squash_merge_commit_title": "COMMIT_OR_PR_TITLE",
           "topics": [
             "go",
-            "http"
+            "http",
+            "library",
+            "networking",
+            "self-hosted"
           ],
           "visibility": "public",
           "web_commit_signoff_required": false
