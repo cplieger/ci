@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Push the generated Docker Hub overview page to every image repo, out of band.
 
-The stable release writes each repo's Hub page; the page is a plain API field,
-so this script renders and PATCHes it directly when adopting the page or
-changing the renderer would otherwise wait on 22 release cadences. Dry-run by
-default: it reports what would change and only `--apply` writes. It renders
-from the local working tree, so run it on the tree you intend to publish.
+The stable release writes each repo's Hub page; this renders it from the local
+working tree and PATCHes it directly, so a renderer change need not wait on 22
+release cadences. It also sets the Hub short description from the GitHub About
+line (read with an authenticated `gh api`), cut to Hub's 100-byte limit and left
+alone when the line is empty or unreadable. Dry-run by default; `--apply` writes.
 Credentials: DOCKERHUB_TOKEN with DOCKERHUB_USERNAME, else the `docker login`
 entry in ~/.docker/config.json; the token is never printed.
 
@@ -32,6 +32,15 @@ RENDERER = (
     Path(__file__).resolve().parent.parent / 'actions/render-hub-overview/render-hub-overview.py'
 )
 TIMEOUT = 30
+# Hub answers 400 to a longer short description, so it is cut here the way the
+# release's peter-evans/dockerhub-description step cuts it: at 100 UTF-8 bytes.
+SHORT_DESCRIPTION_MAX_BYTES = 100
+
+
+def short_description(about: str) -> str:
+    """The About line cut to Hub's byte limit without splitting a character."""
+    raw = about.encode()[:SHORT_DESCRIPTION_MAX_BYTES]
+    return raw.decode('utf-8', 'ignore')
 
 
 def hub_credentials() -> tuple[str, str]:
@@ -90,27 +99,61 @@ def hub_login(user: str, secret: str) -> str:
         raise SystemExit(f'Docker Hub unreachable: {e.reason}') from e
 
 
-def hub_get_description(jwt: str, image: str) -> str | None:
-    """Current full_description, or None when the repo is unreadable."""
+def hub_get_repo(jwt: str, image: str) -> dict | None:
+    """The Hub repository record, or None when it is unreadable."""
     try:
-        return _hub_call(f'/repositories/{image}/', jwt=jwt).get('full_description') or ''
+        return _hub_call(f'/repositories/{image}/', jwt=jwt)
     except urllib.error.HTTPError as e:
         print(f'    read failed: HTTP {e.code}', file=sys.stderr)
         return None
 
 
-def hub_put_description(jwt: str, image: str, body: str) -> bool:
+def hub_patch(jwt: str, image: str, fields: dict[str, str]) -> bool:
     try:
-        _hub_call(
-            f'/repositories/{image}/',
-            jwt=jwt,
-            data={'full_description': body},
-            method='PATCH',
-        )
+        _hub_call(f'/repositories/{image}/', jwt=jwt, data=fields, method='PATCH')
         return True
     except urllib.error.HTTPError as e:
         print(f'    write failed: HTTP {e.code} {e.read()[:200]!r}', file=sys.stderr)
         return False
+
+
+def github_about(owner: str, repo: str) -> str | None:
+    """The repo's GitHub About line, '' when unset, None when unreadable."""
+    proc = subprocess.run(
+        ['gh', 'api', f'repos/{owner}/{repo}', '--jq', '.description // ""'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        lines = proc.stderr.strip().splitlines()
+        print(f'    About line unreadable: {lines[-1] if lines else "gh failed"}', file=sys.stderr)
+        return None
+    return proc.stdout.strip()
+
+
+def pending_fields(
+    page: str, about: str | None, current: dict[str, str | None]
+) -> tuple[dict[str, str], list[str]]:
+    """The Hub fields that differ from the rendered state, and notes on skipped ones."""
+    fields: dict[str, str] = {}
+    notes: list[str] = []
+    if (current.get('full_description') or '').strip() != page.strip():
+        fields['full_description'] = page
+    if about is None:
+        return fields, notes
+    if not about:
+        notes.append('GitHub About line is empty; short description left alone')
+        return fields, notes
+    short = short_description(about)
+    if short != about:
+        notes.append(
+            f'GitHub About line is {len(about.encode())} bytes, cut to '
+            f'{len(short.encode())} for the {SHORT_DESCRIPTION_MAX_BYTES}-byte limit'
+        )
+    if short != (current.get('description') or ''):
+        fields['description'] = short
+    return fields, notes
 
 
 def image_repos(workspace: Path, only: list[str]) -> list[Path]:
@@ -169,7 +212,7 @@ def main() -> int:
     jwt = hub_login(user, secret)
     print(f'authenticated to Docker Hub as {user}\n')
 
-    changed = same = skipped = failed = 0
+    changed = same = skipped = failed = unreadable = 0
     for repo in repos:
         image = f'{args.owner}/{repo.name}'
         print(f'{repo.name}')
@@ -177,19 +220,28 @@ def main() -> int:
         if page is None:
             skipped += 1
             continue
-        current = hub_get_description(jwt, image)
+        current = hub_get_repo(jwt, image)
         if current is None:
             failed += 1
             continue
-        if current.strip() == page.strip():
+        about = github_about(args.owner, repo.name)
+        unreadable += about is None
+        fields, notes = pending_fields(page, about, current)
+        for note in notes:
+            print(f'    {note}')
+        if not fields:
             print(f'    already current ({len(page.encode())} bytes)')
             same += 1
             continue
-        print(f'    {len(current.encode())} bytes on Hub -> {len(page.encode())} bytes rendered')
+        if 'full_description' in fields:
+            on_hub = len((current.get('full_description') or '').encode())
+            print(f'    {on_hub} bytes on Hub -> {len(page.encode())} bytes rendered')
+        if 'description' in fields:
+            print(f'    short description -> {fields["description"]!r}')
         if not args.apply:
             changed += 1
             continue
-        if hub_put_description(jwt, image, page):
+        if hub_patch(jwt, image, fields):
             print('    pushed')
             changed += 1
         else:
@@ -198,10 +250,10 @@ def main() -> int:
     verb = 'pushed' if args.apply else 'would change'
     print(
         f'\n{verb}: {changed}   already current: {same}   '
-        f'render-skipped: {skipped}   failed: {failed}'
+        f'render-skipped: {skipped}   failed: {failed}   About unreadable: {unreadable}'
     )
     if not args.apply and changed:
-        print('dry run — re-run with --apply to write')
+        print('dry run, re-run with --apply to write')
     return 1 if failed else 0
 
 

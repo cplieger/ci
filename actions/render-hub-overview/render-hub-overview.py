@@ -1,30 +1,19 @@
 #!/usr/bin/env python3
 """Render the Docker Hub overview page for an image repo.
 
-Docker Hub caps the full description at 25,000 bytes server-side and the
-publish action truncates anything larger, silently cutting the document's
-end — so mirroring a full README put every README under a budget unrelated
-to what a README is for.
-
-This builds a SHORT page instead (what the image is, how to pull and run
-it, links to the real docs), bounded by construction since its two
-variable-length inputs — README.md's marked summary region and
-compose.yaml — don't grow when the README does. Nothing is committed:
-docker-release.yaml runs this at publish time and feeds the output
-straight to peter-evans/dockerhub-description, so there's no second
-document to keep current.
-
-Relative links are rewritten to absolute GitHub URLs here rather than via
-the action's `enable-url-completion`, which would resolve every anchor
-against README.md instead of this generated page.
+Docker Hub caps a full description at 25,000 bytes and the publish action
+truncates anything longer, so the page is built short rather than mirroring
+the README: the README's marked summary region, the pull command,
+compose.yaml, links to the docs on GitHub, and the License section. Its only
+variable inputs are the region and the compose file, so its size does not
+follow the README's.
 
 Usage:
     render-hub-overview.py --repo-root . --owner cplieger --repo docker-radvd \
         --image cplieger/docker-radvd -o hub-overview.md
 
-Exits 1 when the README carries no summary markers, so a release publishes
-the previous page rather than a truncated one; audit.py checks the markers
-for every image repo.
+Exits 1 when the README carries no summary markers, so a release keeps the
+previous Hub page; audit.py checks the markers for every image repo.
 """
 
 from __future__ import annotations
@@ -141,7 +130,8 @@ def page_title(page: Path) -> str:
 def doc_links(root: Path, owner: str, repo: str, ref: str) -> list[str]:
     """Build the documentation link list from the files the repo actually has."""
     blob = f'https://github.com/{owner}/{repo}/blob/{ref}'
-    links = [f'**[Full documentation]({blob}/README.md)** — configuration, behavior, security']
+    readme = f'[Full documentation]({blob}/README.md)'
+    links = [f'{readme}: setup, settings, troubleshooting and security']
     docs = root / 'docs'
     for page in sorted(docs.glob('*.md')) if docs.is_dir() else []:
         links.append(f'[{page_title(page)}]({blob}/docs/{page.name})')

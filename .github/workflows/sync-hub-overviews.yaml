@@ -92,6 +92,8 @@ jobs:
           # while that happens.
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          # Read-only: gh api reads each repo's About line for the short description.
+          GH_TOKEN: ${{ github.token }}
           APPLY: ${{ github.event.inputs.apply }}
         run: |
           set -euo pipefail
