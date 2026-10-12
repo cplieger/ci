@@ -4,8 +4,9 @@
 #            GITHUB_EVENT_NAME, in the checkout of HEAD; prints rebuild_only=true|false and compare_tag=
 #            (the release the rebuild is compared with, empty unless rebuild_only is
 #            true). A read that fails prints rebuild_only=false with a warning.
-#   compare <new> <attested> <scanned>
-#            env COMPARE_TAG PREV_REF UNREADABLE SBOM_FROM CI_TOOLS GITHUB_OUTPUT
+#   compare <new> <compared>
+#            (the SBOMs of the rebuilt image and of the image at PREV_REF)
+#            env COMPARE_TAG PREV_REF UNREADABLE CI_TOOLS GITHUB_OUTPUT
 #            GITHUB_STEP_SUMMARY; writes skip=true only when the package sets are
 #            equal, skip=false for any other outcome.
 # Both exit 2 on a usage error or an unset CI_TOOLS, scope also on a CHANNEL other than
@@ -13,7 +14,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: rebuild-gate.sh scope | compare NEW ATTESTED SCANNED" >&2
+  echo "usage: rebuild-gate.sh scope | compare NEW COMPARED" >&2
   exit 2
 }
 
@@ -54,8 +55,8 @@ scope() {
 
   [ "${GITHUB_EVENT_NAME:-}" = push ] || result false
   if [ "$CHANNEL" = stable ]; then
-    # The notes diff against this same tag, so a skip is a release whose System
-    # packages block would be empty.
+    # The notes diff against this same tag, so the rebuild is compared with the
+    # release its notes would follow.
     tag=$(bash "$CI_TOOLS/render-notes.sh" --site docker --version "${VERSION:-}" --print-previous) \
       || publishes warning "The release before ${VERSION:-} could not be resolved, so this release publishes as usual."
   else
@@ -89,7 +90,7 @@ scope() {
   fi
   [ -n "$(sed -n 's/^rebuild_request=//p' <<<"$ps_out")" ] || result false
 
-  # The attested SBOM inventories the amd64 image alone.
+  # The candidate is built, and the compared image scanned, for linux/amd64 alone.
   IFS=',' read -ra platforms <<<"${PLATFORMS:-}"
   for p in "${platforms[@]}"; do
     if [ "$(xargs <<<"$p")" = linux/amd64 ]; then
@@ -117,13 +118,12 @@ decide() { # <true|false> <annotation>
 compare() {
   local new prev count noun=packages
   need_tools
-  [ "$#" -eq 3 ] || usage
+  [ "$#" -eq 2 ] || usage
   new=$1 prev=$2
-  [ "${SBOM_FROM:-image}" != path ] || prev=$3
   [ -n "${PREV_REF:-}" ] \
     || decide false "::warning::Publishing this rebuild, because ${UNREADABLE:-the SBOM of ${COMPARE_TAG:-} could not be read}."
   [ -s "$prev" ] \
-    || decide false "::warning::Publishing this rebuild, because no image SBOM of ${COMPARE_TAG:-} could be generated."
+    || decide false "::warning::Publishing this rebuild, because the image of ${COMPARE_TAG:-} could not be scanned."
   [ -s "$new" ] || decide false "::warning::Publishing this rebuild, because the rebuilt image's SBOM could not be generated."
   # A count that is not a number would fail the -gt test below, which reads as equal sets.
   if ! count=$(bash "$CI_TOOLS/render-notes.sh" --sbom-changes --sbom-prev "$prev" --sbom-new "$new") \

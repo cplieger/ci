@@ -62,7 +62,7 @@ wanted = {
         "Scope a rebuild-only release": "scope.sh",
     },
     "rebuild-gate": {
-        "Read the compared release's SBOM": "gateprev.sh",
+        "Verify the compared release's attestation": "gateprev.sh",
         "Compare the package sets": "gatecompare.sh",
     },
     "finalize": {
@@ -103,7 +103,8 @@ gates = {
     "prepare-cosign-uses": next(s for s in jobs["prepare"]["steps"] if s.get("name") == "Install Cosign")["uses"],
     "build-if": " ".join(str(jobs["build"]["if"]).split()),
     "prevsbom-if": step_if("finalize", "Fetch the previous release's SBOM"),
-    "prevsbom-order": fin.index("Generate SBOM (from path)") < fin.index("Fetch the previous release's SBOM") < fin.index("Generate release notes"),
+    "prevsbom-order": max(i for i, n in enumerate(fin) if n.startswith("Generate SBOM"))
+    < fin.index("Fetch the previous release's SBOM") < fin.index("Generate release notes"),
     "provenance-if": step_if("finalize", "Verify the promoted build's signature and SBOM"),
     "before-provenance": fin[: fin.index("Verify the promoted build's signature and SBOM")],
     "first-write": fin[fin.index("Verify the promoted build's signature and SBOM") + 1],
@@ -226,6 +227,17 @@ for publish, skip in (("true", "true"), ("true", ""), ("true", "false"), ("false
         str(dgx(x, o)).lower() for x in (jobs["finalize"]["env"]["PUBLISH"], jobs["build"]["if"], jobs["verify-publish"]["if"])
     )
 gates["publish-cases"] = publish_cases
+gates["sbom-sources"] = sorted(
+    "image" if (s.get("with") or {}).get("image") else f"{s.get('name')}: not an image"
+    for s in jobs["finalize"]["steps"] if str(s.get("uses", "")).startswith("anchore/sbom-action@")
+)
+gates["sbom-knobs"] = sorted(
+    [f"docker-release input {i}" for i in wf_inputs if "sbom" in i]
+    + [f"release.yaml detect output {k}" for k in rjobs["detect"]["outputs"] if "sbom" in k]
+    + [f"release.yaml docker with {k}" for k in rjobs["docker"]["with"] if "sbom" in k]
+)
+policy = next(s for s in rjobs["detect"]["steps"] if s.get("id") == "policy")
+open(f"{out}/policy.sh", "w").write(policy["run"])
 # finalize's condition per job outcome, and whether the run was cancelled.
 def runs_when(expr, results, cancelled):
     e = " ".join(str(expr).split())
@@ -338,6 +350,16 @@ chk "D-P8 a stable run that publishes nothing re-tags no promoted digest" "$(gat
 chk "D-P9 the inputs carry the kind line and the security merges, no promotion note" \
   "$(gate '.inputs | map(select(test("note|security"))) | join(" ")')" "release-kind-note security-shas"
 chk "D-P10 the workflow says nothing of a soak" "$(gate '.soak')" "0"
+policy_keys() { # <repo name> <spdx id> -> the policy step's output keys
+  : >"$WORK/policy-out"
+  (cd "$WORK" && REPO_NAME="$1" REPO_SPDX_ID="$2" GITHUB_OUTPUT="$WORK/policy-out" bash "$WORK/policy.sh") >/dev/null
+  sed 's/=.*//' "$WORK/policy-out" | tr '\n' ' '
+}
+chk "D-P11 every release SBOM scans the published image" "$(gate '."sbom-sources" | join(",")')" "image"
+chk "D-P11 and no input, output or policy chooses another source" "$(gate '."sbom-knobs" | join(",")')" ""
+chk "D-P11 the policy hands every image repository the same keys" \
+  "$(policy_keys marotte AGPL-3.0)/$(policy_keys web-terminal-kiro MPL-2.0)/$(policy_keys docker-age Apache-2.0)" \
+  "registries platforms syft_config image_licenses /registries platforms syft_config image_licenses /registries platforms syft_config image_licenses "
 
 # ── Stub curl: the anonymous GHCR token and manifest HEADs ───────────────────
 # BUILT lists the commits that have a `sha-<commit>` tag on the registry;
@@ -1113,9 +1135,10 @@ usage_rc() { # <CI_TOOLS, empty for unset> <subcommand args...> -> status|stdout
     "$(grep '^::error::' "$WORK/usage.err" || true)"
 }
 chk "D-RG27 scope without CI_TOOLS is a usage error" "$(CHANNEL=dev usage_rc "" scope)" "2|0|0|::error::rebuild-gate: CI_TOOLS is required"
-chk "D-RG27 and compare" "$(usage_rc "" compare a b c)" "2|0|0|::error::rebuild-gate: CI_TOOLS is required"
+chk "D-RG27 and compare" "$(usage_rc "" compare a b)" "2|0|0|::error::rebuild-gate: CI_TOOLS is required"
 chk "D-RG27 scope refuses a channel that is neither dev nor stable" "$(CHANNEL=beta usage_rc "$ROOT/scripts" scope | cut -d'|' -f1-3)" "2|0|0"
-chk "D-RG27 compare refuses two arguments, deciding nothing" "$(usage_rc "$ROOT/scripts" compare a b | cut -d'|' -f1-3)" "2|0|0"
+chk "D-RG27 compare refuses one argument or three, deciding nothing" \
+  "$(usage_rc "$ROOT/scripts" compare a | cut -d'|' -f1-3)/$(usage_rc "$ROOT/scripts" compare a b c | cut -d'|' -f1-3)" "2|0|0/2|0|0"
 
 # The extracted scope step, end to end.
 (cd "$G_DEV" && CHANNEL=dev VERSION=v1.3.0 PLATFORMS=linux/amd64,linux/arm64 GO_LANES_JSON='[]' GITHUB_EVENT_NAME=push \
@@ -1134,13 +1157,14 @@ gstep() { jq -c --arg n "$1" ".gate.steps[] | select(.name == \$n) | $2" "$WORK/
 chk "D-RG18 the gate runs for a rebuild-only range, after prepare, and hands on its compare step's skip" \
   "$(gate '.gate | "\(.if)|\(.needs)|\(.outputs.skip)"')" \
   "\${{ needs.prepare.outputs.rebuild_only == 'true' }}|prepare|\${{ steps.compare.outputs.skip }}"
-chk "D-RG18 the compare step reads the read step's answer and fails the gate on a usage error" \
+chk "D-RG18 the compare step reads the attestation step's answer and fails the gate on a usage error" \
   "$(gstep "Compare the package sets" '[.env, ."continue-on-error"]')" \
-  '[{"CI_TOOLS":"${{ runner.temp }}/cplieger-ci/scripts","PREV_REF":"${{ steps.prev.outputs.ref }}","UNREADABLE":"${{ steps.prev.outputs.unreadable }}","SBOM_FROM":"${{ inputs.sbom-from }}","COMPARE_TAG":"${{ needs.prepare.outputs.compare_tag }}"},null]'
-chk "D-RG18 the read step gets the compared tag and the signing window's inputs" "$(tr '\n' ' ' <"$WORK/gateprev.sh.envmap")" \
+  '[{"CI_TOOLS":"${{ runner.temp }}/cplieger-ci/scripts","PREV_REF":"${{ steps.prev.outputs.ref }}","UNREADABLE":"${{ steps.prev.outputs.unreadable }}","COMPARE_TAG":"${{ needs.prepare.outputs.compare_tag }}"},null]'
+chk "D-RG18 the attestation step gets the compared tag and the signing window's inputs" "$(tr '\n' ' ' <"$WORK/gateprev.sh.envmap")" \
   'CI_TOOLS=${{ runner.temp }}/cplieger-ci/scripts COMPARE_TAG=${{ needs.prepare.outputs.compare_tag }} EXCLUDE_RE=${{ inputs.exclude-re }} SUBPACKAGES_JSON=${{ inputs.subpackages }} '
-chk "D-RG18 a path-mode release also scans the compared image, once its attestation verified" \
-  "$(gstep "Scan the compared release's image" '.if')" "\"\${{ inputs.sbom-from == 'path' && steps.prev.outputs.ref != '' }}\""
+chk "D-RG18 the compared image is scanned by the digest its attestation verified, and a failed scan is the compare step's to judge" \
+  "$(gstep "Scan the compared release's image" '[.if, ."continue-on-error", .with.image, .with."output-file"]')" \
+  "[\"\${{ steps.prev.outputs.ref != '' }}\",true,\"registry:\${{ steps.prev.outputs.ref }}\",\"\${{ runner.temp }}/sbom-scanned.spdx.json\"]"
 chk "D-RG18 the candidate is scanned from the daemon under the name it was built at" \
   "$(gstep "Generate the candidate's SBOM" '.with.image')|$(gstep "Build the candidate image" '.with.tags')" \
   '"docker:rebuild-gate.invalid/candidate:latest"|"rebuild-gate.invalid/candidate:latest"'
@@ -1195,41 +1219,54 @@ gate_sbom "$WORK/g-new.json" sha256:new busybox@1.37.0-r30 musl@1.2.5-r10
 gate_sbom "$WORK/g-same.json" sha256:old busybox@1.37.0-r30 musl@1.2.5-r10
 gate_sbom "$WORK/g-one.json" sha256:old busybox@1.37.0-r29 musl@1.2.5-r10
 gate_sbom "$WORK/g-two.json" sha256:old busybox@1.37.0-r29 musl@1.2.5-r9
-compare_with() { # <new> <attested> <scanned> -> the skip lines written; env PREV_REF UNREADABLE SBOM_FROM
+compare_with() { # <new> <compared> -> the skip lines written; env PREV_REF UNREADABLE
   : >"$WORK/gate-out"
   : >"$WORK/gate-summary"
   (CI_TOOLS="$ROOT/scripts" GITHUB_OUTPUT="$WORK/gate-out" GITHUB_STEP_SUMMARY="$WORK/gate-summary" COMPARE_TAG=v1.2.0 \
-    PREV_REF="${PREV_REF-$G_REF}" UNREADABLE="${UNREADABLE:-}" SBOM_FROM="${SBOM_FROM:-image}" \
-    bash "$ROOT/scripts/rebuild-gate.sh" compare "$1" "$2" "$3") >"$WORK/gate.log" 2>&1 || echo "EXIT=$?" >>"$WORK/gate.log"
+    PREV_REF="${PREV_REF-$G_REF}" UNREADABLE="${UNREADABLE:-}" \
+    bash "$ROOT/scripts/rebuild-gate.sh" compare "$1" "$2") >"$WORK/gate.log" 2>&1 || echo "EXIT=$?" >>"$WORK/gate.log"
   sed -n 's/^skip=//p' "$WORK/gate-out" | tr '\n' ' '
 }
 g_said() { grep -E '^(::(notice|warning|error)::|EXIT=)' "$WORK/gate.log" | tr '\n' '~' || true; }
 g_summary() { wc -c <"$WORK/gate-summary" | tr -d ' '; }
-chk "D-RG10 an unchanged package set skips the publish" "$(compare_with "$WORK/g-new.json" "$WORK/g-same.json" "$WORK/none")|$(g_said)" \
+chk "D-RG10 an unchanged package set skips the publish" "$(compare_with "$WORK/g-new.json" "$WORK/g-same.json")|$(g_said)" \
   "true |::notice::No package changed since v1.2.0, so this rebuild publishes nothing.~"
 chk_has "D-RG10 and the summary names the compared release" "$(cat "$WORK/gate-summary")" \
   "Rebuild skipped: no package changed since \`v1.2.0\` (\`${G_REF}\`), so the image built from source for the comparison is discarded and nothing is published."
-chk "D-RG11 one changed package publishes" "$(compare_with "$WORK/g-new.json" "$WORK/g-one.json" "$WORK/none")|$(g_said)|$(g_summary)" \
+chk "D-RG11 one changed package publishes" "$(compare_with "$WORK/g-new.json" "$WORK/g-one.json")|$(g_said)|$(g_summary)" \
   "false |::notice::1 package changed since v1.2.0, so this rebuild is published.~|0"
-chk "D-RG11 two say so in the plural" "$(compare_with "$WORK/g-new.json" "$WORK/g-two.json" "$WORK/none")|$(g_said)" \
+chk "D-RG11 two say so in the plural" "$(compare_with "$WORK/g-new.json" "$WORK/g-two.json")|$(g_said)" \
   "false |::notice::2 packages changed since v1.2.0, so this rebuild is published.~"
 chk "D-RG12 an unreadable compared SBOM publishes, naming why" \
-  "$(PREV_REF='' UNREADABLE='ghcr.io/owner/app:v1.2.0 is not readable' compare_with "$WORK/g-new.json" "$WORK/g-same.json" "$WORK/none")|$(g_said)|$(g_summary)" \
+  "$(PREV_REF='' UNREADABLE='ghcr.io/owner/app:v1.2.0 is not readable' compare_with "$WORK/g-new.json" "$WORK/g-same.json")|$(g_said)|$(g_summary)" \
   "false |::warning::Publishing this rebuild, because ghcr.io/owner/app:v1.2.0 is not readable.~|0"
-chk "D-RG12 with a reason even when none was handed on" "$(PREV_REF='' compare_with "$WORK/g-new.json" "$WORK/g-same.json" "$WORK/none")|$(g_said)" \
+chk "D-RG12 with a reason even when none was handed on" "$(PREV_REF='' compare_with "$WORK/g-new.json" "$WORK/g-same.json")|$(g_said)" \
   "false |::warning::Publishing this rebuild, because the SBOM of v1.2.0 could not be read.~"
-chk "D-RG13 a path-mode release compares the scanned image, not its binary's attested SBOM" \
-  "$(SBOM_FROM=path compare_with "$WORK/g-new.json" "$WORK/g-same.json" "$WORK/g-one.json")/$(SBOM_FROM=path compare_with "$WORK/g-new.json" "$WORK/g-one.json" "$WORK/g-same.json")" \
-  "false /true "
-chk "D-RG14 no candidate SBOM publishes" "$(compare_with "$WORK/none" "$WORK/g-same.json" "$WORK/none")|$(g_said)|$(g_summary)" \
+chk "D-RG14 no candidate SBOM publishes" "$(compare_with "$WORK/none" "$WORK/g-same.json")|$(g_said)|$(g_summary)" \
   "false |::warning::Publishing this rebuild, because the rebuilt image's SBOM could not be generated.~|0"
-chk "D-RG14 nor does a missing compared SBOM" "$(compare_with "$WORK/g-new.json" "$WORK/none" "$WORK/none")|$(g_said)|$(g_summary)" \
-  "false |::warning::Publishing this rebuild, because no image SBOM of v1.2.0 could be generated.~|0"
-chk "D-RG14 nor a path-mode scan that wrote nothing" "$(SBOM_FROM=path compare_with "$WORK/g-new.json" "$WORK/g-same.json" "$WORK/none")|$(g_said)|$(g_summary)" \
-  "false |::warning::Publishing this rebuild, because no image SBOM of v1.2.0 could be generated.~|0"
+chk "D-RG14 nor does a compared image that could not be scanned" "$(compare_with "$WORK/g-new.json" "$WORK/none")|$(g_said)|$(g_summary)" \
+  "false |::warning::Publishing this rebuild, because the image of v1.2.0 could not be scanned.~|0"
 echo '{}' >"$WORK/g-bad.json"
-chk "D-RG14 nor two SBOMs that cannot be compared" "$(compare_with "$WORK/g-new.json" "$WORK/g-bad.json" "$WORK/none")|$(g_said)|$(g_summary)" \
+chk "D-RG14 nor two SBOMs that cannot be compared" "$(compare_with "$WORK/g-new.json" "$WORK/g-bad.json")|$(g_said)|$(g_summary)" \
   "false |::warning::Publishing this rebuild, because its SBOM and that of v1.2.0 could not be compared.~|0"
+# The extracted compare step, beside an attested SBOM that inventories less than
+# a scan of the same image does (a binary-only one).
+gate_sbom "$WORK/g-binary.json" sha256:old app-module@v1.0.0
+gate_step() { # <scan of the compared image, or none> -> the skip lines written; the attestation is g-binary.json
+  rm -f "$WORK"/sbom-*.spdx.json
+  cp "$WORK/g-new.json" "$WORK/sbom-new.spdx.json"
+  cp "$WORK/g-binary.json" "$WORK/sbom-attested.spdx.json"
+  [ "$1" = none ] || cp "$1" "$WORK/sbom-scanned.spdx.json"
+  (PREV_REF=$G_REF UNREADABLE='' COMPARE_TAG=v1.2.0 run_step gatecompare.sh) >"$WORK/gate.log"
+  rm -f "$WORK"/sbom-*.spdx.json
+  sed -n 's/^skip=//p' "$WORK/out" | tr '\n' ' '
+}
+chk "D-RG13 an unchanged image skips however its attested SBOM was made" "$(gate_step "$WORK/g-same.json")|$(g_said)" \
+  "true |::notice::No package changed since v1.2.0, so this rebuild publishes nothing.~"
+chk "D-RG13 one changed package in the compared image's scan publishes" "$(gate_step "$WORK/g-one.json")|$(g_said)" \
+  "false |::notice::1 package changed since v1.2.0, so this rebuild is published.~"
+chk "D-RG13 a compared image that could not be pulled publishes" "$(gate_step none)|$(g_said)" \
+  "false |::warning::Publishing this rebuild, because the image of v1.2.0 could not be scanned.~"
 rm -f "$WORK"/g-*.json
 
 # ── Release-kind line ────────────────────────────────────────────────────────
@@ -1368,8 +1405,8 @@ chk "D-Q3 a verified bundle attestation yields the previous SPDX document" "$(jq
 chk_has "D-Q3 verified against this workflow's identity, by digest" "$(head -n1 "$COSIGN_LOG")" \
   "verify-attestation --type spdxjson --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp ^https://github\.com/cplieger/ci/\.github/workflows/docker-release\.yaml@ --certificate-github-workflow-repository owner/app --certificate-github-workflow-sha $C1 ghcr.io/owner/app@${PREV_DIGEST}"
 chk "D-Q3 read from what verification printed, with no separate download" "$(cut -d' ' -f1 "$COSIGN_LOG" | tr '\n' ' ')" "verify-attestation "
-# The rebuild gate reads the compared release's SBOM through the same owner,
-# and never fails on it: an unreadable one publishes the rebuild.
+# The rebuild gate verifies the compared release's attestation through the
+# same owner, and never fails on it: an unverifiable one publishes the rebuild.
 gate_prev() { # env-prefixed COMPARE_TAG: runs the gate's step in NOTESREPO; prints its GITHUB_OUTPUT, or EXIT=n
   : >"$WORK/gate-out"
   rm -f "$WORK/sbom-attested.spdx.json"

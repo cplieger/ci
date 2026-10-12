@@ -76,10 +76,6 @@ on:
           SYFT_SELECT_CATALOGERS env below and needs no per-repo config.
         type: string
         default: ""
-      sbom-from:
-        description: "'image' scans the pushed image; 'path' extracts binary to /tmp/sbom-src first."
-        type: string
-        default: "image"
       release-kind-note:
         description: >-
           The sentence saying how this stable release was made (release.yaml's
@@ -517,7 +513,7 @@ jobs:
           upload-release-assets: false
           config: ${{ inputs.syft-config }}
 
-      - name: Read the compared release's SBOM
+      - name: Verify the compared release's attestation
         id: prev
         env:
           CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
@@ -532,11 +528,11 @@ jobs:
             echo "unreadable=${ref}" >> "$GITHUB_OUTPUT"
           fi
 
-      # A path-mode release attests its binary's SBOM alone, which holds no OS
-      # package, so both sides are image scans and the attestation read above
-      # only proves the digest is this repository's.
+      # Both sides are scans by this run's syft, so an attestation made by an
+      # older syft or from another source never reads as a package change. The
+      # attestation verified above only proves the digest is this repository's.
       - name: Scan the compared release's image
-        if: ${{ inputs.sbom-from == 'path' && steps.prev.outputs.ref != '' }}
+        if: ${{ steps.prev.outputs.ref != '' }}
         continue-on-error: true
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -553,12 +549,10 @@ jobs:
           CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           PREV_REF: ${{ steps.prev.outputs.ref }}
           UNREADABLE: ${{ steps.prev.outputs.unreadable }}
-          SBOM_FROM: ${{ inputs.sbom-from }}
           COMPARE_TAG: ${{ needs.prepare.outputs.compare_tag }}
         run: |
           set -euo pipefail
-          bash "$CI_TOOLS/rebuild-gate.sh" compare "$RUNNER_TEMP/sbom-new.spdx.json" \
-            "$RUNNER_TEMP/sbom-attested.spdx.json" "$RUNNER_TEMP/sbom-scanned.spdx.json"
+          bash "$CI_TOOLS/rebuild-gate.sh" compare "$RUNNER_TEMP/sbom-new.spdx.json" "$RUNNER_TEMP/sbom-scanned.spdx.json"
 
   # Builds only when something is published, no dev digest is promoted in its
   # place, and the rebuild gate, when it ran, did not find the package set
@@ -922,35 +916,8 @@ jobs:
           sarif_file: 'trivy-image.sarif'
           category: 'trivy-image-build'
 
-      - name: Extract binary for SBOM (path mode)
-        if: ${{ env.PUBLISH == 'true' && inputs.sbom-from == 'path' }}
-        env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
-          # Via env, never inline ${{ }} in the script body (template injection).
-          BIN_NAME: ${{ inputs.image-name }}
-        run: |
-          set -euo pipefail
-          # path-mode SBOM: pull the multi-arch image (Docker resolves to the
-          # finalize-job's host arch, amd64), extract /app/<image-name>, then
-          # syft scans the binary directly. Used by Go apps where syft on the
-          # image misses the static binary's deps.
-          docker pull "$IMAGE_REF"
-          CID=$(docker create "$IMAGE_REF")
-          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
-          mkdir -p /tmp/sbom-src
-          docker cp "$CID:/app/${BIN_NAME}" "/tmp/sbom-src/${BIN_NAME}"
-
       - name: Generate SBOM (from image)
-        if: ${{ env.PUBLISH == 'true' && inputs.sbom-from == 'image' && inputs.syft-config == '' }}
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
-          format: spdx-json
-          output-file: sbom.spdx.json
-          upload-release-assets: false
-
-      - name: Generate SBOM (from image, with syft config)
-        if: ${{ env.PUBLISH == 'true' && inputs.sbom-from == 'image' && inputs.syft-config != '' }}
+        if: ${{ env.PUBLISH == 'true' }}
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
@@ -958,15 +925,6 @@ jobs:
           output-file: sbom.spdx.json
           upload-release-assets: false
           config: ${{ inputs.syft-config }}
-
-      - name: Generate SBOM (from path)
-        if: ${{ env.PUBLISH == 'true' && inputs.sbom-from == 'path' }}
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          path: /tmp/sbom-src
-          format: spdx-json
-          output-file: sbom.spdx.json
-          upload-release-assets: false
 
       # A shipped-package-versions table in the job summary on every publish.
       # Informational and best-effort (a summary hiccup never fails a release).
