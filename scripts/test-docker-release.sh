@@ -532,6 +532,9 @@ chk "D-W5 docs on top of a rebuilt revert inherit the revert's digest" "${r#*|}"
 r=$(promote_at "$C_DOCS3" "$EXCLUDE_RE_FULL" "$C_REVERT")
 chk "D-W6 an empty commit since (a forced rebuild) builds from source" "${r%|*}" ""
 chk_has "D-W6 the log names the empty commit" "$(cat "$WORK/promote.log")" "changes no file"
+C_SYNC=$(commit "chore(sync): synced file(s) with cplieger/ci (#9)")
+r=$(promote_at "$C_SYNC" "$EXCLUDE_RE_FULL" "$C_DOCS3")
+chk "D-W6 an empty machine commit inherits its parent's digest" "${r#*|}|$(out promote_via)" "$C_DOCS3|ancestor"
 r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL")
 chk "D-W7 no dev build anywhere builds from source" "${r%|*}|$(out promote_via)" "|none"
 chk_has "D-W7 summary says so" "$(cat "$WORK/summary")" "No dev build could be reused"

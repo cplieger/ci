@@ -117,8 +117,17 @@ put package.json '{"name":"tools","devDependencies":{"a":"2"},"dependencies":{"b
 D3=$(commit "fix(deps): bump b")
 chk "S3 a docker repo's package.json is never a published manifest" "$(release S3 stable "$D2" "$D2" "$D3")" "false|[]|[]"
 chk_has "S3 and the log says so" "$(cat "$WORK/log")" "package.json is not a published manifest"
-D4=$(commit "fix: rebuild for base packages")
-chk "S4 an empty commit is a root change" "$(release S4 stable "$D3" "$D3" "$D4")" "true|[]|[]"
+REBUILD_SUBJECT=$(sed -n "s/^REBUILD_SUBJECT='\(.*\)'\$/\1/p" "$TOOLS/path-significance.sh")
+chk "S4 the rebuild subject is rebuild-stale.sh's" \
+  "$(grep -c -F -- "-f message='${REBUILD_SUBJECT}'" "$TOOLS/rebuild-stale.sh")|$(grep -c -F -- "-f title='${REBUILD_SUBJECT}'" "$TOOLS/rebuild-stale.sh")" "1|1"
+chk "S4 and promote-digest.sh's" "$(grep -cxF "REBUILD_SUBJECT='${REBUILD_SUBJECT}'" "$TOOLS/promote-digest.sh")" "1"
+D3S=$(commit "chore(sync): synced file(s) with cplieger/ci (#40)")
+chk "S4 an empty machine commit is no root change" "$(release S4s stable "$D3" "$D3" "$D3S")" "false|[]|[]"
+chk_has "S4 and says why" "$(cat "$WORK/log")" "commit $D3S changes no file and is not a rebuild request, so it is not significant"
+D3R=$(commit "$REBUILD_SUBJECT")
+chk "S4 rebuild-stale.sh's empty commit is a root change" "$(release S4u stable "$D3S" "$D3S" "$D3R")" "true|[]|[]"
+D4=$(commit "${REBUILD_SUBJECT} (#41)")
+chk "S4 so is its squash" "$(release S4 stable "$D3R" "$D3R" "$D4")" "true|[]|[]"
 chk_has "S4 the summary names it" "$(cat "$WORK/summary")" "(commit $D4 changes no file and counts as a root change)"
 chk "S5 a dispatch (no before) counts every tracked file" "$(release S5 stable "" "$D3" "$D4")" "true|[]|[]"
 chk_has "S5 and says so" "$(cat "$WORK/log")" "No before SHA"
@@ -185,6 +194,8 @@ chk "S14 a dependencies change publishes" "$(release S14 stable "$T2" "$T2" "$T3
 chk "S14 a dispatch keeps the manifest significant" "$(release S14d stable "" "" "$T3")" "true|[]|[]"
 chk "S15 MODE=paths applies the same refinement" "$(paths "$T0" "$T1")|$(paths "$T2" "$T3")" \
   'false|[]|[]|[]|true|[]|[]|["package.json"]'
+T4=$(commit "${REBUILD_SUBJECT} (#7)")
+chk "S15e a library ignores even a rebuild request, having no image" "$(release S15e stable "$T3" "$T3" "$T4")" "false|[]|[]"
 
 # ── A Go root with a TS subpackage and two nested lanes ──────────────────────
 export REPO_TYPE=go SUBPACKAGES_JSON='["web"]' GO_LANES_JSON='["yamlenv","tools/gen"]'
@@ -244,6 +255,10 @@ git mv yamlenv/y.go yamlenv/testdata/y.go
 H8=$(commit "refactor(yamlenv): move the source under testdata")
 chk "S25 a lane file moved under an excluded path owes that lane a release from its own tag" \
   "$(release S25t stable "$H7" "$H7" "$H8")" 'false|[]|["yamlenv"]'
+git tag v1.0.3 "$H8"
+git tag yamlenv/v1.0.3 "$H8"
+H9=$(commit "chore(sync): synced file(s) with cplieger/ci (#9)")
+chk "S26 an empty commit on a Go library releases nothing" "$(release S26 stable "$H8" "$H8" "$H9")" 'false|[]|[]'
 cd "$WORK" || exit 1
 
 echo "PASS: path significance ($PASS checks)"
