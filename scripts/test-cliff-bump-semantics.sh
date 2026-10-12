@@ -354,19 +354,19 @@ Migrate first' "T4: a group left holding only a footer-bearing commit renders no
 # these states execute it rather than restate its arithmetic.
 ACTION="$ROOT/actions/git-cliff-version/compute.sh"
 [ -f "$ACTION" ] || fail "compute.sh not found at $ACTION"
-compute_tb() { # <repo> <channel> <pending-version> <pending-in-range> [lane] [exclude-paths]
+compute_tb() { # <repo> <channel> <pending-version> <pending-in-range> <pending-commit> [lane] [exclude-paths]
   local repo="$1" channel="$2" outfile
   outfile="$(mktemp "$WORK/compute-out.XXXXXX")"
   (
     cd "$repo" && GIT_CLIFF_CONFIG="$CFG" CLIFF_BIN="$CLIFF" GITHUB_OUTPUT="$outfile" \
-      CHANNEL="$channel" PENDING_VERSION="$3" PENDING_IN_RANGE="$4" LANE="${5:-}" \
-      EXCLUDE_PATHS="${6:-}" bash "$ACTION" >"$WORK/compute.log" 2>&1
-  ) || fail "compute.sh failed in $repo (channel=$channel pending=${3:-<none>} in-range=$4 lane=${5:-<none>}): $(cat "$WORK/compute.log")"
+      CHANNEL="$channel" PENDING_VERSION="$3" PENDING_IN_RANGE="$4" PENDING_COMMIT="$5" \
+      LANE="${6:-}" EXCLUDE_PATHS="${7:-}" bash "$ACTION" >"$WORK/compute.log" 2>&1
+  ) || fail "compute.sh failed in $repo (channel=$channel pending=${3:-<none>} in-range=$4 pending-commit=${5:-<none>} lane=${6:-<none>}): $(cat "$WORK/compute.log")"
   read_outputs "$outfile"
   [ -n "$OUT_BASE" ] || fail "compute.sh wrote no base output in $repo"
 }
 compute() { # <repo> <channel> [lane] [exclude-paths]: nothing pending
-  compute_tb "$1" "$2" "" false "${3:-}" "${4:-}"
+  compute_tb "$1" "$2" "" false "" "${3:-}" "${4:-}"
 }
 read_outputs() { # <GITHUB_OUTPUT file> -> OUT_* variables
   local line
@@ -502,7 +502,7 @@ commit_of() { git -C "$1" rev-list -n1 "$2"; }
 
 # The action forwards every input compute.sh reads; an input it drops is inert.
 for pair in channel:CHANNEL exclude-paths:EXCLUDE_PATHS lane:LANE \
-  pending-version:PENDING_VERSION pending-in-range:PENDING_IN_RANGE; do
+  pending-version:PENDING_VERSION pending-commit:PENDING_COMMIT pending-in-range:PENDING_IN_RANGE; do
   grep -qE "^  ${pair%%:*}:\$" "$ROOT/actions/git-cliff-version/action.yml" \
     || fail "action.yml declares no '${pair%%:*}' input"
   grep -qF "${pair#*:}: \${{ inputs.${pair%%:*} }}" "$ROOT/actions/git-cliff-version/action.yml" \
@@ -521,7 +521,7 @@ fc "$F" src/m.go "feat: a feature that reached main"
 publish_main "$F"
 git -C "$F" checkout -q dev
 ! git -C "$F" merge-base --is-ancestor v1.2.1 dev || fail "S2 precondition: v1.2.1 must be unreachable from dev"
-compute_tb "$F" dev "" false
+compute_tb "$F" dev "" false ""
 assert_eq "$OUT_BASE" "v1.3.0" "S2a: a fixes-only dev build takes the next minor above the unreachable H"
 assert_eq "$OUT_DEV" "v1.3.0-dev.1" "S2b: the dev counter runs on that base"
 assert_eq "$OUT_H_TAG" "v1.2.1" "S2c: H is the highest stable tag over all refs"
@@ -531,12 +531,12 @@ assert_eq "$OUT_LEVEL" "patch" "S2f: the range holds only the dev fix"
 
 # ── State S3: the patch cap on a main run with nothing pending ───────────────
 git -C "$F" checkout -q main
-compute_tb "$F" stable "" false
+compute_tb "$F" stable "" false ""
 assert_eq "$OUT_BASE" "v1.2.2" "S3a: a feat on main with nothing pending publishes the next patch only"
 assert_eq "$OUT_LEVEL" "minor" "S3b: the cap holds against the minor git-cliff read"
 assert_eq "$OUT_RELEASE" "true" "S3c: base differs from latest"
 git -C "$F" tag v1.2.2
-compute_tb "$F" stable "" false
+compute_tb "$F" stable "" false ""
 assert_eq "$OUT_BASE" "v1.2.2" "S3d: a stable run at a tagged commit repairs that version"
 assert_eq "$OUT_RELEASE" "false" "S3e: the repair run reads release=false"
 
@@ -550,38 +550,38 @@ git -C "$P" checkout -q main
 fc "$P" go.mod "fix(deps): update b module"
 git -C "$P" tag v1.2.1
 PR=$(promote "$P" "$T")
-compute_tb "$P" stable "" true
+compute_tb "$P" stable "" true ""
 assert_eq "$OUT_BASE" "v2.0.0" "S6a: a promoted feat! at R reserves the next major"
 assert_eq "$OUT_FROM" "$(commit_of "$P" v1.2.1)" "S6b: the promotion's range starts at the highest existing stable tag"
 assert_eq "$OUT_LEVEL" "major" "S6c: git-cliff read the breaking change"
-compute_tb "$P" stable "" false
+compute_tb "$P" stable "" false ""
 assert_eq "$OUT_BASE" "v1.2.2" "S6d: the same commit with nothing pending is a patch (pending-in-range is load-bearing)"
 assert_eq "$(pending_of "$P" "$PR")" "v2.0.0" "S4a: an untagged R's version is the promotion arithmetic over P..R"
 
 git -C "$P" checkout -q dev
 fc "$P" src/c.go "fix: a dev fix after the promotion"
-compute_tb "$P" dev "v2.0.0" false
+compute_tb "$P" dev "v2.0.0" false "$PR"
 assert_eq "$OUT_BASE" "v2.1.0" "S4b: a dev build numbers above the untagged pending promotion"
 assert_eq "$OUT_DEV" "v2.1.0-dev.1" "S4c: its dev version"
-assert_eq "$OUT_FROM" "$PR" "S4d: the range starts at the newest reconciliation, newer than H's commit"
+assert_eq "$OUT_FROM" "$PR" "S4d: the range starts at the pending promotion"
 assert_eq "$OUT_LEVEL" "patch" "S4e: the promoted feat! is not recounted"
-compute_tb "$P" dev "" false
-assert_eq "$OUT_BASE" "v1.3.0" "S4f: without the pending version the build would rank below the promotion"
+compute_tb "$P" dev "" false ""
+assert_eq "$OUT_BASE|$OUT_FROM" "v2.0.0|$(commit_of "$P" v1.2.1)" "S4f: with nothing pending, the floor is H's commit, so a reconciliation newer than H does not hide the feat! it promoted"
 
 git -C "$P" checkout -q main
 fc "$P" Dockerfile "fix(deps): update alpine docker tag"
 publish_main "$P"
-compute_tb "$P" stable "" true
+compute_tb "$P" stable "" true ""
 assert_eq "$OUT_BASE" "v2.0.0" "S7a: a later S over an untagged R publishes the promoted major"
 assert_eq "$OUT_FROM" "$(commit_of "$P" v1.2.1)" "S7b: S's range still starts at the highest existing stable tag"
 
 git -C "$P" tag v2.0.0 "$PR"
 git -C "$P" checkout -q dev
-compute_tb "$P" dev "" false
+compute_tb "$P" dev "" false ""
 assert_eq "$OUT_BASE" "v2.1.0" "S1a: once R is tagged, the next dev build does not recount its feat!"
 assert_eq "$OUT_FROM" "$PR" "S1b: the range starts at R"
 git -C "$P" tag v2.0.1 main
-compute_tb "$P" dev "" false
+compute_tb "$P" dev "" false ""
 assert_eq "$OUT_FROM" "$(git -C "$P" rev-parse main)" "S1c: a main patch tagged after R moves the range start to it"
 assert_eq "$OUT_BASE" "v2.1.0" "S1d: the next minor above v2.0.1"
 
@@ -603,7 +603,7 @@ publish_main "$V"
 assert_eq "$(pending_of "$V" "$VR")" "v2.0.0" "S5a: the lowest stable tag on R or a descendant is the pending version"
 git -C "$V" checkout -q dev
 fc "$V" src/b.go "fix: a dev fix after the promotion"
-compute_tb "$V" dev "v2.0.0" false
+compute_tb "$V" dev "v2.0.0" false "$VR"
 assert_eq "$OUT_BASE" "v2.1.0" "S5b: the dev build numbers above it"
 
 # ── State S8: a fixes-only promotion publishes the next minor ───────────────
@@ -612,7 +612,7 @@ git -C "$X8" checkout -q dev
 fc "$X8" src/a.go "fix: only a fix"
 X8T=$(git -C "$X8" rev-parse dev)
 X8R=$(promote "$X8" "$X8T")
-compute_tb "$X8" stable "" true
+compute_tb "$X8" stable "" true ""
 assert_eq "$OUT_BASE" "v1.3.0" "S8a: a fixes-only promotion publishes the next minor"
 assert_eq "$OUT_LEVEL" "patch" "S8b: although git-cliff read a patch"
 assert_eq "$(pending_of "$X8" "$X8R")" "v1.3.0" "S8c: the pending helper agrees with the stable run at R"
@@ -630,17 +630,17 @@ L9T=$(git -C "$L9" rev-parse dev)
 git -C "$L9" checkout -q main
 fc "$L9" yamlenv/go.mod "fix(deps): update a lane dependency"
 git -C "$L9" tag yamlenv/v1.0.1
-promote "$L9" "$L9T" >/dev/null
-compute_tb "$L9" stable "" true "" 'yamlenv/**'
+L9R=$(promote "$L9" "$L9T")
+compute_tb "$L9" stable "" true "" "" 'yamlenv/**'
 assert_eq "$OUT_BASE" "v1.1.0" "S9a: the root lane publishes the promotion's minor"
-compute_tb "$L9" stable "" false yamlenv
+compute_tb "$L9" stable "" false "" yamlenv
 assert_eq "$OUT_BASE" "yamlenv/v1.0.2" "S9b: the lane a root-only promotion left alone publishes its next patch"
 assert_eq "$OUT_H_TAG" "yamlenv/v1.0.1" "S9c: the lane's H is its own tag"
 git -C "$L9" checkout -q dev
 fc "$L9" yamlenv/y.go "fix: a lane fix on dev"
-compute_tb "$L9" dev "" false yamlenv
+compute_tb "$L9" dev "" false "" yamlenv
 assert_eq "$OUT_BASE" "yamlenv/v1.1.0" "S9d: a lane dev build takes the next minor above the lane's H"
-compute_tb "$L9" dev "v1.1.0" false "" 'yamlenv/**'
+compute_tb "$L9" dev "v1.1.0" false "$L9R" "" 'yamlenv/**'
 assert_eq "$OUT_BASE" "v1.2.0" "S9e: the root dev build numbers above the root's pending promotion"
 assert_eq "$OUT_LEVEL" "none" "S9f: the lane fix is outside the root range"
 
@@ -648,12 +648,15 @@ assert_eq "$OUT_LEVEL" "none" "S9f: the lane fix is outside the root range"
 refused "S11a: malformed pending version" "is not of the form" "$P" CHANNEL=dev PENDING_VERSION=2.1.0 bash "$ACTION"
 refused "S11b: pending-in-range on a dev run" "describes a stable run" "$P" CHANNEL=dev PENDING_IN_RANGE=true bash "$ACTION"
 refused "S11c: pending-in-range not a boolean" "must be 'true' or 'false'" "$P" CHANNEL=stable PENDING_IN_RANGE=yes bash "$ACTION"
-git -C "$P" update-ref -d refs/remotes/origin/main
-refused "S11d: a dev run with no remote main" "needs refs/remotes/origin/main" "$P" CHANNEL=dev bash "$ACTION"
 refused "S11e: pending-version of a commit that is not a reconciliation" "is not a reconciliation commit" "$P" bash "$ACTION" pending-version "$T"
 refused "S11f: unknown command" "unknown compute.sh command" "$P" bash "$ACTION" pending-versions "$PR"
 git -C "$X8" tag v1.1.9 "$X8T"
 refused "S11g: a stable tag inside the range" "sit inside" "$X8" CHANNEL=stable PENDING_IN_RANGE=true bash "$ACTION"
+refused "S11h: pending-commit on a stable run" "but this run is on the stable channel" "$P" CHANNEL=stable PENDING_COMMIT="$PR" bash "$ACTION"
+refused "S11i: pending-commit that is not a promotion" "is not a promotion commit, so it is no range floor" "$P" CHANNEL=dev PENDING_VERSION=v2.0.0 PENDING_COMMIT="$T" bash "$ACTION"
+refused "S11j: pending-version without pending-commit" "both or neither are set" "$P" CHANNEL=dev PENDING_VERSION=v2.0.0 bash "$ACTION"
+refused "S11k: pending-commit without pending-version" "both or neither are set" "$P" CHANNEL=dev PENDING_COMMIT="$PR" bash "$ACTION"
+refused "S11l: pending-commit not a commit id" "is not a 40-character commit id" "$P" CHANNEL=dev PENDING_VERSION=v2.0.0 PENDING_COMMIT=main bash "$ACTION"
 
 # ── State S12: a stable run older than H is refused (a re-run, say) ─────────
 Z=$(tb_fixture tb-stale)
@@ -669,7 +672,7 @@ refused "S12a: a stable run at a commit H's commit is not an ancestor of" "which
 refused "S12b: the same with a promotion in range" "which HEAD does not contain" \
   "$Z" CHANNEL=stable PENDING_IN_RANGE=true bash "$ACTION"
 git -C "$Z" checkout -q main
-compute_tb "$Z" stable "" false
+compute_tb "$Z" stable "" false ""
 assert_eq "$OUT_BASE" "v1.2.2" "S12c: at H's own commit the run repairs H"
 
 # ── State S13: a tagless pending promotion is read up to R, never past it ────
@@ -693,8 +696,10 @@ assert_eq "$(grep -c -- "--bump --context .* ${N13R}\$" "$WORK/cliff-argv.log")"
   "S13a: with no stable tag git-cliff is still bounded by R"
 git -C "$N13" checkout -q --detach "$N13R"
 assert_eq "$N13_AHEAD" "$(pending_of "$N13" "$N13R")" "S13b: the version does not depend on how far the checkout is past R"
-compute_tb "$N13" stable "" true
+compute_tb "$N13" stable "" true ""
 assert_eq "$OUT_BASE|$OUT_H_TAG|$OUT_RELEASE" "v1.0.0||true" "S13c: the tagless stable run at R publishes the initial tag"
+compute_tb "$N13" stable "" false ""
+assert_eq "$OUT_BASE|$OUT_H_TAG|$OUT_RELEASE|$OUT_FROM" "v1.0.0||true|" "S13d: a tagless stable run with nothing in range reads the whole history"
 
 # ── State S14: below 1.0.0 on cliff-alpha a breaking range reserves a minor ──
 CFG_STABLE="$CFG"
@@ -711,14 +716,14 @@ fc "$A14" go.mod "fix(deps): update a module"
 git -C "$A14" tag v0.3.1
 publish_main "$A14"
 git -C "$A14" checkout -q dev
-compute_tb "$A14" dev "" false
+compute_tb "$A14" dev "" false ""
 assert_eq "$OUT_BASE|$OUT_LEVEL" "v0.4.0|minor" "S14a: a breaking 0.x dev build takes the next minor, not 1.0.0"
 A14R=$(promote "$A14" "$A14T")
-compute_tb "$A14" stable "" true
+compute_tb "$A14" stable "" true ""
 assert_eq "$OUT_BASE|$OUT_LEVEL" "v0.4.0|minor" "S14b: a breaking 0.x promotion publishes the next minor"
 assert_eq "$(pending_of "$A14" "$A14R")" "v0.4.0" "S14c: the pending helper agrees"
 CFG="$CFG_STABLE"
-compute_tb "$A14" stable "" true
+compute_tb "$A14" stable "" true ""
 assert_eq "$OUT_BASE" "v1.0.0" "S14d: the same promotion on cliff-stable reserves the major (the config is load-bearing)"
 
 echo "PASS: git-cliff $VERSION semantics match the release-gate contract"

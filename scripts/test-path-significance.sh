@@ -321,6 +321,24 @@ chk_has "S34 and says which range" "$(cat "$WORK/perr")" "::error::path-signific
 chk "S34 a channel that is neither dev nor stable fails" "$(REQUEST_CHANNEL=beta paths_rc "$M0" "$MP2")" "2"
 chk_has "S34 and says so" "$(cat "$WORK/perr")" "::error::path-significance: REQUEST_CHANNEL must be dev or stable, got 'beta'"
 
+# A promotion of the same shape in MODE=release: on stable the root-change scan
+# skips the rebuild request dev's side carried in, and counts main's own.
+git checkout -q main
+M35=$(git rev-parse HEAD)
+git checkout -q -b dev35
+put main_test.go 'package main'
+commit "test: cover main" >/dev/null
+T35=$(commit "${REBUILD_SUBJECT} (#5)")
+git checkout -q main
+R35=$(promote "$M35" "$T35")
+git merge -q --ff-only "$R35"
+chk "S35 on stable a rebuild request reached through a promotion's second parent is no root change" \
+  "$(release S35a stable "$M35" "$M35" "$R35")" "false|[]|[]"
+chk "S35 on dev the same request is the build's own" "$(release S35b dev "$M35" "$M35" "$T35")" "true|[]|[]"
+M35R=$(commit "${REBUILD_SUBJECT} (#6)")
+chk "S35 main's own rebuild request after the promotion is a root change on stable" \
+  "$(release S35c stable "$R35" "$M35" "$M35R")" "true|[]|[]"
+
 # ── A ts repo: the root package.json is the published manifest ───────────────
 export REPO_TYPE=ts
 newrepo ts

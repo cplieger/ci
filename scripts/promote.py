@@ -5,9 +5,11 @@ promote.yaml runs one subcommand per job or step, so a repository's own
 configuration and the credential that moves `main` never share a step:
 
     snapshot  resolves --repo and --target to T on dev's first-parent history
-              and main's head M, the run's only authority-bearing values.
-    preview   renders each lane's stable version and notes for a promotion of T;
-              runs the repository's cliff config and holds no token.
+              and main's head M, the run's only authority-bearing values, once
+              no release run of M is in flight.
+    preview   renders each lane's stable version or `no release`, and its notes,
+              for a promotion of T; runs the repository's cliff config and holds
+              no token.
     check     runs the five promotion checks over exactly T and M with this
               repository's code and plans R in --plan-file; reads only.
     create    creates R on GitHub, a commit no ref names yet (PROMOTE_PAT).
@@ -41,6 +43,7 @@ import release_channels as rc
 OWNER = 'cplieger'
 SCRIPTS = Path(__file__).resolve().parent
 CI_ROOT = SCRIPTS.parent
+COMPUTE = CI_ROOT / 'actions/git-cliff-version/compute.sh'
 # scripts/reconciliation.sh matches the same subject.
 RECONCILIATION_SUBJECT = 'release: promote dev into main'
 DIGEST_TRAILER = 'Promoted-Digest'
@@ -377,15 +380,13 @@ def affected_lanes(sig: dict[str, str]) -> list[str]:
     return lanes + json.loads(sig.get('go_modules_to_release') or '[]')
 
 
-def check_affected(sig: dict[str, str]) -> list[str]:
-    if affected_lanes(sig):
-        return []
-    return [
-        (
-            'nothing to publish: the tree diff from main to the target changes no path any lane '
-            'ships (an empty rebuild on dev is not one, since main rebuilds its own images)'
-        )
-    ]
+def check_moves(clone: Path, main: str, target: str) -> list[str]:
+    trees = {git(clone, 'rev-parse', f'{c}^{{tree}}').strip() for c in (main, target)}
+    if len(trees) == 1:
+        return [
+            "nothing to move: the target's tree equals main's, so a promotion would change no file"
+        ]
+    return []
 
 
 # ── Retained dev digest ───────────────────────────────────────────────────────
@@ -622,20 +623,29 @@ def release_runs(repo: str, sha: str) -> list[dict]:
     return (data or {}).get('workflow_runs') or []
 
 
+def main_release_in_flight(repo: str, main: str, committed: datetime) -> list[dict] | None:
+    """None once no release run of main's head, committed at `committed`, can still tag it;
+    else its runs not yet completed, [] while none is listed yet. One read, no wait."""
+    runs = release_runs(repo, main)
+    busy = [r for r in runs if r.get('status') != 'completed']
+    age = (datetime.now(UTC) - committed).total_seconds()
+    if not busy and (runs or age >= MAIN_RUN_GRACE_SECONDS):
+        return None
+    return busy
+
+
 def wait_for_main_release(
     repo: str, main: str, committed: datetime, *, sleep=time.sleep, clock=time.monotonic
 ) -> str:
     """'' once no release run of main's head is in flight, else the reason it timed out."""
     start = clock()
     while True:
-        runs = release_runs(repo, main)
-        busy = [r for r in runs if r.get('status') != 'completed']
-        age = (datetime.now(UTC) - committed).total_seconds()
-        if not busy and (runs or age >= MAIN_RUN_GRACE_SECONDS):
+        busy = main_release_in_flight(repo, main, committed)
+        if busy is None:
             return ''
         if clock() - start >= MAIN_RUN_WAIT_SECONDS:
             what = f'{len(busy)} release run(s) still running' if busy else 'no release run listed'
-            return f"image: main's head {main[:12]} has {what} after {MAIN_RUN_WAIT_SECONDS // 60} minutes"
+            return f"main's head {main[:12]} has {what} after {MAIN_RUN_WAIT_SECONDS // 60} minutes"
         sleep(MAIN_RUN_POLL_SECONDS)
 
 
@@ -645,10 +655,7 @@ def main_stable_tag(clone: Path, main: str) -> str:
 
 
 def check_vulnerabilities(clone: Path, repo: str, main: str, digest: str) -> list[str]:
-    committed = datetime.fromisoformat(git(clone, 'log', '-1', '--format=%cI', main).strip())
-    waited = wait_for_main_release(repo, main, committed)
-    if waited:
-        return [waited]
+    # cmd_snapshot waited out main's release runs before this clone, so it holds M's stable tag.
     tag = main_stable_tag(clone, main)
     if not tag:
         print('image: main has no stable image yet, so a promotion undoes no fix of it')
@@ -811,6 +818,17 @@ def cmd_snapshot(args) -> int:
     if git(clone, 'merge-base', target, main).strip() == target:
         print(f'::error::refused: {target[:12]} is already part of main', file=sys.stderr)
         return 1
+    # preview plans each lane against main's stable tags and check_vulnerabilities reads
+    # M's stable image, so a release of M still running would leave both reading too early.
+    try:
+        committed = datetime.fromisoformat(git(clone, 'log', '-1', '--format=%cI', main).strip())
+        waited = wait_for_main_release(args.repo, main, committed)
+    except GhError as err:
+        print(f'::error::{err}', file=sys.stderr)
+        return 1
+    if waited:
+        print(f'::error::refused: {waited}, so rerun once it finishes', file=sys.stderr)
+        return 1
     write_outputs({'repo': args.repo, 'target': target, 'main': main})
     write_summary(
         f'## Promotion snapshot\n\n**{args.repo}**: dev `{target[:12]}` over main `{main[:12]}`.\n'
@@ -821,21 +839,119 @@ def cmd_snapshot(args) -> int:
 # ── preview ───────────────────────────────────────────────────────────────────
 
 
-def run_tool(clone: Path, script: str, *args: str, **env: str) -> dict[str, str]:
+def run_tool(clone: Path, script: Path, *args: str, **env: str) -> dict[str, str]:
     """Run a release script the way release.yaml does; its $GITHUB_OUTPUT as a dict."""
     out = clone.parent / f'{clone.name}.output'
     out.write_text('')
+    # path-significance.sh appends its report to the step summary, which must
+    # stay out of the preview's own.
+    summary = clone.parent / f'{clone.name}.step-summary'
+    summary.write_text('')
     proc = subprocess.run(
-        ['bash', str(SCRIPTS / script), *args],
+        ['bash', str(script), *args],
         cwd=clone,
         capture_output=True,
         text=True,
         check=False,
-        env=token_free_env(GITHUB_OUTPUT=str(out), **env),
+        env=token_free_env(GITHUB_OUTPUT=str(out), GITHUB_STEP_SUMMARY=str(summary), **env),
     )
     if proc.returncode != 0:
-        raise GhError(f'{script} {" ".join(args)} failed: {proc.stderr.strip()[-600:]}')
+        name = ' '.join([script.name, *args])
+        raise GhError(f'{name} failed: {proc.stderr.strip()[-600:]}')
     return dict(line.split('=', 1) for line in out.read_text().splitlines() if '=' in line)
+
+
+def _field(out: dict[str, str], key: str, tool: str, *, parse: bool = False):
+    """out[key], JSON-decoded when `parse`; GhError naming `tool` when it is missing or malformed."""
+    if key not in out:
+        raise GhError(f'{tool} printed no {key}')
+    if not parse:
+        return out[key]
+    try:
+        return json.loads(out[key])
+    except ValueError:
+        raise GhError(f'{tool} printed malformed {key}') from None
+
+
+def _lane_rows(state, tool: str) -> dict[str, dict]:
+    rows = state if isinstance(state, dict) else None
+    if rows is None or not all(
+        isinstance(row, dict)
+        and isinstance(row.get('h_tag'), str)
+        and isinstance(row.get('kind_note'), str)
+        and isinstance(row.get('in_range'), bool)
+        for row in rows.values()
+    ):
+        raise GhError(f'{tool} printed malformed state')
+    return rows
+
+
+def release_plan(clone: Path, main: str, r: str, layout: Layout) -> dict[str, dict[str, str]]:
+    """{lane key: {version, h_tag, kind_note}} for every lane of main's stable run at R,
+    checked out in `clone`, from release.yaml detect's own steps; version '' for no release."""
+    env = layout.env()
+    tool = 'release-state.sh pending'
+    pending = run_tool(clone, SCRIPTS / 'release-state.sh', 'pending', CHANNEL='stable', **env)
+    raw_state = _field(pending, 'state', tool)
+    rows = _lane_rows(_field(pending, 'state', tool, parse=True), tool)
+    root = run_tool(
+        clone,
+        COMPUTE,
+        CHANNEL='stable',
+        EXCLUDE_PATHS='\n'.join(f'{lane}/**' for lane in layout.lanes),
+        PENDING_IN_RANGE=_field(pending, 'root_in_range', tool),
+    )
+    sig = run_tool(
+        clone,
+        SCRIPTS / 'path-significance.sh',
+        MODE='release',
+        BEFORE=main,
+        HEAD=r,
+        ANCHOR_SHA=_field(root, 'anchor_sha', 'compute.sh'),
+        CHANNEL='stable',
+        **env,
+    )
+    sig_tool = 'path-significance.sh'
+    if _field(pending, 'in_range_any', tool) == 'true':
+        sig = run_tool(
+            clone,
+            SCRIPTS / 'release-state.sh',
+            'publish',
+            CHANNEL='stable',
+            STATE=raw_state,
+            ROOT_CHANGED=_field(sig, 'root_changed', sig_tool),
+            SUBPACKAGES_TO_PUBLISH=_field(sig, 'subpackages_to_publish', sig_tool),
+            GO_MODULES_TO_RELEASE=_field(sig, 'go_modules_to_release', sig_tool),
+            **env,
+        )
+        sig_tool = 'release-state.sh publish'
+    # R is untagged, so detect's anchor-differs test always passes; the significance lists decide.
+    root_releases = _field(sig, 'root_changed', sig_tool) == 'true' or bool(
+        _field(sig, 'subpackages_to_publish', sig_tool, parse=True)
+    )
+    modules = _field(sig, 'go_modules_to_release', sig_tool, parse=True)
+    if (
+        not isinstance(modules, list)
+        or not all(isinstance(m, str) for m in modules)
+        or not set(modules) <= rows.keys() - {'.'}
+    ):
+        raise GhError(f'{sig_tool} printed malformed go_modules_to_release')
+    plan = {}
+    for key, row in rows.items():
+        version = ''
+        if key == '.' and root_releases:
+            version = _field(root, 'base', 'compute.sh')
+        elif key in modules:
+            lane = run_tool(
+                clone,
+                COMPUTE,
+                CHANNEL='stable',
+                LANE=key,
+                PENDING_IN_RANGE='true' if row['in_range'] else 'false',
+            )
+            version = _field(lane, 'base', 'compute.sh')
+        plan[key] = {'version': version, 'h_tag': row['h_tag'], 'kind_note': row['kind_note']}
+    return plan
 
 
 def render_lane_notes(clone: Path, repo: str, key: str, lane: dict, layout: Layout, r: str) -> str:
@@ -867,39 +983,38 @@ def render_lane_notes(clone: Path, repo: str, key: str, lane: dict, layout: Layo
 
 
 def cmd_preview(args) -> int:
-    """The stable release's own pending/number/notes steps, run at a local R."""
+    """release_plan at a local R, rendered per lane, then its `release-plan:` line."""
     try:
         clone = clone_repo(args.repo, Path(args.work_dir) / args.repo, bare=False)
         git(clone, 'checkout', '--quiet', '--detach', args.target)
         r = build_reconciliation(clone, args.main, args.target, '')['sha']
         git(clone, 'checkout', '--quiet', '--detach', r)
         layout = layout_of(inventory.Repo(str(clone)), args.target)
-        exclude = '\n'.join(f'{lane}/**' for lane in layout.lanes)
-        pending = run_tool(clone, 'release-state.sh', 'pending', CHANNEL='stable', **layout.env())
-        state = json.loads(pending.get('state') or '{}')
-        if pending.get('any') == 'true':
-            numbered = run_tool(
-                clone,
-                'release-state.sh',
-                'number',
-                STATE=pending['state'],
-                CLIFF_SCRIPT=str(CI_ROOT / 'actions/git-cliff-version/compute.sh'),
-                EXCLUDE_PATHS=exclude,
-                **layout.env(),
-            )
-            state = json.loads(numbered['state'])
+        plan = release_plan(clone, args.main, r, layout)
         lines = [f'## Promotion preview: {args.repo}', '']
-        published = [(k, v) for k, v in sorted(state.items()) if v.get('version')]
-        if not published:
-            lines.append('No lane publishes: the stable release would carry nothing.')
-        for key, lane in published:
-            notes = render_lane_notes(clone, args.repo, key, lane, layout, r)
+        if not plan:
+            lines.append('This repository has no release lane.')
+        for key, lane in sorted(plan.items()):
             name = 'root' if key == '.' else key
-            lines += [f'### {name} {lane["version"]}', '', notes, '']
+            if lane['version']:
+                notes = render_lane_notes(clone, args.repo, key, lane, layout, r)
+                lines += [f'### {name} {lane["version"]}', '', notes, '']
+            else:
+                since = f' since `{lane["h_tag"]}`' if lane['h_tag'] else ''
+                lines += [
+                    f'### {name}: no release',
+                    '',
+                    f'No path {name} ships changed{since}, so it cuts no version.',
+                    '',
+                ]
     except (GhError, inventory.InventoryError) as err:
         print(f'::error::preview: {err}', file=sys.stderr)
         return 1
     write_summary('\n'.join(lines) + '\n')
+    # Printed after every tool that ran the repository's cliff config, so the
+    # last line of this shape in the log is this one.
+    versions = {key: lane['version'] for key, lane in plan.items()}
+    print('release-plan: ' + json.dumps(versions, sort_keys=True, separators=(',', ':')))
     return 0
 
 
@@ -912,10 +1027,10 @@ def run_checks(
     """(refusals, digest) of the five promotion checks over exactly `main` and `target`."""
     inv = inventory.Repo(str(clone))
     layout = layout_of(inv, target)
-    sig = path_significance(clone, main, target, layout)
     refusals = check_purity(inv, target)
     digest = ''
     if layout.type == 'docker':
+        sig = path_significance(clone, main, target, layout)
         digest, found = check_digest(clone, repo, target, layout, sig)
         refusals += found
     try:
@@ -923,7 +1038,7 @@ def run_checks(
         refusals += check_dominance(inv, main, target, owned, canonical)
     except GhError as err:
         refusals.append(f'dominance: {err}')
-    refusals += check_affected(sig)
+    refusals += check_moves(clone, main, target)
     if digest:
         refusals += check_vulnerabilities(clone, repo, main, digest)
     return refusals, digest
@@ -1112,7 +1227,7 @@ def parse_args(argv: list[str] | None = None):
     snap.set_defaults(func=cmd_snapshot)
 
     for name, func, text in (
-        ('preview', cmd_preview, 'render the versions and notes a promotion publishes'),
+        ('preview', cmd_preview, "render each lane's version or no release, and the notes"),
         ('check', cmd_check, 'run the promotion checks and plan R'),
     ):
         s = sub.add_parser(name, help=text)

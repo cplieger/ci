@@ -1,8 +1,9 @@
 # Promote a two-branch repository's dev commit to its main; scripts/promote.py holds
 # every check, this file the boundaries. apply acts only on snapshot's T and M.
-# preview may run the repository's cliff config, so it holds no token and nothing
-# reads its output. apply re-checks with this repository's code and creates R, a
-# commit no ref names. tag gives the dev image `promoted-<R>`, which retention never
+# preview may run the repository's cliff config, so it holds no token, and nothing
+# in this workflow reads its output; whoever dispatched the run reads its
+# `release-plan:` log line. apply re-checks with this repository's code and creates
+# R, a commit no ref names. tag gives the dev image `promoted-<R>`, which retention never
 # deletes, before move re-reads R and the tag and moves main.
 # PACKAGES_PAT reaches tag only; PROMOTE_PAT reaches create and move only.
 name: Promote
@@ -45,7 +46,8 @@ env:
 jobs:
   snapshot:
     runs-on: ubuntu-26.04
-    timeout-minutes: 10
+    # Above promote.py's MAIN_RUN_WAIT_SECONDS wait for main's release run.
+    timeout-minutes: 60
     permissions:
       contents: read
     outputs:
