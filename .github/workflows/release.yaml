@@ -35,7 +35,7 @@ jobs:
       mode: ${{ steps.channel.outputs.mode }}
       type: ${{ steps.type.outputs.type }}
       subpackages: ${{ steps.type.outputs.subpackages }}
-      subpackages_to_publish: ${{ steps.publish.outputs.subpackages_to_publish || steps.changes.outputs.subpackages_to_publish }}
+      subpackages_to_publish: ${{ steps.publish.outputs.subpackages_to_publish || steps.ahead.outputs.subpackages_to_publish || steps.changes.outputs.subpackages_to_publish }}
       # version is the tag this run creates: the dev version on dev, the
       # stable base on stable. base and dev_version are both exposed because
       # docker-release derives vX / vX.Y from the base on either channel.
@@ -44,9 +44,9 @@ jobs:
       base: ${{ steps.select.outputs.base }}
       dev_version: ${{ steps.select.outputs.dev_version }}
       exclude_re: ${{ steps.changes.outputs.exclude_re }}
-      root_changed: ${{ steps.publish.outputs.root_changed || steps.changes.outputs.root_changed }}
+      root_changed: ${{ steps.publish.outputs.root_changed || steps.ahead.outputs.root_changed || steps.changes.outputs.root_changed }}
       go_modules: ${{ steps.gomodules.outputs.go_modules }}
-      go_modules_to_release: ${{ steps.publish.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}
+      go_modules_to_release: ${{ steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}
       # The root lane's release-kind line.
       release_kind_note: ${{ steps.pending.outputs.root_kind_note }}
       # Per-lane state keyed '.' (root) or the lane dir, the lane matrix, the
@@ -304,6 +304,24 @@ jobs:
           set -euo pipefail
           bash "$CI_TOOLS/path-significance.sh"
 
+      # Dev: a library lane whose build ships its highest stable tag's code
+      # is dropped (release-state.sh ahead).
+      - name: Drop dev builds of stable code
+        id: ahead
+        if: ${{ steps.channel.outputs.channel == 'dev' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+          ROOT_CHANGED: ${{ steps.changes.outputs.root_changed }}
+          SUBPACKAGES_TO_PUBLISH: ${{ steps.changes.outputs.subpackages_to_publish }}
+          GO_MODULES_TO_RELEASE: ${{ steps.changes.outputs.go_modules_to_release }}
+          REPO_TYPE: ${{ steps.type.outputs.type }}
+          SUBPACKAGES_JSON: ${{ steps.type.outputs.subpackages }}
+          GO_LANES_JSON: ${{ steps.gomodules.outputs.go_modules }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" ahead
+
       # Stable: a pending promotion in this run's range publishes
       # its lanes whatever the triggering commit changed.
       - name: Add pending promotions to the publication
@@ -335,8 +353,8 @@ jobs:
         env:
           CHANNEL: ${{ steps.channel.outputs.channel }}
           MODE: ${{ steps.channel.outputs.mode }}
-          ROOT_CHANGED: ${{ steps.publish.outputs.root_changed || steps.changes.outputs.root_changed }}
-          SUBPACKAGES_TO_PUBLISH: ${{ steps.publish.outputs.subpackages_to_publish || steps.changes.outputs.subpackages_to_publish }}
+          ROOT_CHANGED: ${{ steps.publish.outputs.root_changed || steps.ahead.outputs.root_changed || steps.changes.outputs.root_changed }}
+          SUBPACKAGES_TO_PUBLISH: ${{ steps.publish.outputs.subpackages_to_publish || steps.ahead.outputs.subpackages_to_publish || steps.changes.outputs.subpackages_to_publish }}
           BASE: ${{ steps.cliff.outputs.base }}
           DEV_VERSION: ${{ steps.cliff.outputs.dev_version }}
           LATEST: ${{ steps.cliff.outputs.latest }}

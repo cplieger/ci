@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Two-branch release state, one subcommand per release.yaml step: pending
-# (each lane's pending promotion, range and kind line), publish, number (via
-# CLIFF_SCRIPT), receipts, receipt TAG COMMIT, readback SITE TAG [LANE],
+# (each lane's pending promotion, range and kind line), publish, ahead, number
+# (via CLIFF_SCRIPT), receipts, receipt TAG COMMIT, readback SITE TAG [LANE],
 # provenance and complete (IMAGE@DIGEST SOURCE), barrier (holds a stable publish
 # until dev ranks above it), renumber-target, renumber-handoff, renumber (re-tag
 # LANE_KEY's newest dev build as DEV_VERSION), renumber-subpackages, signing-window
 # TAG (EXCLUDE_RE, SUBPACKAGES_JSON), release-digest TAG (IMAGE) and security-shas
-# [FLOOR]. Lane keys: '.' for the root, else the lane dir. pending, publish and number hold no token.
+# [FLOOR]. Lane keys: '.' for the root, else the lane dir. pending, publish, ahead and number hold no token.
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,16 +62,18 @@ lane_keys() { # -> '.' when the root releases, then each nested lane
   case "${REPO_TYPE:-none}" in docker | go | ts) echo . ;; esac
   jq -r '.[]' <<<"${GO_LANES_JSON:-[]}"
 }
-tags_of() { # <regex> -> "<tag> <commit>" per matching tag
-  local name obj peeled
+tags_of() { # <regex> -> "<tag> <commit>" per matching tag; fails when git cannot list the tags
+  local name obj peeled refs
+  refs=$(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)') || return 1
   while read -r name obj peeled; do
     if [[ $name =~ $1 ]]; then
       printf '%s %s\n' "$name" "${peeled:-$obj}"
     fi
-  done < <(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)')
+  done <<<"$refs"
 }
-highest_stable() { # <key> [below X.Y.Z] -> "<tag> <commit>" of the lane's highest stable tag by version
-  local best="" at="" name c
+highest_stable() { # <key> [below X.Y.Z] -> "<tag> <commit>" of the lane's highest stable tag by version; fails with tags_of
+  local best="" at="" name c tags
+  tags=$(tags_of "$(stable_re "$1")") || return 1
   while read -r name c; do
     if [ -n "${2:-}" ] && ! gt "$2" "$(core "$name")"; then
       continue
@@ -79,24 +81,27 @@ highest_stable() { # <key> [below X.Y.Z] -> "<tag> <commit>" of the lane's highe
     if [ -z "$best" ] || gt "$(core "$name")" "$(core "$best")"; then
       best=$name at=$c
     fi
-  done < <(tags_of "$(stable_re "$1")")
+  done <<<"$tags"
   [ -z "$best" ] || printf '%s %s\n' "$best" "$at"
 }
-nearest_dev_tag() { # <commit> <key> -> the highest dev tag of the lane on the commit nearest <commit>
+nearest_dev_tag() { # <commit> <key> -> the highest dev tag of the lane on the commit nearest <commit>; fails when git cannot list the tags or walk <commit>'s history
   local -A at=()
-  local name c
+  local name c tags revs
+  tags=$(tags_of "$(dev_re "$2")") || return 1
   while read -r name c; do
+    [ -n "$name" ] || continue
     if [ -z "${at[$c]:-}" ] || tag_gt "$name" "${at[$c]}"; then
       at[$c]=$name
     fi
-  done < <(tags_of "$(dev_re "$2")")
+  done <<<"$tags"
   [ "${#at[@]}" -gt 0 ] || return 0
+  revs=$(git rev-list --topo-order "$1") || return 1
   while read -r c; do
     if [ -n "${at[$c]:-}" ]; then
       printf '%s' "${at[$c]}"
       return 0
     fi
-  done < <(git rev-list --topo-order "$1")
+  done <<<"$revs"
 }
 
 # A lane is affected by R when R's diff from its first parent changes a path the
@@ -114,23 +119,24 @@ affects() { # <R> <key>
     sed -n 's/^go_modules_to_release=//p' <<<"$res" | jq -e --arg l "$2" 'index($l) != null' >/dev/null
   fi
 }
-newest_affecting() { # <from> <to> <key> -> the newest reconciliation of from..to that affected the lane
-  local c found=""
+newest_affecting() { # <from> <to> <key> -> the newest reconciliation of from..to that affected the lane; fails when reconciliations_in does
+  local c found="" recs
+  recs=$(reconciliations_in "$1" "$2") || return 1
   while IFS= read -r c; do
     if [ -n "$c" ] && affects "$c" "$3"; then
       found=$c
     fi
-  done < <(reconciliations_in "$1" "$2")
+  done <<<"$recs"
   printf '%s' "$found"
 }
-kind_note() { # <release commit> <pending R or ''> <key> -> the release body's opening kind line
+kind_note() { # <release commit> <pending R or ''> <key> -> the release body's opening kind line; fails with git rev-parse or nearest_dev_tag
   local t d from
   if [ -z "$2" ]; then
     printf '%s' "$BUILT_FROM_MAIN"
     return 0
   fi
-  t=$(git rev-parse "$2^2")
-  d=$(nearest_dev_tag "$t" "$3")
+  t=$(git rev-parse "$2^2") || return 1
+  d=$(nearest_dev_tag "$t" "$3") || return 1
   if [ -n "$d" ]; then from="\`$d\`"; else from="\`dev\` at \`${t:0:12}\`"; fi
   if [ "$1" = "$2" ]; then
     printf 'Promoted from %s' "$from"
@@ -141,7 +147,7 @@ kind_note() { # <release commit> <pending R or ''> <key> -> the release body's o
 }
 
 cmd_pending() {
-  local main=HEAD head state='{}' lanes='[]' key h h_tag h_commit r in_range kind repair_kind prev
+  local main=HEAD head state='{}' lanes='[]' keys key h h_tag h_commit r in_range kind repair_kind prev prev_r
   case "${CHANNEL:-}" in
     stable) ;;
     dev)
@@ -152,23 +158,25 @@ cmd_pending() {
     *) die "CHANNEL must be dev or stable, got '${CHANNEL:-}'" ;;
   esac
   head=$(git rev-parse HEAD)
+  keys=$(lane_keys) || die "GO_LANES_JSON '${GO_LANES_JSON:-}' is not a JSON array of lane dirs"
   while IFS= read -r key; do
     [ -n "$key" ] || continue
-    h=$(highest_stable "$key")
+    h=$(highest_stable "$key") || die "cannot read lane ${key}'s stable tags"
     h_tag=${h% *} h_commit=${h#* }
     # Same refusal as compute.sh's: a stable run behind its lane's highest
     # stable tag is older than a published release.
     if [ "$CHANNEL" = stable ] && [ -n "$h_commit" ] && ! git merge-base --is-ancestor "$h_commit" "$head"; then
       die "lane ${key}: the highest stable tag ${h_tag} is on ${h_commit}, which HEAD does not contain, so an older commit is not published above it"
     fi
-    r=$(newest_affecting "$h_commit" "$main" "$key")
+    r=$(newest_affecting "$h_commit" "$main" "$key") || die "cannot list lane ${key}'s promotions on ${main}"
     in_range=false kind="" repair_kind=""
     if [ "$CHANNEL" = stable ]; then
       [ -z "$r" ] || in_range=true
-      kind=$(kind_note "$head" "$r" "$key")
+      kind=$(kind_note "$head" "$r" "$key") || die "cannot find lane ${key}'s promoted dev build for its kind line"
       if [ -n "$h_tag" ]; then
-        prev=$(highest_stable "$key" "$(core "$h_tag")")
-        repair_kind=$(kind_note "$h_commit" "$(newest_affecting "${prev#* }" "$h_commit" "$key")" "$key")
+        prev=$(highest_stable "$key" "$(core "$h_tag")") || die "cannot read lane ${key}'s stable tags"
+        prev_r=$(newest_affecting "${prev#* }" "$h_commit" "$key") || die "cannot list lane ${key}'s promotions up to ${h_tag}"
+        repair_kind=$(kind_note "$h_commit" "$prev_r" "$key") || die "cannot find lane ${key}'s promoted dev build for its kind line"
       fi
     fi
     state=$(jq -c --arg k "$key" --arg lane "$(lane_dir "$key")" --arg h_tag "$h_tag" --arg h_commit "$h_commit" \
@@ -177,7 +185,7 @@ cmd_pending() {
         in_range: $in_range, kind_note: $kind, repair_kind_note: $repair}}' <<<"$state")
     lanes=$(jq -c --arg k "$key" --arg lane "$(lane_dir "$key")" '. + [{key: $k, lane: $lane}]' <<<"$lanes")
     echo "lane ${key}: highest stable ${h_tag:-<none>}, pending promotion ${r:-<none>}, in range ${in_range}"
-  done < <(lane_keys)
+  done <<<"$keys"
   out "state=${state}" "lanes=${lanes}" \
     "any=$(jq -r 'any(.[]; .commit != "")' <<<"$state")" \
     "in_range_any=$(jq -r 'any(.[]; .in_range)' <<<"$state")" \
@@ -188,8 +196,10 @@ cmd_pending() {
 # The root publishes every promotion past its stable tag, since an earlier one
 # whose run failed may have changed a subpackage the newest did not.
 root_promotions() { # <state> -> the root's in-range promotions past its stable tag, oldest first
-  local r h
-  IFS=$'\t' read -r r h < <(jq -r '.["."] // {} | select(.in_range) | [.commit, (.h_commit // "")] | @tsv' <<<"$1") || return 0
+  local row r h
+  row=$(jq -r '.["."] // {} | select(.in_range) | [.commit, (.h_commit // "")] | @tsv' <<<"$1") || return 1
+  [ -n "$row" ] || return 0
+  IFS=$'\t' read -r r h <<<"$row"
   [ -z "$r" ] || reconciliations_in "$h" "$r"
 }
 
@@ -198,8 +208,10 @@ root_promotions() { # <state> -> the root's in-range promotions past its stable 
 # S landed). Unions each in-range lane into the current publication sets.
 cmd_publish() {
   local state="${STATE:?}" rc="${ROOT_CHANGED:-false}" subs="${SUBPACKAGES_TO_PUBLISH:-[]}" mods="${GO_MODULES_TO_RELEASE:-[]}"
-  local key r c recs res
+  local key r c recs res rows
   [ "${CHANNEL:-}" = stable ] || die "publish describes a stable run's range, but this run is on the '${CHANNEL:-}' channel"
+  rows=$(jq -r 'to_entries[] | select(.value.in_range) | [.key, .value.commit] | @tsv' <<<"$state") \
+    || die "STATE is not the pending step's state"
   while IFS=$'\t' read -r key r; do
     [ -n "$key" ] || continue
     if [ "$key" = . ]; then
@@ -218,13 +230,61 @@ cmd_publish() {
       mods=$(jq -c --arg l "$key" 'if any(.[]; . == $l) then . else . + [$l] end' <<<"$mods")
     fi
     note "lane ${key}: this run publishes the pending promotion ${r}"
-  done < <(jq -r 'to_entries[] | select(.value.in_range) | [.key, .value.commit] | @tsv' <<<"$state")
+  done <<<"$rows"
   out "root_changed=${rc}" "subpackages_to_publish=${subs}" "go_modules_to_release=${mods}"
 }
 
+# A dev build is numbered as the next promotion, so a build of a library lane
+# that ships its highest stable tag's code would rank above that stable and move
+# every consumer's dev pin onto a pre-release holding nothing new. Such a lane
+# is dropped from a dev run: a go or ts root with the TS subpackages sharing its
+# version, and every nested Go lane. A lane with a dev tag already above its
+# stable keeps building: consumers sit on that tag, and only a newer dev build
+# carries the stable's code past it. An image root keeps its build, which a
+# promotion re-tags.
+cmd_ahead() {
+  local rc="${ROOT_CHANGED:-false}" subs="${SUBPACKAGES_TO_PUBLISH:-[]}" mods="${GO_MODULES_TO_RELEASE:-[]}"
+  local kept='[]' l s h c name _c res devs lanes
+  [ "${CHANNEL:-}" = dev ] || die "ahead narrows a dev run, but this run is on the '${CHANNEL:-}' channel"
+  ships_past_stable() { # <key> -> 1 only when the lane has a stable tag, no dev tag above it, and HEAD ships its code
+    s=$(highest_stable "$1") || die "cannot read lane ${1}'s stable tags"
+    read -r h c <<<"$s"
+    [ -n "$h" ] || return 0
+    devs=$(tags_of "$(dev_re "$1")") || die "cannot read lane ${1}'s dev tags"
+    while read -r name _c; do
+      if [ -n "$name" ] && gt "$(core "$name")" "$(core "$h")"; then
+        return 0
+      fi
+    done <<<"$devs"
+    res=$(MODE=paths FROM="$c" TO=HEAD bash "$TOOLS/path-significance.sh") \
+      || die "path significance of ${h}..HEAD failed"
+    if [ "$1" = . ]; then
+      grep -qx 'root_changed=true' <<<"$res" && return 0
+      [ "$(sed -n 's/^subpackages_to_publish=//p' <<<"$res")" = '[]' ] || return 0
+    else
+      sed -n 's/^go_modules_to_release=//p' <<<"$res" | jq -e --arg l "$1" 'index($l) != null' >/dev/null && return 0
+    fi
+    note "lane ${1}: HEAD ships the code of ${h}, so this run cuts no dev build of it"
+    return 1
+  }
+  if { [ "$rc" = true ] || [ "$subs" != '[]' ]; } && { [ "${REPO_TYPE:-}" = go ] || [ "${REPO_TYPE:-}" = ts ]; } \
+    && ! ships_past_stable .; then
+    rc=false subs='[]'
+  fi
+  lanes=$(jq -r '.[]' <<<"$mods") || die "GO_MODULES_TO_RELEASE '${mods}' is not a JSON array of lane dirs"
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    ships_past_stable "$l" || continue
+    kept=$(jq -c --arg v "$l" '. + [$v]' <<<"$kept")
+  done <<<"$lanes"
+  out "root_changed=${rc}" "subpackages_to_publish=${subs}" "go_modules_to_release=${kept}"
+}
+
 cmd_number() {
-  local state="${STATE:?}" key r v res
+  local state="${STATE:?}" key r v res rows
   : "${CLIFF_SCRIPT:?}"
+  rows=$(jq -r 'to_entries[] | select(.value.commit != "") | [.key, .value.commit] | @tsv' <<<"$state") \
+    || die "STATE is not the pending step's state"
   while IFS=$'\t' read -r key r; do
     [ -n "$key" ] || continue
     if [ "$key" = . ]; then
@@ -238,7 +298,7 @@ cmd_number() {
     [[ $v =~ $(stable_re "$key") ]] || die "pending-version of ${r} answered '${v}', not a stable version of lane ${key}"
     state=$(jq -c --arg k "$key" --arg v "$v" '.[$k].version = $v' <<<"$state")
     echo "lane ${key}: the promotion ${r} publishes ${v}"
-  done < <(jq -r 'to_entries[] | select(.value.commit != "") | [.key, .value.commit] | @tsv' <<<"$state")
+  done <<<"$rows"
   out "state=${state}" "root_version=$(jq -r '.["."].version // ""' <<<"$state")"
 }
 
@@ -253,32 +313,36 @@ subpackages_at() { # <commit> -> JSON array of the first-level dirs carrying a j
 # published too: the range from the root tag below it, every subpackage when
 # there is none, plus each promotion's own diff, as detect's publish step adds.
 published_subpackages() { # <root tag> <commit> -> JSON array of subpackage dirs
-  local all prev subs from to res add
+  local all prev subs from to res add recs c ranges
   all=$(subpackages_at "$2") || return 1
   if [ "$all" = '[]' ]; then
     echo '[]'
     return 0
   fi
-  prev=$(highest_stable . "$(core "$1")")
+  prev=$(highest_stable . "$(core "$1")") || return 1
   prev=${prev#* }
   if [ -z "$prev" ]; then
     echo "$all"
     return 0
   fi
+  recs=$(reconciliations_in "$prev" "$2") || return 1
+  ranges="$prev $2"
+  while IFS= read -r c; do
+    [ -z "$c" ] || ranges+=$'\n'"${c}^1 ${c}"
+  done <<<"$recs"
   subs='[]'
   while read -r from to; do
     res=$(MODE=paths FROM="$from" TO="$to" SUBPACKAGES_JSON="$all" GO_LANES_JSON='[]' bash "$TOOLS/path-significance.sh") || return 1
     add=$(sed -n 's/^subpackages_to_publish=//p' <<<"$res")
     subs=$(jq -c --argjson add "$add" 'reduce $add[] as $x (.; if any(.[]; . == $x) then . else . + [$x] end)' <<<"$subs")
-  done < <(
-    echo "$prev $2"
-    reconciliations_in "$prev" "$2" | sed -n 's/^\(.\+\)$/\1^1 \1/p'
-  )
+  done <<<"$ranges"
   printf '%s\n' "$subs"
 }
 
 cmd_receipts() {
-  local state="${STATE:?}" repo="${GITHUB_REPOSITORY:?}" repairs='[]' key tag commit kind contexts site subs shas floor
+  local state="${STATE:?}" repo="${GITHUB_REPOSITORY:?}" repairs='[]' key tag commit kind contexts site subs shas floor rows
+  rows=$(jq -r 'to_entries[] | select(.value.h_tag != "") | [.key, .value.h_tag, .value.h_commit, .value.repair_kind_note] | @tsv' <<<"$state") \
+    || die "STATE is not the pending step's state"
   while IFS=$'\t' read -r key tag commit kind; do
     [ -n "$key" ] || continue
     if ! contexts=$(gh api --paginate "repos/${repo}/commits/${commit}/statuses?per_page=100" \
@@ -300,7 +364,7 @@ cmd_receipts() {
     repairs=$(jq -c --arg k "$key" --arg lane "$(lane_dir "$key")" --arg tag "$tag" --arg commit "$commit" \
       --arg site "$site" --arg kind "$kind" --arg subs "$subs" \
       '. + [{key: $k, lane: $lane, tag: $tag, commit: $commit, site: $site, kind_note: $kind, subpackages: $subs}]' <<<"$repairs")
-  done < <(jq -r 'to_entries[] | select(.value.h_tag != "") | [.key, .value.h_tag, .value.h_commit, .value.repair_kind_note] | @tsv' <<<"$state")
+  done <<<"$rows"
   floor=$(notes_floor "$state" "$repairs") || die "could not date the notes ranges of this run"
   if ! shas=$(security_shas "$floor"); then
     die "could not list the merged security pull requests of ${repo}"
@@ -314,18 +378,19 @@ cmd_receipts() {
 # tag below a repaired version, else the lane's highest stable tag. Empty when
 # a lane has no such tag, since its range then starts at the root.
 notes_floor() { # <state> <repairs> -> epoch seconds, or nothing
-  local key h_tag h_commit base floor="" t
+  local key h_tag h_commit base floor="" t rows
+  rows=$(jq -r 'to_entries[] | [.key, .value.h_tag, .value.h_commit] | @tsv' <<<"$1") || return 1
   while IFS=$'\t' read -r key h_tag h_commit; do
     [ -n "$key" ] || continue
     base=$h_commit
     if jq -e --arg k "$key" 'any(.[]; .key == $k)' <<<"$2" >/dev/null; then
-      base=$(highest_stable "$key" "$(core "$h_tag")")
+      base=$(highest_stable "$key" "$(core "$h_tag")") || return 1
       base=${base#* }
     fi
     [ -n "$base" ] || return 0
     t=$(git log -1 --format=%ct "$base") || return 1
     if [ -z "$floor" ] || [ "$t" -lt "$floor" ]; then floor=$t; fi
-  done < <(jq -r 'to_entries[] | [.key, .value.h_tag, .value.h_commit] | @tsv' <<<"$1")
+  done <<<"$rows"
   printf '%s' "$floor"
 }
 # A promotion's range reaches dev's own merges through R's second parent, and a
@@ -425,23 +490,27 @@ verified_at() { # <image@digest> <commit> <signature|sbom>: 0 when docker-releas
 # A stable tag published before its repository released from dev may be
 # served by a build signed at a later first-parent commit that re-pushed the
 # tag, so the window runs from the tag's commit up to the lane's next stable tag.
-publishing_window() { # <tag> <commit> -> the tag's commit, then each later commit that may have re-pushed the tag
-  local c name
+publishing_window() { # <tag> <commit> -> the tag's commit, then each later commit that may have re-pushed the tag; fails when the ancestry-path walk or a later commit's tag list fails
+  local c name revs names
   printf '%s\n' "$2"
   git merge-base --is-ancestor "$2" HEAD || return 0
+  revs=$(git rev-list --first-parent --ancestry-path --reverse "$2..HEAD") || return 1
   while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    names=$(git tag --points-at "$c") || return 1
     while IFS= read -r name; do
       if [[ $name =~ $(stable_re .) ]] && [ "$name" != "$1" ]; then
         return 0
       fi
-    done < <(git tag --points-at "$c")
+    done <<<"$names"
     printf '%s\n' "$c"
-  done < <(git rev-list --first-parent --ancestry-path --reverse "$2..HEAD")
+  done <<<"$revs"
 }
-window_order() { # <tag> <commit> -> publishing_window, the tag's commit first, then newest first
+window_order() { # <tag> <commit> -> publishing_window, the tag's commit first, then newest first; fails with it
   local -a w
-  local i
-  mapfile -t w < <(publishing_window "$1" "$2")
+  local i win
+  win=$(publishing_window "$1" "$2") || return 1
+  mapfile -t w <<<"$win"
   printf '%s\n' "${w[0]}"
   for ((i = ${#w[@]} - 1; i > 0; i--)); do
     printf '%s\n' "${w[i]}"
@@ -536,14 +605,16 @@ readback_image() { # <tag>
   fi
   git cat-file -e "${commit}:grafana-dashboard.json" 2>/dev/null || return 0
   dash=$(ghcr_digest "${IMAGE}/dashboard" "$tag" application/vnd.oci.image.manifest.v1+json)
-  if [ -z "$dash" ] || ! signed_in_window "ghcr.io/${IMAGE}/dashboard@${dash}" "$(window_order "$tag" "$commit")"; then
+  window=$(window_order "$tag" "$commit") || die "cannot tell which commits could have signed ${tag}'s dashboard"
+  if [ -z "$dash" ] || ! signed_in_window "ghcr.io/${IMAGE}/dashboard@${dash}" "$window"; then
     die "ghcr.io/${IMAGE}/dashboard:${tag} is '${dash}', which no docker-release.yaml run at ${commit} or a later main commit below the next stable tag signed"
   fi
   echo "ok: ghcr.io/${IMAGE}/dashboard:${tag} -> ${dash}"
 }
 
 cmd_readback() { # <site> <tag> [lane]; SUBPACKAGES: the root release's subpackage dirs (JSON)
-  local site="${1:?}" tag="${2:?}" lane="${3:-}" mod pkg sub ver="${2##*/}"
+  local site="${1:?}" tag="${2:?}" lane="${3:-}" mod pkg sub subs ver="${2##*/}"
+  subs=$(jq -r '.[]' <<<"${SUBPACKAGES:-[]}") || die "SUBPACKAGES '${SUBPACKAGES:-}' is not a JSON array of subpackage dirs"
   case "$site" in
     go | lane)
       mod=$(git show "${tag}:${lane:+$lane/}go.mod" | awk '$1=="module"{print $2; exit}' | tr -d '"' | sed 's/[A-Z]/!\L&/g')
@@ -563,7 +634,7 @@ cmd_readback() { # <site> <tag> [lane]; SUBPACKAGES: the root release's subpacka
     pkg=$(git show "${tag}:${sub}/package.json" | jq -r .name) || die "no ${sub}/package.json at ${tag}"
     answers "npm ${pkg}@${ver#v}" fetch "https://registry.npmjs.org/${pkg}/${ver#v}" || return 1
     answers "jsr ${pkg}@${ver#v}" fetch "https://jsr.io/${pkg}/${ver#v}_meta.json" || return 1
-  done < <(jq -r '.[]' <<<"${SUBPACKAGES:-[]}")
+  done <<<"$subs"
 }
 
 dev_published() { # <key> <dev tag> -> 0 once every registry the lane's dev channel writes serves the tag
@@ -572,51 +643,62 @@ dev_published() { # <key> <dev tag> -> 0 once every registry the lane's dev chan
   pkg=$(jq -r .name package.json) || return 1
   answers "npm ${pkg}@${2#v}" fetch "https://registry.npmjs.org/${pkg}/${2#v}" >/dev/null
 }
+# has_dev_above and built_past answer the barrier's rank question, so they die
+# on an unreadable tag list rather than answer no: run them in the main shell.
 has_dev_above() { # <key> <X.Y.Z> -> 0 when a published dev build of the lane on dev's history ranks above X.Y.Z
-  local name c
+  local name c tags
+  tags=$(tags_of "$(dev_re "$1")") || die "cannot read lane ${1}'s dev tags"
   while read -r name c; do
+    [ -n "$name" ] || continue
     if gt "$(core "$name")" "$2" && git merge-base --is-ancestor "$c" refs/remotes/origin/dev && dev_published "$1" "$name"; then
       return 0
     fi
-  done < <(tags_of "$(dev_re "$1")")
+  done <<<"$tags"
   return 1
 }
 built_past() { # <key> <T> -> 0 when dev's history holds a dev build of the lane that T cannot reach
-  local name c
+  local name c tags
+  tags=$(tags_of "$(dev_re "$1")") || die "cannot read lane ${1}'s dev tags"
   while read -r name c; do
+    [ -n "$name" ] || continue
     if git merge-base --is-ancestor "$c" refs/remotes/origin/dev && ! git merge-base --is-ancestor "$c" "$2"; then
       return 0
     fi
-  done < <(tags_of "$(dev_re "$1")")
+  done <<<"$tags"
   return 1
 }
-newest_built() { # <key> <T> -> the newest first-parent dev commit past T carrying a dev tag of the lane, or nothing
-  local c
+newest_built() { # <key> <T> -> the newest first-parent dev commit past T carrying a dev tag of the lane, or nothing; fails when git cannot walk dev or list the tags
+  local c at revs
+  revs=$(git rev-list --first-parent "$2..refs/remotes/origin/dev") || return 1
   while IFS= read -r c; do
-    if [ -n "$(tags_at "$c" "$1")" ]; then
+    [ -n "$c" ] || continue
+    at=$(tags_at "$c" "$1") || return 1
+    if [ -n "$at" ]; then
       printf '%s' "$c"
       return 0
     fi
-  done < <(git rev-list --first-parent "$2..refs/remotes/origin/dev")
+  done <<<"$revs"
 }
 # Dev publishes a TS root's npm version and an image's GHCR tags before its git
 # tag, so a run that died in between left a build no dev tag shows. A newer
 # tagged build carries that build's content and renumber lifts it, so only a
 # build past the newest tagged one holds.
-untagged_past() { # <key> <T> -> a dev commit past T whose build is published untagged, newer than every tagged build; fails when a registry cannot tell
-  local c got res code pkg newest
+untagged_past() { # <key> <T> -> a dev commit past T whose build is published untagged, newer than every tagged build; fails when a registry answer, a first-parent walk of dev or the dev-tag list cannot be read
+  local c got res code pkg newest at revs heads
   [ "$1" = . ] || return 0
-  newest=$(newest_built "$1" "$2")
+  newest=$(newest_built "$1" "$2") || return 1
   case "${REPO_TYPE:-}" in
     docker)
+      revs=$(git rev-list --first-parent "$2..refs/remotes/origin/dev") || return 1
       while IFS= read -r c; do
+        [ -n "$c" ] || continue
         [ "$c" != "$newest" ] || return 0
         got=$(ghcr_state "${IMAGE:?}" "sha-${c}") || return 1
         if [ "$got" != absent ]; then
           printf '%s' "$c"
           return 0
         fi
-      done < <(git rev-list --first-parent "$2..refs/remotes/origin/dev")
+      done <<<"$revs"
       ;;
     ts)
       pkg=$(jq -r .name package.json) || return 1
@@ -628,35 +710,45 @@ untagged_past() { # <key> <T> -> a dev commit past T whose build is published un
         200) ;;
         *) return 1 ;;
       esac
+      heads=$(jq -r '.versions // {} | to_entries[] | select(.key | test("-dev\\.[0-9]+$")) | .value.gitHead // empty' <<<"${res%$'\n'*}" | sort -u) \
+        || return 1
       while IFS= read -r c; do
-        if git merge-base --is-ancestor "$c" refs/remotes/origin/dev 2>/dev/null \
-          && ! git merge-base --is-ancestor "$c" "$2" && [ -z "$(tags_at "$c" "$1")" ] \
-          && { [ -z "$newest" ] || ! git merge-base --is-ancestor "$c" "$newest"; }; then
+        [ -n "$c" ] || continue
+        if ! git merge-base --is-ancestor "$c" refs/remotes/origin/dev 2>/dev/null \
+          || git merge-base --is-ancestor "$c" "$2"; then
+          continue
+        fi
+        at=$(tags_at "$c" "$1") || return 1
+        if [ -z "$at" ] && { [ -z "$newest" ] || ! git merge-base --is-ancestor "$c" "$newest"; }; then
           printf '%s' "$c"
           return 0
         fi
-      done < <(jq -r '.versions // {} | to_entries[] | select(.key | test("-dev\\.[0-9]+$")) | .value.gitHead // empty' <<<"${res%$'\n'*}" | sort -u)
+      done <<<"$heads"
       ;;
   esac
 }
-tags_at() { # <commit> <key> -> the lane's dev tags on the commit
-  local name c
+tags_at() { # <commit> <key> -> the lane's dev tags on the commit; fails with tags_of
+  local name c tags
+  tags=$(tags_of "$(dev_re "$2")") || return 1
   while read -r name c; do
-    [ "$c" != "$1" ] || printf '%s\n' "$name"
-  done < <(tags_of "$(dev_re "$2")")
+    [ -z "$name" ] || [ "$c" != "$1" ] || printf '%s\n' "$name"
+  done <<<"$tags"
 }
 
 # A dev run publishes a TS subpackage only when its range changed it, and only
 # after the run's root tag, so no root dev tag shows whether it published.
 promoted_subpackages() { # <R> -> JSON array of the subpackages R's promotion publishes
-  local res
-  res=$(MODE=paths FROM="$1^1" TO="$1" SUBPACKAGES_JSON="$(subpackages_at "$1")" GO_LANES_JSON='[]' \
+  local res all
+  all=$(subpackages_at "$1") || return 1
+  res=$(MODE=paths FROM="$1^1" TO="$1" SUBPACKAGES_JSON="$all" GO_LANES_JSON='[]' \
     bash "$TOOLS/path-significance.sh") || return 1
   sed -n 's/^subpackages_to_publish=//p' <<<"$res"
 }
-last_change() { # <ref> <dir> -> the newest first-parent commit of ref whose own diff changes what the subpackage ships
-  local c from res
+last_change() { # <ref> <dir> -> the newest first-parent commit of ref whose own diff changes what the subpackage ships; fails when git cannot walk ref
+  local c from res revs
+  revs=$(git rev-list --first-parent "$1" -- "$2") || return 1
   while IFS= read -r c; do
+    [ -n "$c" ] || continue
     from=$(git rev-parse --verify --quiet "${c}^1") || from=$(git hash-object -t tree /dev/null)
     res=$(MODE=paths FROM="$from" TO="$c" SUBPACKAGES_JSON="$(jq -cn --arg d "$2" '[$d]')" GO_LANES_JSON='[]' \
       bash "$TOOLS/path-significance.sh") || return 1
@@ -664,7 +756,7 @@ last_change() { # <ref> <dir> -> the newest first-parent commit of ref whose own
       printf '%s' "$c"
       return 0
     fi
-  done < <(git rev-list --first-parent "$1" -- "$2")
+  done <<<"$revs"
 }
 sub_dev_heads() { # <dir> <commit> -> "<version> <gitHead>" per -dev.N version npm serves; nothing on a 404; fails when npm cannot tell
   local pkg res code
@@ -822,7 +914,7 @@ settle_dev_head() {
 # R finished, a release run of dev's head succeeded, and dev ranks above the
 # version published.
 cmd_barrier() {
-  local state="${STATE:?}" plan cutoff key r v c held need="" subrows="" subs s t st lacking waited="" recs
+  local state="${STATE:?}" plan cutoff key r v c p held need="" subrows="" subs s t st lacking waited="" recs rows
   : "${GITHUB_REPOSITORY:?}" "${WORKFLOW:?}" "${GITHUB_RUN_ID:?}"
   plan=$(jq -r --arg root "${ROOT_VERSION:-}" \
     'to_entries[] | select(.value.in_range) | [.key, .value.commit, (if .key == "." then $root else .value.version end)] | @tsv' <<<"$state")
@@ -863,14 +955,16 @@ cmd_barrier() {
   # its run must finish first: every dev run, as a later one may own it.
   held=""
   while IFS=$'\t' read -r key r v; do
-    c=$(untagged_past "$key" "$(git rev-parse "$r^2")") || die "lane ${key}: cannot tell whether dev holds a published, untagged build"
+    p=$(git rev-parse "$r^2") || die "lane ${key}: cannot read the commit ${r} promoted"
+    c=$(untagged_past "$key" "$p") || die "lane ${key}: cannot tell whether dev holds a published, untagged build"
     [ -z "$c" ] || held="${held}${key} "
   done <<<"$plan"
   if [ -n "$held" ]; then
     poll "every dev release run, as dev holds a published build with no dev tag" 2 pending_runs
     git fetch --quiet --force --tags origin '+refs/heads/dev:refs/remotes/origin/dev' || die "cannot fetch dev"
     while IFS=$'\t' read -r key r v; do
-      c=$(untagged_past "$key" "$(git rev-parse "$r^2")") || die "lane ${key}: cannot tell whether dev holds a published, untagged build"
+      p=$(git rev-parse "$r^2") || die "lane ${key}: cannot read the commit ${r} promoted"
+      c=$(untagged_past "$key" "$p") || die "lane ${key}: cannot tell whether dev holds a published, untagged build"
       [ -z "$c" ] || die "lane ${key}: dev's build of ${c} is published with no dev tag and no newer build is tagged, so its version cannot rank above ${v}. Dispatch ${WORKFLOW} on dev to build and tag dev's head, then rerun this run."
     done <<<"$plan"
   fi
@@ -888,9 +982,10 @@ cmd_barrier() {
   done <<<"$recs"
   if [ -n "$recs" ]; then
     t=$(git rev-parse "$(tail -n1 <<<"$recs")^2")
+    rows=$(jq -r '.[]' <<<"$subs")
     while IFS= read -r s; do
       [ -z "$s" ] || subrows+="${s}"$'\t'"${t}"$'\t'"${ROOT_VERSION:-}"$'\n'
-    done < <(jq -r '.[]' <<<"$subs")
+    done <<<"$rows"
   fi
   [ -z "$held" ] || waited=1
   lacking=$(subs_lacking "$subrows" incomplete)
@@ -907,9 +1002,10 @@ cmd_barrier() {
       note "subpackage ${s}: dev's change ${c} has no dev build on npm$([ "$st" = incomplete ] || echo " above the version")"
     done <<<"$lacking"
     while IFS=$'\t' read -r key r v; do
+      p=$(git rev-parse "$r^2") || die "lane ${key}: cannot read the commit ${r} promoted"
       if has_dev_above "$key" "$(core "$v")"; then
         echo "lane ${key}: dev already ranks above ${v}"
-      elif built_past "$key" "$(git rev-parse "$r^2")"; then
+      elif built_past "$key" "$p"; then
         note "lane ${key}: dev holds a build past the promoted commit numbered below ${v}"
         need="${need}${key} "
       else
@@ -946,7 +1042,8 @@ cmd_barrier() {
   REGISTRY_WAITED=0
   settle_dev_head
   while IFS=$'\t' read -r key r v; do
-    built_past "$key" "$(git rev-parse "$r^2")" || continue
+    p=$(git rev-parse "$r^2") || die "lane ${key}: cannot read the commit ${r} promoted"
+    built_past "$key" "$p" || continue
     has_dev_above "$key" "$(core "$v")" || die "lane ${key}: renumber run ${run_id} left no dev build above ${v}"
     echo "lane ${key}: dev now ranks above ${v}"
   done <<<"$plan"
@@ -966,7 +1063,7 @@ cmd_barrier() {
 # EXPECT_COMMIT: the build an earlier job numbered; a newer one refuses.
 cmd_renumber_target() {
   local key="${LANE_KEY:?}" d_tag d
-  d_tag=$(nearest_dev_tag HEAD "$key")
+  d_tag=$(nearest_dev_tag HEAD "$key") || die "cannot read lane ${key}'s dev tags"
   if [ -z "$d_tag" ]; then
     note "lane ${key}: this branch has no dev build, so nothing is renumbered"
     out "commit="
@@ -1010,7 +1107,7 @@ renumber_build() { # <key> <new dev version> -> the build at HEAD to renumber, o
   local key=$1 new=$2 d_tag d
   [ "${CHANNEL:-}" = dev ] || die "renumber runs on the dev channel only"
   [[ $new =~ $(dev_re "$key") ]] || die "'${new}' is not a dev version of lane ${key}"
-  d_tag=$(nearest_dev_tag HEAD "$key")
+  d_tag=$(nearest_dev_tag HEAD "$key") || die "cannot read lane ${key}'s dev tags"
   if [ -z "$d_tag" ]; then
     note "lane ${key}: this branch has no dev build, so nothing is renumbered"
     return 0
@@ -1056,14 +1153,16 @@ handoff_name() { # <prefix> <id> -> an artifact name unique per id, which may ho
 # subpackage the barrier finds without a dev build, or below the pending
 # version, is published from this build under its newest dev tag.
 cmd_renumber_subpackages() {
-  local state="${STATE:?}" d_tag r v t="" s st c dirs='[]'
+  local state="${STATE:?}" d_tag r v t="" s st c dirs='[]' all rows
   [ "${CHANNEL:-}" = dev ] || die "renumber runs on the dev channel only"
-  d_tag=$(nearest_dev_tag HEAD .)
+  d_tag=$(nearest_dev_tag HEAD .) || die "cannot read lane .'s dev tags"
   [ -n "$d_tag" ] && [ "$(git rev-list -n1 "$d_tag")" = "$(git rev-parse HEAD)" ] \
     || die "HEAD is not the root's newest dev build. Check that build out with renumber-target first."
   r=$(jq -r '.["."].commit // ""' <<<"$state")
   v=$(jq -r '.["."].version // ""' <<<"$state")
   [ -z "$r" ] || t=$(git rev-parse "$r^2")
+  all=$(subpackages_at HEAD) || die "cannot list the subpackages of the build ${d_tag}"
+  rows=$(jq -r '.[]' <<<"$all")
   while IFS= read -r s; do
     [ -n "$s" ] || continue
     st=$(sub_dev_state "$s" "$t" "${v:-v0.0.0}") || die "subpackage ${s}: cannot tell whether npm serves its newest dev build"
@@ -1075,7 +1174,7 @@ cmd_renumber_subpackages() {
     fi
     dirs=$(jq -c --arg s "$s" '. + [$s]' <<<"$dirs")
     echo "subpackage ${s}: publishing the build ${d_tag} for dev's change ${c}"
-  done < <(jq -r '.[]' <<<"$(subpackages_at HEAD)")
+  done <<<"$rows"
   out "version=${d_tag}" "dirs=${dirs}"
 }
 
@@ -1122,7 +1221,7 @@ cmd_renumber() {
 }
 
 case "${1:-}" in
-  pending | publish | number | receipts | renumber) "cmd_$1" ;;
+  pending | publish | ahead | number | receipts | renumber) "cmd_$1" ;;
   barrier)
     rc=0
     timeout --kill-after=10 "$BARRIER_SECONDS" "$BASH" "${BASH_SOURCE[0]}" barrier-wait || rc=$?
@@ -1146,5 +1245,5 @@ case "${1:-}" in
     shift
     "$cmd" "$@"
     ;;
-  *) die "usage: release-state.sh pending|publish|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
+  *) die "usage: release-state.sh pending|publish|ahead|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
 esac
