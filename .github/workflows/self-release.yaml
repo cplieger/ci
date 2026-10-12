@@ -180,7 +180,7 @@ jobs:
             # MINUS this list, so it fails SAFE: a NEW reusable workflow
             # auto-propagates, while a forgotten new internal one only costs one
             # harmless extra bump (noticed via the needless PRs, then added here).
-            INTERNAL_WORKFLOWS="audit.yaml daily-security.yaml ghcr-retention.yaml move-major-tag.yaml notify-failure.yaml promote.yaml rebuild-stale.yaml release-maintenance.yaml self-ci.yaml self-codeql.yml self-release.yaml sync.yaml sync-hub-overviews.yaml trigger-renovate.yaml weekly-bench.yaml weekly-fuzz.yaml weekly-gremlins.yaml weekly-links.yaml weekly-stryker.yaml backfill-release-sbom-sigs.yaml"
+            INTERNAL_WORKFLOWS="audit.yaml daily-security.yaml ghcr-retention.yaml move-major-tag.yaml promote.yaml rebuild-stale.yaml release-maintenance.yaml self-ci.yaml self-codeql.yml self-release.yaml sync.yaml sync-hub-overviews.yaml trigger-renovate.yaml weekly-bench.yaml weekly-fuzz.yaml weekly-gremlins.yaml weekly-links.yaml weekly-stryker.yaml backfill-release-sbom-sigs.yaml"
 
             is_internal() {
               local base="$1"
@@ -192,7 +192,7 @@ jobs:
 
             # Renovate periodically rewrites this repo's OWN SHA self-pins
             # (`uses: cplieger/ci/...@<40-hex> # vN`) when the moving major tag
-            # advances. Nine such pins exist: four under workflow-templates/
+            # advances. Ten such pins exist: five under workflow-templates/
             # (Channel 1, propagated by sync.yaml and NOT matched by this gate's
             # globs) and five composite-action pins in consumed workflows (ci.yaml,
             # docker-release.yaml, ts-ci.yaml). Those edit a Channel-2 file yet
@@ -348,10 +348,7 @@ jobs:
             --title "${VERSION}" \
             --notes-file /tmp/RELEASE_NOTES.md
 
-  # `needs:` must list every other job in this workflow. The push-to-main
-  # trigger is a branch push, which notify-failure.yaml's track gate never
-  # reaches (the merging agent watches the post-merge run); a workflow_dispatch
-  # run gets the duration policy, so a short manual run files nothing.
+  # `needs:` must list every other job in this workflow.
   notify:
     needs: release
     if: always()
