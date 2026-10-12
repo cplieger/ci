@@ -65,20 +65,22 @@ git fetch --tags --quiet origin 2>/dev/null || true
 err="$(mktemp)"
 trap 'rm -f "$err"' EXIT
 
-nearest_tag() { # <regex> -> the tag matching it on the commit nearest HEAD, or nothing
+nearest_tag() { # <regex> -> the tag matching it on the commit nearest HEAD, or nothing; fails when git cannot list the tags or walk HEAD
   local -A tag_at=()
-  local name obj peeled commit
+  local name obj peeled commit refs revs
+  refs="$(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)')" || return 1
   while read -r name obj peeled; do
     [[ $name =~ $1 ]] || continue
     tag_at["${peeled:-$obj}"]="$name"
-  done < <(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)')
+  done <<<"$refs"
   [ "${#tag_at[@]}" -gt 0 ] || return 0
+  revs="$(git rev-list --topo-order HEAD)" || return 1
   while read -r commit; do
     if [ -n "${tag_at[$commit]:-}" ]; then
       printf '%s' "${tag_at[$commit]}"
       return 0
     fi
-  done < <(git rev-list --topo-order HEAD)
+  done <<<"$revs"
 }
 
 patch_bump() { # vX.Y.Z (with optional lane prefix) -> vX.Y.(Z+1)
@@ -86,10 +88,11 @@ patch_bump() { # vX.Y.Z (with optional lane prefix) -> vX.Y.(Z+1)
   IFS=. read -r major minor patch <<<"$bare"
   printf '%sv%s.%s.%s' "$PREFIX" "$major" "$minor" "$((patch + 1))"
 }
-dev_version() { # base -> base-dev.<count of existing base-dev.* tags + 1>
-  local base_re n
+dev_version() { # base -> base-dev.<count of existing base-dev.* tags + 1>; fails when git cannot list the tags
+  local base_re n tags
   base_re="$(printf '%s' "$1" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')"
-  n="$(git tag --list "$1-dev.*" | grep -cE "^${base_re}-dev\.[0-9]+\$" || true)"
+  tags="$(git tag --list "$1-dev.*")" || return 1
+  n="$(grep -cE "^${base_re}-dev\.[0-9]+\$" <<<"$tags" || true)"
   printf '%s-dev.%s' "$1" "$((n + 1))"
 }
 
@@ -137,22 +140,36 @@ level_between() { # <from> <to> -> the largest component <to> raises over <from>
     echo none
   fi
 }
-stable_tags() { # -> "<tag> <commit>" per stable tag of the lane, all refs
-  local name obj peeled
+stable_tags() { # -> "<tag> <commit>" per stable tag of the lane, all refs; fails when git cannot list the tags
+  local name obj peeled refs
+  refs="$(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)')" || return 1
   while read -r name obj peeled; do
     [[ $name =~ $PATTERN ]] || continue
     printf '%s %s\n' "$name" "${peeled:-$obj}"
-  done < <(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)')
+  done <<<"$refs"
 }
-tags_in_range() { # <from> <to> -> "<tag> " per stable tag of the lane on a commit of from..to
+tags_in_range() { # <from> <to> -> "<tag> " per stable tag of the lane on a commit of from..to; fails when git cannot list the range or the tags
   local -A in_range=()
-  local c name commit
+  local c name commit revs tags
+  revs="$(git rev-list "$1..$2")" || return 1
   while IFS= read -r c; do
+    [ -n "$c" ] || continue
     in_range["$c"]=1
-  done < <(git rev-list "$1..$2")
+  done <<<"$revs"
+  tags="$(stable_tags)" || return 1
   while read -r name commit; do
+    [ -n "$name" ] || continue
     [ -z "${in_range[$commit]:-}" ] || printf '%s ' "$name"
-  done < <(stable_tags)
+  done <<<"$tags"
+}
+is_ancestor() { # <a> <b> -> 0 when a is an ancestor of b, 1 when not; exits when git cannot tell
+  local rc=0
+  git merge-base --is-ancestor "$1" "$2" || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    echo "::error::git cannot tell whether ${1} is an ancestor of ${2}"
+    exit 1
+  fi
+  return "$rc"
 }
 # git-cliff supplies the change level only, read as its proposal against its
 # own base under the repo's [bump] rules (a 0.x breaking change is a minor on
@@ -161,13 +178,20 @@ tags_in_range() { # <from> <to> -> "<tag> " per stable tag of the lane on a comm
 # inside a range (main's rise along its chain, dev commits carry none);
 # git-cliff would split there, so refuse.
 cliff_level() { # <from> <to> -> sets LEVEL and CLIFF_VERSION (its proposal)
-  local ctx fields prev ver tagged
+  local ctx fields prev ver tagged to
   local -a range
   # git-cliff takes a single revision as a commit id only.
-  range=("$(git rev-parse --verify "$2^{commit}")")
+  to="$(git rev-parse --verify "$2^{commit}")" || {
+    echo "::error::git cannot resolve ${2} to a commit, so git-cliff has no revision to read"
+    exit 1
+  }
+  range=("$to")
   if [ -n "$1" ]; then
     range=("$1..$2")
-    tagged="$(tags_in_range "$1" "$2")"
+    tagged="$(tags_in_range "$1" "$2")" || {
+      echo "::error::git cannot list the stable tags or the commits of ${range[*]}"
+      exit 1
+    }
     if [ -n "$tagged" ]; then
       echo "::error::stable tags ${tagged}sit inside ${range[*]}, so no change level is read across them"
       exit 1
@@ -209,9 +233,14 @@ promotion_version() { # <H> <level> -> the next major for a breaking range, else
 # P being the highest stable tag on any other commit.
 # <R>: a promotion release-state.sh pending found affecting the lane.
 pending_version_of() { # <R> -> the version the pending promotion publishes
-  local r="$1" name commit lowest="" p="" p_commit=""
+  local r="$1" name commit lowest="" p="" p_commit="" tags
+  tags="$(stable_tags)" || {
+    echo "::error::git cannot list the tags, so the stable tags on ${r} are unknown"
+    exit 1
+  }
   while read -r name commit; do
-    if git merge-base --is-ancestor "$r" "$commit"; then
+    [ -n "$name" ] || continue
+    if is_ancestor "$r" "$commit"; then
       if [ -z "$lowest" ] || version_gt "$lowest" "$name"; then
         lowest="$name"
       fi
@@ -219,7 +248,7 @@ pending_version_of() { # <R> -> the version the pending promotion publishes
       p="$name"
       p_commit="$commit"
     fi
-  done < <(stable_tags)
+  done <<<"$tags"
   if [ -n "$lowest" ]; then
     printf '%s\n' "$lowest"
     return 0
@@ -235,25 +264,48 @@ pending_version_of() { # <R> -> the version the pending promotion publishes
 # shellcheck source=SCRIPTDIR/../../scripts/reconciliation.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/../../scripts/reconciliation.sh"
 
+is_promotion() { # <commit> -> 0 when it is a reconciliation commit, 1 when not; exits when the commit is unknown or git cannot read it
+  local rc=0
+  is_reconciliation "$1" || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    echo "::error::cannot tell whether '${1}' is a promotion commit"
+    exit 1
+  fi
+  return "$rc"
+}
+
 if [ -n "$PENDING_OF" ]; then
-  if ! is_reconciliation "$PENDING_OF"; then
+  if ! is_promotion "$PENDING_OF"; then
     echo "::error::'${PENDING_OF}' is not a reconciliation commit, so it is not numbered as a promotion"
     exit 1
   fi
-  pending_version_of "$(git rev-parse "$PENDING_OF^{commit}")"
+  R="$(git rev-parse "$PENDING_OF^{commit}")" || {
+    echo "::error::git cannot resolve '${PENDING_OF}' to a commit"
+    exit 1
+  }
+  pending_version_of "$R"
   exit 0
 fi
 
 DEV_PATTERN="${PATTERN%\$}-dev\\.[0-9]+\$"
-REACHABLE_STABLE="$(nearest_tag "$PATTERN")"
+REACHABLE_STABLE="$(nearest_tag "$PATTERN")" || {
+  echo "::error::git cannot list the tags or walk HEAD, so the nearest stable tag is unknown"
+  exit 1
+}
 if [ "$CHANNEL" = dev ]; then
-  ANCHOR_REF="$(nearest_tag "${PATTERN}|${DEV_PATTERN}")"
+  ANCHOR_REF="$(nearest_tag "${PATTERN}|${DEV_PATTERN}")" || {
+    echo "::error::git cannot list the tags or walk HEAD, so the nearest stable or dev tag is unknown"
+    exit 1
+  }
 else
   ANCHOR_REF="$REACHABLE_STABLE"
 fi
 ANCHOR_SHA=""
 if [ -n "$ANCHOR_REF" ]; then
-  ANCHOR_SHA="$(git rev-list -n1 "$ANCHOR_REF")"
+  ANCHOR_SHA="$(git rev-list -n1 "$ANCHOR_REF")" || {
+    echo "::error::git cannot resolve the anchor tag ${ANCHOR_REF} to a commit"
+    exit 1
+  }
 fi
 
 PENDING_VERSION="${PENDING_VERSION:-}"
@@ -285,27 +337,25 @@ if [ -n "$PENDING_COMMIT" ]; then
     echo "::error::pending-commit '${PENDING_COMMIT}' is not a 40-character commit id"
     exit 1
   fi
-  rc=0
-  is_reconciliation "$PENDING_COMMIT" || rc=$?
-  case "$rc" in
-    0) ;;
-    1)
-      echo "::error::'${PENDING_COMMIT}' is not a promotion commit, so it is no range floor"
-      exit 1
-      ;;
-    *)
-      echo "::error::cannot tell whether '${PENDING_COMMIT}' is a promotion commit"
-      exit 1
-      ;;
-  esac
+  if ! is_promotion "$PENDING_COMMIT"; then
+    echo "::error::'${PENDING_COMMIT}' is not a promotion commit, so it is no range floor"
+    exit 1
+  fi
 fi
 if [ "$CHANNEL" = dev ] && [ "${PENDING_VERSION:+set}" != "${PENDING_COMMIT:+set}" ]; then
   echo "::error::pending-version and pending-commit name one pending promotion, so both or neither are set"
   exit 1
 fi
 
-HEAD_SHA="$(git rev-parse HEAD)"
+HEAD_SHA="$(git rev-parse HEAD)" || {
+  echo "::error::git cannot resolve HEAD, so the stable tag on HEAD is unknown"
+  exit 1
+}
 H_TAG="" H_COMMIT="" HEAD_TAG=""
+TAGS="$(stable_tags)" || {
+  echo "::error::git cannot list the tags, so the highest stable tag is unknown"
+  exit 1
+}
 while read -r name commit; do
   if [ -z "$H_TAG" ] || version_gt "$name" "$H_TAG"; then
     H_TAG="$name"
@@ -314,11 +364,11 @@ while read -r name commit; do
   if [ "$commit" = "$HEAD_SHA" ] && { [ -z "$HEAD_TAG" ] || version_gt "$name" "$HEAD_TAG"; }; then
     HEAD_TAG="$name"
   fi
-done < <(stable_tags)
+done <<<"$TAGS"
 # Every stable tag sits on main's history, so a stable HEAD that does not
 # contain H is an older commit (a re-run after a newer release): numbering it
 # above H would publish older content as the newest version.
-if [ "$CHANNEL" = stable ] && [ -n "$H_COMMIT" ] && ! git merge-base --is-ancestor "$H_COMMIT" HEAD; then
+if [ "$CHANNEL" = stable ] && [ -n "$H_COMMIT" ] && ! is_ancestor "$H_COMMIT" HEAD; then
   echo "::error::the highest stable tag ${H_TAG} is on ${H_COMMIT}, which HEAD does not contain, so an older commit is not published above it"
   exit 1
 fi
@@ -358,7 +408,10 @@ case "$BASE" in
     ;;
 esac
 
-DEV_VERSION="$(dev_version "$BASE")"
+DEV_VERSION="$(dev_version "$BASE")" || {
+  echo "::error::git cannot list the ${BASE}-dev.* tags, so the dev counter is unknown"
+  exit 1
+}
 if [ "$BASE" = "$LATEST" ]; then
   RELEASE=false
 else
