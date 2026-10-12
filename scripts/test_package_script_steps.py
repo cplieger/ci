@@ -165,8 +165,7 @@ class RunStryker(Harness):
         super().setUp()
         scripts = self.workspace / 'scripts'
         scripts.mkdir()
-        for name in ('patch-vitest-runner-separator.py', 'patch-vitest-browser-bail.py'):
-            (scripts / name).write_text(PATCH_STUB)
+        (scripts / 'patch-vitest-runner-separator.py').write_text(PATCH_STUB)
         bin_dir = self.pkg / 'node_modules' / '.bin'
         bin_dir.mkdir(parents=True)
         write_exec(bin_dir / 'stryker', STRYKER_STUB)
