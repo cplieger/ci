@@ -173,6 +173,14 @@ put web/knip.json '{}'
 put web/knip.config.ts 'export default {}'
 D8=$(commit "refactor: dead-code adjudications only")
 chk "S11d deadset and knip configs ship nothing" "$(paths "$D7" "$D8")" 'false|[]|[]|[]'
+put socket.yml 'version: 2'
+put corpus.lock.json '{}'
+put api-surface.json '{}'
+D9=$(commit "chore: test inputs and scanner config only")
+chk "S11t the Socket config and test-only inputs ship nothing" "$(paths "$D8" "$D9")" 'false|[]|[]|[]'
+put web/api-surface.json '{}'
+D10=$(commit "feat(web): a nested api-surface.json")
+chk "S11t a nested api-surface.json is not the root test snapshot" "$(paths "$D9" "$D10")" 'true|[]|[]|["web/api-surface.json"]'
 
 # ── A ts repo: the root package.json is the published manifest ───────────────
 export REPO_TYPE=ts

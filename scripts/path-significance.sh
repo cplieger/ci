@@ -103,7 +103,13 @@ EXCLUDE_PATTERNS=(
   '(^|/)\.codeql-suppressions\.yaml$'
   '(^|/)\.trivyignore$'
   '(^|/)\.syft\.yaml$'
+  '(^|/)socket\.ya?ml$'
   '^\.github/'
+
+  # Test-only inputs read by a test, never by shipped code: deadset-ts's
+  # conformance-corpus pin and API snapshot.
+  '^corpus\.lock\.json$'
+  '^api-surface\.json$'
 
   # Go test code
   '_test\.go$'
