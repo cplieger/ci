@@ -170,7 +170,7 @@ is_rebuild_commit() { # <commit>
   case "$(git log -1 --format=%s "$1")" in
     "$REBUILD_SUBJECT" | "$REBUILD_SUBJECT (#"*")") return 0 ;;
   esac
-  note "commit $1 changes no file and is not a rebuild request; not significant"
+  note "commit $1 changes no file and is not a rebuild request, so it is not significant"
   return 1
 }
 EMPTY_COMMIT=""
@@ -179,7 +179,7 @@ if [ -z "$SIGNIFICANT" ] && [ -n "$RANGE_START" ] && [ "${REPO_TYPE:-}" = docker
     [ -z "$c" ] && continue
     if is_rebuild_commit "$c"; then
       EMPTY_COMMIT="$c"
-      note "commit ${c} is a rebuild request; treating it as a significant root change"
+      note "commit ${c} is a rebuild request, so it counts as a significant root change"
       break
     fi
   done < <(git rev-list --no-merges "$RANGE_START..$HEAD")

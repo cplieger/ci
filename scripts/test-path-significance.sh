@@ -123,7 +123,7 @@ chk "S4 the rebuild subject is rebuild-stale.sh's" \
 chk "S4 and promote-digest.sh's" "$(grep -cxF "REBUILD_SUBJECT='${REBUILD_SUBJECT}'" "$TOOLS/promote-digest.sh")" "1"
 D3S=$(commit "chore(sync): synced file(s) with cplieger/ci (#40)")
 chk "S4 an empty machine commit is no root change" "$(release S4s stable "$D3" "$D3" "$D3S")" "false|[]|[]"
-chk_has "S4 and says why" "$(cat "$WORK/log")" "commit $D3S changes no file and is not a rebuild request"
+chk_has "S4 and says why" "$(cat "$WORK/log")" "commit $D3S changes no file and is not a rebuild request, so it is not significant"
 D3R=$(commit "$REBUILD_SUBJECT")
 chk "S4 rebuild-stale.sh's empty commit is a root change" "$(release S4u stable "$D3S" "$D3S" "$D3R")" "true|[]|[]"
 D4=$(commit "${REBUILD_SUBJECT} (#41)")
