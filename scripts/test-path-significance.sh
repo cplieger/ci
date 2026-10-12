@@ -151,9 +151,13 @@ D3=$(commit "fix(deps): bump b")
 chk "S3 a docker repo's package.json is never a published manifest" "$(release S3 stable "$D2" "$D2" "$D3")" "false|[]|[]"
 chk_has "S3 and the log says so" "$(cat "$WORK/log")" "package.json is not a published manifest"
 REBUILD_SUBJECT=$(sed -n "s/^REBUILD_SUBJECT='\(.*\)'\$/\1/p" "$TOOLS/path-significance.sh")
-chk "S4 the rebuild subject is rebuild-stale.sh's" \
-  "$(grep -c -F -- "-f message='${REBUILD_SUBJECT}'" "$TOOLS/rebuild-stale.sh")|$(grep -c -F -- "-f title='${REBUILD_SUBJECT}'" "$TOOLS/rebuild-stale.sh")" "1|1"
-chk "S4 and promote-digest.sh's" "$(grep -cxF "REBUILD_SUBJECT='${REBUILD_SUBJECT}'" "$TOOLS/promote-digest.sh")" "1"
+[ -n "$REBUILD_SUBJECT" ] || fail "S4 path-significance.sh holds no REBUILD_SUBJECT"
+for f in rebuild-stale.sh promote-digest.sh; do
+  chk "S4 the rebuild subject is ${f}'s" "$(grep -cxF "REBUILD_SUBJECT='${REBUILD_SUBJECT}'" "$TOOLS/$f")" "1"
+done
+# shellcheck disable=SC2016 # the literal argument rebuild-stale.sh passes
+chk "S4 rebuild-stale.sh sends it as the commit message and the PR title" \
+  "$(grep -c -F -- '-f message="$REBUILD_SUBJECT"' "$TOOLS/rebuild-stale.sh")|$(grep -c -F -- '-f title="$REBUILD_SUBJECT"' "$TOOLS/rebuild-stale.sh")" "1|1"
 D3S=$(commit "chore(sync): synced file(s) with cplieger/ci (#40)")
 chk "S4 an empty machine commit is no root change" "$(release S4s stable "$D3" "$D3" "$D3S")" "false|[]|[]"
 chk_has "S4 and says why" "$(cat "$WORK/log")" "commit $D3S changes no file and is not a rebuild request, so it is not significant"
@@ -237,6 +241,85 @@ chk "S28 as is an unset one, when a package.json changed" "$(
   unset SUBPACKAGES_JSON
   paths "$D2" "$D3"
 )" 'false|[]|[]|[]'
+request() { # <from> <to> -> rebuild_request from MODE=paths stdout, or why there is none
+  # Called in a command substitution, where fail exits only the substitution
+  # and so reads as no request.
+  if ! (paths "$1" "$2" >/dev/null); then
+    echo "paths $1..$2 failed"
+  elif [ "$(grep -c '^rebuild_request=' "$WORK/pout")" != 1 ]; then
+    echo "paths $1..$2 printed no single rebuild_request line"
+  else
+    sed -n 's/^rebuild_request=//p' "$WORK/pout"
+  fi
+}
+chk "S30 MODE=paths names the rebuild request in range" "$(request "$D3S" "$D3R")" "$D3R"
+chk "S30 the newest of two" "$(request "$D3S" "$D4")" "$D4"
+chk "S30 none for an empty commit that is not one" "$(request "$D3" "$D3S")" ""
+chk "S30 and notes nothing about it" "$(grep -c '::notice::' "$WORK/perr" || true)" "0"
+chk "S30 none for a commit with files under the rebuild subject" "$(request "$D10" "$D11")" ""
+failing_paths() { # <argv glob> <N> <from> <to> -> the MODE=paths exit status|matching git calls; stderr in $WORK/perr
+  local rc
+  rm -f "$GIT_FAIL/n"
+  rc=$(FAIL_GIT="$1" FAIL_GIT_N="$2" PATH="$GIT_FAIL:$PATH" paths_rc "$3" "$4")
+  echo "$rc|$(git_calls)"
+}
+chk "S31 MODE=paths fails when the commits cannot be listed" \
+  "$(failing_paths 'rev-list --no-merges *' 1 "$D5" "$D6")" "2|1"
+chk_has "S31 and says which range" "$(cat "$WORK/perr")" "::error::path-significance: cannot list the commits of ${D5}..${D6}"
+chk "S31 as does a rebuild request whose subject git cannot read" \
+  "$(failing_paths "log -1 --format=%s $D3R" 1 "$D3S" "$D3R")" "2|1"
+chk_has "S31 and says so" "$(cat "$WORK/perr")" "::error::path-significance: cannot read the subject of commit $D3R"
+chk "S31 and one whose files git cannot read" \
+  "$(failing_paths "diff-tree --root --no-commit-id --name-only -r $D11" 1 "$D10" "$D11")" "2|1"
+chk_has "S31 and says so" "$(cat "$WORK/perr")" "::error::path-significance: cannot read the files commit $D11 changes"
+
+# ── Docker repos whose rebuild request sits beside a change the image ignores ─
+export GO_LANES_JSON='["lane"]'
+newrepo docker-lane
+put Dockerfile 'FROM scratch'
+put main.go 'package main'
+put lane/go.mod 'module example.com/app/lane'
+put lane/l.go 'package lane'
+L0=$(commit "feat: initial")
+put lane/l.go 'package lane // v2'
+commit "fix(lane): a lane change" >/dev/null
+L2=$(commit "$REBUILD_SUBJECT")
+chk "S32 a lane change beside a rebuild request still rebuilds the image" "$(release S32 stable "$L0" "$L0" "$L2")" 'true|[]|["lane"]'
+export GO_LANES_JSON='[]'
+newrepo docker-static
+put Dockerfile 'FROM scratch'
+put static-src/package.json '{"name":"client","devDependencies":{"a":"1"}}'
+P0=$(commit "feat: initial")
+put static-src/package.json '{"name":"client","devDependencies":{"a":"2"}}'
+commit "chore(devdeps): bump a" >/dev/null
+P2=$(commit "${REBUILD_SUBJECT} (#3)")
+chk "S33 a dropped package.json beside a rebuild request still rebuilds the image" "$(release S33 stable "$P0" "$P0" "$P2")" 'true|[]|[]'
+chk_has "S33 the summary names the request" "$(cat "$WORK/summary")" "(commit $P2 changes no file and counts as a root change)"
+
+# ── A promotion: dev's rebuild request on its second parent ─────────────────
+newrepo docker-promotion
+put Dockerfile 'FROM scratch'
+M0=$(commit "feat: initial")
+git checkout -q -b dev
+MD=$(commit "$REBUILD_SUBJECT")
+promote() { # <main parent> <dev parent> -> a promotion commit of the dev parent's tree
+  git commit-tree "${2}^{tree}" -p "$1" -p "$2" -m "release: promote dev into main"
+}
+MP=$(promote "$M0" "$MD")
+chk "S34 on stable a rebuild request reached only through a promotion's second parent is none" \
+  "$(REQUEST_CHANNEL=stable request "$M0" "$MP")" ""
+chk "S34 on dev it is the range's request" "$(REQUEST_CHANNEL=dev request "$M0" "$MP")" "$MD"
+chk "S34 as it is with no channel" "$(request "$M0" "$MP")" "$MD"
+git checkout -q -b main2 "$M0"
+MR=$(commit "${REBUILD_SUBJECT} (#2)")
+MP2=$(promote "$MR" "$MD")
+chk "S34 on stable a rebuild request on main's first parent is the range's" \
+  "$(REQUEST_CHANNEL=stable request "$M0" "$MP2")" "$MR"
+chk "S34 a stable range whose first-parent commits git cannot list fails" \
+  "$(REQUEST_CHANNEL=stable failing_paths 'rev-list --no-merges --first-parent *' 1 "$M0" "$MP2")" "2|1"
+chk_has "S34 and says which range" "$(cat "$WORK/perr")" "::error::path-significance: cannot list the commits of ${M0}..${MP2}"
+chk "S34 a channel that is neither dev nor stable fails" "$(REQUEST_CHANNEL=beta paths_rc "$M0" "$MP2")" "2"
+chk_has "S34 and says so" "$(cat "$WORK/perr")" "::error::path-significance: REQUEST_CHANNEL must be dev or stable, got 'beta'"
 
 # ── A ts repo: the root package.json is the published manifest ───────────────
 export REPO_TYPE=ts

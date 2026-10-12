@@ -4,8 +4,13 @@
 #   SUBPACKAGES_JSON GO_LANES_JSON; writes root_changed, subpackages_to_publish,
 #   go_modules_to_release and exclude_re to $GITHUB_OUTPUT, and a summary.
 # MODE=paths: env FROM TO REPO_TYPE SUBPACKAGES_JSON GO_LANES_JSON; the same
-#   keys plus `significant` (JSON array) on stdout. Tree diff FROM..TO only:
-#   no empty-commit rule, no lane tags. Exits 2 when the diff fails.
+#   keys plus `significant` (JSON array) and `rebuild_request` (the newest
+#   rebuild request in FROM..TO whatever REPO_TYPE is, empty for none) on
+#   stdout. REQUEST_CHANNEL=stable counts only TO's first-parent commits as
+#   rebuild requests, since a promotion's second parent brings dev's; unset or
+#   dev counts every non-merge commit. Tree diff FROM..TO only: the
+#   empty-commit rule sets no root_changed, no lane tags. Exits 2 when the
+#   diff or a commit read fails, or on another REQUEST_CHANNEL.
 # Either mode exits 2 on malformed directory JSON.
 set -euo pipefail
 
@@ -43,6 +48,10 @@ RANGE_START=""
 # (force push) counts every tracked file, so a dispatch stays the repair lever.
 if [ "$MODE" = paths ]; then
   : "${FROM:?MODE=paths needs FROM}" "${TO:?MODE=paths needs TO}"
+  case "${REQUEST_CHANNEL:-}" in
+    "" | dev | stable) ;;
+    *) die "REQUEST_CHANNEL must be dev or stable, got '${REQUEST_CHANNEL}'" ;;
+  esac
   if ! CHANGED=$(git diff --no-renames --name-only "$FROM..$TO"); then
     echo "::error::path-significance: cannot diff ${FROM}..${TO}" >&2
     exit 2
@@ -185,7 +194,7 @@ fi
 # neither releases. REBUILD_SUBJECT is rebuild-stale.sh's; test-path-significance.sh
 # holds the two equal.
 REBUILD_SUBJECT='fix(deps): rebuild against refreshed base packages'
-is_rebuild_commit() { # <commit> -> 0 when it is a rebuild request, 1 when not; dies when git cannot read it
+is_rebuild_request() { # <commit> -> 0 when it changes no file and carries REBUILD_SUBJECT, 1 when it changes a file, 3 when it is another empty commit; dies when git cannot read it
   local files subject
   files=$(git diff-tree --root --no-commit-id --name-only -r "$1") || die "cannot read the files commit $1 changes"
   [ -z "$files" ] || return 1
@@ -193,21 +202,14 @@ is_rebuild_commit() { # <commit> -> 0 when it is a rebuild request, 1 when not; 
   case "$subject" in
     "$REBUILD_SUBJECT" | "$REBUILD_SUBJECT (#"*")") return 0 ;;
   esac
-  note "commit $1 changes no file and is not a rebuild request, so it is not significant"
-  return 1
+  return 3
 }
-EMPTY_COMMIT=""
-if [ -z "$SIGNIFICANT" ] && [ -n "$RANGE_START" ] && [ "${REPO_TYPE:-}" = docker ]; then
-  REVS=$(git rev-list --no-merges "$RANGE_START..$HEAD") || die "cannot list the commits of ${RANGE_START}..${HEAD}"
-  while IFS= read -r c; do
-    [ -z "$c" ] && continue
-    if is_rebuild_commit "$c"; then
-      EMPTY_COMMIT="$c"
-      note "commit ${c} is a rebuild request, so it counts as a significant root change"
-      break
-    fi
-  done <<<"$REVS"
-fi
+is_rebuild_commit() { # <commit>: is_rebuild_request, noting an empty commit that is not one
+  local rc=0
+  is_rebuild_request "$1" || rc=$?
+  [ "$rc" -ne 3 ] || note "commit $1 changes no file and is not a rebuild request, so it is not significant"
+  return "$rc"
+}
 
 # package.json ships only as a published manifest (a declared TS subpackage's,
 # or the root one in a ts repo), and there only through its fields other than
@@ -285,9 +287,6 @@ for l in "${GO_LANES[@]}"; do
   fi
 done
 
-if [ -n "$EMPTY_COMMIT" ]; then
-  ROOT_CHANGED=true
-fi
 if [ -n "$SIGNIFICANT" ]; then
   while IFS= read -r f; do
     [ -z "$f" ] && continue
@@ -315,6 +314,28 @@ if [ -n "$SIGNIFICANT" ]; then
       ROOT_CHANGED=true
     fi
   done <<<"$SIGNIFICANT"
+fi
+
+# Scanned only after the refinement and the classification above, so a dropped
+# package.json or a lane-only change still leaves the image its rebuild. A
+# subpackage change already rebuilds the image through subpackages_to_publish.
+EMPTY_COMMIT=""
+subpkg_changed=false
+for s in "${SUBPACKAGES[@]}"; do
+  [ "${SUBPKG_CHANGED[$s]}" = false ] || subpkg_changed=true
+done
+if [ "$ROOT_CHANGED" = false ] && [ "$subpkg_changed" = false ] \
+  && [ -n "$RANGE_START" ] && [ "${REPO_TYPE:-}" = docker ]; then
+  REVS=$(git rev-list --no-merges "$RANGE_START..$HEAD") || die "cannot list the commits of ${RANGE_START}..${HEAD}"
+  while IFS= read -r c; do
+    [ -z "$c" ] && continue
+    if is_rebuild_commit "$c"; then
+      EMPTY_COMMIT="$c"
+      ROOT_CHANGED=true
+      note "commit ${c} is a rebuild request, so it counts as a significant root change"
+      break
+    fi
+  done <<<"$REVS"
 fi
 
 # A tagged lane is owed a release when a shipped path under it changed since
@@ -351,11 +372,23 @@ for l in "${GO_LANES[@]}"; do
 done
 
 if [ "$MODE" = paths ]; then
+  WALK=(--no-merges)
+  [ "${REQUEST_CHANNEL:-}" != stable ] || WALK+=(--first-parent)
+  REVS=$(git rev-list "${WALK[@]}" "$FROM..$TO") || die "cannot list the commits of ${FROM}..${TO}"
+  REBUILD_REQUEST=""
+  while IFS= read -r c; do
+    [ -z "$c" ] && continue
+    if is_rebuild_request "$c"; then
+      REBUILD_REQUEST="$c"
+      break
+    fi
+  done <<<"$REVS"
   echo "root_changed=$ROOT_CHANGED"
   echo "subpackages_to_publish=$SUBS_TO_PUBLISH"
   echo "go_modules_to_release=$GO_LANES_TO_RELEASE"
   echo "exclude_re=$EXCLUDE_RE"
   echo "significant=$(printf '%s' "$SIGNIFICANT" | jq -Rsc 'split("\n") | map(select(. != ""))')"
+  echo "rebuild_request=$REBUILD_REQUEST"
   exit 0
 fi
 

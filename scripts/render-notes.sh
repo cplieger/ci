@@ -4,6 +4,8 @@
 #   [--lane DIR] [--go-lanes JSON] [--kind-note TEXT] [--sbom-prev F --sbom-new F]
 #   [--security-shas F] [--inventory PATH] [--config FILE]; --print-previous, without --out,
 #   prints the lane's previous stable tag by version (the range start) and stops.
+#   [--sbom-changes] --sbom-prev F --sbom-new F alone prints the number of package
+#   changes the System packages block would list, and stops.
 # The notes cover previous..--release-commit plus the dependency and package diffs.
 # git-cliff executes the repo's cliff config: no token here.
 set -euo pipefail
@@ -14,12 +16,13 @@ die() {
 }
 
 SITE="" VERSION="" OUT="" COMMIT="" LANE="" GO_LANES_JSON="[]"
-PRINT_PREVIOUS=false KIND_NOTE="" REPO=""
+PRINT_PREVIOUS=false SBOM_CHANGES=false KIND_NOTE="" REPO=""
 SBOM_PREV="" SBOM_NEW="" SECURITY_SHAS="" CONFIG=""
 INVENTORY="$(dirname "$0")/inventory.py"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --print-previous) PRINT_PREVIOUS=true ;;
+    --sbom-changes) SBOM_CHANGES=true ;;
     --site | --version | --out | --release-commit | --lane | --go-lanes | --kind-note | --repo | --sbom-prev | --sbom-new | --security-shas | --inventory | --config)
       [ "$#" -ge 2 ] || die "$1 needs a value"
       case "$1" in
@@ -43,6 +46,48 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# shellcheck disable=SC2016 # jq program, not shell
+SBOM_CHANGES_JQ='
+def roots: [.documentDescribes // [] | .[]]
+  + [.relationships[]? | select(.relationshipType == "DESCRIBES" and .spdxElementId == "SPDXRef-DOCUMENT") | .relatedSpdxElement];
+def entries: roots as $r
+  | [ .packages[]?
+      | select(.SPDXID as $id | ($r | index($id)) == null)
+      | .name as $n
+      | { key: (([.externalRefs[]? | select(.referenceType == "purl") | .referenceLocator] | first // "")
+               | sub("@.*$"; "") | if . == "" then "name:" + $n else . end),
+          name: $n, version: (.versionInfo // "") } ]
+  | group_by(.key)
+  | map({ key: .[0].key, value: { name: .[0].name, versions: (map(.version) | unique) } })
+  | from_entries;
+($prev[0] | entries) as $a | ($new[0] | entries) as $b
+| [ ([$a, $b] | map(keys) | add | unique)[] as $k
+    | if ($a | has($k) | not) then
+        { name: $b[$k].name, line: "- Added `\($b[$k].name)` \($b[$k].versions | join(", "))" }
+      elif ($b | has($k) | not) then
+        { name: $a[$k].name, line: "- Removed `\($a[$k].name)` \($a[$k].versions | join(", "))" }
+      elif $a[$k].versions != $b[$k].versions then
+        { name: $a[$k].name, line: "- `\($a[$k].name)` \($a[$k].versions | join(", ")) to \($b[$k].versions | join(", "))" }
+      else empty end ]
+| sort_by(.name, .line)'
+SBOM_DIFF_JQ="${SBOM_CHANGES_JQ}"'
+| if length == 0 then empty else
+    "<details>\n<summary>System packages: \(length) change\(if length == 1 then "" else "s" end) ("
+    + (map(.name) | .[0:3] | join(", "))
+    + ")</summary>\n\n" + (map(.line) | join("\n")) + "\n\n</details>"
+  end'
+
+if [ "$SBOM_CHANGES" = true ]; then
+  if [ -z "$SBOM_PREV" ] || [ -z "$SBOM_NEW" ]; then
+    die "--sbom-changes needs --sbom-prev and --sbom-new"
+  fi
+  for f in "$SBOM_PREV" "$SBOM_NEW"; do
+    jq -e '(.packages | type) == "array"' "$f" >/dev/null 2>&1 || die "${f} is not an SPDX document"
+  done
+  jq -nr --slurpfile prev "$SBOM_PREV" --slurpfile new "$SBOM_NEW" "${SBOM_CHANGES_JQ} | length"
+  exit 0
+fi
 
 case "$SITE" in docker | go | ts | lane) ;; *) die "--site must be docker, go, ts or lane, got '${SITE}'" ;; esac
 [ -n "$VERSION" ] || die "--version is required"
@@ -100,36 +145,6 @@ previous_stable_tag() {
   done < <(git tag --list | grep -E "$PATTERN" || true)
   printf '%s' "$best"
 }
-
-# shellcheck disable=SC2016 # jq program, not shell
-SBOM_DIFF_JQ='
-def roots: [.documentDescribes // [] | .[]]
-  + [.relationships[]? | select(.relationshipType == "DESCRIBES" and .spdxElementId == "SPDXRef-DOCUMENT") | .relatedSpdxElement];
-def entries: roots as $r
-  | [ .packages[]?
-      | select(.SPDXID as $id | ($r | index($id)) == null)
-      | .name as $n
-      | { key: (([.externalRefs[]? | select(.referenceType == "purl") | .referenceLocator] | first // "")
-               | sub("@.*$"; "") | if . == "" then "name:" + $n else . end),
-          name: $n, version: (.versionInfo // "") } ]
-  | group_by(.key)
-  | map({ key: .[0].key, value: { name: .[0].name, versions: (map(.version) | unique) } })
-  | from_entries;
-($prev[0] | entries) as $a | ($new[0] | entries) as $b
-| [ ([$a, $b] | map(keys) | add | unique)[] as $k
-    | if ($a | has($k) | not) then
-        { name: $b[$k].name, line: "- Added `\($b[$k].name)` \($b[$k].versions | join(", "))" }
-      elif ($b | has($k) | not) then
-        { name: $a[$k].name, line: "- Removed `\($a[$k].name)` \($a[$k].versions | join(", "))" }
-      elif $a[$k].versions != $b[$k].versions then
-        { name: $a[$k].name, line: "- `\($a[$k].name)` \($a[$k].versions | join(", ")) to \($b[$k].versions | join(", "))" }
-      else empty end ]
-| sort_by(.name, .line)
-| if length == 0 then empty else
-    "<details>\n<summary>System packages: \(length) change\(if length == 1 then "" else "s" end) ("
-    + (map(.name) | .[0:3] | join(", "))
-    + ")</summary>\n\n" + (map(.line) | join("\n")) + "\n\n</details>"
-  end'
 
 render() {
   [ -n "$COMMIT" ] || die "--release-commit is required"

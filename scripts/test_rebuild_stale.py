@@ -203,6 +203,30 @@ def ghcr(curl, name, tag, created=None, *, index=True):
     curl[f'{base}/blobs/{prefix}cfg-{tag}'] = {'body': {'created': created}}
 
 
+REBUILD = 'fix(deps): rebuild against refreshed base packages'
+
+
+def commits(fx, base, entries):
+    """The commit listing rebuild_requested reads on <base>, and each listed commit's files.
+
+    `entries` are (sha, subject, committed epoch, file count), newest first.
+    """
+    since = iso(NOW - 7 * DAY)
+    fx['api'][f'GET repos/cplieger/tb/commits?sha={base}&since={since}&per_page=100'] = {
+        'body': [
+            {
+                'sha': sha,
+                'commit': {'message': f'{subject}\n\nbody', 'committer': {'date': iso(at)}},
+            }
+            for sha, subject, at, _ in entries
+        ]
+    }
+    for sha, _, _, files in entries:
+        fx['api'][f'GET repos/cplieger/tb/commits/{sha}'] = {
+            'body': {'files': [{'filename': f'f{i}'} for i in range(files)]}
+        }
+
+
 def two_branch_fixture(**over) -> dict:
     """One dev-default repo `tb` with a refreshing apk Dockerfile on both bases."""
     api = {
@@ -218,6 +242,8 @@ def two_branch_fixture(**over) -> dict:
     ghcr(curl, 'tb', 'latest', iso(NOW - 10 * DAY, fraction='.123456789'))
     ghcr(curl, 'tb', 'dev', iso(NOW - DAY), index=False)
     fx = {'now': NOW, 'api': api, 'curl': curl}
+    commits(fx, 'main', [])
+    commits(fx, 'dev', [])
     fx.update(over)
     return fx
 
@@ -284,6 +310,7 @@ class TwoBranchFanout(unittest.TestCase):
                     'channel': 'latest',
                     'last': iso(NOW - 10 * DAY),
                     'age_days': '10',
+                    'since': iso(NOW - 7 * DAY),
                 }
             ],
         )
@@ -555,6 +582,60 @@ class TwoBranchFanout(unittest.TestCase):
         ghcr(fx['curl'], 'tb', 'latest', iso(NOW - 7 * DAY - 1))
         h, _ = self.fanout(fx)
         self.assertEqual([r['base'] for r in h.matrix()], ['main'])
+
+    def test_a_rebuild_request_within_the_interval_holds_a_stale_image_back(self):
+        fx = two_branch_fixture()
+        commits(fx, 'main', [('r1', f'{REBUILD} (#40)', NOW - 2 * DAY, 0)])
+        h, res = self.fanout(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(h.matrix(), [])
+        self.assertIn(
+            f'| tb (main, :latest) | {iso(NOW - 10 * DAY)} | 10 | 7 | '
+            f'fresh (rebuild requested {iso(NOW - 2 * DAY)}) |',
+            h.summary.read_text(),
+        )
+
+    def test_a_rebuild_request_older_than_the_interval_does_not(self):
+        fx = two_branch_fixture()
+        commits(fx, 'main', [('r1', REBUILD, NOW - 8 * DAY, 0)])
+        h, _ = self.fanout(fx)
+        self.assertEqual([r['base'] for r in h.matrix()], ['main'])
+
+    def test_a_commit_borrowing_the_subject_is_not_a_request(self):
+        fx = two_branch_fixture()
+        commits(fx, 'main', [('r1', REBUILD, NOW - 2 * DAY, 1)])
+        h, _ = self.fanout(fx)
+        self.assertEqual([r['base'] for r in h.matrix()], ['main'])
+
+    def test_an_unreadable_request_listing_falls_back_to_the_image_age(self):
+        fx = two_branch_fixture()
+        del fx['api'][
+            f'GET repos/cplieger/tb/commits?sha=main&since={iso(NOW - 7 * DAY)}&per_page=100'
+        ]
+        h, res = self.fanout(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual([r['base'] for r in h.matrix()], ['main'])
+        self.assertIn(
+            '::warning::cplieger/tb: the rebuild requests on main could not be read, '
+            'so the image age alone decides\ngh: Not Found (HTTP 404)\n',
+            res.stdout,
+        )
+
+    def test_the_dev_channel_reads_devs_commits(self):
+        fx = two_branch_fixture()
+        ghcr(fx['curl'], 'tb', 'dev', iso(NOW - 8 * DAY))
+        commits(fx, 'dev', [('d1', REBUILD, NOW - DAY, 0)])
+        h, _ = self.fanout(fx)
+        self.assertEqual([(r['base'], r['channel']) for r in h.matrix()], [('main', 'latest')])
+        self.assertTrue(
+            [c for c in h.calls() if c[0] == 'gh' and 'commits?sha=dev&' in ' '.join(c)]
+        )
+
+    def test_a_fresh_image_reads_no_commits(self):
+        h, _ = self.fanout(two_branch_fixture())
+        self.assertFalse(
+            [c for c in h.calls() if c[0] == 'gh' and 'commits?sha=dev' in ' '.join(c)]
+        )
 
     def test_an_unparsable_created_time_is_an_unreadable_row(self):
         fx = two_branch_fixture()
@@ -923,14 +1004,60 @@ class StalePr(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         return created(h.calls())['body'].split(' Merging this empty commit')[0]
 
+    def stale(self, fx, since=None):
+        h = Harness(self)
+        since = iso(NOW - 7 * DAY) if since is None else since
+        argv = ['bash', str(SCRIPT), 'stale-pr', 'tb', 'main', 'latest', '10', 'L', since]
+        return h, h.run(argv, fx)
+
     def test_reasons(self):
         self.assertEqual(
-            self.body('main', 'latest', '10', '2026-09-24T04:00:00Z'),
+            self.body('main', 'latest', '10', '2026-09-24T04:00:00Z', ''),
             'The `:latest` image is 10 days old (built 2026-09-24T04:00:00Z).',
         )
         self.assertEqual(
-            self.body('dev', 'dev', 'n/a', 'not published'), 'No `:dev` image is published.'
+            self.body('dev', 'dev', 'n/a', 'not published', ''), 'No `:dev` image is published.'
         )
+
+    def test_a_request_merged_after_fanout_opens_no_second_pr(self):
+        fx = pr_fixture()
+        commits(fx, 'main', [('r1', f'{REBUILD} (#41)', NOW - 3600, 0)])
+        h, res = self.stale(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(
+            f'::notice::cplieger/tb: a rebuild request merged into main at {iso(NOW - 3600)}, '
+            'so no other pull request is opened',
+            res.stdout,
+        )
+        calls = h.calls()
+        self.assertFalse([c for c in calls if 'POST' in c or 'PATCH' in c])
+        self.assertEqual(merge_calls(calls), [])
+        listing = next(i for i, c in enumerate(calls) if any('/pulls?' in a for a in c))
+        read = next(i for i, c in enumerate(calls) if any('/commits?sha=main&' in a for a in c))
+        self.assertLess(listing, read, 'the base is read again only once no PR is open')
+
+    def test_no_request_since_fanout_opens_the_pr(self):
+        fx = pr_fixture()
+        commits(fx, 'main', [('r1', REBUILD, NOW - 8 * DAY, 0), ('r2', REBUILD, NOW - DAY, 2)])
+        h, res = self.stale(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(created(h.calls())['base'], 'main')
+
+    def test_an_unreadable_second_read_opens_the_pr_naming_why(self):
+        h, res = self.stale(pr_fixture())
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(
+            '::warning::cplieger/tb: the rebuild requests on main could not be read again, '
+            'so a rebuild pull request is opened\ngh: Not Found (HTTP 404)\n',
+            res.stdout,
+        )
+        self.assertEqual(created(h.calls())['base'], 'main')
+
+    def test_an_empty_since_reads_no_commits(self):
+        h, res = self.stale(pr_fixture(), since='')
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse([c for c in h.calls() if any('/commits?' in a for a in c)])
+        self.assertEqual(created(h.calls())['base'], 'main')
 
 
 def workflow() -> dict:
@@ -946,7 +1073,14 @@ def condition(st: dict, matrix: dict) -> bool:
     return scope.condition(st.get('if'))
 
 
-TB_ROW = {'repo': 'tb', 'base': 'main', 'channel': 'latest', 'last': 'x', 'age_days': '9'}
+TB_ROW = {
+    'repo': 'tb',
+    'base': 'main',
+    'channel': 'latest',
+    'last': 'x',
+    'age_days': '9',
+    'since': 'S',
+}
 BAD_ROW = {**TB_ROW, 'last': 'unreadable', 'age_days': 'n/a', 'unreadable': 'boom'}
 
 
@@ -975,6 +1109,7 @@ class Workflow(unittest.TestCase):
         for row, base in ((TB_ROW, 'main'), ({**TB_ROW, 'base': 'dev'}, 'dev')):
             scope = workflow_replay.Scope({'matrix': row, 'secrets': {}}, {}, [])
             self.assertEqual(scope.render(st['env']['BASE']), base)
+            self.assertEqual(scope.render(st['env']['SINCE']), 'S')
 
     def test_both_jobs_check_out_without_credentials_before_the_script(self):
         jobs = workflow()['jobs']
@@ -1046,17 +1181,19 @@ class Workflow(unittest.TestCase):
 
     def test_the_pr_step_runs_the_script_with_the_row(self):
         st = step(workflow()['jobs']['dispatch'], 'Open a rebuild pull request')
+        env = {'REPO': 'tb', 'BASE': 'main', 'CHANNEL': 'latest', 'AGE_DAYS': '9', 'LAST': 'L'}
         h = Harness(self)
-        res = h.run(
-            ['bash', '-c', st['run']],
-            pr_fixture(),
-            {'REPO': 'tb', 'BASE': 'main', 'CHANNEL': 'latest', 'AGE_DAYS': '9', 'LAST': 'L'},
-            cwd=ROOT,
-        )
+        res = h.run(['bash', '-c', st['run']], pr_fixture(), {**env, 'SINCE': ''}, cwd=ROOT)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertTrue(
             created(h.calls())['body'].startswith('The `:latest` image is 9 days old (built L).')
         )
+        fx = pr_fixture()
+        commits(fx, 'main', [('r1', REBUILD, NOW - 3600, 0)])
+        h = Harness(self)
+        res = h.run(['bash', '-c', st['run']], fx, {**env, 'SINCE': iso(NOW - 7 * DAY)}, cwd=ROOT)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse([c for c in h.calls() if 'POST' in c])
 
 
 if __name__ == '__main__':

@@ -396,7 +396,7 @@ def check_digest(
 ) -> tuple[str, list[str]]:
     """(digest, refusals): the complete dev image promote-digest.sh resolves for T."""
     proc = subprocess.run(
-        ['bash', str(SCRIPTS / 'promote-digest.sh'), target],
+        ['bash', str(SCRIPTS / 'promote-digest.sh'), '--carry-rebuilds', target],
         cwd=clone,
         capture_output=True,
         text=True,

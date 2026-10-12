@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Probe for scripts/render-notes.sh against the pinned git-cliff and the synced
-# cliff config: states N1 to N14 pin the explicit-range notes with their
+# cliff config: states N1 to N17 pin the explicit-range notes with their
 # dependency and system-package parts.
 # CLIFF_BIN=/path/to/git-cliff skips the download.
 # shellcheck disable=SC2016 # the expected notes carry literal markdown backticks
@@ -236,6 +236,30 @@ Built from `main` for dependency and system-package updates
 </details>
 EOF
 grep -q 'ghcr.io/owner/app' "$WORK/out" && fail "N9 the image's own SPDX root package was diffed"
+N9_LINES=$(grep -c '^- ' "$WORK/out")
+
+# The count the rebuild gate reads: the System packages block's own diff.
+changes() { # <prev> <new> -> stdout, or EXIT=n with stderr in $WORK/changes.err
+  (bash "$SCRIPT" --sbom-changes --sbom-prev "$1" --sbom-new "$2") 2>"$WORK/changes.err" || echo "EXIT=$?"
+}
+jq '.name = "other" | .packages |= reverse' "$WORK/prev.spdx.json" >"$WORK/same-a.json"
+sbom "$WORK/same-b.spdx.json" sha256:cccc ssl_client@1.37.0-r29 zlib@1.3.1-r2 busybox@1.37.0-r29 musl@1.2.5-r10
+[ "$(changes "$WORK/same-a.json" "$WORK/same-b.spdx.json")" = 0 ] \
+  || fail "N15 equal package sets must count 0, got '$(changes "$WORK/same-a.json" "$WORK/same-b.spdx.json")'"
+ok "N15 --sbom-changes counts 0 for equal package sets whose roots, names and order differ"
+sbom "$WORK/one.spdx.json" sha256:dddd busybox@1.37.0-r30 musl@1.2.5-r10 zlib@1.3.1-r2 ssl_client@1.37.0-r29
+[ "$(changes "$WORK/prev.spdx.json" "$WORK/one.spdx.json")" = 1 ] || fail "N16 one changed version must count 1"
+n9=$(changes "$WORK/prev.spdx.json" "$WORK/new.spdx.json")
+[ "$n9" = 4 ] && [ "$n9" = "$N9_LINES" ] || fail "N16 the N9 pair must count ${N9_LINES} like its block, got '${n9}'"
+ok "N16 --sbom-changes counts one changed version, and the N9 pair as its block lists it"
+echo '{}' >"$WORK/empty.json"
+echo 'not json' >"$WORK/text.json"
+for bad in "$WORK/empty.json" "$WORK/text.json"; do
+  [ "$(changes "$bad" "$WORK/new.spdx.json")" = EXIT=2 ] || fail "N17 ${bad} must exit 2"
+  grep -qxF "render-notes: ${bad} is not an SPDX document" "$WORK/changes.err" \
+    || fail "N17 the refusal must name ${bad}: $(cat "$WORK/changes.err")"
+done
+ok "N17 --sbom-changes refuses a file that is not an SPDX document, naming it"
 
 # Previous tag by version, numerically; bootstrap has neither link nor diff.
 B="$WORK/boot"

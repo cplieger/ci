@@ -5,9 +5,11 @@
 # tag `:vX.Y.Z`, `:vX.Y`, `:vX`, `:latest` on a promotion commit's trailer
 # digest (never a build), else on the dev digest promote-digest.sh picks, else
 # on a source build; copy to Docker Hub with referrers, re-scan, GitHub Release.
-# Every vulnerability scan is advisory. Like release.yaml, it refuses, in both
-# modes, a caller that is not a public, non-fork repository whose default
-# branch is `dev`.
+# A range whose only release reason is a rebuild request builds its amd64 image
+# unpushed first and publishes nothing when its packages equal the release it
+# follows. Every vulnerability scan is advisory. Like release.yaml, it refuses,
+# in both modes, a caller that is not a public, non-fork repository whose
+# default branch is `dev`.
 name: Docker Release
 
 on:
@@ -202,6 +204,9 @@ jobs:
       publish: ${{ steps.tags.outputs.publish }}
       promote_digest: ${{ steps.promote.outputs.promote_digest }}
       promote_source: ${{ steps.promote.outputs.promote_source }}
+      build-args: ${{ steps.buildargs.outputs.build-args }}
+      rebuild_only: ${{ steps.rebuild.outputs.rebuild_only }}
+      compare_tag: ${{ steps.rebuild.outputs.compare_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -330,12 +335,49 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "Matrix: $matrix"
 
+      # BuildKit restores a cached RUN layer verbatim, so a package layer keeps
+      # shipping the packages current when it was FIRST built; PKG_REFRESH is
+      # today's UTC date, so it rebuilds at most once a day. A Dockerfile opts
+      # in by declaring the ARG in the stage that needs it: BuildKit puts a stage
+      # ARG's value in the environment and cache key of every later RUN of that
+      # stage, while a global ARG reaches FROM lines only. BUILD_VERSION is this
+      # run's tag on its channel (vX.Y.Z-dev.N on dev), never a dev build's
+      # future stable.
+      - name: Resolve build args
+        id: buildargs
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          TAG: ${{ steps.tags.outputs.tag }}
+        run: |
+          set -euo pipefail
+          declares() { grep -qE "^[[:space:]]*ARG[[:space:]]+$1([[:space:]=]|\$)" "$DOCKERFILE"; }
+          args=()
+          if declares PKG_REFRESH; then
+            args+=("PKG_REFRESH=$(date -u +%Y-%m-%d)")
+          fi
+          if declares BUILD_VERSION; then
+            args+=("BUILD_VERSION=${TAG}")
+          fi
+          if [ "${#args[@]}" -eq 0 ]; then
+            echo "No opted-in ARG in ${DOCKERFILE}; passing no build-args."
+          else
+            printf 'Passing %s\n' "${args[@]}"
+          fi
+          {
+            echo "build-args<<EOF"
+            if [ "${#args[@]}" -gt 0 ]; then
+              printf '%s\n' "${args[@]}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       # The stable channel re-tags what the dev channel already built rather
       # than rebuild it; promote-digest.sh decides which build that is. GHCR is
       # read anonymously (the images are public), so no registry login happens
-      # before anything is written.
+      # before anything is written. The rebuild scope step reads the same source
+      # on both channels.
       - name: Check out the ci source
-        if: ${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' }}
+        if: ${{ steps.tags.outputs.publish == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ job.workflow_repository }}
@@ -377,6 +419,20 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "promote_digest=${DIGEST:-<none>} source=${SOURCE}"
 
+      - name: Scope a rebuild-only release
+        id: rebuild
+        if: ${{ steps.tags.outputs.publish == 'true' && steps.promote.outputs.promote_digest == '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: ${{ inputs.channel }}
+          VERSION: ${{ inputs.version }}
+          PLATFORMS: ${{ inputs.platforms }}
+          SUBPACKAGES_JSON: ${{ inputs.subpackages }}
+          GO_LANES_JSON: ${{ inputs.go-modules }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/rebuild-gate.sh" scope >> "$GITHUB_OUTPUT"
+
       - name: Extract metadata
         if: ${{ steps.tags.outputs.publish == 'true' && steps.promote.outputs.promote_digest == '' }}
         id: meta
@@ -388,11 +444,131 @@ jobs:
           labels: |
             ${{ inputs.image-licenses && format('org.opencontainers.image.licenses={0}', inputs.image-licenses) || '' }}
 
-  # Builds only when something is published and no dev digest is being
-  # promoted in its place.
-  build:
+  # The publish decision of a rebuild-only range (prepare's scope step). It
+  # precedes every job that writes: build pushes by digest, so skip gates build,
+  # finalize's PUBLISH and verify-publish. Its writes are build state only: the
+  # GHA cache, which build's amd64 leg can reuse, and buildx's build record
+  # artifact.
+  rebuild-gate:
     needs: prepare
-    if: ${{ needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.promote_digest == '' }}
+    if: ${{ needs.prepare.outputs.rebuild_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.compare.outputs.skip }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The signing window attested-sbom.sh reads walks tags and history.
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # The build context is the workspace root, so the ci source leaves it.
+      - name: Move the ci source out of the build context
+        run: |
+          set -euo pipefail
+          mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Build the candidate image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          platforms: linux/amd64
+          labels: ${{ needs.prepare.outputs.labels }}
+          build-args: ${{ needs.prepare.outputs.build-args }}
+          push: false
+          load: true
+          tags: rebuild-gate.invalid/candidate:latest
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=linux-amd64
+          cache-to: type=gha,mode=max,scope=linux-amd64,ignore-error=true
+
+      - name: Generate the candidate's SBOM
+        continue-on-error: true
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: docker:rebuild-gate.invalid/candidate:latest
+          format: spdx-json
+          output-file: ${{ runner.temp }}/sbom-new.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          config: ${{ inputs.syft-config }}
+
+      - name: Read the compared release's SBOM
+        id: prev
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          COMPARE_TAG: ${{ needs.prepare.outputs.compare_tag }}
+          EXCLUDE_RE: ${{ inputs.exclude-re }}
+          SUBPACKAGES_JSON: ${{ inputs.subpackages }}
+        run: |
+          set -euo pipefail
+          if ref=$(bash "$CI_TOOLS/release-sbom.sh" "$COMPARE_TAG" "$RUNNER_TEMP/sbom-attested.spdx.json"); then
+            echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          else
+            echo "unreadable=${ref}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A path-mode release attests its binary's SBOM alone, which holds no OS
+      # package, so both sides are image scans and the attestation read above
+      # only proves the digest is this repository's.
+      - name: Scan the compared release's image
+        if: ${{ inputs.sbom-from == 'path' && steps.prev.outputs.ref != '' }}
+        continue-on-error: true
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: registry:${{ steps.prev.outputs.ref }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/sbom-scanned.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          config: ${{ inputs.syft-config }}
+
+      - name: Compare the package sets
+        id: compare
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          PREV_REF: ${{ steps.prev.outputs.ref }}
+          UNREADABLE: ${{ steps.prev.outputs.unreadable }}
+          SBOM_FROM: ${{ inputs.sbom-from }}
+          COMPARE_TAG: ${{ needs.prepare.outputs.compare_tag }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/rebuild-gate.sh" compare "$RUNNER_TEMP/sbom-new.spdx.json" \
+            "$RUNNER_TEMP/sbom-attested.spdx.json" "$RUNNER_TEMP/sbom-scanned.spdx.json"
+
+  # Builds only when something is published, no dev digest is promoted in its
+  # place, and the rebuild gate, when it ran, did not find the package set
+  # unchanged. A failed or inconclusive gate leaves skip unset or false, so the
+  # image publishes.
+  build:
+    needs: [prepare, rebuild-gate]
+    if: >-
+      ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true'
+        && needs.prepare.outputs.promote_digest == '' && needs.rebuild-gate.outputs.skip != 'true' }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -411,42 +587,6 @@ jobs:
           # No step in this job pushes with checkout-persisted credentials;
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
-
-      # BuildKit restores a cached RUN layer verbatim, so a package layer keeps
-      # shipping the packages current when it was FIRST built; PKG_REFRESH is
-      # today's UTC date, so it rebuilds at most once a day. A Dockerfile opts
-      # in by declaring the ARG in the stage that needs it: BuildKit puts a stage
-      # ARG's value in the environment and cache key of every later RUN of that
-      # stage, while a global ARG reaches FROM lines only. BUILD_VERSION is this
-      # run's tag on its channel (vX.Y.Z-dev.N on dev), never a dev build's
-      # future stable.
-      - name: Resolve build args
-        id: buildargs
-        env:
-          DOCKERFILE: ${{ inputs.dockerfile }}
-          TAG: ${{ needs.prepare.outputs.tag }}
-        run: |
-          set -euo pipefail
-          declares() { grep -qE "^[[:space:]]*ARG[[:space:]]+$1([[:space:]=]|\$)" "$DOCKERFILE"; }
-          args=()
-          if declares PKG_REFRESH; then
-            args+=("PKG_REFRESH=$(date -u +%Y-%m-%d)")
-          fi
-          if declares BUILD_VERSION; then
-            args+=("BUILD_VERSION=${TAG}")
-          fi
-          if [ "${#args[@]}" -eq 0 ]; then
-            echo "No opted-in ARG in ${DOCKERFILE}; passing no build-args."
-          else
-            printf 'Passing %s\n' "${args[@]}"
-          fi
-          {
-            echo "build-args<<EOF"
-            if [ "${#args[@]}" -gt 0 ]; then
-              printf '%s\n' "${args[@]}"
-            fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -486,8 +626,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ needs.prepare.outputs.labels }}
           # One key=value per line for the args the Dockerfile opted in to,
-          # empty otherwise. See the "Resolve build args" step above.
-          build-args: ${{ steps.buildargs.outputs.build-args }}
+          # empty otherwise. See prepare's "Resolve build args" step.
+          build-args: ${{ needs.prepare.outputs.build-args }}
           # mode=max records the full build definition + base64 Dockerfile for
           # richer SLSA provenance on these public images (min omits the build
           # steps/source). mode=max embeds build-arg VALUES into the published
@@ -532,8 +672,11 @@ jobs:
   # Runs whether or not `build` did (a promotion has no build; a stable push
   # with nothing to publish still refreshes the Docker Hub description).
   finalize:
-    needs: [prepare, build]
-    if: ${{ always() && needs.prepare.result == 'success' && needs.build.result != 'failure' && needs.build.result != 'cancelled' }}
+    needs: [prepare, rebuild-gate, build]
+    # A run cancelled before build starts (while the gate builds, say) leaves build
+    # skipped, not cancelled, so cancelled() names that cancel. A timed-out gate is
+    # no run cancel, so its build still publishes through here.
+    if: ${{ always() && needs.prepare.result == 'success' && needs.build.result != 'failure' && needs.build.result != 'cancelled' && (needs.build.result != 'skipped' || !cancelled()) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -544,7 +687,7 @@ jobs:
       attestations: write
       security-events: write
     env:
-      PUBLISH: ${{ needs.prepare.outputs.publish }}
+      PUBLISH: ${{ needs.prepare.outputs.publish == 'true' && needs.rebuild-gate.outputs.skip != 'true' }}
       TAG: ${{ needs.prepare.outputs.tag }}
       PROMOTE_DIGEST: ${{ needs.prepare.outputs.promote_digest }}
     outputs:
@@ -1138,24 +1281,11 @@ jobs:
             echo "::notice::No earlier stable release exists, so the notes carry no system-package diff."
             exit 0
           fi
-          if ! token=$(curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors \
-            "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull" | jq -r .token); then
-            token=""
-          fi
-          digest=$(curl -fsSI --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $token" \
-            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
-            "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/${PREV}" 2>/dev/null |
-            tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }' || true)
-          if [ -z "$digest" ]; then
-            echo "::warning::${REGISTRY}/${IMAGE_NAME}:${PREV} is not readable, so the notes carry no system-package diff."
+          if ! ref=$(bash "$CI_TOOLS/release-sbom.sh" "$PREV" "$RUNNER_TEMP/sbom-prev.spdx.json"); then
+            echo "::warning::The notes carry no system-package diff, because ${ref}."
             exit 0
           fi
-          REF="${REGISTRY}/${IMAGE_NAME}@${digest}"
-          if ! why=$(bash "$CI_TOOLS/attested-sbom.sh" "$REF" "$PREV" "$RUNNER_TEMP/sbom-prev.spdx.json"); then
-            echo "::warning::The notes carry no system-package diff, because ${why}."
-            exit 0
-          fi
-          echo "previous SBOM: ${PREV} (${REF})"
+          echo "previous SBOM: ${PREV} (${ref})"
 
       - name: Generate release notes
         # Stable only (a dev build has no Release). Deliberately token-free:
@@ -1427,8 +1557,10 @@ jobs:
   # channels; Docker Hub on stable only, which is the only channel that
   # writes it.
   verify-publish:
-    needs: [prepare, finalize]
-    if: ${{ always() && needs.prepare.outputs.publish == 'true' && needs.finalize.result == 'success' }}
+    needs: [prepare, rebuild-gate, finalize]
+    if: >-
+      ${{ always() && needs.prepare.outputs.publish == 'true' && needs.rebuild-gate.outputs.skip != 'true'
+        && needs.finalize.result == 'success' }}
     runs-on: ubuntu-slim
     timeout-minutes: 15
     # The ci source checkout only; every registry read is anonymous.

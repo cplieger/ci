@@ -6,7 +6,9 @@
 #                                    anonymously; exit 3 when the tag does not exist
 #   open-pr <repo> <base> <reason>   GH_TOKEN; an auto-merging empty fix(deps) pull request
 #                                    into <base> (dev or main), or a merge re-request on the open one
-#   stale-pr <repo> <base> <tag> <age-days> <built>   open-pr with the staleness reason
+#   stale-pr <repo> <base> <tag> <age-days> <built> <since>   open-pr with the staleness reason,
+#                                    opening nothing once a rebuild request merged at or after a
+#                                    non-empty <since>
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,9 +17,11 @@ trap 'rm -rf "$WORK"' EXIT
 
 INDEX_TYPES='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
 MANIFEST_TYPES='application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+# path-significance.sh and promote-digest.sh hold copies; test-path-significance.sh holds them equal.
+REBUILD_SUBJECT='fix(deps): rebuild against refreshed base packages'
 
 usage() {
-  sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 
@@ -68,8 +72,31 @@ image_created() { # <repo> <tag>
   echo "$created"
 }
 
-open_pr() { # <repo> <base> <reason>
-  local repo=$1 base=$2 reason=$3 open head tree commit branch body url
+# A rebuild that changes no package publishes no image (docker-release.yaml's
+# rebuild-gate), so the newest rebuild request on the branch dates its refresh.
+rebuild_requested() { # <repo> <base> <since> -> the committer time of the newest rebuild request on base at or after since, or nothing; fails when a read fails
+  local pages list sha date ts since_ts files
+  since_ts=$(date -u -d "$3" +%s) || return 1
+  # --paginate prints one JSON array per page, which jq reads as a stream.
+  pages=$(gh api --paginate "repos/cplieger/${1}/commits?sha=${2}&since=${3}&per_page=100") || return 1
+  # shellcheck disable=SC2016 # jq program, not shell
+  list=$(jq -r --arg s "$REBUILD_SUBJECT" '.[] | (.commit.message | split("\n")[0]) as $m
+    | select($m == $s or ($m | startswith($s + " (#") and endswith(")")))
+    | "\(.sha) \(.commit.committer.date)"' <<<"$pages") || return 1
+  while read -r sha date; do
+    [ -n "$sha" ] || continue
+    ts=$(date -u -d "$date" +%s) || return 1
+    [ "$ts" -ge "$since_ts" ] || continue
+    files=$(gh api "repos/cplieger/${1}/commits/${sha}" --jq '.files | length') || return 1
+    if [ "$files" = 0 ]; then
+      echo "$date"
+      return 0
+    fi
+  done <<<"$list"
+}
+
+open_pr() { # <repo> <base> <reason> [since]
+  local repo=$1 base=$2 reason=$3 since=${4:-} open req head tree commit branch body url
   case "$base" in dev | main) ;; *)
     echo "::error::open-pr: base must be dev or main, got '${base}'" >&2
     exit 2
@@ -97,13 +124,26 @@ open_pr() { # <repo> <base> <reason>
     request_merge "$open"
     return 0
   fi
+  # A rebuild pull request that merged after fanout read the base is no longer open,
+  # so only a fresh read of the base keeps a second one from opening.
+  if [ -n "$since" ]; then
+    if ! req=$(rebuild_requested "$repo" "$base" "$since" 2>"$WORK/requested.err"); then
+      echo "::warning::cplieger/${repo}: the rebuild requests on ${base} could not be read again, so a rebuild pull request is opened"
+      tail -n 1 "$WORK/requested.err"
+      req=""
+    fi
+    if [ -n "$req" ]; then
+      echo "::notice::cplieger/${repo}: a rebuild request merged into ${base} at ${req}, so no other pull request is opened"
+      return 0
+    fi
+  fi
   head=$(gh api "repos/cplieger/${repo}/git/ref/heads/${base}" --jq .object.sha)
   tree=$(gh api "repos/cplieger/${repo}/git/commits/${head}" --jq .tree.sha)
   # An empty commit: the base's own tree with the base's head as its only parent. Its
   # subject is what makes it a significant push (path-significance.sh REBUILD_SUBJECT),
   # and PKG_REFRESH makes the build re-run its package layer.
   commit=$(gh api -X POST "repos/cplieger/${repo}/git/commits" \
-    -f message='fix(deps): rebuild against refreshed base packages' \
+    -f message="$REBUILD_SUBJECT" \
     -f tree="$tree" -f 'parents[]='"$head" --jq .sha)
   branch="rebuild/${base}-$(date -u +%Y%m%d)"
   if gh api "repos/cplieger/${repo}/git/ref/heads/${branch}" >/dev/null 2>&1; then
@@ -114,17 +154,17 @@ open_pr() { # <repo> <base> <reason>
   fi
   body="${reason} Merging this empty commit rebuilds it against the base packages published since then; nothing else changes."
   url=$(gh api -X POST "repos/cplieger/${repo}/pulls" \
-    -f title='fix(deps): rebuild against refreshed base packages' \
+    -f title="$REBUILD_SUBJECT" \
     -f head="$branch" -f base="$base" -f body="$body" --jq .html_url)
   echo "Opened ${url}"
   request_merge "$url"
 }
 
-stale_pr() { # <repo> <base> <tag> <age-days> <built>
+stale_pr() { # <repo> <base> <tag> <age-days> <built> <since>
   if [ "$5" = "not published" ]; then
-    open_pr "$1" "$2" "No \`:${3}\` image is published."
+    open_pr "$1" "$2" "No \`:${3}\` image is published." "$6"
   else
-    open_pr "$1" "$2" "The \`:${3}\` image is ${4} days old (built ${5})."
+    open_pr "$1" "$2" "The \`:${3}\` image is ${4} days old (built ${5})." "$6"
   fi
 }
 
@@ -152,17 +192,19 @@ fanout() {
   } >>"$GITHUB_STEP_SUMMARY"
 
   # A channel ages by its published image, because a promotion re-tags a dev
-  # digest and its run says nothing about when that image was built.
+  # digest and its run says nothing about when that image was built, unless a rebuild
+  # request merged within the interval, which the rebuild gate may have answered with no image.
   two_branch_rows() { # <repo>
-    local r=$1 base tag content dockerfile created rc ts age_secs age_days interval decision
+    local r=$1 base tag content dockerfile created rc ts age_secs age_days interval decision since req
     interval="${INTERVAL_OVERRIDES[$r]:-$INTERVAL_DAYS}"
-    add_channel() { # <base> <tag> <last> <age-days> [unreadable reason]
-      STALE=$(jq -c --arg r "$r" --arg base "$1" --arg tag "$2" --arg l "$3" --arg a "$4" --arg u "${5:-}" \
+    add_channel() { # <base> <tag> <last> <age-days> <since or empty> [unreadable reason]
+      STALE=$(jq -c --arg r "$r" --arg base "$1" --arg tag "$2" --arg l "$3" --arg a "$4" --arg s "$5" --arg u "${6:-}" \
         '. + [{repo: $r, base: $base, channel: $tag, last: $l, age_days: $a}
+              + (if $s == "" then {} else {since: $s} end)
               + (if $u == "" then {} else {unreadable: $u} end)]' <<<"$STALE")
     }
     unreadable_channel() { # <base> <tag> <reason>
-      add_channel "$1" "$2" "unreadable" "n/a" "$3"
+      add_channel "$1" "$2" "unreadable" "n/a" "" "$3"
       echo "| ${r} (${1}, :${2}) | unreadable: ${3} | n/a | ${interval} | **unreadable** |" >>"$GITHUB_STEP_SUMMARY"
     }
     for base in main dev; do
@@ -200,7 +242,7 @@ fanout() {
       case "$rc" in
         0) ;;
         3)
-          add_channel "$base" "$tag" "not published" "n/a"
+          add_channel "$base" "$tag" "not published" "n/a" ""
           echo "| ${r} (${base}, :${tag}) | not published | n/a | ${interval} | **rebuild** |" >>"$GITHUB_STEP_SUMMARY"
           continue
           ;;
@@ -217,8 +259,18 @@ fanout() {
       age_secs=$((now - ts))
       age_days=$((age_secs / 86400))
       if [ "$age_secs" -gt $((interval * 86400)) ]; then
-        add_channel "$base" "$tag" "$created" "$age_days"
-        decision="**rebuild**"
+        since=$(date -u -d "@$((now - interval * 86400))" +%Y-%m-%dT%H:%M:%SZ)
+        if ! req=$(rebuild_requested "$r" "$base" "$since" 2>"$WORK/requested.err"); then
+          echo "::warning::cplieger/${r}: the rebuild requests on ${base} could not be read, so the image age alone decides"
+          tail -n 1 "$WORK/requested.err"
+          req=""
+        fi
+        if [ -n "$req" ]; then
+          decision="fresh (rebuild requested ${req})"
+        else
+          add_channel "$base" "$tag" "$created" "$age_days" "$since"
+          decision="**rebuild**"
+        fi
       else
         decision="fresh"
       fi
@@ -256,8 +308,8 @@ case "${1:-}" in
     open_pr "$2" "$3" "$4"
     ;;
   stale-pr)
-    [ "$#" -eq 6 ] || usage
-    stale_pr "$2" "$3" "$4" "$5" "$6"
+    [ "$#" -eq 7 ] || usage
+    stale_pr "$2" "$3" "$4" "$5" "$6" "$7"
     ;;
   *) usage ;;
 esac

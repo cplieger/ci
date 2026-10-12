@@ -702,13 +702,16 @@ exit 1
 class RetainedDigest(unittest.TestCase):
     """The retained-digest check runs the real promote-digest.sh against stubbed registry and cosign answers."""
 
-    def run_digest(self, built: list[str], signed: bool):
+    def run_digest(self, built: list[str], signed: bool, *, target: str = 'docs'):
         with tempfile.TemporaryDirectory() as tmp:
             fx = Fixture(tmp)
             fx.commit('feat: init', {'Dockerfile': 'FROM scratch\n', 'main.go': 'package main\n'})
             fx.g('checkout', '-q', '-b', 'dev')
             b = fx.commit('feat: build', {'main.go': 'package main\n// b\n'})
-            t = fx.commit('docs: readme', {'README.md': '# x\n'})
+            if target == 'rebuild':
+                t = fx.commit('fix(deps): rebuild against refreshed base packages', empty=True)
+            else:
+                t = fx.commit('docs: readme', {'README.md': '# x\n'})
             bin_dir = Path(tmp) / 'bin'
             bin_dir.mkdir()
             for name, body in (('curl', STUB_CURL), ('cosign', STUB_COSIGN)):
@@ -734,6 +737,11 @@ class RetainedDigest(unittest.TestCase):
         (digest, refusals), log, b = self.run_digest(['b'], signed=True)
         self.assertEqual((digest, refusals), ('sha256:' + '0' * 63 + '7', []))
         self.assertIn('--certificate-github-workflow-repository cplieger/demo', log)
+        self.assertIn(f'--certificate-github-workflow-sha {b}', log)
+
+    def test_a_dev_head_that_is_a_skipped_rebuild_re_tags_its_parents_image(self):
+        (digest, refusals), log, b = self.run_digest(['b'], signed=True, target='rebuild')
+        self.assertEqual((digest, refusals), ('sha256:' + '0' * 63 + '7', []))
         self.assertIn(f'--certificate-github-workflow-sha {b}', log)
 
     def test_no_retained_image_is_refused(self):
