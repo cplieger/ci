@@ -1418,7 +1418,7 @@ class Rebuild(unittest.TestCase):
     def test_every_rebuild_the_router_plans_gets_pkg_refresh_from_the_release_build(self):
         step = next(
             s
-            for s in yaml.safe_load(DOCKER_RELEASE.read_text())['jobs']['build']['steps']
+            for s in yaml.safe_load(DOCKER_RELEASE.read_text())['jobs']['prepare']['steps']
             if s.get('id') == 'buildargs'
         )
         texts = {

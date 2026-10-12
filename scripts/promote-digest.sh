@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The image a stable release re-tags instead of building: promote-digest.sh <commit>
+# The image a stable release re-tags instead of building:
+#   promote-digest.sh [--carry-rebuilds] <commit>
 # Env IMAGE_NAME (<owner>/<name> on GHCR), REGISTRY, EXCLUDE_RE (path-significance.sh's
 # exclude_re; empty accepts an exact sha-<commit> hit only), SUBPACKAGES_JSON (required
 # with EXCLUDE_RE), GITHUB_REPOSITORY, cosign.
@@ -36,6 +37,16 @@ parent_of() { # <commit> <n> -> its n-th parent, or nothing when it has none; di
   esac
 }
 
+# A rebuild request's tree is its parent's, so the parent's image is a build of it.
+# Of this script's callers, only the stable resolve builds a rebuild request fresh:
+# a promotion never builds, and a signing window asks only which runs could have
+# built an image.
+CARRY_REBUILDS=false
+if [ "${1:-}" = --carry-rebuilds ]; then
+  CARRY_REBUILDS=true
+  shift
+fi
+
 EXCLUDE_RE=${EXCLUDE_RE:-}
 if [ -n "$EXCLUDE_RE" ]; then
   jq -e 'type == "array" and all(.[]; type == "string")' <<<"${SUBPACKAGES_JSON:-}" >/dev/null 2>&1 \
@@ -59,6 +70,10 @@ commit_is_pure() { # <commit> -> 0 when its own diff changes no shipped path, so
     # path-significance.sh owns which empty commit is a rebuild request.
     case "$subject" in
       "$REBUILD_SUBJECT" | "$REBUILD_SUBJECT (#"*")")
+        if [ "$CARRY_REBUILDS" = true ]; then
+          notice "commit ${c} is a rebuild request, which changes no file, so it carries its parent's image"
+          return 0
+        fi
         notice "commit ${c} changes no file (a forced rebuild); building from source"
         return 1
         ;;
@@ -82,6 +97,7 @@ walk_is_pure() { # <from> <to> -> 0 when no commit in from..to changes a shipped
 }
 
 if [ "${1:-}" = --sources ]; then
+  CARRY_REBUILDS=true
   c=$(git rev-parse --verify --quiet "${2:?usage: promote-digest.sh --sources <commit>}^{commit}") \
     || die "promote-digest: '$2' is not a commit"
   printf '%s\n' "$c"

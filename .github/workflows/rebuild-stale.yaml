@@ -2,8 +2,8 @@
 # 02:00, daily-security 03:00). An image that installs OS packages at build
 # time picks up upstream fixes only when rebuilt. A two-branch repo gets, per
 # channel whose published image (`:latest` for main, `:dev` for dev) was built
-# longer ago than INTERVAL_DAYS, an auto-merging pull request into that branch
-# carrying one empty `fix(deps)` commit.
+# longer ago than INTERVAL_DAYS and that took no rebuild request within it, an
+# auto-merging pull request into that branch carrying one empty `fix(deps)` commit.
 name: Rebuild stale images
 
 on:
@@ -90,9 +90,10 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           BASE: ${{ matrix.base }}
           CHANNEL: ${{ matrix.channel }}
+          SINCE: ${{ matrix.since }}
         run: |
           set -euo pipefail
-          bash scripts/rebuild-stale.sh stale-pr "$REPO" "$BASE" "$CHANNEL" "$AGE_DAYS" "$LAST"
+          bash scripts/rebuild-stale.sh stale-pr "$REPO" "$BASE" "$CHANNEL" "$AGE_DAYS" "$LAST" "$SINCE"
 
       - name: Report an unreadable image on cplieger/${{ matrix.repo }}
         if: ${{ matrix.unreadable }}

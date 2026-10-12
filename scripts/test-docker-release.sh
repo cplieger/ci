@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Probe of the release-path shell in docker-release.yaml (tag derivation, the
-# promoted-digest step and promote-digest.sh, build args, the notes and
-# previous-SBOM steps, the dev tag, the stable Release, the receipt) and
+# promoted-digest step and promote-digest.sh, build args, the rebuild gate, the
+# notes and previous-SBOM steps, the dev tag, the stable Release, the receipt) and
 # release.yaml (changed paths, version selection, the kind line, the tag steps).
 # Bodies are EXTRACTED at runtime and run in fixture repositories against stub
 # curl, gh and cosign, so the test cannot drift from what ships. Expected
@@ -57,8 +57,14 @@ wanted = {
         "Derive version tags": "derive.sh",
         "Verify root module path": "modpath.sh",
         "Resolve promoted digest": "promote.sh",
+        "Resolve build args": "buildargs.sh",
+        "Compute build matrix": "matrix.sh",
+        "Scope a rebuild-only release": "scope.sh",
     },
-    "build": {"Resolve build args": "buildargs.sh"},
+    "rebuild-gate": {
+        "Read the compared release's SBOM": "gateprev.sh",
+        "Compare the package sets": "gatecompare.sh",
+    },
     "finalize": {
         "Verify the promoted build's signature and SBOM": "provenance.sh",
         "Fetch the previous release's SBOM": "prevsbom.sh",
@@ -170,6 +176,74 @@ for wname, wjobs in (("docker-release", jobs), ("release", rjobs)):
 gates["logins"] = logins
 vp = next(s for s in jobs["verify-publish"]["steps"] if s.get("name") == "Verify published image")
 open(f"{out}/vpimage.sh", "w").write(vp["run"])
+# The rebuild gate and the jobs it holds back.
+gj = jobs["rebuild-gate"]
+gates["gate"] = {
+    "if": str(gj.get("if", "")),
+    "needs": gj.get("needs"),
+    "permissions": gj.get("permissions"),
+    "outputs": gj.get("outputs"),
+    "steps": [{k: s.get(k) for k in ("name", "uses", "with", "env", "run", "if", "continue-on-error")} for s in gj["steps"]],
+}
+gates["build-needs"] = jobs["build"]["needs"]
+gates["finalize-needs"] = jobs["finalize"]["needs"]
+gates["vp-needs"] = jobs["verify-publish"]["needs"]
+gates["vp-if"] = " ".join(str(jobs["verify-publish"]["if"]).split())
+gates["prepare-outputs"] = jobs["prepare"]["outputs"]
+gates["prepare-src-if"] = step_if("prepare", "Check out the ci source")
+gates["scope-if"] = step_if("prepare", "Scope a rebuild-only release")
+gates["scope-after"] = [n for n in ("Check out the ci source", "Resolve promoted digest", "Resolve build args")
+                        if prep.index(n) < prep.index("Scope a rebuild-only release")]
+gates["scope-before-meta"] = prep.index("Scope a rebuild-only release") < prep.index("Extract metadata")
+gates["build-push-args"] = next(s for s in jobs["build"]["steps"] if s.get("name") == "Build and push by digest")["with"]["build-args"]
+def needs_of(name):
+    n = jobs[name].get("needs") or []
+    return [n] if isinstance(n, str) else n
+def reaches(name, target, seen=()):
+    return any(n == target or (n not in seen and reaches(n, target, seen + (n,))) for n in needs_of(name))
+gates["write-reach"] = {
+    name: reaches(name, "rebuild-gate")
+    for name, job in jobs.items()
+    if name != "repair-assets" and "write" in (job.get("permissions") or {}).values()
+}
+# The publish expressions, evaluated: prepare's and the gate's outputs
+# substituted, every needed job successful.
+import re
+
+
+def dgx(expr, o):
+    e = " ".join(str(expr).split())
+    e = e[3:-2] if e.startswith("${{") else e
+    e = re.sub(r"needs\.(prepare|rebuild-gate)\.outputs\.(\w+)", lambda m: repr(o[m.group(1)][m.group(2)]), e)
+    e = re.sub(r"needs\.[\w-]+\.result", "'success'", e)
+    e = e.replace("!cancelled()", "True").replace("always()", "True")
+    return eval(e.replace("&&", " and ").replace("||", " or "), {}, {})
+publish_cases = {}
+for publish, skip in (("true", "true"), ("true", ""), ("true", "false"), ("false", "")):
+    o = {"prepare": {"publish": publish, "promote_digest": ""}, "rebuild-gate": {"skip": skip}}
+    publish_cases[f"{publish}/{skip}"] = "|".join(
+        str(dgx(x, o)).lower() for x in (jobs["finalize"]["env"]["PUBLISH"], jobs["build"]["if"], jobs["verify-publish"]["if"])
+    )
+gates["publish-cases"] = publish_cases
+# finalize's condition per job outcome, and whether the run was cancelled.
+def runs_when(expr, results, cancelled):
+    e = " ".join(str(expr).split())
+    e = e[3:-2] if e.startswith("${{") else e
+    e = re.sub(r"needs\.([\w-]+)\.result", lambda m: repr(results.get(m.group(1), "success")), e)
+    e = e.replace("!cancelled()", repr(not cancelled)).replace("always()", "True")
+    return eval(e.replace("&&", " and ").replace("||", " or "), {}, {})
+gates["finalize-runs"] = {
+    label: runs_when(jobs["finalize"]["if"], results, cancelled)
+    for label, results, cancelled in (
+        ("cancel-in-gate", {"rebuild-gate": "cancelled", "build": "skipped"}, True),
+        ("gate-timeout", {"rebuild-gate": "cancelled", "build": "success"}, False),
+        ("gate-failure", {"rebuild-gate": "failure", "build": "success"}, False),
+        ("skip", {"build": "skipped"}, False),
+        ("no-gate", {"rebuild-gate": "skipped", "build": "skipped"}, False),
+        ("cancel-in-build", {"build": "cancelled"}, True),
+        ("cancel-after-build", {}, True),
+    )
+}
 json.dump(gates, open(f"{out}/gates.json", "w"))
 # The release-kind line: detect hands the root lane's sentence to every
 # stable notes step, docker-release included.
@@ -238,12 +312,18 @@ chk "D-P4 the caller check reads the event's repository alone" "$(cat "$WORK/cal
 chk "D-P5 promote reads the exclusion list and the subpackages" "$(tr '\n' ' ' <"$WORK/promote.sh.env")" "CI_TOOLS EXCLUDE_RE SUBPACKAGES_JSON "
 chk "D-P5 the subpackages are the caller's declared list" "$(sed -n 's/^SUBPACKAGES_JSON=//p' "$WORK/promote.sh.envmap")" '${{ inputs.subpackages }}'
 chk_has "D-P5 promote runs the shared digest resolver" "$(cat "$WORK/promote.sh")" 'bash "$CI_TOOLS/promote-digest.sh" "$GITHUB_SHA"'
-chk "D-P6 build args read the channel tag" "$(tr '\n' ' ' <"$WORK/buildargs.sh.env")" "DOCKERFILE TAG "
+chk "D-P6 build args read the channel tag, in prepare" "$(tr '\n' ' ' <"$WORK/buildargs.sh.env")" "DOCKERFILE TAG "
 # The extracted body sees only the TAG variable; what feeds it is an
 # expression the shell cannot evaluate, so it is pinned by text: the channel
 # tag prepare derived, never the stable base a dev build has not earned.
 chk "D-P7 BUILD_VERSION is fed from the channel tag" \
-  "$(sed -n 's/^TAG=//p' "$WORK/buildargs.sh.envmap")" '${{ needs.prepare.outputs.tag }}'
+  "$(sed -n 's/^TAG=//p' "$WORK/buildargs.sh.envmap")" '${{ steps.tags.outputs.tag }}'
+# One evaluation feeds both builds, so the gate compares the image build would push.
+chk "D-P7 prepare hands its build args on" "$(jq -r '."prepare-outputs"."build-args"' "$WORK/gates.json")" \
+  '${{ steps.buildargs.outputs.build-args }}'
+chk "D-P7 build and the rebuild gate both pass them" \
+  "$(jq -r '."build-push-args"' "$WORK/gates.json")|$(jq -r '.gate.steps[] | select(.name == "Build the candidate image") | .with."build-args"' "$WORK/gates.json")" \
+  '${{ needs.prepare.outputs.build-args }}|${{ needs.prepare.outputs.build-args }}'
 # A re-tagged digest keeps the dev build's own version label and BUILD_VERSION
 # because nothing builds or relabels it: both steps that would are skipped.
 gate() { jq -r "$1" "$WORK/gates.json"; }
@@ -614,6 +694,33 @@ r=$(PROV_DOWN=1 promote_at "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")
 chk "D-W13 a cosign that cannot answer fails the step, neither reusing nor building" \
   "$r|$(sed -n 's/^EXIT=//p' "$WORK/promote.log")" "||1"
 chk "D-W13 after retrying" "$(grep -c '^verify ' "$PROV_LOG")" "5"
+# A promotion check carries the parent's image across a rebuild request, whose
+# tree is its parent's: a rebuild that published nothing has no image of its own.
+printf '%s\n' "$C_BUILT" "$C_REVERT" >"$BUILT"
+for c in "$C_BUILT" "$C_REVERT"; do
+  printf '%s\n' "verify sha256:${c:0:12}0000 $c" "verify-attestation sha256:${c:0:12}0000 $c"
+done >"$PROV_OK"
+carry() { # [--carry-rebuilds] -> promote-digest.sh at C_DOCS3, stdout in carry.out, stderr in carry.log
+  : >"$PROV_LOG"
+  (cd "$REPO" && PATH="$PBIN:$BIN:$PATH" REGISTRY=ghcr.io IMAGE_NAME=owner/app GITHUB_REPOSITORY=owner/app READBACK_SLEEP=0 \
+    EXCLUDE_RE="$EXCLUDE_RE_FULL" SUBPACKAGES_JSON='[]' bash "$ROOT/scripts/promote-digest.sh" "$@" "$C_DOCS3") \
+    >"$WORK/carry.out" 2>"$WORK/carry.log" || echo "EXIT=$?" >>"$WORK/carry.log"
+}
+carry_out() { sed -n "s/^$1=//p" "$WORK/carry.out"; }
+carry --carry-rebuilds
+chk "D-W15 --carry-rebuilds crosses a rebuild request to the image below it" \
+  "$(carry_out promote_source)|$(carry_out promote_via)|$(carry_out promote_digest)" "$C_REVERT|ancestor|sha256:${C_REVERT:0:12}0000"
+chk_has "D-W15 and says so" "$(cat "$WORK/carry.log")" "commit ${C_EMPTY} is a rebuild request, which changes no file, so it carries its parent's image"
+chk "D-W15 having asked for that image's signature and SBOM at its own commit" \
+  "$(cut -d' ' -f1 "$PROV_LOG" | tr '\n' ' ')|$(grep -c -- "-sha ${C_REVERT} ghcr.io/owner/app@sha256:${C_REVERT:0:12}0000\$" "$PROV_LOG")" \
+  "verify verify-attestation |2"
+carry
+chk "D-W15 the stable resolve, without it, still builds a rebuild request from source" \
+  "$(carry_out promote_digest)|$(carry_out promote_via)|$(grep -c '^EXIT=' "$WORK/carry.log" || true)" "|none|0"
+chk "D-W16 a signing window carries across a rebuild request too" \
+  "$(cd "$REPO" && EXCLUDE_RE="$EXCLUDE_RE_FULL" SUBPACKAGES_JSON='[]' bash "$ROOT/scripts/promote-digest.sh" --sources "$C_DOCS3" 2>"$WORK/sources.log" | tr '\n' ' ')" \
+  "$C_DOCS3 $C_EMPTY $C_DOCS2 $C_REVERT "
+chk "D-W16 and notes no carry, deciding no build" "$(grep -c '::notice::' "$WORK/sources.log" || true)" "0"
 
 # ── Two-branch: promotion commits on main ────────────────────────────────────
 # M0 built on main; dev's T1 changes main.go and T_D only docs; M1 is a main
@@ -827,6 +934,301 @@ chk "D-B4 a Dockerfile declaring neither gets no build arg" \
   "$(sed -n '/^build-args<<EOF$/,/^EOF$/p' "$WORK/out" | grep -c '=' || true)" "0"
 unset DOCKERFILE
 
+# ── Rebuild gate: which range is rebuild-only, and what the gate decides ────
+REBUILD='fix(deps): rebuild against refreshed base packages'
+scope_at() { # <repo> -> status|rebuild_only|compare_tag; env CHANNEL VERSION PLATFORMS EVENT SCOPE_TOOLS SCOPE_PATH
+  local rc=0
+  (cd "$1" && PATH="${SCOPE_PATH:-}$PATH" CI_TOOLS="${SCOPE_TOOLS:-$ROOT/scripts}" CHANNEL="$CHANNEL" \
+    VERSION="${VERSION:-v1.3.0}" PLATFORMS="${PLATFORMS-linux/amd64,linux/arm64}" SUBPACKAGES_JSON='[]' GO_LANES_JSON='[]' \
+    GITHUB_EVENT_NAME="${EVENT:-push}" bash "$ROOT/scripts/rebuild-gate.sh" scope) \
+    >"$WORK/scope.out" 2>"$WORK/scope.err" || rc=$?
+  [ "$(grep -c '^rebuild_only=' "$WORK/scope.out")|$(grep -c '^compare_tag=' "$WORK/scope.out")" = "1|1" ] \
+    || [ "$rc" -ne 0 ] || fail "scope printed no single rebuild_only and compare_tag pair: $(cat "$WORK/scope.out")"
+  printf '%s|%s|%s' "$rc" "$(sed -n 's/^rebuild_only=//p' "$WORK/scope.out")" "$(sed -n 's/^compare_tag=//p' "$WORK/scope.out")"
+}
+said() { grep -E '^::(notice|warning|error)::' "$WORK/scope.err" | tr '\n' '~' || true; }
+gate_repo() { # <dir> <branch> -> a repo whose first commit ships a Dockerfile and main.go
+  git init -q -b "$2" "$1"
+  commit_in "$1" "feat: first" Dockerfile='FROM scratch' main.go=v1
+}
+G_DEV="$WORK/gate-dev"
+G_B=$(gate_repo "$G_DEV" dev)
+git -C "$G_DEV" tag v1.3.0-dev.2 "$G_B"
+commit_in "$G_DEV" "$REBUILD (#40)" >/dev/null
+chk "D-RG1 a dev range that only asks for a rebuild is compared with the newest dev build" \
+  "$(CHANNEL=dev scope_at "$G_DEV")" "0|true|v1.3.0-dev.2"
+chk "D-RG1 and says so" "$(said)" \
+  "::notice::This range only asks for a rebuild against refreshed base packages, so its image is compared with v1.3.0-dev.2 before anything is published.~"
+G_VO="$WORK/gate-order"
+G_VO0=$(gate_repo "$G_VO" dev)
+git -C "$G_VO" tag v1.3.0-dev.10 "$G_VO0"
+commit_in "$G_VO" "docs: notes" README.md=x >/dev/null
+git -C "$G_VO" tag v1.3.0-dev.9
+commit_in "$G_VO" "$REBUILD" >/dev/null
+chk "D-RG1 the newest dev build is chosen by version, not by name" "$(CHANNEL=dev scope_at "$G_VO")" "0|true|v1.3.0-dev.10"
+
+G_SHIP="$WORK/gate-ship"
+G_S0=$(gate_repo "$G_SHIP" dev)
+git -C "$G_SHIP" tag v1.3.0-dev.2 "$G_S0"
+commit_in "$G_SHIP" "fix: main" main.go=v2 >/dev/null
+chk "D-RG2 a feature release with no rebuild request publishes as usual" "$(CHANNEL=dev scope_at "$G_SHIP")|$(said)" "0|false||"
+commit_in "$G_SHIP" "$REBUILD" >/dev/null
+chk "D-RG2 a shipped change beside a rebuild request publishes as usual" "$(CHANNEL=dev scope_at "$G_SHIP")|$(said)" \
+  "0|false||::notice::This range ships changes beside its rebuild request, so it publishes as usual.~"
+
+G_STB="$WORK/gate-stable"
+G_M0=$(gate_repo "$G_STB" main)
+git -C "$G_STB" tag v1.2.0 "$G_M0"
+commit_in "$G_STB" "$REBUILD" >/dev/null
+chk "D-RG3 a stable range that only asks for a rebuild is compared with the previous stable release" \
+  "$(CHANNEL=stable VERSION=v1.2.1 scope_at "$G_STB")" "0|true|v1.2.0"
+chk "D-RG5 a dispatch publishes as usual, quietly" "$(EVENT=workflow_dispatch CHANNEL=stable VERSION=v1.2.1 scope_at "$G_STB")|$(said)" "0|false||"
+
+gate_promotion() { # <repo> <main parent> <dev parent> -> a reconciliation commit
+  git -C "$1" commit-tree "${3}^{tree}" -p "$2" -p "$3" -m "release: promote dev into main"
+}
+G_RA="$WORK/gate-rec-a"
+G_RA0=$(gate_repo "$G_RA" main)
+git -C "$G_RA" tag v1.2.0 "$G_RA0"
+git -C "$G_RA" checkout -q -b dev
+G_RAD=$(commit_in "$G_RA" "docs: dev docs" README.md=d)
+git -C "$G_RA" update-ref refs/heads/main "$(gate_promotion "$G_RA" "$G_RA0" "$G_RAD")"
+git -C "$G_RA" checkout -q -f main
+commit_in "$G_RA" "$REBUILD" >/dev/null
+G_RB="$WORK/gate-rec-b"
+G_RB0=$(gate_repo "$G_RB" main)
+git -C "$G_RB" tag v1.2.0 "$G_RB0"
+G_RBQ=$(commit_in "$G_RB" "$REBUILD")
+git -C "$G_RB" checkout -q -b dev "$G_RB0"
+G_RBD=$(commit_in "$G_RB" "docs: dev docs" README.md=d)
+git -C "$G_RB" update-ref refs/heads/main "$(gate_promotion "$G_RB" "$G_RBQ" "$G_RBD")"
+git -C "$G_RB" checkout -q -f main
+for g in "$G_RA" "$G_RB"; do
+  chk "D-RG4 the promotion ($(basename "$g")) ships no path the image counts" \
+    "$(cd "$g" && MODE=paths FROM=v1.2.0 TO=HEAD bash "$ROOT/scripts/path-significance.sh" 2>/dev/null | sed -n 's/^significant=//p')" "[]"
+  chk "D-RG4 a promotion beside a rebuild request ($(basename "$g")) publishes as usual" \
+    "$(CHANNEL=stable VERSION=v1.2.1 scope_at "$g")|$(said)" \
+    "0|false||::notice::A promotion is in this range beside its rebuild request, so it publishes as usual.~"
+done
+G_RC="$WORK/gate-rec-c"
+G_RC0=$(gate_repo "$G_RC" main)
+git -C "$G_RC" tag v1.2.0 "$G_RC0"
+git -C "$G_RC" checkout -q -b dev
+G_RCD=$(commit_in "$G_RC" "$REBUILD")
+git -C "$G_RC" update-ref refs/heads/main "$(gate_promotion "$G_RC" "$G_RC0" "$G_RCD")"
+git -C "$G_RC" checkout -q -f main
+chk "D-RG30 a stable range whose only rebuild request is dev's, behind a promotion, publishes as usual, quietly" \
+  "$(CHANNEL=stable VERSION=v1.2.1 scope_at "$G_RC")|$(said)" "0|false||"
+G_DM="$WORK/gate-dev-merge"
+G_DM0=$(gate_repo "$G_DM" dev)
+git -C "$G_DM" tag v1.3.0-dev.2 "$G_DM0"
+G_DMS=$(git -C "$G_DM" commit-tree "${G_DM0}^{tree}" -p "$G_DM0" -m "$REBUILD")
+git -C "$G_DM" update-ref refs/heads/dev "$(git -C "$G_DM" commit-tree "${G_DM0}^{tree}" -p "$G_DM0" -p "$G_DMS" -m "Merge a rebuild")"
+git -C "$G_DM" checkout -q -f dev
+chk "D-RG30 on dev a rebuild request behind a merge's second parent is still compared" \
+  "$(CHANNEL=dev scope_at "$G_DM")" "0|true|v1.3.0-dev.2"
+
+G_NT="$WORK/gate-notag"
+gate_repo "$G_NT" dev >/dev/null
+commit_in "$G_NT" "$REBUILD" >/dev/null
+chk "D-RG6 a first dev build publishes as usual, quietly" "$(CHANNEL=dev scope_at "$G_NT")|$(said)" "0|false||"
+G_SD="$WORK/gate-side"
+G_SD0=$(gate_repo "$G_SD" dev)
+git -C "$G_SD" tag v1.3.0-dev.1 "$(git -C "$G_SD" commit-tree "${G_SD0}^{tree}" -p "$G_SD0" -m "fix: off dev's history")"
+commit_in "$G_SD" "$REBUILD" >/dev/null
+chk "D-RG6 a compared tag off this history publishes as usual, quietly" "$(CHANNEL=dev scope_at "$G_SD")|$(said)" "0|false||"
+git -C "$G_SD" tag v1.3.0-dev.2
+chk "D-RG6 so does a compared tag at this commit" "$(CHANNEL=dev scope_at "$G_SD")|$(said)" "0|false||"
+
+G_SY="$WORK/gate-sync"
+G_SY0=$(gate_repo "$G_SY" dev)
+git -C "$G_SY" tag v1.3.0-dev.2 "$G_SY0"
+commit_in "$G_SY" "docs: readme" README.md=r >/dev/null
+commit_in "$G_SY" "chore(sync): synced file(s) with cplieger/ci (#40)" >/dev/null
+chk "D-RG7 a docs change and an empty sync commit hold no rebuild request, and say nothing of it" \
+  "$(CHANNEL=dev scope_at "$G_SY")|$(said)" "0|false||"
+G_PJ="$WORK/gate-pj"
+gate_repo "$G_PJ" dev >/dev/null
+commit_in "$G_PJ" "feat: client" static-src/package.json='{"devDependencies":{"a":"1"}}' >/dev/null
+git -C "$G_PJ" tag v1.3.0-dev.2
+commit_in "$G_PJ" "chore(devdeps): bump a" static-src/package.json='{"devDependencies":{"a":"2"}}' >/dev/null
+commit_in "$G_PJ" "$REBUILD" >/dev/null
+chk "D-RG7 a dropped package.json beside a rebuild request is compared, keeping paths mode's notes out of the log" \
+  "$(CHANNEL=dev scope_at "$G_PJ")|$(said)" \
+  "0|true|v1.3.0-dev.2|::notice::This range only asks for a rebuild against refreshed base packages, so its image is compared with v1.3.0-dev.2 before anything is published.~"
+
+chk "D-RG8 an image not built for amd64 publishes its rebuild as usual" "$(PLATFORMS=linux/arm64 CHANNEL=dev scope_at "$G_DEV")|$(said)" \
+  "0|false||::notice::This image is not built for linux/amd64, so its rebuild publishes as usual.~"
+chk "D-RG8 platform entries are trimmed" "$(PLATFORMS=' linux/arm64 , linux/amd64' CHANNEL=dev scope_at "$G_DEV")" "0|true|v1.3.0-dev.2"
+chk "D-RG8 and matched exactly" "$(PLATFORMS=linux/amd64x CHANNEL=dev scope_at "$G_DEV")" "0|false|"
+chk "D-RG8 an arm64 image's release with no rebuild request says nothing of it" \
+  "$(PLATFORMS=linux/arm64 CHANNEL=dev scope_at "$G_SY")|$(said)" "0|false||"
+
+G_TOOLS="$WORK/scope-tools"
+fresh_tools() {
+  rm -rf "$G_TOOLS"
+  mkdir -p "$G_TOOLS"
+  cp -R "$ROOT/scripts/." "$G_TOOLS/"
+}
+fresh_tools
+printf 'echo "::error::path-significance: boom" >&2\nexit 2\n' >"$G_TOOLS/path-significance.sh"
+chk "D-RG9 paths that cannot be classified publish as usual, naming why" \
+  "$(SCOPE_TOOLS="$G_TOOLS" CHANNEL=dev scope_at "$G_DEV")|$(said)|$(grep -cx 'path-significance: boom' "$WORK/scope.err")" \
+  "0|false||::warning::The paths changed since v1.3.0-dev.2 could not be classified, so this release publishes as usual.~|1"
+fresh_tools
+printf 'exit 1\n' >"$G_TOOLS/render-notes.sh"
+chk "D-RG26 an unresolvable previous release publishes as usual" "$(SCOPE_TOOLS="$G_TOOLS" CHANNEL=stable VERSION=v1.2.1 scope_at "$G_STB")|$(said)" \
+  "0|false||::warning::The release before v1.2.1 could not be resolved, so this release publishes as usual.~"
+fresh_tools
+printf 'reconciliations_in() { return 2; }\n' >>"$G_TOOLS/reconciliation.sh"
+chk "D-RG26 so do promotions that cannot be listed" "$(SCOPE_TOOLS="$G_TOOLS" CHANNEL=stable VERSION=v1.2.1 scope_at "$G_STB")|$(said)" \
+  "0|false||::warning::The promotions since v1.2.0 could not be listed, so this release publishes as usual.~"
+G_GIT="$WORK/scope-git"
+mkdir -p "$G_GIT"
+for verb in merge-base tag; do
+  printf '#!/usr/bin/env bash\n[ "$1" = %s ] && exit 128\nexec %q "$@"\n' "$verb" "$(command -v git)" >"$G_GIT/git"
+  chmod 755 "$G_GIT/git"
+  o=$(SCOPE_PATH="$G_GIT:" CHANNEL=dev scope_at "$G_DEV")
+  case "$verb" in
+    merge-base) want="::warning::Whether v1.3.0-dev.2 is an ancestor of this commit could not be read, so this release publishes as usual.~" ;;
+    tag) want="::warning::The dev tags could not be listed, so this release publishes as usual.~" ;;
+  esac
+  chk "D-RG26 a failed git ${verb} publishes as usual" "$o|$(said)" "0|false||$want"
+done
+rm -rf "$G_TOOLS" "$G_GIT"
+
+usage_rc() { # <CI_TOOLS, empty for unset> <subcommand args...> -> status|stdout bytes|GITHUB_OUTPUT bytes|the error line
+  local tools=$1 rc=0
+  shift
+  : >"$WORK/gate-out"
+  (
+    cd "$G_DEV" || exit 1
+    if [ -n "$tools" ]; then export CI_TOOLS="$tools"; else unset CI_TOOLS; fi
+    GITHUB_OUTPUT="$WORK/gate-out" GITHUB_STEP_SUMMARY="$WORK/gate-summary" bash "$ROOT/scripts/rebuild-gate.sh" "$@"
+  ) >"$WORK/usage.out" 2>"$WORK/usage.err" || rc=$?
+  printf '%s|%s|%s|%s' "$rc" "$(wc -c <"$WORK/usage.out" | tr -d ' ')" "$(wc -c <"$WORK/gate-out" | tr -d ' ')" \
+    "$(grep '^::error::' "$WORK/usage.err" || true)"
+}
+chk "D-RG27 scope without CI_TOOLS is a usage error" "$(CHANNEL=dev usage_rc "" scope)" "2|0|0|::error::rebuild-gate: CI_TOOLS is required"
+chk "D-RG27 and compare" "$(usage_rc "" compare a b c)" "2|0|0|::error::rebuild-gate: CI_TOOLS is required"
+chk "D-RG27 scope refuses a channel that is neither dev nor stable" "$(CHANNEL=beta usage_rc "$ROOT/scripts" scope | cut -d'|' -f1-3)" "2|0|0"
+chk "D-RG27 compare refuses two arguments, deciding nothing" "$(usage_rc "$ROOT/scripts" compare a b | cut -d'|' -f1-3)" "2|0|0"
+
+# The extracted scope step, end to end.
+(cd "$G_DEV" && CHANNEL=dev VERSION=v1.3.0 PLATFORMS=linux/amd64,linux/arm64 GO_LANES_JSON='[]' GITHUB_EVENT_NAME=push \
+  run_step scope.sh) >"$WORK/scope-step.log"
+chk "D-RG19 the scope step writes its decision to the step outputs" "$(out rebuild_only)|$(out compare_tag)" "true|v1.3.0-dev.2"
+chk "D-RG17 the scope step runs on a publish that builds" "$(gate '."scope-if"')" \
+  "\${{ steps.tags.outputs.publish == 'true' && steps.promote.outputs.promote_digest == '' }}"
+chk "D-RG17 with the caller's inputs and the ci source" "$(tr '\n' ' ' <"$WORK/scope.sh.envmap")" \
+  'CHANNEL=${{ inputs.channel }} CI_TOOLS=${{ github.workspace }}/.cplieger-ci/scripts GO_LANES_JSON=${{ inputs.go-modules }} PLATFORMS=${{ inputs.platforms }} SUBPACKAGES_JSON=${{ inputs.subpackages }} VERSION=${{ inputs.version }} '
+chk "D-RG17 after that source, the digest walk and the build args, before the metadata" \
+  "$(gate '."scope-after" | join(",")')|$(gate '."scope-before-meta"')" "Check out the ci source,Resolve promoted digest,Resolve build args|true"
+chk "D-RG17 the ci source is checked out on both channels" "$(gate '."prepare-src-if"')" "\${{ steps.tags.outputs.publish == 'true' }}"
+chk "D-RG17 prepare hands the decision on" "$(gate '."prepare-outputs" | "\(.rebuild_only)|\(.compare_tag)"')" \
+  '${{ steps.rebuild.outputs.rebuild_only }}|${{ steps.rebuild.outputs.compare_tag }}'
+gstep() { jq -c --arg n "$1" ".gate.steps[] | select(.name == \$n) | $2" "$WORK/gates.json"; }
+chk "D-RG18 the gate runs for a rebuild-only range, after prepare, and hands on its compare step's skip" \
+  "$(gate '.gate | "\(.if)|\(.needs)|\(.outputs.skip)"')" \
+  "\${{ needs.prepare.outputs.rebuild_only == 'true' }}|prepare|\${{ steps.compare.outputs.skip }}"
+chk "D-RG18 the compare step reads the read step's answer and fails the gate on a usage error" \
+  "$(gstep "Compare the package sets" '[.env, ."continue-on-error"]')" \
+  '[{"CI_TOOLS":"${{ runner.temp }}/cplieger-ci/scripts","PREV_REF":"${{ steps.prev.outputs.ref }}","UNREADABLE":"${{ steps.prev.outputs.unreadable }}","SBOM_FROM":"${{ inputs.sbom-from }}","COMPARE_TAG":"${{ needs.prepare.outputs.compare_tag }}"},null]'
+chk "D-RG18 the read step gets the compared tag and the signing window's inputs" "$(tr '\n' ' ' <"$WORK/gateprev.sh.envmap")" \
+  'CI_TOOLS=${{ runner.temp }}/cplieger-ci/scripts COMPARE_TAG=${{ needs.prepare.outputs.compare_tag }} EXCLUDE_RE=${{ inputs.exclude-re }} SUBPACKAGES_JSON=${{ inputs.subpackages }} '
+chk "D-RG18 a path-mode release also scans the compared image, once its attestation verified" \
+  "$(gstep "Scan the compared release's image" '.if')" "\"\${{ inputs.sbom-from == 'path' && steps.prev.outputs.ref != '' }}\""
+chk "D-RG18 the candidate is scanned from the daemon under the name it was built at" \
+  "$(gstep "Generate the candidate's SBOM" '.with.image')|$(gstep "Build the candidate image" '.with.tags')" \
+  '"docker:rebuild-gate.invalid/candidate:latest"|"rebuild-gate.invalid/candidate:latest"'
+chk "D-RG18 every scan uses the caller's syft config" \
+  "$(jq -r '[.gate.steps[] | select((.uses // "") | startswith("anchore/sbom-action@")) | .with.config] | unique | join(" ")' "$WORK/gates.json")" \
+  '${{ inputs.syft-config }}'
+chk "D-RG20 build waits for the gate and skips on its skip, building when the gate was skipped" \
+  "$(gate '."build-needs" | join(",")')|$(gate '."build-if"' | grep -o "!cancelled()\|needs.prepare.result == 'success'\|needs.rebuild-gate.outputs.skip != 'true'" | tr '\n' ',')" \
+  "prepare,rebuild-gate|!cancelled(),needs.prepare.result == 'success',needs.rebuild-gate.outputs.skip != 'true',"
+pcase() { jq -r --arg k "$1" '."publish-cases"[$k]' "$WORK/gates.json"; }
+chk "D-RG21 an unchanged package set publishes nothing: finalize, build and verify-publish all hold" "$(pcase true/true)" "false|false|false"
+chk "D-RG21 a gate that did not run, or found a change, publishes" "$(pcase true/)/$(pcase true/false)" "true|true|true/true|true|true"
+chk "D-RG21 nothing due publishes nothing" "$(pcase false/)" "false|false|false"
+chk "D-RG22 verify-publish waits for the gate and skips on its skip" \
+  "$(gate '."vp-needs" | join(",")')|$(gate '."vp-if"' | grep -c "needs.rebuild-gate.outputs.skip != 'true'")" "prepare,rebuild-gate,finalize|1"
+chk "D-RG22 finalize waits for it too" "$(gate '."finalize-needs" | join(",")')" "prepare,rebuild-gate,build"
+chk "D-RG29 a run cancelled while the gate builds starts no finalize, a timed-out or failed gate still publishes" \
+  "$(gate '."finalize-runs" | to_entries | map("\(.key)=\(.value)") | join(" ")')" \
+  "cancel-in-gate=false gate-timeout=true gate-failure=true skip=true no-gate=true cancel-in-build=false cancel-after-build=true"
+chk "D-RG23 the gate holds read access alone and logs in nowhere" \
+  "$(gate '.gate.permissions | tojson')|$(gate '[.gate.steps[] | select(.name | startswith("Log in to"))] | length')" '{"contents":"read"}|0'
+chk "D-RG23 its build loads the image into the runner and pushes nothing" \
+  "$(gstep "Build the candidate image" '[.with.push, .with.load, .with.provenance, .with.sbom]')|$(gate '[.gate.steps[] | select(.with.push == true)] | length')" \
+  "[false,true,false,false]|0"
+chk "D-RG23 it signs and attests nothing and holds no token" \
+  "$(gate '[.gate.steps[] | (.run // "") | select(test("cosign (sign|attest)"))] | length')|$(gate '[.gate.steps[] | (.env // {}) | keys[] | select(. == "GH_TOKEN" or . == "GITHUB_TOKEN")] | length')" "0|0"
+chk "D-RG23 its scans upload nothing" \
+  "$(gate '[.gate.steps[] | select((.uses // "") | startswith("anchore/sbom-action@")) | "\(.with."upload-artifact")/\(.with."upload-release-assets")"] | unique | join(" ")')" \
+  "false/false"
+chk "D-RG24 every job that can write waits for the gate" "$(gate '."write-reach" | tojson')" '{"build":true,"finalize":true,"receipt":true}'
+PLATFORMS=linux/amd64,linux/arm64 run_step matrix.sh >/dev/null
+G_NAME=$(out matrix | jq -r '.[] | select(.platform == "linux/amd64") | .name')
+chk "D-RG25 the gate fills the cache build's amd64 leg reads" \
+  "$(gstep "Build the candidate image" '.with."cache-from"')|$(gstep "Build the candidate image" '.with."cache-to"')" \
+  "\"type=gha,scope=${G_NAME}\"|\"type=gha,mode=max,scope=${G_NAME},ignore-error=true\""
+
+# compare: the package sets, read as the notes' System packages block reads them.
+gate_sbom() { # <file> <image digest> <name@version...>
+  local f=$1 digest=$2
+  shift 2
+  jq -n --arg d "$digest" --args '{
+    spdxVersion: "SPDX-2.3",
+    documentDescribes: ["SPDXRef-DocumentRoot-Image"],
+    packages: ([{SPDXID: "SPDXRef-DocumentRoot-Image", name: "ghcr.io/owner/app", versionInfo: $d}]
+      + [$ARGS.positional | to_entries[] | (.value | split("@")) as [$n, $v]
+         | {SPDXID: "SPDXRef-Package-\(.key)", name: $n, versionInfo: $v,
+            externalRefs: [{referenceType: "purl", referenceLocator: "pkg:apk/alpine/\($n)@\($v)?arch=x86_64"}]}])
+  }' "$@" >"$f"
+}
+G_REF="ghcr.io/owner/app@$(dig 7)"
+gate_sbom "$WORK/g-new.json" sha256:new busybox@1.37.0-r30 musl@1.2.5-r10
+gate_sbom "$WORK/g-same.json" sha256:old busybox@1.37.0-r30 musl@1.2.5-r10
+gate_sbom "$WORK/g-one.json" sha256:old busybox@1.37.0-r29 musl@1.2.5-r10
+gate_sbom "$WORK/g-two.json" sha256:old busybox@1.37.0-r29 musl@1.2.5-r9
+compare_with() { # <new> <attested> <scanned> -> the skip lines written; env PREV_REF UNREADABLE SBOM_FROM
+  : >"$WORK/gate-out"
+  : >"$WORK/gate-summary"
+  (CI_TOOLS="$ROOT/scripts" GITHUB_OUTPUT="$WORK/gate-out" GITHUB_STEP_SUMMARY="$WORK/gate-summary" COMPARE_TAG=v1.2.0 \
+    PREV_REF="${PREV_REF-$G_REF}" UNREADABLE="${UNREADABLE:-}" SBOM_FROM="${SBOM_FROM:-image}" \
+    bash "$ROOT/scripts/rebuild-gate.sh" compare "$1" "$2" "$3") >"$WORK/gate.log" 2>&1 || echo "EXIT=$?" >>"$WORK/gate.log"
+  sed -n 's/^skip=//p' "$WORK/gate-out" | tr '\n' ' '
+}
+g_said() { grep -E '^(::(notice|warning|error)::|EXIT=)' "$WORK/gate.log" | tr '\n' '~' || true; }
+g_summary() { wc -c <"$WORK/gate-summary" | tr -d ' '; }
+chk "D-RG10 an unchanged package set skips the publish" "$(compare_with "$WORK/g-new.json" "$WORK/g-same.json" "$WORK/none")|$(g_said)" \
+  "true |::notice::No package changed since v1.2.0, so this rebuild publishes nothing.~"
+chk_has "D-RG10 and the summary names the compared release" "$(cat "$WORK/gate-summary")" \
+  "Rebuild skipped: no package changed since \`v1.2.0\` (\`${G_REF}\`), so the image built from source for the comparison is discarded and nothing is published."
+chk "D-RG11 one changed package publishes" "$(compare_with "$WORK/g-new.json" "$WORK/g-one.json" "$WORK/none")|$(g_said)|$(g_summary)" \
+  "false |::notice::1 package changed since v1.2.0, so this rebuild is published.~|0"
+chk "D-RG11 two say so in the plural" "$(compare_with "$WORK/g-new.json" "$WORK/g-two.json" "$WORK/none")|$(g_said)" \
+  "false |::notice::2 packages changed since v1.2.0, so this rebuild is published.~"
+chk "D-RG12 an unreadable compared SBOM publishes, naming why" \
+  "$(PREV_REF='' UNREADABLE='ghcr.io/owner/app:v1.2.0 is not readable' compare_with "$WORK/g-new.json" "$WORK/g-same.json" "$WORK/none")|$(g_said)|$(g_summary)" \
+  "false |::warning::Publishing this rebuild, because ghcr.io/owner/app:v1.2.0 is not readable.~|0"
+chk "D-RG12 with a reason even when none was handed on" "$(PREV_REF='' compare_with "$WORK/g-new.json" "$WORK/g-same.json" "$WORK/none")|$(g_said)" \
+  "false |::warning::Publishing this rebuild, because the SBOM of v1.2.0 could not be read.~"
+chk "D-RG13 a path-mode release compares the scanned image, not its binary's attested SBOM" \
+  "$(SBOM_FROM=path compare_with "$WORK/g-new.json" "$WORK/g-same.json" "$WORK/g-one.json")/$(SBOM_FROM=path compare_with "$WORK/g-new.json" "$WORK/g-one.json" "$WORK/g-same.json")" \
+  "false /true "
+chk "D-RG14 no candidate SBOM publishes" "$(compare_with "$WORK/none" "$WORK/g-same.json" "$WORK/none")|$(g_said)|$(g_summary)" \
+  "false |::warning::Publishing this rebuild, because the rebuilt image's SBOM could not be generated.~|0"
+chk "D-RG14 nor does a missing compared SBOM" "$(compare_with "$WORK/g-new.json" "$WORK/none" "$WORK/none")|$(g_said)|$(g_summary)" \
+  "false |::warning::Publishing this rebuild, because no image SBOM of v1.2.0 could be generated.~|0"
+chk "D-RG14 nor a path-mode scan that wrote nothing" "$(SBOM_FROM=path compare_with "$WORK/g-new.json" "$WORK/g-same.json" "$WORK/none")|$(g_said)|$(g_summary)" \
+  "false |::warning::Publishing this rebuild, because no image SBOM of v1.2.0 could be generated.~|0"
+echo '{}' >"$WORK/g-bad.json"
+chk "D-RG14 nor two SBOMs that cannot be compared" "$(compare_with "$WORK/g-new.json" "$WORK/g-bad.json" "$WORK/none")|$(g_said)|$(g_summary)" \
+  "false |::warning::Publishing this rebuild, because its SBOM and that of v1.2.0 could not be compared.~|0"
+rm -f "$WORK"/g-*.json
+
 # ── Release-kind line ────────────────────────────────────────────────────────
 chk "D-S1 detect reads no soak record" "$(grep -c 'Read promotion record' "$WORK/detect-steps.txt" || true)" "0"
 chk "D-S1 release.yaml reads no soak-override status" "$(grep -c 'soak-override' "$RELEASE_YAML" || true)" "0"
@@ -946,7 +1348,7 @@ git -C "$NOTESREPO" tag v1.2.0
 git -C "$NOTESREPO" tag v1.10.0
 git -C "$NOTESREPO" tag v1.2.0-dev.1
 o=$(prev_sbom)
-chk_has "D-Q2 a previous tag missing from the registry is skipped" "$o" "ghcr.io/owner/app:v1.2.0 is not readable, so the notes carry no system-package diff."
+chk_has "D-Q2 a previous tag missing from the registry is skipped" "$o" "The notes carry no system-package diff, because ghcr.io/owner/app:v1.2.0 is not readable."
 chk "D-Q2 by version, not by name, and with no cosign call" "$(wc -l <"$COSIGN_LOG" | tr -d ' ')" "0"
 PREV_DIGEST=$(dig 7)
 printf '%s\n' "owner/app:v1.2.0 $PREV_DIGEST" >"$TAGS"
@@ -963,6 +1365,33 @@ chk "D-Q3 a verified bundle attestation yields the previous SPDX document" "$(jq
 chk_has "D-Q3 verified against this workflow's identity, by digest" "$(head -n1 "$COSIGN_LOG")" \
   "verify-attestation --type spdxjson --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp ^https://github\.com/cplieger/ci/\.github/workflows/docker-release\.yaml@ --certificate-github-workflow-repository owner/app --certificate-github-workflow-sha $C1 ghcr.io/owner/app@${PREV_DIGEST}"
 chk "D-Q3 read from what verification printed, with no separate download" "$(cut -d' ' -f1 "$COSIGN_LOG" | tr '\n' ' ')" "verify-attestation "
+# The rebuild gate reads the compared release's SBOM through the same owner,
+# and never fails on it: an unreadable one publishes the rebuild.
+gate_prev() { # env-prefixed COMPARE_TAG: runs the gate's step in NOTESREPO; prints its GITHUB_OUTPUT, or EXIT=n
+  : >"$WORK/gate-out"
+  rm -f "$WORK/sbom-attested.spdx.json"
+  (cd "$NOTESREPO" && PATH="$NBIN:$BIN:$PATH" CI_TOOLS="$ROOT/scripts" RUNNER_TEMP="$WORK" REGISTRY=ghcr.io \
+    GITHUB_REPOSITORY=owner/app IMAGE_NAME=owner/app EXCLUDE_RE="$EXCLUDE_RE_FULL" SUBPACKAGES_JSON='[]' \
+    GITHUB_OUTPUT="$WORK/gate-out" bash "$WORK/gateprev.sh") >"$WORK/gateprev.log" 2>&1 || echo "EXIT=$?"
+  cat "$WORK/gate-out"
+}
+gate_file() { [ -f "$WORK/sbom-attested.spdx.json" ] && jq -c . "$WORK/sbom-attested.spdx.json" || echo none; }
+chk "D-RG15 the gate reads a verified compared SBOM and names its digest" \
+  "$(COMPARE_TAG=v1.2.0 gate_prev)|$(gate_file)" "ref=ghcr.io/owner/app@${PREV_DIGEST}|$(jq -c . <<<"$SPDX")"
+chk "D-RG15 an unreadable tag is a reason, never a failure" \
+  "$(COMPARE_TAG=v1.10.0 gate_prev)|$(gate_file)" "unreadable=ghcr.io/owner/app:v1.10.0 is not readable|none"
+o=$(COSIGN_VERIFY_RC=1 COMPARE_TAG=v1.2.0 gate_prev)
+chk "D-RG15 so is an attestation cosign cannot vouch for" "${o%%=*}=|$(gate_file)|$(grep -c '^EXIT=' <<<"$o" || true)" "unreadable=|none|0"
+rsbom() { # <args...> -> rc|stdout of release-sbom.sh in NOTESREPO
+  local rc=0 o
+  o=$(cd "$NOTESREPO" && PATH="$NBIN:$BIN:$PATH" REGISTRY=ghcr.io IMAGE_NAME=owner/app GITHUB_REPOSITORY=owner/app \
+    EXCLUDE_RE="$EXCLUDE_RE_FULL" SUBPACKAGES_JSON='[]' bash "$ROOT/scripts/release-sbom.sh" "$@" 2>/dev/null) || rc=$?
+  echo "$rc|$o"
+}
+chk "D-RG16 release-sbom.sh refuses one argument" "$(rsbom v1.2.0)" "2|"
+chk "D-RG16 and three" "$(rsbom v1.2.0 "$WORK/x.json" extra)" "2|"
+chk "D-RG16 and prints the ref it read" "$(rsbom v1.2.0 "$WORK/x.json")" "0|ghcr.io/owner/app@${PREV_DIGEST}"
+rm -f "$WORK/x.json"
 envelope dsse "$PREV_DIGEST" >"$COSIGN_VERIFIED"
 prev_sbom >/dev/null
 chk "D-Q4 the DSSE envelope shape decodes too" "$(jq -c . "$WORK/sbom-prev.spdx.json" 2>/dev/null)" "$(jq -c . <<<"$SPDX")"
@@ -1205,6 +1634,10 @@ chk "D-G6 the source is the one the digest walk named" "$(sed -n 's/^PROMOTE_SOU
   '${{ needs.prepare.outputs.promote_source }}'
 chk "D-G6 with the exclusion list and subpackages that walk used" \
   "$(sed -n 's/^EXCLUDE_RE=//p;s/^SUBPACKAGES_JSON=//p' "$WORK/provenance.sh.envmap" | tr '\n' ' ')" '${{ inputs.exclude-re }} ${{ inputs.subpackages }} '
+T_RB=$(git -C "$WORK/rec" commit-tree "${T1}^{tree}" -p "$T1" -m "fix(deps): rebuild against refreshed base packages")
+printf '%s\n' "verify $D_T $T1" "verify-attestation $D_T $T1" >"$PROV_OK"
+chk "D-G7 a promoted rebuild request whose dev build published nothing carries its parent's signed image" \
+  "$(provenance "$T_RB")|$(sed 's/.*-sha \([0-9a-f]*\) .*/\1/' "$PROV_LOG" | tr '\n' ' ')" "ok|$T_RB $T1 $T_RB $T1 "
 
 # ── Dev tag receipt ──────────────────────────────────────────────────────────
 # The stub gh records every call and answers the git-ref read as absent (404)
