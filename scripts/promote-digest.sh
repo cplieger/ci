@@ -12,6 +12,8 @@ set -euo pipefail
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=SCRIPTDIR/reconciliation.sh
 . "$TOOLS/reconciliation.sh"
+# rebuild-stale.sh's commit subject; test-path-significance.sh holds the copies equal.
+REBUILD_SUBJECT='fix(deps): rebuild against refreshed base packages'
 
 die() {
   echo "::error::$*" >&2
@@ -36,8 +38,14 @@ commit_is_pure() { # <commit> -> 0 when its own diff changes no shipped path, so
   fi
   changed=$(git diff --name-only "${c}^" "$c")
   if [ -z "$changed" ]; then
-    echo "::notice::commit ${c} changes no file (a forced rebuild); building from source" >&2
-    return 1
+    # path-significance.sh owns which empty commit is a rebuild request.
+    case "$(git log -1 --format=%s "$c")" in
+      "$REBUILD_SUBJECT" | "$REBUILD_SUBJECT (#"*")")
+        echo "::notice::commit ${c} changes no file (a forced rebuild); building from source" >&2
+        return 1
+        ;;
+    esac
+    return 0
   fi
   sig=$(MODE=paths FROM="${c}^" TO="$c" REPO_TYPE=docker GO_LANES_JSON='[]' \
     bash "$TOOLS/path-significance.sh" 2>/dev/null | sed -n 's/^significant=//p') || sig=""

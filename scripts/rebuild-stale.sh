@@ -99,8 +99,9 @@ open_pr() { # <repo> <base> <reason>
   fi
   head=$(gh api "repos/cplieger/${repo}/git/ref/heads/${base}" --jq .object.sha)
   tree=$(gh api "repos/cplieger/${repo}/git/commits/${head}" --jq .tree.sha)
-  # An empty commit: the base's own tree with the base's head as its only parent. It is
-  # a significant push, and PKG_REFRESH makes the build re-run its package layer.
+  # An empty commit: the base's own tree with the base's head as its only parent. Its
+  # subject is what makes it a significant push (path-significance.sh REBUILD_SUBJECT),
+  # and PKG_REFRESH makes the build re-run its package layer.
   commit=$(gh api -X POST "repos/cplieger/${repo}/git/commits" \
     -f message='fix(deps): rebuild against refreshed base packages' \
     -f tree="$tree" -f 'parents[]='"$head" --jq .sha)

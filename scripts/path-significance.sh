@@ -157,15 +157,29 @@ else
   SIGNIFICANT=$(echo "$CHANGED" | grep -Ev "$EXCLUDE_RE" || true)
 fi
 
-# A commit changing no file exists only to force a rebuild, and git-cliff
-# cannot see it, so it counts as a significant root change.
+# rebuild-stale.sh's empty commit forces an image rebuild against refreshed
+# base packages, and git-cliff cannot see it, so it counts as a significant
+# root change. Any other empty commit is a machine PR whose changes reached the
+# branch first (a sync or Renovate PR squashed after a promotion carried its
+# files), and a library's module or package cannot change without a file, so
+# neither releases. REBUILD_SUBJECT is rebuild-stale.sh's; test-path-significance.sh
+# holds the two equal.
+REBUILD_SUBJECT='fix(deps): rebuild against refreshed base packages'
+is_rebuild_commit() { # <commit>
+  [ -z "$(git diff-tree --root --no-commit-id --name-only -r "$1")" ] || return 1
+  case "$(git log -1 --format=%s "$1")" in
+    "$REBUILD_SUBJECT" | "$REBUILD_SUBJECT (#"*")") return 0 ;;
+  esac
+  note "commit $1 changes no file and is not a rebuild request; not significant"
+  return 1
+}
 EMPTY_COMMIT=""
-if [ -z "$SIGNIFICANT" ] && [ -n "$RANGE_START" ]; then
+if [ -z "$SIGNIFICANT" ] && [ -n "$RANGE_START" ] && [ "${REPO_TYPE:-}" = docker ]; then
   while IFS= read -r c; do
     [ -z "$c" ] && continue
-    if [ -z "$(git diff-tree --root --no-commit-id --name-only -r "$c")" ]; then
+    if is_rebuild_commit "$c"; then
       EMPTY_COMMIT="$c"
-      note "commit ${c} changes no file; treating it as a significant root change"
+      note "commit ${c} is a rebuild request; treating it as a significant root change"
       break
     fi
   done < <(git rev-list --no-merges "$RANGE_START..$HEAD")
