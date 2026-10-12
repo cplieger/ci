@@ -2038,8 +2038,11 @@ def _resolve_with_value(value, inputs, target, strip_unknown=False, env=None, st
     env = env or {}
     step_outputs = step_outputs or {}
 
-    def repl(m):
-        inner = m.group(1).strip()
+    def operand(inner):
+        """One expression operand's value, or None when it is not one modelled here."""
+        lm = re.fullmatch(r"'((?:[^']|'')*)'", inner)
+        if lm:
+            return lm.group(1).replace("''", "'")
         im = re.match(r'inputs\.([\w-]+)$', inner)
         if im:
             return str(inputs.get(im.group(1), ''))
@@ -2061,10 +2064,21 @@ def _resolve_with_value(value, inputs, target, strip_unknown=False, env=None, st
             return 'false'
         # No PR base is available locally. Leaving it empty deliberately sends
         # the meta detect script down its fail-safe full-battery path.
-        if inner in ('github.event.pull_request.base.sha', 'github.event.before'):
+        if inner in (
+            'github.event.pull_request.base.sha',
+            'github.event.before',
+            'github.base_ref',
+        ):
             return ''
         if inner == 'github.sha':
             return ''
+        return None
+
+    def repl(m):
+        # `a || 'default'` yields its first non-empty operand, as Actions does.
+        values = [operand(part.strip()) for part in _split_logical(m.group(1).strip(), '||')]
+        if all(v is not None for v in values):
+            return next((v for v in values if v), '')
         return '' if strip_unknown else m.group(0)
 
     return re.sub(r'\$\{\{\s*(.+?)\s*\}\}', repl, value)

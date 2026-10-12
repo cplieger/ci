@@ -102,3 +102,24 @@ class DashboardCheckMapping(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ResolveOrDefaultTests(unittest.TestCase):
+    """`_resolve_with_value` models an Actions `a || 'default'` expression."""
+
+    def resolve(self, value, **kw):
+        return _ci_local._resolve_with_value(value, {}, ROOT, strip_unknown=True, **kw)  # noqa: SLF001
+
+    def test_an_empty_base_ref_falls_back_to_the_literal_default(self):
+        assert self.resolve("${{ github.base_ref || 'main' }}") == 'main'
+
+    def test_the_first_non_empty_operand_wins(self):
+        assert self.resolve("${{ env.BASE || 'main' }}", env={'BASE': 'dev'}) == 'dev'
+
+    def test_a_quoted_literal_unescapes_doubled_quotes(self):
+        assert self.resolve("${{ '' || 'it''s' }}") == "it's"
+
+    def test_an_unmodelled_operand_keeps_the_strip_rule(self):
+        assert self.resolve("${{ github.actor || 'x' }}") == ''
+        kept = _ci_local._resolve_with_value("${{ github.actor || 'x' }}", {}, ROOT)  # noqa: SLF001
+        assert kept == "${{ github.actor || 'x' }}"
