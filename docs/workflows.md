@@ -66,6 +66,8 @@ Before it tags a release or pushes an image, the workflow checks the root `go.mo
 
 The branch picks the channel. A push to `dev` publishes the dev channel, with `vX.Y.Z-dev.N` tags, `:dev` images on GitHub Container Registry, the npm `dev` dist-tag and no GitHub Release. A push to `main` publishes the stable channel, with a `vX.Y.Z` tag, GitHub Container Registry and Docker Hub images, npm and JSR packages, and a GitHub Release. A run on any other branch, a tag or a pull request fails with an error and publishes nothing.
 
+A dev build is numbered as the next promotion, so a library's dev run whose code is the same as its highest stable release publishes nothing. Otherwise that pre-release would rank above the stable release and move every consumer's `dev` onto it. This covers a Go or TypeScript root together with the TypeScript subpackages that share its version, and each nested Go module. A library whose dev pre-releases already rank above its stable release still builds, because only a newer pre-release brings that stable release's code to the consumers on them. An image repository still builds, because a promotion re-tags that build.
+
 `release.yaml` publishes only from a public, non-fork repository whose default branch is `dev`, which follows [the two-branch release model](#the-two-branch-release-model). For any other caller its first job fails with an error, before anything is built or published. The sync gives a repository with only `main` no release workflow, and such a repository publishes, if at all, from its own workflow.
 
 `docker-release.yaml` is called by `release.yaml` and never directly. Its first job refuses the same callers, in a repair as in a release. Its work splits by channel.

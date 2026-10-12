@@ -129,6 +129,10 @@ facts["renders"] = {k: "render-notes.sh" in s["run"] for k, s in notes.items() i
 facts["outputs"] = jobs["detect"]["outputs"]
 facts["if:publish"] = " ".join(d["Add pending promotions to the publication"].get("if", "").split())
 facts["select-env"] = step(jobs, "detect", "Select version")["env"]
+facts["if:ahead"] = " ".join(d["Drop dev builds of stable code"].get("if", "").split())
+facts["ahead-env"] = d["Drop dev builds of stable code"]["env"]
+facts["ahead-order"] = facts["names"].index("Detect changed paths") < facts["names"].index(
+    "Drop dev builds of stable code") < facts["names"].index("Select version")
 facts["publish-after"] = facts["names"].index("Detect changed paths") < facts["names"].index(
     "Add pending promotions to the publication") < facts["names"].index("Select version")
 facts["renumber-steps"] = [s.get("name") for s in jobs["renumber"]["steps"]]
@@ -645,6 +649,44 @@ pending_at() { # <dir> <channel> -> the state JSON; outputs in $WORK/out
 }
 outkey() { sed -n "s/^$1=//p" "$WORK/out" | head -1; }
 lane() { jq -r --arg k "$1" ".[\$k].$2" <<<"$3"; }
+# A git whose tag listing number FAIL_TAG_READ alone fails, so a case pins the
+# one reader whose failure it injects.
+TAG_GIT="$WORK/tag-git"
+mkdir -p "$TAG_GIT"
+cat >"$TAG_GIT/git" <<SH
+#!/usr/bin/env bash
+if [ "\$1" = for-each-ref ]; then
+  n=\$((\$(cat "$TAG_GIT/n" 2>/dev/null || echo 0) + 1))
+  echo "\$n" >"$TAG_GIT/n"
+  [ "\$n" -ne "\${FAIL_TAG_READ:?}" ] || { echo "stub: tag listing \$n fails" >&2; exit 91; }
+fi
+exec "$(command -v git)" "\$@"
+SH
+chmod 755 "$TAG_GIT/git"
+failing_tag_read() { # <N> <command...>
+  rm -f "$TAG_GIT/n"
+  FAIL_TAG_READ="$1" PATH="$TAG_GIT:$PATH" "${@:2}"
+}
+# A git whose call number FAIL_GIT_N among those whose argv matches the glob
+# FAIL_GIT alone fails; git_calls is how many matched, so a case pins both the
+# call it fails and that the run stopped there.
+GIT_FAIL="$WORK/git-fail"
+mkdir -p "$GIT_FAIL"
+cat >"$GIT_FAIL/git" <<SH
+#!/usr/bin/env bash
+if [[ "\$*" == \${FAIL_GIT:?} ]]; then
+  n=\$((\$(cat "$GIT_FAIL/n" 2>/dev/null || echo 0) + 1))
+  echo "\$n" >"$GIT_FAIL/n"
+  [ "\$n" -ne "\${FAIL_GIT_N:?}" ] || { echo "stub: git \$* fails" >&2; exit 92; }
+fi
+exec "$(command -v git)" "\$@"
+SH
+chmod 755 "$GIT_FAIL/git"
+failing_git() { # <argv glob> <N> <command...>
+  rm -f "$GIT_FAIL/n"
+  FAIL_GIT="$1" FAIL_GIT_N="$2" PATH="$GIT_FAIL:$PATH" "${@:3}"
+}
+git_calls() { cat "$GIT_FAIL/n" 2>/dev/null || echo 0; }
 
 chk "P0 R1 has the reconciliation shape" "$(. "$ROOT/scripts/reconciliation.sh" && cd "$O" && is_reconciliation "$R1" && echo yes)" "yes"
 s=$(pending_at "$O" stable)
@@ -661,6 +703,41 @@ s=$(pending_at "$O" stable)
 chk "P4 at a later S the promotion is still pending" "$(lane . commit "$s")|$(lane . in_range "$s")" "$R1|true"
 chk "P4 and S's kind line says it was built from main" "$(outkey root_kind_note)" \
   'Built from `main`, including the promotion of `v1.1.0-dev.1`'
+pending_failing() { # <N> -> ran|refused, a stable pending run at S1 whose tag listing N fails
+  (cd "$O" && failing_tag_read "$1" env CHANNEL=stable GITHUB_OUTPUT="$WORK/out" bash "$RS" pending) >"$WORK/pending.log" 2>&1 \
+    && echo ran || echo refused
+}
+# The root lane lists its stable tags (1), its dev tags for the kind line (2),
+# then the stable tags below its highest (3).
+chk "P11 a stable tag list git cannot read stops the run" "$(pending_failing 1)" "refused"
+chk_has "P11 and names the lane" "$(cat "$WORK/pending.log")" "cannot read lane .'s stable tags"
+chk "P12 a dev tag list git cannot read for the kind line stops the run" "$(pending_failing 2)" "refused"
+chk_has "P12 and names the lane" "$(cat "$WORK/pending.log")" "cannot find lane .'s promoted dev build for its kind line"
+chk "P13 so does the stable tag list below the highest stable" "$(pending_failing 3)" "refused"
+chk_has "P13 and names the lane" "$(cat "$WORK/pending.log")" "cannot read lane .'s stable tags"
+pending_git_failing() { # <argv glob> <N> -> ran|refused, a stable pending run at S1 whose Nth matching git call fails
+  (cd "$O" && failing_git "$1" "$2" env CHANNEL=stable GITHUB_OUTPUT="$WORK/out" bash "$RS" pending) >"$WORK/pending.log" 2>&1 \
+    && echo ran || echo refused
+}
+chk "P14 a history git cannot walk to the kind line's dev build stops the run" \
+  "$(pending_git_failing 'rev-list --topo-order *' 1)|$(git_calls)" "refused|1"
+chk_has "P14 and names the lane" "$(cat "$WORK/pending.log")" "cannot find lane .'s promoted dev build for its kind line"
+# With no dev tag to look for, only kind_note sees git fail to read R's second parent.
+git -C "$O" tag -d v1.1.0-dev.1 >/dev/null
+got=$(pending_git_failing 'rev-parse *^2' 1)
+git -C "$O" tag v1.1.0-dev.1 "$D1"
+chk "P15 a promoted commit git cannot read stops the run" "$got|$(git_calls)" "refused|1"
+chk_has "P15 and names the lane" "$(cat "$WORK/pending.log")" "cannot find lane .'s promoted dev build for its kind line"
+chk "P16 a lane list that is not JSON stops the run" \
+  "$( (cd "$O" && CHANNEL=stable GO_LANES_JSON='["yamlenv"' GITHUB_OUTPUT="$WORK/out" bash "$RS" pending) >"$WORK/pending.log" 2>&1 && echo ran || echo refused)" \
+  "refused"
+chk_has "P16 and says so" "$(cat "$WORK/pending.log")" "is not a JSON array of lane dirs"
+chk "P17 a promotion list git cannot read stops the run" "$(pending_git_failing 'rev-parse --verify --quiet *' 1)|$(git_calls)" "refused|1"
+chk_has "P17 and names the lane" "$(cat "$WORK/pending.log")" "cannot list lane .'s promotions on HEAD"
+# C0 is checked once for main's promotions past v1.0.0, then once for those up to it.
+chk "P18 so does a promotion list git cannot read up to the stable tag" \
+  "$(pending_git_failing "rev-parse --verify --quiet ${C0}^{commit}" 2)|$(git_calls)" "refused|2"
+chk_has "P18 and names the tag" "$(cat "$WORK/pending.log")" "cannot list lane .'s promotions up to v1.0.0"
 
 W="$WORK/work"
 git clone -q "$O" "$W"
@@ -723,6 +800,15 @@ publish_sets() { echo "$(outkey root_changed)|$(outkey subpackages_to_publish)|$
 chk "Q1 a pending nested lane is added to the lane releases" "$(publish_at "$O" false '[]' '[]' "$s")$(publish_sets)" 'false|[]|["yamlenv"]'
 chk "Q1 once" "$(publish_at "$O" true '[]' '["yamlenv"]' "$s")$(publish_sets)" 'true|[]|["yamlenv"]'
 chk "Q1 never on a dev run" "$(publish_at "$O" false '[]' '[]' "$s" dev)" "EXIT=1"
+chk "Q5 a state that is not JSON publishes nothing" "$(publish_at "$O" false '[]' '[]' '{"."')" "EXIT=1"
+chk_has "Q5 and says so" "$(cat "$WORK/publish.log")" "STATE is not the pending step's state"
+chk "Q6 a root entry whose stable commit jq cannot list publishes nothing" \
+  "$(publish_at "$O" false '[]' '[]' "{\".\":{\"in_range\":true,\"commit\":\"$R1\",\"h_commit\":{},\"h_tag\":\"\"}}")" "EXIT=1"
+chk_has "Q6 and says so" "$(cat "$WORK/publish.log")" "cannot list the root's promotions past its stable tag up to $R1"
+chk "N4 nor is one numbered" \
+  "$( (cd "$O" && STATE='{"."' CLIFF_SCRIPT="$COMPUTE" GITHUB_OUTPUT="$WORK/out" bash "$RS" number) >"$WORK/number.log" 2>&1 && echo ran || echo refused)" \
+  "refused"
+chk_has "N4 and says so" "$(cat "$WORK/number.log")" "STATE is not the pending step's state"
 
 # A first promotion whose release failed before any tag, then a docs-only S:
 # S's own diff ships nothing, so only the pending promotion can publish it.
@@ -790,6 +876,75 @@ chk "Q4 with a stable tag below both: the same" "$(u_publish | cut -d'|' -f3,4)"
 git -C "$U" tag v1.1.0 "$UR1"
 chk "Q4 a promotion its own run published is not owed again" "$(u_publish | cut -d'|' -f3,4)" 'true|[]'
 
+# ── Ahead: a dev build of a library lane must ship past its stable ──────────
+# The same update landed on main (cutting a stable) and then on dev: dev's build
+# would be numbered the next minor and rank above an equal-code stable.
+K="$WORK/ahead"
+git init -q -b main "$K"
+commit_in "$K" "chore: initial" go.mod='module example.com/k' main.go=v1 \
+  yamlenv/go.mod='module example.com/k/yamlenv' yamlenv/y.go=v1 >/dev/null
+git -C "$K" tag v1.0.0
+git -C "$K" tag yamlenv/v1.0.0
+git -C "$K" branch dev
+commit_in "$K" "fix(deps): update dependency go" go.mod='module example.com/k go 1.27.2' \
+  yamlenv/y.go=v2 >/dev/null
+git -C "$K" tag v1.0.1
+git -C "$K" tag yamlenv/v1.0.1
+git -C "$K" checkout -q dev
+commit_in "$K" "chore(deps): update dependency go (dev)" go.mod='module example.com/k go 1.27.2' \
+  yamlenv/y.go=v2 .github/workflows/ci.yaml=synced >/dev/null
+ahead_at() { # <type> <root_changed> <subs to publish> <mods> [subpackages] [channel] -> root|subs|mods, or EXIT=n
+  : >"$WORK/out"
+  (cd "$K" && CHANNEL="${6:-dev}" REPO_TYPE="$1" ROOT_CHANGED="$2" SUBPACKAGES_TO_PUBLISH="$3" \
+    GO_MODULES_TO_RELEASE="$4" SUBPACKAGES_JSON="${5:-[]}" GO_LANES_JSON='["yamlenv"]' GITHUB_OUTPUT="$WORK/out" \
+    bash "$RS" ahead) >"$WORK/ahead.log" 2>&1 || {
+    echo "EXIT=$?"
+    return 0
+  }
+  echo "$(outkey root_changed)|$(outkey subpackages_to_publish)|$(outkey go_modules_to_release)"
+}
+chk "A1 a go root and lane shipping their stables' code cut no dev build" "$(ahead_at go true '[]' '["yamlenv"]')" 'false|[]|[]'
+chk_has "A1 and the run says why" "$(cat "$WORK/ahead.log")" "lane .: HEAD ships the code of v1.0.1"
+chk "A2 a ts root without subpackages is a library too" "$(ahead_at ts true '[]' '[]')" 'false|[]|[]'
+chk "A3 an image root keeps its build, which a promotion re-tags" "$(ahead_at docker true '[]' '["yamlenv"]')" 'true|[]|[]'
+chk "A4 a root and the subpackages sharing its version, all at the stable's code, cut no dev build" \
+  "$(ahead_at go true '["web"]' '[]' '["web"]')" 'false|[]|[]'
+chk "A4 nor does a subpackage-only change equal to the stable" "$(ahead_at ts false '["web"]' '[]' '["web"]')" 'false|[]|[]'
+chk "A5 a lane the run does not release stays out" "$(ahead_at go false '[]' '[]')" 'false|[]|[]'
+chk "A6 a stable run is refused" "$(ahead_at go true '[]' '[]' '[]' stable)" "EXIT=1"
+chk "A14 a tag list git cannot read stops the run" "$(GIT_DIR="$WORK/no-repo" ahead_at go true '[]' '[]')" "EXIT=1"
+chk_has "A14 and names the lane" "$(cat "$WORK/ahead.log")" "cannot read lane .'s stable tags"
+chk "A15 a dev tag list git cannot read stops the run" "$(failing_tag_read 2 ahead_at go true '[]' '[]')" "EXIT=1"
+chk_has "A15 and names the lane" "$(cat "$WORK/ahead.log")" "cannot read lane .'s dev tags"
+chk "A16 a lane set that is not JSON stops the run" "$(ahead_at go false '[]' '["yamlenv"')" "EXIT=1"
+chk_has "A16 and says so" "$(cat "$WORK/ahead.log")" "GO_MODULES_TO_RELEASE '[\"yamlenv\"' is not a JSON array of lane dirs"
+# Dev first: a dev build of an earlier update outranks the stable and lacks
+# this one, so consumers on it need a newer dev build.
+git -C "$K" tag v1.1.0-dev.1 dev~1
+git -C "$K" tag yamlenv/v1.1.0-dev.1 dev~1
+chk "A11 a lane with a dev tag above its stable keeps its build" "$(ahead_at go true '[]' '["yamlenv"]')" 'true|[]|["yamlenv"]'
+chk "A11 and so does a root sharing its version with subpackages" \
+  "$(ahead_at go true '["web"]' '[]' '["web"]')" 'true|["web"]|[]'
+git -C "$K" tag -d v1.1.0-dev.1 yamlenv/v1.1.0-dev.1 >/dev/null
+git -C "$K" tag v1.0.1-dev.1 dev~1
+git -C "$K" tag yamlenv/v1.0.1-dev.1 dev~1
+chk "A12 a dev tag at the stable's own core ranks below it and keeps nothing" \
+  "$(ahead_at go true '[]' '["yamlenv"]')" 'false|[]|[]'
+git -C "$K" tag -d v1.0.1-dev.1 yamlenv/v1.0.1-dev.1 >/dev/null
+git -C "$K" checkout -q --detach dev
+commit_in "$K" "feat(web): widget" web/w.ts=v1 >/dev/null
+chk "A13 a subpackage change past the stable keeps the shared version's build" \
+  "$(ahead_at go false '["web"]' '[]' '["web"]')" 'false|["web"]|[]'
+git -C "$K" checkout -q dev
+commit_in "$K" "feat: root api" main.go=v2 >/dev/null
+chk "A7 a shipped root change past the stable builds" "$(ahead_at go true '[]' '["yamlenv"]')" 'true|[]|[]'
+commit_in "$K" "feat(yamlenv): anchors" yamlenv/y.go=v3 >/dev/null
+chk "A8 a shipped lane change past its stable builds" "$(ahead_at go true '[]' '["yamlenv"]')" 'true|[]|["yamlenv"]'
+git -C "$K" tag -d yamlenv/v1.0.0 yamlenv/v1.0.1 >/dev/null
+git -C "$K" tag -d v1.0.0 v1.0.1 >/dev/null
+git -C "$K" checkout -q --detach dev~2
+chk "A9 with no stable tag the equal-code build of A1 is cut" "$(ahead_at go true '[]' '["yamlenv"]')" 'true|[]|["yamlenv"]'
+
 git -C "$O" checkout -q -b impostor "$S1"
 WRONG=$(git -C "$O" commit-tree "$D3^{tree}" -p "$S1" -p "$D3" -m "Merge branch 'dev'")
 git -C "$O" merge -q --ff-only "$WRONG"
@@ -827,6 +982,12 @@ chk "R1 only the tag without its receipt is repaired" "$(jq -r '[.[].tag] | join
 chk "R1 at its own commit, on the lane site" "$(jq -r '.[0] | "\(.commit) \(.site) \(.lane) \(.key)"' <<<"$r")" "$R2 lane yamlenv yamlenv"
 chk "R1 with its kind line" "$(jq -r '.[0].kind_note' <<<"$r")" 'Promoted from `yamlenv/v1.0.1-dev.1`'
 chk "R24 a lane's repair owes no image assets" "$(outkey repair_images)" "[]"
+chk "R26 a state that is not JSON repairs nothing" "$(STATE_R2='{"."' receipts)" "EXIT"
+chk_has "R26 and says so" "$(cat "$WORK/receipts.log")" "STATE is not the pending step's state"
+# Receipts skip a lane with no stable tag; the notes floor reads every lane.
+chk "R29 a lane entry the notes floor cannot read repairs nothing" \
+  "$(STATE_R2=$(jq -c '. + {"x": {"h_tag": "", "h_commit": {}}}' <<<"$STATE_R2") receipts)" "EXIT"
+chk_has "R29 and says so" "$(cat "$WORK/receipts.log")" "could not date the notes ranges of this run"
 cp "$GH_DIR/statuses-$S1.json" "$WORK/statuses-s1.saved"
 echo '[]' >"$GH_DIR/statuses-$S1.json"
 r=$(REPO_TYPE=docker receipts)
@@ -942,6 +1103,8 @@ chk "R6 a lane readback the proxy cannot answer fails" "$(readback lane yamlenv/
 chk "R6 after the shared wait's fourteen tries" "$(grep -c 'proxy.golang.org/example.com/app/yamlenv/@v/v1.1.0.info' "$CURL_DIR/log")" "14"
 echo "https://proxy.golang.org/example.com/app/yamlenv/@v/v1.1.0.info" >"$CURL_DIR/ok"
 chk "R6 a lane readback the proxy answers passes" "$(readback lane yamlenv/v1.1.0 yamlenv)" "ok"
+chk "R28 a subpackage list that is not JSON reads back nothing" "$(SUBPACKAGES='["web"' readback lane yamlenv/v1.1.0 yamlenv)" "refused"
+chk_has "R28 and says so" "$(cat "$WORK/readback.log")" "is not a JSON array of subpackage dirs"
 chk "R7 an image readback with no manifest fails" "$(readback docker v1.1.0)" "refused"
 IMG_A="sha256:$(printf 'a%.0s' $(seq 64))"
 IMG_E="sha256:$(printf 'e%.0s' $(seq 64))"
@@ -976,6 +1139,12 @@ git -C "$O" tag v1.2.0 "$R2"
 echo "$IMG_A $R2" >"$COSIGN_DIR/signed"
 chk "R13 a signature at the next stable tag's commit is refused" "$(readback docker v1.1.0)" "refused"
 chk "R13 and nothing past the window is asked" "$(wc -l <"$COSIGN_DIR/log" | tr -d ' ')" "1"
+chk "R27 a tag list git cannot read in the window is refused, not walked past" \
+  "$(failing_git 'tag --points-at *' 1 readback docker v1.1.0)|$(git_calls)|$(wc -l <"$COSIGN_DIR/log" | tr -d ' ')" "refused|1|0"
+chk_has "R27 and says it cannot tell" "$(cat "$WORK/readback.log")" "cannot tell which commits could have signed v1.1.0's image"
+chk "R27 as is a main history git cannot walk" \
+  "$(failing_git 'rev-list --first-parent --ancestry-path *' 1 readback docker v1.1.0)|$(git_calls)" "refused|1"
+chk_has "R27 and says so" "$(cat "$WORK/readback.log")" "cannot tell which commits could have signed v1.1.0's image"
 git -C "$O" tag -d v1.2.0 >/dev/null
 echo "$IMG_A $S1" >"$COSIGN_DIR/signed"
 echo 1 >"$COSIGN_DIR/flaky"
@@ -1052,6 +1221,9 @@ echo "$IMG_E $PT" >"$COSIGN_DIR/attested"
 PC=$(commit_in "$P" "chore(sync): update shared files" .editorconfig=x)
 printf '%s\n' "$DASH $PC" "$IMG_E $PT" >"$COSIGN_DIR/signed"
 chk "R13 a dashboard re-pushed from a later main commit reads back" "$(RB_DIR=$P readback docker v2.0.0)" "ok"
+chk "R27 a dashboard whose window git cannot list the tags of is refused" \
+  "$(RB_DIR=$P failing_git 'tag --points-at *' 1 readback docker v2.0.0)|$(git_calls)" "refused|1"
+chk_has "R27 and says it cannot tell" "$(cat "$WORK/readback.log")" "cannot tell which commits could have signed v2.0.0's dashboard"
 printf '%s\n' "$DASH $R1" "$IMG_E $PT" >"$COSIGN_DIR/signed"
 chk "R12 a dashboard no run at R signed is refused" "$(RB_DIR=$P readback docker v2.0.0)" "refused"
 rm "$CURL_DIR/dash-manifest-v2.0.0"
@@ -1153,6 +1325,14 @@ publishes() { # <h_tag> <h_commit> -> the tags of the repairs the OIDC job compl
 }
 chk "R17 the publishing job receives a repair owing subpackages" "$(publishes v1.1.0 "$H1")" "v1.1.0"
 chk "R17 and no repair owing none" "$(publishes v1.2.0 "$H2")" ""
+# A root repair lists the stable tags for its subpackages (1), then for its notes floor (2).
+chk "R25 a stable tag list git cannot read for the subpackages fails the run" "$(failing_tag_read 1 hrepair v1.1.0 "$H1")" "EXIT"
+chk_has "R25 and says so" "$(cat "$WORK/hrepair.log")" "could not tell which subpackages v1.1.0 publishes"
+chk "R25 as does one for the notes floor" "$(failing_tag_read 2 hrepair v1.1.0 "$H1")" "EXIT"
+chk_has "R25 and says so" "$(cat "$WORK/hrepair.log")" "could not date the notes ranges of this run"
+chk "R25 as does a promotion list git cannot read for the subpackages" \
+  "$(failing_git 'rev-parse --verify --quiet *' 1 hrepair v1.1.0 "$H1")|$(git_calls)" "EXIT|1"
+chk_has "R25 and says which" "$(cat "$WORK/hrepair.log")" "could not tell which subpackages v1.1.0 publishes"
 HC="$WORK/hybrid-clone"
 git clone -q "$H" "$HC"
 HCURL="$WORK/hcurl"
@@ -1253,6 +1433,19 @@ chk_has "B19 naming the build" "$(cat "$WORK/barrier.log")" \
   "lane .: dev's build of $D3 is published with no dev tag and no newer build is tagged, so its version cannot rank above v1.1.0"
 chk_has "B19 and the dev release that supersedes it, not a rerun of its own" "$(cat "$WORK/barrier.log")" \
   "Dispatch release.yaml on dev to build and tag dev's head, then rerun this run."
+# Walk 1 of dev past T looks for the newest tagged build, walk 2 for an image.
+chk "B30 a dev history git cannot walk for the newest tagged build holds the publish" \
+  "$(REPO_TYPE=docker IMAGE=o/app failing_git 'rev-list --first-parent *..refs/remotes/origin/dev' 1 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
+chk_has "B30 and says it cannot tell" "$(cat "$WORK/barrier.log")" "lane .: cannot tell whether dev holds a published, untagged build"
+chk "B30 as does one for the untagged image" \
+  "$(REPO_TYPE=docker IMAGE=o/app failing_git 'rev-list --first-parent *..refs/remotes/origin/dev' 2 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|2"
+chk_has "B30 and says so" "$(cat "$WORK/barrier.log")" "lane .: cannot tell whether dev holds a published, untagged build"
+chk "B31 a promoted commit git cannot read holds the publish" \
+  "$(REPO_TYPE=docker IMAGE=o/app failing_git 'rev-parse *^2' 1 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
+chk_has "B31 and names it" "$(cat "$WORK/barrier.log")" "lane .: cannot read the commit $R1 promoted"
+chk "B31 as does one after the hold" \
+  "$(REPO_TYPE=docker IMAGE=o/app failing_git 'rev-parse *^2' 2 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|2"
+chk_has "B31 and names it" "$(cat "$WORK/barrier.log")" "lane .: cannot read the commit $R1 promoted"
 # An older tagged build past T does not cover a newer untagged one.
 git -C "$O" tag v1.1.0-dev.9 "$D2"
 out_b=$(REPO_TYPE=docker IMAGE=o/app barrier)
@@ -1273,6 +1466,16 @@ echo "https://registry.npmjs.org/@o/app {\"versions\":{\"1.0.0-dev.4\":{\"gitHea
 out_b=$(REPO_TYPE=ts barrier)
 chk "B19 an npm dev version published from a commit past T with no tag holds the publish" "$out_b|$(dispatched)" "EXIT=1|0"
 chk_has "B19 naming that commit" "$(cat "$WORK/barrier.log")" "lane .: dev's build of $D3 is published with no dev tag"
+# Listings 1 and 2 find no tagged build on D3 or D2; 3 asks whether npm's D3 is tagged.
+chk "B19 a dev tag list git cannot read beside an untagged npm version holds the publish" \
+  "$(REPO_TYPE=ts failing_tag_read 3 barrier)|$(dispatched)" "EXIT=1|0"
+chk_has "B19 and says it cannot tell" "$(cat "$WORK/barrier.log")" "lane .: cannot tell whether dev holds a published, untagged build"
+cp "$CURL_DIR/docs" "$WORK/docs.saved"
+echo "https://registry.npmjs.org/@o/app {\"versions\":" >"$CURL_DIR/docs"
+out_b=$(REPO_TYPE=ts barrier)
+mv "$WORK/docs.saved" "$CURL_DIR/docs"
+chk "B19 a packument that is not JSON holds the publish" "$out_b|$(dispatched)" "EXIT=1|0"
+chk_has "B19 and says it cannot tell" "$(cat "$WORK/barrier.log")" "lane .: cannot tell whether dev holds a published, untagged build"
 git -C "$O" tag v1.1.0-dev.9 "$D2"
 out_b=$(REPO_TYPE=ts barrier)
 git -C "$O" tag -d v1.1.0-dev.9 >/dev/null
@@ -1334,6 +1537,38 @@ make_hook failure ""
 out_b=$(barrier)
 chk "B5 a failed renumber run holds the publish" "$out_b|$(dispatched)" "EXIT=1|1"
 chk_has "B5 and says so" "$(cat "$WORK/barrier.log")" "renumber run 99 concluded 'failure'"
+renumbered_failing() { # <N> -> EXIT=n|renumber dispatches of B6's barrier with tag listing N failing
+  local got
+  make_hook success v1.2.0-dev.1
+  got=$(failing_tag_read "$1" barrier)
+  git -C "$O" tag -d v1.2.0-dev.1 >/dev/null 2>&1 || true
+  git -C "$W" tag -d v1.2.0-dev.1 >/dev/null 2>&1 || true
+  echo "$got|$(dispatched)"
+}
+# Listing 1 is the untagged-build check's, 2 and 3 the rank and build-past
+# reads before the renumber, 6 and 7 the build-past and rank reads after it.
+chk "B29 a dev tag list git cannot read in the untagged-build check holds the publish" "$(renumbered_failing 1)" "EXIT=1|0"
+chk_has "B29 and says it cannot tell" "$(cat "$WORK/barrier.log")" "lane .: cannot tell whether dev holds a published, untagged build"
+chk "B29 one git cannot read for the rank holds it" "$(renumbered_failing 2)" "EXIT=1|0"
+chk_has "B29 naming the lane" "$(cat "$WORK/barrier.log")" "cannot read lane .'s dev tags"
+chk "B29 as does one for the build past the promoted commit" "$(renumbered_failing 3)" "EXIT=1|0"
+chk "B29 and after the renumber, one for the build past it" "$(renumbered_failing 6)" "EXIT=1|1"
+chk "B29 or for the rank it left" "$(renumbered_failing 7)" "EXIT=1|1"
+chk_has "B29 naming the lane" "$(cat "$WORK/barrier.log")" "cannot read lane .'s dev tags"
+renumbered_git_failing() { # <argv glob> <N> -> EXIT=n|renumber dispatches|matching git calls of B6's barrier with call N failing
+  local got
+  make_hook success v1.2.0-dev.1
+  got=$(failing_git "$1" "$2" barrier)
+  git -C "$O" tag -d v1.2.0-dev.1 >/dev/null 2>&1 || true
+  git -C "$W" tag -d v1.2.0-dev.1 >/dev/null 2>&1 || true
+  echo "$got|$(dispatched)|$(git_calls)"
+}
+# Promoted-commit reads 1 and 2 are the untagged-build check's and the
+# subpackage rows', 3 the rank check's, 5 the one after the renumber.
+chk "B33 a promoted commit git cannot read for the rank check holds the publish" "$(renumbered_git_failing 'rev-parse *^2' 3)" "EXIT=1|0|3"
+chk_has "B33 and names it" "$(cat "$WORK/barrier.log")" "lane .: cannot read the commit $R1 promoted"
+chk "B33 as does one after the renumber" "$(renumbered_git_failing 'rev-parse *^2' 5)" "EXIT=1|1|5"
+chk_has "B33 naming it" "$(cat "$WORK/barrier.log")" "lane .: cannot read the commit $R1 promoted"
 make_hook success v1.2.0-dev.1
 out_b=$(barrier)
 chk "B6 a renumber that ranks dev above the version releases the hold" "$out_b|$(dispatched)" "|1"
@@ -1911,6 +2146,16 @@ target() { # <expected commit> -> ok|refused
 chk "U20 renumber-npm refuses a build other than the one numbered" "$(target "$D3")|$(outkey commit)" "refused|"
 chk_has "U20 naming both" "$(cat "$WORK/renumber.log")" "the newest build is now v1.1.0-dev.3 at $UF, not the $D3 this run numbered"
 chk "U20 and selects the numbered one" "$(target "$UF")|$(outkey commit)" "ok|$UF"
+chk "U25 a dev tag list git cannot read selects no build" "$(failing_tag_read 1 target "$UF")|$(outkey commit)" "refused|"
+chk_has "U25 and names the lane" "$(cat "$WORK/renumber.log")" "cannot read lane .'s dev tags"
+chk "U25 as does a history git cannot walk" \
+  "$(failing_git 'rev-list --topo-order *' 1 target "$UF")|$(outkey commit)|$(git_calls)" "refused||1"
+chk_has "U25 naming the lane" "$(cat "$WORK/renumber.log")" "cannot read lane .'s dev tags"
+chk "U26 a dev tag list git cannot read hands on no build" "$(failing_tag_read 1 handoff ts v1.2.0-dev.8)" "EXIT=1"
+chk_has "U26 and names the lane" "$(cat "$WORK/renumber.log")" "cannot read lane .'s dev tags"
+chk "U26 nor does a history git cannot walk" \
+  "$(failing_git 'rev-list --topo-order *' 1 handoff ts v1.2.0-dev.8)|$(git_calls)" "EXIT=1|1"
+chk_has "U26 naming the lane" "$(cat "$WORK/renumber.log")" "cannot read lane .'s dev tags"
 rm "$W/package.json"
 git -C "$W" checkout -q --detach "$UB"
 
@@ -2001,6 +2246,14 @@ out_b=$(xbarrier "$XR1")
 rm "$CURL_DIR/down"
 chk "B20 an npm registry that cannot answer holds the publish and dispatches nothing" "$out_b|$(dispatched)" "EXIT=1|0"
 chk_has "B20 and says so" "$(cat "$WORK/barrier.log")" "subpackage web: cannot tell whether npm serves its newest dev build"
+xweb 1.0.0-dev.3 "$X0"
+chk "B32 a dev history git cannot walk for the subpackage's newest change holds the publish" \
+  "$(failing_git 'rev-list --first-parent refs/remotes/origin/dev -- *' 1 xbarrier "$XR1")|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
+chk_has "B32 and says it cannot tell" "$(cat "$WORK/barrier.log")" "subpackage web: cannot tell whether npm serves its newest dev build"
+chk "B32 as does a promotion whose subpackages git cannot list" \
+  "$(failing_git 'ls-tree -d --name-only *' 1 xbarrier "$XR1")|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
+chk_has "B32 and says so" "$(cat "$WORK/barrier.log")" "cannot tell which subpackages $XR0 publishes"
+xweb 1.1.0-dev.1 "$XW1"
 out_b=$(xbarrier "$XR0")
 chk "B20 a root-only promotion reads no subpackage registry" "$(grep -c "^$NPM_WEB" "$CURL_DIR/log" || true)" "0"
 # Past T, dev's subpackage must rank above the version, as a root build must.
@@ -2084,6 +2337,14 @@ xweb 1.1.0-dev.2 "$XW2" 1.2.0-dev.1 "$XW2"
 chk "U23 one already above it is left alone" "$(rsub "$XW2")" 'version=v1.2.0-dev.1 dirs=[] '
 xweb
 chk "U23 as is a missing one, published from the build carrying its change" "$(rsub "$XW2")" 'version=v1.2.0-dev.1 dirs=["web"] '
+chk "U27 a dev tag list git cannot read publishes no subpackage" "$(failing_tag_read 1 rsub "$XW2")" "EXIT=1"
+chk_has "U27 and names the lane" "$(cat "$WORK/rsub.log")" "cannot read lane .'s dev tags"
+chk "U27 nor does a build whose subpackages git cannot list" \
+  "$(failing_git 'ls-tree -d --name-only *' 1 rsub "$XW2")|$(git_calls)" "EXIT=1|1"
+chk_has "U27 and says so" "$(cat "$WORK/rsub.log")" "cannot list the subpackages of the build v1.2.0-dev.1"
+chk "U27 nor a dev history git cannot walk for the subpackage's newest change" \
+  "$(failing_git 'rev-list --first-parent refs/remotes/origin/dev -- *' 1 rsub "$XW2")|$(git_calls)" "EXIT=1|1"
+chk_has "U27 and says so" "$(cat "$WORK/rsub.log")" "subpackage web: cannot tell whether npm serves its newest dev build"
 chk "U23 a checkout that is not a dev build is refused" "$(rsub "$XD")" "EXIT=1"
 git -C "$X" checkout -q dev
 XW3=$(commit_in "$X" "feat(web): newest, unbuilt" web/mod.ts=v4)
@@ -2490,11 +2751,16 @@ chk "W11 pending promotions join the publication on stable runs with one in rang
 chk "W11 between the path diff and the release decision" "$(fact '."publish-after"')" "true"
 for key in root_changed subpackages_to_publish go_modules_to_release; do
   chk "W11 detect publishes the joined $key" "$(fact ".outputs.$key")" \
-    "\${{ steps.publish.outputs.$key || steps.changes.outputs.$key }}"
+    "\${{ steps.publish.outputs.$key || steps.ahead.outputs.$key || steps.changes.outputs.$key }}"
 done
 chk "W11 Select version decides on the joined sets" \
   "$(fact '."select-env".ROOT_CHANGED')|$(fact '."select-env".SUBPACKAGES_TO_PUBLISH')" \
-  '${{ steps.publish.outputs.root_changed || steps.changes.outputs.root_changed }}|${{ steps.publish.outputs.subpackages_to_publish || steps.changes.outputs.subpackages_to_publish }}'
+  '${{ steps.publish.outputs.root_changed || steps.ahead.outputs.root_changed || steps.changes.outputs.root_changed }}|${{ steps.publish.outputs.subpackages_to_publish || steps.ahead.outputs.subpackages_to_publish || steps.changes.outputs.subpackages_to_publish }}'
+chk "A10 dev runs narrow the sets after the path diff, before the release decision" \
+  "$(fact '."if:ahead"')|$(fact '."ahead-order"')" "\${{ steps.channel.outputs.channel == 'dev' }}|true"
+chk "A10 from the path diff's own sets" \
+  "$(fact '."ahead-env".ROOT_CHANGED')|$(fact '."ahead-env".SUBPACKAGES_TO_PUBLISH')|$(fact '."ahead-env".GO_MODULES_TO_RELEASE')" \
+  '${{ steps.changes.outputs.root_changed }}|${{ steps.changes.outputs.subpackages_to_publish }}|${{ steps.changes.outputs.go_modules_to_release }}'
 chk "W12 renumber checks the build out before computing its version" \
   "$(fact '."renumber-steps" | (index("Check out the newest build") < index("Compute lane version (cliff)"))')" "true"
 chk "W12 and computes and hands on only when there is a build" \

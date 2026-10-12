@@ -457,7 +457,8 @@ chk "M15 the lane's notes say S carried the promotion" "$(lane_notes yamlenv)" \
 # ── 10. a promoted breaking change, published by a later S ───────────────────
 commit_on dev "fix(deps): update module example.org/dep to v1.3.2" go.mod="$(gomod v1.3.2)" >/dev/null
 run_release dev d6
-chk "M16 dev builds the bump" "$(result)" "v1.3.0-dev.1"
+chk "M16 dev cuts no build of the bump main published as v1.2.1" "$(result)" ""
+chk "M16 since its code is v1.2.1's" "$(git -C "$O" diff --name-only v1.2.1 dev)" ""
 commit_on dev "feat!: rename the greeting flag" main.go='package main\n// v5' >/dev/null
 run_release dev d7
 chk "M16 a breaking dev build reserves the next major" "$(result)" "v2.0.0-dev.1"
