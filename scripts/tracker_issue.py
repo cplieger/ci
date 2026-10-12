@@ -32,6 +32,8 @@ Modes (`--mode`):
 --title; `recur` by exact title among every open issue (a finding's title is
 its identity, so the label is not part of the match). After `upsert` or
 `recur`, `--flag-label NAME --flag on|off` adds or removes NAME on the issue.
+`--assignee LOGIN` assigns LOGIN on a created issue and on an open one that
+lacks it; a failed assignment of an open issue warns and the run goes on.
 
 Every call is REST (`gh api`). Authentication is gh's: pass the token as GH_TOKEN
 in the environment. Runs on the runner's default python3 (3.12).
@@ -130,17 +132,32 @@ def ensure_label(repo: str, name: str) -> None:
             print(f'label {name!r} not created in {repo}: {err}', file=sys.stderr)
 
 
-def create(repo: str, title: str, labels: list[str], body_file: Path) -> int:
+def create(repo: str, title: str, labels: list[str], body_file: Path, assignee: str = '') -> int:
     for name in labels:
         ensure_label(repo, name)
-    issue = api(
-        'POST',
-        f'repos/{repo}/issues',
-        {'title': title, 'body': body_file.read_text(), 'labels': labels},
-    )
+    payload: dict = {'title': title, 'body': body_file.read_text(), 'labels': labels}
+    if assignee:
+        # GitHub drops an assignee without push access instead of failing the create.
+        payload['assignees'] = [assignee]
+    issue = api('POST', f'repos/{repo}/issues', payload)
     number = issue['number']
     print(f'created #{number} in {repo}: {title}')
     return number
+
+
+def ensure_assignee(repo: str, issue: dict, assignee: str) -> None:
+    """Assign `assignee` to an open issue that lacks it; a failure only warns,
+    because the finding itself is already written."""
+    if not assignee or assignee in {a.get('login') for a in issue.get('assignees') or []}:
+        return
+    try:
+        ghrest.send(
+            'POST', f'repos/{repo}/issues/{issue["number"]}/assignees', {'assignees': [assignee]}
+        )
+    except ghrest.ApiError as err:
+        print(f'::warning::{repo}#{issue["number"]}: could not assign {assignee}: {err}')
+        return
+    print(f'assigned {assignee} to #{issue["number"]}')
 
 
 def set_flag(repo: str, number: int, current: set[str], flag_label: str, flag: str) -> None:
@@ -173,9 +190,11 @@ def mode_upsert(args: argparse.Namespace) -> int:
         number, current = issue['number'], label_names(issue)
         api('PATCH', f'repos/{args.repo}/issues/{number}', {'body': args.body_file.read_text()})
         print(f'updated #{number} in {args.repo}')
+        ensure_assignee(args.repo, issue, args.assignee)
     else:
         labels = create_labels(args)
-        number, current = create(args.repo, args.title, labels, args.body_file), set(labels)
+        number = create(args.repo, args.title, labels, args.body_file, args.assignee)
+        current = set(labels)
     if args.flag_label:
         set_flag(args.repo, number, current, args.flag_label, args.flag)
     return 0
@@ -191,9 +210,11 @@ def mode_recur(args: argparse.Namespace) -> int:
             {'body': args.comment_file.read_text()},
         )
         print(f'commented on #{number} in {args.repo}')
+        ensure_assignee(args.repo, issue, args.assignee)
     else:
         labels = create_labels(args)
-        number, current = create(args.repo, args.title, labels, args.body_file), set(labels)
+        number = create(args.repo, args.title, labels, args.body_file, args.assignee)
+        current = set(labels)
     if args.flag_label:
         set_flag(args.repo, number, current, args.flag_label, args.flag)
     return 0
@@ -252,6 +273,7 @@ def parse_args(
     )
     p.add_argument('--flag-label', default='', help='label to add or remove after upsert/recur')
     p.add_argument('--flag', choices=['on', 'off'], help='add (on) or remove (off) --flag-label')
+    p.add_argument('--assignee', default='', help='login to assign after upsert/recur')
     args = p.parse_args(argv)
 
     if args.mode in NEEDS_TITLE and not args.title:
@@ -264,6 +286,8 @@ def parse_args(
         p.error('--flag-label and --flag go together')
     if args.flag_label and args.mode not in TAKES_FLAG:
         p.error(f'--flag-label applies to {", ".join(sorted(TAKES_FLAG))}, not {args.mode}')
+    if args.assignee and args.mode not in TAKES_FLAG:
+        p.error(f'--assignee applies to {", ".join(sorted(TAKES_FLAG))}, not {args.mode}')
     if args.label in RESERVED_LABELS and args.mode not in READ_MODES and not allow_reserved:
         p.error(
             f'--label {args.label} is reserved for its own writer. Only fetch and list take it.'

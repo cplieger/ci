@@ -58,6 +58,7 @@ routes = (
     ('PATCH', r'repos/[^/]+/[^/]+/issues/\d+', 'PATCH issue'),
     ('POST', r'repos/[^/]+/[^/]+/issues/\d+/comments', 'POST comment'),
     ('POST', r'repos/[^/]+/[^/]+/issues/\d+/labels', 'POST issue-labels'),
+    ('POST', r'repos/[^/]+/[^/]+/issues/\d+/assignees', 'POST assignees'),
     ('DELETE', r'repos/[^/]+/[^/]+/issues/\d+/labels/[^/]+', 'DELETE issue-label'),
 )
 op = next((name for m, rx, name in routes if m == method and re.fullmatch(rx, url.path)), None)
@@ -104,7 +105,14 @@ FUZZ_ISSUE = {
     'labels': [{'name': 'fuzz-finding'}, {'name': 'auto-generated'}],
     'body': 'finding',
 }
-WRITES = ('POST issues', 'PATCH issue', 'POST comment', 'POST issue-labels', 'DELETE issue-label')
+WRITES = (
+    'POST issues',
+    'PATCH issue',
+    'POST comment',
+    'POST issue-labels',
+    'DELETE issue-label',
+    'POST assignees',
+)
 LISTING = 'repos/cplieger/x/issues?state=open&labels=gremlins-tracker&per_page=100&page=1'
 
 
@@ -375,6 +383,70 @@ class TrackerIssueTest(unittest.TestCase):
             self.last('POST issues')['body']['labels'], ['fuzz-finding', 'auto-generated']
         )
 
+    # --- assignee ---------------------------------------------------------
+
+    def recur_args(self, *extra: str) -> tuple[str, ...]:
+        return (
+            '--label',
+            'weekly-ci-failure',
+            '--title',
+            FUZZ_ISSUE['title'],
+            '--mode',
+            'recur',
+            '--body-file',
+            str(self.body),
+            '--comment-file',
+            str(self.comment),
+            *extra,
+        )
+
+    def test_assignee_rides_the_create_call(self) -> None:
+        proc = self.run_tracker({}, *self.recur_args('--assignee', 'cplieger'))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.writes(), ['POST issues'])
+        self.assertEqual(self.last('POST issues')['body']['assignees'], ['cplieger'])
+
+    def test_no_assignee_leaves_the_create_call_unassigned(self) -> None:
+        proc = self.run_tracker({}, *self.recur_args())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn('assignees', self.last('POST issues')['body'])
+
+    def test_an_open_issue_lacking_the_assignee_gets_it_once(self) -> None:
+        proc = self.run_tracker(
+            {'open_issues': [FUZZ_ISSUE]}, *self.recur_args('--assignee', 'cplieger')
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.writes(), ['POST comment', 'POST assignees'])
+        add = self.last('POST assignees')
+        self.assertEqual(add['path'], 'repos/cplieger/x/issues/7/assignees')
+        self.assertEqual(add['body'], {'assignees': ['cplieger']})
+
+        assigned = {**FUZZ_ISSUE, 'assignees': [{'login': 'cplieger'}]}
+        proc = self.run_tracker(
+            {'open_issues': [assigned]}, *self.recur_args('--assignee', 'cplieger')
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.writes(), ['POST comment'], 'a present assignee is not re-added')
+
+    def test_upsert_assigns_an_open_issue_lacking_the_assignee(self) -> None:
+        proc = self.run_tracker(
+            {'open_issues': [TRACKER_ISSUE]},
+            *self.tracker_args(
+                '--mode', 'upsert', '--body-file', str(self.body), '--assignee', 'cplieger'
+            ),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.writes(), ['PATCH issue', 'POST assignees'])
+
+    def test_a_failed_assignment_warns_and_still_succeeds(self) -> None:
+        proc = self.run_tracker(
+            {'open_issues': [FUZZ_ISSUE], 'fail': {'POST assignees': [404, 'Not Found']}},
+            *self.recur_args('--assignee', 'cplieger'),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.writes(), ['POST comment', 'POST assignees'])
+        self.assertIn('::warning::cplieger/x#7: could not assign cplieger', proc.stdout)
+
     # --- close-when-clean -------------------------------------------------
 
     def test_close_when_clean_closes_with_the_comment(self) -> None:
@@ -542,6 +614,7 @@ class TrackerIssueTest(unittest.TestCase):
                 'on',
             ),
             ('--label', 'x', '--mode', 'list', '--flag-label', 'f', '--flag', 'on'),
+            ('--label', 'x', '--mode', 'list', '--assignee', 'cplieger'),
         )
         for case in cases:
             with self.subTest(case=case):
@@ -744,6 +817,7 @@ class GatePolicyTest(unittest.TestCase):
             'GITHUB_REF_NAME': ref_name,
             'DEFAULT_BRANCH': default,
             'TITLE': 'Weekly gremlins run is failing',
+            'ASSIGNEE': 'cplieger',
         }
         return subprocess.run(
             ['bash', '-c', GATE_BLOCK], capture_output=True, text=True, env=env, check=False
@@ -756,6 +830,12 @@ class GatePolicyTest(unittest.TestCase):
             return None
         argv = json.loads(lines[-1])
         return argv[argv.index('--mode') + 1]
+
+    def tracker_flag(self, flag: str) -> str | None:
+        """The value of `flag` in the single tracker call, or None when absent."""
+        lines = self.tracker_log.read_text().splitlines()
+        argv = json.loads(lines[-1]) if lines else []
+        return argv[argv.index(flag) + 1] if flag in argv else None
 
     def test_green_scoped_dispatch_does_not_close(self) -> None:
         proc = self.run_gate(
@@ -836,6 +916,41 @@ class GatePolicyTest(unittest.TestCase):
         self.assertEqual(
             self.tracker_mode(), 'close-when-clean', "a tag push is its workflow's whole run"
         )
+
+    def test_failure_assigns_the_owner(self) -> None:
+        proc = self.run_gate(event='schedule', jobs=FAILED_JOBS, minutes_ago=5)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.tracker_flag('--assignee'), 'cplieger')
+
+    def test_push_failure_on_the_default_branch_opens_the_shared_tracker(self) -> None:
+        proc = self.run_gate(
+            event='push', ref_name='dev', default_branch='dev', jobs=FAILED_JOBS, minutes_ago=3
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.tracker_mode(), 'recur', 'a post-merge run is unwatched')
+        self.assertEqual(self.tracker_flag('--title'), 'Weekly gremlins run is failing')
+
+    def test_push_failure_off_the_default_branch_opens_its_own_tracker(self) -> None:
+        proc = self.run_gate(
+            event='push', ref_name='main', default_branch='dev', jobs=FAILED_JOBS, minutes_ago=3
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.tracker_mode(), 'recur')
+        self.assertEqual(self.tracker_flag('--title'), 'Weekly gremlins run is failing on main')
+
+    def test_push_green_off_the_default_branch_closes_only_its_own_tracker(self) -> None:
+        proc = self.run_gate(
+            event='push', ref_name='main', default_branch='dev', jobs=SUCCESS_JOBS, minutes_ago=3
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.tracker_mode(), 'close-when-clean')
+        self.assertEqual(self.tracker_flag('--title'), 'Weekly gremlins run is failing on main')
+
+    def test_push_green_on_the_default_branch_closes_the_shared_tracker(self) -> None:
+        proc = self.run_gate(event='push', jobs=SUCCESS_JOBS, minutes_ago=3)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.tracker_mode(), 'close-when-clean')
+        self.assertEqual(self.tracker_flag('--title'), 'Weekly gremlins run is failing')
 
 
 if __name__ == '__main__':

@@ -4,13 +4,17 @@
 # three consecutive weeks (2026-08-29 through 09-12) with nothing announcing it.
 #
 # Which runs count as unwatched is a decided policy (see the verdict below):
-# automated runs (schedule, and the tag push that automation fires) file on
+# automated runs (schedule, a push, and the tag push automation fires) file on
 # failure; a manual run files only when it ran at least `watched-minutes`, the
 # length past which the person who started it has stopped watching; shorter
-# manual runs and every push/pull-request run are assumed watched and file
-# nothing. The issue closes only on a green run that covered everything on the
-# default branch. Label `weekly-ci-failure`, the same one the private repos'
-# inline `notify` jobs use, so one triage query reads both.
+# manual runs are assumed watched and file nothing, and a pull request blocks
+# its own merge, so it never reaches the job. A push to a branch other than
+# the default files under its own `... on <branch>` title, so a green default
+# branch never closes a red `main`. The issue closes only on a green run that
+# covered everything. Label `weekly-ci-failure`, the same one the private
+# repos' inline `notify` jobs use, so one triage query reads both. The issue
+# is assigned to the repository owner: an issue the workflow token opens
+# notifies nobody otherwise.
 #
 # This tracks the RUNNER failing. The result trackers some callers maintain
 # (`bench-tracker`, `broken-links`, `gremlins-tracker`, `stryker-tracker`)
@@ -61,14 +65,10 @@ permissions: {}
 
 jobs:
   track:
-    # Schedule, manual, and the automation-fired tag push can be unwatched. A
-    # push to a branch (main CI, post-merge) has the merging agent watching the
-    # post-merge run, and a pull request blocks its own merge, so both file
-    # nothing and are not even reached here.
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref_type == 'tag')
+      github.event_name == 'push'
     runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions:
@@ -109,6 +109,7 @@ jobs:
           # treats schedule as on-default without comparing.
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           TITLE: ${{ inputs.workflow }} run is failing
+          ASSIGNEE: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
           label='weekly-ci-failure'
@@ -143,6 +144,8 @@ jobs:
           [ -z "$SCOPE" ] && full_scope=true
           tag_push=false
           [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ] && tag_push=true
+          branch_push=false
+          [ "$EVENT" = push ] && [ "$REF_TYPE" = branch ] && branch_push=true
 
           # A scheduled run always runs on the default branch (and its event
           # payload carries no repository to compare); a dispatch is on-default
@@ -161,7 +164,7 @@ jobs:
           # A failing run opens or comments when nobody watches it to the
           # end: an automated run, or a manual run at least WATCHED_MINUTES long.
           files_on_red=false
-          if [ "$EVENT" = schedule ] || [ "$tag_push" = true ]; then
+          if [ "$EVENT" = schedule ] || [ "$EVENT" = push ]; then
             files_on_red=true
           elif [ "$EVENT" = workflow_dispatch ] && [ "$on_default" = true ] \
             && [ "$minutes" -ge "$WATCHED_MINUTES" ]; then
@@ -169,12 +172,20 @@ jobs:
           fi
 
           # A green run closes only when it covered everything: an unscoped run
-          # on the default branch, or a tag push (its workflow's only trigger).
-          # A scoped run leaves an open issue open.
+          # on the default branch, a push (on its branch's own title), or a tag
+          # push (its workflow's only trigger). A scoped run leaves an open
+          # issue open.
           closes_on_green=false
-          if [ "$full_scope" = true ] && { [ "$tag_push" = true ] || { [ "$on_default" = true ] \
+          if [ "$full_scope" = true ] && { [ "$EVENT" = push ] || { [ "$on_default" = true ] \
             && { [ "$EVENT" = schedule ] || [ "$EVENT" = workflow_dispatch ]; }; }; }; then
             closes_on_green=true
+          fi
+
+          # One tracker per branch for pushes off the default branch: a green
+          # `dev` push must not close the issue a red `main` push opened.
+          title="$TITLE"
+          if [ "$branch_push" = true ] && [ "$on_default" != true ]; then
+            title="${TITLE} on ${REF_NAME}"
           fi
 
           case "$EVENT" in
@@ -190,7 +201,7 @@ jobs:
           if [ -z "$red" ]; then
             if [ "$closes_on_green" = true ]; then
               printf 'The run is green again (%s): %s\n' "$context" "$RUN_URL" >"${RUNNER_TEMP}/comment.md"
-              python3 "$tracker" --repo "$GH_REPO" --label "$label" --title "$TITLE" \
+              python3 "$tracker" --repo "$GH_REPO" --label "$label" --title "$title" \
                 --mode close-when-clean --comment-file "${RUNNER_TEMP}/comment.md"
             else
               echo "green, ${context}; did not cover everything, so the tracker is left as-is"
@@ -221,6 +232,6 @@ jobs:
             printf 'green run covers everything again.\n\n'
             cat "$body"
           } >"${RUNNER_TEMP}/new-issue.md"
-          python3 "$tracker" --repo "$GH_REPO" --label "$label" --title "$TITLE" \
-            --mode recur --body-file "${RUNNER_TEMP}/new-issue.md" \
+          python3 "$tracker" --repo "$GH_REPO" --label "$label" --title "$title" \
+            --mode recur --assignee "$ASSIGNEE" --body-file "${RUNNER_TEMP}/new-issue.md" \
             --comment-file "${RUNNER_TEMP}/comment.md"
