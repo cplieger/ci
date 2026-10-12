@@ -513,6 +513,39 @@ promote_at() { # <head commit> <exclude re> [built commits...] -> runs the walk;
   printf '%s|%s' "$(out promote_digest)" "$(out promote_source)"
 }
 
+# A git whose call FAIL_GIT_N among those whose argv matches the glob FAIL_GIT
+# alone fails; git_calls is how many matched.
+GIT_FAIL="$WORK/git-fail"
+mkdir -p "$GIT_FAIL"
+cat >"$GIT_FAIL/git" <<SH
+#!/usr/bin/env bash
+if [[ "\$*" == \${FAIL_GIT:?} ]]; then
+  n=\$((\$(cat "$GIT_FAIL/n" 2>/dev/null || echo 0) + 1))
+  echo "\$n" >"$GIT_FAIL/n"
+  [ "\$n" -ne "\${FAIL_GIT_N:?}" ] || { echo "stub: git \$* fails" >&2; exit 92; }
+fi
+exec "$(command -v git)" "\$@"
+SH
+chmod 755 "$GIT_FAIL/git"
+git_calls() { cat "$GIT_FAIL/n" 2>/dev/null || echo 0; }
+failing_promote() { # <argv glob> <N> <head commit> <exclude re> [built commits...] -> EXIT=n|matching git calls, or digest|source|via
+  local r
+  rm -f "$GIT_FAIL/n"
+  r=$(FAIL_GIT="$1" FAIL_GIT_N="$2" PATH="$GIT_FAIL:$PATH" promote_at "${@:3}")
+  if grep -q '^EXIT=' "$WORK/promote.log"; then
+    echo "$(grep '^EXIT=' "$WORK/promote.log" | tail -1)|$(git_calls)"
+  else
+    echo "$r|$(out promote_via)"
+  fi
+}
+failing_sources() { # <argv glob> <N> <commit> -> --sources' exit status|its commits|matching git calls, in PROMOTE_REPO
+  local rc=0 got
+  rm -f "$GIT_FAIL/n"
+  got=$(cd "$PROMOTE_REPO" && FAIL_GIT="$1" FAIL_GIT_N="$2" PATH="$GIT_FAIL:$PATH" EXCLUDE_RE="$EXCLUDE_RE_FULL" \
+    SUBPACKAGES_JSON="${WALK_SUBS-[]}" bash "$ROOT/scripts/promote-digest.sh" --sources "$3" 2>"$WORK/sources.log") || rc=$?
+  echo "$rc|$(tr '\n' ' ' <<<"$got")|$(git_calls)"
+}
+
 r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT" "$C_DOCS")
 chk "D-W1 an exact sha- hit promotes this commit's own digest" "${r#*|}|$(out promote_via)" "$C_DOCS|exact"
 r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")
@@ -520,6 +553,21 @@ chk "D-W2 a docs-only target inherits the ancestor's digest" "${r#*|}|$(out prom
 chk_has "D-W2 summary names the promoted build" "$(cat "$WORK/summary")" "built for \`${C_BUILT}\`"
 chk "D-W2 and asks whether the reused image was signed and attested" \
   "$(cut -d' ' -f1 "$PROV_LOG" | tr '\n' ' ')" "verify verify-attestation "
+chk "D-W14 a first-parent chain git cannot walk for an ancestor's image fails the step" \
+  "$(failing_promote 'rev-list --first-parent --skip=1 *' 1 "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")" "EXIT=1|1"
+chk_has "D-W14 and says so" "$(cat "$WORK/promote.log")" "cannot walk the first-parent chain of $C_DOCS"
+chk "D-W14 as does an ancestor whose parents git cannot read" \
+  "$(failing_promote "rev-parse --verify --quiet ${C_BUILT}^2" 1 "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")" "EXIT=1|1"
+chk_has "D-W14 and names it" "$(cat "$WORK/promote.log")" "cannot read the parents of $C_BUILT"
+chk "D-W14 or a walk from it git cannot list" \
+  "$(failing_promote "rev-list --first-parent ${C_BUILT}..${C_DOCS}" 1 "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")" "EXIT=1|1"
+chk_has "D-W14 and says so" "$(cat "$WORK/promote.log")" "cannot walk the first-parent chain ${C_BUILT}..${C_DOCS}"
+chk "D-W14 or a walked commit whose parents git cannot read" \
+  "$(failing_promote "rev-parse --verify --quiet ${C_DOCS}^2" 1 "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")" "EXIT=1|1"
+chk_has "D-W14 and names it" "$(cat "$WORK/promote.log")" "cannot read the parents of $C_DOCS"
+chk "D-W14 or whose diff git cannot read" \
+  "$(failing_promote "diff --name-only ${C_DOCS}^ ${C_DOCS}" 1 "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")" "EXIT=1|1"
+chk_has "D-W14 and names it" "$(cat "$WORK/promote.log")" "cannot diff $C_DOCS against its parent"
 r=$(promote_at "$C_SHIP" "$EXCLUDE_RE_FULL" "$C_BUILT")
 chk "D-W3 a shipped change since builds from source" "${r%|*}" ""
 chk_has "D-W3 the log names the shipped path" "$(cat "$WORK/promote.log")" "changes a shipped path"
@@ -535,6 +583,9 @@ chk_has "D-W6 the log names the empty commit" "$(cat "$WORK/promote.log")" "chan
 C_SYNC=$(commit "chore(sync): synced file(s) with cplieger/ci (#9)")
 r=$(promote_at "$C_SYNC" "$EXCLUDE_RE_FULL" "$C_DOCS3")
 chk "D-W6 an empty machine commit inherits its parent's digest" "${r#*|}|$(out promote_via)" "$C_DOCS3|ancestor"
+chk "D-W14 an empty commit whose subject git cannot read fails the step" \
+  "$(failing_promote "log -1 --format=%s $C_SYNC" 1 "$C_SYNC" "$EXCLUDE_RE_FULL" "$C_DOCS3")" "EXIT=1|1"
+chk_has "D-W14 and names it" "$(cat "$WORK/promote.log")" "cannot read the subject of $C_SYNC"
 r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL")
 chk "D-W7 no dev build anywhere builds from source" "${r%|*}|$(out promote_via)" "|none"
 chk_has "D-W7 summary says so" "$(cat "$WORK/summary")" "No dev build could be reused"
@@ -609,6 +660,13 @@ r=$(promote_at "$R" "$EXCLUDE_RE_FULL" "$M0" "$T1")
 chk "D-M1 a promotion commit re-tags its Promoted-Digest" "$r|$(out promote_via)" "$D_T|$T1|trailer"
 chk "D-M1 leaving its signature to the gate that refuses rather than builds (D-G)" "$(wc -l <"$PROV_LOG" | tr -d ' ')" "0"
 chk_has "D-M1 summary names the trailer" "$(cat "$WORK/summary")" "this promotion commit records (digest \`${D_T}\`, promoted commit \`${T1}\`)"
+chk "D-M14 a commit git cannot tell is a promotion fails the step, neither re-tagging nor building" \
+  "$(failing_promote "rev-list --parents -n1 ${R}^{commit} --" 1 "$R" "$EXCLUDE_RE_FULL" "$M0" "$T1")" "EXIT=1|1"
+chk_has "D-M14 and names it" "$(cat "$WORK/promote.log")" "cannot tell whether $R is a promotion commit"
+chk "D-M14 as does a promotion whose trailers git cannot read" \
+  "$(failing_promote 'interpret-trailers --parse' 1 "$R" "$EXCLUDE_RE_FULL" "$M0" "$T1")" "EXIT=1|1"
+chk_has "D-M14 and says so, not that the trailer is missing" "$(cat "$WORK/promote.log")" \
+  "cannot read the Promoted-Digest trailers of the promotion commit $R"
 out_m=$(cd "$REC" && GITHUB_SHA="$R_OTHER" EXCLUDE_RE="$EXCLUDE_RE_FULL" run_step promote.sh)
 chk_has "D-M2 a digest of another image's package is refused" "$out_m" "is not in ghcr.io/owner/app"
 chk "D-M2 and fails the step with no digest" "$(printf '%s' "$out_m" | sed -n 's/^EXIT=//p')|$(out promote_digest)" "1|"
@@ -685,6 +743,17 @@ sources() { (cd "$SPK" && EXCLUDE_RE="$EXCLUDE_RE_FULL" SUBPACKAGES_JSON='["web"
   bash "$ROOT/scripts/promote-digest.sh" --sources "$1" 2>/dev/null | tr '\n' ' '); }
 chk "D-M13 --sources stops at a shipped subpackage manifest" "$(sources "$P_DEP")" "$P_DEP "
 chk "D-M13 and walks the commits that carried the image" "$(sources "$P_ROOT")" "$P_ROOT $P_DEV $P0 "
+chk "D-M15 --sources fails on a parent git cannot read, not cutting the window short" \
+  "$(failing_sources "rev-parse --verify --quiet ${P_ROOT}^1" 1 "$P_ROOT")" "1|$P_ROOT |1"
+chk_has "D-M15 and names it" "$(cat "$WORK/sources.log")" "cannot read the parents of $P_ROOT"
+chk "D-M15 as on a parent whose own parents git cannot read" \
+  "$(failing_sources "rev-parse --verify --quiet ${P_DEV}^2" 1 "$P_ROOT")" "1|$P_ROOT |1"
+chk_has "D-M15 and names it" "$(cat "$WORK/sources.log")" "cannot read the parents of $P_DEV"
+chk "D-M15 as on a commit git cannot diff" \
+  "$(failing_sources "diff --name-only ${P_ROOT}^ $P_ROOT" 1 "$P_ROOT")" "1|$P_ROOT |1"
+chk_has "D-M15 and names it" "$(cat "$WORK/sources.log")" "cannot diff $P_ROOT against its parent"
+chk "D-M13 a walk cut short by a shipped change" "$(failing_sources 'no such call' 1 "$P_DEP")" "0|$P_DEP |0"
+chk "D-M13 prints no build notice" "$(grep -c '::notice::' "$WORK/sources.log" || true)" "0"
 WALK_SUBS='[]'
 PROMOTE_REPO="$REPO"
 

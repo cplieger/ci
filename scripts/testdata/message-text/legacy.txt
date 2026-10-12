@@ -11,7 +11,6 @@ ${valid} mutants — measured nothing, no
 '{rname}' unreadable (API); rulesets not graded
 '{s['used_by_package']}' (want '{s['expected_package']}'; no API —
 (TLS verification disabled; want \'0\')
-(a forced rebuild); building from source
 (count=0, gates nothing; standard is off)
 (id {aid}) — likely a stale/decommissioned
 (want '{want}' [+/vN]; unfetchable by Go
@@ -22,7 +21,6 @@ NOT auto-update — repoint their '#
 PR as 'Expected'; the context must
 PRs (want absent; Renovate owns deps)
 a reproducer — broken seed corpus
-a shipped path; building from source
 a stale/decommissioned app; remove it
 already published — skipping
 ancestor of ${GITHUB_SHA}; publishing forward.
