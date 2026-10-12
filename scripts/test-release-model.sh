@@ -121,9 +121,13 @@ chmod 755 "$BIN/gh" "$BIN/python3"
 # writes the commit as GitHub would (its own committer), PATCH refs/heads/main
 # honours force=false as a fast-forward check.
 cat >"$GH_DIR/promote-shim.py" <<'PY'
-import json, os, subprocess, sys, types
+import json, os, subprocess, sys, types, urllib.parse
 sys.path.insert(0, os.path.abspath('scripts'))
 import promote
+
+# A stalled wait fails the suite within two minutes rather than after promote.py's 45.
+promote.MAIN_RUN_POLL_SECONDS = 0.1
+promote.MAIN_RUN_WAIT_SECONDS = 120
 
 ORIGIN = os.environ['O']
 LOG = os.path.join(os.environ['GH_DIR'], 'github.log')
@@ -149,6 +153,17 @@ def gh_json(path):
         return {'sha': sha, 'tree': {'sha': git('rev-parse', f'{sha}^{{tree}}')},
                 'parents': [{'sha': p} for p in git('rev-list', '--parents', '-n1', sha).split()[1:]],
                 'message': git('log', '-1', '--format=%B', sha)}
+    base, _, query = path.partition('?')
+    args = urllib.parse.parse_qs(query)
+    if base == 'repos/cplieger/app/actions/workflows/release.yaml/runs' and \
+            sorted(args) == ['branch', 'head_sha', 'per_page'] and args['branch'] == ['main']:
+        # release-busy-<sha>: that commit's release run is in progress; each such
+        # answer leaves release-polled-<sha> behind.
+        sha = args['head_sha'][0]
+        busy = os.path.exists(os.path.join(os.environ['GH_DIR'], f'release-busy-{sha}'))
+        if busy:
+            open(os.path.join(os.environ['GH_DIR'], f'release-polled-{sha}'), 'w').close()
+        return {'workflow_runs': [{'status': 'in_progress' if busy else 'completed'}]}
     raise promote.GhError(f'fake GitHub: unexpected GET {path}')
 
 
@@ -509,27 +524,83 @@ out=$(PREVIEW_FAILS=1 run_promote r4)
 R4=$(head_of main)
 chk "M25 then the promotion, its preview failed too" "$out|$(is_r "$R4")" "promoted $R4|yes"
 
-# ── 12. nothing to publish ───────────────────────────────────────────────────
+# ── 12. nothing to move ──────────────────────────────────────────────────────
 commit_on dev "fix(deps): rebuild the image" >/dev/null
 out=$(run_promote empty)
-chk_has "M26 a dev holding only an empty rebuild beyond main is refused" "$out" "nothing to publish"
+chk_has "M26 a dev holding only an empty rebuild beyond main is refused" "$out" "nothing to move"
 chk "M26 main is untouched" "$(head_of main)" "$R4"
 run_release main r4
 chk "M27 R4 publishes its minor" "$(result)" "v2.1.0"
+
+# ── 13. a promotion that ships nothing ───────────────────────────────────────
+NB=$(commit_on dev "feat!: require the strict lint set" .golangci.yaml='linters: {}')
+run_release dev nb
+chk "M28 a breaking commit to a path no lane ships cuts no dev build" "$(result)" ""
+commit_on dev "fix: shorten the farewell" main.go='package main\n// v8' >/dev/null
+run_release dev nf
+chk "M28 the next dev fix counts it and takes the next major" "$(result)" "v3.0.0-dev.1"
+out=$(TARGET=$NB run_promote r5)
+R5=$(head_of main)
+chk "M29 a target changing only paths no lane ships promotes" "$out|$(is_r "$R5")|$(parents_of "$R5")" \
+  "promoted $R5|yes|$R4 $NB"
+chk_has "M29 and its preview says the root cuts no version" \
+  "$(cat "$(jq -r .runner_temp "$WORK/promote-r5.preview.json")/summary.md")" "### root: no release"
+run_release main r5
+chk "M30 the stable run at the promotion publishes nothing" "$(result)" ""
+chk "M30 with nothing pending, in range or owed" \
+  "$(detect release)|$(lane_state . commit)|$(detect in_range_any)|$(detect repairs)" 'false||false|[]'
+commit_on dev "fix: polish the farewell" main.go='package main\n// v9' >/dev/null
+run_release dev ng
+chk "M31 the next dev build still ranks above the first, its range from the highest stable tag" \
+  "$(result)|$(step_out cliff range_from)" "v3.0.0-dev.2|$(tag_of v2.1.0)"
+out=$(run_promote r6)
+R6=$(head_of main)
+chk "M32 promoting dev's head" "$out" "promoted $R6"
+run_release main r6
+chk "M32 publishes the major the earlier promotion's breaking commit owed" "$(result)" "v3.0.0"
+chk "M32 naming the newest dev build" "$(detect release_kind_note)" 'Promoted from `v3.0.0-dev.2`'
+
+# ── 14. main's release still running when a promotion starts ─────────────────
+commit_on dev "fix(deps): update module example.org/dep to v1.3.6" go.mod="$(gomod v1.3.6)" >/dev/null
+TF=$(commit_on dev "test: cover the farewell" main_test.go='package main')
+MF=$(commit_on main "fix(deps): update module example.org/dep to v1.3.6" go.mod="$(gomod v1.3.6)")
+touch "$GH_DIR/release-busy-$MF"
+run_promote inflight >"$WORK/inflight.out" &
+promoting=$!
+for _ in $(seq 600); do
+  { [ -f "$GH_DIR/release-polled-$MF" ] || ! kill -0 "$promoting" 2>/dev/null; } && break
+  sleep 0.1
+done
+chk "M35 the snapshot waits while main's release run is in progress" \
+  "$([ -f "$GH_DIR/release-polled-$MF" ] && echo waiting || echo 'did not wait')" "waiting"
+AT=$MF run_release main inflight-m
+chk "M35 meanwhile main's run publishes its patch" "$(result)" "v3.0.1"
+rm -f "$GH_DIR/release-busy-$MF"
+wait "$promoting"
+RF=$(head_of main)
+chk "M36 the promotion moves main once that run finished" "$(cat "$WORK/inflight.out")|$(parents_of "$RF")" \
+  "promoted $RF|$MF $TF"
+chk_has "M36 its preview counts the patch main's run published" \
+  "$(cat "$(jq -r .runner_temp "$WORK/promote-inflight.preview.json")/summary.md")" \
+  'No path root ships changed since `v3.0.1`, so it cuts no version.'
+run_release main inflight-r
+chk "M37 the stable run at the promotion publishes nothing, as its preview planned" "$(result)" ""
+
+# ── 15. a lockfile-only commit on main ───────────────────────────────────────
 commit_on main "chore(deps): lock file maintenance" package-lock.json='{"lockfileVersion": 3}' >/dev/null
 run_release main lock
-chk "M27 a lockfile-only commit on main publishes nothing" "$(result)" ""
-chk "M27 no lane ships it" "$(detect root_changed)|$(detect go_modules_to_release)|$(detect release)" 'false|[]|false'
+chk "M33 a lockfile-only commit on main publishes nothing" "$(result)" ""
+chk "M33 no lane ships it" "$(detect root_changed)|$(detect go_modules_to_release)|$(detect release)" 'false|[]|false'
 
-chk "M27 the run checked out the ci source and ran compute from it" \
+chk "M33 the run checked out the ci source and ran compute from it" \
   "$(jq -r '[.ran[] | select(test("ci source|Compute version"))] | join(",")' "$RUN.detect.json")" \
   "Check out the ci source (checkout: --actions-root),Compute version (cliff)"
 
-# ── 13. a main-default repository is refused ─────────────────────────────────
+# ── 16. a main-default repository is refused ─────────────────────────────────
 commit_on main "fix: a main-only fix" main.go='package main\n// main-only' >/dev/null
 DEFAULT_BRANCH=main run_release main maindefault
-chk "M28 a main-default repository's release run is refused at detect" "$(result)" \
+chk "M34 a main-default repository's release run is refused at detect" "$(result)" \
   "refused: ::error::release.yaml publishes only from a public, non-fork repository whose default branch is dev (this one: default branch main, private <unknown>, fork <unknown>). Make dev the default branch, or remove the release.yaml caller and publish from the repository's own workflow."
-chk "M28 running no step after Select channel" "$(jq -r '.ran | join(",")' "$RUN.detect.json")" "Checkout (checkout: --cwd),Select channel"
+chk "M34 running no step after Select channel" "$(jq -r '.ran | join(",")' "$RUN.detect.json")" "Checkout (checkout: --cwd),Select channel"
 
 echo "PASS: two-branch release model end to end ($PASS checks)"

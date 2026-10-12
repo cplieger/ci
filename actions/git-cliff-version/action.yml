@@ -31,6 +31,13 @@ inputs:
       when nothing is pending.
     required: false
     default: ""
+  pending-commit:
+    description: >-
+      Dev channel: the lane's pending promotion commit (`release-state.sh
+      pending`), the change level's range floor; empty when nothing is
+      pending.
+    required: false
+    default: ""
   pending-in-range:
     description: >-
       Stable channel: 'true' when this run's range holds a pending
@@ -104,6 +111,7 @@ runs:
         EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
         LANE: ${{ inputs.lane }}
         PENDING_VERSION: ${{ inputs.pending-version }}
+        PENDING_COMMIT: ${{ inputs.pending-commit }}
         PENDING_IN_RANGE: ${{ inputs.pending-in-range }}
         CLIFF_BIN: git-cliff
       run: |

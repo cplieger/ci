@@ -287,6 +287,7 @@ jobs:
           channel: ${{ steps.channel.outputs.channel }}
           exclude-paths: ${{ steps.gomodules.outputs.exclude_paths }}
           pending-version: ${{ steps.channel.outputs.channel == 'dev' && steps.number.outputs.root_version || '' }}
+          pending-commit: ${{ steps.channel.outputs.channel == 'dev' && steps.pending.outputs.root_commit || '' }}
           pending-in-range: ${{ steps.pending.outputs.root_in_range || 'false' }}
 
       - name: Detect changed paths
@@ -944,6 +945,7 @@ jobs:
           lane: ${{ matrix.lane }}
           exclude-paths: ${{ matrix.lane == '' && needs.detect.outputs.exclude_paths || '' }}
           pending-version: ${{ fromJSON(needs.detect.outputs.lane_state)[matrix.key].version }}
+          pending-commit: ${{ fromJSON(needs.detect.outputs.lane_state)[matrix.key].commit }}
 
       - name: Hand the version on
         id: handoff
@@ -1118,6 +1120,7 @@ jobs:
           channel: dev
           exclude-paths: ${{ needs.detect.outputs.exclude_paths }}
           pending-version: ${{ fromJSON(needs.detect.outputs.lane_state)['.'].version }}
+          pending-commit: ${{ fromJSON(needs.detect.outputs.lane_state)['.'].commit }}
 
       - name: Hand the version on
         id: handoff
@@ -1948,6 +1951,7 @@ jobs:
           channel: ${{ needs.detect.outputs.channel }}
           lane: ${{ matrix.dir }}
           pending-version: ${{ needs.detect.outputs.channel == 'dev' && fromJSON(needs.detect.outputs.lane_state || '{}')[matrix.dir].version || '' }}
+          pending-commit: ${{ needs.detect.outputs.channel == 'dev' && fromJSON(needs.detect.outputs.lane_state || '{}')[matrix.dir].commit || '' }}
           pending-in-range: ${{ fromJSON(needs.detect.outputs.lane_state || '{}')[matrix.dir].in_range && 'true' || 'false' }}
 
       # The lane's copy of detect's "Select version": detect emits the lane

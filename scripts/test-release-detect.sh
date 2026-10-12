@@ -101,6 +101,8 @@ for job in ("repair-notes", "repair-assets", "repair-release", "repair-publish",
     facts[f"jobif:{job}"] = " ".join(str(jobs[job].get("if", "")).split())
     facts[f"perms:{job}"] = jobs[job].get("permissions")
 facts["lanecliff-with"] = step(jobs, "go-nested", "Compute lane version (cliff)")["with"]
+facts["renumber-cliff-with"] = step(jobs, "renumber", "Compute lane version (cliff)")["with"]
+facts["renumber-ts-cliff-with"] = step(jobs, "renumber-ts", "Compute version (cliff)")["with"]
 open(f"{out}/lane-select.sh", "w").write(step(jobs, "go-nested", "Select lane version")["run"])
 facts["lane-select-env"] = step(jobs, "go-nested", "Select lane version")["env"]
 facts["vp-steps"] = [s.get("name") for s in jobs["verify-publish"]["steps"]]
@@ -766,6 +768,16 @@ git -C "$W" checkout -q dev
 s=$(pending_at "$W" dev)
 chk "P5 a dev run sees the promotion pending on main" "$(lane . commit "$s")|$(lane . in_range "$s")" "$R1|false"
 chk "P5 and writes no kind line" "$(outkey root_kind_note)" ""
+chk "P5 and names the root's pending commit" "$(outkey root_commit)" "$R1"
+dev_floor_at() { # <dir> <pending-version> <pending-commit> -> base|range_from of a root dev compute.sh run
+  : >"$WORK/cout"
+  (cd "$1" && CHANNEL=dev PENDING_VERSION="$2" PENDING_COMMIT="$3" EXCLUDE_PATHS='yamlenv/**' CLIFF_BIN="$CLIFF" \
+    GITHUB_OUTPUT="$WORK/cout" bash "$COMPUTE") >"$WORK/compute.log" 2>&1 || fail "compute.sh failed: $(cat "$WORK/compute.log")"
+  printf '%s|%s' "$(sed -n 's/^base=//p' "$WORK/cout")" "$(sed -n 's/^range_from=//p' "$WORK/cout")"
+}
+commit_in "$W" "fix: a dev fix past the promotion" main.go=v3 >/dev/null
+chk "N6 a dev build above a pending promotion reads its change level from that promotion" \
+  "$(dev_floor_at "$W" v1.1.0 "$R1")" "v1.2.0|$R1"
 git -C "$W" update-ref -d refs/remotes/origin/main
 chk "P6 a dev run without origin/main is refused" \
   "$( (cd "$W" && CHANNEL=dev GITHUB_OUTPUT="$WORK/out" bash "$RS" pending) >/dev/null 2>&1 && echo ran || echo refused)" "refused"
@@ -805,6 +817,7 @@ s=$(pending_at "$O" stable)
 chk "P7 a nested-only R leaves the root non-pending" "$(lane . commit "$s")|$(lane . in_range "$s")" "|false"
 chk "P7 and the root's kind line is the main-built one" "$(outkey root_kind_note)" \
   'Built from `main` for dependency and system-package updates'
+chk "P7 and names no root pending commit" "$(outkey root_commit)" ""
 chk "P8 a nested-only R is the lane's pending promotion" "$(lane yamlenv commit "$s")|$(lane yamlenv in_range "$s")" "$R2|true"
 chk "P8 with the lane's dev build in its kind line" "$(lane yamlenv kind_note "$s")" 'Promoted from `yamlenv/v1.0.1-dev.1`'
 got=$( (cd "$O" && failing_jq '*--arg ? yamlenv *' 4 env CHANNEL=stable GITHUB_OUTPUT="$WORK/out" bash "$RS" pending) >"$WORK/pending.log" 2>&1 \
@@ -815,6 +828,11 @@ chk_has "P20 and the lane" "$(cat "$WORK/pending.log")" "cannot tell which of la
 s=$(number "$s")
 chk "N3 a fixes-only lane promotion is numbered the next lane minor" "$(lane yamlenv version "$s")" "yamlenv/v1.1.0"
 chk "N3 and the root gets no version" "$(outkey root_version)" ""
+rm -rf "$WORK/work-n5"
+git clone -q "$O" "$WORK/work-n5"
+git -C "$WORK/work-n5" checkout -q dev
+chk "N7 a root dev build with nothing pending reads from H's commit, past the nested-only promotion newer than it" \
+  "$(dev_floor_at "$WORK/work-n5" "" "")" "v1.2.0|$S1"
 
 # ── Publication: a pending promotion publishes its lanes on its own ──────────
 publish_at() { # <dir> <root_changed> <subs> <mods> <state> [channel] -> outputs in $WORK/out; EXIT=n on failure
@@ -2532,6 +2550,17 @@ chk "W3 pending promotions are numbered before the version" \
   "$(fact '.names | (index("Number pending promotions") < index("Compute version (cliff)"))')" "true"
 chk "W4 the lane compute reads its pending range" "$(fact '."lanecliff-with"."pending-in-range"')" \
   "\${{ fromJSON(needs.detect.outputs.lane_state || '{}')[matrix.dir].in_range && 'true' || 'false' }}"
+chk "W3 the root's pending commit on dev floors its change level" "$(fact '."cliff-with"."pending-commit"')" \
+  "\${{ steps.channel.outputs.channel == 'dev' && steps.pending.outputs.root_commit || '' }}"
+chk "W4 a lane's pending version and commit come from one lane_state row" \
+  "$(fact '."lanecliff-with" | ."pending-version" + " " + ."pending-commit"')" \
+  "\${{ needs.detect.outputs.channel == 'dev' && fromJSON(needs.detect.outputs.lane_state || '{}')[matrix.dir].version || '' }} \${{ needs.detect.outputs.channel == 'dev' && fromJSON(needs.detect.outputs.lane_state || '{}')[matrix.dir].commit || '' }}"
+chk "W28 renumber's compute reads the lane's pending version and commit from one row" \
+  "$(fact '."renumber-cliff-with" | ."pending-version" + " " + ."pending-commit"')" \
+  "\${{ fromJSON(needs.detect.outputs.lane_state)[matrix.key].version }} \${{ fromJSON(needs.detect.outputs.lane_state)[matrix.key].commit }}"
+chk "W28 and so does renumber-ts's" \
+  "$(fact '."renumber-ts-cliff-with" | ."pending-version" + " " + ."pending-commit"')" \
+  "\${{ fromJSON(needs.detect.outputs.lane_state)['.'].version }} \${{ fromJSON(needs.detect.outputs.lane_state)['.'].commit }}"
 lane_select() { # <anchor> -> release|version|gh calls of a stable lane run
   : >"$WORK/out"
   : >"$GH_LOG"

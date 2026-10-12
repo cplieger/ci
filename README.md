@@ -50,7 +50,11 @@ An image release pushes to GitHub Container Registry and to Docker Hub under the
 
 Each release gets a `vX.Y.Z` tag, and the `vX` and `vX.Y` tags move to it. A breaking change starts a new major tag, and callers stay on their major tag until they change the pin. Pin `v3`, the current major line and the only one that gets fixes, as the [security policy](SECURITY.md) states.
 
-The release workflow publishes only from a public, non-fork repository whose default branch is `dev`, and for any other caller it fails in its first job, before anything is built or published. Such a repository follows the [two-branch release model](docs/workflows.md#the-two-branch-release-model). A push to `dev` publishes a pre-release with no GitHub Release, and `main` publishes patches. A promotion from `dev`, started by hand, publishes the next minor or major. Merge its pull requests by squash, so each pull request title becomes one line in its release notes.
+The release workflow publishes only from a public, non-fork repository whose default branch is `dev`, and for any other caller it fails in its first job, before anything is built or published. Such a repository follows the [two-branch release model](docs/workflows.md#the-two-branch-release-model).
+
+In that model, a push to `dev` publishes a pre-release with no GitHub Release, and `main` publishes patches. A promotion from `dev`, started by hand, moves `main` to a tested `dev` commit. The root and each nested Go module then publish only when a file they ship changed since their last stable tag. An image also publishes for a rebuild merged into `main`. Each publishes its next minor or major when a promotion changed that file, and its next patch when only `main` did.
+
+Merge the repository's pull requests by squash, so each pull request title becomes one line in its release notes.
 
 ## Using it outside the cplieger repositories
 

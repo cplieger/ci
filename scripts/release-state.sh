@@ -224,6 +224,7 @@ cmd_pending() {
     "any=$(jq -r 'any(.[]; .commit != "")' <<<"$state")" \
     "in_range_any=$(jq -r 'any(.[]; .in_range)' <<<"$state")" \
     "root_in_range=$(jq -r '.["."].in_range // false' <<<"$state")" \
+    "root_commit=$(jq -r '.["."].commit // ""' <<<"$state")" \
     "root_kind_note=$(jq -r '.["."].kind_note // ""' <<<"$state")"
 }
 

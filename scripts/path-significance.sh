@@ -326,7 +326,11 @@ for s in "${SUBPACKAGES[@]}"; do
 done
 if [ "$ROOT_CHANGED" = false ] && [ "$subpkg_changed" = false ] \
   && [ -n "$RANGE_START" ] && [ "${REPO_TYPE:-}" = docker ]; then
-  REVS=$(git rev-list --no-merges "$RANGE_START..$HEAD") || die "cannot list the commits of ${RANGE_START}..${HEAD}"
+  # On stable only main's own rebuild requests count: one reached through a
+  # promotion's second parent rebuilt dev's image, and main rebuilds its own.
+  WALK=(--no-merges)
+  [ "${CHANNEL:-}" != stable ] || WALK+=(--first-parent)
+  REVS=$(git rev-list "${WALK[@]}" "$RANGE_START..$HEAD") || die "cannot list the commits of ${RANGE_START}..${HEAD}"
   while IFS= read -r c; do
     [ -z "$c" ] && continue
     if is_rebuild_commit "$c"; then

@@ -589,6 +589,27 @@ class Blockers(unittest.TestCase):
         row, _ = plan(shipped)
         self.assertEqual((row['errors'], row['blockers']['weekly']), ([], []))
 
+    def test_a_promotion_run_that_published_nothing_ships_the_machine_prs_merged_before_it(self):
+        promotion = 'c' * 40
+        merged = pr(12, GROUP, created='2026-10-10T02:00:00Z', merged='2026-10-10T03:00:00Z')
+        responses = world(
+            **{
+                CLOSED: [merged],
+                SHIPPED: {
+                    'workflow_runs': [
+                        {
+                            'created_at': '2026-10-10T03:01:00Z',
+                            'updated_at': '2026-10-10T03:30:00Z',
+                            'head_sha': promotion,
+                        }
+                    ]
+                },
+                f'GET {P}/compare/{12:040d}...{promotion}': {'status': 'ahead'},
+            }
+        )
+        row, _ = plan(responses)
+        self.assertEqual((row['errors'], row['blockers']['weekly']), ([], []))
+
     def test_a_release_run_that_does_not_contain_the_merge_ships_nothing(self):
         merged = pr(12, GROUP, created='2026-10-10T02:00:00Z', merged='2026-10-10T03:00:00Z')
         responses = world(

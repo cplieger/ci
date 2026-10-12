@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Version arithmetic for the release channels, configured by environment
-# (CHANNEL, EXCLUDE_PATHS, LANE, CLIFF_BIN, PENDING_VERSION, PENDING_IN_RANGE);
-# results go to $GITHUB_OUTPUT.
+# (CHANNEL, EXCLUDE_PATHS, LANE, CLIFF_BIN, PENDING_VERSION, PENDING_COMMIT,
+# PENDING_IN_RANGE); results go to $GITHUB_OUTPUT.
 # `compute.sh pending-version <commit> [lane]` prints a pending promotion's
 # version instead. Callers: action.yml, scripts/release-state.sh,
 # test-cliff-bump-semantics.sh.
@@ -204,25 +204,10 @@ promotion_version() { # <H> <level> -> the next major for a breaking range, else
     raise "$1" minor
   fi
 }
-newer_on_chain() { # <ref> <a> <b> -> whichever of a, b comes first on ref's first-parent chain
-  local c
-  if [ -z "$2" ] || [ -z "$3" ]; then
-    printf '%s' "${2:-$3}"
-    return 0
-  fi
-  while IFS= read -r c; do
-    case "$c" in
-      "$2" | "$3")
-        printf '%s' "$c"
-        return 0
-        ;;
-    esac
-  done < <(git rev-list --first-parent "$1")
-  printf '%s' "$2"
-}
 # Fixed once: the lowest stable tag on <R> or a descendant published the
 # promotion, receipt or not; otherwise the stable run's arithmetic over P..R,
 # P being the highest stable tag on any other commit.
+# <R>: a promotion release-state.sh pending found affecting the lane.
 pending_version_of() { # <R> -> the version the pending promotion publishes
   local r="$1" name commit lowest="" p="" p_commit=""
   while read -r name commit; do
@@ -290,6 +275,34 @@ if [ -n "$PENDING_VERSION" ] && ! [[ $PENDING_VERSION =~ $PATTERN ]]; then
   echo "::error::pending-version '${PENDING_VERSION}' is not of the form ${PREFIX}vX.Y.Z"
   exit 1
 fi
+PENDING_COMMIT="${PENDING_COMMIT:-}"
+if [ -n "$PENDING_COMMIT" ]; then
+  if [ "$CHANNEL" = stable ]; then
+    echo "::error::pending-commit is a dev run's range floor, but this run is on the stable channel"
+    exit 1
+  fi
+  if ! [[ $PENDING_COMMIT =~ ^[0-9a-f]{40}$ ]]; then
+    echo "::error::pending-commit '${PENDING_COMMIT}' is not a 40-character commit id"
+    exit 1
+  fi
+  rc=0
+  is_reconciliation "$PENDING_COMMIT" || rc=$?
+  case "$rc" in
+    0) ;;
+    1)
+      echo "::error::'${PENDING_COMMIT}' is not a promotion commit, so it is no range floor"
+      exit 1
+      ;;
+    *)
+      echo "::error::cannot tell whether '${PENDING_COMMIT}' is a promotion commit"
+      exit 1
+      ;;
+  esac
+fi
+if [ "$CHANNEL" = dev ] && [ "${PENDING_VERSION:+set}" != "${PENDING_COMMIT:+set}" ]; then
+  echo "::error::pending-version and pending-commit name one pending promotion, so both or neither are set"
+  exit 1
+fi
 
 HEAD_SHA="$(git rev-parse HEAD)"
 H_TAG="" H_COMMIT="" HEAD_TAG=""
@@ -320,21 +333,12 @@ if [ "$CHANNEL" = stable ] && [ -n "$HEAD_TAG" ]; then
   LEVEL=none
   BASE="$HEAD_TAG"
 else
-  if [ "$PENDING_IN_RANGE" = true ]; then
-    RANGE_FROM="$H_COMMIT"
+  # A dev lane's pending promotion is its unpublished range floor (release-state.sh
+  # pending owns which); otherwise the floor is the lane's highest stable tag.
+  if [ "$CHANNEL" = dev ] && [ -n "$PENDING_COMMIT" ]; then
+    RANGE_FROM="$PENDING_COMMIT"
   else
-    if [ "$CHANNEL" = dev ]; then
-      MAIN_REF=refs/remotes/origin/main
-      if ! git rev-parse --verify --quiet "${MAIN_REF}^{commit}" >/dev/null; then
-        echo "::error::a two-branch dev run needs ${MAIN_REF} to exclude promoted commits. Check out with fetch-depth: 0."
-        exit 1
-      fi
-    else
-      MAIN_REF=HEAD
-    fi
-    # A promotion's commits are counted by the stable run that publishes it,
-    # never again by the runs after it.
-    RANGE_FROM="$(newer_on_chain "$MAIN_REF" "$H_COMMIT" "$(newest_reconciliation "$MAIN_REF")")"
+    RANGE_FROM="$H_COMMIT"
   fi
   cliff_level "$RANGE_FROM" HEAD
   if [ -z "$H" ]; then

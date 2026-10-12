@@ -12,7 +12,7 @@ import tempfile
 import types
 import unittest
 import unittest.mock
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
@@ -337,37 +337,99 @@ class Reconciliation(unittest.TestCase):
                 promote.build_reconciliation(fx.src, m, t, '')
 
 
-class Snapshot(unittest.TestCase):
-    def run_snapshot(self, fx, repo='demo', target='', meta=None):
-        out = fx.tmp / 'github_output'
-        out.write_text('')
-        meta = {
-            'name': repo,
-            'default_branch': 'dev',
-            'visibility': 'public',
-            'archived': False,
-            'fork': False,
-            **(meta or {}),
-        }
-        calls = []
+RUNS_PATH = '/actions/workflows/release.yaml/runs'
 
-        def gh_json(path):
-            calls.append(path)
+
+def run_snapshot(fx, repo='demo', target='', meta=None, runs=None, on_poll=None):
+    """(rc, outputs, REST paths read) of cmd_snapshot over the published fixture.
+    `runs` answers each poll of main's release runs in turn (default: one completed
+    run); on_poll(i) runs before the i-th answer."""
+    out = fx.tmp / 'github_output'
+    out.write_text('')
+    meta = {
+        'name': repo,
+        'default_branch': 'dev',
+        'visibility': 'public',
+        'archived': False,
+        'fork': False,
+        **(meta or {}),
+    }
+    answers = iter(runs if runs is not None else [[{'status': 'completed'}]])
+    calls = []
+
+    def gh_json(path):
+        calls.append(path)
+        if RUNS_PATH not in path:
             return meta
+        polled = sum(RUNS_PATH in c for c in calls) - 1
+        if on_poll:
+            on_poll(polled)
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return {'workflow_runs': answer}
 
-        args = promote.parse_args(
-            ['--work-dir', str(fx.work), 'snapshot', '--repo', repo, '--target', target]
+    real_wait = promote.wait_for_main_release
+    clock = iter(range(0, 10**6, promote.MAIN_RUN_POLL_SECONDS))
+
+    def wait(repo, main, committed):
+        return real_wait(repo, main, committed, sleep=lambda _: None, clock=lambda: next(clock))
+
+    args = promote.parse_args(
+        ['--work-dir', str(fx.work), 'snapshot', '--repo', repo, '--target', target]
+    )
+    with (
+        unittest.mock.patch.object(promote, 'gh_json', side_effect=gh_json),
+        unittest.mock.patch.object(promote, 'wait_for_main_release', side_effect=wait),
+        unittest.mock.patch.object(promote, 'CLONE_URL', fx.url()),
+        unittest.mock.patch.dict(
+            os.environ, {'GITHUB_OUTPUT': str(out), 'GITHUB_STEP_SUMMARY': os.devnull}
+        ),
+    ):
+        rc = promote.cmd_snapshot(args)
+    values = dict(line.split('=', 1) for line in out.read_text().splitlines())
+    return rc, values, calls
+
+
+class Snapshot(unittest.TestCase):
+    run_snapshot = staticmethod(run_snapshot)
+
+    def test_outputs_wait_for_every_release_run_of_main(self):
+        busy, done = [{'status': 'in_progress'}], [{'status': 'completed'}]
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m, t = go_repo(fx)
+            fx.publish()
+            rc, values, calls = self.run_snapshot(fx, runs=[busy, [{'status': 'queued'}], done])
+        self.assertEqual((rc, values), (0, {'repo': 'demo', 'target': t, 'main': m}))
+        polls = [c for c in calls if RUNS_PATH in c]
+        self.assertEqual(len(polls), 3)
+        self.assertIn(f'head_sha={m}', polls[0])
+
+    def test_a_release_of_main_that_does_not_finish_is_refused(self):
+        polls = promote.MAIN_RUN_WAIT_SECONDS // promote.MAIN_RUN_POLL_SECONDS + 1
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m, _ = go_repo(fx)
+            fx.publish()
+            with redirect_stderr(io.StringIO()) as err:
+                rc, values, _ = self.run_snapshot(fx, runs=[[{'status': 'in_progress'}]] * polls)
+        self.assertEqual((rc, values), (1, {}))
+        self.assertIn(
+            f"::error::refused: main's head {m[:12]} has 1 release run(s) still running after "
+            f'{promote.MAIN_RUN_WAIT_SECONDS // 60} minutes, so rerun once it finishes',
+            err.getvalue(),
         )
-        with (
-            unittest.mock.patch.object(promote, 'gh_json', side_effect=gh_json),
-            unittest.mock.patch.object(promote, 'CLONE_URL', fx.url()),
-            unittest.mock.patch.dict(
-                os.environ, {'GITHUB_OUTPUT': str(out), 'GITHUB_STEP_SUMMARY': os.devnull}
-            ),
-        ):
-            rc = promote.cmd_snapshot(args)
-        values = dict(line.split('=', 1) for line in out.read_text().splitlines())
-        return rc, values, calls
+
+    def test_a_failed_read_of_main_s_release_runs_fails_the_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            go_repo(fx)
+            fx.publish()
+            with redirect_stderr(io.StringIO()) as err:
+                rc, values, _ = self.run_snapshot(fx, runs=[promote.GhError('HTTP 502')])
+        self.assertEqual((rc, values), (1, {}))
+        self.assertIn('::error::HTTP 502', err.getvalue())
 
     def test_outputs_are_the_dev_head_and_main_head(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -493,7 +555,7 @@ class Checks(unittest.TestCase):
         self.assertEqual((rc, plan), (1, None))
         self.assertIn('main moved since the snapshot', summary)
 
-    def test_a_dev_holding_only_an_empty_rebuild_has_nothing_to_publish(self):
+    def test_a_target_whose_tree_equals_mains_has_nothing_to_move(self):
         with tempfile.TemporaryDirectory() as tmp:
             fx = Fixture(tmp)
             m = fx.commit('feat: init', {'go.mod': GO_MOD, 'main.go': 'package main\n'})
@@ -502,18 +564,22 @@ class Checks(unittest.TestCase):
             fx.publish()
             rc, plan, summary = self.run_check(fx, m, t)
         self.assertEqual((rc, plan), (1, None))
-        self.assertIn('nothing to publish', summary)
+        self.assertIn(
+            "nothing to move: the target's tree equals main's, so a promotion would change no file",
+            summary,
+        )
 
-    def test_a_docs_only_dev_has_nothing_to_publish(self):
+    def test_a_test_only_target_passes_every_check_and_plans_r(self):
         with tempfile.TemporaryDirectory() as tmp:
             fx = Fixture(tmp)
             m = fx.commit('feat: init', {'go.mod': GO_MOD, 'main.go': 'package main\n'})
             fx.g('checkout', '-q', '-b', 'dev')
-            t = fx.commit('docs: readme', {'README.md': '# x\n'})
+            t = fx.commit('test: cover main', {'x_test.go': 'package main\n'})
             fx.publish()
-            rc, _, summary = self.run_check(fx, m, t)
-        self.assertEqual(rc, 1)
-        self.assertIn('nothing to publish', summary)
+            rc, plan, summary = self.run_check(fx, m, t)
+        self.assertEqual(rc, 0, summary)
+        self.assertEqual(plan['parents'], [m, t])
+        self.assertIn('Every check passed', summary)
 
     def test_dominance_refuses_a_non_machine_path_main_changed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -644,6 +710,26 @@ class Checks(unittest.TestCase):
             plan['message'], f'{promote.RECONCILIATION_SUBJECT}\n\nPromoted-Digest: {DIGEST}\n'
         )
 
+    def test_a_test_only_image_target_still_trails_its_dev_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m = fx.commit(
+                'feat: init', {'Dockerfile': 'FROM scratch\n', 'main.go': 'package main\n'}
+            )
+            fx.g('checkout', '-q', '-b', 'dev')
+            t = fx.commit('test: cover main', {'main_test.go': 'package main\n'})
+            fx.publish()
+            patches = (
+                unittest.mock.patch.object(promote, 'check_digest', return_value=(DIGEST, [])),
+                unittest.mock.patch.object(promote, 'check_vulnerabilities', return_value=[]),
+            )
+            rc, plan, summary = self.run_check(fx, m, t, patches=patches)
+        self.assertEqual(rc, 0, summary)
+        self.assertEqual(plan['parents'], [m, t])
+        self.assertEqual(
+            plan['message'], f'{promote.RECONCILIATION_SUBJECT}\n\nPromoted-Digest: {DIGEST}\n'
+        )
+
     def test_a_tampered_preview_output_changes_nothing_check_plans(self):
         with tempfile.TemporaryDirectory() as tmp:
             fx = Fixture(tmp)
@@ -758,7 +844,7 @@ class RetainedDigest(unittest.TestCase):
 
 
 class Vulnerabilities(unittest.TestCase):
-    def run_vulns(self, ours, theirs, findings, *, tag='v1.0.0', waited=''):
+    def run_vulns(self, ours, theirs, findings, *, tag='v1.0.0'):
         with tempfile.TemporaryDirectory() as tmp:
             fx = Fixture(tmp)
             m = fx.commit('feat: init', {'Dockerfile': 'FROM scratch\n'})
@@ -778,7 +864,7 @@ class Vulnerabilities(unittest.TestCase):
                 return findings.get(ref.rsplit('@', 1)[1], set())
 
             with (
-                unittest.mock.patch.object(promote, 'wait_for_main_release', return_value=waited),
+                unittest.mock.patch.object(promote, 'release_runs', side_effect=AssertionError),
                 unittest.mock.patch.object(promote, 'registry_token', return_value='t'),
                 unittest.mock.patch.object(promote, 'tag_digest', side_effect=tag_digest),
                 unittest.mock.patch.object(promote, 'platforms', side_effect=platforms),
@@ -855,10 +941,6 @@ class Vulnerabilities(unittest.TestCase):
         got, refs = self.run_vulns({'linux/amd64': 't'}, {}, {'t': {('CVE-1', 'x')}}, tag='')
         self.assertEqual((got, refs), ([], {}))
 
-    def test_main_release_still_running_is_refused(self):
-        got, refs = self.run_vulns({}, {}, {}, waited='image: still running')
-        self.assertEqual((got, refs), (['image: still running'], {}))
-
 
 class WaitForMainRelease(unittest.TestCase):
     def wait(self, answers, committed_ago):
@@ -891,6 +973,22 @@ class WaitForMainRelease(unittest.TestCase):
         polls = promote.MAIN_RUN_WAIT_SECONDS // promote.MAIN_RUN_POLL_SECONDS + 1
         got, _ = self.wait([[{'status': 'queued'}]] * polls, 30)
         self.assertIn('still running', got)
+
+    def test_one_read_names_the_runs_still_in_flight(self):
+        busy, done = {'id': 7, 'status': 'in_progress'}, {'id': 6, 'status': 'completed'}
+        young = datetime.now(UTC) - timedelta(seconds=30)
+        old = datetime.now(UTC) - timedelta(seconds=promote.MAIN_RUN_GRACE_SECONDS + 1)
+        for runs, committed, want in (
+            ([busy, done], old, [busy]),
+            ([], young, []),
+            ([], old, None),
+            ([done], young, None),
+        ):
+            with (
+                self.subTest(runs=runs, young=committed is young),
+                unittest.mock.patch.object(promote, 'release_runs', return_value=runs),
+            ):
+                self.assertEqual(promote.main_release_in_flight('demo', 'm' * 40, committed), want)
 
 
 class Trivy(unittest.TestCase):
@@ -1295,6 +1393,12 @@ class Workflow(unittest.TestCase):
         for job in ('snapshot', 'preview', 'apply', 'tag', 'move'):
             self.assertEqual(self.doc['jobs'][job]['permissions'], {'contents': 'read'})
 
+    def test_snapshot_outlasts_its_wait_for_main_s_release(self):
+        self.assertGreater(
+            self.doc['jobs']['snapshot']['timeout-minutes'] * 60,
+            promote.MAIN_RUN_WAIT_SECONDS + promote.MAIN_RUN_POLL_SECONDS,
+        )
+
     def test_notify_waits_for_every_job(self):
         jobs = set(self.doc['jobs']) - {'notify'}
         self.assertEqual(set(self.doc['jobs']['notify']['needs']), jobs)
@@ -1319,9 +1423,76 @@ def cliff_bin() -> str:
     return found if found and Path(found).exists() else ''
 
 
+REBUILD_SUBJECT = re.search(
+    r"^REBUILD_SUBJECT='(.*)'$", (HERE / 'path-significance.sh').read_text(), re.MULTILINE
+).group(1)
+CLIFF_STABLE = (ROOT / 'configs/cliff-stable.toml').read_text()
+
+
 @unittest.skipUnless(cliff_bin(), 'needs git-cliff (CLIFF_BIN or PATH)')
 class Preview(unittest.TestCase):
+    def run_preview(self, fx, m, t, run_tool=None):
+        """(rc, summary, stdout, stderr) of cmd_preview over the published fixture."""
+        summary = fx.work / 'summary.md'
+        args = promote.parse_args(
+            ['--work-dir', str(fx.work), 'preview', '--repo', 'demo', '--target', t, '--main', m]
+        )
+        env = {'GITHUB_STEP_SUMMARY': str(summary), 'CLIFF_BIN': cliff_bin(), 'GH_TOKEN': 'x'}
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            unittest.mock.patch.object(promote, 'CLONE_URL', fx.url()),
+            unittest.mock.patch.object(promote, 'run_tool', run_tool or promote.run_tool),
+            unittest.mock.patch.dict(os.environ, env),
+            redirect_stdout(out),
+            redirect_stderr(err),
+        ):
+            rc = promote.cmd_preview(args)
+        text = summary.read_text() if summary.exists() else ''
+        return rc, text, out.getvalue(), err.getvalue()
+
+    def plan_line(self, stdout: str) -> str:
+        return [line for line in stdout.splitlines() if line.startswith('release-plan: ')][-1]
+
+    def go_main(self, fx) -> str:
+        m = fx.commit(
+            'feat: init',
+            {'go.mod': GO_MOD, 'main.go': 'package main\n', 'cliff.toml': CLIFF_STABLE},
+        )
+        fx.g('tag', 'v1.0.0')
+        return m
+
     def test_the_stable_release_steps_number_and_render_the_promotion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m = self.go_main(fx)
+            fx.g('checkout', '-q', '-b', 'dev')
+            t = fx.commit('feat: add greeting (#7)', {'main.go': 'package main\n\n// hi\n'})
+            fx.g('tag', 'v1.1.0-dev.1')
+            fx.publish()
+            rc, text, stdout, _ = self.run_preview(fx, m, t)
+        self.assertEqual(rc, 0, text)
+        self.assertIn('### root v1.1.0', text)
+        self.assertIn('Promoted from `v1.1.0-dev.1`', text)
+        self.assertIn('- Add greeting (#7)', text)
+        self.assertIn('compare/v1.0.0...v1.1.0', text)
+        self.assertEqual(stdout.splitlines()[-1], 'release-plan: {".":"v1.1.0"}')
+
+    def test_a_test_only_promotion_previews_no_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m = self.go_main(fx)
+            fx.g('checkout', '-q', '-b', 'dev')
+            t = fx.commit('test: cover main', {'main_test.go': 'package main\n'})
+            fx.publish()
+            rc, text, stdout, _ = self.run_preview(fx, m, t)
+        self.assertEqual(rc, 0, text)
+        self.assertIn(
+            '### root: no release\n\nNo path root ships changed since `v1.0.0`, so it cuts no version.',
+            text,
+        )
+        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":""}')
+
+    def test_only_the_nested_lane_a_promotion_changes_is_planned(self):
         with tempfile.TemporaryDirectory() as tmp:
             fx = Fixture(tmp)
             m = fx.commit(
@@ -1329,40 +1500,180 @@ class Preview(unittest.TestCase):
                 {
                     'go.mod': GO_MOD,
                     'main.go': 'package main\n',
-                    'cliff.toml': (ROOT / 'configs/cliff-stable.toml').read_text(),
+                    'cliff.toml': CLIFF_STABLE,
+                    'sub/go.mod': 'module github.com/cplieger/demo/sub\n\ngo 1.27\n',
+                    'sub/sub.go': 'package sub\n',
+                },
+            )
+            fx.g('tag', 'v1.0.0')
+            fx.g('tag', 'sub/v0.1.0')
+            fx.g('checkout', '-q', '-b', 'dev')
+            t = fx.commit('feat: add a helper (#7)', {'sub/sub.go': 'package sub\n\n// hi\n'})
+            fx.publish()
+            rc, text, stdout, _ = self.run_preview(fx, m, t)
+        self.assertEqual(rc, 0, text)
+        self.assertIn(
+            '### root: no release\n\nNo path root ships changed since `v1.0.0`, so it cuts no version.',
+            text,
+        )
+        self.assertIn('### sub sub/v0.2.0', text)
+        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":"","sub":"sub/v0.2.0"}')
+
+    def test_a_tagless_test_only_promotion_previews_no_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m = fx.commit(
+                'feat: init',
+                {'go.mod': GO_MOD, 'main.go': 'package main\n', 'cliff.toml': CLIFF_STABLE},
+            )
+            fx.g('checkout', '-q', '-b', 'dev')
+            t = fx.commit('test: cover main', {'main_test.go': 'package main\n'})
+            fx.publish()
+            rc, text, stdout, _ = self.run_preview(fx, m, t)
+        self.assertEqual(rc, 0, text)
+        self.assertIn(
+            '### root: no release\n\nNo path root ships changed, so it cuts no version.', text
+        )
+        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":""}')
+
+    def test_main_s_unreleased_patch_is_previewed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            self.go_main(fx)
+            fx.g('checkout', '-q', '-b', 'dev')
+            bump = {'go.mod': GO_MOD + 'require example.com/dep v1.2.1\n'}
+            fx.commit('fix(deps): update module example.com/dep to v1.2.1 (#8)', bump)
+            t = fx.commit('test: cover main', {'main_test.go': 'package main\n'})
+            fx.g('checkout', '-q', 'main')
+            m = fx.commit('fix(deps): update module example.com/dep to v1.2.1 (#9)', bump)
+            fx.publish()
+            rc, text, stdout, _ = self.run_preview(fx, m, t)
+        self.assertEqual(rc, 0, text)
+        self.assertIn('### root v1.0.1', text)
+        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":"v1.0.1"}')
+
+    def test_main_s_release_in_flight_at_the_snapshot_is_planned_after_it_tags(self):
+        """M's own run tags v1.0.1 while snapshot waits, so the preview plans what
+        R's release does: nothing, rather than the v1.0.1 M already took."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            self.go_main(fx)
+            fx.g('checkout', '-q', '-b', 'dev')
+            bump = {'go.mod': GO_MOD + 'require example.com/dep v1.2.1\n'}
+            fx.commit('fix(deps): update module example.com/dep to v1.2.1 (#8)', bump)
+            t = fx.commit('test: cover main', {'main_test.go': 'package main\n'})
+            fx.g('checkout', '-q', 'main')
+            m = fx.commit('fix(deps): update module example.com/dep to v1.2.1 (#9)', bump)
+            fx.publish()
+
+            def main_release(poll):
+                if poll == 1:
+                    fx.g('tag', 'v1.0.1', m)
+                    fx.publish()
+
+            rc, values, _ = run_snapshot(
+                fx,
+                runs=[[{'status': 'in_progress'}], [{'status': 'completed'}]],
+                on_poll=main_release,
+            )
+            self.assertEqual((rc, values['main'], values['target']), (0, m, t))
+            rc, text, stdout, _ = self.run_preview(fx, values['main'], values['target'])
+        self.assertEqual(rc, 0, text)
+        self.assertIn(
+            '### root: no release\n\nNo path root ships changed since `v1.0.1`, so it cuts no version.',
+            text,
+        )
+        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":""}')
+
+    def test_an_image_promotion_reaching_only_a_dev_rebuild_previews_no_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m = fx.commit(
+                'feat: init',
+                {
+                    'Dockerfile': 'FROM scratch\n',
+                    'main.go': 'package main\n',
+                    'cliff.toml': CLIFF_STABLE,
                 },
             )
             fx.g('tag', 'v1.0.0')
             fx.g('checkout', '-q', '-b', 'dev')
-            t = fx.commit('feat: add greeting (#7)', {'main.go': 'package main\n\n// hi\n'})
-            fx.g('tag', 'v1.1.0-dev.1')
+            fx.commit(f'{REBUILD_SUBJECT} (#5)', empty=True)
+            t = fx.commit('test: cover main', {'main_test.go': 'package main\n'})
             fx.publish()
-            summary = fx.work / 'summary.md'
-            args = promote.parse_args(
-                [
-                    '--work-dir',
-                    str(fx.work),
-                    'preview',
-                    '--repo',
-                    'demo',
-                    '--target',
-                    t,
-                    '--main',
-                    m,
-                ]
-            )
-            env = {'GITHUB_STEP_SUMMARY': str(summary), 'CLIFF_BIN': cliff_bin(), 'GH_TOKEN': 'x'}
-            with (
-                unittest.mock.patch.object(promote, 'CLONE_URL', fx.url()),
-                unittest.mock.patch.dict(os.environ, env),
-            ):
-                rc = promote.cmd_preview(args)
-            text = summary.read_text() if summary.exists() else ''
+            rc, text, stdout, _ = self.run_preview(fx, m, t)
         self.assertEqual(rc, 0, text)
-        self.assertIn('### root v1.1.0', text)
-        self.assertIn('Promoted from `v1.1.0-dev.1`', text)
-        self.assertIn('- Add greeting (#7)', text)
-        self.assertIn('compare/v1.0.0...v1.1.0', text)
+        self.assertIn('### root: no release', text)
+        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":""}')
+
+    def test_a_repository_with_no_release_lane_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m = fx.commit('feat: init', {'run.sh': 'echo hi\n', 'cliff.toml': CLIFF_STABLE})
+            fx.g('checkout', '-q', '-b', 'dev')
+            t = fx.commit('fix: say more', {'run.sh': 'echo hello\n'})
+            fx.publish()
+            rc, text, stdout, _ = self.run_preview(fx, m, t)
+        self.assertEqual(rc, 0, text)
+        self.assertIn('This repository has no release lane.', text)
+        self.assertEqual(self.plan_line(stdout), 'release-plan: {}')
+
+    def test_a_tool_output_missing_a_field_fails_the_preview_naming_it(self):
+        real = promote.run_tool
+
+        def run_tool(clone, script, *args, **env):
+            out = real(clone, script, *args, **env)
+            if script.name == 'release-state.sh' and args == ('pending',):
+                out.pop('state')
+            return out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m = self.go_main(fx)
+            fx.g('checkout', '-q', '-b', 'dev')
+            t = fx.commit('feat: add greeting', {'main.go': 'package main\n\n// hi\n'})
+            fx.publish()
+            rc, _, stdout, stderr = self.run_preview(fx, m, t, run_tool)
+        self.assertEqual(rc, 1)
+        self.assertIn('::error::preview: release-state.sh pending printed no state', stderr)
+        self.assertNotIn('release-plan:', stdout)
+
+    def test_a_malformed_state_fails_the_release_plan(self):
+        for state, why in (
+            ('{".": {"h_tag": "", "kind_note": "", "in_range": "yes"}}', 'malformed state'),
+            ('["."]', 'malformed state'),
+            ('{"."', 'malformed state'),
+        ):
+            with (
+                self.subTest(state=state),
+                unittest.mock.patch.object(promote, 'run_tool', return_value={'state': state}),
+                self.assertRaisesRegex(
+                    promote.GhError, f'^release-state.sh pending printed {why}$'
+                ),
+            ):
+                promote.release_plan(Path('.'), 'm', 'r', promote.Layout('go', [], []))
+
+    def test_a_malformed_module_list_fails_the_release_plan(self):
+        state = json.dumps({'.': {'h_tag': '', 'kind_note': '', 'in_range': False}})
+        for modules in ('"tools"', '[["tools"]]', '[{"x": 1}]', '["tools"]'):
+
+            def run_tool(clone, script, *args, modules=modules, **env):
+                if args == ('pending',):
+                    return {'state': state, 'root_in_range': 'false', 'in_range_any': 'false'}
+                if script.name == 'path-significance.sh':
+                    return {
+                        'root_changed': 'false',
+                        'subpackages_to_publish': '[]',
+                        'go_modules_to_release': modules,
+                    }
+                return {'anchor_sha': 'a' * 40, 'base': 'v0.1.0'}
+
+            with (
+                self.subTest(modules=modules),
+                unittest.mock.patch.object(promote, 'run_tool', run_tool),
+                self.assertRaisesRegex(promote.GhError, 'printed malformed go_modules_to_release$'),
+            ):
+                promote.release_plan(Path('.'), 'm', 'r', promote.Layout('go', [], []))
 
 
 class RestTransport(unittest.TestCase):

@@ -98,6 +98,7 @@ wf_inputs = yaml.safe_load(wf_text)[True]["workflow_call"]["inputs"]
 gates = {
     "meta-if": step_if("prepare", "Extract metadata"),
     "prepare-cosign-if": step_if("prepare", "Install Cosign"),
+    "promote-if": step_if("prepare", "Resolve promoted digest"),
     "prepare-cosign-order": prep.index("Install Cosign") < prep.index("Resolve promoted digest"),
     "prepare-cosign-uses": next(s for s in jobs["prepare"]["steps"] if s.get("name") == "Install Cosign")["uses"],
     "build-if": " ".join(str(jobs["build"]["if"]).split()),
@@ -332,6 +333,8 @@ chk_has "D-P8 no build for a promoted digest" "$(gate '."build-if"')" "needs.pre
 chk "D-P8 cosign reaches the digest walk on stable publishes only, before it runs" \
   "$(gate '."prepare-cosign-if"')|$(gate '."prepare-cosign-order"')" \
   "\${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' }}|true"
+chk "D-P8 a stable run that publishes nothing re-tags no promoted digest" "$(gate '."promote-if"')" \
+  "\${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' }}"
 chk "D-P9 the inputs carry the kind line and the security merges, no promotion note" \
   "$(gate '.inputs | map(select(test("note|security"))) | join(" ")')" "release-kind-note security-shas"
 chk "D-P10 the workflow says nothing of a soak" "$(gate '.soak')" "0"
