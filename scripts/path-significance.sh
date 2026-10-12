@@ -5,7 +5,8 @@
 #   go_modules_to_release and exclude_re to $GITHUB_OUTPUT, and a summary.
 # MODE=paths: env FROM TO REPO_TYPE SUBPACKAGES_JSON GO_LANES_JSON; the same
 #   keys plus `significant` (JSON array) on stdout. Tree diff FROM..TO only:
-#   no empty-commit rule, no lane tags, status 2 when the diff fails.
+#   no empty-commit rule, no lane tags. Exits 2 when the diff fails.
+# Either mode exits 2 on malformed directory JSON.
 set -euo pipefail
 
 MODE="${MODE:-release}"
@@ -19,6 +20,19 @@ esac
 note() {
   if [ "$MODE" = paths ]; then echo "::notice::$*" >&2; else echo "::notice::$*"; fi
 }
+die() {
+  echo "::error::path-significance: $*" >&2
+  exit 2
+}
+dirs_of() { # <name> <JSON> -> one dir per line; an empty <JSON> is no dirs
+  jq -r 'if type == "array" and all(.[]; type == "string") then .[] else error("not an array of strings") end' <<<"$2" \
+    || die "$1 must be a JSON array of dirs, got '$2'"
+}
+SUBPACKAGES=() GO_LANES=()
+DIRS=$(dirs_of SUBPACKAGES_JSON "${SUBPACKAGES_JSON:-}")
+[ -z "$DIRS" ] || mapfile -t SUBPACKAGES <<<"$DIRS"
+DIRS=$(dirs_of GO_LANES_JSON "${GO_LANES_JSON:-}")
+[ -z "$DIRS" ] || mapfile -t GO_LANES <<<"$DIRS"
 
 RANGE_START=""
 # Every diff counts both sides of a rename (--no-renames): a file leaving a
@@ -171,9 +185,12 @@ fi
 # neither releases. REBUILD_SUBJECT is rebuild-stale.sh's; test-path-significance.sh
 # holds the two equal.
 REBUILD_SUBJECT='fix(deps): rebuild against refreshed base packages'
-is_rebuild_commit() { # <commit>
-  [ -z "$(git diff-tree --root --no-commit-id --name-only -r "$1")" ] || return 1
-  case "$(git log -1 --format=%s "$1")" in
+is_rebuild_commit() { # <commit> -> 0 when it is a rebuild request, 1 when not; dies when git cannot read it
+  local files subject
+  files=$(git diff-tree --root --no-commit-id --name-only -r "$1") || die "cannot read the files commit $1 changes"
+  [ -z "$files" ] || return 1
+  subject=$(git log -1 --format=%s "$1") || die "cannot read the subject of commit $1"
+  case "$subject" in
     "$REBUILD_SUBJECT" | "$REBUILD_SUBJECT (#"*")") return 0 ;;
   esac
   note "commit $1 changes no file and is not a rebuild request, so it is not significant"
@@ -181,6 +198,7 @@ is_rebuild_commit() { # <commit>
 }
 EMPTY_COMMIT=""
 if [ -z "$SIGNIFICANT" ] && [ -n "$RANGE_START" ] && [ "${REPO_TYPE:-}" = docker ]; then
+  REVS=$(git rev-list --no-merges "$RANGE_START..$HEAD") || die "cannot list the commits of ${RANGE_START}..${HEAD}"
   while IFS= read -r c; do
     [ -z "$c" ] && continue
     if is_rebuild_commit "$c"; then
@@ -188,7 +206,7 @@ if [ -z "$SIGNIFICANT" ] && [ -n "$RANGE_START" ] && [ "${REPO_TYPE:-}" = docker
       note "commit ${c} is a rebuild request, so it counts as a significant root change"
       break
     fi
-  done < <(git rev-list --no-merges "$RANGE_START..$HEAD")
+  done <<<"$REVS"
 fi
 
 # package.json ships only as a published manifest (a declared TS subpackage's,
@@ -198,10 +216,12 @@ fi
 # (https://docs.npmjs.com/cli/v11/configuring-npm/package-json). Any other
 # package.json is dev tooling. With no BEFORE to compare, stay significant.
 if [ -n "$SIGNIFICANT" ] && echo "$SIGNIFICANT" | grep -qE '(^|/)package\.json$'; then
-  MANIFESTS=$(echo "$SUBPACKAGES_JSON" | jq -r '.[] | . + "/package.json"')
+  MANIFESTS=""
+  [ "${#SUBPACKAGES[@]}" -eq 0 ] || MANIFESTS=$(printf '%s/package.json\n' "${SUBPACKAGES[@]}")
   if [ "$REPO_TYPE" = "ts" ]; then
     MANIFESTS=$(printf '%s\npackage.json\n' "$MANIFESTS")
   fi
+  PKG_JSONS=$(grep -E '(^|/)package\.json$' <<<"$SIGNIFICANT")
   while IFS= read -r pj; do
     [ -z "$pj" ] && continue
     if ! printf '%s\n' "$MANIFESTS" | grep -qxF "$pj"; then
@@ -217,7 +237,7 @@ if [ -n "$SIGNIFICANT" ] && echo "$SIGNIFICANT" | grep -qE '(^|/)package\.json$'
         note "$pj changed only in devDependencies/overrides — not significant"
       fi
     fi
-  done < <(echo "$SIGNIFICANT" | grep -E '(^|/)package\.json$')
+  done <<<"$PKG_JSONS"
 fi
 
 # A path under a subpackage or a nested lane belongs to that one, never to
@@ -226,8 +246,6 @@ ROOT_CHANGED=false
 declare -A SUBPKG_CHANGED
 declare -A LANE_CHANGED
 declare -A LANE_ANCHOR
-mapfile -t SUBPACKAGES < <(echo "$SUBPACKAGES_JSON" | jq -r '.[]')
-mapfile -t GO_LANES < <(echo "$GO_LANES_JSON" | jq -r '.[]')
 for s in "${SUBPACKAGES[@]}"; do
   SUBPKG_CHANGED["$s"]=false
 done
@@ -235,30 +253,33 @@ done
 # A lane is measured from its own newest channel tag: the root anchor ignores
 # lane tags, so it predates a lane-only release. Same exact-regex nearest-tag
 # rule as compute.sh's nearest_tag, so detect and the lane job agree.
-lane_anchor() { # <dir> -> commit of the lane's channel tag nearest HEAD, or nothing
-  local esc re name obj peeled commit
+lane_anchor() { # <dir> -> commit of the lane's channel tag nearest HEAD, or nothing; fails when git cannot list the tags or walk HEAD
+  local esc re name obj peeled commit refs revs
   local -A tag_at=()
   esc=$(printf '%s' "$1" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
   re="^${esc}/v[0-9]+\\.[0-9]+\\.[0-9]+\$"
   if [ "$CHANNEL" = dev ]; then
     re="${re}|${re%\$}-dev\\.[0-9]+\$"
   fi
+  refs=$(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)') || return 1
   while read -r name obj peeled; do
     [[ $name =~ $re ]] || continue
     tag_at["${peeled:-$obj}"]="$name"
-  done < <(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)')
+  done <<<"$refs"
   [ "${#tag_at[@]}" -gt 0 ] || return 0
+  revs=$(git rev-list --topo-order "$HEAD") || return 1
   while read -r commit; do
-    if [ -n "${tag_at[$commit]:-}" ]; then
+    if [ -n "$commit" ] && [ -n "${tag_at[$commit]:-}" ]; then
       printf '%s' "$commit"
       return 0
     fi
-  done < <(git rev-list --topo-order "$HEAD")
+  done <<<"$revs"
 }
 for l in "${GO_LANES[@]}"; do
   LANE_CHANGED["$l"]=false
   if [ "$MODE" = release ]; then
-    LANE_ANCHOR["$l"]="$(lane_anchor "$l")"
+    anchor=$(lane_anchor "$l") || die "cannot read lane ${l}'s tags or the history of ${HEAD}"
+    LANE_ANCHOR["$l"]=$anchor
   else
     LANE_ANCHOR["$l"]=""
   fi

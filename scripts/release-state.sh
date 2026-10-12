@@ -28,6 +28,39 @@ die() {
 note() { echo "::notice::$*" >&2; }
 out() { printf '%s\n' "$@" >>"${GITHUB_OUTPUT:?}"; }
 
+# Each predicate below answers 0 or 1 and dies when git or jq cannot tell, so
+# an error never reads as "no". Inside $(…) a die ends only the substitution,
+# so a caller there checks the status.
+is_ancestor() { # <a> <b> -> 0 when a is an ancestor of b, 1 when not
+  local rc=0
+  git merge-base --is-ancestor "$1" "$2" || rc=$?
+  [ "$rc" -le 1 ] || die "git cannot tell whether ${1} is an ancestor of ${2}"
+  return "$rc"
+}
+has_commit() { # <commit> -> 0 when this checkout holds it, 1 when not
+  local rc=0
+  git rev-parse --verify --quiet "${1}^{commit}" >/dev/null || rc=$?
+  [ "$rc" -le 1 ] || die "git cannot tell whether this checkout holds ${1}"
+  return "$rc"
+}
+has_path() { # <commit> <path> -> 0 when the commit's tree holds the path, 1 when not
+  local entry
+  entry=$(git ls-tree --full-tree --name-only "$1" -- "$2") || die "git cannot read ${2} at ${1}"
+  [ -n "$entry" ]
+}
+in_list() { # <what the array is> <value> <JSON array> -> 0 when the array holds the value, 1 when not
+  local got
+  got=$(jq -n --arg v "$2" --argjson a "$3" '$a | if type == "array" then any(.[]; . == $v) else error("not an array") end') \
+    || die "cannot read ${1} '${3}' as a JSON array"
+  [ "$got" = true ]
+}
+is_promotion() { # <commit> -> 0 when it is a reconciliation commit, 1 when not
+  local rc=0
+  is_reconciliation "$1" || rc=$?
+  [ "$rc" -le 1 ] || die "cannot tell whether ${1} is a promotion commit"
+  return "$rc"
+}
+
 esc() { printf '%s' "$1" | sed -e 's/[][\.|(){}?+*^$]/\\&/g'; }
 lane_dir() { if [ "$1" = . ]; then printf ''; else printf '%s' "$1"; fi; }
 stable_re() { # <key>
@@ -106,8 +139,8 @@ nearest_dev_tag() { # <commit> <key> -> the highest dev tag of the lane on the c
 
 # A lane is affected by R when R's diff from its first parent changes a path the
 # lane ships (path-significance.sh MODE=paths; TS subpackages share the root).
-affects() { # <R> <key>
-  local res
+affects() { # <R> <key>; dies when path-significance.sh fails or answers no lane list
+  local res mods
   res=$(MODE=paths FROM="$1^1" TO="$1" bash "$TOOLS/path-significance.sh") \
     || die "path significance of ${1}^1..${1} failed"
   if [ "$2" = . ]; then
@@ -116,10 +149,11 @@ affects() { # <R> <key>
     fi
     [ "$(sed -n 's/^subpackages_to_publish=//p' <<<"$res")" != '[]' ]
   else
-    sed -n 's/^go_modules_to_release=//p' <<<"$res" | jq -e --arg l "$2" 'index($l) != null' >/dev/null
+    mods=$(sed -n 's/^go_modules_to_release=//p' <<<"$res")
+    in_list "go_modules_to_release of ${1}^1..${1}" "$2" "$mods"
   fi
 }
-newest_affecting() { # <from> <to> <key> -> the newest reconciliation of from..to that affected the lane; fails when reconciliations_in does
+newest_affecting() { # <from> <to> <key> -> the newest reconciliation of from..to that affected the lane; fails when reconciliations_in or affects does
   local c found="" recs
   recs=$(reconciliations_in "$1" "$2") || return 1
   while IFS= read -r c; do
@@ -165,17 +199,17 @@ cmd_pending() {
     h_tag=${h% *} h_commit=${h#* }
     # Same refusal as compute.sh's: a stable run behind its lane's highest
     # stable tag is older than a published release.
-    if [ "$CHANNEL" = stable ] && [ -n "$h_commit" ] && ! git merge-base --is-ancestor "$h_commit" "$head"; then
+    if [ "$CHANNEL" = stable ] && [ -n "$h_commit" ] && ! is_ancestor "$h_commit" "$head"; then
       die "lane ${key}: the highest stable tag ${h_tag} is on ${h_commit}, which HEAD does not contain, so an older commit is not published above it"
     fi
-    r=$(newest_affecting "$h_commit" "$main" "$key") || die "cannot list lane ${key}'s promotions on ${main}"
+    r=$(newest_affecting "$h_commit" "$main" "$key") || die "cannot tell which of lane ${key}'s promotions on ${main} is pending"
     in_range=false kind="" repair_kind=""
     if [ "$CHANNEL" = stable ]; then
       [ -z "$r" ] || in_range=true
       kind=$(kind_note "$head" "$r" "$key") || die "cannot find lane ${key}'s promoted dev build for its kind line"
       if [ -n "$h_tag" ]; then
         prev=$(highest_stable "$key" "$(core "$h_tag")") || die "cannot read lane ${key}'s stable tags"
-        prev_r=$(newest_affecting "${prev#* }" "$h_commit" "$key") || die "cannot list lane ${key}'s promotions up to ${h_tag}"
+        prev_r=$(newest_affecting "${prev#* }" "$h_commit" "$key") || die "cannot tell which of lane ${key}'s promotions up to ${h_tag} it published"
         repair_kind=$(kind_note "$h_commit" "$prev_r" "$key") || die "cannot find lane ${key}'s promoted dev build for its kind line"
       fi
     fi
@@ -244,7 +278,7 @@ cmd_publish() {
 # promotion re-tags.
 cmd_ahead() {
   local rc="${ROOT_CHANGED:-false}" subs="${SUBPACKAGES_TO_PUBLISH:-[]}" mods="${GO_MODULES_TO_RELEASE:-[]}"
-  local kept='[]' l s h c name _c res devs lanes
+  local kept='[]' l s h c name _c res devs lanes mods_past
   [ "${CHANNEL:-}" = dev ] || die "ahead narrows a dev run, but this run is on the '${CHANNEL:-}' channel"
   ships_past_stable() { # <key> -> 1 only when the lane has a stable tag, no dev tag above it, and HEAD ships its code
     s=$(highest_stable "$1") || die "cannot read lane ${1}'s stable tags"
@@ -262,7 +296,8 @@ cmd_ahead() {
       grep -qx 'root_changed=true' <<<"$res" && return 0
       [ "$(sed -n 's/^subpackages_to_publish=//p' <<<"$res")" = '[]' ] || return 0
     else
-      sed -n 's/^go_modules_to_release=//p' <<<"$res" | jq -e --arg l "$1" 'index($l) != null' >/dev/null && return 0
+      mods_past=$(sed -n 's/^go_modules_to_release=//p' <<<"$res")
+      in_list "go_modules_to_release of ${h}..HEAD" "$1" "$mods_past" && return 0
     fi
     note "lane ${1}: HEAD ships the code of ${h}, so this run cuts no dev build of it"
     return 1
@@ -305,7 +340,7 @@ cmd_number() {
 subpackages_at() { # <commit> -> JSON array of the first-level dirs carrying a jsr.json at <commit>
   local d
   git ls-tree -d --name-only "$1" | while IFS= read -r d; do
-    if git cat-file -e "$1:$d/jsr.json" 2>/dev/null; then printf '%s\n' "$d"; fi
+    if has_path "$1" "$d/jsr.json"; then printf '%s\n' "$d"; fi
   done | jq -Rsc 'split("\n") | map(select(. != ""))'
 }
 # TS subpackages share the root version and publish after the root tag, so a
@@ -490,10 +525,10 @@ verified_at() { # <image@digest> <commit> <signature|sbom>: 0 when docker-releas
 # A stable tag published before its repository released from dev may be
 # served by a build signed at a later first-parent commit that re-pushed the
 # tag, so the window runs from the tag's commit up to the lane's next stable tag.
-publishing_window() { # <tag> <commit> -> the tag's commit, then each later commit that may have re-pushed the tag; fails when the ancestry-path walk or a later commit's tag list fails
+publishing_window() { # <tag> <commit> -> the tag's commit, then each later commit that may have re-pushed the tag; fails when git cannot tell the commit's ancestry, or the ancestry-path walk or a later commit's tag list fails
   local c name revs names
   printf '%s\n' "$2"
-  git merge-base --is-ancestor "$2" HEAD || return 0
+  is_ancestor "$2" HEAD || return 0
   revs=$(git rev-list --first-parent --ancestry-path --reverse "$2..HEAD") || return 1
   while IFS= read -r c; do
     [ -n "$c" ] || continue
@@ -563,7 +598,7 @@ cmd_complete() { # <image@digest> <source commit>
 signing_window() { # <tag> -> the commits whose docker-release.yaml run may have signed the tag's image, in the order to try
   local commit
   commit=$(git rev-list -n1 "$1") || die "no tag ${1} in this checkout"
-  if is_reconciliation "$commit"; then
+  if is_promotion "$commit"; then
     bash "$TOOLS/promote-digest.sh" --sources "${commit}^2" || return 1
   else
     bash "$TOOLS/promote-digest.sh" --sources "$commit" || return 1
@@ -580,8 +615,11 @@ release_digest() { # <tag> -> the digest the tag's release published: R's Promot
   local commit want
   : "${IMAGE:?}"
   commit=$(git rev-list -n1 "$1") || die "no tag ${1} in this checkout"
-  if is_reconciliation "$commit"; then
-    promoted_digest "$commit" || die "${1} is on the promotion ${commit}, which carries no root Promoted-Digest"
+  if is_promotion "$commit"; then
+    promoted_digest "$commit" || case $? in
+      1) die "${1} is on the promotion ${commit}, which carries no root Promoted-Digest" ;;
+      *) die "cannot read the Promoted-Digest trailers of ${1}'s promotion ${commit}" ;;
+    esac
   else
     want=$(ghcr_digest "$IMAGE" "$1")
     [ -n "$want" ] || die "ghcr.io/${IMAGE}:${1} does not exist"
@@ -592,7 +630,7 @@ readback_image() { # <tag>
   local tag=$1 commit want dash window
   commit=$(git rev-list -n1 "$tag") || die "no tag ${tag} in this checkout"
   want=$(release_digest "$tag") || exit 1
-  if is_reconciliation "$commit"; then
+  if is_promotion "$commit"; then
     cmd_provenance "ghcr.io/${IMAGE}@${want}" "$(git rev-parse "${commit}^2")"
   else
     window=$(signing_window "$tag") || die "cannot tell which commits could have signed ${tag}'s image"
@@ -603,7 +641,7 @@ readback_image() { # <tag>
   if [[ ${REGISTRIES:-} == *dockerhub* ]]; then
     answers "docker.io/${IMAGE}:${tag} at ${want}" serves "$want" hub_digest "$IMAGE" "$tag" || return 1
   fi
-  git cat-file -e "${commit}:grafana-dashboard.json" 2>/dev/null || return 0
+  has_path "$commit" grafana-dashboard.json || return 0
   dash=$(ghcr_digest "${IMAGE}/dashboard" "$tag" application/vnd.oci.image.manifest.v1+json)
   window=$(window_order "$tag" "$commit") || die "cannot tell which commits could have signed ${tag}'s dashboard"
   if [ -z "$dash" ] || ! signed_in_window "ghcr.io/${IMAGE}/dashboard@${dash}" "$window"; then
@@ -650,7 +688,7 @@ has_dev_above() { # <key> <X.Y.Z> -> 0 when a published dev build of the lane on
   tags=$(tags_of "$(dev_re "$1")") || die "cannot read lane ${1}'s dev tags"
   while read -r name c; do
     [ -n "$name" ] || continue
-    if gt "$(core "$name")" "$2" && git merge-base --is-ancestor "$c" refs/remotes/origin/dev && dev_published "$1" "$name"; then
+    if gt "$(core "$name")" "$2" && is_ancestor "$c" refs/remotes/origin/dev && dev_published "$1" "$name"; then
       return 0
     fi
   done <<<"$tags"
@@ -661,7 +699,7 @@ built_past() { # <key> <T> -> 0 when dev's history holds a dev build of the lane
   tags=$(tags_of "$(dev_re "$1")") || die "cannot read lane ${1}'s dev tags"
   while read -r name c; do
     [ -n "$name" ] || continue
-    if git merge-base --is-ancestor "$c" refs/remotes/origin/dev && ! git merge-base --is-ancestor "$c" "$2"; then
+    if is_ancestor "$c" refs/remotes/origin/dev && ! is_ancestor "$c" "$2"; then
       return 0
     fi
   done <<<"$tags"
@@ -714,12 +752,13 @@ untagged_past() { # <key> <T> -> a dev commit past T whose build is published un
         || return 1
       while IFS= read -r c; do
         [ -n "$c" ] || continue
-        if ! git merge-base --is-ancestor "$c" refs/remotes/origin/dev 2>/dev/null \
-          || git merge-base --is-ancestor "$c" "$2"; then
+        # npm's gitHead may name a commit this checkout never fetched.
+        has_commit "$c" || continue
+        if ! is_ancestor "$c" refs/remotes/origin/dev || is_ancestor "$c" "$2"; then
           continue
         fi
         at=$(tags_at "$c" "$1") || return 1
-        if [ -z "$at" ] && { [ -z "$newest" ] || ! git merge-base --is-ancestor "$c" "$newest"; }; then
+        if [ -z "$at" ] && { [ -z "$newest" ] || ! is_ancestor "$c" "$newest"; }; then
           printf '%s' "$c"
           return 0
         fi
@@ -744,15 +783,20 @@ promoted_subpackages() { # <R> -> JSON array of the subpackages R's promotion pu
     bash "$TOOLS/path-significance.sh") || return 1
   sed -n 's/^subpackages_to_publish=//p' <<<"$res"
 }
-last_change() { # <ref> <dir> -> the newest first-parent commit of ref whose own diff changes what the subpackage ships; fails when git cannot walk ref
-  local c from res revs
+last_change() { # <ref> <dir> -> the newest first-parent commit of ref whose own diff changes what the subpackage ships; fails when git cannot walk ref or read a commit's diff
+  local c from res revs subs
   revs=$(git rev-list --first-parent "$1" -- "$2") || return 1
   while IFS= read -r c; do
     [ -n "$c" ] || continue
-    from=$(git rev-parse --verify --quiet "${c}^1") || from=$(git hash-object -t tree /dev/null)
+    if has_commit "${c}^1"; then
+      from="${c}^1"
+    else
+      from=$(git hash-object -t tree /dev/null) || return 1
+    fi
     res=$(MODE=paths FROM="$from" TO="$c" SUBPACKAGES_JSON="$(jq -cn --arg d "$2" '[$d]')" GO_LANES_JSON='[]' \
       bash "$TOOLS/path-significance.sh") || return 1
-    if sed -n 's/^subpackages_to_publish=//p' <<<"$res" | jq -e --arg d "$2" 'index($d) != null' >/dev/null; then
+    subs=$(sed -n 's/^subpackages_to_publish=//p' <<<"$res")
+    if in_list "subpackages_to_publish of ${from}..${c}" "$2" "$subs"; then
       printf '%s' "$c"
       return 0
     fi
@@ -773,9 +817,9 @@ sub_dev_heads() { # <dir> <commit> -> "<version> <gitHead>" per -dev.N version n
 # A subpackage's dev build is complete once npm serves a -dev.N version
 # published from its newest change on dev or a descendant on dev. With T, a
 # change past T must also rank above V, as a root build past T must.
-sub_dev_state() { # <dir> <T or ''> <V> -> "ok", "incomplete <change>" or "below <change>"
+sub_dev_state() { # <dir> <T or ''> <V> -> "ok", "incomplete <change>" or "below <change>"; fails when git or npm cannot tell
   local dir=$1 t=$2 v=$3 l heads ver head complete=false above=false
-  git cat-file -e "refs/remotes/origin/dev:${dir}/package.json" 2>/dev/null || {
+  has_path refs/remotes/origin/dev "${dir}/package.json" || {
     echo ok
     return 0
   }
@@ -787,14 +831,16 @@ sub_dev_state() { # <dir> <T or ''> <V> -> "ok", "incomplete <change>" or "below
   heads=$(sub_dev_heads "$dir" refs/remotes/origin/dev) || return 1
   while read -r ver head; do
     [ -n "$head" ] || continue
-    git merge-base --is-ancestor "$l" "$head" 2>/dev/null || continue
-    git merge-base --is-ancestor "$head" refs/remotes/origin/dev 2>/dev/null || continue
+    # npm's gitHead may name a commit this checkout never fetched.
+    has_commit "$head" || continue
+    is_ancestor "$l" "$head" || continue
+    is_ancestor "$head" refs/remotes/origin/dev || continue
     complete=true
     if gt "$(core "$ver")" "$(core "$v")"; then above=true; fi
   done <<<"$heads"
   if [ "$complete" = false ]; then
     echo "incomplete $l"
-  elif [ -z "$t" ] || git merge-base --is-ancestor "$l" "$t" || [ "$above" = true ]; then
+  elif [ -z "$t" ] || is_ancestor "$l" "$t" || [ "$above" = true ]; then
     echo ok
   else
     echo "below $l"
@@ -1168,7 +1214,7 @@ cmd_renumber_subpackages() {
     st=$(sub_dev_state "$s" "$t" "${v:-v0.0.0}") || die "subpackage ${s}: cannot tell whether npm serves its newest dev build"
     [ "$st" != ok ] || continue
     c=${st#* }
-    if ! git merge-base --is-ancestor "$c" HEAD; then
+    if ! is_ancestor "$c" HEAD; then
       note "subpackage ${s}: dev's change ${c} is newer than the build ${d_tag}, so that change's own dev run publishes it"
       continue
     fi

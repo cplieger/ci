@@ -97,6 +97,39 @@ paths() {
     "$(sed -n 's/^go_modules_to_release=//p' "$WORK/pout")" "$(sed -n 's/^significant=//p' "$WORK/pout")"
 }
 
+# A git whose call FAIL_GIT_N among those whose argv matches the glob FAIL_GIT
+# alone fails; git_calls is how many matched.
+GIT_FAIL="$WORK/git-fail"
+mkdir -p "$GIT_FAIL"
+cat >"$GIT_FAIL/git" <<SH
+#!/usr/bin/env bash
+if [[ "\$*" == \${FAIL_GIT:?} ]]; then
+  n=\$((\$(cat "$GIT_FAIL/n" 2>/dev/null || echo 0) + 1))
+  echo "\$n" >"$GIT_FAIL/n"
+  [ "\$n" -ne "\${FAIL_GIT_N:?}" ] || { echo "stub: git \$* fails" >&2; exit 92; }
+fi
+exec "$(command -v git)" "\$@"
+SH
+chmod 755 "$GIT_FAIL/git"
+git_calls() { cat "$GIT_FAIL/n" 2>/dev/null || echo 0; }
+# failing_release <argv glob> <N> <channel> <before> <anchor> <head> -> root|subs|lanes, or EXIT=n|matching git calls
+failing_release() {
+  rm -f "$GIT_FAIL/n"
+  export CHANNEL="$3" BEFORE="$4" ANCHOR_SHA="$5" HEAD="$6"
+  FAIL_GIT="$1" FAIL_GIT_N="$2" PATH="$GIT_FAIL:$PATH" run_release "$WORK/changes.sh"
+  if grep -q '^EXIT=' "$WORK/log"; then
+    echo "$(sed -n 's/^EXIT=//p' "$WORK/log" | tail -1)|$(git_calls)"
+  else
+    printf '%s|%s|%s' "$(sed -n 's/^root_changed=//p' "$WORK/out")" \
+      "$(sed -n 's/^subpackages_to_publish=//p' "$WORK/out")" "$(sed -n 's/^go_modules_to_release=//p' "$WORK/out")"
+  fi
+}
+paths_rc() { # <from> <to> -> the MODE=paths exit status; stderr in $WORK/perr
+  local rc=0
+  MODE=paths FROM="$1" TO="$2" bash "$TOOLS/path-significance.sh" >"$WORK/pout" 2>"$WORK/perr" || rc=$?
+  echo "$rc"
+}
+
 # ── A docker repo: docs, lockfile, package.json, empty commit, dispatch ──────
 export REPO_TYPE=docker SUBPACKAGES_JSON='[]' GO_LANES_JSON='[]'
 newrepo docker
@@ -126,6 +159,12 @@ chk "S4 an empty machine commit is no root change" "$(release S4s stable "$D3" "
 chk_has "S4 and says why" "$(cat "$WORK/log")" "commit $D3S changes no file and is not a rebuild request, so it is not significant"
 D3R=$(commit "$REBUILD_SUBJECT")
 chk "S4 rebuild-stale.sh's empty commit is a root change" "$(release S4u stable "$D3S" "$D3S" "$D3R")" "true|[]|[]"
+chk "S27 a range git cannot list for a rebuild request fails the step" \
+  "$(failing_release 'rev-list --no-merges *' 1 stable "$D3S" "$D3S" "$D3R")" "2|1"
+chk_has "S27 and says so" "$(cat "$WORK/log")" "path-significance: cannot list the commits of ${D3S}..${D3R}"
+chk "S27 as does a rebuild request whose subject git cannot read" \
+  "$(failing_release "log -1 --format=%s $D3R" 1 stable "$D3S" "$D3S" "$D3R")" "2|1"
+chk_has "S27 and says so" "$(cat "$WORK/log")" "path-significance: cannot read the subject of commit $D3R"
 D4=$(commit "${REBUILD_SUBJECT} (#41)")
 chk "S4 so is its squash" "$(release S4 stable "$D3R" "$D3R" "$D4")" "true|[]|[]"
 chk_has "S4 the summary names it" "$(cat "$WORK/summary")" "(commit $D4 changes no file and counts as a root change)"
@@ -181,6 +220,23 @@ chk "S11t the Socket config and test-only inputs ship nothing" "$(paths "$D8" "$
 put web/api-surface.json '{}'
 D10=$(commit "feat(web): a nested api-surface.json")
 chk "S11t a nested api-surface.json is not the root test snapshot" "$(paths "$D9" "$D10")" 'true|[]|[]|["web/api-surface.json"]'
+put README.md 'docs, under the rebuild subject'
+D11=$(commit "$REBUILD_SUBJECT")
+chk "S27 a commit under the rebuild subject that changes a file is no rebuild request" \
+  "$(release S27f stable "$D10" "$D10" "$D11")" "false|[]|[]"
+chk "S27 and one whose files git cannot read fails the step" \
+  "$(failing_release "diff-tree --root --no-commit-id --name-only -r $D11" 1 stable "$D10" "$D10" "$D11")" "2|1"
+chk_has "S27 and says so" "$(cat "$WORK/log")" "path-significance: cannot read the files commit $D11 changes"
+chk "S28 a subpackage list that is not JSON fails" "$(SUBPACKAGES_JSON='["web"' paths_rc "$D10" "$D11")" "2"
+chk_has "S28 and says so" "$(cat "$WORK/perr")" "path-significance: SUBPACKAGES_JSON must be a JSON array of dirs, got '[\"web\"'"
+chk "S28 as does one that is not an array of dirs" "$(SUBPACKAGES_JSON='"web"' paths_rc "$D10" "$D11")" "2"
+chk "S28 and a lane list that is not JSON" "$(GO_LANES_JSON='{"a":1}' paths_rc "$D10" "$D11")" "2"
+chk_has "S28 and says so" "$(cat "$WORK/perr")" "path-significance: GO_LANES_JSON must be a JSON array of dirs, got '{\"a\":1}'"
+chk "S28 an empty subpackage list is none" "$(SUBPACKAGES_JSON='' paths "$D9" "$D10")" 'true|[]|[]|["web/api-surface.json"]'
+chk "S28 as is an unset one, when a package.json changed" "$(
+  unset SUBPACKAGES_JSON
+  paths "$D2" "$D3"
+)" 'false|[]|[]|[]'
 
 # ── A ts repo: the root package.json is the published manifest ───────────────
 export REPO_TYPE=ts
@@ -253,6 +309,11 @@ H6=$(commit "fix(yamlenv): after the lane tag")
 chk "S23 a tagged lane is measured from its own tag, an untagged one from the root range" \
   "$(release S23 stable "$H0" "$H0" "$H6")" 'true|["web"]|["yamlenv","tools/gen"]'
 chk_has "S23 and names that tag's commit" "$(cat "$WORK/log")" "lane yamlenv: deriving changed paths from ${H5}..HEAD"
+chk "S29 a lane whose tags git cannot list fails the step" \
+  "$(failing_release 'for-each-ref refs/tags *' 1 stable "$H0" "$H0" "$H6")" "2|1"
+chk_has "S29 and names the lane" "$(cat "$WORK/log")" "path-significance: cannot read lane yamlenv's tags or the history of $H6"
+chk "S29 as does a history git cannot walk to the lane's tag" \
+  "$(failing_release "rev-list --topo-order $H6" 1 stable "$H0" "$H0" "$H6")" "2|1"
 git mv tools/gen/g.go g_moved.go
 H7=$(commit "refactor: move a lane file to the root")
 chk "S24 MODE=paths counts a file leaving a lane against that lane" "$(paths "$H6" "$H7")" \

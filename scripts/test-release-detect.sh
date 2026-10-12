@@ -687,6 +687,23 @@ failing_git() { # <argv glob> <N> <command...>
   FAIL_GIT="$1" FAIL_GIT_N="$2" PATH="$GIT_FAIL:$PATH" "${@:3}"
 }
 git_calls() { cat "$GIT_FAIL/n" 2>/dev/null || echo 0; }
+# The same for jq: call FAIL_JQ_N among those whose argv matches FAIL_JQ fails.
+JQ_FAIL="$WORK/jq-fail"
+mkdir -p "$JQ_FAIL"
+cat >"$JQ_FAIL/jq" <<SH
+#!/usr/bin/env bash
+if [[ "\$*" == \${FAIL_JQ:?} ]]; then
+  n=\$((\$(cat "$JQ_FAIL/n" 2>/dev/null || echo 0) + 1))
+  echo "\$n" >"$JQ_FAIL/n"
+  [ "\$n" -ne "\${FAIL_JQ_N:?}" ] || { echo "stub: jq \$* fails" >&2; exit 5; }
+fi
+exec "$(command -v jq)" "\$@"
+SH
+chmod 755 "$JQ_FAIL/jq"
+failing_jq() { # <argv glob> <N> <command...>
+  rm -f "$JQ_FAIL/n"
+  FAIL_JQ="$1" FAIL_JQ_N="$2" PATH="$JQ_FAIL:$PATH" "${@:3}"
+}
 
 chk "P0 R1 has the reconciliation shape" "$(. "$ROOT/scripts/reconciliation.sh" && cd "$O" && is_reconciliation "$R1" && echo yes)" "yes"
 s=$(pending_at "$O" stable)
@@ -733,11 +750,15 @@ chk "P16 a lane list that is not JSON stops the run" \
   "refused"
 chk_has "P16 and says so" "$(cat "$WORK/pending.log")" "is not a JSON array of lane dirs"
 chk "P17 a promotion list git cannot read stops the run" "$(pending_git_failing 'rev-parse --verify --quiet *' 1)|$(git_calls)" "refused|1"
-chk_has "P17 and names the lane" "$(cat "$WORK/pending.log")" "cannot list lane .'s promotions on HEAD"
+chk_has "P17 and names the lane" "$(cat "$WORK/pending.log")" "cannot tell which of lane .'s promotions on HEAD is pending"
 # C0 is checked once for main's promotions past v1.0.0, then once for those up to it.
 chk "P18 so does a promotion list git cannot read up to the stable tag" \
   "$(pending_git_failing "rev-parse --verify --quiet ${C0}^{commit}" 2)|$(git_calls)" "refused|2"
-chk_has "P18 and names the tag" "$(cat "$WORK/pending.log")" "cannot list lane .'s promotions up to v1.0.0"
+chk_has "P18 and names the tag" "$(cat "$WORK/pending.log")" "cannot tell which of lane .'s promotions up to v1.0.0 it published"
+chk "P19 a highest stable tag whose ancestry git cannot tell stops the run" \
+  "$(pending_git_failing 'merge-base --is-ancestor *' 1)|$(git_calls)" "refused|1"
+chk_has "P19 and says git cannot tell, not that HEAD lacks it" "$(cat "$WORK/pending.log")" \
+  "git cannot tell whether $C0 is an ancestor of $S1"
 
 W="$WORK/work"
 git clone -q "$O" "$W"
@@ -786,6 +807,11 @@ chk "P7 and the root's kind line is the main-built one" "$(outkey root_kind_note
   'Built from `main` for dependency and system-package updates'
 chk "P8 a nested-only R is the lane's pending promotion" "$(lane yamlenv commit "$s")|$(lane yamlenv in_range "$s")" "$R2|true"
 chk "P8 with the lane's dev build in its kind line" "$(lane yamlenv kind_note "$s")" 'Promoted from `yamlenv/v1.0.1-dev.1`'
+got=$( (cd "$O" && failing_jq '*--arg ? yamlenv *' 4 env CHANNEL=stable GITHUB_OUTPUT="$WORK/out" bash "$RS" pending) >"$WORK/pending.log" 2>&1 \
+  && echo ran || echo refused)
+chk "P20 a lane list jq cannot read for the lane's promotion stops the run, not read as unaffected" "$got" "refused"
+chk_has "P20 naming what it could not read" "$(cat "$WORK/pending.log")" "cannot read go_modules_to_release of ${R2}^1..${R2} '[\"yamlenv\"]' as a JSON array"
+chk_has "P20 and the lane" "$(cat "$WORK/pending.log")" "cannot tell which of lane yamlenv's promotions on HEAD is pending"
 s=$(number "$s")
 chk "N3 a fixes-only lane promotion is numbered the next lane minor" "$(lane yamlenv version "$s")" "yamlenv/v1.1.0"
 chk "N3 and the root gets no version" "$(outkey root_version)" ""
@@ -940,6 +966,9 @@ commit_in "$K" "feat: root api" main.go=v2 >/dev/null
 chk "A7 a shipped root change past the stable builds" "$(ahead_at go true '[]' '["yamlenv"]')" 'true|[]|[]'
 commit_in "$K" "feat(yamlenv): anchors" yamlenv/y.go=v3 >/dev/null
 chk "A8 a shipped lane change past its stable builds" "$(ahead_at go true '[]' '["yamlenv"]')" 'true|[]|["yamlenv"]'
+chk "A17 a lane list jq cannot read stops the run, not dropping the lane's build" \
+  "$(failing_jq '*--arg ? yamlenv *' 3 ahead_at go true '[]' '["yamlenv"]')" "EXIT=1"
+chk_has "A17 naming what it could not read" "$(cat "$WORK/ahead.log")" "cannot read go_modules_to_release of yamlenv/v1.0.1..HEAD"
 git -C "$K" tag -d yamlenv/v1.0.0 yamlenv/v1.0.1 >/dev/null
 git -C "$K" tag -d v1.0.0 v1.0.1 >/dev/null
 git -C "$K" checkout -q --detach dev~2
@@ -1147,6 +1176,17 @@ chk "R27 as is a main history git cannot walk" \
 chk_has "R27 and says so" "$(cat "$WORK/readback.log")" "cannot tell which commits could have signed v1.1.0's image"
 git -C "$O" tag -d v1.2.0 >/dev/null
 echo "$IMG_A $S1" >"$COSIGN_DIR/signed"
+chk "R29 a tag commit whose ancestry git cannot tell is refused, not read as off main" \
+  "$(failing_git 'merge-base --is-ancestor *' 1 readback docker v1.1.0)|$(git_calls)" "refused|1"
+chk_has "R29 and says git cannot tell" "$(cat "$WORK/readback.log")" "git cannot tell whether $S1 is an ancestor of HEAD"
+# The release digest, the signature check and the signing window each ask
+# whether the tag's commit is a promotion.
+chk "R29 as is a tag commit git cannot tell is a promotion, for its digest" \
+  "$(failing_git 'rev-list --parents -n1 *' 1 readback docker v1.1.0)|$(git_calls)" "refused|1"
+chk_has "R29 and says so" "$(cat "$WORK/readback.log")" "cannot tell whether $S1 is a promotion commit"
+chk "R29 for its signature" "$(failing_git 'rev-list --parents -n1 *' 2 readback docker v1.1.0)|$(git_calls)" "refused|2"
+chk "R29 and for its signing window" "$(failing_git 'rev-list --parents -n1 *' 3 readback docker v1.1.0)|$(git_calls)" "refused|3"
+chk_has "R29 and says so" "$(cat "$WORK/readback.log")" "cannot tell whether $S1 is a promotion commit"
 echo 1 >"$COSIGN_DIR/flaky"
 chk "R15 a transient cosign failure at the signing commit is retried" "$(readback docker v1.1.0)" "ok"
 chk "R15 by asking that commit again" "$(grep -c -- "-sha $S1 " "$COSIGN_DIR/log")" "2"
@@ -1221,6 +1261,13 @@ echo "$IMG_E $PT" >"$COSIGN_DIR/attested"
 PC=$(commit_in "$P" "chore(sync): update shared files" .editorconfig=x)
 printf '%s\n' "$DASH $PC" "$IMG_E $PT" >"$COSIGN_DIR/signed"
 chk "R13 a dashboard re-pushed from a later main commit reads back" "$(RB_DIR=$P readback docker v2.0.0)" "ok"
+chk "R30 a dashboard file git cannot read is refused, not read as absent" \
+  "$(RB_DIR=$P failing_git '* *grafana-dashboard.json' 1 readback docker v2.0.0)|$(git_calls)" "refused|1"
+chk_has "R30 and says so" "$(cat "$WORK/readback.log")" "git cannot read grafana-dashboard.json at $PR"
+chk "R30 as are a promotion's trailers git cannot read" \
+  "$(RB_DIR=$P failing_git 'interpret-trailers --parse' 1 readback docker v2.0.0)|$(git_calls)" "refused|1"
+chk_has "R30 naming the trailers, not a missing trailer" "$(cat "$WORK/readback.log")" \
+  "cannot read the Promoted-Digest trailers of v2.0.0's promotion $PR"
 chk "R27 a dashboard whose window git cannot list the tags of is refused" \
   "$(RB_DIR=$P failing_git 'tag --points-at *' 1 readback docker v2.0.0)|$(git_calls)" "refused|1"
 chk_has "R27 and says it cannot tell" "$(cat "$WORK/readback.log")" "cannot tell which commits could have signed v2.0.0's dashboard"
@@ -1466,6 +1513,26 @@ echo "https://registry.npmjs.org/@o/app {\"versions\":{\"1.0.0-dev.4\":{\"gitHea
 out_b=$(REPO_TYPE=ts barrier)
 chk "B19 an npm dev version published from a commit past T with no tag holds the publish" "$out_b|$(dispatched)" "EXIT=1|0"
 chk_has "B19 naming that commit" "$(cat "$WORK/barrier.log")" "lane .: dev's build of $D3 is published with no dev tag"
+chk "B35 an npm build whose ancestry on dev git cannot tell holds the publish, not read as off dev" \
+  "$(REPO_TYPE=ts failing_git 'merge-base --is-ancestor *' 1 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
+chk_has "B35 and says git cannot tell" "$(cat "$WORK/barrier.log")" "git cannot tell whether $D3 is an ancestor of refs/remotes/origin/dev"
+chk "B35 as does one whose ancestry to the promoted commit git cannot tell" \
+  "$(REPO_TYPE=ts failing_git 'merge-base --is-ancestor *' 2 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|2"
+chk_has "B35 and says so" "$(cat "$WORK/barrier.log")" "git cannot tell whether $D3 is an ancestor of $D1"
+chk "B35 or the commit npm names, when git cannot tell whether the checkout holds it" \
+  "$(REPO_TYPE=ts failing_git "rev-parse --verify --quiet ${D3}^{commit}" 1 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
+chk_has "B35 and says so" "$(cat "$WORK/barrier.log")" "git cannot tell whether this checkout holds $D3"
+git -C "$O" tag v1.1.0-dev.9 "$D2"
+got=$(REPO_TYPE=ts failing_git 'merge-base --is-ancestor *' 3 barrier)
+git -C "$O" tag -d v1.1.0-dev.9 >/dev/null
+git -C "$W" tag -d v1.1.0-dev.9 >/dev/null
+chk "B35 or its ancestry to the newest tagged build" "$got|$(git_calls)" "EXIT=1|3"
+chk_has "B35 and says so" "$(cat "$WORK/barrier.log")" "git cannot tell whether $D3 is an ancestor of $D2"
+cp "$CURL_DIR/docs" "$WORK/docs.saved"
+echo "https://registry.npmjs.org/@o/app {\"versions\":{\"1.1.0-dev.6\":{\"gitHead\":\"0123456789abcdef0123456789abcdef01234567\"}}}" >"$CURL_DIR/docs"
+out_b=$(REPO_TYPE=ts barrier)
+mv "$WORK/docs.saved" "$CURL_DIR/docs"
+chk "B35 an npm build from a commit this checkout lacks holds nothing" "$out_b|$(dispatched)" "|0"
 # Listings 1 and 2 find no tagged build on D3 or D2; 3 asks whether npm's D3 is tagged.
 chk "B19 a dev tag list git cannot read beside an untagged npm version holds the publish" \
   "$(REPO_TYPE=ts failing_tag_read 3 barrier)|$(dispatched)" "EXIT=1|0"
@@ -1569,6 +1636,19 @@ chk "B33 a promoted commit git cannot read for the rank check holds the publish"
 chk_has "B33 and names it" "$(cat "$WORK/barrier.log")" "lane .: cannot read the commit $R1 promoted"
 chk "B33 as does one after the renumber" "$(renumbered_git_failing 'rev-parse *^2' 5)" "EXIT=1|1|5"
 chk_has "B33 naming it" "$(cat "$WORK/barrier.log")" "lane .: cannot read the commit $R1 promoted"
+# Ancestry reads 1 to 4 are the build-past check's (D1's dev tag, then D3's),
+# 5 to 8 its repeat once no dev run is unfinished, 9 to 12 its repeat after the
+# renumber, and 13 the rank check of the build the renumber left.
+chk "B34 a dev build whose ancestry on dev git cannot tell holds the publish, not read as off dev" \
+  "$(renumbered_git_failing 'merge-base --is-ancestor *' 1)" "EXIT=1|0|1"
+chk_has "B34 and says git cannot tell" "$(cat "$WORK/barrier.log")" "git cannot tell whether $D1 is an ancestor of refs/remotes/origin/dev"
+chk "B34 as does one whose ancestry to the promoted commit git cannot tell" \
+  "$(renumbered_git_failing 'merge-base --is-ancestor *' 2)" "EXIT=1|0|2"
+chk_has "B34 and says so" "$(cat "$WORK/barrier.log")" "git cannot tell whether $D1 is an ancestor of $D1"
+chk "B34 and after the renumber, the rank of the build it left" \
+  "$(renumbered_git_failing 'merge-base --is-ancestor *' 13)" "EXIT=1|1|13"
+chk_has "B34 saying git cannot tell, not that no build ranks above" "$(cat "$WORK/barrier.log")" \
+  "git cannot tell whether $D3 is an ancestor of refs/remotes/origin/dev"
 make_hook success v1.2.0-dev.1
 out_b=$(barrier)
 chk "B6 a renumber that ranks dev above the version releases the hold" "$out_b|$(dispatched)" "|1"
@@ -2241,6 +2321,33 @@ xweb 1.1.0-dev.1 "$XW1"
 out_b=$(xbarrier "$XR1")
 chk "B20 a subpackage dev build of T's own change holds nothing and waits for no later run" \
   "$out_b|$(dispatched)|$(cat "$GH_DIR/runs-calls")" "|0|2"
+chk "B36 a subpackage manifest git cannot read on dev holds the publish, not read as absent" \
+  "$(failing_git '* refs/remotes/origin/dev*web/package.json' 1 xbarrier "$XR1")|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
+chk_has "B36 and says so" "$(cat "$WORK/barrier.log")" "git cannot read web/package.json at refs/remotes/origin/dev"
+chk "B36 as does a subpackage git cannot read in a promotion" \
+  "$(failing_git '* *web/jsr.json' 1 xbarrier "$XR1")|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
+chk_has "B36 and says so" "$(cat "$WORK/barrier.log")" "git cannot read web/jsr.json at $XR0"
+chk "B36 or the parent of its newest change" \
+  "$(failing_git "rev-parse --verify --quiet ${XW1}^1*" 1 xbarrier "$XR1")|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
+chk_has "B36 and says so" "$(cat "$WORK/barrier.log")" "git cannot tell whether this checkout holds ${XW1}^1"
+chk "B36 or the commit npm names for its dev build" \
+  "$(failing_git "rev-parse --verify --quiet ${XW1}^{commit}" 1 xbarrier "$XR1")|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
+chk_has "B36 and says so" "$(cat "$WORK/barrier.log")" "git cannot tell whether this checkout holds $XW1"
+# Ancestry reads 1 to 3: the change to npm's build, that build to dev, the change to T.
+chk "B36 or that build's ancestry from the change" \
+  "$(failing_git 'merge-base --is-ancestor *' 1 xbarrier "$XR1")|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
+chk_has "B36 and says git cannot tell" "$(cat "$WORK/barrier.log")" "git cannot tell whether $XW1 is an ancestor of $XW1"
+chk "B36 or its ancestry on dev" \
+  "$(failing_git 'merge-base --is-ancestor *' 2 xbarrier "$XR1")|$(dispatched)|$(git_calls)" "EXIT=1|0|2"
+chk_has "B36 and says so" "$(cat "$WORK/barrier.log")" "git cannot tell whether $XW1 is an ancestor of refs/remotes/origin/dev"
+chk "B36 or the change's ancestry to the promoted commit" \
+  "$(failing_git 'merge-base --is-ancestor *' 3 xbarrier "$XR1")|$(dispatched)|$(git_calls)" "EXIT=1|0|3"
+chk "B36 or a subpackage list jq cannot read for the newest change" \
+  "$(failing_jq '*--arg ? web *' 4 xbarrier "$XR1")|$(dispatched)" "EXIT=1|0"
+chk_has "B36 and says so" "$(cat "$WORK/barrier.log")" "cannot read subpackages_to_publish of ${XW1}^1..${XW1} '[\"web\"]' as a JSON array"
+xweb 1.0.0-dev.9 0123456789abcdef0123456789abcdef01234567 1.1.0-dev.1 "$XW1"
+out_b=$(xbarrier "$XR1")
+chk "B36 a dev build npm records from a commit this checkout lacks is passed over" "$out_b|$(dispatched)" "|0"
 echo "$NPM_WEB" >"$CURL_DIR/down"
 out_b=$(xbarrier "$XR1")
 rm "$CURL_DIR/down"
@@ -2333,6 +2440,10 @@ rsub() { # <checkout> -> the outputs, or EXIT=n
 xweb 1.1.0-dev.2 "$XW2"
 chk "U23 a subpackage below the pending version is published from the build under its newest dev tag" \
   "$(rsub "$XW2")" 'version=v1.2.0-dev.1 dirs=["web"] '
+# Ancestry reads 1 to 3 are the subpackage's state, 4 the change's to the build.
+chk "U28 a change whose ancestry to the build git cannot tell publishes nothing, not read as newer" \
+  "$(failing_git 'merge-base --is-ancestor *' 4 rsub "$XW2")|$(git_calls)" "EXIT=1|4"
+chk_has "U28 and says git cannot tell" "$(cat "$WORK/rsub.log")" "git cannot tell whether $XW2 is an ancestor of HEAD"
 xweb 1.1.0-dev.2 "$XW2" 1.2.0-dev.1 "$XW2"
 chk "U23 one already above it is left alone" "$(rsub "$XW2")" 'version=v1.2.0-dev.1 dirs=[] '
 xweb
@@ -2402,6 +2513,10 @@ chk_has "U24 naming the root commit as its change" "$(cat "$WORK/zsub.log")" \
   "subpackage web: publishing the build v1.1.0-dev.1 for dev's change $Z0"
 xweb 1.0.0-dev.1 "$Z0"
 chk "U24 a dev build of that root commit leaves it alone" "$(zsub)" 'version=v1.1.0-dev.1 dirs=[] '
+chk "U24 an empty tree git cannot name publishes nothing, not a root change read from nothing" \
+  "$(failing_git 'hash-object -t tree /dev/null' 1 zsub)|$(git_calls)" "EXIT=1|1"
+chk_has "U24 and says it cannot tell" "$(cat "$WORK/zsub.log")" "subpackage web: cannot tell whether npm serves its newest dev build"
+chk_lacks "U24 having diffed no range from an empty start" "$(cat "$WORK/zsub.log")" "MODE=paths needs FROM"
 rm -f "$CURL_DIR/docs"
 
 # ── Wiring ───────────────────────────────────────────────────────────────────

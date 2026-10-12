@@ -119,6 +119,14 @@ DUP=$(mkr "$T" "$SUBJECT
 Promoted-Digest: $D1
 Promoted-Digest: $D2" "$M" "$T")
 chk "R16 two digests for one lane are status 1" "$(status promoted_digest "$DUP")" 1
+EMPTY_TRAILER='Promoted-Digest: '
+EMPTY_DUP=$(mkr "$T" "$SUBJECT
+
+$EMPTY_TRAILER
+Promoted-Digest: $D1" "$M" "$T")
+chk "R16 the empty trailer reaches the parser" \
+  "$(git log -1 --format=%B "$EMPTY_DUP" | git interpret-trailers --parse | grep -c '^Promoted-Digest: $')" 1
+chk "R16 as are an empty root trailer beside a valid one" "$(status promoted_digest "$EMPTY_DUP")" 1
 BAD=$(mkr "$T" "$SUBJECT
 
 Promoted-Digest: sha256:abc" "$M" "$T")
@@ -131,5 +139,44 @@ Signed-off-by: probe <probe@example.invalid>" "$M" "$T")
 chk "R18 a trailer outside the last paragraph is not read" "$(status promoted_digest "$BODY")" 1
 chk "R19 an unknown commit is status 2, not a missing trailer" \
   "$(status promoted_digest 0123456789abcdef0123456789abcdef01234567)" 2
+
+# ── A git that fails: status 2, never "no" ───────────────────────────────────
+# The stub fails only call FAIL_GIT_N among those whose argv matches the glob
+# FAIL_GIT; git_calls is how many matched.
+GIT_FAIL="$WORK/git-fail"
+mkdir -p "$GIT_FAIL"
+cat >"$GIT_FAIL/git" <<SH
+#!/usr/bin/env bash
+if [[ "\$*" == \${FAIL_GIT:?} ]]; then
+  n=\$((\$(cat "$GIT_FAIL/n" 2>/dev/null || echo 0) + 1))
+  echo "\$n" >"$GIT_FAIL/n"
+  [ "\$n" -ne "\${FAIL_GIT_N:?}" ] || { echo "stub: git \$* fails" >&2; exit 92; }
+fi
+exec "$(command -v git)" "\$@"
+SH
+chmod 755 "$GIT_FAIL/git"
+failing() { # <argv glob> <N> <function> <args...> -> its exit status|matching git calls
+  local rc=0
+  rm -f "$GIT_FAIL/n"
+  FAIL_GIT="$1" FAIL_GIT_N="$2" PATH="$GIT_FAIL:$PATH" "${@:3}" >/dev/null 2>&1 || rc=$?
+  echo "$rc|$(cat "$GIT_FAIL/n" 2>/dev/null || echo 0)"
+}
+chk "R20 a commit whose parents git cannot read is status 2" \
+  "$(failing 'rev-list --parents -n1 *' 1 is_reconciliation "$GOOD")" "2|1"
+chk "R20 as is one whose own tree git cannot read" \
+  "$(failing "rev-parse $GOOD^{tree}" 1 is_reconciliation "$GOOD")" "2|1"
+chk "R20 or whose second parent's" "$(failing "rev-parse $T^{tree}" 1 is_reconciliation "$GOOD")" "2|1"
+chk "R20 or whose subject git cannot read" "$(failing 'log -1 --format=%s *' 1 is_reconciliation "$GOOD")" "2|1"
+chk "R21 a first-parent chain git cannot walk is status 2 for the newest" \
+  "$(failing 'rev-list --first-parent --merges *' 1 newest_reconciliation main)" "2|1"
+# main's first-parent merges, newest first: the side merge, GOOD2, GOOD.
+chk "R21 as is a reconciliation on it git cannot read" \
+  "$(failing 'rev-list --parents -n1 *' 2 newest_reconciliation main)" "2|2"
+chk "R21 and for the range" "$(failing 'rev-list --first-parent --merges --reverse *' 1 reconciliations_in "" main)" "2|1"
+chk "R21 as is a reconciliation in it git cannot read" \
+  "$(failing 'rev-list --parents -n1 *' 2 reconciliations_in "" main)" "2|2"
+chk "R22 trailers whose message git cannot read are status 2, not a missing trailer" \
+  "$(failing 'log -1 --format=%B *' 1 promoted_digest "$GOOD")" "2|1"
+chk "R22 as are trailers git cannot parse" "$(failing 'interpret-trailers --parse' 1 promoted_digest "$GOOD")" "2|1"
 
 echo "PASS: reconciliation recogniser ($PASS checks)"
