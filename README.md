@@ -62,7 +62,7 @@ GitHub lets any public repository call a reusable workflow stored in a public re
 
 - Versioning reads a `cliff.toml`, and the lint jobs read the synced configs. Copy them from `configs/` and the repository root.
 - The sync job, the daily settings audit and the scheduled mutation, fuzz and benchmark runs cover cplieger repositories only.
-- The release workflow sets the image license label and the SBOM source for the cplieger repositories it names. Any other repository gets the defaults, which are both registries, `amd64` and `arm64` images, and its own license in the label.
+- The release workflow sets the image license label for the cplieger repositories it names. Any other repository gets the defaults, which are both registries, `amd64` and `arm64` images, and its own license in the label.
 
 Copying a workflow and adapting it is the other way to reuse one. To build your own, GitHub's [reusable workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows) are the built-in way. If you only need to keep files in step across your repositories, [repo-file-sync-action](https://github.com/BetaHuhn/repo-file-sync-action) opens a pull request in each target repository from a `sync.yml` list.
 
