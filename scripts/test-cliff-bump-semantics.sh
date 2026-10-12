@@ -4,7 +4,7 @@
 # --unreleased --bumped-version base anchoring self-release.yaml runs, the
 # stable tag_pattern and the nested-module lane scoping (states A to J), the
 # synced notes template (T0 to T4), and the channels and release arithmetic of
-# actions/git-cliff-version/compute.sh (M to R, S1 to S14). Runs in the scripts
+# actions/git-cliff-version/compute.sh (M to R, S1 to S15). Runs in the scripts
 # CI job, so a git-cliff pin bump re-runs it against the new binary.
 # CLIFF_BIN=/path/to/git-cliff skips the download.
 set -euo pipefail
@@ -725,5 +725,82 @@ assert_eq "$(pending_of "$A14" "$A14R")" "v0.4.0" "S14c: the pending helper agre
 CFG="$CFG_STABLE"
 compute_tb "$A14" stable "" true ""
 assert_eq "$OUT_BASE" "v1.0.0" "S14d: the same promotion on cliff-stable reserves the major (the config is load-bearing)"
+
+# ── State S15: a git read that fails stops the run ──────────────────────────
+# Fails only the FAIL_GIT_N-th call whose argv matches the glob FAIL_GIT, with
+# 128: merge-base --is-ancestor answers with 0 or 1 only.
+GIT_FAIL="$WORK/git-fail"
+mkdir -p "$GIT_FAIL"
+cat >"$GIT_FAIL/git" <<SH
+#!/usr/bin/env bash
+if [[ "\$*" == \${FAIL_GIT:?} ]]; then
+  n=\$((\$(cat "$GIT_FAIL/n" 2>/dev/null || echo 0) + 1))
+  echo "\$n" >"$GIT_FAIL/n"
+  [ "\$n" -ne "\${FAIL_GIT_N:?}" ] || { echo "stub: git \$* fails" >&2; exit 128; }
+fi
+exec "$(command -v git)" "\$@"
+SH
+chmod 755 "$GIT_FAIL/git"
+git_refused() { # <label> <argv glob> <N> <expected message fragment> <repo> <compute.sh args and env...>
+  local label="$1" glob="$2" n="$3" calls
+  shift 3
+  rm -f "$GIT_FAIL/n"
+  FAIL_GIT="$glob" FAIL_GIT_N="$n" PATH="$GIT_FAIL:$PATH" refused "$label" "$@"
+  calls="$(cat "$GIT_FAIL/n" 2>/dev/null || echo 0)"
+  [ "$calls" -ge "$n" ] || fail "$label: only $calls git calls matched '$glob', so call $n never failed"
+}
+G=$(tb_fixture tb-gitfail)
+git -C "$G" checkout -q dev
+fc "$G" src/a.go "fix: a dev fix"
+GR=$(promote "$G" "$(git -C "$G" rev-parse dev)")
+compute_tb "$G" stable "" true ""
+assert_eq "$OUT_BASE|$OUT_FROM" "v1.3.0|$(commit_of "$G" v1.2.0)" "S15 precondition: the stable run at R reads v1.2.0..R"
+TAG_LIST='for-each-ref refs/tags *'
+git_refused "S15a: a stable run whose tags git cannot list for the anchor" "$TAG_LIST" 1 \
+  "so the nearest stable tag is unknown" "$G" CHANNEL=stable PENDING_IN_RANGE=true bash "$ACTION"
+git_refused "S15b: a stable run whose history git cannot walk for the anchor" 'rev-list --topo-order HEAD' 1 \
+  "so the nearest stable tag is unknown" "$G" CHANNEL=stable PENDING_IN_RANGE=true bash "$ACTION"
+git_refused "S15c: a stable run whose tags git cannot list for H" "$TAG_LIST" 2 \
+  "so the highest stable tag is unknown" "$G" CHANNEL=stable PENDING_IN_RANGE=true bash "$ACTION"
+git_refused "S15d: a stable run whose range git cannot list" 'rev-list *..HEAD' 1 \
+  "git cannot list the stable tags or the commits of" "$G" CHANNEL=stable PENDING_IN_RANGE=true bash "$ACTION"
+git_refused "S15e: a stable run whose tags git cannot list for the range" "$TAG_LIST" 3 \
+  "git cannot list the stable tags or the commits of" "$G" CHANNEL=stable PENDING_IN_RANGE=true bash "$ACTION"
+git_refused "S15f: a stable run where git cannot tell whether HEAD contains H" 'merge-base --is-ancestor *' 1 \
+  "is an ancestor of HEAD" "$G" CHANNEL=stable PENDING_IN_RANGE=true bash "$ACTION"
+git_refused "S15o: a stable run whose anchor tag git cannot resolve" 'rev-list -n1 *' 1 \
+  "git cannot resolve the anchor tag v1.2.0 to a commit" "$G" CHANNEL=stable PENDING_IN_RANGE=true bash "$ACTION"
+git_refused "S15p: a stable run whose HEAD git cannot resolve" 'rev-parse HEAD' 1 \
+  "git cannot resolve HEAD, so the stable tag on HEAD is unknown" "$G" CHANNEL=stable PENDING_IN_RANGE=true bash "$ACTION"
+git_refused "S15q: a stable run whose range end git cannot resolve" 'rev-parse --verify HEAD^{commit}' 1 \
+  "git cannot resolve HEAD to a commit, so git-cliff has no revision to read" "$G" CHANNEL=stable PENDING_IN_RANGE=true bash "$ACTION"
+git_refused "S15g: pending-version where git cannot list the tags" "$TAG_LIST" 1 \
+  "so the stable tags on ${GR} are unknown" "$G" bash "$ACTION" pending-version "$GR"
+git_refused "S15h: pending-version where git cannot tell whether a tag is on R" 'merge-base --is-ancestor *' 1 \
+  "git cannot tell whether ${GR} is an ancestor of" "$G" bash "$ACTION" pending-version "$GR"
+git_refused "S15i: pending-version where git cannot resolve R" "rev-parse ${GR}^{commit}" 1 \
+  "git cannot resolve '${GR}' to a commit" "$G" bash "$ACTION" pending-version "$GR"
+NOSUCH=0000000000000000000000000000000000000000
+refused "S15j: pending-version of a commit git cannot read" "cannot tell whether '${NOSUCH}' is a promotion commit" \
+  "$G" bash "$ACTION" pending-version "$NOSUCH"
+git -C "$G" checkout -q dev
+fc "$G" src/b.go "fix: a dev fix after the promotion"
+compute_tb "$G" dev "" false ""
+assert_eq "$OUT_DEV" "v1.3.0-dev.1" "S15 precondition: the dev run counts its dev tags"
+refused "S15k: a dev run whose pending commit git cannot read" "cannot tell whether '${NOSUCH}' is a promotion commit" \
+  "$G" CHANNEL=dev PENDING_VERSION=v1.3.0 PENDING_COMMIT="$NOSUCH" bash "$ACTION"
+git_refused "S15l: a dev run whose tags git cannot list for the anchor" "$TAG_LIST" 2 \
+  "so the nearest stable or dev tag is unknown" "$G" CHANNEL=dev bash "$ACTION"
+git_refused "S15m: a dev run whose dev tags git cannot list" 'tag --list *' 1 \
+  "so the dev counter is unknown" "$G" CHANNEL=dev bash "$ACTION"
+ER=$(tb_fixture tb-empty-range)
+fc "$ER" go.mod "fix(deps): update a module"
+git -C "$ER" tag v1.2.1
+publish_main "$ER"
+git -C "$ER" checkout -q dev
+[ -z "$(git -C "$ER" rev-list v1.2.1..dev)" ] || fail "S15n precondition: v1.2.1..dev must hold no commit"
+compute_tb "$ER" dev "" false ""
+assert_eq "$OUT_BASE|$OUT_FROM" "v1.3.0|$(commit_of "$ER" v1.2.1)" \
+  "S15n: a dev run whose range H..HEAD is empty numbers above H instead of refusing"
 
 echo "PASS: git-cliff $VERSION semantics match the release-gate contract"
