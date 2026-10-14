@@ -213,7 +213,7 @@ LICENSE_OVERRIDES = {
     # First-party applications. Nobody imports an app, so it never enters a
     # consumer's dependency tree and copyleft costs no adoption.
     'cert-converter': 'GPL-3.0',
-    'github-scout': 'GPL-3.0',
+    'forge-scout': 'GPL-3.0',
     'knell': 'GPL-3.0',
     'plex-exporter': 'GPL-3.0',
     'plex-language-sync': 'GPL-3.0',
