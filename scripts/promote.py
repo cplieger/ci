@@ -53,6 +53,12 @@ REGISTRY = 'ghcr.io'
 PROMOTED_TAG_PREFIX = 'promoted-'
 DIGEST_RE = re.compile(r'^sha256:[0-9a-f]{64}$')
 CLONE_URL = 'https://github.com/{owner}/{repo}'
+# release-state.sh `receipt` links the run as <server>/<owner>/<repo>/actions/runs/<id>, and
+# docker-release.yaml names the image after <repo> unless a caller sets image-name (none does),
+# so a receipt names its tag's package.
+RECEIPT_RUN_URL_RE = re.compile(
+    r'https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/actions/runs/\d+'
+)
 REPO_RE = re.compile(r'^[A-Za-z0-9._-]+$')
 FULL_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 TARGET_RE = re.compile(r'^[0-9a-f]{7,40}$')
@@ -80,6 +86,15 @@ class GhError(Exception):
     """A GitHub, registry, git or tool read this script cannot proceed past."""
 
 
+class RegistryNotFoundError(GhError):
+    """A registry read answered HTTP 404."""
+
+
+class RegistryDeniedError(GhError):
+    """A registry read answered HTTP 401 or 403: GHCR's answer for a package that does not
+    exist or that the reader may not pull."""
+
+
 def gh_json(path: str):
     try:
         return ghrest.get(path)
@@ -90,6 +105,13 @@ def gh_json(path: str):
 def gh_send(method: str, path: str, body: dict):
     try:
         return ghrest.send(method, path, body)
+    except ghrest.ApiError as err:
+        raise GhError(str(err)) from None
+
+
+def gh_pages(path: str) -> list:
+    try:
+        return ghrest.pages(path)
     except ghrest.ApiError as err:
         raise GhError(str(err)) from None
 
@@ -517,6 +539,10 @@ def registry_request(
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
             return dict(resp.headers.items()), resp.read()
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        failure = {404: RegistryNotFoundError, 401: RegistryDeniedError, 403: RegistryDeniedError}
+        raise failure.get(exc.code, GhError)(f'{method} {url}: {exc}') from None
     except (urllib.error.URLError, TimeoutError) as exc:
         raise GhError(f'{method} {url}: {exc}') from None
 
@@ -654,6 +680,44 @@ def main_stable_tag(clone: Path, main: str) -> str:
     return rc.newest_stable_tag(tags)
 
 
+def receipt_names(repo: str, commit: str, tag: str) -> list[str]:
+    """The repository names, newest first, under which the completion receipts of `tag` on
+    `commit` link their run: each names the repository as it was called when posted."""
+    context = rc.completion_receipt_context(tag)
+    names = []
+    for status in gh_pages(f'repos/{OWNER}/{repo}/commits/{commit}/statuses'):
+        m = RECEIPT_RUN_URL_RE.fullmatch(status.get('target_url') or '')
+        if (
+            status.get('context') == context
+            and status.get('state') == 'success'
+            and m
+            and m[1] == OWNER
+            and m[2] not in names
+        ):
+            names.append(m[2])
+    return names
+
+
+def stable_image(clone: Path, repo: str, tag: str, token: str) -> tuple[str, str, str]:
+    """(package, digest, pull token) of main's `tag`: the repository's own package, else,
+    on a 404, the first package a completion receipt of the tag names that serves it;
+    ('', '', '') when none does. `token` pulls from the repository's own package."""
+    try:
+        return repo, tag_digest(repo, tag, token), token
+    except RegistryNotFoundError:
+        pass
+    commit = git(clone, 'rev-list', '-n', '1', tag).strip()
+    for name in receipt_names(repo, commit, tag):
+        if name == repo:
+            continue
+        try:
+            pull = registry_token(name)
+            return name, tag_digest(name, tag, pull), pull
+        except RegistryNotFoundError, RegistryDeniedError:
+            continue
+    return '', '', ''
+
+
 def check_vulnerabilities(clone: Path, repo: str, main: str, digest: str) -> list[str]:
     # cmd_snapshot waited out main's release runs before this clone, so it holds M's stable tag.
     tag = main_stable_tag(clone, main)
@@ -661,8 +725,18 @@ def check_vulnerabilities(clone: Path, repo: str, main: str, digest: str) -> lis
         print('image: main has no stable image yet, so a promotion undoes no fix of it')
         return []
     token = registry_token(repo)
-    main_digest = tag_digest(repo, tag, token)
-    ours, theirs = platforms(repo, digest, token), platforms(repo, main_digest, token)
+    package, main_digest, main_token = stable_image(clone, repo, tag, token)
+    if not package:
+        refusal = (
+            f"main's {tag} image is not {REGISTRY}/{OWNER}/{repo}:{tag}, and no completion "
+            f'receipt of {tag} names a package serving it, so the dev image has nothing to be '
+            f"compared with. Copy main's {tag} image to {REGISTRY}/{OWNER}/{repo}:{tag}, then "
+            'dispatch again'
+        )
+        return [refusal]
+    if package != repo:
+        print(f"image: main's {tag} is {REGISTRY}/{OWNER}/{package}@{main_digest}")
+    ours, theirs = platforms(repo, digest, token), platforms(package, main_digest, main_token)
     if (SINGLE_MANIFEST in ours) != (SINGLE_MANIFEST in theirs):
         shape = {True: 'one manifest', False: 'a multi-platform index'}
         mismatch = (
@@ -679,7 +753,9 @@ def check_vulnerabilities(clone: Path, repo: str, main: str, digest: str) -> lis
     for plat, ref in sorted(ours.items()):
         new = trivy_findings(f'{REGISTRY}/{OWNER}/{repo}@{ref}')
         old = (
-            trivy_findings(f'{REGISTRY}/{OWNER}/{repo}@{theirs[plat]}') if plat in theirs else set()
+            trivy_findings(f'{REGISTRY}/{OWNER}/{package}@{theirs[plat]}')
+            if plat in theirs
+            else set()
         )
         found += [
             f"image {plat}: {vid} in {pkg} is fixable and absent from main's {tag}. "

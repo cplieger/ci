@@ -942,6 +942,132 @@ class Vulnerabilities(unittest.TestCase):
         self.assertEqual((got, refs), ([], {}))
 
 
+class StableImageOfARenamedRepo(unittest.TestCase):
+    """check_vulnerabilities over GHCR answers: `packages` maps a package name to the
+    stable tags it serves, every other tag read is a 404 (or `demo_head`'s HTTP code for
+    demo's), and a pull token of a package other than demo and `packages` is a 403, as GHCR
+    denies one for a package that does not exist. A GhError raised is returned as the result."""
+
+    TAG = 'v1.0.0'
+
+    def run_vulns(self, packages, statuses, demo_head=404):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m = fx.commit('feat: init', {'Dockerfile': 'FROM scratch\n'})
+            fx.g('tag', self.TAG)
+            seen = {'heads': [], 'platforms': [], 'scanned': [], 'statuses': []}
+
+            def urlopen(req, timeout=None):
+                url = req.full_url
+                if '/token?' in url:
+                    name = url.split(f'repository:{promote.OWNER}/', 1)[1].split(':', 1)[0]
+                    if name != 'demo' and name not in packages:
+                        raise promote.urllib.error.HTTPError(url, 403, 'Forbidden', {}, None)
+                    return FakeRegistry.response({}, json.dumps({'token': f'tok-{name}'}).encode())
+                name, ref = url.split(f'/v2/{promote.OWNER}/', 1)[1].split('/manifests/')
+                seen['heads'].append(f'{name}:{ref}')
+                digest = packages.get(name, {}).get(ref)
+                if digest is None:
+                    code = demo_head if name == 'demo' else 404
+                    raise promote.urllib.error.HTTPError(url, code, 'Failed', {}, None)
+                return FakeRegistry.response({'Docker-Content-Digest': digest}, b'')
+
+            def pages(path, *args, **kwargs):
+                seen['statuses'].append(path)
+                return statuses
+
+            def platforms(repo, digest, token):
+                seen['platforms'].append((repo, digest, token))
+                return {'linux/amd64': 't' if digest == DIGEST else 'm'}
+
+            def scan(ref):
+                seen['scanned'].append(ref)
+                return set()
+
+            with (
+                unittest.mock.patch.object(promote.urllib.request, 'urlopen', side_effect=urlopen),
+                unittest.mock.patch.object(promote.ghrest, 'pages', side_effect=pages),
+                unittest.mock.patch.object(promote, 'platforms', side_effect=platforms),
+                unittest.mock.patch.object(promote, 'trivy_findings', side_effect=scan),
+            ):
+                try:
+                    got = promote.check_vulnerabilities(fx.src, 'demo', m, DIGEST)
+                except promote.GhError as err:
+                    got = err
+            seen['tag_commit'] = m
+            return got, seen
+
+    @staticmethod
+    def receipt(name, tag='v1.0.0', owner='cplieger', state='success'):
+        return {
+            'context': f'release/complete/{tag}',
+            'state': state,
+            'target_url': f'https://github.com/{owner}/{name}/actions/runs/7',
+        }
+
+    def test_a_renamed_repo_scans_main_s_tag_in_the_package_it_was_released_under(self):
+        got, seen = self.run_vulns(
+            {'old-demo': {self.TAG: 'sha256:main'}},
+            [self.receipt('demo', 'v0.9.0'), self.receipt('old-demo')],
+        )
+        self.assertEqual(got, [])
+        self.assertEqual(seen['heads'], [f'demo:{self.TAG}', f'old-demo:{self.TAG}'])
+        self.assertEqual(
+            seen['statuses'], [f'repos/cplieger/demo/commits/{seen["tag_commit"]}/statuses']
+        )
+        self.assertEqual(
+            seen['platforms'],
+            [('demo', DIGEST, 'tok-demo'), ('old-demo', 'sha256:main', 'tok-old-demo')],
+        )
+        self.assertEqual(
+            seen['scanned'], ['ghcr.io/cplieger/demo@t', 'ghcr.io/cplieger/old-demo@m']
+        )
+
+    def test_a_repo_serving_main_s_tag_under_its_own_name_reads_no_receipt(self):
+        got, seen = self.run_vulns({'demo': {self.TAG: 'sha256:main'}}, [])
+        self.assertEqual(got, [])
+        self.assertEqual(seen['heads'], [f'demo:{self.TAG}'])
+        self.assertEqual(seen['statuses'], [])
+        self.assertEqual(
+            seen['platforms'], [('demo', DIGEST, 'tok-demo'), ('demo', 'sha256:main', 'tok-demo')]
+        )
+        self.assertEqual(seen['scanned'], ['ghcr.io/cplieger/demo@t', 'ghcr.io/cplieger/demo@m'])
+
+    def test_a_failed_read_of_main_s_tag_other_than_a_404_reads_no_receipt(self):
+        for code in (401, 403, 500):
+            with self.subTest(code=code):
+                got, seen = self.run_vulns({}, [self.receipt('old-demo')], demo_head=code)
+                self.assertIsInstance(got, promote.GhError)
+                self.assertNotIsInstance(got, promote.RegistryNotFoundError)
+                self.assertIn(f'demo/manifests/{self.TAG}: HTTP Error {code}', str(got))
+                self.assertEqual(seen['heads'], [f'demo:{self.TAG}'])
+                self.assertEqual(seen['statuses'], [])
+
+    def test_main_s_tag_in_no_package_a_receipt_of_it_names_is_refused(self):
+        other_tag_package = {'other': {self.TAG: 'sha256:other'}, 'stale': {'v0.9.0': 'x'}}
+        for label, statuses in (
+            ('no receipt', []),
+            ('a receipt naming a package without the tag', [self.receipt('stale')]),
+            ('a receipt naming a package GHCR denies', [self.receipt('old-demo')]),
+            (
+                'receipts that are not this tag completing in this owner',
+                [
+                    self.receipt('other', 'v0.9.0'),
+                    self.receipt('other', state='failure'),
+                    self.receipt('other', owner='someone'),
+                ],
+            ),
+        ):
+            with self.subTest(label):
+                got, seen = self.run_vulns(other_tag_package, statuses)
+                self.assertEqual(len(got), 1, got)
+                self.assertIn(f"main's {self.TAG} image", got[0])
+                self.assertIn(f'ghcr.io/cplieger/demo:{self.TAG}', got[0])
+                self.assertIn('then dispatch again', got[0])
+                self.assertNotIn(f'other:{self.TAG}', seen['heads'])
+                self.assertEqual(seen['scanned'], [])
+
+
 class WaitForMainRelease(unittest.TestCase):
     def wait(self, answers, committed_ago):
         calls = iter(answers)
