@@ -6,7 +6,7 @@ Subcommands, run in this order by release-maintenance.yaml, each with its own to
     plan    reads every repository and writes the plan; it writes nothing else.
     merge   (App token) merges the planned pull requests at the head the plan read,
             and opens the planned rebuild pull requests.
-    report  (CI_SCHEDULE) ticks the dashboards, syncs each `Release blocked` issue,
+    report  (CI_SCHEDULE) ticks the dashboards, syncs each `release-blocked` issue,
             and exits 1 when any read or write failed.
 
 `merge-checked` and `rebuild-refreshes` serve other workflows; see their --help.
@@ -51,7 +51,6 @@ REBUILD_RETRY_WINDOW = dt.timedelta(hours=24)
 SCHEDULE_TZ = ZoneInfo('Europe/Paris')
 SCHEDULE_WEEKDAY, SCHEDULE_HOURS = 5, range(6)
 DEADLINE_WEEKDAY, DEADLINE_HOUR = 5, 12
-ISSUE_TITLE = 'Release blocked'
 ISSUE_LABEL = 'release-blocked'
 NOTES_DEFAULT = 'Anything written below this heading is kept when the issue is updated.'
 PER_PAGE = 100
@@ -118,6 +117,13 @@ SECTIONS = (
     ('late', 'A security, expedited or rebuild pull request did not ship within three hours'),
     ('unrouted', 'A fixable vulnerability on `main` has no automatic route'),
 )
+# The issue's title names the sections it holds, joined in SECTIONS order, so a
+# vulnerability with no automatic route never reads as a blocked release.
+SECTION_TITLES = {
+    'weekly': 'Saturday update not shipped',
+    'late': 'Pull request into main not shipped',
+    'unrouted': 'Vulnerability fix has no automatic route',
+}
 
 
 class GhError(Exception):
@@ -1244,6 +1250,16 @@ def issue_body(blockers: dict[str, list[str]], existing: str, unread=()) -> str:
     )
 
 
+def issue_title(body: str) -> str:
+    """The title for `body`: its section headings, short and in SECTIONS order."""
+    inner = trackerlib.sentinel_inner(body, ISSUE_LABEL) or ''
+    held = [SECTION_TITLES[key] for key, title in SECTIONS if f'### {title}\n' in inner]
+    if not held:
+        raise ValueError('an issue body with no section has no title')
+    held = [held[0], *(t[0].lower() + t[1:] for t in held[1:])]
+    return held[0] if len(held) == 1 else f'{", ".join(held[:-1])} and {held[-1]}'
+
+
 def tick(api: Api, repo: str, want: dict) -> str:
     issue = api.get(f'repos/{OWNER}/{repo}/issues/{want["issue"]}')
     body = issue.get('body') or ''
@@ -1264,7 +1280,7 @@ def sync_issue(repo: str, row: dict, run_url: str, tracker, work: Path) -> str:
     """Open, update or close the repository's issue; returns what was done. A row with
     errors, from a read or from a planned action this run did not complete, never
     closes it."""
-    common = ['--repo', f'{OWNER}/{repo}', '--label', ISSUE_LABEL, '--title', ISSUE_TITLE]
+    common = ['--repo', f'{OWNER}/{repo}', '--label', ISSUE_LABEL, '--any-title']
     unread = set(row['unread'])
     if not any(items for key, items in row['blockers'].items() if key not in unread):
         if row['errors']:
@@ -1274,15 +1290,18 @@ def sync_issue(repo: str, row: dict, run_url: str, tracker, work: Path) -> str:
         rc_ = tracker([*common, '--mode', 'close-when-clean', '--comment-file', str(comment)])
         return 'closed if open' if rc_ == 0 else 'failed: close'
     current = work / f'{repo}.current.md'
-    if tracker([*common, '--mode', 'fetch', '--body-file', str(current)]) != 0:
+    current_title = work / f'{repo}.title.txt'
+    fetch = ['--mode', 'fetch', '--body-file', str(current), '--title-file', str(current_title)]
+    if tracker([*common, *fetch]) != 0:
         return 'failed: fetch'
     existing = current.read_text()
     body = issue_body(row['blockers'], existing, unread)
-    if body == existing:
+    title = issue_title(body)
+    if body == existing and title == current_title.read_text():
         return 'unchanged'
     new = work / f'{repo}.body.md'
     new.write_text(body)
-    if tracker([*common, '--mode', 'upsert', '--body-file', str(new)]) != 0:
+    if tracker([*common, '--title', title, '--mode', 'upsert', '--body-file', str(new)]) != 0:
         return 'failed: upsert'
     return 'opened or updated'
 

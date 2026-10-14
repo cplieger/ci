@@ -1771,6 +1771,7 @@ class Issue(unittest.TestCase):
         self.work = Path(self.tmp.name)
         self.calls = []
         self.existing = ''
+        self.existing_title = ''
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -1780,8 +1781,10 @@ class Issue(unittest.TestCase):
         mode = argv[argv.index('--mode') + 1]
         if mode == 'fetch':
             Path(argv[argv.index('--body-file') + 1]).write_text(self.existing)
+            Path(argv[argv.index('--title-file') + 1]).write_text(self.existing_title)
         if mode == 'upsert':
             self.written = Path(argv[argv.index('--body-file') + 1]).read_text()
+            self.title = argv[argv.index('--title') + 1]
         return 0
 
     def row(self, **blockers):
@@ -1802,8 +1805,12 @@ class Issue(unittest.TestCase):
         self.assertEqual(got, 'opened or updated')
         self.assertEqual(self.modes(), ['fetch', 'upsert'])
         self.assertEqual(
-            self.calls[0][:6],
-            ['--repo', f'cplieger/{R}', '--label', 'release-blocked', '--title', 'Release blocked'],
+            self.calls[0][:5],
+            ['--repo', f'cplieger/{R}', '--label', 'release-blocked', '--any-title'],
+        )
+        self.assertNotIn('--title', self.calls[0])
+        self.assertEqual(
+            self.title, 'Saturday update not shipped and vulnerability fix has no automatic route'
         )
         self.assertIn('### The Saturday update did not ship by 12:00 UTC\n\n- w1', self.written)
         self.assertIn(
@@ -1817,11 +1824,34 @@ class Issue(unittest.TestCase):
     def test_a_new_issue_gets_plain_default_notes_and_an_unchanged_body_is_not_rewritten(self):
         rm.sync_issue(R, self.row(late=['l1']), 'RUN', self.tracker, self.work)
         self.assertTrue(self.written.endswith(f'## Free-form notes\n\n{rm.NOTES_DEFAULT}\n'))
-        self.existing, self.calls = self.written, []
+        self.assertEqual(self.title, 'Pull request into main not shipped')
+        self.existing, self.existing_title, self.calls = self.written, self.title, []
         self.assertEqual(
             rm.sync_issue(R, self.row(late=['l1']), 'RUN', self.tracker, self.work), 'unchanged'
         )
         self.assertEqual(self.modes(), ['fetch'])
+
+    def test_an_unchanged_body_under_an_outdated_title_is_retitled(self):
+        rm.sync_issue(R, self.row(unrouted=['u1']), 'RUN', self.tracker, self.work)
+        self.existing, self.existing_title, self.calls = self.written, 'Release blocked', []
+        self.assertEqual(
+            rm.sync_issue(R, self.row(unrouted=['u1']), 'RUN', self.tracker, self.work),
+            'opened or updated',
+        )
+        self.assertEqual(self.modes(), ['fetch', 'upsert'])
+        self.assertEqual(self.title, 'Vulnerability fix has no automatic route')
+        self.assertEqual(self.written, self.existing)
+
+    def test_every_section_has_a_title_and_a_body_with_none_is_refused(self):
+        self.assertEqual(set(rm.SECTION_TITLES), {key for key, _ in rm.SECTIONS})
+        body = rm.issue_body({'weekly': ['w'], 'late': ['l'], 'unrouted': ['u']}, '')
+        self.assertEqual(
+            rm.issue_title(body),
+            'Saturday update not shipped, pull request into main not shipped '
+            'and vulnerability fix has no automatic route',
+        )
+        with self.assertRaises(ValueError):
+            rm.issue_title(rm.issue_body({'weekly': [], 'late': [], 'unrouted': []}, ''))
 
     def test_a_clear_repository_closes_and_a_failed_read_leaves_the_issue(self):
         self.assertEqual(
@@ -1857,7 +1887,10 @@ class Issue(unittest.TestCase):
         )
         self.assertNotIn('partial', self.written)
         self.assertTrue(self.written.endswith('## Free-form notes\n\nmine\n'))
-        self.existing, self.calls = self.written, []
+        self.assertEqual(
+            self.title, 'Saturday update not shipped and vulnerability fix has no automatic route'
+        )
+        self.existing, self.existing_title, self.calls = self.written, self.title, []
         self.assertEqual(rm.sync_issue(R, failed, 'RUN', self.tracker, self.work), 'unchanged')
 
     def test_only_unknown_sections_with_items_leave_the_issue_unopened_and_unclosed(self):
