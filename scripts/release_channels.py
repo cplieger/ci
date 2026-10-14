@@ -32,7 +32,7 @@ DEPLOYED_IMAGE_REPOS = frozenset(
         'docker-radvd',
         'docker-renovate-scheduler',
         'docker-smtp-relay',
-        'github-scout',
+        'forge-scout',
         'knell',
         'marotte',
         'pg-autodump',
