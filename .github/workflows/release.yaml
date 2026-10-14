@@ -1429,7 +1429,7 @@ jobs:
           fi
 
           # renovate: datasource=go depName=golang.org/x/exp
-          XEXP_VERSION=v0.0.0-20261013213113-2ab7f3cbc5fb
+          XEXP_VERSION=v0.0.0-20261014143641-f0251eb4aa3e
           # gorelease TYPE-CHECKS the target module, so its own binary must be
           # built with a toolchain at least as new as that module's `go`
           # directive. A bare GOTOOLCHAIN=auto resolves the minimum x/exp needs
