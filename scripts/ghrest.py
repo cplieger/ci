@@ -39,6 +39,16 @@ def secondary_wait(refusals: int) -> int:
     return SECONDARY_WAIT * 2**refusals
 
 
+# gh's words for a failure on GitHub's side: `HTTP 502: Bad Gateway (...)`, or a GraphQL
+# error GitHub returns for an internal failure or timeout.
+SERVER_FAILURE = re.compile(
+    r'\bHTTP 5\d\d\b|Something went wrong while executing your query'
+    r"|couldn't respond to your request in time",
+    re.IGNORECASE,
+)
+SERVER_WAIT = 10
+
+
 class ApiError(Exception):
     """A request that failed: `status` is the HTTP status, None when gh got no
     response; `reset` is the epoch second a rate limit that refused it lifts."""
@@ -83,11 +93,20 @@ def is_write(args) -> bool:
     return '-X' in args and args[args.index('-X') + 1] != 'GET'
 
 
+def _stderr(proc) -> str:
+    return proc.stderr if isinstance(proc.stderr, str) else (proc.stderr or b'').decode()
+
+
 def refused_by_rate_limit(proc) -> bool:
     """Whether a failed non-API gh command (`gh pr merge`) was refused by a rate limit.
     gh prints GitHub's message but none of its headers, so the message is all there is."""
-    err = proc.stderr if isinstance(proc.stderr, str) else (proc.stderr or b'').decode()
-    return proc.returncode != 0 and 'rate limit' in err.lower()
+    return proc.returncode != 0 and 'rate limit' in _stderr(proc).lower()
+
+
+def failed_on_github(proc) -> bool:
+    """Whether a failed non-API gh command failed on GitHub's side (a 5xx, or a GraphQL
+    reply whose error is the server's own), so it says nothing about its target."""
+    return proc.returncode != 0 and bool(SERVER_FAILURE.search(_stderr(proc)))
 
 
 class Pacer:
@@ -142,17 +161,23 @@ class Pacer:
 def paced(run, pacer: Pacer, tries=3):
     """`run` (run_process's contract) admitted by `pacer`, a write as a write; raises
     the pacer's ApiError. A non-API command refused by a rate limit pauses `pacer` for
-    secondary_wait and is tried again, `tries` times in all; the last refusal is
-    returned, its pause still published. A retry repeats no write: `gh pr merge`, the one
-    command sent here, exits 0 on a pull request an earlier attempt already merged."""
+    secondary_wait, one that failed on GitHub's side for SERVER_WAIT doubling, and is
+    tried again, `tries` times in all; the last refusal is returned, its pause still
+    published. A retry repeats no write: `gh pr merge`, the one command sent here, exits
+    0 on a pull request an earlier attempt already merged."""
 
     def call(args, stdin=None, timeout=None):
         for refusals in range(tries):
             pacer.wait(is_write(args))
             proc = run(args, stdin, timeout)
-            if args[:1] == ['api'] or not refused_by_rate_limit(proc):
+            if args[:1] == ['api']:
                 return proc
-            pacer.pause(secondary_wait(refusals))
+            if refused_by_rate_limit(proc):
+                pacer.pause(secondary_wait(refusals))
+            elif failed_on_github(proc):
+                pacer.pause(SERVER_WAIT * 2**refusals)
+            else:
+                return proc
         return proc
 
     return call
