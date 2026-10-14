@@ -65,6 +65,10 @@ if [ "$1" = list ]; then
   printf '%s' "${GO_LIST_OUT:-}"
   exit "${GO_LIST_RC:-0}"
 fi
+if [ -n "${GO_FAIL_ONCE:-}" ] && [ ! -e "$STUB_LOG/go-failed" ]; then
+  : > "$STUB_LOG/go-failed"
+  exit 1
+fi
 exit "${GO_RC:-0}"
 """
 
@@ -751,6 +755,20 @@ class InstallSteps(Harness):
         )
         run = self.run_step('Install dependencies', self.tmp, {'GO': 'false', 'NPM_DIRS': ''})
         self.assertEqual((run.rc, run.logged('go'), run.logged('npm')), (0, '', ''))
+
+    def test_a_transient_go_failure_is_retried(self):
+        for step in ('Install deadset', 'Install dependencies'):
+            with self.subTest(step=step):
+                env = {'GO': 'true', 'TS': 'false', 'NPM_DIRS': '', 'RETRY_SLEEP': '0'}
+                run = self.run_step(step, self.tmp, {**env, 'GO_FAIL_ONCE': '1'})
+                self.assertEqual(run.rc, 0, run.out)
+                self.assertIn('attempt 1/4 failed', run.out)
+                first = run.logged('go').splitlines()
+                self.assertEqual(first[0], first[1])
+                run = self.run_step(step, self.tmp, {**env, 'GO_RC': '1'})
+                self.assertNotEqual(run.rc, 0)
+                self.assertEqual(len(run.logged('go').splitlines()), 4, run.logged('go'))
+                self.assertIn('failed after 4 attempts', run.out)
 
     def test_a_failed_install_stops_the_job(self):
         run = self.run_step(

@@ -152,12 +152,25 @@ jobs:
 
       # PR-time dependency vulnerability review. Runs for libraries and apps
       # alike (a vulnerable dep in a library propagates to every consumer).
-      # Hard step (no continue-on-error): a `uses:` step can't append to
-      # /tmp/_ci_failures, so soft-gating it would silently tolerate its
-      # failure. Public repos only — the dependency-review API needs the
+      # A `uses:` step can't append to /tmp/_ci_failures, so the retry is the
+      # hard step: the first attempt's continue-on-error only buys the second
+      # one, for the API's intermittent "The request is taking too long to
+      # process". Public repos only — the dependency-review API needs the
       # dependency graph, which private repos on the free plan don't expose.
       - name: Dependency review
+        id: dependency-review
         if: ${{ github.event_name == 'pull_request' && github.event.repository.private == false }}
+        continue-on-error: true
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+
+      - name: Wait before retrying dependency review
+        if: ${{ steps.dependency-review.outcome == 'failure' }}
+        run: sleep 30
+
+      - name: Dependency review (retry)
+        if: ${{ steps.dependency-review.outcome == 'failure' }}
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
