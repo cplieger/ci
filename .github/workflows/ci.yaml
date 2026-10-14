@@ -512,10 +512,6 @@ jobs:
           (
             # renovate: datasource=github-releases depName=gitleaks/gitleaks
             VERSION=v8.30.1
-            # The archive goes to $RUNNER_TEMP, not /tmp: ci-local rewrites the
-            # literal `/tmp/gitleaks` to the PATH binary, and a `/tmp/gitleaks*`
-            # archive name would be rewritten too, dropping the tarball into the
-            # working tree where the next `gitleaks dir` scan would read it.
             curl -fsSL --connect-timeout 10 --max-time 30 \
               --retry 7 --retry-max-time 150 --retry-all-errors \
               -o "$RUNNER_TEMP/gitleaks.tgz" \
@@ -649,8 +645,7 @@ jobs:
       # was silently unchecked - a vacuous corner in a gate), and
       # --exclude-path matches by PATH PREFIX, so excluding `.git` also
       # swallows `.github/**`. `--extensions md` already keeps .git internals
-      # out of scope; node_modules stays excluded for local runs (CI never has
-      # one here, but ci-local does).
+      # out of scope.
       - name: Check internal links (lychee, offline)
         run: |
           lychee --offline --include-fragments --no-progress \
@@ -1005,7 +1000,7 @@ jobs:
                 && DASHBOARD_CHECK_CUE="$RUNNER_TEMP/dashboard-check/cue" \
                   DASHBOARD_CHECK_SCHEMAS="$RUNNER_TEMP/dashboard-check" \
                   python3 -m unittest -v scripts.test_dashboard_check scripts.test_dashboard_check_cli \
-                    scripts.test_dashboard_publish_gate scripts.test_ci_local
+                    scripts.test_dashboard_publish_gate
             else
               echo "no dashboard-check probe in this repo - skipping"
             fi

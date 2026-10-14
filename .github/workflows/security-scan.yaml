@@ -19,11 +19,9 @@ on:
 permissions:
   contents: read
 
-# Trivy binary version, pinned so local scans match what CI runs:
-# cplieger/ci's scripts/install-local-tools.sh reads this same pin via
-# `pin_version aquasecurity/trivy`. Without an explicit version the
-# trivy-action installs its own baked-in default (v0.70.0 at the pinned SHA),
-# which silently drifts from the binary other workflows install directly.
+# Trivy binary version. Without an explicit version the trivy-action installs
+# its own baked-in default (v0.70.0 at the pinned SHA), which silently drifts
+# from the binary other workflows install directly.
 env:
   # renovate: datasource=github-releases depName=aquasecurity/trivy
   TRIVY_VERSION: v0.76.0
@@ -486,9 +484,7 @@ jobs:
           # File first, then extract: plain `--retry` does not cover a
           # mid-transfer receive failure (curl exit 56), and the flag that does
           # (`--retry-all-errors`) is unsafe on a pipe, because curl resets a
-          # partial `-o` write before retrying and cannot reset a pipe. The
-          # archive stays out of /tmp/gitleaks* so ci-local's rewrite of that
-          # literal path cannot reach it.
+          # partial `-o` write before retrying and cannot reset a pipe.
           curl -fsSL --connect-timeout 10 --max-time 30 \
             --retry 7 --retry-max-time 150 --retry-all-errors \
             -o "$RUNNER_TEMP/gitleaks.tgz" \

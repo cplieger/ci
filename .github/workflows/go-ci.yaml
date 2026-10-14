@@ -139,11 +139,8 @@ jobs:
             # Compare regenerated output against the committed tree
             # (catches modified + added files via the staged index). Scoped to
             # the generated-file pathspec, not the whole tree: an unscoped
-            # `git add -A` reports any unrelated uncommitted edit as stale
-            # generator output, naming files no generator ever wrote — noise in
-            # CI only in theory (the checkout is clean) but a routine false
-            # positive under the local ci-local mirror, which runs over the
-            # working tree.
+            # `git add -A` would report any unrelated uncommitted edit as stale
+            # generator output, naming files no generator ever wrote.
             git add -A -- '*.gen.*'
             if ! git diff --cached --quiet -- '*.gen.*'; then
               echo "::error::wiregen output is stale; re-run the generator(s) above and commit the result"

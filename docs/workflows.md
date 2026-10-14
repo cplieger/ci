@@ -132,6 +132,7 @@ Each run is named `Promote <repo>`, with `(dry run)` after a dry run. Runs for o
 | `actions/render-hub-overview` | builds the Docker Hub overview page from the README's marked summary and `compose.yaml` |
 | `actions/comment-audit` | fails when source carries more than 0.55 comment lines per code line |
 | `actions/intake` | runs the pull-request title and `main` intake checks of the `pr-policy` job |
+| `actions/dashboard-check` | checks a Grafana dashboard file against the schema v2 dashboard format and layout, reference and description rules. A classic dashboard passes with a notice |
 | `actions/notice-audit` | fails when the root `NOTICE` departs from its three-line template, or a published package folder lacks identical `LICENSE` and `NOTICE` copies |
 
 ## Workflows for this repository only

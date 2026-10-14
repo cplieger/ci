@@ -30,7 +30,6 @@ permissions:
 # deadset refuses an analyzer whose report schema it does not accept (exit 3),
 # so these pins only work as a set: the meta ci.yaml's deadset-canary job runs
 # this workflow over fixed repositories to prove each set before it ships.
-# Workflow-level so ci-local's version preflight reads them.
 env:
   # renovate: datasource=go depName=github.com/cplieger/deadset
   DEADSET_VERSION: v1.12.0
@@ -191,8 +190,7 @@ jobs:
           fi
 
       # deadset-go loads packages with GOPROXY=off, and deadset-ts resolves
-      # imports through each project's node_modules. The `Install` name makes
-      # ci-local skip it, so a local run never rewrites a developer's tree.
+      # imports through each project's node_modules.
       - name: Install dependencies
         env:
           GO: ${{ steps.target.outputs.go }}
@@ -278,7 +276,7 @@ jobs:
               exit 1
               ;;
             127)
-              echo "::error::deadset is not on PATH, so nothing was checked. scripts/install-local-tools.sh in cplieger/ci installs the pinned build."
+              echo "::error::deadset is not on PATH, so nothing was checked. Check the Install deadset step above, which installs the pinned build."
               exit 1
               ;;
             *)
