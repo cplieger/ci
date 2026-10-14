@@ -286,7 +286,7 @@ class Pacing(unittest.TestCase):
         self.assertEqual(entered[1][1], 100.0 + ghrest.SECONDARY_WAIT)
         self.assertGreaterEqual(entered[2][1], 100.0 + ghrest.SECONDARY_WAIT)
 
-    def test_a_command_rate_limit_retry_waits_longer_each_time_and_only_a_limit_retries(self):
+    def test_a_command_rate_limit_retry_waits_longer_each_time_and_a_refusal_never_retries(self):
         limited = subprocess.CompletedProcess(
             [], 1, b'', b'You have exceeded a secondary rate limit'
         )
@@ -331,6 +331,46 @@ class Pacing(unittest.TestCase):
         for _ in range(2):
             self.assertIs(shared(['pr', 'merge', '1']), done)
         self.assertEqual(pauses, [ghrest.SECONDARY_WAIT, ghrest.SECONDARY_WAIT])
+
+    def test_a_command_failing_on_github_is_retried_after_a_doubling_wait(self):
+        failed = subprocess.CompletedProcess(
+            [], 1, b'', b'GraphQL: Something went wrong while executing your query on x.'
+        )
+        done = subprocess.CompletedProcess([], 0, b'', b'')
+        wait = ghrest.SERVER_WAIT
+        for name, answers, starts, result in (
+            ('a recovery', [failed, failed, done], [0, wait, 3 * wait], done),
+            ('a persisting failure', [failed] * 3, [0, wait, 3 * wait], failed),
+        ):
+            with self.subTest(name):
+                clock, got = [0.0], []
+
+                def advance(s, clock=clock):
+                    clock[0] += s
+
+                def run(_a, _s=None, _t=None, got=got, answers=answers, clock=clock):
+                    got.append(clock[0])
+                    return answers.pop(0)
+
+                pacer = ghrest.Pacer(0.0, sleep=advance, clock=lambda clock=clock: clock[0])
+                shared = ghrest.paced(run, pacer)
+                self.assertIs(shared(['pr', 'merge', '1']), result)
+                self.assertEqual(got, starts)
+
+    def test_what_a_command_failure_on_github_is(self):
+        def proc(rc, err):
+            return subprocess.CompletedProcess([], rc, b'', err)
+
+        for err in (
+            b'gh pr merge 661: GraphQL: Something went wrong while executing your query on x.',
+            b'HTTP 502: Bad Gateway (https://api.github.com/graphql)',
+            "GraphQL: We couldn't respond to your request in time.",
+        ):
+            with self.subTest(err):
+                self.assertTrue(ghrest.failed_on_github(proc(1, err)))
+        self.assertFalse(ghrest.failed_on_github(proc(1, b'HTTP 422: Unprocessable Entity')))
+        self.assertFalse(ghrest.failed_on_github(proc(1, b'Pull request is in clean status')))
+        self.assertFalse(ghrest.failed_on_github(proc(0, b'HTTP 502')))
 
     def test_what_a_command_rate_limit_refusal_is(self):
         def proc(rc, err):
