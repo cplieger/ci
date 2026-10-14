@@ -1,8 +1,8 @@
 """Tag shapes and repository tables shared by the two-channel release scripts.
 
-DEPLOYED_IMAGE_REPOS is owned by the private deployment inventory in the
-private infrastructure repo: a repo joins when it is onboarded there and
-leaves when its deployment is removed; edit both together.
+DEPLOYED_IMAGE_REPOS mirrors the deployment inventory: a repo joins when its
+deployment is onboarded and leaves when that deployment is removed; edit both
+together.
 """
 
 from __future__ import annotations
@@ -33,6 +33,8 @@ DEPLOYED_IMAGE_REPOS = frozenset(
         'docker-renovate-scheduler',
         'docker-smtp-relay',
         'forge-scout',
+        # forge-scout's name until its GitHub rename; drop once the API lists forge-scout.
+        'github-scout',
         'knell',
         'marotte',
         'pg-autodump',

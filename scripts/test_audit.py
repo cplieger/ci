@@ -321,6 +321,20 @@ class TwoChannel(unittest.TestCase):
         hard, _, _ = audit.compliance(s)
         self.assertIn("no deploy-trigger webhook (releases won't reach the orchestrator)", hard)
 
+    def test_renamed_scout_is_a_deployed_gpl_image_under_both_names(self):
+        # Discovery returns whichever name GitHub holds on the day of the rename.
+        for name in ('github-scout', 'forge-scout'):
+            with self.subTest(name=name):
+                s = two_channel(name)
+                s['license'] = 'GPL-3.0'
+                s['webhooks'] = [hook(['registry_package'])]
+                self.assertEqual(audit.compliance(s)[:2], ([], []))
+                s['webhooks'] = []
+                self.assertIn(
+                    "no deploy-trigger webhook (releases won't reach the orchestrator)",
+                    audit.compliance(s)[0],
+                )
+
     def test_library_release_hook_is_a_stale_warning(self):
         s = two_channel('httpx')
         s['webhooks'] = [hook(['release'])]
