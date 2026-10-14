@@ -33,8 +33,6 @@ DEPLOYED_IMAGE_REPOS = frozenset(
         'docker-renovate-scheduler',
         'docker-smtp-relay',
         'forge-scout',
-        # forge-scout's name until its GitHub rename; drop once the API lists forge-scout.
-        'github-scout',
         'knell',
         'marotte',
         'pg-autodump',
