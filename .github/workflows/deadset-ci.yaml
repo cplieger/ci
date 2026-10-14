@@ -172,17 +172,32 @@ jobs:
 
       # setup-go exports GOTOOLCHAIN=local, and deadset and deadset-go may need
       # a newer Go than the target's go.mod or the `stable` manifest names.
+      # The go command never retries a module proxy fetch, and proxy.golang.org
+      # intermittently resets a download stream (HTTP/2 INTERNAL_ERROR).
       - name: Install deadset
         env:
           GO: ${{ steps.target.outputs.go }}
           TS: ${{ steps.target.outputs.ts }}
         run: |
           set -euo pipefail
+          retry() {
+            local attempt=1 max=4 delay=5
+            until "$@"; do
+              if [ "$attempt" -ge "$max" ]; then
+                echo "::error::$* failed after ${max} attempts"
+                return 1
+              fi
+              echo "::warning::$* attempt ${attempt}/${max} failed; retrying in ${delay}s"
+              sleep "${RETRY_SLEEP:-$delay}"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
           export GOTOOLCHAIN=auto
           echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
-          go install "github.com/cplieger/deadset/cmd/deadset@${DEADSET_VERSION}"
+          retry go install "github.com/cplieger/deadset/cmd/deadset@${DEADSET_VERSION}"
           if [ "$GO" = true ]; then
-            go install "github.com/cplieger/deadset-go/cmd/deadset-go@${DEADSET_GO_VERSION}"
+            retry go install "github.com/cplieger/deadset-go/cmd/deadset-go@${DEADSET_GO_VERSION}"
           fi
           if [ "$TS" = true ]; then
             npm install --global --ignore-scripts --no-audit --no-fund \
@@ -197,7 +212,21 @@ jobs:
           NPM_DIRS: ${{ steps.target.outputs.npm_dirs }}
         run: |
           set -euo pipefail
-          if [ "$GO" = true ]; then go mod download; fi
+          # Install deadset's retry, for the same proxy resets.
+          retry() {
+            local attempt=1 max=4 delay=5
+            until "$@"; do
+              if [ "$attempt" -ge "$max" ]; then
+                echo "::error::$* failed after ${max} attempts"
+                return 1
+              fi
+              echo "::warning::$* attempt ${attempt}/${max} failed; retrying in ${delay}s"
+              sleep "${RETRY_SLEEP:-$delay}"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+          if [ "$GO" = true ]; then retry go mod download; fi
           while IFS= read -r dir; do
             if [ -z "$dir" ]; then continue; fi
             echo "npm ci in $dir"

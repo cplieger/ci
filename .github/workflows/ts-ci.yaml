@@ -350,13 +350,24 @@ jobs:
             exit "$rc"
           ) || { echo "web-lint" >> /tmp/_ci_failures; exit 1; }
 
-      # PR-time dependency vulnerability review (npm manifests). Hard step (no
-      # continue-on-error): a `uses:` step can't append to /tmp/_ci_failures,
-      # so soft-gating it would silently tolerate its failure. Public repos
+      # PR-time dependency vulnerability review (npm manifests). go-ci's
+      # Dependency review owns why the retry is the hard step. Public repos
       # only — the dependency-review API needs the dependency graph, which
       # private repos on the free plan don't expose.
       - name: Dependency review
+        id: dependency-review
         if: ${{ inputs.working-directory == '.' && github.event_name == 'pull_request' && github.event.repository.private == false }}
+        continue-on-error: true
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+
+      - name: Wait before retrying dependency review
+        if: ${{ steps.dependency-review.outcome == 'failure' }}
+        run: sleep 30
+
+      - name: Dependency review (retry)
+        if: ${{ steps.dependency-review.outcome == 'failure' }}
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
