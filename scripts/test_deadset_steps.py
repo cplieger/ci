@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import os
 import re
 import shutil
 import stat
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -270,17 +267,10 @@ class Detect(Harness):
         self.assertEqual(json.loads(run_detect(self, TS_ONLY)['deadset_targets']), ['.'])
 
     def test_the_root_is_a_target_exactly_when_deadset_finds_a_language_there(self):
-        sys.path.insert(0, str(ROOT))
-        import _ci_local
-
         for i, (files, expected) in enumerate(ROOT_TARGET_CASES):
             with self.subTest(case=i, files=sorted(files)):
                 want = ['.'] if expected else []
                 self.assertEqual(json.loads(run_detect(self, files)['deadset_targets']), want)
-                repo = git_repo(self.tmp / f'local-{i}', files)
-                self.assertEqual(
-                    json.loads(_ci_local.compute_local_detect(repo)['deadset_targets']), want
-                )
 
     def test_a_root_target_is_one_the_check_accepts(self):
         for i, (files, expected) in enumerate(ROOT_TARGET_CASES):
@@ -570,62 +560,6 @@ class ResolveTarget(Harness):
         self.assertEqual(setup['cache'], "${{ steps.target.outputs.go_sum != '' }}")
         self.assertEqual(setup['cache-dependency-path'], '${{ steps.target.outputs.go_sum }}')
 
-    def test_the_local_plan_predicts_what_the_step_resolves(self):
-        sys.path.insert(0, str(ROOT))
-        import _ci_local
-
-        fixtures = (
-            ({'go.mod': 'module x\n'}, '.'),
-            ({'package-lock.json': '{}', 'src/a.ts': '', 'package.json': '{}'}, '.'),
-            (
-                {
-                    'go.mod': 'module x\n',
-                    'web/tsconfig.json': '{}',
-                    'web/package-lock.json': '{}',
-                    'web/node_modules/y/package-lock.json': '{}',
-                    '.cache/w/package-lock.json': '{}',
-                    'testdata/t/package-lock.json': '{}',
-                    'testdata/t/tsconfig.json': '{}',
-                },
-                '.',
-            ),
-            (
-                {
-                    'go.mod': 'module x\n',
-                    'web/tsconfig.json': '{}',
-                    'web/package-lock.json': '{}',
-                    'deadset.json': '{"analysis":{"languages":["go"]}}',
-                },
-                '.',
-            ),
-            (
-                {
-                    'yamlenv/go.mod': 'module y\n',
-                    'yamlenv/ui/tsconfig.json': '{}',
-                    'yamlenv/ui/package-lock.json': '{}',
-                },
-                'yamlenv',
-            ),
-            (
-                {
-                    'go.mod': 'module x\n',
-                    'package-lock.json': '{}',
-                    'conf/x': '',
-                    'tsconfig.base.json': Link('conf'),
-                },
-                '.',
-            ),
-        )
-        for i, (files, target) in enumerate(fixtures):
-            with self.subTest(fixture=i):
-                run = self.resolve(files, target)
-                self.assertEqual(run.rc, 0, run.out)
-                plan = _ci_local.predict_profile_outputs(
-                    analyze_step('Resolve target'), self.tmp / 'repo' / target, self.tmp / 'repo'
-                )
-                for key in ('go', 'ts', 'npm_dirs'):
-                    self.assertEqual(plan[key], run.outputs[key], key)
-
     def test_the_job_runs_at_the_target_and_reads_its_go_mod(self):
         job = load(DEADSET_CI)['jobs']['analyze']
         self.assertEqual(job['defaults']['run']['working-directory'], '${{ inputs.target }}')
@@ -729,10 +663,10 @@ class Analyze(Harness):
         (self.work / 'run' / 'report.json.sarif').write_text('')
         self.assert_failed(self.analyze(DEADSET_SARIF='0'), 'exited 0 but wrote no SARIF report')
 
-    def test_a_missing_deadset_fails_and_names_the_installer(self):
+    def test_a_missing_deadset_fails_and_names_the_install_step(self):
         run = self.analyze(deadset=False)
         self.assert_failed(run, 'is not on PATH')
-        self.assertIn('install-local-tools.sh', run.out)
+        self.assertIn('Check the Install deadset step above', run.out)
 
     def test_a_go_module_reaching_into_node_modules_fails_before_analysis(self):
         leaked = f'{self.repo}/static-src/node_modules/flatted/golang/pkg/flatted'
@@ -1031,259 +965,6 @@ class Replaced(unittest.TestCase):
     def test_eslint_keeps_no_unused_vars(self):
         base = (ROOT / 'configs' / 'eslint.config.base.mjs').read_text()
         self.assertIn('"@typescript-eslint/no-unused-vars": [\n        "error"', base)
-
-
-class LocalMirror(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        sys.path.insert(0, str(ROOT))
-        import _ci_local
-
-        cls.ci_local = _ci_local
-
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='deadset-local-'))
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        self.addCleanup(self.ci_local._DETECT_CACHE.clear)  # noqa: SLF001
-
-    def test_local_detection_matches_the_ci_detect_body(self):
-        harness = Detect('test_a_mixed_repository_gets_one_root_target')
-        harness.setUp()
-        self.addCleanup(harness.doCleanups)
-        for i, files in enumerate((MIXED_WEB, NESTED, TS_ONLY, IMAGE_ONLY)):
-            with self.subTest(fixture=i):
-                ci = run_detect(harness, files)
-                local = self.ci_local.compute_local_detect(git_repo(self.tmp / str(i), files))
-                for key in ('deadset_targets', 'run_deadset', 'code_changed'):
-                    self.assertEqual(json.loads(local[key]), json.loads(ci[key]), key)
-
-    def test_the_check_runs_once_per_target_and_the_canary_never_runs(self):
-        os.symlink(ROOT, self.tmp / 'ci')
-        job = load(META)['jobs']['deadset']
-        cases = ((GO_ONLY, ['ci/deadset[.]/analyze']), (IMAGE_ONLY, []))
-        cases += ((NESTED, ['ci/deadset[.]/analyze', 'ci/deadset[yamlenv]/analyze']),)
-        for i, (files, names) in enumerate(cases):
-            with self.subTest(fixture=i):
-                repo = git_repo(self.tmp / f'r{i}', files)
-                expanded = self.ci_local._expand_job('ci/deadset', job, {}, repo)  # noqa: SLF001
-                self.assertEqual([name for name, *_ in expanded], names)
-                targets = [name.split('[')[1].split(']')[0] for name in names]
-                self.assertEqual([wd for _, _, wd, _ in expanded], targets)
-        applies = self.ci_local.job_applies_locally
-        image = git_repo(self.tmp / 'image', IMAGE_ONLY)
-        self.assertFalse(applies('ci/deadset/analyze', image))
-        self.assertTrue(applies('ci/deadset/analyze', git_repo(self.tmp / 'go', GO_ONLY)))
-        self.assertFalse(applies('ci/deadset-canary/analyze', self.tmp / 'go'))
-
-    def test_an_include_matrix_is_left_unexpanded(self):
-        job = {'strategy': {'matrix': {'include': [{'a': 1}, {'a': 2}]}}, 'steps': []}
-        expanded = self.ci_local._expand_job('deadset-canary', job, None, self.tmp)  # noqa: SLF001
-        self.assertEqual([name for name, *_ in expanded], ['deadset-canary'])
-
-    def test_the_preflight_reads_the_env_pins_where_the_check_applies(self):
-        os.symlink(ROOT, self.tmp / 'ci')
-        meta = {'jobs': {'deadset': {'uses': './.github/workflows/deadset-ci.yaml'}}}
-        chain = self.ci_local._workflow_env_chain  # noqa: SLF001
-        go = git_repo(self.tmp / 'go', GO_ONLY)
-        pins = self.ci_local.collect_pinned_versions([], chain(meta, go))
-        env = load(DEADSET_CI)['env']
-        self.assertEqual(pins['deadset'][0], env['DEADSET_VERSION'].removeprefix('v'))
-        self.assertEqual(pins['deadset-go'][0], env['DEADSET_GO_VERSION'].removeprefix('v'))
-        self.assertEqual(pins['deadset-ts'][0], env['DEADSET_TS_VERSION'])
-        image = git_repo(self.tmp / 'image', IMAGE_ONLY)
-        self.assertEqual(chain(meta, image), [])
-
-    def test_the_canary_is_reported_as_not_validated_in_cplieger_ci(self):
-        os.symlink(ROOT, self.tmp / 'ci')
-        repo = git_repo(self.tmp / 'repo', GO_ONLY)
-        canary = load(META)['jobs']['deadset-canary']
-        path = self.tmp / 'wf.yaml'
-        path.write_text(yaml.safe_dump({'jobs': {'deadset-canary': canary}}))
-        report = self.ci_local.REPORT
-        for repository, expected in (('cplieger/ci', 1), ('cplieger/marotte', 0)):
-            with self.subTest(repository=repository):
-                before = len(report.not_validated)
-                old = os.environ.get('GITHUB_REPOSITORY')
-                os.environ['GITHUB_REPOSITORY'] = repository
-                try:
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        self.ci_local.process_workflow_file(
-                            path, repo, dry_run=True, ignore_unknown=False, no_codeql=True
-                        )
-                finally:
-                    if old is None:
-                        os.environ.pop('GITHUB_REPOSITORY')
-                    else:
-                        os.environ['GITHUB_REPOSITORY'] = old
-                added = report.not_validated[before:]
-                del report.not_validated[before:]
-                self.assertEqual(
-                    len([e for e in added if e[0].startswith('deadset-canary')]), expected, added
-                )
-
-    def test_each_installed_version_is_read_the_way_the_tool_prints_it(self):
-        tools = self.ci_local._GO_INSTALLED  # noqa: SLF001
-        self.assertLessEqual({'deadset', 'deadset-go'}, tools)
-        self.assertEqual(self.ci_local._VERSION_ARGV['deadset-ts'], ['version'])  # noqa: SLF001
-        write_exec(
-            self.tmp / 'deadset-ts',
-            '#!/bin/sh\n[ "$1" = version ] || exit 2\necho "deadset-ts 6.0.1"\n'
-            'echo "contract 6.0.0"\n',
-        )
-        old_path = os.environ['PATH']
-        os.environ['PATH'] = f'{self.tmp}{os.pathsep}{old_path}'
-        self.addCleanup(os.environ.__setitem__, 'PATH', old_path)
-        self.ci_local._LOCAL_VERSION_CACHE.pop('deadset-ts', None)  # noqa: SLF001
-        self.addCleanup(self.ci_local._LOCAL_VERSION_CACHE.pop, 'deadset-ts', None)  # noqa: SLF001
-        self.assertEqual(self.ci_local._local_tool_version('deadset-ts'), '6.0.1')  # noqa: SLF001
-
-
-INSTALLER_NPM_STUB = """#!/usr/bin/env bash
-printf '%s\\n' "$*" >> "$STUB_LOG/npm"
-exit "${NPM_RC:-0}"
-"""
-
-INSTALLER_GO_STUB = """#!/usr/bin/env bash
-printf '%s GOTOOLCHAIN=%s\\n' "$*" "${GOTOOLCHAIN:-}" >> "$STUB_LOG/go"
-"""
-
-INSTALLER_DRIVER = """set -euo pipefail
-. "$INSTALLER_BODY"
-WF_DIR="$WF_DIR_UNDER_TEST"
-for f in $(declare -F | awk '{print $3}'); do
-  [ "$f" = "$KEEP" ] && continue
-  case "$f" in
-    install_* | advise_gotoolchain) eval "$f() { :; }" ;;
-  esac
-done
-main
-"""
-
-
-class LocalInstaller(unittest.TestCase):
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='deadset-installer-'))
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        self.bin = self.tmp / 'bin'
-        self.log = self.tmp / 'log'
-        for d in (self.bin, self.log):
-            d.mkdir()
-        for tool in ('bash', 'awk', 'grep', 'head', 'dirname', 'cat'):
-            found = shutil.which(tool)
-            self.assertIsNotNone(found, f'{tool} is needed to run the installer')
-            (self.bin / tool).symlink_to(found)
-        text = (ROOT / 'scripts' / 'install-local-tools.sh').read_text().rstrip()
-        self.assertTrue(text.endswith('\nmain "$@"'), 'the installer no longer ends in main "$@"')
-        self.body = self.tmp / 'installer.sh'
-        self.body.write_text(text.removesuffix('main "$@"'))
-        self.driver = self.tmp / 'driver.sh'
-        self.driver.write_text(INSTALLER_DRIVER)
-        self.env = load(DEADSET_CI)['env']
-        self.pin = self.env['DEADSET_TS_VERSION']
-
-    def install(
-        self,
-        installed: str | None = None,
-        npm: bool = True,
-        wf_dir: Path | None = None,
-        npm_rc: str = '0',
-        keep: str = 'install_deadset_ts',
-    ) -> tuple[int, str, str]:
-        if npm:
-            write_exec(self.bin / 'npm', INSTALLER_NPM_STUB)
-        write_exec(self.bin / 'go', INSTALLER_GO_STUB)
-        if installed is not None:
-            write_exec(
-                self.bin / 'deadset-ts',
-                f'#!/bin/sh\n[ "$1" = version ] || exit 2\necho "deadset-ts {installed}"\n',
-            )
-        proc = subprocess.run(
-            [str(self.bin / 'bash'), '--noprofile', '--norc', str(self.driver)],
-            env={
-                'PATH': str(self.bin),
-                'HOME': str(self.tmp),
-                'STUB_LOG': str(self.log),
-                'NPM_RC': npm_rc,
-                'KEEP': keep,
-                'INSTALLER_BODY': str(self.body),
-                'WF_DIR_UNDER_TEST': str(wf_dir or WORKFLOWS),
-            },
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        tool = 'go' if keep == 'install_go_tools' else 'npm'
-        tool_log = self.log / tool
-        return (
-            proc.returncode,
-            proc.stdout + proc.stderr,
-            tool_log.read_text() if tool_log.exists() else '',
-        )
-
-    def summary_line(self, version: str, status: str) -> re.Pattern[str]:
-        return re.compile(
-            rf'^  deadset-ts\s+{re.escape(version)}\s+{re.escape(status)}$', re.MULTILINE
-        )
-
-    def test_the_go_tools_install_at_the_workflow_pins(self):
-        rc, out, go = self.install(keep='install_go_tools')
-        self.assertEqual(rc, 0, out)
-        installs = go.splitlines()
-        for pkg, var in (
-            ('github.com/cplieger/deadset/cmd/deadset', 'DEADSET_VERSION'),
-            ('github.com/cplieger/deadset-go/cmd/deadset-go', 'DEADSET_GO_VERSION'),
-        ):
-            self.assertIn(f'install {pkg}@{self.env[var]} GOTOOLCHAIN=auto', installs)
-        self.assertTrue(any('golang.org/x/vuln/cmd/govulncheck@v' in i for i in installs), go)
-        self.assertNotIn('FAILED', out)
-
-    def test_main_installs_the_pinned_build_without_install_scripts(self):
-        rc, out, npm = self.install()
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(npm, f'install -g --ignore-scripts @cplieger/deadset-ts@{self.pin}\n')
-        self.assertRegex(out, self.summary_line(self.pin, 'npm -g'))
-
-    def test_the_version_comes_from_the_workflow_pin(self):
-        wf = self.tmp / 'workflows'
-        wf.mkdir()
-        (wf / 'deadset-ci.yaml').write_text(
-            'env:\n  # renovate: datasource=npm depName=@cplieger/deadset-ts\n'
-            '  DEADSET_TS_VERSION: 9.8.7\n'
-        )
-        rc, out, npm = self.install(wf_dir=wf)
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(npm, 'install -g --ignore-scripts @cplieger/deadset-ts@9.8.7\n')
-
-    def test_a_current_build_is_left_alone(self):
-        rc, out, npm = self.install(installed=self.pin)
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(npm, '')
-        self.assertRegex(out, self.summary_line(self.pin, 'already current'))
-
-    def test_a_stale_build_is_replaced(self):
-        rc, out, npm = self.install(installed='0.0.1')
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(npm, f'install -g --ignore-scripts @cplieger/deadset-ts@{self.pin}\n')
-
-    def test_each_failure_fails_the_run_and_names_deadset_ts(self):
-        empty = self.tmp / 'no-workflows'
-        empty.mkdir()
-        unpinned = self.tmp / 'unpinned-workflows'
-        unpinned.mkdir()
-        (unpinned / 'deadset-ci.yaml').write_text('DEADSET_TS_VERSION: 1.2.3\n')
-        cases = (
-            ('npm failed', {'npm_rc': '1'}),
-            ('npm not found', {'npm': False}),
-            ('no pin found', {'wf_dir': unpinned}),
-            ('no pin found', {'wf_dir': empty}),
-        )
-        for reason, kwargs in cases:
-            with self.subTest(reason=reason, **{k: str(v) for k, v in kwargs.items()}):
-                (self.bin / 'npm').unlink(missing_ok=True)
-                rc, out, _ = self.install(**kwargs)
-                self.assertEqual(rc, 1, out)
-                self.assertRegex(out, self.summary_line('-', f'FAILED: {reason}'))
-                self.assertIn('WARNING: 1 tool(s) not installed: deadset-ts', out)
 
 
 if __name__ == '__main__':

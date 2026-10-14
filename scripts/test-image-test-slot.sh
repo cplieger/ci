@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Pins the meta ci.yaml docker job's two image-test steps. Both are EXTRACTED
 # from the workflow at runtime, never mirrored: each `if:` goes through
-# _ci_local's evaluator and each body runs under GitHub's default `bash -e` in
-# a fixture checkout, so the probe cannot drift from what ships. CI_WORKFLOW
-# points it at another copy. SC2016: fixture bodies are literal text.
+# workflow_replay's evaluator and each body runs under GitHub's default
+# `bash -e` in a fixture checkout, so the probe cannot drift from what ships.
+# CI_WORKFLOW points it at another copy. SC2016: fixture bodies are literal
+# text.
 # shellcheck disable=SC2016
 set -euo pipefail
 
@@ -63,18 +64,26 @@ PY
 eval_if() {
   python3 -c '
 import sys
+from pathlib import Path
 sys.path.insert(0, sys.argv[1])
-from _ci_local import evaluate_step_if
-print(evaluate_step_if(open(sys.argv[2]).read(), {}, {}, sys.argv[3], {"build": sys.argv[4]}))
-' "$ROOT" "$1" "$2" "${3:-success}"
+import workflow_replay as wr
+root = Path(sys.argv[3])
+class Scope(wr.Scope):
+    def functions(self):
+        found = lambda *pats: "h" if any(p.is_file() for pat in pats for p in root.glob(pat)) else ""
+        return {**super().functions(), "hashFiles": found}
+steps = {"build": {"outcome": sys.argv[4]}}
+print(Scope({"steps": steps}, {}, []).condition(open(sys.argv[2]).read()))
+' "$ROOT/scripts" "$1" "$2" "${3:-success}"
 }
+# GitHub adds an implicit success() to a step `if:` that calls no status function.
 overrides_success() {
   python3 -c '
 import sys
 sys.path.insert(0, sys.argv[1])
-from _ci_local import overrides_implicit_success
-print(overrides_implicit_success(open(sys.argv[2]).read()))
-' "$ROOT" "$1"
+from workflow_replay import STATUS_CALL
+print(bool(STATUS_CALL.search(open(sys.argv[2]).read())))
+' "$ROOT/scripts" "$1"
 }
 
 run_body() {

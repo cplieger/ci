@@ -103,9 +103,9 @@ jobs:
             elif [ "$SHELLCHECK_PATHS" = "auto" ]; then
               # Discover every *.sh in the repo (nested included), matching the
               # ci.yaml `scripts` job. -x follows `source`d files. node_modules
-              # is excluded for LOCAL parity, not for CI: a CI checkout never
-              # has one, but ci-local runs in a working tree where npm ci has
-              # populated it (playwright-core ships .sh files that fail shfmt).
+              # is excluded so a working tree where npm ci ran gets a CI
+              # checkout's result (playwright-core ships .sh files that fail
+              # shfmt).
               files=$(find . -name '*.sh' -not -path './.git/*' -not -path '*/node_modules/*')
               if [ -z "$files" ]; then
                 echo "shellcheck: no *.sh found — skipping"

@@ -8,7 +8,7 @@ Reusable GitHub Actions workflows that lint, test, sign and release every cplieg
 - One release workflow, `release.yaml`, that computes the next version from conventional commits with git-cliff. It publishes a Docker image for `amd64` and `arm64` signed with cosign, npm and JSR packages, or a Go module tag.
 - Security scans with CodeQL, Trivy and gitleaks. Trivy and the full-history gitleaks scan report to the Security tab and never block a merge.
 - Lint, format and changelog configs for golangci-lint, ESLint, Prettier, Stylelint, html-validate, Ruff and git-cliff. A sync job copies them into each cplieger repository as pull requests.
-- Seven composite actions, and `ci-local.sh`, which replays the CI checks on your machine.
+- Eight composite actions.
 
 [Reusable workflows](docs/workflows.md) lists what each workflow runs. [Synced files](docs/synced-files.md) lists every config and which repositories receive it.
 
@@ -68,8 +68,7 @@ Copying a workflow and adapting it is the other way to reuse one. To build your 
 
 ## Running the checks locally
 
-- `bash ci-local.sh`, from the root of a repository that calls `ci.yaml`, replays its CI checks. It reads the workflows from a `ci/` checkout beside the repository when one exists, and otherwise fetches them at the pinned commit with `gh`. `--path SUBDIR` limits the run to one folder, and `--plan-only` prints the plan without running it. Its summary lists every check it could not run on your machine, so a local pass with such checks is not a full CI pass.
-- `scripts/install-local-tools.sh` installs the tool versions CI pins, so local results match CI.
+The checks run in GitHub Actions on every pull request and on every push to `dev` or `main`. To check a change before you push it, run the same tools directly, for example `go test -race ./...`, `golangci-lint run`, `shellcheck` or `ruff check`. [Reusable workflows](docs/workflows.md) lists the tools each workflow runs, and the files in `.github/workflows/` hold the exact commands.
 
 ## Documentation
 
