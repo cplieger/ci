@@ -593,6 +593,70 @@ class TrackerIssueTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn('PATCH repos/cplieger/x/issues/42: HTTP 422 Validation Failed', proc.stderr)
 
+    # --- --any-title ------------------------------------------------------
+
+    def test_any_title_upsert_retitles_the_one_issue_under_the_label(self) -> None:
+        other = {**TRACKER_ISSUE, 'title': 'An older wording'}
+        proc = self.run_tracker(
+            {'open_issues': [other, FUZZ_ISSUE]},
+            *self.tracker_args('--any-title', '--mode', 'upsert', '--body-file', str(self.body)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.writes(), ['PATCH issue'])
+        self.assertEqual(
+            self.last('PATCH issue')['body'],
+            {'body': '# new body\n', 'title': TRACKER_ISSUE['title']},
+        )
+
+    def test_any_title_upsert_leaves_a_matching_title_alone(self) -> None:
+        proc = self.run_tracker(
+            {'open_issues': [TRACKER_ISSUE]},
+            *self.tracker_args('--any-title', '--mode', 'upsert', '--body-file', str(self.body)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.last('PATCH issue')['body'], {'body': '# new body\n'})
+
+    def test_any_title_with_two_issues_under_the_label_writes_nothing(self) -> None:
+        twin = {**TRACKER_ISSUE, 'number': 43, 'title': 'Another'}
+        for mode in (
+            ('--mode', 'upsert', '--body-file', str(self.body)),
+            ('--mode', 'close-when-clean', '--comment-file', str(self.comment)),
+        ):
+            with self.subTest(mode=mode[1]):
+                proc = self.run_tracker(
+                    {'open_issues': [TRACKER_ISSUE, twin]},
+                    *self.tracker_args('--any-title', *mode),
+                )
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertIn('#42, #43', proc.stderr)
+                self.assertEqual(self.writes(), [])
+
+    def test_any_title_fetch_and_close_need_no_title(self) -> None:
+        other = {**TRACKER_ISSUE, 'title': 'An older wording'}
+        body, title = self.tmp / 'existing.md', self.tmp / 'title.txt'
+        label = ('--label', 'gremlins-tracker', '--any-title')
+        proc = self.run_tracker(
+            {'open_issues': [other]},
+            *label,
+            *('--mode', 'fetch', '--body-file', str(body), '--title-file', str(title)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual((body.read_text(), title.read_text()), (other['body'], other['title']))
+        proc = self.run_tracker(
+            {},
+            *label,
+            *('--mode', 'fetch', '--body-file', str(body), '--title-file', str(title)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual((body.read_text(), title.read_text()), ('', ''))
+        proc = self.run_tracker(
+            {'open_issues': [other]},
+            *label,
+            *('--mode', 'close-when-clean', '--comment-file', str(self.comment)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.writes(), ['POST comment', 'PATCH issue'])
+
     # --- argument contract ------------------------------------------------
 
     def test_argument_contract(self) -> None:
@@ -615,6 +679,33 @@ class TrackerIssueTest(unittest.TestCase):
             ),
             ('--label', 'x', '--mode', 'list', '--flag-label', 'f', '--flag', 'on'),
             ('--label', 'x', '--mode', 'list', '--assignee', 'cplieger'),
+            ('--label', 'x', '--any-title', '--mode', 'upsert', '--body-file', str(self.body)),
+            ('--label', 'x', '--any-title', '--mode', 'list'),
+            (
+                '--label',
+                'x',
+                '--title',
+                't',
+                '--any-title',
+                '--mode',
+                'recur',
+                '--body-file',
+                str(self.body),
+                '--comment-file',
+                str(self.comment),
+            ),
+            (
+                '--label',
+                'x',
+                '--title',
+                't',
+                '--mode',
+                'upsert',
+                '--body-file',
+                str(self.body),
+                '--title-file',
+                str(self.body),
+            ),
         )
         for case in cases:
             with self.subTest(case=case):

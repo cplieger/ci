@@ -30,8 +30,13 @@ Modes (`--mode`):
 
 `fetch`, `upsert` and `close-when-clean` find the issue by --label plus exact
 --title; `recur` by exact title among every open issue (a finding's title is
-its identity, so the label is not part of the match). After `upsert` or
-`recur`, `--flag-label NAME --flag on|off` adds or removes NAME on the issue.
+its identity, so the label is not part of the match). With `--any-title` the
+label alone identifies the issue, for a writer that keeps one issue per repo
+and words its title from what the issue holds: only `upsert` then takes
+--title, which it also sets on the open issue, `fetch --title-file` writes the
+current title, and more than one open issue under the label is an error.
+After `upsert` or `recur`, `--flag-label NAME --flag on|off` adds or removes
+NAME on the issue.
 `--assignee LOGIN` assigns LOGIN on a created issue and on an open one that
 lacks it; a failed assignment of an open issue warns and the run goes on.
 
@@ -59,7 +64,7 @@ LABELS = {
     'fuzz-finding': ('b60205', 'Fuzz-discovered regression'),
     'gremlins-tracker': ('5319e7', 'Gremlins mutation testing tracker'),
     'mutation-regression': ('b60205', 'Mutation efficacy regression'),
-    'release-blocked': ('b60205', 'Something that reached main has not shipped'),
+    'release-blocked': ('b60205', 'main has not shipped, or a fix needs a manual route'),
     'repo-audit': ('d93f0b', 'Repository governance audit findings'),
     'stryker-tracker': ('1d76db', 'Stryker mutation testing tracker'),
     'weekly-ci-failure': ('b60205', 'An unwatched CI run failed and needs triage'),
@@ -113,6 +118,22 @@ def find_open(repo: str, title: str, label: str = '') -> dict | None:
         if issue.get('title') == title:
             return issue
     return None
+
+
+def find_by_label(repo: str, label: str) -> dict | None:
+    """The one open issue under `label`, whatever its title; GhError when there are
+    several, since editing either could leave the other stale."""
+    issues = open_issues(repo, label)
+    if len(issues) > 1:
+        numbers = ', '.join(f'#{issue["number"]}' for issue in issues)
+        raise GhError(f'more than one open issue carries {label}: {numbers}')
+    return issues[0] if issues else None
+
+
+def find_issue(args: argparse.Namespace) -> dict | None:
+    if args.any_title:
+        return find_by_label(args.repo, args.label)
+    return find_open(args.repo, args.title, label=args.label)
 
 
 def label_names(issue: dict) -> set[str]:
@@ -178,17 +199,22 @@ def create_labels(args: argparse.Namespace) -> list[str]:
 
 
 def mode_fetch(args: argparse.Namespace) -> int:
-    issue = find_open(args.repo, args.title, label=args.label)
+    issue = find_issue(args)
     args.body_file.write_text((issue.get('body') or '') if issue else '')
+    if args.title_file:
+        args.title_file.write_text((issue.get('title') or '') if issue else '')
     print(f'fetched #{issue["number"]}' if issue else 'no open issue to fetch')
     return 0
 
 
 def mode_upsert(args: argparse.Namespace) -> int:
-    issue = find_open(args.repo, args.title, label=args.label)
+    issue = find_issue(args)
     if issue:
         number, current = issue['number'], label_names(issue)
-        api('PATCH', f'repos/{args.repo}/issues/{number}', {'body': args.body_file.read_text()})
+        edit = {'body': args.body_file.read_text()}
+        if issue.get('title') != args.title:
+            edit['title'] = args.title
+        api('PATCH', f'repos/{args.repo}/issues/{number}', edit)
         print(f'updated #{number} in {args.repo}')
         ensure_assignee(args.repo, issue, args.assignee)
     else:
@@ -221,9 +247,9 @@ def mode_recur(args: argparse.Namespace) -> int:
 
 
 def mode_close_when_clean(args: argparse.Namespace) -> int:
-    issue = find_open(args.repo, args.title, label=args.label)
+    issue = find_issue(args)
     if not issue:
-        print(f'no open issue to close in {args.repo}: {args.title}')
+        print(f'no open issue to close in {args.repo}: {args.title or args.label}')
         return 0
     path = f'repos/{args.repo}/issues/{issue["number"]}'
     api('POST', f'{path}/comments', {'body': args.comment_file.read_text()})
@@ -249,6 +275,7 @@ NEEDS_TITLE = {'fetch', 'upsert', 'recur', 'close-when-clean'}
 NEEDS_BODY = {'fetch', 'upsert', 'recur'}
 NEEDS_COMMENT = {'recur', 'close-when-clean'}
 TAKES_FLAG = {'upsert', 'recur'}
+TAKES_ANY_TITLE = {'fetch', 'upsert', 'close-when-clean'}
 
 
 def parse_args(
@@ -259,7 +286,11 @@ def parse_args(
     )
     p.add_argument('--repo', required=True, help='OWNER/NAME')
     p.add_argument('--label', required=True, help='the label that identifies this writer')
-    p.add_argument('--title', default='', help='exact issue title (every mode but list)')
+    p.add_argument(
+        '--title',
+        default='',
+        help='exact issue title for every mode but list, or for upsert only with --any-title',
+    )
     p.add_argument('--mode', required=True, choices=sorted(MODES))
     p.add_argument(
         '--body-file', type=Path, help='issue body: read by upsert/recur, written by fetch'
@@ -274,9 +305,19 @@ def parse_args(
     p.add_argument('--flag-label', default='', help='label to add or remove after upsert/recur')
     p.add_argument('--flag', choices=['on', 'off'], help='add (on) or remove (off) --flag-label')
     p.add_argument('--assignee', default='', help='login to assign after upsert/recur')
+    p.add_argument(
+        '--any-title',
+        action='store_true',
+        help='match the open issue by --label alone, and let upsert set --title on it',
+    )
+    p.add_argument('--title-file', type=Path, help="fetch writes the open issue's title here")
     args = p.parse_args(argv)
 
-    if args.mode in NEEDS_TITLE and not args.title:
+    if (
+        args.mode in NEEDS_TITLE
+        and not args.title
+        and not (args.any_title and args.mode != 'upsert')
+    ):
         p.error(f'--title is required for --mode {args.mode}')
     if args.mode in NEEDS_BODY and args.body_file is None:
         p.error(f'--body-file is required for --mode {args.mode}')
@@ -288,6 +329,10 @@ def parse_args(
         p.error(f'--flag-label applies to {", ".join(sorted(TAKES_FLAG))}, not {args.mode}')
     if args.assignee and args.mode not in TAKES_FLAG:
         p.error(f'--assignee applies to {", ".join(sorted(TAKES_FLAG))}, not {args.mode}')
+    if args.any_title and args.mode not in TAKES_ANY_TITLE:
+        p.error(f'--any-title applies to {", ".join(sorted(TAKES_ANY_TITLE))}, not {args.mode}')
+    if args.title_file and args.mode != 'fetch':
+        p.error(f'--title-file applies to fetch, not {args.mode}')
     if args.label in RESERVED_LABELS and args.mode not in READ_MODES and not allow_reserved:
         p.error(
             f'--label {args.label} is reserved for its own writer. Only fetch and list take it.'
@@ -305,6 +350,8 @@ def main(argv: list[str] | None = None, *, allow_reserved: bool = False) -> int:
         )
         if args.mode == 'fetch':
             args.body_file.write_text('')
+            if args.title_file:
+                args.title_file.write_text('')
         return 0
     try:
         return MODES[args.mode](args)

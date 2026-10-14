@@ -2,8 +2,8 @@
 # (scripts/release_maintenance.py): merges the green, allowlisted Renovate
 # security pull requests on either branch, expedites the `main` group or opens a
 # rebuild for a fixable finding of the daily scan of `main`, and keeps one
-# `Release blocked` issue per repository. A repository whose default branch is
-# main is never read. Minute 23 keeps clear of Renovate's hourly run.
+# issue per repository, titled by what it holds. A repository whose default
+# branch is main is never read. Minute 23 keeps clear of Renovate's hourly run.
 name: Release maintenance
 
 on:
