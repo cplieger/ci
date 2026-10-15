@@ -1,14 +1,13 @@
 name: publish-badge
 description: >-
   Publish or update one shields `endpoint` JSON on a repo's orphan `badges`
-  branch, preserving sibling badge files (mutation.json and size.json coexist
-  instead of clobbering each other on force-push). Wraps
-  publish-badge.sh in this directory. Referenced by
-  docker-release.yaml as cplieger/ci/actions/publish-badge@<sha> — a composite
+  branch, preserving sibling badge files (size.json, mutation.json and
+  mutation-ts.json coexist, also when two writers publish at once).
+  Wraps publish-badge.sh in this directory. docker-release.yaml references
+  it as cplieger/ci/actions/publish-badge@<sha> for size.json: a composite
   action MUST be pinned by ref (a local ./ path would resolve against the
-  consumer's checkout and 404); Renovate keeps the pin current. This replaced
-  fetching the script from raw.githubusercontent.com/…/main at run time, which
-  executed whatever HEAD held instead of the version the consumer pinned.
+  consumer's checkout and 404); Renovate keeps the pin current.
+  weekly-gremlins.yaml and weekly-stryker.yaml run the script directly.
 
 inputs:
   repo:
@@ -18,7 +17,7 @@ inputs:
     description: Token with contents:write on the target repo.
     required: true
   filename:
-    description: Badge file to write, e.g. coverage.json | mutation.json | size.json.
+    description: Badge file to write, e.g. size.json | mutation.json | mutation-ts.json.
     required: true
   json:
     description: Full one-line shields endpoint JSON for the badge.

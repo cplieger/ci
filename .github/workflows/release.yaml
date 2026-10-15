@@ -760,7 +760,7 @@ jobs:
     needs: [detect, repair-notes, repair-release, repair-publish]
     if: ${{ !cancelled() && needs.detect.outputs.repairs != '' && needs.detect.outputs.repairs != '[]' }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
       statuses: write
@@ -836,7 +836,7 @@ jobs:
     if: |
       needs.detect.outputs.channel == 'stable' && needs.detect.outputs.in_range_any == 'true'
     runs-on: ubuntu-26.04
-    timeout-minutes: 160
+    timeout-minutes: 195
     permissions:
       actions: write
       contents: read
@@ -1132,7 +1132,7 @@ jobs:
     needs: [detect, renumber-ts]
     if: ${{ needs.renumber-ts.outputs.npm_version != '' }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 10
+    timeout-minutes: 25
     permissions:
       contents: write
       statuses: write
@@ -1189,9 +1189,6 @@ jobs:
           LANE_KEY: .
           DEV_VERSION: ${{ needs.renumber-ts.outputs.npm_version }}
           REPO_TYPE: ts
-          # The npm readback's wait (scripts/retry.sh), sized to end inside
-          # this job's timeout, which the barrier's renumber reserve counts.
-          REGISTRY_WAIT_SECONDS: 300
         run: |
           set -euo pipefail
           bash "$CI_TOOLS/release-state.sh" renumber
@@ -1618,16 +1615,9 @@ jobs:
           # token when a mid-run push moved the branch past $GITHUB_SHA; the git
           # ref create has no head restriction. A dev build gets the tag, its
           # receipt and no Release.
-          CREATED=false
-          if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
-            if [ "$EXISTING" != "$GITHUB_SHA" ]; then
-              echo "::error::Tag ${VERSION} exists at ${EXISTING}, not ${GITHUB_SHA}; refusing."
-              exit 1
-            fi
-          else
-            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
-            CREATED=true
-          fi
+          . "$CI_TOOLS/retry.sh"
+          . "$CI_TOOLS/tag-ref.sh"
+          tag_ref "$GITHUB_REPOSITORY" "$VERSION" "$GITHUB_SHA" || exit 1
           if [ "$CHANNEL" != "stable" ]; then
             # The audit reads this receipt: a dev tag has no Release to show
             # that the pipeline, not a hand, created it. A tag without it would
@@ -1637,7 +1627,7 @@ jobs:
               -f state=success -f context="release/tag/${VERSION}" \
               -f description="created by the dev release run" \
               -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
-              if [ "$CREATED" = true ]; then
+              if [ "$TAG_CREATED" = true ]; then
                 echo "::error::receipt for ${VERSION} not recorded; deleting the tag this run created so a rerun recreates both"
                 gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}" >/dev/null
               fi
@@ -1792,16 +1782,9 @@ jobs:
           # token when a mid-run push moved the branch past $GITHUB_SHA; the git
           # ref create has no head restriction. A dev build gets the tag, its
           # receipt and no Release.
-          CREATED=false
-          if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
-            if [ "$EXISTING" != "$GITHUB_SHA" ]; then
-              echo "::error::Tag ${VERSION} exists at ${EXISTING}, not ${GITHUB_SHA}; refusing."
-              exit 1
-            fi
-          else
-            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
-            CREATED=true
-          fi
+          . "$CI_TOOLS/retry.sh"
+          . "$CI_TOOLS/tag-ref.sh"
+          tag_ref "$GITHUB_REPOSITORY" "$VERSION" "$GITHUB_SHA" || exit 1
           if [ "$CHANNEL" != "stable" ]; then
             # The audit reads this receipt: a dev tag has no Release to show
             # that the pipeline, not a hand, created it. A tag without it would
@@ -1811,7 +1794,7 @@ jobs:
               -f state=success -f context="release/tag/${VERSION}" \
               -f description="created by the dev release run" \
               -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
-              if [ "$CREATED" = true ]; then
+              if [ "$TAG_CREATED" = true ]; then
                 echo "::error::receipt for ${VERSION} not recorded; deleting the tag this run created so a rerun recreates both"
                 gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}" >/dev/null
               fi
@@ -2042,16 +2025,9 @@ jobs:
           # the exists-at-different-SHA refuse guard (mirrors the root go
           # job; slash tags are ordinary multi-segment refs). A dev lane
           # build gets the tag, its receipt and no Release.
-          CREATED=false
-          if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
-            if [ "$EXISTING" != "$GITHUB_SHA" ]; then
-              echo "::error::Tag ${VERSION} exists at ${EXISTING}, not ${GITHUB_SHA}; refusing."
-              exit 1
-            fi
-          else
-            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${VERSION}" -f sha="${GITHUB_SHA}"
-            CREATED=true
-          fi
+          . "$CI_TOOLS/retry.sh"
+          . "$CI_TOOLS/tag-ref.sh"
+          tag_ref "$GITHUB_REPOSITORY" "$VERSION" "$GITHUB_SHA" || exit 1
           if [ "$CHANNEL" != "stable" ]; then
             # The audit reads this receipt: a dev tag has no Release to show
             # that the pipeline, not a hand, created it. A tag without it would
@@ -2061,7 +2037,7 @@ jobs:
               -f state=success -f context="release/tag/${VERSION}" \
               -f description="created by the dev release run" \
               -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
-              if [ "$CREATED" = true ]; then
+              if [ "$TAG_CREATED" = true ]; then
                 echo "::error::receipt for ${VERSION} not recorded; deleting the tag this run created so a rerun recreates both"
                 gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}" >/dev/null
               fi
@@ -2095,7 +2071,7 @@ jobs:
           || needs.subpackage.result == 'success'
           || needs.go-nested.result == 'success')
     runs-on: ubuntu-slim
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
     steps:
@@ -2178,7 +2154,7 @@ jobs:
           probe_ts() { # <package.json>
             local pkg
             pkg=$(jq -r .name "$1")
-            probe "npm ${pkg}@${ver}" "https://registry.npmjs.org/${pkg}/${ver}" || rc=1
+            REGISTRY_WAIT_SECONDS=$NPM_SCAN_SECONDS probe "npm ${pkg}@${ver}" "https://registry.npmjs.org/${pkg}/${ver}" || rc=1
             if [ "$CHANNEL" = "stable" ]; then
               probe "jsr ${pkg}@${ver}" "https://jsr.io/${pkg}/${ver}_meta.json" || rc=1
             fi
@@ -2193,6 +2169,17 @@ jobs:
             fi
           }
 
+          # npm's bound is the longest on the shared clock (retry.sh), so npm
+          # waits first; the proxy probed after it gets what its own bound left.
+          if [ "$TS_RESULT" = "success" ]; then
+            probe_ts package.json
+          fi
+          if [ "$SUBPACKAGE_RESULT" = "success" ]; then
+            while IFS= read -r d; do
+              [ -z "$d" ] && continue
+              probe_ts "$d/package.json"
+            done < <(jq -r '.[]' <<<"$SUBPACKAGES_JSON")
+          fi
           if [ "$GO_RESULT" = "success" ]; then
             probe_go go.mod "$VERSION" || rc=1
           fi
@@ -2207,15 +2194,6 @@ jobs:
                 probe_go "$d/go.mod" "${tag#"$d"/}" || rc=1
               done < <(lane_tags_at_head "$d")
             done < <(jq -r '.[]' <<<"$GO_LANES_JSON")
-          fi
-          if [ "$TS_RESULT" = "success" ]; then
-            probe_ts package.json
-          fi
-          if [ "$SUBPACKAGE_RESULT" = "success" ]; then
-            while IFS= read -r d; do
-              [ -z "$d" ] && continue
-              probe_ts "$d/package.json"
-            done < <(jq -r '.[]' <<<"$SUBPACKAGES_JSON")
           fi
           exit "$rc"
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import functools
 import io
 import json
 import os
@@ -2171,6 +2172,149 @@ class MergeChecked(unittest.TestCase):
             )
         self.assertNotIn(delete, gh.called(), 'a refused merge deletes nothing')
 
+    def direct_merge(self, reads, merges):
+        """merge_checked's direct merge of repo-sync/ci/main #5, the pull request read as
+        each of `reads` in turn and the merge answered as each of `merges` in turn."""
+        merge, delete = f'PUT {P}/pulls/5/merge', f'DELETE {P}/git/refs/heads/repo-sync/ci/main'
+        gh = FakeGh(
+            {
+                f'GET {P}/pulls/5': lambda _args, _stdin: reads.pop(0),
+                f'GET {P}/commits/{SHA}/{CHECKS}': GREEN,
+                merge: lambda _args, _stdin: merges.pop(0),
+                delete: b'',
+            }
+        )
+        call = functools.partial(
+            rm.merge_checked, rm.Api(gh), R, 5, run=gh, base='main', head='repo-sync/ci/main'
+        )
+        return gh, call, merge, delete
+
+    def test_a_merge_refused_while_the_base_moved_is_retried_once_at_the_head_it_pinned(self):
+        for code in (405, 409):
+            with self.subTest(code=code):
+                head = pr(5, 'repo-sync/ci/main')
+                gh, call, merge, delete = self.direct_merge(
+                    [head, head], [Status(code, {'message': 'Base branch was modified.'}), {}]
+                )
+                self.assertEqual(call(arm=False), 'merged')
+                self.assertEqual(
+                    [c for c in gh.called() if c.startswith(('GET', 'PUT', 'DELETE'))][-4:],
+                    [merge, f'GET {P}/pulls/5', merge, delete],
+                )
+                bodies = [json.loads(s) for a, s in gh.calls if request_key(a) == merge]
+                self.assertEqual(bodies, [{'merge_method': 'squash', 'sha': SHA}] * 2)
+
+    def test_a_refused_merge_is_never_retried_past_a_changed_head_or_base(self):
+        moved = pr(5, 'repo-sync/ci/main', sha='f' * 40)
+        retargeted = pr(5, 'repo-sync/ci/main', 'dev')
+        for name, reread, want in (
+            ('head moved', moved, f'not merged: its head moved from {SHA[:12]} to ffffffffffff'),
+            ('retargeted', retargeted, 'not merged: the pull request is not repo-sync/ci/main'),
+            ('closed', {**moved, 'state': 'closed'}, 'not merged: the pull request is closed'),
+        ):
+            with self.subTest(name):
+                gh, call, merge, delete = self.direct_merge(
+                    [pr(5, 'repo-sync/ci/main'), reread], [Status(409), {}]
+                )
+                self.assertTrue(call(arm=False).startswith(want))
+                self.assertEqual(gh.called().count(merge), 1)
+                self.assertNotIn(delete, gh.called())
+
+    def test_a_refused_merge_another_writer_completed_reports_it_merged(self):
+        done = pr(5, 'repo-sync/ci/main', merged='2026-10-10T03:00:00Z')
+        gh, call, merge, _ = self.direct_merge([pr(5, 'repo-sync/ci/main'), done], [Status(405)])
+        self.assertEqual(call(arm=False), 'merged')
+        self.assertEqual(gh.called().count(merge), 1)
+
+    def test_a_refused_merge_another_writer_completed_elsewhere_is_never_reported_merged(self):
+        at = '2026-10-10T03:00:00Z'
+        for name, done, want in (
+            (
+                'head moved',
+                pr(5, 'repo-sync/ci/main', sha='f' * 40, merged=at),
+                f'not merged: its head moved from {SHA[:12]} to ffffffffffff',
+            ),
+            (
+                'retargeted',
+                pr(5, 'repo-sync/ci/main', 'dev', merged=at),
+                'not merged: the pull request is not repo-sync/ci/main',
+            ),
+            (
+                'other head',
+                pr(5, 'repo-sync/ci/dev', merged=at),
+                'not merged: the pull request is not repo-sync/ci/main',
+            ),
+            (
+                'fork head',
+                pr(5, 'repo-sync/ci/main', fork=True, merged=at),
+                'not merged: the pull request is not repo-sync/ci/main',
+            ),
+        ):
+            with self.subTest(name):
+                gh, call, merge, delete = self.direct_merge(
+                    [pr(5, 'repo-sync/ci/main'), done], [Status(405)]
+                )
+                result = call(arm=False)
+                self.assertTrue(result.startswith(want), result)
+                self.assertIn('another writer merged it', result)
+                self.assertEqual(gh.called().count(merge), 1)
+                self.assertNotIn(delete, gh.called())
+
+    def test_a_refused_merge_another_writer_completed_without_its_labels_is_not_merged(self):
+        labels = frozenset({'security'})
+        head = pr(5, 'renovate/x', labels=('security',))
+        for name, done in (
+            ('label gone', pr(5, 'renovate/x', merged='2026-10-10T03:00:00Z')),
+            (
+                'security-major',
+                pr(5, 'renovate/x', labels=('security', 'security-major'), merged='2026-10-10'),
+            ),
+        ):
+            with self.subTest(name):
+                reads = [head, done]
+                merge = f'PUT {P}/pulls/5/merge'
+                delete = f'DELETE {P}/git/refs/heads/renovate/x'
+                gh = FakeGh(
+                    {
+                        f'GET {P}/pulls/5': lambda _args, _stdin, r=reads: r.pop(0),
+                        f'GET {P}/commits/{SHA}/{CHECKS}': GREEN,
+                        merge: Status(409),
+                        delete: b'',
+                    }
+                )
+                result = rm.merge_checked(
+                    rm.Api(gh),
+                    R,
+                    5,
+                    gh,
+                    base='main',
+                    head_prefix='renovate/',
+                    labels=labels,
+                    arm=False,
+                )
+                self.assertTrue(
+                    result.startswith('not merged: its labels no longer allow an unattended merge'),
+                    result,
+                )
+                self.assertIn('another writer merged it', result)
+                self.assertEqual(gh.called().count(merge), 1)
+                self.assertNotIn(delete, gh.called())
+
+    def test_a_merge_refused_twice_or_for_another_reason_raises_without_deleting(self):
+        head = pr(5, 'repo-sync/ci/main')
+        for name, merges, puts in (
+            ('refused again', [Status(405), Status(405)], 2),
+            ('forbidden', [Status(403)], 1),
+            ('unprocessable', [Status(422)], 1),
+        ):
+            with self.subTest(name):
+                gh, call, merge, delete = self.direct_merge([head, head], merges)
+                with self.assertRaises(rm.GhError):
+                    call(arm=False)
+                self.assertEqual(gh.called().count(merge), puts)
+                self.assertEqual(gh.called().count(f'GET {P}/pulls/5'), puts)
+                self.assertNotIn(delete, gh.called())
+
     def test_auto_merge_is_armed_only_after_the_read_and_pinned_to_the_head_it_read(self):
         auto = (
             f'pr merge 5 -R cplieger/{R} --squash --delete-branch --auto --match-head-commit {SHA}'
@@ -2216,6 +2360,30 @@ class MergeChecked(unittest.TestCase):
         result = rm.merge_checked(api, R, 5, run=api.command, base='main', head='repo-sync/ci/main')
         self.assertEqual(result, 'merged')
         self.assertEqual(gh.called(), [f'GET {P}/pulls/5'] * 2)
+
+    def test_an_arm_refused_by_a_rate_limit_beside_a_merge_from_another_head_is_not_merged(self):
+        at = '2026-10-10T03:00Z'
+        for name, done in (
+            ('head moved', pr(5, 'repo-sync/ci/main', sha='f' * 40, merged=at)),
+            ('retargeted', pr(5, 'repo-sync/ci/main', 'dev', merged=at)),
+        ):
+            with self.subTest(name):
+                reads = [pr(5, 'repo-sync/ci/main'), done]
+                gh = FakeGh({f'GET {P}/pulls/5': lambda _args, _stdin, r=reads: r.pop(0)})
+                limited = subprocess.CompletedProcess(
+                    [], 1, b'', b'GraphQL: API rate limit exceeded'
+                )
+
+                def run(args, stdin=None, timeout=None, gh=gh, limited=limited):
+                    return limited if args[0] == 'pr' else gh(args, stdin, timeout)
+
+                api = rm.Api(run)
+                result = rm.merge_checked(
+                    api, R, 5, run=api.command, base='main', head='repo-sync/ci/main'
+                )
+                self.assertTrue(result.startswith('not merged: '), result)
+                self.assertIn('another writer merged it', result)
+                self.assertEqual(gh.called(), [f'GET {P}/pulls/5'] * 2)
 
     def test_a_command_failure_is_a_gh_error_and_a_rate_limit_its_own(self):
         cases = (

@@ -127,7 +127,12 @@ SECTION_TITLES = {
 
 
 class GhError(Exception):
-    """A gh call that failed; the message carries the API's or gh's error."""
+    """A gh call that failed; the message carries the API's or gh's error, and
+    `status` the HTTP status of a REST refusal (None otherwise)."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 class RateLimitedError(GhError):
@@ -164,7 +169,7 @@ class Api:
         try:
             return fn(*args)
         except ghrest.ApiError as err:
-            raise GhError(str(err)) from None
+            raise GhError(str(err), err.status) from None
 
     def get(self, path: str):
         return self._call(self.rest.get, path)
@@ -1110,26 +1115,43 @@ def merge_checked(
     that head. GitHub refuses to arm a pull request that is already mergeable, and a
     direct merge (a squash pinned to that head, then the head branch deleted) also needs
     every latest `ci / validate` from GitHub Actions green there: the rulesets exempt an
-    admin credential from the check. An arm refused by a rate limit leaves it open,
-    unless a re-read finds it merged."""
+    admin credential from the check. An arm refused by a rate limit leaves it open. A
+    direct merge refused with 405 or 409 is sent once more, pinned to the same head,
+    once a re-read finds it still open from that head into `base` with its labels.
+    After either refusal, a re-read finding it merged is `merged` only when it still
+    passes every check above at the head first read."""
     if base not in ('dev', 'main'):
         raise ValueError(f'base must be dev or main, got {base!r}')
+
+    def off_course(pr: dict, sha: str) -> str:
+        ref = pr['head'].get('ref') or ''
+        if (
+            pr['base'].get('ref') != base
+            or not own_head(pr, repo)
+            or (head and ref != head)
+            or not ref.startswith(head_prefix)
+        ):
+            return f'not merged: the pull request is not {head or head_prefix or "a head"} of {OWNER}/{repo} into {base}'
+        if sha and pr['head']['sha'] != sha:
+            return f'not merged: its head moved from {sha[:12]} to {pr["head"]["sha"][:12]}'
+        if labels and (not labels_of(pr) & labels or 'security-major' in labels_of(pr)):
+            return 'not merged: its labels no longer allow an unattended merge'
+        return ''
+
+    def left_open(pr: dict, sha: str) -> str:
+        if pr.get('state') != 'open':
+            return f'not merged: the pull request is {pr.get("state")}'
+        return off_course(pr, sha)
+
+    def already_merged(pr: dict) -> str:
+        if why := off_course(pr, at):
+            return f'{why}, though another writer merged it'
+        return 'merged'
+
     pr = api.get(f'repos/{OWNER}/{repo}/pulls/{number}')
-    at = pr['head']['sha']
-    if pr.get('state') != 'open':
-        return f'not merged: the pull request is {pr.get("state")}'
-    ref = pr['head'].get('ref') or ''
-    if (
-        pr['base'].get('ref') != base
-        or not own_head(pr, repo)
-        or (head and ref != head)
-        or not ref.startswith(head_prefix)
-    ):
-        return f'not merged: the pull request is not {head or head_prefix or "a head"} of {OWNER}/{repo} into {base}'
-    if sha and at != sha:
-        return f'not merged: its head moved from {sha[:12]} to {at[:12]}'
-    if labels and (not labels_of(pr) & labels or 'security-major' in labels_of(pr)):
-        return 'not merged: its labels no longer allow an unattended merge'
+    at, ref = pr['head']['sha'], pr['head'].get('ref') or ''
+    if why := left_open(pr, sha):
+        return why
     refused = ''
     if arm:
         args = ['pr', 'merge', str(number), '-R', f'{OWNER}/{repo}', '--squash', '--delete-branch']
@@ -1138,14 +1160,28 @@ def merge_checked(
             return 'armed'
         except RateLimitedError as exc:
             # `gh pr merge` is several requests, and the refused one can follow the merge.
-            if api.get(f'repos/{OWNER}/{repo}/pulls/{number}').get('merged_at'):
-                return 'merged'
+            if (again := api.get(f'repos/{OWNER}/{repo}/pulls/{number}')).get('merged_at'):
+                return already_merged(again)
             return f'not merged: auto-merge was refused by a rate limit ({exc})'
         except GhError as exc:
             refused = f'auto-merge refused ({exc}) and '
     if not validate_green(api, repo, at):
         return f'not merged: {refused}`{VALIDATE_CHECK}` is not green at {at[:12]}'
-    api.put(f'repos/{OWNER}/{repo}/pulls/{number}/merge', {'merge_method': 'squash', 'sha': at})
+    merge = f'repos/{OWNER}/{repo}/pulls/{number}/merge'
+    try:
+        api.put(merge, {'merge_method': 'squash', 'sha': at})
+    except GhError as exc:
+        # GitHub answers 405 for a merge it cannot perform now, which a base another
+        # writer just moved is, and 409 for a pinned head that did not match
+        # (https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request).
+        if exc.status not in (405, 409):
+            raise
+        pr = api.get(f'repos/{OWNER}/{repo}/pulls/{number}')
+        if pr.get('merged_at'):
+            return already_merged(pr)
+        if why := left_open(pr, at):
+            return why
+        api.put(merge, {'merge_method': 'squash', 'sha': at})
     try:
         api.delete_branch(repo, ref)
     except GhError as exc:

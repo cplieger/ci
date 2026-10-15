@@ -364,7 +364,7 @@ jobs:
       - name: Compute + publish mutation badge per repo
         env:
           # CI_SCHEDULE must carry contents:write on consumer repos. The push
-          # targets each repo's orphan `badges` branch, alongside coverage.json.
+          # targets each repo's orphan `badges` branch.
           TOKEN: ${{ secrets.CI_SCHEDULE }}
         run: |
           # Explicit per-command error handling (NOT `set -e` inside a subshell:

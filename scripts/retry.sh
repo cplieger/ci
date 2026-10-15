@@ -32,14 +32,22 @@ login_once() { # <registry> <username>
   printf '%s' "${REGISTRY_PASSWORD:?}" | docker login --username "$2" --password-stdin "$1"
 }
 
+# npm serves a new version only once its malware scan clears it, typically in
+# about 5 min and 15 min or more at peak, with no guaranteed bound
+# (https://github.blog/changelog/2026-07-28-npm-publish-time-malware-scanning-and-dual-use-metadata/).
+# 20 min is a third past that stated peak. An npm wait passes this as its
+# REGISTRY_WAIT_SECONDS; verify-publish, renumber-npm and repair size their
+# timeout-minutes to it.
+NPM_SCAN_SECONDS=${NPM_SCAN_SECONDS:-1200}
+
 # await_registry <label> <predicate...>: polls the predicate (output
-# discarded) until a just-published artifact is served; npm has lagged its
-# publish by two minutes. Backs off 5 s doubling to a 60 s cap within
-# REGISTRY_WAIT_SECONDS (default 600) of waiting per shell, shared by every
-# call because one publish starts all propagation at once and the job must
-# end inside its timeout (a caller whose later publish starts a new one
-# zeroes REGISTRY_WAITED); once spent, a call tries once. Returns 1 with no
-# annotation: the caller owns the verdict.
+# discarded) until a just-published artifact is served, backing off 5 s
+# doubling to a 60 s cap until REGISTRY_WAITED, the waiting of every call in
+# this shell, reaches the call's REGISTRY_WAIT_SECONDS (default 600); once
+# spent, a call tries once. Callers may share that clock, so a job waits its
+# longest bound, not their sum, only while everything they check was published
+# before the first of them; a caller zeroes it once something it checks is
+# published later. Returns 1 with no annotation: the caller owns the verdict.
 REGISTRY_WAITED=${REGISTRY_WAITED:-0}
 await_registry() {
   local label=$1 attempt=1 delay=5 waited=0 budget=${REGISTRY_WAIT_SECONDS:-600} left

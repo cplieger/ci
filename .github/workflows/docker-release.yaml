@@ -1338,21 +1338,17 @@ jobs:
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/create-tag.sh" <<'SH'
+          . "$CI_TOOLS/retry.sh"
+          . "$CI_TOOLS/tag-ref.sh"
           CREATED_TAG=""
           create_tag() { # <tag> -> 0 created (CREATED_TAG set) or reused, 2 handed off, 1 refused
-            if EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$1" --jq .object.sha 2>/dev/null); then
-              if [ "$EXISTING" != "$GITHUB_SHA" ]; then
-                echo "::error::Tag $1 already exists at ${EXISTING}, but this run built ${GITHUB_SHA}; refusing to publish at a mismatched tag."
-                return 1
-              fi
-              echo "Tag $1 already exists at ${GITHUB_SHA} (rerun); reusing it."
+            local rc=0
+            tag_ref "$GITHUB_REPOSITORY" "$1" "$GITHUB_SHA" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              [ "$TAG_CREATED" = false ] || CREATED_TAG="$1"
               return 0
             fi
-            if gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/$1" -f sha="${GITHUB_SHA}" 2>/tmp/tagerr; then
-              CREATED_TAG="$1"
-              return 0
-            fi
-            cat /tmp/tagerr
+            [ "$rc" -eq 2 ] || return 1
             BRANCH_HEAD=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha 2>/dev/null || echo "")
             if [ -n "$BRANCH_HEAD" ] && [ "$BRANCH_HEAD" != "$GITHUB_SHA" ]; then
               MSG="tag $1 not created: ${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${BRANCH_HEAD})"
@@ -1371,6 +1367,7 @@ jobs:
         if: ${{ env.PUBLISH == 'true' && inputs.channel == 'dev' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/create-tag.sh"
@@ -1398,6 +1395,7 @@ jobs:
         if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail

@@ -220,6 +220,7 @@ def from_json(s):
 
 FUNCTIONS = {
     'fromJSON': from_json,
+    'toJSON': lambda v: json.dumps(v, indent=2),
     'contains': lambda h, n: (
         any(equal(x, n) for x in h)
         if isinstance(h, list)
