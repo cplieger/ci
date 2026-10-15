@@ -1,25 +1,13 @@
 #!/usr/bin/env python3
 """File-sync engine: push canonical files from this checkout into consumer repos as PRs.
 
-Per manifest target (a repo, or a repo and a `base:`): clone, copy the mapped files from
-this checkout, commit `chore(sync): ...`, force-push `repo-sync/ci/default`
-(`repo-sync/ci/<base>` for a base target), and keep one `dependencies` PR open. No diff,
-no PR; an open sync PR whose diff evaporated is closed. Files are only added or updated;
-forks are skipped unless --allow-forks. A failed target never stops the rest, and the
-exit is then non-zero.
-
---arm-open-prs is sync.yaml's auto-merge sweep: over the same targets a sync would write
-(--only, forks skipped), it re-reads each target's open sync PRs and arms or merges each
-it finds, exiting non-zero when a found `base: main` PR was left open. A target whose
-lookup fails is warned and skipped.
-
-Targets run on --workers threads (fanout.py), each target's log printed whole in
-manifest order; with more than one worker, writes are paced (WRITE_GAP), and a rate-limit
-refusal holds every worker (ghrest.Pacer).
-
-Auth: a GitHub App installation token in GH_TOKEN, whose installation lists the repos;
-git pushes through gh's credential helper, so no token reaches a remote URL or process
-output.
+Per manifest target (a repo, or a repo and a `base:`): clone, copy the mapped files, commit
+`chore(sync): ...`, force-push `repo-sync/ci/default` (`repo-sync/ci/<base>` for a base target)
+and keep one `dependencies` PR open. No diff, no PR; an open sync PR whose diff evaporated is
+closed. Files are only added or updated. A failed target never stops the rest, and the exit is
+then non-zero. --arm-open-prs is sync.yaml's auto-merge sweep (arm_open_prs). Repos run on
+--workers threads (fanout.py), a repo's targets and PR writes in turn (by_repo), each target's
+log printed whole in target order (repo, then base).
 """
 
 import argparse
@@ -47,7 +35,7 @@ GIT_EMAIL = '338123824+tribble-trouble[bot]@users.noreply.github.com'
 # Repo-local credential helper: git asks gh, gh uses GH_TOKEN/keyring. The
 # leading ! marks a shell-out helper; scoped to each clone, never global.
 CRED_HELPER = '!gh auth git-credential'
-# Seconds between the starts of two writes once targets run concurrently (ghrest.Pacer
+# Seconds between the starts of two writes once repos run concurrently (ghrest.Pacer
 # cites GitHub's rule); --workers 1 is the serial engine and spaces nothing.
 WRITE_GAP = 1.0
 PACER = ghrest.Pacer()
@@ -112,6 +100,17 @@ def load_mapping(manifest_path):
 def target_key(target):
     repo, base = target
     return repo, base or ''
+
+
+def by_repo(items):
+    """`items`, tuples led by their repo, as one list per repo, every order kept. The
+    fan-out unit for writes: GitHub rejects a push racing another write to the same
+    repository (`! [remote rejected] ... (failed)`), so one repo's targets never write
+    from two workers at once."""
+    groups = {}
+    for item in items:
+        groups.setdefault(item[0], []).append(item)
+    return list(groups.values())
 
 
 def clone(repo, dest_dir, base):
@@ -427,7 +426,12 @@ def arm_open_prs(mapping, workers):
         for row in rows
     ]
     left_open = [
-        pr for pr, ok in fanout.ordered(prs, lambda pr: arm(pr, merge_checked), workers) if not ok
+        pr
+        for repo_prs, oks in fanout.ordered(
+            by_repo(prs), lambda group: [arm(pr, merge_checked) for pr in group], workers
+        )
+        for pr, ok in zip(repo_prs, oks, strict=True)
+        if not ok
     ]
     if left_open:
         print('::error::a sync pull request into main was left open, as the lines above show')
@@ -461,7 +465,7 @@ def main():
         '--workers',
         type=int,
         default=fanout.WORKERS,
-        help=f'targets handled at once, 1 to {fanout.MAX_WORKERS} (default {fanout.WORKERS})',
+        help=f'repos handled at once, 1 to {fanout.MAX_WORKERS} (default {fanout.WORKERS})',
     )
     args = ap.parse_args()
     if not 1 <= args.workers <= fanout.MAX_WORKERS:
@@ -487,16 +491,18 @@ def main():
 
     counts = {'changed': 0, 'clean': 0, 'dry': 0}
     failures = []
-    targets = sorted(mapping, key=target_key)
-    for target, outcome in fanout.ordered(
-        targets,
-        lambda t: sync_target(t, mapping[t], source_root, args.dry_run),
+    repos = by_repo(sorted(mapping, key=target_key))
+    outcomes = fanout.ordered(
+        repos,
+        lambda group: [sync_target(t, mapping[t], source_root, args.dry_run) for t in group],
         args.workers,
-    ):
-        if outcome is None:
-            failures.append(target_label(*target))
-        else:
-            counts[outcome] += 1
+    )
+    for group, group_outcomes in outcomes:
+        for target, outcome in zip(group, group_outcomes, strict=True):
+            if outcome is None:
+                failures.append(target_label(*target))
+            else:
+                counts[outcome] += 1
 
     total = len(mapping)
     noun = 'repo(s)' if all(base is None for _repo, base in mapping) else 'target(s)'

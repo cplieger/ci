@@ -83,11 +83,6 @@ jobs:
         run: python3 scripts/classify-repos.py > .github/sync.yml
         timeout-minutes: 5
 
-      # In-house engine: shallow-clones each target, copies the mapped files,
-      # commits `chore(sync): …` on its repo-sync/ci/* branch, force-pushes,
-      # and ensures an open labelled PR (closing stale empty ones). Targets run
-      # concurrently with failure isolation per target; exits non-zero at the
-      # end if any target failed.
       - name: Sync files to consumer repos
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
