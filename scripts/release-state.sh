@@ -14,6 +14,8 @@ TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$TOOLS/reconciliation.sh"
 # shellcheck source=SCRIPTDIR/retry.sh
 . "$TOOLS/retry.sh"
+# shellcheck source=SCRIPTDIR/tag-ref.sh
+. "$TOOLS/tag-ref.sh"
 
 # Owned by scripts/release_channels.py (COMPLETION_RECEIPT_PREFIX, TAG_RECEIPT_PREFIX).
 COMPLETION_PREFIX='release/complete/'
@@ -477,6 +479,9 @@ answers() { # <label> <command...>: retry.sh's await_registry, then the verdict
   return 1
 }
 fetch() { curl -fsSL --connect-timeout 10 --max-time 30 -o /dev/null "$1"; }
+npm_answers() { # <package> <version>: answers for npm's version document, within retry.sh's NPM_SCAN_SECONDS
+  REGISTRY_WAIT_SECONDS=$NPM_SCAN_SECONDS answers "npm ${1}@${2}" fetch "https://registry.npmjs.org/${1}/${2}"
+}
 INDEX_TYPES='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
 registry_digest() { # <registry host> <token url> <repository> <ref> <accept> -> the digest served, or nothing
   local token
@@ -662,7 +667,7 @@ cmd_readback() { # <site> <tag> [lane]; SUBPACKAGES: the root release's subpacka
       ;;
     ts)
       pkg=$(git show "${tag}:package.json" | jq -r .name)
-      answers "npm ${pkg}@${ver#v}" fetch "https://registry.npmjs.org/${pkg}/${ver#v}"
+      npm_answers "$pkg" "${ver#v}"
       answers "jsr ${pkg}@${ver#v}" fetch "https://jsr.io/${pkg}/${ver#v}_meta.json"
       ;;
     docker) readback_image "$tag" ;;
@@ -671,7 +676,7 @@ cmd_readback() { # <site> <tag> [lane]; SUBPACKAGES: the root release's subpacka
   while IFS= read -r sub; do
     [ -n "$sub" ] || continue
     pkg=$(git show "${tag}:${sub}/package.json" | jq -r .name) || die "no ${sub}/package.json at ${tag}"
-    answers "npm ${pkg}@${ver#v}" fetch "https://registry.npmjs.org/${pkg}/${ver#v}" || return 1
+    npm_answers "$pkg" "${ver#v}" || return 1
     answers "jsr ${pkg}@${ver#v}" fetch "https://jsr.io/${pkg}/${ver#v}_meta.json" || return 1
   done <<<"$subs"
 }
@@ -680,7 +685,7 @@ dev_published() { # <key> <dev tag> -> 0 once every registry the lane's dev chan
   local pkg
   [ "$1" = . ] && [ "${REPO_TYPE:-}" = ts ] || return 0
   pkg=$(jq -r .name package.json) || return 1
-  answers "npm ${pkg}@${2#v}" fetch "https://registry.npmjs.org/${pkg}/${2#v}" >/dev/null
+  npm_answers "$pkg" "${2#v}" >/dev/null
 }
 # has_dev_above and built_past answer the barrier's rank question, so they die
 # on an unreadable tag list rather than answer no: run them in the main shell.
@@ -861,11 +866,13 @@ runs_api() { echo "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW}/runs
 # Every wait of one barrier draws on one read budget, and the dev-run wait
 # leaves RENUMBER_READS of it, so the renumber run the hold dispatches is
 # waited for past its three chained renumber jobs' timeout-minutes. BARRIER_SECONDS
-# bounds the whole hold in time, slow and wedged reads included, so the hold
-# ends with its reason inside the barrier job's timeout-minutes.
-BARRIER_READS=${BARRIER_POLLS:-210}
-RENUMBER_READS=${RENUMBER_POLLS:-90}
-BARRIER_SECONDS=${BARRIER_SECONDS:-9000}
+# bounds the whole hold in time: it covers the read budget's sleeps and an npm
+# wait (NPM_SCAN_SECONDS) on each side of the renumber's publish, with 25 min
+# to spare for slow reads, so even a wedged read ends the hold with its reason
+# inside the barrier job's timeout-minutes.
+BARRIER_READS=${BARRIER_POLLS:-240}
+RENUMBER_READS=${RENUMBER_POLLS:-120}
+BARRIER_SECONDS=${BARRIER_SECONDS:-11100}
 read_floor=0
 spend_read() { # <what>: one read of the barrier's budget above read_floor, or die naming what it waited for
   [ "$BARRIER_READS" -gt "$read_floor" ] || die "gave up waiting for $1"
@@ -1097,7 +1104,7 @@ cmd_barrier() {
   # npm's packument can trail a publish by minutes. A subs_lacking that
   # cannot tell ends the wait, and the call after it dies saying so.
   subs_served() { [ -z "$(subs_lacking "$subrows")" ]; }
-  await_registry "every subpackage's dev build on npm" subs_served || true
+  REGISTRY_WAIT_SECONDS=$NPM_SCAN_SECONDS await_registry "every subpackage's dev build on npm" subs_served || true
   lacking=$(subs_lacking "$subrows")
   while read -r s st c; do
     [ -n "$s" ] || continue
@@ -1146,8 +1153,7 @@ publish_npm_dev() { # <dev tag> <commit>
       ;;
     *) die "npm cannot tell whether ${pkg}@${ver} exists (HTTP ${code}), so ${1} is not published or tagged" ;;
   esac
-  answers "npm ${pkg}@${ver}" fetch "https://registry.npmjs.org/${pkg}/${ver}" \
-    || die "npm ${pkg}@${ver} does not read back, so ${1} is not tagged"
+  npm_answers "$pkg" "$ver" || die "npm ${pkg}@${ver} does not read back, so ${1} is not tagged"
 }
 
 renumber_build() { # <key> <new dev version> -> the build at HEAD to renumber, or nothing when it already ranks there
@@ -1226,7 +1232,7 @@ cmd_renumber_subpackages() {
 }
 
 cmd_renumber() {
-  local key="${LANE_KEY:?}" new="${DEV_VERSION:?}" repo="${GITHUB_REPOSITORY:?}" d digest served meta got existing created=false
+  local key="${LANE_KEY:?}" new="${DEV_VERSION:?}" repo="${GITHUB_REPOSITORY:?}" d digest served meta got
   d=$(renumber_build "$key" "$new") || exit 1
   [ -n "$d" ] || return 0
   if [ "$key" = . ] && [ "${REPO_TYPE:-}" = docker ]; then
@@ -1250,16 +1256,11 @@ cmd_renumber() {
   if [ "$key" = . ] && [ "${REPO_TYPE:-}" = ts ]; then
     publish_npm_dev "$new" "$d"
   fi
-  if existing=$(gh api "repos/${repo}/git/ref/tags/${new}" --jq .object.sha 2>/dev/null); then
-    [ "$existing" = "$d" ] || die "tag ${new} exists at ${existing}, not ${d}, so it is not moved"
-  else
-    gh api "repos/${repo}/git/refs" -f ref="refs/tags/${new}" -f sha="$d" >/dev/null
-    created=true
-  fi
+  tag_ref "$repo" "$new" "$d" || die "tag ${new} is not at ${d}, so the build is not renumbered"
   if ! gh api -X POST "repos/${repo}/statuses/${d}" -f state=success -f context="${TAG_RECEIPT_PREFIX}${new}" \
     -f description="created by the dev renumber run" \
     -f target_url="${GITHUB_SERVER_URL:-https://github.com}/${repo}/actions/runs/${GITHUB_RUN_ID:-0}" >/dev/null; then
-    if [ "$created" = true ]; then
+    if [ "$TAG_CREATED" = true ]; then
       gh api -X DELETE "repos/${repo}/git/refs/tags/${new}" >/dev/null
     fi
     die "receipt for ${new} not recorded"

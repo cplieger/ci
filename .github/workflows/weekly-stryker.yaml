@@ -24,7 +24,7 @@
 #               mutants under -race; revisit if flakiness appears)
 # Reporting:    mutation score to the run summary + a `mutation-ts.json`
 #               shields endpoint on the consumer's orphan `badges` branch
-#               (sibling-preserving publisher, coexists with coverage.json /
+#               (sibling-preserving publisher, coexists with size.json /
 #               mutation.json). Colour bands match the Go mutation badge.
 #               Stryker itself exits non-zero when the score drops below the
 #               config's `thresholds.break`, which fails that matrix entry —

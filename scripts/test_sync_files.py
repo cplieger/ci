@@ -1247,7 +1247,9 @@ class Sweep(unittest.TestCase):
         proc, got = self.main_fallback(
             [(15368, 'completed', 'success')], {'auto': True, 'direct': True}
         )
-        self.assertEqual((proc.returncode, len(got)), (1, 2))
+        self.assertEqual(
+            (proc.returncode, len(got)), (1, 3), 'the arm, the direct merge and its one retry'
+        )
 
     def test_mains_direct_merge_refuses_a_pull_request_that_is_not_the_sync_head(self):
         for head, head_repo in (

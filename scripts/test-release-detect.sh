@@ -114,6 +114,7 @@ facts["barrier-env"] = step(jobs, "barrier", "Hold for dev")["env"]
 open(f"{out}/barrier-step.sh", "w").write(step(jobs, "barrier", "Hold for dev")["run"])
 facts["barrier-timeout"] = jobs["barrier"]["timeout-minutes"]
 facts["detect-timeout"] = jobs["detect"]["timeout-minutes"]
+facts["npm-wait-timeouts"] = " ".join(str(jobs[j]["timeout-minutes"]) for j in ("verify-publish", "renumber-npm", "repair"))
 facts["renumber-timeout"] = max(jobs["renumber"]["timeout-minutes"] + jobs["renumber-tag"]["timeout-minutes"],
                                jobs["renumber-ts"]["timeout-minutes"] + jobs["renumber-npm"]["timeout-minutes"]
                                ) + jobs["renumber-subpackages"]["timeout-minutes"]
@@ -498,7 +499,13 @@ case "$method $ep" in
     tag=${ep#"$R"/git/ref/tags/}
     [ -f "$GH_DIR/tag-${tag//\//%}" ] || nf
     cat "$GH_DIR/tag-${tag//\//%}" ;;
-  "POST $R/git/refs") [ ! -f "$GH_DIR/fail-ref" ] || exit 1 ;;
+  "POST $R/git/refs")
+    [ ! -f "$GH_DIR/fail-ref" ] || exit 1
+    if [ -f "$GH_DIR/refuse-ref-once" ]; then
+      rm "$GH_DIR/refuse-ref-once"
+      echo "gh: Reference update failed (HTTP 422)" >&2
+      exit 1
+    fi ;;
   "DELETE $R/git/refs/tags/"*) ;;
   *) echo "stub: unexpected gh $method $ep" >&2; exit 22 ;;
 esac
@@ -1152,6 +1159,33 @@ echo "https://proxy.golang.org/example.com/app/yamlenv/@v/v1.1.0.info" >"$CURL_D
 chk "R6 a lane readback the proxy answers passes" "$(readback lane yamlenv/v1.1.0 yamlenv)" "ok"
 chk "R28 a subpackage list that is not JSON reads back nothing" "$(SUBPACKAGES='["web"' readback lane yamlenv/v1.1.0 yamlenv)" "refused"
 chk_has "R28 and says so" "$(cat "$WORK/readback.log")" "is not a JSON array of subpackage dirs"
+TSR="$WORK/ts-readback"
+git init -q -b main "$TSR"
+mkdir -p "$TSR/web"
+printf '{"name":"@o/app"}\n' >"$TSR/package.json"
+printf '{"name":"@o/web"}\n' >"$TSR/web/package.json"
+git -C "$TSR" add package.json web/package.json
+git -C "$TSR" commit -qm "feat: ts fixture"
+git -C "$TSR" tag v1.4.0
+cp "$CURL_DIR/ok" "$WORK/ok.saved"
+chk "R30 a TS readback npm does not serve fails" "$(RB_DIR=$TSR readback ts v1.4.0)" "refused"
+chk_has "R30 after npm's 1200 s scan bound" "$(cat "$WORK/readback.log")" \
+  "npm @o/app@1.4.0: absent after 24 attempt(s) and 1200s of waiting"
+echo https://registry.npmjs.org/@o/app/1.4.0 >>"$CURL_DIR/ok"
+chk "R30 a TS readback JSR does not serve fails" "$(RB_DIR=$TSR readback ts v1.4.0)" "refused"
+chk_has "R30 after the default 600 s, not npm's scan bound" "$(cat "$WORK/readback.log")" \
+  "jsr @o/app@1.4.0: absent after 14 attempt(s) and 600s of waiting"
+echo https://jsr.io/@o/app/1.4.0_meta.json >>"$CURL_DIR/ok"
+chk "R30 one npm serves, with a subpackage npm does not, fails" "$(SUBPACKAGES='["web"]' RB_DIR=$TSR readback ts v1.4.0)" "refused"
+chk_has "R30 after the subpackage's own 1200 s scan bound" "$(cat "$WORK/readback.log")" \
+  "npm @o/web@1.4.0: absent after 24 attempt(s) and 1200s of waiting"
+echo https://registry.npmjs.org/@o/web/1.4.0 >>"$CURL_DIR/ok"
+chk "R30 one npm serves, with a subpackage JSR does not, fails" "$(SUBPACKAGES='["web"]' RB_DIR=$TSR readback ts v1.4.0)" "refused"
+chk_has "R30 after the subpackage's default 600 s, not npm's scan bound" "$(cat "$WORK/readback.log")" \
+  "jsr @o/web@1.4.0: absent after 14 attempt(s) and 600s of waiting"
+echo https://jsr.io/@o/web/1.4.0_meta.json >>"$CURL_DIR/ok"
+chk "R30 and passes once npm and JSR serve both" "$(SUBPACKAGES='["web"]' RB_DIR=$TSR readback ts v1.4.0)" "ok"
+mv "$WORK/ok.saved" "$CURL_DIR/ok"
 chk "R7 an image readback with no manifest fails" "$(readback docker v1.1.0)" "refused"
 IMG_A="sha256:$(printf 'a%.0s' $(seq 64))"
 IMG_E="sha256:$(printf 'e%.0s' $(seq 64))"
@@ -1728,6 +1762,8 @@ make_hook success ""
 out_b=$(REPO_TYPE=ts barrier)
 chk "B11 a git-only dev tag above the version does not release a TS hold" "$out_b|$(dispatched)" "EXIT=1|1"
 chk_has "B11 the renumber must leave a published build" "$(cat "$WORK/barrier.log")" "lane .: renumber run 99 left no dev build above v1.1.0"
+chk "B11 after npm's 1200 s scan bound before and after the renumber" \
+  "$(grep -c '^npm @o/app@1.2.0-dev.1: absent after 24 attempt(s) and 1200s of waiting$' "$WORK/barrier.log")" "2"
 echo "https://registry.npmjs.org/@o/app/1.2.0-dev.1" >>"$CURL_DIR/ok"
 rm -f "$GH_DIR/on-dispatch"
 out_b=$(REPO_TYPE=ts barrier)
@@ -2028,13 +2064,19 @@ polls=$(grep -o 'BARRIER_POLLS:-[0-9]*' "$RS" | sort -u | cut -d- -f2)
 poll_s=$(grep -o 'POLL_SECONDS:-[0-9]*' "$RS" | sort -u | cut -d- -f2)
 reserve=$(grep -o 'RENUMBER_POLLS:-[0-9]*' "$RS" | sort -u | cut -d- -f2)
 deadline=$(grep -o 'BARRIER_SECONDS:-[0-9]*' "$RS" | sort -u | cut -d- -f2)
+npm_scan=$(grep -o 'NPM_SCAN_SECONDS:-[0-9]*' "$ROOT/scripts/retry.sh" | sort -u | cut -d- -f2)
+[ -n "$npm_scan" ] || fail "B15 retry.sh sets no NPM_SCAN_SECONDS default"
 kill_after=$(grep -o 'timeout --kill-after=[0-9]* "$BARRIER_SECONDS"' "$RS" | sed 's/.*=\([0-9]*\) .*/\1/') \
   || fail "B15 the barrier does not run under its deadline"
 chk "B15 the barrier's deadline, its kill grace and 5 min of setup fit its job timeout" \
-  "$deadline|$kill_after|$(($(fact '."barrier-timeout"') * 60 >= deadline + kill_after + 300))" "9000|10|1"
-chk "B15 and the deadline leaves the read budget's sleeps whole" "$polls|$poll_s|$((deadline >= polls * poll_s))" "210|30|1"
+  "$deadline|$kill_after|$(($(fact '."barrier-timeout"') * 60 >= deadline + kill_after + 300))" "11100|10|1"
+chk "B15 and the deadline covers the read budget's sleeps and an npm wait on each side of the renumber" \
+  "$polls|$poll_s|$npm_scan|$((deadline >= polls * poll_s + 2 * npm_scan))" "240|30|1200|1"
+npm_fit=""
+for t in $(fact '."npm-wait-timeouts"'); do npm_fit="${npm_fit}$((t * 60 >= npm_scan + 300))"; done
+chk "B15 verify-publish, renumber-npm and repair each fit npm's scan bound and 5 min of setup" "$npm_fit" "111"
 chk "B15 the renumber reserve outlasts the three chained renumber jobs' timeouts plus 5 min of queueing each" \
-  "$reserve|$((reserve * poll_s >= $(fact '."renumber-timeout"') * 60 + 900))" "90|1"
+  "$reserve|$((reserve * poll_s >= $(fact '."renumber-timeout"') * 60 + 900))" "120|1"
 chk "B15 and leaves the dev-run wait an hour of reads" "$(((polls - reserve) * poll_s >= 3600))" "1"
 # A status read that never answers spends no read, so only the deadline ends it.
 touch "$GH_DIR/hang-runs"
@@ -2102,6 +2144,17 @@ chk_has "U15 and says so" "$(cat "$WORK/renumber.log")" "cannot tell whether ghc
 chk "U4 a go root tags the commit with no image" "$(renumber go v1.2.0-dev.1)|$(wc -l <"$DOCKER_LOG")" "|0"
 chk "U4 and records the receipt" "$(grep -c 'context=release/tag/v1.2.0-dev.1 ' "$GH_LOG")" "1"
 chk "U4 publishing nothing to npm" "$(grep -c '^npm ' "$GH_LOG" || true)" "0"
+# Renumber legs create their tags in one repository at once, and GitHub can
+# refuse one of two concurrent ref writes.
+touch "$GH_DIR/refuse-ref-once"
+chk "U29 a refused tag create is read again and retried" "$(renumber go v1.2.0-dev.1)|$(grep -c "^api repos/o/app/git/refs -f ref=refs/tags/v1.2.0-dev.1 -f sha=$D3$" "$GH_LOG")|$(grep -c '^api repos/o/app/git/ref/tags/v1.2.0-dev.1 ' "$GH_LOG")" "|2|2"
+chk "U29 then records the receipt" "$(grep -c 'context=release/tag/v1.2.0-dev.1 ' "$GH_LOG")" "1"
+chk_lacks "U29 and reuses no tag" "$(cat "$WORK/renumber.log")" "so it is reused"
+echo "$D3" >"$GH_DIR/tag-v1.2.0-dev.1"
+chk "U30 a tag a lost race left at the build is reused, not created again" \
+  "$(renumber go v1.2.0-dev.1)|$(grep -c '^api repos/o/app/git/refs ' "$GH_LOG" || true)|$(grep -c 'context=release/tag/v1.2.0-dev.1 ' "$GH_LOG")" "|0|1"
+chk_has "U30 saying so" "$(cat "$WORK/renumber.log")" "::notice::Tag v1.2.0-dev.1 already exists at $D3, so it is reused"
+rm "$GH_DIR/tag-v1.2.0-dev.1"
 chk "U5 a build already at or above the new version is left alone" "$(renumber docker v1.1.0-dev.3)|$(wc -l <"$GH_LOG")" "|0"
 chk "U6 renumber outside dev is refused" "$(renumber docker v1.2.0-dev.1 stable)" "EXIT=1"
 touch "$GH_DIR/fail-post"
@@ -2140,6 +2193,8 @@ out_u=$(renumber ts v1.2.0-dev.3)
 rm "$NPM_DIR/silent"
 chk "U11 an npm version that does not read back is never tagged" "$out_u|$(grep -c 'git/refs' "$GH_LOG" || true)" "EXIT=1|0"
 chk_has "U11 and says so" "$(cat "$WORK/renumber.log")" "npm @o/app@1.2.0-dev.3 does not read back, so v1.2.0-dev.3 is not tagged"
+chk_has "U11 after npm's 1200 s scan bound" "$(cat "$WORK/renumber.log")" \
+  "npm @o/app@1.2.0-dev.3: absent after 24 attempt(s) and 1200s of waiting"
 NPM_URL=https://registry.npmjs.org/@o/app
 echo "$NPM_URL/1.2.0-dev.2 {\"version\":\"1.2.0-dev.2\",\"gitHead\":\"$UF\"}" >"$CURL_DIR/docs"
 out_u=$(renumber ts v1.2.0-dev.2)
@@ -2330,6 +2385,8 @@ chk_has "B20 after waiting for every dev run, as its own run may still publish i
 chk "B20 every dev run was read, not only those before the cutoff" "$(cat "$GH_DIR/runs-calls")" "4"
 chk_has "B20 and a renumber that publishes nothing keeps it held" "$(cat "$WORK/barrier.log")" \
   "subpackage web: renumber run 99 left dev's change $XW1 with no dev build on npm, so the stable publish stays held"
+chk_has "B20 after npm's 1200 s scan bound" "$(cat "$WORK/barrier.log")" \
+  "every subpackage's dev build on npm: absent after 24 attempt(s) and 1200s of waiting"
 xweb 1.0.0-dev.3 "$X0"
 xhook success 1.2.0-dev.1 "$XW1"
 out_b=$(xbarrier "$XR1")
@@ -2381,6 +2438,55 @@ chk_has "B32 and says so" "$(cat "$WORK/barrier.log")" "cannot tell which subpac
 xweb 1.1.0-dev.1 "$XW1"
 out_b=$(xbarrier "$XR0")
 chk "B20 a root-only promotion reads no subpackage registry" "$(grep -c "^$NPM_WEB" "$CURL_DIR/log" || true)" "0"
+# A TS root and its subpackage through both npm waits of one hold, on a fake
+# clock: a `sleep` that adds to $CLOCK/now, then serves each "<at> <url>" line
+# of $CLOCK/serve-at whose time has come. Neither npm serves anything before the
+# renumber; after it the root's dev build is served 600 s on, the subpackage's never.
+Y="$WORK/two-epoch" YC="$WORK/two-epoch-clone" CLOCK="$WORK/clock"
+cp -a "$X" "$Y"
+git -C "$Y" checkout -q dev
+git -C "$Y" tag v1.2.0-dev.1 "$(commit_in "$Y" "fix: root past the promotion" main.go=v9)"
+git clone -q "$Y" "$YC"
+git -C "$YC" checkout -q --detach "$XR1"
+printf '{"name":"@o/x"}\n' >"$YC/package.json"
+mkdir -p "$CLOCK/bin"
+echo 0 >"$CLOCK/now"
+: >"$CLOCK/serve-at"
+cat >"$CLOCK/bin/sleep" <<'SH'
+#!/usr/bin/env bash
+now=$(($(cat "$CLOCK/now") + $1))
+echo "$now" >"$CLOCK/now"
+[ "$now" -le 20000 ] || { echo "fake sleep: past 20000 s, so a bound is gone" >&2; exit 1; }
+while read -r at url; do
+  [ "$now" -lt "$at" ] || echo "$url" >>"$CURL_DIR/ok"
+done <"$CLOCK/serve-at"
+SH
+cat >"$GH_DIR/on-dispatch" <<SH
+#!/usr/bin/env bash
+echo 99 >"$GH_DIR/dispatched-id"
+echo '{"status":"completed","conclusion":"success"}' >"$GH_DIR/run-99.json"
+echo "\$((\$(cat "$CLOCK/now") + 600)) https://registry.npmjs.org/@o/x/1.2.0-dev.1" >"$CLOCK/serve-at"
+SH
+chmod 755 "$CLOCK/bin/sleep" "$GH_DIR/on-dispatch"
+xweb 1.0.0-dev.3 "$X0"
+: >"$GH_LOG"
+rm -f "$GH_DIR/runs-calls" "$GH_DIR/runs-queries"
+out_b=$( (cd "$YC" && env -u READBACK_SLEEP -u POLL_SECONDS PATH="$CLOCK/bin:$PATH" CLOCK="$CLOCK" STATE="$(xstate "$XR1")" \
+  ROOT_VERSION=v1.1.0 WORKFLOW=release.yaml REPO_TYPE=ts bash "$RS" barrier) >"$WORK/barrier.log" 2>&1 || echo "EXIT=$?")
+rm -f "$GH_DIR/on-dispatch"
+chk "B37 a TS root and its subpackage that npm does not serve hold the publish through one renumber" \
+  "$out_b|$(dispatched)" "EXIT=1|1"
+chk "B37 the wait before the renumber gets npm's whole bound" \
+  "$(grep -c '^npm @o/x@1.2.0-dev.1: absent after 24 attempt(s) and 1200s of waiting$' "$WORK/barrier.log")" "1"
+chk "B37 the wait after it starts a bound of its own, serving the root on its 14th try, 615 s on" \
+  "$(sed -n '/^dispatched the renumber run 99$/,/^lane \.: dev now ranks above v1\.1\.0$/p' "$WORK/barrier.log" \
+    | grep -c '^npm @o/x@1.2.0-dev.1: not served yet')|$(grep -c '^lane \.: dev now ranks above v1\.1\.0$' "$WORK/barrier.log")" "13|1"
+chk_has "B37 which the subpackage's wait shares" "$(cat "$WORK/barrier.log")" \
+  "every subpackage's dev build on npm: absent after 14 attempt(s) and 585s of waiting"
+deadline=$(sed -n 's/^BARRIER_SECONDS=\${BARRIER_SECONDS:-\([0-9]*\)}$/\1/p' "$RS")
+[ -n "$deadline" ] || fail "B37 release-state.sh sets no BARRIER_SECONDS default"
+chk "B37 and the whole hold, its reads' sleeps included, stays inside the barrier's deadline" \
+  "$(($(cat "$CLOCK/now") >= 2400 && $(cat "$CLOCK/now") <= deadline))" "1"
 # Past T, dev's subpackage must rank above the version, as a root build must.
 git -C "$X" checkout -q dev
 XW2=$(commit_in "$X" "fix(web): later" web/mod.ts=v3)

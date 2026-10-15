@@ -59,13 +59,24 @@ if args[0] == 'api':
             path = rest[i]
             i += 1
     entry = fx['api'].get(f'{method} {path}')
+    if isinstance(entry, list):
+        # A list answers each repeat of this exact call with its next entry.
+        with open(os.environ['STUB_LOG']) as log:
+            seen = sum(json.loads(line)[1:] == args for line in log) - 1
+        entry = entry[min(seen, len(entry) - 1)]
     where, _, query = path.partition('?')
     q = dict(urllib.parse.parse_qsl(query))
     if (method, where) == ('GET', 'repos/cplieger/tb/pulls'):
-        prs = fx.get('prs', {}).get('cplieger/tb', [])
+        # `prs_later` is what the listing reads once this run has written anything.
+        with open(os.environ['STUB_LOG']) as log:
+            wrote = any(json.loads(line)[2:4] in (['-X', 'POST'], ['-X', 'PATCH']) for line in log)
+        prs = fx.get('prs_later' if wrote and 'prs_later' in fx else 'prs', {}).get('cplieger/tb', [])
         entry = {'body': [p for p in prs if p['base']['ref'] == q.get('base', p['base']['ref'])]}
     elif (method, where) == ('POST', 'repos/cplieger/tb/pulls'):
-        entry = {'body': {'html_url': fx.get('created_url', 'https://github.com/cplieger/x/pull/9')}}
+        base = next(a.split('=', 1)[1] for a in args if a.startswith('base='))
+        url = fx.get('created_urls', {}).get(base, fx.get('created_url', 'https://github.com/cplieger/x/pull/9'))
+        refused = fx.get('pull_create_fails')
+        entry = {'exit': 1, 'stderr': refused} if refused else {'body': {'html_url': url}}
     elif method == 'PUT' and where.endswith('/merge'):
         failed = fx.get('merge_fails', {}).get('direct')
         entry = {'exit': 1, 'stderr': 'gh: Pull Request is not mergeable (HTTP 405)'} if failed else {'body': {}}
@@ -291,6 +302,10 @@ class Harness:
         assert line.startswith('matrix='), line
         return json.loads(line.removeprefix('matrix='))
 
+    def rows(self) -> list[dict]:
+        """Each channel the matrix names, as one row carrying its repo."""
+        return [{'repo': leg['repo'], **row} for leg in self.matrix() for row in leg['bases']]
+
 
 class TwoBranchFanout(unittest.TestCase):
     def fanout(self, fx):
@@ -302,7 +317,7 @@ class TwoBranchFanout(unittest.TestCase):
         h, res = self.fanout(two_branch_fixture())
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(
-            h.matrix(),
+            h.rows(),
             [
                 {
                     'repo': 'tb',
@@ -342,15 +357,56 @@ class TwoBranchFanout(unittest.TestCase):
         }
         self.assertEqual(read, {'tb'})
         self.assertTrue(all('cplieger/tb' in c[1] for c in h.calls() if c[0] == 'curl'))
-        self.assertEqual({r['repo'] for r in h.matrix()}, {'tb'})
+        self.assertEqual({r['repo'] for r in h.rows()}, {'tb'})
 
-    def test_both_channels_stale_give_two_rows_main_first(self):
+    def test_both_channels_stale_give_one_leg_whose_bases_run_main_first(self):
         fx = two_branch_fixture()
         ghcr(fx['curl'], 'tb', 'dev', iso(NOW - 8 * DAY))
         h, _ = self.fanout(fx)
+        (leg,) = h.matrix()
+        self.assertEqual((leg['repo'], leg['readable']), ('tb', True))
         self.assertEqual(
-            [(r['base'], r['channel']) for r in h.matrix()], [('main', 'latest'), ('dev', 'dev')]
+            [(r['base'], r['channel']) for r in leg['bases']], [('main', 'latest'), ('dev', 'dev')]
         )
+        self.assertFalse([r for r in leg['bases'] if 'repo' in r])
+
+    def test_each_repository_is_one_leg_in_discovery_order(self):
+        fx = two_branch_fixture()
+        fx['api']['GET user/repos?per_page=100&affiliation=owner']['body'].insert(
+            0, repo('ta', 'dev')
+        )
+        fx['api']['GET repos/cplieger/ta/contents/Dockerfile?ref=main'] = {
+            'body': {'content': b64(APK_REFRESH)}
+        }
+        ghcr(fx['curl'], 'ta', 'latest', iso(NOW - 9 * DAY))
+        ghcr(fx['curl'], 'tb', 'dev', iso(NOW - 8 * DAY))
+        h, res = self.fanout(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(
+            [(leg['repo'], [r['base'] for r in leg['bases']]) for leg in h.matrix()],
+            [('ta', ['main']), ('tb', ['main', 'dev'])],
+        )
+        self.assertIn('Rebuilding 3 image(s).', h.summary.read_text())
+
+    def test_a_leg_is_readable_when_any_of_its_bases_read(self):
+        key = 'GET repos/cplieger/tb/contents/Dockerfile?ref={}'
+        broken = {'exit': 1, 'stderr': 'gh: Server Error (HTTP 502)'}
+        for name, bases, readable in (
+            ('main unreadable, dev stale', ['main'], True),
+            ('both unreadable', ['main', 'dev'], False),
+        ):
+            with self.subTest(name):
+                fx = two_branch_fixture()
+                ghcr(fx['curl'], 'tb', 'dev', iso(NOW - 8 * DAY))
+                for base in bases:
+                    fx['api'][key.format(base)] = broken
+                h, _ = self.fanout(fx)
+                (leg,) = h.matrix()
+                self.assertEqual(
+                    [('unreadable' in r, r['base']) for r in leg['bases']],
+                    [(True, 'main'), ('dev' in bases, 'dev')],
+                )
+                self.assertIs(leg['readable'], readable)
 
     def test_the_age_is_the_images_not_a_runs(self):
         h, _ = self.fanout(two_branch_fixture())
@@ -388,7 +444,7 @@ class TwoBranchFanout(unittest.TestCase):
         ghcr(fx['curl'], 'tb', 'dev', None)
         h, res = self.fanout(fx)
         self.assertEqual(res.returncode, 0, res.stderr)
-        dev = [r for r in h.matrix() if r['base'] == 'dev']
+        dev = [r for r in h.rows() if r['base'] == 'dev']
         self.assertEqual(dev[0]['last'], 'not published')
         self.assertEqual(dev[0]['age_days'], 'n/a')
         self.assertNotIn('unreadable', dev[0])
@@ -429,12 +485,14 @@ class TwoBranchFanout(unittest.TestCase):
                 fx['curl'].update(patch)
                 h, res = self.fanout(fx)
                 self.assertEqual(res.returncode, 0, res.stderr)
-                main = next(r for r in h.matrix() if r['base'] == 'main')
+                main = next(r for r in h.rows() if r['base'] == 'main')
                 self.assertEqual(main['unreadable'], reason)
                 self.assertEqual(main['last'], 'unreadable')
                 summary = h.summary.read_text()
                 self.assertIn('**unreadable**', summary)
-                self.assertIn('could not be read; each fails its dispatch row.', summary)
+                self.assertIn(
+                    "could not be read; each fails its repository's dispatch job.", summary
+                )
                 self.assertIn('Rebuilding 0 image(s).', summary)
 
     def test_a_dockerfile_on_one_base_ages_that_channel_only(self):
@@ -442,7 +500,7 @@ class TwoBranchFanout(unittest.TestCase):
         del fx['api']['GET repos/cplieger/tb/contents/Dockerfile?ref=main']
         ghcr(fx['curl'], 'tb', 'dev', iso(NOW - 9 * DAY))
         h, _ = self.fanout(fx)
-        self.assertEqual([r['base'] for r in h.matrix()], ['dev'])
+        self.assertEqual([r['base'] for r in h.rows()], ['dev'])
         self.assertFalse([c for c in h.calls() if c[0] == 'curl' and c[1].endswith(':latest')])
         self.assertFalse([c for c in h.calls() if c[0] == 'curl' and '/manifests/latest' in c[1]])
 
@@ -472,7 +530,7 @@ class TwoBranchFanout(unittest.TestCase):
                 fx['api'][key] = entry
                 h, res = self.fanout(fx)
                 self.assertEqual(res.returncode, 0, res.stderr)
-                main = next(r for r in h.matrix() if r['base'] == 'main')
+                main = next(r for r in h.rows() if r['base'] == 'main')
                 self.assertTrue(main['unreadable'].startswith(reason), main['unreadable'])
                 self.assertEqual((main['channel'], main['last']), ('latest', 'unreadable'))
                 self.assertFalse(
@@ -480,7 +538,10 @@ class TwoBranchFanout(unittest.TestCase):
                 )
                 summary = h.summary.read_text()
                 self.assertIn('| tb (main, :latest) | unreadable: the Dockerfile on main', summary)
-                self.assertIn('1 image(s) could not be read; each fails its dispatch row.', summary)
+                self.assertIn(
+                    "1 image(s) could not be read; each fails its repository's dispatch job.",
+                    summary,
+                )
 
     def test_a_distroless_base_is_not_a_candidate(self):
         fx = two_branch_fixture()
@@ -488,7 +549,7 @@ class TwoBranchFanout(unittest.TestCase):
             'body': {'content': b64(SCRATCH)}
         }
         h, _ = self.fanout(fx)
-        self.assertEqual(h.matrix(), [])
+        self.assertEqual(h.rows(), [])
         self.assertIn('Rebuilding 0 image(s).', h.summary.read_text())
 
     def test_an_install_counts_as_docker_runs_it(self):
@@ -513,7 +574,7 @@ class TwoBranchFanout(unittest.TestCase):
                 }
                 h, res = self.fanout(fx)
                 self.assertEqual(res.returncode, 0, res.stderr)
-                self.assertEqual([r['base'] for r in h.matrix()], ['main'] if candidate else [])
+                self.assertEqual([r['base'] for r in h.rows()], ['main'] if candidate else [])
 
     def test_an_install_no_pkg_refresh_reaches_is_a_warning_row_and_no_rebuild(self):
         for name, text in (
@@ -538,7 +599,7 @@ class TwoBranchFanout(unittest.TestCase):
                 }
                 h, res = self.fanout(fx)
                 self.assertEqual(res.returncode, 0, res.stderr)
-                self.assertEqual(h.matrix(), [])
+                self.assertEqual(h.rows(), [])
                 self.assertIn(
                     '::warning::cplieger/tb: the Dockerfile on main installs packages in no '
                     'layer PKG_REFRESH reaches',
@@ -567,7 +628,7 @@ class TwoBranchFanout(unittest.TestCase):
         res = h.run(['bash', str(SCRIPT), 'fanout'], fx)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(
-            [(r['base'], r.get('unreadable')) for r in h.matrix()],
+            [(r['base'], r.get('unreadable')) for r in h.rows()],
             [
                 ('main', 'the Dockerfile on main could not be parsed: Traceback: boom'),
                 ('dev', 'the Dockerfile on dev could not be parsed: Traceback: boom'),
@@ -578,17 +639,17 @@ class TwoBranchFanout(unittest.TestCase):
         fx = two_branch_fixture()
         ghcr(fx['curl'], 'tb', 'latest', iso(NOW - 7 * DAY))
         h, _ = self.fanout(fx)
-        self.assertEqual(h.matrix(), [])
+        self.assertEqual(h.rows(), [])
         ghcr(fx['curl'], 'tb', 'latest', iso(NOW - 7 * DAY - 1))
         h, _ = self.fanout(fx)
-        self.assertEqual([r['base'] for r in h.matrix()], ['main'])
+        self.assertEqual([r['base'] for r in h.rows()], ['main'])
 
     def test_a_rebuild_request_within_the_interval_holds_a_stale_image_back(self):
         fx = two_branch_fixture()
         commits(fx, 'main', [('r1', f'{REBUILD} (#40)', NOW - 2 * DAY, 0)])
         h, res = self.fanout(fx)
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual(h.matrix(), [])
+        self.assertEqual(h.rows(), [])
         self.assertIn(
             f'| tb (main, :latest) | {iso(NOW - 10 * DAY)} | 10 | 7 | '
             f'fresh (rebuild requested {iso(NOW - 2 * DAY)}) |',
@@ -599,13 +660,13 @@ class TwoBranchFanout(unittest.TestCase):
         fx = two_branch_fixture()
         commits(fx, 'main', [('r1', REBUILD, NOW - 8 * DAY, 0)])
         h, _ = self.fanout(fx)
-        self.assertEqual([r['base'] for r in h.matrix()], ['main'])
+        self.assertEqual([r['base'] for r in h.rows()], ['main'])
 
     def test_a_commit_borrowing_the_subject_is_not_a_request(self):
         fx = two_branch_fixture()
         commits(fx, 'main', [('r1', REBUILD, NOW - 2 * DAY, 1)])
         h, _ = self.fanout(fx)
-        self.assertEqual([r['base'] for r in h.matrix()], ['main'])
+        self.assertEqual([r['base'] for r in h.rows()], ['main'])
 
     def test_an_unreadable_request_listing_falls_back_to_the_image_age(self):
         fx = two_branch_fixture()
@@ -614,7 +675,7 @@ class TwoBranchFanout(unittest.TestCase):
         ]
         h, res = self.fanout(fx)
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual([r['base'] for r in h.matrix()], ['main'])
+        self.assertEqual([r['base'] for r in h.rows()], ['main'])
         self.assertIn(
             '::warning::cplieger/tb: the rebuild requests on main could not be read, '
             'so the image age alone decides\ngh: Not Found (HTTP 404)\n',
@@ -626,7 +687,7 @@ class TwoBranchFanout(unittest.TestCase):
         ghcr(fx['curl'], 'tb', 'dev', iso(NOW - 8 * DAY))
         commits(fx, 'dev', [('d1', REBUILD, NOW - DAY, 0)])
         h, _ = self.fanout(fx)
-        self.assertEqual([(r['base'], r['channel']) for r in h.matrix()], [('main', 'latest')])
+        self.assertEqual([(r['base'], r['channel']) for r in h.rows()], [('main', 'latest')])
         self.assertTrue(
             [c for c in h.calls() if c[0] == 'gh' and 'commits?sha=dev&' in ' '.join(c)]
         )
@@ -642,7 +703,7 @@ class TwoBranchFanout(unittest.TestCase):
         ghcr(fx['curl'], 'tb', 'latest', 'yesterday-ish')
         h, res = self.fanout(fx)
         self.assertEqual(res.returncode, 0, res.stderr)
-        main = next(r for r in h.matrix() if r['base'] == 'main')
+        main = next(r for r in h.rows() if r['base'] == 'main')
         self.assertEqual(
             (main['last'], main['age_days'], main['unreadable']),
             ('unreadable', 'n/a', 'the image creation time yesterday-ish does not parse'),
@@ -681,7 +742,13 @@ class ImageCreated(unittest.TestCase):
 
     def test_usage(self):
         h = Harness(self)
-        for argv in ([], ['bogus'], ['image-created', 'tb'], ['open-pr', 'tb', 'main']):
+        for argv in (
+            [],
+            ['bogus'],
+            ['image-created', 'tb'],
+            ['open-pr', 'tb', 'main'],
+            ['dispatch', 'tb'],
+        ):
             with self.subTest(argv):
                 self.assertEqual(h.run(['bash', str(SCRIPT), *argv], {}).returncode, 2)
 
@@ -714,6 +781,19 @@ def check_runs(runs):
     }
 
 
+BRANCH_READ = 'GET repos/cplieger/tb/git/ref/heads/rebuild/main-20261004'
+NOT_FOUND = {'exit': 1, 'stderr': 'gh: Not Found (HTTP 404)'}
+REF_REFUSED = {'exit': 1, 'stderr': 'gh: Reference already exists (HTTP 422)'}
+REF_CREATE = [
+    'gh', 'api', '-X', 'POST', 'repos/cplieger/tb/git/refs',
+    '-f', 'ref=refs/heads/rebuild/main-20261004', '-f', 'sha=emptycommit',
+]  # fmt: skip
+
+
+def ref_creates(calls):
+    return [c for c in calls if c[1:5] == ['api', '-X', 'POST', 'repos/cplieger/tb/git/refs']]
+
+
 def pr_fixture(base='main', **over) -> dict:
     api = {
         'GET repos/cplieger/tb/git/ref/heads/main': {'body': {'object': {'sha': 'mainhead'}}},
@@ -742,11 +822,18 @@ def pr(head, base, *, fork=False, n=1):
     }
 
 
+def pull_creates(calls):
+    """The -f fields of each pull request create, in order; each must answer its URL."""
+    creates = [c for c in calls if c[1:5] == ['api', '-X', 'POST', 'repos/cplieger/tb/pulls']]
+    for call in creates:
+        assert call[-2:] == ['--jq', '.html_url'], call
+    return [dict(c[i + 1].split('=', 1) for i, a in enumerate(c) if a == '-f') for c in creates]
+
+
 def created(calls):
-    """The -f fields of the one pull request create, which must answer its URL."""
-    (call,) = [c for c in calls if c[1:5] == ['api', '-X', 'POST', 'repos/cplieger/tb/pulls']]
-    assert call[-2:] == ['--jq', '.html_url'], call
-    return dict(call[i + 1].split('=', 1) for i, a in enumerate(call) if a == '-f')
+    """The -f fields of the one pull request create."""
+    (fields,) = pull_creates(calls)
+    return fields
 
 
 def merge_calls(calls):
@@ -887,7 +974,7 @@ class OpenPr(unittest.TestCase):
         h, res = self.open(fx)
         self.assertIn(
             '::notice::cplieger/tb: rebuild/main-20261004 already exists without an open pull'
-            ' request; moving it to the new commit\n',
+            ' request, so it is moved to the new commit\n',
             res.stdout,
         )
         calls = h.calls()
@@ -899,6 +986,173 @@ class OpenPr(unittest.TestCase):
             calls,
         )  # fmt: skip
         self.assertFalse([c for c in calls if 'repos/cplieger/tb/git/refs' in c and 'POST' in c])
+
+    def concurrent(self, **over):
+        """A second writer opened rebuild/main-20261004 as #12 after this run's first read."""
+        fx = pr_fixture(
+            prs_later={'cplieger/tb': [pr('rebuild/main-20261004', 'main', n=12)]}, **over
+        )
+        fx['api']['GET repos/cplieger/tb/pulls/12'] = pull('main', 'rebuild/main-20261004')
+        return fx
+
+    def test_a_branch_another_writer_created_with_its_pr_is_that_prs_merge_request(self):
+        fx = self.concurrent()
+        fx['api']['POST repos/cplieger/tb/git/refs'] = {
+            'exit': 1,
+            'stderr': 'gh: Reference already exists (HTTP 422)',
+        }
+        h, res = self.open(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        calls = h.calls()
+        self.assertFalse(
+            [c for c in calls if c[1:5] == ['api', '-X', 'POST', 'repos/cplieger/tb/pulls']]
+        )
+        self.assertFalse([c for c in calls if 'PATCH' in c])
+        self.assertEqual([c[3] for c in merge_calls(calls)], ['12'])
+        self.assertIn(
+            '::notice::cplieger/tb: https://github.com/cplieger/tb/pull/12 opened '
+            'rebuild/main-20261004 concurrently, so its merge is asked for',
+            res.stdout,
+        )
+
+    def test_a_branch_another_writer_created_without_a_pr_is_moved_to_this_commit(self):
+        fx = pr_fixture()
+        fx['api']['POST repos/cplieger/tb/git/refs'] = REF_REFUSED
+        fx['api'][BRANCH_READ] = [NOT_FOUND, {'body': {}}]
+        h, res = self.open(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        calls = h.calls()
+        patch = [
+            'gh', 'api', '-X', 'PATCH', 'repos/cplieger/tb/git/refs/heads/rebuild/main-20261004',
+            '-f', 'sha=emptycommit', '-F', 'force=true',
+        ]  # fmt: skip
+        self.assertIn(patch, calls)
+        self.assertEqual(created(calls)['head'], 'rebuild/main-20261004')
+        self.assertLess(
+            calls.index(patch), calls.index(next(c for c in calls if 'title=' + REBUILD in c))
+        )
+        self.assertEqual([c[3] for c in merge_calls(calls)], ['9'])
+
+    def test_a_refused_create_that_left_no_branch_is_sent_once_more(self):
+        fx = pr_fixture()
+        fx['api']['POST repos/cplieger/tb/git/refs'] = [REF_REFUSED, {'body': {}}]
+        h, res = self.open(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        calls = h.calls()
+        self.assertEqual(ref_creates(calls), [REF_CREATE, REF_CREATE])
+        self.assertEqual(calls.count(['gh', 'api', BRANCH_READ.split(' ', 1)[1]]), 2)
+        self.assertFalse([c for c in calls if 'PATCH' in c])
+        self.assertNotIn('so it is moved to the new commit', res.stdout)
+        self.assertEqual(created(calls)['head'], 'rebuild/main-20261004')
+        self.assertEqual([c[3] for c in merge_calls(calls)], ['9'])
+
+    def test_a_create_refused_twice_with_no_branch_fails_saying_so(self):
+        fx = pr_fixture()
+        fx['api']['POST repos/cplieger/tb/git/refs'] = REF_REFUSED
+        h, res = self.open(fx)
+        self.assertEqual(res.returncode, 1)
+        calls = h.calls()
+        self.assertEqual(len(ref_creates(calls)), 2)
+        self.assertEqual(calls.count(['gh', 'api', BRANCH_READ.split(' ', 1)[1]]), 3)
+        self.assertFalse([c for c in calls if 'PATCH' in c])
+        self.assertEqual(pull_creates(calls), [])
+        self.assertEqual(merge_calls(calls), [])
+        self.assertIn(
+            '::error::cplieger/tb: rebuild/main-20261004 could not be created and does not exist,'
+            ' so no rebuild pull request into main was opened',
+            res.stdout,
+        )
+
+    def test_a_create_refused_twice_whose_branch_then_reads_present_is_moved_and_opened(self):
+        fx = pr_fixture()
+        fx['api']['POST repos/cplieger/tb/git/refs'] = REF_REFUSED
+        fx['api'][BRANCH_READ] = [NOT_FOUND, NOT_FOUND, {'body': {}}]
+        h, res = self.open(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        calls = h.calls()
+        self.assertEqual(ref_creates(calls), [REF_CREATE, REF_CREATE])
+        self.assertEqual(calls.count(['gh', 'api', BRANCH_READ.split(' ', 1)[1]]), 3)
+        patch = [
+            'gh', 'api', '-X', 'PATCH', 'repos/cplieger/tb/git/refs/heads/rebuild/main-20261004',
+            '-f', 'sha=emptycommit', '-F', 'force=true',
+        ]  # fmt: skip
+        self.assertIn(patch, calls)
+        self.assertEqual(created(calls)['head'], 'rebuild/main-20261004')
+        self.assertEqual([c[3] for c in merge_calls(calls)], ['9'])
+        self.assertNotIn('does not exist', res.stdout)
+
+    def test_a_create_refused_twice_whose_branch_then_cannot_be_read_fails_without_a_write(self):
+        fx = pr_fixture()
+        fx['api']['POST repos/cplieger/tb/git/refs'] = REF_REFUSED
+        fx['api'][BRANCH_READ] = [
+            NOT_FOUND,
+            NOT_FOUND,
+            {'exit': 1, 'stderr': 'gh: Server Error (HTTP 502)'},
+        ]
+        h, res = self.open(fx)
+        self.assertEqual(res.returncode, 1)
+        calls = h.calls()
+        self.assertEqual(len(ref_creates(calls)), 2)
+        self.assertFalse([c for c in calls if 'PATCH' in c])
+        self.assertEqual(pull_creates(calls), [])
+        self.assertIn('gh: Server Error (HTTP 502)', res.stdout)
+        self.assertIn(
+            '::error::cplieger/tb: rebuild/main-20261004 could not be created, and reading it again'
+            ' failed',
+            res.stdout,
+        )
+        self.assertNotIn('does not exist', res.stdout)
+
+    def test_a_refused_create_whose_branch_cannot_be_read_again_fails_without_a_write(self):
+        fx = pr_fixture()
+        fx['api']['POST repos/cplieger/tb/git/refs'] = REF_REFUSED
+        fx['api'][BRANCH_READ] = [NOT_FOUND, {'exit': 1, 'stderr': 'gh: Server Error (HTTP 502)'}]
+        h, res = self.open(fx)
+        self.assertEqual(res.returncode, 1)
+        calls = h.calls()
+        self.assertEqual(len(ref_creates(calls)), 1)
+        self.assertFalse([c for c in calls if 'PATCH' in c])
+        self.assertEqual(pull_creates(calls), [])
+        self.assertIn(
+            '::error::cplieger/tb: rebuild/main-20261004 could not be created, and reading it again'
+            ' failed',
+            res.stdout,
+        )
+
+    def test_a_pr_another_writer_opened_first_is_that_prs_merge_request(self):
+        fx = self.concurrent(
+            pull_create_fails='gh: Validation Failed: A pull request already exists (HTTP 422)'
+        )
+        h, res = self.open(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual([c[3] for c in merge_calls(h.calls())], ['12'])
+        self.assertNotIn('Opened ', res.stdout)
+
+    def test_a_refused_pr_create_with_no_open_pr_fails_naming_why(self):
+        fx = pr_fixture(pull_create_fails='gh: Validation Failed: No commits between (HTTP 422)')
+        h, res = self.open(fx)
+        self.assertEqual(res.returncode, 1)
+        self.assertEqual(merge_calls(h.calls()), [])
+        self.assertIn('No commits between (HTTP 422)', res.stdout)
+        self.assertIn(
+            '::error::cplieger/tb: no rebuild pull request into main was opened, and none is open',
+            res.stdout,
+        )
+
+    def test_a_ref_create_failure_other_than_an_existing_ref_stops_the_run(self):
+        fx = self.concurrent()
+        fx['api']['POST repos/cplieger/tb/git/refs'] = {
+            'exit': 1,
+            'stderr': 'gh: Server Error (HTTP 502)',
+        }
+        h, res = self.open(fx)
+        self.assertNotEqual(res.returncode, 0)
+        calls = h.calls()
+        self.assertFalse([c for c in calls if 'PATCH' in c])
+        self.assertFalse(
+            [c for c in calls if c[1:5] == ['api', '-X', 'POST', 'repos/cplieger/tb/pulls']]
+        )
+        self.assertEqual(merge_calls(calls), [])
 
     def test_the_merge_falls_back_once_and_fails_when_both_refuse(self):
         res, merges = self.fallback([(15368, 'completed', 'success')], base='dev')
@@ -988,7 +1242,9 @@ class OpenPr(unittest.TestCase):
             [(15368, 'completed', 'success')], merge_fails={'auto': True, 'direct': True}
         )
         self.assertEqual(res.returncode, 1)
-        self.assertEqual(len(merges), 2)
+        self.assertEqual(
+            ['--auto' in c for c in merges], [True, False, False], 'a 405 is retried once'
+        )
         self.assertIn('could not enable auto-merge', res.stdout)
 
     def test_a_base_other_than_dev_or_main_is_refused_before_any_call(self):
@@ -1060,6 +1316,99 @@ class StalePr(unittest.TestCase):
         self.assertEqual(created(h.calls())['base'], 'main')
 
 
+MAIN_ROW = {'base': 'main', 'channel': 'latest', 'last': 'L', 'age_days': '9', 'since': ''}
+DEV_ROW = {'base': 'dev', 'channel': 'dev', 'last': 'not published', 'age_days': 'n/a'}
+BAD_ROW = {**MAIN_ROW, 'last': 'unreadable', 'age_days': 'n/a', 'unreadable': 'boom'}
+
+
+def both_bases_fixture(**over) -> dict:
+    """pr_fixture answering a rebuild pull request into each base: #9 into main, #10 into dev."""
+    fx = pr_fixture(
+        created_urls={
+            'main': 'https://github.com/cplieger/tb/pull/9',
+            'dev': 'https://github.com/cplieger/tb/pull/10',
+        },
+        **over,
+    )
+    fx['api']['GET repos/cplieger/tb/pulls/10'] = pull('dev', 'rebuild/dev-20261004')
+    return fx
+
+
+class Dispatch(unittest.TestCase):
+    def dispatch(self, fx, bases):
+        h = Harness(self)
+        res = h.run(['bash', str(SCRIPT), 'dispatch', 'tb', json.dumps(bases)], fx)
+        return h, res
+
+    def opened(self, h):
+        return [b['base'] for b in pull_creates(h.calls())]
+
+    def test_each_base_is_handled_in_turn_main_first(self):
+        h, res = self.dispatch(both_bases_fixture(), [MAIN_ROW, DEV_ROW])
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(self.opened(h), ['main', 'dev'])
+        calls = h.calls()
+        main_done = calls.index(next(c for c in merge_calls(calls) if c[3] == '9'))
+        dev_first = calls.index(
+            next(c for c in calls if 'repos/cplieger/tb/git/ref/heads/dev' in c)
+        )
+        self.assertLess(main_done, dev_first, "main's pull request is armed before dev is read")
+        self.assertEqual([c[3] for c in merge_calls(calls)], ['9', '10'])
+        summary = h.summary.read_text()
+        self.assertIn('| tb | main | :latest | done |', summary)
+        self.assertIn('| tb | dev | :dev | done |', summary)
+        dev = pull_creates(calls)[1]
+        self.assertTrue(dev['body'].startswith('No `:dev` image is published.'))
+
+    def test_a_failed_base_fails_the_leg_after_the_other_base_is_handled(self):
+        fx = both_bases_fixture()
+        fx['api']['GET repos/cplieger/tb/git/ref/heads/main'] = {
+            'exit': 1,
+            'stderr': 'gh: Server Error (HTTP 502)',
+        }
+        h, res = self.dispatch(fx, [MAIN_ROW, DEV_ROW])
+        self.assertEqual(res.returncode, 1)
+        self.assertEqual(self.opened(h), ['dev'])
+        self.assertIn(
+            '::error::cplieger/tb: the rebuild of main (:latest) failed. Its log is above.',
+            res.stdout,
+        )
+        summary = h.summary.read_text()
+        self.assertIn('| tb | main | :latest | failed |', summary)
+        self.assertIn('| tb | dev | :dev | done |', summary)
+
+    def test_an_unreadable_base_fails_the_leg_naming_the_image_and_rebuilds_the_other(self):
+        h, res = self.dispatch(both_bases_fixture(), [BAD_ROW, DEV_ROW])
+        self.assertEqual(res.returncode, 1)
+        self.assertIn(
+            '::error::ghcr.io/cplieger/tb:latest (main) did not read, so its age is unknown and '
+            'nothing was rebuilt. boom',
+            res.stdout,
+        )
+        self.assertEqual(self.opened(h), ['dev'])
+        self.assertIn('| tb | main | :latest | unreadable |', h.summary.read_text())
+
+    def test_only_unreadable_bases_call_nothing(self):
+        h, res = self.dispatch({}, [BAD_ROW])
+        self.assertEqual(res.returncode, 1)
+        self.assertEqual(h.calls(), [])
+
+    def test_a_since_bound_reaches_its_bases_rebuild_check(self):
+        fx = both_bases_fixture()
+        commits(fx, 'main', [('r1', REBUILD, NOW - 3600, 0)])
+        h, res = self.dispatch(fx, [{**MAIN_ROW, 'since': iso(NOW - 7 * DAY)}, DEV_ROW])
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(self.opened(h), ['dev'])
+
+    def test_bases_that_are_not_a_json_array_of_rows_are_refused_before_any_call(self):
+        for bases in ('not json', '{}', '[{"channel": "dev"}]'):
+            with self.subTest(bases=bases):
+                h = Harness(self)
+                res = h.run(['bash', str(SCRIPT), 'dispatch', 'tb', bases], {})
+                self.assertEqual(res.returncode, 2)
+                self.assertEqual(h.calls(), [])
+
+
 def workflow() -> dict:
     return yaml.safe_load(WORKFLOW.read_text())
 
@@ -1068,52 +1417,59 @@ def step(job: dict, prefix: str) -> dict:
     return next(s for s in job['steps'] if s.get('name', '').startswith(prefix))
 
 
-def condition(st: dict, matrix: dict) -> bool:
-    scope = workflow_replay.Scope({'matrix': matrix}, {}, [])
-    return scope.condition(st.get('if'))
+def scope(matrix: dict) -> workflow_replay.Scope:
+    return workflow_replay.Scope({'matrix': matrix, 'secrets': {}, 'steps': {}}, {}, [])
 
 
-TB_ROW = {
-    'repo': 'tb',
-    'base': 'main',
-    'channel': 'latest',
-    'last': 'x',
-    'age_days': '9',
-    'since': 'S',
-}
-BAD_ROW = {**TB_ROW, 'last': 'unreadable', 'age_days': 'n/a', 'unreadable': 'boom'}
+READABLE_LEG = {'repo': 'tb', 'readable': True, 'bases': [MAIN_ROW, DEV_ROW]}
+UNREADABLE_LEG = {'repo': 'tb', 'readable': False, 'bases': [BAD_ROW]}
 
 
 class Workflow(unittest.TestCase):
-    def test_each_row_kind_runs_exactly_its_steps(self):
+    def test_each_leg_kind_runs_exactly_its_steps(self):
         job = workflow()['jobs']['dispatch']
         names = [s['name'] for s in job['steps']]
         expect = {
             'readable': (
-                TB_ROW,
+                READABLE_LEG,
                 [
                     'Checkout',
                     'Mint the App token',
-                    'Open a rebuild pull request on cplieger/${{ matrix.repo }}',
+                    'Rebuild the stale images of cplieger/${{ matrix.repo }}',
                 ],
             ),
-            'unreadable': (BAD_ROW, ['Report an unreadable image on cplieger/${{ matrix.repo }}']),
+            'unreadable': (
+                UNREADABLE_LEG,
+                ['Checkout', 'Rebuild the stale images of cplieger/${{ matrix.repo }}'],
+            ),
         }
-        for label, (row, wanted) in expect.items():
+        for label, (leg, wanted) in expect.items():
             with self.subTest(label):
-                ran = [n for n, s in zip(names, job['steps'], strict=True) if condition(s, row)]
+                ran = [
+                    n
+                    for n, s in zip(names, job['steps'], strict=True)
+                    if scope(leg).condition(s.get('if'))
+                ]
                 self.assertEqual(ran, wanted)
 
-    def test_the_pr_steps_base_is_the_rows(self):
-        st = step(workflow()['jobs']['dispatch'], 'Open a rebuild pull request')
-        for row, base in ((TB_ROW, 'main'), ({**TB_ROW, 'base': 'dev'}, 'dev')):
-            scope = workflow_replay.Scope({'matrix': row, 'secrets': {}}, {}, [])
-            self.assertEqual(scope.render(st['env']['BASE']), base)
-            self.assertEqual(scope.render(st['env']['SINCE']), 'S')
+    def test_each_leg_is_named_for_its_repository_alone(self):
+        name = workflow()['jobs']['dispatch']['name']
+        self.assertEqual(scope(READABLE_LEG).render(name), 'dispatch (tb)')
+
+    def test_the_rebuild_step_hands_the_script_every_base_of_its_leg(self):
+        st = step(workflow()['jobs']['dispatch'], 'Rebuild the stale images')
+        self.assertEqual(
+            json.loads(scope(READABLE_LEG).render(st['env']['BASES'])), [MAIN_ROW, DEV_ROW]
+        )
+
+    def test_the_fan_out_stays_inside_the_concurrent_job_margin(self):
+        strategy = workflow()['jobs']['dispatch']['strategy']
+        self.assertLessEqual(strategy['max-parallel'], 4)
+        self.assertFalse(strategy['fail-fast'])
 
     def test_both_jobs_check_out_without_credentials_before_the_script(self):
         jobs = workflow()['jobs']
-        for name, user in (('fanout', 'Discover stale'), ('dispatch', 'Open a rebuild')):
+        for name, user in (('fanout', 'Discover stale'), ('dispatch', 'Rebuild the stale')):
             with self.subTest(name):
                 steps = jobs[name]['steps']
                 checkout = next(
@@ -1132,7 +1488,7 @@ class Workflow(unittest.TestCase):
         self.assertEqual(text.count('secrets.SYNC_APP_PRIVATE_KEY'), 1)
         jobs = workflow()['jobs']
         mint = step(jobs['dispatch'], 'Mint the App token')
-        self.assertEqual(mint['if'], '${{ !matrix.unreadable }}')
+        self.assertEqual(mint['if'], '${{ matrix.readable }}')
         self.assertEqual(mint['id'], 'app-token')
         self.assertRegex(mint['uses'], r'^actions/create-github-app-token@[0-9a-f]{40}$')
         self.assertNotIn('continue-on-error', mint)
@@ -1149,7 +1505,7 @@ class Workflow(unittest.TestCase):
                 'permission-pull-requests': 'write',
             },
         )
-        pr_step = step(jobs['dispatch'], 'Open a rebuild pull request')
+        pr_step = step(jobs['dispatch'], 'Rebuild the stale images')
         self.assertEqual(pr_step['env']['GH_TOKEN'], '${{ steps.app-token.outputs.token }}')
         steps = jobs['dispatch']['steps']
         self.assertLess(steps.index(mint), steps.index(pr_step))
@@ -1160,40 +1516,17 @@ class Workflow(unittest.TestCase):
             {'GH_TOKEN': '${{ secrets.CI_SCHEDULE }}'},
         )
 
-    def test_an_unreadable_row_fails_naming_the_image(self):
-        st = step(workflow()['jobs']['dispatch'], 'Report an unreadable image')
-        env = {
-            **os.environ,
-            'REPO': 'tb',
-            'BASE': 'main',
-            'CHANNEL': 'latest',
-            'UNREADABLE': 'GHCR token endpoint answered HTTP 403',
-        }
-        res = subprocess.run(
-            ['bash', '-c', st['run']], env=env, capture_output=True, text=True, check=False
-        )
-        self.assertEqual(res.returncode, 1)
-        self.assertIn(
-            '::error::ghcr.io/cplieger/tb:latest (main) did not read, so its age is unknown and nothing'
-            ' was rebuilt. GHCR token endpoint answered HTTP 403',
-            res.stdout,
-        )
-
-    def test_the_pr_step_runs_the_script_with_the_row(self):
-        st = step(workflow()['jobs']['dispatch'], 'Open a rebuild pull request')
-        env = {'REPO': 'tb', 'BASE': 'main', 'CHANNEL': 'latest', 'AGE_DAYS': '9', 'LAST': 'L'}
+    def test_the_rebuild_step_runs_the_script_with_the_legs_bases(self):
+        st = step(workflow()['jobs']['dispatch'], 'Rebuild the stale images')
         h = Harness(self)
-        res = h.run(['bash', '-c', st['run']], pr_fixture(), {**env, 'SINCE': ''}, cwd=ROOT)
-        self.assertEqual(res.returncode, 0, res.stderr)
+        env = {'REPO': 'tb', 'BASES': json.dumps([MAIN_ROW, DEV_ROW])}
+        res = h.run(['bash', '-c', st['run']], both_bases_fixture(), env, cwd=ROOT)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        bodies = pull_creates(h.calls())
+        self.assertEqual([b['base'] for b in bodies], ['main', 'dev'])
         self.assertTrue(
-            created(h.calls())['body'].startswith('The `:latest` image is 9 days old (built L).')
+            bodies[0]['body'].startswith('The `:latest` image is 9 days old (built L).')
         )
-        fx = pr_fixture()
-        commits(fx, 'main', [('r1', REBUILD, NOW - 3600, 0)])
-        h = Harness(self)
-        res = h.run(['bash', '-c', st['run']], fx, {**env, 'SINCE': iso(NOW - 7 * DAY)}, cwd=ROOT)
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertFalse([c for c in h.calls() if 'POST' in c])
 
 
 if __name__ == '__main__':

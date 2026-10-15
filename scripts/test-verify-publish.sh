@@ -259,6 +259,8 @@ chk "V-B2 absent JSR package fails the run" "$RC" "1"
 chk_has "V-B2 absent JSR package errors" "$OUT" \
   "::error::jsr @cplieger/probe@1.2.3 is not published"
 chk_has "V-B2 npm still reported ok" "$OUT" "ok: npm @cplieger/probe@1.2.3"
+chk "V-B2 and JSR keeps the default 600 s, not npm's scan bound" \
+  "$(grep -c jsr.io "$CURL_LOG")|$(awk '{ s += $1 } END { print s }' "$SLEEP_LOG")" "14|600"
 
 D=$(casedir b3)
 pkgjson "$D"
@@ -293,8 +295,8 @@ export TS_RESULT=success
 spec "*registry.npmjs.org* 22 {}" "*jsr.io* 0 {}"
 run_step "$D"
 chk "V-S1 an absent artifact backs off 5 s doubling to a 60 s cap" \
-  "$(tr '\n' ' ' <"$SLEEP_LOG")" "5 10 20 40 60 60 60 60 60 60 60 60 45 "
-chk "V-S1 and gives up after exactly the 600 s budget" "$(awk '{ s += $1 } END { print s }' "$SLEEP_LOG")" "600"
+  "$(tr '\n' ' ' <"$SLEEP_LOG")" "5 10 20 40 $(printf '60 %.0s' $(seq 18))45 "
+chk "V-S1 and gives up after exactly npm's 1200 s scan bound" "$(awk '{ s += $1 } END { print s }' "$SLEEP_LOG")" "1200"
 chk "V-S1 and fails closed" "$RC" "1"
 
 # npm served a published version two minutes after its publish succeeded:
@@ -319,10 +321,36 @@ defaults
 export TS_RESULT=success
 spec "*registry.npmjs.org* 22 {}" "*jsr.io* 22 {}"
 run_step "$D"
-chk "V-S3 the first absent artifact spends the budget" "$(grep -c registry.npmjs.org "$CURL_LOG")" "14"
+chk "V-S3 the first absent artifact spends the budget" "$(grep -c registry.npmjs.org "$CURL_LOG")" "24"
 chk "V-S3 the second gets one try" "$(grep -c jsr.io "$CURL_LOG")" "1"
-chk "V-S3 and the step waits 600 s in all" "$(awk '{ s += $1 } END { print s }' "$SLEEP_LOG")" "600"
+chk "V-S3 and the step waits 1200 s in all" "$(awk '{ s += $1 } END { print s }' "$SLEEP_LOG")" "1200"
 chk_has "V-S3 both are refused" "$OUT" "::error::jsr @cplieger/probe@1.2.3 is not published"
+
+# npm and the Go proxy share the clock, each to its own bound: npm waits past
+# the proxy's 600 s, and the proxy then gets one try.
+D=$(casedir s4)
+gomod "$D"
+pkgjson "$D"
+defaults
+export GO_RESULT=success TS_RESULT=success CURL_SERVE_PAT="*registry.npmjs.org*" CURL_SERVE_FROM=14
+spec "*proxy.golang.org* 22 github.com/cplieger/probe@v1.2.3: invalid version: unknown revision v1.2.3" \
+  "*registry.npmjs.org* 22 {}" "*jsr.io* 0 {}"
+run_step "$D"
+chk "V-S4 a version npm serves after 615 s passes" "$RC|$(grep -c registry.npmjs.org "$CURL_LOG")" "0|14"
+chk "V-S4 and the proxy, past its bound, gets one try" "$(grep -c proxy.golang.org "$CURL_LOG")" "1"
+chk "V-S4 so the step waits only npm's 615 s" "$(awk '{ s += $1 } END { print s }' "$SLEEP_LOG")" "615"
+
+D=$(casedir s5)
+gomod "$D"
+pkgjson "$D"
+defaults
+export GO_RESULT=success TS_RESULT=success CURL_SERVE_PAT="*registry.npmjs.org*" CURL_SERVE_FROM=7
+spec "*proxy.golang.org* 22 github.com/cplieger/probe@v1.2.3: invalid version: unknown revision v1.2.3" \
+  "*registry.npmjs.org* 22 {}" "*jsr.io* 0 {}"
+run_step "$D"
+chk "V-S5 npm served after 195 s leaves the proxy the rest of its 600 s" "$(grep -c proxy.golang.org "$CURL_LOG")" "11"
+chk "V-S5 so the proxy stops at 600 s on the shared clock" "$(awk '{ s += $1 } END { print s }' "$SLEEP_LOG")" "600"
+chk "V-S5 and only warns" "$RC" "0"
 
 # ── V-D: nested Go lanes ─────────────────────────────────────────────────────
 # The lane loop reads `git tag --points-at HEAD`, so this needs a real repo

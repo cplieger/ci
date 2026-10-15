@@ -1,7 +1,6 @@
 # Messages whose text is at HEAD of main, one key per line (the text three words either side of
 # the semicolon or dash). Rewriting a message deletes its line here, and a line is added only for
 # a message whose text is at HEAD that a wider reader first sees.
-${EXISTING}, not ${GITHUB_SHA}; refusing.
 ${TAG} not recorded; deleting the tag
 ${VERSION} already exists; nothing to push.
 ${VERSION} already exists; skipping creation.
@@ -76,7 +75,6 @@ numeric major — applying the base-path
 of '$*' failed; retrying in ${delay}s
 on (want off; Renovate owns deps)
 on its own; skipping the concurrency
-open pull request; moving it to
 output is stale; re-run the generator(s)
 package directory first; the closure must
 package-dir reports here; 0 means the
@@ -95,7 +93,6 @@ resolvable HEAD — skipping this repo
 rewrite internal imports; apps use the
 rulesets unreadable (API); rulesets not graded
 run (phantom — blocks every PR
-run built ${GITHUB_SHA}; refusing to publish
 runs unreadable (API); version tags not
 setting for {repo}; attempting the issue
 stable tags ${digest}; a promoted image

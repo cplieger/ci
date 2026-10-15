@@ -1784,9 +1784,9 @@ chk "D-G7 a promoted rebuild request whose dev build published nothing carries i
 # ── Dev tag receipt ──────────────────────────────────────────────────────────
 # The stub gh records every call and answers the git-ref read as absent (404)
 # unless GH_TAG_EXISTS names a commit; GH_REF_FAIL makes the ref create fail,
-# GH_HEAD is what the branch head then reads as, and GH_STATUS_FAIL makes the
-# receipt POST fail.
-export GH_LOG="$WORK/gh.log" GH_TAG_EXISTS="" GH_REF_FAIL="" GH_HEAD="" GH_STATUS_FAIL="" GH_RELEASE_MISSING=""
+# a file at GH_REF_REFUSE_ONCE refuses the next ref create once, GH_HEAD is what
+# the branch head then reads as, and GH_STATUS_FAIL makes the receipt POST fail.
+export GH_LOG="$WORK/gh.log" GH_TAG_EXISTS="" GH_REF_FAIL="" GH_REF_REFUSE_ONCE="" GH_HEAD="" GH_STATUS_FAIL="" GH_RELEASE_MISSING=""
 cat >"$BIN/gh" <<'SH'
 #!/bin/sh
 printf '%s\n' "$*" >>"$GH_LOG"
@@ -1799,6 +1799,11 @@ case "$*" in
     ;;
   *"git/refs "*"refs/tags/"*)
     if [ -n "$GH_REF_FAIL" ]; then echo "gh: HTTP 403" >&2; exit 1; fi
+    if [ -n "$GH_REF_REFUSE_ONCE" ] && [ -e "$GH_REF_REFUSE_ONCE" ]; then
+      rm -f "$GH_REF_REFUSE_ONCE"
+      echo "gh: Reference update failed (HTTP 422)" >&2
+      exit 1
+    fi
     exit 0
     ;;
   *"git/ref/heads/"*) printf '%s\n' "$GH_HEAD"; exit 0 ;;
@@ -1857,6 +1862,7 @@ chk "D-T11 and exits 0" "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)" "
 out_tag=$(GH_STATUS_FAIL=1 GH_TAG_EXISTS="$C_BUILT" TAG=v1.3.0-dev.4 run_step devtag.sh)
 chk "D-T12 a failed POST never deletes a tag that predated the attempt" "$(grep -c -- '-X DELETE' "$GH_LOG")" "0"
 chk "D-T12 and still exits 1" "$(printf '%s' "$out_tag" | sed -n 's/^EXIT=//p')" "1"
+chk_has "D-T12 saying the tag at this commit is reused" "$out_tag" "::notice::Tag v1.3.0-dev.4 already exists at $C_BUILT, so it is reused"
 # The three release.yaml tag steps are executed the same way; their bodies
 # read VERSION and CHANNEL and never reach `gh release` on the dev channel.
 for job in go ts go-nested; do
@@ -1868,11 +1874,26 @@ for job in go ts go-nested; do
   : >"$GH_LOG"
   out_tag=$(GH_STATUS_FAIL=1 GH_TAG_EXISTS="$C_BUILT" VERSION=v1.3.0-dev.4 CHANNEL=dev run_step "$job-tag.sh")
   chk "D-T14 the $job step keeps a pre-existing tag on a failed POST" "$(grep -c -- '-X DELETE' "$GH_LOG")" "0"
+  chk_has "D-T14 the $job step says it reuses that tag" "$out_tag" "::notice::Tag v1.3.0-dev.4 already exists at $C_BUILT, so it is reused"
   : >"$GH_LOG"
   out_tag=$(VERSION=v1.3.0-dev.4 CHANNEL=dev run_step "$job-tag.sh")
   chk "D-T15 the $job step tags and records the receipt on a clean run" \
     "$(grep -c -E "git/refs -f ref=refs/tags/v1.3.0-dev.4 -f sha=$C_BUILT|api -X POST repos/owner/app/statuses/$C_BUILT -f state=success -f context=release/tag/v1.3.0-dev.4 " "$GH_LOG")" "2"
   chk "D-T15 the $job step exits 0" "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)" "0"
+done
+# A release run's lanes create their tags in one repository at once, and GitHub
+# can refuse one of two concurrent ref writes: each tag step reads the tag again
+# and retries, so one refusal still tags once and records the receipt.
+for step in go-tag.sh ts-tag.sh go-nested-tag.sh devtag.sh; do
+  : >"$GH_LOG"
+  touch "$WORK/refuse-once"
+  out_tag=$(GH_REF_REFUSE_ONCE="$WORK/refuse-once" GH_HEAD="$C_BUILT" VERSION=v1.3.0-dev.4 CHANNEL=dev TAG=v1.3.0-dev.4 \
+    run_step "$step")
+  chk "D-T16 $step retries a refused tag create" \
+    "$(grep -c "git/refs -f ref=refs/tags/v1.3.0-dev.4 -f sha=$C_BUILT" "$GH_LOG")|$(grep -c "git/ref/tags/v1.3.0-dev.4" "$GH_LOG")" "2|2"
+  chk "D-T16 $step then records one receipt and keeps the tag" \
+    "$(grep -c "api -X POST repos/owner/app/statuses/$C_BUILT -f state=success -f context=release/tag/v1.3.0-dev.4 " "$GH_LOG")|$(grep -c -- '-X DELETE' "$GH_LOG")" "1|0"
+  chk "D-T16 $step exits 0" "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)" "0"
 done
 
 # ── The image lane's completion receipt ──────────────────────────────────────

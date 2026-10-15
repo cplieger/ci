@@ -9,6 +9,8 @@
 #   stale-pr <repo> <base> <tag> <age-days> <built> <since>   open-pr with the staleness reason,
 #                                    opening nothing once a rebuild request merged at or after a
 #                                    non-empty <since>
+#   dispatch <repo> <bases>          GH_TOKEN and GITHUB_STEP_SUMMARY; stale-pr for each of a matrix
+#                                    leg's bases in turn, failing once any base failed or is unreadable
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +23,7 @@ MANIFEST_TYPES='application/vnd.oci.image.manifest.v1+json, application/vnd.dock
 REBUILD_SUBJECT='fix(deps): rebuild against refreshed base packages'
 
 usage() {
-  sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 
@@ -96,7 +98,7 @@ rebuild_requested() { # <repo> <base> <since> -> the committer time of the newes
 }
 
 open_pr() { # <repo> <base> <reason> [since]
-  local repo=$1 base=$2 reason=$3 since=${4:-} open req head tree commit branch body url
+  local repo=$1 base=$2 reason=$3 since=${4:-} open req head tree commit branch body url rc
   case "$base" in dev | main) ;; *)
     echo "::error::open-pr: base must be dev or main, got '${base}'" >&2
     exit 2
@@ -116,9 +118,25 @@ open_pr() { # <repo> <base> <reason> [since]
   # A fork's branch can carry any name, so only this repository's own heads count.
   # Newest first, over REST: the App installation's GraphQL quota is shared with
   # Renovate, which runs as the same App.
-  open=$(gh api --paginate "repos/cplieger/${repo}/pulls?state=open&base=${base}&sort=created&direction=desc&per_page=100" \
-    --jq ".[] | select(.head.repo.full_name == \"cplieger/${repo}\" and (.head.ref | startswith(\"rebuild/${base}-\"))) | .html_url")
-  open=${open%%$'\n'*}
+  open_rebuild() { # [branch] -> the newest open rebuild pull request's URL, that branch's when given
+    local found
+    found=$(gh api --paginate "repos/cplieger/${repo}/pulls?state=open&base=${base}&sort=created&direction=desc&per_page=100" \
+      --jq ".[] | select(.head.repo.full_name == \"cplieger/${repo}\" and (.head.ref | startswith(\"rebuild/${base}-\"))
+        and (\"${1:-}\" == \"\" or .head.ref == \"${1:-}\")) | .html_url") || return 1
+    echo "${found%%$'\n'*}"
+  }
+  # Another writer (release-maintenance.yaml opens main's) can create the branch or
+  # its pull request between this run's read and its write, which GitHub answers
+  # with a 422. That writer's open pull request is then asked to merge, as an open
+  # one found by the read is.
+  concurrent() { # -> 0 once that writer's open pull request is asked to merge, 3 when none is open
+    local url
+    url=$(open_rebuild "$branch") || return 1
+    [ -n "$url" ] || return 3
+    echo "::notice::cplieger/${repo}: ${url} opened ${branch} concurrently, so its merge is asked for"
+    request_merge "$url"
+  }
+  open=$(open_rebuild)
   if [ -n "$open" ]; then
     echo "::notice::cplieger/${repo}: ${open} is already open against ${base}, so its merge is asked for again"
     request_merge "$open"
@@ -146,16 +164,71 @@ open_pr() { # <repo> <base> <reason> [since]
     -f message="$REBUILD_SUBJECT" \
     -f tree="$tree" -f 'parents[]='"$head" --jq .sha)
   branch="rebuild/${base}-$(date -u +%Y%m%d)"
-  if gh api "repos/cplieger/${repo}/git/ref/heads/${branch}" >/dev/null 2>&1; then
-    echo "::notice::cplieger/${repo}: ${branch} already exists without an open pull request; moving it to the new commit"
+  # A branch with no open pull request holds a commit nobody vouches for, so it
+  # is moved to this run's commit rather than opened as it is.
+  move_branch() { # <why>
+    echo "::notice::cplieger/${repo}: ${branch} $1, so it is moved to the new commit"
     gh api -X PATCH "repos/cplieger/${repo}/git/refs/heads/${branch}" -f sha="$commit" -F force=true >/dev/null
-  else
-    gh api -X POST "repos/cplieger/${repo}/git/refs" -f ref="refs/heads/${branch}" -f sha="$commit" >/dev/null
+  }
+  create_branch() { gh api -X POST "repos/cplieger/${repo}/git/refs" -f ref="refs/heads/${branch}" -f sha="$commit" >/dev/null 2>"$WORK/ref.err"; }
+  branch_state() { # -> 0 when the branch reads as present, 3 on a 404, 1 on any other answer (printed)
+    gh api "repos/cplieger/${repo}/git/ref/heads/${branch}" >/dev/null 2>"$WORK/branch.err" && return 0
+    grep -q 'HTTP 404' "$WORK/branch.err" && return 3
+    cat "$WORK/branch.err"
+    return 1
+  }
+  if gh api "repos/cplieger/${repo}/git/ref/heads/${branch}" >/dev/null 2>&1; then
+    move_branch "already exists without an open pull request"
+  elif ! create_branch; then
+    cat "$WORK/ref.err"
+    grep -q 'HTTP 422' "$WORK/ref.err" || return 1
+    rc=0
+    concurrent || rc=$?
+    case "$rc" in
+      0) return 0 ;;
+      3) ;;
+      *) return 1 ;;
+    esac
+    # GitHub answers a ref create with a bare 422 whether or not it applied it
+    # (github/rest-api-description#4887), so each refusal is judged by reading
+    # the branch: present was created by someone, absent after the first
+    # refusal is created once more.
+    rc=0
+    branch_state || rc=$?
+    if [ "$rc" -eq 3 ] && create_branch; then
+      rc=created
+    elif [ "$rc" -eq 3 ]; then
+      cat "$WORK/ref.err"
+      rc=0
+      branch_state || rc=$?
+    fi
+    case "$rc" in
+      created) ;;
+      0) move_branch "was created concurrently without an open pull request" ;;
+      3)
+        echo "::error::cplieger/${repo}: ${branch} could not be created and does not exist, so no rebuild pull request into ${base} was opened"
+        return 1
+        ;;
+      *)
+        echo "::error::cplieger/${repo}: ${branch} could not be created, and reading it again failed"
+        return 1
+        ;;
+    esac
   fi
   body="${reason} Merging this empty commit rebuilds it against the base packages published since then; nothing else changes."
-  url=$(gh api -X POST "repos/cplieger/${repo}/pulls" \
+  if ! url=$(gh api -X POST "repos/cplieger/${repo}/pulls" \
     -f title="$REBUILD_SUBJECT" \
-    -f head="$branch" -f base="$base" -f body="$body" --jq .html_url)
+    -f head="$branch" -f base="$base" -f body="$body" --jq .html_url 2>"$WORK/pull.err"); then
+    cat "$WORK/pull.err"
+    grep -q 'HTTP 422' "$WORK/pull.err" || return 1
+    rc=0
+    concurrent || rc=$?
+    [ "$rc" -ne 3 ] || {
+      echo "::error::cplieger/${repo}: no rebuild pull request into ${base} was opened, and none is open"
+      rc=1
+    }
+    return "$rc"
+  fi
   echo "Opened ${url}"
   request_merge "$url"
 }
@@ -168,11 +241,45 @@ stale_pr() { # <repo> <base> <tag> <age-days> <built> <since>
   fi
 }
 
+# Each base runs stale-pr as its own process, so one base's failure under set -e
+# leaves the next base handled.
+dispatch() { # <repo> <bases JSON: fanout's rows of that repo, main first>
+  local repo=$1 rows base channel last age since unreadable outcome failed=0
+  # U+001F, not a tab: read collapses adjacent whitespace separators, which would
+  # shift every field after an empty since.
+  if ! rows=$(jq -r 'if type == "array" and all(.[]; type == "object" and (.base | type) == "string")
+      then .[] | [.base, .channel, .last, .age_days, (.since // ""), (.unreadable // "")] | join("\u001f")
+      else error("not fanout rows") end' <<<"$2" 2>/dev/null); then
+    echo "::error::dispatch: the bases of cplieger/${repo} are not fanout rows: $2" >&2
+    exit 2
+  fi
+  {
+    echo "| Repo | Base | Channel | Outcome |"
+    echo "|---|---|---|---|"
+  } >>"$GITHUB_STEP_SUMMARY"
+  while IFS=$'\x1f' read -r base channel last age since unreadable; do
+    [ -n "$base" ] || continue
+    if [ -n "$unreadable" ]; then
+      echo "::error::ghcr.io/cplieger/${repo}:${channel} (${base}) did not read, so its age is unknown and nothing was rebuilt. ${unreadable}"
+      outcome=unreadable
+    else
+      echo "::group::cplieger/${repo}: ${base} (:${channel})"
+      outcome="done"
+      bash "${BASH_SOURCE[0]}" stale-pr "$repo" "$base" "$channel" "$age" "$last" "$since" </dev/null || outcome=failed
+      echo "::endgroup::"
+      [ "$outcome" = "done" ] || echo "::error::cplieger/${repo}: the rebuild of ${base} (:${channel}) failed. Its log is above."
+    fi
+    [ "$outcome" = "done" ] || failed=1
+    echo "| ${repo} | ${base} | :${channel} | ${outcome} |" >>"$GITHUB_STEP_SUMMARY"
+  done <<<"$rows"
+  return "$failed"
+}
+
 fanout() {
   # Per-repo staleness overrides (days), keyed by repo name, e.g.
   #   INTERVAL_OVERRIDES[docker-keepalived]=3
   declare -A INTERVAL_OVERRIDES=()
-  local two_branch listing
+  local two_branch listing matrix
 
   # A fork publishes no cplieger image. REST rather than `gh repo list`: the
   # GraphQL quota is shared with every other token of the account owner.
@@ -283,13 +390,22 @@ fanout() {
     two_branch_rows "$r"
   done <<<"$two_branch"
 
-  echo "matrix=${STALE}" >>"$GITHUB_OUTPUT"
+  # One leg per repository, its rows adjacent and main first as two_branch_rows
+  # appends them: GitHub has refused one of two concurrent pushes to one
+  # repository (#845), and asks for mutating requests to be made serially
+  # (https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api),
+  # so dispatch handles a repository's bases in turn.
+  matrix=$(jq -c 'reduce .[] as $r ([];
+      if length > 0 and .[-1].repo == $r.repo then .[-1].bases += [$r | del(.repo)]
+      else . + [{repo: $r.repo, bases: [$r | del(.repo)]}] end)
+    | map(. + {readable: any(.bases[]; .unreadable == null)})' <<<"$STALE")
+  echo "matrix=${matrix}" >>"$GITHUB_OUTPUT"
   count=$(jq '[.[] | select(.unreadable == null)] | length' <<<"$STALE")
   unreadable=$(jq '[.[] | select(.unreadable != null)] | length' <<<"$STALE")
   {
     echo ""
     echo "Rebuilding ${count} image(s)."
-    [ "$unreadable" -eq 0 ] || echo "${unreadable} image(s) could not be read; each fails its dispatch row."
+    [ "$unreadable" -eq 0 ] || echo "${unreadable} image(s) could not be read; each fails its repository's dispatch job."
   } >>"$GITHUB_STEP_SUMMARY"
   echo "Stale images: ${count}"
 }
@@ -310,6 +426,10 @@ case "${1:-}" in
   stale-pr)
     [ "$#" -eq 7 ] || usage
     stale_pr "$2" "$3" "$4" "$5" "$6" "$7"
+    ;;
+  dispatch)
+    [ "$#" -eq 3 ] || usage
+    dispatch "$2" "$3"
     ;;
   *) usage ;;
 esac
