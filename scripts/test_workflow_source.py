@@ -54,6 +54,14 @@ def uses_source(step: dict) -> bool:
     )
 
 
+def condition(step: dict) -> str:
+    """The step's `if:` expression without its `${{ }}` wrapper, or '' when it has none."""
+    expr = str(step.get('if', '')).strip()
+    if expr.startswith('${{') and expr.endswith('}}'):
+        expr = expr[3:-2].strip()
+    return expr
+
+
 class OwnReferences(unittest.TestCase):
     def test_no_step_reaches_this_repository_through_a_moving_ref(self):
         own = 0
@@ -90,6 +98,15 @@ class SourceCheckout(unittest.TestCase):
                     },
                 )
                 self.assertTrue(steps[at]['uses'].startswith('actions/checkout@'))
+                # A conditional checkout leaves the source missing for a use that runs without it.
+                guard = condition(steps[at])
+                if guard:
+                    unguarded = [
+                        s.get('name', '')
+                        for s in steps[at + 1 :]
+                        if uses_source(s) and guard not in condition(s)
+                    ]
+                    self.assertEqual(unguarded, [])
                 # A later root checkout would empty the workspace and the source with it.
                 later = [
                     s.get('name', '')
@@ -100,6 +117,11 @@ class SourceCheckout(unittest.TestCase):
                 self.assertEqual(later, [])
         expected = {'release.yaml:detect', 'release.yaml:go-nested', 'docker-release.yaml:finalize'}
         self.assertLessEqual({*expected, 'ci.yaml:pr-policy'}, users)
+
+    def test_a_condition_reads_without_its_expression_wrapper(self):
+        self.assertEqual(condition({'if': "${{ env.PUBLISH == 'true' }}"}), "env.PUBLISH == 'true'")
+        self.assertEqual(condition({'if': "env.PUBLISH == 'true'"}), "env.PUBLISH == 'true'")
+        self.assertEqual(condition({'run': 'true'}), '')
 
     def test_a_run_body_naming_the_source_counts_as_a_use(self):
         self.assertTrue(uses_source({'run': f'python3 {SOURCE}/scripts/intake.py'}))
