@@ -458,7 +458,9 @@ def audit_over_answers(module, scenario: dict) -> dict:
 
     def fake_gh(*args):
         path = gh_path(args)
-        reads.append(path)
+        # The baseline reads a 404 once; the contents recheck re-reads it at once.
+        if not reads or reads[-1] != path:
+            reads.append(path)
         if '-i' not in args:
             return legacy_reply(answers.get(path), args)
         if path not in answers:
@@ -467,6 +469,10 @@ def audit_over_answers(module, scenario: dict) -> dict:
 
     saved = (module.gh, module.used_by_package_scrape, module.WEBHOOK_HOST)
     module.gh = fake_gh
+    rest = getattr(module, 'REST', None)
+    if rest is not None:
+        saved_sleep = rest.sleep
+        rest.sleep = lambda _seconds: None
     module.used_by_package_scrape = lambda name: tuple(scenario['used_by'])
     module.WEBHOOK_HOST = HOST
     module._canonical_cache.clear()  # noqa: SLF001 (a cached canonical would leak across scenarios)
@@ -475,6 +481,8 @@ def audit_over_answers(module, scenario: dict) -> dict:
         hard, warn, accepted = module.compliance(s)
     finally:
         module.gh, module.used_by_package_scrape, module.WEBHOOK_HOST = saved
+        if rest is not None:
+            rest.sleep = saved_sleep
     return {'hard': hard, 'warn': warn, 'accepted': accepted, 'errors': s['errors'], 'reads': reads}
 
 
@@ -1679,13 +1687,13 @@ class TwoBranchRenovateConfig(unittest.TestCase):
             asked.append(gh_path(args))
             return reply
 
-        original = audit.gh
-        audit.gh = fake_gh
+        saved = (audit.gh, audit.REST.sleep)
+        audit.gh, audit.REST.sleep = fake_gh, lambda _seconds: None
         s = {'errors': []}
         try:
             audit.collect_renovate_config('httpx', 'dev', s)
         finally:
-            audit.gh = original
+            audit.gh, audit.REST.sleep = saved
         return s, asked
 
     def test_collect_reads_the_file_on_the_default_branch(self):
@@ -1782,8 +1790,25 @@ class RestTransport(unittest.TestCase):
         asked, _ = self.replies(gh_ok(body))
         self.assertEqual(audit.file_text('x', 'go.mod'), 'module github.com/cplieger/x\n')
         self.assertEqual(asked, ['repos/cplieger/x/contents/go.mod'])
-        self.replies(gh_http(404))
+        asked, slept = self.replies(gh_http(404), gh_http(404))
         self.assertEqual(audit.file_text('x', 'go.mod'), '')
+        self.assertEqual((len(asked), slept), (2, [audit.CONTENTS_404_RECHECK_SECONDS]))
+
+    def test_a_contents_404_that_a_second_read_contradicts_is_not_absence(self):
+        body = {'content': base64.encodebytes(b'{}').decode()}
+        self.replies(gh_http(404), gh_ok(body))
+        self.assertEqual(audit.file_text('x', 'renovate.json'), '{}')
+        self.replies(gh_http(404), gh_http(502), gh_http(502), gh_http(502), gh_http(502))
+        self.assertIsNone(audit.file_text('x', 'renovate.json'))
+
+    def test_a_404_outside_the_contents_api_is_read_once(self):
+        asked, slept = self.replies(gh_http(404))
+        self.assertIsNone(audit.gh_json_strict('repos/cplieger/x/branches/dev/protection'))
+        self.assertEqual((len(asked), slept), (1, []))
+
+    def test_file_text_reads_a_definitive_non_404_as_unknown(self):
+        self.replies(gh_http(403))
+        self.assertIsNone(audit.file_text('x', 'go.mod'))
 
     def test_file_text_of_a_directory_is_unknown_not_content(self):
         self.replies(gh_ok([{'name': 'a.go'}]))
@@ -2289,11 +2314,15 @@ class Codeowners(unittest.TestCase):
     def read(self, *paths: str) -> list:
         return [f'repos/cplieger/httpx/contents/{p}' for p in paths]
 
+    def distinct(self) -> list:
+        """The paths asked, in order, once each: a 404 is read twice."""
+        return list(dict.fromkeys(self.asked))
+
     def test_no_file_at_any_location_is_compliant(self):
         s, warn = self.grade()
         self.assertEqual((s['codeowners_wildcard'], s['errors'], warn), (None, [], []))
         self.assertEqual(
-            self.asked, self.read('.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS')
+            self.distinct(), self.read('.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS')
         )
 
     def test_a_star_rule_naming_the_owner_warns(self):
@@ -2330,21 +2359,21 @@ class Codeowners(unittest.TestCase):
             {'.github/CODEOWNERS': '/docs/ @someone\n', 'CODEOWNERS': '* @cplieger\n'}
         )
         self.assertEqual((s['codeowners_wildcard'], warn), (None, []))
-        self.assertEqual(self.asked, self.read('.github/CODEOWNERS'))
+        self.assertEqual(self.distinct(), self.read('.github/CODEOWNERS'))
         s, warn = self.grade({'.github/CODEOWNERS': '* @cplieger\n', 'CODEOWNERS': '* @someone\n'})
         self.assertEqual(s['codeowners_wildcard'], '.github/CODEOWNERS')
         self.assertEqual(warn, [CODEOWNERS_LINE.replace('CODEOWNERS:', '.github/CODEOWNERS:')])
         s, warn = self.grade({'docs/CODEOWNERS': '* @cplieger\n'})
         self.assertEqual(s['codeowners_wildcard'], 'docs/CODEOWNERS')
-        self.assertEqual(len(self.asked), 3)
+        self.assertEqual(len(self.distinct()), 3)
 
     def test_an_empty_file_is_present_and_ends_the_lookup(self):
         s, warn = self.grade({'.github/CODEOWNERS': '', 'CODEOWNERS': '* @cplieger\n'})
         self.assertEqual((s['codeowners_wildcard'], s['errors'], warn), (None, [], []))
-        self.assertEqual(self.asked, self.read('.github/CODEOWNERS'))
+        self.assertEqual(self.distinct(), self.read('.github/CODEOWNERS'))
         s, warn = self.grade({'CODEOWNERS': '', 'docs/CODEOWNERS': '* @cplieger\n'})
         self.assertEqual((s['codeowners_wildcard'], s['errors'], warn), (None, [], []))
-        self.assertEqual(self.asked, self.read('.github/CODEOWNERS', 'CODEOWNERS'))
+        self.assertEqual(self.distinct(), self.read('.github/CODEOWNERS', 'CODEOWNERS'))
 
     def test_an_unreadable_file_is_an_error_and_never_a_warning(self):
         s, warn = self.grade({'.github/CODEOWNERS': 403, 'CODEOWNERS': '* @cplieger\n'})
@@ -2365,7 +2394,7 @@ class Codeowners(unittest.TestCase):
                 s, warn = self.grade({'.github/CODEOWNERS': body, 'CODEOWNERS': '* @cplieger\n'})
                 self.assertEqual(s['errors'], ['.github/CODEOWNERS unreadable (API)'])
                 self.assertEqual((s['codeowners_wildcard'], warn), (None, []))
-                self.assertEqual(self.asked, self.read('.github/CODEOWNERS'))
+                self.assertEqual(self.distinct(), self.read('.github/CODEOWNERS'))
 
     def test_the_warning_is_filed_without_waiting_for_adoption(self):
         tmp = tempfile.TemporaryDirectory()
