@@ -596,7 +596,7 @@ cmd_complete() { # <image@digest> <source commit>
 # main's commits included; any other tag's at its commit, at such an ancestor
 # whose image it re-tagged, or in its publishing window. promote-digest.sh
 # owns which ancestors those are.
-signing_window() { # <tag> -> the commits whose docker-release.yaml run may have signed the tag's image, in the order to try
+signing_window() { # <tag, or the commit it is about to name> -> the commits whose docker-release.yaml run may have signed the tag's image, in the order to try
   local commit
   commit=$(git rev-list -n1 "$1") || die "no tag ${1} in this checkout"
   if is_promotion "$commit"; then

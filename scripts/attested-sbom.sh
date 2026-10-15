@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# attested-sbom.sh <image@digest> <tag> <out>: writes to <out> the SPDX document
-# attested to the image by a docker-release.yaml run of GITHUB_REPOSITORY at a
-# commit that could have published <tag> (release-state.sh signing-window, which
-# reads EXCLUDE_RE and SUBPACKAGES_JSON). Exit 0 written; 3 nothing verifies as
-# this repository's, or no SPDX document names the digest; 1 the window or
-# cosign could not tell. On failure stdout carries the reason and <out> is
-# left absent.
+# attested-sbom.sh <image@digest> <tag> <out>: writes to <out>, as one `jq -c` line, the
+# SPDX document attested to the image by a docker-release.yaml run of GITHUB_REPOSITORY
+# at a commit that could have published <tag>, which may be the commit a release is
+# about to tag (release-state.sh signing-window; EXCLUDE_RE, SUBPACKAGES_JSON). Exit 0
+# written; 3 nothing verifies as this repository's, or no SPDX document names the
+# digest; 1 the window or cosign could not tell. On failure stdout carries the reason
+# and <out> is left absent.
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

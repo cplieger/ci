@@ -788,6 +788,22 @@ jobs:
           set -euo pipefail
           bash "$CI_TOOLS/release-state.sh" provenance "${REGISTRY}/${IMAGE_NAME}@${PROMOTE_DIGEST}" "$PROMOTE_SOURCE"
 
+      # A promotion's release SBOM is the one its build attested, never a fresh
+      # scan, so the Release and the image list the same packages. The repair
+      # job reads it through the same script, so both write the same bytes.
+      - name: Read the promoted build's SBOM
+        if: ${{ env.PUBLISH == 'true' && env.PROMOTE_DIGEST != '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          EXCLUDE_RE: ${{ inputs.exclude-re }}
+          SUBPACKAGES_JSON: ${{ inputs.subpackages }}
+        run: |
+          set -euo pipefail
+          if ! why=$(bash "$CI_TOOLS/attested-sbom.sh" "${REGISTRY}/${IMAGE_NAME}@${PROMOTE_DIGEST}" "$GITHUB_SHA" sbom.spdx.json); then
+            echo "::error::sbom.spdx.json is missing, because ${why}. A promotion publishes the SBOM its build attested, so nothing is published without it."
+            exit 1
+          fi
+
       # Build arm: assemble the multi-arch index at the channel tags from the
       # per-arch digests. Promote arm: `imagetools create` with a single
       # source is a carbon copy, so the stable tags point at the dev digest
@@ -917,7 +933,7 @@ jobs:
           category: 'trivy-image-build'
 
       - name: Generate SBOM (from image)
-        if: ${{ env.PUBLISH == 'true' }}
+        if: ${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' }}
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}

@@ -67,6 +67,8 @@ wanted = {
     },
     "finalize": {
         "Verify the promoted build's signature and SBOM": "provenance.sh",
+        "Read the promoted build's SBOM": "promotedsbom.sh",
+        "Publish channel tags on GHCR": "manifest.sh",
         "Fetch the previous release's SBOM": "prevsbom.sh",
         "Generate release notes": "notes.sh",
         "Prepare tag-create helper": "taghelper.sh",
@@ -103,11 +105,22 @@ gates = {
     "prepare-cosign-uses": next(s for s in jobs["prepare"]["steps"] if s.get("name") == "Install Cosign")["uses"],
     "build-if": " ".join(str(jobs["build"]["if"]).split()),
     "prevsbom-if": step_if("finalize", "Fetch the previous release's SBOM"),
-    "prevsbom-order": max(i for i, n in enumerate(fin) if n.startswith("Generate SBOM"))
+    "prevsbom-order": max(i for i, n in enumerate(fin) if n.startswith("Generate SBOM") or n == "Read the promoted build's SBOM")
     < fin.index("Fetch the previous release's SBOM") < fin.index("Generate release notes"),
+    "sbom-readers-after": all(
+        fin.index(w) < fin.index(r)
+        for w in [n for n in fin if n.startswith("Generate SBOM")] + ["Read the promoted build's SBOM"]
+        for r in ("Shipped package versions summary", "Sign SBOM for release assets (keyless)", "Attest SBOM to GHCR")
+    ),
     "provenance-if": step_if("finalize", "Verify the promoted build's signature and SBOM"),
     "before-provenance": fin[: fin.index("Verify the promoted build's signature and SBOM")],
-    "first-write": fin[fin.index("Verify the promoted build's signature and SBOM") + 1],
+    "after-provenance": fin[fin.index("Verify the promoted build's signature and SBOM") + 1],
+    "first-write": fin[fin.index("Verify the promoted build's signature and SBOM") + 2],
+    "promotedsbom-if": step_if("finalize", "Read the promoted build's SBOM"),
+    "scan-ifs": sorted({
+        " ".join(str(s.get("if", "")).split()) for s in jobs["finalize"]["steps"]
+        if str(s.get("uses", "")).startswith("anchore/sbom-action@")
+    }),
     "receipt-if": " ".join(str(jobs["receipt"]["if"]).split()),
     "receipt-needs": jobs["receipt"]["needs"],
     "receipt-perms": jobs["receipt"].get("permissions"),
@@ -355,7 +368,9 @@ policy_keys() { # <repo name> <spdx id> -> the policy step's output keys
   (cd "$WORK" && REPO_NAME="$1" REPO_SPDX_ID="$2" GITHUB_OUTPUT="$WORK/policy-out" bash "$WORK/policy.sh") >/dev/null
   sed 's/=.*//' "$WORK/policy-out" | tr '\n' ' '
 }
-chk "D-P11 every release SBOM scans the published image" "$(gate '."sbom-sources" | join(",")')" "image"
+chk "D-P11 every release SBOM scan reads the published image" "$(gate '."sbom-sources" | join(",")')" "image"
+chk "D-P11 and runs only on a build, so a promotion scans nothing" "$(gate '."scan-ifs" | join(",")')" \
+  "\${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' }}"
 chk "D-P11 and no input, output or policy chooses another source" "$(gate '."sbom-knobs" | join(",")')" ""
 chk "D-P11 the policy hands every image repository the same keys" \
   "$(policy_keys marotte AGPL-3.0)/$(policy_keys web-terminal-kiro MPL-2.0)/$(policy_keys docker-age Apache-2.0)" \
@@ -1644,6 +1659,92 @@ chk "D-A8 with the pinned cosign" "$(gate '."ra-cosign".uses')|$(gate '."ra-cosi
 chk "D-A8 uploading every file the step wrote, failing on none" \
   "$(gate '."ra-upload" | "\(.name)|\(.path)|\(."if-no-files-found")"')" '${{ steps.release.outputs.artifact }}|${{ runner.temp }}/assets/|error'
 
+# ── A promotion's release SBOM: the attestation its dev build made ───────────
+[ -s "$WORK/promotedsbom.sh" ] || fail "D-PS0 the promoted-SBOM step was not extracted"
+chk "D-PS0 the promoted-SBOM step is strict-mode" "$(head -1 "$WORK/promotedsbom.sh")" "set -euo pipefail"
+PSBOM="$WORK/psbom/sbom.spdx.json"
+promoted_sbom() { # <release commit> -> rc|stdout of the step run at it in NOTESREPO; the file it wrote moves to $PSBOM
+  local rc=0 o
+  rm -rf "$WORK/psbom" "$NOTESREPO/sbom.spdx.json"
+  mkdir -p "$WORK/psbom"
+  : >"$COSIGN_LOG"
+  o=$(cd "$NOTESREPO" && PATH="$NBIN:$BIN:$PATH" CI_TOOLS="$ROOT/scripts" REGISTRY=ghcr.io IMAGE_NAME=owner/app \
+    GITHUB_REPOSITORY=owner/app GITHUB_SHA="$1" PROMOTE_DIGEST="$D_P" EXCLUDE_RE="$EXCLUDE_RE_FULL" SUBPACKAGES_JSON='[]' \
+    READBACK_SLEEP=0 bash "$WORK/promotedsbom.sh" 2>&1) || rc=$?
+  [ ! -e "$NOTESREPO/sbom.spdx.json" ] || mv "$NOTESREPO/sbom.spdx.json" "$PSBOM"
+  echo "$rc|$o"
+}
+psbom_file() { [ -e "$PSBOM" ] && echo file || echo none; }
+# Keys out of jq -S order, so a re-sorted or re-indented file cannot match.
+PRED='{"spdxVersion":"SPDX-2.3","name":"ghcr.io/owner/app","packages":[{"SPDXID":"SPDXRef-b","name":"zlib","versionInfo":"1.3.1-r2"},{"SPDXID":"SPDXRef-a","name":"busybox","versionInfo":"1.37.0-r29"}]}'
+D_P=$(dig 9)
+printf '%s\n' '{"uid":"app"}' >"$NOTESREPO/grafana-dashboard.json"
+git -C "$NOTESREPO" checkout -q dev
+TS=$(commit_in "$NOTESREPO" "feat: dev change" main.go=v9)
+REC5=$(git -C "$NOTESREPO" commit-tree -p "$DSH" -p "$TS" -m "release: promote dev into main
+
+Promoted-Digest: ${D_P}" "$TS^{tree}")
+git -C "$NOTESREPO" checkout -q -B main "$REC5"
+echo "owner/app $TS" >"$COSIGN_SIGNED"
+envelope bundle "$D_P" "$PRED" >"$COSIGN_VERIFIED"
+chk "D-PS1 an untagged promotion writes the document its dev build attested" "$(promoted_sbom "$REC5")|$(psbom_file)" "0||file"
+chk "D-PS1 as the attested predicate, one jq -c line" "$(cmp -s "$PSBOM" <(printf '%s\n' "$PRED") && echo same || echo differs)" "same"
+chk "D-PS1 verified against this workflow's identity and repository at the promoted commit, by the promoted digest" \
+  "$(head -n1 "$COSIGN_LOG")" \
+  "verify-attestation --type spdxjson --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp ^https://github\.com/cplieger/ci/\.github/workflows/docker-release\.yaml@ --certificate-github-workflow-repository owner/app --certificate-github-workflow-sha $TS ghcr.io/owner/app@${D_P}"
+chk "D-PS1 and read from what verification printed, with no separate download" "$(cut -d' ' -f1 "$COSIGN_LOG" | sort -u | tr '\n' ' ')" "verify-attestation "
+cp "$PSBOM" "$WORK/psbom-promoted.json"
+git -C "$NOTESREPO" tag v2.1.0
+printf '%s\n' "owner/app:v2.1.0 $D_P" >"$TAGS"
+chk "D-PS2 the repair of that Release, once tagged, hands on the same bytes" \
+  "$(assets v2.1.0 | cut -d'|' -f1)|$(cmp -s "$ASSETS_DIR/sbom.spdx.json" "$WORK/psbom-promoted.json" && echo same || echo differs)" "0|same"
+: >"$TAGS"
+git -C "$NOTESREPO" tag -d v2.1.0 >/dev/null
+echo "other/app $TS" >"$COSIGN_SIGNED"
+o=$(promoted_sbom "$REC5")
+chk "D-PS3 an attestation another repository's run signed fails the step, leaving no file" "${o%%|*}|$(psbom_file)" "1|none"
+chk_has "D-PS3 naming the missing file and why" "$o" \
+  "::error::sbom.spdx.json is missing, because the SBOM attestation of ${REC5} on ghcr.io/owner/app@${D_P} does not verify as this repository's. A promotion publishes the SBOM its build attested, so nothing is published without it."
+echo "owner/app $DSH" >"$COSIGN_SIGNED"
+o=$(promoted_sbom "$REC5")
+chk "D-PS3 so does one signed at a main commit the promotion did not bring" "${o%%|*}|$(psbom_file)|$(asked)" "1|none|$TS "
+echo "owner/app $TS" >"$COSIGN_SIGNED"
+o=$(COSIGN_VERIFY_RC=1 promoted_sbom "$REC5")
+chk "D-PS4 cosign unable to tell fails the step too" "${o%%|*}|$(psbom_file)" "1|none"
+chk_has "D-PS4 saying the attestation does not verify" "$o" "::error::sbom.spdx.json is missing, because the SBOM attestation of ${REC5}"
+envelope bundle "$(dig 8)" "$PRED" >"$COSIGN_VERIFIED"
+o=$(promoted_sbom "$REC5")
+chk "D-PS5 a verified statement about another digest fails it" "${o%%|*}|$(psbom_file)" "1|none"
+chk_has "D-PS5 naming the digest it lacks" "$o" "carries no SPDX document for ${D_P}"
+MB=$(commit_in "$NOTESREPO" "fix: a main change" main.go=v10)
+MD=$(commit_in "$NOTESREPO" "docs: main notes" README.md=main2)
+echo "owner/app $MB" >"$COSIGN_SIGNED"
+envelope bundle "$D_P" "$PRED" >"$COSIGN_VERIFIED"
+chk "D-PS8 a main release re-tagging its parent's build reads the attestation that build made" \
+  "$(promoted_sbom "$MD" | cut -d'|' -f1)|$(psbom_file)|$(asked)" "0|file|$MD $MB "
+chk "D-PS6 runs on publishes of a promoted digest only, the exact complement of the scan" \
+  "$(gate '."promotedsbom-if"')" "\${{ env.PUBLISH == 'true' && env.PROMOTE_DIGEST != '' }}"
+SBIN="$WORK/sbin"
+mkdir -p "$SBIN"
+cat >"$SBIN/docker" <<'SH'
+#!/bin/sh
+[ "$1 $2 $3 $4" = "buildx imagetools create --metadata-file" ] || { echo "stub: unexpected docker $*" >&2; exit 22; }
+printf '{"containerimage.descriptor":{"digest":"%s"}}\n' "$PROMOTE_DIGEST" >"$5"
+SH
+chmod 755 "$SBIN/docker"
+: >"$WORK/manifest-out"
+# The step's metadata file is a fixed /tmp path; the probe keeps it in WORK.
+sed "s|/tmp/manifest-meta.json|$WORK/manifest-meta.json|g" "$WORK/manifest.sh" >"$WORK/manifest-local.sh"
+grep -q "$WORK/manifest-meta.json" "$WORK/manifest-local.sh" || fail "D-PS6 the channel-tag step no longer writes /tmp/manifest-meta.json"
+(cd "$WORK" && PATH="$SBIN:$PATH" REGISTRY=ghcr.io IMAGE_NAME=owner/app PROMOTE_DIGEST="$D_P" VERSION=2.1.0 MINOR=2.1 MAJOR=2 TAGS='' \
+  GITHUB_OUTPUT="$WORK/manifest-out" bash "$WORK/manifest-local.sh") >/dev/null 2>&1 || fail "D-PS6 the channel-tag step failed on a promotion"
+chk "D-PS6 a promotion's channel tags report built=false, so the scan, gated on built, is skipped" \
+  "$(sed -n 's/^built=//p' "$WORK/manifest-out")|$(gate '."scan-ifs" | join(",")')" \
+  "false|\${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' }}"
+chk "D-PS6 with the exclusion list and subpackages the digest walk used" "$(tr '\n' ' ' <"$WORK/promotedsbom.sh.envmap")" \
+  'CI_TOOLS=${{ github.workspace }}/.cplieger-ci/scripts EXCLUDE_RE=${{ inputs.exclude-re }} SUBPACKAGES_JSON=${{ inputs.subpackages }} '
+chk "D-PS7 the summary, the signature and the attestation read the SBOM after either step writes it" "$(gate '."sbom-readers-after"')" "true"
+
 # ── A promoted digest's signature and SBOM, before any write ─────────────────
 provenance() { # <source commit> -> runs the extracted step in the promotion fixture at T1's trailer digest; ok or refused
   : >"$PROV_LOG"
@@ -1669,7 +1770,8 @@ chk_has "D-G6 runs on publishes of a promoted digest only" "$(gate '."provenance
   "env.PUBLISH == 'true' && env.PROMOTE_DIGEST != ''"
 chk "D-G6 after cosign and the tools are in place, before every registry write" "$(gate '."before-provenance" | join("|")')" \
   "Checkout|Check out the ci source|Version ownership gate|Download digests|Set up Docker Buildx|Log in to GHCR|Install Cosign"
-chk "D-G6 the next step is the first write" "$(gate '."first-write"')" "Publish channel tags on GHCR"
+chk "D-G6 the next step reads the promoted SBOM, and the one after is the first write" \
+  "$(gate '."after-provenance"')|$(gate '."first-write"')" "Read the promoted build's SBOM|Publish channel tags on GHCR"
 chk "D-G6 the source is the one the digest walk named" "$(sed -n 's/^PROMOTE_SOURCE=//p' "$WORK/provenance.sh.envmap")" \
   '${{ needs.prepare.outputs.promote_source }}'
 chk "D-G6 with the exclusion list and subpackages that walk used" \
