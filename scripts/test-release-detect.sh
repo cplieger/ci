@@ -2970,12 +2970,13 @@ publish_site() { # <site> <read status> -> rc|the gh calls joined by ';'
 }
 chk "W26 no workflow reads a Release through gh release view, which bills GraphQL" "$(fact '."release-view-sites"')" "0 0"
 for s in go ts lane; do
-  rtag=v9.9.9 gate="\${{ needs.detect.outputs.channel == 'stable' }}"
-  if [ "$s" = lane ]; then rtag=yamlenv/v9.9.9 gate=""; fi
+  rtag=v9.9.9
+  if [ "$s" = lane ]; then rtag=yamlenv/v9.9.9; fi
   REF_S="api repos/o/app/git/ref/tags/$rtag --jq .object.sha" READ_S="api repos/o/app/releases/tags/$rtag"
   CREATE_S="release create $rtag --title $rtag --notes-file NOTES.md"
-  chk "W26 the $s site runs the helper from the ci source it checked out first, on the stable path" \
-    "$(fact ".\"publish-tools:$s\"")" "\${{ github.workspace }}/.cplieger-ci/scripts|.cplieger-ci|True|$gate"
+  # The tag step sources retry.sh and tag-ref.sh on every channel, so the checkout runs on every channel.
+  chk "W26 the $s site runs the helper from the ci source it checked out first, on every channel" \
+    "$(fact ".\"publish-tools:$s\"")" "\${{ github.workspace }}/.cplieger-ci/scripts|.cplieger-ci|True|"
   chk "W26 the $s site leaves a present Release alone" "$(publish_site "$s" 200)" "0|$REF_S;$READ_S"
   chk "W26 the $s site creates the Release on a 404, reading no draft listing" "$(publish_site "$s" 404)" \
     "0|$REF_S;$READ_S;$CREATE_S"
