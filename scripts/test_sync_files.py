@@ -3,6 +3,7 @@ by stub `git` and `gh` binaries that log every call."""
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import importlib.util
 import io
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import unittest.mock
 
@@ -669,6 +671,158 @@ class Concurrent(unittest.TestCase):
                         sync.main()
                     self.assertIn('nothing to sync', out.getvalue())
                     self.assertEqual(sync.PACER.gap, gap)
+
+
+class Overlap:
+    """`same_repo` lists each repo entered while one of its calls was running;
+    `cross_repo` is False when two repos' `dev` calls never ran together."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = collections.Counter()
+        self.entered = collections.defaultdict(threading.Event)
+        self.same_repo = []
+        self.met = threading.Barrier(2, timeout=5)
+        self.cross_repo = True
+
+    def call(self, repo, base):
+        with self.lock:
+            if self.active[repo]:
+                self.same_repo.append(repo)
+            self.active[repo] += 1
+            mine = self.entered[repo, base]
+            sibling = self.entered[repo, 'main' if base == 'dev' else 'dev']
+        mine.set()
+        try:
+            if base == 'dev':
+                try:
+                    self.met.wait()
+                except threading.BrokenBarrierError:
+                    self.cross_repo = False
+            # A bounded window for a sibling on another worker to enter; a sibling run
+            # in turn starts only after this call returns.
+            sibling.wait(timeout=0.5)
+        finally:
+            with self.lock:
+                self.active[repo] -= 1
+
+
+TWO_REPOS_MANIFEST = {
+    'group': [
+        group(['alpha', 'beta'], FILES, base='dev'),
+        group(['alpha', 'beta'], FILES, base='main'),
+    ]
+}
+TWO_REPOS_PRS = {
+    ('cplieger/alpha', 'dev'): 1,
+    ('cplieger/alpha', 'main'): 2,
+    ('cplieger/beta', 'dev'): 3,
+    ('cplieger/beta', 'main'): 4,
+}
+
+
+class OneRepoAtATime(unittest.TestCase):
+    def run_main(self, sync, *flags, code=0):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = pathlib.Path(tmp) / 'sync.yml'
+            manifest.write_text(yaml.safe_dump(TWO_REPOS_MANIFEST, sort_keys=False))
+            argv = ['sync-files.py', '--manifest', str(manifest), '--allow-forks']
+            out = io.StringIO()
+            with (
+                unittest.mock.patch.object(sys, 'argv', [*argv, '--workers', '4', *flags]),
+                contextlib.redirect_stdout(out),
+            ):
+                try:
+                    sync.main()
+                    exited = 0
+                except SystemExit as stop:
+                    exited = stop.code
+            self.assertEqual(exited, code, out.getvalue())
+            return out.getvalue()
+
+    def sweep(self, sync, arm, code=0):
+        import release_maintenance
+
+        with (
+            unittest.mock.patch.object(
+                sync, 'open_pulls', lambda repo, base: [{'number': TWO_REPOS_PRS[repo, base]}]
+            ),
+            unittest.mock.patch.object(sync, 'arm', arm),
+            unittest.mock.patch.object(release_maintenance, 'Api'),
+        ):
+            return self.run_main(sync, '--arm-open-prs', code=code)
+
+    def test_a_repos_targets_sync_in_turn_while_other_repos_sync_alongside(self):
+        sync, seen = load_sync(), Overlap()
+
+        def sync_repo(repo, base, _dest_map, _source_root, _dry_run):
+            seen.call(repo, base)
+            return 'clean'
+
+        with unittest.mock.patch.object(sync, 'sync_repo', sync_repo):
+            out = self.run_main(sync)
+        self.assertEqual(seen.same_repo, [])
+        self.assertTrue(seen.cross_repo, 'alpha and beta never synced at the same time')
+        self.assertEqual(
+            [line for line in out.splitlines() if line.startswith('::group::')],
+            [
+                '::group::cplieger/alpha (base: dev)',
+                '::group::cplieger/alpha (base: main)',
+                '::group::cplieger/beta (base: dev)',
+                '::group::cplieger/beta (base: main)',
+            ],
+        )
+        self.assertIn('4 target(s): 0 synced · 4 already in sync', out)
+
+    def test_a_repos_sync_pull_requests_are_armed_in_turn_while_other_repos_alongside(self):
+        sync, seen = load_sync(), Overlap()
+
+        def arm(pr, _merge_checked):
+            repo, base, number = pr
+            print(f'armed {repo}#{number}')
+            seen.call(repo, base)
+            return True
+
+        out = self.sweep(sync, arm)
+        self.assertEqual(seen.same_repo, [])
+        self.assertTrue(seen.cross_repo, 'alpha and beta were never armed at the same time')
+        armed = (('alpha', 1), ('alpha', 2), ('beta', 3), ('beta', 4))
+        self.assertEqual(out.splitlines(), [f'armed cplieger/{r}#{n}' for r, n in armed])
+
+    def test_a_failed_target_spares_its_sibling_and_fails_the_run(self):
+        sync, synced = load_sync(), []
+
+        def sync_repo(repo, base, _dest_map, _source_root, _dry_run):
+            synced.append((repo, base))
+            if (repo, base) == ('cplieger/alpha', 'dev'):
+                raise subprocess.CalledProcessError(1, 'git', stderr='! [remote rejected]')
+            return 'clean'
+
+        with unittest.mock.patch.object(sync, 'sync_repo', sync_repo):
+            out = self.run_main(sync, code=1)
+        self.assertEqual(
+            sorted(synced),
+            [(f'cplieger/{r}', b) for r in ('alpha', 'beta') for b in ('dev', 'main')],
+        )
+        self.assertIn(
+            '::warning::cplieger/alpha (base: dev): sync failed — ! [remote rejected]', out
+        )
+        self.assertIn(
+            '4 target(s): 0 synced · 3 already in sync · 0 with pending diffs (dry-run) · '
+            '1 failed (cplieger/alpha (base: dev))',
+            out,
+        )
+
+    def test_a_main_pull_request_left_open_fails_the_sweep_and_spares_the_rest(self):
+        sync, armed = load_sync(), []
+
+        def arm(pr, _merge_checked):
+            armed.append(pr)
+            return pr != ('cplieger/alpha', 'main', 2)
+
+        out = self.sweep(sync, arm, code=1)
+        self.assertEqual(sorted(armed), sorted((*t, n) for t, n in TWO_REPOS_PRS.items()))
+        self.assertIn('::error::a sync pull request into main was left open', out)
 
 
 class ArmDefault(unittest.TestCase):
