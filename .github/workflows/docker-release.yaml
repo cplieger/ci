@@ -878,7 +878,7 @@ jobs:
       - name: Publish image-size badge
         if: ${{ steps.sizebadge.outputs.json != '' }}
         continue-on-error: true
-        uses: cplieger/ci/actions/publish-badge@37d8edbe68e40e89598b9ad14a6ebb01cf46faec # v3
+        uses: cplieger/ci/actions/publish-badge@b5d4fb9e6b8482596c925a3a8956d0d5bcc82804 # v3
         with:
           repo: ${{ github.repository }}
           token: ${{ github.token }}
@@ -1479,7 +1479,7 @@ jobs:
         # The renderer's own failures are already caught inside the action (empty
         # `path` output); this covers the action itself failing to resolve.
         continue-on-error: true
-        uses: cplieger/ci/actions/render-hub-overview@37d8edbe68e40e89598b9ad14a6ebb01cf46faec # v3
+        uses: cplieger/ci/actions/render-hub-overview@b5d4fb9e6b8482596c925a3a8956d0d5bcc82804 # v3
         with:
           owner: ${{ github.repository_owner }}
           repo: ${{ github.event.repository.name }}
