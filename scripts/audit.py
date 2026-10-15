@@ -264,6 +264,8 @@ REST = ghrest.Client(run=lambda args, *_: gh(*args))
 # definitive absence) so a flaky call never manufactures a HARD failure.
 API_ERROR = object()
 
+CONTENTS_404_RECHECK_SECONDS = 3
+
 
 def gh_retry(path):
     """One GET under ghrest's retry policy: (response, definitive), where the
@@ -274,6 +276,19 @@ def gh_retry(path):
     """
     try:
         return REST.request('GET', path), True
+    except ghrest.NotFoundError as err:
+        if '/contents/' not in path:
+            return err, True
+        first = err
+    except ghrest.ApiError as err:
+        return err, err.definitive
+    # The contents API has answered 404 for a file present before and after
+    # (cplieger/ci#838), so an absence is graded only once a second read agrees.
+    REST.sleep(CONTENTS_404_RECHECK_SECONDS)
+    try:
+        return REST.request('GET', path), True
+    except ghrest.NotFoundError:
+        return first, True
     except ghrest.ApiError as err:
         return err, err.definitive
 
@@ -317,14 +332,14 @@ def api_status(path):
 
 
 def file_text(repo, path):
-    """Decoded file content; '' when the file is definitively absent;
-    None on an API error or a body that is not a file (unknown — do not treat
+    """Decoded file content; '' when the file is absent (HTTP 404); None on
+    any other failure or a body that is not a file (unknown — do not treat
     as absent)."""
     r, definitive = gh_retry(f'repos/{OWNER}/{repo}/contents/{path}')
     if not definitive:
         return None
     if isinstance(r, ghrest.ApiError):
-        return ''
+        return '' if r.status == 404 else None
     return decoded_file(r.body)
 
 
