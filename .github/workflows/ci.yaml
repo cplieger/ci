@@ -475,7 +475,7 @@ jobs:
       - name: Install zizmor
         run: |
           # renovate: datasource=pypi depName=zizmor
-          VERSION=1.31.0
+          VERSION=1.31.1
           pipx install "zizmor==${VERSION}"
 
       # actionlint does not know the ubuntu-26.04 / ubuntu-26.04-arm labels
