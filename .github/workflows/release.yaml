@@ -1414,7 +1414,7 @@ jobs:
 
           ver="${VERSION#v}"
           major="${ver%%.*}"
-          prev=$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          prev=$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -m1 -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
           if [ -z "$prev" ]; then
             echo "::notice::no previous stable tag - nothing to compare, skipping API check"
             exit 0
