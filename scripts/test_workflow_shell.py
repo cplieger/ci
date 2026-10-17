@@ -18,6 +18,7 @@ COVERED = (
     '.github/workflows/docker-release.yaml',
     '.github/workflows/promote.yaml',
     '.github/workflows/ghcr-retention.yaml',
+    '.github/workflows/community-data-refresh.yaml',
     '.github/workflows/rebuild-stale.yaml',
     '.github/workflows/deadset-ci.yaml',
     'actions/git-cliff-version/action.yml',
