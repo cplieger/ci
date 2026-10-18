@@ -99,8 +99,9 @@ jobs:
       # committed files differ; a repository with no wiregen generator no-ops.
       # `*.gen.*` is wiregen's output naming and scopes both the presence test and
       # the diff, so a generator emitting another name goes unmeasured. testdata/
-      # is pruned as in the meta nested-module discovery: a golden fixture is not
-      # shipped output, and the wiregen repo itself has fixtures and no generator.
+      # and fixtures/ are pruned: a fixture is not shipped output (a corpus can
+      # hold Buf's own buf.gen.yaml), and the wiregen repo has fixtures and no
+      # generator.
       - name: Wiregen drift
         continue-on-error: true
         run: |
@@ -113,7 +114,7 @@ jobs:
                   grep -qE '^package main([[:space:]]|$)' "$d"/*.go 2>/dev/null && echo "$d" || true
                 done) || true
             genfiles=$(git ls-files '*.gen.*' \
-              | grep -Ev '(^|/)(node_modules|vendor|testdata|static|dist)/' || true)
+              | grep -Ev '(^|/)(node_modules|vendor|testdata|fixtures|static|dist)/' || true)
             if [ -z "$gens" ]; then
               # Tracked generated output with no generator to regenerate it is
               # the exact state this check exists to catch: the discovery above
