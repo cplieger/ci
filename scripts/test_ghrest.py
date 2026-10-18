@@ -150,6 +150,9 @@ class Request(unittest.TestCase):
         self.assertEqual(
             run.calls[0][0], ['api', '-i', '-H', 'Accept: application/octet-stream', 'a/zip']
         )
+        c, run, _ = client(reply(404))
+        self.assertIsNone(c.get_or_none('a/x', ('Accept: application/json',)))
+        self.assertEqual(run.calls[0][0], ['api', '-i', '-H', 'Accept: application/json', 'a/x'])
 
 
 class RateLimit(unittest.TestCase):

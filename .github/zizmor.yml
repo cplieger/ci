@@ -28,6 +28,7 @@ rules:
       # The workflows calling notify-failure.yaml.
       - audit.yaml
       - backfill-release-sbom-sigs.yaml
+      - community-data-refresh.yaml
       - daily-security.yaml
       - ghcr-retention.yaml
       - move-major-tag.yaml

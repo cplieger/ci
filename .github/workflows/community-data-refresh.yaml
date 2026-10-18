@@ -1,0 +1,143 @@
+# Opens or updates one pull request per repository in REPOS
+# (scripts/community_data_refresh.py; langtag's CLDR tables) from the proposal
+# its own community-data-refresh.yaml uploaded. That workflow runs the
+# repository's refresh on its base branch with no secret; this one runs none of
+# the repository's code and reads the artifact only as data, checked against
+# the row's allowed paths. The pull request waits for its ci / validate and a
+# human merge. The proposal format is in docs/workflows.md; sync.yaml
+# documents the App's secrets.
+name: Community data refresh
+
+on:
+  schedule:
+    # The 3rd of each month, three hours after the repositories' own refresh
+    # at 05:17 UTC, which takes at most 20 minutes.
+    - cron: "17 8 3 * *"
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Space/comma-separated repo names to limit the run. Empty runs every listed repository."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Plan the repositories
+        id: plan
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          set -euo pipefail
+          python3 scripts/community_data_refresh.py plan --only "$ONLY"
+
+  propose:
+    name: propose (${{ matrix.repo }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    # One writer at a time per repository's refresh branch.
+    concurrency:
+      group: community-data-refresh-${{ matrix.repo }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Another repository's artifacts need a token holding actions: read on it.
+      - name: Mint the read token
+        id: read-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          owner: cplieger
+          repositories: ${{ matrix.repo }}
+          permission-actions: read
+
+      - name: Find the refresh run
+        id: run
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+          REPO: ${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          python3 scripts/community_data_refresh.py locate --repo "$REPO"
+
+      - name: Download the proposal
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: community-data-refresh
+          path: ${{ runner.temp }}/proposal
+          github-token: ${{ steps.read-token.outputs.token }}
+          repository: cplieger/${{ matrix.repo }}
+          run-id: ${{ steps.run.outputs.run-id }}
+
+      - name: Check the proposal
+        id: check
+        env:
+          REPO: ${{ matrix.repo }}
+          PROPOSAL: ${{ runner.temp }}/proposal
+        run: |
+          set -euo pipefail
+          python3 scripts/community_data_refresh.py check --repo "$REPO" --proposal "$PROPOSAL"
+
+      # The App token: a pull request the workflow token opens starts no CI run.
+      - name: Mint the App token
+        if: steps.check.outputs.changed == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          owner: cplieger
+          repositories: ${{ matrix.repo }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Propose cplieger/${{ matrix.repo }}'s refresh
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          REPO: ${{ matrix.repo }}
+          BASE: ${{ steps.run.outputs.base }}
+          PROPOSAL: ${{ runner.temp }}/proposal
+        run: |
+          set -euo pipefail
+          python3 scripts/community_data_refresh.py propose --repo "$REPO" --base "$BASE" --proposal "$PROPOSAL" --bot "${APP_SLUG}[bot]"
+
+  # `needs:` must list every other job in this workflow.
+  notify:
+    needs: [plan, propose]
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      scope: ${{ inputs.only }}
