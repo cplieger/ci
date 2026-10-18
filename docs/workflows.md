@@ -13,7 +13,7 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | `go.mod` at the root | `go` | `go-ci.yaml` |
 | a `go.mod` in a subfolder, with tracked Go files | `go-nested` | `go-ci.yaml` once per module folder |
 | `jsr.json` at the root | `ts` | `ts-ci.yaml` |
-| a `package.json` or `jsr.json` in `static-src/`, `web/` or `internal/server/static-src/` | `web` | `ts-ci.yaml` in the first folder found, with the CSS and HTML lints on |
+| a `package.json` or `jsr.json` in `static-src/`, `web/`, `internal/server/static-src/` or `internal/webui/static-src/` | `web` | `ts-ci.yaml` in the first folder found, with the CSS and HTML lints on |
 | a `Dockerfile` | `shell` | `shell-ci.yaml` |
 | Go or TypeScript that deadset detects, or a root `deadset.json` naming languages, or a `go-nested` module | `deadset` | `deadset-ci.yaml` at the repository root, and once per nested module folder |
 | a `Dockerfile` | `docker`, `docker-arm64` | an image build on `amd64`, and on `arm64` in public repositories, with no push and no scan |

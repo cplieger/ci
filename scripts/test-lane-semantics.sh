@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# Regression probe for the nested-Go-module lane SHELL semantics that
-# release.yaml (detect: gomodules + changed-path classification, go-nested:
-# module-path verify + version guards + regex escaping) and ci.yaml (detect:
-# nested validation discovery) embed inline. The classification step is
-# extracted from release.yaml and executed in fixture repos; the other
-# function bodies below MIRROR the workflow snippets, so when editing either
-# side update the other in the same change. Runs in the ci repo's `scripts`
-# CI job (opt-in by file presence).
+# Regression probe for the shell semantics release.yaml and ci.yaml embed
+# inline: nested-Go-module lanes (release.yaml detect and go-nested, ci.yaml's
+# nested validation discovery) and ci.yaml's web-frontend probe. A snippet not
+# extracted below is MIRRORED, so editing either side updates the other in the
+# same change. Runs in the ci repo's `scripts` CI job (opt-in by file presence).
 set -euo pipefail
 
 # Hermetic git, same rationale as test-cliff-bump-semantics.sh: a global
@@ -92,17 +89,25 @@ discover_ci() {
   echo "$DIRS"
 }
 
-# release.yaml detect/changes is EXTRACTED and executed, not mirrored: the
-# classification reads git tags and diffs, which a mirror could only fake.
+# release.yaml detect/changes and ci.yaml's web-frontend probe loop are
+# EXTRACTED and executed: the classification reads git tags and diffs a mirror
+# could only fake, and a mirrored folder list would pass after ci.yaml's changed.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RELEASE_YAML="$ROOT/.github/workflows/release.yaml"
-python3 - "$RELEASE_YAML" "$WORK" <<'PY'
-import sys, yaml
+CI_YAML="$ROOT/.github/workflows/ci.yaml"
+python3 - "$RELEASE_YAML" "$CI_YAML" "$WORK" <<'PY'
+import sys, textwrap, yaml
 
-release, out = sys.argv[1], sys.argv[2]
+release, ci, out = sys.argv[1], sys.argv[2], sys.argv[3]
 jobs = yaml.safe_load(open(release))["jobs"]
 step = next(s for s in jobs["detect"]["steps"] if s.get("name") == "Detect changed paths")
 open(f"{out}/changes.sh", "w").write(step["run"])
+
+jobs = yaml.safe_load(open(ci))["jobs"]
+lines = next(s for s in jobs["detect"]["steps"] if s.get("name") == "Detect repo surfaces")["run"].splitlines()
+start = next(i for i, l in enumerate(lines) if l.strip().startswith("# Probe known nested web-frontend locations"))
+end = next(i for i in range(start, len(lines)) if lines[i].strip() == "done")
+open(f"{out}/web-probe.sh", "w").write(textwrap.dedent("\n".join(lines[start : end + 1])) + "\n")
 PY
 classify() { # <channel> <anchor> <head> -> root=<bool> lanes=<json>; env SUBPACKAGES_JSON GO_LANES_JSON; run in a repo
   : >"$WORK/out"
@@ -206,6 +211,34 @@ git -C "$R" commit -qm init
 put scratch/go.mod "module github.com/cplieger/u/scratch" "go 1.26.5"
 put scratch/s.go "package scratch"
 chk "L-A7 untracked go.mod is not a lane" "$(cd "$R" && discover_release)" "[]"
+
+# ── Web-frontend probe states ────────────────────────────────────────────────
+web_probe() {
+  local web_dir="" run_web=false d
+  cd "$1" || exit 1
+  # shellcheck source=/dev/null
+  . "$WORK/web-probe.sh"
+  echo "web_dir=$web_dir run_web=$run_web"
+}
+mkweb() {
+  W="$WORK/web-$1"
+  local p
+  for p in "${@:2}"; do
+    mkdir -p "$W/$(dirname "$p")"
+    echo '{}' >"$W/$p"
+  done
+}
+mkweb client internal/webui/static-src/package.json
+chk "L-W1 internal/webui/static-src/package.json is the web frontend" \
+  "$(web_probe "$W")" "web_dir=internal/webui/static-src run_web=true"
+mkweb both internal/webui/static-src/package.json static-src/package.json
+chk "L-W2 static-src is probed first" "$(web_probe "$W")" "web_dir=static-src run_web=true"
+mkweb jsr internal/webui/static-src/jsr.json
+chk "L-W4 a jsr.json alone marks the frontend" \
+  "$(web_probe "$W")" "web_dir=internal/webui/static-src run_web=true"
+mkweb bare internal/webui/static-src/app.ts
+chk "L-W3 a folder with neither package.json nor jsr.json is no frontend" \
+  "$(web_probe "$W")" "web_dir= run_web=false"
 
 # ── Classification states ────────────────────────────────────────────────────
 # No lane carries a tag yet, so every lane is judged on the root range: its
@@ -347,4 +380,4 @@ LANE_ARGS=()
 set -- git-cliff --unreleased --tag v1.2.3 "${LANE_ARGS[@]}" --strip header
 chk "L-F4 empty LANE_ARGS contributes zero argv words" "$#" "6"
 
-echo "PASS: nested-module lane shell semantics match the pinned contract (${PASS} checks)"
+echo "PASS: nested-module lane and web-probe shell semantics match the pinned contract (${PASS} checks)"
