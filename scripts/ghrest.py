@@ -339,10 +339,10 @@ class Client:
     def get(self, path: str, headers=()) -> Any:
         return self.json_of('GET', path, self.request('GET', path, headers=headers))
 
-    def get_or_none(self, path: str) -> Any:
+    def get_or_none(self, path: str, headers=()) -> Any:
         """get(), with a 404 read as None."""
         try:
-            return self.get(path)
+            return self.get(path, headers)
         except NotFoundError:
             return None
 

@@ -1,13 +1,10 @@
-"""community_data_refresh.py: the plan, the proposal a refresh packages in a real
-git checkout, its validation, and the pull request a proposal makes through a
-fake `gh api -i`."""
-
 from __future__ import annotations
 
 import base64
 import io
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -20,52 +17,33 @@ import ghrest
 import workflow_replay
 import yaml
 
-GIT_ENV = {
-    'GIT_AUTHOR_NAME': 't',
-    'GIT_AUTHOR_EMAIL': 't@example.invalid',
-    'GIT_COMMITTER_NAME': 't',
-    'GIT_COMMITTER_EMAIL': 't@example.invalid',
-    'GIT_CONFIG_GLOBAL': '/dev/null',
-    'GIT_CONFIG_NOSYSTEM': '1',
-}
 BASE = 'b' * 40
+TIP = 'd' * 40
 WORKFLOW = Path(__file__).resolve().parent.parent / '.github/workflows/community-data-refresh.yaml'
 BOT = 'tribble-trouble[bot]'
 API = 'repos/cplieger/langtag'
+PATHS = cdr.REPOS['langtag']['paths']
 
 
 class Plan(unittest.TestCase):
     def test_an_empty_only_covers_every_repository(self):
-        self.assertEqual(cdr.plan('', ''), [{'repo': n, **row} for n, row in cdr.REPOS.items()])
+        self.assertEqual(cdr.plan(''), [{'repo': n} for n in cdr.REPOS])
 
     def test_only_selects_named_repositories_once(self):
-        self.assertEqual([r['repo'] for r in cdr.plan('langtag, langtag', '')], ['langtag'])
+        self.assertEqual(cdr.plan('langtag, langtag'), [{'repo': 'langtag'}])
 
-    def test_args_go_with_exactly_one_repository(self):
-        self.assertEqual(cdr.plan('langtag', '-release release-48')[0]['repo'], 'langtag')
-        with self.assertRaisesRegex(cdr.RefusedError, "args are one repository's"):
-            cdr.plan('', '-release release-48')
-        with (
-            unittest.mock.patch.dict(cdr.REPOS, {'other': {'branch': 'dev', 'command': 'x'}}),
-            self.assertRaisesRegex(cdr.RefusedError, "args are one repository's"),
+    def test_an_unlisted_repository_is_refused(self):
+        with self.assertRaisesRegex(
+            cdr.RefusedError, 'nope not refreshed. The repositories are langtag'
         ):
-            cdr.plan('langtag other', '-release release-48')
-
-    def test_refusals(self):
-        for only, args, want in (
-            ('nope', '', 'nope not refreshed. The repositories are langtag'),
-            ('langtag', '-a\n-b', 'one line'),
-            ('langtag', '-a\r', 'one line'),
-        ):
-            with self.subTest(only=only, args=args), self.assertRaisesRegex(cdr.RefusedError, want):
-                cdr.plan(only, args)
+            cdr.plan('nope')
 
     def test_an_empty_list_fails_rather_than_covering_nothing(self):
         with (
             unittest.mock.patch.dict(cdr.REPOS, clear=True),
             self.assertRaisesRegex(cdr.RefusedError, 'lists no repository'),
         ):
-            cdr.plan('', '')
+            cdr.plan('')
 
     def test_the_command_writes_the_matrix_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -76,7 +54,7 @@ class Plan(unittest.TestCase):
             ):
                 self.assertEqual(cdr.main(['plan', '--only', 'langtag']), 0)
             key, _, value = out.read_text().strip().partition('=')
-            self.assertEqual((key, json.loads(value)), ('matrix', cdr.plan('langtag', '')))
+            self.assertEqual((key, json.loads(value)), ('matrix', cdr.plan('langtag')))
 
     def test_a_refusal_exits_1_with_an_error_annotation(self):
         err = io.StringIO()
@@ -85,83 +63,12 @@ class Plan(unittest.TestCase):
         self.assertTrue(err.getvalue().startswith('::error::nope not refreshed'))
 
 
-class Package(unittest.TestCase):
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.tmp = Path(tmp.name)
-        self.tree, self.text = self.tmp / 'tree', self.tmp / 'text'
-        self.tree.mkdir()
-        self.text.mkdir()
-        self.git('init', '-q')
-        (self.tree / 'kept.txt').write_text('kept\n')
-        (self.tree / 'table.go').write_text('old\n')
-        (self.tree / 'gone.txt').write_text('gone\n')
-        self.git('add', '.')
-        self.git('commit', '-q', '-m', 'base')
-        self.base = self.git('rev-parse', 'HEAD').strip()
-
-    def git(self, *args):
-        return subprocess.run(
-            ['git', '-C', str(self.tree), *args],
-            capture_output=True,
-            text=True,
-            check=True,
-            env={**os.environ, **GIT_ENV},
-        ).stdout
-
-    def write_text(self):
-        (self.text / 'title').write_text('feat: update the data\n')
-        (self.text / 'body.md').write_text('Body.\n')
-
-    def test_every_change_is_packaged_with_the_text(self):
-        (self.tree / 'table.go').write_text('new\n')
-        (self.tree / 'gone.txt').unlink()
-        (self.tree / 'sub').mkdir()
-        (self.tree / 'sub' / 'run.sh').write_text('#!/bin/sh\n')
-        (self.tree / 'sub' / 'run.sh').chmod(0o755)
-        self.write_text()
-        out = self.tmp / 'proposal'
-        manifest = cdr.package(self.tree, self.text, out)
-        self.assertEqual(manifest['base'], self.base)
-        self.assertEqual(
-            manifest['changes'],
-            [
-                {'path': 'gone.txt', 'deleted': True},
-                {'path': 'sub/run.sh', 'mode': '100755'},
-                {'path': 'table.go', 'mode': '100644'},
-            ],
-        )
-        self.assertEqual((out / 'files' / 'table.go').read_text(), 'new\n')
-        self.assertEqual((out / 'files' / 'sub' / 'run.sh').read_text(), '#!/bin/sh\n')
-        self.assertFalse((out / 'files' / 'kept.txt').exists())
-        self.assertEqual(json.loads((out / cdr.MANIFEST).read_text()), manifest)
-        p = cdr.Proposal(out)
-        self.assertEqual((p.title, p.body), ('feat: update the data', 'Body.\n'))
-
-    def test_an_unchanged_tree_needs_no_text(self):
-        out = self.tmp / 'proposal'
-        self.assertEqual(cdr.package(self.tree, self.text, out), {'base': self.base, 'changes': []})
-        self.assertEqual(cdr.Proposal(out).changes, [])
-
-    def test_a_change_without_its_text_is_refused(self):
-        (self.tree / 'table.go').write_text('new\n')
-        with self.assertRaisesRegex(cdr.RefusedError, 'wrote no title'):
-            cdr.package(self.tree, self.text, self.tmp / 'proposal')
-
-    def test_a_symlink_is_refused(self):
-        (self.tree / 'link').symlink_to('kept.txt')
-        self.write_text()
-        with self.assertRaisesRegex(cdr.RefusedError, 'link has mode 120000'):
-            cdr.package(self.tree, self.text, self.tmp / 'proposal')
-
-
-def write_proposal(root: Path, changes, files=None, title='feat: x\n', body='Body.\n', base=BASE):
+def write_proposal(root: Path, changes, files=None, title='feat: x\n', body='Body.\n'):
     (root / cdr.FILES).mkdir(parents=True, exist_ok=True)
     for path, data in (files or {}).items():
         (root / cdr.FILES / path).parent.mkdir(parents=True, exist_ok=True)
         (root / cdr.FILES / path).write_bytes(data)
-    (root / cdr.MANIFEST).write_text(json.dumps({'base': base, 'changes': changes}))
+    (root / cdr.MANIFEST).write_text(json.dumps({'changes': changes}))
     if title is not None:
         (root / 'title').write_text(title)
     if body is not None:
@@ -178,46 +85,49 @@ class Check(unittest.TestCase):
     def test_a_valid_proposal_reads(self):
         write_proposal(
             self.root,
-            [{'path': 'a/b.go', 'mode': '100644'}, {'path': 'c', 'deleted': True}],
-            {'a/b.go': b'x'},
+            ['names/table.go', 'scripttable.go'],
+            {'names/table.go': b'n', 'scripttable.go': b's'},
         )
-        p = cdr.Proposal(self.root)
-        self.assertEqual((p.base, p.title, p.body, len(p.changes)), (BASE, 'feat: x', 'Body.\n', 2))
+        p = cdr.Proposal(self.root, PATHS)
+        self.assertEqual(
+            (p.changes, p.title, p.body),
+            (['names/table.go', 'scripttable.go'], 'feat: x', 'Body.\n'),
+        )
+        self.assertEqual(p.file('names/table.go').read_bytes(), b'n')
 
-    def test_unsafe_paths_are_refused(self):
-        for path in (
-            '',
-            '../x',
-            '/etc/passwd',
-            '.git/config',
-            'a/../b',
-            'a/./b',
-            'a//b',
-            'a/',
-            'a\\b',
-            7,
-        ):
-            with self.subTest(path=path):
-                self.assertFalse(cdr.safe_path(path))
-        self.assertTrue(cdr.safe_path('names/testdata/names.golden'))
-        self.assertTrue(cdr.safe_path('.github/x'))
+    def test_a_proposal_of_no_change_needs_no_text_or_files(self):
+        (self.root / cdr.MANIFEST).write_text('{"changes": []}')
+        p = cdr.Proposal(self.root, PATHS)
+        self.assertEqual((p.changes, p.title, p.body), ([], '', ''))
 
     def test_refusals(self):
+        one = {'changes': ['scripttable.go'], 'files': {'scripttable.go': b'x'}}
         for name, kw, want in (
-            ('base', {'base': 'HEAD'}, "base 'HEAD' is not a commit SHA"),
-            ('path', {'changes': [{'path': '../x', 'mode': '100644'}]}, 'names no path'),
+            ('not a list', {'changes': 'scripttable.go'}, 'holds no list of paths'),
+            ('not a path', {'changes': [7]}, 'holds no list of paths'),
             (
                 'twice',
-                {'changes': [{'path': 'a', 'mode': '100644'}, {'path': 'a', 'deleted': True}]},
-                'a is changed twice',
+                {'changes': ['scripttable.go', 'scripttable.go']},
+                'names a path twice',
             ),
-            ('mode', {'changes': [{'path': 'a', 'mode': '120000'}]}, 'want a path and a mode'),
             (
-                'extra',
-                {'changes': [{'path': 'a', 'deleted': True, 'mode': '100644'}]},
-                'want a path',
+                'outside the allowed paths',
+                {
+                    'changes': ['.github/workflows/ci.yaml'],
+                    'files': {'.github/workflows/ci.yaml': b'x'},
+                },
+                r'\.github/workflows/ci\.yaml is not a path this refresh may change',
             ),
-            ('missing', {'changes': [{'path': 'b', 'mode': '100644'}]}, 'b is changed but not in'),
+            (
+                'missing file',
+                {'files': {}},
+                r"holds \[\], but proposal.json lists \['scripttable.go'\]",
+            ),
+            (
+                'extra file',
+                {'files': {'scripttable.go': b'x', 'regiontable.go': b'y'}},
+                r"holds \['regiontable.go', 'scripttable.go'\]",
+            ),
             ('no title', {'title': None}, 'title is unreadable'),
             ('blank title', {'title': ' \n'}, 'one non-empty line'),
             ('two lines', {'title': 'a\nb\n'}, 'one non-empty line'),
@@ -225,22 +135,50 @@ class Check(unittest.TestCase):
             ('long body', {'body': 'x' * 65537}, 'over 65536'),
         ):
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
-                args = {'changes': [{'path': 'a', 'mode': '100644'}], 'files': {'a': b'x'}, **kw}
-                write_proposal(Path(tmp), **args)
+                write_proposal(Path(tmp), **{**one, **kw})
                 with self.assertRaisesRegex(cdr.RefusedError, want):
-                    cdr.Proposal(Path(tmp))
+                    cdr.Proposal(Path(tmp), PATHS)
+
+    def test_a_link_is_refused_wherever_it_sits(self):
+        for name, plant in (
+            ('file', lambda f: (f / 'scripttable.go').symlink_to('/etc/passwd')),
+            ('folder', lambda f: (f / 'names').symlink_to('/etc')),
+            ('files', None),
+        ):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                write_proposal(root, ['scripttable.go'])
+                if plant is None:
+                    (root / cdr.FILES).rmdir()
+                    (root / cdr.FILES).symlink_to('/etc')
+                    want = 'files is not a folder'
+                else:
+                    plant(root / cdr.FILES)
+                    want = f'files/{"names" if name == "folder" else "scripttable.go"} is not a regular'
+                with self.assertRaisesRegex(cdr.RefusedError, want):
+                    cdr.Proposal(root, PATHS)
+
+    def test_a_proposal_over_the_size_cap_is_refused(self):
+        write_proposal(self.root, ['scripttable.go'], {'scripttable.go': b'x' * 11})
+        with (
+            unittest.mock.patch.object(cdr, 'FILES_MAX', 10),
+            self.assertRaisesRegex(cdr.RefusedError, 'holds 11 bytes, over 10'),
+        ):
+            cdr.Proposal(self.root, PATHS)
+        with unittest.mock.patch.object(cdr, 'FILES_MAX', 11):
+            cdr.Proposal(self.root, PATHS)
 
     def test_an_unreadable_manifest_is_refused(self):
         with self.assertRaisesRegex(cdr.RefusedError, 'proposal.json is unreadable'):
-            cdr.Proposal(self.root)
+            cdr.Proposal(self.root, PATHS)
         (self.root / cdr.MANIFEST).write_text('[]')
-        with self.assertRaisesRegex(cdr.RefusedError, 'holds no change list'):
-            cdr.Proposal(self.root)
+        with self.assertRaisesRegex(cdr.RefusedError, 'holds no list of paths'):
+            cdr.Proposal(self.root, PATHS)
 
     def test_the_command_outputs_whether_it_changes_anything(self):
         for changes, files, want in (
             ([], {}, 'changed=false'),
-            ([{'path': 'a', 'mode': '100644'}], {'a': b'x'}, 'changed=true'),
+            (['scripttable.go'], {'scripttable.go': b'x'}, 'changed=true'),
         ):
             with self.subTest(want), tempfile.TemporaryDirectory() as tmp:
                 write_proposal(Path(tmp) / 'p', changes, files)
@@ -249,8 +187,15 @@ class Check(unittest.TestCase):
                     unittest.mock.patch.dict(os.environ, {'GITHUB_OUTPUT': str(out)}),
                     redirect_stdout(io.StringIO()),
                 ):
-                    self.assertEqual(cdr.main(['check', '--proposal', str(Path(tmp) / 'p')]), 0)
+                    argv = ['check', '--repo', 'langtag', '--proposal', str(Path(tmp) / 'p')]
+                    self.assertEqual(cdr.main(argv), 0)
                 self.assertEqual(out.read_text(), want + '\n')
+
+    def test_the_command_refuses_an_unlisted_repository(self):
+        write_proposal(self.root, [])
+        with redirect_stderr(io.StringIO()):
+            argv = ['check', '--repo', 'nope', '--proposal', str(self.root)]
+            self.assertEqual(cdr.main(argv), 1)
 
 
 def reply(status: int, body=None) -> subprocess.CompletedProcess:
@@ -282,7 +227,8 @@ class FakeGitHub:
 def base_routes(extra=None):
     routes = {
         ('GET', f'{API}/pulls?state=open&head=cplieger:{cdr.BRANCH}&base=dev'): [],
-        ('GET', f'{API}/git/ref/heads/dev'): {'object': {'sha': BASE}},
+        ('GET', f'{API}/git/ref/heads/dev'): {'object': {'sha': TIP}},
+        ('GET', f'{API}/compare/{BASE}...{TIP}?per_page=1'): {'status': 'ahead'},
         ('GET', f'{API}/git/commits/{BASE}'): {'tree': {'sha': 'basetree'}},
         ('POST', f'{API}/git/blobs'): {'sha': 'blob1'},
         ('POST', f'{API}/git/trees'): {'sha': 'newtree'},
@@ -292,6 +238,9 @@ def base_routes(extra=None):
         ('POST', f'{API}/pulls'): {'html_url': 'https://github.com/cplieger/langtag/pull/9'},
         ('PATCH', f'{API}/pulls/7'): {},
     }
+    for path in ('scripttable.go', 'names/table.go'):
+        for ref in (BASE, TIP):
+            routes['GET', f'{API}/contents/{path}?ref={ref}'] = {'sha': f'{path} blob'}
     routes.update(extra or {})
     return routes
 
@@ -307,15 +256,15 @@ class Propose(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         write_proposal(
             Path(tmp.name),
-            [{'path': 'table.go', 'mode': '100644'}, {'path': 'gone.txt', 'deleted': True}],
-            {'table.go': b'new\n'},
+            ['scripttable.go', 'names/table.go'],
+            {'scripttable.go': b'new\n', 'names/table.go': b'names\n'},
         )
-        self.proposal = cdr.Proposal(Path(tmp.name))
+        self.proposal = cdr.Proposal(Path(tmp.name), PATHS)
 
     def run_propose(self, routes):
         fake = FakeGitHub(routes)
         gh = ghrest.Client(run=fake, sleep=lambda _: None)
-        return cdr.propose(gh, 'langtag', 'dev', BOT, self.proposal), fake.writes
+        return cdr.propose(gh, 'langtag', BOT, BASE, self.proposal), fake.writes
 
     def with_pr(self, pr, commits, head_tree='oldtree'):
         return base_routes(
@@ -332,20 +281,28 @@ class Propose(unittest.TestCase):
     def test_a_first_proposal_opens_the_pull_request(self):
         said, writes = self.run_propose(base_routes())
         self.assertEqual(said, cdr.Outcome('opened https://github.com/cplieger/langtag/pull/9'))
-        content = base64.b64encode(b'new\n').decode()
+
+        def blob(data):
+            return (
+                'POST',
+                f'{API}/git/blobs',
+                {'content': base64.b64encode(data).decode(), 'encoding': 'base64'},
+            )
+
+        def entry(path):
+            return {'path': path, 'mode': '100644', 'type': 'blob', 'sha': 'blob1'}
+
         self.assertEqual(
             writes,
             [
-                ('POST', f'{API}/git/blobs', {'content': content, 'encoding': 'base64'}),
+                blob(b'new\n'),
+                blob(b'names\n'),
                 (
                     'POST',
                     f'{API}/git/trees',
                     {
                         'base_tree': 'basetree',
-                        'tree': [
-                            {'path': 'table.go', 'mode': '100644', 'type': 'blob', 'sha': 'blob1'},
-                            {'path': 'gone.txt', 'mode': '100644', 'type': 'blob', 'sha': None},
-                        ],
+                        'tree': [entry('scripttable.go'), entry('names/table.go')],
                     },
                 ),
                 (
@@ -392,7 +349,12 @@ class Propose(unittest.TestCase):
             said.text, 'https://github.com/cplieger/langtag/pull/7 already proposes this change'
         )
         self.assertEqual(
-            [w[:2] for w in writes], [('POST', f'{API}/git/blobs'), ('POST', f'{API}/git/trees')]
+            [w[:2] for w in writes],
+            [
+                ('POST', f'{API}/git/blobs'),
+                ('POST', f'{API}/git/blobs'),
+                ('POST', f'{API}/git/trees'),
+            ],
         )
 
     def test_an_open_pull_request_with_the_same_files_gets_the_new_text(self):
@@ -423,13 +385,63 @@ class Propose(unittest.TestCase):
         )
         self.assertEqual(writes, [])
 
-    def test_a_proposal_from_a_base_that_moved_writes_nothing(self):
-        routes = self.with_pr(open_pr(head_sha='d' * 40), [{'author': {'login': BOT}}])
-        routes['GET', f'{API}/git/ref/heads/dev'] = {'object': {'sha': 'e' * 40}}
+    def test_a_base_still_in_the_base_branch_history_is_proposed_on(self):
+        for status in ('identical', 'ahead'):
+            with self.subTest(status):
+                routes = base_routes()
+                routes['GET', f'{API}/compare/{BASE}...{TIP}?per_page=1'] = {'status': status}
+                said, writes = self.run_propose(routes)
+                self.assertEqual(said.text, 'opened https://github.com/cplieger/langtag/pull/9')
+                self.assertIn(
+                    (
+                        'POST',
+                        f'{API}/git/commits',
+                        {'message': 'feat: x', 'tree': 'newtree', 'parents': [BASE]},
+                    ),
+                    writes,
+                )
+
+    def test_a_base_gone_from_the_base_branch_history_writes_nothing(self):
+        for status in ('diverged', 'behind', 'gone'):
+            with self.subTest(status):
+                routes = self.with_pr(open_pr(), [{'author': {'login': BOT}}])
+                compare = 'GET', f'{API}/compare/{BASE}...{TIP}?per_page=1'
+                if status == 'gone':
+                    del routes[compare]
+                else:
+                    routes[compare] = {'status': status}
+                fake = FakeGitHub(routes)
+                gh = ghrest.Client(run=fake, sleep=lambda _: None)
+                with self.assertRaisesRegex(
+                    cdr.RefusedError, f'{BASE} is not in the history of dev \\({status}\\)'
+                ):
+                    cdr.propose(gh, 'langtag', BOT, BASE, self.proposal)
+                self.assertEqual(fake.writes, [])
+
+    def test_a_missing_base_branch_writes_nothing(self):
+        routes = base_routes()
+        del routes['GET', f'{API}/git/ref/heads/dev']
         fake = FakeGitHub(routes)
         gh = ghrest.Client(run=fake, sleep=lambda _: None)
-        with self.assertRaisesRegex(cdr.RefusedError, f'dev moved from {BASE} to {"e" * 40}'):
-            cdr.propose(gh, 'langtag', 'dev', BOT, self.proposal)
+        with self.assertRaisesRegex(cdr.RefusedError, 'langtag has no dev branch to propose to'):
+            cdr.propose(gh, 'langtag', BOT, BASE, self.proposal)
+        self.assertEqual(fake.writes, [])
+
+    def test_a_base_branch_edit_to_a_proposed_path_writes_nothing(self):
+        routes = self.with_pr(open_pr(), [{'author': {'login': BOT}}])
+        routes['GET', f'{API}/contents/scripttable.go?ref={TIP}'] = {'sha': 'by hand'}
+        del routes['GET', f'{API}/contents/names/table.go?ref={TIP}']
+        fake = FakeGitHub(routes)
+        gh = ghrest.Client(run=fake, sleep=lambda _: None)
+        with self.assertRaisesRegex(
+            cdr.RefusedError,
+            re.escape(
+                'dev changed scripttable.go (scripttable.go blob to by hand), names/table.go'
+                f' (names/table.go blob to absent) since {BASE}, the commit the refresh ran on,'
+                " which the proposal would overwrite. Run langtag's community-data-refresh.yaml"
+            ),
+        ):
+            cdr.propose(gh, 'langtag', BOT, BASE, self.proposal)
         self.assertEqual(fake.writes, [])
 
     def test_a_pull_request_left_alone_warns_on_the_run(self):
@@ -442,8 +454,9 @@ class Propose(unittest.TestCase):
                 unittest.mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': str(summary)}),
                 redirect_stdout(out),
             ):
-                argv = ['propose', '--repo', 'langtag', '--proposal', str(self.proposal.root)]
-                self.assertEqual(cdr.main([*argv, '--bot', BOT]), 0)
+                argv = ['propose', '--repo', 'langtag', '--base', BASE]
+                argv += ['--proposal', str(self.proposal.root), '--bot', BOT]
+                self.assertEqual(cdr.main(argv), 0)
             self.assertEqual(out.getvalue(), f'::warning::{left.text}\n')
             self.assertEqual(summary.read_text(), left.text + '\n')
 
@@ -455,151 +468,470 @@ class Propose(unittest.TestCase):
                 unittest.mock.patch.object(cdr, 'propose', side_effect=AssertionError),
                 redirect_stdout(out),
             ):
-                argv = ['propose', '--repo', 'langtag', '--proposal', tmp, '--bot', BOT]
-                self.assertEqual(cdr.main(argv), 0)
+                argv = ['propose', '--repo', 'langtag', '--base', BASE, '--proposal', tmp]
+                self.assertEqual(cdr.main([*argv, '--bot', BOT]), 0)
             self.assertEqual(out.getvalue(), 'no change\n')
 
     def test_the_command_refuses_an_unlisted_repository(self):
-        with redirect_stderr(io.StringIO()):
-            argv = ['propose', '--repo', 'nope', '--proposal', '/nonexistent', '--bot', BOT]
+        err = io.StringIO()
+        argv = ['propose', '--repo', 'nope', '--base', BASE]
+        argv += ['--proposal', str(self.proposal.root), '--bot', BOT]
+        with (
+            unittest.mock.patch.object(cdr, 'propose', side_effect=AssertionError),
+            redirect_stderr(err),
+        ):
             self.assertEqual(cdr.main(argv), 1)
+        self.assertIn("repo 'nope' is not refreshed", err.getvalue())
 
 
-class Workflow(unittest.TestCase):
-    """The plan and refresh jobs replayed, the refresh with a stand-in command
-    in place of the repository's."""
+GIT_ENV = {
+    'GIT_AUTHOR_NAME': 't',
+    'GIT_AUTHOR_EMAIL': 't@example.invalid',
+    'GIT_COMMITTER_NAME': 't',
+    'GIT_COMMITTER_EMAIL': 't@example.invalid',
+    'GIT_CONFIG_GLOBAL': '/dev/null',
+    'GIT_CONFIG_NOSYSTEM': '1',
+}
 
-    # The shape of a REPOS command: one program, whose arguments the job extends.
-    COMMAND = 'bash ../stand-in.sh -out "$REFRESH_OUT"'
-    STAND_IN = (
-        'printf "%s\\n" "$@" > ../args\n'
-        'echo new > table.go\n'
-        'echo "feat: t" > "$2/title"\n'
-        'echo b > "$2/body.md"\n'
-    )
+
+class GitGitHub:
+    """`gh api -i` over a real git repository: the git data, refs, contents and
+    compare endpoints propose calls act on it, so git, not a route table,
+    decides what the proposal commit holds and whether its pull request merges."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.pulls = []
+        self.writes = []
+        self.git('init', '-q', '-b', 'dev')
+
+    def git(self, *args, stdin=None, env=None, check=True) -> str:
+        return (
+            subprocess.run(
+                ['git', *args],
+                cwd=self.root,
+                input=stdin,
+                capture_output=True,
+                check=check,
+                env={**os.environ, **GIT_ENV, **(env or {})},
+            )
+            .stdout.decode()
+            .strip()
+        )
+
+    def commit(self, files: dict[str, bytes | None]) -> str:
+        """A commit writing `files` (None deletes one) on dev's tip, or a root
+        commit when dev is gone; dev moves to it."""
+        parent = self.git('rev-parse', '-q', '--verify', 'dev', check=False)
+        index = {'GIT_INDEX_FILE': str(self.root / '.git' / 'test-index')}
+        self.git('read-tree', *([parent] if parent else ['--empty']), env=index)
+        for path, data in files.items():
+            if data is None:
+                self.git('update-index', '--force-remove', path, env=index)
+                continue
+            blob = self.git('hash-object', '-w', '--stdin', stdin=data)
+            self.git('update-index', '--add', '--cacheinfo', f'100644,{blob},{path}', env=index)
+        tree = self.git('write-tree', env=index)
+        sha = self.git('commit-tree', tree, *(['-p', parent] if parent else []), '-m', 'c')
+        self.git('update-ref', 'refs/heads/dev', sha)
+        return sha
+
+    def mergeable(self) -> bool:
+        merge = ['merge-tree', '--write-tree', 'dev', cdr.BRANCH]
+        return (
+            subprocess.run(
+                ['git', *merge], cwd=self.root, capture_output=True, check=False
+            ).returncode
+            == 0
+        )
+
+    def answer(self, method, path, body, headers):
+        git = path.removeprefix(f'{API}/git/')
+        if (method, path) == ('GET', f'{API}/pulls?state=open&head=cplieger:{cdr.BRANCH}&base=dev'):
+            return self.pulls
+        if method == 'GET' and (
+            m := re.fullmatch(rf'{API}/compare/(\w+)\.\.\.(\w+)\?per_page=1', path)
+        ):
+            base, dev = m[1], m[2]
+            ancestor = self.git('merge-base', base, dev, check=False)
+            if not ancestor:
+                return None
+            if base == dev:
+                return {'status': 'identical'}
+            if ancestor in (base, dev):
+                return {'status': 'ahead' if ancestor == base else 'behind'}
+            return {'status': 'diverged'}
+        if method == 'GET' and (m := re.fullmatch(rf'{API}/contents/(.+)\?ref=(\w+)', path)):
+            sha = self.git('rev-parse', '-q', '--verify', f'{m[2]}:{m[1]}', check=False)
+            if not sha:
+                return None
+            # The default media type answers a folder as the list of its entries:
+            # https://docs.github.com/en/rest/repos/contents
+            folder = self.git('cat-file', '-t', sha) == 'tree'
+            if folder and 'Accept: application/vnd.github.object+json' not in headers:
+                return [{'sha': e.split()[2]} for e in self.git('ls-tree', sha).splitlines()]
+            return {'sha': sha}
+        if method == 'GET' and git.startswith('commits/'):
+            return {
+                'tree': {'sha': self.git('rev-parse', git.removeprefix('commits/') + '^{tree}')}
+            }
+        if method == 'GET' and git.startswith('ref/heads/'):
+            sha = self.git('rev-parse', '-q', '--verify', 'refs/' + git[4:], check=False)
+            return {'object': {'sha': sha}} if sha else None
+        if (method, git) == ('POST', 'blobs'):
+            data = base64.b64decode(body['content'])
+            return {'sha': self.git('hash-object', '-w', '--stdin', stdin=data)}
+        if (method, git) == ('POST', 'trees'):
+            index = {'GIT_INDEX_FILE': str(self.root / '.git' / 'api-index')}
+            self.git('read-tree', body['base_tree'], env=index)
+            for e in body['tree']:
+                info = f'{e["mode"]},{e["sha"]},{e["path"]}'
+                self.git('update-index', '--add', '--cacheinfo', info, env=index)
+            return {'sha': self.git('write-tree', env=index)}
+        if (method, git) == ('POST', 'commits'):
+            parents = [a for p in body['parents'] for a in ('-p', p)]
+            return {'sha': self.git('commit-tree', body['tree'], *parents, '-m', body['message'])}
+        if (method, git) == ('POST', 'refs'):
+            self.git('update-ref', body['ref'], body['sha'])
+            return {}
+        if method == 'POST' and path == f'{API}/pulls':
+            self.pulls.append({**body, 'number': 9, 'html_url': 'https://example.invalid/9'})
+            return self.pulls[-1]
+        return None
+
+    def __call__(self, args, stdin=None, timeout=None):
+        method = args[args.index('-X') + 1] if '-X' in args else 'GET'
+        path = args[args.index('--input') - 1] if '--input' in args else args[-1]
+        body = json.loads(stdin) if stdin else None
+        headers = [args[i + 1] for i, a in enumerate(args) if a == '-H']
+        if method != 'GET':
+            self.writes.append((method, path))
+        out = self.answer(method, path, body, headers)
+        return reply(404, {'message': 'Not Found'}) if out is None else reply(200, out)
+
+
+class ProposeOnGit(unittest.TestCase):
+    """The proposal commit sits on the refresh's commit and goes ahead only
+    while dev still holds that commit and every proposed path as it was."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.tmp = Path(tmp.name)
-        self.cwd = self.tmp / 'cwd'
-        target = self.cwd / 'target'
-        target.mkdir(parents=True)
-        (self.cwd / 'scripts').symlink_to(Path(__file__).resolve().parent)
-        (self.cwd / 'stand-in.sh').write_text(self.STAND_IN)
-        env = {**os.environ, **GIT_ENV}
-        (target / 'table.go').write_text('old\n')
-        for args in (['init', '-q'], ['add', '.'], ['commit', '-q', '-m', 'base']):
-            subprocess.run(['git', '-C', str(target), *args], check=True, env=env)
+        root = Path(tmp.name)
+        (root / 'repo').mkdir()
+        self.gh = GitGitHub(root / 'repo')
+        self.root = self.gh.commit({'README.md': b'readme\n'})
+        self.base = self.gh.commit({'scripttable.go': b'one\ntwo\nthree\n'})
+        write_proposal(root / 'p', ['scripttable.go'], {'scripttable.go': b'one\ntwo\n3\n'})
+        self.proposal = cdr.Proposal(root / 'p', PATHS)
 
-    def replay(self, job, context, *extra):
-        ctx, out = self.tmp / 'ctx.json', self.tmp / 'out.json'
-        ctx.write_text(json.dumps(context))
-        argv = ['--workflow', str(WORKFLOW), '--job', job, '--context', str(ctx)]
-        argv += ['--cwd', str(self.cwd), '--out', str(out), *extra]
-        with redirect_stderr(io.StringIO()):
-            rc = workflow_replay.main(argv)
-        return rc, json.loads(out.read_text())
+    def propose(self):
+        gh = ghrest.Client(run=self.gh, sleep=lambda _: None)
+        return cdr.propose(gh, 'langtag', BOT, self.base, self.proposal)
 
-    def refresh(self, args, command=COMMAND):
-        context = {
-            'inputs': {'args': args},
-            'matrix': {'repo': 'langtag', 'branch': 'dev', 'command': command},
-            'github': {'token': 'test-token'},
-            'needs': {'plan': {'result': 'success', 'outputs': {}}},
-        }
-        skips = ['Checkout cplieger/${{ matrix.repo }}', 'Setup Go', 'Upload the proposal']
-        return self.replay('refresh', context, *(f'--skip={s}' for s in skips))
+    def refused(self, want: str):
+        with self.assertRaisesRegex(cdr.RefusedError, want):
+            self.propose()
+        self.assertEqual(self.gh.writes, [])
 
+    def test_dev_moved_on_an_unlisted_path_proceeds_and_merges(self):
+        self.gh.commit({'README.md': b'edited\n'})
+        self.assertEqual(self.propose().text, 'opened https://example.invalid/9')
+        self.assertEqual(self.gh.git('rev-parse', f'{cdr.BRANCH}^'), self.base)
+        self.assertTrue(self.gh.mergeable())
+
+    def test_dev_edited_a_listed_path_elsewhere_in_the_file_is_refused(self):
+        was = self.gh.git('rev-parse', f'{self.base}:scripttable.go')
+        self.gh.commit({'scripttable.go': b'1\ntwo\nthree\n'})
+        now = self.gh.git('rev-parse', 'dev:scripttable.go')
+        self.refused(re.escape(f'dev changed scripttable.go ({was} to {now}) since {self.base}'))
+
+    def test_dev_deleted_a_listed_path_is_refused(self):
+        was = self.gh.git('rev-parse', f'{self.base}:scripttable.go')
+        self.gh.commit({'scripttable.go': None})
+        self.refused(re.escape(f'dev changed scripttable.go ({was} to absent)'))
+
+    def test_dev_replaced_a_listed_path_with_a_folder_is_refused(self):
+        was = self.gh.git('rev-parse', f'{self.base}:scripttable.go')
+        self.gh.commit({'scripttable.go': None, 'scripttable.go/x.go': b'x\n'})
+        now = self.gh.git('rev-parse', 'dev:scripttable.go')
+        self.refused(re.escape(f'dev changed scripttable.go ({was} to {now})'))
+
+    def test_dev_rewritten_from_a_shared_commit_is_refused(self):
+        self.gh.git('update-ref', 'refs/heads/dev', self.root)
+        self.gh.commit({'scripttable.go': b'one\ntwo\nthree\n', 'README.md': b'again\n'})
+        self.refused(r'is not in the history of dev \(diverged\)')
+
+    def test_dev_rewritten_from_no_shared_commit_is_refused(self):
+        self.gh.git('update-ref', '-d', 'refs/heads/dev')
+        self.gh.commit({'scripttable.go': b'one\ntwo\nthree\n'})
+        self.refused(r'is not in the history of dev \(gone\), so it was rewritten')
+
+    def test_the_proposal_commit_changes_only_its_listed_paths(self):
+        self.gh.commit({'README.md': b'edited\n', 'names/table.go': b'n\n'})
+        self.propose()
+        changed = self.gh.git('diff', '--name-only', self.base, cdr.BRANCH).split()
+        self.assertEqual(changed, self.proposal.changes)
+
+
+RUNS = (
+    f'{API}/actions/workflows/{cdr.WORKFLOW}/runs'
+    '?branch=dev&status=completed&exclude_pull_requests=true&per_page=100'
+)
+
+
+def a_run(run_id=41, **kw):
+    run = {
+        'id': run_id,
+        'event': 'schedule',
+        'head_branch': 'dev',
+        'head_sha': BASE,
+        'head_repository': {'full_name': 'cplieger/langtag'},
+        'conclusion': 'success',
+        'html_url': f'https://github.com/cplieger/langtag/actions/runs/{run_id}',
+    }
+    return {**run, **kw}
+
+
+class Locate(unittest.TestCase):
+    def locate(self, runs):
+        fake = FakeGitHub({('GET', RUNS): {'workflow_runs': runs}})
+        return cdr.locate(ghrest.Client(run=fake, sleep=lambda _: None), 'langtag'), fake.writes
+
+    def test_the_newest_run_of_the_base_branch_is_read(self):
+        runs = [
+            a_run(1, event='pull_request', conclusion='failure'),
+            a_run(2, event='push'),
+            a_run(3, head_branch='other'),
+            a_run(4, head_repository={'full_name': 'someone/langtag'}),
+            a_run(5, event='workflow_dispatch', head_sha='e' * 40),
+            a_run(6),
+        ]
+        run, writes = self.locate(runs)
+        self.assertEqual(run, cdr.Run(5, 'e' * 40, a_run(5)['html_url']))
+        self.assertEqual(writes, [])
+
+    def test_a_failed_newest_run_is_refused_rather_than_an_older_one_read(self):
+        with self.assertRaisesRegex(
+            cdr.RefusedError, r'runs/7 concluded failure, so it proposes nothing'
+        ):
+            self.locate([a_run(7, conclusion='failure'), a_run(6)])
+
+    def test_refusals(self):
+        for name, runs, want in (
+            (
+                'no run',
+                [a_run(1, event='pull_request')],
+                'langtag has no completed community-data-refresh.yaml run on dev',
+            ),
+            ('no commit', [a_run(head_sha='HEAD')], 'names no run id and commit'),
+            ('no id', [a_run(run_id='41')], 'names no run id and commit'),
+        ):
+            with self.subTest(name), self.assertRaisesRegex(cdr.RefusedError, want):
+                self.locate(runs)
+
+    def test_the_command_writes_the_run_id_and_base(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'out'
+            with (
+                unittest.mock.patch.object(cdr, 'locate', return_value=cdr.Run(41, BASE, 'u')),
+                unittest.mock.patch.dict(os.environ, {'GITHUB_OUTPUT': str(out)}),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(cdr.main(['locate', '--repo', 'langtag']), 0)
+            self.assertEqual(out.read_text(), f'run-id=41\nbase={BASE}\n')
+
+
+class Workflow(unittest.TestCase):
     def test_plan_outputs_the_matrix(self):
-        rc, result = self.replay(
-            'plan', {'inputs': {'only': 'langtag', 'args': '-release release-48'}}
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / 'cwd').mkdir()
+            (tmp / 'cwd' / 'scripts').symlink_to(Path(__file__).resolve().parent)
+            (tmp / 'ctx.json').write_text(json.dumps({'inputs': {'only': 'langtag'}}))
+            argv = [
+                '--workflow',
+                str(WORKFLOW),
+                '--job',
+                'plan',
+                '--context',
+                str(tmp / 'ctx.json'),
+            ]
+            argv += ['--cwd', str(tmp / 'cwd'), '--out', str(tmp / 'out.json')]
+            with redirect_stderr(io.StringIO()):
+                rc = workflow_replay.main(argv)
+            result = json.loads((tmp / 'out.json').read_text())
         self.assertEqual(rc, 0, result.get('failed'))
-        self.assertEqual(json.loads(result['outputs']['matrix']), cdr.plan('langtag', ''))
+        self.assertEqual(json.loads(result['outputs']['matrix']), cdr.plan('langtag'))
 
-    def test_the_command_gets_its_directory_and_the_arguments(self):
-        rc, result = self.refresh('-release release-48  -x')
-        self.assertEqual(rc, 0, result.get('failed'))
-        temp = Path(result['runner_temp'])
-        self.assertEqual(
-            (self.cwd / 'args').read_text().splitlines(),
-            ['-out', str(temp / 'refresh-out'), '-release', 'release-48', '-x'],
-        )
-        p = cdr.Proposal(temp / 'proposal')
-        self.assertEqual(
-            (p.changes, p.title), ([{'path': 'table.go', 'mode': '100644'}], 'feat: t')
-        )
 
-    def test_no_arguments_reach_the_command_as_none(self):
-        rc, result = self.refresh('')
-        self.assertEqual(rc, 0, result.get('failed'))
-        self.assertEqual(
-            (self.cwd / 'args').read_text().splitlines(),
-            ['-out', str(Path(result['runner_temp']) / 'refresh-out')],
-        )
+APP_KEY = {
+    'client-id': '${{ secrets.SYNC_APP_ID }}',
+    'private-key': '${{ secrets.SYNC_APP_PRIVATE_KEY }}',
+    'owner': 'cplieger',
+    'repositories': '${{ matrix.repo }}',
+}
+CHECKOUT = {
+    'name': 'Checkout',
+    'uses': 'actions/checkout@SHA',
+    'with': {'persist-credentials': False},
+}
+JOBS = {
+    'plan': {
+        'runs-on': 'ubuntu-26.04',
+        'timeout-minutes': 5,
+        'outputs': {'matrix': '${{ steps.plan.outputs.matrix }}'},
+        'steps': [
+            CHECKOUT,
+            {
+                'name': 'Plan the repositories',
+                'id': 'plan',
+                'env': {'ONLY': '${{ inputs.only }}'},
+                'run': 'set -euo pipefail\n'
+                'python3 scripts/community_data_refresh.py plan --only "$ONLY"\n',
+            },
+        ],
+    },
+    'propose': {
+        'name': 'propose (${{ matrix.repo }})',
+        'needs': 'plan',
+        'strategy': {
+            'fail-fast': False,
+            'matrix': {'include': '${{ fromJSON(needs.plan.outputs.matrix) }}'},
+        },
+        'runs-on': 'ubuntu-26.04',
+        'timeout-minutes': 10,
+        'permissions': {'contents': 'read'},
+        'concurrency': {
+            'group': 'community-data-refresh-${{ matrix.repo }}',
+            'cancel-in-progress': False,
+        },
+        'steps': [
+            CHECKOUT,
+            {
+                'name': 'Mint the read token',
+                'id': 'read-token',
+                'uses': 'actions/create-github-app-token@SHA',
+                'with': {**APP_KEY, 'permission-actions': 'read'},
+            },
+            {
+                'name': 'Find the refresh run',
+                'id': 'run',
+                'env': {
+                    'GH_TOKEN': '${{ steps.read-token.outputs.token }}',
+                    'REPO': '${{ matrix.repo }}',
+                },
+                'run': 'set -euo pipefail\n'
+                'python3 scripts/community_data_refresh.py locate --repo "$REPO"\n',
+            },
+            {
+                'name': 'Download the proposal',
+                'uses': 'actions/download-artifact@SHA',
+                'with': {
+                    'name': 'community-data-refresh',
+                    'path': '${{ runner.temp }}/proposal',
+                    'github-token': '${{ steps.read-token.outputs.token }}',
+                    'repository': 'cplieger/${{ matrix.repo }}',
+                    'run-id': '${{ steps.run.outputs.run-id }}',
+                },
+            },
+            {
+                'name': 'Check the proposal',
+                'id': 'check',
+                'env': {'REPO': '${{ matrix.repo }}', 'PROPOSAL': '${{ runner.temp }}/proposal'},
+                'run': 'set -euo pipefail\n'
+                'python3 scripts/community_data_refresh.py check --repo "$REPO"'
+                ' --proposal "$PROPOSAL"\n',
+            },
+            {
+                'name': 'Mint the App token',
+                'if': "steps.check.outputs.changed == 'true'",
+                'id': 'app-token',
+                'uses': 'actions/create-github-app-token@SHA',
+                'with': {
+                    **APP_KEY,
+                    'permission-contents': 'write',
+                    'permission-pull-requests': 'write',
+                },
+            },
+            {
+                'name': "Propose cplieger/${{ matrix.repo }}'s refresh",
+                'if': "steps.check.outputs.changed == 'true'",
+                'env': {
+                    'GH_TOKEN': '${{ steps.app-token.outputs.token }}',
+                    'APP_SLUG': '${{ steps.app-token.outputs.app-slug }}',
+                    'REPO': '${{ matrix.repo }}',
+                    'BASE': '${{ steps.run.outputs.base }}',
+                    'PROPOSAL': '${{ runner.temp }}/proposal',
+                },
+                'run': 'set -euo pipefail\n'
+                'python3 scripts/community_data_refresh.py propose --repo "$REPO"'
+                ' --base "$BASE" --proposal "$PROPOSAL" --bot "${APP_SLUG}[bot]"\n',
+            },
+        ],
+    },
+    'notify': {
+        'needs': ['plan', 'propose'],
+        'if': 'always()',
+        'permissions': {'actions': 'read', 'contents': 'read', 'issues': 'write'},
+        'uses': './.github/workflows/notify-failure.yaml',
+        'with': {
+            'workflow': '${{ github.workflow }}',
+            'run-url': '${{ github.server_url }}/${{ github.repository }}'
+            '/actions/runs/${{ github.run_id }}',
+            'scope': '${{ inputs.only }}',
+        },
+    },
+}
 
-    def test_a_failed_command_fails_the_job_before_packaging(self):
-        rc, result = self.refresh('', command='exit 3')
-        self.assertEqual(rc, 1)
-        self.assertIn("step 'Run the refresh command' exited 3", result['failed'])
-        self.assertFalse((Path(result['runner_temp']) / 'proposal').exists())
+
+# YAML 1.1 resolves on as true, which PyYAML follows: https://yaml.org/type/bool.html
+TOP = {
+    'name': 'Community data refresh',
+    True: {
+        'schedule': [{'cron': '17 8 3 * *'}],
+        'workflow_dispatch': {
+            'inputs': {
+                'only': {
+                    'description': 'Space/comma-separated repo names to limit the run.'
+                    ' Empty runs every listed repository.',
+                    'type': 'string',
+                    'required': False,
+                    'default': '',
+                }
+            }
+        },
+    },
+    'permissions': {'contents': 'read'},
+}
 
 
 class WorkflowShape(unittest.TestCase):
-    """The token boundary: the repository's code runs in refresh with only the
-    job token, and the App token exists only in propose, for that repository."""
+    """The trust boundary is the whole workflow, compared exactly: it runs only
+    on schedule or by hand, no job checks out or runs a refreshed repository's
+    code, the read token can only read its runs, and the write token is minted
+    only for a checked change and reaches only the propose step. Changing any
+    key or step changes TOP or JOBS."""
 
-    APP_TOKEN = 'actions/create-github-app-token@'
+    def unpinned(self, job):
+        """`job` with each action's commit SHA replaced by `SHA`, after checking
+        it is one."""
+        steps = []
+        for step in job.get('steps', []):
+            if 'uses' in step:
+                action, _, sha = step['uses'].partition('@')
+                self.assertRegex(sha, r'\A[0-9a-f]{40}\Z', step['uses'])
+                step = {**step, 'uses': f'{action}@SHA'}
+            steps.append(step)
+        return {**job, 'steps': steps} if 'steps' in job else job
 
-    @classmethod
-    def setUpClass(cls):
-        cls.text = WORKFLOW.read_text()
-        cls.jobs = yaml.safe_load(cls.text)['jobs']
-
-    def step(self, job, name):
-        return next(s for s in self.jobs[job]['steps'] if s.get('name') == name)
-
-    def test_refresh_runs_the_command_with_only_the_job_token(self):
-        refresh = self.jobs['refresh']
-        self.assertEqual(refresh['permissions'], {'contents': 'read'})
-        self.assertNotIn('secrets.', yaml.safe_dump(refresh))
-        self.assertFalse([s for s in refresh['steps'] if self.APP_TOKEN in s.get('uses', '')])
-        env = self.step('refresh', 'Run the refresh command')['env']
-        self.assertEqual(env['GITHUB_TOKEN'], '${{ github.token }}')
-
-    def test_only_propose_mints_the_app_token_for_the_one_repository(self):
-        minting = {
-            job: [s for s in spec.get('steps', []) if self.APP_TOKEN in s.get('uses', '')]
-            for job, spec in self.jobs.items()
-        }
-        self.assertEqual({job for job, steps in minting.items() if steps}, {'propose'})
-        (mint,) = minting['propose']
-        self.assertEqual(
-            {k: v for k, v in mint['with'].items() if k not in ('client-id', 'private-key')},
-            {
-                'owner': 'cplieger',
-                'repositories': '${{ matrix.repo }}',
-                'permission-contents': 'write',
-                'permission-pull-requests': 'write',
-            },
-        )
-        self.assertEqual(self.jobs['propose']['permissions'], {'contents': 'read'})
-
-    def test_propose_runs_no_target_code_and_passes_the_token_once(self):
-        steps = self.jobs['propose']['steps']
-        self.assertFalse([s for s in steps if 'repository' in s.get('with', {})])
-        self.assertNotIn('matrix.command', yaml.safe_dump(self.jobs['propose']))
-        for s in steps:
-            if 'run' in s:
-                self.assertIn('python3 scripts/community_data_refresh.py', s['run'], s['name'])
-        holders = [s['name'] for s in steps if 'steps.app-token.outputs.token' in yaml.safe_dump(s)]
-        self.assertEqual(holders, ["Propose cplieger/${{ matrix.repo }}'s refresh"])
-        self.assertEqual(self.text.count('steps.app-token.outputs.token'), 1)
-
-    def test_the_proposal_artifact_keeps_hidden_files(self):
-        upload = self.step('refresh', 'Upload the proposal')
-        self.assertTrue(upload['with']['include-hidden-files'] is True)
+    def test_the_workflow_is_exactly_the_reviewed_one(self):
+        doc = yaml.safe_load(WORKFLOW.read_text())
+        self.assertEqual({k: v for k, v in doc.items() if k != 'jobs'}, TOP)
+        self.assertEqual(list(doc['jobs']), list(JOBS))
+        for name, want in JOBS.items():
+            with self.subTest(name):
+                self.assertEqual(self.unpinned(doc['jobs'][name]), want)
 
 
 if __name__ == '__main__':
