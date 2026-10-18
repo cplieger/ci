@@ -74,7 +74,15 @@ A dev build is numbered as the next promotion, so a library's dev run whose code
 
 On the dev channel it builds the image on native `amd64` and `arm64` runners and pushes it to GitHub Container Registry. It signs the image with cosign, attaches an SBOM and runs a Trivy scan. A repository with a root `grafana-dashboard.json` also gets the dashboard pushed as an OCI artifact.
 
-On the stable channel it re-tags the image the dev channel built for that commit as `vX.Y.Z`, `vX.Y`, `vX` and `latest`. It copies the image to Docker Hub with its signatures and creates the GitHub Release with the SBOM and the dashboard. When it promotes a build, the Release's SBOM is the one that build signed into the image, read only once its signature checks out. When no dev build matches, it builds from source and says so in the run summary. It also writes the Docker Hub overview page from the README.
+On the stable channel it re-tags the image the dev channel built for that commit as `vX.Y.Z`, `vX.Y`, `vX` and `latest`. It copies the image to Docker Hub with its signatures and creates the GitHub Release with its assets, described below. When it promotes a build, the Release's SBOM is the one that build signed into the image, read only once its signature checks out. When no dev build matches, it builds from source and says so in the run summary. It also writes the Docker Hub overview page from the README.
+
+A stable image release carries these GitHub Release assets:
+
+- `sbom.spdx.json`, the image's SBOM;
+- `grafana-dashboard.json`, when the release commit holds one at the repository root;
+- `openapi.json`, the release commit's `docs/openapi.json`, when it holds one.
+
+The SBOM, the dashboard and the API document each have a cosign bundle, `<file>.sigstore.json`, signed by `docker-release.yaml`, and the dashboard and the API document also come with a `.sha256` checksum. So you can verify an asset without pulling the image. The run reads the Release back and fails if an asset is missing. A repository with neither file gets the SBOM alone. When a stable run completes an earlier stable tag whose Release is missing, it creates that Release with the same assets: the SBOM attested to the tag's published image, and the files from the tag's own commit. It publishes nothing if one cannot be made.
 
 A job that runs a script or action from cplieger/ci first checks out cplieger/ci at the commit you pinned. The copy goes to `.cplieger-ci` beside your checkout and keeps no token on disk. So the commit you pin decides every line of cplieger/ci code the run executes. The `pr-policy` job of `ci.yaml` works the same way.
 

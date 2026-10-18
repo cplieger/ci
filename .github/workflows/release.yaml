@@ -584,7 +584,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # An image's Release carries its signed SBOM and dashboard, and only
+  # An image's Release carries the signed assets release-assets.sh lists, and only
   # docker-release.yaml's identity may sign them. The caller grants what that
   # workflow's other jobs declare; the job that runs holds read and OIDC only.
   repair-assets:
@@ -667,6 +667,7 @@ jobs:
         if: ${{ steps.release.outputs.missing == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           TAG: ${{ matrix.tag }}
           SITE: ${{ matrix.site }}
         run: |
@@ -675,18 +676,9 @@ jobs:
             gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes/NOTES.md"
             exit 0
           fi
-          cd "$RUNNER_TEMP/assets"
-          assets=(sbom.spdx.json sbom.spdx.json.sigstore.json)
-          dashboard=(grafana-dashboard.json grafana-dashboard.json.sha256 grafana-dashboard.json.sigstore.json)
-          for f in "${dashboard[@]}"; do
-            if [ -e "$f" ]; then
-              assets+=("${dashboard[@]}")
-              break
-            fi
-          done
-          for f in "${assets[@]}"; do
-            [ -s "$f" ] || { echo "::error::${f} is missing. ${TAG} is not published without it."; exit 1; }
-          done
+          dir="$RUNNER_TEMP/assets"
+          names=$(bash "$CI_TOOLS/release-assets.sh" names "$TAG" "$dir")
+          mapfile -t assets <<<"$names"
           # A draft left by an upload that died is not a Release by tag, so it would linger.
           gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
             | jq -r --arg v "$TAG" '.[] | select(.draft and .tag_name == $v) | .id' \
@@ -695,11 +687,8 @@ jobs:
                 echo "::notice::deleting orphaned draft release ${id} for ${TAG}"
                 gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
               done
-          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes/NOTES.md" "${assets[@]}"
-          have=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.assets[].name')
-          for f in "${assets[@]}"; do
-            grep -qxF "$f" <<<"$have" || { echo "::error::Release ${TAG} is missing asset ${f}"; exit 1; }
-          done
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes/NOTES.md" "${assets[@]/#/$dir/}"
+          bash "$CI_TOOLS/release-assets.sh" check "$TAG" "${assets[@]}"
 
   repair-publish:
     needs: [detect, repair-release]

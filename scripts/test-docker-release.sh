@@ -73,8 +73,9 @@ wanted = {
         "Generate release notes": "notes.sh",
         "Prepare tag-create helper": "taghelper.sh",
         "Create dev tag": "devtag.sh",
+        "Stage and sign the release assets": "stagesign.sh",
         "Create release": "createrel.sh",
-        "Verify dashboard release assets": "verifydash.sh",
+        "Verify the release assets": "verifyassets.sh",
     },
     "receipt": {"Record the completion receipt": "receipt.sh"},
     "repair-assets": {"Check the Release": "rassets-check.sh", "Sign the release assets": "rassets.sh"},
@@ -110,7 +111,7 @@ gates = {
     "sbom-readers-after": all(
         fin.index(w) < fin.index(r)
         for w in [n for n in fin if n.startswith("Generate SBOM")] + ["Read the promoted build's SBOM"]
-        for r in ("Shipped package versions summary", "Sign SBOM for release assets (keyless)", "Attest SBOM to GHCR")
+        for r in ("Shipped package versions summary", "Stage and sign the release assets", "Attest SBOM to GHCR")
     ),
     "provenance-if": step_if("finalize", "Verify the promoted build's signature and SBOM"),
     "before-provenance": fin[: fin.index("Verify the promoted build's signature and SBOM")],
@@ -1623,6 +1624,66 @@ echo "owner/app $DSH" >"$COSIGN_SIGNED"
 chk "D-A6 an image the registry does not serve at the tag fails before cosign" "$(assets v2.0.0)|$(wc -l <"$COSIGN_LOG" | tr -d ' ')" "1||0"
 chk_has "D-A6 naming the missing asset" "$(cat "$WORK/assets.log")" \
   "::error::sbom.spdx.json is missing, because the image digest that v2.0.0 published is unknown. v2.0.0 is not published without it."
+# The tree's API document, on a side branch whose tags are deleted after, so
+# no later case sees them in a signing window.
+git -C "$NOTESREPO" checkout -q -b api-document "$DSH"
+OAPI=$(commit_in "$NOTESREPO" "feat: publish the API document" docs/openapi.json='{"openapi":"3.1.0"}')
+git -C "$NOTESREPO" tag v2.0.1
+printf '{"openapi":"edited after the tag"}' >"$NOTESREPO/docs/openapi.json"
+printf '%s\n' "owner/app:v2.0.1 $PREV_DIGEST" >"$TAGS"
+echo "owner/app $OAPI" >"$COSIGN_SIGNED"
+OAPI_ASSETS="openapi.json openapi.json.sha256 openapi.json.sigstore.json"
+DASH_NAMES="grafana-dashboard.json grafana-dashboard.json.sha256 grafana-dashboard.json.sigstore.json"
+chk "D-A9 a tag whose tree holds docs/openapi.json hands it on as openapi.json, with its checksum and signature" \
+  "$(assets v2.0.1)|$(signed)" "0|$DASH_NAMES $OAPI_ASSETS sbom.spdx.json sbom.spdx.json.sigstore.json |3"
+chk "D-A9 the document is the tag commit's, checked as the release names it" \
+  "$(cat "$ASSETS_DIR/openapi.json")|$(cd "$ASSETS_DIR" && sha256sum -c openapi.json.sha256)" '{"openapi":"3.1.0"}|openapi.json: OK'
+chk "D-A9 and signed under its asset name" "$(grep -c '^sign-blob --yes openapi.json --bundle openapi.json.sigstore.json$' "$COSIGN_LOG")" "1"
+chk "D-A10 a failed signature of it hands nothing on" \
+  "$(COSIGN_SIGN_RC=1 COSIGN_SIGN_FAIL=openapi.json assets v2.0.1 | cut -d'|' -f1)" "1"
+chk_has "D-A10 naming that bundle" "$(cat "$WORK/assets.log")" \
+  "::error::openapi.json.sigstore.json is missing, because cosign could not sign openapi.json. v2.0.1 is not published without it."
+git -C "$NOTESREPO" checkout -q docs/openapi.json
+git -C "$NOTESREPO" rm -q docs/openapi.json
+mkdir -p "$NOTESREPO/docs"
+ln -s ../main.go "$NOTESREPO/docs/openapi.json"
+git -C "$NOTESREPO" add docs/openapi.json
+git -C "$NOTESREPO" commit -q -m "chore: link the API document"
+git -C "$NOTESREPO" tag v2.0.2
+printf '%s\n' "owner/app:v2.0.2 $PREV_DIGEST" >"$TAGS"
+echo "owner/app $(git -C "$NOTESREPO" rev-parse HEAD)" >"$COSIGN_SIGNED"
+chk "D-A11 a docs/openapi.json that is not a regular file hands nothing on" "$(assets v2.0.2 | cut -d'|' -f1)" "1"
+chk_has "D-A11 naming it" "$(cat "$WORK/assets.log")" \
+  "::error::docs/openapi.json at v2.0.2 is not a regular file, so openapi.json cannot be published from it."
+SSRT="$WORK/ss-rt"
+stage_signed() { # <commit> -> rc|the files the finalize step staged, with a log in $WORK/ss.log
+  local rc=0
+  rm -rf "$SSRT"
+  mkdir -p "$SSRT"
+  : >"$COSIGN_LOG"
+  printf '%s\n' "$SPDX" >"$NOTESREPO/sbom.spdx.json"
+  (cd "$NOTESREPO" && PATH="$ABIN:$BIN:$PATH" CI_TOOLS="$ROOT/scripts" RUNNER_TEMP="$SSRT" GITHUB_SHA="$1" VERSION=v2.0.1 \
+    READBACK_SLEEP=0 bash "$WORK/stagesign.sh") >"$WORK/ss.log" 2>&1 || rc=$?
+  rm -f "$NOTESREPO/sbom.spdx.json"
+  echo "$rc|$(find "$SSRT/release-assets" -mindepth 1 -printf '%f\n' 2>/dev/null | sort | tr '\n' ' ')"
+}
+[ -s "$WORK/stagesign.sh" ] || fail "D-S0 the finalize step staging the release assets was not extracted"
+chk "D-S0 it runs on stable publishes only" "$(cat "$WORK/stagesign.sh.if")" "\${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}"
+chk "D-S1 a release commit holding docs/openapi.json stages and signs it beside the SBOM and the dashboard" \
+  "$(stage_signed "$OAPI")|$(signed)" "0|$DASH_NAMES $OAPI_ASSETS sbom.spdx.json sbom.spdx.json.sigstore.json |3"
+chk "D-S1 the release commit's document, not the working tree's" \
+  "$(cat "$SSRT/release-assets/openapi.json")|$(cd "$SSRT/release-assets" && sha256sum -c openapi.json.sha256)" '{"openapi":"3.1.0"}|openapi.json: OK'
+chk "D-S1 and the SBOM this run generated" "$(cat "$SSRT/release-assets/sbom.spdx.json")" "$SPDX"
+chk "D-S2 a release commit without it stages what it staged before" \
+  "$(stage_signed "$DSH")|$(signed)" "0|$DASH_NAMES sbom.spdx.json sbom.spdx.json.sigstore.json |2"
+chk "D-S3 a failed signature fails the step" "$(COSIGN_SIGN_RC=1 COSIGN_SIGN_FAIL=openapi.json stage_signed "$OAPI" | cut -d'|' -f1)" "1"
+chk_has "D-S3 naming the bundle" "$(cat "$WORK/ss.log")" \
+  "::error::openapi.json.sigstore.json is missing, because cosign could not sign openapi.json. v2.0.1 is not published without it."
+git -C "$NOTESREPO" checkout -q main
+git -C "$NOTESREPO" tag -d v2.0.1 v2.0.2 >/dev/null
+git -C "$NOTESREPO" branch -q -D api-document
+: >"$TAGS"
+echo "owner/app $DSH" >"$COSIGN_SIGNED"
 rassets_check() { # -> the missing output, or EXIT=n
   : >"$WORK/ra.out"
   (PATH="$ABIN:$BIN:$PATH" CI_TOOLS="$ROOT/scripts" GITHUB_REPOSITORY=owner/app TAG=v2.0.0 GITHUB_OUTPUT="$WORK/ra.out" \
@@ -1938,6 +1999,16 @@ cat >"$BIN/gh" <<'SH'
 #!/bin/sh
 printf '%s\n' "$*" >>"$GH_LOG"
 st=$(cat "$REL_DIR/state")
+# gh expands and stats every asset path before any request, so a missing one
+# fails the call (cli/cli pkg/cmd/release/shared/upload.go AssetsFromArgs).
+present() {
+  for a in "$@"; do
+    [ -f "$a" ] || {
+      printf 'no matches found for `%s`\n' "$a" >&2
+      return 1
+    }
+  done
+}
 case "$*" in
   "api repos/owner/app/git/ref/tags/v2.0.0 --jq .object.sha")
     printf '%s\n' "$GITHUB_SHA"
@@ -1963,11 +2034,14 @@ case "$*" in
   "api -X DELETE repos/owner/app/releases/"*) exit 0 ;;
   "release create v2.0.0 --title v2.0.0 --notes-file RELEASE_NOTES.md "*)
     shift 7
-    printf '%s\n' "$@" >"$REL_DIR/assets"
+    present "$@" || exit 1
+    for a in "$@"; do printf '%s\n' "${a##*/}"; done >"$REL_DIR/assets"
     if [ -n "$IMMUTABLE_ON" ]; then echo immutable; else echo mutable; fi >"$REL_DIR/state"
     exit 0
     ;;
   "release upload --clobber v2.0.0 "*)
+    shift 4
+    present "$@" || exit 1
     if [ "$st" = immutable ]; then
       echo "HTTP 422: Cannot upload assets to an immutable release." >&2
       exit 1
@@ -1980,7 +2054,14 @@ exit 22
 SH
 chmod 755 "$BIN/gh"
 DASH_ASSETS=(grafana-dashboard.json grafana-dashboard.json.sha256 grafana-dashboard.json.sigstore.json)
+OAPI_ASSET_LIST=(openapi.json openapi.json.sha256 openapi.json.sigstore.json)
 ALL_ASSETS=(sbom.spdx.json sbom.spdx.json.sigstore.json "${DASH_ASSETS[@]}")
+STAGED="$WORK/release-assets"
+staged() { # <asset name...>: what the stage-and-sign step left for the create
+  rm -rf "$STAGED"
+  mkdir -p "$STAGED"
+  for f; do echo "bytes of $f" >"$STAGED/$f"; done
+}
 release_store() { # <state> [asset names...]: the store as the run finds it
   echo "$1" >"$REL_DIR/state"
   shift
@@ -1996,31 +2077,55 @@ finalize_release() { # [IMMUTABLE env] -> runs Create release then, when it publ
     reused=$(out reused) immutable=$(out immutable)
     [ "$(out published)" = true ] || exit 0
     echo "outputs: reused=${reused} immutable=${immutable}"
-    REUSED=$reused IMMUTABLE=$immutable run_step verifydash.sh
+    REUSED=$reused IMMUTABLE=$immutable run_step verifyassets.sh
   )
 }
 calls() { grep -cE "$1" "$GH_LOG" || true; }
-(cd "$WORK/relcwd" && touch sbom.spdx.json sbom.spdx.json.sigstore.json RELEASE_NOTES.md "${DASH_ASSETS[@]}")
+releases() { grep '^release ' "$GH_LOG" | sed "s#$STAGED/##g" | tr '\n' ';'; }
+(cd "$WORK/relcwd" && touch RELEASE_NOTES.md)
+staged "${ALL_ASSETS[@]}"
 chk "D-I0 the verify step reads whether the Release is immutable from the create step" \
-  "$(sed -n 's/^IMMUTABLE=//p' "$WORK/verifydash.sh.envmap")" '${{ steps.release.outputs.immutable }}'
+  "$(sed -n 's/^IMMUTABLE=//p' "$WORK/verifyassets.sh.envmap")" '${{ steps.release.outputs.immutable }}'
+chk "D-I0 and runs on every Release the create step published" \
+  "$(cat "$WORK/verifyassets.sh.if")" "\${{ env.PUBLISH == 'true' && steps.release.outputs.published == 'true' }}"
 
 for on in "" 1; do
   release_store absent
   out_rel=$(IMMUTABLE_ON=$on finalize_release)
   chk "D-I1 a first publish (immutable setting '${on:-off}') is one create carrying every asset" \
-    "$(grep '^release ' "$GH_LOG" | tr '\n' ';')" "release create v2.0.0 --title v2.0.0 --notes-file RELEASE_NOTES.md ${ALL_ASSETS[*]};"
+    "$(releases)" "release create v2.0.0 --title v2.0.0 --notes-file RELEASE_NOTES.md ${ALL_ASSETS[*]};"
   chk "D-I1 and the published Release holds them all" "$(tr '\n' ' ' <"$REL_DIR/assets")" "${ALL_ASSETS[*]} "
   chk "D-I1 and nothing is uploaded after it" "$(calls '^release upload')" "0"
   chk "D-I1 and the verify step passes" "$(printf '%s' "$out_rel" | grep -c '^EXIT=' || true)" "0"
 done
 chk_has "D-I1 a first publish is no reuse" "$out_rel" "outputs: reused= immutable="
 
-(cd "$WORK/relcwd" && rm -f "${DASH_ASSETS[@]}")
+staged sbom.spdx.json sbom.spdx.json.sigstore.json
 release_store absent
 out_rel=$(finalize_release)
 chk "D-I2 without a dashboard the create carries the SBOM pair alone" \
-  "$(grep '^release ' "$GH_LOG")" "release create v2.0.0 --title v2.0.0 --notes-file RELEASE_NOTES.md sbom.spdx.json sbom.spdx.json.sigstore.json"
-(cd "$WORK/relcwd" && touch "${DASH_ASSETS[@]}")
+  "$(releases)" "release create v2.0.0 --title v2.0.0 --notes-file RELEASE_NOTES.md sbom.spdx.json sbom.spdx.json.sigstore.json;"
+chk "D-I2 and the verify step reads that pair back, passing" \
+  "$(calls 'releases/tags/v2.0.0 --jq .assets')|$(printf '%s' "$out_rel" | grep -c '^EXIT=' || true)" "1|0"
+
+staged "${ALL_ASSETS[@]}" "${OAPI_ASSET_LIST[@]}"
+release_store absent
+out_rel=$(finalize_release)
+chk "D-I8 a tree holding docs/openapi.json: the create carries openapi.json, its checksum and its signature" \
+  "$(releases)" "release create v2.0.0 --title v2.0.0 --notes-file RELEASE_NOTES.md ${ALL_ASSETS[*]} ${OAPI_ASSET_LIST[*]};"
+chk "D-I8 and the verify step passes" "$(printf '%s' "$out_rel" | grep -c '^EXIT=' || true)" "0"
+release_store immutable "${ALL_ASSETS[@]}"
+out_rel=$(finalize_release)
+chk "D-I9 an immutable Release missing openapi.json fails the verify step" \
+  "$(printf '%s' "$out_rel" | sed -n 's/^EXIT=//p')" "1"
+chk_has "D-I9 naming the asset" "$out_rel" "::error::Release v2.0.0 is missing asset openapi.json"
+staged "${ALL_ASSETS[@]}" openapi.json openapi.json.sha256
+release_store absent
+out_rel=$(finalize_release)
+chk "D-I10 a document staged without its signature fails before any GitHub call" \
+  "$(printf '%s' "$out_rel" | sed -n 's/^EXIT=//p')|$(wc -l <"$GH_LOG" | tr -d ' ')" "1|0"
+chk_has "D-I10 naming the signature" "$out_rel" "::error::openapi.json.sigstore.json is missing. v2.0.0 is not published without it."
+staged "${ALL_ASSETS[@]}"
 
 release_store absent
 printf '%s\n' '[{"id":11,"draft":true,"tag_name":"v2.0.0"},{"id":12,"draft":true,"tag_name":"v1.9.0"},{"id":13,"draft":false,"tag_name":"v2.0.0"}]' >"$REL_DIR/listing.json"
@@ -2034,7 +2139,7 @@ release_store immutable "${ALL_ASSETS[@]}"
 out_rel=$(finalize_release)
 chk_has "D-I4 a rerun over an immutable Release reuses it" "$out_rel" "outputs: reused=true immutable=true"
 chk "D-I4 and uploads nothing" "$(calls '^release ')" "0"
-chk_has "D-I4 and says why" "$out_rel" "::notice::Release v2.0.0 is immutable, so its dashboard assets stay as first published."
+chk_has "D-I4 and says why" "$out_rel" "::notice::Release v2.0.0 is immutable, so its assets stay as first published."
 chk "D-I4 and still verifies the assets, passing" \
   "$(calls 'releases/tags/v2.0.0 --jq .assets')|$(printf '%s' "$out_rel" | grep -c '^EXIT=' || true)" "1|0"
 
@@ -2042,13 +2147,13 @@ release_store immutable sbom.spdx.json sbom.spdx.json.sigstore.json grafana-dash
 out_rel=$(finalize_release)
 chk "D-I5 an immutable Release missing a dashboard asset fails the verify step" \
   "$(printf '%s' "$out_rel" | sed -n 's/^EXIT=//p')" "1"
-chk_has "D-I5 naming the asset" "$out_rel" "::error::release v2.0.0 is missing asset grafana-dashboard.json.sha256"
+chk_has "D-I5 naming the asset" "$out_rel" "::error::Release v2.0.0 is missing asset grafana-dashboard.json.sha256"
 
 release_store mutable "${ALL_ASSETS[@]}"
 out_rel=$(finalize_release)
 chk_has "D-I6 a rerun over a mutable Release reuses it" "$out_rel" "outputs: reused=true immutable=false"
-chk "D-I6 and clobbers the dashboard assets with this build's" \
-  "$(grep '^release ' "$GH_LOG")" "release upload --clobber v2.0.0 ${DASH_ASSETS[*]}"
+chk "D-I6 and clobbers every asset with this build's" \
+  "$(releases)" "release upload --clobber v2.0.0 ${ALL_ASSETS[*]};"
 chk "D-I6 and passes" "$(printf '%s' "$out_rel" | grep -c '^EXIT=' || true)" "0"
 
 release_store down

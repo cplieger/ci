@@ -2875,7 +2875,7 @@ if [ "$1 $2" = "release create" ]; then
     case "$1" in
       -R | --title | --notes-file) shift 2 ;;
       --verify-tag) shift ;;
-      *) printf '%s\n' "$1" >>"$PUB_DIR/served"; shift ;;
+      *) printf '%s\n' "${1##*/}" >>"$PUB_DIR/served"; shift ;;
     esac
   done
   exit 0
@@ -2900,20 +2900,33 @@ publish_release() { # <site> [asset file ...] -> rc|the gh calls, one per line j
     esac
   done
   (cd "$WORK" && PATH="$PBIN:$PATH" PUB_DIR="$PUB_DIR" RUNNER_TEMP="$rt" GITHUB_REPOSITORY=o/app GH_TOKEN=t TAG=v9.9.9 SITE="$1" \
-    bash "$WORK/repair-release-publish.sh") >"$WORK/publish.log" 2>&1 || rc=$?
+    CI_TOOLS="$ROOT/scripts" bash "$WORK/repair-release-publish.sh") >"$WORK/publish.log" 2>&1 || rc=$?
   echo "$rc|$(sed "s#$rt#RT#g" "$PUB_DIR/log" 2>/dev/null | paste -sd ';' -)"
 }
 SBOM_PAIR="sbom.spdx.json sbom.spdx.json.sigstore.json"
 DASH="grafana-dashboard.json grafana-dashboard.json.sha256 grafana-dashboard.json.sigstore.json"
+OAPI="openapi.json openapi.json.sha256 openapi.json.sigstore.json"
+in_rt() { # <asset name...> -> the create's asset arguments
+  local f
+  for f; do printf ' RT/assets/%s' "$f"; done
+}
 LIST="api --paginate repos/o/app/releases?per_page=100"
 CREATE="release create v9.9.9 -R o/app --verify-tag --title v9.9.9 --notes-file RT/notes/NOTES.md"
 READ="api repos/o/app/releases/tags/v9.9.9 --jq .assets[].name"
 # shellcheck disable=SC2086 # the asset lists are word lists
 {
   chk "W25 an image Release is created once, with its SBOM and the SBOM's signature, then read back" \
-    "$(publish_release docker $SBOM_PAIR)" "0|$LIST;$CREATE $SBOM_PAIR;$READ"
+    "$(publish_release docker $SBOM_PAIR)" "0|$LIST;$CREATE$(in_rt $SBOM_PAIR);$READ"
   chk "W25 and the dashboard, its checksum and its signature when the tag ships one" \
-    "$(publish_release docker $SBOM_PAIR $DASH)" "0|$LIST;$CREATE $SBOM_PAIR $DASH;$READ"
+    "$(publish_release docker $SBOM_PAIR $DASH)" "0|$LIST;$CREATE$(in_rt $SBOM_PAIR $DASH);$READ"
+  chk "W25 and openapi.json, its checksum and its signature when the tag's tree holds docs/openapi.json" \
+    "$(publish_release docker $SBOM_PAIR $DASH $OAPI)" "0|$LIST;$CREATE$(in_rt $SBOM_PAIR $DASH $OAPI);$READ"
+  chk "W25 a Release that reads back without openapi.json fails closed" \
+    "$(PUB_DROP=openapi.json publish_release docker $SBOM_PAIR $OAPI | cut -d'|' -f1)" "1"
+  chk_has "W25 naming it" "$(cat "$WORK/publish.log")" "::error::Release v9.9.9 is missing asset openapi.json"
+  chk "W25 a document handed on without its signature publishes nothing" \
+    "$(publish_release docker $SBOM_PAIR openapi.json openapi.json.sha256)" "1|"
+  chk_has "W25 naming the signature" "$(cat "$WORK/publish.log")" "::error::openapi.json.sigstore.json is missing. v9.9.9 is not published without it."
   chk "W25 a missing SBOM signature publishes nothing" "$(publish_release docker sbom.spdx.json)" "1|"
   chk_has "W25 naming it" "$(cat "$WORK/publish.log")" "::error::sbom.spdx.json.sigstore.json is missing. v9.9.9 is not published without it."
   chk "W25 nor does a missing SBOM" "$(publish_release docker sbom.spdx.json.sigstore.json)" "1|"
@@ -2927,7 +2940,7 @@ READ="api repos/o/app/releases/tags/v9.9.9 --jq .assets[].name"
   jq -n '[{id: 1, draft: false, tag_name: "v9.9.9"}, {id: 2, draft: true, tag_name: "v9.9.8"}]' >"$WORK/releases.page1"
   jq -n '[{id: 77, draft: true, tag_name: "v9.9.9"}]' >"$WORK/releases.page2"
   chk "W25 an orphaned draft of the tag, even on a later page, is deleted before the create" \
-    "$(publish_release docker $SBOM_PAIR)" "0|$LIST;api -X DELETE repos/o/app/releases/77;$CREATE $SBOM_PAIR;$READ"
+    "$(publish_release docker $SBOM_PAIR)" "0|$LIST;api -X DELETE repos/o/app/releases/77;$CREATE$(in_rt $SBOM_PAIR);$READ"
   rm "$WORK/releases.page1" "$WORK/releases.page2"
   chk "W25 a Release that reads back without an asset fails" \
     "$(PUB_DROP=sbom.spdx.json.sigstore.json publish_release docker $SBOM_PAIR | cut -d'|' -f1)" "1"
