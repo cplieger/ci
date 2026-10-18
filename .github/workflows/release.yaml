@@ -679,14 +679,7 @@ jobs:
           dir="$RUNNER_TEMP/assets"
           names=$(bash "$CI_TOOLS/release-assets.sh" names "$TAG" "$dir")
           mapfile -t assets <<<"$names"
-          # A draft left by an upload that died is not a Release by tag, so it would linger.
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            | jq -r --arg v "$TAG" '.[] | select(.draft and .tag_name == $v) | .id' \
-            | while IFS= read -r id; do
-                [ -n "$id" ] || continue
-                echo "::notice::deleting orphaned draft release ${id} for ${TAG}"
-                gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
-              done
+          bash "$CI_TOOLS/release-assets.sh" cleanup-drafts "$TAG"
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes/NOTES.md" "${assets[@]/#/$dir/}"
           bash "$CI_TOOLS/release-assets.sh" check "$TAG" "${assets[@]}"
 

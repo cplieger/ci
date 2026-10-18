@@ -6,6 +6,7 @@
 #   sign <tag> <dir>        writes <file>.sigstore.json beside the SBOM and each staged file
 #   names <tag> <dir>       prints the Release's asset names, one per line; fails naming the first file <dir> lacks or holds empty
 #   check <tag> <name...>   fails naming the first name GITHUB_REPOSITORY's published Release of <tag> does not list
+#   cleanup-drafts <tag>    deletes every draft Release of <tag> in GITHUB_REPOSITORY, before that Release is created
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,10 +86,24 @@ cmd_check() { # <tag> <name...>
   done
 }
 
+# gh release create with assets drafts, uploads, then publishes (cli/cli v2.96.0
+# pkg/cmd/release/create/create.go), so an upload that died leaves a draft the
+# by-tag read does not return.
+cmd_cleanup_drafts() { # <tag>
+  local tag=$1 id
+  gh api --paginate "repos/${GITHUB_REPOSITORY:?}/releases?per_page=100" \
+    | jq -r --arg v "$tag" '.[] | select(.draft and .tag_name == $v) | .id' \
+    | while IFS= read -r id; do
+      echo "::notice::deleting orphaned draft release ${id} for ${tag}"
+      gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
+    done
+}
+
 case "${1:-}" in
   stage) cmd_stage "${2:?usage: release-assets.sh stage TREE-ISH DIR}" "${3:?usage: release-assets.sh stage TREE-ISH DIR}" ;;
   sign) cmd_sign "${2:?usage: release-assets.sh sign TAG DIR}" "${3:?usage: release-assets.sh sign TAG DIR}" ;;
   names) cmd_names "${2:?usage: release-assets.sh names TAG DIR}" "${3:?usage: release-assets.sh names TAG DIR}" ;;
   check) cmd_check "${2:?usage: release-assets.sh check TAG NAME...}" "${@:3}" ;;
-  *) die "usage: release-assets.sh stage|sign|names|check ..." ;;
+  cleanup-drafts) cmd_cleanup_drafts "${2:?usage: release-assets.sh cleanup-drafts TAG}" ;;
+  *) die "usage: release-assets.sh stage|sign|names|check|cleanup-drafts ..." ;;
 esac

@@ -1394,11 +1394,8 @@ jobs:
           # Release presence, status-aware: only a definitive HTTP 404
           # proceeds to create; any other API failure fails the step
           # (retryable) instead of risking a duplicate-create. The by-tag
-          # endpoint returns only PUBLISHED releases, so a DRAFT orphaned by
-          # a prior wedged asset upload (gh release create drafts first when
-          # assets are attached, publishes after the upload) reads as absent
-          # — correct, but the orphan must be deleted before re-creating or
-          # it accumulates in the UI while holding no tag ref.
+          # endpoint returns only PUBLISHED releases, so a draft orphaned by
+          # a wedged asset upload reads as absent; cleanup-drafts deletes it.
           if immutable=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" --jq .immutable 2>/tmp/relerr); then
             echo "::notice::Release ${VERSION} already exists; skipping creation."
             {
@@ -1412,13 +1409,7 @@ jobs:
             cat /tmp/relerr
             exit 1
           fi
-          gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            | jq -r --arg v "$VERSION" '.[] | select(.draft and .tag_name == $v) | .id' \
-            | while IFS= read -r id; do
-                [ -z "$id" ] && continue
-                echo "::notice::deleting orphaned draft release ${id} for ${VERSION}"
-                gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
-              done
+          bash "$CI_TOOLS/release-assets.sh" cleanup-drafts "$VERSION"
           gh release create "$VERSION" \
             --title "$VERSION" \
             --notes-file RELEASE_NOTES.md \

@@ -286,6 +286,8 @@ for job in ("go", "ts"):
 for job, name in (("go", "Tag + GitHub Release"), ("ts", "Tag + GitHub Release"), ("go-nested", "Tag + GitHub Release (lane)")):
     step = next(s for s in rjobs[job]["steps"] if s.get("name") == name)
     open(f"{out}/{job}-tag.sh", "w").write(step["run"])
+publish = next(s for s in rjobs["repair-release"]["steps"] if s.get("name") == "Publish the missing Release")
+open(f"{out}/repair-publish.sh", "w").write(publish["run"])
 perms = {job: sorted(rjobs[job].get("permissions") or {}) for job in ("go", "ts", "go-nested", "docker")}
 perms["docker-release/finalize"] = sorted(jobs["finalize"].get("permissions") or {})
 template = yaml.safe_load(open(release.replace("workflows/release.yaml", "workflow-templates/release.yml")))
@@ -1985,12 +1987,81 @@ done
 chk "D-T9 every tagging job and the caller hold the statuses scope" "$(tr '\n' ' ' <"$WORK/statuses-scope.txt")" \
   "docker=True docker-release/finalize=True go=True go-nested=True template/release=True ts=True "
 
+# ── Orphaned drafts: both Release creates clear them through one subcommand ──
+# The stub gh serves CL_REPO's releases listing as two pages and refuses any
+# other call; CL_FAIL=list or CL_FAIL=delete makes that call fail.
+CBIN="$WORK/cbin" CL_DIR="$WORK/cl"
+mkdir -p "$CBIN" "$CL_DIR"
+cat >"$CBIN/gh" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >>"$CL_DIR/log"
+case "$*" in
+  "api --paginate repos/$CL_REPO/releases?per_page=100")
+    [ "${CL_FAIL:-}" != list ] || {
+      echo "gh: Server Error (HTTP 502)" >&2
+      exit 1
+    }
+    cat "$CL_DIR/page1" "$CL_DIR/page2"
+    exit 0
+    ;;
+  "api -X DELETE repos/$CL_REPO/releases/"*)
+    [ "${CL_FAIL:-}" != delete ] || {
+      echo "gh: Server Error (HTTP 502)" >&2
+      exit 1
+    }
+    exit 0
+    ;;
+esac
+printf 'stub: unexpected gh %s\n' "$*" >&2
+exit 22
+SH
+chmod 755 "$CBIN/gh"
+cleanup_line() { # <step body> -> the step's cleanup-drafts call
+  grep -E '^ *bash "\$CI_TOOLS/release-assets\.sh" cleanup-drafts "\$[A-Z_]+"$' "$WORK/$1" | sed 's/^ *//'
+}
+cleanup_at() { # <step body> <tag variable> <repo> <tag> -> rc|the gh calls joined by ';', output in $CL_DIR/out
+  local line rc=0
+  line=$(cleanup_line "$1")
+  [ -n "$line" ] || fail "D-OD0 $1 does not call release-assets.sh cleanup-drafts"
+  : >"$CL_DIR/log"
+  (env PATH="$CBIN:$PATH" CI_TOOLS="$ROOT/scripts" GITHUB_REPOSITORY="$3" CL_DIR="$CL_DIR" CL_REPO="$3" CL_FAIL="${CL_FAIL:-}" "$2=$4" \
+    bash -euo pipefail -c "$line") >"$CL_DIR/out" 2>&1 || rc=$?
+  echo "$rc|$(paste -sd ';' "$CL_DIR/log")"
+}
+listing() { # <tag> -> page 1: the tag's published Release and a live draft of another tag; page 2: the tag's orphaned draft
+  jq -n --arg t "$1" '[{id: 1, draft: false, tag_name: $t}, {id: 2, draft: true, tag_name: "v0.0.1"}]' >"$CL_DIR/page1"
+  jq -n --arg t "$1" '[{id: 3, draft: true, tag_name: $t}]' >"$CL_DIR/page2"
+}
+chk "D-OD0 finalize's Create release step clears its version's drafts" "$(cleanup_line createrel.sh)" \
+  'bash "$CI_TOOLS/release-assets.sh" cleanup-drafts "$VERSION"'
+chk "D-OD0 the repair's Publish the missing Release step clears its tag's drafts" "$(cleanup_line repair-publish.sh)" \
+  'bash "$CI_TOOLS/release-assets.sh" cleanup-drafts "$TAG"'
+for site in "createrel.sh VERSION owner/app v2.0.0" "repair-publish.sh TAG o/app v9.9.9"; do
+  read -r body var repo tag <<<"$site"
+  listing "$tag"
+  chk "D-OD1 $body: the tag's orphaned draft on a later page is deleted; its Release and another tag's live draft stay" \
+    "$(cleanup_at "$body" "$var" "$repo" "$tag")" \
+    "0|api --paginate repos/$repo/releases?per_page=100;api -X DELETE repos/$repo/releases/3"
+  chk "D-OD1 $body: saying which" "$(cat "$CL_DIR/out")" "::notice::deleting orphaned draft release 3 for $tag"
+done
+listing v2.0.0
+echo '[]' >"$CL_DIR/page2"
+chk "D-OD2 with no orphaned draft nothing is deleted" "$(cleanup_at createrel.sh VERSION owner/app v2.0.0)" \
+  "0|api --paginate repos/owner/app/releases?per_page=100"
+listing v2.0.0
+chk "D-OD3 an unreadable listing fails, deleting nothing" \
+  "$(CL_FAIL=list cleanup_at createrel.sh VERSION owner/app v2.0.0)" "1|api --paginate repos/owner/app/releases?per_page=100"
+chk "D-OD4 a failed delete fails" "$(CL_FAIL=delete cleanup_at createrel.sh VERSION owner/app v2.0.0 | cut -d'|' -f1)" "1"
+chk_has "D-OD5 a call without a tag is a usage error" \
+  "$(PATH="$CBIN:$PATH" bash "$ROOT/scripts/release-assets.sh" cleanup-drafts 2>&1 || echo "EXIT=$?")" \
+  "usage: release-assets.sh cleanup-drafts TAG"
+
 # ── Stable Release: draft-then-publish, and a rerun over an immutable Release ─
 # The stub gh models one Release store for v2.0.0: REL_DIR/state is absent,
 # mutable, immutable or down (a 502 on the by-tag read), assets its names, and
-# listing.json what the releases listing answers. `gh release create` with
-# assets is the draft, upload, publish sequence (cli/cli v2.96.0
-# pkg/cmd/release/create/create.go), so it publishes every asset at once and
+# listing.json (with listing.p2.json, when present) the releases listing pages.
+# `gh release create` with assets drafts, uploads, then publishes (cli/cli
+# v2.96.0 pkg/cmd/release/create/create.go), so every asset lands at once and
 # the Release is immutable from then on when IMMUTABLE_ON is set; an upload to
 # an immutable Release is refused as GitHub refuses it.
 export REL_DIR="$WORK/rel" IMMUTABLE_ON=""
@@ -2027,8 +2098,9 @@ case "$*" in
     cat "$REL_DIR/assets"
     exit 0
     ;;
-  "api repos/owner/app/releases?per_page=100")
+  "api --paginate repos/owner/app/releases?per_page=100")
     cat "$REL_DIR/listing.json"
+    if [ -f "$REL_DIR/listing.p2.json" ]; then cat "$REL_DIR/listing.p2.json"; fi
     exit 0
     ;;
   "api -X DELETE repos/owner/app/releases/"*) exit 0 ;;
@@ -2067,6 +2139,7 @@ release_store() { # <state> [asset names...]: the store as the run finds it
   shift
   if [ "$#" -gt 0 ]; then printf '%s\n' "$@" >"$REL_DIR/assets"; else : >"$REL_DIR/assets"; fi
   echo '[]' >"$REL_DIR/listing.json"
+  rm -f "$REL_DIR/listing.p2.json"
   : >"$GH_LOG"
 }
 finalize_release() { # [IMMUTABLE env] -> runs Create release then, when it published, the verify step
@@ -2134,6 +2207,13 @@ chk "D-I3 an orphaned draft of this version is deleted, and nothing else" \
   "$(grep -- '-X DELETE' "$GH_LOG" | tr '\n' ';')" "api -X DELETE repos/owner/app/releases/11;"
 chk "D-I3 before the one create" \
   "$(grep -E -- '-X DELETE|^release create' "$GH_LOG" | cut -d' ' -f1-2 | tr '\n' ';')" "api -X;release create;"
+release_store absent
+printf '%s\n' '[{"id":21,"draft":false,"tag_name":"v1.9.0"}]' >"$REL_DIR/listing.json"
+printf '%s\n' '[{"id":22,"draft":true,"tag_name":"v2.0.0"}]' >"$REL_DIR/listing.p2.json"
+out_rel=$(finalize_release)
+chk "D-I3 an orphaned draft of this version on a later page is deleted too, before the create" \
+  "$(grep -E -- '-X DELETE|^release create' "$GH_LOG" | cut -d' ' -f1-5 | tr '\n' ';')" \
+  "api -X DELETE repos/owner/app/releases/22;release create v2.0.0 --title v2.0.0;"
 
 release_store immutable "${ALL_ASSETS[@]}"
 out_rel=$(finalize_release)
