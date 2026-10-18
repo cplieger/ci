@@ -1295,36 +1295,20 @@ jobs:
           fi
           bash "$CI_TOOLS/render-notes.sh" "${args[@]}"
 
-      - name: Sign SBOM for release assets (keyless)
-        # Attach a cosign Sigstore bundle next to the SBOM so the GitHub
-        # Release carries a signed artifact a consumer can verify without
-        # pulling the image: the GHCR image and attestation signatures above
-        # live in the registry, so a release-asset consumer never sees them.
-        #
-        # cosign v3 turns --new-bundle-format and --use-signing-config on by
-        # default, which deprecates (and ignores) --output-signature /
-        # --output-certificate and makes --bundle required. The single
-        # .sigstore.json bundle carries the signature, certificate and Rekor
-        # inclusion proof.
+      # A cosign bundle beside the SBOM and each tree file lets a consumer
+      # verify it without pulling the image, whose signatures live in the registry.
+      - name: Stage and sign the release assets
         if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          . "$CI_TOOLS/retry.sh"
-          retry cosign sign-blob --yes sbom.spdx.json \
-            --bundle sbom.spdx.json.sigstore.json
-
-      - name: Sign dashboard for release assets (keyless)
-        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && hashFiles('grafana-dashboard.json') != '' }}
-        env:
-          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
-        run: |
-          set -euo pipefail
-          . "$CI_TOOLS/retry.sh"
-          sha256sum grafana-dashboard.json > grafana-dashboard.json.sha256
-          retry cosign sign-blob --yes grafana-dashboard.json \
-            --bundle grafana-dashboard.json.sigstore.json
+          dir="$RUNNER_TEMP/release-assets"
+          mkdir -p "$dir"
+          cp sbom.spdx.json "$dir/"
+          bash "$CI_TOOLS/release-assets.sh" stage "$GITHUB_SHA" "$dir"
+          bash "$CI_TOOLS/release-assets.sh" sign "$VERSION" "$dir"
 
       # The tag ref is created via the git data API pinned to $GITHUB_SHA
       # (`gh release create --target` 403s once the branch moved on); a tag at
@@ -1399,6 +1383,9 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          dir="$RUNNER_TEMP/release-assets"
+          names=$(bash "$CI_TOOLS/release-assets.sh" names "$VERSION" "$dir")
+          mapfile -t assets <<<"$names"
           . "$RUNNER_TEMP/create-tag.sh"
           rc=0
           create_tag "$VERSION" || rc=$?
@@ -1432,49 +1419,37 @@ jobs:
                 echo "::notice::deleting orphaned draft release ${id} for ${VERSION}"
                 gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
               done
-          ASSETS=(sbom.spdx.json sbom.spdx.json.sigstore.json)
-          # The two side files are written only by the dashboard sign step, which is
-          # gated on a root grafana-dashboard.json; keying on all three keeps this step
-          # file-presence-driven rather than repo-list-driven and never hands gh a
-          # path that is not there.
-          if [ -f grafana-dashboard.json ] && [ -f grafana-dashboard.json.sha256 ] && [ -f grafana-dashboard.json.sigstore.json ]; then
-            ASSETS+=(grafana-dashboard.json grafana-dashboard.json.sha256 grafana-dashboard.json.sigstore.json)
-          fi
           gh release create "$VERSION" \
             --title "$VERSION" \
             --notes-file RELEASE_NOTES.md \
-            "${ASSETS[@]}"
+            "${assets[@]/#/$dir/}"
           echo "published=true" >> "$GITHUB_OUTPUT"
 
-      - name: Verify dashboard release assets
-        if: ${{ steps.release.outputs.published == 'true' && hashFiles('grafana-dashboard.json') != '' }}
+      - name: Verify the release assets
+        if: ${{ env.PUBLISH == 'true' && steps.release.outputs.published == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           VERSION: ${{ inputs.version }}
           REUSED: ${{ steps.release.outputs.reused }}
           IMMUTABLE: ${{ steps.release.outputs.immutable }}
         run: |
           set -euo pipefail
+          dir="$RUNNER_TEMP/release-assets"
+          names=$(bash "$CI_TOOLS/release-assets.sh" names "$VERSION" "$dir")
+          mapfile -t assets <<<"$names"
           # A rerun that found its Release already present moves the image tags
-          # to the fresh build; the dashboard assets follow for the same reason.
-          # An immutable Release refuses uploads, and the tag guard pins it to
-          # this commit, so its dashboard bytes are this build's already.
+          # to the fresh build; the assets follow for the same reason. An
+          # immutable Release refuses uploads, so its assets stay.
           if [ "$REUSED" = "true" ] && [ "$IMMUTABLE" = "true" ]; then
-            echo "::notice::Release ${VERSION} is immutable, so its dashboard assets stay as first published."
+            echo "::notice::Release ${VERSION} is immutable, so its assets stay as first published."
           elif [ "$REUSED" = "true" ]; then
-            gh release upload --clobber "$VERSION" \
-              grafana-dashboard.json grafana-dashboard.json.sha256 grafana-dashboard.json.sigstore.json
+            gh release upload --clobber "$VERSION" "${assets[@]/#/$dir/}"
           fi
-          # REST by-tag read, the same call the create step's presence check makes: gh release
-          # view bills GraphQL, whose secondary rate limit reads as "release not found".
-          have=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" --jq '.assets[].name')
-          for f in grafana-dashboard.json grafana-dashboard.json.sha256 grafana-dashboard.json.sigstore.json; do
-            grep -qx "$f" <<<"$have" || { echo "::error::release ${VERSION} is missing asset ${f}"; exit 1; }
-          done
-          {
-            echo ""
-            echo "Release assets: \`grafana-dashboard.json\`, \`grafana-dashboard.json.sha256\`, \`grafana-dashboard.json.sigstore.json\`."
-          } >> "$GITHUB_STEP_SUMMARY"
+          bash "$CI_TOOLS/release-assets.sh" check "$VERSION" "${assets[@]}"
+          list=""
+          for f in "${assets[@]}"; do list+="${list:+, }\`${f}\`"; done
+          printf '\nRelease assets: %s.\n' "$list" >> "$GITHUB_STEP_SUMMARY"
 
       # The two Docker Hub description steps run on every stable-channel run,
       # published or not, so a docs-only promotion still refreshes the page.
@@ -1673,7 +1648,6 @@ jobs:
           SUBPACKAGES_JSON: ${{ inputs.subpackages }}
         run: |
           set -euo pipefail
-          . "$CI_TOOLS/retry.sh"
           out="$RUNNER_TEMP/assets"
           mkdir -p "$out"
           if ! digest=$(IMAGE="$IMAGE_NAME" bash "$CI_TOOLS/release-state.sh" release-digest "$TAG"); then
@@ -1684,20 +1658,8 @@ jobs:
             echo "::error::sbom.spdx.json is missing, because ${why}. ${TAG} is not published without it."
             exit 1
           fi
-          sign() {
-            if ! retry cosign sign-blob --yes "$1" --bundle "$1.sigstore.json"; then
-              echo "::error::$1.sigstore.json is missing, because cosign could not sign $1. ${TAG} is not published without it."
-              exit 1
-            fi
-          }
-          cd "$out"
-          sign sbom.spdx.json
-          commit=$(git -C "$GITHUB_WORKSPACE" rev-list -n1 "$TAG")
-          if git -C "$GITHUB_WORKSPACE" cat-file -e "${commit}:grafana-dashboard.json" 2>/dev/null; then
-            git -C "$GITHUB_WORKSPACE" show "${commit}:grafana-dashboard.json" > grafana-dashboard.json
-            sha256sum grafana-dashboard.json > grafana-dashboard.json.sha256
-            sign grafana-dashboard.json
-          fi
+          bash "$CI_TOOLS/release-assets.sh" stage "$TAG" "$out"
+          bash "$CI_TOOLS/release-assets.sh" sign "$TAG" "$out"
 
       - name: Hand the assets on
         if: ${{ steps.release.outputs.missing == 'true' }}
