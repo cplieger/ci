@@ -126,11 +126,13 @@ jobs:
 
             # Probe known nested web-frontend locations. First hit wins.
             # Add new paths centrally if a future repo introduces a different
-            # layout — no per-repo override needed.
+            # layout — no per-repo override needed. scripts/test-lane-semantics.sh
+            # finds this loop by the first line of this comment and runs it.
             for d in \
               "static-src" \
               "web" \
               "internal/server/static-src" \
+              "internal/webui/static-src" \
             ; do
               if [ -d "$d" ] && { [ -f "$d/package.json" ] || [ -f "$d/jsr.json" ]; }; then
                 web_dir="$d"
@@ -803,14 +805,15 @@ jobs:
             fi
           ) || { echo "Probe git-cliff bump semantics" >> /tmp/_ci_failures; exit 1; }
 
-      # Nested-module lane shell-semantics probe (opt-in by file presence).
+      # Lane and web-probe shell-semantics probe (opt-in by file presence).
       # The cliff probe above pins the git-cliff side of the lane contract;
-      # this one pins the SHELL side (lane discovery eligibility, changed-path
-      # classification, module-path verification, version guards, escaping)
-      # that release.yaml and the meta ci.yaml embed inline — so an edit to
-      # the prune list or classification loop cannot merge if it breaks the
-      # pinned contract.
-      - name: Probe nested-lane shell semantics
+      # this one pins the SHELL side that release.yaml and the meta ci.yaml
+      # embed inline (lane discovery eligibility, changed-path classification,
+      # module-path verification, version guards, escaping, and the
+      # web-frontend probe's folder order), so an edit to the prune list, the
+      # classification loop or the probe folders cannot merge if it breaks
+      # the pinned contract.
+      - name: Probe lane and web-probe shell semantics
         continue-on-error: true
         run: |
           (
@@ -819,7 +822,7 @@ jobs:
             else
               echo "no lane semantics probe in this repo - skipping"
             fi
-          ) || { echo "Probe nested-lane shell semantics" >> /tmp/_ci_failures; exit 1; }
+          ) || { echo "Probe lane and web-probe shell semantics" >> /tmp/_ci_failures; exit 1; }
 
       # verify-publish shell-semantics probe (opt-in by file presence). The
       # release gate's registry read-back is pure shell that nothing else
