@@ -96,7 +96,6 @@ jobs:
           if [ "$code_changed" = "true" ]; then
             [ -f go.mod ] && run_go=true
             [ -f jsr.json ] && run_ts=true
-            [ -f Dockerfile ] && run_shell=true
             [ -f Dockerfile ] && run_docker=true
 
             # The root `./...` never crosses a nested module, so each tracked
@@ -147,14 +146,19 @@ jobs:
               run_python=true
             fi
 
-            # Scripts: pure tooling/docs repos only (no go.mod/jsr.json/
-            # Dockerfile — Go/TS/Docker repos lint via their own jobs). Fires on
-            # shell scripts or workflow files → actionlint + shellcheck.
-            if [ ! -f Dockerfile ] && [ ! -f go.mod ] && [ ! -f jsr.json ]; then
-              if [ -n "$(find . -name '*.sh' -not -path './.git/*' -not -path '*/node_modules/*' -print -quit)" ] \
-                || [ -n "$(find .github/workflows -name '*.y*ml' -print -quit 2> /dev/null)" ]; then
-                run_scripts=true
+            # The two branches are disjoint, so shell lint has at most one home per
+            # repo: shell-ci.yaml in a Dockerfile repo, or in a Go or TypeScript repo
+            # with a tracked *.sh outside the pruned trees; the scripts job in a repo
+            # with no Dockerfile, go.mod or jsr.json that has shell scripts or
+            # workflow files. scripts/test_shell_routing.py pins both branches.
+            if [ -f Dockerfile ] || [ -f go.mod ] || [ -f jsr.json ]; then
+              if [ -f Dockerfile ] \
+                || [ -n "$(git ls-files '*.sh' | grep -Ev '(^|/)(node_modules|vendor|testdata|dist)/' | head -1)" ]; then
+                run_shell=true
               fi
+            elif [ -n "$(find . -name '*.sh' -not -path './.git/*' -not -path '*/node_modules/*' -print -quit)" ] \
+              || [ -n "$(find .github/workflows -name '*.y*ml' -print -quit 2> /dev/null)" ]; then
+              run_scripts=true
             fi
 
             # The root is a dead-code target exactly when deadset finds a language
@@ -260,6 +264,8 @@ jobs:
     needs: detect
     if: ${{ needs.detect.outputs.run_shell == 'true' }}
     uses: ./.github/workflows/shell-ci.yaml
+    with:
+      dockerfile: ${{ needs.detect.outputs.run_docker == 'true' && './Dockerfile' || '' }}
 
   # deadset-ci.yaml's analyze job uploads SARIF, and a called job requesting a
   # permission its caller withholds fails the whole run at startup
@@ -679,14 +685,11 @@ jobs:
       - name: Lint Python (ruff check)
         run: ruff check --output-format github .
 
-  # Config + tooling/docs lint for repos with no go.mod/jsr.json/Dockerfile
-  # (Docker/Go/TS repos get shell + workflow lint via their own jobs). This is
-  # the surface for the tooling repos that call the meta workflow (cplieger/ci,
-  # cplieger/.github — the private repos run their own bespoke ci.yaml and do
-  # not come through here), so it covers their full battery: workflows
-  # (actionlint + zizmor), shell (lint + format), YAML, TOML, and secret
-  # scanning. Soft-gated like shell-ci.yaml: each step records its name to
-  # /tmp/_ci_failures on failure and the final step fails the job if any did.
+  # Config + tooling/docs lint for repos with no go.mod/jsr.json/Dockerfile;
+  # detect owns the routing. It covers their shell (lint, format, unit tests),
+  # YAML, TOML and the probes. Soft-gated like shell-ci.yaml: each step records
+  # its name to /tmp/_ci_failures on failure and the final step fails the job
+  # if any did.
   scripts:
     needs: detect
     if: ${{ needs.detect.outputs.run_scripts == 'true' }}
@@ -758,6 +761,18 @@ jobs:
               shfmt -d -i 2 -ci -bn $files
             fi
           ) || { echo "Format check shell scripts (shfmt)" >> /tmp/_ci_failures; exit 1; }
+
+      # shell-ci.yaml's step of the same name owns this body's shape.
+      - name: Run shell unit tests
+        continue-on-error: true
+        run: |
+          (
+            if [ -f tests/shell/run.sh ]; then
+              bash tests/shell/run.sh
+            else
+              echo "no shell unit tests in this repo - skipping"
+            fi
+          ) || { echo "Run shell unit tests" >> /tmp/_ci_failures; exit 1; }
 
       # yamllint: honour a repo-local config when present (e.g. .kiro's
       # .yamllint.yaml), else fall back to a relaxed default with a 150-char

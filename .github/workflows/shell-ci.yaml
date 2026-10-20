@@ -1,9 +1,9 @@
 name: Shell CI
 
-# Reusable shell/Docker CI. Called by the meta ci.yaml's `shell` job for every
-# repo with a Dockerfile (the single home of hadolint — go-ci deliberately does
-# not duplicate it); consumers pin the meta workflow by SHA with a
-# major-version comment.
+# Reusable shell/Docker CI. Called by the meta ci.yaml's `shell` job; its
+# `detect` job decides which repos come here. The single home of hadolint: go-ci
+# deliberately does not duplicate it. Consumers pin the meta workflow by SHA
+# with a major-version comment.
 
 on:
   workflow_call:
@@ -27,7 +27,7 @@ on:
         type: string
         default: "DL3018,DL3066"
       dockerfile:
-        description: Path to the Dockerfile to lint.
+        description: Path to the Dockerfile to lint. An empty path skips hadolint.
         type: string
         default: "./Dockerfile"
 
@@ -178,6 +178,7 @@ jobs:
           ) || { echo "Format check shell scripts (shfmt)" >> /tmp/_ci_failures; exit 1; }
 
       - name: Validate Dockerfile
+        if: ${{ inputs.dockerfile != '' }}
         continue-on-error: true
         env:
           # Via env, never inline ${{ }} in the script body (template injection).
@@ -203,8 +204,7 @@ jobs:
               hadolint ${IGNORE_FLAGS} - < "$DOCKERFILE"
           ) || { echo "Validate Dockerfile" >> /tmp/_ci_failures; exit 1; }
 
-      # Repo-provided shell unit tests, opt-in by tests/shell/run.sh. They reach
-      # the fail-CLOSED boot branches an image smoke test never takes.
+      # Repo-provided shell unit tests, opt-in by tests/shell/run.sh.
       # Presence is tested with -f and the runner invoked through `bash`, not
       # -x plus ./script: in a consumer repo a file committed 100644 would make
       # the suite skip SILENTLY and report green. Runs after the linters, so a

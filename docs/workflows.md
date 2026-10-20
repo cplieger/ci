@@ -14,12 +14,14 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | a `go.mod` in a subfolder, with tracked Go files | `go-nested` | `go-ci.yaml` once per module folder |
 | `jsr.json` at the root | `ts` | `ts-ci.yaml` |
 | a `package.json` or `jsr.json` in `static-src/`, `web/`, `internal/server/static-src/` or `internal/webui/static-src/` | `web` | `ts-ci.yaml` in the first folder found, with the CSS and HTML lints on |
-| a `Dockerfile` | `shell` | `shell-ci.yaml` |
+| a `Dockerfile`, or a root `go.mod` or `jsr.json` and a tracked `.sh` file outside `node_modules`, `vendor`, `testdata` and `dist` | `shell` | `shell-ci.yaml`, with hadolint only when there is a `Dockerfile` |
 | Go or TypeScript that deadset detects, or a root `deadset.json` naming languages, or a `go-nested` module | `deadset` | `deadset-ci.yaml` at the repository root, and once per nested module folder |
 | a `Dockerfile` | `docker`, `docker-arm64` | an image build on `amd64`, and on `arm64` in public repositories, with no push and no scan |
 | `*.py` files | `python` | Ruff |
-| shell scripts or workflow files, and no `go.mod`, `jsr.json` or `Dockerfile` | `scripts` | shellcheck, shfmt, yamllint, a TOML check, and the probe scripts present in the repository |
+| shell scripts or workflow files, and no `go.mod`, `jsr.json` or `Dockerfile` | `scripts` | shellcheck, shfmt, `tests/shell/run.sh` when the repository has one, yamllint, a TOML check, and the probe scripts present in the repository |
 | a pull request, in a repository whose default branch is `dev` | `pr-policy` | a conventional-commit check of the title, and on a pull request into `main` a check of what its head branch may change |
+
+The `shell` and `scripts` jobs never both run, so no shell script is checked twice.
 
 After the `amd64` build, the `docker` job runs two optional image tests. The shared smoke harness runs when the repository has `tests/image-smoke.conf`. A repository's own `tests/image-test.sh` runs with the image reference as its first argument, and it must be committed as executable.
 
@@ -30,7 +32,7 @@ After the `amd64` build, the `docker` job runs two optional image tests. The sha
 | `go-ci.yaml` | `go vet`, golangci-lint, `go test -race`, govulncheck, `go mod verify`, a wiregen drift check, dependency review on public pull requests |
 | `ts-ci.yaml` | `npm ci`, ESLint, `tsc`, knip for import cycles and undeclared dependencies, vitest, fast-check fuzz tests, Prettier, `package.json` and `jsr.json` version parity, a publish-surface check, dependency review |
 | `ts-ci.yaml` with `web-lint: true` | the above, plus Stylelint, html-validate and an import-map coverage check |
-| `shell-ci.yaml` | shellcheck, shfmt, hadolint, and `tests/shell/run.sh` when the repository has one |
+| `shell-ci.yaml` | shellcheck, shfmt, hadolint on the `dockerfile` input unless it is empty, and `tests/shell/run.sh` when the repository has one |
 
 With `web-lint: true`, a package that declares a `lint:web` script in `package.json` runs that script in place of Stylelint and html-validate, so a local `npm run lint:web` is the same check. The script must lint every tracked CSS file with Stylelint and the synced `.stylelintrc.json`, lint every tracked HTML file with html-validate, and exit non-zero when either fails.
 
