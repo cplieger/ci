@@ -161,9 +161,10 @@ def renovate_config_findings(text, branch):
 
 # Repos with no orchestrator relationship, so no deploy hook is graded; a
 # missing hook stays HARD everywhere else. A denylist, so a new repo that needs
-# a hook is flagged, and each entry says why it needs none: the one entry is a
-# private workspace that ships nothing.
-NO_DEPLOY_HOOK = {'AWS'}
+# a hook is flagged, and each entry says why it needs none: AWS is a private
+# workspace that ships nothing, and animap-source runs its weekly job in its own
+# Actions and deploys nothing.
+NO_DEPLOY_HOOK = {'AWS', 'animap-source'}
 # The GitHub App that must report the validate check (15368 = GitHub Actions):
 # a context open to any app (-1) or pinned to another lets an integration satisfy it.
 ACTIONS_APP_ID = 15368
