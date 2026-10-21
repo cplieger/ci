@@ -24,7 +24,7 @@ permissions:
 # from the binary other workflows install directly.
 env:
   # renovate: datasource=github-releases depName=aquasecurity/trivy
-  TRIVY_VERSION: v0.76.0
+  TRIVY_VERSION: v0.76.1
 
 jobs:
   trivy:
