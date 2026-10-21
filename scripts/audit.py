@@ -189,14 +189,7 @@ HUB_MARKER_END = '<!-- hub-overview END -->'
 
 # {repo: {warning-prefix: reason}}: matching warnings are counted, not listed.
 # Every entry needs a reason; remove it once the deviation is fixed.
-ACCEPTED = {
-    'animap': {
-        # baseline.yaml runs on every pull request and fails one that adds an
-        # entry to checks/collision-baseline.json; required, so a new
-        # collision cannot be accepted by growing the baseline.
-        "unexpected extra required check 'shrink-only'": 'the collision baseline may only shrink',
-    },
-}
+ACCEPTED: dict[str, dict[str, str]] = {}
 
 # Expected spdx_id per repo; a repo not listed is Apache-2.0.
 # Values are what GitHub's licensee reports: it cannot tell -only from
