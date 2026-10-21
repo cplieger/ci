@@ -141,7 +141,7 @@ env:
   # renovate: datasource=github-releases depName=sigstore/cosign
   COSIGN_VERSION: v3.1.4
   # renovate: datasource=github-releases depName=aquasecurity/trivy
-  TRIVY_VERSION: v0.76.0
+  TRIVY_VERSION: v0.76.1
   # Central SBOM cataloger policy: syft's sbom-cataloger is NOT in its default
   # image cataloger set, and a CycloneDX fragment embedded by a source-compiling
   # image (docker-nut-upsd) is inventoried only with it. The action spawns syft
