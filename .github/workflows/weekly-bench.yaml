@@ -344,7 +344,7 @@ jobs:
           cache: false
 
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.15"
 
@@ -618,7 +618,7 @@ jobs:
       # stryker aggregate job failed for every repo for weeks because its script
       # used 3.14 syntax that 3.12 rejects at PARSE time, so no tracker issue had
       # ever been created. Author against 3.14, pin 3.14.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.15"
 
