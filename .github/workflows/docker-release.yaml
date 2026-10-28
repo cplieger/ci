@@ -743,7 +743,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ ! -x tests/image-test.sh ]; then
-            echo "::error file=tests/image-test.sh::tests/image-test.sh is not executable; commit it as mode 100755"
+            echo "::error file=tests/image-test.sh::tests/image-test.sh is not executable. Commit it as mode 100755: git update-index --chmod=+x tests/image-test.sh"
             exit 1
           fi
           ./tests/image-test.sh "$IMAGE_REF"
