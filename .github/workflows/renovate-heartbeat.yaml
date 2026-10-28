@@ -1,0 +1,84 @@
+# Daily check that the resident Renovate deployment still opens pull requests.
+# Whatever stops it, its GitHub App then opens none in any cplieger repository;
+# scripts/renovate_heartbeat.py reads that from GitHub search. One issue in
+# docker-renovate-scheduler, the image the deployment runs, stays open while
+# the window is empty and closes on the first run that finds a pull request.
+# It cannot see a fault that only another authentication mode meets: the
+# image smoke test owns that.
+name: Renovate heartbeat
+
+on:
+  schedule:
+    - cron: "41 7 * * *"   # daily 07:41 UTC
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "Hours with no pull request from the App that open the issue."
+        type: number
+        default: 48
+
+permissions:
+  contents: read
+  # The issue write happens in docker-renovate-scheduler via the CI_SCHEDULE PAT.
+
+concurrency:
+  group: renovate-heartbeat
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the heartbeat and tracker scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/renovate_heartbeat.py
+            scripts/tracker_issue.py
+            scripts/trackerlib.py
+            scripts/ghrest.py
+          sparse-checkout-cone-mode: false
+
+      - name: Check and report
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          # Via env, never inline ${{ }} in the body (template injection).
+          HOURS: ${{ inputs.hours || 48 }}
+          # The App the resident Renovate container authenticates as.
+          AUTHOR: app/tribble-trouble
+          OWNER: cplieger
+          REPO: cplieger/docker-renovate-scheduler
+          # An alarm that needs action, so it reaches the owner as notify-failure's do.
+          ASSIGNEE: ${{ github.repository_owner }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Renovate stopped opening pull requests"
+          verdict=$(python3 scripts/renovate_heartbeat.py --author "$AUTHOR" --owner "$OWNER" \
+            --hours "$HOURS" --run-url "$RUN_URL" \
+            --body-file "$RUNNER_TEMP/body.md" --comment-file "$RUNNER_TEMP/comment.md")
+          echo "Renovate heartbeat: ${verdict}"
+          if [ "$verdict" = stalled ]; then
+            python3 scripts/tracker_issue.py --repo "$REPO" --label renovate-heartbeat \
+              --title "$title" --mode upsert --assignee "$ASSIGNEE" --body-file "$RUNNER_TEMP/body.md"
+          else
+            python3 scripts/tracker_issue.py --repo "$REPO" --label renovate-heartbeat \
+              --title "$title" --mode close-when-clean --comment-file "$RUNNER_TEMP/comment.md"
+          fi
+
+  # `needs:` must list every other job in this workflow.
+  notify:
+    needs: [check]
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
