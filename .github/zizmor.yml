@@ -35,6 +35,7 @@ rules:
       - promote.yaml
       - rebuild-stale.yaml
       - release-maintenance.yaml
+      - renovate-heartbeat.yaml
       - self-release.yaml
       - sync-hub-overviews.yaml
       - sync.yaml

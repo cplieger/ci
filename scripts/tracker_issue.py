@@ -65,6 +65,7 @@ LABELS = {
     'gremlins-tracker': ('5319e7', 'Gremlins mutation testing tracker'),
     'mutation-regression': ('b60205', 'Mutation efficacy regression'),
     'release-blocked': ('b60205', 'main has not shipped, or a fix needs a manual route'),
+    'renovate-heartbeat': ('b60205', 'The resident Renovate opened no pull request in the window'),
     'repo-audit': ('d93f0b', 'Repository governance audit findings'),
     'stryker-tracker': ('1d76db', 'Stryker mutation testing tracker'),
     'weekly-ci-failure': ('b60205', 'An unwatched CI run failed and needs triage'),
