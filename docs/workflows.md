@@ -23,7 +23,7 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 
 The `shell` and `scripts` jobs never both run, so no shell script is checked twice.
 
-After the `amd64` build, the `docker` job runs two optional image tests. The shared smoke harness runs when the repository has `tests/image-smoke.conf`. A repository's own `tests/image-test.sh` runs with the image reference as its first argument, and it must be committed as executable.
+After the `amd64` build, the `docker` job runs two optional image tests. The shared smoke harness runs when the repository has `tests/image-smoke.conf`. A repository's own `tests/image-test.sh` runs with the image reference as its first argument, and it must be committed as executable. The release workflow runs both again on every image it builds, as [the release workflow](#the-release-workflow) describes.
 
 ## The language workflows
 
@@ -77,6 +77,8 @@ A dev build is numbered as the next promotion, so a library's dev run whose code
 On the dev channel it builds the image on native `amd64` and `arm64` runners and pushes it to GitHub Container Registry. It signs the image with cosign, attaches an SBOM and runs a Trivy scan. A repository with a root `grafana-dashboard.json` also gets the dashboard pushed as an OCI artifact.
 
 On the stable channel it re-tags the image the dev channel built for that commit as `vX.Y.Z`, `vX.Y`, `vX` and `latest`. It copies the image to Docker Hub with its signatures and creates the GitHub Release with its assets, described below. When it promotes a build, the Release's SBOM is the one that build signed into the image, read only once its signature checks out. When no dev build matches, it builds from source and says so in the run summary. It also writes the Docker Hub overview page from the README.
+
+Every image it builds, on either channel, then runs the `docker` job's two image tests in an `image-test` job, against the `amd64` digest the build pushed and before anything is tagged. A failure, or a run cancelled before the tests pass, leaves that digest without a tag. A rebuild-only range relies on this: its pull request changes no file, so the `docker` job skipped it, and the base packages it refreshes are tested only here. The job has read access to packages only, so the repository's test scripts never run beside the build's write token.
 
 A stable image release carries these GitHub Release assets:
 

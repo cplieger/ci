@@ -663,14 +663,101 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # The meta ci.yaml docker job's two image tests, against the amd64 digest build
+  # pushed and before finalize tags anything, so a red test leaves it untagged.
+  # A rebuild-only range changes no file, so its pull request skipped that job,
+  # and the base packages it refreshes are tested only here. A job of its own,
+  # so the repository's test scripts run beside a read-only package token, never
+  # build's write token and OIDC authority. amd64 only, like that job.
+  image-test:
+    needs: [prepare, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && contains(needs.prepare.outputs.matrix, '"linux/amd64"') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # The tests run from the workspace root, so the ci source leaves it.
+      - name: Move the ci source out of the workspace
+        run: |
+          set -euo pipefail
+          mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
+
+      - name: Download the amd64 digest
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: digests-linux-amd64
+          path: ${{ runner.temp }}/digests
+
+      - name: Log in to GHCR
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          registry_login "$REGISTRY" "$REGISTRY_USERNAME"
+
+      - name: Resolve the image reference
+        id: image
+        run: |
+          set -euo pipefail
+          digest=$(cat "$RUNNER_TEMP/digests/linux-amd64")
+          case "$digest" in
+            sha256:*) ;;
+            *)
+              echo "::error::the amd64 digest artifact holds '${digest}', not a sha256 digest"
+              exit 1
+              ;;
+          esac
+          echo "ref=${REGISTRY}/${IMAGE_NAME}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Image smoke test
+        if: ${{ hashFiles('tests/image-smoke.sh') != '' }}
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          sh tests/image-smoke.sh "$IMAGE_REF"
+
+      # Runs after a red harness so one run reports both verdicts.
+      - name: Image test suite
+        if: ${{ !cancelled() && steps.image.outcome == 'success' && hashFiles('tests/image-test.sh') != '' }}
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ ! -x tests/image-test.sh ]; then
+            echo "::error file=tests/image-test.sh::tests/image-test.sh is not executable. Commit it as mode 100755: git update-index --chmod=+x tests/image-test.sh"
+            exit 1
+          fi
+          ./tests/image-test.sh "$IMAGE_REF"
+
   # Runs whether or not `build` did (a promotion has no build; a stable push
   # with nothing to publish still refreshes the Docker Hub description).
   finalize:
-    needs: [prepare, rebuild-gate, build]
+    needs: [prepare, rebuild-gate, build, image-test]
     # A run cancelled before build starts (while the gate builds, say) leaves build
     # skipped, not cancelled, so cancelled() names that cancel. A timed-out gate is
-    # no run cancel, so its build still publishes through here.
-    if: ${{ always() && needs.prepare.result == 'success' && needs.build.result != 'failure' && needs.build.result != 'cancelled' && (needs.build.result != 'skipped' || !cancelled()) }}
+    # no run cancel, so its build still publishes through here. image-test is
+    # skipped with no build or no amd64 leg, and by a cancel; only the cancel
+    # holds a pushed build back untested.
+    if: ${{ always() && needs.prepare.result == 'success' && needs.build.result != 'failure' && needs.build.result != 'cancelled' && (needs.build.result != 'skipped' || !cancelled()) && (needs.image-test.result == 'success' || (needs.image-test.result == 'skipped' && !cancelled())) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
