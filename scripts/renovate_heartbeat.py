@@ -97,14 +97,14 @@ def main(argv=None, client=None, now=None) -> int:
             return 0
         if recent.get('incomplete_results'):
             print(
-                f'::error::GitHub marked the search for {base} incomplete; no verdict this run',
+                f'::error::GitHub marked the search for {base} incomplete, so this run gives no verdict',
                 file=sys.stderr,
             )
             return 1
         ever = search_prs(client, base)
         if ever.get('incomplete_results') and not ever['items']:
             print(
-                f'::error::GitHub marked the search for {base} incomplete; no verdict this run',
+                f'::error::GitHub marked the search for {base} incomplete, so this run gives no verdict',
                 file=sys.stderr,
             )
             return 1
