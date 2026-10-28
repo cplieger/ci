@@ -178,6 +178,19 @@ gates["repair-call-runs-refused"] = call_runs(True, {"caller"})
 gates["release-call-runs-refused"] = call_runs(False, {"caller"})
 gates["sarif-if"] = step_if("finalize", "Upload Trivy SARIF")
 gates["build-steps"] = names("build")
+it = jobs["image-test"]
+it_step = {s.get("name"): s for s in it["steps"]}
+gates["image-test"] = {
+    "needs": it["needs"],
+    "if": " ".join(str(it["if"]).split()),
+    "permissions": it["permissions"],
+    "steps": names("image-test"),
+    "download": it_step["Download the amd64 digest"]["with"],
+    "upload-name": next(s for s in jobs["build"]["steps"] if s.get("name") == "Upload digest")["with"]["name"],
+    **{n: {"if": str(it_step[n].get("if", "")), "ref": it_step[n]["env"]["IMAGE_REF"], "run": it_step[n]["run"]}
+       for n in ("Image smoke test", "Image test suite")},
+}
+open(f"{out}/image-ref.sh", "w").write(it_step["Resolve the image reference"]["run"])
 # Every registry login on the release path, both workflows.
 logins = []
 for wname, wjobs in (("docker-release", jobs), ("release", rjobs)):
@@ -265,10 +278,14 @@ gates["finalize-runs"] = {
         ("cancel-in-gate", {"rebuild-gate": "cancelled", "build": "skipped"}, True),
         ("gate-timeout", {"rebuild-gate": "cancelled", "build": "success"}, False),
         ("gate-failure", {"rebuild-gate": "failure", "build": "success"}, False),
-        ("skip", {"build": "skipped"}, False),
-        ("no-gate", {"rebuild-gate": "skipped", "build": "skipped"}, False),
-        ("cancel-in-build", {"build": "cancelled"}, True),
-        ("cancel-after-build", {}, True),
+        ("skip", {"build": "skipped", "image-test": "skipped"}, False),
+        ("no-gate", {"rebuild-gate": "skipped", "build": "skipped", "image-test": "skipped"}, False),
+        ("cancel-in-build", {"build": "cancelled", "image-test": "skipped"}, True),
+        ("cancel-after-build", {"image-test": "skipped"}, True),
+        ("cancel-in-tests", {"image-test": "cancelled"}, True),
+        ("cancel-after-tests", {}, True),
+        ("red-tests", {"image-test": "failure"}, False),
+        ("no-amd64-leg", {"image-test": "skipped"}, False),
     )
 }
 json.dump(gates, open(f"{out}/gates.json", "w"))
@@ -1198,10 +1215,10 @@ chk "D-RG21 a gate that did not run, or found a change, publishes" "$(pcase true
 chk "D-RG21 nothing due publishes nothing" "$(pcase false/)" "false|false|false"
 chk "D-RG22 verify-publish waits for the gate and skips on its skip" \
   "$(gate '."vp-needs" | join(",")')|$(gate '."vp-if"' | grep -c "needs.rebuild-gate.outputs.skip != 'true'")" "prepare,rebuild-gate,finalize|1"
-chk "D-RG22 finalize waits for it too" "$(gate '."finalize-needs" | join(",")')" "prepare,rebuild-gate,build"
-chk "D-RG29 a run cancelled while the gate builds starts no finalize, a timed-out or failed gate still publishes" \
+chk "D-RG22 finalize waits for it too, and for the image tests" "$(gate '."finalize-needs" | join(",")')" "prepare,rebuild-gate,build,image-test"
+chk "D-RG29 a run cancelled while the gate builds, or before its image tests pass, starts no finalize; a timed-out or failed gate still publishes" \
   "$(gate '."finalize-runs" | to_entries | map("\(.key)=\(.value)") | join(" ")')" \
-  "cancel-in-gate=false gate-timeout=true gate-failure=true skip=true no-gate=true cancel-in-build=false cancel-after-build=true"
+  "cancel-in-gate=false gate-timeout=true gate-failure=true skip=true no-gate=true cancel-in-build=false cancel-after-build=false cancel-in-tests=false cancel-after-tests=true red-tests=false no-amd64-leg=true"
 chk "D-RG23 the gate holds read access alone and logs in nowhere" \
   "$(gate '.gate.permissions | tojson')|$(gate '[.gate.steps[] | select(.name | startswith("Log in to"))] | length')" '{"contents":"read"}|0'
 chk "D-RG23 its build loads the image into the runner and pushes nothing" \
@@ -2265,8 +2282,8 @@ login() { # <tag> <registry env> -> runs the extracted login step; prints its ou
   (PATH="$LBIN:$PATH" CI_TOOLS="$ROOT/scripts" REGISTRY="$2" REGISTRY_USERNAME=probe-user \
     REGISTRY_PASSWORD=probe-secret bash "$WORK/login-$1.sh" 2>&1) || echo "EXIT=$?"
 }
-chk "D-L1 the release path logs in at four sites" "$(gate '.logins | join(" ")')" \
-  "docker-release-build-ghcr docker-release-finalize-ghcr docker-release-finalize-hub release-renumber-tag-ghcr"
+chk "D-L1 the release path logs in at five sites" "$(gate '.logins | join(" ")')" \
+  "docker-release-build-ghcr docker-release-image-test-ghcr docker-release-finalize-ghcr docker-release-finalize-hub release-renumber-tag-ghcr"
 chk "D-L1 and no workflow uses a login action" \
   "$(grep -c 'docker/login-action' "$WORKFLOW" "$RELEASE_YAML" | awk -F: '{ s += $2 } END { print s }')" "0"
 for tag in $(gate '.logins[]'); do
@@ -2292,6 +2309,35 @@ chk "D-L5 the build job moves the ci source out of the build context before buil
   "$(gate '."build-steps" | (index("Move the ci source out of the build context") < index("Build and push by digest")) and (index("Check out the ci source") < index("Log in to GHCR"))')" "true"
 chk "D-L6 the SARIF upload runs only when the scan wrote its file" "$(gate '."sarif-if"')" \
   "\${{ always() && env.PUBLISH == 'true' && hashFiles('trivy-image.sarif') != '' }}"
+# ── image-test: the consumer's image tests, on the pushed amd64 digest ───────
+chk "D-IT1 image-test follows a successful build that has an amd64 leg" \
+  "$(gate '."image-test".needs | join(",")')|$(gate '."image-test".if')" \
+  "prepare,build|\${{ !cancelled() && needs.build.result == 'success' && contains(needs.prepare.outputs.matrix, '\"linux/amd64\"') }}"
+chk "D-IT2 it holds read access alone, so the tests never run beside a write token or OIDC" \
+  "$(gate '."image-test".permissions | tojson')" '{"contents":"read","packages":"read"}'
+chk "D-IT3 it checks out, moves the ci source out, then logs in before resolving and testing" \
+  "$(gate '."image-test".steps | join("|")')" \
+  "Checkout|Check out the ci source|Move the ci source out of the workspace|Download the amd64 digest|Log in to GHCR|Resolve the image reference|Image smoke test|Image test suite"
+chk "D-IT4 it reads the digest artifact the amd64 build leg uploads" \
+  "$(gate '."image-test".download.name')|$(gate '."image-test"."upload-name"')|$(printf 'linux/amd64' | sed 's|/|-|g')" \
+  "digests-linux-amd64|digests-\${{ matrix.name }}|linux-amd64"
+mkdir -p "$WORK/it/digests"
+printf 'sha256:%064d\n' 7 >"$WORK/it/digests/linux-amd64"
+: >"$WORK/it/out"
+(RUNNER_TEMP="$WORK/it" GITHUB_OUTPUT="$WORK/it/out" REGISTRY=ghcr.io IMAGE_NAME=probe/app bash "$WORK/image-ref.sh")
+chk "D-IT5 the reference names the registry, the image and the pushed digest" "$(cat "$WORK/it/out")" \
+  "ref=ghcr.io/probe/app@sha256:$(printf '%064d' 7)"
+printf 'not-a-digest\n' >"$WORK/it/digests/linux-amd64"
+out_it=$( (RUNNER_TEMP="$WORK/it" GITHUB_OUTPUT="$WORK/it/out2" REGISTRY=ghcr.io IMAGE_NAME=probe/app bash "$WORK/image-ref.sh" 2>&1) || echo "EXIT=$?")
+chk_has "D-IT5 an artifact that holds no digest fails the job" "$out_it" "EXIT=1"
+chk "D-IT6 both tests take that reference" \
+  "$(gate '."image-test"."Image smoke test".ref')|$(gate '."image-test"."Image test suite".ref')" \
+  "\${{ steps.image.outputs.ref }}|\${{ steps.image.outputs.ref }}"
+chk "D-IT6 the harness runs when the repository has it; the suite also after a red harness" \
+  "$(gate '."image-test"."Image smoke test".if')|$(gate '."image-test"."Image test suite".if')" \
+  "\${{ hashFiles('tests/image-smoke.sh') != '' }}|\${{ !cancelled() && steps.image.outcome == 'success' && hashFiles('tests/image-test.sh') != '' }}"
+chk_has "D-IT6 the harness is run through sh" "$(gate '."image-test"."Image smoke test".run')" 'sh tests/image-smoke.sh "$IMAGE_REF"'
+chk_has "D-IT6 the suite is executed directly" "$(gate '."image-test"."Image test suite".run')" './tests/image-test.sh "$IMAGE_REF"'
 
 # ── verify-publish: every registry written serves this run's digest ──────────
 # Stub curl: a token request (-o) gets a token; a manifest HEAD (-I) answers
