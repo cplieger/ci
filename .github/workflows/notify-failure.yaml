@@ -139,6 +139,12 @@ jobs:
           # timed from when it started rather than from the first attempt.
           started=$(gh api "repos/${GH_REPO}/actions/runs/${RUN_ID}" --jq '.run_started_at')
           minutes=$(( ( $(date -u +%s) - $(date -u -d "$started" +%s) ) / 60 ))
+          # GitHub has stamped run_started_at an hour past the runner's clock
+          # (run 41288831230), which made a negative duration.
+          duration="${minutes} min"
+          if [ "$minutes" -lt 0 ]; then
+            duration='duration unknown'
+          fi
 
           full_scope=false
           [ -z "$SCOPE" ] && full_scope=true
@@ -196,7 +202,7 @@ jobs:
           esac
           scope_line="full scope"
           [ -n "$SCOPE" ] && scope_line="scoped to: ${SCOPE}"
-          context=$(printf '%s run on %s, %s, %d min' "$when" "${GITHUB_REF_NAME}" "$scope_line" "$minutes")
+          context=$(printf '%s run on %s, %s, %s' "$when" "${GITHUB_REF_NAME}" "$scope_line" "$duration")
 
           if [ -z "$red" ]; then
             if [ "$closes_on_green" = true ]; then

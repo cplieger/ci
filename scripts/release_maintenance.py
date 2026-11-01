@@ -1333,13 +1333,13 @@ def sync_issue(repo: str, row: dict, run_url: str, tracker, work: Path) -> str:
     existing = current.read_text()
     body = issue_body(row['blockers'], existing, unread)
     title = issue_title(body)
-    if body == existing and title == current_title.read_text():
-        return 'unchanged'
+    unchanged = body == existing and title == current_title.read_text()
     new = work / f'{repo}.body.md'
     new.write_text(body)
+    # Called even when unchanged: upsert is what closes a duplicate issue.
     if tracker([*common, '--title', title, '--mode', 'upsert', '--body-file', str(new)]) != 0:
         return 'failed: upsert'
-    return 'opened or updated'
+    return 'unchanged' if unchanged else 'opened or updated'
 
 
 def cell(text: str) -> str:

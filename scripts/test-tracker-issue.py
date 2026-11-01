@@ -616,20 +616,101 @@ class TrackerIssueTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.last('PATCH issue')['body'], {'body': '# new body\n'})
 
-    def test_any_title_with_two_issues_under_the_label_writes_nothing(self) -> None:
+    def test_any_title_upsert_keeps_the_oldest_and_closes_the_newer_as_duplicates(self) -> None:
+        # The listing is newest first, as GitHub returns it.
+        twins = [{**TRACKER_ISSUE, 'number': n, 'title': 'Another'} for n in (44, 43)]
+        proc = self.run_tracker(
+            {'open_issues': [*twins, TRACKER_ISSUE]},
+            *self.tracker_args('--any-title', '--mode', 'upsert', '--body-file', str(self.body)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        writes = [(c['op'], c['path'], c['body']) for c in self.calls() if c['op'] in WRITES]
+        self.assertEqual(
+            writes,
+            [
+                ('PATCH issue', 'repos/cplieger/x/issues/42', {'body': '# new body\n'}),
+                (
+                    'POST comment',
+                    'repos/cplieger/x/issues/43/comments',
+                    {'body': 'Duplicate of #42.\n'},
+                ),
+                (
+                    'PATCH issue',
+                    'repos/cplieger/x/issues/43',
+                    {'state': 'closed', 'state_reason': 'duplicate'},
+                ),
+                (
+                    'POST comment',
+                    'repos/cplieger/x/issues/44/comments',
+                    {'body': 'Duplicate of #42.\n'},
+                ),
+                (
+                    'PATCH issue',
+                    'repos/cplieger/x/issues/44',
+                    {'state': 'closed', 'state_reason': 'duplicate'},
+                ),
+            ],
+        )
+
+    def test_any_title_upsert_of_an_unchanged_issue_still_closes_its_duplicates(self) -> None:
+        current = {**TRACKER_ISSUE, 'body': '# new body\n'}
+        twin = {**current, 'number': 43}
+        proc = self.run_tracker(
+            {'open_issues': [twin, current]},
+            *self.tracker_args('--any-title', '--mode', 'upsert', '--body-file', str(self.body)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('unchanged #42', proc.stdout)
+        self.assertEqual(
+            [(c['op'], c['path']) for c in self.calls() if c['op'] in WRITES],
+            [
+                ('POST comment', 'repos/cplieger/x/issues/43/comments'),
+                ('PATCH issue', 'repos/cplieger/x/issues/43'),
+            ],
+        )
+
+    def test_any_title_fetch_reads_the_oldest_and_only_warns_about_duplicates(self) -> None:
+        twin = {**TRACKER_ISSUE, 'number': 43, 'body': 'twin body', 'title': 'Another'}
+        body, title = self.tmp / 'existing.md', self.tmp / 'title.txt'
+        proc = self.run_tracker(
+            {'open_issues': [twin, TRACKER_ISSUE]},
+            *('--label', 'gremlins-tracker', '--any-title'),
+            *('--mode', 'fetch', '--body-file', str(body), '--title-file', str(title)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            (body.read_text(), title.read_text()),
+            (TRACKER_ISSUE['body'], TRACKER_ISSUE['title']),
+        )
+        self.assertIn('::warning::cplieger/x#43 duplicates #42', proc.stdout)
+        self.assertEqual(self.writes(), [])
+
+    def test_any_title_close_when_clean_closes_every_issue_under_the_label(self) -> None:
         twin = {**TRACKER_ISSUE, 'number': 43, 'title': 'Another'}
-        for mode in (
-            ('--mode', 'upsert', '--body-file', str(self.body)),
-            ('--mode', 'close-when-clean', '--comment-file', str(self.comment)),
-        ):
-            with self.subTest(mode=mode[1]):
-                proc = self.run_tracker(
-                    {'open_issues': [TRACKER_ISSUE, twin]},
-                    *self.tracker_args('--any-title', *mode),
-                )
-                self.assertEqual(proc.returncode, 1, proc.stderr)
-                self.assertIn('#42, #43', proc.stderr)
-                self.assertEqual(self.writes(), [])
+        proc = self.run_tracker(
+            {'open_issues': [twin, TRACKER_ISSUE]},
+            *('--label', 'gremlins-tracker', '--any-title'),
+            *('--mode', 'close-when-clean', '--comment-file', str(self.comment)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        closes = [c for c in self.calls() if c['op'] == 'PATCH issue']
+        self.assertEqual(
+            [(c['path'], c['body']['state_reason']) for c in closes],
+            [
+                ('repos/cplieger/x/issues/42', 'completed'),
+                ('repos/cplieger/x/issues/43', 'completed'),
+            ],
+        )
+
+    def test_upsert_of_an_unchanged_issue_writes_nothing(self) -> None:
+        current = {**TRACKER_ISSUE, 'body': '# new body\n'}
+        proc = self.run_tracker(
+            {'open_issues': [current]},
+            *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('unchanged #42', proc.stdout)
+        self.assertEqual(self.writes(), [])
 
     def test_any_title_fetch_and_close_need_no_title(self) -> None:
         other = {**TRACKER_ISSUE, 'title': 'An older wording'}
@@ -956,6 +1037,15 @@ class GatePolicyTest(unittest.TestCase):
         proc = self.run_gate(event='schedule', jobs=FAILED_JOBS, minutes_ago=5)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.tracker_mode(), 'recur')
+
+    def test_a_start_stamped_after_the_runner_clock_reads_duration_unknown(self) -> None:
+        proc = self.run_gate(event='schedule', jobs=FAILED_JOBS, minutes_ago=-60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        comment = Path(self.tracker_flag('--comment-file')).read_text()
+        self.assertIn('Context: scheduled run on main, full scope, duration unknown\n', comment)
+        proc = self.run_gate(event='schedule', jobs=FAILED_JOBS, minutes_ago=5)
+        comment = Path(self.tracker_flag('--comment-file')).read_text()
+        self.assertIn('Context: scheduled run on main, full scope, 5 min\n', comment)
 
     def test_schedule_green_closes(self) -> None:
         proc = self.run_gate(event='schedule', jobs=SUCCESS_JOBS, minutes_ago=5)

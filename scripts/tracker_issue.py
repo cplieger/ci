@@ -33,8 +33,10 @@ Modes (`--mode`):
 its identity, so the label is not part of the match). With `--any-title` the
 label alone identifies the issue, for a writer that keeps one issue per repo
 and words its title from what the issue holds: only `upsert` then takes
---title, which it also sets on the open issue, `fetch --title-file` writes the
-current title, and more than one open issue under the label is an error.
+--title, which it also sets on the open issue, and `fetch --title-file` writes the
+current title. Under `--any-title` the oldest open issue is the one: `upsert`
+closes any newer ones as its duplicates, and `close-when-clean` closes them all.
+`upsert` writes nothing when the body and title already match.
 After `upsert` or `recur`, `--flag-label NAME --flag on|off` adds or removes
 NAME on the issue.
 `--assignee LOGIN` assigns LOGIN on a created issue and on an open one that
@@ -121,20 +123,25 @@ def find_open(repo: str, title: str, label: str = '') -> dict | None:
     return None
 
 
-def find_by_label(repo: str, label: str) -> dict | None:
-    """The one open issue under `label`, whatever its title; GhError when there are
-    several, since editing either could leave the other stale."""
-    issues = open_issues(repo, label)
-    if len(issues) > 1:
-        numbers = ', '.join(f'#{issue["number"]}' for issue in issues)
-        raise GhError(f'more than one open issue carries {label}: {numbers}')
-    return issues[0] if issues else None
+def find_by_label(repo: str, label: str) -> tuple[dict | None, list[dict]]:
+    """The oldest open issue under `label`, whatever its title, and the newer ones.
+    A newer one is a duplicate: a listing that came back empty while the issue
+    existed (GitHub outage, 2026-10-22) let an upsert create it."""
+    issues = sorted(open_issues(repo, label), key=lambda issue: issue['number'])
+    return (issues[0] if issues else None), issues[1:]
 
 
-def find_issue(args: argparse.Namespace) -> dict | None:
+def find_issue(args: argparse.Namespace) -> tuple[dict | None, list[dict]]:
+    """The issue the mode acts on, and the duplicates of it (only under --any-title)."""
     if args.any_title:
         return find_by_label(args.repo, args.label)
-    return find_open(args.repo, args.title, label=args.label)
+    return find_open(args.repo, args.title, label=args.label), []
+
+
+def close_issue(repo: str, number: int, comment: str, reason: str) -> None:
+    path = f'repos/{repo}/issues/{number}'
+    api('POST', f'{path}/comments', {'body': comment})
+    api('PATCH', path, {'state': 'closed', 'state_reason': reason})
 
 
 def label_names(issue: dict) -> set[str]:
@@ -200,28 +207,38 @@ def create_labels(args: argparse.Namespace) -> list[str]:
 
 
 def mode_fetch(args: argparse.Namespace) -> int:
-    issue = find_issue(args)
+    issue, duplicates = find_issue(args)
     args.body_file.write_text((issue.get('body') or '') if issue else '')
     if args.title_file:
         args.title_file.write_text((issue.get('title') or '') if issue else '')
     print(f'fetched #{issue["number"]}' if issue else 'no open issue to fetch')
+    for dup in duplicates:
+        print(f'::warning::{args.repo}#{dup["number"]} duplicates #{issue["number"]}')
     return 0
 
 
 def mode_upsert(args: argparse.Namespace) -> int:
-    issue = find_issue(args)
+    issue, duplicates = find_issue(args)
     if issue:
         number, current = issue['number'], label_names(issue)
-        edit = {'body': args.body_file.read_text()}
+        edit = {}
+        if (issue.get('body') or '') != (body := args.body_file.read_text()):
+            edit['body'] = body
         if issue.get('title') != args.title:
             edit['title'] = args.title
-        api('PATCH', f'repos/{args.repo}/issues/{number}', edit)
-        print(f'updated #{number} in {args.repo}')
+        if edit:
+            api('PATCH', f'repos/{args.repo}/issues/{number}', edit)
+            print(f'updated #{number} in {args.repo}')
+        else:
+            print(f'unchanged #{number} in {args.repo}')
         ensure_assignee(args.repo, issue, args.assignee)
     else:
         labels = create_labels(args)
         number = create(args.repo, args.title, labels, args.body_file, args.assignee)
         current = set(labels)
+    for dup in duplicates:
+        close_issue(args.repo, dup['number'], f'Duplicate of #{number}.\n', 'duplicate')
+        print(f'closed #{dup["number"]} in {args.repo} as a duplicate of #{number}')
     if args.flag_label:
         set_flag(args.repo, number, current, args.flag_label, args.flag)
     return 0
@@ -248,14 +265,13 @@ def mode_recur(args: argparse.Namespace) -> int:
 
 
 def mode_close_when_clean(args: argparse.Namespace) -> int:
-    issue = find_issue(args)
+    issue, duplicates = find_issue(args)
     if not issue:
         print(f'no open issue to close in {args.repo}: {args.title or args.label}')
         return 0
-    path = f'repos/{args.repo}/issues/{issue["number"]}'
-    api('POST', f'{path}/comments', {'body': args.comment_file.read_text()})
-    api('PATCH', path, {'state': 'closed', 'state_reason': 'completed'})
-    print(f'closed #{issue["number"]} in {args.repo}')
+    for each in (issue, *duplicates):
+        close_issue(args.repo, each['number'], args.comment_file.read_text(), 'completed')
+        print(f'closed #{each["number"]} in {args.repo}')
     return 0
 
 
