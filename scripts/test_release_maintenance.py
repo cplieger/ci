@@ -1822,7 +1822,7 @@ class Issue(unittest.TestCase):
         self.assertTrue(self.written.endswith('## Free-form notes\n\nwaiting on upstream\n'))
         self.assertTrue(self.written.startswith('<!-- release-blocked -->\n'))
 
-    def test_a_new_issue_gets_plain_default_notes_and_an_unchanged_body_is_not_rewritten(self):
+    def test_a_new_issue_gets_plain_default_notes_and_an_unchanged_body_still_upserts(self):
         rm.sync_issue(R, self.row(late=['l1']), 'RUN', self.tracker, self.work)
         self.assertTrue(self.written.endswith(f'## Free-form notes\n\n{rm.NOTES_DEFAULT}\n'))
         self.assertEqual(self.title, 'Pull request into main not shipped')
@@ -1830,7 +1830,9 @@ class Issue(unittest.TestCase):
         self.assertEqual(
             rm.sync_issue(R, self.row(late=['l1']), 'RUN', self.tracker, self.work), 'unchanged'
         )
-        self.assertEqual(self.modes(), ['fetch'])
+        # The upsert writes nothing for an unchanged issue but closes any duplicate.
+        self.assertEqual(self.modes(), ['fetch', 'upsert'])
+        self.assertEqual(self.written, self.existing)
 
     def test_an_unchanged_body_under_an_outdated_title_is_retitled(self):
         rm.sync_issue(R, self.row(unrouted=['u1']), 'RUN', self.tracker, self.work)
