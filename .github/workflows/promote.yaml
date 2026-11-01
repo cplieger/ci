@@ -24,6 +24,10 @@ on:
         description: "Run every check and render the preview, but do not move main."
         type: boolean
         default: false
+      accept_vulnerabilities:
+        description: "Vulnerability IDs, comma separated, the image check lets through because no rebuild here can fix them (a base image's payload). Every other fixable finding still refuses."
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -114,7 +118,7 @@ jobs:
           set -euo pipefail
           python3 scripts/promote.py --work-dir "$RUNNER_TEMP/promote" preview --repo "$REPO" --target "$TARGET" --main "$MAIN"
 
-  # Invariant: apply reads needs.snapshot.outputs and inputs.dry_run only, and
+  # Invariant: apply reads needs.snapshot.outputs and dispatch inputs only, and
   # restores nothing preview wrote; preview is in `needs` for ordering.
   apply:
     needs: [snapshot, preview]
@@ -167,11 +171,13 @@ jobs:
           TARGET: ${{ needs.snapshot.outputs.target }}
           MAIN: ${{ needs.snapshot.outputs.main }}
           DRY_RUN: ${{ inputs.dry_run }}
+          ACCEPT_VULNERABILITIES: ${{ inputs.accept_vulnerabilities }}
         run: |
           set -euo pipefail
           export TRIVY_BIN="$RUNNER_TEMP/bin/trivy" TRIVY_CACHE_DIR="$RUNNER_TEMP/trivy-cache"
           args=(--repo "$REPO" --target "$TARGET" --main "$MAIN" --plan-file "$RUNNER_TEMP/plan.json")
           [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
+          args+=(--accept-vulnerabilities "$ACCEPT_VULNERABILITIES")
           python3 scripts/promote.py --work-dir "$RUNNER_TEMP/promote" check "${args[@]}"
 
       - name: Create R

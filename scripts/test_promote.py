@@ -525,7 +525,8 @@ class Checks(unittest.TestCase):
             finally:
                 for p in patches:
                     p.stop()
-        return rc, (json.loads(plan.read_text()) if plan.exists() else None), summary.read_text()
+        written = summary.read_text() if summary.exists() else ''
+        return rc, (json.loads(plan.read_text()) if plan.exists() else None), written
 
     def test_every_check_passing_plans_r_from_exactly_m_and_t(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -540,6 +541,36 @@ class Checks(unittest.TestCase):
         self.assertEqual(plan['tree'], tree)
         self.assertEqual(plan['message'], promote.RECONCILIATION_SUBJECT + '\n')
         self.assertIn('Dry run: main is not moved.', summary)
+
+    def test_accepted_ids_reach_the_checks_and_the_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m, t = go_repo(fx)
+            fx.publish()
+            seen = {}
+
+            def checks(*args, accepted=frozenset(), **kwargs):
+                seen['accepted'] = accepted
+                return [], ''
+
+            with unittest.mock.patch.object(promote, 'run_checks', side_effect=checks):
+                rc, _, summary = self.run_check(
+                    fx, m, t, extra=['--accept-vulnerabilities', 'CVE-2026-1, GHSA-x1y2-z3w4-v5u6']
+                )
+        self.assertEqual(rc, 0, summary)
+        self.assertEqual(seen['accepted'], {'CVE-2026-1', 'GHSA-x1y2-z3w4-v5u6'})
+        self.assertIn('Accepted without a fix here: CVE-2026-1, GHSA-x1y2-z3w4-v5u6.', summary)
+
+    def test_a_malformed_accepted_id_is_a_usage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m, t = go_repo(fx)
+            fx.publish()
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc, plan, _ = self.run_check(fx, m, t, extra=['--accept-vulnerabilities', '$(x)'])
+        self.assertEqual((rc, plan), (2, None))
+        self.assertIn('not a vulnerability ID: $(x)', err.getvalue())
 
     def test_main_moved_since_the_snapshot_is_refused_before_any_check(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -695,7 +726,7 @@ class Checks(unittest.TestCase):
             fx.publish()
             seen = {}
 
-            def vulns(clone, repo, main, digest):
+            def vulns(clone, repo, main, digest, accepted):
                 seen['vulns'] = (repo, main, digest)
                 return []
 
@@ -844,7 +875,7 @@ class RetainedDigest(unittest.TestCase):
 
 
 class Vulnerabilities(unittest.TestCase):
-    def run_vulns(self, ours, theirs, findings, *, tag='v1.0.0'):
+    def run_vulns(self, ours, theirs, findings, *, tag='v1.0.0', accepted=frozenset()):
         with tempfile.TemporaryDirectory() as tmp:
             fx = Fixture(tmp)
             m = fx.commit('feat: init', {'Dockerfile': 'FROM scratch\n'})
@@ -870,7 +901,19 @@ class Vulnerabilities(unittest.TestCase):
                 unittest.mock.patch.object(promote, 'platforms', side_effect=platforms),
                 unittest.mock.patch.object(promote, 'trivy_findings', side_effect=scan),
             ):
-                return promote.check_vulnerabilities(fx.src, 'demo', m, DIGEST), refs
+                return promote.check_vulnerabilities(fx.src, 'demo', m, DIGEST, accepted), refs
+
+    def test_an_accepted_id_passes_and_every_other_new_finding_still_refuses(self):
+        findings = {'t': {('CVE-1', 'undici'), ('CVE-2', 'zlib')}, 'm': set()}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            got, _ = self.run_vulns(
+                {'linux/amd64': 't'}, {'linux/amd64': 'm'}, findings, accepted=frozenset({'CVE-1'})
+            )
+        self.assertEqual(len(got), 1, got)
+        self.assertIn('CVE-2 in zlib', got[0])
+        self.assertIn('accept_vulnerabilities naming it', got[0])
+        self.assertIn('CVE-1 in undici accepted', out.getvalue())
 
     def test_a_fixable_finding_main_lacks_is_refused_per_platform(self):
         ours = {'linux/amd64': 't-amd', 'linux/arm64': 't-arm'}
@@ -1404,12 +1447,15 @@ class Workflow(unittest.TestCase):
     doc = yaml.safe_load((ROOT / '.github/workflows/promote.yaml').read_text())
     text = (ROOT / '.github/workflows/promote.yaml').read_text()
 
-    def test_manual_only_with_three_inputs(self):
+    def test_manual_only_with_four_inputs(self):
         on = self.doc[True]
         self.assertEqual(list(on), ['workflow_dispatch'])
-        self.assertEqual(list(on['workflow_dispatch']['inputs']), ['repo', 'target', 'dry_run'])
+        self.assertEqual(
+            list(on['workflow_dispatch']['inputs']),
+            ['repo', 'target', 'dry_run', 'accept_vulnerabilities'],
+        )
 
-    def test_apply_reads_only_snapshot_outputs_and_the_dry_run_input(self):
+    def test_apply_reads_only_snapshot_outputs_and_dispatch_inputs(self):
         apply = self.doc['jobs']['apply']
         body = json.dumps(apply)
         self.assertNotIn('needs.preview', body)
@@ -1420,6 +1466,7 @@ class Workflow(unittest.TestCase):
             'secrets.PROMOTE_PAT',
             'inputs.dry_run',
             '!inputs.dry_run',
+            'inputs.accept_vulnerabilities',
             'env.COSIGN_VERSION',
             "!cancelled() && needs.snapshot.result == 'success'",
             'needs.snapshot.outputs.repo',
