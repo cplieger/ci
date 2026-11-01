@@ -64,8 +64,6 @@ esac
 exit 0
 """
 
-PATCH_STUB = 'print("stub patch applied")\n'
-
 
 def workflow_step(path: Path, job: str, name: str) -> dict:
     for step in yaml.safe_load(path.read_text())['jobs'][job]['steps']:
@@ -163,9 +161,6 @@ class RunStryker(Harness):
 
     def setUp(self):
         super().setUp()
-        scripts = self.workspace / 'scripts'
-        scripts.mkdir()
-        (scripts / 'patch-vitest-runner-separator.py').write_text(PATCH_STUB)
         bin_dir = self.pkg / 'node_modules' / '.bin'
         bin_dir.mkdir(parents=True)
         write_exec(bin_dir / 'stryker', STRYKER_STUB)

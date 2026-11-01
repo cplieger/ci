@@ -44,9 +44,6 @@ jobs:
       - name: Probe gremlins measurement scripts
         run: python3 scripts/test-gremlins-scripts.py
 
-      - name: Probe the vitest-runner separator stopgap
-        run: python3 scripts/test-patch-vitest-runner-separator.py
-
       - name: Probe stryker aggregate artifact discovery
         run: python3 scripts/test-stryker-aggregate.py
 

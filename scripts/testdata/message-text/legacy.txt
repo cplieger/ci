@@ -39,7 +39,6 @@ every major — drop the suffix
 exactly {\"weekly\": false}; mutation-testing the dir
 failed for {p.tag}; STOPPING. Restore with:
 failed for {p.tag}; aborting before any
-fixed it — delete the stopgap
 for ${repo} — continuing
 for ${r} — dropping it from
 for run ${RUN_ID}; not touching the
@@ -83,7 +82,6 @@ path element — a sentinel/local module,
 produced no output; the compiler could
 published manifest — dropped from significance
 readable in '${meta}'; that artifact is
-refused to apply; upstream probably fixed
 repo (want main; {s["name"]} publishes from
 repo cannot self-approve; every PR blocks
 repo discovery failed; refusing to report
