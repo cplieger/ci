@@ -1044,6 +1044,7 @@ class GatePolicyTest(unittest.TestCase):
         comment = Path(self.tracker_flag('--comment-file')).read_text()
         self.assertIn('Context: scheduled run on main, full scope, duration unknown\n', comment)
         proc = self.run_gate(event='schedule', jobs=FAILED_JOBS, minutes_ago=5)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         comment = Path(self.tracker_flag('--comment-file')).read_text()
         self.assertIn('Context: scheduled run on main, full scope, 5 min\n', comment)
 
