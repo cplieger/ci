@@ -126,7 +126,6 @@ EXCLUDE_PATTERNS=(
   '(^|/)\.codeql-suppressions\.yaml$'
   '(^|/)\.trivyignore$'
   '(^|/)\.syft\.yaml$'
-  '(^|/)socket\.ya?ml$'
   '^\.github/'
 
   # Test-only inputs read by a test, never by shipped code: deadset-ts's
