@@ -107,12 +107,12 @@ In a repository whose default branch is `dev`, human work merges into `dev`, and
 
 A collapsed Dependencies block follows. It lists what changed in `go.mod`, `package-lock.json`, `uv.lock`, Dockerfile `FROM` lines and pinned versions, and marks updates from a Renovate security pull request. An image release ends with a System packages block from the two signed SBOMs.
 
-`promote.yaml` in this repository promotes a chosen `dev` commit to `main`, on demand only. Its inputs are `repo`, `target` and `dry_run`, and `target` defaults to the head of `dev`. It refuses the promotion unless all five checks pass:
+`promote.yaml` in this repository promotes a chosen `dev` commit to `main`, on demand only. Its inputs are `repo`, `target`, `dry_run` and `accept_vulnerabilities`, and `target` defaults to the head of `dev`. It refuses the promotion unless all five checks pass:
 
 - The commit pins no first-party dependency at a `-dev.` version.
 - Each image lane still has a signed `dev` image on GitHub Container Registry, built from that commit or from an ancestor with no shipped change since.
 - Every file that changed on `main` since the branches split is a dependency file or a synced file. The commit has each dependency at the same version, a newer one or none, and each synced file equal to `main`'s copy or the current one here.
-- The commit's image publishes every platform the image of `main` publishes, and has no fixable `HIGH` or `CRITICAL` finding, on any platform, that the image of `main` lacks.
+- The commit's image publishes every platform the image of `main` publishes, and has no fixable `HIGH` or `CRITICAL` finding, on any platform, that the image of `main` lacks. A finding whose ID is listed in `accept_vulnerabilities` passes this check: use it when no rebuild here can fix the finding, such as a package inside a base image, and the run summary names each accepted ID.
 - The commit's tree differs from `main`'s.
 
 A promotion that changes no path any lane ships still moves `main`. Its preview names the version each lane will publish, or says the lane has no release. The preview starts once every release run of `main`'s head has finished, so it counts the tags those runs create. The promotion waits up to 45 minutes for them, then stops and asks for a rerun. On `main`, an empty rebuild commit counts as a change only when it was merged into `main` itself, not when a promotion brings in one from `dev`.

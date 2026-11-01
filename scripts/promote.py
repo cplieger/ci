@@ -61,6 +61,7 @@ RECEIPT_RUN_URL_RE = re.compile(
 )
 REPO_RE = re.compile(r'^[A-Za-z0-9._-]+$')
 FULL_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
+VULN_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]*$')
 TARGET_RE = re.compile(r'^[0-9a-f]{7,40}$')
 MAIN_RUN_POLL_SECONDS = 30
 MAIN_RUN_WAIT_SECONDS = 45 * 60
@@ -718,7 +719,11 @@ def stable_image(clone: Path, repo: str, tag: str, token: str) -> tuple[str, str
     return '', '', ''
 
 
-def check_vulnerabilities(clone: Path, repo: str, main: str, digest: str) -> list[str]:
+def check_vulnerabilities(
+    clone: Path, repo: str, main: str, digest: str, accepted: frozenset[str] = frozenset()
+) -> list[str]:
+    """Refusals for each fixable finding the dev image adds over main's stable image; an
+    `accepted` ID is printed instead, for a fix no rebuild here can reach."""
     # cmd_snapshot waited out main's release runs before this clone, so it holds M's stable tag.
     tag = main_stable_tag(clone, main)
     if not tag:
@@ -757,11 +762,15 @@ def check_vulnerabilities(clone: Path, repo: str, main: str, digest: str) -> lis
             if plat in theirs
             else set()
         )
-        found += [
-            f"image {plat}: {vid} in {pkg} is fixable and absent from main's {tag}. "
-            'Rebuild on dev and promote the new head'
-            for vid, pkg in sorted(new - old)
-        ]
+        for vid, pkg in sorted(new - old):
+            if vid in accepted:
+                print(f'image {plat}: {vid} in {pkg} accepted (accept_vulnerabilities)')
+                continue
+            found.append(
+                f"image {plat}: {vid} in {pkg} is fixable and absent from main's {tag}. "
+                'Rebuild on dev and promote the new head. When no rebuild here can fix it '
+                "(a base image's payload), dispatch again with accept_vulnerabilities naming it"
+            )
     return found
 
 
@@ -1098,7 +1107,13 @@ def cmd_preview(args) -> int:
 
 
 def run_checks(
-    clone: Path, repo: str, main: str, target: str, work: Path, classify=None
+    clone: Path,
+    repo: str,
+    main: str,
+    target: str,
+    work: Path,
+    classify=None,
+    accepted: frozenset[str] = frozenset(),
 ) -> tuple[list[str], str]:
     """(refusals, digest) of the five promotion checks over exactly `main` and `target`."""
     inv = inventory.Repo(str(clone))
@@ -1116,7 +1131,7 @@ def run_checks(
         refusals.append(f'dominance: {err}')
     refusals += check_moves(clone, main, target)
     if digest:
-        refusals += check_vulnerabilities(clone, repo, main, digest)
+        refusals += check_vulnerabilities(clone, repo, main, digest, accepted)
     return refusals, digest
 
 
@@ -1126,6 +1141,10 @@ def cmd_check(args) -> int:
         FULL_SHA_RE.fullmatch(s) for s in (args.main, args.target)
     ):
         print('::error::check needs a repository name and two full commit SHAs', file=sys.stderr)
+        return 2
+    accepted = frozenset(args.accept_vulnerabilities.replace(',', ' ').split())
+    if bad := sorted(v for v in accepted if not VULN_ID_RE.fullmatch(v)):
+        print(f'::error::not a vulnerability ID: {", ".join(bad)}', file=sys.stderr)
         return 2
     try:
         clone = clone_repo(args.repo, work / f'{args.repo}.git', bare=True)
@@ -1141,7 +1160,9 @@ def cmd_check(args) -> int:
                 '',
             )
         else:
-            refusals, digest = run_checks(clone, args.repo, args.main, args.target, work)
+            refusals, digest = run_checks(
+                clone, args.repo, args.main, args.target, work, accepted=accepted
+            )
         plan = None if refusals else build_reconciliation(clone, args.main, args.target, digest)
     except (GhError, inventory.InventoryError) as err:
         refusals, plan = [f'a read failed: {err}'], None
@@ -1159,6 +1180,8 @@ def cmd_check(args) -> int:
         f'Every check passed: R `{plan["sha"][:12]}` (tree of `{args.target[:12]}`, '
         f'parents `{args.main[:12]}` and `{args.target[:12]}`).'
     )
+    if accepted:
+        lines.append(f'Accepted without a fix here: {", ".join(sorted(accepted))}.')
     if args.dry_run:
         lines.append('Dry run: main is not moved.')
     write_summary('\n'.join(lines) + '\n')
@@ -1314,6 +1337,11 @@ def parse_args(argv: list[str] | None = None):
         if name == 'check':
             s.add_argument('--plan-file', required=True)
             s.add_argument('--dry-run', action='store_true', help='say so in the summary')
+            s.add_argument(
+                '--accept-vulnerabilities',
+                default='',
+                help='vulnerability IDs, comma or space separated, the image check lets through',
+            )
 
     create = sub.add_parser('create', help='create R, a commit no ref names yet')
     create.add_argument('--plan-file', required=True)
