@@ -292,6 +292,11 @@ jobs:
           sparse-checkout-cone-mode: false
           path: ci
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       # The issues-disabled guard, label creation and the fail-closed API
       # handling are scripts/tracker_issue.py's. A failed write for one finding
       # is recorded and the loop goes on, so every finding gets its issue and

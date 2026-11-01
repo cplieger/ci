@@ -17,8 +17,7 @@ of the repository; it reads that artifact as data, one subcommand per step:
              refusing when the base branch was rewritten or changed a
              proposed path since that commit.
 
-The proposal format is in docs/workflows.md. Stdlib only; runs on the
-runner's system python3 (3.12).
+The proposal format is in docs/workflows.md. Stdlib only.
 """
 
 from __future__ import annotations
@@ -73,7 +72,7 @@ def write_outputs(values: dict[str, str]) -> None:
     lines = ''.join(f'{k}={v}\n' for k, v in values.items())
     path = os.environ.get('GITHUB_OUTPUT')
     if path:
-        with open(path, 'a', encoding='utf-8') as fh:
+        with open(path, 'a') as fh:
             fh.write(lines)
     print(lines, end='')
 
@@ -150,7 +149,7 @@ class Proposal:
     def __init__(self, root: Path, allowed):
         self.root = root
         try:
-            doc = json.loads((root / MANIFEST).read_text(encoding='utf-8'))
+            doc = json.loads((root / MANIFEST).read_text())
         except (OSError, ValueError) as err:
             raise RefusedError(f'{MANIFEST} is unreadable: {err}') from None
         changes = doc.get('changes') if isinstance(doc, dict) else None
@@ -200,7 +199,7 @@ class Proposal:
 
     def _read(self, name: str) -> str:
         try:
-            return (self.root / name).read_text(encoding='utf-8')
+            return (self.root / name).read_text()
         except (OSError, UnicodeDecodeError) as err:
             raise RefusedError(f'{name} is unreadable: {err}') from None
 
@@ -340,7 +339,7 @@ def cmd_propose(a) -> int:
     print(f'::warning::{done.text}')
     summary = os.environ.get('GITHUB_STEP_SUMMARY')
     if summary:
-        with open(summary, 'a', encoding='utf-8') as fh:
+        with open(summary, 'a') as fh:
             fh.write(done.text + '\n')
     return 0
 

@@ -859,7 +859,7 @@ def vet(path: pathlib.Path, cue: str, schemas: list[tuple[str, pathlib.Path]]) -
         for tag, schema in schemas:
             schema = schema.resolve()
             try:
-                text = schema.read_text(encoding='utf-8')
+                text = schema.read_text()
                 match = re.search(r'^package\s+(\w+)', text, re.MULTILINE)
                 strict = pathlib.Path(tmp) / f'strict-{tag}.cue'
                 strict.write_text(STRICT_CUE.format(package=match.group(1) if match else 'v2'))
@@ -930,7 +930,7 @@ def escape_property(text: str) -> str:
 
 def load(path: pathlib.Path) -> tuple[object, str | None]:
     try:
-        return json.loads(path.read_text(encoding='utf-8')), None
+        return json.loads(path.read_text()), None
     except FileNotFoundError:
         return None, 'the file does not exist.'
     except (UnicodeDecodeError, json.JSONDecodeError) as err:

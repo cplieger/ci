@@ -103,7 +103,7 @@ def run(
 
 def read_json(path: Path) -> dict:
     try:
-        return json.loads(path.read_text(encoding='utf-8'))
+        return json.loads(path.read_text())
     except FileNotFoundError as exc:
         raise SurfaceError(f'{path}: not found') from exc
     except json.JSONDecodeError as exc:
@@ -237,7 +237,7 @@ def compute_closure(pkg_dir: Path, entries: list[Path]) -> tuple[set[Path], set[
 
     with tempfile.TemporaryDirectory(prefix='publish-surface-') as tmp:
         probe_path = Path(tmp) / 'tsconfig.json'
-        probe_path.write_text(json.dumps(probe, indent=2), encoding='utf-8')
+        probe_path.write_text(json.dumps(probe, indent=2))
         proc = run(
             [str(tsc), '-p', str(probe_path), '--listFiles'],
             cwd=pkg_dir,

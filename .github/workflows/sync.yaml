@@ -72,6 +72,11 @@ jobs:
           permission-pull-requests: write
           permission-workflows: write
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       # Regenerate the repo↔file manifest fresh on every run, then hand it
       # straight to scripts/sync-files.py below via --manifest. The file is
       # gitignored and never committed: it's a build artifact, and a committed

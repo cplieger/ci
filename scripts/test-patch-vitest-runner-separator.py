@@ -60,19 +60,16 @@ def make_tree(
     if vitest_version is not None:
         vitest = root / 'node_modules' / 'vitest'
         vitest.mkdir(parents=True)
-        (vitest / 'package.json').write_text(
-            f'{{"name": "vitest", "version": "{vitest_version}"}}', encoding='utf-8'
-        )
+        (vitest / 'package.json').write_text(f'{{"name": "vitest", "version": "{vitest_version}"}}')
     if not runner:
         return
     runner_dir = root / 'node_modules' / '@stryker-mutator' / 'vitest-runner'
     (runner_dir / 'dist' / 'src').mkdir(parents=True)
     (runner_dir / 'package.json').write_text(
-        f'{{"name": "@stryker-mutator/vitest-runner", "version": "{runner_version}"}}',
-        encoding='utf-8',
+        f'{{"name": "@stryker-mutator/vitest-runner", "version": "{runner_version}"}}'
     )
     for rel in TARGETS:
-        (runner_dir / rel).write_text(collect_test_name(body), encoding='utf-8')
+        (runner_dir / rel).write_text(collect_test_name(body))
 
 
 def run(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -85,7 +82,7 @@ def run(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 def bodies(root: Path) -> list[str]:
     runner_dir = root / 'node_modules' / '@stryker-mutator' / 'vitest-runner'
-    return [(runner_dir / rel).read_text(encoding='utf-8') for rel in TARGETS]
+    return [(runner_dir / rel).read_text() for rel in TARGETS]
 
 
 def case_patches_stock_vitest5() -> None:
@@ -157,7 +154,7 @@ def case_two_anchors_fails_loudly() -> None:
         make_tree(root)
         runner_dir = root / 'node_modules' / '@stryker-mutator' / 'vitest-runner'
         doubled = runner_dir / TARGETS[0]
-        doubled.write_text(collect_test_name(STOCK) + collect_test_name(STOCK), encoding='utf-8')
+        doubled.write_text(collect_test_name(STOCK) + collect_test_name(STOCK))
         proc = run(root)
         check('two anchors exits 3', ok=proc.returncode == 3, detail=f'rc={proc.returncode}')
         check('two anchors reports the count', ok='appears 2 times' in proc.stdout)

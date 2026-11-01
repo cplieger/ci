@@ -15,7 +15,7 @@ stalled or the closing comment to --comment-file when alive. A search GitHub
 marks incomplete that finds nothing proves nothing, so it exits 1 instead.
 
 Every call is REST through scripts/ghrest.py; authentication is gh's GH_TOKEN.
-Stdlib only; runs on the runner's system python3 (3.12).
+Stdlib only.
 """
 
 from __future__ import annotations

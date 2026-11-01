@@ -707,7 +707,7 @@ def cmd_go_modules(_args) -> int:
 def cmd_summarize(args) -> int:
     doc = collect(args, Path.cwd())
     Path(args.out).write_text(json.dumps(doc, indent=2) + '\n')
-    with open(args.summary, 'a', encoding='utf-8') as fh:
+    with open(args.summary, 'a') as fh:
         fh.write(render(doc) + '\n')
     for e in doc['errors']:
         print(f'::error::{e}')

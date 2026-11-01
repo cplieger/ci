@@ -41,7 +41,7 @@ NAME on the issue.
 lacks it; a failed assignment of an open issue warns and the run goes on.
 
 Every call is REST (`gh api`). Authentication is gh's: pass the token as GH_TOKEN
-in the environment. Runs on the runner's default python3 (3.12).
+in the environment.
 """
 
 from __future__ import annotations

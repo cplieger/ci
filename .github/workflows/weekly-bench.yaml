@@ -614,10 +614,6 @@ jobs:
           # checkout-persisted credentials.
           persist-credentials: false
 
-      # Pinned deliberately. The runner's system python3 is 3.12, and the
-      # stryker aggregate job failed for every repo for weeks because its script
-      # used 3.14 syntax that 3.12 rejects at PARSE time, so no tracker issue had
-      # ever been created. Author against 3.14, pin 3.14.
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.15"

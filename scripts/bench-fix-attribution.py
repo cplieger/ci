@@ -43,7 +43,7 @@ class FormatError(RuntimeError):
 
 
 def load(path: pathlib.Path) -> dict:
-    raw = path.read_text(encoding='utf-8')
+    raw = path.read_text()
     if not raw.startswith(PREFIX):
         raise FormatError(
             f"{path} does not start with {PREFIX!r}; the action's output format "
@@ -62,7 +62,7 @@ def dump(path: pathlib.Path, data: dict) -> None:
     # Must reproduce JSON.stringify(data, null, 2) byte for byte, so that a run
     # which changes nothing produces no diff: 2-space indent, no space before
     # the separator colon's value beyond one, and no ASCII escaping.
-    path.write_text(PREFIX + json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
+    path.write_text(PREFIX + json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def commit_from_api(payload: dict) -> dict:
@@ -136,7 +136,7 @@ def main() -> int:
 
     try:
         data = load(args.data_file)
-        replacement = commit_from_api(json.loads(args.commit_json.read_text(encoding='utf-8')))
+        replacement = commit_from_api(json.loads(args.commit_json.read_text()))
         touched = repair(data, args.expect_commit, replacement, args.repo_url)
     except (FormatError, json.JSONDecodeError, OSError) as err:
         print(f'bench-fix-attribution: {err}', file=sys.stderr)

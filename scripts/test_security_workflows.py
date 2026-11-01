@@ -237,7 +237,11 @@ class SecurityScanPublishedMode(unittest.TestCase):
             )
             out = tools / 'out'
             out.touch()
-            step = self.jobs['published-image']['steps'][1]
+            step = next(
+                s
+                for s in self.jobs['published-image']['steps']
+                if s.get('name') == 'Resolve the published stable image'
+            )
             env = {
                 'CI_TOOLS': str(tools),
                 'GITHUB_OUTPUT': str(out),
@@ -471,7 +475,7 @@ class DailySecurity(unittest.TestCase):
     def new_fanout(self) -> str:
         steps = self.wf['jobs']['fanout']['steps']
         self.assertEqual(steps[0]['with'], {'persist-credentials': False})
-        return steps[1]['run']
+        return next(s['run'] for s in steps if 'run' in s)
 
     def test_main_default_rows_and_calls_are_head_s_and_dev_default_repos_add_main(self):
         security = 'docker-age subflux tool-catalog private-repo loki old'

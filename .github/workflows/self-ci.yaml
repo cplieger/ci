@@ -36,11 +36,6 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
-      # stryker-aggregate.py uses PEP 758 (`except A, B:`), which needs Python
-      # 3.14, and ubuntu-24.04's own python3 is 3.12 and rejects it at PARSE
-      # time. weekly-stryker.yaml's aggregate job pins the same version for the
-      # same reason; without the pin here its probe fails on every case with a
-      # SyntaxError rather than on anything it is testing.
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -60,9 +55,6 @@ jobs:
 
   # The issue transport every scheduled writer calls (scripts/tracker_issue.py)
   # and the body skeleton the three aggregators share (scripts/trackerlib.py).
-  # Both run on the runner's default python3 in most callers and under a 3.14
-  # pin in weekly-bench/weekly-stryker, so the suite runs on both: the default
-  # interpreter first (the stryker golden skips itself there), then 3.14.
   tracker-scripts:
     runs-on: ubuntu-26.04
     timeout-minutes: 5
@@ -75,21 +67,18 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
-      - name: Probe the tracker transport (default python3)
-        run: python3 scripts/test-tracker-issue.py
-
-      - name: Probe the tracker bodies (default python3)
-        run: python3 scripts/test-tracker-body.py
-
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.15"
 
-      - name: Probe the tracker bodies (python 3.14)
+      - name: Probe the tracker transport
+        run: python3 scripts/test-tracker-issue.py
+
+      - name: Probe the tracker bodies
         run: python3 scripts/test-tracker-body.py
 
-  # The two-channel release scripts, on the runner's default python3 because
-  # that is what promote.yaml and ghcr-retention.yaml run them with:
+  # The two-channel release scripts:
   # release_channels.py (tag shapes and repo tables), promote.py (the
   # promotion checks), ghcr_retention.py (the dev-version selection),
   # audit.py (the ruleset and webhook grading of both branch models) and the
@@ -106,8 +95,13 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
-      # test_workflow_shell.py parses the workflows; the runner's yamllint is a
-      # pipx install, so its PyYAML is not importable from the system python3.
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      # test_workflow_shell.py parses the workflows, and the set-up interpreter
+      # has no PyYAML.
       - name: Install PyYAML
         run: |
           set -euo pipefail
@@ -115,7 +109,7 @@ jobs:
           VERSION=6.0.3
           pip install -q --break-system-packages "PyYAML==${VERSION}"
 
-      - name: Probe the release-channel scripts (default python3)
+      - name: Probe the release-channel scripts
         run: |
           set -euo pipefail
           python3 -m unittest discover -s scripts -p 'test_*.py' -v

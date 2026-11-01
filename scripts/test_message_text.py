@@ -104,7 +104,7 @@ def tree_files() -> list[str]:
 
 
 def legacy() -> set[str]:
-    lines = LEGACY.read_text(encoding='utf-8').splitlines()
+    lines = LEGACY.read_text().splitlines()
     return {line for line in lines if line and not line.startswith('#')}
 
 
@@ -112,9 +112,7 @@ def found() -> list[tuple[str, int, str]]:
     return [
         (name, n, key)
         for name in tree_files()
-        for n, key in keys(
-            (ROOT / name).read_text(encoding='utf-8', errors='replace'), name.endswith('.py')
-        )
+        for n, key in keys((ROOT / name).read_text(errors='replace'), name.endswith('.py'))
     ]
 
 

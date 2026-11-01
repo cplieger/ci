@@ -133,7 +133,7 @@ def git(clone: Path, *args: str, stdin: str | None = None, env: dict | None = No
 def write_summary(text: str) -> None:
     path = os.environ.get('GITHUB_STEP_SUMMARY')
     if path:
-        with open(path, 'a', encoding='utf-8') as fh:
+        with open(path, 'a') as fh:
             fh.write(text)
     print(text, end='')
 
@@ -142,7 +142,7 @@ def write_outputs(values: dict[str, str]) -> None:
     path = os.environ.get('GITHUB_OUTPUT')
     lines = ''.join(f'{k}={v}\n' for k, v in values.items())
     if path:
-        with open(path, 'a', encoding='utf-8') as fh:
+        with open(path, 'a') as fh:
             fh.write(lines)
     print(lines, end='')
 
@@ -481,7 +481,7 @@ def sync_inputs(repo: str, work: Path, classify=None) -> tuple[Path, Path]:
     except failure as err:
         raise GhError(f'classify-repos.py: {err}') from None
     owned = work / 'sync-owned.txt'
-    owned.write_text(''.join(f'{p}\n' for p in patterns()), encoding='utf-8')
+    owned.write_text(''.join(f'{p}\n' for p in patterns()))
     canonical = work / 'canonical'
     shutil.rmtree(canonical, ignore_errors=True)
     canonical.mkdir(parents=True)

@@ -108,7 +108,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.input:
-        with open(args.input, encoding='utf-8') as fh:
+        with open(args.input) as fh:
             text = fh.read()
     else:
         text = sys.stdin.read()

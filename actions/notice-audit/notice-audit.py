@@ -105,7 +105,7 @@ def package_roots(root: Path, files: list[Path]) -> list[Path]:
             continue
         if path.name == 'package.json':
             try:
-                manifest = json.loads((root / path).read_text(encoding='utf-8'))
+                manifest = json.loads((root / path).read_text())
             except (OSError, json.JSONDecodeError) as exc:
                 raise RuntimeError(f'cannot read {path}: {exc}') from exc
             if (
@@ -138,7 +138,7 @@ def audit(root: Path, repo: str) -> tuple[list[str], int]:
     if not notice.is_file():
         findings.append('NOTICE is missing at the repository root')
     else:
-        findings.extend(template_findings(notice.read_text(encoding='utf-8'), repo))
+        findings.extend(template_findings(notice.read_text(), repo))
     roots = package_roots(root, visible_files(root))
     for package_dir in roots:
         findings.extend(copy_findings(root, package_dir))

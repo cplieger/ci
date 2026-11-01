@@ -120,7 +120,7 @@ def named_section(readme_text: str, heading: str) -> str | None:
 
 def page_title(page: Path) -> str:
     """A docs page's own H1, so the link text is the page's title not its filename."""
-    for line in page.read_text(encoding='utf-8').split('\n'):
+    for line in page.read_text().split('\n'):
         if line.startswith('# '):
             return line[2:].strip()
     stem = page.stem.replace('-', ' ').replace('_', ' ')
@@ -146,7 +146,7 @@ def render(args: argparse.Namespace) -> str:
     readme_path = root / args.readme
     if not readme_path.is_file():
         fail(f'{readme_path} not found')
-    readme_text = readme_path.read_text(encoding='utf-8')
+    readme_text = readme_path.read_text()
 
     summary = marked_region(readme_text)
     if summary is None:
@@ -174,7 +174,7 @@ def render(args: argparse.Namespace) -> str:
     compose = root / args.compose
     if compose.is_file():
         parts += ['## Quick start', '']
-        parts += ['```yaml', compose.read_text(encoding='utf-8').strip(), '```', '']
+        parts += ['```yaml', compose.read_text().strip(), '```', '']
 
     parts += ['## Documentation', '']
     parts += [f'- {line}' for line in doc_links(root, args.owner, args.repo, args.ref)]
@@ -208,7 +208,7 @@ def main() -> int:
         args.image = f'{args.owner}/{args.repo}'
 
     page = render(args)
-    size = len(page.encode('utf-8'))
+    size = len(page.encode())
     if size > HUB_MAX_BYTES:
         fail(
             f"rendered overview is {size} bytes, over Docker Hub's {HUB_MAX_BYTES}-byte "
@@ -223,7 +223,7 @@ def main() -> int:
         )
 
     if args.output:
-        Path(args.output).write_text(page, encoding='utf-8')
+        Path(args.output).write_text(page)
         print(f'wrote {args.output} ({size} bytes)', file=sys.stderr)
     else:
         sys.stdout.write(page)

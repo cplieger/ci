@@ -1408,7 +1408,7 @@ def cmd_report(args, api: Api, tracker=tracker_main) -> int:
                 print(f'::error::{repo}: {e}')
     if not plan['repos']:
         lines.append('| (no repository has `dev` as its default branch) | | | | | | |')
-    with open(args.summary, 'a', encoding='utf-8') as fh:
+    with open(args.summary, 'a') as fh:
         fh.write('\n'.join(lines) + '\n')
     return 1 if failed else 0
 

@@ -94,7 +94,7 @@ class DataError(RuntimeError):
 
 
 def load_series(path: pathlib.Path) -> dict:
-    raw = path.read_text(encoding='utf-8')
+    raw = path.read_text()
     if not raw.startswith(PREFIX):
         raise DataError(f'{path} is not the benchmark action data format')
     try:
@@ -295,7 +295,7 @@ def main() -> int:
 
     existing = ''
     if args.existing_body_file and args.existing_body_file.is_file():
-        existing = args.existing_body_file.read_text(encoding='utf-8')
+        existing = args.existing_body_file.read_text()
 
     # Tolerant like its siblings: a repo whose series cannot be read reports zero
     # entries so the workflow leaves its issue alone, rather than publishing a

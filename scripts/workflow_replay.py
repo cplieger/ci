@@ -29,6 +29,7 @@ from pathlib import Path
 import yaml
 
 CHECKOUT = 'actions/checkout@'
+SETUP_PYTHON = 'actions/setup-python@'
 OWN_ACTION = re.compile(r'^cplieger/ci/actions/([A-Za-z0-9_-]+)@')
 LOCAL_ACTION = re.compile(r'^\./([A-Za-z0-9_./-]+)$')
 CI_REPOSITORY = 'cplieger/ci'
@@ -509,6 +510,10 @@ class Job:
                 outs = self.run_bash(name, scope.render(step['run']), env)
             elif uses.startswith(CHECKOUT):
                 self.checkout(name, step.get('with') or {}, scope)
+                outs = {}
+            elif uses.startswith(SETUP_PYTHON):
+                # The replay runs its steps on this interpreter, already at the floor.
+                self.ran.append(name)
                 outs = {}
             elif LOCAL_ACTION.match(uses) or OWN_ACTION.match(uses):
                 local = LOCAL_ACTION.match(uses)
