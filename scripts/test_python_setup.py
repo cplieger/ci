@@ -2,13 +2,16 @@
 
 The runner's own python3 is older than the floor, so a job that skips
 actions/setup-python runs the scripts on an interpreter they do not target. The
-floor is configs/ruff.toml's target-version.
+floor is configs/ruff.toml's target-version. The set-up interpreter carries no
+third-party package, so a job installs every one its scripts import.
 """
 
 from __future__ import annotations
 
+import ast
 import pathlib
 import re
+import sys
 import tomllib
 import unittest
 
@@ -20,6 +23,11 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 PYTHON_CALL = re.compile(r'(?<![\w./-])python3?\s+(-[A-Za-z]|["\']?\$|[\w./{}$"-]*\.py\b)')
 PIP_INSTALL = re.compile(r'(?<![\w./-])pip3?\s+install\b')
 SETUP = 'actions/setup-python@'
+SCRIPT_TOKEN = re.compile(r'([\w./-]+)\.py\b')
+# The importable module each pinned pip package provides, where the names differ;
+# yamllint depends on PyYAML.
+PROVIDES = {'pyyaml': {'yaml'}, 'yamllint': {'yaml', 'yamllint'}}
+PIN = re.compile(r'(?<![\w./-])pip3?\s+install[^\n]*?"?([A-Za-z][\w.-]*)==')
 
 
 def floor() -> str:
@@ -49,6 +57,50 @@ def step_lists():
             yield rel, name, job.get('steps') or []
 
 
+def third_party(path: pathlib.Path, seen: set[pathlib.Path]) -> set[str]:
+    """Top-level modules `path` imports that are neither stdlib nor a sibling script, transitively."""
+    if path in seen:
+        return set()
+    seen.add(path)
+    found = set()
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names = [node.module]
+        else:
+            continue
+        for name in (n.split('.')[0] for n in names):
+            if name in sys.stdlib_module_names or name == '__future__':
+                continue
+            local = next(
+                (
+                    d / f'{name}.py'
+                    for d in (path.parent, ROOT / 'scripts')
+                    if (d / f'{name}.py').is_file()
+                ),
+                None,
+            )
+            found |= third_party(local, seen) if local else {name}
+    return found
+
+
+def installed(steps: list[dict]) -> set[str]:
+    pins = {m.lower() for s in steps for m in PIN.findall(s.get('run') or '')}
+    return set().union(*(PROVIDES.get(p, {p}) for p in pins))
+
+
+def scripts_run(steps: list[dict]) -> set[pathlib.Path]:
+    run = '\n'.join(s.get('run') or '' for s in steps)
+    out = set()
+    for stem in SCRIPT_TOKEN.findall(run):
+        name = pathlib.Path(stem).name + '.py'
+        out |= {p for p in ROOT.glob(f'**/{name}') if '.git' not in p.parts}
+    if 'unittest discover' in run:
+        out |= set(ROOT.glob('scripts/test_*.py'))
+    return out
+
+
 class TestPythonSetup(unittest.TestCase):
     def test_every_python_job_sets_up_the_floor_first(self):
         want = floor()
@@ -66,6 +118,21 @@ class TestPythonSetup(unittest.TestCase):
             f'add an {SETUP} step with python-version "{want}" before the first step '
             'that runs Python; when the floor moves, bump configs/ruff.toml target-version '
             'and every python-version together:\n' + '\n'.join(problems),
+        )
+
+    def test_every_python_job_installs_the_packages_its_scripts_import(self):
+        problems = []
+        for rel, job, steps in step_lists():
+            if not any(runs_python(s) for s in steps):
+                continue
+            needed = set().union(*(third_party(p, set()) for p in scripts_run(steps)))
+            missing = sorted(needed - installed(steps))
+            if missing:
+                problems.append(f'{rel} {job}: {missing}')
+        self.assertFalse(
+            problems,
+            'add a pinned `pip install "<package>==<version>"` step with a `# renovate:` '
+            'comment after Setup Python for each module:\n' + '\n'.join(problems),
         )
 
     def test_the_detector_sees_the_call_shapes_in_use(self):
