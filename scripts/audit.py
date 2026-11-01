@@ -55,7 +55,7 @@ _expected_rulesets_cache = {}
 def expected_ruleset(name):
     """The committed ruleset body for `name`, read once."""
     if name not in _expected_rulesets_cache:
-        with open(RULESETS_DIR / f'{name}.json', encoding='utf-8') as fh:
+        with open(RULESETS_DIR / f'{name}.json') as fh:
             _expected_rulesets_cache[name] = json.load(fh)
     return _expected_rulesets_cache[name]
 
@@ -121,7 +121,7 @@ def two_branch_renovate():
     classify = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(classify)
     [(source, dest)] = classify.pairs(classify.TWO_BRANCH_RENOVATE)
-    with open(REPO_ROOT / source, encoding='utf-8') as fh:
+    with open(REPO_ROOT / source) as fh:
         return dest, json.load(fh)
 
 
@@ -139,7 +139,7 @@ def collect_renovate_config(name, branch, s):
         return
     try:
         content = base64.b64decode(''.join(body['content'].split()), validate=True)
-        s['renovate_json'] = content.decode('utf-8')
+        s['renovate_json'] = content.decode()
     except ValueError:
         s['errors'].append(f'{dest} on {branch} unreadable (API), so not graded')
 
@@ -370,7 +370,7 @@ def decoded_file(raw, strict=False):
         return None
     try:
         decoded = base64.b64decode(''.join(content.split()), validate=strict)
-        return decoded.decode('utf-8', 'replace')
+        return decoded.decode(errors='replace')
     except ValueError, UnicodeError:
         return None if strict else ''
 
@@ -438,7 +438,7 @@ def used_by_package_scrape(name):
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 — same fixed https URL
-                body = resp.read(512 * 1024).decode('utf-8', 'replace')
+                body = resp.read(512 * 1024).decode(errors='replace')
             m = re.search(
                 r'property="og:title" content="Network Dependents '
                 r'· [^"]+? · (.+?) repositories"',
@@ -1020,7 +1020,7 @@ def collect(meta):
         elif isinstance(rd, dict) and rd.get('content') is not None:
             try:
                 s['readme_text'] = base64.b64decode(''.join(rd['content'].split())).decode(
-                    'utf-8', 'replace'
+                    errors='replace'
                 )
             except ValueError, UnicodeError:
                 s['readme_text'] = ''
@@ -1824,7 +1824,7 @@ def write_issue(name, mode, text):
     close-when-clean) with `text` as the body or the closing comment."""
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / 'text.md'
-        path.write_text(text, encoding='utf-8')
+        path.write_text(text)
         flag = '--body-file' if mode == 'upsert' else '--comment-file'
         argv = [
             *('--repo', f'{OWNER}/{name}', '--label', ISSUE_LABEL, '--title', ISSUE_TITLE),
@@ -1841,7 +1841,7 @@ def load_findings(path):
     """The findings dict --findings-out wrote; None, with the reason on stderr,
     when it is unreadable or from a scoped run."""
     try:
-        findings = json.loads(Path(path).read_text(encoding='utf-8'))
+        findings = json.loads(Path(path).read_text())
     except OSError as err:
         sys.stderr.write(f'error: findings file unreadable: {err}\n')
         return None
@@ -2009,7 +2009,7 @@ def main():
         settings = list(pool.map(audit_repo, metas))
 
     if args.dump:
-        with open(args.dump, 'w', encoding='utf-8') as fh:
+        with open(args.dump, 'w') as fh:
             json.dump(settings, fh, indent=2, sort_keys=True)
 
     # No repo readable at all is an outage, not an under-scoped token.
@@ -2126,7 +2126,7 @@ def main():
             'visibility': args.visibility,
             'repos': rows,
         }
-        with open(args.findings_out, 'w', encoding='utf-8') as fh:
+        with open(args.findings_out, 'w') as fh:
             json.dump(findings, fh, indent=2, sort_keys=True)
     if hard_total:
         sys.exit(1)

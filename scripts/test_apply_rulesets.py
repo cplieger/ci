@@ -105,7 +105,7 @@ class ApplyRulesets(unittest.TestCase):
         **meta,
     ):
         if pinned is None:
-            pinned = {PIN_OK: META_CI.read_text(encoding='utf-8'), PIN_OLD: META_CI_WITHOUT_POLICY}
+            pinned = {PIN_OK: META_CI.read_text(), PIN_OLD: META_CI_WITHOUT_POLICY}
         fx = {
             f'repos/cplieger/{repo}': {
                 'name': repo,

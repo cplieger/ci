@@ -37,7 +37,7 @@ Scope guarantees:
 
 Run from (or point --repo-dir at) a local clone whose `origin` remote is the
 GitHub repo; `gh` must be authed, and every GitHub call is REST.
-Requires Python 3.11+ and PyYAML. Run AFTER the new cliff.toml has synced into the repo,
+Requires Python 3.15+ and PyYAML. Run AFTER the new cliff.toml has synced into the repo,
 or pass --config pointing at cplieger/ci's configs/cliff-stable.toml (or
 cliff-alpha.toml for pre-1.0 repos).
 
@@ -69,10 +69,10 @@ from pathlib import Path
 
 import yaml
 
-if sys.version_info < (3, 11):  # noqa: UP036 - the guard IS the feature
-    sys.exit('error: this script needs Python 3.11+')
+if sys.version_info < (3, 15):  # noqa: UP036 - the guard IS the feature
+    sys.exit('error: this script needs Python 3.15+; upgrade the interpreter, never the script')
 
-# Imported after the guard: inventory needs tomllib (3.11+).
+# Imported after the guard, so an older interpreter fails with its message.
 import ghrest
 from inventory import Repo
 
@@ -116,7 +116,7 @@ def normalize(body: str) -> str:
 
 
 def sha256(text: str) -> str:
-    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def rest(call, *args):
@@ -313,7 +313,7 @@ def security_shas(repo_dir: Path, repo: str, prevs: list[str], scratch: Path) ->
         env={**os.environ, 'GITHUB_REPOSITORY': repo},
     )
     path = scratch / 'security-shas'
-    path.write_text(proc.stdout, encoding='utf-8')
+    path.write_text(proc.stdout)
     return path
 
 
@@ -366,7 +366,7 @@ def render(
     env = {k: v for k, v in os.environ.items() if k not in {'GITHUB_TOKEN', 'GH_TOKEN'}}
     env['CLIFF_BIN'] = cliff_bin
     run(cmd, repo_dir, env=env)
-    return out.read_text(encoding='utf-8').strip()
+    return out.read_text().strip()
 
 
 def fetch_body(repo: str, tag: str) -> str:
@@ -384,7 +384,7 @@ def restore(repo_dir: Path, backup_dir: Path) -> int:
     if not manifest_file.exists():
         print(f'error: {backup_dir} has no manifest.json (not a backup dir)', file=sys.stderr)
         return 2
-    manifest = json.loads(manifest_file.read_text(encoding='utf-8'))
+    manifest = json.loads(manifest_file.read_text())
     repo = repo_identity(repo_dir)
     if manifest['repo'] != repo:
         print(
@@ -394,7 +394,7 @@ def restore(repo_dir: Path, backup_dir: Path) -> int:
     for entry in manifest['entries']:
         tag = entry['tag']
         f = backup_dir / f'{tag}.md'
-        body = f.read_text(encoding='utf-8', newline='')
+        body = f.read_text(newline='')
         if sha256(body) != entry['old_sha256']:
             print(
                 f'error: backup file for {tag} does not match its manifest hash; aborting',
@@ -410,7 +410,7 @@ def restore(repo_dir: Path, backup_dir: Path) -> int:
 def load_carve_outs(path: Path, repo: str) -> dict[str, str]:
     """This repo's carved-out tags and their reasons; exits 2 naming a malformed file."""
     try:
-        doc = yaml.safe_load(path.read_text(encoding='utf-8'))
+        doc = yaml.safe_load(path.read_text())
     except (OSError, yaml.YAMLError) as exc:
         print(f'error: carve-out list {path}: {exc}', file=sys.stderr)
         sys.exit(2)
@@ -544,7 +544,7 @@ def main() -> int:
     tag_shas = verify_tags(repo_dir, tags)
 
     print(
-        f'repo: {repo}  releases: {len(tags)}  config: {config} (sha256 {sha256(config.read_text(encoding="utf-8"))[:12]})'
+        f'repo: {repo}  releases: {len(tags)}  config: {config} (sha256 {sha256(config.read_text())[:12]})'
     )
     print(f'oldest release {tags[0]} is skipped (no predecessor tag)\n')
 
@@ -635,7 +635,7 @@ def main() -> int:
     manifest = {
         'repo': repo,
         'config': str(config),
-        'config_sha256': sha256(config.read_text(encoding='utf-8')),
+        'config_sha256': sha256(config.read_text()),
         'created': int(time.time()),
         'entries': [
             {'tag': p.tag, 'tag_sha': tag_shas[p.tag], 'old_sha256': sha256(p.old)} for p in plans
@@ -643,16 +643,14 @@ def main() -> int:
     }
     for p in plans:
         f = backup_dir / f'{p.tag}.md'
-        f.write_text(p.old, encoding='utf-8', newline='')
-        if sha256(f.read_text(encoding='utf-8', newline='')) != sha256(p.old):
+        f.write_text(p.old, newline='')
+        if sha256(f.read_text(newline='')) != sha256(p.old):
             print(
                 f'error: backup verification failed for {p.tag}; aborting before any edit',
                 file=sys.stderr,
             )
             return 2
-    (backup_dir / 'manifest.json').write_text(
-        json.dumps(manifest, indent=2) + '\n', encoding='utf-8'
-    )
+    (backup_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(f'backups written and verified: {backup_dir}')
 
     # Phase 2b: edit, with an optimistic re-check against concurrent changes.

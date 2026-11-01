@@ -45,7 +45,7 @@ def load_history(name: str) -> list[tuple[str, str | None, dict[str, str | None]
         if path is not None:
             commits[-1][2][path] = ''.join(line + '\n' for line in body)
 
-    for line in (FIXTURES / name / 'history.txt').read_text(encoding='utf-8').splitlines():
+    for line in (FIXTURES / name / 'history.txt').read_text().splitlines():
         if not line.startswith('@@ '):
             body.append(line)
             continue
@@ -100,7 +100,7 @@ class Fixture:
         with tempfile.TemporaryDirectory() as cdir:
             for p, text in (canonical or {}).items():
                 (Path(cdir) / p).parent.mkdir(parents=True, exist_ok=True)
-                (Path(cdir) / p).write_text(text, encoding='utf-8')
+                (Path(cdir) / p).write_text(text)
             patterns = [inventory.glob_pattern(p) for p in owned]
             return inventory.dominance(
                 self.repo, self.sha[base], self.sha[main], self.sha[target], patterns, Path(cdir)
@@ -1125,7 +1125,7 @@ class MalformedSections(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             git = ['git', '-C', tmp, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid']
             subprocess.run(['git', 'init', '-q', tmp], check=True)
-            (Path(tmp) / path).write_text(text, encoding='utf-8')
+            (Path(tmp) / path).write_text(text)
             subprocess.run([*git, 'add', '.'], check=True)
             subprocess.run([*git, 'commit', '-q', '-m', 'malformed'], check=True)
             proc = subprocess.run(
@@ -1347,7 +1347,7 @@ class RemovedDependency(FixtureCase):
     def test_the_cli_exit_code_follows_dev_history_for_a_main_added_dependency(self):
         with tempfile.TemporaryDirectory() as tmp:
             sync = Path(tmp) / 'sync-owned.txt'
-            sync.write_text('cliff.toml\n', encoding='utf-8')
+            sync.write_text('cliff.toml\n')
             for target, want in (('T_dropped_new', 0), ('T_dropped_older', 1), ('T', 1)):
                 out = io.StringIO()
                 with self.subTest(target=target), contextlib.redirect_stdout(out):
@@ -1389,7 +1389,7 @@ class RemovedDependency(FixtureCase):
         fx.lose_blob('T', 'go.mod')
         with tempfile.TemporaryDirectory() as tmp:
             sync = Path(tmp) / 'sync-owned.txt'
-            sync.write_text('cliff.toml\n', encoding='utf-8')
+            sync.write_text('cliff.toml\n')
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = inventory.main(
@@ -2020,7 +2020,7 @@ class SyncOnlyChange(FixtureCase):
     def test_an_unreadable_canonical_copy_exits_2_without_a_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
             sync, canon = Path(tmp) / 'sync-owned.txt', Path(tmp) / 'canonical'
-            sync.write_text('.editorconfig\n', encoding='utf-8')
+            sync.write_text('.editorconfig\n')
             (canon / '.editorconfig').mkdir(parents=True)
             proc = subprocess.run(
                 [
@@ -2076,7 +2076,7 @@ class GlobPattern(unittest.TestCase):
     def test_the_cli_reads_globs_and_comments(self):
         with tempfile.TemporaryDirectory() as tmp:
             sync = Path(tmp) / 'sync-owned.txt'
-            sync.write_text('# synced\n\n  scripts/*.sh  \n', encoding='utf-8')
+            sync.write_text('# synced\n\n  scripts/*.sh  \n')
             (pattern,) = inventory.load_sync_owned(str(sync))
         self.assertTrue(pattern.fullmatch('scripts/a.sh'))
 
@@ -2304,32 +2304,31 @@ class CoverageCorpus(unittest.TestCase):
         remote = self.tmp / 'remote' / 'owner' / 'app.git'
         seed = self.tmp / 'seed'
         subprocess.run(['git', 'init', '-q', '-b', 'main', str(seed)], check=True)
-        (seed / 'Dockerfile').write_text(f'FROM alpine:3.24.2@sha256:{HEX1}\n', encoding='utf-8')
-        (seed / 'tools.json').write_text('{}\n', encoding='utf-8')
-        (seed / 'yarn.lock').write_text('# yarn lockfile v1\n', encoding='utf-8')
+        (seed / 'Dockerfile').write_text(f'FROM alpine:3.24.2@sha256:{HEX1}\n')
+        (seed / 'tools.json').write_text('{}\n')
+        (seed / 'yarn.lock').write_text('# yarn lockfile v1\n')
         git = ['git', '-C', str(seed), '-c', 'user.name=t', '-c', 'user.email=t@example.invalid']
         subprocess.run([*git, 'add', '.'], check=True)
         subprocess.run([*git, 'commit', '-q', '-m', 'seed'], check=True)
         subprocess.run([*git, 'checkout', '-q', '-b', 'dev'], check=True)
-        (seed / 'package.json').write_text('{"dependencies": {"x": "^1.0.0"}}\n', encoding='utf-8')
+        (seed / 'package.json').write_text('{"dependencies": {"x": "^1.0.0"}}\n')
         subprocess.run([*git, 'add', '.'], check=True)
         subprocess.run([*git, 'commit', '-q', '-m', 'dev only'], check=True)
         # A lockfile the engine refuses (v1) and a require it cannot order, beside a readable Dockerfile.
         subprocess.run([*git, 'checkout', '-q', '-b', 'broken', 'main'], check=True)
-        (seed / 'package.json').write_text('{"dependencies": {"x": "^1.0.0"}}\n', encoding='utf-8')
+        (seed / 'package.json').write_text('{"dependencies": {"x": "^1.0.0"}}\n')
         (seed / 'package-lock.json').write_text(
-            '{"lockfileVersion": 1, "dependencies": {"x": {"version": "1.0.0"}}}\n',
-            encoding='utf-8',
+            '{"lockfileVersion": 1, "dependencies": {"x": {"version": "1.0.0"}}}\n'
         )
         (seed / 'go.mod').write_text(
-            'module example.com/app\n\ngo 1.26\n\nrequire example.com/x master\n', encoding='utf-8'
+            'module example.com/app\n\ngo 1.26\n\nrequire example.com/x master\n'
         )
         subprocess.run([*git, 'add', '.'], check=True)
         subprocess.run([*git, 'commit', '-q', '-m', 'broken surfaces'], check=True)
         # Surfaces with no dependency in them: the only revision an empty extraction fits.
         subprocess.run([*git, 'checkout', '-q', '-b', 'bare', 'main'], check=True)
         subprocess.run([*git, 'rm', '-q', 'Dockerfile'], check=True)
-        (seed / 'package.json').write_text('{"name": "app"}\n', encoding='utf-8')
+        (seed / 'package.json').write_text('{"name": "app"}\n')
         subprocess.run([*git, 'add', '.'], check=True)
         subprocess.run([*git, 'commit', '-q', '-m', 'no dependencies'], check=True)
         subprocess.run(['git', 'clone', '-q', '--bare', str(seed), str(remote)], check=True)
@@ -2340,8 +2339,7 @@ class CoverageCorpus(unittest.TestCase):
             '#!/bin/sh\nset -eu\ncp "$1" "$STUB_SEEN"\nshift\nprintf "%s\\n" "$@" >"$STUB_ARGS"\n'
             'for a in "$@"; do case $a in --report-path=*)\n'
             '  p=${a#*=}; b=${p##*/report-}; src=$STUB_REPORT.${b%.json}\n'
-            '  [ -f "$src" ] || src=$STUB_REPORT\n  cp "$src" "$p" ;;\nesac; done\n',
-            encoding='utf-8',
+            '  [ -f "$src" ] || src=$STUB_REPORT\n  cp "$src" "$p" ;;\nesac; done\n'
         )
         self.stub.chmod(0o755)
         # gh applies the script's own --jq filter to a fixture listing, and refuses any other call.
@@ -2353,8 +2351,7 @@ class CoverageCorpus(unittest.TestCase):
             '"api --paginate user/repos?per_page=100&affiliation=owner --jq" ]; then\n'
             '  echo "unexpected gh call: $*" >&2\n  exit 64\nfi\n'
             'if [ -n "${STUB_GH_FAIL:-}" ]; then echo "gh: HTTP 401" >&2; exit 1; fi\n'
-            'jq -r "$5" "$STUB_GH_REPOS"\n',
-            encoding='utf-8',
+            'jq -r "$5" "$STUB_GH_REPOS"\n'
         )
         gh.chmod(0o755)
 
@@ -2392,10 +2389,9 @@ class CoverageCorpus(unittest.TestCase):
                         }
                         | (entries or {}),
                     }
-                ),
-                encoding='utf-8',
+                )
             )
-        (self.tmp / 'listing.json').write_text(json.dumps(list(listing)), encoding='utf-8')
+        (self.tmp / 'listing.json').write_text(json.dumps(list(listing)))
         env = {
             **os.environ,
             'PATH': f'{self.tmp / "bin"}{os.pathsep}{os.environ["PATH"]}',
@@ -2443,9 +2439,9 @@ class CoverageCorpus(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn('checked owner/app@main: 1 package file(s) Renovate manages', proc.stdout)
         self.assertIn('RESULT: PASS', proc.stdout)
-        seen = json.loads((self.tmp / 'seen.json').read_text(encoding='utf-8'))
+        seen = json.loads((self.tmp / 'seen.json').read_text())
         self.assertEqual(seen, {'force': {'baseBranchPatterns': ['main']}})
-        args = (self.tmp / 'args.txt').read_text(encoding='utf-8').split()
+        args = (self.tmp / 'args.txt').read_text().split()
         self.assertEqual(
             args,
             [
@@ -2502,9 +2498,9 @@ class CoverageCorpus(unittest.TestCase):
         proc = self.run_corpus({'npm': [self.pf('package.json')]}, base='dev')
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn('checked owner/app@dev: 1 package file(s) Renovate manages', proc.stdout)
-        seen = json.loads((self.tmp / 'seen.json').read_text(encoding='utf-8'))
+        seen = json.loads((self.tmp / 'seen.json').read_text())
         self.assertEqual(seen, {'force': {'baseBranchPatterns': ['dev']}})
-        args = (self.tmp / 'args.txt').read_text(encoding='utf-8').split()
+        args = (self.tmp / 'args.txt').read_text().split()
         self.assertIn(f'--report-path={self.tmp / "work" / "report-dev.json"}', args)
 
     def test_a_dev_only_package_file_is_unread_on_main(self):
@@ -2745,7 +2741,7 @@ class CoverageCorpus(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn('over 2 repo(s)', proc.stdout)
-        args = (self.tmp / 'args.txt').read_text(encoding='utf-8').split()
+        args = (self.tmp / 'args.txt').read_text().split()
         self.assertEqual(args[-3:], ['--autodiscover=false', 'owner/app', 'owner/other'])
         for name in ('app', 'other'):
             self.assertIn(f'checked owner/{name}@main: 1 package file(s)', proc.stdout)
@@ -2788,7 +2784,7 @@ class Cli(FixtureCase):
     ) -> tuple[int, str, str]:
         with tempfile.TemporaryDirectory() as tmp:
             sync = Path(tmp) / 'sync-owned.txt'
-            sync.write_text(owned, encoding='utf-8')
+            sync.write_text(owned)
             return self.run_cli(
                 'dominance',
                 '--git-dir',
@@ -2884,7 +2880,7 @@ class Cli(FixtureCase):
         with tempfile.TemporaryDirectory() as tmp:
             for path, text in files.items():
                 (Path(tmp) / path).parent.mkdir(parents=True, exist_ok=True)
-                (Path(tmp) / path).write_text(text, encoding='utf-8')
+                (Path(tmp) / path).write_text(text)
             git = ['git', '-C', tmp, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid']
             subprocess.run(['git', 'init', '-q', tmp], check=True)
             subprocess.run([*git, 'add', '.'], check=True)

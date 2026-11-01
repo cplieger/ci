@@ -1385,7 +1385,7 @@ class MainDefaultIdentity(unittest.TestCase):
     (testdata/audit/main-default.json), with its merge-model lines regraded
     squash-only. A public release.yaml caller there is HARD."""
 
-    SCENARIOS: ClassVar[list] = json.loads(MAIN_DEFAULT.read_text(encoding='utf-8'))['scenarios']
+    SCENARIOS: ClassVar[list] = json.loads(MAIN_DEFAULT.read_text())['scenarios']
 
     @staticmethod
     def squash_only(sc: dict) -> dict:
@@ -2000,8 +2000,7 @@ class IssueFiling(unittest.TestCase):
                     'visibility': visibility,
                     'repos': list(rows),
                 }
-            ),
-            encoding='utf-8',
+            )
         )
         return str(path)
 
@@ -2109,7 +2108,7 @@ class IssueFiling(unittest.TestCase):
         bad = Path(self.tmp.name) / 'bad.json'
         for text in ('{not json', '{"repos": {}}'):
             with self.subTest(text=text):
-                bad.write_text(text, encoding='utf-8')
+                bad.write_text(text)
                 self.assertEqual(self.file(FakeIssues(), str(bad))[0], 2)
         self.assertEqual(self.file(FakeIssues(), str(bad) + '.absent')[0], 2)
 
@@ -2407,8 +2406,7 @@ class Codeowners(unittest.TestCase):
                     'visibility': 'all',
                     'repos': [row('httpx', warnings=[CODEOWNERS_LINE])],
                 }
-            ),
-            encoding='utf-8',
+            )
         )
         fake = FakeIssues()
         with (
@@ -2459,7 +2457,7 @@ class AuditWorkflow(unittest.TestCase):
     WORKFLOW = Path(__file__).resolve().parent.parent / '.github' / 'workflows' / 'audit.yaml'
 
     def test_the_filing_token_is_scoped_to_the_filing_step(self):
-        text = self.WORKFLOW.read_text(encoding='utf-8')
+        text = self.WORKFLOW.read_text()
         doc = yaml.safe_load(text)
         job = doc['jobs']['audit']
         steps = {s.get('name'): s for s in job['steps']}

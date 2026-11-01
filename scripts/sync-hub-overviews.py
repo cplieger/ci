@@ -40,7 +40,7 @@ SHORT_DESCRIPTION_MAX_BYTES = 100
 def short_description(about: str) -> str:
     """The About line cut to Hub's byte limit without splitting a character."""
     raw = about.encode()[:SHORT_DESCRIPTION_MAX_BYTES]
-    return raw.decode('utf-8', 'ignore')
+    return raw.decode(errors='ignore')
 
 
 def hub_credentials() -> tuple[str, str]:

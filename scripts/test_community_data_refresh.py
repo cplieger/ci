@@ -776,6 +776,11 @@ CHECKOUT = {
     'uses': 'actions/checkout@SHA',
     'with': {'persist-credentials': False},
 }
+SETUP_PYTHON = {
+    'name': 'Setup Python',
+    'uses': 'actions/setup-python@SHA',
+    'with': {'python-version': '3.15'},
+}
 JOBS = {
     'plan': {
         'runs-on': 'ubuntu-26.04',
@@ -783,6 +788,7 @@ JOBS = {
         'outputs': {'matrix': '${{ steps.plan.outputs.matrix }}'},
         'steps': [
             CHECKOUT,
+            SETUP_PYTHON,
             {
                 'name': 'Plan the repositories',
                 'id': 'plan',
@@ -808,6 +814,7 @@ JOBS = {
         },
         'steps': [
             CHECKOUT,
+            SETUP_PYTHON,
             {
                 'name': 'Mint the read token',
                 'id': 'read-token',

@@ -934,9 +934,9 @@ class Repo:
             check=False,
         )
         if proc.returncode != 0:
-            stderr = proc.stderr.decode('utf-8', errors='replace').strip()
+            stderr = proc.stderr.decode(errors='replace').strip()
             raise GitReadError(f'{path}: git cat-file blob {sha}:{path}: {stderr}')
-        return proc.stdout.decode('utf-8', errors='surrogateescape')
+        return proc.stdout.decode(errors='surrogateescape')
 
     def parsed(self, sha: str, path: str) -> tuple[list[Record], str] | None:
         """(records, skeleton) of a surface file, None when the file is absent."""
@@ -1193,7 +1193,7 @@ def glob_pattern(pattern: str) -> re.Pattern:
 def load_sync_owned(path: str) -> list[re.Pattern]:
     """One path or glob (`glob_pattern`) per line; `#` comments."""
     try:
-        text = Path(path).read_text(encoding='utf-8')
+        text = Path(path).read_text()
     except OSError as exc:
         raise InventoryError(f'sync-owned set {path}: {exc}') from None
     patterns = [
@@ -1463,7 +1463,7 @@ def canonical_copy(canonical: Path, path: str) -> str | None:
         return None
     except OSError as exc:
         raise InventoryError(f'canonical copy {canonical / path}: {exc}') from None
-    return data.decode('utf-8', errors='surrogateescape')
+    return data.decode(errors='surrogateescape')
 
 
 def _judge_path(repo, base, main, target, path, owned, canonical, pins) -> dict:
@@ -1591,11 +1591,7 @@ def _security_shas(path: str | None) -> set[str]:
     if not path:
         return set()
     try:
-        return {
-            line.strip()
-            for line in Path(path).read_text(encoding='utf-8').splitlines()
-            if line.strip()
-        }
+        return {line.strip() for line in Path(path).read_text().splitlines() if line.strip()}
     except OSError as exc:
         raise InventoryError(f'security SHAs {path}: {exc}') from None
 

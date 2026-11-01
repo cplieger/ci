@@ -38,7 +38,7 @@ import json, os, sys, urllib.parse
 d = os.environ['FAKE_GH_DIR']
 args = sys.argv[1:]
 stdin = sys.stdin.read() if '--input' in args else ''
-with open(os.path.join(d, 'gh.argv'), 'a', encoding='utf-8') as f:
+with open(os.path.join(d, 'gh.argv'), 'a') as f:
     f.write(json.dumps(args) + '\\n')
 tags = os.environ.get('FAKE_TAGS', 'v1.0.0 v1.1.0').split()
 drafts = os.environ.get('FAKE_DRAFTS', '').split()
@@ -77,7 +77,7 @@ if args[:2] == ['api', '-i']:
         if tag not in tags:
             answer(404, {'message': 'Not Found'})
         edited = os.path.join(d, tag + '.edited.md')
-        body = open(edited, encoding='utf-8', newline='').read() if os.path.exists(edited) else 'old body'
+        body = open(edited, newline='').read() if os.path.exists(edited) else 'old body'
         answer(200, {'id': 1000 + tags.index(tag), 'tag_name': tag, 'body': body, 'assets': assets(tag)})
     if method == 'GET' and where.startswith('repos/owner/app/releases/assets/'):
         tag, _, name = where.rsplit('/', 1)[1].partition('--')
@@ -86,17 +86,17 @@ if args[:2] == ['api', '-i']:
         answer(200, open(os.path.join(d, tag + name.removeprefix('sbom')), 'rb').read())
     if method == 'PATCH' and where.startswith('repos/owner/app/releases/'):
         tag = tags[int(where.rsplit('/', 1)[1]) - 1000]
-        with open(os.path.join(d, tag + '.edited.md'), 'w', encoding='utf-8', newline='') as f:
+        with open(os.path.join(d, tag + '.edited.md'), 'w', newline='') as f:
             f.write(json.loads(stdin)['body'])
         answer(200, {})
     answer(404, {'message': f'fake gh: no route for {method} {path}'})
 elif args[:1] == ['api'] and '/pulls?' in args[1]:
-    with open(os.path.join(d, 'gh-api.argv'), 'a', encoding='utf-8') as f:
+    with open(os.path.join(d, 'gh-api.argv'), 'a') as f:
         f.write(args[1] + '\\n')
     base = args[1].split('&base=')[1].split('&')[0]
     pulls = os.path.join(d, f'pulls-{base}.json')
     first = args[1].endswith('&page=1') and os.path.exists(pulls)
-    print(open(pulls, encoding='utf-8').read() if first else '[]')
+    print(open(pulls).read() if first else '[]')
 else:
     sys.exit(f'fake gh: unexpected {args}')
 """
@@ -108,11 +108,11 @@ FAKE_COSIGN = """\
 #!/usr/bin/env python3
 import hashlib, json, os, sys
 args = sys.argv[1:]
-with open(os.path.join(os.environ['FAKE_GH_DIR'], 'cosign.argv'), 'a', encoding='utf-8') as f:
+with open(os.path.join(os.environ['FAKE_GH_DIR'], 'cosign.argv'), 'a') as f:
     f.write(' '.join(args) + '\\n')
 if args[:1] != ['verify-blob']:
     sys.exit(f'fake cosign: unexpected {args}')
-bundle = json.load(open(args[args.index('--bundle') + 1], encoding='utf-8'))
+bundle = json.load(open(args[args.index('--bundle') + 1]))
 for flag, key in (('--certificate-github-workflow-repository', 'repository'),
                   ('--certificate-github-workflow-sha', 'sha')):
     if flag in args and args[args.index(flag) + 1] != bundle[key]:
@@ -151,7 +151,7 @@ class BackfillRenderTest(unittest.TestCase):
         bin_dir = self.tmp / 'bin'
         bin_dir.mkdir()
         for name, body in (('gh', FAKE_GH), ('git-cliff', FAKE_CLIFF), ('cosign', FAKE_COSIGN)):
-            (bin_dir / name).write_text(body, encoding='utf-8')
+            (bin_dir / name).write_text(body)
             (bin_dir / name).chmod(0o755)
         self.env['PATH'] = f'{bin_dir}{os.pathsep}{self.env["PATH"]}'
         self.cliff = str(bin_dir / 'git-cliff')
@@ -169,7 +169,7 @@ class BackfillRenderTest(unittest.TestCase):
     def commit(self, files: dict[str, str], message: str) -> None:
         for path, text in files.items():
             (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
-            (self.repo / path).write_text(text, encoding='utf-8')
+            (self.repo / path).write_text(text)
         self.git('add', '-A')
         self.git('commit', '-qm', message)
 
@@ -240,7 +240,7 @@ class BackfillRenderTest(unittest.TestCase):
         )
 
     def cliff_argv(self) -> str:
-        return (self.tmp / 'cliff.argv').read_text(encoding='utf-8')
+        return (self.tmp / 'cliff.argv').read_text()
 
     def release_sbom(
         self,
@@ -255,15 +255,13 @@ class BackfillRenderTest(unittest.TestCase):
         (default the tag's commit) made over `packages`; `shipped` replaces the
         asset's content after signing."""
         signed = sbom(packages)
-        (self.tmp / f'{tag}.spdx.json').write_text(sbom(shipped or packages), encoding='utf-8')
+        (self.tmp / f'{tag}.spdx.json').write_text(sbom(shipped or packages))
         bundle = {
-            'sha256': hashlib.sha256(signed.encode('utf-8')).hexdigest(),
+            'sha256': hashlib.sha256(signed.encode()).hexdigest(),
             'repository': repo,
             'sha': signed_at or self.git('rev-parse', f'{tag}^{{commit}}'),
         }
-        (self.tmp / f'{tag}.spdx.json.sigstore.json').write_text(
-            json.dumps(bundle), encoding='utf-8'
-        )
+        (self.tmp / f'{tag}.spdx.json.sigstore.json').write_text(json.dumps(bundle))
 
     def test_two_branch_renders_through_render_notes_with_both_sboms(self):
         self.build(bump_dep=True)
@@ -286,7 +284,7 @@ class BackfillRenderTest(unittest.TestCase):
             r'--tag-pattern ^v[0-9]+\.[0-9]+\.[0-9]+$ --tag v1.1.0 --exclude-path yamlenv/**', argv
         )
         self.assertIn(f'v1.0.0..{self.git("rev-parse", "v1.1.0")}', argv)
-        verified = (self.tmp / 'cosign.argv').read_text(encoding='utf-8')
+        verified = (self.tmp / 'cosign.argv').read_text()
         self.assertEqual(verified.count('verify-blob --bundle '), 2)
         self.assertIn(
             '--certificate-oidc-issuer https://token.actions.githubusercontent.com '
@@ -337,7 +335,7 @@ class BackfillRenderTest(unittest.TestCase):
         out = self.backfill(cliff_out='', FAKE_TAGS='v1.0.0 v1.1.0 v1.2.0')
         self.assertNotIn('1.0 to 1.1', out)
         self.assertNotIn('1.1 to 1.2', out)
-        verified = (self.tmp / 'cosign.argv').read_text(encoding='utf-8')
+        verified = (self.tmp / 'cosign.argv').read_text()
         self.assertIn(
             f'--certificate-github-workflow-sha {self.git("rev-parse", "v1.2.0")} ', verified
         )
@@ -356,7 +354,7 @@ class BackfillRenderTest(unittest.TestCase):
         )
         self.assertIn('+- `busybox` 1.0 to 1.1', out)
         self.assertIn('+- `busybox` 1.1 to 1.2', out)
-        verified = (self.tmp / 'cosign.argv').read_text(encoding='utf-8')
+        verified = (self.tmp / 'cosign.argv').read_text()
         self.assertEqual(verified.count('verify-blob --bundle '), 3)
 
     def test_two_branch_never_publishes_a_tampered_sbom(self):
@@ -365,7 +363,7 @@ class BackfillRenderTest(unittest.TestCase):
         self.release_sbom('v1.1.0', {'busybox': '1.1'}, shipped={'busybox': '6.6.6-forged'})
         out = self.backfill('--apply', cliff_out='')
         self.assertIn('applied v1.1.0', out)
-        edited = (self.tmp / 'v1.1.0.edited.md').read_text(encoding='utf-8')
+        edited = (self.tmp / 'v1.1.0.edited.md').read_text()
         self.assertIn('**Full changelog**', edited)
         self.assertNotIn('System packages', edited)
         self.assertNotIn('forged', edited)
@@ -396,7 +394,7 @@ class BackfillRenderTest(unittest.TestCase):
             }
             for ref, sha, labels in prs
         ]
-        (self.tmp / f'pulls-{base}.json').write_text(json.dumps(body), encoding='utf-8')
+        (self.tmp / f'pulls-{base}.json').write_text(json.dumps(body))
 
     def test_two_branch_marks_only_updates_merged_through_a_security_pr(self):
         self.build(bump_dep=True, bump_both=True)
@@ -410,7 +408,7 @@ class BackfillRenderTest(unittest.TestCase):
         out = self.backfill(cliff_out='')
         self.assertIn('+- `example.com/dep` v1.0.0 to v1.1.0 (Go, security update)', out)
         self.assertIn('+- `example.com/other` v1.0.0 to v1.2.0 (Go)', out)
-        reads = (self.tmp / 'gh-api.argv').read_text(encoding='utf-8')
+        reads = (self.tmp / 'gh-api.argv').read_text()
         for base in ('main', 'dev'):
             self.assertIn(f'repos/owner/app/pulls?state=closed&base={base}&sort=updated', reads)
 
@@ -438,8 +436,7 @@ class BackfillRenderTest(unittest.TestCase):
         self.build(bump_dep=False)
         carve_outs = self.tmp / 'carve-outs.yaml'
         carve_outs.write_text(
-            'carve_outs:\n  - repo: owner/app\n    tag: v1.1.0\n    reason: hand-written\n',
-            encoding='utf-8',
+            'carve_outs:\n  - repo: owner/app\n    tag: v1.1.0\n    reason: hand-written\n'
         )
         for apply, summary in (
             ([], 'DRY-RUN (use --apply to edit): 0 would change'),
@@ -470,14 +467,14 @@ class BackfillRenderTest(unittest.TestCase):
         self.assertFalse((self.tmp / 'cliff.argv').exists())
 
     def rest_calls(self) -> list[list[str]]:
-        argv = (self.tmp / 'gh.argv').read_text(encoding='utf-8').splitlines()
+        argv = (self.tmp / 'gh.argv').read_text().splitlines()
         return [json.loads(line) for line in argv]
 
     def test_apply_patches_the_release_by_id_over_rest_and_reads_it_back(self):
         self.build(bump_dep=False)
         out = self.backfill('--apply', cliff_out='### Fixed\n\n- Root fix (#2)\n')
         self.assertIn('applied v1.1.0', out)
-        edited = (self.tmp / 'v1.1.0.edited.md').read_text(encoding='utf-8')
+        edited = (self.tmp / 'v1.1.0.edited.md').read_text()
         self.assertEqual(
             edited,
             '### Fixed\n\n- Root fix (#2)\n\n'
@@ -567,11 +564,11 @@ class CarveOutListTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / 'carve-outs.yaml'
 
     def load(self, text: str, repo: str) -> dict[str, str]:
-        self.path.write_text(text, encoding='utf-8')
+        self.path.write_text(text)
         return backfill.load_carve_outs(self.path, repo)
 
     def assert_refused(self, text: str) -> str:
-        self.path.write_text(text, encoding='utf-8')
+        self.path.write_text(text)
         err = io.StringIO()
         with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as raised:
             backfill.load_carve_outs(self.path, 'owner/one')

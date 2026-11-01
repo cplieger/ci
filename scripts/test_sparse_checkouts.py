@@ -19,7 +19,7 @@ SCRIPTS = ROOT / 'scripts'
 def first_party_imports(path: pathlib.Path) -> set[str]:
     """The scripts/ modules a script imports by name, at any depth of its body."""
     names = set()
-    for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+    for node in ast.walk(ast.parse(path.read_text())):
         if isinstance(node, ast.Import):
             names.update(alias.name.split('.')[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
@@ -44,7 +44,7 @@ def sparse_lists():
     files = sorted((ROOT / '.github/workflows').glob('*.y*ml'))
     files += sorted((ROOT / 'actions').glob('*/action.y*ml'))
     for path in files:
-        doc = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+        doc = yaml.safe_load(path.read_text()) or {}
         steps = [s for job in (doc.get('jobs') or {}).values() for s in job.get('steps') or []]
         steps += (doc.get('runs') or {}).get('steps') or []
         for step in steps:

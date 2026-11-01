@@ -7,9 +7,6 @@ owns the sentinel format, the rolling history table (one row per run, keyed by
 run id, trimmed to a window), the trend and regression tests over that table,
 and the notes carry-over. Rendering the per-tracker prose stays in each
 aggregator.
-
-Runs on the runner's default python3 (3.12): weekly-gremlins does not pin an
-interpreter.
 """
 
 from __future__ import annotations
@@ -48,9 +45,9 @@ def sentinel_inner(existing: str, name: str) -> str | None:
     return m.group(1) if m else None
 
 
-def history_lines(existing: str, sentinel: str) -> list[str]:
-    """The data rows of the history table inside `sentinel`, newest first."""
-    inner = sentinel_inner(existing, sentinel)
+def history_lines(existing: str, block: str) -> list[str]:
+    """The data rows of the history table inside the `block` sentinel pair, newest first."""
+    inner = sentinel_inner(existing, block)
     if inner is None:
         return []
     return [line.rstrip() for line in inner.splitlines() if DATA_ROW_RE.match(line)]
@@ -61,16 +58,16 @@ def split_cells(row: str) -> list[str]:
     return [c.strip() for c in row.split('|') if c.strip()]
 
 
-def history_rows(existing: str, sentinel: str, run_id: str = '') -> list[list[str]]:
-    return [split_cells(row) for row in prior_lines(existing, sentinel, run_id)]
+def history_rows(existing: str, block: str, run_id: str = '') -> list[list[str]]:
+    return [split_cells(row) for row in prior_lines(existing, block, run_id)]
 
 
-def prior_lines(existing: str, sentinel: str, run_id: str = '') -> list[str]:
+def prior_lines(existing: str, block: str, run_id: str = '') -> list[str]:
     """History rows written by runs other than `run_id`, newest first.
 
     A re-aggregate's own earlier row is the same measurement, not history.
     """
-    rows = history_lines(existing, sentinel)
+    rows = history_lines(existing, block)
     if run_id:
         rows = [
             r for r in rows if (own := RUN_MARKER_RE.search(r)) is None or own.group(1) != run_id
@@ -88,7 +85,7 @@ def percent_cell(cells: list[str], index: int) -> float | None:
         return None
 
 
-def history_column(existing: str, sentinel: str, index: int = 1) -> list[float]:
+def history_column(existing: str, block: str, index: int = 1) -> list[float]:
     """Every readable percent value in one column of the history, newest first.
 
     Feeds the trend mean and the regression test, where order does not matter
@@ -97,7 +94,7 @@ def history_column(existing: str, sentinel: str, index: int = 1) -> list[float]:
     itself, because dropping unreadable rows here would shift what [0] means.
     """
     values = []
-    for cells in history_rows(existing, sentinel):
+    for cells in history_rows(existing, block):
         value = percent_cell(cells, index)
         if value is not None:
             values.append(value)
@@ -106,7 +103,7 @@ def history_column(existing: str, sentinel: str, index: int = 1) -> list[float]:
 
 def update_history_block(
     existing: str,
-    sentinel: str,
+    block: str,
     header: str,
     new_row: str,
     run_id: str = '',
@@ -120,7 +117,7 @@ def update_history_block(
     ONE row: a re-run of the aggregate job reads the same artifacts, so its row
     replaces the one carrying its run id instead of counting twice in the mean.
     """
-    rows = prior_lines(existing, sentinel, run_id)
+    rows = prior_lines(existing, block, run_id)
 
     prev = percent_cell(split_cells(rows[0]), 1) if rows else None
     current = percent_cell(split_cells(new_row), 1)
@@ -137,7 +134,7 @@ def update_history_block(
         row += f' <!-- run:{run_id} -->'
     rows.insert(0, row)
     rows = rows[:keep]
-    return sentinel_block(sentinel, header + '\n' + '\n'.join(rows))
+    return sentinel_block(block, header + '\n' + '\n'.join(rows))
 
 
 def trend_marker(mean: float, history: list[float], weeks: int = ROLLING_WEEKS) -> str:

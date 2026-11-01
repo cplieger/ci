@@ -553,9 +553,7 @@ def main() -> int:
     p.add_argument("--badge-file", type=Path, default=None,
                    help="Write a shields `endpoint` JSON (label 'mutation', "
                         # Escaped: argparse validates help strings as %-format
-                        # templates (Python 3.14 raises ValueError on a bare %,
-                        # which took the whole script down before it parsed a
-                        # single argument — the runner is on 3.12 today).
+                        # templates (3.14+ raises ValueError on a bare %).
                         "message '<efficacy_mean>%%') here for the README badge")
     p.add_argument("--attempts-marker-file", type=Path, default=None,
                    help="Write the count of parseable attempts here. The "

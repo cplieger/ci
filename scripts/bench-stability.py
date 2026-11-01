@@ -140,7 +140,7 @@ def main() -> int:
 
     for path in args.inputs:
         label = path.rsplit('/', 1)[-1].removesuffix('.txt')
-        with open(path, encoding='utf-8') as fh:
+        with open(path) as fh:
             samples = parse(fh.read())
         if not samples:
             print(f'{path}: no Benchmark lines found', file=sys.stderr)

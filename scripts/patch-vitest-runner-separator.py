@@ -79,13 +79,8 @@ EXIT_UPSTREAM_FIXED = 3
 
 
 def read_version(package_json: Path) -> str | None:
-    # Two single-type excepts, deliberately: a tuple form gets reformatted into
-    # PEP 758 (`except A, B:`) against this repo's py314 target, and the runner
-    # that executes this script is ubuntu-24.04's system python3 (3.12), which
-    # rejects that at PARSE time. Same trap that left stryker-aggregate.py
-    # unparseable for weeks. Nothing here needs 3.14 syntax, so it uses none.
     try:
-        raw = package_json.read_text(encoding='utf-8')
+        raw = package_json.read_text()
     except OSError:
         return None
     try:
@@ -107,7 +102,7 @@ def major(version: str | None) -> int | None:
 def patch_file(path: Path, *, check_only: bool) -> tuple[str, str]:
     """Return (verdict, detail). Verdict is one of ok, patched, upstream, anchor, io."""
     try:
-        text = path.read_text(encoding='utf-8')
+        text = path.read_text()
     except OSError as exc:
         return 'io', str(exc)
 
@@ -128,7 +123,7 @@ def patch_file(path: Path, *, check_only: bool) -> tuple[str, str]:
     if check_only:
         return 'patched', 'would patch 1 occurrence'
     try:
-        path.write_text(text.replace(STOCK, PATCHED, 1), encoding='utf-8')
+        path.write_text(text.replace(STOCK, PATCHED, 1))
     except OSError as exc:
         return 'io', str(exc)
     return 'patched', 'patched 1 occurrence'

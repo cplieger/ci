@@ -64,7 +64,7 @@ class SyncHeaders(unittest.TestCase):
             if marker is None:
                 continue
             with self.subTest(source=source):
-                lines = (ROOT / source).read_text(encoding='utf-8').splitlines()
+                lines = (ROOT / source).read_text().splitlines()
                 # A shebang must stay on line 1, so the header follows it.
                 first = lines[1] if lines and lines[0].startswith('#!') else lines[0]
                 pattern = rf'{re.escape(marker)} Synced from cplieger/ci/{re.escape(source)}[ .]'

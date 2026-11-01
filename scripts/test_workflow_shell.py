@@ -40,7 +40,7 @@ COVERED_STEPS = (
     (
         '.github/workflows/self-ci.yaml',
         'release-channel-scripts',
-        'Probe the release-channel scripts (default python3)',
+        'Probe the release-channel scripts',
     ),
 )
 # `set -uo pipefail` is accepted for a block that inspects exit codes itself.

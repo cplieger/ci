@@ -581,7 +581,7 @@ class Title(unittest.TestCase):
 
 
 def action_body() -> tuple[dict, str]:
-    step = yaml.safe_load(ACTION.read_text())['runs']['steps'][0]
+    step = next(s for s in yaml.safe_load(ACTION.read_text())['runs']['steps'] if 'run' in s)
     return step['env'], step['run']
 
 

@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
     table = render_table(rows)
     summary = os.environ.get('GITHUB_STEP_SUMMARY')
     if summary:
-        with open(summary, 'a', encoding='utf-8') as fh:
+        with open(summary, 'a') as fh:
             fh.write(table)
     print(table, end='')
     print(

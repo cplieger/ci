@@ -408,7 +408,7 @@ def audit(root: Path) -> Audit:
             excluded['deleted'] += 1
             continue
         try:
-            text = path.read_text(encoding='utf-8', errors='replace')
+            text = path.read_text(errors='replace')
         except OSError as exc:
             raise RuntimeError(f'cannot read {relative}: {exc}') from exc
         reason = exclusion(relative, text)

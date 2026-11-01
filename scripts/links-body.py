@@ -2,8 +2,7 @@
 """Render the `Broken external links` tracker body from a lychee markdown report.
 
 weekly-links.yaml writes the body once per repo and hands it to tracker_issue.py;
-the report itself is lychee's `--format markdown` output. Runs on the runner's
-default python3 (3.12).
+the report itself is lychee's `--format markdown` output.
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ PREAMBLE = (
 
 
 def build_body(report: bytes, run_url: str) -> str:
-    text = report[:REPORT_CAP_BYTES].decode('utf-8', errors='replace').rstrip('\n')
+    text = report[:REPORT_CAP_BYTES].decode(errors='replace').rstrip('\n')
     return PREAMBLE + trackerlib.sentinel_block('links-data', text) + f'\n\n_Run: {run_url}_\n'
 
 

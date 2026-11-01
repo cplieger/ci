@@ -10,7 +10,7 @@ Every outcome is read from the response `gh api -i` prints, on a non-2xx exit to
 - A 5xx or a transport failure backs off 2, 4, 8 s for GET, PUT, PATCH and DELETE. A
   POST is retried only after a rate-limit refusal: a failed POST may have been applied.
 
-Stdlib only; runs on the runner's system python3 (3.12).
+Stdlib only.
 """
 
 from __future__ import annotations
@@ -208,7 +208,7 @@ def error_detail(resp: Response) -> str:
     try:
         doc = json.loads(resp.body)
     except ValueError:
-        return ' '.join(resp.body.decode('utf-8', 'replace').split())[:200]
+        return ' '.join(resp.body.decode(errors='replace').split())[:200]
     if not isinstance(doc, dict):
         return ''
     codes = [

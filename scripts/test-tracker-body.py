@@ -94,10 +94,6 @@ class GoldenBodyTest(unittest.TestCase):
             str(FIXTURES / 'gremlins'),
         )
 
-    @unittest.skipIf(
-        sys.version_info < (3, 14),
-        'stryker-aggregate.py uses PEP 758 syntax; weekly-stryker.yaml pins python 3.14',
-    )
     def test_stryker_golden(self) -> None:
         self.check_golden(
             'stryker',

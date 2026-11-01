@@ -176,6 +176,11 @@ jobs:
           # the badge push authenticates via CI_SCHEDULE inside the script.
           persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Clone target repo at pinned SHA
         run: |
           set -euo pipefail
@@ -407,13 +412,6 @@ jobs:
           path: artifacts
           pattern: stryker-*
 
-      # stryker-aggregate.py is written against the release-current Python the
-      # scripts are authored on, and uses PEP 758 (`except A, B:`) which needs
-      # 3.14. ubuntu-24.04's own `python3` is 3.12, which rejects it at PARSE
-      # time — so every repo failed with `SyntaxError: multiple exception types
-      # must be parenthesized`, the job exited 1, and no repo ever received a
-      # tracker issue. Pin the interpreter rather than downgrading the script
-      # (same call weekly-bench.yaml makes for bench-reduce.py).
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
