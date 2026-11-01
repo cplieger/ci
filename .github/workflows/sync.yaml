@@ -77,6 +77,14 @@ jobs:
         with:
           python-version: "3.15"
 
+      # classify-repos.py and sync-files.py read YAML; the set-up interpreter has no PyYAML.
+      - name: Install PyYAML
+        run: |
+          set -euo pipefail
+          # renovate: datasource=pypi depName=PyYAML
+          VERSION=6.0.3
+          pip install -q "PyYAML==${VERSION}"
+
       # Regenerate the repo↔file manifest fresh on every run, then hand it
       # straight to scripts/sync-files.py below via --manifest. The file is
       # gitignored and never committed: it's a build artifact, and a committed
