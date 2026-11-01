@@ -519,7 +519,7 @@ chk "M25 a dry run passes every check and moves nothing" "$(DRY_RUN=true run_pro
 out=$(PREVIEW_FAILS=1 IMAGE_DIGEST="sha256:$(printf '%064d' 0 | tr 0 d)" run_promote image-preview-failed)
 chk "M25 a failed preview still tags an image lane and reaches move" \
   "$out|$(jq -r .failed "$WORK/promote-image-preview-failed.preview.json")|$(jq -r '.ran | join(",")' "$WORK/promote-image-preview-failed.tag.json")|$(head_of main)" \
-  "move reached Promote|the hook before 'Preview' exited 1|Checkout (checkout: --cwd),Tag the promoted image (skipped)|$M"
+  "move reached Promote|the hook before 'Preview' exited 1|Checkout (checkout: --cwd),Setup Python,Tag the promoted image (skipped)|$M"
 out=$(PREVIEW_FAILS=1 run_promote r4)
 R4=$(head_of main)
 chk "M25 then the promotion, its preview failed too" "$out|$(is_r "$R4")" "promoted $R4|yes"
