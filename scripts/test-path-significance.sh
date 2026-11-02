@@ -212,6 +212,7 @@ chk "S11r so does a push range with no anchor" \
   "$(release S11rp dev "$D6" "" "$D7")" "true|[]|[]"
 put deadset.json '{}'
 put web/deadset-ignore.json '[]'
+put deadset-baseline.json '{}'
 put web/knip.json '{}'
 put web/knip.config.ts 'export default {}'
 D8=$(commit "refactor: dead-code adjudications only")

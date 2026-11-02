@@ -31,12 +31,12 @@ permissions:
 # so these pins only work as a set: the meta ci.yaml's deadset-canary job runs
 # this workflow over fixed repositories to prove each set before it ships.
 env:
-  # renovate: datasource=go depName=github.com/cplieger/deadset
-  DEADSET_VERSION: v1.12.0
-  # renovate: datasource=go depName=github.com/cplieger/deadset-go
-  DEADSET_GO_VERSION: v1.28.0
+  # renovate: datasource=go depName=github.com/cplieger/deadset/v2
+  DEADSET_VERSION: v2.0.0-dev.21
+  # renovate: datasource=go depName=github.com/cplieger/deadset-go/v2
+  DEADSET_GO_VERSION: v2.0.0-dev.25
   # renovate: datasource=npm depName=@cplieger/deadset-ts
-  DEADSET_TS_VERSION: 7.1.0
+  DEADSET_TS_VERSION: 8.0.0-dev.14
 
 jobs:
   analyze:
@@ -60,8 +60,9 @@ jobs:
 
       # The languages are deadset's own choice, replayed so the job installs
       # what that choice needs: analysis.languages from deadset.json, else the
-      # central file's, else deadset's detection by file name, which records
-      # every non-directory entry (commands.md "How languages are detected").
+      # central file's, else deadset's detection by file name, in which each
+      # language skips its own analyzer's directories (commands.md "How
+      # languages are detected"). proto needs no setup, so it is not replayed.
       # A nested module's central file names go alone, because deadset-ts at
       # the root already reads every tsconfig under it; a root with no go.mod
       # leaves out the Go its modules hold. A language whose setup cannot be
@@ -86,19 +87,16 @@ jobs:
           fi
           if [ -z "$languages" ]; then
             languages_from=detected
-            names="$(find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o \( -type f -o -type l \) -print | sed 's|.*/||')"
-            go_names="$names"
-            if [ ! -f go.mod ]; then
-              # meta ci.yaml's go-nested skips a module under static/ or dist/, so no target covers its Go.
-              go_names="$({
-                find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' -o -exec test -e '{}/go.mod' \; \) -prune \) -o \( -type f -o -type l \) -print
-                find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o -name go.mod \( -path '*/static/*' -o -path '*/dist/*' \) -print
-              } | sed 's|.*/||')"
-            fi
             found=()
-            if grep -qxE 'go\.mod|.+\.go' <<<"$go_names"; then found+=(go); fi
-            if grep -qxE 'tsconfig.*\.json' <<<"$names" \
-              || { grep -qE '\.(ts|tsx|mts|cts)$' <<<"$names" && grep -qx 'package\.json' <<<"$names"; }; then
+            if [ -n "$(find . -mindepth 1 \
+              \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.*' -o -name '_*' \) -prune \) \
+              -o ! -type d \( -name go.mod -o \( -name '*.go' ! -name '.*' ! -name '_*' \) \) -print -quit)" ]; then
+              found+=(go)
+            fi
+            if [ -n "$(find . -mindepth 1 \( -type d \( -name node_modules -o -name .git \) -prune \) \
+              -o ! -type d \( -name 'tsconfig*.json' -o -name 'jsconfig*.json' \
+              -o \( \( -name '*.js' -o -name '*.jsx' -o -name '*.mjs' -o -name '*.cjs' \) \
+              ! -name '*.min.js' ! -name '*.min.cjs' ! -name '*.min.mjs' \) \) -print -quit)" ]; then
               found+=(ts)
             fi
             languages="$(IFS=,; printf '%s' "${found[*]:-}")"
@@ -120,15 +118,19 @@ jobs:
             echo "::error::Go is in scope at $TARGET ($languages_from), but $TARGET has no go.mod to load it from. Add a root deadset.json whose analysis.languages leaves go out, or analyze the module at its own root."
             exit 1
           fi
+          # JavaScript with no package.json, such as a node script, has nothing
+          # to install.
           npm_dirs=()
-          while IFS= read -r lock; do
-            case "/$lock" in
+          manifests=0
+          while IFS= read -r file; do
+            case "/$file" in
               */node_modules/* | */testdata/* | */vendor/* | */.*/*) continue ;;
+              */package.json) manifests=$((manifests + 1)) ;;
+              *) if [ "$ts" = true ]; then npm_dirs+=("$(dirname "$file")"); fi ;;
             esac
-            if [ "$ts" = true ]; then npm_dirs+=("$(dirname "$lock")"); fi
-          done < <(git ls-files -- ':(glob)**/package-lock.json')
-          if [ "$ts" = true ] && [ "${#npm_dirs[@]}" -eq 0 ]; then
-            echo "::error::TypeScript is in scope at $TARGET ($languages_from), but no package-lock.json is tracked there, so its dependencies cannot be installed for deadset-ts. Commit the lockfile, or add a root deadset.json whose analysis.languages leaves ts out."
+          done < <(git ls-files -- ':(glob)**/package-lock.json' ':(glob)**/package.json')
+          if [ "$ts" = true ] && [ "$manifests" -gt 0 ] && [ "${#npm_dirs[@]}" -eq 0 ]; then
+            echo "::error::TypeScript is in scope at $TARGET ($languages_from), but no package-lock.json is tracked under it, so its dependencies cannot be installed for deadset-ts. Commit the lockfile, or add a root deadset.json whose analysis.languages leaves ts out."
             exit 1
           fi
           kind=library
@@ -181,7 +183,9 @@ jobs:
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '26'
-          cache: npm
+          # setup-node throws on a cache with no lockfile:
+          # https://github.com/actions/setup-node/blob/949feb2413d6458794dcd2491c4babbbce0c15c1/src/cache-restore.ts#L84-L87
+          cache: ${{ steps.target.outputs.lockfiles != '' && 'npm' || '' }}
           cache-dependency-path: ${{ steps.target.outputs.lockfiles }}
 
       # setup-go exports GOTOOLCHAIN=local, and deadset and deadset-go may need
@@ -209,9 +213,9 @@ jobs:
           }
           export GOTOOLCHAIN=auto
           echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
-          retry go install "github.com/cplieger/deadset/cmd/deadset@${DEADSET_VERSION}"
+          retry go install "github.com/cplieger/deadset/v2/cmd/deadset@${DEADSET_VERSION}"
           if [ "$GO" = true ]; then
-            retry go install "github.com/cplieger/deadset-go/cmd/deadset-go@${DEADSET_GO_VERSION}"
+            retry go install "github.com/cplieger/deadset-go/v2/cmd/deadset-go@${DEADSET_GO_VERSION}"
           fi
           if [ "$TS" = true ]; then
             npm install --global --ignore-scripts --no-audit --no-fund \
@@ -250,7 +254,8 @@ jobs:
       # An npm package can ship Go source (flatted ships golang/pkg/flatted),
       # and `./...` enters node_modules unless go.mod ignores it or a go.mod
       # fences the npm project off. deadset reads deadset.json,
-      # deadset-ignore.json and deadset-edges.json at the target root only.
+      # deadset-ignore.json, deadset-baseline.json and deadset-edges.json at
+      # the target root only.
       # Flags outrank deadset.json, so --formats, which the SARIF upload
       # needs, is the one key a repository cannot set; any other flag would
       # take a key from it.
@@ -280,7 +285,7 @@ jobs:
           misplaced=0
           while IFS= read -r dir; do
             if [ -z "$dir" ] || [ "$dir" = . ]; then continue; fi
-            for name in deadset.json deadset-ignore.json deadset-edges.json; do
+            for name in deadset.json deadset-ignore.json deadset-baseline.json deadset-edges.json; do
               if [ -n "$(git ls-files -- "$dir/$name")" ]; then
                 rel="$dir/$name"
                 if [ "$TARGET" != . ]; then rel="$TARGET/$rel"; fi
@@ -311,7 +316,7 @@ jobs:
               exit 1
               ;;
             3)
-              echo "::error::deadset produced no answer (exit 3), so nothing was checked. An analyzer was missing, refused or failed, and its output is above."
+              echo "::error::deadset produced no answer (exit 3), so nothing was checked. The class line above names the cause: a setup failure is fixed in the repository, a run failure in the install or the tools."
               exit 1
               ;;
             4)
