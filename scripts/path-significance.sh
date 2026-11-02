@@ -100,7 +100,7 @@ EXCLUDE_PATTERNS=(
   # Root-anchored only: a nested static-src/tsconfig.json is a tsc build input
   # of the web client a Go binary embeds.
   '^tsconfig\.json$'
-  '(^|/)deadset(-ignore|-edges)?\.json$'
+  '(^|/)deadset(-ignore|-baseline|-edges)?\.json$'
   # knip's configs.
   '(^|/)(\.knip\.jsonc?|knip\.(jsonc?|[jt]s)|knip\.config\.[jt]s)$'
   '(^|/)stryker\.config\.json$'
