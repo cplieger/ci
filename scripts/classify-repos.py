@@ -107,8 +107,8 @@ def ts_config_group(ts_dir):
     The ESLint base is the one config a consumer imports rather than names on
     a command line, and an import resolves its `@eslint/js` and
     `typescript-eslint` imports from its own folder upward, so it lands beside
-    the project's package.json. The other three stay at the root, where the
-    lint steps read them."""
+    the project's package.json or jsr.json. The other three stay at the root,
+    where the lint steps read them."""
     if not ts_dir:
         return TS_CONFIG
     base, *rest = TS_CONFIG.files
