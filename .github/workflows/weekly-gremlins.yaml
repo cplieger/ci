@@ -247,6 +247,13 @@ jobs:
           echo "workers<=${workers} (nproc=${nproc_n}, mem-cap=${max_by_mem})"
           echo "GOMEMLIMIT=${gomem_mb}MiB (${gomem_solo_mb}MiB solo) container=${cap_mb}MiB (MemAvailable=${avail_kb}KiB)"
 
+          # A Go suite may shell out to node (wiregen runs its generated decoders),
+          # and go-ci.yaml gets it from the runner image; the golang image has none.
+          node_mount=()
+          if node_bin=$(command -v node); then
+            node_mount=(-v "$(readlink -f "$node_bin")":/usr/local/bin/node:ro)
+          fi
+
           rc=0
           MERGE_ARGS=()
           for m in $MODULES; do
@@ -266,6 +273,7 @@ jobs:
               -v "${PWD}/target":/work \
               -v "${PWD}/scripts/gremlins-run.sh":/gremlins-run.sh:ro \
               -v "${PWD}/scripts/gremlins-pkgname.patch":/gremlins-pkgname.patch:ro \
+              "${node_mount[@]}" \
               -w "/work/${m}" \
               -e GREMLINS_VERSION="${GREMLINS_VERSION}" \
               -e GREMLINS_PATCH=/gremlins-pkgname.patch \
