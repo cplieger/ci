@@ -5,7 +5,7 @@
       "code": "DS1001",
       "symbol": "ts://./configs/eslint.config.base.mjs#default:alias",
       "path": "configs/eslint.config.base.mjs",
-      "reason": "The shared ESLint base that scripts/sync-files.py copies to the root of each repository in the TypeScript lint/format configs group of scripts/classify-repos.py, where a root npm package's eslint.config.mjs imports it. This repository is its source and never imports it."
+      "reason": "The shared ESLint base that scripts/sync-files.py copies beside the npm project of each repository in the TypeScript lint/format configs groups of scripts/classify-repos.py, where that project's eslint.config.mjs imports it. This repository is its source and never imports it."
     }
   ]
 }

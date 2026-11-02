@@ -96,6 +96,28 @@ TS_CONFIG = Group(
         ('configs/htmlvalidate.json', '.htmlvalidate.json'),
     ),
 )
+# The nested frontend folders ci.yaml's web job probes, in its order (a test
+# holds the two lists equal).
+WEB_DIRS = ('static-src', 'web', 'internal/server/static-src', 'internal/webui/static-src')
+
+
+def ts_config_group(ts_dir):
+    """TS_CONFIG for a repo whose npm project is in `ts_dir` ('' for the root).
+
+    The ESLint base is the one config a consumer imports rather than names on
+    a command line, and an import resolves its `@eslint/js` and
+    `typescript-eslint` imports from its own folder upward, so it lands beside
+    the project's package.json. The other three stay at the root, where the
+    lint steps read them."""
+    if not ts_dir:
+        return TS_CONFIG
+    base, *rest = TS_CONFIG.files
+    return Group(
+        f'{TS_CONFIG.comment} (npm project in {ts_dir})',
+        ((base[0], f'{ts_dir}/{base[1]}'), *rest),
+    )
+
+
 RELEASE = Group(
     'Release (unified auto-detect)',
     (('.github/workflow-templates/release.yml', '.github/workflows/release.yaml'),),
@@ -153,9 +175,14 @@ def render_files(group):
     return '\n'.join(lines)
 
 
+def every_group():
+    """GROUPS' groups plus the TS_CONFIG variant for each of WEB_DIRS."""
+    return [group for _key, group in GROUPS] + [ts_config_group(d) for d in WEB_DIRS]
+
+
 def sync_owned_patterns():
     """Every consumer path any group can write, sorted; reads no API."""
-    return sorted({dest for _key, group in GROUPS for _source, dest in pairs(group)})
+    return sorted({dest for group in every_group() for _source, dest in pairs(group)})
 
 
 def canonical_sources(repo):
@@ -164,7 +191,7 @@ def canonical_sources(repo):
     tags read fails."""
     tier = cliff_tier(repo.split('/')[-1])
     sources = {}
-    for _key, group in GROUPS:
+    for group in every_group():
         if group in CLIFF.values() and group is not CLIFF[tier]:
             continue
         sources.update((dest, source) for source, dest in pairs(group))
@@ -285,6 +312,13 @@ def classify(repo, ref='HEAD'):
     # meta CI. A marker, not "not releaseable": a repo that releases nothing may
     # keep its own CI, which the sync must never overwrite.
     has_publish = '.github/workflows/publish.yaml' in tree
+    # Where ci.yaml lints the npm project: the root when it holds one, else
+    # the first web folder that does.
+    ts_dir = ''
+    if not (has_pkg or has_jsr):
+        ts_dir = next(
+            (d for d in WEB_DIRS if f'{d}/package.json' in tree or f'{d}/jsr.json' in tree), ''
+        )
 
     if has_gomod:
         lang = 'go'
@@ -303,6 +337,7 @@ def classify(repo, ref='HEAD'):
         'has_jsr': has_jsr,
         'has_pkg': has_pkg,
         'is_web': is_web,
+        'ts_dir': ts_dir,
         'can_release': has_gomod or has_jsr or has_dockerfile,
         'has_smoke': has_smoke,
         'has_shell_tests': has_shell_tests,
@@ -381,6 +416,23 @@ def assign(repo_names, profiles, releasing):
     return groups
 
 
+def emit_block(groups, profiles, *, base=None):
+    """Print every group of one block (the single-branch one, or one base's),
+    the TypeScript configs as one group per npm project folder, root first."""
+    suffix = f' (base: {base})' if base else ''
+    for index, (key, group) in enumerate(GROUPS):
+        lead_blank = base is not None or index > 0
+        if key != 'ts_config':
+            print_group(
+                group.comment + suffix, groups[key], group, lead_blank=lead_blank, base=base
+            )
+            continue
+        for ts_dir in ('', *WEB_DIRS):
+            repos = [repo for repo in groups[key] if profiles[repo]['ts_dir'] == ts_dir]
+            variant = ts_config_group(ts_dir)
+            print_group(variant.comment + suffix, repos, variant, lead_blank=lead_blank, base=base)
+
+
 def print_group(comment, repos, group, *, lead_blank=True, base=None):
     """Emit one sync.yml group (comment, repos block, file list) if non-empty."""
     if not repos:
@@ -409,6 +461,7 @@ def profile_repo(repo):
         profile['cliff_tier'] = tier
     return found
 
+
 def main():
     # Skip the ci repo itself (it is the sync source, never a target).
     repos = [repo for repo in discover_repos() if repo['name'] != 'ci']
@@ -430,15 +483,12 @@ def main():
         sys.exit(f'classify-repos: {err}')
 
     print(HEADER)
-    groups = assign(single, profiles, releasing=False)
-    for index, (key, group) in enumerate(GROUPS):
-        print_group(group.comment, groups[key], group, lead_blank=index > 0)
+    emit_block(assign(single, profiles, releasing=False), profiles)
     for base in BASES:
         names = sorted(per_base[base])
         groups = assign(names, per_base[base], releasing=True)
         groups['two_branch_renovate'] = names
-        for key, group in GROUPS:
-            print_group(f'{group.comment} (base: {base})', groups[key], group, base=base)
+        emit_block(groups, per_base[base], base=base)
 
 
 if __name__ == '__main__':

@@ -9,6 +9,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -278,6 +279,62 @@ class MainDefault(unittest.TestCase):
         self.assertIn('classify-repos: tags listing of edgeapp truncated', err)
 
 
+class EslintBaseDest(unittest.TestCase):
+    """The ESLint base lands beside the npm project its eslint.config.mjs sits in."""
+
+    def manifest(self, trees):
+        fx = {
+            'repos': [repo(name.split('@')[0]) for name in trees],
+            'trees': trees,
+            'tags': {},
+        }
+        rc, out, err, _calls = run_classify(SCRIPTS / 'classify-repos.py', fx)
+        self.assertEqual(rc, 0, err)
+        return yaml.safe_load(out)['group']
+
+    def base_dests(self, groups):
+        """{repo name: ESLint base dest} over the manifest's groups."""
+        out = {}
+        for group in groups:
+            for entry in group['files']:
+                if isinstance(entry, dict) and entry['source'] == 'configs/eslint.config.base.mjs':
+                    for name in group['repos'].split():
+                        out[name.split('/')[-1]] = entry['dest']
+        return out
+
+    def test_a_nested_npm_project_gets_the_base_in_its_folder_and_the_rest_at_the_root(self):
+        groups = self.manifest(
+            {
+                'rootts@HEAD': ['package.json', 'src/a.ts'],
+                'webgo@HEAD': ['go.mod', 'web', 'web/package.json', 'web/src/a.ts'],
+                'srcgo@HEAD': ['go.mod', 'static-src', 'static-src/package.json'],
+                'deepgo@HEAD': ['go.mod', 'internal/server/static-src/package.json'],
+            }
+        )
+        self.assertEqual(
+            self.base_dests(groups),
+            {
+                'rootts': 'eslint.config.base.mjs',
+                'webgo': 'web/eslint.config.base.mjs',
+                'srcgo': 'static-src/eslint.config.base.mjs',
+                'deepgo': 'internal/server/static-src/eslint.config.base.mjs',
+            },
+        )
+        webgo = next(g for g in groups if 'web/eslint.config.base.mjs' in str(g['files']))
+        self.assertIn(
+            {'source': 'configs/prettier.json', 'dest': '.prettierrc.json'}, webgo['files']
+        )
+
+    def test_a_web_folder_without_an_npm_project_keeps_the_base_at_the_root(self):
+        groups = self.manifest({'gohybrid@HEAD': ['go.mod', 'internal/server/static-src/app.ts']})
+        self.assertEqual(self.base_dests(groups), {'gohybrid': 'eslint.config.base.mjs'})
+
+    def test_the_folders_are_the_ones_ci_yaml_probes_in_its_order(self):
+        text = (ROOT / '.github' / 'workflows' / 'ci.yaml').read_text()
+        loop = text.split('# Probe known nested web-frontend locations.', 1)[1].split('; do', 1)[0]
+        self.assertEqual(tuple(re.findall(r'"([^"]+)" \\', loop)), load_classify().WEB_DIRS)
+
+
 class Discovery(unittest.TestCase):
     """The REST repo listing: every page read, a failure or timeout aborts."""
 
@@ -507,13 +564,17 @@ class SyncOwnedSet(unittest.TestCase):
                 '.stylelintrc.json',
                 'cliff.toml',
                 'eslint.config.base.mjs',
+                'internal/server/static-src/eslint.config.base.mjs',
+                'internal/webui/static-src/eslint.config.base.mjs',
                 'renovate.json',
                 'ruff.toml',
                 'scripts/collect-licenses.sh',
                 'scripts/repin-sha.sh',
+                'static-src/eslint.config.base.mjs',
                 'tests/image-smoke.sh',
                 'tests/shell/harness_test.sh',
                 'tests/shell/lib.sh',
+                'web/eslint.config.base.mjs',
             ],
         )
 
