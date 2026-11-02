@@ -174,7 +174,8 @@ jobs:
             # Probe known nested web-frontend locations. First hit wins.
             # Add new paths centrally if a future repo introduces a different
             # layout — no per-repo override needed. scripts/test-lane-semantics.sh
-            # finds this loop by the first line of this comment and runs it.
+            # finds this loop by the first line of this comment and runs it, and
+            # scripts/classify-repos.py's WEB_DIRS follows it.
             for d in \
               "static-src" \
               "web" \
