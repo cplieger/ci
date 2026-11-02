@@ -139,12 +139,13 @@ jobs:
         run: |
           set -euo pipefail
           # `gremlins unleash .` measures exactly ONE module: coverage comes
-          # from a root `go test -cover ./...`, which cannot reach a NESTED
-          # module, so every mutant there would read NOT COVERED. Run once per
-          # module and merge the results (see the run step). Eligibility mirrors
-          # ci.yaml's detect step (validation, not release-lane semantics):
-          # prune vendored/generated trees, require tracked .go files, keep
-          # internal/ and dotless-path modules. Keep the two in sync.
+          # from a root `go test -cover ./...`, which cannot run a NESTED
+          # module's tests, so that module's own suite would never measure it.
+          # Run once per module and merge the results (see the run step).
+          # Eligibility mirrors ci.yaml's detect step (validation, not
+          # release-lane semantics): prune vendored/generated trees, require
+          # tracked .go files, keep internal/ and dotless-path modules. Keep the
+          # two in sync.
           MODULES="."
           while IFS= read -r f; do
             [ -z "$f" ] && continue
@@ -169,23 +170,17 @@ jobs:
           MODULES: ${{ steps.modules.outputs.modules }}
         run: |
           set -euo pipefail
-          # Always overwrite with the central policy so the weekly run uses the
-          # canonical exclude-list regardless of what each consumer has
-          # committed. The committed per-repo copies (kept in sync by
-          # sync.yaml, for local `gremlins unleash`) may lag; the shared run must
-          # not. "centralization is the point" — see configs/gremlins.yaml.
-          # Copied from this run's own checkout (same commit as the workflow),
-          # not fetched from raw main at run time.
+          # Always overwrite with this checkout's central policy: the consumers'
+          # committed copies (synced for local `gremlins unleash`) may lag, the
+          # shared run must not.
           #
           # One copy PER MODULE: gremlins resolves .gremlins.yaml from the module
-          # root of its working directory (its config search path ends at
-          # findModuleRoot()), so a nested module's run would otherwise fall
-          # through to gremlins' defaults and mutate files the central
-          # exclude-list rules out. Injecting per-repo entries into these copies
-          # is still not a thing we do — the exclusions stay central.
-          for m in $MODULES; do
-            cp configs/gremlins.yaml "target/${m}/.gremlins.yaml"
-          done
+          # root of its working directory (findModuleRoot()), so a nested module
+          # would otherwise run on gremlins' defaults. Each copy also excludes
+          # the module's deeper modules (gremlins-scope.py owns why); per-repo
+          # policy entries stay out, the exclusions stay central.
+          read -ra mods <<< "$MODULES"
+          python3 scripts/gremlins-scope.py --config configs/gremlins.yaml --target target "${mods[@]}"
 
       # MEMORY CONTAINMENT VIA A DOCKER CGROUP. Mutation is precisely the act of
       # turning a bounded size/loop into an unbounded one, so some mutant WILL
@@ -300,17 +295,8 @@ jobs:
             exit "$rc"
           fi
 
-          # Fold the per-module results into the ONE result per attempt that
-          # gremlins-aggregate.py, the badge and the tracker issue are built on,
-          # so the repo keeps a single published number and that number covers
-          # every module. The script sums counters and re-derives the percentages
-          # with gremlins' own formulas (a mean of per-module percentages would
-          # let a 3-mutant module outweigh a 300-mutant one), drops the root
-          # run's uncovered copies of nested files, and refuses to write a number
-          # when an input's totals disagree with its own mutant list. A missing
-          # per-module file is a zero-mutant module — gremlins writes no report
-          # when it finds none, which is the "clean exit, no file" case this step
-          # used to handle inline.
+          # Fold the per-module results into the ONE result per attempt the
+          # aggregate, badge and tracker are built on; gremlins-merge.py owns how.
           if ! python3 scripts/gremlins-merge.py --out /tmp/gremlins-out.json "${MERGE_ARGS[@]}"; then
             echo '{"gremlins_error": true}' > /tmp/gremlins-out.json
             echo "::error::merging per-module gremlins results failed for ${{ matrix.repo }} (attempt ${{ matrix.attempt }})"

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pin the contract of the gremlins measurement scripts; exit 0 = pass.
 
+gremlins-scope.py writes each module's config with its deeper modules excluded,
 gremlins-merge.py folds one result per Go module into one per-attempt result,
 gremlins-aggregate.py turns the attempts into the tracker body, history and
 badge, and gremlins-run.sh's coefficient and mode decision are extracted and
@@ -9,6 +10,7 @@ run. Nothing else executes them before the weekly run publishes their number.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -19,6 +21,9 @@ HERE = Path(__file__).resolve().parent
 MERGE = HERE / 'gremlins-merge.py'
 AGGREGATE = HERE / 'gremlins-aggregate.py'
 RUNNER = HERE / 'gremlins-run.sh'
+SCOPE = HERE / 'gremlins-scope.py'
+WORKFLOW = HERE.parent / '.github' / 'workflows' / 'weekly-gremlins.yaml'
+CENTRAL = HERE.parent / 'configs' / 'gremlins.yaml'
 
 FAILURES: list[str] = []
 
@@ -271,6 +276,8 @@ def test_nested_verdict_in_root_run_is_fatal(tmp: Path) -> None:
     check('nested verdict in root run: says which file and status',
           ok='yamlenv/yamlenv.go' in proc.stderr and 'KILLED' in proc.stderr,
           detail=proc.stderr[-300:])
+    check('nested verdict in root run: blames the scope exclusion',
+          ok='gremlins-scope.py' in proc.stderr, detail=proc.stderr[-300:])
 
 
 def test_inconsistent_input_is_fatal(tmp: Path) -> None:
@@ -337,6 +344,163 @@ def test_root_module_required(tmp: Path) -> None:
     ])
     proc, _ = run_merge(tmp, [('yamlenv', nested)], out_name='norootmod.json')
     check('root module required: exits non-zero', ok=proc.returncode != 0)
+
+
+# ---------------------------------------------------------------------------
+# gremlins-scope.py and the workflow steps that call it
+# ---------------------------------------------------------------------------
+def workflow_step(name: str) -> str:
+    """The `run: |` block of weekly-gremlins.yaml's step `name`, dedented; '' when absent."""
+    lines = WORKFLOW.read_text().splitlines()
+    try:
+        start = lines.index(f'      - name: {name}')
+    except ValueError:
+        return ''
+    for i in range(start + 1, len(lines)):
+        if lines[i].startswith('      - '):
+            return ''
+        if lines[i] == '        run: |':
+            body = []
+            for line in lines[i + 1:]:
+                if line and not line.startswith(' ' * 10):
+                    break
+                body.append(line[10:])
+            return '\n'.join(body) + '\n'
+    return ''
+
+
+def exclude_patterns(config: str) -> list[str]:
+    """The quoted `unleash.exclude-files` entries of a gremlins config."""
+    m = re.search(r'^  exclude-files:[ \t]*\n((?:(?:    .*|[ \t]*)\n)*)', config, re.MULTILINE)
+    return re.findall(r"^    - '([^']*)'", m.group(1), re.MULTILINE) if m else []
+
+
+def gremlins_scope(module_root: Path) -> list[str]:
+    """The files gremlins v0.6.0 mutates when run in module_root under its .gremlins.yaml.
+
+    Mirrors internal/engine/engine.go Run: every non-test .go file under the
+    module root, minus those whose module-relative path an exclude-files regexp
+    matches (internal/exclusion/rules.go uses regexp.MatchString, unanchored).
+    """
+    patterns = [re.compile(p) for p in exclude_patterns((module_root / '.gremlins.yaml').read_text())]
+    out = []
+    for p in sorted(module_root.rglob('*.go')):
+        rel = p.relative_to(module_root).as_posix()
+        if rel.startswith('.git/') or rel.endswith('_test.go'):
+            continue
+        if not any(r.search(rel) for r in patterns):
+            out.append(rel)
+    return out
+
+
+def animap_fixture(repo: Path) -> None:
+    """A root module importing an in-tree nested module through a replace (animap's shape)."""
+    files = {
+        'go.mod': (
+            'module github.com/cplieger/animap\n\ngo 1.26\n\n'
+            'require github.com/cplieger/animap/mapread v0.0.0\n\n'
+            'replace github.com/cplieger/animap/mapread => ./mapread\n'
+        ),
+        'animap.go': 'package animap\n',
+        'animap_test.go': 'package animap\n',
+        'cmd/animap/main.go': 'package main\n',
+        'cmd/animap/verify.go': 'package main\n\nimport _ "github.com/cplieger/animap/mapread"\n',
+        'mapreader/reader.go': 'package mapreader\n',
+        'mapread/go.mod': 'module github.com/cplieger/animap/mapread\n\ngo 1.26\n',
+        'mapread/encode.go': 'package mapread\n',
+        'mapread/decode.go': 'package mapread\n',
+        'mapread/encode_test.go': 'package mapread\n',
+    }
+    for name, text in files.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(text)
+    git = ['git', '-C', str(repo), '-c', 'user.name=t', '-c', 'user.email=t@t']
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    subprocess.run([*git, 'add', '--', *files], check=True)
+    subprocess.run([*git, 'commit', '-qm', 'fixture'], check=True)
+
+
+def run_scope(target: Path, *modules: str, config: Path = CENTRAL) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(SCOPE), '--config', str(config), '--target', str(target), *modules],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_workflow_scopes_root_run_off_nested_module(tmp: Path) -> None:
+    """The animap failure, through the workflow's own Discover and Sync steps.
+
+    The root tests compile mapread/*.go through the replace, so a root run that
+    mutates them records real verdicts the merge must refuse. The root's
+    gremlins scope has to stop at the nested module's directory.
+    """
+    discover = workflow_step('Discover Go modules to measure')
+    sync = workflow_step('Sync central .gremlins.yaml (authoritative for the weekly run)')
+    check('workflow scope: Discover and Sync steps extracted', ok=bool(discover and sync))
+    if not (discover and sync):
+        return
+    (tmp / 'target').mkdir()
+    animap_fixture(tmp / 'target')
+    (tmp / 'scripts').symlink_to(HERE)
+    (tmp / 'configs').symlink_to(CENTRAL.parent)
+    env = {**os.environ, 'GIT_CONFIG_GLOBAL': '/dev/null', 'GITHUB_OUTPUT': str(tmp / 'out')}
+    bash = ['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c']
+    proc = subprocess.run([*bash, discover], cwd=tmp, env=env, capture_output=True, text=True,
+                          check=False)
+    modules = (tmp / 'out').read_text().strip() if (tmp / 'out').exists() else ''
+    check('workflow scope: Discover finds the root and the nested module',
+          ok=proc.returncode == 0 and modules == 'modules=. mapread',
+          detail=f'rc={proc.returncode} {modules!r} {proc.stderr[-300:]}')
+    proc = subprocess.run([*bash, sync], cwd=tmp, env={**env, 'MODULES': modules[len('modules='):]},
+                          capture_output=True, text=True, check=False)
+    check('workflow scope: Sync succeeds', ok=proc.returncode == 0, detail=proc.stderr[-300:])
+    if proc.returncode != 0:
+        return
+    root_scope = gremlins_scope(tmp / 'target')
+    check('workflow scope: the root run mutates no file of the nested module',
+          ok=root_scope == ['animap.go', 'cmd/animap/verify.go', 'mapreader/reader.go'],
+          detail=str(root_scope))
+    nested_scope = gremlins_scope(tmp / 'target' / 'mapread')
+    check('workflow scope: the nested run still mutates its own files',
+          ok=nested_scope == ['decode.go', 'encode.go'], detail=str(nested_scope))
+    check('workflow scope: a leaf module gets the central config unchanged',
+          ok=(tmp / 'target' / 'mapread' / '.gremlins.yaml').read_text() == CENTRAL.read_text())
+
+
+def test_scope_excludes_every_deeper_module(tmp: Path) -> None:
+    """Containment at every level, with '.' escaped so a dotted dir matches only itself."""
+    for d in ('a.b/c', 'tools'):
+        (tmp / d).mkdir(parents=True)
+    proc = run_scope(tmp, '.', 'a.b', 'a.b/c', 'tools')
+    check('scope nesting: succeeds', ok=proc.returncode == 0, detail=proc.stderr[-300:])
+    if proc.returncode != 0:
+        return
+    central = exclude_patterns(CENTRAL.read_text())
+    added = {d: [p for p in exclude_patterns((tmp / d / '.gremlins.yaml').read_text())
+                 if p not in central] for d in ('.', 'a.b', 'a.b/c', 'tools')}
+    check('scope nesting: each copy adds exactly its deeper modules',
+          ok=added == {'.': [r'^a\.b/', r'^a\.b/c/', '^tools/'], 'a.b': ['^c/'],
+                       'a.b/c': [], 'tools': []}, detail=str(added))
+    root = [re.compile(p) for p in added['.']]
+    check('scope nesting: a dotted dir does not swallow its look-alikes',
+          ok=not any(r.search(f) for r in root for f in ('aXb/x.go', 'x/a.b/y.go', 'toolsx/z.go')))
+    check('scope nesting: the central entries all survive',
+          ok=all(p in exclude_patterns((tmp / '.gremlins.yaml').read_text()) for p in central))
+
+
+def test_scope_refuses_what_it_cannot_scope(tmp: Path) -> None:
+    (tmp / 'sub').mkdir()
+    bare = tmp / 'bare.yaml'
+    bare.write_text('unleash:\n  threshold:\n    efficacy: 0\n')
+    proc = run_scope(tmp, '.', 'sub', config=bare)
+    check('scope refusal: a config without one exclude-files anchor exits non-zero',
+          ok=proc.returncode != 0 and 'exclude-files' in proc.stderr, detail=proc.stderr[-300:])
+    proc = run_scope(tmp, '.', 'sub', 'sub/')
+    check('scope refusal: a duplicate module dir exits non-zero',
+          ok=proc.returncode != 0 and 'unique' in proc.stderr, detail=proc.stderr[-300:])
+    proc = run_scope(tmp, '.', 'a b')
+    check('scope refusal: a dir outside the safe charset exits non-zero',
+          ok=proc.returncode != 0 and 'characters' in proc.stderr, detail=proc.stderr[-300:])
 
 
 # ---------------------------------------------------------------------------
@@ -885,8 +1049,8 @@ def test_aggregate_marks_a_mode_switch(tmp: Path) -> None:
 
 
 def main() -> int:
-    if not MERGE.exists() or not AGGREGATE.exists() or not RUNNER.exists():
-        print(f'missing script: {MERGE} / {AGGREGATE} / {RUNNER}')
+    if not all(p.exists() for p in (MERGE, AGGREGATE, RUNNER, SCOPE)):
+        print(f'missing script: {MERGE} / {AGGREGATE} / {RUNNER} / {SCOPE}')
         return 1
     tests = [
         test_single_module_is_identity,
@@ -897,6 +1061,9 @@ def main() -> int:
         test_missing_module_output_is_zero_not_error,
         test_module_nested_in_nested,
         test_root_module_required,
+        test_workflow_scopes_root_run_off_nested_module,
+        test_scope_excludes_every_deeper_module,
+        test_scope_refuses_what_it_cannot_scope,
         test_aggregate_consumes_merged_output,
         test_aggregate_flags_disagreeing_verdicts,
         test_aggregate_flags_sudden_perfect_week,

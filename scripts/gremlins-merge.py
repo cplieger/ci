@@ -33,12 +33,13 @@ What it does
    this script would then publish a number nobody has checked, so it exits 1 and
    the attempt goes red instead.
 3. Drops, from each module's result, mutations that live inside a DEEPER module's
-   directory. The root run walks the whole tree, so it also analyses nested
-   module files; without this they would be counted twice — once as uncovered
-   noise here, once properly by that module's own run. Every dropped mutation
-   must be NOT COVERED or SKIPPED (an uncovered mutant is never executed, so it
-   cannot carry a verdict); anything else means the root run really did cover
-   nested code and the drop would be discarding a real verdict, so it exits 1.
+   directory. gremlins-scope.py excludes those directories from every outer
+   module's run, so a healthy run has none; a run under an unscoped config (a
+   consumer's committed copy) reports them as uncovered noise, which would count
+   twice, once here and once properly by that module's own run. Every dropped
+   mutation must be NOT COVERED or SKIPPED (an uncovered mutant is never
+   executed, so it cannot carry a verdict); anything else means the exclusion
+   failed and the outer suite really ran nested code, so it exits 1.
 4. Prefixes each non-root module's filenames with its directory, so positions in
    the tracker issue stay repo-relative and unambiguous.
 5. Recomputes the merged counters, `test_efficacy`, `mutations_coverage` and
@@ -89,8 +90,8 @@ TYPE_TO_STAT_KEY = {
 }
 
 # Statuses a mutant inside a nested module may legitimately carry in an OUTER
-# module's run. An uncovered mutant is never executed, so it cannot come back
-# killed, lived, timed out or not viable.
+# module's run that missed the scope exclusion. An uncovered mutant is never
+# executed, so it cannot come back killed, lived, timed out or not viable.
 DROPPABLE_STATUSES = {"NOT_COVERED", "SKIPPED"}
 
 # Percentage comparison tolerance for the per-input self-check. gremlins writes
@@ -214,11 +215,11 @@ def load_mode(path: Path) -> str:
 def deeper_dirs(dir_: str, all_dirs: list[str]) -> list[str]:
     """Module dirs strictly inside `dir_`, as module-relative prefixes.
 
-    The root run walks the whole tree; an intermediate module's run walks its
-    own subtree. Either way a deeper module's files are that module's business,
-    so they are dropped here and counted by its own run. Doing this by
-    containment rather than by rejecting overlapping modules means a module
-    nested inside a nested module still lands in exactly one bucket.
+    A deeper module's files are that module's business, counted by its own run:
+    gremlins-scope.py excludes these prefixes from `dir_`'s run and merge() drops
+    any file under them that still appears. Doing this by containment rather
+    than by rejecting overlapping modules means a module nested inside a nested
+    module still lands in exactly one bucket.
     """
     out = []
     for other in all_dirs:
@@ -256,7 +257,8 @@ def merge(modules: list[tuple[str, Path]]) -> dict:
                 if bad:
                     problems.append(
                         f"[{dir_}] {name} belongs to a nested module but carries {sorted(bad)} "
-                        "in this run — dropping it would discard a real verdict"
+                        "in this run — its directory escaped the nested-module exclusion "
+                        "(scripts/gremlins-scope.py), and dropping it would discard a real verdict"
                     )
                 dropped += len(fe.get("mutations") or [])
                 continue
