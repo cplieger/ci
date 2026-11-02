@@ -24,7 +24,11 @@ STEP = 'Dead code (deadset)'
 KNIP_STEP = 'Import cycles and undeclared dependencies (knip)'
 MARKER = '/tmp/_ci_failures'
 SHA = re.compile(r'^[0-9a-f]{40}$')
-DEPS = ('github.com/cplieger/deadset', 'github.com/cplieger/deadset-go', '@cplieger/deadset-ts')
+DEPS = (
+    'github.com/cplieger/deadset/v2',
+    'github.com/cplieger/deadset-go/v2',
+    '@cplieger/deadset-ts',
+)
 
 # The generic workflow pin manager of the shared Renovate preset
 # (cplieger/.github default.json), which is what bumps these pins.
@@ -238,21 +242,43 @@ NESTED = {
     'web/go.mod': 'module web-ignore\n',
     'web/package.json': '{}',
 }
-TS_ONLY = {'jsr.json': '{}', 'package.json': '{}', 'package-lock.json': '{}', 'mod.ts': ''}
+TS_ONLY = {
+    'jsr.json': '{}',
+    'package.json': '{}',
+    'package-lock.json': '{}',
+    'tsconfig.json': '{}',
+    'mod.ts': '',
+}
 IMAGE_ONLY = {'Dockerfile': 'FROM scratch\n', 'run.sh': '#!/bin/sh\n'}
 TS_WITHOUT_JSR = {'package.json': '{}', 'package-lock.json': '{}', 'tsconfig.json': '{}'}
+# Go and ts expectations from deadset-spec's contract/languages.json rows
+# (markers, extensions, skipped_files, skipped_directories, matched against
+# names alone); proto puts no root in scope, because the check analyzes go and
+# ts.
 ROOT_TARGET_CASES = (
     (TS_WITHOUT_JSR, True),
-    ({'package.json': '{}', 'src/a.mts': ''}, True),
     ({'cmd/x.go': ''}, True),
     ({'README.md': 'x\n', 'deadset.json': '{"analysis":{"languages":["ts"]}}'}, True),
     ({'README.md': 'x\n', 'tsconfig.json': Link('README.md')}, True),
     ({'conf/x': '', 'lib.go': Link('conf')}, True),
+    ({'README.md': 'x\n', 'web/jsconfig.app.json': '{}'}, True),
+    ({'static-src/package.json': '{}', 'static-src/app.js': ''}, True),
+    ({'README.md': 'x\n', 'tests/stub.mjs': ''}, True),
+    ({'README.md': 'x\n', 'scripts/check.cjs': ''}, True),
+    ({'README.md': 'x\n', 'ui/view.jsx': ''}, True),
+    ({'README.md': 'x\n', 'testdata/f/tsconfig.json': '{}'}, True),
+    ({'README.md': 'x\n', '.github/t/tsconfig.json': '{}'}, True),
+    ({'README.md': 'x\n', 'vendor/v/a.js': ''}, True),
+    ({'README.md': 'x\n', '_site/a.js': ''}, True),
+    ({'package.json': '{}', 'src/a.mts': ''}, False),
     ({'README.md': 'x\n', 'tools/a.ts': ''}, False),
     ({'README.md': 'x\n', 'node_modules/p/tsconfig.json': '{}'}, False),
+    ({'README.md': 'x\n', 'node_modules/p/index.js': ''}, False),
+    ({'README.md': 'x\n', 'dist/a.min.js': '', 'b.min.cjs': '', 'c.min.mjs': ''}, False),
     ({'README.md': 'x\n', 'testdata/m/go.mod': 'module m\n'}, False),
-    ({'README.md': 'x\n', '.github/t/tsconfig.json': '{}'}, False),
-    ({'static-src/package.json': '{}', 'static-src/app.js': ''}, False),
+    ({'README.md': 'x\n', '_tools/x.go': '', '.hidden/y.go': '', 'vendor/v/z.go': ''}, False),
+    ({'README.md': 'x\n', 'pkg/_x.go': '', 'pkg/.y.go': ''}, False),
+    ({'README.md': 'x\n', 'api/v1/a.proto': '', 'buf.yaml': ''}, False),
 )
 
 
@@ -270,13 +296,13 @@ class Detect(Harness):
     def test_a_typescript_root_is_a_target(self):
         self.assertEqual(json.loads(run_detect(self, TS_ONLY)['deadset_targets']), ['.'])
 
-    def test_the_root_is_a_target_exactly_when_deadset_finds_a_language_there(self):
+    def test_the_root_is_a_target_exactly_when_deadset_finds_go_or_typescript_there(self):
         for i, (files, expected) in enumerate(ROOT_TARGET_CASES):
             with self.subTest(case=i, files=sorted(files)):
                 want = ['.'] if expected else []
                 self.assertEqual(json.loads(run_detect(self, files)['deadset_targets']), want)
 
-    def test_a_root_target_is_one_the_check_accepts(self):
+    def test_a_root_target_holds_a_language_the_check_analyzes(self):
         for i, (files, expected) in enumerate(ROOT_TARGET_CASES):
             if not expected:
                 continue
@@ -335,6 +361,7 @@ class MetaJobs(unittest.TestCase):
                 ('cplieger/actions', '.'),  # TypeScript only
                 ('cplieger/keyenc', '.'),  # Go and TypeScript
                 ('cplieger/envx', 'yamlenv'),  # a nested module
+                ('cplieger/docker-renovate-scheduler', '.'),  # JavaScript, no npm project
             },
         )
         for key in ('repository', 'ref', 'target'):
@@ -435,13 +462,30 @@ class ResolveTarget(Harness):
             ({'go.mod': 'module x\n'}, 'go'),
             ({'go.mod': 'module x\n', 'cmd/x.go': 'package main\n'}, 'go'),
             ({**lock, 'web/tsconfig.app.json': '{}'}, 'ts'),
-            ({**lock, 'web/src/a.mts': '', 'web/package.json': '{}'}, 'ts'),
+            ({**lock, 'web/src/a.mjs': '', 'web/package.json': '{}'}, 'ts'),
+            ({**lock, 'web/jsconfig.json': '{}'}, 'ts'),
             ({'go.mod': 'module x\n', **lock, 'web/tsconfig.json': '{}'}, 'go,ts'),
-            ({'go.mod': 'module x\n', 'tools/a.ts': ''}, 'go'),
+            ({'go.mod': 'module x\n', 'tools/a.ts': '', 'web/src/a.mts': ''}, 'go'),
             ({'go.mod': 'module x\n', 'node_modules/p/tsconfig.json': '{}'}, 'go'),
-            ({'go.mod': 'module x\n', 'testdata/f/tsconfig.json': '{}'}, 'go'),
-            ({'go.mod': 'module x\n', 'vendor/v/tsconfig.json': '{}'}, 'go'),
-            ({'go.mod': 'module x\n', '.github/t/tsconfig.json': '{}'}, 'go'),
+            ({'go.mod': 'module x\n', 'node_modules/p/a.js': '', 'dist/a.min.js': ''}, 'go'),
+            ({'go.mod': 'module x\n', 'testdata/f/tsconfig.json': '{}'}, 'go,ts'),
+            ({'go.mod': 'module x\n', 'vendor/v/tsconfig.json': '{}'}, 'go,ts'),
+            ({'go.mod': 'module x\n', '.github/t/tsconfig.json': '{}'}, 'go,ts'),
+            ({'go.mod': 'module x\n', 'tests/stub.mjs': ''}, 'go,ts'),
+            (
+                {
+                    **lock,
+                    'web/tsconfig.json': '{}',
+                    '_tools/x.go': '',
+                    '.hidden/y.go': '',
+                    'testdata/z.go': '',
+                    'vendor/v/w.go': '',
+                    'node_modules/n/m.go': '',
+                    'pkg/_x.go': '',
+                    'pkg/.y.go': '',
+                },
+                'ts',
+            ),
             ({'go.mod': 'module x\n', **lock, 'web/tsconfig.json': Link('../go.mod')}, 'go,ts'),
             (
                 {'go.mod': 'module x\n', **lock, 'conf/x': '', 'tsconfig.b.json': Link('conf')},
@@ -467,7 +511,9 @@ class ResolveTarget(Harness):
         self.assertEqual(self.languages(self.resolve(files))[:2], ('go,ts', 'detected'))
 
     def test_a_language_whose_setup_cannot_be_derived_fails(self):
-        run = self.resolve({'go.mod': 'module x\n', 'web/tsconfig.json': '{}'})
+        run = self.resolve(
+            {'go.mod': 'module x\n', 'web/tsconfig.json': '{}', 'web/package.json': '{}'}
+        )
         self.assertEqual(run.rc, 1, run.out)
         self.assertIn('::error::TypeScript is in scope at . (detected)', run.out)
         self.assertIn('no package-lock.json is tracked', run.out)
@@ -475,10 +521,41 @@ class ResolveTarget(Harness):
         self.assertEqual(run.rc, 1, run.out)
         self.assertIn('::error::Go is in scope at . (detected), but . has no go.mod', run.out)
         run = self.resolve(
-            {'go.mod': 'module x\n', 'deadset.json': '{"analysis":{"languages":["ts"]}}'}
+            {
+                'go.mod': 'module x\n',
+                'package.json': '{}',
+                'deadset.json': '{"analysis":{"languages":["ts"]}}',
+            }
         )
         self.assertEqual(run.rc, 1, run.out)
         self.assertIn('TypeScript is in scope at . (repository: deadset.json)', run.out)
+
+    def test_javascript_without_an_npm_project_installs_nothing(self):
+        run = self.resolve({'go.mod': 'module x\n', 'tests/stub.mjs': ''})
+        self.assertEqual(self.languages(run), ('go,ts', 'detected', 'true', 'true'))
+        self.assertEqual((run.outputs['npm_dirs'], run.outputs['lockfiles']), ('', ''))
+        vendored = {
+            'tsconfig.json': '{}',
+            'node_modules/x/package.json': '{}',
+            'testdata/y/package.json': '{}',
+            'vendor/z/package.json': '{}',
+            '.cache/w/package.json': '{}',
+        }
+        run = self.resolve(vendored)
+        self.assertEqual(self.languages(run)[3], 'true')
+        self.assertEqual(run.outputs['npm_dirs'], '')
+
+    def test_one_tracked_lockfile_lets_a_project_without_one_through(self):
+        run = self.resolve(
+            {
+                'tsconfig.json': '{}',
+                'package.json': '{}',
+                'package-lock.json': '{}',
+                'fixtures/a/target/package.json': '{}',
+            }
+        )
+        self.assertEqual(self.languages(run)[3], 'true')
+        self.assertEqual(run.outputs['npm_dirs'], '.')
 
     def test_only_tracked_lockfiles_outside_vendored_trees_count(self):
         run = self.resolve(
@@ -572,6 +649,9 @@ class ResolveTarget(Harness):
         )
         node = analyze_step('Setup Node.js')['with']
         self.assertEqual(node['cache-dependency-path'], '${{ steps.target.outputs.lockfiles }}')
+        self.assertEqual(
+            node['cache'], "${{ steps.target.outputs.lockfiles != '' && 'npm' || '' }}"
+        )
 
 
 class Analyze(Harness):
@@ -693,7 +773,12 @@ class Analyze(Harness):
         self.assertEqual(run.logged('go'), '')
 
     def test_a_configuration_file_below_the_root_fails_and_the_analysis_still_runs(self):
-        for name in ('deadset.json', 'deadset-ignore.json', 'deadset-edges.json'):
+        for name in (
+            'deadset.json',
+            'deadset-ignore.json',
+            'deadset-baseline.json',
+            'deadset-edges.json',
+        ):
             with self.subTest(name=name):
                 shutil.rmtree(self.tmp / 'repo')
                 self.repo = git_repo(
@@ -724,9 +809,9 @@ class InstallSteps(Harness):
         self.assertEqual(
             run.logged('go').splitlines(),
             [
-                f'install github.com/cplieger/deadset/cmd/deadset@{pins[DEPS[0]]} GOTOOLCHAIN=auto',
+                f'install github.com/cplieger/deadset/v2/cmd/deadset@{pins[DEPS[0]]} GOTOOLCHAIN=auto',
                 (
-                    f'install github.com/cplieger/deadset-go/cmd/deadset-go@{pins[DEPS[1]]} '
+                    f'install github.com/cplieger/deadset-go/v2/cmd/deadset-go@{pins[DEPS[1]]} '
                     'GOTOOLCHAIN=auto'
                 ),
             ],

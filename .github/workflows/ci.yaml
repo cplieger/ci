@@ -161,18 +161,22 @@ jobs:
               run_scripts=true
             fi
 
-            # The root is a dead-code target exactly when deadset finds a language
-            # there: deadset-ci.yaml's Resolve target replays the same rule, and a
-            # test runs both on one fixture set. deadset-go's `./...` stops at a
-            # nested module, so each one is its own target.
+            # The root is a dead-code target exactly when deadset finds Go or
+            # TypeScript there: deadset-ci.yaml's Resolve target replays the
+            # same rule, and a test runs both on one fixture set. deadset-go's
+            # `./...` stops at a nested module, so each one is its own target.
             root_languages=""
             if [ -f deadset.json ]; then
               root_languages=$(jq -r '.analysis.languages // [] | join(",")' deadset.json 2> /dev/null || true)
             fi
             if [ -z "$root_languages" ]; then
-              names=$(find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o \( -type f -o -type l \) -print | sed 's|.*/||')
-              if grep -qxE 'go\.mod|.+\.go|tsconfig.*\.json' <<< "$names" \
-                || { grep -qE '\.(ts|tsx|mts|cts)$' <<< "$names" && grep -qx 'package\.json' <<< "$names"; }; then
+              if [ -n "$(find . -mindepth 1 \
+                \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.*' -o -name '_*' \) -prune \) \
+                -o ! -type d \( -name go.mod -o \( -name '*.go' ! -name '.*' ! -name '_*' \) \) -print -quit)" ] \
+                || [ -n "$(find . -mindepth 1 \( -type d \( -name node_modules -o -name .git \) -prune \) \
+                  -o ! -type d \( -name 'tsconfig*.json' -o -name 'jsconfig*.json' \
+                  -o \( \( -name '*.js' -o -name '*.jsx' -o -name '*.mjs' -o -name '*.cjs' \) \
+                  ! -name '*.min.js' ! -name '*.min.cjs' ! -name '*.min.mjs' \) \) -print -quit)" ]; then
                 root_languages=detected
               fi
             fi
@@ -286,10 +290,11 @@ jobs:
       target: ${{ matrix.target }}
 
   # The pinned deadset tools over one Go-only, one TypeScript-only, one mixed
-  # repository and one nested module, so a pin set that makes deadset refuse or
-  # give no answer fails here before a release carries it. `off` still fails
-  # exit 2 and 3; findings at the frozen commits do not. Refresh a ref only
-  # when its repository stops representing its shape.
+  # repository, one nested module and one with JavaScript but no npm project,
+  # so a pin set that makes deadset refuse or give no answer fails here before
+  # a release carries it. `off` still fails exit 2 and 3; findings at the
+  # frozen commits do not. Refresh a ref only when its repository stops
+  # representing its shape.
   deadset-canary:
     needs: detect
     if: ${{ github.repository == 'cplieger/ci' && needs.detect.outputs.code_changed == 'true' }}
@@ -312,6 +317,9 @@ jobs:
           - repository: cplieger/envx
             ref: 742555f1312abdb307361e4c1873fea4b02ad5be
             target: yamlenv
+          - repository: cplieger/docker-renovate-scheduler
+            ref: 67f927923c241d5e50ca2a1377db368b1a89e02b
+            target: '.'
     uses: ./.github/workflows/deadset-ci.yaml
     with:
       repository: ${{ matrix.repository }}
