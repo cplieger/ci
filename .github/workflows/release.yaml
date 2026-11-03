@@ -2230,8 +2230,8 @@ jobs:
   # A green publish job is not proof the artifact is fetchable. Each lane that
   # ran is read back at the released version: the Go proxy for the root module
   # and each nested lane, npm (and JSR on stable) for the root package, each
-  # subpackage and each lane's TS half. The docker lane is verified inside docker-release.yaml,
-  # which holds the manifest digest.
+  # subpackage and each lane's TS half. The docker lane is verified inside
+  # docker-release.yaml, which holds the manifest digest.
   verify-publish:
     needs: [detect, docker, go, ts, subpackage, go-nested, lane-halves]
     # A skipped dependency skips this job under the default success(), and a

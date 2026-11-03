@@ -1330,7 +1330,8 @@ cmd_half_free() { # <lane> <lane tag> <commit>
   fi
   while read -r v h; do
     [ -n "$v" ] || continue
-    # npm's gitHead may name a commit this checkout never fetched.
+    # A version published from a commit of this repository is the lane's own,
+    # which may rank anywhere; only the others bound it.
     if [ -n "$h" ] && has_commit "$h"; then continue; fi
     if [ -z "$top" ] || gt "$(core "$v")" "$top"; then top=$(core "$v"); fi
   done < <(jq -r '.versions // {} | to_entries[] | "\(.key) \(.value.gitHead // "")"' <<<"$doc")

@@ -2879,13 +2879,13 @@ lsub() { # <checkout> -> the outputs of renumber-subpackages for lane alpha, or 
   tr '\n' ' ' <"$WORK/out"
 }
 NPM_PKG=$NPM_ALPHA xweb
-chk "U30 a lane's half with no dev build is published from the lane's build under its newest dev tag" \
+chk "U31 a lane's half with no dev build is published from the lane's build under its newest dev tag" \
   "$(lsub "$LBW")" 'version=alpha/v1.2.0-dev.1 dirs=["alpha/web"] '
 NPM_PKG=$NPM_ALPHA xweb 1.2.0-dev.1 "$LBW"
-chk "U30 one npm serves from that change is left alone" "$(lsub "$LBW")" 'version=alpha/v1.2.0-dev.1 dirs=[] '
-chk "U30 a checkout that is not the lane's newest dev build is refused" "$(lsub "$LBG")" "EXIT=1"
-chk_has "U30 naming the lane" "$(cat "$WORK/lsub.log")" "HEAD is not lane alpha's newest dev build"
-chk "U30 a half git cannot read at the build publishes nothing" \
+chk "U31 one npm serves from that change is left alone" "$(lsub "$LBW")" 'version=alpha/v1.2.0-dev.1 dirs=[] '
+chk "U31 a checkout that is not the lane's newest dev build is refused" "$(lsub "$LBG")" "EXIT=1"
+chk_has "U31 naming the lane" "$(cat "$WORK/lsub.log")" "HEAD is not lane alpha's newest dev build"
+chk "U31 a half git cannot read at the build publishes nothing" \
   "$(failing_git '* HEAD -- alpha/web/jsr.json' 1 lsub "$LBW")|$(git_calls)" "EXIT=1|1"
 mkdir -p "$WORK/lbcurl"
 : >"$WORK/lbcurl/ok"
@@ -2893,7 +2893,7 @@ mkdir -p "$WORK/lbcurl"
 git -C "$LBC" checkout -q --detach "$LBW"
 (cd "$LBC" && env -u JSR_VERSION PATH="$BIN2:$PATH" CURL_DIR="$WORK/lbcurl" CI_TOOLS="$ROOT/scripts" VERSION=alpha/v1.2.0-dev.1 \
   CHANNEL=dev DIRS='["alpha/web"]' bash "$WORK/rh-publish.sh") >"$WORK/rhpub.log" 2>&1 || echo "EXIT=$?" >>"$SP_LOG"
-chk "U30 the publish step puts the half on npm's dev dist-tag from the lane's build, at the lane's dev version" \
+chk "U31 the publish step puts the half on npm's dev dist-tag from the lane's build, at the lane's dev version" \
   "$(grep -E '^(npm publish|published|npx|EXIT)' "$SP_LOG" | tr '\n' ';')|$(cat "$SP_LOG.version" 2>/dev/null)" \
   "npm publish --access public --tag dev @web;published v2;|1.2.0-dev.1"
 # A lane's version must be free on its half's npm package before the lane's tag.
