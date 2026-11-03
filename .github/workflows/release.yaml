@@ -2327,10 +2327,15 @@ jobs:
             return 1
           }
           # JSR receives the stable channel only, so a dev version is never
-          # there to read back.
+          # there to read back; a private package's publish is a dry run, so
+          # neither registry holds it.
           probe_ts() { # <package.json> [X.Y.Z, the root's version by default]
             local pkg v="${2:-$ver}"
             pkg=$(jq -r .name "$1")
+            if [ "$(jq -r '.private // false' "$1")" = true ]; then
+              echo "skip: ${pkg} is private, so no registry holds it"
+              return 0
+            fi
             REGISTRY_WAIT_SECONDS=$NPM_SCAN_SECONDS probe "npm ${pkg}@${v}" "https://registry.npmjs.org/${pkg}/${v}" || rc=1
             if [ "$CHANNEL" = "stable" ]; then
               probe "jsr ${pkg}@${v}" "https://jsr.io/${pkg}/${v}_meta.json" || rc=1

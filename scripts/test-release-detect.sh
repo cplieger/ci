@@ -1243,6 +1243,16 @@ chk_has "R30 after the subpackage's default 600 s, not npm's scan bound" "$(cat 
   "jsr @o/web@1.4.0: absent after 14 attempt(s) and 600s of waiting"
 echo https://jsr.io/@o/web/1.4.0_meta.json >>"$CURL_DIR/ok"
 chk "R30 and passes once npm and JSR serve both" "$(SUBPACKAGES='["web"]' RB_DIR=$TSR readback ts v1.4.0)" "ok"
+mkdir -p "$TSR/priv"
+printf '{"name":"@o/priv","private":true}\n' >"$TSR/priv/package.json"
+git -C "$TSR" add priv/package.json
+git -C "$TSR" commit -qm "feat: private subpackage"
+git -C "$TSR" tag v1.5.0
+printf '%s\n' https://registry.npmjs.org/@o/app/1.5.0 https://jsr.io/@o/app/1.5.0_meta.json >>"$CURL_DIR/ok"
+chk "K3 a private subpackage is not read back, as no registry receives it" \
+  "$(SUBPACKAGES='["priv"]' RB_DIR=$TSR readback ts v1.5.0)|$(grep -c '@o/priv' "$CURL_DIR/log" || true)" "ok|0"
+chk "K3 while a public one beside it still is" "$(SUBPACKAGES='["priv","web"]' RB_DIR=$TSR readback ts v1.5.0)" "refused"
+chk_has "K3 naming the public one" "$(cat "$WORK/readback.log")" "npm @o/web@1.5.0: absent after"
 mv "$WORK/ok.saved" "$CURL_DIR/ok"
 chk "R7 an image readback with no manifest fails" "$(readback docker v1.1.0)" "refused"
 IMG_A="sha256:$(printf 'a%.0s' $(seq 64))"
@@ -1432,6 +1442,7 @@ case "$*" in
   "publish --access public" | "publish --access public --tag dev")
     printf 'published %s\n' "$(cat mod.ts)" >>"$SP_LOG"
     echo "https://registry.npmjs.org/$(jq -r .name package.json)/$(cat "$SP_LOG.version")" >>"$CURL_DIR/ok" ;;
+  "publish --dry-run --access public" | "publish --dry-run --access public --tag dev") ;;
   "install --no-save") ;;
   *) echo "stub: unexpected npm $*" >&2; exit 22 ;;
 esac
@@ -1441,6 +1452,7 @@ cat >"$BIN2/npx" <<'SH'
 printf 'npx %s @%s\n' "$*" "${PWD##*/}" >>"$SP_LOG"
 case "$*" in
   "-y jsr@"*" publish --allow-dirty") echo "https://jsr.io/$(jq -r .name jsr.json)/$(jq -r .version jsr.json)_meta.json" >>"$CURL_DIR/ok" ;;
+  "-y jsr@"*" publish --dry-run --allow-dirty") ;;
   *) echo "stub: unexpected npx $*" >&2; exit 22 ;;
 esac
 SH
@@ -1651,6 +1663,31 @@ git -C "$L" tag alpha/v1.0.0-dev.10 "$L4"
 chk "H5 the highest dev tag at HEAD, by version" "$(hpub "$L4" dev | cut -d'|' -f1)" "1.0.0-dev.10"
 chk "H5 a lane with no tag of the channel at HEAD is refused" "$(hpub "$L3" dev)" "EXIT=1"
 chk_has "H5 naming the lane" "$(cat "$WORK/hpub.log")" "::error::lane alpha has no dev tag at"
+kpub() { # <channel> <version> <private: true|false> -> the publish calls|registry reads|versions recorded, or EXIT=n
+  local d reg
+  d=$(mktemp -d "$WORK/kpub.XXXXXX")
+  reg=$(mktemp -d "$WORK/kreg.XXXXXX")
+  : >"$reg/ok"
+  : >"$reg/log"
+  : >"$SP_LOG"
+  rm -f "$SP_LOG.version"
+  echo v1 >"$d/mod.ts"
+  echo '{"name":"@o/priv","version":"0.0.0"}' >"$d/jsr.json"
+  jq -nc --argjson p "$3" '{name: "@o/priv", version: "0.0.0", private: $p}' >"$d/package.json"
+  (cd "$d" && PATH="$BIN2:$PATH" CURL_DIR="$reg" VERSION="$2" CHANNEL="$1" JSR_VERSION=0.14.3 \
+    bash "$ROOT/scripts/publish-subpackage.sh") >"$WORK/kpub.log" 2>&1 || {
+    echo "EXIT=$?"
+    return 0
+  }
+  echo "$(grep -E '^(npm (publish|view|install)|npx)' "$SP_LOG" | sed 's/ @kpub\..*//' | tr '\n' ';')|$(awk 'END{print NR}' "$reg/log")|$(cat "$SP_LOG.version") $(jq -r .version "$d/jsr.json")|$(awk 'END{print NR}' "$reg/ok")"
+}
+chk "K1 a private package on dev is a dry run under the dev dist-tag, at its version, reading no registry" \
+  "$(kpub dev alpha/v1.2.0-dev.3 true)" "npm publish --dry-run --access public --tag dev;|0|1.2.0-dev.3 1.2.0-dev.3|0"
+chk "K1 on stable a dry run to npm then JSR, with its dependencies installed for JSR" \
+  "$(kpub stable v1.4.0 true)" "npm publish --dry-run --access public;npm install --no-save;npx -y jsr@0.14.3 publish --dry-run --allow-dirty;|0|1.4.0 1.4.0|0"
+chk_has "K1 saying it is a dry run" "$(cat "$WORK/kpub.log")" "::notice::@o/priv is private, so its publish is a dry run"
+chk "K2 a public package still checks npm and JSR and publishes for real" \
+  "$(kpub stable v1.4.0 false)" "npm view @o/priv@1.4.0 version;npm publish --access public;npm install --no-save;npx -y jsr@0.14.3 publish --allow-dirty;|1|1.4.0 1.4.0|2"
 chk "H6 detect finds the halves once the publication is final, before the release decision" \
   "$(fact '."halves-order"')|$(fact '."halves-if"')" "true|\${{ steps.gomodules.outputs.go_halves != '[]' }}"
 chk "H6 from the final lane list and the discovered halves" \
@@ -2915,6 +2952,14 @@ chk "G8 go-nested checks the lane's version against its half's npm package" "$(g
 chk "G8 after the lane's version is selected and before its tag, holding no token" \
   "$(fact '."gn-steps" | (index("Select lane version") < index("Check the half'"'"'s npm versions")) and (index("Check the half'"'"'s npm versions") < index("Tag + GitHub Release (lane)"))')|$(fact '."gn-free-if"')|$(fact '."gn-free-env" | has("GH_TOKEN")')" \
   "true|\${{ steps.lane.outputs.release == 'true' }}|false"
+git -C "$LB" tag alpha/v1.3.0-dev.2 "$LBP"
+git -C "$LBC" fetch -q --tags origin '+refs/heads/dev:refs/remotes/origin/dev'
+NPM_PKG=$NPM_ALPHA xweb
+: >"$CURL_DIR/log"
+chk "K4 a private half npm never receives is never owed a dev build, so renumber publishes none" \
+  "$(lsub "$LBP")|$(npm_reads)" 'version=alpha/v1.3.0-dev.2 dirs=[] |0'
+out_b=$(lbarrier "$LBR1")
+chk "K4 and the barrier holds nothing for it" "$out_b|$(npm_reads)" "|0"
 sed -i "\\|^$NPM_ALPHA |d" "$CURL_DIR/docs"
 # The renumber run publishes the subpackages the barrier would hold, from the
 # root's renumbered build.

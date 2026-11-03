@@ -3,7 +3,8 @@
 # version (vX.Y.Z) or a lane tag (<lane>/vX.Y.Z): npm under the `dev` dist-tag
 # on the dev channel, npm then JSR (CLI JSR_VERSION) on stable. A registry that
 # already serves the version is skipped, so a rerun completes a partial
-# publish. OIDC only: trusted publishers at npmjs.com and jsr.io.
+# publish. A `"private": true` package is a dry run on both, checking neither.
+# OIDC only: trusted publishers at npmjs.com and jsr.io.
 set -euo pipefail
 : "${VERSION:?}" "${CHANNEL:?}"
 
@@ -16,7 +17,12 @@ NPM_TAG_ARGS=()
 if [ "$CHANNEL" != "stable" ]; then
   NPM_TAG_ARGS=(--tag dev)
 fi
-if npm view "$pkg@$ver" version >/dev/null 2>&1; then
+DRY_RUN=()
+if [ "$(jq -r '.private // false' package.json)" = true ]; then
+  DRY_RUN=(--dry-run)
+  echo "::notice::$pkg is private, so its publish is a dry run"
+  npm publish --dry-run --access public "${NPM_TAG_ARGS[@]}"
+elif npm view "$pkg@$ver" version >/dev/null 2>&1; then
   echo "::notice::npm: $pkg@$ver already published — skipping"
 else
   npm publish --access public "${NPM_TAG_ARGS[@]}"
@@ -26,7 +32,7 @@ if [ "$CHANNEL" != "stable" ]; then
   exit 0
 fi
 : "${JSR_VERSION:?}"
-if curl -fsSL "https://jsr.io/${pkg}/meta.json" \
+if [ "${#DRY_RUN[@]}" -eq 0 ] && curl -fsSL "https://jsr.io/${pkg}/meta.json" \
   | jq -e --arg v "$ver" '.versions[$v]' >/dev/null 2>&1; then
   echo "::notice::jsr: $pkg@$ver already published — skipping"
 else
@@ -34,5 +40,5 @@ else
   # @cplieger/actions -> @cplieger/reactive) must already be in node_modules,
   # which the npm publish above does not install.
   npm install --no-save
-  npx -y "jsr@${JSR_VERSION}" publish --allow-dirty
+  npx -y "jsr@${JSR_VERSION}" publish "${DRY_RUN[@]}" --allow-dirty
 fi

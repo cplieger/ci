@@ -495,4 +495,23 @@ chk "V-H5 the half's npm read waits before the lane's proxy read, as npm's bound
   "$RC|$(head -1 "$CURL_LOG")|$(tail -1 "$CURL_LOG")" \
   "0|$HALF_NPM|https://proxy.golang.org/github.com/cplieger/probe/alpha/@v/v1.4.0.info"
 
+# ── V-K: a private package is dry-run, so no registry holds it ──────────────
+printf '{"name":"@cplieger/alpha","version":"0.0.0","private":true}\n' >"$HALF/alpha/web/package.json"
+mkdir -p "$HALF/web"
+printf '{"name":"@cplieger/web","version":"0.0.0","private":true}\n' >"$HALF/web/package.json"
+defaults
+export HALVES_RESULT=success HALVES_JSON='["alpha"]' SUBPACKAGE_RESULT=success SUBPACKAGES_JSON='["web"]'
+spec "*registry.npmjs.org* 22 {}" "*jsr.io* 22 {}"
+run_step "$HALF"
+chk "V-K1 a private half and a private subpackage are not read back" "$RC|$(lines "$CURL_LOG")" "0|0"
+chk_has "V-K1 saying why" "$OUT" "@cplieger/alpha is private, so no registry holds it"
+mkdir -p "$HALF/pub"
+pkgjson "$HALF/pub"
+defaults
+export SUBPACKAGE_RESULT=success SUBPACKAGES_JSON='["web","pub"]'
+spec "*registry.npmjs.org* 0 {}" "*jsr.io* 0 {}"
+run_step "$HALF"
+chk "V-K2 a public subpackage beside a private one still is" "$RC|$(cat "$CURL_LOG")" "0|$NPM_URL
+$JSR_URL"
+
 echo "PASS: verify-publish probe contract holds (${PASS} checks)"

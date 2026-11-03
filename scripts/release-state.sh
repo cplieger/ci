@@ -723,7 +723,7 @@ readback_image() { # <tag>
 }
 
 cmd_readback() { # <site> <tag> [lane]; SUBPACKAGES: the root release's subpackage dirs (JSON)
-  local site="${1:?}" tag="${2:?}" lane="${3:-}" mod pkg sub subs ver="${2##*/}"
+  local site="${1:?}" tag="${2:?}" lane="${3:-}" mod pkg manifest sub subs ver="${2##*/}"
   subs=$(jq -r '.[]' <<<"${SUBPACKAGES:-[]}") || die "SUBPACKAGES '${SUBPACKAGES:-}' is not a JSON array of subpackage dirs"
   case "$site" in
     go | lane)
@@ -741,7 +741,12 @@ cmd_readback() { # <site> <tag> [lane]; SUBPACKAGES: the root release's subpacka
   esac
   while IFS= read -r sub; do
     [ -n "$sub" ] || continue
-    pkg=$(git show "${tag}:${sub}/package.json" | jq -r .name) || die "no ${sub}/package.json at ${tag}"
+    manifest=$(git show "${tag}:${sub}/package.json") || die "no ${sub}/package.json at ${tag}"
+    pkg=$(jq -r .name <<<"$manifest") || die "${sub}/package.json at ${tag} is not JSON"
+    if [ "$(jq -r '.private // false' <<<"$manifest")" = true ]; then
+      echo "ok: ${pkg} is private, so no registry holds it"
+      continue
+    fi
     npm_answers "$pkg" "${ver#v}" || return 1
     answers "jsr ${pkg}@${ver#v}" fetch "https://jsr.io/${pkg}/${ver#v}_meta.json" || return 1
   done <<<"$subs"
@@ -906,13 +911,19 @@ sub_dev_heads() { # <dir> <commit> -> "<version> <gitHead>" per -dev.N version n
 }
 # A subpackage's dev build is complete once npm serves a -dev.N version
 # published from its newest change on dev or a descendant on dev. With T, a
-# change past T must also rank above V, as a root build past T must.
+# change past T must also rank above V, as a root build past T must. A private
+# one at dev's head is always complete: its publish is a dry run.
 sub_dev_state() { # <dir> <T or ''> <V> -> "ok", "incomplete <change>" or "below <change>"; fails when git or npm cannot tell
-  local dir=$1 t=$2 v=$3 l heads ver head complete=false above=false
+  local dir=$1 t=$2 v=$3 private l heads ver head complete=false above=false
   has_path refs/remotes/origin/dev "${dir}/package.json" || {
     echo ok
     return 0
   }
+  private=$(git show "refs/remotes/origin/dev:${dir}/package.json" | jq -r '.private // false') || return 1
+  if [ "$private" = true ]; then
+    echo ok
+    return 0
+  fi
   l=$(last_change refs/remotes/origin/dev "$dir") || return 1
   if [ -z "$l" ]; then
     echo ok
