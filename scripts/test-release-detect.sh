@@ -1647,6 +1647,51 @@ chk "H7 with OIDC and no write scope, since it runs the package's scripts" "$(fa
 chk "H7 through the shared script, in the half's directory" \
   "$(fact '."lh-steps" | join(",")')|$(grep -c 'publish-subpackage.sh' "$WORK/half-publish.sh")|$(fact '."lh-wd"')" \
   "Checkout,Setup Node.js,Check out the ci source,Publish the lane's TS half|1|\${{ matrix.lane }}/web"
+git -C "$L" checkout -q main
+LG=$(commit_in "$L" "fix(alpha): go only, stable" alpha/a.go=v4)
+git -C "$L" tag alpha/v1.1.1 "$LG"
+git -C "$L" tag beta/v1.0.0 "$L0"
+lrepair() { # <key> <h_tag> <h_commit> -> the subpackages the lane's repair owes, or EXIT
+  : >"$WORK/out"
+  (cd "$L" && REPO_TYPE=none GO_LANES_JSON='["alpha","beta"]' GITHUB_OUTPUT="$WORK/out" \
+    STATE="{\"$1\": {\"h_tag\": \"$2\", \"h_commit\": \"$3\", \"repair_kind_note\": \"\"}}" bash "$RS" receipts) \
+    >"$WORK/lrepair.log" 2>&1 || {
+    echo EXIT
+    return 0
+  }
+  outkey repairs | jq -r '.[0] | "\(.site) \(.subpackages)"'
+}
+chk "H8 an unreceipted lane tag owes its half when the range changed it" "$(lrepair alpha alpha/v1.1.0 "$LS")" 'lane ["alpha/web"]'
+chk "H8 its first stable tag owes it" "$(lrepair alpha alpha/v1.0.0 "$L4")" 'lane ["alpha/web"]'
+chk "H8 a Go-only release owes none" "$(lrepair alpha alpha/v1.1.1 "$LG")" 'lane []'
+chk "H8 nor does a lane with no half" "$(lrepair beta beta/v1.0.0 "$L0")" 'lane []'
+chk "H8 the publishing job receives the repair that owes it" \
+  "$(lrepair alpha alpha/v1.1.0 "$LS" >/dev/null && outkey repair_publishes | jq -r '[.[] | "\(.tag) \(.lane)"] | join(",")')" \
+  "alpha/v1.1.0 alpha"
+chk "H8 a stable tag list git cannot read for the half fails the run" "$(failing_tag_read 1 lrepair alpha alpha/v1.1.0 "$LS")" "EXIT"
+chk_has "H8 and says so" "$(cat "$WORK/lrepair.log")" "cannot read lane alpha's stable tags"
+LC=$(lane_clone "$LG")
+cp "$CURL_DIR/ok" "$WORK/ok.saved"
+printf '%s\n' https://proxy.golang.org/example.com/l/alpha/@v/v1.1.0.info >"$CURL_DIR/ok"
+chk "H9 a lane repair whose half npm does not serve is refused" \
+  "$(SUBPACKAGES='["alpha/web"]' RB_DIR=$LC readback lane alpha/v1.1.0 alpha)" "refused"
+chk_has "H9 naming the half at the lane's version" "$(cat "$WORK/readback.log")" "npm @o/alpha@1.1.0"
+printf '%s\n' https://registry.npmjs.org/@o/alpha/1.1.0 https://jsr.io/@o/alpha/1.1.0_meta.json >>"$CURL_DIR/ok"
+chk "H9 and reads back once npm and JSR serve it" "$(SUBPACKAGES='["alpha/web"]' RB_DIR=$LC readback lane alpha/v1.1.0 alpha)" "ok"
+mv "$WORK/ok.saved" "$CURL_DIR/ok"
+rm -rf "$WORK/rt"
+mkdir -p "$WORK/rt" "$WORK/lcurl"
+: >"$WORK/lcurl/ok"
+: >"$SP_LOG"
+(cd "$LC" && PATH="$BIN2:$PATH" CURL_DIR="$WORK/lcurl" RUNNER_TEMP="$WORK/rt" CI_TOOLS="$ROOT/scripts" TAG=alpha/v1.1.0 \
+  COMMIT="$LS" SUBPACKAGES='["alpha/web"]' JSR_VERSION="$(fact '."repair-complete-env".JSR_VERSION')" bash "$WORK/repair-complete.sh") \
+  >"$WORK/lcomplete.log" 2>&1 || fail "the repair's half step failed: $(cat "$WORK/lcomplete.log")"
+chk "H9 the repair publishes the half from the lane tag's tree at the lane's version" \
+  "$(grep -E '^(npm publish|published|npx)' "$SP_LOG" | tr '\n' ';')|$(cat "$SP_LOG.version")" \
+  "npm publish --access public @web;published v2;npx -y jsr@0.14.3 publish --allow-dirty @web;|1.1.0"
+chk "H10 verify-publish waits on the halves, so a failed one leaves its lane unreceipted for the repair" \
+  "$(fact '."needs:verify-publish" | index("lane-halves") != null')|$(fact '."jobif:verify-publish"' | grep -c "!contains(needs.\*.result, 'failure')")" \
+  "true|1"
 
 # ── The dev barrier ──────────────────────────────────────────────────────────
 rm -rf "$W"

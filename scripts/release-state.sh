@@ -360,13 +360,13 @@ lane_anchor() { # <key> -> the commit of the lane's channel tag nearest HEAD (st
   done <<<"$revs"
 }
 # A lane's TS half ships what a root subpackage would: path-significance.sh's
-# exclusions and published-manifest rule decide, over the range and, on
-# stable, each promotion's own diff in it, as published_subpackages counts.
-half_changed() { # <lane> <from commit or ''> <to> -> 0 when the half at <lane>/web changed; dies when it cannot tell
+# exclusions and published-manifest rule decide, over the range and, with
+# promotions, each promotion's own diff in it, as published_subpackages counts.
+half_changed() { # <lane> <from commit or ''> <to> [promotions] -> 0 when the half at <lane>/web changed; dies when it cannot tell
   local from=$2 f t res subs recs c ranges
   [ -n "$from" ] || from=$(git hash-object -t tree /dev/null)
   ranges="$from $3"
-  if [ "${CHANNEL:-}" = stable ]; then
+  if [ "${4:-}" = promotions ]; then
     recs=$(reconciliations_in "$2" "$3") || die "cannot list the promotions of ${2:-the root}..${3}"
     while IFS= read -r c; do
       [ -z "$c" ] || ranges+=$'\n'"${c}^1 ${c}"
@@ -383,14 +383,14 @@ half_changed() { # <lane> <from commit or ''> <to> -> 0 when the half at <lane>/
   return 1
 }
 cmd_halves() {
-  local mods="${GO_MODULES_TO_RELEASE:-[]}" halves="${GO_HALVES_JSON:-[]}" pub='[]' l a lanes
-  case "${CHANNEL:-}" in dev | stable) ;; *) die "CHANNEL must be dev or stable, got '${CHANNEL:-}'" ;; esac
+  local mods="${GO_MODULES_TO_RELEASE:-[]}" halves="${GO_HALVES_JSON:-[]}" pub='[]' l a lanes with=""
+  case "${CHANNEL:-}" in dev) ;; stable) with=promotions ;; *) die "CHANNEL must be dev or stable, got '${CHANNEL:-}'" ;; esac
   lanes=$(jq -r --argjson h "$halves" '.[] | select(. as $l | any($h[]; . == $l))' <<<"$mods") \
     || die "GO_MODULES_TO_RELEASE '${mods}' and GO_HALVES_JSON '${halves}' must be JSON arrays of lane dirs"
   while IFS= read -r l; do
     [ -n "$l" ] || continue
     a=$(lane_anchor "$l") || die "cannot read lane ${l}'s tags or the history of HEAD"
-    if half_changed "$l" "$a" HEAD; then
+    if half_changed "$l" "$a" HEAD "$with"; then
       pub=$(jq -c --arg v "$l" '. + [$v]' <<<"$pub")
       echo "lane ${l}: ${l}/web changed since ${a:-its first commit}, so it publishes at the lane's version"
     else
@@ -438,7 +438,7 @@ published_subpackages() { # <root tag> <commit> -> JSON array of subpackage dirs
 }
 
 cmd_receipts() {
-  local state="${STATE:?}" repo="${GITHUB_REPOSITORY:?}" repairs='[]' key tag commit kind contexts site subs shas floor rows
+  local state="${STATE:?}" repo="${GITHUB_REPOSITORY:?}" repairs='[]' key tag commit kind contexts site subs shas floor rows prev
   rows=$(jq -r 'to_entries[] | select(.value.h_tag != "") | [.key, .value.h_tag, .value.h_commit, .value.repair_kind_note] | @tsv' <<<"$state") \
     || die "STATE is not the pending step's state"
   while IFS=$'\t' read -r key tag commit kind; do
@@ -457,6 +457,12 @@ cmd_receipts() {
       subs=$(published_subpackages "$tag" "$commit") || die "could not tell which subpackages ${tag} publishes"
     else
       site=lane
+      if has_path "$commit" "$key/web/jsr.json"; then
+        prev=$(highest_stable "$key" "$(core "$tag")") || die "cannot read lane ${key}'s stable tags"
+        if half_changed "$key" "${prev#* }" "$commit" promotions; then
+          subs=$(jq -cn --arg d "$key/web" '[$d]')
+        fi
+      fi
     fi
     note "lane ${key}: ${tag} has no completion receipt, so this run repairs it at ${commit} first"
     repairs=$(jq -c --arg k "$key" --arg lane "$(lane_dir "$key")" --arg tag "$tag" --arg commit "$commit" \

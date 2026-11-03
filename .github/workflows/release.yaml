@@ -2143,11 +2143,11 @@ jobs:
   # ─── Verify every registry this run published to ──────────────────────────
   # A green publish job is not proof the artifact is fetchable. Each lane that
   # ran is read back at the released version: the Go proxy for the root module
-  # and each nested lane, npm (and JSR on stable) for the root package and
-  # each subpackage. The docker lane is verified inside docker-release.yaml,
+  # and each nested lane, npm (and JSR on stable) for the root package, each
+  # subpackage and each lane's TS half. The docker lane is verified inside docker-release.yaml,
   # which holds the manifest digest.
   verify-publish:
-    needs: [detect, docker, go, ts, subpackage, go-nested]
+    needs: [detect, docker, go, ts, subpackage, go-nested, lane-halves]
     # A skipped dependency skips this job under the default success(), and a
     # repo is one type so most lanes skip: run when none failed and at least
     # one registry lane published.
@@ -2191,6 +2191,8 @@ jobs:
           TS_RESULT: ${{ needs.ts.result }}
           SUBPACKAGE_RESULT: ${{ needs.subpackage.result }}
           GO_NESTED_RESULT: ${{ needs.go-nested.result }}
+          HALVES_JSON: ${{ needs.detect.outputs.halves_to_publish }}
+          HALVES_RESULT: ${{ needs.lane-halves.result }}
         run: |
           set -euo pipefail
           . "$CI_TOOLS/retry.sh"
@@ -2240,12 +2242,12 @@ jobs:
           }
           # JSR receives the stable channel only, so a dev version is never
           # there to read back.
-          probe_ts() { # <package.json>
-            local pkg
+          probe_ts() { # <package.json> [X.Y.Z, the root's version by default]
+            local pkg v="${2:-$ver}"
             pkg=$(jq -r .name "$1")
-            REGISTRY_WAIT_SECONDS=$NPM_SCAN_SECONDS probe "npm ${pkg}@${ver}" "https://registry.npmjs.org/${pkg}/${ver}" || rc=1
+            REGISTRY_WAIT_SECONDS=$NPM_SCAN_SECONDS probe "npm ${pkg}@${v}" "https://registry.npmjs.org/${pkg}/${v}" || rc=1
             if [ "$CHANNEL" = "stable" ]; then
-              probe "jsr ${pkg}@${ver}" "https://jsr.io/${pkg}/${ver}_meta.json" || rc=1
+              probe "jsr ${pkg}@${v}" "https://jsr.io/${pkg}/${v}_meta.json" || rc=1
             fi
           }
           # Only tags of this channel's shape: a stable and a dev lane tag can
@@ -2268,6 +2270,15 @@ jobs:
               [ -z "$d" ] && continue
               probe_ts "$d/package.json"
             done < <(jq -r '.[]' <<<"$SUBPACKAGES_JSON")
+          fi
+          if [ "$HALVES_RESULT" = "success" ]; then
+            while IFS= read -r d; do
+              [ -z "$d" ] && continue
+              while IFS= read -r tag; do
+                [ -z "$tag" ] && continue
+                probe_ts "$d/web/package.json" "${tag#"$d"/v}"
+              done < <(lane_tags_at_head "$d")
+            done < <(jq -r '.[]' <<<"$HALVES_JSON")
           fi
           if [ "$GO_RESULT" = "success" ]; then
             probe_go go.mod "$VERSION" || rc=1
