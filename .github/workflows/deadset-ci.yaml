@@ -1,8 +1,7 @@
 name: Dead code (deadset)
 
-# One deadset analysis of a target root. The languages come from the target's
-# deadset.json; without one, the repository root uses deadset's detection and a
-# nested Go module uses Go alone.
+# One deadset analysis of a target root, in the languages deadset's census
+# (`deadset print-languages`) puts in scope there.
 
 on:
   workflow_call:
@@ -32,7 +31,7 @@ permissions:
 # this workflow over fixed repositories to prove each set before it ships.
 env:
   # renovate: datasource=go depName=github.com/cplieger/deadset/v2
-  DEADSET_VERSION: v2.0.0-dev.21
+  DEADSET_VERSION: v2.0.0-dev.24
   # renovate: datasource=go depName=github.com/cplieger/deadset-go/v2
   DEADSET_GO_VERSION: v2.0.0-dev.25
   # renovate: datasource=npm depName=@cplieger/deadset-ts
@@ -58,15 +57,9 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
-      # The languages are deadset's own choice, replayed so the job installs
-      # what that choice needs: analysis.languages from deadset.json, else the
-      # central file's, else deadset's detection by file name, in which each
-      # language skips its own analyzer's directories (commands.md "How
-      # languages are detected"). proto needs no setup, so it is not replayed.
       # A nested module's central file names go alone, because deadset-ts at
-      # the root already reads every tsconfig under it; a root with no go.mod
-      # leaves out the Go its modules hold. A language whose setup cannot be
-      # derived fails here.
+      # the root already reads every tsconfig under it; its deadset.json still
+      # outranks the central file.
       - name: Resolve target
         id: target
         env:
@@ -74,97 +67,29 @@ jobs:
         run: |
           set -euo pipefail
           work="$(mktemp -d "$RUNNER_TEMP/deadset.XXXXXX")"
-          languages=""
-          if [ -f deadset.json ]; then
-            languages="$(jq -r '.analysis.languages // [] | join(",")' deadset.json 2>/dev/null || true)"
-          fi
-          languages_from="repository: deadset.json"
-          central_languages='[]'
-          if [ -z "$languages" ] && [ "$TARGET" != . ]; then
-            languages=go
-            languages_from="central: nested module"
-            central_languages='["go"]'
-          fi
-          if [ -z "$languages" ]; then
-            languages_from=detected
-            found=()
-            if [ -n "$(find . -mindepth 1 \
-              \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.*' -o -name '_*' \) -prune \) \
-              -o ! -type d \( -name go.mod -o \( -name '*.go' ! -name '.*' ! -name '_*' \) \) -print -quit)" ]; then
-              found+=(go)
-            fi
-            if [ -n "$(find . -mindepth 1 \( -type d \( -name node_modules -o -name .git \) -prune \) \
-              -o ! -type d \( -name 'tsconfig*.json' -o -name 'jsconfig*.json' \
-              -o \( \( -name '*.js' -o -name '*.jsx' -o -name '*.mjs' -o -name '*.cjs' \) \
-              ! -name '*.min.js' ! -name '*.min.cjs' ! -name '*.min.mjs' \) \) -print -quit)" ]; then
-              found+=(ts)
-            fi
-            languages="$(IFS=,; printf '%s' "${found[*]:-}")"
-            # deadset's own detection would count the modules' Go again.
-            if [ "$languages" = ts ] && grep -qxE 'go\.mod|.+\.go' <<<"$names"; then
-              languages_from="central: Go only in nested modules"
-              central_languages='["ts"]'
-            fi
-          fi
-          go=false
-          ts=false
-          case ",$languages," in *,go,*) go=true ;; esac
-          case ",$languages," in *,ts,*) ts=true ;; esac
-          if [ "$go" = false ] && [ "$ts" = false ]; then
-            echo "::error::nothing to analyze at $TARGET: analysis.languages ($languages_from) is '${languages}', and this check analyzes go and ts."
-            exit 1
-          fi
-          if [ "$go" = true ] && [ ! -f go.mod ]; then
-            echo "::error::Go is in scope at $TARGET ($languages_from), but $TARGET has no go.mod to load it from. Add a root deadset.json whose analysis.languages leaves go out, or analyze the module at its own root."
-            exit 1
-          fi
-          # JavaScript with no package.json, such as a node script, has nothing
-          # to install.
-          npm_dirs=()
-          manifests=0
-          while IFS= read -r file; do
-            case "/$file" in
-              */node_modules/* | */testdata/* | */vendor/* | */.*/*) continue ;;
-              */package.json) manifests=$((manifests + 1)) ;;
-              *) if [ "$ts" = true ]; then npm_dirs+=("$(dirname "$file")"); fi ;;
-            esac
-          done < <(git ls-files -- ':(glob)**/package-lock.json' ':(glob)**/package.json')
-          if [ "$ts" = true ] && [ "$manifests" -gt 0 ] && [ "${#npm_dirs[@]}" -eq 0 ]; then
-            echo "::error::TypeScript is in scope at $TARGET ($languages_from), but no package-lock.json is tracked under it, so its dependencies cannot be installed for deadset-ts. Commit the lockfile, or add a root deadset.json whose analysis.languages leaves ts out."
-            exit 1
-          fi
           kind=library
           if [ -f Dockerfile ]; then kind=application; fi
+          central_languages='[]'
+          if [ "$TARGET" != . ]; then central_languages='["go"]'; fi
           jq -n --arg kind "$kind" --argjson languages "$central_languages" \
             '{target: {kind: $kind}} + if $languages == [] then {} else {analysis: {languages: $languages}} end' \
             > "$work/central.json"
           prefix=""
           if [ "$TARGET" != . ]; then prefix="$TARGET/"; fi
+          go_mod=false
           go_sum=""
-          if [ "$go" = true ] && [ -f go.sum ]; then go_sum="${prefix}go.sum"; fi
+          if [ -f go.mod ]; then
+            go_mod=true
+            if [ -f go.sum ]; then go_sum="${prefix}go.sum"; fi
+          fi
           {
             echo "work=$work"
+            echo "go_mod=$go_mod"
             echo "go_sum=$go_sum"
-            echo "languages=$languages"
-            echo "languages_from=$languages_from"
-            echo "go=$go"
-            echo "ts=$ts"
-            echo "npm_dirs<<NPM_DIRS_END"
-            for d in "${npm_dirs[@]}"; do printf '%s\n' "$d"; done
-            echo "NPM_DIRS_END"
-            echo "lockfiles<<LOCKFILES_END"
-            for d in "${npm_dirs[@]}"; do
-              if [ "$d" = . ]; then
-                printf '%spackage-lock.json\n' "$prefix"
-              else
-                printf '%s%s/package-lock.json\n' "$prefix" "$d"
-              fi
-            done
-            echo "LOCKFILES_END"
           } >> "$GITHUB_OUTPUT"
 
       - name: Setup Go
-        if: ${{ steps.target.outputs.go == 'true' }}
+        if: ${{ steps.target.outputs.go_mod == 'true' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: ${{ inputs.target }}/go.mod
@@ -172,30 +97,17 @@ jobs:
           cache-dependency-path: ${{ steps.target.outputs.go_sum }}
 
       - name: Setup Go (deadset only)
-        if: ${{ steps.target.outputs.go != 'true' }}
+        if: ${{ steps.target.outputs.go_mod != 'true' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
           cache: false
-
-      - name: Setup Node.js
-        if: ${{ steps.target.outputs.ts == 'true' }}
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: '26'
-          # setup-node throws on a cache with no lockfile:
-          # https://github.com/actions/setup-node/blob/949feb2413d6458794dcd2491c4babbbce0c15c1/src/cache-restore.ts#L84-L87
-          cache: ${{ steps.target.outputs.lockfiles != '' && 'npm' || '' }}
-          cache-dependency-path: ${{ steps.target.outputs.lockfiles }}
 
       # setup-go exports GOTOOLCHAIN=local, and deadset and deadset-go may need
       # a newer Go than the target's go.mod or the `stable` manifest names.
       # The go command never retries a module proxy fetch, and proxy.golang.org
       # intermittently resets a download stream (HTTP/2 INTERNAL_ERROR).
       - name: Install deadset
-        env:
-          GO: ${{ steps.target.outputs.go }}
-          TS: ${{ steps.target.outputs.ts }}
         run: |
           set -euo pipefail
           retry() {
@@ -214,20 +126,109 @@ jobs:
           export GOTOOLCHAIN=auto
           echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
           retry go install "github.com/cplieger/deadset/v2/cmd/deadset@${DEADSET_VERSION}"
-          if [ "$GO" = true ]; then
-            retry go install "github.com/cplieger/deadset-go/v2/cmd/deadset-go@${DEADSET_GO_VERSION}"
+
+      # The census is the plan `deadset analyze` makes from the same flags, so
+      # the job installs exactly the analyzers that run invokes. Its
+      # no-program failure is deadset's answer that the target holds no
+      # program; any other failure fails the job, never reads as no languages.
+      - name: Languages in scope (deadset)
+        id: census
+        env:
+          TARGET: ${{ inputs.target }}
+          WORK: ${{ steps.target.outputs.work }}
+        run: |
+          set -euo pipefail
+          rc=0
+          deadset print-languages --target=. --central="$WORK/central.json" \
+            > "$WORK/census.json" 2> "$WORK/census.err" || rc=$?
+          cat "$WORK/census.err" >&2
+          if [ "$rc" -eq 3 ] && grep -q '^setup failure: no-program: ' "$WORK/census.err"; then
+            echo "::notice::deadset finds no program at $TARGET, so there is nothing to check."
+            echo "analyze=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          if [ "$TS" = true ]; then
-            npm install --global --ignore-scripts --no-audit --no-fund \
-              "@cplieger/deadset-ts@${DEADSET_TS_VERSION}"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::deadset print-languages exited $rc, so the languages in scope at $TARGET are unknown and nothing was checked. Its error is above."
+            exit 1
           fi
+          analyzers="$(jq -er '.analyzers | map(.name) | join(",")' "$WORK/census.json")" || {
+            echo "::error::deadset print-languages wrote no census naming its analyzers, so nothing was checked."
+            exit 1
+          }
+          from() {
+            jq -r --arg language "$1" '.languages[] | select(.language == $language) | .provenance' "$WORK/census.json"
+          }
+          echo "analysis.languages $(jq -r '[.languages[] | "\(.language) (\(.provenance))"] | join(", ")' "$WORK/census.json"); analyzers ${analyzers:-none}"
+          go=false
+          ts=false
+          IFS=, read -ra names <<< "$analyzers"
+          for name in "${names[@]}"; do
+            case "$name" in
+              deadset-go) go=true ;;
+              deadset-ts) ts=true ;;
+              *)
+                echo "::error::deadset would run the analyzer $name at $TARGET, and this check installs only deadset-go and deadset-ts. Leave providers.analyzers out of deadset.json."
+                exit 1
+                ;;
+            esac
+          done
+          if [ "$go" = true ] && [ ! -f go.mod ]; then
+            echo "::error::Go is in scope at $TARGET ($(from go)), but $TARGET has no go.mod to load it from. Add a root deadset.json whose analysis.languages leaves go out, or analyze the module at its own root."
+            exit 1
+          fi
+          # JavaScript with no package.json, such as a node script, has nothing
+          # to install.
+          npm_dirs=()
+          manifests=0
+          while IFS= read -r file; do
+            case "/$file" in
+              */node_modules/* | */testdata/* | */vendor/* | */.*/*) continue ;;
+              */package.json) manifests=$((manifests + 1)) ;;
+              *) if [ "$ts" = true ]; then npm_dirs+=("$(dirname "$file")"); fi ;;
+            esac
+          done < <(git ls-files -- ':(glob)**/package-lock.json' ':(glob)**/package.json')
+          if [ "$ts" = true ] && [ "$manifests" -gt 0 ] && [ "${#npm_dirs[@]}" -eq 0 ]; then
+            echo "::error::TypeScript is in scope at $TARGET ($(from ts)), but no package-lock.json is tracked under it, so its dependencies cannot be installed for deadset-ts. Commit the lockfile, or add a root deadset.json whose analysis.languages leaves ts out."
+            exit 1
+          fi
+          prefix=""
+          if [ "$TARGET" != . ]; then prefix="$TARGET/"; fi
+          {
+            echo "analyze=true"
+            echo "go=$go"
+            echo "ts=$ts"
+            echo "npm_dirs<<NPM_DIRS_END"
+            for d in "${npm_dirs[@]}"; do printf '%s\n' "$d"; done
+            echo "NPM_DIRS_END"
+            echo "lockfiles<<LOCKFILES_END"
+            for d in "${npm_dirs[@]}"; do
+              if [ "$d" = . ]; then
+                printf '%spackage-lock.json\n' "$prefix"
+              else
+                printf '%s%s/package-lock.json\n' "$prefix" "$d"
+              fi
+            done
+            echo "LOCKFILES_END"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        if: ${{ steps.census.outputs.ts == 'true' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          # setup-node throws on a cache with no lockfile:
+          # https://github.com/actions/setup-node/blob/949feb2413d6458794dcd2491c4babbbce0c15c1/src/cache-restore.ts#L84-L87
+          cache: ${{ steps.census.outputs.lockfiles != '' && 'npm' || '' }}
+          cache-dependency-path: ${{ steps.census.outputs.lockfiles }}
 
       # deadset-go loads packages with GOPROXY=off, and deadset-ts resolves
       # imports through each project's node_modules.
-      - name: Install dependencies
+      - name: Install analyzers and dependencies
+        if: ${{ steps.census.outputs.analyze == 'true' }}
         env:
-          GO: ${{ steps.target.outputs.go }}
-          NPM_DIRS: ${{ steps.target.outputs.npm_dirs }}
+          GO: ${{ steps.census.outputs.go }}
+          TS: ${{ steps.census.outputs.ts }}
+          NPM_DIRS: ${{ steps.census.outputs.npm_dirs }}
         run: |
           set -euo pipefail
           # Install deadset's retry, for the same proxy resets.
@@ -244,7 +245,14 @@ jobs:
               delay=$((delay * 2))
             done
           }
-          if [ "$GO" = true ]; then retry go mod download; fi
+          if [ "$GO" = true ]; then
+            retry go install "github.com/cplieger/deadset-go/v2/cmd/deadset-go@${DEADSET_GO_VERSION}"
+            retry go mod download
+          fi
+          if [ "$TS" = true ]; then
+            npm install --global --ignore-scripts --no-audit --no-fund \
+              "@cplieger/deadset-ts@${DEADSET_TS_VERSION}"
+          fi
           while IFS= read -r dir; do
             if [ -z "$dir" ]; then continue; fi
             echo "npm ci in $dir"
@@ -260,14 +268,13 @@ jobs:
       # needs, is the one key a repository cannot set; any other flag would
       # take a key from it.
       - name: Dead code (deadset)
+        if: ${{ steps.census.outputs.analyze == 'true' }}
         env:
           TARGET: ${{ inputs.target }}
           EXIT_CODE: ${{ inputs.exit-code }}
           WORK: ${{ steps.target.outputs.work }}
-          LANGUAGES: ${{ steps.target.outputs.languages }}
-          LANGUAGES_FROM: ${{ steps.target.outputs.languages_from }}
-          GO: ${{ steps.target.outputs.go }}
-          NPM_DIRS: ${{ steps.target.outputs.npm_dirs }}
+          GO: ${{ steps.census.outputs.go }}
+          NPM_DIRS: ${{ steps.census.outputs.npm_dirs }}
         run: |
           set -euo pipefail
           if [ "$GO" = true ]; then
@@ -295,8 +302,7 @@ jobs:
             done
           done < <(printf '%s\n' "$NPM_DIRS")
           deadset print-config --target=. --central="$WORK/central.json" \
-            | jq -r --arg languages "$LANGUAGES" --arg from "$LANGUAGES_FROM" \
-              '"target.kind \(.target.kind) (\(.provenance["target.kind"])); analysis.languages \($languages) (\($from))"' \
+            | jq -r '"target.kind \(.target.kind) (\(.provenance["target.kind"]))"' \
             || true
           rc=0
           deadset analyze --target=. --central="$WORK/central.json" --run-dir="$WORK/run" \
