@@ -47,6 +47,8 @@ jobs:
       root_changed: ${{ steps.publish.outputs.root_changed || steps.ahead.outputs.root_changed || steps.changes.outputs.root_changed }}
       go_modules: ${{ steps.gomodules.outputs.go_modules }}
       go_modules_to_release: ${{ steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}
+      go_halves: ${{ steps.gomodules.outputs.go_halves }}
+      halves_to_publish: ${{ steps.halves.outputs.halves_to_publish || '[]' }}
       # The root lane's release-kind line.
       release_kind_note: ${{ steps.pending.outputs.root_kind_note }}
       # Per-lane state keyed '.' (root) or the lane dir, the lane matrix, the
@@ -224,13 +226,26 @@ jobs:
               fi
             done < <(echo "$LANES" | jq -r '.[]')
           done < <(echo "$LANES" | jq -r '.[]')
+          # A lane's TS half is the package at <lane>/web, published at the
+          # lane's version; it never joins the root subpackages above.
+          HALVES="[]"
+          while IFS= read -r d; do
+            [ -z "$d" ] && continue
+            [ -n "$(git ls-files "$d/web/jsr.json")" ] || continue
+            if [ -z "$(git ls-files "$d/web/package.json")" ]; then
+              echo "::error::$d/web/jsr.json has no package.json beside it. A lane's TS half publishes to npm, then JSR."
+              exit 1
+            fi
+            HALVES=$(echo "$HALVES" | jq -c --arg v "$d" '. + [$v]')
+          done < <(echo "$LANES" | jq -r '.[]')
           {
             echo "go_modules=$LANES"
+            echo "go_halves=$HALVES"
             echo "exclude_paths<<EOF"
             echo "$LANES" | jq -r '.[] | . + "/**"'
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "nested Go module lanes: $LANES"
+          echo "nested Go module lanes: $LANES, TS halves: $HALVES"
 
       # Every job runs the scripts and actions of the commit this workflow
       # runs from, checked out beside the consumer's tree: a `uses:` ref to
@@ -281,6 +296,7 @@ jobs:
 
       - name: Compute version (cliff)
         id: cliff
+        if: ${{ steps.type.outputs.type != 'none' }}
         uses: ./.cplieger-ci/actions/git-cliff-version
         with:
           channel: ${{ steps.channel.outputs.channel }}
@@ -342,17 +358,31 @@ jobs:
           set -euo pipefail
           bash "$CI_TOOLS/release-state.sh" publish
 
+      - name: Find the lane halves to publish
+        id: halves
+        if: ${{ steps.gomodules.outputs.go_halves != '[]' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+          GO_MODULES_TO_RELEASE: ${{ steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}
+          GO_HALVES_JSON: ${{ steps.gomodules.outputs.go_halves }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" halves
+
       # The release decision is "a shipped path changed and this commit is
       # not already tagged on this channel"; git-cliff only decides the bump
       # level. A changed TS subpackage counts: it
       # shares the root version, so its publish needs the root tag the go job
       # creates, while the root image rebuilds on root_changed alone. A
-      # renumber run publishes nothing here; the renumber jobs tag it.
+      # renumber run publishes nothing here; the renumber jobs tag it. A
+      # root-less repo (type none) releases only its nested lanes.
       - name: Select version
         id: select
         env:
           CHANNEL: ${{ steps.channel.outputs.channel }}
           MODE: ${{ steps.channel.outputs.mode }}
+          REPO_TYPE: ${{ steps.type.outputs.type }}
           ROOT_CHANGED: ${{ steps.publish.outputs.root_changed || steps.ahead.outputs.root_changed || steps.changes.outputs.root_changed }}
           SUBPACKAGES_TO_PUBLISH: ${{ steps.publish.outputs.subpackages_to_publish || steps.ahead.outputs.subpackages_to_publish || steps.changes.outputs.subpackages_to_publish }}
           BASE: ${{ steps.cliff.outputs.base }}
@@ -361,6 +391,20 @@ jobs:
           ANCHOR_SHA: ${{ steps.cliff.outputs.anchor_sha }}
         run: |
           set -euo pipefail
+          if [ "$REPO_TYPE" = none ]; then
+            if [ "$SUBPACKAGES_TO_PUBLISH" != "[]" ]; then
+              echo "::error::TS subpackages ${SUBPACKAGES_TO_PUBLISH} share the root version, but this root has no Dockerfile, jsr.json or go.mod, so it has none. Move each into a nested Go module's web/ directory, or give the root a type."
+              exit 1
+            fi
+            {
+              echo "version="
+              echo "release=false"
+              echo "base="
+              echo "dev_version="
+            } >> "$GITHUB_OUTPUT"
+            echo "Selected: no root release (the root has no Dockerfile, jsr.json or go.mod); nested lanes release on their own"
+            exit 0
+          fi
           if [ -z "$BASE" ]; then
             echo "::error::git-cliff-version returned no base"
             exit 1
@@ -1249,6 +1293,81 @@ jobs:
             (cd "$dir" && bash "$CI_TOOLS/publish-subpackage.sh")
           done < <(jq -r '.[]' <<<"$DIRS")
 
+  # A lane's TS half follows its lane's renumber as a subpackage follows the
+  # root's, one leg per lane.
+  renumber-halves:
+    needs: [detect, renumber-tag]
+    if: |
+      !cancelled() && needs.detect.outputs.mode == 'renumber' && needs.detect.outputs.go_halves != '[]'
+      && (needs.renumber-tag.result == 'success' || needs.renumber-tag.result == 'skipped')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJSON(needs.detect.outputs.go_halves) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Check out the newest build
+        id: target
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          LANE_KEY: ${{ matrix.lane }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber-target
+
+      - name: Select the half
+        id: plan
+        if: ${{ steps.target.outputs.commit != '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: dev
+          STATE: ${{ needs.detect.outputs.lane_state }}
+          LANE_KEY: ${{ matrix.lane }}
+          REPO_TYPE: ${{ needs.detect.outputs.type }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber-subpackages
+
+      - name: Setup Node.js
+        if: ${{ steps.plan.outputs.dirs != '' && steps.plan.outputs.dirs != '[]' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish the half
+        if: ${{ steps.plan.outputs.dirs != '' && steps.plan.outputs.dirs != '[]' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          VERSION: ${{ steps.plan.outputs.version }}
+          DIRS: ${{ steps.plan.outputs.dirs }}
+          CHANNEL: dev
+        run: |
+          set -euo pipefail
+          while IFS= read -r dir; do
+            (cd "$dir" && bash "$CI_TOOLS/publish-subpackage.sh")
+          done < <(jq -r '.[]' <<<"$DIRS")
+
   # ─── Docker image build + sign + SBOM + release (delegated) ────────────────
   # On dev a build is due only when a new dev version is (root_changed and
   # this commit untagged); on stable the job also runs with nothing to publish,
@@ -1973,6 +2092,17 @@ jobs:
           fi
           echo "ok: module path '$modpath' matches lane ${DIR} ($VERSION)"
 
+      # Before the tag, which reserves the version for the lane's TS half too.
+      - name: Check the half's npm versions
+        if: ${{ steps.lane.outputs.release == 'true' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          DIR: ${{ matrix.dir }}
+          VERSION: ${{ steps.lane.outputs.version }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" half-free "$DIR" "$VERSION" "$GITHUB_SHA"
+
       - name: Generate lane release notes
         # Stable only. Deliberately token-free — this step executes the
         # git-cliff binary the compute action installed; see the go job's
@@ -2031,14 +2161,79 @@ jobs:
             gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md
           fi
 
+  # ─── A lane's TS half (<lane>/web), published at the lane's version ───────
+  # Apart from go-nested, whose contents write must not reach the package's
+  # lifecycle scripts. The lane's tag precedes the publish, as the root tag
+  # precedes a root subpackage's.
+  lane-halves:
+    needs: [detect, go-nested]
+    if: |
+      !cancelled() && needs.go-nested.result == 'success' && needs.detect.outputs.halves_to_publish != '[]'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJSON(needs.detect.outputs.halves_to_publish) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # The lane's tag at HEAD is the version: a matrix job's outputs are
+      # last-writer-wins across its legs, so go-nested cannot hand it on.
+      - name: Publish the lane's TS half
+        working-directory: ${{ matrix.lane }}/web
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          LANE: ${{ matrix.lane }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
+          # renovate: datasource=npm depName=jsr
+          JSR_VERSION: 0.14.3
+        run: |
+          set -euo pipefail
+          if [ "$CHANNEL" = stable ]; then
+            tags=$(git tag --points-at HEAD --list "$LANE/v[0-9]*" | grep -E "^${LANE}/v[0-9]+\.[0-9]+\.[0-9]+\$" || true)
+          else
+            tags=$(git tag --points-at HEAD --list "$LANE/v[0-9]*-dev.*")
+          fi
+          tag=$(sort -V <<<"$tags" | tail -n1)
+          if [ -z "$tag" ]; then
+            echo "::error::lane ${LANE} has no ${CHANNEL} tag at $(git rev-parse HEAD), though go-nested released it. Its TS half is not published without one."
+            exit 1
+          fi
+          echo "lane ${LANE}: publishing ${LANE}/web at ${tag}"
+          VERSION="$tag" bash "$CI_TOOLS/publish-subpackage.sh"
+
   # ─── Verify every registry this run published to ──────────────────────────
   # A green publish job is not proof the artifact is fetchable. Each lane that
   # ran is read back at the released version: the Go proxy for the root module
-  # and each nested lane, npm (and JSR on stable) for the root package and
-  # each subpackage. The docker lane is verified inside docker-release.yaml,
-  # which holds the manifest digest.
+  # and each nested lane, npm (and JSR on stable) for the root package, each
+  # subpackage and each lane's TS half. The docker lane is verified inside
+  # docker-release.yaml, which holds the manifest digest.
   verify-publish:
-    needs: [detect, docker, go, ts, subpackage, go-nested]
+    needs: [detect, docker, go, ts, subpackage, go-nested, lane-halves]
     # A skipped dependency skips this job under the default success(), and a
     # repo is one type so most lanes skip: run when none failed and at least
     # one registry lane published.
@@ -2082,6 +2277,8 @@ jobs:
           TS_RESULT: ${{ needs.ts.result }}
           SUBPACKAGE_RESULT: ${{ needs.subpackage.result }}
           GO_NESTED_RESULT: ${{ needs.go-nested.result }}
+          HALVES_JSON: ${{ needs.detect.outputs.halves_to_publish }}
+          HALVES_RESULT: ${{ needs.lane-halves.result }}
         run: |
           set -euo pipefail
           . "$CI_TOOLS/retry.sh"
@@ -2130,13 +2327,18 @@ jobs:
             return 1
           }
           # JSR receives the stable channel only, so a dev version is never
-          # there to read back.
-          probe_ts() { # <package.json>
-            local pkg
+          # there to read back; a private package's publish is a dry run, so
+          # neither registry holds it.
+          probe_ts() { # <package.json> [X.Y.Z, the root's version by default]
+            local pkg v="${2:-$ver}"
             pkg=$(jq -r .name "$1")
-            REGISTRY_WAIT_SECONDS=$NPM_SCAN_SECONDS probe "npm ${pkg}@${ver}" "https://registry.npmjs.org/${pkg}/${ver}" || rc=1
+            if [ "$(jq -r '.private // false' "$1")" = true ]; then
+              echo "skip: ${pkg} is private, so no registry holds it"
+              return 0
+            fi
+            REGISTRY_WAIT_SECONDS=$NPM_SCAN_SECONDS probe "npm ${pkg}@${v}" "https://registry.npmjs.org/${pkg}/${v}" || rc=1
             if [ "$CHANNEL" = "stable" ]; then
-              probe "jsr ${pkg}@${ver}" "https://jsr.io/${pkg}/${ver}_meta.json" || rc=1
+              probe "jsr ${pkg}@${v}" "https://jsr.io/${pkg}/${v}_meta.json" || rc=1
             fi
           }
           # Only tags of this channel's shape: a stable and a dev lane tag can
@@ -2159,6 +2361,15 @@ jobs:
               [ -z "$d" ] && continue
               probe_ts "$d/package.json"
             done < <(jq -r '.[]' <<<"$SUBPACKAGES_JSON")
+          fi
+          if [ "$HALVES_RESULT" = "success" ]; then
+            while IFS= read -r d; do
+              [ -z "$d" ] && continue
+              while IFS= read -r tag; do
+                [ -z "$tag" ] && continue
+                probe_ts "$d/web/package.json" "${tag#"$d"/v}"
+              done < <(lane_tags_at_head "$d")
+            done < <(jq -r '.[]' <<<"$HALVES_JSON")
           fi
           if [ "$GO_RESULT" = "success" ]; then
             probe_go go.mod "$VERSION" || rc=1

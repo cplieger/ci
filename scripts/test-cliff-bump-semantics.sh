@@ -510,6 +510,46 @@ for pair in channel:CHANNEL exclude-paths:EXCLUDE_PATHS lane:LANE \
 done
 echo "ok: action.yml forwards every compute.sh input"
 
+# ── State L: <lane>/.first-version seeds a lane with no stable tag ──────────
+L=$(mkfixture chan-seed)
+fc "$L" README.md "docs: root only"
+git -C "$L" branch dev
+LB=$(git -C "$L" rev-parse main)
+git -C "$L" checkout -q dev
+fc "$L" beta/b.go "feat(beta): an unseeded lane"
+fc "$L" sse/s.go "feat(sse): move the library"
+printf 'v1.5.0\n' >"$L/sse/.first-version"
+git -C "$L" add sse/.first-version
+git -C "$L" commit -qm "feat(sse): continue npm's numbering"
+publish_main "$L"
+compute "$L" dev sse
+assert_eq "$OUT_BASE|$OUT_DEV" "sse/v1.5.0|sse/v1.5.0-dev.1" "L1: a seeded lane's first dev build starts at its seed"
+compute "$L" dev beta
+assert_eq "$OUT_BASE|$OUT_DEV" "beta/v1.0.0|beta/v1.0.0-dev.1" "L2: an unseeded lane starts at v1.0.0"
+git -C "$L" tag sse/v1.5.0-dev.1
+fc "$L" sse/s.go "feat(sse): a dev feature on the seed"
+compute "$L" dev sse
+assert_eq "$OUT_DEV" "sse/v1.5.0-dev.2" "L3: dev builds before the first promotion count on the seed"
+LT=$(git -C "$L" rev-parse dev)
+LR=$(promote "$L" "$LT")
+git -C "$L" checkout -q --detach "$LB"
+assert_eq "$(pending_of "$L" "$LR" sse)" "sse/v1.5.0" "L4: the promotion publishes the seed, read at the promotion, not at HEAD"
+git -C "$L" checkout -q main
+compute "$L" stable sse
+assert_eq "$OUT_BASE" "sse/v1.5.0" "L5: the stable run publishes the seed"
+git -C "$L" tag sse/v1.5.0
+git -C "$L" checkout -q dev
+fc "$L" sse/s.go "feat(sse): after the first stable"
+compute "$L" dev sse
+assert_eq "$OUT_DEV" "sse/v1.6.0-dev.1" "L6: once the lane has a stable tag the seed is inert"
+mkdir -p "$L/gamma"
+echo g >"$L/gamma/g.go"
+printf '1.5\n' >"$L/gamma/.first-version"
+git -C "$L" add gamma
+git -C "$L" commit -qm "feat(gamma): a malformed seed"
+refused "L7: a seed that is not vX.Y.Z is refused, naming the file" "gamma/.first-version" "$L" \
+  CHANNEL=dev LANE=gamma bash "$ACTION"
+
 # ── State S2: a dev build numbers above a main patch it cannot reach ─────────
 F=$(tb_fixture tb-floor)
 git -C "$F" checkout -q dev

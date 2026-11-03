@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Two-branch release state, one subcommand per release.yaml step: pending
-# (each lane's pending promotion, range and kind line), publish, ahead, number
-# (via CLIFF_SCRIPT), receipts, receipt TAG COMMIT, readback SITE TAG [LANE],
-# provenance and complete (IMAGE@DIGEST SOURCE), barrier (holds a stable publish
-# until dev ranks above it), renumber-target, renumber-handoff, renumber (re-tag
-# LANE_KEY's newest dev build as DEV_VERSION), renumber-subpackages, signing-window
-# TAG (EXCLUDE_RE, SUBPACKAGES_JSON), release-digest TAG (IMAGE) and security-shas
-# [FLOOR]. Lane keys: '.' for the root, else the lane dir. pending, publish, ahead and number hold no token.
+# Two-branch release state, one subcommand per release.yaml step: pending,
+# publish, ahead, halves, number (CLIFF_SCRIPT), receipts, receipt TAG COMMIT,
+# readback SITE TAG [LANE], provenance and complete (IMAGE@DIGEST SOURCE),
+# barrier, renumber-target, renumber-handoff, renumber (re-tag LANE_KEY's newest
+# dev build as DEV_VERSION), renumber-subpackages, half-free LANE TAG COMMIT,
+# signing-window TAG (EXCLUDE_RE, SUBPACKAGES_JSON), release-digest TAG (IMAGE),
+# security-shas [FLOOR]. Lane keys: '.' for the root, else the lane dir.
+# pending, publish, ahead, halves, number and half-free hold no token.
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -340,6 +340,66 @@ cmd_number() {
   out "state=${state}" "root_version=$(jq -r '.["."].version // ""' <<<"$state")"
 }
 
+lane_anchor() { # <key> -> the commit of the lane's channel tag nearest HEAD (stable, or either on dev), or nothing; fails with tags_of or a walk of HEAD
+  local -A at=()
+  local name c tags revs
+  tags=$(tags_of "$(stable_re "$1")") || return 1
+  if [ "${CHANNEL:-}" = dev ]; then
+    tags+=$'\n'$(tags_of "$(dev_re "$1")") || return 1
+  fi
+  while read -r name c; do
+    [ -z "$name" ] || at[$c]=1
+  done <<<"$tags"
+  [ "${#at[@]}" -gt 0 ] || return 0
+  revs=$(git rev-list --topo-order HEAD) || return 1
+  while IFS= read -r c; do
+    if [ -n "${at[$c]:-}" ]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done <<<"$revs"
+}
+# A lane's TS half ships what a root subpackage would: path-significance.sh's
+# exclusions and published-manifest rule decide, over the range and, with
+# promotions, each promotion's own diff in it, as published_subpackages counts.
+half_changed() { # <lane> <from commit or ''> <to> [promotions] -> 0 when the half at <lane>/web changed; dies when it cannot tell
+  local from=$2 f t res subs recs c ranges
+  [ -n "$from" ] || from=$(git hash-object -t tree /dev/null)
+  ranges="$from $3"
+  if [ "${4:-}" = promotions ]; then
+    recs=$(reconciliations_in "$2" "$3") || die "cannot list the promotions of ${2:-the root}..${3}"
+    while IFS= read -r c; do
+      [ -z "$c" ] || ranges+=$'\n'"${c}^1 ${c}"
+    done <<<"$recs"
+  fi
+  while read -r f t; do
+    res=$(MODE=paths FROM="$f" TO="$t" REPO_TYPE=none SUBPACKAGES_JSON="$(jq -cn --arg d "$1/web" '[$d]')" GO_LANES_JSON='[]' \
+      bash "$TOOLS/path-significance.sh") || die "path significance of ${f}..${t} failed"
+    subs=$(sed -n 's/^subpackages_to_publish=//p' <<<"$res")
+    if in_list "subpackages_to_publish of ${f}..${t}" "$1/web" "$subs"; then
+      return 0
+    fi
+  done <<<"$ranges"
+  return 1
+}
+cmd_halves() {
+  local mods="${GO_MODULES_TO_RELEASE:-[]}" halves="${GO_HALVES_JSON:-[]}" pub='[]' l a lanes with=""
+  case "${CHANNEL:-}" in dev) ;; stable) with=promotions ;; *) die "CHANNEL must be dev or stable, got '${CHANNEL:-}'" ;; esac
+  lanes=$(jq -r --argjson h "$halves" '.[] | select(. as $l | any($h[]; . == $l))' <<<"$mods") \
+    || die "GO_MODULES_TO_RELEASE '${mods}' and GO_HALVES_JSON '${halves}' must be JSON arrays of lane dirs"
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    a=$(lane_anchor "$l") || die "cannot read lane ${l}'s tags or the history of HEAD"
+    if half_changed "$l" "$a" HEAD "$with"; then
+      pub=$(jq -c --arg v "$l" '. + [$v]' <<<"$pub")
+      echo "lane ${l}: ${l}/web changed since ${a:-its first commit}, so it publishes at the lane's version"
+    else
+      echo "lane ${l}: ${l}/web is unchanged since ${a:-its first commit}"
+    fi
+  done <<<"$lanes"
+  out "halves_to_publish=${pub}"
+}
+
 subpackages_at() { # <commit> -> JSON array of the first-level dirs carrying a jsr.json at <commit>
   local d
   git ls-tree -d --name-only "$1" | while IFS= read -r d; do
@@ -378,7 +438,7 @@ published_subpackages() { # <root tag> <commit> -> JSON array of subpackage dirs
 }
 
 cmd_receipts() {
-  local state="${STATE:?}" repo="${GITHUB_REPOSITORY:?}" repairs='[]' key tag commit kind contexts site subs shas floor rows
+  local state="${STATE:?}" repo="${GITHUB_REPOSITORY:?}" repairs='[]' key tag commit kind contexts site subs shas floor rows prev
   rows=$(jq -r 'to_entries[] | select(.value.h_tag != "") | [.key, .value.h_tag, .value.h_commit, .value.repair_kind_note] | @tsv' <<<"$state") \
     || die "STATE is not the pending step's state"
   while IFS=$'\t' read -r key tag commit kind; do
@@ -397,6 +457,12 @@ cmd_receipts() {
       subs=$(published_subpackages "$tag" "$commit") || die "could not tell which subpackages ${tag} publishes"
     else
       site=lane
+      if has_path "$commit" "$key/web/jsr.json"; then
+        prev=$(highest_stable "$key" "$(core "$tag")") || die "cannot read lane ${key}'s stable tags"
+        if half_changed "$key" "${prev#* }" "$commit" promotions; then
+          subs=$(jq -cn --arg d "$key/web" '[$d]')
+        fi
+      fi
     fi
     note "lane ${key}: ${tag} has no completion receipt, so this run repairs it at ${commit} first"
     repairs=$(jq -c --arg k "$key" --arg lane "$(lane_dir "$key")" --arg tag "$tag" --arg commit "$commit" \
@@ -657,7 +723,7 @@ readback_image() { # <tag>
 }
 
 cmd_readback() { # <site> <tag> [lane]; SUBPACKAGES: the root release's subpackage dirs (JSON)
-  local site="${1:?}" tag="${2:?}" lane="${3:-}" mod pkg sub subs ver="${2##*/}"
+  local site="${1:?}" tag="${2:?}" lane="${3:-}" mod pkg manifest sub subs ver="${2##*/}"
   subs=$(jq -r '.[]' <<<"${SUBPACKAGES:-[]}") || die "SUBPACKAGES '${SUBPACKAGES:-}' is not a JSON array of subpackage dirs"
   case "$site" in
     go | lane)
@@ -675,7 +741,12 @@ cmd_readback() { # <site> <tag> [lane]; SUBPACKAGES: the root release's subpacka
   esac
   while IFS= read -r sub; do
     [ -n "$sub" ] || continue
-    pkg=$(git show "${tag}:${sub}/package.json" | jq -r .name) || die "no ${sub}/package.json at ${tag}"
+    manifest=$(git show "${tag}:${sub}/package.json") || die "no ${sub}/package.json at ${tag}"
+    pkg=$(jq -r .name <<<"$manifest") || die "${sub}/package.json at ${tag} is not JSON"
+    if [ "$(jq -r '.private // false' <<<"$manifest")" = true ]; then
+      echo "ok: ${pkg} is private, so no registry holds it"
+      continue
+    fi
     npm_answers "$pkg" "${ver#v}" || return 1
     answers "jsr ${pkg}@${ver#v}" fetch "https://jsr.io/${pkg}/${ver#v}_meta.json" || return 1
   done <<<"$subs"
@@ -789,6 +860,24 @@ promoted_subpackages() { # <R> -> JSON array of the subpackages R's promotion pu
     bash "$TOOLS/path-significance.sh") || return 1
   sed -n 's/^subpackages_to_publish=//p' <<<"$res"
 }
+# A lane's half publishes after the lane's tag, so the barrier holds for it as
+# for a root subpackage once a promotion past the lane's stable tag changed it.
+half_rows() { # <state> <plan> -> "<lane>/web\t<T>\t<V>" per in-range lane whose promotions changed its half
+  local key r v h c t recs
+  while IFS=$'\t' read -r key r v; do
+    [ -n "$key" ] && [ "$key" != . ] || continue
+    has_path "$r" "$key/web/jsr.json" || continue
+    h=$(jq -r --arg k "$key" '.[$k].h_commit // ""' <<<"$1")
+    recs=$(reconciliations_in "$h" "$r") || die "cannot list lane ${key}'s promotions past its stable tag"
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      half_changed "$key" "${c}^1" "$c" || continue
+      t=$(git rev-parse "${r}^2") || die "lane ${key}: cannot read the commit ${r} promoted"
+      printf '%s\t%s\t%s\n' "$key/web" "$t" "$v"
+      break
+    done <<<"$recs"
+  done <<<"$2"
+}
 last_change() { # <ref> <dir> -> the newest first-parent commit of ref whose own diff changes what the subpackage ships; fails when git cannot walk ref or read a commit's diff
   local c from res revs subs
   revs=$(git rev-list --first-parent "$1" -- "$2") || return 1
@@ -822,13 +911,19 @@ sub_dev_heads() { # <dir> <commit> -> "<version> <gitHead>" per -dev.N version n
 }
 # A subpackage's dev build is complete once npm serves a -dev.N version
 # published from its newest change on dev or a descendant on dev. With T, a
-# change past T must also rank above V, as a root build past T must.
+# change past T must also rank above V, as a root build past T must. A private
+# one at dev's head is always complete: its publish is a dry run.
 sub_dev_state() { # <dir> <T or ''> <V> -> "ok", "incomplete <change>" or "below <change>"; fails when git or npm cannot tell
-  local dir=$1 t=$2 v=$3 l heads ver head complete=false above=false
+  local dir=$1 t=$2 v=$3 private l heads ver head complete=false above=false
   has_path refs/remotes/origin/dev "${dir}/package.json" || {
     echo ok
     return 0
   }
+  private=$(git show "refs/remotes/origin/dev:${dir}/package.json" | jq -r '.private // false') || return 1
+  if [ "$private" = true ]; then
+    echo ok
+    return 0
+  fi
   l=$(last_change refs/remotes/origin/dev "$dir") || return 1
   if [ -z "$l" ]; then
     echo ok
@@ -1041,6 +1136,7 @@ cmd_barrier() {
       [ -z "$s" ] || subrows+="${s}"$'\t'"${t}"$'\t'"${ROOT_VERSION:-}"$'\n'
     done <<<"$rows"
   fi
+  subrows+=$(half_rows "$state" "$plan") || exit 1
   [ -z "$held" ] || waited=1
   lacking=$(subs_lacking "$subrows" incomplete)
   if [ -n "$lacking" ]; then
@@ -1202,19 +1298,68 @@ handoff_name() { # <prefix> <id> -> an artifact name unique per id, which may ho
   printf '%s-%s\n' "$1" "$(printf '%s' "$2" | sha256sum | cut -c1-16)"
 }
 
-# After the root renumber, at the build renumber-target checked out: each
-# subpackage the barrier finds without a dev build, or below the pending
-# version, is published from this build under its newest dev tag.
+# A lane's version is also its half's npm version, so before the lane's tag it
+# is refused when npm serves it from another commit, or when it does not rank
+# above every version npm holds from outside this repository (the package's
+# history from before it moved here), which <lane>/.first-version seeds past.
+cmd_half_free() { # <lane> <lane tag> <commit>
+  local lane=$1 tag=$2 commit=$3 manifest pkg ver res code doc at v h top="" a b c
+  has_path "$commit" "$lane/web/jsr.json" || return 0
+  manifest=$(git show "$commit:$lane/web/package.json") || die "no ${lane}/web/package.json at ${commit}"
+  if [ "$(jq -r '.private // false' <<<"$manifest")" = true ]; then
+    note "lane ${lane}: its half is private, so npm holds none of its versions"
+    return 0
+  fi
+  pkg=$(jq -er '.name | strings' <<<"$manifest") || die "${lane}/web/package.json at ${commit} names no package"
+  ver=${tag##*/}
+  ver=${ver#v}
+  res=$(curl -sS --connect-timeout 10 --max-time 30 --retry 3 -w '\n%{http_code}' "https://registry.npmjs.org/${pkg}") || res=$'\n000'
+  code=${res##*$'\n'}
+  case "$code" in
+    404) return 0 ;;
+    200) doc=${res%$'\n'*} ;;
+    *) die "npm cannot tell which versions of ${pkg} exist (HTTP ${code}), so ${tag} is not tagged" ;;
+  esac
+  at=$(jq -r --arg v "$ver" '.versions // {} | if has($v) then "at " + (.[$v].gitHead // "") else "" end' <<<"$doc") \
+    || die "npm's answer for ${pkg} is not a packument, so ${tag} is not tagged"
+  if [ -n "$at" ]; then
+    [ "${at#at }" = "$commit" ] \
+      || die "npm already serves ${pkg}@${ver} from '${at#at }', not ${commit}, so ${tag} is not tagged"
+    note "npm ${pkg}@${ver} is already published from ${commit}"
+    return 0
+  fi
+  while read -r v h; do
+    [ -n "$v" ] || continue
+    # A version published from a commit of this repository is the lane's own,
+    # which may rank anywhere; only the others bound it.
+    if [ -n "$h" ] && has_commit "$h"; then continue; fi
+    if [ -z "$top" ] || gt "$(core "$v")" "$top"; then top=$(core "$v"); fi
+  done < <(jq -r '.versions // {} | to_entries[] | "\(.key) \(.value.gitHead // "")"' <<<"$doc")
+  if [ -n "$top" ] && ! gt "$(core "$tag")" "$top"; then
+    IFS=. read -r a b c <<<"$top"
+    die "npm holds ${pkg}@${top} from outside this repository, so ${tag} would not rank above it. Before the lane's first stable tag, commit ${lane}/.first-version holding v${a}.${b}.$((c + 1)) or higher."
+  fi
+}
+
+# After LANE_KEY's renumber, at the build renumber-target checked out: each of
+# its subpackages (a lane's: its half) the barrier finds without a dev build,
+# or below the pending version, is published from this build under its newest
+# dev tag.
 cmd_renumber_subpackages() {
-  local state="${STATE:?}" d_tag r v t="" s st c dirs='[]' all rows
+  local state="${STATE:?}" key="${LANE_KEY:-.}" d_tag r v t="" s st c dirs='[]' all='[]' rows who="the root's"
   [ "${CHANNEL:-}" = dev ] || die "renumber runs on the dev channel only"
-  d_tag=$(nearest_dev_tag HEAD .) || die "cannot read lane .'s dev tags"
+  [ "$key" = . ] || who="lane ${key}'s"
+  d_tag=$(nearest_dev_tag HEAD "$key") || die "cannot read lane ${key}'s dev tags"
   [ -n "$d_tag" ] && [ "$(git rev-list -n1 "$d_tag")" = "$(git rev-parse HEAD)" ] \
-    || die "HEAD is not the root's newest dev build. Check that build out with renumber-target first."
-  r=$(jq -r '.["."].commit // ""' <<<"$state")
-  v=$(jq -r '.["."].version // ""' <<<"$state")
+    || die "HEAD is not ${who} newest dev build. Check that build out with renumber-target first."
+  r=$(jq -r --arg k "$key" '.[$k].commit // ""' <<<"$state")
+  v=$(jq -r --arg k "$key" '.[$k].version // ""' <<<"$state")
   [ -z "$r" ] || t=$(git rev-parse "$r^2")
-  all=$(subpackages_at HEAD) || die "cannot list the subpackages of the build ${d_tag}"
+  if [ "$key" = . ]; then
+    all=$(subpackages_at HEAD) || die "cannot list the subpackages of the build ${d_tag}"
+  elif has_path HEAD "$key/web/jsr.json"; then
+    all=$(jq -cn --arg d "$key/web" '[$d]')
+  fi
   rows=$(jq -r '.[]' <<<"$all")
   while IFS= read -r s; do
     [ -n "$s" ] || continue
@@ -1255,6 +1400,8 @@ cmd_renumber() {
   fi
   if [ "$key" = . ] && [ "${REPO_TYPE:-}" = ts ]; then
     publish_npm_dev "$new" "$d"
+  elif [ "$key" != . ]; then
+    cmd_half_free "$key" "$new" "$d"
   fi
   tag_ref "$repo" "$new" "$d" || die "tag ${new} is not at ${d}, so the build is not renumbered"
   if ! gh api -X POST "repos/${repo}/statuses/${d}" -f state=success -f context="${TAG_RECEIPT_PREFIX}${new}" \
@@ -1269,7 +1416,7 @@ cmd_renumber() {
 }
 
 case "${1:-}" in
-  pending | publish | ahead | number | receipts | renumber) "cmd_$1" ;;
+  pending | publish | ahead | halves | number | receipts | renumber) "cmd_$1" ;;
   barrier)
     rc=0
     timeout --kill-after=10 "$BARRIER_SECONDS" "$BASH" "${BASH_SOURCE[0]}" barrier-wait || rc=$?
@@ -1283,6 +1430,10 @@ case "${1:-}" in
   renumber-target) cmd_renumber_target ;;
   renumber-handoff) cmd_renumber_handoff ;;
   renumber-subpackages) cmd_renumber_subpackages ;;
+  half-free)
+    [ "$#" -eq 4 ] || die "usage: release-state.sh half-free <lane> <tag> <commit>"
+    cmd_half_free "$2" "$3" "$4"
+    ;;
   handoff-read) cmd_handoff_read "${2:?usage: release-state.sh handoff-read <file>}" ;;
   handoff-name) handoff_name "${2:?usage: release-state.sh handoff-name <prefix> <id>}" "${3:?usage: release-state.sh handoff-name <prefix> <id>}" ;;
   signing-window) signing_window "${2:?usage: release-state.sh signing-window <tag>}" ;;
@@ -1293,5 +1444,5 @@ case "${1:-}" in
     shift
     "$cmd" "$@"
     ;;
-  *) die "usage: release-state.sh pending|publish|ahead|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
+  *) die "usage: release-state.sh pending|publish|ahead|halves|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|half-free|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
 esac

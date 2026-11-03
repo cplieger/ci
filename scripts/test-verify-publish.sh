@@ -82,13 +82,15 @@ chk "V-P8 body parses under bash" \
   "$(bash -n "$WORK/step.sh" 2>/dev/null && echo ok || echo bad)" "ok"
 # Guard against a tenth env var arriving later: the cases would leave it
 # unset, it would die under set -u, and that reads as a real refusal.
-chk "V-P9 step env is exactly the nine the cases populate" \
+chk "V-P9 step env is exactly the eleven the cases populate" \
   "$(cat "$WORK/env-keys")" \
   "CHANNEL
 CI_TOOLS
 GO_LANES_JSON
 GO_NESTED_RESULT
 GO_RESULT
+HALVES_JSON
+HALVES_RESULT
 SUBPACKAGES_JSON
 SUBPACKAGE_RESULT
 TS_RESULT
@@ -165,6 +167,7 @@ chmod 755 "$BIN/sleep" "$BIN/curl"
 defaults() { # every case starts fully populated; an unset var dies under set -u
   export CHANNEL=stable VERSION=v1.2.3 SUBPACKAGES_JSON='[]' GO_LANES_JSON='[]'
   export GO_RESULT=skipped TS_RESULT=skipped SUBPACKAGE_RESULT=skipped GO_NESTED_RESULT=skipped
+  export HALVES_JSON='[]' HALVES_RESULT=skipped
   export CI_TOOLS="$ROOT/scripts"
   unset CURL_SERVE_PAT CURL_SERVE_FROM
 }
@@ -448,5 +451,67 @@ spec '*proxy.golang.org* 0 {"Version":"v1.1.0"}'
 run_step "$LANE"
 chk "V-F4 stable lane probes only the stable lane tag" "$(sort -u "$CURL_LOG")" "$LANE_URL"
 chk "V-F4 the stable lane run passes" "$RC" "0"
+
+# ── V-H: a lane's TS half, read back at its lane's version ──────────────────
+HALF="$WORK/half"
+mkdir -p "$HALF/alpha/web"
+git -C "$HALF" init -q -b main
+printf 'module github.com/cplieger/probe/alpha\n\ngo 1.26.5\n' >"$HALF/alpha/go.mod"
+printf '{"name":"@cplieger/alpha","version":"0.0.0"}\n' >"$HALF/alpha/web/package.json"
+git -C "$HALF" add alpha
+git -C "$HALF" -c user.email=probe@ci.local -c user.name=probe -c commit.gpgsign=false commit -qm "feat: half fixture"
+git -C "$HALF" tag alpha/v1.4.0
+git -C "$HALF" tag alpha/v1.4.0-dev.3
+HALF_NPM="https://registry.npmjs.org/@cplieger/alpha/1.4.0"
+defaults
+export HALVES_RESULT=success HALVES_JSON='["alpha"]'
+spec "*registry.npmjs.org* 0 {}" "*jsr.io* 0 {}"
+run_step "$HALF"
+chk "V-H1 a stable half is read back on npm then JSR at the lane's version, not the root's" \
+  "$RC|$(cat "$CURL_LOG")" "0|$HALF_NPM
+https://jsr.io/@cplieger/alpha/1.4.0_meta.json"
+defaults
+export CHANNEL=dev HALVES_RESULT=success HALVES_JSON='["alpha"]'
+spec "*registry.npmjs.org* 0 {}" "*jsr.io* 0 {}"
+run_step "$HALF"
+chk "V-H2 a dev half on npm only, at the lane's dev tag" "$RC|$(cat "$CURL_LOG")" \
+  "0|https://registry.npmjs.org/@cplieger/alpha/1.4.0-dev.3"
+defaults
+export HALVES_RESULT=success HALVES_JSON='["alpha"]'
+spec "*registry.npmjs.org* 22 {}" "*jsr.io* 0 {}"
+run_step "$HALF"
+chk "V-H3 a half npm does not serve fails the run" "$RC" "1"
+chk_has "V-H3 naming it at the lane's version" "$OUT" "::error::npm @cplieger/alpha@1.4.0 is not published"
+defaults
+export HALVES_JSON='["alpha"]'
+spec "*registry.npmjs.org* 0 {}" "*jsr.io* 0 {}"
+run_step "$HALF"
+chk "V-H4 a half this run did not publish is not read" "$RC|$(lines "$CURL_LOG")" "0|0"
+defaults
+export HALVES_RESULT=success HALVES_JSON='["alpha"]' GO_NESTED_RESULT=success GO_LANES_JSON='["alpha"]'
+spec "*registry.npmjs.org* 0 {}" "*jsr.io* 0 {}" '*proxy.golang.org* 0 {"Version":"v1.4.0"}'
+run_step "$HALF"
+chk "V-H5 the half's npm read waits before the lane's proxy read, as npm's bound is the longest" \
+  "$RC|$(head -1 "$CURL_LOG")|$(tail -1 "$CURL_LOG")" \
+  "0|$HALF_NPM|https://proxy.golang.org/github.com/cplieger/probe/alpha/@v/v1.4.0.info"
+
+# ── V-K: a private package is dry-run, so no registry holds it ──────────────
+printf '{"name":"@cplieger/alpha","version":"0.0.0","private":true}\n' >"$HALF/alpha/web/package.json"
+mkdir -p "$HALF/web"
+printf '{"name":"@cplieger/web","version":"0.0.0","private":true}\n' >"$HALF/web/package.json"
+defaults
+export HALVES_RESULT=success HALVES_JSON='["alpha"]' SUBPACKAGE_RESULT=success SUBPACKAGES_JSON='["web"]'
+spec "*registry.npmjs.org* 22 {}" "*jsr.io* 22 {}"
+run_step "$HALF"
+chk "V-K1 a private half and a private subpackage are not read back" "$RC|$(lines "$CURL_LOG")" "0|0"
+chk_has "V-K1 saying why" "$OUT" "@cplieger/alpha is private, so no registry holds it"
+mkdir -p "$HALF/pub"
+pkgjson "$HALF/pub"
+defaults
+export SUBPACKAGE_RESULT=success SUBPACKAGES_JSON='["web","pub"]'
+spec "*registry.npmjs.org* 0 {}" "*jsr.io* 0 {}"
+run_step "$HALF"
+chk "V-K2 a public subpackage beside a private one still is" "$RC|$(cat "$CURL_LOG")" "0|$NPM_URL
+$JSR_URL"
 
 echo "PASS: verify-publish probe contract holds (${PASS} checks)"
