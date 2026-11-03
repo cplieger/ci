@@ -193,8 +193,10 @@ jobs:
           fi
           prefix=""
           if [ "$TARGET" != . ]; then prefix="$TARGET/"; fi
+          detected="$(jq -r 'all(.languages[]; .provenance == "detected")' "$WORK/census.json")"
           {
             echo "analyze=true"
+            echo "detected=$detected"
             echo "go=$go"
             echo "ts=$ts"
             echo "npm_dirs<<NPM_DIRS_END"
@@ -273,6 +275,7 @@ jobs:
           TARGET: ${{ inputs.target }}
           EXIT_CODE: ${{ inputs.exit-code }}
           WORK: ${{ steps.target.outputs.work }}
+          DETECTED: ${{ steps.census.outputs.detected }}
           GO: ${{ steps.census.outputs.go }}
           NPM_DIRS: ${{ steps.census.outputs.npm_dirs }}
         run: |
@@ -306,7 +309,8 @@ jobs:
             || true
           rc=0
           deadset analyze --target=. --central="$WORK/central.json" --run-dir="$WORK/run" \
-            --formats=text,sarif --exit-code="$EXIT_CODE" || rc=$?
+            --formats=text,sarif --exit-code="$EXIT_CODE" 2> "$WORK/analyze.err" || rc=$?
+          cat "$WORK/analyze.err" >&2
           if { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; } && [ ! -s "$WORK/run/report.json.sarif" ]; then
             echo "::error::deadset exited $rc but wrote no SARIF report to $WORK/run/report.json.sarif, though --formats=text,sarif asked for one, so its findings cannot reach code scanning."
             exit 1
@@ -322,8 +326,14 @@ jobs:
               exit 1
               ;;
             3)
-              echo "::error::deadset produced no answer (exit 3), so nothing was checked. The class line above names the cause: a setup failure is fixed in the repository, a run failure in the install or the tools."
-              exit 1
+              # deadset prints the same no-program line for a language a
+              # configuration names, which must hold a program.
+              if [ "$DETECTED" = true ] && grep -q '^setup failure: no-program: ' "$WORK/analyze.err"; then
+                echo "::notice::deadset finds no program at $TARGET, so there is nothing to check."
+              else
+                echo "::error::deadset produced no answer (exit 3), so nothing was checked. The class line above names the cause: a setup failure is fixed in the repository, a run failure in the install or the tools."
+                exit 1
+              fi
               ;;
             4)
               echo "::error::deadset left a cross-language finding pending (exit 4): a deadset-edges.json edge names a side no analyzer in this run reported, so the finding was neither confirmed nor cleared. Check that analysis.languages holds every language the edge spans."

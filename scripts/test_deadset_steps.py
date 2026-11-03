@@ -51,6 +51,7 @@ if [ "$1" = print-config ]; then
   exit 0
 fi
 printf '%s\\n' "$@" > "$STUB_LOG/argv"
+if [ -n "${ANALYZE_ERR:-}" ]; then printf '%s\\n' "$ANALYZE_ERR" >&2; fi
 for a in "$@"; do
   case "$a" in
     --central=*) cp "${a#--central=}" "$STUB_LOG/central.json" ;;
@@ -263,6 +264,12 @@ INSTALL_STEP = 'Install analyzers and dependencies'
 NO_PROGRAM = (
     'setup failure: no-program: no file under /w puts a language in scope, so it holds no '
     'program; run from the directory that holds a program'
+)
+# What deadset v2.0.0-dev.24 prints when deadset-ts finds no inputs in a lone
+# tsconfig.json.
+TS_NO_PROGRAM = (
+    'setup failure: no-program: no configuration discovery derived could be built; '
+    "tsconfig.json: TS18003: No inputs were found in config file 'tsconfig.json'."
 )
 UNSUPPORTED = (
     'setup failure: unsupported-language: the census of /w puts only "proto" in scope, and '
@@ -549,6 +556,21 @@ class Census(Harness):
         run = self.ask(GO_ONLY, census('go', provenance='repository: deadset.json'))
         self.assertIn('analysis.languages go (repository: deadset.json)', run.out)
 
+    def test_the_census_says_whether_deadset_detected_every_language(self):
+        lock = {'package-lock.json': '{}'}
+        configured = json.loads(census('go', 'ts'))
+        configured['languages'][1]['provenance'] = 'repository: deadset.json'
+        cases = (
+            (census('go', 'ts'), 'true'),
+            (census('go', provenance='central: /w/central.json'), 'false'),
+            (json.dumps(configured), 'false'),
+        )
+        for document, want in cases:
+            with self.subTest(census=document):
+                run = self.ask({**GO_ONLY, **lock}, document)
+                self.assertEqual(run.rc, 0, run.out)
+                self.assertEqual(run.outputs['detected'], want)
+
     def test_no_program_is_the_one_answer_that_skips_the_check(self):
         run = self.ask({'README.md': 'x\n'}, CENSUS_RC='3', CENSUS_ERR=NO_PROGRAM)
         self.assertEqual(run.rc, 0, run.out)
@@ -703,6 +725,7 @@ class Analyze(Harness):
             'TARGET': '.',
             'EXIT_CODE': 'on',
             'WORK': str(self.work),
+            'DETECTED': 'true',
             'GO': 'true',
             'NPM_DIRS': '',
             **env,
@@ -767,6 +790,43 @@ class Analyze(Harness):
         for rc, message in cases.items():
             with self.subTest(rc=rc):
                 self.assert_failed(self.analyze(DEADSET_RC=rc), message)
+
+    def test_the_step_reads_whether_the_census_detected_every_language(self):
+        self.assertEqual(
+            analyze_step(STEP)['env']['DETECTED'], '${{ steps.census.outputs.detected }}'
+        )
+
+    def test_no_program_in_detected_languages_passes(self):
+        run = self.analyze(DEADSET_RC='3', ANALYZE_ERR=TS_NO_PROGRAM)
+        self.assertEqual(run.rc, 0, run.out)
+        self.assertIn(
+            '::notice::deadset finds no program at ., so there is nothing to check.', run.out
+        )
+        self.assertIn(TS_NO_PROGRAM, run.out)
+        self.assertNotIn('::error::', run.out)
+
+    def test_no_program_in_configured_languages_fails(self):
+        run = self.analyze(DEADSET_RC='3', ANALYZE_ERR=TS_NO_PROGRAM, DETECTED='false')
+        self.assert_failed(run, 'produced no answer (exit 3)')
+        self.assertNotIn('::notice::', run.out)
+
+    def test_every_other_exit_3_fails_in_detected_languages(self):
+        for err in (
+            'run failure: analyzer-crashed: deadset-ts: exit status 2',
+            f'deadset-ts: {TS_NO_PROGRAM}',
+            '',
+        ):
+            with self.subTest(err=err):
+                run = self.analyze(DEADSET_RC='3', ANALYZE_ERR=err)
+                self.assert_failed(run, 'produced no answer (exit 3)')
+        run = self.analyze(DEADSET_RC='2', ANALYZE_ERR=TS_NO_PROGRAM)
+        self.assert_failed(run, 'refused the run (exit 2)')
+
+    def test_a_misplaced_file_fails_a_run_with_no_program(self):
+        self.repo = git_repo(self.tmp / 'repo', {'web/deadset.json': '{}'})
+        run = self.analyze(DEADSET_RC='3', ANALYZE_ERR=TS_NO_PROGRAM, NPM_DIRS='web', GO='false')
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn('::error file=web/deadset.json::', run.out)
 
     def test_a_complete_run_without_its_sarif_report_fails(self):
         for rc in ('0', '1'):
