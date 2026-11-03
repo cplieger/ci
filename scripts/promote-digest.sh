@@ -122,9 +122,21 @@ COMMIT=$(git rev-parse --verify --quiet "${1:?usage: promote-digest.sh <commit>}
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors \
-  -o "$WORK/ghcr-token.json" "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull"
-token=$(jq -r .token "$WORK/ghcr-token.json")
+# No --fail, so a 403 is an answer; --retry still retries 408, 429 and 5xx.
+token_status=$(curl -sSL --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors \
+  -o "$WORK/ghcr-token.json" -w '%{http_code}' "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull") \
+  || die "no answer from the ${REGISTRY} token endpoint for ${IMAGE_NAME}"
+token=""
+case "$token_status" in
+  200)
+    token=$(jq -r '.token // empty' "$WORK/ghcr-token.json" 2>/dev/null) || token=""
+    [ -n "$token" ] || die "the ${REGISTRY} token endpoint answered no token for ${IMAGE_NAME}"
+    ;;
+  # GHCR refuses an anonymous pull token for a package that does not exist yet:
+  # a new repository's first stable run can start before its first dev build pushes.
+  403) ;;
+  *) die "the ${REGISTRY} token endpoint answered HTTP ${token_status} for ${IMAGE_NAME}" ;;
+esac
 
 emit() { # <digest> <source> <via>
   printf 'promote_digest=%s\npromote_source=%s\npromote_via=%s\n' "$1" "$2" "$3"
@@ -142,6 +154,7 @@ rc=0
 is_reconciliation "$COMMIT" || rc=$?
 [ "$rc" -le 1 ] || die "cannot tell whether ${COMMIT} is a promotion commit"
 if [ "$rc" -eq 0 ]; then
+  [ -n "$token" ] || die "promotion commit ${COMMIT} promotes a digest of ${REGISTRY}/${IMAGE_NAME}, which does not exist, and a promotion never builds from source"
   rc=0
   DIGEST=$(promoted_digest "$COMMIT") || rc=$?
   case "$rc" in
@@ -164,6 +177,11 @@ if [ "$rc" -eq 0 ]; then
   exit 0
 fi
 
+if [ -z "$token" ]; then
+  notice "${REGISTRY}/${IMAGE_NAME} does not exist yet, so no dev build can be reused; building ${COMMIT} from source"
+  emit "" "$COMMIT" none
+  exit 0
+fi
 DIGEST=$(digest_of_sha "$COMMIT" || true)
 SOURCE="$COMMIT"
 VIA=exact

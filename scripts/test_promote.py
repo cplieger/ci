@@ -783,10 +783,11 @@ class Checks(unittest.TestCase):
 
 
 STUB_CURL = r"""#!/usr/bin/env bash
-out="" url="" head=false
+out="" url="" head=false status_out=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -o) out=$2; shift ;;
+    -w) status_out=true; shift ;;
     -H | --connect-timeout | --max-time | --retry | --retry-max-time) shift ;;
     -*I*) head=true ;;
     -*) ;;
@@ -796,7 +797,10 @@ while [ "$#" -gt 0 ]; do
 done
 echo "$url" >>"$STUB_LOG"
 case "$url" in
-  */token*) echo '{"token":"t"}' >"$out" ;;
+  */token*)
+    echo '{"token":"t"}' >"$out"
+    if [ "$status_out" = true ]; then printf 200; fi
+    ;;
   */manifests/sha-*)
     sha=${url##*/sha-}
     if grep -qx "$sha" "$STUB_IMAGES"; then
