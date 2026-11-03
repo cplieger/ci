@@ -422,7 +422,7 @@ def animap_fixture(repo: Path) -> None:
 
 def run_scope(target: Path, *modules: str, config: Path = CENTRAL) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, str(SCOPE), '--config', str(config), '--target', str(target), *modules],
+        [sys.executable, str(SCOPE), '--config', str(config), '--target', str(target), '--', *modules],
         capture_output=True, text=True, check=False,
     )
 
@@ -488,6 +488,29 @@ def test_scope_excludes_every_deeper_module(tmp: Path) -> None:
           ok=all(p in exclude_patterns((tmp / '.gremlins.yaml').read_text()) for p in central))
 
 
+def test_scope_takes_a_dash_dir_as_a_module(tmp: Path) -> None:
+    """Discover's charset admits a leading '-'; it must reach the script as a dir, not an option."""
+    (tmp / '-h').mkdir()
+    proc = run_scope(tmp, '.', '-h')
+    written = proc.returncode == 0 and (tmp / '-h' / '.gremlins.yaml').is_file()
+    check('scope dash dir: succeeds and writes -h/.gremlins.yaml', ok=written,
+          detail=f'rc={proc.returncode} {proc.stderr[-300:]}')
+    if not written:
+        return
+    check('scope dash dir: the root copy excludes it',
+          ok='^-h/' in exclude_patterns((tmp / '.gremlins.yaml').read_text()))
+    sync = workflow_step('Sync central .gremlins.yaml (authoritative for the weekly run)')
+    (tmp / 'target' / '-h').mkdir(parents=True)
+    (tmp / 'scripts').symlink_to(HERE)
+    (tmp / 'configs').symlink_to(CENTRAL.parent)
+    proc = subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', sync],
+                          cwd=tmp, env={**os.environ, 'MODULES': ' . -h'},
+                          capture_output=True, text=True, check=False)
+    check('scope dash dir: the workflow Sync step passes it as a dir',
+          ok=proc.returncode == 0 and (tmp / 'target' / '-h' / '.gremlins.yaml').is_file(),
+          detail=f'rc={proc.returncode} {proc.stderr[-300:]}')
+
+
 def test_scope_refuses_what_it_cannot_scope(tmp: Path) -> None:
     (tmp / 'sub').mkdir()
     bare = tmp / 'bare.yaml'
@@ -495,12 +518,23 @@ def test_scope_refuses_what_it_cannot_scope(tmp: Path) -> None:
     proc = run_scope(tmp, '.', 'sub', config=bare)
     check('scope refusal: a config without one exclude-files anchor exits non-zero',
           ok=proc.returncode != 0 and 'exclude-files' in proc.stderr, detail=proc.stderr[-300:])
-    proc = run_scope(tmp, '.', 'sub', 'sub/')
-    check('scope refusal: a duplicate module dir exits non-zero',
-          ok=proc.returncode != 0 and 'unique' in proc.stderr, detail=proc.stderr[-300:])
     proc = run_scope(tmp, '.', 'a b')
     check('scope refusal: a dir outside the safe charset exits non-zero',
           ok=proc.returncode != 0 and 'characters' in proc.stderr, detail=proc.stderr[-300:])
+
+
+def test_central_config_skips_dirs_go_never_builds(tmp: Path) -> None:
+    """testdata/ and "."/"_" dirs are never compiled, so their mutants could only read NOT COVERED."""
+    files = ('lib.go', 'testdata/fixture.go', 'pkg/testdata/gen.go', '_examples/ex.go',
+             'pkg/.cache/c.go', 'pkg/my_testdata/keep.go', 'a_b/keep.go', 'pkg/x.y/keep.go')
+    for f in files:
+        (tmp / f).parent.mkdir(parents=True, exist_ok=True)
+        (tmp / f).write_text('package x\n')
+    (tmp / '.gremlins.yaml').write_text(CENTRAL.read_text())
+    scope = gremlins_scope(tmp)
+    check('central config: unbuilt dirs are out of scope, look-alikes stay in',
+          ok=scope == ['a_b/keep.go', 'lib.go', 'pkg/my_testdata/keep.go', 'pkg/x.y/keep.go'],
+          detail=str(scope))
 
 
 # ---------------------------------------------------------------------------
@@ -1063,7 +1097,9 @@ def main() -> int:
         test_root_module_required,
         test_workflow_scopes_root_run_off_nested_module,
         test_scope_excludes_every_deeper_module,
+        test_scope_takes_a_dash_dir_as_a_module,
         test_scope_refuses_what_it_cannot_scope,
+        test_central_config_skips_dirs_go_never_builds,
         test_aggregate_consumes_merged_output,
         test_aggregate_flags_disagreeing_verdicts,
         test_aggregate_flags_sudden_perfect_week,

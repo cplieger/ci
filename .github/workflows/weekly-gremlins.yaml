@@ -173,14 +173,12 @@ jobs:
           # Always overwrite with this checkout's central policy: the consumers'
           # committed copies (synced for local `gremlins unleash`) may lag, the
           # shared run must not.
-          #
           # One copy PER MODULE: gremlins resolves .gremlins.yaml from the module
           # root of its working directory (findModuleRoot()), so a nested module
-          # would otherwise run on gremlins' defaults. Each copy also excludes
-          # the module's deeper modules (gremlins-scope.py owns why); per-repo
-          # policy entries stay out, the exclusions stay central.
+          # would otherwise run on gremlins' defaults. Each copy also excludes its
+          # deeper modules (scripts/gremlins-scope.py); no per-repo entries.
           read -ra mods <<< "$MODULES"
-          python3 scripts/gremlins-scope.py --config configs/gremlins.yaml --target target "${mods[@]}"
+          python3 scripts/gremlins-scope.py --config configs/gremlins.yaml --target target -- "${mods[@]}"
 
       # MEMORY CONTAINMENT VIA A DOCKER CGROUP. Mutation is precisely the act of
       # turning a bounded size/loop into an unbounded one, so some mutant WILL

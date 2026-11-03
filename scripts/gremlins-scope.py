@@ -12,7 +12,7 @@ gremlins-merge.py later uses to refuse any such file that still appears.
 
 Usage
 -----
-    gremlins-scope.py --config configs/gremlins.yaml --target target . mapread
+    gremlins-scope.py --config configs/gremlins.yaml --target target -- . mapread
 
 writes target/./.gremlins.yaml (excluding '^mapread/') and
 target/mapread/.gremlins.yaml (the central config unchanged).
@@ -67,14 +67,12 @@ def main() -> int:
     p.add_argument('modules', nargs='+', help="module dirs relative to --target ('.' for the root)")
     args = p.parse_args()
 
-    dirs = [m.rstrip('/') or '.' for m in args.modules]
+    dirs = args.modules
     for d in dirs:
         if not SAFE_DIR.fullmatch(d):
             raise SystemExit(
                 f'gremlins-scope: module dir {d!r} has characters outside [A-Za-z0-9._/-]'
             )
-    if len(set(dirs)) != len(dirs):
-        raise SystemExit(f'gremlins-scope: module dirs must be unique, got {dirs}')
 
     central = args.config.read_text()
     for d in dirs:

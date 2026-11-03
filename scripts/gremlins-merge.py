@@ -8,8 +8,10 @@ Why this exists
 every coverage-profile line to key blocks by repo-relative filename
 (`internal/coverage/coverage.go:removeModuleFromPath`). A NESTED module's
 packages carry a different module path, and a root `go test ./...` cannot run
-their tests at all, so their mutants come back `NOT COVERED` no matter how good
-that module's own suite is. Measured on cplieger/envx: its `yamlenv`
+their tests at all. When the root tests do not compile those files either, their
+mutants come back `NOT COVERED` no matter how good that module's own suite is;
+when an in-tree `replace` the root tests import does compile them, the root
+suite gives them a real verdict instead. Measured on cplieger/envx: its `yamlenv`
 subdirectory (own `go.mod`, own suite at 98.6% coverage) contributed 43
 analysed / 43 uncovered / 0 killed / 0 lived, which dragged the repo's
 published mutant coverage to 41.4% — a number that described a module boundary,
@@ -34,12 +36,10 @@ What it does
    the attempt goes red instead.
 3. Drops, from each module's result, mutations that live inside a DEEPER module's
    directory. gremlins-scope.py excludes those directories from every outer
-   module's run, so a healthy run has none; a run under an unscoped config (a
-   consumer's committed copy) reports them as uncovered noise, which would count
-   twice, once here and once properly by that module's own run. Every dropped
-   mutation must be NOT COVERED or SKIPPED (an uncovered mutant is never
-   executed, so it cannot carry a verdict); anything else means the exclusion
-   failed and the outer suite really ran nested code, so it exits 1.
+   module's run, so a healthy run has none. One that still appears is dropped
+   when every mutation is NOT COVERED or SKIPPED (never executed, so no verdict;
+   its module's own run counts it); anything else means the exclusion failed and
+   the outer suite ran nested code, so it exits 1.
 4. Prefixes each non-root module's filenames with its directory, so positions in
    the tracker issue stay repo-relative and unambiguous.
 5. Recomputes the merged counters, `test_efficacy`, `mutations_coverage` and
