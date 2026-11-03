@@ -151,14 +151,14 @@ jobs:
             echo "::error::deadset print-languages exited $rc, so the languages in scope at $TARGET are unknown and nothing was checked. Its error is above."
             exit 1
           fi
-          analyzers="$(jq -er '.analyzers | map(.name) | join(",")' "$WORK/census.json")" || {
+          analyzers="$(jq -er '.analyzers | select(length > 0) | map(.name) | join(",")' "$WORK/census.json")" || {
             echo "::error::deadset print-languages wrote no census naming its analyzers, so nothing was checked."
             exit 1
           }
           from() {
             jq -r --arg language "$1" '.languages[] | select(.language == $language) | .provenance' "$WORK/census.json"
           }
-          echo "analysis.languages $(jq -r '[.languages[] | "\(.language) (\(.provenance))"] | join(", ")' "$WORK/census.json"); analyzers ${analyzers:-none}"
+          echo "analysis.languages $(jq -r '[.languages[] | "\(.language) (\(.provenance))"] | join(", ")' "$WORK/census.json"); analyzers $analyzers"
           go=false
           ts=false
           IFS=, read -ra names <<< "$analyzers"
