@@ -139,53 +139,66 @@ jobs:
         run: |
           set -euo pipefail
           # `gremlins unleash .` measures exactly ONE module: coverage comes
-          # from a root `go test -cover ./...`, which cannot reach a NESTED
-          # module, so every mutant there would read NOT COVERED. Run once per
-          # module and merge the results (see the run step). Eligibility mirrors
-          # ci.yaml's detect step (validation, not release-lane semantics):
-          # prune vendored/generated trees, require tracked .go files, keep
-          # internal/ and dotless-path modules. Keep the two in sync.
+          # from a root `go test -cover ./...`, which cannot run a NESTED
+          # module's tests, so that module's own suite would never measure it.
+          # Run once per module and merge the results (see the run step).
+          # Eligibility mirrors ci.yaml's detect step (validation, not
+          # release-lane semantics): prune vendored/generated trees, require
+          # tracked .go files, keep internal/ and dotless-path modules. Keep the
+          # two in sync.
+          safe_dir() {
+            case "$1" in
+              *[!A-Za-z0-9._/-]*)
+                echo "::error::nested go.mod dir '$1' contains characters outside [A-Za-z0-9._/-]"
+                exit 1 ;;
+            esac
+          }
+          PRUNED='(^|/)(node_modules|vendor|testdata|static|dist)/'
           MODULES="."
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             d=$(dirname "$f")
-            case "$d" in
-              *[!A-Za-z0-9._/-]*)
-                echo "::error::nested go.mod dir '$d' contains characters outside [A-Za-z0-9._/-]"
-                exit 1 ;;
-            esac
+            safe_dir "$d"
             if [ -z "$(git -C target ls-files "$d/*.go" | head -1)" ]; then
               echo "  skip:    ${d} (no tracked .go files — nothing to mutate)"
               continue
             fi
             MODULES="${MODULES} ${d}"
             echo "  measure: ${d} ($(awk '$1=="module"{print $2; exit}' "target/$f"))"
-          done < <(git -C target ls-files '*/go.mod' | grep -Ev '(^|/)(node_modules|vendor|testdata|static|dist)/' || true)
+          done < <(git -C target ls-files '*/go.mod' | grep -Ev "$PRUNED" || true)
+          # A pruned module is not measured, yet the outer module's run walks
+          # its files all the same, so the Sync step excludes it there too.
+          UNMEASURED=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            d=$(dirname "$f")
+            safe_dir "$d"
+            UNMEASURED="${UNMEASURED} ${d}"
+            echo "  exclude: ${d} (pruned tree, not measured)"
+          done < <(git -C target ls-files '*/go.mod' | grep -E "$PRUNED" || true)
           echo "modules=${MODULES}" >> "$GITHUB_OUTPUT"
+          echo "unmeasured=${UNMEASURED# }" >> "$GITHUB_OUTPUT"
           echo "modules to measure: ${MODULES}"
 
       - name: Sync central .gremlins.yaml (authoritative for the weekly run)
         env:
           MODULES: ${{ steps.modules.outputs.modules }}
+          UNMEASURED: ${{ steps.modules.outputs.unmeasured }}
         run: |
           set -euo pipefail
-          # Always overwrite with the central policy so the weekly run uses the
-          # canonical exclude-list regardless of what each consumer has
-          # committed. The committed per-repo copies (kept in sync by
-          # sync.yaml, for local `gremlins unleash`) may lag; the shared run must
-          # not. "centralization is the point" — see configs/gremlins.yaml.
-          # Copied from this run's own checkout (same commit as the workflow),
-          # not fetched from raw main at run time.
-          #
+          # Always overwrite with this checkout's central policy: the consumers'
+          # committed copies (synced for local `gremlins unleash`) may lag, the
+          # shared run must not.
           # One copy PER MODULE: gremlins resolves .gremlins.yaml from the module
-          # root of its working directory (its config search path ends at
-          # findModuleRoot()), so a nested module's run would otherwise fall
-          # through to gremlins' defaults and mutate files the central
-          # exclude-list rules out. Injecting per-repo entries into these copies
-          # is still not a thing we do — the exclusions stay central.
-          for m in $MODULES; do
-            cp configs/gremlins.yaml "target/${m}/.gremlins.yaml"
-          done
+          # root of its working directory (findModuleRoot()), so a nested module
+          # would otherwise run on gremlins' defaults. Each copy also excludes its
+          # deeper modules (scripts/gremlins-scope.py); no per-repo entries.
+          read -ra mods <<< "$MODULES"
+          read -ra pruned <<< "$UNMEASURED"
+          excludes=()
+          for d in "${pruned[@]}"; do excludes+=("--exclude-dir=${d}"); done
+          python3 scripts/gremlins-scope.py --config configs/gremlins.yaml --target target \
+            "${excludes[@]}" -- "${mods[@]}"
 
       # MEMORY CONTAINMENT VIA A DOCKER CGROUP. Mutation is precisely the act of
       # turning a bounded size/loop into an unbounded one, so some mutant WILL
@@ -300,17 +313,8 @@ jobs:
             exit "$rc"
           fi
 
-          # Fold the per-module results into the ONE result per attempt that
-          # gremlins-aggregate.py, the badge and the tracker issue are built on,
-          # so the repo keeps a single published number and that number covers
-          # every module. The script sums counters and re-derives the percentages
-          # with gremlins' own formulas (a mean of per-module percentages would
-          # let a 3-mutant module outweigh a 300-mutant one), drops the root
-          # run's uncovered copies of nested files, and refuses to write a number
-          # when an input's totals disagree with its own mutant list. A missing
-          # per-module file is a zero-mutant module — gremlins writes no report
-          # when it finds none, which is the "clean exit, no file" case this step
-          # used to handle inline.
+          # Fold the per-module results into the ONE result per attempt the
+          # aggregate, badge and tracker are built on; gremlins-merge.py owns how.
           if ! python3 scripts/gremlins-merge.py --out /tmp/gremlins-out.json "${MERGE_ARGS[@]}"; then
             echo '{"gremlins_error": true}' > /tmp/gremlins-out.json
             echo "::error::merging per-module gremlins results failed for ${{ matrix.repo }} (attempt ${{ matrix.attempt }})"
