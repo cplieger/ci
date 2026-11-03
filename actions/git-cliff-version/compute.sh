@@ -47,7 +47,23 @@ if [ -n "$LANE" ]; then
   PREFIX="${LANE}/"
   ARGS=(--tag-pattern "$PATTERN" --include-path "${LANE}/**")
   # The synced config's initial_tag is root-shaped and would fail the pattern.
-  export GIT_CLIFF__BUMP__INITIAL_TAG="${LANE}/v1.0.0"
+  # git-cliff reads it only while the lane has no stable tag, so a committed
+  # <lane>/.first-version, read at the revision numbered, seeds the lane's
+  # first version (a package that already holds v1.x on npm continues there).
+  SEED_AT="${PENDING_OF:-HEAD}"
+  FIRST=v1.0.0
+  if ! seed_entry="$(git ls-tree --name-only "$SEED_AT" -- "${LANE}/.first-version")"; then
+    echo "::error::git cannot read ${LANE}/.first-version at ${SEED_AT}"
+    exit 1
+  fi
+  if [ -n "$seed_entry" ]; then
+    FIRST="$(git show "${SEED_AT}:${LANE}/.first-version")"
+    if ! [[ $FIRST =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "::error::${LANE}/.first-version holds '${FIRST}', not one line vX.Y.Z"
+      exit 1
+    fi
+  fi
+  export GIT_CLIFF__BUMP__INITIAL_TAG="${LANE}/${FIRST}"
 else
   PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+$'
   PREFIX=""

@@ -2092,6 +2092,17 @@ jobs:
           fi
           echo "ok: module path '$modpath' matches lane ${DIR} ($VERSION)"
 
+      # Before the tag, which reserves the version for the lane's TS half too.
+      - name: Check the half's npm versions
+        if: ${{ steps.lane.outputs.release == 'true' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          DIR: ${{ matrix.dir }}
+          VERSION: ${{ steps.lane.outputs.version }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" half-free "$DIR" "$VERSION" "$GITHUB_SHA"
+
       - name: Generate lane release notes
         # Stable only. Deliberately token-free — this step executes the
         # git-cliff binary the compute action installed; see the go job's

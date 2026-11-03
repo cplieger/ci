@@ -104,6 +104,11 @@ facts["lanecliff-with"] = step(jobs, "go-nested", "Compute lane version (cliff)"
 facts["renumber-cliff-with"] = step(jobs, "renumber", "Compute lane version (cliff)")["with"]
 facts["renumber-ts-cliff-with"] = step(jobs, "renumber-ts", "Compute version (cliff)")["with"]
 open(f"{out}/lane-select.sh", "w").write(step(jobs, "go-nested", "Select lane version")["run"])
+facts["gn-steps"] = [s.get("name") for s in jobs["go-nested"]["steps"]]
+gnf = next((s for s in jobs["go-nested"]["steps"] if s.get("name") == "Check the half's npm versions"), {"run": "exit 99"})
+open(f"{out}/gn-free.sh", "w").write(gnf["run"])
+facts["gn-free-if"] = gnf.get("if", "")
+facts["gn-free-env"] = gnf.get("env", {})
 facts["lane-select-env"] = step(jobs, "go-nested", "Select lane version")["env"]
 facts["vp-steps"] = [s.get("name") for s in jobs["verify-publish"]["steps"]]
 facts["receipts-step-ifs"] = [s.get("if", "") for s in jobs["receipts"]["steps"]]
@@ -2837,13 +2842,13 @@ lsub() { # <checkout> -> the outputs of renumber-subpackages for lane alpha, or 
   tr '\n' ' ' <"$WORK/out"
 }
 NPM_PKG=$NPM_ALPHA xweb
-chk "U29 a lane's half with no dev build is published from the lane's build under its newest dev tag" \
+chk "U30 a lane's half with no dev build is published from the lane's build under its newest dev tag" \
   "$(lsub "$LBW")" 'version=alpha/v1.2.0-dev.1 dirs=["alpha/web"] '
 NPM_PKG=$NPM_ALPHA xweb 1.2.0-dev.1 "$LBW"
-chk "U29 one npm serves from that change is left alone" "$(lsub "$LBW")" 'version=alpha/v1.2.0-dev.1 dirs=[] '
-chk "U29 a checkout that is not the lane's newest dev build is refused" "$(lsub "$LBG")" "EXIT=1"
-chk_has "U29 naming the lane" "$(cat "$WORK/lsub.log")" "HEAD is not lane alpha's newest dev build"
-chk "U29 a half git cannot read at the build publishes nothing" \
+chk "U30 one npm serves from that change is left alone" "$(lsub "$LBW")" 'version=alpha/v1.2.0-dev.1 dirs=[] '
+chk "U30 a checkout that is not the lane's newest dev build is refused" "$(lsub "$LBG")" "EXIT=1"
+chk_has "U30 naming the lane" "$(cat "$WORK/lsub.log")" "HEAD is not lane alpha's newest dev build"
+chk "U30 a half git cannot read at the build publishes nothing" \
   "$(failing_git '* HEAD -- alpha/web/jsr.json' 1 lsub "$LBW")|$(git_calls)" "EXIT=1|1"
 mkdir -p "$WORK/lbcurl"
 : >"$WORK/lbcurl/ok"
@@ -2851,9 +2856,66 @@ mkdir -p "$WORK/lbcurl"
 git -C "$LBC" checkout -q --detach "$LBW"
 (cd "$LBC" && env -u JSR_VERSION PATH="$BIN2:$PATH" CURL_DIR="$WORK/lbcurl" CI_TOOLS="$ROOT/scripts" VERSION=alpha/v1.2.0-dev.1 \
   CHANNEL=dev DIRS='["alpha/web"]' bash "$WORK/rh-publish.sh") >"$WORK/rhpub.log" 2>&1 || echo "EXIT=$?" >>"$SP_LOG"
-chk "U29 the publish step puts the half on npm's dev dist-tag from the lane's build, at the lane's dev version" \
+chk "U30 the publish step puts the half on npm's dev dist-tag from the lane's build, at the lane's dev version" \
   "$(grep -E '^(npm publish|published|npx|EXIT)' "$SP_LOG" | tr '\n' ';')|$(cat "$SP_LOG.version" 2>/dev/null)" \
   "npm publish --access public --tag dev @web;published v2;|1.2.0-dev.1"
+# A lane's version must be free on its half's npm package before the lane's tag.
+FOREIGN=0123456789abcdef0123456789abcdef01234567
+git -C "$LBC" checkout -q --detach "$LBW"
+hfree() { # <tag> [commit] [lane] -> ok, or EXIT=n
+  : >"$CURL_DIR/log"
+  (cd "$LBC" && bash "$RS" half-free "${3:-alpha}" "$1" "${2:-$LBW}") >"$WORK/hfree.log" 2>&1 && echo ok || echo "EXIT=$?"
+}
+npm_reads() { grep -c "^$NPM_ALPHA\$" "$CURL_DIR/log" || true; }
+sed -i "\\|^$NPM_ALPHA |d" "$CURL_DIR/docs"
+chk "G1 a package npm has never served leaves every version free" "$(hfree alpha/v1.0.0-dev.1)|$(npm_reads)" "ok|1"
+NPM_PKG=$NPM_ALPHA xweb 1.0.0 "$FOREIGN" 1.2.1 "" 1.3.0-dev.4 "$FOREIGN"
+chk "G2 a lane version at or below the package's history from before the move is refused" \
+  "$(hfree alpha/v1.0.0-dev.1)|$(hfree alpha/v1.3.0)" "EXIT=1|EXIT=1"
+chk_has "G2 naming the seed that clears it" "$(cat "$WORK/hfree.log")" \
+  "npm holds @o/alpha@1.3.0 from outside this repository, so alpha/v1.3.0 would not rank above it. Before the lane's first stable tag, commit alpha/.first-version holding v1.3.1 or higher."
+chk "G2 one above it is free" "$(hfree alpha/v1.5.0-dev.1)|$(hfree alpha/v1.5.0)" "ok|ok"
+NPM_PKG=$NPM_ALPHA xweb 1.0.0 "$FOREIGN" 1.6.0-dev.1 "$LBG"
+chk "G3 the lane's own builds above its version do not block it" "$(hfree alpha/v1.5.0)" "ok"
+NPM_PKG=$NPM_ALPHA xweb 1.5.0-dev.1 "$LBW"
+chk "G4 the version npm already serves from this commit is free, for a rerun" "$(hfree alpha/v1.5.0-dev.1)" "ok"
+NPM_PKG=$NPM_ALPHA xweb 1.5.0-dev.1 "$LBG"
+chk "G4 the version npm serves from another commit is refused" "$(hfree alpha/v1.5.0-dev.1)" "EXIT=1"
+chk_has "G4 naming both commits" "$(cat "$WORK/hfree.log")" "npm already serves @o/alpha@1.5.0-dev.1 from '$LBG', not $LBW"
+echo "$NPM_ALPHA" >"$CURL_DIR/down"
+chk "G5 npm that cannot answer is refused, not read as free" "$(hfree alpha/v1.5.0)" "EXIT=1"
+chk_has "G5 and says so" "$(cat "$WORK/hfree.log")" "npm cannot tell which versions of @o/alpha exist (HTTP 000)"
+rm "$CURL_DIR/down"
+NPM_PKG=$NPM_ALPHA xweb 1.0.0 "$FOREIGN"
+chk "G6 a lane with no half reads no npm" "$(hfree beta/v1.0.0 "$LBW" beta)|$(npm_reads)" "ok|0"
+git -C "$LB" checkout -q dev
+LBP=$(commit_in "$LB" "chore(alpha): private half" alpha/web/package.json='{"name":"@o/alpha","version":"0.0.0","private":true}')
+git -C "$LB" checkout -q main
+git -C "$LBC" fetch -q origin '+refs/heads/dev:refs/remotes/origin/dev'
+chk "G6 nor does a private half, which npm never receives" "$(hfree alpha/v1.0.0 "$LBP")|$(npm_reads)" "ok|0"
+chk "G6 a guard missing its commit is refused" \
+  "$( (cd "$LBC" && bash "$RS" half-free alpha alpha/v1.0.0) >/dev/null 2>&1 && echo ok || echo refused)" "refused"
+NPM_PKG=$NPM_ALPHA xweb 1.3.0 "$FOREIGN"
+lrenumber() { # -> renumbers lane alpha's build at LBW as alpha/v1.3.0-dev.1; prints EXIT=n on failure
+  : >"$GH_LOG"
+  (cd "$LBC" && git checkout -q --detach "$LBW" && CHANNEL=dev LANE_KEY=alpha DEV_VERSION=alpha/v1.3.0-dev.1 REPO_TYPE=none \
+    bash "$RS" renumber) >"$WORK/lrenumber.log" 2>&1 || echo "EXIT=$?"
+}
+chk "G7 a lane renumber to a version its half cannot take is refused before any tag" \
+  "$(lrenumber)|$(grep -c 'git/refs' "$GH_LOG" || true)" "EXIT=1|0"
+sed -i "\\|^$NPM_ALPHA |d" "$CURL_DIR/docs"
+chk "G7 and tags the build once it is free" \
+  "$(lrenumber)|$(grep -c "^api repos/o/app/git/refs -f ref=refs/tags/alpha/v1.3.0-dev.1 -f sha=$LBW\$" "$GH_LOG")" "|1"
+NPM_PKG=$NPM_ALPHA xweb 1.0.0 "$FOREIGN"
+gn_free() { # <version> -> the extracted go-nested guard step at LBW, ok or EXIT=n
+  (cd "$LBC" && git checkout -q --detach "$LBW" && CI_TOOLS="$ROOT/scripts" DIR=alpha VERSION="$1" GITHUB_SHA="$LBW" \
+    bash "$WORK/gn-free.sh") >"$WORK/gnfree.log" 2>&1 && echo ok || echo "EXIT=$?"
+}
+chk "G8 go-nested checks the lane's version against its half's npm package" "$(gn_free alpha/v1.0.0)|$(gn_free alpha/v1.1.0)" "EXIT=1|ok"
+chk "G8 after the lane's version is selected and before its tag, holding no token" \
+  "$(fact '."gn-steps" | (index("Select lane version") < index("Check the half'"'"'s npm versions")) and (index("Check the half'"'"'s npm versions") < index("Tag + GitHub Release (lane)"))')|$(fact '."gn-free-if"')|$(fact '."gn-free-env" | has("GH_TOKEN")')" \
+  "true|\${{ steps.lane.outputs.release == 'true' }}|false"
+sed -i "\\|^$NPM_ALPHA |d" "$CURL_DIR/docs"
 # The renumber run publishes the subpackages the barrier would hold, from the
 # root's renumbered build.
 git -C "$XC" fetch -q --tags origin '+refs/heads/dev:refs/remotes/origin/dev'

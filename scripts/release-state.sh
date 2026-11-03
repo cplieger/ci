@@ -3,10 +3,10 @@
 # publish, ahead, halves, number (CLIFF_SCRIPT), receipts, receipt TAG COMMIT,
 # readback SITE TAG [LANE], provenance and complete (IMAGE@DIGEST SOURCE),
 # barrier, renumber-target, renumber-handoff, renumber (re-tag LANE_KEY's newest
-# dev build as DEV_VERSION), renumber-subpackages, signing-window TAG
-# (EXCLUDE_RE, SUBPACKAGES_JSON), release-digest TAG (IMAGE) and security-shas
-# [FLOOR]. Lane keys: '.' for the root, else the lane dir. pending, publish,
-# ahead, halves and number hold no token.
+# dev build as DEV_VERSION), renumber-subpackages, half-free LANE TAG COMMIT,
+# signing-window TAG (EXCLUDE_RE, SUBPACKAGES_JSON), release-digest TAG (IMAGE),
+# security-shas [FLOOR]. Lane keys: '.' for the root, else the lane dir.
+# pending, publish, ahead, halves, number and half-free hold no token.
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -1287,6 +1287,48 @@ handoff_name() { # <prefix> <id> -> an artifact name unique per id, which may ho
   printf '%s-%s\n' "$1" "$(printf '%s' "$2" | sha256sum | cut -c1-16)"
 }
 
+# A lane's version is also its half's npm version, so before the lane's tag it
+# is refused when npm serves it from another commit, or when it does not rank
+# above every version npm holds from outside this repository (the package's
+# history from before it moved here), which <lane>/.first-version seeds past.
+cmd_half_free() { # <lane> <lane tag> <commit>
+  local lane=$1 tag=$2 commit=$3 manifest pkg ver res code doc at v h top="" a b c
+  has_path "$commit" "$lane/web/jsr.json" || return 0
+  manifest=$(git show "$commit:$lane/web/package.json") || die "no ${lane}/web/package.json at ${commit}"
+  if [ "$(jq -r '.private // false' <<<"$manifest")" = true ]; then
+    note "lane ${lane}: its half is private, so npm holds none of its versions"
+    return 0
+  fi
+  pkg=$(jq -er '.name | strings' <<<"$manifest") || die "${lane}/web/package.json at ${commit} names no package"
+  ver=${tag##*/}
+  ver=${ver#v}
+  res=$(curl -sS --connect-timeout 10 --max-time 30 --retry 3 -w '\n%{http_code}' "https://registry.npmjs.org/${pkg}") || res=$'\n000'
+  code=${res##*$'\n'}
+  case "$code" in
+    404) return 0 ;;
+    200) doc=${res%$'\n'*} ;;
+    *) die "npm cannot tell which versions of ${pkg} exist (HTTP ${code}), so ${tag} is not tagged" ;;
+  esac
+  at=$(jq -r --arg v "$ver" '.versions // {} | if has($v) then "at " + (.[$v].gitHead // "") else "" end' <<<"$doc") \
+    || die "npm's answer for ${pkg} is not a packument, so ${tag} is not tagged"
+  if [ -n "$at" ]; then
+    [ "${at#at }" = "$commit" ] \
+      || die "npm already serves ${pkg}@${ver} from '${at#at }', not ${commit}, so ${tag} is not tagged"
+    note "npm ${pkg}@${ver} is already published from ${commit}"
+    return 0
+  fi
+  while read -r v h; do
+    [ -n "$v" ] || continue
+    # npm's gitHead may name a commit this checkout never fetched.
+    if [ -n "$h" ] && has_commit "$h"; then continue; fi
+    if [ -z "$top" ] || gt "$(core "$v")" "$top"; then top=$(core "$v"); fi
+  done < <(jq -r '.versions // {} | to_entries[] | "\(.key) \(.value.gitHead // "")"' <<<"$doc")
+  if [ -n "$top" ] && ! gt "$(core "$tag")" "$top"; then
+    IFS=. read -r a b c <<<"$top"
+    die "npm holds ${pkg}@${top} from outside this repository, so ${tag} would not rank above it. Before the lane's first stable tag, commit ${lane}/.first-version holding v${a}.${b}.$((c + 1)) or higher."
+  fi
+}
+
 # After LANE_KEY's renumber, at the build renumber-target checked out: each of
 # its subpackages (a lane's: its half) the barrier finds without a dev build,
 # or below the pending version, is published from this build under its newest
@@ -1346,6 +1388,8 @@ cmd_renumber() {
   fi
   if [ "$key" = . ] && [ "${REPO_TYPE:-}" = ts ]; then
     publish_npm_dev "$new" "$d"
+  elif [ "$key" != . ]; then
+    cmd_half_free "$key" "$new" "$d"
   fi
   tag_ref "$repo" "$new" "$d" || die "tag ${new} is not at ${d}, so the build is not renumbered"
   if ! gh api -X POST "repos/${repo}/statuses/${d}" -f state=success -f context="${TAG_RECEIPT_PREFIX}${new}" \
@@ -1374,6 +1418,10 @@ case "${1:-}" in
   renumber-target) cmd_renumber_target ;;
   renumber-handoff) cmd_renumber_handoff ;;
   renumber-subpackages) cmd_renumber_subpackages ;;
+  half-free)
+    [ "$#" -eq 4 ] || die "usage: release-state.sh half-free <lane> <tag> <commit>"
+    cmd_half_free "$2" "$3" "$4"
+    ;;
   handoff-read) cmd_handoff_read "${2:?usage: release-state.sh handoff-read <file>}" ;;
   handoff-name) handoff_name "${2:?usage: release-state.sh handoff-name <prefix> <id>}" "${3:?usage: release-state.sh handoff-name <prefix> <id>}" ;;
   signing-window) signing_window "${2:?usage: release-state.sh signing-window <tag>}" ;;
@@ -1384,5 +1432,5 @@ case "${1:-}" in
     shift
     "$cmd" "$@"
     ;;
-  *) die "usage: release-state.sh pending|publish|ahead|halves|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
+  *) die "usage: release-state.sh pending|publish|ahead|halves|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|half-free|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
 esac
