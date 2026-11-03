@@ -15,7 +15,7 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | `jsr.json` at the root | `ts` | `ts-ci.yaml` |
 | a `package.json` or `jsr.json` in `static-src/`, `web/`, `internal/server/static-src/` or `internal/webui/static-src/` | `web` | `ts-ci.yaml` in the first folder found, with the CSS and HTML lints on |
 | a `Dockerfile`, or a root `go.mod` or `jsr.json` and a tracked `.sh` file outside `node_modules`, `vendor`, `testdata` and `dist` | `shell` | `shell-ci.yaml`, with hadolint only when there is a `Dockerfile` |
-| Go or TypeScript that deadset detects, or a root `deadset.json` naming languages, or a `go-nested` module | `deadset` | `deadset-ci.yaml` at the repository root, and once per nested module folder |
+| any files | `deadset` | `deadset-ci.yaml` at the repository root, and once per nested Go module folder with tracked Go files |
 | a `Dockerfile` | `docker`, `docker-arm64` | an image build on `amd64`, and on `arm64` in public repositories, with no push and no scan |
 | `*.py` files | `python` | Ruff |
 | shell scripts or workflow files, and no `go.mod`, `jsr.json` or `Dockerfile` | `scripts` | shellcheck, shfmt, `tests/shell/run.sh` when the repository has one, yamllint, a TOML check, and the probe scripts present in the repository |
@@ -42,12 +42,13 @@ In a TypeScript package with a knip configuration, `ts-ci.yaml` also runs [knip]
 
 ## The dead-code check
 
-`deadset-ci.yaml` runs [deadset](https://github.com/cplieger/deadset) at the repository root when deadset finds Go or TypeScript there, and once in each nested Go module folder. The root run covers the Go and TypeScript that deadset finds there, with deadset-go and deadset-ts, so deadset can match an edge that crosses from one language to the other. deadset-go stops at a nested module's `go.mod`, so each nested module gets its own run for its Go. deadset-ts at the root already reads every TypeScript project below it, nested modules included, so a nested run leaves TypeScript out.
+`deadset-ci.yaml` runs [deadset](https://github.com/cplieger/deadset) at the repository root, and once in each nested Go module folder. The root run covers the Go and TypeScript that deadset finds there, with deadset-go and deadset-ts, so deadset can match an edge that crosses from one language to the other. deadset-go stops at a nested module's `go.mod`, so each nested module gets its own run for its Go. deadset-ts at the root already reads every TypeScript project below it, nested modules included, so a nested run leaves TypeScript out.
 
 A run reads its settings from `deadset.json` at its root. Every key that file sets wins, except `reporters.formats`: the workflow always asks for text and SARIF. When the file leaves `target.kind` out, it is `application` if the folder has a `Dockerfile` and `library` otherwise. deadset then reports no unused export from a library's published API, because callers outside the repository may use it.
 
-The languages are the `analysis.languages` of `deadset.json`. When the file names none, a nested module's run takes Go alone, and the root run lets deadset detect them from file names, as its [commands page](https://github.com/cplieger/deadset/blob/HEAD/docs/commands.md#how-languages-are-detected) describes, so TypeScript test fixtures count too. A repository that holds fixtures in a language it does not ship lists its own languages. The workflow installs what each language needs, and fails before the analysis when it cannot:
+The languages are the `analysis.languages` of `deadset.json`. When the file names none, a nested module's run takes Go alone, and the root run lets deadset detect them from file names, as its [commands page](https://github.com/cplieger/deadset/blob/HEAD/docs/commands.md#how-languages-are-detected) describes, so TypeScript test fixtures count too. A repository that holds fixtures in a language it does not ship lists its own languages. The workflow first asks deadset which languages and analyzers the run will use, with `deadset print-languages`. When deadset finds no program at the root, the check passes and analyzes nothing. Any other failure of that question fails the check. The workflow then installs only the analyzers deadset names, and fails before the analysis when a language's setup cannot be derived:
 
+- The workflow installs deadset-go and deadset-ts only, so a `providers.analyzers` that names another analyzer fails.
 - Go needs a `go.mod` at the run's root.
 - TypeScript needs a committed `package-lock.json` when it has a `package.json`. Both count only outside `node_modules`, `testdata`, `vendor` and hidden folders. Each folder that holds a lockfile is installed with `npm ci`. JavaScript with no `package.json`, such as a script run with `node`, installs nothing.
 
@@ -58,7 +59,7 @@ Any finding at `deny` severity fails the check. So does a run that gives no answ
 
 Each run also writes SARIF and uploads it to code scanning, under the category `deadset`, or `deadset/<folder>` for a nested module. Each analyzer's findings stay a separate analysis inside that category. The upload needs `security-events: write`, which the synced `ci.yml` grants. It is skipped in private repositories, and a failed upload never fails the check.
 
-In `cplieger/ci` itself, a `deadset-canary` job runs the same workflow with the pinned deadset, deadset-go and deadset-ts over five public repositories at fixed commits, and ignores their findings. A version bump that makes deadset refuse a run or give no answer fails that job before a release carries it.
+In `cplieger/ci` itself, a `deadset-canary` job runs the same workflow with the pinned deadset, deadset-go and deadset-ts over six public repositories at fixed commits, and ignores their findings. A version bump that makes deadset refuse a run or give no answer fails that job before a release carries it.
 
 ## The release workflow
 
