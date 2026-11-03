@@ -855,6 +855,24 @@ promoted_subpackages() { # <R> -> JSON array of the subpackages R's promotion pu
     bash "$TOOLS/path-significance.sh") || return 1
   sed -n 's/^subpackages_to_publish=//p' <<<"$res"
 }
+# A lane's half publishes after the lane's tag, so the barrier holds for it as
+# for a root subpackage once a promotion past the lane's stable tag changed it.
+half_rows() { # <state> <plan> -> "<lane>/web\t<T>\t<V>" per in-range lane whose promotions changed its half
+  local key r v h c t recs
+  while IFS=$'\t' read -r key r v; do
+    [ -n "$key" ] && [ "$key" != . ] || continue
+    has_path "$r" "$key/web/jsr.json" || continue
+    h=$(jq -r --arg k "$key" '.[$k].h_commit // ""' <<<"$1")
+    recs=$(reconciliations_in "$h" "$r") || die "cannot list lane ${key}'s promotions past its stable tag"
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      half_changed "$key" "${c}^1" "$c" || continue
+      t=$(git rev-parse "${r}^2") || die "lane ${key}: cannot read the commit ${r} promoted"
+      printf '%s\t%s\t%s\n' "$key/web" "$t" "$v"
+      break
+    done <<<"$recs"
+  done <<<"$2"
+}
 last_change() { # <ref> <dir> -> the newest first-parent commit of ref whose own diff changes what the subpackage ships; fails when git cannot walk ref or read a commit's diff
   local c from res revs subs
   revs=$(git rev-list --first-parent "$1" -- "$2") || return 1
@@ -1107,6 +1125,7 @@ cmd_barrier() {
       [ -z "$s" ] || subrows+="${s}"$'\t'"${t}"$'\t'"${ROOT_VERSION:-}"$'\n'
     done <<<"$rows"
   fi
+  subrows+=$(half_rows "$state" "$plan") || exit 1
   [ -z "$held" ] || waited=1
   lacking=$(subs_lacking "$subrows" incomplete)
   if [ -n "$lacking" ]; then
@@ -1268,19 +1287,25 @@ handoff_name() { # <prefix> <id> -> an artifact name unique per id, which may ho
   printf '%s-%s\n' "$1" "$(printf '%s' "$2" | sha256sum | cut -c1-16)"
 }
 
-# After the root renumber, at the build renumber-target checked out: each
-# subpackage the barrier finds without a dev build, or below the pending
-# version, is published from this build under its newest dev tag.
+# After LANE_KEY's renumber, at the build renumber-target checked out: each of
+# its subpackages (a lane's: its half) the barrier finds without a dev build,
+# or below the pending version, is published from this build under its newest
+# dev tag.
 cmd_renumber_subpackages() {
-  local state="${STATE:?}" d_tag r v t="" s st c dirs='[]' all rows
+  local state="${STATE:?}" key="${LANE_KEY:-.}" d_tag r v t="" s st c dirs='[]' all='[]' rows who="the root's"
   [ "${CHANNEL:-}" = dev ] || die "renumber runs on the dev channel only"
-  d_tag=$(nearest_dev_tag HEAD .) || die "cannot read lane .'s dev tags"
+  [ "$key" = . ] || who="lane ${key}'s"
+  d_tag=$(nearest_dev_tag HEAD "$key") || die "cannot read lane ${key}'s dev tags"
   [ -n "$d_tag" ] && [ "$(git rev-list -n1 "$d_tag")" = "$(git rev-parse HEAD)" ] \
-    || die "HEAD is not the root's newest dev build. Check that build out with renumber-target first."
-  r=$(jq -r '.["."].commit // ""' <<<"$state")
-  v=$(jq -r '.["."].version // ""' <<<"$state")
+    || die "HEAD is not ${who} newest dev build. Check that build out with renumber-target first."
+  r=$(jq -r --arg k "$key" '.[$k].commit // ""' <<<"$state")
+  v=$(jq -r --arg k "$key" '.[$k].version // ""' <<<"$state")
   [ -z "$r" ] || t=$(git rev-parse "$r^2")
-  all=$(subpackages_at HEAD) || die "cannot list the subpackages of the build ${d_tag}"
+  if [ "$key" = . ]; then
+    all=$(subpackages_at HEAD) || die "cannot list the subpackages of the build ${d_tag}"
+  elif has_path HEAD "$key/web/jsr.json"; then
+    all=$(jq -cn --arg d "$key/web" '[$d]')
+  fi
   rows=$(jq -r '.[]' <<<"$all")
   while IFS= read -r s; do
     [ -n "$s" ] || continue

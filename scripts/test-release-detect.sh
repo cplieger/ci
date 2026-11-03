@@ -115,9 +115,11 @@ open(f"{out}/barrier-step.sh", "w").write(step(jobs, "barrier", "Hold for dev")[
 facts["barrier-timeout"] = jobs["barrier"]["timeout-minutes"]
 facts["detect-timeout"] = jobs["detect"]["timeout-minutes"]
 facts["npm-wait-timeouts"] = " ".join(str(jobs[j]["timeout-minutes"]) for j in ("verify-publish", "renumber-npm", "repair"))
-facts["renumber-timeout"] = max(jobs["renumber"]["timeout-minutes"] + jobs["renumber-tag"]["timeout-minutes"],
-                               jobs["renumber-ts"]["timeout-minutes"] + jobs["renumber-npm"]["timeout-minutes"]
-                               ) + jobs["renumber-subpackages"]["timeout-minutes"]
+facts["renumber-timeout"] = max(max(jobs["renumber"]["timeout-minutes"] + jobs["renumber-tag"]["timeout-minutes"],
+                                   jobs["renumber-ts"]["timeout-minutes"] + jobs["renumber-npm"]["timeout-minutes"]
+                                   ) + jobs["renumber-subpackages"]["timeout-minutes"],
+                               jobs["renumber"]["timeout-minutes"] + jobs["renumber-tag"]["timeout-minutes"]
+                               + jobs.get("renumber-halves", {}).get("timeout-minutes", 0))
 notes = {
     "go": step(jobs, "go", "Generate release notes"),
     "ts": step(jobs, "ts", "Generate release notes"),
@@ -200,6 +202,14 @@ facts["rsub-steps"] = [s.get("name") for s in jobs["renumber-subpackages"]["step
 facts["rsub-if"] = {s.get("name"): s.get("if", "") for s in jobs["renumber-subpackages"]["steps"]}
 facts["rsub-env"] = {s.get("name"): s.get("env", {}) for s in jobs["renumber-subpackages"]["steps"]}
 open(f"{out}/rsub-publish.sh", "w").write(step(jobs, "renumber-subpackages", "Publish the subpackages")["run"])
+rh = jobs.get("renumber-halves", {"steps": []})
+facts["rh-needs"] = rh.get("needs")
+facts["rh-perms"] = rh.get("permissions")
+facts["rh-strategy"] = rh.get("strategy")
+facts["rh-steps"] = [s.get("name") for s in rh["steps"]]
+facts["rh-if"] = {s.get("name"): s.get("if", "") for s in rh["steps"]}
+facts["rh-env"] = {s.get("name"): s.get("env", {}) for s in rh["steps"]}
+open(f"{out}/rh-publish.sh", "w").write(next((s for s in rh["steps"] if s.get("name") == "Publish the half"), {"run": "exit 99"})["run"])
 
 # Every job that executes the repository's cliff config (git-cliff, the compute
 # action or render-notes.sh), and which of them hold OIDC.
@@ -256,7 +266,7 @@ def ev(expr, res, outs):
 # run. The repair jobs are the repair itself, and the renumber jobs need
 # mode=renumber.
 EXEMPT = {"repair-notes", "repair-assets", "repair-release", "repair-publish", "renumber", "renumber-tag", "renumber-ts", "renumber-npm",
-          "renumber-subpackages"}
+          "renumber-subpackages", "renumber-halves"}
 writers = [n for n, j in jobs.items() if n not in EXEMPT and (
     str(j.get("uses", "")).endswith("docker-release.yaml")
     or {k for k, v in (j.get("permissions") or {}).items() if v == "write"} & {"id-token", "packages", "contents"})]
@@ -288,6 +298,10 @@ for tag_r, npm_r, mode, subs in (("success", "skipped", "renumber", '["web"]'), 
     res = {"detect": "success", "renumber-tag": tag_r, "renumber-npm": npm_r}
     rsub[f"{tag_r} {npm_r} {mode} {subs}"] = ev(jobs["renumber-subpackages"]["if"], res, {"mode": mode, "subpackages": subs})
 facts["rsub-gate"] = rsub
+facts["rh-gate"] = [ev(rh["if"], {"detect": "success", "renumber-tag": tag_r}, {"mode": mode, "go_halves": halves}) if "if" in rh else None
+                    for tag_r, mode, halves in (("success", "renumber", '["alpha"]'), ("skipped", "renumber", '["alpha"]'),
+                                                ("failure", "renumber", '["alpha"]'), ("success", "normal", '["alpha"]'),
+                                                ("success", "renumber", "[]"))]
 # A matrix job's same-named outputs are last-writer-wins across its legs, so
 # no job may read a value off one.
 mcons = []
@@ -2553,8 +2567,8 @@ xweb() { # [<version> <gitHead> ...] -> the packument npm serves for @o/web
     shift 2
   done
   a=$(printf '%s\n' "${v[@]}" | jq -sc 'add // {}')
-  sed -i "\\|^$NPM_WEB |d" "$CURL_DIR/docs" 2>/dev/null || true
-  echo "$NPM_WEB {\"versions\":$a}" >>"$CURL_DIR/docs"
+  sed -i "\\|^${NPM_PKG:-$NPM_WEB} |d" "$CURL_DIR/docs" 2>/dev/null || true
+  echo "${NPM_PKG:-$NPM_WEB} {\"versions\":$a}" >>"$CURL_DIR/docs"
 }
 xbarrier() { # <R> -> runs the barrier at XR1 in the clone; prints EXIT=n on failure
   : >"$GH_LOG"
@@ -2757,7 +2771,89 @@ xweb 1.1.0-dev.1 "$YW"
 out_b=$(ybarrier)
 chk "B25 its dev build releases the hold with no renumber" "$out_b|$(dispatched)" "|0"
 rm -f "$GH_DIR/on-dispatch"
+# A root-less repo whose lane alpha has a TS half: the half publishes after
+# the lane's tag, so the barrier holds for it as for a root subpackage.
+LB="$WORK/lane-barrier"
+git init -q -b main "$LB"
+LB0=$(commit_in "$LB" "feat: initial" go.work='go 1.26' alpha/go.mod='module example.com/l/alpha' alpha/a.go=v1 \
+  alpha/web/go.mod='module web-ignore' alpha/web/mod.ts=v1 alpha/web/jsr.json='{"name":"@o/alpha","version":"0.0.0"}' \
+  alpha/web/package.json='{"name":"@o/alpha","version":"0.0.0"}')
+git -C "$LB" tag alpha/v1.0.0 "$LB0"
+git -C "$LB" checkout -q -b dev
+LBG=$(commit_in "$LB" "fix(alpha): go only" alpha/a.go=v2)
+LBW=$(commit_in "$LB" "feat(alpha): web" alpha/web/mod.ts=v2)
+git -C "$LB" tag alpha/v1.1.0-dev.1 "$LBW"
+git -C "$LB" checkout -q main
+LBR0=$(GIT_COMMITTER_DATE=2026-10-01T12:00:00Z git -C "$LB" commit-tree "$LBG^{tree}" -p main -p "$LBG" -m "release: promote dev into main")
+LBR1=$(GIT_COMMITTER_DATE=2026-10-01T12:00:00Z git -C "$LB" commit-tree "$LBW^{tree}" -p "$LBR0" -p "$LBW" -m "release: promote dev into main")
+git -C "$LB" update-ref refs/heads/main "$LBR1"
+LBC="$WORK/lane-barrier-clone"
+git clone -q "$LB" "$LBC"
+git -C "$LBC" checkout -q --detach "$LBR1"
+NPM_ALPHA=https://registry.npmjs.org/@o/alpha
+lbarrier() { # <R> -> runs the barrier for lane alpha's promotion R; prints EXIT=n on failure
+  : >"$GH_LOG"
+  : >"$CURL_DIR/log"
+  rm -f "$GH_DIR/runs-calls" "$GH_DIR/runs-queries"
+  (cd "$LBC" && STATE="$(jq -nc --arg r "$1" --arg h "$LB0" '{alpha: {commit: $r, h_commit: $h, in_range: true, version: "alpha/v1.1.0"}}')" \
+  ROOT_VERSION="" WORKFLOW=release.yaml REPO_TYPE=none BARRIER_POLLS=12 RENUMBER_POLLS=4 bash "$RS" barrier) \
+    >"$WORK/barrier.log" 2>&1 || echo "EXIT=$?"
+}
+NPM_PKG=$NPM_ALPHA xweb
+NPM_PKG=$NPM_ALPHA xhook success
+out_b=$(lbarrier "$LBR1")
+chk "B38 a lane's half whose newest dev change has no dev build holds the publish behind a renumber" "$out_b|$(dispatched)" "EXIT=1|1"
+chk_has "B38 naming the half and its change" "$(cat "$WORK/barrier.log")" \
+  "subpackage alpha/web: renumber run 99 left dev's change $LBW with no dev build on npm, so the stable publish stays held"
+NPM_PKG=$NPM_ALPHA xweb
+NPM_PKG=$NPM_ALPHA xhook success 1.1.0-dev.1 "$LBW"
+out_b=$(lbarrier "$LBR1")
+chk "B38 the renumber's dev build of the half releases the hold" "$out_b|$(dispatched)" "|1"
+rm -f "$GH_DIR/on-dispatch"
+NPM_PKG=$NPM_ALPHA xweb 1.1.0-dev.1 "$LBW"
+out_b=$(lbarrier "$LBR1")
+chk "B38 a dev build of the half's change holds nothing" "$out_b|$(dispatched)" "|0"
+NPM_PKG=$NPM_ALPHA xweb
+out_b=$(lbarrier "$LBR0")
+chk "B38 a lane promotion that left the half alone holds only for the lane, reading no npm" \
+  "$(grep -c "^$NPM_ALPHA" "$CURL_DIR/log" || true)|$(grep -c 'alpha/web' "$WORK/barrier.log" || true)|$(grep -q 'lane alpha: dev holds a build past the promoted commit' "$WORK/barrier.log" && echo held)" \
+  "0|0|held"
+chk "B38 a promotion whose half git cannot read holds the publish, not read as absent" \
+  "$(failing_git '* *alpha/web/jsr.json' 1 lbarrier "$LBR1")|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
+chk_has "B38 and says so" "$(cat "$WORK/barrier.log")" "git cannot read alpha/web/jsr.json at $LBR1"
+rm -f "$GH_DIR/on-dispatch"
 mv "$GH_DIR/runs-idle.saved" "$GH_DIR/runs-idle.json"
+# The renumber run publishes a lane's half from the lane's renumbered build.
+git -C "$LB" tag alpha/v1.2.0-dev.1 "$LBW"
+git -C "$LBC" fetch -q --tags origin '+refs/heads/dev:refs/remotes/origin/dev'
+lsub() { # <checkout> -> the outputs of renumber-subpackages for lane alpha, or EXIT=n
+  : >"$WORK/out"
+  (cd "$LBC" && git checkout -q --detach "$1" && CHANNEL=dev LANE_KEY=alpha REPO_TYPE=none \
+    STATE="$(jq -nc --arg r "$LBR1" '{alpha: {commit: $r, version: "alpha/v1.1.0"}}')" \
+    GITHUB_OUTPUT="$WORK/out" bash "$RS" renumber-subpackages) >"$WORK/lsub.log" 2>&1 || {
+    echo "EXIT=$?"
+    return 0
+  }
+  tr '\n' ' ' <"$WORK/out"
+}
+NPM_PKG=$NPM_ALPHA xweb
+chk "U29 a lane's half with no dev build is published from the lane's build under its newest dev tag" \
+  "$(lsub "$LBW")" 'version=alpha/v1.2.0-dev.1 dirs=["alpha/web"] '
+NPM_PKG=$NPM_ALPHA xweb 1.2.0-dev.1 "$LBW"
+chk "U29 one npm serves from that change is left alone" "$(lsub "$LBW")" 'version=alpha/v1.2.0-dev.1 dirs=[] '
+chk "U29 a checkout that is not the lane's newest dev build is refused" "$(lsub "$LBG")" "EXIT=1"
+chk_has "U29 naming the lane" "$(cat "$WORK/lsub.log")" "HEAD is not lane alpha's newest dev build"
+chk "U29 a half git cannot read at the build publishes nothing" \
+  "$(failing_git '* HEAD -- alpha/web/jsr.json' 1 lsub "$LBW")|$(git_calls)" "EXIT=1|1"
+mkdir -p "$WORK/lbcurl"
+: >"$WORK/lbcurl/ok"
+: >"$SP_LOG"
+git -C "$LBC" checkout -q --detach "$LBW"
+(cd "$LBC" && env -u JSR_VERSION PATH="$BIN2:$PATH" CURL_DIR="$WORK/lbcurl" CI_TOOLS="$ROOT/scripts" VERSION=alpha/v1.2.0-dev.1 \
+  CHANNEL=dev DIRS='["alpha/web"]' bash "$WORK/rh-publish.sh") >"$WORK/rhpub.log" 2>&1 || echo "EXIT=$?" >>"$SP_LOG"
+chk "U29 the publish step puts the half on npm's dev dist-tag from the lane's build, at the lane's dev version" \
+  "$(grep -E '^(npm publish|published|npx|EXIT)' "$SP_LOG" | tr '\n' ';')|$(cat "$SP_LOG.version" 2>/dev/null)" \
+  "npm publish --access public --tag dev @web;published v2;|1.2.0-dev.1"
 # The renumber run publishes the subpackages the barrier would hold, from the
 # root's renumbered build.
 git -C "$XC" fetch -q --tags origin '+refs/heads/dev:refs/remotes/origin/dev'
@@ -2930,6 +3026,17 @@ chk "W23 checking the newest build out, selecting, then publishing through the s
 chk "W23 selecting only at a build, publishing only what was selected, on the dev channel" \
   "$(fact '."rsub-if"."Select the subpackages"')|$(fact '."rsub-if"."Publish the subpackages"')|$(fact '."rsub-env"."Publish the subpackages" | "\(.CHANNEL) \(.VERSION) \(.DIRS)"')" \
   "\${{ steps.target.outputs.commit != '' }}|\${{ steps.plan.outputs.dirs != '' && steps.plan.outputs.dirs != '[]' }}|dev \${{ steps.plan.outputs.version }} \${{ steps.plan.outputs.dirs }}"
+chk "W30 a renumber run publishes each lane's half after the lane renumber, with OIDC and no other write scope" \
+  "$(fact '."rh-needs" | join(" ")')|$(fact '."rh-perms" | tojson')|$(fact '."rh-strategy" | tojson')" \
+  'detect renumber-tag|{"contents":"read","id-token":"write"}|{"fail-fast":false,"matrix":{"lane":"${{ fromJSON(needs.detect.outputs.go_halves) }}"}}'
+chk "W30 once the lane renumber succeeded or had nothing to do, in renumber mode, in a repo with halves" \
+  "$(fact '."rh-gate" | map(tostring) | join(" ")')" "true true false false false"
+chk "W30 checking the lane's newest build out, selecting, then publishing through the shared script" \
+  "$(fact '."rh-steps" | join(",")')|$(grep -c 'publish-subpackage.sh' "$WORK/rh-publish.sh")" \
+  "Checkout,Check out the ci source,Check out the newest build,Select the half,Setup Node.js,Publish the half|1"
+chk "W30 for the leg's lane, selecting only at a build and publishing only what was selected, on the dev channel" \
+  "$(fact '."rh-env"."Check out the newest build".LANE_KEY')|$(fact '."rh-env"."Select the half".LANE_KEY')|$(fact '."rh-if"."Select the half"')|$(fact '."rh-if"."Publish the half"')|$(fact '."rh-env"."Publish the half" | "\(.CHANNEL) \(.VERSION) \(.DIRS)"')" \
+  "\${{ matrix.lane }}|\${{ matrix.lane }}|\${{ steps.target.outputs.commit != '' }}|\${{ steps.plan.outputs.dirs != '' && steps.plan.outputs.dirs != '[]' }}|dev \${{ steps.plan.outputs.version }} \${{ steps.plan.outputs.dirs }}"
 chk "W13 checking that build out and installing before it tags" \
   "$(fact '."renumber-npm-steps" | join(",")')" "Checkout,Check out the ci source,Move the ci source out of the package,Check out the numbered build,Setup Node.js,Install dependencies,Renumber"
 chk "W14 an image repair installs the pinned cosign" "$(fact '."repair-if"."Install Cosign"')|$(fact '."repair-cosign"')" \

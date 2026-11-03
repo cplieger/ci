@@ -1293,6 +1293,81 @@ jobs:
             (cd "$dir" && bash "$CI_TOOLS/publish-subpackage.sh")
           done < <(jq -r '.[]' <<<"$DIRS")
 
+  # A lane's TS half follows its lane's renumber as a subpackage follows the
+  # root's, one leg per lane.
+  renumber-halves:
+    needs: [detect, renumber-tag]
+    if: |
+      !cancelled() && needs.detect.outputs.mode == 'renumber' && needs.detect.outputs.go_halves != '[]'
+      && (needs.renumber-tag.result == 'success' || needs.renumber-tag.result == 'skipped')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJSON(needs.detect.outputs.go_halves) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Check out the newest build
+        id: target
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          LANE_KEY: ${{ matrix.lane }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber-target
+
+      - name: Select the half
+        id: plan
+        if: ${{ steps.target.outputs.commit != '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: dev
+          STATE: ${{ needs.detect.outputs.lane_state }}
+          LANE_KEY: ${{ matrix.lane }}
+          REPO_TYPE: ${{ needs.detect.outputs.type }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" renumber-subpackages
+
+      - name: Setup Node.js
+        if: ${{ steps.plan.outputs.dirs != '' && steps.plan.outputs.dirs != '[]' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish the half
+        if: ${{ steps.plan.outputs.dirs != '' && steps.plan.outputs.dirs != '[]' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          VERSION: ${{ steps.plan.outputs.version }}
+          DIRS: ${{ steps.plan.outputs.dirs }}
+          CHANNEL: dev
+        run: |
+          set -euo pipefail
+          while IFS= read -r dir; do
+            (cd "$dir" && bash "$CI_TOOLS/publish-subpackage.sh")
+          done < <(jq -r '.[]' <<<"$DIRS")
+
   # ─── Docker image build + sign + SBOM + release (delegated) ────────────────
   # On dev a build is due only when a new dev version is (root_changed and
   # this commit untagged); on stable the job also runs with nothing to publish,
