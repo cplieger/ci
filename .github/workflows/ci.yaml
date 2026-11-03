@@ -375,8 +375,8 @@ jobs:
   # repository, one nested module, one with JavaScript but no npm project and
   # one with no program, so a pin set that makes deadset refuse or give no
   # answer fails here before a release carries it. `off` still fails exit 2
-  # and 3; findings at the frozen commits do not. Refresh a ref only when its repository stops
-  # representing its shape.
+  # and 3; findings at the frozen commits do not. Refresh a ref only when its
+  # repository stops representing its shape.
   deadset-canary:
     needs: detect
     if: ${{ github.repository == 'cplieger/ci' && needs.detect.outputs.code_changed == 'true' }}
