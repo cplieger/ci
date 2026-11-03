@@ -265,15 +265,15 @@ NO_PROGRAM = (
     'setup failure: no-program: no file under /w puts a language in scope, so it holds no '
     'program; run from the directory that holds a program'
 )
+UNSUPPORTED = (
+    'setup failure: unsupported-language: the census of /w puts only "proto" in scope, and '
+    'this build holds no reader of it; run a release of deadset that holds its reader'
+)
 # What deadset v2.0.0-dev.24 prints when deadset-ts finds no inputs in a lone
 # tsconfig.json.
 TS_NO_PROGRAM = (
     'setup failure: no-program: no configuration discovery derived could be built; '
     "tsconfig.json: TS18003: No inputs were found in config file 'tsconfig.json'."
-)
-UNSUPPORTED = (
-    'setup failure: unsupported-language: the census of /w puts only "proto" in scope, and '
-    'this build holds no reader of it; run a release of deadset that holds its reader'
 )
 
 
@@ -540,7 +540,6 @@ class Census(Harness):
             (census('go'), ('true', 'true', 'false')),
             (census('ts'), ('true', 'false', 'true')),
             (census('go', 'ts'), ('true', 'true', 'true')),
-            (census('go', analyzers=[]), ('true', 'false', 'false')),
         )
         lock = {'package-lock.json': '{}'}
         for document, want in cases:
@@ -585,7 +584,7 @@ class Census(Harness):
         self.assert_unknown(run, '::error::deadset print-languages exited 127')
 
     def test_a_census_that_names_no_analyzers_fails(self):
-        for document in ('', 'not json', '{}', '{"analyzers": null}'):
+        for document in ('', 'not json', '{}', '{"analyzers": null}', '{"analyzers": []}'):
             with self.subTest(census=document):
                 run = self.ask(GO_ONLY, document)
                 self.assert_unknown(run, 'wrote no census naming its analyzers')
