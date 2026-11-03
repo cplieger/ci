@@ -32,9 +32,8 @@ unleash:
     efficacy: 0
     mutant-coverage: 0
 
-  # Files where mutation testing produces stuck "live mutant" or never-covered
-  # findings without adding signal — kept out of the analysis to keep the
-  # score honest.
+  # Files where mutation testing produces stuck "live mutant" findings without
+  # adding signal — kept out of the analysis to keep the score honest.
   #
   # These are Go (RE2) REGULAR EXPRESSIONS, matched with regexp.MatchString
   # against each repo-relative file path (forward slashes, e.g.
@@ -47,11 +46,6 @@ unleash:
   #   ^foo\.go$       foo.go at the repo root only
   #   (^|/)bar/       anything under a bar/ directory at any depth
   exclude-files:
-    # Directories the go tool never builds (`go help packages`), so no test
-    # can cover them: testdata/ and names starting with "." or "_"
-    - '(^|/)testdata/'
-    - '(^|/)[._][^/]*/'
-
     # Universal lifecycle / bootstrapping
     - '(^|/)main\.go$'
 

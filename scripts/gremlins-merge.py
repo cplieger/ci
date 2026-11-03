@@ -10,12 +10,12 @@ every coverage-profile line to key blocks by repo-relative filename
 packages carry a different module path, and a root `go test ./...` cannot run
 their tests at all. When the root tests do not compile those files either, their
 mutants come back `NOT COVERED` no matter how good that module's own suite is;
-when an in-tree `replace` the root tests import does compile them, the root
-suite gives them a real verdict instead. Measured on cplieger/envx: its `yamlenv`
-subdirectory (own `go.mod`, own suite at 98.6% coverage) contributed 43
-analysed / 43 uncovered / 0 killed / 0 lived, which dragged the repo's
-published mutant coverage to 41.4% — a number that described a module boundary,
-not a test suite.
+when an in-tree `replace` the root tests import compiles them and the run is in
+integration mode (`--coverpkg ./...`), the root suite gives them a real verdict
+instead. Measured on cplieger/envx: its `yamlenv` subdirectory (own `go.mod`,
+own suite at 98.6% coverage) contributed 43 analysed / 43 uncovered / 0 killed /
+0 lived, which dragged the repo's published mutant coverage to 41.4%, a number
+that described a module boundary, not a test suite.
 
 So the weekly runner unleashes gremlins once per module. That yields several
 JSON results per attempt, while everything downstream — `gremlins-aggregate.py`,

@@ -410,6 +410,8 @@ def animap_fixture(repo: Path) -> None:
         'mapread/encode.go': 'package mapread\n',
         'mapread/decode.go': 'package mapread\n',
         'mapread/encode_test.go': 'package mapread\n',
+        'static/ui/go.mod': 'module github.com/cplieger/animap/static/ui\n\ngo 1.26\n',
+        'static/ui/ui.go': 'package ui\n',
     }
     for name, text in files.items():
         (repo / name).parent.mkdir(parents=True, exist_ok=True)
@@ -420,9 +422,11 @@ def animap_fixture(repo: Path) -> None:
     subprocess.run([*git, 'commit', '-qm', 'fixture'], check=True)
 
 
-def run_scope(target: Path, *modules: str, config: Path = CENTRAL) -> subprocess.CompletedProcess:
+def run_scope(target: Path, *modules: str, config: Path = CENTRAL,
+              excludes: tuple[str, ...] = ()) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, str(SCOPE), '--config', str(config), '--target', str(target), '--', *modules],
+        [sys.executable, str(SCOPE), '--config', str(config), '--target', str(target),
+         *(f'--exclude-dir={d}' for d in excludes), '--', *modules],
         capture_output=True, text=True, check=False,
     )
 
@@ -432,7 +436,8 @@ def test_workflow_scopes_root_run_off_nested_module(tmp: Path) -> None:
 
     The root tests compile mapread/*.go through the replace, so a root run that
     mutates them records real verdicts the merge must refuse. The root's
-    gremlins scope has to stop at the nested module's directory.
+    gremlins scope has to stop at the nested module's directory, and at the
+    static/ui module Discover prunes and so never measures.
     """
     discover = workflow_step('Discover Go modules to measure')
     sync = workflow_step('Sync central .gremlins.yaml (authoritative for the weekly run)')
@@ -447,11 +452,14 @@ def test_workflow_scopes_root_run_off_nested_module(tmp: Path) -> None:
     bash = ['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c']
     proc = subprocess.run([*bash, discover], cwd=tmp, env=env, capture_output=True, text=True,
                           check=False)
-    modules = (tmp / 'out').read_text().strip() if (tmp / 'out').exists() else ''
-    check('workflow scope: Discover finds the root and the nested module',
-          ok=proc.returncode == 0 and modules == 'modules=. mapread',
-          detail=f'rc={proc.returncode} {modules!r} {proc.stderr[-300:]}')
-    proc = subprocess.run([*bash, sync], cwd=tmp, env={**env, 'MODULES': modules[len('modules='):]},
+    outputs = dict(line.split('=', 1) for line in
+                   ((tmp / 'out').read_text().splitlines() if (tmp / 'out').exists() else []))
+    check('workflow scope: Discover measures the root and mapread, not the pruned module',
+          ok=proc.returncode == 0 and outputs == {'modules': '. mapread', 'unmeasured': 'static/ui'},
+          detail=f'rc={proc.returncode} {outputs!r} {proc.stderr[-300:]}')
+    proc = subprocess.run([*bash, sync], cwd=tmp,
+                          env={**env, 'MODULES': outputs.get('modules', ''),
+                               'UNMEASURED': outputs.get('unmeasured', '')},
                           capture_output=True, text=True, check=False)
     check('workflow scope: Sync succeeds', ok=proc.returncode == 0, detail=proc.stderr[-300:])
     if proc.returncode != 0:
@@ -460,6 +468,8 @@ def test_workflow_scopes_root_run_off_nested_module(tmp: Path) -> None:
     check('workflow scope: the root run mutates no file of the nested module',
           ok=root_scope == ['animap.go', 'cmd/animap/verify.go', 'mapreader/reader.go'],
           detail=str(root_scope))
+    check('workflow scope: the pruned module gets no config of its own',
+          ok=not (tmp / 'target' / 'static' / 'ui' / '.gremlins.yaml').exists())
     nested_scope = gremlins_scope(tmp / 'target' / 'mapread')
     check('workflow scope: the nested run still mutates its own files',
           ok=nested_scope == ['decode.go', 'encode.go'], detail=str(nested_scope))
@@ -488,6 +498,22 @@ def test_scope_excludes_every_deeper_module(tmp: Path) -> None:
           ok=all(p in exclude_patterns((tmp / '.gremlins.yaml').read_text()) for p in central))
 
 
+def test_scope_excludes_an_unmeasured_module(tmp: Path) -> None:
+    """An --exclude-dir module is cut from every outer module and gets no copy."""
+    (tmp / 'x' / 'static' / 'y').mkdir(parents=True)
+    proc = run_scope(tmp, '.', 'x', excludes=('x/static/y',))
+    check('scope unmeasured: succeeds', ok=proc.returncode == 0, detail=proc.stderr[-300:])
+    if proc.returncode != 0:
+        return
+    central = exclude_patterns(CENTRAL.read_text())
+    added = {d: [p for p in exclude_patterns((tmp / d / '.gremlins.yaml').read_text())
+                 if p not in central] for d in ('.', 'x')}
+    check('scope unmeasured: each outer copy excludes it',
+          ok=added == {'.': ['^x/', '^x/static/y/'], 'x': ['^static/y/']}, detail=str(added))
+    check('scope unmeasured: it gets no config of its own',
+          ok=not (tmp / 'x' / 'static' / 'y' / '.gremlins.yaml').exists())
+
+
 def test_scope_takes_a_dash_dir_as_a_module(tmp: Path) -> None:
     """Discover's charset admits a leading '-'; it must reach the script as a dir, not an option."""
     (tmp / '-h').mkdir()
@@ -504,7 +530,7 @@ def test_scope_takes_a_dash_dir_as_a_module(tmp: Path) -> None:
     (tmp / 'scripts').symlink_to(HERE)
     (tmp / 'configs').symlink_to(CENTRAL.parent)
     proc = subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', sync],
-                          cwd=tmp, env={**os.environ, 'MODULES': ' . -h'},
+                          cwd=tmp, env={**os.environ, 'MODULES': ' . -h', 'UNMEASURED': ''},
                           capture_output=True, text=True, check=False)
     check('scope dash dir: the workflow Sync step passes it as a dir',
           ok=proc.returncode == 0 and (tmp / 'target' / '-h' / '.gremlins.yaml').is_file(),
@@ -521,20 +547,9 @@ def test_scope_refuses_what_it_cannot_scope(tmp: Path) -> None:
     proc = run_scope(tmp, '.', 'a b')
     check('scope refusal: a dir outside the safe charset exits non-zero',
           ok=proc.returncode != 0 and 'characters' in proc.stderr, detail=proc.stderr[-300:])
-
-
-def test_central_config_skips_dirs_go_never_builds(tmp: Path) -> None:
-    """testdata/ and "."/"_" dirs are never compiled, so their mutants could only read NOT COVERED."""
-    files = ('lib.go', 'testdata/fixture.go', 'pkg/testdata/gen.go', '_examples/ex.go',
-             'pkg/.cache/c.go', 'pkg/my_testdata/keep.go', 'a_b/keep.go', 'pkg/x.y/keep.go')
-    for f in files:
-        (tmp / f).parent.mkdir(parents=True, exist_ok=True)
-        (tmp / f).write_text('package x\n')
-    (tmp / '.gremlins.yaml').write_text(CENTRAL.read_text())
-    scope = gremlins_scope(tmp)
-    check('central config: unbuilt dirs are out of scope, look-alikes stay in',
-          ok=scope == ['a_b/keep.go', 'lib.go', 'pkg/my_testdata/keep.go', 'pkg/x.y/keep.go'],
-          detail=str(scope))
+    proc = run_scope(tmp, '.', excludes=('a b',))
+    check('scope refusal: an --exclude-dir outside the safe charset exits non-zero',
+          ok=proc.returncode != 0 and 'characters' in proc.stderr, detail=proc.stderr[-300:])
 
 
 # ---------------------------------------------------------------------------
@@ -1097,9 +1112,9 @@ def main() -> int:
         test_root_module_required,
         test_workflow_scopes_root_run_off_nested_module,
         test_scope_excludes_every_deeper_module,
+        test_scope_excludes_an_unmeasured_module,
         test_scope_takes_a_dash_dir_as_a_module,
         test_scope_refuses_what_it_cannot_scope,
-        test_central_config_skips_dirs_go_never_builds,
         test_aggregate_consumes_merged_output,
         test_aggregate_flags_disagreeing_verdicts,
         test_aggregate_flags_sudden_perfect_week,
