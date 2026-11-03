@@ -399,10 +399,11 @@ chk "D-P11 the policy hands every image repository the same keys" \
 # ── Stub curl: the anonymous GHCR token and manifest HEADs ───────────────────
 # BUILT lists the commits that have a `sha-<commit>` tag on the registry;
 # PKGS lists "<image> <digest>" and TAGS "<image>:<tag> <digest>" lines that
-# exist. CURL_DOWN makes every registry read fail as a network error.
+# exist. CURL_DOWN makes every registry read fail as a network error, and
+# TOKEN_STATUS=403 is GHCR's answer for a package that does not exist yet.
 BIN="$WORK/bin"
 mkdir -p "$BIN"
-export BUILT="$WORK/built" PKGS="$WORK/pkgs" TAGS="$WORK/tags" CURL_DOWN=""
+export BUILT="$WORK/built" PKGS="$WORK/pkgs" TAGS="$WORK/tags" CURL_DOWN="" TOKEN_STATUS=200
 : >"$PKGS"
 : >"$TAGS"
 cat >"$BIN/curl" <<'SH'
@@ -410,15 +411,24 @@ cat >"$BIN/curl" <<'SH'
 OUT=
 URL=
 FAIL=0
+CODE=0
 take_out=0
+take_w=0
 for a in "$@"; do
   if [ "$take_out" = 1 ]; then
     OUT=$a
     take_out=0
     continue
   fi
+  if [ "$take_w" = 1 ]; then
+    [ "$a" = '%{http_code}' ] || { printf 'stub: unexpected -w %s\n' "$a" >&2 && exit 22; }
+    CODE=1
+    take_w=0
+    continue
+  fi
   case $a in
     -o) take_out=1 ;;
+    -w) take_w=1 ;;
     --*) ;;
     -*f*) FAIL=1 ;;
     http*) URL=$a ;;
@@ -439,7 +449,11 @@ case "$URL" in
     exit 0
     ;;
   */token?*)
-    if [ -n "$OUT" ]; then printf '{"token":"stub"}\n' >"$OUT"; else printf '{"token":"stub"}\n'; fi
+    body='{"token":"stub"}'
+    [ "$TOKEN_STATUS" = 200 ] || body='{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}'
+    [ "$TOKEN_STATUS" = 200 ] || [ "$FAIL" = 0 ] || exit 22
+    if [ -n "$OUT" ]; then printf '%s\n' "$body" >"$OUT"; else printf '%s\n' "$body"; fi
+    [ "$CODE" = 0 ] || printf '%s' "$TOKEN_STATUS"
     exit 0
     ;;
 esac
@@ -729,6 +743,14 @@ chk_has "D-W14 and names it" "$(cat "$WORK/promote.log")" "cannot read the subje
 r=$(promote_at "$C_DOCS" "$EXCLUDE_RE_FULL")
 chk "D-W7 no dev build anywhere builds from source" "${r%|*}|$(out promote_via)" "|none"
 chk_has "D-W7 summary says so" "$(cat "$WORK/summary")" "No dev build could be reused"
+r=$(TOKEN_STATUS=403 promote_at "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")
+chk "D-W17 a package that does not exist yet builds from source" \
+  "$r|$(out promote_via)|$(grep -c '^EXIT=' "$WORK/promote.log" || true)" "|$C_DOCS|none|0"
+chk_has "D-W17 and says why" "$(cat "$WORK/promote.log")" "ghcr.io/owner/app does not exist yet"
+r=$(TOKEN_STATUS=500 promote_at "$C_DOCS" "$EXCLUDE_RE_FULL" "$C_BUILT")
+chk "D-W17 any other refused token fails the step, neither reusing nor building" \
+  "$r|$(sed -n 's/^EXIT=//p' "$WORK/promote.log")" "||1"
+chk_has "D-W17 naming the status" "$(cat "$WORK/promote.log")" "answered HTTP 500"
 r=$(promote_at "$C_DOCS" "" "$C_BUILT")
 chk "D-W8 an empty exclusion list accepts only an exact hit" "${r%|*}" ""
 r=$(promote_at "$C_DOCS3" "$EXCLUDE_RE_FULL" "$C_BUILT" "$C_REVERT" "$C_DOCS3")
@@ -842,6 +864,10 @@ chk_has "D-M3 a digest retention deleted is refused, never built" "$out_m" "A pr
 chk "D-M3 and fails the step" "$(printf '%s' "$out_m" | sed -n 's/^EXIT=//p')" "1"
 out_m=$(cd "$REC" && GITHUB_SHA="$R_BARE" EXCLUDE_RE="$EXCLUDE_RE_FULL" run_step promote.sh)
 chk_has "D-M3 a promotion without its trailer is refused" "$out_m" "no single well-formed Promoted-Digest trailer"
+out_m=$(cd "$REC" && TOKEN_STATUS=403 GITHUB_SHA="$R" EXCLUDE_RE="$EXCLUDE_RE_FULL" run_step promote.sh)
+chk_has "D-M3 a promotion into a package that does not exist is refused, never built" "$out_m" \
+  "promotes a digest of ghcr.io/owner/app, which does not exist"
+chk "D-M3 and fails the step with no digest" "$(printf '%s' "$out_m" | sed -n 's/^EXIT=//p')|$(out promote_digest)" "1|"
 out_m=$(cd "$REC" && CURL_DOWN=1 GITHUB_SHA="$R" EXCLUDE_RE="$EXCLUDE_RE_FULL" run_step promote.sh)
 chk_has "D-M3 an unreadable registry is refused, never built" "$out_m" "could not read ghcr.io/owner/app@${D_T}"
 r=$(promote_at "$S" "$EXCLUDE_RE_FULL" "$M0" "$M1" "$T1")
