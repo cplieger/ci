@@ -223,6 +223,7 @@ LICENSE_OVERRIDES = {
     # adds; rationed because it also puts AGPL on corporate blocklists.
     'subflux': 'AGPL-3.0',
     'marotte': 'AGPL-3.0',
+    'grelot': 'AGPL-3.0',
 }
 
 # HARD merge model: squash only, the PR title as the changelog line, and
