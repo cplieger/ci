@@ -89,7 +89,7 @@ open(f"{out}/receipt-step.sh", "w").write(vp["run"])
 facts = {}
 d = {s.get("name"): s for s in jobs["detect"]["steps"]}
 for name in ("Find pending promotions", "Install git-cliff for promotion numbering", "Number pending promotions",
-             "Read release receipts"):
+             "Compute version (cliff)", "Read release receipts"):
     facts[f"if:{name}"] = d[name].get("if", "")
 facts["cliff-with"] = d["Compute version (cliff)"]["with"]
 facts["names"] = [s.get("name") for s in jobs["detect"]["steps"]]
@@ -256,6 +256,9 @@ for t in ("docker", "go", "ts"):
     outs = {"type": t, "channel": "stable", "mode": "normal", "release": "true", "root_changed": "true", "subpackages_to_publish": '["web"]', "go_modules_to_release": '["yamlenv"]'}
     for r, b in (("success", "success"), ("skipped", "skipped"), ("failure", "skipped"), ("skipped", "failure"), ("cancelled", "skipped")):
         sim[f"{t} repair={r} barrier={b}"] = simulate({"repair": r, "barrier": b}, outs)
+for r in ("true", "false"):
+    outs = {"type": "none", "channel": "stable", "mode": "normal", "release": r, "root_changed": "true", "subpackages_to_publish": "[]", "go_modules_to_release": '["alpha", "beta"]'}
+    sim[f"none release={r}"] = simulate({"repair": "skipped", "barrier": "skipped"}, outs)
 facts["gate-sim"] = sim
 rsub = {}
 for tag_r, npm_r, mode, subs in (("success", "skipped", "renumber", '["web"]'), ("skipped", "success", "renumber", '["web"]'),
@@ -361,10 +364,10 @@ chk "C4 and the repository's visibility and fork flag" \
 chk "C4 every detect step follows Select channel" "$(fact '.names | index("Select channel")')" "1"
 
 # ── Select version: the release decision ─────────────────────────────────────
-select_out() { # <channel> <mode> <root_changed> <subs> <anchor> <base> -> outputs on one line
+select_out() { # <channel> <mode> <root_changed> <subs> <anchor> <base> [repo type] -> outputs on one line
   : >"$WORK/out"
   CHANNEL="$1" MODE="$2" ROOT_CHANGED="$3" SUBPACKAGES_TO_PUBLISH="$4" ANCHOR_SHA="$5" GITHUB_SHA=head \
-    BASE="$6" DEV_VERSION="$6-dev.1" LATEST=v1.2.0 \
+    BASE="$6" DEV_VERSION="${6:+$6-dev.1}" LATEST=v1.2.0 REPO_TYPE="${7:-go}" \
     GITHUB_OUTPUT="$WORK/out" bash "$WORK/select.sh" >/dev/null 2>&1 || echo "EXIT=$?" >>"$WORK/out"
   tr '\n' ' ' <"$WORK/out"
 }
@@ -380,6 +383,18 @@ chk "C6 renumber publishes nothing" "$(select_out dev renumber true '[]' older v
 chk "C6 renumber still names the dev version" "$(select_out dev renumber true '[]' older v1.3.0 | cut -d' ' -f1)" "version=v1.3.0-dev.1"
 chk_has "C6 Select version reads the mode" "$(cat "$WORK/select-env.txt")" "MODE"
 chk "C7 detect has 5 minutes" "$(fact '."detect-timeout"')" "5"
+# A root with no Dockerfile, jsr.json or go.mod ships nothing of its own: its
+# nested lanes release in go-nested, so the root computes no version.
+chk "C8 a root-less repo computes no root version" "$(fact '."if:Compute version (cliff)"')" \
+  "\${{ steps.type.outputs.type != 'none' }}"
+chk_has "C8 Select version reads the repo type" "$(cat "$WORK/select-env.txt")" "REPO_TYPE"
+chk "C8 so a root-less stable run releases nothing at the root" "$(select_out stable normal true '[]' older "" none)" \
+  "version= release=false base= dev_version= "
+chk "C8 nor a root-less dev run" "$(select_out dev normal true '[]' older "" none)" \
+  "version= release=false base= dev_version= "
+chk "C8 a root-less repo with a root subpackage is refused: no root version exists to publish it at" \
+  "$(select_out stable normal false '["web"]' older "" none)" "EXIT=1 "
+chk "C8 a typed root still refuses an empty base" "$(select_out dev normal true '[]' older "" docker)" "EXIT=1 "
 
 # ── Stubs ────────────────────────────────────────────────────────────────────
 BIN="$WORK/bin"
@@ -723,6 +738,9 @@ chk "P2 a root-only R leaves the nested lane non-pending" "$(lane yamlenv commit
 chk "P2 and the lane's kind line is the main-built one" "$(lane yamlenv kind_note "$s")" \
   'Built from `main` for dependency and system-package updates'
 chk "P3 the lane matrix lists the root and the lane" "$(outkey lanes)" '[{"key":".","lane":""},{"key":"yamlenv","lane":"yamlenv"}]'
+s=$(REPO_TYPE=none pending_at "$O" stable)
+chk "P3 a root-less repo's state and lane matrix hold its lanes only" "$(jq -c 'keys' <<<"$s")|$(outkey lanes)|$(outkey root_in_range)" \
+  '["yamlenv"]|[{"key":"yamlenv","lane":"yamlenv"}]|false'
 
 S1=$(commit_in "$O" "fix(deps): update module example.org/x" go.sum=b)
 s=$(pending_at "$O" stable)
@@ -2813,6 +2831,8 @@ for t in docker go ts; do
     chk "W21 a $t repo writes nothing when $g" "$(fact ".\"gate-sim\".\"$t $g\"")" ""
   done
 done
+chk "W21 a root-less repo releases only its lanes, whatever the root's release flag" \
+  "$(fact '."gate-sim"."none release=true"')|$(fact '."gate-sim"."none release=false"')" "go-nested|go-nested"
 chk "W21 the subpackage job reads both gates itself" "$(fact '."needs:subpackage" | join(" ")')" "detect repair barrier docker ts go"
 gate() { # <repair-notes result> <repair-release result> <repair-publish result> -> ok|refused
   NOTES=$1 RELEASE=$2 PUBLISH=$3 bash "$WORK/repair-gate.sh" >/dev/null 2>&1 && echo ok || echo refused

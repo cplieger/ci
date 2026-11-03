@@ -281,6 +281,7 @@ jobs:
 
       - name: Compute version (cliff)
         id: cliff
+        if: ${{ steps.type.outputs.type != 'none' }}
         uses: ./.cplieger-ci/actions/git-cliff-version
         with:
           channel: ${{ steps.channel.outputs.channel }}
@@ -347,12 +348,14 @@ jobs:
       # level. A changed TS subpackage counts: it
       # shares the root version, so its publish needs the root tag the go job
       # creates, while the root image rebuilds on root_changed alone. A
-      # renumber run publishes nothing here; the renumber jobs tag it.
+      # renumber run publishes nothing here; the renumber jobs tag it. A
+      # root-less repo (type none) releases only its nested lanes.
       - name: Select version
         id: select
         env:
           CHANNEL: ${{ steps.channel.outputs.channel }}
           MODE: ${{ steps.channel.outputs.mode }}
+          REPO_TYPE: ${{ steps.type.outputs.type }}
           ROOT_CHANGED: ${{ steps.publish.outputs.root_changed || steps.ahead.outputs.root_changed || steps.changes.outputs.root_changed }}
           SUBPACKAGES_TO_PUBLISH: ${{ steps.publish.outputs.subpackages_to_publish || steps.ahead.outputs.subpackages_to_publish || steps.changes.outputs.subpackages_to_publish }}
           BASE: ${{ steps.cliff.outputs.base }}
@@ -361,6 +364,20 @@ jobs:
           ANCHOR_SHA: ${{ steps.cliff.outputs.anchor_sha }}
         run: |
           set -euo pipefail
+          if [ "$REPO_TYPE" = none ]; then
+            if [ "$SUBPACKAGES_TO_PUBLISH" != "[]" ]; then
+              echo "::error::TS subpackages ${SUBPACKAGES_TO_PUBLISH} share the root version, but this root has no Dockerfile, jsr.json or go.mod, so it has none. Move each into a nested Go module's web/ directory, or give the root a type."
+              exit 1
+            fi
+            {
+              echo "version="
+              echo "release=false"
+              echo "base="
+              echo "dev_version="
+            } >> "$GITHUB_OUTPUT"
+            echo "Selected: no root release (the root has no Dockerfile, jsr.json or go.mod); nested lanes release on their own"
+            exit 0
+          fi
           if [ -z "$BASE" ]; then
             echo "::error::git-cliff-version returned no base"
             exit 1
