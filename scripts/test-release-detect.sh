@@ -138,6 +138,23 @@ facts["ahead-order"] = facts["names"].index("Detect changed paths") < facts["nam
     "Drop dev builds of stable code") < facts["names"].index("Select version")
 facts["publish-after"] = facts["names"].index("Detect changed paths") < facts["names"].index(
     "Add pending promotions to the publication") < facts["names"].index("Select version")
+open(f"{out}/type.sh", "w").write(d["Detect type + subpackages"]["run"])
+open(f"{out}/gomodules.sh", "w").write(d["Detect nested Go modules"]["run"])
+hv = d.get("Find the lane halves to publish", {})
+facts["halves-if"] = " ".join(hv.get("if", "").split())
+facts["halves-env"] = hv.get("env", {})
+facts["halves-order"] = bool(hv) and facts["names"].index("Add pending promotions to the publication") < facts["names"].index(
+    "Find the lane halves to publish") < facts["names"].index("Select version")
+lh = jobs.get("lane-halves", {"steps": []})
+facts["lh-needs"] = lh.get("needs")
+facts["lh-if"] = " ".join(str(lh.get("if", "")).split())
+facts["lh-perms"] = lh.get("permissions")
+facts["lh-strategy"] = lh.get("strategy")
+facts["lh-steps"] = [s.get("name") for s in lh["steps"]]
+lhp = next((s for s in lh["steps"] if s.get("name") == "Publish the lane's TS half"), {"run": "exit 99"})
+open(f"{out}/half-publish.sh", "w").write(lhp["run"])
+facts["lh-env"] = lhp.get("env", {})
+facts["lh-wd"] = lhp.get("working-directory", "")
 facts["renumber-steps"] = [s.get("name") for s in jobs["renumber"]["steps"]]
 facts["renumber-if"] = {s.get("name"): s.get("if", "") for s in jobs["renumber"]["steps"]}
 facts["renumber-tag-steps"] = [s.get("name") for s in jobs["renumber-tag"]["steps"]]
@@ -253,12 +270,16 @@ def simulate(gates, outs):
     return " ".join(n for n in writers if res[n] == "success")
 sim = {}
 for t in ("docker", "go", "ts"):
-    outs = {"type": t, "channel": "stable", "mode": "normal", "release": "true", "root_changed": "true", "subpackages_to_publish": '["web"]', "go_modules_to_release": '["yamlenv"]'}
+    outs = {"type": t, "channel": "stable", "mode": "normal", "release": "true", "root_changed": "true", "subpackages_to_publish": '["web"]', "go_modules_to_release": '["yamlenv"]', "halves_to_publish": '["yamlenv"]'}
     for r, b in (("success", "success"), ("skipped", "skipped"), ("failure", "skipped"), ("skipped", "failure"), ("cancelled", "skipped")):
         sim[f"{t} repair={r} barrier={b}"] = simulate({"repair": r, "barrier": b}, outs)
 for r in ("true", "false"):
-    outs = {"type": "none", "channel": "stable", "mode": "normal", "release": r, "root_changed": "true", "subpackages_to_publish": "[]", "go_modules_to_release": '["alpha", "beta"]'}
+    outs = {"type": "none", "channel": "stable", "mode": "normal", "release": r, "root_changed": "true", "subpackages_to_publish": "[]", "go_modules_to_release": '["alpha", "beta"]', "halves_to_publish": '["alpha"]'}
     sim[f"none release={r}"] = simulate({"repair": "skipped", "barrier": "skipped"}, outs)
+outs["halves_to_publish"] = "[]"
+sim["none no halves"] = simulate({"repair": "skipped", "barrier": "skipped"}, outs)
+outs["mode"], outs["halves_to_publish"] = "renumber", '["alpha"]'
+sim["none renumber"] = simulate({"repair": "skipped", "barrier": "skipped"}, outs)
 facts["gate-sim"] = sim
 rsub = {}
 for tag_r, npm_r, mode, subs in (("success", "skipped", "renumber", '["web"]'), ("skipped", "success", "renumber", '["web"]'),
@@ -1481,7 +1502,7 @@ chk "R18 a subpackage missing from JSR is not receipted either" "$(hreadback '["
 rm "$GH_DIR/release-v1.1.0"
 
 # The subpackage job publishes through the shared script.
-sp_run() { # <channel> <npm has it: y|n> <jsr has it: y|n> -> the npm and npx calls, then jsr.json
+sp_run() { # <channel> <npm has it: y|n> <jsr has it: y|n> [version] -> the npm and npx calls, then jsr.json
   local d c
   d=$(mktemp -d "$WORK/sp.XXXXXX")
   c="$d/curl"
@@ -1493,7 +1514,7 @@ sp_run() { # <channel> <npm has it: y|n> <jsr has it: y|n> -> the npm and npx ca
   [ "$2" = n ] || echo "https://registry.npmjs.org/@o/web/2.0.0" >>"$c/ok"
   [ "$3" = n ] || echo 'https://jsr.io/@o/web/meta.json {"versions":{"2.0.0":{}}}' >"$c/docs"
   : >"$SP_LOG"
-  (cd "$d/web" && PATH="$BIN2:$PATH" CURL_DIR="$c" VERSION=v2.0.0 CHANNEL="$1" CI_TOOLS="$ROOT/scripts" \
+  (cd "$d/web" && PATH="$BIN2:$PATH" CURL_DIR="$c" VERSION="${4:-v2.0.0}" CHANNEL="$1" CI_TOOLS="$ROOT/scripts" \
     JSR_VERSION="$(fact '."subpkg-env".JSR_VERSION')" bash "$WORK/subpkg-new.sh") >/dev/null 2>&1 || echo "EXIT=$?"
   cat "$SP_LOG" "$d/web/jsr.json"
 }
@@ -1501,6 +1522,131 @@ chk_has "R20 a stable publish reaches npm" "$(sp_run stable n n)" "npm publish -
 chk_has "R20 and JSR" "$(sp_run stable n n)" "npx -y jsr@0.14.3 publish --allow-dirty @web"
 chk_lacks "R20 a version both registries hold is published to neither" "$(sp_run stable y y)" "publish"
 chk_lacks "R20 and the shared script runs to the end" "$(sp_run stable n n)$(sp_run dev n n)" "EXIT="
+chk_has "R20 a root version publishes as itself" "$(sp_run stable n n v2.0.0)|$(cat "$SP_LOG.version")" '"version": "2.0.0"
+}|2.0.0'
+chk_has "R20 a lane tag publishes at the lane's version" "$(sp_run stable n n alpha/v2.0.0)|$(cat "$SP_LOG.version")" '"version": "2.0.0"
+}|2.0.0'
+
+# ── A nested lane's TS half: <lane>/web, at the lane's version ───────────────
+L="$WORK/lanes"
+git init -q -b main "$L"
+L0=$(commit_in "$L" "feat: initial" go.work='go 1.26' alpha/go.mod='module example.com/l/alpha' alpha/a.go=v1 \
+  alpha/web/go.mod='module web-ignore' alpha/web/mod.ts=v1 alpha/web/jsr.json='{"name":"@o/alpha","version":"0.0.0"}' \
+  alpha/web/package.json='{"name":"@o/alpha","version":"0.0.0","devDependencies":{"x":"1"}}' \
+  beta/go.mod='module example.com/l/beta' beta/b.go=v1 \
+  web/jsr.json='{"name":"@o/web","version":"0.0.0"}' web/package.json='{"name":"@o/web","version":"0.0.0"}')
+disc() { # <repo> -> subpackages|go_modules|go_halves of the extracted detect steps, or EXIT=n
+  : >"$WORK/out"
+  (cd "$1" && GITHUB_OUTPUT="$WORK/out" bash "$WORK/type.sh" && GITHUB_OUTPUT="$WORK/out" bash "$WORK/gomodules.sh") \
+    >"$WORK/disc.log" 2>&1 || {
+    echo "EXIT=$?"
+    return 0
+  }
+  echo "$(outkey subpackages)|$(outkey go_modules)|$(outkey go_halves)"
+}
+chk "H1 a lane's web/ package is its TS half, and a first-level one stays a root subpackage" "$(disc "$L")" \
+  '["web"]|["alpha","beta"]|["alpha"]'
+mkdir -p "$L/beta/web"
+printf '{}\n' >"$L/beta/web/jsr.json"
+printf '{}\n' >"$L/beta/web/package.json"
+chk "H1 only a tracked web/ package counts" "$(disc "$L" | cut -d'|' -f3)" '["alpha"]'
+rm -r "$L/beta/web"
+LG="$WORK/lanes-nopkg"
+git init -q -b main "$LG"
+commit_in "$LG" "feat: initial" gamma/go.mod='module example.com/g/gamma' gamma/g.go=v1 \
+  gamma/web/jsr.json='{"name":"@o/g","version":"0.0.0"}' >/dev/null
+chk "H1 a half with a jsr.json and no package.json is refused" "$(disc "$LG")" "EXIT=1"
+chk_has "H1 naming it" "$(cat "$WORK/disc.log")" "::error::gamma/web/jsr.json has no package.json beside it"
+lane_clone() { # <commit> -> a fresh clone of the lanes fixture, detached at the commit
+  local c
+  c=$(mktemp -d "$WORK/lc.XXXXXX")
+  git clone -q --no-checkout "$L" "$c"
+  git -C "$c" checkout -q --detach "$1"
+  printf '%s' "$c"
+}
+halves_at() { # <commit> <channel> <lanes to release> [halves] -> halves_to_publish, or EXIT=n
+  local c
+  c=$(lane_clone "$1")
+  : >"$WORK/out"
+  (cd "$c" && CHANNEL="$2" GO_MODULES_TO_RELEASE="$3" GO_HALVES_JSON="${4:-[\"alpha\"]}" GITHUB_OUTPUT="$WORK/out" \
+    bash "$RS" halves) >"$WORK/halves.log" 2>&1 || {
+    echo "EXIT=$?"
+    return 0
+  }
+  outkey halves_to_publish
+}
+chk "H2 a lane's first build publishes its half" "$(halves_at "$L0" dev '["alpha","beta"]')" '["alpha"]'
+git -C "$L" tag alpha/v1.0.0-dev.1 "$L0"
+L1=$(commit_in "$L" "fix(alpha): go only" alpha/a.go=v2)
+chk "H2 a Go-only change since the lane's dev build publishes no half" "$(halves_at "$L1" dev '["alpha"]')" '[]'
+git -C "$L" tag alpha/v1.0.0-dev.2 "$L1"
+L2=$(commit_in "$L" "feat(alpha): web" alpha/web/mod.ts=v2)
+chk "H2 a change under web/ publishes it" "$(halves_at "$L2" dev '["alpha"]')" '["alpha"]'
+chk "H2 only when its lane releases" "$(halves_at "$L2" dev '["beta"]')" '[]'
+chk "H2 and only for a lane with a half" "$(halves_at "$L2" dev '["alpha","beta"]' '[]')" '[]'
+git -C "$L" tag alpha/v1.0.0-dev.3 "$L2"
+L3=$(commit_in "$L" "chore(alpha): dev tooling" alpha/web/README.md=docs \
+  alpha/web/package.json='{"name":"@o/alpha","version":"0.0.0","devDependencies":{"x":"2"}}')
+chk "H2 a devDependencies bump or a doc under web/ ships nothing" "$(halves_at "$L3" dev '["alpha"]')" '[]'
+L4=$(commit_in "$L" "feat(alpha): runtime dependency" \
+  alpha/web/package.json='{"name":"@o/alpha","version":"0.0.0","dependencies":{"y":"1"},"devDependencies":{"x":"2"}}')
+chk "H2 a runtime dependency under web/ ships" "$(halves_at "$L4" dev '["alpha"]')" '["alpha"]'
+git -C "$L" tag alpha/v1.0.0-dev.4 "$L4"
+chk "H2 a lane already tagged at HEAD publishes nothing" "$(halves_at "$L4" dev '["alpha"]')" '[]'
+chk "H3 a stable run measures from the lane's stable tag, never a dev one" "$(halves_at "$L4" stable '["alpha"]')" '["alpha"]'
+git -C "$L" tag alpha/v1.0.0 "$L4"
+git -C "$L" checkout -q -b dev
+LT=$(commit_in "$L" "feat(alpha): promoted web" alpha/web/mod.ts=v3)
+git -C "$L" checkout -q main
+LR=$(git -C "$L" commit-tree "$LT^{tree}" -p "$L4" -p "$LT" -m "release: promote dev into main")
+git -C "$L" merge -q --ff-only "$LR"
+LS=$(commit_in "$L" "fix(alpha): restore" alpha/web/mod.ts=v2 alpha/a.go=v3)
+chk "H3 a promotion's own change to the half counts though a later commit undid it" \
+  "$(halves_at "$LS" stable '["alpha"]')" '["alpha"]'
+chk "H3 the net range alone shows no change" "$(halves_at "$LS" dev '["alpha"]')" '[]'
+git -C "$L" tag alpha/v1.1.0 "$LS"
+chk "H3 a stable lane tagged at HEAD publishes nothing" "$(halves_at "$LS" stable '["alpha"]')" '[]'
+chk "H4 a lane list that is not JSON fails the run" "$(halves_at "$LS" stable 'alpha')" "EXIT=1"
+chk "H4 as does a channel that is neither" "$(halves_at "$LS" '' '["alpha"]')" "EXIT=1"
+hpub() { # <commit> <channel> -> the version published|the npm and npx publish calls, or EXIT=n
+  local c reg
+  c=$(lane_clone "$1")
+  reg=$(mktemp -d "$WORK/hreg.XXXXXX")
+  : >"$reg/ok"
+  : >"$SP_LOG"
+  rm -f "$SP_LOG.version"
+  (cd "$c/$(fact '."lh-wd"' | sed 's/\${{ matrix.lane }}/alpha/')" && PATH="$BIN2:$PATH" CURL_DIR="$reg" LANE=alpha CHANNEL="$2" \
+    CI_TOOLS="$ROOT/scripts" JSR_VERSION="$(fact '."lh-env".JSR_VERSION')" bash "$WORK/half-publish.sh") \
+    >"$WORK/hpub.log" 2>&1 || {
+    echo "EXIT=$?"
+    return 0
+  }
+  echo "$(cat "$SP_LOG.version")|$(grep -E '^(npm publish|npx)' "$SP_LOG" | tr '\n' ';')"
+}
+git -C "$L" tag alpha/v1.1.0-dev.1 "$LS"
+chk "H5 a stable lane publishes its half at its stable tag, to npm then JSR" "$(hpub "$LS" stable)" \
+  "1.1.0|npm publish --access public @web;npx -y jsr@0.14.3 publish --allow-dirty @web;"
+chk "H5 a dev lane at its dev tag, under the dev dist-tag" "$(hpub "$L4" dev)" \
+  "1.0.0-dev.4|npm publish --access public --tag dev @web;"
+git -C "$L" tag alpha/v1.0.0-dev.10 "$L4"
+chk "H5 the highest dev tag at HEAD, by version" "$(hpub "$L4" dev | cut -d'|' -f1)" "1.0.0-dev.10"
+chk "H5 a lane with no tag of the channel at HEAD is refused" "$(hpub "$L3" dev)" "EXIT=1"
+chk_has "H5 naming the lane" "$(cat "$WORK/hpub.log")" "::error::lane alpha has no dev tag at"
+chk "H6 detect finds the halves once the publication is final, before the release decision" \
+  "$(fact '."halves-order"')|$(fact '."halves-if"')" "true|\${{ steps.gomodules.outputs.go_halves != '[]' }}"
+chk "H6 from the final lane list and the discovered halves" \
+  "$(fact '."halves-env".GO_MODULES_TO_RELEASE')|$(fact '."halves-env".GO_HALVES_JSON')|$(fact '."halves-env".CHANNEL')" \
+  '${{ steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}|${{ steps.gomodules.outputs.go_halves }}|${{ steps.channel.outputs.channel }}'
+chk "H6 and hands them on" "$(fact '.outputs.go_halves')|$(fact '.outputs.halves_to_publish')" \
+  "\${{ steps.gomodules.outputs.go_halves }}|\${{ steps.halves.outputs.halves_to_publish || '[]' }}"
+chk "H7 the half publishes after its lane's tag, one leg per lane" \
+  "$(fact '."lh-needs" | join(" ")')|$(fact '."lh-if"')|$(fact '."lh-strategy" | tojson')" \
+  "detect go-nested|!cancelled() && needs.go-nested.result == 'success' && needs.detect.outputs.halves_to_publish != '[]'|{\"fail-fast\":false,\"matrix\":{\"lane\":\"\${{ fromJSON(needs.detect.outputs.halves_to_publish) }}\"}}"
+chk "H7 with OIDC and no write scope, since it runs the package's scripts" "$(fact '."lh-perms" | tojson')" \
+  '{"contents":"read","id-token":"write"}'
+chk "H7 through the shared script, in the half's directory" \
+  "$(fact '."lh-steps" | join(",")')|$(grep -c 'publish-subpackage.sh' "$WORK/half-publish.sh")|$(fact '."lh-wd"')" \
+  "Checkout,Setup Node.js,Check out the ci source,Publish the lane's TS half|1|\${{ matrix.lane }}/web"
 
 # ── The dev barrier ──────────────────────────────────────────────────────────
 rm -rf "$W"
@@ -2774,7 +2920,7 @@ chk "W16 with OIDC for npm and JSR" "$(fact '."perms:repair-publish" | tojson')"
 chk "W16 the subpackage job publishes through the shared script" \
   "$(fact '."subpkg-steps" | join(",")')|$(grep -c 'publish-subpackage.sh' "$WORK/subpkg-new.sh")" \
   "Checkout,Setup Node.js,Check out the ci source,Publish subpackage to npm + JSR|1"
-chk "W16 every jsr CLI pin is one Renovate-tracked version" "$(fact '."jsr-pins" | join(",")')|$(fact '."jsr-pin-sites"')" "0.14.3|3"
+chk "W16 every jsr CLI pin is one Renovate-tracked version" "$(fact '."jsr-pins" | join(",")')|$(fact '."jsr-pin-sites"')" "0.14.3|4"
 chk "W17 docker-release leaves the receipt to release.yaml when subpackages share the version" \
   "$(fact '."docker-with"."defer-receipt"')|$(fact '."dr-defer".default')" "\${{ needs.detect.outputs.subpackages_to_publish != '[]' }}|false"
 chk_has "W17 and its receipt job honours it" "$(fact '."dr-receipt-if"')" "&& !inputs.defer-receipt"
@@ -2822,17 +2968,19 @@ chk_has "W22 said on stderr with the error" "$(cat "$WORK/rex.err")" \
 gh: HTTP 502"
 rm "$GH_DIR/fail-release"
 chk "W21 every job that writes a registry, a tag or a Release on a stable run is simulated" \
-  "$(fact '."stable-writers" | join(" ")')" "docker go ts subpackage go-nested"
+  "$(fact '."stable-writers" | join(" ")')" "docker go ts subpackage go-nested lane-halves"
 for t in docker go ts; do
   chk "W21 a $t repo publishes once both gates passed or were skipped" \
     "$(fact ".\"gate-sim\".\"$t repair=success barrier=success\"")|$(fact ".\"gate-sim\".\"$t repair=skipped barrier=skipped\"")" \
-    "$t subpackage go-nested|$t subpackage go-nested"
+    "$t subpackage go-nested lane-halves|$t subpackage go-nested lane-halves"
   for g in "repair=failure barrier=skipped" "repair=skipped barrier=failure" "repair=cancelled barrier=skipped"; do
     chk "W21 a $t repo writes nothing when $g" "$(fact ".\"gate-sim\".\"$t $g\"")" ""
   done
 done
 chk "W21 a root-less repo releases only its lanes, whatever the root's release flag" \
-  "$(fact '."gate-sim"."none release=true"')|$(fact '."gate-sim"."none release=false"')" "go-nested|go-nested"
+  "$(fact '."gate-sim"."none release=true"')|$(fact '."gate-sim"."none release=false"')" "go-nested lane-halves|go-nested lane-halves"
+chk "W21 a lane's TS half publishes only when detect names it, and never in a renumber run" \
+  "$(fact '."gate-sim"."none no halves"')|$(fact '."gate-sim"."none renumber"')" "go-nested|"
 chk "W21 the subpackage job reads both gates itself" "$(fact '."needs:subpackage" | join(" ")')" "detect repair barrier docker ts go"
 gate() { # <repair-notes result> <repair-release result> <repair-publish result> -> ok|refused
   NOTES=$1 RELEASE=$2 PUBLISH=$3 bash "$WORK/repair-gate.sh" >/dev/null 2>&1 && echo ok || echo refused

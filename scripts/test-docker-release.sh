@@ -945,7 +945,7 @@ changes_at() { # <anchor> <head> -> root_changed|subpackages_to_publish
 }
 select_at() { # <channel> <root_changed> <subpackages_to_publish> <anchor> <head> -> release|version
   CHANNEL="$1" MODE=normal ROOT_CHANGED="$2" SUBPACKAGES_TO_PUBLISH="$3" ANCHOR_SHA="$4" GITHUB_SHA="$5" \
-    BASE=v1.3.0 DEV_VERSION=v1.3.0-dev.1 LATEST=v1.2.0 \
+    BASE=v1.3.0 DEV_VERSION=v1.3.0-dev.1 LATEST=v1.2.0 REPO_TYPE=go \
     run_step select.sh >/dev/null
   printf '%s|%s' "$(out release)" "$(out version)"
 }

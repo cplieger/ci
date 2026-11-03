@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Two-branch release state, one subcommand per release.yaml step: pending
-# (each lane's pending promotion, range and kind line), publish, ahead, number
-# (via CLIFF_SCRIPT), receipts, receipt TAG COMMIT, readback SITE TAG [LANE],
-# provenance and complete (IMAGE@DIGEST SOURCE), barrier (holds a stable publish
-# until dev ranks above it), renumber-target, renumber-handoff, renumber (re-tag
-# LANE_KEY's newest dev build as DEV_VERSION), renumber-subpackages, signing-window
-# TAG (EXCLUDE_RE, SUBPACKAGES_JSON), release-digest TAG (IMAGE) and security-shas
-# [FLOOR]. Lane keys: '.' for the root, else the lane dir. pending, publish, ahead and number hold no token.
+# Two-branch release state, one subcommand per release.yaml step: pending,
+# publish, ahead, halves, number (CLIFF_SCRIPT), receipts, receipt TAG COMMIT,
+# readback SITE TAG [LANE], provenance and complete (IMAGE@DIGEST SOURCE),
+# barrier, renumber-target, renumber-handoff, renumber (re-tag LANE_KEY's newest
+# dev build as DEV_VERSION), renumber-subpackages, signing-window TAG
+# (EXCLUDE_RE, SUBPACKAGES_JSON), release-digest TAG (IMAGE) and security-shas
+# [FLOOR]. Lane keys: '.' for the root, else the lane dir. pending, publish,
+# ahead, halves and number hold no token.
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -338,6 +338,66 @@ cmd_number() {
     echo "lane ${key}: the promotion ${r} publishes ${v}"
   done <<<"$rows"
   out "state=${state}" "root_version=$(jq -r '.["."].version // ""' <<<"$state")"
+}
+
+lane_anchor() { # <key> -> the commit of the lane's channel tag nearest HEAD (stable, or either on dev), or nothing; fails with tags_of or a walk of HEAD
+  local -A at=()
+  local name c tags revs
+  tags=$(tags_of "$(stable_re "$1")") || return 1
+  if [ "${CHANNEL:-}" = dev ]; then
+    tags+=$'\n'$(tags_of "$(dev_re "$1")") || return 1
+  fi
+  while read -r name c; do
+    [ -z "$name" ] || at[$c]=1
+  done <<<"$tags"
+  [ "${#at[@]}" -gt 0 ] || return 0
+  revs=$(git rev-list --topo-order HEAD) || return 1
+  while IFS= read -r c; do
+    if [ -n "${at[$c]:-}" ]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done <<<"$revs"
+}
+# A lane's TS half ships what a root subpackage would: path-significance.sh's
+# exclusions and published-manifest rule decide, over the range and, on
+# stable, each promotion's own diff in it, as published_subpackages counts.
+half_changed() { # <lane> <from commit or ''> <to> -> 0 when the half at <lane>/web changed; dies when it cannot tell
+  local from=$2 f t res subs recs c ranges
+  [ -n "$from" ] || from=$(git hash-object -t tree /dev/null)
+  ranges="$from $3"
+  if [ "${CHANNEL:-}" = stable ]; then
+    recs=$(reconciliations_in "$2" "$3") || die "cannot list the promotions of ${2:-the root}..${3}"
+    while IFS= read -r c; do
+      [ -z "$c" ] || ranges+=$'\n'"${c}^1 ${c}"
+    done <<<"$recs"
+  fi
+  while read -r f t; do
+    res=$(MODE=paths FROM="$f" TO="$t" REPO_TYPE=none SUBPACKAGES_JSON="$(jq -cn --arg d "$1/web" '[$d]')" GO_LANES_JSON='[]' \
+      bash "$TOOLS/path-significance.sh") || die "path significance of ${f}..${t} failed"
+    subs=$(sed -n 's/^subpackages_to_publish=//p' <<<"$res")
+    if in_list "subpackages_to_publish of ${f}..${t}" "$1/web" "$subs"; then
+      return 0
+    fi
+  done <<<"$ranges"
+  return 1
+}
+cmd_halves() {
+  local mods="${GO_MODULES_TO_RELEASE:-[]}" halves="${GO_HALVES_JSON:-[]}" pub='[]' l a lanes
+  case "${CHANNEL:-}" in dev | stable) ;; *) die "CHANNEL must be dev or stable, got '${CHANNEL:-}'" ;; esac
+  lanes=$(jq -r --argjson h "$halves" '.[] | select(. as $l | any($h[]; . == $l))' <<<"$mods") \
+    || die "GO_MODULES_TO_RELEASE '${mods}' and GO_HALVES_JSON '${halves}' must be JSON arrays of lane dirs"
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    a=$(lane_anchor "$l") || die "cannot read lane ${l}'s tags or the history of HEAD"
+    if half_changed "$l" "$a" HEAD; then
+      pub=$(jq -c --arg v "$l" '. + [$v]' <<<"$pub")
+      echo "lane ${l}: ${l}/web changed since ${a:-its first commit}, so it publishes at the lane's version"
+    else
+      echo "lane ${l}: ${l}/web is unchanged since ${a:-its first commit}"
+    fi
+  done <<<"$lanes"
+  out "halves_to_publish=${pub}"
 }
 
 subpackages_at() { # <commit> -> JSON array of the first-level dirs carrying a jsr.json at <commit>
@@ -1269,7 +1329,7 @@ cmd_renumber() {
 }
 
 case "${1:-}" in
-  pending | publish | ahead | number | receipts | renumber) "cmd_$1" ;;
+  pending | publish | ahead | halves | number | receipts | renumber) "cmd_$1" ;;
   barrier)
     rc=0
     timeout --kill-after=10 "$BARRIER_SECONDS" "$BASH" "${BASH_SOURCE[0]}" barrier-wait || rc=$?
@@ -1293,5 +1353,5 @@ case "${1:-}" in
     shift
     "$cmd" "$@"
     ;;
-  *) die "usage: release-state.sh pending|publish|ahead|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
+  *) die "usage: release-state.sh pending|publish|ahead|halves|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
 esac

@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Publishes the TS subpackage in the working directory as VERSION: npm under
-# the `dev` dist-tag on the dev channel, npm then JSR (CLI JSR_VERSION) on
-# stable. A registry that already serves the version is skipped, so a rerun
-# completes a partial publish. OIDC only: trusted publishers at npmjs.com and
-# jsr.io.
+# Publishes the TS package in the working directory at VERSION, a root
+# version (vX.Y.Z) or a lane tag (<lane>/vX.Y.Z): npm under the `dev` dist-tag
+# on the dev channel, npm then JSR (CLI JSR_VERSION) on stable. A registry that
+# already serves the version is skipped, so a rerun completes a partial
+# publish. OIDC only: trusted publishers at npmjs.com and jsr.io.
 set -euo pipefail
 : "${VERSION:?}" "${CHANNEL:?}"
 
-ver="${VERSION#v}"
+ver="${VERSION##*/}"
+ver="${ver#v}"
 pkg="$(npm pkg get name | tr -d '\"')"
 npm pkg set version="$ver"
 node -e "const fs=require('fs'),f='jsr.json',j=JSON.parse(fs.readFileSync(f));j.version='${ver}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
