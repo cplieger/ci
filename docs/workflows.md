@@ -48,7 +48,7 @@ In a TypeScript package with a knip configuration, `ts-ci.yaml` also runs [knip]
 
 `deadset-ci.yaml` runs [deadset](https://github.com/cplieger/deadset) at the repository root, and once in each nested Go module folder. The root run covers the Go and TypeScript that deadset finds there, with deadset-go and deadset-ts, so deadset can match an edge that crosses from one language to the other. deadset-go stops at a nested module's `go.mod`, so each nested module gets its own run for its Go. deadset-ts at the root already reads every TypeScript project below it, nested modules included, so a nested run leaves TypeScript out.
 
-In a repository with no `go.mod` at the root, the root run leaves out the Go inside nested module folders, which their own runs cover. The root run then covers only TypeScript, and it does not run when the repository has none. Go outside every module folder still fails the root run, because it has no `go.mod` to load from.
+In a repository with no `go.mod` at the root, the root run leaves out the Go inside nested module folders, which their own runs cover. The root run then covers only TypeScript, and passes with nothing checked when the repository has none. Go outside every module folder, or a root `deadset.json` naming Go, still fails the root run, because the root has no `go.mod` to load Go from.
 
 A run reads its settings from `deadset.json` at its root. Every key that file sets wins, except `reporters.formats`: the workflow always asks for text and SARIF. When the file leaves `target.kind` out, it is `application` if the folder has a `Dockerfile` and `library` otherwise. deadset then reports no unused export from a library's published API, because callers outside the repository may use it.
 

@@ -453,7 +453,8 @@ class ResolveTarget(Harness):
     def test_the_step_writes_the_central_file_and_names_no_language(self):
         run = self.resolve({'go.mod': 'module x\n', 'cmd/tool/main.go': 'package main\n'})
         self.assertEqual(self.central(run), {'target': {'kind': 'library'}})
-        self.assertEqual(set(run.outputs), {'work', 'go_mod', 'go_sum'})
+        self.assertEqual(set(run.outputs), {'work', 'go_mod', 'go_sum', 'modules_only_go'})
+        self.assertEqual(run.outputs['modules_only_go'], 'false')
 
     def test_a_dockerfile_makes_an_application(self):
         run = self.resolve({'go.mod': 'module x\n', 'Dockerfile': 'FROM scratch\n'})
@@ -519,7 +520,13 @@ class Census(Harness):
         repo = git_repo(self.tmp / 'repo', files)
         self.work = Path(tempfile.mkdtemp(dir=self.runner_temp))
         (self.work / 'central.json').write_text('{"target":{"kind":"library"}}')
-        merged = {'TARGET': target, 'WORK': str(self.work), 'CENSUS_OUT': document, **env}
+        merged = {
+            'TARGET': target,
+            'WORK': str(self.work),
+            'MODULES_ONLY_GO': 'false',
+            'CENSUS_OUT': document,
+            **env,
+        }
         deadset = merged.pop('DEADSET', '1') == '1'
         return self.run_step(CENSUS_STEP, repo / target, merged, deadset=deadset)
 
@@ -659,7 +666,12 @@ class Census(Harness):
         run = self.run_step(
             CENSUS_STEP,
             self.tmp / 'repo',
-            {'TARGET': '.', 'WORK': str(self.work), 'CENSUS_OUT': census('go', 'ts')},
+            {
+                'TARGET': '.',
+                'WORK': str(self.work),
+                'MODULES_ONLY_GO': 'false',
+                'CENSUS_OUT': census('go', 'ts'),
+            },
         )
         self.assertEqual(run.outputs['npm_dirs'], 'web')
 
