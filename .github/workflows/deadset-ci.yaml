@@ -83,10 +83,16 @@ jobs:
           if [ -f go.mod ]; then
             go_mod=true
             if [ -f go.sum ]; then go_sum="${prefix}go.sum"; fi
-          elif [ "$TARGET" = . ] && [ -z "$(find . \( -type d \( -name node_modules -o -name testdata \
-            -o -name vendor -o -name '.?*' -o -exec test -e '{}/go.mod' \; \) -prune \) -o \( -type f -o -type l \) \
-            \( -name go.mod -o -name '*.go' \) -print -quit)" ]; then
-            modules_only_go=true
+          elif [ "$TARGET" = . ]; then
+            # Go no module target covers: outside every module folder, or in a
+            # module under static/ or dist/, which meta ci.yaml's go-nested skips.
+            uncovered="$(
+              find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \
+                -o -exec test -e '{}/go.mod' \; \) -prune \) -o \( -type f -o -type l \) \( -name go.mod -o -name '*.go' \) -print
+              find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) \
+                -o -name go.mod \( -path '*/static/*' -o -path '*/dist/*' \) -print
+            )"
+            if [ -z "$uncovered" ]; then modules_only_go=true; fi
           fi
           {
             echo "work=$work"
