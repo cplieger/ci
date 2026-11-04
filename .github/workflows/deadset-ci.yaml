@@ -59,7 +59,8 @@ jobs:
 
       # A nested module's central file names go alone, because deadset-ts at
       # the root already reads every tsconfig under it; its deadset.json still
-      # outranks the central file.
+      # outranks the central file. A root with no go.mod whose Go all sits in
+      # nested modules (modules_only_go) leaves that Go to each module's target.
       - name: Resolve target
         id: target
         env:
@@ -78,14 +79,20 @@ jobs:
           if [ "$TARGET" != . ]; then prefix="$TARGET/"; fi
           go_mod=false
           go_sum=""
+          modules_only_go=false
           if [ -f go.mod ]; then
             go_mod=true
             if [ -f go.sum ]; then go_sum="${prefix}go.sum"; fi
+          elif [ "$TARGET" = . ] && [ -z "$(find . \( -type d \( -name node_modules -o -name testdata \
+            -o -name vendor -o -name '.?*' -o -exec test -e '{}/go.mod' \; \) -prune \) -o \( -type f -o -type l \) \
+            \( -name go.mod -o -name '*.go' \) -print -quit)" ]; then
+            modules_only_go=true
           fi
           {
             echo "work=$work"
             echo "go_mod=$go_mod"
             echo "go_sum=$go_sum"
+            echo "modules_only_go=$modules_only_go"
           } >> "$GITHUB_OUTPUT"
 
       - name: Setup Go
@@ -136,28 +143,43 @@ jobs:
         env:
           TARGET: ${{ inputs.target }}
           WORK: ${{ steps.target.outputs.work }}
+          MODULES_ONLY_GO: ${{ steps.target.outputs.modules_only_go }}
         run: |
           set -euo pipefail
-          rc=0
-          deadset print-languages --target=. --central="$WORK/central.json" \
-            > "$WORK/census.json" 2> "$WORK/census.err" || rc=$?
-          cat "$WORK/census.err" >&2
-          if [ "$rc" -eq 3 ] && grep -q '^setup failure: no-program: ' "$WORK/census.err"; then
-            echo "::notice::deadset finds no program at $TARGET, so there is nothing to check."
+          skip() {
+            echo "::notice::deadset finds no program at $TARGET$1, so there is nothing to check."
             echo "analyze=false" >> "$GITHUB_OUTPUT"
             exit 0
-          fi
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::deadset print-languages exited $rc, so the languages in scope at $TARGET are unknown and nothing was checked. Its error is above."
-            exit 1
-          fi
-          analyzers="$(jq -er '.analyzers | select(length > 0) | map(.name) | join(",")' "$WORK/census.json")" || {
-            echo "::error::deadset print-languages wrote no census naming its analyzers, so nothing was checked."
-            exit 1
+          }
+          ask() {
+            local rc=0
+            deadset print-languages --target=. --central="$WORK/central.json" \
+              > "$WORK/census.json" 2> "$WORK/census.err" || rc=$?
+            cat "$WORK/census.err" >&2
+            if [ "$rc" -eq 3 ] && grep -q '^setup failure: no-program: ' "$WORK/census.err"; then
+              skip ""
+            fi
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::deadset print-languages exited $rc, so the languages in scope at $TARGET are unknown and nothing was checked. Its error is above."
+              exit 1
+            fi
+            analyzers="$(jq -er '.analyzers | select(length > 0) | map(.name) | join(",")' "$WORK/census.json")" || {
+              echo "::error::deadset print-languages wrote no census naming its analyzers, so nothing was checked."
+              exit 1
+            }
           }
           from() {
             jq -r --arg language "$1" '.languages[] | select(.language == $language) | .provenance' "$WORK/census.json"
           }
+          ask
+          # deadset's detection counts the nested modules' Go, which their own
+          # targets analyze; a repository deadset.json naming go still decides.
+          if [ "$MODULES_ONLY_GO" = true ] && [ "$(from go)" = detected ]; then
+            if [ -z "$(from ts)" ]; then skip " outside its nested Go modules"; fi
+            jq '.analysis.languages = ["ts"]' "$WORK/central.json" > "$WORK/central.ts.json"
+            mv "$WORK/central.ts.json" "$WORK/central.json"
+            ask
+          fi
           echo "analysis.languages $(jq -r '[.languages[] | "\(.language) (\(.provenance))"] | join(", ")' "$WORK/census.json"); analyzers $analyzers"
           go=false
           ts=false

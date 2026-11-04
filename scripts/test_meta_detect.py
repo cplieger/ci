@@ -1,6 +1,7 @@
 """The meta ci.yaml's detect routing for nested modules: which TS halves get
-ts-ci, when the modules are tested together under a generated go.work, and how
-the jobs they feed are wired into validate."""
+ts-ci, when the modules are tested together under a generated go.work, how the
+jobs they feed are wired into validate, and which dead-code targets a root-less
+repository gets."""
 
 from __future__ import annotations
 
@@ -9,10 +10,21 @@ import os
 import shutil
 import subprocess
 import unittest
+from pathlib import Path
 
 import workflow_replay as wr
 import yaml
-from test_deadset_steps import GO_CI, META, Harness, git_repo, run_detect, workflow_step
+from test_deadset_steps import (
+    CENSUS_STEP,
+    GO_CI,
+    META,
+    Harness,
+    census,
+    git_repo,
+    run_detect,
+    workflow_step,
+    write_exec,
+)
 
 GO_FILE = 'package m\n'
 SENTINEL = 'module web-ignore\n'
@@ -227,6 +239,90 @@ class GoWorkWiring(unittest.TestCase):
         self.assertEqual(step['env']['GO_WORK'], '${{ needs.go-work.result }}')
         self.assertIn('"go-work=$GO_WORK"', step['run'])
 
+
+GO_MODULES_ONLY = {
+    'README.md': 'x\n',
+    **module('alpha', 'example.com/r/alpha'),
+    **module('beta', 'example.com/r/beta'),
+}
+
+
+# print-languages answers CENSUS_OUT, or CENSUS_TS once the central file names
+# ts, keeping each call's central file as central.<n>.json.
+TWO_CENSUS_STUB = """#!/usr/bin/env bash
+if [ "$1" = print-languages ]; then
+  n=$(find "$STUB_LOG" -name 'central.*.json' | wc -l)
+  for a in "$@"; do
+    case "$a" in --central=*) cp "${a#--central=}" "$STUB_LOG/central.$n.json" ;; esac
+  done
+  if grep -q '"ts"' "$STUB_LOG/central.$n.json"; then printf '%s' "$CENSUS_TS"; else printf '%s' "$CENSUS_OUT"; fi
+  exit 0
+fi
+exit 1
+"""
+
+
+class RootLessDeadset(Harness):
+    def stub(self, deadset: bool = True) -> None:
+        super().stub(deadset)
+        if deadset:
+            write_exec(self.bin / 'deadset', TWO_CENSUS_STUB)
+
+    def root(self, files: dict[str, str], first: str, second: str = ''):
+        """Resolve target, then the census, at the root of a repository of `files`."""
+        repo = git_repo(self.tmp / f'root-{len(list(self.tmp.glob("root-*")))}', files)
+        target = self.run_step('Resolve target', repo, {'TARGET': '.'})
+        self.assertEqual(target.rc, 0, target.out)
+        env = {
+            'TARGET': '.',
+            'WORK': target.outputs['work'],
+            'MODULES_ONLY_GO': target.outputs['modules_only_go'],
+            'CENSUS_OUT': first,
+            'CENSUS_TS': second,
+        }
+        return target, self.run_step(CENSUS_STEP, repo, env)
+
+    def test_go_modules_alone_leave_the_root_nothing_to_check(self):
+        out = run_detect(self, GO_MODULES_ONLY)
+        self.assertEqual(json.loads(out['deadset_targets']), ['.', 'alpha', 'beta'])
+        target, run = self.root(GO_MODULES_ONLY, census('go'))
+        self.assertEqual(target.outputs['modules_only_go'], 'true')
+        self.assertEqual(run.rc, 0, run.out)
+        self.assertEqual(run.outputs['analyze'], 'false')
+        self.assertIn('::notice::deadset finds no program at . outside its nested Go modules', run.out)
+
+    def test_the_root_of_module_halves_analyzes_only_their_typescript(self):
+        out = run_detect(self, ROOTLESS)
+        self.assertEqual(json.loads(out['deadset_targets']), ['.', 'alpha', 'beta', 'gamma'])
+        target, run = self.root(ROOTLESS, census('go', 'ts'), census('ts', provenance='central'))
+        self.assertEqual(run.rc, 0, run.out)
+        self.assertEqual(
+            (run.outputs['analyze'], run.outputs['go'], run.outputs['ts']), ('true', 'false', 'true')
+        )
+        asked = [json.loads(run.logged(f'central.{n}.json')) for n in (0, 1)]
+        self.assertNotIn('analysis', asked[0])
+        self.assertEqual(asked[1]['analysis'], {'languages': ['ts']})
+        central = json.loads(Path(target.outputs['work'], 'central.json').read_text())
+        self.assertEqual(central['analysis'], {'languages': ['ts']})
+        self.assertEqual(run.outputs['npm_dirs'], 'alpha/web\ngamma/web')
+
+    def test_go_outside_every_module_still_fails_closed(self):
+        files = {**ROOTLESS, 'tools/x.go': 'package main\n'}
+        target, run = self.root(files, census('go', 'ts'))
+        self.assertEqual(target.outputs['modules_only_go'], 'false')
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn('::error::Go is in scope at . (detected), but . has no go.mod', run.out)
+
+    def test_a_repository_file_still_decides(self):
+        files = {**GO_MODULES_ONLY, 'deadset.json': '{"analysis":{"languages":["go"]}}'}
+        target, run = self.root(files, census('go', provenance='repository: deadset.json'))
+        self.assertEqual(target.outputs['modules_only_go'], 'true')
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn('Go is in scope at . (repository: deadset.json)', run.out)
+
+    def test_a_root_go_module_is_never_modules_only(self):
+        target, _ = self.root({**ROOTLESS, 'go.mod': 'module example.com/r\n'}, census('go', 'ts'))
+        self.assertEqual(target.outputs['modules_only_go'], 'false')
 
 if __name__ == '__main__':
     unittest.main()
