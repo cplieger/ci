@@ -17,6 +17,8 @@ jobs:
       run_go: ${{ steps.detect.outputs.run_go }}
       run_go_nested: ${{ steps.detect.outputs.run_go_nested }}
       go_nested_dirs: ${{ steps.detect.outputs.go_nested_dirs }}
+      run_ts_nested: ${{ steps.detect.outputs.run_ts_nested }}
+      ts_nested_dirs: ${{ steps.detect.outputs.ts_nested_dirs }}
       run_ts: ${{ steps.detect.outputs.run_ts }}
       run_web: ${{ steps.detect.outputs.run_web }}
       run_shell: ${{ steps.detect.outputs.run_shell }}
@@ -42,6 +44,8 @@ jobs:
           run_go=false
           run_go_nested=false
           go_nested_dirs="[]"
+          run_ts_nested=false
+          ts_nested_dirs="[]"
           run_ts=false
           run_web=false
           run_shell=false
@@ -121,6 +125,17 @@ jobs:
               run_go_nested=true
             fi
 
+            # A module's TS half at <dir>/web (release.yaml's go_halves shape) is a
+            # library, so it gets ts-ci without the web job's frontend lint.
+            while IFS= read -r d; do
+              if [ -n "$(git ls-files "$d/web/package.json" "$d/web/jsr.json")" ]; then
+                ts_nested_dirs=$(echo "$ts_nested_dirs" | jq -c --arg v "$d/web" '. + [$v]')
+              fi
+            done < <(jq -r '.[]' <<< "$go_nested_dirs")
+            if [ "$ts_nested_dirs" != "[]" ]; then
+              run_ts_nested=true
+            fi
+
             # Probe known nested web-frontend locations. First hit wins.
             # Add new paths centrally if a future repo introduces a different
             # layout — no per-repo override needed. scripts/test-lane-semantics.sh
@@ -170,6 +185,8 @@ jobs:
             echo "run_go=$run_go"
             echo "run_go_nested=$run_go_nested"
             echo "go_nested_dirs=$go_nested_dirs"
+            echo "run_ts_nested=$run_ts_nested"
+            echo "ts_nested_dirs=$ts_nested_dirs"
             echo "run_ts=$run_ts"
             echo "run_web=$run_web"
             echo "run_shell=$run_shell"
@@ -190,6 +207,7 @@ jobs:
             echo "| go-nested | $run_go_nested | $go_nested_dirs |"
             echo "| ts       | $run_ts | . |"
             echo "| web      | $run_web | ${web_dir:-—} |"
+            echo "| ts-nested | $run_ts_nested | $ts_nested_dirs |"
             echo "| shell    | $run_shell | . |"
             echo "| docker   | $run_docker | . |"
             echo "| python   | $run_python | . |"
@@ -239,6 +257,17 @@ jobs:
     with:
       working-directory: ${{ needs.detect.outputs.web_dir }}
       web-lint: true
+
+  ts-nested:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_ts_nested == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.detect.outputs.ts_nested_dirs) }}
+    uses: ./.github/workflows/ts-ci.yaml
+    with:
+      working-directory: ${{ matrix.dir }}
 
   shell:
     needs: detect
@@ -1104,7 +1133,7 @@ jobs:
   # per-type templates so existing branch-protection rules keep working
   # without per-repo updates).
   validate:
-    needs: [detect, repo, go, go-nested, ts, web, shell, deadset, deadset-canary, docker, docker-arm64, markdown, python, scripts, pr-policy]
+    needs: [detect, repo, go, go-nested, ts, web, ts-nested, shell, deadset, deadset-canary, docker, docker-arm64, markdown, python, scripts, pr-policy]
     if: always()
     runs-on: ubuntu-26.04
     timeout-minutes: 1
@@ -1117,6 +1146,7 @@ jobs:
           GO_NESTED: ${{ needs.go-nested.result }}
           TS: ${{ needs.ts.result }}
           WEB: ${{ needs.web.result }}
+          TS_NESTED: ${{ needs.ts-nested.result }}
           SHELL: ${{ needs.shell.result }}
           DEADSET: ${{ needs.deadset.result }}
           DEADSET_CANARY: ${{ needs.deadset-canary.result }}
@@ -1139,7 +1169,7 @@ jobs:
           # them, which exposes a blind detection that skipped everything.
           ran=0
           skipped=0
-          set -- "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "ts=$TS" "web=$WEB" "shell=$SHELL" "deadset=$DEADSET" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"
+          set -- "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "ts=$TS" "web=$WEB" "ts-nested=$TS_NESTED" "shell=$SHELL" "deadset=$DEADSET" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"
           # pr-policy runs on two-branch repositories only, so only there is it
           # counted and listed.
           if [ "$TWO_BRANCH" = true ]; then

@@ -396,6 +396,7 @@ VALIDATE_JOBS = [
     'GO_NESTED',
     'TS',
     'WEB',
+    'TS_NESTED',
     'SHELL',
     'DEADSET',
     'DEADSET_CANARY',
