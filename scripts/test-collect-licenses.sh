@@ -160,7 +160,7 @@ run "$root/out"
 if [ "$rc" -eq 0 ]; then pass 'with the override in place the run exits 0'; else fail 'with the override in place the run exits 0' "rc=$rc: $out"; fi
 if [ "$(printf '%s\n' "$out" | wc -l)" -eq 1 ]; then pass 'success prints exactly one line'; else fail 'success prints exactly one line' "$out"; fi
 case "$out" in
-  'collect-licenses: 5 modules, 8 files under '*) pass 'the summary counts modules and files' ;;
+  'collect-licenses: 6 modules, 10 files under '*) pass 'the summary counts modules and files' ;;
   *) fail 'the summary counts modules and files' "$out" ;;
 esac
 
@@ -177,6 +177,17 @@ expect_file 'a lowercase license.md is collected' "$o/example.com/lower/license.
 expect_absent 'a Go source file named like a license is not collected' "$o/example.com/licensed/licensed.go"
 expect_file 'the override file lands under the module path' "$o/example.com/bare/LICENSE.txt"
 expect_absent 'a test-only module is not collected' "$o/example.com/testonly"
+goroot=$(go env GOROOT)
+if cmp -s "$goroot/LICENSE" "$o/go/LICENSE"; then
+  pass 'the Go standard library license lands under go/, byte-identical'
+else
+  fail 'the Go standard library license lands under go/, byte-identical' "missing or different: $o/go/LICENSE"
+fi
+if cmp -s "$goroot/PATENTS" "$o/go/PATENTS"; then
+  pass 'the Go PATENTS grant travels with it'
+else
+  fail 'the Go PATENTS grant travels with it' "missing or different: $o/go/PATENTS"
+fi
 if cmp -s "$root/licensed/LICENSE" "$o/example.com/licensed/LICENSE"; then
   pass 'a copied license is byte-identical to the source'
 else
@@ -203,6 +214,25 @@ case "$out" in
 esac
 expect_absent 'a refused run does not leave a partial image root' "$root/out-nomain/app"
 
+# --- a Go toolchain with no LICENSE fails closed -----------------------------------
+fakeroot="$root/fake-goroot"
+fakebin="$root/fake-bin"
+mkdir -p "$fakeroot" "$fakebin"
+realgo=$(command -v go)
+cat >"$fakebin/go" <<EOF
+#!/bin/sh
+if [ "\$*" = 'env GOROOT' ]; then printf '%s\n' '$fakeroot'; exit 0; fi
+exec '$realgo' "\$@"
+EOF
+chmod 755 "$fakebin/go"
+out=$(cd "$app" && PATH="$fakebin:$PATH" sh "$SUBJECT" --name app --out "$root/out-nogo" 2>&1)
+rc=$?
+if [ "$rc" -eq 1 ]; then pass 'a Go toolchain with no LICENSE exits 1'; else fail 'a Go toolchain with no LICENSE exits 1' "rc=$rc: $out"; fi
+case "$out" in
+  *"the Go toolchain at $fakeroot has no LICENSE"*) pass 'the refusal names the toolchain directory' ;;
+  *) fail 'the refusal names the toolchain directory' "$out" ;;
+esac
+
 # --- --src walks another module directory, --out stays relative to the caller ---------
 (cd "$root" && sh "$SUBJECT" --src "$app" --name app --out out-src ./... >/dev/null 2>&1)
 rc=$?
@@ -217,6 +247,9 @@ out=$(cd "$app" && sh "$SUBJECT" --name 'nested/app' --out "$root/out-usage" 2>&
 rc=$?
 if [ "$rc" -eq 2 ]; then pass 'a --name with a slash exits 2'; else fail 'a --name with a slash exits 2' "rc=$rc: $out"; fi
 expect_absent 'a refused --name writes nothing' "$root/out-usage"
+out=$(cd "$app" && sh "$SUBJECT" --name go --out "$root/out-usage" 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ]; then pass 'a --name of go exits 2'; else fail 'a --name of go exits 2' "rc=$rc: $out"; fi
 out=$(cd "$app" && sh "$SUBJECT" --name app --bogus 2>&1)
 rc=$?
 if [ "$rc" -eq 2 ]; then pass 'an unknown option exits 2'; else fail 'an unknown option exits 2' "rc=$rc: $out"; fi
