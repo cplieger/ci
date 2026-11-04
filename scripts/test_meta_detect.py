@@ -267,6 +267,16 @@ class RootLessDeadset(Harness):
         self.assertEqual(run.rc, 1, run.out)
         self.assertIn('::error::Go is in scope at . (detected), but . has no go.mod', run.out)
 
+    def test_a_module_no_other_target_covers_still_fails_closed(self):
+        for d in ('dist/x', 'static/x', 'alpha/dist/x'):
+            with self.subTest(d=d):
+                files = {**GO_MODULES_ONLY, **module(d, f'example.com/r/{d}')}
+                out = run_detect(self, files)
+                self.assertEqual(json.loads(out['deadset_targets']), ['.', 'alpha', 'beta'])
+                run = self.resolve_root(files)
+                self.assertEqual(run.rc, 1, run.out)
+                self.assertIn('::error::Go is in scope at . (detected), but . has no go.mod', run.out)
+
     def test_a_repository_file_still_decides(self):
         files = {**GO_MODULES_ONLY, 'deadset.json': '{"analysis":{"languages":["go"]}}'}
         self.assertIn('.', json.loads(run_detect(self, files)['deadset_targets']))

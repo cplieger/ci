@@ -224,7 +224,11 @@ jobs:
               names=$(find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o \( -type f -o -type l \) -print | sed 's|.*/||')
               go_names=$names
               if [ ! -f go.mod ]; then
-                go_names=$(find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' -o -exec test -e '{}/go.mod' \; \) -prune \) -o \( -type f -o -type l \) -print | sed 's|.*/||')
+                # go-nested skips a module under static/ or dist/, so no target covers its Go.
+                go_names=$({
+                  find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' -o -exec test -e '{}/go.mod' \; \) -prune \) -o \( -type f -o -type l \) -print
+                  find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o -name go.mod \( -path '*/static/*' -o -path '*/dist/*' \) -print
+                } | sed 's|.*/||')
               fi
               if grep -qxE 'go\.mod|.+\.go' <<< "$go_names" || grep -qxE 'tsconfig.*\.json' <<< "$names" \
                 || { grep -qE '\.(ts|tsx|mts|cts)$' <<< "$names" && grep -qx 'package\.json' <<< "$names"; }; then
