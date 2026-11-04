@@ -214,14 +214,19 @@ jobs:
             # The root is a dead-code target exactly when deadset finds a language
             # there: deadset-ci.yaml's Resolve target replays the same rule, and a
             # test runs both on one fixture set. deadset-go's `./...` stops at a
-            # nested module, so each one is its own target.
+            # nested module, so each one is its own target, and a root with no
+            # go.mod leaves every module's Go to that module's target.
             root_languages=""
             if [ -f deadset.json ]; then
               root_languages=$(jq -r '.analysis.languages // [] | join(",")' deadset.json 2> /dev/null || true)
             fi
             if [ -z "$root_languages" ]; then
               names=$(find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o \( -type f -o -type l \) -print | sed 's|.*/||')
-              if grep -qxE 'go\.mod|.+\.go|tsconfig.*\.json' <<< "$names" \
+              go_names=$names
+              if [ ! -f go.mod ]; then
+                go_names=$(find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' -o -exec test -e '{}/go.mod' \; \) -prune \) -o \( -type f -o -type l \) -print | sed 's|.*/||')
+              fi
+              if grep -qxE 'go\.mod|.+\.go' <<< "$go_names" || grep -qxE 'tsconfig.*\.json' <<< "$names" \
                 || { grep -qE '\.(ts|tsx|mts|cts)$' <<< "$names" && grep -qx 'package\.json' <<< "$names"; }; then
                 root_languages=detected
               fi

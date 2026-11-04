@@ -1,6 +1,7 @@
 """The meta ci.yaml's detect routing for nested modules: which TS halves get
-ts-ci, when the modules are tested together under a generated go.work, and how
-the jobs they feed are wired into validate."""
+ts-ci, when the modules are tested together under a generated go.work, how the
+jobs they feed are wired into validate, and which dead-code targets a root-less
+repository gets."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import os
 import shutil
 import subprocess
 import unittest
+from pathlib import Path
 
 import workflow_replay as wr
 import yaml
@@ -226,6 +228,51 @@ class GoWorkWiring(unittest.TestCase):
         step = validate['steps'][0]
         self.assertEqual(step['env']['GO_WORK'], '${{ needs.go-work.result }}')
         self.assertIn('"go-work=$GO_WORK"', step['run'])
+
+
+GO_MODULES_ONLY = {
+    'README.md': 'x\n',
+    **module('alpha', 'example.com/r/alpha'),
+    **module('beta', 'example.com/r/beta'),
+}
+
+
+class RootLessDeadset(Harness):
+    def resolve_root(self, files: dict[str, str]):
+        repo = git_repo(self.tmp / f'resolve-{len(list(self.tmp.glob("resolve-*")))}', files)
+        return self.run_step('Resolve target', repo, {'TARGET': '.'})
+
+    def test_go_modules_alone_are_each_a_target_and_the_root_is_none(self):
+        out = run_detect(self, GO_MODULES_ONLY)
+        self.assertEqual(json.loads(out['deadset_targets']), ['alpha', 'beta'])
+
+    def test_the_root_of_module_halves_analyzes_only_their_typescript(self):
+        out = run_detect(self, ROOTLESS)
+        self.assertEqual(json.loads(out['deadset_targets']), ['.', 'alpha', 'beta', 'gamma'])
+        run = self.resolve_root(ROOTLESS)
+        self.assertEqual(run.rc, 0, run.out)
+        got = run.outputs
+        self.assertEqual(
+            (got['languages'], got['languages_from'], got['go'], got['ts']),
+            ('ts', 'central: Go only in nested modules', 'false', 'true'),
+        )
+        central = json.loads(Path(got['work'], 'central.json').read_text())
+        self.assertEqual(central['analysis'], {'languages': ['ts']})
+        self.assertEqual(got['npm_dirs'], 'alpha/web\ngamma/web')
+
+    def test_go_outside_every_module_still_fails_closed(self):
+        files = {**ROOTLESS, 'tools/x.go': 'package main\n'}
+        self.assertIn('.', json.loads(run_detect(self, files)['deadset_targets']))
+        run = self.resolve_root(files)
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn('::error::Go is in scope at . (detected), but . has no go.mod', run.out)
+
+    def test_a_repository_file_still_decides(self):
+        files = {**GO_MODULES_ONLY, 'deadset.json': '{"analysis":{"languages":["go"]}}'}
+        self.assertIn('.', json.loads(run_detect(self, files)['deadset_targets']))
+        run = self.resolve_root(files)
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn('Go is in scope at . (repository: deadset.json)', run.out)
 
 
 if __name__ == '__main__':
