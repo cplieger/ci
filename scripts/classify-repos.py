@@ -16,6 +16,7 @@ are never read. Repos are read concurrently (fanout.py); the output keeps the
 repo order.
 """
 
+import re
 import sys
 from typing import NamedTuple
 
@@ -261,11 +262,28 @@ def discover_repos():
     )
 
 
-def classify(repo, ref='HEAD'):
+NESTED_GO_PRUNED = re.compile(r'(^|/)(node_modules|vendor|testdata|static|dist)/')
+
+
+def has_nested_go(tree):
+    """True when some <dir>/go.mod outside the pruned trees has a .go file below
+    <dir>: ci.yaml's go-nested discovery, which validates exactly these."""
+    dirs = [
+        path.removesuffix('/go.mod')
+        for path in tree
+        if path.endswith('/go.mod') and not NESTED_GO_PRUNED.search(path)
+    ]
+    sources = [path for path in tree if path.endswith('.go')]
+    return any(source.startswith(f'{d}/') for d in dirs for source in sources)
+
+
+def classify(repo, ref='HEAD', *, releasing=False):
     """Profile the repo's surfaces and language from its tree at `ref`, read once.
 
     A root check is an exact-path match against the recursive listing; the
-    cliff tier is read separately (cliff_tier).
+    cliff tier is read separately (cliff_tier). A `releasing` (two-branch) base
+    with no root go.mod is Go when it holds nested modules, because the release
+    pipeline ships them as lanes; elsewhere a root-less repo keeps its own CI.
     """
     tree = tree_paths(repo, ref)
     has_gomod = 'go.mod' in tree
@@ -275,8 +293,21 @@ def classify(repo, ref='HEAD'):
     has_pyproject = 'pyproject.toml' in tree
     is_web = 'static-src' in tree or 'web' in tree
 
+    if has_gomod:
+        lang = 'go'
+    elif has_jsr or has_pkg:
+        lang = 'ts'
+    elif has_dockerfile:
+        lang = 'shell'
+    elif has_pyproject:
+        lang = 'python'
+    elif releasing and has_nested_go(tree):
+        lang = 'go'
+    else:
+        lang = 'none'
+
     # Deeper web indicators: internal/server/static-src, a nested */web/* tree.
-    if has_gomod and not is_web:
+    if lang == 'go' and not is_web:
         is_web = any('static-src' in path or '/web/' in path for path in tree)
     has_smoke = 'tests/image-smoke.conf' in tree
     # The same file shell-ci.yaml runs, so enrolment and execution cannot disagree.
@@ -286,24 +317,13 @@ def classify(repo, ref='HEAD'):
     # keep its own CI, which the sync must never overwrite.
     has_publish = '.github/workflows/publish.yaml' in tree
 
-    if has_gomod:
-        lang = 'go'
-    elif has_jsr or has_pkg:
-        lang = 'ts'
-    elif has_dockerfile:
-        lang = 'shell'
-    elif has_pyproject:
-        lang = 'python'
-    else:
-        lang = 'none'
-
     return {
         'readable': bool(tree),
         'lang': lang,
         'has_jsr': has_jsr,
         'has_pkg': has_pkg,
         'is_web': is_web,
-        'can_release': has_gomod or has_jsr or has_dockerfile,
+        'can_release': lang == 'go' or has_jsr or has_dockerfile,
         'has_smoke': has_smoke,
         'has_shell_tests': has_shell_tests,
         'has_dockerfile': has_dockerfile,
@@ -403,11 +423,12 @@ def profile_repo(repo):
     name = repo['name']
     if not release_channels.is_two_branch(repo):
         return [(None, classify(name))]
-    found = [(base, classify(name, base)) for base in BASES]
+    found = [(base, classify(name, base, releasing=True)) for base in BASES]
     tier = cliff_tier(name)
     for _base, profile in found:
         profile['cliff_tier'] = tier
     return found
+
 
 def main():
     # Skip the ci repo itself (it is the sync source, never a target).

@@ -14,12 +14,12 @@ A synced file is overwritten on the next sync, so change it here, never in the r
 
 | Source in this repository | Lands as | Received by |
 | --- | --- | --- |
-| `.github/workflow-templates/ci.yml`, `codeql.yml`, `security.yml` | `.github/workflows/ci.yaml`, `codeql.yml`, `security.yml` | repositories with a root `go.mod`, `jsr.json` or `Dockerfile`, plus repositories that publish from their own `.github/workflows/publish.yaml` |
-| `.github/workflow-templates/release.yml` | `.github/workflows/release.yaml` | two-branch repositories with a root `go.mod`, `jsr.json` or `Dockerfile` and no `.github/workflows/publish.yaml` |
+| `.github/workflow-templates/ci.yml`, `codeql.yml`, `security.yml` | `.github/workflows/ci.yaml`, `codeql.yml`, `security.yml` | repositories with a root `go.mod`, `jsr.json` or `Dockerfile`, two-branch repositories with Go modules only in subfolders, and repositories that publish from their own `.github/workflows/publish.yaml` |
+| `.github/workflow-templates/release.yml` | `.github/workflows/release.yaml` | two-branch repositories with a root `go.mod`, `jsr.json` or `Dockerfile`, or with Go modules only in subfolders, and no `.github/workflows/publish.yaml` |
 | `.editorconfig`, `.gitattributes` | the same names | every repository in the two rows above, plus Python repositories |
 | `.golangci.yaml`, `configs/gremlins.yaml` | `.golangci.yaml`, `.gremlins.yaml` | Go repositories |
 | `configs/eslint.config.base.mjs`, `configs/prettier.json`, `configs/stylelint.json`, `configs/htmlvalidate.json` | `eslint.config.base.mjs`, `.prettierrc.json`, `.stylelintrc.json`, `.htmlvalidate.json` | TypeScript repositories, and Go repositories with a TypeScript or web folder |
-| `configs/cliff-stable.toml` or `configs/cliff-alpha.toml` | `cliff.toml` | two-branch repositories with a root `go.mod`, `jsr.json`, `package.json` or `Dockerfile`. One whose latest stable tag starts with `v0.` gets the alpha file |
+| `configs/cliff-stable.toml` or `configs/cliff-alpha.toml` | `cliff.toml` | two-branch repositories with a root `go.mod`, `jsr.json`, `package.json` or `Dockerfile`, or with Go modules only in subfolders. One whose latest stable tag starts with `v0.` gets the alpha file |
 | `configs/ruff.toml` | `ruff.toml` | Python repositories |
 | `configs/image-smoke.sh` | `tests/image-smoke.sh` | image repositories that commit a `tests/image-smoke.conf` |
 | `configs/shell/lib.sh`, `configs/shell/harness_test.sh` | `tests/shell/lib.sh`, `tests/shell/harness_test.sh` | repositories that commit a `tests/shell/run.sh` |

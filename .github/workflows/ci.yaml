@@ -17,6 +17,10 @@ jobs:
       run_go: ${{ steps.detect.outputs.run_go }}
       run_go_nested: ${{ steps.detect.outputs.run_go_nested }}
       go_nested_dirs: ${{ steps.detect.outputs.go_nested_dirs }}
+      run_ts_nested: ${{ steps.detect.outputs.run_ts_nested }}
+      ts_nested_dirs: ${{ steps.detect.outputs.ts_nested_dirs }}
+      run_go_work: ${{ steps.detect.outputs.run_go_work }}
+      go_work_dirs: ${{ steps.detect.outputs.go_work_dirs }}
       run_ts: ${{ steps.detect.outputs.run_ts }}
       run_web: ${{ steps.detect.outputs.run_web }}
       run_shell: ${{ steps.detect.outputs.run_shell }}
@@ -43,6 +47,10 @@ jobs:
           run_go=false
           run_go_nested=false
           go_nested_dirs="[]"
+          run_ts_nested=false
+          ts_nested_dirs="[]"
+          run_go_work=false
+          go_work_dirs="[]"
           run_ts=false
           run_web=false
           run_shell=false
@@ -123,6 +131,48 @@ jobs:
               run_go_nested=true
             fi
 
+            # A module requiring a sibling by version, with no replace of it, builds
+            # against the sibling's tag, so every module's head is also tested
+            # together under a generated go.work.
+            gomod_field() {
+              awk -v want="$2" '
+                { gsub(/"/, "") }
+                $1 ~ /^\/\// { next }
+                ($1 == "require" || $1 == "replace") && $2 == "(" { blk = $1; next }
+                blk != "" && $1 == ")" { blk = ""; next }
+                blk != "" { if (blk == want) print $1; next }
+                $1 == want { print $2 }
+              ' "$1/go.mod"
+            }
+            mod_dirs=$(jq -r '.[]' <<< "$go_nested_dirs")
+            [ -f go.mod ] && mod_dirs=$(printf '.\n%s' "$mod_dirs")
+            mod_paths=$(while IFS= read -r d; do if [ -n "$d" ]; then gomod_field "$d" module; fi; done <<< "$mod_dirs")
+            while IFS= read -r d; do
+              [ -z "$d" ] && continue
+              own=$(gomod_field "$d" module)
+              replaced=$(gomod_field "$d" replace)
+              while IFS= read -r p; do
+                if [ -n "$p" ] && [ "$p" != "$own" ] && grep -qxF -- "$p" <<< "$mod_paths" \
+                  && ! grep -qxF -- "$p" <<< "$replaced"; then
+                  run_go_work=true
+                fi
+              done < <(gomod_field "$d" require)
+            done <<< "$mod_dirs"
+            if [ "$run_go_work" = true ]; then
+              go_work_dirs=$(jq -cR '[., inputs | select(. != "")]' <<< "$mod_dirs")
+            fi
+
+            # A module's TS half at <dir>/web (release.yaml's go_halves shape) is a
+            # library, so it gets ts-ci without the web job's frontend lint.
+            while IFS= read -r d; do
+              if [ -n "$(git ls-files "$d/web/package.json" "$d/web/jsr.json")" ]; then
+                ts_nested_dirs=$(echo "$ts_nested_dirs" | jq -c --arg v "$d/web" '. + [$v]')
+              fi
+            done < <(jq -r '.[]' <<< "$go_nested_dirs")
+            if [ "$ts_nested_dirs" != "[]" ]; then
+              run_ts_nested=true
+            fi
+
             # Probe known nested web-frontend locations. First hit wins.
             # Add new paths centrally if a future repo introduces a different
             # layout — no per-repo override needed. scripts/test-lane-semantics.sh
@@ -164,14 +214,23 @@ jobs:
             # The root is a dead-code target exactly when deadset finds a language
             # there: deadset-ci.yaml's Resolve target replays the same rule, and a
             # test runs both on one fixture set. deadset-go's `./...` stops at a
-            # nested module, so each one is its own target.
+            # nested module, so each one is its own target, and a root with no
+            # go.mod leaves every module's Go to that module's target.
             root_languages=""
             if [ -f deadset.json ]; then
               root_languages=$(jq -r '.analysis.languages // [] | join(",")' deadset.json 2> /dev/null || true)
             fi
             if [ -z "$root_languages" ]; then
               names=$(find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o \( -type f -o -type l \) -print | sed 's|.*/||')
-              if grep -qxE 'go\.mod|.+\.go|tsconfig.*\.json' <<< "$names" \
+              go_names=$names
+              if [ ! -f go.mod ]; then
+                # go-nested skips a module under static/ or dist/, so no target covers its Go.
+                go_names=$({
+                  find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' -o -exec test -e '{}/go.mod' \; \) -prune \) -o \( -type f -o -type l \) -print
+                  find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o -name go.mod \( -path '*/static/*' -o -path '*/dist/*' \) -print
+                } | sed 's|.*/||')
+              fi
+              if grep -qxE 'go\.mod|.+\.go' <<< "$go_names" || grep -qxE 'tsconfig.*\.json' <<< "$names" \
                 || { grep -qE '\.(ts|tsx|mts|cts)$' <<< "$names" && grep -qx 'package\.json' <<< "$names"; }; then
                 root_languages=detected
               fi
@@ -189,6 +248,10 @@ jobs:
             echo "run_go=$run_go"
             echo "run_go_nested=$run_go_nested"
             echo "go_nested_dirs=$go_nested_dirs"
+            echo "run_ts_nested=$run_ts_nested"
+            echo "ts_nested_dirs=$ts_nested_dirs"
+            echo "run_go_work=$run_go_work"
+            echo "go_work_dirs=$go_work_dirs"
             echo "run_ts=$run_ts"
             echo "run_web=$run_web"
             echo "run_shell=$run_shell"
@@ -208,8 +271,10 @@ jobs:
             echo "|---|---|---|"
             echo "| go       | $run_go | . |"
             echo "| go-nested | $run_go_nested | $go_nested_dirs |"
+            echo "| go-work  | $run_go_work | $go_work_dirs |"
             echo "| ts       | $run_ts | . |"
             echo "| web      | $run_web | ${web_dir:-—} |"
+            echo "| ts-nested | $run_ts_nested | $ts_nested_dirs |"
             echo "| shell    | $run_shell | . |"
             echo "| docker   | $run_docker | . |"
             echo "| python   | $run_python | . |"
@@ -247,6 +312,46 @@ jobs:
       working-directory: ${{ matrix.dir }}
       go-version-file: ${{ matrix.dir }}/go.mod
 
+  # Builds every module's head against the others' heads, so a change that breaks
+  # a sibling fails before it is tagged; the go.work exists only in this checkout.
+  go-work:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_go_work == 'true' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ fromJSON(needs.detect.outputs.go_work_dirs)[0] }}/go.mod
+          cache-dependency-path: '**/go.sum'
+
+      # go.work's go line is the highest module's, which can sit above the
+      # toolchain setup-go installed from the first module (setup-go exports
+      # GOTOOLCHAIN=local).
+      - name: Build and test every module under one go.work
+        env:
+          DIRS: ${{ needs.detect.outputs.go_work_dirs }}
+          GOTOOLCHAIN: auto
+        run: |
+          mapfile -t dirs < <(jq -r '.[]' <<< "$DIRS")
+          go work init
+          go work use "${dirs[@]}"
+          rc=0
+          for d in "${dirs[@]}"; do
+            echo "::group::$d"
+            if ! (cd "$d" && go build ./... && go test -count=1 -race ./...); then
+              echo "::error::$d does not build or pass its tests against the other modules' heads"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$rc"
+
   ts:
     needs: detect
     if: ${{ needs.detect.outputs.run_ts == 'true' }}
@@ -259,6 +364,17 @@ jobs:
     with:
       working-directory: ${{ needs.detect.outputs.web_dir }}
       web-lint: true
+
+  ts-nested:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_ts_nested == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.detect.outputs.ts_nested_dirs) }}
+    uses: ./.github/workflows/ts-ci.yaml
+    with:
+      working-directory: ${{ matrix.dir }}
 
   shell:
     needs: detect
@@ -1116,7 +1232,7 @@ jobs:
   # per-type templates so existing branch-protection rules keep working
   # without per-repo updates).
   validate:
-    needs: [detect, repo, go, go-nested, ts, web, shell, deadset, deadset-canary, docker, docker-arm64, markdown, python, scripts, pr-policy]
+    needs: [detect, repo, go, go-nested, go-work, ts, web, ts-nested, shell, deadset, deadset-canary, docker, docker-arm64, markdown, python, scripts, pr-policy]
     if: always()
     runs-on: ubuntu-26.04
     timeout-minutes: 1
@@ -1127,8 +1243,10 @@ jobs:
           REPO: ${{ needs.repo.result }}
           GO: ${{ needs.go.result }}
           GO_NESTED: ${{ needs.go-nested.result }}
+          GO_WORK: ${{ needs.go-work.result }}
           TS: ${{ needs.ts.result }}
           WEB: ${{ needs.web.result }}
+          TS_NESTED: ${{ needs.ts-nested.result }}
           SHELL: ${{ needs.shell.result }}
           DEADSET: ${{ needs.deadset.result }}
           DEADSET_CANARY: ${{ needs.deadset-canary.result }}
@@ -1151,7 +1269,7 @@ jobs:
           # them, which exposes a blind detection that skipped everything.
           ran=0
           skipped=0
-          set -- "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "ts=$TS" "web=$WEB" "shell=$SHELL" "deadset=$DEADSET" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"
+          set -- "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "go-work=$GO_WORK" "ts=$TS" "web=$WEB" "ts-nested=$TS_NESTED" "shell=$SHELL" "deadset=$DEADSET" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"
           # pr-policy runs on two-branch repositories only, so only there is it
           # counted and listed.
           if [ "$TWO_BRANCH" = true ]; then

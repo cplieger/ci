@@ -63,8 +63,9 @@ jobs:
       # central file's, else deadset's detection by file name, which records
       # every non-directory entry (commands.md "How languages are detected").
       # A nested module's central file names go alone, because deadset-ts at
-      # the root already reads every tsconfig under it. A language whose setup
-      # cannot be derived fails here.
+      # the root already reads every tsconfig under it; a root with no go.mod
+      # leaves out the Go its modules hold. A language whose setup cannot be
+      # derived fails here.
       - name: Resolve target
         id: target
         env:
@@ -86,13 +87,26 @@ jobs:
           if [ -z "$languages" ]; then
             languages_from=detected
             names="$(find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o \( -type f -o -type l \) -print | sed 's|.*/||')"
+            go_names="$names"
+            if [ ! -f go.mod ]; then
+              # meta ci.yaml's go-nested skips a module under static/ or dist/, so no target covers its Go.
+              go_names="$({
+                find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' -o -exec test -e '{}/go.mod' \; \) -prune \) -o \( -type f -o -type l \) -print
+                find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o -name go.mod \( -path '*/static/*' -o -path '*/dist/*' \) -print
+              } | sed 's|.*/||')"
+            fi
             found=()
-            if grep -qxE 'go\.mod|.+\.go' <<<"$names"; then found+=(go); fi
+            if grep -qxE 'go\.mod|.+\.go' <<<"$go_names"; then found+=(go); fi
             if grep -qxE 'tsconfig.*\.json' <<<"$names" \
               || { grep -qE '\.(ts|tsx|mts|cts)$' <<<"$names" && grep -qx 'package\.json' <<<"$names"; }; then
               found+=(ts)
             fi
             languages="$(IFS=,; printf '%s' "${found[*]:-}")"
+            # deadset's own detection would count the modules' Go again.
+            if [ "$languages" = ts ] && grep -qxE 'go\.mod|.+\.go' <<<"$names"; then
+              languages_from="central: Go only in nested modules"
+              central_languages='["ts"]'
+            fi
           fi
           go=false
           ts=false
