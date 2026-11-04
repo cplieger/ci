@@ -201,7 +201,7 @@ jobs:
       - name: Publish surface (registries ship exactly the public API)
         id: publish_surface
         continue-on-error: true
-        uses: cplieger/ci/actions/publish-surface@3731702cb3006acd313036b67503282bc7a3ff38 # v3
+        uses: cplieger/ci/actions/publish-surface@94392240ea227f342e5b42c95cfa6490dcbd4b9b # v3
         with:
           package-dir: ${{ inputs.working-directory }}
 
