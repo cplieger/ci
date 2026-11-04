@@ -12,8 +12,10 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | any files | `markdown` | markdownlint-cli2, and lychee offline for internal links and heading anchors |
 | `go.mod` at the root | `go` | `go-ci.yaml` |
 | a `go.mod` in a subfolder, with tracked Go files | `go-nested` | `go-ci.yaml` once per module folder |
+| a Go module whose `go.mod` requires another module of the repository with no `replace` for it | `go-work` | a build and `go test -race` of every module against the other modules' current code, under a `go.work` the job creates and never commits |
 | `jsr.json` at the root | `ts` | `ts-ci.yaml` |
 | a `package.json` or `jsr.json` in `static-src/`, `web/`, `internal/server/static-src/` or `internal/webui/static-src/` | `web` | `ts-ci.yaml` in the first folder found, with the CSS and HTML lints on |
+| a `package.json` or `jsr.json` in the `web/` folder of a `go-nested` module | `ts-nested` | `ts-ci.yaml` once per such folder |
 | a `Dockerfile`, or a root `go.mod` or `jsr.json` and a tracked `.sh` file outside `node_modules`, `vendor`, `testdata` and `dist` | `shell` | `shell-ci.yaml`, with hadolint only when there is a `Dockerfile` |
 | any files | `deadset` | `deadset-ci.yaml` at the repository root, and once per nested Go module folder with tracked Go files |
 | a `Dockerfile` | `docker`, `docker-arm64` | an image build on `amd64`, and on `arm64` in public repositories, with no push and no scan |
@@ -22,6 +24,8 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | a pull request, in a repository whose default branch is `dev` | `pr-policy` | a conventional-commit check of the title, and on a pull request into `main` a check of what its head branch may change |
 
 The `shell` and `scripts` jobs never both run, so no shell script is checked twice.
+
+`go-ci.yaml` runs with `GOWORK=off`, so each module builds against the versions of the other modules that its `go.mod` names, as a consumer's build does. A module that starts using a change to another module of the repository therefore fails its `go-nested` job until that module's change is tagged and the `require` names the tag. The `go-work` job catches the opposite case: a change to one module that breaks another fails there, before either is tagged.
 
 After the `amd64` build, the `docker` job runs two optional image tests. The shared smoke harness runs when the repository has `tests/image-smoke.conf`. A repository's own `tests/image-test.sh` runs with the image reference as its first argument, and it must be committed as executable. The release workflow runs both again on every image it builds, as [the release workflow](#the-release-workflow) describes.
 
@@ -43,6 +47,8 @@ In a TypeScript package with a knip configuration, `ts-ci.yaml` also runs [knip]
 ## The dead-code check
 
 `deadset-ci.yaml` runs [deadset](https://github.com/cplieger/deadset) at the repository root, and once in each nested Go module folder. The root run covers the Go and TypeScript that deadset finds there, with deadset-go and deadset-ts, so deadset can match an edge that crosses from one language to the other. deadset-go stops at a nested module's `go.mod`, so each nested module gets its own run for its Go. deadset-ts at the root already reads every TypeScript project below it, nested modules included, so a nested run leaves TypeScript out.
+
+In a repository with no `go.mod` at the root, the root run leaves out the Go inside nested module folders, which their own runs cover. The root run then covers only TypeScript, and passes with nothing checked when the repository has none. Go outside every module folder, or a root `deadset.json` naming Go, still fails the root run, because the root has no `go.mod` to load Go from.
 
 A run reads its settings from `deadset.json` at its root. Every key that file sets wins, except `reporters.formats`: the workflow always asks for text and SARIF. When the file leaves `target.kind` out, it is `application` if the folder has a `Dockerfile` and `library` otherwise. deadset then reports no unused export from a library's published API, because callers outside the repository may use it.
 
