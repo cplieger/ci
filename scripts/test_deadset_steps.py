@@ -394,6 +394,7 @@ VALIDATE_JOBS = [
     'REPO',
     'GO',
     'GO_NESTED',
+    'GO_WORK',
     'TS',
     'WEB',
     'TS_NESTED',
