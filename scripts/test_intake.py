@@ -774,7 +774,7 @@ class Workflow(unittest.TestCase):
         proc, summary = self.aggregate()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn('pr-policy: skipped', proc.stdout)
-        self.assertIn('of 14 dispatched jobs', summary)
+        self.assertIn('of 15 dispatched jobs', summary)
         self.assertIn('| pr-policy | skipped |\n', summary)
 
     def test_validate_fails_on_a_failed_pr_policy(self):
@@ -790,9 +790,9 @@ class Workflow(unittest.TestCase):
                 proc, summary = self.aggregate('dev', go='success', **flags)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertNotIn('pr-policy', proc.stdout + summary)
-                self.assertIn('of 13 dispatched jobs', summary)
+                self.assertIn('of 14 dispatched jobs', summary)
 
-    def test_a_main_default_validate_reports_thirteen_jobs_and_no_pr_policy(self):
+    def test_a_main_default_validate_reports_fourteen_jobs_and_no_pr_policy(self):
         proc, summary = self.aggregate('main', go='success')
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn('pr-policy', proc.stdout)
@@ -802,6 +802,7 @@ class Workflow(unittest.TestCase):
                 ('repo', 'success'),
                 ('go', 'success'),
                 ('go-nested', 'skipped'),
+                ('go-work', 'skipped'),
                 ('ts', 'skipped'),
                 ('web', 'skipped'),
                 ('ts-nested', 'skipped'),
@@ -817,7 +818,7 @@ class Workflow(unittest.TestCase):
         self.assertEqual(
             summary,
             '## CI validate\n\n'
-            '**ran 3 / skipped 10** (of 13 dispatched jobs; detect: success)\n\n'
+            '**ran 3 / skipped 11** (of 14 dispatched jobs; detect: success)\n\n'
             '| Job | Result |\n|---|---|\n' + rows,
         )
 

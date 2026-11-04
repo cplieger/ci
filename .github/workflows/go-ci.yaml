@@ -19,6 +19,10 @@ jobs:
   validate:
     runs-on: ubuntu-26.04
     timeout-minutes: 30
+    # A module builds against the versions its go.mod names, as its consumers do;
+    # ci.yaml's go-work job tests the modules' heads together.
+    env:
+      GOWORK: 'off'
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
