@@ -289,7 +289,9 @@ class RootLessDeadset(Harness):
         self.assertEqual(target.outputs['modules_only_go'], 'true')
         self.assertEqual(run.rc, 0, run.out)
         self.assertEqual(run.outputs['analyze'], 'false')
-        self.assertIn('::notice::deadset finds no program at . outside its nested Go modules', run.out)
+        self.assertIn(
+            '::notice::deadset finds no program at . outside its nested Go modules', run.out
+        )
 
     def test_the_root_of_module_halves_analyzes_only_their_typescript(self):
         out = run_detect(self, ROOTLESS)
@@ -297,7 +299,8 @@ class RootLessDeadset(Harness):
         target, run = self.root(ROOTLESS, census('go', 'ts'), census('ts', provenance='central'))
         self.assertEqual(run.rc, 0, run.out)
         self.assertEqual(
-            (run.outputs['analyze'], run.outputs['go'], run.outputs['ts']), ('true', 'false', 'true')
+            (run.outputs['analyze'], run.outputs['go'], run.outputs['ts']),
+            ('true', 'false', 'true'),
         )
         asked = [json.loads(run.logged(f'central.{n}.json')) for n in (0, 1)]
         self.assertNotIn('analysis', asked[0])
@@ -322,7 +325,9 @@ class RootLessDeadset(Harness):
                 target, run = self.root(files, census('go'))
                 self.assertEqual(target.outputs['modules_only_go'], 'false')
                 self.assertEqual(run.rc, 1, run.out)
-                self.assertIn('::error::Go is in scope at . (detected), but . has no go.mod', run.out)
+                self.assertIn(
+                    '::error::Go is in scope at . (detected), but . has no go.mod', run.out
+                )
 
     def test_a_repository_file_still_decides(self):
         files = {**GO_MODULES_ONLY, 'deadset.json': '{"analysis":{"languages":["go"]}}'}
@@ -334,6 +339,7 @@ class RootLessDeadset(Harness):
     def test_a_root_go_module_is_never_modules_only(self):
         target, _ = self.root({**ROOTLESS, 'go.mod': 'module example.com/r\n'}, census('go', 'ts'))
         self.assertEqual(target.outputs['modules_only_go'], 'false')
+
 
 if __name__ == '__main__':
     unittest.main()
