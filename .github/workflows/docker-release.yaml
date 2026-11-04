@@ -117,6 +117,13 @@ on:
           overrides a Dockerfile LABEL of the same key.
         type: string
         default: ""
+      binaries:
+        description: >-
+          The client a stable Release carries as binaries, <name>=<package>
+          (the caller's policy step resolves it per repo). Empty builds none.
+          scripts/release-assets.sh builds the package for each of its targets.
+        type: string
+        default: ""
     secrets:
       DOCKERHUB_USERNAME:
         required: false
@@ -1403,19 +1410,31 @@ jobs:
           fi
           bash "$CI_TOOLS/render-notes.sh" "${args[@]}"
 
-      # A cosign bundle beside the SBOM and each tree file lets a consumer
-      # verify it without pulling the image, whose signatures live in the registry.
+      # The module's own go and toolchain lines pick the compiler (GOTOOLCHAIN=auto
+      # on the step that builds).
+      - name: Set up Go for the release binaries
+        if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && inputs.binaries != '' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
+      # A cosign bundle beside the SBOM, each tree file and each binary lets a
+      # consumer verify it without pulling the image, whose signatures live in the registry.
       - name: Stage and sign the release assets
         if: ${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           VERSION: ${{ inputs.version }}
+          BINARIES: ${{ inputs.binaries }}
+          GOTOOLCHAIN: auto
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/release-assets"
           mkdir -p "$dir"
           cp sbom.spdx.json "$dir/"
           bash "$CI_TOOLS/release-assets.sh" stage "$GITHUB_SHA" "$dir"
+          bash "$CI_TOOLS/release-assets.sh" build "$GITHUB_SHA" "$VERSION" "$dir"
           bash "$CI_TOOLS/release-assets.sh" sign "$VERSION" "$dir"
 
       # The tag ref is created via the git data API pinned to $GITHUB_SHA
@@ -1738,6 +1757,13 @@ jobs:
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
+      - name: Set up Go for the release binaries
+        if: ${{ steps.release.outputs.missing == 'true' && inputs.binaries != '' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
       - name: Sign the release assets
         if: ${{ steps.release.outputs.missing == 'true' }}
         env:
@@ -1745,6 +1771,8 @@ jobs:
           TAG: ${{ inputs.repair-tag }}
           EXCLUDE_RE: ${{ inputs.exclude-re }}
           SUBPACKAGES_JSON: ${{ inputs.subpackages }}
+          BINARIES: ${{ inputs.binaries }}
+          GOTOOLCHAIN: auto
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/assets"
@@ -1758,6 +1786,7 @@ jobs:
             exit 1
           fi
           bash "$CI_TOOLS/release-assets.sh" stage "$TAG" "$out"
+          bash "$CI_TOOLS/release-assets.sh" build "$TAG" "$TAG" "$out"
           bash "$CI_TOOLS/release-assets.sh" sign "$TAG" "$out"
 
       - name: Hand the assets on

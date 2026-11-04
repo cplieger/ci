@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# The assets of an image's GitHub Release, gathered in one directory: the SBOM
-# and each TREE_FILES file the tagged tree holds, each with a cosign bundle beside
-# it, and each tree file also with its .sha256 checksum.
+# The assets of an image's GitHub Release, gathered in one directory: the SBOM,
+# each TREE_FILES file the tagged tree holds and, for a repository opted in, its
+# client binaries, each with a cosign bundle beside it, and each tree file and
+# binary also with its .sha256 checksum.
 #   stage <tree-ish> <dir>  writes each TREE_FILES file the tree holds into an existing <dir>, with its checksum; reads git in the working directory
+#   build <tree-ish> <tag> <dir>  with BINARIES=<name>=<package>, builds the package at the tree for each BINARY_TARGETS entry as <name>-<goos>-<goarch>[.exe] with its checksum, stamped -X main.version=<tag>, and lists them in <dir>/binary-assets.txt; nothing without BINARIES
 #   sign <tag> <dir>        writes <file>.sigstore.json beside the SBOM and each staged file
 #   names <tag> <dir>       prints the Release's asset names, one per line; fails naming the first file <dir> lacks or holds empty
 #   check <tag> <name...>   fails naming the first name GITHUB_REPOSITORY's published Release of <tag> does not list
@@ -16,6 +18,9 @@ TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SBOM=sbom.spdx.json
 # A file's asset name is its basename, so no two paths here may share one.
 TREE_FILES=(grafana-dashboard.json docs/openapi.json)
+BINARY_TARGETS=(linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64)
+# Not an asset: sign and names read it to know which binaries the build step made.
+BINARY_LIST=binary-assets.txt
 
 die() {
   echo "::error::$*" >&2
@@ -38,6 +43,47 @@ cmd_stage() { # <tree-ish> <dir>
   done
 }
 
+cmd_build() { # <tree-ish> <tag> <dir>
+  local tree=$1 tag=$2 dir=$3 name pkg src target goos goarch out
+  [ -n "${BINARIES:-}" ] || return 0
+  case "$BINARIES" in
+    *=*) name=${BINARIES%%=*} pkg=${BINARIES#*=} ;;
+    *) die "BINARIES must be <name>=<package>, got '${BINARIES}'" ;;
+  esac
+  case "$name" in
+    '' | .* | *[!a-z0-9._-]*) die "the binary name in BINARIES must be lowercase letters, digits, '.', '_' or '-', got '${name}'" ;;
+  esac
+  case "$pkg" in
+    . | ./*) ;;
+    *) die "the package in BINARIES must be . or ./<dir>, got '${pkg}'" ;;
+  esac
+  case "/$pkg/" in
+    */../*) die "the package in BINARIES must stay inside the repository, got '${pkg}'" ;;
+  esac
+  # A worktree of the tree, so the binary is the release commit's whatever the
+  # job checked out.
+  src=$(mktemp -d)
+  git worktree add --quiet --detach "$src" "$tree" || die "git cannot check out ${tree} to build ${name}"
+  : >"$dir/$BINARY_LIST"
+  for target in "${BINARY_TARGETS[@]}"; do
+    goos=${target%/*} goarch=${target#*/}
+    out="${name}-${goos}-${goarch}"
+    [ "$goos" != windows ] || out="${out}.exe"
+    if ! (cd "$src" && CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+      go build -trimpath -ldflags "-s -w -X main.version=${tag}" -o "$dir/$out" "$pkg"); then
+      git worktree remove --force "$src"
+      die "${out} is missing, because go build of ${pkg} for ${target} failed. ${tag} is not published without it."
+    fi
+    (cd "$dir" && sha256sum "$out" >"$out.sha256")
+    printf '%s\n' "$out" >>"$dir/$BINARY_LIST"
+  done
+  git worktree remove --force "$src"
+}
+
+binaries_in() { # <dir> -> the binary names the build step listed, one per line
+  [ ! -e "$1/$BINARY_LIST" ] || cat "$1/$BINARY_LIST"
+}
+
 cmd_sign() { # <tag> <dir>
   local tag=$1 dir=$2 path name
   local files=("$SBOM")
@@ -46,6 +92,11 @@ cmd_sign() { # <tag> <dir>
     name=${path##*/}
     [ ! -e "$dir/$name" ] || files+=("$name")
   done
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    [ -s "$dir/$name" ] || die "${name} is missing. ${tag} is not published without it."
+    files+=("$name")
+  done < <(binaries_in "$dir")
   cd "$dir"
   for name in "${files[@]}"; do
     # cosign v3 requires --bundle: its one .sigstore.json carries the
@@ -68,6 +119,9 @@ cmd_names() { # <tag> <dir>
       fi
     done
   done
+  while IFS= read -r name; do
+    [ -z "$name" ] || names+=("$name" "$name.sha256" "$name.sigstore.json")
+  done < <(binaries_in "$dir")
   for f in "${names[@]}"; do
     [ -s "$dir/$f" ] || die "${f} is missing. ${tag} is not published without it."
   done
@@ -101,9 +155,10 @@ cmd_cleanup_drafts() { # <tag>
 
 case "${1:-}" in
   stage) cmd_stage "${2:?usage: release-assets.sh stage TREE-ISH DIR}" "${3:?usage: release-assets.sh stage TREE-ISH DIR}" ;;
+  build) cmd_build "${2:?usage: release-assets.sh build TREE-ISH TAG DIR}" "${3:?usage: release-assets.sh build TREE-ISH TAG DIR}" "${4:?usage: release-assets.sh build TREE-ISH TAG DIR}" ;;
   sign) cmd_sign "${2:?usage: release-assets.sh sign TAG DIR}" "${3:?usage: release-assets.sh sign TAG DIR}" ;;
   names) cmd_names "${2:?usage: release-assets.sh names TAG DIR}" "${3:?usage: release-assets.sh names TAG DIR}" ;;
   check) cmd_check "${2:?usage: release-assets.sh check TAG NAME...}" "${@:3}" ;;
   cleanup-drafts) cmd_cleanup_drafts "${2:?usage: release-assets.sh cleanup-drafts TAG}" ;;
-  *) die "usage: release-assets.sh stage|sign|names|check|cleanup-drafts ..." ;;
+  *) die "usage: release-assets.sh stage|build|sign|names|check|cleanup-drafts ..." ;;
 esac
