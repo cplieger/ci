@@ -995,12 +995,33 @@ jobs:
       # is [vuln,secret], and image-layer secret detection (a build ARG, a
       # gitignored COPY, the base image) is coverage gitleaks' git-tree scan
       # cannot provide, so a Trivy default change must not silently drop it.
+      # trivy-action's own installer downloads from get.trivy.dev, which
+      # stopped resolving on 2026-11-03
+      # (https://github.com/aquasecurity/setup-trivy/issues/42).
+      - name: Install Trivy
+        if: ${{ env.PUBLISH == 'true' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          tgz="trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz"
+          base="https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}"
+          for f in "$tgz" "$tgz.sigstore.json"; do
+            curl -fsSL --connect-timeout 10 --max-time 120 --retry 7 --retry-max-time 150 --retry-all-errors \
+              -o "$RUNNER_TEMP/$f" "$base/$f"
+          done
+          cosign verify-blob --bundle "$RUNNER_TEMP/$tgz.sigstore.json" \
+            --certificate-identity "https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/${TRIVY_VERSION}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$RUNNER_TEMP/$tgz"
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          tar xzf "$RUNNER_TEMP/$tgz" -C "$RUNNER_TEMP/trivy-bin" trivy
+          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+
       - name: Trivy scan published image
         if: ${{ env.PUBLISH == 'true' }}
         continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
           scanners: 'vuln,secret'
           format: 'sarif'

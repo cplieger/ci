@@ -19,12 +19,16 @@ on:
 permissions:
   contents: read
 
-# Trivy binary version. Without an explicit version the trivy-action installs
-# its own baked-in default (v0.70.0 at the pinned SHA), which silently drifts
-# from the binary other workflows install directly.
+# The Trivy binary every job installs from its GitHub release, and the cosign
+# that verifies it. trivy-action's own installer (setup-trivy) downloads from
+# get.trivy.dev, which stopped resolving on 2026-11-03
+# (https://github.com/aquasecurity/setup-trivy/issues/42), so each Trivy step
+# sets skip-setup-trivy and runs the binary the Install Trivy step put on PATH.
 env:
   # renovate: datasource=github-releases depName=aquasecurity/trivy
   TRIVY_VERSION: v0.76.1
+  # renovate: datasource=github-releases depName=sigstore/cosign
+  COSIGN_VERSION: v3.1.4
 
 jobs:
   trivy:
@@ -115,6 +119,28 @@ jobs:
           # otherwise-advisory job (which is exactly what happened).
           cache-from: type=gha
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      # Outside the workspace, which the filesystem scans read.
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          tgz="trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz"
+          base="https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}"
+          for f in "$tgz" "$tgz.sigstore.json"; do
+            curl -fsSL --connect-timeout 10 --max-time 120 --retry 7 --retry-max-time 150 --retry-all-errors \
+              -o "$RUNNER_TEMP/$f" "$base/$f"
+          done
+          cosign verify-blob --bundle "$RUNNER_TEMP/$tgz.sigstore.json" \
+            --certificate-identity "https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/${TRIVY_VERSION}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$RUNNER_TEMP/$tgz"
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          tar xzf "$RUNNER_TEMP/$tgz" -C "$RUNNER_TEMP/trivy-bin" trivy
+          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+
       # All Trivy scans here are ADVISORY (exit-code 0): base-image CVEs are often
       # outside the maintainer's control, and build-ability is gated by the
       # required `ci / validate` check instead. `secret` is ABSENT: gitleaks runs
@@ -124,7 +150,7 @@ jobs:
       - name: Trivy filesystem scan (advisory)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
           scan-type: fs
           scanners: 'vuln'
           severity: ${{ inputs.severity }}
@@ -142,7 +168,7 @@ jobs:
       - name: Trivy license scan (advisory)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
           scan-type: fs
           scanners: 'license'
           severity: 'UNKNOWN,MEDIUM,HIGH,CRITICAL'
@@ -154,7 +180,7 @@ jobs:
       - name: Trivy misconfig scan (report-only)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
           scan-type: fs
           scanners: 'misconfig'
           exit-code: '0'
@@ -173,7 +199,7 @@ jobs:
         if: ${{ steps.profile.outputs.image == 'true' && steps.profile.outputs.published != 'true' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
           image-ref: 'ci-scan:latest'
           scanners: 'vuln,secret'
           severity: ${{ inputs.severity }}
@@ -186,7 +212,7 @@ jobs:
         if: ${{ steps.profile.outputs.published == 'true' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
           scan-type: fs
           scanners: 'vuln'
           severity: ${{ inputs.severity }}
@@ -268,6 +294,8 @@ jobs:
       - name: Install cosign
         if: ${{ steps.resolve.outputs.index != '' }}
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
 
       # The signed release SBOM is the record of what the image ships, components
       # built from source included, so the summary reads them from it.
@@ -303,10 +331,31 @@ jobs:
       contents: read
       security-events: write
     steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          tgz="trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz"
+          base="https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}"
+          for f in "$tgz" "$tgz.sigstore.json"; do
+            curl -fsSL --connect-timeout 10 --max-time 120 --retry 7 --retry-max-time 150 --retry-all-errors \
+              -o "$RUNNER_TEMP/$f" "$base/$f"
+          done
+          cosign verify-blob --bundle "$RUNNER_TEMP/$tgz.sigstore.json" \
+            --certificate-identity "https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/${TRIVY_VERSION}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$RUNNER_TEMP/$tgz"
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          tar xzf "$RUNNER_TEMP/$tgz" -C "$RUNNER_TEMP/trivy-bin" trivy
+          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+
       - name: Trivy published image scan (advisory)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
           image-ref: ${{ matrix.ref }}
           scanners: 'vuln,secret'
           severity: ${{ inputs.severity }}
@@ -318,7 +367,7 @@ jobs:
       - name: Trivy published image scan for the main summary
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
           image-ref: ${{ matrix.ref }}
           scanners: 'vuln'
           severity: ${{ inputs.severity }}
