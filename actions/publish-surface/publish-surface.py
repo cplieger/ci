@@ -300,14 +300,9 @@ def npm_shipped(pkg_dir: Path) -> tuple[set[Path], dict[str, bytes]]:
     """
     with tempfile.TemporaryDirectory(prefix='publish-surface-') as tmp:
         proc = run(['npm', 'pack', '--json', '--pack-destination', tmp], cwd=pkg_dir)
-        try:
-            payload = json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
-            raise SurfaceError(f'npm pack --json returned non-JSON: {exc}\n{proc.stdout}') from exc
-        if not payload or 'files' not in payload[0] or 'filename' not in payload[0]:
-            raise SurfaceError(f'npm pack --json payload missing `files`: {proc.stdout[:400]}')
+        entry = pack_entry(proc.stdout)
         packed: dict[str, bytes] = {}
-        with tarfile.open(Path(tmp) / payload[0]['filename']) as tar:
+        with tarfile.open(Path(tmp) / entry['filename']) as tar:
             for name in ATTRIBUTION_FILES:
                 try:
                     member = tar.extractfile(f'package/{name}')
@@ -315,7 +310,25 @@ def npm_shipped(pkg_dir: Path) -> tuple[set[Path], dict[str, bytes]]:
                     continue
                 if member is not None:
                     packed[name] = member.read()
-    return {Path(entry['path']) for entry in payload[0]['files']}, packed
+    return {Path(file['path']) for file in entry['files']}, packed
+
+
+def pack_entry(stdout: str) -> dict:
+    """The package's entry in `npm pack --json` output.
+
+    npm 11 prints a list of entries and npm 12 an object keyed by package name
+    (https://github.com/expo/expo/issues/48091); both carry `filename` and `files`.
+    """
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise SurfaceError(f'npm pack --json returned non-JSON: {exc}\n{stdout}') from exc
+    entries = list(payload.values()) if isinstance(payload, dict) else payload
+    if not isinstance(entries, list) or not entries or not isinstance(entries[0], dict):
+        raise SurfaceError(f'npm pack --json printed no package entry: {stdout[:400]}')
+    if 'files' not in entries[0] or 'filename' not in entries[0]:
+        raise SurfaceError(f'npm pack --json payload missing `files`: {stdout[:400]}')
+    return entries[0]
 
 
 def jsr_shipped(pkg_dir: Path) -> set[Path]:
