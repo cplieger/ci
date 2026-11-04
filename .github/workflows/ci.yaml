@@ -131,9 +131,9 @@ jobs:
               run_go_nested=true
             fi
 
-            # A module requiring a sibling by version, with no replace of it, names a
-            # version that exists only once the sibling is tagged, so every module's
-            # head is also tested together under a generated go.work.
+            # A module requiring a sibling by version, with no replace of it, builds
+            # against the sibling's tag, so every module's head is also tested
+            # together under a generated go.work.
             gomod_field() {
               awk -v want="$2" '
                 { gsub(/"/, "") }

@@ -1,14 +1,13 @@
 name: TS CI
 
 # Reusable TypeScript-library CI for build-less ESM packages. Called by the
-# meta ci.yaml (`ts` job at the root, `ts-nested` at each module's <dir>/web,
-# `web` job at a nested frontend dir with web-lint: true); consumers pin the
-# meta workflow by SHA with a
-# major-version comment.
+# meta ci.yaml: `ts` at the root, `ts-nested` at each module's <dir>/web, and
+# `web` at a nested frontend dir with web-lint: true. Consumers pin the meta
+# workflow by SHA with a major-version comment.
 # Node is pinned below to the same major release.yaml publishes with, so the
-# tested and published environments match (and the version doesn't drift
-# silently with runner-image updates). `tsc` comes from each repo's own
-# `@typescript/native` devDependency (matches the apps' build-less pipeline).
+# tested and published environments match and the version doesn't drift
+# silently with runner-image updates. `tsc` comes from each repo's own
+# `@typescript/native` devDependency.
 
 on:
   workflow_call:
