@@ -502,6 +502,96 @@ class PrivateOnDev(unittest.TestCase):
         self.assertIn('secret', groups_by_base(out)[ci, None])
 
 
+ROOTLESS_LANES = [
+    'README.md',
+    'alpha',
+    'alpha/go.mod',
+    'alpha/alpha.go',
+    'beta',
+    'beta/go.mod',
+    'beta/cmd/beta/main.go',
+]
+WEB_HALF = ['alpha/web', 'alpha/web/package.json', 'alpha/web/jsr.json', 'alpha/web/go.mod']
+
+
+def rootless_fixture(trees, branch='dev', name='lanes'):
+    """MAIN_FIXTURE plus one repo whose bases (or HEAD) hold `trees`."""
+    fx = copy.deepcopy(MAIN_FIXTURE)
+    fx['repos'].append(repo(name, branch))
+    refs = ('dev', 'main') if branch == 'dev' else ('HEAD',)
+    fx['trees'].update({f'{name}@{ref}': trees for ref in refs})
+    fx['tags'][name] = ['alpha/v1.1.0', 'alpha/v1.2.0-dev.1']
+    return fx
+
+
+def groups_of(out, name):
+    """{base: sorted group comments naming `name`}, base None for single-branch."""
+    found = {}
+    for (comment, base), names in groups_by_base(out).items():
+        if name in names:
+            found.setdefault(base, []).append(comment.split(' (base: ')[0])
+    return {base: sorted(comments) for base, comments in found.items()}
+
+
+class RootLessGo(unittest.TestCase):
+    """A repo with no root go.mod whose product is its nested Go modules."""
+
+    CI = 'Unified CI (auto-detects go/ts/web/shell surfaces)'
+    GOLANGCI = 'Go-tooling configs (Go-having repos)'
+    TS = 'TypeScript lint/format configs'
+    RELEASE = 'Release (unified auto-detect)'
+    CLIFF = 'Cliff config (stable — v1.x+)'
+    RENOVATE = 'Two-branch Renovate delta (repos whose default branch is dev)'
+
+    def classify(self, fx, name='lanes'):
+        rc, out, err, _calls = run_classify(SCRIPTS / 'classify-repos.py', fx)
+        self.assertEqual(rc, 0, err)
+        return groups_of(out, name), err
+
+    def test_two_branch_nested_modules_with_a_web_half_release_as_go(self):
+        groups, err = self.classify(rootless_fixture(ROOTLESS_LANES + WEB_HALF))
+        want = sorted([self.CI, self.GOLANGCI, self.TS, self.RELEASE, self.CLIFF, self.RENOVATE])
+        self.assertEqual(groups, {'dev': want, 'main': want})
+        for base in ('dev', 'main'):
+            self.assertRegex(
+                err,
+                rf'classified: lanes +lang=go +web=true +cliff=stable +release=true base={base}',
+            )
+
+    def test_without_a_web_half_no_ts_configs_sync(self):
+        groups, _err = self.classify(rootless_fixture(ROOTLESS_LANES))
+        want = sorted([self.CI, self.GOLANGCI, self.RELEASE, self.CLIFF, self.RENOVATE])
+        self.assertEqual(groups, {'dev': want, 'main': want})
+
+    def test_vendored_testdata_and_sentinel_modules_do_not_count(self):
+        trees = [
+            'README.md',
+            'vendor/x/go.mod',
+            'vendor/x/x.go',
+            'tools/testdata/m/go.mod',
+            'tools/testdata/m/m.go',
+            'site/node_modules/y/go.mod',
+            'site/node_modules/y/y.go',
+            *WEB_HALF,
+        ]
+        groups, err = self.classify(rootless_fixture(trees))
+        self.assertEqual(groups, {'dev': [self.RENOVATE], 'main': [self.RENOVATE]})
+        self.assertRegex(
+            err, r'classified: lanes +lang=none +web=false +cliff=stable +release=false'
+        )
+
+    def test_a_single_branch_root_less_repo_keeps_its_own_ci(self):
+        groups, err = self.classify(rootless_fixture(ROOTLESS_LANES, branch='main'))
+        self.assertEqual(groups, {})
+        self.assertRegex(err, r'classified: lanes +lang=none +web=false\n')
+
+    def test_a_root_module_repo_is_classified_as_before(self):
+        trees = ['go.mod', 'main.go', 'sub/go.mod', 'sub/sub.go']
+        groups, _err = self.classify(rootless_fixture(trees))
+        want = sorted([self.CI, self.GOLANGCI, self.RELEASE, self.CLIFF, self.RENOVATE])
+        self.assertEqual(groups, {'dev': want, 'main': want})
+
+
 class WrongShapeTags(unittest.TestCase):
     """A tags response that parses but is not a list of named tag objects."""
 
