@@ -259,21 +259,24 @@ TS_ONLY = {
 IMAGE_ONLY = {'Dockerfile': 'FROM scratch\n', 'run.sh': '#!/bin/sh\n'}
 CENSUS_STEP = 'Languages in scope (deadset)'
 INSTALL_STEP = 'Install analyzers and dependencies'
-# The class lines deadset v2.0.0-dev.24 prints for a tree with no program and
+# The class lines deadset v2.0.0-dev.26 prints for a tree with no program and
 # for a tree holding only Protocol Buffers.
 NO_PROGRAM = (
     'setup failure: no-program: no file under /w puts a language in scope, so it holds no '
-    'program; run from the directory that holds a program'
+    'program; run from the directory that holds a program (go reads one from go.mod or a .go '
+    'file; ts reads one from tsconfig*.json or jsconfig*.json or a .js or .jsx or .mjs or .cjs '
+    'file), or name the languages to analyze in analysis.languages'
 )
 UNSUPPORTED = (
     'setup failure: unsupported-language: the census of /w puts only "proto" in scope, and '
     'this build holds no reader of it; run a release of deadset that holds its reader'
 )
-# What deadset v2.0.0-dev.24 prints when deadset-ts finds no inputs in a lone
+# What deadset v2.0.0-dev.26 prints when deadset-ts finds no inputs in a lone
 # tsconfig.json.
 TS_NO_PROGRAM = (
     'setup failure: no-program: no configuration discovery derived could be built; '
-    "tsconfig.json: TS18003: No inputs were found in config file 'tsconfig.json'."
+    "tsconfig.json: TS18003: No inputs were found in config file 'tsconfig.json'. "
+    "Specified 'include' paths were '[\"**/*\"]' and 'exclude' paths were '[]'."
 )
 
 
