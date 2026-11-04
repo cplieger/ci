@@ -111,6 +111,9 @@ EXCLUDE_PATTERNS=(
   # Docs and license
   '\.md$'
   '(^|/)LICENSE$'
+  # The synced license collector: a change to it alone rides each image's next
+  # build rather than rebuilding every image the sync reaches.
+  '^scripts/collect-licenses\.sh$'
   # README images. Root docs/ only, and valid only while no
   # Dockerfile COPYs or embeds docs/ into an image.
   '^docs/.*\.(png|jpe?g|webp|gif|svg)$'
