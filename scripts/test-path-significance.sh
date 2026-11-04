@@ -428,6 +428,25 @@ git tag v1.0.3 "$H8"
 git tag yamlenv/v1.0.3 "$H8"
 H9=$(commit "chore(sync): synced file(s) with cplieger/ci (#9)")
 chk "S26 an empty commit on a Go library releases nothing" "$(release S26 stable "$H8" "$H8" "$H9")" 'false|[]|[]'
+
+# ── The synced license collector rides the next build ───────────────────────
+export GO_LANES_JSON='[]'
+newrepo docker-licenses
+put Dockerfile 'FROM scratch'
+put main.go 'package main'
+put scripts/collect-licenses.sh '#!/bin/sh'
+put scripts/repin-sha.sh '#!/bin/sh'
+K0=$(commit "feat: initial")
+put scripts/collect-licenses.sh '#!/bin/sh # v2'
+K1=$(commit "chore(sync): synced file(s) with cplieger/ci (#2)")
+chk "S36 a change to the synced license collector alone releases nothing" "$(release S34 stable "$K0" "$K0" "$K1")" 'false|[]|[]'
+chk "S36 and MODE=paths lists nothing significant" "$(paths "$K0" "$K1")" 'false|[]|[]|[]'
+put scripts/repin-sha.sh '#!/bin/sh # v2'
+K2=$(commit "chore(sync): synced file(s) with cplieger/ci (#3)")
+chk "S36 another script under scripts/ still counts" "$(paths "$K1" "$K2")" 'true|[]|[]|["scripts/repin-sha.sh"]'
+put cmd/scripts/collect-licenses.sh '#!/bin/sh'
+K3=$(commit "feat: a nested copy")
+chk "S36 only the root copy is excluded" "$(paths "$K2" "$K3")" 'true|[]|[]|["cmd/scripts/collect-licenses.sh"]'
 cd "$WORK" || exit 1
 
 echo "PASS: path significance ($PASS checks)"
