@@ -66,6 +66,7 @@ jobs:
       platforms: ${{ steps.policy.outputs.platforms }}
       syft_config: ${{ steps.policy.outputs.syft_config }}
       image_licenses: ${{ steps.policy.outputs.image_licenses }}
+      binaries: ${{ steps.policy.outputs.binaries }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -524,14 +525,22 @@ jobs:
             SYFT_CONFIG=""
           fi
 
+          # The client an image repository's stable Release carries as
+          # binaries, <name>=<package> (scripts/release-assets.sh build).
+          BINARIES=""
+          case "$REPO_NAME" in
+            grelot) BINARIES="grelot=." ;;
+          esac
+
           {
             echo "registries=$REGISTRIES"
             echo "platforms=$PLATFORMS"
             echo "syft_config=$SYFT_CONFIG"
             echo "image_licenses=$IMAGE_LICENSES"
+            echo "binaries=$BINARIES"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS syft_config='$SYFT_CONFIG' image_licenses='$IMAGE_LICENSES'"
+          echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS syft_config='$SYFT_CONFIG' image_licenses='$IMAGE_LICENSES' binaries='$BINARIES'"
 
   # ─── Repair each lane's unreceipted stable tag first ───────────────────────
   # A lane's tag follows its registry writes, so a failed run can leave only
@@ -652,6 +661,7 @@ jobs:
       repair-tag: ${{ matrix.tag }}
       exclude-re: ${{ needs.detect.outputs.exclude_re }}
       subpackages: ${{ needs.detect.outputs.subpackages }}
+      binaries: ${{ needs.detect.outputs.binaries }}
 
   # Checks out nothing and runs nothing from the repository.
   repair-release:
@@ -1415,6 +1425,7 @@ jobs:
       platforms: ${{ needs.detect.outputs.platforms }}
       syft-config: ${{ needs.detect.outputs.syft_config }}
       image-licenses: ${{ needs.detect.outputs.image_licenses }}
+      binaries: ${{ needs.detect.outputs.binaries }}
     secrets: inherit
 
   # ─── Go module release (tag + GitHub Release; `go install` fetches by tag) ─

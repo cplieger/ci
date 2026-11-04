@@ -138,6 +138,10 @@ gates = {
     "ra-perms": jobs["repair-assets"].get("permissions"),
     "ra-steps": names("repair-assets"),
     "ra-step-ifs": [str(s.get("if", "")) for s in jobs["repair-assets"]["steps"][3:]],
+    "binaries-go-if": step_if("finalize", "Set up Go for the release binaries"),
+    "binaries-go-order": fin.index("Set up Go for the release binaries") + 1 == fin.index("Stage and sign the release assets"),
+    "binaries-go-with": next(s for s in jobs["finalize"]["steps"] if s.get("name") == "Set up Go for the release binaries")["with"],
+    "ra-go-with": next(s for s in jobs["repair-assets"]["steps"] if s.get("name") == "Set up Go for the release binaries")["with"],
     "ra-upload": next(s for s in jobs["repair-assets"]["steps"] if s.get("name") == "Hand the assets on")["with"],
     "ra-cosign": next(s for s in jobs["repair-assets"]["steps"] if s.get("name") == "Install Cosign"),
     "repair-tag-default": wf_inputs["repair-tag"]["default"],
@@ -394,7 +398,14 @@ chk "D-P11 and runs only on a build, so a promotion scans nothing" "$(gate '."sc
 chk "D-P11 and no input, output or policy chooses another source" "$(gate '."sbom-knobs" | join(",")')" ""
 chk "D-P11 the policy hands every image repository the same keys" \
   "$(policy_keys marotte AGPL-3.0)/$(policy_keys web-terminal-kiro MPL-2.0)/$(policy_keys docker-age Apache-2.0)" \
-  "registries platforms syft_config image_licenses /registries platforms syft_config image_licenses /registries platforms syft_config image_licenses "
+  "registries platforms syft_config image_licenses binaries /registries platforms syft_config image_licenses binaries /registries platforms syft_config image_licenses binaries "
+policy_value() { # <repo name> <key> -> that key's value from the policy step
+  : >"$WORK/policy-out"
+  (cd "$WORK" && REPO_NAME="$1" REPO_SPDX_ID=Apache-2.0 GITHUB_OUTPUT="$WORK/policy-out" bash "$WORK/policy.sh") >/dev/null
+  sed -n "s/^$2=//p" "$WORK/policy-out"
+}
+chk "D-P12 grelot's Release carries its client as binaries, and no other repository's does" \
+  "$(policy_value grelot binaries)|$(policy_value marotte binaries)|$(policy_value knell binaries)" "grelot=.||"
 
 # ── Stub curl: the anonymous GHCR token and manifest HEADs ───────────────────
 # BUILT lists the commits that have a `sha-<commit>` tag on the registry;
@@ -1627,6 +1638,36 @@ chk "D-A1 and 3 when the verified statements name another digest" "$(attested v1
 ASSETS_RT="$WORK/rt-assets" ASSETS_DIR="$WORK/rt-assets/assets" ABIN="$WORK/abin"
 mkdir -p "$ABIN"
 ln -s "$NBIN/cosign" "$NBIN/sleep" "$ABIN/"
+# The go stub writes each output with what built it: the target, cgo, the
+# ldflags, the package and the first line of main.go in its working directory,
+# and logs the call; GO_FAIL_TARGET fails one target's build.
+export GO_LOG="$WORK/go.log"
+cat >"$ABIN/go" <<'SH'
+#!/bin/sh
+[ "$1" = build ] || { echo "stub: unexpected go $*" >&2 && exit 22; }
+shift
+out="" ldflags="" pkg="" trim=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -trimpath) trim=1 ;;
+    -ldflags) ldflags=$2 && shift ;;
+    -o) out=$2 && shift ;;
+    -*) echo "stub: unexpected go build flag $1" >&2 && exit 22 ;;
+    *) pkg=$1 ;;
+  esac
+  shift
+done
+[ -n "$out" ] && [ -n "$pkg" ] && [ -n "$trim" ] || { echo "stub: go build needs -trimpath, -o and a package" >&2 && exit 22; }
+printf '%s/%s\n' "$GOOS" "$GOARCH" >>"$GO_LOG"
+if [ "${GO_FAIL_TARGET:-}" = "$GOOS/$GOARCH" ]; then echo "stub: build failed" >&2 && exit 1; fi
+printf '%s/%s cgo=%s ldflags=%s pkg=%s main=%s\n' "$GOOS" "$GOARCH" "$CGO_ENABLED" "$ldflags" "$pkg" "$(head -1 main.go)" >"$out"
+SH
+chmod 755 "$ABIN/go"
+sorted_words() { tr ' ' '\n' <<<"$*" | sed '/^$/d' | sort | tr '\n' ' '; }
+BIN_NAMES=""
+for t in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64.exe windows-arm64.exe; do
+  BIN_NAMES="$BIN_NAMES app-$t app-$t.sha256 app-$t.sigstore.json"
+done
 assets() { # <tag> -> rc|the files handed on, in ASSETS_DIR, with a log in $WORK/assets.log
   local rc=0
   rm -rf "$ASSETS_RT"
@@ -1644,6 +1685,12 @@ chk "D-A2 a tag without a dashboard hands on its attested SBOM and the SBOM's si
   "$(assets v1.2.0)|$(jq -c . "$ASSETS_DIR/sbom.spdx.json")" "0|sbom.spdx.json sbom.spdx.json.sigstore.json |$(jq -c . <<<"$SPDX")"
 chk "D-A2 signed with the release's own bundle name" "$(grep '^sign-blob' "$COSIGN_LOG")|$(cat "$ASSETS_DIR/sbom.spdx.json.sigstore.json")" \
   "sign-blob --yes sbom.spdx.json --bundle sbom.spdx.json.sigstore.json|bundle over $(sha256sum <"$ASSETS_DIR/sbom.spdx.json" | cut -d' ' -f1)"
+: >"$GO_LOG"
+r=$(BINARIES='app=.' assets v1.2.0)
+chk "D-A2 with BINARIES the repair builds the tag's binaries beside its SBOM" "$r|$(signed)" \
+  "0|$(sorted_words "$BIN_NAMES binary-assets.txt sbom.spdx.json sbom.spdx.json.sigstore.json")|7"
+chk "D-A2 from the tag's own tree, stamped with the tag" "$(cat "$ASSETS_DIR/app-linux-amd64")" \
+  "linux/amd64 cgo=0 ldflags=-s -w -X main.version=v1.2.0 pkg=. main=$(git -C "$NOTESREPO" show v1.2.0:main.go)"
 DSH=$(commit_in "$NOTESREPO" "feat: ship a dashboard" grafana-dashboard.json='{"uid":"app"}')
 git -C "$NOTESREPO" tag v2.0.0
 printf '{"uid":"edited after the tag"}' >"$NOTESREPO/grafana-dashboard.json"
@@ -1724,6 +1771,39 @@ chk "D-S2 a release commit without it stages what it staged before" \
 chk "D-S3 a failed signature fails the step" "$(COSIGN_SIGN_RC=1 COSIGN_SIGN_FAIL=openapi.json stage_signed "$OAPI" | cut -d'|' -f1)" "1"
 chk_has "D-S3 naming the bundle" "$(cat "$WORK/ss.log")" \
   "::error::openapi.json.sigstore.json is missing, because cosign could not sign openapi.json. v2.0.1 is not published without it."
+
+# ── The client binaries an opted-in repository's Release carries ────────────
+chk "D-B1 the step hands the caller's binaries input to the build" \
+  "$(sed -n 's/^BINARIES=//p;s/^GOTOOLCHAIN=//p' "$WORK/stagesign.sh.envmap" | tr '\n' ' ')" '${{ inputs.binaries }} auto '
+chk "D-B1 Go is set up only for an opted-in stable publish, before the step" \
+  "$(gate '."binaries-go-if"')|$(gate '."binaries-go-order"')|$(gate '."binaries-go-with" | tojson')" \
+  "\${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && inputs.binaries != '' }}|true|{\"go-version\":\"stable\",\"cache\":false}"
+: >"$GO_LOG"
+chk "D-B2 without BINARIES nothing is built" "$(stage_signed "$DSH" | cut -d'|' -f1)|$(wc -l <"$GO_LOG" | tr -d ' ')" "0|0"
+printf 'v9-working-tree\n' >"$NOTESREPO/main.go"
+r=$(BINARIES='app=.' stage_signed "$DSH")
+git -C "$NOTESREPO" checkout -q -- main.go
+chk "D-B3 BINARIES builds six targets, each with its checksum and signature, beside the other assets" \
+  "$r|$(signed)" "0|$(sorted_words "$BIN_NAMES binary-assets.txt $DASH_NAMES sbom.spdx.json sbom.spdx.json.sigstore.json")|8"
+chk "D-B3 each from the release commit's tree, without cgo, stamped with the tag" \
+  "$(head -c 200 "$SSRT/release-assets/app-windows-arm64.exe")" \
+  "windows/arm64 cgo=0 ldflags=-s -w -X main.version=v2.0.1 pkg=. main=$(git -C "$NOTESREPO" show "$DSH:main.go")"
+chk "D-B3 and its checksum matches it" "$(cd "$SSRT/release-assets" && sha256sum -c app-linux-arm64.sha256)" "app-linux-arm64: OK"
+chk "D-B3 the list names the six binaries in target order" "$(tr '\n' ' ' <"$SSRT/release-assets/binary-assets.txt")" \
+  "app-linux-amd64 app-linux-arm64 app-darwin-amd64 app-darwin-arm64 app-windows-amd64.exe app-windows-arm64.exe "
+chk "D-B3 and leaves no worktree behind" "$(git -C "$NOTESREPO" worktree list | wc -l | tr -d ' ')" "1"
+for bad in 'app' '=.' 'App=.' '.app=.' 'a/b=.' 'app=cmd/app' 'app=/abs' 'app=./../x'; do
+  : >"$GO_LOG"
+  r=$(BINARIES="$bad" stage_signed "$DSH" | cut -d'|' -f1)
+  chk "D-B4 BINARIES '$bad' fails the step before any build" "$r|$(wc -l <"$GO_LOG" | tr -d ' ')" "1|0"
+done
+chk_has "D-B4 naming what it wants" "$(cat "$WORK/ss.log")" "the package in BINARIES must stay inside the repository, got './../x'"
+: >"$GO_LOG"
+r=$(GO_FAIL_TARGET=darwin/amd64 BINARIES='app=./cmd/app' stage_signed "$DSH" | cut -d'|' -f1)
+chk "D-B5 a failed build fails the step, signing nothing" "$r|$(signed)" "1|0"
+chk_has "D-B5 naming the binary and the target" "$(cat "$WORK/ss.log")" \
+  "::error::app-darwin-amd64 is missing, because go build of ./cmd/app for darwin/amd64 failed. v2.0.1 is not published without it."
+chk "D-B5 and leaves no worktree behind" "$(git -C "$NOTESREPO" worktree list | wc -l | tr -d ' ')" "1"
 git -C "$NOTESREPO" checkout -q main
 git -C "$NOTESREPO" tag -d v2.0.1 v2.0.2 >/dev/null
 git -C "$NOTESREPO" branch -q -D api-document
@@ -1759,7 +1839,10 @@ chk "D-A8 so a repair call runs the caller check and repair-assets alone" "$(gat
 chk "D-A8 and repair-assets only with one, reading and signing, in its own job" \
   "$(gate '."ra-if"')|$(gate '."ra-perms" | tojson')" "\${{ inputs.repair-tag != '' }}|{\"contents\":\"read\",\"id-token\":\"write\"}"
 chk "D-A8 checking the Release before installing, signing and uploading" "$(gate '."ra-steps" | join(",")')|$(gate '."ra-step-ifs" | unique | join(" ")')" \
-  "Checkout,Check out the ci source,Check the Release,Install Cosign,Sign the release assets,Hand the assets on|\${{ steps.release.outputs.missing == 'true' }}"
+  "Checkout,Check out the ci source,Check the Release,Install Cosign,Set up Go for the release binaries,Sign the release assets,Hand the assets on|\${{ steps.release.outputs.missing == 'true' && inputs.binaries != '' }} \${{ steps.release.outputs.missing == 'true' }}"
+chk "D-A8 Go set up as finalize sets it up" "$(gate '."ra-go-with" | tojson')" "$(gate '."binaries-go-with" | tojson')"
+chk "D-A8 and the caller's binaries input reaches the signing step" \
+  "$(sed -n 's/^BINARIES=//p;s/^GOTOOLCHAIN=//p' "$WORK/rassets.sh.envmap" | tr '\n' ' ')" '${{ inputs.binaries }} auto '
 chk "D-A8 with the pinned cosign" "$(gate '."ra-cosign".uses')|$(gate '."ra-cosign".with."cosign-release"')" \
   "$(gate '."prepare-cosign-uses"')|\${{ env.COSIGN_VERSION }}"
 chk "D-A8 uploading every file the step wrote, failing on none" \
@@ -2241,6 +2324,23 @@ out_rel=$(finalize_release)
 chk "D-I10 a document staged without its signature fails before any GitHub call" \
   "$(printf '%s' "$out_rel" | sed -n 's/^EXIT=//p')|$(wc -l <"$GH_LOG" | tr -d ' ')" "1|0"
 chk_has "D-I10 naming the signature" "$out_rel" "::error::openapi.json.sigstore.json is missing. v2.0.0 is not published without it."
+BIN_ASSET_LIST=()
+for t in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64.exe windows-arm64.exe; do
+  BIN_ASSET_LIST+=("app-$t" "app-$t.sha256" "app-$t.sigstore.json")
+done
+staged "${ALL_ASSETS[@]}" "${BIN_ASSET_LIST[@]}"
+printf 'app-%s\n' linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64.exe windows-arm64.exe >"$STAGED/binary-assets.txt"
+release_store absent
+out_rel=$(finalize_release)
+chk "D-I11 the binaries the build listed ride the one create, each with its checksum and signature" \
+  "$(releases)" "release create v2.0.0 --title v2.0.0 --notes-file RELEASE_NOTES.md ${ALL_ASSETS[*]} ${BIN_ASSET_LIST[*]};"
+chk "D-I11 and the verify step passes" "$(printf '%s' "$out_rel" | grep -c '^EXIT=' || true)" "0"
+rm "$STAGED/app-darwin-arm64.sigstore.json"
+release_store absent
+out_rel=$(finalize_release)
+chk "D-I12 a listed binary staged without its signature fails before any GitHub call" \
+  "$(printf '%s' "$out_rel" | sed -n 's/^EXIT=//p')|$(wc -l <"$GH_LOG" | tr -d ' ')" "1|0"
+chk_has "D-I12 naming the signature" "$out_rel" "::error::app-darwin-arm64.sigstore.json is missing. v2.0.0 is not published without it."
 staged "${ALL_ASSETS[@]}"
 
 release_store absent
