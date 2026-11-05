@@ -51,7 +51,9 @@ elif args[:2] == ['add', '--']:
     meta = json.loads(pathlib.Path('.stub.json').read_text())
     with open(os.environ['ADD_LOG'], 'a') as log:
         for path in args[2:]:
-            entry = [meta['repo'], path, pathlib.Path(path).read_text(), os.access(path, os.X_OK)]
+            # The mode bit git stages: root's os.access(X_OK) follows ACLs and says
+            # yes for a 0644 file on an NFSv4-ACL filesystem.
+            entry = [meta['repo'], path, pathlib.Path(path).read_text(), bool(os.stat(path).st_mode & 0o100)]
             log.write(json.dumps(entry) + '\n')
 elif args[:3] == ['diff', '--cached', '--name-only']:
     meta = json.loads(pathlib.Path('.stub.json').read_text())

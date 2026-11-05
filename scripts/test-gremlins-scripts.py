@@ -9,6 +9,7 @@ run. Nothing else executes them before the weekly run publishes their number.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -18,6 +19,10 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+_spec = importlib.util.spec_from_file_location('gremlins_aggregate', HERE / 'gremlins-aggregate.py')
+gremlins_aggregate = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(gremlins_aggregate)
 MERGE = HERE / 'gremlins-merge.py'
 AGGREGATE = HERE / 'gremlins-aggregate.py'
 RUNNER = HERE / 'gremlins-run.sh'
@@ -50,7 +55,9 @@ def result(module: str, files: list[tuple[str, list[tuple[str, str]]]]) -> dict:
         'ARITHMETIC_BASE': 'arithmetic_base',
         'CONDITIONALS_BOUNDARY': 'conditionals_boundary',
         'CONDITIONALS_NEGATION': 'conditionals_negation',
+        'INVERT_BITWISE': 'invert_bitwise',
         'INVERT_BWASSIGN': 'invert_bitwise_assignments',
+        'INVERT_LOGICAL': 'invert_logical',
         'INVERT_LOOPCTRL': 'invert_loop_ctrl',
     }
     counts = {'KILLED': 0, 'LIVED': 0, 'NOT COVERED': 0, 'NOT VIABLE': 0, 'TIMED OUT': 0}
@@ -140,6 +147,13 @@ def test_single_module_is_identity(tmp: Path) -> None:
           detail=f'{merged["mutations_coverage"]} vs {root["mutations_coverage"]}')
     check('single module: mutation positions preserved',
           ok=sorted(f['file_name'] for f in merged['files']) == ['other.go', 'thing.go'])
+
+
+def default_mutators_config(tmp: Path) -> tuple[str, ...]:
+    """--config args for a config that runs gremlins' default mutators, as legacy rows did."""
+    cfg = tmp / 'default-mutators.yaml'
+    cfg.write_text('silent: false\n')
+    return ('--config', str(cfg))
 
 
 def attempt_dir(art: Path, repo: str, attempt: int) -> Path:
@@ -537,6 +551,61 @@ def test_scope_takes_a_dash_dir_as_a_module(tmp: Path) -> None:
           detail=f'rc={proc.returncode} {proc.stderr[-300:]}')
 
 
+# ---------------------------------------------------------------------------
+# configs/gremlins.yaml: only keys gremlins reads
+# ---------------------------------------------------------------------------
+# The keys gremlins v0.6.0 reads (internal/configuration/configuration.go and
+# MutantTypeEnabledKey). Its published JSON Schema cannot gate this: it sets no
+# additionalProperties, and it omits exclude-files, workers and invert-logical.
+GREMLINS_LAYOUT = {
+    'silent': None,
+    'unleash': {
+        'dry-run': None, 'output-statuses': None, 'output': None, 'tags': None,
+        'coverpkg': None, 'workers': None, 'test-cpu': None, 'timeout-coefficient': None,
+        'integration': None, 'exclude-files': None, 'diff': None,
+        'threshold': {'efficacy': None, 'mutant-coverage': None},
+    },
+    'mutants': {name: {'enabled': None} for name in gremlins_aggregate.GREMLINS_MUTATORS},
+}
+
+
+def unread_keys(config: object, layout: dict, prefix: str = '') -> list[str]:
+    """Dotted paths in config that gremlins never reads under layout."""
+    if not isinstance(config, dict):
+        return []
+    out = []
+    for key, value in config.items():
+        path = f'{prefix}{key}'
+        if key not in layout:
+            out.append(path)
+        elif isinstance(layout[key], dict):
+            out += unread_keys(value, layout[key], f'{path}.')
+    return out
+
+
+def test_central_config_keys_are_read(tmp: Path) -> None:
+    pinned = re.search(r'^\s*GREMLINS_VERSION=(\S+)$', WORKFLOW.read_text(), re.MULTILINE)
+    check('central config: the key table matches the pinned gremlins',
+          ok=bool(pinned) and pinned.group(1) == 'v0.6.0',
+          detail=f'workflow pins {pinned and pinned.group(1)}: re-check GREMLINS_LAYOUT and '
+                 'gremlins-aggregate.GREMLINS_MUTATORS against that release, then update the pin here')
+    config = gremlins_aggregate.load_config(CENTRAL.read_text())
+    unread = unread_keys(config, GREMLINS_LAYOUT)
+    check('central config: every key is one gremlins reads', ok=not unread, detail=str(unread))
+    entries = (config.get('mutants') or {}).values()
+    check('central config: every mutants entry sets a bool enabled',
+          ok=all(isinstance(e, dict) and isinstance(e.get('enabled'), bool) for e in entries))
+    enabled = gremlins_aggregate.enabled_mutators(config)
+    check('central config: gremlins runs every mutator type',
+          ok=enabled == set(gremlins_aggregate.GREMLINS_MUTATORS),
+          detail=f'off: {sorted(set(gremlins_aggregate.GREMLINS_MUTATORS) - enabled)}')
+    nested = gremlins_aggregate.load_config(
+        'unleash:\n  mutants:\n    invert-logical:\n      enabled: true\n')
+    check('central config: a mutants block nested under unleash is caught',
+          ok=unread_keys(nested, GREMLINS_LAYOUT) == ['unleash.mutants']
+          and gremlins_aggregate.enabled_mutators(nested) == gremlins_aggregate.DEFAULT_MUTATORS)
+
+
 def test_scope_refuses_what_it_cannot_scope(tmp: Path) -> None:
     (tmp / 'sub').mkdir()
     bare = tmp / 'bare.yaml'
@@ -654,13 +723,12 @@ def test_aggregate_flags_sudden_perfect_week(tmp: Path) -> None:
     proc = subprocess.run(
         [sys.executable, str(AGGREGATE), '--repo', 'rsync', '--artifacts-dir', str(art),
          '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1',
-         '--existing-body-file', str(existing)],
+         '--existing-body-file', str(existing), *default_mutators_config(tmp)],
         capture_output=True, text=True, check=False,
     )
     check('sudden perfect week: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
     check('sudden perfect week: body carries the caution',
-          ok='100%' in proc.stdout and 'measurement' in proc.stdout.lower(),
-          detail=proc.stdout[:600])
+          ok='A jump to 100% efficacy' in proc.stdout, detail=proc.stdout[:600])
     check('sudden perfect week: history row preserved', ok='2026-08-16 22:00' in proc.stdout)
 
 
@@ -693,7 +761,7 @@ def test_aggregate_never_names_an_older_week_as_last_week(tmp: Path) -> None:
     proc = subprocess.run(
         [sys.executable, str(AGGREGATE), '--repo', 'rsync', '--artifacts-dir', str(art),
          '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1',
-         '--existing-body-file', str(existing)],
+         '--existing-body-file', str(existing), *default_mutators_config(tmp)],
         capture_output=True, text=True, check=False,
     )
     check('unreadable newest row: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
@@ -727,7 +795,7 @@ def test_aggregate_reads_last_week_from_the_newest_row(tmp: Path) -> None:
     proc = subprocess.run(
         [sys.executable, str(AGGREGATE), '--repo', 'rsync', '--artifacts-dir', str(art),
          '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1',
-         '--existing-body-file', str(existing)],
+         '--existing-body-file', str(existing), *default_mutators_config(tmp)],
         capture_output=True, text=True, check=False,
     )
     check('newest row read: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
@@ -1031,16 +1099,17 @@ MODE_HISTORY = (
     '# Gremlins mutation testing tracker\n\n'
     '## Rolling 12-week history\n'
     '<!-- gremlins-data -->\n'
-    '| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy |\n'
-    '|---|---|---|---|---|---|\n'
-    '| 2026-09-27 22:00 | 90.0% | ±0.0% | 60.0% | 2 | +0.0% | <!-- run:3 -->\n'
-    '| 2026-09-20 22:00 | 90.0% | ±0.0% | 60.0% | 2 | — | <!-- run:2 -->\n'
+    '| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy | Mode '
+    '| Mutators |\n'
+    '|---|---|---|---|---|---|---|---|\n'
+    '| 2026-09-27 22:00 | 90.0% | ±0.0% | 60.0% | 2 | +0.0% | per-package | all | <!-- run:3 -->\n'
+    '| 2026-09-20 22:00 | 90.0% | ±0.0% | 60.0% | 2 | — | per-package | all | <!-- run:2 -->\n'
     '<!-- /gremlins-data -->\n'
 )
 
 
 def aggregate_week(tmp: Path, name: str, mode: str, files: list, existing: str,
-                   run_id: str) -> tuple[subprocess.CompletedProcess, str]:
+                   run_id: str, config: tuple[str, ...] = ()) -> tuple[subprocess.CompletedProcess, str]:
     art = tmp / f'art-{name}'
     for attempt in (1, 2, 3):
         doc = result('github.com/cplieger/x/v2', files)
@@ -1053,7 +1122,7 @@ def aggregate_week(tmp: Path, name: str, mode: str, files: list, existing: str,
         [sys.executable, str(AGGREGATE), '--repo', 'sw', '--artifacts-dir', str(art),
          '--week', f'2026-10-{int(run_id):02d} 22:00', '--run-url',
          f'https://github.com/cplieger/ci/actions/runs/{run_id}',
-         '--existing-body-file', str(body), '--regression-marker-file', str(marker)],
+         '--existing-body-file', str(body), '--regression-marker-file', str(marker), *config],
         capture_output=True, text=True, check=False,
     )
     return proc, marker.read_text() if marker.exists() else ''
@@ -1066,12 +1135,12 @@ def test_aggregate_marks_a_mode_switch(tmp: Path) -> None:
     check('mode switch: the same drop without a switch raises the label', ok=flag == 'true',
           detail=flag)
     check('mode switch: control row records per-package with no switch mark',
-          ok='| per-package | <!-- run:4 -->' in proc.stdout, detail=proc.stdout[:900])
+          ok='| per-package | all | <!-- run:4 -->' in proc.stdout, detail=proc.stdout[:900])
 
     proc, flag = aggregate_week(tmp, 'switch', 'integration', half, MODE_HISTORY, '4')
     check('mode switch: switch week exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
     check('mode switch: the row marks the switch and the expected jump',
-          ok='| integration (switched from per-package; score jump expected) | <!-- run:4 -->'
+          ok='| integration (switched from per-package; score jump expected) | all | <!-- run:4 -->'
           in proc.stdout, detail=proc.stdout[:900])
     check('mode switch: the switch week does not raise the label', ok=flag == 'false', detail=flag)
     check('mode switch: the header says why', ok='Mode switched from per-package to integration'
@@ -1080,13 +1149,14 @@ def test_aggregate_marks_a_mode_switch(tmp: Path) -> None:
     # Re-aggregating the same run must still see the switch, not its own row.
     rerun, flag = aggregate_week(tmp, 'rerun', 'integration', half, proc.stdout, '4')
     check('mode switch: a re-aggregate of the switch run keeps the mark',
-          ok='(switched from per-package; score jump expected) | <!-- run:4 -->' in rerun.stdout
+          ok='(switched from per-package; score jump expected) | all | <!-- run:4 -->'
+          in rerun.stdout
           and rerun.stdout.count('<!-- run:4 -->') == 1 and flag == 'false',
           detail=rerun.stdout[:900])
 
     after, flag = aggregate_week(tmp, 'after', 'integration', half, proc.stdout, '5')
     check('mode switch: the next week in the new mode is unmarked',
-          ok='| integration | <!-- run:5 -->' in after.stdout, detail=after.stdout[:900])
+          ok='| integration | all | <!-- run:5 -->' in after.stdout, detail=after.stdout[:900])
     check('mode switch: the next week compares only integration rows', ok=flag == 'false',
           detail=flag)
 
@@ -1095,6 +1165,106 @@ def test_aggregate_marks_a_mode_switch(tmp: Path) -> None:
     check('mode switch: a switch to 100% is not called a measurement failure',
           ok='jump to 100%' not in proc.stdout.lower() and 'Mode switched' in proc.stdout,
           detail=proc.stdout[:900])
+
+
+# The rows the weekly runner wrote while configs/gremlins.yaml nested its
+# mutants block under unleash: no Mutators cell, and gremlins' default types.
+LEGACY_HISTORY = (
+    '# Gremlins mutation testing tracker\n\n'
+    '## Rolling 12-week history\n'
+    '<!-- gremlins-data -->\n'
+    '| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy | Mode |\n'
+    '|---|---|---|---|---|---|---|\n'
+    '| 2026-09-27 22:00 | 90.0% | ±0.0% | 60.0% | 2 | +0.0% | per-package | <!-- run:3 -->\n'
+    '| 2026-09-20 22:00 | 90.0% | ±0.0% | 60.0% | 2 | — | per-package | <!-- run:2 -->\n'
+    '<!-- /gremlins-data -->\n'
+)
+
+
+def test_aggregate_starts_a_baseline_when_the_mutators_change(tmp: Path) -> None:
+    half = [('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'INVERT_LOGICAL')])]
+    legacy = default_mutators_config(tmp)
+    proc, flag = aggregate_week(tmp, 'm-control', 'per-package', half, LEGACY_HISTORY, '4', legacy)
+    check('mutator switch: control week exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
+    check('mutator switch: the same drop on the same mutators raises the label', ok=flag == 'true',
+          detail=flag)
+    check('mutator switch: control row records the default set unmarked',
+          ok='| per-package | default | <!-- run:4 -->' in proc.stdout, detail=proc.stdout[:900])
+
+    proc, flag = aggregate_week(tmp, 'm-switch', 'per-package', half, LEGACY_HISTORY, '4')
+    check('mutator switch: the first all-mutators week exits 0', ok=proc.returncode == 0,
+          detail=proc.stderr[-400:])
+    check('mutator switch: the row marks the switch',
+          ok='| per-package | all (switched from default; score shift expected) | <!-- run:4 -->'
+          in proc.stdout, detail=proc.stdout[:900])
+    check('mutator switch: the first all-mutators week does not raise the label', ok=flag == 'false',
+          detail=flag)
+    check('mutator switch: the header says why',
+          ok='Mutators switched from default to all' in proc.stdout and '**Trend**' not in proc.stdout,
+          detail=proc.stdout[:900])
+
+    rerun, flag = aggregate_week(tmp, 'm-rerun', 'per-package', half, proc.stdout, '4')
+    check('mutator switch: a re-aggregate of the switch run keeps the mark',
+          ok='all (switched from default; score shift expected) | <!-- run:4 -->' in rerun.stdout
+          and rerun.stdout.count('<!-- run:4 -->') == 1 and flag == 'false',
+          detail=rerun.stdout[:900])
+
+    worse = [('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'INVERT_LOGICAL'),
+                       ('LIVED', 'INVERT_BITWISE'), ('LIVED', 'INVERT_LOOPCTRL')])]
+    after, flag = aggregate_week(tmp, 'm-after', 'per-package', worse, proc.stdout, '5')
+    check('mutator switch: the next week on all mutators is unmarked',
+          ok='| per-package | all | <!-- run:5 -->' in after.stdout, detail=after.stdout[:900])
+    check('mutator switch: the next week compares against the new baseline only', ok=flag == 'true'
+          and '-25.0% from 12-week mean (50.0%)' in after.stdout, detail=after.stdout[:900])
+
+    perfect = [('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'INVERT_LOGICAL')])]
+    proc, _ = aggregate_week(tmp, 'm-perfect', 'per-package', perfect, LEGACY_HISTORY, '4')
+    check('mutator switch: a switch to 100% is not called a measurement failure',
+          ok='jump to 100%' not in proc.stdout.lower() and 'Mutators switched' in proc.stdout,
+          detail=proc.stdout[:900])
+
+
+def test_enabled_mutators_follows_gremlins(tmp: Path) -> None:
+    """gremlins' configuration.Get[bool] reads a non-bool as false and an absent key as the default."""
+    em = gremlins_aggregate.enabled_mutators
+    default = gremlins_aggregate.DEFAULT_MUTATORS
+    cases = {
+        'no mutants key keeps the defaults': ({}, default),
+        'an explicit false turns a default type off':
+            ({'mutants': {'arithmetic-base': {'enabled': False}}}, default - {'arithmetic-base'}),
+        'a string is not true': ({'mutants': {'invert-logical': {'enabled': 'true'}}}, default),
+        'a non-bool turns a default type off':
+            ({'mutants': {'arithmetic-base': {'enabled': 'yes'}}}, default - {'arithmetic-base'}),
+        'a null enabled keeps the default':
+            ({'mutants': {'arithmetic-base': {'enabled': None}}}, default),
+        'an entry without enabled keeps the default':
+            ({'mutants': {'invert-logical': True, 'arithmetic-base': {}}}, default),
+        'a top-level entry turns a type on':
+            ({'mutants': {'invert-logical': {'enabled': True}}}, default | {'invert-logical'}),
+    }
+    for name, (config, want) in cases.items():
+        check(f'enabled mutators: {name}', ok=em(config) == want, detail=str(sorted(em(config))))
+    for word in ('yes', 'on', 'y', 'True'):
+        doc = gremlins_aggregate.load_config(f'mutants:\n  invert-logical:\n    enabled: {word}\n')
+        value = doc['mutants']['invert-logical']['enabled']
+        on = word == 'True'
+        check(f'enabled mutators: YAML 1.2 reads enabled: {word} as gremlins does',
+              ok=isinstance(value, bool) == on and ('invert-logical' in em(doc)) == on,
+              detail=repr(value))
+    label = gremlins_aggregate.mutators_label
+    check('mutators label: all, default, and a sorted list otherwise',
+          ok=label(frozenset(gremlins_aggregate.GREMLINS_MUTATORS)) == 'all'
+          and label(default) == 'default'
+          and label(frozenset({'invert-logical', 'arithmetic-base'})) == 'arithmetic-base+invert-logical'
+          and label(frozenset()) == 'none')
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), '--repo', 'x', '--artifacts-dir', str(tmp),
+         '--week', '2026-10-04 22:00', '--run-url', 'https://example.invalid/run/1',
+         '--config', str(tmp / 'missing.yaml')],
+        capture_output=True, text=True, check=False,
+    )
+    check('mutators label: an unreadable --config fails loudly',
+          ok=proc.returncode == 1 and 'cannot read' in proc.stderr, detail=proc.stderr[-300:])
 
 
 def main() -> int:
@@ -1115,6 +1285,7 @@ def main() -> int:
         test_scope_excludes_an_unmeasured_module,
         test_scope_takes_a_dash_dir_as_a_module,
         test_scope_refuses_what_it_cannot_scope,
+        test_central_config_keys_are_read,
         test_aggregate_consumes_merged_output,
         test_aggregate_flags_disagreeing_verdicts,
         test_aggregate_flags_sudden_perfect_week,
@@ -1130,6 +1301,8 @@ def main() -> int:
         test_runner_mode_selection,
         test_merge_records_the_mode,
         test_aggregate_marks_a_mode_switch,
+        test_aggregate_starts_a_baseline_when_the_mutators_change,
+        test_enabled_mutators_follows_gremlins,
     ]
     for t in tests:
         print(f'{t.__name__}:')

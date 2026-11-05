@@ -48,6 +48,7 @@ TEST_SEGMENTS = {
     '__snapshots__',
     'e2e',
     'authtest',
+    'accesstest',
     'certtest',
     'testcerts',
     'plextest',
