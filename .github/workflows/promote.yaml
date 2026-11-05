@@ -43,7 +43,7 @@ concurrency:
 
 env:
   # renovate: datasource=github-releases depName=aquasecurity/trivy
-  TRIVY_VERSION: v0.76.1
+  TRIVY_VERSION: v0.76.2
   # renovate: datasource=github-releases depName=sigstore/cosign
   COSIGN_VERSION: v3.1.4
 
