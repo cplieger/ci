@@ -371,6 +371,19 @@ class MetaJobs(unittest.TestCase):
         for key in ('repository', 'ref', 'target'):
             self.assertEqual(job['with'][key], f'${{{{ matrix.{key} }}}}')
 
+    def test_the_go_os_canary_runs_each_os_leg_over_a_real_module(self):
+        job = self.jobs['go-os-canary']
+        self.assertEqual(job['uses'], './.github/workflows/go-os-ci.yaml')
+        self.assertIn("github.repository == 'cplieger/ci'", job['if'])
+        self.assertIs(job['strategy']['fail-fast'], expr2=False)
+        include = job['strategy']['matrix']['include']
+        for entry in include:
+            self.assertRegex(entry['ref'], SHA)
+            self.assertTrue(entry['repository'].startswith('cplieger/'), entry)
+        self.assertEqual({e['runner'] for e in include}, {'windows-latest', 'macos-latest'})
+        for key in ('repository', 'ref', 'runner'):
+            self.assertEqual(job['with'][key], f'${{{{ matrix.{key} }}}}')
+
     def test_every_caller_grants_what_the_analyze_job_requests(self):
         grant = {'contents': 'read', 'security-events': 'write'}
         self.assertEqual(load(DEADSET_CI)['jobs']['analyze']['permissions'], grant)
@@ -393,6 +406,8 @@ VALIDATE_JOBS = [
     'GO',
     'GO_NESTED',
     'GO_WORK',
+    'GO_OS',
+    'GO_OS_CANARY',
     'TS',
     'WEB',
     'TS_NESTED',
@@ -435,6 +450,17 @@ class Validate(Harness):
         run = self.run_validate(DEADSET_CANARY='failure', CI_REPO='true')
         self.assertEqual(run.rc, 1, run.out)
         self.assertIn('::error::deadset-canary job: failure', run.out)
+
+    def test_the_go_os_canary_counts_in_cplieger_ci_only(self):
+        self.assertEqual(self.run_validate(GO_OS_CANARY='failure').rc, 0)
+        run = self.run_validate(GO_OS_CANARY='failure', CI_REPO='true')
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn('::error::go-os-canary job: failure', run.out)
+
+    def test_a_failed_os_leg_fails_validate_everywhere(self):
+        run = self.run_validate(GO_OS='failure')
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn('::error::go-os job: failure', run.out)
 
 
 class ResolveTarget(Harness):

@@ -1,0 +1,154 @@
+name: Go OS CI
+
+# One Go module's vet, lint and race tests on a non-Linux runner, plus a vet of
+# every release target. ci.yaml calls it for a module that tracks
+# OS-specific files; go-ci.yaml already runs govulncheck, module verification,
+# wiregen drift and dependency review for the same module on Linux.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: The runner label, `windows-latest` or `macos-latest`.
+        type: string
+        required: true
+      working-directory:
+        description: The module's directory, relative to the repository root.
+        type: string
+        default: '.'
+      go-version-file:
+        description: Path to the go.mod that pins the Go version.
+        type: string
+        default: go.mod
+      repository:
+        description: Another public repository to test instead of the caller's (the canary).
+        type: string
+        default: ''
+      ref:
+        description: The commit of `repository` to test.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    env:
+      GOWORK: 'off'
+    defaults:
+      run:
+        # Git Bash on Windows, so every step body is the same script on each runner.
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+          cache: true
+
+      - name: Install golangci-lint
+        run: |
+          set -euo pipefail
+          # renovate: datasource=github-releases depName=golangci/golangci-lint
+          VERSION=v2.15.0
+          case "$RUNNER_OS" in
+            Windows) os=windows; ext=zip ;;
+            macOS) os=darwin; ext=tar.gz ;;
+            *) echo "::error::no golangci-lint build for runner OS $RUNNER_OS"; exit 1 ;;
+          esac
+          case "$RUNNER_ARCH" in
+            X64) arch=amd64 ;;
+            ARM64) arch=arm64 ;;
+            *) echo "::error::no golangci-lint build for runner arch $RUNNER_ARCH"; exit 1 ;;
+          esac
+          name="golangci-lint-${VERSION#v}-${os}-${arch}"
+          curl -fsSL --connect-timeout 10 --max-time 60 \
+            --retry 7 --retry-max-time 150 --retry-all-errors \
+            -o "$RUNNER_TEMP/golangci-lint.$ext" \
+            "https://github.com/golangci/golangci-lint/releases/download/${VERSION}/${name}.${ext}"
+          dest="$RUNNER_TEMP/golangci-lint"
+          mkdir -p "$dest"
+          if [ "$ext" = zip ]; then
+            unzip -q -o "$RUNNER_TEMP/golangci-lint.zip" -d "$dest"
+          else
+            tar -xzf "$RUNNER_TEMP/golangci-lint.tar.gz" -C "$dest"
+          fi
+          echo "$dest/$name" >> "$GITHUB_PATH"
+          "$dest/$name/golangci-lint" --version
+
+      # Soft-gate block, as in go-ci.yaml: any step added here MUST end with
+      #   || { echo "<step name>" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
+      # or continue-on-error hides its failure from "Check results". RUNNER_TEMP
+      # rather than /tmp, so the marker has one path on every runner OS.
+      - name: C toolchain
+        continue-on-error: true
+        # CGO_ENABLED=1 (which -race needs) is set on this step and the race step
+        # only: job-wide, it would make the cross-vet need a C compiler per target.
+        # Windows -race needs mingw-w64 runtime 8 or later; the libsynchronization
+        # probe is the test https://go.dev/doc/articles/race_detector gives.
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          (
+            go env CGO_ENABLED CC || exit 1
+            cc=$(go env CC)
+            command -v "$cc" >/dev/null || { echo "::error::C compiler '$cc' not found; go test -race needs cgo"; exit 1; }
+            "$cc" --version || exit 1
+            if [ "$RUNNER_OS" = Windows ]; then
+              lib=$("$cc" --print-file-name libsynchronization.a) || exit 1
+              echo "libsynchronization.a: $lib"
+              [ "$lib" != libsynchronization.a ] || { echo "::error::'$cc' lacks mingw-w64 runtime 8 or later; go test -race cannot link"; exit 1; }
+            fi
+          ) || { echo "c-toolchain" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
+
+      - name: Vet
+        continue-on-error: true
+        run: ( go vet ./... ) || { echo "vet" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
+
+      - name: Lint (golangci-lint)
+        continue-on-error: true
+        run: ( golangci-lint run --allow-parallel-runners --timeout=5m ./... ) || { echo "golangci-lint" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
+
+      - name: Test (race)
+        continue-on-error: true
+        env:
+          CGO_ENABLED: '1'
+        run: ( go test -count=1 -race ./... ) || { echo "test" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
+
+      # vet type-checks test files, which a cross `go build` skips.
+      - name: Cross-vet release targets
+        continue-on-error: true
+        run: |
+          rc=0
+          for goos in linux darwin windows; do
+            for goarch in amd64 arm64; do
+              echo "::group::$goos/$goarch"
+              GOOS=$goos GOARCH=$goarch go vet ./... || { echo "::error::go vet fails for $goos/$goarch"; rc=1; }
+              echo "::endgroup::"
+            done
+          done
+          [ "$rc" -eq 0 ] || { echo "cross-vet" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
+
+      - name: Check results
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/_ci_failures" ]; then
+            echo "::error::Failed validation steps:"
+            sort -u "$RUNNER_TEMP/_ci_failures" >&2
+            exit 1
+          fi
+          echo "All validation steps passed"
