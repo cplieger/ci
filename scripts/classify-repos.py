@@ -103,16 +103,22 @@ WEB_DIRS = ('static-src', 'web', 'internal/server/static-src', 'internal/webui/s
 
 
 def ts_config_group(ts_dir):
-    """TS_CONFIG for a repo whose npm project is in `ts_dir` ('' for the root).
+    """TS_CONFIG for a repo whose npm project is in `ts_dir` ('' for the root,
+    None when its npm projects sit only in folders no group serves).
 
     The ESLint base is the one config a consumer imports rather than names on
     a command line, and an import resolves its `@eslint/js` and
     `typescript-eslint` imports from its own folder upward, so it lands beside
-    the project's package.json or jsr.json. The other three stay at the root,
-    where the lint steps read them."""
-    if not ts_dir:
+    the project's package.json or jsr.json, and nowhere when no such folder
+    is one the sync writes to. The other three stay at the root, where the
+    lint steps read them."""
+    if ts_dir == '':
         return TS_CONFIG
     base, *rest = TS_CONFIG.files
+    if ts_dir is None:
+        return Group(
+            f'{TS_CONFIG.comment} (no ESLint base: npm projects in other folders)', tuple(rest)
+        )
     return Group(
         f'{TS_CONFIG.comment} (npm project in {ts_dir})',
         ((base[0], f'{ts_dir}/{base[1]}'), *rest),
@@ -178,7 +184,8 @@ def render_files(group):
 
 def every_group():
     """GROUPS' groups plus the TS_CONFIG variant for each of WEB_DIRS."""
-    return [group for _key, group in GROUPS] + [ts_config_group(d) for d in WEB_DIRS]
+    variants = [ts_config_group(d) for d in (*WEB_DIRS, None)]
+    return [group for _key, group in GROUPS] + variants
 
 
 def sync_owned_patterns():
@@ -344,12 +351,23 @@ def classify(repo, ref='HEAD', *, releasing=False):
     # keep its own CI, which the sync must never overwrite.
     has_publish = '.github/workflows/publish.yaml' in tree
     # Where ci.yaml lints the npm project: the root when it holds one, else
-    # the first web folder that does.
+    # the first web folder that does, else None when the only projects sit in
+    # other folders, such as a nested module's web/ half, which keeps its own copy.
     ts_dir = ''
     if not (has_pkg or has_jsr):
         ts_dir = next(
             (d for d in WEB_DIRS if f'{d}/package.json' in tree or f'{d}/jsr.json' in tree), ''
         )
+    if (
+        ts_dir == ''
+        and not (has_pkg or has_jsr)
+        and any(
+            path.endswith(('/package.json', '/jsr.json'))
+            and not any(f'/{d}/' in f'/{path}' for d in ('node_modules', 'testdata', 'vendor'))
+            for path in tree
+        )
+    ):
+        ts_dir = None
 
     return {
         'readable': bool(tree),
@@ -447,7 +465,7 @@ def emit_block(groups, profiles, *, base=None):
                 group.comment + suffix, groups[key], group, lead_blank=lead_blank, base=base
             )
             continue
-        for ts_dir in ('', *WEB_DIRS):
+        for ts_dir in ('', *WEB_DIRS, None):
             repos = [repo for repo in groups[key] if profiles[repo]['ts_dir'] == ts_dir]
             variant = ts_config_group(ts_dir)
             print_group(variant.comment + suffix, repos, variant, lead_blank=lead_blank, base=base)

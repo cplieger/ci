@@ -325,6 +325,20 @@ class EslintBaseDest(unittest.TestCase):
             {'source': 'configs/prettier.json', 'dest': '.prettierrc.json'}, webgo['files']
         )
 
+    def test_npm_projects_only_in_other_folders_get_no_base(self):
+        half = ['go.mod', 'alpha/go.mod', 'alpha/a.go', 'alpha/web/package.json']
+        groups = self.manifest(
+            {
+                'halves@HEAD': half,
+                'fixtures@HEAD': ['go.mod', 'web', 'web/app.ts', 'testdata/x/package.json'],
+            }
+        )
+        self.assertEqual(self.base_dests(groups), {'fixtures': 'eslint.config.base.mjs'})
+        prettier = {'source': 'configs/prettier.json', 'dest': '.prettierrc.json'}
+        self.assertTrue(
+            any('halves' in g['repos'] and prettier in g['files'] for g in groups), groups
+        )
+
     def test_a_web_folder_without_an_npm_project_keeps_the_base_at_the_root(self):
         groups = self.manifest({'gohybrid@HEAD': ['go.mod', 'internal/server/static-src/app.ts']})
         self.assertEqual(self.base_dests(groups), {'gohybrid': 'eslint.config.base.mjs'})
@@ -538,7 +552,7 @@ class RootLessGo(unittest.TestCase):
 
     CI = 'Unified CI (auto-detects go/ts/web/shell surfaces)'
     GOLANGCI = 'Go-tooling configs (Go-having repos)'
-    TS = 'TypeScript lint/format configs'
+    TS = 'TypeScript lint/format configs (no ESLint base: npm projects in other folders)'
     RELEASE = 'Release (unified auto-detect)'
     CLIFF = 'Cliff config (stable — v1.x+)'
     RENOVATE = 'Two-branch Renovate delta (repos whose default branch is dev)'
