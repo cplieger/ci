@@ -549,7 +549,7 @@ jobs:
           # The cplieger/go filesafe/windows head, until that branch merges
           # into cplieger/go's dev and its own go-os leg runs there.
           - repository: cplieger/go
-            ref: 926f7342126fe36ee3e09e7b5e37b7b46e1d1fcb
+            ref: 2f6b3463bc9dce88a6938c2a761bde81312f20fc
             dir: filesafe
             runner: windows-latest
     uses: ./.github/workflows/go-os-ci.yaml
