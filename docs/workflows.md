@@ -13,7 +13,7 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | `go.mod` at the root | `go` | `go-ci.yaml` |
 | a `go.mod` in a subfolder, with tracked Go files | `go-nested` | `go-ci.yaml` once per module folder |
 | a Go module whose `go.mod` requires another module of the repository with no `replace` for it | `go-work` | a build and `go test -race` of every module against the other modules' current code, under a `go.work` the job creates and never commits |
-| a Go module that tracks a file built for Windows or macOS: a `_windows` or `_darwin` file-name constraint (`x_windows.go`, `x_darwin_arm64_test.go`), or a `//go:build` line naming `windows` or `darwin` as a term that is not negated | `go-os` | `go-os-ci.yaml` on `windows-latest` or `macos-latest`, once per module and operating system |
+| a Go module that tracks a file built for Windows or macOS: a `_windows` or `_darwin` file-name constraint (`x_windows.go`, `x_darwin_arm64_test.go`), or a `//go:build` line above the package clause naming `windows` or `darwin` as a term that is not negated | `go-os` | `go-os-ci.yaml` on `windows-latest` or `macos-latest`, once per module and operating system |
 | `jsr.json` at the root | `ts` | `ts-ci.yaml` |
 | a `package.json` or `jsr.json` in `static-src/`, `web/`, `internal/server/static-src/` or `internal/webui/static-src/` | `web` | `ts-ci.yaml` in the first folder found, with the CSS and HTML lints on |
 | a `package.json` or `jsr.json` in the `web/` folder of a `go-nested` module | `ts-nested` | `ts-ci.yaml` once per such folder |

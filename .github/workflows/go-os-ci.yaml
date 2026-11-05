@@ -111,7 +111,10 @@ jobs:
             if [ "$RUNNER_OS" = Windows ]; then
               lib=$("$cc" --print-file-name libsynchronization.a) || exit 1
               echo "libsynchronization.a: $lib"
-              [ "$lib" != libsynchronization.a ] || { echo "::error::'$cc' lacks mingw-w64 runtime 8 or later, so go test -race cannot link"; exit 1; }
+              if [ "$lib" = libsynchronization.a ]; then
+                echo "::error::'$cc' lacks mingw-w64 runtime 8 or later, so go test -race cannot link"
+                exit 1
+              fi
             fi
           ) || { echo "c-toolchain" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
 

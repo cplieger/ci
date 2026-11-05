@@ -166,8 +166,10 @@ jobs:
 
             # A module tracking a Go file built for windows or darwin is also tested
             # on that OS's runner, because the Linux go-ci leg may compile none of it.
-            # Go's file-name constraint is _GOOS, _GOARCH or _GOOS_GOARCH; a
-            # //go:build line counts where it names the OS as a non-negated term.
+            # A file name counts when it ends _GOOS or _GOOS_GOARCH with a known
+            # GOARCH (go/build's knownArch), before an optional _test. A //go:build
+            # line counts only in the header above the package clause, where it
+            # names the OS as a non-negated term.
             # A file belongs to the deepest module folder above it, so a nested
             # module's file never puts the root module on a runner.
             # scripts/test-lane-semantics.sh runs this block, from this line to the
@@ -175,14 +177,16 @@ jobs:
             go_os_files() {
               local f e os
               local prune='(^|/)(node_modules|vendor|testdata|static|dist)/'
-              local suffix='_(windows|darwin)(_[a-z0-9]+)?(_test)?\.go$'
+              local arch='386|amd64|amd64p32|arm|armbe|arm64|arm64be|loong64|mips|mipsle|mips64|mips64le'
+              arch+='|mips64p32|mips64p32le|ppc|ppc64|ppc64le|riscv|riscv64|s390|s390x|sparc|sparc64|wasm'
+              local suffix="_(windows|darwin)(_($arch))?(_test)?\\.go\$"
               while IFS= read -r f; do
                 if [[ $f =~ $suffix ]]; then
                   printf '%s\t%s\n' "${BASH_REMATCH[1]}" "$f"
                 fi
               done < <(git ls-files '*.go' | grep -Ev "$prune" || true)
               while IFS= read -r f; do
-                e=$(grep -m1 -E '^//go:build[[:space:]]' -- "$f" || true)
+                e=$(awk '/^package[[:space:]]/ { exit } /^\/\/go:build[[:space:]]/ { print; exit }' "$f")
                 for os in $(go_build_positive_terms "${e#//go:build}" | grep -xE 'windows|darwin'); do
                   printf '%s\t%s\n' "$os" "$f"
                 done
@@ -546,10 +550,17 @@ jobs:
             ref: c2cefa26d9df62b514741f86f96368ca9cd72a11
             dir: '.'
             runner: macos-latest
-          # The cplieger/go filesafe/windows head, until that branch merges
-          # into cplieger/go's dev and its own go-os leg runs there.
+          - repository: cplieger/grelot
+            ref: 35eae8d8dd6b991c861fdeae58a8d71f5694097f
+            dir: '.'
+            runner: windows-latest
+          - repository: cplieger/grelot
+            ref: 35eae8d8dd6b991c861fdeae58a8d71f5694097f
+            dir: '.'
+            runner: macos-latest
+          # cplieger/go filesafe: the Windows POSIX-rename and sharing tests.
           - repository: cplieger/go
-            ref: 7667083360b747343d885701bb636ff96affbce4
+            ref: 639f476a79a0328ea75ecec4acee96a121eca653
             dir: filesafe
             runner: windows-latest
     uses: ./.github/workflows/go-os-ci.yaml

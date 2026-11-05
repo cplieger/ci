@@ -248,8 +248,9 @@ chk "L-W3 a folder with neither package.json nor jsr.json is no frontend" \
 
 # ── go-os runner detection states ────────────────────────────────────────────
 # Expected rows follow Go's build constraints (go help buildconstraint): a file
-# name ending _GOOS, _GOOS_GOARCH or either plus _test, or a //go:build line
-# naming the OS outside an odd number of negations. mod_dirs is MIRRORED from
+# name ending _GOOS, _GOOS_GOARCH with a known GOARCH, or either plus _test, or
+# a //go:build line above the package clause naming the OS outside an odd
+# number of negations. mod_dirs is MIRRORED from
 # ci.yaml's detect (nested validation discovery plus the root go.mod).
 # The block runs in a fresh bash with the runner's options (bash -eo pipefail),
 # because a command substitution here would run it with errexit off.
@@ -305,9 +306,12 @@ put main_linux.go "package main"
 put main_test.go "package main"
 put windows.go "package main"
 put str.go "package main" "" 'const s = "//go:build windows"'
+put raw.go "package main" "" 'const r = `' "//go:build windows" '`'
+put x_windows_helper.go "package main"
+put x_darwin_cgo_test.go "package main"
 commit_all
 os_rows
-chk "L-O2 no OS-named file or constraint: no OS leg" "$rows" ""
+chk "L-O2 no OS-named file or header constraint: no OS leg" "$rows" ""
 
 mkrepo goos-negated
 put go.mod "module github.com/cplieger/negated" "go 1.26.5"
