@@ -112,7 +112,9 @@ jobs:
           (
             # `package main // comment` is legal, so the clause match takes a
             # trailing token; `package mainly` and `main_test` still do not match.
-            gens=$(grep -rlZ --include='*.go' 'cplieger/wiregen' . 2>/dev/null \
+            # Both import paths: main branches keep the standalone module until
+            # their promotion, dev branches import it from cplieger/go.
+            gens=$(grep -rlZE --include='*.go' 'cplieger/(go/)?wiregen' . 2>/dev/null \
               | xargs -0 -r -n1 dirname | sort -u \
               | while IFS= read -r d; do
                   grep -qE '^package main([[:space:]]|$)' "$d"/*.go 2>/dev/null && echo "$d" || true
@@ -129,7 +131,7 @@ jobs:
               # No generated files and no generator is the honest empty set and
               # still skips.
               if [ -n "$genfiles" ]; then
-                echo "::error::wiregen: the repo tracks generated files but no generator command was discovered, so nothing regenerated them and this drift check measured nothing. Either a package main directory stopped importing github.com/cplieger/wiregen directly (check for the import moving behind a helper package or a build tag), or these files are no longer generated and should be deleted or renamed off the *.gen.* pattern."
+                echo "::error::wiregen: the repo tracks generated files but no generator command was discovered, so nothing regenerated them and this drift check measured nothing. Either a package main directory stopped importing github.com/cplieger/go/wiregen (or github.com/cplieger/wiregen) directly (check for the import moving behind a helper package or a build tag), or these files are no longer generated and should be deleted or renamed off the *.gen.* pattern."
                 printf '%s\n' "$genfiles" | sed 's/^/  tracked generated file: /'
                 exit 1
               fi
