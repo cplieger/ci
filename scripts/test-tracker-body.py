@@ -111,7 +111,7 @@ class GoldenBodyTest(unittest.TestCase):
             '--repo',
             'pathinside',
             '--data-file',
-            str(FIXTURES / 'bench' / 'data.js'),
+            str(FIXTURES / 'bench' / 'data.txt'),
         )
 
     def test_bench_golden_regressed_only(self) -> None:
@@ -127,7 +127,7 @@ class GoldenBodyTest(unittest.TestCase):
             '--repo',
             'pathinside',
             '--data-file',
-            str(FIXTURES / 'bench' / 'data-regressed.js'),
+            str(FIXTURES / 'bench' / 'data-regressed.txt'),
             expected='expected-regressed',
         )
         self.assertEqual(marker, 'true')

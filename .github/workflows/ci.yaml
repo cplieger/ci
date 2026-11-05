@@ -29,7 +29,6 @@ jobs:
       run_scripts: ${{ steps.detect.outputs.run_scripts }}
       web_dir: ${{ steps.detect.outputs.web_dir }}
       code_changed: ${{ steps.detect.outputs.code_changed }}
-      run_deadset: ${{ steps.detect.outputs.run_deadset }}
       deadset_targets: ${{ steps.detect.outputs.deadset_targets }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,7 +57,6 @@ jobs:
           run_python=false
           run_scripts=false
           web_dir=""
-          run_deadset=false
           deadset_targets="[]"
 
           # --- Did any non-docs (code) file change? ---
@@ -211,36 +209,14 @@ jobs:
               run_scripts=true
             fi
 
-            # The root is a dead-code target exactly when deadset finds a language
-            # there: deadset-ci.yaml's Resolve target replays the same rule, and a
-            # test runs both on one fixture set. deadset-go's `./...` stops at a
-            # nested module, so each one is its own target, and a root with no
-            # go.mod leaves every module's Go to that module's target.
-            root_languages=""
-            if [ -f deadset.json ]; then
-              root_languages=$(jq -r '.analysis.languages // [] | join(",")' deadset.json 2> /dev/null || true)
-            fi
-            if [ -z "$root_languages" ]; then
-              names=$(find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o \( -type f -o -type l \) -print | sed 's|.*/||')
-              go_names=$names
-              if [ ! -f go.mod ]; then
-                # go-nested skips a module under static/ or dist/, so no target covers its Go.
-                go_names=$({
-                  find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' -o -exec test -e '{}/go.mod' \; \) -prune \) -o \( -type f -o -type l \) -print
-                  find . \( -type d \( -name node_modules -o -name testdata -o -name vendor -o -name '.?*' \) -prune \) -o -name go.mod \( -path '*/static/*' -o -path '*/dist/*' \) -print
-                } | sed 's|.*/||')
-              fi
-              if grep -qxE 'go\.mod|.+\.go' <<< "$go_names" || grep -qxE 'tsconfig.*\.json' <<< "$names" \
-                || { grep -qE '\.(ts|tsx|mts|cts)$' <<< "$names" && grep -qx 'package\.json' <<< "$names"; }; then
-                root_languages=detected
-              fi
-            fi
-            if [ -n "$root_languages" ]; then
-              deadset_targets='["."]'
-            fi
-            deadset_targets=$(jq -cn --argjson a "$deadset_targets" --argjson b "$go_nested_dirs" '$a + $b')
-            if [ "$deadset_targets" != "[]" ]; then
-              run_deadset=true
+            # deadset-ci.yaml asks deadset whether the root holds a program, so
+            # the root is always a dead-code target. Under a root go.mod,
+            # deadset-go's `./...` stops at a nested module, so each one is its
+            # own target; with no root go.mod, deadset-go analyzes every module
+            # below the root in one report (deadset-go README).
+            deadset_targets='["."]'
+            if [ -f go.mod ]; then
+              deadset_targets=$(jq -cn --argjson b "$go_nested_dirs" '["."] + $b')
             fi
           fi
 
@@ -260,7 +236,6 @@ jobs:
             echo "run_scripts=$run_scripts"
             echo "web_dir=$web_dir"
             echo "code_changed=$code_changed"
-            echo "run_deadset=$run_deadset"
             echo "deadset_targets=$deadset_targets"
           } >> "$GITHUB_OUTPUT"
 
@@ -279,7 +254,7 @@ jobs:
             echo "| docker   | $run_docker | . |"
             echo "| python   | $run_python | . |"
             echo "| scripts  | $run_scripts | . |"
-            echo "| deadset  | $run_deadset | $deadset_targets |"
+            echo "| deadset  | $code_changed | $deadset_targets |"
             echo "| markdown | true (always) | . |"
             echo ""
             echo "code_changed: $code_changed"
@@ -389,7 +364,7 @@ jobs:
   # the chain grants both scopes.
   deadset:
     needs: detect
-    if: ${{ needs.detect.outputs.run_deadset == 'true' }}
+    if: ${{ needs.detect.outputs.code_changed == 'true' }}
     permissions:
       contents: read
       security-events: write
@@ -402,10 +377,13 @@ jobs:
       target: ${{ matrix.target }}
 
   # The pinned deadset tools over one Go-only, one TypeScript-only, one mixed
-  # repository and one nested module, so a pin set that makes deadset refuse or
-  # give no answer fails here before a release carries it. `off` still fails
-  # exit 2 and 3; findings at the frozen commits do not. Refresh a ref only
-  # when its repository stops representing its shape.
+  # repository, one nested module, one with JavaScript but no npm project, one
+  # of Go modules with no root go.mod and one with no program, so a pin set
+  # that makes deadset refuse or give no answer fails here before a release
+  # carries it. `off` still fails exit 2 and 3, except print-languages finding
+  # no language, which skips the cplieger/docs row; findings at the frozen
+  # commits do not. Refresh a ref only when its repository stops representing
+  # its shape.
   deadset-canary:
     needs: detect
     if: ${{ github.repository == 'cplieger/ci' && needs.detect.outputs.code_changed == 'true' }}
@@ -428,6 +406,15 @@ jobs:
           - repository: cplieger/envx
             ref: 742555f1312abdb307361e4c1873fea4b02ad5be
             target: yamlenv
+          - repository: cplieger/docker-renovate-scheduler
+            ref: 67f927923c241d5e50ca2a1377db368b1a89e02b
+            target: '.'
+          - repository: cplieger/docs
+            ref: 0df62b0d75ac1d8b0289e476c2b81730783e2bde
+            target: '.'
+          - repository: cplieger/go
+            ref: 85a60345f20fdd2ebc75d4b9022cbcad9a041297
+            target: '.'
     uses: ./.github/workflows/deadset-ci.yaml
     with:
       repository: ${{ matrix.repository }}
