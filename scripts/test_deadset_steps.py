@@ -380,9 +380,14 @@ class MetaJobs(unittest.TestCase):
         for entry in include:
             self.assertRegex(entry['ref'], SHA)
             self.assertTrue(entry['repository'].startswith('cplieger/'), entry)
+            self.assertTrue(entry['dir'], entry)
         self.assertEqual({e['runner'] for e in include}, {'windows-latest', 'macos-latest'})
         for key in ('repository', 'ref', 'runner'):
             self.assertEqual(job['with'][key], f'${{{{ matrix.{key} }}}}')
+        # setup-go reads go-version-file from the repository root, not the
+        # module's working directory, so a nested module needs both inputs.
+        self.assertEqual(job['with']['working-directory'], '${{ matrix.dir }}')
+        self.assertEqual(job['with']['go-version-file'], '${{ matrix.dir }}/go.mod')
 
     def test_every_caller_grants_what_the_analyze_job_requests(self):
         grant = {'contents': 'read', 'security-events': 'write'}

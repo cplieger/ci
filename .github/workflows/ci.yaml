@@ -532,21 +532,34 @@ jobs:
         include:
           - repository: cplieger/deadset-go
             ref: b303bc823a71feef2593880d6ca962e10c25da1c
+            dir: '.'
             runner: windows-latest
           - repository: cplieger/deadset-go
             ref: b303bc823a71feef2593880d6ca962e10c25da1c
+            dir: '.'
             runner: macos-latest
           - repository: cplieger/bolttable
             ref: c2cefa26d9df62b514741f86f96368ca9cd72a11
+            dir: '.'
             runner: windows-latest
           - repository: cplieger/bolttable
             ref: c2cefa26d9df62b514741f86f96368ca9cd72a11
+            dir: '.'
             runner: macos-latest
+          # The cplieger/go filesafe/windows head, until that branch merges
+          # into cplieger/go's dev and its own go-os leg runs there.
+          - repository: cplieger/go
+            ref: 926f7342126fe36ee3e09e7b5e37b7b46e1d1fcb
+            dir: filesafe
+            runner: windows-latest
     uses: ./.github/workflows/go-os-ci.yaml
     with:
       repository: ${{ matrix.repository }}
       ref: ${{ matrix.ref }}
       runner: ${{ matrix.runner }}
+      working-directory: ${{ matrix.dir }}
+      # setup-go reads this path from the repository root.
+      go-version-file: ${{ matrix.dir }}/go.mod
 
   # Builds the image at PR time (single-arch, no push, no scan) and runs the
   # repo's image tests against it, so a Dockerfile that does not build or an
