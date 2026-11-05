@@ -238,51 +238,32 @@ GO_MODULES_ONLY = {
 
 
 class RootLessDeadset(Harness):
+    """With no root go.mod, deadset-go analyzes every module from the root in one run."""
+
     def resolve_root(self, files: dict[str, str]):
         repo = git_repo(self.tmp / f'resolve-{len(list(self.tmp.glob("resolve-*")))}', files)
         return self.run_step('Resolve target', repo, {'TARGET': '.'})
 
-    def test_go_modules_alone_are_each_a_target_and_the_root_is_none(self):
+    def test_go_modules_alone_have_one_target_and_keep_their_go_jobs(self):
         out = run_detect(self, GO_MODULES_ONLY)
-        self.assertEqual(json.loads(out['deadset_targets']), ['alpha', 'beta'])
+        self.assertEqual(json.loads(out['deadset_targets']), ['.'])
+        self.assertEqual(json.loads(out['go_nested_dirs']), ['alpha', 'beta'])
 
-    def test_the_root_of_module_halves_analyzes_only_their_typescript(self):
+    def test_the_root_of_module_halves_is_the_one_target_and_names_no_language(self):
         out = run_detect(self, ROOTLESS)
-        self.assertEqual(json.loads(out['deadset_targets']), ['.', 'alpha', 'beta', 'gamma'])
+        self.assertEqual(json.loads(out['deadset_targets']), ['.'])
+        self.assertEqual(json.loads(out['go_nested_dirs']), ['alpha', 'beta', 'gamma'])
         run = self.resolve_root(ROOTLESS)
         self.assertEqual(run.rc, 0, run.out)
-        got = run.outputs
-        self.assertEqual(
-            (got['languages'], got['languages_from'], got['go'], got['ts']),
-            ('ts', 'central: Go only in nested modules', 'false', 'true'),
-        )
-        central = json.loads(Path(got['work'], 'central.json').read_text())
-        self.assertEqual(central['analysis'], {'languages': ['ts']})
-        self.assertEqual(got['npm_dirs'], 'alpha/web\ngamma/web')
+        central = json.loads(Path(run.outputs['work'], 'central.json').read_text())
+        self.assertEqual(central, {'target': {'kind': 'library'}})
+        self.assertEqual(run.outputs['go_mod'], 'false')
 
-    def test_go_outside_every_module_still_fails_closed(self):
-        files = {**ROOTLESS, 'tools/x.go': 'package main\n'}
-        self.assertIn('.', json.loads(run_detect(self, files)['deadset_targets']))
-        run = self.resolve_root(files)
-        self.assertEqual(run.rc, 1, run.out)
-        self.assertIn('::error::Go is in scope at . (detected), but . has no go.mod', run.out)
-
-    def test_a_module_no_other_target_covers_still_fails_closed(self):
+    def test_a_module_under_static_or_dist_adds_no_target(self):
         for d in ('dist/x', 'static/x', 'alpha/dist/x'):
             with self.subTest(d=d):
                 files = {**GO_MODULES_ONLY, **module(d, f'example.com/r/{d}')}
-                out = run_detect(self, files)
-                self.assertEqual(json.loads(out['deadset_targets']), ['.', 'alpha', 'beta'])
-                run = self.resolve_root(files)
-                self.assertEqual(run.rc, 1, run.out)
-                self.assertIn('::error::Go is in scope at . (detected), but . has no go.mod', run.out)
-
-    def test_a_repository_file_still_decides(self):
-        files = {**GO_MODULES_ONLY, 'deadset.json': '{"analysis":{"languages":["go"]}}'}
-        self.assertIn('.', json.loads(run_detect(self, files)['deadset_targets']))
-        run = self.resolve_root(files)
-        self.assertEqual(run.rc, 1, run.out)
-        self.assertIn('Go is in scope at . (repository: deadset.json)', run.out)
+                self.assertEqual(json.loads(run_detect(self, files)['deadset_targets']), ['.'])
 
 
 if __name__ == '__main__':

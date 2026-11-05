@@ -210,9 +210,14 @@ jobs:
             fi
 
             # deadset-ci.yaml asks deadset whether the root holds a program, so
-            # the root is always a dead-code target. deadset-go's `./...` stops
-            # at a nested module, so each one is its own target.
-            deadset_targets=$(jq -cn --argjson b "$go_nested_dirs" '["."] + $b')
+            # the root is always a dead-code target. Under a root go.mod,
+            # deadset-go's `./...` stops at a nested module, so each one is its
+            # own target; with no root go.mod, deadset-go analyzes every module
+            # below the root in one report (deadset-go README).
+            deadset_targets='["."]'
+            if [ -f go.mod ]; then
+              deadset_targets=$(jq -cn --argjson b "$go_nested_dirs" '["."] + $b')
+            fi
           fi
 
           {
@@ -372,12 +377,13 @@ jobs:
       target: ${{ matrix.target }}
 
   # The pinned deadset tools over one Go-only, one TypeScript-only, one mixed
-  # repository, one nested module, one with JavaScript but no npm project and
-  # one with no program, so a pin set that makes deadset refuse or give no
-  # answer fails here before a release carries it. `off` still fails exit 2
-  # and 3, except print-languages finding no language, which skips the
-  # cplieger/docs row; findings at the frozen commits do not. Refresh a ref
-  # only when its repository stops representing its shape.
+  # repository, one nested module, one with JavaScript but no npm project, one
+  # of Go modules with no root go.mod and one with no program, so a pin set
+  # that makes deadset refuse or give no answer fails here before a release
+  # carries it. `off` still fails exit 2 and 3, except print-languages finding
+  # no language, which skips the cplieger/docs row; findings at the frozen
+  # commits do not. Refresh a ref only when its repository stops representing
+  # its shape.
   deadset-canary:
     needs: detect
     if: ${{ github.repository == 'cplieger/ci' && needs.detect.outputs.code_changed == 'true' }}
@@ -405,6 +411,9 @@ jobs:
             target: '.'
           - repository: cplieger/docs
             ref: 0df62b0d75ac1d8b0289e476c2b81730783e2bde
+            target: '.'
+          - repository: cplieger/go
+            ref: 85a60345f20fdd2ebc75d4b9022cbcad9a041297
             target: '.'
     uses: ./.github/workflows/deadset-ci.yaml
     with:

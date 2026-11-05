@@ -72,6 +72,7 @@ exit "$rc"
 
 GO_STUB = """#!/usr/bin/env bash
 printf '%s GOTOOLCHAIN=%s\\n' "$*" "${GOTOOLCHAIN:-}" >> "$STUB_LOG/go"
+printf '%s %s\\n' "$(basename "$PWD")" "$1" >> "$STUB_LOG/go-dir"
 if [ "$1" = list ]; then
   printf '%s' "${GO_LIST_OUT:-}"
   exit "${GO_LIST_RC:-0}"
@@ -259,7 +260,7 @@ TS_ONLY = {
 IMAGE_ONLY = {'Dockerfile': 'FROM scratch\n', 'run.sh': '#!/bin/sh\n'}
 CENSUS_STEP = 'Languages in scope (deadset)'
 INSTALL_STEP = 'Install analyzers and dependencies'
-# The class lines deadset v2.0.0-dev.26 prints for a tree with no program and
+# The class lines deadset v2.0.0-dev.28 prints for a tree with no program and
 # for a tree holding only Protocol Buffers.
 NO_PROGRAM = (
     'setup failure: no-program: no file under /w puts a language in scope, so it holds no '
@@ -271,8 +272,8 @@ UNSUPPORTED = (
     'setup failure: unsupported-language: the census of /w puts only "proto" in scope, and '
     'this build holds no reader of it; run a release of deadset that holds its reader'
 )
-# What deadset v2.0.0-dev.26 prints when deadset-ts finds no inputs in a lone
-# tsconfig.json.
+# What deadset v2.0.0-dev.28 prints when analysis.languages names ts and
+# deadset-ts finds no inputs in a lone tsconfig.json.
 TS_NO_PROGRAM = (
     'setup failure: no-program: no configuration discovery derived could be built; '
     "tsconfig.json: TS18003: No inputs were found in config file 'tsconfig.json'. "
@@ -368,6 +369,7 @@ class MetaJobs(unittest.TestCase):
                 ('cplieger/envx', 'yamlenv'),  # a nested module
                 ('cplieger/docker-renovate-scheduler', '.'),  # JavaScript, no npm project
                 ('cplieger/docs', '.'),  # no program
+                ('cplieger/go', '.'),  # Go modules and no root go.mod
             },
         )
         for key in ('repository', 'ref', 'target'):
@@ -605,13 +607,29 @@ class Census(Harness):
         )
         self.assert_unknown(run, '::error::TypeScript is in scope at . (detected)')
         self.assertIn('no package-lock.json is tracked', run.out)
-        run = self.ask({'package-lock.json': '{}', 'tool/x.go': ''}, census('go', 'ts'))
-        self.assert_unknown(run, '::error::Go is in scope at . (detected), but . has no go.mod')
         run = self.ask(
             {'go.mod': 'module x\n', 'package.json': '{}'},
             census('ts', provenance='repository: deadset.json'),
         )
         self.assert_unknown(run, 'TypeScript is in scope at . (repository: deadset.json)')
+
+    def test_go_is_set_up_in_every_module_deadset_go_loads(self):
+        run = self.ask(NESTED, census('go'))
+        self.assertEqual(run.outputs['go_dirs'], '.')
+        rootless = {
+            'alpha/go.mod': 'module a\n',
+            'beta/x/go.mod': 'module b\n',
+            'node_modules/n/go.mod': 'module n\n',
+            'testdata/t/go.mod': 'module t\n',
+            'vendor/v/go.mod': 'module v\n',
+            '.cache/c/go.mod': 'module c\n',
+            '_old/o/go.mod': 'module o\n',
+        }
+        run = self.ask(rootless, census('go', provenance='repository: deadset.json'))
+        self.assertEqual(self.installs(run), ('true', 'true', 'false'))
+        self.assertEqual(run.outputs['go_dirs'], 'alpha\nbeta/x')
+        run = self.ask({**rootless, 'package-lock.json': '{}'}, census('ts'))
+        self.assertEqual(run.outputs['go_dirs'], '')
 
     def test_javascript_without_an_npm_project_installs_nothing(self):
         run = self.ask({'go.mod': 'module x\n', 'tests/stub.mjs': ''}, census('go', 'ts'))
@@ -714,7 +732,7 @@ class Analyze(Harness):
             'TARGET': '.',
             'EXIT_CODE': 'on',
             'WORK': str(self.work),
-            'GO': 'true',
+            'GO_DIRS': '.',
             'NPM_DIRS': '',
             **env,
         }
@@ -817,8 +835,19 @@ class Analyze(Harness):
         self.assertIn('::error::go list ./... failed at .', run.out)
         self.assertEqual(run.logged('argv'), '')
 
+    def test_each_module_is_listed_and_named_where_it_leaks(self):
+        shutil.rmtree(self.tmp / 'repo')
+        self.repo = git_repo(self.tmp / 'repo', {'alpha/go.mod': 'module a\n', 'beta/go.mod': ''})
+        run = self.analyze(GO_DIRS='alpha\nbeta')
+        self.assertEqual(run.rc, 0, run.out)
+        self.assertEqual(run.logged('go-dir').splitlines(), ['alpha list', 'beta list'])
+        run = self.analyze(GO_DIRS='alpha\nbeta', GO_LIST_OUT='/r/alpha/node_modules/x\n')
+        self.assertIn('::error::the Go module at alpha reaches into node_modules', run.out)
+        run = self.analyze(GO_DIRS='alpha', GO_LIST_RC='1')
+        self.assertIn('::error::go list ./... failed at alpha,', run.out)
+
     def test_a_typescript_only_target_never_calls_go(self):
-        run = self.analyze(GO='false', GO_LIST_OUT='/x/node_modules/y\n')
+        run = self.analyze(GO_DIRS='', GO_LIST_OUT='/x/node_modules/y\n')
         self.assertEqual(run.rc, 0, run.out)
         self.assertEqual(run.logged('go'), '')
 
@@ -843,7 +872,7 @@ class Analyze(Harness):
 
     def test_a_misplaced_file_is_named_from_the_repository_root(self):
         self.repo = git_repo(self.tmp / 'repo', {'yamlenv/web/deadset.json': '{}'}) / 'yamlenv'
-        run = self.analyze(TARGET='yamlenv', NPM_DIRS='web', GO='false')
+        run = self.analyze(TARGET='yamlenv', NPM_DIRS='web', GO_DIRS='')
         self.assertIn('::error file=yamlenv/web/deadset.json::', run.out)
         self.assertIn('at the target root, yamlenv, only', run.out)
 
@@ -873,7 +902,7 @@ class InstallSteps(Harness):
         )
         for name in ('web', 'ui'):
             (self.tmp / name).mkdir()
-        env = {'GO': 'true', 'TS': 'true', 'NPM_DIRS': 'web\nui'}
+        env = {'GO': 'true', 'TS': 'true', 'GO_DIRS': '.', 'NPM_DIRS': 'web\nui'}
         run = self.run_step(INSTALL_STEP, self.tmp, env)
         self.assertEqual(run.rc, 0, run.out)
         self.assertEqual(
@@ -899,6 +928,14 @@ class InstallSteps(Harness):
         )
         run = self.run_step(INSTALL_STEP, self.tmp, {'GO': 'false', 'TS': 'false', 'NPM_DIRS': ''})
         self.assertEqual((run.rc, run.logged('go'), run.logged('npm')), (0, '', ''))
+
+    def test_modules_are_downloaded_in_each_directory_deadset_names(self):
+        for name in ('alpha', 'beta'):
+            (self.tmp / name).mkdir()
+        env = {'GO': 'true', 'TS': 'false', 'GO_DIRS': 'alpha\nbeta', 'NPM_DIRS': ''}
+        run = self.run_step(INSTALL_STEP, self.tmp, env)
+        self.assertEqual(run.rc, 0, run.out)
+        self.assertEqual(run.logged('go-dir').splitlines()[1:], ['alpha mod', 'beta mod'])
 
     def test_a_transient_go_failure_is_retried(self):
         for step in ('Install deadset', INSTALL_STEP):
@@ -941,10 +978,13 @@ class InstallSteps(Harness):
             {
                 'GO': '${{ steps.census.outputs.go }}',
                 'TS': '${{ steps.census.outputs.ts }}',
+                'GO_DIRS': '${{ steps.census.outputs.go_dirs }}',
                 'NPM_DIRS': '${{ steps.census.outputs.npm_dirs }}',
             },
         )
-        self.assertEqual(analyze_step(STEP)['env']['GO'], '${{ steps.census.outputs.go }}')
+        self.assertEqual(
+            analyze_step(STEP)['env']['GO_DIRS'], '${{ steps.census.outputs.go_dirs }}'
+        )
         self.assertEqual(
             analyze_step(STEP)['env']['NPM_DIRS'], '${{ steps.census.outputs.npm_dirs }}'
         )
@@ -1120,6 +1160,66 @@ class KnipStep(Harness):
         run = self.run_knip({'package.json': '{"name": "x"}', 'knip.json': '{}'}, rc='1')
         self.assertEqual(run.rc, 1, run.out)
         self.assertEqual(run.recorded, 'knip\n')
+
+
+PINNED_BIN = os.environ.get('DEADSET_PINNED_BIN', '')
+GO_MODULE = {
+    'alpha/go.mod': 'module example.com/alpha\n\ngo 1.24\n',
+    'alpha/a.go': 'package alpha\n\nfunc F() {}\n',
+}
+TS_PROJECT = {
+    'package.json': '{"name":"m","private":true}\n',
+    'tsconfig.json': '{"compilerOptions":{"strict":true},"include":["src"]}\n',
+    'src/index.ts': 'export const x = 1;\n',
+}
+
+
+@unittest.skipUnless(
+    PINNED_BIN, 'DEADSET_PINNED_BIN names no directory of the pinned deadset tools'
+)
+class PinnedRootWithoutGoMod(Harness):
+    """The pinned tools at a root no go.mod governs, the one deadset target there."""
+
+    def analyze(self, files: dict[str, str]) -> tuple[int, dict, str]:
+        self.assertEqual(json.loads(run_detect(self, files)['deadset_targets']), ['.'])
+        repo = git_repo(self.tmp / 'pinned', files)
+        central = self.tmp / 'central.json'
+        central.write_text('{"target":{"kind":"library"}}')
+        env = {
+            **os.environ,
+            'PATH': os.pathsep.join([PINNED_BIN, os.environ['PATH']]),
+            'TMPDIR': str(self.tmp),
+            'GOFLAGS': '',
+        }
+        args = ['deadset', 'analyze', '--target=.', f'--central={central}']
+        args.append(f'--run-dir={self.tmp / "run"}')
+        proc = subprocess.run(args, cwd=repo, env=env, capture_output=True, text=True, timeout=600)
+        report = json.loads((self.tmp / 'run' / 'report.json').read_text())
+        return proc.returncode, report, proc.stdout + proc.stderr
+
+    def analyzers(self, report: dict) -> list[str]:
+        return [m['name'] for m in report['merged_from']]
+
+    def test_go_modules_alone_are_analyzed_at_the_root(self):
+        rc, report, out = self.analyze(GO_MODULE)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.analyzers(report), ['deadset-go'])
+        self.assertEqual(report['target']['identity'], 'example.com/alpha')
+        self.assertEqual(report['totals']['withheld']['possible'], 1)
+
+    def test_a_root_project_and_a_module_are_analyzed_together(self):
+        rc, report, out = self.analyze({**GO_MODULE, **TS_PROJECT})
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.analyzers(report), ['deadset-go', 'deadset-ts'])
+        self.assertEqual(report['analyzer']['languages'], ['go', 'ts'])
+
+    def test_a_configured_go_loads_the_modules_below(self):
+        rc, report, out = self.analyze(
+            {**GO_MODULE, 'deadset.json': '{"analysis":{"languages":["go"]}}'}
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.analyzers(report), ['deadset-go'])
+        self.assertEqual(report['target']['identity'], 'example.com/alpha')
 
 
 class Replaced(unittest.TestCase):

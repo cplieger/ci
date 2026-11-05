@@ -172,9 +172,18 @@ jobs:
                 ;;
             esac
           done
-          if [ "$go" = true ] && [ ! -f go.mod ]; then
-            echo "::error::Go is in scope at $TARGET ($(from go)), but $TARGET has no go.mod to load it from. Add a root deadset.json whose analysis.languages leaves go out, or analyze the module at its own root."
-            exit 1
+          # With no go.mod at the target, deadset-go analyzes every module below
+          # it in one report, skipping the directories its `./...` skips.
+          go_dirs=()
+          if [ "$go" = true ] && [ -f go.mod ]; then
+            go_dirs=(.)
+          elif [ "$go" = true ]; then
+            while IFS= read -r file; do
+              case "/$file" in
+                */node_modules/* | */testdata/* | */vendor/* | */.*/* | */_*/*) continue ;;
+              esac
+              go_dirs+=("$(dirname "$file")")
+            done < <(git ls-files -- ':(glob)**/go.mod')
           fi
           # JavaScript with no package.json, such as a node script, has nothing
           # to install.
@@ -197,6 +206,9 @@ jobs:
             echo "analyze=true"
             echo "go=$go"
             echo "ts=$ts"
+            echo "go_dirs<<GO_DIRS_END"
+            for d in "${go_dirs[@]}"; do printf '%s\n' "$d"; done
+            echo "GO_DIRS_END"
             echo "npm_dirs<<NPM_DIRS_END"
             for d in "${npm_dirs[@]}"; do printf '%s\n' "$d"; done
             echo "NPM_DIRS_END"
@@ -228,6 +240,7 @@ jobs:
         env:
           GO: ${{ steps.census.outputs.go }}
           TS: ${{ steps.census.outputs.ts }}
+          GO_DIRS: ${{ steps.census.outputs.go_dirs }}
           NPM_DIRS: ${{ steps.census.outputs.npm_dirs }}
         run: |
           set -euo pipefail
@@ -247,7 +260,10 @@ jobs:
           }
           if [ "$GO" = true ]; then
             retry go install "github.com/cplieger/deadset-go/v2/cmd/deadset-go@${DEADSET_GO_VERSION}"
-            retry go mod download
+            while IFS= read -r dir; do
+              if [ -z "$dir" ]; then continue; fi
+              (cd "$dir" && retry go mod download)
+            done < <(printf '%s\n' "$GO_DIRS")
           fi
           if [ "$TS" = true ]; then
             npm install --global --ignore-scripts --no-audit --no-fund \
@@ -273,22 +289,26 @@ jobs:
           TARGET: ${{ inputs.target }}
           EXIT_CODE: ${{ inputs.exit-code }}
           WORK: ${{ steps.target.outputs.work }}
-          GO: ${{ steps.census.outputs.go }}
+          GO_DIRS: ${{ steps.census.outputs.go_dirs }}
           NPM_DIRS: ${{ steps.census.outputs.npm_dirs }}
         run: |
           set -euo pipefail
-          if [ "$GO" = true ]; then
-            dirs="$(go list -e -find -f '{{.Dir}}' ./...)" || {
-              echo "::error::go list ./... failed at $TARGET, so nothing was checked. Its error is above."
+          while IFS= read -r module; do
+            if [ -z "$module" ]; then continue; fi
+            at="$module"
+            if [ "$TARGET" != . ]; then at="$TARGET/$module"; fi
+            if [ "$module" = . ]; then at="$TARGET"; fi
+            dirs="$(cd "$module" && go list -e -find -f '{{.Dir}}' ./...)" || {
+              echo "::error::go list ./... failed at $at, so nothing was checked. Its error is above."
               exit 1
             }
             leaked="$(printf '%s\n' "$dirs" | grep -E '/node_modules(/|$)' || true)"
             if [ -n "$leaked" ]; then
-              echo "::error::the Go module at $TARGET reaches into node_modules, so deadset-go would analyze Go code an npm package ships. Add an 'ignore ./<dir>/node_modules' line to go.mod (Go 1.25 or later), or a go.mod in the npm project to fence it off."
+              echo "::error::the Go module at $at reaches into node_modules, so deadset-go would analyze Go code an npm package ships. Add an 'ignore ./<dir>/node_modules' line to go.mod (Go 1.25 or later), or a go.mod in the npm project to fence it off."
               printf '%s\n' "$leaked" | sed 's/^/  /'
               exit 1
             fi
-          fi
+          done < <(printf '%s\n' "$GO_DIRS")
           misplaced=0
           while IFS= read -r dir; do
             if [ -z "$dir" ] || [ "$dir" = . ]; then continue; fi
