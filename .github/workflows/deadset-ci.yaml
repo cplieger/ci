@@ -33,7 +33,7 @@ env:
   # renovate: datasource=go depName=github.com/cplieger/deadset/v2
   DEADSET_VERSION: v2.0.0-dev.28
   # renovate: datasource=go depName=github.com/cplieger/deadset-go/v2
-  DEADSET_GO_VERSION: v2.0.0-dev.32
+  DEADSET_GO_VERSION: v2.0.0-dev.34
   # renovate: datasource=npm depName=@cplieger/deadset-ts
   DEADSET_TS_VERSION: 8.0.0-dev.16
 
@@ -275,11 +275,8 @@ jobs:
             (cd "$dir" && npm ci --ignore-scripts --no-audit --no-fund)
           done < <(printf '%s\n' "$NPM_DIRS")
 
-      # An npm package can ship Go source (flatted ships golang/pkg/flatted),
-      # and `./...` enters node_modules unless go.mod ignores it or a go.mod
-      # fences the npm project off. deadset reads deadset.json,
-      # deadset-ignore.json, deadset-baseline.json and deadset-edges.json at
-      # the target root only.
+      # deadset reads deadset.json, deadset-ignore.json, deadset-baseline.json
+      # and deadset-edges.json at the target root only.
       # Flags outrank deadset.json, so --formats, which the SARIF upload
       # needs, is the one key a repository cannot set; any other flag would
       # take a key from it.
@@ -289,26 +286,9 @@ jobs:
           TARGET: ${{ inputs.target }}
           EXIT_CODE: ${{ inputs.exit-code }}
           WORK: ${{ steps.target.outputs.work }}
-          GO_DIRS: ${{ steps.census.outputs.go_dirs }}
           NPM_DIRS: ${{ steps.census.outputs.npm_dirs }}
         run: |
           set -euo pipefail
-          while IFS= read -r module; do
-            if [ -z "$module" ]; then continue; fi
-            at="$module"
-            if [ "$TARGET" != . ]; then at="$TARGET/$module"; fi
-            if [ "$module" = . ]; then at="$TARGET"; fi
-            dirs="$(cd "$module" && go list -e -find -f '{{.Dir}}' ./...)" || {
-              echo "::error::go list ./... failed at $at, so nothing was checked. Its error is above."
-              exit 1
-            }
-            leaked="$(printf '%s\n' "$dirs" | grep -E '/node_modules(/|$)' || true)"
-            if [ -n "$leaked" ]; then
-              echo "::error::the Go module at $at reaches into node_modules, so deadset-go would analyze Go code an npm package ships. Add an 'ignore ./<dir>/node_modules' line to go.mod (Go 1.25 or later), or a go.mod in the npm project to fence it off."
-              printf '%s\n' "$leaked" | sed 's/^/  /'
-              exit 1
-            fi
-          done < <(printf '%s\n' "$GO_DIRS")
           misplaced=0
           while IFS= read -r dir; do
             if [ -z "$dir" ] || [ "$dir" = . ]; then continue; fi

@@ -73,10 +73,6 @@ exit "$rc"
 GO_STUB = """#!/usr/bin/env bash
 printf '%s GOTOOLCHAIN=%s\\n' "$*" "${GOTOOLCHAIN:-}" >> "$STUB_LOG/go"
 printf '%s %s\\n' "$(basename "$PWD")" "$1" >> "$STUB_LOG/go-dir"
-if [ "$1" = list ]; then
-  printf '%s' "${GO_LIST_OUT:-}"
-  exit "${GO_LIST_RC:-0}"
-fi
 if [ -n "${GO_FAIL_ONCE:-}" ] && [ ! -e "$STUB_LOG/go-failed" ]; then
   : > "$STUB_LOG/go-failed"
   exit 1
@@ -732,7 +728,6 @@ class Analyze(Harness):
             'TARGET': '.',
             'EXIT_CODE': 'on',
             'WORK': str(self.work),
-            'GO_DIRS': '.',
             'NPM_DIRS': '',
             **env,
         }
@@ -820,34 +815,8 @@ class Analyze(Harness):
         self.assert_failed(run, 'is not on PATH')
         self.assertIn('Check the Install deadset step above', run.out)
 
-    def test_a_go_module_reaching_into_node_modules_fails_before_analysis(self):
-        leaked = f'{self.repo}/static-src/node_modules/flatted/golang/pkg/flatted'
-        run = self.analyze(GO_LIST_OUT=f'{self.repo}\n{self.repo}/cmd\n{leaked}\n')
-        self.assertEqual(run.rc, 1, run.out)
-        self.assertIn("Add an 'ignore ./<dir>/node_modules' line to go.mod", run.out)
-        self.assertIn(f'  {leaked}', run.out)
-        self.assertEqual(run.logged('argv'), '')
-        self.assertIn('list -e -find -f {{.Dir}} ./...', run.logged('go'))
-
-    def test_a_failed_package_listing_fails_before_analysis(self):
-        run = self.analyze(GO_LIST_RC='1')
-        self.assertEqual(run.rc, 1, run.out)
-        self.assertIn('::error::go list ./... failed at .', run.out)
-        self.assertEqual(run.logged('argv'), '')
-
-    def test_each_module_is_listed_and_named_where_it_leaks(self):
-        shutil.rmtree(self.tmp / 'repo')
-        self.repo = git_repo(self.tmp / 'repo', {'alpha/go.mod': 'module a\n', 'beta/go.mod': ''})
-        run = self.analyze(GO_DIRS='alpha\nbeta')
-        self.assertEqual(run.rc, 0, run.out)
-        self.assertEqual(run.logged('go-dir').splitlines(), ['alpha list', 'beta list'])
-        run = self.analyze(GO_DIRS='alpha\nbeta', GO_LIST_OUT='/r/alpha/node_modules/x\n')
-        self.assertIn('::error::the Go module at alpha reaches into node_modules', run.out)
-        run = self.analyze(GO_DIRS='alpha', GO_LIST_RC='1')
-        self.assertIn('::error::go list ./... failed at alpha,', run.out)
-
-    def test_a_typescript_only_target_never_calls_go(self):
-        run = self.analyze(GO_DIRS='', GO_LIST_OUT='/x/node_modules/y\n')
+    def test_the_analysis_never_calls_go(self):
+        run = self.analyze()
         self.assertEqual(run.rc, 0, run.out)
         self.assertEqual(run.logged('go'), '')
 
@@ -872,7 +841,7 @@ class Analyze(Harness):
 
     def test_a_misplaced_file_is_named_from_the_repository_root(self):
         self.repo = git_repo(self.tmp / 'repo', {'yamlenv/web/deadset.json': '{}'}) / 'yamlenv'
-        run = self.analyze(TARGET='yamlenv', NPM_DIRS='web', GO_DIRS='')
+        run = self.analyze(TARGET='yamlenv', NPM_DIRS='web')
         self.assertIn('::error file=yamlenv/web/deadset.json::', run.out)
         self.assertIn('at the target root, yamlenv, only', run.out)
 
@@ -982,9 +951,7 @@ class InstallSteps(Harness):
                 'NPM_DIRS': '${{ steps.census.outputs.npm_dirs }}',
             },
         )
-        self.assertEqual(
-            analyze_step(STEP)['env']['GO_DIRS'], '${{ steps.census.outputs.go_dirs }}'
-        )
+        self.assertNotIn('GO_DIRS', analyze_step(STEP)['env'])
         self.assertEqual(
             analyze_step(STEP)['env']['NPM_DIRS'], '${{ steps.census.outputs.npm_dirs }}'
         )
@@ -1180,9 +1147,14 @@ TS_PROJECT = {
 class PinnedRootWithoutGoMod(Harness):
     """The pinned tools at a root no go.mod governs, the one deadset target there."""
 
-    def analyze(self, files: dict[str, str]) -> tuple[int, dict, str]:
+    def analyze(
+        self, files: dict[str, str], untracked: dict[str, str] | None = None
+    ) -> tuple[int, dict, str]:
         self.assertEqual(json.loads(run_detect(self, files)['deadset_targets']), ['.'])
         repo = git_repo(self.tmp / 'pinned', files)
+        for name, text in (untracked or {}).items():
+            (repo / name).parent.mkdir(parents=True, exist_ok=True)
+            (repo / name).write_text(text)
         central = self.tmp / 'central.json'
         central.write_text('{"target":{"kind":"library"}}')
         env = {
@@ -1212,6 +1184,19 @@ class PinnedRootWithoutGoMod(Harness):
         self.assertEqual(rc, 1, out)
         self.assertEqual(self.analyzers(report), ['deadset-go', 'deadset-ts'])
         self.assertEqual(report['analyzer']['languages'], ['go', 'ts'])
+
+    def test_go_an_npm_package_ships_is_never_analyzed(self):
+        shipped = 'web/node_modules/flatted/golang/pkg/flatted/flatted.go'
+        files = {
+            **GO_MODULE,
+            '.gitignore': 'node_modules/\n',
+            'web/go.mod': 'module web-ignore\n',
+            'web/package.json': '{"name":"w","private":true}\n',
+        }
+        rc, report, out = self.analyze(files, {shipped: 'package flatted\n\nfunc ToJSON() {}\n'})
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn('node_modules', json.dumps(report['findings']))
+        self.assertEqual(report['totals']['withheld']['possible'], 1)
 
     def test_a_configured_go_loads_the_modules_below(self):
         rc, report, out = self.analyze(

@@ -59,10 +59,7 @@ The languages are the `analysis.languages` of `deadset.json`. When the file name
 
 When the analyzer of a detected language finds no program, for example in a `tsconfig.json` with no inputs, deadset leaves that language out and reports the rest. When `analysis.languages` names the language, or the analyzer cannot read its configuration, the check fails.
 
-Any finding at `deny` severity fails the check. So does a run that gives no answer, such as a missing or refused analyzer, and a run that ends without writing its SARIF report. To keep a symbol, put a `deadset:ignore` directive with its code and a reason on the line above it. Two repository layouts fail the check on their own:
-
-- A Go module that reaches into an npm project's `node_modules` fails before deadset runs, because an npm package can ship Go source. Add an `ignore ./<folder>/node_modules` line to `go.mod` (Go 1.25 or later), or put a `go.mod` in the npm project to fence it off.
-- A `deadset.json`, `deadset-ignore.json`, `deadset-baseline.json` or `deadset-edges.json` in an npm project folder below the root is never read, so the check fails and names it. Move it to the root and make its paths relative to the root.
+Any finding at `deny` severity fails the check. So does a run that gives no answer, such as a missing or refused analyzer, and a run that ends without writing its SARIF report. To keep a symbol, put a `deadset:ignore` directive with its code and a reason on the line above it. A `deadset.json`, `deadset-ignore.json`, `deadset-baseline.json` or `deadset-edges.json` in an npm project folder below the root is never read, so the check fails and names it. Move it to the root and make its paths relative to the root. deadset-go never analyzes the Go source an npm package ships under `node_modules`.
 
 Each run also writes SARIF and uploads it to code scanning, under the category `deadset`, or `deadset/<folder>` for a nested module. Each analyzer's findings stay a separate analysis inside that category. The upload needs `security-events: write`, which the synced `ci.yml` grants. It is skipped in private repositories, and a failed upload never fails the check.
 
