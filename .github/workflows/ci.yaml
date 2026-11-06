@@ -539,32 +539,28 @@ jobs:
       matrix:
         include:
           - repository: cplieger/deadset-go
-            ref: b303bc823a71feef2593880d6ca962e10c25da1c
+            ref: 35361bb6ae20124ecbf4e3e164e3b7d8ed70d46c
             dir: '.'
             runner: windows-latest
           - repository: cplieger/deadset-go
-            ref: b303bc823a71feef2593880d6ca962e10c25da1c
+            ref: 35361bb6ae20124ecbf4e3e164e3b7d8ed70d46c
             dir: '.'
             runner: macos-latest
           - repository: cplieger/bolttable
-            ref: c2cefa26d9df62b514741f86f96368ca9cd72a11
-            dir: '.'
-            runner: windows-latest
-          - repository: cplieger/bolttable
-            ref: c2cefa26d9df62b514741f86f96368ca9cd72a11
+            ref: b65411add175dea15e1ffbd483c2b7b3046207e8
             dir: '.'
             runner: macos-latest
           - repository: cplieger/grelot
-            ref: 93dcaa0111b5195c7be5f201b9c2b3d8d46024aa
+            ref: 0462ae0b8af30242f72a3951c1a008b0c84871ea
             dir: '.'
             runner: windows-latest
           - repository: cplieger/grelot
-            ref: 93dcaa0111b5195c7be5f201b9c2b3d8d46024aa
+            ref: 0462ae0b8af30242f72a3951c1a008b0c84871ea
             dir: '.'
             runner: macos-latest
           # cplieger/go filesafe: the Windows POSIX-rename and sharing tests.
           - repository: cplieger/go
-            ref: ec4f5be970d7d4679b7dcff8425436ad7e4e6659
+            ref: 8a4da7700fc6413d58f7cace2cd11c48282c2510
             dir: filesafe
             runner: windows-latest
     uses: ./.github/workflows/go-os-ci.yaml
