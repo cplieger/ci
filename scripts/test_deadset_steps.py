@@ -988,7 +988,8 @@ class InstallSteps(Harness):
         )
 
     def test_both_steps_share_one_retry_and_one_install_pinned(self):
-        bodies = [analyze_step(s)['run'] for s in ('Install deadset', INSTALL_STEP)]
+        steps = ('Install deadset', INSTALL_STEP)
+        bodies = [analyze_step(s)['run'] for s in steps]
         for name in ('retry', 'install_pinned'):
             with self.subTest(function=name):
                 found = [
@@ -997,6 +998,9 @@ class InstallSteps(Harness):
                 ]
                 self.assertTrue(all(found), name)
                 self.assertEqual(found[0].group(0), found[1].group(0))
+        for step, body in zip(steps, bodies, strict=True):
+            with self.subTest(step=step):
+                self.assertNotRegex(body, r'go install \S+@')
 
 
 NEWER = 'v99.0.0'
@@ -1065,11 +1069,13 @@ class StaleProxyHandler(BaseHTTPRequestHandler):
 GO = shutil.which('go')
 
 
-@unittest.skipUnless(GO, 'go is not installed')
+# CI must run these, so a runner without Go fails them instead of skipping.
+@unittest.skipUnless(GO or os.environ.get('CI'), 'go is not installed')
 class PinnedInstallWhileANewerTagIsUnserved(Harness):
     """Each install step against a proxy that lists a newer version it cannot serve."""
 
     def setUp(self):
+        self.assertTrue(GO, 'go is not on PATH')
         super().setUp()
         self.pins = {
             DEPS[0]: WORKFLOW_ENV['DEADSET_VERSION'],
