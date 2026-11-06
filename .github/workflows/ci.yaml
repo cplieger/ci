@@ -551,11 +551,11 @@ jobs:
             dir: '.'
             runner: macos-latest
           - repository: cplieger/grelot
-            ref: 0462ae0b8af30242f72a3951c1a008b0c84871ea
+            ref: dd5a797091d1ff41daa34eaad28c2b0b7986f1c7
             dir: '.'
             runner: windows-latest
           - repository: cplieger/grelot
-            ref: 0462ae0b8af30242f72a3951c1a008b0c84871ea
+            ref: dd5a797091d1ff41daa34eaad28c2b0b7986f1c7
             dir: '.'
             runner: macos-latest
           # cplieger/go filesafe: the Windows POSIX-rename and sharing tests.
