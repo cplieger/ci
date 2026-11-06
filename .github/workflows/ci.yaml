@@ -539,23 +539,23 @@ jobs:
       matrix:
         include:
           - repository: cplieger/deadset-go
-            ref: 35361bb6ae20124ecbf4e3e164e3b7d8ed70d46c
+            ref: 0541550ec30c508d77ce4076b4a0ab05b3b7732f
             dir: '.'
             runner: windows-latest
           - repository: cplieger/deadset-go
-            ref: 35361bb6ae20124ecbf4e3e164e3b7d8ed70d46c
+            ref: 0541550ec30c508d77ce4076b4a0ab05b3b7732f
             dir: '.'
             runner: macos-latest
           - repository: cplieger/bolttable
-            ref: b65411add175dea15e1ffbd483c2b7b3046207e8
+            ref: 41fffbc67f3a87baf2d626c661b863a2ae25bdb1
             dir: '.'
             runner: macos-latest
           - repository: cplieger/grelot
-            ref: 023e90f789e8fd95c588a5cfeee01ff92445dcbe
+            ref: 1a415dbe2a6769a906e12086a183107181d0a873
             dir: '.'
             runner: windows-latest
           - repository: cplieger/grelot
-            ref: 023e90f789e8fd95c588a5cfeee01ff92445dcbe
+            ref: 1a415dbe2a6769a906e12086a183107181d0a873
             dir: '.'
             runner: macos-latest
           # cplieger/go filesafe: the Windows POSIX-rename and sharing tests.
