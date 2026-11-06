@@ -9,9 +9,9 @@ Last update: 2026-09-14 22:30
 
 ## Rolling 12-week history
 <!-- gremlins-data -->
-| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy | Mode |
-|---|---|---|---|---|---|---|
-| 2026-09-14 22:30 | 90.2% | ±0.9% | 88.9% | 15 | — | per-package | <!-- run:34900000001 -->
+| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy | Mode | Mutators |
+|---|---|---|---|---|---|---|---|
+| 2026-09-14 22:30 | 90.2% | ±0.9% | 88.9% | 15 | — | per-package | all | <!-- run:34900000001 -->
 <!-- /gremlins-data -->
 
 ## Current live mutants (15, this week)
@@ -74,6 +74,10 @@ Last update: 2026-09-14 22:30
   packages, and is chosen each run when its measured cost fits a quarter of the
   job's time cap. A row marked as switched starts a new baseline, so its score
   jump is expected.
+- **Mutators**: the gremlins mutator types the week ran: `all` eleven,
+  gremlins' `default` five, or the enabled types joined by `+`. Rows from
+  before this column ran `default`. A row marked as switched starts a new
+  baseline, so its score shift is expected.
 
 The "Current live mutants" section is bucketed by **how many of the N runs the
 mutant LIVED in** (N = attempts that week, normally 3):
@@ -89,7 +93,8 @@ mutant LIVED in** (N = attempts that week, normally 3):
   test or strengthen an existing assertion.
 
 The `mutation-regression` label is added when this week's mean efficacy drops
->5% below the rolling 12-week mean of the weeks run in the same mode.
+>5% below the rolling 12-week mean of the weeks run in the same mode with the
+same mutators.
 
 A ⚠️ line under "This week" means the number describes the measurement, not the
 suite: either the attempts disagreed about which mutants survive (one verdict per

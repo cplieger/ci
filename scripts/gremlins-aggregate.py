@@ -10,16 +10,85 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 import trackerlib
+import yaml
 
 MAX_LIVE_MUTANTS_INLINE = 50  # cap; remainder goes to artifact link
 REGRESSION_THRESHOLD_PCT = 5.0  # mean drops > 5% below rolling-mean → flag
 HISTORY_SENTINEL = "gremlins-data"
+CENTRAL_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "gremlins.yaml"
+
+# Every gremlins v0.6.0 mutator type and whether it runs when the config leaves
+# it out (internal/configuration/mutantenabled.go).
+GREMLINS_MUTATORS = {
+    "arithmetic-base": True,
+    "conditionals-boundary": True,
+    "conditionals-negation": True,
+    "increment-decrement": True,
+    "invert-assignments": False,
+    "invert-bitwise": False,
+    "invert-bwassign": False,
+    "invert-logical": False,
+    "invert-loopctrl": False,
+    "invert-negatives": True,
+    "remove-self-assignments": False,
+}
+DEFAULT_MUTATORS = frozenset(t for t, on in GREMLINS_MUTATORS.items() if on)
+
+
+class Yaml12Loader(yaml.SafeLoader):
+    """A SafeLoader that resolves only YAML 1.2 booleans, as gremlins' yaml.v3 does.
+
+    PyYAML follows YAML 1.1 (https://yaml.org/type/bool.html), where yes, no, on and
+    off are bools too; gremlins reads them as strings, so `enabled: yes` leaves a type off.
+    """
+
+
+Yaml12Loader.yaml_implicit_resolvers = {
+    first: [(tag, rx) for tag, rx in resolvers if tag != "tag:yaml.org,2002:bool"]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+Yaml12Loader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool", re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF")
+)
+
+
+def load_config(text: str) -> object:
+    """A .gremlins.yaml parsed with the booleans gremlins reads; raises yaml.YAMLError."""
+    return yaml.load(text, Loader=Yaml12Loader)  # noqa: S506 - a SafeLoader subclass
+
+
+def enabled_mutators(config: object) -> frozenset[str]:
+    """The mutator types gremlins v0.6.0 runs under a parsed .gremlins.yaml.
+
+    gremlins reads only the top-level `mutants.<type>.enabled` key
+    (configuration.MutantTypeEnabledKey). A type with no enabled value (absent or null)
+    keeps its default; any other non-bool reads as off.
+    """
+    mutants = config.get("mutants") if isinstance(config, dict) else None
+    mutants = mutants if isinstance(mutants, dict) else {}
+    on = set()
+    for name, default in GREMLINS_MUTATORS.items():
+        entry = mutants.get(name)
+        value = entry.get("enabled") if isinstance(entry, dict) else None
+        if value is True or (value is None and default):
+            on.add(name)
+    return frozenset(on)
+
+
+def mutators_label(enabled: frozenset[str]) -> str:
+    """One space-free word naming a mutator set: the History table's Mutators cell."""
+    if enabled == frozenset(GREMLINS_MUTATORS):
+        return "all"
+    if enabled == DEFAULT_MUTATORS:
+        return "default"
+    return "+".join(sorted(enabled)) or "none"
 
 
 def mutant_key(m: dict) -> tuple:
@@ -247,8 +316,8 @@ Last update: {week_ending}
 ## Rolling 12-week history
 """
 
-HISTORY_HEADER = """| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy | Mode |
-|---|---|---|---|---|---|---|"""
+HISTORY_HEADER = """| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy | Mode | Mutators |
+|---|---|---|---|---|---|---|---|"""
 
 LIVE_BLOCK_TPL = """## Current live mutants{header_suffix}
 <!-- live-mutants -->
@@ -273,6 +342,10 @@ LEGEND = """## How to read
   packages, and is chosen each run when its measured cost fits a quarter of the
   job's time cap. A row marked as switched starts a new baseline, so its score
   jump is expected.
+- **Mutators**: the gremlins mutator types the week ran: `all` eleven,
+  gremlins' `default` five, or the enabled types joined by `+`. Rows from
+  before this column ran `default`. A row marked as switched starts a new
+  baseline, so its score shift is expected.
 
 The "Current live mutants" section is bucketed by **how many of the N runs the
 mutant LIVED in** (N = attempts that week, normally 3):
@@ -288,7 +361,8 @@ mutant LIVED in** (N = attempts that week, normally 3):
   test or strengthen an existing assertion.
 
 The `mutation-regression` label is added when this week's mean efficacy drops
->5% below the rolling 12-week mean of the weeks run in the same mode.
+>5% below the rolling 12-week mean of the weeks run in the same mode with the
+same mutators.
 
 A ⚠️ line under "This week" means the number describes the measurement, not the
 suite: either the attempts disagreed about which mutants survive (one verdict per
@@ -390,18 +464,42 @@ def render_bucketed_live_mutants(buckets: dict[int, list[dict]], n_runs: int, ca
     return "\n".join(parts), overflow_total
 
 
-def row_mode(cells: list[str]) -> str:
-    """A history row's mode; a row without a Mode cell reads as per-package.
+def row_cell(cells: list[str], index: int, absent: str) -> str:
+    """The first word of a history row's cell at index, or absent for an older row.
 
-    Such a row may carry its run marker at cells[6] instead.
+    An older row may carry its run marker at that index instead.
     """
-    if len(cells) > 6 and not cells[6].startswith("<!--"):
-        return cells[6].split()[0]
-    return "per-package"
+    if len(cells) > index and not cells[index].startswith("<!--"):
+        return cells[index].split()[0]
+    return absent
+
+
+def row_mode(cells: list[str]) -> str:
+    """A history row's mode; a row without a Mode cell reads as per-package."""
+    return row_cell(cells, 6, "per-package")
+
+
+def row_mutators(cells: list[str]) -> str:
+    """A history row's mutator set; a row without a Mutators cell ran gremlins' defaults.
+
+    configs/gremlins.yaml nested its mutants block under unleash until the
+    Mutators column existed, so gremlins ran only its default types.
+    """
+    return row_cell(cells, 7, "default")
+
+
+def switch_cell(now: str, before: str | None, expected: str) -> str:
+    """A Mode or Mutators cell, marking the week its value changed."""
+    return now if before is None else f"{now} (switched from {before}; {expected})"
 
 
 def measurement_cautions(
-    agg: dict, prev_live_count: int | None, switched_from: str | None = None
+    agg: dict,
+    prev_live_count: int | None,
+    *,
+    switched_from: str | None,
+    mutators: str,
+    mutators_from: str | None,
 ) -> list[str]:
     """Lines warning that this week's number measures the harness, not the suite.
 
@@ -409,7 +507,8 @@ def measurement_cautions(
     measurement failures: attempts disagreeing about which mutants survive, and a
     flawless week right after one with live mutants. prev_live_count is None when
     last week's count is unreadable, which silences the second shape;
-    switched_from, last week's mode when it differs, replaces it with a note.
+    switched_from and mutators_from, last week's mode and mutator set when they
+    differ, replace it with a note.
     """
     lines = []
     if switched_from:
@@ -417,6 +516,12 @@ def measurement_cautions(
             f"> 🔀 **Mode switched from {switched_from} to {agg['mode']}.** The mutants run and "
             "the tests they run against changed, so a score jump this week is expected. The trend "
             "and the `mutation-regression` label compare only weeks run in the same mode."
+        )
+    if mutators_from:
+        lines.append(
+            f"> 🔀 **Mutators switched from {mutators_from} to {mutators}.** gremlins ran other "
+            "mutant types, so efficacy and mutant counts shift this week. The trend and the "
+            "`mutation-regression` label compare only weeks run with the same mutators."
         )
     n = agg["n_runs"]
     unstable = sum(len(v) for k, v in (agg["live_buckets"] or {}).items() if 0 < k < n)
@@ -437,6 +542,7 @@ def measurement_cautions(
         and prev_live_count is not None
         and prev_live_count > 0
         and not switched_from
+        and not mutators_from
     ):
         lines.append(
             f"> ⚠️ **A jump to 100% efficacy.** Last week reported {prev_live_count} live "
@@ -447,8 +553,10 @@ def measurement_cautions(
     return lines
 
 
-def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> tuple[str, bool]:
-    """Returns (new_body, regression_flag)."""
+def build_body(
+    repo: str, week: str, agg: dict, run_url: str, existing: str, mutators: str
+) -> tuple[str, bool]:
+    """Returns (new_body, regression_flag); mutators is this run's mutators_label."""
     eff_mean = agg["efficacy_mean"]
     eff_stddev = agg["efficacy_stddev"]
     cov_mean = agg["mutant_coverage_mean"]
@@ -460,19 +568,24 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
     mode = agg["mode"]
     prev_mode = row_mode(history_rows[0]) if history_rows else mode
     switched_from = prev_mode if prev_mode != mode else None
-    mode_cell = mode if switched_from is None else (
-        f"{mode} (switched from {switched_from}; score jump expected)"
-    )
+    prev_mutators = row_mutators(history_rows[0]) if history_rows else mutators
+    mutators_from = prev_mutators if prev_mutators != mutators else None
     history_block = trackerlib.update_history_block(
-        existing, HISTORY_SENTINEL, HISTORY_HEADER, new_row, run_id, after_delta=mode_cell
+        existing, HISTORY_SENTINEL, HISTORY_HEADER, new_row, run_id,
+        after_delta=(
+            switch_cell(mode, switched_from, "score jump expected"),
+            switch_cell(mutators, mutators_from, "score shift expected"),
+        ),
     )
 
-    # Only same-mode rows feed the trend and regression mean: another mode runs
-    # other mutants against other tests, so a switch would read as a regression.
+    # Only rows with this mode and mutator set feed the trend and regression
+    # mean: either change runs other mutants, so a switch would read as a regression.
     history_means = [
         value
         for cells in history_rows
-        if row_mode(cells) == mode and (value := trackerlib.percent_cell(cells, 1)) is not None
+        if row_mode(cells) == mode
+        and row_mutators(cells) == mutators
+        and (value := trackerlib.percent_cell(cells, 1)) is not None
     ]
 
     # Live-mutant count (column 5) feeds the jump-to-100% caution, which names
@@ -494,7 +607,10 @@ def build_body(repo: str, week: str, agg: dict, run_url: str, existing: str) -> 
             prev_live_count = None
 
     trend_line = trackerlib.trend_marker(eff_mean, history_means)
-    cautions = measurement_cautions(agg, prev_live_count, switched_from)
+    cautions = measurement_cautions(
+        agg, prev_live_count,
+        switched_from=switched_from, mutators=mutators, mutators_from=mutators_from,
+    )
     caution_lines = ("\n" + "\n".join(cautions) + "\n") if cautions else "\n"
 
     live_block_inner, overflow = render_bucketed_live_mutants(
@@ -559,7 +675,15 @@ def main() -> int:
                    help="Write the count of parseable attempts here. The "
                         "workflow reads it to skip publishing for a repo whose "
                         "every attempt failed (0) instead of emitting a 0%% badge.")
+    p.add_argument("--config", type=Path, default=CENTRAL_CONFIG,
+                   help="the .gremlins.yaml the attempts ran under. Its mutator set keys "
+                        "the baseline (default: this checkout's configs/gremlins.yaml)")
     args = p.parse_args()
+    try:
+        mutators = mutators_label(enabled_mutators(load_config(args.config.read_text())))
+    except (OSError, yaml.YAMLError) as e:
+        print(f"::error::gremlins-aggregate: cannot read {args.config}: {e}", file=sys.stderr)
+        return 1
 
     # Attempts are matched by the meta.json each artifact carries, and searched at
     # ANY depth: actions/download-artifact only creates the per-artifact directory
@@ -609,7 +733,7 @@ def main() -> int:
     if args.existing_body_file and args.existing_body_file.exists():
         existing = args.existing_body_file.read_text()
 
-    body, regression = build_body(args.repo, args.week, agg, args.run_url, existing)
+    body, regression = build_body(args.repo, args.week, agg, args.run_url, existing, mutators)
     print(body)
 
     if args.regression_marker_file:

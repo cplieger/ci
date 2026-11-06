@@ -24,6 +24,8 @@ PYTHON_CALL = re.compile(r'(?<![\w./-])python3?\s+(-[A-Za-z]|["\']?\$|[\w./{}$"-
 PIP_INSTALL = re.compile(r'(?<![\w./-])pip3?\s+install\b')
 SETUP = 'actions/setup-python@'
 SCRIPT_TOKEN = re.compile(r'([\w./-]+)\.py\b')
+# A string literal naming a script file: a test that runs a sibling as a subprocess.
+SCRIPT_LITERAL = re.compile(r'[\w.-]+\.py')
 # The importable module each pinned pip package provides, where the names differ;
 # yamllint depends on PyYAML.
 PROVIDES = {'pyyaml': {'yaml'}, 'yamllint': {'yaml', 'yamllint'}}
@@ -64,6 +66,14 @@ def third_party(path: pathlib.Path, seen: set[pathlib.Path]) -> set[str]:
     seen.add(path)
     found = set()
     for node in ast.walk(ast.parse(path.read_text())):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and SCRIPT_LITERAL.fullmatch(node.value)
+            and (path.parent / node.value).is_file()
+        ):
+            found |= third_party(path.parent / node.value, seen)
+            continue
         if isinstance(node, ast.Import):
             names = [a.name for a in node.names]
         elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
@@ -91,7 +101,12 @@ def installed(steps: list[dict]) -> set[str]:
 
 
 def scripts_run(steps: list[dict]) -> set[pathlib.Path]:
-    run = '\n'.join(s.get('run') or '' for s in steps)
+    run = '\n'.join(
+        line
+        for s in steps
+        for line in (s.get('run') or '').splitlines()
+        if not line.lstrip().startswith('#')
+    )
     out = set()
     for stem in SCRIPT_TOKEN.findall(run):
         name = pathlib.Path(stem).name + '.py'
@@ -151,6 +166,10 @@ class TestPythonSetup(unittest.TestCase):
             'npm install',
         ):
             assert not runs_python({'run': run}), run
+
+    def test_the_detector_follows_subprocess_scripts_and_skips_comments(self):
+        self.assertEqual(scripts_run([{'run': '# see gremlins-aggregate.py\necho hi'}]), set())
+        self.assertIn('yaml', third_party(ROOT / 'scripts' / 'test-tracker-body.py', set()))
 
 
 if __name__ == '__main__':

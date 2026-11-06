@@ -377,6 +377,14 @@ jobs:
         with:
           python-version: "3.15"
 
+      # gremlins-aggregate.py reads configs/gremlins.yaml; the set-up interpreter has no PyYAML.
+      - name: Install PyYAML
+        run: |
+          set -euo pipefail
+          # renovate: datasource=pypi depName=PyYAML
+          VERSION=6.0.3
+          pip install -q "PyYAML==${VERSION}"
+
       - name: Download all per-attempt artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -458,6 +466,14 @@ jobs:
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.15"
+
+      # gremlins-aggregate.py reads configs/gremlins.yaml; the set-up interpreter has no PyYAML.
+      - name: Install PyYAML
+        run: |
+          set -euo pipefail
+          # renovate: datasource=pypi depName=PyYAML
+          VERSION=6.0.3
+          pip install -q "PyYAML==${VERSION}"
 
       - name: Download all per-attempt artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2

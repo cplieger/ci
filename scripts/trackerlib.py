@@ -108,12 +108,12 @@ def update_history_block(
     new_row: str,
     run_id: str = '',
     keep: int = ROLLING_WEEKS,
-    after_delta: str = '',
+    after_delta: tuple[str, ...] = (),
 ) -> str:
     """Roll the history table forward by one run and render the sentinel block.
 
     `new_row` carries every cell before the delta (column 2 against the previous
-    newest row); `after_delta`, when set, is one cell after it. A run contributes
+    newest row); `after_delta` holds the cells after it, in order. A run contributes
     ONE row: a re-run of the aggregate job reads the same artifacts, so its row
     replaces the one carrying its run id instead of counting twice in the mean.
     """
@@ -126,10 +126,10 @@ def update_history_block(
     # The delta is its OWN cell and the run marker sits AFTER the closing pipe:
     # both must add a trailing cell, never shift an index a reader uses
     # (cells[1] for the score, cells[4] for the gremlins live count, cells[6]
-    # for the gremlins mode).
+    # and cells[7] for the gremlins mode and mutators).
     row = new_row.rstrip() + f' {delta_str} |'
-    if after_delta:
-        row += f' {after_delta} |'
+    for cell in after_delta:
+        row += f' {cell} |'
     if run_id:
         row += f' <!-- run:{run_id} -->'
     rows.insert(0, row)
