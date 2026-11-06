@@ -1,0 +1,12 @@
+# Loki rules for the fixture app. Load this file or alerts/promql.yaml, not both.
+# The comment lines must survive the check.
+groups:
+  - name: fixture
+    rules:
+      - alert: FixtureErrorLogged
+        expr: sum by (container) (count_over_time({container="fixture"} | logfmt | level="ERROR" [10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: The fixture app logged an error.

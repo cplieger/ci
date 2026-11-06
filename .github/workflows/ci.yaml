@@ -29,6 +29,7 @@ jobs:
       run_docker: ${{ steps.detect.outputs.run_docker }}
       run_python: ${{ steps.detect.outputs.run_python }}
       run_scripts: ${{ steps.detect.outputs.run_scripts }}
+      run_alerts: ${{ steps.detect.outputs.run_alerts }}
       web_dir: ${{ steps.detect.outputs.web_dir }}
       code_changed: ${{ steps.detect.outputs.code_changed }}
       deadset_targets: ${{ steps.detect.outputs.deadset_targets }}
@@ -60,6 +61,7 @@ jobs:
           run_docker=false
           run_python=false
           run_scripts=false
+          run_alerts=false
           web_dir=""
           deadset_targets="[]"
 
@@ -308,6 +310,13 @@ jobs:
             fi
           fi
 
+          # Outside the code_changed gate, so a change to docs/monitoring.md
+          # alone still meets the alert-table check. `:(glob)` keeps `*` from
+          # crossing into a subfolder of alerts/.
+          if [ -n "$(git ls-files ':(glob)alerts/*.yaml')" ]; then
+            run_alerts=true
+          fi
+
           {
             echo "run_go=$run_go"
             echo "run_go_nested=$run_go_nested"
@@ -324,6 +333,7 @@ jobs:
             echo "run_docker=$run_docker"
             echo "run_python=$run_python"
             echo "run_scripts=$run_scripts"
+            echo "run_alerts=$run_alerts"
             echo "web_dir=$web_dir"
             echo "code_changed=$code_changed"
             echo "deadset_targets=$deadset_targets"
@@ -345,6 +355,7 @@ jobs:
             echo "| docker   | $run_docker | . |"
             echo "| python   | $run_python | . |"
             echo "| scripts  | $run_scripts | . |"
+            echo "| alerts   | $run_alerts | alerts/ |"
             echo "| deadset  | $code_changed | $deadset_targets |"
             echo "| markdown | true (always) | . |"
             echo ""
@@ -699,6 +710,42 @@ jobs:
           # scope would evict each other.
           cache-from: type=gha,scope=arm64
           cache-to: type=gha,mode=max,scope=arm64,ignore-error=true
+
+  # The rule checks and the script behind them come from this workflow's own
+  # commit, as the dashboard check does.
+  alerts:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_alerts == 'true' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Alert rules
+        continue-on-error: true
+        uses: ./.cplieger-ci/actions/alert-rules
+
+      - name: Check results
+        if: always()
+        run: |
+          if [ -f /tmp/_ci_failures ]; then
+            echo "::error::Failed validation steps:"
+            sort -u /tmp/_ci_failures >&2
+            exit 1
+          fi
+          echo "All validation steps passed"
 
   # Repo-wide checks that depend on no language surface: actionlint, zizmor
   # and a working-tree gitleaks scan, run exactly once per repo.
@@ -1369,7 +1416,7 @@ jobs:
   # per-type templates so existing branch-protection rules keep working
   # without per-repo updates).
   validate:
-    needs: [detect, repo, go, go-nested, go-work, go-os, go-os-canary, ts, web, ts-nested, shell, deadset, deadset-canary, docker, docker-arm64, markdown, python, scripts, pr-policy]
+    needs: [detect, repo, go, go-nested, go-work, go-os, go-os-canary, ts, web, ts-nested, shell, deadset, deadset-canary, docker, docker-arm64, markdown, python, scripts, alerts, pr-policy]
     if: always()
     runs-on: ubuntu-26.04
     timeout-minutes: 1
@@ -1394,6 +1441,7 @@ jobs:
           MARKDOWN: ${{ needs.markdown.result }}
           PYTHON: ${{ needs.python.result }}
           SCRIPTS: ${{ needs.scripts.result }}
+          ALERTS: ${{ needs.alerts.result }}
           PR_POLICY: ${{ needs.pr-policy.result }}
           TWO_BRANCH: ${{ github.event.repository.default_branch == 'dev' && !github.event.repository.private && !github.event.repository.fork }}
           CI_REPO: ${{ github.repository == 'cplieger/ci' }}
@@ -1408,7 +1456,7 @@ jobs:
           # them, which exposes a blind detection that skipped everything.
           ran=0
           skipped=0
-          set -- "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "go-work=$GO_WORK" "go-os=$GO_OS" "ts=$TS" "web=$WEB" "ts-nested=$TS_NESTED" "shell=$SHELL" "deadset=$DEADSET" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"
+          set -- "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "go-work=$GO_WORK" "go-os=$GO_OS" "ts=$TS" "web=$WEB" "ts-nested=$TS_NESTED" "shell=$SHELL" "deadset=$DEADSET" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS" "alerts=$ALERTS"
           # pr-policy runs on two-branch repositories only, so only there is it
           # counted and listed.
           if [ "$TWO_BRANCH" = true ]; then

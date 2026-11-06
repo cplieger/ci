@@ -128,6 +128,41 @@ jobs:
       - name: Probe the tracker bodies
         run: python3 scripts/test-tracker-body.py
 
+  # actions/alert-rules over the fixture repositories in
+  # scripts/testdata/alert-rules, with the promtool and lokitool its action.yml
+  # pins: a test expecting an alert its rule never fires, rules that do not
+  # parse and an alert table that disagrees with the rules must fail, a
+  # correct set must pass and a repository with no alerts/ folder must skip.
+  alert-rules:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      # The test and alert-table.py read YAML; the set-up interpreter has no PyYAML.
+      - name: Install PyYAML
+        run: |
+          set -euo pipefail
+          # renovate: datasource=pypi depName=PyYAML
+          VERSION=6.0.3
+          pip install -q --break-system-packages "PyYAML==${VERSION}"
+
+      - name: Probe the alert-rules check
+        run: |
+          set -euo pipefail
+          ALERT_RULES_TOOLS="$RUNNER_TEMP/alert-rules" python3 -m unittest -v scripts.test_alert_rules
+
   # The two-channel release scripts:
   # release_channels.py (tag shapes and repo tables), promote.py (the
   # promotion checks), ghcr_retention.py (the dev-version selection),

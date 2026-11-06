@@ -1,0 +1,8 @@
+groups:
+  - name: fixture
+    rules:
+      - alert: FixtureDown
+        expr: sum(up{job="fixture"} == 0
+        for: 5m
+        labels:
+          severity: critical

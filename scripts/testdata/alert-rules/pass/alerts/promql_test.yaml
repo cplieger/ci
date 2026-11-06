@@ -1,0 +1,23 @@
+rule_files:
+  - promql.yaml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: up{job="fixture", instance="a"}
+        values: 0x15
+      - series: fixture_errors_total{job="fixture", instance="a"}
+        values: 0x15
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FixtureDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: fixture
+              instance: a
+            exp_annotations:
+              summary: The fixture app is not being scraped.
+      - eval_time: 10m
+        alertname: FixtureErrorLogged
+        exp_alerts: []

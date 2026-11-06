@@ -814,6 +814,7 @@ class Workflow(unittest.TestCase):
                 ('markdown', 'success'),
                 ('python', 'skipped'),
                 ('scripts', 'skipped'),
+                ('alerts', 'skipped'),
             )
         )
         self.assertEqual(
