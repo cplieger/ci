@@ -7,7 +7,10 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import unittest
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import yaml
@@ -73,11 +76,12 @@ exit "$rc"
 GO_STUB = """#!/usr/bin/env bash
 printf '%s GOTOOLCHAIN=%s\\n' "$*" "${GOTOOLCHAIN:-}" >> "$STUB_LOG/go"
 printf '%s %s\\n' "$(basename "$PWD")" "$1" >> "$STUB_LOG/go-dir"
-if [ -n "${GO_FAIL_ONCE:-}" ] && [ ! -e "$STUB_LOG/go-failed" ]; then
+if [ -n "${GO_FAIL_ONCE:-}" ] && [[ "$*" == "$GO_FAIL_ONCE"* ]] && [ ! -e "$STUB_LOG/go-failed" ]; then
   : > "$STUB_LOG/go-failed"
   exit 1
 fi
-exit "${GO_RC:-0}"
+if [ -n "${GO_FAIL:-}" ] && [[ "$*" == "$GO_FAIL"* ]]; then exit 1; fi
+exit 0
 """
 
 NPM_STUB = """#!/usr/bin/env bash
@@ -846,6 +850,15 @@ class Analyze(Harness):
         self.assertIn('at the target root, yamlenv, only', run.out)
 
 
+def pinned_install(package: str, version: str, toolchain: str) -> list[str]:
+    """The go calls install_pinned makes, as GO_STUB logs them."""
+    return [
+        f'mod init install GOTOOLCHAIN={toolchain}',
+        f'get {package}@{version} GOTOOLCHAIN={toolchain}',
+        f'install {package} GOTOOLCHAIN={toolchain}',
+    ]
+
+
 class InstallSteps(Harness):
     def pins(self) -> dict[str, str]:
         return {m['dep']: m['ver'] for m in RENOVATE_PIN.finditer(DEADSET_CI.read_text())}
@@ -856,16 +869,14 @@ class InstallSteps(Harness):
         self.assertEqual(run.rc, 0, run.out)
         self.assertEqual(
             run.logged('go').splitlines(),
-            [
-                f'install github.com/cplieger/deadset/v2/cmd/deadset@{pins[DEPS[0]]} GOTOOLCHAIN=auto'
-            ],
+            pinned_install(f'{DEPS[0]}/cmd/deadset', pins[DEPS[0]], 'auto'),
         )
         self.assertEqual(run.logged('npm'), '')
         self.assertIn('GOTOOLCHAIN=auto', run.github_env.splitlines())
 
     def test_each_analyzer_installs_at_its_pin_only_where_deadset_names_it(self):
         pins = self.pins()
-        go_install = f'install github.com/cplieger/deadset-go/v2/cmd/deadset-go@{pins[DEPS[1]]} '
+        go_install = pinned_install(f'{DEPS[1]}/cmd/deadset-go', pins[DEPS[1]], '')
         npm_install = (
             f'install --global --ignore-scripts --no-audit --no-fund {DEPS[2]}@{pins[DEPS[2]]}'
         )
@@ -876,8 +887,12 @@ class InstallSteps(Harness):
         self.assertEqual(run.rc, 0, run.out)
         self.assertEqual(
             run.logged('go').splitlines(),
-            [f'{go_install}GOTOOLCHAIN=', 'mod download GOTOOLCHAIN='],
+            [*go_install, 'mod download GOTOOLCHAIN='],
         )
+        dirs = [line.split(' ')[0] for line in run.logged('go-dir').splitlines()]
+        self.assertRegex(dirs[0], r'^install\.\w{6}$')
+        self.assertEqual(dirs, [dirs[0]] * 3 + [self.tmp.name])
+        self.assertEqual([p.name for p in self.runner_temp.iterdir()], [dirs[0]])
         self.assertEqual(
             [line.split(' ', 1)[1] for line in run.logged('npm').splitlines()],
             [
@@ -904,21 +919,37 @@ class InstallSteps(Harness):
         env = {'GO': 'true', 'TS': 'false', 'GO_DIRS': 'alpha\nbeta', 'NPM_DIRS': ''}
         run = self.run_step(INSTALL_STEP, self.tmp, env)
         self.assertEqual(run.rc, 0, run.out)
-        self.assertEqual(run.logged('go-dir').splitlines()[1:], ['alpha mod', 'beta mod'])
+        self.assertEqual(run.logged('go-dir').splitlines()[3:], ['alpha mod', 'beta mod'])
 
     def test_a_transient_go_failure_is_retried(self):
-        for step in ('Install deadset', INSTALL_STEP):
-            with self.subTest(step=step):
-                env = {'GO': 'true', 'TS': 'false', 'NPM_DIRS': '', 'RETRY_SLEEP': '0'}
-                run = self.run_step(step, self.tmp, {**env, 'GO_FAIL_ONCE': '1'})
+        env = {'GO': 'true', 'TS': 'false', 'GO_DIRS': '.', 'NPM_DIRS': '', 'RETRY_SLEEP': '0'}
+        for step, call in (
+            ('Install deadset', 'get '),
+            (INSTALL_STEP, 'get '),
+            (INSTALL_STEP, 'mod download'),
+        ):
+            with self.subTest(step=step, call=call):
+                run = self.run_step(step, self.tmp, {**env, 'GO_FAIL_ONCE': call})
                 self.assertEqual(run.rc, 0, run.out)
                 self.assertIn('attempt 1/4 failed', run.out)
-                first = run.logged('go').splitlines()
-                self.assertEqual(first[0], first[1])
-                run = self.run_step(step, self.tmp, {**env, 'GO_RC': '1'})
+                calls = [c for c in run.logged('go').splitlines() if c.startswith(call)]
+                self.assertEqual(len(calls), 2, calls)
+                self.assertEqual(calls[0], calls[1])
+                run = self.run_step(step, self.tmp, {**env, 'GO_FAIL': call})
                 self.assertNotEqual(run.rc, 0)
-                self.assertEqual(len(run.logged('go').splitlines()), 4, run.logged('go'))
+                calls = [c for c in run.logged('go').splitlines() if c.startswith(call)]
+                self.assertEqual(len(calls), 4, calls)
                 self.assertIn('failed after 4 attempts', run.out)
+
+    def test_a_failed_pinned_build_stops_the_job_without_a_retry(self):
+        env = {'GO': 'true', 'TS': 'false', 'GO_DIRS': '.', 'NPM_DIRS': '', 'RETRY_SLEEP': '0'}
+        for step in ('Install deadset', INSTALL_STEP):
+            for call, calls in (('mod init', 1), ('install ', 3)):
+                with self.subTest(step=step, call=call):
+                    run = self.run_step(step, self.tmp, {**env, 'GO_FAIL': call})
+                    self.assertNotEqual(run.rc, 0)
+                    self.assertEqual(len(run.logged('go').splitlines()), calls, run.logged('go'))
+                    self.assertNotIn('attempt', run.out)
 
     def test_a_failed_install_stops_the_job(self):
         for env in (
@@ -955,6 +986,141 @@ class InstallSteps(Harness):
         self.assertEqual(
             analyze_step(STEP)['env']['NPM_DIRS'], '${{ steps.census.outputs.npm_dirs }}'
         )
+
+    def test_both_steps_share_one_retry_and_one_install_pinned(self):
+        steps = ('Install deadset', INSTALL_STEP)
+        bodies = [analyze_step(s)['run'] for s in steps]
+        for name in ('retry', 'install_pinned'):
+            with self.subTest(function=name):
+                found = [
+                    re.search(rf'^ *{name}\(\) \{{\n.*?^ *\}}$', b, re.MULTILINE | re.DOTALL)
+                    for b in bodies
+                ]
+                self.assertTrue(all(found), name)
+                self.assertEqual(found[0].group(0), found[1].group(0))
+        for step, body in zip(steps, bodies, strict=True):
+            with self.subTest(step=step):
+                self.assertNotRegex(body, r'go install \S+@')
+
+
+NEWER = 'v2.999.0'
+PINNED_MAIN = """package main
+
+import (
+\t"fmt"
+\t"runtime/debug"
+)
+
+func main() {
+\tinfo, _ := debug.ReadBuildInfo()
+\tfmt.Println(info.Main.Path, info.Main.Version)
+}
+"""
+
+
+class StaleProxy(ThreadingHTTPServer):
+    """A GOPROXY that names NEWER as every module's latest and serves no go.mod for it.
+
+    The go command fails reading that go.mod as it fails when sum.golang.org
+    has no record of a fresh tag yet: either way NEWER's go.mod is unverifiable.
+    """
+
+    def __init__(self, root: Path, pins: dict[str, str]):
+        self.root, self.pins, self.requests = root.resolve(), pins, []
+        for module, version in pins.items():
+            base = root / module / '@v'
+            base.mkdir(parents=True)
+            gomod = f'module {module}\n\ngo 1.21\n'
+            (base / f'{version}.info').write_text(json.dumps({'Version': version}))
+            (base / f'{version}.mod').write_text(gomod)
+            with zipfile.ZipFile(base / f'{version}.zip', 'w') as z:
+                prefix = f'{module}@{version}/'
+                z.writestr(prefix + 'go.mod', gomod)
+                z.writestr(f'{prefix}cmd/{module.split("/")[-2]}/main.go', PINNED_MAIN)
+            (base / 'list').write_text(f'{version}\n{NEWER}\n')
+            (base / f'{NEWER}.info').write_text(json.dumps({'Version': NEWER}))
+            (root / module / '@latest').write_text(json.dumps({'Version': NEWER}))
+        super().__init__(('127.0.0.1', 0), StaleProxyHandler)
+
+    @property
+    def url(self) -> str:
+        return f'http://127.0.0.1:{self.server_address[1]}'
+
+
+class StaleProxyHandler(BaseHTTPRequestHandler):
+    server: StaleProxy
+
+    def do_GET(self):
+        self.server.requests.append(self.path)
+        path = (self.server.root / self.path.lstrip('/')).resolve()
+        if not path.is_relative_to(self.server.root) or not path.is_file():
+            self.send_error(404)
+            return
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+GO = shutil.which('go')
+
+
+# CI must run these, so a runner without Go fails them instead of skipping.
+@unittest.skipUnless(GO or os.environ.get('CI'), 'go is not installed')
+class PinnedInstallWhileANewerTagIsUnserved(Harness):
+    """Each install step against a proxy that lists a newer version it cannot serve."""
+
+    def setUp(self):
+        self.assertTrue(GO, 'go is not on PATH')
+        super().setUp()
+        self.pins = {
+            DEPS[0]: WORKFLOW_ENV['DEADSET_VERSION'],
+            DEPS[1]: WORKFLOW_ENV['DEADSET_GO_VERSION'],
+        }
+        self.proxy = StaleProxy(self.tmp / 'proxy', self.pins)
+        threading.Thread(target=self.proxy.serve_forever, daemon=True).start()
+        self.addCleanup(self.proxy.server_close)
+        self.addCleanup(self.proxy.shutdown)
+        self.gobin = self.tmp / 'gobin'
+        gocache = subprocess.run([GO, 'env', 'GOCACHE'], capture_output=True, text=True)
+        self.go_env = {
+            'PATH': os.pathsep.join([str(Path(GO).resolve().parent), '/usr/bin', '/bin']),
+            'GOPATH': str(self.tmp / 'gopath'),
+            'GOBIN': str(self.gobin),
+            'GOCACHE': gocache.stdout.strip() or str(self.tmp / 'gocache'),
+            'GOFLAGS': '-modcacherw',
+            'GOPROXY': self.proxy.url,
+            'GOSUMDB': 'off',
+            'GOTOOLCHAIN': 'local',
+            'GOENV': 'off',
+            'RETRY_SLEEP': '0',
+        }
+
+    def assert_installed(self, run: StepRun, module: str, command: str) -> None:
+        self.assertEqual(run.rc, 0, run.out)
+        stamped = subprocess.run([self.gobin / command], capture_output=True, text=True)
+        self.assertEqual(stamped.stdout.split(), [module, self.pins[module]])
+        newer = [p for p in self.proxy.requests if NEWER in p]
+        self.assertTrue(newer, 'the step never asked for the newer version')
+
+    def test_the_old_go_install_at_the_pin_fails_on_this_proxy(self):
+        package = f'{DEPS[1]}/cmd/deadset-go@{self.pins[DEPS[1]]}'
+        run = self.run_body(f'go install {package}\n', self.tmp, self.go_env)
+        self.assertNotEqual(run.rc, 0, run.out)
+        self.assertIn('loading deprecation', run.out)
+
+    def test_deadset_installs_at_its_pin(self):
+        run = self.run_step('Install deadset', self.tmp, self.go_env)
+        self.assert_installed(run, DEPS[0], 'deadset')
+
+    def test_deadset_go_installs_at_its_pin(self):
+        env = {**self.go_env, 'GO': 'true', 'TS': 'false', 'GO_DIRS': '', 'NPM_DIRS': ''}
+        run = self.run_step(INSTALL_STEP, self.tmp, env)
+        self.assert_installed(run, DEPS[1], 'deadset-go')
 
 
 class Pins(unittest.TestCase):

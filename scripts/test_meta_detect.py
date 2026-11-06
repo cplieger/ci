@@ -170,8 +170,13 @@ def module_tree(alpha_api: str) -> dict[str, str]:
     }
 
 
-@unittest.skipUnless(shutil.which('go'), 'go is not installed')
+# CI must run these, so a runner without Go fails them instead of skipping.
+@unittest.skipUnless(shutil.which('go') or os.environ.get('CI'), 'go is not installed')
 class GoWorkStep(Harness):
+    def setUp(self):
+        self.assertTrue(shutil.which('go'), 'go is not on PATH')
+        super().setUp()
+
     def run_go_work(self, files: dict[str, str]) -> subprocess.CompletedProcess:
         repo = git_repo(self.tmp / f'work-{len(list(self.tmp.glob("work-*")))}', files)
         step = workflow_step(META, 'Build and test every module under one go.work', 'go-work')

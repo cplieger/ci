@@ -98,7 +98,7 @@ jobs:
   # strict-mode scan of the release-channel workflows' run blocks.
   release-channel-scripts:
     runs-on: ubuntu-26.04
-    timeout-minutes: 5
+    timeout-minutes: 8
     permissions:
       contents: read
     steps:
@@ -122,7 +122,18 @@ jobs:
           VERSION=6.0.3
           pip install -q --break-system-packages "PyYAML==${VERSION}"
 
+      # The go.work and pinned-install tests run real go builds; ubuntu-26.04
+      # keeps Go only in the tool cache, off PATH.
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
       - name: Probe the release-channel scripts
+        env:
+          # setup-go exports GOTOOLCHAIN=local and lags each Go patch release.
+          GOTOOLCHAIN: auto
         run: |
           set -euo pipefail
           python3 -m unittest discover -s scripts -p 'test_*.py' -v
