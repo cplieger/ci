@@ -41,6 +41,14 @@ jobs:
         with:
           python-version: "3.15"
 
+      # The gremlins probes and gremlins-aggregate.py read YAML; the set-up interpreter has no PyYAML.
+      - name: Install PyYAML
+        run: |
+          set -euo pipefail
+          # renovate: datasource=pypi depName=PyYAML
+          VERSION=6.0.3
+          pip install -q --break-system-packages "PyYAML==${VERSION}"
+
       - name: Probe gremlins measurement scripts
         run: python3 scripts/test-gremlins-scripts.py
 
@@ -68,6 +76,14 @@ jobs:
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.15"
+
+      # test-tracker-body.py runs gremlins-aggregate.py, which reads YAML; the set-up interpreter has no PyYAML.
+      - name: Install PyYAML
+        run: |
+          set -euo pipefail
+          # renovate: datasource=pypi depName=PyYAML
+          VERSION=6.0.3
+          pip install -q --break-system-packages "PyYAML==${VERSION}"
 
       - name: Probe the tracker transport
         run: python3 scripts/test-tracker-issue.py

@@ -4,14 +4,15 @@ Auto-updated weekly by [`cplieger/ci/.github/workflows/weekly-gremlins.yaml`](ht
 Last update: 2026-09-14 22:30
 
 **This week**: 90.2% efficacy (±0.9% across 3 runs), 88.9% mutant coverage. 15 confirmed live mutants.
-**Trend**: ↗ +9.1% from 12-week mean (81.1%).
+
+> 🔀 **Mutators switched from default to all.** gremlins ran other mutant types, so efficacy and mutant counts shift this week. The trend and the `mutation-regression` label compare only weeks run with the same mutators.
 > ⚠️ **Verdicts disagree across attempts.** 3 mutants came back LIVED in some of the 3 runs and KILLED in others, so one verdict per disagreement is false and the mean is partly noise. Either a flaky test, or cross-worker interference in the runner — gremlins workers share one `/tmp`, so a test bound to a fixed absolute path can delete a marker another worker is polling for (the weekly runner probes for that and drops to `--workers 1` when it reproduces). Equivalent mutants cannot all be killed, so a 100% attempt next to a survivor in another attempt is a measurement failure, not a perfect score.
 
 ## Rolling 12-week history
 <!-- gremlins-data -->
-| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy | Mode |
-|---|---|---|---|---|---|---|
-| 2026-09-14 22:30 | 90.2% | ±0.9% | 88.9% | 15 | +1.2% | per-package | <!-- run:34900000001 -->
+| Run (UTC) | Mean efficacy | Stddev | Mutant coverage | Live mutants | Δ efficacy | Mode | Mutators |
+|---|---|---|---|---|---|---|---|
+| 2026-09-14 22:30 | 90.2% | ±0.9% | 88.9% | 15 | +1.2% | per-package | all (switched from default; score shift expected) | <!-- run:34900000001 -->
 | 2026-09-07 08:51 | 89.0% | ±0.0% | 88.9% | 15 | -0.4% | <!-- run:34067440955 -->
 | 2026-08-31 07:56 | 89.4% | ±0.0% | 90.4% | 12 | -0.1% | <!-- run:33344173658 -->
 | 2026-08-24 05:00 | 89.5% | ±0.0% | 90.5% | 12 | +10.8% | <!-- run:32670569584 -->
@@ -83,6 +84,10 @@ Last update: 2026-09-14 22:30
   packages, and is chosen each run when its measured cost fits a quarter of the
   job's time cap. A row marked as switched starts a new baseline, so its score
   jump is expected.
+- **Mutators**: the gremlins mutator types the week ran: `all` eleven,
+  gremlins' `default` five, or the enabled types joined by `+`. Rows from
+  before this column ran `default`. A row marked as switched starts a new
+  baseline, so its score shift is expected.
 
 The "Current live mutants" section is bucketed by **how many of the N runs the
 mutant LIVED in** (N = attempts that week, normally 3):
@@ -98,7 +103,8 @@ mutant LIVED in** (N = attempts that week, normally 3):
   test or strengthen an existing assertion.
 
 The `mutation-regression` label is added when this week's mean efficacy drops
->5% below the rolling 12-week mean of the weeks run in the same mode.
+>5% below the rolling 12-week mean of the weeks run in the same mode with the
+same mutators.
 
 A ⚠️ line under "This week" means the number describes the measurement, not the
 suite: either the attempts disagreed about which mutants survive (one verdict per

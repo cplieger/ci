@@ -142,6 +142,7 @@ EXCLUDE_PATTERNS=(
   '(^|/)testsupport/'
   '(^|/)testcerts/'
   '(^|/)authtest/'
+  '(^|/)accesstest/'
 
   # TS test code
   '\.test\.ts$'
