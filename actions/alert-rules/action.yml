@@ -1,9 +1,11 @@
 name: alert-rules
 description: >-
-  Fail when a repository's alert rules do not check: promtool check rules on
-  alerts/promql.yaml and promtool test rules on alerts/promql_test.yaml, a
-  LogQL parse of a copy of alerts/logql.yaml, and an alert table in
-  docs/monitoring.md that names exactly the alerts the rule files define.
+  Fail when a repository's alert rules do not check: promtool check rules
+  when alerts/promql.yaml exists, promtool test rules when
+  alerts/promql_test.yaml exists, a LogQL parse of a copy of
+  alerts/logql.yaml when that file exists, and, when docs/monitoring.md
+  exists, a check that its alert table names exactly the alerts the rule
+  files define.
 
 runs:
   using: composite
