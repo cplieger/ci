@@ -248,9 +248,10 @@ chk "L-W3 a folder with neither package.json nor jsr.json is no frontend" \
 
 # ── go-os runner detection states ────────────────────────────────────────────
 # Expected rows follow Go's build constraints (go help buildconstraint): a file
-# name ending _GOOS, _GOOS_GOARCH with a known GOARCH, or either plus _test, or
-# a //go:build line above the package clause naming the OS outside an odd
-# number of negations. mod_dirs is MIRRORED from
+# name whose part before the first dot ends _GOOS, _GOOS_GOARCH with a known
+# GOARCH, or either plus _test, or a //go:build line above the package clause
+# naming the OS outside an odd number of negations; Go ignores a name starting
+# with _ or . below the module folder (go help packages). mod_dirs is MIRRORED from
 # ci.yaml's detect (nested validation discovery plus the root go.mod).
 # The block runs in a fresh bash with the runner's options (bash -eo pipefail),
 # because a command substitution here would run it with errexit off.
@@ -309,9 +310,29 @@ put str.go "package main" "" 'const s = "//go:build windows"'
 put raw.go "package main" "" 'const r = `' "//go:build windows" '`'
 put x_windows_helper.go "package main"
 put x_darwin_cgo_test.go "package main"
+put b.c_windows.go "package main"
+put _x_windows.go "package main"
+put .y_darwin.go "package main"
+put _h.go "//go:build windows" "" "package main"
+put _gen/g_windows.go "package gen"
+put sub/_z_windows.go "package sub"
+put p/.cache/c.go "//go:build darwin" "" "package cache"
 commit_all
 os_rows
 chk "L-O2 no OS-named file or header constraint: no OS leg" "$rows" ""
+
+mkrepo goos-cut
+put go.mod "module github.com/cplieger/cut" "go 1.26.5"
+put main.go "package main"
+put x_windows.pb.go "package main"
+put static/s_darwin.go "package static"
+put dist/d.go "//go:build windows" "" "package dist"
+put _tools/go.mod "module github.com/cplieger/cut/tools" "go 1.26.5"
+put _tools/t_darwin.go "package tools"
+commit_all
+os_rows
+chk "L-O6 Go's name cut at the first dot, static and dist trees, and a module in a _ folder" \
+  "$rows" ".=macos-latest .=windows-latest _tools=macos-latest"
 
 mkrepo goos-negated
 put go.mod "module github.com/cplieger/negated" "go 1.26.5"

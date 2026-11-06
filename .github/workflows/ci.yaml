@@ -166,22 +166,21 @@ jobs:
 
             # A module tracking a Go file built for windows or darwin is also tested
             # on that OS's runner, because the Linux go-ci leg may compile none of it.
-            # A file name counts when it ends _GOOS or _GOOS_GOARCH with a known
-            # GOARCH (go/build's knownArch), before an optional _test. A //go:build
-            # line counts only in the header above the package clause, where it
-            # names the OS as a non-negated term.
-            # A file belongs to the deepest module folder above it, so a nested
-            # module's file never puts the root module on a runner.
-            # scripts/test-lane-semantics.sh runs this block, from this line to the
-            # matrix dedup.
+            # The rules are go/build's: the name before its first dot ends _GOOS or
+            # _GOOS_GOARCH with a known GOARCH, then an optional _test; or a //go:build
+            # line above the package clause names the OS as a non-negated term. A file
+            # belongs to the deepest module folder above it, and Go skips it when a
+            # name below that folder starts with _ or .
+            # scripts/test-lane-semantics.sh runs this block, to the matrix dedup.
             go_os_files() {
-              local f e os
-              local prune='(^|/)(node_modules|vendor|testdata|static|dist)/'
+              local f b e os
+              local prune='(^|/)(node_modules|vendor|testdata)/'
               local arch='386|amd64|amd64p32|arm|armbe|arm64|arm64be|loong64|mips|mipsle|mips64|mips64le'
               arch+='|mips64p32|mips64p32le|ppc|ppc64|ppc64le|riscv|riscv64|s390|s390x|sparc|sparc64|wasm'
-              local suffix="_(windows|darwin)(_($arch))?(_test)?\\.go\$"
+              local suffix="_(windows|darwin)(_($arch))?(_test)?\$"
               while IFS= read -r f; do
-                if [[ $f =~ $suffix ]]; then
+                b=${f##*/}
+                if [[ ${b%%.*} =~ $suffix ]]; then
                   printf '%s\t%s\n' "${BASH_REMATCH[1]}" "$f"
                 fi
               done < <(git ls-files '*.go' | grep -Ev "$prune" || true)
@@ -236,6 +235,11 @@ jobs:
                 d=$(dirname "$d")
               done
               grep -qxF -- "$d" <<< "$mod_dirs" || continue
+              rel=$f
+              [ "$d" = . ] || rel=${f#"$d"/}
+              if [[ /$rel =~ /[_.] ]]; then
+                continue
+              fi
               go_os_matrix=$(jq -c --arg d "$d" --arg r "$runner" '. + [{dir: $d, runner: $r}]' <<< "$go_os_matrix")
             done < <(go_os_files)
             go_os_matrix=$(jq -c 'unique_by([.dir, .runner])' <<< "$go_os_matrix")
