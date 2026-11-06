@@ -84,6 +84,8 @@ if args[0] == 'api':
         entry = {'body': ''}
     if entry is None or entry.get('exit'):
         stderr = (entry or {}).get('stderr', 'gh: Not Found (HTTP 404)')
+        # What a --paginate read printed of its earlier pages before failing.
+        sys.stdout.write((entry or {}).get('stdout', ''))
         if include:
             status = stderr.rsplit('HTTP ', 1)[-1].rstrip(')') if 'HTTP ' in stderr else '404'
             sys.stdout.write(f'HTTP/2.0 {status} Error\n\r\n' + json.dumps({'message': stderr}))
@@ -143,6 +145,12 @@ if '-d' not in args:
     now = json.load(open(os.environ['STUB_FIXTURE']))['now']
     args = ['-d', f'@{now}', *args]
 os.execv(real, [real, *args])
+"""
+
+SLEEP_STUB = r"""#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['STUB_LOG'], 'a') as log:
+    log.write(json.dumps(['sleep', *sys.argv[1:]]) + '\n')
 """
 
 NOW = 1791086400  # 2026-10-04T04:00:00Z
@@ -265,7 +273,12 @@ class Harness:
         test.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.bin = self.tmp / 'bin'
         self.bin.mkdir()
-        for name, body in (('gh', GH_STUB), ('curl', CURL_STUB), ('date', DATE_STUB)):
+        for name, body in (
+            ('gh', GH_STUB),
+            ('curl', CURL_STUB),
+            ('date', DATE_STUB),
+            ('sleep', SLEEP_STUB),
+        ):
             path = self.bin / name
             path.write_text(body)
             path.chmod(0o755)
@@ -542,6 +555,74 @@ class TwoBranchFanout(unittest.TestCase):
                     "1 image(s) could not be read; each fails its repository's dispatch job.",
                     summary,
                 )
+
+    def test_a_read_github_failed_to_answer_is_tried_again(self):
+        key = 'GET repos/cplieger/tb/contents/Dockerfile?ref=main'
+        html = "invalid character '<' looking for beginning of value"
+        for label, failures in (
+            ('an html error page', [{'exit': 1, 'stderr': html}]),
+            ('two server errors', [{'exit': 1, 'stderr': 'gh: Server Error (HTTP 502)'}] * 2),
+        ):
+            with self.subTest(label):
+                fx = two_branch_fixture()
+                fx['api'][key] = [*failures, fx['api'][key]]
+                h, res = self.fanout(fx)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                main = next(r for r in h.rows() if r['base'] == 'main')
+                self.assertNotIn('unreadable', main)
+                self.assertEqual(main['age_days'], '10')
+                reads = [c for c in h.calls() if c[:3] == ['gh', 'api', key.split(' ', 1)[1]]]
+                self.assertEqual(len(reads), len(failures) + 1)
+                self.assertEqual(
+                    [c for c in h.calls() if c[0] == 'sleep'],
+                    [['sleep', '2'], ['sleep', '4']][: len(failures)],
+                )
+
+    def test_a_read_failing_four_times_is_an_unreadable_row(self):
+        key = 'GET repos/cplieger/tb/contents/Dockerfile?ref=main'
+        fx = two_branch_fixture()
+        fx['api'][key] = {'exit': 1, 'stderr': 'gh: Server Error (HTTP 503)'}
+        h, res = self.fanout(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        main = next(r for r in h.rows() if r['base'] == 'main')
+        self.assertEqual(
+            main['unreadable'],
+            'the Dockerfile on main could not be read: gh: Server Error (HTTP 503)',
+        )
+        reads = [c for c in h.calls() if c[:3] == ['gh', 'api', key.split(' ', 1)[1]]]
+        self.assertEqual(len(reads), 4)
+        self.assertEqual(
+            [c for c in h.calls() if c[0] == 'sleep'],
+            [['sleep', '2'], ['sleep', '4'], ['sleep', '8']],
+        )
+
+    def test_a_4xx_answer_is_not_tried_again(self):
+        key = 'GET repos/cplieger/tb/contents/Dockerfile?ref=main'
+        fx = two_branch_fixture()
+        fx['api'][key] = {'exit': 1, 'stderr': 'gh: Resource not accessible (HTTP 403)'}
+        h, res = self.fanout(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        main = next(r for r in h.rows() if r['base'] == 'main')
+        self.assertEqual(
+            main['unreadable'],
+            'the Dockerfile on main could not be read: gh: Resource not accessible (HTTP 403)',
+        )
+        reads = [c for c in h.calls() if c[:3] == ['gh', 'api', key.split(' ', 1)[1]]]
+        self.assertEqual(len(reads), 1)
+        self.assertFalse([c for c in h.calls() if c[0] == 'sleep'])
+
+    def test_a_listing_retried_after_a_partial_page_is_read_once(self):
+        key = 'GET user/repos?per_page=100&affiliation=owner'
+        fx = two_branch_fixture()
+        partial = json.dumps(repo('tb', 'dev')) + '\n'
+        fx['api'][key] = [
+            {'exit': 1, 'stdout': partial, 'stderr': 'gh: Server Error (HTTP 502)'},
+            fx['api'][key],
+        ]
+        h, res = self.fanout(fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual([leg['repo'] for leg in h.matrix()], ['tb'])
+        self.assertEqual([r['base'] for r in h.rows()], ['main'])
 
     def test_a_distroless_base_is_not_a_candidate(self):
         fx = two_branch_fixture()
