@@ -1003,7 +1003,7 @@ class InstallSteps(Harness):
                 self.assertNotRegex(body, r'go install \S+@')
 
 
-NEWER = 'v99.0.0'
+NEWER = 'v2.999.0'
 PINNED_MAIN = """package main
 
 import (
@@ -1026,7 +1026,7 @@ class StaleProxy(ThreadingHTTPServer):
     """
 
     def __init__(self, root: Path, pins: dict[str, str]):
-        self.root, self.pins, self.requests = root, pins, []
+        self.root, self.pins, self.requests = root.resolve(), pins, []
         for module, version in pins.items():
             base = root / module / '@v'
             base.mkdir(parents=True)
