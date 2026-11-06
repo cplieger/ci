@@ -734,7 +734,6 @@ jobs:
           persist-credentials: false
 
       - name: Alert rules
-        continue-on-error: true
         uses: ./.cplieger-ci/actions/alert-rules
 
       - name: Check results

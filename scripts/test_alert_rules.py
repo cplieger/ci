@@ -109,7 +109,7 @@ class Wiring(unittest.TestCase):
         check = next(
             s for s in job['steps'] if s.get('uses') == './.cplieger-ci/actions/alert-rules'
         )
-        self.assertIs(check['continue-on-error'], expr2=True)
+        self.assertNotIn('continue-on-error', check)
         self.assertEqual(job['steps'][-1]['name'], 'Check results')
         self.assertIn('/tmp/_ci_failures', job['steps'][-1]['run'])
 

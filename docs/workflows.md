@@ -22,7 +22,7 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | a `Dockerfile` | `docker`, `docker-arm64` | an image build on `amd64`, and on `arm64` in public repositories, with no push and no scan |
 | `*.py` files | `python` | Ruff |
 | shell scripts or workflow files, and no `go.mod`, `jsr.json` or `Dockerfile` | `scripts` | shellcheck, shfmt, `tests/shell/run.sh` when the repository has one, yamllint, a TOML check, and the probe scripts present in the repository |
-| an `alerts/*.yaml` file | `alerts` | `promtool check rules` on `alerts/promql.yaml`, `promtool test rules` on `alerts/promql_test.yaml`, a LogQL parse of a copy of `alerts/logql.yaml`, and, when `docs/monitoring.md` exists, a check that its alert table names exactly the alerts the rule files define |
+| an `alerts/*.yaml` file | `alerts` | `promtool check rules` when `alerts/promql.yaml` exists, `promtool test rules` when `alerts/promql_test.yaml` exists, a LogQL parse of a copy of `alerts/logql.yaml` when that file exists, and, when `docs/monitoring.md` exists, a check that its alert table names exactly the alerts the rule files define |
 | a pull request, in a repository whose default branch is `dev` | `pr-policy` | a conventional-commit check of the title, and on a pull request into `main` a check of what its head branch may change |
 
 The `shell` and `scripts` jobs never both run, so no shell script is checked twice.
