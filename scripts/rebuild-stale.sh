@@ -36,6 +36,24 @@ ghcr_get() { # <url> <accept> <out> [bearer token] -> the HTTP status; fails whe
     "${auth[@]}" -H "Accept: $2" -o "$3" -w '%{http_code}' "$1"
 }
 
+# A read GitHub failed to answer (a 5xx, a dropped transfer, or a body that is not
+# the JSON asked for, as an HTML error page is) says nothing about its target, so it
+# is tried again after 2, 4 and 8 s, as ghrest.py's Client is; a 4xx is GitHub's
+# answer and returns at once. Output is held back until an attempt succeeds, because
+# a --paginate read that fails mid-listing has already printed its first pages.
+gh_read() { # <gh api arguments> -> the answer; the last attempt's stderr on failure
+  local attempt=1 delay=2 out=$WORK/read.out err=$WORK/read.err
+  until gh api "$@" >"$out" 2>"$err"; do
+    if [ "$attempt" -ge 4 ] || grep -qE 'HTTP 4[0-9]{2}\b' "$err"; then
+      cat "$err" >&2
+      return 1
+    fi
+    sleep "$delay"
+    attempt=$((attempt + 1)) delay=$((delay * 2))
+  done
+  cat "$out"
+}
+
 image_created() { # <repo> <tag>
   local repo="cplieger/$1" tag=$2 token status digest created
   status=$(ghcr_get "https://ghcr.io/token?scope=repository:${repo}:pull" application/json "$WORK/token.json") \
@@ -80,7 +98,7 @@ rebuild_requested() { # <repo> <base> <since> -> the committer time of the newes
   local pages list sha date ts since_ts files
   since_ts=$(date -u -d "$3" +%s) || return 1
   # --paginate prints one JSON array per page, which jq reads as a stream.
-  pages=$(gh api --paginate "repos/cplieger/${1}/commits?sha=${2}&since=${3}&per_page=100") || return 1
+  pages=$(gh_read --paginate "repos/cplieger/${1}/commits?sha=${2}&since=${3}&per_page=100") || return 1
   # shellcheck disable=SC2016 # jq program, not shell
   list=$(jq -r --arg s "$REBUILD_SUBJECT" '.[] | (.commit.message | split("\n")[0]) as $m
     | select($m == $s or ($m | startswith($s + " (#") and endswith(")")))
@@ -89,7 +107,7 @@ rebuild_requested() { # <repo> <base> <since> -> the committer time of the newes
     [ -n "$sha" ] || continue
     ts=$(date -u -d "$date" +%s) || return 1
     [ "$ts" -ge "$since_ts" ] || continue
-    files=$(gh api "repos/cplieger/${1}/commits/${sha}" --jq '.files | length') || return 1
+    files=$(gh_read "repos/cplieger/${1}/commits/${sha}" --jq '.files | length') || return 1
     if [ "$files" = 0 ]; then
       echo "$date"
       return 0
@@ -120,7 +138,7 @@ open_pr() { # <repo> <base> <reason> [since]
   # Renovate, which runs as the same App.
   open_rebuild() { # [branch] -> the newest open rebuild pull request's URL, that branch's when given
     local found
-    found=$(gh api --paginate "repos/cplieger/${repo}/pulls?state=open&base=${base}&sort=created&direction=desc&per_page=100" \
+    found=$(gh_read --paginate "repos/cplieger/${repo}/pulls?state=open&base=${base}&sort=created&direction=desc&per_page=100" \
       --jq ".[] | select(.head.repo.full_name == \"cplieger/${repo}\" and (.head.ref | startswith(\"rebuild/${base}-\"))
         and (\"${1:-}\" == \"\" or .head.ref == \"${1:-}\")) | .html_url") || return 1
     echo "${found%%$'\n'*}"
@@ -155,8 +173,8 @@ open_pr() { # <repo> <base> <reason> [since]
       return 0
     fi
   fi
-  head=$(gh api "repos/cplieger/${repo}/git/ref/heads/${base}" --jq .object.sha)
-  tree=$(gh api "repos/cplieger/${repo}/git/commits/${head}" --jq .tree.sha)
+  head=$(gh_read "repos/cplieger/${repo}/git/ref/heads/${base}" --jq .object.sha)
+  tree=$(gh_read "repos/cplieger/${repo}/git/commits/${head}" --jq .tree.sha)
   # An empty commit: the base's own tree with the base's head as its only parent. Its
   # subject is what makes it a significant push (path-significance.sh REBUILD_SUBJECT),
   # and PKG_REFRESH makes the build re-run its package layer.
@@ -172,12 +190,12 @@ open_pr() { # <repo> <base> <reason> [since]
   }
   create_branch() { gh api -X POST "repos/cplieger/${repo}/git/refs" -f ref="refs/heads/${branch}" -f sha="$commit" >/dev/null 2>"$WORK/ref.err"; }
   branch_state() { # -> 0 when the branch reads as present, 3 on a 404, 1 on any other answer (printed)
-    gh api "repos/cplieger/${repo}/git/ref/heads/${branch}" >/dev/null 2>"$WORK/branch.err" && return 0
+    gh_read "repos/cplieger/${repo}/git/ref/heads/${branch}" >/dev/null 2>"$WORK/branch.err" && return 0
     grep -q 'HTTP 404' "$WORK/branch.err" && return 3
     cat "$WORK/branch.err"
     return 1
   }
-  if gh api "repos/cplieger/${repo}/git/ref/heads/${branch}" >/dev/null 2>&1; then
+  if gh_read "repos/cplieger/${repo}/git/ref/heads/${branch}" >/dev/null 2>&1; then
     move_branch "already exists without an open pull request"
   elif ! create_branch; then
     cat "$WORK/ref.err"
@@ -283,7 +301,7 @@ fanout() {
 
   # A fork publishes no cplieger image. REST rather than `gh repo list`: the
   # GraphQL quota is shared with every other token of the account owner.
-  listing=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
+  listing=$(gh_read --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
   .[] | select(.archived == false and .fork == false)
       | {name, default_branch, visibility, fork, archived} | @json
 ')
@@ -318,7 +336,7 @@ fanout() {
       tag=dev
       [ "$base" = main ] && tag=latest
       # Only a 404 means the base has no Dockerfile; any other failed read is a row.
-      if ! content=$(gh api "repos/cplieger/${r}/contents/Dockerfile?ref=${base}" --jq '.content' 2>"$WORK/contents.err"); then
+      if ! content=$(gh_read "repos/cplieger/${r}/contents/Dockerfile?ref=${base}" --jq '.content' 2>"$WORK/contents.err"); then
         grep -q 'HTTP 404' "$WORK/contents.err" && continue
         unreadable_channel "$base" "$tag" "the Dockerfile on ${base} could not be read: $(head -n 1 "$WORK/contents.err")"
         continue
