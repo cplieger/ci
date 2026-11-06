@@ -30,3 +30,37 @@ tag_ref_once() { # <owner/repo> <tag> <commit>
   gh api "repos/$1/git/refs" -f ref="refs/tags/$2" -f sha="$3" >/dev/null || return 1
   TAG_CREATED=true
 }
+
+# branch_moved_past <owner/repo> <branch> <commit>: prints the branch's head and
+# returns 0 when it is not <commit>, 1 when it is; prints nothing and returns 2
+# when the head cannot be read.
+branch_moved_past() {
+  local head
+  head=$(gh api "repos/$1/git/ref/heads/$2" --jq .object.sha 2>/dev/null) || return 2
+  [ -n "$head" ] || return 2
+  printf '%s' "$head"
+  [ "$head" != "$3" ]
+}
+
+# tag_ref_or_handoff <owner/repo> <branch> <tag> <commit>: tag_ref for a dev run.
+# Once a push that edits workflow files lands past <commit>, GitHub refuses the
+# integration token's ref create (ui#42, deadset#281, toolbelt#506), and runs
+# queue per ref, so the run on the new head releases this range. Returns 0 when
+# the tag is at <commit>, 2 when the create failed after <branch> moved on (a
+# handoff, warned), 1 otherwise: the tag sits elsewhere, or the create failed
+# while <commit> is still the head or the head cannot be read.
+tag_ref_or_handoff() {
+  local rc=0 head mrc=0
+  tag_ref "$1" "$3" "$4" || rc=$?
+  [ "$rc" -eq 2 ] || return "$rc"
+  head=$(branch_moved_past "$1" "$2" "$4") || mrc=$?
+  case "$mrc" in
+    0)
+      echo "::warning::tag $3 not created: $2 advanced past $4 (now ${head}), and a superseded run loses ref-create; the run on the new head releases this range."
+      return 2
+      ;;
+    1) echo "::error::tag create for $3 failed while this run is still $2's head; not a superseded run, so check the token's permissions and the API." ;;
+    *) echo "::error::tag create for $3 failed and $2's head is unreadable, so a handoff cannot be confirmed." ;;
+  esac
+  return 1
+}

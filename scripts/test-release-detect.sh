@@ -160,6 +160,9 @@ facts["lh-strategy"] = lh.get("strategy")
 facts["lh-steps"] = [s.get("name") for s in lh["steps"]]
 lhp = next((s for s in lh["steps"] if s.get("name") == "Publish the lane's TS half"), {"run": "exit 99"})
 open(f"{out}/half-publish.sh", "w").write(lhp["run"])
+lht = next((s for s in lh["steps"] if s.get("name") == "Find the lane's tag"), {"run": "exit 99"})
+open(f"{out}/half-tag.sh", "w").write(lht["run"])
+facts["lh-publish-if"] = str(lhp.get("if", ""))
 facts["lh-env"] = lhp.get("env", {})
 facts["lh-wd"] = lhp.get("working-directory", "")
 facts["renumber-steps"] = [s.get("name") for s in jobs["renumber"]["steps"]]
@@ -1410,6 +1413,31 @@ chk "R8 the lane tag at HEAD is receipted once its Release exists" "$(vp_receipt
 chk "R8 under its own context" "$(grep -c "statuses/$R2 -f state=success -f context=release/complete/yamlenv/v1.1.0 " "$GH_LOG")" "1"
 chk "R9 a root publish without a Release fails the step" "$(vp_receipts success)" "EXIT=1"
 chk "R9 and posts no root receipt" "$(grep -c 'context=release/complete/v1.1.0 ' "$GH_LOG" || true)" "0"
+# A root that handed its tag off left none: its receipt belongs to the run on
+# the new head, and only a moved branch makes a missing tag a handoff.
+RCPT_GH="$WORK/rcpt-gh"
+mkdir -p "$RCPT_GH"
+cat >"$RCPT_GH/gh" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"/git/ref/heads/main"*) [ -n "$RCPT_HEAD" ] || exit 1; printf '%s\n' "$RCPT_HEAD"; exit 0 ;;
+esac
+printf '%s\n' "$*" >>"$GH_LOG"
+exit 0
+SH
+chmod 755 "$RCPT_GH/gh"
+vp_handoff() { # <branch head> -> exit status|root receipts for v9.9.9, an untagged version
+  : >"$GH_LOG"
+  (cd "$O" && PATH="$RCPT_GH:$PATH" RCPT_HEAD="$1" CI_TOOLS="$ROOT/scripts" VERSION=v9.9.9 GO_LANES_JSON='[]' GO_RESULT=success \
+    TS_RESULT=skipped DOCKER_RESULT=skipped SUBPACKAGE_RESULT=skipped GO_NESTED_RESULT=skipped GITHUB_REPOSITORY=o/r \
+    GITHUB_REF_NAME=main GITHUB_SHA="$(git -C "$O" rev-parse HEAD)" bash "$WORK/receipt-step.sh") >"$WORK/vp.log" 2>&1 \
+    && echo "0|$(grep -c 'release/complete/v9.9.9' "$GH_LOG" || true)" || echo "$?|$(grep -c 'release/complete/v9.9.9' "$GH_LOG" || true)"
+}
+chk "R9 a root handed off to a newer head records no receipt and passes" \
+  "$(vp_handoff dddddddddddddddddddddddddddddddddddddddd)" "0|0"
+chk_has "R9 and says whose receipt it is" "$(cat "$WORK/vp.log")" "::warning::v9.9.9 was handed off to main's new head"
+chk "R9 a root with no tag and its branch still here fails" "$(vp_handoff "$(git -C "$O" rev-parse HEAD)")" "1|0"
+chk "R9 as does one whose branch head is unreadable" "$(vp_handoff "")" "1|0"
 # An image whose version subpackages share is receipted here, once they published.
 git -C "$O" tag v9.0.0 HEAD
 touch "$GH_DIR/release-v9.0.0"
@@ -1639,16 +1667,40 @@ git -C "$L" tag alpha/v1.1.0 "$LS"
 chk "H3 a stable lane tagged at HEAD publishes nothing" "$(halves_at "$LS" stable '["alpha"]')" '[]'
 chk "H4 a lane list that is not JSON fails the run" "$(halves_at "$LS" stable 'alpha')" "EXIT=1"
 chk "H4 as does a channel that is neither" "$(halves_at "$LS" '' '["alpha"]')" "EXIT=1"
-hpub() { # <commit> <channel> -> the version published|the npm and npx publish calls, or EXIT=n
-  local c reg
+# The branch head the lane-tag lookup reads; GH_HEAD unset is the clone's HEAD.
+HGH="$WORK/hgh"
+mkdir -p "$HGH"
+cat >"$HGH/gh" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"/git/ref/heads/"*) printf '%s\n' "$GH_HEAD"; exit 0 ;;
+esac
+echo "gh stub: unexpected $*" >&2
+exit 64
+SH
+chmod 755 "$HGH/gh"
+hpub() { # <commit> <channel> -> the version published|the npm and npx publish calls, HANDOFF, or EXIT=n
+  local c reg head tag
   c=$(lane_clone "$1")
   reg=$(mktemp -d "$WORK/hreg.XXXXXX")
   : >"$reg/ok"
   : >"$SP_LOG"
+  : >"$WORK/hout"
   rm -f "$SP_LOG.version"
+  head=$(git -C "$c" rev-parse HEAD)
+  (cd "$c" && PATH="$HGH:$BIN2:$PATH" GITHUB_OUTPUT="$WORK/hout" GITHUB_REPOSITORY=o/r GITHUB_REF_NAME=dev GITHUB_SHA="$head" \
+    GH_HEAD="${GH_HEAD:-$head}" LANE=alpha CHANNEL="$2" CI_TOOLS="$ROOT/scripts" bash "$WORK/half-tag.sh") >"$WORK/hpub.log" 2>&1 || {
+    echo "EXIT=$?"
+    return 0
+  }
+  tag=$(sed -n 's/^tag=//p' "$WORK/hout")
+  if [ -z "$tag" ]; then
+    echo HANDOFF
+    return 0
+  fi
   (cd "$c/$(fact '."lh-wd"' | sed 's/\${{ matrix.lane }}/alpha/')" && PATH="$BIN2:$PATH" CURL_DIR="$reg" LANE=alpha CHANNEL="$2" \
-    CI_TOOLS="$ROOT/scripts" JSR_VERSION="$(fact '."lh-env".JSR_VERSION')" bash "$WORK/half-publish.sh") \
-    >"$WORK/hpub.log" 2>&1 || {
+    VERSION="$tag" CI_TOOLS="$ROOT/scripts" JSR_VERSION="$(fact '."lh-env".JSR_VERSION')" bash "$WORK/half-publish.sh") \
+    >>"$WORK/hpub.log" 2>&1 || {
     echo "EXIT=$?"
     return 0
   }
@@ -1663,6 +1715,9 @@ git -C "$L" tag alpha/v1.0.0-dev.10 "$L4"
 chk "H5 the highest dev tag at HEAD, by version" "$(hpub "$L4" dev | cut -d'|' -f1)" "1.0.0-dev.10"
 chk "H5 a lane with no tag of the channel at HEAD is refused" "$(hpub "$L3" dev)" "EXIT=1"
 chk_has "H5 naming the lane" "$(cat "$WORK/hpub.log")" "::error::lane alpha has no dev tag at"
+chk "H5 a lane with no tag after its branch moved hands its half off" \
+  "$(GH_HEAD=dddddddddddddddddddddddddddddddddddddddd hpub "$L3" dev)" "HANDOFF"
+chk "H5 the publish runs only with the lane's tag" "$(fact '."lh-publish-if"')" "\${{ steps.lanetag.outputs.tag != '' }}"
 kpub() { # <channel> <version> <private: true|false> -> the publish calls|registry reads|versions recorded, or EXIT=n
   local d reg
   d=$(mktemp -d "$WORK/kpub.XXXXXX")
@@ -1702,7 +1757,7 @@ chk "H7 with OIDC and no write scope, since it runs the package's scripts" "$(fa
   '{"contents":"read","id-token":"write"}'
 chk "H7 through the shared script, in the half's directory" \
   "$(fact '."lh-steps" | join(",")')|$(grep -c 'publish-subpackage.sh' "$WORK/half-publish.sh")|$(fact '."lh-wd"')" \
-  "Checkout,Setup Node.js,Check out the ci source,Publish the lane's TS half|1|\${{ matrix.lane }}/web"
+  "Checkout,Setup Node.js,Check out the ci source,Find the lane's tag,Publish the lane's TS half|1|\${{ matrix.lane }}/web"
 git -C "$L" checkout -q main
 LG=$(commit_in "$L" "fix(alpha): go only, stable" alpha/a.go=v4)
 git -C "$L" tag alpha/v1.1.1 "$LG"
@@ -3178,7 +3233,7 @@ chk "W16 after the Release and before the readback, which reads them too" \
 chk "W16 with OIDC for npm and JSR" "$(fact '."perms:repair-publish" | tojson')" '{"contents":"read","id-token":"write"}'
 chk "W16 the subpackage job publishes through the shared script" \
   "$(fact '."subpkg-steps" | join(",")')|$(grep -c 'publish-subpackage.sh' "$WORK/subpkg-new.sh")" \
-  "Checkout,Setup Node.js,Check out the ci source,Publish subpackage to npm + JSR|1"
+  "Checkout,Setup Node.js,Check out the ci source,Hand off with the root tag,Publish subpackage to npm + JSR|1"
 chk "W16 every jsr CLI pin is one Renovate-tracked version" "$(fact '."jsr-pins" | join(",")')|$(fact '."jsr-pin-sites"')" "0.14.3|4"
 chk "W17 docker-release leaves the receipt to release.yaml when subpackages share the version" \
   "$(fact '."docker-with"."defer-receipt"')|$(fact '."dr-defer".default')" "\${{ needs.detect.outputs.subpackages_to_publish != '[]' }}|false"
@@ -3405,7 +3460,7 @@ publish_site() { # <site> <read status> -> rc|the gh calls joined by ';'
   echo notes >"$d/NOTES.md"
   : >"$d/log"
   (cd "$d" && PATH="$RBIN:$PATH" REL_LOG="$d/log" REL_READ="$2" GH_TOKEN=t GITHUB_REPOSITORY=o/app \
-    GITHUB_SHA=c0ffee VERSION="$rtag" CHANNEL=stable CI_TOOLS="$ROOT/scripts" bash -e "$body") >"$WORK/ps.log" 2>&1 || rc=$?
+    GITHUB_REF_NAME=main GITHUB_SHA=c0ffee VERSION="$rtag" CHANNEL=stable CI_TOOLS="$ROOT/scripts" bash -e "$body") >"$WORK/ps.log" 2>&1 || rc=$?
   echo "$rc|$(paste -sd ';' "$d/log")"
 }
 chk "W26 no workflow reads a Release through gh release view, which bills GraphQL" "$(fact '."release-view-sites"')" "0 0"

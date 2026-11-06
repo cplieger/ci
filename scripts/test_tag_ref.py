@@ -28,6 +28,10 @@ if args[:1] == ['api'] and args[1].startswith('repos/o/app/git/ref/tags/'):
     if tag in state['tags']:
         done(0, state['tags'][tag] + '\n')
     done(1, err='gh: Not Found (HTTP 404)\n')
+if args[:1] == ['api'] and args[1] == 'repos/o/app/git/ref/heads/dev':
+    if state.get('head'):
+        done(0, state['head'] + '\n')
+    done(1, err='gh: Bad credentials (HTTP 401)\n')
 if args[:2] == ['api', 'repos/o/app/git/refs']:
     fields = dict(a.split('=', 1) for a in args[2:] if '=' in a)
     tag, sha = fields['ref'].removeprefix('refs/tags/'), fields['sha']
@@ -46,19 +50,21 @@ COMMIT = 'c' * 40
 
 
 class TagRef(unittest.TestCase):
-    def run_tag_ref(self, tags=None, creates=()):
+    def run_tag_ref(self, tags=None, creates=(), head=None, call='tag_ref o/app v1.2.0'):
         tmp = pathlib.Path(tempfile.mkdtemp(prefix='tag-ref-'))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         (tmp / 'gh').write_text(GH_STUB)
         (tmp / 'gh').chmod(0o755)
         state = tmp / 'state.json'
-        state.write_text(json.dumps({'tags': tags or {}, 'creates': list(creates), 'calls': []}))
+        state.write_text(
+            json.dumps({'tags': tags or {}, 'creates': list(creates), 'calls': [], 'head': head})
+        )
         script = (
             'set -euo pipefail\n'
             f'. "{SCRIPTS}/retry.sh"\n'
             f'. "{SCRIPTS}/tag-ref.sh"\n'
             'rc=0\n'
-            f'tag_ref o/app v1.2.0 {COMMIT} || rc=$?\n'
+            f'{call} {COMMIT} || rc=$?\n'
             'echo "rc=${rc} created=${TAG_CREATED}"\n'
         )
         env = {
@@ -127,6 +133,77 @@ class TagRef(unittest.TestCase):
         self.assertIn('::error::tag_ref_once failed after 5 attempts', out)
         self.assertTrue(out.endswith('rc=2 created=false\n'), out)
         self.assertEqual((tags, len(creates)), ({}, 5))
+
+
+HANDOFF = 'tag_ref_or_handoff o/app dev v1.2.0'
+
+
+class TagRefOrHandoff(TagRef):
+    """A dev run whose branch moved past it loses ref-create (a workflow-file push)."""
+
+    def test_a_create_that_succeeds_needs_no_head_read(self):
+        out, tags, _ = self.run_tag_ref(call=HANDOFF, head='d' * 40)
+        self.assertTrue(out.endswith('rc=0 created=true\n'), out)
+        self.assertEqual(tags, {'v1.2.0': COMMIT})
+
+    def test_a_failed_create_after_the_branch_moved_hands_off(self):
+        out, tags, _ = self.run_tag_ref(creates=['refused'] * 5, head='d' * 40, call=HANDOFF)
+        self.assertIn(
+            f'::warning::tag v1.2.0 not created: dev advanced past {COMMIT} (now {"d" * 40})', out
+        )
+        self.assertNotIn('::error::tag create', out)
+        self.assertTrue(out.endswith('rc=2 created=false\n'), out)
+        self.assertEqual(tags, {})
+
+    def test_a_failed_create_still_at_the_head_is_refused(self):
+        out, _, _ = self.run_tag_ref(creates=['refused'] * 5, head=COMMIT, call=HANDOFF)
+        self.assertIn(
+            "::error::tag create for v1.2.0 failed while this run is still dev's head", out
+        )
+        self.assertTrue(out.endswith('rc=1 created=false\n'), out)
+
+    def test_a_failed_create_with_an_unreadable_head_is_refused(self):
+        out, _, _ = self.run_tag_ref(creates=['refused'] * 5, call=HANDOFF)
+        self.assertIn("::error::tag create for v1.2.0 failed and dev's head is unreadable", out)
+        self.assertTrue(out.endswith('rc=1 created=false\n'), out)
+
+    def test_a_tag_at_another_commit_is_refused_without_a_head_read(self):
+        out, _, _ = self.run_tag_ref(tags={'v1.2.0': 'b' * 40}, head='d' * 40, call=HANDOFF)
+        self.assertTrue(out.endswith('rc=1 created=false\n'), out)
+        self.assertNotIn('advanced past', out)
+
+
+class BranchMovedPast(unittest.TestCase):
+    def run_moved(self, head):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix='moved-'))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / 'gh').write_text(GH_STUB)
+        (tmp / 'gh').chmod(0o755)
+        state = tmp / 'state.json'
+        state.write_text(json.dumps({'tags': {}, 'creates': [], 'calls': [], 'head': head}))
+        script = (
+            'set -euo pipefail\n'
+            f'. "{SCRIPTS}/retry.sh"\n'
+            f'. "{SCRIPTS}/tag-ref.sh"\n'
+            'rc=0\n'
+            f'at=$(branch_moved_past o/app dev {COMMIT}) || rc=$?\n'
+            'echo "rc=${rc} at=${at}"\n'
+        )
+        env = {**os.environ, 'PATH': f'{tmp}:{os.environ["PATH"]}', 'STUB_STATE': str(state)}
+        res = subprocess.run(
+            ['bash', '-c', script], env=env, capture_output=True, text=True, check=False
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout
+
+    def test_moved(self):
+        self.assertEqual(self.run_moved('d' * 40), f'rc=0 at={"d" * 40}\n')
+
+    def test_still_at_head(self):
+        self.assertEqual(self.run_moved(COMMIT), f'rc=1 at={COMMIT}\n')
+
+    def test_unreadable(self):
+        self.assertEqual(self.run_moved(None), 'rc=2 at=\n')
 
 
 if __name__ == '__main__':
