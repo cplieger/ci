@@ -564,7 +564,7 @@ jobs:
             runner: macos-latest
           # cplieger/go filesafe: the Windows POSIX-rename and sharing tests.
           - repository: cplieger/go
-            ref: 639f476a79a0328ea75ecec4acee96a121eca653
+            ref: ec4f5be970d7d4679b7dcff8425436ad7e4e6659
             dir: filesafe
             runner: windows-latest
     uses: ./.github/workflows/go-os-ci.yaml
