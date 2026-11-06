@@ -843,4 +843,31 @@ compute_tb "$ER" dev "" false ""
 assert_eq "$OUT_BASE|$OUT_FROM" "v1.3.0|$(commit_of "$ER" v1.2.1)" \
   "S15n: a dev run whose range H..HEAD is empty numbers above H instead of refusing"
 
+# ── S16: a commit that changes only an embedded file sets the bump ──────────
+# The config's **/*.md drops a commit that touches only a .md, but a file a
+# non-test //go:embed names ships in the binary, so its type counts. A dev
+# build is numbered as the next promotion, so it reads the level.
+EB=$(tb_fixture emb-bump)
+git -C "$EB" checkout -q dev
+mkdir -p "$EB/cli" "$EB/lane"
+printf 'package cli\n\nimport _ "embed"\n\n//go:embed manual.md\nvar Manual string\n' >"$EB/cli/manual.go"
+printf 'module example.com/eb/lane\n\ngo 1.26\n' >"$EB/lane/go.mod"
+printf 'package lane\n\nimport _ "embed"\n\n//go:embed README.md\nvar R string\n' >"$EB/lane/lane.go"
+git -C "$EB" add -A
+fc "$EB" cli/manual.md "fix: add the embedded manual"
+fc "$EB" lane/README.md "fix(lane): add the lane readme"
+git -C "$EB" tag lane/v1.0.0
+publish_main "$EB"
+compute "$EB" dev "" "lane/**"
+assert_eq "$OUT_BASE" "v1.3.0" "S16 precondition: fixes alone number the next minor"
+fc "$EB" README.md "feat!: rewrite the readme"
+compute "$EB" dev "" "lane/**"
+assert_eq "$OUT_BASE" "v1.3.0" "S16: an unembedded .md sets no level"
+fc "$EB" cli/manual.md "feat!: rewrite the help text"
+compute "$EB" dev "" "lane/**"
+assert_eq "$OUT_BASE" "v2.0.0" "S16: a breaking change to an embedded file alone is a major"
+fc "$EB" lane/README.md "feat(lane)!: rewrite the lane readme"
+compute "$EB" dev lane
+assert_eq "$OUT_BASE" "lane/v2.0.0" "S16: and a lane reads its own embedded file"
+
 echo "PASS: git-cliff $VERSION semantics match the release-gate contract"

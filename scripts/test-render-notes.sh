@@ -287,6 +287,50 @@ expect "N11 a first release has no compare link and no dependency diff" <<'EOF'
 - Initial (#1)
 EOF
 
+# A commit whose only change is a file a non-test //go:embed names ships, so
+# its line belongs in the notes though the cliff config's **/*.md drops it.
+EM="$WORK/embedded"
+new_repo "$EM"
+printf 'module example.com/em\n\ngo 1.26\n' >"$EM/go.mod"
+mkdir -p "$EM/cli" "$EM/lane"
+printf 'package cli\n\nimport _ "embed"\n\n//go:embed manual.md\nvar Manual string\n' >"$EM/cli/manual.go"
+printf 'package cli\n\n//go:embed testonly.md\nvar t string\n' >"$EM/cli/x_test.go"
+printf 'module example.com/em/lane\n\ngo 1.26\n' >"$EM/lane/go.mod"
+printf 'package lane\n\nimport _ "embed"\n\n//go:embed README.md\nvar R string\n' >"$EM/lane/lane.go"
+c "$EM" cli/manual.md "feat: initial (#1)"
+git -C "$EM" tag v1.0.0
+git -C "$EM" tag lane/v1.0.0
+c "$EM" cli/manual.md "fix: reword the manual (#2)
+
+BREAKING CHANGE: the help text changes"
+c "$EM" README.md "fix: reword the readme (#3)"
+c "$EM" cli/testonly.md "fix: reword a test fixture (#4)"
+c "$EM" cli/manual.md "docs: typo in the manual (#5)"
+c "$EM" lane/README.md "fix(lane): reword the lane readme (#6)"
+c "$EM" cli/c.go "feat: add a command (#7)"
+rn "$EM" --repo owner/em --release-commit HEAD --site go --version v2.0.0 --go-lanes '["lane"]'
+expect "N18 an embedded file's commit is in the root's notes; an unembedded, test-only, docs or lane one is not" <<'EOF'
+### Breaking changes
+
+#### Reword the manual (#2)
+
+The help text changes
+
+### Added
+
+- Add a command (#7)
+
+**Full changelog**: https://github.com/owner/em/compare/v1.0.0...v2.0.0
+EOF
+rn "$EM" --repo owner/em --release-commit HEAD --site lane --lane lane --version lane/v1.0.1
+expect "N18 and the lane's notes take its own embedded file" <<'EOF'
+### Fixed
+
+- Reword the lane readme (#6)
+
+**Full changelog**: https://github.com/owner/em/compare/lane/v1.0.0...lane/v1.0.1
+EOF
+
 refused "N12a an unstable version" "is not a stable version of this lane" "$T" "${TB[@]}" --site go --version v2.0.0-dev.1 --out "$WORK/out"
 refused "N12b a lane version without the lane prefix" "is not a stable version of this lane" "$T" "${TB[@]}" --site lane --lane yamlenv --version v1.1.0 --out "$WORK/out"
 refused "N12c no --repo" "--repo is required" "$T" --release-commit "$R" --site go --version v2.0.0 --out "$WORK/out"

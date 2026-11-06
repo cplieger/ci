@@ -158,7 +158,24 @@ render() {
   prev=$(previous_stable_tag)
   range=$commit
   [ -z "$prev" ] || range="${prev}..${commit}"
-  changes=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" --strip header "$range")
+  # A commit the path filter drops that changes a file a non-test //go:embed
+  # names ships, so its line belongs here (go-embeds.py; compute.sh counts it).
+  local -a with=() scope=(--config "${CONFIG:-${GIT_CLIFF_CONFIG:-cliff.toml}}")
+  local msg i embeds
+  for ((i = 0; i < ${#SCOPE_ARGS[@]}; i += 2)); do
+    case "${SCOPE_ARGS[$i]}" in
+      --include-path) scope+=(--include "${SCOPE_ARGS[$((i + 1))]}") ;;
+      --exclude-path) scope+=(--exclude "${SCOPE_ARGS[$((i + 1))]}") ;;
+    esac
+  done
+  embeds=$(mktemp)
+  python3 "$(dirname "$0")/go-embeds.py" --with-commits "$range" "${scope[@]}" >"$embeds" \
+    || die "cannot read the //go:embed directives over ${range}"
+  while IFS= read -r -d '' msg; do
+    with+=(--with-commit "$msg")
+  done <"$embeds"
+  rm -f "$embeds"
+  changes=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" "${with[@]}" --strip header "$range")
   if [ -n "$prev" ]; then
     changes+=$'\n\n'"**Full changelog**: https://github.com/${REPO}/compare/${prev}...${VERSION}"
     local inv=(diff --git-dir . --from "$prev" --to "$commit" --lane "${LANE:-.}" --format markdown)
