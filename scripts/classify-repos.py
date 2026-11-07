@@ -7,8 +7,8 @@ from that base's tree and its groups carry `base:`; every other repo from HEAD.
 
 Importable: `sync_owned_patterns()` is every path the sync can write, as globs,
 `canonical_sources(repo)` maps each of `repo`'s paths to its source here, and
-`classify_tree(tree, releasing=)` with `synced_dests(profile, releasing=)` give a
-local tree's profile and the paths the sync writes into it, reading no API.
+`classify_tree(tree, releasing=)` with `synced_dests(profile)` give a local
+tree's profile and the paths the sync writes into it, reading no API.
 
 Failure model: the repo listing aborts on an error, a timeout or the page cap;
 an unreadable tree drops that repo (or base) from every group; a failed
@@ -356,15 +356,20 @@ def classify(repo, ref='HEAD', *, releasing=False):
 
 
 def classify_tree(tree, *, releasing=False):
-    """Profile a repo's surfaces and language from `tree`, every path of its git
-    tree with the directories among them (the recursive trees listing). Reads
-    no API, so fleet tooling classifies a local clone the way the sync does.
+    """Profile a repo's surfaces and language from `tree`, the paths of its git
+    tree: the recursive trees listing, or a clone's `git ls-files`, whose
+    directories are derived here (a git tree holds no empty one, so both give
+    one profile). Reads no API, so fleet tooling classifies a local clone the
+    way the sync does. The profile records `releasing`, which synced_dests reads.
 
     A root check is an exact-path match against the listing; the cliff tier is
     read separately (cliff_tier). A `releasing` (two-branch) base with no root
     go.mod is Go when it holds nested modules, because the release pipeline
     ships them as lanes; elsewhere a root-less repo keeps its own CI.
     """
+    readable = bool(tree)
+    tree = set(tree)
+    tree |= {path.rsplit('/', depth)[0] for path in tree for depth in range(1, path.count('/') + 1)}
     has_gomod = 'go.mod' in tree
     has_jsr = 'jsr.json' in tree
     has_pkg = 'package.json' in tree
@@ -416,7 +421,8 @@ def classify_tree(tree, *, releasing=False):
         ts_dirs = ('',)
 
     return {
-        'readable': bool(tree),
+        'readable': readable,
+        'releasing': releasing,
         'lang': lang,
         'has_jsr': has_jsr,
         'has_pkg': has_pkg,
@@ -430,14 +436,18 @@ def classify_tree(tree, *, releasing=False):
     }
 
 
-def synced_dests(profile, *, releasing):
-    """Every path the sync writes into a repo of `profile`, sorted: the dests of
-    each group assign() puts it in, the TypeScript configs placed by its
-    ts_dirs, and on a `releasing` base the two-branch Renovate delta. Both cliff
-    tiers write cliff.toml, so a profile with no cliff_tier reads as stable."""
+def synced_dests(profile):
+    """Every path the sync writes into a repo of `profile` (classify_tree), sorted:
+    the dests of each group assign() puts it in, the TypeScript configs placed by
+    its ts_dirs, and on a releasing base the two-branch Renovate delta. An
+    unreadable tree gets nothing, as main() leaves it out of every group, and so
+    does the ci repo, the sync's source, which the caller excludes by name. Both
+    cliff tiers write cliff.toml, so a profile with no cliff_tier reads as stable."""
+    if not profile['readable']:
+        return []
     profile = {'cliff_tier': 'stable', **profile}
-    groups = assign(['repo'], {'repo': profile}, releasing)
-    if releasing:
+    groups = assign(['repo'], {'repo': profile}, profile['releasing'])
+    if profile['releasing']:
         groups['two_branch_renovate'] = ['repo']
     dests = set()
     for key, group in GROUPS:
