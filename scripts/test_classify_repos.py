@@ -873,9 +873,12 @@ class LocalTree(unittest.TestCase):
             ['go.mod', 'main.go', 'web/package.json', 'web/a.ts'],
             ['go.mod', 'main.go', 'web/index.ts'],
             ['go.mod', 'main.go', 'static-src/app.ts'],
+            ['go.mod', 'main.go', 'web/static/app.js'],
             ['a/go.mod', 'a/a.go', 'a/web/package.json'],
         ):
-            listed = files + sorted({f.rsplit('/', 1)[0] for f in files if '/' in f})
+            listed = files + sorted(
+                {f.rsplit('/', depth)[0] for f in files for depth in range(1, f.count('/') + 1)}
+            )
             for releasing in (False, True):
                 self.assertEqual(
                     self.classify.classify_tree(files, releasing=releasing),
@@ -883,6 +886,7 @@ class LocalTree(unittest.TestCase):
                     files,
                 )
         self.assertIn('.prettierrc.json', self.dests(['go.mod', 'main.go', 'web/package.json']))
+        self.assertIn('.prettierrc.json', self.dests(['go.mod', 'main.go', 'web/static/app.js']))
 
     def test_an_unreadable_tree_gets_nothing(self):
         for releasing in (False, True):

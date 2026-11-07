@@ -367,8 +367,8 @@ def classify_tree(tree, *, releasing=False):
     go.mod is Go when it holds nested modules, because the release pipeline
     ships them as lanes; elsewhere a root-less repo keeps its own CI.
     """
-    readable = bool(tree)
     tree = set(tree)
+    readable = bool(tree)
     tree |= {path.rsplit('/', depth)[0] for path in tree for depth in range(1, path.count('/') + 1)}
     has_gomod = 'go.mod' in tree
     has_jsr = 'jsr.json' in tree
