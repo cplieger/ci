@@ -49,7 +49,11 @@ done(64, err=f'gh stub: unexpected {args}\n')
 COMMIT = 'c' * 40
 
 
-class TagRef(unittest.TestCase):
+class RunsTagRef:
+    """Runs one tag-ref.sh call against the stub; head_reads holds its branch-head reads."""
+
+    head_reads: list
+
     def run_tag_ref(self, tags=None, creates=(), head=None, call='tag_ref o/app v1.2.0'):
         tmp = pathlib.Path(tempfile.mkdtemp(prefix='tag-ref-'))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
@@ -79,8 +83,11 @@ class TagRef(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         doc = json.loads(state.read_text())
         creates = [c for c in doc['calls'] if c[:2] == ['api', 'repos/o/app/git/refs']]
+        self.head_reads = [c for c in doc['calls'] if any('git/ref/heads/' in a for a in c)]
         return res.stdout, doc['tags'], creates
 
+
+class TagRef(RunsTagRef, unittest.TestCase):
     def test_an_absent_tag_is_created_at_the_commit(self):
         out, tags, creates = self.run_tag_ref()
         self.assertEqual(out, 'rc=0 created=true\n')
@@ -138,13 +145,13 @@ class TagRef(unittest.TestCase):
 HANDOFF = 'tag_ref_or_handoff o/app dev v1.2.0'
 
 
-class TagRefOrHandoff(TagRef):
+class TagRefOrHandoff(RunsTagRef, unittest.TestCase):
     """A dev run whose branch moved past it loses ref-create (a workflow-file push)."""
 
     def test_a_create_that_succeeds_needs_no_head_read(self):
         out, tags, _ = self.run_tag_ref(call=HANDOFF, head='d' * 40)
         self.assertTrue(out.endswith('rc=0 created=true\n'), out)
-        self.assertEqual(tags, {'v1.2.0': COMMIT})
+        self.assertEqual((tags, self.head_reads), ({'v1.2.0': COMMIT}, []))
 
     def test_a_failed_create_after_the_branch_moved_hands_off(self):
         out, tags, _ = self.run_tag_ref(creates=['refused'] * 5, head='d' * 40, call=HANDOFF)
@@ -171,6 +178,7 @@ class TagRefOrHandoff(TagRef):
         out, _, _ = self.run_tag_ref(tags={'v1.2.0': 'b' * 40}, head='d' * 40, call=HANDOFF)
         self.assertTrue(out.endswith('rc=1 created=false\n'), out)
         self.assertNotIn('advanced past', out)
+        self.assertEqual(self.head_reads, [])
 
 
 class BranchMovedPast(unittest.TestCase):

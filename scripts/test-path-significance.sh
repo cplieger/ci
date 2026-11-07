@@ -529,6 +529,35 @@ put docs/guide.md 'v2'
 put docs/tool/README.md 'v2'
 N1=$(commit "docs: both")
 chk "S41 a directory pattern stops at a nested module" "$(paths "$N0" "$N1")" 'true|[]|[]|["docs/guide.md"]'
+# A directive in a file Go never builds embeds nothing: one under testdata or
+# a `_` directory, or behind `//go:build ignore`.
+newrepo embeds-ignored
+put go.mod 'module example.com/ign'
+put gen/gen.go '//go:build ignore
+
+package main
+
+import _ "embed"
+
+//go:embed notes.md
+var notes string'
+put gen/notes.md 'v1'
+put tools/testdata/t.go 'package t
+
+//go:embed fixture.md
+var f string'
+put tools/testdata/fixture.md 'v1'
+put _old/o.go 'package old
+
+//go:embed old.md
+var o string'
+put _old/old.md 'v1'
+I0=$(commit "feat: initial")
+put gen/notes.md 'v2'
+put tools/testdata/fixture.md 'v2'
+put _old/old.md 'v2'
+I1=$(commit "docs: all three")
+chk "S42 a directive in a file Go never builds embeds nothing" "$(paths "$I0" "$I1")" 'false|[]|[]|[]'
 cd "$WORK" || exit 1
 
 echo "PASS: path significance ($PASS checks)"

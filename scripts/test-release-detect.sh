@@ -3172,7 +3172,7 @@ chk "W13 from the version and build renumber-ts handed on" \
   "\${{ steps.handoff.outputs.version }} \${{ steps.handoff.outputs.commit }}|\${{ needs.renumber-ts.outputs.npm_version }}|\${{ needs.renumber-ts.outputs.npm_commit }}"
 chk "W13 renumber-ts is one job for the TS root in renumber mode, computing then handing on" \
   "$(fact '."jobif:renumber-ts"')|$(fact '."renumber-ts-steps" | join(",")')" \
-  "\${{ needs.detect.outputs.mode == 'renumber' && needs.detect.outputs.type == 'ts' }}|Checkout,Check out the ci source,Check out the newest build,Compute version (cliff),Hand the version on"
+  "\${{ needs.detect.outputs.mode == 'renumber' && needs.detect.outputs.type == 'ts' }}|Checkout,Check out the ci source,Setup Python,Check out the newest build,Compute version (cliff),Hand the version on"
 chk "W13 and the renumber matrix skips the TS root and exports nothing" \
   "$(fact '."renumber-if"."Check out the newest build"')|$(fact '."renumber-matrix-outputs"')" \
   "\${{ matrix.key != '.' || needs.detect.outputs.type != 'ts' }}|false"
@@ -3184,7 +3184,7 @@ chk "W23 once the root renumber succeeded or had nothing to do, in renumber mode
   "$(fact '."rsub-gate" | [.[]] | map(tostring) | join(" ")')" "true true false false false false"
 chk "W23 checking the newest build out, selecting, then publishing through the shared script" \
   "$(fact '."rsub-steps" | join(",")')|$(grep -c 'publish-subpackage.sh' "$WORK/rsub-publish.sh")" \
-  "Checkout,Check out the ci source,Check out the newest build,Select the subpackages,Setup Node.js,Publish the subpackages|1"
+  "Checkout,Check out the ci source,Setup Python,Check out the newest build,Select the subpackages,Setup Node.js,Publish the subpackages|1"
 chk "W23 selecting only at a build, publishing only what was selected, on the dev channel" \
   "$(fact '."rsub-if"."Select the subpackages"')|$(fact '."rsub-if"."Publish the subpackages"')|$(fact '."rsub-env"."Publish the subpackages" | "\(.CHANNEL) \(.VERSION) \(.DIRS)"')" \
   "\${{ steps.target.outputs.commit != '' }}|\${{ steps.plan.outputs.dirs != '' && steps.plan.outputs.dirs != '[]' }}|dev \${{ steps.plan.outputs.version }} \${{ steps.plan.outputs.dirs }}"
@@ -3195,12 +3195,12 @@ chk "W30 once the lane renumber succeeded or had nothing to do, in renumber mode
   "$(fact '."rh-gate" | map(tostring) | join(" ")')" "true true false false false"
 chk "W30 checking the lane's newest build out, selecting, then publishing through the shared script" \
   "$(fact '."rh-steps" | join(",")')|$(grep -c 'publish-subpackage.sh' "$WORK/rh-publish.sh")" \
-  "Checkout,Check out the ci source,Check out the newest build,Select the half,Setup Node.js,Publish the half|1"
+  "Checkout,Check out the ci source,Setup Python,Check out the newest build,Select the half,Setup Node.js,Publish the half|1"
 chk "W30 for the leg's lane, selecting only at a build and publishing only what was selected, on the dev channel" \
   "$(fact '."rh-env"."Check out the newest build".LANE_KEY')|$(fact '."rh-env"."Select the half".LANE_KEY')|$(fact '."rh-if"."Select the half"')|$(fact '."rh-if"."Publish the half"')|$(fact '."rh-env"."Publish the half" | "\(.CHANNEL) \(.VERSION) \(.DIRS)"')" \
   "\${{ matrix.lane }}|\${{ matrix.lane }}|\${{ steps.target.outputs.commit != '' }}|\${{ steps.plan.outputs.dirs != '' && steps.plan.outputs.dirs != '[]' }}|dev \${{ steps.plan.outputs.version }} \${{ steps.plan.outputs.dirs }}"
 chk "W13 checking that build out and installing before it tags" \
-  "$(fact '."renumber-npm-steps" | join(",")')" "Checkout,Check out the ci source,Move the ci source out of the package,Check out the numbered build,Setup Node.js,Install dependencies,Renumber"
+  "$(fact '."renumber-npm-steps" | join(",")')" "Checkout,Check out the ci source,Move the ci source out of the package,Setup Python,Check out the numbered build,Setup Node.js,Install dependencies,Renumber"
 chk "W14 an image repair installs the pinned cosign" "$(fact '."repair-if"."Install Cosign"')|$(fact '."repair-cosign"')" \
   "\${{ matrix.site == 'docker' }}|$(sed -n 's/^  COSIGN_VERSION: //p' "$ROOT/.github/workflows/docker-release.yaml")"
 chk "W14 and reads back every registry the run wrote" "$(fact '."repair-env".REGISTRIES')" '${{ needs.detect.outputs.registries }}'
@@ -3250,7 +3250,7 @@ chk "W18 the repair renders to a file it hands on as an artifact of its own tag"
   'true|${{ runner.temp }}/notes/NOTES.md|${{ steps.release.outputs.artifact }}|${{ steps.release.outputs.artifact }}'
 chk "W18 and the Release is written by a job that checks out and runs nothing of the repository" \
   "$(fact '."repair-release-steps" | join(",")')|$(fact '."perms:repair-release" | tojson')|$(fact '."needs:repair-release" | join(" ")')" \
-  'Check out the ci source,Check the Release,Fetch the notes,Fetch the assets,Publish the missing Release|{"contents":"write"}|detect repair-notes repair-assets'
+  'Check out the ci source,Setup Python,Check the Release,Fetch the notes,Fetch the assets,Publish the missing Release|{"contents":"write"}|detect repair-notes repair-assets'
 chk_has "W18 from that file" "$(fact '."repair-publish-run"')" '--notes-file "$RUNNER_TEMP/notes/NOTES.md"'
 release_check() { # <job> -> its missing output for v9.9.9, or EXIT=n
   local rt
@@ -3519,7 +3519,7 @@ chk "W12 reading the artifact its own leg of renumber wrote" \
   "$(fact '."renumber-upload".name')|$(fact '."renumber-fetch".name')|$(grep -c 'handoff-name renumber "$LANE_KEY"' "$WORK/renumber-write.sh")" \
   "\${{ steps.write.outputs.artifact }}|\${{ steps.name.outputs.artifact }}|1"
 chk "W12 and running no cliff config" "$(fact '."renumber-tag-steps" | join(",")')" \
-  "Checkout,Check out the ci source,Name the handoff,Fetch the handoff,Read the handoff,Check out the numbered build,Log in to GHCR,Renumber"
+  "Checkout,Check out the ci source,Setup Python,Name the handoff,Fetch the handoff,Read the handoff,Check out the numbered build,Log in to GHCR,Renumber"
 chk "W12 after every leg of renumber, whose write scopes it alone holds" \
   "$(fact '."needs:renumber-tag" | join(" ")')|$(fact '."perms:renumber" | tojson')|$(fact '."perms:renumber-tag" | tojson')" \
   'detect renumber|{"contents":"read"}|{"contents":"write","statuses":"write","packages":"write"}'

@@ -1516,12 +1516,17 @@ class Workflow(unittest.TestCase):
                 [
                     'Checkout',
                     'Mint the App token',
+                    'Setup Python',
                     'Rebuild the stale images of cplieger/${{ matrix.repo }}',
                 ],
             ),
             'unreadable': (
                 UNREADABLE_LEG,
-                ['Checkout', 'Rebuild the stale images of cplieger/${{ matrix.repo }}'],
+                [
+                    'Checkout',
+                    'Setup Python',
+                    'Rebuild the stale images of cplieger/${{ matrix.repo }}',
+                ],
             ),
         }
         for label, (leg, wanted) in expect.items():

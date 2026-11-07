@@ -42,7 +42,7 @@ branch_moved_past() {
   [ "$head" != "$3" ]
 }
 
-# tag_ref_or_handoff <owner/repo> <branch> <tag> <commit>: tag_ref for a dev run.
+# tag_ref_or_handoff <owner/repo> <branch> <tag> <commit>: tag_ref for a release run on <branch>.
 # Once a push that edits workflow files lands past <commit>, GitHub refuses the
 # integration token's ref create (ui#42, deadset#281, toolbelt#506), and runs
 # queue per ref, so the run on the new head releases this range. Returns 0 when
@@ -56,10 +56,10 @@ tag_ref_or_handoff() {
   head=$(branch_moved_past "$1" "$2" "$4") || mrc=$?
   case "$mrc" in
     0)
-      echo "::warning::tag $3 not created: $2 advanced past $4 (now ${head}), and a superseded run loses ref-create; the run on the new head releases this range."
+      echo "::warning::tag $3 not created: $2 advanced past $4 (now ${head}), and a superseded run loses ref-create. The run on the new head releases this range."
       return 2
       ;;
-    1) echo "::error::tag create for $3 failed while this run is still $2's head; not a superseded run, so check the token's permissions and the API." ;;
+    1) echo "::error::tag create for $3 failed while this run is still $2's head. It is not a superseded run, so check the token's permissions and the API." ;;
     *) echo "::error::tag create for $3 failed and $2's head is unreadable, so a handoff cannot be confirmed." ;;
   esac
   return 1

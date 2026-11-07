@@ -19,8 +19,11 @@ calls (a dispatch run asks about every tracked file), with Go's
 rules (https://pkg.go.dev/embed): space-separated patterns, each optionally a
 quoted string and prefixed `all:`, matched element by element as path.Match
 does; a pattern naming a directory embeds its tree except names starting with
-`.` or `_`, unless `all:`. Build constraints are not evaluated, so a file any
-platform builds counts. Exits 2 when git cannot read the tree.
+`.` or `_`, unless `all:`. A file Go never builds (under testdata, vendor or a
+`.` or `_` name, or behind `//go:build ignore`) is skipped; other constraints
+are not evaluated, so a file any platform builds counts. A `//go:embed` line
+inside a raw string or a /* */ comment also counts, which can release a commit
+that ships nothing; reading Go's syntax would need a Go toolchain in detect. Exits 2 when git cannot read the tree.
 """
 
 from __future__ import annotations
@@ -72,33 +75,61 @@ def patterns(line: str) -> list[str]:
     return out
 
 
-def element_re(pattern: str) -> re.Pattern[str]:
-    """path.Match for one path element: * and ? never cross a slash."""
+NEVER = re.compile(r'(?!)')
+
+
+def translate(pattern: str) -> str:
+    """path.Match for one path element as a regex: * and ? never cross a slash,
+    and a class is `[` then an optional `^`, ranges `lo-hi` or single characters
+    (each backslash-escapable), then `]`. Raises ValueError on a pattern
+    path.Match rejects."""
     out, i, n = [], 0, len(pattern)
+
+    def esc(k: int) -> tuple[str, int]:
+        if k >= n or pattern[k] in '-]':
+            raise ValueError(pattern)
+        if pattern[k] == '\\':
+            k += 1
+            if k >= n:
+                raise ValueError(pattern)
+        return pattern[k], k + 1
+
     while i < n:
         c = pattern[i]
-        if c == '*':
-            out.append('[^/]*')
-        elif c == '?':
-            out.append('[^/]')
-        elif c == '\\' and i + 1 < n:
+        if c in '*?':
+            out.append('[^/]*' if c == '*' else '[^/]')
             i += 1
-            out.append(re.escape(pattern[i]))
+        elif c == '\\':
+            if i + 1 >= n:
+                raise ValueError(pattern)
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
         elif c == '[':
-            j = pattern.find(']', i + 2)
-            if j < 0:
-                out.append(re.escape(c))
-            else:
-                body = pattern[i + 1 : j]
-                neg = body.startswith('^')
-                body = body[1:] if neg else body
-                body = body.replace('\\', '\\\\')
-                out.append(f'[{"^" if neg else ""}{body}]')
-                i = j
+            i += 1
+            neg = i < n and pattern[i] == '^'
+            i += neg
+            ranges = []
+            while not (i < n and pattern[i] == ']' and ranges):
+                lo, i = esc(i)
+                hi = lo
+                if i < n and pattern[i] == '-':
+                    hi, i = esc(i + 1)
+                ranges.append(re.escape(lo) if lo == hi else f'{re.escape(lo)}-{re.escape(hi)}')
+            i += 1
+            out.append(f'[{"^/" if neg else ""}{"".join(ranges)}]')
         else:
             out.append(re.escape(c))
-        i += 1
-    return re.compile(''.join(out) + r'\Z')
+            i += 1
+    return ''.join(out) + r'\Z'
+
+
+def element_re(pattern: str) -> re.Pattern[str]:
+    """translate's regex, compiled; a pattern path.Match rejects matches nothing,
+    which Go's build refuses anyway."""
+    try:
+        return re.compile(translate(pattern))
+    except ValueError, re.error:
+        return NEVER
 
 
 def embeds(pattern: str, rel: str) -> bool:
@@ -115,7 +146,13 @@ def embeds(pattern: str, rel: str) -> bool:
     return keep_hidden or not any(e.startswith(('.', '_')) for e in below)
 
 
-DIRECTIVE = r'^[[:space:]]*//go:embed[[:space:]]'
+DIRECTIVE = r'^[[:space:]]*//go:(embed|build)[[:space:]]'
+
+
+def go_skips(name: str) -> bool:
+    """Whether Go builds no package from this file's directory or name: a
+    directory or file named testdata or vendor, or starting with `.` or `_`."""
+    return any(e in ('testdata', 'vendor') or e.startswith(('.', '_')) for e in name.split('/'))
 
 
 def glob_re(pattern: str) -> re.Pattern[str]:
@@ -182,11 +219,23 @@ def embedded_at(commit: str, paths: list[str]) -> list[str]:
     if proc.returncode > 1:
         sys.stderr.write(f'go-embeds: git grep failed: {proc.stderr.strip()}\n')
         sys.exit(2)
-    directives: dict[str, list[str]] = {}
+    lines = []
+    ignored = set()
     for line in proc.stdout.splitlines():
         name, _, rest = line.partition('\0')
         _, _, text = rest.partition('\0')
         name = name.removeprefix(f'{commit}:')
+        if '//go:build' in text:
+            # `//go:build ignore` keeps a file out of every build; other
+            # constraints hold on some platform, so their files count.
+            if text.split('//go:build', 1)[1].strip() == 'ignore':
+                ignored.add(name)
+        elif not go_skips(name):
+            lines.append((name, text))
+    directives: dict[str, list[str]] = {}
+    for name, text in lines:
+        if name in ignored:
+            continue
         d = name.rsplit('/', 1)[0] if '/' in name else ''
         directives.setdefault(d, []).extend(patterns(text.split('//go:embed', 1)[1]))
 

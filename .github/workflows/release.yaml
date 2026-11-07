@@ -259,6 +259,11 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       # Token-free: the steps up to Compute version run the repository's
       # cliff config.
       - name: Find pending promotions
@@ -577,6 +582,11 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Check the Release
         id: release
         env:
@@ -686,6 +696,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Check the Release
         id: release
@@ -843,6 +858,11 @@ jobs:
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Read back and record the receipt
         env:
           GH_TOKEN: ${{ github.token }}
@@ -892,6 +912,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Hold for dev
         env:
@@ -950,6 +975,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Check out the newest build
         id: target
@@ -1038,6 +1068,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Name the handoff
         id: name
@@ -1128,6 +1163,11 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Check out the newest build
         id: target
         env:
@@ -1196,6 +1236,11 @@ jobs:
           set -euo pipefail
           mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Check out the numbered build
         env:
           CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
@@ -1261,6 +1306,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Check out the newest build
         id: target
@@ -1335,6 +1385,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Check out the newest build
         id: target
@@ -1678,6 +1733,11 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Generate release notes
         # Stable only: a dev build creates no Release. Deliberately
         # token-free: this step downloads and EXECUTES git-cliff, and an
@@ -1799,18 +1859,23 @@ jobs:
 
       # Before npm's publish, which a handed-off tag would leave behind: once
       # the branch has moved past this commit, the run on the new head
-      # releases this range. branch_moved_past's rule (tag-ref.sh), read
-      # inline because the ci source is checked out only after the package's
-      # lifecycle scripts have run.
+      # releases this range. A version already tagged here is this run's own
+      # (a rerun after a failed Release), so it repairs on. branch_moved_past's
+      # rule (tag-ref.sh), read inline because the ci source is checked out
+      # only after the package's lifecycle scripts have run.
       - name: Hand off to a newer push
         id: handoff
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.detect.outputs.version }}
         run: |
           set -euo pipefail
-          head=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha 2>/dev/null || true)
+          at=$(git rev-list -n1 "$VERSION" 2>/dev/null || true)
+          head=""
+          [ "$at" = "$GITHUB_SHA" ] \
+            || head=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha 2>/dev/null || true)
           if [ -n "$head" ] && [ "$head" != "$GITHUB_SHA" ]; then
-            echo "::warning::${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${head}) before the publish; the run on the new head releases this range."
+            echo "::warning::${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${head}) before the publish. The run on the new head releases this range."
             echo "handoff=true" >>"$GITHUB_OUTPUT"
           else
             echo "handoff=false" >>"$GITHUB_OUTPUT"
@@ -1871,6 +1936,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Generate release notes
         # Stable only; deliberately token-free — this step executes the
@@ -2009,7 +2079,7 @@ jobs:
           if [ "$(git rev-list -n1 "$VERSION" 2>/dev/null || true)" != "$GITHUB_SHA" ]; then
             . "$CI_TOOLS/tag-ref.sh"
             if head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA"); then
-              echo "::warning::${VERSION} is not tagged here and ${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${head}); the run on the new head publishes ${DIR}."
+              echo "::warning::${VERSION} is not tagged here and ${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${head}). The run on the new head publishes ${DIR}."
               handoff=true
             fi
           fi
@@ -2155,6 +2225,11 @@ jobs:
           fi
           echo "ok: module path '$modpath' matches lane ${DIR} ($VERSION)"
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       # Before the tag, which reserves the version for the lane's TS half too.
       - name: Check the half's npm versions
         if: ${{ steps.lane.outputs.release == 'true' }}
@@ -2290,7 +2365,7 @@ jobs:
           if [ -z "$tag" ]; then
             . "$CI_TOOLS/tag-ref.sh"
             if head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA"); then
-              echo "::warning::lane ${LANE} has no ${CHANNEL} tag at ${GITHUB_SHA} and ${GITHUB_REF_NAME} advanced past it (now ${head}); the run on the new head publishes its TS half."
+              echo "::warning::lane ${LANE} has no ${CHANNEL} tag at ${GITHUB_SHA} and ${GITHUB_REF_NAME} advanced past it (now ${head}). The run on the new head publishes its TS half."
               echo "tag=" >>"$GITHUB_OUTPUT"
               exit 0
             fi
@@ -2447,7 +2522,7 @@ jobs:
           if [ -n "$VERSION" ] && [ "$(git rev-list -n1 "$VERSION" 2>/dev/null || true)" != "$GITHUB_SHA" ]; then
             . "$CI_TOOLS/tag-ref.sh"
             if head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA"); then
-              echo "::warning::${VERSION} is not tagged at ${GITHUB_SHA} and ${GITHUB_REF_NAME} advanced past it (now ${head}); the root was handed off, so its artifacts are not verified here."
+              echo "::warning::${VERSION} is not tagged at ${GITHUB_SHA} and ${GITHUB_REF_NAME} advanced past it (now ${head}). The root was handed off, so its artifacts are not verified here."
               root=false
             fi
           fi
@@ -2519,6 +2594,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Record completion receipts
         env:

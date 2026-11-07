@@ -449,6 +449,10 @@ class Job:
             if not inner.condition(step.get('if')):
                 continue
             require_replayable(label, step)
+            if str(step.get('uses', '')).startswith(SETUP_PYTHON):
+                # As at job level: the replay's interpreter is already at the floor.
+                self.ran.append(label)
+                continue
             if 'run' not in step:
                 raise ReplayError(f'{label}: only run steps are replayed inside a composite')
             step_env = {

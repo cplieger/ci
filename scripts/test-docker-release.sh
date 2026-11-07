@@ -137,7 +137,10 @@ gates = {
     "ra-needs": jobs["repair-assets"].get("needs"),
     "ra-perms": jobs["repair-assets"].get("permissions"),
     "ra-steps": names("repair-assets"),
-    "ra-step-ifs": [str(s.get("if", "")) for s in jobs["repair-assets"]["steps"][3:]],
+    "ra-step-ifs": [
+        str(s.get("if", ""))
+        for s in jobs["repair-assets"]["steps"][[s.get("name") for s in jobs["repair-assets"]["steps"]].index("Check the Release") + 1:]
+    ],
     "binaries-go-if": step_if("finalize", "Set up Go for the release binaries"),
     "binaries-go-order": fin.index("Set up Go for the release binaries") + 1 == fin.index("Stage and sign the release assets"),
     "binaries-go-with": next(s for s in jobs["finalize"]["steps"] if s.get("name") == "Set up Go for the release binaries")["with"],
@@ -1852,7 +1855,7 @@ chk "D-A8 so a repair call runs the caller check and repair-assets alone" "$(gat
 chk "D-A8 and repair-assets only with one, reading and signing, in its own job" \
   "$(gate '."ra-if"')|$(gate '."ra-perms" | tojson')" "\${{ inputs.repair-tag != '' }}|{\"contents\":\"read\",\"id-token\":\"write\"}"
 chk "D-A8 checking the Release before installing, signing and uploading" "$(gate '."ra-steps" | join(",")')|$(gate '."ra-step-ifs" | unique | join(" ")')" \
-  "Checkout,Check out the ci source,Check the Release,Install Cosign,Set up Go for the release binaries,Sign the release assets,Hand the assets on|\${{ steps.release.outputs.missing == 'true' && inputs.binaries != '' }} \${{ steps.release.outputs.missing == 'true' }}"
+  "Checkout,Check out the ci source,Setup Python,Check the Release,Install Cosign,Set up Go for the release binaries,Sign the release assets,Hand the assets on|\${{ steps.release.outputs.missing == 'true' && inputs.binaries != '' }} \${{ steps.release.outputs.missing == 'true' }}"
 chk "D-A8 Go set up as finalize sets it up" "$(gate '."ra-go-with" | tojson')" "$(gate '."binaries-go-with" | tojson')"
 chk "D-A8 and the caller's binaries input reaches the signing step" \
   "$(sed -n 's/^BINARIES=//p;s/^GOTOOLCHAIN=//p' "$WORK/rassets.sh.envmap" | tr '\n' ' ')" '${{ inputs.binaries }} auto '
@@ -1971,7 +1974,7 @@ chk "D-G5 asking the source first, then that ancestor" "$(sed 's/.*-sha \([0-9a-
 chk_has "D-G6 runs on publishes of a promoted digest only" "$(gate '."provenance-if"')" \
   "env.PUBLISH == 'true' && env.PROMOTE_DIGEST != ''"
 chk "D-G6 after cosign and the tools are in place, before every registry write" "$(gate '."before-provenance" | join("|")')" \
-  "Checkout|Check out the ci source|Version ownership gate|Download digests|Set up Docker Buildx|Log in to GHCR|Install Cosign"
+  "Checkout|Check out the ci source|Version ownership gate|Download digests|Set up Docker Buildx|Log in to GHCR|Install Cosign|Setup Python"
 chk "D-G6 the next step reads the promoted SBOM, and the one after is the first write" \
   "$(gate '."after-provenance"')|$(gate '."first-write"')" "Read the promoted build's SBOM|Publish channel tags on GHCR"
 chk "D-G6 the source is the one the digest walk named" "$(sed -n 's/^PROMOTE_SOURCE=//p' "$WORK/provenance.sh.envmap")" \
@@ -2120,13 +2123,26 @@ cat >"$WORK/handoff-ifs.want" <<'JSON'
 {"lane-halves": ["Publish the lane's TS half"], "subpackage": ["Publish subpackage to npm + JSR"], "ts": ["Publish to npm + JSR", "Generate release notes", "Tag + GitHub Release"]}
 JSON
 chk "D-T19 the publishes and tags each handoff gates" "$(cat "$WORK/handoff-ifs.json")" "$(cat "$WORK/handoff-ifs.want")"
-out_h=$(GH_HEAD="$C_DOCS" run_step ts-handoff.sh)
+run_step_in() { # <script in cwd>: run_step's environment, in the current directory
+  : >"$WORK/out"
+  PATH="$PBIN:$BIN:$PATH" GITHUB_OUTPUT="$WORK/out" CI_TOOLS="$ROOT/scripts" GITHUB_REPOSITORY=owner/app READBACK_SLEEP=0 \
+    bash "$1" 2>&1 || echo "EXIT=$?"
+}
+out_h=$(GH_HEAD="$C_DOCS" VERSION=v1.3.0-dev.4 run_step ts-handoff.sh)
 chk "D-T20 ts hands off when the branch moved before its publish" "$(out handoff)" "true"
 chk_has "D-T20 and warns" "$out_h" "::warning::dev advanced past $C_BUILT (now $C_DOCS) before the publish"
-GH_HEAD="$C_BUILT" run_step ts-handoff.sh >/dev/null
+GH_HEAD="$C_BUILT" VERSION=v1.3.0-dev.4 run_step ts-handoff.sh >/dev/null
 chk "D-T21 ts publishes while still at the head" "$(out handoff)" "false"
-GH_HEAD="" run_step ts-handoff.sh >/dev/null
+GH_HEAD="" VERSION=v1.3.0-dev.4 run_step ts-handoff.sh >/dev/null
 chk "D-T21 ts publishes when the head is unreadable" "$(out handoff)" "false"
+TSREPO="$WORK/ts-handoff"
+rm -rf "$TSREPO"
+git init -q -b dev "$TSREPO"
+git -C "$TSREPO" -c user.email=p@ci.local -c user.name=p -c commit.gpgsign=false commit -q --allow-empty -m "feat: ts root"
+git -C "$TSREPO" tag v1.3.0-dev.4
+(cd "$TSREPO" && cp "$WORK/ts-handoff.sh" ./.t.sh && GH_HEAD="$C_DOCS" GITHUB_SHA="$(git rev-parse HEAD)" VERSION=v1.3.0-dev.4 \
+  run_step_in .t.sh) >/dev/null
+chk "D-T28 a ts rerun whose version is already tagged here repairs on though the branch moved" "$(out handoff)" "false"
 SUBREPO="$WORK/sub-handoff"
 rm -rf "$SUBREPO"
 git init -q -b dev "$SUBREPO"
@@ -2135,14 +2151,9 @@ SUB_SHA=$(git -C "$SUBREPO" rev-parse HEAD)
 sub_handoff() { # <head> -> runs the subpackage handoff in SUBREPO at SUB_SHA
   (cd "$SUBREPO" && cp "$WORK/sub-handoff.sh" ./.h.sh && GH_HEAD="$1" GITHUB_SHA="$SUB_SHA" VERSION=v1.3.0-dev.4 DIR=web run_step_in .h.sh)
 }
-run_step_in() { # <script in cwd>: run_step's environment, in the current directory
-  : >"$WORK/out"
-  PATH="$PBIN:$BIN:$PATH" GITHUB_OUTPUT="$WORK/out" CI_TOOLS="$ROOT/scripts" GITHUB_REPOSITORY=owner/app READBACK_SLEEP=0 \
-    bash "$1" 2>&1 || echo "EXIT=$?"
-}
 out_h=$(sub_handoff "$C_DOCS")
 chk "D-T22 a subpackage with no root tag here hands off once the branch moved" "$(out handoff)" "true"
-chk_has "D-T22 and names the subpackage" "$out_h" "the run on the new head publishes web."
+chk_has "D-T22 and names the subpackage" "$out_h" "The run on the new head publishes web."
 sub_handoff "$SUB_SHA" >/dev/null
 chk "D-T23 a subpackage with no root tag and the branch still here publishes" "$(out handoff)" "false"
 git -C "$SUBREPO" tag v1.3.0-dev.4
