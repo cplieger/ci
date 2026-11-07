@@ -102,10 +102,6 @@ unleash:
     - '(^|/)metrics/metrics\.go$'  # prometheus counter registration, no logic
     - '(^|/)metrics/process\.go$'  # /proc parsing — needs Linux env to exercise
 
-    # Thin httputil adapters (already covered by cplieger/httpx tests)
-    - '(^|/)internal/httputil/httputil\.go$'
-    - '(^|/)internal/httpx/client\.go$'
-
     # SPA route registration (no business logic)
     - '^routes\.go$'
     - '(^|/)server/routes\.go$'
