@@ -466,7 +466,8 @@ def load_classify():
 
 def sync_inputs(repo: str, work: Path, classify=None) -> tuple[Path, Path]:
     """The sync-owned set and the repo's canonical sync copies, from classify-repos.py's
-    `sync_owned_patterns()` (globs) and `canonical_sources(repo)` ({dest: source path});
+    `sync_owned_patterns()` and `canonical_sources(repo)` ({dest: source path}): every
+    literal pattern, plus each glob narrowed to the canonical destinations it matches here;
     GhError when either cannot be read."""
     module = classify or load_classify()
     patterns = getattr(module, 'sync_owned_patterns', None)

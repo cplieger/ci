@@ -394,6 +394,8 @@ class EslintBaseDest(unittest.TestCase):
         # reach a sync.yml dest, where ` #` would cut it short.
         odd = ['go.mod', 'main.go', 'a #b/go.mod', 'a #b/x.go', 'a #b/web/package.json']
         self.assertEqual(load_classify().nested_halves(odd), [])
+        spaced = ['go.mod', 'main.go', 'a b/go.mod', 'a b/x.go', 'a b/web/package.json']
+        self.assertEqual(load_classify().nested_halves(spaced), [])
         groups = self.manifest({'oddname@HEAD': odd})
         self.assertNotIn('oddname', self.half_dests(groups))
 
