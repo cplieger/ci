@@ -297,6 +297,7 @@ printf 'package cli\n\nimport _ "embed"\n\n//go:embed manual.md\nvar Manual stri
 printf 'package cli\n\n//go:embed testonly.md\nvar t string\n' >"$EM/cli/x_test.go"
 printf 'module example.com/em/lane\n\ngo 1.26\n' >"$EM/lane/go.mod"
 printf 'package lane\n\nimport _ "embed"\n\n//go:embed README.md\nvar R string\n' >"$EM/lane/lane.go"
+printf 'package main\n\nimport _ "embed"\n\n//go:embed help.md\nvar help string\n' >"$EM/help.go"
 c "$EM" cli/manual.md "feat: initial (#1)"
 git -C "$EM" tag v1.0.0
 git -C "$EM" tag lane/v1.0.0
@@ -307,6 +308,7 @@ c "$EM" README.md "fix: reword the readme (#3)"
 c "$EM" cli/testonly.md "fix: reword a test fixture (#4)"
 c "$EM" cli/manual.md "docs: typo in the manual (#5)"
 c "$EM" lane/README.md "fix(lane): reword the lane readme (#6)"
+c "$EM" help.md "fix: reword the root help (#8)"
 c "$EM" cli/c.go "feat: add a command (#7)"
 rn "$EM" --repo owner/em --release-commit HEAD --site go --version v2.0.0 --go-lanes '["lane"]'
 expect "N18 an embedded file's commit is in the root's notes; an unembedded, test-only, docs or lane one is not" <<'EOF'
@@ -319,6 +321,10 @@ The help text changes
 ### Added
 
 - Add a command (#7)
+
+### Fixed
+
+- Reword the root help (#8)
 
 **Full changelog**: https://github.com/owner/em/compare/v1.0.0...v2.0.0
 EOF

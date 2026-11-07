@@ -1,34 +1,18 @@
 #!/usr/bin/env python3
-"""Which changed files a non-test //go:embed names, so they ship.
+"""Which changed files a non-test //go:embed names, so they ship though the
+release excludes call them docs (grelot's `grelot help` is an embedded .md).
 
-Usage: go-embeds.py <commit> < paths prints the paths on stdin a directive at
-<commit> names; path-significance.sh asks it about the changed paths its
-excludes drop. go-embeds.py --with-commits <range> [--include G]...
-[--exclude G]... [--config cliff.toml] prints, each followed by a NUL, the full message of every
-commit in <range> that git-cliff's own path filter would drop (every changed
-file matches an --exclude, or none matches an --include) though one of those
-files is embedded at the range's end. render-notes.sh and the version compute
-pass each back with --with-commit, with no sha: git-cliff 2.14.2 parses a
-`<sha> <message>` argument's message to the first newline only, which loses a
-BREAKING CHANGE footer. A doc or config file a Go
-build embeds ships in the binary (grelot's `grelot help` is an embedded
-manual.md). Each path is
-checked against the directives of the non-test .go files in its directory and
-in each parent up to the nearest go.mod, read from the commit's tree in two git
-calls (a dispatch run asks about every tracked file), with Go's
-rules (https://pkg.go.dev/embed): space-separated patterns, each optionally a
-quoted string and prefixed `all:`, matched element by element as path.Match
-does; a pattern naming a directory embeds its tree except names starting with
-`.` or `_`, unless `all:`. A file Go never builds (under testdata, vendor or a
-`.` or `_` name, or behind `//go:build ignore`) is skipped; other constraints
-are not evaluated, so a file any platform builds counts. A `//go:embed` line
-inside a raw string or a /* */ comment also counts, which can release a commit
-that ships nothing; reading Go's syntax would need a Go toolchain in detect. Exits 2 when git cannot read the tree.
+`go-embeds.py <commit> < paths` prints the paths a directive at <commit> names
+(path-significance.sh). `go-embeds.py --with-commits <range> [--include G]
+[--exclude G] [--config cliff.toml]` prints, NUL-separated, the message of each
+commit git-cliff's path filter drops though it changes an embedded file
+(compute.sh and render-notes.sh). Exits 2 when git cannot read the tree.
 """
 
 from __future__ import annotations
 
 import ast
+import functools
 import os
 import re
 import subprocess
@@ -156,16 +140,21 @@ def go_skips(name: str) -> bool:
 
 
 def glob_re(pattern: str) -> re.Pattern[str]:
-    """git-cliff's glob (Rust `glob`, require_literal_separator off): `**` and
-    `*` cross slashes, `?` is one character, and a pattern ending in `/` means
-    the directory's tree."""
+    """git-cliff's glob (Rust `glob`, require_literal_separator off): a `**/`
+    component matches zero or more directories, `**` and `*` otherwise cross
+    slashes, `?` is one character, and a pattern ending in `/` means the
+    directory's tree."""
     if pattern.endswith('/'):
         pattern += '**'
     pattern = pattern.removeprefix('./')
     out, i = [], 0
     while i < len(pattern):
         c = pattern[i]
-        if c == '*':
+        if pattern.startswith('**/', i) and (i == 0 or pattern[i - 1] == '/'):
+            # A `**` component matches zero or more directories.
+            out.append('(?:.*/)?')
+            i += 2
+        elif c == '*':
             out.append('.*')
             while i + 1 < len(pattern) and pattern[i + 1] == '*':
                 i += 1
@@ -178,9 +167,11 @@ def glob_re(pattern: str) -> re.Pattern[str]:
             else:
                 body = pattern[i + 1 : j]
                 neg = body.startswith('!')
-                out.append(
-                    f'[{"^" if neg else ""}{(body[1:] if neg else body).replace(chr(92), chr(92) * 2)}]'
-                )
+                body = (body[1:] if neg else body).replace('\\', '\\\\')
+                # Rust glob negates with `!` only; a leading `^` is a character.
+                if body.startswith('^'):
+                    body = '\\' + body
+                out.append(f'[{"^" if neg else ""}{body}]')
                 i = j
         else:
             out.append(re.escape(c))
@@ -188,8 +179,13 @@ def glob_re(pattern: str) -> re.Pattern[str]:
     return re.compile(''.join(out) + r'\Z')
 
 
-def embedded_at(commit: str, paths: list[str]) -> list[str]:
-    """The paths a non-test //go:embed at <commit> names."""
+@functools.cache
+def directives_at(commit: str) -> tuple[frozenset[str], dict[str, list[str]]]:
+    """The module directories and each directory's //go:embed patterns at
+    <commit>, read once: a file Go never builds is skipped (go_skips, or
+    `//go:build ignore`); other constraints are not evaluated, and a directive
+    line inside a raw string or a /* */ comment counts, either of which can
+    release a commit that ships nothing."""
     modules = {
         n.rsplit('/', 1)[0] if '/' in n else ''
         for n in git('ls-tree', '-r', '--name-only', commit).splitlines()
@@ -238,7 +234,14 @@ def embedded_at(commit: str, paths: list[str]) -> list[str]:
             continue
         d = name.rsplit('/', 1)[0] if '/' in name else ''
         directives.setdefault(d, []).extend(patterns(text.split('//go:embed', 1)[1]))
+    return frozenset(modules), directives
 
+
+def embedded_at(commit: str, paths: list[str]) -> list[str]:
+    """The paths a non-test //go:embed at <commit> names, by Go's rules
+    (https://pkg.go.dev/embed): a directive in a file's directory or a parent up
+    to the nearest go.mod."""
+    modules, directives = directives_at(commit)
     found = []
     for path in paths:
         parts = path.split('/')
@@ -254,7 +257,9 @@ def embedded_at(commit: str, paths: list[str]) -> list[str]:
 
 
 def with_commits(args: list[str]) -> int:
-    """The --with-commits mode; see the module docstring."""
+    """The --with-commits mode. Each message is printed whole, with no sha:
+    git-cliff 2.14.2 parses a `<sha> <message>` --with-commit only to the first
+    newline, which would lose a BREAKING CHANGE footer."""
     # Scope globs (--include, --exclude) say which lane a file belongs to; the
     # config's exclude_paths say which files are docs. git-cliff drops a commit
     # unless a changed file is in scope and not a doc; this keeps a dropped
@@ -269,9 +274,9 @@ def with_commits(args: list[str]) -> int:
         if flag == '--config':
             if os.path.exists(value):
                 with open(value, 'rb') as f:
-                    docs += [
-                        glob_re(g) for g in tomllib.load(f).get('git', {}).get('exclude_paths', [])
-                    ]
+                    cfg = tomllib.load(f).get('git', {})
+                docs += [glob_re(g) for g in cfg.get('exclude_paths', [])]
+                includes += [glob_re(g) for g in cfg.get('include_paths', [])]
         elif flag == '--include':
             includes.append(glob_re(value))
         else:

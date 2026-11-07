@@ -79,7 +79,7 @@ fi
 git fetch --tags --quiet origin 2>/dev/null || true
 
 err="$(mktemp)"
-trap 'rm -f "$err"' EXIT
+trap 'rm -f "$err" "$err.embeds"' EXIT
 
 nearest_tag() { # <regex> -> the tag matching it on the commit nearest HEAD, or nothing; fails when git cannot list the tags or walk HEAD
   local -A tag_at=()

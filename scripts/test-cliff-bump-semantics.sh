@@ -870,4 +870,16 @@ fc "$EB" lane/README.md "feat(lane)!: rewrite the lane readme"
 compute "$EB" dev lane
 assert_eq "$OUT_BASE" "lane/v2.0.0" "S16: and a lane reads its own embedded file"
 
+# The config's **/*.md matches a root file too, so an embedded root .md is the
+# same case one directory up.
+ER2=$(tb_fixture emb-bump-root)
+git -C "$ER2" checkout -q dev
+printf 'package main\n\nimport _ "embed"\n\n//go:embed help.md\nvar help string\n' >"$ER2/help.go"
+git -C "$ER2" add -A
+fc "$ER2" help.md "fix: add the root help"
+publish_main "$ER2"
+fc "$ER2" help.md "feat!: rewrite the root help"
+compute "$ER2" dev
+assert_eq "$OUT_BASE" "v2.0.0" "S16: a breaking change to an embedded root file alone is a major"
+
 echo "PASS: git-cliff $VERSION semantics match the release-gate contract"

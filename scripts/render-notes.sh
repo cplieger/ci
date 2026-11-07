@@ -169,13 +169,24 @@ render() {
     esac
   done
   embeds=$(mktemp)
+  # shellcheck disable=SC2064 # the path is fixed now
+  trap "rm -f '$embeds'" EXIT
   python3 "$(dirname "$0")/go-embeds.py" --with-commits "$range" "${scope[@]}" >"$embeds" \
     || die "cannot read the //go:embed directives over ${range}"
   while IFS= read -r -d '' msg; do
     with+=(--with-commit "$msg")
   done <"$embeds"
-  rm -f "$embeds"
-  changes=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" "${with[@]}" --strip header "$range")
+  if [ "${#with[@]}" -eq 0 ]; then
+    changes=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" --strip header "$range")
+  else
+    # git-cliff 2.14.2 adds --with-commit commits to its last release, an empty
+    # one after the tagged release, which renders as a second block; so the
+    # releases' commits are merged into the tagged one and rendered once.
+    local ctx
+    ctx=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" "${with[@]}" --context "$range")
+    changes=$(jq '[(map(select(.version != null)) | first // .[0]) + {commits: (map(.commits) | add)}]' <<<"$ctx" \
+      | "$CLIFF" "${CLIFF_ARGS[@]}" --from-context - --strip header)
+  fi
   if [ -n "$prev" ]; then
     changes+=$'\n\n'"**Full changelog**: https://github.com/${REPO}/compare/${prev}...${VERSION}"
     local inv=(diff --git-dir . --from "$prev" --to "$commit" --lane "${LANE:-.}" --format markdown)
