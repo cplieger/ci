@@ -4,15 +4,18 @@ release excludes call them docs (grelot's `grelot help` is an embedded .md).
 
 `go-embeds.py <commit> < paths` prints the paths a directive at <commit> names
 (path-significance.sh). `go-embeds.py --with-commits <range> [--include G]
-[--exclude G] [--config cliff.toml]` prints, NUL-separated, the message of each
-commit git-cliff's path filter drops though it changes an embedded file
-(compute.sh and render-notes.sh). Exits 2 when git cannot read the tree.
+[--exclude G] [--config cliff.toml] [--positions FILE]` prints, NUL-separated
+and oldest first, the message of each commit git-cliff's path filter drops
+though it changes an embedded file (compute.sh and render-notes.sh); FILE gets
+each commit's index in the range, by sha and by printed message. Exits 2 when
+git cannot read the tree.
 """
 
 from __future__ import annotations
 
 import ast
 import functools
+import json
 import os
 import re
 import subprocess
@@ -259,19 +262,23 @@ def embedded_at(commit: str, paths: list[str]) -> list[str]:
 def with_commits(args: list[str]) -> int:
     """The --with-commits mode. Each message is printed whole, with no sha:
     git-cliff 2.14.2 parses a `<sha> <message>` --with-commit only to the first
-    newline, which would lose a BREAKING CHANGE footer."""
+    newline, which would lose a BREAKING CHANGE footer. Such a commit has an
+    empty id in git-cliff's context, so --positions also keys each one by its
+    message, for render-notes.sh to sort the release in the range's order."""
     # Scope globs (--include, --exclude) say which lane a file belongs to; the
     # config's exclude_paths say which files are docs. git-cliff drops a commit
     # unless a changed file is in scope and not a doc; this keeps a dropped
     # one when a file in scope is a doc a directive embeds.
-    rng, includes, scope_out, docs = args[0], [], [], []
+    rng, includes, scope_out, docs, positions = args[0], [], [], [], None
     rest = iter(args[1:])
     for flag in rest:
         value = next(rest, None)
-        if flag not in ('--include', '--exclude', '--config') or value is None:
+        if flag not in ('--include', '--exclude', '--config', '--positions') or value is None:
             sys.stderr.write(f'go-embeds: unexpected argument {flag!r}\n')
             return 2
-        if flag == '--config':
+        if flag == '--positions':
+            positions = value
+        elif flag == '--config':
             if os.path.exists(value):
                 with open(value, 'rb') as f:
                     cfg = tomllib.load(f).get('git', {})
@@ -282,7 +289,9 @@ def with_commits(args: list[str]) -> int:
         else:
             scope_out.append(glob_re(value))
     end = rng.split('..')[-1]
-    for sha in git('rev-list', '--no-merges', rng).split():
+    at: dict[str, dict[str, int]] = {'commits': {}, 'messages': {}}
+    for i, sha in enumerate(git('rev-list', '--reverse', '--no-merges', rng).split()):
+        at['commits'][sha] = i
         files = git('diff-tree', '--root', '--no-commit-id', '--name-only', '-r', '-z', sha).split(
             '\0'
         )
@@ -296,7 +305,12 @@ def with_commits(args: list[str]) -> int:
         if not scoped or any(not any(r.match(f) for r in docs) for f in scoped):
             continue
         if embedded_at(end, scoped):
-            sys.stdout.write(git('log', '-1', '--format=%B', sha).strip() + '\0')
+            message = git('log', '-1', '--format=%B', sha).strip()
+            at['messages'].setdefault(message, i)
+            sys.stdout.write(message + '\0')
+    if positions:
+        with open(positions, 'w') as f:
+            json.dump(at, f)
     return 0
 
 

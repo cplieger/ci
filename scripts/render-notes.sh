@@ -161,7 +161,7 @@ render() {
   # A commit the path filter drops that changes a file a non-test //go:embed
   # names ships, so its line belongs here (go-embeds.py; compute.sh counts it).
   local -a with=() scope=(--config "${CONFIG:-${GIT_CLIFF_CONFIG:-cliff.toml}}")
-  local msg i embeds
+  local msg i embeds order
   for ((i = 0; i < ${#SCOPE_ARGS[@]}; i += 2)); do
     case "${SCOPE_ARGS[$i]}" in
       --include-path) scope+=(--include "${SCOPE_ARGS[$((i + 1))]}") ;;
@@ -169,9 +169,10 @@ render() {
     esac
   done
   embeds=$(mktemp)
-  # shellcheck disable=SC2064 # the path is fixed now
-  trap "rm -f '$embeds'" EXIT
-  python3 "$(dirname "$0")/go-embeds.py" --with-commits "$range" "${scope[@]}" >"$embeds" \
+  order=$(mktemp)
+  # shellcheck disable=SC2064 # the paths are fixed now
+  trap "rm -f '$embeds' '$order'" EXIT
+  python3 "$(dirname "$0")/go-embeds.py" --with-commits "$range" "${scope[@]}" --positions "$order" >"$embeds" \
     || die "cannot read the //go:embed directives over ${range}"
   while IFS= read -r -d '' msg; do
     with+=(--with-commit "$msg")
@@ -181,10 +182,15 @@ render() {
   else
     # git-cliff 2.14.2 adds --with-commit commits to its last release, an empty
     # one after the tagged release, which renders as a second block; so the
-    # releases' commits are merged into the tagged one and rendered once.
+    # releases' commits are merged into the tagged one, sorted back into the
+    # range's order (a --with-commit commit has an empty id, so it is found by
+    # its message), and rendered once.
     local ctx
     ctx=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" "${with[@]}" --context "$range")
-    changes=$(jq '[(map(select(.version != null)) | first // .[0]) + {commits: (map(.commits) | add)}]' <<<"$ctx" \
+    changes=$(jq --slurpfile at "$order" '
+      (map(select(.version != null)) + map(select(.version == null))) as $r
+      | [$r[0] + {commits: ($r | map(.commits) | add
+          | sort_by(if .id != "" then $at[0].commits[.id] else $at[0].messages[.raw_message] end // 1e9))}]' <<<"$ctx" \
       | "$CLIFF" "${CLIFF_ARGS[@]}" --from-context - --strip header)
   fi
   if [ -n "$prev" ]; then

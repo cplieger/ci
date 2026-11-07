@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Probe for scripts/render-notes.sh against the pinned git-cliff and the synced
-# cliff config: states N1 to N17 pin the explicit-range notes with their
-# dependency and system-package parts.
+# cliff config: states N1 to N19 pin the explicit-range notes, their
+# dependency and system-package parts, and the embedded files' lines.
 # CLIFF_BIN=/path/to/git-cliff skips the download.
 # shellcheck disable=SC2016 # the expected notes carry literal markdown backticks
 set -euo pipefail
@@ -335,6 +335,30 @@ expect "N18 and the lane's notes take its own embedded file" <<'EOF'
 - Reword the lane readme (#6)
 
 **Full changelog**: https://github.com/owner/em/compare/lane/v1.0.0...lane/v1.0.1
+EOF
+
+# Embedded lines reach git-cliff as --with-commit commits in a release of their
+# own; the merged section keeps the range's order, as a direct render would.
+EO="$WORK/embedded-order"
+new_repo "$EO"
+printf 'module example.com/eo\n\ngo 1.26\n' >"$EO/go.mod"
+printf 'package main\n\nimport _ "embed"\n\n//go:embed help.md\nvar help string\n' >"$EO/help.go"
+c "$EO" main.go "feat: initial (#1)"
+git -C "$EO" tag v1.0.0
+c "$EO" main.go "fix: one, kept (#2)"
+c "$EO" help.md "fix: two, embedded (#3)"
+c "$EO" help.md "fix: three, embedded (#4)"
+c "$EO" main.go "fix: four, kept (#5)"
+rn "$EO" --repo owner/eo --release-commit HEAD --site go --version v1.0.1
+expect "N19 embedded lines keep the range's order among the kept ones" <<'EOF'
+### Fixed
+
+- One, kept (#2)
+- Two, embedded (#3)
+- Three, embedded (#4)
+- Four, kept (#5)
+
+**Full changelog**: https://github.com/owner/eo/compare/v1.0.0...v1.0.1
 EOF
 
 refused "N12a an unstable version" "is not a stable version of this lane" "$T" "${TB[@]}" --site go --version v2.0.0-dev.1 --out "$WORK/out"
