@@ -5,8 +5,10 @@ The manifest (.github/sync.yml) goes to stdout, per-repo diagnostics to stderr.
 A two-branch repo (release_channels.is_two_branch) is classified once per base
 from that base's tree and its groups carry `base:`; every other repo from HEAD.
 
-Importable: `sync_owned_patterns()` is every path the sync can write, as globs, and
-`canonical_sources(repo)` maps each of `repo`'s paths to its source here.
+Importable: `sync_owned_patterns()` is every path the sync can write, as globs,
+`canonical_sources(repo)` maps each of `repo`'s paths to its source here, and
+`classify_tree(tree, releasing=)` with `synced_dests(profile, releasing=)` give a
+local tree's profile and the paths the sync writes into it, reading no API.
 
 Failure model: the repo listing aborts on an error, a timeout or the page cap;
 an unreadable tree drops that repo (or base) from every group; a failed
@@ -349,14 +351,20 @@ def nested_halves(tree):
 
 
 def classify(repo, ref='HEAD', *, releasing=False):
-    """Profile the repo's surfaces and language from its tree at `ref`, read once.
+    """Profile the repo from its tree at `ref`, read once (classify_tree)."""
+    return classify_tree(tree_paths(repo, ref) or [], releasing=releasing)
 
-    A root check is an exact-path match against the recursive listing; the
-    cliff tier is read separately (cliff_tier). A `releasing` (two-branch) base
-    with no root go.mod is Go when it holds nested modules, because the release
-    pipeline ships them as lanes; elsewhere a root-less repo keeps its own CI.
+
+def classify_tree(tree, *, releasing=False):
+    """Profile a repo's surfaces and language from `tree`, every path of its git
+    tree with the directories among them (the recursive trees listing). Reads
+    no API, so fleet tooling classifies a local clone the way the sync does.
+
+    A root check is an exact-path match against the listing; the cliff tier is
+    read separately (cliff_tier). A `releasing` (two-branch) base with no root
+    go.mod is Go when it holds nested modules, because the release pipeline
+    ships them as lanes; elsewhere a root-less repo keeps its own CI.
     """
-    tree = tree_paths(repo, ref) or []
     has_gomod = 'go.mod' in tree
     has_jsr = 'jsr.json' in tree
     has_pkg = 'package.json' in tree
@@ -420,6 +428,23 @@ def classify(repo, ref='HEAD', *, releasing=False):
         'has_dockerfile': has_dockerfile,
         'has_publish': has_publish,  # own publish.yaml -> meta CI without release.yaml
     }
+
+
+def synced_dests(profile, *, releasing):
+    """Every path the sync writes into a repo of `profile`, sorted: the dests of
+    each group assign() puts it in, the TypeScript configs placed by its
+    ts_dirs, and on a `releasing` base the two-branch Renovate delta. Both cliff
+    tiers write cliff.toml, so a profile with no cliff_tier reads as stable."""
+    profile = {'cliff_tier': 'stable', **profile}
+    groups = assign(['repo'], {'repo': profile}, releasing)
+    if releasing:
+        groups['two_branch_renovate'] = ['repo']
+    dests = set()
+    for key, group in GROUPS:
+        if groups[key]:
+            chosen = ts_config_group(profile['ts_dirs']) if key == 'ts_config' else group
+            dests.update(dest for _source, dest in pairs(chosen))
+    return sorted(dests)
 
 
 def log_profile(repo, profile, base=None):

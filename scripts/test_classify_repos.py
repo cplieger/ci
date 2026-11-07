@@ -846,6 +846,84 @@ class SyncOwnedSet(unittest.TestCase):
                 self.assertEqual(seen.setdefault(dest, source), source, dest)
 
 
+class LocalTree(unittest.TestCase):
+    """classify_tree and synced_dests answer from a tree listing alone, as a local clone
+    gives one, and agree with the manifest the API-read classification prints."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.classify = load_classify()
+
+    def test_the_tree_classifier_is_what_classify_reads(self):
+        tree = ['go.mod', 'main.go', 'web', 'web/package.json', 'Dockerfile']
+        with unittest.mock.patch.object(self.classify, 'tree_paths', return_value=tree):
+            for releasing in (False, True):
+                self.assertEqual(
+                    self.classify.classify('x', releasing=releasing),
+                    self.classify.classify_tree(tree, releasing=releasing),
+                )
+        with unittest.mock.patch.object(self.classify, 'api_json', side_effect=AssertionError):
+            self.classify.classify_tree(tree)
+
+    def test_a_single_branch_go_library_gets_ci_and_lint_but_no_release(self):
+        profile = self.classify.classify_tree(['go.mod', 'lib.go'])
+        dests = self.classify.synced_dests(profile, releasing=False)
+        self.assertIn('.github/workflows/ci.yaml', dests)
+        self.assertIn('.golangci.yaml', dests)
+        for absent in ('.github/workflows/release.yaml', 'cliff.toml', 'renovate.json'):
+            self.assertNotIn(absent, dests)
+
+    def test_a_two_branch_module_repo_gets_release_renovate_and_the_half_bases(self):
+        tree = ['README.md', 'a', 'a/go.mod', 'a/a.go', 'b', 'b/go.mod', 'b/b.go']
+        tree += ['b/web', 'b/web/package.json', 'b/web/go.mod']
+        profile = self.classify.classify_tree(tree, releasing=True)
+        dests = self.classify.synced_dests(profile, releasing=True)
+        for present in (
+            '.github/workflows/release.yaml',
+            'cliff.toml',
+            'renovate.json',
+            'b/web/eslint.config.base.mjs',
+            '.prettierrc.json',
+        ):
+            self.assertIn(present, dests)
+        self.assertNotIn('eslint.config.base.mjs', dests)
+        self.assertEqual(
+            self.classify.synced_dests(self.classify.classify_tree(tree), releasing=False), []
+        )
+
+    def test_a_publishing_repo_gets_the_artifact_ci(self):
+        profile = self.classify.classify_tree(['data.json', '.github/workflows/publish.yaml'])
+        dests = self.classify.synced_dests(profile, releasing=True)
+        artifact = sorted(dest for _s, dest in self.classify.pairs(self.classify.ARTIFACT_CI))
+        self.assertTrue(set(artifact) <= set(dests), (artifact, dests))
+        self.assertNotIn('.github/workflows/release.yaml', dests)
+
+    def test_the_dests_match_the_manifest(self):
+        rc, out, err, _calls = run_classify(SCRIPTS / 'classify-repos.py', two_branch_fixture())
+        self.assertEqual(rc, 0, err)
+        fx = two_branch_fixture()
+        for name, branch in ((r['name'], r.get('default_branch')) for r in fx['repos']):
+            base = 'dev' if branch == 'dev' else None
+            key = f'{name}@{base or "HEAD"}'
+            if name == 'ci' or key not in fx['trees']:
+                continue
+            tree = fx['trees'][key]
+            want = sorted(
+                (entry if isinstance(entry, str) else entry['dest'])
+                for group in yaml.safe_load(out)['group']
+                if name in [r.split('/')[-1] for r in group['repos'].split()]
+                and group.get('base') == base
+                for entry in group['files']
+            )
+            profile = self.classify.classify_tree(tree, releasing=base is not None)
+            profile['cliff_tier'] = 'stable'
+            self.assertEqual(
+                self.classify.synced_dests(profile, releasing=base is not None),
+                sorted(set(want)),
+                name,
+            )
+
+
 class Consumers(unittest.TestCase):
     """The main intake and the promotion read the set from this module."""
 
