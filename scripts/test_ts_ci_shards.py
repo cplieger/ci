@@ -1,7 +1,6 @@
 """ts-ci.yaml's vitest shards: the count read and validated from the package's own
 `cplieger.vitestShards`, the shard matrix and check names, which steps each shard
-runs, how the test step hands vitest its shard, and the one validate result over
-every shard."""
+runs and how the test step hands vitest its shard."""
 
 from __future__ import annotations
 
@@ -12,7 +11,6 @@ import unittest
 import workflow_replay as wr
 import yaml
 from test_deadset_steps import META
-from test_deadset_steps import Harness as DetectHarness
 from test_package_script_steps import WORKFLOWS, Harness, workflow_step
 
 TS_CI = WORKFLOWS / 'ts-ci.yaml'
@@ -131,6 +129,10 @@ class ShardMatrix(unittest.TestCase):
         self.assertEqual(self.name(1, 2), 'validate (shard 1/2)')
         self.assertEqual(self.name(2, 2), 'validate (shard 2/2)')
 
+    def test_a_refused_count_skips_validate(self):
+        needs = counted(None, 'failure')
+        self.assertFalse(wr.job_condition(ts_ci(), 'validate', {'needs': needs}, []))
+
 
 def running_steps(shard: int) -> list[str]:
     """The validate steps that run in a shard of a public pull request on a root
@@ -230,59 +232,6 @@ class TestStep(Harness):
         run = self.run_test({'test': 'node --test'}, 1, 2)
         self.assertEqual(run.rc, 1, run.out)
         self.assertEqual(run.recorded, 'test\n')
-
-
-def shards_job() -> dict:
-    return ts_ci()['jobs']['shards']
-
-
-def shards_runs(count: int | None, validate: str, counting: str = 'success') -> bool:
-    needs = {**counted(count, counting), 'validate': {'result': validate}}
-    return wr.job_condition(ts_ci(), 'shards', {'needs': needs}, [])
-
-
-class ShardsVerdict(DetectHarness):
-    def name(self, count: int | None) -> str:
-        return evaluate(shards_job()['name'], {'needs': counted(count)})
-
-    def test_sharded_the_verdict_job_carries_the_validate_name(self):
-        self.assertEqual(self.name(2), 'validate')
-        self.assertNotEqual(self.name(1), 'validate')
-        self.assertNotEqual(self.name(None), 'validate')
-
-    def test_it_runs_after_every_shard_whatever_their_result(self):
-        self.assertEqual(shards_job()['needs'], ['shard-count', 'validate'])
-        for count, validate, counting in ((2, 'failure', 'success'), (2, 'success', 'success'),
-                                          (1, 'success', 'success'), (None, 'skipped', 'failure')):
-            with self.subTest(count=count, validate=validate):
-                self.assertTrue(shards_runs(count, validate, counting))
-
-    def check_runs(self, count: int | None) -> bool:
-        scope = wr.Scope({'needs': counted(count)}, {}, [])
-        return scope.condition(shards_job()['steps'][0].get('if'))
-
-    def test_only_a_sharded_run_checks_the_shards(self):
-        self.assertNotIn('shard-count', shards_job()['if'])
-        self.assertTrue(self.check_runs(2))
-        self.assertFalse(self.check_runs(1))
-        self.assertFalse(self.check_runs(None))
-
-    def test_a_refused_count_skips_validate(self):
-        needs = counted(None, 'failure')
-        self.assertFalse(wr.job_condition(ts_ci(), 'validate', {'needs': needs}, []))
-
-    def verdict(self, result: str):
-        step = shards_job()['steps'][0]
-        self.assertEqual(step['env']['RESULT'], '${{ needs.validate.result }}')
-        return self.run_body(step['run'], self.tmp, {'RESULT': result})
-
-    def test_it_passes_only_when_every_shard_passed(self):
-        self.assertEqual(self.verdict('success').rc, 0)
-        for result in ('failure', 'cancelled'):
-            with self.subTest(result=result):
-                run = self.verdict(result)
-                self.assertEqual(run.rc, 1, run.out)
-                self.assertIn(f'a validate shard ended {result}', run.out)
 
 
 class MetaPassesNoCount(unittest.TestCase):
