@@ -466,7 +466,8 @@ def load_classify():
 
 def sync_inputs(repo: str, work: Path, classify=None) -> tuple[Path, Path]:
     """The sync-owned set and the repo's canonical sync copies, from classify-repos.py's
-    `sync_owned_patterns()` (globs) and `canonical_sources(repo)` ({dest: source path});
+    `sync_owned_patterns()` and `canonical_sources(repo)` ({dest: source path}): every
+    literal pattern, plus each glob narrowed to the canonical destinations it matches here;
     GhError when either cannot be read."""
     module = classify or load_classify()
     patterns = getattr(module, 'sync_owned_patterns', None)
@@ -481,8 +482,16 @@ def sync_inputs(repo: str, work: Path, classify=None) -> tuple[Path, Path]:
         mapping = sources(repo)
     except failure as err:
         raise GhError(f'classify-repos.py: {err}') from None
+    # A glob (a module half's ESLint base) owns only the paths the sync writes
+    # in this repo, so a hand copy elsewhere under it stays the repo's.
+    listed = patterns()
+    globs = [inventory.glob_pattern(p) for p in listed if '*' in p]
+    narrowed = [p for p in listed if '*' not in p]
+    narrowed += sorted(
+        d for d in mapping if d not in narrowed and any(g.fullmatch(d) for g in globs)
+    )
     owned = work / 'sync-owned.txt'
-    owned.write_text(''.join(f'{p}\n' for p in patterns()))
+    owned.write_text(''.join(f'{p}\n' for p in narrowed))
     canonical = work / 'canonical'
     shutil.rmtree(canonical, ignore_errors=True)
     canonical.mkdir(parents=True)
