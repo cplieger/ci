@@ -60,6 +60,11 @@ class Expressions(unittest.TestCase):
         with self.assertRaises(wr.ReplayError):
             ev('hashFiles(a)', a={})
 
+    def test_format_past_its_arguments_is_refused(self):
+        self.assertEqual(ev("format('{{{0}}}-{1}', 'a', 'b')"), '{a}-b')
+        with self.assertRaisesRegex(wr.ReplayError, 'no argument 1'):
+            ev("format('{0}-{1}', 'a')")
+
     def test_render_whole_and_embedded(self):
         scope = wr.Scope({'a': {'v': True, 'w': 'x'}}, {}, [])
         self.assertEqual(scope.render('${{ a.v }}'), 'true')
