@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Regression probe for the shell semantics release.yaml and ci.yaml embed
 # inline: nested-Go-module lanes (release.yaml detect and go-nested, ci.yaml's
-# nested validation discovery) and ci.yaml's web-frontend probe. A snippet not
-# extracted below is MIRRORED, so editing either side updates the other in the
-# same change. Runs in the ci repo's `scripts` CI job (opt-in by file presence).
+# nested validation discovery), ci.yaml's web-frontend probe and its go-os
+# runner detection. A snippet not extracted below is MIRRORED, so editing
+# either side updates the other in the same change. Runs in the ci repo's
+# `scripts` CI job (opt-in by file presence).
 set -euo pipefail
 
 # Hermetic git, same rationale as test-cliff-bump-semantics.sh: a global
@@ -89,9 +90,10 @@ discover_ci() {
   echo "$DIRS"
 }
 
-# release.yaml detect/changes and ci.yaml's web-frontend probe loop are
-# EXTRACTED and executed: the classification reads git tags and diffs a mirror
-# could only fake, and a mirrored folder list would pass after ci.yaml's changed.
+# release.yaml detect/changes, ci.yaml's web-frontend probe loop and its go-os
+# block are EXTRACTED and executed: the classification reads git tags and diffs
+# a mirror could only fake, and a mirrored folder list or file rule would pass
+# after ci.yaml's changed.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RELEASE_YAML="$ROOT/.github/workflows/release.yaml"
 CI_YAML="$ROOT/.github/workflows/ci.yaml"
@@ -108,6 +110,10 @@ lines = next(s for s in jobs["detect"]["steps"] if s.get("name") == "Detect repo
 start = next(i for i, l in enumerate(lines) if l.strip().startswith("# Probe known nested web-frontend locations"))
 end = next(i for i in range(start, len(lines)) if lines[i].strip() == "done")
 open(f"{out}/web-probe.sh", "w").write(textwrap.dedent("\n".join(lines[start : end + 1])) + "\n")
+
+start = next(i for i, l in enumerate(lines) if l.strip().startswith("# A module tracking a Go file built for windows or darwin"))
+end = next(i for i in range(start, len(lines)) if lines[i].strip().startswith("go_os_matrix=$(jq -c 'unique_by"))
+open(f"{out}/go-os.sh", "w").write(textwrap.dedent("\n".join(lines[start : end + 1])) + "\n")
 PY
 classify() { # <channel> <anchor> <head> -> root=<bool> lanes=<json>; env SUBPACKAGES_JSON GO_LANES_JSON; run in a repo
   : >"$WORK/out"
@@ -239,6 +245,141 @@ chk "L-W4 a jsr.json alone marks the frontend" \
 mkweb bare internal/webui/static-src/app.ts
 chk "L-W3 a folder with neither package.json nor jsr.json is no frontend" \
   "$(web_probe "$W")" "web_dir= run_web=false"
+
+# ── go-os runner detection states ────────────────────────────────────────────
+# Expected rows follow Go's build constraints (go help buildconstraint): a file
+# name whose part before the first dot ends _GOOS, _GOOS_GOARCH with a known
+# GOARCH, or either plus _test, or a //go:build line above the package clause
+# naming the OS outside an odd number of negations; Go ignores a name starting
+# with _ or . below the module folder (go help packages). mod_dirs is MIRRORED from
+# ci.yaml's detect (nested validation discovery plus the root go.mod).
+# The block runs in a fresh bash with the runner's options (bash -eo pipefail),
+# because a command substitution here would run it with errexit off.
+cat >"$WORK/go-os-run.sh" <<'SH'
+mod_dirs=$1
+go_os_matrix="[]"
+# shellcheck source=/dev/null
+. "$2"
+jq -r 'sort_by([.dir, .runner]) | map("\(.dir)=\(.runner)") | join(" ")' <<<"$go_os_matrix"
+SH
+os_rows() { # sets rows to <dir>=<runner>... for the repo at $R
+  local mod_dirs
+  mod_dirs=$(cd "$R" && discover_ci | jq -r '.[]')
+  if [ -f "$R/go.mod" ]; then mod_dirs=$(printf '.\n%s' "$mod_dirs"); fi
+  rows=$(cd "$R" && bash -eo pipefail "$WORK/go-os-run.sh" "$mod_dirs" "$WORK/go-os.sh") \
+    || fail "ci.yaml's go-os block failed in $R"
+}
+commit_all() {
+  git -C "$R" add -A
+  git -C "$R" commit -qm init
+}
+
+mkrepo goos
+put go.mod "module github.com/cplieger/goos" "go 1.26.5"
+put root.go "package goos"
+put root_darwin.go "package goos"
+put win/go.mod "module github.com/cplieger/goos/win" "go 1.26.5"
+put win/w_windows.go "package win"
+put win/sub/deep_windows.go "package sub"
+put mac/go.mod "module github.com/cplieger/goos/mac" "go 1.26.5"
+put mac/m.go "package mac"
+put mac/m_darwin_test.go "package mac"
+put arch/go.mod "module github.com/cplieger/goos/arch" "go 1.26.5"
+put arch/a.go "package arch"
+put arch/a_windows_arm64.go "package arch"
+put archtest/go.mod "module github.com/cplieger/goos/archtest" "go 1.26.5"
+put archtest/a.go "package archtest"
+put archtest/a_darwin_arm64_test.go "package archtest"
+put tag/go.mod "module github.com/cplieger/goos/tag" "go 1.26.5"
+put tag/t.go "//go:build windows" "" "package tag"
+put both/go.mod "module github.com/cplieger/goos/both" "go 1.26.5"
+put both/b.go "//go:build (darwin && arm64) || windows" "" "package both"
+commit_all
+os_rows
+chk "L-O1 each module gets the runner of the OS files it tracks; a nested module's file stays its own" \
+  "$rows" \
+  ".=macos-latest arch=windows-latest archtest=macos-latest both=macos-latest both=windows-latest mac=macos-latest tag=windows-latest win=windows-latest"
+
+mkrepo goos-none
+put go.mod "module github.com/cplieger/none" "go 1.26.5"
+put main.go "package main"
+put main_linux.go "package main"
+put main_test.go "package main"
+put windows.go "package main"
+put str.go "package main" "" 'const s = "//go:build windows"'
+put raw.go "package main" "" 'const r = `' "//go:build windows" '`'
+put x_windows_helper.go "package main"
+put x_darwin_cgo_test.go "package main"
+put b.c_windows.go "package main"
+put _x_windows.go "package main"
+put .y_darwin.go "package main"
+put _h.go "//go:build windows" "" "package main"
+put _gen/g_windows.go "package gen"
+put sub/_z_windows.go "package sub"
+put p/.cache/c.go "//go:build darwin" "" "package cache"
+commit_all
+os_rows
+chk "L-O2 no OS-named file or header constraint: no OS leg" "$rows" ""
+
+mkrepo goos-cut
+put go.mod "module github.com/cplieger/cut" "go 1.26.5"
+put main.go "package main"
+put x_windows.pb.go "package main"
+put static/s_darwin.go "package static"
+put dist/d.go "//go:build windows" "" "package dist"
+put _tools/go.mod "module github.com/cplieger/cut/tools" "go 1.26.5"
+put _tools/t_darwin.go "package tools"
+commit_all
+os_rows
+chk "L-O6 Go's name cut at the first dot, static and dist trees, and a module in a _ folder" \
+  "$rows" ".=macos-latest .=windows-latest _tools=macos-latest"
+
+mkrepo goos-negated
+put go.mod "module github.com/cplieger/negated" "go 1.26.5"
+put n.go "//go:build !windows" "" "package negated"
+put o.go "//go:build !(linux || darwin || windows)" "" "package negated"
+put k.go "//go:build unix && !darwin" "" "package negated"
+put l.go "//go:build linux && !(freebsd || (darwin && arm64))" "" "package negated"
+commit_all
+os_rows
+chk "L-O3 an OS named only under negation gains no leg" "$rows" ""
+
+mkrepo goos-vendored
+put go.mod "module github.com/cplieger/vendored" "go 1.26.5"
+put main.go "package main"
+put vendor/x/v_windows.go "package x"
+put vendor/q/q.go "//go:build darwin" "" "package q"
+put testdata/t_windows.go "package t"
+put node_modules/y/go.mod "module github.com/vendored/y" "go 1.0"
+put node_modules/y/y_darwin.go "package y"
+commit_all
+os_rows
+chk "L-O4 vendored and testdata trees gain no leg" "$rows" ""
+
+mkrepo goos-orphan
+put tool/go.mod "module github.com/cplieger/orphan/tool" "go 1.26.5"
+put tool/t.go "package tool"
+put tool/t_darwin.go "package tool"
+put hack/x_windows.go "package hack"
+commit_all
+put tool/u_windows.go "package tool"
+os_rows
+chk "L-O5 a file under no module, or untracked, gains no leg" "$rows" "tool=macos-latest"
+
+# go_build_positive_terms decides polarity alone; each expression pins one rule.
+awk '/^go_build_positive_terms\(\) \{/,/^}/' "$WORK/go-os.sh" >"$WORK/positive-terms.sh"
+[ -s "$WORK/positive-terms.sh" ] || fail "go_build_positive_terms not found in ci.yaml's go-os block"
+# shellcheck source=/dev/null
+. "$WORK/positive-terms.sh"
+positive() { go_build_positive_terms "$1" | sort | paste -sd' ' -; }
+chk "L-P1 a bare term" "$(positive 'windows')" "windows"
+chk "L-P2 a negated term" "$(positive '!windows')" ""
+chk "L-P3 a double negation" "$(positive '!!windows')" "windows"
+chk "L-P4 an alternation" "$(positive 'linux || darwin')" "darwin linux"
+chk "L-P5 a negated group" "$(positive '!(linux || darwin)')" ""
+chk "L-P6 a negation inside a negated group" "$(positive '!(!windows)')" "windows"
+chk "L-P7 nested groups" "$(positive 'a && !(b || !(c && darwin))')" "a c darwin"
+chk "L-P8 a version term" "$(positive 'go1.21 && windows')" "go1.21 windows"
 
 # ── Classification states ────────────────────────────────────────────────────
 # No lane carries a tag yet, so every lane is judged on the root range: its
@@ -380,4 +521,4 @@ LANE_ARGS=()
 set -- git-cliff --unreleased --tag v1.2.3 "${LANE_ARGS[@]}" --strip header
 chk "L-F4 empty LANE_ARGS contributes zero argv words" "$#" "6"
 
-echo "PASS: nested-module lane and web-probe shell semantics match the pinned contract (${PASS} checks)"
+echo "PASS: nested-module lane, web-probe and go-os detection shell semantics match the pinned contract (${PASS} checks)"
