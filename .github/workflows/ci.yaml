@@ -340,9 +340,6 @@ jobs:
     with:
       working-directory: ${{ needs.detect.outputs.web_dir }}
       web-lint: true
-      # A web suite too long for one runner splits into vitest shards. Drop a
-      # repository once one runner fits its suite again.
-      vitest-shards: ${{ github.event.repository.name == 'marotte' && 2 || 1 }}
 
   ts-nested:
     needs: detect

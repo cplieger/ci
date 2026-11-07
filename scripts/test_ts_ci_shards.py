@@ -1,6 +1,7 @@
-"""ts-ci.yaml's vitest-shards input: the shard matrix and check names, which steps
-each shard runs, how the test step hands vitest its shard, the one validate
-result over every shard, and the meta ci.yaml's per-repository shard count."""
+"""ts-ci.yaml's vitest shards: the count read and validated from the package's own
+`cplieger.vitestShards`, the shard matrix and check names, which steps each shard
+runs, how the test step hands vitest its shard, and the one validate result over
+every shard."""
 
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from test_deadset_steps import Harness as DetectHarness
 from test_package_script_steps import WORKFLOWS, Harness, workflow_step
 
 TS_CI = WORKFLOWS / 'ts-ci.yaml'
+READ_STEP = 'Read cplieger.vitestShards'
 
 # Logs the arguments vitest received, so a test sees what reached it.
 VITEST_STUB = """#!/usr/bin/env bash
@@ -33,41 +35,101 @@ def evaluate(template: str, contexts: dict):
     return wr.Scope(contexts, {}, []).evaluate(whole.group(1))
 
 
-def shard_list(count) -> list | None:
-    matrix = ts_ci()['jobs']['validate']['strategy']['matrix']['shard']
-    return evaluate(matrix, {'inputs': {'vitest-shards': count}})
+def counted(count: int | None, result: str = 'success') -> dict:
+    """The needs context for the shard-count job: outputs as the read step writes
+    them, or none when it failed."""
+    outputs = {} if count is None else {'count': str(count), 'shards': json.dumps(list(range(1, count + 1)))}
+    return {'shard-count': {'result': result, 'outputs': outputs}}
 
 
-def validate_name(shard: int, count: int) -> str:
-    name = ts_ci()['jobs']['validate']['name']
-    return evaluate(name, {'inputs': {'vitest-shards': count}, 'matrix': {'shard': shard}})
+class ShardCount(Harness):
+    STEP = workflow_step(TS_CI, 'shard-count', READ_STEP)
+
+    def read(self, manifest: object | None = None, *, raw: str | None = None):
+        if raw is not None:
+            (self.pkg / 'package.json').write_text(raw)
+        elif manifest is not None:
+            (self.pkg / 'package.json').write_text(json.dumps(manifest))
+        return self.run_step({'READ_COUNT': self.STEP['env']['READ_COUNT'], 'PACKAGE': './package.json'})
+
+    def assert_refused(self, run, message: str):
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn(message, run.out)
+        self.assertEqual(run.outputs, {})
+        self.assertEqual([line for line in run.out.splitlines() if line.startswith('::')], [run.out.strip()])
+
+    def test_the_step_reads_the_working_directory_package(self):
+        self.assertEqual(self.STEP['env']['PACKAGE'], '${{ inputs.working-directory }}/package.json')
+        self.assertNotIn('defaults', ts_ci()['jobs']['shard-count'])
+
+    def test_a_package_without_the_field_runs_one_shard(self):
+        for manifest in ({'name': 'x'}, {'name': 'x', 'cplieger': {}}, {'cplieger': {'other': 3}}):
+            with self.subTest(manifest=manifest):
+                run = self.read(manifest)
+                self.assertEqual(run.rc, 0, run.out)
+                self.assertEqual(run.outputs, {'count': '1', 'shards': '[1]'})
+
+    def test_a_count_from_one_to_one_hundred_lists_every_shard_once(self):
+        for count in (1, 2, 100):
+            with self.subTest(count=count):
+                run = self.read({'cplieger': {'vitestShards': count}})
+                self.assertEqual(run.rc, 0, run.out)
+                self.assertEqual(run.outputs['count'], str(count))
+                self.assertEqual(json.loads(run.outputs['shards']), list(range(1, count + 1)))
+
+    def test_a_count_that_is_not_an_integer_from_one_to_one_hundred_fails_the_job(self):
+        for value in (0, 101, -1, 2.5, '2', True, None, [2], {'n': 2}, 1e300):
+            with self.subTest(value=value):
+                run = self.read({'cplieger': {'vitestShards': value}})
+                self.assert_refused(run, 'it must be an integer from 1 to 100')
+
+    def test_a_cplieger_field_that_is_not_an_object_fails_the_job(self):
+        for value in (2, 'vitestShards', None, [{'vitestShards': 2}]):
+            with self.subTest(value=value):
+                self.assert_refused(self.read({'cplieger': value}), '"cplieger" must be an object')
+
+    def test_an_unreadable_package_fails_the_job(self):
+        self.assert_refused(self.read(), 'cannot read the vitest shard count')
+        self.assert_refused(self.read(raw='{"cplieger":'), 'cannot read the vitest shard count')
+
+    def test_a_value_cannot_start_a_workflow_command(self):
+        run = self.read({'cplieger': {'vitestShards': '\n::add-mask::x\n'}})
+        self.assert_refused(run, 'cplieger.vitestShards is "\\n::add-mask::x\\n"')
+        run = self.read(raw='{"a":\n::add-mask::x\n}')
+        self.assert_refused(run, 'cannot read the vitest shard count')
+
+    def test_a_long_value_is_cut_in_the_error(self):
+        run = self.read({'cplieger': {'vitestShards': 'x' * 500}})
+        self.assert_refused(run, 'it must be an integer from 1 to 100')
+        self.assertLess(len(run.out), 200)
 
 
 class ShardMatrix(unittest.TestCase):
-    def test_the_input_defaults_to_one_shard(self):
-        # PyYAML reads the bare `on` key as YAML 1.1's boolean true.
-        spec = ts_ci()[True]['workflow_call']['inputs']['vitest-shards']
-        self.assertEqual((spec['type'], spec['default']), ('number', 1))
-
-    def test_a_count_from_one_to_eight_lists_every_shard_once(self):
-        for count in range(1, 9):
+    def test_validate_waits_for_the_count_and_takes_its_list(self):
+        validate = ts_ci()['jobs']['validate']
+        self.assertEqual(validate['needs'], 'shard-count')
+        matrix = validate['strategy']['matrix']['shard']
+        for count in (1, 2, 100):
             with self.subTest(count=count):
-                self.assertEqual(shard_list(count), list(range(1, count + 1)))
+                self.assertEqual(evaluate(matrix, {'needs': counted(count)}), list(range(1, count + 1)))
 
-    def test_a_count_outside_one_to_eight_lists_no_shard(self):
-        for count in (0, 9):
-            with self.subTest(count=count):
-                self.assertFalse(shard_list(count))
+    def test_the_count_is_no_longer_an_input(self):
+        self.assertNotIn('vitest-shards', ts_ci()[True]['workflow_call']['inputs'])
+        self.assertNotIn('vitest-shards', TS_CI.read_text())
 
     def test_one_failed_shard_does_not_cancel_the_others(self):
         self.assertFalse(ts_ci()['jobs']['validate']['strategy']['fail-fast'])
 
+    def name(self, shard: int, count: int) -> str:
+        template = ts_ci()['jobs']['validate']['name']
+        return evaluate(template, {'needs': counted(count), 'matrix': {'shard': shard}})
+
     def test_unsharded_the_job_keeps_the_plain_validate_name(self):
-        self.assertEqual(validate_name(1, 1), 'validate')
+        self.assertEqual(self.name(1, 1), 'validate')
 
     def test_each_shard_is_named_with_its_index_and_count(self):
-        self.assertEqual(validate_name(1, 2), 'validate (shard 1/2)')
-        self.assertEqual(validate_name(2, 2), 'validate (shard 2/2)')
+        self.assertEqual(self.name(1, 2), 'validate (shard 1/2)')
+        self.assertEqual(self.name(2, 2), 'validate (shard 2/2)')
 
 
 def running_steps(shard: int) -> list[str]:
@@ -75,7 +137,8 @@ def running_steps(shard: int) -> list[str]:
     web package, every earlier step having passed."""
     contexts = {
         'matrix': {'shard': shard},
-        'inputs': {'vitest-shards': 2, 'web-lint': True, 'working-directory': '.'},
+        'needs': counted(2),
+        'inputs': {'web-lint': True, 'working-directory': '.'},
         'github': {'event_name': 'pull_request', 'event': {'repository': {'private': False}}},
         'steps': {},
     }
@@ -123,6 +186,12 @@ class TestStep(Harness):
         self.package(scripts)
         return self.run_step({'SHARD': str(shard), 'SHARDS': str(shards)})
 
+    def test_the_step_takes_its_shard_and_the_read_count(self):
+        self.assertEqual(
+            self.STEP['env'],
+            {'SHARD': '${{ matrix.shard }}', 'SHARDS': '${{ needs.shard-count.outputs.count }}'},
+        )
+
     def test_unsharded_runs_the_test_script_as_it_stands(self):
         guard = 'echo guard "$@" >> "$STUB_LOG/guard"'
         run = self.run_test({'test': f'vitest --run && {guard}'}, 1, 1)
@@ -153,6 +222,7 @@ class TestStep(Harness):
                 run = self.run_test({'test': script}, 1, 2)
                 self.assertEqual(run.rc, 1, run.out)
                 self.assertEqual(run.recorded, 'test\n')
+                self.assertIn('sets cplieger.vitestShards to 2', run.out)
                 self.assertIn('must be one vitest command', run.out)
                 self.assertEqual(run.logged('vitest'), '')
 
@@ -166,22 +236,30 @@ def shards_job() -> dict:
     return ts_ci()['jobs']['shards']
 
 
-def shards_runs(count: int, validate: str) -> bool:
-    contexts = {'inputs': {'vitest-shards': count}, 'needs': {'validate': {'result': validate}}}
-    return wr.job_condition(ts_ci(), 'shards', contexts, [])
+def shards_runs(count: int | None, validate: str, counting: str = 'success') -> bool:
+    needs = {**counted(count, counting), 'validate': {'result': validate}}
+    return wr.job_condition(ts_ci(), 'shards', {'needs': needs}, [])
 
 
 class ShardsVerdict(DetectHarness):
+    def name(self, count: int | None) -> str:
+        return evaluate(shards_job()['name'], {'needs': counted(count)})
+
     def test_sharded_the_verdict_job_carries_the_validate_name(self):
-        name = shards_job()['name']
-        self.assertEqual(evaluate(name, {'inputs': {'vitest-shards': 2}}), 'validate')
-        self.assertNotEqual(evaluate(name, {'inputs': {'vitest-shards': 1}}), 'validate')
+        self.assertEqual(self.name(2), 'validate')
+        self.assertNotEqual(self.name(1), 'validate')
+        self.assertNotEqual(self.name(None), 'validate')
 
     def test_it_runs_after_every_shard_whatever_their_result_only_when_sharded(self):
-        self.assertEqual(shards_job()['needs'], 'validate')
+        self.assertEqual(shards_job()['needs'], ['shard-count', 'validate'])
         self.assertTrue(shards_runs(2, 'failure'))
         self.assertTrue(shards_runs(2, 'success'))
         self.assertFalse(shards_runs(1, 'success'))
+
+    def test_a_refused_count_skips_it_and_validate_alike(self):
+        self.assertFalse(shards_runs(None, 'skipped', 'failure'))
+        needs = counted(None, 'failure')
+        self.assertFalse(wr.job_condition(ts_ci(), 'validate', {'needs': needs}, []))
 
     def verdict(self, result: str):
         step = shards_job()['steps'][0]
@@ -197,27 +275,13 @@ class ShardsVerdict(DetectHarness):
                 self.assertIn(f'a validate shard ended {result}', run.out)
 
 
-def meta_jobs() -> dict:
-    return yaml.safe_load(META.read_text())['jobs']
-
-
-def web_shard_count(github: dict):
-    return evaluate(meta_jobs()['web']['with']['vitest-shards'], {'github': github})
-
-
-class MetaShardCount(unittest.TestCase):
-    def test_a_listed_repository_runs_its_web_suite_in_shards(self):
-        self.assertEqual(web_shard_count({'event': {'repository': {'name': 'marotte'}}}), 2)
-
-    def test_any_other_repository_runs_one_shard(self):
-        self.assertEqual(web_shard_count({'event': {'repository': {'name': 'subflux'}}}), 1)
-
-    def test_an_event_without_a_repository_runs_one_shard(self):
-        self.assertEqual(web_shard_count({'event': {}}), 1)
-
-    def test_the_count_reaches_the_web_job_only(self):
-        jobs = meta_jobs()
-        self.assertNotIn('vitest-shards', json.dumps(jobs['ts']) + json.dumps(jobs['ts-nested']))
+class MetaPassesNoCount(unittest.TestCase):
+    def test_no_ts_ci_call_names_a_count_or_a_repository(self):
+        jobs = yaml.safe_load(META.read_text())['jobs']
+        for name in ('ts', 'ts-nested', 'web'):
+            with self.subTest(job=name):
+                self.assertNotIn('vitest-shards', json.dumps(jobs[name]))
+        self.assertNotIn('vitest-shards', META.read_text())
 
 
 if __name__ == '__main__':
