@@ -5,8 +5,8 @@ The manifest (.github/sync.yml) goes to stdout, per-repo diagnostics to stderr.
 A two-branch repo (release_channels.is_two_branch) is classified once per base
 from that base's tree and its groups carry `base:`; every other repo from HEAD.
 
-Importable: `sync_owned_patterns()` is every path the sync can write, and
-`canonical_sources(repo)` maps each of them to its source here.
+Importable: `sync_owned_patterns()` is every path the sync can write, as globs, and
+`canonical_sources(repo)` maps each of `repo`'s paths to its source here.
 
 Failure model: the repo listing aborts on an error, a timeout or the page cap;
 an unreadable tree drops that repo (or base) from every group; a failed
@@ -102,27 +102,32 @@ TS_CONFIG = Group(
 WEB_DIRS = ('static-src', 'web', 'internal/server/static-src', 'internal/webui/static-src')
 
 
-def ts_config_group(ts_dir):
-    """TS_CONFIG for a repo whose npm project is in `ts_dir` ('' for the root,
-    None when its npm projects sit only in folders no group serves).
+def ts_config_group(ts_dirs):
+    """TS_CONFIG for a repo whose npm projects are in `ts_dirs` ('' for the root,
+    empty when its npm projects sit only in folders no group serves).
 
     The ESLint base is the one config a consumer imports rather than names on
     a command line, and an import resolves its `@eslint/js` and
     `typescript-eslint` imports from its own folder upward, so it lands beside
-    the project's package.json or jsr.json, and nowhere when no such folder
+    each project's package.json or jsr.json, and nowhere when no such folder
     is one the sync writes to. The other three stay at the root, where the
     lint steps read them."""
-    if ts_dir == '':
+    if ts_dirs == ('',):
         return TS_CONFIG
     base, *rest = TS_CONFIG.files
-    if ts_dir is None:
+    if not ts_dirs:
         return Group(
             f'{TS_CONFIG.comment} (no ESLint base: npm projects in other folders)', tuple(rest)
         )
+    where = ', '.join(d or 'the root' for d in ts_dirs)
     return Group(
-        f'{TS_CONFIG.comment} (npm project in {ts_dir})',
-        ((base[0], f'{ts_dir}/{base[1]}'), *rest),
+        f'{TS_CONFIG.comment} (npm project{"s" if len(ts_dirs) > 1 else ""} in {where})',
+        (*((base[0], f'{d}/{base[1]}' if d else base[1]) for d in ts_dirs), *rest),
     )
+
+
+# Every consumer path a module half's ESLint base can take (nested_halves).
+HALF_BASE = '**/web/eslint.config.base.mjs'
 
 
 RELEASE = Group(
@@ -183,14 +188,15 @@ def render_files(group):
 
 
 def every_group():
-    """GROUPS' groups plus the TS_CONFIG variant for each of WEB_DIRS."""
-    variants = [ts_config_group(d) for d in (*WEB_DIRS, None)]
+    """GROUPS' groups plus the TS_CONFIG variant for each of WEB_DIRS and the
+    one with no ESLint base."""
+    variants = [ts_config_group(d) for d in (*((d,) for d in WEB_DIRS), ())]
     return [group for _key, group in GROUPS] + variants
 
 
 def sync_owned_patterns():
-    """Every consumer path any group can write, sorted; reads no API."""
-    return sorted({dest for group in every_group() for _source, dest in pairs(group)})
+    """Every consumer path any group can write, as globs, sorted; reads no API."""
+    return sorted({dest for group in every_group() for _source, dest in pairs(group)} | {HALF_BASE})
 
 
 def canonical_sources(repo):
@@ -203,6 +209,9 @@ def canonical_sources(repo):
         if group in CLIFF.values() and group is not CLIFF[tier]:
             continue
         sources.update((dest, source) for source, dest in pairs(group))
+    base_source, base_dest = TS_CONFIG.files[0]
+    for half in nested_halves(tree_paths(repo.split('/')[-1])):
+        sources[f'{half}/{base_dest}'] = base_source
     return sources
 
 
@@ -299,16 +308,33 @@ def discover_repos():
 NESTED_GO_PRUNED = re.compile(r'(^|/)(node_modules|vendor|testdata|static|dist)/')
 
 
-def has_nested_go(tree):
-    """True when some <dir>/go.mod outside the pruned trees has a .go file below
-    <dir>: ci.yaml's go-nested discovery, which validates exactly these."""
-    dirs = [
-        path.removesuffix('/go.mod')
-        for path in tree
-        if path.endswith('/go.mod') and not NESTED_GO_PRUNED.search(path)
-    ]
+def nested_modules(tree):
+    """Each <dir> whose <dir>/go.mod sits outside the pruned trees and has a .go
+    file below <dir>, sorted: ci.yaml's go-nested discovery, which validates
+    exactly these."""
     sources = [path for path in tree if path.endswith('.go')]
-    return any(source.startswith(f'{d}/') for d in dirs for source in sources)
+    return sorted(
+        d
+        for d in (path.removesuffix('/go.mod') for path in tree if path.endswith('/go.mod'))
+        if not NESTED_GO_PRUNED.search(f'{d}/go.mod')
+        and any(source.startswith(f'{d}/') for source in sources)
+    )
+
+
+def has_nested_go(tree):
+    """True when the repo holds a nested Go module (nested_modules)."""
+    return bool(nested_modules(tree))
+
+
+def nested_halves(tree):
+    """<dir>/web for each nested module whose web folder holds a package.json or
+    jsr.json, sorted: ci.yaml's ts-nested discovery, which lints exactly these."""
+    paths = set(tree)
+    return [
+        f'{d}/web'
+        for d in nested_modules(tree)
+        if f'{d}/web/package.json' in paths or f'{d}/web/jsr.json' in paths
+    ]
 
 
 def classify(repo, ref='HEAD', *, releasing=False):
@@ -350,24 +376,22 @@ def classify(repo, ref='HEAD', *, releasing=False):
     # meta CI. A marker, not "not releaseable": a repo that releases nothing may
     # keep its own CI, which the sync must never overwrite.
     has_publish = '.github/workflows/publish.yaml' in tree
-    # Where ci.yaml lints the npm project: the root when it holds one, else
-    # the first web folder that does, else None when the only projects sit in
-    # other folders, such as a nested module's web/ half, which keeps its own copy.
-    ts_dir = ''
-    if not (has_pkg or has_jsr):
-        ts_dir = next(
-            (d for d in WEB_DIRS if f'{d}/package.json' in tree or f'{d}/jsr.json' in tree), ''
+    # Where ci.yaml lints npm projects: the root when it holds one, else the
+    # first web folder that does, and each nested module's TS half. With none
+    # of those, the base goes to the root, or nowhere when the only projects
+    # sit in other folders, which keep their own copy.
+    project = '' if has_pkg or has_jsr else None
+    if project is None:
+        project = next(
+            (d for d in WEB_DIRS if f'{d}/package.json' in tree or f'{d}/jsr.json' in tree), None
         )
-    if (
-        ts_dir == ''
-        and not (has_pkg or has_jsr)
-        and any(
-            path.endswith(('/package.json', '/jsr.json'))
-            and not any(f'/{d}/' in f'/{path}' for d in ('node_modules', 'testdata', 'vendor'))
-            for path in tree
-        )
+    ts_dirs = (*(() if project is None else (project,)), *nested_halves(tree))
+    if not ts_dirs and not any(
+        path.endswith(('/package.json', '/jsr.json'))
+        and not any(f'/{d}/' in f'/{path}' for d in ('node_modules', 'testdata', 'vendor'))
+        for path in tree
     ):
-        ts_dir = None
+        ts_dirs = ('',)
 
     return {
         'readable': bool(tree),
@@ -375,7 +399,7 @@ def classify(repo, ref='HEAD', *, releasing=False):
         'has_jsr': has_jsr,
         'has_pkg': has_pkg,
         'is_web': is_web,
-        'ts_dir': ts_dir,
+        'ts_dirs': ts_dirs,
         'can_release': lang == 'go' or has_jsr or has_dockerfile,
         'has_smoke': has_smoke,
         'has_shell_tests': has_shell_tests,
@@ -465,9 +489,11 @@ def emit_block(groups, profiles, *, base=None):
                 group.comment + suffix, groups[key], group, lead_blank=lead_blank, base=base
             )
             continue
-        for ts_dir in ('', *WEB_DIRS, None):
-            repos = [repo for repo in groups[key] if profiles[repo]['ts_dir'] == ts_dir]
-            variant = ts_config_group(ts_dir)
+        single = [(d,) for d in ('', *WEB_DIRS)]
+        several = sorted({profiles[repo]['ts_dirs'] for repo in groups[key]} - {*single, ()})
+        for ts_dirs in [*single, *several, ()]:
+            repos = [repo for repo in groups[key] if profiles[repo]['ts_dirs'] == ts_dirs]
+            variant = ts_config_group(ts_dirs)
             print_group(variant.comment + suffix, repos, variant, lead_blank=lead_blank, base=base)
 
 

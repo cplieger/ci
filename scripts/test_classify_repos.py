@@ -17,6 +17,7 @@ import unittest
 import unittest.mock
 
 import yaml
+from inventory import glob_pattern
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
 ROOT = SCRIPTS.parent
@@ -325,19 +326,56 @@ class EslintBaseDest(unittest.TestCase):
             {'source': 'configs/prettier.json', 'dest': '.prettierrc.json'}, webgo['files']
         )
 
+    def half_dests(self, groups):
+        """{repo name: [ESLint base dests]} over the manifest's groups."""
+        out = {}
+        for group in groups:
+            for entry in group['files']:
+                if isinstance(entry, dict) and entry['source'] == 'configs/eslint.config.base.mjs':
+                    for name in group['repos'].split():
+                        out.setdefault(name.split('/')[-1], []).append(entry['dest'])
+        return out
+
+    def test_each_module_half_gets_the_base_and_the_root_gets_none(self):
+        halves = [
+            *('alpha/go.mod', 'alpha/a.go', 'alpha/web/package.json', 'alpha/web/go.mod'),
+            *('beta/go.mod', 'beta/b.go'),
+            *('gamma/go.mod', 'gamma/g.go', 'gamma/web/jsr.json'),
+        ]
+        rc, out, err, _calls = run_classify(
+            SCRIPTS / 'classify-repos.py', rootless_fixture(['README.md', *halves])
+        )
+        self.assertEqual(rc, 0, err)
+        groups = [g for g in yaml.safe_load(out)['group'] if 'lanes' in g['repos']]
+        want = ['alpha/web/eslint.config.base.mjs', 'gamma/web/eslint.config.base.mjs']
+        self.assertEqual(self.half_dests(groups), {'lanes': want + want})
+        lanes = next(g for g in groups if 'alpha/web/eslint.config.base.mjs' in str(g['files']))
+        self.assertIn(
+            {'source': 'configs/prettier.json', 'dest': '.prettierrc.json'}, lanes['files']
+        )
+
+    def test_a_root_project_and_module_halves_each_get_the_base(self):
+        trees = ['package.json', 'mod.ts', 'alpha/go.mod', 'alpha/a.go', 'alpha/web/package.json']
+        groups = self.manifest({'mixed@HEAD': ['go.mod', 'main.go', *trees]})
+        self.assertEqual(
+            self.half_dests(groups),
+            {'mixed': ['eslint.config.base.mjs', 'alpha/web/eslint.config.base.mjs']},
+        )
+
     def test_npm_projects_only_in_other_folders_get_no_base(self):
-        half = ['go.mod', 'alpha/go.mod', 'alpha/a.go', 'alpha/web/package.json']
+        # dist/x is pruned and tools/web holds no Go source, so neither is a module half,
+        # and no lint step reads a base beside them; a testdata project is no project.
+        odd = ['go.mod', 'main.go', 'dist/x/go.mod', 'dist/x/x.go', 'dist/x/web/package.json']
+        odd += ['tools/web/package.json', 'tools/web/go.mod']
         groups = self.manifest(
             {
-                'halves@HEAD': half,
+                'odd@HEAD': odd,
                 'fixtures@HEAD': ['go.mod', 'web', 'web/app.ts', 'testdata/x/package.json'],
             }
         )
-        self.assertEqual(self.base_dests(groups), {'fixtures': 'eslint.config.base.mjs'})
+        self.assertEqual(self.half_dests(groups), {'fixtures': ['eslint.config.base.mjs']})
         prettier = {'source': 'configs/prettier.json', 'dest': '.prettierrc.json'}
-        self.assertTrue(
-            any('halves' in g['repos'] and prettier in g['files'] for g in groups), groups
-        )
+        self.assertTrue(any('odd' in g['repos'] and prettier in g['files'] for g in groups), groups)
 
     def test_a_web_folder_without_an_npm_project_keeps_the_base_at_the_root(self):
         groups = self.manifest({'gohybrid@HEAD': ['go.mod', 'internal/server/static-src/app.ts']})
@@ -552,7 +590,7 @@ class RootLessGo(unittest.TestCase):
 
     CI = 'Unified CI (auto-detects go/ts/web/shell surfaces)'
     GOLANGCI = 'Go-tooling configs (Go-having repos)'
-    TS = 'TypeScript lint/format configs (no ESLint base: npm projects in other folders)'
+    TS = 'TypeScript lint/format configs'
     RELEASE = 'Release (unified auto-detect)'
     CLIFF = 'Cliff config (stable — v1.x+)'
     RENOVATE = 'Two-branch Renovate delta (repos whose default branch is dev)'
@@ -564,7 +602,8 @@ class RootLessGo(unittest.TestCase):
 
     def test_two_branch_nested_modules_with_a_web_half_release_as_go(self):
         groups, err = self.classify(rootless_fixture(ROOTLESS_LANES + WEB_HALF))
-        want = sorted([self.CI, self.GOLANGCI, self.TS, self.RELEASE, self.CLIFF, self.RENOVATE])
+        ts = f'{self.TS} (npm project in alpha/web)'
+        want = sorted([self.CI, self.GOLANGCI, ts, self.RELEASE, self.CLIFF, self.RENOVATE])
         self.assertEqual(groups, {'dev': want, 'main': want})
         for base in ('dev', 'main'):
             self.assertRegex(
@@ -655,6 +694,7 @@ class SyncOwnedSet(unittest.TestCase):
         self.assertEqual(
             self.classify.sync_owned_patterns(),
             [
+                '**/web/eslint.config.base.mjs',
                 '.editorconfig',
                 '.gitattributes',
                 '.github/workflows/ci.yaml',
@@ -685,8 +725,9 @@ class SyncOwnedSet(unittest.TestCase):
     def test_it_covers_every_dest_a_manifest_writes_and_reads_no_api(self):
         _rc, out, _err, _calls = run_classify(SCRIPTS / 'classify-repos.py', two_branch_fixture())
         with unittest.mock.patch.object(subprocess, 'run', side_effect=AssertionError('API read')):
-            owned = set(self.classify.sync_owned_patterns())
-        self.assertLessEqual(manifest_dests(out), owned)
+            owned = [glob_pattern(g) for g in self.classify.sync_owned_patterns()]
+        for dest in manifest_dests(out):
+            self.assertTrue(any(p.fullmatch(dest) for p in owned), dest)
 
     def test_canonical_sources_resolve_cliff_by_tier_and_exist_here(self):
         fx = {'repos': [], 'trees': {}, 'tags': {'a': ['v0.4.1'], 'b': ['v2.0.0']}}
@@ -701,11 +742,28 @@ class SyncOwnedSet(unittest.TestCase):
         self.assertEqual(alpha['cliff.toml'], 'configs/cliff-alpha.toml')
         self.assertEqual(stable['cliff.toml'], 'configs/cliff-stable.toml')
         self.assertEqual(untagged['cliff.toml'], 'configs/cliff-stable.toml')
-        self.assertEqual(sorted(alpha), self.classify.sync_owned_patterns())
+        static = [p for p in self.classify.sync_owned_patterns() if '*' not in p]
+        self.assertEqual(sorted(alpha), static)
         for source in {**alpha, **stable}.values():
             self.assertTrue((ROOT / source).is_file(), source)
         self.assertEqual(alpha['renovate.json'], 'configs/renovate-two-branch.json')
         self.assertEqual(alpha['.github/workflows/ci.yaml'], '.github/workflow-templates/ci.yml')
+
+    def test_canonical_sources_add_each_module_half(self):
+        trees = ['alpha/go.mod', 'alpha/a.go', 'alpha/web/package.json', 'beta/go.mod']
+        fx = {'repos': [], 'trees': {'lanes@HEAD': trees}, 'tags': {'lanes': ['v1.0.0']}}
+        gh = StubGh(fx)
+        try:
+            with gh.patched():
+                sources = self.classify.canonical_sources('cplieger/lanes')
+        finally:
+            gh.close()
+        self.assertEqual(
+            sources['alpha/web/eslint.config.base.mjs'], 'configs/eslint.config.base.mjs'
+        )
+        self.assertNotIn('beta/web/eslint.config.base.mjs', sources)
+        owned = [glob_pattern(g) for g in self.classify.sync_owned_patterns()]
+        self.assertTrue(all(any(p.fullmatch(d) for p in owned) for d in sources), sources)
 
     def test_canonical_sources_raise_on_a_failed_tags_read(self):
         gh = StubGh({'repos': [], 'trees': {}, 'tags': {}, 'tags_fail': ['a']})
