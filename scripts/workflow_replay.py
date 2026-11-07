@@ -221,11 +221,16 @@ def from_json(s):
 
 def format_(fmt, *args) -> str:
     """format(): `{N}` takes argument N, and `{{` and `}}` are literal braces."""
-    return re.sub(
-        r'\{\{|\}\}|\{(\d+)\}',
-        lambda m: m.group(0)[0] if m.group(1) is None else to_str(args[int(m.group(1))]),
-        to_str(fmt),
-    )
+
+    def arg(m):
+        if m.group(1) is None:
+            return m.group(0)[0]
+        n = int(m.group(1))
+        if n >= len(args):
+            raise ReplayError(f'format({to_str(fmt)!r}): no argument {n}')
+        return to_str(args[n])
+
+    return re.sub(r'\{\{|\}\}|\{(\d+)\}', arg, to_str(fmt))
 
 
 FUNCTIONS = {
