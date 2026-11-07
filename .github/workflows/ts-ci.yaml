@@ -20,6 +20,10 @@ on:
         description: Run the package's lint:web script, or stylelint + html-validate without one (libraries shipping CSS/HTML).
         type: boolean
         default: false
+      vitest-shards:
+        description: Split the tests across this many validate jobs, 1 to 8, each running `npm test -- --shard=<i>/<n>`. Above 1 the package's test script must be one vitest command.
+        type: number
+        default: 1
 
 permissions:
   contents: read
@@ -27,6 +31,15 @@ permissions:
 
 jobs:
   validate:
+    # Unsharded, the job keeps the plain `validate` check name; a name that
+    # references matrix gets no matrix suffix appended.
+    name: ${{ inputs.vitest-shards > 1 && format('validate (shard {0}/{1})', matrix.shard, inputs.vitest-shards) || 'validate' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Expressions have no range function, so the list is looked up by count;
+        # a count outside 1..8 yields no list and the run fails at startup.
+        shard: ${{ fromJSON('[[],[1],[1,2],[1,2,3],[1,2,3,4],[1,2,3,4,5],[1,2,3,4,5,6],[1,2,3,4,5,6,7],[1,2,3,4,5,6,7,8]]')[inputs.vitest-shards] }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     defaults:
@@ -78,11 +91,14 @@ jobs:
       # step added to this block MUST end with
       #   || { echo "<step name>" >> /tmp/_ci_failures; exit 1; }
       # or its failure is silently tolerated by continue-on-error.
+      # Every check but the tests runs once, in shard 1.
       - name: Lint (eslint)
+        if: ${{ matrix.shard == 1 }}
         continue-on-error: true
         run: ( npx eslint . ) || { echo "eslint" >> /tmp/_ci_failures; exit 1; }
 
       - name: Typecheck (tsc)
+        if: ${{ matrix.shard == 1 }}
         continue-on-error: true
         run: ( npm run typecheck && npm run typecheck:tests ) || { echo "typecheck" >> /tmp/_ci_failures; exit 1; }
 
@@ -95,6 +111,7 @@ jobs:
       # --no-config-hints: every ignore entry for an unchecked type reads as unused.
       # A cycle fails only where the config sets `rules: { cycles: error }`.
       - name: Import cycles and undeclared dependencies (knip)
+        if: ${{ matrix.shard == 1 }}
         continue-on-error: true
         run: |
           (
@@ -120,7 +137,24 @@ jobs:
 
       - name: Test (vitest)
         continue-on-error: true
-        run: ( npm test ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.vitest-shards }}
+        run: |
+          (
+            if [ "$SHARDS" -eq 1 ]; then
+              npm test
+              exit "$?"
+            fi
+            # npm appends `--` arguments to the script's command line, so they reach
+            # its last command only (and no pre/post script): anything after vitest
+            # would take --shard while every shard ran the whole suite.
+            if ! node -e "const s=(require('./package.json').scripts||{}).test||''; process.exit(/\bvitest\b/.test(s) && !/[;&|]/.test(s) ? 0 : 1)"; then
+              echo "::error::vitest-shards is ${SHARDS}, so this job runs 'npm test -- --shard=${SHARD}/${SHARDS}': the package.json test script must be one vitest command. Move a command that follows the tests to posttest."
+              exit 1
+            fi
+            npm test -- --shard="${SHARD}/${SHARDS}"
+          ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
       - name: Fuzz (fast-check)
         # Fuzzing is intentionally non-deterministic: a push/PR failing because
@@ -128,7 +162,7 @@ jobs:
         # fuzz on push/PR (shift-left) at the budget configured in each test;
         # private repos only on manual dispatch. (The central weekly-fuzz.yaml
         # is Go-only — there is no deep weekly TS fuzz run.)
-        if: ${{ github.event.repository.private == false || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        if: ${{ matrix.shard == 1 && (github.event.repository.private == false || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
         continue-on-error: true
         run: |
           (
@@ -166,6 +200,7 @@ jobs:
           ) || { echo "fuzz" >> /tmp/_ci_failures; exit 1; }
 
       - name: Format (prettier)
+        if: ${{ matrix.shard == 1 }}
         continue-on-error: true
         run: ( npx prettier --check . ) || { echo "prettier" >> /tmp/_ci_failures; exit 1; }
 
@@ -174,6 +209,7 @@ jobs:
       # marks a manifest edit that touched one file. Scans from the git root so a
       # root library and a subpackage (web/) are both covered; no jsr.json no-ops.
       - name: Version parity (package.json == jsr.json)
+        if: ${{ matrix.shard == 1 }}
         continue-on-error: true
         run: |
           (
@@ -200,6 +236,7 @@ jobs:
       # `exports` map fails the step.
       - name: Publish surface (registries ship exactly the public API)
         id: publish_surface
+        if: ${{ matrix.shard == 1 }}
         continue-on-error: true
         uses: cplieger/ci/actions/publish-surface@46c870f8a7765605069393634eac83d209cf89fa # v3
         with:
@@ -221,7 +258,7 @@ jobs:
       # from the git root; no importmap no-ops. web-lint only: a library's
       # importmap is a dev scaffold, not a shipped page contract.
       - name: Import map coverage
-        if: ${{ inputs.web-lint }}
+        if: ${{ inputs.web-lint && matrix.shard == 1 }}
         continue-on-error: true
         env:
           IMPORTMAP_CHECK: |
@@ -312,7 +349,7 @@ jobs:
           ) || { echo "Import map coverage" >> /tmp/_ci_failures; exit 1; }
 
       - name: Lint web (CSS/HTML)
-        if: ${{ inputs.web-lint }}
+        if: ${{ inputs.web-lint && matrix.shard == 1 }}
         continue-on-error: true
         run: |
           (
@@ -356,7 +393,7 @@ jobs:
       # private repos on the free plan don't expose.
       - name: Dependency review
         id: dependency-review
-        if: ${{ inputs.working-directory == '.' && github.event_name == 'pull_request' && github.event.repository.private == false }}
+        if: ${{ matrix.shard == 1 && inputs.working-directory == '.' && github.event_name == 'pull_request' && github.event.repository.private == false }}
         continue-on-error: true
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
@@ -381,6 +418,25 @@ jobs:
             exit 1
           fi
           echo "All validation steps passed"
+
+  # Sharded, the one `validate` check over every shard. Unsharded it is skipped,
+  # under another name, and the validate job above holds that check itself.
+  shards:
+    name: ${{ inputs.vitest-shards > 1 && 'validate' || 'vitest shards' }}
+    needs: validate
+    if: ${{ always() && inputs.vitest-shards > 1 }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 1
+    steps:
+      - name: Every shard passed
+        env:
+          RESULT: ${{ needs.validate.result }}
+        run: |
+          if [ "$RESULT" != success ]; then
+            echo "::error::a validate shard ended $RESULT; its Check results step names the failed steps"
+            exit 1
+          fi
+          echo "Every validate shard passed"
 
   # The tests again on the oldest Node the package claims, read from its own
   # `engines.node` floor (`>=24`, `>=24.3`, `^24`). `validate` runs on the Node

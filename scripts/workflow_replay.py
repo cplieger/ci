@@ -219,8 +219,18 @@ def from_json(s):
         raise ReplayError(f'fromJSON({to_str(s)!r}): {exc}') from exc
 
 
+def format_(fmt, *args) -> str:
+    """format(): `{N}` takes argument N, and `{{` and `}}` are literal braces."""
+    return re.sub(
+        r'\{\{|\}\}|\{(\d+)\}',
+        lambda m: m.group(0)[0] if m.group(1) is None else to_str(args[int(m.group(1))]),
+        to_str(fmt),
+    )
+
+
 FUNCTIONS = {
     'fromJSON': from_json,
+    'format': format_,
     'toJSON': lambda v: json.dumps(v, indent=2),
     'contains': lambda h, n: (
         any(equal(x, n) for x in h)

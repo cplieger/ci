@@ -28,6 +28,7 @@ jobs:
       run_python: ${{ steps.detect.outputs.run_python }}
       run_scripts: ${{ steps.detect.outputs.run_scripts }}
       web_dir: ${{ steps.detect.outputs.web_dir }}
+      web_vitest_shards: ${{ steps.detect.outputs.web_vitest_shards }}
       code_changed: ${{ steps.detect.outputs.code_changed }}
       deadset_targets: ${{ steps.detect.outputs.deadset_targets }}
     steps:
@@ -42,6 +43,8 @@ jobs:
 
       - name: Detect repo surfaces
         id: detect
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
         run: |
           run_go=false
           run_go_nested=false
@@ -57,6 +60,7 @@ jobs:
           run_python=false
           run_scripts=false
           web_dir=""
+          web_vitest_shards=1
           deadset_targets="[]"
 
           # --- Did any non-docs (code) file change? ---
@@ -189,6 +193,13 @@ jobs:
               fi
             done
 
+            # A web suite too long for one runner splits into vitest shards
+            # (ts-ci.yaml's vitest-shards). Drop a repository once one runner fits
+            # its suite again.
+            case "$REPO_NAME" in
+              marotte) web_vitest_shards=2 ;;
+            esac
+
             # Python: any *.py → ruff lint (inline canonical config, same
             # rationale as the markdown job).
             if [ -n "$(find . -name '*.py' -not -path './.git/*' -print -quit)" ]; then
@@ -236,6 +247,7 @@ jobs:
             echo "run_python=$run_python"
             echo "run_scripts=$run_scripts"
             echo "web_dir=$web_dir"
+            echo "web_vitest_shards=$web_vitest_shards"
             echo "code_changed=$code_changed"
             echo "deadset_targets=$deadset_targets"
           } >> "$GITHUB_OUTPUT"
@@ -249,7 +261,7 @@ jobs:
             echo "| go-nested | $run_go_nested | $go_nested_dirs |"
             echo "| go-work  | $run_go_work | $go_work_dirs |"
             echo "| ts       | $run_ts | . |"
-            echo "| web      | $run_web | ${web_dir:-—} |"
+            echo "| web      | $run_web | ${web_dir:-—} (vitest shards: $web_vitest_shards) |"
             echo "| ts-nested | $run_ts_nested | $ts_nested_dirs |"
             echo "| shell    | $run_shell | . |"
             echo "| docker   | $run_docker | . |"
@@ -340,6 +352,7 @@ jobs:
     with:
       working-directory: ${{ needs.detect.outputs.web_dir }}
       web-lint: true
+      vitest-shards: ${{ fromJSON(needs.detect.outputs.web_vitest_shards) }}
 
   ts-nested:
     needs: detect
