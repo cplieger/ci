@@ -250,14 +250,24 @@ class ShardsVerdict(DetectHarness):
         self.assertNotEqual(self.name(1), 'validate')
         self.assertNotEqual(self.name(None), 'validate')
 
-    def test_it_runs_after_every_shard_whatever_their_result_only_when_sharded(self):
+    def test_it_runs_after_every_shard_whatever_their_result(self):
         self.assertEqual(shards_job()['needs'], ['shard-count', 'validate'])
-        self.assertTrue(shards_runs(2, 'failure'))
-        self.assertTrue(shards_runs(2, 'success'))
-        self.assertFalse(shards_runs(1, 'success'))
+        for count, validate, counting in ((2, 'failure', 'success'), (2, 'success', 'success'),
+                                          (1, 'success', 'success'), (None, 'skipped', 'failure')):
+            with self.subTest(count=count, validate=validate):
+                self.assertTrue(shards_runs(count, validate, counting))
 
-    def test_a_refused_count_skips_it_and_validate_alike(self):
-        self.assertFalse(shards_runs(None, 'skipped', 'failure'))
+    def check_runs(self, count: int | None) -> bool:
+        scope = wr.Scope({'needs': counted(count)}, {}, [])
+        return scope.condition(shards_job()['steps'][0].get('if'))
+
+    def test_only_a_sharded_run_checks_the_shards(self):
+        self.assertNotIn('shard-count', shards_job()['if'])
+        self.assertTrue(self.check_runs(2))
+        self.assertFalse(self.check_runs(1))
+        self.assertFalse(self.check_runs(None))
+
+    def test_a_refused_count_skips_validate(self):
         needs = counted(None, 'failure')
         self.assertFalse(wr.job_condition(ts_ci(), 'validate', {'needs': needs}, []))
 

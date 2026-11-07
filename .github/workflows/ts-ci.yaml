@@ -467,16 +467,19 @@ jobs:
           fi
           echo "All validation steps passed"
 
-  # Sharded, the one `validate` check over every shard. Unsharded it is skipped,
-  # under another name, and the validate job above holds that check itself.
+  # Sharded, the one `validate` check over every shard. Unsharded it passes under
+  # another name, and the validate job above holds that check itself. The job
+  # always runs: GitHub never evaluates a skipped job's name, so a job-level
+  # condition would show the raw expression as the check name.
   shards:
     name: ${{ needs.shard-count.outputs.count > 1 && 'validate' || 'vitest shards' }}
     needs: [shard-count, validate]
-    if: ${{ always() && needs.shard-count.outputs.count > 1 }}
+    if: ${{ always() }}
     runs-on: ubuntu-26.04
     timeout-minutes: 1
     steps:
       - name: Every shard passed
+        if: ${{ needs.shard-count.outputs.count > 1 }}
         env:
           RESULT: ${{ needs.validate.result }}
         run: |
