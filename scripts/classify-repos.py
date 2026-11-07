@@ -111,7 +111,7 @@ def ts_config_group(ts_dirs):
     `typescript-eslint` imports from its own folder upward, so it lands beside
     each project's package.json or jsr.json, and nowhere when no such folder
     is one the sync writes to. The other three stay at the root, where the
-    lint steps read them."""
+    lint steps read them unless a nearer copy shadows them."""
     if ts_dirs == ('',):
         return TS_CONFIG
     base, *rest = TS_CONFIG.files
@@ -201,16 +201,21 @@ def sync_owned_patterns():
 
 def canonical_sources(repo):
     """{dest: source path in this repo} for every sync-owned path, with
-    cliff.toml resolved by `repo`'s cliff tier. Raises ClassifyError when the
-    tags read fails."""
-    tier = cliff_tier(repo.split('/')[-1])
+    cliff.toml resolved by `repo`'s cliff tier and the ESLint base of each
+    module half in `repo`'s default-branch tree. Raises ClassifyError when the
+    tags or the tree read fails."""
+    name = repo.split('/')[-1]
+    tier = cliff_tier(name)
     sources = {}
     for group in every_group():
         if group in CLIFF.values() and group is not CLIFF[tier]:
             continue
         sources.update((dest, source) for source, dest in pairs(group))
+    tree = tree_paths(name)
+    if tree is None:
+        raise ClassifyError(f'tree read failed for {name}, so its module halves are unknown')
     base_source, base_dest = TS_CONFIG.files[0]
-    for half in nested_halves(tree_paths(repo.split('/')[-1])):
+    for half in nested_halves(tree):
         sources[f'{half}/{base_dest}'] = base_source
     return sources
 
@@ -229,10 +234,11 @@ def api_json(path):
 
 
 def tree_paths(repo, ref='HEAD'):
-    """Every path in the repo's git tree at `ref`, recursively; [] when unreadable."""
+    """Every path in the repo's git tree at `ref`, recursively; None when unreadable,
+    a truncated listing included (GitHub caps a recursive tree)."""
     data = api_json(f'repos/{OWNER}/{repo}/git/trees/{ref}?recursive=1')
-    if not isinstance(data, dict):
-        return []
+    if not isinstance(data, dict) or data.get('truncated'):
+        return None
     return [entry.get('path', '') for entry in data.get('tree') or [] if isinstance(entry, dict)]
 
 
@@ -308,15 +314,20 @@ def discover_repos():
 NESTED_GO_PRUNED = re.compile(r'(^|/)(node_modules|vendor|testdata|static|dist)/')
 
 
+MODULE_DIR = re.compile(r'[A-Za-z0-9._/-]+')
+
+
 def nested_modules(tree):
-    """Each <dir> whose <dir>/go.mod sits outside the pruned trees and has a .go
-    file below <dir>, sorted: ci.yaml's go-nested discovery, which validates
-    exactly these."""
+    """Each <dir> whose <dir>/go.mod sits outside the pruned trees, whose name
+    stays in [A-Za-z0-9._/-] and which has a .go file below it, sorted:
+    ci.yaml's go-nested discovery, which validates exactly these and fails on
+    any other name, so no other name reaches a sync.yml dest."""
     sources = [path for path in tree if path.endswith('.go')]
     return sorted(
         d
         for d in (path.removesuffix('/go.mod') for path in tree if path.endswith('/go.mod'))
         if not NESTED_GO_PRUNED.search(f'{d}/go.mod')
+        and MODULE_DIR.fullmatch(d)
         and any(source.startswith(f'{d}/') for source in sources)
     )
 
@@ -345,7 +356,7 @@ def classify(repo, ref='HEAD', *, releasing=False):
     with no root go.mod is Go when it holds nested modules, because the release
     pipeline ships them as lanes; elsewhere a root-less repo keeps its own CI.
     """
-    tree = tree_paths(repo, ref)
+    tree = tree_paths(repo, ref) or []
     has_gomod = 'go.mod' in tree
     has_jsr = 'jsr.json' in tree
     has_pkg = 'package.json' in tree
@@ -376,16 +387,19 @@ def classify(repo, ref='HEAD', *, releasing=False):
     # meta CI. A marker, not "not releaseable": a repo that releases nothing may
     # keep its own CI, which the sync must never overwrite.
     has_publish = '.github/workflows/publish.yaml' in tree
-    # Where ci.yaml lints npm projects: the root when it holds one, else the
-    # first web folder that does, and each nested module's TS half. With none
-    # of those, the base goes to the root, or nowhere when the only projects
-    # sit in other folders, which keep their own copy.
-    project = '' if has_pkg or has_jsr else None
-    if project is None:
-        project = next(
-            (d for d in WEB_DIRS if f'{d}/package.json' in tree or f'{d}/jsr.json' in tree), None
-        )
-    ts_dirs = (*(() if project is None else (project,)), *nested_halves(tree))
+    # Where ci.yaml lints npm projects: the root when it holds one, the first
+    # web folder that does (its web job probes them whatever the root holds),
+    # and each nested module's TS half. With none of those, the base goes to
+    # the root, or nowhere when the only projects sit in other folders, which
+    # keep their own copy.
+    web = next(
+        (d for d in WEB_DIRS if f'{d}/package.json' in tree or f'{d}/jsr.json' in tree), None
+    )
+    ts_dirs = (
+        *(('',) if has_pkg or has_jsr else ()),
+        *((web,) if web else ()),
+        *nested_halves(tree),
+    )
     if not ts_dirs and not any(
         path.endswith(('/package.json', '/jsr.json'))
         and not any(f'/{d}/' in f'/{path}' for d in ('node_modules', 'testdata', 'vendor'))
@@ -480,7 +494,9 @@ def assign(repo_names, profiles, releasing):
 
 def emit_block(groups, profiles, *, base=None):
     """Print every group of one block (the single-branch one, or one base's),
-    the TypeScript configs as one group per npm project folder, root first."""
+    the TypeScript configs as one group per distinct set of ESLint-base folders:
+    the root and each WEB_DIRS folder alone, then every other set sorted, then
+    the group with no base."""
     suffix = f' (base: {base})' if base else ''
     for index, (key, group) in enumerate(GROUPS):
         lead_blank = base is not None or index > 0
@@ -490,8 +506,8 @@ def emit_block(groups, profiles, *, base=None):
             )
             continue
         single = [(d,) for d in ('', *WEB_DIRS)]
-        several = sorted({profiles[repo]['ts_dirs'] for repo in groups[key]} - {*single, ()})
-        for ts_dirs in [*single, *several, ()]:
+        others = sorted({profiles[repo]['ts_dirs'] for repo in groups[key]} - {*single, ()})
+        for ts_dirs in [*single, *others, ()]:
             repos = [repo for repo in groups[key] if profiles[repo]['ts_dirs'] == ts_dirs]
             variant = ts_config_group(ts_dirs)
             print_group(variant.comment + suffix, repos, variant, lead_blank=lead_blank, base=base)

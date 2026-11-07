@@ -355,18 +355,76 @@ class EslintBaseDest(unittest.TestCase):
         )
 
     def test_a_root_project_and_module_halves_each_get_the_base(self):
-        trees = ['package.json', 'mod.ts', 'alpha/go.mod', 'alpha/a.go', 'alpha/web/package.json']
-        groups = self.manifest({'mixed@HEAD': ['go.mod', 'main.go', *trees]})
+        half = ['alpha/go.mod', 'alpha/a.go', 'alpha/web/package.json']
+        groups = self.manifest(
+            {
+                'mixed@HEAD': ['go.mod', 'main.go', 'package.json', 'mod.ts', *half],
+                'jsrmixed@HEAD': ['go.mod', 'main.go', 'jsr.json', 'mod.ts', *half],
+            }
+        )
+        want = ['eslint.config.base.mjs', 'alpha/web/eslint.config.base.mjs']
+        self.assertEqual(self.half_dests(groups), {'mixed': want, 'jsrmixed': want})
+
+    def test_a_root_project_and_a_web_folder_each_get_the_base(self):
+        # ci.yaml's web job probes WEB_DIRS whatever the root holds, so both are linted.
+        tree = ['package.json', 'mod.ts', 'web/package.json', 'web/app.ts']
+        groups = self.manifest({'both@HEAD': tree})
         self.assertEqual(
             self.half_dests(groups),
-            {'mixed': ['eslint.config.base.mjs', 'alpha/web/eslint.config.base.mjs']},
+            {'both': ['eslint.config.base.mjs', 'web/eslint.config.base.mjs']},
+        )
+
+    def test_halves_follow_go_nested_at_any_depth(self):
+        # go-nested validates a module at any depth whose .go files may sit in a subdirectory.
+        tree = ['go.mod', 'main.go', 'pkg/mods/x/go.mod', 'pkg/mods/x/x.go']
+        tree += ['pkg/mods/x/web/package.json', 'beta/go.mod', 'beta/internal/b.go']
+        tree += ['beta/web/jsr.json']
+        self.assertEqual(load_classify().nested_halves(tree), ['beta/web', 'pkg/mods/x/web'])
+
+    def test_a_truncated_tree_reads_as_unreadable(self):
+        classify = load_classify()
+        listing = {'tree': [{'path': 'go.mod'}], 'truncated': True}
+        with unittest.mock.patch.object(classify, 'api_json', return_value=listing):
+            self.assertIsNone(classify.tree_paths('big'))
+        with unittest.mock.patch.object(classify, 'api_json', return_value={'tree': []}):
+            self.assertEqual(classify.tree_paths('empty'), [])
+
+    def test_a_module_name_go_nested_refuses_is_no_half(self):
+        # ci.yaml fails on a module dir outside [A-Za-z0-9._/-]; such a name must never
+        # reach a sync.yml dest, where ` #` would cut it short.
+        odd = ['go.mod', 'main.go', 'a #b/go.mod', 'a #b/x.go', 'a #b/web/package.json']
+        self.assertEqual(load_classify().nested_halves(odd), [])
+        groups = self.manifest({'oddname@HEAD': odd})
+        self.assertNotIn('oddname', self.half_dests(groups))
+
+    def test_the_typescript_groups_print_single_folders_then_sets_then_no_base(self):
+        half = ['alpha/go.mod', 'alpha/a.go', 'alpha/web/package.json']
+        groups = self.manifest(
+            {
+                'zroot@HEAD': ['package.json', 'mod.ts'],
+                'ytwo@HEAD': [
+                    'go.mod',
+                    'main.go',
+                    *half,
+                    'beta/go.mod',
+                    'beta/b.go',
+                    'beta/web/jsr.json',
+                ],
+                'xone@HEAD': ['go.mod', 'main.go', *half],
+                'wnone@HEAD': ['go.mod', 'main.go', 'tools/web/package.json'],
+            }
+        )
+        ts = [g for g in groups if 'configs/prettier.json' in str(g['files'])]
+        self.assertEqual(
+            [g['repos'].split()[0].split('/')[-1] for g in ts], ['zroot', 'xone', 'ytwo', 'wnone']
         )
 
     def test_npm_projects_only_in_other_folders_get_no_base(self):
-        # dist/x is pruned and tools/web holds no Go source, so neither is a module half,
-        # and no lint step reads a base beside them; a testdata project is no project.
+        # dist/x is pruned and the tools module holds no Go source, so go-nested skips both
+        # and neither web folder is a half; no lint step reads a base beside them, and a
+        # testdata project is no project.
         odd = ['go.mod', 'main.go', 'dist/x/go.mod', 'dist/x/x.go', 'dist/x/web/package.json']
-        odd += ['tools/web/package.json', 'tools/web/go.mod']
+        odd += ['tools/go.mod', 'tools/web/package.json']
         groups = self.manifest(
             {
                 'odd@HEAD': odd,
@@ -730,13 +788,16 @@ class SyncOwnedSet(unittest.TestCase):
             self.assertTrue(any(p.fullmatch(dest) for p in owned), dest)
 
     def test_canonical_sources_resolve_cliff_by_tier_and_exist_here(self):
-        fx = {'repos': [], 'trees': {}, 'tags': {'a': ['v0.4.1'], 'b': ['v2.0.0']}}
+        trees = {f'{r}@HEAD': ['go.mod', 'main.go'] for r in 'abc'}
+        fx = {'repos': [], 'trees': trees, 'tags': {'a': ['v0.4.1'], 'b': ['v2.0.0']}}
         gh = StubGh(fx)
         try:
             with gh.patched():
                 alpha = self.classify.canonical_sources('a')
                 stable = self.classify.canonical_sources('cplieger/b')
                 untagged = self.classify.canonical_sources('c')
+                with self.assertRaisesRegex(self.classify.ClassifyError, 'tree read failed for d'):
+                    self.classify.canonical_sources('d')
         finally:
             gh.close()
         self.assertEqual(alpha['cliff.toml'], 'configs/cliff-alpha.toml')
@@ -800,7 +861,10 @@ class Consumers(unittest.TestCase):
     def test_the_promotion_writes_the_set_and_the_canonical_copies(self):
         import promote
 
-        gh = StubGh({'repos': [], 'trees': {}, 'tags': {'edgeapp': ['v1.3.0']}})
+        half = ['alpha/go.mod', 'alpha/a.go', 'alpha/web/package.json']
+        trees = {'edgeapp@HEAD': ['go.mod', 'main.go'], 'halves@HEAD': ['go.mod', 'main.go', *half]}
+        tags = {'edgeapp': ['v1.3.0'], 'halves': ['v1.0.0']}
+        gh = StubGh({'repos': [], 'trees': trees, 'tags': tags})
         try:
             with tempfile.TemporaryDirectory() as tmp, gh.patched():
                 work = pathlib.Path(tmp)
@@ -808,9 +872,16 @@ class Consumers(unittest.TestCase):
                 lines = owned.read_text().splitlines()
                 renovate = (canonical / 'renovate.json').read_text()
                 cliff = (canonical / 'cliff.toml').read_text()
+                owned, canonical = promote.sync_inputs('halves', work)
+                half_lines = owned.read_text().splitlines()
+                half_base = (canonical / 'alpha/web/eslint.config.base.mjs').read_text()
         finally:
             gh.close()
-        self.assertEqual(lines, load_classify().sync_owned_patterns())
+        # A glob owns only the paths the sync writes in this repo.
+        literal = [p for p in load_classify().sync_owned_patterns() if '*' not in p]
+        self.assertEqual(lines, literal)
+        self.assertEqual(half_lines, [*literal, 'alpha/web/eslint.config.base.mjs'])
+        self.assertEqual(half_base, (ROOT / 'configs' / 'eslint.config.base.mjs').read_text())
         self.assertEqual(renovate, (ROOT / 'configs' / 'renovate-two-branch.json').read_text())
         self.assertEqual(cliff, (ROOT / 'configs' / 'cliff-stable.toml').read_text())
 

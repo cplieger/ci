@@ -481,8 +481,16 @@ def sync_inputs(repo: str, work: Path, classify=None) -> tuple[Path, Path]:
         mapping = sources(repo)
     except failure as err:
         raise GhError(f'classify-repos.py: {err}') from None
+    # A glob (a module half's ESLint base) owns only the paths the sync writes
+    # in this repo, so a hand copy elsewhere under it stays the repo's.
+    listed = patterns()
+    globs = [inventory.glob_pattern(p) for p in listed if '*' in p]
+    narrowed = [p for p in listed if '*' not in p]
+    narrowed += sorted(
+        d for d in mapping if d not in narrowed and any(g.fullmatch(d) for g in globs)
+    )
     owned = work / 'sync-owned.txt'
-    owned.write_text(''.join(f'{p}\n' for p in patterns()))
+    owned.write_text(''.join(f'{p}\n' for p in narrowed))
     canonical = work / 'canonical'
     shutil.rmtree(canonical, ignore_errors=True)
     canonical.mkdir(parents=True)
