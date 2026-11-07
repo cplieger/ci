@@ -434,7 +434,7 @@ jobs:
           RESULT: ${{ needs.validate.result }}
         run: |
           if [ "$RESULT" != success ]; then
-            echo "::error::a validate shard ended $RESULT; its Check results step names the failed steps"
+            echo "::error::a validate shard ended $RESULT, and its Check results step names the failed steps"
             exit 1
           fi
           echo "Every validate shard passed"
