@@ -280,8 +280,11 @@ class MetaPassesNoCount(unittest.TestCase):
         jobs = yaml.safe_load(META.read_text())['jobs']
         for name in ('ts', 'ts-nested', 'web'):
             with self.subTest(job=name):
-                self.assertNotIn('vitest-shards', json.dumps(jobs[name]))
+                call = json.dumps(jobs[name])
+                self.assertNotIn('vitest-shards', call)
+                self.assertNotIn('repository.name', call)
         self.assertNotIn('vitest-shards', META.read_text())
+        self.assertNotIn('repository.name', TS_CI.read_text())
 
 
 if __name__ == '__main__':
