@@ -10,9 +10,8 @@ import unittest
 
 import workflow_replay as wr
 import yaml
-from test_deadset_steps import META, git_repo
+from test_deadset_steps import META
 from test_deadset_steps import Harness as DetectHarness
-from test_deadset_steps import workflow_step as meta_step
 from test_package_script_steps import WORKFLOWS, Harness, workflow_step
 
 TS_CI = WORKFLOWS / 'ts-ci.yaml'
@@ -141,7 +140,13 @@ class TestStep(Harness):
         self.assertEqual(run.recorded, '')
 
     def test_a_compound_test_script_fails_the_shard_before_running(self):
-        for script in ('vitest --run && node guard.ts', 'vitest --run; true', 'vitest | tee x'):
+        for script in (
+            'vitest --run && node guard.ts',
+            'vitest --run; true',
+            'vitest | tee x',
+            'vitest --run # x',
+            'vitest --run\nnode guard.ts',
+        ):
             with self.subTest(script=script):
                 (self.tmp / 'log' / 'vitest').unlink(missing_ok=True)
                 (self.tmp / 'ci_failures').unlink(missing_ok=True)
@@ -192,36 +197,26 @@ class ShardsVerdict(DetectHarness):
                 self.assertIn(f'a validate shard ended {result}', run.out)
 
 
-WEB_REPO = {'go.mod': 'module x\n', 'main.go': 'package main\n', 'static-src/package.json': '{}'}
+def meta_jobs() -> dict:
+    return yaml.safe_load(META.read_text())['jobs']
 
 
-class MetaShardCount(DetectHarness):
-    def detect(self, repo_name: str) -> dict[str, str]:
-        body = wr.EXPR.sub('', meta_step(META, 'Detect repo surfaces', 'detect')['run'])
-        repo = git_repo(self.tmp / f'detect-{repo_name}', WEB_REPO)
-        run = self.run_body(body, repo, {'REPO_NAME': repo_name})
-        self.assertEqual(run.rc, 0, run.out)
-        return run.outputs
+def web_shard_count(github: dict):
+    return evaluate(meta_jobs()['web']['with']['vitest-shards'], {'github': github})
 
+
+class MetaShardCount(unittest.TestCase):
     def test_a_listed_repository_runs_its_web_suite_in_shards(self):
-        out = self.detect('marotte')
-        self.assertEqual((out['run_web'], out['web_vitest_shards']), ('true', '2'))
+        self.assertEqual(web_shard_count({'event': {'repository': {'name': 'marotte'}}}), 2)
 
     def test_any_other_repository_runs_one_shard(self):
-        self.assertEqual(self.detect('subflux')['web_vitest_shards'], '1')
+        self.assertEqual(web_shard_count({'event': {'repository': {'name': 'subflux'}}}), 1)
+
+    def test_an_event_without_a_repository_runs_one_shard(self):
+        self.assertEqual(web_shard_count({'event': {}}), 1)
 
     def test_the_count_reaches_the_web_job_only(self):
-        jobs = yaml.safe_load(META.read_text())['jobs']
-        detect = jobs['detect']
-        self.assertEqual(
-            detect['outputs']['web_vitest_shards'], '${{ steps.detect.outputs.web_vitest_shards }}'
-        )
-        step = meta_step(META, 'Detect repo surfaces', 'detect')
-        self.assertEqual(step['env']['REPO_NAME'], '${{ github.event.repository.name }}')
-        self.assertEqual(
-            jobs['web']['with']['vitest-shards'],
-            '${{ fromJSON(needs.detect.outputs.web_vitest_shards) }}',
-        )
+        jobs = meta_jobs()
         self.assertNotIn('vitest-shards', json.dumps(jobs['ts']) + json.dumps(jobs['ts-nested']))
 
 

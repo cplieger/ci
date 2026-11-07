@@ -31,14 +31,15 @@ permissions:
 
 jobs:
   validate:
-    # Unsharded, the job keeps the plain `validate` check name; a name that
-    # references matrix gets no matrix suffix appended.
+    # A name that is an expression gets no matrix suffix
+    # (github.com/orgs/community/discussions/144467), so unsharded the check
+    # stays `validate`.
     name: ${{ inputs.vitest-shards > 1 && format('validate (shard {0}/{1})', matrix.shard, inputs.vitest-shards) || 'validate' }}
     strategy:
       fail-fast: false
       matrix:
         # Expressions have no range function, so the list is looked up by count;
-        # a count outside 1..8 yields no list and the run fails at startup.
+        # a count outside 1..8 yields an empty list or null, and the job fails to start.
         shard: ${{ fromJSON('[[],[1],[1,2],[1,2,3],[1,2,3,4],[1,2,3,4,5],[1,2,3,4,5,6],[1,2,3,4,5,6,7],[1,2,3,4,5,6,7,8]]')[inputs.vitest-shards] }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -149,7 +150,7 @@ jobs:
             # npm appends `--` arguments to the script's command line, so they reach
             # its last command only (and no pre/post script): anything after vitest
             # would take --shard while every shard ran the whole suite.
-            if ! node -e "const s=(require('./package.json').scripts||{}).test||''; process.exit(/\bvitest\b/.test(s) && !/[;&|]/.test(s) ? 0 : 1)"; then
+            if ! node -e "const s=(require('./package.json').scripts||{}).test||''; process.exit(/\bvitest\b/.test(s) && !/[;&|#\n]/.test(s) ? 0 : 1)"; then
               echo "::error::vitest-shards is ${SHARDS}, so this job runs 'npm test -- --shard=${SHARD}/${SHARDS}': the package.json test script must be one vitest command. Move a command that follows the tests to posttest."
               exit 1
             fi
