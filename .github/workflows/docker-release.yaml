@@ -395,6 +395,11 @@ jobs:
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Resolve promoted digest
         id: promote
         if: ${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' }}
@@ -519,6 +524,11 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
           config: ${{ inputs.syft-config }}
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Verify the compared release's attestation
         id: prev
@@ -868,6 +878,11 @@ jobs:
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       # Before any stable write: a re-tagged digest is never signed or attested
       # again, so the build it promotes must have done both (release-state.sh).
@@ -1439,11 +1454,9 @@ jobs:
 
       # The tag ref is created via the git data API pinned to $GITHUB_SHA
       # (`gh release create --target` 403s once the branch moved on); a tag at
-      # the same SHA is reused, one elsewhere refuses. Handoff: after a push
-      # carrying workflow-file changes lands past this commit, the integration token
-      # loses ref-create entirely, so when tag-create fails AND the branch head
-      # has moved on, the run exits 0 and the head run's anchor range
-      # re-releases this content. Failing while still at head stays hard.
+      # the same SHA is reused, one elsewhere refuses, and a create a
+      # superseded run loses hands off to the run on the new head
+      # (tag_ref_or_handoff in tag-ref.sh).
       - name: Prepare tag-create helper
         if: ${{ env.PUBLISH == 'true' }}
         run: |
@@ -1454,23 +1467,11 @@ jobs:
           CREATED_TAG=""
           create_tag() { # <tag> -> 0 created (CREATED_TAG set) or reused, 2 handed off, 1 refused
             local rc=0
-            tag_ref "$GITHUB_REPOSITORY" "$1" "$GITHUB_SHA" || rc=$?
-            if [ "$rc" -eq 0 ]; then
-              [ "$TAG_CREATED" = false ] || CREATED_TAG="$1"
-              return 0
+            tag_ref_or_handoff "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$1" "$GITHUB_SHA" || rc=$?
+            if [ "$rc" -eq 0 ] && [ "$TAG_CREATED" = true ]; then
+              CREATED_TAG="$1"
             fi
-            [ "$rc" -eq 2 ] || return 1
-            BRANCH_HEAD=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha 2>/dev/null || echo "")
-            if [ -n "$BRANCH_HEAD" ] && [ "$BRANCH_HEAD" != "$GITHUB_SHA" ]; then
-              MSG="tag $1 not created: ${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${BRANCH_HEAD})"
-              MSG="${MSG} and the superseded run lost ref-create; handing off, the head run re-releases this content."
-              echo "::warning::${MSG}"
-              return 2
-            fi
-            MSG="tag create for $1 failed while this run is still ${GITHUB_REF_NAME}'s head"
-            MSG="${MSG}; not the supersession race, investigate token permissions/API state."
-            echo "::error::${MSG}"
-            return 1
+            return "$rc"
           }
           SH
 
@@ -1739,6 +1740,11 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Check the Release
         id: release
         env:
@@ -1820,6 +1826,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Record the completion receipt
         env:

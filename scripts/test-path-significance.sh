@@ -448,6 +448,116 @@ chk "S36 another script under scripts/ still counts" "$(paths "$K1" "$K2")" 'tru
 put cmd/scripts/collect-licenses.sh '#!/bin/sh'
 K3=$(commit "feat: a nested copy")
 chk "S36 only the root copy is excluded" "$(paths "$K2" "$K3")" 'true|[]|[]|["cmd/scripts/collect-licenses.sh"]'
+# ── A file a non-test //go:embed names ships, whatever the excludes say ─────
+# grelot#67 changed only internal/cli/manual.md, which manual.go embeds as
+# `grelot help`, and released nothing.
+export REPO_TYPE=go SUBPACKAGES_JSON='[]' GO_LANES_JSON='["lane"]'
+newrepo embeds
+put go.mod 'module example.com/app'
+put main.go 'package main'
+put internal/cli/manual.go 'package cli
+
+import _ "embed"
+
+//go:embed manual.md
+var Manual string'
+put internal/cli/manual.md 'v1'
+put internal/cli/notes.md 'v1'
+put internal/cli/x_test.go 'package cli
+
+//go:embed testonly.md
+var testOnly string'
+put internal/cli/testonly.md 'v1'
+# shellcheck disable=SC2016 # a Go raw string, literal backticks
+put web/web.go 'package web
+
+import "embed"
+
+//go:embed "static" all:hidden `assets/*.md`
+var FS embed.FS'
+put web/static/index.md 'v1'
+put web/static/sub/.hidden.md 'v1'
+put web/static/_skip.md 'v1'
+put web/hidden/.dot.md 'v1'
+put web/assets/logo.md 'v1'
+put web/assets/deep/logo.md 'v1'
+put docs/guide.md 'v1'
+put lane/go.mod 'module example.com/app/lane'
+put lane/lane.go 'package lane
+
+import _ "embed"
+
+//go:embed README.md
+var readme string'
+put lane/README.md 'v1'
+E0=$(commit "feat: initial")
+git tag v1.0.0 "$E0"
+git tag lane/v1.0.0 "$E0"
+for f in internal/cli/manual.md internal/cli/notes.md internal/cli/testonly.md web/static/index.md \
+  web/static/sub/.hidden.md web/static/_skip.md web/hidden/.dot.md web/assets/logo.md web/assets/deep/logo.md docs/guide.md; do
+  put "$f" 'v2'
+done
+E1=$(commit "fix: reword the shipped and unshipped docs")
+chk "S37 an embedded .md is significant; an unembedded or test-embedded one is not" \
+  "$(paths "$E0" "$E1")" 'true|[]|[]|["internal/cli/manual.md","web/assets/logo.md","web/hidden/.dot.md","web/static/index.md"]'
+chk "S37 and the release owes the root" "$(release S37 dev "$E0" "$E0" "$E1")" 'true|[]|[]'
+put lane/README.md 'v2'
+E2=$(commit "fix(lane): reword the embedded readme")
+chk "S38 an embedded file in a lane owes that lane, not the root" "$(release S38 dev "$E1" "$E1" "$E2")" 'false|[]|["lane"]'
+chk "S38 and MODE=paths names it" "$(paths "$E1" "$E2")" 'false|[]|["lane"]|["lane/README.md"]'
+put docs/guide.md 'v3'
+E3=$(commit "docs: the guide")
+chk "S39 an unembedded doc alone still releases nothing" "$(paths "$E2" "$E3")" 'false|[]|[]|[]'
+chk "S40 a tree the embed check cannot read fails the run, never drops the path" \
+  "$(failing_paths 'ls-tree*' 1 "$E2" "$E3")" '2|1'
+chk_has "S40 and says why" "$(cat "$WORK/perr")" "cannot read the //go:embed directives at $E3"
+# Go's embed skips a subdirectory that holds its own go.mod, so a directory
+# pattern above a nested module never names that module's files.
+newrepo embeds-nested
+put go.mod 'module example.com/site'
+put site.go 'package site
+
+import "embed"
+
+//go:embed docs
+var Docs embed.FS'
+put docs/guide.md 'v1'
+put docs/tool/go.mod 'module example.com/site/docs/tool'
+put docs/tool/README.md 'v1'
+N0=$(commit "feat: initial")
+put docs/guide.md 'v2'
+put docs/tool/README.md 'v2'
+N1=$(commit "docs: both")
+chk "S41 a directory pattern stops at a nested module" "$(paths "$N0" "$N1")" 'true|[]|[]|["docs/guide.md"]'
+# A directive in a file Go never builds embeds nothing: one under testdata or
+# a `_` directory, or behind `//go:build ignore`.
+newrepo embeds-ignored
+put go.mod 'module example.com/ign'
+put gen/gen.go '//go:build ignore
+
+package main
+
+import _ "embed"
+
+//go:embed notes.md
+var notes string'
+put gen/notes.md 'v1'
+put tools/testdata/t.go 'package t
+
+//go:embed fixture.md
+var f string'
+put tools/testdata/fixture.md 'v1'
+put _old/o.go 'package old
+
+//go:embed old.md
+var o string'
+put _old/old.md 'v1'
+I0=$(commit "feat: initial")
+put gen/notes.md 'v2'
+put tools/testdata/fixture.md 'v2'
+put _old/old.md 'v2'
+I1=$(commit "docs: all three")
+chk "S42 a directive in a file Go never builds embeds nothing" "$(paths "$I0" "$I1")" 'false|[]|[]|[]'
 cd "$WORK" || exit 1
 
 echo "PASS: path significance ($PASS checks)"
