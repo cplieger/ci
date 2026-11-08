@@ -21,6 +21,8 @@ jobs:
       ts_nested_dirs: ${{ steps.detect.outputs.ts_nested_dirs }}
       run_go_work: ${{ steps.detect.outputs.run_go_work }}
       go_work_dirs: ${{ steps.detect.outputs.go_work_dirs }}
+      run_go_os: ${{ steps.detect.outputs.run_go_os }}
+      go_os_matrix: ${{ steps.detect.outputs.go_os_matrix }}
       run_ts: ${{ steps.detect.outputs.run_ts }}
       run_web: ${{ steps.detect.outputs.run_web }}
       run_shell: ${{ steps.detect.outputs.run_shell }}
@@ -50,6 +52,8 @@ jobs:
           ts_nested_dirs="[]"
           run_go_work=false
           go_work_dirs="[]"
+          run_go_os=false
+          go_os_matrix="[]"
           run_ts=false
           run_web=false
           run_shell=false
@@ -160,6 +164,89 @@ jobs:
               go_work_dirs=$(jq -cR '[., inputs | select(. != "")]' <<< "$mod_dirs")
             fi
 
+            # A module tracking a Go file built for windows or darwin is also tested
+            # on that OS's runner, because the Linux go-ci leg may compile none of it.
+            # The rules are go/build's: the name before its first dot ends _GOOS or
+            # _GOOS_GOARCH with a known GOARCH, then an optional _test; or a //go:build
+            # line above the package clause names the OS as a non-negated term. A file
+            # belongs to the deepest module folder above it, and Go skips it when a
+            # name below that folder starts with _ or .
+            # scripts/test-lane-semantics.sh runs this block, to the matrix dedup.
+            go_os_files() {
+              local f b e os
+              local prune='(^|/)(node_modules|vendor|testdata)/'
+              local arch='386|amd64|amd64p32|arm|armbe|arm64|arm64be|loong64|mips|mipsle|mips64|mips64le'
+              arch+='|mips64p32|mips64p32le|ppc|ppc64|ppc64le|riscv|riscv64|s390|s390x|sparc|sparc64|wasm'
+              local suffix="_(windows|darwin)(_($arch))?(_test)?\$"
+              while IFS= read -r f; do
+                b=${f##*/}
+                if [[ ${b%%.*} =~ $suffix ]]; then
+                  printf '%s\t%s\n' "${BASH_REMATCH[1]}" "$f"
+                fi
+              done < <(git ls-files '*.go' | grep -Ev "$prune" || true)
+              while IFS= read -r f; do
+                e=$(awk '/^package[[:space:]]/ { exit } /^\/\/go:build[[:space:]]/ { print; exit }' "$f")
+                for os in $(go_build_positive_terms "${e#//go:build}" | grep -xE 'windows|darwin'); do
+                  printf '%s\t%s\n' "$os" "$f"
+                done
+              done < <(git grep -lE '^//go:build[[:space:]].*(windows|darwin)' -- '*.go' | grep -Ev "$prune" || true)
+            }
+            # Prints each term of a //go:build expression under an even number of
+            # negations, counting a ! before the term and each enclosing !( ).
+            go_build_positive_terms() {
+              local e=$1 c i p=0 pending=0 word="" stack=()
+              for ((i = 0; i <= ${#e}; i++)); do
+                c=${e:i:1}
+                if [[ $c =~ [A-Za-z0-9_.] ]]; then
+                  word+=$c
+                  continue
+                fi
+                if [ -n "$word" ]; then
+                  if [ $((p ^ pending)) -eq 0 ]; then
+                    printf '%s\n' "$word"
+                  fi
+                  word=""
+                  pending=0
+                fi
+                case "$c" in
+                  '!') pending=$((pending ^ 1)) ;;
+                  '(')
+                    stack+=("$p")
+                    p=$((p ^ pending))
+                    pending=0
+                    ;;
+                  ')')
+                    if [ "${#stack[@]}" -gt 0 ]; then
+                      p=${stack[-1]}
+                      unset 'stack[-1]'
+                    fi
+                    ;;
+                esac
+              done
+            }
+            while IFS=$'\t' read -r os f; do
+              [ -z "$f" ] && continue
+              case "$os" in
+                windows) runner=windows-latest ;;
+                *) runner=macos-latest ;;
+              esac
+              d=$(dirname "$f")
+              while [ "$d" != . ] && ! grep -qxF -- "$d" <<< "$mod_dirs"; do
+                d=$(dirname "$d")
+              done
+              grep -qxF -- "$d" <<< "$mod_dirs" || continue
+              rel=$f
+              [ "$d" = . ] || rel=${f#"$d"/}
+              if [[ /$rel =~ /[_.] ]]; then
+                continue
+              fi
+              go_os_matrix=$(jq -c --arg d "$d" --arg r "$runner" '. + [{dir: $d, runner: $r}]' <<< "$go_os_matrix")
+            done < <(go_os_files)
+            go_os_matrix=$(jq -c 'unique_by([.dir, .runner])' <<< "$go_os_matrix")
+            if [ "$go_os_matrix" != "[]" ]; then
+              run_go_os=true
+            fi
+
             # A module's TS half at <dir>/web (release.yaml's go_halves shape) is a
             # library, so it gets ts-ci without the web job's frontend lint.
             while IFS= read -r d; do
@@ -229,6 +316,8 @@ jobs:
             echo "ts_nested_dirs=$ts_nested_dirs"
             echo "run_go_work=$run_go_work"
             echo "go_work_dirs=$go_work_dirs"
+            echo "run_go_os=$run_go_os"
+            echo "go_os_matrix=$go_os_matrix"
             echo "run_ts=$run_ts"
             echo "run_web=$run_web"
             echo "run_shell=$run_shell"
@@ -248,6 +337,7 @@ jobs:
             echo "| go       | $run_go | . |"
             echo "| go-nested | $run_go_nested | $go_nested_dirs |"
             echo "| go-work  | $run_go_work | $go_work_dirs |"
+            echo "| go-os    | $run_go_os | $go_os_matrix |"
             echo "| ts       | $run_ts | . |"
             echo "| web      | $run_web | ${web_dir:-—} |"
             echo "| ts-nested | $run_ts_nested | $ts_nested_dirs |"
@@ -327,6 +417,19 @@ jobs:
             echo "::endgroup::"
           done
           exit "$rc"
+
+  go-os:
+    needs: detect
+    if: ${{ needs.detect.outputs.run_go_os == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.go_os_matrix) }}
+    uses: ./.github/workflows/go-os-ci.yaml
+    with:
+      runner: ${{ matrix.runner }}
+      working-directory: ${{ matrix.dir }}
+      go-version-file: ${{ matrix.dir }}/go.mod
 
   ts:
     needs: detect
@@ -422,6 +525,52 @@ jobs:
       ref: ${{ matrix.ref }}
       target: ${{ matrix.target }}
       exit-code: 'off'
+
+  # go-os-ci.yaml over public modules with windows or darwin Go files, at fixed
+  # commits, on each runner detect selects for them, so a change to that
+  # workflow or its pins that breaks a real module's leg fails here before a
+  # release carries it. Refresh a ref only when its module stops tracking such
+  # files.
+  go-os-canary:
+    needs: detect
+    if: ${{ github.repository == 'cplieger/ci' && needs.detect.outputs.code_changed == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repository: cplieger/deadset-go
+            ref: ec6d88c28c9a168b66ef8046be4e6157c5c9995a
+            dir: '.'
+            runner: windows-latest
+          - repository: cplieger/deadset-go
+            ref: ec6d88c28c9a168b66ef8046be4e6157c5c9995a
+            dir: '.'
+            runner: macos-latest
+          - repository: cplieger/bolttable
+            ref: 41fffbc67f3a87baf2d626c661b863a2ae25bdb1
+            dir: '.'
+            runner: macos-latest
+          - repository: cplieger/grelot
+            ref: 341d7a43812ac27ed4396064317a2d7eb56a00b7
+            dir: '.'
+            runner: windows-latest
+          - repository: cplieger/grelot
+            ref: 341d7a43812ac27ed4396064317a2d7eb56a00b7
+            dir: '.'
+            runner: macos-latest
+          # cplieger/go filesafe: the Windows POSIX-rename and sharing tests.
+          - repository: cplieger/go
+            ref: 8a4da7700fc6413d58f7cace2cd11c48282c2510
+            dir: filesafe
+            runner: windows-latest
+    uses: ./.github/workflows/go-os-ci.yaml
+    with:
+      repository: ${{ matrix.repository }}
+      ref: ${{ matrix.ref }}
+      runner: ${{ matrix.runner }}
+      working-directory: ${{ matrix.dir }}
+      # setup-go reads this path from the repository root.
+      go-version-file: ${{ matrix.dir }}/go.mod
 
   # Builds the image at PR time (single-arch, no push, no scan) and runs the
   # repo's image tests against it, so a Dockerfile that does not build or an
@@ -922,8 +1071,8 @@ jobs:
         continue-on-error: true
         run: |
           (
-            if [ -x scripts/test-cliff-bump-semantics.sh ]; then
-              ./scripts/test-cliff-bump-semantics.sh
+            if [ -f scripts/test-cliff-bump-semantics.sh ]; then
+              bash scripts/test-cliff-bump-semantics.sh
             else
               echo "no cliff semantics probe in this repo - skipping"
             fi
@@ -933,16 +1082,16 @@ jobs:
       # The cliff probe above pins the git-cliff side of the lane contract;
       # this one pins the SHELL side that release.yaml and the meta ci.yaml
       # embed inline (lane discovery eligibility, changed-path classification,
-      # module-path verification, version guards, escaping, and the
-      # web-frontend probe's folder order), so an edit to the prune list, the
-      # classification loop or the probe folders cannot merge if it breaks
-      # the pinned contract.
+      # module-path verification, version guards, escaping, the web-frontend
+      # probe's folder order and the go-os runner detection), so an edit to the
+      # prune list, the classification loop, the probe folders or the OS file
+      # rule cannot merge if it breaks the pinned contract.
       - name: Probe lane and web-probe shell semantics
         continue-on-error: true
         run: |
           (
-            if [ -x scripts/test-lane-semantics.sh ]; then
-              ./scripts/test-lane-semantics.sh
+            if [ -f scripts/test-lane-semantics.sh ]; then
+              bash scripts/test-lane-semantics.sh
             else
               echo "no lane semantics probe in this repo - skipping"
             fi
@@ -959,8 +1108,8 @@ jobs:
         continue-on-error: true
         run: |
           (
-            if [ -x scripts/test-verify-publish.sh ]; then
-              ./scripts/test-verify-publish.sh
+            if [ -f scripts/test-verify-publish.sh ]; then
+              bash scripts/test-verify-publish.sh
             else
               echo "no verify-publish probe in this repo - skipping"
             fi
@@ -976,8 +1125,8 @@ jobs:
         run: |
           set -euo pipefail
           (
-            if [ -x scripts/test-docker-release.sh ]; then
-              ./scripts/test-docker-release.sh
+            if [ -f scripts/test-docker-release.sh ]; then
+              bash scripts/test-docker-release.sh
             else
               echo "no docker-release probe in this repo - skipping"
             fi
@@ -1220,7 +1369,7 @@ jobs:
   # per-type templates so existing branch-protection rules keep working
   # without per-repo updates).
   validate:
-    needs: [detect, repo, go, go-nested, go-work, ts, web, ts-nested, shell, deadset, deadset-canary, docker, docker-arm64, markdown, python, scripts, pr-policy]
+    needs: [detect, repo, go, go-nested, go-work, go-os, go-os-canary, ts, web, ts-nested, shell, deadset, deadset-canary, docker, docker-arm64, markdown, python, scripts, pr-policy]
     if: always()
     runs-on: ubuntu-26.04
     timeout-minutes: 1
@@ -1232,6 +1381,8 @@ jobs:
           GO: ${{ needs.go.result }}
           GO_NESTED: ${{ needs.go-nested.result }}
           GO_WORK: ${{ needs.go-work.result }}
+          GO_OS: ${{ needs.go-os.result }}
+          GO_OS_CANARY: ${{ needs.go-os-canary.result }}
           TS: ${{ needs.ts.result }}
           WEB: ${{ needs.web.result }}
           TS_NESTED: ${{ needs.ts-nested.result }}
@@ -1257,14 +1408,14 @@ jobs:
           # them, which exposes a blind detection that skipped everything.
           ran=0
           skipped=0
-          set -- "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "go-work=$GO_WORK" "ts=$TS" "web=$WEB" "ts-nested=$TS_NESTED" "shell=$SHELL" "deadset=$DEADSET" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"
+          set -- "repo=$REPO" "go=$GO" "go-nested=$GO_NESTED" "go-work=$GO_WORK" "go-os=$GO_OS" "ts=$TS" "web=$WEB" "ts-nested=$TS_NESTED" "shell=$SHELL" "deadset=$DEADSET" "docker=$DOCKER" "docker-arm64=$DOCKER_ARM64" "markdown=$MARKDOWN" "python=$PYTHON" "scripts=$SCRIPTS"
           # pr-policy runs on two-branch repositories only, so only there is it
           # counted and listed.
           if [ "$TWO_BRANCH" = true ]; then
             set -- "$@" "pr-policy=$PR_POLICY"
           fi
           if [ "$CI_REPO" = true ]; then
-            set -- "$@" "deadset-canary=$DEADSET_CANARY"
+            set -- "$@" "deadset-canary=$DEADSET_CANARY" "go-os-canary=$GO_OS_CANARY"
           fi
           for pair in "$@"; do
             name="${pair%%=*}"; result="${pair##*=}"

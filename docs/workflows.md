@@ -13,6 +13,7 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | `go.mod` at the root | `go` | `go-ci.yaml` |
 | a `go.mod` in a subfolder, with tracked Go files | `go-nested` | `go-ci.yaml` once per module folder |
 | a Go module whose `go.mod` requires another module of the repository with no `replace` for it | `go-work` | a build and `go test -race` of every module against the other modules' current code, under a `go.work` the job creates and never commits |
+| a Go module that tracks a file built for Windows or macOS: a `_windows` or `_darwin` file-name constraint before the name's first dot (`x_windows.go`, `x_windows.pb.go`, `x_darwin_arm64_test.go`), or a `//go:build` line above the package clause naming `windows` or `darwin` as a term that is not negated, in a file Go does not ignore | `go-os` | `go-os-ci.yaml` on `windows-latest` or `macos-latest`, once per module and operating system |
 | `jsr.json` at the root | `ts` | `ts-ci.yaml` |
 | a `package.json` or `jsr.json` in `static-src/`, `web/`, `internal/server/static-src/` or `internal/webui/static-src/` | `web` | `ts-ci.yaml` in the first folder found, with the CSS and HTML lints on |
 | a `package.json` or `jsr.json` in the `web/` folder of a `go-nested` module | `ts-nested` | `ts-ci.yaml` once per such folder |
@@ -27,6 +28,8 @@ The `shell` and `scripts` jobs never both run, so no shell script is checked twi
 
 `go-ci.yaml` runs with `GOWORK=off`, so each module builds against the versions of the other modules that its `go.mod` names, as a consumer's build does. A module that starts using a change to another module of the repository therefore fails its `go-nested` job until that module's change is tagged and the `require` names the tag. The `go-work` job catches the opposite case: a change to one module that breaks another fails there, before either is tagged.
 
+In `cplieger/ci` itself, a `go-os-canary` job runs `go-os-ci.yaml` over public Go modules that track Windows or macOS files, at fixed commits, on each runner detection selects for them. A change to that workflow or its pins that breaks a real module's Windows or macOS leg fails that job before a release carries it.
+
 After the `amd64` build, the `docker` job runs two optional image tests. The shared smoke harness runs when the repository has `tests/image-smoke.conf`. A repository's own `tests/image-test.sh` runs with the image reference as its first argument, and it must be committed as executable. The release workflow runs both again on every image it builds, as [the release workflow](#the-release-workflow) describes.
 
 ## The language workflows
@@ -34,6 +37,7 @@ After the `amd64` build, the `docker` job runs two optional image tests. The sha
 | Workflow | What it runs |
 | --- | --- |
 | `go-ci.yaml` | `go vet`, golangci-lint, `go test -race`, govulncheck, `go mod verify`, a wiregen drift check, dependency review on public pull requests |
+| `go-os-ci.yaml` | on the `runner` input's Windows or macOS runner: `go vet`, golangci-lint, `go test -race`, and `go vet` for Linux, macOS and Windows on amd64 and arm64 |
 | `ts-ci.yaml` | `npm ci`, ESLint, `tsc`, knip for import cycles and undeclared dependencies, vitest, fast-check fuzz tests, Prettier, `package.json` and `jsr.json` version parity, a publish-surface check, dependency review |
 | `ts-ci.yaml` with `web-lint: true` | the above, plus Stylelint, html-validate and an import-map coverage check |
 | `shell-ci.yaml` | shellcheck, shfmt, hadolint on the `dockerfile` input unless it is empty, and `tests/shell/run.sh` when the repository has one |
@@ -65,7 +69,7 @@ Any finding at `deny` severity fails the check. So does a run that gives no answ
 
 Each run also writes SARIF and uploads it to code scanning, under the category `deadset`, or `deadset/<folder>` for a nested module. Each analyzer's findings stay a separate analysis inside that category. The upload needs `security-events: write`, which the synced `ci.yml` grants. It is skipped in private repositories, and a failed upload never fails the check.
 
-In `cplieger/ci` itself, a `deadset-canary` job runs the same workflow with the pinned deadset, deadset-go and deadset-ts over six public repositories at fixed commits, and ignores their findings. A version bump that makes deadset refuse a run or give no answer fails that job before a release carries it.
+In `cplieger/ci` itself, a `deadset-canary` job runs the same workflow with the pinned deadset, deadset-go and deadset-ts over seven public repositories at fixed commits, and ignores their findings. A version bump that makes deadset refuse a run or give no answer fails that job before a release carries it.
 
 ## The release workflow
 
