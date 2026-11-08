@@ -49,3 +49,30 @@ index df452f48..afa6b308 100644
  }
 
  func normalisePkgPath(pkg string) string {
+diff --git a/internal/engine/engine_test.go b/internal/engine/engine_test.go
+index 714271e..798e587 100644
+--- a/internal/engine/engine_test.go
++++ b/internal/engine/engine_test.go
+@@ -675,13 +675,20 @@ func TestPackageDiscovery(t *testing.T) {
+ 			name:     "from root, normal mode",
+ 			fromPkg:  ".",
+ 			intMode:  false,
+-			wantPath: "example.com",
++			wantPath: "example.com/testdata/fixtures",
+ 		},
+ 		{
+ 			name:     "from subpackage, normal mode",
+ 			fromPkg:  "testdata/main/fixture",
+ 			intMode:  false,
+-			wantPath: "example.com/testdata/main",
++			wantPath: "example.com/testdata/main/fixture/testdata/fixtures",
++		},
++		{
++			// The fixture is `package main`: the import path is still the file's directory.
++			name:     "a main package under cmd",
++			fromPkg:  "cmd/app",
++			intMode:  false,
++			wantPath: "example.com/cmd/app/testdata/fixtures",
+ 		},
+ 	}
+ 	for _, tc := range testCases {

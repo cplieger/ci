@@ -58,6 +58,32 @@ jobs:
       - name: Probe shared artifact-repo discovery
         run: bash scripts/test-discover-artifact-repos.sh
 
+  # The patches the weekly gremlins run builds into the tool, with the tests they
+  # carry, against the pinned gremlins release.
+  gremlins-patches:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Probe the gremlins patches
+        env:
+          # setup-go exports GOTOOLCHAIN=local and lags each Go patch release.
+          GOTOOLCHAIN: auto
+        run: bash scripts/test-gremlins-patches.sh
+
   # The issue transport every scheduled writer calls (scripts/tracker_issue.py)
   # and the body skeleton the three aggregators share (scripts/trackerlib.py).
   tracker-scripts:
