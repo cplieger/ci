@@ -79,7 +79,8 @@ else
   CHANGED=$(git ls-files)
 fi
 
-# Paths that never ship in an artifact (extended regex). Invariant: the
+# Paths that never ship in an artifact (extended regex), unless a non-test
+# //go:embed names one (shipped, below). Invariant: the
 # consumer cliff configs' `exclude_paths` (configs/cliff-*.toml) stay a strict
 # subset of this list, and every config file the ci sync writes (editor, lint,
 # CI and changelog configs) is matched here.
@@ -183,10 +184,32 @@ EXCLUDE_RE=$(
   echo "${EXCLUDE_PATTERNS[*]}"
 )
 
+# A path the excludes drop still ships when a non-test //go:embed names it
+# (grelot's embedded manual.md is its `grelot help`); go-embeds.py reads the
+# directives from HEAD's tree. Prints those of the paths on stdin.
+TOOLS_DIR=$(dirname "${BASH_SOURCE[0]}")
+embedded_of() { # <paths> -> the ones a non-test //go:embed names at HEAD; dies when the tree cannot be read
+  [ -n "$1" ] || return 0
+  printf '%s\n' "$1" | python3 "$TOOLS_DIR/go-embeds.py" "$HEAD" \
+    || die "cannot read the //go:embed directives at ${HEAD}"
+}
+# shipped <paths> -> the paths that ship: not excluded, or embedded
+shipped() {
+  local kept dropped embedded
+  kept=$(grep -Ev "$EXCLUDE_RE" <<<"$1" || true)
+  dropped=$(grep -E "$EXCLUDE_RE" <<<"$1" || true)
+  embedded=$(embedded_of "$dropped") || exit 2
+  while IFS= read -r f; do
+    # stderr: the caller captures stdout, and Actions reads both streams.
+    [ -z "$f" ] || note "$f is excluded by name, but a //go:embed names it, so it ships" >&2
+  done <<<"$embedded"
+  printf '%s\n%s\n' "$kept" "$embedded" | LC_ALL=C sort -u | sed '/^$/d'
+}
+
 if [ -z "$CHANGED" ]; then
   SIGNIFICANT=""
 else
-  SIGNIFICANT=$(echo "$CHANGED" | grep -Ev "$EXCLUDE_RE" || true)
+  SIGNIFICANT=$(shipped "$CHANGED") || exit 2
 fi
 
 # rebuild-stale.sh's empty commit forces an image rebuild against refreshed
@@ -359,8 +382,9 @@ for l in "${GO_LANES[@]}"; do
   fi
   note "lane ${l}: deriving changed paths from ${anchor}..HEAD (newest lane tag on this channel)"
   lane_diff=$(git diff --no-renames --name-only "$anchor..$HEAD" -- "$l/")
-  if [ -n "$lane_diff" ] && grep -Eqv "$EXCLUDE_RE" <<<"$lane_diff"; then
-    LANE_CHANGED["$l"]=true
+  if [ -n "$lane_diff" ]; then
+    lane_shipped=$(shipped "$lane_diff") || exit 2
+    [ -z "$lane_shipped" ] || LANE_CHANGED["$l"]=true
   fi
 done
 

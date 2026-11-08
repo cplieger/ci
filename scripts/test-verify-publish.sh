@@ -80,12 +80,13 @@ chk_has "V-P6 body waits through the shared registry helper" "$STEP_BODY" '. "$C
 chk_has "V-P7 body discovers lane tags at HEAD" "$STEP_BODY" 'git tag --points-at HEAD'
 chk "V-P8 body parses under bash" \
   "$(bash -n "$WORK/step.sh" 2>/dev/null && echo ok || echo bad)" "ok"
-# Guard against a tenth env var arriving later: the cases would leave it
+# Guard against another env var arriving later: the cases would leave it
 # unset, it would die under set -u, and that reads as a real refusal.
-chk "V-P9 step env is exactly the eleven the cases populate" \
+chk "V-P9 step env is exactly the twelve the cases populate" \
   "$(cat "$WORK/env-keys")" \
   "CHANNEL
 CI_TOOLS
+GH_TOKEN
 GO_LANES_JSON
 GO_NESTED_RESULT
 GO_RESULT
@@ -161,14 +162,29 @@ done <"$CURL_SPEC"
 printf 'stub: no spec entry for %s\n' "$URL"
 exit 22
 SH
-chmod 755 "$BIN/sleep" "$BIN/curl"
+# The branch head the handoff check reads; GH_HEAD empty is an unreadable head.
+cat >"$BIN/gh" <<'SH'
+#!/bin/sh
+case "$*" in
+  "api repos/cplieger/probe/git/ref/heads/dev --jq .object.sha")
+    [ -n "${GH_HEAD:-}" ] || { echo "gh: HTTP 401" >&2; exit 1; }
+    printf '%s\n' "$GH_HEAD"
+    exit 0
+    ;;
+esac
+echo "gh stub: unexpected $*" >&2
+exit 64
+SH
+chmod 755 "$BIN/sleep" "$BIN/curl" "$BIN/gh"
 
 # ── Case plumbing ────────────────────────────────────────────────────────────
 defaults() { # every case starts fully populated; an unset var dies under set -u
   export CHANNEL=stable VERSION=v1.2.3 SUBPACKAGES_JSON='[]' GO_LANES_JSON='[]'
   export GO_RESULT=skipped TS_RESULT=skipped SUBPACKAGE_RESULT=skipped GO_NESTED_RESULT=skipped
   export HALVES_JSON='[]' HALVES_RESULT=skipped
-  export CI_TOOLS="$ROOT/scripts"
+  export CI_TOOLS="$ROOT/scripts" GH_TOKEN=probe-token
+  export GITHUB_REPOSITORY=cplieger/probe GITHUB_REF_NAME=dev GITHUB_SHA=cccccccccccccccccccccccccccccccccccccccc
+  export GH_HEAD="$GITHUB_SHA"
   unset CURL_SERVE_PAT CURL_SERVE_FROM
 }
 spec() { # <line>...
@@ -513,5 +529,58 @@ spec "*registry.npmjs.org* 0 {}" "*jsr.io* 0 {}"
 run_step "$HALF"
 chk "V-K2 a public subpackage beside a private one still is" "$RC|$(cat "$CURL_LOG")" "0|$NPM_URL
 $JSR_URL"
+
+# ── V-R: a root handed off to a newer push ───────────────────────────────────
+# tag_ref_or_handoff leaves no root tag when the branch moved past the run, and
+# the run on the new head publishes and verifies the root.
+moved=dddddddddddddddddddddddddddddddddddddddd
+D=$(casedir r1)
+pkgjson "$D"
+gomod "$D"
+defaults
+export TS_RESULT=success GO_RESULT=success GH_HEAD=$moved
+spec "*registry.npmjs.org* 22 {}" "*proxy.golang.org* 22 x"
+run_step "$D"
+chk "V-R1 a handed-off root keeps the run green" "$RC" "0"
+chk_has "V-R1 the handoff is warned" "$OUT" \
+  "::warning::v1.2.3 is not tagged at $GITHUB_SHA and dev advanced past it (now $moved)"
+chk "V-R1 no root artifact is awaited" "$(lines "$CURL_LOG")" "0"
+
+D=$(casedir r2)
+pkgjson "$D"
+defaults
+export TS_RESULT=success
+spec "*registry.npmjs.org* 22 {}" "*jsr.io* 0 {}"
+run_step "$D"
+chk "V-R2 an untagged root with the branch still here is verified, and fails" "$RC" "1"
+chk_lacks "V-R2 no handoff is claimed" "$OUT" "advanced past"
+
+D=$(casedir r3)
+pkgjson "$D"
+defaults
+export TS_RESULT=success GH_HEAD=""
+spec "*registry.npmjs.org* 22 {}" "*jsr.io* 0 {}"
+run_step "$D"
+chk "V-R3 an unreadable head is no handoff" "$RC" "1"
+
+# The root tagged before the branch moved: its artifacts are owed here.
+TAGGED="$WORK/tagged"
+mkdir -p "$TAGGED"
+git -C "$TAGGED" init -q -b main
+git -C "$TAGGED" config user.email probe@ci.local
+git -C "$TAGGED" config user.name probe
+git -C "$TAGGED" config commit.gpgsign false
+pkgjson "$TAGGED"
+git -C "$TAGGED" add -A
+git -C "$TAGGED" commit -qm "feat: tagged root fixture"
+git -C "$TAGGED" tag v1.2.3
+defaults
+export TS_RESULT=success GITHUB_SHA
+GITHUB_SHA=$(git -C "$TAGGED" rev-parse HEAD)
+export GH_HEAD=$moved
+spec "*registry.npmjs.org* 22 {}" "*jsr.io* 0 {}"
+run_step "$TAGGED"
+chk "V-R4 a root tagged here is verified though the branch moved" "$RC" "1"
+chk_lacks "V-R4 no handoff is claimed" "$OUT" "advanced past"
 
 echo "PASS: verify-publish probe contract holds (${PASS} checks)"

@@ -137,7 +137,10 @@ gates = {
     "ra-needs": jobs["repair-assets"].get("needs"),
     "ra-perms": jobs["repair-assets"].get("permissions"),
     "ra-steps": names("repair-assets"),
-    "ra-step-ifs": [str(s.get("if", "")) for s in jobs["repair-assets"]["steps"][3:]],
+    "ra-step-ifs": [
+        str(s.get("if", ""))
+        for s in jobs["repair-assets"]["steps"][[s.get("name") for s in jobs["repair-assets"]["steps"]].index("Check the Release") + 1:]
+    ],
     "binaries-go-if": step_if("finalize", "Set up Go for the release binaries"),
     "binaries-go-order": fin.index("Set up Go for the release binaries") + 1 == fin.index("Stage and sign the release assets"),
     "binaries-go-with": next(s for s in jobs["finalize"]["steps"] if s.get("name") == "Set up Go for the release binaries")["with"],
@@ -307,6 +310,19 @@ for job in ("go", "ts"):
 for job, name in (("go", "Tag + GitHub Release"), ("ts", "Tag + GitHub Release"), ("go-nested", "Tag + GitHub Release (lane)")):
     step = next(s for s in rjobs[job]["steps"] if s.get("name") == name)
     open(f"{out}/{job}-tag.sh", "w").write(step["run"])
+# The handoff steps a superseded run takes before it publishes.
+for job, name, file in (
+    ("ts", "Hand off to a newer push", "ts-handoff.sh"),
+    ("subpackage", "Hand off with the root tag", "sub-handoff.sh"),
+    ("lane-halves", "Find the lane's tag", "lanetag.sh"),
+):
+    step = next(s for s in rjobs[job]["steps"] if s.get("name") == name)
+    open(f"{out}/{file}", "w").write(step["run"])
+handoff_ifs = {
+    job: [s.get("name") for s in rjobs[job]["steps"] if "handoff" in str(s.get("if", "")) or "lanetag" in str(s.get("if", ""))]
+    for job in ("ts", "subpackage", "lane-halves")
+}
+open(f"{out}/handoff-ifs.json", "w").write(json.dumps(handoff_ifs, sort_keys=True))
 publish = next(s for s in rjobs["repair-release"]["steps"] if s.get("name") == "Publish the missing Release")
 open(f"{out}/repair-publish.sh", "w").write(publish["run"])
 perms = {job: sorted(rjobs[job].get("permissions") or {}) for job in ("go", "ts", "go-nested", "docker")}
@@ -1839,7 +1855,7 @@ chk "D-A8 so a repair call runs the caller check and repair-assets alone" "$(gat
 chk "D-A8 and repair-assets only with one, reading and signing, in its own job" \
   "$(gate '."ra-if"')|$(gate '."ra-perms" | tojson')" "\${{ inputs.repair-tag != '' }}|{\"contents\":\"read\",\"id-token\":\"write\"}"
 chk "D-A8 checking the Release before installing, signing and uploading" "$(gate '."ra-steps" | join(",")')|$(gate '."ra-step-ifs" | unique | join(" ")')" \
-  "Checkout,Check out the ci source,Check the Release,Install Cosign,Set up Go for the release binaries,Sign the release assets,Hand the assets on|\${{ steps.release.outputs.missing == 'true' && inputs.binaries != '' }} \${{ steps.release.outputs.missing == 'true' }}"
+  "Checkout,Check out the ci source,Setup Python,Check the Release,Install Cosign,Set up Go for the release binaries,Sign the release assets,Hand the assets on|\${{ steps.release.outputs.missing == 'true' && inputs.binaries != '' }} \${{ steps.release.outputs.missing == 'true' }}"
 chk "D-A8 Go set up as finalize sets it up" "$(gate '."ra-go-with" | tojson')" "$(gate '."binaries-go-with" | tojson')"
 chk "D-A8 and the caller's binaries input reaches the signing step" \
   "$(sed -n 's/^BINARIES=//p;s/^GOTOOLCHAIN=//p' "$WORK/rassets.sh.envmap" | tr '\n' ' ')" '${{ inputs.binaries }} auto '
@@ -1958,7 +1974,7 @@ chk "D-G5 asking the source first, then that ancestor" "$(sed 's/.*-sha \([0-9a-
 chk_has "D-G6 runs on publishes of a promoted digest only" "$(gate '."provenance-if"')" \
   "env.PUBLISH == 'true' && env.PROMOTE_DIGEST != ''"
 chk "D-G6 after cosign and the tools are in place, before every registry write" "$(gate '."before-provenance" | join("|")')" \
-  "Checkout|Check out the ci source|Version ownership gate|Download digests|Set up Docker Buildx|Log in to GHCR|Install Cosign"
+  "Checkout|Check out the ci source|Version ownership gate|Download digests|Set up Docker Buildx|Log in to GHCR|Install Cosign|Setup Python"
 chk "D-G6 the next step reads the promoted SBOM, and the one after is the first write" \
   "$(gate '."after-provenance"')|$(gate '."first-write"')" "Read the promoted build's SBOM|Publish channel tags on GHCR"
 chk "D-G6 the source is the one the digest walk named" "$(sed -n 's/^PROMOTE_SOURCE=//p' "$WORK/provenance.sh.envmap")" \
@@ -2084,6 +2100,80 @@ for step in go-tag.sh ts-tag.sh go-nested-tag.sh devtag.sh; do
     "$(grep -c "api -X POST repos/owner/app/statuses/$C_BUILT -f state=success -f context=release/tag/v1.3.0-dev.4 " "$GH_LOG")|$(grep -c -- '-X DELETE' "$GH_LOG")" "1|0"
   chk "D-T16 $step exits 0" "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)" "0"
 done
+# A push that edits workflow files and lands past the run's commit takes the
+# integration token's ref-create (ui#42): every tag step hands off to the run
+# on the new head, with no receipt, and fails only while still at the head.
+for step in go-tag.sh ts-tag.sh go-nested-tag.sh devtag.sh; do
+  : >"$GH_LOG"
+  out_tag=$(GH_REF_FAIL=1 GH_HEAD="$C_DOCS" VERSION=v1.3.0-dev.4 CHANNEL=dev TAG=v1.3.0-dev.4 run_step "$step")
+  chk "D-T17 $step hands off once the branch moved past it" \
+    "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)|$(grep -c 'statuses/' "$GH_LOG" || true)" "0|0"
+  chk_has "D-T17 $step warns the handoff" "$out_tag" \
+    "::warning::tag v1.3.0-dev.4 not created: dev advanced past $C_BUILT (now $C_DOCS)"
+  : >"$GH_LOG"
+  out_tag=$(GH_REF_FAIL=1 GH_HEAD="$C_BUILT" VERSION=v1.3.0-dev.4 CHANNEL=dev TAG=v1.3.0-dev.4 run_step "$step")
+  chk "D-T18 $step fails a refused create while still at the head" \
+    "$(printf '%s' "$out_tag" | sed -n 's/^EXIT=//p')" "1"
+  chk_has "D-T18 $step says it is not a superseded run" "$out_tag" \
+    "::error::tag create for v1.3.0-dev.4 failed while this run is still dev's head"
+done
+# A superseded run stops before npm too: ts and subpackage publish ahead of a
+# tag, and a lane's half needs the lane's tag.
+cat >"$WORK/handoff-ifs.want" <<'JSON'
+{"lane-halves": ["Publish the lane's TS half"], "subpackage": ["Publish subpackage to npm + JSR"], "ts": ["Publish to npm + JSR", "Generate release notes", "Tag + GitHub Release"]}
+JSON
+chk "D-T19 the publishes and tags each handoff gates" "$(cat "$WORK/handoff-ifs.json")" "$(cat "$WORK/handoff-ifs.want")"
+run_step_in() { # <script in cwd>: run_step's environment, in the current directory
+  : >"$WORK/out"
+  PATH="$PBIN:$BIN:$PATH" GITHUB_OUTPUT="$WORK/out" CI_TOOLS="$ROOT/scripts" GITHUB_REPOSITORY=owner/app READBACK_SLEEP=0 \
+    bash "$1" 2>&1 || echo "EXIT=$?"
+}
+out_h=$(GH_HEAD="$C_DOCS" VERSION=v1.3.0-dev.4 run_step ts-handoff.sh)
+chk "D-T20 ts hands off when the branch moved before its publish" "$(out handoff)" "true"
+chk_has "D-T20 and warns" "$out_h" "::warning::dev advanced past $C_BUILT (now $C_DOCS) before the publish"
+GH_HEAD="$C_BUILT" VERSION=v1.3.0-dev.4 run_step ts-handoff.sh >/dev/null
+chk "D-T21 ts publishes while still at the head" "$(out handoff)" "false"
+GH_HEAD="" VERSION=v1.3.0-dev.4 run_step ts-handoff.sh >/dev/null
+chk "D-T21 ts publishes when the head is unreadable" "$(out handoff)" "false"
+TSREPO="$WORK/ts-handoff"
+rm -rf "$TSREPO"
+git init -q -b dev "$TSREPO"
+git -C "$TSREPO" -c user.email=p@ci.local -c user.name=p -c commit.gpgsign=false commit -q --allow-empty -m "feat: ts root"
+git -C "$TSREPO" tag v1.3.0-dev.4
+(cd "$TSREPO" && cp "$WORK/ts-handoff.sh" ./.t.sh && GH_HEAD="$C_DOCS" GITHUB_SHA="$(git rev-parse HEAD)" VERSION=v1.3.0-dev.4 \
+  run_step_in .t.sh) >/dev/null
+chk "D-T28 a ts rerun whose version is already tagged here repairs on though the branch moved" "$(out handoff)" "false"
+SUBREPO="$WORK/sub-handoff"
+rm -rf "$SUBREPO"
+git init -q -b dev "$SUBREPO"
+git -C "$SUBREPO" -c user.email=p@ci.local -c user.name=p -c commit.gpgsign=false commit -q --allow-empty -m "feat: root"
+SUB_SHA=$(git -C "$SUBREPO" rev-parse HEAD)
+sub_handoff() { # <head> -> runs the subpackage handoff in SUBREPO at SUB_SHA
+  (cd "$SUBREPO" && cp "$WORK/sub-handoff.sh" ./.h.sh && GH_HEAD="$1" GITHUB_SHA="$SUB_SHA" VERSION=v1.3.0-dev.4 DIR=web run_step_in .h.sh)
+}
+out_h=$(sub_handoff "$C_DOCS")
+chk "D-T22 a subpackage with no root tag here hands off once the branch moved" "$(out handoff)" "true"
+chk_has "D-T22 and names the subpackage" "$out_h" "The run on the new head publishes web."
+sub_handoff "$SUB_SHA" >/dev/null
+chk "D-T23 a subpackage with no root tag and the branch still here publishes" "$(out handoff)" "false"
+git -C "$SUBREPO" tag v1.3.0-dev.4
+sub_handoff "$C_DOCS" >/dev/null
+chk "D-T24 a subpackage whose root tag is here publishes though the branch moved" "$(out handoff)" "false"
+LANEREPO="$WORK/lane-handoff"
+rm -rf "$LANEREPO"
+git init -q -b dev "$LANEREPO"
+git -C "$LANEREPO" -c user.email=p@ci.local -c user.name=p -c commit.gpgsign=false commit -q --allow-empty -m "feat: lane"
+LANE_SHA=$(git -C "$LANEREPO" rev-parse HEAD)
+lanetag() { # <head> -> runs the lane-tag lookup in LANEREPO
+  (cd "$LANEREPO" && cp "$WORK/lanetag.sh" ./.l.sh && GH_HEAD="$1" GITHUB_SHA="$LANE_SHA" LANE=yamlenv CHANNEL=dev run_step_in .l.sh)
+}
+out_h=$(lanetag "$C_DOCS")
+chk "D-T25 a lane with no tag hands its half off once the branch moved" "$(out tag)|$(printf '%s' "$out_h" | grep -c '^EXIT=' || true)" "|0"
+out_h=$(lanetag "$LANE_SHA")
+chk "D-T26 a lane with no tag and the branch still here fails" "$(printf '%s' "$out_h" | sed -n 's/^EXIT=//p')" "1"
+git -C "$LANEREPO" tag yamlenv/v1.1.0-dev.2
+lanetag "$C_DOCS" >/dev/null
+chk "D-T27 a lane's tag here is its half's version" "$(out tag)" "yamlenv/v1.1.0-dev.2"
 
 # ── The image lane's completion receipt ──────────────────────────────────────
 : >"$GH_LOG"

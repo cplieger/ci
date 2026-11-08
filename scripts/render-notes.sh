@@ -158,7 +158,41 @@ render() {
   prev=$(previous_stable_tag)
   range=$commit
   [ -z "$prev" ] || range="${prev}..${commit}"
-  changes=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" --strip header "$range")
+  # A commit the path filter drops that changes a file a non-test //go:embed
+  # names ships, so its line belongs here (go-embeds.py; compute.sh counts it).
+  local -a with=() scope=(--config "${CONFIG:-${GIT_CLIFF_CONFIG:-cliff.toml}}")
+  local msg i embeds order
+  for ((i = 0; i < ${#SCOPE_ARGS[@]}; i += 2)); do
+    case "${SCOPE_ARGS[$i]}" in
+      --include-path) scope+=(--include "${SCOPE_ARGS[$((i + 1))]}") ;;
+      --exclude-path) scope+=(--exclude "${SCOPE_ARGS[$((i + 1))]}") ;;
+    esac
+  done
+  embeds=$(mktemp)
+  order=$(mktemp)
+  # shellcheck disable=SC2064 # the paths are fixed now
+  trap "rm -f '$embeds' '$order'" EXIT
+  python3 "$(dirname "$0")/go-embeds.py" --with-commits "$range" "${scope[@]}" --positions "$order" >"$embeds" \
+    || die "cannot read the //go:embed directives over ${range}"
+  while IFS= read -r -d '' msg; do
+    with+=(--with-commit "$msg")
+  done <"$embeds"
+  if [ "${#with[@]}" -eq 0 ]; then
+    changes=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" --strip header "$range")
+  else
+    # git-cliff 2.14.2 adds --with-commit commits to its last release, an empty
+    # one after the tagged release, which renders as a second block; so the
+    # releases' commits are merged into the tagged one, sorted back into the
+    # range's order (a --with-commit commit has an empty id, so it is found by
+    # its message), and rendered once.
+    local ctx
+    ctx=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" "${with[@]}" --context "$range")
+    changes=$(jq --slurpfile at "$order" '
+      (map(select(.version != null)) + map(select(.version == null))) as $r
+      | [$r[0] + {commits: ($r | map(.commits) | add
+          | sort_by(if .id != "" then $at[0].commits[.id] else $at[0].messages[.raw_message] end // 1e9))}]' <<<"$ctx" \
+      | "$CLIFF" "${CLIFF_ARGS[@]}" --from-context - --strip header)
+  fi
   if [ -n "$prev" ]; then
     changes+=$'\n\n'"**Full changelog**: https://github.com/${REPO}/compare/${prev}...${VERSION}"
     local inv=(diff --git-dir . --from "$prev" --to "$commit" --lane "${LANE:-.}" --format markdown)

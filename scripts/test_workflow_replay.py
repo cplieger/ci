@@ -60,6 +60,11 @@ class Expressions(unittest.TestCase):
         with self.assertRaises(wr.ReplayError):
             ev('hashFiles(a)', a={})
 
+    def test_format_past_its_arguments_is_refused(self):
+        self.assertEqual(ev("format('{{{0}}}-{1}', 'a', 'b')"), '{a}-b')
+        with self.assertRaisesRegex(wr.ReplayError, 'no argument 1'):
+            ev("format('{0}-{1}', 'a')")
+
     def test_render_whole_and_embedded(self):
         scope = wr.Scope({'a': {'v': True, 'w': 'x'}}, {}, [])
         self.assertEqual(scope.render('${{ a.v }}'), 'true')
@@ -211,12 +216,17 @@ class CiSource(unittest.TestCase):
                         'using': 'composite',
                         'steps': [
                             {
+                                'name': 'Setup Python',
+                                'uses': 'actions/setup-python@0000000000000000000000000000000000000000',
+                                'with': {'python-version': '3.15'},
+                            },
+                            {
                                 'id': 's',
                                 'shell': 'bash',
                                 'env': {'W': '${{ inputs.word }}'},
                                 'run': 'echo "said=$W:$(cat "$GITHUB_ACTION_PATH/../../marker")"'
                                 ' >> "$GITHUB_OUTPUT"',
-                            }
+                            },
                         ],
                     },
                 }
@@ -248,6 +258,8 @@ class CiSource(unittest.TestCase):
         self.assertEqual((rc, res['outputs']), (0, {'said': 'hi:root'}))
         self.assertEqual((self.cwd / '.src').resolve(), self.root.resolve())
         self.assertIn('Check out the ci source (checkout: --actions-root)', res['ran'])
+        # The composite's setup-python is inert: the replay already runs at the floor.
+        self.assertIn('say/Setup Python', res['ran'])
 
     def test_a_local_action_without_the_checkout_is_refused(self):
         rc, res = self.replay([{'id': 'a', 'uses': './.src/actions/say'}])

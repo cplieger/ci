@@ -79,7 +79,7 @@ fi
 git fetch --tags --quiet origin 2>/dev/null || true
 
 err="$(mktemp)"
-trap 'rm -f "$err"' EXIT
+trap 'rm -f "$err" "$err.embeds"' EXIT
 
 nearest_tag() { # <regex> -> the tag matching it on the commit nearest HEAD, or nothing; fails when git cannot list the tags or walk HEAD
   local -A tag_at=()
@@ -213,7 +213,25 @@ cliff_level() { # <from> <to> -> sets LEVEL and CLIFF_VERSION (its proposal)
       exit 1
     fi
   fi
-  if ! ctx="$("$CLIFF_BIN" --bump --context "${ARGS[@]}" "${range[@]}" 2>"$err")"; then
+  # A commit the path filter drops that changes a file a non-test //go:embed
+  # names ships, so its type counts (go-embeds.py; render-notes.sh lists it).
+  local -a with=() scope=(--config "${GIT_CLIFF_CONFIG:-cliff.toml}")
+  local msg i
+  for ((i = 0; i < ${#ARGS[@]}; i++)); do
+    case "${ARGS[$i]}" in
+      --include-path) scope+=(--include "${ARGS[$((i + 1))]}") ;;
+      --exclude-path) scope+=(--exclude "${ARGS[$((i + 1))]}") ;;
+    esac
+  done
+  python3 "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-embeds.py" --with-commits "${range[0]}" "${scope[@]}" \
+    >"$err.embeds" || {
+    echo "::error::cannot read the //go:embed directives over ${range[*]}"
+    exit 1
+  }
+  while IFS= read -r -d '' msg; do
+    with+=(--with-commit "$msg")
+  done <"$err.embeds"
+  if ! ctx="$("$CLIFF_BIN" --bump --context "${ARGS[@]}" "${with[@]}" "${range[@]}" 2>"$err")"; then
     echo "::error::git-cliff --bump --context failed over ${range[*]}:"
     sed 's/^/  /' "$err" >&2 || true
     exit 1

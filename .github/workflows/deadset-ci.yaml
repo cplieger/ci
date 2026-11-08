@@ -31,11 +31,11 @@ permissions:
 # this workflow over fixed repositories to prove each set before it ships.
 env:
   # renovate: datasource=go depName=github.com/cplieger/deadset/v2
-  DEADSET_VERSION: v2.0.0-dev.31
+  DEADSET_VERSION: v2.0.0-dev.39
   # renovate: datasource=go depName=github.com/cplieger/deadset-go/v2
-  DEADSET_GO_VERSION: v2.0.0-dev.36
+  DEADSET_GO_VERSION: v2.0.0-dev.43
   # renovate: datasource=npm depName=@cplieger/deadset-ts
-  DEADSET_TS_VERSION: 8.0.0-dev.16
+  DEADSET_TS_VERSION: 8.0.0-dev.18
 
 jobs:
   analyze:
@@ -107,6 +107,10 @@ jobs:
       # a newer Go than the target's go.mod or the `stable` manifest names.
       # The go command never retries a module proxy fetch, and proxy.golang.org
       # intermittently resets a download stream (HTTP/2 INTERNAL_ERROR).
+      # `go install pkg@version` fails when the module's newest go.mod cannot be
+      # read (its deprecation check, cmd/go/internal/load/pkg.go), as happens
+      # for minutes after each tag; `go get` ignores that error, so the pin is
+      # resolved in a throwaway module and built there.
       - name: Install deadset
         run: |
           set -euo pipefail
@@ -123,9 +127,14 @@ jobs:
               delay=$((delay * 2))
             done
           }
+          install_pinned() {
+            local scratch
+            scratch="$(mktemp -d "$RUNNER_TEMP/install.XXXXXX")"
+            (cd "$scratch" && go mod init install && retry go get "$1@$2" && go install "$1")
+          }
           export GOTOOLCHAIN=auto
           echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
-          retry go install "github.com/cplieger/deadset/v2/cmd/deadset@${DEADSET_VERSION}"
+          install_pinned github.com/cplieger/deadset/v2/cmd/deadset "$DEADSET_VERSION"
 
       # The census is the plan `deadset analyze` makes from the same flags, so
       # the job installs exactly the analyzers that run invokes. Its
@@ -244,7 +253,7 @@ jobs:
           NPM_DIRS: ${{ steps.census.outputs.npm_dirs }}
         run: |
           set -euo pipefail
-          # Install deadset's retry, for the same proxy resets.
+          # Install deadset's retry and install_pinned, for the same proxy faults.
           retry() {
             local attempt=1 max=4 delay=5
             until "$@"; do
@@ -258,8 +267,13 @@ jobs:
               delay=$((delay * 2))
             done
           }
+          install_pinned() {
+            local scratch
+            scratch="$(mktemp -d "$RUNNER_TEMP/install.XXXXXX")"
+            (cd "$scratch" && go mod init install && retry go get "$1@$2" && go install "$1")
+          }
           if [ "$GO" = true ]; then
-            retry go install "github.com/cplieger/deadset-go/v2/cmd/deadset-go@${DEADSET_GO_VERSION}"
+            install_pinned github.com/cplieger/deadset-go/v2/cmd/deadset-go "$DEADSET_GO_VERSION"
             while IFS= read -r dir; do
               if [ -z "$dir" ]; then continue; fi
               (cd "$dir" && retry go mod download)

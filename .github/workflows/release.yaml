@@ -259,6 +259,11 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       # Token-free: the steps up to Compute version run the repository's
       # cliff config.
       - name: Find pending promotions
@@ -577,6 +582,11 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Check the Release
         id: release
         env:
@@ -686,6 +696,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Check the Release
         id: release
@@ -843,6 +858,11 @@ jobs:
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Read back and record the receipt
         env:
           GH_TOKEN: ${{ github.token }}
@@ -892,6 +912,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Hold for dev
         env:
@@ -950,6 +975,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Check out the newest build
         id: target
@@ -1038,6 +1068,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Name the handoff
         id: name
@@ -1128,6 +1163,11 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Check out the newest build
         id: target
         env:
@@ -1196,6 +1236,11 @@ jobs:
           set -euo pipefail
           mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Check out the numbered build
         env:
           CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
@@ -1261,6 +1306,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Check out the newest build
         id: target
@@ -1335,6 +1385,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Check out the newest build
         id: target
@@ -1538,7 +1593,7 @@ jobs:
           fi
 
           # renovate: datasource=go depName=golang.org/x/exp
-          XEXP_VERSION=v0.0.0-20261014143641-f0251eb4aa3e
+          XEXP_VERSION=v0.0.0-20261106192419-47ce03d25ef0
           # gorelease TYPE-CHECKS the target module, so its own binary must be
           # built with a toolchain at least as new as that module's `go`
           # directive. A bare GOTOOLCHAIN=auto resolves the minimum x/exp needs
@@ -1678,6 +1733,11 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Generate release notes
         # Stable only: a dev build creates no Release. Deliberately
         # token-free: this step downloads and EXECUTES git-cliff, and an
@@ -1722,13 +1782,16 @@ jobs:
           set -euo pipefail
           # Tag ref created first via the git data API, pinned to the trigger
           # commit; release then attaches to the existing tag (no --target).
-          # `gh release create --target` tag-creation 403s for the integration
-          # token when a mid-run push moved the branch past $GITHUB_SHA; the git
-          # ref create has no head restriction. A dev build gets the tag, its
-          # receipt and no Release.
+          # Once a push that edits workflow files lands past $GITHUB_SHA, the
+          # integration token loses ref-create, and the run on the new head
+          # releases this range, so that failure hands off (tag-ref.sh). A dev
+          # build gets the tag, its receipt and no Release.
           . "$CI_TOOLS/retry.sh"
           . "$CI_TOOLS/tag-ref.sh"
-          tag_ref "$GITHUB_REPOSITORY" "$VERSION" "$GITHUB_SHA" || exit 1
+          rc=0
+          tag_ref_or_handoff "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" || rc=$?
+          [ "$rc" -ne 2 ] || exit 0
+          [ "$rc" -eq 0 ] || exit 1
           if [ "$CHANNEL" != "stable" ]; then
             # The audit reads this receipt: a dev tag has no Release to show
             # that the pipeline, not a hand, created it. A tag without it would
@@ -1794,7 +1857,32 @@ jobs:
           set -euo pipefail
           npm ci
 
+      # Before npm's publish, which a handed-off tag would leave behind: once
+      # the branch has moved past this commit, the run on the new head
+      # releases this range. A version already tagged here is this run's own
+      # (a rerun after a failed Release), so it repairs on. branch_moved_past's
+      # rule (tag-ref.sh), read inline because the ci source is checked out
+      # only after the package's lifecycle scripts have run.
+      - name: Hand off to a newer push
+        id: handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          at=$(git rev-list -n1 "$VERSION" 2>/dev/null || true)
+          head=""
+          [ "$at" = "$GITHUB_SHA" ] \
+            || head=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha 2>/dev/null || true)
+          if [ -n "$head" ] && [ "$head" != "$GITHUB_SHA" ]; then
+            echo "::warning::${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${head}) before the publish. The run on the new head releases this range."
+            echo "handoff=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "handoff=false" >>"$GITHUB_OUTPUT"
+          fi
+
       - name: Publish to npm + JSR
+        if: ${{ steps.handoff.outputs.handoff != 'true' }}
         # The version-exists guards below make a rerun of the publish path
         # skip what already landed.
         env:
@@ -1849,10 +1937,15 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Generate release notes
         # Stable only; deliberately token-free — this step executes the
         # downloaded git-cliff binary; see the go job's identical split.
-        if: ${{ needs.detect.outputs.channel == 'stable' }}
+        if: ${{ steps.handoff.outputs.handoff != 'true' && needs.detect.outputs.channel == 'stable' }}
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
@@ -1879,6 +1972,7 @@ jobs:
           bash "$CI_TOOLS/render-notes.sh" "${args[@]}"
 
       - name: Tag + GitHub Release
+        if: ${{ steps.handoff.outputs.handoff != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
@@ -1888,13 +1982,16 @@ jobs:
           set -euo pipefail
           # Tag ref created first via the git data API, pinned to the trigger
           # commit; release then attaches to the existing tag (no --target).
-          # `gh release create --target` tag-creation 403s for the integration
-          # token when a mid-run push moved the branch past $GITHUB_SHA; the git
-          # ref create has no head restriction. A dev build gets the tag, its
-          # receipt and no Release.
+          # Once a push that edits workflow files lands past $GITHUB_SHA, the
+          # integration token loses ref-create, and the run on the new head
+          # releases this range, so that failure hands off (tag-ref.sh). A dev
+          # build gets the tag, its receipt and no Release.
           . "$CI_TOOLS/retry.sh"
           . "$CI_TOOLS/tag-ref.sh"
-          tag_ref "$GITHUB_REPOSITORY" "$VERSION" "$GITHUB_SHA" || exit 1
+          rc=0
+          tag_ref_or_handoff "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" || rc=$?
+          [ "$rc" -ne 2 ] || exit 0
+          [ "$rc" -eq 0 ] || exit 1
           if [ "$CHANNEL" != "stable" ]; then
             # The audit reads this receipt: a dev tag has no Release to show
             # that the pipeline, not a hand, created it. A tag without it would
@@ -1964,7 +2061,32 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      # A subpackage publishes at the root version, so without the root tag
+      # here it would leave npm a version no tag names. A root job that handed
+      # its tag off (tag_ref_or_handoff) left none, and the run on the new
+      # head publishes both; a root with no tag and the branch still here
+      # publishes as before.
+      - name: Hand off with the root tag
+        id: handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          VERSION: ${{ needs.detect.outputs.version }}
+          DIR: ${{ matrix.dir }}
+        run: |
+          set -euo pipefail
+          handoff=false
+          if [ "$(git rev-list -n1 "$VERSION" 2>/dev/null || true)" != "$GITHUB_SHA" ]; then
+            . "$CI_TOOLS/tag-ref.sh"
+            if head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA"); then
+              echo "::warning::${VERSION} is not tagged here and ${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${head}). The run on the new head publishes ${DIR}."
+              handoff=true
+            fi
+          fi
+          echo "handoff=${handoff}" >>"$GITHUB_OUTPUT"
+
       - name: Publish subpackage to npm + JSR
+        if: ${{ steps.handoff.outputs.handoff != 'true' }}
         working-directory: ${{ matrix.dir }}
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
@@ -2103,6 +2225,11 @@ jobs:
           fi
           echo "ok: module path '$modpath' matches lane ${DIR} ($VERSION)"
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       # Before the tag, which reserves the version for the lane's TS half too.
       - name: Check the half's npm versions
         if: ${{ steps.lane.outputs.release == 'true' }}
@@ -2143,12 +2270,16 @@ jobs:
         run: |
           set -euo pipefail
           # Tag ref via the git data API pinned to the trigger commit, with
-          # the exists-at-different-SHA refuse guard (mirrors the root go
-          # job; slash tags are ordinary multi-segment refs). A dev lane
-          # build gets the tag, its receipt and no Release.
+          # the exists-at-different-SHA refuse guard and the superseded-run
+          # handoff (mirrors the root go job; slash tags are ordinary
+          # multi-segment refs). A dev lane build gets the tag, its receipt
+          # and no Release.
           . "$CI_TOOLS/retry.sh"
           . "$CI_TOOLS/tag-ref.sh"
-          tag_ref "$GITHUB_REPOSITORY" "$VERSION" "$GITHUB_SHA" || exit 1
+          rc=0
+          tag_ref_or_handoff "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" || rc=$?
+          [ "$rc" -ne 2 ] || exit 0
+          [ "$rc" -eq 0 ] || exit 1
           if [ "$CHANNEL" != "stable" ]; then
             # The audit reads this receipt: a dev tag has no Release to show
             # that the pipeline, not a hand, created it. A tag without it would
@@ -2213,15 +2344,16 @@ jobs:
           persist-credentials: false
 
       # The lane's tag at HEAD is the version: a matrix job's outputs are
-      # last-writer-wins across its legs, so go-nested cannot hand it on.
-      - name: Publish the lane's TS half
-        working-directory: ${{ matrix.lane }}/web
+      # last-writer-wins across its legs, so go-nested cannot hand it on. A
+      # lane that handed its tag off to a newer push (tag_ref_or_handoff)
+      # leaves none, and the run on the new head publishes the half.
+      - name: Find the lane's tag
+        id: lanetag
         env:
+          GH_TOKEN: ${{ github.token }}
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           LANE: ${{ matrix.lane }}
           CHANNEL: ${{ needs.detect.outputs.channel }}
-          # renovate: datasource=npm depName=jsr
-          JSR_VERSION: 0.14.3
         run: |
           set -euo pipefail
           if [ "$CHANNEL" = stable ]; then
@@ -2231,11 +2363,31 @@ jobs:
           fi
           tag=$(sort -V <<<"$tags" | tail -n1)
           if [ -z "$tag" ]; then
+            . "$CI_TOOLS/tag-ref.sh"
+            if head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA"); then
+              echo "::warning::lane ${LANE} has no ${CHANNEL} tag at ${GITHUB_SHA} and ${GITHUB_REF_NAME} advanced past it (now ${head}). The run on the new head publishes its TS half."
+              echo "tag=" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
             echo "::error::lane ${LANE} has no ${CHANNEL} tag at $(git rev-parse HEAD), though go-nested released it. Its TS half is not published without one."
             exit 1
           fi
-          echo "lane ${LANE}: publishing ${LANE}/web at ${tag}"
-          VERSION="$tag" bash "$CI_TOOLS/publish-subpackage.sh"
+          echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+
+      - name: Publish the lane's TS half
+        if: ${{ steps.lanetag.outputs.tag != '' }}
+        working-directory: ${{ matrix.lane }}/web
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          LANE: ${{ matrix.lane }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
+          VERSION: ${{ steps.lanetag.outputs.tag }}
+          # renovate: datasource=npm depName=jsr
+          JSR_VERSION: 0.14.3
+        run: |
+          set -euo pipefail
+          echo "lane ${LANE}: publishing ${LANE}/web at ${VERSION}"
+          bash "$CI_TOOLS/publish-subpackage.sh"
 
   # ─── Verify every registry this run published to ──────────────────────────
   # A green publish job is not proof the artifact is fetchable. Each lane that
@@ -2279,6 +2431,7 @@ jobs:
 
       - name: Verify published artifacts
         env:
+          GH_TOKEN: ${{ github.token }}
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           CHANNEL: ${{ needs.detect.outputs.channel }}
           VERSION: ${{ needs.detect.outputs.version }}
@@ -2362,12 +2515,24 @@ jobs:
             fi
           }
 
+          # A root job that handed its tag off to a newer push (tag_ref_or_handoff)
+          # succeeded with no root tag here; the run on the new head publishes
+          # and verifies the root, so its artifacts are not awaited here.
+          root=true
+          if [ -n "$VERSION" ] && [ "$(git rev-list -n1 "$VERSION" 2>/dev/null || true)" != "$GITHUB_SHA" ]; then
+            . "$CI_TOOLS/tag-ref.sh"
+            if head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA"); then
+              echo "::warning::${VERSION} is not tagged at ${GITHUB_SHA} and ${GITHUB_REF_NAME} advanced past it (now ${head}). The root was handed off, so its artifacts are not verified here."
+              root=false
+            fi
+          fi
+
           # npm's bound is the longest on the shared clock (retry.sh), so npm
           # waits first; the proxy probed after it gets what its own bound left.
-          if [ "$TS_RESULT" = "success" ]; then
+          if [ "$root" = true ] && [ "$TS_RESULT" = "success" ]; then
             probe_ts package.json
           fi
-          if [ "$SUBPACKAGE_RESULT" = "success" ]; then
+          if [ "$root" = true ] && [ "$SUBPACKAGE_RESULT" = "success" ]; then
             while IFS= read -r d; do
               [ -z "$d" ] && continue
               probe_ts "$d/package.json"
@@ -2382,7 +2547,7 @@ jobs:
               done < <(lane_tags_at_head "$d")
             done < <(jq -r '.[]' <<<"$HALVES_JSON")
           fi
-          if [ "$GO_RESULT" = "success" ]; then
+          if [ "$root" = true ] && [ "$GO_RESULT" = "success" ]; then
             probe_go go.mod "$VERSION" || rc=1
           fi
           if [ "$GO_NESTED_RESULT" = "success" ]; then
@@ -2430,6 +2595,11 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Record completion receipts
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2443,8 +2613,19 @@ jobs:
           GO_NESTED_RESULT: ${{ needs.go-nested.result }}
         run: |
           set -euo pipefail
-          if [ "$GO_RESULT" = "success" ] || [ "$TS_RESULT" = "success" ]; then
-            bash "$CI_TOOLS/release-state.sh" receipt "$VERSION" "$(git rev-list -n1 "$VERSION")"
+          root_at=$(git rev-list -n1 "$VERSION" 2>/dev/null || true)
+          if { [ "$GO_RESULT" = "success" ] || [ "$TS_RESULT" = "success" ]; } && [ -z "$root_at" ]; then
+            # A root that handed its tag off to a newer push (tag_ref_or_handoff)
+            # left none; the run on the new head records this version's receipt.
+            . "$CI_TOOLS/tag-ref.sh"
+            if head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA"); then
+              echo "::warning::${VERSION} was handed off to ${GITHUB_REF_NAME}'s new head ${head}, so its receipt is that run's"
+            else
+              echo "::error::${VERSION} has no tag, though the root job succeeded"
+              exit 1
+            fi
+          elif [ "$GO_RESULT" = "success" ] || [ "$TS_RESULT" = "success" ]; then
+            bash "$CI_TOOLS/release-state.sh" receipt "$VERSION" "$root_at"
           elif [ "$DOCKER_RESULT" = "success" ] && [ "$SUBPACKAGE_RESULT" = "success" ] \
             && [ "$(git rev-list -n1 "$VERSION" 2>/dev/null)" = "$GITHUB_SHA" ]; then
             bash "$CI_TOOLS/release-state.sh" receipt "$VERSION" "$GITHUB_SHA"

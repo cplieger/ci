@@ -38,13 +38,33 @@ def floor() -> str:
     return f'{major}.{minor}'
 
 
+# A call or source of a repository shell script (`bash "$CI_TOOLS/x.sh"`,
+# `. "$TOOLS/tag-ref.sh"`): its Python runs on the job's interpreter too.
+SHELL_CALL = re.compile(
+    r'(?:^|[\s;(&|`])(?:bash|sh|\.|source)\s+["\']?[^\s"\';|&)]*?([\w.-]+\.sh)\b'
+)
+
+
+def code_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if not line.lstrip().startswith('#')]
+
+
+def calls_python(lines: list[str], seen: set[pathlib.Path]) -> bool:
+    """Whether the lines run Python, directly or through a repository shell script."""
+    for line in lines:
+        if PYTHON_CALL.search(line) or PIP_INSTALL.search(line):
+            return True
+        for name in SHELL_CALL.findall(line):
+            for script in (*ROOT.glob(f'scripts/{name}'), *ROOT.glob(f'actions/*/{name}')):
+                if script not in seen:
+                    seen.add(script)
+                    if calls_python(code_lines(script.read_text()), seen):
+                        return True
+    return False
+
+
 def runs_python(step: dict) -> bool:
-    run = step.get('run') or ''
-    return any(
-        PYTHON_CALL.search(line) or PIP_INSTALL.search(line)
-        for line in run.splitlines()
-        if not line.lstrip().startswith('#')
-    )
+    return calls_python(code_lines(step.get('run') or ''), set())
 
 
 def step_lists():
@@ -166,6 +186,13 @@ class TestPythonSetup(unittest.TestCase):
             'npm install',
         ):
             assert not runs_python({'run': run}), run
+
+    def test_the_detector_follows_shell_scripts_to_their_python(self):
+        # render-notes.sh runs inventory.py; tag-ref.sh runs no Python.
+        assert runs_python({'run': 'bash "$CI_TOOLS/render-notes.sh" "${args[@]}"'})
+        assert runs_python({'run': 'bash "$GITHUB_ACTION_PATH/compute.sh"'})
+        assert not runs_python({'run': '. "$CI_TOOLS/tag-ref.sh"'})
+        assert not runs_python({'run': '# bash "$CI_TOOLS/render-notes.sh"'})
 
     def test_the_detector_follows_subprocess_scripts_and_skips_comments(self):
         self.assertEqual(scripts_run([{'run': '# see gremlins-aggregate.py\necho hi'}]), set())
