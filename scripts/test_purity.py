@@ -153,6 +153,7 @@ class HeldLanesCli(unittest.TestCase):
         want = promote.held_lanes(repo, commit)
         self.assertTrue(want, 'the fixture must hold a lane')
         self.assertEqual(json.loads(got.stdout), want)
+        return want
 
     def test_a_path_git_quotes_is_read_as_promote_reads_it(self):
         c = self.commit(
@@ -174,10 +175,28 @@ class HeldLanesCli(unittest.TestCase):
             }
         )
         self.assert_agrees_with_promote(c)
-        c = self.commit({'wiregen/web/package.json': b'{"name": "\xff"'})
-        got = self.cli(c, lanes='["wiregen"]')
-        self.assertEqual(got.returncode, 2, got.stderr)
-        self.assertIn('wiregen/web/package.json', got.stderr)
+        c = self.commit(
+            {
+                'wiregen/go.mod': GO_MOD.format(sub='/wiregen') + STABLE_PIN,
+                'wiregen/web/package.json': (
+                    b'{"description": "\xff", "dependencies": {"@cplieger/x": "1.0.0-dev.1"}}'
+                ),
+            }
+        )
+        held = self.assert_agrees_with_promote(c)
+        self.assertEqual(
+            held, {'wiregen': ['wiregen/web/package.json: dependencies @cplieger/x 1.0.0-dev.1']}
+        )
+
+    def test_a_file_name_that_is_not_utf8_does_not_hide_the_tree(self):
+        c = self.commit(
+            {
+                'wiregen/go.mod': GO_MOD.format(sub='/wiregen') + DEV_PIN,
+                'wiregen/w.go': 'package wiregen\n',
+                os.fsdecode(b'docs/caf\xff.txt'): 'x\n',
+            }
+        )
+        self.assert_agrees_with_promote(c)
 
     def test_a_bad_commit_or_lane_list_exits_1(self):
         self.commit({'wiregen/go.mod': GO_MOD.format(sub='/wiregen')})

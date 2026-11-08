@@ -198,10 +198,9 @@ def tree_files(repo: inventory.Repo, commit: str) -> dict[str, str]:
     return {p: repo.blob(commit, p) or '' for p in repo.paths(commit) if is_purity_file(p)}
 
 
-def held_lanes(commit: str, lanes: list[str], git_dir: str = '.') -> dict[str, list[str]]:
-    """lane_holds over the nested lanes' purity files at `commit`."""
-    files = tree_files(inventory.Repo(git_dir), commit)
-    return lane_holds({p: t for p, t in files.items() if inventory.lane_of(p, lanes) != '.'}, lanes)
+def held_lanes(commit: str, lanes: list[str]) -> dict[str, list[str]]:
+    """lane_holds over the purity files at `commit` in the working directory's repository."""
+    return lane_holds(tree_files(inventory.Repo('.'), commit), lanes)
 
 
 def main(argv: list[str]) -> int:

@@ -917,8 +917,18 @@ class Repo:
 
     def paths(self, sha: str) -> list[str]:
         if sha not in self._trees:
+            # -z prints each name's raw bytes. Decoded as blob() decodes text, a
+            # name that is not UTF-8 lists, and reads back through argv, instead
+            # of failing the whole tree.
+            args = ('ls-tree', '-r', '-z', '--name-only', sha)
+            proc = subprocess.run(
+                ['git', '-C', self.git_dir, *args], capture_output=True, check=False
+            )
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode(errors='replace').strip()
+                raise GitReadError(f'git {" ".join(args)}: {stderr}')
             self._trees[sha] = [
-                p for p in self.git('ls-tree', '-r', '-z', '--name-only', sha).split('\0') if p
+                p.decode(errors='surrogateescape') for p in proc.stdout.split(b'\0') if p
             ]
             self._present[sha] = set(self._trees[sha])
         return self._trees[sha]
