@@ -10,6 +10,8 @@ import sys
 import tempfile
 import unittest
 
+import inventory
+import promote
 import purity
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -62,6 +64,13 @@ class LaneHolds(unittest.TestCase):
         with self.assertRaises(purity.PurityInputError):
             purity.lane_holds({'sse/web/package.json': '{'}, ['sse'])
 
+    def test_purity_file_selection(self):
+        self.assertTrue(purity.is_purity_file('go.mod'))
+        self.assertTrue(purity.is_purity_file('web/jsr.json'))
+        self.assertTrue(purity.is_purity_file('Dockerfile.arm64'))
+        self.assertFalse(purity.is_purity_file('static-src/node_modules/x/package.json'))
+        self.assertFalse(purity.is_purity_file('main.go'))
+
 
 class HeldLanesCli(unittest.TestCase):
     """The CLI reads a commit's tree, not the work tree, as release-state.sh needs."""
@@ -92,7 +101,10 @@ class HeldLanesCli(unittest.TestCase):
         for path, text in files.items():
             p = self.repo / path
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(text)
+            if isinstance(text, bytes):
+                p.write_bytes(text)
+            else:
+                p.write_text(text)
             self.git('add', path)
         self.git('commit', '-q', '-m', 'c')
         return self.git('rev-parse', 'HEAD')
@@ -131,6 +143,41 @@ class HeldLanesCli(unittest.TestCase):
         got = self.cli(c)
         self.assertEqual(got.returncode, 2, got.stdout)
         self.assertIn('wiregen/web/jsr.json', got.stderr)
+
+    def assert_agrees_with_promote(self, commit):
+        """The CLI holds exactly the lanes promote.py's preview names at `commit`."""
+        repo = inventory.Repo(str(self.repo))
+        lanes = repo.lanes(commit)
+        got = self.cli(commit, lanes=json.dumps(lanes))
+        self.assertEqual(got.returncode, 0, got.stderr)
+        want = promote.held_lanes(repo, commit)
+        self.assertTrue(want, 'the fixture must hold a lane')
+        self.assertEqual(json.loads(got.stdout), want)
+
+    def test_a_path_git_quotes_is_read_as_promote_reads_it(self):
+        c = self.commit(
+            {
+                'wiregen/go.mod': GO_MOD.format(sub='/wiregen') + STABLE_PIN,
+                'wiregen/w.go': 'package wiregen\n',
+                'wiregen/wéb "x"/package.json': '{"dependencies": {"@cplieger/x": "1.0.0-dev.1"}}',
+            }
+        )
+        self.assert_agrees_with_promote(c)
+
+    def test_a_manifest_with_a_non_utf8_byte_is_read_as_promote_reads_it(self):
+        c = self.commit(
+            {
+                'wiregen/go.mod': GO_MOD.format(sub='/wiregen').encode()
+                + b'// \xff\xfe\n'
+                + DEV_PIN.encode(),
+                'wiregen/w.go': 'package wiregen\n',
+            }
+        )
+        self.assert_agrees_with_promote(c)
+        c = self.commit({'wiregen/web/package.json': b'{"name": "\xff"'})
+        got = self.cli(c, lanes='["wiregen"]')
+        self.assertEqual(got.returncode, 2, got.stderr)
+        self.assertIn('wiregen/web/package.json', got.stderr)
 
     def test_a_bad_commit_or_lane_list_exits_1(self):
         self.commit({'wiregen/go.mod': GO_MOD.format(sub='/wiregen')})

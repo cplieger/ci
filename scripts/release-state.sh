@@ -303,7 +303,7 @@ cmd_hold() {
     [ -n "$l" ] || continue
     note "lane ${l}: held back, because it pins a first-party dependency at a dev version (${why}). It publishes from the first stable run whose tree pins it only at stable versions."
   done < <(jq -r --argjson mods "$mods" 'to_entries[] | select(.key as $k | $mods | index($k)) | [.key, (.value | join("; "))] | @tsv' <<<"$held")
-  out "go_modules_to_release=${kept}" "held=$(jq -c --argjson mods "$mods" 'with_entries(select(.key as $k | $mods | index($k)))' <<<"$held")"
+  out "go_modules_to_release=${kept}"
 }
 
 # A dev build is numbered as the next promotion, so a build of a library lane

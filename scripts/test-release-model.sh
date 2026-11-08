@@ -302,6 +302,12 @@ result() { cat "$RUN.result"; }
 detect() { jq -r ".outputs.$1" "$RUN.detect.json"; }
 lane_state() { detect lane_state | jq -r --arg k "$1" ".[\$k].$2"; }
 step_out() { jq -r ".steps.$1.outputs.$2" "$RUN.detect.json"; }
+step_log() { # <step name>: what the detect step printed, stdout then stderr
+  local i
+  i=$(jq -r --arg n "$1" '.ran | index($n) // empty' "$RUN.detect.json")
+  [ -n "$i" ] || fail "detect ran no step named '$1'"
+  cat "$(jq -r .runner_temp "$RUN.detect.json")/log-$i.txt"
+}
 lane_notes() { head -n1 "$RUN.lane-$1.notes"; }
 
 # ── A promotion: promote.yaml's jobs ─────────────────────────────────────────
@@ -607,8 +613,9 @@ chk_has "M38 its checks say the rest publishes" \
   'Held back: lane `wire` pins a first-party dependency at a dev version (wire/go.mod: github.com/cplieger/go/filesafe v1.0.0-dev.6)'
 run_release main held1
 chk "M39 the stable run publishes the other lane only" "$(result)" "yamlenv/v1.3.0"
-chk "M39 and says which lane it held and why" "$(step_out hold held)|$(detect go_modules_to_release)" \
-  '{"wire":["wire/go.mod: github.com/cplieger/go/filesafe v1.0.0-dev.6"]}|["yamlenv"]'
+chk "M39 and drops the held lane from the lanes it releases" "$(detect go_modules_to_release)" '["yamlenv"]'
+chk_has "M39 and says in its log which lane it held and why" "$(step_log 'Hold back lanes that pin a dev version')" \
+  '::notice::lane wire: held back, because it pins a first-party dependency at a dev version (wire/go.mod: github.com/cplieger/go/filesafe v1.0.0-dev.6).'
 commit_on main "fix(deps): update module example.org/dep to v1.3.7" go.mod="$(gomod v1.3.7)" >/dev/null
 run_release main held-s
 chk "M40 a later main commit does not publish the held lane on that promotion's account" \

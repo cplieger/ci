@@ -5,8 +5,8 @@ A stable release that ships such a pin hands its consumers a pre-release
 they never chose. promote.py refuses a promotion whose root carries one and
 holds back a nested lane that does; release.yaml's stable run and
 release-state.sh hold the same lanes back through `held-lanes` below. This
-module owns the rule, so the three cannot disagree. Its functions read text
-only; the CLI reads one commit's tree with git.
+module owns the rule and the tree reader, so the three cannot disagree. Its
+rule functions read text only; tree_files and the CLI read one commit's tree.
 
     purity.py held-lanes <commit>   GO_LANES_JSON: JSON array of nested lane dirs
 
@@ -20,8 +20,9 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
+
+import inventory
 
 
 def first_party(spec: str) -> bool:
@@ -173,14 +174,6 @@ def is_purity_file(path: str) -> bool:
     return base in ('go.mod', 'package.json', 'jsr.json') or base.startswith('Dockerfile')
 
 
-def lane_of(path: str, lanes: list[str]) -> str:
-    """The nested lane a path ships in, '.' for the root (inventory.lane_of's rule)."""
-    for lane in lanes:
-        if path.startswith(lane + '/'):
-            return lane
-    return '.'
-
-
 def lane_holds(files: dict[str, str], lanes: list[str]) -> dict[str, list[str]]:
     """{lane: [violation, ...]} of each nested lane whose own purity files, among
     {path: text}, pin a first-party dependency at a dev version. A root
@@ -190,7 +183,7 @@ def lane_holds(files: dict[str, str], lanes: list[str]) -> dict[str, list[str]]:
     for path in sorted(files):
         if not is_purity_file(path):
             continue
-        lane = lane_of(path, lanes)
+        lane = inventory.lane_of(path, lanes)
         if lane == '.':
             continue
         found = purity_violations({path: files[path]})
@@ -199,18 +192,16 @@ def lane_holds(files: dict[str, str], lanes: list[str]) -> dict[str, list[str]]:
     return held
 
 
-def _git(*args: str) -> str:
-    return subprocess.run(['git', *args], capture_output=True, text=True, check=True).stdout
+def tree_files(repo: inventory.Repo, commit: str) -> dict[str, str]:
+    """{path: text} of every purity file in `commit`'s tree. Raises
+    inventory.InventoryError when git cannot read the tree."""
+    return {p: repo.blob(commit, p) or '' for p in repo.paths(commit) if is_purity_file(p)}
 
 
-def held_lanes(commit: str, lanes: list[str]) -> dict[str, list[str]]:
-    """lane_holds over the purity files under each lane at `commit`."""
-    files: dict[str, str] = {}
-    for lane in lanes:
-        for path in _git('ls-tree', '-r', '--name-only', commit, '--', f'{lane}/').splitlines():
-            if is_purity_file(path):
-                files[path] = _git('show', f'{commit}:{path}')
-    return lane_holds(files, lanes)
+def held_lanes(commit: str, lanes: list[str], git_dir: str = '.') -> dict[str, list[str]]:
+    """lane_holds over the nested lanes' purity files at `commit`."""
+    files = tree_files(inventory.Repo(git_dir), commit)
+    return lane_holds({p: t for p, t in files.items() if inventory.lane_of(p, lanes) != '.'}, lanes)
 
 
 def main(argv: list[str]) -> int:
@@ -227,8 +218,8 @@ def main(argv: list[str]) -> int:
         return 1
     try:
         held = held_lanes(argv[1], lanes)
-    except subprocess.CalledProcessError as err:
-        print(f'::error::git {" ".join(err.cmd[1:])} failed: {err.stderr.strip()}', file=sys.stderr)
+    except inventory.InventoryError as err:
+        print(f'::error::{err}', file=sys.stderr)
         return 1
     except PurityInputError as err:
         print(f'::error::{err}, so its first-party pins cannot be judged', file=sys.stderr)

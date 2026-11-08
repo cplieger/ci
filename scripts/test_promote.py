@@ -251,13 +251,6 @@ class Purity(unittest.TestCase):
         )
         self.assertEqual(promote.purity_violations({'Dockerfile': text}), [])
 
-    def test_purity_file_selection(self):
-        self.assertTrue(promote.is_purity_file('go.mod'))
-        self.assertTrue(promote.is_purity_file('web/jsr.json'))
-        self.assertTrue(promote.is_purity_file('Dockerfile.arm64'))
-        self.assertFalse(promote.is_purity_file('static-src/node_modules/x/package.json'))
-        self.assertFalse(promote.is_purity_file('main.go'))
-
 
 class PurityPerLane(unittest.TestCase):
     def test_root_and_pin_file_violations_refuse_and_a_nested_lane_is_held(self):

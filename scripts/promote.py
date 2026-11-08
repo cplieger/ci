@@ -39,7 +39,7 @@ from pathlib import Path
 import ghrest
 import inventory
 import release_channels as rc
-from purity import PurityInputError, first_party, is_purity_file, lane_holds, purity_violations
+from purity import PurityInputError, first_party, lane_holds, purity_violations, tree_files
 
 OWNER = 'cplieger'
 SCRIPTS = Path(__file__).resolve().parent
@@ -177,16 +177,12 @@ def pin_violations(repo: inventory.Repo, target: str) -> list[str]:
     return sorted(found)
 
 
-def _purity_files(repo: inventory.Repo, target: str) -> dict[str, str]:
-    return {p: repo.blob(target, p) or '' for p in repo.paths(target) if is_purity_file(p)}
-
-
 def check_purity(repo: inventory.Repo, target: str) -> list[str]:
     """Refusals: a root manifest or a shipped pin file pinning a first-party
     dependency at a dev version, and any manifest the check cannot read. A
     nested lane's own dev pin is no refusal: the stable run holds that lane
     back (held_lanes) and the rest of the promotion publishes."""
-    files = _purity_files(repo, target)
+    files = tree_files(repo, target)
     lanes = repo.lanes(target)
     refusals, found = [], []
     for path in sorted(files):
@@ -212,7 +208,7 @@ def held_lanes(repo: inventory.Repo, target: str) -> dict[str, list[str]]:
     """{lane: [violation, ...]} of the nested lanes `target` holds back, the
     rule release.yaml's stable run applies through purity.py. A manifest the
     check cannot read is skipped here; check_purity refuses it."""
-    files, lanes = _purity_files(repo, target), repo.lanes(target)
+    files, lanes = tree_files(repo, target), repo.lanes(target)
     readable = {}
     for path, text in files.items():
         try:
@@ -226,8 +222,8 @@ def held_lanes(repo: inventory.Repo, target: str) -> dict[str, list[str]]:
 def held_lines(held: dict[str, list[str]]) -> list[str]:
     return [
         f'Held back: lane `{lane}` pins a first-party dependency at a dev version '
-        f'({"; ".join(found)}). It publishes from the first promotion whose tree pins it '
-        'only at stable versions; the other lanes publish now.'
+        f'({"; ".join(found)}). It publishes from the first stable run whose tree pins it '
+        'only at stable versions; the other lanes publish as planned.'
         for lane, found in sorted(held.items())
     ]
 
@@ -995,7 +991,7 @@ def cmd_preview(args) -> int:
                     '',
                     (
                         f'It pins a first-party dependency at a dev version ({lane["held"]}), so '
-                        'it publishes from the first promotion whose tree pins it only at stable '
+                        'it publishes from the first stable run whose tree pins it only at stable '
                         'versions.'
                     ),
                     '',
