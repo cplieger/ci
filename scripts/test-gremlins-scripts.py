@@ -1036,7 +1036,7 @@ def test_runner_mode_selection(_tmp: Path) -> None:
     check('runner mode: env guards extracted from gremlins-run.sh', ok='OUT:?' in guards,
           detail=repr(guards))
     base = {'PATH': '/usr/bin:/bin', **dict.fromkeys((
-        'GREMLINS_VERSION', 'GREMLINS_PATCH', 'WORKERS_MAX', 'GOMEM_MAX_MB', 'GOMEM_SOLO_MB',
+        'GREMLINS_VERSION', 'GREMLINS_PATCHES', 'WORKERS_MAX', 'GOMEM_MAX_MB', 'GOMEM_SOLO_MB',
         'PROBE_TIMEOUT', 'OUT'), 'x')}
     src, proc = call_shell('select_mode', '60', '20', '4', deps=('integration_wanted',),
                            prelude=guards, env=base)
@@ -1064,6 +1064,32 @@ def test_runner_mode_selection(_tmp: Path) -> None:
           ok=proc.returncode == 0 and proc.stdout == 'per-package\n' and proc.stderr
           == 'mode=per-package (suite=unmeasured mutants=unmeasured workers=1 cap=350min)\n',
           detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+
+
+def test_workflow_applies_every_patch(_tmp: Path) -> None:
+    """A patch in scripts/ that the run step does not mount and list is never applied."""
+    step = workflow_step('Run gremlins (attempt ${{ matrix.attempt }})')
+    check('patches: run step extracted from weekly-gremlins.yaml', ok=bool(step))
+    on_disk = sorted(p.name for p in HERE.glob('gremlins-*.patch'))
+    mounts = dict(re.findall(
+        r'-v "\$\{PWD\}/scripts/(gremlins-[^"]+\.patch)":(/[^:"]+):ro', step))
+    listed = re.search(r'-e GREMLINS_PATCHES="([^"]*)"', step)
+    paths = listed.group(1).split() if listed else []
+    check('patches: every scripts/gremlins-*.patch is mounted',
+          ok=bool(on_disk) and sorted(mounts) == on_disk, detail=f'{sorted(mounts)} != {on_disk}')
+    check('patches: GREMLINS_PATCHES lists every mounted patch once',
+          ok=sorted(paths) == sorted(mounts.values()) and len(set(paths)) == len(paths),
+          detail=f'{paths} vs {sorted(mounts.values())}')
+    runner = RUNNER.read_text()
+    check('patches: gremlins-run.sh says when to delete each patch',
+          ok=all(name in runner for name in on_disk),
+          detail=str([n for n in on_disk if n not in runner]))
+    # gremlins' own tests cover the parse and the executor, not cmd/unleash.go;
+    # without this line the patch builds, passes and changes no timeout.
+    pkgtimeout = (HERE / 'gremlins-pkgtimeout.patch').read_text()
+    check('patches: gremlins-pkgtimeout.patch wires the per-package times into the executor',
+          ok=bool(re.search(r'^\+.*engine\.WithPackageElapsed\(cProfile\.PackageElapsed\)',
+                            pkgtimeout, re.MULTILINE)))
 
 
 def test_merge_records_the_mode(tmp: Path) -> None:
@@ -1299,6 +1325,7 @@ def main() -> int:
         test_timeout_coefficient_scales_with_workers,
         test_integration_decision,
         test_runner_mode_selection,
+        test_workflow_applies_every_patch,
         test_merge_records_the_mode,
         test_aggregate_marks_a_mode_switch,
         test_aggregate_starts_a_baseline_when_the_mutators_change,

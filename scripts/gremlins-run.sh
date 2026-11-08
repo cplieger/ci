@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One module's gremlins run inside the memory-capped container that
 # .github/workflows/weekly-gremlins.yaml starts, from the module root. Env:
-# GREMLINS_VERSION, GREMLINS_PATCH (absolute path of gremlins-pkgname.patch),
+# GREMLINS_VERSION, GREMLINS_PATCHES (space-separated absolute paths of the
+# scripts/gremlins-*.patch files, applied in order),
 # WORKERS_MAX, GOMEM_MAX_MB / GOMEM_SOLO_MB (GOMEMLIMIT for WORKERS_MAX workers /
 # one forced worker), PROBE_TIMEOUT (seconds per probe phase), OUT (result JSON),
 # and optional JOB_TIMEOUT_MINUTES (the run job's cap; unset keeps per-package).
@@ -16,14 +17,17 @@ set -euo pipefail
 # dies with --rm.
 git config --global --add safe.directory '*'
 
-: "${GREMLINS_VERSION:?}" "${GREMLINS_PATCH:?}" "${WORKERS_MAX:?}"
+: "${GREMLINS_VERSION:?}" "${GREMLINS_PATCHES:?}" "${WORKERS_MAX:?}"
 : "${GOMEM_MAX_MB:?}" "${GOMEM_SOLO_MB:?}" "${PROBE_TIMEOUT:?}" "${OUT:?}"
 
-# gremlins budgets each mutant at coverage-pass time x this coefficient (default
-# 3: https://github.com/go-gremlins/gremlins/blob/v0.6.0/internal/engine/executor.go#L101).
-# The coverage pass has every CPU to itself and a mutant gets about 1/workers of
-# them, so a CPU-bound survivor would time out at the stock 3 and drop out of
-# efficacy.
+# gremlins budgets each mutant at its coverage-pass test time x this coefficient:
+# its own package's in per-package mode (with a floor), the whole pass's under
+# --integration or when the package has no recorded time
+# (gremlins-pkgtimeout.patch owns both; default 3:
+# https://github.com/go-gremlins/gremlins/blob/v0.6.0/internal/engine/executor.go#L101).
+# A mutant gets about 1/workers of the CPUs its package's tests had in the
+# coverage pass, so a CPU-bound survivor would time out at the stock 3 and drop
+# out of efficacy.
 timeout_coefficient() {
   printf '%s\n' "$((3 * $1))"
 }
@@ -79,16 +83,23 @@ clone_gremlins() {
     https://github.com/go-gremlins/gremlins "${gremlins_src}"
 }
 
-# v0.6.0 tests a `package main` mutant against the module root's tests
-# (https://github.com/go-gremlins/gremlins/issues/268). Delete the patch and this
-# build once a pinned gremlins release contains the fix:
-# https://github.com/go-gremlins/gremlins/pull/306
+# Each patch fixes a v0.6.0 bug. Delete a patch once a pinned gremlins release
+# contains its fix, and this build once no patch is left:
+# - gremlins-pkgname.patch: a `package main` mutant is tested against the module
+#   root's tests (https://github.com/go-gremlins/gremlins/issues/268, fix
+#   https://github.com/go-gremlins/gremlins/pull/306).
+# - gremlins-pkgtimeout.patch: every mutant's timeout is the whole module's
+#   coverage time, so a hang in a fast package costs the slowest suite's time
+#   (https://github.com/go-gremlins/gremlins/issues/261).
 retry clone_gremlins
-if ! git -C "${gremlins_src}" apply --check "${GREMLINS_PATCH}"; then
-  echo "::error::scripts/gremlins-pkgname.patch no longer applies to gremlins ${GREMLINS_VERSION}: upstream has probably changed or fixed pkgName. Delete scripts/gremlins-pkgname.patch and this build step, and go back to the release download."
-  exit 1
-fi
-git -C "${gremlins_src}" apply "${GREMLINS_PATCH}"
+read -r -a patches <<<"${GREMLINS_PATCHES}"
+for patch in "${patches[@]}"; do
+  if ! git -C "${gremlins_src}" apply --check "${patch}"; then
+    echo "::error::scripts/${patch##*/} no longer applies to gremlins ${GREMLINS_VERSION}. If that release fixes the upstream issue listed for this patch in scripts/gremlins-run.sh, delete the patch (and this build step if it was the last one). Otherwise rebase the patch onto the release."
+    exit 1
+  fi
+  git -C "${gremlins_src}" apply "${patch}"
+done
 (
   cd "${gremlins_src}"
   retry timeout 300 go mod download
@@ -98,8 +109,8 @@ git -C "${gremlins_src}" apply "${GREMLINS_PATCH}"
 )
 
 # Compiler output does not depend on GOGC and -toolexec never wraps the test
-# binary, so no test sees a difference. It does shorten the coverage pass that
-# gremlins multiplies into the per-mutant timeout, by about 15% on a large module.
+# binary, so no test sees a difference. It shortens every compile and link
+# gremlins runs, which was about 15% of a large module's coverage pass.
 emit_gogc_toolexec() {
   cat <<'EOF'
 #!/bin/sh

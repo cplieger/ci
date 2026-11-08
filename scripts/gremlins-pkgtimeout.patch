@@ -1,0 +1,356 @@
+diff --git a/cmd/unleash.go b/cmd/unleash.go
+index d7eddb2..d4afe19 100644
+--- a/cmd/unleash.go
++++ b/cmd/unleash.go
+@@ -179,7 +179,7 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
+ 	wdDealer := workdir.NewCachedDealer(workDir, mod.Root)
+ 	defer wdDealer.Clean()
+
+-	jDealer := engine.NewExecutorDealer(mod, wdDealer, cProfile.Elapsed)
++	jDealer := engine.NewExecutorDealer(mod, wdDealer, cProfile.Elapsed, engine.WithPackageElapsed(cProfile.PackageElapsed))
+
+ 	codeData := engine.CodeData{
+ 		Cov:       cProfile.Profile,
+diff --git a/internal/coverage/coverage.go b/internal/coverage/coverage.go
+index d7be532..9768257 100644
+--- a/internal/coverage/coverage.go
++++ b/internal/coverage/coverage.go
+@@ -38,7 +38,10 @@ import (
+ // it took to generate the coverage report.
+ type Result struct {
+ 	Profile Profile
+-	Elapsed time.Duration
++	// PackageElapsed is each tested package's own test run time, keyed by import
++	// path. It excludes the build, and has no entry for a package without tests.
++	PackageElapsed map[string]time.Duration
++	Elapsed        time.Duration
+ }
+
+ // Coverage is responsible for executing a Go test with coverage via the Run() method,
+@@ -100,7 +103,7 @@ func (c *Coverage) Run() (Result, error) {
+ 	if err := c.downloadModules(); err != nil {
+ 		return Result{}, fmt.Errorf("impossible to download modules: %w", err)
+ 	}
+-	elapsed, err := c.executeCoverage()
++	elapsed, out, err := c.executeCoverage()
+ 	if err != nil {
+ 		return Result{}, fmt.Errorf("impossible to executeCoverage coverage: %w", err)
+ 	}
+@@ -110,7 +113,24 @@ func (c *Coverage) Run() (Result, error) {
+ 		return Result{}, fmt.Errorf("an error occurred while generating coverage profile: %w", err)
+ 	}
+
+-	return Result{Profile: profile, Elapsed: elapsed}, nil
++	return Result{Profile: profile, PackageElapsed: packageElapsed(out), Elapsed: elapsed}, nil
++}
++
++// packageElapsed reads the run time go test prints on each passing package's
++// "ok" line. A cached result prints "(cached)" there instead and gets no entry.
++func packageElapsed(out []byte) map[string]time.Duration {
++	elapsed := make(map[string]time.Duration)
++	for line := range strings.Lines(string(out)) {
++		f := strings.Fields(line)
++		if len(f) < 3 || f[0] != "ok" {
++			continue
++		}
++		if d, err := time.ParseDuration(f[2]); err == nil {
++			elapsed[f[1]] = d
++		}
++	}
++
++	return elapsed
+ }
+
+ func (c *Coverage) profile() (Profile, error) {
+@@ -141,7 +161,7 @@ func (c *Coverage) downloadModules() error {
+ 	return cmd.Run()
+ }
+
+-func (c *Coverage) executeCoverage() (time.Duration, error) {
++func (c *Coverage) executeCoverage() (time.Duration, []byte, error) {
+ 	args := []string{"test"}
+ 	if c.buildTags != "" {
+ 		args = append(args, "-tags", c.buildTags)
+@@ -150,17 +170,20 @@ func (c *Coverage) executeCoverage() (time.Duration, error) {
+ 		args = append(args, "-coverpkg", c.coverPkg)
+ 	}
+
+-	args = append(args, "-cover", "-coverprofile", c.filePath(), c.scanPath())
++	// Mutant timeouts are multiples of these times, so they must be measured
++	// runs: a result from the test cache takes milliseconds.
++	args = append(args, "-count=1", "-cover", "-coverprofile", c.filePath(), c.scanPath())
+ 	cmd := c.cmdContext("go", args...)
+
+ 	start := time.Now()
+-	if out, err := cmd.CombinedOutput(); err != nil {
++	out, err := cmd.CombinedOutput()
++	if err != nil {
+ 		log.Infof("\n%s\n", string(out))
+
+-		return 0, err
++		return 0, nil, err
+ 	}
+
+-	return time.Since(start), nil
++	return time.Since(start), out, nil
+ }
+
+ func (c *Coverage) scanPath() string {
+diff --git a/internal/coverage/coverage_test.go b/internal/coverage/coverage_test.go
+index 78f3002..c40c4fd 100644
+--- a/internal/coverage/coverage_test.go
++++ b/internal/coverage/coverage_test.go
+@@ -22,6 +22,7 @@ import (
+ 	"os/exec"
+ 	"strings"
+ 	"testing"
++	"time"
+
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/spf13/viper"
+@@ -94,7 +95,7 @@ func TestCoverageRun(t *testing.T) {
+ 			_, _ = cov.Run()
+
+ 			firstWant := "go mod download"
+-			secondWant := fmt.Sprintf("go test -tags tag1 tag2 -coverpkg %s -cover -coverprofile %v %s",
++			secondWant := fmt.Sprintf("go test -tags tag1 tag2 -coverpkg %s -count=1 -cover -coverprofile %v %s",
+ 				coverpkg, wantFilePath, tc.wantPath)
+
+ 			if len(holder.events) != 2 {
+@@ -176,6 +177,32 @@ func TestCoverageParsesOutput(t *testing.T) {
+ 	}
+ }
+
++func TestCoverageRecordsPackageElapsed(t *testing.T) {
++	mod := gomodule.GoModule{
++		Name:       "example.com",
++		CallingDir: ".",
++	}
++	out := "ok  \texample.com\t0.490s\tcoverage: 80.0% of statements\n" +
++		"ok  \texample.com/slow\t12.500s\tcoverage: 61.2% of statements\n" +
++		"?   \texample.com/notests\t[no test files]\n" +
++		"\texample.com/nocover\t\tcoverage: 0.0% of statements\n" +
++		"ok  \texample.com/cached\t(cached)\tcoverage: 50.0% of statements\n"
++	cov := coverage.NewWithCmd(fakeExecCommandOutput(out), "testdata/valid", mod)
++
++	got, err := cov.Run()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	want := map[string]time.Duration{
++		"example.com":      490 * time.Millisecond,
++		"example.com/slow": 12500 * time.Millisecond,
++	}
++	if !cmp.Equal(got.PackageElapsed, want) {
++		t.Error(cmp.Diff(got.PackageElapsed, want))
++	}
++}
++
+ func TestParseOutputFail(t *testing.T) {
+ 	mod := gomodule.GoModule{
+ 		Name:       "example.com",
+@@ -192,6 +219,7 @@ func TestCoverageProcessSuccess(_ *testing.T) {
+ 	if os.Getenv("GO_TEST_PROCESS") != "1" {
+ 		return
+ 	}
++	fmt.Print(os.Getenv("GO_TEST_PROCESS_OUTPUT"))
+ 	os.Exit(0) // skipcq: RVV-A0003
+ }
+
+@@ -222,6 +250,18 @@ func fakeExecCommandSuccess(got *commandHolder) execContext {
+ 	}
+ }
+
++func fakeExecCommandOutput(out string) execContext {
++	return func(command string, args ...string) *exec.Cmd {
++		cs := []string{"-test.run=TestCoverageProcessSuccess", "--", command}
++		cs = append(cs, args...)
++		// #nosec G204 - We are in tests, we don't care
++		cmd := exec.Command(os.Args[0], cs...)
++		cmd.Env = []string{"GO_TEST_PROCESS=1", "GO_TEST_PROCESS_OUTPUT=" + out}
++
++		return cmd
++	}
++}
++
+ func fakeExecCommandFailure(run int) execContext {
+ 	var executed int
+
+diff --git a/internal/engine/executor.go b/internal/engine/executor.go
+index 1f182ad..6755fca 100644
+--- a/internal/engine/executor.go
++++ b/internal/engine/executor.go
+@@ -38,6 +38,11 @@ import (
+ // of each test run.
+ const DefaultTimeoutCoefficient = 3
+
++// MinPackageTimeout is the shortest timeout a mutant timed from its own package
++// gets. A package's test run time excludes compiling and linking the mutant,
++// which this has to cover on a loaded machine.
++const MinPackageTimeout = 60 * time.Second
++
+ // ExecutorDealer is the initializer for new workerpool.Executor.
+ type ExecutorDealer interface {
+ 	NewExecutor(mut mutator.Mutator, outCh chan<- mutator.Mutator, wg *sync.WaitGroup) workerpool.Executor
+@@ -55,8 +60,10 @@ type MutantExecutorDealer struct {
+ 	wdDealer          workdir.Dealer
+ 	execContext       execContext
+ 	mod               gomodule.GoModule
++	pkgElapsed        map[string]time.Duration
+ 	buildTags         string
+ 	testExecutionTime time.Duration
++	coefficient       time.Duration
+ 	dryRun            bool
+ 	integrationMode   bool
+ 	testCPU           int
+@@ -74,6 +81,18 @@ func WithExecContext(c execContext) ExecutorDealerOption {
+ 	}
+ }
+
++// WithPackageElapsed times each mutant outside integration mode from its own
++// package's test run time, keyed by import path, with MinPackageTimeout as the
++// floor. A package with no entry, and every mutant in integration mode, keeps
++// the whole run's time.
++func WithPackageElapsed(elapsed map[string]time.Duration) ExecutorDealerOption {
++	return func(m MutantExecutorDealer) MutantExecutorDealer {
++		m.pkgElapsed = elapsed
++
++		return m
++	}
++}
++
+ // NewExecutorDealer initialises a MutantExecutorDealer.
+ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.Duration, opts ...ExecutorDealerOption) *MutantExecutorDealer {
+ 	buildTags := configuration.Get[string](configuration.UnleashTagsKey)
+@@ -99,6 +118,7 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
+ 		integrationMode:   integrationMode,
+ 		testCPU:           testCPU,
+ 		testExecutionTime: elapsed * time.Duration(coefficient),
++		coefficient:       time.Duration(coefficient),
+ 		execContext:       exec.CommandContext,
+ 	}
+
+@@ -125,12 +145,23 @@ func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- muta
+ 		buildTags:         m.buildTags,
+ 		execContext:       m.execContext,
+ 		testCPU:           m.testCPU,
+-		testExecutionTime: m.testExecutionTime,
++		testExecutionTime: m.timeout(mut.Pkg()),
+ 	}
+
+ 	return &mj
+ }
+
++// timeout is a mutant's test budget. Integration mode runs every package's
++// tests, so only the whole coverage run's time fits it.
++func (m MutantExecutorDealer) timeout(pkg string) time.Duration {
++	elapsed, ok := m.pkgElapsed[pkg]
++	if !ok || m.integrationMode {
++		return m.testExecutionTime
++	}
++
++	return max(elapsed*m.coefficient, MinPackageTimeout)
++}
++
+ type execContext = func(ctx context.Context, name string, args ...string) *exec.Cmd
+
+ type mutantExecutor struct {
+diff --git a/internal/engine/executor_test.go b/internal/engine/executor_test.go
+index e5a1c67..7b0de47 100644
+--- a/internal/engine/executor_test.go
++++ b/internal/engine/executor_test.go
+@@ -21,6 +21,7 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"os/exec"
++	"slices"
+ 	"strings"
+ 	"sync"
+ 	"testing"
+@@ -324,6 +325,85 @@ func TestMutatorRun(t *testing.T) {
+ 	}
+ }
+
++func TestMutantTimeoutFromItsPackage(t *testing.T) {
++	const moduleElapsed = 200 * time.Second
++	pkgElapsed := map[string]time.Duration{
++		"example.com/slow": 10 * time.Second,
++		"example.com/fast": 490 * time.Millisecond,
++	}
++	testCases := []struct {
++		name        string
++		pkg         string
++		intMode     bool
++		wantTimeout time.Duration
++	}{
++		{
++			name:        "coefficient times the package's own test time",
++			pkg:         "example.com/slow",
++			wantTimeout: 10 * time.Second * 12,
++		},
++		{
++			name:        "a fast package gets the floor",
++			pkg:         "example.com/fast",
++			wantTimeout: engine.MinPackageTimeout,
++		},
++		{
++			name:        "a package the coverage pass did not time gets the module figure",
++			pkg:         "example.com/untimed",
++			wantTimeout: moduleElapsed * 12,
++		},
++		{
++			name:        "integration mode runs every package, so it gets the module figure",
++			pkg:         "example.com/slow",
++			intMode:     true,
++			wantTimeout: moduleElapsed * 12,
++		},
++	}
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			viperSet(map[string]any{
++				configuration.UnleashIntegrationMode:       tc.intMode,
++				configuration.UnleashTimeoutCoefficientKey: 12,
++			})
++			defer viperReset()
++
++			mod := gomodule.GoModule{
++				Name:       "example.com",
++				Root:       ".",
++				CallingDir: ".",
++			}
++			wdDealer := newWdDealerStub(t)
++			holder := &commandHolder{}
++			mjd := engine.NewExecutorDealer(mod, wdDealer, moduleElapsed,
++				engine.WithExecContext(fakeExecCommandSuccessWithHolder(holder)),
++				engine.WithPackageElapsed(pkgElapsed))
++			mut := &mutantStub{
++				status:  mutator.Runnable,
++				mutType: mutator.ConditionalsBoundary,
++				pkg:     tc.pkg,
++			}
++			outCh := make(chan mutator.Mutator)
++			wg := sync.WaitGroup{}
++			wg.Add(1)
++			executor := mjd.NewExecutor(mut, outCh, &wg)
++			go func() {
++				<-outCh
++				close(outCh)
++			}()
++			executor.Start(&workerpool.Worker{Name: "test", ID: 1})
++			wg.Wait()
++
++			wantArg := (2*time.Second + tc.wantTimeout).String()
++			if !slices.Contains(holder.args, wantArg) {
++				t.Errorf("expected -timeout %s, got: go %s", wantArg, strings.Join(holder.args, " "))
++			}
++			if d := absTimeDiff(holder.timeout, tc.wantTimeout); d > time.Second {
++				t.Errorf("expected a deadline %s away, got %s", tc.wantTimeout, holder.timeout)
++			}
++		})
++	}
++}
++
+ func TestCPU(t *testing.T) {
+ 	testCases := []struct {
+ 		name        string

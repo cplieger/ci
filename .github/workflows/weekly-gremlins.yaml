@@ -286,10 +286,11 @@ jobs:
               -v "${PWD}/target":/work \
               -v "${PWD}/scripts/gremlins-run.sh":/gremlins-run.sh:ro \
               -v "${PWD}/scripts/gremlins-pkgname.patch":/gremlins-pkgname.patch:ro \
+              -v "${PWD}/scripts/gremlins-pkgtimeout.patch":/gremlins-pkgtimeout.patch:ro \
               "${node_mount[@]}" \
               -w "/work/${m}" \
               -e GREMLINS_VERSION="${GREMLINS_VERSION}" \
-              -e GREMLINS_PATCH=/gremlins-pkgname.patch \
+              -e GREMLINS_PATCHES="/gremlins-pkgname.patch /gremlins-pkgtimeout.patch" \
               -e WORKERS_MAX="${workers}" \
               -e GOMEM_MAX_MB="${gomem_mb}" \
               -e GOMEM_SOLO_MB="${gomem_solo_mb}" \
