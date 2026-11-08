@@ -18,7 +18,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from dashboard_check_fixtures import (
     CLASSIC,
-    STRAY_CONDITIONAL_PLACES,
     conditional_group,
     dc,
     defaults,
@@ -177,20 +176,6 @@ class BannedFields(RuleCase):
         element(doc, 'panel-1')['subtitle'] = 'Right now'
         self.assert_finding(doc, 'banned-field', 'subtitle')
 
-    def test_rejects_main_branch_auto_grid_fields(self):
-        for field in (
-            'fitContent',
-            'matchRowHeights',
-            'minHeight',
-            'minHeightMode',
-            'maxHeight',
-            'maxHeightMode',
-        ):
-            with self.subTest(field=field):
-                doc = valid()
-                rows(doc)[1]['spec']['layout']['spec'][field] = 1
-                self.assert_finding(doc, 'banned-field', field)
-
     def test_accepts_fields_added_in_grafana_13_2(self):
         doc = valid()
         defaults(doc, 'panel-2')['color'] = {
@@ -204,27 +189,12 @@ class BannedFields(RuleCase):
 
 
 class Datasources(RuleCase):
-    def test_rejects_string_datasource_reference(self):
-        doc = valid()
-        element(doc, 'panel-2')['data']['spec']['queries'][0]['spec']['query']['datasource'] = (
-            '${datasource}'
-        )
-        self.assert_finding(doc, 'datasource', 'a string')
-
     def test_rejects_literal_datasource_uid(self):
         doc = valid()
         element(doc, 'panel-2')['data']['spec']['queries'][0]['spec']['query']['datasource'] = {
             'name': 'mimir'
         }
         self.assert_finding(doc, 'datasource', 'mimir')
-
-    def test_rejects_literal_uid_beside_the_variable_name(self):
-        doc = valid()
-        element(doc, 'panel-2')['data']['spec']['queries'][0]['spec']['query']['datasource'] = {
-            'name': '${datasource}',
-            'uid': 'hard-coded-uid',
-        }
-        self.assert_finding(doc, 'datasource', 'also holds uid')
 
     def test_rejects_query_without_datasource(self):
         doc = valid()
@@ -259,13 +229,6 @@ class Datasources(RuleCase):
         query = element(doc, 'panel-2')['data']['spec']['queries'][0]['spec']['query']
         query['group'], query['datasource'] = 'datasource', {'name': 'mimir'}
         self.assert_finding(doc, 'datasource', 'mimir')
-
-    def test_rejects_the_dashboard_datasource_with_a_pinned_uid(self):
-        doc = valid()
-        query = element(doc, 'panel-2')['data']['spec']['queries'][0]['spec']['query']
-        query['group'] = 'datasource'
-        query['datasource'] = {'name': '-- Dashboard --', 'uid': 'hard-coded-uid'}
-        self.assert_finding(doc, 'datasource', 'also holds uid')
 
     def test_rejects_a_variable_reading_the_dashboard_datasource(self):
         doc = valid()
@@ -348,39 +311,6 @@ class Layout(RuleCase):
         items = grid_items(doc)
         items[1], items[2] = items[2], items[1]
         self.assert_finding(doc, 'layout', 'y-then-x')
-
-    def test_rejects_conditional_rendering_on_grid_item(self):
-        doc = valid()
-        grid_items(doc)[0]['spec']['conditionalRendering'] = {'kind': 'ConditionalRenderingGroup'}
-        self.assert_finding(doc, 'layout', 'conditionalRendering')
-
-    def test_rejects_conditional_rendering_outside_an_item_row_or_tab(self):
-        for place, holder in STRAY_CONDITIONAL_PLACES.items():
-            with self.subTest(place=place):
-                doc = valid()
-                holder(doc)['conditionalRendering'] = conditional_group()
-                self.assert_finding(doc, 'layout', 'outside an auto-grid item')
-
-    def test_accepts_conditional_rendering_on_a_row(self):
-        doc = valid()
-        rows(doc)[0]['spec']['conditionalRendering'] = conditional_group()
-        self.assert_clean(doc)
-
-    def test_accepts_conditional_rendering_on_a_tab(self):
-        doc = valid()
-        doc['spec']['layout'] = tabs_of(('Overview', doc['spec']['layout']))
-        doc['spec']['layout']['spec']['tabs'][0]['spec']['conditionalRendering'] = (
-            conditional_group()
-        )
-        self.assert_clean(doc)
-
-    def test_accepts_conditional_rendering_on_auto_grid_item(self):
-        doc = valid()
-        rows(doc)[1]['spec']['layout']['spec']['items'][0]['spec']['conditionalRendering'] = {
-            'kind': 'ConditionalRenderingGroup',
-            'spec': {'visibility': 'show', 'condition': 'and', 'items': []},
-        }
-        self.assert_clean(doc)
 
     def test_requires_crosshair_for_side_by_side_time_series(self):
         doc = valid()
@@ -743,15 +673,130 @@ class StrictVet(unittest.TestCase):
                 self.assertNotIn('[references]', out)
                 self.assertNotIn('[datasource]', out)
 
-    def test_stray_conditional_rendering_passes_the_vet_and_fails_the_layout_rule(self):
-        for place, holder in STRAY_CONDITIONAL_PLACES.items():
+    def assert_rejected_at(self, doc: dict, path: str) -> None:
+        code, out = self.check(doc)
+        self.assertEqual(code, 1, out)
+        cue_lines = [line for line in out.splitlines() if '[cue]' in line]
+        self.assertTrue(cue_lines, out)
+        self.assertIn(path, cue_lines[0])
+
+    def test_rejects_conditional_rendering_where_grafana_ignores_it(self):
+        grid = 'spec.layout.spec.rows.0.spec.layout.spec'
+        places = {
+            'panel spec': ('spec.elements."panel-1".spec', lambda doc: element(doc, 'panel-1')),
+            'dashboard spec': ('spec', lambda doc: doc['spec']),
+            'grid item': (f'{grid}.items.0.spec', lambda doc: grid_items(doc)[0]['spec']),
+            'grid layout spec': (grid, lambda doc: rows(doc)[0]['spec']['layout']['spec']),
+        }
+        for place, (path, holder) in places.items():
+            with self.subTest(place=place):
+                doc = valid()
+                holder(doc)['conditionalRendering'] = conditional_group()
+                self.assert_rejected_at(doc, f'{path}.conditionalRendering: field not allowed')
+
+    def test_accepts_conditional_rendering_on_an_auto_grid_item_a_row_or_a_tab(self):
+        def on_tab(doc: dict) -> dict:
+            doc['spec']['layout'] = tabs_of(('Overview', doc['spec']['layout']))
+            return doc['spec']['layout']['spec']['tabs'][0]['spec']
+
+        places = {
+            'auto-grid item': lambda doc: rows(doc)[1]['spec']['layout']['spec']['items'][0][
+                'spec'
+            ],
+            'row': lambda doc: rows(doc)[0]['spec'],
+            'tab': on_tab,
+        }
+        for place, holder in places.items():
             with self.subTest(place=place):
                 doc = valid()
                 holder(doc)['conditionalRendering'] = conditional_group()
                 code, out = self.check(doc)
-                self.assertEqual(code, 1, out)
-                self.assertNotIn('[cue]', out)
-                self.assertIn('[layout] conditionalRendering sits outside', out)
+                self.assertEqual(code, 0, out)
+
+    def test_rejects_auto_grid_fields_only_grafana_main_has(self):
+        for field in (
+            'fitContent',
+            'matchRowHeights',
+            'minHeight',
+            'minHeightMode',
+            'maxHeight',
+            'maxHeightMode',
+        ):
+            with self.subTest(field=field):
+                doc = valid()
+                rows(doc)[1]['spec']['layout']['spec'][field] = 1
+                self.assert_rejected_at(
+                    doc, f'spec.layout.spec.rows.1.spec.layout.spec.{field}: field not allowed'
+                )
+
+    def test_rejects_a_datasource_that_is_not_a_bare_name(self):
+        query_path = 'spec.elements."panel-2".spec.data.spec.queries.0.spec.query.datasource'
+        refs = {
+            'a string': ('${datasource}', query_path),
+            'a uid beside the name': (
+                {'name': '${datasource}', 'uid': 'hard-coded-uid'},
+                f'{query_path}.uid: field not allowed',
+            ),
+        }
+        for label, (ref, path) in refs.items():
+            with self.subTest(ref=label):
+                doc = valid()
+                element(doc, 'panel-2')['data']['spec']['queries'][0]['spec']['query'][
+                    'datasource'
+                ] = ref
+                self.assert_rejected_at(doc, path)
+
+    def test_rejects_a_key_the_schema_does_not_define_at_any_depth(self):
+        def misspell_field_config(doc: dict) -> None:
+            viz = element(doc, 'panel-1')['vizConfig']['spec']
+            viz['fieldconfig'] = viz.pop('fieldConfig')
+
+        def misspell_in_a_tab(doc: dict) -> None:
+            grid_items(doc)[0]['spec']['widht'] = 4
+            doc['spec']['layout'] = tabs_of(('Overview', doc['spec']['layout']))
+
+        in_tab = 'spec.layout.spec.tabs.0.spec.layout.spec.rows.0.spec.layout.spec.items.0'
+
+        cases = {
+            'spec.bogusField': lambda doc: doc['spec'].update(bogusField=1),
+            'spec.elements."panel-1".spec.vizConfig.spec.fieldconfig': misspell_field_config,
+            'spec.layout.spec.rows.0.spec.titel': lambda doc: rows(doc)[0]['spec'].update(
+                titel='Queue'
+            ),
+            'spec.layout.spec.rows.0.spec.layout.spec.items.0.spec.widht': lambda doc: grid_items(
+                doc
+            )[0]['spec'].update(widht=4),
+            f'{in_tab}.spec.widht': misspell_in_a_tab,
+            'spec.variables.1.spec.lable': lambda doc: variable(doc, 'worker')['spec'].update(
+                lable='Worker'
+            ),
+        }
+        for path, plant in cases.items():
+            with self.subTest(path=path):
+                doc = valid()
+                plant(doc)
+                self.assert_rejected_at(doc, f'{path}: field not allowed')
+
+    def test_free_form_fields_stay_open(self):
+        free = {'pluginOnly': {'nested': [1, {'deeper': True}]}}
+        doc = valid()
+        panel = element(doc, 'panel-2')
+        viz = panel['vizConfig']['spec']
+        viz['options']['legend'].update(free)
+        viz['fieldConfig']['defaults']['custom'].update(free)
+        viz['fieldConfig']['defaults']['links'] = [free]
+        viz['fieldConfig']['overrides'].append(
+            {
+                'matcher': {'id': 'byName', 'options': free},
+                'properties': [{'id': 'custom.width', 'value': free}],
+            }
+        )
+        panel['data']['spec']['queries'][0]['spec']['query']['spec'].update(free)
+        table = element(doc, 'panel-4')['data']['spec']['transformations'][0]['spec']
+        table['options'].update(free)
+        doc['spec']['annotations'][0]['spec']['legacyOptions'] = free
+        code, out = self.check(doc)
+        self.assertEqual(code, 0, out)
 
     def test_names_the_schema_and_the_file_location(self):
         doc = valid()
