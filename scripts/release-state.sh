@@ -2,11 +2,12 @@
 # Two-branch release state, one subcommand per release.yaml step: pending,
 # publish, ahead, halves, number (CLIFF_SCRIPT), receipts, receipt TAG COMMIT,
 # readback SITE TAG [LANE], provenance and complete (IMAGE@DIGEST SOURCE),
+# hold (drop the nested lanes HEAD holds back from a stable run),
 # barrier, renumber-target, renumber-handoff, renumber (re-tag LANE_KEY's newest
 # dev build as DEV_VERSION), renumber-subpackages, half-free LANE TAG COMMIT,
 # signing-window TAG (EXCLUDE_RE, SUBPACKAGES_JSON), release-digest TAG (IMAGE),
 # security-shas [FLOOR]. Lane keys: '.' for the root, else the lane dir.
-# pending, publish, ahead, halves, number and half-free hold no token.
+# pending, publish, hold, ahead, halves, number and half-free hold no token.
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -155,11 +156,28 @@ affects() { # <R> <key>; dies when path-significance.sh fails or answers no lane
     in_list "go_modules_to_release of ${1}^1..${1}" "$2" "$mods"
   fi
 }
-newest_affecting() { # <from> <to> <key> -> the newest reconciliation of from..to that affected the lane; fails when reconciliations_in or affects does
+# A nested lane is held back at a commit whose tree pins one of its own
+# manifests' first-party dependencies at a dev version (purity.py, the rule
+# promote.py applies): no stable run publishes it there. The root is never held;
+# promote.py refuses such a root.
+held_lanes_at() { # <commit> -> JSON object {lane: [violation, ...]} of the lanes held there; fails when purity.py does
+  GO_LANES_JSON="${GO_LANES_JSON:-[]}" python3 "$TOOLS/purity.py" held-lanes "$1"
+}
+is_held() { # <commit> <key> -> 0 when the commit holds the lane back, 1 when not; dies when it cannot tell
+  local held got
+  [ "$2" != . ] || return 1
+  held=$(held_lanes_at "$1") || die "cannot tell which lanes ${1} holds back"
+  got=$(jq -r --arg k "$2" 'has($k)' <<<"$held") || die "purity.py held-lanes printed no JSON object for ${1}"
+  [ "$got" = true ]
+}
+# A promotion that held a lane back is not that lane's promotion: it published
+# nothing of it, so the lane is not pending there and no later stable run
+# publishes it on that promotion's account.
+newest_affecting() { # <from> <to> <key> -> the newest reconciliation of from..to that affected the lane and did not hold it back; fails when reconciliations_in, affects or is_held does
   local c found="" recs
   recs=$(reconciliations_in "$1" "$2") || return 1
   while IFS= read -r c; do
-    if [ -n "$c" ] && affects "$c" "$3"; then
+    if [ -n "$c" ] && affects "$c" "$3" && ! is_held "$c" "$3"; then
       found=$c
     fi
   done <<<"$recs"
@@ -269,6 +287,23 @@ cmd_publish() {
     note "lane ${key}: this run publishes the pending promotion ${r}"
   done <<<"$rows"
   out "root_changed=${rc}" "subpackages_to_publish=${subs}" "go_modules_to_release=${mods}"
+}
+
+# A stable run publishes no nested lane HEAD holds back, whatever put it on the
+# list (a changed path or a pending promotion): it would hand its consumers a
+# pre-release they never chose. The lane publishes from the first stable run
+# whose tree pins it only at stable versions.
+cmd_hold() {
+  local mods="${GO_MODULES_TO_RELEASE:-[]}" held kept l why
+  [ "${CHANNEL:-}" = stable ] || die "hold narrows a stable run, but this run is on the '${CHANNEL:-}' channel"
+  held=$(held_lanes_at HEAD) || die "cannot tell which lanes HEAD holds back"
+  kept=$(jq -c --argjson held "$held" '[.[] | select(. as $l | $held | has($l) | not)]' <<<"$mods") \
+    || die "GO_MODULES_TO_RELEASE '${mods}' is not a JSON array of lane dirs"
+  while IFS=$'\t' read -r l why; do
+    [ -n "$l" ] || continue
+    note "lane ${l}: held back, because it pins a first-party dependency at a dev version (${why}). It publishes from the first stable run whose tree pins it only at stable versions."
+  done < <(jq -r --argjson mods "$mods" 'to_entries[] | select(.key as $k | $mods | index($k)) | [.key, (.value | join("; "))] | @tsv' <<<"$held")
+  out "go_modules_to_release=${kept}" "held=$(jq -c --argjson mods "$mods" 'with_entries(select(.key as $k | $mods | index($k)))' <<<"$held")"
 }
 
 # A dev build is numbered as the next promotion, so a build of a library lane
@@ -1416,7 +1451,7 @@ cmd_renumber() {
 }
 
 case "${1:-}" in
-  pending | publish | ahead | halves | number | receipts | renumber) "cmd_$1" ;;
+  pending | publish | hold | ahead | halves | number | receipts | renumber) "cmd_$1" ;;
   barrier)
     rc=0
     timeout --kill-after=10 "$BARRIER_SECONDS" "$BASH" "${BASH_SOURCE[0]}" barrier-wait || rc=$?

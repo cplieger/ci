@@ -260,7 +260,7 @@ class Purity(unittest.TestCase):
 
 
 class PurityPerLane(unittest.TestCase):
-    def test_each_violation_names_its_lane_and_shipped_pin_files_count(self):
+    def test_root_and_pin_file_violations_refuse_and_a_nested_lane_is_held(self):
         with tempfile.TemporaryDirectory() as tmp:
             fx = Fixture(tmp)
             fx.commit(
@@ -275,14 +275,15 @@ class PurityPerLane(unittest.TestCase):
                 },
             )
             repo = promote.inventory.Repo(str(fx.src))
-            got = promote.check_purity(repo, fx.g('rev-parse', 'HEAD'))
-        self.assertEqual(len(got), 3, got)
+            head = fx.g('rev-parse', 'HEAD')
+            got = promote.check_purity(repo, head)
+            held = promote.held_lanes(repo, head)
+        self.assertEqual(len(got), 2, got)
         self.assertIn('lane .:', got[0])
         self.assertIn('(go.mod: github.com/cplieger/httpx v5.0.4-dev.1)', got[0])
-        self.assertIn('lane sub:', got[1])
-        self.assertIn('(sub/go.mod: github.com/cplieger/envx v2.2.0-dev.3)', got[1])
-        self.assertIn('lane .:', got[2])
-        self.assertIn('(entrypoint.sh: cplieger/toolbelt v3.3.0-dev.2)', got[2])
+        self.assertIn('lane .:', got[1])
+        self.assertIn('(entrypoint.sh: cplieger/toolbelt v3.3.0-dev.2)', got[1])
+        self.assertEqual(held, {'sub': ['sub/go.mod: github.com/cplieger/envx v2.2.0-dev.3']})
 
 
 class Reconciliation(unittest.TestCase):

@@ -46,7 +46,7 @@ jobs:
       exclude_re: ${{ steps.changes.outputs.exclude_re }}
       root_changed: ${{ steps.publish.outputs.root_changed || steps.ahead.outputs.root_changed || steps.changes.outputs.root_changed }}
       go_modules: ${{ steps.gomodules.outputs.go_modules }}
-      go_modules_to_release: ${{ steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}
+      go_modules_to_release: ${{ steps.hold.outputs.go_modules_to_release || steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}
       go_halves: ${{ steps.gomodules.outputs.go_halves }}
       halves_to_publish: ${{ steps.halves.outputs.halves_to_publish || '[]' }}
       # The root lane's release-kind line.
@@ -364,13 +364,30 @@ jobs:
           set -euo pipefail
           bash "$CI_TOOLS/release-state.sh" publish
 
+      # A stable run publishes no nested lane whose own manifests pin a
+      # first-party dependency at a dev version (scripts/purity.py, the rule
+      # promote.py applies): a promotion holds such a lane back and publishes
+      # the rest. The lane publishes from the first stable run whose tree pins
+      # it only at stable versions.
+      - name: Hold back lanes that pin a dev version
+        id: hold
+        if: ${{ steps.channel.outputs.channel == 'stable' && steps.gomodules.outputs.go_modules != '[]' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+          GO_MODULES_TO_RELEASE: ${{ steps.publish.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}
+          GO_LANES_JSON: ${{ steps.gomodules.outputs.go_modules }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" hold
+
       - name: Find the lane halves to publish
         id: halves
         if: ${{ steps.gomodules.outputs.go_halves != '[]' }}
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           CHANNEL: ${{ steps.channel.outputs.channel }}
-          GO_MODULES_TO_RELEASE: ${{ steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}
+          GO_MODULES_TO_RELEASE: ${{ steps.hold.outputs.go_modules_to_release || steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}
           GO_HALVES_JSON: ${{ steps.gomodules.outputs.go_halves }}
         run: |
           set -euo pipefail
