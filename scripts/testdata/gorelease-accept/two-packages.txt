@@ -1,0 +1,19 @@
+# example.com/lib/v2
+## incompatible changes
+Client.Close: changed from func() to func() error
+## compatible changes
+Client.Flush: added
+
+# example.com/lib/v2/wire
+## incompatible changes
+Frame.Size: removed
+Decode: removed
+
+# example.com/lib/v2/wire/legacy
+## incompatible changes
+package removed
+
+# summary
+v2.4.0 is not a valid semantic version for this release.
+There are incompatible changes.
+

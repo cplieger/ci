@@ -1558,6 +1558,26 @@ jobs:
           fi
           echo "ok: module path '$modpath' matches '$expected' ($VERSION)"
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # gorelease refuses a tree `git status --porcelain` calls dirty, and the
+      # untracked ci source would make it one.
+      - name: Move the ci source out of the module
+        run: |
+          set -euo pipefail
+          mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       # API-compatibility check, PRE-TAG, and it fails the release. Versions
       # come from commit messages, so a `feat:` that renames an exported symbol
       # mints a minor and breaks consumers while every other check stays green.
@@ -1566,8 +1586,10 @@ jobs:
       # the change. Skipped for apps and major bumps (a major IS the break), and
       # skipped rather than failed when the tool cannot install or run. It
       # refuses a dirty tree, so it cannot preview a release from local edits.
+      # A decided break ships under a minor through the caller's api-accept.txt.
       - name: API compatibility (gorelease)
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           # The stable base on both channels: a dev build compared against the
           # previous dev build would be refused for a legitimate minor.
           VERSION: ${{ needs.detect.outputs.base }}
@@ -1663,6 +1685,53 @@ jobs:
             verdict=operational
           fi
 
+          # api-accept.txt is read from the caller's checkout, the working
+          # directory; the script owns its format and the recomputed verdict.
+          accept_md="$RUNNER_TEMP/api-accept.md"
+          if [ -f api-accept.txt ] && { [ "$verdict" = ok ] || [ "$verdict" = api ]; }; then
+            # The checks gorelease's incompatible-changes verdict hides need these two
+            # lookups; a failed one is omitted, which the script treats as blocking.
+            lookups=()
+            if [ "$verdict" = api ]; then
+              modpath=$(awk '$1=="module"{print $2; exit}' go.mod)
+              if existing=$(cd "$RUNNER_TEMP" && GOFLAGS='' go list -m -versions -f '{{join .Versions " "}}' "$modpath"); then
+                lookups+=(--existing "$existing")
+              fi
+              # gorelease's own lookup (findSelectedVersion after prepareLoadDir in
+              # cmd/gorelease/gorelease.go) runs in a module that requires this one and copies
+              # only go.mod's go and require lines, so the caller's replace and exclude do not
+              # apply. `go list -mod=mod -m all` stands in for the `go get` gorelease runs there
+              # first: it raises each root to its selected version, which a lazy `go list -m` reads.
+              self_version() {
+                local dir args
+                args=$(go mod edit -json | jq -r '(.Go // empty | "-go=" + .), (.Require[]? | "-require=\(.Path)@\(.Version)")') || return 1
+                dir=$(mktemp -d "$RUNNER_TEMP/gorelease-self.XXXXXX") || return 1
+                printf 'module gorelease-self\n' >"$dir/go.mod" || return 1
+                if [ -f go.sum ]; then
+                  cp go.sum "$dir/go.sum" || return 1
+                fi
+                local -a edit=("-require=$modpath@$VERSION" "-replace=$modpath=$PWD")
+                if [ -n "$args" ]; then
+                  mapfile -t -O "${#edit[@]}" edit <<<"$args"
+                fi
+                (cd "$dir" && go mod edit "${edit[@]}" && go list -mod=mod -m all >/dev/null \
+                  && go list -m -f '{{.Version}}' -- "$modpath")
+              }
+              if self=$(self_version); then
+                lookups+=(--self "$self")
+              fi
+            fi
+            arc=0
+            python3 "$CI_TOOLS/gorelease-accept.py" --verdict "$verdict" --report "$out" \
+              --accept api-accept.txt --base "$prev" --version "$VERSION" \
+              "${lookups[@]}" --summary "$accept_md" || arc=$?
+            case "$verdict:$arc" in
+              ok:0 | api:1) ;;
+              api:0) verdict=accepted ;;
+              *) verdict=accept-error ;;
+            esac
+          fi
+
           {
             echo "### API compatibility: ${prev} -> ${VERSION}"
             echo ""
@@ -1676,7 +1745,16 @@ jobs:
                 echo "non-major bump or a release diagnostic (\`isSuccessful\` covers both)."
                 echo "So read the report below before assuming which: if the version is"
                 echo "wrong, the commit that mints it needs a \`!\` to cut a major; if the"
-                echo "change is compatible and the report is wrong, investigate with apidiff."
+                echo "change is compatible and the report is wrong, investigate with apidiff;"
+                echo "if the break is decided for a minor, list each line in \`api-accept.txt\`."
+                ;;
+              accepted)
+                echo "gorelease rejected ${VERSION} only for incompatible changes this"
+                echo "repository's \`api-accept.txt\` accepts, so the release proceeds."
+                ;;
+              accept-error)
+                echo "**\`api-accept.txt\` could not be applied, and this FAILS the release.**"
+                echo "The log names the line or argument it could not use."
                 ;;
               operational)
                 echo "**gorelease could not run, so the API surface was NOT checked.**"
@@ -1691,6 +1769,9 @@ jobs:
                 ;;
             esac
             echo ""
+            if [ -f "$accept_md" ]; then
+              cat "$accept_md"
+            fi
             echo '```'
             head -c 8000 "$out"
             echo '```'
@@ -1715,6 +1796,14 @@ jobs:
               echo "::error::gorelease usage error - this step invoked it wrongly (report above, and in the run summary)"
               exit 1
               ;;
+            accepted)
+              echo "::notice::every incompatible change gorelease reported for ${VERSION} is in api-accept.txt (report above, and in the run summary)"
+              exit 0
+              ;;
+            accept-error)
+              echo "::error::api-accept.txt could not be applied to the gorelease report (see above)"
+              exit 1
+              ;;
             operational)
               # Fail OPEN, on the same reasoning as the install failure above: an
               # unreachable checker is an infrastructure fault, and failing every
@@ -1724,19 +1813,6 @@ jobs:
               ;;
           esac
           exit 0
-
-      - name: Check out the ci source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: .cplieger-ci
-          persist-credentials: false
-
-      - name: Setup Python
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.15"
 
       - name: Generate release notes
         # Stable only: a dev build creates no Release. Deliberately
@@ -1748,7 +1824,7 @@ jobs:
         # downloaded code.
         if: ${{ needs.detect.outputs.channel == 'stable' }}
         env:
-          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
           KIND_NOTE: ${{ needs.detect.outputs.release_kind_note }}
@@ -1775,7 +1851,7 @@ jobs:
       - name: Tag + GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
           CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |

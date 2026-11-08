@@ -348,6 +348,11 @@ for key, job, name in (("go", "go", "Tag + GitHub Release"), ("ts", "ts", "Tag +
     facts[f"publish-tools:{key}"] = "|".join((
         step(jobs, job, name)["env"].get("CI_TOOLS", ""), ci_src["with"]["path"],
         str(names.index("Check out the ci source") < names.index(name)), ci_src.get("if", "")))
+    move = next((s for s in jobs[job]["steps"] if str(s.get("name", "")).startswith("Move the ci source")), None)
+    facts[f"publish-move:{key}"] = "none" if move is None else "|".join((
+        str(names.index("Check out the ci source") < names.index(move["name"])
+            < names.index("API compatibility (gorelease)") < names.index(name)),
+        move.get("if", ""), str('mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"' in move["run"])))
 facts["release-view-sites"] = " ".join(str(open(new.replace("release.yaml", wf)).read().count("gh release view"))
                                        for wf in ("release.yaml", "docker-release.yaml"))
 facts["repair-tag-callers"] = sorted(n for n, j in jobs.items()
@@ -3470,8 +3475,15 @@ for s in go ts lane; do
   REF_S="api repos/o/app/git/ref/tags/$rtag --jq .object.sha" READ_S="api repos/o/app/releases/tags/$rtag"
   CREATE_S="release create $rtag --title $rtag --notes-file NOTES.md"
   # The tag step sources retry.sh and tag-ref.sh on every channel, so the checkout runs on every channel.
+  # The go job moves the checkout out of the module before gorelease, so its tag step reads the moved copy.
+  tools='${{ github.workspace }}/.cplieger-ci/scripts' move=none moved="leaves that source where it checked it out"
+  if [ "$s" = go ]; then
+    tools='${{ runner.temp }}/cplieger-ci/scripts' move='True||True'
+    moved="moves that source to the runner temp dir before gorelease and the tag step, on every channel"
+  fi
   chk "W26 the $s site runs the helper from the ci source it checked out first, on every channel" \
-    "$(fact ".\"publish-tools:$s\"")" "\${{ github.workspace }}/.cplieger-ci/scripts|.cplieger-ci|True|"
+    "$(fact ".\"publish-tools:$s\"")" "$tools|.cplieger-ci|True|"
+  chk "W26 the $s site $moved" "$(fact ".\"publish-move:$s\"")" "$move"
   chk "W26 the $s site leaves a present Release alone" "$(publish_site "$s" 200)" "0|$REF_S;$READ_S"
   chk "W26 the $s site creates the Release on a 404, reading no draft listing" "$(publish_site "$s" 404)" \
     "0|$REF_S;$READ_S;$CREATE_S"
