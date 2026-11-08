@@ -1,0 +1,12 @@
+# github.com/cplieger/web-terminal-engine/v6/terminal
+## incompatible changes
+StartZombieReaper: removed
+
+# github.com/cplieger/web-terminal-engine/v6/vt
+## compatible changes
+Screen.FocusEnableSeq: added
+
+# summary
+v6.5.0 is not a valid semantic version for this release.
+There are incompatible changes.
+

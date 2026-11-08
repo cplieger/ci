@@ -81,6 +81,25 @@ A TypeScript subpackage or module half whose `package.json` sets `"private": tru
 
 Before it tags a release or pushes an image, the workflow checks the root `go.mod` module path. A library's path must be `github.com/<owner>/<repo>`, with a `/vN` suffix from major version 2 on. An image repository's path must be the plain `github.com/<owner>/<repo>` at every major version, because nothing imports an app. A repository with no root `go.mod` skips the check.
 
+Before it tags a Go library, the run compares the root module's exported API with the newest stable tag using [gorelease](https://pkg.go.dev/golang.org/x/exp/cmd/gorelease). It fails when the change is incompatible but the version is not a new major. The check runs on both channels against the next stable version. It skips a root `package main`, a first release and a major bump.
+
+When gorelease cannot install, run or load the packages, the run warns and lets the release through. It fails when gorelease rejects its own arguments. The run summary shows the gorelease report.
+
+To ship a decided incompatible change in a minor release, commit `api-accept.txt` at the repository root. Each line names one change as `<package import path>: <line from the gorelease report>`. Copy the line from under `## incompatible changes`, below that package's `# <package import path>` heading. Lines starting with `#` and blank lines are ignored. An entry must match a whole report line of the same package.
+
+When gorelease cannot load the new version's packages, the run lets the release through as described above and does not read the file. Otherwise the file lets gorelease's rejection pass only when all of these hold:
+
+- Every incompatible change in the report has an entry.
+- No package has a load error.
+- gorelease reports no diagnostic and no reason other than the incompatible changes.
+- The version raises the minor version over the newest stable tag.
+- The Go module proxy does not already list the version.
+- No dependency requires a higher version of the module.
+
+gorelease's verdict on incompatible changes hides those last three checks, so the run makes them itself. When it cannot list the published versions or the module graph, it keeps the release failed. Like gorelease, the run reads the module graph as a module that depends on this one sees it. The repository's own `replace` and `exclude` directives therefore do not hide a dependency that requires a higher version.
+
+The run warns about each entry that matches no incompatible change or repeats an earlier entry. A line that is not in the `<package>: <change>` form fails the release. The run summary lists the accepted, unaccepted and unmatched entries. Delete the file once a stable tag contains the change, or the next releases warn about every entry. Committing the file starts a release like any other change, so adding it reruns the check on the change it accepts.
+
 The branch picks the channel. A push to `dev` publishes the dev channel, with `vX.Y.Z-dev.N` tags, `:dev` images on GitHub Container Registry, the npm `dev` dist-tag and no GitHub Release. A push to `main` publishes the stable channel, with a `vX.Y.Z` tag, GitHub Container Registry and Docker Hub images, npm and JSR packages, and a GitHub Release. A run on any other branch, a tag or a pull request fails with an error and publishes nothing.
 
 Runs on one branch queue, and a newer push replaces a run still waiting, so the run on the newest head always comes last. Once a push that edits workflow files lands past a run's commit, GitHub refuses that run's tag create. The run then hands its version off: it ends with a warning, and the run on the newest head releases every commit since the last tag under one version. The root TypeScript package checks before it reaches npm, which keeps every version it receives, and hands off when the branch has moved and its version has no tag at the run's commit. A subpackage or a lane's TypeScript half hands off when its version has no tag there and the branch has moved. A refused tag create while the run is still the branch head stays an error.
