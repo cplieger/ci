@@ -777,6 +777,14 @@ class StrictVet(unittest.TestCase):
                 plant(doc)
                 self.assert_rejected_at(doc, f'{path}: field not allowed')
 
+        with self.subTest(path='a row key and a key in its grid item'):
+            doc = valid()
+            rows(doc)[0]['spec']['titel'] = 'Queue'
+            grid_items(doc)[0]['spec']['widht'] = 4
+            row = 'spec.layout.spec.rows.0.spec'
+            for path in (f'{row}.titel', f'{row}.layout.spec.items.0.spec.widht'):
+                self.assert_rejected_at(doc, f'{path}: field not allowed |')
+
     def test_free_form_fields_stay_open(self):
         free = {'pluginOnly': {'nested': [1, {'deeper': True}]}}
         doc = valid()

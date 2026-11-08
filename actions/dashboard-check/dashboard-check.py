@@ -849,21 +849,39 @@ def nested_layout_errors(
     path: pathlib.Path, cue: str, schema: pathlib.Path, strict: pathlib.Path
 ) -> list[tuple[str, str, str]]:
     """cue drops an error two disjunctions deep (cue-lang/cue#3607), and a layout inside a row
-    or a tab is that deep, so each layout is vetted alone; the innermost failing one names the key."""
+    or a tab is that deep, so each layout is vetted alone, on its own level only."""
     layout = obj(obj(json.loads(path.read_text())).get('spec')).get('layout')
     node_file = strict.parent / 'layout.json'
-    reports = {}
+    errors = []
     for where, node in layout_nodes(layout, 'spec.layout'):
-        node_file.write_text(json.dumps(node))
+        node_file.write_text(json.dumps(own_level(node)))
         report = run_cue(cue, schema, strict, node_file, f'#Strict{node["kind"]}')
         if report is not None:
-            reports[where] = report
-    return [
-        error
-        for where, report in reports.items()
-        if not any(other.startswith(f'{where}.') for other in reports)
-        for error in cue_errors(report, f'{where}.', None)
-    ]
+            errors += cue_errors(report, f'{where}.', None)
+    return errors
+
+
+EMPTY_GRID = {'kind': 'GridLayout', 'spec': {'items': []}}
+
+
+def own_level(layout: dict) -> dict:
+    """layout with each nested layout that layout_nodes also yields swapped for an empty grid:
+    when a nested layout fails its disjunction, cue v0.17.1 drops the errors beside it, such as
+    a misspelt key in the row that holds it."""
+    spec = layout.get('spec')
+    if not isinstance(spec, dict):
+        return layout
+    spec = dict(spec)
+    for key in ('rows', 'tabs'):
+        if isinstance(spec.get(key), list):
+            spec[key] = [
+                {**member, 'spec': {**member['spec'], 'layout': EMPTY_GRID}}
+                if isinstance(member, dict)
+                and obj(obj(member.get('spec')).get('layout')).get('kind') in LAYOUT_KINDS
+                else member
+                for member in spec[key]
+            ]
+    return {**layout, 'spec': spec}
 
 
 def layout_nodes(layout: object, where: str) -> list[tuple[str, dict]]:
@@ -890,6 +908,8 @@ def cue_errors(output: str, prefix: str, name: str | None) -> list[tuple[str, st
             (s.strip() for s in lines[i + 1 :] if s.startswith(' ') and name and name in s),
             '',
         )
+        if not location:
+            headline = headline.removesuffix(':')
         out.append((headline.partition(': ')[0], headline, location))
     return out
 
