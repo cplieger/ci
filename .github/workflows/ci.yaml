@@ -539,11 +539,11 @@ jobs:
       matrix:
         include:
           - repository: cplieger/deadset-go
-            ref: 263fc990eafa9c88c0fefa839f057f21eb6530a0
+            ref: ec6d88c28c9a168b66ef8046be4e6157c5c9995a
             dir: '.'
             runner: windows-latest
           - repository: cplieger/deadset-go
-            ref: 263fc990eafa9c88c0fefa839f057f21eb6530a0
+            ref: ec6d88c28c9a168b66ef8046be4e6157c5c9995a
             dir: '.'
             runner: macos-latest
           - repository: cplieger/bolttable
