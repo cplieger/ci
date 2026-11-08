@@ -302,6 +302,12 @@ result() { cat "$RUN.result"; }
 detect() { jq -r ".outputs.$1" "$RUN.detect.json"; }
 lane_state() { detect lane_state | jq -r --arg k "$1" ".[\$k].$2"; }
 step_out() { jq -r ".steps.$1.outputs.$2" "$RUN.detect.json"; }
+step_log() { # <step name>: what the detect step printed, stdout then stderr
+  local i
+  i=$(jq -r --arg n "$1" '.ran | index($n) // empty' "$RUN.detect.json")
+  [ -n "$i" ] || fail "detect ran no step named '$1'"
+  cat "$(jq -r .runner_temp "$RUN.detect.json")/log-$i.txt"
+}
 lane_notes() { head -n1 "$RUN.lane-$1.notes"; }
 
 # ── A promotion: promote.yaml's jobs ─────────────────────────────────────────
@@ -585,6 +591,44 @@ chk_has "M36 its preview counts the patch main's run published" \
   'No path root ships changed since `v3.0.1`, so it cuts no version.'
 run_release main inflight-r
 chk "M37 the stable run at the promotion publishes nothing, as its preview planned" "$(result)" ""
+
+# ── 14b. a lane pinning a first-party dev version is held, then published ────
+# promote.py holds back a nested lane whose own manifests pin a first-party
+# dependency at a dev version; the stable run publishes the rest (purity.py).
+# The held promotion is not the lane's pending promotion, so dev keeps numbering
+# the lane on its own line and a later main commit does not publish it.
+wiremod() { printf 'module github.com/o/app/wire\\n\\ngo 1.27\\n\\nrequire github.com/cplieger/go/filesafe %s' "$1"; }
+commit_on dev "feat(wire): add the wire lane" wire/go.mod="$(wiremod v1.0.0-dev.6)" wire/w.go='package wire\n// v1' \
+  yamlenv/y.go='package yamlenv\n// held pass 1' >/dev/null
+run_release dev w1
+chk "M38 dev builds the new lane and the lane it changed" "$(result)" "wire/v1.0.0-dev.1 yamlenv/v1.3.0-dev.1"
+out=$(run_promote held1)
+RH1=$(head_of main)
+chk "M38 a promotion with a dev-pinned lane is not refused" "$out" "promoted $RH1"
+chk_has "M38 its preview names the held lane and why" \
+  "$(cat "$(jq -r .runner_temp "$WORK/promote-held1.preview.json")/summary.md")" \
+  "### wire: held back"
+chk_has "M38 its checks say the rest publishes" \
+  "$(cat "$(jq -r .runner_temp "$WORK/promote-held1.apply.json")/summary.md")" \
+  'Held back: lane `wire` pins a first-party dependency at a dev version (wire/go.mod: github.com/cplieger/go/filesafe v1.0.0-dev.6)'
+run_release main held1
+chk "M39 the stable run publishes the other lane only" "$(result)" "yamlenv/v1.3.0"
+chk "M39 and drops the held lane from the lanes it releases" "$(detect go_modules_to_release)" '["yamlenv"]'
+chk_has "M39 and says in its log which lane it held and why" "$(step_log 'Hold back lanes that pin a dev version')" \
+  '::notice::lane wire: held back, because it pins a first-party dependency at a dev version (wire/go.mod: github.com/cplieger/go/filesafe v1.0.0-dev.6).'
+commit_on main "fix(deps): update module example.org/dep to v1.3.7" go.mod="$(gomod v1.3.7)" >/dev/null
+run_release main held-s
+chk "M40 a later main commit does not publish the held lane on that promotion's account" \
+  "$(result)|$(lane_state wire commit)|$(lane_state wire in_range)" "v3.0.2||false"
+commit_on dev "fix(deps): update module github.com/cplieger/go/filesafe to v1.0.0" wire/go.mod="$(wiremod v1.0.0)" \
+  go.mod="$(gomod v1.3.7)" >/dev/null # main's bump too, so dominance passes and the root ships nothing new
+run_release dev w2
+chk "M41 dev keeps numbering the held lane on its own line" "$(result)|$(lane_state wire commit)" "wire/v1.0.0-dev.2|"
+out=$(run_promote held2)
+chk "M42 once its pin is stable, the next promotion publishes the lane" "$out" "promoted $(head_of main)"
+run_release main held2
+chk "M42 at its seed version, promoted from its newest dev build" "$(result)|$(lane_notes wire)" \
+  'wire/v1.0.0|Promoted from `wire/v1.0.0-dev.2`'
 
 # ── 15. a lockfile-only commit on main ───────────────────────────────────────
 commit_on main "chore(deps): lock file maintenance" package-lock.json='{"lockfileVersion": 3}' >/dev/null

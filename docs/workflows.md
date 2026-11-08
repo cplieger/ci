@@ -151,11 +151,13 @@ A collapsed Dependencies block follows. It lists what changed in `go.mod`, `pack
 
 `promote.yaml` in this repository promotes a chosen `dev` commit to `main`, on demand only. Its inputs are `repo`, `target`, `dry_run` and `accept_vulnerabilities`, and `target` defaults to the head of `dev`. It refuses the promotion unless all five checks pass:
 
-- The commit pins no first-party dependency at a `-dev.` version.
+- The commit's root pins no first-party dependency at a `-dev.` version, in its own manifests or its shipped pin files.
 - Each image lane still has a signed `dev` image on GitHub Container Registry, built from that commit or from an ancestor with no shipped change since.
 - Every file that changed on `main` since the branches split is a dependency file or a synced file. The commit has each dependency at the same version, a newer one or none, and each synced file equal to `main`'s copy or the current one here.
 - The commit's image publishes every platform the image of `main` publishes, and has no fixable `HIGH` or `CRITICAL` finding, on any platform, that the image of `main` lacks. A finding whose ID is listed in `accept_vulnerabilities` passes this check: use it when no rebuild here can fix the finding, such as a package inside a base image, and the run summary names each accepted ID.
 - The commit's tree differs from `main`'s.
+
+A nested Go module whose own manifests (its `go.mod`, and its TypeScript half's `package.json` and `jsr.json`) pin a first-party dependency at a `-dev.` version does not refuse the promotion. It is held back: the promotion moves `main` and the other lanes publish as planned, but the stable run publishes nothing of that module. The preview names it under "held back", the checks' summary names its pins, and the stable run's log names the lane. A held promotion is not the module's pending promotion, so a later commit on `main` does not publish it while its tree still pins the dev version. The module publishes from the first stable run whose tree pins it only at stable versions, which is normally the next promotion. A library whose modules require each other promotes in two passes this way: the first publishes the modules with no dev pin, then each held module moves to those stable versions on `dev`, and the second promotion publishes it. `scripts/purity.py` holds the rule that `promote.py` and the stable run both apply.
 
 A promotion that changes no path any lane ships still moves `main`. Its preview names the version each lane will publish, or says the lane has no release. The preview starts once every release run of `main`'s head has finished, so it counts the tags those runs create. The promotion waits up to 45 minutes for them, then stops and asks for a rerun. On `main`, an empty rebuild commit counts as a change only when it was merged into `main` itself, not when a promotion brings in one from `dev`.
 

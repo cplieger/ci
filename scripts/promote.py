@@ -39,6 +39,7 @@ from pathlib import Path
 import ghrest
 import inventory
 import release_channels as rc
+from purity import PurityInputError, first_party, lane_holds, purity_violations, tree_files
 
 OWNER = 'cplieger'
 SCRIPTS = Path(__file__).resolve().parent
@@ -158,155 +159,6 @@ def token_free_env(**extra: str) -> dict[str, str]:
 # ── Purity ────────────────────────────────────────────────────────────────────
 
 
-def _first_party(spec: str) -> bool:
-    return 'cplieger/' in spec or spec.startswith('@cplieger/')
-
-
-def _go_mod_directives(text: str):
-    """(directive, words) for every require and replace line, blocks unfolded."""
-    block = ''
-    for raw in text.splitlines():
-        line = raw.split('//', 1)[0].strip()
-        if not line:
-            continue
-        if block:
-            if line == ')':
-                block = ''
-            else:
-                yield block, line.split()
-            continue
-        words = line.split()
-        if words[0] in ('require', 'replace'):
-            if len(words) == 2 and words[1] == '(':
-                block = words[0]
-            else:
-                yield words[0], words[1:]
-
-
-def _go_mod_violations(path: str, text: str) -> list[str]:
-    found = []
-    for directive, words in _go_mod_directives(text):
-        if directive == 'require':
-            if (
-                len(words) >= 2
-                and words[0].startswith('github.com/cplieger/')
-                and '-dev.' in words[1]
-            ):
-                found.append(f'{path}: {words[0]} {words[1]}')
-            continue
-        # replace [old [vOld]] => new [vNew]: the replacement is what Go builds.
-        if '=>' not in words:
-            continue
-        target = words[words.index('=>') + 1 :]
-        if (
-            len(target) >= 2
-            and target[0].startswith('github.com/cplieger/')
-            and '-dev.' in target[1]
-        ):
-            found.append(f'{path}: replace {words[0]} => {target[0]} {target[1]}')
-    return found
-
-
-class PurityInputError(GhError):
-    """A purity file whose shape the check cannot read, so its pins cannot be judged."""
-
-
-def _json_sections(path: str, text: str, sections: tuple[str, ...]) -> list[tuple[str, dict]]:
-    """(section, mapping) for each present section of a JSON manifest, as npm and JSR
-    read it: the document and every present section must be objects."""
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as err:
-        raise PurityInputError(f'{path} is not valid JSON ({err})') from None
-    if not isinstance(data, dict):
-        raise PurityInputError(f'{path} is not a JSON object')
-    found = []
-    for section in sections:
-        mapping = data.get(section)
-        if mapping is None:
-            continue
-        if not isinstance(mapping, dict):
-            raise PurityInputError(f'{section} in {path} is not an object')
-        found.append((section, mapping))
-    return found
-
-
-def _package_json_violations(path: str, text: str) -> list[str]:
-    found = []
-    sections = ('dependencies', 'peerDependencies', 'optionalDependencies')
-    for section, mapping in _json_sections(path, text, sections):
-        for name, spec in mapping.items():
-            # An alias spec (`npm:@cplieger/x@1.0.0-dev.1`) names the package
-            # in the value, so both sides are judged.
-            if _first_party(f'{name} {spec}') and '-dev.' in str(spec):
-                found.append(f'{path}: {section} {name} {spec}')
-    return found
-
-
-def _jsr_json_violations(path: str, text: str) -> list[str]:
-    return [
-        f'{path}: imports {name} {spec}'
-        for _, mapping in _json_sections(path, text, ('imports',))
-        for name, spec in mapping.items()
-        if '@cplieger/' in f'{name} {spec}' and '-dev.' in str(spec)
-    ]
-
-
-_RENOVATE_DEP = re.compile(r'#\s*renovate:.*\bdepName=(\S+)')
-_FROM_LINE = re.compile(r'^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)', re.IGNORECASE)
-_ARG_LINE = re.compile(r'^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)=(\S+)')
-
-
-def _dockerfile_violations(path: str, text: str) -> list[str]:
-    """A `# renovate:` marker annotates the ARG on the next line only, as
-    Renovate reads it; any other line in between disowns it."""
-    found = []
-    renovate_dep = ''
-    for raw in text.splitlines():
-        m = _RENOVATE_DEP.search(raw)
-        if m:
-            renovate_dep = m.group(1)
-            continue
-        m = _FROM_LINE.match(raw)
-        if m:
-            image = m.group(1)
-            if image.startswith('ghcr.io/cplieger/') and '-dev.' in image:
-                found.append(f'{path}: FROM {image}')
-        m = _ARG_LINE.match(raw)
-        if m:
-            name, value = m.group(1), m.group(2).strip('"\'')
-            if '-dev.' in value and (_first_party(value) or _first_party(renovate_dep)):
-                found.append(f'{path}: ARG {name}={value}')
-        renovate_dep = ''
-    return found
-
-
-def purity_violations(files: dict[str, str]) -> list[str]:
-    """First-party pins at a `-dev.` version among {path: text} for go.mod,
-    package.json, jsr.json and Dockerfile* files. Empty means pure. Raises
-    PurityInputError when a JSON manifest has a shape it cannot read."""
-    found: list[str] = []
-    for path in sorted(files):
-        text = files[path]
-        base = path.rsplit('/', 1)[-1]
-        if base == 'go.mod':
-            found += _go_mod_violations(path, text)
-        elif base == 'package.json':
-            found += _package_json_violations(path, text)
-        elif base == 'jsr.json':
-            found += _jsr_json_violations(path, text)
-        elif base.startswith('Dockerfile'):
-            found += _dockerfile_violations(path, text)
-    return found
-
-
-def is_purity_file(path: str) -> bool:
-    if '/node_modules/' in f'/{path}':
-        return False
-    base = path.rsplit('/', 1)[-1]
-    return base in ('go.mod', 'package.json', 'jsr.json') or base.startswith('Dockerfile')
-
-
 # Shipped pin files only the inventory reads; lockfiles ship to no consumer.
 _PIN_SURFACES = frozenset({'pins', 'bundled-tools'})
 
@@ -320,28 +172,59 @@ def pin_violations(repo: inventory.Repo, target: str) -> list[str]:
         found += [
             f'{path}: {r.identity} {r.value}'
             for r in records
-            if _first_party(r.identity) and '-dev.' in r.value
+            if first_party(r.identity) and '-dev.' in r.value
         ]
     return sorted(found)
 
 
 def check_purity(repo: inventory.Repo, target: str) -> list[str]:
-    files = {p: repo.blob(target, p) or '' for p in repo.paths(target) if is_purity_file(p)}
+    """Refusals: a root manifest or a shipped pin file pinning a first-party
+    dependency at a dev version, and any manifest the check cannot read. A
+    nested lane's own dev pin is no refusal: the stable run holds that lane
+    back (held_lanes) and the rest of the promotion publishes."""
+    files = tree_files(repo, target)
     lanes = repo.lanes(target)
     refusals, found = [], []
     for path in sorted(files):
         try:
-            found += purity_violations({path: files[path]})
+            violations = purity_violations({path: files[path]})
         except PurityInputError as err:
             refusals.append(
                 f'lane {inventory.lane_of(path, lanes)}: {err}, so the first-party pins in '
                 f'{path} cannot be judged. Fix {path} on dev'
             )
+            continue
+        if inventory.lane_of(path, lanes) == '.':
+            found += violations
     found += pin_violations(repo, target)
     return refusals + [
         f'lane {inventory.lane_of(v.split(":", 1)[0], lanes)}: a first-party dependency is '
         f'pinned at a dev version ({v}). Promote it first and stabilize this commit'
         for v in found
+    ]
+
+
+def held_lanes(repo: inventory.Repo, target: str) -> dict[str, list[str]]:
+    """{lane: [violation, ...]} of the nested lanes `target` holds back, the
+    rule release.yaml's stable run applies through purity.py. A manifest the
+    check cannot read is skipped here; check_purity refuses it."""
+    files, lanes = tree_files(repo, target), repo.lanes(target)
+    readable = {}
+    for path, text in files.items():
+        try:
+            purity_violations({path: text})
+        except PurityInputError:
+            continue
+        readable[path] = text
+    return lane_holds(readable, lanes)
+
+
+def held_lines(held: dict[str, list[str]]) -> list[str]:
+    return [
+        f'Held back: lane `{lane}` pins a first-party dependency at a dev version '
+        f'({"; ".join(found)}). It publishes from the first stable run whose tree pins it '
+        'only at stable versions; the other lanes publish as planned.'
+        for lane, found in sorted(held.items())
     ]
 
 
@@ -981,8 +864,9 @@ def _lane_rows(state, tool: str) -> dict[str, dict]:
 
 
 def release_plan(clone: Path, main: str, r: str, layout: Layout) -> dict[str, dict[str, str]]:
-    """{lane key: {version, h_tag, kind_note}} for every lane of main's stable run at R,
-    checked out in `clone`, from release.yaml detect's own steps; version '' for no release."""
+    """{lane key: {version, h_tag, kind_note, held}} for every lane of main's stable run at R,
+    checked out in `clone`, from release.yaml detect's own steps; version '' for no release,
+    held the violations of a lane the run holds back ('' when it is not held)."""
     env = layout.env()
     tool = 'release-state.sh pending'
     pending = run_tool(clone, SCRIPTS / 'release-state.sh', 'pending', CHANNEL='stable', **env)
@@ -1030,12 +914,15 @@ def release_plan(clone: Path, main: str, r: str, layout: Layout) -> dict[str, di
         or not set(modules) <= rows.keys() - {'.'}
     ):
         raise GhError(f'{sig_tool} printed malformed go_modules_to_release')
+    # release.yaml's hold step: a lane whose own manifests pin a first-party dev
+    # version publishes nothing at R.
+    held = held_lanes(inventory.Repo(str(clone)), r)
     plan = {}
     for key, row in rows.items():
         version = ''
         if key == '.' and root_releases:
             version = _field(root, 'base', 'compute.sh')
-        elif key in modules:
+        elif key in modules and key not in held:
             lane = run_tool(
                 clone,
                 COMPUTE,
@@ -1044,7 +931,12 @@ def release_plan(clone: Path, main: str, r: str, layout: Layout) -> dict[str, di
                 PENDING_IN_RANGE='true' if row['in_range'] else 'false',
             )
             version = _field(lane, 'base', 'compute.sh')
-        plan[key] = {'version': version, 'h_tag': row['h_tag'], 'kind_note': row['kind_note']}
+        plan[key] = {
+            'version': version,
+            'h_tag': row['h_tag'],
+            'kind_note': row['kind_note'],
+            'held': '; '.join(held.get(key, [])),
+        }
     return plan
 
 
@@ -1093,6 +985,17 @@ def cmd_preview(args) -> int:
             if lane['version']:
                 notes = render_lane_notes(clone, args.repo, key, lane, layout, r)
                 lines += [f'### {name} {lane["version"]}', '', notes, '']
+            elif lane.get('held'):
+                lines += [
+                    f'### {name}: held back',
+                    '',
+                    (
+                        f'It pins a first-party dependency at a dev version ({lane["held"]}), so '
+                        'it publishes from the first stable run whose tree pins it only at stable '
+                        'versions.'
+                    ),
+                    '',
+                ]
             else:
                 since = f' since `{lane["h_tag"]}`' if lane['h_tag'] else ''
                 lines += [
@@ -1173,8 +1076,9 @@ def cmd_check(args) -> int:
                 clone, args.repo, args.main, args.target, work, accepted=accepted
             )
         plan = None if refusals else build_reconciliation(clone, args.main, args.target, digest)
+        held = {} if refusals else held_lanes(inventory.Repo(str(clone)), args.target)
     except (GhError, inventory.InventoryError) as err:
-        refusals, plan = [f'a read failed: {err}'], None
+        refusals, plan, held = [f'a read failed: {err}'], None, {}
     lines = [f'## Promotion checks: {args.repo}', '']
     if refusals:
         lines += [f'- {r}' for r in refusals]
@@ -1189,6 +1093,7 @@ def cmd_check(args) -> int:
         f'Every check passed: R `{plan["sha"][:12]}` (tree of `{args.target[:12]}`, '
         f'parents `{args.main[:12]}` and `{args.target[:12]}`).'
     )
+    lines += held_lines(held)
     if accepted:
         lines.append(f'Accepted without a fix here: {", ".join(sorted(accepted))}.')
     if args.dry_run:

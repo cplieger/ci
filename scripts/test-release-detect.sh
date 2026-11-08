@@ -147,6 +147,13 @@ facts["publish-after"] = facts["names"].index("Detect changed paths") < facts["n
     "Add pending promotions to the publication") < facts["names"].index("Select version")
 open(f"{out}/type.sh", "w").write(d["Detect type + subpackages"]["run"])
 open(f"{out}/gomodules.sh", "w").write(d["Detect nested Go modules"]["run"])
+hd = d.get("Hold back lanes that pin a dev version", {})
+facts["hold-if"] = " ".join(hd.get("if", "").split())
+facts["hold-env"] = hd.get("env", {})
+facts["hold-run"] = " ".join(hd.get("run", "").split())
+facts["hold-order"] = bool(hd) and facts["names"].index("Add pending promotions to the publication") < facts["names"].index(
+    "Hold back lanes that pin a dev version") < facts["names"].index("Find the lane halves to publish")
+facts["out:go_modules_to_release"] = jobs["detect"]["outputs"]["go_modules_to_release"]
 hv = d.get("Find the lane halves to publish", {})
 facts["halves-if"] = " ".join(hv.get("if", "").split())
 facts["halves-env"] = hv.get("env", {})
@@ -1752,7 +1759,15 @@ chk "H6 detect finds the halves once the publication is final, before the releas
   "$(fact '."halves-order"')|$(fact '."halves-if"')" "true|\${{ steps.gomodules.outputs.go_halves != '[]' }}"
 chk "H6 from the final lane list and the discovered halves" \
   "$(fact '."halves-env".GO_MODULES_TO_RELEASE')|$(fact '."halves-env".GO_HALVES_JSON')|$(fact '."halves-env".CHANNEL')" \
-  '${{ steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}|${{ steps.gomodules.outputs.go_halves }}|${{ steps.channel.outputs.channel }}'
+  '${{ steps.hold.outputs.go_modules_to_release || steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}|${{ steps.gomodules.outputs.go_halves }}|${{ steps.channel.outputs.channel }}'
+chk "HB1 a stable run holds back the lanes that pin a dev version, after the pending promotions join and before the halves" \
+  "$(fact '."hold-order"')|$(fact '."hold-if"')|$(fact '."hold-run"')" \
+  "true|\${{ steps.channel.outputs.channel == 'stable' && steps.gomodules.outputs.go_modules != '[]' }}|set -euo pipefail bash \"\$CI_TOOLS/release-state.sh\" hold"
+chk "HB1 from the pending-joined lane list and every discovered lane" \
+  "$(fact '."hold-env".GO_MODULES_TO_RELEASE')|$(fact '."hold-env".GO_LANES_JSON')|$(fact '."hold-env".CHANNEL')" \
+  '${{ steps.publish.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}|${{ steps.gomodules.outputs.go_modules }}|${{ steps.channel.outputs.channel }}'
+chk "HB1 and the held list is what detect hands the lane jobs" "$(fact '."out:go_modules_to_release"')" \
+  '${{ steps.hold.outputs.go_modules_to_release || steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}'
 chk "H6 and hands them on" "$(fact '.outputs.go_halves')|$(fact '.outputs.halves_to_publish')" \
   "\${{ steps.gomodules.outputs.go_halves }}|\${{ steps.halves.outputs.halves_to_publish || '[]' }}"
 chk "H7 the half publishes after its lane's tag, one leg per lane" \
@@ -3507,10 +3522,11 @@ chk "W10 the root kind line replaces the promotion note" "$(fact '.outputs | has
 chk "W11 pending promotions join the publication on stable runs with one in range" "$(fact '."if:publish"')" \
   "steps.channel.outputs.channel == 'stable' && steps.pending.outputs.in_range_any == 'true'"
 chk "W11 between the path diff and the release decision" "$(fact '."publish-after"')" "true"
-for key in root_changed subpackages_to_publish go_modules_to_release; do
+for key in root_changed subpackages_to_publish; do
   chk "W11 detect publishes the joined $key" "$(fact ".outputs.$key")" \
     "\${{ steps.publish.outputs.$key || steps.ahead.outputs.$key || steps.changes.outputs.$key }}"
 done
+# go_modules_to_release also passes the stable run's hold (HB1).
 chk "W11 Select version decides on the joined sets" \
   "$(fact '."select-env".ROOT_CHANGED')|$(fact '."select-env".SUBPACKAGES_TO_PUBLISH')" \
   '${{ steps.publish.outputs.root_changed || steps.ahead.outputs.root_changed || steps.changes.outputs.root_changed }}|${{ steps.publish.outputs.subpackages_to_publish || steps.ahead.outputs.subpackages_to_publish || steps.changes.outputs.subpackages_to_publish }}'
