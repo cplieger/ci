@@ -40,6 +40,7 @@ jobs:
       count: ${{ steps.read.outputs.count }}
       shards: ${{ steps.read.outputs.shards }}
       floor: ${{ steps.read.outputs.floor }}
+      node: ${{ steps.read.outputs.node }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -78,17 +79,21 @@ jobs:
             }
             // The floor is the major of the oldest version engines.node allows,
             // as the semver library npm bundles beside this Node reads it
-            // (minVersion), so it means what npm's engines check means. A floor
-            // below Node 4, the first release after 0.12, names no Node this job
-            // can install. An invalid range, or one no version satisfies, is a
-            // package.json defect and fails the job.
+            // (minVersion). engines-floor asks setup-node for the range kept
+            // within that major (node), so the Node it installs, the newest
+            // release the spec allows, is one the range allows. A floor below
+            // Node 4 is 0, the floor of a range that allows any version, or a
+            // major Node never released (1 to 3), so it names no Node to test.
+            // An invalid range, or one no version satisfies, is a package.json
+            // defect and fails the job.
             const range = pkg?.engines?.node;
             if (range != null && typeof range !== "string") {
               fail(`engines.node is ${JSON.stringify(range).slice(0, 40)}: it must be a version range string`);
             }
             const shown = JSON.stringify(range ?? "").slice(0, 60);
             let floor = "";
-            let major = -1;
+            let node = "";
+            let major;
             if (range) {
               let semver;
               try {
@@ -105,15 +110,25 @@ jobs:
                 fail(`engines.node is ${shown}: no version satisfies it`);
               }
               major = oldest.major;
-              floor = major >= 4 ? String(major) : "";
+              if (major >= 4) {
+                floor = String(major);
+                // Each || alternative that reaches the floor major, with that
+                // major's bounds added; comparator values hold only operators
+                // and version text, so no line break reaches the output.
+                const within = `>=${major}.0.0 <${major + 1}.0.0-0`;
+                node = new semver.Range(range).set
+                  .map((set) => [...set.map((c) => c.value).filter(Boolean), within].join(" "))
+                  .filter((alt) => semver.validRange(alt) !== null && semver.minVersion(alt) !== null)
+                  .join(" || ");
+              }
             }
             const shards = Array.from({ length: count }, (_, i) => i + 1);
-            appendFileSync(process.env.GITHUB_OUTPUT, `count=${count}\nshards=${JSON.stringify(shards)}\nfloor=${floor}\n`);
+            appendFileSync(process.env.GITHUB_OUTPUT, `count=${count}\nshards=${JSON.stringify(shards)}\nfloor=${floor}\nnode=${node}\n`);
             console.log(`vitest shards: ${count}`);
             if (!range) {
               console.log("::notice::package.json declares no engines.node floor; nothing to test beyond the publishing Node");
             } else if (floor === "") {
-              console.log(`::notice::engines.node ${shown} allows Node ${major}, which this job cannot install, so only the publishing Node tests it`);
+              console.log(`::notice::engines.node ${shown} allows Node ${major}, older than any Node release from 4 on, so only the publishing Node tests it`);
             } else {
               console.log(`engines.node ${shown}: testing on Node ${floor}`);
             }
@@ -544,7 +559,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: ${{ needs.package.outputs.floor }}
+          node-version: ${{ needs.package.outputs.node }}
           cache: npm
           cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
 

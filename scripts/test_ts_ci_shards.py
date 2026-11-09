@@ -7,7 +7,9 @@ its shard."""
 from __future__ import annotations
 
 import json
+import shutil
 import stat
+import subprocess
 import unittest
 
 import workflow_replay as wr
@@ -38,13 +40,13 @@ def evaluate(template: str, contexts: dict):
     return wr.Scope(contexts, {}, []).evaluate(whole.group(1))
 
 
-def counted(count: int | None, result: str = 'success', floor: str = '24') -> dict:
+def counted(count: int | None, result: str = 'success', floor: str = '24', node: str = '>=24.0.0 <25.0.0-0') -> dict:
     """The needs context for the package job: outputs as the read step writes
     them, or none when it failed."""
     outputs = (
         {}
         if count is None
-        else {'count': str(count), 'shards': json.dumps(list(range(1, count + 1))), 'floor': floor}
+        else {'count': str(count), 'shards': json.dumps(list(range(1, count + 1))), 'floor': floor, 'node': node}
     )
     return {'package': {'result': result, 'outputs': outputs}}
 
@@ -79,7 +81,7 @@ class PackageSettings(Harness):
             with self.subTest(manifest=manifest):
                 run = self.read(manifest)
                 self.assertEqual(run.rc, 0, run.out)
-                self.assertEqual(run.outputs, {'count': '1', 'shards': '[1]', 'floor': ''})
+                self.assertEqual(run.outputs, {'count': '1', 'shards': '[1]', 'floor': '', 'node': ''})
 
     def test_a_count_from_one_to_one_hundred_lists_every_shard_once(self):
         for count in (1, 2, 100):
@@ -155,7 +157,8 @@ class PackageSettings(Harness):
                 run = self.read({'engines': {'node': node}})
                 self.assertEqual(run.rc, 0, run.out)
                 self.assertEqual(run.outputs['floor'], '')
-                self.assertIn(f'::notice::engines.node {json.dumps(node)} allows Node {major}, which this job cannot install', run.out)
+                self.assertIn(f'::notice::engines.node {json.dumps(node)} allows Node {major}, older than any Node release from 4 on', run.out)
+                self.assertEqual(run.outputs['node'], '')
 
     def test_an_invalid_range_fails_the_job(self):
         for node in ('lts', '08', '>=1e3', '>=2O', '>=24 ' + 'x' * 500, '>=24\n::add-mask::x'):
@@ -168,6 +171,54 @@ class PackageSettings(Harness):
         for node in ('>=22 <22', '22 - 20', '^18 >=20'):
             with self.subTest(node=node):
                 self.assert_refused(self.read({'engines': {'node': node}}), 'no version satisfies it')
+
+    def test_setup_node_gets_the_range_kept_within_the_floor_major(self):
+        """setup-node installs the newest release its spec allows, so the spec
+        keeps the range within the floor major and that release satisfies it."""
+        for node, inside, outside in (
+            ('>=24', ['24.0.0', '24.99.0'], ['25.0.0', '23.9.0']),
+            ('~20.1', ['20.1.0', '20.1.8'], ['20.19.0', '20.0.9']),
+            ('=18.17.0', ['18.17.0'], ['18.20.8']),
+            ('^22 || ^20', ['20.0.0', '20.19.0'], ['22.1.0', '21.0.0']),
+            ('<26 >=22', ['22.5.0'], ['23.0.0', '21.9.0']),
+        ):
+            with self.subTest(node=node):
+                spec = self.read({'engines': {'node': node}}).outputs['node']
+                self.assertNotIn('\n', spec)
+                self.assertEqual(self.satisfied(spec, inside + outside), [True] * len(inside) + [False] * len(outside), spec)
+
+    def satisfied(self, spec: str, versions: list[str]) -> list[bool]:
+        """Which versions npm's semver says spec allows."""
+        script = (
+            'const p = require("node:path");'
+            'const s = require(p.join(p.dirname(process.execPath), "..", "lib", "node_modules", "npm", "node_modules", "semver"));'
+            'console.log(JSON.stringify(JSON.parse(process.argv[2]).map((v) => s.satisfies(v, process.argv[1]))));'
+        )
+        out = subprocess.run([shutil.which('node'), '-e', script, spec, json.dumps(versions)], capture_output=True, text=True, check=True)
+        return json.loads(out.stdout)
+
+    def test_a_semver_that_cannot_be_loaded_fails_the_job(self):
+        # The step finds npm's semver from process.execPath; a preload moves it.
+        preload = self.tmp / 'no-npm.js'
+        preload.write_text('process.execPath = "/nonexistent/bin/node";\n')
+        (self.pkg / 'package.json').write_text(json.dumps({'engines': {'node': '>=24'}}))
+        run = self.run_step({'READ_PACKAGE': self.STEP['env']['READ_PACKAGE'], 'PACKAGE': './package.json', 'NODE_OPTIONS': f'--require={preload}'})
+        self.assert_refused(run, 'cannot load the semver library npm bundles')
+
+    def test_a_long_range_is_cut(self):
+        run = self.read({'engines': {'node': ['x' * 500]}})
+        self.assert_refused(run, 'it must be a version range string')
+        self.assertLess(len(run.out), 200, run.out)
+        for node, floor in (('>=24 <99 ' * 80, '24'), ('* ' * 300, '')):
+            with self.subTest(node=node[:10]):
+                run = self.read({'engines': {'node': node}})
+                self.assertEqual(run.outputs['floor'], floor)
+                self.assertLess(max(len(line) for line in run.out.splitlines()), 200, run.out)
+
+    def test_a_range_with_a_newline_is_logged_on_one_line(self):
+        run = self.read({'engines': {'node': '>=24\n<26'}})
+        self.assertEqual(run.outputs['floor'], '24')
+        self.assertIn('engines.node ">=24\\n<26": testing on Node 24', run.out)
 
     def test_the_job_passes_on_every_output_the_step_writes(self):
         run = self.read({'cplieger': {'vitestShards': 2}, 'engines': {'node': '>=22'}})
@@ -375,9 +426,10 @@ class FloorShardSteps(unittest.TestCase):
                 self.assertNotIn('if', step)
                 self.assertNotIn('continue-on-error', step)
 
-    def test_the_floor_job_runs_on_the_read_floor(self):
+    def test_the_floor_job_runs_on_the_read_node_spec(self):
         setup = workflow_step(TS_CI, 'engines-floor', 'Setup Node.js')
-        self.assertEqual(evaluate(setup['with']['node-version'], {'needs': counted(2, floor='22')}), '22')
+        needs = counted(2, floor='22', node='>=22.0.0 <23.0.0-0')
+        self.assertEqual(evaluate(setup['with']['node-version'], {'needs': needs}), '>=22.0.0 <23.0.0-0')
 
 
 class MetaPassesNoCount(unittest.TestCase):
