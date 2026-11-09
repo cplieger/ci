@@ -68,13 +68,6 @@ def conditional_group() -> dict:
     }
 
 
-STRAY_CONDITIONAL_PLACES = {
-    'panel spec': lambda doc: element(doc, 'panel-1'),
-    'layout spec': lambda doc: rows(doc)[0]['spec']['layout']['spec'],
-    'dashboard spec': lambda doc: doc['spec'],
-}
-
-
 def run_cli(*args: str) -> tuple[int, str]:
     out = io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):

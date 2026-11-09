@@ -428,6 +428,7 @@ VALIDATE_JOBS = [
     'MARKDOWN',
     'PYTHON',
     'SCRIPTS',
+    'ALERTS',
     'PR_POLICY',
 ]
 VALIDATE_ENV = dict.fromkeys(VALIDATE_JOBS, 'success')

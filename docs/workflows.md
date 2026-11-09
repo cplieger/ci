@@ -4,7 +4,7 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 
 ## The CI entry point
 
-`ci.yaml` checks which files the repository has and runs one job per match. A repository with Go and a web frontend runs both jobs in parallel. The `repo` and `markdown` jobs always run, and `pr-policy` runs on every pull request it applies to. The other jobs run only when the change touches a file other than Markdown, `LICENSE` or `.gitignore`. The `validate` job collects every result, so branch protection needs one required check, `ci / validate`.
+`ci.yaml` checks which files the repository has and runs one job per match. A repository with Go and a web frontend runs both jobs in parallel. The `repo` and `markdown` jobs always run, `pr-policy` runs on every pull request it applies to, and `alerts` runs whenever the repository has an alert rule file. The other jobs run only when the change touches a file other than Markdown, `LICENSE` or `.gitignore`. The `validate` job collects every result, so branch protection needs one required check, `ci / validate`.
 
 | The repository has | Job | What runs |
 | --- | --- | --- |
@@ -22,9 +22,12 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | a `Dockerfile` | `docker`, `docker-arm64` | an image build on `amd64`, and on `arm64` in public repositories, with no push and no scan |
 | `*.py` files | `python` | Ruff |
 | shell scripts or workflow files, and no `go.mod`, `jsr.json` or `Dockerfile` | `scripts` | shellcheck, shfmt, `tests/shell/run.sh` when the repository has one, yamllint, a TOML check, and the probe scripts present in the repository |
+| an `alerts/*.yaml` file | `alerts` | `promtool check rules` when `alerts/promql.yaml` exists, `promtool test rules` when `alerts/promql_test.yaml` exists, a LogQL parse of a copy of `alerts/logql.yaml` when that file exists, and, when `docs/monitoring.md` exists, a check that its alert table names exactly the alerts the rule files define |
 | a pull request, in a repository whose default branch is `dev` | `pr-policy` | a conventional-commit check of the title, and on a pull request into `main` a check of what its head branch may change |
 
 The `shell` and `scripts` jobs never both run, so no shell script is checked twice.
+
+An edit to `docs/monitoring.md` alone still runs the `alerts` job, so it meets the alert-table check. The alert table is each table on the page whose first column is headed `Alert`, outside code blocks, and a row names its alerts in backticks in that column. The LogQL parse runs `lokitool rules lint` on a copy, because that command rewrites the file it reads.
 
 `go-ci.yaml` runs with `GOWORK=off`, so each module builds against the versions of the other modules that its `go.mod` names, as a consumer's build does. A module that starts using a change to another module of the repository therefore fails its `go-nested` job until that module's change is tagged and the `require` names the tag. The `go-work` job catches the opposite case: a change to one module that breaks another fails there, before either is tagged.
 
@@ -188,7 +191,8 @@ Each run is named `Promote <repo>`, with `(dry run)` after a dry run. Runs for o
 | `actions/render-hub-overview` | builds the Docker Hub overview page from the README's marked summary and `compose.yaml` |
 | `actions/comment-audit` | fails when source carries more than 0.55 comment lines per code line |
 | `actions/intake` | runs the pull-request title and `main` intake checks of the `pr-policy` job |
-| `actions/dashboard-check` | checks a Grafana dashboard file against the schema v2 dashboard format and layout, reference and description rules. A classic dashboard passes with a notice |
+| `actions/dashboard-check` | checks a Grafana dashboard file against the schema v2 dashboard format, where a key the format does not define fails at any depth, and against layout, reference and description rules. A classic dashboard passes with a notice |
+| `actions/alert-rules` | checks the alert rule files and the alert table of `docs/monitoring.md`, with a pinned `promtool` and `lokitool`, for the `alerts` job |
 | `actions/notice-audit` | fails when the root `NOTICE` departs from its three-line template, or a published package folder lacks identical `LICENSE` and `NOTICE` copies |
 
 ## Workflows for this repository only

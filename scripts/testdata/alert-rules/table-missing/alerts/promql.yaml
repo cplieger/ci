@@ -1,0 +1,18 @@
+# Prometheus rules for the fixture app. Load this file or alerts/logql.yaml, not both.
+groups:
+  - name: fixture
+    rules:
+      - alert: FixtureDown
+        expr: up{job="fixture"} == 0 or absent(up{job="fixture"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: The fixture app is not being scraped.
+      - alert: FixtureErrorLogged
+        expr: increase(fixture_errors_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: The fixture app counted an error.

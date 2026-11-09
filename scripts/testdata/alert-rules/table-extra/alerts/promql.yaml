@@ -1,0 +1,8 @@
+groups:
+  - name: fixture
+    rules:
+      - alert: FixtureDown
+        expr: up{job="fixture"} == 0 or absent(up{job="fixture"})
+        for: 5m
+        labels:
+          severity: critical

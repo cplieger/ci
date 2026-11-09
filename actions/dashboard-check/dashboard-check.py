@@ -39,17 +39,6 @@ TABLE_CELL_OVERRIDE = {
     'properties': [{'id': 'noValue', 'value': '-'}],
 }
 
-# Auto-grid keys CUE cannot reject (its structs are open) that exist only on
-# Grafana's main branch.
-BANNED_AUTO_GRID_KEYS = (
-    'fitContent',
-    'matchRowHeights',
-    'minHeight',
-    'minHeightMode',
-    'maxHeight',
-    'maxHeightMode',
-)
-
 # `x - (x @ start())` is the stable form of `x - first_over_time(x[..] @ start())`, which needs
 # Prometheus 3.14 or promql-experimental-functions.
 CHANGE_QUERY = re.compile(
@@ -161,35 +150,14 @@ class Checker:
         if kind == 'GridLayout':
             ctx.grids.append((where, [item for _, item in objs(spec.get('items'))]))
             for i, item in objs(spec.get('items')):
-                item_spec = obj(item.get('spec'))
-                at = f'{where}.items[{i}]'
-                ctx.reference(item_spec.get('element'), at)
-                ctx.conditional_judged.add(id(item_spec))
-                if 'conditionalRendering' in item_spec:
-                    self.fail(
-                        at,
-                        'layout',
-                        'a GridLayoutItem carries no conditionalRendering; Grafana ignores it.',
-                        'move the panel into an AutoGridLayout row, or put the rule on its row.',
-                    )
+                ctx.reference(obj(item.get('spec')).get('element'), f'{where}.items[{i}]')
         elif kind == 'AutoGridLayout':
             ctx.auto_grids.append((where, spec))
-            for key in BANNED_AUTO_GRID_KEYS:
-                if key in spec:
-                    self.fail(
-                        where,
-                        'banned-field',
-                        f'auto-grid {key} exists only on Grafana main, not in a release.',
-                        f'remove {key}.',
-                    )
             for i, item in objs(spec.get('items')):
-                item_spec = obj(item.get('spec'))
-                ctx.conditional_judged.add(id(item_spec))
-                ctx.reference(item_spec.get('element'), f'{where}.items[{i}]')
+                ctx.reference(obj(item.get('spec')).get('element'), f'{where}.items[{i}]')
         elif kind == 'RowsLayout':
             for i, row in objs(spec.get('rows')):
                 row_spec = obj(row.get('spec'))
-                ctx.conditional_judged.add(id(row_spec))
                 at = f'{where}.rows[{i}]'
                 title = row_spec.get('title')
                 if not isinstance(title, str) or not title.strip():
@@ -211,7 +179,6 @@ class Checker:
         else:
             for i, tab in objs(spec.get('tabs')):
                 tab_spec = obj(tab.get('spec'))
-                ctx.conditional_judged.add(id(tab_spec))
                 at = f'{where}.tabs[{i}]'
                 if isinstance(tab_spec.get('title'), str):
                     ctx.prose.append((at, 'tab title', tab_spec['title'], False))
@@ -219,24 +186,6 @@ class Checker:
                     (f'{at}.variables', v) for _, v in objs(tab_spec.get('variables'))
                 )
                 self.walk(tab_spec.get('layout'), f'{at}.layout', ctx)
-
-    def stray_conditionals(self, node: object, where: str, ctx: Layout) -> None:
-        if isinstance(node, list):
-            for i, member in enumerate(node):
-                self.stray_conditionals(member, f'{where}[{i}]', ctx)
-            return
-        if not isinstance(node, dict):
-            return
-        if 'conditionalRendering' in node and id(node) not in ctx.conditional_judged:
-            self.fail(
-                where,
-                'layout',
-                'conditionalRendering sits outside an auto-grid item, a row or a tab, '
-                'so Grafana ignores it.',
-                "move the rule to the panel's AutoGridLayoutItem, its row or its tab.",
-            )
-        for key, value in node.items():
-            self.stray_conditionals(value, f'{where}.{key}', ctx)
 
     def references(self, spec: dict, ctx: Layout) -> None:
         elements = spec.get('elements') if isinstance(spec.get('elements'), dict) else {}
@@ -291,29 +240,14 @@ class Checker:
         fix = 'reference the datasource variable: {"name": "${datasource}"}.'
         if (group, ref) == (DASHBOARD_DATASOURCE[0], {'name': DASHBOARD_DATASOURCE[1]}):
             return
+        name = obj(ref).get('name')
         if ref is None:
             self.fail(where, 'datasource', 'the query has no datasource.', fix)
-        elif isinstance(ref, str):
-            self.fail(
-                where,
-                'datasource',
-                f'the datasource is a string {ref!r}, which Grafana mis-resolves (grafana/grafana#128167).',
-                fix,
-            )
-        elif not isinstance(ref, dict) or not VARIABLE_REF.match(str(ref.get('name', ''))):
-            name = ref.get('name') if isinstance(ref, dict) else ref
+        elif not VARIABLE_REF.match(str(name or '')):
             self.fail(
                 where,
                 'datasource',
                 f'the datasource {name!r} is not a variable reference, so it breaks on any other install.',
-                fix,
-            )
-        if isinstance(ref, dict) and set(ref) - {'name'}:
-            self.fail(
-                where,
-                'datasource',
-                f'the datasource also holds {", ".join(sorted(set(ref) - {"name"}))}, '
-                'which pins it to one install.',
                 fix,
             )
 
@@ -535,7 +469,6 @@ class Checker:
         layout = spec.get('layout')
         self.top_layout(layout)
         self.walk(layout, 'spec.layout', ctx)
-        self.stray_conditionals(spec, 'spec', ctx)
         self.references(spec, ctx)
 
         elements = spec.get('elements') if isinstance(spec.get('elements'), dict) else {}
@@ -706,7 +639,6 @@ class Layout:
     auto_grids: list = dataclasses.field(default_factory=list)
     variables: list = dataclasses.field(default_factory=list)
     prose: list = dataclasses.field(default_factory=list)
-    conditional_judged: set = dataclasses.field(default_factory=set)
 
     def reference(self, ref: object, where: str) -> None:
         name = ref.get('name') if isinstance(ref, dict) else None
@@ -844,10 +776,14 @@ def check(
 
 STRICT_CUE = """package {package}
 
+// The schema's structs are plain, so open. A definition closes every struct it reaches, those
+// it references included, while `...`, `_` and pattern fields stay open; close() would close
+// only the top level. https://cuelang.org/docs/reference/spec/#definitions-and-hidden-fields
 // The stock elements default `Element | *{{}}` lets a garbage element pass.
-StrictDashboardSpec: DashboardSpec & {{elements: [string]: Element}}
-StrictDashboardResource: {{spec: StrictDashboardSpec}}
-"""
+#StrictDashboardSpec: DashboardSpec & {{elements: [string]: Element}}
+StrictDashboardResource: {{spec: #StrictDashboardSpec}}
+{layouts}"""
+LAYOUT_DEFINITIONS = ''.join(f'#Strict{kind}: {kind}Kind\n' for kind in sorted(LAYOUT_KINDS))
 
 
 def vet(path: pathlib.Path, cue: str, schemas: list[tuple[str, pathlib.Path]]) -> list[Finding]:
@@ -862,24 +798,15 @@ def vet(path: pathlib.Path, cue: str, schemas: list[tuple[str, pathlib.Path]]) -
                 text = schema.read_text()
                 match = re.search(r'^package\s+(\w+)', text, re.MULTILINE)
                 strict = pathlib.Path(tmp) / f'strict-{tag}.cue'
-                strict.write_text(STRICT_CUE.format(package=match.group(1) if match else 'v2'))
-                result = subprocess.run(
-                    [
-                        cue,
-                        'vet',
-                        '-c',
-                        '-d',
-                        'StrictDashboardResource',
-                        str(schema),
-                        str(strict),
-                        path.name,
-                    ],
-                    cwd=path.parent,
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                    check=False,
+                strict.write_text(
+                    STRICT_CUE.format(
+                        package=match.group(1) if match else 'v2', layouts=LAYOUT_DEFINITIONS
+                    )
                 )
+                report = run_cue(cue, schema, strict, path, 'StrictDashboardResource')
+                errors = [] if report is None else cue_errors(report, '', path.name)
+                if errors:
+                    errors += nested_layout_errors(path, cue, schema, strict)
             except (OSError, subprocess.TimeoutExpired) as err:
                 findings.append(
                     Finding(
@@ -890,34 +817,113 @@ def vet(path: pathlib.Path, cue: str, schemas: list[tuple[str, pathlib.Path]]) -
                     )
                 )
                 continue
-            if result.returncode != 0:
+            if report is not None:
                 findings.append(
                     Finding(
                         'spec',
                         'cue',
                         f'the spec does not vet against Grafana {tag} dashboard_spec.cue: '
-                        + cue_summary(result.stdout + result.stderr, path.name),
+                        + (cue_summary(errors) or report.strip()),
                         f'use only fields and values the {tag} schema defines.',
                     )
                 )
     return findings
 
 
-def cue_summary(output: str, name: str, limit: int = 12) -> str:
-    """Each error headline with its first location inside the checked file."""
+def run_cue(
+    cue: str, schema: pathlib.Path, strict: pathlib.Path, data: pathlib.Path, expr: str
+) -> str | None:
+    """cue vet's report on data against expr, or None when data vets."""
+    result = subprocess.run(
+        [cue, 'vet', '-c', '-d', expr, str(schema), str(strict), data.name],
+        cwd=data.parent,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    return None if result.returncode == 0 else result.stdout + result.stderr
+
+
+def nested_layout_errors(
+    path: pathlib.Path, cue: str, schema: pathlib.Path, strict: pathlib.Path
+) -> list[tuple[str, str, str]]:
+    """cue drops an error two disjunctions deep (cue-lang/cue#3607), and a layout inside a row
+    or a tab is that deep, so each layout is vetted alone, on its own level only."""
+    layout = obj(obj(json.loads(path.read_text())).get('spec')).get('layout')
+    node_file = strict.parent / 'layout.json'
+    errors = []
+    for where, node in layout_nodes(layout, 'spec.layout'):
+        node_file.write_text(json.dumps(own_level(node)))
+        report = run_cue(cue, schema, strict, node_file, f'#Strict{node["kind"]}')
+        if report is not None:
+            errors += cue_errors(report, f'{where}.', None)
+    return errors
+
+
+EMPTY_GRID = {'kind': 'GridLayout', 'spec': {'items': []}}
+
+
+def own_level(layout: dict) -> dict:
+    """layout with each nested layout that layout_nodes also yields swapped for an empty grid:
+    when a nested layout fails its disjunction, cue v0.17.1 drops the errors beside it, such as
+    a misspelt key in the row that holds it."""
+    spec = layout.get('spec')
+    if not isinstance(spec, dict):
+        return layout
+    spec = dict(spec)
+    for key in ('rows', 'tabs'):
+        if isinstance(spec.get(key), list):
+            spec[key] = [
+                {**member, 'spec': {**member['spec'], 'layout': EMPTY_GRID}}
+                if isinstance(member, dict)
+                and obj(obj(member.get('spec')).get('layout')).get('kind') in LAYOUT_KINDS
+                else member
+                for member in spec[key]
+            ]
+    return {**layout, 'spec': spec}
+
+
+def layout_nodes(layout: object, where: str) -> list[tuple[str, dict]]:
+    """Every layout of a known kind in the tree, with its cue path."""
+    if not isinstance(layout, dict) or layout.get('kind') not in LAYOUT_KINDS:
+        return []
+    found = [(where, layout)]
+    for key in ('rows', 'tabs'):
+        for i, member in objs(obj(layout.get('spec')).get(key)):
+            found += layout_nodes(
+                obj(member.get('spec')).get('layout'), f'{where}.spec.{key}.{i}.spec.layout'
+            )
+    return found
+
+
+def cue_errors(output: str, prefix: str, name: str | None) -> list[tuple[str, str, str]]:
+    """(path, headline, first location inside name) per cue error."""
     lines, out = output.splitlines(), []
     for i, line in enumerate(lines):
         if line.startswith(' ') or not line.strip():
             continue
+        headline = prefix + line.strip()
         location = next(
-            (s.strip() for s in lines[i + 1 :] if s.startswith(' ') and name in s),
+            (s.strip() for s in lines[i + 1 :] if s.startswith(' ') and name and name in s),
             '',
         )
-        out.append(f'{line.strip()} ({location})' if location else line.strip())
-        if len(out) == limit:
-            out.append('...')
-            break
-    return ' | '.join(out) or output.strip()
+        if not location:
+            headline = headline.removesuffix(':')
+        out.append((headline.partition(': ')[0], headline, location))
+    return out
+
+
+def cue_summary(errors: list[tuple[str, str, str]], limit: int = 12) -> str:
+    """Deepest path first: a failed disjunction lists every disjunct's mismatch above the key."""
+    unique: dict[str, tuple[str, str]] = {}
+    for where, headline, at in errors:
+        unique.setdefault(headline, (where, at))
+    ranked = sorted(unique.items(), key=lambda item: -item[1][0].count('.'))
+    out = [f'{headline} ({at})' if at else headline for headline, (_, at) in ranked[:limit]]
+    if len(ranked) > limit:
+        out.append('...')
+    return ' | '.join(out)
 
 
 def escape_data(text: str) -> str:
