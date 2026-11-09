@@ -1,5 +1,6 @@
-"""ts-ci.yaml's vitest shards: the count read and validated from the package's own
-`cplieger.vitestShards`, the shard matrix and check names of `validate` and
+"""ts-ci.yaml's package settings and vitest shards: the count read and validated
+from the package's own `cplieger.vitestShards` and the floor from its
+`engines.node`, the shard matrix and check names of `validate` and
 `engines-floor`, which steps each shard runs and how each test step hands vitest
 its shard."""
 
@@ -15,7 +16,7 @@ from test_deadset_steps import META
 from test_package_script_steps import WORKFLOWS, Harness, workflow_step
 
 TS_CI = WORKFLOWS / 'ts-ci.yaml'
-READ_STEP = 'Read cplieger.vitestShards'
+READ_STEP = 'Read cplieger.vitestShards and engines.node'
 # The jobs that run the vitest suite, each split by the read count, with its
 # test step.
 SHARDED = {'validate': 'Test (vitest)', 'engines-floor': 'Test (vitest) on the engines floor'}
@@ -37,22 +38,26 @@ def evaluate(template: str, contexts: dict):
     return wr.Scope(contexts, {}, []).evaluate(whole.group(1))
 
 
-def counted(count: int | None, result: str = 'success') -> dict:
-    """The needs context for the shard-count job: outputs as the read step writes
+def counted(count: int | None, result: str = 'success', floor: str = '24') -> dict:
+    """The needs context for the package job: outputs as the read step writes
     them, or none when it failed."""
-    outputs = {} if count is None else {'count': str(count), 'shards': json.dumps(list(range(1, count + 1)))}
-    return {'shard-count': {'result': result, 'outputs': outputs}}
+    outputs = (
+        {}
+        if count is None
+        else {'count': str(count), 'shards': json.dumps(list(range(1, count + 1))), 'floor': floor}
+    )
+    return {'package': {'result': result, 'outputs': outputs}}
 
 
-class ShardCount(Harness):
-    STEP = workflow_step(TS_CI, 'shard-count', READ_STEP)
+class PackageSettings(Harness):
+    STEP = workflow_step(TS_CI, 'package', READ_STEP)
 
     def read(self, manifest: object | None = None, *, raw: str | None = None):
         if raw is not None:
             (self.pkg / 'package.json').write_text(raw)
         elif manifest is not None:
             (self.pkg / 'package.json').write_text(json.dumps(manifest))
-        return self.run_step({'READ_COUNT': self.STEP['env']['READ_COUNT'], 'PACKAGE': './package.json'})
+        return self.run_step({'READ_PACKAGE': self.STEP['env']['READ_PACKAGE'], 'PACKAGE': './package.json'})
 
     def assert_refused(self, run, message: str):
         self.assertEqual(run.rc, 1, run.out)
@@ -60,16 +65,21 @@ class ShardCount(Harness):
         self.assertEqual(run.outputs, {})
         self.assertEqual([line for line in run.out.splitlines() if line.startswith('::')], [run.out.strip()])
 
+    def floor(self, node: object) -> str:
+        run = self.read({'engines': {'node': node}})
+        self.assertEqual(run.rc, 0, run.out)
+        return run.outputs['floor']
+
     def test_the_step_reads_the_working_directory_package(self):
         self.assertEqual(self.STEP['env']['PACKAGE'], '${{ inputs.working-directory }}/package.json')
-        self.assertNotIn('defaults', ts_ci()['jobs']['shard-count'])
+        self.assertNotIn('defaults', ts_ci()['jobs']['package'])
 
     def test_a_package_without_the_field_runs_one_shard(self):
         for manifest in ({'name': 'x'}, {'name': 'x', 'cplieger': {}}, {'cplieger': {'other': 3}}):
             with self.subTest(manifest=manifest):
                 run = self.read(manifest)
                 self.assertEqual(run.rc, 0, run.out)
-                self.assertEqual(run.outputs, {'count': '1', 'shards': '[1]'})
+                self.assertEqual(run.outputs, {'count': '1', 'shards': '[1]', 'floor': ''})
 
     def test_a_count_from_one_to_one_hundred_lists_every_shard_once(self):
         for count in (1, 2, 100):
@@ -91,14 +101,52 @@ class ShardCount(Harness):
                 self.assert_refused(self.read({'cplieger': value}), '"cplieger" must be an object')
 
     def test_an_unreadable_package_fails_the_job(self):
-        self.assert_refused(self.read(), 'cannot read the vitest shard count')
-        self.assert_refused(self.read(raw='{"cplieger":'), 'cannot read the vitest shard count')
+        self.assert_refused(self.read(), 'cannot read the package settings')
+        self.assert_refused(self.read(raw='{"cplieger":'), 'cannot read the package settings')
 
     def test_a_value_cannot_start_a_workflow_command(self):
         run = self.read({'cplieger': {'vitestShards': '\n::add-mask::x\n'}})
         self.assert_refused(run, 'cplieger.vitestShards is "\\n::add-mask::x\\n"')
         run = self.read(raw='{"a":\n::add-mask::x\n}')
-        self.assert_refused(run, 'cannot read the vitest shard count')
+        self.assert_refused(run, 'cannot read the package settings')
+
+    def test_the_floor_is_the_major_of_a_lower_bound(self):
+        for node, want in (
+            ('>=24', '24'),
+            ('>=24.3', '24'),
+            ('>= 24.3.1', '24'),
+            ('^22', '22'),
+            ('~20.1', '20'),
+            ('v18', '18'),
+            ('24.x', '24'),
+            (' >=26 <28', '26'),
+        ):
+            with self.subTest(node=node):
+                self.assertEqual(self.floor(node), want)
+
+    def test_no_lower_bound_means_no_floor_with_a_notice(self):
+        for manifest in ({}, {'engines': {}}, {'engines': {'node': None}}, {'engines': {'node': '*'}}, {'engines': {'node': '>24'}}, {'engines': 'x'}):
+            with self.subTest(manifest=manifest):
+                run = self.read(manifest)
+                self.assertEqual(run.rc, 0, run.out)
+                self.assertEqual(run.outputs['floor'], '')
+                self.assertIn('::notice::package.json declares no engines.node floor', run.out)
+
+    def test_a_floor_is_logged_without_a_notice(self):
+        run = self.read({'engines': {'node': '>=24'}})
+        self.assertIn('engines.node ">=24": testing on Node 24', run.out)
+        self.assertNotIn('::', run.out)
+
+    def test_an_engines_node_that_is_not_a_string_fails_the_job(self):
+        for value in (24, ['>=24'], {'min': 24}, True):
+            with self.subTest(value=value):
+                self.assert_refused(self.read({'engines': {'node': value}}), 'it must be a version range string')
+
+    def test_a_range_cannot_start_a_workflow_command(self):
+        run = self.read({'engines': {'node': '>=24\n::add-mask::x'}})
+        self.assertEqual(run.rc, 0, run.out)
+        self.assertEqual(run.outputs['floor'], '24')
+        self.assertEqual([line for line in run.out.splitlines() if line.startswith('::')], [])
 
     def test_a_long_value_is_cut_in_the_error(self):
         run = self.read({'cplieger': {'vitestShards': 'x' * 500}})
@@ -109,12 +157,13 @@ class ShardCount(Harness):
 class ShardMatrix(unittest.TestCase):
     def test_each_sharded_job_waits_for_the_count_and_takes_its_list(self):
         for job in SHARDED:
-            spec = ts_ci()['jobs'][job]
-            self.assertEqual(spec['needs'], 'shard-count')
-            matrix = spec['strategy']['matrix']['shard']
-            for count in (1, 2, 100):
-                with self.subTest(job=job, count=count):
-                    self.assertEqual(evaluate(matrix, {'needs': counted(count)}), list(range(1, count + 1)))
+            with self.subTest(job=job):
+                spec = ts_ci()['jobs'][job]
+                self.assertEqual(spec['needs'], 'package')
+                matrix = spec['strategy']['matrix']['shard']
+                for count in (1, 2, 100):
+                    with self.subTest(count=count):
+                        self.assertEqual(evaluate(matrix, {'needs': counted(count)}), list(range(1, count + 1)))
 
     def test_only_the_sharded_jobs_run_vitest(self):
         jobs = ts_ci()['jobs']
@@ -150,6 +199,17 @@ class ShardMatrix(unittest.TestCase):
         for job in SHARDED:
             with self.subTest(job=job):
                 self.assertFalse(wr.job_condition(ts_ci(), job, {'needs': needs}, []))
+
+    def test_a_read_count_runs_each_sharded_job(self):
+        for job in SHARDED:
+            for count in (1, 3):
+                with self.subTest(job=job, count=count):
+                    self.assertTrue(wr.job_condition(ts_ci(), job, {'needs': counted(count)}, []))
+
+    def test_no_floor_skips_every_floor_shard_and_not_validate(self):
+        needs = counted(3, floor='')
+        self.assertFalse(wr.job_condition(ts_ci(), 'engines-floor', {'needs': needs}, []))
+        self.assertTrue(wr.job_condition(ts_ci(), 'validate', {'needs': needs}, []))
 
 
 def running_steps(shard: int) -> list[str]:
@@ -212,7 +272,7 @@ class TestStep(Harness):
     def test_the_step_takes_its_shard_and_the_read_count(self):
         self.assertEqual(
             self.STEP['env'],
-            {'SHARD': '${{ matrix.shard }}', 'SHARDS': '${{ needs.shard-count.outputs.count }}'},
+            {'SHARD': '${{ matrix.shard }}', 'SHARDS': '${{ needs.package.outputs.count }}'},
         )
 
     def test_unsharded_runs_the_test_script_as_it_stands(self):
@@ -266,17 +326,20 @@ class FloorTestStep(TestStep):
     STEP = workflow_step(TS_CI, JOB, SHARDED[JOB])
     REFUSED_RECORD = ''
 
-    def test_the_step_runs_only_when_a_floor_is_declared(self):
-        self.assertEqual(self.STEP['if'], "steps.floor.outputs.major != ''")
 
 
 class FloorShardSteps(unittest.TestCase):
-    def test_every_shard_runs_the_whole_floor_job(self):
-        """No floor step is shard-1-only: each shard needs Node, the install and its
-        part of the suite."""
+    def test_every_shard_runs_every_floor_step(self):
+        """The job condition holds the floor gate, so each shard runs the setup,
+        the install and its part of the suite, and no step tolerates a failure."""
         for step in ts_ci()['jobs']['engines-floor']['steps']:
             with self.subTest(step=step['name']):
-                self.assertNotIn('matrix', step.get('if', ''))
+                self.assertNotIn('if', step)
+                self.assertNotIn('continue-on-error', step)
+
+    def test_the_floor_job_runs_on_the_read_floor(self):
+        setup = workflow_step(TS_CI, 'engines-floor', 'Setup Node.js')
+        self.assertEqual(evaluate(setup['with']['node-version'], {'needs': counted(2, floor='22')}), '22')
 
 
 class MetaPassesNoCount(unittest.TestCase):

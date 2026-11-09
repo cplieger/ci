@@ -26,17 +26,20 @@ permissions:
 
 
 jobs:
-  # A matrix cannot read a file, so this job reads the package's own shard count
-  # (`cplieger.vitestShards` in package.json, which sync never writes) for
-  # `validate` and `engines-floor`. The value is the checked-out branch's, so it is untrusted: only a
-  # count this script validated reaches the outputs.
-  shard-count:
-    name: vitest shard count
+  # A matrix or a job condition cannot read a file, so this job reads the
+  # package's own settings once: its vitest shard count (`cplieger.vitestShards`,
+  # which sync never writes) for `validate` and `engines-floor`, and its
+  # `engines.node` floor for `engines-floor`. The values are the checked-out
+  # branch's, so they are untrusted: only what this script validated reaches
+  # the outputs.
+  package:
+    name: package settings
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       count: ${{ steps.read.outputs.count }}
       shards: ${{ steps.read.outputs.shards }}
+      floor: ${{ steps.read.outputs.floor }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,11 +48,11 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
-      - name: Read cplieger.vitestShards
+      - name: Read cplieger.vitestShards and engines.node
         id: read
         env:
           PACKAGE: ${{ inputs.working-directory }}/package.json
-          READ_COUNT: |
+          READ_PACKAGE: |
             const { appendFileSync, readFileSync } = require("node:fs");
             const path = process.env.PACKAGE;
             // One line only: a newline from the file (JSON.parse quotes the source)
@@ -60,7 +63,7 @@ jobs:
             };
             let pkg;
             try { pkg = JSON.parse(readFileSync(path, "utf8")); }
-            catch (err) { fail(`cannot read the vitest shard count: ${err.message}`); }
+            catch (err) { fail(`cannot read the package settings: ${err.message}`); }
             const own = pkg?.cplieger;
             if (own !== undefined && (own === null || typeof own !== "object" || Array.isArray(own))) {
               fail('"cplieger" must be an object, such as {"vitestShards": 2}');
@@ -73,21 +76,33 @@ jobs:
                 fail(`cplieger.vitestShards is ${shown}: it must be an integer from 1 to 100`);
               }
             }
+            // The floor is the major of a lower bound (`>=24`, `>=24.3`, `^24`,
+            // `~24`, `v24`); a range with none, or no engines.node, means no floor.
+            const range = pkg?.engines?.node;
+            if (range != null && typeof range !== "string") {
+              fail(`engines.node is ${String(JSON.stringify(range)).slice(0, 40)}: it must be a version range string`);
+            }
+            const floor = /^\s*(?:>=|\^|~)?\s*v?(\d+)/.exec(range ?? "")?.[1] ?? "";
             const shards = Array.from({ length: count }, (_, i) => i + 1);
-            appendFileSync(process.env.GITHUB_OUTPUT, `count=${count}\nshards=${JSON.stringify(shards)}\n`);
+            appendFileSync(process.env.GITHUB_OUTPUT, `count=${count}\nshards=${JSON.stringify(shards)}\nfloor=${floor}\n`);
             console.log(`vitest shards: ${count}`);
-        run: node -e "$READ_COUNT"
+            if (floor === "") {
+              console.log("::notice::package.json declares no engines.node floor; nothing to test beyond the publishing Node");
+            } else {
+              console.log(`engines.node ${JSON.stringify(range).slice(0, 60)}: testing on Node ${floor}`);
+            }
+        run: node -e "$READ_PACKAGE"
 
   validate:
-    needs: shard-count
+    needs: package
     # A name that is an expression gets no matrix suffix
     # (github.com/orgs/community/discussions/144467), so unsharded the check
     # stays `validate`.
-    name: ${{ needs.shard-count.outputs.count > 1 && format('validate (shard {0}/{1})', matrix.shard, needs.shard-count.outputs.count) || 'validate' }}
+    name: ${{ needs.package.outputs.count > 1 && format('validate (shard {0}/{1})', matrix.shard, needs.package.outputs.count) || 'validate' }}
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(needs.shard-count.outputs.shards) }}
+        shard: ${{ fromJSON(needs.package.outputs.shards) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     defaults:
@@ -187,7 +202,7 @@ jobs:
         continue-on-error: true
         env:
           SHARD: ${{ matrix.shard }}
-          SHARDS: ${{ needs.shard-count.outputs.count }}
+          SHARDS: ${{ needs.package.outputs.count }}
         run: |
           (
             if [ "$SHARDS" -eq 1 ]; then
@@ -473,17 +488,18 @@ jobs:
   # run on it and an API only a newer Node has ships unnoticed. Tests only:
   # lint, types and the published surface do not depend on the runtime. The job
   # reads no publishing version, so it stays right when that version moves; a
-  # package with no `engines.node` skips it with a notice.
-  # Split like validate's tests, so a suite that needs shards on the publishing
+  # package with no `engines.node` skips it, and the package job says so. It is
+  # split like validate's tests, so a suite that needs shards on the publishing
   # Node gets them on the floor too. The meta workflow's validate aggregates
   # every shard through this workflow's result.
   engines-floor:
-    needs: shard-count
-    name: ${{ needs.shard-count.outputs.count > 1 && format('engines-floor (shard {0}/{1})', matrix.shard, needs.shard-count.outputs.count) || 'engines-floor' }}
+    needs: package
+    if: ${{ needs.package.outputs.floor != '' }}
+    name: ${{ needs.package.outputs.count > 1 && format('engines-floor (shard {0}/{1})', matrix.shard, needs.package.outputs.count) || 'engines-floor' }}
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(needs.shard-count.outputs.shards) }}
+        shard: ${{ fromJSON(needs.package.outputs.shards) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     defaults:
@@ -497,37 +513,21 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
-      - name: Read the engines floor
-        id: floor
-        run: |
-          set -euo pipefail
-          range=$(node -e "process.stdout.write((require('./package.json').engines||{}).node||'')")
-          major=$(printf '%s' "$range" | sed -nE 's/^[[:space:]]*(>=|\^|~)?[[:space:]]*v?([0-9]+).*/\2/p')
-          if [ -z "$major" ]; then
-            echo "::notice::package.json declares no engines.node floor; nothing to test beyond the publishing Node"
-          else
-            echo "engines.node ${range}: testing on Node ${major}"
-          fi
-          echo "major=${major}" >> "$GITHUB_OUTPUT"
-
       - name: Setup Node.js
-        if: steps.floor.outputs.major != ''
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: ${{ steps.floor.outputs.major }}
+          node-version: ${{ needs.package.outputs.floor }}
           cache: npm
           cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
 
       - name: Install deps
-        if: steps.floor.outputs.major != ''
         run: npm ci
 
       # The same hand-off as validate's test step, without its soft gate.
       - name: Test (vitest) on the engines floor
-        if: steps.floor.outputs.major != ''
         env:
           SHARD: ${{ matrix.shard }}
-          SHARDS: ${{ needs.shard-count.outputs.count }}
+          SHARDS: ${{ needs.package.outputs.count }}
         run: |
           if [ "$SHARDS" -eq 1 ]; then
             npm test
