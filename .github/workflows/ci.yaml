@@ -117,13 +117,13 @@ jobs:
             # the root go.mod.
             while IFS= read -r f; do
               [ -z "$f" ] && continue
-              d=$(dirname "$f")
+              d=$(dirname -- "$f")
               case "$d" in
                 *[!A-Za-z0-9._/-]*)
                   echo "::error::nested go.mod dir '$d' contains characters outside [A-Za-z0-9._/-]"
                   exit 1 ;;
               esac
-              if [ -z "$(git ls-files "$d/*.go" | head -1)" ]; then
+              if [ -z "$(git ls-files -- "$d/*.go" | head -1)" ]; then
                 echo "nested module '$d': no tracked .go files - skipping validation"
                 continue
               fi
@@ -230,9 +230,9 @@ jobs:
                 windows) runner=windows-latest ;;
                 *) runner=macos-latest ;;
               esac
-              d=$(dirname "$f")
+              d=$(dirname -- "$f")
               while [ "$d" != . ] && ! grep -qxF -- "$d" <<< "$mod_dirs"; do
-                d=$(dirname "$d")
+                d=$(dirname -- "$d")
               done
               grep -qxF -- "$d" <<< "$mod_dirs" || continue
               rel=$f
@@ -250,7 +250,7 @@ jobs:
             # A module's TS half at <dir>/web (release.yaml's go_halves shape) is a
             # library, so it gets ts-ci without the web job's frontend lint.
             while IFS= read -r d; do
-              if [ -n "$(git ls-files "$d/web/package.json" "$d/web/jsr.json")" ]; then
+              if [ -n "$(git ls-files -- "$d/web/package.json" "$d/web/jsr.json")" ]; then
                 ts_nested_dirs=$(echo "$ts_nested_dirs" | jq -c --arg v "$d/web" '. + [$v]')
               fi
             done < <(jq -r '.[]' <<< "$go_nested_dirs")

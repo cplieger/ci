@@ -49,7 +49,18 @@ jobs:
           VERSION=6.0.3
           pip install -q --break-system-packages "PyYAML==${VERSION}"
 
+      # The gremlins probes time `go test` on a scratch module; ubuntu-26.04
+      # keeps Go only in the tool cache, off PATH.
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
       - name: Probe gremlins measurement scripts
+        env:
+          # setup-go exports GOTOOLCHAIN=local and lags each Go patch release.
+          GOTOOLCHAIN: auto
         run: python3 scripts/test-gremlins-scripts.py
 
       - name: Probe stryker aggregate artifact discovery

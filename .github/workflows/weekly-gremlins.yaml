@@ -22,16 +22,28 @@ concurrency:
   group: weekly-gremlins
   cancel-in-progress: false
 
+env:
+  # scripts/gremlins-container.sh builds this release in the plan and run jobs.
+  # renovate: datasource=github-releases depName=go-gremlins/gremlins
+  GREMLINS_VERSION: v0.6.0
+  # Per probe phase; a slower suite stays unverified rather than throttled.
+  PROBE_TIMEOUT: "600"
+
 jobs:
   fanout:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
-      matrix: ${{ steps.fanout.outputs.matrix }}
+      repos: ${{ steps.fanout.outputs.repos }}
       # A job's timeout-minutes cannot read env
       # (https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability);
       # scripts/gremlins-run.sh sizes --integration against this same cap.
       run_timeout_minutes: "350"
+      plan_timeout_minutes: "90"
+      # A repo whose attempt projects past this splits into shards
+      # (scripts/gremlins-shard.py). Well under the cap, because the projection
+      # leaves out hanging mutants and a slow runner takes about 1.4x as long.
+      shard_target_minutes: "240"
     steps:
       - name: Discover Go-having repos with non-trivial source
         id: fanout
@@ -84,24 +96,28 @@ jobs:
             fi
           done
 
-          # Build matrix: repo × attempt(1..3)
-          matrix=$(printf '%s\n' "${GO_REPOS[@]}" | jq -R . | jq -s -c '
-            [.[] | . as $r | [1,2,3] | .[] | {repo: $r, attempt: .}]
-          ')
-          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          # The plan job sizes each repo and the shard job builds repo x attempt
+          # (x shard) from it. select() drops the one empty line printf gives
+          # an empty list.
+          repos_json=$(printf '%s\n' "${GO_REPOS[@]}" | jq -R 'select(length > 0)' | jq -s -c .)
+          echo "repos=${repos_json}" >> "$GITHUB_OUTPUT"
           echo ""
-          echo "Total matrix entries: $(echo "$matrix" | jq 'length')"
+          echo "Total repos: $(echo "$repos_json" | jq 'length')"
 
-  run:
+  # Sizes each repo's attempt from the repo's own measurements: the probe and
+  # mode decision a run makes, then per package its RUNNABLE mutants and what
+  # one mutant costs (scripts/gremlins-run.sh with PLAN_DIR). The shard job
+  # splits a repo whose attempt would not finish well inside the run job's cap.
+  plan:
     needs: fanout
-    if: ${{ needs.fanout.outputs.matrix != '[]' }}
+    if: ${{ needs.fanout.outputs.repos != '[]' }}
     strategy:
       fail-fast: false
       max-parallel: 6   # account budget: 20; leave >=4 for ad-hoc PR work
       matrix:
-        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
+        repo: ${{ fromJSON(needs.fanout.outputs.repos) }}
     runs-on: ubuntu-26.04
-    timeout-minutes: ${{ fromJSON(needs.fanout.outputs.run_timeout_minutes) }}
+    timeout-minutes: ${{ fromJSON(needs.fanout.outputs.plan_timeout_minutes) }}
     permissions:
       contents: read
     env:
@@ -121,112 +137,156 @@ jobs:
         with:
           python-version: "3.15"
 
-      - name: Clone target repo
-        run: |
-          set -euo pipefail
-          # Plain git clone over HTTPS draws no API quota, so a rate-limited run
-          # can still clone; resolving the repo through the gh CLI would spend
-          # GraphQL quota this run may already have exhausted. One-shot auth as a
-          # top-level `git -c` (never `git clone --config`), so the token is NOT
-          # written into target/.git/config — this job bind-mounts the tree into
-          # a container that copies it to every gremlins worker.
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          git -c "http.https://github.com/.extraheader=${auth}" \
-            clone --depth 1 "https://github.com/cplieger/${{ matrix.repo }}.git" target
+      - name: Clone the target repo and scope its modules
+        id: prepare
+        env:
+          REPO: ${{ matrix.repo }}
+        run: bash scripts/gremlins-prepare.sh "${REPO}"
 
-      - name: Discover Go modules to measure
-        id: modules
+      - name: Size each module's mutation work
+        env:
+          REPO: ${{ matrix.repo }}
+          SHA: ${{ steps.prepare.outputs.sha }}
+          MODULES: ${{ steps.prepare.outputs.modules }}
+          JOB_TIMEOUT_MINUTES: ${{ needs.fanout.outputs.run_timeout_minutes }}
+          TARGET_MINUTES: ${{ needs.fanout.outputs.shard_target_minutes }}
+          PLAN_TIMEOUT_MINUTES: ${{ needs.fanout.outputs.plan_timeout_minutes }}
         run: |
           set -euo pipefail
-          # `gremlins unleash .` measures exactly ONE module: coverage comes
-          # from a root `go test -cover ./...`, which cannot run a NESTED
-          # module's tests, so that module's own suite would never measure it.
-          # Run once per module and merge the results (see the run step).
-          # Eligibility mirrors ci.yaml's detect step (validation, not
-          # release-lane semantics): prune vendored/generated trees, require
-          # tracked .go files, keep internal/ and dotless-path modules. Keep the
-          # two in sync.
-          safe_dir() {
-            case "$1" in
-              *[!A-Za-z0-9._/-]*)
-                echo "::error::nested go.mod dir '$1' contains characters outside [A-Za-z0-9._/-]"
-                exit 1 ;;
-            esac
-          }
-          PRUNED='(^|/)(node_modules|vendor|testdata|static|dist)/'
-          MODULES="."
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            d=$(dirname "$f")
-            safe_dir "$d"
-            if [ -z "$(git -C target ls-files "$d/*.go" | head -1)" ]; then
-              echo "  skip:    ${d} (no tracked .go files — nothing to mutate)"
+          # No module starts after this, and a module's concurrency probe, dry
+          # run and timing runs end by it. The job's cap keeps 20 min for the
+          # steps before this one, the last module's gremlins build, the package
+          # in flight (go test's default 10-min -timeout) and the upload.
+          PLAN_DEADLINE=$(($(date +%s) + (PLAN_TIMEOUT_MINUTES - 20) * 60))
+          export PLAN_DEADLINE
+          # A module left unsized fails the planner after it writes the plan. The
+          # module runs whole and unmeasured, in a shard of its own when the
+          # repo shards.
+          plan_args=()
+          for m in $MODULES; do
+            plan_args+=(--module "${m}=plan/modules/${m}")
+            if [ "$(date +%s)" -ge "${PLAN_DEADLINE}" ]; then
+              echo "::error::the plan deadline passed before ${REPO} module ${m} started"
               continue
             fi
-            MODULES="${MODULES} ${d}"
-            echo "  measure: ${d} ($(awk '$1=="module"{print $2; exit}' "target/$f"))"
-          done < <(git -C target ls-files '*/go.mod' | grep -Ev "$PRUNED" || true)
-          # A pruned module is not measured, yet the outer module's run walks
-          # its files all the same, so the Sync step excludes it there too.
-          UNMEASURED=""
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            d=$(dirname "$f")
-            safe_dir "$d"
-            UNMEASURED="${UNMEASURED} ${d}"
-            echo "  exclude: ${d} (pruned tree, not measured)"
-          done < <(git -C target ls-files '*/go.mod' | grep -E "$PRUNED" || true)
-          echo "modules=${MODULES}" >> "$GITHUB_OUTPUT"
-          echo "unmeasured=${UNMEASURED# }" >> "$GITHUB_OUTPUT"
-          echo "modules to measure: ${MODULES}"
+            echo "::group::size ${REPO} module ${m}"
+            rc=0
+            PLAN_DIR="${PWD}/plan/modules/${m}" bash scripts/gremlins-container.sh "${m}" || rc=$?
+            echo "::endgroup::"
+            if [ "${rc}" -ne 0 ]; then
+              echo "::error::sizing ${REPO} module ${m} failed (exit ${rc})"
+            fi
+          done
+          python3 scripts/gremlins-shard.py plan --repo "${REPO}" --sha "${SHA}" \
+            --target-minutes "${TARGET_MINUTES}" "${plan_args[@]}" --out plan/plan.json
 
-      - name: Sync central .gremlins.yaml (authoritative for the weekly run)
+      - name: Upload the shard plan
+        if: ${{ !cancelled() && hashFiles('plan/plan.json') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: shard-plan-${{ matrix.repo }}
+          path: plan/plan.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # The run job's matrix: attempt x shard for a repo its plan split, and the
+  # plain repo x attempt for every other repo, including one with no usable plan.
+  shard:
+    needs: [fanout, plan]
+    if: ${{ !cancelled() && needs.fanout.result == 'success' && needs.fanout.outputs.repos != '[]' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout ci (for scripts/)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      - name: Download the shard plans
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: plans
+          pattern: shard-plan-*
+
+      - name: Build the run matrix
+        id: matrix
         env:
-          MODULES: ${{ steps.modules.outputs.modules }}
-          UNMEASURED: ${{ steps.modules.outputs.unmeasured }}
+          REPOS: ${{ needs.fanout.outputs.repos }}
         run: |
           set -euo pipefail
-          # Always overwrite with this checkout's central policy: the consumers'
-          # committed copies (synced for local `gremlins unleash`) may lag, the
-          # shared run must not.
-          # One copy PER MODULE: gremlins resolves .gremlins.yaml from the module
-          # root of its working directory (findModuleRoot()), so a nested module
-          # would otherwise run on gremlins' defaults. Each copy also excludes its
-          # deeper modules (scripts/gremlins-scope.py); no per-repo entries.
-          read -ra mods <<< "$MODULES"
-          read -ra pruned <<< "$UNMEASURED"
-          excludes=()
-          for d in "${pruned[@]}"; do excludes+=("--exclude-dir=${d}"); done
-          python3 scripts/gremlins-scope.py --config configs/gremlins.yaml --target target \
-            "${excludes[@]}" -- "${mods[@]}"
+          matrix=$(python3 scripts/gremlins-shard.py matrix --repos "${REPOS}" --plans plans --attempts 3)
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Total matrix entries: $(echo "$matrix" | jq 'length')"
 
-      # MEMORY CONTAINMENT VIA A DOCKER CGROUP. Mutation is precisely the act of
-      # turning a bounded size/loop into an unbounded one, so some mutant WILL
-      # allocate without limit (a boundary mutant on a make() size, an append in
-      # a now-infinite loop, …). Measured on subflux: a single worker hit ~14 GiB
-      # on one internal/server mutant. GOMEMLIMIT is a SOFT heap target and does
-      # not stop a single large LIVE allocation, so it cannot prevent this;
-      # worker count is irrelevant (1 worker OOMs just the same). Run bare on the
-      # host, that runaway trips the kernel OOM-killer on the whole VM, which
-      # nondeterministically reaps either the test (run continues) or the runner
-      # agent (job dies, "received a shutdown signal") — every subflux shard
-      # failed this way at 33/38/81 min, at 4 AND at 2 workers.
-      #
-      # Fix: run gremlins INSIDE a container capped at 80% of MemAvailable. A
-      # runaway now busts the CONTAINER cgroup, whose OOM-killer reaps the
-      # biggest task (the runaway test) while gremlins keeps going and records it
-      # (verified: a 1- and 2-worker capped run survive the ~14 GiB mutant and
-      # complete). The runner agent lives OUTSIDE the container, so the worst
-      # case is a clean step failure, never a runner shutdown.
-      #
-      # Workers are bounded by CPUs and by memory (heap + compile/link toolchain
-      # per worker): 4 on the 4-vCPU 16 GB runner, where a runaway outweighs a
-      # healthy worker tenfold so the OOM-killer's victim stays unambiguous, and
-      # auto-scaled on bigger runners. They are also bounded by whether the
-      # suite survives running beside itself, which scripts/gremlins-run.sh probes.
+  run:
+    name: run (${{ matrix.repo }}, ${{ matrix.attempt }}${{ matrix.shards && format(', shard {0} of {1}', matrix.shard, matrix.shards) || '' }})
+    needs: [fanout, shard]
+    # The shard job runs after a failed plan, which would skip this job by
+    # default (https://github.com/actions/runner/issues/2205).
+    if: ${{ !cancelled() && needs.shard.result == 'success' && needs.shard.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 6   # account budget: 20; leave >=4 for ad-hoc PR work
+      matrix:
+        include: ${{ fromJSON(needs.shard.outputs.matrix) }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: ${{ fromJSON(needs.fanout.outputs.run_timeout_minutes) }}
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+      # Empty for a repo that runs each attempt in one job.
+      SHARD: ${{ matrix.shard }}
+      SHARDS: ${{ matrix.shards }}
+    steps:
+      # Checkout FIRST: actions/checkout cleans the workspace, so it must not
+      # run after the target clone below.
+      - name: Checkout ci (for configs/)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      - name: Download this repo's shard plan
+        if: ${{ matrix.shards }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: shard-plan-${{ matrix.repo }}
+          path: plan
+
+      - name: Clone the target repo and scope its modules
+        id: prepare
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SHARDS}" ]; then
+            bash scripts/gremlins-prepare.sh "${REPO}" plan/plan.json "${SHARD}"
+          else
+            bash scripts/gremlins-prepare.sh "${REPO}"
+          fi
+
+      # scripts/gremlins-container.sh owns the memory containment and worker sizing.
       - name: Run gremlins (attempt ${{ matrix.attempt }})
         env:
-          MODULES: ${{ steps.modules.outputs.modules }}
+          MODULES: ${{ steps.prepare.outputs.modules }}
           JOB_TIMEOUT_MINUTES: ${{ needs.fanout.outputs.run_timeout_minutes }}
         run: |
           set -uo pipefail
@@ -235,69 +295,50 @@ jobs:
           # Surface that as a RED cell — fail-fast is off, so one bad repo doesn't
           # cancel the others, and the upload step (if: always()) still ships an
           # artifact downstream.
-          # renovate: datasource=github-releases depName=go-gremlins/gremlins
-          GREMLINS_VERSION=v0.6.0
-          PROBE_TIMEOUT=600   # per probe phase; a slower suite stays unverified rather than throttled
+          fail() {
+            # Error marker so the badge and aggregate jobs skip this attempt
+            # (load_run returns None on a file with no "files" key) instead of
+            # publishing a misleading 0%.
+            echo '{"gremlins_error": true}' > /tmp/gremlins-out.json
+            echo "::error::$1"
+            exit "$2"
+          }
 
-          # Memory-aware sizing, computed on the host and passed into the
-          # container. cap_mb is BOTH the container memory ceiling and the budget
-          # the worker count derives from; reserve heap + toolchain per worker.
-          avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
-          cap_mb=$(( avail_kb * 80 / 100 / 1024 ))
-          nproc_n=$(nproc)
-          toolchain_mb=1024   # go compile+link RSS per worker (not bounded by GOMEMLIMIT); measured peak 0.98 GiB at GOGC=400
-          heap_min_mb=1024    # GOMEMLIMIT floor over the 0.61 GB measured test peak; lower GC-thrashes into false timeouts
-          per_worker_mb=$(( toolchain_mb + heap_min_mb ))
-          max_by_mem=$(( cap_mb / per_worker_mb )); [ "$max_by_mem" -lt 1 ] && max_by_mem=1
-          workers=$(( nproc_n < max_by_mem ? nproc_n : max_by_mem ))
-          gomem_mb=$(( (cap_mb - workers * toolchain_mb) / workers ))
-          [ "$gomem_mb" -lt "$heap_min_mb" ] && gomem_mb=$heap_min_mb
-          # Second candidate: the heap budget if the probe drops the run to one
-          # worker. Same formula, same cap — both computed here so ALL of the
-          # memory arithmetic stays in one place and the container only picks.
-          gomem_solo_mb=$(( cap_mb - toolchain_mb ))
-          [ "$gomem_solo_mb" -lt "$heap_min_mb" ] && gomem_solo_mb=$heap_min_mb
-          echo "workers<=${workers} (nproc=${nproc_n}, mem-cap=${max_by_mem})"
-          echo "GOMEMLIMIT=${gomem_mb}MiB (${gomem_solo_mb}MiB solo) container=${cap_mb}MiB (MemAvailable=${avail_kb}KiB)"
-
-          # A Go suite may shell out to node (wiregen runs its generated decoders),
-          # and go-ci.yaml gets it from the runner image; the golang image has none.
-          node_mount=()
-          if node_bin=$(command -v node); then
-            node_mount=(-v "$(readlink -f "$node_bin")":/usr/local/bin/node:ro)
+          # A shard runs only the modules its plan gives it, each in the mode
+          # and at the worker count the plan measured for the whole module (a
+          # module the plan could not size gets neither and measures its own),
+          # and skips the rest.
+          runs=()
+          modes=()
+          workers=()
+          MERGE_ARGS=()
+          if [ -n "${SHARDS}" ]; then
+            plan_lines=$(python3 scripts/gremlins-shard.py modules --plan plan/plan.json \
+              --shard "${SHARD}" --modules "${MODULES}") \
+              || fail "no module list for ${{ matrix.repo }} shard ${SHARD} of ${SHARDS}" 1
+            while read -r verb m mode n; do
+              if [ "${verb}" = run ]; then
+                runs+=("${m}")
+                modes+=("${mode}")
+                workers+=("${n}")
+              else
+                MERGE_ARGS+=(--skip-module "${m}")
+              fi
+            done <<<"${plan_lines}"
+          else
+            for m in $MODULES; do
+              runs+=("${m}")
+              modes+=("")
+              workers+=("")
+            done
           fi
 
           rc=0
-          MERGE_ARGS=()
-          for m in $MODULES; do
+          for i in "${!runs[@]}"; do
+            m="${runs[i]}"
             echo "::group::gremlins ${{ matrix.repo }} module ${m}"
-            # Go toolchain image from THAT module's go.mod (a `toolchain` line
-            # wins over the `go` line); fall back to the minor tag if the patch
-            # tag is missing, then to a sane default. Per module, because a
-            # nested module may require a newer Go than the root — ci.yaml pins
-            # each nested module to its own go.mod for the same reason.
-            gover=$(grep -oP '^(toolchain go|go )\K[0-9]+\.[0-9]+(\.[0-9]+)?' "target/${m}/go.mod" | tail -1)
-            image="golang:${gover:-1.26}"
-            docker pull "$image" 2>/dev/null || { image="golang:${gover%.*}"; docker pull "$image"; }
-            echo "image=${image}"
-
-            docker run --rm \
-              --memory="${cap_mb}m" --memory-swap="${cap_mb}m" \
-              -v "${PWD}/target":/work \
-              -v "${PWD}/scripts/gremlins-run.sh":/gremlins-run.sh:ro \
-              -v "${PWD}/scripts/gremlins-pkgname.patch":/gremlins-pkgname.patch:ro \
-              -v "${PWD}/scripts/gremlins-pkgtimeout.patch":/gremlins-pkgtimeout.patch:ro \
-              "${node_mount[@]}" \
-              -w "/work/${m}" \
-              -e GREMLINS_VERSION="${GREMLINS_VERSION}" \
-              -e GREMLINS_PATCHES="/gremlins-pkgname.patch /gremlins-pkgtimeout.patch" \
-              -e WORKERS_MAX="${workers}" \
-              -e GOMEM_MAX_MB="${gomem_mb}" \
-              -e GOMEM_SOLO_MB="${gomem_solo_mb}" \
-              -e PROBE_TIMEOUT="${PROBE_TIMEOUT}" \
-              -e JOB_TIMEOUT_MINUTES="${JOB_TIMEOUT_MINUTES}" \
-              -e OUT="/work/${m}/gremlins-out.json" \
-              "${image}" bash /gremlins-run.sh || rc=$?
+            OUT="/work/${m}/gremlins-out.json" GREMLINS_MODE="${modes[i]}" GREMLINS_WORKERS="${workers[i]}" \
+              bash scripts/gremlins-container.sh "${m}" || rc=$?
             echo "::endgroup::"
             if [ "$rc" -ne 0 ]; then
               break
@@ -307,19 +348,14 @@ jobs:
 
           # Hand the result to the badge/aggregate jobs, which read /tmp.
           if [ "$rc" -ne 0 ]; then
-            # Error marker so they SKIP this attempt (load_run returns None on a
-            # file with no "files" key) instead of publishing a misleading 0%.
-            echo '{"gremlins_error": true}' > /tmp/gremlins-out.json
-            echo "::error::gremlins failed for ${{ matrix.repo }} (attempt ${{ matrix.attempt }}), exit ${rc}"
-            exit "$rc"
+            fail "gremlins failed for ${{ matrix.repo }} (attempt ${{ matrix.attempt }}), exit ${rc}" "$rc"
           fi
 
-          # Fold the per-module results into the ONE result per attempt the
-          # aggregate, badge and tracker are built on; gremlins-merge.py owns how.
+          # Fold the per-module results into the ONE result per attempt (per
+          # shard, which gremlins-aggregate.py merges) the aggregate, badge and
+          # tracker are built on; gremlins-merge.py owns how.
           if ! python3 scripts/gremlins-merge.py --out /tmp/gremlins-out.json "${MERGE_ARGS[@]}"; then
-            echo '{"gremlins_error": true}' > /tmp/gremlins-out.json
-            echo "::error::merging per-module gremlins results failed for ${{ matrix.repo }} (attempt ${{ matrix.attempt }})"
-            exit 1
+            fail "merging per-module gremlins results failed for ${{ matrix.repo }} (attempt ${{ matrix.attempt }})" 1
           fi
 
       # The artifact carries its own identity, because its NAME does not survive
@@ -334,14 +370,17 @@ jobs:
           REPO: ${{ matrix.repo }}
           ATTEMPT: ${{ matrix.attempt }}
         run: |
-          jq -n --arg repo "$REPO" --arg attempt "$ATTEMPT" \
-            '{repo: $repo, attempt: $attempt}' > /tmp/meta.json
+          # A shard also records which of how many, so the aggregate merges an
+          # attempt's shards before it compares attempts.
+          jq -n --arg repo "$REPO" --arg attempt "$ATTEMPT" --arg shard "$SHARD" --arg shards "$SHARDS" \
+            '{repo: $repo, attempt: $attempt}
+             + if $shards == "" then {} else {shard: $shard, shards: $shards} end' > /tmp/meta.json
 
       - name: Upload full mutants.json (artifact, 90-day retention)
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: gremlins-${{ matrix.repo }}-${{ matrix.attempt }}
+          name: gremlins-${{ matrix.repo }}-${{ matrix.attempt }}${{ matrix.shards && format('-shard{0}', matrix.shard) || '' }}
           # Both under /tmp, so the computed common ancestor puts each at the
           # artifact root beside the other.
           path: |
@@ -360,7 +399,7 @@ jobs:
   # not possible).
   badge:
     needs: [fanout, run]
-    if: always() && needs.fanout.outputs.matrix != '[]'
+    if: always() && needs.fanout.outputs.repos != '[]'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -448,7 +487,7 @@ jobs:
 
   aggregate:
     needs: [fanout, run]
-    if: always() && needs.fanout.outputs.matrix != '[]'
+    if: always() && needs.fanout.outputs.repos != '[]'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -547,7 +586,7 @@ jobs:
 
   # `needs:` must list every other job in this workflow.
   notify:
-    needs: [fanout, run, badge, aggregate]
+    needs: [fanout, plan, shard, run, badge, aggregate]
     if: always()
     permissions:
       actions: read

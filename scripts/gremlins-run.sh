@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # One module's gremlins run inside the memory-capped container that
 # .github/workflows/weekly-gremlins.yaml starts, from the module root. Env:
-# GREMLINS_VERSION, GREMLINS_PATCHES (space-separated absolute paths of the
-# scripts/gremlins-*.patch files, applied in order),
-# WORKERS_MAX, GOMEM_MAX_MB / GOMEM_SOLO_MB (GOMEMLIMIT for WORKERS_MAX workers /
-# one forced worker), PROBE_TIMEOUT (seconds per probe phase), OUT (result JSON),
-# and optional JOB_TIMEOUT_MINUTES (the run job's cap; unset keeps per-package).
-# Writes the chosen mode to "${OUT}.mode" for scripts/gremlins-merge.py.
+# GREMLINS_VERSION, GREMLINS_PATCHES (patch paths, applied in order),
+# WORKERS_MAX, GOMEM_MAX_MB / GOMEM_SOLO_MB (GOMEMLIMIT at WORKERS_MAX / one
+# worker), PROBE_TIMEOUT (seconds per probe phase), optional JOB_TIMEOUT_MINUTES
+# (the run job's cap; unset keeps per-package), a shard's GREMLINS_MODE and
+# GREMLINS_WORKERS (the plan's, set together, replacing the probe and the mode
+# choice), and OUT (result JSON) or PLAN_DIR and PLAN_DEADLINE (size the module).
 set -euo pipefail
 
 # The clone is bind-mounted from the runner and owned by the runner uid, while
@@ -18,7 +18,8 @@ set -euo pipefail
 git config --global --add safe.directory '*'
 
 : "${GREMLINS_VERSION:?}" "${GREMLINS_PATCHES:?}" "${WORKERS_MAX:?}"
-: "${GOMEM_MAX_MB:?}" "${GOMEM_SOLO_MB:?}" "${PROBE_TIMEOUT:?}" "${OUT:?}"
+: "${GOMEM_MAX_MB:?}" "${GOMEM_SOLO_MB:?}" "${PROBE_TIMEOUT:?}" "${PLAN_DIR:-${OUT:?}}"
+: "${PLAN_DIR:+${PLAN_DEADLINE:?}}" "${GREMLINS_WORKERS:+${GREMLINS_MODE:?}}" "${GREMLINS_MODE:+${GREMLINS_WORKERS:?}}"
 
 # gremlins budgets each mutant at its coverage-pass test time x this coefficient:
 # its own package's in per-package mode (with a floor), the whole pass's under
@@ -49,7 +50,21 @@ integration_wanted() {
 
 # select_mode SUITE_SECS MUTANTS WORKERS prints the mode and logs it with its
 # inputs to stderr; an unset or empty JOB_TIMEOUT_MINUTES is an unmeasured cap.
+# A GREMLINS_MODE from the shard plan wins: every shard of a module must run
+# the mode its whole-module plan chose, or the merged attempt mixes two.
 select_mode() {
+  case "${GREMLINS_MODE:-}" in
+    '') ;;
+    integration | per-package)
+      printf 'mode=%s (set by the shard plan)\n' "${GREMLINS_MODE}" >&2
+      printf '%s\n' "${GREMLINS_MODE}"
+      return 0
+      ;;
+    *)
+      printf '::error::GREMLINS_MODE=%s is neither integration nor per-package\n' "${GREMLINS_MODE}" >&2
+      return 1
+      ;;
+  esac
   local cap="${JOB_TIMEOUT_MINUTES:-}" mode=per-package sizing=
   if sizing=$(integration_wanted "$1" "$2" "$3" "${cap}"); then
     mode=integration
@@ -58,6 +73,37 @@ select_mode() {
   printf 'mode=%s (suite=%s mutants=%s workers=%s cap=%s%s)\n' "${mode}" \
     "${suite:-unmeasured}" "${2:-unmeasured}" "$3" "${cap_text:-unmeasured}" "${sizing:+ ${sizing}}" >&2
   printf '%s\n' "${mode}"
+}
+
+# time_package_mutants DEADLINE prints "<import path><TAB><ms>" for each
+# package with non-test Go files under the current directory: the larger of the
+# wall and CPU time `go test` takes to rebuild and test it after a code change.
+# A surviving mutant holds its worker for the wall time, and for at least the
+# CPU time when the workers share the cores its tests use. A failing package,
+# and every package left at DEADLINE (epoch seconds), gets no row. It edits each
+# package in place and restores it, so run it in a copy of the tree.
+time_package_mutants() {
+  local dir path file rc out real user sys ms late='' TIMEFORMAT='%3R %3U %3S'
+  go list -f '{{.Dir}}{{"\t"}}{{.ImportPath}}{{"\t"}}{{if .GoFiles}}{{index .GoFiles 0}}{{end}}' ./... \
+    | while IFS=$'\t' read -r dir path file; do
+      [ -n "${file}" ] || continue
+      if [ "$(date +%s)" -ge "$1" ]; then
+        [ -n "${late}" ] || echo "::warning::the plan deadline passed before ${path}, so it and every later package take the dearest package's time" >&2
+        late=1
+        continue
+      fi
+      cp -p "${dir}/${file}" "${dir}/${file}.orig"
+      printf '\nfunc gremlinsPlan%s%s() int { return %s }\n' "${RANDOM}" "${RANDOM}" "${RANDOM}" >>"${dir}/${file}"
+      rc=0
+      out=$({ time go test -count=1 -failfast "${path}" >/dev/null 2>&1; } 2>&1) || rc=$?
+      mv "${dir}/${file}.orig" "${dir}/${file}"
+      [ "${rc}" -eq 0 ] || continue
+      read -r real user sys <<<"${out}" || continue
+      ms=$((10#${user/[.,]/} + 10#${sys/[.,]/}))
+      real=$((10#${real/[.,]/}))
+      [ "${real}" -le "${ms}" ] || ms="${real}"
+      printf '%s\t%s\n' "${path}" "${ms}"
+    done
 }
 
 retry() {
@@ -151,12 +197,20 @@ export GOFLAGS="${GOFLAGS:+${GOFLAGS} }-toolexec=/usr/local/bin/gogc-toolexec"
 # verdict, which is why gremlins-aggregate.py separately flags attempts that
 # disagree about which mutants survived. Cost is one extra suite run against a
 # mutation run that executes the suite once per mutant.
-workers="${WORKERS_MAX}"
-export GOMEMLIMIT="${GOMEM_MAX_MB}MiB"
-suite_secs=
-mutants=
+choose_workers() {
+  workers="${WORKERS_MAX}"
+  export GOMEMLIMIT="${GOMEM_MAX_MB}MiB"
+  suite_secs=
+  mutants=
+  if [ -n "${GREMLINS_WORKERS:-}" ]; then
+    # The plan sized this shard at the count its own probe left; a probe
+    # here that failed would run the shard at 1 worker, ~4x its projection.
+    workers="${GREMLINS_WORKERS}"
+    echo "workers=${workers} (set by the shard plan, so no concurrency probe)"
+    return 0
+  fi
+  [ "${WORKERS_MAX}" -gt 1 ] || return 0
 
-if [ "${WORKERS_MAX}" -gt 1 ]; then
   # gremlins downloads modules itself; doing it here first keeps the probe from
   # timing out on a cold module cache.
   go mod download || echo "::warning::go mod download failed before the concurrency probe; letting gremlins report it"
@@ -237,9 +291,48 @@ if [ "${WORKERS_MAX}" -gt 1 ]; then
     fi
   fi
   rm -rf "${probe_a}" "${probe_b}"
-fi
+}
+
+# In plan mode the three probe phases share the time left before PLAN_DEADLINE.
+# Under 3 s left would give each `timeout 0`, which is no limit at all.
+plan_time_left() {
+  [ -n "${PLAN_DIR:-}" ] || return 0
+  local left=$((PLAN_DEADLINE - $(date +%s)))
+  if [ "${left}" -lt 3 ]; then
+    echo "::error::the plan deadline passed before the concurrency probe"
+    exit 1
+  fi
+  [ "${PROBE_TIMEOUT}" -le $((left / 3)) ] || PROBE_TIMEOUT=$((left / 3))
+}
+plan_time_left
+choose_workers
 
 mode=$(select_mode "${suite_secs}" "${mutants}" "${workers}")
+
+if [ -n "${PLAN_DIR:-}" ]; then
+  printf 'workers=%s\nmode=%s\nsuite_secs=%s\nmutants=%s\nsetup_secs=%s\n' \
+    "${workers}" "${mode}" "${suite_secs}" "${mutants}" "${SECONDS}" >"${PLAN_DIR}/plan.env"
+  if [ "${mode}" = per-package ]; then
+    left=$((PLAN_DEADLINE - $(date +%s)))
+    if [ "${left}" -le 0 ]; then
+      echo "::error::the plan deadline passed before the per-package gremlins dry run"
+      exit 1
+    fi
+    timeout "${left}" gremlins unleash --dry-run --output "${PLAN_DIR}/dry-run.json" . >/tmp/gremlins-plan-dry.log 2>&1 || {
+      echo "::error::the per-package gremlins dry run failed"
+      tail --lines=20 /tmp/gremlins-plan-dry.log
+      exit 1
+    }
+    plan_tree=/tmp/plan-tree
+    rm -rf "${plan_tree}"
+    cp -a . "${plan_tree}"
+    (cd "${plan_tree}" && time_package_mutants "${PLAN_DEADLINE}") >"${PLAN_DIR}/mutant-ms.tsv"
+  fi
+  # gremlins-shard.py size_module trusts the files above only after this line.
+  printf 'sized=1\n' >>"${PLAN_DIR}/plan.env"
+  exit 0
+fi
+
 mode_flags=()
 if [ "${mode}" = integration ]; then
   mode_flags=(--integration --coverpkg ./...)

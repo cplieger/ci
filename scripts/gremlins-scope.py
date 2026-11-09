@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import re
 import sys
 from pathlib import Path
@@ -34,6 +35,11 @@ _spec = importlib.util.spec_from_file_location(
 )
 gremlins_merge = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gremlins_merge)
+_spec = importlib.util.spec_from_file_location(
+    'gremlins_shard', Path(__file__).with_name('gremlins-shard.py')
+)
+gremlins_shard = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(gremlins_shard)
 
 # The workflow's module discovery refuses any other character, which also keeps
 # '.' the only regex metacharacter to escape and no quote inside a YAML entry.
@@ -41,10 +47,19 @@ SAFE_DIR = re.compile(r'[A-Za-z0-9._/-]+')
 ANCHOR = re.compile(r'^  exclude-files:[ \t]*$', re.MULTILINE)
 
 
-def scoped_config(central: str, dir_: str, all_dirs: list[str]) -> str:
-    """The central config with dir_'s deeper module directories excluded."""
+def escaped(d: str) -> str:
+    return d.replace('.', r'\.')
+
+
+def scoped_config(central: str, dir_: str, all_dirs: list[str],
+                  other_shards: list[str] = ()) -> str:
+    """The central config with dir_'s deeper module directories excluded.
+
+    other_shards: package dirs of dir_ that another shard mutates; each loses
+    its own files only ('.' is the module root's).
+    """
     inner = gremlins_merge.deeper_dirs(dir_, all_dirs)
-    if not inner:
+    if not inner and not other_shards:
         return central
     anchors = list(ANCHOR.finditer(central))
     if len(anchors) != 1:
@@ -52,14 +67,26 @@ def scoped_config(central: str, dir_: str, all_dirs: list[str]) -> str:
             f'gremlins-scope: expected one "  exclude-files:" line in the central config, '
             f'found {len(anchors)}'
         )
-    entries = ''.join(f"    - '^{d.replace('.', r'\.')}/'\n" for d in sorted(inner))
+    entries = ''
+    if inner:
+        entries += "    # Nested Go modules, not this module's code (scripts/gremlins-scope.py)\n"
+        entries += ''.join(f"    - '^{escaped(d)}/'\n" for d in sorted(inner))
+    if other_shards:
+        entries += '    # Packages another shard of this attempt mutates (scripts/gremlins-shard.py)\n'
+        entries += ''.join(
+            "    - '^[^/]+$'\n" if d == '.' else f"    - '^{escaped(d)}/[^/]+$'\n"
+            for d in sorted(other_shards)
+        )
     at = anchors[0].end() + 1
-    return (
-        central[:at]
-        + "    # Nested Go modules, not this module's code (scripts/gremlins-scope.py)\n"
-        + entries
-        + central[at:]
-    )
+    return central[:at] + entries + central[at:]
+
+
+def other_shard_packages(plan: dict, shard: int, dir_: str) -> list[str]:
+    """The package dirs of module dir_ that the plan gives a shard other than shard."""
+    module = plan['modules'].get(dir_)
+    if module is None:
+        raise SystemExit(f'gremlins-scope: the shard plan has no module {dir_!r}')
+    return [pkg for pkg, e in (module.get('packages') or {}).items() if e.get('shard') != shard]
 
 
 def main() -> int:
@@ -70,8 +97,19 @@ def main() -> int:
     p.add_argument('--target', required=True, type=Path, help='checkout holding the modules')
     p.add_argument('--exclude-dir', action='append', default=[], metavar='DIR',
                    help='nested module dir to exclude from its outer modules but not measure')
+    p.add_argument('--plan', type=Path, help="scripts/gremlins-shard.py's plan for this repo")
+    p.add_argument('--shard', type=int, help='the shard of --plan this run is')
     p.add_argument('modules', nargs='+', help="module dirs relative to --target ('.' for the root)")
     args = p.parse_args()
+    if (args.plan is None) != (args.shard is None):
+        raise SystemExit('gremlins-scope: --plan and --shard go together')
+    plan = None
+    if args.plan is not None:
+        plan = json.loads(args.plan.read_text())
+        if why := gremlins_shard.valid_plan(plan):
+            raise SystemExit(f'gremlins-scope: the shard plan cannot be used ({why})')
+        if not 1 <= args.shard <= plan['shards']:
+            raise SystemExit(f'gremlins-scope: shard {args.shard} is outside 1..{plan["shards"]}')
 
     candidates = args.modules + args.exclude_dir
     for d in candidates:
@@ -83,8 +121,12 @@ def main() -> int:
     central = args.config.read_text()
     for d in args.modules:
         inner = gremlins_merge.deeper_dirs(d, candidates)
-        (args.target / d / '.gremlins.yaml').write_text(scoped_config(central, d, candidates))
+        others = other_shard_packages(plan, args.shard, d) if plan else []
+        (args.target / d / '.gremlins.yaml').write_text(scoped_config(central, d, candidates, others))
         print(f'[{d}] .gremlins.yaml excludes nested modules: {inner or "none"}', file=sys.stderr)
+        if plan:
+            print(f'[{d}] shard {args.shard} of {plan["shards"]} also excludes '
+                  f'{len(others)} package(s) other shards mutate', file=sys.stderr)
     return 0
 
 

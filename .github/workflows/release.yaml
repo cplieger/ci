@@ -192,7 +192,7 @@ jobs:
           LANES="[]"
           while IFS= read -r f; do
             [ -z "$f" ] && continue
-            d=$(dirname "$f")
+            d=$(dirname -- "$f")
             case "$d" in
               *[!A-Za-z0-9._/-]*)
                 echo "::error::nested go.mod dir '$d' contains characters outside [A-Za-z0-9._/-]; not a valid Go module path element"
@@ -210,7 +210,7 @@ jobs:
                 echo "::notice::nested go.mod '$f' (module '${modpath:-<none>}') has a dotless first path element — a sentinel/local module, not a release lane"
                 continue ;;
             esac
-            if [ -z "$(git ls-files "$d/*.go" | head -1)" ]; then
+            if [ -z "$(git ls-files -- "$d/*.go" | head -1)" ]; then
               echo "::notice::nested module '$d' has no tracked .go files — not a release lane"
               continue
             fi
@@ -232,8 +232,8 @@ jobs:
           HALVES="[]"
           while IFS= read -r d; do
             [ -z "$d" ] && continue
-            [ -n "$(git ls-files "$d/web/jsr.json")" ] || continue
-            if [ -z "$(git ls-files "$d/web/package.json")" ]; then
+            [ -n "$(git ls-files -- "$d/web/jsr.json")" ] || continue
+            if [ -z "$(git ls-files -- "$d/web/package.json")" ]; then
               echo "::error::$d/web/jsr.json has no package.json beside it. A lane's TS half publishes to npm, then JSR."
               exit 1
             fi

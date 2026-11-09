@@ -126,7 +126,7 @@ jobs:
               continue
             fi
             while IFS= read -r cfg; do
-              dir=$(dirname "${cfg#scan/}")
+              dir=$(dirname -- "${cfg#scan/}")
               # A sidecar, not a stryker.config key: Stryker warns on unknown keys.
               weekly="$(dirname "$cfg")/stryker.weekly.json"
               if [ "$EVENT" = schedule ] && [ -z "${ONLY:-}" ] && [ -f "$weekly" ]; then
