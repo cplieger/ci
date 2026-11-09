@@ -49,6 +49,15 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      # The read loads the semver library npm bundles beside this Node, and a
+      # runner other than GitHub's hosted image may carry no Node, so install
+      # the one validate tests on. No cache: this job installs no packages.
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # Keep in step with validate's Setup Node.js.
+          node-version: '26'
+
       - name: Read cplieger.vitestShards and engines.node
         id: read
         env:

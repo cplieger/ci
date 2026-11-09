@@ -72,6 +72,18 @@ class PackageSettings(Harness):
         self.assertEqual(run.rc, 0, run.out)
         return run.outputs['floor']
 
+    def test_the_job_sets_up_the_publishing_node_before_the_read(self):
+        """The read loads the semver library npm bundles beside the Node on PATH,
+        and a runner other than GitHub's hosted image may carry none, so the job
+        installs the same Node as validate first."""
+        steps = ts_ci()['jobs']['package']['steps']
+        names = [s.get('name') for s in steps]
+        self.assertLess(names.index('Setup Node.js'), names.index(READ_STEP))
+        setup = steps[names.index('Setup Node.js')]
+        validate_setup = workflow_step(TS_CI, 'validate', 'Setup Node.js')
+        self.assertEqual(setup['uses'], validate_setup['uses'])
+        self.assertEqual(setup['with']['node-version'], validate_setup['with']['node-version'])
+
     def test_the_step_reads_the_working_directory_package(self):
         self.assertEqual(self.STEP['env']['PACKAGE'], '${{ inputs.working-directory }}/package.json')
         self.assertNotIn('defaults', ts_ci()['jobs']['package'])
