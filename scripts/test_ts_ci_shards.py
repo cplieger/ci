@@ -1,6 +1,7 @@
 """ts-ci.yaml's vitest shards: the count read and validated from the package's own
-`cplieger.vitestShards`, the shard matrix and check names, which steps each shard
-runs and how the test step hands vitest its shard."""
+`cplieger.vitestShards`, the shard matrix and check names of `validate` and
+`engines-floor`, which steps each shard runs and how each test step hands vitest
+its shard."""
 
 from __future__ import annotations
 
@@ -15,6 +16,9 @@ from test_package_script_steps import WORKFLOWS, Harness, workflow_step
 
 TS_CI = WORKFLOWS / 'ts-ci.yaml'
 READ_STEP = 'Read cplieger.vitestShards'
+# The jobs that run the vitest suite, each split by the read count, with its
+# test step.
+SHARDED = {'validate': 'Test (vitest)', 'engines-floor': 'Test (vitest) on the engines floor'}
 
 # Logs the arguments vitest received, so a test sees what reached it.
 VITEST_STUB = """#!/usr/bin/env bash
@@ -103,35 +107,49 @@ class ShardCount(Harness):
 
 
 class ShardMatrix(unittest.TestCase):
-    def test_validate_waits_for_the_count_and_takes_its_list(self):
-        validate = ts_ci()['jobs']['validate']
-        self.assertEqual(validate['needs'], 'shard-count')
-        matrix = validate['strategy']['matrix']['shard']
-        for count in (1, 2, 100):
-            with self.subTest(count=count):
-                self.assertEqual(evaluate(matrix, {'needs': counted(count)}), list(range(1, count + 1)))
+    def test_each_sharded_job_waits_for_the_count_and_takes_its_list(self):
+        for job in SHARDED:
+            spec = ts_ci()['jobs'][job]
+            self.assertEqual(spec['needs'], 'shard-count')
+            matrix = spec['strategy']['matrix']['shard']
+            for count in (1, 2, 100):
+                with self.subTest(job=job, count=count):
+                    self.assertEqual(evaluate(matrix, {'needs': counted(count)}), list(range(1, count + 1)))
+
+    def test_only_the_sharded_jobs_run_vitest(self):
+        jobs = ts_ci()['jobs']
+        running = {job for job, spec in jobs.items() for step in spec.get('steps', []) if 'npm test' in step.get('run', '')}
+        self.assertEqual(running, set(SHARDED))
 
     def test_the_count_is_no_longer_an_input(self):
         self.assertNotIn('vitest-shards', ts_ci()[True]['workflow_call']['inputs'])
         self.assertNotIn('vitest-shards', TS_CI.read_text())
 
     def test_one_failed_shard_does_not_cancel_the_others(self):
-        self.assertFalse(ts_ci()['jobs']['validate']['strategy']['fail-fast'])
+        for job in SHARDED:
+            with self.subTest(job=job):
+                self.assertFalse(ts_ci()['jobs'][job]['strategy']['fail-fast'])
 
-    def name(self, shard: int, count: int) -> str:
-        template = ts_ci()['jobs']['validate']['name']
+    def name(self, job: str, shard: int, count: int) -> str:
+        template = ts_ci()['jobs'][job]['name']
         return evaluate(template, {'needs': counted(count), 'matrix': {'shard': shard}})
 
-    def test_unsharded_the_job_keeps_the_plain_validate_name(self):
-        self.assertEqual(self.name(1, 1), 'validate')
+    def test_unsharded_each_job_keeps_its_plain_name(self):
+        for job in SHARDED:
+            with self.subTest(job=job):
+                self.assertEqual(self.name(job, 1, 1), job)
 
     def test_each_shard_is_named_with_its_index_and_count(self):
-        self.assertEqual(self.name(1, 2), 'validate (shard 1/2)')
-        self.assertEqual(self.name(2, 2), 'validate (shard 2/2)')
+        for job in SHARDED:
+            with self.subTest(job=job):
+                self.assertEqual(self.name(job, 1, 2), f'{job} (shard 1/2)')
+                self.assertEqual(self.name(job, 2, 2), f'{job} (shard 2/2)')
 
-    def test_a_refused_count_skips_validate(self):
+    def test_a_refused_count_skips_each_sharded_job(self):
         needs = counted(None, 'failure')
-        self.assertFalse(wr.job_condition(ts_ci(), 'validate', {'needs': needs}, []))
+        for job in SHARDED:
+            with self.subTest(job=job):
+                self.assertFalse(wr.job_condition(ts_ci(), job, {'needs': needs}, []))
 
 
 def running_steps(shard: int) -> list[str]:
@@ -174,7 +192,10 @@ class ShardSteps(unittest.TestCase):
 
 
 class TestStep(Harness):
-    STEP = workflow_step(TS_CI, 'validate', 'Test (vitest)')
+    """validate's test step, which records a failure for its soft gate."""
+
+    JOB = 'validate'
+    STEP = workflow_step(TS_CI, JOB, SHARDED[JOB])
 
     def setUp(self):
         super().setUp()
@@ -210,6 +231,9 @@ class TestStep(Harness):
         self.assertEqual(run.logged('post'), 'post\n')
         self.assertEqual(run.recorded, '')
 
+    # What a refused shard leaves in the soft gate's failure file.
+    REFUSED_RECORD = 'test\n'
+
     def test_a_compound_test_script_fails_the_shard_before_running(self):
         for script in (
             'vitest --run && node guard.ts',
@@ -223,7 +247,7 @@ class TestStep(Harness):
                 (self.tmp / 'ci_failures').unlink(missing_ok=True)
                 run = self.run_test({'test': script}, 1, 2)
                 self.assertEqual(run.rc, 1, run.out)
-                self.assertEqual(run.recorded, 'test\n')
+                self.assertEqual(run.recorded, self.REFUSED_RECORD)
                 self.assertIn('sets cplieger.vitestShards to 2', run.out)
                 self.assertIn('must be one vitest command', run.out)
                 self.assertEqual(run.logged('vitest'), '')
@@ -231,7 +255,28 @@ class TestStep(Harness):
     def test_a_test_script_without_vitest_fails_the_shard(self):
         run = self.run_test({'test': 'node --test'}, 1, 2)
         self.assertEqual(run.rc, 1, run.out)
-        self.assertEqual(run.recorded, 'test\n')
+        self.assertEqual(run.recorded, self.REFUSED_RECORD)
+
+
+class FloorTestStep(TestStep):
+    """engines-floor's test step: the same shard hand-off, with no soft gate, so a
+    refusal fails the step without recording it."""
+
+    JOB = 'engines-floor'
+    STEP = workflow_step(TS_CI, JOB, SHARDED[JOB])
+    REFUSED_RECORD = ''
+
+    def test_the_step_runs_only_when_a_floor_is_declared(self):
+        self.assertEqual(self.STEP['if'], "steps.floor.outputs.major != ''")
+
+
+class FloorShardSteps(unittest.TestCase):
+    def test_every_shard_runs_the_whole_floor_job(self):
+        """No floor step is shard-1-only: each shard needs Node, the install and its
+        part of the suite."""
+        for step in ts_ci()['jobs']['engines-floor']['steps']:
+            with self.subTest(step=step['name']):
+                self.assertNotIn('matrix', step.get('if', ''))
 
 
 class MetaPassesNoCount(unittest.TestCase):

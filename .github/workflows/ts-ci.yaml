@@ -28,7 +28,7 @@ permissions:
 jobs:
   # A matrix cannot read a file, so this job reads the package's own shard count
   # (`cplieger.vitestShards` in package.json, which sync never writes) for
-  # `validate`. The value is the checked-out branch's, so it is untrusted: only a
+  # `validate` and `engines-floor`. The value is the checked-out branch's, so it is untrusted: only a
   # count this script validated reaches the outputs.
   shard-count:
     name: vitest shard count
@@ -474,7 +474,16 @@ jobs:
   # lint, types and the published surface do not depend on the runtime. The job
   # reads no publishing version, so it stays right when that version moves; a
   # package with no `engines.node` skips it with a notice.
+  # Split like validate's tests, so a suite that needs shards on the publishing
+  # Node gets them on the floor too. The meta workflow's validate aggregates
+  # every shard through this workflow's result.
   engines-floor:
+    needs: shard-count
+    name: ${{ needs.shard-count.outputs.count > 1 && format('engines-floor (shard {0}/{1})', matrix.shard, needs.shard-count.outputs.count) || 'engines-floor' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.shard-count.outputs.shards) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     defaults:
@@ -513,6 +522,22 @@ jobs:
         if: steps.floor.outputs.major != ''
         run: npm ci
 
+      # The same hand-off as validate's test step, without its soft gate.
       - name: Test (vitest) on the engines floor
         if: steps.floor.outputs.major != ''
-        run: npm test
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ needs.shard-count.outputs.count }}
+        run: |
+          if [ "$SHARDS" -eq 1 ]; then
+            npm test
+            exit "$?"
+          fi
+          # npm appends `--` arguments to the script's command line, so they reach
+          # its last command only (and no pre/post script): anything after vitest
+          # would take --shard while every shard ran the whole suite.
+          if ! node -e "const s=(require('./package.json').scripts||{}).test||''; process.exit(/\bvitest\b/.test(s) && !/[;&|#\n]/.test(s) ? 0 : 1)"; then
+            echo "::error::package.json sets cplieger.vitestShards to ${SHARDS}, so this job runs 'npm test -- --shard=${SHARD}/${SHARDS}': the package.json test script must be one vitest command. Move a command that follows the tests to posttest."
+            exit 1
+          fi
+          npm test -- --shard="${SHARD}/${SHARDS}"
