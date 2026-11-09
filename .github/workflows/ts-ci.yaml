@@ -72,22 +72,29 @@ jobs:
             if (own !== undefined && Object.hasOwn(own, "vitestShards")) {
               count = own.vitestShards;
               if (!Number.isInteger(count) || count < 1 || count > 100) {
-                const shown = String(JSON.stringify(count)).slice(0, 40);
+                const shown = JSON.stringify(count).slice(0, 40);
                 fail(`cplieger.vitestShards is ${shown}: it must be an integer from 1 to 100`);
               }
             }
-            // The floor is the major of a lower bound (`>=24`, `>=24.3`, `^24`,
-            // `~24`, `v24`); a range with none, or no engines.node, means no floor.
+            // The floor is the lowest major any `||` alternative allows, each read
+            // from the lower bound it starts with (`>=24`, `>=24.3`, `^24`, `~24`,
+            // `~>24`, `=24`, `v24`, `24.x`, `20 - 22`). An alternative this reads
+            // no bound from (`*`, `>24`, `<26`) means no floor, as does no
+            // engines.node.
             const range = pkg?.engines?.node;
             if (range != null && typeof range !== "string") {
-              fail(`engines.node is ${String(JSON.stringify(range)).slice(0, 40)}: it must be a version range string`);
+              fail(`engines.node is ${JSON.stringify(range).slice(0, 40)}: it must be a version range string`);
             }
-            const floor = /^\s*(?:>=|\^|~)?\s*v?(\d+)/.exec(range ?? "")?.[1] ?? "";
+            const majors = (range ?? "").split("||").map((alt) => /^\s*(?:>=|\^|~>?|=)?\s*v?(\d+)/.exec(alt)?.[1]);
+            // The lowest as the digits read, so the output stays a bare number.
+            const floor = range && majors.every((m) => m !== undefined) ? majors.reduce((a, b) => (Number(b) < Number(a) ? b : a)) : "";
             const shards = Array.from({ length: count }, (_, i) => i + 1);
             appendFileSync(process.env.GITHUB_OUTPUT, `count=${count}\nshards=${JSON.stringify(shards)}\nfloor=${floor}\n`);
             console.log(`vitest shards: ${count}`);
-            if (floor === "") {
+            if (!range) {
               console.log("::notice::package.json declares no engines.node floor; nothing to test beyond the publishing Node");
+            } else if (floor === "") {
+              console.log(`::notice::engines.node ${JSON.stringify(range).slice(0, 60)} has no lower bound this job reads, so only the publishing Node tests it`);
             } else {
               console.log(`engines.node ${JSON.stringify(range).slice(0, 60)}: testing on Node ${floor}`);
             }
@@ -482,20 +489,21 @@ jobs:
           fi
           echo "All validation steps passed"
 
-  # The tests again on the oldest Node the package claims, read from its own
-  # `engines.node` floor (`>=24`, `>=24.3`, `^24`). `validate` runs on the Node
+  # The tests again on the oldest Node major the package claims, read from its
+  # own `engines.node` floor (`>=24`, `^24`, `^22 || ^20`). `validate` runs on the Node
   # that publishes, so without this a package promising an older Node is never
   # run on it and an API only a newer Node has ships unnoticed. Tests only:
   # lint, types and the published surface do not depend on the runtime. The job
   # reads no publishing version, so it stays right when that version moves; a
-  # package with no `engines.node` skips it, and the package job says so. It is
-  # split like validate's tests, so a suite that needs shards on the publishing
-  # Node gets them on the floor too. The meta workflow's validate aggregates
-  # every shard through this workflow's result.
+  # package with no floor skips it, and the package job says so. It is split
+  # like validate's tests, so a suite that needs shards on the publishing Node
+  # gets them on the floor too. The meta workflow's validate aggregates every
+  # shard through this workflow's result. It takes no expression name: GitHub
+  # does not evaluate one for a skipped job, and skipping is this job's common
+  # path, so its rows read `engines-floor` skipped and `engines-floor (<i>)` run.
   engines-floor:
     needs: package
     if: ${{ needs.package.outputs.floor != '' }}
-    name: ${{ needs.package.outputs.count > 1 && format('engines-floor (shard {0}/{1})', matrix.shard, needs.package.outputs.count) || 'engines-floor' }}
     strategy:
       fail-fast: false
       matrix:

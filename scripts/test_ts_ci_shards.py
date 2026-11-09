@@ -110,27 +110,60 @@ class PackageSettings(Harness):
         run = self.read(raw='{"a":\n::add-mask::x\n}')
         self.assert_refused(run, 'cannot read the package settings')
 
-    def test_the_floor_is_the_major_of_a_lower_bound(self):
+    def test_the_floor_is_the_lowest_major_of_the_lower_bounds(self):
         for node, want in (
             ('>=24', '24'),
             ('>=24.3', '24'),
             ('>= 24.3.1', '24'),
             ('^22', '22'),
             ('~20.1', '20'),
+            ('~>20', '20'),
+            ('=18.17.0', '18'),
             ('v18', '18'),
             ('24.x', '24'),
+            ('20 - 22', '20'),
             (' >=26 <28', '26'),
+            ('^22 || ^20', '20'),
+            ('22 || >=20.3 || ^24', '20'),
         ):
             with self.subTest(node=node):
                 self.assertEqual(self.floor(node), want)
 
-    def test_no_lower_bound_means_no_floor_with_a_notice(self):
-        for manifest in ({}, {'engines': {}}, {'engines': {'node': None}}, {'engines': {'node': '*'}}, {'engines': {'node': '>24'}}, {'engines': 'x'}):
+    def test_no_engines_node_means_no_floor_with_a_notice(self):
+        for manifest in (
+            {},
+            {'engines': {}},
+            {'engines': {'node': None}},
+            {'engines': {'node': ''}},
+            {'engines': 'x'},
+        ):
             with self.subTest(manifest=manifest):
                 run = self.read(manifest)
                 self.assertEqual(run.rc, 0, run.out)
                 self.assertEqual(run.outputs['floor'], '')
                 self.assertIn('::notice::package.json declares no engines.node floor', run.out)
+
+    def test_a_range_with_an_unread_bound_means_no_floor_with_its_own_notice(self):
+        for node in ('*', '>24', '<26', '^22 || *', '>18 || >=16'):
+            with self.subTest(node=node):
+                run = self.read({'engines': {'node': node}})
+                self.assertEqual(run.rc, 0, run.out)
+                self.assertEqual(run.outputs['floor'], '')
+                self.assertIn(f'::notice::engines.node {json.dumps(node)} has no lower bound this job reads', run.out)
+
+    def test_the_job_passes_on_every_output_the_step_writes(self):
+        run = self.read({'cplieger': {'vitestShards': 2}, 'engines': {'node': '>=22'}})
+        job = ts_ci()['jobs']['package']
+        steps = {self.STEP['id']: {'outputs': run.outputs}}
+        self.assertEqual({k: evaluate(v, {'steps': steps}) for k, v in job['outputs'].items()}, run.outputs)
+
+    def test_a_long_range_is_cut(self):
+        run = self.read({'engines': {'node': ['x' * 500]}})
+        self.assert_refused(run, 'it must be a version range string')
+        self.assertLess(len(run.out), 200, run.out)
+        run = self.read({'engines': {'node': '>=24 ' + 'x' * 500}})
+        self.assertEqual(run.outputs['floor'], '24')
+        self.assertLess(max(len(line) for line in run.out.splitlines()), 120, run.out)
 
     def test_a_floor_is_logged_without_a_notice(self):
         run = self.read({'engines': {'node': '>=24'}})
@@ -138,7 +171,7 @@ class PackageSettings(Harness):
         self.assertNotIn('::', run.out)
 
     def test_an_engines_node_that_is_not_a_string_fails_the_job(self):
-        for value in (24, ['>=24'], {'min': 24}, True):
+        for value in (24, 0, False, ['>=24'], {'min': 24}, True):
             with self.subTest(value=value):
                 self.assert_refused(self.read({'engines': {'node': value}}), 'it must be a version range string')
 
@@ -179,20 +212,21 @@ class ShardMatrix(unittest.TestCase):
             with self.subTest(job=job):
                 self.assertFalse(ts_ci()['jobs'][job]['strategy']['fail-fast'])
 
-    def name(self, job: str, shard: int, count: int) -> str:
-        template = ts_ci()['jobs'][job]['name']
+    def name(self, shard: int, count: int) -> str:
+        template = ts_ci()['jobs']['validate']['name']
         return evaluate(template, {'needs': counted(count), 'matrix': {'shard': shard}})
 
-    def test_unsharded_each_job_keeps_its_plain_name(self):
-        for job in SHARDED:
-            with self.subTest(job=job):
-                self.assertEqual(self.name(job, 1, 1), job)
+    def test_unsharded_validate_keeps_its_plain_name(self):
+        self.assertEqual(self.name(1, 1), 'validate')
 
-    def test_each_shard_is_named_with_its_index_and_count(self):
-        for job in SHARDED:
-            with self.subTest(job=job):
-                self.assertEqual(self.name(job, 1, 2), f'{job} (shard 1/2)')
-                self.assertEqual(self.name(job, 2, 2), f'{job} (shard 2/2)')
+    def test_each_validate_shard_is_named_with_its_index_and_count(self):
+        self.assertEqual(self.name(1, 2), 'validate (shard 1/2)')
+        self.assertEqual(self.name(2, 2), 'validate (shard 2/2)')
+
+    def test_the_floor_job_takes_no_expression_name(self):
+        """GitHub does not evaluate a skipped job's expression name, and most
+        packages skip the floor job, so its row must read plain `engines-floor`."""
+        self.assertNotIn('name', ts_ci()['jobs']['engines-floor'])
 
     def test_a_refused_count_skips_each_sharded_job(self):
         needs = counted(None, 'failure')
@@ -325,7 +359,6 @@ class FloorTestStep(TestStep):
     JOB = 'engines-floor'
     STEP = workflow_step(TS_CI, JOB, SHARDED[JOB])
     REFUSED_RECORD = ''
-
 
 
 class FloorShardSteps(unittest.TestCase):
