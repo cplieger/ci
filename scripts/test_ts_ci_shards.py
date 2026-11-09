@@ -83,6 +83,9 @@ class PackageSettings(Harness):
         validate_setup = workflow_step(TS_CI, 'validate', 'Setup Node.js')
         self.assertEqual(setup['uses'], validate_setup['uses'])
         self.assertEqual(setup['with']['node-version'], validate_setup['with']['node-version'])
+        self.assertNotIn('cache', setup['with'])
+        self.assertTrue(setup['with'].get('package-manager-cache') is False)
+
 
     def test_the_step_reads_the_working_directory_package(self):
         self.assertEqual(self.STEP['env']['PACKAGE'], '${{ inputs.working-directory }}/package.json')
@@ -454,6 +457,21 @@ class MetaPassesNoCount(unittest.TestCase):
                 self.assertNotIn('repository.name', call)
         self.assertNotIn('vitest-shards', META.read_text())
         self.assertNotIn('repository.name', TS_CI.read_text())
+
+
+class SetupNodeCaching(unittest.TestCase):
+    def test_every_setup_node_step_names_its_cache_or_turns_caching_off(self):
+        """setup-node caches npm on its own whenever package.json names npm as
+        its packageManager, and fails with no root lockfile, so a step either
+        asks for the npm cache or turns that automatic caching off."""
+        for path in sorted(WORKFLOWS.glob('*.y*ml')):
+            for job, spec in (yaml.safe_load(path.read_text()).get('jobs') or {}).items():
+                for step in spec.get('steps') or []:
+                    if 'actions/setup-node@' not in str(step.get('uses', '')):
+                        continue
+                    with self.subTest(workflow=path.name, job=job, step=step.get('name')):
+                        given = step.get('with') or {}
+                        self.assertTrue(given.get('cache') == 'npm' or given.get('package-manager-cache') is False, given)
 
 
 if __name__ == '__main__':

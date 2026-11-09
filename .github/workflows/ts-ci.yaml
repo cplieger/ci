@@ -51,10 +51,14 @@ jobs:
 
       # The read loads the semver library npm bundles beside this Node, and a
       # runner other than GitHub's hosted image may carry no Node, so install
-      # the one validate tests on. No cache: this job installs no packages.
+      # the one validate tests on.
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
+          # No cache, and automatic caching off: this job installs no packages,
+          # and setup-node would otherwise cache npm whenever package.json
+          # names npm as its packageManager.
+          package-manager-cache: false
           # Keep in step with validate's Setup Node.js.
           node-version: '26'
 
