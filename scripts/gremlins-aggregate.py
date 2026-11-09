@@ -9,6 +9,7 @@ survive; the sentinel and history mechanics are trackerlib's.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import statistics
@@ -18,6 +19,12 @@ from pathlib import Path
 
 import trackerlib
 import yaml
+
+_spec = importlib.util.spec_from_file_location(
+    "gremlins_merge", Path(__file__).with_name("gremlins-merge.py")
+)
+gremlins_merge = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(gremlins_merge)
 
 MAX_LIVE_MUTANTS_INLINE = 50  # cap; remainder goes to artifact link
 REGRESSION_THRESHOLD_PCT = 5.0  # mean drops > 5% below rolling-mean → flag
@@ -181,6 +188,11 @@ def load_run(path: Path):
             data = json.load(fp)
     except (json.JSONDecodeError, FileNotFoundError):
         return None
+    return parse_run(data)
+
+
+def parse_run(data: object):
+    """load_run's parse of an already-read document."""
     if not isinstance(data, dict) or "files" not in data:
         return None
 
@@ -207,8 +219,11 @@ def load_run(path: Path):
     return muts, summary
 
 
-def aggregate(attempt_files: list[Path]) -> dict:
+def aggregate(attempt_files: list[Path | dict]) -> dict:
     """Cross-reference mutants across N runs.
+
+    Each attempt is its gremlins-out.json, or the document merge_shards made
+    from its shards.
 
     Returns a dict with:
         attempts:        N
@@ -223,7 +238,7 @@ def aggregate(attempt_files: list[Path]) -> dict:
     runs = []        # list of normalised mutant lists, one per parseable attempt
     summaries = []   # gremlins' own per-attempt efficacy/coverage/counts
     for f in attempt_files:
-        loaded = load_run(f)
+        loaded = parse_run(f) if isinstance(f, dict) else load_run(f)
         if loaded is None:
             continue
         muts, summary = loaded
@@ -656,6 +671,38 @@ def build_body(
     return body, regression
 
 
+def merged_attempt(repo: str, attempt: str, shards: list[tuple[dict, Path]]) -> dict | None:
+    """One sharded attempt's shard results merged, or None (with a warning) when incomplete.
+
+    An attempt missing a shard, or with a shard that failed, would publish the
+    score of part of the module, so it is skipped like a failed attempt.
+    """
+    where = f"[{repo}] attempt {attempt}"
+    counts = sorted({str(meta.get("shards")) for meta, _ in shards})
+    indices = sorted(str(meta.get("shard")) for meta, _ in shards)
+    k = counts[0] if len(counts) == 1 and counts[0].isdigit() else None
+    if k is None or indices != sorted(str(n) for n in range(1, int(k) + 1)):
+        print(f"::warning::{where} has shards {indices} of {'/'.join(counts)}, so it is skipped",
+              file=sys.stderr)
+        return None
+    docs = []
+    for meta, path in sorted(shards, key=lambda s: int(s[0]["shard"])):
+        try:
+            doc = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            doc = None
+        if not isinstance(doc, dict) or "files" not in doc:
+            print(f"::warning::{where} shard {meta['shard']} has no result, so it is skipped",
+                  file=sys.stderr)
+            return None
+        docs.append(doc)
+    try:
+        return gremlins_merge.merge_shards(docs)
+    except SystemExit as exc:
+        print(f"::warning::{where} is skipped: {exc}", file=sys.stderr)
+        return None
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Aggregate weekly gremlins runs into the tracker issue body.")
     p.add_argument("--repo", required=True, help="repo name without owner")
@@ -692,7 +739,8 @@ def main() -> int:
     # `gremlins-{repo}-*/gremlins-out.json` glob and the directory-name parsing it
     # depended on find nothing. A missing or unreadable meta.json means the file
     # cannot be attributed to a repo, so it is skipped rather than guessed at.
-    attempt_files = []
+    attempt_files: list[Path | dict] = []
+    sharded: dict[str, list[tuple[dict, Path]]] = {}
     for out_path in sorted(args.artifacts_dir.rglob("gremlins-out.json")):
         try:
             meta = json.loads((out_path.parent / "meta.json").read_text())
@@ -700,8 +748,16 @@ def main() -> int:
             print(f"[{args.repo}] no readable meta.json beside {out_path}; skipping",
                   file=sys.stderr)
             continue
-        if meta.get("repo") == args.repo:
+        if meta.get("repo") != args.repo:
+            continue
+        if "shards" in meta:
+            sharded.setdefault(str(meta.get("attempt")), []).append((meta, out_path))
+        else:
             attempt_files.append(out_path)
+    for attempt in sorted(sharded):
+        merged = merged_attempt(args.repo, attempt, sharded[attempt])
+        if merged is not None:
+            attempt_files.append(merged)
     print(f"[{args.repo}] found {len(attempt_files)} attempt files", file=sys.stderr)
 
     agg = aggregate(attempt_files)

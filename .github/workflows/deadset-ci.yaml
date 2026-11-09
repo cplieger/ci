@@ -191,7 +191,7 @@ jobs:
               case "/$file" in
                 */node_modules/* | */testdata/* | */vendor/* | */.*/* | */_*/*) continue ;;
               esac
-              go_dirs+=("$(dirname "$file")")
+              go_dirs+=("$(dirname -- "$file")")
             done < <(git ls-files -- ':(glob)**/go.mod')
           fi
           # JavaScript with no package.json, such as a node script, has nothing
@@ -202,7 +202,7 @@ jobs:
             case "/$file" in
               */node_modules/* | */testdata/* | */vendor/* | */.*/*) continue ;;
               */package.json) manifests=$((manifests + 1)) ;;
-              *) if [ "$ts" = true ]; then npm_dirs+=("$(dirname "$file")"); fi ;;
+              *) if [ "$ts" = true ]; then npm_dirs+=("$(dirname -- "$file")"); fi ;;
             esac
           done < <(git ls-files -- ':(glob)**/package-lock.json' ':(glob)**/package.json')
           if [ "$ts" = true ] && [ "$manifests" -gt 0 ] && [ "${#npm_dirs[@]}" -eq 0 ]; then

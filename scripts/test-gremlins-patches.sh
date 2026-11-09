@@ -9,7 +9,7 @@
 set -euo pipefail
 
 HERE=$(cd -- "$(dirname -- "$0")" && pwd)
-version=$(grep -oP '^\s*GREMLINS_VERSION=\K\S+$' "${HERE}/../.github/workflows/weekly-gremlins.yaml")
+version=$(grep -oP '^\s*GREMLINS_VERSION: \K\S+$' "${HERE}/../.github/workflows/weekly-gremlins.yaml")
 src=$(mktemp -d)
 trap 'rm -rf "${src}"' EXIT
 

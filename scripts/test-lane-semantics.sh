@@ -36,7 +36,7 @@ discover_release() { # run in a repo; prints JSON array or fails
   local LANES="[]" f d modpath a b
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    d=$(dirname "$f")
+    d=$(dirname -- "$f")
     case "$d" in
       *[!A-Za-z0-9._/-]*)
         echo "CHARSET_ERROR"
@@ -51,7 +51,7 @@ discover_release() { # run in a repo; prints JSON array or fails
       *.*) : ;;
       *) continue ;;
     esac
-    if [ -z "$(git ls-files "$d/*.go" | head -1)" ]; then
+    if [ -z "$(git ls-files -- "$d/*.go" | head -1)" ]; then
       continue
     fi
     LANES=$(echo "$LANES" | jq -c --arg v "$d" '. + [$v]')
@@ -75,14 +75,14 @@ discover_ci() {
   local DIRS="[]" f d
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    d=$(dirname "$f")
+    d=$(dirname -- "$f")
     case "$d" in
       *[!A-Za-z0-9._/-]*)
         echo "CHARSET_ERROR"
         return 0
         ;;
     esac
-    if [ -z "$(git ls-files "$d/*.go" | head -1)" ]; then
+    if [ -z "$(git ls-files -- "$d/*.go" | head -1)" ]; then
       continue
     fi
     DIRS=$(echo "$DIRS" | jq -c --arg v "$d" '. + [$v]')
@@ -166,7 +166,7 @@ mkrepo() { # name -> $R
   git -C "$R" config commit.gpgsign false
 }
 put() { # path content...
-  mkdir -p "$R/$(dirname "$1")"
+  mkdir -p "$R/$(dirname -- "$1")"
   printf '%s\n' "${@:2}" >"$R/$1"
 }
 
@@ -217,6 +217,17 @@ git -C "$R" commit -qm init
 put scratch/go.mod "module github.com/cplieger/u/scratch" "go 1.26.5"
 put scratch/s.go "package scratch"
 chk "L-A7 untracked go.mod is not a lane" "$(cd "$R" && discover_release)" "[]"
+
+mkrepo dash
+put go.mod "module github.com/cplieger/dash" "go 1.26.5"
+put m.go "package main"
+put -h/go.mod "module github.com/cplieger/dash/-h" "go 1.26.5"
+put -h/h.go "package h"
+git -C "$R" add -A
+git -C "$R" commit -qm init
+chk "L-A8 a module dir starting with a dash is a lane, not an option (release)" \
+  "$(cd "$R" && discover_release)" '["-h"]'
+chk "L-A9 a module dir starting with a dash is validated (ci)" "$(cd "$R" && discover_ci)" '["-h"]'
 
 # ── Web-frontend probe states ────────────────────────────────────────────────
 web_probe() {

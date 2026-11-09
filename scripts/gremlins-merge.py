@@ -232,8 +232,8 @@ def deeper_dirs(dir_: str, all_dirs: list[str]) -> list[str]:
     return out
 
 
-def merge(modules: list[tuple[str, Path]]) -> dict:
-    all_dirs = [d for d, _ in modules]
+def merge(modules: list[tuple[str, Path]], skipped: list[str] = ()) -> dict:
+    all_dirs = [d for d, _ in modules] + list(skipped)
     merged_files: list[dict] = []
     per_module = []
     problems: list[str] = []
@@ -299,12 +299,15 @@ def merge(modules: list[tuple[str, Path]]) -> dict:
             "gremlins-merge: refusing to publish a number derived from results that "
             "do not add up (see errors above)"
         )
+    return result_doc(root_module_name, merged_files, per_module)
 
-    tallied = counts_from_files(merged_files)
+
+def result_doc(go_module: str, files: list[dict], per_module: list[dict]) -> dict:
+    tallied = counts_from_files(files)
     c = tallied["counts"]
     module_modes = {m["mode"] for m in per_module}
     return {
-        "go_module": root_module_name,
+        "go_module": go_module,
         "test_efficacy": efficacy(c),
         "mutations_coverage": mutant_coverage(c),
         "mutants_total": c["total"],
@@ -314,11 +317,58 @@ def merge(modules: list[tuple[str, Path]]) -> dict:
         "mutants_not_covered": c["not_covered"],
         "elapsed_time": 0.0,
         "mutator_statistics": tallied["stats"],
-        "files": merged_files,
+        "files": files,
         # Not part of gremlins' schema (readers ignore unknown keys).
         "modules": per_module,
         "mode": module_modes.pop() if len(module_modes) == 1 else "mixed",
     }
+
+
+MODULE_COUNTERS = (
+    "mutants_total", "mutants_killed", "mutants_lived", "mutants_not_covered",
+    "mutants_not_viable", "mutants_timed_out", "dropped_nested_mutations",
+)
+
+
+def merge_shards(docs: list[dict]) -> dict:
+    """Fold one attempt's shard results (each this script's output) into one result.
+
+    Shards mutate disjoint packages, so their files are concatenated and the
+    counters re-derived; a file in two shards would count its verdicts twice,
+    so it is refused, as is a shard whose own totals do not add up.
+    """
+    problems: list[str] = []
+    files: list[dict] = []
+    seen: dict[str, int] = {}
+    modules: dict[str, dict] = {}
+    go_module = ""
+    for n, doc in enumerate(docs, start=1):
+        problems += self_check(f"shard {n}", doc, counts_from_files(doc.get("files") or []))
+        go_module = go_module or doc.get("go_module") or ""
+        for fe in doc.get("files") or []:
+            name = fe.get("file_name") or ""
+            if name in seen:
+                problems.append(f"[shard {n}] {name} was measured by shard {seen[name]} too")
+                continue
+            seen[name] = n
+            files.append(fe)
+        for m in doc.get("modules") or []:
+            acc = modules.get(m["dir"])
+            if acc is None:
+                modules[m["dir"]] = dict(m)
+                continue
+            for key in MODULE_COUNTERS:
+                acc[key] += m[key]
+            if acc["mode"] != m["mode"]:
+                acc["mode"] = "mixed"
+    if problems:
+        raise SystemExit("gremlins-merge: shards do not add up: " + "; ".join(problems))
+    for m in modules.values():
+        c = {"killed": m["mutants_killed"], "lived": m["mutants_lived"],
+             "not_covered": m["mutants_not_covered"]}
+        m["test_efficacy"] = round(efficacy(c), 4)
+        m["mutations_coverage"] = round(mutant_coverage(c), 4)
+    return result_doc(go_module, files, list(modules.values()))
 
 
 def parse_module_arg(raw: str) -> tuple[str, Path]:
@@ -335,17 +385,20 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--module", action="append", required=True, metavar="DIR=PATH",
                    help="module directory ('.' for the root module) and its gremlins JSON; repeatable")
+    p.add_argument("--skip-module", action="append", default=[], metavar="DIR",
+                   help="module directory this shard did not run (repeatable)")
     p.add_argument("--out", required=True, type=Path, help="merged JSON destination")
     args = p.parse_args()
 
     modules = [parse_module_arg(m) for m in args.module]
-    dirs = [d for d, _ in modules]
+    skipped = [d.rstrip("/") or "." for d in args.skip_module]
+    dirs = [d for d, _ in modules] + skipped
     if len(set(dirs)) != len(dirs):
-        raise SystemExit(f"--module directories must be unique, got {dirs}")
+        raise SystemExit(f"--module and --skip-module directories must be unique, got {dirs}")
     if "." not in dirs:
-        raise SystemExit("the root module ('.') must be among --module arguments")
+        raise SystemExit("the root module ('.') must be among --module or --skip-module arguments")
 
-    merged = merge(modules)
+    merged = merge(modules, skipped)
     args.out.write_text(json.dumps(merged))
     c = merged
     print(
