@@ -110,7 +110,7 @@ class PackageSettings(Harness):
         run = self.read(raw='{"a":\n::add-mask::x\n}')
         self.assert_refused(run, 'cannot read the package settings')
 
-    def test_the_floor_is_the_lowest_major_of_the_lower_bounds(self):
+    def test_the_floor_is_the_major_npm_reads_as_the_oldest_allowed(self):
         for node, want in (
             ('>=24', '24'),
             ('>=24.3', '24'),
@@ -120,11 +120,17 @@ class PackageSettings(Harness):
             ('~>20', '20'),
             ('=18.17.0', '18'),
             ('v18', '18'),
+            ('v=20', '20'),
             ('24.x', '24'),
             ('20 - 22', '20'),
             (' >=26 <28', '26'),
+            ('<26 >=22', '22'),
+            ('>=18 >=20', '20'),
+            ('>24', '25'),
             ('^22 || ^20', '20'),
+            ('^10 || ^8', '8'),
             ('22 || >=20.3 || ^24', '20'),
+            ('>=4', '4'),
         ):
             with self.subTest(node=node):
                 self.assertEqual(self.floor(node), want)
@@ -143,27 +149,31 @@ class PackageSettings(Harness):
                 self.assertEqual(run.outputs['floor'], '')
                 self.assertIn('::notice::package.json declares no engines.node floor', run.out)
 
-    def test_a_range_with_an_unread_bound_means_no_floor_with_its_own_notice(self):
-        for node in ('*', '>24', '<26', '^22 || *', '>18 || >=16'):
+    def test_a_floor_below_node_4_means_no_floor_with_its_own_notice(self):
+        for node, major in (('*', 0), ('>=0.0.0', 0), ('>=0.12', 0), ('<26', 0), ('^22 || *', 0), ('>=1', 1), ('^3', 3)):
             with self.subTest(node=node):
                 run = self.read({'engines': {'node': node}})
                 self.assertEqual(run.rc, 0, run.out)
                 self.assertEqual(run.outputs['floor'], '')
-                self.assertIn(f'::notice::engines.node {json.dumps(node)} has no lower bound this job reads', run.out)
+                self.assertIn(f'::notice::engines.node {json.dumps(node)} allows Node {major}, which this job cannot install', run.out)
+
+    def test_an_invalid_range_fails_the_job(self):
+        for node in ('lts', '08', '>=1e3', '>=2O', '>=24 ' + 'x' * 500, '>=24\n::add-mask::x'):
+            with self.subTest(node=node):
+                run = self.read({'engines': {'node': node}})
+                self.assert_refused(run, 'it must be a valid semver range')
+                self.assertLess(len(run.out), 200, run.out)
+
+    def test_a_range_no_version_satisfies_fails_the_job(self):
+        for node in ('>=22 <22', '22 - 20', '^18 >=20'):
+            with self.subTest(node=node):
+                self.assert_refused(self.read({'engines': {'node': node}}), 'no version satisfies it')
 
     def test_the_job_passes_on_every_output_the_step_writes(self):
         run = self.read({'cplieger': {'vitestShards': 2}, 'engines': {'node': '>=22'}})
         job = ts_ci()['jobs']['package']
         steps = {self.STEP['id']: {'outputs': run.outputs}}
         self.assertEqual({k: evaluate(v, {'steps': steps}) for k, v in job['outputs'].items()}, run.outputs)
-
-    def test_a_long_range_is_cut(self):
-        run = self.read({'engines': {'node': ['x' * 500]}})
-        self.assert_refused(run, 'it must be a version range string')
-        self.assertLess(len(run.out), 200, run.out)
-        run = self.read({'engines': {'node': '>=24 ' + 'x' * 500}})
-        self.assertEqual(run.outputs['floor'], '24')
-        self.assertLess(max(len(line) for line in run.out.splitlines()), 120, run.out)
 
     def test_a_floor_is_logged_without_a_notice(self):
         run = self.read({'engines': {'node': '>=24'}})
@@ -174,12 +184,6 @@ class PackageSettings(Harness):
         for value in (24, 0, False, ['>=24'], {'min': 24}, True):
             with self.subTest(value=value):
                 self.assert_refused(self.read({'engines': {'node': value}}), 'it must be a version range string')
-
-    def test_a_range_cannot_start_a_workflow_command(self):
-        run = self.read({'engines': {'node': '>=24\n::add-mask::x'}})
-        self.assertEqual(run.rc, 0, run.out)
-        self.assertEqual(run.outputs['floor'], '24')
-        self.assertEqual([line for line in run.out.splitlines() if line.startswith('::')], [])
 
     def test_a_long_value_is_cut_in_the_error(self):
         run = self.read({'cplieger': {'vitestShards': 'x' * 500}})
@@ -225,7 +229,8 @@ class ShardMatrix(unittest.TestCase):
 
     def test_the_floor_job_takes_no_expression_name(self):
         """GitHub does not evaluate a skipped job's expression name, and most
-        packages skip the floor job, so its row must read plain `engines-floor`."""
+        packages skip the floor job, so it takes no name: skipped it reads
+        `engines-floor`, run `engines-floor (<i>)`."""
         self.assertNotIn('name', ts_ci()['jobs']['engines-floor'])
 
     def test_a_refused_count_skips_each_sharded_job(self):
