@@ -86,7 +86,6 @@ class PackageSettings(Harness):
         self.assertNotIn('cache', setup['with'])
         self.assertTrue(setup['with'].get('package-manager-cache') is False)
 
-
     def test_the_step_reads_the_working_directory_package(self):
         self.assertEqual(self.STEP['env']['PACKAGE'], '${{ inputs.working-directory }}/package.json')
         self.assertNotIn('defaults', ts_ci()['jobs']['package'])
