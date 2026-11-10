@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-# Two-branch release state, one subcommand per release.yaml step: pending,
-# publish, ahead, halves, number (CLIFF_SCRIPT), receipts, receipt TAG COMMIT,
-# readback SITE TAG [LANE], provenance and complete (IMAGE@DIGEST SOURCE),
-# hold (drop the nested lanes HEAD holds back from a stable run),
-# barrier, renumber-target, renumber-handoff, renumber (re-tag LANE_KEY's newest
-# dev build as DEV_VERSION), renumber-subpackages, half-free LANE TAG COMMIT,
-# signing-window TAG (EXCLUDE_RE, SUBPACKAGES_JSON), release-digest TAG (IMAGE),
-# security-shas [FLOOR]. Lane keys: '.' for the root, else the lane dir.
-# pending, publish, hold, ahead, halves, number and half-free hold no token.
+# Two-branch release state, one subcommand per release.yaml step: pending, publish, ahead, halves,
+# number (CLIFF_SCRIPT), receipts, receipt TAG COMMIT, readback SITE TAG [LANE], provenance and
+# complete (IMAGE@DIGEST SOURCE), hold (drop the nested lanes HEAD holds back from a stable run),
+# barrier, renumber-target, renumber-handoff, renumber (re-tag LANE_KEY's newest dev build as
+# DEV_VERSION), renumber-subpackages, half-free LANE TAG COMMIT, signing-window TAG (EXCLUDE_RE,
+# SUBPACKAGES_JSON), release-digest TAG (IMAGE), security-shas [FLOOR]. Lane keys: '.' for the
+# root, else the lane dir. pending, publish, hold, ahead, halves, number and half-free hold no token.
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -716,8 +714,8 @@ signing_window() { # <tag, or the commit it is about to name> -> the commits who
 # A stable image tag is complete only at the digest its release published:
 # R's Promoted-Digest, signed and attested by the build it promotes, for a
 # promotion, else a digest a docker-release.yaml run in the tag's signing
-# window signed. Every registry that run writes must serve it, and the
-# dashboard artifact too when the commit ships one.
+# window signed. Every registry that run writes must serve it, and so must
+# each dashboard artifact the commit ships (dashboards.sh).
 release_digest() { # <tag> -> the digest the tag's release published: R's Promoted-Digest, else what GHCR serves at the tag
   local commit want
   : "${IMAGE:?}"
@@ -734,7 +732,7 @@ release_digest() { # <tag> -> the digest the tag's release published: R's Promot
   fi
 }
 readback_image() { # <tag>
-  local tag=$1 commit want dash window
+  local tag=$1 commit want dashboards file package dash window
   commit=$(git rev-list -n1 "$tag") || die "no tag ${tag} in this checkout"
   want=$(release_digest "$tag") || exit 1
   if is_promotion "$commit"; then
@@ -748,13 +746,17 @@ readback_image() { # <tag>
   if [[ ${REGISTRIES:-} == *dockerhub* ]]; then
     answers "docker.io/${IMAGE}:${tag} at ${want}" serves "$want" hub_digest "$IMAGE" "$tag" || return 1
   fi
-  has_path "$commit" grafana-dashboard.json || return 0
-  dash=$(ghcr_digest "${IMAGE}/dashboard" "$tag" application/vnd.oci.image.manifest.v1+json)
+  dashboards=$(bash "$TOOLS/dashboards.sh" list-tree "$commit") || die "cannot list the dashboards ${tag} ships at ${commit}"
+  [ -n "$dashboards" ] || return 0
   window=$(window_order "$tag" "$commit") || die "cannot tell which commits could have signed ${tag}'s dashboard"
-  if [ -z "$dash" ] || ! signed_in_window "ghcr.io/${IMAGE}/dashboard@${dash}" "$window"; then
-    die "ghcr.io/${IMAGE}/dashboard:${tag} is '${dash}', which no docker-release.yaml run at ${commit} or a later main commit below the next stable tag signed"
-  fi
-  echo "ok: ghcr.io/${IMAGE}/dashboard:${tag} -> ${dash}"
+  while IFS= read -r file; do
+    package=$(bash "$TOOLS/dashboards.sh" package "$file") || exit 1
+    dash=$(ghcr_digest "${IMAGE}/${package}" "$tag" application/vnd.oci.image.manifest.v1+json)
+    if [ -z "$dash" ] || ! signed_in_window "ghcr.io/${IMAGE}/${package}@${dash}" "$window"; then
+      die "ghcr.io/${IMAGE}/${package}:${tag} is '${dash}', which no docker-release.yaml run at ${commit} or a later main commit below the next stable tag signed"
+    fi
+    echo "ok: ghcr.io/${IMAGE}/${package}:${tag} -> ${dash}"
+  done <<<"$dashboards"
 }
 
 cmd_readback() { # <site> <tag> [lane]; SUBPACKAGES: the root release's subpackage dirs (JSON)

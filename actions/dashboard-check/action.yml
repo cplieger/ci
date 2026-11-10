@@ -9,7 +9,9 @@ description: >-
 
 inputs:
   path:
-    description: The dashboard file, relative to the repository root.
+    description: >-
+      The dashboard file, relative to the repository root, or several separated
+      by whitespace. Each is checked against its own base copy.
     default: grafana-dashboard.json
   base-ref:
     description: >-

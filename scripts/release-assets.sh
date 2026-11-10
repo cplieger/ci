@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# The assets of an image's GitHub Release, gathered in one directory: the SBOM,
-# each TREE_FILES file the tagged tree holds and, for a repository opted in, its
-# client binaries, each with a cosign bundle beside it, and each tree file and
-# binary also with its .sha256 checksum.
-#   stage <tree-ish> <dir>  writes each TREE_FILES file the tree holds into an existing <dir>, with its checksum; reads git in the working directory
+# An image's Release assets in one directory: the SBOM, each tree file (the tree's dashboards, then
+# TREE_FILES) and any opted-in client binaries, each with a cosign bundle and, but the SBOM, a .sha256.
+#   stage <tree-ish> <dir>  writes each tree file the tree holds into an existing <dir>, with its checksum; reads git in the working directory
 #   build <tree-ish> <tag> <dir>  with BINARIES=<name>=<package>, builds the package at the tree for each BINARY_TARGETS entry as <name>-<goos>-<goarch>[.exe] with its checksum, stamped -X main.version=<tag>, and lists them in <dir>/binary-assets.txt; nothing without BINARIES
 #   sign <tag> <dir>        writes <file>.sigstore.json beside the SBOM and each staged file
 #   names <tag> <dir>       prints the Release's asset names, one per line; fails naming the first file <dir> lacks or holds empty
@@ -16,8 +14,9 @@ TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$TOOLS/retry.sh"
 
 SBOM=sbom.spdx.json
-# A file's asset name is its basename, so no two paths here may share one.
-TREE_FILES=(grafana-dashboard.json docs/openapi.json)
+# A file's asset name is its basename, so no two paths here may share one, nor
+# a dashboard's (dashboards.sh).
+TREE_FILES=(docs/openapi.json)
 BINARY_TARGETS=(linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64)
 # Not an asset: sign and names read it to know which binaries the build step made.
 BINARY_LIST=binary-assets.txt
@@ -27,9 +26,32 @@ die() {
   exit 1
 }
 
-cmd_stage() { # <tree-ish> <dir>
-  local tree=$1 dir=$2 path name entry
+tree_paths() { # <tree-ish> -> the path of each tree file the tree may hold
+  bash "$TOOLS/dashboards.sh" list-tree "$1" || return
+  printf '%s\n' "${TREE_FILES[@]}"
+}
+
+# A part is the file, its checksum or its bundle; names reads a lone part as a
+# file handed on incomplete.
+staged_names() { # <dir> -> the asset name of each tree file <dir> holds a part of, in tree_paths order
+  local path f
+  (
+    shopt -s nullglob
+    for f in "$1"/grafana-dashboard*.json "$1"/grafana-dashboard*.json.sha256 "$1"/grafana-dashboard*.json.sigstore.json; do
+      f=${f##*/}
+      f=${f%.sha256}
+      printf '%s\n' "${f%.sigstore.json}"
+    done
+  ) | bash "$TOOLS/dashboards.sh" filter || return
   for path in "${TREE_FILES[@]}"; do
+    printf '%s\n' "${path##*/}"
+  done
+}
+
+cmd_stage() { # <tree-ish> <dir>
+  local tree=$1 dir=$2 paths path name entry
+  paths=$(tree_paths "$tree")
+  while IFS= read -r path; do
     entry=$(git ls-tree --full-tree "$tree" -- "$path") || die "git cannot read ${path} at ${tree}"
     [ -n "$entry" ] || continue
     name=${path##*/}
@@ -40,7 +62,7 @@ cmd_stage() { # <tree-ish> <dir>
     esac
     git cat-file blob "${tree}:${path}" >"$dir/$name" || die "git cannot read ${path} at ${tree}"
     (cd "$dir" && sha256sum "$name" >"$name.sha256")
-  done
+  done <<<"$paths"
 }
 
 cmd_build() { # <tree-ish> <tag> <dir>
@@ -85,13 +107,13 @@ binaries_in() { # <dir> -> the binary names the build step listed, one per line
 }
 
 cmd_sign() { # <tag> <dir>
-  local tag=$1 dir=$2 path name
+  local tag=$1 dir=$2 tree_names name
   local files=("$SBOM")
   [ -s "$dir/$SBOM" ] || die "${SBOM} is missing. ${tag} is not published without it."
-  for path in "${TREE_FILES[@]}"; do
-    name=${path##*/}
+  tree_names=$(staged_names "$dir")
+  while IFS= read -r name; do
     [ ! -e "$dir/$name" ] || files+=("$name")
-  done
+  done <<<"$tree_names"
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     [ -s "$dir/$name" ] || die "${name} is missing. ${tag} is not published without it."
@@ -108,17 +130,17 @@ cmd_sign() { # <tag> <dir>
 }
 
 cmd_names() { # <tag> <dir>
-  local tag=$1 dir=$2 path name f
+  local tag=$1 dir=$2 tree_names name f
   local names=("$SBOM" "$SBOM.sigstore.json")
-  for path in "${TREE_FILES[@]}"; do
-    name=${path##*/}
+  tree_names=$(staged_names "$dir")
+  while IFS= read -r name; do
     for f in "$name" "$name.sha256" "$name.sigstore.json"; do
       if [ -e "$dir/$f" ]; then
         names+=("$name" "$name.sha256" "$name.sigstore.json")
         break
       fi
     done
-  done
+  done <<<"$tree_names"
   while IFS= read -r name; do
     [ -z "$name" ] || names+=("$name" "$name.sha256" "$name.sigstore.json")
   done < <(binaries_in "$dir")
