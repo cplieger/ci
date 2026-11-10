@@ -251,12 +251,11 @@ class BaseFetch(unittest.TestCase):
         # A single-parent commit whose parent is not the event base, so a
         # check that took any first parent would read it.
         git('commit', '-q', '--allow-empty', '-m', 'after the merge')
-        return repo, {
-            'opened': opened,
-            'built': built,
-            'merge': merge,
-            'after': git('rev-parse', 'HEAD'),
-        }
+        after = git('rev-parse', 'HEAD')
+        # HEAD stays on the merge, as a runner checks it out, so a fallback to
+        # HEAD would read its first parent.
+        git('checkout', '-q', merge)
+        return repo, {'opened': opened, 'built': built, 'merge': merge, 'after': after}
 
     def test_a_pull_request_reads_the_base_its_merge_was_built_on(self):
         repo, sha = self.merge_checkout()
@@ -269,13 +268,17 @@ class BaseFetch(unittest.TestCase):
 
     def test_any_other_base_is_read_as_given(self):
         repo, sha = self.merge_checkout()
+        # Each case names the merge and the event base, so only the event or
+        # the equality guard keeps the ref as given.
+        merge = {'GITHUB_SHA': sha['merge'], 'EVENT_BASE_SHA': sha['opened']}
         for name, ref, extra in (
-            ('a push', sha['opened'], {'GITHUB_EVENT_NAME': 'push', 'EVENT_BASE_SHA': ''}),
+            ('a push', sha['opened'], {**merge, 'GITHUB_EVENT_NAME': 'push'}),
             (
-                'a caller-chosen base',
-                'abc123',
-                {'GITHUB_EVENT_NAME': 'pull_request', 'EVENT_BASE_SHA': sha['opened']},
+                'a pull_request_target',
+                sha['opened'],
+                {**merge, 'GITHUB_EVENT_NAME': 'pull_request_target'},
             ),
+            ('a caller-chosen base', 'abc123', {**merge, 'GITHUB_EVENT_NAME': 'pull_request'}),
         ):
             with self.subTest(name):
                 result, log, _ = self.fetch(ref, extra=extra, cwd=repo)
