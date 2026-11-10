@@ -73,12 +73,14 @@ jobs:
           code_changed=true
           changed=""
           diffed=false
+          scope_modules=false
           case "${{ github.event_name }}" in
             pull_request)
               base="${{ github.event.pull_request.base.sha }}"
               if git cat-file -e "${base}^{commit}" 2> /dev/null; then
                 changed=$(git diff --name-only "$base" HEAD)
                 diffed=true
+                scope_modules=true
               fi
               ;;
             push)
@@ -258,6 +260,45 @@ jobs:
             done < <(jq -r '.[]' <<< "$go_nested_dirs")
             if [ "$ts_nested_dirs" != "[]" ]; then
               run_ts_nested=true
+            fi
+
+            # On a pull request in a repository of modules with no root go.mod,
+            # go-nested, go-os and ts-nested run only for the modules a changed
+            # path belongs to. Each go-nested and go-os leg builds with GOWORK=off,
+            # against its siblings' tagged versions, so a change to one module
+            # cannot change another's result there; go-work, which tests every
+            # module's head together, still runs in full. A changed path outside
+            # every module (go.work, lint config, workflows, scripts) keeps every
+            # module unless it is a doc file, and so does a push, so the merge's
+            # own run checks them all. scripts/test-lane-semantics.sh runs this
+            # block.
+            if [ "$scope_modules" = true ] && [ ! -f go.mod ] && [ "$go_nested_dirs" != "[]" ]; then
+              nested=$(jq -r '.[]' <<< "$go_nested_dirs")
+              touched=""
+              scoped=true
+              while IFS= read -r p; do
+                [ -z "$p" ] && continue
+                m=$(dirname -- "$p")
+                while [ "$m" != . ] && ! grep -qxF -- "$m" <<< "$nested"; do
+                  m=$(dirname -- "$m")
+                done
+                if [ "$m" != . ]; then
+                  touched=$(printf '%s\n%s' "$touched" "$m")
+                elif ! grep -qE '(\.md$|^LICENSE$|^\.gitignore$)' <<< "$p"; then
+                  scoped=false
+                  break
+                fi
+              done <<< "$changed"
+              if [ "$scoped" = true ]; then
+                keep=$(printf '%s\n' "$touched" | jq -ncR '[inputs | select(. != "")] | unique')
+                go_nested_dirs=$(jq -c --argjson k "$keep" 'map(select(. as $d | any($k[]; . == $d)))' <<< "$go_nested_dirs")
+                go_os_matrix=$(jq -c --argjson k "$keep" 'map(select(.dir as $d | any($k[]; . == $d)))' <<< "$go_os_matrix")
+                ts_nested_dirs=$(jq -c --argjson k "$keep" 'map(select(rtrimstr("/web") as $d | any($k[]; . == $d)))' <<< "$ts_nested_dirs")
+                if [ "$go_nested_dirs" = "[]" ]; then run_go_nested=false; fi
+                if [ "$go_os_matrix" = "[]" ]; then run_go_os=false; fi
+                if [ "$ts_nested_dirs" = "[]" ]; then run_ts_nested=false; fi
+                echo "pull request: validating only the changed modules $keep"
+              fi
             fi
 
             # Probe known nested web-frontend locations. First hit wins.

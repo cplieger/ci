@@ -114,6 +114,11 @@ open(f"{out}/web-probe.sh", "w").write(textwrap.dedent("\n".join(lines[start : e
 start = next(i for i, l in enumerate(lines) if l.strip().startswith("# A module tracking a Go file built for windows or darwin"))
 end = next(i for i in range(start, len(lines)) if lines[i].strip().startswith("go_os_matrix=$(jq -c 'unique_by"))
 open(f"{out}/go-os.sh", "w").write(textwrap.dedent("\n".join(lines[start : end + 1])) + "\n")
+
+start = next(i for i, l in enumerate(lines) if l.strip().startswith("# On a pull request in a repository of modules"))
+indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
+end = next(i for i in range(start + 1, len(lines)) if lines[i] == indent + "fi")
+open(f"{out}/module-scope.sh", "w").write(textwrap.dedent("\n".join(lines[start : end + 1])) + "\n")
 PY
 classify() { # <channel> <anchor> <head> -> root=<bool> lanes=<json>; env SUBPACKAGES_JSON GO_LANES_JSON; run in a repo
   : >"$WORK/out"
@@ -521,6 +526,49 @@ chk "L-F2 docker-release go-modules input defaults to '[]'" \
 # shellcheck disable=SC2016 # literal single-quoted grep pattern, no expansion wanted
 chk "L-F3 the docker notes step hands the lanes to render-notes.sh" \
   "$(grep -c -- '--go-lanes "$GO_LANES_JSON"' "$DOCKER_YAML")" "1"
+# ── module scoping on a pull request ─────────────────────────────────────────
+# ci.yaml's detect narrows go-nested, go-os and ts-nested to the modules a
+# changed path belongs to, on a pull request in a repo with no root go.mod. Each
+# go-nested and go-os leg builds with GOWORK=off against its siblings' tags, so
+# no other module's result can change there; any non-doc path outside every
+# module keeps them all, as does a push.
+cat >"$WORK/scope-run.sh" <<'SH'
+scope_modules=$1
+changed=$2
+go_nested_dirs='["filesafe","httpclient","keyenc","measure","ssrf"]'
+go_os_matrix='[{"dir":"filesafe","runner":"windows-latest"},{"dir":"measure","runner":"macos-latest"}]'
+ts_nested_dirs='["keyenc/web"]'
+run_go_nested=true
+run_go_os=true
+run_ts_nested=true
+# shellcheck source=/dev/null
+. "$3" >/dev/null
+printf 'nested=%s os=%s ts=%s run=%s,%s,%s\n' "$go_nested_dirs" "$(jq -c 'map(.dir)' <<<"$go_os_matrix")" \
+  "$ts_nested_dirs" "$run_go_nested" "$run_go_os" "$run_ts_nested"
+SH
+scope() { # <scope_modules> <changed paths, one per line> [root] -> the narrowed outputs
+  local d
+  d=$(mktemp -d "$WORK/scope.XXXXXX")
+  if [ -n "${3:-}" ]; then : >"$d/go.mod"; fi
+  (cd "$d" && bash -eo pipefail "$WORK/scope-run.sh" "$1" "$2" "$WORK/module-scope.sh") \
+    || fail "ci.yaml's module-scope block failed for '$2'"
+}
+ALL='nested=["filesafe","httpclient","keyenc","measure","ssrf"] os=["filesafe","measure"] ts=["keyenc/web"] run=true,true,true'
+chk "M-S1 a change inside one module validates that module alone" \
+  "$(scope true 'measure/exposition.go')" 'nested=["measure"] os=["measure"] ts=[] run=true,true,false'
+chk "M-S2 a doc file outside every module does not widen the scope" \
+  "$(scope true $'measure/exposition.go\nREADME.md\nLICENSE')" 'nested=["measure"] os=["measure"] ts=[] run=true,true,false'
+chk "M-S3 a non-doc path outside every module keeps every module" \
+  "$(scope true $'measure/exposition.go\n.golangci.yaml')" "$ALL"
+chk "M-S4 a change to a module's web half validates the module and the half" \
+  "$(scope true 'keyenc/web/src/keyenc.ts')" 'nested=["keyenc"] os=[] ts=["keyenc/web"] run=true,false,true'
+chk "M-S5 a package below a module belongs to that module" \
+  "$(scope true $'httpclient/certtest/certtest.go\nssrf/README.md')" 'nested=["httpclient","ssrf"] os=[] ts=[] run=true,false,false'
+chk "M-S6 a path in a folder that is no longer a module keeps every module" \
+  "$(scope true 'oldmod/old.go')" "$ALL"
+chk "M-S7 a push keeps every module" "$(scope false 'measure/exposition.go')" "$ALL"
+chk "M-S8 a repo with a root go.mod keeps every module" "$(scope true 'measure/exposition.go' root)" "$ALL"
+
 # shellcheck disable=SC2016 # literal single-quoted grep pattern, no expansion wanted
 chk "L-F3 and render-notes.sh scopes each git-cliff read of the range by them" \
   "$(grep -c '"$CLIFF" --tag-pattern' "$ROOT/scripts/render-notes.sh")|$(grep '"$CLIFF" --tag-pattern' "$ROOT/scripts/render-notes.sh" | grep -vc '"\${SCOPE_ARGS\[@\]}"')" "2|0"
@@ -532,4 +580,4 @@ LANE_ARGS=()
 set -- git-cliff --unreleased --tag v1.2.3 "${LANE_ARGS[@]}" --strip header
 chk "L-F4 empty LANE_ARGS contributes zero argv words" "$#" "6"
 
-echo "PASS: nested-module lane, web-probe and go-os detection shell semantics match the pinned contract (${PASS} checks)"
+echo "PASS: nested-module lane, web-probe, go-os detection and module-scope shell semantics match the pinned contract (${PASS} checks)"
