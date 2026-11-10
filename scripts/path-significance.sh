@@ -238,35 +238,76 @@ is_rebuild_commit() { # <commit>: is_rebuild_request, noting an empty commit tha
 }
 
 # package.json ships only as a published manifest (a declared TS subpackage's,
-# or the root one in a ts repo), and there only through its fields other than
-# devDependencies and overrides: npm reads overrides from the installing
-# project's root manifest alone
-# (https://docs.npmjs.com/cli/v11/configuring-npm/package-json). Any other
-# package.json is dev tooling. With no BEFORE to compare, stay significant.
-if [ -n "$SIGNIFICANT" ] && echo "$SIGNIFICANT" | grep -qE '(^|/)package\.json$'; then
-  MANIFESTS=""
-  [ "${#SUBPACKAGES[@]}" -eq 0 ] || MANIFESTS=$(printf '%s/package.json\n' "${SUBPACKAGES[@]}")
-  if [ "$REPO_TYPE" = "ts" ]; then
-    MANIFESTS=$(printf '%s\npackage.json\n' "$MANIFESTS")
+# the root one in a ts repo, or a nested lane's TS half at <lane>/web, which
+# release.yaml finds by its jsr.json and publishes at the lane's version), and
+# there only through its fields other than devDependencies, overrides and
+# version: npm reads overrides from the installing project's root manifest
+# alone (https://docs.npmjs.com/cli/v11/configuring-npm/package-json), and
+# every publish rewrites version. A published manifest's jsr.json ships
+# through every field but version. Any other package.json is dev tooling.
+# With no <from> to compare, stay significant.
+MANIFESTS=""
+[ "${#SUBPACKAGES[@]}" -eq 0 ] || MANIFESTS=$(printf '%s/package.json\n' "${SUBPACKAGES[@]}")
+if [ "${REPO_TYPE:-}" = "ts" ]; then
+  MANIFESTS=$(printf '%s\npackage.json\n' "$MANIFESTS")
+fi
+for l in "${GO_LANES[@]}"; do
+  if git cat-file -e "$HEAD:$l/web/jsr.json" 2>/dev/null; then
+    MANIFESTS=$(printf '%s\n%s/web/package.json\n' "$MANIFESTS" "$l")
   fi
-  PKG_JSONS=$(grep -E '(^|/)package\.json$' <<<"$SIGNIFICANT")
+done
+# shipped_fields <rev> <file> prints the fields of a manifest that ship, in a
+# canonical form: keys sorted, except under exports and imports, whose order is
+# Node's condition match order, and typesVersions, whose first matching range
+# wins (https://www.typescriptlang.org/docs/handbook/declaration-files/publishing.html#version-selection-with-typesversions);
+# nothing printed when <rev> has no such file or it is not JSON.
+shipped_fields() {
+  git show "$1:$2" 2>/dev/null | jq -c '
+    def sortkeys: if type == "object" then to_entries | sort_by(.key) | map(.value |= sortkeys) | from_entries
+      elif type == "array" then map(sortkeys) else . end;
+    del(.devDependencies, .overrides, .version) | . as $m
+    | ($m | del(.exports, .imports, .typesVersions) | sortkeys) + {exports: $m.exports, imports: $m.imports, typesVersions: $m.typesVersions}' 2>/dev/null || true
+}
+refine_manifests() { # <from> <paths> -> the paths less each manifest file that ships nothing since <from>
+  local from=$1 paths=$2 pj b h l
   while IFS= read -r pj; do
     [ -z "$pj" ] && continue
-    if ! printf '%s\n' "$MANIFESTS" | grep -qxF "$pj"; then
-      SIGNIFICANT=$(echo "$SIGNIFICANT" | grep -vxF "$pj" || true)
-      note "$pj is not a published manifest — dropped from significance"
-      continue
-    fi
-    if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
-      b=$(git show "$BEFORE:$pj" 2>/dev/null | jq -S 'del(.devDependencies, .overrides)' 2>/dev/null || echo "")
-      h=$(git show "$HEAD:$pj" 2>/dev/null | jq -S 'del(.devDependencies, .overrides)' 2>/dev/null || echo "")
+    case "$pj" in
+      */jsr.json | jsr.json)
+        # Only a published manifest's jsr.json is judged. Under a lane, any
+        # but the half's own is dev tooling, as its package.json is; any other
+        # keeps counting as before.
+        if ! printf '%s\n' "$MANIFESTS" | grep -qxF -- "${pj%jsr.json}package.json"; then
+          for l in "${GO_LANES[@]}"; do
+            if [[ $pj == "$l/"* && $pj != "$l/web/jsr.json" ]]; then
+              paths=$(grep -vxF -- "$pj" <<<"$paths" || true)
+              note "$pj is not a published manifest — dropped from significance" >&2
+              break
+            fi
+          done
+          continue
+        fi
+        ;;
+      *)
+        if ! printf '%s\n' "$MANIFESTS" | grep -qxF -- "$pj"; then
+          paths=$(grep -vxF -- "$pj" <<<"$paths" || true)
+          note "$pj is not a published manifest — dropped from significance" >&2
+          continue
+        fi
+        ;;
+    esac
+    if [ -n "$from" ] && [ "$from" != "0000000000000000000000000000000000000000" ]; then
+      b=$(shipped_fields "$from" "$pj")
+      h=$(shipped_fields "$HEAD" "$pj")
       if [ -n "$b" ] && [ "$b" = "$h" ]; then
-        SIGNIFICANT=$(echo "$SIGNIFICANT" | grep -vxF "$pj" || true)
-        note "$pj changed only in devDependencies/overrides — not significant"
+        paths=$(grep -vxF -- "$pj" <<<"$paths" || true)
+        note "$pj changed none of the fields it ships, so it is not significant" >&2
       fi
     fi
-  done <<<"$PKG_JSONS"
-fi
+  done < <(grep -E '(^|/)(package|jsr)\.json$' <<<"$paths" || true)
+  printf '%s' "$paths"
+}
+[ -z "$SIGNIFICANT" ] || SIGNIFICANT=$(refine_manifests "$BEFORE" "$SIGNIFICANT")
 
 # A path under a subpackage or a nested lane belongs to that one, never to
 # the root.
@@ -382,6 +423,7 @@ for l in "${GO_LANES[@]}"; do
   fi
   note "lane ${l}: deriving changed paths from ${anchor}..HEAD (newest lane tag on this channel)"
   lane_diff=$(git diff --no-renames --name-only "$anchor..$HEAD" -- "$l/")
+  lane_diff=$(refine_manifests "$anchor" "$lane_diff")
   if [ -n "$lane_diff" ]; then
     lane_shipped=$(shipped "$lane_diff") || exit 2
     [ -z "$lane_shipped" ] || LANE_CHANGED["$l"]=true

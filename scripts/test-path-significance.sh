@@ -349,7 +349,7 @@ T0=$(commit "feat: initial")
 put package.json '{"name":"@o/lib","devDependencies":{"a":"2"},"dependencies":{"b":"1"}}'
 T1=$(commit "chore(devdeps): bump a")
 chk "S12 a devDependency-only change publishes nothing" "$(release S12 stable "$T0" "$T0" "$T1")" "false|[]|[]"
-chk_has "S12 and says why" "$(cat "$WORK/log")" "changed only in devDependencies/overrides"
+chk_has "S12 and says why" "$(cat "$WORK/log")" "changed none of the fields it ships"
 put package.json '{"name":"@o/lib","devDependencies":{"a":"2"},"dependencies":{"b":"1"},"overrides":{"qs":"6"}}'
 T2=$(commit "fix: override qs")
 chk "S13 an overrides-only change publishes nothing" "$(release S13 stable "$T1" "$T1" "$T2")" "false|[]|[]"
@@ -559,5 +559,82 @@ put _old/old.md 'v2'
 I1=$(commit "docs: all three")
 chk "S42 a directive in a file Go never builds embeds nothing" "$(paths "$I0" "$I1")" 'false|[]|[]|[]'
 cd "$WORK" || exit 1
+
+# ── A tagged lane's web half that changed only its dev tooling ──────────────
+# cplieger/go released keyenc/v1.2.1 with no Go change: keyenc/web's
+# package.json moved only a devDependency and its lockfile followed. The lane
+# lane range drops it by the same manifest rule the root range applies.
+export REPO_TYPE=go SUBPACKAGES_JSON='[]' GO_LANES_JSON='["keyenc"]'
+newrepo lane-half
+put keyenc/go.mod 'module example.com/go/keyenc'
+put keyenc/k.go 'package keyenc'
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"0.0.0","devDependencies":{"knip":"1"},"dependencies":{}}'
+put keyenc/web/package-lock.json '{"lockfileVersion":3}'
+put keyenc/web/jsr.json '{"name":"@o/keyenc","version":"0.0.0"}'
+N0=$(commit "feat: initial")
+git tag keyenc/v1.2.0 "$N0"
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"0.0.0","devDependencies":{"knip":"2"},"dependencies":{}}'
+put keyenc/web/package-lock.json '{"lockfileVersion":3,"x":1}'
+N1=$(commit "chore(devdeps): update knip")
+chk "S43 a lane whose web half changed only devDependencies and its lockfile is owed nothing" \
+  "$(release S43 stable "$N0" "$N0" "$N1")" 'false|[]|[]'
+chk_has "S43 and says why" "$(cat "$WORK/log")" "keyenc/web/package.json changed none of the fields it ships"
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"0.0.0","devDependencies":{"knip":"2"},"dependencies":{"b":"1"}}'
+N2=$(commit "fix(deps): keyenc web b")
+chk "S43 a lane web half's dependencies change still owes the lane a release" \
+  "$(release S43b stable "$N1" "$N0" "$N2")" 'false|[]|["keyenc"]'
+put keyenc/k.go 'package keyenc // v2'
+git tag keyenc/v1.2.1 "$N2"
+N3=$(commit "fix(keyenc): code")
+chk "S43 a lane code change beside nothing else still owes a release" "$(release S43c stable "$N2" "$N2" "$N3")" 'false|[]|["keyenc"]'
+# MODE=paths (release-state.sh's affects and ahead, promote.py) reads the same
+# rule: the half's manifest ships through its runtime fields, a lane-level
+# package.json beside no jsr.json is dev tooling.
+N4=$N3
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"0.0.0","devDependencies":{"knip":"3"},"dependencies":{"b":"1"}}'
+N5=$(commit "chore(devdeps): update knip")
+chk "S44 MODE=paths: a half's devDependencies bump ships nothing" "$(paths "$N4" "$N5")" 'false|[]|[]|[]'
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"0.0.0","devDependencies":{"knip":"3"},"dependencies":{"b":"2"}}'
+N6=$(commit "fix(deps): keyenc web b")
+chk "S44 MODE=paths: a half's dependencies change is the lane's" "$(paths "$N5" "$N6")" 'false|[]|["keyenc"]|["keyenc/web/package.json"]'
+put keyenc/tools/package.json '{"scripts":{"x":"1"}}'
+N7=$(commit "chore(keyenc): tool")
+git tag keyenc/v1.2.2 "$N7"
+put keyenc/tools/package.json '{"scripts":{"x":"2"}}'
+N8=$(commit "chore(keyenc): tool script")
+chk "S44 a lane's package.json that is no half is dev tooling" "$(release S44 stable "$N7" "$N7" "$N8")" 'false|[]|[]'
+
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"0.0.0","devDependencies":{"knip":"3"},"dependencies":{"b":"2"},"exports":{".":{"node":"./n.js","default":"./d.js"}}}'
+N9=$(commit "feat(keyenc): node entry")
+git tag keyenc/v1.2.3 "$N9"
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"0.0.0","devDependencies":{"knip":"3"},"dependencies":{"b":"2"},"exports":{".":{"default":"./d.js","node":"./n.js"}}}'
+N10=$(commit "fix(keyenc): condition order")
+chk "S45 a reordered exports condition is a change the half ships" "$(release S45 stable "$N9" "$N9" "$N10")" 'false|[]|["keyenc"]'
+git tag keyenc/v1.2.4 "$N10"
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"1.0.0","devDependencies":{"knip":"3"},"dependencies":{"b":"2"},"exports":{".":{"default":"./d.js","node":"./n.js"}}}'
+put keyenc/web/jsr.json '{"name":"@o/keyenc","version":"1.0.0"}'
+N11=$(commit "chore(keyenc): align the half's version")
+chk "S45 a version-only edit of the half's package.json and jsr.json ships nothing" \
+  "$(release S45b stable "$N10" "$N10" "$N11")" 'false|[]|[]'
+put keyenc/web/jsr.json '{"name":"@o/keyenc","version":"1.0.0","exports":"./d.ts"}'
+N12=$(commit "feat(keyenc): jsr entry")
+chk "S45 a jsr.json change beyond its version ships" "$(release S45c stable "$N11" "$N10" "$N12")" 'false|[]|["keyenc"]'
+chk "S45 MODE=paths as half_changed calls it sees an exports reorder" \
+  "$(SUBPACKAGES_JSON='["keyenc/web"]' GO_LANES_JSON='[]' REPO_TYPE=none paths "$N9" "$N10")" \
+  'false|["keyenc/web"]|[]|["keyenc/web/package.json"]'
+git tag keyenc/v1.2.5 "$N12"
+put keyenc/web/package.json '{"dependencies":{"b":"2"},"version":"1.0.0","name":"@o/keyenc","devDependencies":{"knip":"3"},"exports":{".":{"default":"./d.js","node":"./n.js"}}}'
+N13=$(commit "chore(keyenc): sort the half's manifest")
+chk "S46 a key reorder outside exports, imports and typesVersions ships nothing" "$(release S46 stable "$N12" "$N12" "$N13")" 'false|[]|[]'
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"1.0.0","dependencies":{"b":"2"},"typesVersions":{">=5.0":{"*":["a/*"]},"*":{"*":["b/*"]}}}'
+N14=$(commit "feat(keyenc): types per compiler")
+git tag keyenc/v1.2.6 "$N14"
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"1.0.0","dependencies":{"b":"2"},"typesVersions":{"*":{"*":["b/*"]},">=5.0":{"*":["a/*"]}}}'
+N15=$(commit "fix(keyenc): typesVersions order")
+chk "S46 a reordered typesVersions range is a change the half ships" "$(release S46b stable "$N14" "$N14" "$N15")" 'false|[]|["keyenc"]'
+git tag keyenc/v1.2.7 "$N15"
+put keyenc/tools/jsr.json '{"name":"@o/tools","version":"1.0.0"}'
+N16=$(commit "chore(keyenc): tool jsr")
+chk "S46 a lane's jsr.json beside no half is dev tooling" "$(release S46c stable "$N15" "$N15" "$N16")" 'false|[]|[]'
 
 echo "PASS: path significance ($PASS checks)"
