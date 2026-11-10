@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import unittest
@@ -168,6 +169,92 @@ def module_tree(alpha_api: str) -> dict[str, str]:
         'beta/b.go': call,
         'beta/b_test.go': test,
     }
+
+
+GIT_ENV = {**os.environ, 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1'}
+
+
+def git(repo: Path, *args: str) -> str:
+    argv = ['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com', *args]
+    return subprocess.run(
+        argv, cwd=repo, check=True, env=GIT_ENV, capture_output=True, text=True
+    ).stdout.strip()
+
+
+class PullRequestBase(Harness):
+    """A pull request's diff starts where its merge ref meets the base branch,
+    not at the event's base SHA, which GitHub leaves at the base branch's tip
+    when the pull request opened."""
+
+    def setUp(self):
+        super().setUp()
+        repo = git_repo(
+            self.tmp / 'pr',
+            {**module('alpha', 'example.com/r/alpha'), **module('beta', 'example.com/r/beta')},
+        )
+        self.repo = repo
+        git(repo, 'checkout', '-qb', 'dev')
+        git(repo, 'commit', '-qm', 'opened on')
+        self.opened = git(repo, 'rev-parse', 'HEAD')
+        git(repo, 'checkout', '-qb', 'topic')
+        (repo / 'alpha' / 'm.go').write_text('package m\n\nvar A = 1\n')
+        git(repo, 'commit', '-qam', 'the pull request changes alpha')
+        git(repo, 'checkout', '-q', 'dev')
+        (repo / 'beta' / 'm.go').write_text('package m\n\nvar B = 1\n')
+        git(repo, 'commit', '-qam', 'dev changes beta after the pull request opened')
+        self.built_on = git(repo, 'rev-parse', 'HEAD')
+        git(repo, 'checkout', '-q', '--detach')
+        git(repo, 'merge', '-q', '--no-ff', '-m', 'merge ref', 'topic')
+        self.merge_ref = git(repo, 'rev-parse', 'HEAD')
+        git(repo, 'update-ref', 'refs/remotes/origin/dev', self.built_on)
+
+    def detect(self, env: dict[str, str]) -> dict[str, str]:
+        body = workflow_step(META, 'Detect repo surfaces', 'detect')['run']
+        body = body.replace('${{ github.event_name }}', 'pull_request')
+        body = body.replace('${{ github.event.pull_request.base.sha }}', self.opened)
+        body = re.sub(r'\$\{\{[^}]*\}\}', '', body)
+        run = self.run_body(body, self.repo, env)
+        self.assertEqual(run.rc, 0, run.out)
+        return run.outputs
+
+    def test_a_base_that_moved_after_the_pull_request_opened_adds_no_module(self):
+        out = self.detect({'GITHUB_BASE_REF': 'dev'})
+        self.assertEqual(json.loads(out['go_nested_dirs']), ['alpha'])
+        self.assertEqual(out['pr_base'], self.built_on)
+
+    def test_a_base_that_moved_after_the_merge_ref_was_built_changes_nothing(self):
+        git(self.repo, 'checkout', '-q', 'dev')
+        (self.repo / 'beta' / 'm.go').write_text('package m\n\nvar B = 2\n')
+        git(self.repo, 'commit', '-qam', 'dev moves again')
+        git(self.repo, 'update-ref', 'refs/remotes/origin/dev', 'HEAD')
+        git(self.repo, 'checkout', '-q', self.merge_ref)
+        out = self.detect({'GITHUB_BASE_REF': 'dev'})
+        self.assertEqual(json.loads(out['go_nested_dirs']), ['alpha'])
+        self.assertEqual(out['pr_base'], self.built_on)
+
+    def test_no_fetched_base_branch_falls_back_to_the_event_base(self):
+        for env in ({}, {'GITHUB_BASE_REF': 'gone'}):
+            with self.subTest(env=env):
+                out = self.detect(env)
+                self.assertEqual(json.loads(out['go_nested_dirs']), ['alpha', 'beta'])
+                self.assertEqual(out['pr_base'], self.opened)
+
+    def test_the_jobs_comparing_with_the_base_read_pr_base(self):
+        jobs = workflow()['jobs']
+        self.assertEqual(
+            jobs['detect']['outputs']['pr_base'], '${{ steps.detect.outputs.pr_base }}'
+        )
+        dashboard = next(s for s in jobs['repo']['steps'] if s.get('name') == 'Dashboard check')
+        self.assertEqual(
+            dashboard['with']['base-ref'],
+            '${{ needs.detect.outputs.pr_base || github.event.before }}',
+        )
+        self.assertEqual(jobs['pr-policy']['needs'], 'detect')
+        intake = next(s for s in jobs['pr-policy']['steps'] if s.get('id') == 'intake')
+        self.assertEqual(
+            intake['with']['base-sha'],
+            '${{ needs.detect.outputs.pr_base || github.event.pull_request.base.sha }}',
+        )
 
 
 # CI must run these, so a runner without Go fails them instead of skipping.

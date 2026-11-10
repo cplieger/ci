@@ -17,7 +17,10 @@ inputs:
     description: owner/name of the repository holding the head branch (`intake`).
     default: ''
   base-sha:
-    description: Base branch tip the pull request event names (`intake`).
+    description: >-
+      A commit of the base branch (`intake`); the head is judged from where it
+      meets this commit. Pass the base branch's current tip: the event's base
+      SHA is its tip when the pull request opened.
     default: ''
   head-sha:
     description: Head commit, present in the working directory's repository (`intake`).

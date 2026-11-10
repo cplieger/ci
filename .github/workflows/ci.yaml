@@ -33,6 +33,7 @@ jobs:
       web_dir: ${{ steps.detect.outputs.web_dir }}
       code_changed: ${{ steps.detect.outputs.code_changed }}
       deadset_targets: ${{ steps.detect.outputs.deadset_targets }}
+      pr_base: ${{ steps.detect.outputs.pr_base }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -76,9 +77,21 @@ jobs:
           diffed=false
           scope_modules=false
           sibling_replaced=false
+          pr_base=""
           case "${{ github.event_name }}" in
             pull_request)
+              # The event's base SHA is the base branch's tip when the pull
+              # request opened, and GitHub does not move it when the base
+              # branch moves, so a diff from it lists every change the base
+              # gained since. Diff from where HEAD meets the base branch's
+              # fetched tip instead: the merge ref's first parent. pr_base
+              # hands the same commit to the jobs that compare with the base.
               base="${{ github.event.pull_request.base.sha }}"
+              if tip=$(git rev-parse -q --verify "refs/remotes/origin/${GITHUB_BASE_REF:-}^{commit}") \
+                && fork=$(git merge-base "$tip" HEAD); then
+                base=$fork
+              fi
+              pr_base=$base
               if git cat-file -e "${base}^{commit}" 2> /dev/null; then
                 changed=$(git diff --name-only --no-renames "$base" HEAD)
                 diffed=true
@@ -399,6 +412,7 @@ jobs:
             echo "web_dir=$web_dir"
             echo "code_changed=$code_changed"
             echo "deadset_targets=$deadset_targets"
+            echo "pr_base=$pr_base"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -930,6 +944,8 @@ jobs:
         if: ${{ hashFiles('grafana-dashboard.json') != '' }}
         continue-on-error: true
         uses: ./.cplieger-ci/actions/dashboard-check
+        with:
+          base-ref: ${{ needs.detect.outputs.pr_base || github.event.before }}
 
       - name: Check results
         if: always()
@@ -1404,6 +1420,8 @@ jobs:
   # the PR title is the changelog line, and `main` takes machine heads only.
   # Soft-gated like the jobs above.
   pr-policy:
+    # detect's pr_base is the intake's base.
+    needs: detect
     if: >-
       ${{ github.event_name == 'pull_request' && github.event.repository.default_branch == 'dev'
       && !github.event.repository.private && !github.event.repository.fork }}
@@ -1446,7 +1464,7 @@ jobs:
           check: intake
           head-ref: ${{ github.head_ref }}
           head-repo: ${{ github.event.pull_request.head.repo.full_name }}
-          base-sha: ${{ github.event.pull_request.base.sha }}
+          base-sha: ${{ needs.detect.outputs.pr_base || github.event.pull_request.base.sha }}
           head-sha: ${{ github.event.pull_request.head.sha }}
 
       # An action that fails before its body runs, or a failed source checkout
