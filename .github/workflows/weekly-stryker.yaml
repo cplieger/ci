@@ -243,8 +243,10 @@ jobs:
           # Vitest Browser Mode needs a real Chromium, enrolled by the
           # `@vitest/browser-playwright` devDependency (same marker as
           # ts-ci.yaml) and installed through the repo's OWN pinned `playwright`
-          # CLI so the build number matches. NOT `--with-deps`: ubuntu-24.04
-          # already carries Chromium's shared libraries. After the enrolment
+          # CLI so the build number matches. NOT `--with-deps`: the runner image
+          # already carries Chromium's shared libraries. Chromium alone, with no
+          # CPLIEGER_BROWSERS: a mutant's verdict does not depend on the engine,
+          # and every engine would multiply the weekly run. After the enrolment
           # gate, because a skipped dir runs no tests; a failed install fails
           # here rather than as a misleading stryker dry-run error.
           if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then

@@ -154,7 +154,7 @@ jobs:
             const shards = Array.from({ length: count }, (_, i) => i + 1);
             appendFileSync(process.env.GITHUB_OUTPUT, `count=${count}\nshards=${JSON.stringify(shards)}\nfloor=${floor}\nnode=${node}\nbrowsers=${browsers.join(",")}\n`);
             console.log(`vitest shards: ${count}`);
-            console.log(`browsers: ${browsers.join(", ")}`);
+            console.log(`browsers (Vitest Browser Mode only): ${browsers.join(", ")}`);
             if (!range) {
               console.log("::notice::package.json declares no engines.node floor; nothing to test beyond the publishing Node");
             } else if (floor === "") {
@@ -176,6 +176,11 @@ jobs:
         shard: ${{ fromJSON(needs.package.outputs.shards) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
+    # The validated engines, for the install and for every vitest run (the
+    # tests, their posttest and the fuzz step): comma-separated in
+    # `chromium,firefox,webkit` order.
+    env:
+      CPLIEGER_BROWSERS: ${{ needs.package.outputs.browsers }}
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -204,24 +209,19 @@ jobs:
       - name: Install deps
         run: npm ci
 
-      # Vitest Browser Mode needs real browsers; enrolment is the package's own
-      # `@vitest/browser-playwright` devDependency, and the engines are the
-      # package job's validated `cplieger.browsers` (Chromium alone by default).
-      # Chromium takes no `--with-deps`: the runner image already carries its
-      # libraries, and the flag's apt fetch (fonts only) has no throughput bound.
-      # Firefox and WebKit need it, since the image lacks their libraries, so the
-      # step's timeout bounds a slow mirror. The repo's pinned `playwright`
-      # (`--no-install`) picks the browser builds its library expects. Not
-      # `--only-shell`: the configs use `channel: "chromium"`. Setup, not a
-      # check, so it sits outside the soft-gate block.
+      # Browser Mode enrols by the `@vitest/browser-playwright` devDependency; the
+      # engines are the validated `cplieger.browsers` in CPLIEGER_BROWSERS. No
+      # `--with-deps` for Chromium: the image carries its libraries, and that apt
+      # fetch has no throughput bound. Firefox and WebKit need it, so the timeout
+      # bounds a slow mirror. The pinned `playwright` (`--no-install`) picks the
+      # builds its library expects; not `--only-shell`, since the configs use
+      # `channel: "chromium"`. Setup, so outside the soft-gate block.
       - name: Install browsers (vitest browser mode)
         timeout-minutes: 10
-        env:
-          BROWSERS: ${{ needs.package.outputs.browsers }}
         run: |
           if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
             with_deps=()
-            IFS=, read -ra engines <<< "${BROWSERS:-chromium}"
+            IFS=, read -ra engines <<< "$CPLIEGER_BROWSERS"
             for engine in "${engines[@]}"; do
               case "$engine" in
                 chromium) npx --no-install playwright install chromium ;;
@@ -294,9 +294,6 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
           SHARDS: ${{ needs.package.outputs.count }}
-          # The validated engines, for a vitest config that runs Browser Mode in
-          # each: `chromium,firefox,webkit` order, comma-separated.
-          CPLIEGER_BROWSERS: ${{ needs.package.outputs.browsers }}
         run: |
           (
             if [ "$SHARDS" -eq 1 ]; then
@@ -598,6 +595,9 @@ jobs:
         shard: ${{ fromJSON(needs.package.outputs.shards) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
+    # The same engines as validate's, for its install and tests.
+    env:
+      CPLIEGER_BROWSERS: ${{ needs.package.outputs.browsers }}
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -623,12 +623,10 @@ jobs:
       # browsers on the floor too.
       - name: Install browsers (vitest browser mode)
         timeout-minutes: 10
-        env:
-          BROWSERS: ${{ needs.package.outputs.browsers }}
         run: |
           if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
             with_deps=()
-            IFS=, read -ra engines <<< "${BROWSERS:-chromium}"
+            IFS=, read -ra engines <<< "$CPLIEGER_BROWSERS"
             for engine in "${engines[@]}"; do
               case "$engine" in
                 chromium) npx --no-install playwright install chromium ;;
@@ -651,7 +649,6 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
           SHARDS: ${{ needs.package.outputs.count }}
-          CPLIEGER_BROWSERS: ${{ needs.package.outputs.browsers }}
         run: |
           if [ "$SHARDS" -eq 1 ]; then
             npm test

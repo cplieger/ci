@@ -321,7 +321,15 @@ class PackageSettings(Harness):
                 run = self.read(manifest)
                 self.assertEqual(run.rc, 0, run.out)
                 self.assertEqual(run.outputs['browsers'], 'chromium')
-                self.assertIn('browsers: chromium', run.out)
+                self.assertIn('browsers (Vitest Browser Mode only): chromium', run.out)
+
+    def test_a_browsers_key_inherited_through_the_prototype_is_not_read(self):
+        # JSON.parse keeps `__proto__` as an own key, so only a refactor that
+        # copies the object into another (Object.assign, a spread into defaults)
+        # would make it a prototype and let its browsers through.
+        run = self.read(raw='{"cplieger": {"__proto__": {"browsers": ["firefox", "webkit"]}}}')
+        self.assertEqual(run.rc, 0, run.out)
+        self.assertEqual(run.outputs['browsers'], 'chromium')
 
     def test_the_browsers_listed_are_passed_in_one_fixed_order(self):
         for listed, want in (
@@ -454,48 +462,45 @@ class InstallStep(Harness):
     def install(self, browsers: str, enrolled: bool = True):
         dev = {'@vitest/browser-playwright': '5.1.0'} if enrolled else {}
         (self.pkg / 'package.json').write_text(json.dumps({'name': 'f', 'devDependencies': dev}))
-        return self.run_step({'BROWSERS': browsers})
+        return self.run_step({'CPLIEGER_BROWSERS': browsers})
 
     def test_both_jobs_run_the_same_install_on_the_read_engines(self):
         floor = workflow_step(TS_CI, 'engines-floor', INSTALL_STEP)
         self.assertEqual(floor, self.STEP)
-        self.assertEqual(self.STEP['env'], {'BROWSERS': '${{ needs.package.outputs.browsers }}'})
+        self.assertNotIn('env', self.STEP)
         self.assertEqual(self.STEP['timeout-minutes'], 10)
         jobs = ts_ci()['jobs']
         for job in SHARDED:
             with self.subTest(job=job):
+                # The job carries the list, so the install, the tests, their
+                # posttest and the fuzz step read one value.
+                self.assertEqual(
+                    jobs[job]['env'], {'CPLIEGER_BROWSERS': '${{ needs.package.outputs.browsers }}'}
+                )
+                for step in jobs[job]['steps']:
+                    self.assertNotIn('CPLIEGER_BROWSERS', step.get('env') or {}, step.get('name'))
                 names = [step.get('name') for step in jobs[job]['steps']]
                 self.assertLess(names.index('Install deps'), names.index(INSTALL_STEP))
                 self.assertLess(names.index(INSTALL_STEP), names.index(SHARDED[job]))
 
-    def test_chromium_installs_without_the_system_libraries(self):
-        run = self.install('chromium')
-        self.assertEqual(run.rc, 0, run.out)
-        self.assertEqual(run.logged('npx'), '--no-install playwright install chromium\n')
-
-    def test_firefox_and_webkit_install_with_their_system_libraries_in_one_call(self):
+    def test_each_list_installs_chromium_alone_and_the_rest_with_their_libraries(self):
+        chromium = '--no-install playwright install chromium\n'
         for browsers, want in (
+            ('chromium', chromium),
             (
                 'chromium,firefox,webkit',
-                'chromium\n--no-install playwright install --with-deps firefox webkit\n',
+                chromium + '--no-install playwright install --with-deps firefox webkit\n',
             ),
-            ('firefox', None),
-            ('webkit', None),
+            ('chromium,webkit', chromium + '--no-install playwright install --with-deps webkit\n'),
+            ('firefox,webkit', '--no-install playwright install --with-deps firefox webkit\n'),
+            ('firefox', '--no-install playwright install --with-deps firefox\n'),
+            ('webkit', '--no-install playwright install --with-deps webkit\n'),
         ):
             with self.subTest(browsers=browsers):
                 (self.tmp / 'log' / 'npx').unlink(missing_ok=True)
                 run = self.install(browsers)
                 self.assertEqual(run.rc, 0, run.out)
-                if want is None:
-                    want = f'--no-install playwright install --with-deps {browsers}\n'
-                else:
-                    want = '--no-install playwright install ' + want
                 self.assertEqual(run.logged('npx'), want)
-
-    def test_an_empty_list_installs_chromium(self):
-        run = self.install('')
-        self.assertEqual(run.rc, 0, run.out)
-        self.assertEqual(run.logged('npx'), '--no-install playwright install chromium\n')
 
     def test_a_package_outside_browser_mode_installs_nothing(self):
         run = self.install('chromium,firefox', enrolled=False)
@@ -555,11 +560,7 @@ class TestStep(Harness):
     def test_the_step_takes_its_shard_and_the_read_count(self):
         self.assertEqual(
             self.STEP['env'],
-            {
-                'SHARD': '${{ matrix.shard }}',
-                'SHARDS': '${{ needs.package.outputs.count }}',
-                'CPLIEGER_BROWSERS': '${{ needs.package.outputs.browsers }}',
-            },
+            {'SHARD': '${{ matrix.shard }}', 'SHARDS': '${{ needs.package.outputs.count }}'},
         )
 
     def test_unsharded_runs_the_test_script_as_it_stands(self):
