@@ -214,7 +214,7 @@ jobs:
               [ "$old" != "$new" ]
             }
 
-            CHANGED="$(git diff --name-only "${LAST_TAG}..HEAD")"
+            CHANGED="$(git diff --name-only --no-renames "${LAST_TAG}..HEAD")"
             echo "Changed files since ${LAST_TAG}:"
             echo "$CHANGED" | awk '{ print "  " $0 }'
 

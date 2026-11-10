@@ -31,6 +31,10 @@ An edit to `docs/monitoring.md` alone still runs the `alerts` job, so it meets t
 
 `go-ci.yaml` runs with `GOWORK=off`, so each module builds against the versions of the other modules that its `go.mod` names, as a consumer's build does. A module that starts using a change to another module of the repository therefore fails its `go-nested` job until that module's change is tagged and the `require` names the tag. The `go-work` job catches the opposite case: a change to one module that breaks another fails there, before either is tagged.
 
+On a pull request in a repository with no root `go.mod`, `go-nested`, `go-os` and `ts-nested` run only for the modules the pull request changes. A moved file counts for both the module it left and the one it entered. Each leg builds against the other modules' tags, so a change to one module cannot change another module's result there. `go-work` still runs for every module.
+
+A changed file outside every module folder keeps every module, unless its path ends in `.md` or is `LICENSE` or `.gitignore` at the root. So does a module that replaces another, or a symlink into another module. A push, such as the merge into `dev`, runs every module.
+
 In `cplieger/ci` itself, a `go-os-canary` job runs `go-os-ci.yaml` over public Go modules that track Windows or macOS files, at fixed commits, on each runner detection selects for them. A change to that workflow or its pins that breaks a real module's Windows or macOS leg fails that job before a release carries it.
 
 After the `amd64` build, the `docker` job runs two optional image tests. The shared smoke harness runs when the repository has `tests/image-smoke.conf`. A repository's own `tests/image-test.sh` runs with the image reference as its first argument, and it must be committed as executable. The release workflow runs both again on every image it builds, as [the release workflow](#the-release-workflow) describes.

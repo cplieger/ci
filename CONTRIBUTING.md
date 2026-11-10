@@ -21,7 +21,7 @@ The [shared contributing rules](https://github.com/cplieger/.github/blob/main/CO
 
 ## Checks
 
-- Most jobs run on `ubuntu-26.04`, whose `sort` rejects an attached separator such as `-t=` and prints nothing. Write `sort -t '='` or use `awk`, because a probe that passes with GNU `sort` locally can read empty output in CI.
+- Most jobs run on `ubuntu-26.04`, whose `sort` and `realpath` differ from GNU's, so a probe that passes locally can fail in CI. `sort` rejects an attached separator such as `-t=` and prints nothing: write `sort -t '='`. `realpath -m` exits 1 on a symlink loop: test its status under `set -e`.
 
 ## Releases
 
