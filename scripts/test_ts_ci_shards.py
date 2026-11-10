@@ -323,10 +323,11 @@ class PackageSettings(Harness):
                 self.assertEqual(run.outputs['browsers'], 'chromium')
                 self.assertIn('browsers (Vitest Browser Mode only): chromium', run.out)
 
-    def test_a_browsers_key_inherited_through_the_prototype_is_not_read(self):
-        # JSON.parse keeps `__proto__` as an own key, so only a refactor that
-        # copies the object into another (Object.assign, a spread into defaults)
-        # would make it a prototype and let its browsers through.
+    def test_a_browsers_key_under_proto_is_not_read(self):
+        # JSON.parse keeps `__proto__` as an own key, so today the read never
+        # sees these browsers. The case fails only if a refactor both copies the
+        # object with Object.assign, which turns the key into a prototype, and
+        # reads `browsers` without Object.hasOwn; a spread keeps the key its own.
         run = self.read(raw='{"cplieger": {"__proto__": {"browsers": ["firefox", "webkit"]}}}')
         self.assertEqual(run.rc, 0, run.out)
         self.assertEqual(run.outputs['browsers'], 'chromium')
@@ -487,6 +488,10 @@ class InstallStep(Harness):
         chromium = '--no-install playwright install chromium\n'
         for browsers, want in (
             ('chromium', chromium),
+            (
+                'chromium,firefox',
+                chromium + '--no-install playwright install --with-deps firefox\n',
+            ),
             (
                 'chromium,firefox,webkit',
                 chromium + '--no-install playwright install --with-deps firefox webkit\n',
