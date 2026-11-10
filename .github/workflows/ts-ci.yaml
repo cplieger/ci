@@ -28,8 +28,9 @@ permissions:
 jobs:
   # A matrix or a job condition cannot read a file, so this job reads the
   # package's own settings once: its vitest shard count (`cplieger.vitestShards`,
-  # which sync never writes) for `validate` and `engines-floor`, and its
-  # `engines.node` floor for `engines-floor`. The values are the checked-out
+  # which sync never writes) and its browsers (`cplieger.browsers`) for
+  # `validate` and `engines-floor`, and its `engines.node` floor for
+  # `engines-floor`. The values are the checked-out
   # branch's, so they are untrusted: only what this script validated reaches
   # the outputs.
   package:
@@ -41,6 +42,7 @@ jobs:
       shards: ${{ steps.read.outputs.shards }}
       floor: ${{ steps.read.outputs.floor }}
       node: ${{ steps.read.outputs.node }}
+      browsers: ${{ steps.read.outputs.browsers }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,7 +64,7 @@ jobs:
           # Keep in step with validate's Setup Node.js.
           node-version: '26'
 
-      - name: Read cplieger.vitestShards and engines.node
+      - name: Read cplieger.vitestShards, cplieger.browsers and engines.node
         id: read
         env:
           PACKAGE: ${{ inputs.working-directory }}/package.json
@@ -89,6 +91,20 @@ jobs:
                 const shown = JSON.stringify(count).slice(0, 40);
                 fail(`cplieger.vitestShards is ${shown}: it must be an integer from 1 to 100`);
               }
+            }
+            // The engines Vitest Browser Mode runs in, in this fixed order
+            // whatever order the list gives, so the install and the tests
+            // never depend on how the branch spelled it.
+            const engines = ["chromium", "firefox", "webkit"];
+            let browsers = ["chromium"];
+            if (own !== undefined && Object.hasOwn(own, "browsers")) {
+              const list = own.browsers;
+              if (!Array.isArray(list) || list.length === 0 || new Set(list).size !== list.length
+                || !list.every((b) => engines.includes(b))) {
+                const shown = JSON.stringify(list).slice(0, 60);
+                fail(`cplieger.browsers is ${shown}: it must be a non-empty list of unique names from chromium, firefox and webkit`);
+              }
+              browsers = engines.filter((b) => list.includes(b));
             }
             // The floor is the major of the oldest version engines.node allows,
             // as the semver library npm bundles beside this Node reads it
@@ -136,8 +152,9 @@ jobs:
               }
             }
             const shards = Array.from({ length: count }, (_, i) => i + 1);
-            appendFileSync(process.env.GITHUB_OUTPUT, `count=${count}\nshards=${JSON.stringify(shards)}\nfloor=${floor}\nnode=${node}\n`);
+            appendFileSync(process.env.GITHUB_OUTPUT, `count=${count}\nshards=${JSON.stringify(shards)}\nfloor=${floor}\nnode=${node}\nbrowsers=${browsers.join(",")}\n`);
             console.log(`vitest shards: ${count}`);
+            console.log(`browsers (Vitest Browser Mode only): ${browsers.join(", ")}`);
             if (!range) {
               console.log("::notice::package.json declares no engines.node floor; nothing to test beyond the publishing Node");
             } else if (floor === "") {
@@ -159,6 +176,11 @@ jobs:
         shard: ${{ fromJSON(needs.package.outputs.shards) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
+    # The validated engines, for the install and for every vitest run (the
+    # tests, their posttest and the fuzz step): comma-separated in
+    # `chromium,firefox,webkit` order.
+    env:
+      CPLIEGER_BROWSERS: ${{ needs.package.outputs.browsers }}
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -187,17 +209,32 @@ jobs:
       - name: Install deps
         run: npm ci
 
-      # Vitest Browser Mode needs a real Chromium; enrolment is the package's own
-      # `@vitest/browser-playwright` devDependency. No `--with-deps`: the runner
-      # image already carries Chromium's libraries, and the flag's apt fetch (fonts
-      # only) has no throughput bound, so a slow mirror can outlast the job. The
-      # repo's pinned `playwright` (`--no-install`) picks the browser build its
-      # library expects. Not `--only-shell`: the configs use `channel: "chromium"`.
-      # Setup, not a check, so it sits outside the soft-gate block.
-      - name: Install browser (vitest browser mode)
+      # Browser Mode enrols by the `@vitest/browser-playwright` devDependency; the
+      # engines are the validated `cplieger.browsers` in CPLIEGER_BROWSERS. No
+      # `--with-deps` for Chromium: the image carries its libraries, and that apt
+      # fetch has no throughput bound. Firefox and WebKit need it, so the timeout
+      # bounds a slow mirror. The pinned `playwright` (`--no-install`) picks the
+      # builds its library expects; not `--only-shell`, since the configs use
+      # `channel: "chromium"`. Setup, so outside the soft-gate block.
+      - name: Install browsers (vitest browser mode)
+        timeout-minutes: 10
         run: |
           if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
-            npx --no-install playwright install chromium
+            with_deps=()
+            IFS=, read -ra engines <<< "$CPLIEGER_BROWSERS"
+            for engine in "${engines[@]}"; do
+              case "$engine" in
+                chromium) npx --no-install playwright install chromium ;;
+                firefox | webkit) with_deps+=("$engine") ;;
+                *)
+                  echo "::error::unknown browser engine '${engine}'"
+                  exit 1
+                  ;;
+              esac
+            done
+            if [ "${#with_deps[@]}" -gt 0 ]; then
+              npx --no-install playwright install --with-deps "${with_deps[@]}"
+            fi
           else
             echo "no @vitest/browser-playwright devDependency; skipping browser install"
           fi
@@ -558,6 +595,9 @@ jobs:
         shard: ${{ fromJSON(needs.package.outputs.shards) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
+    # The same engines as validate's, for its install and tests.
+    env:
+      CPLIEGER_BROWSERS: ${{ needs.package.outputs.browsers }}
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -578,6 +618,31 @@ jobs:
 
       - name: Install deps
         run: npm ci
+
+      # The same install as validate's, so a browser-mode suite finds its
+      # browsers on the floor too.
+      - name: Install browsers (vitest browser mode)
+        timeout-minutes: 10
+        run: |
+          if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
+            with_deps=()
+            IFS=, read -ra engines <<< "$CPLIEGER_BROWSERS"
+            for engine in "${engines[@]}"; do
+              case "$engine" in
+                chromium) npx --no-install playwright install chromium ;;
+                firefox | webkit) with_deps+=("$engine") ;;
+                *)
+                  echo "::error::unknown browser engine '${engine}'"
+                  exit 1
+                  ;;
+              esac
+            done
+            if [ "${#with_deps[@]}" -gt 0 ]; then
+              npx --no-install playwright install --with-deps "${with_deps[@]}"
+            fi
+          else
+            echo "no @vitest/browser-playwright devDependency; skipping browser install"
+          fi
 
       # The same hand-off as validate's test step, without its soft gate.
       - name: Test (vitest) on the engines floor

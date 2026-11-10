@@ -18,7 +18,8 @@ from test_deadset_steps import META
 from test_package_script_steps import WORKFLOWS, Harness, workflow_step
 
 TS_CI = WORKFLOWS / 'ts-ci.yaml'
-READ_STEP = 'Read cplieger.vitestShards and engines.node'
+READ_STEP = 'Read cplieger.vitestShards, cplieger.browsers and engines.node'
+INSTALL_STEP = 'Install browsers (vitest browser mode)'
 # The jobs that run the vitest suite, each split by the read count, with its
 # test step.
 SHARDED = {'validate': 'Test (vitest)', 'engines-floor': 'Test (vitest) on the engines floor'}
@@ -40,13 +41,20 @@ def evaluate(template: str, contexts: dict):
     return wr.Scope(contexts, {}, []).evaluate(whole.group(1))
 
 
-def counted(count: int | None, result: str = 'success', floor: str = '24', node: str = '>=24.0.0 <25.0.0-0') -> dict:
+def counted(
+    count: int | None, result: str = 'success', floor: str = '24', node: str = '>=24.0.0 <25.0.0-0'
+) -> dict:
     """The needs context for the package job: outputs as the read step writes
     them, or none when it failed."""
     outputs = (
         {}
         if count is None
-        else {'count': str(count), 'shards': json.dumps(list(range(1, count + 1))), 'floor': floor, 'node': node}
+        else {
+            'count': str(count),
+            'shards': json.dumps(list(range(1, count + 1))),
+            'floor': floor,
+            'node': node,
+        }
     )
     return {'package': {'result': result, 'outputs': outputs}}
 
@@ -59,13 +67,17 @@ class PackageSettings(Harness):
             (self.pkg / 'package.json').write_text(raw)
         elif manifest is not None:
             (self.pkg / 'package.json').write_text(json.dumps(manifest))
-        return self.run_step({'READ_PACKAGE': self.STEP['env']['READ_PACKAGE'], 'PACKAGE': './package.json'})
+        return self.run_step(
+            {'READ_PACKAGE': self.STEP['env']['READ_PACKAGE'], 'PACKAGE': './package.json'}
+        )
 
     def assert_refused(self, run, message: str):
         self.assertEqual(run.rc, 1, run.out)
         self.assertIn(message, run.out)
         self.assertEqual(run.outputs, {})
-        self.assertEqual([line for line in run.out.splitlines() if line.startswith('::')], [run.out.strip()])
+        self.assertEqual(
+            [line for line in run.out.splitlines() if line.startswith('::')], [run.out.strip()]
+        )
 
     def floor(self, node: object) -> str:
         run = self.read({'engines': {'node': node}})
@@ -83,10 +95,18 @@ class PackageSettings(Harness):
         validate_setup = workflow_step(TS_CI, 'validate', 'Setup Node.js')
         self.assertEqual(setup['uses'], validate_setup['uses'])
         # No cache, and automatic caching off: the job installs no packages.
-        self.assertEqual(setup['with'], {'node-version': validate_setup['with']['node-version'], 'package-manager-cache': False})
+        self.assertEqual(
+            setup['with'],
+            {
+                'node-version': validate_setup['with']['node-version'],
+                'package-manager-cache': False,
+            },
+        )
 
     def test_the_step_reads_the_working_directory_package(self):
-        self.assertEqual(self.STEP['env']['PACKAGE'], '${{ inputs.working-directory }}/package.json')
+        self.assertEqual(
+            self.STEP['env']['PACKAGE'], '${{ inputs.working-directory }}/package.json'
+        )
         self.assertNotIn('defaults', ts_ci()['jobs']['package'])
 
     def test_a_package_without_the_field_runs_one_shard(self):
@@ -94,7 +114,16 @@ class PackageSettings(Harness):
             with self.subTest(manifest=manifest):
                 run = self.read(manifest)
                 self.assertEqual(run.rc, 0, run.out)
-                self.assertEqual(run.outputs, {'count': '1', 'shards': '[1]', 'floor': '', 'node': ''})
+                self.assertEqual(
+                    run.outputs,
+                    {
+                        'count': '1',
+                        'shards': '[1]',
+                        'floor': '',
+                        'node': '',
+                        'browsers': 'chromium',
+                    },
+                )
 
     def test_a_count_from_one_to_one_hundred_lists_every_shard_once(self):
         for count in (1, 2, 100):
@@ -165,12 +194,23 @@ class PackageSettings(Harness):
                 self.assertIn('::notice::package.json declares no engines.node floor', run.out)
 
     def test_a_floor_below_node_4_means_no_floor_with_its_own_notice(self):
-        for node, major in (('*', 0), ('>=0.0.0', 0), ('>=0.12', 0), ('<26', 0), ('^22 || *', 0), ('>=1', 1), ('^3', 3)):
+        for node, major in (
+            ('*', 0),
+            ('>=0.0.0', 0),
+            ('>=0.12', 0),
+            ('<26', 0),
+            ('^22 || *', 0),
+            ('>=1', 1),
+            ('^3', 3),
+        ):
             with self.subTest(node=node):
                 run = self.read({'engines': {'node': node}})
                 self.assertEqual(run.rc, 0, run.out)
                 self.assertEqual(run.outputs['floor'], '')
-                self.assertIn(f'::notice::engines.node {json.dumps(node)} allows Node {major}, older than any Node release from 4 on', run.out)
+                self.assertIn(
+                    f'::notice::engines.node {json.dumps(node)} allows Node {major}, older than any Node release from 4 on',
+                    run.out,
+                )
                 self.assertEqual(run.outputs['node'], '')
 
     def test_an_invalid_range_fails_the_job(self):
@@ -183,7 +223,9 @@ class PackageSettings(Harness):
     def test_a_range_no_version_satisfies_fails_the_job(self):
         for node in ('>=22 <22', '22 - 20', '^18 >=20'):
             with self.subTest(node=node):
-                self.assert_refused(self.read({'engines': {'node': node}}), 'no version satisfies it')
+                self.assert_refused(
+                    self.read({'engines': {'node': node}}), 'no version satisfies it'
+                )
 
     def test_setup_node_gets_the_range_kept_within_the_floor_major(self):
         """setup-node installs the newest release its spec allows, so the spec
@@ -198,7 +240,11 @@ class PackageSettings(Harness):
             with self.subTest(node=node):
                 spec = self.read({'engines': {'node': node}}).outputs['node']
                 self.assertNotIn('\n', spec)
-                self.assertEqual(self.satisfied(spec, inside + outside), [True] * len(inside) + [False] * len(outside), spec)
+                self.assertEqual(
+                    self.satisfied(spec, inside + outside),
+                    [True] * len(inside) + [False] * len(outside),
+                    spec,
+                )
 
     def satisfied(self, spec: str, versions: list[str]) -> list[bool]:
         """Which versions npm's semver says spec allows."""
@@ -207,7 +253,12 @@ class PackageSettings(Harness):
             'const s = require(p.join(p.dirname(process.execPath), "..", "lib", "node_modules", "npm", "node_modules", "semver"));'
             'console.log(JSON.stringify(JSON.parse(process.argv[2]).map((v) => s.satisfies(v, process.argv[1]))));'
         )
-        out = subprocess.run([shutil.which('node'), '-e', script, spec, json.dumps(versions)], capture_output=True, text=True, check=True)
+        out = subprocess.run(
+            [shutil.which('node'), '-e', script, spec, json.dumps(versions)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         return json.loads(out.stdout)
 
     def test_a_semver_that_cannot_be_loaded_fails_the_job(self):
@@ -215,7 +266,13 @@ class PackageSettings(Harness):
         preload = self.tmp / 'no-npm.js'
         preload.write_text('process.execPath = "/nonexistent/bin/node";\n')
         (self.pkg / 'package.json').write_text(json.dumps({'engines': {'node': '>=24'}}))
-        run = self.run_step({'READ_PACKAGE': self.STEP['env']['READ_PACKAGE'], 'PACKAGE': './package.json', 'NODE_OPTIONS': f'--require={preload}'})
+        run = self.run_step(
+            {
+                'READ_PACKAGE': self.STEP['env']['READ_PACKAGE'],
+                'PACKAGE': './package.json',
+                'NODE_OPTIONS': f'--require={preload}',
+            }
+        )
         self.assert_refused(run, 'cannot load the semver library npm bundles')
 
     def test_a_long_range_is_cut(self):
@@ -237,7 +294,9 @@ class PackageSettings(Harness):
         run = self.read({'cplieger': {'vitestShards': 2}, 'engines': {'node': '>=22'}})
         job = ts_ci()['jobs']['package']
         steps = {self.STEP['id']: {'outputs': run.outputs}}
-        self.assertEqual({k: evaluate(v, {'steps': steps}) for k, v in job['outputs'].items()}, run.outputs)
+        self.assertEqual(
+            {k: evaluate(v, {'steps': steps}) for k, v in job['outputs'].items()}, run.outputs
+        )
 
     def test_a_floor_is_logged_without_a_notice(self):
         run = self.read({'engines': {'node': '>=24'}})
@@ -247,12 +306,60 @@ class PackageSettings(Harness):
     def test_an_engines_node_that_is_not_a_string_fails_the_job(self):
         for value in (24, 0, False, ['>=24'], {'min': 24}, True):
             with self.subTest(value=value):
-                self.assert_refused(self.read({'engines': {'node': value}}), 'it must be a version range string')
+                self.assert_refused(
+                    self.read({'engines': {'node': value}}), 'it must be a version range string'
+                )
 
     def test_a_long_value_is_cut_in_the_error(self):
         run = self.read({'cplieger': {'vitestShards': 'x' * 500}})
         self.assert_refused(run, 'it must be an integer from 1 to 100')
         self.assertLess(len(run.out), 200)
+
+    def test_a_package_without_browsers_runs_chromium(self):
+        for manifest in ({}, {'cplieger': {'vitestShards': 2}}):
+            with self.subTest(manifest=manifest):
+                run = self.read(manifest)
+                self.assertEqual(run.rc, 0, run.out)
+                self.assertEqual(run.outputs['browsers'], 'chromium')
+                self.assertIn('browsers (Vitest Browser Mode only): chromium', run.out)
+
+    def test_a_browsers_key_under_proto_is_not_read(self):
+        # JSON.parse keeps `__proto__` as an own key, so today the read never
+        # sees these browsers. The case fails only if a refactor both copies the
+        # object with Object.assign, which turns the key into a prototype, and
+        # reads `browsers` without Object.hasOwn; a spread keeps the key its own.
+        run = self.read(raw='{"cplieger": {"__proto__": {"browsers": ["firefox", "webkit"]}}}')
+        self.assertEqual(run.rc, 0, run.out)
+        self.assertEqual(run.outputs['browsers'], 'chromium')
+
+    def test_the_browsers_listed_are_passed_in_one_fixed_order(self):
+        for listed, want in (
+            (['chromium', 'firefox', 'webkit'], 'chromium,firefox,webkit'),
+            (['webkit', 'chromium'], 'chromium,webkit'),
+            (['firefox'], 'firefox'),
+        ):
+            with self.subTest(listed=listed):
+                run = self.read({'cplieger': {'browsers': listed}})
+                self.assertEqual(run.rc, 0, run.out)
+                self.assertEqual(run.outputs['browsers'], want)
+
+    def test_a_browsers_value_that_is_not_a_list_of_known_engines_fails_the_job(self):
+        for value in (
+            [],
+            'chromium',
+            ['chromium', 'chromium'],
+            ['safari'],
+            ['Chromium'],
+            [1],
+            None,
+            {'chromium': True},
+            ['chromium\n::add-mask::x'],
+        ):
+            with self.subTest(value=value):
+                self.assert_refused(
+                    self.read({'cplieger': {'browsers': value}}),
+                    'it must be a non-empty list of unique names from chromium, firefox and webkit',
+                )
 
 
 class ShardMatrix(unittest.TestCase):
@@ -264,11 +371,18 @@ class ShardMatrix(unittest.TestCase):
                 matrix = spec['strategy']['matrix']['shard']
                 for count in (1, 2, 100):
                     with self.subTest(count=count):
-                        self.assertEqual(evaluate(matrix, {'needs': counted(count)}), list(range(1, count + 1)))
+                        self.assertEqual(
+                            evaluate(matrix, {'needs': counted(count)}), list(range(1, count + 1))
+                        )
 
     def test_only_the_sharded_jobs_run_vitest(self):
         jobs = ts_ci()['jobs']
-        running = {job for job, spec in jobs.items() for step in spec.get('steps', []) if 'npm test' in step.get('run', '')}
+        running = {
+            job
+            for job, spec in jobs.items()
+            for step in spec.get('steps', [])
+            if 'npm test' in step.get('run', '')
+        }
         self.assertEqual(running, set(SHARDED))
 
     def test_the_count_is_no_longer_an_input(self):
@@ -329,8 +443,84 @@ def running_steps(shard: int) -> list[str]:
     return [s['name'] for s in ts_ci()['jobs']['validate']['steps'] if scope.condition(s.get('if'))]
 
 
+# Logs each playwright install, so a test sees which engines were asked for.
+NPX_PLAYWRIGHT_STUB = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$STUB_LOG/npx"
+"""
+
+
+class InstallStep(Harness):
+    """The browser install both test jobs run before their tests."""
+
+    STEP = workflow_step(TS_CI, 'validate', INSTALL_STEP)
+
+    def setUp(self):
+        super().setUp()
+        (self.bin / 'npx').unlink()
+        (self.bin / 'npx').write_text(NPX_PLAYWRIGHT_STUB)
+        (self.bin / 'npx').chmod(0o755)
+
+    def install(self, browsers: str, enrolled: bool = True):
+        dev = {'@vitest/browser-playwright': '5.1.0'} if enrolled else {}
+        (self.pkg / 'package.json').write_text(json.dumps({'name': 'f', 'devDependencies': dev}))
+        return self.run_step({'CPLIEGER_BROWSERS': browsers})
+
+    def test_both_jobs_run_the_same_install_on_the_read_engines(self):
+        floor = workflow_step(TS_CI, 'engines-floor', INSTALL_STEP)
+        self.assertEqual(floor, self.STEP)
+        self.assertNotIn('env', self.STEP)
+        self.assertEqual(self.STEP['timeout-minutes'], 10)
+        jobs = ts_ci()['jobs']
+        for job in SHARDED:
+            with self.subTest(job=job):
+                # The job carries the list, so the install, the tests, their
+                # posttest and the fuzz step read one value.
+                self.assertEqual(
+                    jobs[job]['env'], {'CPLIEGER_BROWSERS': '${{ needs.package.outputs.browsers }}'}
+                )
+                for step in jobs[job]['steps']:
+                    self.assertNotIn('CPLIEGER_BROWSERS', step.get('env') or {}, step.get('name'))
+                names = [step.get('name') for step in jobs[job]['steps']]
+                self.assertLess(names.index('Install deps'), names.index(INSTALL_STEP))
+                self.assertLess(names.index(INSTALL_STEP), names.index(SHARDED[job]))
+
+    def test_each_list_installs_chromium_alone_and_the_rest_with_their_libraries(self):
+        chromium = '--no-install playwright install chromium\n'
+        for browsers, want in (
+            ('chromium', chromium),
+            (
+                'chromium,firefox',
+                chromium + '--no-install playwright install --with-deps firefox\n',
+            ),
+            (
+                'chromium,firefox,webkit',
+                chromium + '--no-install playwright install --with-deps firefox webkit\n',
+            ),
+            ('chromium,webkit', chromium + '--no-install playwright install --with-deps webkit\n'),
+            ('firefox,webkit', '--no-install playwright install --with-deps firefox webkit\n'),
+            ('firefox', '--no-install playwright install --with-deps firefox\n'),
+            ('webkit', '--no-install playwright install --with-deps webkit\n'),
+        ):
+            with self.subTest(browsers=browsers):
+                (self.tmp / 'log' / 'npx').unlink(missing_ok=True)
+                run = self.install(browsers)
+                self.assertEqual(run.rc, 0, run.out)
+                self.assertEqual(run.logged('npx'), want)
+
+    def test_a_package_outside_browser_mode_installs_nothing(self):
+        run = self.install('chromium,firefox', enrolled=False)
+        self.assertEqual(run.rc, 0, run.out)
+        self.assertEqual(run.logged('npx'), '')
+        self.assertIn('skipping browser install', run.out)
+
+    def test_an_unknown_engine_fails_the_step(self):
+        run = self.install('chromium,safari')
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn("::error::unknown browser engine 'safari'", run.out)
+
+
 class ShardSteps(unittest.TestCase):
-    SETUP = ('Checkout', 'Setup Node.js', 'Install deps', 'Install browser (vitest browser mode)')
+    SETUP = ('Checkout', 'Setup Node.js', 'Install deps', INSTALL_STEP)
 
     def test_a_later_shard_runs_only_the_setup_its_tests_and_the_verdict(self):
         self.assertEqual(running_steps(2), [*self.SETUP, 'Test (vitest)', 'Check results'])
@@ -442,7 +632,9 @@ class FloorShardSteps(unittest.TestCase):
     def test_the_floor_job_runs_on_the_read_node_spec(self):
         setup = workflow_step(TS_CI, 'engines-floor', 'Setup Node.js')
         needs = counted(2, floor='22', node='>=22.0.0 <23.0.0-0')
-        self.assertEqual(evaluate(setup['with']['node-version'], {'needs': needs}), '>=22.0.0 <23.0.0-0')
+        self.assertEqual(
+            evaluate(setup['with']['node-version'], {'needs': needs}), '>=22.0.0 <23.0.0-0'
+        )
 
 
 class MetaPassesNoCount(unittest.TestCase):
@@ -469,8 +661,13 @@ class SetupNodeCaching(unittest.TestCase):
                         continue
                     with self.subTest(workflow=path.name, job=job, step=step.get('name')):
                         given = step.get('with') or {}
-                        if given.get('cache') != 'npm' and given.get('package-manager-cache') is not False:
-                            self.fail(f'{given} neither sets cache: npm nor package-manager-cache: false')
+                        if (
+                            given.get('cache') != 'npm'
+                            and given.get('package-manager-cache') is not False
+                        ):
+                            self.fail(
+                                f'{given} neither sets cache: npm nor package-manager-cache: false'
+                            )
 
 
 if __name__ == '__main__':
