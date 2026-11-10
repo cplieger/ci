@@ -618,9 +618,11 @@ manifest() { # <file prefix>
 }
 case "$url" in
   https://ghcr.io/token\?scope=repository:o/app:pull | https://ghcr.io/token\?scope=repository:o/app/dashboard:pull \
+    | https://ghcr.io/token\?scope=repository:o/app/dashboard-messages:pull \
     | "https://auth.docker.io/token?service=registry.docker.io&scope=repository:o/app:pull") emit '{"token":"stub"}' ;;
   https://ghcr.io/v2/o/app/manifests/*) manifest manifest ;;
   https://ghcr.io/v2/o/app/dashboard/manifests/*) manifest dash-manifest ;;
+  https://ghcr.io/v2/o/app/dashboard-messages/manifests/*) manifest dashm-manifest ;;
   https://registry-1.docker.io/v2/o/app/manifests/*) manifest hub-manifest ;;
   *)
     # $CURL_DIR/docs holds "<url> <body>" lines, $CURL_DIR/down URLs that do not connect.
@@ -1396,9 +1398,9 @@ echo "$IMG_E $PT" >"$COSIGN_DIR/attested"
 PC=$(commit_in "$P" "chore(sync): update shared files" .editorconfig=x)
 printf '%s\n' "$DASH $PC" "$IMG_E $PT" >"$COSIGN_DIR/signed"
 chk "R13 a dashboard re-pushed from a later main commit reads back" "$(RB_DIR=$P readback docker v2.0.0)" "ok"
-chk "R30 a dashboard file git cannot read is refused, not read as absent" \
-  "$(RB_DIR=$P failing_git '* *grafana-dashboard.json' 1 readback docker v2.0.0)|$(git_calls)" "refused|1"
-chk_has "R30 and says so" "$(cat "$WORK/readback.log")" "git cannot read grafana-dashboard.json at $PR"
+chk "R30 a tree git cannot list the dashboards of is refused, not read as holding none" \
+  "$(RB_DIR=$P failing_git "ls-tree -z --full-tree $PR" 1 readback docker v2.0.0)|$(git_calls)" "refused|1"
+chk_has "R30 and says so" "$(cat "$WORK/readback.log")" "cannot list the dashboards v2.0.0 ships at $PR"
 chk "R30 as are a promotion's trailers git cannot read" \
   "$(RB_DIR=$P failing_git 'interpret-trailers --parse' 1 readback docker v2.0.0)|$(git_calls)" "refused|1"
 chk_has "R30 naming the trailers, not a missing trailer" "$(cat "$WORK/readback.log")" \
@@ -1411,6 +1413,27 @@ chk "R12 a dashboard no run at R signed is refused" "$(RB_DIR=$P readback docker
 rm "$CURL_DIR/dash-manifest-v2.0.0"
 chk "R12 no published dashboard is refused" "$(RB_DIR=$P readback docker v2.0.0)" "refused"
 chk_has "R12 naming the dashboard" "$(cat "$WORK/readback.log")" "ghcr.io/o/app/dashboard:v2.0.0 is ''"
+# A second dashboard reads back as its own package, signed in the same window.
+git -C "$P" checkout -q dev
+PT2=$(commit_in "$P" "feat: a messages dashboard" grafana-dashboard-messages.json='{"uid":"m"}')
+git -C "$P" checkout -q main
+PR2=$(git -C "$P" commit-tree "$PT2^{tree}" -p main -p "$PT2" -m "release: promote dev into main" -m "Promoted-Digest: $IMG_E")
+git -C "$P" merge -q --ff-only "$PR2"
+git -C "$P" tag v2.1.0 "$PR2"
+DASHM="sha256:$(printf 'e%.0s' $(seq 64))"
+echo "$DASH" >"$CURL_DIR/dash-manifest-v2.1.0"
+echo "$DASHM" >"$CURL_DIR/dashm-manifest-v2.1.0"
+echo "$IMG_E" >"$CURL_DIR/manifest-v2.1.0"
+printf '%s\n' "$DASH $PR2" "$DASHM $PR2" "$IMG_E $PT2" >"$COSIGN_DIR/signed"
+echo "$IMG_E $PT2" >"$COSIGN_DIR/attested"
+chk "R31 a tag shipping two dashboards reads back with both signed at R" "$(RB_DIR=$P readback docker v2.1.0)" "ok"
+chk_has "R31 the second as its own package" "$(cat "$WORK/readback.log")" "ok: ghcr.io/o/app/dashboard-messages:v2.1.0 -> $DASHM"
+printf '%s\n' "$DASH $PR2" "$IMG_E $PT2" >"$COSIGN_DIR/signed"
+chk "R31 a second dashboard no run at R signed is refused" "$(RB_DIR=$P readback docker v2.1.0)" "refused"
+printf '%s\n' "$DASH $PR2" "$DASHM $PR2" "$IMG_E $PT2" >"$COSIGN_DIR/signed"
+rm "$CURL_DIR/dashm-manifest-v2.1.0"
+chk "R31 a second dashboard never published is refused" "$(RB_DIR=$P readback docker v2.1.0)" "refused"
+chk_has "R31 naming it" "$(cat "$WORK/readback.log")" "ghcr.io/o/app/dashboard-messages:v2.1.0 is ''"
 
 # The verify-publish step: a receipt per lane that published, none without a Release.
 git -C "$O" checkout -q main

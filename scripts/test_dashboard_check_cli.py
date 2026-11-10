@@ -150,7 +150,7 @@ class BaseFetch(unittest.TestCase):
     )
 
     def fetch(
-        self, ref: str, code: str = '200'
+        self, ref: str, code: str = '200', stale: bool = False
     ) -> tuple[subprocess.CompletedProcess, str, pathlib.Path]:
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         stub = tmp / 'bin' / 'curl'
@@ -160,6 +160,8 @@ class BaseFetch(unittest.TestCase):
         log = tmp / 'curl.log'
         log.touch()
         out = tmp / 'base.json'
+        if stale:
+            out.write_text('stale')
         env = {
             'PATH': f'{stub.parent}:/usr/bin:/bin',
             'STUB_LOG': str(log),
@@ -212,6 +214,19 @@ class BaseFetch(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('::error', result.stdout + result.stderr)
         self.assertFalse(out.exists())
+
+    def test_an_answer_with_no_base_removes_an_earlier_files_copy(self):
+        # check.sh reuses one out-file for every dashboard it checks.
+        for ref, code, rc in (
+            ('', '200', 0),
+            ('0' * 40, '200', 0),
+            ('abc123', '404', 0),
+            ('abc123', '500', 1),
+        ):
+            with self.subTest(ref=ref, code=code):
+                result, _, out = self.fetch(ref, code, stale=True)
+                self.assertEqual(result.returncode, rc, result.stderr)
+                self.assertFalse(out.exists())
 
 
 if __name__ == '__main__':

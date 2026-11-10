@@ -99,7 +99,7 @@ on:
         description: >-
           Repair: the stable tag whose missing Release needs its
           assets. The call then builds and publishes nothing, and hands on the
-          tag's attested SBOM, the dashboard at its commit, and their signatures.
+          tag's attested SBOM, the dashboards at its commit, and their signatures.
         type: string
         default: ""
       security-shas:
@@ -792,7 +792,7 @@ jobs:
       digest: ${{ steps.manifest.outputs.digest }}
       version: ${{ needs.prepare.outputs.version }}
       tag: ${{ needs.prepare.outputs.tag }}
-      dashboard-digest: ${{ steps.dashboard-oci.outputs.digest }}
+      dashboards: ${{ steps.dashboard-oci.outputs.published }}
       released: ${{ steps.release.outputs.published }}
     steps:
       - name: Checkout
@@ -1214,7 +1214,7 @@ jobs:
       - name: Install oras
         if: >-
           ${{ env.PUBLISH == 'true'
-            && (hashFiles('grafana-dashboard.json') != ''
+            && (hashFiles('grafana-dashboard.json', 'grafana-dashboard-*.json') != ''
                 || (inputs.channel == 'stable' && contains(inputs.registries, 'dockerhub'))) }}
         run: |
           set -euo pipefail
@@ -1304,67 +1304,84 @@ jobs:
 
       - name: Publish dashboard OCI artifact
         id: dashboard-oci
-        if: ${{ env.PUBLISH == 'true' && hashFiles('grafana-dashboard.json') != '' }}
+        if: ${{ env.PUBLISH == 'true' && hashFiles('grafana-dashboard.json', 'grafana-dashboard-*.json') != '' }}
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           # Via env, never inline ${{ }} in the script body (template injection).
           CHANNEL: ${{ inputs.channel }}
           VERSION: ${{ needs.prepare.outputs.version }}
           MAJOR: ${{ needs.prepare.outputs.major }}
-          DASHBOARD_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/dashboard
         run: |
           set -euo pipefail
           . "$CI_TOOLS/retry.sh"
+          listing=$(bash "$CI_TOOLS/dashboards.sh" list)
+          read -r -d '' -a files <<<"$listing" || true
           # Consumers re-import by identity: a classic dashboard's uid, a schema
-          # v2 resource's metadata.name. A file with neither is not published.
-          format=$(jq -r '
-            if type != "object" then "none"
-            elif (has("apiVersion") | not) and (.uid | type) == "string" and (.uid | length) > 0 then "v1"
-            elif (keys == ["apiVersion", "kind", "metadata", "spec"])
-              and .apiVersion == "dashboard.grafana.app/v2" and .kind == "Dashboard"
-              and (.metadata | type) == "object" and (.metadata | keys) == ["name"]
-              and (.metadata.name | type) == "string" and (.metadata.name | length) > 0
-              and (.spec | type) == "object" then "v2"
-            else "none" end' grafana-dashboard.json) || format=none
-          if [ "$format" = none ]; then
-            msg="grafana-dashboard.json is neither a classic dashboard (a string uid, no apiVersion)"
-            msg="$msg nor a schema v2 resource (exactly apiVersion dashboard.grafana.app/v2, kind Dashboard,"
-            msg="$msg a metadata holding only a name, and a spec object)"
-            echo "::error file=grafana-dashboard.json::$msg"
-            exit 1
-          fi
-          artifact_type="application/vnd.grafana.dashboard.${format}+json"
+          # v2 resource's metadata.name. A file with neither is not published,
+          # and every file is read before any is pushed.
+          formats=()
+          rc=0
+          for file in "${files[@]}"; do
+            format=$(jq -r '
+              if type != "object" then "none"
+              elif (has("apiVersion") | not) and (.uid | type) == "string" and (.uid | length) > 0 then "v1"
+              elif (keys == ["apiVersion", "kind", "metadata", "spec"])
+                and .apiVersion == "dashboard.grafana.app/v2" and .kind == "Dashboard"
+                and (.metadata | type) == "object" and (.metadata | keys) == ["name"]
+                and (.metadata.name | type) == "string" and (.metadata.name | length) > 0
+                and (.spec | type) == "object" then "v2"
+              else "none" end' "$file") || format=none
+            if [ "$format" = none ]; then
+              msg="${file} is neither a classic dashboard (a string uid, no apiVersion)"
+              msg="$msg nor a schema v2 resource (exactly apiVersion dashboard.grafana.app/v2, kind Dashboard,"
+              msg="$msg a metadata holding only a name, and a spec object)"
+              echo "::error file=${file}::$msg"
+              rc=1
+            fi
+            formats+=("$format")
+          done
+          [ "$rc" -eq 0 ] || exit 1
           # oras-go stamps org.opencontainers.image.created=now unless the caller sets
           # it, so without a fixed value every push (a rerun included) mints a
           # new manifest digest and moves both tags off the signed one. The commit
           # time makes the manifest a pure function of its inputs.
           created=$(git show -s --format=%cI "$GITHUB_SHA")
-          # dev: the dev version only; stable: the version and its major.
-          if [ "$CHANNEL" = "dev" ]; then
-            REFS="${DASHBOARD_REF}:${TAG}"
-            SHOWN="\`${DASHBOARD_REF}:${TAG}\`"
-          else
-            REFS="${DASHBOARD_REF}:${VERSION},${MAJOR}"
-            SHOWN="\`${DASHBOARD_REF}:${VERSION}\` (also \`:${MAJOR}\`)"
-          fi
-          oras push --export-manifest "$RUNNER_TEMP/dashboard-manifest.json" \
-            --artifact-type "$artifact_type" \
-            --annotation "org.opencontainers.image.created=${created}" \
-            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
-            --annotation "org.opencontainers.image.version=${TAG}" \
-            "$REFS" \
-            grafana-dashboard.json:application/json
-          digest="sha256:$(sha256sum "$RUNNER_TEMP/dashboard-manifest.json" | cut -d' ' -f1)"
-          retry cosign sign --yes "${DASHBOARD_REF}@${digest}"
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          {
-            echo "## Grafana dashboard"
-            echo ""
-            echo "OCI artifact ${SHOWN}, digest \`${digest}\`, cosign-signed (keyless)."
-            echo ""
-            echo "Artifact type \`${artifact_type}\`."
-          } >> "$GITHUB_STEP_SUMMARY"
+          published='[]'
+          for i in "${!files[@]}"; do
+            file=${files[$i]}
+            artifact_type="application/vnd.grafana.dashboard.${formats[$i]}+json"
+            package=$(bash "$CI_TOOLS/dashboards.sh" package "$file")
+            ref="${REGISTRY}/${IMAGE_NAME}/${package}"
+            # dev: the dev version only; stable: the version and its major.
+            if [ "$CHANNEL" = "dev" ]; then
+              REFS="${ref}:${TAG}"
+              SHOWN="\`${ref}:${TAG}\`"
+            else
+              REFS="${ref}:${VERSION},${MAJOR}"
+              SHOWN="\`${ref}:${VERSION}\` (also \`:${MAJOR}\`)"
+            fi
+            oras push --export-manifest "$RUNNER_TEMP/${package}-manifest.json" \
+              --artifact-type "$artifact_type" \
+              --annotation "org.opencontainers.image.created=${created}" \
+              --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+              --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+              --annotation "org.opencontainers.image.version=${TAG}" \
+              "$REFS" \
+              "${file}:application/json"
+            digest="sha256:$(sha256sum "$RUNNER_TEMP/${package}-manifest.json" | cut -d' ' -f1)"
+            retry cosign sign --yes "${ref}@${digest}"
+            published=$(jq -c --arg p "$package" --arg d "$digest" '. + [{package: $p, digest: $d}]' <<<"$published")
+            heading="Grafana dashboard"
+            [ "$file" = grafana-dashboard.json ] || heading="${heading} \`${file}\`"
+            {
+              echo "## ${heading}"
+              echo ""
+              echo "OCI artifact ${SHOWN}, digest \`${digest}\`, cosign-signed (keyless)."
+              echo ""
+              echo "Artifact type \`${artifact_type}\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "published=${published}" >> "$GITHUB_OUTPUT"
 
       # The System packages part diffs this release's SBOM against the one
       # attested on the previous stable release's image, read only once its
@@ -1637,7 +1654,7 @@ jobs:
       VERSION: ${{ needs.prepare.outputs.tag }}
       DIGEST: ${{ needs.finalize.outputs.digest }}
       REGISTRIES: ${{ inputs.registries }}
-      DASHBOARD_DIGEST: ${{ needs.finalize.outputs.dashboard-digest }}
+      DASHBOARDS: ${{ needs.finalize.outputs.dashboards }}
     steps:
       - name: Check out the ci source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1661,8 +1678,8 @@ jobs:
           # releases whose tags were already pullable, so it is not consulted.
           pull_token() { # <name> <token url>
             curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors \
-              -o "$RUNNER_TEMP/$1-token.json" "$2"
-            jq -r .token "$RUNNER_TEMP/$1-token.json"
+              -o "$RUNNER_TEMP/$1-token.json" "$2" \
+              && jq -r .token "$RUNNER_TEMP/$1-token.json"
           }
           ghcr_token=$(pull_token ghcr "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull")
           hub_token=
@@ -1702,13 +1719,23 @@ jobs:
           if [ -n "$hub_token" ]; then
             verify "docker.io/${IMAGE_NAME}:${VERSION}" "$DIGEST" registry-1.docker.io "$hub_token" "$IMAGE_NAME" "$INDEX" || rc=1
           fi
-          # A single OCI image manifest, so its own Accept, and never the
-          # any-digest arm: an empty dashboard digest means nothing was pushed.
-          if [ -n "$DASHBOARD_DIGEST" ]; then
-            dash_token=$(pull_token dash "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}/dashboard:pull")
-            verify "${REGISTRY}/${IMAGE_NAME}/dashboard:${VERSION}" "$DASHBOARD_DIGEST" \
-              "$REGISTRY" "$dash_token" "${IMAGE_NAME}/dashboard" application/vnd.oci.image.manifest.v1+json || rc=1
-          fi
+          # Each dashboard is a single OCI image manifest, so its own Accept, and
+          # each digest is one finalize pushed, so never the any-digest arm.
+          # GHCR makes a new package private on its first publish
+          # (https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility),
+          # and refuses an anonymous token for it.
+          dashboards=$(jq -r '.[] | "\(.package) \(.digest)"' <<<"${DASHBOARDS:-[]}")
+          while read -r package dash_digest; do
+            [ -n "$package" ] || continue
+            repo="${IMAGE_NAME}/${package}"
+            if ! dash_token=$(pull_token "$package" "https://${REGISTRY}/token?scope=repository:${repo}:pull"); then
+              echo "::error::${REGISTRY}/${repo}: no anonymous pull token. A package's first publish leaves it private until its owner makes it public. Then rerun this job."
+              rc=1
+              continue
+            fi
+            verify "${REGISTRY}/${repo}:${VERSION}" "$dash_digest" \
+              "$REGISTRY" "$dash_token" "$repo" application/vnd.oci.image.manifest.v1+json || rc=1
+          done <<<"$dashboards"
           exit "$rc"
 
   # ─── The assets of a repaired Release ─────────────────────────────────────
