@@ -14,9 +14,10 @@ inputs:
   base-ref:
     description: >-
       The revision whose copy pins the dashboard identity. Empty or all zeros
-      means no base. The default's pull request base SHA is the base branch's
-      tip when the pull request opened, so a caller that knows the commit its
-      merge ref was built on passes that.
+      means no base. The default is the event's pull request base SHA, or the
+      push's previous tip. GitHub leaves that SHA at the base branch's tip when
+      the pull request opened, so on a checkout of the merge commit the base
+      copy is read at the merge's first parent instead.
     default: ${{ github.event.pull_request.base.sha || github.event.before }}
   token:
     description: A token that can read the repository contents.
@@ -35,6 +36,7 @@ runs:
       env:
         DASHBOARD_PATH: ${{ inputs.path }}
         BASE_REF: ${{ inputs.base-ref }}
+        EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         TOKEN: ${{ inputs.token }}
       run: |
         bash "${GITHUB_ACTION_PATH}/check.sh" \

@@ -163,7 +163,7 @@ class Heads(IntakeCase):
         moved = self.fx.commit('release: promote dev into main')
         self.assert_allowed(self.fx.run('renovate/main-x', head, base=moved))
 
-    def test_a_head_rebased_onto_main_is_judged_from_mains_current_tip(self):
+    def test_a_head_rebased_onto_main_is_judged_from_where_the_merge_ref_was_built(self):
         # The event's base SHA stays at main's tip when the pull request
         # opened, so ci.yaml passes detect's pr_base: from that stale SHA the
         # promotion the head was rebased onto reads as the head's content.

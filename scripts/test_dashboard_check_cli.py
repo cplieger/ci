@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -150,7 +151,11 @@ class BaseFetch(unittest.TestCase):
     )
 
     def fetch(
-        self, ref: str, code: str = '200'
+        self,
+        ref: str,
+        code: str = '200',
+        extra: dict[str, str] | None = None,
+        cwd: pathlib.Path | None = None,
     ) -> tuple[subprocess.CompletedProcess, str, pathlib.Path]:
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         stub = tmp / 'bin' / 'curl'
@@ -168,10 +173,14 @@ class BaseFetch(unittest.TestCase):
             'TOKEN': 'token-value',
             'GITHUB_API_URL': 'https://api.github.com',
             'GITHUB_REPOSITORY': 'owner/repo',
+            'GIT_CONFIG_GLOBAL': '/dev/null',
+            'GIT_CONFIG_NOSYSTEM': '1',
+            **(extra or {}),
         }
         result = subprocess.run(
             ['bash', str(ACTION / 'fetch-base.sh'), 'grafana-dashboard.json', ref, str(out)],
             env=env,
+            cwd=cwd,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -206,6 +215,77 @@ class BaseFetch(unittest.TestCase):
         result, _, out = self.fetch('abc123', '404')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(out.exists())
+
+    def merge_checkout(self) -> tuple[pathlib.Path, dict[str, str]]:
+        """A checkout of a pull request's merge commit: the base moved to `built`
+        after the pull request opened on `opened`."""
+        repo = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        env = {**os.environ, 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1'}
+
+        def git(*args: str) -> str:
+            argv = ['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com', *args]
+            return subprocess.run(
+                argv, cwd=repo, env=env, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+        git('init', '-q', '-b', 'dev')
+        git('commit', '-q', '--allow-empty', '-m', 'opened on')
+        opened = git('rev-parse', 'HEAD')
+        git('checkout', '-qb', 'topic')
+        git('commit', '-q', '--allow-empty', '-m', 'the pull request')
+        git('checkout', '-q', 'dev')
+        git('commit', '-q', '--allow-empty', '-m', 'the base moves')
+        built = git('rev-parse', 'HEAD')
+        git('checkout', '-q', '--detach')
+        git(
+            'merge',
+            '-q',
+            '--no-ff',
+            '-m',
+            'merge ref\n\nparent 0000000000000000000000000000000000000001',
+            'topic',
+        )
+        return repo, {'opened': opened, 'built': built, 'merge': git('rev-parse', 'HEAD')}
+
+    def test_a_pull_request_reads_the_base_its_merge_was_built_on(self):
+        repo, sha = self.merge_checkout()
+        event = {'GITHUB_EVENT_NAME': 'pull_request', 'EVENT_BASE_SHA': sha['opened']}
+        for name, extra in (
+            ('merge commit named', {**event, 'GITHUB_SHA': sha['merge']}),
+            ('HEAD alone', event),
+        ):
+            with self.subTest(name):
+                result, log, _ = self.fetch(sha['opened'], extra=extra, cwd=repo)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'ref={sha["built"]}', log)
+
+    def test_any_other_base_is_read_as_given(self):
+        repo, sha = self.merge_checkout()
+        for name, ref, extra in (
+            ('a push', sha['opened'], {'GITHUB_EVENT_NAME': 'push', 'EVENT_BASE_SHA': ''}),
+            (
+                'a caller-chosen base',
+                'abc123',
+                {'GITHUB_EVENT_NAME': 'pull_request', 'EVENT_BASE_SHA': sha['opened']},
+            ),
+        ):
+            with self.subTest(name):
+                result, log, _ = self.fetch(ref, extra=extra, cwd=repo)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'ref={ref}', log)
+
+    def test_a_pull_request_with_no_merge_commit_at_hand_keeps_the_event_base(self):
+        repo, sha = self.merge_checkout()
+        event = {'GITHUB_EVENT_NAME': 'pull_request', 'EVENT_BASE_SHA': sha['opened']}
+        outside = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for name, extra, cwd in (
+            ('a single-parent head', {**event, 'GITHUB_SHA': sha['built']}, repo),
+            ('no repository', event, outside),
+        ):
+            with self.subTest(name):
+                result, log, _ = self.fetch(sha['opened'], extra=extra, cwd=cwd)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'ref={sha["opened"]}', log)
 
     def test_other_answer_fails_closed(self):
         result, _, out = self.fetch('abc123', '500')

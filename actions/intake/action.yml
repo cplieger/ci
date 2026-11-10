@@ -19,8 +19,9 @@ inputs:
   base-sha:
     description: >-
       A commit of the base branch (`intake`); the head is judged from where it
-      meets this commit. Pass the base branch's current tip: the event's base
-      SHA is its tip when the pull request opened.
+      meets this commit. Pass the commit the pull request's merge ref was built
+      on: the event's base SHA is the base branch's tip when the pull request
+      opened, and GitHub does not move it.
     default: ''
   head-sha:
     description: Head commit, present in the working directory's repository (`intake`).

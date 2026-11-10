@@ -83,13 +83,12 @@ jobs:
               # The event's base SHA is the base branch's tip when the pull
               # request opened, and GitHub does not move it when the base
               # branch moves, so a diff from it lists every change the base
-              # gained since. Diff from where HEAD meets the base branch's
-              # fetched tip instead: the merge ref's first parent. pr_base
-              # hands the same commit to the jobs that compare with the base.
+              # gained since. Diff from the merge ref's first parent instead,
+              # the base commit GitHub built it on. pr_base hands the same
+              # commit to the main intake.
               base="${{ github.event.pull_request.base.sha }}"
-              if tip=$(git rev-parse -q --verify "refs/remotes/origin/${GITHUB_BASE_REF:-}^{commit}") \
-                && fork=$(git merge-base "$tip" HEAD); then
-                base=$fork
+              if git rev-parse -q --verify 'HEAD^2^{commit}' > /dev/null; then
+                base=$(git rev-parse 'HEAD^1')
               fi
               pr_base=$base
               if git cat-file -e "${base}^{commit}" 2> /dev/null; then
@@ -944,8 +943,6 @@ jobs:
         if: ${{ hashFiles('grafana-dashboard.json') != '' }}
         continue-on-error: true
         uses: ./.cplieger-ci/actions/dashboard-check
-        with:
-          base-ref: ${{ needs.detect.outputs.pr_base || github.event.before }}
 
       - name: Check results
         if: always()
@@ -1464,7 +1461,7 @@ jobs:
           check: intake
           head-ref: ${{ github.head_ref }}
           head-repo: ${{ github.event.pull_request.head.repo.full_name }}
-          base-sha: ${{ needs.detect.outputs.pr_base || github.event.pull_request.base.sha }}
+          base-sha: ${{ needs.detect.outputs.pr_base }}
           head-sha: ${{ github.event.pull_request.head.sha }}
 
       # An action that fails before its body runs, or a failed source checkout
