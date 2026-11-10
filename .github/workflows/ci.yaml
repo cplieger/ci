@@ -69,16 +69,18 @@ jobs:
           # A path filter on the caller would leave the required ci / validate pending
           # forever, so the workflow always runs and the heavy jobs gate on this.
           # Anything that cannot be diffed (a dispatch, a first push, a shallow base)
-          # counts as a code change.
+          # counts as a code change. --no-renames lists both sides of a move, so the
+          # folder a file left counts as changed too.
           code_changed=true
           changed=""
           diffed=false
           scope_modules=false
+          sibling_replaced=false
           case "${{ github.event_name }}" in
             pull_request)
               base="${{ github.event.pull_request.base.sha }}"
               if git cat-file -e "${base}^{commit}" 2> /dev/null; then
-                changed=$(git diff --name-only "$base" HEAD)
+                changed=$(git diff --name-only --no-renames "$base" HEAD)
                 diffed=true
                 scope_modules=true
               fi
@@ -88,7 +90,7 @@ jobs:
               if [ -n "$before" ] \
                 && [ "$before" != "0000000000000000000000000000000000000000" ] \
                 && git cat-file -e "${before}^{commit}" 2> /dev/null; then
-                changed=$(git diff --name-only "$before" "${{ github.sha }}")
+                changed=$(git diff --name-only --no-renames "$before" "${{ github.sha }}")
                 diffed=true
               fi
               ;;
@@ -161,6 +163,12 @@ jobs:
                 if [ -n "$p" ] && [ "$p" != "$own" ] && grep -qxF -- "$p" <<< "$mod_paths" \
                   && ! grep -qxF -- "$p" <<< "$replaced"; then
                   run_go_work=true
+                fi
+                # A sibling replaced by a local path builds from its head even
+                # under GOWORK=off, so its change reaches this module's legs.
+                if [ -n "$p" ] && [ "$p" != "$own" ] && grep -qxF -- "$p" <<< "$mod_paths" \
+                  && grep -qxF -- "$p" <<< "$replaced"; then
+                  sibling_replaced=true
                 fi
               done < <(gomod_field "$d" require)
             done <<< "$mod_dirs"
@@ -264,36 +272,46 @@ jobs:
 
             # On a pull request in a repository of modules with no root go.mod,
             # go-nested, go-os and ts-nested run only for the modules a changed
-            # path belongs to. Each go-nested and go-os leg builds with GOWORK=off,
-            # against its siblings' tagged versions, so a change to one module
-            # cannot change another's result there; go-work, which tests every
-            # module's head together, still runs in full. A changed path outside
-            # every module (go.work, lint config, workflows, scripts) keeps every
-            # module unless it is a doc file, and so does a push, so the merge's
-            # own run checks them all. scripts/test-lane-semantics.sh runs this
-            # block.
-            if [ "$scope_modules" = true ] && [ ! -f go.mod ] && [ "$go_nested_dirs" != "[]" ]; then
+            # path belongs to: each go-nested and go-os leg builds with GOWORK=off
+            # against its siblings' tags, and go-work still tests every head
+            # together. A non-doc path outside every module, a local replace of a
+            # sibling or a symlink leaving its module keeps them all, as does a
+            # push. scripts/test-lane-semantics.sh runs this block.
+            if [ "$scope_modules" = true ] && [ ! -f go.mod ] && [ "$go_nested_dirs" != "[]" ] \
+              && [ "$sibling_replaced" != true ]; then
               nested=$(jq -r '.[]' <<< "$go_nested_dirs")
-              touched=""
-              scoped=true
-              while IFS= read -r p; do
-                [ -z "$p" ] && continue
-                m=$(dirname -- "$p")
+              module_of() { # <path> -> its deepest module dir, or .
+                local m
+                m=$(dirname -- "$1")
                 while [ "$m" != . ] && ! grep -qxF -- "$m" <<< "$nested"; do
                   m=$(dirname -- "$m")
                 done
+                printf '%s' "$m"
+              }
+              touched=""
+              scoped=true
+              while IFS= read -r l; do
+                [ -z "$l" ] && continue
+                t=$(realpath -m --relative-to=. -- "$(dirname -- "$l")/$(readlink -- "$l")")
+                if [ "$(module_of "$l")" != "$(module_of "$t/x")" ]; then
+                  scoped=false
+                fi
+              done < <(git ls-files -s | awk '$1 == "120000" { sub(/^[^\t]*\t/, ""); print }')
+              while [ "$scoped" = true ] && IFS= read -r p; do
+                [ -z "$p" ] && continue
+                m=$(module_of "$p")
                 if [ "$m" != . ]; then
                   touched=$(printf '%s\n%s' "$touched" "$m")
                 elif ! grep -qE '(\.md$|^LICENSE$|^\.gitignore$)' <<< "$p"; then
                   scoped=false
-                  break
                 fi
               done <<< "$changed"
               if [ "$scoped" = true ]; then
                 keep=$(printf '%s\n' "$touched" | jq -ncR '[inputs | select(. != "")] | unique')
                 go_nested_dirs=$(jq -c --argjson k "$keep" 'map(select(. as $d | any($k[]; . == $d)))' <<< "$go_nested_dirs")
                 go_os_matrix=$(jq -c --argjson k "$keep" 'map(select(.dir as $d | any($k[]; . == $d)))' <<< "$go_os_matrix")
-                ts_nested_dirs=$(jq -c --argjson k "$keep" 'map(select(rtrimstr("/web") as $d | any($k[]; . == $d)))' <<< "$ts_nested_dirs")
+                ts_nested_dirs=$(jq -c --argjson k "$keep" \
+                  'map(select(. as $t | rtrimstr("/web") as $d | any($k[]; . == $d or . == $t)))' <<< "$ts_nested_dirs")
                 if [ "$go_nested_dirs" = "[]" ]; then run_go_nested=false; fi
                 if [ "$go_os_matrix" = "[]" ]; then run_go_os=false; fi
                 if [ "$ts_nested_dirs" = "[]" ]; then run_ts_nested=false; fi

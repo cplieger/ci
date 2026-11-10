@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Regression probe for the shell semantics release.yaml and ci.yaml embed
 # inline: nested-Go-module lanes (release.yaml detect and go-nested, ci.yaml's
-# nested validation discovery), ci.yaml's web-frontend probe and its go-os
-# runner detection. A snippet not extracted below is MIRRORED, so editing
+# nested validation discovery), ci.yaml's web-frontend probe, its go-os
+# runner detection and its pull-request module scoping. A snippet not extracted below is MIRRORED, so editing
 # either side updates the other in the same change. Runs in the ci repo's
 # `scripts` CI job (opt-in by file presence).
 set -euo pipefail
@@ -526,16 +526,29 @@ chk "L-F2 docker-release go-modules input defaults to '[]'" \
 # shellcheck disable=SC2016 # literal single-quoted grep pattern, no expansion wanted
 chk "L-F3 the docker notes step hands the lanes to render-notes.sh" \
   "$(grep -c -- '--go-lanes "$GO_LANES_JSON"' "$DOCKER_YAML")" "1"
+# shellcheck disable=SC2016 # literal single-quoted grep pattern, no expansion wanted
+chk "L-F3 and render-notes.sh scopes each git-cliff read of the range by them" \
+  "$(grep -c '"$CLIFF" --tag-pattern' "$ROOT/scripts/render-notes.sh")|$(grep '"$CLIFF" --tag-pattern' "$ROOT/scripts/render-notes.sh" | grep -vc '"\${SCOPE_ARGS\[@\]}"')" "2|0"
+# An empty lane array must contribute ZERO argv words, keeping every
+# no-lane docker repo's git-cliff command argument-identical (same
+# expansion form the renderer uses; bash >= 4.4 drops the empty array
+# under set -u).
+LANE_ARGS=()
+set -- git-cliff --unreleased --tag v1.2.3 "${LANE_ARGS[@]}" --strip header
+chk "L-F4 empty LANE_ARGS contributes zero argv words" "$#" "6"
+
 # ── module scoping on a pull request ─────────────────────────────────────────
 # ci.yaml's detect narrows go-nested, go-os and ts-nested to the modules a
 # changed path belongs to, on a pull request in a repo with no root go.mod. Each
 # go-nested and go-os leg builds with GOWORK=off against its siblings' tags, so
 # no other module's result can change there; any non-doc path outside every
-# module keeps them all, as does a push.
+# module, a local replace of a sibling or a symlink leaving its module keeps
+# them all, as does a push.
 cat >"$WORK/scope-run.sh" <<'SH'
 scope_modules=$1
 changed=$2
-go_nested_dirs='["filesafe","httpclient","keyenc","measure","ssrf"]'
+sibling_replaced=${4:-false}
+go_nested_dirs=${NESTED:-'["filesafe","httpclient","keyenc","measure","ssrf"]'}
 go_os_matrix='[{"dir":"filesafe","runner":"windows-latest"},{"dir":"measure","runner":"macos-latest"}]'
 ts_nested_dirs='["keyenc/web"]'
 run_go_nested=true
@@ -546,11 +559,28 @@ run_ts_nested=true
 printf 'nested=%s os=%s ts=%s run=%s,%s,%s\n' "$go_nested_dirs" "$(jq -c 'map(.dir)' <<<"$go_os_matrix")" \
   "$ts_nested_dirs" "$run_go_nested" "$run_go_os" "$run_ts_nested"
 SH
-scope() { # <scope_modules> <changed paths, one per line> [root] -> the narrowed outputs
+scope() { # <scope_modules> <changed paths, one per line> [root|replaced|symlink]
   local d
   d=$(mktemp -d "$WORK/scope.XXXXXX")
-  if [ -n "${3:-}" ]; then : >"$d/go.mod"; fi
-  (cd "$d" && bash -eo pipefail "$WORK/scope-run.sh" "$1" "$2" "$WORK/module-scope.sh") \
+  git -C "$d" init -q
+  case "${3:-}" in
+    root) : >"$d/go.mod" ;;
+    symlink)
+      mkdir -p "$d/measure" "$d/ssrf"
+      : >"$d/ssrf/a.go"
+      ln -s ../ssrf/a.go "$d/measure/a.go"
+      git -C "$d" add -A
+      ;;
+    inside)
+      mkdir -p "$d/measure/sub"
+      : >"$d/measure/a.go"
+      ln -s ../a.go "$d/measure/sub/b.go"
+      git -C "$d" add -A
+      ;;
+  esac
+  local replaced=false
+  if [ "${3:-}" = replaced ]; then replaced=true; fi
+  (cd "$d" && bash -eo pipefail "$WORK/scope-run.sh" "$1" "$2" "$WORK/module-scope.sh" "$replaced") \
     || fail "ci.yaml's module-scope block failed for '$2'"
 }
 ALL='nested=["filesafe","httpclient","keyenc","measure","ssrf"] os=["filesafe","measure"] ts=["keyenc/web"] run=true,true,true'
@@ -568,16 +598,16 @@ chk "M-S6 a path in a folder that is no longer a module keeps every module" \
   "$(scope true 'oldmod/old.go')" "$ALL"
 chk "M-S7 a push keeps every module" "$(scope false 'measure/exposition.go')" "$ALL"
 chk "M-S8 a repo with a root go.mod keeps every module" "$(scope true 'measure/exposition.go' root)" "$ALL"
-
-# shellcheck disable=SC2016 # literal single-quoted grep pattern, no expansion wanted
-chk "L-F3 and render-notes.sh scopes each git-cliff read of the range by them" \
-  "$(grep -c '"$CLIFF" --tag-pattern' "$ROOT/scripts/render-notes.sh")|$(grep '"$CLIFF" --tag-pattern' "$ROOT/scripts/render-notes.sh" | grep -vc '"\${SCOPE_ARGS\[@\]}"')" "2|0"
-# An empty lane array must contribute ZERO argv words, keeping every
-# no-lane docker repo's git-cliff command argument-identical (same
-# expansion form the renderer uses; bash >= 4.4 drops the empty array
-# under set -u).
-LANE_ARGS=()
-set -- git-cliff --unreleased --tag v1.2.3 "${LANE_ARGS[@]}" --strip header
-chk "L-F4 empty LANE_ARGS contributes zero argv words" "$#" "6"
+chk "M-S9 detect lists both sides of a rename, so a moved file's old module is validated" \
+  "$(grep -c 'git diff --name-only --no-renames' "$CI_YAML")" "2"
+chk "M-S10 a sibling replaced by a local path keeps every module" \
+  "$(scope true 'measure/exposition.go' replaced)" "$ALL"
+chk "M-S11 a symlink into another module keeps every module" \
+  "$(scope true 'ssrf/a.go' symlink)" "$ALL"
+chk "M-S12 a symlink inside its own module keeps the scope" \
+  "$(scope true 'measure/a.go' inside)" 'nested=["measure"] os=["measure"] ts=[] run=true,true,false'
+chk "M-S13 a web half that is itself a module keeps its ts-nested leg" \
+  "$(NESTED='["filesafe","keyenc","keyenc/web","measure"]' scope true 'keyenc/web/src/keyenc.ts')" \
+  'nested=["keyenc/web"] os=[] ts=["keyenc/web"] run=true,false,true'
 
 echo "PASS: nested-module lane, web-probe, go-os detection and module-scope shell semantics match the pinned contract (${PASS} checks)"
