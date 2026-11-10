@@ -236,6 +236,9 @@ jobs:
         if: ${{ steps.census.outputs.ts == 'true' }}
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
+          # Automatic caching off, so an empty cache below caches nothing:
+          # setup-node otherwise caches npm when package.json names it.
+          package-manager-cache: false
           node-version: '26'
           # setup-node throws on a cache with no lockfile:
           # https://github.com/actions/setup-node/blob/949feb2413d6458794dcd2491c4babbbce0c15c1/src/cache-restore.ts#L84-L87

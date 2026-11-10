@@ -72,6 +72,19 @@ class PackageSettings(Harness):
         self.assertEqual(run.rc, 0, run.out)
         return run.outputs['floor']
 
+    def test_the_job_sets_up_the_publishing_node_before_the_read(self):
+        """The read loads the semver library npm bundles beside the Node on PATH,
+        and a runner other than GitHub's hosted image may carry none, so the job
+        installs the same Node as validate first."""
+        steps = ts_ci()['jobs']['package']['steps']
+        names = [s.get('name') for s in steps]
+        self.assertLess(names.index('Setup Node.js'), names.index(READ_STEP))
+        setup = steps[names.index('Setup Node.js')]
+        validate_setup = workflow_step(TS_CI, 'validate', 'Setup Node.js')
+        self.assertEqual(setup['uses'], validate_setup['uses'])
+        # No cache, and automatic caching off: the job installs no packages.
+        self.assertEqual(setup['with'], {'node-version': validate_setup['with']['node-version'], 'package-manager-cache': False})
+
     def test_the_step_reads_the_working_directory_package(self):
         self.assertEqual(self.STEP['env']['PACKAGE'], '${{ inputs.working-directory }}/package.json')
         self.assertNotIn('defaults', ts_ci()['jobs']['package'])
@@ -442,6 +455,22 @@ class MetaPassesNoCount(unittest.TestCase):
                 self.assertNotIn('repository.name', call)
         self.assertNotIn('vitest-shards', META.read_text())
         self.assertNotIn('repository.name', TS_CI.read_text())
+
+
+class SetupNodeCaching(unittest.TestCase):
+    def test_every_setup_node_step_names_its_cache_or_turns_caching_off(self):
+        """setup-node caches npm on its own whenever package.json names npm as
+        its packageManager, and fails with no root lockfile, so a step either
+        asks for the npm cache or turns that automatic caching off."""
+        for path in sorted(WORKFLOWS.glob('*.y*ml')):
+            for job, spec in (yaml.safe_load(path.read_text()).get('jobs') or {}).items():
+                for step in spec.get('steps') or []:
+                    if 'actions/setup-node@' not in str(step.get('uses', '')):
+                        continue
+                    with self.subTest(workflow=path.name, job=job, step=step.get('name')):
+                        given = step.get('with') or {}
+                        if given.get('cache') != 'npm' and given.get('package-manager-cache') is not False:
+                            self.fail(f'{given} neither sets cache: npm nor package-manager-cache: false')
 
 
 if __name__ == '__main__':
