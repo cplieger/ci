@@ -382,6 +382,17 @@ for l in "${GO_LANES[@]}"; do
   fi
   note "lane ${l}: deriving changed paths from ${anchor}..HEAD (newest lane tag on this channel)"
   lane_diff=$(git diff --no-renames --name-only "$anchor..$HEAD" -- "$l/")
+  # A package.json in the lane, its TS half's manifest among them, ships only
+  # through its fields other than devDependencies and overrides, as above.
+  while IFS= read -r pj; do
+    [ -z "$pj" ] && continue
+    b=$(git show "$anchor:$pj" 2>/dev/null | jq -S 'del(.devDependencies, .overrides)' 2>/dev/null || echo "")
+    h=$(git show "$HEAD:$pj" 2>/dev/null | jq -S 'del(.devDependencies, .overrides)' 2>/dev/null || echo "")
+    if [ -n "$b" ] && [ "$b" = "$h" ]; then
+      lane_diff=$(grep -vxF -- "$pj" <<<"$lane_diff" || true)
+      note "$pj changed only in devDependencies/overrides — not significant"
+    fi
+  done < <(grep -E '(^|/)package\.json$' <<<"$lane_diff" || true)
   if [ -n "$lane_diff" ]; then
     lane_shipped=$(shipped "$lane_diff") || exit 2
     [ -z "$lane_shipped" ] || LANE_CHANGED["$l"]=true

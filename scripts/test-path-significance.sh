@@ -560,4 +560,31 @@ I1=$(commit "docs: all three")
 chk "S42 a directive in a file Go never builds embeds nothing" "$(paths "$I0" "$I1")" 'false|[]|[]|[]'
 cd "$WORK" || exit 1
 
+# ── A tagged lane's web half that changed only its dev tooling ──────────────
+# cplieger/go released keyenc/v1.2.1 with no Go change: keyenc/web's
+# package.json moved only a devDependency and its lockfile followed. The lane
+# loop must drop that package.json as the root range's refinement does.
+export REPO_TYPE=go SUBPACKAGES_JSON='[]' GO_LANES_JSON='["keyenc"]'
+newrepo lane-half
+put keyenc/go.mod 'module example.com/go/keyenc'
+put keyenc/k.go 'package keyenc'
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"0.0.0","devDependencies":{"knip":"1"},"dependencies":{}}'
+put keyenc/web/package-lock.json '{"lockfileVersion":3}'
+N0=$(commit "feat: initial")
+git tag keyenc/v1.2.0 "$N0"
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"0.0.0","devDependencies":{"knip":"2"},"dependencies":{}}'
+put keyenc/web/package-lock.json '{"lockfileVersion":3,"x":1}'
+N1=$(commit "chore(devdeps): update knip")
+chk "S43 a lane whose web half changed only devDependencies and its lockfile is owed nothing" \
+  "$(release S43 stable "$N0" "$N0" "$N1")" 'false|[]|[]'
+chk_has "S43 and says why" "$(cat "$WORK/log")" "keyenc/web/package.json changed only in devDependencies/overrides"
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"0.0.0","devDependencies":{"knip":"2"},"dependencies":{"b":"1"}}'
+N2=$(commit "fix(deps): keyenc web b")
+chk "S43 a lane web half's dependencies change still owes the lane a release" \
+  "$(release S43b stable "$N1" "$N0" "$N2")" 'false|[]|["keyenc"]'
+put keyenc/k.go 'package keyenc // v2'
+git tag keyenc/v1.2.1 "$N2"
+N3=$(commit "fix(keyenc): code")
+chk "S43 a lane code change beside nothing else still owes a release" "$(release S43c stable "$N2" "$N2" "$N3")" 'false|[]|["keyenc"]'
+
 echo "PASS: path significance ($PASS checks)"
