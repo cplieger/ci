@@ -547,7 +547,7 @@ chk "L-F4 empty LANE_ARGS contributes zero argv words" "$#" "6"
 # changed path belongs to, on a pull request in a repo with no root go.mod. Each
 # go-nested and go-os leg builds with GOWORK=off against its siblings' tags, so
 # no other module's result can change there; any non-doc path outside every
-# module, a local replace of a sibling or a symlink leaving its module keeps
+# module, a replace of a sibling or a symlink leaving its module keeps
 # them all, as does a push.
 cat >"$WORK/scope-run.sh" <<'SH'
 scope_modules=$1
@@ -555,8 +555,6 @@ changed=$2
 sibling_replaced=false
 go_nested_dirs=${NESTED:-'["filesafe","httpclient","keyenc","measure","ssrf"]'}
 if [ "$4" = true ]; then
-  mod_dirs=$(jq -r '.[]' <<<"$go_nested_dirs")
-  run_go_work=false
   # shellcheck source=/dev/null
   . "$(dirname "$3")/go-work.sh"
 fi
@@ -570,7 +568,7 @@ run_ts_nested=true
 printf 'nested=%s os=%s ts=%s run=%s,%s,%s\n' "$go_nested_dirs" "$(jq -c 'map(.dir)' <<<"$go_os_matrix")" \
   "$ts_nested_dirs" "$run_go_nested" "$run_go_os" "$run_ts_nested"
 SH
-scope() { # <scope_modules> <changed paths, one per line> [root|replaced|symlink]
+scope() { # <scope_modules> <changed paths, one per line> [root|symlink|inside|absolute|loop|quoted|replaced|required|unrequired|crlf]
   local d
   d=$(mktemp -d "$WORK/scope.XXXXXX")
   git -C "$d" init -q
@@ -589,6 +587,13 @@ scope() { # <scope_modules> <changed paths, one per line> [root|replaced|symlink
       done
       if [ "$3" != unrequired ]; then printf 'require example.com/r/ssrf v0.1.0\n' >>"$d/measure/go.mod"; fi
       if [ "$3" != required ]; then printf 'replace example.com/r/ssrf => ../ssrf\n' >>"$d/measure/go.mod"; fi
+      ;;
+    crlf)
+      for m in filesafe httpclient keyenc measure ssrf; do
+        mkdir -p "$d/$m"
+        printf 'module example.com/r/%s\r\n' "$m" >"$d/$m/go.mod"
+      done
+      printf 'replace (\r\n\texample.com/r/ssrf => ../ssrf\r\n)\r\n' >>"$d/measure/go.mod"
       ;;
     absolute)
       mkdir -p "$d/measure" "$d/ssrf"
@@ -615,7 +620,7 @@ scope() { # <scope_modules> <changed paths, one per line> [root|replaced|symlink
       ;;
   esac
   local replaced=false
-  case "${3:-}" in replaced | required | unrequired) replaced=true ;; esac
+  case "${3:-}" in replaced | required | unrequired | crlf) replaced=true ;; esac
   (cd "$d" && bash -eo pipefail "$WORK/scope-run.sh" "$1" "$2" "$WORK/module-scope.sh" "$replaced") \
     || fail "ci.yaml's module-scope block failed for '$2'"
 }
@@ -651,11 +656,19 @@ chk "M-S9 and self-release lists both sides of a rename since the last tag" \
 chk "M-S10 and a sibling required by version alone keeps the scope" \
   "$(scope true 'measure/exposition.go' required)" 'nested=["measure"] os=["measure"] ts=[] run=true,true,false'
 chk "M-S14 a symlink loop does not fail detect" "$(scope true 'measure/a.go' loop | wc -l)" "1"
+# A realpath that fails, as uutils' does on a loop, keeps every module on any host.
+mkdir -p "$WORK/realpath-fails"
+printf '#!/bin/sh\nexit 1\n' >"$WORK/realpath-fails/realpath"
+chmod +x "$WORK/realpath-fails/realpath"
+chk "M-S14 and a realpath failure keeps every module" \
+  "$(PATH="$WORK/realpath-fails:$PATH" scope true 'measure/a.go' inside)" "$ALL"
 chk "M-S15 a symlink whose name git quotes still keeps every module" \
   "$(scope true 'ssrf/a.go' quoted)" "$ALL"
 chk "M-S16 an absolute symlink into another module keeps every module" \
   "$(scope true 'ssrf/a.go' absolute)" "$ALL"
 chk "M-S10 and a replaced sibling the module does not require keeps every module" \
   "$(scope true 'measure/exposition.go' unrequired)" "$ALL"
+chk "M-S10 and a replace block in a CRLF go.mod keeps every module" \
+  "$(scope true 'measure/exposition.go' crlf)" "$ALL"
 
 echo "PASS: nested-module lane, web-probe, go-os detection and module-scope shell semantics match the pinned contract (${PASS} checks)"

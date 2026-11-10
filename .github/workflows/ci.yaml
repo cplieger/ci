@@ -144,7 +144,7 @@ jobs:
             # together under a generated go.work.
             gomod_field() {
               awk -v want="$2" '
-                { gsub(/"/, "") }
+                { gsub(/\r/, ""); gsub(/"/, "") }
                 $1 ~ /^\/\// { next }
                 ($1 == "require" || $1 == "replace") && $2 == "(" { blk = $1; next }
                 blk != "" && $1 == ")" { blk = ""; next }
@@ -165,8 +165,8 @@ jobs:
                   run_go_work=true
                 fi
               done < <(gomod_field "$d" require)
-              # A replaced sibling builds from its head even under GOWORK=off,
-              # required directly or not, so its change reaches this module.
+              # A replaced sibling, required directly or not, keeps every module: a
+              # local replace builds from the sibling's head even under GOWORK=off.
               while IFS= read -r p; do
                 if [ -n "$p" ] && [ "$p" != "$own" ] && grep -qxF -- "$p" <<< "$mod_paths"; then
                   sibling_replaced=true
@@ -275,9 +275,10 @@ jobs:
             # go-nested, go-os and ts-nested run only for the modules a changed
             # path belongs to: each go-nested and go-os leg builds with GOWORK=off
             # against its siblings' tags, and go-work still tests every head
-            # together. A non-doc path outside every module, a local replace of a
-            # sibling or a symlink leaving its module keeps them all, as does a
-            # push. scripts/test-lane-semantics.sh runs this block.
+            # together. A non-doc path outside every module, a replace of a
+            # sibling, or a symlink that leaves its module or that realpath cannot
+            # resolve keeps them all, as does a push.
+            # scripts/test-lane-semantics.sh runs this block.
             if [ "$scope_modules" = true ] && [ ! -f go.mod ] && [ "$go_nested_dirs" != "[]" ] \
               && [ "$sibling_replaced" != true ]; then
               nested=$(jq -r '.[]' <<< "$go_nested_dirs")
