@@ -163,6 +163,21 @@ class Heads(IntakeCase):
         moved = self.fx.commit('release: promote dev into main')
         self.assert_allowed(self.fx.run('renovate/main-x', head, base=moved))
 
+    def test_a_head_rebased_onto_main_is_judged_from_where_the_merge_ref_was_built(self):
+        # The event's base SHA stays at main's tip when the pull request
+        # opened, so ci.yaml passes detect's pr_base: from that stale SHA the
+        # promotion the head was rebased onto reads as the head's content.
+        opened = self.fx.base
+        git(self.fx.dir, 'checkout', '-q', 'main')
+        self.fx.write({'main.go': 'package main // human work promoted\n'})
+        moved = self.fx.commit('release: promote dev into main')
+        git(self.fx.dir, 'checkout', '-q', '-B', 'head', moved)
+        head = self.fx.change({'go.mod': GO_MOD.replace('v1.4.0', 'v1.4.1')})
+        self.assert_allowed(self.fx.run('renovate/main-x', head, base=moved))
+        self.assert_refused(
+            self.fx.run('renovate/main-x', head, base=opened), 'main.go: not an inventory surface'
+        )
+
 
 class Renovate(IntakeCase):
     files: ClassVar[dict[str, str]] = {

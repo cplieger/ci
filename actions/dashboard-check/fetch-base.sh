@@ -4,7 +4,9 @@
 # GITHUB_REPOSITORY). Exit 0 with no <out-file> when there is no base: an
 # empty or all-zero ref (a manual run, a new branch) or a file the base lacks.
 # Any other answer exits 1, because the identity and regression checks would
-# otherwise pass unchecked.
+# otherwise pass unchecked. On a pull request whose <base-ref> is the event's
+# base SHA (env EVENT_BASE_SHA), it reads the base at the first parent of the
+# merge commit GITHUB_SHA instead, when the working directory holds it.
 set -euo pipefail
 
 [ "$#" -eq 3 ] || {
@@ -17,6 +19,17 @@ rm -f "$out"
 if [ -z "$ref" ] || [ -z "${ref//0/}" ]; then
   echo "dashboard-check: no base revision; the identity and regression checks are skipped"
   exit 0
+fi
+
+# GitHub leaves the event's base SHA at the base branch's tip when the pull
+# request opened. The merge commit's first parent is the base it was built on.
+# The parent lines come from the commit's header, which a shallow checkout
+# holds too; the header ends at the first blank line, before the message.
+if [ "${GITHUB_EVENT_NAME:-}" = pull_request ] && [ "$ref" = "${EVENT_BASE_SHA:-}" ]; then
+  mapfile -t parents < <(git cat-file -p "${GITHUB_SHA:-}" 2>/dev/null | sed -n '/^$/q; s/^parent //p')
+  if [ "${#parents[@]}" -ge 2 ]; then
+    ref=${parents[0]}
+  fi
 fi
 
 tmp=$(mktemp)

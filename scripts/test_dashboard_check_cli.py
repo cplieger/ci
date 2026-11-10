@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+
+import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -150,7 +153,12 @@ class BaseFetch(unittest.TestCase):
     )
 
     def fetch(
-        self, ref: str, code: str = '200', stale: bool = False
+        self,
+        ref: str,
+        code: str = '200',
+        extra: dict[str, str] | None = None,
+        cwd: pathlib.Path | None = None,
+        stale: bool = False,
     ) -> tuple[subprocess.CompletedProcess, str, pathlib.Path]:
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         stub = tmp / 'bin' / 'curl'
@@ -170,10 +178,14 @@ class BaseFetch(unittest.TestCase):
             'TOKEN': 'token-value',
             'GITHUB_API_URL': 'https://api.github.com',
             'GITHUB_REPOSITORY': 'owner/repo',
+            'GIT_CONFIG_GLOBAL': '/dev/null',
+            'GIT_CONFIG_NOSYSTEM': '1',
+            **(extra or {}),
         }
         result = subprocess.run(
             ['bash', str(ACTION / 'fetch-base.sh'), 'grafana-dashboard.json', ref, str(out)],
             env=env,
+            cwd=cwd,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -208,6 +220,97 @@ class BaseFetch(unittest.TestCase):
         result, _, out = self.fetch('abc123', '404')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(out.exists())
+
+    def merge_checkout(self) -> tuple[pathlib.Path, dict[str, str]]:
+        """A checkout of a pull request's merge commit: the base moved to `built`
+        after the pull request opened on `opened`."""
+        repo = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        env = {**os.environ, 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1'}
+
+        def git(*args: str) -> str:
+            argv = ['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com', *args]
+            return subprocess.run(
+                argv, cwd=repo, env=env, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+        git('init', '-q', '-b', 'dev')
+        git('commit', '-q', '--allow-empty', '-m', 'opened on')
+        opened = git('rev-parse', 'HEAD')
+        git('checkout', '-qb', 'topic')
+        git('commit', '-q', '--allow-empty', '-m', 'the pull request')
+        git('checkout', '-q', 'dev')
+        git('commit', '-q', '--allow-empty', '-m', 'the base moves')
+        built = git('rev-parse', 'HEAD')
+        git('checkout', '-q', '--detach')
+        git(
+            'merge',
+            '-q',
+            '--no-ff',
+            '-m',
+            'merge ref\n\nparent 0000000000000000000000000000000000000001',
+            'topic',
+        )
+        merge = git('rev-parse', 'HEAD')
+        # A single-parent commit whose parent is not the event base, so a
+        # check that took any first parent would read it.
+        git('commit', '-q', '--allow-empty', '-m', 'after the merge')
+        after = git('rev-parse', 'HEAD')
+        # HEAD stays on the merge, as a runner checks it out, so a fallback to
+        # HEAD would read its first parent.
+        git('checkout', '-q', merge)
+        return repo, {'opened': opened, 'built': built, 'merge': merge, 'after': after}
+
+    def test_a_pull_request_reads_the_base_its_merge_was_built_on(self):
+        repo, sha = self.merge_checkout()
+        event = {'GITHUB_EVENT_NAME': 'pull_request', 'EVENT_BASE_SHA': sha['opened']}
+        result, log, _ = self.fetch(
+            sha['opened'], extra={**event, 'GITHUB_SHA': sha['merge']}, cwd=repo
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'ref={sha["built"]}', log)
+
+    def test_any_other_base_is_read_as_given(self):
+        repo, sha = self.merge_checkout()
+        # Each case names the merge and the event base, so only the event or
+        # the equality guard keeps the ref as given.
+        merge = {'GITHUB_SHA': sha['merge'], 'EVENT_BASE_SHA': sha['opened']}
+        for name, ref, extra in (
+            ('a push', sha['opened'], {**merge, 'GITHUB_EVENT_NAME': 'push'}),
+            (
+                'a pull_request_target',
+                sha['opened'],
+                {**merge, 'GITHUB_EVENT_NAME': 'pull_request_target'},
+            ),
+            ('a caller-chosen base', 'abc123', {**merge, 'GITHUB_EVENT_NAME': 'pull_request'}),
+        ):
+            with self.subTest(name):
+                result, log, _ = self.fetch(ref, extra=extra, cwd=repo)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'ref={ref}', log)
+
+    def test_a_pull_request_with_no_merge_commit_at_hand_keeps_the_event_base(self):
+        repo, sha = self.merge_checkout()
+        event = {'GITHUB_EVENT_NAME': 'pull_request', 'EVENT_BASE_SHA': sha['opened']}
+        outside = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for name, extra, cwd in (
+            ('a single-parent head', {**event, 'GITHUB_SHA': sha['after']}, repo),
+            ('no GITHUB_SHA', event, repo),
+            ('no repository', {**event, 'GITHUB_SHA': sha['merge']}, outside),
+        ):
+            with self.subTest(name):
+                result, log, _ = self.fetch(sha['opened'], extra=extra, cwd=cwd)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'ref={sha["opened"]}', log)
+
+    def test_the_action_hands_the_script_the_event_base_its_default_names(self):
+        action = yaml.safe_load((ACTION / 'action.yml').read_text())
+        step = next(s for s in action['runs']['steps'] if s.get('name') == 'Check the dashboard')
+        self.assertEqual(step['env']['EVENT_BASE_SHA'], '${{ github.event.pull_request.base.sha }}')
+        self.assertTrue(
+            action['inputs']['base-ref']['default'].startswith(
+                '${{ github.event.pull_request.base.sha ||'
+            )
+        )
 
     def test_other_answer_fails_closed(self):
         result, _, out = self.fetch('abc123', '500')
