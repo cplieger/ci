@@ -918,7 +918,7 @@ jobs:
       # The dashboard check comes from this workflow's own commit, so it needs
       # no pin of its own.
       - name: Check out the ci source
-        if: ${{ hashFiles('grafana-dashboard.json') != '' }}
+        if: ${{ hashFiles('grafana-dashboard.json', 'grafana-dashboard-*.json') != '' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ job.workflow_repository }}
@@ -926,10 +926,25 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
+      - name: List the dashboards
+        id: dashboards
+        if: ${{ hashFiles('grafana-dashboard.json', 'grafana-dashboard-*.json') != '' }}
+        continue-on-error: true
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+        run: |
+          (
+            files=$(bash "$CI_TOOLS/dashboards.sh" list) \
+              && echo "files=${files//$'\n'/ }" >> "$GITHUB_OUTPUT"
+          ) || { echo "List the dashboards" >> /tmp/_ci_failures; exit 1; }
+
       - name: Dashboard check
-        if: ${{ hashFiles('grafana-dashboard.json') != '' }}
+        # Every step using the ci source repeats the checkout's guard (scripts/test_workflow_source.py).
+        if: ${{ hashFiles('grafana-dashboard.json', 'grafana-dashboard-*.json') != '' && steps.dashboards.outputs.files != '' }}
         continue-on-error: true
         uses: ./.cplieger-ci/actions/dashboard-check
+        with:
+          path: ${{ steps.dashboards.outputs.files }}
 
       - name: Check results
         if: always()

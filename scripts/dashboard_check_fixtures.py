@@ -10,6 +10,8 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ACTION = ROOT / 'actions' / 'dashboard-check'
 FIXTURE = ROOT / 'scripts' / 'testdata' / 'dashboard-check' / 'valid.json'
+ONE_DASHBOARD = ROOT / 'scripts' / 'testdata' / 'dashboards' / 'one-dashboard'
+TWO_DASHBOARDS = ROOT / 'scripts' / 'testdata' / 'dashboards' / 'two-dashboards'
 
 _spec = importlib.util.spec_from_file_location('dashboard_check', ACTION / 'dashboard-check.py')
 dc = importlib.util.module_from_spec(_spec)
