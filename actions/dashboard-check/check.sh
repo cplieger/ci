@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Env: DASHBOARD_PATH (the file), BASE_REF (empty: no base), TOKEN (contents
-# read), DASHBOARD_CHECK_TOOLS (tool dir, default $RUNNER_TEMP/dashboard-check).
+# Env: DASHBOARD_PATH (the file), BASE_REF (empty: no base), EVENT_BASE_SHA
+# (the pull request event's base SHA: fetch-base.sh reads that base at the merge
+# commit's first parent), TOKEN (contents read), DASHBOARD_CHECK_TOOLS (tool
+# dir, default $RUNNER_TEMP/dashboard-check).
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

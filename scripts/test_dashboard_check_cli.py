@@ -8,6 +8,8 @@ import sys
 import tempfile
 import unittest
 
+import yaml
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from dashboard_check_fixtures import (
@@ -245,19 +247,25 @@ class BaseFetch(unittest.TestCase):
             'merge ref\n\nparent 0000000000000000000000000000000000000001',
             'topic',
         )
-        return repo, {'opened': opened, 'built': built, 'merge': git('rev-parse', 'HEAD')}
+        merge = git('rev-parse', 'HEAD')
+        # A single-parent commit whose parent is not the event base, so a
+        # check that took any first parent would read it.
+        git('commit', '-q', '--allow-empty', '-m', 'after the merge')
+        return repo, {
+            'opened': opened,
+            'built': built,
+            'merge': merge,
+            'after': git('rev-parse', 'HEAD'),
+        }
 
     def test_a_pull_request_reads_the_base_its_merge_was_built_on(self):
         repo, sha = self.merge_checkout()
         event = {'GITHUB_EVENT_NAME': 'pull_request', 'EVENT_BASE_SHA': sha['opened']}
-        for name, extra in (
-            ('merge commit named', {**event, 'GITHUB_SHA': sha['merge']}),
-            ('HEAD alone', event),
-        ):
-            with self.subTest(name):
-                result, log, _ = self.fetch(sha['opened'], extra=extra, cwd=repo)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn(f'ref={sha["built"]}', log)
+        result, log, _ = self.fetch(
+            sha['opened'], extra={**event, 'GITHUB_SHA': sha['merge']}, cwd=repo
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'ref={sha["built"]}', log)
 
     def test_any_other_base_is_read_as_given(self):
         repo, sha = self.merge_checkout()
@@ -279,13 +287,24 @@ class BaseFetch(unittest.TestCase):
         event = {'GITHUB_EVENT_NAME': 'pull_request', 'EVENT_BASE_SHA': sha['opened']}
         outside = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         for name, extra, cwd in (
-            ('a single-parent head', {**event, 'GITHUB_SHA': sha['built']}, repo),
-            ('no repository', event, outside),
+            ('a single-parent head', {**event, 'GITHUB_SHA': sha['after']}, repo),
+            ('no GITHUB_SHA', event, repo),
+            ('no repository', {**event, 'GITHUB_SHA': sha['merge']}, outside),
         ):
             with self.subTest(name):
                 result, log, _ = self.fetch(sha['opened'], extra=extra, cwd=cwd)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f'ref={sha["opened"]}', log)
+
+    def test_the_action_hands_the_script_the_event_base_its_default_names(self):
+        action = yaml.safe_load((ACTION / 'action.yml').read_text())
+        step = next(s for s in action['runs']['steps'] if s.get('name') == 'Check the dashboard')
+        self.assertEqual(step['env']['EVENT_BASE_SHA'], '${{ github.event.pull_request.base.sha }}')
+        self.assertTrue(
+            action['inputs']['base-ref']['default'].startswith(
+                '${{ github.event.pull_request.base.sha ||'
+            )
+        )
 
     def test_other_answer_fails_closed(self):
         result, _, out = self.fetch('abc123', '500')

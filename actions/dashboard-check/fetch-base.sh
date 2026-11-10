@@ -26,8 +26,8 @@ fi
 # The parent lines come from the commit's header, which a shallow checkout
 # holds too; the header ends at the first blank line, before the message.
 if [ "${GITHUB_EVENT_NAME:-}" = pull_request ] && [ "$ref" = "${EVENT_BASE_SHA:-}" ]; then
-  mapfile -t parents < <(git cat-file -p "${GITHUB_SHA:-HEAD}" 2> /dev/null | sed -n '/^$/q; s/^parent //p')
-  if [ "${#parents[@]}" -eq 2 ]; then
+  mapfile -t parents < <(git cat-file -p "${GITHUB_SHA:-}" 2> /dev/null | sed -n '/^$/q; s/^parent //p')
+  if [ "${#parents[@]}" -ge 2 ]; then
     ref=${parents[0]}
   fi
 fi

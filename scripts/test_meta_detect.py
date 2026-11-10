@@ -250,6 +250,11 @@ class PullRequestBase(Harness):
 
     def test_a_checkout_that_is_no_merge_falls_back_to_the_event_base(self):
         git(self.repo, 'checkout', '-q', 'topic')
+        # A second head commit, so HEAD^1 is not the event base: a check that
+        # took any first parent would diff from it.
+        (self.repo / 'alpha' / 'n.go').write_text('package m\n')
+        git(self.repo, 'add', '-A')
+        git(self.repo, 'commit', '-qm', 'a second head commit')
         out = self.detect({'GITHUB_BASE_REF': 'dev'})
         self.assertEqual(json.loads(out['go_nested_dirs']), ['alpha'])
         self.assertEqual(out['pr_base'], self.opened)
