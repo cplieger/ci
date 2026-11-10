@@ -8,7 +8,7 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 
 | The repository has | Job | What runs |
 | --- | --- | --- |
-| any files | `repo` | actionlint, zizmor, a gitleaks scan of the working tree, the comment-ratio check, the NOTICE check |
+| any files | `repo` | actionlint, zizmor, a gitleaks scan of the working tree, the comment-ratio check, the NOTICE check, and `actions/dashboard-check` on each root `grafana-dashboard.json` and `grafana-dashboard-<suffix>.json` |
 | any files | `markdown` | markdownlint-cli2, and lychee offline for internal links and heading anchors |
 | `go.mod` at the root | `go` | `go-ci.yaml` |
 | a `go.mod` in a subfolder, with tracked Go files | `go-nested` | `go-ci.yaml` once per module folder |
@@ -123,7 +123,7 @@ A dev build is numbered as the next promotion, so a library's dev run whose code
 
 `docker-release.yaml` is called by `release.yaml` and never directly. Its first job refuses the same callers, in a repair as in a release. Its work splits by channel.
 
-On the dev channel it builds the image on native `amd64` and `arm64` runners and pushes it to GitHub Container Registry. It signs the image with cosign, attaches an SBOM and runs a Trivy scan. A repository with a root `grafana-dashboard.json` also gets the dashboard pushed as an OCI artifact.
+On the dev channel it builds the image on native `amd64` and `arm64` runners and pushes it to GitHub Container Registry. It signs the image with cosign, attaches an SBOM and runs a Trivy scan. A repository with a root `grafana-dashboard.json` also gets the dashboard pushed as the OCI artifact `ghcr.io/<owner>/<image>/dashboard`, and each root `grafana-dashboard-<suffix>.json` as `ghcr.io/<owner>/<image>/dashboard-<suffix>`, all at the release's version. A suffix is lowercase letters and digits in runs joined by single hyphens, such as `messages` or `logs-2`. The `repo` job and the release refuse any other `grafana-dashboard-*.json` at the root by name, because its package name could be invalid. GitHub makes a new package private on its first publish, so the release that first pushes a dashboard package fails its read-back from the registry until you make that package public and rerun the failed job.
 
 On the stable channel it re-tags the image the dev channel built for that commit as `vX.Y.Z`, `vX.Y`, `vX` and `latest`. It copies the image to Docker Hub with its signatures and creates the GitHub Release with its assets, described below. When it promotes a build, the Release's SBOM is the one that build signed into the image, read only once its signature checks out. When no dev build matches, it builds from source and says so in the run summary. It also writes the Docker Hub overview page from the README.
 
@@ -132,11 +132,11 @@ Every image it builds, on either channel, then runs the `docker` job's two image
 A stable image release carries these GitHub Release assets:
 
 - `sbom.spdx.json`, the image's SBOM;
-- `grafana-dashboard.json`, when the release commit holds one at the repository root;
+- `grafana-dashboard.json` and each `grafana-dashboard-<suffix>.json` the release commit holds at the repository root;
 - `openapi.json`, the release commit's `docs/openapi.json`, when it holds one;
 - the repository's client as binaries for Linux, macOS and Windows on `amd64` and `arm64`, named `<name>-<goos>-<goarch>` with `.exe` on Windows, when `release.yaml`'s policy step names a client for the repository. `scripts/release-assets.sh build` compiles them from the release commit with `CGO_ENABLED=0`, `-trimpath` and `-ldflags "-s -w -X main.version=<tag>"`, using the Go version the module's `go.mod` asks for.
 
-The SBOM, the dashboard, the API document and each binary have a cosign bundle, `<file>.sigstore.json`, signed by `docker-release.yaml`, and all but the SBOM also come with a `.sha256` checksum. So you can verify an asset without pulling the image. The run reads the Release back and fails if an asset is missing. A repository with neither file gets the SBOM alone. When a stable run completes an earlier stable tag whose Release is missing, it creates that Release with the same assets: the SBOM attested to the tag's published image, and the files from the tag's own commit. It publishes nothing if one cannot be made. Before creating either Release, `scripts/release-assets.sh cleanup-drafts` deletes any draft Release of its tag, the kind an asset upload that died leaves behind.
+The SBOM, each dashboard, the API document and each binary have a cosign bundle, `<file>.sigstore.json`, signed by `docker-release.yaml`, and all but the SBOM also come with a `.sha256` checksum. So you can verify an asset without pulling the image. The run reads the Release back and fails if an asset is missing. A repository with no dashboard, API document or client gets the SBOM alone. When a stable run completes an earlier stable tag whose Release is missing, it creates that Release with the same assets: the SBOM attested to the tag's published image, and the files from the tag's own commit. It publishes nothing if one cannot be made. Before creating either Release, `scripts/release-assets.sh cleanup-drafts` deletes any draft Release of its tag, the kind an asset upload that died leaves behind.
 
 A job that runs a script or action from cplieger/ci first checks out cplieger/ci at the commit you pinned. The copy goes to `.cplieger-ci` beside your checkout and keeps no token on disk. So the commit you pin decides every line of cplieger/ci code the run executes. The `pr-policy` job of `ci.yaml` works the same way.
 
@@ -197,7 +197,7 @@ Each run is named `Promote <repo>`, with `(dry run)` after a dry run. Runs for o
 | `actions/render-hub-overview` | builds the Docker Hub overview page from the README's marked summary and `compose.yaml` |
 | `actions/comment-audit` | fails when source carries more than 0.55 comment lines per code line |
 | `actions/intake` | runs the pull-request title and `main` intake checks of the `pr-policy` job |
-| `actions/dashboard-check` | checks a Grafana dashboard file against the schema v2 dashboard format, where a key the format does not define fails at any depth, and against layout, reference and description rules. A classic dashboard passes with a notice |
+| `actions/dashboard-check` | checks each Grafana dashboard file its `path` input names, whitespace-separated, against the schema v2 dashboard format, where a key the format does not define fails at any depth, and against layout, reference and description rules. A classic dashboard passes with a notice |
 | `actions/alert-rules` | checks the alert rule files and the alert table of `docs/monitoring.md`, with a pinned `promtool` and `lokitool`, for the `alerts` job |
 | `actions/notice-audit` | fails when the root `NOTICE` departs from its three-line template, or a published package folder lacks identical `LICENSE` and `NOTICE` copies |
 

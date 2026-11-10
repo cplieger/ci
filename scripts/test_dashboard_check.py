@@ -18,6 +18,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from dashboard_check_fixtures import (
     CLASSIC,
+    ONE_DASHBOARD,
+    TWO_DASHBOARDS,
     conditional_group,
     dc,
     defaults,
@@ -650,6 +652,15 @@ class StrictVet(unittest.TestCase):
     def test_valid_fixture_vets_against_every_schema(self):
         code, out = self.check(valid())
         self.assertEqual(code, 0, out)
+
+    def test_each_bundled_dashboard_fixture_vets(self):
+        for repo, count in ((ONE_DASHBOARD, 1), (TWO_DASHBOARDS, 2)):
+            paths = sorted(repo.glob('grafana-dashboard*.json'))
+            self.assertEqual(len(paths), count, repo)
+            for path in paths:
+                with self.subTest(file=f'{repo.name}/{path.name}'):
+                    code, out = run_cli('--cue', CUE, *self.schema_args(), str(path))
+                    self.assertEqual(code, 0, out)
 
     def test_rejects_an_element_of_unknown_kind(self):
         doc = valid()

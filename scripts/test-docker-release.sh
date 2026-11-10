@@ -76,6 +76,7 @@ wanted = {
         "Stage and sign the release assets": "stagesign.sh",
         "Create release": "createrel.sh",
         "Verify the release assets": "verifyassets.sh",
+        "Publish dashboard OCI artifact": "dashpub.sh",
     },
     "receipt": {"Record the completion receipt": "receipt.sh"},
     "repair-assets": {"Check the Release": "rassets-check.sh", "Sign the release assets": "rassets.sh"},
@@ -212,6 +213,7 @@ for wname, wjobs in (("docker-release", jobs), ("release", rjobs)):
 gates["logins"] = logins
 vp = next(s for s in jobs["verify-publish"]["steps"] if s.get("name") == "Verify published image")
 open(f"{out}/vpimage.sh", "w").write(vp["run"])
+open(f"{out}/vpimage.sh.envmap", "w").write("".join(f"{k}={v}\n" for k, v in sorted(jobs["verify-publish"]["env"].items())))
 # The rebuild gate and the jobs it holds back.
 gj = jobs["rebuild-gate"]
 gates["gate"] = {
@@ -1788,6 +1790,116 @@ chk "D-S3 a failed signature fails the step" "$(COSIGN_SIGN_RC=1 COSIGN_SIGN_FAI
 chk_has "D-S3 naming the bundle" "$(cat "$WORK/ss.log")" \
   "::error::openapi.json.sigstore.json is missing, because cosign could not sign openapi.json. v2.0.1 is not published without it."
 
+# ── Two dashboards ─────────────────────────────────────────────────────────
+# Each file is listed for the repo job's check, pushed as its own package
+# and attached to the Release.
+TWO_FIXTURE="$ROOT/scripts/testdata/dashboards/two-dashboards"
+python3 - "$ROOT/.github/workflows/ci.yaml" "$WORK/cilist.sh" <<'PY2'
+import sys, yaml
+steps = yaml.safe_load(open(sys.argv[1]))["jobs"]["repo"]["steps"]
+step = next(s for s in steps if s.get("name") == "List the dashboards")
+open(sys.argv[2], "w").write(step["run"])
+check = next(s for s in steps if s.get("name") == "Dashboard check")
+open(sys.argv[2] + ".with", "w").write(check["with"]["path"])
+PY2
+[ -s "$WORK/cilist.sh" ] && [ -s "$WORK/dashpub.sh" ] || fail "D-DB0 the dashboard listing or publish step was not extracted"
+chk "D-DB0 the repo job checks exactly what it listed" "$(cat "$WORK/cilist.sh.with")" '${{ steps.dashboards.outputs.files }}'
+git -C "$NOTESREPO" checkout -q -b two-dashboards "$DSH"
+cp "$TWO_FIXTURE/grafana-dashboard.json" "$TWO_FIXTURE/grafana-dashboard-messages.json" "$NOTESREPO/"
+git -C "$NOTESREPO" add grafana-dashboard.json grafana-dashboard-messages.json
+git -C "$NOTESREPO" commit -q -m "feat: a messages dashboard"
+TWO=$(git -C "$NOTESREPO" rev-parse HEAD)
+git -C "$NOTESREPO" tag v2.0.3
+MSG_NAMES="grafana-dashboard-messages.json grafana-dashboard-messages.json.sha256 grafana-dashboard-messages.json.sigstore.json"
+listed() { # <commit> -> rc|the files output the repo job's listing step writes for the commit's tree|its failure marker
+  local rc=0
+  rm -rf "$WORK/cilist" && mkdir -p "$WORK/cilist"
+  git -C "$NOTESREPO" archive "$1" | tar -x -C "$WORK/cilist"
+  sed "s#/tmp/_ci_failures#$WORK/cilist.marker#" "$WORK/cilist.sh" >"$WORK/cilist-run.sh"
+  rm -f "$WORK/cilist.marker" "$WORK/cilist.out"
+  (cd "$WORK/cilist" && CI_TOOLS="$ROOT/scripts" GITHUB_OUTPUT="$WORK/cilist.out" bash -e "$WORK/cilist-run.sh") >"$WORK/cilist.log" 2>&1 || rc=$?
+  echo "$rc|$(cat "$WORK/cilist.out" 2>/dev/null)|$(cat "$WORK/cilist.marker" 2>/dev/null)"
+}
+chk "D-DB1 one dashboard is listed alone for the check" "$(listed "$DSH")" "0|files=grafana-dashboard.json|"
+chk "D-DB1 a second dashboard is listed beside it" "$(listed "$TWO")" "0|files=grafana-dashboard.json grafana-dashboard-messages.json|"
+DBIN="$WORK/dbin"
+mkdir -p "$DBIN"
+export DASH_LOG="$WORK/dash.log"
+cat >"$DBIN/oras" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = push ] || { echo "stub: unexpected oras $*" >&2 && exit 22; }
+all="$*" out=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in --export-manifest) out=$2 && shift ;; esac
+  shift
+done
+[ -n "$out" ] || { echo "stub: oras push without --export-manifest" >&2 && exit 22; }
+printf '%s' "$all" >"$out"
+printf 'push %s\n' "$(awk '{ print $(NF-1), $NF }' <<<"$all")" >>"$DASH_LOG"
+SH
+cat >"$DBIN/cosign" <<'SH'
+#!/usr/bin/env bash
+[ "$1 $2" = "sign --yes" ] || { echo "stub: unexpected cosign $*" >&2 && exit 22; }
+printf 'sign %s\n' "$3" >>"$DASH_LOG"
+SH
+chmod 755 "$DBIN/oras" "$DBIN/cosign"
+dash_published() { # <commit> -> rc|the published output; the pushes and signatures in $DASH_LOG
+  local rc=0
+  : >"$DASH_LOG"
+  git -C "$NOTESREPO" checkout -q "$1" -- .
+  : >"$WORK/out"
+  (cd "$NOTESREPO" && PATH="$DBIN:$PATH" CI_TOOLS="$ROOT/scripts" RUNNER_TEMP="$WORK" GITHUB_OUTPUT="$WORK/out" \
+    GITHUB_STEP_SUMMARY="$WORK/summary" GITHUB_SHA="$1" GITHUB_REPOSITORY=owner/app REGISTRY=ghcr.io IMAGE_NAME=owner/app \
+    CHANNEL=stable TAG=v2.0.3 VERSION=v2.0.3 MAJOR=v2 bash "$WORK/dashpub.sh") >"$WORK/dashpub.log" 2>&1 || rc=$?
+  echo "$rc|$(out published)"
+}
+mdigest() { echo "sha256:$(sha256sum "$WORK/$1-manifest.json" | cut -d' ' -f1)"; }
+git -C "$NOTESREPO" checkout -q "$DSH"
+r=$(dash_published "$DSH")
+chk "D-DB2 one dashboard is pushed and signed as the dashboard package alone" "$r|$(tr '\n' ';' <"$DASH_LOG")" \
+  "0|[{\"package\":\"dashboard\",\"digest\":\"$(mdigest dashboard)\"}]|push ghcr.io/owner/app/dashboard:v2.0.3,v2 grafana-dashboard.json:application/json;sign ghcr.io/owner/app/dashboard@$(mdigest dashboard);"
+git -C "$NOTESREPO" checkout -q two-dashboards
+r=$(dash_published "$TWO")
+D_MAIN=$(mdigest dashboard) D_MSG=$(mdigest dashboard-messages)
+chk "D-DB2 a second dashboard is pushed and signed as its own package" "$r|$(tr '\n' ';' <"$DASH_LOG")" \
+  "0|[{\"package\":\"dashboard\",\"digest\":\"$D_MAIN\"},{\"package\":\"dashboard-messages\",\"digest\":\"$D_MSG\"}]|push ghcr.io/owner/app/dashboard:v2.0.3,v2 grafana-dashboard.json:application/json;sign ghcr.io/owner/app/dashboard@$D_MAIN;push ghcr.io/owner/app/dashboard-messages:v2.0.3,v2 grafana-dashboard-messages.json:application/json;sign ghcr.io/owner/app/dashboard-messages@$D_MSG;"
+chk "D-DB2 each from its own file" "$(grep -c 'grafana-dashboard-messages.json:application/json' "$WORK/dashboard-messages-manifest.json")|$(grep -c 'grafana-dashboard-messages' "$WORK/dashboard-manifest.json" || true)" "1|0"
+printf '%s\n' "owner/app:v2.0.3 $PREV_DIGEST" >"$TAGS"
+echo "owner/app $TWO" >"$COSIGN_SIGNED"
+chk "D-DB3 a tag shipping two dashboards hands on both, each with its checksum and signature" "$(assets v2.0.3)|$(signed)" \
+  "0|$(sorted_words "$DASH_NAMES $MSG_NAMES sbom.spdx.json sbom.spdx.json.sigstore.json")|3"
+chk "D-DB3 signed in the Release's order, the second dashboard from the tag's tree" \
+  "$(grep '^sign-blob' "$COSIGN_LOG" | cut -d' ' -f3 | tr '\n' ' ')|$(cmp -s "$ASSETS_DIR/grafana-dashboard-messages.json" "$TWO_FIXTURE/grafana-dashboard-messages.json" && echo same)|$(cd "$ASSETS_DIR" && sha256sum -c grafana-dashboard-messages.json.sha256)" \
+  "sbom.spdx.json grafana-dashboard.json grafana-dashboard-messages.json |same|grafana-dashboard-messages.json: OK"
+chk "D-DB3 a failed signature of the second dashboard hands nothing on" \
+  "$(COSIGN_SIGN_RC=1 COSIGN_SIGN_FAIL=grafana-dashboard-messages.json assets v2.0.3 | cut -d'|' -f1)" "1"
+chk_has "D-DB3 naming that bundle" "$(cat "$WORK/assets.log")" \
+  "::error::grafana-dashboard-messages.json.sigstore.json is missing, because cosign could not sign grafana-dashboard-messages.json. v2.0.3 is not published without it."
+chk "D-DB4 a release commit holding two dashboards stages and signs both" \
+  "$(stage_signed "$TWO")|$(signed)" "0|$(sorted_words "$DASH_NAMES $MSG_NAMES sbom.spdx.json sbom.spdx.json.sigstore.json")|3"
+chk "D-DB4 and the Release names both, the main dashboard first" \
+  "$(bash "$ROOT/scripts/release-assets.sh" names v2.0.1 "$SSRT/release-assets" | tr '\n' ' ')" \
+  "sbom.spdx.json sbom.spdx.json.sigstore.json $DASH_NAMES $MSG_NAMES "
+rm "$SSRT/release-assets/grafana-dashboard-messages.json.sigstore.json"
+chk "D-DB4 a second dashboard staged without its signature names it" \
+  "$(bash "$ROOT/scripts/release-assets.sh" names v2.0.1 "$SSRT/release-assets" 2>&1 >/dev/null || echo "EXIT=$?")" \
+  "::error::grafana-dashboard-messages.json.sigstore.json is missing. v2.0.1 is not published without it.
+EXIT=1"
+printf '{}\n' >"$NOTESREPO/grafana-dashboard-Logs.json"
+git -C "$NOTESREPO" add grafana-dashboard-Logs.json
+git -C "$NOTESREPO" commit -q -m "feat: a badly named dashboard"
+BADDASH=$(git -C "$NOTESREPO" rev-parse HEAD)
+git -C "$NOTESREPO" tag v2.0.4
+printf '%s\n' "owner/app:v2.0.4 $PREV_DIGEST" >"$TAGS"
+echo "owner/app $BADDASH" >"$COSIGN_SIGNED"
+chk "D-DB5 a refused dashboard name fails the check's listing" "$(listed "$BADDASH")" "1||List the dashboards"
+chk_has "D-DB5 naming the file" "$(cat "$WORK/cilist.log")" "::error::grafana-dashboard-Logs.json cannot be published"
+chk "D-DB5 and the publish, before any push" "$(dash_published "$BADDASH" | cut -d'|' -f1)|$(wc -l <"$DASH_LOG" | tr -d ' ')" "1|0"
+chk "D-DB5 and the Release's assets, before any signature" "$(assets v2.0.4 | cut -d'|' -f1)|$(signed)" "1|0"
+chk_has "D-DB5 naming the file there too" "$(cat "$WORK/assets.log")" "::error::grafana-dashboard-Logs.json cannot be published"
+git -C "$NOTESREPO" checkout -q -f api-document
+git -C "$NOTESREPO" tag -d v2.0.3 v2.0.4 >/dev/null
+
 # ── The client binaries an opted-in repository's Release carries ────────────
 chk "D-B1 the step hands the caller's binaries input to the build" \
   "$(sed -n 's/^BINARIES=//p;s/^GOTOOLCHAIN=//p' "$WORK/stagesign.sh.envmap" | tr '\n' ' ')" '${{ inputs.binaries }} auto '
@@ -2556,9 +2668,10 @@ chk_has "D-IT6 the harness is run through sh" "$(gate '."image-test"."Image smok
 chk_has "D-IT6 the suite is executed directly" "$(gate '."image-test"."Image test suite".run')" './tests/image-test.sh "$IMAGE_REF"'
 
 # ── verify-publish: every registry written serves this run's digest ──────────
-# Stub curl: a token request (-o) gets a token; a manifest HEAD (-I) answers
+# Stub curl: a token request (-o) gets a token, unless its URL matches
+# DENY_TOKEN, which fails as GHCR's 403 does; a manifest HEAD (-I) answers
 # SERVE_<site> as its digest once the site has been asked SERVE_<site>_FROM
-# times (default 1), else fails as a 404 does. Sites: ghcr, hub, dash.
+# times (default 1), else fails as a 404 does. Sites: ghcr, hub, dash, dashm.
 VBIN="$WORK/vbin"
 mkdir -p "$VBIN"
 export VCURL_LOG="$WORK/vcurl.log"
@@ -2573,11 +2686,13 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 if [ -n "$out" ]; then
+  case "$url" in ${DENY_TOKEN:-}) exit 22 ;; esac
   printf '{"token":"t"}\n' >"$out"
   exit 0
 fi
 case "$url" in
   */dashboard/manifests/*) site=dash ;;
+  */dashboard-messages/manifests/*) site=dashm ;;
   https://registry-1.docker.io/*) site=hub ;;
   *) site=ghcr ;;
 esac
@@ -2597,21 +2712,38 @@ vp_image() { # env-prefixed: runs the step; prints its output, EXIT=n on failure
   (PATH="$VBIN:$PATH" CI_TOOLS="$ROOT/scripts" RUNNER_TEMP="$WORK" REGISTRY=ghcr.io IMAGE_NAME=owner/app \
     VERSION=v1.3.0 DIGEST="$D_IDX" bash "$WORK/vpimage.sh" 2>&1) || echo "EXIT=$?"
 }
-out_v=$(CHANNEL=stable REGISTRIES=ghcr,dockerhub DASHBOARD_DIGEST="$D_DASH" SERVE_ghcr="$D_IDX" \
+ONE_DASH="[{\"package\":\"dashboard\",\"digest\":\"$D_DASH\"}]"
+chk "D-X0 the step reads the dashboards finalize published" \
+  "$(sed -n 's/^DASHBOARDS=//p' "$WORK/vpimage.sh.envmap")" '${{ needs.finalize.outputs.dashboards }}'
+out_v=$(CHANNEL=stable REGISTRIES=ghcr,dockerhub DASHBOARDS="$ONE_DASH" SERVE_ghcr="$D_IDX" \
   SERVE_hub="$D_IDX" SERVE_hub_FROM=7 SERVE_dash="$D_DASH" vp_image)
 chk "D-X1 a Docker Hub tag served on the seventh read passes" "$(printf '%s' "$out_v" | grep -c '^EXIT=' || true)" "0"
 chk_has "D-X1 reported as a late answer" "$out_v" \
   "::notice::docker.io/owner/app:v1.3.0 was served on attempt 7, after 195s of waiting"
 chk_has "D-X1 the dashboard at its own digest" "$out_v" "ok: ghcr.io/owner/app/dashboard:v1.3.0 -> $D_DASH"
-out_v=$(CHANNEL=stable REGISTRIES=ghcr,dockerhub DASHBOARD_DIGEST="" SERVE_ghcr="$D_DASH" SERVE_hub="$D_IDX" vp_image)
+out_v=$(CHANNEL=stable REGISTRIES=ghcr,dockerhub DASHBOARDS="" SERVE_ghcr="$D_DASH" SERVE_hub="$D_IDX" vp_image)
 chk "D-X2 a tag at another digest fails" "$(printf '%s' "$out_v" | sed -n 's/^EXIT=//p')" "1"
 chk_has "D-X2 naming what the registry served" "$out_v" \
   "::error::ghcr.io/owner/app:v1.3.0: expected $D_IDX, registry answered '$D_DASH'"
 chk "D-X2 after the whole wait, and Docker Hub still read once" \
   "$(grep -cx ghcr "$VCURL_LOG")|$(grep -cx hub "$VCURL_LOG")" "14|1"
-out_v=$(CHANNEL=dev REGISTRIES=ghcr,dockerhub DASHBOARD_DIGEST="$D_DASH" SERVE_ghcr="$D_IDX" vp_image)
+out_v=$(CHANNEL=dev REGISTRIES=ghcr,dockerhub DASHBOARDS="$ONE_DASH" SERVE_ghcr="$D_IDX" vp_image)
 chk_has "D-X3 a dashboard never served fails as nothing" "$out_v" \
   "::error::ghcr.io/owner/app/dashboard:v1.3.0: expected $D_DASH, registry answered 'nothing'"
 chk "D-X3 and a dev run never reads Docker Hub" "$(grep -cx hub "$VCURL_LOG" || true)" "0"
+D_DASHM="sha256:$(printf '3%.0s' $(seq 64))"
+TWO_DASH="[{\"package\":\"dashboard\",\"digest\":\"$D_DASH\"},{\"package\":\"dashboard-messages\",\"digest\":\"$D_DASHM\"}]"
+out_v=$(CHANNEL=dev REGISTRIES=ghcr DASHBOARDS="$TWO_DASH" SERVE_ghcr="$D_IDX" SERVE_dash="$D_DASH" SERVE_dashm="$D_DASHM" vp_image)
+chk "D-X4 two dashboards each read back at their own digest pass" "$(printf '%s' "$out_v" | grep -c '^EXIT=' || true)" "0"
+chk_has "D-X4 the second as its own package" "$out_v" "ok: ghcr.io/owner/app/dashboard-messages:v1.3.0 -> $D_DASHM"
+out_v=$(CHANNEL=dev REGISTRIES=ghcr DASHBOARDS="$TWO_DASH" SERVE_ghcr="$D_IDX" SERVE_dash="$D_DASH" SERVE_dashm="$D_DASH" vp_image)
+chk "D-X5 a second dashboard at the first's digest fails" "$(printf '%s' "$out_v" | sed -n 's/^EXIT=//p')" "1"
+chk_has "D-X5 naming it" "$out_v" "::error::ghcr.io/owner/app/dashboard-messages:v1.3.0: expected $D_DASHM, registry answered '$D_DASH'"
+out_v=$(CHANNEL=dev REGISTRIES=ghcr DASHBOARDS="$TWO_DASH" SERVE_ghcr="$D_IDX" SERVE_dashm="$D_DASHM" \
+  DENY_TOKEN='*repository:owner/app/dashboard:pull' vp_image)
+chk "D-X6 a package GHCR gives no anonymous token for fails, the others still read" \
+  "$(printf '%s' "$out_v" | sed -n 's/^EXIT=//p')|$(grep -cx dash "$VCURL_LOG" || true)|$(grep -cx dashm "$VCURL_LOG" || true)" "1|0|1"
+chk_has "D-X6 saying what the owner does" "$out_v" \
+  "::error::ghcr.io/owner/app/dashboard: no anonymous pull token. A package's first publish leaves it private until its owner makes it public. Then rerun this job."
 
 echo "PASS ($PASS checks)"

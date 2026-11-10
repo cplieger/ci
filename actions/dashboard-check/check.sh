@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Env: DASHBOARD_PATH (the file), BASE_REF (empty: no base), TOKEN (contents
-# read), DASHBOARD_CHECK_TOOLS (tool dir, default $RUNNER_TEMP/dashboard-check).
+# Env: DASHBOARD_PATH (the files, whitespace-separated), BASE_REF (empty: no
+# base), TOKEN (contents read), DASHBOARD_CHECK_TOOLS (tool dir, default
+# $RUNNER_TEMP/dashboard-check). Checks every file, failing if any fails.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -14,11 +15,24 @@ for schema in "$tools"/schema-*.cue; do
   args+=(--schema "${tag%.cue}=${schema}")
 done
 
+read -r -d '' -a paths <<<"${DASHBOARD_PATH:-}" || true
+[ "${#paths[@]}" -gt 0 ] || {
+  echo "::error::dashboard-check: no dashboard file given" >&2
+  exit 2
+}
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-bash "$here/fetch-base.sh" "$DASHBOARD_PATH" "${BASE_REF:-}" "$work/base.json"
-if [ -f "$work/base.json" ]; then
-  args+=(--base-file "$work/base.json")
-fi
-
-python3 "$here/dashboard-check.py" "${args[@]}" "$DASHBOARD_PATH"
+rc=0
+for path in "${paths[@]}"; do
+  file_args=("${args[@]}")
+  if ! bash "$here/fetch-base.sh" "$path" "${BASE_REF:-}" "$work/base.json"; then
+    rc=1
+    continue
+  fi
+  if [ -f "$work/base.json" ]; then
+    file_args+=(--base-file "$work/base.json")
+  fi
+  python3 "$here/dashboard-check.py" "${file_args[@]}" "$path" || rc=1
+done
+exit "$rc"
