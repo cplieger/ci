@@ -50,7 +50,6 @@ gremlins --dry-run failed; keeping per-package mode\n
 has issues disabled; skipped {args.mode} for
 image repo — the next release
 image repos matched; nothing to sync
-in devDependencies/overrides — not significant
 its gremlins JSON; repeatable
 its manifest hash; aborting
 linux/amd64 sub-manifest found; skipping size badge
