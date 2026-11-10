@@ -2,9 +2,10 @@
 # Regression probe for the shell semantics release.yaml and ci.yaml embed
 # inline: nested-Go-module lanes (release.yaml detect and go-nested, ci.yaml's
 # nested validation discovery), ci.yaml's web-frontend probe, its go-os
-# runner detection and its pull-request module scoping. A snippet not extracted below is MIRRORED, so editing
-# either side updates the other in the same change. Runs in the ci repo's
-# `scripts` CI job (opt-in by file presence).
+# runner detection and its pull-request module scoping. A snippet not
+# extracted below is MIRRORED, so editing either side updates the other in
+# the same change. Runs in the ci repo's `scripts` CI job (opt-in by file
+# presence).
 set -euo pipefail
 
 # Hermetic git, same rationale as test-cliff-bump-semantics.sh: a global
@@ -114,6 +115,10 @@ open(f"{out}/web-probe.sh", "w").write(textwrap.dedent("\n".join(lines[start : e
 start = next(i for i, l in enumerate(lines) if l.strip().startswith("# A module tracking a Go file built for windows or darwin"))
 end = next(i for i in range(start, len(lines)) if lines[i].strip().startswith("go_os_matrix=$(jq -c 'unique_by"))
 open(f"{out}/go-os.sh", "w").write(textwrap.dedent("\n".join(lines[start : end + 1])) + "\n")
+
+start = next(i for i, l in enumerate(lines) if l.strip().startswith("# A module requiring a sibling by version"))
+end = next(i for i in range(start, len(lines)) if lines[i].strip() == 'done <<< "$mod_dirs"')
+open(f"{out}/go-work.sh", "w").write(textwrap.dedent("\n".join(lines[start : end + 1])) + "\n")
 
 start = next(i for i, l in enumerate(lines) if l.strip().startswith("# On a pull request in a repository of modules"))
 indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
@@ -547,8 +552,14 @@ chk "L-F4 empty LANE_ARGS contributes zero argv words" "$#" "6"
 cat >"$WORK/scope-run.sh" <<'SH'
 scope_modules=$1
 changed=$2
-sibling_replaced=${4:-false}
+sibling_replaced=false
 go_nested_dirs=${NESTED:-'["filesafe","httpclient","keyenc","measure","ssrf"]'}
+if [ "$4" = true ]; then
+  mod_dirs=$(jq -r '.[]' <<<"$go_nested_dirs")
+  run_go_work=false
+  # shellcheck source=/dev/null
+  . "$(dirname "$3")/go-work.sh"
+fi
 go_os_matrix='[{"dir":"filesafe","runner":"windows-latest"},{"dir":"measure","runner":"macos-latest"}]'
 ts_nested_dirs='["keyenc/web"]'
 run_go_nested=true
@@ -571,6 +582,31 @@ scope() { # <scope_modules> <changed paths, one per line> [root|replaced|symlink
       ln -s ../ssrf/a.go "$d/measure/a.go"
       git -C "$d" add -A
       ;;
+    replaced | required | unrequired)
+      for m in filesafe httpclient keyenc measure ssrf; do
+        mkdir -p "$d/$m"
+        printf 'module example.com/r/%s\n' "$m" >"$d/$m/go.mod"
+      done
+      if [ "$3" != unrequired ]; then printf 'require example.com/r/ssrf v0.1.0\n' >>"$d/measure/go.mod"; fi
+      if [ "$3" != required ]; then printf 'replace example.com/r/ssrf => ../ssrf\n' >>"$d/measure/go.mod"; fi
+      ;;
+    absolute)
+      mkdir -p "$d/measure" "$d/ssrf"
+      : >"$d/ssrf/a.go"
+      ln -s "$d/ssrf/a.go" "$d/measure/a.go"
+      git -C "$d" add -A
+      ;;
+    loop)
+      mkdir -p "$d/measure"
+      ln -s loop "$d/measure/loop"
+      git -C "$d" add -A
+      ;;
+    quoted)
+      mkdir -p "$d/measure" "$d/ssrf"
+      : >"$d/ssrf/a.go"
+      ln -s ../ssrf/a.go "$d/measure/é.go"
+      git -C "$d" add -A
+      ;;
     inside)
       mkdir -p "$d/measure/sub"
       : >"$d/measure/a.go"
@@ -579,7 +615,7 @@ scope() { # <scope_modules> <changed paths, one per line> [root|replaced|symlink
       ;;
   esac
   local replaced=false
-  if [ "${3:-}" = replaced ]; then replaced=true; fi
+  case "${3:-}" in replaced | required | unrequired) replaced=true ;; esac
   (cd "$d" && bash -eo pipefail "$WORK/scope-run.sh" "$1" "$2" "$WORK/module-scope.sh" "$replaced") \
     || fail "ci.yaml's module-scope block failed for '$2'"
 }
@@ -609,5 +645,17 @@ chk "M-S12 a symlink inside its own module keeps the scope" \
 chk "M-S13 a web half that is itself a module keeps its ts-nested leg" \
   "$(NESTED='["filesafe","keyenc","keyenc/web","measure"]' scope true 'keyenc/web/src/keyenc.ts')" \
   'nested=["keyenc/web"] os=[] ts=["keyenc/web"] run=true,false,true'
+# shellcheck disable=SC2016 # literal single-quoted grep pattern, no expansion wanted
+chk "M-S9 and self-release lists both sides of a rename since the last tag" \
+  "$(grep -c 'git diff --name-only --no-renames "\${LAST_TAG}..HEAD"' "$ROOT/.github/workflows/self-release.yaml")" "1"
+chk "M-S10 and a sibling required by version alone keeps the scope" \
+  "$(scope true 'measure/exposition.go' required)" 'nested=["measure"] os=["measure"] ts=[] run=true,true,false'
+chk "M-S14 a symlink loop does not fail detect" "$(scope true 'measure/a.go' loop | wc -l)" "1"
+chk "M-S15 a symlink whose name git quotes still keeps every module" \
+  "$(scope true 'ssrf/a.go' quoted)" "$ALL"
+chk "M-S16 an absolute symlink into another module keeps every module" \
+  "$(scope true 'ssrf/a.go' absolute)" "$ALL"
+chk "M-S10 and a replaced sibling the module does not require keeps every module" \
+  "$(scope true 'measure/exposition.go' unrequired)" "$ALL"
 
 echo "PASS: nested-module lane, web-probe, go-os detection and module-scope shell semantics match the pinned contract (${PASS} checks)"

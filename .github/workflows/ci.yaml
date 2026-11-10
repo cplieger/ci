@@ -164,13 +164,14 @@ jobs:
                   && ! grep -qxF -- "$p" <<< "$replaced"; then
                   run_go_work=true
                 fi
-                # A sibling replaced by a local path builds from its head even
-                # under GOWORK=off, so its change reaches this module's legs.
-                if [ -n "$p" ] && [ "$p" != "$own" ] && grep -qxF -- "$p" <<< "$mod_paths" \
-                  && grep -qxF -- "$p" <<< "$replaced"; then
+              done < <(gomod_field "$d" require)
+              # A replaced sibling builds from its head even under GOWORK=off,
+              # required directly or not, so its change reaches this module.
+              while IFS= read -r p; do
+                if [ -n "$p" ] && [ "$p" != "$own" ] && grep -qxF -- "$p" <<< "$mod_paths"; then
                   sibling_replaced=true
                 fi
-              done < <(gomod_field "$d" require)
+              done <<< "$replaced"
             done <<< "$mod_dirs"
             if [ "$run_go_work" = true ]; then
               go_work_dirs=$(jq -cR '[., inputs | select(. != "")]' <<< "$mod_dirs")
@@ -290,13 +291,14 @@ jobs:
               }
               touched=""
               scoped=true
-              while IFS= read -r l; do
-                [ -z "$l" ] && continue
-                t=$(realpath -m --relative-to=. -- "$(dirname -- "$l")/$(readlink -- "$l")")
-                if [ "$(module_of "$l")" != "$(module_of "$t/x")" ]; then
+              while IFS= read -r -d '' e; do
+                [ "${e%% *}" = 120000 ] || continue
+                l=${e#*$'\t'}
+                if ! t=$(realpath -m --relative-to=. -- "$l") \
+                  || [ "$(module_of "$l")" != "$(module_of "$t/x")" ]; then
                   scoped=false
                 fi
-              done < <(git ls-files -s | awk '$1 == "120000" { sub(/^[^\t]*\t/, ""); print }')
+              done < <(git ls-files -s -z)
               while [ "$scoped" = true ] && IFS= read -r p; do
                 [ -z "$p" ] && continue
                 m=$(module_of "$p")
