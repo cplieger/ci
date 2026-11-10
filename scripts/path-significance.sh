@@ -258,24 +258,35 @@ for l in "${GO_LANES[@]}"; do
 done
 # shipped_fields <rev> <file> prints the fields of a manifest that ship, in a
 # canonical form: keys sorted, except under exports and imports, whose order is
-# Node's condition match order, and nothing printed when <rev> has no such file
-# or it is not JSON.
+# Node's condition match order, and typesVersions, whose first matching range
+# wins (https://www.typescriptlang.org/docs/handbook/declaration-files/publishing.html#version-selection-with-typesversions);
+# nothing printed when <rev> has no such file or it is not JSON.
 shipped_fields() {
   git show "$1:$2" 2>/dev/null | jq -c '
     def sortkeys: if type == "object" then to_entries | sort_by(.key) | map(.value |= sortkeys) | from_entries
       elif type == "array" then map(sortkeys) else . end;
     del(.devDependencies, .overrides, .version) | . as $m
-    | ($m | del(.exports, .imports) | sortkeys) + {exports: $m.exports, imports: $m.imports}' 2>/dev/null || true
+    | ($m | del(.exports, .imports, .typesVersions) | sortkeys) + {exports: $m.exports, imports: $m.imports, typesVersions: $m.typesVersions}' 2>/dev/null || true
 }
 refine_manifests() { # <from> <paths> -> the paths less each manifest file that ships nothing since <from>
-  local from=$1 paths=$2 pj b h
+  local from=$1 paths=$2 pj b h l
   while IFS= read -r pj; do
     [ -z "$pj" ] && continue
     case "$pj" in
       */jsr.json | jsr.json)
-        # Only a published manifest's jsr.json is judged; any other keeps
-        # counting as before.
-        printf '%s\n' "$MANIFESTS" | grep -qxF -- "${pj%jsr.json}package.json" || continue
+        # Only a published manifest's jsr.json is judged. Under a lane, any
+        # but the half's own is dev tooling, as its package.json is; any other
+        # keeps counting as before.
+        if ! printf '%s\n' "$MANIFESTS" | grep -qxF -- "${pj%jsr.json}package.json"; then
+          for l in "${GO_LANES[@]}"; do
+            if [[ $pj == "$l/"* && $pj != "$l/web/jsr.json" ]]; then
+              paths=$(grep -vxF -- "$pj" <<<"$paths" || true)
+              note "$pj is not a published manifest — dropped from significance" >&2
+              break
+            fi
+          done
+          continue
+        fi
         ;;
       *)
         if ! printf '%s\n' "$MANIFESTS" | grep -qxF -- "$pj"; then

@@ -622,5 +622,19 @@ chk "S45 a jsr.json change beyond its version ships" "$(release S45c stable "$N1
 chk "S45 MODE=paths as half_changed calls it sees an exports reorder" \
   "$(SUBPACKAGES_JSON='["keyenc/web"]' GO_LANES_JSON='[]' REPO_TYPE=none paths "$N9" "$N10")" \
   'false|["keyenc/web"]|[]|["keyenc/web/package.json"]'
+git tag keyenc/v1.2.5 "$N12"
+put keyenc/web/package.json '{"dependencies":{"b":"2"},"version":"1.0.0","name":"@o/keyenc","devDependencies":{"knip":"3"},"exports":{".":{"default":"./d.js","node":"./n.js"}}}'
+N13=$(commit "chore(keyenc): sort the half's manifest")
+chk "S46 a key reorder outside exports, imports and typesVersions ships nothing" "$(release S46 stable "$N12" "$N12" "$N13")" 'false|[]|[]'
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"1.0.0","dependencies":{"b":"2"},"typesVersions":{">=5.0":{"*":["a/*"]},"*":{"*":["b/*"]}}}'
+N14=$(commit "feat(keyenc): types per compiler")
+git tag keyenc/v1.2.6 "$N14"
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"1.0.0","dependencies":{"b":"2"},"typesVersions":{"*":{"*":["b/*"]},">=5.0":{"*":["a/*"]}}}'
+N15=$(commit "fix(keyenc): typesVersions order")
+chk "S46 a reordered typesVersions range is a change the half ships" "$(release S46b stable "$N14" "$N14" "$N15")" 'false|[]|["keyenc"]'
+git tag keyenc/v1.2.7 "$N15"
+put keyenc/tools/jsr.json '{"name":"@o/tools","version":"1.0.0"}'
+N16=$(commit "chore(keyenc): tool jsr")
+chk "S46 a lane's jsr.json beside no half is dev tooling" "$(release S46c stable "$N15" "$N15" "$N16")" 'false|[]|[]'
 
 echo "PASS: path significance ($PASS checks)"
