@@ -590,7 +590,7 @@ while [ "$#" -gt 0 ]; do
     -H | --connect-timeout | --max-time | --retry) shift 2 ;;
     -fsSI) head=1; shift ;;
     -sSI) head=1 nofail=1; shift ;;
-    -sS) nofail=1; shift ;;
+    -sS | -sSL) nofail=1; shift ;;
     http*) url=$1; shift ;;
     *) shift ;;
   esac
@@ -603,9 +603,11 @@ answer() { # <code> [body]
   if [ -n "$fmt" ]; then printf '%b' "${fmt//'%{http_code}'/$1}"; fi
   exit 0
 }
+# $CURL_DIR/retried-503 prints the 503 a retried read answered first, as curl --retry does.
 manifest() { # <file prefix>
   ref=${url##*/manifests/}
   [ "$head" = 1 ] || exit 22
+  [ "$nofail" != 1 ] || [ ! -f "$CURL_DIR/retried-503" ] || printf 'HTTP/2 503\r\nDocker-Content-Digest: sha256:stale\r\n\r\n'
   if [ -f "$CURL_DIR/$1-$ref" ]; then
     printf 'HTTP/2 200\r\nDocker-Content-Digest: %s\r\n\r\n' "$(cat "$CURL_DIR/$1-$ref")"
   elif [ "$nofail" = 1 ] && [ -f "$CURL_DIR/status-$ref" ]; then
@@ -619,8 +621,17 @@ manifest() { # <file prefix>
 case "$url" in
   https://ghcr.io/token\?scope=repository:o/app:pull | https://ghcr.io/token\?scope=repository:o/app/dashboard:pull \
     | https://ghcr.io/token\?scope=repository:o/app/dashboard-messages:pull \
-    | "https://auth.docker.io/token?service=registry.docker.io&scope=repository:o/app:pull") emit '{"token":"stub"}' ;;
+    | "https://auth.docker.io/token?service=registry.docker.io&scope=repository:o/app:pull") answer 200 '{"token":"stub"}' ;;
+  # $CURL_DIR/runner-private refuses the runner package's anonymous token, as GHCR does for a private package.
+  https://ghcr.io/token\?scope=repository:o/app-runner:pull)
+    if [ -f "$CURL_DIR/runner-private" ]; then
+      [ "$nofail" = 1 ] || exit 22
+      answer 403 '{"errors":[{"code":"DENIED"}]}'
+    fi
+    answer 200 '{"token":"stub"}'
+    ;;
   https://ghcr.io/v2/o/app/manifests/*) manifest manifest ;;
+  https://ghcr.io/v2/o/app-runner/manifests/*) manifest runner-manifest ;;
   https://ghcr.io/v2/o/app/dashboard/manifests/*) manifest dash-manifest ;;
   https://ghcr.io/v2/o/app/dashboard-messages/manifests/*) manifest dashm-manifest ;;
   https://registry-1.docker.io/v2/o/app/manifests/*) manifest hub-manifest ;;
@@ -2523,6 +2534,61 @@ chk "U6 renumber outside dev is refused" "$(renumber docker v1.2.0-dev.1 stable)
 touch "$GH_DIR/fail-post"
 chk "U7 a failed receipt deletes the tag the run created" "$(renumber go v1.2.0-dev.1)|$(grep -c '^api -X DELETE repos/o/app/git/refs/tags/v1.2.0-dev.1$' "$GH_LOG")" "EXIT=1|1"
 rm "$GH_DIR/fail-post"
+
+# A build that shipped runner images (images/<name>/Dockerfile) re-tags each
+# image's build of the commit as <name>-<version>, beside the app image.
+WR="$WORK/runner-clone"
+rm -rf "$WR"
+git clone -q "$O" "$WR"
+git -C "$WR" checkout -q --detach origin/dev
+RI=$(commit_in "$WR" "feat: runner images" "images/base/Dockerfile=FROM scratch" "images/build/Dockerfile=FROM scratch" images/notes.md=x)
+git -C "$WR" tag v1.1.0-dev.9 "$RI"
+RB="sha256:$(printf 'e%.0s' $(seq 64))" RD="sha256:$(printf 'f%.0s' $(seq 64))"
+echo "$DIGEST" >"$CURL_DIR/manifest-sha-$RI"
+echo "$RB" >"$CURL_DIR/runner-manifest-base-sha-$RI"
+out_u=$(W=$WR renumber docker v1.2.0-dev.1)
+chk "U36 a runner image with no build of the commit is refused before any write" \
+  "$out_u|$(wc -l <"$DOCKER_LOG")|$(grep -c 'git/refs' "$GH_LOG" || true)" "EXIT=1|0|0"
+chk_has "U36 naming it" "$(cat "$WORK/renumber.log")" \
+  "ghcr.io/o/app-runner:build-sha-$RI does not exist, and renumber re-tags an existing build but never builds one"
+echo "$RD" >"$CURL_DIR/runner-manifest-build-sha-$RI"
+chk "U37 every runner image is re-tagged with the app image" "$(W=$WR renumber docker v1.2.0-dev.1)" ""
+chk "U37 each by digest under <name>-<version>" "$(sed 's/--metadata-file [^ ]* //' "$DOCKER_LOG" | tr '\n' ';')" \
+  "buildx imagetools create -t ghcr.io/o/app:v1.2.0-dev.1 ghcr.io/o/app@$DIGEST;buildx imagetools create -t ghcr.io/o/app-runner:base-v1.2.0-dev.1 ghcr.io/o/app-runner@$RB;buildx imagetools create -t ghcr.io/o/app-runner:build-v1.2.0-dev.1 ghcr.io/o/app-runner@$RD;"
+chk "U37 then the git tag lands on the build" "$(grep -c "^api repos/o/app/git/refs -f ref=refs/tags/v1.2.0-dev.1 -f sha=$RI$" "$GH_LOG")" "1"
+echo "$RB" >"$CURL_DIR/runner-manifest-base-v1.2.0-dev.1"
+chk "U38 a runner version tag already serving the build is not written again" \
+  "$(W=$WR renumber docker v1.2.0-dev.1)|$(grep -c 'app-runner:base-' "$DOCKER_LOG" || true)|$(grep -c 'app-runner:build-' "$DOCKER_LOG")" "|0|1"
+echo "$RD" >"$CURL_DIR/runner-manifest-base-v1.2.0-dev.1"
+out_u=$(W=$WR renumber docker v1.2.0-dev.1)
+chk "U39 a runner version tag serving another build is refused before any write" \
+  "$out_u|$(wc -l <"$DOCKER_LOG")|$(grep -c 'git/refs' "$GH_LOG" || true)" "EXIT=1|0|0"
+chk_has "U39 naming both builds" "$(cat "$WORK/renumber.log")" \
+  "ghcr.io/o/app-runner:base-v1.2.0-dev.1 already serves $RD, not the build at $RI ($RB)"
+rm "$CURL_DIR/runner-manifest-base-v1.2.0-dev.1"
+touch "$CURL_DIR/runner-private"
+out_u=$(W=$WR renumber docker v1.2.0-dev.1)
+rm "$CURL_DIR/runner-private"
+chk "U40 a runner package GHCR will not read anonymously is refused before any write" \
+  "$out_u|$(wc -l <"$DOCKER_LOG")|$(grep -c 'git/refs' "$GH_LOG" || true)" "EXIT=1|0|0"
+chk_has "U40 with the owner's step" "$(cat "$WORK/renumber.log")" "its owner makes it public in the package settings"
+echo 500 >"$CURL_DIR/status-build-sha-$RI"
+rm "$CURL_DIR/runner-manifest-build-sha-$RI"
+out_u=$(W=$WR renumber docker v1.2.0-dev.1)
+chk "U41 a runner build GHCR answers HTTP 500 for is refused before any write" \
+  "$out_u|$(wc -l <"$DOCKER_LOG")|$(grep -c 'git/refs' "$GH_LOG" || true)" "EXIT=1|0|0"
+chk_has "U41 naming the status" "$(cat "$WORK/renumber.log")" \
+  "cannot read ghcr.io/o/app-runner:build-sha-$RI, because its manifest endpoint answered HTTP 500, so v1.2.0-dev.1 is not tagged"
+chk_lacks "U41 and not blaming a private package" "$(cat "$WORK/renumber.log")" "make it public"
+rm "$CURL_DIR/status-build-sha-$RI"
+echo "$RD" >"$CURL_DIR/runner-manifest-build-sha-$RI"
+touch "$CURL_DIR/retried-503"
+out_u=$(W=$WR renumber docker v1.2.0-dev.1)
+rm "$CURL_DIR/retried-503"
+chk "U42 reads that answered 503 and then 200 on their retry re-tag every image by its digest" \
+  "$out_u|$(sed 's/--metadata-file [^ ]* //' "$DOCKER_LOG" | tr '\n' ';')" \
+  "|buildx imagetools create -t ghcr.io/o/app:v1.2.0-dev.1 ghcr.io/o/app@$DIGEST;buildx imagetools create -t ghcr.io/o/app-runner:base-v1.2.0-dev.1 ghcr.io/o/app-runner@$RB;buildx imagetools create -t ghcr.io/o/app-runner:build-v1.2.0-dev.1 ghcr.io/o/app-runner@$RD;"
+rm -f "$CURL_DIR/manifest-sha-$RI" "$CURL_DIR/runner-manifest-base-sha-$RI" "$CURL_DIR/runner-manifest-build-sha-$RI"
 
 # The version and the tag name one commit: an older built fix below a newer
 # unbuilt breaking commit is numbered and tagged at the build.

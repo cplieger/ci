@@ -180,6 +180,17 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      # test_runner_input.py reads each caller template's callee at the commit
+      # the template pins, which this depth-1 checkout lacks.
+      - name: Fetch the commits the caller templates pin
+        run: |
+          set -euo pipefail
+          source scripts/retry.sh
+          mapfile -t pins < <(grep -ohE 'cplieger/ci/\.github/workflows/[A-Za-z0-9_.-]+@[0-9a-f]{40}' \
+            .github/workflow-templates/*.yml | cut -d@ -f2 | sort -u)
+          [ "${#pins[@]}" -gt 0 ] || { echo "::error::no pinned call in the caller templates"; exit 1; }
+          retry git fetch --quiet --no-tags --depth 1 origin "${pins[@]}"
+
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:

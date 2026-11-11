@@ -5,13 +5,22 @@ name: CI
 
 on:
   workflow_call:
+    inputs:
+      runner:
+        description: >-
+          The runner label for every job that can leave GitHub's hosted runners,
+          such as a self-hosted pool's; empty runs them on ubuntu-26.04. The image
+          builds, the arm64 build, the Windows and macOS legs and the shell job
+          when it lints a Dockerfile stay hosted.
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
   detect:
-    runs-on: ubuntu-26.04
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 2
     outputs:
       run_go: ${{ steps.detect.outputs.run_go }}
@@ -27,6 +36,7 @@ jobs:
       run_web: ${{ steps.detect.outputs.run_web }}
       run_shell: ${{ steps.detect.outputs.run_shell }}
       run_docker: ${{ steps.detect.outputs.run_docker }}
+      runner_images: ${{ steps.runner-images.outputs.runner_images }}
       run_python: ${{ steps.detect.outputs.run_python }}
       run_scripts: ${{ steps.detect.outputs.run_scripts }}
       run_alerts: ${{ steps.detect.outputs.run_alerts }}
@@ -437,6 +447,19 @@ jobs:
             echo "code_changed: $code_changed"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The release publishes each images/<name>/Dockerfile beside a root
+      # Dockerfile (docker-release.yaml's runner images), so the docker job builds them.
+      - name: Detect runner images
+        id: runner-images
+        run: |
+          set -euo pipefail
+          found=false
+          if [ -f Dockerfile ] && [ -n "$(git ls-files -- ':(glob)images/*/Dockerfile')" ]; then
+            found=true
+          fi
+          echo "runner_images=${found}" >> "$GITHUB_OUTPUT"
+          echo "runner images: ${found}"
+
   # The four sub-CI workflows below use local refs (uses: ./...), not @sha
   # pins. GitHub resolves a local reusable-workflow ref to the SAME commit a
   # consumer pinned ci.yaml to, so a fix to go-ci/ts-ci/shell-ci reaches
@@ -447,6 +470,8 @@ jobs:
     needs: detect
     if: ${{ needs.detect.outputs.run_go == 'true' }}
     uses: ./.github/workflows/go-ci.yaml
+    with:
+      runner: ${{ inputs.runner }}
 
   # Nested Go modules (independent release lanes — see release.yaml's
   # go-nested job): `go test ./...` at the root does not cross module
@@ -463,13 +488,14 @@ jobs:
     with:
       working-directory: ${{ matrix.dir }}
       go-version-file: ${{ matrix.dir }}/go.mod
+      runner: ${{ inputs.runner }}
 
   # Builds every module's head against the others' heads, so a change that breaks
   # a sibling fails before it is tagged; the go.work exists only in this checkout.
   go-work:
     needs: detect
     if: ${{ needs.detect.outputs.run_go_work == 'true' }}
-    runs-on: ubuntu-26.04
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -521,6 +547,8 @@ jobs:
     needs: detect
     if: ${{ needs.detect.outputs.run_ts == 'true' }}
     uses: ./.github/workflows/ts-ci.yaml
+    with:
+      runner: ${{ inputs.runner }}
 
   web:
     needs: detect
@@ -529,6 +557,7 @@ jobs:
     with:
       working-directory: ${{ needs.detect.outputs.web_dir }}
       web-lint: true
+      runner: ${{ inputs.runner }}
 
   ts-nested:
     needs: detect
@@ -540,6 +569,7 @@ jobs:
     uses: ./.github/workflows/ts-ci.yaml
     with:
       working-directory: ${{ matrix.dir }}
+      runner: ${{ inputs.runner }}
 
   shell:
     needs: detect
@@ -547,6 +577,7 @@ jobs:
     uses: ./.github/workflows/shell-ci.yaml
     with:
       dockerfile: ${{ needs.detect.outputs.run_docker == 'true' && './Dockerfile' || '' }}
+      runner: ${{ inputs.runner }}
 
   # deadset-ci.yaml's analyze job uploads SARIF, and a called job requesting a
   # permission its caller withholds fails the whole run at startup
@@ -565,6 +596,7 @@ jobs:
     uses: ./.github/workflows/deadset-ci.yaml
     with:
       target: ${{ matrix.target }}
+      runner: ${{ inputs.runner }}
 
   # The pinned deadset tools over one Go-only, one TypeScript-only, one mixed
   # repository, one nested module, one with JavaScript but no npm project, one
@@ -611,6 +643,7 @@ jobs:
       ref: ${{ matrix.ref }}
       target: ${{ matrix.target }}
       exit-code: 'off'
+      runner: ${{ inputs.runner }}
 
   # go-os-ci.yaml over public modules with windows or darwin Go files, at fixed
   # commits, on each runner detect selects for them, so a change to that
@@ -662,12 +695,12 @@ jobs:
   # repo's image tests against it, so a Dockerfile that does not build or an
   # image that does not work fails the required check. Vulnerability scanning
   # stays advisory in security-scan.yaml, so a base-image CVE never blocks a
-  # merge or release.
+  # merge or release. It ignores the runner input: the build needs a Docker daemon.
   docker:
     needs: detect
     if: ${{ needs.detect.outputs.run_docker == 'true' }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 15
+    timeout-minutes: ${{ needs.detect.outputs.runner_images == 'true' && 60 || 15 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -734,6 +767,44 @@ jobs:
           fi
           ./tests/image-test.sh ci-smoke:latest
 
+      # Every runner image builds amd64 with no output, in the release's order, each
+      # sibling it names swapped for its own target here as the release swaps it.
+      # They need no app image, so they run after a red one and report their own verdict.
+      - name: Check out the ci source
+        if: ${{ !cancelled() && needs.detect.outputs.runner_images == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # The build context is the workspace root, so the ci source leaves it.
+      - name: Move the ci source out of the build context
+        if: ${{ !cancelled() && needs.detect.outputs.runner_images == 'true' }}
+        run: |
+          set -euo pipefail
+          mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
+
+      - name: Setup Python
+        if: ${{ !cancelled() && needs.detect.outputs.runner_images == 'true' }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      - name: Build the runner images (no push)
+        if: ${{ !cancelled() && needs.detect.outputs.runner_images == 'true' }}
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          PACKAGE: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-runner
+        run: |
+          set -euo pipefail
+          plan=$(python3 "$CI_TOOLS/runner_images.py" plan --package "$PACKAGE" --channel dev --tag ci \
+            --sha "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --date "$(date -u +%Y-%m-%d)" \
+            --created "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+          python3 "$CI_TOOLS/runner_images.py" bake --platform linux/amd64 --context "$GITHUB_WORKSPACE" <<<"$plan" > "$RUNNER_TEMP/runner-images.json"
+          docker buildx bake --file "$RUNNER_TEMP/runner-images.json"
+
   # arm64 build-ability gate. Same rationale as the amd64 `docker` job: without
   # it, an arch-specific Dockerfile break (a hardcoded amd64 download URL, a
   # wrong `uname -m` case, a base image without an arm64 manifest) merges green
@@ -741,7 +812,7 @@ jobs:
   # Build only — the image tests run once, on amd64. Public repos only: arm
   # hosted runners are free for public repos; a free-plan private repo's job
   # would queue forever and block the required check (every Dockerfile
-  # consumer is public today).
+  # consumer is public today). It ignores the runner input, as `docker` does.
   docker-arm64:
     needs: detect
     if: ${{ needs.detect.outputs.run_docker == 'true' && github.event.repository.private == false }}
@@ -791,7 +862,7 @@ jobs:
   alerts:
     needs: detect
     if: ${{ needs.detect.outputs.run_alerts == 'true' }}
-    runs-on: ubuntu-26.04
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -829,7 +900,7 @@ jobs:
   #   || { echo "<step name>" >> /tmp/_ci_failures; exit 1; }
   repo:
     needs: detect
-    runs-on: ubuntu-26.04
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -847,18 +918,43 @@ jobs:
         run: |
           # renovate: datasource=github-releases depName=rhysd/actionlint
           VERSION=v1.7.12
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
           curl -fsSL --connect-timeout 10 --max-time 30 \
             --retry 7 --retry-max-time 150 --retry-all-errors \
             -o "$RUNNER_TEMP/actionlint.tgz" \
             "https://github.com/rhysd/actionlint/releases/download/${VERSION}/actionlint_${VERSION#v}_linux_amd64.tar.gz"
-          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C /tmp actionlint
-          sudo mv /tmp/actionlint /usr/local/bin/actionlint
+          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$bin" actionlint
+          echo "$bin" >> "$GITHUB_PATH"
+
+      # actionlint checks run: blocks only through a shellcheck on PATH, and
+      # skips them silently without one, as on a runner image that ships none.
+      - name: Install shellcheck
+        run: |
+          # renovate: datasource=github-releases depName=koalaman/shellcheck
+          VERSION=v0.11.0
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          curl -fsSL --connect-timeout 10 --max-time 30 \
+            --retry 7 --retry-max-time 150 --retry-all-errors \
+            -o "$RUNNER_TEMP/shellcheck.tgz" \
+            "https://github.com/koalaman/shellcheck/releases/download/${VERSION}/shellcheck-${VERSION}.linux.x86_64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/shellcheck.tgz" -C "$bin" --strip-components=1 \
+            "shellcheck-${VERSION}/shellcheck"
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/shellcheck" --version
+
+      # Not pipx: only GitHub's hosted image ships it.
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
 
       - name: Install zizmor
         run: |
           # renovate: datasource=pypi depName=zizmor
           VERSION=1.32.0
-          pipx install "zizmor==${VERSION}"
+          pip install -q --break-system-packages "zizmor==${VERSION}"
 
       # actionlint does not know the ubuntu-26.04 / ubuntu-26.04-arm labels
       # (rhysd/actionlint#682), and no release carries them: v1.7.12 is the
@@ -977,7 +1073,7 @@ jobs:
   # disabling the rule).
   markdown:
     needs: detect
-    runs-on: ubuntu-26.04
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -986,11 +1082,20 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      # A runner other than GitHub's hosted image may carry no Node.
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          # This job installs one global tool and no project packages.
+          package-manager-cache: false
+
       - name: Install markdownlint-cli2
         run: |
           # renovate: datasource=npm depName=markdownlint-cli2
           VERSION=0.24.0
-          npm install -g "markdownlint-cli2@${VERSION}"
+          npm install --global --prefix "$RUNNER_TEMP" "markdownlint-cli2@${VERSION}"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: Write markdownlint config
         run: |
@@ -1025,16 +1130,18 @@ jobs:
           # from the usual release-asset pattern; getting either wrong 404s.
           # renovate: datasource=github-releases depName=lycheeverse/lychee
           VERSION=v0.24.2
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
           # The archive nests the binary one level deep in a target-named
           # directory, hence --strip-components=1 rather than a bare member name.
           curl -fsSL --connect-timeout 10 --max-time 60 \
             --retry 7 --retry-max-time 150 --retry-all-errors \
             -o "$RUNNER_TEMP/lychee.tgz" \
             "https://github.com/lycheeverse/lychee/releases/download/lychee-${VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz"
-          tar -xzf "$RUNNER_TEMP/lychee.tgz" -C /tmp --strip-components=1 \
+          tar -xzf "$RUNNER_TEMP/lychee.tgz" -C "$bin" --strip-components=1 \
             lychee-x86_64-unknown-linux-gnu/lychee
-          sudo mv /tmp/lychee /usr/local/bin/lychee
-          lychee --version
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/lychee" --version
 
       # Directory input + --hidden + --extensions, NOT a '**/*.md' glob, and NO
       # --exclude-path .git. Both verified empirically before shipping: the
@@ -1056,7 +1163,7 @@ jobs:
   python:
     needs: detect
     if: ${{ needs.detect.outputs.run_python == 'true' }}
-    runs-on: ubuntu-26.04
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1065,11 +1172,17 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      # Not pipx: only GitHub's hosted image ships it.
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
       - name: Install ruff
         run: |
           # renovate: datasource=pypi depName=ruff
           VERSION=0.17.4
-          pipx install "ruff==${VERSION}"
+          pip install -q --break-system-packages "ruff==${VERSION}"
 
       - name: Lint Python (ruff check)
         run: ruff check --output-format github .
@@ -1082,7 +1195,7 @@ jobs:
   scripts:
     needs: detect
     if: ${{ needs.detect.outputs.run_scripts == 'true' }}
-    runs-on: ubuntu-26.04
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1112,23 +1225,29 @@ jobs:
           # so the gate matches local tooling and stays reproducible.
           # renovate: datasource=github-releases depName=koalaman/shellcheck
           VERSION=v0.11.0
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
           curl -fsSL --connect-timeout 10 --max-time 30 \
             --retry 7 --retry-max-time 150 --retry-all-errors \
             -o "$RUNNER_TEMP/shellcheck.tgz" \
             "https://github.com/koalaman/shellcheck/releases/download/${VERSION}/shellcheck-${VERSION}.linux.x86_64.tar.gz"
-          tar -xzf "$RUNNER_TEMP/shellcheck.tgz" -C /tmp "shellcheck-${VERSION}/shellcheck"
-          sudo mv "/tmp/shellcheck-${VERSION}/shellcheck" /usr/local/bin/shellcheck
-          shellcheck --version
+          tar -xzf "$RUNNER_TEMP/shellcheck.tgz" -C "$bin" --strip-components=1 \
+            "shellcheck-${VERSION}/shellcheck"
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/shellcheck" --version
 
       - name: Install shfmt
         run: |
           # renovate: datasource=github-releases depName=mvdan/sh
           VERSION=v3.14.1
-          sudo curl -fsSL --connect-timeout 10 --max-time 30 \
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          curl -fsSL --connect-timeout 10 --max-time 30 \
             --retry 7 --retry-max-time 150 --retry-all-errors \
-            -o /usr/local/bin/shfmt \
+            -o "$bin/shfmt" \
             "https://github.com/mvdan/sh/releases/download/${VERSION}/shfmt_${VERSION}_linux_amd64"
-          sudo chmod +x /usr/local/bin/shfmt
+          chmod +x "$bin/shfmt"
+          echo "$bin" >> "$GITHUB_PATH"
 
       - name: Lint shell scripts (shellcheck)
         continue-on-error: true
@@ -1437,7 +1556,7 @@ jobs:
     if: >-
       ${{ github.event_name == 'pull_request' && github.event.repository.default_branch == 'dev'
       && !github.event.repository.private && !github.event.repository.fork }}
-    runs-on: ubuntu-26.04
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1509,7 +1628,7 @@ jobs:
   validate:
     needs: [detect, repo, go, go-nested, go-work, go-os, go-os-canary, ts, web, ts-nested, shell, deadset, deadset-canary, docker, docker-arm64, markdown, python, scripts, alerts, pr-policy]
     if: always()
-    runs-on: ubuntu-26.04
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 1
     steps:
       - name: Aggregate CI dispatch results

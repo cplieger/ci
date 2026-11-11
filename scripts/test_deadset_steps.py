@@ -169,6 +169,8 @@ class StepRun:
         self.outputs = read_outputs(tmp / 'github_output')
         env = tmp / 'github_env'
         self.github_env = env.read_text() if env.exists() else ''
+        path = tmp / 'github_path'
+        self.github_path = path.read_text() if path.exists() else ''
         marker = tmp / 'ci_failures'
         self.recorded = marker.read_text() if marker.exists() else ''
 
@@ -212,6 +214,7 @@ class Harness(unittest.TestCase):
             'RUNNER_TEMP': str(self.runner_temp),
             'GITHUB_OUTPUT': str(self.tmp / 'github_output'),
             'GITHUB_ENV': str(self.tmp / 'github_env'),
+            'GITHUB_PATH': str(self.tmp / 'github_path'),
             'GITHUB_STEP_SUMMARY': str(self.tmp / 'github_summary'),
             'GIT_CONFIG_GLOBAL': '/dev/null',
             'STUB_LOG': str(self.log),
@@ -335,7 +338,9 @@ class MetaJobs(unittest.TestCase):
             '${{ fromJSON(needs.detect.outputs.deadset_targets) }}',
         )
         self.assertIs(job['strategy']['fail-fast'], expr2=False)
-        self.assertEqual(job['with'], {'target': '${{ matrix.target }}'})
+        self.assertEqual(
+            job['with'], {'target': '${{ matrix.target }}', 'runner': '${{ inputs.runner }}'}
+        )
         self.assertNotIn('run_deadset', self.jobs['detect']['outputs'])
 
     def test_no_language_workflow_runs_deadset(self):
@@ -622,11 +627,33 @@ class Census(Harness):
         run = self.ask(GO_ONLY, DEADSET='0')
         self.assert_unknown(run, '::error::deadset print-languages exited 127')
 
-    def test_a_census_that_names_no_analyzers_fails(self):
-        for document in ('', 'not json', '{}', '{"analyzers": null}', '{"analyzers": []}'):
+    def test_a_census_that_names_no_language_fails(self):
+        proto = census('proto', analyzers=[])
+        for document in (
+            '',
+            'not json',
+            '{}',
+            '{"analyzers": []}',
+            '{"languages": [], "analyzers": []}',
+            '{"languages": "go", "analyzers": []}',
+            proto.replace('"analyzers": []', '"analyzers": null'),
+            json.dumps({k: v for k, v in json.loads(proto).items() if k != 'analyzers'}),
+        ):
             with self.subTest(census=document):
                 run = self.ask(GO_ONLY, document)
-                self.assert_unknown(run, 'wrote no census naming its analyzers')
+                self.assert_unknown(
+                    run, 'wrote no census naming the languages in scope and their analyzers'
+                )
+
+    def test_a_proto_only_census_is_analyzed_with_no_analyzer(self):
+        files = {'api/v1/service.proto': 'syntax = "proto3";\n'}
+        run = self.ask(files, census('proto', analyzers=[]))
+        self.assertEqual(self.installs(run), ('true', 'false', 'false'))
+        self.assertIn(
+            'analysis.languages proto (detected); no analyzer: deadset reads these languages itself',
+            run.out,
+        )
+        self.assertNotIn('analyzers ', run.out)
 
     def test_an_analyzer_the_check_cannot_install_fails(self):
         run = self.ask(GO_ONLY, census('go', analyzers=['deadset-go', 'golint-dead']))
@@ -906,6 +933,13 @@ class InstallSteps(Harness):
         self.assertEqual(run.logged('npm'), '')
         self.assertIn('GOTOOLCHAIN=auto', run.github_env.splitlines())
 
+    def test_go_installs_land_in_the_job_temp_bin_on_the_path(self):
+        run = self.run_step('Install deadset', self.tmp, {'GOBIN': '/usr/local/bin'})
+        self.assertEqual(run.rc, 0, run.out)
+        gobin = str(self.runner_temp / 'bin')
+        self.assertIn(f'GOBIN={gobin}', run.github_env.splitlines())
+        self.assertEqual(run.github_path.splitlines(), [gobin])
+
     def test_each_analyzer_installs_at_its_pin_only_where_deadset_names_it(self):
         pins = self.pins()
         go_install = pinned_install(f'{DEPS[1]}/cmd/deadset-go', pins[DEPS[1]], '')
@@ -1117,7 +1151,7 @@ class PinnedInstallWhileANewerTagIsUnserved(Harness):
         threading.Thread(target=self.proxy.serve_forever, daemon=True).start()
         self.addCleanup(self.proxy.server_close)
         self.addCleanup(self.proxy.shutdown)
-        self.gobin = self.tmp / 'gobin'
+        self.gobin = self.runner_temp / 'bin'
         gocache = subprocess.run([GO, 'env', 'GOCACHE'], capture_output=True, text=True)
         self.go_env = {
             'PATH': os.pathsep.join([str(Path(GO).resolve().parent), '/usr/bin', '/bin']),
@@ -1146,7 +1180,8 @@ class PinnedInstallWhileANewerTagIsUnserved(Harness):
         self.assertIn('loading deprecation', run.out)
 
     def test_deadset_installs_at_its_pin(self):
-        run = self.run_step('Install deadset', self.tmp, self.go_env)
+        env = {**self.go_env, 'GOBIN': str(self.tmp / 'gobin')}
+        run = self.run_step('Install deadset', self.tmp, env)
         self.assert_installed(run, DEPS[0], 'deadset')
 
     def test_deadset_go_installs_at_its_pin(self):

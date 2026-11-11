@@ -14,11 +14,13 @@ SUBJECT="$HERE/discover-artifact-repos.sh"
 
 failures=0
 
-# Run the subject and compare stdout (comma-joined) and exit status.
+# Run the subject and compare stdout (comma-joined) and exit status. Arguments
+# after the four named ones go to the subject before the directory.
 expect() {
   local label="$1" want_out="$2" want_rc="$3" dir="$4"
+  shift 4
   local got rc
-  got=$(bash "$SUBJECT" "$dir" 2>/dev/null | tr '\n' ',')
+  got=$(bash "$SUBJECT" "$@" "$dir" 2>"$root/stderr" | tr '\n' ',')
   rc=$?
   got=${got%,}
   if [ "$got" = "$want_out" ] && [ "$rc" = "$want_rc" ]; then
@@ -94,6 +96,23 @@ mkdir -p "$root/mixed2/artifacts/zzz-bad"
 printf 'not json' >"$root/mixed2/artifacts/zzz-bad/meta.json"
 expect 'a broken meta sorting LAST does not lose a healthy repo' 'good' 0 "$root/mixed2/artifacts"
 
+# The allow-list: target code writes meta.json, so a repo the run did not
+# schedule is dropped with a warning naming it, and the rest are kept.
+meta "$root/allow/artifacts/stryker-a-root" a
+meta "$root/allow/artifacts/stryker-b-root" b
+meta "$root/allow/artifacts/stryker-c-root" forged
+expect 'an allow-list keeps only its repos' 'a,b' 0 "$root/allow/artifacts" --allow 'a b'
+if grep -q "names 'forged', which this run did not schedule" "$root/stderr"; then
+  printf '  PASS  a dropped repo is warned by name\n'
+else
+  printf '  FAIL  a dropped repo is warned by name: stderr was %s\n' "'$(cat "$root/stderr")'"
+  failures=$((failures + 1))
+fi
+expect 'an allow-list is matched by whole name' 'a' 0 "$root/allow/artifacts" --allow 'a bb forge'
+expect 'an empty allow-list keeps nothing' '' 0 "$root/allow/artifacts" --allow ''
+meta "$root/allow1/artifacts" forged
+expect 'a flat single artifact outside the allow-list is dropped' '' 0 "$root/allow1/artifacts" --allow 'a'
+
 # Usage error is its own status, distinct from both success and the guard.
 got_rc=0
 bash "$SUBJECT" >/dev/null 2>&1 || got_rc=$?
@@ -101,6 +120,14 @@ if [ "$got_rc" = 2 ]; then
   printf '  PASS  a missing argument exits 2\n'
 else
   printf '  FAIL  a missing argument exits 2: got rc=%s\n' "$got_rc"
+  failures=$((failures + 1))
+fi
+got_rc=0
+bash "$SUBJECT" --allow >/dev/null 2>&1 || got_rc=$?
+if [ "$got_rc" = 2 ]; then
+  printf '  PASS  --allow with no list exits 2\n'
+else
+  printf '  FAIL  --allow with no list exits 2: got rc=%s\n' "$got_rc"
   failures=$((failures + 1))
 fi
 

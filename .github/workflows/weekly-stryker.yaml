@@ -1,44 +1,7 @@
-# Weekly TS mutation testing across cplieger consumer repos — the Stryker
-# counterpart to weekly-gremlins.yaml (Go). Pattern C: this workflow owns the
-# matrix and the max-parallel cap; runs happen here, not via cross-repo
-# dispatch.
-#
-# Opt-in contract (per TS package dir, e.g. repo root or static-src/):
-#   1. commit a stryker.config.json (mutate globs, thresholds, vitest runner)
-#   2. add the devDependencies the config needs:
-#        @stryker-mutator/core + @stryker-mutator/vitest-runner
-#        (+ @stryker-mutator/typescript-checker when `checkers` is used)
-#   3. optionally declare a `test:mutation` script running `stryker run`;
-#      the run step then calls it (see "Run stryker")
-# The fanout discovers configs automatically; a dir whose devDeps are missing
-# is SKIPPED with an actionable notice instead of failing, so the runner can
-# ship ahead of repo enrollment and light up as repos opt in.
-# Opt-out: a dir committing stryker.weekly.json = {"weekly": false} is skipped
-# on the scheduled run only; every workflow_dispatch still mutation-tests it.
-#
-# Schedule:     Saturdays 22:00 UTC (own slot: gremlins Sun 22:00, fuzz
-#               Wed 22:00, security daily 03:00 — never fighting the same
-#               20-slot budget window)
-# Runs:         1 per package dir (no 3-attempt averaging: Stryker+vitest on
-#               these small TS surfaces is far more deterministic than Go
-#               mutants under -race; revisit if flakiness appears)
-# Reporting:    mutation score to the run summary + a `mutation-ts.json`
-#               shields endpoint on the consumer's orphan `badges` branch
-#               (sibling-preserving publisher, coexists with size.json /
-#               mutation.json). Colour bands match the Go mutation badge.
-#               Stryker itself exits non-zero when the score drops below the
-#               config's `thresholds.break`, which fails that matrix entry —
-#               red is a real regression signal, but nothing blocks consumer
-#               merges (internal weekly job, not a required check).
-# Tracker:      Per-repo `Stryker mutation testing tracker` issue (label
-#               stryker-tracker), the TS twin of the gremlins tracker:
-#               rolling 12-week score table inside <!-- stryker-data -->
-#               sentinels, surviving mutants bucketed Survived vs NoCoverage,
-#               free-form notes preserved. The `mutation-regression` label is
-#               toggled when this week's score drops >5% below the rolling
-#               mean. A repo whose run produced no parseable report is left
-#               untouched (no misleading 0% rows — the red matrix entry is
-#               the signal).
+# Weekly Stryker mutation testing of every TS package dir that commits a
+# stryker.config.json, in the public cplieger repositories; the Go twin is
+# weekly-gremlins.yaml. The opt-in contract, the opt-out, the badge and the
+# tracker are documented in docs/workflows.md "The scheduled runs".
 name: Weekly stryker
 
 on:
@@ -47,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Comma/space-separated repo names to limit the run (for testing). Empty runs against all cplieger repos."
+        description: "Comma/space-separated repo names to limit the run (for testing). Empty runs every public cplieger repo."
         required: false
         default: ""
 
@@ -65,6 +28,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
+      repos: ${{ steps.fanout.outputs.repos }}
     steps:
       - name: Discover TS package dirs with a stryker config
         id: fanout
@@ -76,19 +40,16 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          # One-shot clone auth, built once for the scan loop below. Passed as a
-          # top-level `git -c` (never `git clone --config`), so the token is not
-          # written into any scan/.git/config.
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
           # Repo discovery over REST, not the GraphQL `gh repo list`: the fanout
-          # is a single point of failure for the whole run, and GraphQL shares a
-          # quota the per-repo clones also draw, so a quota exhaustion there
-          # loses every repo at once. Forks are excluded (same rule as
+          # is a single point of failure for the whole run, and the GraphQL
+          # budget is shared by every session on the account, so its exhaustion
+          # would lose every repo at once. Forks are excluded (same rule as
           # scripts/audit.py): a fork carries UPSTREAM's code and tests, so its
           # mutation score measures someone else's suite and its tracker issue
-          # would be unactionable.
+          # would be unactionable. Public only: this repository's run logs and
+          # artifacts are world-readable (CONTRIBUTING.md).
           repos=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
-            .[] | select(.archived == false and .fork == false) | .name
+            .[] | select(.archived == false and .fork == false and .visibility == "public") | .name
           ')
 
           if [ -n "${ONLY:-}" ]; then
@@ -104,29 +65,30 @@ jobs:
           matrix='[]'
           for r in $repos; do
             rm -rf scan
-            # Plain git clone over HTTPS draws no API quota, so a rate-limited
-            # run can still clone; resolving the repo through the gh CLI would
-            # spend GraphQL quota this run may already have exhausted. A failed
-            # clone is LOUD rather than a silent `|| continue` that dropped the
-            # repo with no trace.
-            if ! git -c "http.https://github.com/.extraheader=${auth}" \
-                clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
+            # Plain git over HTTPS draws no API quota, so a rate-limited run can
+            # still clone, where `gh repo clone` would spend GraphQL budget.
+            if ! git clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
               echo "::warning::${r}: clone failed — skipping this repo"
               continue
             fi
-            # The clone can still exit 0 leaving no resolvable HEAD, which reaches
-            # rev-parse; that exits 128 under `set -e` and would kill the whole
-            # job, taking every other repo's matrix entry with it (2026-08-15:
-            # died one repo after web-terminal-engine, `run` skipped entirely, no
-            # repo mutation-tested that week). Replaying this loop over all 57
-            # repos found no repo that reproduces it, so it is a transient clone
-            # and the right blast radius is one skipped repo, not every repo.
+            # A clone can exit 0 with no resolvable HEAD, and an unguarded
+            # rev-parse under `set -e` would end the job and every repo's entry
+            # with it; one transient clone skips one repo.
             if ! sha=$(git -C scan rev-parse HEAD 2>/dev/null); then
               echo "::warning::${r}: clone left no resolvable HEAD — skipping this repo"
               continue
             fi
             while IFS= read -r cfg; do
               dir=$(dirname -- "${cfg#scan/}")
+              # The badge job finds this entry's artifact by a download pattern
+              # built from the dir, where a glob character would match others.
+              case "$dir" in
+                *[!A-Za-z0-9._/-]*)
+                  echo "::warning::${r}:${dir}: skipped, because the directory name holds a character outside A-Z, a-z, 0-9, '.', '_', '-' and '/'"
+                  continue
+                  ;;
+              esac
+              if [ "$dir" = . ]; then slug=root; else slug=${dir//\//_}; fi
               # A sidecar, not a stryker.config key: Stryker warns on unknown keys.
               weekly="$(dirname "$cfg")/stryker.weekly.json"
               if [ "$EVENT" = schedule ] && [ -z "${ONLY:-}" ] && [ -f "$weekly" ]; then
@@ -139,13 +101,20 @@ jobs:
               fi
               echo "  include ${r}:${dir} @ ${sha:0:12}"
               matrix=$(printf '%s' "$matrix" | jq -c \
-                --arg r "$r" --arg s "$sha" --arg d "$dir" \
-                '. + [{repo: $r, sha: $s, dir: $d}]')
+                --arg r "$r" --arg s "$sha" --arg d "$dir" --arg slug "$slug" \
+                '. + [{repo: $r, sha: $s, dir: $d, slug: $slug}]')
             done < <(find scan -maxdepth 4 -name 'stryker.config.*' -not -path '*/node_modules/*' | sort)
           done
           rm -rf scan
 
+          # The tracker job downloads each repo's artifacts by the exact names its
+          # run entries upload (a brace list for several), so an artifact cannot
+          # reach another repo's tracker. The dir check above keeps names glob-free.
+          repos=$(jq -c 'group_by(.repo) | map({repo: .[0].repo, artifacts: (
+            map("stryker-\(.repo)-\(.slug)") | if length == 1 then .[0] else "{\(join(","))}" end)})' <<<"$matrix")
+
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "repos=${repos}" >> "$GITHUB_OUTPUT"
           echo "Total entries: $(printf '%s' "$matrix" | jq 'length')"
 
   run:
@@ -164,34 +133,23 @@ jobs:
     timeout-minutes: 345
     permissions:
       contents: read
-    env:
-      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
     steps:
-      # Checkout FIRST (actions/checkout cleans the workspace): brings the
-      # sibling-preserving badge publisher bundled with actions/publish-badge.
-      - name: Checkout ci (for the badge publisher)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # No step in this job pushes with checkout-persisted credentials;
-          # the badge push authenticates via CI_SCHEDULE inside the script.
-          persist-credentials: false
-
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.15"
 
+      # Anonymous: the fanout lists only public repositories, and this job
+      # runs the target's code, so it holds no secret.
       - name: Clone target repo at pinned SHA
+        env:
+          REPO: ${{ matrix.repo }}
+          SHA: ${{ matrix.sha }}
         run: |
           set -euo pipefail
-          # One-shot auth as a top-level `git -c` so a private target cannot
-          # break the clone and the token is not persisted into target/.git.
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          git -c "http.https://github.com/.extraheader=${auth}" \
-            clone --depth 1 "https://github.com/cplieger/${{ matrix.repo }}.git" target
-          git -c "http.https://github.com/.extraheader=${auth}" \
-            -C target fetch --depth 1 origin "${{ matrix.sha }}"
-          git -C target checkout --quiet "${{ matrix.sha }}"
+          git clone --depth 1 "https://github.com/cplieger/${REPO}.git" target
+          git -C target fetch --depth 1 origin "${SHA}"
+          git -C target checkout --quiet "${SHA}"
 
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -200,16 +158,6 @@ jobs:
           package-manager-cache: false
           # Keep in step with ts-ci.yaml / release.yaml (same major).
           node-version: '26'
-
-      - name: Compute artifact slug for this package dir
-        id: slug
-        env:
-          DIR: ${{ matrix.dir }}
-        run: |
-          # Artifact names cannot contain '/'; meta.json (below) is the
-          # authoritative repo/dir mapping — the slug is only for uniqueness.
-          if [ "$DIR" = "." ]; then slug=root; else slug=${DIR//\//_}; fi
-          echo "slug=${slug}" >> "$GITHUB_OUTPUT"
 
       - name: Run stryker
         id: stryker
@@ -325,48 +273,33 @@ jobs:
           echo "### ${ENTRY}: mutation score ${score}% (stryker exit ${rc})" >> "$GITHUB_STEP_SUMMARY"
 
           # Propagate a below-break-threshold failure AFTER capturing the
-          # score, so the badge step below still publishes the (low) number.
+          # score, so the badge job still publishes the (low) number.
           echo "rc=${rc}" >> "$GITHUB_OUTPUT"
 
-      - name: Stage report for the tracker aggregate
+      # No reader of the artifact uses the files' or test files' source, a
+      # copy of the tree, so the staged report drops both.
+      - name: Stage report for the badge and tracker jobs
         if: ${{ steps.stryker.outputs.report != '' }}
         env:
           REPORT: ${{ steps.stryker.outputs.report }}
           REPO: ${{ matrix.repo }}
           DIR: ${{ matrix.dir }}
+          SCORE: ${{ steps.stryker.outputs.score }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/stage
-          cp "target/${DIR}/${REPORT}" /tmp/stage/mutation.json
-          jq -n --arg repo "$REPO" --arg dir "$DIR" '{repo: $repo, dir: $dir}' > /tmp/stage/meta.json
+          jq 'del(.files[]?.source, .testFiles[]?.source)' "target/${DIR}/${REPORT}" > /tmp/stage/mutation.json
+          jq -n --arg repo "$REPO" --arg dir "$DIR" --arg score "$SCORE" \
+            '{repo: $repo, dir: $dir, score: $score}' > /tmp/stage/meta.json
 
       - name: Upload report (artifact, 90-day retention)
         if: ${{ steps.stryker.outputs.report != '' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: stryker-${{ matrix.repo }}-${{ steps.slug.outputs.slug }}
+          name: stryker-${{ matrix.repo }}-${{ matrix.slug }}
           path: /tmp/stage
           if-no-files-found: warn
           retention-days: 90
-
-      - name: Publish mutation-ts badge
-        if: ${{ steps.stryker.outputs.skipped != 'true' && steps.stryker.outputs.score != '' }}
-        env:
-          TOKEN: ${{ secrets.CI_SCHEDULE }}
-          SCORE: ${{ steps.stryker.outputs.score }}
-          REPO: cplieger/${{ matrix.repo }}
-        run: |
-          set -euo pipefail
-          # Colour bands match the Go mutation badge (gremlins-aggregate.py).
-          int=${SCORE%.*}; : "${int:=0}"
-          if [ "$int" -ge 85 ]; then color=brightgreen
-          elif [ "$int" -ge 75 ]; then color=green
-          elif [ "$int" -ge 50 ]; then color=yellow
-          elif [ "$int" -ge 30 ]; then color=orange
-          else color=red
-          fi
-          json=$(printf '{"schemaVersion":1,"label":"mutation (TS)","message":"%s%%","color":"%s"}' "$SCORE" "$color")
-          bash actions/publish-badge/publish-badge.sh "$REPO" "$TOKEN" mutation-ts.json "$json"
 
       - name: Surface below-threshold score
         if: ${{ steps.stryker.outputs.rc != '' && steps.stryker.outputs.rc != '0' }}
@@ -377,14 +310,82 @@ jobs:
           echo "::error::${ENTRY}: mutation score fell below the config's thresholds.break (stryker exit ${RC})"
           exit 1
 
-  # Update the per-repo tracker issue — the TS twin of weekly-gremlins.yaml's
-  # aggregate job. Independent of the badge publish (which happens per matrix
-  # entry in `run`), so a tracker failure never blocks the badge and vice
-  # versa. Reads the staged report artifacts; a repo with no parseable report
-  # this week is left untouched (its red matrix entry is the signal).
+  # Publish each entry's mutation-ts badge from the score its run staged. The
+  # push token lives in this job, which runs no target code: a step after the
+  # target's `npm ci` in `run` could reach it through GITHUB_ENV, GITHUB_PATH
+  # or the workspace. That code also writes meta.json, so the repo comes from
+  # this matrix and the artifact from its name, never from meta.json.
+  badge:
+    needs: [fanout, run]
+    if: ${{ !cancelled() && needs.fanout.result == 'success' && needs.fanout.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      # One at a time in the order the jobs are created, the matrix's own
+      # (docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations),
+      # so a repo with several package dirs ends on the same dir's badge.
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout ci (for the badge publisher)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # the badge push authenticates via CI_SCHEDULE inside the script.
+          persist-credentials: false
+
+      # A pattern matching nothing downloads nothing and succeeds: the entry
+      # was skipped or failed before it staged a report. One match extracts
+      # straight into `path`.
+      - name: Download this entry's report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifact
+          pattern: stryker-${{ matrix.repo }}-${{ matrix.slug }}
+
+      - name: Publish this entry's mutation-ts badge
+        env:
+          TOKEN: ${{ secrets.CI_SCHEDULE }}
+          REPO: ${{ matrix.repo }}
+          ENTRY: ${{ matrix.repo }}:${{ matrix.dir }}
+        run: |
+          set -euo pipefail
+          if [ ! -f artifact/meta.json ]; then
+            echo "${ENTRY}: no report was staged, so no badge is published"
+            exit 0
+          fi
+          score=$(jq -r '.score // ""' artifact/meta.json 2>/dev/null) || score=""
+          if ! [[ $score =~ ^[0-9]{1,3}(\.[0-9]+)?$ ]]; then
+            echo "::error::${ENTRY}: the staged score is not a number, so no badge was published"
+            exit 1
+          fi
+          # Colour bands match the Go mutation badge (gremlins-aggregate.py).
+          int=${score%.*}
+          if [ "$int" -ge 85 ]; then color=brightgreen
+          elif [ "$int" -ge 75 ]; then color=green
+          elif [ "$int" -ge 50 ]; then color=yellow
+          elif [ "$int" -ge 30 ]; then color=orange
+          else color=red
+          fi
+          json=$(printf '{"schemaVersion":1,"label":"mutation (TS)","message":"%s%%","color":"%s"}' "$score" "$color")
+          bash actions/publish-badge/publish-badge.sh "cplieger/${REPO}" "$TOKEN" mutation-ts.json "$json"
+
+  # Update each repo's tracker issue, the TS twin of weekly-gremlins.yaml's
+  # aggregate job, independent of the badge job so neither failure blocks the
+  # other. A repo with no parseable report this week is left untouched (its red
+  # matrix entry is the signal).
   aggregate:
     needs: [fanout, run]
-    if: always() && needs.fanout.outputs.matrix != '[]'
+    if: ${{ always() && needs.fanout.result == 'success' && needs.fanout.outputs.repos != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.fanout.outputs.repos) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -399,85 +400,54 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
-      - name: Download all report artifacts
+      - name: Download this repo's reports
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
-          pattern: stryker-*
+          pattern: ${{ matrix.artifacts }}
 
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.15"
 
-      - name: Aggregate + update tracker issue per repo
+      - name: Aggregate + update this repo's tracker issue
+        env:
+          REPO: ${{ matrix.repo }}
         run: |
-          # Delegate stats + body generation to scripts/stryker-aggregate.py.
-          # It groups the staged reports by the repo named in each meta.json
-          # (artifact-name parsing is ambiguous — repo names and dir slugs
-          # both contain hyphens), aggregates multi-dir repos into one score,
-          # rolls the 12-week history forward (preserving free-form notes),
-          # renders the Survived/NoCoverage buckets, and writes regression +
-          # entries markers. The issue reads and writes go through
-          # scripts/tracker_issue.py. Explicit per-command error handling (NOT
-          # `set -e` in a `( … ) || …` subshell, which bash neuters): each repo
-          # is isolated, failures warn and set had_failure, and the job exits
-          # red at the end if anything failed.
-          set -uo pipefail
-          # Repos come from the meta.json each artifact carries; the script owns
-          # why that is not a glob, and goes red on the layout defect itself.
-          REPOS=$(bash scripts/discover-artifact-repos.sh artifacts) || exit 1
-          if [ -z "$REPOS" ]; then
-            echo "no report artifacts this week — nothing to aggregate"
+          set -euo pipefail
+          # Target code wrote meta.json, so an artifact naming another repo is
+          # warned and skipped; stryker-aggregate.py reads only this repo's.
+          found=$(bash scripts/discover-artifact-repos.sh --allow "$REPO" artifacts)
+          if [ -z "$found" ]; then
+            echo "no report names ${REPO} this week, so its tracker issue is left untouched"
             exit 0
           fi
-          WEEK_ENDING=$(date -u +'%Y-%m-%d %H:%M')
-          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          R="cplieger/${REPO}"
           title="Stryker mutation testing tracker"
-
-          process_repo() {
-            local repo="$1" R="cplieger/$1" ent flag=off
-
-            python3 scripts/tracker_issue.py --repo "$R" --label stryker-tracker --title "$title" \
-              --mode fetch --body-file "/tmp/existing-${repo}.md" || return 1
-
-            python3 scripts/stryker-aggregate.py \
-              --repo "$repo" --artifacts-dir artifacts --week "$WEEK_ENDING" --run-url "$RUN_URL" \
-              --regression-marker-file "/tmp/regression-${repo}.txt" \
-              --entries-marker-file "/tmp/entries-${repo}.txt" \
-              --existing-body-file "/tmp/existing-${repo}.md" > "/tmp/body-${repo}.md" || return 1
-
-            ent=$(cat "/tmp/entries-${repo}.txt" 2>/dev/null || echo 0)
-            if [ "$ent" -eq 0 ]; then
-              echo "  no parseable reports for ${repo} — leaving the tracker issue untouched"
-              return 0
-            fi
-
-            if [ "$(cat "/tmp/regression-${repo}.txt" 2>/dev/null)" = "true" ]; then
-              flag=on
-            fi
-            python3 scripts/tracker_issue.py --repo "$R" --label stryker-tracker --title "$title" \
-              --mode upsert --body-file "/tmp/body-${repo}.md" \
-              --flag-label mutation-regression --flag "$flag" || return 1
-          }
-
-          had_failure=0
-          for repo in $REPOS; do
-            echo "::group::$repo"
-            if ! process_repo "$repo"; then
-              echo "::warning::aggregate failed for ${repo} — continuing"
-              had_failure=1
-            fi
-            echo "::endgroup::"
-          done
-          if [ "$had_failure" -ne 0 ]; then
-            echo "::error::one or more tracker-issue updates failed"
-            exit 1
+          python3 scripts/tracker_issue.py --repo "$R" --label stryker-tracker --title "$title" \
+            --mode fetch --body-file "$RUNNER_TEMP/existing.md"
+          python3 scripts/stryker-aggregate.py \
+            --repo "$REPO" --artifacts-dir artifacts --week "$(date -u +'%Y-%m-%d %H:%M')" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --regression-marker-file "$RUNNER_TEMP/regression.txt" \
+            --entries-marker-file "$RUNNER_TEMP/entries.txt" \
+            --existing-body-file "$RUNNER_TEMP/existing.md" > "$RUNNER_TEMP/body.md"
+          if [ "$(cat "$RUNNER_TEMP/entries.txt" 2>/dev/null || echo 0)" -eq 0 ]; then
+            echo "no parseable reports for ${REPO}, so its tracker issue is left untouched"
+            exit 0
           fi
+          flag=off
+          if [ "$(cat "$RUNNER_TEMP/regression.txt" 2>/dev/null)" = "true" ]; then
+            flag=on
+          fi
+          python3 scripts/tracker_issue.py --repo "$R" --label stryker-tracker --title "$title" \
+            --mode upsert --body-file "$RUNNER_TEMP/body.md" \
+            --flag-label mutation-regression --flag "$flag"
 
   # `needs:` must list every other job in this workflow.
   notify:
-    needs: [fanout, run, aggregate]
+    needs: [fanout, run, badge, aggregate]
     if: always()
     permissions:
       actions: read

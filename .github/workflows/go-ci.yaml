@@ -11,13 +11,19 @@ on:
         description: Working directory for Go commands (e.g. 'web' for monorepos).
         type: string
         default: '.'
+      runner:
+        description: >-
+          The runner label for the job, such as a self-hosted pool's; empty runs it
+          on ubuntu-26.04. `go test -race` needs a C compiler on the runner.
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
   validate:
-    runs-on: ubuntu-26.04
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 30
     # A module builds against the versions its go.mod names, as its consumers do;
     # ci.yaml's go-work job tests the modules' heads together.
@@ -46,6 +52,7 @@ jobs:
           set -euo pipefail
           # renovate: datasource=github-releases depName=golangci/golangci-lint
           VERSION=v2.15.0
+          bin="$RUNNER_TEMP/bin"
           # install.sh downloads the release tarball from GitHub internally,
           # and that fetch intermittently returns HTTP 504. `curl --retry` only
           # covers downloading install.sh itself, not install.sh's own internal
@@ -55,7 +62,7 @@ jobs:
           delay=5
           until curl -fsSL --retry 3 \
                   "https://raw.githubusercontent.com/golangci/golangci-lint/${VERSION}/install.sh" \
-                | sh -s -- -b /usr/local/bin "${VERSION}"; do
+                | sh -s -- -b "${bin}" "${VERSION}"; do
             if [ "${attempt}" -ge "${max}" ]; then
               echo "::error::golangci-lint install failed after ${max} attempts"
               exit 1
@@ -65,6 +72,7 @@ jobs:
             attempt=$((attempt + 1))
             delay=$((delay * 2))
           done
+          echo "${bin}" >> "$GITHUB_PATH"
 
       - name: Install tools
         run: |

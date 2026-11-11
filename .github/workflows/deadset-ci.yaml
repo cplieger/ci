@@ -22,6 +22,12 @@ on:
         description: deadset's --exit-code, `on` or `off`.
         type: string
         default: 'on'
+      runner:
+        description: >-
+          The runner label for the job, such as a self-hosted pool's; empty runs it
+          on ubuntu-26.04.
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -39,7 +45,7 @@ env:
 
 jobs:
   analyze:
-    runs-on: ubuntu-26.04
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -132,14 +138,20 @@ jobs:
             scratch="$(mktemp -d "$RUNNER_TEMP/install.XXXXXX")"
             (cd "$scratch" && go mod init install && retry go get "$1@$2" && go install "$1")
           }
-          export GOTOOLCHAIN=auto
-          echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
+          export GOTOOLCHAIN=auto GOBIN="$RUNNER_TEMP/bin"
+          {
+            echo "GOTOOLCHAIN=auto"
+            echo "GOBIN=$GOBIN"
+          } >> "$GITHUB_ENV"
+          echo "$GOBIN" >> "$GITHUB_PATH"
           install_pinned github.com/cplieger/deadset/v2/cmd/deadset "$DEADSET_VERSION"
 
       # The census is the plan `deadset analyze` makes from the same flags, so
       # the job installs exactly the analyzers that run invokes. Its
       # no-program failure is deadset's answer that the target holds no
       # program; any other failure fails the job, never reads as no languages.
+      # An empty analyzer list is valid: deadset reads proto in process
+      # (deadset-spec contract/census.schema.json).
       - name: Languages in scope (deadset)
         id: census
         env:
@@ -160,14 +172,18 @@ jobs:
             echo "::error::deadset print-languages exited $rc, so the languages in scope at $TARGET are unknown and nothing was checked. Its error is above."
             exit 1
           fi
-          analyzers="$(jq -er '.analyzers | select(length > 0) | map(.name) | join(",")' "$WORK/census.json")" || {
-            echo "::error::deadset print-languages wrote no census naming its analyzers, so nothing was checked."
+          if ! jq -e '(.languages | type == "array" and length > 0) and (.analyzers | type == "array")' \
+            "$WORK/census.json" > /dev/null 2>&1; then
+            echo "::error::deadset print-languages wrote no census naming the languages in scope and their analyzers, so nothing was checked."
             exit 1
-          }
+          fi
+          analyzers="$(jq -r '.analyzers | map(.name) | join(",")' "$WORK/census.json")"
           from() {
             jq -r --arg language "$1" '.languages[] | select(.language == $language) | .provenance' "$WORK/census.json"
           }
-          echo "analysis.languages $(jq -r '[.languages[] | "\(.language) (\(.provenance))"] | join(", ")' "$WORK/census.json"); analyzers $analyzers"
+          ran="analyzers $analyzers"
+          if [ -z "$analyzers" ]; then ran="no analyzer: deadset reads these languages itself"; fi
+          echo "analysis.languages $(jq -r '[.languages[] | "\(.language) (\(.provenance))"] | join(", ")' "$WORK/census.json"); $ran"
           go=false
           ts=false
           IFS=, read -ra names <<< "$analyzers"

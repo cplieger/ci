@@ -25,7 +25,7 @@ jobs:
 
 Pin every reference to a full commit SHA with the tag in a comment, as above. Renovate reads the comment and updates the SHA when the tag moves. Never pin to a branch. To find the commit a tag points at, run `git ls-remote https://github.com/cplieger/ci refs/tags/v3`.
 
-Neither entry point takes inputs. `ci.yaml` picks its jobs from the files it finds, and [Reusable workflows](docs/workflows.md) lists which file starts which job. The release workflow picks the release type from the files at the repository root. A `Dockerfile` publishes an image, a `jsr.json` publishes to npm and JSR, and a `go.mod` gets a Go tag. When more than one is present, a `Dockerfile` wins over `jsr.json`, and `jsr.json` wins over `go.mod`. The calling job grants the permissions and passes the two Docker Hub secrets:
+`ci.yaml` takes one optional input, `runner`, which moves the jobs that can leave GitHub's hosted runners onto a runner label of your choice ([Choosing the runner](docs/workflows.md#choosing-the-runner)). The release workflow takes none. `ci.yaml` picks its jobs from the files it finds, and [Reusable workflows](docs/workflows.md) lists which file starts which job. The release workflow picks the release type from the files at the repository root. A `Dockerfile` publishes an image, and each `images/<name>/Dockerfile` beside it publishes a [runner image](docs/workflows.md#the-release-workflow) on the same version. A `jsr.json` publishes to npm and JSR, and a `go.mod` gets a Go tag. When more than one is present, a `Dockerfile` wins over `jsr.json`, and `jsr.json` wins over `go.mod`. The calling job grants the permissions and passes the two Docker Hub secrets:
 
 ```yaml
 # .github/workflows/release.yaml

@@ -3,7 +3,8 @@
 # each one's .gremlins.yaml, from the ci checkout root. weekly-gremlins.yaml's
 # plan and run jobs both call it, so a shard measures the modules its plan
 # sized. A shard passes its PLAN (scripts/gremlins-shard.py's plan.json) and
-# SHARD. Writes sha and modules to GITHUB_OUTPUT. Env: GH_TOKEN.
+# SHARD. Writes sha and modules to GITHUB_OUTPUT. The clone is anonymous,
+# because the fanout lists only public repositories.
 #
 # Usage: gremlins-prepare.sh REPO [PLAN SHARD]
 set -euo pipefail
@@ -15,20 +16,15 @@ if [ -n "${plan}" ] && [ -z "${shard}" ]; then
   echo "::error::gremlins-prepare.sh: a PLAN needs its SHARD" >&2
   exit 2
 fi
-: "${GH_TOKEN:?}" "${GITHUB_OUTPUT:?}"
+: "${GITHUB_OUTPUT:?}"
 
-# git over HTTPS draws no API quota, so a rate-limited run still clones. Auth as
-# a top-level `git -c` (never `git clone --config`) keeps the token out of
-# target/.git/config, which gremlins copies to every worker.
-auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
-git -c "http.https://github.com/.extraheader=${auth}" \
-  clone --depth 1 "https://github.com/cplieger/${repo}.git" target
+# git over HTTPS draws no API quota, so a rate-limited run still clones.
+git clone --depth 1 "https://github.com/cplieger/${repo}.git" target
 # Every shard measures the commit its plan sized, so its packages are the ones
 # the plan assigned even if the repo moved since.
 if [ -n "${plan}" ]; then
   sha=$(jq -er '.sha | select(test("^[0-9a-f]{40}$"))' "${plan}")
-  git -C target -c "http.https://github.com/.extraheader=${auth}" \
-    fetch --quiet --depth 1 origin "${sha}"
+  git -C target fetch --quiet --depth 1 origin "${sha}"
   git -C target -c advice.detachedHead=false checkout --quiet "${sha}"
 fi
 echo "sha=$(git -C target rev-parse HEAD)" >>"${GITHUB_OUTPUT}"

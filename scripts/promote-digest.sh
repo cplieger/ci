@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # The image a stable release re-tags instead of building:
 #   promote-digest.sh [--carry-rebuilds] <commit>
-# Env IMAGE_NAME (<owner>/<name> on GHCR), REGISTRY, EXCLUDE_RE (path-significance.sh's
-# exclude_re; empty accepts an exact sha-<commit> hit only), SUBPACKAGES_JSON (required
-# with EXCLUDE_RE), GITHUB_REPOSITORY, cosign.
-# Prints promote_digest= (empty: build from source), promote_source=, promote_via=
-# exact|ancestor|trailer|none. Exit 1 refuses a promotion commit whose
-# Promoted-Digest this image's package lacks. --sources <commit> reads no registry: the
-# commit, then each first-parent ancestor whose image it carries unchanged, nearest first.
+# Env IMAGE_NAME (<owner>/<name> on GHCR), REGISTRY, EXCLUDE_RE (path-significance.sh's exclude_re;
+# empty accepts an exact sha-<commit> hit only), SUBPACKAGES_JSON (required with EXCLUDE_RE),
+# GITHUB_REPOSITORY, cosign. Prints promote_digest= (empty: build from source), promote_source=,
+# promote_via= exact|ancestor|trailer|none. Exit 1 refuses a promotion commit whose Promoted-Digest
+# this image's package lacks. --sources <commit> reads no registry: the commit, then each
+# first-parent ancestor whose image it carries unchanged, nearest first.
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -166,6 +165,8 @@ if [ "$rc" -eq 0 ]; then
     -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
     "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/${DIGEST}" 2>/dev/null | tr -d '\r') \
     || die "could not read ${REGISTRY}/${IMAGE_NAME}@${DIGEST}, and a promotion is never built from source"
+  # A retried read prints every attempt's headers, and the last one is the answer.
+  reply=$(awk '/^HTTP\// { b = "" } { b = b $0 "\n" } END { printf "%s", b }' <<<"$reply")
   status=$(awk 'NR == 1 { print $2 }' <<<"$reply")
   served=$(awk 'tolower($1) == "docker-content-digest:" { print $2 }' <<<"$reply")
   case "$status" in

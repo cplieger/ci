@@ -209,6 +209,7 @@ LICENSE_OVERRIDES = {
     'cert-converter': 'GPL-3.0',
     'forge-scout': 'GPL-3.0',
     'knell': 'GPL-3.0',
+    'manade': 'GPL-3.0',
     'plex-exporter': 'GPL-3.0',
     'plex-language-sync': 'GPL-3.0',
     'registry-stats': 'GPL-3.0',

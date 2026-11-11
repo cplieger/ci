@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Delete aged dev-channel versions from the owner's GHCR container packages.
 
-Candidates are the versions is_candidate accepts; the newest KEEP_NEWEST
-survive at any age and the rest go once older than MAX_AGE_DAYS. Needs a
+Candidates are the versions is_candidate accepts; the newest KEEP_NEWEST of
+each image survive at any age and the rest go once older than MAX_AGE_DAYS. Needs a
 GH_TOKEN with read:packages and delete:packages; `--dry-run` deletes nothing.
 """
 
@@ -23,6 +23,9 @@ OWNER = 'cplieger'
 KEEP_NEWEST = 10
 MAX_AGE_DAYS = 30
 SHA_TAG_RE = re.compile(r'^sha-[0-9a-f]{40}$')
+# A runner package (runner_images.py) holds several images, each tag prefixed by its image name.
+RUNNER_SUFFIX = '-runner'
+RUNNER_TAG_RE = re.compile(r'^(?P<image>[a-z0-9]{1,32})-(?P<tag>.+)$')
 
 
 def gh(*args: str) -> str:
@@ -47,16 +50,28 @@ def created_at(version: dict) -> datetime:
     return datetime.fromisoformat(version['created_at'])
 
 
-def is_candidate(version: dict) -> bool:
+def channel_tags(version: dict, package: str = '') -> list[tuple[str, str]]:
+    """(image, tag) per tag: a runner package's tag split at its image name, else ('', tag)."""
+    if not package.endswith(RUNNER_SUFFIX):
+        return [('', t) for t in version_tags(version)]
+    out = []
+    for t in version_tags(version):
+        m = RUNNER_TAG_RE.match(t)
+        out.append((m['image'], m['tag']) if m else (t, ''))
+    return out
+
+
+def is_candidate(version: dict, package: str = '') -> bool:
     """Tagged, every tag a dev version or a `sha-<commit>` tag, at least one a
     dev version. Untagged versions are the per-architecture manifests live
-    indexes reference, and the API cannot tell one from an orphan."""
-    tags = version_tags(version)
+    indexes reference, and the API cannot tell one from an orphan. A runner
+    image tagged only `<name>-sha-<commit>` is a build no version took."""
+    tags = [t for _, t in channel_tags(version, package)]
     if not tags:
         return False
     if not all(rc.is_dev_tag(t) or SHA_TAG_RE.match(t) for t in tags):
         return False
-    return any(rc.is_dev_tag(t) for t in tags)
+    return package.endswith(RUNNER_SUFFIX) or any(rc.is_dev_tag(t) for t in tags)
 
 
 def select_deletions(
@@ -64,12 +79,21 @@ def select_deletions(
     now: datetime,
     keep_newest: int = KEEP_NEWEST,
     max_age_days: int = MAX_AGE_DAYS,
+    package: str = '',
 ) -> list[dict]:
-    """The versions to delete: candidates beyond the newest `keep_newest`, older
-    than `max_age_days` (a version exactly that old is kept)."""
-    candidates = sorted((v for v in versions if is_candidate(v)), key=created_at, reverse=True)
+    """The versions to delete: candidates beyond each image's newest `keep_newest`,
+    older than `max_age_days` (a version exactly that old is kept)."""
+    candidates = sorted(
+        (v for v in versions if is_candidate(v, package)), key=created_at, reverse=True
+    )
+    per_image: dict[str, list[dict]] = {}
+    for v in candidates:
+        per_image.setdefault(min(i for i, _ in channel_tags(v, package)), []).append(v)
     cutoff = timedelta(days=max_age_days)
-    return [v for v in candidates[keep_newest:] if now - created_at(v) > cutoff]
+    doomed = [
+        v for vs in per_image.values() for v in vs[keep_newest:] if now - created_at(v) > cutoff
+    ]
+    return sorted(doomed, key=created_at, reverse=True)
 
 
 def list_packages() -> list[str]:
@@ -118,9 +142,11 @@ def main(argv: list[str] | None = None) -> int:
     deleted = 0
     for name in list_packages():
         versions = list_versions(name)
-        doomed = select_deletions(versions, now)
+        doomed = select_deletions(versions, now, package=name)
         doomed_ids = {v['id'] for v in doomed}
-        for v in sorted((v for v in versions if is_candidate(v)), key=created_at, reverse=True):
+        for v in sorted(
+            (v for v in versions if is_candidate(v, name)), key=created_at, reverse=True
+        ):
             action = 'keep'
             if v['id'] in doomed_ids:
                 action = 'would delete' if args.dry_run else 'delete'
