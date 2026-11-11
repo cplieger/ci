@@ -569,8 +569,16 @@ case "$method $ep" in
     tag=${ep#"$R"/git/ref/tags/}
     [ -f "$GH_DIR/tag-${tag//\//%}" ] || nf
     cat "$GH_DIR/tag-${tag//\//%}" ;;
+  "GET $R/git/ref/heads/"*)
+    # dev's head as GitHub serves it; GH_HEAD unset is an unreadable head.
+    [ -n "${GH_HEAD:-}" ] || exit 1
+    printf '%s\n' "$GH_HEAD" ;;
   "POST $R/git/refs")
     [ ! -f "$GH_DIR/fail-ref" ] || exit 1
+    if [ -f "$GH_DIR/refuse-ref-always" ]; then
+      echo "gh: Resource not accessible by integration (HTTP 403)" >&2
+      exit 1
+    fi
     if [ -f "$GH_DIR/refuse-ref-once" ]; then
       rm "$GH_DIR/refuse-ref-once"
       echo "gh: Reference update failed (HTTP 422)" >&2
@@ -2432,7 +2440,43 @@ make_hook cancelled ""
 out_b=$(POLLS=9 barrier)
 chk "B24 one that leaves dev below the version holds the publish" "$out_b|$(dispatched)" "EXIT=1|1"
 chk_has "B24 naming the lane" "$(cat "$WORK/barrier.log")" "lane .: renumber run 99 left no dev build above v1.1.0"
-rm -f "$GH_DIR/on-dispatch"
+# A workflow-editing dev push that lands past the renumber run's head costs the
+# run its tag create, so it hands the tag off and succeeds having numbered
+# nothing (cmd_renumber); the barrier dispatches the renumber again for dev as
+# it then stands, and that run numbers it.
+handoff_hook() { # <run head of the first renumber run>: the first run numbers nothing, the second tags v1.2.0-dev.1
+  cat >"$GH_DIR/on-dispatch" <<SH
+#!/usr/bin/env bash
+n=\$(cat "$GH_DIR/renumbers" 2>/dev/null || echo 0)
+n=\$((n + 1))
+echo "\$n" >"$GH_DIR/renumbers"
+echo 99 >"$GH_DIR/dispatched-id"
+if [ "\$n" -eq 1 ]; then
+  echo '{"status":"completed","conclusion":"success","head_sha":"$1"}' >"$GH_DIR/run-99.json"
+else
+  echo '{"status":"completed","conclusion":"success","head_sha":"$D3"}' >"$GH_DIR/run-99.json"
+  git -C "$O" tag v1.2.0-dev.1 "$D3"
+fi
+SH
+  chmod 755 "$GH_DIR/on-dispatch"
+  rm -f "$GH_DIR/renumbers"
+}
+OLDH=$(git -C "$O" rev-parse "$D3^")
+handoff_hook "$OLDH"
+out_b=$(POLLS=9 barrier)
+chk "B39 a renumber run that handed its tag off is dispatched again for dev's new head" "$out_b|$(dispatched)" "|2"
+chk_has "B39 saying why" "$(cat "$WORK/barrier.log")" \
+  "renumber run 99 numbered dev's $OLDH, and dev has moved past it with a lane still below its version, so the renumber is dispatched again"
+chk_has "B39 and the second run releases the hold" "$(cat "$WORK/barrier.log")" "lane .: dev now ranks above v1.1.0"
+untag v1.2.0-dev.1
+handoff_hook "$OLDH"
+out_b=$(POLLS=9 RENUMBER_DISPATCHES=1 barrier)
+chk "B39 the dispatches stop at RENUMBER_DISPATCHES and the publish stays held" "$out_b|$(dispatched)" "EXIT=1|1"
+chk_has "B39 naming the lane" "$(cat "$WORK/barrier.log")" "lane .: renumber run 99 left no dev build above v1.1.0"
+handoff_hook "$D3"
+out_b=$(POLLS=9 barrier)
+chk "B39 a run that numbered dev's head and left a lane below is not dispatched again" "$out_b|$(dispatched)" "EXIT=1|1"
+rm -f "$GH_DIR/on-dispatch" "$GH_DIR/renumbers"
 git -C "$O" tag v1.2.0-dev.1 "$D3"
 polls=$(grep -o 'BARRIER_POLLS:-[0-9]*' "$RS" | sort -u | cut -d- -f2)
 poll_s=$(grep -o 'POLL_SECONDS:-[0-9]*' "$RS" | sort -u | cut -d- -f2)
@@ -2534,6 +2578,18 @@ chk "U6 renumber outside dev is refused" "$(renumber docker v1.2.0-dev.1 stable)
 touch "$GH_DIR/fail-post"
 chk "U7 a failed receipt deletes the tag the run created" "$(renumber go v1.2.0-dev.1)|$(grep -c '^api -X DELETE repos/o/app/git/refs/tags/v1.2.0-dev.1$' "$GH_LOG")" "EXIT=1|1"
 rm "$GH_DIR/fail-post"
+# A workflow-editing dev push past this run's head costs its token the ref
+# create, so every attempt fails: once dev moved past the run's head the run
+# hands the tag off and succeeds with no receipt, and otherwise it fails.
+touch "$GH_DIR/refuse-ref-always"
+chk "U43 a tag create refused after dev moved past the run's head hands the tag off" \
+  "$(GITHUB_SHA=$OLDH GH_HEAD=$D3 renumber go v1.2.0-dev.1)|$(grep -c 'context=release/tag/v1.2.0-dev.1 ' "$GH_LOG" || true)" "|0"
+chk_has "U43 saying so" "$(cat "$WORK/renumber.log")" "::warning::tag v1.2.0-dev.1 not created: dev advanced past $OLDH (now $D3)"
+chk "U44 one refused while the run's head is still dev's fails the run" \
+  "$(GITHUB_SHA=$D3 GH_HEAD=$D3 renumber go v1.2.0-dev.1)|$(grep -c 'context=release/tag/v1.2.0-dev.1 ' "$GH_LOG" || true)" "EXIT=1|0"
+chk_has "U44 saying it is no superseded run" "$(cat "$WORK/renumber.log")" "It is not a superseded run"
+chk "U44 as does one with no run head to compare" "$(GH_HEAD=$D3 renumber go v1.2.0-dev.1)" "EXIT=1"
+rm "$GH_DIR/refuse-ref-always"
 
 # A build that shipped runner images (images/<name>/Dockerfile) re-tags each
 # image's build of the commit as <name>-<version>, beside the app image.

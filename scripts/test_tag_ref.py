@@ -54,7 +54,7 @@ class RunsTagRef:
 
     head_reads: list
 
-    def run_tag_ref(self, tags=None, creates=(), head=None, call='tag_ref o/app v1.2.0'):
+    def run_tag_ref(self, tags=None, creates=(), head=None, call='tag_ref o/app v1.2.0', tail=''):
         tmp = pathlib.Path(tempfile.mkdtemp(prefix='tag-ref-'))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         (tmp / 'gh').write_text(GH_STUB)
@@ -68,7 +68,7 @@ class RunsTagRef:
             f'. "{SCRIPTS}/retry.sh"\n'
             f'. "{SCRIPTS}/tag-ref.sh"\n'
             'rc=0\n'
-            f'{call} {COMMIT} || rc=$?\n'
+            f'{call} {COMMIT}{tail} || rc=$?\n'
             'echo "rc=${rc} created=${TAG_CREATED}"\n'
         )
         env = {
@@ -178,6 +178,41 @@ class TagRefOrHandoff(RunsTagRef, unittest.TestCase):
         out, _, _ = self.run_tag_ref(tags={'v1.2.0': 'b' * 40}, head='d' * 40, call=HANDOFF)
         self.assertTrue(out.endswith('rc=1 created=false\n'), out)
         self.assertNotIn('advanced past', out)
+        self.assertEqual(self.head_reads, [])
+
+
+RUN = 'e' * 40
+
+
+class TagRefOrHandoffFromRunHead(RunsTagRef, unittest.TestCase):
+    """A renumber run tags an older build: the branch is compared with the run's own head."""
+
+    def test_a_failed_create_after_the_branch_moved_past_the_run_hands_off(self):
+        out, tags, _ = self.run_tag_ref(
+            creates=['refused'] * 5, head='d' * 40, call=HANDOFF, tail=f' {RUN}'
+        )
+        self.assertIn(
+            f'::warning::tag v1.2.0 not created: dev advanced past {RUN} (now {"d" * 40})', out
+        )
+        self.assertTrue(out.endswith('rc=2 created=false\n'), out)
+        self.assertEqual(tags, {})
+
+    def test_a_failed_create_while_the_run_is_the_head_is_refused(self):
+        # The tagged commit is not the head, yet the run is: no superseded run.
+        out, _, _ = self.run_tag_ref(
+            creates=['refused'] * 5, head=RUN, call=HANDOFF, tail=f' {RUN}'
+        )
+        self.assertIn(
+            "::error::tag create for v1.2.0 failed while this run is still dev's head", out
+        )
+        self.assertTrue(out.endswith('rc=1 created=false\n'), out)
+
+    def test_an_empty_run_head_cannot_confirm_a_handoff(self):
+        out, _, _ = self.run_tag_ref(
+            creates=['refused'] * 5, head='d' * 40, call=HANDOFF, tail=" ''"
+        )
+        self.assertIn("::error::tag create for v1.2.0 failed and dev's head is unreadable", out)
+        self.assertTrue(out.endswith('rc=1 created=false\n'), out)
         self.assertEqual(self.head_reads, [])
 
 

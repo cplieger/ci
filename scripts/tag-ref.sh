@@ -42,21 +42,27 @@ branch_moved_past() {
   [ "$head" != "$3" ]
 }
 
-# tag_ref_or_handoff <owner/repo> <branch> <tag> <commit>: tag_ref for a release run on <branch>.
-# Once a push that edits workflow files lands past <commit>, GitHub refuses the
-# integration token's ref create (ui#42, deadset#281, toolbelt#506), and runs
-# queue per ref, so the run on the new head releases this range. Returns 0 when
-# the tag is at <commit>, 2 when the create failed after <branch> moved on (a
-# handoff, warned), 1 otherwise: the tag sits elsewhere, or the create failed
-# while <commit> is still the head or the head cannot be read.
+# tag_ref_or_handoff <owner/repo> <branch> <tag> <commit> [<run head>]: tag_ref
+# for a release run on <branch> whose head is <run head> (default <commit>).
+# Once a push that edits workflow files lands past the run's head, GitHub
+# refuses the integration token's ref create (ui#42, deadset#281, toolbelt#506),
+# and runs queue per ref, so the run on the new head releases this range.
+# Returns 0 when the tag is at <commit>, 2 when the create failed after <branch>
+# moved past the run's head (a handoff, warned), 1 otherwise: the tag sits
+# elsewhere, or the create failed while the run's head is still the branch's,
+# or the head cannot be read.
 tag_ref_or_handoff() {
-  local rc=0 head mrc=0
+  local rc=0 head mrc=0 run=${5-$4}
   tag_ref "$1" "$3" "$4" || rc=$?
   [ "$rc" -eq 2 ] || return "$rc"
-  head=$(branch_moved_past "$1" "$2" "$4") || mrc=$?
+  if [ -n "$run" ]; then
+    head=$(branch_moved_past "$1" "$2" "$run") || mrc=$?
+  else
+    mrc=2
+  fi
   case "$mrc" in
     0)
-      echo "::warning::tag $3 not created: $2 advanced past $4 (now ${head}), and a superseded run loses ref-create. The run on the new head releases this range."
+      echo "::warning::tag $3 not created: $2 advanced past ${run} (now ${head}), and a superseded run loses ref-create. The run on the new head releases this range."
       return 2
       ;;
     1) echo "::error::tag create for $3 failed while this run is still $2's head. It is not a superseded run, so check the token's permissions and the API." ;;

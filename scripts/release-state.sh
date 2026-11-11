@@ -1232,6 +1232,16 @@ cmd_barrier() {
     git fetch --quiet --force --tags origin '+refs/heads/dev:refs/remotes/origin/dev' || die "cannot fetch dev"
     waited=1
   fi
+  renumbered_short() { # true when a lane dev holds a build past still has no dev build above its version
+    local key r v p
+    while IFS=$'\t' read -r key r v; do
+      [ -n "$key" ] || continue
+      p=$(git rev-parse "$r^2") || die "lane ${key}: cannot read the commit ${r} promoted"
+      built_past "$key" "$p" || continue
+      has_dev_above "$key" "$(core "$v")" || return 0
+    done <<<"$plan"
+    return 1
+  }
   assess() { # sets need and lacking from dev as last fetched
     need=""
     lacking=$(subs_lacking "$subrows")
@@ -1268,17 +1278,30 @@ cmd_barrier() {
     assess
   done
   read_floor=0
-  dispatch_wait renumber mode=renumber
-  case "$run_conclusion" in
-    success) ;;
-    # A dev run queued behind the renumber run replaced it in the group, and
-    # numbers dev's head itself.
-    cancelled) poll "every dev release run, as renumber run ${run_id} was cancelled" 2 pending_runs ;;
-    *) die "renumber run ${run_id} concluded '${run_conclusion}', so the stable publish stays held" ;;
-  esac
-  # The renumber run's publish starts a propagation of its own.
-  REGISTRY_WAITED=0
-  settle_dev_head
+  # A renumber run whose tag create a workflow-editing dev push cost it hands
+  # the tag off and succeeds having numbered nothing (cmd_renumber), so while a
+  # lane still lacks a build above its version and dev moved past that run's
+  # head, the renumber is dispatched again for dev as it then stands, up to
+  # RENUMBER_DISPATCHES runs in all.
+  local dispatches=0
+  while :; do
+    dispatches=$((dispatches + 1))
+    dispatch_wait renumber mode=renumber
+    case "$run_conclusion" in
+      success) ;;
+      # A dev run queued behind the renumber run replaced it in the group, and
+      # numbers dev's head itself.
+      cancelled) poll "every dev release run, as renumber run ${run_id} was cancelled" 2 pending_runs ;;
+      *) die "renumber run ${run_id} concluded '${run_conclusion}', so the stable publish stays held" ;;
+    esac
+    # The renumber run's publish starts a propagation of its own.
+    REGISTRY_WAITED=0
+    settle_dev_head
+    [ "$run_conclusion" = success ] && [ "$dispatches" -lt "${RENUMBER_DISPATCHES:-3}" ] || break
+    renumbered_short || break
+    [[ $run_head =~ ^[0-9a-f]{40}$ ]] && [ "$(git rev-parse refs/remotes/origin/dev)" != "$run_head" ] || break
+    note "renumber run ${run_id} numbered dev's ${run_head}, and dev has moved past it with a lane still below its version, so the renumber is dispatched again"
+  done
   while IFS=$'\t' read -r key r v; do
     p=$(git rev-parse "$r^2") || die "lane ${key}: cannot read the commit ${r} promoted"
     built_past "$key" "$p" || continue
@@ -1520,7 +1543,16 @@ cmd_renumber() {
   elif [ "$key" != . ]; then
     cmd_half_free "$key" "$new" "$d"
   fi
-  tag_ref "$repo" "$new" "$d" || die "tag ${new} is not at ${d}, so the build is not renumbered"
+  # A workflow-editing push that lands on dev past this run's head costs its
+  # token the ref create; the barrier then dispatches a renumber of dev's new
+  # head (cmd_barrier), so this run records nothing and succeeds.
+  rc=0
+  tag_ref_or_handoff "$repo" "${GITHUB_REF_NAME:-dev}" "$new" "$d" "${GITHUB_SHA:-}" || rc=$?
+  case "$rc" in
+    0) ;;
+    2) return 0 ;;
+    *) die "tag ${new} is not at ${d}, so the build is not renumbered" ;;
+  esac
   if ! gh api -X POST "repos/${repo}/statuses/${d}" -f state=success -f context="${TAG_RECEIPT_PREFIX}${new}" \
     -f description="created by the dev renumber run" \
     -f target_url="${GITHUB_SERVER_URL:-https://github.com}/${repo}/actions/runs/${GITHUB_RUN_ID:-0}" >/dev/null; then
