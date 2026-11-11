@@ -1,8 +1,8 @@
 # Weekly fuzzing of every `func Fuzz` target in the public cplieger Go
-# repositories, from the committed seed corpus only. A repo whose targets
-# overrun one shard's budget is split across runners rather than given less
-# time per target. The budget, the sharding and the per-finding issues are
-# documented in docs/workflows.md "The scheduled runs".
+# repositories, one unit per Go module, from the committed seed corpus only. A
+# module whose targets overrun one shard's budget is split across runners rather
+# than given less time per target. The budget, the sharding and the per-finding
+# issues are documented in docs/workflows.md "The scheduled runs".
 name: Weekly fuzz
 
 on:
@@ -32,7 +32,17 @@ jobs:
       shard_matrix: ${{ steps.fanout.outputs.shard_matrix }}
       repo_matrix: ${{ steps.fanout.outputs.repo_matrix }}
     steps:
-      - name: Discover fuzz targets and compute per-repo shard counts
+      - name: Checkout ci (for the module discovery)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _ci
+          persist-credentials: false
+          sparse-checkout: scripts/go-units.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Discover fuzz targets and compute per-module shard counts
         id: fanout
         env:
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
@@ -53,7 +63,6 @@ jobs:
           shard_matrix='[]'
           repo_matrix='[]'
           for r in $repos; do
-            gh api "/repos/cplieger/${r}/contents/go.mod" --silent 2>/dev/null || continue
             rm -rf scan
             # Plain git over HTTPS draws no API quota, so a rate-limited run can
             # still clone, where `gh repo clone` would spend GraphQL budget.
@@ -67,30 +76,42 @@ jobs:
               echo "::warning::cannot resolve HEAD for ${r}, so it is dropped from the fuzz matrix this week"
               continue
             fi
-            # Count fuzz targets (proxy for `go test -list '^Fuzz'`; exact count
-            # is recomputed per shard at run time, this only sizes the matrix).
-            # `|| true`: grep exits 1 when a Go repo has tests but no fuzz funcs,
-            # which pipefail+set -e would otherwise treat as fatal.
-            count=$(grep -rhE '^func Fuzz' --include='*_test.go' scan 2>/dev/null | wc -l | tr -d ' ' || true)
-            if [ "${count:-0}" -eq 0 ]; then
-              echo "  skip ${r}: no fuzz targets"
+            # One unit per Go module, the root and each nested one, since a
+            # module's `go list ./...` never crosses into another. The count is a
+            # proxy for `go test -list '^Fuzz'` that only sizes the shards; each
+            # shard recomputes the exact list at run time.
+            if ! units=$(bash _ci/scripts/go-units.sh scan '^func Fuzz'); then
+              echo "::warning::module discovery failed for ${r}, so it is dropped from the fuzz matrix this week"
               continue
             fi
-            # shards = ceil(count * FUZZ_TIME_SECONDS / SHARD_BUDGET_SECONDS), >= 1
-            shards=$(( (count * FUZZ_TIME_SECONDS + SHARD_BUDGET_SECONDS - 1) / SHARD_BUDGET_SECONDS ))
-            [ "$shards" -lt 1 ] && shards=1
-            echo "  include ${r}: ${count} target(s) -> ${shards} shard(s) @ ${sha:0:12}"
+            artifacts=()
+            while IFS=$'\t' read -r dir slug count; do
+              [ -n "$dir" ] || continue
+              if [ "${count:-0}" -eq 0 ]; then
+                echo "  skip ${r}:${dir}: no fuzz targets"
+                continue
+              fi
+              # shards = ceil(count * FUZZ_TIME_SECONDS / SHARD_BUDGET_SECONDS), >= 1
+              shards=$(( (count * FUZZ_TIME_SECONDS + SHARD_BUDGET_SECONDS - 1) / SHARD_BUDGET_SECONDS ))
+              [ "$shards" -lt 1 ] && shards=1
+              echo "  include ${r}:${dir}: ${count} target(s) -> ${shards} shard(s) @ ${sha:0:12}"
+              for i in $(seq 0 $((shards - 1))); do
+                artifacts+=("fuzz-findings-${r}=${slug}-shard${i}")
+                shard_matrix=$(printf '%s' "$shard_matrix" | jq -c \
+                  --arg r "$r" --arg s "$sha" --arg d "$dir" --arg slug "$slug" \
+                  --argjson sh "$i" --argjson tot "$shards" \
+                  '. + [{repo: $r, sha: $s, dir: $d, slug: $slug, shard: $sh, shards: $tot}]')
+              done
+            done <<<"$units"
+            if [ "${#artifacts[@]}" -eq 0 ]; then
+              continue
+            fi
             # The report job downloads exactly the names this repo's shards
-            # upload (a brace list for several): a `-shard*` glob would also
-            # match a repo named `<repo>-shard<x>`, and file its findings here.
-            repo_matrix=$(printf '%s' "$repo_matrix" | jq -c --arg r "$r" --arg s "$sha" --argjson n "$shards" '
-              . + [{repo: $r, sha: $s, artifacts: ([range($n)] | map("fuzz-findings-\($r)-shard\(.)")
-                | if length == 1 then .[0] else "{\(join(","))}" end)}]')
-            for i in $(seq 0 $((shards - 1))); do
-              shard_matrix=$(printf '%s' "$shard_matrix" | jq -c \
-                --arg r "$r" --arg s "$sha" --argjson sh "$i" --argjson tot "$shards" \
-                '. + [{repo: $r, sha: $s, shard: $sh, shards: $tot}]')
-            done
+            # upload (a brace list for several): a glob would also match a repo
+            # whose name extends this one's, and file its findings here.
+            repo_matrix=$(printf '%s' "$repo_matrix" | jq -c --arg r "$r" --arg s "$sha" \
+              --args '. + [{repo: $r, sha: $s, artifacts: ($ARGS.positional
+                | if length == 1 then .[0] else "{\(join(","))}" end)}]' "${artifacts[@]}")
           done
           rm -rf scan
 
@@ -129,21 +150,25 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: target/go.mod
+          go-version-file: target/${{ matrix.dir }}/go.mod
           cache: false
 
+      # GOWORK=off: a module builds against the versions its own go.mod pins,
+      # as ci.yaml's go-nested lanes do, whatever go.work a repo commits.
       - name: Run this shard's fuzz targets
-        working-directory: target
+        working-directory: target/${{ matrix.dir }}
         env:
           SHARD: ${{ matrix.shard }}
           SHARDS: ${{ matrix.shards }}
+          MODULE: ${{ matrix.dir }}
+          GOWORK: "off"
         run: |
           set -uo pipefail
           : > "$GITHUB_WORKSPACE/findings.txt"
           : > "$GITHUB_WORKSPACE/broken.txt"
           # Deterministic global target list: `go list ./...` is import-path
           # sorted and `go test -list` order is stable for a fixed commit, so
-          # every shard of this repo sees the identical ordered list and the
+          # every shard of this module sees the identical ordered list and the
           # round-robin slice below partitions it without overlap or gaps.
           targets=()
           for pkg in $(go list ./...); do
@@ -152,7 +177,7 @@ jobs:
             done
           done
           total=${#targets[@]}
-          echo "repo has ${total} fuzz target(s); shard ${SHARD}/${SHARDS}, ${FUZZ_TIME_SECONDS}s/target"
+          echo "module ${MODULE} has ${total} fuzz target(s); shard ${SHARD}/${SHARDS}, ${FUZZ_TIME_SECONDS}s/target"
           idx=0
           ran=0
           for entry in "${targets[@]}"; do
@@ -167,17 +192,19 @@ jobs:
                 # The seed exists on THIS runner but not in the report job's
                 # clone (it isn't committed yet), so capture its size + base64
                 # preview here and carry them through the artifact. Fields:
-                # fuzzname|hash|repo-relative-path|size|base64-preview.
+                # fuzzname|hash|repo-relative-path|size|base64-preview|module.
                 dir=$(go list -f '{{.Dir}}' "$pkg")
                 seed="${dir}/${rel}"
                 size=$(wc -c < "$seed" 2>/dev/null || echo 0)
                 preview=$(head -c 500 "$seed" 2>/dev/null | base64 -w0 2>/dev/null | head -c 800 || true)
-                # Repo-relative seed path. For the ROOT package dir == $PWD, so
-                # the plain ${dir#"$PWD"/} prefix-strip would not match (no
-                # trailing slash) and leak an absolute runner path into the
-                # issue body; strip the two parts separately instead.
-                rel_dir="${dir#"$PWD"}"; rel_dir="${rel_dir#/}"
-                printf '%s|%s|%s|%s|%s\n' "$fn" "$(basename "$rel")" "${rel_dir:+$rel_dir/}${rel}" "$size" "$preview" \
+                # Repo-relative seed path. For a package at the repo root,
+                # dir == the clone, so the plain ${dir#"$root"/} prefix-strip
+                # would not match (no trailing slash) and leak an absolute
+                # runner path into the issue body; strip the two parts
+                # separately instead.
+                root="$GITHUB_WORKSPACE/target"
+                rel_dir="${dir#"$root"}"; rel_dir="${rel_dir#/}"
+                printf '%s|%s|%s|%s|%s|%s\n' "$fn" "$(basename "$rel")" "${rel_dir:+$rel_dir/}${rel}" "$size" "$preview" "$MODULE" \
                   >> "$GITHUB_WORKSPACE/findings.txt"
               elif [ "$status" -ne 0 ]; then
                 # Failed with no reproducer: a committed seed or f.Add entry that
@@ -204,7 +231,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fuzz-findings-${{ matrix.repo }}-shard${{ matrix.shard }}
+          name: fuzz-findings-${{ matrix.repo }}=${{ matrix.slug }}-shard${{ matrix.shard }}
           path: findings.txt
           if-no-files-found: warn
           retention-days: 14
@@ -248,6 +275,7 @@ jobs:
           sparse-checkout: |
             scripts/tracker_issue.py
             scripts/ghrest.py
+            scripts/go-units.sh
           sparse-checkout-cone-mode: false
           path: ci
 
@@ -274,18 +302,28 @@ jobs:
           echo "consolidated $(wc -l < "$merged") finding(s) for ${REPO}"
 
           printf 'Recurred in %s\n' "$RUN_URL" > "$RUNNER_TEMP/recurred.md"
-          while IFS='|' read -r target hash path size preview; do
+          while IFS='|' read -r target hash path size preview module; do
             [ -z "$target" ] && continue
             title="[fuzz] ${target} regression — ${hash}"
+            # A nested module's tests run from its own dir, never the root's,
+            # and its title names it: two modules can share a target name and a
+            # reproducer hash, and the title is the finding's identity.
+            repro="go test -run='^${target}\$/${hash}' ./..."
+            head="**Target**: \`${target}\`"
+            if [ -n "${module:-}" ] && [ "$module" != . ]; then
+              title="[fuzz] ${target} (${module}) regression — ${hash}"
+              repro="cd ${module} && ${repro}"
+              head="${head}"$'\n'"**Module**: \`${module}\`"
+            fi
             cat > "$RUNNER_TEMP/finding.md" <<EOF
-          **Target**: \`${target}\`
+          ${head}
           **Reproducer hash**: \`${hash}\`
           **Found in**: ${RUN_URL}
 
           **Reproduce locally:**
 
           \`\`\`bash
-          go test -run='^${target}\$/${hash}' ./...
+          ${repro}
           \`\`\`
 
           **Seed file**: \`${path}\` (${size} bytes, base64 preview):
@@ -305,18 +343,37 @@ jobs:
               --comment-file "$RUNNER_TEMP/recurred.md" || had_failure=1
           done < "$merged"
 
-          # Auto-close fuzz issues whose seed was committed to the corpus.
+          # Auto-close fuzz issues whose seed was committed to the corpus. Seed
+          # corpora live at the package level (internal/foo/testdata/fuzz/...),
+          # so the search covers the issue's module: a nested module's tree for
+          # an issue naming it, the root's tree outside every nested module for
+          # one that names none.
           python3 "$tracker" --repo "$REPO" --label fuzz-finding --mode list \
             > "$RUNNER_TEMP/open-findings.tsv" || had_failure=1
+          nested=$(bash "$GITHUB_WORKSPACE/ci/scripts/go-units.sh" . | cut -f1 | grep -vxF . || true)
           while IFS=$'\t' read -r _ title; do
-            target=$(echo "$title" | sed -nE 's|^\[fuzz\] ([A-Za-z][A-Za-z0-9_]*) regression .+$|\1|p')
-            hash=$(echo "$title" | sed -nE 's|^.+ — ([a-f0-9]+)$|\1|p')
+            target=$(sed -nE 's|^\[fuzz\] ([A-Za-z][A-Za-z0-9_]*)( \([A-Za-z0-9._/-]+\))? regression .+$|\1|p' <<<"$title")
+            module=$(sed -nE 's|^\[fuzz\] [A-Za-z][A-Za-z0-9_]* \(([A-Za-z0-9._/-]+)\) regression .+$|\1|p' <<<"$title")
+            hash=$(sed -nE 's|^.+ — ([a-f0-9]+)$|\1|p' <<<"$title")
             { [ -z "$target" ] || [ -z "$hash" ]; } && continue
-            # Search the WHOLE tree: seed corpora live at the package level
-            # (e.g. internal/foo/testdata/fuzz/...), not only at the repo root.
-            # A root-only `find testdata/fuzz` never matched non-root packages,
-            # leaving their issues open forever despite the committed seed.
-            seedpath=$(find . -path "*/testdata/fuzz/${target}/${hash}" -print -quit 2>/dev/null)
+            # Only a module this checkout holds, which also keeps the title from
+            # steering the search outside the tree.
+            if [ -n "$module" ] && ! grep -qxF -- "$module" <<<"$nested"; then
+              continue
+            fi
+            start=.
+            [ -z "$module" ] || start="./${module}"
+            prune=()
+            for d in $nested; do
+              if [ -z "$module" ] || [[ $d == "$module"/* ]]; then
+                prune+=(-path "./${d}" -prune -o)
+              fi
+            done
+            if ! seedpath=$(find "$start" ${prune[@]+"${prune[@]}"} -path "*/testdata/fuzz/${target}/${hash}" -print -quit); then
+              echo "::warning::the seed search for '${title}' failed, so the issue stays open this week"
+              had_failure=1
+              continue
+            fi
             if [ -n "$seedpath" ]; then
               msg="Closed automatically: seed \`${seedpath#./}\` was committed; now part of the deterministic regression corpus."
               printf '%s\n' "$msg" > "$RUNNER_TEMP/closed.md"

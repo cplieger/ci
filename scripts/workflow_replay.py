@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Replay one job of a GitHub Actions workflow locally, for the shell probes.
 
-Runs the job's steps in --cwd: `run:` bodies with bash and composite actions,
-with every `${{ }}` and `if:` evaluated against --context (github, inputs,
-needs, secrets, matrix, job; github.workspace is --cwd and runner.temp the
-replay's temp dir) and the steps so far. `actions/checkout` of the
-job's own repository is a no-op (the caller prepares --cwd); a checkout of
-`job.workflow_repository` into a `path` links that path to --actions-root,
-the ci source under test. A local action (`./<path>`) runs from --cwd, and a
-`cplieger/ci/actions/<name>@<ref>` one from --actions-root, which replays an
-older revision's workflow. Any other action fails unless --skip names its
-step. Writes the job's and steps' outputs and every expression evaluated to
---out; exits 1 naming the step that failed. Stdlib plus PyYAML.
+Runs the job's steps in --cwd (a step's `working-directory` under it): `run:`
+bodies with bash and composite actions, with every `${{ }}` and `if:` evaluated
+against --context (github, inputs, needs, secrets, matrix, job;
+github.workspace is --cwd and runner.temp the replay's temp dir) and the steps
+so far. `actions/checkout` of the job's own repository is a no-op (the caller
+prepares --cwd); a checkout of `job.workflow_repository` into a `path` links
+that path to --actions-root, the ci source under test. A local action
+(`./<path>`) runs from --cwd, and a `cplieger/ci/actions/<name>@<ref>` one from
+--actions-root, which replays an older revision's workflow. Any other action
+fails unless --skip names its step. Writes the job's and steps' outputs and
+every expression evaluated to --out; exits 1 naming the step that failed.
+Stdlib plus PyYAML.
 """
 
 from __future__ import annotations
@@ -391,7 +392,10 @@ class Job:
         self.ran: list[str] = []
         self.context = context
 
-    def run_bash(self, name: str, body: str, env: dict[str, str]) -> dict[str, str]:
+    def run_bash(
+        self, name: str, body: str, env: dict[str, str], workdir: str = ''
+    ) -> dict[str, str]:
+        """Runs one `run:` body in --cwd, or in its `working-directory` under it."""
         out_file = self.temp / f'out-{len(self.ran)}'
         env_file = self.temp / f'env-{len(self.ran)}'
         path_file = self.temp / f'path-{len(self.ran)}'
@@ -409,7 +413,7 @@ class Job:
         }
         proc = subprocess.run(
             ['bash', '--noprofile', '--norc', '-eo', 'pipefail', str(script)],
-            cwd=self.cwd,
+            cwd=self.cwd / workdir,
             env=full,
             capture_output=True,
             text=True,
@@ -529,7 +533,8 @@ class Job:
             env = {**job_env, **{k: scope.render(v) for k, v in (step.get('env') or {}).items()}}
             uses = step.get('uses', '')
             if 'run' in step:
-                outs = self.run_bash(name, scope.render(step['run']), env)
+                workdir = scope.render(step.get('working-directory', ''))
+                outs = self.run_bash(name, scope.render(step['run']), env, workdir)
             elif uses.startswith(CHECKOUT):
                 self.checkout(name, step.get('with') or {}, scope)
                 outs = {}

@@ -136,6 +136,17 @@ class GoldenBodyTest(unittest.TestCase):
         self.assertNotIn('<summary>First measurement —', body)
         self.assertIn('</details>\n\n<!-- /bench-findings -->', body)
 
+    def test_bench_module_body_names_the_module_and_links_its_series(self) -> None:
+        """A nested module's tracker differs from the root's only in its header."""
+        args = ('--repo', 'go', '--data-file', str(FIXTURES / 'bench' / 'data.txt'))
+        root = render('bench-aggregate.py', *args)
+        module = render('bench-aggregate.py', *args, '--module', 'pathinside')
+        self.assertTrue(module.startswith('# Benchmark regression tracker: pathinside\n'))
+        self.assertIn('Weekly medians for `go/pathinside`', module)
+        self.assertIn('/tree/benchmarks/pathinside)', module)
+        self.assertEqual(module.split('\n## Trend', 1)[1], root.split('\n## Trend', 1)[1])
+        self.assertTrue(root.startswith('# Benchmark regression tracker\n'))
+
 
 class HistoryBlockTest(unittest.TestCase):
     def block(self, existing: str, row: str, run_id: str = '', keep: int = 12) -> str:

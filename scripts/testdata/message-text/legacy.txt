@@ -63,7 +63,6 @@ no API — fix by hand:
 no commit sha; not graded
 no deploy hook; remove it)
 no engines.node floor; nothing to test
-no repo names; nothing to track
 no vulnerability statements; refusing to pass
 not found locally; run `git fetch
 not tagged yet; publishing.
