@@ -274,10 +274,13 @@ gates["sbom-knobs"] = sorted(
 )
 policy = next(s for s in rjobs["detect"]["steps"] if s.get("id") == "policy")
 open(f"{out}/policy.sh", "w").write(policy["run"])
-# finalize's condition per job outcome, and whether the run was cancelled.
+# finalize's condition per job outcome, and whether the run was cancelled, in
+# a repository with no runner images (scripts/test_runner_release_steps.py has
+# the runner images' cases).
 def runs_when(expr, results, cancelled):
     e = " ".join(str(expr).split())
     e = e[3:-2] if e.startswith("${{") else e
+    e = re.sub(r"needs\.prepare\.outputs\.runner-images", "''", e)
     e = re.sub(r"needs\.([\w-]+)\.result", lambda m: repr(results.get(m.group(1), "success")), e)
     e = e.replace("!cancelled()", repr(not cancelled)).replace("always()", "True")
     return eval(e.replace("&&", " and ").replace("||", " or "), {}, {})
@@ -416,7 +419,7 @@ chk "D-P11 and runs only on a build, so a promotion scans nothing" "$(gate '."sc
 chk "D-P11 and no input, output or policy chooses another source" "$(gate '."sbom-knobs" | join(",")')" ""
 chk "D-P11 the policy hands every image repository the same keys" \
   "$(policy_keys marotte AGPL-3.0)/$(policy_keys web-terminal-kiro MPL-2.0)/$(policy_keys docker-age Apache-2.0)" \
-  "registries platforms syft_config image_licenses binaries /registries platforms syft_config image_licenses binaries /registries platforms syft_config image_licenses binaries "
+  "registries platforms syft_config image_licenses runner_image_licenses binaries /registries platforms syft_config image_licenses runner_image_licenses binaries /registries platforms syft_config image_licenses runner_image_licenses binaries "
 policy_value() { # <repo name> <key> -> that key's value from the policy step
   : >"$WORK/policy-out"
   (cd "$WORK" && REPO_NAME="$1" REPO_SPDX_ID=Apache-2.0 GITHUB_OUTPUT="$WORK/policy-out" bash "$WORK/policy.sh") >/dev/null
@@ -424,6 +427,9 @@ policy_value() { # <repo name> <key> -> that key's value from the policy step
 }
 chk "D-P12 grelot's Release carries its client as binaries, and no other repository's does" \
   "$(policy_value grelot binaries)|$(policy_value marotte binaries)|$(policy_value knell binaries)" "grelot=.||"
+chk "D-P13 manade's four runner images carry GitHub's runner and Docker's binaries, and no other repository names one" \
+  "$(policy_value manade runner_image_licenses)|$(policy_value marotte runner_image_licenses)" \
+  '{"base":"GPL-3.0-or-later AND MIT AND Apache-2.0","build":"GPL-3.0-or-later AND MIT AND Apache-2.0","browser":"GPL-3.0-or-later AND MIT AND Apache-2.0","docker":"GPL-3.0-or-later AND MIT AND Apache-2.0"}|{}'
 
 # ── Stub curl: the anonymous GHCR token and manifest HEADs ───────────────────
 # BUILT lists the commits that have a `sha-<commit>` tag on the registry;
@@ -463,7 +469,9 @@ for a in "$@"; do
     http*) URL=$a ;;
   esac
 done
+# RETRIED_503 prints the 503 a retried read answered first, as curl --retry does.
 answer() { # <status> [digest]
+  [ -z "${RETRIED_503:-}" ] || [ "$FAIL" = 1 ] || printf 'HTTP/2 503\r\nDocker-Content-Digest: sha256:stale\r\n\r\n'
   if [ "$1" != 200 ]; then
     [ "$FAIL" = 1 ] && exit 22
     printf 'HTTP/2 %s\r\n\r\n' "$1"
@@ -878,6 +886,9 @@ r=$(promote_at "$R" "$EXCLUDE_RE_FULL" "$M0" "$T1")
 chk "D-M1 a promotion commit re-tags its Promoted-Digest" "$r|$(out promote_via)" "$D_T|$T1|trailer"
 chk "D-M1 leaving its signature to the gate that refuses rather than builds (D-G)" "$(wc -l <"$PROV_LOG" | tr -d ' ')" "0"
 chk_has "D-M1 summary names the trailer" "$(cat "$WORK/summary")" "this promotion commit records (digest \`${D_T}\`, promoted commit \`${T1}\`)"
+r=$(RETRIED_503=1 promote_at "$R" "$EXCLUDE_RE_FULL" "$M0" "$T1")
+chk "D-M16 a trailer digest read that answered 503 and then 200 on its retry re-tags the digest" \
+  "$r|$(out promote_via)" "$D_T|$T1|trailer"
 chk "D-M14 a commit git cannot tell is a promotion fails the step, neither re-tagging nor building" \
   "$(failing_promote "rev-list --parents -n1 ${R}^{commit} --" 1 "$R" "$EXCLUDE_RE_FULL" "$M0" "$T1")" "EXIT=1|1"
 chk_has "D-M14 and names it" "$(cat "$WORK/promote.log")" "cannot tell whether $R is a promotion commit"
@@ -1244,9 +1255,9 @@ chk "D-RG17 the ci source is checked out on both channels" "$(gate '."prepare-sr
 chk "D-RG17 prepare hands the decision on" "$(gate '."prepare-outputs" | "\(.rebuild_only)|\(.compare_tag)"')" \
   '${{ steps.rebuild.outputs.rebuild_only }}|${{ steps.rebuild.outputs.compare_tag }}'
 gstep() { jq -c --arg n "$1" ".gate.steps[] | select(.name == \$n) | $2" "$WORK/gates.json"; }
-chk "D-RG18 the gate runs for a rebuild-only range, after prepare, and hands on its compare step's skip" \
+chk "D-RG18 the gate runs for a rebuild-only range with no runner images, after prepare, and hands on its compare step's skip" \
   "$(gate '.gate | "\(.if)|\(.needs)|\(.outputs.skip)"')" \
-  "\${{ needs.prepare.outputs.rebuild_only == 'true' }}|prepare|\${{ steps.compare.outputs.skip }}"
+  "\${{ needs.prepare.outputs.rebuild_only == 'true' && needs.prepare.outputs.runner-images == '' }}|prepare|\${{ steps.compare.outputs.skip }}"
 chk "D-RG18 the compare step reads the attestation step's answer and fails the gate on a usage error" \
   "$(gstep "Compare the package sets" '[.env, ."continue-on-error"]')" \
   '[{"CI_TOOLS":"${{ runner.temp }}/cplieger-ci/scripts","PREV_REF":"${{ steps.prev.outputs.ref }}","UNREADABLE":"${{ steps.prev.outputs.unreadable }}","COMPARE_TAG":"${{ needs.prepare.outputs.compare_tag }}"},null]'
@@ -1270,7 +1281,7 @@ chk "D-RG21 a gate that did not run, or found a change, publishes" "$(pcase true
 chk "D-RG21 nothing due publishes nothing" "$(pcase false/)" "false|false|false"
 chk "D-RG22 verify-publish waits for the gate and skips on its skip" \
   "$(gate '."vp-needs" | join(",")')|$(gate '."vp-if"' | grep -c "needs.rebuild-gate.outputs.skip != 'true'")" "prepare,rebuild-gate,finalize|1"
-chk "D-RG22 finalize waits for it too, and for the image tests" "$(gate '."finalize-needs" | join(",")')" "prepare,rebuild-gate,build,image-test"
+chk "D-RG22 finalize waits for it too, for the image tests and for every signed runner image" "$(gate '."finalize-needs" | join(",")')" "prepare,rebuild-gate,build,image-test,runner-publish"
 chk "D-RG29 a run cancelled while the gate builds, or before its image tests pass, starts no finalize; a timed-out or failed gate still publishes" \
   "$(gate '."finalize-runs" | to_entries | map("\(.key)=\(.value)") | join(" ")')" \
   "cancel-in-gate=false gate-timeout=true gate-failure=true skip=true no-gate=true cancel-in-build=false cancel-after-build=false cancel-in-tests=false cancel-after-tests=true red-tests=false no-amd64-leg=true"
@@ -1284,7 +1295,7 @@ chk "D-RG23 it signs and attests nothing and holds no token" \
 chk "D-RG23 its scans upload nothing" \
   "$(gate '[.gate.steps[] | select((.uses // "") | startswith("anchore/sbom-action@")) | "\(.with."upload-artifact")/\(.with."upload-release-assets")"] | unique | join(" ")')" \
   "false/false"
-chk "D-RG24 every job that can write waits for the gate" "$(gate '."write-reach" | tojson')" '{"build":true,"finalize":true,"receipt":true}'
+chk "D-RG24 every job that can write waits for the gate" "$(gate '."write-reach" | tojson')" '{"build":true,"runner-build":true,"runner-publish":true,"finalize":true,"receipt":true}'
 PLATFORMS=linux/amd64,linux/arm64 run_step matrix.sh >/dev/null
 G_NAME=$(out matrix | jq -r '.[] | select(.platform == "linux/amd64") | .name')
 chk "D-RG25 the gate fills the cache build's amd64 leg reads" \
@@ -2086,7 +2097,7 @@ chk "D-G5 asking the source first, then that ancestor" "$(sed 's/.*-sha \([0-9a-
 chk_has "D-G6 runs on publishes of a promoted digest only" "$(gate '."provenance-if"')" \
   "env.PUBLISH == 'true' && env.PROMOTE_DIGEST != ''"
 chk "D-G6 after cosign and the tools are in place, before every registry write" "$(gate '."before-provenance" | join("|")')" \
-  "Checkout|Check out the ci source|Version ownership gate|Download digests|Set up Docker Buildx|Log in to GHCR|Install Cosign|Setup Python"
+  "Checkout|Check out the ci source|Version ownership gate|Download digests|Download the signed runner digests|Set up Docker Buildx|Log in to GHCR|Install Cosign|Setup Python"
 chk "D-G6 the next step reads the promoted SBOM, and the one after is the first write" \
   "$(gate '."after-provenance"')|$(gate '."first-write"')" "Read the promoted build's SBOM|Publish channel tags on GHCR"
 chk "D-G6 the source is the one the digest walk named" "$(sed -n 's/^PROMOTE_SOURCE=//p' "$WORK/provenance.sh.envmap")" \
@@ -2610,8 +2621,8 @@ login() { # <tag> <registry env> -> runs the extracted login step; prints its ou
   (PATH="$LBIN:$PATH" CI_TOOLS="$ROOT/scripts" REGISTRY="$2" REGISTRY_USERNAME=probe-user \
     REGISTRY_PASSWORD=probe-secret bash "$WORK/login-$1.sh" 2>&1) || echo "EXIT=$?"
 }
-chk "D-L1 the release path logs in at five sites" "$(gate '.logins | join(" ")')" \
-  "docker-release-build-ghcr docker-release-image-test-ghcr docker-release-finalize-ghcr docker-release-finalize-hub release-renumber-tag-ghcr"
+chk "D-L1 the release path logs in at seven sites" "$(gate '.logins | join(" ")')" \
+  "docker-release-build-ghcr docker-release-image-test-ghcr docker-release-runner-build-ghcr docker-release-runner-publish-ghcr docker-release-finalize-ghcr docker-release-finalize-hub release-renumber-tag-ghcr"
 chk "D-L1 and no workflow uses a login action" \
   "$(grep -c 'docker/login-action' "$WORKFLOW" "$RELEASE_YAML" | awk -F: '{ s += $2 } END { print s }')" "0"
 for tag in $(gate '.logins[]'); do

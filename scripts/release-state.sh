@@ -592,16 +592,68 @@ registry_digest() { # <registry host> <token url> <repository> <ref> <accept> ->
 ghcr_digest() { # <repository> <ref> [accept] -> the digest GHCR serves (an index by default), or nothing
   registry_digest ghcr.io "https://ghcr.io/token?scope=repository:${1}:pull" "$1" "$2" "${3:-$INDEX_TYPES}"
 }
-ghcr_state() { # <repository> <ref> -> the index digest served, or "absent" on a 404; fails when GHCR cannot tell
-  local token hdr
-  token=$(curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors \
-    "https://ghcr.io/token?scope=repository:${1}:pull" | jq -r .token) || return 1
+# A retried curl writes every attempt's reply to stdout, so a header read keeps
+# the last reply and a body read goes through a file, which each retry truncates.
+last_reply() { awk '/^HTTP\// { b = "" } { b = b $0 "\n" } END { printf "%s", b }'; }
+http_read() { # <url> -> its body, a newline and the HTTP status; fails when nothing answers
+  local f code
+  f=$(mktemp)
+  code=$(curl -sS --connect-timeout 10 --max-time 30 --retry 3 -o "$f" -w '%{http_code}' "$1") || {
+    rm -f "$f"
+    return 1
+  }
+  cat "$f"
+  rm -f "$f"
+  printf '\n%s' "$code"
+}
+# ghcr_state <repository> <ref> -> the index digest served, or "absent" on a 404. When GHCR
+# cannot tell it prints why and fails: 2 when the token endpoint refuses an anonymous read
+# (HTTP 403, a private or missing package), 1 otherwise.
+ghcr_state() {
+  local f code token hdr status digest
+  f=$(mktemp)
+  code=$(curl -sSL --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors -o "$f" -w '%{http_code}' \
+    "https://ghcr.io/token?scope=repository:${1}:pull") || code=none
+  token=$(jq -r '.token // empty' "$f" 2>/dev/null) || token=""
+  rm -f "$f"
+  case "$code" in
+    200) [ -n "$token" ] || {
+      echo "its token endpoint answered no token"
+      return 1
+    } ;;
+    403)
+      echo "its token endpoint refused an anonymous read (HTTP 403)"
+      return 2
+      ;;
+    none)
+      echo "its token endpoint did not answer"
+      return 1
+      ;;
+    *)
+      echo "its token endpoint answered HTTP ${code}"
+      return 1
+      ;;
+  esac
   hdr=$(curl -sSI --connect-timeout 10 --max-time 30 --retry 3 -H "Authorization: Bearer ${token}" \
-    -H "Accept: ${INDEX_TYPES}" "https://ghcr.io/v2/${1}/manifests/${2}" | tr -d '\r') || return 1
-  case "$(awk 'NR == 1 { print $2 }' <<<"$hdr")" in
-    200) awk 'tolower($1) == "docker-content-digest:" { print $2 }' <<<"$hdr" | grep . ;;
+    -H "Accept: ${INDEX_TYPES}" "https://ghcr.io/v2/${1}/manifests/${2}" | tr -d '\r' | last_reply) || {
+    echo "its manifest endpoint did not answer"
+    return 1
+  }
+  status=$(awk 'NR == 1 { print $2 }' <<<"$hdr")
+  case "$status" in
+    200)
+      digest=$(awk 'tolower($1) == "docker-content-digest:" { print $2 }' <<<"$hdr")
+      [ -n "$digest" ] || {
+        echo "its manifest endpoint answered no digest"
+        return 1
+      }
+      printf '%s\n' "$digest"
+      ;;
     404) echo absent ;;
-    *) return 1 ;;
+    *)
+      echo "its manifest endpoint answered HTTP ${status:-nothing}"
+      return 1
+      ;;
   esac
 }
 hub_digest() { # <repository> <ref>
@@ -854,8 +906,7 @@ untagged_past() { # <key> <T> -> a dev commit past T whose build is published un
       ;;
     ts)
       pkg=$(jq -r .name package.json) || return 1
-      res=$(curl -sS --connect-timeout 10 --max-time 30 --retry 3 -w '\n%{http_code}' \
-        "https://registry.npmjs.org/${pkg}") || return 1
+      res=$(http_read "https://registry.npmjs.org/${pkg}") || return 1
       code=${res##*$'\n'}
       case "$code" in
         404) return 0 ;;
@@ -937,7 +988,7 @@ last_change() { # <ref> <dir> -> the newest first-parent commit of ref whose own
 sub_dev_heads() { # <dir> <commit> -> "<version> <gitHead>" per -dev.N version npm serves; nothing on a 404; fails when npm cannot tell
   local pkg res code
   pkg=$(git show "$2:$1/package.json" | jq -er '.name | strings') || return 1
-  res=$(curl -sS --connect-timeout 10 --max-time 30 --retry 3 -w '\n%{http_code}' "https://registry.npmjs.org/${pkg}") || return 1
+  res=$(http_read "https://registry.npmjs.org/${pkg}") || return 1
   code=${res##*$'\n'}
   case "$code" in
     404) return 0 ;;
@@ -1270,8 +1321,7 @@ cmd_renumber_target() {
 publish_npm_dev() { # <dev tag> <commit>
   local pkg ver="${1#v}" res code head
   pkg=$(jq -r .name package.json) || die "no package.json name to publish ${1} under"
-  res=$(curl -sS --connect-timeout 10 --max-time 30 --retry 3 -w '\n%{http_code}' \
-    "https://registry.npmjs.org/${pkg}/${ver}") || res=$'\n000'
+  res=$(http_read "https://registry.npmjs.org/${pkg}/${ver}") || res=$'\n000'
   code=${res##*$'\n'}
   case "$code" in
     404)
@@ -1350,7 +1400,7 @@ cmd_half_free() { # <lane> <lane tag> <commit>
   pkg=$(jq -er '.name | strings' <<<"$manifest") || die "${lane}/web/package.json at ${commit} names no package"
   ver=${tag##*/}
   ver=${ver#v}
-  res=$(curl -sS --connect-timeout 10 --max-time 30 --retry 3 -w '\n%{http_code}' "https://registry.npmjs.org/${pkg}") || res=$'\n000'
+  res=$(http_read "https://registry.npmjs.org/${pkg}") || res=$'\n000'
   code=${res##*$'\n'}
   case "$code" in
     404) return 0 ;;
@@ -1413,27 +1463,57 @@ cmd_renumber_subpackages() {
   out "version=${d_tag}" "dirs=${dirs}"
 }
 
+# Dev publication pushes a version tag before the git tag, so a version tag
+# serving another digest belongs to a newer build and must not move.
+retag_state() { # <repository> <digest> <new tag> <commit> -> "write" when the tag is absent, nothing when it serves the digest; dies otherwise
+  local served
+  served=$(ghcr_state "$1" "$3") || die "cannot tell whether ghcr.io/${1}:${3} exists, because ${served}, so it is not written"
+  if [ "$served" = "$2" ]; then
+    note "ghcr.io/${1}:${3} already serves the build at ${4}"
+  elif [ "$served" != absent ]; then
+    die "ghcr.io/${1}:${3} already serves ${served}, not the build at ${4} (${2}). A dev release run published it without tagging it, so rerun that run instead of renumbering over it."
+  else
+    echo write
+  fi
+}
+retag() { # <repository> <digest> <new tag>
+  local meta got
+  meta=$(mktemp "${RUNNER_TEMP:-/tmp}/renumber-meta.XXXXXX")
+  docker buildx imagetools create --metadata-file "$meta" -t "ghcr.io/${1}:${3}" "ghcr.io/${1}@${2}"
+  got=$(jq -r '."containerimage.descriptor".digest' "$meta")
+  rm -f "$meta"
+  [ "$got" = "$2" ] || die "re-tagging ${2} as ${1}:${3} changed the digest to ${got}"
+}
+
 cmd_renumber() {
-  local key="${LANE_KEY:?}" new="${DEV_VERSION:?}" repo="${GITHUB_REPOSITORY:?}" d digest served meta got
+  local key="${LANE_KEY:?}" new="${DEV_VERSION:?}" repo="${GITHUB_REPOSITORY:?}" d digest names n state w rc
+  local -a writes=()
   d=$(renumber_build "$key" "$new") || exit 1
   [ -n "$d" ] || return 0
   if [ "$key" = . ] && [ "${REPO_TYPE:-}" = docker ]; then
     digest=$(ghcr_digest "${IMAGE:?}" "sha-${d}")
     [ -n "$digest" ] || die "ghcr.io/${IMAGE}:sha-${d} does not exist, and renumber re-tags an existing build but never builds one"
-    # Dev publication pushes the version tag before the git tag, so a version
-    # tag serving another digest belongs to a newer build and must not move.
-    served=$(ghcr_state "$IMAGE" "$new") || die "cannot tell whether ghcr.io/${IMAGE}:${new} exists, so it is not written"
-    if [ "$served" = "$digest" ]; then
-      note "ghcr.io/${IMAGE}:${new} already serves the build at ${d}"
-    elif [ "$served" != absent ]; then
-      die "ghcr.io/${IMAGE}:${new} already serves ${served}, not the build at ${d} (${digest}). A dev release run published it without tagging it, so rerun that run instead of renumbering over it."
-    else
-      meta=$(mktemp "${RUNNER_TEMP:-/tmp}/renumber-meta.XXXXXX")
-      docker buildx imagetools create --metadata-file "$meta" -t "ghcr.io/${IMAGE}:${new}" "ghcr.io/${IMAGE}@${digest}"
-      got=$(jq -r '."containerimage.descriptor".digest' "$meta")
-      rm -f "$meta"
-      [ "$got" = "$digest" ] || die "re-tagging ${digest} as ${new} changed the digest to ${got}"
-    fi
+    w=$(retag_state "$IMAGE" "$digest" "$new" "$d") || exit 1
+    [ -z "$w" ] || writes+=("$IMAGE $digest $new")
+    # Each runner image the build published (runner_images.py) takes <name>-<new>.
+    names=$(git ls-tree -r --name-only "$d" -- images | sed -n 's|^images/\([^/]*\)/Dockerfile$|\1|p') \
+      || die "cannot list the runner images at ${d}"
+    for n in $names; do
+      rc=0
+      state=$(ghcr_state "${IMAGE}-runner" "${n}-sha-${d}") || rc=$?
+      case "$rc" in
+        0) ;;
+        2) die "cannot read ghcr.io/${IMAGE}-runner:${n}-sha-${d}, because ${state}, so ${new} is not tagged. GHCR refuses an anonymous read of a private package: its owner makes it public in the package settings" ;;
+        *) die "cannot read ghcr.io/${IMAGE}-runner:${n}-sha-${d}, because ${state}, so ${new} is not tagged" ;;
+      esac
+      [ "$state" != absent ] || die "ghcr.io/${IMAGE}-runner:${n}-sha-${d} does not exist, and renumber re-tags an existing build but never builds one"
+      w=$(retag_state "${IMAGE}-runner" "$state" "${n}-${new}" "$d") || exit 1
+      [ -z "$w" ] || writes+=("${IMAGE}-runner $state ${n}-${new}")
+    done
+    for w in "${writes[@]}"; do
+      # shellcheck disable=SC2086 # three words
+      retag $w
+    done
   fi
   if [ "$key" = . ] && [ "${REPO_TYPE:-}" = ts ]; then
     publish_npm_dev "$new" "$d"

@@ -439,10 +439,8 @@ def run_scope(target: Path, *modules: str, config: Path = CENTRAL,
     )
 
 
-CLONE_CREDENTIAL = 'stand-in-credential'
-
-
-def prepare(tmp: Path, repo: str, *args: str) -> tuple[subprocess.CompletedProcess, dict]:
+def prepare(tmp: Path, repo: str, *args: str,
+            extra_env: dict[str, str] | None = None) -> tuple[subprocess.CompletedProcess, dict]:
     """Run gremlins-prepare.sh from a ci-checkout-shaped tmp, cloning tmp/src/<repo>.git.
 
     git's url.insteadOf sends the script's own https://github.com/cplieger/ URL
@@ -456,7 +454,7 @@ def prepare(tmp: Path, repo: str, *args: str) -> tuple[subprocess.CompletedProce
     out = tmp / 'github-output'
     out.write_text('')
     env = {**os.environ, 'GIT_CONFIG_GLOBAL': str(tmp / 'gitconfig'), 'GIT_CONFIG_NOSYSTEM': '1',
-           'GITHUB_OUTPUT': str(out), 'GH_TOKEN': CLONE_CREDENTIAL}
+           'GITHUB_OUTPUT': str(out), **(extra_env or {})}
     proc = subprocess.run(['bash', str(PREPARE), repo, *args], cwd=tmp, env=env,
                           capture_output=True, text=True, check=False)
     return proc, dict(line.split('=', 1) for line in out.read_text().splitlines())
@@ -490,8 +488,8 @@ def test_prepare_scopes_root_run_off_nested_module(tmp: Path) -> None:
     if proc.returncode != 0:
         return
     git_config = (tmp / 'target' / '.git' / 'config').read_text()
-    check('prepare scope: the token is not written into the clone',
-          ok=CLONE_CREDENTIAL not in git_config and 'extraheader' not in git_config)
+    check('prepare scope: no auth header is written into the clone',
+          ok='extraheader' not in git_config)
     root_scope = gremlins_scope(tmp / 'target')
     check('prepare scope: the root run mutates no file of the nested module',
           ok=root_scope == ['animap.go', 'cmd/animap/verify.go', 'mapreader/reader.go'],
@@ -595,6 +593,37 @@ def test_prepare_pins_a_shard_to_its_plan(tmp: Path) -> None:
     proc, _ = prepare(tmp, 'pin', str(plan))
     check('prepare pin: a plan without its shard fails before cloning',
           ok=proc.returncode != 0 and not (tmp / 'target').exists(), detail=proc.stderr[-300:])
+
+
+def test_prepare_clones_anonymously(tmp: Path) -> None:
+    """The clone and the plan fetch carry no auth header, even with GH_TOKEN set."""
+    work = tmp / 'work'
+    sized = commit_fixture(work, {'go.mod': 'module example.com/anon\n', 'anon.go': 'package anon\n'})
+    publish_fixture(tmp, 'anon', work)
+    plan = tmp / 'plan.json'
+    plan.write_text(json.dumps({'repo': 'anon', 'sha': sized, 'shards': 1, 'modules': {'.': {
+        'mode': 'per-package', 'workers': 4, 'shards': [1], 'packages': {'.': {'shard': 1}}}}}))
+    log = tmp / 'seen.log'
+    bindir = tmp / 'bin'
+    bindir.mkdir()
+    (bindir / 'git').write_text(
+        '#!/usr/bin/env bash\n'
+        'h=no; case "$*" in *extraheader*|*AUTHORIZATION*) h=yes;; esac\n'
+        'sub=; for a in "$@"; do case "$a" in clone|fetch|checkout|rev-parse|ls-files) sub=$a; break;; esac; done\n'
+        f'printf "git %s header=%s\\n" "$sub" "$h" >>{str(log)!r}\n'
+        f'exec {shutil.which("git")!r} "$@"\n')
+    (bindir / 'git').chmod(0o755)
+    proc, outputs = prepare(tmp, 'anon', str(plan), '1', extra_env={
+        'PATH': f'{bindir}:{os.environ["PATH"]}', 'GH_TOKEN': 'stand-in-credential'})
+    seen = log.read_text().splitlines() if log.exists() else []
+    check('prepare anonymous: the clone and the plan fetch run without a header',
+          ok=proc.returncode == 0 and outputs.get('sha') == sized
+          and 'git clone header=no' in seen and 'git fetch header=no' in seen
+          and not any('header=yes' in line for line in seen),
+          detail=f'rc={proc.returncode} {seen} {proc.stderr[-300:]}')
+    git_config = (tmp / 'target' / '.git' / 'config').read_text() if proc.returncode == 0 else ''
+    check('prepare anonymous: the clone records no credential',
+          ok=proc.returncode == 0 and 'stand-in-credential' not in git_config)
 
 
 # ---------------------------------------------------------------------------
@@ -1556,7 +1585,7 @@ def test_shard_small_module_stays_one_unchanged_job(tmp: Path) -> None:
     plans.mkdir()
     (plans / 'plan.json').write_text(json.dumps(plan))
     proc = run_shard('matrix', '--repos', json.dumps(['small']), '--plans', str(plans),
-                     '--attempts', '3')
+                     '--attempts', '3', '--artifacts', json.dumps(['shard-plan-small']))
     matrix = json.loads(proc.stdout) if proc.returncode == 0 else None
     check('one shard: its matrix entries are the unsharded ones the fanout always built',
           ok=matrix == [{'repo': 'small', 'attempt': n} for n in (1, 2, 3)],
@@ -1594,7 +1623,7 @@ def matrix_of(tmp: Path, plan: dict) -> tuple[subprocess.CompletedProcess, list 
     plans.mkdir()
     (plans / 'plan.json').write_text(json.dumps(plan))
     proc = run_shard('matrix', '--repos', json.dumps([plan['repo']]), '--plans', str(plans),
-                     '--attempts', '1')
+                     '--attempts', '1', '--artifacts', json.dumps([f'shard-plan-{plan["repo"]}']))
     return proc, json.loads(proc.stdout) if proc.returncode == 0 else None
 
 
@@ -1699,7 +1728,8 @@ def test_shard_matrix_falls_back_to_one_job(tmp: Path) -> None:
         (plans / name).mkdir(parents=True)
         (plans / name / 'plan.json').write_text(json.dumps(doc))
     proc = run_shard('matrix', '--repos', json.dumps(['deadset-go', 'thing', 'bad', 'gap', 'spaced']),
-                     '--plans', str(plans), '--attempts', '3')
+                     '--plans', str(plans), '--attempts', '3',
+                     '--artifacts', json.dumps(sorted(d.name for d in plans.iterdir())))
     matrix = json.loads(proc.stdout) if proc.returncode == 0 else []
     k = plan['shards']
     want = [{'repo': 'deadset-go', 'attempt': a, 'shard': s, 'shards': k}
@@ -1726,9 +1756,76 @@ def test_shard_matrix_falls_back_to_one_job(tmp: Path) -> None:
           and spaced_plan['modules']['.']['packages'] == {}
           and spaced_plan['modules']['.']['mode'] is None,
           detail=f'{spaced_plan} {proc.stderr[-300:]}')
-    proc = run_shard('matrix', '--repos', '[]', '--plans', str(tmp / 'none'), '--attempts', '3')
+    proc = run_shard('matrix', '--repos', '[]', '--plans', str(tmp / 'none'), '--attempts', '3',
+                     '--artifacts', '[]')
     check('matrix: no repos is an empty matrix', ok=proc.returncode == 0 and
           json.loads(proc.stdout or 'null') == [], detail=f'{proc.stdout!r} {proc.stderr[-200:]}')
+
+
+def test_shard_matrix_binds_each_plan_to_its_artifact(tmp: Path) -> None:
+    proc, plan = plan_repo(tmp, 'b', {'.': (DEADSET_GO['module'], DEADSET_GO['env'],
+                                            DEADSET_GO['packages'])})
+    if plan is None or plan['shards'] < 2:
+        check('binding: a plan of 2 or more shards', ok=False, detail=proc.stderr[-400:])
+        return
+    k = plan['shards']
+    fewer = json.loads(json.dumps(plan))
+    fewer['shards'] = 1
+    for e in fewer['modules'].values():
+        e['shards'] = [1]
+        for p in e['packages'].values():
+            p['shard'] = 1
+    shard = load_script('gremlins_shard', SHARD)
+    check('binding: the forged plan alone would be trusted', ok=shard.valid_plan(fewer) == '',
+          detail=shard.valid_plan(fewer))
+
+    def matrix_for(repos: list[str], files: dict[str, dict],
+                   artifacts: list[str] | None = None) -> tuple[list | None, str]:
+        """ARTIFACTS defaults to the top-level directories FILES names."""
+        plans = tmp / f'plans-{len(list(tmp.iterdir()))}'
+        for rel, doc in files.items():
+            (plans / rel).parent.mkdir(parents=True, exist_ok=True)
+            (plans / rel).write_text(json.dumps(doc))
+        if artifacts is None:
+            artifacts = sorted({rel.split('/')[0] for rel in files if '/' in rel})
+        p = run_shard('matrix', '--repos', json.dumps(repos), '--plans', str(plans), '--attempts', '1',
+                      '--artifacts', json.dumps(artifacts))
+        return (json.loads(p.stdout) if p.returncode == 0 else None), p.stderr
+
+    sharded_b = [{'repo': 'b', 'attempt': 1, 'shard': s, 'shards': k} for s in range(1, k + 1)]
+    # 'a' and 'z' sort either side of 'b', so neither order lets a forgery win.
+    for forger in ('a', 'z'):
+        got, err = matrix_for([forger, 'b'], {'shard-plan-b/plan.json': plan,
+                                              f'shard-plan-{forger}/plan.json': fewer})
+        check(f'binding: a plan uploaded by {forger} naming b does not replace b\'s own',
+              ok=got == [{'repo': forger, 'attempt': 1}, *sharded_b],
+              detail=f'{got} {err[-300:]}')
+        check(f'binding: the warning names {forger} and the repo its artifact claims',
+              ok=f"{forger}: its shard-plan artifact names repo 'b'" in err, detail=err[-300:])
+    got, err = matrix_for(['a', 'b'], {'plan.json': plan}, ['shard-plan-b'])
+    check('binding: with two repos planned and one plan uploaded, the lone root plan is its uploader\'s',
+          ok=got == [{'repo': 'a', 'attempt': 1}, *sharded_b], detail=f'{got} {err[-300:]}')
+    for listed in ([], ['shard-plan-a', 'shard-plan-b'], ['shard-plan-c'], ['plan-b']):
+        got, err = matrix_for(['a', 'b'], {'plan.json': plan}, listed)
+        check(f'binding: a lone root plan with the artifacts {listed} is ignored',
+              ok=got == [{'repo': 'a', 'attempt': 1}, {'repo': 'b', 'attempt': 1}]
+              and 'is not one repo\'s shard-plan artifact' in err, detail=f'{got} {err[-300:]}')
+    got, err = matrix_for(['a'], {'plan.json': plan}, ['shard-plan-a'])
+    check('binding: a lone root plan naming another repo is ignored',
+          ok=got == [{'repo': 'a', 'attempt': 1}] and "names repo 'b'" in err,
+          detail=f'{got} {err[-300:]}')
+    got, err = matrix_for(['b'], {'plan.json': plan}, ['shard-plan-b'])
+    check('binding: a lone root plan is its one repo\'s', ok=got == sharded_b, detail=f'{got} {err[-300:]}')
+    for repos in (['b'], ['a', 'b']):
+        got, err = matrix_for(repos, {'plan.json': plan}, ['shard-plan-b', 'shard-plan-b'])
+        check(f'binding: a lone root plan listed once per rerun attempt is still b\'s ({repos})',
+              ok=got == [{'repo': r, 'attempt': 1} for r in repos if r != 'b'] + sharded_b,
+              detail=f'{got} {err[-300:]}')
+    got, err = matrix_for(['a', 'b'], {'shard-plan-b/nested/plan.json': plan,
+                                       'shard-plan-c/plan.json': {**plan, 'repo': 'c'}})
+    check('binding: a nested plan or one from a repo outside the fanout is ignored',
+          ok=got == [{'repo': 'a', 'attempt': 1}, {'repo': 'b', 'attempt': 1}]
+          and err.count('is not one repo\'s shard-plan artifact') == 2, detail=f'{got} {err[-300:]}')
 
 
 def three_module_plan(tmp: Path) -> Path:
@@ -2356,6 +2453,7 @@ def main() -> int:
         test_scope_excludes_an_unmeasured_module,
         test_scope_takes_a_dash_dir_as_a_module,
         test_prepare_pins_a_shard_to_its_plan,
+        test_prepare_clones_anonymously,
         test_scope_refuses_what_it_cannot_scope,
         test_central_config_keys_are_read,
         test_aggregate_consumes_merged_output,
@@ -2383,6 +2481,7 @@ def main() -> int:
         test_shard_sizes_a_zero_mutant_module_as_zero,
         test_shard_falls_back_for_a_module_it_cannot_size,
         test_shard_matrix_falls_back_to_one_job,
+        test_shard_matrix_binds_each_plan_to_its_artifact,
         test_shard_lists_each_shards_modules,
         test_shard_scope_partitions_the_module,
         test_merge_skips_a_module_the_shard_did_not_run,

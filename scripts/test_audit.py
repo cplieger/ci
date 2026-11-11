@@ -332,6 +332,13 @@ class TwoChannel(unittest.TestCase):
             audit.compliance(s)[0],
         )
 
+    def test_manade_wants_gpl(self):
+        s = two_channel('manade')
+        self.assertEqual(s['license'], 'GPL-3.0')
+        self.assertNotIn('license', ' '.join(audit.compliance(s)[1]))
+        s['license'] = 'Apache-2.0'
+        self.assertIn('license Apache-2.0 (want GPL-3.0)', audit.compliance(s)[1])
+
     def test_library_release_hook_is_a_stale_warning(self):
         s = two_channel('httpx')
         s['webhooks'] = [hook(['release'])]

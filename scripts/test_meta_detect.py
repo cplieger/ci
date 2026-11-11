@@ -90,7 +90,10 @@ class TsNested(Harness):
             job['strategy']['matrix']['dir'], '${{ fromJSON(needs.detect.outputs.ts_nested_dirs) }}'
         )
         self.assertFalse(job['strategy']['fail-fast'])
-        self.assertEqual(job['with'], {'working-directory': '${{ matrix.dir }}'})
+        self.assertEqual(
+            job['with'],
+            {'working-directory': '${{ matrix.dir }}', 'runner': '${{ inputs.runner }}'},
+        )
 
     def test_validate_fails_on_a_failed_half(self):
         validate = workflow()['jobs']['validate']

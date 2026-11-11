@@ -66,6 +66,7 @@ jobs:
       platforms: ${{ steps.policy.outputs.platforms }}
       syft_config: ${{ steps.policy.outputs.syft_config }}
       image_licenses: ${{ steps.policy.outputs.image_licenses }}
+      runner_image_licenses: ${{ steps.policy.outputs.runner_image_licenses }}
       binaries: ${{ steps.policy.outputs.binaries }}
     steps:
       - name: Checkout
@@ -554,15 +555,27 @@ jobs:
             grelot) BINARIES="grelot=." ;;
           esac
 
+          # Each images/<name>/Dockerfile's licences, a JSON object of name to
+          # SPDX expression; an image it leaves out takes image_licenses.
+          RUNNER_IMAGE_LICENSES="{}"
+          case "$REPO_NAME" in
+            manade)
+              # GitHub's runner and its container hooks (MIT), Docker's static
+              # binaries and buildx (Apache-2.0), all from the shared base.
+              lic="GPL-3.0-or-later AND MIT AND Apache-2.0"
+              RUNNER_IMAGE_LICENSES=$(jq -cn --arg l "$lic" '{base: $l, build: $l, browser: $l, docker: $l}') ;;
+          esac
+
           {
             echo "registries=$REGISTRIES"
             echo "platforms=$PLATFORMS"
             echo "syft_config=$SYFT_CONFIG"
             echo "image_licenses=$IMAGE_LICENSES"
+            echo "runner_image_licenses=$RUNNER_IMAGE_LICENSES"
             echo "binaries=$BINARIES"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS syft_config='$SYFT_CONFIG' image_licenses='$IMAGE_LICENSES' binaries='$BINARIES'"
+          echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS syft_config='$SYFT_CONFIG' image_licenses='$IMAGE_LICENSES' runner_image_licenses='$RUNNER_IMAGE_LICENSES' binaries='$BINARIES'"
 
   # ─── Repair each lane's unreceipted stable tag first ───────────────────────
   # A lane's tag follows its registry writes, so a failed run can leave only
@@ -1505,6 +1518,7 @@ jobs:
       platforms: ${{ needs.detect.outputs.platforms }}
       syft-config: ${{ needs.detect.outputs.syft_config }}
       image-licenses: ${{ needs.detect.outputs.image_licenses }}
+      runner-image-licenses: ${{ needs.detect.outputs.runner_image_licenses }}
       binaries: ${{ needs.detect.outputs.binaries }}
     secrets: inherit
 

@@ -1,34 +1,8 @@
-# Weekly fuzz exploration across all Go-having cplieger consumer repos.
-# Pattern C: matrix + max-parallel cap owned here, not via cross-repo
-# workflow_dispatch. One place to manage the shared fuzz schedule and
-# the issue-creation/auto-close logic for findings.
-#
-# Schedule:           Wednesdays 22:00 UTC (mid-week off-peak; different day
-#                     from gremlins-Sunday and security-daily so they never
-#                     fight for the 20-slot account budget)
-# Concurrency cap:    6 jobs in parallel (>=4 slots reserved for ad-hoc work)
-# Fuzz budget:        2 minutes per target. Each run starts ONLY from the
-#                     committed testdata/fuzz/ seed corpus: the runner is
-#                     ephemeral and setup-go runs with cache:false, so the
-#                     coverage-guided corpus Go builds during the run is
-#                     discarded. Exploration does NOT accumulate depth
-#                     run-to-run; the only persistent growth is a failing seed
-#                     a human commits (which becomes a deterministic regression
-#                     in testdata/fuzz/). The 2m/target budget is fixed:
-#                     large repos are SHARDED across runners rather than
-#                     having their per-target time cut.
-# Dynamic sharding:   fanout counts each repo's fuzz targets and computes
-#                     shards = ceil(targets x 2m / SHARD_BUDGET). A repo that
-#                     fits the budget runs on one runner; a repo that would
-#                     overrun the 6h hosted-runner ceiling is split across N
-#                     runners, each fuzzing a deterministic round-robin slice
-#                     of the targets. Scales to any target count. The per-repo
-#                     `report` job then consolidates every shard's findings
-#                     into one issue-management pass.
-# Reporting:          Per-finding GitHub issue in the consumer repo. Opens
-#                     when fuzz writes a new failing seed; auto-closes when
-#                     the seed gets committed to testdata/fuzz/. Idempotent
-#                     across runs.
+# Weekly fuzzing of every `func Fuzz` target in the public cplieger Go
+# repositories, from the committed seed corpus only. A repo whose targets
+# overrun one shard's budget is split across runners rather than given less
+# time per target. The budget, the sharding and the per-finding issues are
+# documented in docs/workflows.md "The scheduled runs".
 name: Weekly fuzz
 
 on:
@@ -67,20 +41,13 @@ jobs:
           SHARD_BUDGET_SECONDS: "14400"
         run: |
           set -euo pipefail
-          # One-shot clone auth, built once for the scan loop below. Passed as a
-          # top-level `git -c` (never `git clone --config`), so the token is not
-          # written into any scan/.git/config.
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          # Repo discovery over REST, not the GraphQL `gh repo list`: the fanout
-          # is a single point of failure for the whole run, and GraphQL shares a
-          # quota the per-repo reads and clones also draw, so a quota exhaustion
-          # there loses every repo at once. Forks are excluded (same rule as
-          # scripts/audit.py): a fork carries UPSTREAM's code, so fuzzing it
-          # spends the runner budget on targets we neither own nor can fix, and
-          # any finding would be filed against a repo whose issues are typically
-          # disabled.
+          # REST, not the GraphQL `gh repo list`: GraphQL shares a quota the
+          # per-repo reads also draw, and this listing is every repo's single
+          # point of failure. A fork carries UPSTREAM's code, whose findings we
+          # cannot fix. Public only: this repository's run logs and artifacts
+          # are world-readable (CONTRIBUTING.md).
           repos=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
-            .[] | select(.archived == false and .fork == false) | .name
+            .[] | select(.archived == false and .fork == false and .visibility == "public") | .name
           ')
 
           shard_matrix='[]'
@@ -88,17 +55,18 @@ jobs:
           for r in $repos; do
             gh api "/repos/cplieger/${r}/contents/go.mod" --silent 2>/dev/null || continue
             rm -rf scan
-            # Plain git clone over HTTPS draws no API quota, so a rate-limited
-            # run can still clone; resolving the repo through the gh CLI would
-            # spend GraphQL quota this run may already have exhausted. A clone
-            # that still fails is LOUD — a silent `|| continue` dropped the repo
-            # from the matrix with no trace.
-            if ! git -c "http.https://github.com/.extraheader=${auth}" \
-                clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
+            # Plain git over HTTPS draws no API quota, so a rate-limited run can
+            # still clone, where `gh repo clone` would spend GraphQL budget.
+            if ! git clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
               echo "::warning::clone failed for ${r} — dropping it from the fuzz matrix this week"
               continue
             fi
-            sha=$(git -C scan rev-parse HEAD)
+            # A clone can exit 0 with no resolvable HEAD; unguarded under
+            # `set -e`, rev-parse would end the fanout for every repo.
+            if ! sha=$(git -C scan rev-parse HEAD 2>/dev/null); then
+              echo "::warning::cannot resolve HEAD for ${r}, so it is dropped from the fuzz matrix this week"
+              continue
+            fi
             # Count fuzz targets (proxy for `go test -list '^Fuzz'`; exact count
             # is recomputed per shard at run time, this only sizes the matrix).
             # `|| true`: grep exits 1 when a Go repo has tests but no fuzz funcs,
@@ -112,7 +80,12 @@ jobs:
             shards=$(( (count * FUZZ_TIME_SECONDS + SHARD_BUDGET_SECONDS - 1) / SHARD_BUDGET_SECONDS ))
             [ "$shards" -lt 1 ] && shards=1
             echo "  include ${r}: ${count} target(s) -> ${shards} shard(s) @ ${sha:0:12}"
-            repo_matrix=$(printf '%s' "$repo_matrix" | jq -c --arg r "$r" --arg s "$sha" '. + [{repo: $r, sha: $s}]')
+            # The report job downloads exactly the names this repo's shards
+            # upload (a brace list for several): a `-shard*` glob would also
+            # match a repo named `<repo>-shard<x>`, and file its findings here.
+            repo_matrix=$(printf '%s' "$repo_matrix" | jq -c --arg r "$r" --arg s "$sha" --argjson n "$shards" '
+              . + [{repo: $r, sha: $s, artifacts: ([range($n)] | map("fuzz-findings-\($r)-shard\(.)")
+                | if length == 1 then .[0] else "{\(join(","))}" end)}]')
             for i in $(seq 0 $((shards - 1))); do
               shard_matrix=$(printf '%s' "$shard_matrix" | jq -c \
                 --arg r "$r" --arg s "$sha" --argjson sh "$i" --argjson tot "$shards" \
@@ -140,20 +113,18 @@ jobs:
     timeout-minutes: 350
     permissions:
       contents: read
-    env:
-      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
     steps:
+      # Anonymous: the fanout lists only public repositories, and this job
+      # runs the target's code, so it holds no secret.
       - name: Clone target repo at pinned SHA
+        env:
+          REPO: ${{ matrix.repo }}
+          SHA: ${{ matrix.sha }}
         run: |
           set -euo pipefail
-          # One-shot auth as a top-level `git -c` so a private target cannot
-          # break the clone and the token is not persisted into target/.git.
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          git -c "http.https://github.com/.extraheader=${auth}" \
-            clone --depth 1 "https://github.com/cplieger/${{ matrix.repo }}.git" target
-          git -c "http.https://github.com/.extraheader=${auth}" \
-            -C target fetch --depth 1 origin "${{ matrix.sha }}"
-          git -C target checkout --quiet "${{ matrix.sha }}"
+          git clone --depth 1 "https://github.com/cplieger/${REPO}.git" target
+          git -C target fetch --depth 1 origin "${SHA}"
+          git -C target checkout --quiet "${SHA}"
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -209,19 +180,10 @@ jobs:
                 printf '%s|%s|%s|%s|%s\n' "$fn" "$(basename "$rel")" "${rel_dir:+$rel_dir/}${rel}" "$size" "$preview" \
                   >> "$GITHUB_WORKSPACE/findings.txt"
               elif [ "$status" -ne 0 ]; then
-                # go test failed but wrote no reproducer, so the target never
-                # explored anything: it is BROKEN, not fuzzing. Two real shapes,
-                # neither of which writes testdata/fuzz/... — a committed seed or
-                # f.Add entry that already fails (the seed phase aborts before
-                # fuzzing starts), and a build failure in the package.
-                #
-                # This was silent until 2026-08: `|| true` discarded the exit
-                # status and the extraction above found no path, so the leg went
-                # green with no finding and no issue. marotte's FuzzSetDebug
-                # panicked on seed#0 in every weekly run for weeks with zero
-                # signal anywhere. Fail the shard instead — a broken target is a
-                # process defect, so it fails closed rather than filing an issue
-                # that the seed-committed auto-close could never close.
+                # Failed with no reproducer: a committed seed or f.Add entry that
+                # already fails, or a build failure, so the target never fuzzed.
+                # The shard fails rather than filing an issue, because no seed
+                # commit could ever auto-close one.
                 printf '%s (%s)\n' "$fn" "$pkg" >> "$GITHUB_WORKSPACE/broken.txt"
                 echo "::error::${fn} (${pkg}) failed without writing a reproducer — broken seed corpus or build failure, see the group log"
               fi
@@ -249,7 +211,7 @@ jobs:
 
   report:
     needs: [fanout, fuzz]
-    if: ${{ always() && needs.fanout.outputs.repo_matrix != '[]' }}
+    if: ${{ always() && needs.fanout.result == 'success' && needs.fanout.outputs.repo_matrix != '[]' }}
     strategy:
       fail-fast: false
       max-parallel: 6
@@ -265,22 +227,19 @@ jobs:
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Clone target repo at pinned SHA
+        env:
+          SHA: ${{ matrix.sha }}
         run: |
           set -euo pipefail
-          # One-shot auth as a top-level `git -c` so a private target cannot
-          # break the clone and the token is not persisted into target/.git.
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          git -c "http.https://github.com/.extraheader=${auth}" \
-            clone --depth 1 "https://github.com/cplieger/${{ matrix.repo }}.git" target
-          git -c "http.https://github.com/.extraheader=${auth}" \
-            -C target fetch --depth 1 origin "${{ matrix.sha }}"
-          git -C target checkout --quiet "${{ matrix.sha }}"
+          git clone --depth 1 "https://github.com/${REPO}.git" target
+          git -C target fetch --depth 1 origin "${SHA}"
+          git -C target checkout --quiet "${SHA}"
 
       - name: Download this repo's shard findings
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: shard-findings
-          pattern: fuzz-findings-${{ matrix.repo }}-shard*
+          pattern: ${{ matrix.artifacts }}
 
       - name: Checkout ci (for the tracker transport)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

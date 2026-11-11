@@ -35,7 +35,11 @@ BUILD_STEPS = (
     'Build image (no push)',
     'Trivy image scan (advisory)',
 )
-PUBLISHED_STEPS = ('Trivy filesystem scan for the main summary', 'Upload the filesystem report')
+PUBLISHED_STEPS = (
+    "Record the verified cosign's digest",
+    'Trivy filesystem scan for the main summary',
+    'Upload the filesystem report',
+)
 # (default branch, event, ref) of every run a repository can start today, then
 # the one the published mode exists for.
 TODAY = [
@@ -165,7 +169,13 @@ class SecurityScanForMainDefaultRepos(unittest.TestCase):
     def test_the_trivy_job_only_gains_outputs_and_the_history_scan_is_untouched(self):
         job = {k: v for k, v in self.wf['jobs']['trivy'].items() if k not in ('outputs', 'steps')}
         self.assertEqual(job, {k: v for k, v in self.head['trivy'].items() if k != 'steps'})
-        self.assertEqual(self.wf['jobs']['gitleaks-history'], self.head['gitleaks-history'])
+        history, head = (
+            dict(self.wf['jobs']['gitleaks-history']),
+            dict(self.head['gitleaks-history']),
+        )
+        self.assertEqual(history.pop('runs-on'), "${{ inputs.runner || 'ubuntu-26.04' }}")
+        self.assertEqual(head.pop('runs-on'), 'ubuntu-26.04')
+        self.assertEqual(history, head)
         self.assertEqual(sorted(self.wf['jobs']), sorted([*self.head['jobs'], *PUBLISHED_JOBS]))
 
     def test_no_published_job_runs_outside_the_published_mode(self):

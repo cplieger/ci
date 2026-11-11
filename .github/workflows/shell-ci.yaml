@@ -27,16 +27,25 @@ on:
         type: string
         default: "DL3018,DL3066"
       dockerfile:
-        description: Path to the Dockerfile to lint. An empty path skips hadolint.
+        description: >-
+          Path to the Dockerfile to lint, beside every images/<name>/Dockerfile (the
+          release's runner images). An empty path skips hadolint.
         type: string
         default: "./Dockerfile"
+      runner:
+        description: >-
+          The runner label for the job, such as a self-hosted pool's; empty runs it
+          on ubuntu-26.04. A non-empty dockerfile keeps it on ubuntu-26.04, because
+          hadolint runs in Docker.
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
   validate:
-    runs-on: ubuntu-26.04
+    runs-on: ${{ (inputs.dockerfile == '' && inputs.runner) || 'ubuntu-26.04' }}
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,11 +71,14 @@ jobs:
         run: |
           # renovate: datasource=github-releases depName=mvdan/sh
           VERSION=v3.14.1
-          sudo curl -fsSL --connect-timeout 10 --max-time 30 \
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          curl -fsSL --connect-timeout 10 --max-time 30 \
             --retry 7 --retry-max-time 150 --retry-all-errors \
-            -o /usr/local/bin/shfmt \
+            -o "$bin/shfmt" \
             "https://github.com/mvdan/sh/releases/download/${VERSION}/shfmt_${VERSION}_linux_amd64"
-          sudo chmod +x /usr/local/bin/shfmt
+          chmod +x "$bin/shfmt"
+          echo "$bin" >> "$GITHUB_PATH"
 
       - name: Install shellcheck
         run: |
@@ -76,13 +88,16 @@ jobs:
           # local tooling and stays reproducible.
           # renovate: datasource=github-releases depName=koalaman/shellcheck
           VERSION=v0.11.0
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
           curl -fsSL --connect-timeout 10 --max-time 30 \
             --retry 7 --retry-max-time 150 --retry-all-errors \
             -o "$RUNNER_TEMP/shellcheck.tgz" \
             "https://github.com/koalaman/shellcheck/releases/download/${VERSION}/shellcheck-${VERSION}.linux.x86_64.tar.gz"
-          tar -xzf "$RUNNER_TEMP/shellcheck.tgz" -C /tmp "shellcheck-${VERSION}/shellcheck"
-          sudo mv "/tmp/shellcheck-${VERSION}/shellcheck" /usr/local/bin/shellcheck
-          shellcheck --version
+          tar -xzf "$RUNNER_TEMP/shellcheck.tgz" -C "$bin" --strip-components=1 \
+            "shellcheck-${VERSION}/shellcheck"
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/shellcheck" --version
 
       # Soft-gate block: each step below runs to completion (continue-on-error)
       # and records its own name to /tmp/_ci_failures on failure; the final
@@ -199,9 +214,18 @@ jobs:
               docker pull -q "hadolint/hadolint:${HADOLINT_VERSION}" && break
               echo "hadolint pull ${attempt}/3 failed; retrying" >&2; sleep $((attempt * 5))
             done
+            rc=0
             # shellcheck disable=SC2086
             docker run --rm -i "hadolint/hadolint:${HADOLINT_VERSION}" \
-              hadolint ${IGNORE_FLAGS} - < "$DOCKERFILE"
+              hadolint ${IGNORE_FLAGS} - < "$DOCKERFILE" || rc=1
+            shopt -s nullglob
+            for f in images/*/Dockerfile; do
+              echo "hadolint ${f}"
+              # shellcheck disable=SC2086
+              docker run --rm -i "hadolint/hadolint:${HADOLINT_VERSION}" \
+                hadolint ${IGNORE_FLAGS} - < "$f" || rc=1
+            done
+            [ "$rc" -eq 0 ]
           ) || { echo "Validate Dockerfile" >> /tmp/_ci_failures; exit 1; }
 
       # Repo-provided shell unit tests, opt-in by tests/shell/run.sh.

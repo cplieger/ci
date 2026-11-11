@@ -19,7 +19,7 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | a `package.json` or `jsr.json` in the `web/` folder of a `go-nested` module | `ts-nested` | `ts-ci.yaml` once per such folder |
 | a `Dockerfile`, or a root `go.mod` or `jsr.json` and a tracked `.sh` file outside `node_modules`, `vendor`, `testdata` and `dist` | `shell` | `shell-ci.yaml`, with hadolint only when there is a `Dockerfile` |
 | any files | `deadset` | `deadset-ci.yaml` at the repository root, and, when the root has a `go.mod`, once per nested Go module folder with tracked Go files |
-| a `Dockerfile` | `docker`, `docker-arm64` | an image build on `amd64`, and on `arm64` in public repositories, with no push and no scan |
+| a `Dockerfile` | `docker`, `docker-arm64` | an image build on `amd64`, and on `arm64` in public repositories, with no push and no scan; the `docker` job also builds each `images/<name>/Dockerfile` beside the `Dockerfile` on `amd64` (the release's runner images, below) |
 | `*.py` files | `python` | Ruff |
 | shell scripts or workflow files, and no `go.mod`, `jsr.json` or `Dockerfile` | `scripts` | shellcheck, shfmt, `tests/shell/run.sh` when the repository has one, yamllint, a TOML check, and the probe scripts present in the repository |
 | an `alerts/*.yaml` file | `alerts` | `promtool check rules` when `alerts/promql.yaml` exists, `promtool test rules` when `alerts/promql_test.yaml` exists, a LogQL parse of a copy of `alerts/logql.yaml` when that file exists, and, when `docs/monitoring.md` exists, a check that its alert table names exactly the alerts the rule files define |
@@ -37,7 +37,26 @@ A changed file outside every module folder keeps every module, unless its path e
 
 In `cplieger/ci` itself, a `go-os-canary` job runs `go-os-ci.yaml` over public Go modules that track Windows or macOS files, at fixed commits, on each runner detection selects for them. A change to that workflow or its pins that breaks a real module's Windows or macOS leg fails that job before a release carries it.
 
-After the `amd64` build, the `docker` job runs two optional image tests. The shared smoke harness runs when the repository has `tests/image-smoke.conf`. A repository's own `tests/image-test.sh` runs with the image reference as its first argument, and it must be committed as executable. The release workflow runs both again on every image it builds, as [the release workflow](#the-release-workflow) describes.
+After the `amd64` build, the `docker` job runs two optional image tests. The shared smoke harness runs when the repository has `tests/image-smoke.conf`. A repository's own `tests/image-test.sh` runs with the image reference as its first argument, and it must be committed as executable. The release workflow runs both again on the app image it builds, as [the release workflow](#the-release-workflow) describes.
+
+## Choosing the runner
+
+`ci.yaml`, `security-scan.yaml` and the four workflows `ci.yaml` calls (`go-ci.yaml`, `ts-ci.yaml`, `shell-ci.yaml` and `deadset-ci.yaml`) take a `runner` input, a runner label that is empty by default. Empty runs every job on `ubuntu-26.04`. `ci.yaml` passes its input on to the workflows it calls.
+
+These jobs stay on GitHub's runners whatever the input says:
+
+- `docker`, which builds the image, and `docker-arm64`, which builds it on `arm64`;
+- `shell`, when the repository has a `Dockerfile`, because hadolint runs in Docker;
+- `go-os`, on Windows and macOS;
+- the `trivy` job of `security-scan.yaml`, which builds the image.
+
+`codeql.yaml` takes no `runner` input. It runs only in public repositories, and its Go build uses the Go that GitHub's image carries.
+
+The jobs that move install their tools into `$RUNNER_TEMP/bin` with no `sudo`, and set up Go, Node and Python with the setup actions, so a runner built from GitHub's runner container image, `ghcr.io/actions/actions-runner`, runs them as a user with no root. A few checks need more on the runner:
+
+- `go test -race`, in `go-ci.yaml` and `go-work`, needs a C compiler.
+- A `ts-ci.yaml` package with `@vitest/browser-playwright` needs the system libraries of each engine it tests on, Chromium or those named in `cplieger.browsers`, because on a self-hosted runner the job installs the browsers without `--with-deps`.
+- deadset over a large Go module peaks near 3 GB of memory.
 
 ## The language workflows
 
@@ -47,7 +66,7 @@ After the `amd64` build, the `docker` job runs two optional image tests. The sha
 | `go-os-ci.yaml` | on the `runner` input's Windows or macOS runner: `go vet`, golangci-lint, `go test -race`, and `go vet` for Linux, macOS and Windows on amd64 and arm64 |
 | `ts-ci.yaml` | `npm ci`, ESLint, `tsc`, knip for import cycles and undeclared dependencies, vitest, fast-check fuzz tests, Prettier, `package.json` and `jsr.json` version parity, a publish-surface check, dependency review |
 | `ts-ci.yaml` with `web-lint: true` | the above, plus Stylelint, html-validate and an import-map coverage check |
-| `shell-ci.yaml` | shellcheck, shfmt, hadolint on the `dockerfile` input unless it is empty, and `tests/shell/run.sh` when the repository has one |
+| `shell-ci.yaml` | shellcheck, shfmt, hadolint on the `dockerfile` input and every `images/<name>/Dockerfile` unless the input is empty, and `tests/shell/run.sh` when the repository has one |
 
 With `web-lint: true`, a package that declares a `lint:web` script in `package.json` runs that script in place of Stylelint and html-validate, so a local `npm run lint:web` is the same check. The script must lint every tracked CSS file with Stylelint and the synced `.stylelintrc.json`, lint every tracked HTML file with html-validate, and exit non-zero when either fails.
 
@@ -71,6 +90,8 @@ The languages are the `analysis.languages` of `deadset.json`. When the file name
 
 - The workflow installs deadset-go and deadset-ts only, so a `providers.analyzers` that names another analyzer fails.
 - TypeScript needs a committed `package-lock.json` when it has a `package.json`. Both count only outside `node_modules`, `testdata`, `vendor` and hidden folders. Each folder that holds a lockfile is installed with `npm ci`. JavaScript with no `package.json`, such as a script run with `node`, installs nothing.
+
+deadset reads some languages itself, such as Protocol Buffers, so a root holding only `.proto` files needs no analyzer: the workflow installs none and runs the analysis.
 
 When the analyzer of a detected language finds no program, for example in a `tsconfig.json` with no inputs, deadset leaves that language out and reports the rest. When `analysis.languages` names the language, or the analyzer cannot read its configuration, the check fails.
 
@@ -127,7 +148,7 @@ On the dev channel it builds the image on native `amd64` and `arm64` runners and
 
 On the stable channel it re-tags the image the dev channel built for that commit as `vX.Y.Z`, `vX.Y`, `vX` and `latest`. It copies the image to Docker Hub with its signatures and creates the GitHub Release with its assets, described below. When it promotes a build, the Release's SBOM is the one that build signed into the image, read only once its signature checks out. When no dev build matches, it builds from source and says so in the run summary. It also writes the Docker Hub overview page from the README.
 
-Every image it builds, on either channel, then runs the `docker` job's two image tests in an `image-test` job, against the `amd64` digest the build pushed and before anything is tagged. A failure, or a run cancelled before the tests pass, leaves that digest without a tag. A rebuild-only range relies on this: its pull request changes no file, so the `docker` job skipped it, and the base packages it refreshes are tested only here. The job has read access to packages only, so the repository's test scripts never run beside the build's write token.
+The app image it builds, on either channel, then runs the `docker` job's two image tests in an `image-test` job, against the `amd64` digest the build pushed and before anything is tagged. The runner images described below do not run the repository's image tests. A failure, or a run cancelled before the tests pass, leaves that digest without a tag. A rebuild-only range relies on this: its pull request changes no file, so the `docker` job skipped it, and the base packages it refreshes are tested only here. The job has read access to packages only, so the repository's test scripts never run beside the build's write token.
 
 A stable image release carries these GitHub Release assets:
 
@@ -137,6 +158,12 @@ A stable image release carries these GitHub Release assets:
 - the repository's client as binaries for Linux, macOS and Windows on `amd64` and `arm64`, named `<name>-<goos>-<goarch>` with `.exe` on Windows, when `release.yaml`'s policy step names a client for the repository. `scripts/release-assets.sh build` compiles them from the release commit with `CGO_ENABLED=0`, `-trimpath` and `-ldflags "-s -w -X main.version=<tag>"`, using the Go version the module's `go.mod` asks for.
 
 The SBOM, each dashboard, the API document and each binary have a cosign bundle, `<file>.sigstore.json`, signed by `docker-release.yaml`, and all but the SBOM also come with a `.sha256` checksum. So you can verify an asset without pulling the image. The run reads the Release back and fails if an asset is missing. A repository with no dashboard, API document or client gets the SBOM alone. When a stable run completes an earlier stable tag whose Release is missing, it creates that Release with the same assets: the SBOM attested to the tag's published image, and the files from the tag's own commit. It publishes nothing if one cannot be made. Before creating either Release, `scripts/release-assets.sh cleanup-drafts` deletes any draft Release of its tag, the kind an asset upload that died leaves behind.
+
+A repository can publish more images on the same version line. Each `images/<name>/Dockerfile` is a runner image in the package `ghcr.io/<owner>/<image>-runner`, built with the repository root as its context, where `<name>` is 1 to 32 lowercase letters and digits. The dev channel tags it `<name>-vX.Y.Z-dev.N`, `<name>-dev` and `<name>-sha-<commit>`. The stable channel tags it `<name>-vX.Y.Z`, `<name>` and, for a build, `<name>-sha-<commit>`. A renumber run re-tags each runner image's build of the commit as `<name>-vX.Y.Z-dev.N` beside the app image, and refuses before any tag when one of them is missing. Like the app image, each runner image is built on native `amd64` and `arm64` runners, signed with cosign by `docker-release.yaml`, and given an attested SBOM and a Trivy scan, whose findings go to the Security tab under `trivy-image-runner-<name>`. Its licence label comes from `runner_image_licenses` in `release.yaml`'s policy step, or else from the app image's.
+
+A runner image can build on another one by naming its moving tag as a `FROM` image, a `COPY --from=` or the `from=` of a `RUN --mount`, as in `FROM ghcr.io/<owner>/<image>-runner:base-dev`. The release builds that image first and swaps those three forms for the digest it just pushed, so an image never builds on an older copy of another. The build rewrites no other mention, so a moving tag named anywhere else, such as in a `RUN` command, an `ENV` or a `LABEL`, fails the release. Any other reference to the package, such as a version tag, a digest or the image itself, fails the release too, and so does a cycle.
+
+A stable promotion re-tags the runner images that the dev channel built for the promoted commit when every one of them was signed and attested by that build. Otherwise all of them build from source. Each runner image is pushed under `<name>-sha-<commit>` only, then scanned, signed and attested. `finalize` writes every runner image's version tag and then every channel tag right after it moves the app image's channel tags. It starts only once every runner image is signed and the app image passed `image-test`, and the write follows each check that can refuse the release. So a failed runner image, a failed image test or a refused release moves no runner tag and leaves the version untagged, and the next run publishes it. A failure after the app image's tags moved is completed by a rerun of `finalize`, as for the app image. They get no Docker Hub copy and no Release asset. The rebuild-only comparison reads the app image only, so a rebuild-only range in a repository with runner images always publishes. The weekly `rebuild-stale.yaml` ages each runner image whose Dockerfile installs packages under `PKG_REFRESH`, by `<name>-dev` on `dev` and `<name>` on `main`, as it ages the app image, so a stale runner image rebuilds its channel even beside an app image that installs no packages. `ghcr-retention.yaml` keeps the newest ten dev builds of each runner image. GitHub makes a new package private on its first publish, so the owner makes the runner package public in its settings before anyone pulls it without logging in. A repository with no `images/<name>/Dockerfile` releases as before.
 
 A job that runs a script or action from cplieger/ci first checks out cplieger/ci at the commit you pinned. The copy goes to `.cplieger-ci` beside your checkout and keeps no token on disk. So the commit you pin decides every line of cplieger/ci code the run executes. The `pr-policy` job of `ci.yaml` works the same way.
 
@@ -232,3 +259,15 @@ For a fixable finding of the daily scan of `main`, it asks Renovate to run the w
 For an OS package of an image whose final stage installs packages, it opens a rebuild pull request into `main` instead. The rebuild refreshes those packages only when an install runs after an `ARG PKG_REFRESH` line, in the same stage or in a stage it is built from. Otherwise the finding is listed in the issue.
 
 It also keeps one issue per repository, labelled `release-blocked`, and closes it once every section is clear. The title names the sections the issue holds, such as `Vulnerability fix has no automatic route`, so a finding that blocks no release does not read as a blocked one. The issue lists the Saturday update when it has not shipped by 12:00 UTC. It lists any security, expedited or rebuild pull request into `main` that has not shipped within three hours. It also lists every fixable finding with no automatic route, and a missing, older or incomplete scan. When a read fails, the issue keeps the sections that read would have checked as they were, and the issue is not closed that hour. It also stays open in an hour when a planned merge, rebuild or dashboard tick did not happen, for example because the dashboard changed after it was read.
+
+## The scheduled runs
+
+The weekly workflows run each repository's mutation tests, fuzz targets, benchmarks and link checks here in cplieger/ci, so one place holds the schedule, the matrix and its `max-parallel` cap. Stryker runs on Saturdays, gremlins on Sundays, benchmarks on Tuesdays, fuzzing on Wednesdays and the link check on Thursdays, all at 22:00 UTC.
+
+They take only repositories that are public, not archived and not forks, because anyone signed in to GitHub can read this repository's run logs and artifacts. A private repository that wants these runs runs them in its own CI. A job that runs a repository's code clones it anonymously and references no secret. The jobs that publish a badge, update a tracker issue or file a finding run no repository code. They take each repository from their own matrix and download only the artifacts that repository's run entries uploaded, by exact name.
+
+`weekly-stryker.yaml` mutation-tests each TypeScript package directory, the root or a subdirectory such as `static-src/`, that commits a `stryker.config.json`. The directory also needs the devDependencies its config names: `@stryker-mutator/core` and `@stryker-mutator/vitest-runner`, plus `@stryker-mutator/typescript-checker` when it sets `checkers`. When it declares a `test:mutation` script, the run calls that script instead of `stryker run`. A directory whose devDependencies are missing is skipped with a notice. A directory that commits `stryker.weekly.json` as `{"weekly": false}` is skipped on the schedule only, and a run started by hand still tests it.
+
+Each directory runs once a week. Its score goes to the run summary and to a `mutation-ts.json` badge on the repository's `badges` branch, in the colour bands of the Go mutation badge. Stryker fails the entry when the score falls below the config's `thresholds.break`, which blocks no merge. Each repository keeps one `Stryker mutation testing tracker` issue, labelled `stryker-tracker`, with a 12-week score table and the surviving mutants grouped as Survived or NoCoverage. Notes written outside its marked blocks are kept. The `mutation-regression` label is set when the week's score falls more than 5% below the 12-week mean. A run that produced no readable report leaves the issue as it was. The staged report drops the source text Stryker embeds for each file and test file.
+
+`weekly-fuzz.yaml` fuzzes every `func Fuzz` target for 2 minutes, starting from the committed `testdata/fuzz/` corpus only. The runner is discarded and setup-go's cache is off, so the corpus a run grows is lost, and depth grows only through a failing seed someone commits. A repository whose targets overrun one runner's 4-hour budget is split into shards, each fuzzing a fixed share of the targets, rather than given less time per target. Each new failing seed opens a `fuzz-finding` issue in the repository, and committing the seed under `testdata/fuzz/` closes it on the next run.

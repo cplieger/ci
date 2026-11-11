@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Comma/space-separated repo names to limit the run (for testing a fix). Empty runs against all cplieger repos."
+        description: "Comma/space-separated repo names to limit the run (for testing a fix). Empty runs every public cplieger repo."
         required: false
         default: ""
 
@@ -60,9 +60,10 @@ jobs:
           # every repo at once. Forks are excluded (same rule as
           # scripts/audit.py): a fork carries UPSTREAM's code and tests, so its
           # mutation score measures someone else's suite and its tracker issue
-          # would be unactionable.
+          # would be unactionable. Public only: this repository's run logs and
+          # artifacts are world-readable (CONTRIBUTING.md).
           repos=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
-            .[] | select(.archived == false and .fork == false) | .name
+            .[] | select(.archived == false and .fork == false and .visibility == "public") | .name
           ')
 
           # Optional manual filter: the workflow_dispatch 'only' input limits the
@@ -120,8 +121,6 @@ jobs:
     timeout-minutes: ${{ fromJSON(needs.fanout.outputs.plan_timeout_minutes) }}
     permissions:
       contents: read
-    env:
-      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
     steps:
       # Checkout FIRST: actions/checkout cleans the workspace, so it must not
       # run after the target clone below.
@@ -197,9 +196,11 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
+      actions: read
       contents: read
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      repos: ${{ steps.matrix.outputs.repos }}
     steps:
       - name: Checkout ci (for scripts/)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -219,14 +220,29 @@ jobs:
           path: plans
           pattern: shard-plan-*
 
+      # The names come from the API, not the download, because a lone artifact
+      # extracts without its directory and its plan.json names no owner the
+      # target could not have written.
       - name: Build the run matrix
         id: matrix
         env:
+          GH_TOKEN: ${{ github.token }}
           REPOS: ${{ needs.fanout.outputs.repos }}
         run: |
           set -euo pipefail
-          matrix=$(python3 scripts/gremlins-shard.py matrix --repos "${REPOS}" --plans plans --attempts 3)
+          artifacts=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired | not) | .name | select(startswith("shard-plan-"))' \
+            | jq -Rsc 'split("\n") | map(select(. != "")) | unique')
+          matrix=$(python3 scripts/gremlins-shard.py matrix --repos "${REPOS}" --plans plans --attempts 3 \
+            --artifacts "${artifacts}")
+          # The badge and tracker jobs download each repo's artifacts by the exact
+          # names its run entries upload (a brace list for several), so an
+          # artifact cannot reach another repo's badge or tracker.
+          repos=$(jq -c 'group_by(.repo) | map({repo: .[0].repo, artifacts: (
+            map("gremlins-\(.repo)-\(.attempt)\(if .shards then "-shard\(.shard)" else "" end)")
+            | if length == 1 then .[0] else "{\(join(","))}" end)})' <<<"$matrix")
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "repos=${repos}" >> "$GITHUB_OUTPUT"
           echo "Total matrix entries: $(echo "$matrix" | jq 'length')"
 
   run:
@@ -245,7 +261,6 @@ jobs:
     permissions:
       contents: read
     env:
-      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
       # Empty for a repo that runs each attempt in one job.
       SHARD: ${{ matrix.shard }}
       SHARDS: ${{ matrix.shards }}
@@ -358,12 +373,9 @@ jobs:
             fail "merging per-module gremlins results failed for ${{ matrix.repo }} (attempt ${{ matrix.attempt }})" 1
           fi
 
-      # The artifact carries its own identity, because its NAME does not survive
-      # the transport: actions/download-artifact only creates the per-artifact
-      # directory when more than one artifact matched its pattern, so a run whose
-      # pattern matches exactly one artifact extracts flat and the repo name that
-      # used to be parsed out of the directory is simply gone. The same shape
-      # weekly-stryker.yaml already uses.
+      # actions/download-artifact extracts a single matched artifact with no
+      # directory, so its name is lost and the attempt and shard ride in meta.json.
+      # The readers take the repo from the names they download, never from here.
       - name: Record which repo and attempt this artifact is
         if: always()
         env:
@@ -389,17 +401,17 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
-  # Publish the per-repo mutation badge to each consumer's orphan `badges`
-  # branch. Independent of the `aggregate` (issue-tracker) job below, so a
-  # tracker-issue failure never blocks the README badge — and vice versa. Reads
-  # the same per-attempt artifacts and reuses scripts/gremlins-aggregate.py's
-  # parser (the trusted efficacy formula) plus the sibling-preserving publisher
-  # script bundled with the publish-badge composite action (called directly
-  # here — this job loops repos inside one step, where a `uses:` per repo is
-  # not possible).
+  # Publish each repo's mutation badge to its orphan `badges` branch,
+  # independent of the `aggregate` (issue-tracker) job below so neither failure
+  # blocks the other. scripts/gremlins-aggregate.py computes the efficacy.
   badge:
-    needs: [fanout, run]
-    if: always() && needs.fanout.outputs.repos != '[]'
+    needs: [shard, run]
+    if: ${{ always() && needs.shard.result == 'success' && needs.shard.outputs.repos != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.shard.outputs.repos) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -425,69 +437,48 @@ jobs:
           VERSION=6.0.3
           pip install -q "PyYAML==${VERSION}"
 
-      - name: Download all per-attempt artifacts
+      - name: Download this repo's attempts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
-          pattern: gremlins-*
+          pattern: ${{ matrix.artifacts }}
 
-      - name: Compute + publish mutation badge per repo
+      - name: Compute + publish this repo's mutation badge
         env:
           # CI_SCHEDULE must carry contents:write on consumer repos. The push
           # targets each repo's orphan `badges` branch.
           TOKEN: ${{ secrets.CI_SCHEDULE }}
+          REPO: ${{ matrix.repo }}
         run: |
-          # Explicit per-command error handling (NOT `set -e` inside a subshell:
-          # bash ignores errexit for a `( … ) || …` subshell, which is why an
-          # earlier version reported success while every repo failed). Each repo
-          # is isolated; a failure warns, sets had_failure, and the loop
-          # continues so healthy repos still publish. The job then exits red if
-          # anything failed, so the run never goes green on a real failure.
-          set -uo pipefail
-          # Repos come from the meta.json each artifact carries; the script owns
-          # why that is not a glob, and goes red on the layout defect itself.
-          REPOS=$(bash scripts/discover-artifact-repos.sh artifacts) || exit 1
-          if [ -z "$REPOS" ]; then
-            echo "no attempt artifacts this week — no badge to publish"
+          set -euo pipefail
+          # Target code wrote meta.json, so an artifact naming another repo is
+          # warned and skipped; gremlins-aggregate.py reads only this repo's.
+          found=$(bash scripts/discover-artifact-repos.sh --allow "$REPO" artifacts)
+          if [ -z "$found" ]; then
+            echo "no attempt names ${REPO} this week, so its badge is left untouched"
             exit 0
           fi
-          WEEK=$(date -u +'%Y-%m-%d %H:%M')
-          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-
-          publish_one() {
-            local repo="$1"
-            local badge="/tmp/mutation-${repo}.json"
-            python3 scripts/gremlins-aggregate.py \
-              --repo "$repo" --artifacts-dir artifacts --week "$WEEK" \
-              --run-url "$RUN_URL" --badge-file "$badge" >/dev/null || return 1
-            # The script only writes the badge when at least one attempt parsed,
-            # so a repo whose every attempt errored is skipped (its red comes
-            # from the run job) instead of overwriting a good badge with 0%.
-            if [ ! -s "$badge" ]; then
-              echo "  no parseable attempts for ${repo} — leaving existing badge untouched"
-              return 0
-            fi
-            bash actions/publish-badge/publish-badge.sh \
-              "cplieger/${repo}" "$TOKEN" mutation.json "$(cat "$badge")" || return 1
-          }
-
-          had_failure=0
-          for repo in $REPOS; do
-            echo "::group::$repo"
-            if ! publish_one "$repo"; then
-              echo "::warning::badge publish failed for ${repo} — continuing"
-              had_failure=1
-            fi
-            echo "::endgroup::"
-          done
-          if [ "$had_failure" -ne 0 ]; then
-            echo "::error::one or more mutation-badge publishes failed"
-            exit 1
+          badge="$RUNNER_TEMP/mutation.json"
+          python3 scripts/gremlins-aggregate.py \
+            --repo "$REPO" --artifacts-dir artifacts --week "$(date -u +'%Y-%m-%d %H:%M')" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --badge-file "$badge" >/dev/null
+          # Written only when an attempt parsed, so a repo whose every attempt
+          # errored keeps its badge rather than showing 0%.
+          if [ ! -s "$badge" ]; then
+            echo "no parseable attempts for ${REPO}, so its badge is left untouched"
+            exit 0
           fi
+          bash actions/publish-badge/publish-badge.sh "cplieger/${REPO}" "$TOKEN" mutation.json "$(cat "$badge")"
 
   aggregate:
-    needs: [fanout, run]
-    if: always() && needs.fanout.outputs.repos != '[]'
+    needs: [shard, run]
+    if: ${{ always() && needs.shard.result == 'success' && needs.shard.outputs.repos != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.shard.outputs.repos) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -515,74 +506,44 @@ jobs:
           VERSION=6.0.3
           pip install -q "PyYAML==${VERSION}"
 
-      - name: Download all per-attempt artifacts
+      - name: Download this repo's attempts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
-          pattern: gremlins-*
+          pattern: ${{ matrix.artifacts }}
 
-      - name: Aggregate + update tracker issue per repo
+      - name: Aggregate + update this repo's tracker issue
+        env:
+          REPO: ${{ matrix.repo }}
         run: |
-          # Delegate stats + body generation to scripts/gremlins-aggregate.py —
-          # the same parser the `badge` job trusts. It reads each attempt's
-          # gremlins-out.json, computes mean/stddev/coverage, rolls the 12-week
-          # history forward (preserving free-form notes), renders the
-          # frequency-bucketed live mutants, and writes regression + attempts
-          # markers. The issue reads and writes go through
-          # scripts/tracker_issue.py. Explicit per-command error handling (NOT
-          # `set -e` in a `( … ) || …` subshell, which bash neuters): each repo
-          # is isolated, failures warn and set had_failure, and the job exits
-          # red at the end if anything failed.
-          set -uo pipefail
-          # Same discovery as the badge job above, for the same reason.
-          REPOS=$(bash scripts/discover-artifact-repos.sh artifacts) || exit 1
-          if [ -z "$REPOS" ]; then
-            echo "no attempt artifacts this week — nothing to aggregate"
+          set -euo pipefail
+          # The badge job's check, for the same reason.
+          found=$(bash scripts/discover-artifact-repos.sh --allow "$REPO" artifacts)
+          if [ -z "$found" ]; then
+            echo "no attempt names ${REPO} this week, so its tracker issue is left untouched"
             exit 0
           fi
-          WEEK_ENDING=$(date -u +'%Y-%m-%d %H:%M')
-          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          R="cplieger/${REPO}"
           title="Gremlins mutation testing tracker"
-
-          process_repo() {
-            local repo="$1" R="cplieger/$1" att flag=off
-
-            python3 scripts/tracker_issue.py --repo "$R" --label gremlins-tracker --title "$title" \
-              --mode fetch --body-file "/tmp/existing-${repo}.md" || return 1
-
-            python3 scripts/gremlins-aggregate.py \
-              --repo "$repo" --artifacts-dir artifacts --week "$WEEK_ENDING" --run-url "$RUN_URL" \
-              --regression-marker-file "/tmp/regression-${repo}.txt" \
-              --attempts-marker-file "/tmp/attempts-${repo}.txt" \
-              --existing-body-file "/tmp/existing-${repo}.md" > "/tmp/body-${repo}.md" || return 1
-
-            att=$(cat "/tmp/attempts-${repo}.txt" 2>/dev/null || echo 0)
-            if [ "$att" -eq 0 ]; then
-              echo "  no parseable attempts for ${repo} — leaving the tracker issue untouched"
-              return 0
-            fi
-
-            if [ "$(cat "/tmp/regression-${repo}.txt" 2>/dev/null)" = "true" ]; then
-              flag=on
-            fi
-            python3 scripts/tracker_issue.py --repo "$R" --label gremlins-tracker --title "$title" \
-              --mode upsert --body-file "/tmp/body-${repo}.md" \
-              --flag-label mutation-regression --flag "$flag" || return 1
-          }
-
-          had_failure=0
-          for repo in $REPOS; do
-            echo "::group::$repo"
-            if ! process_repo "$repo"; then
-              echo "::warning::aggregate failed for ${repo} — continuing"
-              had_failure=1
-            fi
-            echo "::endgroup::"
-          done
-          if [ "$had_failure" -ne 0 ]; then
-            echo "::error::one or more tracker-issue updates failed"
-            exit 1
+          python3 scripts/tracker_issue.py --repo "$R" --label gremlins-tracker --title "$title" \
+            --mode fetch --body-file "$RUNNER_TEMP/existing.md"
+          python3 scripts/gremlins-aggregate.py \
+            --repo "$REPO" --artifacts-dir artifacts --week "$(date -u +'%Y-%m-%d %H:%M')" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --regression-marker-file "$RUNNER_TEMP/regression.txt" \
+            --attempts-marker-file "$RUNNER_TEMP/attempts.txt" \
+            --existing-body-file "$RUNNER_TEMP/existing.md" > "$RUNNER_TEMP/body.md"
+          if [ "$(cat "$RUNNER_TEMP/attempts.txt" 2>/dev/null || echo 0)" -eq 0 ]; then
+            echo "no parseable attempts for ${REPO}, so its tracker issue is left untouched"
+            exit 0
           fi
+          flag=off
+          if [ "$(cat "$RUNNER_TEMP/regression.txt" 2>/dev/null)" = "true" ]; then
+            flag=on
+          fi
+          python3 scripts/tracker_issue.py --repo "$R" --label gremlins-tracker --title "$title" \
+            --mode upsert --body-file "$RUNNER_TEMP/body.md" \
+            --flag-label mutation-regression --flag "$flag"
 
   # `needs:` must list every other job in this workflow.
   notify:

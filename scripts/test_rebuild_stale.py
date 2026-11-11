@@ -794,6 +794,113 @@ class TwoBranchFanout(unittest.TestCase):
         self.assertIn('Rebuilding 0 image(s).', summary)
 
 
+def runner_fixture(app=SCRATCH, images=('base', 'build'), ages=None, **over) -> dict:
+    """two_branch_fixture whose bases also hold images/<name>/Dockerfile for each of images,
+    the runner tags built `ages[(base, name)]` days ago (None: not published), 1 by default."""
+    fx = two_branch_fixture(**over)
+    curl = fx['curl']
+    ghcr(curl, 'tb', 'latest', iso(NOW - DAY))
+    for base in ('main', 'dev'):
+        fx['api'][f'GET repos/cplieger/tb/contents/Dockerfile?ref={base}'] = {
+            'body': {'content': b64(app)}
+        }
+        fx['api'][f'GET repos/cplieger/tb/contents/images?ref={base}'] = {
+            'body': [{'name': n, 'type': 'dir'} for n in images]
+            + [{'name': 'README.md', 'type': 'file'}, {'name': 'Not-An-Image', 'type': 'dir'}]
+        }
+        for n in images:
+            fx['api'][f'GET repos/cplieger/tb/contents/images/{n}/Dockerfile?ref={base}'] = {
+                'body': {'content': b64(APK_REFRESH)}
+            }
+            age = (ages or {}).get((base, n), 1)
+            tag = n if base == 'main' else f'{n}-dev'
+            ghcr(curl, 'tb-runner', tag, None if age is None else iso(NOW - age * DAY))
+    return fx
+
+
+class RunnerImageFanout(unittest.TestCase):
+    """A channel is stale when its app image or any runner image beside it is."""
+
+    def fanout(self, fx):
+        h = Harness(self)
+        res = h.run(['bash', str(SCRIPT), 'fanout'], fx)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return h
+
+    def test_fresh_runner_images_beside_a_distroless_app_rebuild_nothing(self):
+        h = self.fanout(runner_fixture())
+        self.assertEqual(h.rows(), [])
+        summary = h.summary.read_text()
+        self.assertIn(
+            f'| tb (dev, tb-runner:base-dev) | {iso(NOW - DAY)} | 1 | 7 | fresh |', summary
+        )
+        self.assertIn(f'| tb (main, tb-runner:build) | {iso(NOW - DAY)} | 1 | 7 | fresh |', summary)
+        read = [c[2] for c in h.calls() if c[:2] == ['gh', 'api']]
+        self.assertNotIn('repos/cplieger/tb/contents/images/Not-An-Image/Dockerfile?ref=dev', read)
+
+    def test_a_stale_runner_image_rebuilds_its_channel_even_when_the_app_installs_nothing(self):
+        h = self.fanout(runner_fixture(ages={('dev', 'build'): 9}))
+        self.assertEqual(
+            h.rows(),
+            [
+                {
+                    'repo': 'tb',
+                    'base': 'dev',
+                    'channel': 'dev',
+                    'last': iso(NOW - 9 * DAY),
+                    'age_days': '9',
+                    'since': iso(NOW - 7 * DAY),
+                    'image': 'tb-runner:build-dev',
+                }
+            ],
+        )
+
+    def test_a_missing_runner_tag_is_stale(self):
+        h = self.fanout(runner_fixture(ages={('main', 'base'): None}))
+        self.assertEqual(
+            h.rows(),
+            [
+                {
+                    'repo': 'tb',
+                    'base': 'main',
+                    'channel': 'latest',
+                    'last': 'not published',
+                    'age_days': 'n/a',
+                    'image': 'tb-runner:base',
+                }
+            ],
+        )
+
+    def test_one_request_rebuilds_a_channel_with_several_stale_images(self):
+        h = self.fanout(
+            runner_fixture(APK_REFRESH, ages={('dev', 'base'): 8, ('dev', 'build'): 9}),
+        )
+        dev = [r for r in h.rows() if r['base'] == 'dev']
+        self.assertEqual([r['image'] for r in dev], ['tb-runner:base-dev'])
+        self.assertIn(
+            f'| tb (dev, tb-runner:build-dev) | {iso(NOW - 9 * DAY)} | 9 | 7 | **rebuild** |',
+            h.summary.read_text(),
+        )
+
+    def test_an_unlisted_images_directory_is_an_unreadable_row(self):
+        fx = runner_fixture()
+        fx['api']['GET repos/cplieger/tb/contents/images?ref=dev'] = {
+            'exit': 1,
+            'stderr': 'gh: Bad credentials (HTTP 401)',
+        }
+        rows = self.fanout(fx).rows()
+        self.assertEqual([r['base'] for r in rows], ['dev'])
+        self.assertEqual(
+            rows[0]['unreadable'],
+            'the images/ directory on dev could not be listed: gh: Bad credentials (HTTP 401)',
+        )
+
+    def test_without_an_images_directory_only_the_app_is_read(self):
+        h = self.fanout(two_branch_fixture())
+        self.assertEqual([r.get('image') for r in h.rows()], [None])
+        self.assertFalse([c for c in h.calls() if 'tb-runner' in json.dumps(c)])
+
+
 class ImageCreated(unittest.TestCase):
     def test_exit_codes(self):
         h = Harness(self)
@@ -1355,6 +1462,10 @@ class StalePr(unittest.TestCase):
         self.assertEqual(
             self.body('dev', 'dev', 'n/a', 'not published', ''), 'No `:dev` image is published.'
         )
+        self.assertEqual(
+            self.body('dev', 'dev', '9', 'B', '', 'tb-runner:build-dev'),
+            'The `tb-runner:build-dev` image is 9 days old (built B).',
+        )
 
     def test_a_request_merged_after_fanout_opens_no_second_pr(self):
         fx = pr_fixture()
@@ -1468,6 +1579,15 @@ class Dispatch(unittest.TestCase):
         )
         self.assertEqual(self.opened(h), ['dev'])
         self.assertIn('| tb | main | :latest | unreadable |', h.summary.read_text())
+
+    def test_a_runner_image_row_names_its_image(self):
+        bad = {**BAD_ROW, 'image': 'tb-runner:base'}
+        runner = {**DEV_ROW, 'image': 'tb-runner:build-dev'}
+        h, res = self.dispatch(both_bases_fixture(), [bad, runner])
+        self.assertEqual(res.returncode, 1)
+        self.assertIn('::error::ghcr.io/cplieger/tb-runner:base (main) did not read', res.stdout)
+        dev = pull_creates(h.calls())[0]
+        self.assertTrue(dev['body'].startswith('No `tb-runner:build-dev` image is published.'))
 
     def test_only_unreadable_bases_call_nothing(self):
         h, res = self.dispatch({}, [BAD_ROW])

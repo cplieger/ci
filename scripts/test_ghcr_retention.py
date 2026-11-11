@@ -88,6 +88,39 @@ class Selection(unittest.TestCase):
         self.assertEqual(gr.select_deletions(versions, NOW), [])
 
 
+class RunnerPackage(unittest.TestCase):
+    """A runner package's tags carry their image name: <name>-v1.3.0-dev.7, <name>-sha-<c>."""
+
+    PKG = 'app-runner'
+    C = 'f' * 40
+
+    def test_a_runner_dev_build_is_a_candidate_once_its_name_is_set_aside(self):
+        dev = version(1, ['base-v1.3.0-dev.7', f'base-sha-{self.C}'], 40)
+        self.assertTrue(gr.is_candidate(dev, self.PKG))
+        self.assertFalse(gr.is_candidate(dev))
+
+    def test_a_runner_build_no_version_took_is_a_candidate(self):
+        self.assertTrue(gr.is_candidate(version(1, [f'build-sha-{self.C}'], 40), self.PKG))
+
+    def test_moving_and_stable_runner_tags_are_never_candidates(self):
+        for tags in (
+            ['base-v1.3.0-dev.7', 'base-dev', f'base-sha-{self.C}'],
+            ['base-v1.3.0', 'base'],
+            ['base'],
+            ['base-v1.3.0-dev.7', 'base-v1.3.0'],
+        ):
+            self.assertFalse(gr.is_candidate(version(1, tags, 40), self.PKG), tags)
+
+    def test_each_image_keeps_its_own_newest_ten(self):
+        versions = [
+            version(100 * k + i, [f'{name}-v1.0.0-dev.{i}'], 100 + i)
+            for k, name in enumerate(('base', 'build', 'browser', 'docker'), 1)
+            for i in range(1, 13)
+        ]
+        doomed = {v['id'] for v in gr.select_deletions(versions, NOW, package=self.PKG)}
+        self.assertEqual(doomed, {111, 112, 211, 212, 311, 312, 411, 412})
+
+
 class PromotedImages(unittest.TestCase):
     """promote.yaml tags a promoted dev digest before main can name it."""
 

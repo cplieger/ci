@@ -39,7 +39,6 @@ every major — drop the suffix
 exactly {\"weekly\": false}; mutation-testing the dir
 failed for {p.tag}; STOPPING. Restore with:
 failed for {p.tag}; aborting before any
-for ${repo} — continuing
 for ${r} — dropping it from
 for run ${RUN_ID}; not touching the
 found in input; did the run
@@ -83,7 +82,6 @@ published manifest — dropped from significance
 readable in '${meta}'; that artifact is
 repo (want main; {s["name"]} publishes from
 repo cannot self-approve; every PR blocks
-repo discovery failed; refusing to report
 report diffs only; no push, no
 required_linear_history=on (want off; the merge model
 resolvable HEAD — skipping this repo

@@ -282,17 +282,45 @@ def valid_plan(doc: object) -> str:
     return ''
 
 
-def matrix(repos: list[str], plans_dir: Path, attempts: int) -> list[dict]:
+def plan_owner(path: Path, plans_dir: Path, repos: list[str], artifacts: list[str]) -> str | None:
+    """The repo whose plan job uploaded PATH, from the artifact name alone.
+
+    The target's code ran in that job and could write any plan.json, but not
+    the artifact name. actions/download-artifact v8 extracts a lone match
+    without its directory, so a root plan.json is bound through ARTIFACTS,
+    this run's shard-plan-* artifact names, when they name exactly one. The
+    run's artifact listing repeats a name once per attempt that uploaded it.
+    """
+    if path.parent == plans_dir:
+        if len(set(artifacts)) != 1:
+            return None
+        name = artifacts[0].removeprefix('shard-plan-')
+        return name if name != artifacts[0] and name in repos else None
+    name = path.parent.name.removeprefix('shard-plan-')
+    if path.parent.parent == plans_dir and name != path.parent.name and name in repos:
+        return name
+    return None
+
+
+def matrix(repos: list[str], plans_dir: Path, attempts: int, artifacts: list[str]) -> list[dict]:
     plans: dict[str, dict] = {}
     for path in sorted(plans_dir.rglob('plan.json')) if plans_dir.is_dir() else []:
+        owner = plan_owner(path, plans_dir, repos, artifacts)
+        if owner is None:
+            print(f'::warning::{path} is not one repo\'s shard-plan artifact, so it is ignored',
+                  file=sys.stderr)
+            continue
         try:
             doc = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             print(f'::warning::{path} is unreadable, so it is ignored ({exc})', file=sys.stderr)
             continue
-        repo = doc.get('repo') if isinstance(doc, dict) else None
-        if isinstance(repo, str):
-            plans[repo] = doc
+        named = doc.get('repo') if isinstance(doc, dict) else None
+        if named != owner:
+            print(f'::warning::{owner}: its shard-plan artifact names repo {named!r}, '
+                  'so it is ignored', file=sys.stderr)
+            continue
+        plans[owner] = doc
     out = []
     for repo in repos:
         doc = plans.get(repo)
@@ -351,6 +379,8 @@ def main() -> int:
     mx.add_argument('--repos', required=True, help='JSON list of repo names')
     mx.add_argument('--plans', required=True, type=Path, help='downloaded plan artifacts')
     mx.add_argument('--attempts', required=True, type=int)
+    mx.add_argument('--artifacts', required=True,
+                    help="JSON list of this run's shard-plan-* artifact names")
     md = sub.add_parser('modules', help='which modules one shard runs')
     md.add_argument('--plan', required=True, type=Path)
     md.add_argument('--shard', required=True, type=int)
@@ -371,7 +401,10 @@ def main() -> int:
         repos = json.loads(args.repos)
         if not isinstance(repos, list) or not all(isinstance(r, str) and r for r in repos):
             raise SystemExit(f'--repos must be a JSON list of names, got {args.repos!r}')
-        print(json.dumps(matrix(repos, args.plans, args.attempts), separators=(',', ':')))
+        artifacts = json.loads(args.artifacts)
+        if not isinstance(artifacts, list) or not all(isinstance(a, str) for a in artifacts):
+            raise SystemExit(f'--artifacts must be a JSON list of names, got {args.artifacts!r}')
+        print(json.dumps(matrix(repos, args.plans, args.attempts, artifacts), separators=(',', ':')))
     else:
         doc = json.loads(args.plan.read_text())
         print('\n'.join(shard_modules(doc, args.shard, args.modules.split())))

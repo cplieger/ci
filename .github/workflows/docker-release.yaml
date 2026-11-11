@@ -1,15 +1,11 @@
-# Reusable Docker publish workflow, called only by release.yaml, which passes
-# the channel, the version and whether a release is due. dev: build once on
-# native amd64 and arm64 runners, push to GHCR as `:<dev-version>`, `:dev` and
-# `:sha-<commit>`, sign, attest the SBOM, scan, create the dev git tag. stable:
-# tag `:vX.Y.Z`, `:vX.Y`, `:vX`, `:latest` on a promotion commit's trailer
-# digest (never a build), else on the dev digest promote-digest.sh picks, else
-# on a source build; copy to Docker Hub with referrers, re-scan, GitHub Release.
-# A range whose only release reason is a rebuild request builds its amd64 image
-# unpushed first and publishes nothing when its packages equal the release it
-# follows. Every vulnerability scan is advisory. Like release.yaml, it refuses,
-# in both modes, a caller that is not a public, non-fork repository whose
-# default branch is `dev`.
+# Reusable Docker publish workflow, called only by release.yaml. dev: build on
+# native amd64 and arm64 runners, push `:<dev-version>`, `:dev`, `:sha-<commit>`,
+# sign, attest the SBOM, scan, create the dev tag. stable: tag `:vX.Y.Z`, `:vX.Y`,
+# `:vX`, `:latest` on the promoted dev digest (promote-digest.sh) or a source
+# build, copy to Docker Hub, re-scan, create the Release. Each
+# images/<name>/Dockerfile is a runner image of <image>-runner at the same
+# version (scripts/runner_images.py), pushed and signed before finalize, which
+# tags them after the app image.
 name: Docker Release
 
 on:
@@ -117,6 +113,13 @@ on:
           overrides a Dockerfile LABEL of the same key.
         type: string
         default: ""
+      runner-image-licenses:
+        description: >-
+          JSON object of runner image name to the SPDX expression of everything
+          it ships (the caller's policy step). An image it does not name takes
+          image-licenses.
+        type: string
+        default: "{}"
       binaries:
         description: >-
           The client a stable Release carries as binaries, <name>=<package>
@@ -132,6 +135,7 @@ on:
 
 env:
   IMAGE_NAME: ${{ github.repository_owner }}/${{ inputs.image-name }}
+  RUNNER_IMAGE_NAME: ${{ github.repository_owner }}/${{ inputs.image-name }}-runner
   REGISTRY: ghcr.io
   # Held one patch behind on purpose. setup-buildx-action resolves the version
   # from docker/actions-toolkit's .github/buildx-releases.json, which a bot
@@ -210,6 +214,9 @@ jobs:
       build-args: ${{ steps.buildargs.outputs.build-args }}
       rebuild_only: ${{ steps.rebuild.outputs.rebuild_only }}
       compare_tag: ${{ steps.rebuild.outputs.compare_tag }}
+      runner-images: ${{ steps.runner.outputs.runner_images }}
+      runner-names: ${{ steps.runner.outputs.runner_names }}
+      runner-promoted: ${{ steps.runner-promote.outputs.runner_promoted }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -400,6 +407,33 @@ jobs:
         with:
           python-version: "3.15"
 
+      # Empty outputs when the repository has no images/<name>/Dockerfile, so
+      # no runner job starts and the app image publishes alone.
+      - name: Plan the runner images
+        id: runner
+        if: ${{ steps.tags.outputs.publish == 'true' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: ${{ inputs.channel }}
+          TAG: ${{ steps.tags.outputs.tag }}
+          LICENSES: ${{ inputs.runner-image-licenses }}
+          DEFAULT_LICENSES: ${{ inputs.image-licenses }}
+        run: |
+          set -euo pipefail
+          plan=$(python3 "$CI_TOOLS/runner_images.py" plan --package "${REGISTRY}/${RUNNER_IMAGE_NAME}" \
+            --channel "$CHANNEL" --tag "$TAG" --sha "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" \
+            --date "$(date -u +%Y-%m-%d)" --created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --licenses "$LICENSES" --default-licenses "$DEFAULT_LICENSES")
+          if [ "$plan" = '[]' ]; then
+            echo "No images/<name>/Dockerfile, so the app image publishes alone."
+            exit 0
+          fi
+          {
+            echo "runner_images=${plan}"
+            echo "runner_names=$(jq -c 'map(.name)' <<<"$plan")"
+          } >> "$GITHUB_OUTPUT"
+          jq -r --arg p "${REGISTRY}/${RUNNER_IMAGE_NAME}" '.[] | "\($p): \(.index_tag), \(.version_tag), \(.moving_tag)"' <<<"$plan"
+
       - name: Resolve promoted digest
         id: promote
         if: ${{ inputs.channel == 'stable' && steps.tags.outputs.publish == 'true' }}
@@ -426,6 +460,28 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           echo "promote_digest=${DIGEST:-<none>} source=${SOURCE}"
+
+      # The runner images follow the app image's dev build when every one of
+      # them has a complete build of the same commit, else all build from source.
+      - name: Resolve the promoted runner images
+        id: runner-promote
+        if: ${{ steps.tags.outputs.publish == 'true' && steps.promote.outputs.promote_digest != '' && steps.runner.outputs.runner_names != '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          EXCLUDE_RE: ${{ inputs.exclude-re }}
+          SUBPACKAGES_JSON: ${{ inputs.subpackages }}
+          SOURCE: ${{ steps.promote.outputs.promote_source }}
+          NAMES: ${{ steps.runner.outputs.runner_names }}
+        run: |
+          set -euo pipefail
+          found=$(python3 "$CI_TOOLS/runner_images.py" promoted --package "$RUNNER_IMAGE_NAME" \
+            --source "$SOURCE" --names "$NAMES")
+          if [ "$found" = '{}' ]; then
+            echo "The runner images build from source."
+            exit 0
+          fi
+          echo "runner_promoted=${found}" >> "$GITHUB_OUTPUT"
+          echo "Promoting the runner images the dev channel built for ${SOURCE}: ${found}"
 
       - name: Scope a rebuild-only release
         id: rebuild
@@ -456,10 +512,11 @@ jobs:
   # precedes every job that writes: build pushes by digest, so skip gates build,
   # finalize's PUBLISH and verify-publish. Its writes are build state only: the
   # GHA cache, which build's amd64 leg can reuse, and buildx's build record
-  # artifact.
+  # artifact. It compares the app image alone, so a repository with runner
+  # images skips it and publishes.
   rebuild-gate:
     needs: prepare
-    if: ${{ needs.prepare.outputs.rebuild_only == 'true' }}
+    if: ${{ needs.prepare.outputs.rebuild_only == 'true' && needs.prepare.outputs.runner-images == '' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
@@ -765,18 +822,309 @@ jobs:
           fi
           ./tests/image-test.sh "$IMAGE_REF"
 
+  # Every runner image for one platform, in build order, pushed by digest
+  # like the app image's build.
+  runner-build:
+    needs: [prepare, rebuild-gate]
+    if: >-
+      ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true'
+        && needs.prepare.outputs.runner-images != '' && needs.prepare.outputs.runner-promoted == ''
+        && needs.rebuild-gate.outputs.skip != 'true' }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # The build context is the workspace root, so the ci source leaves it.
+      - name: Move the ci source out of the build context
+        run: |
+          set -euo pipefail
+          mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
+
+      - name: Log in to GHCR
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          registry_login "$REGISTRY" "$REGISTRY_USERNAME"
+
+      # provenance mode=max publishes the build-arg values, which are the same
+      # date and release tag the app image's build passes.
+      - name: Build and push the runner images by digest
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          PLAN: ${{ needs.prepare.outputs.runner-images }}
+          PACKAGE: ${{ env.REGISTRY }}/${{ env.RUNNER_IMAGE_NAME }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH_NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/runner-images-build.sh" "$PLATFORM" "$ARCH_NAME" "$RUNNER_TEMP/runner-digests"
+
+      - name: Upload digests
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runner-digests-${{ matrix.name }}
+          path: ${{ runner.temp }}/runner-digests/
+          if-no-files-found: error
+          retention-days: 1
+
+  # One runner image under its commit's index tag (this run's build, or the dev
+  # build prepare found for a promotion, unchanged), with finalize's per-image
+  # steps: scan, SBOM, signature and SBOM attestation. No channel tag moves here.
+  runner-publish:
+    needs: [prepare, rebuild-gate, runner-build]
+    if: >-
+      ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true'
+        && needs.prepare.outputs.runner-images != '' && needs.rebuild-gate.outputs.skip != 'true'
+        && (needs.runner-build.result == 'success'
+            || (needs.runner-build.result == 'skipped' && needs.prepare.outputs.runner-promoted != '')) }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.prepare.outputs.runner-names) }}
+    env:
+      PROMOTED_DIGEST: ${{ fromJSON(needs.prepare.outputs.runner-promoted || '{}')[matrix.image] || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The provenance check walks the promoted commit's history.
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Download digests
+        if: ${{ env.PROMOTED_DIGEST == '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/runner-digests
+          pattern: runner-digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+
+      - name: Log in to GHCR
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          registry_login "$REGISTRY" "$REGISTRY_USERNAME"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      # A re-tagged digest is never signed or attested again (finalize's step
+      # of the same name).
+      - name: Verify the promoted build's signature and SBOM
+        if: ${{ env.PROMOTED_DIGEST != '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          EXCLUDE_RE: ${{ inputs.exclude-re }}
+          SUBPACKAGES_JSON: ${{ inputs.subpackages }}
+          PROMOTE_SOURCE: ${{ needs.prepare.outputs.promote_source }}
+          PACKAGE: ${{ env.REGISTRY }}/${{ env.RUNNER_IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" provenance "${PACKAGE}@${PROMOTED_DIGEST}" "$PROMOTE_SOURCE"
+
+      - name: Publish the build on GHCR
+        id: publish
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          PLAN: ${{ needs.prepare.outputs.runner-images }}
+          MATRIX: ${{ needs.prepare.outputs.matrix }}
+          IMAGE: ${{ matrix.image }}
+          PACKAGE: ${{ env.REGISTRY }}/${{ env.RUNNER_IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PROMOTED_DIGEST" ]; then
+            digest=$PROMOTED_DIGEST
+          else
+            PLATFORM_COUNT=$(jq length <<<"$MATRIX")
+            export PLATFORM_COUNT
+            digest=$(bash "$CI_TOOLS/runner-images-publish.sh" index "$IMAGE" "$RUNNER_TEMP/runner-digests")
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "${PACKAGE}@${digest} is ${IMAGE}"
+
+      - name: Install Trivy
+        continue-on-error: true
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/install-trivy.sh"
+
+      # Advisory, with finalize's scan settings.
+      - name: Trivy scan published image
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          skip-setup-trivy: true
+          image-ref: ${{ env.REGISTRY }}/${{ env.RUNNER_IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
+          scanners: 'vuln,secret'
+          format: 'sarif'
+          output: 'trivy-image.sarif'
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        if: ${{ always() && hashFiles('trivy-image.sarif') != '' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: 'trivy-image.sarif'
+          category: trivy-image-runner-${{ matrix.image }}
+
+      # upload-artifact off: the matrix legs would share the action's
+      # default artifact name, and an artifact name can be written once.
+      - name: Generate SBOM (from image)
+        if: ${{ env.PROMOTED_DIGEST == '' }}
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.RUNNER_IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          config: ${{ inputs.syft-config }}
+
+      # Only the summary reads it: the provenance step already refused a
+      # promoted build without an SBOM attestation.
+      - name: Read the promoted build's SBOM
+        if: ${{ env.PROMOTED_DIGEST != '' }}
+        continue-on-error: true
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          EXCLUDE_RE: ${{ inputs.exclude-re }}
+          SUBPACKAGES_JSON: ${{ inputs.subpackages }}
+          IMAGE: ${{ matrix.image }}
+          PACKAGE: ${{ env.REGISTRY }}/${{ env.RUNNER_IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          if ! why=$(bash "$CI_TOOLS/attested-sbom.sh" "${PACKAGE}@${PROMOTED_DIGEST}" "$GITHUB_SHA" sbom.spdx.json); then
+            echo "::warning::the summary lists no packages for ${IMAGE}, because ${why}"
+            exit 1
+          fi
+
+      - name: Shipped package versions summary
+        if: ${{ hashFiles('sbom.spdx.json') != '' }}
+        continue-on-error: true
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/sbom-summary.sh" sbom.spdx.json "Shipped package versions: ${IMAGE}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign the image (recursive, covering each platform)
+        if: ${{ env.PROMOTED_DIGEST == '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.RUNNER_IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          retry cosign sign --yes --recursive "$IMAGE_REF"
+
+      - name: Attest SBOM to GHCR
+        if: ${{ env.PROMOTED_DIGEST == '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.RUNNER_IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          retry cosign attest --yes --predicate sbom.spdx.json --type spdxjson "$IMAGE_REF"
+
+      - name: Hand the signed digest on
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/runner-index"
+          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/runner-index/${IMAGE}"
+
+      - name: Upload the signed digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runner-index-${{ matrix.image }}
+          path: ${{ runner.temp }}/runner-index/${{ matrix.image }}
+          if-no-files-found: error
+          retention-days: 1
+
   # Runs whether or not `build` did (a promotion has no build; a stable push
   # with nothing to publish still refreshes the Docker Hub description).
   finalize:
-    needs: [prepare, rebuild-gate, build, image-test]
+    needs: [prepare, rebuild-gate, build, image-test, runner-publish]
     # A run cancelled before build starts (while the gate builds, say) leaves build
     # skipped, not cancelled, so cancelled() names that cancel. A timed-out gate is
     # no run cancel, so its build still publishes through here. image-test is
     # skipped with no build or no amd64 leg, and by a cancel; only the cancel
-    # holds a pushed build back untested.
-    if: ${{ always() && needs.prepare.result == 'success' && needs.build.result != 'failure' && needs.build.result != 'cancelled' && (needs.build.result != 'skipped' || !cancelled()) && (needs.image-test.result == 'success' || (needs.image-test.result == 'skipped' && !cancelled())) }}
+    # holds a pushed build back untested. Runner images exist only when the run
+    # publishes, so a repository with them waits for every one to be signed.
+    if: >-
+      ${{ always() && needs.prepare.result == 'success' && needs.build.result != 'failure' && needs.build.result != 'cancelled'
+        && (needs.build.result != 'skipped' || !cancelled())
+        && (needs.image-test.result == 'success' || (needs.image-test.result == 'skipped' && !cancelled()))
+        && (needs.prepare.outputs.runner-images == '' || needs.runner-publish.result == 'success') }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 15
+    timeout-minutes: ${{ needs.prepare.outputs.runner-images != '' && 45 || 15 }}
     permissions:
       contents: write
       statuses: write
@@ -812,41 +1160,17 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
-      # Refuse a BACKWARD publish: a rerun of an older run rejoins after its
-      # successor released, `prepare` is not re-attempted, and every publish
-      # step would push the channel's whole tag set from the older commit and
-      # sign it at the released version (measured 2026-09-04, docker-renovate-
-      # scheduler: a rerun republished v3.3.13 on both registries from the
-      # parent commit before the end-of-job tag guard refused). Direction is
-      # the test: equal, absent and forward proceed; backward, diverged and an
-      # unanswerable compare are refused, and each has nothing left to publish.
+      # A rerun of an older run rejoins after its successor released, and
+      # `prepare` is not re-attempted, so this runs before the first write.
       - name: Version ownership gate
         if: ${{ env.PUBLISH == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           VERSION: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          if ! EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null); then
-            echo "::notice::${VERSION} is not tagged yet; publishing."
-            exit 0
-          fi
-          if [ "$EXISTING" = "$GITHUB_SHA" ]; then
-            echo "::notice::${VERSION} already names this commit; publishing."
-            exit 0
-          fi
-          STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${GITHUB_SHA}...${EXISTING}" \
-            --jq .status 2>/dev/null || echo "unknown")
-          if [ "$STATUS" = "behind" ]; then
-            echo "::notice::${VERSION} names ${EXISTING}, an ancestor of ${GITHUB_SHA}; publishing forward."
-            exit 0
-          fi
-          MSG="refusing to publish ${VERSION}: its tag names ${EXISTING} and this run built ${GITHUB_SHA}"
-          MSG="${MSG} (compare status: ${STATUS}). Publishing would overwrite the released image with an"
-          MSG="${MSG} older build and sign it at that version. The commit at ${EXISTING} already carries"
-          MSG="${MSG} this version, so a rerun has nothing to publish."
-          echo "::error::${MSG}"
-          exit 1
+          bash "$CI_TOOLS/version-owner.sh" "$VERSION"
 
       - name: Download digests
         if: ${{ needs.build.result == 'success' }}
@@ -854,6 +1178,14 @@ jobs:
         with:
           path: /tmp/digests
           pattern: digests-*
+          merge-multiple: true
+
+      - name: Download the signed runner digests
+        if: ${{ env.PUBLISH == 'true' && needs.prepare.outputs.runner-images != '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/runner-index
+          pattern: runner-index-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -964,6 +1296,19 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Manifest digest: $digest (built=${BUILT})"
 
+      # Right after the app's channel tags and after every refusal above, so a
+      # refused release moves no runner tag, and a failure from here on is a
+      # post-tag failure a rerun of this job completes.
+      - name: Publish the runner images' channel tags on GHCR
+        if: ${{ env.PUBLISH == 'true' && needs.prepare.outputs.runner-images != '' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          PLAN: ${{ needs.prepare.outputs.runner-images }}
+          PACKAGE: ${{ env.REGISTRY }}/${{ env.RUNNER_IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/runner-images-publish.sh" tags "$RUNNER_TEMP/runner-index"
+
       - name: Render image-size badge JSON
         # Self-published size badge: sum the linux/amd64 compressed (download)
         # layer sizes of the published index and write a shields `endpoint`
@@ -1010,34 +1355,20 @@ jobs:
           filename: size.json
           json: ${{ steps.sizebadge.outputs.json }}
 
-      # ADVISORY, and the only CVE layer; a promotion re-scans the dev digest
-      # so a stable release carries a scan of its own date. A fixable HIGH in a
-      # base image is answered by a base-digest bump or `PKG_REFRESH`, never by
-      # failing this run. `scanners` is pinned explicitly: Trivy's image default
-      # is [vuln,secret], and image-layer secret detection (a build ARG, a
-      # gitignored COPY, the base image) is coverage gitleaks' git-tree scan
-      # cannot provide, so a Trivy default change must not silently drop it.
-      # trivy-action's own installer downloads from get.trivy.dev, which
-      # stopped resolving on 2026-11-03
-      # (https://github.com/aquasecurity/setup-trivy/issues/42).
       - name: Install Trivy
         if: ${{ env.PUBLISH == 'true' }}
         continue-on-error: true
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
-          tgz="trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz"
-          base="https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}"
-          for f in "$tgz" "$tgz.sigstore.json"; do
-            curl -fsSL --connect-timeout 10 --max-time 120 --retry 7 --retry-max-time 150 --retry-all-errors \
-              -o "$RUNNER_TEMP/$f" "$base/$f"
-          done
-          cosign verify-blob --bundle "$RUNNER_TEMP/$tgz.sigstore.json" \
-            --certificate-identity "https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/${TRIVY_VERSION}" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$RUNNER_TEMP/$tgz"
-          mkdir -p "$RUNNER_TEMP/trivy-bin"
-          tar xzf "$RUNNER_TEMP/$tgz" -C "$RUNNER_TEMP/trivy-bin" trivy
-          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+          bash "$CI_TOOLS/install-trivy.sh"
 
+      # ADVISORY, and the only CVE layer; a promotion re-scans the dev digest
+      # so a stable release carries a scan of its own date. `scanners` is
+      # pinned: image-layer secret detection (a build ARG, a gitignored COPY,
+      # the base image) is coverage gitleaks' git-tree scan cannot provide, so
+      # a change of Trivy's default must not drop it.
       - name: Trivy scan published image
         if: ${{ env.PUBLISH == 'true' }}
         continue-on-error: true
@@ -1077,32 +1408,11 @@ jobs:
       - name: Shipped package versions summary
         if: ${{ env.PUBLISH == 'true' }}
         continue-on-error: true
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
-          SBOM=sbom.spdx.json
-          {
-            echo "## Shipped package versions"
-            echo ""
-            echo "| Package | Version |"
-            echo "|---|---|"
-            # Exclude the SPDX document root (the image itself; syft links it
-            # via a DESCRIBES relationship), sort, dedupe. Capped at 400 rows
-            # to keep the summary bounded for module-heavy Go images.
-            jq -r '
-              ( [ .documentDescribes // [] | .[] ]
-                + [ .relationships[]?
-                    | select(.relationshipType == "DESCRIBES"
-                             and .spdxElementId == "SPDXRef-DOCUMENT")
-                    | .relatedSpdxElement ] ) as $roots
-              | [ .packages[]?
-                  | select(.SPDXID as $id | ($roots | index($id)) == null)
-                  | "| \(.name) | \(.versionInfo // "(none)") |" ]
-              | sort | unique
-              | if length > 400 then
-                  .[0:400] + ["", "(+ \(length - 400) more; the full inventory ships in sbom.spdx.json as registry attestation and release asset)"]
-                else . end
-              | .[]' "$SBOM"
-          } >> "$GITHUB_STEP_SUMMARY"
+          bash "$CI_TOOLS/sbom-summary.sh" sbom.spdx.json >> "$GITHUB_STEP_SUMMARY"
 
       # A promoted digest already carries the dev build's signature and
       # attestations (they are referrers of the digest, not of a tag), so only

@@ -1,45 +1,33 @@
 #!/usr/bin/env bash
-#
-# Print the repo names present in a directory of downloaded workflow artifacts,
-# one per line, read from the meta.json each artifact carries.
-#
-# Usage: discover-artifact-repos.sh <artifacts-dir>
-#
-# Exit 0 with names on stdout, or exit 0 silently when nothing was downloaded at
-# all. Exit 3 when artifacts ARE present but no repo can be read from any of
-# them, because that is a defect and the caller must go red rather than quietly
-# process zero repos.
-#
-# WHY THIS IS NOT A GLOB IN THE CALLER. Every caller used to discover repos from
-# the per-artifact DIRECTORY, either by globbing `<name>-*/meta.json` or by
-# parsing the directory name. actions/download-artifact only creates that
-# directory when MORE THAN ONE artifact matched its pattern — its own docs say a
-# single matched artifact is "extracted directly to the specified path" — so a run
-# with exactly one matching artifact extracts flat and every one of those
-# discoveries found nothing. It found nothing SILENTLY: no tracker issue updated,
-# no badge published, no warning, job green. Measured 2026-09-13 on a single-repo
-# weekly-stryker dispatch, which published a correct 95.5% badge from the run job
-# and left the tracker untouched from the aggregate job.
-#
-# So depth is not something a caller may assume, and the artifact's identity has
-# to live in its payload rather than in its name. Probed by
-# scripts/test-discover-artifact-repos.sh.
+# Usage: discover-artifact-repos.sh [--allow '<repo> ...'] <artifacts-dir>
+# Prints, one per line, the repos named by the meta.json of each downloaded
+# artifact (download-artifact extracts a single match with no directory, so the
+# name is never read from a path). --allow keeps only the listed repos and warns
+# on others; an empty list keeps none. Exit 0, silent when nothing was
+# downloaded; exit 3 when artifacts are present but name no repo, which the
+# caller goes red on. Probed by scripts/test-discover-artifact-repos.sh.
 set -uo pipefail
 
-dir="${1:-}"
-if [ -z "$dir" ]; then
-  echo "usage: $(basename -- "$0") <artifacts-dir>" >&2
+usage() {
+  echo "usage: $(basename -- "$0") [--allow '<repo> ...'] <artifacts-dir>" >&2
   exit 2
+}
+
+filter=0
+allowed=""
+if [ "${1:-}" = --allow ]; then
+  [ "$#" -ge 2 ] || usage
+  filter=1
+  allowed=" $2 "
+  shift 2
 fi
+dir="${1:-}"
+[ -n "$dir" ] || usage
 
 metas=$(find "$dir" -name meta.json 2>/dev/null | sort || true)
 
-# One jq per file, deliberately. Handing jq the whole list is shorter and
-# order-dependently wrong: jq aborts on the first file it cannot parse, so a
-# single malformed meta.json suppresses every repo whose path sorts after it.
-# Measured while writing the probe (a 'bad' directory sorting before a 'good'
-# one lost the good repo entirely), which would have been a worse silent skip
-# than the one this script exists to fix.
+# One jq per file: jq aborts on the first file it cannot parse, so handing it
+# the whole list loses every repo whose meta.json sorts after a malformed one.
 repos=""
 while IFS= read -r meta; do
   [ -n "$meta" ] || continue
@@ -54,13 +42,23 @@ done < <(printf '%s\n' "$metas")
 repos=$(printf '%s' "$repos" | grep -v '^$' | sort -u || true)
 
 if [ -n "$repos" ]; then
-  printf '%s\n' "$repos"
+  if [ "$filter" -eq 1 ]; then
+    kept=""
+    while IFS= read -r repo; do
+      case "$allowed" in
+        *" $repo "*) kept="${kept}${repo}"$'\n' ;;
+        *) echo "::warning::an artifact names '${repo}', which this run did not schedule, so it is skipped" >&2 ;;
+      esac
+    done <<<"$repos"
+    printf '%s' "$kept"
+  else
+    printf '%s\n' "$repos"
+  fi
   exit 0
 fi
 
 # Nothing downloaded is legitimate: every matrix entry is allowed to fail, and
-# each one's own red is the signal. Files present with no repo readable from them
-# is the layout defect above.
+# each one's own red is the signal.
 if [ -n "$(find "$dir" -type f 2>/dev/null | head -1)" ]; then
   echo "::error::artifacts were downloaded to '${dir}' but no repo could be read from any meta.json" >&2
   find "$dir" 2>/dev/null | head -20 >&2

@@ -34,6 +34,9 @@ OWN_ACTION = re.compile(r'^cplieger/ci/actions/([A-Za-z0-9_-]+)@')
 LOCAL_ACTION = re.compile(r'^\./([A-Za-z0-9_./-]+)$')
 CI_REPOSITORY = 'cplieger/ci'
 EXPR = re.compile(r'\$\{\{(.*?)\}\}', re.DOTALL)
+# One expression and nothing around it: fullmatch would let EXPR span
+# `${{ a }}:${{ b }}` as one.
+WHOLE_EXPR = re.compile(r'\$\{\{((?:(?!\}\}).)*)\}\}', re.DOTALL)
 TOKEN = re.compile(
     r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<num>\d+(?:\.\d+)?)|(?P<op>==|!=|<=|>=|&&|\|\||[!<>()\[\].,])"
     r'|(?P<id>[A-Za-z_][A-Za-z0-9_-]*))'
@@ -274,7 +277,7 @@ class Scope:
     def render(self, value) -> str:
         if not isinstance(value, str):
             return to_str(value)
-        whole = EXPR.fullmatch(value.strip())
+        whole = WHOLE_EXPR.fullmatch(value.strip())
         if whole:
             return to_str(self.evaluate(whole.group(1)))
         return EXPR.sub(lambda m: to_str(self.evaluate(m.group(1))), value)
@@ -285,7 +288,7 @@ class Scope:
         if isinstance(cond, bool):
             return cond
         text = str(cond).strip()
-        whole = EXPR.fullmatch(text)
+        whole = WHOLE_EXPR.fullmatch(text)
         return truthy(self.evaluate(whole.group(1) if whole else text))
 
 
@@ -335,7 +338,7 @@ def job_condition(workflow: dict, job_name: str, contexts: dict, log: list) -> b
     if isinstance(cond, bool):
         return cond
     text = str(cond).strip()
-    whole = EXPR.fullmatch(text)
+    whole = WHOLE_EXPR.fullmatch(text)
     text = (whole.group(1) if whole else text).strip()
     if not STATUS_CALL.search(text):
         text = f'success() && ({text})'

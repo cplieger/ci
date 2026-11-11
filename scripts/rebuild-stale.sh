@@ -1,16 +1,5 @@
 #!/usr/bin/env bash
-# Base-package rebuilds for rebuild-stale.yaml.
-#   fanout                           GH_TOKEN, INTERVAL_DAYS, GITHUB_STEP_SUMMARY and
-#                                    GITHUB_OUTPUT; writes the dispatch matrix
-#   image-created <repo> <tag>       the build time of ghcr.io/cplieger/<repo>:<tag>, read
-#                                    anonymously; exit 3 when the tag does not exist
-#   open-pr <repo> <base> <reason>   GH_TOKEN; an auto-merging empty fix(deps) pull request
-#                                    into <base> (dev or main), or a merge re-request on the open one
-#   stale-pr <repo> <base> <tag> <age-days> <built> <since>   open-pr with the staleness reason,
-#                                    opening nothing once a rebuild request merged at or after a
-#                                    non-empty <since>
-#   dispatch <repo> <bases>          GH_TOKEN and GITHUB_STEP_SUMMARY; stale-pr for each of a matrix
-#                                    leg's bases in turn, failing once any base failed or is unreadable
+# Base-package rebuilds for rebuild-stale.yaml; usage() lists the commands.
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,7 +12,19 @@ MANIFEST_TYPES='application/vnd.oci.image.manifest.v1+json, application/vnd.dock
 REBUILD_SUBJECT='fix(deps): rebuild against refreshed base packages'
 
 usage() {
-  sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  cat >&2 <<'EOF'
+  fanout                           GH_TOKEN, INTERVAL_DAYS, GITHUB_STEP_SUMMARY and
+                                   GITHUB_OUTPUT; writes the dispatch matrix
+  image-created <repo> <tag>       the build time of ghcr.io/cplieger/<repo>:<tag>, read
+                                   anonymously; exit 3 when the tag does not exist
+  open-pr <repo> <base> <reason>   GH_TOKEN; an auto-merging empty fix(deps) pull request
+                                   into <base> (dev or main), or a merge re-request on the open one
+  stale-pr <repo> <base> <tag> <age-days> <built> <since> [image]   open-pr with the staleness
+                                   reason (naming a runner image when given), opening nothing once
+                                   a rebuild request merged at or after a non-empty <since>
+  dispatch <repo> <bases>          GH_TOKEN and GITHUB_STEP_SUMMARY; stale-pr for each of a matrix
+                                   leg's bases in turn, failing once any base failed or is unreadable
+EOF
   exit 2
 }
 
@@ -251,22 +252,23 @@ open_pr() { # <repo> <base> <reason> [since]
   request_merge "$url"
 }
 
-stale_pr() { # <repo> <base> <tag> <age-days> <built> <since>
+stale_pr() { # <repo> <base> <tag> <age-days> <built> <since> [runner image ref]
+  local image="${7:-:${3}}"
   if [ "$5" = "not published" ]; then
-    open_pr "$1" "$2" "No \`:${3}\` image is published." "$6"
+    open_pr "$1" "$2" "No \`${image}\` image is published." "$6"
   else
-    open_pr "$1" "$2" "The \`:${3}\` image is ${4} days old (built ${5})." "$6"
+    open_pr "$1" "$2" "The \`${image}\` image is ${4} days old (built ${5})." "$6"
   fi
 }
 
 # Each base runs stale-pr as its own process, so one base's failure under set -e
 # leaves the next base handled.
 dispatch() { # <repo> <bases JSON: fanout's rows of that repo, main first>
-  local repo=$1 rows base channel last age since unreadable outcome failed=0
+  local repo=$1 rows base channel last age since unreadable image outcome failed=0
   # U+001F, not a tab: read collapses adjacent whitespace separators, which would
   # shift every field after an empty since.
   if ! rows=$(jq -r 'if type == "array" and all(.[]; type == "object" and (.base | type) == "string")
-      then .[] | [.base, .channel, .last, .age_days, (.since // ""), (.unreadable // "")] | join("\u001f")
+      then .[] | [.base, .channel, .last, .age_days, (.since // ""), (.unreadable // ""), (.image // "")] | join("\u001f")
       else error("not fanout rows") end' <<<"$2" 2>/dev/null); then
     echo "::error::dispatch: the bases of cplieger/${repo} are not fanout rows: $2" >&2
     exit 2
@@ -275,15 +277,15 @@ dispatch() { # <repo> <bases JSON: fanout's rows of that repo, main first>
     echo "| Repo | Base | Channel | Outcome |"
     echo "|---|---|---|---|"
   } >>"$GITHUB_STEP_SUMMARY"
-  while IFS=$'\x1f' read -r base channel last age since unreadable; do
+  while IFS=$'\x1f' read -r base channel last age since unreadable image; do
     [ -n "$base" ] || continue
     if [ -n "$unreadable" ]; then
-      echo "::error::ghcr.io/cplieger/${repo}:${channel} (${base}) did not read, so its age is unknown and nothing was rebuilt. ${unreadable}"
+      echo "::error::ghcr.io/cplieger/${image:-${repo}:${channel}} (${base}) did not read, so its age is unknown and nothing was rebuilt. ${unreadable}"
       outcome=unreadable
     else
       echo "::group::cplieger/${repo}: ${base} (:${channel})"
       outcome="done"
-      bash "${BASH_SOURCE[0]}" stale-pr "$repo" "$base" "$channel" "$age" "$last" "$since" </dev/null || outcome=failed
+      bash "${BASH_SOURCE[0]}" stale-pr "$repo" "$base" "$channel" "$age" "$last" "$since" ${image:+"$image"} </dev/null || outcome=failed
       echo "::endgroup::"
       [ "$outcome" = "done" ] || echo "::error::cplieger/${repo}: the rebuild of ${base} (:${channel}) failed. Its log is above."
     fi
@@ -319,31 +321,39 @@ fanout() {
   # A channel ages by its published image, because a promotion re-tags a dev
   # digest and its run says nothing about when that image was built, unless a rebuild
   # request merged within the interval, which the rebuild gate may have answered with no image.
+  # The images are the app's and each runner image beside it (runner_images.py); the
+  # rebuild request a stale one opens rebuilds all of a channel's images.
   two_branch_rows() { # <repo>
-    local r=$1 base tag content dockerfile created rc ts age_secs age_days interval decision since req
+    local r=$1 base tag interval names n rebuilt absent
     interval="${INTERVAL_OVERRIDES[$r]:-$INTERVAL_DAYS}"
-    add_channel() { # <base> <tag> <last> <age-days> <since or empty> [unreadable reason]
+    add_channel() { # <base> <tag> <last> <age-days> <since or empty> [unreadable reason] [runner image ref]
       STALE=$(jq -c --arg r "$r" --arg base "$1" --arg tag "$2" --arg l "$3" --arg a "$4" --arg s "$5" --arg u "${6:-}" \
+        --arg i "${7:-}" \
         '. + [{repo: $r, base: $base, channel: $tag, last: $l, age_days: $a}
               + (if $s == "" then {} else {since: $s} end)
-              + (if $u == "" then {} else {unreadable: $u} end)]' <<<"$STALE")
+              + (if $u == "" then {} else {unreadable: $u} end)
+              + (if $i == "" then {} else {image: $i} end)]' <<<"$STALE")
     }
-    unreadable_channel() { # <base> <tag> <reason>
-      add_channel "$1" "$2" "unreadable" "n/a" "" "$3"
-      echo "| ${r} (${1}, :${2}) | unreadable: ${3} | n/a | ${interval} | **unreadable** |" >>"$GITHUB_STEP_SUMMARY"
+    unreadable_channel() { # <base> <tag> <reason> [runner image ref]
+      add_channel "$1" "$2" "unreadable" "n/a" "" "$3" "${4:-}"
+      echo "| ${r} (${1}, ${4:-:${2}}) | unreadable: ${3} | n/a | ${interval} | **unreadable** |" >>"$GITHUB_STEP_SUMMARY"
     }
-    for base in main dev; do
-      tag=dev
-      [ "$base" = main ] && tag=latest
-      # Only a 404 means the base has no Dockerfile; any other failed read is a row.
-      if ! content=$(gh_read "repos/cplieger/${r}/contents/Dockerfile?ref=${base}" --jq '.content' 2>"$WORK/contents.err"); then
-        grep -q 'HTTP 404' "$WORK/contents.err" && continue
-        unreadable_channel "$base" "$tag" "the Dockerfile on ${base} could not be read: $(head -n 1 "$WORK/contents.err")"
-        continue
+    # One image of a channel; sets absent when the base has no such Dockerfile.
+    image_row() { # <base> <tag> <Dockerfile path> <package> <package tag> <runner image ref or empty>
+      local base=$1 tag=$2 path=$3 pkg=$4 ptag=$5 ref=$6 label content dockerfile created rc ts age_secs age_days decision since req
+      label="${ref:-:${tag}}"
+      # Only a 404 means the base has no such Dockerfile; any other failed read is a row.
+      if ! content=$(gh_read "repos/cplieger/${r}/contents/${path}?ref=${base}" --jq '.content' 2>"$WORK/contents.err"); then
+        if grep -q 'HTTP 404' "$WORK/contents.err"; then
+          absent=1
+          return 0
+        fi
+        unreadable_channel "$base" "$tag" "the ${path} on ${base} could not be read: $(head -n 1 "$WORK/contents.err")" "$ref"
+        return 0
       fi
       if ! dockerfile=$(base64 -d 2>/dev/null <<<"$content") || [ -z "$dockerfile" ]; then
-        unreadable_channel "$base" "$tag" "the Dockerfile on ${base} did not decode as base64 content"
-        continue
+        unreadable_channel "$base" "$tag" "the ${path} on ${base} did not decode as base64 content" "$ref"
+        return 0
       fi
       # Read as Docker runs it, so a continued or exec-form install counts, and only
       # an install a new PKG_REFRESH reaches is rebuilt rather than restored from cache.
@@ -351,35 +361,36 @@ fanout() {
       python3 "$TOOLS/release_maintenance.py" rebuild-refreshes <<<"$dockerfile" 2>"$WORK/installs.err" || rc=$?
       case "$rc" in
         0) ;;
-        3) continue ;;
+        3) return 0 ;;
         4)
-          echo "::warning::cplieger/${r}: the Dockerfile on ${base} installs packages in no layer PKG_REFRESH reaches, so a rebuild would reuse the cached packages"
-          echo "| ${r} (${base}, :${tag}) | not refreshed by a rebuild | n/a | ${interval} | **no PKG_REFRESH** |" >>"$GITHUB_STEP_SUMMARY"
-          continue
+          echo "::warning::cplieger/${r}: the ${path} on ${base} installs packages in no layer PKG_REFRESH reaches, so a rebuild would reuse the cached packages"
+          echo "| ${r} (${base}, ${label}) | not refreshed by a rebuild | n/a | ${interval} | **no PKG_REFRESH** |" >>"$GITHUB_STEP_SUMMARY"
+          return 0
           ;;
         *)
-          unreadable_channel "$base" "$tag" "the Dockerfile on ${base} could not be parsed: $(tail -n 1 "$WORK/installs.err")"
-          continue
+          unreadable_channel "$base" "$tag" "the ${path} on ${base} could not be parsed: $(tail -n 1 "$WORK/installs.err")" "$ref"
+          return 0
           ;;
       esac
       rc=0
-      created=$(image_created "$r" "$tag" 2>"$WORK/created.err") || rc=$?
+      created=$(image_created "$pkg" "$ptag" 2>"$WORK/created.err") || rc=$?
       case "$rc" in
         0) ;;
         3)
-          add_channel "$base" "$tag" "not published" "n/a" ""
-          echo "| ${r} (${base}, :${tag}) | not published | n/a | ${interval} | **rebuild** |" >>"$GITHUB_STEP_SUMMARY"
-          continue
+          [ -n "$rebuilt" ] || add_channel "$base" "$tag" "not published" "n/a" "" "" "$ref"
+          rebuilt=1
+          echo "| ${r} (${base}, ${label}) | not published | n/a | ${interval} | **rebuild** |" >>"$GITHUB_STEP_SUMMARY"
+          return 0
           ;;
         *)
-          unreadable_channel "$base" "$tag" "$(head -n 1 "$WORK/created.err")"
-          continue
+          unreadable_channel "$base" "$tag" "$(head -n 1 "$WORK/created.err")" "$ref"
+          return 0
           ;;
       esac
       ts=$(date -u -d "$created" +%s 2>/dev/null) || ts=""
       if [ -z "$ts" ]; then
-        unreadable_channel "$base" "$tag" "the image creation time ${created} does not parse"
-        continue
+        unreadable_channel "$base" "$tag" "the image creation time ${created} does not parse" "$ref"
+        return 0
       fi
       age_secs=$((now - ts))
       age_days=$((age_secs / 86400))
@@ -393,13 +404,35 @@ fanout() {
         if [ -n "$req" ]; then
           decision="fresh (rebuild requested ${req})"
         else
-          add_channel "$base" "$tag" "$created" "$age_days" "$since"
+          [ -n "$rebuilt" ] || add_channel "$base" "$tag" "$created" "$age_days" "$since" "" "$ref"
+          rebuilt=1
           decision="**rebuild**"
         fi
       else
         decision="fresh"
       fi
-      echo "| ${r} (${base}, :${tag}) | ${created} | ${age_days} | ${interval} | ${decision} |" >>"$GITHUB_STEP_SUMMARY"
+      echo "| ${r} (${base}, ${label}) | ${created} | ${age_days} | ${interval} | ${decision} |" >>"$GITHUB_STEP_SUMMARY"
+    }
+    for base in main dev; do
+      tag=dev
+      [ "$base" = main ] && tag=latest
+      rebuilt="" absent=""
+      image_row "$base" "$tag" Dockerfile "$r" "$tag" ""
+      [ -z "$absent" ] || continue
+      if ! names=$(gh_read "repos/cplieger/${r}/contents/images?ref=${base}" \
+        --jq 'if type == "array" then .[] | select(.type == "dir" and (.name | test("^[a-z0-9]{1,32}$"))) | .name else empty end' \
+        2>"$WORK/images.err"); then
+        grep -q 'HTTP 404' "$WORK/images.err" && continue
+        unreadable_channel "$base" "$tag" "the images/ directory on ${base} could not be listed: $(head -n 1 "$WORK/images.err")"
+        continue
+      fi
+      for n in $names; do
+        if [ "$base" = main ]; then
+          image_row "$base" "$tag" "images/${n}/Dockerfile" "${r}-runner" "$n" "${r}-runner:${n}"
+        else
+          image_row "$base" "$tag" "images/${n}/Dockerfile" "${r}-runner" "${n}-dev" "${r}-runner:${n}-dev"
+        fi
+      done
     done
   }
 
@@ -442,8 +475,8 @@ case "${1:-}" in
     open_pr "$2" "$3" "$4"
     ;;
   stale-pr)
-    [ "$#" -eq 7 ] || usage
-    stale_pr "$2" "$3" "$4" "$5" "$6" "$7"
+    [ "$#" -eq 7 ] || [ "$#" -eq 8 ] || usage
+    stale_pr "${@:2}"
     ;;
   dispatch)
     [ "$#" -eq 3 ] || usage

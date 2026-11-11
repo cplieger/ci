@@ -36,8 +36,8 @@ concurrency:
 jobs:
   # `go test ./...` compiles a benchmark and never executes it, so an unenrolled
   # one can rot unseen. This job runs every non-enrolled `func Benchmark` once,
-  # to prove it still runs; the enrolled set comes from fanout's output, so
-  # enrolment needs no edit here. One job rather than a matrix: the work is
+  # to prove it still runs; the fanout lists the repositories, so enrolment
+  # needs no edit here. One job rather than a matrix: the work is
   # about a second per repo, less than a leg's checkout and toolchain setup.
   smoke:
     needs: fanout
@@ -50,9 +50,52 @@ jobs:
           go-version: stable
           cache: false
 
+      # Anonymous clones of the fanout's public repositories: the next step
+      # runs each repo's code, so this job holds no secret.
+      - name: Clone every unenrolled repo carrying benchmarks
+        id: clone
+        env:
+          # Injected via env rather than inlined in the body so the value
+          # cannot expand into shell code.
+          UNENROLLED: ${{ needs.fanout.outputs.unenrolled }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "$UNENROLLED" ]; then
+            # Without this no repo is cloned, the next step checks none, and the
+            # job exits 0 having verified nothing - the same vacuous green this
+            # job exists to catch in other people's benchmarks.
+            echo "::error::the fanout listed no unenrolled repository"
+            exit 1
+          fi
+
+          : > "${RUNNER_TEMP}/bench-smoke-repos"
+          skipped=0
+          for r in $UNENROLLED; do
+            dest="scan/${r}"
+            # Bounded individually. This loop is serial over every unenrolled
+            # repo, so one wedged clone would otherwise consume the job timeout
+            # and the log would not say which repo did it. 120s is generous for
+            # a --depth 1 clone. Plain git over HTTPS draws no API quota, so a
+            # rate-limited run can still clone; the gh CLI would resolve through
+            # GraphQL, whose quota this run may already have spent.
+            if ! timeout 120 git clone --depth 1 "https://github.com/cplieger/${r}.git" "$dest" >/dev/null 2>&1; then
+              echo "::warning::clone failed or timed out for ${r} - skipping"
+              rm -rf "$dest"
+              continue
+            fi
+            if [ ! -f "${dest}/go.mod" ] \
+                || ! grep -rq --include='*_test.go' 'func Benchmark' "$dest" 2>/dev/null; then
+              skipped=$((skipped + 1))
+              rm -rf "$dest"
+              continue
+            fi
+            printf '%s\n' "$r" >> "${RUNNER_TEMP}/bench-smoke-repos"
+          done
+          echo "skipped=${skipped}" >> "$GITHUB_OUTPUT"
+
       - name: Execute every unenrolled benchmark once
         env:
-          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
           # setup-go exports GOTOOLCHAIN=local, and `go-version: stable` above
           # resolves ONLY from actions/go-versions' manifest, which lags an
           # upstream Go patch tag by hours while Renovate bumps every consumer's
@@ -62,60 +105,16 @@ jobs:
           # X-1)` (go1.27.1, run 33573180820). Same workaround as
           # deadset-ci.yaml's Install deadset.
           GOTOOLCHAIN: auto
-          # From the fanout job, never restated here. Injected via env rather
-          # than inlined in the body so the value cannot expand into shell code.
-          ENROLLED: ${{ needs.fanout.outputs.enrolled }}
+          SKIPPED: ${{ steps.clone.outputs.skipped }}
         run: |
           set -uo pipefail
 
-          # One-shot clone auth, built once for the loop below (top-level
-          # `git -c`, never persisted into scan/.git/config).
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          # Repo discovery over REST, not the GraphQL `gh repo list`: GraphQL
-          # shares a quota the per-repo clones draw too, and this guard already
-          # fails the job closed when discovery returns nothing. Forks are
-          # excluded (same rule as scripts/audit.py): a fork's tree is
-          # UPSTREAM's, so its benchmarks are someone else's.
-          if ! live=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
-            .[] | select(.archived == false and .fork == false) | .name
-          '); then
-            echo "::error::repo discovery failed; refusing to report green having checked nothing"
-            exit 1
-          fi
-          if [ -z "$live" ]; then
-            # Without this the loop body never runs, checked stays 0, and the job
-            # exits 0 having verified nothing - the same vacuous green this job
-            # exists to catch in other people's benchmarks.
-            echo "::error::repo discovery returned no repositories"
-            exit 1
-          fi
-
+          mapfile -t repos < "${RUNNER_TEMP}/bench-smoke-repos"
           broken=""
           checked=0
-          skipped=0
-          for r in $live; do
-            case " $ENROLLED " in *" $r "*) continue ;; esac
-
-            rm -rf scan
-            # Bounded individually. This loop is serial over every unenrolled
-            # repo, so one wedged clone or module download would otherwise
-            # consume the job timeout and the log would not say which repo did
-            # it. 120s is generous for a --depth 1 clone. Plain git over HTTPS
-            # draws no API quota, so a rate-limited run can still clone; the gh
-            # CLI would resolve through GraphQL, whose quota this run may already
-            # have spent.
-            if ! timeout 120 git -c "http.https://github.com/.extraheader=${auth}" \
-                clone --depth 1 "https://github.com/cplieger/${r}.git" scan >/dev/null 2>&1; then
-              echo "::warning::clone failed or timed out for ${r} - skipping"
-              continue
-            fi
-            [ -f scan/go.mod ] || { skipped=$((skipped + 1)); continue; }
-            if ! grep -rq --include='*_test.go' 'func Benchmark' scan 2>/dev/null; then
-              skipped=$((skipped + 1))
-              continue
-            fi
-
-            n=$(grep -rh --include='*_test.go' -c 'func Benchmark' scan 2>/dev/null \
+          for r in "${repos[@]}"; do
+            dir="scan/${r}"
+            n=$(grep -rh --include='*_test.go' -c 'func Benchmark' "$dir" 2>/dev/null \
               | awk '{s+=$1} END {print s+0}')
             printf '%-28s %s benchmark(s): ' "$r" "$n"
             checked=$((checked + 1))
@@ -125,7 +124,7 @@ jobs:
             # versions go.mod pins. `go test -C`, not a `cd` subshell, keeps the
             # output redirect and the tail below on the same path. 300s covers
             # a cold module download plus the largest enrolled suite (~10s warm).
-            if GOWORK=off timeout 300 go test -C scan -run='^$' -bench=. -benchtime=1x ./... \
+            if GOWORK=off timeout 300 go test -C "$dir" -run='^$' -bench=. -benchtime=1x ./... \
                 > out.txt 2>&1; then
               echo "ok"
             else
@@ -161,7 +160,7 @@ jobs:
           rm -rf scan out.txt
 
           echo ""
-          echo "checked ${checked} unenrolled repo(s) with benchmarks; skipped ${skipped} without"
+          echo "checked ${checked} unenrolled repo(s) with benchmarks; skipped ${SKIPPED} without"
 
           if [ -n "$broken" ]; then
             # Fail closed. A benchmark that does not run is a process defect,
@@ -176,9 +175,9 @@ jobs:
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
-      # Published so the smoke job can subtract it. One source of truth for the
-      # enrolled set; a second literal would be a drift waiting to happen.
-      enrolled: ${{ steps.fanout.outputs.enrolled }}
+      # The live public repositories ENROLLED leaves out, for the smoke job,
+      # which runs their code and so cannot hold the token the listing needs.
+      unenrolled: ${{ steps.fanout.outputs.unenrolled }}
     steps:
       - name: Discover Go repos carrying benchmarks
         id: fanout
@@ -189,10 +188,6 @@ jobs:
           ONLY: ${{ github.event.inputs.only }}
         run: |
           set -euo pipefail
-
-          # One-shot clone auth, built once for the loops below (top-level
-          # `git -c`, never persisted into scan/.git/config).
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
 
           # The enrolled set, by three criteria: (1) deterministic compute in the
           # TIMED region (no disk, network, sleep or wall clock, enforced per
@@ -209,22 +204,25 @@ jobs:
           ENROLLED="$ENROLLED subflux marotte"                     # the two large apps
           ENROLLED="$ENROLLED auth"                                # per-request auth path, KDF skipped
 
-          # Repo discovery over REST, not the GraphQL `gh repo list`: GraphQL
-          # shares a quota the per-repo clones draw too, so a fanout failure
-          # loses the whole run. Forks are excluded (same rule as
-          # scripts/audit.py): a fork's tree is UPSTREAM's. `tr` is load-bearing:
-          # --jq emits one name per LINE and the liveness test below is a
-          # space-delimited substring match, so without the flattening `*" $r "*`
-          # never matches (a newline is not a space) and every enrolled repo is
-          # rejected as "not live", emptying the matrix and vacuously passing.
+          # REST, not the GraphQL `gh repo list`, whose quota the per-repo clones
+          # draw too. A fork's tree is UPSTREAM's. Public only: this repository's
+          # run logs and artifacts are world-readable (CONTRIBUTING.md). `tr` is
+          # load-bearing: the liveness test below matches `*" $r "*`, which a
+          # newline-separated list never satisfies, emptying the matrix.
           live=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
-            .[] | select(.archived == false and .fork == false) | .name
+            .[] | select(.archived == false and .fork == false and .visibility == "public") | .name
           ' | tr '\n' ' ')
+
+          unenrolled=""
+          for r in $live; do
+            case " $ENROLLED " in *" $r "*) ;; *) unenrolled="$unenrolled $r" ;; esac
+          done
+          echo "unenrolled=${unenrolled# }" >> "$GITHUB_OUTPUT"
 
           repos=""
           for r in $ENROLLED; do
             case " $live " in *" $r "*) repos="$repos $r" ;; *)
-              echo "::warning::enrolled repo '$r' is not live (archived, fork, or renamed) - skipping" ;;
+              echo "::warning::enrolled repo '$r' is not live (archived, fork, private, or renamed) - skipping" ;;
             esac
           done
 
@@ -254,8 +252,7 @@ jobs:
             # Plain git clone over HTTPS draws no API quota, so a rate-limited
             # run can still clone; the gh CLI would resolve through GraphQL,
             # whose quota this run may already have spent.
-            if ! git -c "http.https://github.com/.extraheader=${auth}" \
-                clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
+            if ! git clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
               echo "::warning::clone failed for ${r} - skipping"
               continue
             fi
@@ -287,7 +284,6 @@ jobs:
           rm -rf scan
 
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
-          echo "enrolled=${ENROLLED}" >> "$GITHUB_OUTPUT"
           echo "Total entries: $(printf '%s' "$matrix" | jq 'length')"
 
           # An empty matrix skips the `run` job, which reports the leg green
@@ -313,19 +309,16 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    # CI_SCHEDULE is an org-wide write PAT and it is deliberately NOT job-level env.
-    # This job runs `go test -bench` over code from 18 repositories, so a
-    # job-level token sits in the environment of a step that executes other
-    # people's benchmarks, any one of which could read it with os.Getenv. It is
-    # granted per step, to the two steps that push.
+    # No step here holds CI_SCHEDULE: this job runs other repositories'
+    # benchmarks, which could reach a later step's token through GITHUB_ENV,
+    # GITHUB_PATH or the workspace. The publish job writes the results.
     steps:
       # Checkout ci FIRST (actions/checkout cleans the workspace): this brings
       # scripts/bench-reduce.py, which the consumer repo does not carry.
       - name: Checkout ci (for the reducer)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # No step in this job pushes with checkout-persisted credentials;
-          # the chart push authenticates via CI_SCHEDULE below.
+          # No step in this job pushes with checkout-persisted credentials.
           persist-credentials: false
           path: _ci
 
@@ -498,12 +491,63 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
+  # Writes each repo's medians to its `benchmarks` branch, from the artifact
+  # its run entry uploaded, in a job that runs no benchmarked code.
+  publish:
+    needs: [fanout, run]
+    if: ${{ !cancelled() && needs.fanout.result == 'success' && needs.fanout.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout ci (for the attribution fix)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # the chart push authenticates via CI_SCHEDULE below.
+          persist-credentials: false
+          path: _ci
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      # A pattern that matches nothing downloads nothing and succeeds, which is
+      # the case of a run entry that failed before it wrote any sample.
+      - name: Download this repo's medians
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: bench
+          pattern: bench-raw-${{ matrix.repo }}
+
+      # The run entry uploads its samples even when it fails, so only a
+      # non-empty series of medians is published; that entry's red is the signal.
+      - name: Check the medians
+        id: medians
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          if jq -e 'type == "array" and length > 0' bench/bench.json >/dev/null 2>&1; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::${REPO}: no medians from the run job, so nothing was published"
+          fi
+
       # The action cannot bootstrap a missing data branch (verified in its
       # v1.22.1 dist: gh-repository mode is clone + plain checkout, which fails
       # on a branch that does not exist). Create the empty orphan branch once;
       # every later run sees it and this becomes a no-op. Same bot identity the
       # publish-badge composite uses for its orphan `badges` branch.
       - name: Ensure benchmarks branch exists
+        if: ${{ steps.medians.outputs.ok == 'true' }}
         env:
           REPO: ${{ matrix.repo }}
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
@@ -531,10 +575,11 @@ jobs:
       # fail-on-alert stays false, because a wall-clock regression on a shared
       # runner is evidence to investigate, not proof the code got slower.
       - name: Publish + compare
+        if: ${{ steps.medians.outputs.ok == 'true' }}
         uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
           tool: customSmallerIsBetter
-          output-file-path: ${{ runner.temp }}/bench.json
+          output-file-path: bench/bench.json
           github-token: ${{ secrets.CI_SCHEDULE }}
           gh-repository: github.com/cplieger/${{ matrix.repo }}
           gh-pages-branch: benchmarks
@@ -557,6 +602,7 @@ jobs:
       # v1.22.1 format with this run's ci SHA newest, and round-trips byte-identical,
       # so an unchanged run makes no commit.
       - name: Re-point the data point at the benchmarked commit
+        if: ${{ steps.medians.outputs.ok == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
           REPO: ${{ matrix.repo }}
@@ -596,7 +642,7 @@ jobs:
   # each consumer's `benchmarks` branch, the durable full series, and regenerates
   # the trend table weekly rather than rolling rendered markdown forward.
   aggregate:
-    needs: [fanout, run]
+    needs: [fanout, run, publish]
     if: ${{ always() && needs.fanout.outputs.matrix != '[]' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -690,7 +736,7 @@ jobs:
 
   # `needs:` must list every other job in this workflow.
   notify:
-    needs: [fanout, smoke, run, aggregate]
+    needs: [fanout, smoke, run, publish, aggregate]
     if: always()
     permissions:
       actions: read

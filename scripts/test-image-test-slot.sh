@@ -108,7 +108,19 @@ chk "T3 harness gate" "$(cat "$WORK/harness.if")" "\${{ hashFiles('tests/image-s
 # Exact text: always() evaluates like !cancelled() here but runs on a cancel too.
 chk "T3 suite gate" "$(cat "$WORK/suite.if")" \
   "\${{ !cancelled() && steps.build.outcome == 'success' && hashFiles('tests/image-test.sh') != '' }}"
-chk "T14 docker job budget (minutes)" "$(cat "$WORK/timeout")" "15"
+# The budget is an expression: 15 minutes, or 60 when the repo also builds
+# runner images (images/<name>/Dockerfile) in this job.
+budget() {
+  python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import workflow_replay as wr
+needs = {"detect": {"outputs": {"runner_images": sys.argv[3]}}}
+print(wr.Scope({"needs": needs}, {}, []).render(open(sys.argv[2]).read()))
+' "$ROOT/scripts" "$WORK/timeout" "$1"
+}
+chk "T14 docker job budget (minutes)" "$(budget false)" "15"
+chk "T14 docker job budget with runner images (minutes)" "$(budget true)" "60"
 chk "T15 docker-arm64 runs no image test" "$(cat "$WORK/arm64")" "0"
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────

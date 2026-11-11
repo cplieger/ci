@@ -69,6 +69,7 @@ class Expressions(unittest.TestCase):
         scope = wr.Scope({'a': {'v': True, 'w': 'x'}}, {}, [])
         self.assertEqual(scope.render('${{ a.v }}'), 'true')
         self.assertEqual(scope.render('p-${{ a.w }}-q'), 'p-x-q')
+        self.assertEqual(scope.render('${{ a.w }}:${{ a.v }}'), 'x:true')
 
 
 class JobConditions(unittest.TestCase):
