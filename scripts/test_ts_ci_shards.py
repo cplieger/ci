@@ -511,8 +511,8 @@ class InstallStep(Harness):
                 self.assertEqual(run.logged('npx'), want)
 
     def test_a_self_hosted_runner_installs_without_the_system_libraries(self):
-        """A self-hosted runner has no root for apt, so Firefox and WebKit
-        install from its image's libraries; a hosted one keeps --with-deps."""
+        """A self-hosted runner may grant no root for apt, so Firefox and WebKit
+        install without --with-deps; a hosted one keeps it."""
         for runner, want in (
             ('self-hosted', '--no-install playwright install firefox webkit\n'),
             ('github-hosted', '--no-install playwright install --with-deps firefox webkit\n'),
