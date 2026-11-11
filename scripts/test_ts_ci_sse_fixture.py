@@ -30,10 +30,14 @@ done
 """
 
 
-def needs(fixture: str = '', tags: str = '') -> dict:
+def needs(fixture: str = '', tags: str = '', go_sum: str = '') -> dict:
     """The package job's needs context with the fixture outputs the read wrote."""
     context = counted(2)
-    context['package']['outputs'] |= {'sse-fixture': fixture, 'sse-fixture-tags': tags}
+    context['package']['outputs'] |= {
+        'sse-fixture': fixture,
+        'sse-fixture-tags': tags,
+        'sse-fixture-sum': go_sum,
+    }
     return context
 
 
@@ -60,9 +64,9 @@ class ReadFixture(Harness):
     def fixture(self, directory: object, tags: object = 'marotte_test'):
         return self.read({'name': 'x', 'sseFixture': directory, 'sseFixtureTags': tags})
 
-    def assert_built(self, run, directory: str, tags: str = 'marotte_test'):
+    def assert_built(self, run, directory: str, tags: str = 'marotte_test', go_sum: str = ''):
         self.assertEqual(run.rc, 0, run.out)
-        self.assertEqual(run.outputs, {'dir': directory, 'tags': tags})
+        self.assertEqual(run.outputs, {'dir': directory, 'tags': tags, 'sum': go_sum})
         self.assertNotIn('::', run.out)
 
     def assert_refused(self, run, message: str):
@@ -84,7 +88,7 @@ class ReadFixture(Harness):
             with self.subTest(manifest=manifest):
                 run = self.read(manifest)
                 self.assertEqual(run.rc, 0, run.out)
-                self.assertEqual(run.outputs, {'dir': '', 'tags': ''})
+                self.assertEqual(run.outputs, {'dir': '', 'tags': '', 'sum': ''})
                 self.assertIn('no sseFixture', run.out)
 
     def test_the_module_directory_is_read_against_the_package_directory(self):
@@ -108,6 +112,27 @@ class ReadFixture(Harness):
         (self.workspace / 'server' / 'go.mod').write_text('module example.com/server\n')
         (self.web / 'link').symlink_to('../server')
         self.assert_built(self.fixture('link'), 'server')
+
+    def test_a_go_sum_in_the_checkout_is_output_by_its_real_path(self):
+        (self.workspace / 'server').mkdir()
+        (self.workspace / 'server' / 'go.mod').write_text('module example.com/server\n')
+        (self.workspace / 'server' / 'go.sum').write_text('')
+        (self.workspace / 'go.sum').symlink_to('server/go.sum')
+        self.assert_built(self.fixture('../server'), 'server', go_sum='server/go.sum')
+        self.assert_built(self.fixture('..'), '.', go_sum='server/go.sum')
+
+    def test_a_module_without_a_go_sum_file_outputs_no_go_sum(self):
+        self.assert_built(self.fixture('..'), '.')
+        (self.workspace / 'go.sum').symlink_to('missing')
+        self.assert_built(self.fixture('..'), '.')
+        (self.workspace / 'go.sum').unlink()
+        (self.workspace / 'go.sum').mkdir()
+        self.assert_built(self.fixture('..'), '.')
+
+    def test_a_go_sum_symlink_out_of_the_checkout_fails_the_job(self):
+        (self.outside / 'go.sum').write_text('')
+        (self.workspace / 'go.sum').symlink_to(self.outside / 'go.sum')
+        self.assert_refused(self.fixture('..'), 'its go.sum is a symlink outside')
 
     def test_tags_are_optional_and_any_comma_list_of_tag_names_is_passed_as_written(self):
         self.assert_built(self.read({'sseFixture': '..'}), '.', '')
@@ -190,6 +215,9 @@ class ReadFixture(Harness):
         for directory in ('../a\nb', '../a\n::add-mask::x', 'link'):
             with self.subTest(directory=directory):
                 self.assert_refused(self.fixture(directory), 'control character')
+        (weird / 'go.sum').write_text('')
+        (self.workspace / 'go.sum').symlink_to(weird / 'go.sum')
+        self.assert_refused(self.fixture('..'), 'control character')
 
     def test_an_unreadable_package_fails_the_job(self):
         self.assert_refused(self.read(raw='{"sseFixture":'), 'cannot read the package settings')
@@ -255,9 +283,12 @@ class FixtureSteps(unittest.TestCase):
         names = [s.get('name') for s in job['steps']]
         self.assertLess(names.index('Checkout'), names.index(READ_STEP))
         step = workflow_step(TS_CI, 'package', READ_STEP)
-        steps = {step['id']: {'outputs': {'dir': 'server', 'tags': 'a,b'}}}
+        steps = {step['id']: {'outputs': {'dir': 'server', 'tags': 'a,b', 'sum': 'server/go.sum'}}}
         self.assertEqual(evaluate(job['outputs']['sse-fixture'], {'steps': steps}), 'server')
         self.assertEqual(evaluate(job['outputs']['sse-fixture-tags'], {'steps': steps}), 'a,b')
+        self.assertEqual(
+            evaluate(job['outputs']['sse-fixture-sum'], {'steps': steps}), 'server/go.sum'
+        )
 
     def test_each_test_job_builds_the_same_way_after_its_setup_and_before_its_checks(self):
         for job in SHARDED:
@@ -289,15 +320,17 @@ class FixtureSteps(unittest.TestCase):
         step = workflow_step(TS_CI, 'validate', SETUP_STEP)
         go_ci = workflow_step(WORKFLOWS / 'go-ci.yaml', 'validate', 'Setup Go')
         self.assertEqual(step['uses'], go_ci['uses'])
-        scope = wr.Scope({'needs': needs('server')}, {}, [])
-        self.assertEqual(
-            {k: scope.render(v) if isinstance(v, str) else v for k, v in step['with'].items()},
-            {
-                'go-version-file': 'server/go.mod',
-                'cache': True,
-                'cache-dependency-path': 'server/go.sum',
-            },
-        )
+        for go_sum, cache in (('server/go.sum', 'true'), ('', 'false')):
+            with self.subTest(go_sum=go_sum):
+                scope = wr.Scope({'needs': needs('server', go_sum=go_sum)}, {}, [])
+                self.assertEqual(
+                    {k: scope.render(v) for k, v in step['with'].items()},
+                    {
+                        'go-version-file': 'server/go.mod',
+                        'cache': cache,
+                        'cache-dependency-path': go_sum,
+                    },
+                )
 
     def test_an_enrolled_package_builds_in_every_shard(self):
         contexts = {

@@ -54,6 +54,7 @@ jobs:
       browsers: ${{ steps.read.outputs.browsers }}
       sse-fixture: ${{ steps.fixture.outputs.dir }}
       sse-fixture-tags: ${{ steps.fixture.outputs.tags }}
+      sse-fixture-sum: ${{ steps.fixture.outputs.sum }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -177,8 +178,9 @@ jobs:
 
       # The Go module of a test server the suite runs against (`sseFixture`,
       # relative to package.json) and its `-tags` (`sseFixtureTags`). The
-      # directory is output as its real path relative to the checkout, where
-      # setup-go resolves its inputs, so no symlink leads a later step outside.
+      # directory and its go.sum (empty when absent) are output as real paths
+      # relative to the checkout, where setup-go resolves its inputs, so no
+      # symlink leads a later step outside.
       - name: Read sseFixture and sseFixtureTags
         id: fixture
         env:
@@ -197,12 +199,13 @@ jobs:
             try { pkg = JSON.parse(readFileSync(pkgPath, "utf8")); }
             catch (err) { fail(`cannot read the package settings: ${err.message}`); }
             const own = (key) => pkg !== null && typeof pkg === "object" && Object.hasOwn(pkg, key);
-            const out = (dir, tags) => appendFileSync(process.env.GITHUB_OUTPUT, `dir=${dir}\ntags=${tags}\n`);
+            const out = (dir, tags, sum) =>
+              appendFileSync(process.env.GITHUB_OUTPUT, `dir=${dir}\ntags=${tags}\nsum=${sum}\n`);
             if (!own("sseFixture")) {
               if (own("sseFixtureTags")) {
                 fail("sseFixtureTags is set without sseFixture: name the Go module directory to build, or drop the tags");
               }
-              out("", "");
+              out("", "", "");
               console.log("no sseFixture: no Go test server to build");
               process.exit(0);
             }
@@ -251,11 +254,17 @@ jobs:
             if (mod === null || !statSync(mod).isFile()) {
               fail(`sseFixture is ${dirShown}: it holds no go.mod file`);
             }
+            let sum;
+            try { sum = realpathSync(join(real, "go.sum")); } catch { sum = null; }
+            if (sum !== null && !within(realRoot, sum)) {
+              fail(`sseFixture is ${dirShown}: its go.sum is a symlink outside the checkout`);
+            }
+            const sumRel = sum !== null && statSync(sum).isFile() ? relative(realRoot, sum) : "";
             const rel = relative(realRoot, real) || ".";
-            if (control.test(rel)) {
+            if (control.test(rel) || control.test(sumRel)) {
               fail(`sseFixture is ${dirShown}: the directory's real path holds a control character`);
             }
-            out(rel, tags);
+            out(rel, tags, sumRel);
             console.log(`sseFixture: building the Go module in ${rel} with -tags "${tags}"`);
         run: node -e "$READ_FIXTURE"
 
@@ -349,16 +358,16 @@ jobs:
 
       # The Go test server the package names in `sseFixture`, built for every
       # shard and handed to the tests as SSE_FIXTURE. Setup, so outside the
-      # soft-gate block: a server that cannot build fails the job instead of
-      # leaving its suite to skip. setup-go's default cache key reads go.sum at
-      # the checkout root, which a nested module lacks.
+      # soft-gate block. setup-go's default cache key reads go.sum at the
+      # checkout root, which a nested module lacks, and a module with no go.sum
+      # gets no cache instead of a restore warning.
       - name: Setup Go (sseFixture)
         if: ${{ needs.package.outputs.sse-fixture != '' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: ${{ needs.package.outputs.sse-fixture }}/go.mod
-          cache: true
-          cache-dependency-path: ${{ needs.package.outputs.sse-fixture }}/go.sum
+          cache: ${{ needs.package.outputs.sse-fixture-sum != '' }}
+          cache-dependency-path: ${{ needs.package.outputs.sse-fixture-sum }}
 
       - name: Build the sseFixture test server
         if: ${{ needs.package.outputs.sse-fixture != '' }}
@@ -799,8 +808,8 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: ${{ needs.package.outputs.sse-fixture }}/go.mod
-          cache: true
-          cache-dependency-path: ${{ needs.package.outputs.sse-fixture }}/go.sum
+          cache: ${{ needs.package.outputs.sse-fixture-sum != '' }}
+          cache-dependency-path: ${{ needs.package.outputs.sse-fixture-sum }}
 
       - name: Build the sseFixture test server
         if: ${{ needs.package.outputs.sse-fixture != '' }}
