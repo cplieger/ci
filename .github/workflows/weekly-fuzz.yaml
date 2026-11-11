@@ -1,8 +1,8 @@
 # Weekly fuzzing of every `func Fuzz` target in the public cplieger Go
-# repositories, from the committed seed corpus only. A repo whose targets
-# overrun one shard's budget is split across runners rather than given less
-# time per target. The budget, the sharding and the per-finding issues are
-# documented in docs/workflows.md "The scheduled runs".
+# repositories, one unit per Go module, from the committed seed corpus only. A
+# module whose targets overrun one shard's budget is split across runners rather
+# than given less time per target. The budget, the sharding and the per-finding
+# issues are documented in docs/workflows.md "The scheduled runs".
 name: Weekly fuzz
 
 on:
@@ -96,7 +96,7 @@ jobs:
               [ "$shards" -lt 1 ] && shards=1
               echo "  include ${r}:${dir}: ${count} target(s) -> ${shards} shard(s) @ ${sha:0:12}"
               for i in $(seq 0 $((shards - 1))); do
-                artifacts+=("fuzz-findings-${r}-${slug}-shard${i}")
+                artifacts+=("fuzz-findings-${r}=${slug}-shard${i}")
                 shard_matrix=$(printf '%s' "$shard_matrix" | jq -c \
                   --arg r "$r" --arg s "$sha" --arg d "$dir" --arg slug "$slug" \
                   --argjson sh "$i" --argjson tot "$shards" \
@@ -168,7 +168,7 @@ jobs:
           : > "$GITHUB_WORKSPACE/broken.txt"
           # Deterministic global target list: `go list ./...` is import-path
           # sorted and `go test -list` order is stable for a fixed commit, so
-          # every shard of this repo sees the identical ordered list and the
+          # every shard of this module sees the identical ordered list and the
           # round-robin slice below partitions it without overlap or gaps.
           targets=()
           for pkg in $(go list ./...); do
@@ -231,7 +231,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fuzz-findings-${{ matrix.repo }}-${{ matrix.slug }}-shard${{ matrix.shard }}
+          name: fuzz-findings-${{ matrix.repo }}=${{ matrix.slug }}-shard${{ matrix.shard }}
           path: findings.txt
           if-no-files-found: warn
           retention-days: 14
@@ -275,6 +275,7 @@ jobs:
           sparse-checkout: |
             scripts/tracker_issue.py
             scripts/ghrest.py
+            scripts/go-units.sh
           sparse-checkout-cone-mode: false
           path: ci
 
@@ -304,10 +305,13 @@ jobs:
           while IFS='|' read -r target hash path size preview module; do
             [ -z "$target" ] && continue
             title="[fuzz] ${target} regression — ${hash}"
-            # A nested module's tests run from its own dir, never the root's.
+            # A nested module's tests run from its own dir, never the root's,
+            # and its title names it: two modules can share a target name and a
+            # reproducer hash, and the title is the finding's identity.
             repro="go test -run='^${target}\$/${hash}' ./..."
             head="**Target**: \`${target}\`"
             if [ -n "${module:-}" ] && [ "$module" != . ]; then
+              title="[fuzz] ${target} (${module}) regression — ${hash}"
               repro="cd ${module} && ${repro}"
               head="${head}"$'\n'"**Module**: \`${module}\`"
             fi
@@ -339,18 +343,33 @@ jobs:
               --comment-file "$RUNNER_TEMP/recurred.md" || had_failure=1
           done < "$merged"
 
-          # Auto-close fuzz issues whose seed was committed to the corpus.
+          # Auto-close fuzz issues whose seed was committed to the corpus. Seed
+          # corpora live at the package level (internal/foo/testdata/fuzz/...),
+          # so the search covers the issue's module: a nested module's tree for
+          # an issue naming it, the root's tree outside every nested module for
+          # one that names none.
           python3 "$tracker" --repo "$REPO" --label fuzz-finding --mode list \
             > "$RUNNER_TEMP/open-findings.tsv" || had_failure=1
+          nested=$(bash "$GITHUB_WORKSPACE/ci/scripts/go-units.sh" . | cut -f1 | grep -vxF . || true)
           while IFS=$'\t' read -r _ title; do
-            target=$(echo "$title" | sed -nE 's|^\[fuzz\] ([A-Za-z][A-Za-z0-9_]*) regression .+$|\1|p')
-            hash=$(echo "$title" | sed -nE 's|^.+ — ([a-f0-9]+)$|\1|p')
+            target=$(sed -nE 's|^\[fuzz\] ([A-Za-z][A-Za-z0-9_]*)( \([A-Za-z0-9._/-]+\))? regression .+$|\1|p' <<<"$title")
+            module=$(sed -nE 's|^\[fuzz\] [A-Za-z][A-Za-z0-9_]* \(([A-Za-z0-9._/-]+)\) regression .+$|\1|p' <<<"$title")
+            hash=$(sed -nE 's|^.+ — ([a-f0-9]+)$|\1|p' <<<"$title")
             { [ -z "$target" ] || [ -z "$hash" ]; } && continue
-            # Search the WHOLE tree: seed corpora live at the package level
-            # (e.g. internal/foo/testdata/fuzz/...), not only at the repo root.
-            # A root-only `find testdata/fuzz` never matched non-root packages,
-            # leaving their issues open forever despite the committed seed.
-            seedpath=$(find . -path "*/testdata/fuzz/${target}/${hash}" -print -quit 2>/dev/null)
+            # Only a module this checkout holds, which also keeps the title from
+            # steering the search outside the tree.
+            if [ -n "$module" ] && ! grep -qxF -- "$module" <<<"$nested"; then
+              continue
+            fi
+            start=.
+            [ -z "$module" ] || start="./${module}"
+            prune=()
+            for d in $nested; do
+              if [ -z "$module" ] || [[ $d == "$module"/* ]]; then
+                prune+=(-path "./${d}" -prune -o)
+              fi
+            done
+            seedpath=$(find "$start" ${prune[@]+"${prune[@]}"} -path "*/testdata/fuzz/${target}/${hash}" -print -quit 2>/dev/null)
             if [ -n "$seedpath" ]; then
               msg="Closed automatically: seed \`${seedpath#./}\` was committed; now part of the deterministic regression corpus."
               printf '%s\n' "$msg" > "$RUNNER_TEMP/closed.md"

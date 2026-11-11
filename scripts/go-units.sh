@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Usage: go-units.sh <tree> [<regex>]    (probed by scripts/test_go_units.py)
 # Prints each Go module of a checkout, root first, then nested ones in byte
-# order: <dir> TAB <slug> TAB <count>. A module is a go.mod whose dir holds a .go
-# file, outside node_modules, vendor, testdata, static and dist (ci.yaml's
-# go-nested rule). <slug> is the dir with `/` as `_`, `root` for `.`. <count> is
-# the lines of the module's own *_test.go files matching the ERE <regex>, else 0.
-# An unsafe dir, or one whose slug is taken, is skipped with a ::warning::.
+# order: <dir> TAB <slug> TAB <count>. A root go.mod is always a unit, and a
+# nested one when its dir holds a .go file, outside node_modules, vendor,
+# testdata, static and dist (ci.yaml's rule). <slug> is the dir with `/` as `_`,
+# `root` for `.`. <count> is the lines of the module's own *_test.go files
+# matching the ERE <regex>, else 0. An unsafe dir, or one whose slug is taken,
+# is skipped with a ::warning::.
 set -euo pipefail
 
 [ "$#" -ge 1 ] && [ "$#" -le 2 ] || {
@@ -23,7 +24,9 @@ pruned=(-name .git -o -name node_modules -o -name vendor -o -name testdata -o -n
 
 mods=()
 [ -f "$tree/go.mod" ] && mods+=(.)
-while IFS= read -r f; do
+# NUL-separated, so a dir name holding a newline stays one name and fails the
+# character check instead of splitting into names that pass it.
+while IFS= read -r -d '' f; do
   d=$(dirname -- "${f#"$tree"/}")
   case "$d" in
     *[!A-Za-z0-9._/-]*)
@@ -31,11 +34,17 @@ while IFS= read -r f; do
       continue
       ;;
   esac
+  case "/$d/" in
+    */../* | */./*)
+      echo "::warning::go-units: skipped module dir '$d', which holds a '.' or '..' segment" >&2
+      continue
+      ;;
+  esac
   if [ -z "$(find "$tree/$d" -name '*.go' -type f -print -quit)" ]; then
     continue
   fi
   mods+=("$d")
-done < <(find "$tree" \( "${pruned[@]}" \) -prune -o -name go.mod -type f ! -path "$tree/go.mod" -print | LC_ALL=C sort)
+done < <(find "$tree" \( "${pruned[@]}" \) -prune -o -name go.mod -type f ! -path "$tree/go.mod" -print0 | LC_ALL=C sort -z)
 
 declare -A taken=()
 for d in "${mods[@]}"; do

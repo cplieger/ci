@@ -1,9 +1,7 @@
 """scripts/go-units.sh: the Go modules a weekly fan-out treats as units.
 
-The weekly fuzz and bench runs once probed only a root go.mod, so a repository
-made of nested modules (cplieger/go) got no run at all, and a nested module
-beside a root one was never fuzzed. Each case builds a tree and checks the
-units, their slugs and the per-module counts.
+Each case builds a tree and checks the units go-units.sh lists, their slugs and
+their per-module counts.
 """
 
 from __future__ import annotations
@@ -115,6 +113,12 @@ class GoUnits(unittest.TestCase):
         self.assertIn(
             "skipped module dir 'p_q', because module dir 'p/q' already has slug 'p_q'", err
         )
+
+    def test_a_dir_name_with_a_newline_stays_one_name_and_is_refused(self):
+        tree = self.tree({'a\n../x/go.mod': 'module x\n', 'a\n../x/x.go': ''})
+        rc, rows, err = run(tree)
+        self.assertEqual((rc, rows), (0, []))
+        self.assertIn('outside A-Z', err)
 
     def test_a_tree_with_no_module_prints_nothing(self):
         tree = self.tree({'README.md': ''})
