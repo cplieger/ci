@@ -125,6 +125,9 @@ LISTING = [
     {'name': 'zpriv', 'visibility': 'private', 'private': True, 'archived': False, 'fork': False},
 ]
 PUBLIC = ['xmlx', 'zpub']
+# A weekly workflow runs in cplieger/ci itself, so its ci-source checkout names
+# github.repository at github.sha.
+WEEKLY_GITHUB = {'repository': 'cplieger/ci', 'sha': '0' * 40}
 SHA = '0123456789abcdef0123456789abcdef01234567'
 FANOUT_GH_STUB = """#!/usr/bin/env bash
 case "$*" in
@@ -141,8 +144,10 @@ esac
 """
 # A clone holds a Go module with a fuzz target ($TREES/<repo>.fuzz of them when
 # that file exists) and a benchmark, and a stryker config in each dir
-# $TREES/<repo> lists (the root when it lists none). With $TREES/<repo>.nohead
-# the clone succeeds but leaves no resolvable HEAD.
+# $TREES/<repo> lists (the root when it lists none). Each dir $TREES/<repo>.mods
+# lists is a nested module with one fuzz target and one benchmark, and with
+# $TREES/<repo>.noroot the root holds no module. With $TREES/<repo>.nohead the
+# clone succeeds but leaves no resolvable HEAD.
 FANOUT_GIT_STUB = """#!/usr/bin/env bash
 printf '%s\n' "$*" >>"$STUB_LOG"
 if [ "$1" = -C ]; then [ -f "$2/.nohead" ] && exit 128; echo "$SHA"; exit 0; fi
@@ -150,9 +155,19 @@ dest="${@: -1}"
 r=$(basename "${@: -2:1}" .git)
 mkdir -p "$dest"
 [ -f "$TREES/$r.nohead" ] && : >"$dest/.nohead"
-printf 'module example.com/%s\n' "$r" >"$dest/go.mod"
-printf 'package x\nfunc FuzzX(f *testing.F) {}\nfunc BenchmarkX(b *testing.B) {}\n' >"$dest/x_test.go"
-[ -f "$TREES/$r.fuzz" ] && seq 2 "$(cat "$TREES/$r.fuzz")" | sed 's/.*/func FuzzX&(f *testing.F) {}/' >>"$dest/x_test.go"
+if [ ! -f "$TREES/$r.noroot" ]; then
+  printf 'module example.com/%s\n' "$r" >"$dest/go.mod"
+  printf 'package x\nfunc FuzzX(f *testing.F) {}\nfunc BenchmarkX(b *testing.B) {}\n' >"$dest/x_test.go"
+  [ -f "$TREES/$r.fuzz" ] && seq 2 "$(cat "$TREES/$r.fuzz")" | sed 's/.*/func FuzzX&(f *testing.F) {}/' >>"$dest/x_test.go"
+fi
+if [ -f "$TREES/$r.mods" ]; then
+  while IFS= read -r m; do
+    mkdir -p "$dest/$m"
+    printf 'module example.com/%s/%s\n' "$r" "$m" >"$dest/$m/go.mod"
+    printf 'package m\n' >"$dest/$m/m.go"
+    printf 'package m\nfunc FuzzM(f *testing.F) {}\nfunc BenchmarkM(b *testing.B) {}\n' >"$dest/$m/m_test.go"
+  done <"$TREES/$r.mods"
+fi
 dirs=.
 [ -f "$TREES/$r" ] && dirs=$(cat "$TREES/$r")
 while IFS= read -r d; do
@@ -180,7 +195,11 @@ class FanoutReplay:
         github: dict | None = None,
         fuzz: dict | None = None,
         nohead: tuple[str, ...] = (),
+        mods: dict[str, list[str]] | None = None,
+        noroot: tuple[str, ...] = (),
+        extra: tuple[str, ...] = (),
     ) -> dict:
+        """Replays a fanout; `extra` adds public live repositories to the listing."""
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         bindir, trees = tmp / 'bin', tmp / 'trees'
         bindir.mkdir()
@@ -188,18 +207,29 @@ class FanoutReplay:
         for stub, body in (('gh', FANOUT_GH_STUB), ('git', FANOUT_GIT_STUB)):
             (bindir / stub).write_text(body)
             (bindir / stub).chmod(0o755)
-        (tmp / 'listing.json').write_text(json.dumps(LISTING))
+        listing = LISTING + [
+            {'name': r, 'visibility': 'public', 'private': False, 'archived': False, 'fork': False}
+            for r in extra
+        ]
+        (tmp / 'listing.json').write_text(json.dumps(listing))
         (trees / 'xmlx').write_text('.\nweb/app\nodd[1]\n')
         for repo, targets in (fuzz or {}).items():
             (trees / f'{repo}.fuzz').write_text(str(targets))
         for repo in nohead:
             (trees / f'{repo}.nohead').write_text('')
+        for repo, dirs in (mods or {}).items():
+            (trees / f'{repo}.mods').write_text(''.join(f'{d}\n' for d in dirs))
+        for repo in noroot:
+            (trees / f'{repo}.noroot').write_text('')
         rc, result, log = replay_job(
             tmp,
             name,
             'fanout',
             [],
-            github=github or {'event_name': 'schedule', 'event': {'inputs': {'only': ''}}},
+            github={
+                **WEEKLY_GITHUB,
+                **(github or {'event_name': 'schedule', 'event': {'inputs': {'only': ''}}}),
+            },
             PATH=f'{bindir}:{os.environ["PATH"]}',
             LISTING=str(tmp / 'listing.json'),
             TREES=str(trees),
@@ -209,7 +239,8 @@ class FanoutReplay:
         for line in log:
             self.assertNotIn('extraheader', line)
         clones = [line.split()[-2] for line in log if line.startswith('clone ')]
-        self.assertTrue(all(re.search(r'/(xmlx|zpub)\.git$', url) for url in clones), clones)
+        names = '|'.join(('xmlx', 'zpub', *extra))
+        self.assertTrue(all(re.search(rf'/({names})\.git$', url) for url in clones), clones)
         return result['steps']['fanout']['outputs']
 
 
@@ -258,11 +289,41 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
         outputs = self.fanout('weekly-fuzz.yaml')
         self.assertEqual(
             json.loads(outputs['repo_matrix']),
-            [{'repo': r, 'sha': SHA, 'artifacts': f'fuzz-findings-{r}-shard0'} for r in PUBLIC],
+            [
+                {'repo': r, 'sha': SHA, 'artifacts': f'fuzz-findings-{r}-root-shard0'}
+                for r in PUBLIC
+            ],
         )
         self.assertEqual(
             json.loads(outputs['shard_matrix']),
-            [{'repo': r, 'sha': SHA, 'shard': 0, 'shards': 1} for r in PUBLIC],
+            [
+                {'repo': r, 'sha': SHA, 'dir': '.', 'slug': 'root', 'shard': 0, 'shards': 1}
+                for r in PUBLIC
+            ],
+        )
+
+    def test_the_fuzz_fanout_emits_each_go_module_as_its_own_unit(self):
+        outputs = self.fanout(
+            'weekly-fuzz.yaml', mods={'xmlx': ['a', 'b/c'], 'zpub': ['m']}, noroot=('xmlx',)
+        )
+        self.assertEqual(
+            json.loads(outputs['repo_matrix']),
+            [
+                {
+                    'repo': 'xmlx',
+                    'sha': SHA,
+                    'artifacts': '{fuzz-findings-xmlx-a-shard0,fuzz-findings-xmlx-b_c-shard0}',
+                },
+                {
+                    'repo': 'zpub',
+                    'sha': SHA,
+                    'artifacts': '{fuzz-findings-zpub-root-shard0,fuzz-findings-zpub-m-shard0}',
+                },
+            ],
+        )
+        self.assertEqual(
+            [(e['repo'], e['dir'], e['slug']) for e in json.loads(outputs['shard_matrix'])],
+            [('xmlx', 'a', 'a'), ('xmlx', 'b/c', 'b_c'), ('zpub', '.', 'root'), ('zpub', 'm', 'm')],
         )
 
     def test_a_clone_with_no_head_drops_only_that_repository(self):
@@ -272,10 +333,31 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
         self.assertEqual([e['repo'] for e in json.loads(fuzz['repo_matrix'])], ['xmlx'])
         self.assertEqual([e['repo'] for e in json.loads(fuzz['shard_matrix'])], ['xmlx'])
 
-    def test_the_bench_fanout_emits_public_repositories(self):
-        outputs = self.fanout('weekly-bench.yaml')
-        self.assertEqual(json.loads(outputs['matrix']), [{'repo': 'xmlx', 'sha': SHA}])
-        self.assertEqual(outputs['unenrolled'], 'zpub')
+    def test_the_bench_fanout_emits_each_enrolled_module_once(self):
+        outputs = self.fanout(
+            'weekly-bench.yaml', extra=('go',), mods={'go': ['xmlx', 'jsonx']}, noroot=('go',)
+        )
+        self.assertEqual(
+            json.loads(outputs['matrix']),
+            [
+                {'repo': 'go', 'sha': SHA, 'dir': 'xmlx', 'slug': 'xmlx', 'key': 'go/xmlx'},
+                {'repo': 'go', 'sha': SHA, 'dir': 'jsonx', 'slug': 'jsonx', 'key': 'go/jsonx'},
+            ],
+        )
+        self.assertEqual(outputs['live'], 'xmlx zpub go')
+        self.assertIn('go/xmlx', outputs['enrolled'].split())
+
+    def test_the_bench_only_filter_takes_a_repo_or_one_key(self):
+        for only, keys in (('go', ['go/xmlx', 'go/jsonx']), ('go/jsonx', ['go/jsonx'])):
+            with self.subTest(only=only):
+                outputs = self.fanout(
+                    'weekly-bench.yaml',
+                    github={'event_name': 'workflow_dispatch', 'event': {'inputs': {'only': only}}},
+                    extra=('go',),
+                    mods={'go': ['xmlx', 'jsonx']},
+                    noroot=('go',),
+                )
+                self.assertEqual([e['key'] for e in json.loads(outputs['matrix'])], keys)
 
 
 GIT_STUB = """#!/usr/bin/env bash
@@ -288,6 +370,12 @@ printf 'git %s header=%s\n' "$r" "$h" >>"$STUB_LOG"
 mkdir -p "$dest"
 printf 'module example.com/%s\n' "$r" >"$dest/go.mod"
 [ "$r" = b ] || printf 'package x\nfunc BenchmarkX(b *testing.B) {}\n' >"$dest/x_test.go"
+if [ "$r" = m ]; then
+  mkdir -p "$dest/sub"
+  printf 'module example.com/m/sub\n' >"$dest/sub/go.mod"
+  printf 'package sub\n' >"$dest/sub/s.go"
+  printf 'package sub\nfunc BenchmarkS(b *testing.B) {}\n' >"$dest/sub/s_test.go"
+fi
 """
 GO_STUB = """#!/usr/bin/env bash
 printf 'go %s\n' "$3" >>"$STUB_LOG"
@@ -297,7 +385,9 @@ echo PASS
 
 
 class BenchSmoke(unittest.TestCase):
-    def replay(self, unenrolled: str = 'a b d .github', **env: str) -> tuple[int, dict, list[str]]:
+    def replay(
+        self, live: str = 'a b d .github', enrolled: str = '', **env: str
+    ) -> tuple[int, dict, list[str]]:
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         bindir = tmp / 'bin'
         bindir.mkdir()
@@ -307,8 +397,11 @@ class BenchSmoke(unittest.TestCase):
         (tmp / 'cwd').mkdir()
         log = tmp / 'stub.log'
         context = {
+            'github': WEEKLY_GITHUB,
             'secrets': {},
-            'needs': {'fanout': {'result': 'success', 'outputs': {'unenrolled': unenrolled}}},
+            'needs': {
+                'fanout': {'result': 'success', 'outputs': {'live': live, 'enrolled': enrolled}}
+            },
         }
         (tmp / 'ctx.json').write_text(json.dumps(context))
         argv = ['--workflow', str(WORKFLOWS / 'weekly-bench.yaml'), '--job', 'smoke']
@@ -347,10 +440,24 @@ class BenchSmoke(unittest.TestCase):
         self.assertIn('go scan/.github', log)
 
     def test_an_empty_list_from_the_fanout_fails_the_job(self):
-        rc, result, log = self.replay(unenrolled='')
+        rc, result, log = self.replay(live='')
         self.assertEqual(rc, 1)
-        self.assertIn('Clone every unenrolled repo carrying benchmarks', result['failed'])
+        self.assertIn(
+            'Clone every live repo and list its unenrolled modules with benchmarks',
+            result['failed'],
+        )
         self.assertEqual(log, [])
+
+    def test_an_enrolled_key_is_skipped_and_a_nested_module_runs_on_its_own(self):
+        rc, result, log = self.replay(live='a m', enrolled='a langtag m')
+        self.assertEqual(rc, 0, result.get('failed'))
+        self.assertEqual(log, ['git a header=no', 'git m header=no', 'go scan/m/sub'])
+
+    def test_a_run_that_checks_no_module_fails_the_job(self):
+        rc, result, log = self.replay(live='a b', enrolled='a')
+        self.assertEqual(rc, 1)
+        self.assertIn('Execute every unenrolled benchmark once', result['failed'])
+        self.assertEqual(log, ['git a header=no', 'git b header=no'])
 
 
 PUBLISH_BADGE_STUB = """#!/usr/bin/env bash
@@ -792,7 +899,10 @@ class ArtifactBinding(FanoutReplay, unittest.TestCase):
         repos = json.loads(outputs['repo_matrix'])
         self.assertEqual(
             [r['artifacts'] for r in repos],
-            ['fuzz-findings-xmlx-shard0', '{fuzz-findings-zpub-shard0,fuzz-findings-zpub-shard1}'],
+            [
+                'fuzz-findings-xmlx-root-shard0',
+                '{fuzz-findings-zpub-root-shard0,fuzz-findings-zpub-root-shard1}',
+            ],
         )
         want = upload_names(
             'weekly-fuzz.yaml', 'Upload shard findings', json.loads(outputs['shard_matrix']), 'fuzz'
@@ -908,7 +1018,7 @@ class BenchPublish(unittest.TestCase):
         '--skip',
         'Checkout ci (for the attribution fix)',
         '--skip',
-        "Download this repo's medians",
+        "Download this entry's medians",
         '--stop-before',
         'Ensure benchmarks branch exists',
     )
@@ -937,8 +1047,8 @@ class BenchPublish(unittest.TestCase):
         for s in later:
             with self.subTest(step=s.get('name')):
                 self.assertEqual(s.get('if'), "${{ steps.medians.outputs.ok == 'true' }}")
-        download = steps[names.index("Download this repo's medians")]['with']
-        self.assertEqual(download['pattern'], 'bench-raw-${{ matrix.repo }}')
+        download = steps[names.index("Download this entry's medians")]['with']
+        self.assertEqual(download['pattern'], 'bench-raw-${{ matrix.repo }}-${{ matrix.slug }}')
         upload = next(
             s
             for s in load('weekly-bench.yaml')['jobs']['run']['steps']

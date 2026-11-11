@@ -35,10 +35,11 @@ concurrency:
 
 jobs:
   # `go test ./...` compiles a benchmark and never executes it, so an unenrolled
-  # one can rot unseen. This job runs every non-enrolled `func Benchmark` once,
-  # to prove it still runs; the fanout lists the repositories, so enrolment
-  # needs no edit here. One job rather than a matrix: the work is
-  # about a second per repo, less than a leg's checkout and toolchain setup.
+  # one can rot unseen. This job runs every `func Benchmark` of each module
+  # ENROLLED leaves out once, to prove it still runs; the fanout lists the
+  # repositories, so enrolment needs no edit here. One job rather than a matrix:
+  # the work is about a second per module, less than a leg's checkout and
+  # toolchain setup.
   smoke:
     needs: fanout
     runs-on: ubuntu-26.04
@@ -50,33 +51,44 @@ jobs:
           go-version: stable
           cache: false
 
+      - name: Checkout ci (for the module discovery)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _ci
+          persist-credentials: false
+          sparse-checkout: scripts/go-units.sh
+          sparse-checkout-cone-mode: false
+
       # Anonymous clones of the fanout's public repositories: the next step
       # runs each repo's code, so this job holds no secret.
-      - name: Clone every unenrolled repo carrying benchmarks
+      - name: Clone every live repo and list its unenrolled modules with benchmarks
         id: clone
         env:
-          # Injected via env rather than inlined in the body so the value
+          # Injected via env rather than inlined in the body so the values
           # cannot expand into shell code.
-          UNENROLLED: ${{ needs.fanout.outputs.unenrolled }}
+          LIVE: ${{ needs.fanout.outputs.live }}
+          ENROLLED: ${{ needs.fanout.outputs.enrolled }}
         run: |
           set -uo pipefail
 
-          if [ -z "$UNENROLLED" ]; then
+          if [ -z "$LIVE" ]; then
             # Without this no repo is cloned, the next step checks none, and the
             # job exits 0 having verified nothing - the same vacuous green this
             # job exists to catch in other people's benchmarks.
-            echo "::error::the fanout listed no unenrolled repository"
+            echo "::error::the fanout listed no live repository"
             exit 1
           fi
 
-          : > "${RUNNER_TEMP}/bench-smoke-repos"
+          : > "${RUNNER_TEMP}/bench-smoke-units"
           skipped=0
-          for r in $UNENROLLED; do
+          for r in $LIVE; do
             dest="scan/${r}"
-            # Bounded individually. This loop is serial over every unenrolled
-            # repo, so one wedged clone would otherwise consume the job timeout
-            # and the log would not say which repo did it. 120s is generous for
-            # a --depth 1 clone. Plain git over HTTPS draws no API quota, so a
+            # Bounded individually. This loop is serial over every live repo, so
+            # one wedged clone would otherwise consume the job timeout and the
+            # log would not say which repo did it. 120s is generous for a
+            # --depth 1 clone. Plain git over HTTPS draws no API quota, so a
             # rate-limited run can still clone; the gh CLI would resolve through
             # GraphQL, whose quota this run may already have spent.
             if ! timeout 120 git clone --depth 1 "https://github.com/cplieger/${r}.git" "$dest" >/dev/null 2>&1; then
@@ -84,13 +96,27 @@ jobs:
               rm -rf "$dest"
               continue
             fi
-            if [ ! -f "${dest}/go.mod" ] \
-                || ! grep -rq --include='*_test.go' 'func Benchmark' "$dest" 2>/dev/null; then
-              skipped=$((skipped + 1))
+            if ! units=$(bash _ci/scripts/go-units.sh "$dest" '^func Benchmark'); then
+              echo "::warning::module discovery failed for ${r} - skipping"
               rm -rf "$dest"
               continue
             fi
-            printf '%s\n' "$r" >> "${RUNNER_TEMP}/bench-smoke-repos"
+            kept=0
+            while IFS=$'\t' read -r dir _ n; do
+              [ -n "$dir" ] || continue
+              key=$r
+              [ "$dir" = . ] || key="${r}/${dir}"
+              case " $ENROLLED " in *" $key "*) continue ;; esac
+              if [ "$n" -eq 0 ]; then
+                skipped=$((skipped + 1))
+                continue
+              fi
+              path=$dest
+              [ "$dir" = . ] || path="${dest}/${dir}"
+              printf '%s\t%s\t%s\n' "$key" "$path" "$n" >> "${RUNNER_TEMP}/bench-smoke-units"
+              kept=1
+            done <<<"$units"
+            [ "$kept" -eq 1 ] || rm -rf "$dest"
           done
           echo "skipped=${skipped}" >> "$GITHUB_OUTPUT"
 
@@ -109,14 +135,10 @@ jobs:
         run: |
           set -uo pipefail
 
-          mapfile -t repos < "${RUNNER_TEMP}/bench-smoke-repos"
           broken=""
           checked=0
-          for r in "${repos[@]}"; do
-            dir="scan/${r}"
-            n=$(grep -rh --include='*_test.go' -c 'func Benchmark' "$dir" 2>/dev/null \
-              | awk '{s+=$1} END {print s+0}')
-            printf '%-28s %s benchmark(s): ' "$r" "$n"
+          while IFS=$'\t' read -r key dir n; do
+            printf '%-28s %s benchmark(s): ' "$key" "$n"
             checked=$((checked + 1))
 
             # -benchtime=1x runs each benchmark once: it asserts the code still
@@ -129,9 +151,9 @@ jobs:
               echo "ok"
             else
               echo "BROKEN"
-              broken="$broken $r"
+              broken="$broken $key"
               {
-                echo "### ${r}: benchmark does not run"
+                echo "### ${key}: benchmark does not run"
                 echo ""
                 # The cause FIRST, then the context collapsed. A fixed tail
                 # window is not enough on its own: packages that pass report
@@ -156,11 +178,16 @@ jobs:
               # write fails or is truncated.
               grep -m4 -E 'panic:|--- FAIL|^FAIL' out.txt || tail -20 out.txt
             fi
-          done
+          done < "${RUNNER_TEMP}/bench-smoke-units"
           rm -rf scan out.txt
 
           echo ""
-          echo "checked ${checked} unenrolled repo(s) with benchmarks; skipped ${SKIPPED} without"
+          echo "checked ${checked} unenrolled module(s) with benchmarks; skipped ${SKIPPED} without"
+
+          if [ "$checked" -eq 0 ]; then
+            echo "::error::no unenrolled module with benchmarks was checked"
+            exit 1
+          fi
 
           if [ -n "$broken" ]; then
             # Fail closed. A benchmark that does not run is a process defect,
@@ -175,11 +202,22 @@ jobs:
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
-      # The live public repositories ENROLLED leaves out, for the smoke job,
+      # The live public repositories and the enrolled keys, for the smoke job,
       # which runs their code and so cannot hold the token the listing needs.
-      unenrolled: ${{ steps.fanout.outputs.unenrolled }}
+      live: ${{ steps.fanout.outputs.live }}
+      enrolled: ${{ steps.fanout.outputs.enrolled }}
     steps:
-      - name: Discover Go repos carrying benchmarks
+      - name: Checkout ci (for the module discovery)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _ci
+          persist-credentials: false
+          sparse-checkout: scripts/go-units.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Discover Go modules carrying benchmarks
         id: fanout
         env:
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
@@ -193,16 +231,18 @@ jobs:
           # TIMED region (no disk, network, sleep or wall clock, enforced per
           # series by SKIP in the run job), (2) a measured spread the 150%
           # threshold can police, (3) attributable commits, which sets benchtime.
-          # LIBRARY vs APP is not a criterion. Excluded: atomicfile, health,
-          # scheduler, cert-converter, docker-age, docker-fclones-scheduler (IO),
-          # arrapi, plexapi (network), envx (startup only), toolbelt, pinstall,
-          # wiregen (install or build time), webhttp (net/http-dominated).
-          ENROLLED="xmlx jsonx jsoncap ssrf httpx"                 # cost-contract libraries
-          ENROLLED="$ENROLLED runesafe pathinside keyenc langtag urlform"   # pure-compute libraries
-          ENROLLED="$ENROLLED metrics slogx web-terminal-engine"   # per-call hot paths
-          ENROLLED="$ENROLLED plex-language-sync plex-exporter"    # CPU-bound app paths
-          ENROLLED="$ENROLLED subflux marotte"                     # the two large apps
-          ENROLLED="$ENROLLED auth"                                # per-request auth path, KDF skipped
+          # LIBRARY vs APP is not a criterion. An entry is a repo, for its root
+          # module, or <repo>/<dir> for a nested one. Excluded: go/filesafe,
+          # go/health, go/scheduler, cert-converter, docker-age,
+          # docker-fclones-scheduler (IO), arrapi, plexapi (network), go/envx
+          # (startup only), toolbelt, go/wiregen (install or build time),
+          # go/httpserver (net/http-dominated).
+          ENROLLED="go/xmlx go/jsonx go/ssrf go/httpclient"                 # cost-contract libraries
+          ENROLLED="$ENROLLED go/textsafe go/pathinside go/keyenc langtag go/urlform"   # pure-compute libraries
+          ENROLLED="$ENROLLED go/measure go/slogx web-terminal-engine"     # per-call hot paths
+          ENROLLED="$ENROLLED plex-language-sync plex-exporter"            # CPU-bound app paths
+          ENROLLED="$ENROLLED subflux marotte"                             # the two large apps
+          ENROLLED="$ENROLLED auth"                                        # per-request auth path, KDF skipped
 
           # REST, not the GraphQL `gh repo list`, whose quota the per-repo clones
           # draw too. A fork's tree is UPSTREAM's. Public only: this repository's
@@ -212,17 +252,17 @@ jobs:
           live=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
             .[] | select(.archived == false and .fork == false and .visibility == "public") | .name
           ' | tr '\n' ' ')
+          # The smoke job runs every unit of these repos that ENROLLED leaves out.
+          {
+            echo "live=${live% }"
+            echo "enrolled=${ENROLLED}"
+          } >> "$GITHUB_OUTPUT"
 
-          unenrolled=""
-          for r in $live; do
-            case " $ENROLLED " in *" $r "*) ;; *) unenrolled="$unenrolled $r" ;; esac
-          done
-          echo "unenrolled=${unenrolled# }" >> "$GITHUB_OUTPUT"
-
-          repos=""
-          for r in $ENROLLED; do
-            case " $live " in *" $r "*) repos="$repos $r" ;; *)
-              echo "::warning::enrolled repo '$r' is not live (archived, fork, private, or renamed) - skipping" ;;
+          keys=""
+          for k in $ENROLLED; do
+            r=${k%%/*}
+            case " $live " in *" $r "*) keys="$keys $k" ;; *)
+              echo "::warning::enrolled repo '$r' is not live (archived, fork, private, or renamed) - skipping $k" ;;
             esac
           done
 
@@ -230,56 +270,75 @@ jobs:
           # is hardcoded, so "none of them are live" is a defect in this
           # workflow or in discovery, never a legitimate weekly state - and it
           # is the exact shape that made this leg vacuously green for weeks.
-          if [ -z "$repos" ]; then
+          if [ -z "$keys" ]; then
             echo "::error::no enrolled repo resolved against live discovery" \
                  "(enrolled: ${ENROLLED}) - refusing to report a green leg"
             exit 1
           fi
 
+          # `only` names a repo, which takes all its enrolled modules, or one key.
           if [ -n "${ONLY:-}" ]; then
             wanted=" $(echo "$ONLY" | tr ',' ' ') "
             filtered=""
-            for r in $repos; do
-              case "$wanted" in *" $r "*) filtered="$filtered $r" ;; esac
+            for k in $keys; do
+              case "$wanted" in *" $k "* | *" ${k%%/*} "*) filtered="$filtered $k" ;; esac
             done
-            repos="$filtered"
-            echo "manual 'only' filter active -> ${repos:-<none matched>}"
+            keys="$filtered"
+            echo "manual 'only' filter active -> ${keys:-<none matched>}"
           fi
 
           matrix='[]'
-          for r in $repos; do
-            rm -rf scan
-            # Plain git clone over HTTPS draws no API quota, so a rate-limited
-            # run can still clone; the gh CLI would resolve through GraphQL,
-            # whose quota this run may already have spent.
-            if ! git clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
-              echo "::warning::clone failed for ${r} - skipping"
+          cloned=""
+          for k in $keys; do
+            r=${k%%/*}
+            dir=.
+            [ "$k" = "$r" ] || dir=${k#*/}
+            # One clone per repo, however many of its modules are enrolled.
+            if [ "$cloned" != "$r" ]; then
+              cloned=$r
+              rm -rf scan
+              units="" sha=""
+              # Plain git clone over HTTPS draws no API quota, so a rate-limited
+              # run can still clone; the gh CLI would resolve through GraphQL,
+              # whose quota this run may already have spent.
+              if ! git clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
+                echo "::warning::clone failed for ${r} - skipping"
+                continue
+              fi
+              # Guarded for the same reason as weekly-stryker's copy: a clone that
+              # exits 0 with no resolvable HEAD makes rev-parse exit 128, and
+              # under `bash -e` that kills the fanout and every other repo's
+              # matrix entry with it. One skipped repo is the right blast radius.
+              if ! sha=$(git -C scan rev-parse HEAD 2>/dev/null); then
+                echo "::warning::cannot resolve HEAD for ${r} - skipping"
+                sha=""
+                continue
+              fi
+              if ! units=$(bash _ci/scripts/go-units.sh scan '^func Benchmark'); then
+                echo "::warning::module discovery failed for ${r} - skipping"
+                units=""
+                continue
+              fi
+            fi
+            [ -n "$sha" ] || continue
+            line=$(awk -F'\t' -v d="$dir" '$1 == d' <<<"$units")
+            if [ -z "$line" ]; then
+              echo "  skip ${k}: no Go module at ${dir}"
               continue
             fi
-            if [ ! -f scan/go.mod ]; then
-              echo "  skip ${r}: no go.mod"
-              continue
-            fi
-            # Only enrol a repo that actually has a benchmark to run. Without
+            IFS=$'\t' read -r _ slug n <<<"$line"
+            # Only enrol a module that actually has a benchmark to run. Without
             # this the reducer would fail the leg on empty input, which is
-            # correct behaviour for a repo that SHOULD have benchmarks and a
+            # correct behaviour for a module that SHOULD have benchmarks and a
             # false alarm for one that never did.
-            n=$(grep -rl --include='*_test.go' 'func Benchmark' scan 2>/dev/null | wc -l)
             if [ "$n" -eq 0 ]; then
-              echo "  skip ${r}: no benchmark functions"
+              echo "  skip ${k}: no benchmark functions"
               continue
             fi
-            # Guarded for the same reason as weekly-stryker's copy: a clone that
-            # exits 0 with no resolvable HEAD makes rev-parse exit 128, and
-            # under `bash -e` that kills the fanout and every other repo's
-            # matrix entry with it. One skipped repo is the right blast radius.
-            if ! sha=$(git -C scan rev-parse HEAD 2>/dev/null); then
-              echo "::warning::cannot resolve HEAD for ${r} - skipping"
-              continue
-            fi
-            echo "  include ${r} @ ${sha:0:12} (${n} files with benchmarks)"
+            echo "  include ${k} @ ${sha:0:12} (${n} benchmark(s))"
             matrix=$(printf '%s' "$matrix" | jq -c \
-              --arg r "$r" --arg s "$sha" '. + [{repo: $r, sha: $s}]')
+              --arg r "$r" --arg s "$sha" --arg d "$dir" --arg slug "$slug" --arg k "$k" \
+              '. + [{repo: $r, sha: $s, dir: $d, slug: $slug, key: $k}]')
           done
           rm -rf scan
 
@@ -333,7 +392,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: app/go.mod
+          go-version-file: app/${{ matrix.dir }}/go.mod
           cache: false
 
       - name: Setup Python
@@ -348,13 +407,15 @@ jobs:
       # at 3s does not fit the timeout. SKIP (`go test -skip`) drops one offending
       # series without a positive -bench regex; each entry names what it excludes,
       # judged on the timed region only. Both values reach a shell, so both are
-      # validated.
+      # validated. Both defaults key on the entry (`<repo>` or `<repo>/<dir>`),
+      # and GOWORK=off builds a module against the versions its go.mod pins.
       - name: Run benchmarks
-        working-directory: app
+        working-directory: app/${{ matrix.dir }}
         env:
           COUNT: ${{ github.event.inputs.count || '10' }}
           BENCHTIME_INPUT: ${{ github.event.inputs.benchtime }}
-          REPO: ${{ matrix.repo }}
+          KEY: ${{ matrix.key }}
+          GOWORK: "off"
         run: |
           set -euo pipefail
           case "$COUNT" in
@@ -367,7 +428,7 @@ jobs:
           if [ -n "${BENCHTIME_INPUT:-}" ]; then
             BENCHTIME="$BENCHTIME_INPUT"
           else
-            case "$REPO" in
+            case "$KEY" in
               subflux|marotte) BENCHTIME=1s ;;
               *)               BENCHTIME=3s ;;
             esac
@@ -381,7 +442,7 @@ jobs:
           esac
 
           SKIP=""
-          case "$REPO" in
+          case "$KEY" in
             auth)
               # Argon2id, whose cost IS the security parameter. The tracker is
               # customSmallerIsBetter, so it alerts only on getting slower, and
@@ -410,7 +471,7 @@ jobs:
               SKIP='BenchmarkFileAction_Copy' ;;
           esac
 
-          echo "repo=$REPO count=$COUNT benchtime=$BENCHTIME skip=${SKIP:-<none>}"
+          echo "entry=$KEY count=$COUNT benchtime=$BENCHTIME skip=${SKIP:-<none>}"
 
           # A skip alternative that stops matching silently returns its series to the
           # chart, so each alternative is grepped in the sources (`A|B/x` still matches
@@ -452,7 +513,7 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "### ${{ matrix.repo }} benchmarks"
+            echo "### ${{ matrix.key }} benchmarks"
             echo ""
             echo "| Benchmark | Value | Unit | Spread |"
             echo "|---|---|---|---|"
@@ -468,7 +529,7 @@ jobs:
           set -uo pipefail
           {
             echo ""
-            echo "<details><summary>${{ matrix.repo }} series stability</summary>"
+            echo "<details><summary>${{ matrix.key }} series stability</summary>"
             echo ""
             echo '```'
             python3 _ci/scripts/bench-stability.py "$RUNNER_TEMP/bench-raw.txt" || true
@@ -484,7 +545,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: bench-raw-${{ matrix.repo }}
+          name: bench-raw-${{ matrix.repo }}-${{ matrix.slug }}
           path: |
             ${{ runner.temp }}/bench-raw.txt
             ${{ runner.temp }}/bench.json
@@ -521,31 +582,33 @@ jobs:
 
       # A pattern that matches nothing downloads nothing and succeeds, which is
       # the case of a run entry that failed before it wrote any sample.
-      - name: Download this repo's medians
+      - name: Download this entry's medians
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: bench
-          pattern: bench-raw-${{ matrix.repo }}
+          pattern: bench-raw-${{ matrix.repo }}-${{ matrix.slug }}
 
       # The run entry uploads its samples even when it fails, so only a
       # non-empty series of medians is published; that entry's red is the signal.
       - name: Check the medians
         id: medians
         env:
-          REPO: ${{ matrix.repo }}
+          KEY: ${{ matrix.key }}
         run: |
           set -euo pipefail
           if jq -e 'type == "array" and length > 0' bench/bench.json >/dev/null 2>&1; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::${REPO}: no medians from the run job, so nothing was published"
+            echo "::notice::${KEY}: no medians from the run job, so nothing was published"
           fi
 
       # The action cannot bootstrap a missing data branch (verified in its
       # v1.22.1 dist: gh-repository mode is clone + plain checkout, which fails
       # on a branch that does not exist). Create the empty orphan branch once;
       # every later run sees it and this becomes a no-op. Same bot identity the
-      # publish-badge composite uses for its orphan `badges` branch.
+      # publish-badge composite uses for its orphan `badges` branch. Two module
+      # entries of one repo can race to create it, so a refused push that left
+      # the branch in place is the other entry's success.
       - name: Ensure benchmarks branch exists
         if: ${{ steps.medians.outputs.ok == 'true' }}
         env:
@@ -563,11 +626,15 @@ jobs:
           git -C "$tmp" config user.name 'github-actions[bot]'
           git -C "$tmp" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git -C "$tmp" commit -q --allow-empty -m 'ci: bootstrap benchmark data branch'
-          git -C "$tmp" push -q \
+          if ! git -C "$tmp" push -q \
             "https://x-access-token:${GH_TOKEN}@github.com/cplieger/${REPO}.git" \
-            benchmarks:benchmarks
+            benchmarks:benchmarks; then
+            git ls-remote --exit-code --heads \
+              "https://github.com/cplieger/${REPO}.git" benchmarks >/dev/null
+            echo "benchmarks branch was created in ${REPO} by another entry"
+          fi
           rm -rf "$tmp"
-          echo "created empty benchmarks branch in ${REPO}"
+          echo "benchmarks branch ready in ${REPO}"
 
       # Publishes the median series to the consumer's orphan `benchmarks` branch,
       # never `badges`: publish-badge.sh rebuilds that from root *.json and
@@ -583,7 +650,8 @@ jobs:
           github-token: ${{ secrets.CI_SCHEDULE }}
           gh-repository: github.com/cplieger/${{ matrix.repo }}
           gh-pages-branch: benchmarks
-          benchmark-data-dir-path: .
+          # Each module keeps its own series under its dir; the root's stays at `.`.
+          benchmark-data-dir-path: ${{ matrix.dir }}
           auto-push: true
           alert-threshold: "150%"
           # The action comments on github.context.repo (dist/src/write.js:136), which
@@ -600,47 +668,65 @@ jobs:
       # reserves it), so the point is re-pointed at the benchmarked commit here.
       # bench-fix-attribution.py refuses any file that is not exactly the pinned
       # v1.22.1 format with this run's ci SHA newest, and round-trips byte-identical,
-      # so an unchanged run makes no commit.
+      # so an unchanged run makes no commit. Another module entry of the same repo
+      # can push the branch in between, so a refused push starts over from a
+      # fresh clone, at most five times.
       - name: Re-point the data point at the benchmarked commit
         if: ${{ steps.medians.outputs.ok == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
           REPO: ${{ matrix.repo }}
           SHA: ${{ matrix.sha }}
+          DIR: ${{ matrix.dir }}
         run: |
           set -euo pipefail
           work=$(mktemp -d)
           trap 'rm -rf "$work"' EXIT
+          data="${DIR}/data.js"
+          [ "$DIR" = . ] && data=data.js
 
-          git clone --quiet --depth 1 --branch benchmarks \
-            "https://x-access-token:${GH_TOKEN}@github.com/cplieger/${REPO}.git" \
-            "$work/data"
           gh api "repos/cplieger/${REPO}/commits/${SHA}" > "$work/commit.json"
 
-          python3 _ci/scripts/bench-fix-attribution.py \
-            --data-file "$work/data/data.js" \
-            --expect-commit "$GITHUB_SHA" \
-            --commit-json "$work/commit.json" \
-            --repo-url "https://github.com/cplieger/${REPO}"
+          for attempt in 1 2 3 4 5; do
+            rm -rf "$work/data"
+            git clone --quiet --depth 1 --branch benchmarks \
+              "https://x-access-token:${GH_TOKEN}@github.com/cplieger/${REPO}.git" \
+              "$work/data"
 
-          if git -C "$work/data" diff --quiet -- data.js; then
-            echo "data.js already correct - nothing to push"
-            exit 0
-          fi
+            python3 _ci/scripts/bench-fix-attribution.py \
+              --data-file "$work/data/${data}" \
+              --expect-commit "$GITHUB_SHA" \
+              --commit-json "$work/commit.json" \
+              --repo-url "https://github.com/cplieger/${REPO}"
 
-          git -C "$work/data" \
-            -c user.name='github-actions[bot]' \
-            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit --quiet -m "ci: attribute benchmark data to ${SHA}" -- data.js
-          git -C "$work/data" push --quiet origin benchmarks
-          echo "re-pointed ${REPO} benchmark data at ${SHA}"
+            if git -C "$work/data" diff --quiet -- "$data"; then
+              echo "${data} already correct - nothing to push"
+              exit 0
+            fi
 
-  # ─── Tracker issue per consumer (Pattern C, same shape as the siblings) ─────
-  # The action's alert comment is off (above), so this files a per-repo tracker
-  # issue like gremlins and stryker; a benchmark is a continuous series with no
-  # fixing artifact, so fuzz's per-finding shape would never auto-close. It reads
-  # each consumer's `benchmarks` branch, the durable full series, and regenerates
-  # the trend table weekly rather than rolling rendered markdown forward.
+            git -C "$work/data" \
+              -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit --quiet -m "ci: attribute benchmark data to ${SHA}" -- "$data"
+            if git -C "$work/data" push --quiet origin benchmarks; then
+              echo "re-pointed ${REPO} ${data} at ${SHA}"
+              exit 0
+            fi
+            echo "::warning::push of ${REPO} ${data} refused (attempt ${attempt}), retrying from a fresh clone"
+            sleep $((attempt * 3))
+          done
+          echo "::error::could not push ${REPO} ${data} after 5 attempts"
+          exit 1
+
+  # ─── Tracker issue per entry (Pattern C, same shape as the siblings) ────────
+  # The action's alert comment is off (above), so this files a tracker issue per
+  # enrolled module like gremlins and stryker: a repo's root module keeps the
+  # plain title and a nested one names its dir, so each regression flag points
+  # at one series. A benchmark is a continuous series with no fixing artifact,
+  # so fuzz's per-finding shape would never auto-close. It reads each module's
+  # data.js on the consumer's `benchmarks` branch, the durable full series, and
+  # regenerates the trend table weekly rather than rolling rendered markdown
+  # forward.
   aggregate:
     needs: [fanout, run, publish]
     if: ${{ always() && needs.fanout.outputs.matrix != '[]' }}
@@ -666,16 +752,20 @@ jobs:
 
       - name: Update the tracker issue in each consumer
         run: |
-          # NOT `set -e`: errexit is neutered inside the `if ! process_repo`
+          # NOT `set -e`: errexit is neutered inside the `if ! process_entry`
           # form, and an earlier sibling reported success while every repo failed.
           set -uo pipefail
 
           WEEK=$(date -u +'%Y-%m-%d %H:%M')
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          TITLE='Benchmark regression tracker'
-
-          process_repo() {
-            local repo="$1" R="cplieger/$1" work ent flag=off
+          process_entry() {
+            local repo="$1" dir="$2" slug="$3" R="cplieger/$1" work ent flag=off
+            local title='Benchmark regression tracker' data=data.js tag="$1"
+            if [ "$dir" != . ]; then
+              title="Benchmark regression tracker: ${dir}"
+              data="${dir}/data.js"
+              tag="${repo}-${slug}"
+            fi
 
             work=$(mktemp -d)
             if ! git clone --quiet --depth "$((12 + 1))" --branch benchmarks \
@@ -685,50 +775,56 @@ jobs:
               return 0
             fi
 
-            python3 scripts/tracker_issue.py --repo "$R" --label bench-tracker --title "$TITLE" \
-              --mode fetch --body-file "/tmp/existing-${repo}.md" || { rm -rf "$work"; return 1; }
+            if [ ! -f "$work/data/${data}" ]; then
+              echo "  ${repo} has no ${data} yet - nothing to track"
+              rm -rf "$work"
+              return 0
+            fi
+
+            python3 scripts/tracker_issue.py --repo "$R" --label bench-tracker --title "$title" \
+              --mode fetch --body-file "/tmp/existing-${tag}.md" || { rm -rf "$work"; return 1; }
 
             python3 scripts/bench-aggregate.py \
-              --repo "$repo" --data-file "$work/data/data.js" \
+              --repo "$repo" --module "$dir" --data-file "$work/data/${data}" \
               --week "$WEEK" --run-url "$RUN_URL" \
-              --regression-marker-file "/tmp/regression-${repo}.txt" \
-              --entries-marker-file "/tmp/entries-${repo}.txt" \
-              --existing-body-file "/tmp/existing-${repo}.md" > "/tmp/body-${repo}.md" || { rm -rf "$work"; return 1; }
+              --regression-marker-file "/tmp/regression-${tag}.txt" \
+              --entries-marker-file "/tmp/entries-${tag}.txt" \
+              --existing-body-file "/tmp/existing-${tag}.md" > "/tmp/body-${tag}.md" || { rm -rf "$work"; return 1; }
             rm -rf "$work"
 
             # No parseable series means no honest tracker body. Leave the issue
             # exactly as it was rather than publishing an empty one; the red run
             # leg is the signal for that.
-            ent=$(cat "/tmp/entries-${repo}.txt" 2>/dev/null || echo 0)
+            ent=$(cat "/tmp/entries-${tag}.txt" 2>/dev/null || echo 0)
             if [ "$ent" -eq 0 ]; then
-              echo "  no benchmarks in ${repo}'s newest point - leaving the issue untouched"
+              echo "  no benchmarks in ${data}'s newest point - leaving the issue untouched"
               return 0
             fi
 
-            if [ "$(cat "/tmp/regression-${repo}.txt" 2>/dev/null)" = "true" ]; then
+            if [ "$(cat "/tmp/regression-${tag}.txt" 2>/dev/null)" = "true" ]; then
               flag=on
             fi
-            python3 scripts/tracker_issue.py --repo "$R" --label bench-tracker --title "$TITLE" \
-              --mode upsert --body-file "/tmp/body-${repo}.md" \
+            python3 scripts/tracker_issue.py --repo "$R" --label bench-tracker --title "$title" \
+              --mode upsert --body-file "/tmp/body-${tag}.md" \
               --flag-label bench-regression --flag "$flag" || return 1
             return 0
           }
 
-          repos=$(printf '%s' "$MATRIX" | jq -r '.[].repo' | sort -u)
-          if [ -z "$repos" ]; then
-            echo "::error::fanout produced no repo names; nothing to track"
+          entries=$(printf '%s' "$MATRIX" | jq -r '.[] | [.repo, .dir, .slug, .key] | @tsv' | LC_ALL=C sort -u)
+          if [ -z "$entries" ]; then
+            echo "::error::the fanout produced no entries, so there is nothing to track"
             exit 1
           fi
 
           had_failure=0
-          for repo in $repos; do
-            echo "::group::$repo"
-            if ! process_repo "$repo"; then
-              echo "::warning::tracker update failed for ${repo} - continuing"
+          while IFS=$'\t' read -r repo dir slug key; do
+            echo "::group::$key"
+            if ! process_entry "$repo" "$dir" "$slug"; then
+              echo "::warning::tracker update failed for ${key} - continuing"
               had_failure=1
             fi
             echo "::endgroup::"
-          done
+          done <<<"$entries"
           if [ "$had_failure" -ne 0 ]; then
             echo "::error::one or more tracker-issue updates failed"
             exit 1

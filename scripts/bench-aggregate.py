@@ -224,8 +224,9 @@ def render_rows(points: list[dict], repo_url: str) -> str:
 
 
 def build_body(
-    data: dict, repo: str, week: str, run_url: str, existing: str
+    data: dict, repo: str, week: str, run_url: str, existing: str, module: str = '.'
 ) -> tuple[str, bool, int]:
+    """A nested module's body names its dir in the title and links its own series."""
     suite, points = next(iter(data['entries'].items()))
     if not points:
         raise DataError(f'suite {suite!r} has no data points')
@@ -249,14 +250,17 @@ def build_body(
     if overflow:
         findings += f'\n_… and {overflow} more; full series on the `benchmarks` branch._\n'
 
+    title, label, chart_url = TITLE, repo, f'{repo_url}/tree/benchmarks'
+    if module != '.':
+        title, label, chart_url = f'{TITLE}: {module}', f'{repo}/{module}', f'{chart_url}/{module}'
     body = (
         HEADER_TPL.format(
-            title=TITLE,
-            repo=repo,
+            title=title,
+            repo=label,
             n=BASELINE_POINTS,
             week=week,
             run_url=run_url,
-            chart_url=f'{repo_url}/tree/benchmarks',
+            chart_url=chart_url,
         )
         + '\n## Trend\n\n'
         + trackerlib.sentinel_block(
@@ -281,6 +285,7 @@ def main() -> int:
     )
     ap.add_argument('--repo', required=True, help='repo name without owner')
     ap.add_argument('--data-file', required=True, type=pathlib.Path, help="the consumer's data.js")
+    ap.add_argument('--module', default='.', help="the module's dir in the repo, or . for the root")
     ap.add_argument('--week', required=True, help='YYYY-MM-DD HH:MM')
     ap.add_argument('--run-url', required=True)
     ap.add_argument('--existing-body-file', type=pathlib.Path, default=None)
@@ -302,7 +307,9 @@ def main() -> int:
     # misleading empty tracker. The workflow decides whether that is fatal.
     try:
         data = load_series(args.data_file)
-        body, regression, entries = build_body(data, args.repo, args.week, args.run_url, existing)
+        body, regression, entries = build_body(
+            data, args.repo, args.week, args.run_url, existing, args.module
+        )
     except (DataError, OSError) as err:
         print(f'[{args.repo}] bench-aggregate: {err}', file=sys.stderr)
         if args.entries_marker_file:
