@@ -443,19 +443,14 @@ def running_steps(shard: int) -> list[str]:
     return [s['name'] for s in ts_ci()['jobs']['validate']['steps'] if scope.condition(s.get('if'))]
 
 
-# Logs each playwright call, so a test sees which engines were asked for. The
-# install-deps dry run answers as $STUB_DEPS says: none missing, two missing, or
-# a failed simulation; the real install-deps fails when $STUB_INSTALL_DEPS=fail.
+# Logs each playwright call, so a test sees which engines were asked for, in
+# order. install-deps prints an apt line and fails when $STUB_INSTALL_DEPS=fail.
 NPX_PLAYWRIGHT_STUB = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$STUB_LOG/npx"
 case "$*" in
-  *"install-deps --dry-run"*)
-    case "${STUB_DEPS:-none}" in
-      none) echo 'All system dependencies are installed.' ;;
-      list) printf 'Missing system dependencies (2):\\n  libfoo1\\n  libbar2.0-0\\n' ;;
-      *) echo "Failed to run 'apt-get install -s' to simulate dependency install"; exit 1 ;;
-    esac ;;
-  *install-deps*) [ "${STUB_INSTALL_DEPS:-ok}" = ok ] ;;
+  *install-deps*)
+    echo 'E: Unable to fetch some archives'
+    [ "${STUB_INSTALL_DEPS:-ok}" = ok ] ;;
 esac
 """
 
@@ -499,13 +494,13 @@ class InstallStep(Harness):
                 self.assertLess(names.index('Install deps'), names.index(INSTALL_STEP))
                 self.assertLess(names.index(INSTALL_STEP), names.index(SHARDED[job]))
 
-    def test_each_list_installs_chromium_alone_and_asks_what_the_rest_lack(self):
+    def test_each_list_installs_chromium_alone_and_the_rest_after_their_libraries(self):
         chromium = '--no-install playwright install chromium\n'
 
         def rest(engines: str) -> str:
             return (
+                f'--no-install playwright install-deps {engines}\n'
                 f'--no-install playwright install {engines}\n'
-                f'--no-install playwright install-deps --dry-run {engines}\n'
             )
 
         for browsers, want in (
@@ -520,41 +515,30 @@ class InstallStep(Harness):
             with self.subTest(browsers=browsers):
                 run = self.install(browsers)
                 self.assertEqual(run.rc, 0, run.out)
-                # Nothing is missing, so install-deps and its apt never run.
                 self.assertEqual(run.logged('npx'), want)
 
-    def test_missing_libraries_are_installed_by_playwright_under_a_time_bound(self):
-        for deps in ('list', 'fail'):
-            with self.subTest(dry_run=deps):
-                run = self.install('firefox,webkit', STUB_DEPS=deps)
-                self.assertEqual(run.rc, 0, run.out)
-                self.assertTrue(
-                    run.logged('npx').endswith(
-                        '--no-install playwright install-deps firefox webkit\n'
-                    ),
-                    run.logged('npx'),
-                )
+    def test_the_library_install_is_bounded_and_a_failure_names_the_outage(self):
         install = next(
             line for line in self.STEP['run'].splitlines() if 'playwright install-deps "' in line
         )
         self.assertIn('timeout 300 ', install)
-        self.assertIn('> "$log" 2>&1 < /dev/null', install)
-
-    def test_a_failed_install_fails_the_step_with_the_outage_named(self):
-        run = self.install('webkit', STUB_DEPS='list', STUB_INSTALL_DEPS='fail')
+        run = self.install('webkit', STUB_INSTALL_DEPS='fail')
         self.assertEqual(run.rc, 1, run.out)
         self.assertIn('Ubuntu mirror or DNS outage', run.out)
+        # apt's own output reaches the log, and no engine installs without its libraries.
+        self.assertIn('E: Unable to fetch some archives', run.out)
+        self.assertEqual(run.logged('npx'), '--no-install playwright install-deps webkit\n')
 
     def test_a_self_hosted_runner_installs_without_the_system_libraries(self):
         """A self-hosted runner may grant no root for apt, so Firefox and WebKit
-        install alone there; a hosted one also asks what it lacks."""
+        install alone there; a hosted one installs their libraries first."""
         for runner, want in (
             ('self-hosted', '--no-install playwright install firefox webkit\n'),
             (
                 'github-hosted',
                 (
+                    '--no-install playwright install-deps firefox webkit\n'
                     '--no-install playwright install firefox webkit\n'
-                    '--no-install playwright install-deps --dry-run firefox webkit\n'
                 ),
             ),
         ):
