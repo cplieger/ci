@@ -109,7 +109,9 @@ class Evaluate:
         tok = self.tokens.pop(0)
         if tok == '(':
             out = self.either()
-            assert self.tokens.pop(0) == ')'
+            close = self.tokens.pop(0)
+            if close != ')':
+                raise ValueError(f'expected ) in the runs-on expression, got {close!r}')
             return out
         if tok.startswith("'"):
             return tok[1:-1]
