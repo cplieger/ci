@@ -1009,7 +1009,7 @@ jobs:
       - name: Comment ratio
         if: ${{ github.repository != 'cplieger/ci' }}
         continue-on-error: true
-        uses: cplieger/ci/actions/comment-audit@bc8e7a70763d9b879fade7be4a057c24295bc9a5 # v3
+        uses: cplieger/ci/actions/comment-audit@bc8cf8788db4b5f8b5edd3d9ff8cdcec54e52f4e # v3
 
       # No denylist, unlike comment-audit: a NOTICE is owed by every repo.
       - name: NOTICE audit
@@ -1022,7 +1022,7 @@ jobs:
       - name: NOTICE audit
         if: ${{ github.repository != 'cplieger/ci' }}
         continue-on-error: true
-        uses: cplieger/ci/actions/notice-audit@bc8e7a70763d9b879fade7be4a057c24295bc9a5 # v3
+        uses: cplieger/ci/actions/notice-audit@bc8cf8788db4b5f8b5edd3d9ff8cdcec54e52f4e # v3
 
       # The dashboard check comes from this workflow's own commit, so it needs
       # no pin of its own.
