@@ -460,10 +460,13 @@ class InstallStep(Harness):
         (self.bin / 'npx').write_text(NPX_PLAYWRIGHT_STUB)
         (self.bin / 'npx').chmod(0o755)
 
-    def install(self, browsers: str, enrolled: bool = True):
+    def install(self, browsers: str, enrolled: bool = True, runner: str | None = None):
         dev = {'@vitest/browser-playwright': '5.1.0'} if enrolled else {}
         (self.pkg / 'package.json').write_text(json.dumps({'name': 'f', 'devDependencies': dev}))
-        return self.run_step({'CPLIEGER_BROWSERS': browsers})
+        env = {'CPLIEGER_BROWSERS': browsers}
+        if runner is not None:
+            env['RUNNER_ENVIRONMENT'] = runner
+        return self.run_step(env)
 
     def test_both_jobs_run_the_same_install_on_the_read_engines(self):
         floor = workflow_step(TS_CI, 'engines-floor', INSTALL_STEP)
@@ -504,6 +507,19 @@ class InstallStep(Harness):
             with self.subTest(browsers=browsers):
                 (self.tmp / 'log' / 'npx').unlink(missing_ok=True)
                 run = self.install(browsers)
+                self.assertEqual(run.rc, 0, run.out)
+                self.assertEqual(run.logged('npx'), want)
+
+    def test_a_self_hosted_runner_installs_without_the_system_libraries(self):
+        """A self-hosted runner may grant no root for apt, so Firefox and WebKit
+        install without --with-deps; a hosted one keeps it."""
+        for runner, want in (
+            ('self-hosted', '--no-install playwright install firefox webkit\n'),
+            ('github-hosted', '--no-install playwright install --with-deps firefox webkit\n'),
+        ):
+            with self.subTest(runner=runner):
+                (self.tmp / 'log' / 'npx').unlink(missing_ok=True)
+                run = self.install('firefox,webkit', runner=runner)
                 self.assertEqual(run.rc, 0, run.out)
                 self.assertEqual(run.logged('npx'), want)
 

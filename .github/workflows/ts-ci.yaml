@@ -212,8 +212,8 @@ jobs:
       # Browser Mode enrols by the `@vitest/browser-playwright` devDependency; the
       # engines are the validated `cplieger.browsers` in CPLIEGER_BROWSERS. No
       # `--with-deps` for Chromium: the image carries its libraries, and that apt
-      # fetch has no throughput bound. Firefox and WebKit need it, so the timeout
-      # bounds a slow mirror. The pinned `playwright` (`--no-install`) picks the
+      # fetch has no throughput bound. Firefox and WebKit take it on a hosted
+      # runner, so the timeout bounds a slow mirror. The pinned `playwright` (`--no-install`) picks the
       # builds its library expects; not `--only-shell`, since the configs use
       # `channel: "chromium"`. Setup, so outside the soft-gate block.
       - name: Install browsers (vitest browser mode)
@@ -233,7 +233,13 @@ jobs:
               esac
             done
             if [ "${#with_deps[@]}" -gt 0 ]; then
-              npx --no-install playwright install --with-deps "${with_deps[@]}"
+              # --with-deps needs root for apt, which a self-hosted runner may
+              # not grant; its image carries the libraries. Unset reads hosted.
+              if [ "${RUNNER_ENVIRONMENT:-github-hosted}" = github-hosted ]; then
+                npx --no-install playwright install --with-deps "${with_deps[@]}"
+              else
+                npx --no-install playwright install "${with_deps[@]}"
+              fi
             fi
           else
             echo "no @vitest/browser-playwright devDependency; skipping browser install"
@@ -638,7 +644,13 @@ jobs:
               esac
             done
             if [ "${#with_deps[@]}" -gt 0 ]; then
-              npx --no-install playwright install --with-deps "${with_deps[@]}"
+              # --with-deps needs root for apt, which a self-hosted runner may
+              # not grant; its image carries the libraries. Unset reads hosted.
+              if [ "${RUNNER_ENVIRONMENT:-github-hosted}" = github-hosted ]; then
+                npx --no-install playwright install --with-deps "${with_deps[@]}"
+              else
+                npx --no-install playwright install "${with_deps[@]}"
+              fi
             fi
           else
             echo "no @vitest/browser-playwright devDependency; skipping browser install"
