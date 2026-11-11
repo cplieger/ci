@@ -34,12 +34,6 @@ while IFS= read -r -d '' f; do
       continue
       ;;
   esac
-  case "/$d/" in
-    */../* | */./*)
-      echo "::warning::go-units: skipped module dir '$d', which holds a '.' or '..' segment" >&2
-      continue
-      ;;
-  esac
   if [ -z "$(find "$tree/$d" -name '*.go' -type f -print -quit)" ]; then
     continue
   fi

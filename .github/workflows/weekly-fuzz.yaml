@@ -369,7 +369,11 @@ jobs:
                 prune+=(-path "./${d}" -prune -o)
               fi
             done
-            seedpath=$(find "$start" ${prune[@]+"${prune[@]}"} -path "*/testdata/fuzz/${target}/${hash}" -print -quit 2>/dev/null)
+            if ! seedpath=$(find "$start" ${prune[@]+"${prune[@]}"} -path "*/testdata/fuzz/${target}/${hash}" -print -quit); then
+              echo "::warning::the seed search for '${title}' failed, so the issue stays open this week"
+              had_failure=1
+              continue
+            fi
             if [ -n "$seedpath" ]; then
               msg="Closed automatically: seed \`${seedpath#./}\` was committed; now part of the deterministic regression corpus."
               printf '%s\n' "$msg" > "$RUNNER_TEMP/closed.md"

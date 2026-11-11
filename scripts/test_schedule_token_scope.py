@@ -147,12 +147,14 @@ esac
 # $TREES/<repo> lists (the root when it lists none). Each dir $TREES/<repo>.mods
 # lists is a nested module with one fuzz target and one benchmark, and with
 # $TREES/<repo>.noroot the root holds no module. With $TREES/<repo>.nohead the
-# clone succeeds but leaves no resolvable HEAD.
+# clone succeeds but leaves no resolvable HEAD, and with $TREES/<repo>.noclone it
+# fails.
 FANOUT_GIT_STUB = """#!/usr/bin/env bash
 printf '%s\n' "$*" >>"$STUB_LOG"
 if [ "$1" = -C ]; then [ -f "$2/.nohead" ] && exit 128; echo "$SHA"; exit 0; fi
 dest="${@: -1}"
 r=$(basename "${@: -2:1}" .git)
+[ -f "$TREES/$r.noclone" ] && exit 128
 mkdir -p "$dest"
 [ -f "$TREES/$r.nohead" ] && : >"$dest/.nohead"
 if [ ! -f "$TREES/$r.noroot" ]; then
@@ -198,6 +200,7 @@ class FanoutReplay:
         mods: dict[str, list[str]] | None = None,
         noroot: tuple[str, ...] = (),
         extra: tuple[str, ...] = (),
+        noclone: tuple[str, ...] = (),
     ) -> dict:
         """Replays a fanout; `extra` adds public live repositories to the listing."""
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -221,6 +224,8 @@ class FanoutReplay:
             (trees / f'{repo}.mods').write_text(''.join(f'{d}\n' for d in dirs))
         for repo in noroot:
             (trees / f'{repo}.noroot').write_text('')
+        for repo in noclone:
+            (trees / f'{repo}.noclone').write_text('')
         rc, result, log = replay_job(
             tmp,
             name,
@@ -239,6 +244,7 @@ class FanoutReplay:
         for line in log:
             self.assertNotIn('extraheader', line)
         clones = [line.split()[-2] for line in log if line.startswith('clone ')]
+        self.clones = clones
         names = '|'.join(('xmlx', 'zpub', *extra))
         self.assertTrue(all(re.search(rf'/({names})\.git$', url) for url in clones), clones)
         return result['steps']['fanout']['outputs']
@@ -346,6 +352,29 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
         )
         self.assertEqual(outputs['live'], 'xmlx zpub go')
         self.assertIn('go/xmlx', outputs['enrolled'].split())
+
+    def test_a_repo_whose_keys_enrol_apart_is_cloned_once_and_dropped_whole(self):
+        # ENROLLED puts langtag between go/keyenc and go/urlform.
+        outputs = self.fanout(
+            'weekly-bench.yaml',
+            extra=('go', 'langtag'),
+            mods={'go': ['keyenc', 'urlform']},
+            noroot=('go',),
+            noclone=('go',),
+        )
+        self.assertEqual([e['key'] for e in json.loads(outputs['matrix'])], ['langtag'])
+        self.assertEqual(sum(url.endswith('/go.git') for url in self.clones), 1)
+
+    def test_a_repo_with_no_head_drops_every_key_and_is_read_once(self):
+        outputs = self.fanout(
+            'weekly-bench.yaml',
+            extra=('go', 'langtag'),
+            mods={'go': ['keyenc', 'urlform']},
+            noroot=('go',),
+            nohead=('go',),
+        )
+        self.assertEqual([e['key'] for e in json.loads(outputs['matrix'])], ['langtag'])
+        self.assertEqual(sum(url.endswith('/go.git') for url in self.clones), 1)
 
     def test_the_bench_only_filter_takes_a_repo_or_one_key(self):
         for only, keys in (('go', ['go/xmlx', 'go/jsonx']), ('go/jsonx', ['go/jsonx'])):
@@ -1342,12 +1371,20 @@ class FuzzPerModule(unittest.TestCase):
             'xmlx/x.go': '',
             'jsonx/testdata/fuzz/FuzzP/a1b2': 'seed',
             'jsonx/testdata/fuzz/FuzzR/c3d4': 'seed',
+            # A module inside jsonx: its seed closes no jsonx issue.
+            'jsonx/inner/go.mod': 'module i\n',
+            'jsonx/inner/i.go': '',
+            'jsonx/inner/testdata/fuzz/FuzzQ/e5f6': 'seed',
+            # A dir named like a substring of a module, which a loose match would take.
+            'json/testdata/fuzz/FuzzP/a1b2': 'seed',
         }
         titles = (
             '[fuzz] FuzzP (jsonx) regression — a1b2',
             '[fuzz] FuzzP (xmlx) regression — a1b2',
             '[fuzz] FuzzR regression — c3d4',
             '[fuzz] FuzzP (../jsonx) regression — a1b2',
+            '[fuzz] FuzzQ (jsonx) regression — e5f6',
+            '[fuzz] FuzzP (json) regression — a1b2',
         )
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         closed = self.report(tmp / 'nested', '', modules, titles)

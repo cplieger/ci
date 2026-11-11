@@ -303,23 +303,20 @@ jobs:
               # Plain git clone over HTTPS draws no API quota, so a rate-limited
               # run can still clone; the gh CLI would resolve through GraphQL,
               # whose quota this run may already have spent.
+              # A failure leaves sha empty, and every key of the repo, this one
+              # included, is logged as skipped below.
               if ! git clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
                 echo "::warning::clone failed for ${r} - skipping"
-                continue
-              fi
               # Guarded for the same reason as weekly-stryker's copy: a clone that
               # exits 0 with no resolvable HEAD makes rev-parse exit 128, and
               # under `bash -e` that kills the fanout and every other repo's
               # matrix entry with it. One skipped repo is the right blast radius.
-              if ! sha=$(git -C scan rev-parse HEAD 2>/dev/null); then
+              elif ! sha=$(git -C scan rev-parse HEAD 2>/dev/null); then
                 echo "::warning::cannot resolve HEAD for ${r} - skipping"
                 sha=""
-                continue
-              fi
-              if ! units=$(bash _ci/scripts/go-units.sh scan '^func Benchmark'); then
+              elif ! units=$(bash _ci/scripts/go-units.sh scan '^func Benchmark'); then
                 echo "::warning::module discovery failed for ${r} - skipping"
                 units="" sha=""
-                continue
               fi
             fi
             if [ -z "$sha" ]; then
