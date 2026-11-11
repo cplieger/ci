@@ -242,12 +242,28 @@ jobs:
               esac
             done
             if [ "${#with_deps[@]}" -gt 0 ]; then
-              # --with-deps needs root for apt, which a self-hosted runner may
-              # not grant; its image carries the libraries. Unset reads hosted.
+              npx --no-install playwright install "${with_deps[@]}"
+              # The system libraries need root for apt, which a self-hosted
+              # runner may not grant; its image carries them. Unset reads
+              # hosted. Playwright's install-deps runs apt-get update even when
+              # nothing is missing, and an Ubuntu mirror or DNS outage then
+              # stalls it to the step timeout, so ask first and bound it. Its
+              # output goes to a file: an apt the timeout leaves behind would
+              # otherwise hold the step's output open past the bound.
               if [ "${RUNNER_ENVIRONMENT:-github-hosted}" = github-hosted ]; then
-                npx --no-install playwright install --with-deps "${with_deps[@]}"
-              else
-                npx --no-install playwright install "${with_deps[@]}"
+                deps=$(npx --no-install playwright install-deps --dry-run "${with_deps[@]}" 2>&1) || deps=""
+                if grep -qx 'All system dependencies are installed.' <<< "$deps"; then
+                  echo "the runner already carries the system libraries for: ${with_deps[*]}"
+                else
+                  log="$RUNNER_TEMP/playwright-install-deps.log"
+                  rc=0
+                  timeout 300 npx --no-install playwright install-deps "${with_deps[@]}" > "$log" 2>&1 < /dev/null || rc=$?
+                  cat "$log"
+                  if [ "$rc" -ne 0 ]; then
+                    echo "::error::playwright install-deps for ${with_deps[*]} failed or ran past 5 minutes (exit ${rc}). An Ubuntu mirror or DNS outage is the usual cause: rerun the job once it clears."
+                    exit 1
+                  fi
+                fi
               fi
             fi
           else
@@ -653,12 +669,28 @@ jobs:
               esac
             done
             if [ "${#with_deps[@]}" -gt 0 ]; then
-              # --with-deps needs root for apt, which a self-hosted runner may
-              # not grant; its image carries the libraries. Unset reads hosted.
+              npx --no-install playwright install "${with_deps[@]}"
+              # The system libraries need root for apt, which a self-hosted
+              # runner may not grant; its image carries them. Unset reads
+              # hosted. Playwright's install-deps runs apt-get update even when
+              # nothing is missing, and an Ubuntu mirror or DNS outage then
+              # stalls it to the step timeout, so ask first and bound it. Its
+              # output goes to a file: an apt the timeout leaves behind would
+              # otherwise hold the step's output open past the bound.
               if [ "${RUNNER_ENVIRONMENT:-github-hosted}" = github-hosted ]; then
-                npx --no-install playwright install --with-deps "${with_deps[@]}"
-              else
-                npx --no-install playwright install "${with_deps[@]}"
+                deps=$(npx --no-install playwright install-deps --dry-run "${with_deps[@]}" 2>&1) || deps=""
+                if grep -qx 'All system dependencies are installed.' <<< "$deps"; then
+                  echo "the runner already carries the system libraries for: ${with_deps[*]}"
+                else
+                  log="$RUNNER_TEMP/playwright-install-deps.log"
+                  rc=0
+                  timeout 300 npx --no-install playwright install-deps "${with_deps[@]}" > "$log" 2>&1 < /dev/null || rc=$?
+                  cat "$log"
+                  if [ "$rc" -ne 0 ]; then
+                    echo "::error::playwright install-deps for ${with_deps[*]} failed or ran past 5 minutes (exit ${rc}). An Ubuntu mirror or DNS outage is the usual cause: rerun the job once it clears."
+                    exit 1
+                  fi
+                fi
               fi
             fi
           else

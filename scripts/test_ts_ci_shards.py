@@ -443,9 +443,20 @@ def running_steps(shard: int) -> list[str]:
     return [s['name'] for s in ts_ci()['jobs']['validate']['steps'] if scope.condition(s.get('if'))]
 
 
-# Logs each playwright install, so a test sees which engines were asked for.
+# Logs each playwright call, so a test sees which engines were asked for. The
+# install-deps dry run answers as $STUB_DEPS says: none missing, two missing, or
+# a failed simulation; the real install-deps fails when $STUB_INSTALL_DEPS=fail.
 NPX_PLAYWRIGHT_STUB = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$STUB_LOG/npx"
+case "$*" in
+  *"install-deps --dry-run"*)
+    case "${STUB_DEPS:-none}" in
+      none) echo 'All system dependencies are installed.' ;;
+      list) printf 'Missing system dependencies (2):\\n  libfoo1\\n  libbar2.0-0\\n' ;;
+      *) echo "Failed to run 'apt-get install -s' to simulate dependency install"; exit 1 ;;
+    esac ;;
+  *install-deps*) [ "${STUB_INSTALL_DEPS:-ok}" = ok ] ;;
+esac
 """
 
 
@@ -460,10 +471,11 @@ class InstallStep(Harness):
         (self.bin / 'npx').write_text(NPX_PLAYWRIGHT_STUB)
         (self.bin / 'npx').chmod(0o755)
 
-    def install(self, browsers: str, enrolled: bool = True, runner: str | None = None):
+    def install(self, browsers: str, enrolled: bool = True, runner: str | None = None, **stub: str):
         dev = {'@vitest/browser-playwright': '5.1.0'} if enrolled else {}
         (self.pkg / 'package.json').write_text(json.dumps({'name': 'f', 'devDependencies': dev}))
-        env = {'CPLIEGER_BROWSERS': browsers}
+        (self.tmp / 'log' / 'npx').unlink(missing_ok=True)
+        env = {'CPLIEGER_BROWSERS': browsers, **stub}
         if runner is not None:
             env['RUNNER_ENVIRONMENT'] = runner
         return self.run_step(env)
@@ -487,38 +499,66 @@ class InstallStep(Harness):
                 self.assertLess(names.index('Install deps'), names.index(INSTALL_STEP))
                 self.assertLess(names.index(INSTALL_STEP), names.index(SHARDED[job]))
 
-    def test_each_list_installs_chromium_alone_and_the_rest_with_their_libraries(self):
+    def test_each_list_installs_chromium_alone_and_asks_what_the_rest_lack(self):
         chromium = '--no-install playwright install chromium\n'
+
+        def rest(engines: str) -> str:
+            return (
+                f'--no-install playwright install {engines}\n'
+                f'--no-install playwright install-deps --dry-run {engines}\n'
+            )
+
         for browsers, want in (
             ('chromium', chromium),
-            (
-                'chromium,firefox',
-                chromium + '--no-install playwright install --with-deps firefox\n',
-            ),
-            (
-                'chromium,firefox,webkit',
-                chromium + '--no-install playwright install --with-deps firefox webkit\n',
-            ),
-            ('chromium,webkit', chromium + '--no-install playwright install --with-deps webkit\n'),
-            ('firefox,webkit', '--no-install playwright install --with-deps firefox webkit\n'),
-            ('firefox', '--no-install playwright install --with-deps firefox\n'),
-            ('webkit', '--no-install playwright install --with-deps webkit\n'),
+            ('chromium,firefox', chromium + rest('firefox')),
+            ('chromium,firefox,webkit', chromium + rest('firefox webkit')),
+            ('chromium,webkit', chromium + rest('webkit')),
+            ('firefox,webkit', rest('firefox webkit')),
+            ('firefox', rest('firefox')),
+            ('webkit', rest('webkit')),
         ):
             with self.subTest(browsers=browsers):
-                (self.tmp / 'log' / 'npx').unlink(missing_ok=True)
                 run = self.install(browsers)
                 self.assertEqual(run.rc, 0, run.out)
+                # Nothing is missing, so install-deps and its apt never run.
                 self.assertEqual(run.logged('npx'), want)
+
+    def test_missing_libraries_are_installed_by_playwright_under_a_time_bound(self):
+        for deps in ('list', 'fail'):
+            with self.subTest(dry_run=deps):
+                run = self.install('firefox,webkit', STUB_DEPS=deps)
+                self.assertEqual(run.rc, 0, run.out)
+                self.assertTrue(
+                    run.logged('npx').endswith(
+                        '--no-install playwright install-deps firefox webkit\n'
+                    ),
+                    run.logged('npx'),
+                )
+        install = next(
+            line for line in self.STEP['run'].splitlines() if 'playwright install-deps "' in line
+        )
+        self.assertIn('timeout 300 ', install)
+        self.assertIn('> "$log" 2>&1 < /dev/null', install)
+
+    def test_a_failed_install_fails_the_step_with_the_outage_named(self):
+        run = self.install('webkit', STUB_DEPS='list', STUB_INSTALL_DEPS='fail')
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn('Ubuntu mirror or DNS outage', run.out)
 
     def test_a_self_hosted_runner_installs_without_the_system_libraries(self):
         """A self-hosted runner may grant no root for apt, so Firefox and WebKit
-        install without --with-deps; a hosted one keeps it."""
+        install alone there; a hosted one also asks what it lacks."""
         for runner, want in (
             ('self-hosted', '--no-install playwright install firefox webkit\n'),
-            ('github-hosted', '--no-install playwright install --with-deps firefox webkit\n'),
+            (
+                'github-hosted',
+                (
+                    '--no-install playwright install firefox webkit\n'
+                    '--no-install playwright install-deps --dry-run firefox webkit\n'
+                ),
+            ),
         ):
             with self.subTest(runner=runner):
-                (self.tmp / 'log' / 'npx').unlink(missing_ok=True)
                 run = self.install('firefox,webkit', runner=runner)
                 self.assertEqual(run.rc, 0, run.out)
                 self.assertEqual(run.logged('npx'), want)
