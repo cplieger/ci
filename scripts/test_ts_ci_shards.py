@@ -294,9 +294,9 @@ class PackageSettings(Harness):
         run = self.read({'cplieger': {'vitestShards': 2}, 'engines': {'node': '>=22'}})
         job = ts_ci()['jobs']['package']
         steps = {self.STEP['id']: {'outputs': run.outputs}}
-        self.assertEqual(
-            {k: evaluate(v, {'steps': steps}) for k, v in job['outputs'].items()}, run.outputs
-        )
+        # test_ts_ci_sse_fixture covers the outputs the fixture read writes.
+        mine = {k: v for k, v in job['outputs'].items() if f'steps.{self.STEP["id"]}.' in v}
+        self.assertEqual({k: evaluate(v, {'steps': steps}) for k, v in mine.items()}, run.outputs)
 
     def test_a_floor_is_logged_without_a_notice(self):
         run = self.read({'engines': {'node': '>=24'}})
@@ -663,10 +663,15 @@ class FloorTestStep(TestStep):
 class FloorShardSteps(unittest.TestCase):
     def test_every_shard_runs_every_floor_step(self):
         """The job condition holds the floor gate, so each shard runs the setup,
-        the install and its part of the suite, and no step tolerates a failure."""
+        the install and its part of the suite, and no step tolerates a failure.
+        Only the Go test server steps take a condition, the package's opt-in."""
+        opt_in = "${{ needs.package.outputs.sse-fixture != '' }}"
         for step in ts_ci()['jobs']['engines-floor']['steps']:
             with self.subTest(step=step['name']):
-                self.assertNotIn('if', step)
+                if 'sseFixture' in step['name']:
+                    self.assertEqual(step['if'], opt_in)
+                else:
+                    self.assertNotIn('if', step)
                 self.assertNotIn('continue-on-error', step)
 
     def test_the_floor_job_runs_on_the_read_node_spec(self):
