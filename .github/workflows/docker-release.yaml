@@ -1032,9 +1032,15 @@ jobs:
 
       # upload-artifact off: the matrix legs would share the action's
       # default artifact name, and an artifact name can be written once.
+      # A runner image is a full Ubuntu userland, and its SBOM lists every
+      # file each package owns: the browser image's ran past 18 MB, which
+      # Rekor refuses at the attestation below (502). The package list,
+      # which every reader of the SBOM uses, stays whole without them.
       - name: Generate SBOM (from image)
         if: ${{ env.PROMOTED_DIGEST == '' }}
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        env:
+          SYFT_RELATIONSHIPS_PACKAGE_FILE_OWNERSHIP: "false"
         with:
           image: ${{ env.REGISTRY }}/${{ env.RUNNER_IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
           format: spdx-json
@@ -1348,7 +1354,7 @@ jobs:
       - name: Publish image-size badge
         if: ${{ steps.sizebadge.outputs.json != '' }}
         continue-on-error: true
-        uses: cplieger/ci/actions/publish-badge@4fe1acfe19c72c84a399b1f86a71ff15773ee317 # v3
+        uses: cplieger/ci/actions/publish-badge@135dbe2c118e0e96c451341d42341cbaeb2f7cb5 # v3
         with:
           repo: ${{ github.repository }}
           token: ${{ github.token }}
@@ -1914,7 +1920,7 @@ jobs:
         # The renderer's own failures are already caught inside the action (empty
         # `path` output); this covers the action itself failing to resolve.
         continue-on-error: true
-        uses: cplieger/ci/actions/render-hub-overview@4fe1acfe19c72c84a399b1f86a71ff15773ee317 # v3
+        uses: cplieger/ci/actions/render-hub-overview@135dbe2c118e0e96c451341d42341cbaeb2f7cb5 # v3
         with:
           owner: ${{ github.repository_owner }}
           repo: ${{ github.event.repository.name }}

@@ -45,7 +45,7 @@ The integration tests run when that build passes and the repository has a root `
 
 ## Choosing the runner
 
-`ci.yaml`, `security-scan.yaml` and the four workflows `ci.yaml` calls (`go-ci.yaml`, `ts-ci.yaml`, `shell-ci.yaml` and `deadset-ci.yaml`) take a `runner` input, a runner label that is empty by default. Empty runs every job on `ubuntu-26.04`. `ci.yaml` passes its input on to the workflows it calls.
+`ci.yaml`, `security-scan.yaml` and the four workflows `ci.yaml` calls (`go-ci.yaml`, `ts-ci.yaml`, `shell-ci.yaml` and `deadset-ci.yaml`) take a `runner` input, a runner label that is empty by default. Empty runs every job on `ubuntu-26.04`. `ci.yaml` passes its input on to the workflows it calls, and the synced `ci.yml` and `security.yml` pass the repository's `CI_RUNNER` variable, so setting that variable to a self-hosted runner's label moves the repository's jobs there, and deleting it moves them back.
 
 These jobs stay on GitHub's runners whatever the input says:
 
@@ -264,7 +264,7 @@ For a fixable finding of the daily scan of `main`, it asks Renovate to run the w
 
 For an OS package of an image whose final stage installs packages, it opens a rebuild pull request into `main` instead. The rebuild refreshes those packages only when an install runs after an `ARG PKG_REFRESH` line, in the same stage or in a stage it is built from. Otherwise the finding is listed in the issue.
 
-It also keeps one issue per repository, labelled `release-blocked`, and closes it once every section is clear. The title names the sections the issue holds, such as `Vulnerability fix has no automatic route`, so a finding that blocks no release does not read as a blocked one. The issue lists the Saturday update when it has not shipped by 12:00 UTC. It lists any security, expedited or rebuild pull request into `main` that has not shipped within three hours. It also lists every fixable finding with no automatic route, and a missing, older or incomplete scan. When a read fails, the issue keeps the sections that read would have checked as they were, and the issue is not closed that hour. It also stays open in an hour when a planned merge, rebuild or dashboard tick did not happen, for example because the dashboard changed after it was read.
+It also keeps one issue per repository, labelled `release-blocked`, and closes it once every section is clear. The title names the sections the issue holds, such as `Vulnerability fix has no automatic route`, so a finding that blocks no release does not read as a blocked one. The issue lists the Saturday update when it has not shipped by 12:00 UTC. It lists any security, expedited or rebuild pull request into `main` that has not shipped within three hours. An expedited one is the weekly `main` group opened early, or any other Renovate update into `main`, such as an update of the `ghcr.io/actions/actions-runner` base image. It also lists every fixable finding with no automatic route, and a missing, older or incomplete scan. When a read fails, the issue keeps the sections that read would have checked as they were, and the issue is not closed that hour. It also stays open in an hour when a planned merge, rebuild or dashboard tick did not happen, for example because the dashboard changed after it was read.
 
 ## The scheduled runs
 
