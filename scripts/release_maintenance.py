@@ -296,7 +296,9 @@ def plan_security(api: Api, repo: str, open_prs: list[dict]) -> tuple[list[dict]
 
 
 def main_kind(pr: dict, repo: str) -> str | None:
-    """`group`, `security` or `rebuild` for a machine pull request into `main`."""
+    """`group`, `security`, `rebuild` or `expedited` for a machine pull request into
+    `main`. `expedited` is any other Renovate update: cplieger/.github two-branch.json
+    opens some outside the weekly group, such as `ghcr.io/actions/actions-runner`."""
     if pr['base']['ref'] != 'main' or not own_head(pr, repo):
         return None
     head = pr['head']['ref']
@@ -304,8 +306,8 @@ def main_kind(pr: dict, repo: str) -> str | None:
         return 'group'
     if rc.main_intake_kind(head) == 'rebuild':
         return 'rebuild'
-    if head.startswith('renovate/') and 'security' in labels_of(pr):
-        return 'security'
+    if head.startswith('renovate/'):
+        return 'security' if 'security' in labels_of(pr) else 'expedited'
     return None
 
 
@@ -362,6 +364,8 @@ def due_of(pr: dict, kind: str) -> tuple[str, dt.datetime]:
 def describe(pr: dict, kind: str, section: str) -> str:
     if kind == 'group':
         kind = 'Saturday group' if section == 'weekly' else 'expedited group'
+    elif kind == 'expedited':
+        kind = 'expedited update'
     return f'#{pr["number"]} ({kind}, `{pr["head"]["ref"]}`)'
 
 
