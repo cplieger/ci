@@ -149,7 +149,12 @@ case "$*" in
       shift
     done
     exit 1 ;;
-  */contents/go.mod*) exit 0 ;;
+  */contents/go.mod*)
+    p="$*"
+    r=${p#*/repos/cplieger/}
+    r=${r%%/*}
+    if [ -f "$TREES/$r.noroot" ]; then echo 'gh: Not Found (HTTP 404)' >&2; exit 1; fi
+    exit 0 ;;
   */git/trees/*) echo 20000 ;;
   *) exit 1 ;;
 esac
@@ -158,7 +163,8 @@ esac
 # that file exists) and a benchmark, and a stryker config in each dir
 # $TREES/<repo> lists (the root when it lists none). Each dir $TREES/<repo>.mods
 # lists is a nested module with one fuzz target and one benchmark, and with
-# $TREES/<repo>.noroot the root holds no module. With $TREES/<repo>.nohead the
+# $TREES/<repo>.noroot the root holds no module. Every clone holds 12000 bytes
+# of non-test Go, past the gremlins fanout's size floor. With $TREES/<repo>.nohead the
 # clone succeeds but leaves no resolvable HEAD, and with $TREES/<repo>.noclone it
 # fails.
 FANOUT_GIT_STUB = """#!/usr/bin/env bash
@@ -169,6 +175,7 @@ r=$(basename "${@: -2:1}" .git)
 [ -f "$TREES/$r.noclone" ] && exit 128
 mkdir -p "$dest"
 [ -f "$TREES/$r.nohead" ] && : >"$dest/.nohead"
+head -c 12000 /dev/zero | tr '\0' ' ' >"$dest/big.go"
 if [ ! -f "$TREES/$r.noroot" ]; then
   printf 'module example.com/%s\n' "$r" >"$dest/go.mod"
   printf 'package x\nfunc FuzzX(f *testing.F) {}\nfunc BenchmarkX(b *testing.B) {}\n' >"$dest/x_test.go"
@@ -257,7 +264,7 @@ class FanoutReplay:
         self.assertEqual(rc, 0, result.get('failed'))
         for line in log:
             self.assertNotIn('extraheader', line)
-        clones = [line.split()[-2] for line in log if line.startswith('clone ')]
+        clones = [line.split()[-2] for line in log if 'clone' in line.split()]
         self.clones = clones
         names = '|'.join(('xmlx', 'zpub', *extra))
         self.assertTrue(all(re.search(rf'/({names})\.git$', url) for url in clones), clones)
@@ -298,6 +305,43 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
 
     def test_the_gremlins_fanout_emits_public_repositories(self):
         outputs = self.fanout('weekly-gremlins.yaml')
+        self.assertEqual(json.loads(outputs['repos']), PUBLIC)
+
+    def test_the_gremlins_fanout_keeps_a_repo_of_nested_modules_through_go_units(self):
+        outputs = self.fanout(
+            'weekly-gremlins.yaml',
+            extra=('go',),
+            mods={'go': ['keyenc', 'urlform']},
+            noroot=('go',),
+        )
+        self.assertEqual(json.loads(outputs['repos']), [*PUBLIC, 'go'])
+        self.assertIn('https://github.com/cplieger/go.git', self.clones)
+
+    def test_the_gremlins_fanout_skips_a_repo_with_no_go_module_and_keeps_a_root_one(self):
+        outputs = self.fanout('weekly-gremlins.yaml', noroot=('zpub',))
+        self.assertEqual(json.loads(outputs['repos']), [r for r in PUBLIC if r != 'zpub'])
+        self.assertEqual(
+            sorted(self.clones), sorted(f'https://github.com/cplieger/{r}.git' for r in PUBLIC)
+        )
+
+    def test_every_fanout_clone_in_a_repo_loop_is_bounded(self):
+        # One stalled clone in a serial loop would hold the job until its timeout.
+        seen = 0
+        for name in ('weekly-gremlins.yaml', 'weekly-fuzz.yaml', 'weekly-bench.yaml'):
+            for job, spec in load(name)['jobs'].items():
+                for s in spec.get('steps', []):
+                    lines = s.get('run', '').splitlines()
+                    for i, line in enumerate(lines):
+                        if re.search(r'\bclone\b.*cplieger/\$\{r\}\.git', line):
+                            seen += 1
+                            with self.subTest(name, job=job, line=line.strip()):
+                                self.assertIn(
+                                    'timeout 120 git', ' '.join(lines[max(0, i - 1) : i + 1])
+                                )
+        self.assertEqual(seen, 4)
+
+    def test_the_gremlins_fanout_runs_a_repo_it_cannot_clone_so_its_call_shows_it(self):
+        outputs = self.fanout('weekly-gremlins.yaml', noclone=('zpub',))
         self.assertEqual(json.loads(outputs['repos']), PUBLIC)
 
     def test_the_fuzz_fanout_emits_public_repositories(self):
@@ -896,7 +940,6 @@ class ArtifactBinding(FanoutReplay, unittest.TestCase):
             env={
                 **os.environ,
                 'ENTRIES': json.dumps(entries),
-                'TARGET_MINUTES': '200',
                 'GITHUB_OUTPUT': str(out),
             },
         )
@@ -927,7 +970,7 @@ class ArtifactBinding(FanoutReplay, unittest.TestCase):
         ]
         needs = {
             'plan': {'result': 'success', 'outputs': {}},
-            'setup': {'result': 'success', 'outputs': {'key': 'a', 'shard_target_minutes': '240'}},
+            'setup': {'result': 'success', 'outputs': {'key': 'a'}},
         }
         matrix = [r for r in GREMLINS_MATRIX if r['repo'] == 'a']
         rc, result, log = replay_job(
@@ -943,7 +986,7 @@ class ArtifactBinding(FanoutReplay, unittest.TestCase):
             log,
             [
                 (
-                    'shard matrix --repo a --plan sizing/plan.json --attempts 3 --target-minutes 240 '
+                    'shard matrix --repo a --plan sizing/plan.json --attempts 3 '
                     '--history history/costs.json --out-plan run-plans/plan.json'
                 )
             ],

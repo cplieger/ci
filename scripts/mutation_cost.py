@@ -29,19 +29,22 @@ if TYPE_CHECKING:
 # Every plain log line starts with this, so the runner never reads one as a command.
 SAY_PREFIX = '- '
 
-# The bar a shard meets: its measured time within BAND of its projection, and
-# at most LONGEST_SHARD_MINUTES, two thirds of the hosted runner's 360-min job
-# limit. TOP_MINUTES, the band's top, is the longest projection that keeps both.
+# The bar a sharded run meets (bar_faults): the measured time within BAND of the
+# projection, and every job, slowest runner included, ended by SAFE_JOB_MINUTES,
+# 60 min under the hosted runner's 360-min job limit.
 BAND = 0.15
-LONGEST_SHARD_MINUTES = 240
-TOP_MINUTES = LONGEST_SHARD_MINUTES / (1 + BAND)
+SAFE_JOB_MINUTES = 300
+# The largest ratio of two jobs' times on identical work: 1.76 in gremlins run
+# 43153682226 (one shard's work took 160 and 282 min), rounded up.
+# gremlins-shard.py's record job measures it each week and warns past this.
+SLOWDOWN = 1.8
 # A job matrix runs at most 256 jobs (https://docs.github.com/en/actions/reference/limits),
 # which one call's run matrix keeps: MAX_SHARDS dirs of MAX_SHARDS shards (Stryker),
 # or 3 attempts of MAX_SHARDS shards (gremlins).
 MATRIX_LIMIT = 256
-# deadset-ts's full Stryker run, about 36 machine-hours, is about 11 shards at
-# the 200-min target, and 16 leaves 1.5x room. A forged price therefore holds
-# at most 16 budget-length jobs of its run's concurrency group.
+# deadset-ts's full Stryker run, about 36 machine-hours, needs about 16 to 19 shards
+# at the band's top (5 to 31 min of setup). A forged price therefore holds at most
+# 16 budget-length jobs of its run's concurrency group.
 MAX_SHARDS = 16
 # A measured cost per mutant more than this factor either way from its probe's is
 # refused: run 42584241747's files measured 0.052 to 9.3 times their package's.
@@ -59,6 +62,8 @@ MAX_INPUT_BYTES = 32 * 2**20
 # holds '~' or '=', which entry_key uses as its separators.
 REPO_NAME = re.compile(r'[A-Za-z0-9._-]+')
 DIR_PART = re.compile(r'[A-Za-z0-9._-]+')
+# A git object id, SHA-1 or SHA-256: the file version a Stryker cost history's range rows belong to.
+GIT_BLOB = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
 
 
 def entry_key(repo: str, dir_: str | None = None) -> str:
@@ -136,9 +141,45 @@ def pack(items: list[Item], k: int, setup: dict[str, float]) -> list[Bin]:
     return bins
 
 
-def top_secs(target: float) -> float:
-    """The band's top for TARGET seconds: TARGET x (1 + BAND), never past TOP_MINUTES."""
-    return min(target * (1 + BAND), TOP_MINUTES * 60)
+def target_secs(setup: float) -> float:
+    """The most work one shard of SETUP seconds' setup takes so a SLOWDOWN-times slower runner,
+    which stretches the setup as well, ends by SAFE_JOB_MINUTES."""
+    return max(0.0, SAFE_JOB_MINUTES * 60 / SLOWDOWN - setup)
+
+
+# The band's top, setup and work together: a shard whose jobs average BAND over a projection
+# this long holds setup + target_secs(setup) whatever its setup.
+TOP_SECS = SAFE_JOB_MINUTES * 60 / (SLOWDOWN * (1 + BAND))
+
+
+def bar_faults(projected: list[float], attempts: list[list[float | None]]) -> list[str]:
+    """How a run misses the bar, or []: PROJECTED minutes per shard, and per attempt each shard's measured minutes.
+
+    Bar (a) never judges one job: with two or more attempts each shard's mean is
+    judged against its projection, and with one attempt the run's total against
+    its projected total, when it has two or more shards. Bar (b) judges every
+    job. A shard with no measure in some attempt has no mean, which misses the bar.
+    """
+    faults = []
+    measured: list[list[float]] = []
+    for i, want in enumerate(projected):
+        got = [a[i] for a in attempts if i < len(a) and a[i] is not None]
+        if len(got) < len(attempts) or not got:
+            faults.append(f'shard {i + 1} has no measure in every attempt')
+            continue
+        measured.append(got)
+        mean = sum(got) / len(got)
+        if len(got) > 1 and abs(mean - want) > want * BAND:
+            faults.append(f'shard {i + 1} averaged {mean:.1f} min against {want:.1f} projected')
+        if max(got) > SAFE_JOB_MINUTES:
+            faults.append(f'shard {i + 1} took {max(got):.1f} min, past {SAFE_JOB_MINUTES}')
+    if len(attempts) == 1 and len(projected) > 1 and len(measured) == len(projected):
+        want, got = sum(projected), sum(m[0] for m in measured)
+        if abs(got - want) > want * BAND:
+            faults.append(
+                f'the run took {got:.1f} min over its shards against {want:.1f} projected'
+            )
+    return faults
 
 
 def floor_secs(items: list[Item], setup: dict[str, float]) -> float:
@@ -147,17 +188,18 @@ def floor_secs(items: list[Item], setup: dict[str, float]) -> float:
 
 
 def choose(
-    items: list[Item], setup: dict[str, float], target: float, limit: int = MAX_SHARDS
+    items: list[Item], setup: dict[str, float], top: float, limit: int = MAX_SHARDS
 ) -> tuple[int, list[Bin]]:
-    """The shard count for TARGET seconds, at most LIMIT, and its packing.
+    """The shard count for a band whose top is TOP seconds (TOP_SECS), at most LIMIT, and its packing.
 
-    One job when it ends by the band's top (top_secs); else the fewest shards
-    that all land inside the band, else the fewest whose slowest ends by its
-    top. When no count gets there, because one item and its setup (the floor)
-    pass the top or LIMIT stops the search first, the fewest shards that reach
-    the floor, or failing that the lowest slowest shard.
+    The band runs from TOP x (1 - BAND) / (1 + BAND) to TOP. One job when it
+    ends by the top; else the fewest shards that all land inside the band, else
+    the fewest whose slowest ends by the top. When no count gets there, because
+    one item and its setup (the floor) pass the top or LIMIT stops the search
+    first, the fewest shards that reach the floor, or failing that the lowest
+    slowest shard.
     """
-    high, low = top_secs(target), target * (1 - BAND)
+    high, low = top, top * (1 - BAND) / (1 + BAND)
     one = pack(items, 1, setup)
     if one[0].load <= high:
         return 1, one
@@ -191,11 +233,11 @@ def choose(
 
 
 def capped(
-    k: int, bins: list[Bin], items: list[Item], setup: dict[str, float], target: float, limit: int
+    k: int, bins: list[Bin], items: list[Item], setup: dict[str, float], top: float, limit: int
 ) -> bool:
     """Whether LIMIT, not the prices, set choose's K: more shards would have ended its slowest sooner."""
     slowest = max((b.load for b in bins), default=0.0)
-    return k == limit < len(items) and slowest > max(top_secs(target), floor_secs(items, setup))
+    return k == limit < len(items) and slowest > max(top, floor_secs(items, setup))
 
 
 def cap_reason(cap: int) -> str:
@@ -213,8 +255,9 @@ def cap_note(where: str, plan: object) -> Template | None:
         return None
     note = t'{where}: runs in {plan.get("shards")!r:.20} shard(s), capped by {plan["capped"]:.200}'
     longest = max((m for m in plan.get('projected_minutes') or [] if nonnegative(m)), default=None)
-    if longest is not None and longest > TOP_MINUTES:
-        note += t', so its longest sized shard projects {longest} min, past the {TOP_MINUTES:.1f} min the band allows'
+    top = plan.get('top_minutes')
+    if longest is not None and nonnegative(top) and longest > top:
+        note += t', so its longest sized shard projects {longest} min, past the {top:.1f} min the band allows'
     shared = plan.get('unsized_shared')
     if isinstance(shared, list) and shared and all(isinstance(d, str) for d in shared):
         note += t'; unsized, planned as a full shard each, these share a shard: {", ".join(shared):.1000}'
@@ -368,9 +411,14 @@ def clean_files(files: object) -> dict[str, dict]:
 
 
 def record_fault(rec: object) -> str:
-    """Why REC is not a cost record as carry_forward writes it ({files: {path: {secs, mutants}}, setup_secs}), or ''."""
-    if not isinstance(rec, dict) or not set(rec) <= {'files', 'setup_secs'}:
-        return 'it is not a {files, setup_secs} object'
+    """Why REC is not a cost record ({files: {path: {secs, mutants}}, setup_secs}, Stryker's with blobs), or ''."""
+    if not isinstance(rec, dict) or not set(rec) <= {'files', 'setup_secs', 'blobs'}:
+        return 'it is not a {files, setup_secs, blobs} object'
+    blobs = rec.get('blobs', {})
+    if not isinstance(blobs, dict) or not all(
+        isinstance(v, str) and GIT_BLOB.fullmatch(v) for v in blobs.values()
+    ):
+        return 'its blobs are not all git object ids'
     files = rec.get('files', {})
     if (
         not isinstance(files, dict)

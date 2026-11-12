@@ -52,9 +52,6 @@ jobs:
       # A job's timeout-minutes cannot read env
       # (https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability).
       run_timeout_minutes: "350"
-      # scripts/mutation_cost.py choose packs shards from 15% under this up to
-      # TOP_MINUTES, which keeps its bar.
-      shard_target_minutes: "200"
     steps:
       - name: Checkout ci (for scripts/)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -116,7 +113,10 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.discover.outputs.entries) }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    # 30 min on marotte (run 43153701425); 120 leaves a 1.8x slower runner
+    # (mutation_cost.SLOWDOWN) room. Stryker ends a dry run at the config's
+    # dryRunTimeoutMinutes on any runner.
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -252,11 +252,10 @@ jobs:
         id: matrix
         env:
           ENTRIES: ${{ needs.discover.outputs.entries }}
-          TARGET_MINUTES: ${{ needs.discover.outputs.shard_target_minutes }}
         run: |
           set -euo pipefail
           out=$(python3 scripts/stryker-shard.py matrix --entries "${ENTRIES}" --plans plans \
-            --target-minutes "${TARGET_MINUTES}" --history history --out-plans run-plans)
+            --history history --out-plans run-plans)
           # The aggregate job downloads exactly these names.
           reports=$(jq -r '.merge | map("stryker-\(.key)") | if length == 1 then .[0] else "{\(join(","))}" end' <<<"$out")
           {
@@ -287,8 +286,8 @@ jobs:
     runs-on: ubuntu-26.04
     # 360 is the hosted-runner ceiling. An entry that outgrows one job shards;
     # each shard's Stryker stops 25 min before this cap, counted from the job's
-    # first script step (RUN_DEADLINE below), and gets 5 more to stop (the -k of
-    # stryker-run.sh's timeout).
+    # first script step (RUN_DEADLINE below), and gets 5 more to stop
+    # (stryker-run.sh's KILL_GRACE).
     timeout-minutes: ${{ fromJSON(needs.discover.outputs.run_timeout_minutes) }}
     permissions:
       contents: read
@@ -354,16 +353,19 @@ jobs:
           ENTRY: ${{ matrix.repo }}:${{ matrix.dir }}
           MUTATE: ${{ steps.shard.outputs.mutate }}
           RUN_DEADLINE: ${{ steps.shard.outputs.deadline }}
+        # The sampler logs a line a minute, which the log keeps when the runner
+        # is shut down, and keeps the same series for the upload below.
         run: |
           set -uo pipefail
           ci="${GITHUB_WORKSPACE}"
+          python3 "${ci}/scripts/runner-sample.py" --out "${RUNNER_TEMP}/samples.tsv" \
+            --disk "${GITHUB_WORKSPACE}" &
+          sampler=$!
+          trap 'kill "${sampler}" 2>/dev/null || true' EXIT
           rc=0
           REPORTER="${ci}/scripts/stryker-ci-reporter.mjs" CI_STRYKER_TIMES="${RUNNER_TEMP}/times.tsv" \
             CI_STRYKER_RESULT="${RUNNER_TEMP}/result.json" bash "${ci}/scripts/stryker-run.sh" || rc=$?
           echo "rc=${rc}" >> "$GITHUB_OUTPUT"
-          if [ "${rc}" -eq 124 ] || [ "${rc}" -eq 137 ]; then
-            echo "::error::${ENTRY}: the shard reached its time budget, so it publishes nothing and records what it measured"
-          fi
 
       # The merge job reads the result, its costs and meta.json; it takes the
       # repo and dir from its own matrix and checks them against meta.json.
@@ -393,6 +395,15 @@ jobs:
             '{repo: $repo, dir: $dir, shard: $shard, shards: $shards, complete: $complete, skipped: $skipped}' \
             > /tmp/stage/meta.json
           echo "complete=${complete}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload this shard's runner samples
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: strykersamples-${{ matrix.key }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/samples.tsv
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload this shard's result
         if: ${{ !cancelled() && steps.stryker.outputs.rc != '' }}

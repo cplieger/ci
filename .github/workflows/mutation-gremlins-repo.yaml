@@ -47,9 +47,6 @@ jobs:
       # scripts/gremlins-run.sh sizes --integration against this same cap.
       run_timeout_minutes: "350"
       plan_timeout_minutes: "90"
-      # scripts/mutation_cost.py choose packs shards from 15% under this up to
-      # TOP_MINUTES, which keeps its bar.
-      shard_target_minutes: "200"
     steps:
       - name: Checkout ci (for scripts/)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -83,9 +80,10 @@ jobs:
     permissions:
       contents: read
     # The call's entries for its result record: scripts/gremlins-prepare.sh
-    # writes both before the target's code runs.
+    # writes them before the target's code runs.
     outputs:
       modules: ${{ steps.prepare.outputs.modules }}
+      untested: ${{ steps.prepare.outputs.untested }}
       refused: ${{ steps.prepare.outputs.refused }}
     steps:
       # Checkout FIRST: actions/checkout cleans the workspace, so it must not
@@ -209,11 +207,10 @@ jobs:
         env:
           REPO: ${{ inputs.repository }}
           KEY: ${{ needs.setup.outputs.key }}
-          TARGET_MINUTES: ${{ needs.setup.outputs.shard_target_minutes }}
         run: |
           set -euo pipefail
           matrix=$(python3 scripts/gremlins-shard.py matrix --repo "${REPO}" --plan sizing/plan.json \
-            --attempts 3 --target-minutes "${TARGET_MINUTES}" --history history/costs.json \
+            --attempts 3 --history history/costs.json \
             --out-plan run-plans/plan.json)
           # The record, badge and aggregate jobs download exactly these names (a
           # brace list for several), so no other call's artifact reaches them.

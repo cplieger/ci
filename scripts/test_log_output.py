@@ -218,7 +218,7 @@ class Scripts(unittest.TestCase):
                 )
                 self.run_script(
                     h, 'stryker-shard.py', 'matrix', '--entries', json.dumps([entry]),
-                    '--plans', str(d / 'plans'), '--target-minutes', '60',
+                    '--plans', str(d / 'plans'),
                     '--history', str(d / 'history'), '--out-plans', str(d / 'out'),
                     log_stdout=False,
                 )  # fmt: skip
@@ -286,12 +286,12 @@ class Scripts(unittest.TestCase):
                 self.write(d / 'history.json', {'repo': 'r', 'modules': {h: {'files': {}, h: 1}}})
                 self.run_script(
                     h, 'gremlins-shard.py', 'matrix', '--repo', 'r', '--plan', str(d / 'sizing.json'),
-                    '--attempts', '1', '--target-minutes', '200', '--history', str(d / 'history.json'),
+                    '--attempts', '1', '--history', str(d / 'history.json'),
                     '--out-plan', str(d / 'plan.json'), log_stdout=False,
                 )  # fmt: skip
             self.run_script(
                 h, 'gremlins-shard.py', 'matrix', '--repo', h, '--plan', str(self.tmp / 'none'),
-                '--attempts', '1', '--target-minutes', '200', log_stdout=False,
+                '--attempts', '1', log_stdout=False,
             )  # fmt: skip
 
         self.each(case)

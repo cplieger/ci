@@ -7,8 +7,8 @@ surviving mutant (gremlins-run.sh time_package_mutants); an integration module,
 suite x mutants. The shard job prices each file from the repo's last measured
 run (`history`, built from each shard's `costs`) where it has one, the prior
 times the measured-to-prior ratio where not (scripts/mutation_cost.py project),
-and packs files into shards that each end near --target-minutes, longest first
-(`matrix`, mutation_cost.choose). A file is the smallest unit gremlins can scope, and a mutant's
+and packs files into shards that each end inside the band mutation_cost.TOP_SECS
+derives from runner speed, longest first (`matrix`, mutation_cost.choose). A file is the smallest unit gremlins can scope, and a mutant's
 verdict does not depend on its shard: each mutant runs its own package's tests
 under that package's timeout.
 """
@@ -221,37 +221,37 @@ def integration_price(e: dict, h: dict) -> tuple[float | None, str]:
 
 
 def with_unsized(
-    items: list[Item], setup: dict[str, float], unsized: int, target: float, limit: int
+    items: list[Item], setup: dict[str, float], unsized: int, top: float, limit: int
 ) -> tuple[int, int, list[Bin]]:
     """The shards UNSIZED items get, and the sized ITEMS' shard count and packing in the rest of LIMIT.
 
     An unsized item (a module the plan could not size, or a module or file whose
     probe measured nothing and has no history) is of unknown cost, so it is
-    priced as a whole shard (mutation_cost.top_secs) and gets one of its own
+    priced as a whole shard (TOP, the band's top) and gets one of its own
     while LIMIT leaves the sized work one. Past that, the split whose longest
     shard projects least, ties going to more unsized shards; at a LIMIT of 1
     everything is one job.
     """
     if not unsized or not items:
         return min(unsized, limit), *(
-            mutation_cost.choose(items, setup, target, limit) if items else (0, [])
+            mutation_cost.choose(items, setup, top, limit) if items else (0, [])
         )
     if limit == 1:
         return 0, 1, mutation_cost.pack(items, 1, setup)
-    whole = mutation_cost.top_secs(target)
     best: tuple[float, int, int, list[Bin]] | None = None
     for own in range(min(unsized, limit - 1), 0, -1):
-        k, bins = mutation_cost.choose(items, setup, target, limit - own)
-        longest = max(*(b.load for b in bins), -(-unsized // own) * whole)
+        k, bins = mutation_cost.choose(items, setup, top, limit - own)
+        longest = max(*(b.load for b in bins), -(-unsized // own) * top)
         if best is None or longest < best[0]:
             best = (longest, own, k, bins)
     return best[1:]
 
 
 def assign(
-    doc: dict, history: dict | None, target_minutes: float, limit: int = mutation_cost.MAX_SHARDS
+    doc: dict, history: dict | None, limit: int = mutation_cost.MAX_SHARDS
 ) -> tuple[dict, list[Template]]:
-    """The run plan, doc's files priced from HISTORY and packed into at most LIMIT shards of TARGET_MINUTES, and its warnings."""
+    """The run plan, doc's files priced from HISTORY and packed into at most LIMIT shards inside the
+    band (mutation_cost.TOP_SECS), and its warnings."""
     plan = json.loads(json.dumps(doc))
     entries, items, setup, refused = plan['modules'], [], {}, 0
     unsized: list[Item] = []
@@ -301,18 +301,19 @@ def assign(
             t"from the probe's were refused, so those files are priced from it"
         )
     one_job = sum(setup.values()) + sum(it.work for it in items)
-    own, k, bins = with_unsized(items, setup, len(unsized), target_minutes * 60, limit)
+    top_secs = mutation_cost.TOP_SECS
+    own, k, bins = with_unsized(items, setup, len(unsized), top_secs, limit)
     room = limit - own
     projected: list[float | None] = [round(b.load / 60, 1) for b in bins]
-    top = mutation_cost.top_secs(target_minutes * 60) / 60
-    if items and mutation_cost.capped(k, bins, items, setup, target_minutes * 60, room):
+    top = round(top_secs / 60, 1)
+    if items and mutation_cost.capped(k, bins, items, setup, top_secs, room):
         plan['capped'] = mutation_cost.cap_reason(limit)
     elif items and max(projected) > top:
         slowest = max(items, key=lambda it: it.work)
         warnings.append(
             t'{plan["repo"]}: {slowest.group}:{slowest.unit or "(module)"} alone '
             t'projects {slowest.work / 60:.0f} min, so its shard ends past {top:.1f} min, the top of '
-            t'the band around the {target_minutes:g}-min target'
+            t'its band'
         )
     if own:
         extra = [Bin() for _ in range(own)]
@@ -346,7 +347,7 @@ def assign(
     for e in entries.values():
         e['shards'].sort()
     plan.update(
-        target_minutes=target_minutes,
+        top_minutes=top,
         shards=len(bins),
         one_job_minutes=round(one_job / 60, 1),
         projected_minutes=projected,
@@ -464,11 +465,13 @@ def history_fault(doc: object, repo: str) -> str:
     """Why DOC is not REPO's whole cost history, or ''; a history is used whole or not at all."""
     if (
         not isinstance(doc, dict)
-        or not set(doc) <= {'repo', 'modules'}
+        or not set(doc) <= {'repo', 'modules', 'slowdown'}
         or doc.get('repo') != repo
         or not isinstance(doc.get('modules'), dict)
     ):
-        return f"it is not {repo}'s {{repo, modules}} object"
+        return f"it is not {repo}'s {{repo, modules, slowdown}} object"
+    if doc.get('slowdown') is not None and not mutation_cost.nonnegative(doc['slowdown']):
+        return f'its slowdown {doc["slowdown"]!r:.200} is not a ratio'
     for d, rec in doc['modules'].items():
         if why := mutation_cost.record_fault(rec):
             return f'module {d!r:.200}: {why}'
@@ -487,7 +490,7 @@ def read_history(path: Path | None, repo: str) -> dict | None:
 
 
 def plan_repo(
-    repo: str, plan_path: Path, target_minutes: float, history_path: Path | None
+    repo: str, plan_path: Path, history_path: Path | None
 ) -> tuple[dict, dict | None, list[Template]] | None:
     """REPO's run plan, the history it priced from and its warnings, or None when it runs one job per attempt.
 
@@ -522,7 +525,7 @@ def plan_repo(
             'warning', t'{repo}: shard plan refused ({why}), so each attempt runs in one job'
         )
         return None
-    plan, warnings = assign(doc, history, target_minutes)
+    plan, warnings = assign(doc, history)
     return plan, history, warnings
 
 
@@ -531,14 +534,13 @@ def matrix(
     plan_path: Path,
     attempts: int,
     *,
-    target_minutes: float,
     history_path: Path | None = None,
     out_plan: Path | None = None,
 ) -> list[dict]:
     """REPO's run matrix, attempt x shard; a repo that shards gets its run plan in OUT_PLAN."""
     mutation_cost.entry_key(repo)
     k = 1
-    if (planned := plan_repo(repo, plan_path, target_minutes, history_path)) is not None:
+    if (planned := plan_repo(repo, plan_path, history_path)) is not None:
         plan, history, warnings = planned
         k = plan['shards']
         if out_plan is not None:
@@ -643,6 +645,21 @@ def read_doc(path: Path | None) -> dict:
     return doc if isinstance(doc, dict) else {}
 
 
+def slowdown(runs: dict[str, dict[str, tuple[float, int]]]) -> float | None:
+    """The largest ratio of two attempts' seconds per mutant on one shard's identical work, or None.
+
+    RUNS is, per shard, each attempt's (worker-seconds, mutants); only attempts
+    that measured the shard's most mutants did its whole work.
+    """
+    ratios = []
+    for attempts in runs.values():
+        most = max((n for _, n in attempts.values()), default=0)
+        rates = [secs / n for secs, n in attempts.values() if n == most and n > 0 and secs > 0]
+        if len(rates) > 1:
+            ratios.append(max(rates) / min(rates))
+    return round(max(ratios), 2) if ratios else None
+
+
 def history(
     repo: str, artifacts_dir: Path, previous: Path | None = None, plan: Path | None = None
 ) -> dict | None:
@@ -652,13 +669,18 @@ def history(
     PLAN, only its modules, and in a per-package module only its files, are kept.
     """
     records: dict[str, list[dict]] = {}
+    runs: dict[str, dict[str, tuple[float, int]]] = {}
     for meta_path in sorted(artifacts_dir.rglob('meta.json')):
         meta, doc = read_doc(meta_path), read_doc(meta_path.parent / 'gremlins-costs.json')
         if meta.get('repo') != repo or not isinstance(doc.get('modules'), dict):
             continue
+        secs, mutants = 0.0, 0
         for dir_, rec in doc['modules'].items():
             if isinstance(dir_, str) and isinstance(rec, dict):
                 records.setdefault(dir_, []).append(rec)
+                for e in mutation_cost.clean_files(rec.get('files')).values():
+                    secs, mutants = secs + e['secs'], mutants + e['mutants']
+        runs.setdefault(str(meta.get('shard', '')), {})[str(meta.get('attempt'))] = (secs, mutants)
     try:
         old = read_history(previous, repo)
     except Exception as exc:
@@ -699,7 +721,7 @@ def history(
         modules[d] = mutation_cost.carry_forward(new, old.get(d), keep, counts)
     if not any(m['files'] or m['setup_secs'] is not None for m in modules.values()):
         return None
-    return {'repo': repo, 'modules': modules}
+    return {'repo': repo, 'modules': modules, 'slowdown': slowdown(runs)}
 
 
 def parse_module_arg(raw: str) -> tuple[str, Path]:
@@ -723,7 +745,6 @@ def main() -> int:
     mx.add_argument('--repo', required=True)
     mx.add_argument('--plan', required=True, type=Path, help="the plan job's sizing")
     mx.add_argument('--attempts', required=True, type=int)
-    mx.add_argument('--target-minutes', required=True, type=float)
     mx.add_argument('--history', type=Path, help="the repo's last cost history")
     mx.add_argument(
         '--out-plan', type=Path, help='where to write the run plan when the repo shards'
@@ -762,7 +783,6 @@ def main() -> int:
             args.repo,
             args.plan,
             args.attempts,
-            target_minutes=args.target_minutes,
             history_path=args.history,
             out_plan=args.out_plan,
         )
@@ -782,6 +802,17 @@ def main() -> int:
             return 0
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(doc, indent=1) + '\n')
+        if (measured := doc['slowdown']) is not None:
+            line = t'{args.repo}: runner slowdown this week {measured}x on identical work'
+            mutation_cost.say(line)
+            mutation_cost.summarize(line)
+            if measured > mutation_cost.SLOWDOWN:
+                mutation_cost.annotate(
+                    'warning',
+                    t'{args.repo}: attempts ran {measured}x apart on identical work, past the '
+                    t'{mutation_cost.SLOWDOWN}x mutation_cost.SLOWDOWN plans for',
+                    summary=True,
+                )
     return 0
 
 

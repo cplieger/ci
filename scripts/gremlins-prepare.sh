@@ -57,7 +57,10 @@ declare -A is_refused=()
 mapfile -t bad < <(jq -r '.[].index' <<<"${refused}")
 for i in "${bad[@]}"; do is_refused["${nested[i]}"]=1; done
 refused=$(jq -c 'map(del(.index))' <<<"${refused}")
-modules=(.)
+# The root is a module, and listed first, only when it has a go.mod: a repo of
+# nested modules alone (cplieger/go) has none.
+modules=()
+[ -f target/go.mod ] && modules=(.)
 for d in "${nested[@]}"; do
   if [ -n "${is_refused["${d}"]:-}" ]; then
     unmeasured+=("${d}")
@@ -70,6 +73,21 @@ for d in "${nested[@]}"; do
   modules+=("${d}")
   gha_say 'measure: %s (%s)' "${d}" "$(awk '$1=="module"{print $2; exit}' "target/${d}/go.mod")"
 done
+if [ "${#modules[@]}" -eq 0 ]; then
+  if [ "${refused}" = '[]' ]; then
+    echo "::error::${repo} has no Go module to measure"
+    exit 1
+  fi
+  # The runner keeps a failed step's outputs (actions/runner ActionRunner.cs
+  # processes file commands in a finally), so the record names each refused dir.
+  {
+    echo "modules="
+    echo "untested="
+    echo "refused=$(jq -c . <<<"${refused}")"
+  } >>"${GITHUB_OUTPUT}"
+  echo "::error::every Go module dir of ${repo} was refused"
+  exit 1
+fi
 untested=()
 if [ -n "${GREMLINS_MODULE:-}" ]; then
   selected=()

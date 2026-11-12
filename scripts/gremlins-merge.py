@@ -429,8 +429,6 @@ def main() -> int:
     dirs = [d for d, _ in modules] + skipped
     if len(set(dirs)) != len(dirs):
         raise SystemExit(f'--module and --skip-module directories must be unique, got {dirs}')
-    if '.' not in dirs:
-        raise SystemExit("the root module ('.') must be among --module or --skip-module arguments")
 
     merged = merge(modules, skipped)
     args.out.write_text(json.dumps(merged))

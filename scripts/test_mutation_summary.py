@@ -110,8 +110,6 @@ class Calls(unittest.TestCase):
                 found['entries'],
                 '--plans',
                 str(d / 'plans'),
-                '--target-minutes',
-                '200',
                 '--history',
                 str(d / 'history'),
                 '--out-plans',
@@ -519,6 +517,19 @@ class Calls(unittest.TestCase):
         )  # fmt: skip
         self.assertIn('odd dir: refused', doc['reason'])
 
+    def test_gremlins_a_repo_whose_every_module_is_refused_is_red_naming_each(self):
+        # gremlins-prepare.sh writes the refused dir, then fails the plan job and each run leg.
+        refused = json.dumps(
+            [{'dir': 'my mod', 'reason': "directory 'my mod' is not a relative path"}]
+        )
+        found = {'modules': '', 'untested': '', 'refused': refused}
+        doc = self.outcome(
+            'gremlins', self.gremlins_needs(found, plan='failure', run='failure'), 'failed',
+            {'my mod': 'refused'},
+        )  # fmt: skip
+        self.assertEqual(doc['fault'], '')
+        self.assertIn("my mod: refused (directory 'my mod' is not a relative path)", doc['reason'])
+
     def test_gremlins_one_failed_shard_fails_every_module(self):
         for job, result in (('run', 'failure'), ('shard', 'failure'), ('run', 'cancelled')):
             with self.subTest(job=job, result=result):
@@ -537,6 +548,32 @@ class Calls(unittest.TestCase):
         )
         doc = self.outcome('gremlins', needs, 'passed', {'mapread': 'tested'}, module='mapread')
         self.assertEqual(doc['target'], 'mapread')
+
+    def test_gremlins_a_one_module_call_names_the_other_modules_untested(self):
+        found = {'modules': 'keyenc', 'untested': 'jsonx xmlx', 'refused': '[]'}
+        needs = self.gremlins_needs(found, badge='skipped', aggregate='skipped')
+        doc = self.outcome('gremlins', needs, 'passed', {'keyenc': 'tested'}, module='keyenc')
+        self.assertEqual(doc['untested'], ['jsonx', 'xmlx'])
+        rc, rows, summary = self.fleet('gremlins', {'a': doc}, ['a'])
+        self.assertEqual((rc, rows), (0, {'a': 'passed'}))
+        self.assertIn('| `a` | `passed` | `2` | `jsonx, xmlx` |', summary)
+        _, whole = self.call('gremlins', self.gremlins_needs())
+        self.assertEqual(whole['untested'], [])
+        for label, bad in {
+            'not a list': 'jsonx',
+            'unsorted': ['xmlx', 'jsonx'],
+            'also an entry': ['jsonx', 'keyenc'],
+        }.items():
+            with self.subTest(label):
+                rc, rows, summary = self.fleet('gremlins', {'a': {**doc, 'untested': bad}}, ['a'])
+                self.assertEqual((rc, rows), (1, {'a': 'failed'}))
+                self.assertIn('unreadable result', summary)
+
+    def test_the_gremlins_plan_job_exports_the_untested_modules(self):
+        wf = yaml.safe_load(WORKFLOW['gremlins'].read_text())
+        self.assertEqual(
+            wf['jobs']['plan']['outputs']['untested'], '${{ steps.prepare.outputs.untested }}'
+        )
 
     def test_a_pipeline_job_that_did_not_run_leaves_its_entries_not_run_and_red(self):
         found = self.discover(['w/stryker.config.json'])

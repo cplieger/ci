@@ -138,6 +138,27 @@ def run_merge(
 # ---------------------------------------------------------------------------
 # gremlins-merge.py
 # ---------------------------------------------------------------------------
+def test_merge_takes_a_repo_of_nested_modules_with_no_root(tmp: Path) -> None:
+    keyenc = result('github.com/cplieger/go/keyenc', [('k.go', [('KILLED', 'ARITHMETIC_BASE')])])
+    jsonx = result('github.com/cplieger/go/jsonx', [('j.go', [('LIVED', 'INVERT_LOGICAL')])])
+    proc, merged = run_merge(tmp, [('keyenc', keyenc), ('jsonx', jsonx)])
+    check(
+        "nested only: cplieger/go's modules merge with no root module",
+        ok=proc.returncode == 0
+        and merged is not None
+        and [m['dir'] for m in merged['modules']] == ['keyenc', 'jsonx']
+        and (merged['mutants_killed'], merged['mutants_lived']) == (1, 1)
+        and sorted(f['file_name'] for f in merged['files']) == ['jsonx/j.go', 'keyenc/k.go'],
+        detail=proc.stderr[-300:],
+    )
+    one, merged = run_merge(tmp, [('keyenc', keyenc)], out_name='one.json', skip=('jsonx',))
+    check(
+        'nested only: a one-module call merges that module and skips the rest',
+        ok=one.returncode == 0 and merged is not None and merged['mutants_killed'] == 1,
+        detail=one.stderr[-300:],
+    )
+
+
 def test_single_module_is_identity(tmp: Path) -> None:
     """A repo with no nested module must publish exactly what gremlins said.
 
@@ -491,20 +512,6 @@ def test_module_nested_in_nested(tmp: Path) -> None:
     )
 
 
-def test_root_module_required(tmp: Path) -> None:
-    nested = result(
-        'github.com/cplieger/envx/yamlenv/v2',
-        [
-            ('yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')]),
-        ],
-    )
-    proc, _ = run_merge(tmp, [('yamlenv', nested)], out_name='norootmod.json')
-    check('root module required: exits non-zero', ok=proc.returncode != 0)
-
-
-# ---------------------------------------------------------------------------
-# gremlins-scope.py and gremlins-prepare.sh, which calls it
-# ---------------------------------------------------------------------------
 def exclude_patterns(config: str) -> list[str]:
     """The quoted `unleash.exclude-files` entries of a gremlins config."""
     m = re.search(r'^  exclude-files:[ \t]*\n((?:(?:    .*|[ \t]*)\n)*)', config, re.MULTILINE)
@@ -633,6 +640,76 @@ def publish_fixture(tmp: Path, repo: str, work: Path) -> None:
     (tmp / 'src').mkdir(exist_ok=True)
     subprocess.run(
         ['git', 'clone', '-q', '--bare', str(work), str(tmp / 'src' / f'{repo}.git')], check=True
+    )
+
+
+def nested_only_fixture(work: Path, modules: list[str], *, root: bool) -> None:
+    """A repository of nested Go modules, as cplieger/go is, with a root module too when ROOT."""
+    work.mkdir(parents=True)
+
+    def run(*a: str) -> None:
+        subprocess.run(['git', '-C', str(work), *a], check=True, capture_output=True)
+
+    run('init', '-q')
+    (work / 'README.md').write_text('fixture\n')
+    if root:
+        (work / 'go.mod').write_text('module example.com/r\n\ngo 1.26\n')
+        (work / 'r.go').write_text('package r\n')
+    for m in modules:
+        (work / m).mkdir(parents=True)
+        (work / m / 'go.mod').write_text(f'module example.com/go/{m}\n\ngo 1.26\n')
+        (work / m / 'm.go').write_text('package m\n\nfunc One() int { return 1 }\n')
+    run('add', '.')
+    run('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'fixture')
+
+
+def test_prepare_seeds_the_root_only_when_it_has_a_go_mod(tmp: Path) -> None:
+    for repo, root, want in (('go', False, 'jsonx keyenc'), ('knell', True, '. jsonx keyenc')):
+        work = tmp / f'work-{repo}'
+        nested_only_fixture(work, ['keyenc', 'jsonx'], root=root)
+        publish_fixture(tmp, repo, work)
+        shutil.rmtree(tmp / 'target', ignore_errors=True)
+        proc, outputs = prepare(tmp, repo)
+        check(
+            f'prepare seeding: {repo} ({"a" if root else "no"} root go.mod) measures {want}',
+            ok=proc.returncode == 0 and outputs.get('modules') == want,
+            detail=f'rc={proc.returncode} {outputs!r} {proc.stderr[-300:]}',
+        )
+    shutil.rmtree(tmp / 'target', ignore_errors=True)
+    one, got = prepare(tmp, 'go', extra_env={'GREMLINS_MODULE': 'keyenc'})
+    check(
+        'prepare seeding: a one-module call on a nested-only repo measures that module and lists '
+        'the others untested, with no root among them',
+        ok=one.returncode == 0
+        and got.get('modules') == 'keyenc'
+        and got.get('untested') == 'jsonx',
+        detail=f'rc={one.returncode} {got!r} {one.stderr[-300:]}',
+    )
+    work = tmp / 'work-none'
+    nested_only_fixture(work, [], root=False)
+    publish_fixture(tmp, 'none', work)
+    shutil.rmtree(tmp / 'target', ignore_errors=True)
+    none, _ = prepare(tmp, 'none')
+    check(
+        'prepare seeding: a repo with no Go module fails, naming it',
+        ok=none.returncode != 0 and 'none has no Go module to measure' in none.stdout,
+        detail=f'rc={none.returncode} {none.stdout[-300:]} {none.stderr[-300:]}',
+    )
+    work = tmp / 'work-spaced'
+    nested_only_fixture(work, ['my mod'], root=False)
+    publish_fixture(tmp, 'spaced', work)
+    shutil.rmtree(tmp / 'target', ignore_errors=True)
+    spaced, outputs = prepare(tmp, 'spaced')
+    refused = json.loads(outputs.get('refused') or 'null')
+    check(
+        'prepare seeding: a nested-only repo whose every module dir is refused fails, '
+        'writing the refused dir for its record',
+        ok=spaced.returncode != 0
+        and (outputs.get('modules'), outputs.get('untested')) == ('', '')
+        and isinstance(refused, list)
+        and [r.get('dir') for r in refused] == ['my mod']
+        and 'has no Go module to measure' not in spaced.stdout,
+        detail=f'rc={spaced.returncode} {outputs!r} {spaced.stdout[-300:]}',
     )
 
 
@@ -2307,7 +2384,7 @@ DEADSET_GO = {
 }
 # Longest-first over the fixture: 2 shards project 256 and 294 min, 3 project
 # 193, 174 and 193. Run 42520923530 spent 163 min in internal/exempt alone.
-FIXTURE_SHARDS = 3
+FIXTURE_SHARDS = 4
 # Wall minutes on 4 workers of the slow packages run 42520923530's attempt 1
 # finished, from its log. internal/conventions (1.2 min) is left out: 4 hangs at
 # the 60 s floor are most of it, and the projection has no term for hangs.
@@ -2318,9 +2395,6 @@ RUN_42520923530_MINUTES = {
     'internal/liveness': 23.4,
 }
 CI_CAP_MINUTES = 350
-SHARD_TARGET_MINUTES = int(
-    re.search(r'shard_target_minutes: "(\d+)"', REPO_WORKFLOW.read_text()).group(1)
-)
 FIXTURE_SHA = '8ea1867888623f3fab42af9c0404571c0ae8e851'
 
 
@@ -2370,7 +2444,6 @@ def plan_repo(
     tmp: Path,
     repo: str,
     modules: dict[str, tuple[str, dict | None, dict | None]],
-    target: int = SHARD_TARGET_MINUTES,
 ) -> tuple[subprocess.CompletedProcess, dict | None]:
     """Size fixture plan dirs with `gremlins-shard.py plan`, then plan the run with `matrix`.
 
@@ -2397,8 +2470,6 @@ def plan_repo(
             str(plans / 'plan.json'),
             '--attempts',
             '1',
-            '--target-minutes',
-            str(target),
             '--out-plan',
             str(tmp / f'run-plans-{repo}' / f'{repo}.json'),
         )
@@ -2476,12 +2547,13 @@ def test_shard_projects_deadset_go_past_one_job(tmp: Path) -> None:
         detail=str({p: round(projected[p], 1) for p in RUN_42520923530_MINUTES}),
     )
     check(
-        'shard projection: the planner picks the count whose shards project inside the band, '
-        'from 15% under the target to the top the longest-shard bar allows',
+        'shard projection: every shard ends by the top that runner speed and the job limit allow, '
+        'but one running a package alone, which no count shortens',
         ok=len(plan['projected_minutes']) == k
+        and plan['top_minutes'] == round(mutation_cost.TOP_SECS / 60, 1)
         and all(
-            SHARD_TARGET_MINUTES * (1 - mutation_cost.BAND) <= m <= mutation_cost.TOP_MINUTES
-            for m in plan['projected_minutes']
+            m <= plan['top_minutes'] or sum(e['shard'] == n for e in got.values()) == 1
+            for n, m in enumerate(plan['projected_minutes'], start=1)
         ),
         detail=str(plan['projected_minutes']),
     )
@@ -2508,7 +2580,7 @@ def test_shard_projects_deadset_go_past_one_job(tmp: Path) -> None:
     fewer = mutation_cost.pack(items, k - 1, {'.': setup})
     check(
         "shard projection: one shard fewer would end past the band's top",
-        ok=max(b.load for b in fewer) > mutation_cost.top_secs(SHARD_TARGET_MINUTES * 60),
+        ok=max(b.load for b in fewer) > plan['top_minutes'] * 60,
         detail=str([round(b.load / 60, 1) for b in fewer]),
     )
 
@@ -2620,8 +2692,6 @@ def test_shard_plans_a_recorded_run_from_its_costs(tmp: Path) -> None:
         str(plans / 'plan.json'),
         '--attempts',
         '3',
-        '--target-minutes',
-        str(SHARD_TARGET_MINUTES),
         '--history',
         str(history / 'deadset-go.json'),
         '--out-plan',
@@ -2663,21 +2733,19 @@ def test_shard_plans_a_recorded_run_from_its_costs(tmp: Path) -> None:
         detail=f'{ {p: round(by_pkg[p]) for p in probe} } vs probe { {p: round(v) for p, v in probe.items()} }',
     )
     setup = json.loads((history / 'deadset-go.json').read_text())['modules']['.']['setup_secs']
-    for attempt, secs in sorted(measured.items()):
+    attempts = []
+    for _, secs in sorted(measured.items()):
         loads = [setup] * plan['shards']
         for p, f in files.items():
             loads[f['shard'] - 1] += secs.get(p, 0.0) / 4
-        projected = [m * 60 for m in plan['projected_minutes']]
-        check(
-            f"recorded run: attempt {attempt}'s measured shards each end within {mutation_cost.BAND:.0%} "
-            f'of their projection, the longest by {mutation_cost.LONGEST_SHARD_MINUTES} min',
-            ok=all(
-                abs(load - want) <= want * mutation_cost.BAND
-                for load, want in zip(loads, projected, strict=True)
-            )
-            and max(loads) <= mutation_cost.LONGEST_SHARD_MINUTES * 60,
-            detail=f'{[round(x / 60, 1) for x in loads]} vs projected {plan["projected_minutes"]}',
-        )
+        attempts.append([load / 60 for load in loads])
+    faults = mutation_cost.bar_faults(plan['projected_minutes'], attempts)
+    check(
+        f"recorded run: each shard's mean over the attempts ends within {mutation_cost.BAND:.0%} "
+        f'of its projection, and every attempt by {mutation_cost.SAFE_JOB_MINUTES} min',
+        ok=not faults,
+        detail=f'{faults} {[[round(x, 1) for x in a] for a in attempts]} vs {plan["projected_minutes"]}',
+    )
     old = [setup] * 4
     for p in files:
         old[fx['old_plan_shards'][p.rsplit('/', 1)[0]] - 1] += measured['2'].get(p, 0.0) / 4
@@ -3096,8 +3164,6 @@ def test_shard_small_module_stays_one_unchanged_job(tmp: Path) -> None:
         str(plans / 'plan.json'),
         '--attempts',
         '3',
-        '--target-minutes',
-        str(SHARD_TARGET_MINUTES),
     )
     matrix = json.loads(proc.stdout) if proc.returncode == 0 else None
     check(
@@ -3165,8 +3231,6 @@ def matrix_of(tmp: Path, plan: dict) -> tuple[subprocess.CompletedProcess, list 
         str(plans / 'plan.json'),
         '--attempts',
         '1',
-        '--target-minutes',
-        str(SHARD_TARGET_MINUTES),
     )
     return proc, json.loads(proc.stdout) if proc.returncode == 0 else None
 
@@ -3344,8 +3408,6 @@ def call_matrix(
             repo,
             '--attempts',
             str(attempts),
-            '--target-minutes',
-            str(SHARD_TARGET_MINUTES),
             *args,
         ],
         capture_output=True,
@@ -3549,7 +3611,6 @@ def three_module_plan(tmp: Path) -> Path:
     doc = {
         'repo': 'tree',
         'sha': FIXTURE_SHA,
-        'target_minutes': 240,
         'shards': 2,
         'one_job_minutes': 400.0,
         'projected_minutes': [200.0, 200.0],
@@ -4423,7 +4484,6 @@ def test_workflow_plans_then_shards_the_run(tmp: Path) -> None:
             'SHA': FIXTURE_SHA,
             'MODULES': '. tools',
             'JOB_TIMEOUT_MINUTES': '350',
-            'TARGET_MINUTES': '240',
             'PLAN_TIMEOUT_MINUTES': '90',
         },
     )
@@ -4480,7 +4540,6 @@ def test_workflow_plans_then_shards_the_run(tmp: Path) -> None:
                 'SHA': FIXTURE_SHA,
                 'MODULES': '. tools',
                 'JOB_TIMEOUT_MINUTES': '350',
-                'TARGET_MINUTES': '240',
                 **extra,
             },
         )
@@ -4744,12 +4803,11 @@ def test_workflow_carries_costs_between_runs(tmp: Path) -> None:
     )
     build = step('shard', 'Build the run matrix')
     check(
-        "workflow costs: the matrix plans the call's repo from its history at the setup job's target",
+        "workflow costs: the matrix plans the call's repo from its history, with no target a caller sets",
         ok='--history history/costs.json' in build.get('run', '')
         and '--out-plan run-plans/plan.json' in build.get('run', '')
         and '--plan sizing/plan.json' in build.get('run', '')
-        and build.get('env', {}).get('TARGET_MINUTES')
-        == '${{ needs.setup.outputs.shard_target_minutes }}'
+        and 'TARGET_MINUTES' not in json.dumps(build)
         and 'cp history/costs.json run-plans/history.json' in build.get('run', ''),
         detail=build.get('run', '')[-400:],
     )
@@ -4872,7 +4930,6 @@ def test_shard_matrix_fuzz_plans_each_bad_input(tmp: Path) -> None:
                     repo,
                     root / 'sizing.json',
                     3,
-                    target_minutes=SHARD_TARGET_MINUTES,
                     history_path=root / 'history.json',
                     out_plan=root / 'plan.json',
                 )
@@ -4912,15 +4969,67 @@ def test_shard_matrix_fuzz_plans_each_bad_input(tmp: Path) -> None:
         )
 
 
+def test_shard_keeps_every_shard_under_the_safe_limit_beside_a_slow_setup(tmp: Path) -> None:
+    import contextlib
+    import io
+
+    shard = load_script('gremlins_shard', SHARD)
+    # Three shards' worth of work at the band's top beside an 80-min setup.
+    files = int((3 * 0.99 * mutation_cost.TOP_SECS - 80 * 60 - 3600) / 300)
+    doc = {
+        'repo': 'r',
+        'sha': FIXTURE_SHA,
+        'modules': {
+            'slow': {
+                'mode': 'per-package',
+                'workers': 1,
+                'setup_secs': 80 * 60.0,
+                'packages': {},
+                'files': {'s/x.go': {'runnable': 10, 'prior_secs': 3600.0}},
+            },
+            'fast': {
+                'mode': 'per-package',
+                'workers': 1,
+                'setup_secs': 0.0,
+                'packages': {},
+                'files': {
+                    f'p{n:03d}/x.go': {'runnable': 10, 'prior_secs': 300.0} for n in range(files)
+                },
+            },
+        },
+    }
+    with contextlib.redirect_stderr(io.StringIO()):
+        plan, _ = shard.assign(doc, None)
+    slowest = []
+    for n in range(1, plan['shards'] + 1):
+        setups = sum(
+            doc['modules'][d]['setup_secs'] for d, e in plan['modules'].items() if n in e['shards']
+        )
+        work = sum(
+            f['work_secs']
+            for e in plan['modules'].values()
+            for f in e['files'].values()
+            if f['shard'] == n
+        )
+        slowest.append(mutation_cost.SLOWDOWN * (setups + work) / 60)
+    check(
+        'band: beside an 80-min setup, every shard of a 0-min-setup module ends by '
+        f'{mutation_cost.SAFE_JOB_MINUTES} min on a {mutation_cost.SLOWDOWN}x runner',
+        ok=shard.valid_plan(plan) == ''
+        and all(m <= mutation_cost.SAFE_JOB_MINUTES for m in slowest),
+        detail=f'{[round(m, 1) for m in slowest]} top={plan["top_minutes"]}',
+    )
+
+
 def unsized_doc(unsized: int, files: int = 6) -> dict:
-    """A sizing: one per-package module of FILES 125-min files on 1 worker, beside UNSIZED unsized modules."""
+    """A sizing: one per-package module of FILES 66.7-min files on 1 worker, beside UNSIZED unsized modules."""
     modules = {
         '.': {
             'mode': 'per-package',
             'workers': 1,
             'setup_secs': 60.0,
             'packages': {},
-            'files': {f'p{n}/x.go': {'runnable': 100, 'prior_secs': 5000.0} for n in range(files)},
+            'files': {f'p{n}/x.go': {'runnable': 100, 'prior_secs': 4000.0} for n in range(files)},
         }
     }
     modules |= {
@@ -4975,7 +5084,7 @@ def test_shard_prices_a_probe_under_its_tick_as_unknown(tmp: Path) -> None:
         )
         doc = {'repo': 'tick', 'sha': FIXTURE_SHA, 'modules': {'.': entry}}
         with contextlib.redirect_stderr(io.StringIO()):
-            plan, warnings = shard.assign(doc, history, SHARD_TARGET_MINUTES)
+            plan, warnings = shard.assign(doc, history)
         e = plan['modules']['.']
         cost, work = (
             (e['cost'], e['work_secs'])
@@ -5031,7 +5140,7 @@ def test_shard_prices_an_integration_module_with_no_mutants_at_nothing(tmp: Path
     write_plan_dir(tmp / 'none', 'github.com/cplieger/none', env, None)
     doc = {'repo': 'none', 'sha': FIXTURE_SHA, 'modules': {'.': shard.size_module(tmp / 'none')}}
     with contextlib.redirect_stderr(io.StringIO()):
-        plan, warnings = shard.assign(doc, history, SHARD_TARGET_MINUTES)
+        plan, warnings = shard.assign(doc, history)
     e = plan['modules']['.']
     texts = [mutation_cost.render(w) for w in warnings]
     check(
@@ -5041,12 +5150,57 @@ def test_shard_prices_an_integration_module_with_no_mutants_at_nothing(tmp: Path
     )
 
 
+def test_history_measures_the_runner_slowdown_on_identical_work(tmp: Path) -> None:
+    shard = load_script('gremlins_shard', SHARD)
+    # Shard 3 of run 43153682226 ran 160 and 282 min on one runner pair; a cut-short attempt is not its work.
+    runs = {
+        '3': {'1': (160.0, 10), '2': (282.0, 10), '3': (200.0, 10)},
+        '1': {'1': (50.0, 5), '2': (10.0, 1)},
+        '': {'1': (5.0, 5)},
+    }
+    check(
+        "slowdown: the widest ratio of two attempts that did one shard's whole work",
+        ok=shard.slowdown(runs) == 1.76 and shard.slowdown({'': {'1': (5.0, 5)}}) is None,
+        detail=str(shard.slowdown(runs)),
+    )
+    art = tmp / 'slowdown'
+    for attempt, secs in (('1', 100.0), ('2', 190.0)):
+        d = art / f'gremlins-r-{attempt}'
+        d.mkdir(parents=True)
+        (d / 'meta.json').write_text(json.dumps({'repo': 'r', 'attempt': attempt}))
+        (d / 'gremlins-costs.json').write_text(
+            json.dumps(
+                {
+                    'modules': {
+                        '.': {'setup_secs': 10.0, 'files': {'a.go': {'secs': secs, 'mutants': 10}}}
+                    }
+                }
+            )
+        )
+    out = tmp / 'slowdown-history.json'
+    proc = run_shard('history', '--repo', 'r', '--artifacts-dir', str(art), '--out', str(out))
+    doc = json.loads(out.read_text()) if out.exists() else {}
+    check(
+        "slowdown: the record job stores the week's slowdown and warns past mutation_cost.SLOWDOWN",
+        ok=proc.returncode == 0
+        and doc.get('slowdown') == 1.9
+        and '- r: runner slowdown this week 1.9x on identical work' in proc.stderr
+        and '::warning::r: attempts ran 1.9x apart on identical work, past the 1.8x' in proc.stderr
+        and shard.history_fault(doc, 'r') == '',
+        detail=f'{doc.get("slowdown")} {proc.stderr[-400:]}',
+    )
+    check(
+        'slowdown: a history whose slowdown is not a ratio is refused',
+        ok='slowdown' in shard.history_fault({**doc, 'slowdown': 'x'}, 'r'),
+    )
+
+
 def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
     import contextlib
     import io
 
     shard = load_script('gremlins_shard', SHARD)
-    target = SHARD_TARGET_MINUTES * 60
+    top = mutation_cost.TOP_SECS
 
     def split(plan: dict) -> tuple[int, list[list[str]], list[int]]:
         """The sized module's shard count, each shard's unsized modules, and the shards mixing both."""
@@ -5062,7 +5216,7 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
             mutation_cost.Item('.', p, f['prior_secs'])
             for p, f in doc['modules']['.']['files'].items()
         ]
-        return mutation_cost.choose(items, {'.': 60.0}, target, room)[0]
+        return mutation_cost.choose(items, {'.': 60.0}, top, room)[0]
 
     for unsized, limit, own, capped in (
         (13, 16, 13, False),
@@ -5073,7 +5227,7 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
     ):
         doc = unsized_doc(unsized)
         with contextlib.redirect_stderr(io.StringIO()):
-            plan, warnings = shard.assign(doc, None, SHARD_TARGET_MINUTES, limit)
+            plan, warnings = shard.assign(doc, None, limit)
         k, per, mixed = split(plan)
         holders = sum(1 for m in per if m)
         check(
@@ -5089,7 +5243,7 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
         )
     doc = unsized_doc(15)
     with contextlib.redirect_stderr(io.StringIO()):
-        plan, warnings = shard.assign(doc, None, SHARD_TARGET_MINUTES, 16)
+        plan, warnings = shard.assign(doc, None, 16)
     _, per, _ = split(plan)
     shared = [m for m in per if len(m) > 1]
     texts = [mutation_cost.render(w) for w in warnings]
@@ -5107,7 +5261,7 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
     only = {**unsized_doc(0), 'modules': unsized_doc(20)['modules']}
     del only['modules']['.']
     with contextlib.redirect_stderr(io.StringIO()):
-        plan, _ = shard.assign(only, None, SHARD_TARGET_MINUTES, 16)
+        plan, _ = shard.assign(only, None, 16)
     names = sorted(plan.get('unsized_shared') or [])
     want_shared = sorted(
         {
@@ -5131,7 +5285,7 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
     )
     small = unsized_doc(2, files=1)
     with contextlib.redirect_stderr(io.StringIO()):
-        plan, _ = shard.assign(small, None, SHARD_TARGET_MINUTES, 2)
+        plan, _ = shard.assign(small, None, 2)
     check(
         'unsized cap note: a sub-band sized shard beside shared unsized ones is not called past the band',
         ok='capped' in plan
@@ -5148,8 +5302,8 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
     )
     doc = unsized_doc(1, files=1)
     with contextlib.redirect_stderr(io.StringIO()):
-        plan, _ = shard.assign(doc, None, SHARD_TARGET_MINUTES, 16)
-        lone, _ = shard.assign(doc, None, SHARD_TARGET_MINUTES, 1)
+        plan, _ = shard.assign(doc, None, 16)
+        lone, _ = shard.assign(doc, None, 1)
     check(
         'unsized: beside a module that fits one job it still gets its own, and joins it only at a limit of 1',
         ok=split(plan)[0] == 1
@@ -5163,7 +5317,7 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
     only = {**unsized_doc(0), 'modules': unsized_doc(20)['modules']}
     del only['modules']['.']
     with contextlib.redirect_stderr(io.StringIO()):
-        plan, warnings = shard.assign(only, None, SHARD_TARGET_MINUTES, 16)
+        plan, warnings = shard.assign(only, None, 16)
     check(
         'unsized: a repo of only unsized modules fills its limit, the rest sharing with a warning',
         ok=plan['shards'] == 16 and shard.valid_plan(plan) == '' and 'capped' in plan and warnings,
@@ -5272,17 +5426,47 @@ def test_shard_history_keeps_a_fuller_measure_over_a_short_sample(tmp: Path) -> 
     )
 
 
+# The listing is the only API call the fanout makes.
 FANOUT_GH = r"""#!/bin/bash
-r=$(printf '%s' "$*" | sed -n 's#.*/repos/cplieger/\([^/]*\)/.*#\1#p')
 case "$*" in
   *user/repos*) cat "$TREES/repos" ;;
-  */contents/go.mod*)
-    [ -f "$TREES/$r.nogo" ] && { echo 'gh: Not Found (HTTP 404)' >&2; exit 1; }
-    [ -f "$TREES/$r.err" ] && { echo 'gh: Server Error (HTTP 502)' >&2; exit 1; }
-    exit 0 ;;
-  */git/trees/*) [ -f "$TREES/$r.tree" ] && exit 1; echo 20000 ;;
   *) exit 1 ;;
 esac
+"""
+# A clone holds a root module of 12000 bytes of non-test Go (100 with
+# $TREES/<repo>.small), none with $TREES/<repo>.nogo, nested ones only with
+# $TREES/<repo>.nested, one nested module in `my mod` with $TREES/<repo>.space;
+# it fails with $TREES/<repo>.err and stalls 30 s with $TREES/<repo>.hang.
+FANOUT_GIT = r"""#!/bin/bash
+dest="${@: -1}"
+r=$(basename "${@: -2:1}" .git)
+[ -f "$TREES/$r.err" ] && exit 128
+[ -f "$TREES/$r.hang" ] && exec sleep 30
+mkdir -p "$dest/.git"
+size=12000
+[ -f "$TREES/$r.small" ] && size=100
+if [ -f "$TREES/$r.nested" ]; then
+  for m in keyenc jsonx; do
+    mkdir -p "$dest/$m"
+    printf 'module example.com/%s\n' "$m" >"$dest/$m/go.mod"
+    head -c "$size" /dev/zero | tr '\0' ' ' >"$dest/$m/m.go"
+  done
+elif [ -f "$TREES/$r.space" ]; then
+  mkdir -p "$dest/my mod"
+  printf 'module example.com/m\n' >"$dest/my mod/go.mod"
+  head -c "$size" /dev/zero | tr '\0' ' ' >"$dest/my mod/m.go"
+elif [ ! -f "$TREES/$r.nogo" ]; then
+  printf 'module example.com/%s\n' "$r" >"$dest/go.mod"
+  head -c "$size" /dev/zero | tr '\0' ' ' >"$dest/r.go"
+  head -c 50000 /dev/zero | tr '\0' ' ' >"$dest/r_test.go"
+  head -c 50000 /dev/zero | tr '\0' ' ' >"$dest/.git/x.go"
+fi
+"""
+# The fanout's clone bound, logged and shortened to 1 s.
+FANOUT_TIMEOUT = r"""#!/bin/bash
+printf '%s\n' "$1" >>"$TREES/../timeout.log"
+shift
+exec REAL 1 "$@"
 """
 
 
@@ -5290,14 +5474,23 @@ def test_workflow_runs_a_repo_it_cannot_read_in_its_own_call(tmp: Path) -> None:
     jobs = workflow_jobs(WORKFLOW)
     body = next((s.get('run', '') for s in jobs['fanout']['steps'] if s.get('id') == 'fanout'), '')
     (tmp / 'bin').mkdir()
-    (tmp / 'bin' / 'gh').write_text(FANOUT_GH)
-    (tmp / 'bin' / 'gh').chmod(0o755)
+    real_timeout = shutil.which('timeout') or '/usr/bin/timeout'
+    for name, stub in (
+        ('gh', FANOUT_GH),
+        ('git', FANOUT_GIT),
+        ('timeout', FANOUT_TIMEOUT.replace('REAL', real_timeout)),
+    ):
+        (tmp / 'bin' / name).write_text(stub)
+        (tmp / 'bin' / name).chmod(0o755)
+    (tmp / '_ci').mkdir()
+    (tmp / '_ci' / 'scripts').symlink_to(HERE)
     trees = tmp / 'trees'
     trees.mkdir()
 
     def fanout(repos: dict[str, str]) -> tuple[int, dict, str, str]:
         for p in trees.iterdir():
             p.unlink()
+        (tmp / 'timeout.log').unlink(missing_ok=True)
         (trees / 'repos').write_text(''.join(f'{r}\n' for r in repos))
         for r, flag in repos.items():
             if flag:
@@ -5333,15 +5526,43 @@ def test_workflow_runs_a_repo_it_cannot_read_in_its_own_call(tmp: Path) -> None:
         )
 
     rc, outputs, log, summary = fanout(
-        {'a': '', 'nogo': 'nogo', 'down': 'err', 'tree': 'tree', 'z': ''}
+        {'a': '', 'nogo': 'nogo', 'down': 'err', 'go': 'nested', 'tiny': 'small', 'z': ''}
     )
     check(
-        'workflow fan-out: a repo without go.mod is left out quietly, one whose reads fail runs, named',
+        'workflow fan-out: a repo with no Go module is left out quietly, one of nested modules '
+        'only is kept, one whose reads fail runs, named, and one under 10000 bytes of non-test '
+        'Go in its clone is skipped',
         ok=rc == 0
-        and outputs == {'repos': ['a', 'down', 'tree', 'z']}
-        and '::warning::down: its go.mod lookup failed' in log
-        and '::warning::tree: its source tree could not be read' in log
-        and '### down: its go.mod lookup failed' in summary,
+        and outputs == {'repos': ['a', 'down', 'go', 'z']}
+        and '::warning::down: its Go modules could not be read' in log
+        and '### down: its Go modules could not be read' in summary
+        and '  include: a (12000 bytes of non-test Go)' in log
+        and '  include: go (24000 bytes of non-test Go)' in log
+        and '  skip:    tiny (100 bytes' in log,
+        detail=f'{rc} {outputs} {log[-600:]}',
+    )
+    t0 = time.monotonic()
+    rc, outputs, log, summary = fanout({'a': '', 'stall': 'hang', 'z': ''})
+    took = time.monotonic() - t0
+    bounds = (tmp / 'timeout.log').read_text().split() if (tmp / 'timeout.log').exists() else []
+    check(
+        'workflow fan-out: a stalled clone is cut at its bound and the repo runs, named, '
+        'beside the others',
+        ok=rc == 0
+        and outputs == {'repos': ['a', 'stall', 'z']}
+        and '::warning::stall: its Go modules could not be read' in log
+        and bounds == ['120', '120', '120']
+        and took < 25,
+        detail=f'{rc} {outputs} {bounds} {took:.1f}s {log[-300:]}',
+    )
+    rc, outputs, log, summary = fanout({'a': '', 'odd': 'space'})
+    check(
+        'workflow fan-out: a nested-only repo whose every module dir go-units skips runs, '
+        'named, so its call refuses the dir',
+        ok=rc == 0
+        and outputs == {'repos': ['a', 'odd']}
+        and '::warning::odd: every Go module dir it holds was skipped' in log
+        and '### odd: every Go module dir it holds was skipped' in summary,
         detail=f'{rc} {outputs} {log[-300:]}',
     )
     rc, outputs, log, summary = fanout({'nogo': 'nogo'})
@@ -5418,7 +5639,6 @@ def test_workflow_shard_step_plans_the_call(tmp: Path) -> None:
                 **os.environ,
                 'REPO': 'a',
                 'KEY': 'a~',
-                'TARGET_MINUTES': '200',
                 'GITHUB_OUTPUT': str(out),
             },
         )
@@ -5536,7 +5756,6 @@ def main() -> int:
         test_inconsistent_input_is_fatal,
         test_missing_module_output_is_zero_not_error,
         test_module_nested_in_nested,
-        test_root_module_required,
         test_prepare_scopes_root_run_off_nested_module,
         test_prepare_refuses_a_module_entry_key_refuses_and_measures_the_rest,
         test_scope_excludes_every_deeper_module,
@@ -5591,7 +5810,11 @@ def main() -> int:
         test_workflow_plans_then_shards_the_run,
         test_workflow_carries_costs_between_runs,
         test_shard_matrix_fuzz_plans_each_bad_input,
+        test_history_measures_the_runner_slowdown_on_identical_work,
+        test_prepare_seeds_the_root_only_when_it_has_a_go_mod,
+        test_merge_takes_a_repo_of_nested_modules_with_no_root,
         test_shard_gives_each_unsized_module_a_shard_of_its_own,
+        test_shard_keeps_every_shard_under_the_safe_limit_beside_a_slow_setup,
         test_shard_prices_a_probe_under_its_tick_as_unknown,
         test_shard_prices_an_integration_module_with_no_mutants_at_nothing,
         test_shard_history_ignores_a_refused_previous_history_whole,

@@ -30,7 +30,11 @@ while IFS= read -r -d '' f; do
   d=$(dirname -- "${f#"$tree"/}")
   case "$d" in
     *[!A-Za-z0-9._/-]*)
-      echo "::warning::go-units: skipped module dir '$d', which holds a character outside A-Z, a-z, 0-9, '.', '_', '-' and '/'" >&2
+      # Escaped as gha-log.sh's gha_escape, inlined because callers sparse-check-out this file alone.
+      e=${d//%/%25}
+      e=${e//$'\r'/%0D}
+      e=${e//$'\n'/%0A}
+      echo "::warning::go-units: skipped module dir '$e', which holds a character outside A-Z, a-z, 0-9, '.', '_', '-' and '/'" >&2
       continue
       ;;
   esac

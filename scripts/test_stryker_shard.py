@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import itertools
 import json
 import os
 import pathlib
+import random
 import shutil
 import subprocess
 import sys
@@ -157,7 +159,7 @@ class PlanAndMatrix(unittest.TestCase):
         self.assertIn('runners', ss.valid_sizing(forged, ENTRY))
 
     def test_a_ranged_mutate_entry_runs_whole_on_its_config(self):
-        files = {f'src/f{i}.ts': (100, 0, 3_600_000) for i in range(6)}
+        files = {f'src/f{i}.ts': (100, 0, 14_400_000) for i in range(6)}
         for ranged in (None, 'yes'):
             with self.subTest(ranged=ranged):
                 self.assertFalse(
@@ -175,7 +177,6 @@ class PlanAndMatrix(unittest.TestCase):
         self,
         docs: dict[str, dict],
         entries=(ENTRY,),
-        target: float = 60,
         history: dict[str, str] | None = None,
     ) -> tuple[list, list]:
         plans = self.tmp / 'plans'
@@ -186,10 +187,10 @@ class PlanAndMatrix(unittest.TestCase):
         hist.mkdir(exist_ok=True)
         for key, text in (history or {}).items():
             (hist / f'{key}.json').write_text(text)
-        return ss.matrix(list(entries), plans, target, self.tmp / 'out', hist)
+        return ss.matrix(list(entries), plans, self.tmp / 'out', hist)
 
     def big(self) -> dict:
-        files = {f'src/f{i}.ts': (100, 0, 3_600_000) for i in range(6)}
+        files = {f'src/f{i}.ts': (100, 0, 14_400_000) for i in range(6)}
         return ss.sizing('r', 'web', SHA, {}, plan_pass(files))
 
     def test_an_entry_over_the_target_shards_by_file_and_names_each_shard_s_artifact(self):
@@ -218,10 +219,10 @@ class PlanAndMatrix(unittest.TestCase):
         self.assertTrue(all(p.endswith('.ts') for lst in lists for p in lst))
 
     def test_history_prices_a_file_by_its_measured_cost_and_rides_in_the_run_plan(self):
-        # Each big() file's probe is 36.96 s per run mutant.
+        # Each big() file's probe is 144.96 s per run mutant.
         hist = {
             'files': {
-                'src/f0.ts': {'secs': 3000.0, 'mutants': 100},
+                'src/f0.ts': {'secs': 14000.0, 'mutants': 100},
                 'src/x.ts': {'secs': 1.0, 'mutants': 1},
                 'src/f2.ts': {'secs': 0.0, 'mutants': 100},
                 'src/f3.ts': {'secs': 1e9, 'mutants': 100},
@@ -239,7 +240,7 @@ class PlanAndMatrix(unittest.TestCase):
         self.assertEqual(
             plan['files']['src/f2.ts']['work_secs'], plan['files']['src/f1.ts']['work_secs']
         )
-        self.assertEqual(plan['history']['files']['src/f0.ts'], {'secs': 3000.0, 'mutants': 100})
+        self.assertEqual(plan['history']['files']['src/f0.ts'], {'secs': 14000.0, 'mutants': 100})
         self.assertEqual(plan['history']['files']['src/x.ts'], {'secs': 1.0, 'mutants': 1})
 
     def test_a_history_with_any_malformed_part_is_ignored_whole_and_named(self):
@@ -304,10 +305,10 @@ class PlanAndMatrix(unittest.TestCase):
         self.assertEqual(ss.valid_sizing(unsafe, ENTRY), '')
 
     def test_an_entry_past_max_shards_runs_at_it_and_says_so(self):
-        files = {f'src/f{i}.ts': (100, 0, 3_600_000) for i in range(300)}
+        files = {f'src/f{i}.ts': (100, 0, 14_400_000) for i in range(300)}
         doc = ss.sizing('r', 'web', SHA, {}, plan_pass(files))
         with unittest.mock.patch('sys.stderr', new_callable=io.StringIO) as err:
-            run, _ = self.matrix({'r~web': doc}, target=200)
+            run, _ = self.matrix({'r~web': doc})
         plan = json.loads((self.tmp / 'out' / 'r~web.json').read_text())
         self.assertEqual(
             (len(run), plan['shards']), (ss.mutation_cost.MAX_SHARDS, ss.mutation_cost.MAX_SHARDS)
@@ -328,7 +329,7 @@ class PlanAndMatrix(unittest.TestCase):
                 e['dir'],
                 SHA,
                 {},
-                plan_pass({f'src/f{n}.ts': (100, 0, 3_600_000) for n in range(300)}),
+                plan_pass({f'src/f{n}.ts': (100, 0, 14_400_000) for n in range(300)}),
             )
             for f in doc['files'].values():
                 if i % 2 and price is None:
@@ -364,8 +365,6 @@ class PlanAndMatrix(unittest.TestCase):
                     json.dumps(entries),
                     '--plans',
                     str(plans),
-                    '--target-minutes',
-                    '200',
                     '--history',
                     str(hist),
                     '--out-plans',
@@ -436,6 +435,582 @@ class PlanAndMatrix(unittest.TestCase):
         self.assertEqual(len(run), 1)
 
 
+def layout(seed: int) -> list[list]:
+    """A file's mutant spans as Stryker places them: nested blocks, one-line runs, early results,
+    now and then one mutant spanning the whole file."""
+    rng = random.Random(seed)
+    spans, line = [], 1
+    while line < 400:
+        size = rng.choice((1, 1, 2, 5, 20, 60))
+        first, last = line, line + size - 1
+        spans.append([first, last, rng.choice((None, 0.96, 3.0, 40.0))])
+        for _ in range(rng.randrange(0, 4)):
+            a = rng.randint(first, last)
+            spans.append([a, rng.randint(a, last), rng.choice((None, 1.5, 9.0))])
+        line = last + rng.choice((0, 1, 3))
+    if seed % 7 == 0:
+        spans.append([1, line, 2.0])
+    return spans
+
+
+def inside(first: int, last: int, unit: str) -> bool:
+    """Stryker's rule (instrumenter babel-transformer.ts shouldMutate): a range wholly includes the mutant."""
+    m = ss.RANGE.fullmatch(unit)
+    return int(m['first']) <= first and last <= int(m['last'])
+
+
+def ids(spans: list[list]) -> list[list]:
+    """The plan pass's id of each span's mutant: an early one is ignored by a directive."""
+    return [
+        [
+            a,
+            1,
+            b,
+            5,
+            'ConditionalExpression',
+            *((None, None) if p is not None else ('Ignored', 'x')),
+        ]
+        for a, b, p in spans
+    ]
+
+
+def heavy(spans: list[list]) -> dict:
+    run = sum(1 for sp in spans if sp[2] is not None)
+    return {
+        'run': run,
+        'early': len(spans) - run,
+        'spans': spans,
+        'ids': ids(spans),
+        'directives': [],
+        'blob': 'a' * 40,
+    }
+
+
+class Ranges(unittest.TestCase):
+    """A file past one shard's work runs as line ranges of it (stryker-js --mutate file:first-last)."""
+
+    def test_a_split_file_s_ranges_hold_each_of_its_mutants_exactly_once(self):
+        for seed in range(120):
+            spans = layout(seed)
+            f = heavy(spans)
+            with self.subTest(seed=seed):
+                pieces, _ = ss.split('src/s.ts', f, 1000.0, 120.0, None)
+                units = [u for u, *_ in pieces]
+                if seed % 7 == 0:
+                    self.assertEqual(len(units), 1)
+                else:
+                    self.assertGreater(len(units), 1)
+                for first, last, _ in spans:
+                    self.assertEqual(sum(inside(first, last, u) for u in units), 1, (first, last))
+                for unit, run, early, _ in pieces:
+                    held = [sp for sp in spans if inside(sp[0], sp[1], unit)]
+                    self.assertEqual(
+                        (run, early),
+                        (sum(sp[2] is not None for sp in held), sum(sp[2] is None for sp in held)),
+                    )
+                lines = sorted(ss.lines_of(u) for u in units)
+                self.assertTrue(all(a[1] < b[0] for a, b in itertools.pairwise(lines)), lines)
+                self.assertAlmostEqual(sum(w for *_, w in pieces), 1000.0)
+
+    def test_the_cut_keeps_every_range_inside_the_room_its_atoms_allow(self):
+        spans = [[n, n, 10.0] for n in range(1, 101)]
+        pieces, atom = ss.split('src/s.ts', heavy(spans), 1000.0, 260.0, None)
+        self.assertEqual(len(pieces), 4)
+        self.assertTrue(all(w <= 260.0 for *_, w in pieces), [w for *_, w in pieces])
+        self.assertAlmostEqual(atom, 10.0)
+        whole, atom = ss.split('src/s.ts', heavy([[1, 100, 10.0], *spans]), 1000.0, 260.0, None)
+        self.assertEqual([u for u, *_ in whole], ['src/s.ts:1-100'])
+        self.assertAlmostEqual(atom, 1000.0)
+        fits, _ = ss.split('src/s.ts', heavy(spans), 200.0, 260.0, None)
+        self.assertEqual([u for u, *_ in fits], ['src/s.ts'])
+
+    def test_the_cut_takes_more_pieces_when_uneven_atoms_need_them_to_fit_the_room(self):
+        room = ss.mutation_cost.TOP_SECS - 31.2 * 60
+        # Five one-line atoms of 80 min: four pieces can do no better than 160/160/80.
+        five = [[10 * n + 1, 10 * n + 1, 10.0] for n in range(5)]
+        # Three methods of 100, 180 and 100 mutants, each one atom through its body's
+        # BlockStatement mutant: 227.7 min of work as assign() prices them at 72.4 s a
+        # mutant with 2 test runners on 4 workers; two pieces give 167.8/59.9.
+        methods, line = [], 1
+        for size in (100, 180, 100):
+            methods.append([line, line + size, 10.0])
+            methods += [[line + 1 + i, line + 1 + i, 10.0] for i in range(size - 1)]
+            line += size + 2
+        rows = [(five, 400 * 60.0, 5), (methods, 227.7 * 60, 3)]
+        for spans, work, count in rows:
+            with self.subTest(atoms=count):
+                pieces, atom = ss.split('src/s.ts', heavy(spans), work, room, None)
+                self.assertLessEqual(atom, room)
+                self.assertTrue(all(w <= room for *_, w in pieces), [w / 60 for *_, w in pieces])
+                self.assertAlmostEqual(sum(w for *_, w in pieces), work)
+
+    def test_a_cut_no_piece_count_fits_keeps_the_smallest_largest_piece(self):
+        spans = [[1, 1, 10.0], [3, 3, 10.0], [5, 5, 30.0]]
+        pieces, atom = ss.split('src/s.ts', heavy(spans), 500.0, 200.0, None)
+        self.assertEqual([u for u, *_ in pieces], ['src/s.ts:1-3', 'src/s.ts:5-5'])
+        self.assertAlmostEqual(atom, 300.0)
+
+    def test_an_unchanged_file_cuts_by_its_measured_ranges_and_a_changed_one_by_its_prior(self):
+        spans = [[n, n, 10.0] for n in range(1, 101)]
+        history = {
+            'files': {
+                'src/s.ts:1-50': {'secs': 9000.0, 'mutants': 50},
+                'src/s.ts:51-100': {'secs': 1000.0, 'mutants': 50},
+            },
+            'blobs': {'src/s.ts': 'a' * 40},
+        }
+        measured, _ = ss.split('src/s.ts', heavy(spans), 1000.0, 520.0, history)
+        self.assertEqual([u for u, *_ in measured], ['src/s.ts:1-28', 'src/s.ts:29-100'])
+        changed = {**history, 'blobs': {'src/s.ts': 'b' * 40}}
+        even, _ = ss.split('src/s.ts', heavy(spans), 1000.0, 520.0, changed)
+        self.assertEqual([u for u, *_ in even], ['src/s.ts:1-50', 'src/s.ts:51-100'])
+
+    def test_a_file_past_one_shard_is_planned_as_ranges_across_shards(self):
+        # scroll-controller.ts in run 43153701425: 1,672 run mutants at 72.4 worker-seconds each.
+        mutants = [[2 * n - 1, 2 * n, 72_400 - 960] for n in range(1, 1673)]
+        files = {'src/s.ts': (1672, 0, sum(m[2] for m in mutants)), 'src/t.ts': (10, 0, 1000)}
+        doc = ss.sizing('r', 'web', SHA, {}, plan_pass(files), {'src/s.ts': 'a' * 40})
+        spans = ss.spans_of(mutants, 1.0)
+        doc['files']['src/s.ts'].update(spans=spans, ids=ids(spans), directives=[[1, 0], [9, 4]])
+        self.assertEqual(ss.valid_sizing(doc, ENTRY), '')
+        run, merge = self.matrix(doc)
+        plan = json.loads((self.tmp / 'out' / 'r~web.json').read_text())
+        ranges = [u for u in plan['files'] if u.startswith('src/s.ts:')]
+        self.assertGreater(len(ranges), 1)
+        self.assertGreater(len({plan['files'][u]['shard'] for u in ranges}), 1)
+        self.assertEqual(plan['blobs'], {'src/s.ts': 'a' * 40})
+        self.assertTrue(all(m <= plan['top_minutes'] for m in plan['projected_minutes']))
+        self.assertEqual(plan['top_minutes'], round(ss.mutation_cost.TOP_SECS / 60, 1))
+        self.assertEqual(plan['ids'], {'src/s.ts': ids(spans)})
+        listed = [
+            u for n in range(1, plan['shards'] + 1) for u in ss.mutate_list(plan, n).split(',')
+        ]
+        openers = [u for u in listed if ss.OPENER.fullmatch(u)]
+        self.assertEqual(sorted(u for u in listed if u not in openers), sorted(plan['files']))
+        # Each shard holding a range of the file also passes each directive's opener.
+        shards = {plan['files'][u]['shard'] for u in ranges}
+        self.assertEqual(
+            sorted(openers), sorted(['src/s.ts:1:0-1:2', 'src/s.ts:9:4-9:6'] * len(shards))
+        )
+        self.assertEqual(sum(plan['files'][u]['run'] for u in ranges), 1672)
+        self.assertEqual(len(run), merge[0]['shards'])
+
+    def test_a_span_no_cut_shortens_is_planned_whole_and_named(self):
+        mutants = [[1, 3344, 71_440], *[[2 * n - 1, 2 * n, 71_440] for n in range(1, 1672)]]
+        doc = ss.sizing('r', 'web', SHA, {}, plan_pass({'src/s.ts': (1672, 0, 1672 * 71_440)}))
+        spans = ss.spans_of(mutants, 1.0)
+        doc['files']['src/s.ts'].update(spans=spans, ids=ids(spans), directives=[])
+        with unittest.mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+            self.matrix(doc)
+        plan = json.loads((self.tmp / 'out' / 'r~web.json').read_text())
+        self.assertEqual(list(plan['files'] or {'src/s.ts:1-3344': 0}), ['src/s.ts:1-3344'])
+        self.assertIn(
+            "::warning::r:web: src/s.ts holds one mutant's span of 504 min", err.getvalue()
+        )
+
+    def matrix(self, doc: dict) -> tuple[list, list]:
+        self.tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.tmp / 'plans').mkdir()
+        (self.tmp / 'plans' / 'r~web.json').write_text(json.dumps(doc))
+        return ss.matrix([ENTRY], self.tmp / 'plans', self.tmp / 'out', self.tmp / 'history')
+
+    def test_the_plan_pass_s_spans_and_blobs_ride_in_the_sizing_and_are_checked(self):
+        pass_ = plan_pass({'src/a.ts': (2, 1, 3000)})
+        pass_['files']['src/a.ts']['mutants'] = [[1, 4, 1000], [2, 2, None], [6, 6, 2000]]
+        doc = ss.sizing('r', 'web', SHA, {}, pass_, {'src/a.ts': 'c' * 40, 'src/x.ts': 'd' * 40})
+        f = doc['files']['src/a.ts']
+        self.assertEqual(
+            (f['spans'], f['blob']),
+            (
+                [
+                    [1, 4, 1 + ss.PRIOR_OVERHEAD_SECS],
+                    [2, 2, None],
+                    [6, 6, 2 + ss.PRIOR_OVERHEAD_SECS],
+                ],
+                'c' * 40,
+            ),
+        )
+        self.assertEqual(ss.valid_sizing(doc, ENTRY), '')
+        for bad in (
+            [[1, 4, 1.0]],
+            [[4, 1, 1.0], [2, 2, None], [6, 6, 2.0]],
+            [[0, 1, 1.0], [2, 2, None], [6, 6, 1.0]],
+            [[1, 4, None], [2, 2, None], [6, 6, 2.0]],
+            'x',
+        ):
+            with self.subTest(bad=bad):
+                self.assertIn(
+                    'spans',
+                    ss.valid_sizing({**doc, 'files': {'src/a.ts': {**f, 'spans': bad}}}, ENTRY),
+                )
+        self.assertIn(
+            'blob', ss.valid_sizing({**doc, 'files': {'src/a.ts': {**f, 'blob': 'zz'}}}, ENTRY)
+        )
+        torn = plan_pass({'src/a.ts': (2, 1, 3000)})
+        torn['files']['src/a.ts']['mutants'] = [[1, 4, 1000]]
+        self.assertNotIn('spans', ss.sizing('r', 'web', SHA, {}, torn)['files']['src/a.ts'])
+
+    def test_the_plan_pass_s_ids_and_directives_ride_in_the_sizing_and_are_checked(self):
+        pass_ = plan_pass({'src/a.ts': (2, 1, 3000)})
+        pass_['files']['src/a.ts']['mutants'] = [[1, 4, 1000], [2, 2, None], [6, 6, 2000]]
+        rows = [
+            [1, 3, 4, 2, 'BlockStatement', None, None],
+            [2, 5, 2, 9, 'StringLiteral', 'Ignored', 'Ignored using a comment'],
+            [6, 1, 6, 4, 'ArithmeticOperator', None, None],
+        ]
+        pass_['files']['src/a.ts']['ids'] = rows
+        marks = {'src/a.ts': [[1, 0]]}
+        f = ss.sizing('r', 'web', SHA, {}, pass_, {'src/a.ts': 'c' * 40}, marks)['files'][
+            'src/a.ts'
+        ]
+        self.assertEqual((f['ids'], f['directives']), (rows, [[1, 0]]))
+        doc = ss.sizing('r', 'web', SHA, {}, pass_, {'src/a.ts': 'c' * 40}, marks)
+        self.assertEqual(ss.valid_sizing(doc, ENTRY), '')
+        for bad in (
+            rows[:2],
+            [rows[1], rows[0], rows[2]],
+            [[0, *rows[0][1:]], *rows[1:]],
+            [[*rows[0][:4], 7, None, None], *rows[1:]],
+        ):
+            with self.subTest(bad=bad):
+                torn = json.loads(json.dumps(pass_))
+                torn['files']['src/a.ts']['ids'] = bad
+                self.assertNotIn(
+                    'ids', ss.sizing('r', 'web', SHA, {}, torn, None, marks)['files']['src/a.ts']
+                )
+                self.assertIn(
+                    'ids', ss.valid_sizing({**doc, 'files': {'src/a.ts': {**f, 'ids': bad}}}, ENTRY)
+                )
+        for marked in ([[0, 0]], [[1, -1]], [[1]], [[1, 0]] * (ss.MAX_DIRECTIVES + 1)):
+            with self.subTest(marked=marked):
+                self.assertIn(
+                    'directives',
+                    ss.valid_sizing(
+                        {**doc, 'files': {'src/a.ts': {**f, 'directives': marked}}}, ENTRY
+                    ),
+                )
+        # Past MAX_DIRECTIVES, or with no scan of its source, a file keeps no ids and runs whole.
+        many = {'src/a.ts': [[n, 0] for n in range(1, ss.MAX_DIRECTIVES + 2)]}
+        for got in (
+            ss.sizing('r', 'web', SHA, {}, pass_, None, many),
+            ss.sizing('r', 'web', SHA, {}, pass_),
+        ):
+            self.assertNotIn('ids', got['files']['src/a.ts'])
+
+    def test_a_file_past_one_shard_with_no_ids_runs_whole_and_is_named(self):
+        f = heavy([[n, n, 10.0] for n in range(1, 101)])
+        del f['ids'], f['directives']
+        self.assertEqual(ss.split('src/s.ts', f, 1000.0, 260.0, None)[0][0][0], 'src/s.ts')
+        mutants = [[2 * n - 1, 2 * n, 72_400 - 960] for n in range(1, 1673)]
+        doc = ss.sizing('r', 'web', SHA, {}, plan_pass({'src/s.ts': (1672, 0, 1672 * 71_440)}))
+        doc['files']['src/s.ts']['spans'] = ss.spans_of(mutants, 1.0)
+        with unittest.mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+            self.matrix(doc)
+        plan = json.loads((self.tmp / 'out' / 'r~web.json').read_text())
+        self.assertEqual((plan['shards'], plan['ids']), (1, {}))
+        self.assertIn("src/s.ts projects 504 min, past a shard's 143 min", err.getvalue())
+        self.assertIn('gave no mutant ids', err.getvalue())
+
+    def test_openers_are_the_file_scope_directives_where_babel_counts_them(self):
+        text = (
+            '// Stryker disable all\r\n'
+            'const s = "\U0001f600"; /* Stryker restore ArithmeticOperator: why */\n'
+            '  // Stryker disable next-line all\n'
+            '  //Stryker restore all\u2028'
+            '/** Stryker disable all */ x; // stryker disable all\n'
+            '\t/* Stryker disable StringLiteral,BooleanLiteral */\n'
+        )
+        # The emoji is two UTF-16 columns; next-line, JSDoc and lower-case forms are not file-scope.
+        self.assertEqual(ss.openers(text), [[1, 0], [2, 16], [4, 2], [6, 1]])
+        self.assertEqual(ss.openers('let a = 1;\n'), [])
+
+    def test_each_file_s_directives_are_read_from_its_blob_at_head(self):
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        env = {**os.environ, 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1'}
+        (tmp / 'src').mkdir()
+        (tmp / 'src' / 'a.ts').write_text('a;\n  // Stryker disable all\nb;\n')
+        (tmp / 'src' / 'b.ts').write_text('b;\n')
+        for cmd in (
+            ['init', '-q'],
+            ['add', '.'],
+            ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'x'],
+        ):
+            subprocess.run(['git', '-C', str(tmp), *cmd], check=True, env=env)
+        (tmp / 'src' / 'a.ts').write_text('instrumented in place\n')
+        versions = ss.blobs(tmp, ['src/a.ts', 'src/b.ts'])
+        self.assertEqual(ss.directives(tmp, versions), {'src/a.ts': [[2, 2]], 'src/b.ts': []})
+        self.assertEqual(ss.directives(tmp, {'src/a.ts': '0' * 40}), {})
+        self.assertEqual(ss.directives(tmp / 'nowhere', versions), {})
+
+    def test_each_file_s_blob_is_its_version_at_head(self):
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        env = {**os.environ, 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1'}
+        (tmp / 'web' / 'src').mkdir(parents=True)
+        (tmp / 'web' / 'src' / 'a.ts').write_text('export const a = 1;\n')
+        for cmd in (
+            ['init', '-q'],
+            ['add', '.'],
+            ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'x'],
+        ):
+            subprocess.run(['git', '-C', str(tmp), *cmd], check=True, env=env)
+        want = subprocess.run(
+            ['git', '-C', str(tmp), 'rev-parse', 'HEAD:web/src/a.ts'],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        ).stdout.strip()
+        (tmp / 'web' / 'src' / 'a.ts').write_text('instrumented in place\n')
+        self.assertEqual(ss.blobs(tmp / 'web', ['src/a.ts', 'src/none.ts']), {'src/a.ts': want})
+        self.assertEqual(ss.blobs(tmp / 'nowhere', ['src/a.ts']), {})
+
+
+def ranged_report(shard: int, lines: list[int], statuses: dict[int, str] | None = None) -> dict:
+    rep = {'schemaVersion': '2', 'thresholds': {'high': 80, 'low': 60}, 'testFiles': {}}
+    status = {n: 'Killed' if n % 2 else 'Survived' for n in lines} | (statuses or {})
+    rep['files'] = {
+        'src/s.ts': {
+            'language': 'typescript',
+            'source': 's',
+            'mutants': [
+                {
+                    **mutant(
+                        f'{shard}{n}', status[n], killed=['t'] * (status[n] == 'Killed'), line=n
+                    ),
+                    'coveredBy': [],
+                }
+                for n in lines
+            ],
+        }
+    }
+    return rep
+
+
+def plan_ids(early: dict[int, str] | None = None, lines: range = range(1, 5)) -> list[list]:
+    """The plan pass's ids of ranged_report's mutants, line N ignored with reason EARLY[N]."""
+    early = early or {}
+    return [
+        [
+            n,
+            1,
+            n,
+            5,
+            'ConditionalExpression',
+            *(('Ignored', early[n]) if n in early else (None, None)),
+        ]
+        for n in lines
+    ]
+
+
+class RangeMerge(unittest.TestCase):
+    PLAN: ClassVar[dict] = {
+        'repo': 'r',
+        'dir': 'web',
+        'sha': SHA,
+        'shards': 2,
+        'break': None,
+        'files': {
+            'src/s.ts:1-2': {'shard': 1, 'run': 2, 'early': 0},
+            'src/s.ts:3-4': {'shard': 2, 'run': 2, 'early': 0},
+        },
+        'mutants': {'src/s.ts:1-2': 2, 'src/s.ts:3-4': 2},
+        'ids': {'src/s.ts': plan_ids()},
+        'directives': {'src/s.ts': []},
+        'blobs': {'src/s.ts': 'a' * 40},
+        'history': None,
+    }
+
+    def write(self, reports: dict[int, list[int]], statuses: dict[int, str] | None = None) -> None:
+        self.tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for n, lines in reports.items():
+            d = self.tmp / 'shards' / f'strykershard-r~web-{n}'
+            d.mkdir(parents=True)
+            (d / 'result.json').write_text(json.dumps(ranged_report(n, lines, statuses)))
+            (d / 'meta.json').write_text(
+                json.dumps(
+                    {
+                        'repo': 'r',
+                        'dir': 'web',
+                        'shard': n,
+                        'shards': 2,
+                        'complete': True,
+                        'skipped': False,
+                    }
+                )
+            )
+            unit = 'src/s.ts:1-2' if n == 1 else 'src/s.ts:3-4'
+            (d / 'costs.json').write_text(
+                json.dumps({'setup_secs': 50.0, 'files': {unit: {'secs': 10.0 * n, 'mutants': 2}}})
+            )
+
+    def merge(self, plan: dict | None = None) -> tuple[int, str]:
+        with unittest.mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+            rc = ss.merge(
+                plan or self.PLAN, self.tmp / 'shards', self.tmp / 'stage', self.tmp / 'costs'
+            )
+        return rc, err.getvalue()
+
+    def test_a_split_file_merges_into_one_file_with_each_mutant_once(self):
+        self.write({1: [1, 2], 2: [3, 4]})
+        rc, err = self.merge()
+        self.assertEqual(rc, 0, err)
+        merged = json.loads((self.tmp / 'stage' / 'mutation.json').read_text())
+        lines = [m['location']['start']['line'] for m in merged['files']['src/s.ts']['mutants']]
+        self.assertEqual(sorted(lines), [1, 2, 3, 4])
+        self.assertEqual(len({m['id'] for m in merged['files']['src/s.ts']['mutants']}), 4)
+        self.assertEqual(
+            json.loads((self.tmp / 'stage' / 'meta.json').read_text())['score'], '50.0'
+        )
+        history = json.loads((self.tmp / 'costs' / 'costs.json').read_text())
+        self.assertEqual(
+            history,
+            {
+                'files': {
+                    'src/s.ts:1-2': {'secs': 10.0, 'mutants': 2},
+                    'src/s.ts:3-4': {'secs': 20.0, 'mutants': 2},
+                },
+                'setup_secs': 50.0,
+                'blobs': {'src/s.ts': 'a' * 40},
+            },
+        )
+
+    def test_a_mutant_lost_or_counted_twice_publishes_nothing(self):
+        overlapping = {
+            **self.PLAN,
+            'files': {
+                'src/s.ts:1-3': {'shard': 1, 'run': 3, 'early': 0},
+                'src/s.ts:3-4': {'shard': 2, 'run': 2, 'early': 0},
+            },
+        }
+        for reports, plan, why in (
+            ({1: [1, 2], 2: [3]}, None, 'shard 2 reports 1 mutants in its ranges'),
+            ({1: [1, 2], 2: [2, 3, 4]}, None, 'shard 2 reports 3 mutants'),
+            ({1: [1, 2], 2: [1, 4]}, None, 'shard 2 reports a mutant of'),
+            ({1: [1, 2, 3], 2: [3, 4]}, overlapping, 'shards 1 and 2 both report one mutant'),
+        ):
+            with self.subTest(why=why):
+                self.write(reports)
+                rc, err = self.merge(plan)
+                self.assertEqual(rc, 1)
+                self.assertIn(why, err)
+                self.assertFalse((self.tmp / 'stage' / 'meta.json').exists())
+
+    def test_the_plan_pass_decides_which_mutants_a_directive_ignores(self):
+        # `/* Stryker disable all */` leads the file and `// Stryker restore all` sits between
+        # lines 3 and 4, inside shard 2's range: the whole-file plan pass ignores lines 1 to 3.
+        # Each ranged run lost the disable in a subtree its range skipped and ran them.
+        why = 'Ignored using a comment'
+        plan = {**self.PLAN, 'ids': {'src/s.ts': plan_ids({1: why, 2: why, 3: why})}}
+        self.write({1: [1, 2], 2: [3, 4]}, {4: 'Killed'})
+        rc, err = self.merge(plan)
+        self.assertEqual(rc, 0, err)
+        merged = json.loads((self.tmp / 'stage' / 'mutation.json').read_text())
+        got = {
+            m['location']['start']['line']: (m['status'], m.get('statusReason'), 'killedBy' in m)
+            for m in merged['files']['src/s.ts']['mutants']
+        }
+        self.assertEqual(
+            got,
+            {1: ('Ignored', why, False), 2: ('Ignored', why, False), 3: ('Ignored', why, False)}
+            | {4: ('Killed', None, True)},
+        )
+        self.assertEqual(
+            json.loads((self.tmp / 'stage' / 'meta.json').read_text())['score'], '100.0'
+        )
+
+    def test_a_range_s_mutants_that_are_not_the_plan_pass_s_publish_nothing(self):
+        moved = plan_ids()
+        moved[3][1] = 2
+        for plan, statuses, why in (
+            (
+                {**self.PLAN, 'ids': {'src/s.ts': moved}},
+                None,
+                (
+                    "shard 2 reports a mutant of 'src/s.ts' at 4:1 ('ConditionalExpression') its "
+                    'plan pass did not find'
+                ),
+            ),
+            (
+                {**self.PLAN, 'ids': {'src/s.ts': [*plan_ids(), plan_ids(lines=range(4, 5))[0]]}},
+                None,
+                "no shard reports the mutant of 'src/s.ts' its plan pass found at 4:1",
+            ),
+            (
+                self.PLAN,
+                {3: 'Ignored'},
+                (
+                    "shard 2 ignored the mutant of 'src/s.ts' at 3:1 ('ConditionalExpression') "
+                    'that its plan pass runs'
+                ),
+            ),
+            ({**self.PLAN, 'ids': {}}, None, "the plan holds no mutant ids for 'src/s.ts'"),
+        ):
+            with self.subTest(why=why):
+                self.write({1: [1, 2], 2: [3, 4]}, statuses)
+                rc, err = self.merge(plan)
+                self.assertEqual(rc, 1)
+                self.assertIn(why, err)
+                self.assertFalse((self.tmp / 'stage' / 'meta.json').exists())
+
+
+class RangeHistory(unittest.TestCase):
+    def write(self, plan: dict, measured: dict) -> dict:
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        ss.write_history(tmp, [{'setup_secs': 60.0}], plan, measured, set(plan['mutants']))
+        return json.loads((tmp / 'costs.json').read_text())
+
+    def plan(self, blob: str, old: dict) -> dict:
+        return {
+            'mutants': {'src/s.ts:1-40': 4, 'src/s.ts:41-90': 4, 'src/t.ts': 1},
+            'blobs': {'src/s.ts': blob, 'src/t.ts': 'e' * 40},
+            'history': old,
+        }
+
+    OLD: ClassVar[dict] = {
+        'files': {
+            'src/s.ts:1-30': {'secs': 1.0, 'mutants': 3},
+            'src/s.ts:31-60': {'secs': 2.0, 'mutants': 3},
+            'src/s.ts:61-90': {'secs': 3.0, 'mutants': 3},
+            'src/t.ts': {'secs': 4.0, 'mutants': 1},
+        },
+        'setup_secs': 40.0,
+        'blobs': {'src/s.ts': 'a' * 40, 'src/t.ts': 'f' * 40},
+    }
+
+    def test_an_unchanged_file_keeps_its_old_ranges_that_no_new_measure_overlaps(self):
+        got = self.write(
+            self.plan('a' * 40, self.OLD), {'src/s.ts:1-40': {'secs': 9.0, 'mutants': 4}}
+        )
+        self.assertEqual(sorted(got['files']), ['src/s.ts:1-40', 'src/s.ts:61-90', 'src/t.ts'])
+        self.assertEqual(got['blobs'], {'src/s.ts': 'a' * 40, 'src/t.ts': 'f' * 40})
+
+    def test_a_changed_file_keeps_only_this_run_s_measures(self):
+        got = self.write(
+            self.plan('b' * 40, self.OLD), {'src/s.ts:1-40': {'secs': 9.0, 'mutants': 4}}
+        )
+        self.assertEqual(sorted(got['files']), ['src/s.ts:1-40', 'src/t.ts'])
+        self.assertEqual(got['blobs'], {'src/s.ts': 'b' * 40, 'src/t.ts': 'f' * 40})
+
+    def test_a_short_sample_keeps_the_last_measure_and_a_whole_file_row_replaces_its_ranges(self):
+        got = self.write(
+            self.plan('a' * 40, self.OLD), {'src/s.ts:1-40': {'secs': 9.0, 'mutants': 1}}
+        )
+        self.assertEqual(
+            sorted(got['files']), ['src/s.ts:1-30', 'src/s.ts:31-60', 'src/s.ts:61-90', 'src/t.ts']
+        )
+        whole = {**self.plan('a' * 40, self.OLD), 'mutants': {'src/s.ts': 8, 'src/t.ts': 1}}
+        got = self.write(whole, {'src/s.ts': {'secs': 9.0, 'mutants': 8}})
+        self.assertEqual(sorted(got['files']), ['src/s.ts', 'src/t.ts'])
+
+    def test_a_history_with_blobs_reads_back_and_one_with_bad_blobs_is_refused(self):
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (tmp / 'h.json').write_text(json.dumps(self.OLD))
+        self.assertEqual(ss.read_history(tmp / 'h.json')['blobs'], self.OLD['blobs'])
+        (tmp / 'h.json').write_text(json.dumps({**self.OLD, 'blobs': {'src/s.ts': 'nope'}}))
+        with self.assertRaises(ValueError):
+            ss.read_history(tmp / 'h.json')
+
+
 class Fuzz(unittest.TestCase):
     """Generated bad versions of an entry's plan or history still plan the entry, and say so."""
 
@@ -450,11 +1025,11 @@ class Fuzz(unittest.TestCase):
                 'web',
                 SHA,
                 {'thresholds': {'break': 50}},
-                plan_pass({f'src/f{n}.ts': (100, 1, 3_600_000) for n in range(6)}),
+                plan_pass({f'src/f{n}.ts': (100, 1, 14_400_000) for n in range(6)}),
             )
         ).encode()
         self.history = json.dumps(
-            {'files': {'src/f0.ts': {'secs': 3000.0, 'mutants': 100}}, 'setup_secs': 100.0}
+            {'files': {'src/f0.ts': {'secs': 14000.0, 'mutants': 100}}, 'setup_secs': 100.0}
         ).encode()
         self.n = 0
 
@@ -467,9 +1042,7 @@ class Fuzz(unittest.TestCase):
             if data is not None:
                 (root / kind / f'{key}.json').write_bytes(data)
         with unittest.mock.patch('sys.stderr', new_callable=io.StringIO) as err:
-            run, merge = ss.matrix(
-                [self.VICTIM], root / 'plans', 60, root / 'out', root / 'history'
-            )
+            run, merge = ss.matrix([self.VICTIM], root / 'plans', root / 'out', root / 'history')
         out = root / 'out' / f'{key}.json'
         return run, merge, out.read_bytes() if out.exists() else None, err.getvalue()
 
@@ -722,11 +1295,12 @@ class Merge(unittest.TestCase):
         capped = {
             **self.PLAN,
             'projected_minutes': [250.0, 240.0],
+            'top_minutes': 157.0,
             'capped': 'a cap of 16 shards',
         }
         with unittest.mock.patch('sys.stderr', new_callable=io.StringIO) as err:
             self.assertEqual(self.merge(plan=capped), 0)
-        top = f'{ss.mutation_cost.TOP_MINUTES:.1f}'
+        top = '157.0'
         note = (
             'r:web: runs in 2 shard(s), capped by a cap of 16 shards, so its longest sized '
             f'shard projects 250.0 min, past the {top} min the band allows'
@@ -763,6 +1337,7 @@ class Merge(unittest.TestCase):
                     'src/c.ts': {'secs': 20.0, 'mutants': 1},
                 },
                 'setup_secs': 51.5,
+                'blobs': {},
             },
         )
 
@@ -791,6 +1366,7 @@ class Merge(unittest.TestCase):
                     'src/c.ts': {'secs': 5.0, 'mutants': 1},
                 },
                 'setup_secs': 51.0,
+                'blobs': {},
             },
         )
 
@@ -845,7 +1421,8 @@ class Merge(unittest.TestCase):
         shutil.rmtree(self.shards)
         self.assertEqual(self.merge(plan=lone), 1)
         self.assertEqual(
-            self.history(), {'files': self.PLAN['history']['files'], 'setup_secs': 40.0}
+            self.history(),
+            {'files': self.PLAN['history']['files'], 'setup_secs': 40.0, 'blobs': {}},
         )
 
     def test_a_run_that_killed_nothing_publishes_and_records_nothing(self):
@@ -895,15 +1472,36 @@ if (plugin.kind !== 'Reporter' || plugin.name !== 'ci') process.exit(9);
 const cwd = process.cwd();
 const R = plugin.injectableClass;
 const options = JSON.parse(process.env.HARNESS_OPTIONS || '{"concurrency": 4, "checkers": []}');
+// The plan's mutants carry Stryker's 0-based lines: these sit on lines 1 to 3, 5 and 2 of the file.
+const at = (first, last) => ({ start: { line: first - 1, column: 2 }, end: { line: last - 1, column: 9 } });
+// onMutantTested gets mutation-testing-report-schema locations, which are 1-based.
+const schema = (first, last) => ({ start: { line: first, column: 3 }, end: { line: last, column: 10 } });
 const r = new R(options, { [`${cwd}/src/a.ts`]: { mutate: true }, [`${cwd}/src/z.ts`]: { mutate: true },
   [`${cwd}/src/skip.ts`]: { mutate: false },
-  ...(process.env.HARNESS_RANGED ? { [`${cwd}/src/r.ts`]: { mutate: [{ start: { line: 1, column: 0 }, end: { line: 2, column: 0 } }] } } : {}) });
+  ...(process.env.HARNESS_RANGED ? { [`${cwd}/src/r.ts`]: { mutate: [
+    // A directive's opener on line 9 (stryker-shard.py mutate_list), listed first.
+    { start: { line: 8, column: 4 }, end: { line: 8, column: 6 } },
+    { start: { line: 0, column: 0 }, end: { line: 1, column: Number.MAX_SAFE_INTEGER } },
+    { start: { line: 2, column: 0 }, end: { line: 4, column: Number.MAX_SAFE_INTEGER } },
+    { start: { line: 5, column: 0 }, end: { line: 8, column: Number.MAX_SAFE_INTEGER } }] } } : {}) });
 r.onMutationTestingPlanReady({ mutantPlans: [
-  { plan: 'Run', netTime: 120, mutant: { id: '1', fileName: `${cwd}/src/a.ts` } },
-  { plan: 'Run', netTime: 30, mutant: { id: '3', fileName: `${cwd}/src/a.ts` } },
-  { plan: 'EarlyResult', mutant: { id: '2', fileName: `${cwd}/src/a.ts`, status: 'Ignored' } }] });
-r.onMutantTested({ id: '2', fileName: `${cwd}/src/a.ts` });
-r.onMutantTested({ id: '1', fileName: `${cwd}/src/a.ts` });
+  { plan: 'Run', netTime: 120, mutant: { id: '1', fileName: `${cwd}/src/a.ts`, mutatorName: 'BlockStatement', location: at(1, 3) } },
+  { plan: 'Run', netTime: 30, mutant: { id: '3', fileName: `${cwd}/src/a.ts`, mutatorName: 'StringLiteral', location: at(5, 5) } },
+  { plan: 'EarlyResult', mutant: { id: '2', fileName: `${cwd}/src/a.ts`, mutatorName: 'StringLiteral', status: 'Ignored',
+    statusReason: 'Ignored using a comment', location: at(2, 2) } },
+  ...(process.env.HARNESS_RANGED ? [
+    { plan: 'Run', netTime: 7, mutant: { id: '4', fileName: `${cwd}/src/r.ts`, location: at(7, 8) } },
+    { plan: 'Run', netTime: 5, mutant: { id: '5', fileName: `${cwd}/src/r.ts`, location: at(2, 2) } },
+    { plan: 'Run', netTime: 5, mutant: { id: '6', fileName: `${cwd}/src/r.ts`, location: at(3, 3) } },
+    { plan: 'Run', netTime: 5, mutant: { id: '7', fileName: `${cwd}/src/r.ts`, location: at(9, 9) } }] : [])] });
+r.onMutantTested({ id: '2', fileName: `${cwd}/src/a.ts`, location: schema(2, 2) });
+r.onMutantTested({ id: '1', fileName: `${cwd}/src/a.ts`, location: schema(1, 3) });
+if (process.env.HARNESS_RANGED) {
+  // Each range's last line and the adjacent range's first line.
+  for (const [id, first, last] of [['4', 7, 8], ['5', 2, 2], ['6', 3, 3], ['7', 9, 9]]) {
+    r.onMutantTested({ id, fileName: `${cwd}/src/r.ts`, location: schema(first, last) });
+  }
+}
 r.onMutationTestReportReady({ schemaVersion: '2', files: { 'src/a.ts': { mutants: [] } } }, {});
 """
 
@@ -942,8 +1540,19 @@ r.onMutationTestReportReady({ schemaVersion: '2', files: { 'src/a.ts': { mutants
         self.assertEqual(
             plan['files'],
             {
-                'src/a.ts': {'run': 2, 'early': 1, 'net_ms': 150},
-                'src/z.ts': {'run': 0, 'early': 0, 'net_ms': 0},
+                'src/a.ts': {
+                    'run': 2,
+                    'early': 1,
+                    'net_ms': 150,
+                    'mutants': [[1, 3, 120], [5, 5, 30], [2, 2, None]],
+                    # Schema locations, as the shards' reports carry them.
+                    'ids': [
+                        [1, 3, 3, 10, 'BlockStatement', None, None],
+                        [5, 3, 5, 10, 'StringLiteral', None, None],
+                        [2, 3, 2, 10, 'StringLiteral', 'Ignored', 'Ignored using a comment'],
+                    ],
+                },
+                'src/z.ts': {'run': 0, 'early': 0, 'net_ms': 0, 'mutants': [], 'ids': []},
             },
         )
         self.assertFalse((tmp / 'times').exists())
@@ -970,6 +1579,21 @@ r.onMutationTestReportReady({ schemaVersion: '2', files: { 'src/a.ts': { mutants
         plan = json.loads((tmp / 'plan.json').read_text())
         self.assertTrue(plan['ranged'] is True)
         self.assertIn('src/r.ts', plan['files'])
+
+    def test_a_ranged_shard_records_each_finish_under_the_range_holding_it(self):
+        proc, tmp = self.run_harness(
+            {'CI_STRYKER_TIMES': 'times', 'CI_STRYKER_RESULT': 'result.json'},
+            {'HARNESS_RANGED': '1'},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = [r.split('\t')[1] for r in (tmp / 'times').read_text().splitlines()[3:-1]]
+        self.assertEqual(
+            rows, ['src/a.ts', 'src/r.ts:6-9', 'src/r.ts:1-2', 'src/r.ts:3-5', 'src/r.ts:6-9']
+        )
+        self.assertEqual(
+            sorted(ss.costs(tmp / 'times')['files']),
+            ['src/a.ts', 'src/r.ts:1-2', 'src/r.ts:3-5', 'src/r.ts:6-9'],
+        )
 
     def test_a_run_records_each_planned_mutant_s_finish_its_report_and_its_end(self):
         proc, tmp = self.run_harness(
@@ -1183,7 +1807,7 @@ class Wiring(unittest.TestCase):
             ],
         )
         _, merge = ss.matrix(
-            json.loads(outputs['entries']), self.tmp_dir(), 200, self.tmp_dir(), self.tmp_dir()
+            json.loads(outputs['entries']), self.tmp_dir(), self.tmp_dir(), self.tmp_dir()
         )
         self.assertEqual([m['key'] for m in merge], [k for _, k in got])
 
@@ -1323,11 +1947,11 @@ class Wiring(unittest.TestCase):
                 'x/y',
                 SHA,
                 {},
-                plan_pass({f'src/f{i}.ts': (100, 0, 3_600_000) for i in range(6)}),
+                plan_pass({f'src/f{i}.ts': (100, 0, 14_400_000) for i in range(6)}),
             )
             (plans / 'a-b~x=y.json').write_text(json.dumps(doc))
             run, merge = ss.matrix(
-                [one], plans, 60, pathlib.Path(tmp) / 'o', pathlib.Path(tmp) / 'history'
+                [one], plans, pathlib.Path(tmp) / 'o', pathlib.Path(tmp) / 'history'
             )
         k = merge[0]['shards']
         names = {self.render(upload, r) for r in run}
@@ -1427,7 +2051,6 @@ class Wiring(unittest.TestCase):
             env={
                 **os.environ,
                 'ENTRIES': json.dumps(entries),
-                'TARGET_MINUTES': '200',
                 'GITHUB_OUTPUT': str(out),
             },
         )

@@ -231,7 +231,7 @@ class Pack(unittest.TestCase):
             [sorted(it.unit for it in b.items) for b in bins],
             [['f3', 'f4', 'f7'], ['f1', 'f2', 'f5', 'f6']],
         )
-        k, _ = mutation_cost.choose(items, {'m': 0}, 15)
+        k, _ = mutation_cost.choose(items, {'m': 0}, 17.25)
         self.assertEqual(k, 2)
 
     def test_two_groups_pack_as_the_exhaustive_rule_does(self):
@@ -261,75 +261,127 @@ class Pack(unittest.TestCase):
 
 
 class Choose(unittest.TestCase):
-    """Shards land from BAND under the target up to top_secs: 85 to 115 of a 100-s target."""
+    """Shards land in a band whose top is the given one: 85 to 115 under a 115-s top."""
 
     @staticmethod
     def items(*work: float) -> list:
         return [mutation_cost.Item('m', f'f{i}', w) for i, w in enumerate(work)]
 
     def test_a_run_inside_the_band_s_top_stays_one_job(self):
-        k, bins = mutation_cost.choose(self.items(60, 50), {'m': 0}, 100)
+        k, bins = mutation_cost.choose(self.items(60, 50), {'m': 0}, 115)
         self.assertEqual((k, bins[0].load), (1, 110))
 
     def test_the_count_that_lands_every_shard_in_the_band_beats_more_shards_under_the_target(self):
-        k, bins = mutation_cost.choose(self.items(*[10] * 22), {'m': 0}, 100)
+        k, bins = mutation_cost.choose(self.items(*[10] * 22), {'m': 0}, 115)
         self.assertEqual(k, 2)
         self.assertTrue(all(85 <= b.load <= 115 for b in bins), [b.load for b in bins])
 
     def test_with_no_count_in_the_band_the_fewest_under_its_top(self):
-        k, bins = mutation_cost.choose(self.items(*[10] * 16), {'m': 0}, 100)
+        k, bins = mutation_cost.choose(self.items(*[10] * 16), {'m': 0}, 115)
         self.assertEqual((k, [b.load for b in bins]), (2, [80, 80]))
 
     def test_an_item_over_the_band_stops_at_the_fewest_shards_that_isolate_it(self):
-        k, bins = mutation_cost.choose(self.items(500, 30, 20), {'m': 10}, 100)
+        k, bins = mutation_cost.choose(self.items(500, 30, 20), {'m': 10}, 115)
         self.assertEqual((k, max(b.load for b in bins)), (2, 510))
 
     def test_two_thousand_items_with_one_over_the_target_choose_in_seconds(self):
         items = self.items(5000, *[1.0 + i % 7 for i in range(1999)])
         started = time.monotonic()
-        _, bins = mutation_cost.choose(items, {'m': 30}, 600)
+        _, bins = mutation_cost.choose(items, {'m': 30}, 690)
         self.assertLess(time.monotonic() - started, 5)
         self.assertEqual(max(b.load for b in bins), 5030)
         self.assertEqual(sum(len(b.items) for b in bins), 2000)
 
-    def test_the_band_s_top_keeps_the_longest_bar_at_the_full_tolerance(self):
-        self.assertAlmostEqual(
-            mutation_cost.TOP_MINUTES * (1 + mutation_cost.BAND),
-            mutation_cost.LONGEST_SHARD_MINUTES,
-        )
-        self.assertEqual(mutation_cost.top_secs(200 * 60), mutation_cost.TOP_MINUTES * 60)
-        self.assertAlmostEqual(mutation_cost.top_secs(100 * 60), 115 * 60)
-        # 220 min in one job is inside 200 min's 15% but past the top the bar allows.
-        k, bins = mutation_cost.choose(self.items(*[10 * 60] * 22), {'m': 0}, 200 * 60)
+    def test_the_target_holds_the_slowest_runner_and_the_top_holds_the_band_under_it(self):
+        mc = mutation_cost
+        self.assertEqual((mc.SAFE_JOB_MINUTES, mc.SLOWDOWN, mc.BAND), (300, 1.8, 0.15))
+        # gremlins' 3-min setup, marotte static-src's 31.2 min and a slow 80 min.
+        for minutes in (0.0, 3.0, 31.2, 80.0):
+            setup = minutes * 60
+            with self.subTest(setup=minutes):
+                target = mc.target_secs(setup)
+                self.assertAlmostEqual(target, 300 * 60 / 1.8 - setup)
+                # The runner slows the setup too (1.46x in run 43153682226), so the whole job scales.
+                self.assertAlmostEqual(mc.SLOWDOWN * (setup + target), mc.SAFE_JOB_MINUTES * 60)
+                # A shard at the top whose mean runs BAND over still ends in time on the slowest runner.
+                self.assertLessEqual(
+                    mc.SLOWDOWN * (1 + mc.BAND) * mc.TOP_SECS, mc.SAFE_JOB_MINUTES * 60 + 1e-6
+                )
+                self.assertAlmostEqual(mc.TOP_SECS * (1 + mc.BAND), setup + target)
+        self.assertAlmostEqual(mc.target_secs(180) / 60, 163.7, places=1)
+        self.assertAlmostEqual(mc.target_secs(1872) / 60, 135.5, places=1)
+        self.assertAlmostEqual(mc.TOP_SECS / 60, 144.9, places=1)
+        self.assertEqual(mc.target_secs(400 * 60), 0.0)
+
+    def test_a_run_past_the_top_splits_and_none_of_its_shards_passes_it(self):
+        top = mutation_cost.TOP_SECS
+        k, bins = mutation_cost.choose(self.items(*[10 * 60] * 22), {'m': 180}, top)
         self.assertEqual(k, 2)
-        self.assertTrue(all(b.load <= mutation_cost.TOP_MINUTES * 60 for b in bins))
+        self.assertTrue(all(b.load <= top for b in bins), [b.load for b in bins])
 
     def test_no_count_passes_the_limit_whatever_the_prices(self):
-        k, _ = mutation_cost.choose(self.items(*[1e6] * 300), {'m': 30}, 200 * 60)
+        k, _ = mutation_cost.choose(self.items(*[1e6] * 300), {'m': 30}, 230 * 60)
         self.assertEqual(k, mutation_cost.MAX_SHARDS)
         for work in (1e6, 1e300, 1e308, float('inf')):
             for limit in (mutation_cost.MAX_SHARDS, 3):
                 with self.subTest(work=work, limit=limit):
                     items = self.items(*[work] * 300)
-                    k, bins = mutation_cost.choose(items, {'m': 30}, 200 * 60, limit=limit)
+                    k, bins = mutation_cost.choose(items, {'m': 30}, 230 * 60, limit=limit)
                     self.assertTrue(1 <= k <= limit and len(bins) == k, k)
                     self.assertEqual(sum(len(b.items) for b in bins), 300)
         k, _ = mutation_cost.choose(
-            self.items(1e300, 1e308, 1e308), {'m': 1e308}, 200 * 60, limit=1
+            self.items(1e300, 1e308, 1e308), {'m': 1e308}, 230 * 60, limit=1
         )
         self.assertEqual(k, 1)
 
     def test_capped_says_whether_more_shards_would_have_shortened_the_longest(self):
         items = self.items(*[60 * 60] * 30)
-        k, bins = mutation_cost.choose(items, {'m': 0}, 200 * 60, limit=4)
-        self.assertTrue(mutation_cost.capped(k, bins, items, {'m': 0}, 200 * 60, limit=4))
-        k, bins = mutation_cost.choose(items, {'m': 0}, 200 * 60)
+        k, bins = mutation_cost.choose(items, {'m': 0}, 230 * 60, limit=4)
+        self.assertTrue(mutation_cost.capped(k, bins, items, {'m': 0}, 230 * 60, limit=4))
+        k, bins = mutation_cost.choose(items, {'m': 0}, 230 * 60)
         self.assertFalse(
-            mutation_cost.capped(k, bins, items, {'m': 0}, 200 * 60, limit=mutation_cost.MAX_SHARDS)
+            mutation_cost.capped(k, bins, items, {'m': 0}, 230 * 60, limit=mutation_cost.MAX_SHARDS)
         )
         lone = self.items(500 * 60, 10, 10)
-        k, bins = mutation_cost.choose(lone, {'m': 0}, 200 * 60, limit=2)
-        self.assertFalse(mutation_cost.capped(k, bins, lone, {'m': 0}, 200 * 60, limit=2))
+        k, bins = mutation_cost.choose(lone, {'m': 0}, 230 * 60, limit=2)
+        self.assertFalse(mutation_cost.capped(k, bins, lone, {'m': 0}, 230 * 60, limit=2))
+
+
+class Bar(unittest.TestCase):
+    def test_each_shard_s_mean_over_its_attempts_is_judged_never_one_job(self):
+        # 160 and 282 min on one shard's work, 1.76x apart, average 221 against 200.
+        self.assertEqual(mutation_cost.bar_faults([200.0], [[160.0], [282.0]]), [])
+        self.assertEqual(
+            mutation_cost.bar_faults([200.0], [[240.0], [242.0]]),
+            ['shard 1 averaged 241.0 min against 200.0 projected'],
+        )
+        self.assertEqual(mutation_cost.bar_faults([150.0], [[180.0]]), [])
+
+    def test_one_attempt_per_shard_is_judged_once_over_the_run(self):
+        # Stryker's one job per shard: 180 + 100 against 150 + 150 is within the band.
+        self.assertEqual(mutation_cost.bar_faults([150.0, 150.0], [[180.0, 100.0]]), [])
+        self.assertEqual(
+            mutation_cost.bar_faults([150.0, 150.0], [[180.0, 190.0]]),
+            ['the run took 370.0 min over its shards against 300.0 projected'],
+        )
+        self.assertEqual(
+            mutation_cost.bar_faults([150.0], [[301.0]]), ['shard 1 took 301.0 min, past 300']
+        )
+
+    def test_every_job_ends_by_the_safe_limit(self):
+        self.assertEqual(
+            mutation_cost.bar_faults([280.0], [[250.0], [301.0]]),
+            ['shard 1 took 301.0 min, past 300'],
+        )
+
+    def test_a_shard_missing_from_an_attempt_has_no_mean(self):
+        self.assertEqual(
+            mutation_cost.bar_faults([100.0, 100.0], [[100.0, None], [100.0, 100.0]]),
+            ['shard 2 has no measure in every attempt'],
+        )
+        self.assertEqual(
+            mutation_cost.bar_faults([100.0], []), ['shard 1 has no measure in every attempt']
+        )
 
 
 class MatrixBound(unittest.TestCase):
@@ -445,7 +497,11 @@ class EntryKey(unittest.TestCase):
                         'shard-plan',
                     )
                 ]
-                own += [f'strykershard-{key}-{n}' for n in range(1, mutation_cost.MAX_SHARDS + 1)]
+                own += [
+                    f'{p}-{key}-{n}'
+                    for p in ('strykershard', 'strykersamples')
+                    for n in range(1, mutation_cost.MAX_SHARDS + 1)
+                ]
                 for name in own:
                     self.assertNotIn(
                         name, names, f'{(repo, dir_)} and {names.get(name)} share {name}'

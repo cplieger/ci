@@ -1,11 +1,11 @@
-// mutation-stryker-repo.yaml's `ci` reporter, loaded with --appendPlugins from the ci checkout, so it
-// imports nothing from the target's node_modules; scripts/stryker-shard.py reads its files.
-// CI_STRYKER_PLAN=<file>: once the plan is ready (after the dry run, before any mutant runs),
-// write the worker and test runner counts and each file to mutate with its mutants to run, its
-// early results and their summed netTime, then exit 0.
-// CI_STRYKER_TIMES=<file> and CI_STRYKER_RESULT=<file>: append "<epoch ms>\t<file>" as each planned
-// mutant finishes, after "#workers", "#launch" (process start) and "#start" rows; once the report
-// is complete, write it, as the json reporter would, to the result file, then append "#done".
+// mutation-stryker-repo.yaml's `ci` reporter, loaded with --appendPlugins from the ci checkout, so
+// it imports nothing from the target's node_modules; scripts/stryker-shard.py reads its files.
+// CI_STRYKER_PLAN=<file>: write the worker and runner counts and, per file, its run and early
+// mutants, their netTime, each mutant's [first, last line, netTime | null] and its id [start line,
+// column, end line, column, mutator, early status | null, reason | null], then exit 0.
+// CI_STRYKER_TIMES=<file>, CI_STRYKER_RESULT=<file>: after "#workers", "#launch" and "#start" rows,
+// append "<epoch ms>\t<unit>" as each planned mutant finishes (its file, or the "file:first-last"
+// range holding it); then write the report as the json reporter would and append "#done".
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,6 +40,18 @@ class CiReporter {
     const mutated = Object.entries(fileDescriptions).filter(([, d]) => d.mutate);
     this.mutated = mutated.map(([f]) => relative(f));
     this.ranged = mutated.some(([, d]) => Array.isArray(d.mutate));
+    // Stryker's ranges hold 0-based lines; --mutate and the plan write them 1-based. A range with
+    // columns is a directive comment's opener (stryker-shard.py mutate_list), which holds no unit.
+    this.ranges = Object.fromEntries(
+      mutated
+        .filter(([, d]) => Array.isArray(d.mutate))
+        .map(([f, d]) => [
+          relative(f),
+          d.mutate
+            .filter((r) => r.start.column === 0 && r.end.column === Number.MAX_SAFE_INTEGER)
+            .map((r) => [r.start.line + 1, r.end.line + 1]),
+        ]),
+    );
     this.plan = process.env.CI_STRYKER_PLAN || '';
     this.times = process.env.CI_STRYKER_TIMES || '';
     this.result = process.env.CI_STRYKER_RESULT || '';
@@ -49,15 +61,20 @@ class CiReporter {
   onMutationTestingPlanReady({ mutantPlans }) {
     const now = Date.now();
     if (this.plan) {
-      const files = Object.fromEntries(this.mutated.map((f) => [f, { run: 0, early: 0, net_ms: 0 }]));
+      const empty = () => ({ run: 0, early: 0, net_ms: 0, mutants: [], ids: [] });
+      const files = Object.fromEntries(this.mutated.map((f) => [f, empty()]));
       for (const p of mutantPlans) {
-        const f = (files[relative(p.mutant.fileName)] ??= { run: 0, early: 0, net_ms: 0 });
+        const f = (files[relative(p.mutant.fileName)] ??= empty());
+        const { start, end } = p.mutant.location;
         if (p.plan === 'Run') {
           f.run += 1;
           f.net_ms += p.netTime;
         } else {
           f.early += 1;
         }
+        f.mutants.push([start.line + 1, end.line + 1, p.plan === 'Run' ? p.netTime : null]);
+        const early = p.plan === 'Run' ? [null, null] : [p.mutant.status, p.mutant.statusReason ?? null];
+        f.ids.push([start.line + 1, start.column + 1, end.line + 1, end.column + 1, p.mutant.mutatorName, ...early]);
       }
       const doc = { workers: this.workers, runners: this.runners, ranged: this.ranged, setup_ms: now - launch, files };
       fs.writeFileSync(this.plan, JSON.stringify(doc));
@@ -69,9 +86,18 @@ class CiReporter {
     }
   }
 
+  // result.location is already a 1-based schema location (core's toSchemaLocation).
+  unit(result) {
+    const file = relative(result.fileName);
+    const first = result.location.start.line;
+    const last = result.location.end.line;
+    const range = (this.ranges[file] ?? []).find(([a, b]) => a <= first && last <= b);
+    return range ? `${file}:${range[0]}-${range[1]}` : file;
+  }
+
   onMutantTested(result) {
     if (this.times && this.run.has(result.id)) {
-      fs.appendFileSync(this.times, `${Date.now()}\t${relative(result.fileName)}\n`);
+      fs.appendFileSync(this.times, `${Date.now()}\t${this.unit(result)}\n`);
     }
   }
 

@@ -5,8 +5,9 @@
 mutation-stryker-repo.yaml writes `<key>.json` from its `needs` (every job's
 result and outputs) and the merged results it downloaded: the entries the call
 found, and per entry tested, refused, failed, not run or opted out, each with
-its reason. An entry is tested only when its merged result holds a mutant a
-test judged. It exits 1 unless the call passed or every entry opted out, so
+its reason, and the modules a one-module call leaves untested, which never
+decide its outcome. An entry is tested only when its merged result holds a
+mutant a test judged. It exits 1 unless the call passed or every entry opted out, so
 the call goes red on its own.
 
 `fleet`: the weekly summary job reads each call's record on its own. A row
@@ -59,15 +60,19 @@ def _json(text: object, default: object) -> object:
         return None
 
 
-def found(tool: str, needs: dict) -> tuple[list[str], list[dict], list[str], str]:
-    """The testable, refused and opted-out entries the finder job output, and why they are unknown, or ''."""
+def found(tool: str, needs: dict) -> tuple[list[str], list[dict], list[str], list[str], str]:
+    """The testable, refused, opted-out and untested entries the finder job output, and why
+    they are unknown, or ''."""
     job = FINDER[tool]
     if needs[job]['result'] != 'success' and tool == 'stryker':
-        return [], [], [], f'the {job} job ended {needs[job]["result"]}'
+        return [], [], [], [], f'the {job} job ended {needs[job]["result"]}'
     out = needs[job].get('outputs') or {}
+    untested: object = []
     if tool == 'gremlins':
         testable = out.get('modules', '').split() if isinstance(out.get('modules'), str) else None
         opted: object = []
+        untested = out.get('untested', '')
+        untested = untested.split() if isinstance(untested, str) else None
     else:
         raw = _json(out.get('entries'), None)
         testable = (
@@ -78,26 +83,27 @@ def found(tool: str, needs: dict) -> tuple[list[str], list[dict], list[str], str
         )
         opted = _json(out.get('opted_out'), [])
     refused = _json(out.get('refused'), [])
+    usable = isinstance(refused, list) and all(
+        isinstance(r, dict) and isinstance(r.get('dir'), str) and isinstance(r.get('reason'), str)
+        for r in refused
+    )
     if (
         testable is None
-        or (tool == 'gremlins' and not testable)
-        or not isinstance(refused, list)
-        or not all(
-            isinstance(r, dict)
-            and isinstance(r.get('dir'), str)
-            and isinstance(r.get('reason'), str)
-            for r in refused
-        )
+        or not usable
+        # A gremlins call always finds a module to test, or refused every one it found.
+        or (tool == 'gremlins' and not testable and not refused)
         or not isinstance(opted, list)
         or not all(isinstance(d, str) for d in opted)
+        or untested is None
     ):
         return (
             [],
             [],
             [],
+            [],
             f'the {job} job wrote no usable entry list (it ended {needs[job]["result"]})',
         )
-    return testable, refused, opted, ''
+    return testable, refused, opted, untested, ''
 
 
 def planned(needs: dict) -> set[str] | None:
@@ -251,7 +257,7 @@ def record(
         raise SystemExit(
             f'mutation-summary: the needs context lacks {sorted(wanted)} or a job result'
         )
-    testable, refused, opted, fault = found(tool, needs)
+    testable, refused, opted, untested, fault = found(tool, needs)
     plan = planned(needs) if tool == 'stryker' else None
     entries = {r['dir']: {'state': REFUSED, 'reason': r['reason']} for r in refused}
     entries |= {
@@ -274,6 +280,7 @@ def record(
         'found': sorted(entries),
         'tested': sorted(n for n, e in entries.items() if e['state'] == TESTED),
         'entries': dict(sorted(entries.items())),
+        'untested': sorted(set(untested) - set(entries)),
         'shards': max_shards(tool, needs),
     }
     doc['outcome'], doc['reason'] = judge(doc)
@@ -304,6 +311,14 @@ def result_fault(doc: object, tool: str, key: str) -> str:
         n for n, e in entries.items() if e['state'] == TESTED
     ):
         return 'its found or tested list disagrees with its entries'
+    untested = doc.get('untested')
+    if (
+        not isinstance(untested, list)
+        or not all(isinstance(d, str) for d in untested)
+        or untested != sorted(set(untested))
+        or set(untested) & set(entries)
+    ):
+        return 'its untested list is not a sorted list of names apart from its entries'
     if not isinstance(doc.get('fault'), str):
         return 'its fault is not a string'
     shards = doc.get('shards')
@@ -314,27 +329,28 @@ def result_fault(doc: object, tool: str, key: str) -> str:
     return ''
 
 
-def row(tool: str, key: str, results: Path) -> tuple[str, str, str]:
-    """KEY's (outcome, shards, reason) cells; a fault in its record is that key's alone."""
+def row(tool: str, key: str, results: Path) -> tuple[str, str, str, str]:
+    """KEY's (outcome, shards, untested, reason) cells; a fault in its record is that key's alone."""
     try:
         if not KEY.fullmatch(key) or key in ('.', '..'):
-            return FAILED, '', f'unreadable result: its key {key!r:.200} is not an entry_key'
+            return FAILED, '', '', f'unreadable result: its key {key!r:.200} is not an entry_key'
         path = results / f'{key}.json'
         if not path.is_file():
-            return NOT_RUN, '', 'no result: the call ended before its result job'
+            return NOT_RUN, '', '', 'no result: the call ended before its result job'
         doc = mutation_cost.load_json(path)
         if why := result_fault(doc, tool, key):
-            return FAILED, '', f'unreadable result: {why}'
+            return FAILED, '', '', f'unreadable result: {why}'
     except Exception as exc:
-        return FAILED, '', f'unreadable result: {mutation_cost.describe(exc)}'
-    return doc['outcome'], '' if doc['shards'] is None else str(doc['shards']), doc['reason']
+        return FAILED, '', '', f'unreadable result: {mutation_cost.describe(exc)}'
+    shards = '' if doc['shards'] is None else str(doc['shards'])
+    return doc['outcome'], shards, ', '.join(doc['untested']), doc['reason']
 
 
-def summary(tool: str, keys: list[str], results: Path) -> list[tuple[str, str, str, str]]:
+def summary(tool: str, keys: list[str], results: Path) -> list[tuple[str, str, str, str, str]]:
     rows = []
     for key in keys:
-        outcome, shards, why = row(tool, key, results)
-        rows.append((key, outcome, shards, why))
+        outcome, shards, untested, why = row(tool, key, results)
+        rows.append((key, outcome, shards, untested, why))
         if outcome not in GREEN:
             mutation_cost.annotate('error', t'{tool} {key}: {outcome} ({why:.2000})')
         elif outcome == OPTED_OUT:
@@ -348,11 +364,13 @@ def fleet(tool: str, keys_json: str, results: Path) -> int:
         raise SystemExit(f'--keys must be a JSON list of names, got {keys_json!r:.200}')
     rows = summary(tool, keys, results)
     mutation_cost.summarize(t'{tool}: {len(rows)} call(s)')
-    mutation_cost.summarize(t'| key | outcome | shards | reason |', table=True)
-    mutation_cost.summarize(t'|---|---|---|---|', table=True)
-    for key, outcome, shards, why in rows:
-        mutation_cost.summarize(t'| {key} | {outcome} | {shards} | {why:.2000} |', table=True)
-    for key, outcome, _, _ in rows:
+    mutation_cost.summarize(t'| key | outcome | shards | untested | reason |', table=True)
+    mutation_cost.summarize(t'|---|---|---|---|---|', table=True)
+    for key, outcome, shards, untested, why in rows:
+        mutation_cost.summarize(
+            t'| {key} | {outcome} | {shards} | {untested:.2000} | {why:.2000} |', table=True
+        )
+    for key, outcome, *_ in rows:
         mutation_cost.say(t'{key}: {outcome}')
     if not rows:
         mutation_cost.annotate('error', t'{tool}: the run named no call, so it tested nothing')
@@ -364,6 +382,12 @@ def write_record(args: argparse.Namespace) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(doc, indent=1) + '\n')
     where = f'{args.repo}:{args.target}' if args.target else args.repo
+    if doc['untested']:
+        mutation_cost.annotate(
+            'notice',
+            t'{where}: untested in this call: {", ".join(doc["untested"]):.2000}',
+            summary=True,
+        )
     if doc['outcome'] not in GREEN:
         mutation_cost.annotate(
             'error', t'{where}: {doc["outcome"]} ({doc["reason"]:.2000})', summary=True

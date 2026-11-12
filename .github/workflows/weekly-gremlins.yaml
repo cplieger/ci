@@ -25,10 +25,20 @@ concurrency:
 jobs:
   fanout:
     runs-on: ubuntu-26.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     outputs:
       repos: ${{ steps.fanout.outputs.repos }}
     steps:
+      - name: Checkout ci (for the module discovery)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _ci
+          persist-credentials: false
+          sparse-checkout: scripts/go-units.sh
+          sparse-checkout-cone-mode: false
+
       - name: Discover Go-having repos with non-trivial source
         id: fanout
         env:
@@ -64,7 +74,8 @@ jobs:
           fi
 
           # Keep repos that:
-          #   - have go.mod at root
+          #   - hold a Go module, at the root or nested (scripts/go-units.sh,
+          #     the rule weekly fuzz and bench use)
           #   - have at least 200 LOC of non-test Go (heuristic to skip tiny
           #     repos like db-dumper where mutation testing yields nothing)
           # A repo whose reads fail runs all the same: its own call then fails
@@ -74,29 +85,33 @@ jobs:
             echo "::warning::$1"
             echo "### $1" >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
           }
+          units_err=$(mktemp)
           for r in $repos; do
-            if ! err=$(gh api "/repos/cplieger/${r}/contents/go.mod" --silent 2>&1); then
-              case "$err" in *"(HTTP 404)"*) continue ;; esac
-              fault "${r}: its go.mod lookup failed, so it runs, and its call fails if it has no Go module"
+            rm -rf scan
+            : >"$units_err"
+            # Plain git over HTTPS draws no API quota; the clone is anonymous.
+            # Bounded so a stalled clone is this repo's fault, not the job's timeout.
+            if ! timeout 120 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+              clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null \
+              || ! units=$(bash _ci/scripts/go-units.sh scan 2>"$units_err" | cut -f1); then
+              cat "$units_err" >&2
+              fault "${r}: its Go modules could not be read, so it runs, and its call fails if it has none"
               GO_REPOS+=("$r")
               continue
             fi
-            if ! loc=$(gh api "/repos/cplieger/${r}/git/trees/HEAD?recursive=1" \
-              --jq 'if .truncated then "truncated" else
-                [.tree[] | select(.type=="blob" and (.path | test("\\.go$") and (test("_test\\.go$") | not)))] | map(.size // 0) | add // 0
-              end' 2>/dev/null); then
-              fault "${r}: its source tree could not be read, so it runs whatever its size"
-              GO_REPOS+=("$r")
-              continue
-            fi
-            # A truncated tree lists only a prefix, so its byte count is no size.
-            if [ "$loc" = truncated ]; then
-              fault "${r}: its source tree is truncated, so it runs whatever its size"
-              GO_REPOS+=("$r")
+            cat "$units_err" >&2
+            if [ -z "$units" ]; then
+              # A dir go-units skips for its name still gets a call, whose prepare refuses or measures it.
+              if grep -q 'skipped module dir' "$units_err"; then
+                fault "${r}: every Go module dir it holds was skipped, so it runs and its call refuses them"
+                GO_REPOS+=("$r")
+              fi
               continue
             fi
             # Bytes ~ 50/line for typical Go; 200 LOC ≈ 10000 bytes
-            if [ "${loc:-0}" -ge 10000 ]; then
+            loc=$(find scan -name .git -prune -o -name '*.go' ! -name '*_test.go' -type f -printf '%s\n' \
+              | awk '{ n += $1 } END { print n + 0 }')
+            if [ "$loc" -ge 10000 ]; then
               GO_REPOS+=("$r")
               echo "  include: ${r} (${loc} bytes of non-test Go)"
             else

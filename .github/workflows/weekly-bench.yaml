@@ -304,9 +304,10 @@ jobs:
               # run can still clone; the gh CLI would resolve through GraphQL,
               # whose quota this run may already have spent.
               # A failure leaves sha empty, and every key of the repo, this one
-              # included, is logged as skipped below.
-              if ! git clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
-                echo "::warning::clone failed for ${r} - skipping"
+              # included, is logged as skipped below. Bounded as the fanout's clone is.
+              if ! timeout 120 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+                clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
+                echo "::warning::clone failed or timed out for ${r} - skipping"
               # Guarded for the same reason as weekly-stryker's copy: a clone that
               # exits 0 with no resolvable HEAD makes rev-parse exit 128, and
               # under `bash -e` that kills the fanout and every other repo's
