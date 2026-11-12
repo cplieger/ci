@@ -3,7 +3,7 @@
 # queue key (rhysd/actionlint#654). Delete each entry with the actionlint pin bump
 # that includes its fix.
 paths:
-  .github/workflows/{ci,release,docker-release,security-scan}.yaml:
+  .github/workflows/{ci,release,docker-release,security-scan,mutation-gremlins-repo,mutation-stryker-repo}.yaml:
     ignore:
       - 'property "workflow_(repository|sha)" is not defined in object type \{check_run_id: number;'
   .github/workflows/promote.yaml:

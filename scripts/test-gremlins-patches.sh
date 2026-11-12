@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Run gremlins' own test suite with every scripts/gremlins-*.patch applied to the
-# release weekly-gremlins.yaml pins. The weekly run applies the same patches but
+# release mutation-gremlins-repo.yaml pins. The weekly run applies the same patches but
 # never runs the tests they carry, and a version bump that breaks a patch shows a
 # red check on its PR instead of first failing on Sunday.
 #
@@ -9,7 +9,7 @@
 set -euo pipefail
 
 HERE=$(cd -- "$(dirname -- "$0")" && pwd)
-version=$(grep -oP '^\s*GREMLINS_VERSION: \K\S+$' "${HERE}/../.github/workflows/weekly-gremlins.yaml")
+version=$(grep -oP '^\s*GREMLINS_VERSION: \K\S+$' "${HERE}/../.github/workflows/mutation-gremlins-repo.yaml")
 src=$(mktemp -d)
 trap 'rm -rf "${src}"' EXIT
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Run scripts/gremlins-run.sh for one Go module of the clone in ./target, in a
-# memory-capped golang container, for weekly-gremlins.yaml's plan and run jobs.
+# memory-capped golang container, for mutation-gremlins-repo.yaml's plan and run jobs.
 #
 # Usage (from the ci checkout root): gremlins-container.sh MODULE_DIR
 # Env: GREMLINS_VERSION, PROBE_TIMEOUT, JOB_TIMEOUT_MINUTES, and either OUT (the
-# result path inside the container) or PLAN_DIR (a host directory for the plan
-# files) and PLAN_DEADLINE (epoch seconds); a shard's GREMLINS_MODE and
-# GREMLINS_WORKERS (the plan's, which replaces the count sized here).
+# result path inside the container) and an optional RUN_DEADLINE, or PLAN_DIR (a
+# host directory for the plan files) and PLAN_DEADLINE (both epoch seconds); a
+# shard's GREMLINS_MODE and GREMLINS_WORKERS (the plan's, replacing the count here).
 set -uo pipefail
 
 m="${1:?module dir}"
@@ -62,6 +62,7 @@ if [ -n "${PLAN_DIR:-}" ]; then
   role_env=(-v "${PLAN_DIR}":/plan -e PLAN_DIR=/plan -e PLAN_DEADLINE="${PLAN_DEADLINE:?}")
 else
   role_env=(-e OUT="${OUT:?}")
+  [ -z "${RUN_DEADLINE:-}" ] || role_env+=(-e RUN_DEADLINE="${RUN_DEADLINE}")
 fi
 if [ -n "${GREMLINS_MODE:-}" ]; then
   role_env+=(-e GREMLINS_MODE="${GREMLINS_MODE}")

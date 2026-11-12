@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # One module's gremlins run inside the memory-capped container that
-# .github/workflows/weekly-gremlins.yaml starts, from the module root. Env:
-# GREMLINS_VERSION, GREMLINS_PATCHES (patch paths, applied in order),
-# WORKERS_MAX, GOMEM_MAX_MB / GOMEM_SOLO_MB (GOMEMLIMIT at WORKERS_MAX / one
-# worker), PROBE_TIMEOUT (seconds per probe phase), optional JOB_TIMEOUT_MINUTES
-# (the run job's cap; unset keeps per-package), a shard's GREMLINS_MODE and
-# GREMLINS_WORKERS (the plan's, set together, replacing the probe and the mode
-# choice), and OUT (result JSON) or PLAN_DIR and PLAN_DEADLINE (size the module).
+# .github/workflows/mutation-gremlins-repo.yaml starts, from the module root. Env:
+# GREMLINS_VERSION, GREMLINS_PATCHES (applied in order), WORKERS_MAX, GOMEM_MAX_MB /
+# GOMEM_SOLO_MB (GOMEMLIMIT at WORKERS_MAX / one worker), PROBE_TIMEOUT (seconds per
+# probe phase), optional JOB_TIMEOUT_MINUTES (the run job's cap; unset keeps per-package),
+# a shard's GREMLINS_MODE and GREMLINS_WORKERS (set together, replacing the probe and the
+# mode choice), and OUT (result JSON; OUT.times and RUN_DEADLINE: unleash_mutants) or
+# PLAN_DIR and PLAN_DEADLINE (size the module).
 set -euo pipefail
 
 # The clone is bind-mounted from the runner and owned by the runner uid, while
@@ -35,14 +35,15 @@ timeout_coefficient() {
 
 # integration_wanted SUITE_SECS MUTANTS WORKERS CAP_MINUTES prints the estimate
 # (suite x mutants / workers) against a quarter of the cap and succeeds when it
-# fits. Any missing or non-numeric input fails, keeping per-package mode.
+# fits. Any missing or non-numeric input fails, keeping per-package mode, and so
+# does a suite of 0 s: under the one-second tick of `date +%s`, it is unmeasured.
 integration_wanted() {
   [ "$#" -eq 4 ] || return 1
   local n
   for n in "$@"; do
     case "${n}" in '' | 0?* | *[!0-9]*) return 1 ;; esac
   done
-  [ "$3" -gt 0 ] || return 1
+  [ "$1" -gt 0 ] && [ "$3" -gt 0 ] || return 1
   local estimate=$(($1 * $2 / $3)) budget=$(($4 * 60 / 4))
   printf 'estimate=%ss budget=%ss\n' "${estimate}" "${budget}"
   [ "${estimate}" -lt "${budget}" ]
@@ -338,8 +339,38 @@ if [ "${mode}" = integration ]; then
   mode_flags=(--integration --coverpkg ./...)
 fi
 
+# stamp_lines FILE copies stdin to stdout and appends each line to FILE behind
+# its arrival time, from which scripts/gremlins-shard.py costs prices each file.
+stamp_lines() {
+  local line
+  {
+    while IFS= read -r line || [ -n "${line}" ]; do
+      printf '%s\n' "${line}"
+      printf '%s\t%s\n' "${EPOCHREALTIME/,/.}" "${line}" >&3
+    done
+  } 3>>"$1"
+}
+
+# unleash_mutants runs the mutation pass and records it in OUT.times. By
+# RUN_DEADLINE (epoch seconds; unset is none) it stops the pass and returns 124,
+# the mutants finished so far still on record.
+unleash_mutants() {
+  local limit=()
+  if [ -n "${RUN_DEADLINE:-}" ]; then
+    local left=$((RUN_DEADLINE - $(date +%s)))
+    if [ "${left}" -lt 3 ]; then
+      echo "::error::the run deadline passed before the mutation pass"
+      return 124
+    fi
+    limit=(timeout -k 60 "${left}")
+  fi
+  printf '#workers\t%s\n#launch\t%s\n' "${workers}" "$((EPOCHSECONDS - SECONDS))" >"${OUT}.times"
+  "${limit[@]}" gremlins unleash --workers "${workers}" --timeout-coefficient "${coefficient}" \
+    "${mode_flags[@]}" --output "${OUT}" . | stamp_lines "${OUT}.times"
+}
+
 coefficient=$(timeout_coefficient "${workers}")
 printf 'workers=%s timeout-coefficient=%s GOMEMLIMIT=%s GOFLAGS=%s module=%s\n' \
   "${workers}" "${coefficient}" "${GOMEMLIMIT}" "${GOFLAGS}" "$(pwd)"
-gremlins unleash --workers "${workers}" --timeout-coefficient "${coefficient}" "${mode_flags[@]}" --output "${OUT}" .
+unleash_mutants
 printf '%s\n' "${mode}" >"${OUT}.mode"

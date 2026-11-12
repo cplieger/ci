@@ -1,0 +1,543 @@
+"""Per-file mutation cost from a recorded run, and the shard packing of both weekly mutation runs.
+
+gremlins and Stryker each report one completion per mutant while a fixed pool of
+workers runs the mutants in file order. A file's measured cost is the gap before
+each of its completions times the workers (attribute). The next run prices a file
+from that history, or from its tool's prior times the measured-to-prior ratio of
+the files that have both (project), and packs files into shards that each end
+near a target (choose), at most MAX_SHARDS of them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import heapq
+import json
+import math
+import os
+import re
+import sys
+import traceback
+from dataclasses import dataclass, field
+from string.templatelib import Template, convert
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+    from pathlib import Path
+
+# Every plain log line starts with this, so the runner never reads one as a command.
+SAY_PREFIX = '- '
+
+# The bar a shard meets: its measured time within BAND of its projection, and
+# at most LONGEST_SHARD_MINUTES, two thirds of the hosted runner's 360-min job
+# limit. TOP_MINUTES, the band's top, is the longest projection that keeps both.
+BAND = 0.15
+LONGEST_SHARD_MINUTES = 240
+TOP_MINUTES = LONGEST_SHARD_MINUTES / (1 + BAND)
+# A job matrix runs at most 256 jobs (https://docs.github.com/en/actions/reference/limits),
+# which one call's run matrix keeps: MAX_SHARDS dirs of MAX_SHARDS shards (Stryker),
+# or 3 attempts of MAX_SHARDS shards (gremlins).
+MATRIX_LIMIT = 256
+# deadset-ts's full Stryker run, about 36 machine-hours, is about 11 shards at
+# the 200-min target, and 16 leaves 1.5x room. A forged price therefore holds
+# at most 16 budget-length jobs of its run's concurrency group.
+MAX_SHARDS = 16
+# A measured cost per mutant more than this factor either way from its probe's is
+# refused: run 42584241747's files measured 0.052 to 9.3 times their package's.
+PRICE_FACTOR = 50
+# A float holds every int up to this exactly; a larger count is not a measure.
+MAX_COUNT = 2**53
+# gremlins-run.sh times a suite with `date +%s` and a package's mutant in whole
+# milliseconds. A probe under its clock's tick measured nothing, so it is unknown.
+SECOND_TICK = 1.0
+MILLISECOND_TICK = 0.001
+# A run plan or cost history holds about 200 bytes a file, so this is over
+# 100,000 files; a larger input is refused unparsed.
+MAX_INPUT_BYTES = 32 * 2**20
+# GitHub's repository name characters, and a directory part's. Neither set
+# holds '~' or '=', which entry_key uses as its separators.
+REPO_NAME = re.compile(r'[A-Za-z0-9._-]+')
+DIR_PART = re.compile(r'[A-Za-z0-9._-]+')
+
+
+def entry_key(repo: str, dir_: str | None = None) -> str:
+    """The name every artifact, plan and history file of one entry is built from, distinct per (REPO, DIR_).
+
+    A whole-repository entry (DIR_ None) is its name; a package dir's is
+    REPO~DIR with '/' written '=', and the root's REPO~. Only the characters
+    above go in, so the key reads back to one entry and holds no glob
+    character. Raises ValueError for any other name.
+    """
+    if not isinstance(repo, str) or not REPO_NAME.fullmatch(repo) or repo in ('.', '..'):
+        raise ValueError(f'repository name {repo!r:.200} is outside [A-Za-z0-9._-]')
+    if dir_ is None:
+        return repo
+    if dir_ == '.':
+        return f'{repo}~'
+    parts = dir_.split('/') if isinstance(dir_, str) else ['']
+    if not all(DIR_PART.fullmatch(p) and p not in ('.', '..') for p in parts):
+        raise ValueError(f'directory {dir_!r:.200} is not a relative path of [A-Za-z0-9._-] names')
+    return f'{repo}~{"=".join(parts)}'
+
+
+@dataclass(frozen=True)
+class Item:
+    """One unit a shard runs whole: a file, or a group with nothing to split."""
+
+    group: str  # what one setup buys: a gremlins module, a Stryker entry
+    unit: str | None
+    work: float  # wall seconds on the group's workers
+
+
+@dataclass
+class Bin:
+    load: float = 0.0
+    groups: set[str] = field(default_factory=set)
+    items: list[Item] = field(default_factory=list)
+
+
+def pack(items: list[Item], k: int, setup: dict[str, float]) -> list[Bin]:
+    """Greedy longest-first packing into k shards.
+
+    Each item goes to the shard whose projected time it raises least, counting
+    its group's setup only where that group is not yet present; ties go to a
+    shard that already runs the group, then to the lower index. With one group
+    this is the classic longest-processing-time rule.
+    """
+    bins = [Bin() for _ in range(k)]
+    groups = {it.group for it in items}
+    # Per group, (load, index) heaps of the shards that run it and of those that
+    # do not; an entry whose load or membership has since changed is skipped.
+    have: dict[str, list[tuple[float, int]]] = {g: [] for g in groups}
+    lack: dict[str, list[tuple[float, int]]] = {g: [(0.0, i) for i in range(k)] for g in groups}
+
+    def lowest(heap: list[tuple[float, int]], g: str, *, member: bool) -> tuple[float, int] | None:
+        while heap and (
+            heap[0][0] != bins[heap[0][1]].load or (g in bins[heap[0][1]].groups) != member
+        ):
+            heapq.heappop(heap)
+        return heap[0] if heap else None
+
+    for item in sorted(items, key=lambda it: (-it.work, it.group, it.unit or '')):
+        g = item.group
+        options = []
+        if top := lowest(have[g], g, member=True):
+            options.append((top[0] + item.work, False, top[1]))
+        if top := lowest(lack[g], g, member=False):
+            options.append((top[0] + item.work + setup[g], True, top[1]))
+        load, _, i = min(options)
+        b = bins[i]
+        b.load = load
+        b.groups.add(g)
+        b.items.append(item)
+        for h in groups:
+            heapq.heappush(have[h] if h in b.groups else lack[h], (load, i))
+    return bins
+
+
+def top_secs(target: float) -> float:
+    """The band's top for TARGET seconds: TARGET x (1 + BAND), never past TOP_MINUTES."""
+    return min(target * (1 + BAND), TOP_MINUTES * 60)
+
+
+def floor_secs(items: list[Item], setup: dict[str, float]) -> float:
+    """The slowest one item and its setup can run, which no shard count shortens."""
+    return max((it.work + setup[it.group] for it in items), default=0.0)
+
+
+def choose(
+    items: list[Item], setup: dict[str, float], target: float, limit: int = MAX_SHARDS
+) -> tuple[int, list[Bin]]:
+    """The shard count for TARGET seconds, at most LIMIT, and its packing.
+
+    One job when it ends by the band's top (top_secs); else the fewest shards
+    that all land inside the band, else the fewest whose slowest ends by its
+    top. When no count gets there, because one item and its setup (the floor)
+    pass the top or LIMIT stops the search first, the fewest shards that reach
+    the floor, or failing that the lowest slowest shard.
+    """
+    high, low = top_secs(target), target * (1 - BAND)
+    one = pack(items, 1, setup)
+    if one[0].load <= high:
+        return 1, one
+    floor = floor_secs(items, setup)
+    limit = min(limit, max(1, len(items)))
+    if one[0].load <= floor or limit == 1:
+        return 1, one
+    total, setups = sum(it.work for it in items), sum(setup[g] for g in {it.group for it in items})
+    # Every shard count below this one has a shard past both the top and the floor.
+    bound = max(high, floor)
+    least = total / bound if bound > 0 else math.inf
+    start = min(limit, max(2, math.ceil(least))) if math.isfinite(least) else limit
+    fit: tuple[int, list[Bin]] | None = None
+    best: tuple[float, int, list[Bin]] = (one[0].load, 1, one)
+    for k in range(start, limit + 1):
+        bins = pack(items, k, setup)
+        loads = [b.load for b in bins]
+        if max(loads) <= high:
+            if min(loads) >= low:
+                return k, bins
+            fit = fit or (k, bins)
+            if total / (k + 1) + setups < low:
+                break
+        elif fit is None and max(loads) <= floor:
+            return k, bins
+        if max(loads) < best[0]:
+            best = (max(loads), k, bins)
+    if fit is not None:
+        return fit
+    return best[1], best[2]
+
+
+def capped(
+    k: int, bins: list[Bin], items: list[Item], setup: dict[str, float], target: float, limit: int
+) -> bool:
+    """Whether LIMIT, not the prices, set choose's K: more shards would have ended its slowest sooner."""
+    slowest = max((b.load for b in bins), default=0.0)
+    return k == limit < len(items) and slowest > max(top_secs(target), floor_secs(items, setup))
+
+
+def cap_reason(cap: int) -> str:
+    """Why a plan whose prices wanted more runs CAP shards."""
+    return f'a cap of {cap} shards'
+
+
+def cap_note(where: str, plan: object) -> Template | None:
+    """The warning a capped run plan carries, stating only what the plan holds, or None for any other.
+
+    A plan's `unsized_shared` lists the modules and files of unknown cost that
+    the cap put in a shard with other work.
+    """
+    if not isinstance(plan, dict) or not isinstance(plan.get('capped'), str):
+        return None
+    note = t'{where}: runs in {plan.get("shards")!r:.20} shard(s), capped by {plan["capped"]:.200}'
+    longest = max((m for m in plan.get('projected_minutes') or [] if nonnegative(m)), default=None)
+    if longest is not None and longest > TOP_MINUTES:
+        note += t', so its longest sized shard projects {longest} min, past the {TOP_MINUTES:.1f} min the band allows'
+    shared = plan.get('unsized_shared')
+    if isinstance(shared, list) and shared and all(isinstance(d, str) for d in shared):
+        note += t'; unsized, planned as a full shard each, these share a shard: {", ".join(shared):.1000}'
+    return note
+
+
+def escape_data(s: str) -> str:
+    """S as an annotation's message, escaped as the Actions toolkit's escapeData does."""
+    return s.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+
+
+def _plain(s: str) -> str:
+    # The runner also reads `##[command]` anywhere in a line that is not a `::` command
+    # (actions/runner ActionCommand.TryParse), and a plain line is never unescaped.
+    return escape_data(s).replace('#', '%23')
+
+
+def _code_span(s: str) -> str:
+    s = escape_data(s)
+    if not s:
+        return ''
+    fence = '`' * (max((len(r) for r in re.findall('`+', s)), default=0) + 1)
+    pad = ' ' if s[0] in '` ' or s[-1] in '` ' else ''
+    return f'{fence}{pad}{s}{pad}{fence}'
+
+
+def render(msg: Template, quote: Callable[[str], str] = str) -> str:
+    """MSG's text, each interpolated value passed through QUOTE and each literal part kept.
+
+    A t-string's literal parts are what the script wrote and its values are
+    data, so this is the one place target-written text gets its escaping.
+    """
+    if not isinstance(msg, Template):
+        raise TypeError(f'a log line is a t-string, not {type(msg).__name__}')
+    out = []
+    for part in msg:
+        if isinstance(part, str):
+            out.append(part)
+        elif isinstance(part.value, Template):
+            out.append(render(part.value, quote))
+        else:
+            out.append(quote(format(convert(part.value, part.conversion), part.format_spec)))
+    return ''.join(out)
+
+
+def say(msg: Template) -> None:
+    """Log MSG as a plain line: it starts with SAY_PREFIX, so no value it holds starts a workflow command."""
+    print(SAY_PREFIX + render(msg, _plain), file=sys.stderr)
+
+
+def annotate(kind: str, msg: Template, *, summary: bool = False) -> None:
+    """Write MSG as a KIND annotation, and to the run summary too when SUMMARY."""
+    if kind not in ('notice', 'warning', 'error'):
+        raise ValueError(f'{kind!r} is not an annotation')
+    print(f'::{kind}::{render(msg, escape_data)}', file=sys.stderr)
+    if summary:
+        summarize(msg)
+
+
+def run_main(main: Callable[[], int]) -> int:
+    """MAIN's exit code, with an uncaught error logged through say, so its text starts no command."""
+    try:
+        return main()
+    except SystemExit as exc:
+        if exc.code is None or isinstance(exc.code, int):
+            return exc.code or 0
+        annotate('error', t'{exc.code}')
+        return 1
+    except Exception:
+        for line in traceback.format_exc().splitlines():
+            say(t'{line}')
+        return 1
+
+
+def summarize(msg: Template, *, table: bool = False) -> None:
+    """Append MSG to the job's run summary when GitHub Actions provides one, each value in a code span.
+
+    MSG is a heading, or with TABLE a table row, whose values also escape '|'.
+    """
+    if path := os.environ.get('GITHUB_STEP_SUMMARY'):
+        line = (
+            render(msg, lambda v: _code_span(v).replace('|', '\\|'))
+            if table
+            else f'### {render(msg, _code_span)}'
+        )
+        with open(path, 'a') as f:
+            f.write(line + '\n')
+
+
+def attribute(events: Iterable[tuple[float, str]], start: float, workers: int) -> dict[str, dict]:
+    """Worker-seconds and completions per file from one run's (time, file) completions.
+
+    Each completion is charged the wall time since the one before it (or since
+    START, the moment the workers began), times the workers. A completion
+    stamped before the previous one is charged nothing.
+    """
+    out: dict[str, dict] = {}
+    prev = start
+    for t, path in events:
+        gap = max(0.0, t - prev)
+        prev = max(prev, t)
+        e = out.setdefault(path, {'secs': 0.0, 'mutants': 0})
+        e['secs'] += gap * workers
+        e['mutants'] += 1
+    return {p: {'secs': round(e['secs'], 3), 'mutants': e['mutants']} for p, e in out.items()}
+
+
+def count(v: object) -> bool:
+    """An int from 0 to MAX_COUNT, never a bool."""
+    return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= MAX_COUNT
+
+
+def nonnegative(v: object) -> bool:
+    """A finite number at or above 0, never a bool; an int only up to MAX_COUNT."""
+    if isinstance(v, int):
+        return count(v)
+    return isinstance(v, float) and math.isfinite(v) and v >= 0
+
+
+def known(probe: float, tick: float) -> float | None:
+    """PROBE, or None when it is under TICK, its clock's resolution, and so measured nothing."""
+    return probe if probe >= tick else None
+
+
+def plausible(measured: float, probe: float | None) -> bool:
+    """MEASURED is within PRICE_FACTOR of PROBE either way; against an unknown PROBE, any positive measure."""
+    if probe is None:
+        return measured > 0
+    return probe > 0 and probe / PRICE_FACTOR <= measured <= probe * PRICE_FACTOR
+
+
+def setup_price(measured: object, probe: float) -> float:
+    """The setup a plan prices: MEASURED when it is a plausible measure of PROBE, else PROBE."""
+    usable = nonnegative(measured) and plausible(float(measured), known(probe, SECOND_TICK))
+    return float(measured) if usable else probe
+
+
+def clean_files(files: object) -> dict[str, dict]:
+    """The usable {path: {secs, mutants}} rows of an untrusted cost record."""
+    if not isinstance(files, dict):
+        return {}
+    return {
+        p: {'secs': float(e['secs']), 'mutants': e['mutants']}
+        for p, e in files.items()
+        if isinstance(p, str)
+        and isinstance(e, dict)
+        and nonnegative(e.get('secs'))
+        and count(e.get('mutants'))
+        and e['mutants'] > 0
+    }
+
+
+def record_fault(rec: object) -> str:
+    """Why REC is not a cost record as carry_forward writes it ({files: {path: {secs, mutants}}, setup_secs}), or ''."""
+    if not isinstance(rec, dict) or not set(rec) <= {'files', 'setup_secs'}:
+        return 'it is not a {files, setup_secs} object'
+    files = rec.get('files', {})
+    if (
+        not isinstance(files, dict)
+        or len(clean_files(files)) != len(files)
+        or any(set(e) != {'secs', 'mutants'} for e in files.values())
+    ):
+        return 'its file rows are not all {secs, mutants} measures'
+    if rec.get('setup_secs') is not None and not nonnegative(rec['setup_secs']):
+        return f'its setup_secs {rec["setup_secs"]!r:.200} is not a measure'
+    return ''
+
+
+def combine(records: list[dict]) -> dict:
+    """One history from several runs of the same work: the mean per file and of the setup.
+
+    Each record is {'files': {path: {secs, mutants}}, 'setup_secs': float}; a file
+    or setup a record lacks is averaged over the records that have it.
+    """
+    acc: dict[str, list[dict]] = {}
+    setups = []
+    for r in records:
+        for p, e in clean_files(r.get('files')).items():
+            acc.setdefault(p, []).append(e)
+        if nonnegative(r.get('setup_secs')):
+            setups.append(float(r['setup_secs']))
+    files = {
+        p: {
+            'secs': round(sum(e['secs'] for e in es) / len(es), 3),
+            'mutants': round(sum(e['mutants'] for e in es) / len(es)),
+        }
+        for p, es in sorted(acc.items())
+    }
+    return {'files': files, 'setup_secs': round(sum(setups) / len(setups), 1) if setups else None}
+
+
+def carry_forward(
+    new: dict, old: object, keep: set[str] | None = None, planned: dict[str, int] | None = None
+) -> dict:
+    """NEW's history with OLD's last measure of each file NEW did not measure, limited to KEEP when given.
+
+    A file a run never reached before its job stopped, or whose shard left no
+    record, has no new measure, so its last one still prices it. Nor does a
+    file whose new sample holds under half of its PLANNED mutants, the few a
+    job finished before its budget cut it.
+    """
+    old = old if isinstance(old, dict) else {}
+    fresh = {
+        p: e
+        for p, e in clean_files(new.get('files')).items()
+        if planned is None or e['mutants'] * 2 >= planned.get(p, 0)
+    }
+    files = {**clean_files(old.get('files')), **fresh}
+    setup = new.get('setup_secs') if nonnegative(new.get('setup_secs')) else old.get('setup_secs')
+    return {
+        'files': {p: e for p, e in sorted(files.items()) if keep is None or p in keep},
+        'setup_secs': float(setup) if nonnegative(setup) else None,
+    }
+
+
+def project(
+    units: dict[str, tuple[int, float | None]], history: dict | None
+) -> dict[str, tuple[float | None, str]]:
+    """Each file's worker-seconds for the next run, and whether history or the prior priced it.
+
+    units: {path: (mutants the next run executes there, the tool's prior
+    worker-seconds, None when its probe measured nothing)}. A file with a
+    plausible history costs its mutants times its measured cost per mutant. Any
+    other costs its prior times the measured-to-prior ratio over the files
+    priced from history, or the prior alone when none is; one whose history was
+    implausible is marked 'refused'. A file with mutants, no prior and no usable
+    history is (None, 'unknown'): its cost is not known, never 0.
+    """
+    hist = clean_files(history.get('files') if isinstance(history, dict) else None)
+    per_mutant, refused = {}, set()
+    for path, (n, p) in units.items():
+        if path not in hist:
+            continue
+        cost = hist[path]['secs'] / hist[path]['mutants']
+        if n == 0 or plausible(cost, None if p is None else p / n):
+            per_mutant[path] = cost
+        else:
+            refused.add(path)
+    priced = [p for p in per_mutant if units[p][0] > 0 and units[p][1] is not None]
+    measured = sum(units[p][0] * per_mutant[p] for p in priced)
+    prior = sum(units[p][1] for p in priced)
+    ratio = measured / prior if measured > 0 and prior > 0 else 1.0
+    if not math.isfinite(ratio):
+        ratio = 1.0
+    out: dict[str, tuple[float | None, str]] = {}
+    for path, (n, p) in units.items():
+        if path in per_mutant:
+            out[path] = (n * per_mutant[path], 'measured')
+        elif p is None:
+            out[path] = (None, 'unknown') if n else (0.0, 'prior')
+        else:
+            out[path] = (p * ratio, 'refused' if path in refused else 'prior')
+    return out
+
+
+def refusals(priced: dict[str, tuple[float, str]]) -> int:
+    """How many of project()'s files had their history refused."""
+    return sum(1 for _, source in priced.values() if source == 'refused')
+
+
+def load_json(path: Path, limit: int | None = MAX_INPUT_BYTES) -> object:
+    """PATH's JSON value.
+
+    Raises OSError when it is unreadable, ValueError when it is past LIMIT
+    bytes (None for no limit), not UTF-8 or not JSON, and RecursionError when
+    it nests deeper than the parser can follow.
+    """
+    with open(path, 'rb') as f:
+        data = f.read() if limit is None else f.read(limit + 1)
+    if limit is not None and len(data) > limit:
+        raise ValueError(f'{path} is past {limit} bytes')
+    return json.loads(data.decode())
+
+
+def describe(exc: BaseException) -> str:
+    """EXC for a warning line: repr escapes its newlines, so no text it carries starts a workflow command."""
+    return repr(exc)[:300]
+
+
+def refused(repo: str, dirs: Iterable[str | bytes]) -> list[dict]:
+    """Each of DIRS that entry_key refuses for REPO, with the reason and its index in DIRS,
+    each annotated as an error. A bytes name that is not UTF-8 is refused, shown escaped."""
+    out = []
+    for i, d in enumerate(dirs):
+        try:
+            if isinstance(d, bytes):
+                try:
+                    d = d.decode()
+                except UnicodeDecodeError:
+                    d = d.decode(errors='backslashreplace')
+                    raise ValueError(f'directory {d!r} is not UTF-8') from None
+            entry_key(repo, d)
+        except ValueError as exc:
+            annotate('error', t'{repo}: {str(exc)}, so it is refused')
+            out.append({'dir': d, 'reason': str(exc), 'index': i})
+    return out
+
+
+def main() -> int:
+    """`key --repo R [--dir D]`: print entry_key(R, D), D empty for the whole repository.
+
+    `refused --repo R`: read NUL-terminated dirs on stdin and print refused()'s JSON list.
+    """
+    p = argparse.ArgumentParser(description=main.__doc__)
+    sub = p.add_subparsers(dest='command', required=True)
+    k = sub.add_parser('key')
+    k.add_argument('--repo', required=True)
+    k.add_argument('--dir', default='')
+    r = sub.add_parser('refused')
+    r.add_argument('--repo', required=True)
+    args = p.parse_args()
+    if args.command == 'refused':
+        dirs = sys.stdin.buffer.read().split(b'\0')
+        dirs = dirs[:-1] if dirs and not dirs[-1] else dirs
+        print(json.dumps(refused(args.repo, dirs), separators=(',', ':')))
+        return 0
+    try:
+        print(entry_key(args.repo, args.dir or None))
+    except ValueError as exc:
+        annotate('error', t'{str(exc)}')
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(run_main(main))

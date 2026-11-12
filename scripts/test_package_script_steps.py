@@ -14,8 +14,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 import yaml
 
@@ -25,8 +27,7 @@ MARKER = '/tmp/_ci_failures'
 NODE = shutil.which('node')
 NPM = shutil.which('npm')
 
-# Logs how the step started it, then writes a schema report whose counts the
-# step's metrics parse turns into a score.
+# Logs how the step started it, writes a schema report, and records a SIGINT.
 STRYKER_STUB = """#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
@@ -37,6 +38,10 @@ fs.writeFileSync(path.join(process.env.STUB_LOG, 'stryker.json'), JSON.stringify
   githubActions: process.env.GITHUB_ACTIONS,
   preloaded: Object.keys(require.cache),
 }));
+process.on('SIGINT', () => {
+  fs.appendFileSync(path.join(process.env.STUB_LOG, 'interrupted'), 'SIGINT\\n');
+  process.exit(130);
+});
 const killed = Number(process.env.STRYKER_KILLED ?? 3);
 const mutants = [];
 for (let i = 0; i < killed; i++) mutants.push({ status: 'Killed' });
@@ -44,7 +49,8 @@ mutants.push({ status: 'Survived' });
 fs.mkdirSync('reports/mutation', { recursive: true });
 fs.writeFileSync('reports/mutation/mutation.json',
   JSON.stringify({ schemaVersion: '2', files: { 'a.ts': { mutants } } }));
-process.exit(Number(process.env.STRYKER_RC ?? 0));
+const sleep = Number(process.env.STRYKER_SLEEP ?? 0);
+setTimeout(() => process.exit(Number(process.env.STRYKER_RC ?? 0)), sleep * 1000);
 """
 
 # `npm ci` is the only npm call that would touch the network; the rest is real npm.
@@ -156,25 +162,48 @@ class Harness(unittest.TestCase):
 
 
 class RunStryker(Harness):
-    STEP = workflow_step(WORKFLOWS / 'weekly-stryker.yaml', 'run', 'Run stryker')
-    REPORTERS = ('run', '--reporters', 'json,progress')
+    """scripts/stryker-run.sh, which weekly-stryker.yaml's plan and run jobs call from the package dir."""
+
+    STEP: ClassVar[dict] = {'run': f'bash {ROOT / "scripts" / "stryker-run.sh"}'}
 
     def setUp(self):
         super().setUp()
         bin_dir = self.pkg / 'node_modules' / '.bin'
         bin_dir.mkdir(parents=True)
         write_exec(bin_dir / 'stryker', STRYKER_STUB)
+        self.reporter = str(self.tmp / 'ci' / 'stryker-ci-reporter.mjs')
 
     def run_stryker(self, env: dict[str, str] | None = None) -> StepRun:
-        return self.run_step({'ENTRY': 'repo:.', **(env or {})}, shell='-e')
+        base = {
+            'ENTRY': 'repo:.',
+            'REPORTER': self.reporter,
+            'CI_STRYKER_TIMES': str(self.tmp / 'times'),
+            'RUN_DEADLINE': str(int(time.time()) + 600),
+            'CI_STRYKER_RESULT': str(self.tmp / 'result.json'),
+            'MUTATE': 'src/a.ts,src/b.ts',
+        }
+        return self.run_step({**base, **(env or {})}, shell='-e')
 
-    def test_a_declared_script_is_what_runs_with_the_step_flags(self):
+    def shard_argv(self) -> list[str]:
+        return [
+            'run',
+            '--reporters',
+            'progress,ci',
+            '--appendPlugins',
+            self.reporter,
+            '--mutate',
+            'src/a.ts,src/b.ts',
+        ]
+
+    def test_a_declared_script_is_what_runs_with_the_shard_flags(self):
         self.package({'test:mutation': 'stryker run'})
         run = self.run_stryker({'NODE_OPTIONS': '--max-old-space-size=4096'})
         self.assertEqual(run.rc, 0, run.out)
-        self.assertIn('run test:mutation -- --reporters json,progress', run.logged('npm'))
+        self.assertIn(
+            'run test:mutation -- --reporters progress,ci --appendPlugins', run.logged('npm')
+        )
         started = run.stryker()
-        self.assertEqual(started['argv'], list(self.REPORTERS))
+        self.assertEqual(started['argv'], self.shard_argv())
         self.assertEqual(started['githubActions'], 'false')
         self.assertEqual(started['execArgv'], [])
         self.assertIn('--max-old-space-size=4096', started['nodeOptions'])
@@ -184,8 +213,6 @@ class RunStryker(Harness):
         self.assertIn(
             "setFlagsFromString('--no-json-stringify-fast-path')", Path(preload).read_text()
         )
-        self.assertEqual(run.outputs.get('score'), '75.0')
-        self.assertEqual(run.outputs.get('rc'), '0')
 
     def test_without_a_declared_script_stryker_runs_under_the_node_flag(self):
         self.package({'test': 'vitest run'})
@@ -193,32 +220,72 @@ class RunStryker(Harness):
         self.assertEqual(run.rc, 0, run.out)
         self.assertEqual(run.logged('npm'), 'ci\n')
         started = run.stryker()
-        self.assertEqual(started['argv'], list(self.REPORTERS))
+        self.assertEqual(started['argv'], self.shard_argv())
         self.assertEqual(started['execArgv'], ['--no-json-stringify-fast-path'])
         self.assertEqual(started['githubActions'], 'false')
-        self.assertEqual(run.outputs.get('score'), '75.0')
 
-    def test_a_declared_script_below_the_break_threshold_carries_its_exit_code(self):
+    def test_the_plan_pass_runs_only_the_ci_reporter_with_no_mutate_list(self):
+        self.package({'test': 'vitest run'})
+        run = self.run_step(
+            {
+                'ENTRY': 'repo:.',
+                'REPORTER': self.reporter,
+                'CI_STRYKER_PLAN': str(self.tmp / 'pass.json'),
+            },
+            shell='-e',
+        )
+        self.assertEqual(run.rc, 0, run.out)
+        self.assertEqual(
+            run.stryker()['argv'], ['run', '--reporters', 'ci', '--appendPlugins', self.reporter]
+        )
+
+    def test_a_shard_without_a_result_file_runs_nothing(self):
+        self.package({'test:mutation': 'stryker run'})
+        run = self.run_stryker({'CI_STRYKER_RESULT': ''})
+        self.assertNotEqual(run.rc, 0, run.out)
+        self.assertIn('CI_STRYKER_RESULT', run.out)
+        self.assertEqual(run.stryker(), {})
+
+    def test_stryker_s_exit_status_is_the_script_s(self):
         self.package({'test:mutation': 'stryker run'})
         run = self.run_stryker({'STRYKER_RC': '2'})
-        self.assertEqual(run.rc, 0, run.out)
-        self.assertEqual(run.outputs.get('rc'), '2')
-        self.assertEqual(run.outputs.get('score'), '75.0')
+        self.assertEqual(run.rc, 2, run.out)
 
-    def test_a_declared_script_still_passes_the_enrolment_gate_first(self):
+    def test_a_shard_past_its_budget_is_interrupted_so_stryker_can_save_its_results(self):
+        for scripts in ({'test:mutation': 'stryker run'}, {'test': 'vitest run'}):
+            with self.subTest(scripts=scripts):
+                self.package(scripts)
+                (self.tmp / 'log' / 'interrupted').unlink(missing_ok=True)
+                run = self.run_stryker(
+                    {'RUN_DEADLINE': str(int(time.time()) + 3), 'STRYKER_SLEEP': '30'}
+                )
+                self.assertEqual(run.rc, 124, run.out)
+                self.assertEqual(run.logged('interrupted'), 'SIGINT\n')
+
+    def test_the_install_s_time_comes_out_of_the_shard_s_budget(self):
         self.package({'test:mutation': 'stryker run'})
-        run = self.run_stryker({'NPX_STRYKER_RC': '1'})
-        self.assertEqual(run.rc, 0, run.out)
-        self.assertEqual(run.outputs.get('skipped'), 'true')
+        run = self.run_stryker({'RUN_DEADLINE': str(int(time.time()) - 1)})
+        self.assertEqual(run.rc, 124, run.out)
+        self.assertIn("used the shard's whole budget", run.out)
         self.assertEqual(run.logged('npm'), 'ci\n')
         self.assertEqual(run.stryker(), {})
 
-    def test_a_declared_script_that_kills_nothing_fails(self):
+    def test_a_deadline_that_is_not_an_epoch_second_runs_nothing(self):
         self.package({'test:mutation': 'stryker run'})
-        run = self.run_stryker({'STRYKER_KILLED': '0'})
-        self.assertEqual(run.rc, 1, run.out)
-        self.assertIn('killed 0 of 1 mutants', run.out)
-        self.assertNotIn('score', run.outputs)
+        for bad in ('1+1', 'x', '-5', '1e9'):
+            with self.subTest(bad=bad):
+                run = self.run_stryker({'RUN_DEADLINE': bad})
+                self.assertEqual(run.rc, 2, run.out)
+                self.assertIn('is not an epoch second', run.out)
+                self.assertEqual(run.stryker(), {})
+
+    def test_an_entry_without_stryker_is_not_enrolled_and_runs_nothing(self):
+        self.package({'test:mutation': 'stryker run'})
+        run = self.run_stryker({'NPX_STRYKER_RC': '1'})
+        self.assertEqual(run.rc, 3, run.out)
+        self.assertIn('is not a devDependency', run.out)
+        self.assertEqual(run.logged('npm'), 'ci\n')
+        self.assertEqual(run.stryker(), {})
 
     def test_a_failed_install_stops_before_any_script(self):
         self.package({'test:mutation': 'stryker run'})

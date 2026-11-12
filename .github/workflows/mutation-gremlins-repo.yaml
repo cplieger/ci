@@ -1,0 +1,690 @@
+# Mutation-tests one public cplieger repository with gremlins: sizes its Go
+# modules, shards each attempt by measured cost, runs the attempts, records the
+# costs next week prices from, and publishes the badge and tracker issue.
+# weekly-gremlins.yaml calls it once per repository; docs/workflows.md
+# "The scheduled runs" documents the contract.
+name: Gremlins one repository
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        description: "A public cplieger repository name."
+        required: true
+        type: string
+      module:
+        description: "One Go module dir ('.' for the root) to test alone; empty tests every module and publishes the badge and tracker."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CI_SCHEDULE:
+        description: "Pushes the badge and writes the tracker issue; only the badge and aggregate jobs see it. A one-target call needs none."
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  # scripts/gremlins-container.sh builds this release in the plan and run jobs.
+  # renovate: datasource=github-releases depName=go-gremlins/gremlins
+  GREMLINS_VERSION: v0.6.0
+  # Per probe phase; a slower suite stays unverified rather than throttled.
+  PROBE_TIMEOUT: "600"
+
+jobs:
+  # The inputs become every artifact's key here, before any job reads them:
+  # all calls of one caller run share its artifact namespace.
+  setup:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+      # A job's timeout-minutes cannot read env
+      # (https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability);
+      # scripts/gremlins-run.sh sizes --integration against this same cap.
+      run_timeout_minutes: "350"
+      plan_timeout_minutes: "90"
+      # scripts/mutation_cost.py choose packs shards from 15% under this up to
+      # TOP_MINUTES, which keeps its bar.
+      shard_target_minutes: "200"
+    steps:
+      - name: Checkout ci (for scripts/)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      - name: Key this repository and module
+        id: key
+        env:
+          REPO: ${{ inputs.repository }}
+          MODULE: ${{ inputs.module }}
+        run: |
+          set -euo pipefail
+          key=$(python3 scripts/mutation_cost.py key --repo "$REPO" --dir "$MODULE")
+          echo "key=${key}" >>"$GITHUB_OUTPUT"
+
+  # Sizes each module from the repo's own measurements: the probe and mode
+  # decision a run makes, then per file its RUNNABLE mutants and per package
+  # what one mutant costs (scripts/gremlins-run.sh with PLAN_DIR).
+  plan:
+    needs: setup
+    runs-on: ubuntu-26.04
+    timeout-minutes: ${{ fromJSON(needs.setup.outputs.plan_timeout_minutes) }}
+    permissions:
+      contents: read
+    # The call's entries for its result record: scripts/gremlins-prepare.sh
+    # writes both before the target's code runs.
+    outputs:
+      modules: ${{ steps.prepare.outputs.modules }}
+      refused: ${{ steps.prepare.outputs.refused }}
+    steps:
+      # Checkout FIRST: actions/checkout cleans the workspace, so it must not
+      # run after the target clone below.
+      - name: Checkout ci (for configs/ and scripts/)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      - name: Clone the target repo and scope its modules
+        id: prepare
+        env:
+          REPO: ${{ inputs.repository }}
+          GREMLINS_MODULE: ${{ inputs.module }}
+        run: bash scripts/gremlins-prepare.sh "${REPO}"
+
+      - name: Size each module's mutation work
+        env:
+          REPO: ${{ inputs.repository }}
+          SHA: ${{ steps.prepare.outputs.sha }}
+          MODULES: ${{ steps.prepare.outputs.modules }}
+          JOB_TIMEOUT_MINUTES: ${{ needs.setup.outputs.run_timeout_minutes }}
+          PLAN_TIMEOUT_MINUTES: ${{ needs.setup.outputs.plan_timeout_minutes }}
+        run: |
+          set -euo pipefail
+          # No module starts after this, and a module's concurrency probe, dry
+          # run and timing runs end by it. The job's cap keeps 20 min for the
+          # steps before this one, the last module's gremlins build, the package
+          # in flight (go test's default 10-min -timeout) and the upload.
+          PLAN_DEADLINE=$(($(date +%s) + (PLAN_TIMEOUT_MINUTES - 20) * 60))
+          export PLAN_DEADLINE
+          # A module left unsized fails the planner after it writes the plan;
+          # scripts/gremlins-shard.py with_unsized owns how it is sharded.
+          plan_args=()
+          for m in $MODULES; do
+            plan_args+=(--module "${m}=plan/modules/${m}")
+            if [ "$(date +%s)" -ge "${PLAN_DEADLINE}" ]; then
+              echo "::error::the plan deadline passed before ${REPO} module ${m} started"
+              continue
+            fi
+            echo "::group::size ${REPO} module ${m}"
+            rc=0
+            PLAN_DIR="${PWD}/plan/modules/${m}" bash scripts/gremlins-container.sh "${m}" || rc=$?
+            echo "::endgroup::"
+            if [ "${rc}" -ne 0 ]; then
+              echo "::error::sizing ${REPO} module ${m} failed (exit ${rc})"
+            fi
+          done
+          python3 scripts/gremlins-shard.py plan --repo "${REPO}" --sha "${SHA}" \
+            "${plan_args[@]}" --out plan/plan.json
+
+      - name: Upload the shard plan
+        if: ${{ !cancelled() && hashFiles('plan/plan.json') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: shard-plan-${{ needs.setup.outputs.key }}
+          path: plan/plan.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # The run job's matrix: attempt x shard when the plan splits the repo, else
+  # one job per attempt, which a missing or refused plan also gets. Runs no
+  # target code, so it alone fetches the last run's cost history.
+  shard:
+    needs: [setup, plan]
+    if: ${{ !cancelled() && needs.setup.result == 'success' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      artifacts: ${{ steps.matrix.outputs.artifacts }}
+    steps:
+      - name: Checkout ci (for scripts/)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      # Absent when the plan job failed before its upload; the repo then runs
+      # one job per attempt.
+      - name: Download the shard plan
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: shard-plan-${{ needs.setup.outputs.key }}
+          path: sizing
+
+      # With no history every file is priced from its probe, so a fetch that
+      # fails or runs out of time costs only the prices it did not reach.
+      - name: Fetch the cost history
+        timeout-minutes: 4
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEY: ${{ needs.setup.outputs.key }}
+          REF: ${{ github.ref_name }}
+        run: bash scripts/mutation-history.sh "gremlinscosts-${KEY}" "${REF}" history costs.json
+
+      - name: Build the run matrix
+        id: matrix
+        env:
+          REPO: ${{ inputs.repository }}
+          KEY: ${{ needs.setup.outputs.key }}
+          TARGET_MINUTES: ${{ needs.setup.outputs.shard_target_minutes }}
+        run: |
+          set -euo pipefail
+          matrix=$(python3 scripts/gremlins-shard.py matrix --repo "${REPO}" --plan sizing/plan.json \
+            --attempts 3 --target-minutes "${TARGET_MINUTES}" --history history/costs.json \
+            --out-plan run-plans/plan.json)
+          # The record, badge and aggregate jobs download exactly these names (a
+          # brace list for several), so no other call's artifact reaches them.
+          artifacts=$(jq -r --arg k "$KEY" \
+            'map("gremlins-\($k)-\(.attempt)\(if .shards then "-shard\(.shard)" else "" end)")
+             | if length == 1 then .[0] else "{\(join(","))}" end' <<<"$matrix")
+          {
+            echo "matrix=${matrix}"
+            echo "artifacts=${artifacts}"
+          } >> "$GITHUB_OUTPUT"
+          # The record job carries each file this run does not measure over from here.
+          mkdir -p run-plans
+          if [ -f history/costs.json ]; then cp history/costs.json run-plans/history.json; fi
+
+      - name: Upload the run plan
+        if: ${{ hashFiles('run-plans/**') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gremlinsplans-${{ needs.setup.outputs.key }}
+          path: run-plans
+          if-no-files-found: error
+          retention-days: 7
+
+  run:
+    name: run (${{ matrix.attempt }}${{ matrix.shards && format(', shard {0} of {1}', matrix.shard, matrix.shards) || '' }})
+    needs: [setup, shard]
+    if: ${{ !cancelled() && needs.shard.result == 'success' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 6   # account budget: 20; weekly-gremlins.yaml runs 2 repos at once, leaving >=4 for PR work
+      matrix:
+        include: ${{ fromJSON(needs.shard.outputs.matrix) }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: ${{ fromJSON(needs.setup.outputs.run_timeout_minutes) }}
+    permissions:
+      contents: read
+    env:
+      # Empty for a repo that runs each attempt in one job.
+      SHARD: ${{ matrix.shard }}
+      SHARDS: ${{ matrix.shards }}
+    steps:
+      # Checkout FIRST: actions/checkout cleans the workspace, so it must not
+      # run after the target clone below.
+      - name: Checkout ci (for configs/ and scripts/)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      - name: Download the run plan
+        if: ${{ matrix.shards }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gremlinsplans-${{ needs.setup.outputs.key }}
+          path: plan
+
+      - name: Clone the target repo and scope its modules
+        id: prepare
+        env:
+          REPO: ${{ inputs.repository }}
+          GREMLINS_MODULE: ${{ inputs.module }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SHARDS}" ]; then
+            bash scripts/gremlins-prepare.sh "${REPO}" plan/plan.json "${SHARD}"
+          else
+            bash scripts/gremlins-prepare.sh "${REPO}"
+          fi
+
+      # scripts/gremlins-container.sh owns the memory containment and worker sizing.
+      - name: Run gremlins (attempt ${{ matrix.attempt }})
+        env:
+          REPO: ${{ inputs.repository }}
+          ATTEMPT: ${{ matrix.attempt }}
+          MODULES: ${{ steps.prepare.outputs.modules }}
+          UNTESTED: ${{ steps.prepare.outputs.untested }}
+          JOB_TIMEOUT_MINUTES: ${{ needs.setup.outputs.run_timeout_minutes }}
+        run: |
+          set -uo pipefail
+          # gremlins exits 0 on success regardless of efficacy (threshold=0); a
+          # non-zero exit means an internal error (bad config, build failure, …).
+          # Surface that as a RED cell — fail-fast is off, so one bad attempt
+          # doesn't cancel the others, and the upload step (if: always()) still
+          # ships an artifact downstream.
+          fail() {
+            # Error marker so the badge and aggregate jobs skip this attempt
+            # (load_run returns None on a file with no "files" key) instead of
+            # publishing a misleading 0%.
+            echo '{"gremlins_error": true}' > /tmp/gremlins-out.json
+            echo "::error::$1"
+            exit "$2"
+          }
+
+          # A shard runs only the modules its plan gives it, each in the mode
+          # and at the worker count the plan measured for the whole module (a
+          # module the plan could not size gets neither and measures its own),
+          # and skips the rest. A module the module input left out is skipped too.
+          runs=()
+          modes=()
+          workers=()
+          MERGE_ARGS=()
+          COST_ARGS=()
+          for m in ${UNTESTED:-}; do MERGE_ARGS+=(--skip-module "${m}"); done
+          if [ -n "${SHARDS}" ]; then
+            plan_lines=$(python3 scripts/gremlins-shard.py modules --plan plan/plan.json \
+              --shard "${SHARD}" --modules "${MODULES}") \
+              || fail "no module list for ${REPO} shard ${SHARD} of ${SHARDS}" 1
+            while read -r verb m mode n; do
+              if [ "${verb}" = run ]; then
+                runs+=("${m}")
+                modes+=("${mode}")
+                workers+=("${n}")
+              else
+                MERGE_ARGS+=(--skip-module "${m}")
+              fi
+            done <<<"${plan_lines}"
+          else
+            for m in $MODULES; do
+              runs+=("${m}")
+              modes+=("")
+              workers+=("")
+            done
+          fi
+
+          # Every module's mutation pass stops by this (gremlins-run.sh
+          # unleash_mutants), leaving the cost record, merge and upload time
+          # inside the job's cap.
+          RUN_DEADLINE=$(($(date +%s) + (JOB_TIMEOUT_MINUTES - 20) * 60))
+          export RUN_DEADLINE
+          rc=0
+          for i in "${!runs[@]}"; do
+            m="${runs[i]}"
+            echo "::group::gremlins ${REPO} module ${m}"
+            OUT="/work/${m}/gremlins-out.json" GREMLINS_MODE="${modes[i]}" GREMLINS_WORKERS="${workers[i]}" \
+              bash scripts/gremlins-container.sh "${m}" || rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              break
+            fi
+            MERGE_ARGS+=(--module "${m}=target/${m}/gremlins-out.json")
+          done
+          for m in "${runs[@]}"; do
+            [ -f "target/${m}/gremlins-out.json.times" ] && COST_ARGS+=(--module "${m}=target/${m}/gremlins-out.json.times")
+          done
+          # Next week's shard job prices each file from this record, a failed
+          # module's finished files included.
+          if [ "${#COST_ARGS[@]}" -eq 0 ] \
+            || ! python3 scripts/gremlins-shard.py costs "${COST_ARGS[@]}" --out /tmp/gremlins-costs.json; then
+            echo "::warning::no cost record for ${REPO}, so next week prices it from its probe"
+          fi
+
+          # Hand the result to the badge/aggregate jobs, which read /tmp.
+          if [ "$rc" -eq 124 ]; then
+            fail "gremlins for ${REPO} (attempt ${ATTEMPT}) stopped at the run deadline, with its finished mutants' costs recorded" 124
+          elif [ "$rc" -ne 0 ]; then
+            fail "gremlins failed for ${REPO} (attempt ${ATTEMPT}), exit ${rc}" "$rc"
+          fi
+
+          # Fold the per-module results into the ONE result per attempt (per
+          # shard, which gremlins-aggregate.py merges) the aggregate, badge and
+          # tracker are built on; gremlins-merge.py owns how.
+          if ! python3 scripts/gremlins-merge.py --out /tmp/gremlins-out.json "${MERGE_ARGS[@]}"; then
+            fail "merging per-module gremlins results failed for ${REPO} (attempt ${ATTEMPT})" 1
+          fi
+
+      # actions/download-artifact extracts a single matched artifact with no
+      # directory, so its name is lost and the attempt and shard ride in meta.json.
+      # The readers take the repo from the names they download, never from here.
+      - name: Record which repo and attempt this artifact is
+        if: always()
+        env:
+          REPO: ${{ inputs.repository }}
+          ATTEMPT: ${{ matrix.attempt }}
+        run: |
+          # A shard also records which of how many, so the aggregate merges an
+          # attempt's shards before it compares attempts.
+          jq -n --arg repo "$REPO" --arg attempt "$ATTEMPT" --arg shard "$SHARD" --arg shards "$SHARDS" \
+            '{repo: $repo, attempt: $attempt}
+             + if $shards == "" then {} else {shard: $shard, shards: $shards} end' > /tmp/meta.json
+
+      - name: Upload full mutants.json (artifact, 90-day retention)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gremlins-${{ needs.setup.outputs.key }}-${{ matrix.attempt }}${{ matrix.shards && format('-shard{0}', matrix.shard) || '' }}
+          # All under /tmp, so the computed common ancestor puts each at the
+          # artifact root beside the others.
+          path: |
+            /tmp/gremlins-out.json
+            /tmp/meta.json
+            /tmp/gremlins-costs.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  # Next week's prices and the capped note, from the run's artifacts and the
+  # history the shard job priced from; holds no token, which only publishing needs.
+  record:
+    needs: [setup, shard, run]
+    if: ${{ always() && needs.shard.result == 'success' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout ci (for scripts/)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      - name: Download this repo's attempts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          pattern: ${{ needs.shard.outputs.artifacts }}
+
+      # Absent when the repo ran one job per attempt and had no history; the
+      # history step then keeps only this run's measures.
+      - name: Download the run plan and the history it priced from
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gremlinsplans-${{ needs.setup.outputs.key }}
+          path: run-plans
+
+      - name: Name a capped shard plan
+        env:
+          REPO: ${{ inputs.repository }}
+        run: python3 scripts/gremlins-shard.py capped --repo "$REPO" --plan run-plans/plan.json
+
+      - name: Record this repo's measured costs
+        env:
+          REPO: ${{ inputs.repository }}
+        run: |
+          python3 scripts/gremlins-shard.py history --repo "$REPO" --artifacts-dir artifacts \
+            --previous run-plans/history.json --plan run-plans/plan.json --out costs/costs.json
+
+      - name: Upload this repo's cost history
+        if: ${{ hashFiles('costs/costs.json') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gremlinscosts-${{ needs.setup.outputs.key }}
+          path: costs/costs.json
+          if-no-files-found: error
+          retention-days: 90
+
+  # Publish the repo's mutation badge to its orphan `badges` branch,
+  # independent of the `aggregate` (issue-tracker) job below so neither failure
+  # blocks the other. scripts/gremlins-aggregate.py computes the efficacy. A
+  # one-module call publishes neither, because both describe the whole repo.
+  badge:
+    needs: [setup, shard, run]
+    if: ${{ always() && needs.shard.result == 'success' && inputs.module == '' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Require the CI_SCHEDULE secret
+        env:
+          TOKEN: ${{ secrets.CI_SCHEDULE }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::a whole-repository call publishes the badge, so the caller must pass CI_SCHEDULE"
+            exit 1
+          fi
+
+      - name: Checkout ci (for scripts/)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      # gremlins-aggregate.py reads configs/gremlins.yaml; the set-up interpreter has no PyYAML.
+      - name: Install PyYAML
+        run: |
+          set -euo pipefail
+          # renovate: datasource=pypi depName=PyYAML
+          VERSION=6.0.3
+          pip install -q "PyYAML==${VERSION}"
+
+      - name: Download this repo's attempts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          pattern: ${{ needs.shard.outputs.artifacts }}
+
+      - name: Compute + publish this repo's mutation badge
+        env:
+          # CI_SCHEDULE must carry contents:write on consumer repos. The push
+          # targets each repo's orphan `badges` branch.
+          TOKEN: ${{ secrets.CI_SCHEDULE }}
+          REPO: ${{ inputs.repository }}
+        run: |
+          set -euo pipefail
+          # Target code wrote meta.json, so an artifact naming another repo is
+          # warned and skipped; gremlins-aggregate.py reads only this repo's.
+          found=$(bash scripts/discover-artifact-repos.sh --allow "$REPO" artifacts)
+          if [ -z "$found" ]; then
+            echo "no attempt names ${REPO} this week, so its badge is left untouched"
+            exit 0
+          fi
+          badge="$RUNNER_TEMP/mutation.json"
+          python3 scripts/gremlins-aggregate.py \
+            --repo "$REPO" --artifacts-dir artifacts --week "$(date -u +'%Y-%m-%d %H:%M')" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --badge-file "$badge" >/dev/null
+          # Written only when an attempt parsed, so a repo whose every attempt
+          # errored keeps its badge rather than showing 0%.
+          if [ ! -s "$badge" ]; then
+            echo "no parseable attempts for ${REPO}, so its badge is left untouched"
+            exit 0
+          fi
+          bash actions/publish-badge/publish-badge.sh "cplieger/${REPO}" "$TOKEN" mutation.json "$(cat "$badge")"
+
+  aggregate:
+    needs: [setup, shard, run]
+    if: ${{ always() && needs.shard.result == 'success' && inputs.module == '' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+    steps:
+      - name: Require the CI_SCHEDULE secret
+        env:
+          TOKEN: ${{ secrets.CI_SCHEDULE }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::a whole-repository call writes the tracker issue, so the caller must pass CI_SCHEDULE"
+            exit 1
+          fi
+
+      - name: Checkout ci (for scripts/)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      # gremlins-aggregate.py reads configs/gremlins.yaml; the set-up interpreter has no PyYAML.
+      - name: Install PyYAML
+        run: |
+          set -euo pipefail
+          # renovate: datasource=pypi depName=PyYAML
+          VERSION=6.0.3
+          pip install -q "PyYAML==${VERSION}"
+
+      - name: Download this repo's attempts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          pattern: ${{ needs.shard.outputs.artifacts }}
+
+      - name: Aggregate + update this repo's tracker issue
+        env:
+          REPO: ${{ inputs.repository }}
+        run: |
+          set -euo pipefail
+          # The badge job's check, for the same reason.
+          found=$(bash scripts/discover-artifact-repos.sh --allow "$REPO" artifacts)
+          if [ -z "$found" ]; then
+            echo "no attempt names ${REPO} this week, so its tracker issue is left untouched"
+            exit 0
+          fi
+          R="cplieger/${REPO}"
+          title="Gremlins mutation testing tracker"
+          python3 scripts/tracker_issue.py --repo "$R" --label gremlins-tracker --title "$title" \
+            --mode fetch --body-file "$RUNNER_TEMP/existing.md"
+          python3 scripts/gremlins-aggregate.py \
+            --repo "$REPO" --artifacts-dir artifacts --week "$(date -u +'%Y-%m-%d %H:%M')" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --regression-marker-file "$RUNNER_TEMP/regression.txt" \
+            --attempts-marker-file "$RUNNER_TEMP/attempts.txt" \
+            --existing-body-file "$RUNNER_TEMP/existing.md" > "$RUNNER_TEMP/body.md"
+          if [ "$(cat "$RUNNER_TEMP/attempts.txt" 2>/dev/null || echo 0)" -eq 0 ]; then
+            echo "no parseable attempts for ${REPO}, so its tracker issue is left untouched"
+            exit 0
+          fi
+          flag=off
+          if [ "$(cat "$RUNNER_TEMP/regression.txt" 2>/dev/null)" = "true" ]; then
+            flag=on
+          fi
+          python3 scripts/tracker_issue.py --repo "$R" --label gremlins-tracker --title "$title" \
+            --mode upsert --body-file "$RUNNER_TEMP/body.md" \
+            --flag-label mutation-regression --flag "$flag"
+
+  # The call's positive record, which the caller's fleet summary reads because
+  # a matrix call's outputs keep only the last call's values. Built from every
+  # job's result and the plan and shard jobs' outputs, never from a file target
+  # code wrote; scripts/mutation-summary.py record owns the outcome, and this
+  # job fails unless the call passed.
+  result:
+    needs: [setup, plan, shard, run, record, badge, aggregate]
+    if: ${{ always() && needs.setup.result == 'success' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout ci (for scripts/)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          # No step in this job pushes with checkout-persisted credentials;
+          # do not leave the token in .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      # A tested entry is counted from these; a lost download leaves its
+      # entries not run, which the record names.
+      - name: Download this call's merged results
+        if: ${{ needs.shard.outputs.artifacts != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: attempts
+          pattern: ${{ needs.shard.outputs.artifacts }}
+
+      - name: Write this call's result
+        env:
+          REPO: ${{ inputs.repository }}
+          MODULE: ${{ inputs.module }}
+          KEY: ${{ needs.setup.outputs.key }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 scripts/mutation-summary.py record --tool gremlins --repo "$REPO" --target "$MODULE" \
+            --key "$KEY" --needs "$NEEDS" --out "result/${KEY}.json" --reports attempts
+
+      - name: Upload this call's result
+        if: ${{ always() && hashFiles('result/*.json') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gremlinsresult-${{ needs.setup.outputs.key }}
+          path: result
+          if-no-files-found: error
+          retention-days: 7

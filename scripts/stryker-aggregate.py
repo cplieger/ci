@@ -10,8 +10,8 @@ dir.
 Inputs:
     repo:           e.g. "reactive" (without owner)
     artifacts_dir:  directory containing per-entry subdirs like
-                    stryker-<repo>-<dirslug>/ each holding mutation.json
-                    (the mutation-testing-elements schema report) and
+                    stryker-<key>/ (scripts/mutation_cost.py entry_key), each
+                    holding mutation.json (the mutation-testing-elements schema report) and
                     meta.json ({"repo": ..., "dir": ...}).
     week_ending:    YYYY-MM-DD HH:MM
     run_url:        URL of the current workflow run (artifact link)
@@ -43,6 +43,7 @@ import json
 import sys
 from pathlib import Path
 
+import mutation_cost
 import trackerlib
 
 MAX_MUTANTS_INLINE = 50
@@ -101,7 +102,7 @@ def aggregate(entry_dirs: list[tuple[str, Path]]):
     for pkg_dir, report in entry_dirs:
         loaded = load_report(report)
         if loaded is None:
-            print(f'  skip unparseable report for dir {pkg_dir}', file=sys.stderr)
+            mutation_cost.say(t'skip unparseable report for dir {pkg_dir}')
             continue
         mutants, counts = loaded
         for k, v in counts.items():
@@ -308,12 +309,12 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    # Entries are matched by meta.json CONTENT, not artifact-name parsing (repo
-    # names and dir slugs both contain hyphens). Searched at any depth, because
-    # actions/download-artifact only creates the per-artifact directory when
-    # MORE THAN ONE artifact matched its pattern: a run with exactly one
-    # reporting package dir extracts flat into the artifacts dir, and a
-    # fixed-depth `stryker-*/meta.json` glob silently finds nothing there.
+    # Entries are matched by meta.json CONTENT, not artifact names, and searched
+    # at any depth, because actions/download-artifact only creates the
+    # per-artifact directory when MORE THAN ONE artifact matched its pattern: a
+    # run with exactly one reporting package dir extracts flat into the
+    # artifacts dir, and a fixed-depth `stryker-*/meta.json` glob silently
+    # finds nothing there.
     entry_dirs = []
     for meta_path in sorted(args.artifacts_dir.rglob('meta.json')):
         try:
@@ -353,4 +354,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(mutation_cost.run_main(main))

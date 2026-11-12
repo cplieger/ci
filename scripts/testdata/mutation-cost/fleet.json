@@ -1,0 +1,75 @@
+{
+ "stryker": [
+  {
+   "repo": "deadset-ts",
+   "dir": "."
+  },
+  {
+   "repo": "go",
+   "dir": "keyenc/web"
+  },
+  {
+   "repo": "go",
+   "dir": "sse/web"
+  },
+  {
+   "repo": "marotte",
+   "dir": "static-src"
+  },
+  {
+   "repo": "reactive",
+   "dir": "."
+  },
+  {
+   "repo": "subflux",
+   "dir": "internal/server/static-src"
+  },
+  {
+   "repo": "ui",
+   "dir": "."
+  },
+  {
+   "repo": "web-terminal-engine",
+   "dir": "web"
+  },
+  {
+   "repo": "web-terminal-kiro",
+   "dir": "static-src"
+  },
+  {
+   "repo": "web-terminal-ui",
+   "dir": "."
+  }
+ ],
+ "gremlins": [
+  "access",
+  "animap",
+  "arrapi",
+  "auth",
+  "bolttable",
+  "cert-converter",
+  "deadset",
+  "deadset-go",
+  "deadset-spec",
+  "docker-age",
+  "docker-fclones-scheduler",
+  "docker-renovate-scheduler",
+  "forge-scout",
+  "forgeapi",
+  "grelot",
+  "knell",
+  "langtag",
+  "marotte",
+  "pg-autodump",
+  "plex-exporter",
+  "plex-language-sync",
+  "plexapi",
+  "seadex-scout",
+  "subflux",
+  "tautulli-remap",
+  "toolbelt",
+  "web-terminal-engine",
+  "web-terminal-kiro",
+  "web-terminal-server"
+ ]
+}

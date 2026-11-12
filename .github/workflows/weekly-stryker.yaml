@@ -1,7 +1,8 @@
 # Weekly Stryker mutation testing of every TS package dir that commits a
-# stryker.config.json, in the public cplieger repositories; the Go twin is
-# weekly-gremlins.yaml. The opt-in contract, the opt-out, the badge and the
-# tracker are documented in docs/workflows.md "The scheduled runs".
+# stryker config, in the public cplieger repositories; the Go twin is
+# weekly-gremlins.yaml. Each repo is one call of mutation-stryker-repo.yaml, so
+# one repo's failure ends only its own call. The opt-in contract, the opt-out,
+# the badge and the tracker are documented in docs/workflows.md "The scheduled runs".
 name: Weekly stryker
 
 on:
@@ -27,17 +28,15 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
-      matrix: ${{ steps.fanout.outputs.matrix }}
       repos: ${{ steps.fanout.outputs.repos }}
     steps:
-      - name: Discover TS package dirs with a stryker config
+      - name: Discover repos with a stryker config
         id: fanout
         env:
           GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
           # Injected via env (not inline ${{ }} in the script) so a crafted
           # dispatch input can't expand into shell code (template injection).
           ONLY: ${{ github.event.inputs.only }}
-          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # Repo discovery over REST, not the GraphQL `gh repo list`: the fanout
@@ -62,392 +61,97 @@ jobs:
             echo "manual 'only' filter active -> ${repos:-<none matched>}"
           fi
 
-          matrix='[]'
+          # A config up to three dirs down, outside node_modules, as the call's
+          # discover job scans (scripts/stryker-shard.py config_dirs). A repo
+          # whose tree cannot be read whole runs all the same: its call finds
+          # its configs from a clone, or finds none.
+          found=()
           for r in $repos; do
-            rm -rf scan
-            # Plain git over HTTPS draws no API quota, so a rate-limited run can
-            # still clone, where `gh repo clone` would spend GraphQL budget.
-            if ! git clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
-              echo "::warning::${r}: clone failed — skipping this repo"
-              continue
+            if ! hit=$(gh api "/repos/cplieger/${r}/git/trees/HEAD?recursive=1" --jq '
+              if .truncated then "truncated" else
+                [.tree[] | select(.type == "blob") | .path
+                 | select(test("(^|/)node_modules/") | not)
+                 | select(test("^([^/]+/){0,3}stryker\\.config\\.[^/]+$"))] | length | tostring
+              end' 2>/dev/null); then
+              echo "::warning::${r}: its source tree could not be read, so it runs and its call looks for configs"
+              found+=("$r")
+            elif [ "$hit" = truncated ]; then
+              echo "::warning::${r}: its source tree is truncated, so it runs and its call looks for configs"
+              found+=("$r")
+            elif [ "$hit" -gt 0 ]; then
+              echo "  include: ${r}"
+              found+=("$r")
             fi
-            # A clone can exit 0 with no resolvable HEAD, and an unguarded
-            # rev-parse under `set -e` would end the job and every repo's entry
-            # with it; one transient clone skips one repo.
-            if ! sha=$(git -C scan rev-parse HEAD 2>/dev/null); then
-              echo "::warning::${r}: clone left no resolvable HEAD — skipping this repo"
-              continue
-            fi
-            while IFS= read -r cfg; do
-              dir=$(dirname -- "${cfg#scan/}")
-              # The badge job finds this entry's artifact by a download pattern
-              # built from the dir, where a glob character would match others.
-              case "$dir" in
-                *[!A-Za-z0-9._/-]*)
-                  echo "::warning::${r}:${dir}: skipped, because the directory name holds a character outside A-Z, a-z, 0-9, '.', '_', '-' and '/'"
-                  continue
-                  ;;
-              esac
-              if [ "$dir" = . ]; then slug=root; else slug=${dir//\//_}; fi
-              # A sidecar, not a stryker.config key: Stryker warns on unknown keys.
-              weekly="$(dirname "$cfg")/stryker.weekly.json"
-              if [ "$EVENT" = schedule ] && [ -z "${ONLY:-}" ] && [ -f "$weekly" ]; then
-                if jq -e '. == {weekly: false}' "$weekly" >/dev/null 2>&1; then
-                  echo "::notice::${r}:${dir}: stryker.weekly.json sets weekly=false, so the scheduled run skips it. Dispatch with only=${r} to mutation-test it."
-                  continue
-                fi
-                # Malformed runs the dir: failing here would drop every repo's entry with it.
-                echo "::warning::${r}:${dir}: stryker.weekly.json is not exactly {\"weekly\": false}; mutation-testing the dir anyway"
-              fi
-              echo "  include ${r}:${dir} @ ${sha:0:12}"
-              matrix=$(printf '%s' "$matrix" | jq -c \
-                --arg r "$r" --arg s "$sha" --arg d "$dir" --arg slug "$slug" \
-                '. + [{repo: $r, sha: $s, dir: $d, slug: $slug}]')
-            done < <(find scan -maxdepth 4 -name 'stryker.config.*' -not -path '*/node_modules/*' | sort)
           done
-          rm -rf scan
+          # select() drops the one empty line printf gives an empty list.
+          repos_json=$(printf '%s\n' "${found[@]}" | jq -R 'select(length > 0)' | jq -s -c .)
+          echo "repos=${repos_json}" >> "$GITHUB_OUTPUT"
+          echo "Total repos: $(jq 'length' <<<"$repos_json")"
+          if [ "${#found[@]}" -eq 0 ]; then
+            echo "::error::no repo with a stryker config was found to run, so this run tests nothing"
+            echo "### no repo with a stryker config was found to run, so this run tests nothing" >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          fi
 
-          # The tracker job downloads each repo's artifacts by the exact names its
-          # run entries upload (a brace list for several), so an artifact cannot
-          # reach another repo's tracker. The dir check above keeps names glob-free.
-          repos=$(jq -c 'group_by(.repo) | map({repo: .[0].repo, artifacts: (
-            map("stryker-\(.repo)-\(.slug)") | if length == 1 then .[0] else "{\(join(","))}" end)})' <<<"$matrix")
-
-          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
-          echo "repos=${repos}" >> "$GITHUB_OUTPUT"
-          echo "Total entries: $(printf '%s' "$matrix" | jq 'length')"
-
-  run:
+  repo:
+    name: stryker (${{ matrix.repo }})
     needs: fanout
-    if: ${{ needs.fanout.outputs.matrix != '[]' }}
     strategy:
       fail-fast: false
-      max-parallel: 3   # CPU-heavy; few enrolled repos today — leaves the budget free
+      # Each call runs up to 3 Stryker jobs at once; 2 calls keep the account's
+      # budget for the other schedulers and ad-hoc PR work.
+      max-parallel: 2
       matrix:
-        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
+        repo: ${{ fromJSON(needs.fanout.outputs.repos) }}
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/mutation-stryker-repo.yaml
+    with:
+      repository: ${{ matrix.repo }}
+      # Only the scheduled run honours a dir's opt-out; a dispatch tests it.
+      honour-opt-out: ${{ github.event_name == 'schedule' }}
+    secrets:
+      CI_SCHEDULE: ${{ secrets.CI_SCHEDULE }}
+
+  # Reads each call's result on its own, so a missing or unreadable one is
+  # named for its repo and the rest are still summarised, and fails unless
+  # every call's record earned `passed` (scripts/mutation-summary.py fleet).
+  # Each call names its file by its key, so the merged download keeps them apart.
+  summary:
+    needs: [fanout, repo]
+    if: ${{ !cancelled() && needs.fanout.result == 'success' }}
     runs-on: ubuntu-26.04
-    # Sized to measured work: web-terminal-ui's full run is ~3.3-4.4h on this
-    # runner (8696 mutants at ~44/min, 2026-09-27, no hang, 0.4% timeouts).
-    # 360 is the hosted-runner ceiling, so a package that outgrows this needs
-    # incremental mode or a narrower `mutate`, not a bigger number.
-    timeout-minutes: 345
+    timeout-minutes: 5
     permissions:
       contents: read
-    steps:
-      - name: Setup Python
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.15"
-
-      # Anonymous: the fanout lists only public repositories, and this job
-      # runs the target's code, so it holds no secret.
-      - name: Clone target repo at pinned SHA
-        env:
-          REPO: ${{ matrix.repo }}
-          SHA: ${{ matrix.sha }}
-        run: |
-          set -euo pipefail
-          git clone --depth 1 "https://github.com/cplieger/${REPO}.git" target
-          git -C target fetch --depth 1 origin "${SHA}"
-          git -C target checkout --quiet "${SHA}"
-
-      - name: Setup Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          # Automatic caching off: this step restores no npm cache.
-          package-manager-cache: false
-          # Keep in step with ts-ci.yaml / release.yaml (same major).
-          node-version: '26'
-
-      - name: Run stryker
-        id: stryker
-        working-directory: target/${{ matrix.dir }}
-        env:
-          ENTRY: ${{ matrix.repo }}:${{ matrix.dir }}
-        run: |
-          set -uo pipefail
-
-          # Explicit, because this block runs WITHOUT `set -e`: a failed
-          # `npm ci` otherwise falls through to the enrollment gate below,
-          # which finds no stryker binary, reports the dir as un-enrolled and
-          # exits 0 — a green matrix entry that mutation-tested nothing and
-          # blamed the repo for it. The two causes want opposite outcomes, so
-          # they are separated here rather than conflated one gate later.
-          if ! npm ci; then
-            echo "::error::${ENTRY}: npm ci failed"
-            exit 1
-          fi
-
-          # Enrollment gate: config present but the Stryker devDeps missing →
-          # skip with an actionable notice (the runner ships ahead of repo
-          # enrollment), never a red herring failure.
-          if ! npx --no-install stryker --version >/dev/null 2>&1; then
-            msg="${ENTRY}: stryker.config.* present but @stryker-mutator/core is not a devDependency — skipping."
-            echo "::notice::${msg} Enroll: npm i -D @stryker-mutator/core @stryker-mutator/vitest-runner"
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Vitest Browser Mode needs a real Chromium, enrolled by the
-          # `@vitest/browser-playwright` devDependency (same marker as
-          # ts-ci.yaml) and installed through the repo's OWN pinned `playwright`
-          # CLI so the build number matches. NOT `--with-deps`: the runner image
-          # already carries Chromium's shared libraries. Chromium alone, with no
-          # CPLIEGER_BROWSERS: every engine would multiply the weekly run, and a
-          # suite that stubs engine quirks kills the same mutants in any engine.
-          # After the enrolment gate, because a skipped dir runs no tests; a
-          # failed install fails here rather than as a misleading stryker
-          # dry-run error.
-          if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
-            if ! npx --no-install playwright install chromium; then
-              echo "::error::${ENTRY}: playwright chromium install failed"
-              exit 1
-            fi
-          else
-            echo "no @vitest/browser-playwright devDependency; skipping browser install"
-          fi
-
-          # A declared `test:mutation` is the package's entry point, so the weekly
-          # and local runs are one command; it must run `stryker run`, which gets
-          # the flags after `--`. --reporters json overrides the config's
-          # reporters for CI; progress keeps the log alive under the job timeout.
-          rc=0
-          # GITHUB_ACTIONS=false on this command only: vitest adds its
-          # github-actions reporter when it is "true", so each killed mutant's
-          # test failure would annotate a green job. CI=true still marks CI.
-          # Node 26's JSON.stringify fast path aborts ("Zone Allocation failed")
-          # on the checker's very large IPC message, and Node refuses the flag in
-          # NODE_OPTIONS, so a declared script's node gets it from a preload.
-          # Remove both once Node fixes that.
-          if node -e "const s=require('./package.json').scripts||{}; process.exit(s['test:mutation']?0:1)"; then
-            preload="${RUNNER_TEMP}/no-json-stringify-fast-path.cjs"
-            printf '%s\n' "require('node:v8').setFlagsFromString('--no-json-stringify-fast-path');" > "$preload"
-            GITHUB_ACTIONS=false NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--require=${preload}" \
-              npm run test:mutation -- --reporters json,progress || rc=$?
-          else
-            GITHUB_ACTIONS=false node --no-json-stringify-fast-path node_modules/.bin/stryker run --reporters json,progress || rc=$?
-          fi
-
-          # Locate the schema report (jsonReporter default:
-          # reports/mutation/mutation.json; tolerate overridden fileNames).
-          report=$(grep -rls '"schemaVersion"' reports/ 2>/dev/null | head -1 || true)
-          if [ -z "$report" ]; then
-            echo "::error::${ENTRY}: stryker produced no JSON report (exit ${rc})"
-            exit "${rc:-1}"
-          fi
-
-          # Mutation score per mutation-testing-elements metrics:
-          # detected (Killed+Timeout) / valid (detected + Survived+NoCoverage).
-          # Emits "<score> <detected> <valid>" so the zero-kill guard below reads
-          # the counts without a second parse of an 8 MB report. python -c and a
-          # here-string, never a heredoc: its terminator breaks under GHA's YAML
-          # dedent.
-          metrics=$(python3 -c "
-          import json, sys
-          from collections import Counter
-          data = json.load(open(sys.argv[1]))
-          c = Counter(m['status'] for f in data.get('files', {}).values() for m in f.get('mutants', []))
-          detected = c['Killed'] + c['Timeout']
-          valid = detected + c['Survived'] + c['NoCoverage']
-          print(f'{detected / valid * 100:.1f}' if valid else '0.0', detected, valid)
-          " "$report")
-          read -r score detected valid <<< "$metrics"
-
-          # A run that killed NOTHING measured nothing: 0 detected against valid
-          # mutants means the harness never activated one, and without
-          # `thresholds.break` that would publish as a green run. Known cause:
-          # @stryker-mutator/vitest-runner 10 runs ZERO tests per mutant under
-          # vitest 5, and its `vitest: ">=2.0.0"` range accepts it silently. The
-          # stopgap above patches that, so a 0 here means the stopgap did
-          # nothing (read its output first) or a second cause exists. Guarded on
-          # `valid > 0` so a package with no mutants still reports 0.0%.
-          if [ "${detected}" = "0" ] && [ "${valid}" -gt 0 ]; then
-            echo "${ENTRY}: no mutant was detected, so the harness never activated one." \
-              "vitest 5 + @stryker-mutator/vitest-runner 10 runs 0 tests per mutant; see this step's comment."
-            echo "::error::${ENTRY}: killed 0 of ${valid} mutants — measured nothing, no score published"
-            exit 1
-          fi
-
-          echo "score=${score}" >> "$GITHUB_OUTPUT"
-          echo "report=${report}" >> "$GITHUB_OUTPUT"
-          echo "### ${ENTRY}: mutation score ${score}% (stryker exit ${rc})" >> "$GITHUB_STEP_SUMMARY"
-
-          # Propagate a below-break-threshold failure AFTER capturing the
-          # score, so the badge job still publishes the (low) number.
-          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
-
-      # No reader of the artifact uses the files' or test files' source, a
-      # copy of the tree, so the staged report drops both.
-      - name: Stage report for the badge and tracker jobs
-        if: ${{ steps.stryker.outputs.report != '' }}
-        env:
-          REPORT: ${{ steps.stryker.outputs.report }}
-          REPO: ${{ matrix.repo }}
-          DIR: ${{ matrix.dir }}
-          SCORE: ${{ steps.stryker.outputs.score }}
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/stage
-          jq 'del(.files[]?.source, .testFiles[]?.source)' "target/${DIR}/${REPORT}" > /tmp/stage/mutation.json
-          jq -n --arg repo "$REPO" --arg dir "$DIR" --arg score "$SCORE" \
-            '{repo: $repo, dir: $dir, score: $score}' > /tmp/stage/meta.json
-
-      - name: Upload report (artifact, 90-day retention)
-        if: ${{ steps.stryker.outputs.report != '' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: stryker-${{ matrix.repo }}-${{ matrix.slug }}
-          path: /tmp/stage
-          if-no-files-found: warn
-          retention-days: 90
-
-      - name: Surface below-threshold score
-        if: ${{ steps.stryker.outputs.rc != '' && steps.stryker.outputs.rc != '0' }}
-        env:
-          RC: ${{ steps.stryker.outputs.rc }}
-          ENTRY: ${{ matrix.repo }}:${{ matrix.dir }}
-        run: |
-          echo "::error::${ENTRY}: mutation score fell below the config's thresholds.break (stryker exit ${RC})"
-          exit 1
-
-  # Publish each entry's mutation-ts badge from the score its run staged. The
-  # push token lives in this job, which runs no target code: a step after the
-  # target's `npm ci` in `run` could reach it through GITHUB_ENV, GITHUB_PATH
-  # or the workspace. That code also writes meta.json, so the repo comes from
-  # this matrix and the artifact from its name, never from meta.json.
-  badge:
-    needs: [fanout, run]
-    if: ${{ !cancelled() && needs.fanout.result == 'success' && needs.fanout.outputs.matrix != '[]' }}
-    strategy:
-      fail-fast: false
-      # One at a time in the order the jobs are created, the matrix's own
-      # (docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations),
-      # so a repo with several package dirs ends on the same dir's badge.
-      max-parallel: 1
-      matrix:
-        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
-    runs-on: ubuntu-26.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout ci (for the badge publisher)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # No step in this job pushes with checkout-persisted credentials;
-          # the badge push authenticates via CI_SCHEDULE inside the script.
-          persist-credentials: false
-
-      # A pattern matching nothing downloads nothing and succeeds: the entry
-      # was skipped or failed before it staged a report. One match extracts
-      # straight into `path`.
-      - name: Download this entry's report
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          path: artifact
-          pattern: stryker-${{ matrix.repo }}-${{ matrix.slug }}
-
-      - name: Publish this entry's mutation-ts badge
-        env:
-          TOKEN: ${{ secrets.CI_SCHEDULE }}
-          REPO: ${{ matrix.repo }}
-          ENTRY: ${{ matrix.repo }}:${{ matrix.dir }}
-        run: |
-          set -euo pipefail
-          if [ ! -f artifact/meta.json ]; then
-            echo "${ENTRY}: no report was staged, so no badge is published"
-            exit 0
-          fi
-          score=$(jq -r '.score // ""' artifact/meta.json 2>/dev/null) || score=""
-          if ! [[ $score =~ ^[0-9]{1,3}(\.[0-9]+)?$ ]]; then
-            echo "::error::${ENTRY}: the staged score is not a number, so no badge was published"
-            exit 1
-          fi
-          # Colour bands match the Go mutation badge (gremlins-aggregate.py).
-          int=${score%.*}
-          if [ "$int" -ge 85 ]; then color=brightgreen
-          elif [ "$int" -ge 75 ]; then color=green
-          elif [ "$int" -ge 50 ]; then color=yellow
-          elif [ "$int" -ge 30 ]; then color=orange
-          else color=red
-          fi
-          json=$(printf '{"schemaVersion":1,"label":"mutation (TS)","message":"%s%%","color":"%s"}' "$score" "$color")
-          bash actions/publish-badge/publish-badge.sh "cplieger/${REPO}" "$TOKEN" mutation-ts.json "$json"
-
-  # Update each repo's tracker issue, the TS twin of weekly-gremlins.yaml's
-  # aggregate job, independent of the badge job so neither failure blocks the
-  # other. A repo with no parseable report this week is left untouched (its red
-  # matrix entry is the signal).
-  aggregate:
-    needs: [fanout, run]
-    if: ${{ always() && needs.fanout.result == 'success' && needs.fanout.outputs.repos != '[]' }}
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        include: ${{ fromJSON(needs.fanout.outputs.repos) }}
-    runs-on: ubuntu-26.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    env:
-      GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
     steps:
       - name: Checkout ci (for scripts/)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # No step in this job pushes with checkout-persisted credentials;
-          # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
-
-      - name: Download this repo's reports
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          path: artifacts
-          pattern: ${{ matrix.artifacts }}
 
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.15"
 
-      - name: Aggregate + update this repo's tracker issue
+      - name: Download every call's result
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: results
+          pattern: strykerresult-*
+          merge-multiple: true
+
+      # A whole-repo call's key is its repo name (scripts/mutation_cost.py entry_key).
+      - name: Summarise the fleet
         env:
-          REPO: ${{ matrix.repo }}
-        run: |
-          set -euo pipefail
-          # Target code wrote meta.json, so an artifact naming another repo is
-          # warned and skipped; stryker-aggregate.py reads only this repo's.
-          found=$(bash scripts/discover-artifact-repos.sh --allow "$REPO" artifacts)
-          if [ -z "$found" ]; then
-            echo "no report names ${REPO} this week, so its tracker issue is left untouched"
-            exit 0
-          fi
-          R="cplieger/${REPO}"
-          title="Stryker mutation testing tracker"
-          python3 scripts/tracker_issue.py --repo "$R" --label stryker-tracker --title "$title" \
-            --mode fetch --body-file "$RUNNER_TEMP/existing.md"
-          python3 scripts/stryker-aggregate.py \
-            --repo "$REPO" --artifacts-dir artifacts --week "$(date -u +'%Y-%m-%d %H:%M')" \
-            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            --regression-marker-file "$RUNNER_TEMP/regression.txt" \
-            --entries-marker-file "$RUNNER_TEMP/entries.txt" \
-            --existing-body-file "$RUNNER_TEMP/existing.md" > "$RUNNER_TEMP/body.md"
-          if [ "$(cat "$RUNNER_TEMP/entries.txt" 2>/dev/null || echo 0)" -eq 0 ]; then
-            echo "no parseable reports for ${REPO}, so its tracker issue is left untouched"
-            exit 0
-          fi
-          flag=off
-          if [ "$(cat "$RUNNER_TEMP/regression.txt" 2>/dev/null)" = "true" ]; then
-            flag=on
-          fi
-          python3 scripts/tracker_issue.py --repo "$R" --label stryker-tracker --title "$title" \
-            --mode upsert --body-file "$RUNNER_TEMP/body.md" \
-            --flag-label mutation-regression --flag "$flag"
+          REPOS: ${{ needs.fanout.outputs.repos }}
+        run: python3 scripts/mutation-summary.py fleet --tool stryker --keys "${REPOS}" --results results
 
   # `needs:` must list every other job in this workflow.
   notify:
-    needs: [fanout, run, badge, aggregate]
+    needs: [fanout, repo, summary]
     if: always()
     permissions:
       actions: read

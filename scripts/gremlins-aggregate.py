@@ -6,6 +6,7 @@ body on stdout, diagnostics on stderr. Only the `<!-- gremlins-data -->` and
 `<!-- live-mutants -->` sentinel blocks are replaced, so notes outside them
 survive; the sentinel and history mechanics are trackerlib's.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -17,34 +18,35 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import mutation_cost
 import trackerlib
 import yaml
 
 _spec = importlib.util.spec_from_file_location(
-    "gremlins_merge", Path(__file__).with_name("gremlins-merge.py")
+    'gremlins_merge', Path(__file__).with_name('gremlins-merge.py')
 )
 gremlins_merge = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gremlins_merge)
 
 MAX_LIVE_MUTANTS_INLINE = 50  # cap; remainder goes to artifact link
 REGRESSION_THRESHOLD_PCT = 5.0  # mean drops > 5% below rolling-mean → flag
-HISTORY_SENTINEL = "gremlins-data"
-CENTRAL_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "gremlins.yaml"
+HISTORY_SENTINEL = 'gremlins-data'
+CENTRAL_CONFIG = Path(__file__).resolve().parent.parent / 'configs' / 'gremlins.yaml'
 
 # Every gremlins v0.6.0 mutator type and whether it runs when the config leaves
 # it out (internal/configuration/mutantenabled.go).
 GREMLINS_MUTATORS = {
-    "arithmetic-base": True,
-    "conditionals-boundary": True,
-    "conditionals-negation": True,
-    "increment-decrement": True,
-    "invert-assignments": False,
-    "invert-bitwise": False,
-    "invert-bwassign": False,
-    "invert-logical": False,
-    "invert-loopctrl": False,
-    "invert-negatives": True,
-    "remove-self-assignments": False,
+    'arithmetic-base': True,
+    'conditionals-boundary': True,
+    'conditionals-negation': True,
+    'increment-decrement': True,
+    'invert-assignments': False,
+    'invert-bitwise': False,
+    'invert-bwassign': False,
+    'invert-logical': False,
+    'invert-loopctrl': False,
+    'invert-negatives': True,
+    'remove-self-assignments': False,
 }
 DEFAULT_MUTATORS = frozenset(t for t, on in GREMLINS_MUTATORS.items() if on)
 
@@ -58,11 +60,11 @@ class Yaml12Loader(yaml.SafeLoader):
 
 
 Yaml12Loader.yaml_implicit_resolvers = {
-    first: [(tag, rx) for tag, rx in resolvers if tag != "tag:yaml.org,2002:bool"]
+    first: [(tag, rx) for tag, rx in resolvers if tag != 'tag:yaml.org,2002:bool']
     for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
 }
 Yaml12Loader.add_implicit_resolver(
-    "tag:yaml.org,2002:bool", re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF")
+    'tag:yaml.org,2002:bool', re.compile(r'^(?:true|True|TRUE|false|False|FALSE)$'), list('tTfF')
 )
 
 
@@ -78,12 +80,12 @@ def enabled_mutators(config: object) -> frozenset[str]:
     (configuration.MutantTypeEnabledKey). A type with no enabled value (absent or null)
     keeps its default; any other non-bool reads as off.
     """
-    mutants = config.get("mutants") if isinstance(config, dict) else None
+    mutants = config.get('mutants') if isinstance(config, dict) else None
     mutants = mutants if isinstance(mutants, dict) else {}
     on = set()
     for name, default in GREMLINS_MUTATORS.items():
         entry = mutants.get(name)
-        value = entry.get("enabled") if isinstance(entry, dict) else None
+        value = entry.get('enabled') if isinstance(entry, dict) else None
         if value is True or (value is None and default):
             on.add(name)
     return frozenset(on)
@@ -92,10 +94,10 @@ def enabled_mutators(config: object) -> frozenset[str]:
 def mutators_label(enabled: frozenset[str]) -> str:
     """One space-free word naming a mutator set: the History table's Mutators cell."""
     if enabled == frozenset(GREMLINS_MUTATORS):
-        return "all"
+        return 'all'
     if enabled == DEFAULT_MUTATORS:
-        return "default"
-    return "+".join(sorted(enabled)) or "none"
+        return 'default'
+    return '+'.join(sorted(enabled)) or 'none'
 
 
 def mutant_key(m: dict) -> tuple:
@@ -109,31 +111,31 @@ def mutant_key(m: dict) -> tuple:
     Older versions used "relative_position" / different key names; we read both
     so the script tolerates schema drift.
     """
-    pos = m.get("position") or m.get("relative_position") or {}
+    pos = m.get('position') or m.get('relative_position') or {}
     return (
-        m.get("file") or pos.get("file"),
-        pos.get("row") or pos.get("line"),
-        pos.get("column") or pos.get("col"),
-        m.get("type") or m.get("mutator") or m.get("mutator_name"),
+        m.get('file') or pos.get('file'),
+        pos.get('row') or pos.get('line'),
+        pos.get('column') or pos.get('col'),
+        m.get('type') or m.get('mutator') or m.get('mutator_name'),
     )
 
 
 def mutant_label(m: dict) -> str:
-    pos = m.get("position") or m.get("relative_position") or {}
-    row = pos.get("row") or pos.get("line") or "?"
-    typ = m.get("type") or m.get("mutator") or m.get("mutator_name") or "?"
+    pos = m.get('position') or m.get('relative_position') or {}
+    row = pos.get('row') or pos.get('line') or '?'
+    typ = m.get('type') or m.get('mutator') or m.get('mutator_name') or '?'
     # gremlins v0.6.0's JSON carries no before/after tokens; only render the
     # arrow when an older/richer schema supplies them.
-    cur = m.get("current_token") or m.get("token_old")
-    new = m.get("new_token") or m.get("token_new")
+    cur = m.get('current_token') or m.get('token_old')
+    new = m.get('new_token') or m.get('token_new')
     if cur and new:
-        return f"L{row} — {typ}: `{cur}` → `{new}`"
-    return f"L{row} — {typ}"
+        return f'L{row} — {typ}: `{cur}` → `{new}`'
+    return f'L{row} — {typ}'
 
 
 def file_of(m: dict) -> str:
-    pos = m.get("position") or m.get("relative_position") or {}
-    return m.get("file") or pos.get("file") or "(unknown)"
+    pos = m.get('position') or m.get('relative_position') or {}
+    return m.get('file') or pos.get('file') or '(unknown)'
 
 
 def safe_div(a: float, b: float) -> float:
@@ -148,15 +150,14 @@ def badge_color(efficacy: float) -> str:
     strong and 85%+ is excellent.
     """
     if efficacy >= 85:
-        return "brightgreen"
+        return 'brightgreen'
     if efficacy >= 75:
-        return "green"
+        return 'green'
     if efficacy >= 50:
-        return "yellow"
+        return 'yellow'
     if efficacy >= 30:
-        return "orange"
-    return "red"
-
+        return 'orange'
+    return 'red'
 
 
 def load_run(path: Path):
@@ -186,35 +187,37 @@ def load_run(path: Path):
     try:
         with open(path) as fp:
             data = json.load(fp)
-    except (json.JSONDecodeError, FileNotFoundError):
+    except json.JSONDecodeError, FileNotFoundError:
         return None
     return parse_run(data)
 
 
 def parse_run(data: object):
     """load_run's parse of an already-read document."""
-    if not isinstance(data, dict) or "files" not in data:
+    if not isinstance(data, dict) or 'files' not in data:
         return None
 
     muts = []
-    for fe in data.get("files") or []:
-        fname = fe.get("file_name")
-        for m in fe.get("mutations") or []:
-            muts.append({
-                "status": (m.get("status") or "").upper().replace(" ", "_"),
-                "type": m.get("type"),
-                "position": {"file": fname, "row": m.get("line"), "column": m.get("column")},
-            })
+    for fe in data.get('files') or []:
+        fname = fe.get('file_name')
+        for m in fe.get('mutations') or []:
+            muts.append(
+                {
+                    'status': (m.get('status') or '').upper().replace(' ', '_'),
+                    'type': m.get('type'),
+                    'position': {'file': fname, 'row': m.get('line'), 'column': m.get('column')},
+                }
+            )
     summary = {
-        "efficacy": float(data.get("test_efficacy") or 0.0),
-        "mutant_coverage": float(data.get("mutations_coverage") or 0.0),
-        "killed": int(data.get("mutants_killed") or 0),
-        "lived": int(data.get("mutants_lived") or 0),
-        "not_covered": int(data.get("mutants_not_covered") or 0),
-        "not_viable": int(data.get("mutants_not_viable") or 0),
-        "total": int(data.get("mutants_total") or 0),
+        'efficacy': float(data.get('test_efficacy') or 0.0),
+        'mutant_coverage': float(data.get('mutations_coverage') or 0.0),
+        'killed': int(data.get('mutants_killed') or 0),
+        'lived': int(data.get('mutants_lived') or 0),
+        'not_covered': int(data.get('mutants_not_covered') or 0),
+        'not_viable': int(data.get('mutants_not_viable') or 0),
+        'total': int(data.get('mutants_total') or 0),
         # gremlins-merge.py's attempt mode; absent reads as per-package.
-        "mode": data.get("mode") or "per-package",
+        'mode': data.get('mode') or 'per-package',
     }
     return muts, summary
 
@@ -235,8 +238,8 @@ def aggregate(attempt_files: list[Path | dict]) -> dict:
         flaky:           list of mutant detail dicts (LIVED in some, KILLED in others)
         live_count:      len(confirmed_live)
     """
-    runs = []        # list of normalised mutant lists, one per parseable attempt
-    summaries = []   # gremlins' own per-attempt efficacy/coverage/counts
+    runs = []  # list of normalised mutant lists, one per parseable attempt
+    summaries = []  # gremlins' own per-attempt efficacy/coverage/counts
     for f in attempt_files:
         loaded = parse_run(f) if isinstance(f, dict) else load_run(f)
         if loaded is None:
@@ -247,15 +250,15 @@ def aggregate(attempt_files: list[Path | dict]) -> dict:
 
     if not runs:
         return {
-            "attempts": 0,
-            "per_attempt": [],
-            "efficacy_mean": 0.0,
-            "efficacy_stddev": 0.0,
-            "mutant_coverage_mean": 0.0,
-            "live_buckets": {},
-            "live_count": 0,
-            "n_runs": 0,
-            "mode": "per-package",
+            'attempts': 0,
+            'per_attempt': [],
+            'efficacy_mean': 0.0,
+            'efficacy_stddev': 0.0,
+            'mutant_coverage_mean': 0.0,
+            'live_buckets': {},
+            'live_count': 0,
+            'n_runs': 0,
+            'mode': 'per-package',
         }
 
     # Per-run figures come straight from gremlins' own top-level fields, so the
@@ -266,28 +269,30 @@ def aggregate(attempt_files: list[Path | dict]) -> dict:
     # excluded, not folded into killed (gremlins internal/report).
     per_attempt = []
     for s in summaries:
-        per_attempt.append({
-            "killed": s["killed"],
-            "lived": s["lived"],
-            "not_covered": s["not_covered"],
-            "not_viable": s["not_viable"],
-            "runnable": s["killed"] + s["lived"],
-            "efficacy": round(s["efficacy"], 1),
-            "mutant_coverage": round(s["mutant_coverage"], 1),
-        })
+        per_attempt.append(
+            {
+                'killed': s['killed'],
+                'lived': s['lived'],
+                'not_covered': s['not_covered'],
+                'not_viable': s['not_viable'],
+                'runnable': s['killed'] + s['lived'],
+                'efficacy': round(s['efficacy'], 1),
+                'mutant_coverage': round(s['mutant_coverage'], 1),
+            }
+        )
 
-    efficacies = [a["efficacy"] for a in per_attempt]
+    efficacies = [a['efficacy'] for a in per_attempt]
     eff_mean = round(statistics.mean(efficacies), 1)
     eff_stddev = round(statistics.pstdev(efficacies), 1) if len(efficacies) > 1 else 0.0
-    cov_mean = round(statistics.mean([a["mutant_coverage"] for a in per_attempt]), 1)
+    cov_mean = round(statistics.mean([a['mutant_coverage'] for a in per_attempt]), 1)
 
     by_key: dict[tuple, dict] = {}
     for run in runs:
         for m in run:
             k = mutant_key(m)
             if k not in by_key:
-                by_key[k] = {"statuses": [], "detail": m}
-            by_key[k]["statuses"].append((m.get("status") or "").upper())
+                by_key[k] = {'statuses': [], 'detail': m}
+            by_key[k]['statuses'].append((m.get('status') or '').upper())
 
     # Bucket every mutant that LIVED at least once by its lived-frequency.
     # Rare flakes (LIVED 1/N) are the most actionable — a test that USUALLY
@@ -297,28 +302,27 @@ def aggregate(attempt_files: list[Path | dict]) -> dict:
     n_runs = len(runs)
     live_buckets: dict[int, list[dict]] = {i: [] for i in range(1, n_runs + 1)}
     for entry in by_key.values():
-        statuses = entry["statuses"]
-        lived_count = sum(1 for s in statuses if s == "LIVED")
+        statuses = entry['statuses']
+        lived_count = sum(1 for s in statuses if s == 'LIVED')
         if lived_count >= 1:
-            entry["detail"]["_lived_count"] = lived_count
-            entry["detail"]["_runs_seen"] = len(statuses)
-            live_buckets[lived_count].append(entry["detail"])
+            entry['detail']['_lived_count'] = lived_count
+            entry['detail']['_runs_seen'] = len(statuses)
+            live_buckets[lived_count].append(entry['detail'])
 
     total_live = sum(len(v) for v in live_buckets.values())
-    modes = {s["mode"] for s in summaries}
+    modes = {s['mode'] for s in summaries}
 
     return {
-        "attempts": len(runs),
-        "per_attempt": per_attempt,
-        "efficacy_mean": eff_mean,
-        "efficacy_stddev": eff_stddev,
-        "mutant_coverage_mean": cov_mean,
-        "live_buckets": live_buckets,    # {lived_count: [mutant detail, ...]}
-        "live_count": total_live,
-        "n_runs": n_runs,
-        "mode": modes.pop() if len(modes) == 1 else "mixed",
+        'attempts': len(runs),
+        'per_attempt': per_attempt,
+        'efficacy_mean': eff_mean,
+        'efficacy_stddev': eff_stddev,
+        'mutant_coverage_mean': cov_mean,
+        'live_buckets': live_buckets,  # {lived_count: [mutant detail, ...]}
+        'live_count': total_live,
+        'n_runs': n_runs,
+        'mode': modes.pop() if len(modes) == 1 else 'mixed',
     }
-
 
 
 HEADER_TPL = """# Gremlins mutation testing tracker
@@ -394,13 +398,15 @@ Add anything below — won't be touched by the auto-updater.
 def render_mutant_section(name: str, mutants: list[dict], cap: int) -> tuple[str, int]:
     """Group mutants by file, render as collapsible section. Returns (markdown, overflow_count)."""
     if not mutants:
-        return "", 0
+        return '', 0
     # Group by file, sort within file by line.
     by_file: dict[str, list[dict]] = defaultdict(list)
     for m in mutants:
         by_file[file_of(m)].append(m)
     for f in by_file:
-        by_file[f].sort(key=lambda m: (m.get("position") or m.get("relative_position") or {}).get("row") or 0)
+        by_file[f].sort(
+            key=lambda m: (m.get('position') or m.get('relative_position') or {}).get('row') or 0
+        )
 
     rendered = 0
     overflow = 0
@@ -409,19 +415,21 @@ def render_mutant_section(name: str, mutants: list[dict], cap: int) -> tuple[str
         if rendered >= cap:
             overflow += len(by_file[file])
             continue
-        parts.append(f"### `{file}`")
+        parts.append(f'### `{file}`')
         for m in by_file[file]:
             if rendered >= cap:
                 overflow += 1
                 continue
-            parts.append(f"- {mutant_label(m)}")
+            parts.append(f'- {mutant_label(m)}')
             rendered += 1
-        parts.append("")
-    body = "\n".join(parts).rstrip()
+        parts.append('')
+    body = '\n'.join(parts).rstrip()
     return LIVE_DETAILS_TPL.format(summary=name, count=len(mutants), body=body), overflow
 
 
-def render_bucketed_live_mutants(buckets: dict[int, list[dict]], n_runs: int, cap: int) -> tuple[str, int]:
+def render_bucketed_live_mutants(
+    buckets: dict[int, list[dict]], n_runs: int, cap: int
+) -> tuple[str, int]:
     """Render frequency-bucketed live mutants, rare-first.
 
     Bucket order:
@@ -442,41 +450,45 @@ def render_bucketed_live_mutants(buckets: dict[int, list[dict]], n_runs: int, ca
             continue
 
         if n == n_runs:
-            label = f"Solid gap — LIVED in all {n_runs} runs (known coverage hole)"
-            open_attr = ""
+            label = f'Solid gap — LIVED in all {n_runs} runs (known coverage hole)'
+            open_attr = ''
         elif n == 1:
-            label = f"Rare flake — LIVED in 1 of {n_runs} runs (test usually catches it)"
-            open_attr = " open"
+            label = f'Rare flake — LIVED in 1 of {n_runs} runs (test usually catches it)'
+            open_attr = ' open'
         else:
-            label = f"Weakly flaky — LIVED in {n} of {n_runs} runs"
-            open_attr = ""
+            label = f'Weakly flaky — LIVED in {n} of {n_runs} runs'
+            open_attr = ''
 
         by_file: dict[str, list[dict]] = defaultdict(list)
         for m in mutants:
             by_file[file_of(m)].append(m)
         for f in by_file:
-            by_file[f].sort(key=lambda m: (m.get("position") or m.get("relative_position") or {}).get("row") or 0)
+            by_file[f].sort(
+                key=lambda m: (
+                    (m.get('position') or m.get('relative_position') or {}).get('row') or 0
+                )
+            )
 
         body_parts = []
         for file in sorted(by_file):
             if remaining_cap <= 0:
                 overflow_total += len(by_file[file])
                 continue
-            body_parts.append(f"### `{file}`")
+            body_parts.append(f'### `{file}`')
             for m in by_file[file]:
                 if remaining_cap <= 0:
                     overflow_total += 1
                     continue
-                body_parts.append(f"- {mutant_label(m)}")
+                body_parts.append(f'- {mutant_label(m)}')
                 remaining_cap -= 1
-            body_parts.append("")
+            body_parts.append('')
 
-        body_md = "\n".join(body_parts).rstrip()
+        body_md = '\n'.join(body_parts).rstrip()
         parts.append(
-            f"<details{open_attr}>\n<summary>{label} — {len(mutants)}</summary>\n\n{body_md}\n\n</details>\n"
+            f'<details{open_attr}>\n<summary>{label} — {len(mutants)}</summary>\n\n{body_md}\n\n</details>\n'
         )
 
-    return "\n".join(parts), overflow_total
+    return '\n'.join(parts), overflow_total
 
 
 def row_cell(cells: list[str], index: int, absent: str) -> str:
@@ -484,14 +496,14 @@ def row_cell(cells: list[str], index: int, absent: str) -> str:
 
     An older row may carry its run marker at that index instead.
     """
-    if len(cells) > index and not cells[index].startswith("<!--"):
+    if len(cells) > index and not cells[index].startswith('<!--'):
         return cells[index].split()[0]
     return absent
 
 
 def row_mode(cells: list[str]) -> str:
     """A history row's mode; a row without a Mode cell reads as per-package."""
-    return row_cell(cells, 6, "per-package")
+    return row_cell(cells, 6, 'per-package')
 
 
 def row_mutators(cells: list[str]) -> str:
@@ -500,12 +512,12 @@ def row_mutators(cells: list[str]) -> str:
     configs/gremlins.yaml nested its mutants block under unleash until the
     Mutators column existed, so gremlins ran only its default types.
     """
-    return row_cell(cells, 7, "default")
+    return row_cell(cells, 7, 'default')
 
 
 def switch_cell(now: str, before: str | None, expected: str) -> str:
     """A Mode or Mutators cell, marking the week its value changed."""
-    return now if before is None else f"{now} (switched from {before}; {expected})"
+    return now if before is None else f'{now} (switched from {before}; {expected})'
 
 
 def measurement_cautions(
@@ -528,41 +540,41 @@ def measurement_cautions(
     lines = []
     if switched_from:
         lines.append(
-            f"> 🔀 **Mode switched from {switched_from} to {agg['mode']}.** The mutants run and "
-            "the tests they run against changed, so a score jump this week is expected. The trend "
-            "and the `mutation-regression` label compare only weeks run in the same mode."
+            f'> 🔀 **Mode switched from {switched_from} to {agg["mode"]}.** The mutants run and '
+            'the tests they run against changed, so a score jump this week is expected. The trend '
+            'and the `mutation-regression` label compare only weeks run in the same mode.'
         )
     if mutators_from:
         lines.append(
-            f"> 🔀 **Mutators switched from {mutators_from} to {mutators}.** gremlins ran other "
-            "mutant types, so efficacy and mutant counts shift this week. The trend and the "
-            "`mutation-regression` label compare only weeks run with the same mutators."
+            f'> 🔀 **Mutators switched from {mutators_from} to {mutators}.** gremlins ran other '
+            'mutant types, so efficacy and mutant counts shift this week. The trend and the '
+            '`mutation-regression` label compare only weeks run with the same mutators.'
         )
-    n = agg["n_runs"]
-    unstable = sum(len(v) for k, v in (agg["live_buckets"] or {}).items() if 0 < k < n)
+    n = agg['n_runs']
+    unstable = sum(len(v) for k, v in (agg['live_buckets'] or {}).items() if 0 < k < n)
     if n > 1 and unstable:
         lines.append(
-            f"> ⚠️ **Verdicts disagree across attempts.** {unstable} mutant"
-            f"{'' if unstable == 1 else 's'} came back LIVED in some of the {n} runs and KILLED in "
-            "others, so one verdict per disagreement is false and the mean is partly noise. Either a "
-            "flaky test, or cross-worker interference in the runner — gremlins workers share one "
-            "`/tmp`, so a test bound to a fixed absolute path can delete a marker another worker is "
-            "polling for (the weekly runner probes for that and drops to `--workers 1` when it "
-            "reproduces). Equivalent mutants cannot all be killed, so a 100% attempt next to a "
-            "survivor in another attempt is a measurement failure, not a perfect score."
+            f'> ⚠️ **Verdicts disagree across attempts.** {unstable} mutant'
+            f'{"" if unstable == 1 else "s"} came back LIVED in some of the {n} runs and KILLED in '
+            'others, so one verdict per disagreement is false and the mean is partly noise. Either a '
+            'flaky test, or cross-worker interference in the runner — gremlins workers share one '
+            '`/tmp`, so a test bound to a fixed absolute path can delete a marker another worker is '
+            'polling for (the weekly runner probes for that and drops to `--workers 1` when it '
+            'reproduces). Equivalent mutants cannot all be killed, so a 100% attempt next to a '
+            'survivor in another attempt is a measurement failure, not a perfect score.'
         )
     if (
-        agg["efficacy_mean"] >= 99.95
-        and agg["live_count"] == 0
+        agg['efficacy_mean'] >= 99.95
+        and agg['live_count'] == 0
         and prev_live_count is not None
         and prev_live_count > 0
         and not switched_from
         and not mutators_from
     ):
         lines.append(
-            f"> ⚠️ **A jump to 100% efficacy.** Last week reported {prev_live_count} live "
-            "mutant(s) and this week reports none. Absent a change to the tests, that is evidence of "
-            "a measurement failure rather than a fixed suite: equivalent mutants cannot all be "
+            f'> ⚠️ **A jump to 100% efficacy.** Last week reported {prev_live_count} live '
+            'mutant(s) and this week reports none. Absent a change to the tests, that is evidence of '
+            'a measurement failure rather than a fixed suite: equivalent mutants cannot all be '
             "killed. Check the run's per-attempt logs before believing the score."
         )
     return lines
@@ -572,24 +584,28 @@ def build_body(
     repo: str, week: str, agg: dict, run_url: str, existing: str, mutators: str
 ) -> tuple[str, bool]:
     """Returns (new_body, regression_flag); mutators is this run's mutators_label."""
-    eff_mean = agg["efficacy_mean"]
-    eff_stddev = agg["efficacy_stddev"]
-    cov_mean = agg["mutant_coverage_mean"]
-    live_count = agg["live_count"]
+    eff_mean = agg['efficacy_mean']
+    eff_stddev = agg['efficacy_stddev']
+    cov_mean = agg['mutant_coverage_mean']
+    live_count = agg['live_count']
 
-    new_row = f"| {week} | {eff_mean}% | ±{eff_stddev}% | {cov_mean}% | {live_count} |"
+    new_row = f'| {week} | {eff_mean}% | ±{eff_stddev}% | {cov_mean}% | {live_count} |'
     run_id = trackerlib.run_id_of(run_url)
     history_rows = trackerlib.history_rows(existing, HISTORY_SENTINEL, run_id)
-    mode = agg["mode"]
+    mode = agg['mode']
     prev_mode = row_mode(history_rows[0]) if history_rows else mode
     switched_from = prev_mode if prev_mode != mode else None
     prev_mutators = row_mutators(history_rows[0]) if history_rows else mutators
     mutators_from = prev_mutators if prev_mutators != mutators else None
     history_block = trackerlib.update_history_block(
-        existing, HISTORY_SENTINEL, HISTORY_HEADER, new_row, run_id,
+        existing,
+        HISTORY_SENTINEL,
+        HISTORY_HEADER,
+        new_row,
+        run_id,
         after_delta=(
-            switch_cell(mode, switched_from, "score jump expected"),
-            switch_cell(mutators, mutators_from, "score shift expected"),
+            switch_cell(mode, switched_from, 'score jump expected'),
+            switch_cell(mutators, mutators_from, 'score shift expected'),
         ),
     )
 
@@ -623,47 +639,55 @@ def build_body(
 
     trend_line = trackerlib.trend_marker(eff_mean, history_means)
     cautions = measurement_cautions(
-        agg, prev_live_count,
-        switched_from=switched_from, mutators=mutators, mutators_from=mutators_from,
+        agg,
+        prev_live_count,
+        switched_from=switched_from,
+        mutators=mutators,
+        mutators_from=mutators_from,
     )
-    caution_lines = ("\n" + "\n".join(cautions) + "\n") if cautions else "\n"
+    caution_lines = ('\n' + '\n'.join(cautions) + '\n') if cautions else '\n'
 
     live_block_inner, overflow = render_bucketed_live_mutants(
-        agg["live_buckets"], agg["n_runs"], MAX_LIVE_MUTANTS_INLINE
+        agg['live_buckets'], agg['n_runs'], MAX_LIVE_MUTANTS_INLINE
     )
     overflow_block = (
-        f"\n_… and {overflow} more in the [full report]({run_url}#artifacts)._\n"
-        if overflow else ""
+        f'\n_… and {overflow} more in the [full report]({run_url}#artifacts)._\n'
+        if overflow
+        else ''
     )
 
     if not live_block_inner:
-        live_block = "## Current live mutants\n<!-- live-mutants -->\nNone — every mutant killed by the test suite this week. 🎉\n<!-- /live-mutants -->"
+        live_block = '## Current live mutants\n<!-- live-mutants -->\nNone — every mutant killed by the test suite this week. 🎉\n<!-- /live-mutants -->'
     else:
         live_block = (
-            f"## Current live mutants ({live_count}, this week)\n"
-            f"<!-- live-mutants -->\n"
-            f"{live_block_inner}{overflow_block}\n"
-            f"<!-- /live-mutants -->"
+            f'## Current live mutants ({live_count}, this week)\n'
+            f'<!-- live-mutants -->\n'
+            f'{live_block_inner}{overflow_block}\n'
+            f'<!-- /live-mutants -->'
         )
 
     header = HEADER_TPL.format(
         week_ending=week,
         eff_mean=eff_mean,
         eff_stddev=eff_stddev,
-        attempts=agg["attempts"],
+        attempts=agg['attempts'],
         cov_mean=cov_mean,
         live_count=live_count,
-        plural="" if live_count == 1 else "s",
+        plural='' if live_count == 1 else 's',
         trend_line=trend_line,
         caution_lines=caution_lines,
     )
 
     body = (
         header
-        + history_block + "\n\n"
-        + live_block + "\n\n"
-        + LEGEND.rsplit("\n## Free-form notes", 1)[0]
-        + "\n## Free-form notes\n\n" + trackerlib.preserve_notes(existing) + "\n"
+        + history_block
+        + '\n\n'
+        + live_block
+        + '\n\n'
+        + LEGEND.rsplit('\n## Free-form notes', 1)[0]
+        + '\n## Free-form notes\n\n'
+        + trackerlib.preserve_notes(existing)
+        + '\n'
     )
 
     regression = trackerlib.regression(eff_mean, history_means, REGRESSION_THRESHOLD_PCT)
@@ -677,59 +701,83 @@ def merged_attempt(repo: str, attempt: str, shards: list[tuple[dict, Path]]) -> 
     An attempt missing a shard, or with a shard that failed, would publish the
     score of part of the module, so it is skipped like a failed attempt.
     """
-    where = f"[{repo}] attempt {attempt}"
-    counts = sorted({str(meta.get("shards")) for meta, _ in shards})
-    indices = sorted(str(meta.get("shard")) for meta, _ in shards)
+    where = f'[{repo}] attempt {attempt}'
+    counts = sorted({str(meta.get('shards')) for meta, _ in shards})
+    indices = sorted(str(meta.get('shard')) for meta, _ in shards)
     k = counts[0] if len(counts) == 1 and counts[0].isdigit() else None
     if k is None or indices != sorted(str(n) for n in range(1, int(k) + 1)):
-        print(f"::warning::{where} has shards {indices} of {'/'.join(counts)}, so it is skipped",
-              file=sys.stderr)
+        mutation_cost.annotate(
+            'warning', t'{where} has shards {indices} of {"/".join(counts)}, so it is skipped'
+        )
         return None
     docs = []
-    for meta, path in sorted(shards, key=lambda s: int(s[0]["shard"])):
+    for meta, path in sorted(shards, key=lambda s: int(s[0]['shard'])):
         try:
             doc = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+        except OSError, json.JSONDecodeError:
             doc = None
-        if not isinstance(doc, dict) or "files" not in doc:
-            print(f"::warning::{where} shard {meta['shard']} has no result, so it is skipped",
-                  file=sys.stderr)
+        if not isinstance(doc, dict) or 'files' not in doc:
+            mutation_cost.annotate(
+                'warning', t'{where} shard {meta["shard"]} has no result, so it is skipped'
+            )
             return None
         docs.append(doc)
     try:
         return gremlins_merge.merge_shards(docs)
     except SystemExit as exc:
-        print(f"::warning::{where} is skipped: {exc}", file=sys.stderr)
+        mutation_cost.annotate('warning', t'{where} is skipped: {exc}')
         return None
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Aggregate weekly gremlins runs into the tracker issue body.")
-    p.add_argument("--repo", required=True, help="repo name without owner")
-    p.add_argument("--artifacts-dir", required=True, type=Path)
-    p.add_argument("--week", required=True, help="YYYY-MM-DD")
-    p.add_argument("--run-url", required=True, help="Workflow run URL for artifact link")
-    p.add_argument("--existing-body-file", type=Path, default=None,
-                   help="Path to existing issue body (or omit if creating fresh)")
-    p.add_argument("--regression-marker-file", type=Path, default=None,
-                   help="Write 'true' or 'false' here for the workflow to read")
-    p.add_argument("--badge-file", type=Path, default=None,
-                   help="Write a shields `endpoint` JSON (label 'mutation', "
-                        # Escaped: argparse validates help strings as %-format
-                        # templates (3.14+ raises ValueError on a bare %).
-                        "message '<efficacy_mean>%%') here for the README badge")
-    p.add_argument("--attempts-marker-file", type=Path, default=None,
-                   help="Write the count of parseable attempts here. The "
-                        "workflow reads it to skip publishing for a repo whose "
-                        "every attempt failed (0) instead of emitting a 0%% badge.")
-    p.add_argument("--config", type=Path, default=CENTRAL_CONFIG,
-                   help="the .gremlins.yaml the attempts ran under. Its mutator set keys "
-                        "the baseline (default: this checkout's configs/gremlins.yaml)")
+    p = argparse.ArgumentParser(
+        description='Aggregate weekly gremlins runs into the tracker issue body.'
+    )
+    p.add_argument('--repo', required=True, help='repo name without owner')
+    p.add_argument('--artifacts-dir', required=True, type=Path)
+    p.add_argument('--week', required=True, help='YYYY-MM-DD')
+    p.add_argument('--run-url', required=True, help='Workflow run URL for artifact link')
+    p.add_argument(
+        '--existing-body-file',
+        type=Path,
+        default=None,
+        help='Path to existing issue body (or omit if creating fresh)',
+    )
+    p.add_argument(
+        '--regression-marker-file',
+        type=Path,
+        default=None,
+        help="Write 'true' or 'false' here for the workflow to read",
+    )
+    p.add_argument(
+        '--badge-file',
+        type=Path,
+        default=None,
+        help="Write a shields `endpoint` JSON (label 'mutation', "
+        # Escaped: argparse validates help strings as %-format
+        # templates (3.14+ raises ValueError on a bare %).
+        "message '<efficacy_mean>%%') here for the README badge",
+    )
+    p.add_argument(
+        '--attempts-marker-file',
+        type=Path,
+        default=None,
+        help='Write the count of parseable attempts here. The '
+        'workflow reads it to skip publishing for a repo whose '
+        'every attempt failed (0) instead of emitting a 0%% badge.',
+    )
+    p.add_argument(
+        '--config',
+        type=Path,
+        default=CENTRAL_CONFIG,
+        help='the .gremlins.yaml the attempts ran under. Its mutator set keys '
+        "the baseline (default: this checkout's configs/gremlins.yaml)",
+    )
     args = p.parse_args()
     try:
         mutators = mutators_label(enabled_mutators(load_config(args.config.read_text())))
     except (OSError, yaml.YAMLError) as e:
-        print(f"::error::gremlins-aggregate: cannot read {args.config}: {e}", file=sys.stderr)
+        print(f'::error::gremlins-aggregate: cannot read {args.config}: {e}', file=sys.stderr)
         return 1
 
     # Attempts are matched by the meta.json each artifact carries, and searched at
@@ -741,51 +789,55 @@ def main() -> int:
     # cannot be attributed to a repo, so it is skipped rather than guessed at.
     attempt_files: list[Path | dict] = []
     sharded: dict[str, list[tuple[dict, Path]]] = {}
-    for out_path in sorted(args.artifacts_dir.rglob("gremlins-out.json")):
+    for out_path in sorted(args.artifacts_dir.rglob('gremlins-out.json')):
         try:
-            meta = json.loads((out_path.parent / "meta.json").read_text())
-        except (OSError, json.JSONDecodeError):
-            print(f"[{args.repo}] no readable meta.json beside {out_path}; skipping",
-                  file=sys.stderr)
+            meta = json.loads((out_path.parent / 'meta.json').read_text())
+        except OSError, json.JSONDecodeError:
+            mutation_cost.say(
+                t'[{args.repo}] no readable meta.json beside {str(out_path)}; skipping'
+            )
             continue
-        if meta.get("repo") != args.repo:
+        if meta.get('repo') != args.repo:
             continue
-        if "shards" in meta:
-            sharded.setdefault(str(meta.get("attempt")), []).append((meta, out_path))
+        if 'shards' in meta:
+            sharded.setdefault(str(meta.get('attempt')), []).append((meta, out_path))
         else:
             attempt_files.append(out_path)
     for attempt in sorted(sharded):
         merged = merged_attempt(args.repo, attempt, sharded[attempt])
         if merged is not None:
             attempt_files.append(merged)
-    print(f"[{args.repo}] found {len(attempt_files)} attempt files", file=sys.stderr)
+    print(f'[{args.repo}] found {len(attempt_files)} attempt files', file=sys.stderr)
 
     agg = aggregate(attempt_files)
-    print(f"[{args.repo}] efficacy={agg['efficacy_mean']}±{agg['efficacy_stddev']} "
-          f"cov={agg['mutant_coverage_mean']} live={agg['live_count']} "
-          f"attempts={agg['attempts']} mode={agg['mode']} "
-          f"buckets={ {k: len(v) for k, v in agg['live_buckets'].items()} }",
-          file=sys.stderr)
+    mutation_cost.say(
+        t'[{args.repo}] efficacy={agg["efficacy_mean"]}±{agg["efficacy_stddev"]} '
+        t'cov={agg["mutant_coverage_mean"]} live={agg["live_count"]} '
+        t'attempts={agg["attempts"]} mode={agg["mode"]} '
+        t'buckets={ {k: len(v) for k, v in agg["live_buckets"].items()} }',
+    )
 
     if args.attempts_marker_file:
-        args.attempts_marker_file.write_text(str(agg["attempts"]))
+        args.attempts_marker_file.write_text(str(agg['attempts']))
 
     # Emit the README badge endpoint JSON (one line) if requested. Skipped when
     # there were no parseable attempts, so a failed run never overwrites a good
     # badge with "0%".
-    if args.badge_file and agg["attempts"] > 0:
-        eff = agg["efficacy_mean"]
+    if args.badge_file and agg['attempts'] > 0:
+        eff = agg['efficacy_mean']
         badge = {
-            "schemaVersion": 1,
-            "label": "mutation",
-            "message": f"{eff}%",
-            "color": badge_color(eff),
+            'schemaVersion': 1,
+            'label': 'mutation',
+            'message': f'{eff}%',
+            'color': badge_color(eff),
         }
         args.badge_file.write_text(json.dumps(badge))
-        print(f"[{args.repo}] wrote badge {args.badge_file}: {eff}% ({badge['color']})",
-              file=sys.stderr)
+        print(
+            f'[{args.repo}] wrote badge {args.badge_file}: {eff}% ({badge["color"]})',
+            file=sys.stderr,
+        )
 
-    existing = ""
+    existing = ''
     if args.existing_body_file and args.existing_body_file.exists():
         existing = args.existing_body_file.read_text()
 
@@ -793,10 +845,10 @@ def main() -> int:
     print(body)
 
     if args.regression_marker_file:
-        args.regression_marker_file.write_text("true" if regression else "false")
+        args.regression_marker_file.write_text('true' if regression else 'false')
 
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    sys.exit(mutation_cost.run_main(main))

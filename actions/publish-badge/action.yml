@@ -7,7 +7,7 @@ description: >-
   it as cplieger/ci/actions/publish-badge@<sha> for size.json: a composite
   action MUST be pinned by ref (a local ./ path would resolve against the
   consumer's checkout and 404); Renovate keeps the pin current.
-  weekly-gremlins.yaml and weekly-stryker.yaml run the script directly.
+  mutation-gremlins-repo.yaml and mutation-stryker-repo.yaml run the script directly.
 
 inputs:
   repo:
