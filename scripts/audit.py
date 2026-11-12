@@ -177,9 +177,7 @@ FOOTER_DISCLAIMER = (
     'fitness for production environments. Use at your own risk.'
 )
 FOOTER_AI_NOTE = (
-    'This project was built with AI-assisted tooling using '
-    '[Claude](https://claude.com), [GPT](https://openai.com), and '
-    '[Kiro](https://kiro.dev). The human maintainer defines architecture, '
+    'This project was built with AI assistance. The human maintainer defines architecture, '
     'supervises implementation, and makes all final decisions.'
 )
 # The pair the Docker Hub overview renderer (actions/render-hub-overview)
