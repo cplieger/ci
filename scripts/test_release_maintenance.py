@@ -709,6 +709,42 @@ class Blockers(unittest.TestCase):
                     '#23 (security, `renovate/main-y-vulnerability`) is still open. It was due by '
                     '2026-10-10 12:59 UTC. Its labels allow no automatic merge, so it waits for you.'
                 ),
+                '#24 (expedited update, `renovate/main-z`) is still open. It was due by 2026-10-10 12:59 UTC.',
+            ],
+        )
+
+    def test_an_update_outside_the_group_gets_three_hours_even_in_the_saturday_window(self):
+        head = 'renovate/main-ghcr.io-actions-actions-runner-2.x'
+        # 02:00 UTC is 04:00 in Paris, inside the weekly group's Saturday window.
+        prs = [
+            pr(30, head, created='2026-10-10T09:00:00Z'),
+            pr(31, head, created='2026-10-10T02:00:00Z'),
+        ]
+        due_30 = (
+            f'#30 (expedited update, `{head}`) is still open. It was due by 2026-10-10 12:00 UTC.'
+        )
+        due_31 = (
+            f'#31 (expedited update, `{head}`) is still open. It was due by 2026-10-10 05:00 UTC.'
+        )
+        row, _ = plan(world(**{OPEN: prs}), now=dt.datetime(2026, 10, 10, 11, 59, tzinfo=dt.UTC))
+        self.assertEqual((row['blockers']['weekly'], row['blockers']['late']), ([], [due_31]))
+        row, _ = plan(world(**{OPEN: prs}))
+        self.assertEqual(
+            (row['blockers']['weekly'], row['blockers']['late']), ([], [due_30, due_31])
+        )
+
+    def test_a_merged_update_outside_the_group_with_no_release_since_is_a_blocker(self):
+        head = 'renovate/main-ghcr.io-actions-actions-runner-2.x'
+        merged = pr(32, head, created='2026-10-10T08:00:00Z', merged='2026-10-10T08:30:00Z')
+        row, _ = plan(world(**{CLOSED: [merged]}))
+        self.assertEqual((row['errors'], row['blockers']['weekly']), ([], []))
+        self.assertEqual(
+            row['blockers']['late'],
+            [
+                (
+                    f'#32 (expedited update, `{head}`) merged at 2026-10-10 08:30 UTC, and no release '
+                    'run on `main` has succeeded since. It was due by 2026-10-10 11:00 UTC.'
+                )
             ],
         )
 
