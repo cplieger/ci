@@ -168,6 +168,7 @@ class RunnerInput(unittest.TestCase):
 
     def test_each_synced_caller_passes_only_inputs_its_pinned_callee_declares(self):
         calls = 0
+        callers = {}
         for path in sorted(TEMPLATES.glob('*.yml')):
             for job, spec in load(path)['jobs'].items():
                 m = PINNED_CALL.match(spec.get('uses', ''))
@@ -178,7 +179,11 @@ class RunnerInput(unittest.TestCase):
                 with self.subTest(template=path.name, job=job):
                     declared = self.pinned_inputs(m.group(2), m.group(1))
                     self.assertLessEqual(set(given), set(declared))
+                    if m.group(1) in TAKES_RUNNER:
+                        callers[m.group(1)] = path.name
+                        self.assertEqual(given.get('runner'), '${{ vars.CI_RUNNER }}')
         self.assertGreaterEqual(calls, 4)
+        self.assertEqual(callers, {'ci.yaml': 'ci.yml', 'security-scan.yaml': 'security.yml'})
 
 
 class Routing(unittest.TestCase):

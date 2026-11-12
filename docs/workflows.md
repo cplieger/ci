@@ -45,7 +45,7 @@ The integration tests run when that build passes and the repository has a root `
 
 ## Choosing the runner
 
-`ci.yaml`, `security-scan.yaml` and the four workflows `ci.yaml` calls (`go-ci.yaml`, `ts-ci.yaml`, `shell-ci.yaml` and `deadset-ci.yaml`) take a `runner` input, a runner label that is empty by default. Empty runs every job on `ubuntu-26.04`. `ci.yaml` passes its input on to the workflows it calls.
+`ci.yaml`, `security-scan.yaml` and the four workflows `ci.yaml` calls (`go-ci.yaml`, `ts-ci.yaml`, `shell-ci.yaml` and `deadset-ci.yaml`) take a `runner` input, a runner label that is empty by default. Empty runs every job on `ubuntu-26.04`. `ci.yaml` passes its input on to the workflows it calls, and the synced `ci.yml` and `security.yml` pass the repository's `CI_RUNNER` variable, so setting that variable to a self-hosted runner's label moves the repository's jobs there, and deleting it moves them back.
 
 These jobs stay on GitHub's runners whatever the input says:
 
