@@ -38,10 +38,10 @@ jobs:
   # A matrix or a job condition cannot read a file, so this job reads the
   # package's own settings once: its vitest shard count (`cplieger.vitestShards`,
   # which sync never writes) and its browsers (`cplieger.browsers`) for
-  # `validate` and `engines-floor`, and its `engines.node` floor for
-  # `engines-floor`. The values are the checked-out
-  # branch's, so they are untrusted: only what this script validated reaches
-  # the outputs.
+  # `validate` and `engines-floor`, its `engines.node` floor for
+  # `engines-floor`, and the Go test server both build before their tests
+  # (`sseFixture`). The values are the checked-out branch's, so they are
+  # untrusted: only what these scripts validated reaches the outputs.
   package:
     name: package settings
     runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
@@ -52,6 +52,9 @@ jobs:
       floor: ${{ steps.read.outputs.floor }}
       node: ${{ steps.read.outputs.node }}
       browsers: ${{ steps.read.outputs.browsers }}
+      sse-fixture: ${{ steps.fixture.outputs.dir }}
+      sse-fixture-tags: ${{ steps.fixture.outputs.tags }}
+      sse-fixture-sum: ${{ steps.fixture.outputs.sum }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -173,6 +176,98 @@ jobs:
             }
         run: node -e "$READ_PACKAGE"
 
+      # The Go module of a test server the suite runs against (`sseFixture`,
+      # relative to package.json) and its `-tags` (`sseFixtureTags`). The
+      # directory and its go.sum (empty when absent) are output as real paths
+      # relative to the checkout, where setup-go resolves its inputs, so no
+      # symlink leads a later step outside.
+      - name: Read sseFixture and sseFixtureTags
+        id: fixture
+        env:
+          PACKAGE: ${{ inputs.working-directory }}/package.json
+          READ_FIXTURE: |
+            const { appendFileSync, readFileSync, realpathSync, statSync } = require("node:fs");
+            const { dirname, isAbsolute, join, relative, resolve, sep } = require("node:path");
+            const shown = process.env.PACKAGE;
+            const fail = (why) => {
+              console.error(`::error::${shown}: ${why.replace(/[\r\n]+/g, " ")}`);
+              process.exit(1);
+            };
+            const root = resolve(process.env.GITHUB_WORKSPACE);
+            const pkgPath = resolve(root, shown);
+            let pkg;
+            try { pkg = JSON.parse(readFileSync(pkgPath, "utf8")); }
+            catch (err) { fail(`cannot read the package settings: ${err.message}`); }
+            const own = (key) => pkg !== null && typeof pkg === "object" && Object.hasOwn(pkg, key);
+            const out = (dir, tags, sum) =>
+              appendFileSync(process.env.GITHUB_OUTPUT, `dir=${dir}\ntags=${tags}\nsum=${sum}\n`);
+            if (!own("sseFixture")) {
+              if (own("sseFixtureTags")) {
+                fail("sseFixtureTags is set without sseFixture: name the Go module directory to build, or drop the tags");
+              }
+              out("", "", "");
+              console.log("no sseFixture: no Go test server to build");
+              process.exit(0);
+            }
+            const dir = pkg.sseFixture;
+            const dirShown = JSON.stringify(dir).slice(0, 80);
+            const control = /[\x00-\x1f\x7f]/;
+            if (typeof dir !== "string" || dir === "" || isAbsolute(dir)) {
+              fail(`sseFixture is ${dirShown}: it must be a path relative to package.json, such as ".."`);
+            }
+            if (control.test(dir)) {
+              fail(`sseFixture is ${dirShown}: the path holds a control character`);
+            }
+            let tags = "";
+            if (own("sseFixtureTags")) {
+              tags = pkg.sseFixtureTags;
+              if (typeof tags !== "string" || !/^[A-Za-z0-9_,]+$/.test(tags)) {
+                const tagsShown = JSON.stringify(tags).slice(0, 60);
+                fail(`sseFixtureTags is ${tagsShown}: it must be Go build tags of letters, digits and underscores, separated by commas`);
+              }
+            }
+            const within = (base, p) => {
+              const rel = relative(base, p);
+              return !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
+            };
+            const wanted = resolve(dirname(pkgPath), dir);
+            if (!within(root, wanted)) {
+              fail(`sseFixture is ${dirShown}: it resolves outside the checkout`);
+            }
+            const realRoot = realpathSync(root);
+            let real;
+            try { real = realpathSync(wanted); }
+            catch (err) {
+              fail(`sseFixture is ${dirShown}: ${err.code === "ENOENT" ? "no such directory" : `cannot resolve it (${err.code})`}`);
+            }
+            if (!within(realRoot, real)) {
+              fail(`sseFixture is ${dirShown}: a symlink takes it outside the checkout`);
+            }
+            if (!statSync(real).isDirectory()) {
+              fail(`sseFixture is ${dirShown}: it is not a directory`);
+            }
+            let mod;
+            try { mod = realpathSync(join(real, "go.mod")); } catch { mod = null; }
+            if (mod !== null && !within(realRoot, mod)) {
+              fail(`sseFixture is ${dirShown}: its go.mod is a symlink outside the checkout`);
+            }
+            if (mod === null || !statSync(mod).isFile()) {
+              fail(`sseFixture is ${dirShown}: it holds no go.mod file`);
+            }
+            let sum;
+            try { sum = realpathSync(join(real, "go.sum")); } catch { sum = null; }
+            if (sum !== null && !within(realRoot, sum)) {
+              fail(`sseFixture is ${dirShown}: its go.sum is a symlink outside the checkout`);
+            }
+            const sumRel = sum !== null && statSync(sum).isFile() ? relative(realRoot, sum) : "";
+            const rel = relative(realRoot, real) || ".";
+            if (control.test(rel) || control.test(sumRel)) {
+              fail(`sseFixture is ${dirShown}: the directory's real path holds a control character`);
+            }
+            out(rel, tags, sumRel);
+            console.log(`sseFixture: building the Go module in ${rel} with -tags "${tags}"`);
+        run: node -e "$READ_FIXTURE"
+
   validate:
     needs: package
     # A name that is an expression gets no matrix suffix
@@ -260,6 +355,33 @@ jobs:
           else
             echo "no @vitest/browser-playwright devDependency; skipping browser install"
           fi
+
+      # The Go test server the package names in `sseFixture`, built for every
+      # shard and handed to the tests as SSE_FIXTURE. Setup, so outside the
+      # soft-gate block. setup-go's default cache key reads go.sum at the
+      # checkout root, which a nested module lacks, and a module with no go.sum
+      # gets no cache instead of a restore warning.
+      - name: Setup Go (sseFixture)
+        if: ${{ needs.package.outputs.sse-fixture != '' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ needs.package.outputs.sse-fixture }}/go.mod
+          cache: ${{ needs.package.outputs.sse-fixture-sum != '' }}
+          cache-dependency-path: ${{ needs.package.outputs.sse-fixture-sum }}
+
+      - name: Build the sseFixture test server
+        if: ${{ needs.package.outputs.sse-fixture != '' }}
+        timeout-minutes: 10
+        env:
+          FIXTURE_DIR: ${{ needs.package.outputs.sse-fixture }}
+          FIXTURE_TAGS: ${{ needs.package.outputs.sse-fixture-tags }}
+        run: |
+          cd "$GITHUB_WORKSPACE/$FIXTURE_DIR"
+          if ! go build -tags "$FIXTURE_TAGS" -o "$RUNNER_TEMP/sse-fixture" .; then
+            echo "::error::the sseFixture test server in ${FIXTURE_DIR} failed to build with -tags \"${FIXTURE_TAGS}\""
+            exit 1
+          fi
+          echo "SSE_FIXTURE=$RUNNER_TEMP/sse-fixture" >> "$GITHUB_ENV"
 
       # Soft-gate block: each step below runs to completion (continue-on-error)
       # and records its own name to /tmp/_ci_failures on failure; the final
@@ -679,6 +801,29 @@ jobs:
           else
             echo "no @vitest/browser-playwright devDependency; skipping browser install"
           fi
+
+      # The same Go test server build as validate's.
+      - name: Setup Go (sseFixture)
+        if: ${{ needs.package.outputs.sse-fixture != '' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ needs.package.outputs.sse-fixture }}/go.mod
+          cache: ${{ needs.package.outputs.sse-fixture-sum != '' }}
+          cache-dependency-path: ${{ needs.package.outputs.sse-fixture-sum }}
+
+      - name: Build the sseFixture test server
+        if: ${{ needs.package.outputs.sse-fixture != '' }}
+        timeout-minutes: 10
+        env:
+          FIXTURE_DIR: ${{ needs.package.outputs.sse-fixture }}
+          FIXTURE_TAGS: ${{ needs.package.outputs.sse-fixture-tags }}
+        run: |
+          cd "$GITHUB_WORKSPACE/$FIXTURE_DIR"
+          if ! go build -tags "$FIXTURE_TAGS" -o "$RUNNER_TEMP/sse-fixture" .; then
+            echo "::error::the sseFixture test server in ${FIXTURE_DIR} failed to build with -tags \"${FIXTURE_TAGS}\""
+            exit 1
+          fi
+          echo "SSE_FIXTURE=$RUNNER_TEMP/sse-fixture" >> "$GITHUB_ENV"
 
       # The same hand-off as validate's test step, without its soft gate.
       - name: Test (vitest) on the engines floor
