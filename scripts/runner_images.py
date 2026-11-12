@@ -5,7 +5,8 @@ plan --package ghcr.io/OWNER/APP-runner --channel dev|stable --tag TAG --sha SHA
     --date YYYY-MM-DD --created ISO8601 [--licenses JSON] [--default-licenses SPDX]: the images in
     build order as a JSON array, [] for none. promoted --package OWNER/APP-runner --source COMMIT
     --names JSON: {name: digest} when every image has a complete dev build of COMMIT, else {}.
-    bake --platform PLATFORM --context DIR < PLAN: a bake file building PLAN with no output.
+    bake --platform PLATFORM --context DIR --package ghcr.io/OWNER/APP-runner < PLAN: a bake file
+    loading PLAN into the daemon.
 """
 
 from __future__ import annotations
@@ -281,8 +282,9 @@ def promoted(package: str, source: str, names: list[str]) -> dict[str, str]:
     return found
 
 
-def bake(plan_json: str, platform: str, context: str) -> dict:
-    """Each image as a bake target with no output, a sibling it names built by its own target."""
+def bake(plan_json: str, platform: str, context: str, package: str) -> dict:
+    """Each image as a bake target loaded into the daemon under its moving and version tags in
+    package, a sibling it names built by its own target."""
     targets = {}
     for image in json.loads(plan_json):
         targets[image['name']] = {
@@ -294,7 +296,8 @@ def bake(plan_json: str, platform: str, context: str) -> dict:
                 a.split('=', 1) for a in image['build_args'] if a.startswith('PKG_REFRESH=')
             ),
             'contexts': {ref: f'target:{parent}' for ref, parent in image['parents'].items()},
-            'output': ['type=cacheonly'],
+            'tags': [f'{package}:{image["moving_tag"]}', f'{package}:{image["version_tag"]}'],
+            'output': ['type=docker'],
         }
     return {'group': {'default': {'targets': list(targets)}}, 'target': targets}
 
@@ -318,12 +321,17 @@ def main(argv: list[str] | None = None) -> int:
     bk = sub.add_parser('bake')
     bk.add_argument('--platform', required=True)
     bk.add_argument('--context', required=True)
+    bk.add_argument('--package', required=True)
     args = p.parse_args(argv)
     try:
         if args.cmd == 'plan':
             print(json.dumps(plan(Path.cwd(), args), separators=(',', ':')))
         elif args.cmd == 'bake':
-            print(json.dumps(bake(sys.stdin.read(), args.platform, args.context), indent=2))
+            print(
+                json.dumps(
+                    bake(sys.stdin.read(), args.platform, args.context, args.package), indent=2
+                )
+            )
         else:
             print(
                 json.dumps(
