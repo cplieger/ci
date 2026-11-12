@@ -19,7 +19,7 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | a `package.json` or `jsr.json` in the `web/` folder of a `go-nested` module | `ts-nested` | `ts-ci.yaml` once per such folder |
 | a `Dockerfile`, or a root `go.mod` or `jsr.json` and a tracked `.sh` file outside `node_modules`, `vendor`, `testdata` and `dist` | `shell` | `shell-ci.yaml`, with hadolint only when there is a `Dockerfile` |
 | any files | `deadset` | `deadset-ci.yaml` at the repository root, and, when the root has a `go.mod`, once per nested Go module folder with tracked Go files |
-| a `Dockerfile` | `docker`, `docker-arm64` | an image build on `amd64`, and on `arm64` in public repositories, with no push and no scan; the `docker` job also builds each `images/<name>/Dockerfile` beside the `Dockerfile` on `amd64` (the release's runner images, below) |
+| a `Dockerfile` | `docker`, `docker-arm64` | an image build on `amd64`, and on `arm64` in public repositories, with no push and no scan; the `docker` job also builds each `images/<name>/Dockerfile` beside the `Dockerfile` on `amd64` into the Docker daemon (the release's runner images, below). When that build passes and the repository has a root `go.mod` and a tracked `*_integration_test.go` file, the job then runs the root module's `go test -tags integration` |
 | `*.py` files | `python` | Ruff |
 | shell scripts or workflow files, and no `go.mod`, `jsr.json` or `Dockerfile` | `scripts` | shellcheck, shfmt, `tests/shell/run.sh` when the repository has one, yamllint, a TOML check, and the probe scripts present in the repository |
 | an `alerts/*.yaml` file | `alerts` | `promtool check rules` when `alerts/promql.yaml` exists, `promtool test rules` when `alerts/promql_test.yaml` exists, a LogQL parse of a copy of `alerts/logql.yaml` when that file exists, and, when `docs/monitoring.md` exists, a check that its alert table names exactly the alerts the rule files define |
@@ -38,6 +38,10 @@ A changed file outside every module folder keeps every module, unless its path e
 In `cplieger/ci` itself, a `go-os-canary` job runs `go-os-ci.yaml` over public Go modules that track Windows or macOS files, at fixed commits, on each runner detection selects for them. A change to that workflow or its pins that breaks a real module's Windows or macOS leg fails that job before a release carries it.
 
 After the `amd64` build, the `docker` job runs two optional image tests. The shared smoke harness runs when the repository has `tests/image-smoke.conf`. A repository's own `tests/image-test.sh` runs with the image reference as its first argument, and it must be committed as executable. The release workflow runs both again on the app image it builds, as [the release workflow](#the-release-workflow) describes.
+
+In a repository with runner images, the `docker` job then builds each one on `amd64` in the release's order. It loads each into the runner's Docker daemon as `ghcr.io/<owner>/<image>-runner:<name>-dev` and `<name>-ci`. A test therefore reads the images this commit builds, never a published copy.
+
+The integration tests run when that build passes and the repository has a root `go.mod` and a tracked `*_integration_test.go` file. The job sets up Go from that `go.mod` and runs `go test -tags integration -count=1 -timeout 45m ./...` at the root. They run whatever the app image's tests said, and they reach the daemon at `/var/run/docker.sock`. The job's time limit is 120 minutes with runner images and 15 minutes without. A repository with integration tests but no runner images does not run them here.
 
 ## Choosing the runner
 
@@ -150,7 +154,7 @@ On the dev channel it builds the image on native `amd64` and `arm64` runners and
 
 On the stable channel it re-tags the image the dev channel built for that commit as `vX.Y.Z`, `vX.Y`, `vX` and `latest`. It copies the image to Docker Hub with its signatures and creates the GitHub Release with its assets, described below. When it promotes a build, the Release's SBOM is the one that build signed into the image, read only once its signature checks out. When no dev build matches, it builds from source and says so in the run summary. It also writes the Docker Hub overview page from the README.
 
-The app image it builds, on either channel, then runs the `docker` job's two image tests in an `image-test` job, against the `amd64` digest the build pushed and before anything is tagged. The runner images described below do not run the repository's image tests. A failure, or a run cancelled before the tests pass, leaves that digest without a tag. A rebuild-only range relies on this: its pull request changes no file, so the `docker` job skipped it, and the base packages it refreshes are tested only here. The job has read access to packages only, so the repository's test scripts never run beside the build's write token.
+The app image it builds, on either channel, then runs the `docker` job's two image tests in an `image-test` job, against the `amd64` digest the build pushed and before anything is tagged. A failure, or a run cancelled before the tests pass, leaves that digest without a tag. A rebuild-only range relies on this: its pull request changes no file, so the `docker` job skipped it, and the base packages it refreshes are tested only here. The job has read access to packages only, so the repository's test scripts never run beside the build's write token. The release does not test the runner images described below. On a pull request, the `docker` job runs the repository's integration tests against them when it has some, as [the CI entry point](#the-ci-entry-point) describes.
 
 A stable image release carries these GitHub Release assets:
 

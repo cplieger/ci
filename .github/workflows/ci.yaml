@@ -700,7 +700,10 @@ jobs:
     needs: detect
     if: ${{ needs.detect.outputs.run_docker == 'true' }}
     runs-on: ubuntu-26.04
-    timeout-minutes: ${{ needs.detect.outputs.runner_images == 'true' && 60 || 15 }}
+    # With runner images the budget is the app image's 15, the release's 60 for the runner
+    # images and the integration run's 45, so a hung suite hits its own timeout first and
+    # fails with a goroutine dump instead of being killed with none.
+    timeout-minutes: ${{ needs.detect.outputs.runner_images == 'true' && 120 || 15 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -767,8 +770,8 @@ jobs:
           fi
           ./tests/image-test.sh ci-smoke:latest
 
-      # Every runner image builds amd64 with no output, in the release's order, each
-      # sibling it names swapped for its own target here as the release swaps it.
+      # Every runner image builds amd64 into the daemon under its -dev tag, in the release's
+      # order, each sibling it names swapped for its own target here as the release swaps it.
       # They need no app image, so they run after a red one and report their own verdict.
       - name: Check out the ci source
         if: ${{ !cancelled() && needs.detect.outputs.runner_images == 'true' }}
@@ -793,6 +796,7 @@ jobs:
           python-version: "3.15"
 
       - name: Build the runner images (no push)
+        id: runner-images
         if: ${{ !cancelled() && needs.detect.outputs.runner_images == 'true' }}
         env:
           CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
@@ -802,8 +806,41 @@ jobs:
           plan=$(python3 "$CI_TOOLS/runner_images.py" plan --package "$PACKAGE" --channel dev --tag ci \
             --sha "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --date "$(date -u +%Y-%m-%d)" \
             --created "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
-          python3 "$CI_TOOLS/runner_images.py" bake --platform linux/amd64 --context "$GITHUB_WORKSPACE" <<<"$plan" > "$RUNNER_TEMP/runner-images.json"
+          python3 "$CI_TOOLS/runner_images.py" bake --platform linux/amd64 --context "$GITHUB_WORKSPACE" \
+            --package "$PACKAGE" <<<"$plan" > "$RUNNER_TEMP/runner-images.json"
           docker buildx bake --file "$RUNNER_TEMP/runner-images.json"
+
+      # The integration suites run the runner images just loaded, so they wait on that
+      # build alone and run whatever the app image's verdict. `./...` stops at a nested
+      # module's boundary, so only the root module's suites run.
+      - name: Detect the integration tests
+        id: integration
+        if: ${{ !cancelled() && steps.runner-images.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          found=false
+          if [ -f go.mod ] && [ -n "$(git ls-files -- '*_integration_test.go')" ]; then
+            found=true
+          fi
+          echo "found=${found}" >> "$GITHUB_OUTPUT"
+          echo "integration tests: ${found}"
+
+      - name: Setup Go
+        id: integration-go
+        if: ${{ !cancelled() && steps.integration.outputs.found == 'true' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # GOWORK is off as in go-ci.yaml: the module builds as go.mod pins it.
+      - name: Run the integration tests
+        if: ${{ !cancelled() && steps.integration-go.outcome == 'success' }}
+        env:
+          GOWORK: 'off'
+        run: |
+          set -euo pipefail
+          go test -tags integration -count=1 -timeout 45m ./...
 
   # arm64 build-ability gate. Same rationale as the amd64 `docker` job: without
   # it, an arch-specific Dockerfile break (a hardcoded amd64 download URL, a
