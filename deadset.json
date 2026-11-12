@@ -1,0 +1,7 @@
+{
+  "ts": {
+    "entry_files": [
+      "scripts/stryker-ci-reporter.mjs"
+    ]
+  }
+}

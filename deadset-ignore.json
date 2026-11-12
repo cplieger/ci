@@ -6,6 +6,42 @@
       "symbol": "ts://./configs/eslint.config.base.mjs#default:alias",
       "path": "configs/eslint.config.base.mjs",
       "reason": "The shared ESLint base that scripts/sync-files.py copies beside the npm project of each repository in the TypeScript lint/format configs groups of scripts/classify-repos.py, where that project's eslint.config.mjs imports it. This repository is its source and never imports it."
+    },
+    {
+      "code": "DS1002",
+      "symbol": "ts://./scripts/stryker-ci-reporter.mjs#launch",
+      "path": "scripts/stryker-ci-reporter.mjs",
+      "reason": "Read only by CiReporter's members, which Stryker's plugin factory calls through strykerPlugins; deadset-ts false positive D12, remove when fixed"
+    },
+    {
+      "code": "DS1003",
+      "symbol": "ts://./scripts/stryker-ci-reporter.mjs#CiReporter.inject:static",
+      "path": "scripts/stryker-ci-reporter.mjs",
+      "reason": "Stryker's plugin factory calls it through strykerPlugins; deadset-ts false positive D12, remove when fixed"
+    },
+    {
+      "code": "DS1003",
+      "symbol": "ts://./scripts/stryker-ci-reporter.mjs#CiReporter.onMutationTestingPlanReady",
+      "path": "scripts/stryker-ci-reporter.mjs",
+      "reason": "Stryker's plugin factory calls it through strykerPlugins; deadset-ts false positive D12, remove when fixed"
+    },
+    {
+      "code": "DS1003",
+      "symbol": "ts://./scripts/stryker-ci-reporter.mjs#CiReporter.onMutantTested",
+      "path": "scripts/stryker-ci-reporter.mjs",
+      "reason": "Stryker's plugin factory calls it through strykerPlugins; deadset-ts false positive D12, remove when fixed"
+    },
+    {
+      "code": "DS1003",
+      "symbol": "ts://./scripts/stryker-ci-reporter.mjs#CiReporter.onMutationTestReportReady",
+      "path": "scripts/stryker-ci-reporter.mjs",
+      "reason": "Stryker's plugin factory calls it through strykerPlugins; deadset-ts false positive D12, remove when fixed"
+    },
+    {
+      "code": "DS1003",
+      "symbol": "ts://./scripts/stryker-ci-reporter.mjs#CiReporter.unit",
+      "path": "scripts/stryker-ci-reporter.mjs",
+      "reason": "Called by onMutantTested, which Stryker's plugin factory calls through strykerPlugins; deadset-ts false positive D12, remove when fixed"
     }
   ]
 }
