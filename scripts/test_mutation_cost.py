@@ -93,14 +93,23 @@ class Project(unittest.TestCase):
         self.assertEqual(mutation_cost.project({'a': (1, 7.0)}, None), want)
         self.assertEqual(mutation_cost.project({'a': (1, 7.0)}, {'files': 'junk'}), want)
 
-    def test_a_sample_short_of_the_unit_s_mutants_prices_nothing(self):
+    def test_a_sample_short_of_the_unit_s_mutants_prices_what_it_measured_and_the_rest_at_the_error(
+        self,
+    ):
         e = mutation_cost.PRIOR_ERROR
         # 987 of 1672 mutants measured at 72.4 s each before a deadline cut the shard.
-        hist = {'files': {'s.ts': {'secs': 987 * 72.4, 'mutants': 987}}}
-        got = mutation_cost.project({'s.ts': (1672, 1672 * 30.0)}, hist)
-        self.assertEqual(got, {'s.ts': (1672 * 30.0 * e, 'prior')})
+        row = {'secs': 987 * 72.4, 'mutants': 987}
+        got = mutation_cost.project({'s.ts': (1672, 1672 * 30.0)}, {'files': {'s.ts': row}})
+        self.assertEqual(got, {'s.ts': (987 * 72.4 + 685 * 30.0 * e, 'partial')})
+        self.assertEqual(mutation_cost.measured_part(got['s.ts'], row), 987 * 72.4)
+        # With each mutant's prior, the ones it did not reach are taken as the costliest.
+        each = [1.0, 9.0, 2.0, 8.0]
+        cut = {'secs': 6.0, 'mutants': 2}
+        self.assertEqual(mutation_cost.price(4, 20.0, cut, each), (6.0 + 17.0 * e, 'partial'))
+        self.assertEqual(mutation_cost.measured_part((1.0, 'prior'), None), 0.0)
+        self.assertEqual(mutation_cost.measured_part((5.0, 'measured'), None), 5.0)
         # With no prior either, its cost is unknown.
-        hist['files']['u.ts'] = {'secs': 20.0, 'mutants': 2}
+        hist = {'files': {'u.ts': {'secs': 20.0, 'mutants': 2}}}
         self.assertEqual(
             mutation_cost.project({'u.ts': (5, None)}, hist), {'u.ts': (None, 'unknown')}
         )
@@ -390,6 +399,78 @@ class Choose(unittest.TestCase):
         self.assertFalse(mutation_cost.capped(k, bins, lone, {'m': 0}, 230 * 60, limit=2))
 
 
+class Bound(unittest.TestCase):
+    """fit: no shard projects past BOUND_SECS but one its job's deadline bounds; else the plan fails."""
+
+    B = mutation_cost.BOUND_SECS
+
+    @staticmethod
+    def items(*work: float, known: float | None = None) -> list:
+        return [mutation_cost.Item('m', f'f{i}', w, known) for i, w in enumerate(work)]
+
+    def test_the_bound_holds_the_slowest_runner_to_the_safe_limit(self):
+        mc = mutation_cost
+        self.assertAlmostEqual(mc.SLOWDOWN * mc.BOUND_SECS, mc.SAFE_JOB_MINUTES * 60)
+        self.assertAlmostEqual(mc.target_secs(600.0), mc.BOUND_SECS - 600.0)
+
+    def test_a_count_past_the_limit_is_taken_where_the_bound_needs_it(self):
+        items = self.items(*[self.B * 0.6] * 40)
+        k, bins = mutation_cost.choose(items, {'m': 0}, mutation_cost.TOP_SECS)
+        self.assertTrue(mutation_cost.breaches(bins, {'m': 0}))
+        k, bins = mutation_cost.fit(items, {'m': 0}, mutation_cost.TOP_SECS)
+        self.assertEqual((k, mutation_cost.breaches(bins, {'m': 0})), (40, []))
+        self.assertGreater(k, mutation_cost.MAX_SHARDS)
+
+    def test_an_estimate_past_the_bound_runs_alone_under_the_deadline(self):
+        items = [*self.items(self.B * 3, known=0.0), *self.items(10.0, 20.0)]
+        _, bins = mutation_cost.fit(items, {'m': 60}, mutation_cost.TOP_SECS)
+        self.assertEqual(mutation_cost.breaches(bins, {'m': 60}), [])
+        alone = mutation_cost.deadline_bound(bins, {'m': 60})
+        self.assertEqual([[it.work for it in bins[i].items] for i in alone], [[self.B * 3]])
+        # Shared with other work, it is a breach: only a unit alone is the deadline's.
+        shared = mutation_cost.pack(items, 1, {'m': 60})
+        self.assertEqual(mutation_cost.breaches(shared, {'m': 60}), [0])
+        self.assertEqual(mutation_cost.breaches(shared, {'m': 60}, whole=True), [])
+
+    def test_a_measure_past_the_bound_fails_the_plan_named(self):
+        for items, known in ((self.items(self.B, 10.0), None), (self.items(self.B * 2), self.B)):
+            with self.subTest(known=known):
+                items = [mutation_cost.Item('m', 'big', self.B * 2, known), *items[1:]]
+                with self.assertRaises(mutation_cost.UnsafePlanError) as ctx:
+                    mutation_cost.fit(items, {'m': 1.0}, mutation_cost.TOP_SECS)
+                self.assertIn('big alone projects', str(ctx.exception))
+
+    def test_more_shards_than_most_fails_the_plan(self):
+        items = self.items(*[self.B * 0.9] * 10)
+        with self.assertRaises(mutation_cost.UnsafePlanError) as ctx:
+            mutation_cost.fit(items, {'m': 0}, mutation_cost.TOP_SECS, most=9)
+        self.assertIn('no count of up to 9 shards', str(ctx.exception))
+        with self.assertRaises(mutation_cost.UnsafePlanError) as ctx:
+            mutation_cost.fit(self.items(self.B, self.B), {'m': 0}, mutation_cost.TOP_SECS, 1, 1)
+        self.assertIn('cannot be sharded', str(ctx.exception))
+
+    def test_the_deadline_note_names_each_unit_or_nothing(self):
+        note = mutation_cost.deadline_note('r:web', {'deadline': ['a.ts:1-9', 'b.ts']})
+        self.assertIn(
+            'r:web: unmeasured, running alone under the deadline: a.ts:1-9, b.ts',
+            mutation_cost.render(note),
+        )
+        for plan in ({'deadline': []}, {}, None, {'deadline': [1]}):
+            self.assertIsNone(mutation_cost.deadline_note('r', plan))
+
+    def test_a_unit_s_source_is_partial_where_its_parts_mix(self):
+        for parts, want in (
+            (['measured'], 'measured'),
+            (['prior', 'prior'], 'prior'),
+            (['measured', 'prior'], 'partial'),
+            (['partial', 'measured'], 'partial'),
+            (['refused', 'measured'], 'refused'),
+            (['unknown', 'prior'], 'unknown'),
+            ([], 'measured'),
+        ):
+            self.assertEqual(mutation_cost.source_of(parts), want, parts)
+
+
 class Bar(unittest.TestCase):
     def test_each_shard_s_mean_over_its_attempts_is_judged_never_one_job(self):
         # 160 and 282 min on one shard's work, 1.76x apart, average 221 against 200.
@@ -456,6 +537,64 @@ class PriceOwner(unittest.TestCase):
     """mutation_cost.price is the one place a unit's price is set: nothing else scales a prior."""
 
     COST_SCRIPTS = ('mutation_cost.py', 'stryker-shard.py', 'gremlins-shard.py')
+    # Where a prior meets a measure by right: price sets prices, prior_error measures the ratio.
+    OWNERS = frozenset({'price', 'prior_error'})
+    PRIOR = frozenset({'prior', 'priors', 'prior_secs', 'PRIOR_ERROR'})
+    # A history row's key, or a local that names its measure.
+    MEASURE = frozenset({"'secs'", 'measured'})
+
+    def taint(self, node: ast.AST, names: dict[str, set[str]]) -> set[str]:
+        """What NODE reads: 'prior' (a prior or PRIOR_ERROR) and 'measure' (a measured secs),
+        through NAMES, the local names already assigned from either."""
+        out: set[str] = set()
+        for n in ast.walk(node):
+            word = (
+                n.id
+                if isinstance(n, ast.Name)
+                else n.attr
+                if isinstance(n, ast.Attribute)
+                else repr(n.value)
+                if isinstance(n, ast.Constant) and n.value == 'secs'
+                else n.value
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                else None
+            )
+            out |= {'prior'} if word in self.PRIOR else set()
+            out |= {'measure'} if word in self.MEASURE else set()
+            if isinstance(n, ast.Name):
+                out |= names.get(n.id, set())
+        return out
+
+    def mixed(self, fn: ast.FunctionDef) -> list[int]:
+        """The lines of FN where a multiply or divide reads both a prior and a measure, through any
+        chain of local assignments, loops and comprehensions."""
+        names: dict[str, set[str]] = {}
+        flows = []
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign):
+                flows += [(t, n.value) for t in n.targets]
+            elif isinstance(n, ast.AugAssign | ast.AnnAssign | ast.NamedExpr) and n.value:
+                flows.append((n.target, n.value))
+            elif isinstance(n, ast.For | ast.comprehension):
+                flows.append((n.target, n.iter))
+        changed = True
+        while changed:
+            changed = False
+            for target, value in flows:
+                got = self.taint(value, names)
+                for t in ast.walk(target):
+                    if isinstance(t, ast.Name) and not got <= names.get(t.id, set()):
+                        names[t.id] = names.get(t.id, set()) | got
+                        changed = True
+        return sorted(
+            {
+                n.lineno
+                for n in ast.walk(fn)
+                if isinstance(n, ast.BinOp)
+                and isinstance(n.op, ast.Mult | ast.Div)
+                and self.taint(n, names) >= {'prior', 'measure'}
+            }
+        )
 
     @staticmethod
     def priced(node: ast.expr) -> bool:
@@ -487,7 +626,10 @@ class PriceOwner(unittest.TestCase):
                 visit(child, owner)
 
         visit(ast.parse(source), '<module>')
-        return out
+        for fn in ast.walk(ast.parse(source)):
+            if isinstance(fn, ast.FunctionDef) and fn.name not in self.OWNERS:
+                out += [f'{name}:{line} in {fn.name}' for line in self.mixed(fn)]
+        return sorted(set(out), key=lambda x: int(x.split(':')[1].split()[0]))
 
     def test_no_cost_script_scales_a_prior_outside_price(self):
         for name in self.COST_SCRIPTS:
@@ -497,6 +639,27 @@ class PriceOwner(unittest.TestCase):
     def test_the_check_names_a_scaled_prior(self):
         source = 'def assign(f, r):\n    return f["prior_secs"] * r\n\ndef g(p):\n    return p * PRIOR_ERROR\n'
         self.assertEqual(self.sites(source, 'x.py'), ['x.py:2 in assign', 'x.py:5 in g'])
+
+    def test_the_check_follows_a_prior_and_a_measure_through_locals(self):
+        # The cross-file calibration of an earlier project(), and an earlier weights()' cross-range one.
+        source = """def project(units, hist):
+    measured = sum(hist[p]['secs'] for p in hist)
+    prior = sum(units[p][1] for p in hist)
+    ratio = measured / prior
+    return {p: v * ratio for p, v in units.items()}
+
+def weights(spans, rows):
+    prior = [s[2] for s in spans]
+    rates = [r['secs'] / p for r, p in zip(rows, prior)]
+    return [p * rates[0] for p in prior]
+
+def fine(secs, workers):
+    return secs / workers
+"""
+        self.assertEqual(
+            self.sites(source, 'x.py'),
+            ['x.py:4 in project', 'x.py:5 in project', 'x.py:9 in weights', 'x.py:10 in weights'],
+        )
 
 
 class PriorError(unittest.TestCase):
@@ -565,7 +728,7 @@ class CarryForward(unittest.TestCase):
         for old in (None, [], {'files': [1], 'setup_secs': -1}):
             self.assertEqual(mutation_cost.carry_forward(new, old), new)
 
-    def test_a_sample_short_of_its_planned_mutants_replaces_no_last_measure_and_fills_none(self):
+    def test_a_sample_short_of_its_planned_mutants_replaces_only_a_measure_of_fewer(self):
         new = {
             'files': {
                 'cut': {'secs': 2.0, 'mutants': 4},
@@ -585,9 +748,13 @@ class CarryForward(unittest.TestCase):
             {
                 'cut': {'secs': 90.0, 'mutants': 10},
                 'half': {'secs': 9.0, 'mutants': 10},
+                'new': {'secs': 1.0, 'mutants': 1},
                 'whole': {'secs': 7.0, 'mutants': 10},
             },
         )
+        old['files']['cut']['mutants'] = 3
+        got = mutation_cost.carry_forward(new, old, planned=planned)['files']
+        self.assertEqual(got['cut'], {'secs': 2.0, 'mutants': 4})
 
 
 FLEET = json.loads((SCRIPTS / 'testdata' / 'mutation-cost' / 'fleet.json').read_text())

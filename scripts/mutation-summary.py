@@ -116,6 +116,20 @@ def planned(needs: dict) -> set[str] | None:
     return {m['dir'] for m in merge}
 
 
+def plan_failed(needs: dict) -> dict[str, str]:
+    """Each Stryker dir whose plan the shard job failed, with its reason."""
+    rows = _json((needs['shard'].get('outputs') or {}).get('failed'), [])
+    if not isinstance(rows, list):
+        return {}
+    return {
+        r['dir']: r['reason']
+        for r in rows
+        if isinstance(r, dict)
+        and isinstance(r.get('dir'), str)
+        and isinstance(r.get('reason'), str)
+    }
+
+
 def stryker_judged(reports: Path, repo: str) -> dict[str, int | str]:
     """Per dir, the mutants a test judged in the merged report the merge job staged, or why it is unreadable.
 
@@ -183,7 +197,12 @@ def gremlins_judged(reports: Path, repo: str, legs: object) -> dict[str, int | s
 
 
 def state(
-    tool: str, needs: dict, dir_: str, plan: set[str] | None, judged: dict[str, int | str]
+    tool: str,
+    needs: dict,
+    dir_: str,
+    plan: set[str] | None,
+    judged: dict[str, int | str],
+    unsafe: dict[str, str] | None = None,
 ) -> dict:
     """A testable entry's state: tested only when every job of its pipeline succeeded and
     its merged result holds a mutant a test judged."""
@@ -192,6 +211,8 @@ def state(
         if result in ('failure', 'cancelled'):
             return {'state': FAILED, 'reason': f'the {job} job ended {result}'}
         if job == 'shard' and result == 'success' and tool == 'stryker':
+            if dir_ in (unsafe or {}):
+                return {'state': FAILED, 'reason': (unsafe or {})[dir_]}
             if plan is None:
                 return {'state': FAILED, 'reason': 'the shard job wrote no usable merge list'}
             if dir_ not in plan:
@@ -269,7 +290,8 @@ def record(
     else:
         legs = _json((needs['shard'].get('outputs') or {}).get('matrix'), None)
         judged = gremlins_judged(reports, repo, legs)
-    entries |= {d: state(tool, needs, d, plan, judged) for d in testable}
+    unsafe = plan_failed(needs) if tool == 'stryker' else None
+    entries |= {d: state(tool, needs, d, plan, judged, unsafe) for d in testable}
     doc = {
         'tool': tool,
         'repo': repo,

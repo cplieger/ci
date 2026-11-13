@@ -4,8 +4,8 @@ gremlins and Stryker each report one completion per mutant while a fixed pool of
 workers runs the mutants in file order. A file's measured cost is the gap before
 each of its completions times the workers (attribute). The next run prices a file
 from that history while the file is unchanged, or from its tool's prior times
-PRIOR_ERROR (project), and packs files into shards that each end near a target
-(choose), at most MAX_SHARDS of them.
+PRIOR_ERROR (price), and packs files into shards that each end near a target
+(choose), more than MAX_SHARDS only where the bound on every job needs them (fit).
 """
 
 from __future__ import annotations
@@ -46,12 +46,11 @@ SLOWDOWN = 1.9
 # records measure it per shard (prior_error) and warn past this.
 PRIOR_ERROR = 3.0
 # A job matrix runs at most 256 jobs (https://docs.github.com/en/actions/reference/limits),
-# which one call's run matrix keeps: MAX_SHARDS dirs of MAX_SHARDS shards (Stryker),
-# or 3 attempts of MAX_SHARDS shards (gremlins).
+# so a plan whose run matrix needs more fails.
 MATRIX_LIMIT = 256
-# deadset-ts's full Stryker run, about 36 machine-hours, needs about 16 to 19 shards
-# at the band's top (5 to 31 min of setup). A forged price therefore holds at most
-# 16 budget-length jobs of its run's concurrency group.
+# The most shards a plan takes to bring its shards into the band (choose); fit takes more
+# only for the bound. deadset-ts's full Stryker run, about 36 machine-hours, needs about
+# 16 to 19 shards at the band's top (5 to 31 min of setup).
 MAX_SHARDS = 16
 # A measured cost per mutant more than this factor either way from its probe's is
 # refused: run 42584241747's files measured 0.052 to 9.3 times their package's.
@@ -100,6 +99,7 @@ class Item:
     group: str  # what one setup buys: a gremlins module, a Stryker entry
     unit: str | None
     work: float  # wall seconds on the group's workers
+    known: float | None = None  # the part of work a measure priced; None for all of it
 
 
 @dataclass
@@ -148,10 +148,14 @@ def pack(items: list[Item], k: int, setup: dict[str, float]) -> list[Bin]:
     return bins
 
 
+# The most one job's setup and work may project so a SLOWDOWN-times slower runner, which
+# stretches the setup as well, ends it by SAFE_JOB_MINUTES.
+BOUND_SECS = SAFE_JOB_MINUTES * 60 / SLOWDOWN
+
+
 def target_secs(setup: float) -> float:
-    """The most work one shard of SETUP seconds' setup takes so a SLOWDOWN-times slower runner,
-    which stretches the setup as well, ends by SAFE_JOB_MINUTES."""
-    return max(0.0, SAFE_JOB_MINUTES * 60 / SLOWDOWN - setup)
+    """The most work one shard of SETUP seconds' setup takes within BOUND_SECS."""
+    return max(0.0, BOUND_SECS - setup)
 
 
 # The band's top, setup and work together: a shard whose jobs average BAND over a projection
@@ -243,6 +247,91 @@ def choose(
     return best[1], best[2]
 
 
+def measured_load(b: Bin, setup: dict[str, float]) -> float:
+    """B's projection without its estimates: its setups and the work measures priced."""
+    return sum(setup[g] for g in b.groups) + sum(
+        it.work if it.known is None else it.known for it in b.items
+    )
+
+
+def breaches(bins: list[Bin], setup: dict[str, float], *, whole: bool = False) -> list[int]:
+    """The indices of BINS that project past BOUND_SECS, but for a shard the job's deadline bounds.
+
+    That is a shard of one item alone, or with WHOLE its items as one job no
+    count splits, holding an estimate (PRIOR_ERROR times a prior) and whose
+    measured part and setup fit BOUND_SECS: a job's deadline stops it in time to
+    save what it measured, which prices it the next week.
+    """
+    return [
+        i
+        for i, b in enumerate(bins)
+        if b.load > BOUND_SECS
+        and not (
+            (whole or len(b.items) == 1)
+            and any(it.known is not None for it in b.items)
+            and measured_load(b, setup) <= BOUND_SECS
+        )
+    ]
+
+
+def deadline_bound(bins: list[Bin], setup: dict[str, float], *, whole: bool = False) -> list[int]:
+    """The indices of BINS past BOUND_SECS that breaches() leaves to the job's deadline."""
+    unsafe = set(breaches(bins, setup, whole=whole))
+    return [i for i, b in enumerate(bins) if b.load > BOUND_SECS and i not in unsafe]
+
+
+class UnsafePlanError(ValueError):
+    """No plan keeps every job within BOUND_SECS (fit)."""
+
+
+def fit(
+    items: list[Item],
+    setup: dict[str, float],
+    top: float,
+    limit: int = MAX_SHARDS,
+    most: int = MATRIX_LIMIT,
+) -> tuple[int, list[Bin]]:
+    """choose()'s count and packing in at most LIMIT shards when no shard breaches the bound,
+    else the fewest shards up to MOST in which none does; with a MOST of 1, the items are one job.
+
+    Raises UnsafePlanError naming an item whose measured part and setup pass
+    BOUND_SECS alone, which no count shortens, or when no count up to MOST
+    keeps every shard within the bound.
+    """
+    whole = most <= 1
+    over = [
+        it
+        for it in items
+        if setup[it.group] + (it.work if it.known is None else it.known) > BOUND_SECS
+    ]
+    if over:
+        it = max(over, key=lambda x: x.work if x.known is None else x.known)
+        measured = it.work if it.known is None else it.known
+        raise UnsafePlanError(
+            f'{it.unit or it.group} alone projects {(setup[it.group] + measured) / 60:.4g} min of '
+            f'measured setup and work, past the {BOUND_SECS / 60:.0f} min a job may project, and no '
+            f'cut or shard count shortens it'
+        )
+    k, bins = choose(items, setup, top, max(1, min(limit, most)))
+    if not breaches(bins, setup, whole=whole):
+        return k, bins
+    if whole:
+        raise UnsafePlanError(
+            f'its one job projects {bins[0].load / 60:.4g} min, past the '
+            f'{BOUND_SECS / 60:.0f} min a job may project, and it cannot be sharded'
+        )
+    groups = {it.group for it in items}
+    least = (sum(it.work for it in items) + sum(setup[g] for g in groups)) / BOUND_SECS
+    for n in range(max(k + 1, math.ceil(least) if math.isfinite(least) else 0), most + 1):
+        bins = pack(items, n, setup)
+        if not breaches(bins, setup):
+            return n, bins
+    raise UnsafePlanError(
+        f'no count of up to {most} shards keeps every job within the {BOUND_SECS / 60:.0f} min a '
+        f'job may project'
+    )
+
+
 def crowded(bins: list[Bin]) -> float:
     """The slowest of BINS that holds more than one item, which more shards could shorten; 0 for none."""
     return max((b.load for b in bins if len(b.items) > 1), default=0.0)
@@ -262,11 +351,7 @@ def cap_reason(cap: int) -> str:
 
 
 def cap_note(where: str, plan: object) -> Template | None:
-    """The warning a capped run plan carries, stating only what the plan holds, or None for any other.
-
-    A plan's `unsized_shared` lists the modules and files of unknown cost that
-    the cap put in a shard with other work.
-    """
+    """The warning a capped run plan carries, stating only what the plan holds, or None for any other."""
     if not isinstance(plan, dict) or not isinstance(plan.get('capped'), str):
         return None
     note = t'{where}: runs in {plan.get("shards")!r:.20} shard(s), capped by {plan["capped"]:.200}'
@@ -274,10 +359,19 @@ def cap_note(where: str, plan: object) -> Template | None:
     top = plan.get('top_minutes')
     if longest is not None and nonnegative(top) and longest > top:
         note += t', so its longest sized shard projects {longest} min, past the {top:.1f} min the band allows'
-    shared = plan.get('unsized_shared')
-    if isinstance(shared, list) and shared and all(isinstance(d, str) for d in shared):
-        note += t'; unsized, planned as a full shard each, these share a shard: {", ".join(shared):.1000}'
     return note
+
+
+def deadline_note(where: str, plan: object) -> Template | None:
+    """The warning naming each unit a run plan runs alone under its job's deadline, or None."""
+    alone = plan.get('deadline') if isinstance(plan, dict) else None
+    if not isinstance(alone, list) or not alone or not all(isinstance(u, str) for u in alone):
+        return None
+    return (
+        t'{where}: unmeasured, running alone under the deadline: {", ".join(alone):.2000} '
+        t'(each estimated past the {BOUND_SECS / 60:.0f} min a job may project; its measures '
+        t'price it next week)'
+    )
 
 
 def escape_data(s: str) -> str:
@@ -498,16 +592,20 @@ def carry_forward(
 
     A file a run never reached before its job stopped, or whose shard left no
     record, has no new measure, so its last one still prices it. A new sample
-    of fewer than its PLANNED mutants, the ones a job finished before its budget
-    cut it, prices nothing (price), so it replaces no last measure.
+    of fewer than its PLANNED mutants, the ones a job finished before its
+    deadline cut it, prices what it measured (price), and replaces a last
+    measure of as many mutants or fewer.
     """
     old = old if isinstance(old, dict) else {}
+    last = clean_files(old.get('files'))
     fresh = {
         p: e
         for p, e in clean_files(new.get('files')).items()
-        if planned is None or e['mutants'] >= planned.get(p, 0)
+        if planned is None
+        or e['mutants'] >= planned.get(p, 0)
+        or e['mutants'] > last.get(p, {}).get('mutants', 0)
     }
-    files = {**clean_files(old.get('files')), **fresh}
+    files = {**last, **fresh}
     setup = new.get('setup_secs') if nonnegative(new.get('setup_secs')) else old.get('setup_secs')
     return {
         'files': {p: e for p, e in sorted(files.items()) if keep is None or p in keep},
@@ -515,14 +613,19 @@ def carry_forward(
     }
 
 
-def price(n: int, prior: float | None, row: dict | None) -> tuple[float | None, str]:
+def price(
+    n: int, prior: float | None, row: dict | None, each: list[float] | None = None
+) -> tuple[float | None, str]:
     """A unit's worker-seconds for the next run and their source: the one place either tool sets a price.
 
     N is the mutants the unit (a file, range or module) now runs, PRIOR its
     tool's prior worker-seconds (None when its probe measured nothing), ROW its
-    {secs, mutants} history at the unit's current blob, or None. ROW prices N at
-    its cost per mutant ('measured') only when it measured at least N mutants
-    and is plausible against PRIOR. Anything else costs PRIOR x PRIOR_ERROR,
+    {secs, mutants} history at the unit's current blob, or None. A ROW plausible
+    against PRIOR prices N at its cost per mutant ('measured') when it measured
+    at least N mutants. A plausible ROW of fewer, a sample a job's deadline cut,
+    costs what it measured plus PRIOR_ERROR times the prior of the mutants it did
+    not reach ('partial'): the costliest of EACH, the N mutants' own priors, when
+    given, else their share of PRIOR. Anything else costs PRIOR x PRIOR_ERROR,
     'refused' for an implausible ROW, else 'prior'; with no PRIOR it is
     (None, 'unknown'), never 0.
     """
@@ -532,11 +635,34 @@ def price(n: int, prior: float | None, row: dict | None) -> tuple[float | None, 
         if n == 0 or plausible(cost, None if prior is None else prior / n):
             if row['mutants'] >= n:
                 return n * cost, 'measured'
+            if prior is not None:
+                left = n - row['mutants']
+                rest = sum(sorted(each, reverse=True)[:left]) if each else prior * left / n
+                return row['secs'] + rest * PRIOR_ERROR, 'partial'
         else:
             refused = True
     if prior is None:
         return (None, 'unknown') if n else (0.0, 'prior')
     return prior * PRIOR_ERROR, 'refused' if refused else 'prior'
+
+
+def measured_part(priced: tuple[float | None, str], row: dict | None) -> float:
+    """The seconds of a price() that a measure set: all of a 'measured' one, a 'partial' one's ROW, else none."""
+    secs, source = priced
+    if source == 'measured':
+        return secs or 0.0
+    return row['secs'] if source == 'partial' and row is not None else 0.0
+
+
+def source_of(sources: Iterable[str]) -> str:
+    """One source for a unit whose parts have SOURCES: 'unknown' or 'refused' when any part is,
+    'prior' or 'measured' when every part is, else 'partial'."""
+    have = set(sources)
+    if found := next((s for s in ('unknown', 'refused') if s in have), None):
+        return found
+    if len(have) == 1 and have <= {'prior', 'measured'}:
+        return have.pop()
+    return 'partial' if have else 'measured'
 
 
 def spread(total: float, weights: list[float]) -> list[float]:
@@ -587,8 +713,8 @@ def note_prior_error(where: str, measured: float | None) -> None:
 
 
 def refusals(priced: dict[str, tuple[float, str]]) -> int:
-    """How many of project()'s files had their history refused."""
-    return sum(1 for _, source in priced.values() if source == 'refused')
+    """How many of the priced files had their history refused."""
+    return sum(1 for v in priced.values() if v[1] == 'refused')
 
 
 def load_json(path: Path, limit: int | None = MAX_INPUT_BYTES) -> object:

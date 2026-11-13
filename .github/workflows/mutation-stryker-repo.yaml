@@ -194,8 +194,9 @@ jobs:
 
   # The run and merge matrices: entry x shard from each entry's plan, priced by
   # its last cost history, one shard for an entry with no usable plan, none for
-  # one that is not enrolled. Runs no target code, so it alone fetches an
-  # earlier run's artifact (the cost history).
+  # one that is not enrolled or whose plan cannot keep every job within the
+  # bound (its failed list, which the result names). Runs no target code, so it
+  # alone fetches an earlier run's artifact (the cost history).
   shard:
     needs: [discover, plan]
     if: ${{ !cancelled() && needs.discover.result == 'success' && needs.discover.outputs.entries != '[]' }}
@@ -207,6 +208,7 @@ jobs:
     outputs:
       run: ${{ steps.matrix.outputs.run }}
       merge: ${{ steps.matrix.outputs.merge }}
+      failed: ${{ steps.matrix.outputs.failed }}
       reports: ${{ steps.matrix.outputs.reports }}
     steps:
       - name: Checkout ci (for scripts/)
@@ -261,6 +263,7 @@ jobs:
           {
             echo "run=$(jq -c .run <<<"${out}")"
             echo "merge=$(jq -c .merge <<<"${out}")"
+            echo "failed=$(jq -c .failed <<<"${out}")"
             echo "reports=${reports}"
           } >> "$GITHUB_OUTPUT"
 

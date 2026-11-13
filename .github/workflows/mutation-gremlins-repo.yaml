@@ -125,7 +125,7 @@ jobs:
           PLAN_DEADLINE=$(($(date +%s) + (PLAN_TIMEOUT_MINUTES - 20) * 60))
           export PLAN_DEADLINE
           # A module left unsized fails the planner after it writes the plan;
-          # scripts/gremlins-shard.py with_unsized owns how it is sharded.
+          # scripts/gremlins-shard.py assign owns how it is sharded.
           plan_args=()
           for m in $MODULES; do
             plan_args+=(--module "${m}=plan/modules/${m}")

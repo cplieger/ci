@@ -9,7 +9,8 @@ job prices each file from the repo's last measured run (`history`, built from
 each shard's `costs`) where it measured the file's current blob, the prior times
 PRIOR_ERROR where not (scripts/mutation_cost.py price),
 and packs files into shards that each end inside the band mutation_cost.TOP_SECS
-derives from runner speed, longest first (`matrix`, mutation_cost.choose). A file is the smallest unit gremlins can scope, and a mutant's
+derives from runner speed, longest first, with more shards where the bound on every
+job needs them (`matrix`, mutation_cost.fit). A file is the smallest unit gremlins can scope, and a mutant's
 verdict does not depend on its shard: each mutant runs its own package's tests
 under that package's timeout.
 """
@@ -214,7 +215,7 @@ def sizing(
             mutation_cost.annotate(
                 'error',
                 t'{repo}: module {dir_} could not be sized ({why}, in {str(plan_dir)}), so it runs '
-                t'whole and unmeasured, priced as a full shard (gremlins-shard.py with_unsized)',
+                t'whole and unmeasured in a shard of its own (gremlins-shard.py assign)',
             )
             entries[dir_] = {
                 'mode': None,
@@ -233,49 +234,40 @@ def module_history(history: dict | None, dir_: str) -> dict:
     return h if isinstance(h, dict) else {}
 
 
-def integration_price(e: dict, h: dict) -> tuple[float | None, str]:
+def integration_price(e: dict, h: dict) -> tuple[tuple[float | None, str], dict | None]:
     """An integration module's price (mutation_cost.price) from its history rows at their current
-    blobs, summed into one; a module with no mutants costs 0 whatever its history."""
+    blobs, summed into one, and that row; a module with no mutants costs 0 whatever its history."""
     if not e['mutants']:
-        return 0.0, 'prior'
+        return (0.0, 'prior'), None
     hist = mutation_cost.clean_files(h.get('files'))
     done = sum(f['mutants'] for f in hist.values())
-    total = {'secs': sum(f['secs'] for f in hist.values()), 'mutants': done}
-    return mutation_cost.price(e['mutants'], e['prior_secs'], total if done else None)
+    total = {'secs': sum(f['secs'] for f in hist.values()), 'mutants': done} if done else None
+    return mutation_cost.price(e['mutants'], e['prior_secs'], total), total
 
 
-def with_unsized(
-    items: list[Item], setup: dict[str, float], unsized: int, top: float, limit: int
-) -> tuple[int, int, list[Bin]]:
-    """The shards UNSIZED items get, and the sized ITEMS' shard count and packing in the rest of LIMIT.
-
-    An unsized item (a module the plan could not size, or a module or file whose
-    probe measured nothing and has no history) is of unknown cost, so it is
-    priced as a whole shard (TOP, the band's top) and gets one of its own
-    while LIMIT leaves the sized work one. Past that, the split whose longest
-    shard projects least, ties going to more unsized shards; at a LIMIT of 1
-    everything is one job.
-    """
-    if not unsized or not items:
-        return min(unsized, limit), *(
-            mutation_cost.choose(items, setup, top, limit) if items else (0, [])
-        )
-    if limit == 1:
-        return 0, 1, mutation_cost.pack(items, 1, setup)
-    best: tuple[float, int, int, list[Bin]] | None = None
-    for own in range(min(unsized, limit - 1), 0, -1):
-        k, bins = mutation_cost.choose(items, setup, top, limit - own)
-        longest = max(*(b.load for b in bins), -(-unsized // own) * top)
-        if best is None or longest < best[0]:
-            best = (longest, own, k, bins)
-    return best[1:]
+def item(group: str, unit: str | None, priced: tuple, row: dict | None, workers: int) -> Item:
+    """The packed unit of a price (mutation_cost.price) on WORKERS, with the part a measure set."""
+    secs, source = priced
+    known = None if source == 'measured' else mutation_cost.measured_part(priced, row) / workers
+    return Item(group, unit, secs / workers, known)
 
 
 def assign(
-    doc: dict, history: dict | None, limit: int = mutation_cost.MAX_SHARDS
+    doc: dict,
+    history: dict | None,
+    limit: int = mutation_cost.MAX_SHARDS,
+    most: int = mutation_cost.MATRIX_LIMIT,
 ) -> tuple[dict, list[Template]]:
-    """The run plan, doc's files priced from HISTORY and packed into at most LIMIT shards inside the
-    band (mutation_cost.TOP_SECS), and its warnings."""
+    """The run plan, doc's files priced from HISTORY and packed by mutation_cost.fit into at most
+    LIMIT shards inside the band (mutation_cost.TOP_SECS), or up to MOST where the bound needs
+    them, and its warnings.
+
+    A module the plan could not size, or a module or file whose probe measured
+    nothing and has no history, is of unknown cost, so it gets a shard of its
+    own, which its job's deadline bounds. Raises mutation_cost.UnsafePlanError,
+    naming the repo and the unit or the count, when no plan of up to MOST
+    shards keeps every job within mutation_cost.BOUND_SECS.
+    """
     plan = json.loads(json.dumps(doc))
     entries, items, setup, refused = plan['modules'], [], {}, 0
     unsized: list[Item] = []
@@ -289,15 +281,17 @@ def assign(
         setup[dir_] = mutation_cost.setup_price(h.get('setup_secs'), e['setup_secs'])
         workers = e['workers']
         if e['mode'] == 'integration':
-            secs, e['cost'] = integration_price(e, h)
+            priced, row = integration_price(e, h)
+            e['cost'] = priced[1]
             refused += e['cost'] == 'refused'
-            e['work_secs'] = None if secs is None else round(secs / workers, 1)
-            if secs is None:
+            e['work_secs'] = None if priced[0] is None else round(priced[0] / workers, 1)
+            if priced[0] is None:
                 unsized.append(Item(dir_, None, 0.0))
                 unknown.append(dir_)
             else:
-                items.append(Item(dir_, None, secs / workers))
+                items.append(item(dir_, None, priced, row, workers))
             continue
+        rows = mutation_cost.clean_files(h.get('files'))
         priced = mutation_cost.project(
             {p: (f['runnable'], f['prior_secs']) for p, f in e['files'].items()}, h
         )
@@ -310,7 +304,7 @@ def assign(
                 unsized.append(Item(dir_, p, 0.0))
                 unknown.append(f'{dir_}:{p}')
             else:
-                items.append(Item(dir_, p, secs / workers))
+                items.append(item(dir_, p, priced[p], rows.get(p), workers))
         if not e['files']:
             items.append(Item(dir_, None, 0.0))
     warnings: list[Template] = []
@@ -326,10 +320,24 @@ def assign(
         )
     one_job = sum(setup.values()) + sum(it.work for it in items)
     top_secs = mutation_cost.TOP_SECS
-    own, k, bins = with_unsized(items, setup, len(unsized), top_secs, limit)
-    room = limit - own
+    own = len(unsized)
+    room = max(1, limit - own)
+    if own + bool(items) > most:
+        raise mutation_cost.UnsafePlanError(
+            f'{plan["repo"]}: its {own} unit(s) of unknown cost need a shard each, which with its '
+            f'sized work is more than the {most} shards it may run, so its plan fails'
+        )
+    try:
+        k, bins = mutation_cost.fit(items, setup, top_secs, room, most - own) if items else (0, [])
+    except mutation_cost.UnsafePlanError as exc:
+        raise mutation_cost.UnsafePlanError(f'{plan["repo"]}: {exc}, so its plan fails') from None
     projected: list[float | None] = [round(b.load / 60, 1) for b in bins]
     top = round(top_secs / 60, 1)
+    alone = [
+        it.group if it.unit is None else f'{it.group}:{it.unit}'
+        for i in mutation_cost.deadline_bound(bins, setup)
+        for it in bins[i].items
+    ]
     if items and mutation_cost.capped(k, bins, items, setup, top_secs, room):
         plan['capped'] = mutation_cost.cap_reason(limit)
     elif items and max(projected) > top:
@@ -339,26 +347,9 @@ def assign(
             t'projects {slowest.work / 60:.0f} min, so its shard ends past {top:.1f} min, the top of '
             t'its band'
         )
-    if own:
-        extra = [Bin() for _ in range(own)]
-        for i, it in enumerate(unsized):
-            extra[i % own].items.append(it)
-        bins += extra
-        projected += [None] * own
-    elif unsized:
-        bins[0].items += unsized
-    marked = {id(it) for it in unsized}
-    if shared := sorted(
-        {
-            it.group if it.unit is None else f'{it.group}:{it.unit}'
-            for b in bins
-            if len(b.items) > 1
-            for it in b.items
-            if id(it) in marked
-        }
-    ):
-        plan['capped'] = mutation_cost.cap_reason(limit)
-        plan['unsized_shared'] = shared
+    for it in unsized:
+        bins.append(Bin(items=[it]))
+        projected.append(None)
     for e in entries.values():
         e['shards'] = []
     for n, b in enumerate(bins, start=1):
@@ -375,6 +366,7 @@ def assign(
         shards=len(bins),
         one_job_minutes=round(one_job / 60, 1),
         projected_minutes=projected,
+        deadline=sorted(alone),
     )
     if note := mutation_cost.cap_note(plan['repo'], plan):
         warnings.append(note)
@@ -521,7 +513,7 @@ def read_history(path: Path | None, repo: str) -> dict | None:
 
 
 def plan_repo(
-    repo: str, plan_path: Path, history_path: Path | None
+    repo: str, plan_path: Path, history_path: Path | None, most: int = mutation_cost.MATRIX_LIMIT
 ) -> tuple[dict, dict | None, list[Template]] | None:
     """REPO's run plan, the history it priced from and its warnings, or None when it runs one job per attempt.
 
@@ -556,7 +548,7 @@ def plan_repo(
             'warning', t'{repo}: shard plan refused ({why}), so each attempt runs in one job'
         )
         return None
-    plan, warnings = assign(doc, history)
+    plan, warnings = assign(doc, history, most=most)
     return plan, history, warnings
 
 
@@ -568,10 +560,20 @@ def matrix(
     history_path: Path | None = None,
     out_plan: Path | None = None,
 ) -> list[dict]:
-    """REPO's run matrix, attempt x shard; a repo that shards gets its run plan in OUT_PLAN."""
+    """REPO's run matrix, attempt x shard; a repo that shards gets its run plan in OUT_PLAN.
+
+    Raises SystemExit when no plan of at most MATRIX_LIMIT jobs over the
+    ATTEMPTS keeps every job within the bound (assign).
+    """
     mutation_cost.entry_key(repo)
     k = 1
-    if (planned := plan_repo(repo, plan_path, history_path)) is not None:
+    try:
+        planned = plan_repo(
+            repo, plan_path, history_path, max(1, mutation_cost.MATRIX_LIMIT // attempts)
+        )
+    except mutation_cost.UnsafePlanError as exc:
+        raise SystemExit(str(exc)) from None
+    if planned is not None:
         plan, history, warnings = planned
         k = plan['shards']
         if out_plan is not None:
@@ -579,6 +581,8 @@ def matrix(
             out_plan.write_text(json.dumps(plan, indent=1) + '\n')
         for w in warnings:
             mutation_cost.annotate('warning', w)
+        if note := mutation_cost.deadline_note(repo, plan):
+            mutation_cost.annotate('warning', note, summary=True)
         measured = sum(
             1
             for e in plan['modules'].values()
@@ -784,9 +788,11 @@ def history(
             isinstance(e, dict)
             and e.get('mode') == 'integration'
             and mutation_cost.count(e.get('mutants'))
-            and sum(f['mutants'] for f in new['files'].values()) < e['mutants']
+            and (got := sum(f['mutants'] for f in new['files'].values())) < e['mutants']
+            and sum(f['mutants'] for f in mutation_cost.clean_files(last.get('files')).values())
+            >= got
         ):
-            # integration_price prices the module from its total, so a short sample keeps the last one whole.
+            # integration_price prices the module from its total, so a cut sample replaces no fuller one.
             new = {**new, 'files': {}}
         rows += prior_rows(e, new['files'])
         rec = mutation_cost.carry_forward(new, last, keep, counts)

@@ -120,7 +120,11 @@ class Calls(unittest.TestCase):
             check=True,
         )
         out = json.loads(proc.stdout)
-        return {'run': json.dumps(out['run']), 'merge': json.dumps(out['merge'])}
+        return {
+            'run': json.dumps(out['run']),
+            'merge': json.dumps(out['merge']),
+            'failed': json.dumps(out['failed']),
+        }
 
     def stryker_needs(self, found: dict, matrices: dict | None, **results: str) -> dict:
         """NEEDS of the Stryker result job: every job succeeded unless RESULTS says otherwise."""
@@ -261,6 +265,22 @@ class Calls(unittest.TestCase):
             {'v': 'tested', 'w': 'tested'},
         )  # fmt: skip
         self.assertEqual((doc['shards'], doc['reason'], doc['fault']), (1, '', ''))
+
+    def test_stryker_a_dir_whose_plan_failed_is_red_and_named_beside_a_tested_one(self):
+        found = self.discover(['v/stryker.config.json', 'w/stryker.config.json'])
+        out = self.shard_outputs(found)
+        why = (
+            'a:w: no count of up to 256 shards keeps every job within the bound, so its plan fails'
+        )
+        shard = {
+            k: json.dumps([r for r in json.loads(out[k]) if r['dir'] == 'v'])
+            for k in ('run', 'merge')
+        }
+        shard['failed'] = json.dumps([{'dir': 'w', 'reason': why}])
+        doc = self.outcome(
+            'stryker', self.stryker_needs(found, shard), 'failed', {'v': 'tested', 'w': 'failed'}
+        )
+        self.assertEqual(doc['entries']['w']['reason'], why)
 
     def test_stryker_shards_is_the_most_one_dir_runs(self):
         found = self.discover(['v/stryker.config.json', 'w/stryker.config.json'])

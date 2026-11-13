@@ -2779,6 +2779,26 @@ def test_shard_plans_a_recorded_run_from_its_costs(tmp: Path) -> None:
         == {f['cost'] for f in files.values()},
         detail=f'{again.get(edited)} {sized}',
     )
+    proc = run_shard(
+        'matrix',
+        *('--repo', 'deadset-go', '--plan', str(plans / 'edited.json'), '--attempts', '3'),
+        *('--out-plan', str(tmp / 'first.json')),
+    )
+    first = json.loads((tmp / 'first.json').read_text())['modules']['.']['files']
+    sizes = json.loads((plans / 'edited.json').read_text())['modules']['.']['files']
+    for label, priced in (('no history', first), ('its own history, one file edited', again)):
+        off = [
+            p
+            for p, f in priced.items()
+            if f['cost'] == 'prior'
+            and abs(f['work_secs'] - sizes[p]['prior_secs'] * mutation_cost.PRIOR_ERROR / 4) > 0.05
+        ]
+        check(
+            f'recorded run, {label}: every file priced from its prior costs its prior times '
+            'PRIOR_ERROR, never a rate taken from other files',
+            ok=not off and any(f['cost'] == 'prior' for f in priced.values()),
+            detail=str(off[:5]),
+        )
     old = [setup] * 4
     for p in files:
         old[fx['old_plan_shards'][p.rsplit('/', 1)[0]] - 1] += measured['2'].get(p, 0.0) / 4
@@ -3600,28 +3620,65 @@ def test_shard_matrix_stays_within_the_cap_whatever_the_prices(tmp: Path) -> Non
             check(f'hostile prices: {repo} ends', ok=False, detail='still running after 120 s')
             return
     check(
-        'hostile prices: every plan ends, and in seconds',
-        ok=all(p.returncode == 0 for p, _, _ in results.values())
-        and time.monotonic() - started < 120,
-        detail=str({r: p.stderr[-200:] for r, (p, _, _) in results.items() if p.returncode}),
-    )
-    counts = {r: {e.get('shards', 1) for e in m or []} for r, (_, m, _) in results.items()}
-    check(
-        'hostile prices: every repo runs all 3 attempts, each at one count within MAX_SHARDS',
+        'hostile prices: every plan ends, planned or failed, and in seconds',
         ok=all(
-            len(c) == 1
-            and 1 <= next(iter(c)) <= mutation_cost.MAX_SHARDS
-            and len(results[r][1]) == 3 * next(iter(c))
-            for r, c in counts.items()
-        ),
-        detail=str(counts),
+            p.returncode in (0, 1) and 'Traceback' not in p.stderr for p, _, _ in results.values()
+        )
+        and time.monotonic() - started < 120,
+        detail=str({r: p.stderr[-200:] for r, (p, _, _) in results.items() if p.returncode > 1}),
     )
+    per_attempt = mutation_cost.MATRIX_LIMIT // 3
+    outcomes = {}
+    for r, (p, m, plan) in results.items():
+        if p.returncode == 0:
+            k = {e.get('shards', 1) for e in m}
+            sized = [x for x in (plan or {}).get('projected_minutes') or [] if x is not None]
+            bound = mutation_cost.BOUND_SECS / 60
+            lone = set((plan or {}).get('deadline') or [])
+            outcomes[r] = (
+                len(k) == 1
+                and 1 <= next(iter(k)) <= per_attempt
+                and len(m) == 3 * next(iter(k))
+                and (all(x <= bound for x in sized) or bool(lone))
+            )
+        else:
+            outcomes[r] = f'::error::{r}: ' in p.stderr and 'so its plan fails' in p.stderr
+    check(
+        'hostile prices: every repo runs all 3 attempts within the run matrix, each job within the '
+        'bound or alone under its deadline, or its plan fails, named',
+        ok=all(outcomes.values()),
+        detail=str({r: results[r][0].stderr[-300:] for r, ok in outcomes.items() if not ok}),
+    )
+    capped_doc = {
+        'repo': 'wide',
+        'sha': FIXTURE_SHA,
+        'modules': {
+            '.': {
+                'mode': 'per-package',
+                'workers': 1,
+                'setup_secs': 60.0,
+                'packages': {},
+                # 30 files at 70 min each: 16 shards keep the bound but not the band's top.
+                'files': {
+                    f'p{i}/x.go': {
+                        'runnable': 10,
+                        'prior_secs': 70 * 60 / mutation_cost.PRIOR_ERROR,
+                    }
+                    for i in range(30)
+                },
+            }
+        },
+    }
+    wide = call_matrix(tmp, 'wide', capped_doc)
+    results['wide'] = wide
     capped = [r for r, (_, _, plan) in results.items() if plan and plan.get('capped')]
     check(
-        'hostile prices: the repos whose plans want more than MAX_SHARDS run capped, and say so',
-        ok=set(capped) >= {f'r{i}' for i in range(0, 16, 2)}
+        'hostile prices: a repo whose band wants more than MAX_SHARDS that keep the bound runs '
+        'capped, and says so',
+        ok='wide' in capped
+        and wide[2]['shards'] == mutation_cost.MAX_SHARDS
         and all(f'::warning::{r}: runs in ' in results[r][0].stderr for r in capped),
-        detail=str(capped),
+        detail=f'{capped} {wide[0].stderr[-300:]}',
     )
     check(
         'hostile prices: an over-range measured price is refused and that file priced from its probe',
@@ -5344,7 +5401,7 @@ def test_shard_prices_only_history_at_the_current_blob(tmp: Path) -> None:
         (
             'one file edited since',
             {'a.go': a, 'b.go': b},
-            (400.0 * mutation_cost.PRIOR_ERROR, 'prior'),
+            (50.0 + 400.0 * 40 / 100 * mutation_cost.PRIOR_ERROR, 'partial'),
         ),
         ('no blob known', {}, (400.0 * mutation_cost.PRIOR_ERROR, 'prior')),
     ):
@@ -5387,86 +5444,34 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
         ]
         return mutation_cost.choose(items, {'.': 60.0}, top, room)[0]
 
-    for unsized, limit, own, capped in (
-        (13, 16, 13, False),
-        (15, 16, 14, True),
-        (1, 2, 1, True),
-        (1, 16, 1, False),
-        (3, 5, 3, True),
-    ):
+    for unsized, limit in ((13, 16), (15, 16), (1, 2), (1, 16), (3, 5)):
         doc = unsized_doc(unsized)
         with contextlib.redirect_stderr(io.StringIO()):
             plan, warnings = shard.assign(doc, None, limit)
         k, per, mixed = split(plan)
         holders = sum(1 for m in per if m)
+        sized = [m for m in plan['projected_minutes'] if m is not None]
         check(
-            f'unsized: {unsized} unsized module(s) at a limit of {limit} take {own} shard(s) of their own, '
-            'beside the sized shards the rest of the limit wants',
-            ok=plan['shards'] <= limit
-            and holders == own
+            f'unsized: {unsized} unsized module(s) at a limit of {limit} each take a shard of their '
+            'own, beside sized shards that keep the bound',
+            ok=plan['shards'] == unsized + k
+            and holders == unsized
             and not mixed
-            and k == want(doc, limit - own)
+            and k >= want(doc, max(1, limit - unsized))
+            and all(m <= mutation_cost.BOUND_SECS / 60 for m in sized)
             and shard.valid_plan(plan) == ''
-            and ('capped' in plan) == capped,
-            detail=f'k={k} per={per} capped={plan.get("capped")} {warnings}',
+            and 'unsized_shared' not in plan,
+            detail=f'k={k} per={per} {sized} {warnings}',
         )
-    doc = unsized_doc(15)
-    with contextlib.redirect_stderr(io.StringIO()):
-        plan, warnings = shard.assign(doc, None, 16)
-    _, per, _ = split(plan)
-    shared = [m for m in per if len(m) > 1]
-    texts = [mutation_cost.render(w) for w in warnings]
-    check(
-        'unsized: past the limit, the modules that share a shard are named with the cap',
-        ok=len(shared) == 1
-        and plan.get('unsized_shared') == shared[0]
-        and any(all(d in w for d in shared[0]) and 'cap' in w for w in texts),
-        detail=f'{per} {texts}',
-    )
 
     def note(plan: dict) -> str:
         return mutation_cost.render(mutation_cost.cap_note('r', plan) or t'')
 
-    only = {**unsized_doc(0), 'modules': unsized_doc(20)['modules']}
-    del only['modules']['.']
-    with contextlib.redirect_stderr(io.StringIO()):
-        plan, _ = shard.assign(only, None, 16)
-    names = sorted(plan.get('unsized_shared') or [])
-    want_shared = sorted(
-        {
-            d
-            for d, e in plan['modules'].items()
-            if any(
-                sum(1 for f in plan['modules'].values() if n in f['shards']) > 1
-                for n in e['shards']
-            )
-        }
-    )
+    sized = {'capped': 'a cap of 16 shards', 'shards': 2, 'projected_minutes': [250.0, None]}
+    sized['top_minutes'] = 137.3
     check(
-        'unsized cap note: an all-unsized plan names every shared module and quotes no projection',
-        ok=names == want_shared
-        and names
-        and all(d in note(plan) for d in names)
-        and 'unsized, planned as a full shard' in note(plan)
-        and 'None' not in note(plan)
-        and 'past the' not in note(plan),
-        detail=f'{names} {want_shared} {note(plan)}',
-    )
-    small = unsized_doc(2, files=1)
-    with contextlib.redirect_stderr(io.StringIO()):
-        plan, _ = shard.assign(small, None, 2)
-    check(
-        'unsized cap note: a sub-band sized shard beside shared unsized ones is not called past the band',
-        ok='capped' in plan
-        and sorted(plan.get('unsized_shared') or []) == ['u00', 'u01']
-        and 'past the' not in note(plan)
-        and 'u00, u01' in note(plan),
-        detail=f'{plan.get("projected_minutes")} {note(plan)}',
-    )
-    sized = {**plan, 'unsized_shared': None, 'projected_minutes': [250.0, None]}
-    check(
-        'unsized cap note: a numeric projection past the top is stated with its number',
-        ok='projects 250.0 min, past the' in note(sized),
+        'cap note: a numeric projection past the top is stated with its number',
+        ok='projects 250.0 min, past the' in note(sized) and 'None' not in note(sized),
         detail=note(sized),
     )
     doc = unsized_doc(1, files=1)
@@ -5474,13 +5479,11 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
         plan, _ = shard.assign(doc, None, 16)
         lone, _ = shard.assign(doc, None, 1)
     check(
-        'unsized: beside a module that fits one job it still gets its own, and joins it only at a limit of 1',
-        ok=split(plan)[0] == 1
-        and split(plan)[2] == []
-        and plan['shards'] == 2
-        and lone['shards'] == 1
-        and lone['modules']['u00']['shards'] == [1]
-        and 'capped' in lone,
+        'unsized: beside a module that fits one job it still gets its own, at any limit',
+        ok=all(
+            split(x)[0] == 1 and split(x)[2] == [] and x['shards'] == 2 and 'capped' not in x
+            for x in (plan, lone)
+        ),
         detail=f'{plan["shards"]} {lone}',
     )
     only = {**unsized_doc(0), 'modules': unsized_doc(20)['modules']}
@@ -5488,9 +5491,24 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
     with contextlib.redirect_stderr(io.StringIO()):
         plan, warnings = shard.assign(only, None, 16)
     check(
-        'unsized: a repo of only unsized modules fills its limit, the rest sharing with a warning',
-        ok=plan['shards'] == 16 and shard.valid_plan(plan) == '' and 'capped' in plan and warnings,
+        'unsized: a repo of only unsized modules runs each in a shard of its own, past the limit',
+        ok=plan['shards'] == 20
+        and shard.valid_plan(plan) == ''
+        and 'capped' not in plan
+        and sorted(n for e in plan['modules'].values() for n in e['shards']) == list(range(1, 21)),
         detail=f'{plan["shards"]} {warnings}',
+    )
+    many = {**unsized_doc(0), 'modules': unsized_doc(85)['modules']}
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            shard.assign(many, None, 16, 85)
+        why = ''
+    except mutation_cost.UnsafePlanError as exc:
+        why = str(exc)
+    check(
+        'unsized: more units of unknown cost than the run matrix holds fail the plan, named',
+        ok='85 unit(s) of unknown cost' in why and 'so its plan fails' in why,
+        detail=why,
     )
 
 
@@ -5607,14 +5625,18 @@ def test_shard_history_keeps_a_fuller_measure_over_a_short_sample(tmp: Path) -> 
     shard = load_script('gremlins_shard', SHARD)
     got = shard.history('r', tmp / 'artifacts', previous, plan)
     check(
-        "history: a file's sample short of its planned mutants keeps the last measure or records "
-        'none, a whole one replaces it',
+        "history: a file's sample short of its planned mutants keeps a fuller last measure, else "
+        'records what it measured; a whole one replaces it',
         ok=got['modules']['.']['files']
-        == {'a.go': {'secs': 50.0, 'mutants': 10}, 'b.go': {'secs': 30.0, 'mutants': 6}},
+        == {
+            'a.go': {'secs': 50.0, 'mutants': 10},
+            'b.go': {'secs': 30.0, 'mutants': 6},
+            'c.go': {'secs': 3.0, 'mutants': 9},
+        },
         detail=str(got),
     )
     check(
-        "history: an integration module's short sample keeps its last measure whole, and the new setup",
+        "history: an integration module's short sample keeps a fuller last measure whole, and the new setup",
         ok=got['modules']['tools']
         == {
             'files': {'t.go': {'secs': 60.0, 'mutants': 10}},
