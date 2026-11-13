@@ -2382,9 +2382,10 @@ DEADSET_GO = {
         'internal/suppress': (47, 3, 3023),
     },
 }
-# Longest-first over the fixture: 2 shards project 256 and 294 min, 3 project
-# 193, 174 and 193. Run 42520923530 spent 163 min in internal/exempt alone.
-FIXTURE_SHARDS = 4
+# Never measured, every package is priced at PRIOR_ERROR times its probe, so the three
+# slowest each pass a shard alone and the rest fill two more. Run 42520923530 spent 163
+# min in internal/exempt alone.
+FIXTURE_SHARDS = 5
 # Wall minutes on 4 workers of the slow packages run 42520923530's attempt 1
 # finished, from its log. internal/conventions (1.2 min) is left out: 4 hangs at
 # the 60 s floor are most of it, and the projection has no term for hangs.
@@ -2495,10 +2496,10 @@ def by_package(module: dict) -> dict[str, dict]:
 
 
 def fixture_work_secs(packages: dict) -> dict[str, float]:
-    """Each package's projected worker-seconds: RUNNABLE x its mutant time."""
+    """Each package's projected worker-seconds, never measured: RUNNABLE x its mutant time x PRIOR_ERROR."""
     dearest = max((c for *_, c in packages.values() if c is not None), default=0)
     return {
-        pkg: runnable * (ms if ms is not None else dearest) / 1000
+        pkg: runnable * (ms if ms is not None else dearest) / 1000 * mutation_cost.PRIOR_ERROR
         for pkg, (runnable, _, ms) in packages.items()
     }
 
@@ -2518,7 +2519,7 @@ def test_shard_projects_deadset_go_past_one_job(tmp: Path) -> None:
     setup = float(env['setup_secs']) + float(env['suite_secs'])
     one_job = (setup + sum(work.values()) / int(env['workers'])) / 60
     check(
-        'shard projection: one job is setup + suite + sum(RUNNABLE x mutant time) / workers',
+        'shard projection: one job is setup + suite + sum(RUNNABLE x mutant time x PRIOR_ERROR) / workers',
         ok=abs(plan['one_job_minutes'] - one_job) < 0.1,
         detail=f'{plan["one_job_minutes"]} vs {one_job:.1f}',
     )
@@ -3112,8 +3113,8 @@ def test_shard_bin_pack_longest_first(tmp: Path) -> None:
     )
     k, bins = shard.choose(items, {'.': 0}, 6)
     check(
-        'bin pack: an item past the band alone stops at the shard count that isolates it',
-        ok=k == 4 and max(b.load for b in bins) == 7,
+        'bin pack: an item past the band runs alone, and no shard of several items passes the top',
+        ok=k == 5 and sorted(b.load for b in bins) == [5, 5, 5, 6, 7],
         detail=f'{k} {[b.load for b in bins]}',
     )
     k, bins = shard.choose([], {'.': 0}, 6)
@@ -3183,7 +3184,10 @@ def test_shard_small_module_stays_one_unchanged_job(tmp: Path) -> None:
         'one shard: an integration module plans from the run inputs alone',
         ok=plan is not None
         and plan['shards'] == 1
-        and abs(plan['one_job_minutes'] - (200 + 30 + 30 * 300 / 4) / 60) < 0.1,
+        and abs(
+            plan['one_job_minutes'] - (200 + 30 + 30 * 300 * mutation_cost.PRIOR_ERROR / 4) / 60
+        )
+        < 0.1,
         detail=f'{plan and plan["one_job_minutes"]} {proc.stderr[-300:]}',
     )
 
@@ -4985,7 +4989,9 @@ def test_shard_keeps_every_shard_under_the_safe_limit_beside_a_slow_setup(tmp: P
                 'workers': 1,
                 'setup_secs': 80 * 60.0,
                 'packages': {},
-                'files': {'s/x.go': {'runnable': 10, 'prior_secs': 3600.0}},
+                'files': {
+                    's/x.go': {'runnable': 10, 'prior_secs': 3600.0 / mutation_cost.PRIOR_ERROR}
+                },
             },
             'fast': {
                 'mode': 'per-package',
@@ -4993,7 +4999,11 @@ def test_shard_keeps_every_shard_under_the_safe_limit_beside_a_slow_setup(tmp: P
                 'setup_secs': 0.0,
                 'packages': {},
                 'files': {
-                    f'p{n:03d}/x.go': {'runnable': 10, 'prior_secs': 300.0} for n in range(files)
+                    f'p{n:03d}/x.go': {
+                        'runnable': 10,
+                        'prior_secs': 300.0 / mutation_cost.PRIOR_ERROR,
+                    }
+                    for n in range(files)
                 },
             },
         },
@@ -5022,14 +5032,17 @@ def test_shard_keeps_every_shard_under_the_safe_limit_beside_a_slow_setup(tmp: P
 
 
 def unsized_doc(unsized: int, files: int = 6) -> dict:
-    """A sizing: one per-package module of FILES 66.7-min files on 1 worker, beside UNSIZED unsized modules."""
+    """A sizing: one per-package module of FILES files priced at 66.7 min on 1 worker, beside UNSIZED unsized modules."""
     modules = {
         '.': {
             'mode': 'per-package',
             'workers': 1,
             'setup_secs': 60.0,
             'packages': {},
-            'files': {f'p{n}/x.go': {'runnable': 100, 'prior_secs': 4000.0} for n in range(files)},
+            'files': {
+                f'p{n}/x.go': {'runnable': 100, 'prior_secs': 4000.0 / mutation_cost.PRIOR_ERROR}
+                for n in range(files)
+            },
         }
     }
     modules |= {
@@ -5195,6 +5208,38 @@ def test_history_measures_the_runner_slowdown_on_identical_work(tmp: Path) -> No
     )
 
 
+def test_shard_history_measures_prior_priced_work_per_shard(tmp: Path) -> None:
+    shard = load_script('gremlins_shard', SHARD)
+    files = {
+        'a/x.go': {'shard': 1, 'cost': 'prior', 'prior_secs': 100.0},
+        'a/y.go': {'shard': 1, 'cost': 'prior', 'prior_secs': 10.0},
+        'b/x.go': {'shard': 2, 'cost': 'measured', 'prior_secs': 1.0},
+        'c/x.go': {'shard': 2, 'cost': 'refused', 'prior_secs': 50.0},
+    }
+    measured = {
+        'a/x.go': {'secs': 200.0, 'mutants': 1},
+        'a/y.go': {'secs': 90.0, 'mutants': 1},
+        'b/x.go': {'secs': 900.0, 'mutants': 1},
+        'c/x.go': {'secs': 25.0, 'mutants': 1},
+    }
+    rows = shard.prior_rows({'mode': 'per-package', 'files': files}, measured)
+    integ = {'mode': 'integration', 'shards': [3], 'cost': 'prior', 'prior_secs': 40.0}
+    rows += shard.prior_rows(integ, {'.': {'secs': 100.0, 'mutants': 9}})
+    check(
+        "prior error: the record job takes each shard's prior-priced work against its prior, "
+        'never a measured file',
+        ok=sorted(rows) == [(1, 90.0, 10.0), (1, 200.0, 100.0), (2, 25.0, 50.0), (3, 100.0, 40.0)]
+        and mutation_cost.prior_error(rows) == 2.64,
+        detail=str(rows),
+    )
+    check(
+        'prior error: a history keeps it as a ratio or refuses it',
+        ok=shard.history_fault({'repo': 'r', 'modules': {}, 'prior_error': 2.5}, 'r') == ''
+        and 'prior_error'
+        in shard.history_fault({'repo': 'r', 'modules': {}, 'prior_error': -1}, 'r'),
+    )
+
+
 def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
     import contextlib
     import io
@@ -5213,7 +5258,7 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
 
     def want(doc: dict, room: int) -> int:
         items = [
-            mutation_cost.Item('.', p, f['prior_secs'])
+            mutation_cost.Item('.', p, f['prior_secs'] * mutation_cost.PRIOR_ERROR)
             for p, f in doc['modules']['.']['files'].items()
         ]
         return mutation_cost.choose(items, {'.': 60.0}, top, room)[0]
@@ -5813,6 +5858,7 @@ def main() -> int:
         test_history_measures_the_runner_slowdown_on_identical_work,
         test_prepare_seeds_the_root_only_when_it_has_a_go_mod,
         test_merge_takes_a_repo_of_nested_modules_with_no_root,
+        test_shard_history_measures_prior_priced_work_per_shard,
         test_shard_gives_each_unsized_module_a_shard_of_its_own,
         test_shard_keeps_every_shard_under_the_safe_limit_beside_a_slow_setup,
         test_shard_prices_a_probe_under_its_tick_as_unknown,

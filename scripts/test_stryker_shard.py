@@ -3,6 +3,7 @@ mutation-stryker-repo.yaml and weekly-stryker.yaml."""
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import io
 import itertools
@@ -459,6 +460,12 @@ def inside(first: int, last: int, unit: str) -> bool:
     return int(m['first']) <= first and last <= int(m['last'])
 
 
+def holds(unit: str, span: list) -> bool:
+    """Whether UNIT, a whole file or a range of it, holds SPAN's mutant."""
+    first, last = ss.lines_of(unit)
+    return first <= span[0] and span[1] <= last
+
+
 def ids(spans: list[list]) -> list[list]:
     """The plan pass's id of each span's mutant: an early one is ignored by a directive."""
     return [
@@ -605,7 +612,7 @@ class Ranges(unittest.TestCase):
         plan = json.loads((self.tmp / 'out' / 'r~web.json').read_text())
         self.assertEqual(list(plan['files'] or {'src/s.ts:1-3344': 0}), ['src/s.ts:1-3344'])
         self.assertIn(
-            "::warning::r:web: src/s.ts holds one mutant's span of 504 min", err.getvalue()
+            "::warning::r:web: src/s.ts holds one mutant's span of 1513 min", err.getvalue()
         )
 
     def matrix(self, doc: dict) -> tuple[list, list]:
@@ -708,7 +715,7 @@ class Ranges(unittest.TestCase):
             self.matrix(doc)
         plan = json.loads((self.tmp / 'out' / 'r~web.json').read_text())
         self.assertEqual((plan['shards'], plan['ids']), (1, {}))
-        self.assertIn("src/s.ts projects 504 min, past a shard's 135 min", err.getvalue())
+        self.assertIn("src/s.ts projects 1513 min, past a shard's 135 min", err.getvalue())
         self.assertIn('gave no mutant ids', err.getvalue())
 
     def test_openers_are_the_file_scope_directives_where_babel_counts_them(self):
@@ -871,6 +878,7 @@ class RangeMerge(unittest.TestCase):
                 },
                 'setup_secs': 50.0,
                 'blobs': {'src/s.ts': 'a' * 40},
+                'prior_error': None,
             },
         )
 
@@ -1338,6 +1346,7 @@ class Merge(unittest.TestCase):
                 },
                 'setup_secs': 51.5,
                 'blobs': {},
+                'prior_error': None,
             },
         )
 
@@ -1367,6 +1376,7 @@ class Merge(unittest.TestCase):
                 },
                 'setup_secs': 51.0,
                 'blobs': {},
+                'prior_error': None,
             },
         )
 
@@ -1422,7 +1432,12 @@ class Merge(unittest.TestCase):
         self.assertEqual(self.merge(plan=lone), 1)
         self.assertEqual(
             self.history(),
-            {'files': self.PLAN['history']['files'], 'setup_secs': 40.0, 'blobs': {}},
+            {
+                'files': self.PLAN['history']['files'],
+                'setup_secs': 40.0,
+                'blobs': {},
+                'prior_error': None,
+            },
         )
 
     def test_a_run_that_killed_nothing_publishes_and_records_nothing(self):
@@ -2078,3 +2093,148 @@ class Wiring(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RecordedRun(unittest.TestCase):
+    """Run 43328238671 (marotte static-src, 7 shards) replayed: its plan pass's sizing and the cost
+    each of its units measured, spread over the unit's mutants by their prior."""
+
+    FIXTURE: ClassVar[dict] = json.loads(
+        gzip.open(SCRIPTS / 'testdata' / 'mutation-cost' / 'marotte-43328238671.json.gz').read()
+    )
+
+    def actual(self) -> dict[str, list[float]]:
+        """Each file's measured worker-seconds per mutant, in its spans' order."""
+        sizing, costs = self.FIXTURE['sizing'], self.FIXTURE['costs']
+        out = {}
+        for path, f in sizing['files'].items():
+            spans, got = f['spans'], [0.0] * len(f['spans'])
+            for unit, e in costs['files'].items():
+                if ss.file_of(unit) != path:
+                    continue
+                held = [i for i, s in enumerate(spans) if holds(unit, s) and s[2]]
+                total = sum(spans[i][2] for i in held)
+                for i in held:
+                    got[i] += e['secs'] * spans[i][2] / total
+            out[path] = got
+        return out
+
+    def slowest(self, history: dict | None) -> tuple[dict, list[float]]:
+        """The plan from HISTORY, and each of its shards' measured minutes on a SLOWDOWN-times slower runner."""
+        sizing, costs = self.FIXTURE['sizing'], self.FIXTURE['costs']
+        with unittest.mock.patch('sys.stderr', new_callable=io.StringIO):
+            plan, _ = ss.assign(sizing, history)
+        files = plan['files'] or {p: {'shard': 1} for p in sizing['files']}
+        per = self.actual()
+        jobs = [costs['setup_secs']] * plan['shards']
+        for unit, f in files.items():
+            path = ss.file_of(unit)
+            spans = sizing['files'][path]['spans']
+            jobs[f['shard'] - 1] += (
+                sum(c for s, c in zip(spans, per[path], strict=True) if holds(unit, s))
+                / sizing['workers']
+            )
+        return plan, [j / 60 * ss.mutation_cost.SLOWDOWN for j in jobs]
+
+    def test_every_measured_unit_is_one_the_plan_pass_found(self):
+        units = self.FIXTURE['costs']['files']
+        self.assertEqual(
+            {ss.file_of(u) for u in units}, set(self.FIXTURE['sizing']['files']), sorted(units)
+        )
+        for path, got in self.actual().items():
+            want = sum(e['secs'] for u, e in units.items() if ss.file_of(u) == path)
+            self.assertAlmostEqual(sum(got), want, places=3, msg=path)
+
+    def test_a_first_week_entry_ends_every_shard_by_the_safe_limit_on_the_slowest_runner(self):
+        limit = ss.mutation_cost.SAFE_JOB_MINUTES
+        for name, history in (
+            ('no history', None),
+            ('the partial sample this run planned from', self.FIXTURE['planned_from']),
+        ):
+            with self.subTest(history=name):
+                plan, jobs = self.slowest(history)
+                self.assertGreater(plan['shards'], 1)
+                self.assertLessEqual(max(jobs), limit, [round(j, 1) for j in jobs])
+
+    def test_the_run_s_own_history_plans_shards_within_the_bar(self):
+        costs = self.FIXTURE['costs']
+        plan, jobs = self.slowest({'files': costs['files'], 'setup_secs': costs['setup_secs']})
+        self.assertLessEqual(max(jobs), ss.mutation_cost.SAFE_JOB_MINUTES)
+        measured = [j / ss.mutation_cost.SLOWDOWN for j in jobs]
+        self.assertEqual(
+            ss.mutation_cost.bar_faults(plan['projected_minutes'], [measured]), [], measured
+        )
+
+
+class Counts(unittest.TestCase):
+    """count_rows judges a later run's statuses per file, only where the file's blob is unchanged."""
+
+    @staticmethod
+    def report(**files: dict[str, int]) -> dict:
+        return {
+            'files': {
+                p: {'mutants': [{'status': s} for s, n in c.items() for _ in range(n)]}
+                for p, c in files.items()
+            }
+        }
+
+    def test_each_file_is_matched_differs_or_skipped_by_its_blob(self):
+        a, b, c = 'a' * 40, 'b' * 40, 'c' * 40
+        rows = [
+            # file, baseline, proof, baseline blob, proof blob, verdict
+            (
+                'same',
+                {'Killed': 435, 'Survived': 69},
+                {'Killed': 437, 'Survived': 67},
+                a,
+                a,
+                'match',
+            ),
+            (
+                'moved',
+                {'Killed': 400, 'Survived': 100},
+                {'Killed': 480, 'Survived': 20},
+                a,
+                a,
+                'differs',
+            ),
+            ('grown', {'Killed': 10}, {'Killed': 11}, a, a, 'differs'),
+            ('small', {'Killed': 5, 'Timeout': 2}, {'Killed': 7}, a, a, 'match'),
+            ('edited', {'Killed': 10}, {'Killed': 90}, a, b, 'skipped'),
+            ('unknown', {'Killed': 10}, {'Killed': 90}, None, c, 'skipped'),
+            ('deleted', {'Killed': 10}, None, a, None, 'skipped'),
+            ('added', None, {'Killed': 10}, None, a, 'skipped'),
+        ]
+        old = self.report(**{f: x for f, x, *_ in rows if x})
+        new = self.report(**{f: y for f, _, y, *_ in rows if y})
+        before = {f: p for f, _, _, p, _, _ in rows if p}
+        after = {f: q for f, _, _, _, q, _ in rows if q}
+        got = {r['file']: r['verdict'] for r in ss.count_rows(old, new, before, after)}
+        self.assertEqual(got, {f: v for f, *_, v in rows})
+
+    def test_the_cli_exits_1_only_when_an_unchanged_file_differs(self):
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        blobs = {'x.ts': 'a' * 40}
+        for name, doc in (
+            ('base.json', self.report(**{'x.ts': {'Killed': 10}})),
+            ('ok.json', self.report(**{'x.ts': {'Killed': 9, 'Survived': 1}})),
+            ('bad.json', self.report(**{'x.ts': {'Survived': 10}})),
+            ('blobs.json', blobs),
+        ):
+            (tmp / name).write_text(json.dumps(doc))
+        for proof, rc in (('ok.json', 0), ('bad.json', 1)):
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SHARD),
+                    'counts',
+                    *('--baseline', str(tmp / 'base.json'), '--proof', str(tmp / proof)),
+                    *('--baseline-blobs', str(tmp / 'blobs.json')),
+                    *('--proof-blobs', str(tmp / 'blobs.json')),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            with self.subTest(proof=proof):
+                self.assertEqual(proc.returncode, rc, proc.stderr)

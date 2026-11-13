@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import zipfile
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
@@ -76,20 +77,32 @@ class History(unittest.TestCase):
 
 
 class Project(unittest.TestCase):
-    def test_history_prices_a_file_per_mutant_and_scales_the_prior_of_the_rest(self):
+    def test_history_prices_a_file_per_mutant_and_the_rest_at_its_prior_times_the_error(self):
+        e = mutation_cost.PRIOR_ERROR
         units = {'a': (4, 100.0), 'b': (2, 50.0), 'new': (3, 30.0)}
-        hist = {'files': {'a': {'secs': 80.0, 'mutants': 2}, 'b': {'secs': 10.0, 'mutants': 1}}}
+        hist = {'files': {'a': {'secs': 160.0, 'mutants': 4}, 'b': {'secs': 30.0, 'mutants': 3}}}
         got = mutation_cost.project(units, hist)
-        # Measured 4 x 40 + 2 x 10 = 180 against a prior of 150, so new costs 30 x 1.2.
+        # Measured files set no ratio for the rest: one file's prior error says nothing of another's.
         self.assertEqual(
-            got, {'a': (160.0, 'measured'), 'b': (20.0, 'measured'), 'new': (36.0, 'prior')}
+            got, {'a': (160.0, 'measured'), 'b': (20.0, 'measured'), 'new': (30.0 * e, 'prior')}
         )
 
-    def test_no_history_is_the_prior(self):
-        self.assertEqual(mutation_cost.project({'a': (1, 7.0)}, None), {'a': (7.0, 'prior')})
-        self.assertEqual(
-            mutation_cost.project({'a': (1, 7.0)}, {'files': 'junk'}), {'a': (7.0, 'prior')}
-        )
+    def test_no_history_is_the_prior_times_the_error(self):
+        want = {'a': (7.0 * mutation_cost.PRIOR_ERROR, 'prior')}
+        self.assertEqual(mutation_cost.project({'a': (1, 7.0)}, None), want)
+        self.assertEqual(mutation_cost.project({'a': (1, 7.0)}, {'files': 'junk'}), want)
+
+    def test_a_partial_sample_prices_only_the_mutants_it_measured(self):
+        e = mutation_cost.PRIOR_ERROR
+        # 987 of 1672 mutants measured at 72.4 s each before a deadline cut the shard.
+        hist = {'files': {'s.ts': {'secs': 987 * 72.4, 'mutants': 987}}}
+        got = mutation_cost.project({'s.ts': (1672, 1672 * 30.0), 'u.ts': (5, None)}, hist)
+        self.assertAlmostEqual(got['s.ts'][0], 987 * 72.4 + 685 * 30.0 * e)
+        self.assertEqual(got['s.ts'][1], 'partial')
+        # With no prior the measured rate is all there is.
+        hist['files']['u.ts'] = {'secs': 20.0, 'mutants': 2}
+        got = mutation_cost.project({'u.ts': (5, None)}, hist)
+        self.assertEqual(got, {'u.ts': (50.0, 'measured')})
 
     def test_a_file_with_no_mutant_left_costs_nothing(self):
         got = mutation_cost.project({'a': (0, 5.0)}, {'files': {'a': {'secs': 9.0, 'mutants': 3}}})
@@ -117,13 +130,11 @@ class Project(unittest.TestCase):
             }
         }
         got = mutation_cost.project(units, hist)
-        # ok (20 against 10) and edge (10f against 10) set the ratio: (20 + 10f) / 20.
-        ratio = (20 + 10 * f) / 20
         self.assertEqual(got['ok'], (20.0, 'measured'))
         self.assertEqual(got['edge'], (10.0 * f, 'measured'))
         for name in ('zero', 'huge', 'tiny', 'new'):
             with self.subTest(name=name):
-                self.assertAlmostEqual(got[name][0], 10.0 * ratio)
+                self.assertAlmostEqual(got[name][0], 10.0 * mutation_cost.PRIOR_ERROR)
                 self.assertEqual(got[name][1], 'prior' if name == 'new' else 'refused')
         self.assertEqual(got['free'], (0.0, 'refused'))
 
@@ -156,12 +167,12 @@ class Project(unittest.TestCase):
         self.assertEqual(got['zero'], (None, 'unknown'))
         self.assertEqual(got['empty'], (0.0, 'prior'))
 
-    def test_an_unknown_prior_does_not_skew_the_ratio_of_the_rest(self):
+    def test_an_unknown_prior_does_not_change_the_price_of_the_rest(self):
         units = {'a': (4, 100.0), 'u': (10, None), 'new': (3, 30.0)}
         hist = {'files': {'a': {'secs': 80.0, 'mutants': 2}, 'u': {'secs': 1e4, 'mutants': 10}}}
         got = mutation_cost.project(units, hist)
         self.assertEqual(got['u'], (1e4, 'measured'))
-        self.assertEqual(got['new'], (48.0, 'prior'))
+        self.assertEqual(got['new'], (30.0 * mutation_cost.PRIOR_ERROR, 'prior'))
 
     def test_a_measured_setup_outside_the_factor_of_its_probe_is_refused(self):
         f = mutation_cost.PRICE_FACTOR
@@ -283,6 +294,16 @@ class Choose(unittest.TestCase):
     def test_an_item_over_the_band_stops_at_the_fewest_shards_that_isolate_it(self):
         k, bins = mutation_cost.choose(self.items(500, 30, 20), {'m': 10}, 115)
         self.assertEqual((k, max(b.load for b in bins)), (2, 510))
+
+    def test_an_item_past_the_top_runs_alone_and_the_rest_still_fit_the_top(self):
+        k, bins = mutation_cost.choose(self.items(500, 300, 60, 50, 40), {'m': 0}, 115)
+        self.assertEqual(k, 4)
+        self.assertEqual(sorted(b.load for b in bins), [60, 90, 300, 500])
+        items = self.items(500, 300, 60, 50, 40)
+        self.assertFalse(mutation_cost.capped(k, bins, items, {'m': 0}, 115, 4))
+        k, bins = mutation_cost.choose(items, {'m': 0}, 115, 3)
+        self.assertEqual(sorted(b.load for b in bins), [150, 300, 500])
+        self.assertTrue(mutation_cost.capped(k, bins, items, {'m': 0}, 115, 3))
 
     def test_two_thousand_items_with_one_over_the_target_choose_in_seconds(self):
         items = self.items(5000, *[1.0 + i % 7 for i in range(1999)])
@@ -409,6 +430,38 @@ class Bar(unittest.TestCase):
         )
 
 
+class PriorError(unittest.TestCase):
+    def test_the_measure_is_the_largest_shard_sum_of_prior_priced_work_against_its_prior(self):
+        rows = [(1, 30.0, 10.0), (1, 2.0, 10.0), (2, 9.0, 1.0), (2, 1.0, 9.0), (3, 5.0, 0.0)]
+        # Shard 1 took 32 of 20, shard 2 10 of 10: a small unit's 9x moves only its shard.
+        self.assertEqual(mutation_cost.prior_error(rows), 1.6)
+        self.assertIsNone(mutation_cost.prior_error([]))
+        self.assertIsNone(mutation_cost.prior_error([(1, 5.0, 0.0)]))
+
+    def test_a_measure_past_the_constant_warns_and_any_measure_is_summarized(self):
+        for measured, warned in (
+            (None, False),
+            (1.0, False),
+            (mutation_cost.PRIOR_ERROR + 0.1, True),
+        ):
+            with (
+                self.subTest(measured=measured),
+                unittest.mock.patch.object(mutation_cost, 'annotate') as annotate,
+                unittest.mock.patch.object(mutation_cost, 'summarize') as summarize,
+                unittest.mock.patch.object(mutation_cost, 'say'),
+            ):
+                mutation_cost.note_prior_error('r', measured)
+                self.assertEqual(annotate.called, warned)
+                self.assertEqual(summarize.call_count, int(measured is not None))
+
+    def test_a_record_s_prior_error_is_a_ratio_or_none(self):
+        base = {'files': {}, 'setup_secs': 1.0}
+        self.assertEqual(mutation_cost.record_fault({**base, 'prior_error': 2.5}), '')
+        self.assertEqual(mutation_cost.record_fault({**base, 'prior_error': None}), '')
+        self.assertIn('prior_error', mutation_cost.record_fault({**base, 'prior_error': -1}))
+        self.assertIn('prior_error', mutation_cost.record_fault({**base, 'prior_error': 'x'}))
+
+
 class MatrixBound(unittest.TestCase):
     def test_one_call_s_run_matrix_fits_one_github_matrix(self):
         self.assertLessEqual(
@@ -443,7 +496,7 @@ class CarryForward(unittest.TestCase):
         for old in (None, [], {'files': [1], 'setup_secs': -1}):
             self.assertEqual(mutation_cost.carry_forward(new, old), new)
 
-    def test_a_sample_under_half_its_planned_mutants_never_replaces_the_last_measure(self):
+    def test_a_sample_under_half_its_planned_mutants_replaces_no_last_measure_and_fills_none(self):
         new = {
             'files': {
                 'cut': {'secs': 2.0, 'mutants': 4},
@@ -463,6 +516,7 @@ class CarryForward(unittest.TestCase):
             {
                 'cut': {'secs': 90.0, 'mutants': 10},
                 'half': {'secs': 6.0, 'mutants': 5},
+                'new': {'secs': 1.0, 'mutants': 1},
                 'whole': {'secs': 7.0, 'mutants': 10},
             },
         )

@@ -200,24 +200,20 @@ def module_history(history: dict | None, dir_: str) -> dict:
 
 
 def integration_price(e: dict, h: dict) -> tuple[float | None, str]:
-    """An integration module's worker-seconds: its mutants at the history's plausible cost per mutant, else its prior.
+    """An integration module's worker-seconds, priced as mutation_cost.project prices a file.
 
-    A module with no mutants costs 0 whatever its history. With no prior (its
-    suite ran under the clock's tick) and no usable history the price is
-    (None, 'unknown').
+    Its history's mutants cost what they took, at a plausible cost per mutant;
+    the rest cost their share of the prior times PRIOR_ERROR. A module with no
+    mutants costs 0 whatever its history. With no prior (its suite ran under
+    the clock's tick) and no usable history the price is (None, 'unknown').
     """
-    prior = e['prior_secs']
     if not e['mutants']:
         return 0.0, 'prior'
     hist = mutation_cost.clean_files(h.get('files'))
     done = sum(f['mutants'] for f in hist.values())
-    cost = sum(f['secs'] for f in hist.values()) / done if done else None
-    probe = None if prior is None else prior / e['mutants']
-    if cost is not None and mutation_cost.plausible(cost, probe):
-        return e['mutants'] * cost, 'measured'
-    if prior is None:
-        return None, 'unknown'
-    return prior, 'prior' if cost is None else 'refused'
+    total = {'files': {'.': {'secs': sum(f['secs'] for f in hist.values()), 'mutants': done}}}
+    priced = mutation_cost.project({'.': (e['mutants'], e['prior_secs'])}, total if done else None)
+    return priced['.']
 
 
 def with_unsized(
@@ -465,13 +461,14 @@ def history_fault(doc: object, repo: str) -> str:
     """Why DOC is not REPO's whole cost history, or ''; a history is used whole or not at all."""
     if (
         not isinstance(doc, dict)
-        or not set(doc) <= {'repo', 'modules', 'slowdown'}
+        or not set(doc) <= {'repo', 'modules', 'slowdown', 'prior_error'}
         or doc.get('repo') != repo
         or not isinstance(doc.get('modules'), dict)
     ):
-        return f"it is not {repo}'s {{repo, modules, slowdown}} object"
-    if doc.get('slowdown') is not None and not mutation_cost.nonnegative(doc['slowdown']):
-        return f'its slowdown {doc["slowdown"]!r:.200} is not a ratio'
+        return f"it is not {repo}'s {{repo, modules, slowdown, prior_error}} object"
+    for key in ('slowdown', 'prior_error'):
+        if doc.get(key) is not None and not mutation_cost.nonnegative(doc[key]):
+            return f'its {key} {doc[key]!r:.200} is not a ratio'
     for d, rec in doc['modules'].items():
         if why := mutation_cost.record_fault(rec):
             return f'module {d!r:.200}: {why}'
@@ -660,6 +657,28 @@ def slowdown(runs: dict[str, dict[str, tuple[float, int]]]) -> float | None:
     return round(max(ratios), 2) if ratios else None
 
 
+def prior_rows(e: object, measured: dict) -> list[tuple[object, float, float]]:
+    """(shard, measured seconds, prior seconds) of each unit of plan module E priced from its prior alone,
+    for mutation_cost.prior_error; MEASURED is this run's mean per file over its attempts."""
+    if not isinstance(e, dict):
+        return []
+    prior_priced = ('prior', 'refused')
+    if e.get('mode') == 'integration':
+        shards = e.get('shards') or [None]
+        if e.get('cost') not in prior_priced or not measured or not e.get('prior_secs'):
+            return []
+        return [(shards[0], sum(f['secs'] for f in measured.values()), e['prior_secs'])]
+    files = e.get('files') if isinstance(e.get('files'), dict) else {}
+    return [
+        (f.get('shard'), measured[p]['secs'], f['prior_secs'])
+        for p, f in files.items()
+        if isinstance(f, dict)
+        and f.get('cost') in prior_priced
+        and p in measured
+        and mutation_cost.nonnegative(f.get('prior_secs'))
+    ]
+
+
 def history(
     repo: str, artifacts_dir: Path, previous: Path | None = None, plan: Path | None = None
 ) -> dict | None:
@@ -696,6 +715,7 @@ def history(
     if isinstance(planned, dict):
         dirs &= set(planned)
     modules = {}
+    rows: list[tuple[object, float, float]] = []
     for d in sorted(dirs):
         e = planned.get(d) if isinstance(planned, dict) else None
         files = e.get('files') if isinstance(e, dict) and e.get('mode') == 'per-package' else None
@@ -715,13 +735,20 @@ def history(
             and e.get('mode') == 'integration'
             and mutation_cost.count(e.get('mutants'))
             and sum(f['mutants'] for f in new['files'].values()) * 2 < e['mutants']
+            and mutation_cost.clean_files((old.get(d) or {}).get('files'))
         ):
             # integration_price prices the module from its total, so a short sample keeps the last one whole.
             new = {**new, 'files': {}}
+        rows += prior_rows(e, new['files'])
         modules[d] = mutation_cost.carry_forward(new, old.get(d), keep, counts)
     if not any(m['files'] or m['setup_secs'] is not None for m in modules.values()):
         return None
-    return {'repo': repo, 'modules': modules, 'slowdown': slowdown(runs)}
+    return {
+        'repo': repo,
+        'modules': modules,
+        'slowdown': slowdown(runs),
+        'prior_error': mutation_cost.prior_error(rows),
+    }
 
 
 def parse_module_arg(raw: str) -> tuple[str, Path]:
@@ -813,6 +840,7 @@ def main() -> int:
                     t'{mutation_cost.SLOWDOWN}x mutation_cost.SLOWDOWN plans for',
                     summary=True,
                 )
+        mutation_cost.note_prior_error(args.repo, doc['prior_error'])
     return 0
 
 

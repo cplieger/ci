@@ -3,8 +3,8 @@
 gremlins and Stryker each report one completion per mutant while a fixed pool of
 workers runs the mutants in file order. A file's measured cost is the gap before
 each of its completions times the workers (attribute). The next run prices a file
-from that history, or from its tool's prior times the measured-to-prior ratio of
-the files that have both (project), and packs files into shards that each end
+from that history, or from its tool's prior times PRIOR_ERROR (project), and
+packs files into shards that each end
 near a target (choose), at most MAX_SHARDS of them.
 """
 
@@ -39,6 +39,11 @@ SAFE_JOB_MINUTES = 300
 # gremlins run 43328219246 (shard 2's work took 85, 125 and 161 min), past the 1.76
 # of run 43153682226. gremlins-shard.py's record job measures it each week and warns past this.
 SLOWDOWN = 1.9
+# A unit no run has measured is planned at its tool's prior times this: the largest measured
+# ratio of actual cost to the prior price a plan gave, rounded up to 0.5. Stryker run
+# 43328238671's store.ts took 2.69x its price (its shard 2.31x). Both weekly records measure
+# it per shard (prior_error) and warn past this.
+PRIOR_ERROR = 3.0
 # A job matrix runs at most 256 jobs (https://docs.github.com/en/actions/reference/limits),
 # which one call's run matrix keeps: MAX_SHARDS dirs of MAX_SHARDS shards (Stryker),
 # or 3 attempts of MAX_SHARDS shards (gremlins).
@@ -199,9 +204,10 @@ def choose(
     The band runs from TOP x (1 - BAND) / (1 + BAND) to TOP. One job when it
     ends by the top; else the fewest shards that all land inside the band, else
     the fewest whose slowest ends by the top. When no count gets there, because
-    one item and its setup (the floor) pass the top or LIMIT stops the search
-    first, the fewest shards that reach the floor, or failing that the lowest
-    slowest shard.
+    an item and its setup pass the top or LIMIT stops the search first, the
+    fewest shards in which only an item running alone passes the top, or
+    failing that the fewest whose slowest shard of several items (crowded) is
+    lowest: no count shortens an item running alone.
     """
     high, low = top, top * (1 - BAND) / (1 + BAND)
     one = pack(items, 1, setup)
@@ -217,7 +223,7 @@ def choose(
     least = total / bound if bound > 0 else math.inf
     start = min(limit, max(2, math.ceil(least))) if math.isfinite(least) else limit
     fit: tuple[int, list[Bin]] | None = None
-    best: tuple[float, int, list[Bin]] = (one[0].load, 1, one)
+    best: tuple[tuple[float, float], int, list[Bin]] = ((crowded(one), one[0].load), 1, one)
     for k in range(start, limit + 1):
         bins = pack(items, k, setup)
         loads = [b.load for b in bins]
@@ -227,21 +233,26 @@ def choose(
             fit = fit or (k, bins)
             if total / (k + 1) + setups < low:
                 break
-        elif fit is None and max(loads) <= floor:
+        elif fit is None and all(b.load <= high or len(b.items) == 1 for b in bins):
             return k, bins
-        if max(loads) < best[0]:
-            best = (max(loads), k, bins)
+        if (crowded(bins), max(loads)) < best[0]:
+            best = ((crowded(bins), max(loads)), k, bins)
     if fit is not None:
         return fit
     return best[1], best[2]
 
 
+def crowded(bins: list[Bin]) -> float:
+    """The slowest of BINS that holds more than one item, which more shards could shorten; 0 for none."""
+    return max((b.load for b in bins if len(b.items) > 1), default=0.0)
+
+
 def capped(
     k: int, bins: list[Bin], items: list[Item], setup: dict[str, float], top: float, limit: int
 ) -> bool:
-    """Whether LIMIT, not the prices, set choose's K: more shards would have ended its slowest sooner."""
-    slowest = max((b.load for b in bins), default=0.0)
-    return k == limit < len(items) and slowest > max(top, floor_secs(items, setup))
+    """Whether LIMIT, not the prices, set choose's K: more shards would have ended a shard of
+    several items, past the top, sooner."""
+    return k == limit < len(items) and crowded(bins) > top
 
 
 def cap_reason(cap: int) -> str:
@@ -415,9 +426,12 @@ def clean_files(files: object) -> dict[str, dict]:
 
 
 def record_fault(rec: object) -> str:
-    """Why REC is not a cost record ({files: {path: {secs, mutants}}, setup_secs}, Stryker's with blobs), or ''."""
-    if not isinstance(rec, dict) or not set(rec) <= {'files', 'setup_secs', 'blobs'}:
-        return 'it is not a {files, setup_secs, blobs} object'
+    """Why REC is not a cost record ({files: {path: {secs, mutants}}, setup_secs}, Stryker's with
+    blobs and prior_error), or ''."""
+    if not isinstance(rec, dict) or not set(rec) <= {'files', 'setup_secs', 'blobs', 'prior_error'}:
+        return 'it is not a {files, setup_secs, blobs, prior_error} object'
+    if rec.get('prior_error') is not None and not nonnegative(rec['prior_error']):
+        return f'its prior_error {rec["prior_error"]!r:.200} is not a ratio'
     blobs = rec.get('blobs', {})
     if not isinstance(blobs, dict) or not all(
         isinstance(v, str) and GIT_BLOB.fullmatch(v) for v in blobs.values()
@@ -464,17 +478,19 @@ def carry_forward(
     """NEW's history with OLD's last measure of each file NEW did not measure, limited to KEEP when given.
 
     A file a run never reached before its job stopped, or whose shard left no
-    record, has no new measure, so its last one still prices it. Nor does a
-    file whose new sample holds under half of its PLANNED mutants, the few a
-    job finished before its budget cut it.
+    record, has no new measure, so its last one still prices it. A new sample
+    under half of its PLANNED mutants, the few a job finished before its budget
+    cut it, replaces no last measure; with none it is kept, and project()
+    prices only the mutants it measured.
     """
     old = old if isinstance(old, dict) else {}
+    last = clean_files(old.get('files'))
     fresh = {
         p: e
         for p, e in clean_files(new.get('files')).items()
-        if planned is None or e['mutants'] * 2 >= planned.get(p, 0)
+        if planned is None or e['mutants'] * 2 >= planned.get(p, 0) or p not in last
     }
-    files = {**clean_files(old.get('files')), **fresh}
+    files = {**last, **fresh}
     setup = new.get('setup_secs') if nonnegative(new.get('setup_secs')) else old.get('setup_secs')
     return {
         'files': {p: e for p, e in sorted(files.items()) if keep is None or p in keep},
@@ -485,41 +501,66 @@ def carry_forward(
 def project(
     units: dict[str, tuple[int, float | None]], history: dict | None
 ) -> dict[str, tuple[float | None, str]]:
-    """Each file's worker-seconds for the next run, and whether history or the prior priced it.
+    """Each file's worker-seconds for the next run, and how it was priced.
 
     units: {path: (mutants the next run executes there, the tool's prior
     worker-seconds, None when its probe measured nothing)}. A file with a
-    plausible history costs its mutants times its measured cost per mutant. Any
-    other costs its prior times the measured-to-prior ratio over the files
-    priced from history, or the prior alone when none is; one whose history was
-    implausible is marked 'refused'. A file with mutants, no prior and no usable
-    history is (None, 'unknown'): its cost is not known, never 0.
+    plausible history costs its mutants at their measured cost per mutant
+    ('measured'). When that history measured fewer mutants than the next run
+    executes (a deadline-cut sample, or mutants added since), the measured ones
+    cost what they took and the rest their share of the prior times
+    PRIOR_ERROR ('partial'). Any other file costs its prior times PRIOR_ERROR
+    ('prior', or 'refused' when its history was implausible). A file with
+    mutants, no prior and no usable history is (None, 'unknown'), never 0.
     """
     hist = clean_files(history.get('files') if isinstance(history, dict) else None)
-    per_mutant, refused = {}, set()
-    for path, (n, p) in units.items():
-        if path not in hist:
-            continue
-        cost = hist[path]['secs'] / hist[path]['mutants']
-        if n == 0 or plausible(cost, None if p is None else p / n):
-            per_mutant[path] = cost
-        else:
-            refused.add(path)
-    priced = [p for p in per_mutant if units[p][0] > 0 and units[p][1] is not None]
-    measured = sum(units[p][0] * per_mutant[p] for p in priced)
-    prior = sum(units[p][1] for p in priced)
-    ratio = measured / prior if measured > 0 and prior > 0 else 1.0
-    if not math.isfinite(ratio):
-        ratio = 1.0
     out: dict[str, tuple[float | None, str]] = {}
     for path, (n, p) in units.items():
-        if path in per_mutant:
-            out[path] = (n * per_mutant[path], 'measured')
+        h = hist.get(path)
+        cost = None if h is None else h['secs'] / h['mutants']
+        if h is not None and (n == 0 or plausible(cost, None if p is None else p / n)):
+            if h['mutants'] >= n or p is None:
+                out[path] = (n * cost, 'measured')
+            else:
+                out[path] = (h['secs'] + (n - h['mutants']) * p / n * PRIOR_ERROR, 'partial')
         elif p is None:
             out[path] = (None, 'unknown') if n else (0.0, 'prior')
         else:
-            out[path] = (p * ratio, 'refused' if path in refused else 'prior')
+            out[path] = (p * PRIOR_ERROR, 'prior' if h is None else 'refused')
     return out
+
+
+def prior_error(rows: Iterable[tuple[object, float, float]]) -> float | None:
+    """The largest ratio, over shards, of what a plan's prior-priced units took to their prior, or None.
+
+    ROWS holds (shard, measured seconds, prior seconds) per measured unit the
+    plan priced from its prior alone. Summing per shard keeps a unit too small
+    to move its shard from setting the ratio; a unit that fills its shard sets
+    it whole.
+    """
+    acc: dict[object, list[float]] = {}
+    for shard, measured, prior in rows:
+        a = acc.setdefault(shard, [0.0, 0.0])
+        a[0] += measured
+        a[1] += prior
+    ratios = [m / p for m, p in acc.values() if p > 0]
+    return round(max(ratios), 2) if ratios else None
+
+
+def note_prior_error(where: str, measured: float | None) -> None:
+    """Log and summarize this week's measured prior error, warning when it is past PRIOR_ERROR."""
+    if measured is None:
+        return
+    line = t'{where}: prior-priced work took up to {measured}x its prior in one shard this week'
+    say(line)
+    summarize(line)
+    if measured > PRIOR_ERROR:
+        annotate(
+            'warning',
+            t'{where}: prior-priced work took {measured}x its prior in one shard, past the '
+            t'{PRIOR_ERROR}x mutation_cost.PRIOR_ERROR plans it at',
+            summary=True,
+        )
 
 
 def refusals(priced: dict[str, tuple[float, str]]) -> int:

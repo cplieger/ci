@@ -16,6 +16,7 @@ import argparse
 import collections
 import importlib.util
 import json
+import math
 import re
 import subprocess
 import sys
@@ -37,9 +38,8 @@ _spec.loader.exec_module(stryker_aggregate)
 # (TypeScript checker, runner IPC): 0.96 in ui's run of 42418943692 (55 min x 4
 # workers, less 45.7 min of summed duration x 4/2, over 8059 mutants), fitted
 # with the 2 runners its checker leaves of 4 workers while checking. Stryker's
-# freeCheckers() hands those back once checking ends, so the half split is an
-# upper bound that over-prices a never-run entry. sse/web bounds nothing: its
-# summed durations exceed what 2 runners could hold.
+# freeCheckers() hands those back once checking ends. The prior still ran 2.69x
+# low on marotte's store.ts, so plans scale it by mutation_cost.PRIOR_ERROR.
 PRIOR_OVERHEAD_SECS = 0.96
 # The run job's steps outside the Stryker process (checkout, clone, npm ci,
 # upload) took 40 s to 1 min in run 42418943692.
@@ -424,6 +424,12 @@ def lines_of(unit: str) -> tuple[float, float]:
     return (int(m['first']), int(m['last'])) if m else (1, float('inf'))
 
 
+def overlaps(u: str, v: str) -> bool:
+    """Whether units U and V share a line of one file."""
+    (a, b), (c, d) = lines_of(u), lines_of(v)
+    return file_of(u) == file_of(v) and a <= d and c <= b
+
+
 def by_file(history: dict | None) -> dict | None:
     """HISTORY with each split file's range rows summed into one row per file, which project() prices."""
     if not isinstance(history, dict):
@@ -552,6 +558,7 @@ def assign(
         )
     shardable = doc.get('shardable') is True and bool(doc['files'])
     units: dict[str, tuple[str, int, int]] = {}
+    priors: dict[str, float] = {}
     items = []
     for path, f in doc['files'].items():
         work = priced[path][0] / workers
@@ -574,6 +581,9 @@ def assign(
         for unit, run, early, w in pieces:
             units[unit] = (path, run, early)
             items.append(mutation_cost.Item('.', unit, w))
+            if priced[path][1] in ('prior', 'refused'):
+                # A prior-priced file's pieces are cut by prior weight, so each holds its share of work.
+                priors[unit] = f['prior_secs'] * (w / work if work > 0 else 1.0)
     one_job = setup + sum(it.work for it in items)
     k, bins = (
         mutation_cost.choose(items, {'.': setup}, top, limit)
@@ -591,6 +601,8 @@ def assign(
                 'work_secs': round(it.work, 1),
                 'cost': priced[path][1],
             }
+            if it.unit in priors:
+                files[it.unit]['prior_secs'] = round(priors[it.unit], 3)
     plan = {k_: doc[k_] for k_ in ('repo', 'dir', 'sha', 'break', 'workers')}
     split_files = sorted({file_of(u) for u in files if RANGE.fullmatch(u)}) if k > 1 else []
     plan.update(
@@ -955,35 +967,46 @@ def resolved_break(report: dict, planned: object) -> object:
 
 
 def write_history(
-    out: Path, setups: list[dict], plan: dict, measured: dict, keep: set[str] | None
+    out: Path,
+    setups: list[dict],
+    plan: dict,
+    measured: dict,
+    keep: set[str] | None,
+    prior_error: float | None = None,
 ) -> None:
     """OUT/costs.json: this run's measure of each unit, else its last one, for the files of KEEP when given.
 
     Every row of one file comes from the version its blob names: an old row of
     a file this run measured stays only when the file is unchanged and the row
     overlaps no unit measured now. A new sample of under half a unit's planned
-    mutants never replaces its last measure.
+    mutants never replaces a last measure of the same version; with none it is
+    kept, and the next plan prices only the mutants it measured.
     """
     out.mkdir(parents=True, exist_ok=True)
     planned = plan.get('mutants') if isinstance(plan.get('mutants'), dict) else {}
+    old = plan.get('history') if isinstance(plan.get('history'), dict) else {}
+    old_blobs, new_blobs = old.get('blobs') or {}, plan.get('blobs') or {}
+    last = [
+        u
+        for u in mutation_cost.clean_files(old.get('files'))
+        if old_blobs.get(file_of(u)) == new_blobs.get(file_of(u))
+    ]
     fresh = {
         u: e
         for u, e in mutation_cost.clean_files(measured).items()
-        if e['mutants'] * 2 >= planned.get(u, 0)
+        if e['mutants'] * 2 >= planned.get(u, 0) or not any(overlaps(u, v) for v in last)
     }
-    old = plan.get('history') if isinstance(plan.get('history'), dict) else {}
-    old_blobs, new_blobs = old.get('blobs') or {}, plan.get('blobs') or {}
     touched = {file_of(u) for u in fresh}
     blobs = {f: new_blobs[f] for f in touched if f in new_blobs}
     rows = dict(fresh)
     for u, e in mutation_cost.clean_files(old.get('files')).items():
-        f, (a, b) = file_of(u), lines_of(u)
+        f = file_of(u)
         if u in rows:
             continue
         if f in touched:
             if f not in blobs or old_blobs.get(f) != blobs[f]:
                 continue
-            if any(file_of(v) == f and a <= lines_of(v)[1] and lines_of(v)[0] <= b for v in fresh):
+            if any(overlaps(u, v) for v in fresh):
                 continue
         elif f in old_blobs:
             blobs[f] = old_blobs[f]
@@ -997,8 +1020,55 @@ def write_history(
         'files': rows,
         'setup_secs': setup,
         'blobs': {f: b for f, b in sorted(blobs.items()) if any(file_of(u) == f for u in rows)},
+        'prior_error': prior_error,
     }
     (out / 'costs.json').write_text(json.dumps(history, indent=1) + '\n')
+
+
+# Two runs of one file version differ in a few mutants that hang or race under load
+# (diff.ts: 2 of 693 between runs 41323038268 and 43328238671), so each status may move
+# by this share of the file's mutants, and at least COUNT_SLACK.
+COUNT_VARIANCE = 0.01
+COUNT_SLACK = 2
+
+
+def file_counts(report: object) -> dict[str, dict[str, int]]:
+    """Each file of a Stryker REPORT with its mutants' count per status."""
+    files = report.get('files') if isinstance(report, dict) else None
+    out: dict[str, dict[str, int]] = {}
+    for path, f in (files or {}).items():
+        counts: dict[str, int] = {}
+        for m in f.get('mutants') or [] if isinstance(f, dict) else []:
+            status = m.get('status') if isinstance(m, dict) else None
+            counts[str(status)] = counts.get(str(status), 0) + 1
+        out[path] = counts
+    return out
+
+
+def count_rows(baseline: object, proof: object, before: dict, after: dict) -> list[dict]:
+    """Per file, whether PROOF's statuses match BASELINE's within run-to-run variance.
+
+    Only a file whose git blob is the same in both runs (BEFORE and AFTER map
+    file to blob) is judged: 'match' or 'differs', and a different mutant total
+    differs. Any other file, a changed or unknown blob or a file one run lacks,
+    is 'skipped', since its mutants are not the same ones.
+    """
+    old, new = file_counts(baseline), file_counts(proof)
+    rows = []
+    for path in sorted(set(old) | set(new)):
+        row = {'file': path, 'baseline': old.get(path), 'proof': new.get(path)}
+        blob = before.get(path)
+        if path not in old or path not in new or not blob or after.get(path) != blob:
+            rows.append({**row, 'verdict': 'skipped'})
+            continue
+        a, b = old[path], new[path]
+        total = sum(a.values())
+        slack = max(COUNT_SLACK, math.ceil(total * COUNT_VARIANCE))
+        same = total == sum(b.values()) and all(
+            abs(a.get(k, 0) - b.get(k, 0)) <= slack for k in set(a) | set(b)
+        )
+        rows.append({**row, 'verdict': 'match' if same else 'differs'})
+    return rows
 
 
 def merge(plan: dict, shards_dir: Path, stage: Path, costs_out: Path) -> int:
@@ -1044,13 +1114,19 @@ def merge(plan: dict, shards_dir: Path, stage: Path, costs_out: Path) -> int:
                 )
     if not problems and files:
         problems += range_faults(reports, files, plan.get('ids'))
+    error = mutation_cost.prior_error(
+        (f['shard'], measured[u]['secs'], f['prior_secs'])
+        for u, f in (files or {}).items()
+        if u in measured and mutation_cost.nonnegative(f.get('prior_secs'))
+    )
+    mutation_cost.note_prior_error(where, error)
     if problems:
         mutation_cost.annotate(
             'error', t'{where}: {", ".join(problems)}, so this week publishes no score for it'
         )
         mutation_cost.summarize(t'{where}: no score this week ({", ".join(problems)})')
         reported = {p for rep in reports.values() for p in rep['files']}
-        write_history(costs_out, setups, plan, measured, set(files or reported) or None)
+        write_history(costs_out, setups, plan, measured, set(files or reported) or None, error)
         return 1
     merged = merge_reports(reports, owner)
     plan_statuses(merged, plan.get('ids'))
@@ -1068,7 +1144,7 @@ def merge(plan: dict, shards_dir: Path, stage: Path, costs_out: Path) -> int:
         )
         mutation_cost.summarize(t'{where}: no score this week (killed 0 of {valid} mutants)')
         return 1
-    write_history(costs_out, setups, plan, measured, set(files or merged['files']))
+    write_history(costs_out, setups, plan, measured, set(files or merged['files']), error)
     score = f'{detected / valid * 100:.1f}' if valid else '0.0'
     staged = json.loads(json.dumps(merged))
     for f in staged['files'].values():
@@ -1126,6 +1202,11 @@ def main() -> int:
     me.add_argument('--shards', required=True, type=Path)
     me.add_argument('--stage', required=True, type=Path)
     me.add_argument('--costs', required=True, type=Path)
+    cc = sub.add_parser('counts', help="compare two runs' statuses per file of an unchanged blob")
+    cc.add_argument('--baseline', required=True, type=Path, help="the earlier run's mutation.json")
+    cc.add_argument('--proof', required=True, type=Path, help="the later run's mutation.json")
+    cc.add_argument('--baseline-blobs', required=True, type=Path, help='{file: blob} at its sha')
+    cc.add_argument('--proof-blobs', required=True, type=Path, help='{file: blob} at its sha')
     args = p.parse_args()
 
     if args.command == 'discover':
@@ -1164,6 +1245,15 @@ def main() -> int:
             )
         run, merge_ = matrix(entries, args.plans, args.out_plans, args.history)
         print(json.dumps({'run': run, 'merge': merge_}, separators=(',', ':')))
+    elif args.command == 'counts':
+        rows = count_rows(
+            read_json(args.baseline, None),
+            read_json(args.proof, None),
+            read_json(args.baseline_blobs),
+            read_json(args.proof_blobs),
+        )
+        print(json.dumps(rows, indent=1))
+        return 1 if any(r['verdict'] == 'differs' for r in rows) else 0
     elif args.command == 'mutate':
         print(mutate_list(json.loads(args.plan.read_text()), args.shard))
     elif args.command == 'costs':
