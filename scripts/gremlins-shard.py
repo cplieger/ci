@@ -4,9 +4,10 @@
 The plan job sizes each module (`plan`): per file of a per-package module its
 RUNNABLE mutants and a prior cost, RUNNABLE x the package's measured cost of one
 surviving mutant (gremlins-run.sh time_package_mutants); an integration module,
-suite x mutants. The shard job prices each file from the repo's last measured
-run (`history`, built from each shard's `costs`) where it has one, the prior
-times the measured-to-prior ratio where not (scripts/mutation_cost.py project),
+suite x mutants, with each module's git blob per Go file (`blobs`). The shard
+job prices each file from the repo's last measured run (`history`, built from
+each shard's `costs`) where it measured the file's current blob, the prior times
+PRIOR_ERROR where not (scripts/mutation_cost.py price),
 and packs files into shards that each end inside the band mutation_cost.TOP_SECS
 derives from runner speed, longest first (`matrix`, mutation_cost.choose). A file is the smallest unit gremlins can scope, and a mutant's
 verdict does not depend on its shard: each mutant runs its own package's tests
@@ -19,6 +20,7 @@ import argparse
 import json
 import math
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -169,12 +171,44 @@ def size_module(plan_dir: Path) -> dict:
     return entry
 
 
-def sizing(repo: str, sha: str, modules: list[tuple[str, Path]]) -> tuple[dict, list[str]]:
-    """The repo's sizing and the modules it could not size."""
+def blobs(target: Path, dir_: str) -> dict[str, str]:
+    """Each Go source file of module DIR_ at TARGET's HEAD, module-relative, with its git blob:
+    the version a file's measured cost belongs to. {} when git cannot list it."""
+    proc = subprocess.run(
+        ['git', '-C', str(target), 'ls-tree', '-r', '-z', 'HEAD', '--', dir_],
+        capture_output=True,
+        check=False,
+    )
+    prefix = '' if dir_ == '.' else f'{dir_}/'
+    out = {}
+    for row in proc.stdout.split(b'\0') if proc.returncode == 0 else []:
+        meta, _, raw = row.partition(b'\t')
+        fields, name = meta.split(), raw.decode(errors='replace')
+        if (
+            len(fields) == 3
+            and fields[1] == b'blob'
+            and name.startswith(prefix)
+            and name.endswith('.go')
+            and not name.endswith('_test.go')
+            and mutation_cost.GIT_BLOB.fullmatch(fields[2].decode())
+        ):
+            out[name.removeprefix(prefix)] = fields[2].decode()
+    return dict(sorted(out.items()))
+
+
+def sizing(
+    repo: str, sha: str, modules: list[tuple[str, Path]], target: Path | None = None
+) -> tuple[dict, list[str]]:
+    """The repo's sizing and the modules it could not size; with TARGET, the clone, each sized
+    module's blobs, limited to its files when it lists them."""
     entries, unsized = {}, []
     for dir_, plan_dir in modules:
         try:
             entries[dir_] = size_module(plan_dir)
+            if target is not None:
+                found = blobs(target, dir_)
+                files = entries[dir_]['files']
+                entries[dir_]['blobs'] = {p: b for p, b in found.items() if not files or p in files}
         except Exception as exc:
             why = str(exc) if isinstance(exc, UnsizedError) else mutation_cost.describe(exc)
             mutation_cost.annotate(
@@ -200,20 +234,14 @@ def module_history(history: dict | None, dir_: str) -> dict:
 
 
 def integration_price(e: dict, h: dict) -> tuple[float | None, str]:
-    """An integration module's worker-seconds, priced as mutation_cost.project prices a file.
-
-    Its history's mutants cost what they took, at a plausible cost per mutant;
-    the rest cost their share of the prior times PRIOR_ERROR. A module with no
-    mutants costs 0 whatever its history. With no prior (its suite ran under
-    the clock's tick) and no usable history the price is (None, 'unknown').
-    """
+    """An integration module's price (mutation_cost.price) from its history rows at their current
+    blobs, summed into one; a module with no mutants costs 0 whatever its history."""
     if not e['mutants']:
         return 0.0, 'prior'
     hist = mutation_cost.clean_files(h.get('files'))
     done = sum(f['mutants'] for f in hist.values())
-    total = {'files': {'.': {'secs': sum(f['secs'] for f in hist.values()), 'mutants': done}}}
-    priced = mutation_cost.project({'.': (e['mutants'], e['prior_secs'])}, total if done else None)
-    return priced['.']
+    total = {'secs': sum(f['secs'] for f in hist.values()), 'mutants': done}
+    return mutation_cost.price(e['mutants'], e['prior_secs'], total if done else None)
 
 
 def with_unsized(
@@ -257,7 +285,7 @@ def assign(
         if e['mode'] is None:
             unsized.append(Item(dir_, None, 0.0))
             continue
-        h = module_history(history, dir_)
+        h = mutation_cost.at_blobs(module_history(history, dir_), e.get('blobs') or {})
         setup[dir_] = mutation_cost.setup_price(h.get('setup_secs'), e['setup_secs'])
         workers = e['workers']
         if e['mode'] == 'integration':
@@ -396,6 +424,12 @@ def valid_module(dir_: str, e: object, *, planned: int | None) -> str:
         for p in packages.values()
     ):
         return f'module {dir_!r:.200} has no usable package map'
+    versions = e.get('blobs', {})
+    if not isinstance(versions, dict) or not all(
+        isinstance(p, str) and isinstance(b, str) and mutation_cost.GIT_BLOB.fullmatch(b)
+        for p, b in versions.items()
+    ):
+        return f'module {dir_!r:.200} has blobs that are not all git object ids'
     files = e.get('files')
     if not isinstance(files, dict) or not all(isinstance(f, dict) for f in files.values()):
         return f'module {dir_!r:.200} has no file map'
@@ -659,13 +693,18 @@ def slowdown(runs: dict[str, dict[str, tuple[float, int]]]) -> float | None:
 
 def prior_rows(e: object, measured: dict) -> list[tuple[object, float, float]]:
     """(shard, measured seconds, prior seconds) of each unit of plan module E priced from its prior alone,
-    for mutation_cost.prior_error; MEASURED is this run's mean per file over its attempts."""
+    and measured whole, for mutation_cost.prior_error; MEASURED is this run's mean per file over
+    its attempts."""
     if not isinstance(e, dict):
         return []
     prior_priced = ('prior', 'refused')
     if e.get('mode') == 'integration':
         shards = e.get('shards') or [None]
         if e.get('cost') not in prior_priced or not measured or not e.get('prior_secs'):
+            return []
+        if not mutation_cost.count(e.get('mutants')) or (
+            sum(f['mutants'] for f in measured.values()) < e['mutants']
+        ):
             return []
         return [(shards[0], sum(f['secs'] for f in measured.values()), e['prior_secs'])]
     files = e.get('files') if isinstance(e.get('files'), dict) else {}
@@ -676,6 +715,8 @@ def prior_rows(e: object, measured: dict) -> list[tuple[object, float, float]]:
         and f.get('cost') in prior_priced
         and p in measured
         and mutation_cost.nonnegative(f.get('prior_secs'))
+        and mutation_cost.count(f.get('runnable'))
+        and measured[p]['mutants'] >= f['runnable']
     ]
 
 
@@ -684,8 +725,10 @@ def history(
 ) -> dict | None:
     """The repo's history: this run's cost records bound to it by meta.json, carried over PREVIOUS.
 
-    A file this run did not measure keeps its PREVIOUS measure; with this run's
-    PLAN, only its modules, and in a per-package module only its files, are kept.
+    A file this run did not measure keeps its PREVIOUS measure while its blob is
+    the one PLAN gives it; with this run's PLAN, only its modules, and in a
+    per-package module only its files, are kept, each with its blob. A module no
+    PLAN gives blobs keeps its PREVIOUS record and records no new measure.
     """
     records: dict[str, list[dict]] = {}
     runs: dict[str, dict[str, tuple[float, int]]] = {}
@@ -730,17 +773,25 @@ def history(
             else None
         )
         new = mutation_cost.combine(records.get(d, []))
+        prev = old.get(d) if isinstance(old.get(d), dict) else {}
+        versions = e.get('blobs') if isinstance(e, dict) else None
+        if not isinstance(versions, dict):
+            # No plan names this run's versions, so its measures price nothing and the last stay as they were.
+            versions = prev.get('blobs') if isinstance(prev.get('blobs'), dict) else {}
+            new = {**new, 'files': {}}
+        last = mutation_cost.at_blobs(prev, versions)
         if (
             isinstance(e, dict)
             and e.get('mode') == 'integration'
             and mutation_cost.count(e.get('mutants'))
-            and sum(f['mutants'] for f in new['files'].values()) * 2 < e['mutants']
-            and mutation_cost.clean_files((old.get(d) or {}).get('files'))
+            and sum(f['mutants'] for f in new['files'].values()) < e['mutants']
         ):
             # integration_price prices the module from its total, so a short sample keeps the last one whole.
             new = {**new, 'files': {}}
         rows += prior_rows(e, new['files'])
-        modules[d] = mutation_cost.carry_forward(new, old.get(d), keep, counts)
+        rec = mutation_cost.carry_forward(new, last, keep, counts)
+        rec['blobs'] = {p: versions[p] for p in rec['files'] if isinstance(versions.get(p), str)}
+        modules[d] = rec
     if not any(m['files'] or m['setup_secs'] is not None for m in modules.values()):
         return None
     return {
@@ -768,6 +819,7 @@ def main() -> int:
     pl.add_argument('--sha', required=True)
     pl.add_argument('--module', action='append', required=True, metavar='DIR=PLAN_DIR')
     pl.add_argument('--out', required=True, type=Path)
+    pl.add_argument('--target', type=Path, help="the target repo's clone, for each file's git blob")
     mx = sub.add_parser('matrix', help="one repo's run plan and its run job's matrix")
     mx.add_argument('--repo', required=True)
     mx.add_argument('--plan', required=True, type=Path, help="the plan job's sizing")
@@ -799,7 +851,9 @@ def main() -> int:
     if args.command == 'plan':
         if not SHA.fullmatch(args.sha):
             raise SystemExit(f'--sha {args.sha!r:.200} is not a 40-hex commit')
-        doc, unsized = sizing(args.repo, args.sha, [parse_module_arg(m) for m in args.module])
+        doc, unsized = sizing(
+            args.repo, args.sha, [parse_module_arg(m) for m in args.module], args.target
+        )
         args.out.write_text(json.dumps(doc, indent=1) + '\n')
         files = sum(len(e['files']) for e in doc['modules'].values())
         mutation_cost.say(t'{args.repo}: sized {len(doc["modules"])} module(s), {files} file(s)')

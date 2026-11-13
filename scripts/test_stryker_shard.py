@@ -229,8 +229,12 @@ class PlanAndMatrix(unittest.TestCase):
                 'src/f3.ts': {'secs': 1e9, 'mutants': 100},
             },
             'setup_secs': 100,
+            'blobs': {f'src/f{i}.ts': 'a' * 40 for i in range(4)},
         }
-        self.matrix({'r~web': self.big()}, history={'r~web': json.dumps(hist)})
+        doc = self.big()
+        for f in doc['files'].values():
+            f['blob'] = 'a' * 40
+        self.matrix({'r~web': doc}, history={'r~web': json.dumps(hist)})
         plan = json.loads((self.tmp / 'out' / 'r~web.json').read_text())
         self.assertEqual(plan['files']['src/f0.ts']['cost'], 'measured')
         self.assertEqual(plan['files']['src/f1.ts']['cost'], 'prior')
@@ -569,8 +573,33 @@ class Ranges(unittest.TestCase):
         measured, _ = ss.split('src/s.ts', heavy(spans), 1000.0, 520.0, history)
         self.assertEqual([u for u, *_ in measured], ['src/s.ts:1-28', 'src/s.ts:29-100'])
         changed = {**history, 'blobs': {'src/s.ts': 'b' * 40}}
-        even, _ = ss.split('src/s.ts', heavy(spans), 1000.0, 520.0, changed)
+        current = ss.mutation_cost.at_blobs(changed, {'src/s.ts': 'a' * 40}, ss.file_of)
+        even, _ = ss.split('src/s.ts', heavy(spans), 1000.0, 520.0, current)
         self.assertEqual([u for u, *_ in even], ['src/s.ts:1-50', 'src/s.ts:51-100'])
+
+    def test_an_unmeasured_range_costs_its_prior_times_the_error_beside_a_measured_one(self):
+        # 200 mutants at 1 s of prior; 1-100 measured 50 s, so the file prices 50 + 100 x 3.
+        f = {**heavy([[n, n, 1.0] for n in range(1, 201)]), 'prior_secs': 200.0}
+        measured = {'src/s.ts:1-100': {'secs': 50.0, 'mutants': 100}}
+        for name, rows in (
+            ('101-200 has no row', measured),
+            (
+                '101-200 was cut after 10',
+                {**measured, 'src/s.ts:101-200': {'secs': 30.0, 'mutants': 10}},
+            ),
+        ):
+            with self.subTest(name):
+                hist = {'files': rows}
+                self.assertEqual(ss.file_price('src/s.ts', f, hist), (350.0, 'prior'))
+                each = ss.span_prices('src/s.ts', f, hist)
+                self.assertAlmostEqual(sum(c for c, _ in each[:100]), 50.0)
+                self.assertAlmostEqual(sum(c for c, _ in each[100:]), 300.0)
+                self.assertEqual({s for _, s in each[:100]}, {'measured'})
+                self.assertEqual({s for _, s in each[100:]}, {'prior'})
+                # prior_error reads only units no measure priced.
+                self.assertIsNone(ss.prior_held('src/s.ts:1-100', f, hist))
+                self.assertAlmostEqual(ss.prior_held('src/s.ts:101-200', f, hist), 100.0)
+                self.assertIsNone(ss.prior_held('src/s.ts:90-110', f, hist))
 
     def test_a_file_past_one_shard_is_planned_as_ranges_across_shards(self):
         # scroll-controller.ts in run 43153701425: 1,672 run mutants at 72.4 worker-seconds each.
@@ -1411,6 +1440,24 @@ class Merge(unittest.TestCase):
         self.assertEqual(self.history()['files']['src/a.ts'], {'secs': 50.0, 'mutants': 10})
         self.assertEqual(self.history()['files']['src/b.ts'], {'secs': 20.0, 'mutants': 1})
 
+    def test_prior_error_is_measured_on_a_one_job_plan_and_never_from_a_cut_sample(self):
+        # Shard 1 measured src/a.ts at 10 s over 1 mutant, against a prior of 5 s.
+        for jobs in (1, 2):
+            for planned, want in ((1, 2.0), (2, None)):
+                plan = {
+                    **self.PLAN,
+                    'mutants': {'src/a.ts': planned, 'src/b.ts': 1, 'src/c.ts': 1},
+                    'priors': {'src/a.ts': 5.0},
+                }
+                if jobs == 1:
+                    plan = {**plan, 'shards': 1, 'files': None}
+                with (
+                    self.subTest(jobs=jobs, planned=planned),
+                    unittest.mock.patch('sys.stderr', new_callable=io.StringIO),
+                ):
+                    self.merge(plan)
+                    self.assertEqual(self.history()['prior_error'], want)
+
     def test_a_missing_owned_file_publishes_nothing(self):
         rep = json.loads((self.shards / 'strykershard-r~web-2' / 'result.json').read_text())
         del rep['files']['src/c.ts']
@@ -2091,10 +2138,6 @@ class Wiring(unittest.TestCase):
                 self.assertIn("inputs.dir == ''", self.jobs[job]['if'])
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class RecordedRun(unittest.TestCase):
     """Run 43328238671 (marotte static-src, 7 shards) replayed: its plan pass's sizing and the cost
     each of its units measured, spread over the unit's mutants by their prior."""
@@ -2119,9 +2162,17 @@ class RecordedRun(unittest.TestCase):
             out[path] = got
         return out
 
+    BLOB = 'a' * 40
+
+    def at(self, history: dict, blob: str = BLOB) -> dict:
+        """HISTORY recorded on every file at BLOB; the plan's sizing has every file at self.BLOB."""
+        return {**history, 'blobs': dict.fromkeys(self.FIXTURE['sizing']['files'], blob)}
+
     def slowest(self, history: dict | None) -> tuple[dict, list[float]]:
         """The plan from HISTORY, and each of its shards' measured minutes on a SLOWDOWN-times slower runner."""
-        sizing, costs = self.FIXTURE['sizing'], self.FIXTURE['costs']
+        sizing, costs = json.loads(json.dumps(self.FIXTURE['sizing'])), self.FIXTURE['costs']
+        for f in sizing['files'].values():
+            f['blob'] = self.BLOB
         with unittest.mock.patch('sys.stderr', new_callable=io.StringIO):
             plan, _ = ss.assign(sizing, history)
         files = plan['files'] or {p: {'shard': 1} for p in sizing['files']}
@@ -2149,7 +2200,8 @@ class RecordedRun(unittest.TestCase):
         limit = ss.mutation_cost.SAFE_JOB_MINUTES
         for name, history in (
             ('no history', None),
-            ('the partial sample this run planned from', self.FIXTURE['planned_from']),
+            ('the partial sample this run planned from', self.at(self.FIXTURE['planned_from'])),
+            ('every file changed since its measure', self.at(self.FIXTURE['costs'], 'b' * 40)),
         ):
             with self.subTest(history=name):
                 plan, jobs = self.slowest(history)
@@ -2158,12 +2210,52 @@ class RecordedRun(unittest.TestCase):
 
     def test_the_run_s_own_history_plans_shards_within_the_bar(self):
         costs = self.FIXTURE['costs']
-        plan, jobs = self.slowest({'files': costs['files'], 'setup_secs': costs['setup_secs']})
+        plan, jobs = self.slowest(
+            self.at({'files': costs['files'], 'setup_secs': costs['setup_secs']})
+        )
         self.assertLessEqual(max(jobs), ss.mutation_cost.SAFE_JOB_MINUTES)
         measured = [j / ss.mutation_cost.SLOWDOWN for j in jobs]
         self.assertEqual(
             ss.mutation_cost.bar_faults(plan['projected_minutes'], [measured]), [], measured
         )
+
+    def test_a_split_file_with_one_range_unmeasured_prices_that_range_at_its_prior(self):
+        sizing, costs = self.FIXTURE['sizing'], self.FIXTURE['costs']
+        gone = 'scroll-controller.ts:767-1344'
+        rows = {u: e for u, e in costs['files'].items() if u != gone}
+        history = self.at({'files': rows, 'setup_secs': costs['setup_secs']})
+        plan, jobs = self.slowest(history)
+        f = {**sizing['files']['scroll-controller.ts'], 'blob': self.BLOB}
+        each = ss.span_prices('scroll-controller.ts', f, history)
+        a, b = ss.lines_of(gone)
+        held = [
+            (c, src)
+            for s, (c, src) in zip(f['spans'], each, strict=True)
+            if a <= s[0] and s[1] <= b and s[2] is not None
+        ]
+        prior = sum(s[2] for s in f['spans'] if a <= s[0] and s[1] <= b and s[2] is not None)
+        self.assertEqual({src for _, src in held}, {'prior'})
+        self.assertAlmostEqual(sum(c for c, _ in held), prior * ss.mutation_cost.PRIOR_ERROR)
+        units = [u for u in plan['files'] if ss.file_of(u) == 'scroll-controller.ts']
+        self.assertEqual({plan['files'][u]['cost'] for u in units}, {'prior'})
+        # At three times its prior the range needs more shards than an entry runs, so pieces of
+        # measured lines pass the top too, and the plan says so.
+        sized = json.loads(json.dumps(sizing))
+        for x in sized['files'].values():
+            x['blob'] = self.BLOB
+        with unittest.mock.patch('sys.stderr', new_callable=io.StringIO):
+            _, warnings = ss.assign(sized, history)
+        texts = [ss.mutation_cost.render(w) for w in warnings]
+        self.assertTrue(any('the top of its band' in t for t in texts), (texts, jobs))
+
+    def test_a_measure_of_another_blob_prices_nothing(self):
+        sizing = self.FIXTURE['sizing']
+        plan, _ = self.slowest(self.at(self.FIXTURE['costs'], 'b' * 40))
+        self.assertEqual({f['cost'] for f in plan['files'].values()}, {'prior'})
+        store = [f['work_secs'] for u, f in plan['files'].items() if ss.file_of(u) == 'store.ts']
+        want = sizing['files']['store.ts']['prior_secs'] * ss.mutation_cost.PRIOR_ERROR
+        self.assertAlmostEqual(sum(store), want / sizing['workers'], delta=0.1 * len(store))
+        self.assertGreater(len(store), 1)
 
 
 class Counts(unittest.TestCase):
@@ -2212,6 +2304,17 @@ class Counts(unittest.TestCase):
         got = {r['file']: r['verdict'] for r in ss.count_rows(old, new, before, after)}
         self.assertEqual(got, {f: v for f, *_, v in rows})
 
+    def test_totals_are_each_run_s_status_sums_over_every_file(self):
+        old = self.report(a={'Killed': 3}, b={'Killed': 1, 'Survived': 2})
+        new = self.report(a={'Killed': 2, 'Timeout': 1}, c={'Survived': 4})
+        self.assertEqual(
+            ss.count_totals(old, new),
+            {
+                'baseline': {'Killed': 4, 'Survived': 2},
+                'proof': {'Killed': 2, 'Survived': 4, 'Timeout': 1},
+            },
+        )
+
     def test_the_cli_exits_1_only_when_an_unchanged_file_differs(self):
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         blobs = {'x.ts': 'a' * 40}
@@ -2222,7 +2325,16 @@ class Counts(unittest.TestCase):
             ('blobs.json', blobs),
         ):
             (tmp / name).write_text(json.dumps(doc))
-        for proof, rc in (('ok.json', 0), ('bad.json', 1)):
+        (tmp / 'other.json').write_text(json.dumps({'x.ts': 'b' * 40}))
+        (tmp / 'list.json').write_text('[]')
+        for proof, after, rc in (
+            ('ok.json', 'blobs.json', 0),
+            ('bad.json', 'blobs.json', 1),
+            ('missing.json', 'blobs.json', 2),
+            ('blobs.json', 'blobs.json', 2),
+            ('ok.json', 'list.json', 2),
+            ('ok.json', 'other.json', 2),
+        ):
             proc = subprocess.run(
                 [
                     sys.executable,
@@ -2230,11 +2342,23 @@ class Counts(unittest.TestCase):
                     'counts',
                     *('--baseline', str(tmp / 'base.json'), '--proof', str(tmp / proof)),
                     *('--baseline-blobs', str(tmp / 'blobs.json')),
-                    *('--proof-blobs', str(tmp / 'blobs.json')),
+                    *('--proof-blobs', str(tmp / after)),
                 ],
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            with self.subTest(proof=proof):
+            with self.subTest(proof=proof, after=after):
                 self.assertEqual(proc.returncode, rc, proc.stderr)
+                if rc == 2:
+                    self.assertIn('::error::', proc.stdout + proc.stderr)
+                else:
+                    out = json.loads(proc.stdout)
+                    self.assertEqual(out['totals']['baseline'], {'Killed': 10})
+                    self.assertEqual(
+                        [r['verdict'] for r in out['files']], ['match', 'differs'][rc : rc + 1]
+                    )
+
+
+if __name__ == '__main__':
+    unittest.main()

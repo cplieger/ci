@@ -38,8 +38,8 @@ _spec.loader.exec_module(stryker_aggregate)
 # (TypeScript checker, runner IPC): 0.96 in ui's run of 42418943692 (55 min x 4
 # workers, less 45.7 min of summed duration x 4/2, over 8059 mutants), fitted
 # with the 2 runners its checker leaves of 4 workers while checking. Stryker's
-# freeCheckers() hands those back once checking ends. The prior still ran 2.69x
-# low on marotte's store.ts, so plans scale it by mutation_cost.PRIOR_ERROR.
+# freeCheckers() hands those back once checking ends, so no split bounds the
+# prior; mutation_cost.PRIOR_ERROR owns its margin.
 PRIOR_OVERHEAD_SECS = 0.96
 # The run job's steps outside the Stryker process (checkout, clone, npm ci,
 # upload) took 40 s to 1 min in run 42418943692.
@@ -430,42 +430,61 @@ def overlaps(u: str, v: str) -> bool:
     return file_of(u) == file_of(v) and a <= d and c <= b
 
 
-def by_file(history: dict | None) -> dict | None:
-    """HISTORY with each split file's range rows summed into one row per file, which project() prices."""
-    if not isinstance(history, dict):
-        return history
-    files: dict[str, dict] = {}
-    for unit, e in mutation_cost.clean_files(history.get('files')).items():
-        f = files.setdefault(file_of(unit), {'secs': 0.0, 'mutants': 0})
-        f['secs'] += e['secs']
-        f['mutants'] += e['mutants']
-    return {**history, 'files': files}
+def span_prices(path: str, f: dict, history: dict | None) -> list[tuple[float, str]]:
+    """Each of F's spans' worker-seconds and source, from mutation_cost.price.
 
-
-def weights(path: str, f: dict, history: dict | None) -> list[float]:
-    """Each of PATH's mutants' share of its price: its prior, or, for an unchanged file with
-    measured ranges, its old range's measured seconds spread over that range by prior."""
+    HISTORY holds only rows at F's current blob. The run spans one of PATH's rows
+    holds (a range, or the whole file) share that row's price by prior; a span in
+    no row is priced alone; an early span costs nothing.
+    """
     spans = f['spans']
-    prior = [s[2] or 0.0 for s in spans]
-    hist = history or {}
-    if not f.get('blob') or (hist.get('blobs') or {}).get(path) != f['blob']:
-        return prior
     rows = [
-        (*lines_of(u), e['secs'])
-        for u, e in mutation_cost.clean_files(hist.get('files')).items()
-        if file_of(u) == path and RANGE.fullmatch(u)
+        (*lines_of(u), e)
+        for u, e in mutation_cost.clean_files((history or {}).get('files')).items()
+        if file_of(u) == path
     ]
-    inside: list[int | None] = []
-    for first, last, _ in spans:
-        inside.append(next((i for i, r in enumerate(rows) if r[0] <= first and last <= r[1]), None))
-    held = [sum(p for p, i in zip(prior, inside, strict=True) if i == n) for n in range(len(rows))]
-    measured = [r[2] / held[n] if held[n] > 0 else None for n, r in enumerate(rows)]
-    rates = [m for m in measured if m is not None]
-    mean = sum(rates) / len(rates) if rates else 1.0
-    return [
-        p * (measured[i] if i is not None and measured[i] is not None else mean)
-        for p, i in zip(prior, inside, strict=True)
+    inside = [
+        next((i for i, (a, b, _) in enumerate(rows) if a <= first and last <= b), None)
+        for first, last, _ in spans
     ]
+    out = [mutation_cost.price(0, None, None)] * len(spans)
+    for n, (_, _, e) in enumerate(rows):
+        held = [j for j, i in enumerate(inside) if i == n and spans[j][2] is not None]
+        secs, source = mutation_cost.price(len(held), sum(spans[j][2] for j in held), e)
+        for j, part in zip(
+            held, mutation_cost.spread(secs, [spans[j][2] for j in held]), strict=True
+        ):
+            out[j] = (part, source)
+    for j, i in enumerate(inside):
+        if i is None and spans[j][2] is not None:
+            out[j] = mutation_cost.price(1, spans[j][2], None)
+    return out
+
+
+def file_price(path: str, f: dict, history: dict | None) -> tuple[float, str]:
+    """PATH's price and source: its spans' sum where it has spans, any not 'measured' setting it."""
+    if not f.get('spans'):
+        rows = mutation_cost.clean_files((history or {}).get('files'))
+        return mutation_cost.price(f['run'], f['prior_secs'], rows.get(path))
+    each = span_prices(path, f, history)
+    sources = {src for (_, _, p), (_, src) in zip(f['spans'], each, strict=True) if p is not None}
+    source = next((s for s in ('refused', 'prior') if s in sources), 'measured')
+    return sum(c for c, _ in each), source
+
+
+def prior_held(unit: str, f: dict, history: dict | None) -> float | None:
+    """UNIT's prior seconds when no mutant it runs is priced from a measure, for prior_error; else None."""
+    if not f.get('spans'):
+        return None if file_price(unit, f, history)[1] == 'measured' else f['prior_secs']
+    first, last = lines_of(unit)
+    inside = [
+        (s[2], src)
+        for s, (_, src) in zip(f['spans'], span_prices(file_of(unit), f, history), strict=True)
+        if first <= s[0] and s[1] <= last and s[2] is not None
+    ]
+    if any(src == 'measured' for _, src in inside):
+        return None
+    return sum(p for p, _ in inside)
 
 
 def atoms(spans: list[list], costs: list[float]) -> list[list]:
@@ -514,13 +533,12 @@ def split(
     path: str, f: dict, work: float, room: float, history: dict | None
 ) -> tuple[list[tuple], float]:
     """PATH as (unit, run, early, work) pieces of at most ROOM seconds where its atoms allow, and
-    its largest atom's seconds; one whole-file piece when it fits ROOM, or has no spans to cut or
+    its largest atom's seconds, cut by span_prices over HISTORY (rows at its current blob); one
+    whole-file piece when it fits ROOM, or has no spans to cut or
     no ids to check its ranges' results against."""
     if work <= room or room <= 0 or not f.get('spans') or 'ids' not in f:
         return [(path, f['run'], f['early'], work)], 0.0
-    w = weights(path, f, history)
-    total = sum(w)
-    costs = [work * x / total if total > 0 else work / len(w) for x in w]
+    costs = mutation_cost.spread(work, [c for c, _ in span_prices(path, f, history)])
     groups = atoms(f['spans'], costs)
     # cut() minimises the largest piece for a given count only: uneven atoms can need
     # more pieces than ceil(work / room) before every piece fits.
@@ -547,9 +565,10 @@ def assign(
     where = f'{doc["repo"]}:{doc["dir"]}'
     setup = mutation_cost.setup_price((history or {}).get('setup_secs'), doc['setup_secs'])
     top = mutation_cost.TOP_SECS
-    priced = mutation_cost.project(
-        {p: (f['run'], f['prior_secs']) for p, f in doc['files'].items()}, by_file(history)
+    current = mutation_cost.at_blobs(
+        history, {p: f['blob'] for p, f in doc['files'].items() if f.get('blob')}, file_of
     )
+    priced = {p: file_price(p, f, current) for p, f in doc['files'].items()}
     warnings: list[Template] = []
     if refused := mutation_cost.refusals(priced):
         warnings.append(
@@ -563,7 +582,7 @@ def assign(
     for path, f in doc['files'].items():
         work = priced[path][0] / workers
         pieces, atom = (
-            split(path, f, work, top - setup, history)
+            split(path, f, work, top - setup, current)
             if shardable
             else ([(path, f['run'], f['early'], work)], 0.0)
         )
@@ -581,9 +600,8 @@ def assign(
         for unit, run, early, w in pieces:
             units[unit] = (path, run, early)
             items.append(mutation_cost.Item('.', unit, w))
-            if priced[path][1] in ('prior', 'refused'):
-                # A prior-priced file's pieces are cut by prior weight, so each holds its share of work.
-                priors[unit] = f['prior_secs'] * (w / work if work > 0 else 1.0)
+            if (held := prior_held(unit, f, current)) is not None:
+                priors[unit] = held
     one_job = setup + sum(it.work for it in items)
     k, bins = (
         mutation_cost.choose(items, {'.': setup}, top, limit)
@@ -601,14 +619,13 @@ def assign(
                 'work_secs': round(it.work, 1),
                 'cost': priced[path][1],
             }
-            if it.unit in priors:
-                files[it.unit]['prior_secs'] = round(priors[it.unit], 3)
     plan = {k_: doc[k_] for k_ in ('repo', 'dir', 'sha', 'break', 'workers')}
     split_files = sorted({file_of(u) for u in files if RANGE.fullmatch(u)}) if k > 1 else []
     plan.update(
         shards=k,
         files=files if k > 1 else None,
         mutants={u: run for u, (_, run, _) in units.items()},
+        priors={u: round(p, 3) for u, p in priors.items()},
         ids={p: doc['files'][p]['ids'] for p in split_files},
         directives={p: doc['files'][p]['directives'] for p in split_files},
         blobs={p: f['blob'] for p, f in doc['files'].items() if f.get('blob')},
@@ -978,23 +995,17 @@ def write_history(
 
     Every row of one file comes from the version its blob names: an old row of
     a file this run measured stays only when the file is unchanged and the row
-    overlaps no unit measured now. A new sample of under half a unit's planned
-    mutants never replaces a last measure of the same version; with none it is
-    kept, and the next plan prices only the mutants it measured.
+    overlaps no unit measured now. A new sample of fewer than a unit's planned
+    mutants prices nothing (mutation_cost.price), so it is not kept.
     """
     out.mkdir(parents=True, exist_ok=True)
     planned = plan.get('mutants') if isinstance(plan.get('mutants'), dict) else {}
     old = plan.get('history') if isinstance(plan.get('history'), dict) else {}
     old_blobs, new_blobs = old.get('blobs') or {}, plan.get('blobs') or {}
-    last = [
-        u
-        for u in mutation_cost.clean_files(old.get('files'))
-        if old_blobs.get(file_of(u)) == new_blobs.get(file_of(u))
-    ]
     fresh = {
         u: e
         for u, e in mutation_cost.clean_files(measured).items()
-        if e['mutants'] * 2 >= planned.get(u, 0) or not any(overlaps(u, v) for v in last)
+        if e['mutants'] >= planned.get(u, 0)
     }
     touched = {file_of(u) for u in fresh}
     blobs = {f: new_blobs[f] for f in touched if f in new_blobs}
@@ -1026,9 +1037,9 @@ def write_history(
 
 
 # Two runs of one file version differ in a few mutants that hang or race under load
-# (diff.ts: 2 of 693 between runs 41323038268 and 43328238671), so each status may move
-# by this share of the file's mutants, and at least COUNT_SLACK.
-COUNT_VARIANCE = 0.01
+# (diff.ts: 2 of 693, 0.29%, between runs 41323038268 and 43328238671), so each status
+# may move by that share rounded up to 0.5% of the file's mutants, and at least COUNT_SLACK.
+COUNT_VARIANCE = 0.005
 COUNT_SLACK = 2
 
 
@@ -1069,6 +1080,33 @@ def count_rows(baseline: object, proof: object, before: dict, after: dict) -> li
         )
         rows.append({**row, 'verdict': 'match' if same else 'differs'})
     return rows
+
+
+def count_totals(baseline: object, proof: object) -> dict[str, dict[str, int]]:
+    """Each run's mutants per status over all its files, reported beside count_rows and judged by nothing."""
+    out = {}
+    for name, report in (('baseline', baseline), ('proof', proof)):
+        totals: collections.Counter[str] = collections.Counter()
+        for counts in file_counts(report).values():
+            totals.update(counts)
+        out[name] = dict(sorted(totals.items()))
+    return out
+
+
+def prior_rows(plan: dict, files: dict | None, measured: dict) -> list[tuple[object, float, float]]:
+    """(shard, measured seconds, prior seconds) of each unit PLAN priced from its prior that this
+    run measured whole, for mutation_cost.prior_error; a one-job plan's units are its lone shard's."""
+    priors = plan.get('priors') if isinstance(plan.get('priors'), dict) else {}
+    mutants = plan.get('mutants') if isinstance(plan.get('mutants'), dict) else {}
+    return [
+        (files[u]['shard'] if files else 1, measured[u]['secs'], p)
+        for u, p in priors.items()
+        if u in measured
+        and (not files or u in files)
+        and mutation_cost.nonnegative(p)
+        and mutation_cost.count(mutants.get(u))
+        and measured[u]['mutants'] >= mutants[u]
+    ]
 
 
 def merge(plan: dict, shards_dir: Path, stage: Path, costs_out: Path) -> int:
@@ -1114,11 +1152,7 @@ def merge(plan: dict, shards_dir: Path, stage: Path, costs_out: Path) -> int:
                 )
     if not problems and files:
         problems += range_faults(reports, files, plan.get('ids'))
-    error = mutation_cost.prior_error(
-        (f['shard'], measured[u]['secs'], f['prior_secs'])
-        for u, f in (files or {}).items()
-        if u in measured and mutation_cost.nonnegative(f.get('prior_secs'))
-    )
+    error = mutation_cost.prior_error(prior_rows(plan, files, measured))
     mutation_cost.note_prior_error(where, error)
     if problems:
         mutation_cost.annotate(
@@ -1246,13 +1280,29 @@ def main() -> int:
         run, merge_ = matrix(entries, args.plans, args.out_plans, args.history)
         print(json.dumps({'run': run, 'merge': merge_}, separators=(',', ':')))
     elif args.command == 'counts':
+        docs = {}
+        for name in ('baseline', 'proof', 'baseline_blobs', 'proof_blobs'):
+            path = getattr(args, name)
+            doc = read_json(
+                path, None if name in ('baseline', 'proof') else mutation_cost.MAX_INPUT_BYTES
+            )
+            report = name in ('baseline', 'proof')
+            if not isinstance(doc, dict) or (report and not isinstance(doc.get('files'), dict)):
+                mutation_cost.annotate(
+                    'error', t'counts: {str(path):.200} is not a readable JSON object of its kind'
+                )
+                return 2
+            docs[name] = doc
         rows = count_rows(
-            read_json(args.baseline, None),
-            read_json(args.proof, None),
-            read_json(args.baseline_blobs),
-            read_json(args.proof_blobs),
+            docs['baseline'], docs['proof'], docs['baseline_blobs'], docs['proof_blobs']
         )
-        print(json.dumps(rows, indent=1))
+        totals = count_totals(docs['baseline'], docs['proof'])
+        print(json.dumps({'files': rows, 'totals': totals}, indent=1))
+        if not any(r['verdict'] in ('match', 'differs') for r in rows):
+            mutation_cost.annotate(
+                'error', t'counts: no file has the same blob in both runs, so nothing was compared'
+            )
+            return 2
         return 1 if any(r['verdict'] == 'differs' for r in rows) else 0
     elif args.command == 'mutate':
         print(mutate_list(json.loads(args.plan.read_text()), args.shard))

@@ -3,9 +3,9 @@
 gremlins and Stryker each report one completion per mutant while a fixed pool of
 workers runs the mutants in file order. A file's measured cost is the gap before
 each of its completions times the workers (attribute). The next run prices a file
-from that history, or from its tool's prior times PRIOR_ERROR (project), and
-packs files into shards that each end
-near a target (choose), at most MAX_SHARDS of them.
+from that history while the file is unchanged, or from its tool's prior times
+PRIOR_ERROR (project), and packs files into shards that each end near a target
+(choose), at most MAX_SHARDS of them.
 """
 
 from __future__ import annotations
@@ -39,10 +39,11 @@ SAFE_JOB_MINUTES = 300
 # gremlins run 43328219246 (shard 2's work took 85, 125 and 161 min), past the 1.76
 # of run 43153682226. gremlins-shard.py's record job measures it each week and warns past this.
 SLOWDOWN = 1.9
-# A unit no run has measured is planned at its tool's prior times this: the largest measured
-# ratio of actual cost to the prior price a plan gave, rounded up to 0.5. Stryker run
-# 43328238671's store.ts took 2.69x its price (its shard 2.31x). Both weekly records measure
-# it per shard (prior_error) and warn past this.
+# A unit with no measured history at its current git blob is planned at its tool's prior times
+# this, a ruled margin: in Stryker run 43328238671 prior-priced work took at most 0.48x its prior
+# per shard, and 3.53x in the largest single-file ratio (platform.ts, too small to move a shard);
+# store.ts's 2.69x was against a price another file's ratio had already scaled down. Both weekly
+# records measure it per shard (prior_error) and warn past this.
 PRIOR_ERROR = 3.0
 # A job matrix runs at most 256 jobs (https://docs.github.com/en/actions/reference/limits),
 # which one call's run matrix keeps: MAX_SHARDS dirs of MAX_SHARDS shards (Stryker),
@@ -449,6 +450,24 @@ def record_fault(rec: object) -> str:
     return ''
 
 
+def at_blobs(
+    history: dict | None, blobs: dict[str, str], file_of: Callable[[str], str] = str
+) -> dict | None:
+    """HISTORY with only the rows measured on the version BLOBS gives their file (FILE_OF a row's
+    unit): a row whose file's blob is missing on either side, or differs, prices nothing now."""
+    if not isinstance(history, dict):
+        return history
+    old = history.get('blobs') if isinstance(history.get('blobs'), dict) else {}
+    return {
+        **history,
+        'files': {
+            u: e
+            for u, e in clean_files(history.get('files')).items()
+            if blobs.get(file_of(u)) and old.get(file_of(u)) == blobs[file_of(u)]
+        },
+    }
+
+
 def combine(records: list[dict]) -> dict:
     """One history from several runs of the same work: the mean per file and of the setup.
 
@@ -479,18 +498,16 @@ def carry_forward(
 
     A file a run never reached before its job stopped, or whose shard left no
     record, has no new measure, so its last one still prices it. A new sample
-    under half of its PLANNED mutants, the few a job finished before its budget
-    cut it, replaces no last measure; with none it is kept, and project()
-    prices only the mutants it measured.
+    of fewer than its PLANNED mutants, the ones a job finished before its budget
+    cut it, prices nothing (price), so it replaces no last measure.
     """
     old = old if isinstance(old, dict) else {}
-    last = clean_files(old.get('files'))
     fresh = {
         p: e
         for p, e in clean_files(new.get('files')).items()
-        if planned is None or e['mutants'] * 2 >= planned.get(p, 0) or p not in last
+        if planned is None or e['mutants'] >= planned.get(p, 0)
     }
-    files = {**last, **fresh}
+    files = {**clean_files(old.get('files')), **fresh}
     setup = new.get('setup_secs') if nonnegative(new.get('setup_secs')) else old.get('setup_secs')
     return {
         'files': {p: e for p, e in sorted(files.items()) if keep is None or p in keep},
@@ -498,43 +515,49 @@ def carry_forward(
     }
 
 
+def price(n: int, prior: float | None, row: dict | None) -> tuple[float | None, str]:
+    """A unit's worker-seconds for the next run and their source: the one place either tool sets a price.
+
+    N is the mutants the unit (a file, range or module) now runs, PRIOR its
+    tool's prior worker-seconds (None when its probe measured nothing), ROW its
+    {secs, mutants} history at the unit's current blob, or None. ROW prices N at
+    its cost per mutant ('measured') only when it measured at least N mutants
+    and is plausible against PRIOR. Anything else costs PRIOR x PRIOR_ERROR,
+    'refused' for an implausible ROW, else 'prior'; with no PRIOR it is
+    (None, 'unknown'), never 0.
+    """
+    refused = False
+    if row is not None:
+        cost = row['secs'] / row['mutants']
+        if n == 0 or plausible(cost, None if prior is None else prior / n):
+            if row['mutants'] >= n:
+                return n * cost, 'measured'
+        else:
+            refused = True
+    if prior is None:
+        return (None, 'unknown') if n else (0.0, 'prior')
+    return prior * PRIOR_ERROR, 'refused' if refused else 'prior'
+
+
+def spread(total: float, weights: list[float]) -> list[float]:
+    """TOTAL shared over WEIGHTS in proportion, evenly when they sum to 0; the parts sum to TOTAL."""
+    whole = sum(weights)
+    return [total * w / whole if whole > 0 else total / len(weights) for w in weights]
+
+
 def project(
     units: dict[str, tuple[int, float | None]], history: dict | None
 ) -> dict[str, tuple[float | None, str]]:
-    """Each file's worker-seconds for the next run, and how it was priced.
-
-    units: {path: (mutants the next run executes there, the tool's prior
-    worker-seconds, None when its probe measured nothing)}. A file with a
-    plausible history costs its mutants at their measured cost per mutant
-    ('measured'). When that history measured fewer mutants than the next run
-    executes (a deadline-cut sample, or mutants added since), the measured ones
-    cost what they took and the rest their share of the prior times
-    PRIOR_ERROR ('partial'). Any other file costs its prior times PRIOR_ERROR
-    ('prior', or 'refused' when its history was implausible). A file with
-    mutants, no prior and no usable history is (None, 'unknown'), never 0.
-    """
+    """Each file's price for the next run (price); units: {path: (mutants it runs, prior)}."""
     hist = clean_files(history.get('files') if isinstance(history, dict) else None)
-    out: dict[str, tuple[float | None, str]] = {}
-    for path, (n, p) in units.items():
-        h = hist.get(path)
-        cost = None if h is None else h['secs'] / h['mutants']
-        if h is not None and (n == 0 or plausible(cost, None if p is None else p / n)):
-            if h['mutants'] >= n or p is None:
-                out[path] = (n * cost, 'measured')
-            else:
-                out[path] = (h['secs'] + (n - h['mutants']) * p / n * PRIOR_ERROR, 'partial')
-        elif p is None:
-            out[path] = (None, 'unknown') if n else (0.0, 'prior')
-        else:
-            out[path] = (p * PRIOR_ERROR, 'prior' if h is None else 'refused')
-    return out
+    return {path: price(n, p, hist.get(path)) for path, (n, p) in units.items()}
 
 
 def prior_error(rows: Iterable[tuple[object, float, float]]) -> float | None:
     """The largest ratio, over shards, of what a plan's prior-priced units took to their prior, or None.
 
-    ROWS holds (shard, measured seconds, prior seconds) per measured unit the
-    plan priced from its prior alone. Summing per shard keeps a unit too small
+    ROWS holds (shard, measured seconds, prior seconds) per unit the plan
+    priced from its prior alone and this run measured whole. Summing per shard keeps a unit too small
     to move its shard from setting the ratio; a unit that fills its shard sets
     it whole.
     """

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import io
 import json
 import os
@@ -92,17 +93,38 @@ class Project(unittest.TestCase):
         self.assertEqual(mutation_cost.project({'a': (1, 7.0)}, None), want)
         self.assertEqual(mutation_cost.project({'a': (1, 7.0)}, {'files': 'junk'}), want)
 
-    def test_a_partial_sample_prices_only_the_mutants_it_measured(self):
+    def test_a_sample_short_of_the_unit_s_mutants_prices_nothing(self):
         e = mutation_cost.PRIOR_ERROR
         # 987 of 1672 mutants measured at 72.4 s each before a deadline cut the shard.
         hist = {'files': {'s.ts': {'secs': 987 * 72.4, 'mutants': 987}}}
-        got = mutation_cost.project({'s.ts': (1672, 1672 * 30.0), 'u.ts': (5, None)}, hist)
-        self.assertAlmostEqual(got['s.ts'][0], 987 * 72.4 + 685 * 30.0 * e)
-        self.assertEqual(got['s.ts'][1], 'partial')
-        # With no prior the measured rate is all there is.
+        got = mutation_cost.project({'s.ts': (1672, 1672 * 30.0)}, hist)
+        self.assertEqual(got, {'s.ts': (1672 * 30.0 * e, 'prior')})
+        # With no prior either, its cost is unknown.
         hist['files']['u.ts'] = {'secs': 20.0, 'mutants': 2}
-        got = mutation_cost.project({'u.ts': (5, None)}, hist)
-        self.assertEqual(got, {'u.ts': (50.0, 'measured')})
+        self.assertEqual(
+            mutation_cost.project({'u.ts': (5, None)}, hist), {'u.ts': (None, 'unknown')}
+        )
+        hist['files']['u.ts']['mutants'] = 5
+        self.assertEqual(
+            mutation_cost.project({'u.ts': (5, None)}, hist), {'u.ts': (20.0, 'measured')}
+        )
+
+    def test_spread_shares_a_total_by_weight_and_keeps_its_sum(self):
+        self.assertEqual(mutation_cost.spread(90.0, [1.0, 2.0]), [30.0, 60.0])
+        self.assertEqual(mutation_cost.spread(10.0, [0.0, 0.0]), [5.0, 5.0])
+
+    def test_a_row_of_another_blob_is_dropped(self):
+        hist = {
+            'files': {
+                'a': {'secs': 1.0, 'mutants': 1},
+                'b': {'secs': 2.0, 'mutants': 1},
+                'c': {'secs': 3.0, 'mutants': 1},
+            },
+            'blobs': {'a': 'a' * 40, 'b': 'a' * 40},
+        }
+        got = mutation_cost.at_blobs(hist, {'a': 'a' * 40, 'b': 'b' * 40, 'c': 'a' * 40})
+        self.assertEqual(sorted(got['files']), ['a'])
+        self.assertIsNone(mutation_cost.at_blobs(None, {}))
 
     def test_a_file_with_no_mutant_left_costs_nothing(self):
         got = mutation_cost.project({'a': (0, 5.0)}, {'files': {'a': {'secs': 9.0, 'mutants': 3}}})
@@ -430,6 +452,53 @@ class Bar(unittest.TestCase):
         )
 
 
+class PriceOwner(unittest.TestCase):
+    """mutation_cost.price is the one place a unit's price is set: nothing else scales a prior."""
+
+    COST_SCRIPTS = ('mutation_cost.py', 'stryker-shard.py', 'gremlins-shard.py')
+
+    @staticmethod
+    def priced(node: ast.expr) -> bool:
+        """NODE reads PRIOR_ERROR or a unit's prior_secs."""
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name | ast.Attribute) and (
+                getattr(n, 'id', None) == 'PRIOR_ERROR' or getattr(n, 'attr', None) == 'PRIOR_ERROR'
+            ):
+                return True
+            if isinstance(n, ast.Constant) and n.value == 'prior_secs':
+                return True
+        return False
+
+    def sites(self, source: str, name: str) -> list[str]:
+        out = []
+
+        def visit(node: ast.AST, owner: str) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.FunctionDef):
+                    visit(child, child.name)
+                    continue
+                if (
+                    isinstance(child, ast.BinOp | ast.AugAssign)
+                    and isinstance(child.op, ast.Mult | ast.Div)
+                    and owner != 'price'
+                    and self.priced(child)
+                ):
+                    out.append(f'{name}:{child.lineno} in {owner}')
+                visit(child, owner)
+
+        visit(ast.parse(source), '<module>')
+        return out
+
+    def test_no_cost_script_scales_a_prior_outside_price(self):
+        for name in self.COST_SCRIPTS:
+            with self.subTest(name):
+                self.assertEqual(self.sites((SCRIPTS / name).read_text(), name), [])
+
+    def test_the_check_names_a_scaled_prior(self):
+        source = 'def assign(f, r):\n    return f["prior_secs"] * r\n\ndef g(p):\n    return p * PRIOR_ERROR\n'
+        self.assertEqual(self.sites(source, 'x.py'), ['x.py:2 in assign', 'x.py:5 in g'])
+
+
 class PriorError(unittest.TestCase):
     def test_the_measure_is_the_largest_shard_sum_of_prior_priced_work_against_its_prior(self):
         rows = [(1, 30.0, 10.0), (1, 2.0, 10.0), (2, 9.0, 1.0), (2, 1.0, 9.0), (3, 5.0, 0.0)]
@@ -496,7 +565,7 @@ class CarryForward(unittest.TestCase):
         for old in (None, [], {'files': [1], 'setup_secs': -1}):
             self.assertEqual(mutation_cost.carry_forward(new, old), new)
 
-    def test_a_sample_under_half_its_planned_mutants_replaces_no_last_measure_and_fills_none(self):
+    def test_a_sample_short_of_its_planned_mutants_replaces_no_last_measure_and_fills_none(self):
         new = {
             'files': {
                 'cut': {'secs': 2.0, 'mutants': 4},
@@ -515,8 +584,7 @@ class CarryForward(unittest.TestCase):
             got,
             {
                 'cut': {'secs': 90.0, 'mutants': 10},
-                'half': {'secs': 6.0, 'mutants': 5},
-                'new': {'secs': 1.0, 'mutants': 1},
+                'half': {'secs': 9.0, 'mutants': 10},
                 'whole': {'secs': 7.0, 'mutants': 10},
             },
         )

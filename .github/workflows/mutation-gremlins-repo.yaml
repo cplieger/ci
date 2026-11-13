@@ -142,7 +142,7 @@ jobs:
             fi
           done
           python3 scripts/gremlins-shard.py plan --repo "${REPO}" --sha "${SHA}" \
-            "${plan_args[@]}" --out plan/plan.json
+            "${plan_args[@]}" --target target --out plan/plan.json
 
       - name: Upload the shard plan
         if: ${{ !cancelled() && hashFiles('plan/plan.json') != '' }}
