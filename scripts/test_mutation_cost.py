@@ -63,9 +63,8 @@ class History(unittest.TestCase):
         files = {
             'a': {'blob': self.BLOB, 'secs': {'k': [1.0]}},
             'b': {'blob': self.BLOB, 'secs': {'k': [2.0]}},
-            'c': {'blob': 'not a blob', 'secs': {'k': [3.0]}},
         }
-        got = mutation_cost.at_blobs(files, {'a': self.BLOB, 'b': 'b' * 40, 'c': 'not a blob'})
+        got = mutation_cost.at_blobs(files, {'a': self.BLOB, 'b': 'b' * 40})
         self.assertEqual(got, {'a': {'k': [1.0]}})
         self.assertEqual(mutation_cost.at_blobs(None, {}), {})
 
@@ -120,12 +119,10 @@ class Price(unittest.TestCase):
 
     def test_a_unit_costs_its_measured_mutants_and_the_rest_at_the_error(self):
         got = mutation_cost.price([(10.0, 4.0), (10.0, None), (20.0, 9.0)])
-        self.assertEqual(got, (13.0 + 10.0 * self.E, 13.0, 'partial', 2, 2))
+        self.assertEqual(got, (13.0 + 10.0 * self.E, 13.0, 'partial', 2))
         self.assertEqual(mutation_cost.price([(10.0, 4.0)]).source, 'measured')
-        self.assertEqual(
-            mutation_cost.price([(10.0, None)]), (10.0 * self.E, 0.0, 'prior', None, 0)
-        )
-        self.assertEqual(mutation_cost.price([]), (0.0, 0.0, 'measured', None, 0))
+        self.assertEqual(mutation_cost.price([(10.0, None)]), (10.0 * self.E, 0.0, 'prior', None))
+        self.assertEqual(mutation_cost.price([]), (0.0, 0.0, 'measured', None))
 
     def test_a_cut_sample_is_never_priced_below_what_it_measured(self):
         # 10 of 500 mutants measured 48000 s against a 2-s prior each.
@@ -140,7 +137,7 @@ class Price(unittest.TestCase):
     def test_an_unmeasured_mutant_of_no_prior_is_unknown_never_zero(self):
         self.assertEqual(mutation_cost.price([(None, None), (1.0, 2.0)]).source, 'unknown')
         self.assertIsNone(mutation_cost.price([(None, None)]).secs)
-        self.assertEqual(mutation_cost.price([(None, 2700.0)]), (2700.0, 2700.0, 'measured', 0, 1))
+        self.assertEqual(mutation_cost.price([(None, 2700.0)]), (2700.0, 2700.0, 'measured', 0))
 
     def test_pair_gives_each_planned_mutant_its_own_measure(self):
         got = mutation_cost.pair(

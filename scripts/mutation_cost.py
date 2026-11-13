@@ -42,9 +42,8 @@ SAFE_JOB_MINUTES = 300
 SLOWDOWN = 1.9
 # A mutant with no measure at its file's current git blob is planned at its tool's prior times
 # this, a ruled margin: in Stryker run 43328238671 prior-priced work took at most 0.48x its prior
-# per shard, and 3.53x in the largest single-file ratio (platform.ts, too small to move a shard);
-# store.ts's 2.69x was against a price another file's ratio had already scaled down. Both weekly
-# records measure it per shard (prior_error) and warn past this.
+# per shard, and 3.53x in the largest single-file ratio (platform.ts, too small to move a shard).
+# Both weekly records measure it per shard (prior_error) and warn past this.
 PRIOR_ERROR = 3.0
 # A job matrix runs at most 256 jobs (https://docs.github.com/en/actions/reference/limits),
 # so a plan whose run matrix needs more fails.
@@ -526,18 +525,13 @@ def clean_secs(secs: object) -> dict[str, list[float]]:
 
 
 def clean_files(files: object) -> dict[str, dict]:
-    """The usable {path: {blob, secs}} entries of an untrusted cost history: a git blob and the
-    measures clean_secs keeps."""
+    """The {path: {blob, secs}} entries of FILES, a history's files record_fault accepted (or
+    None for none), each with the measures clean_secs keeps and none without one."""
     if not isinstance(files, dict):
         return {}
-    out = {}
-    for p, e in files.items():
-        if not (isinstance(p, str) and isinstance(e, dict)):
-            continue
-        blob, secs = e.get('blob'), clean_secs(e.get('secs'))
-        if isinstance(blob, str) and GIT_BLOB.fullmatch(blob) and secs:
-            out[p] = {'blob': blob, 'secs': secs}
-    return out
+    return {
+        p: {'blob': e['blob'], 'secs': s} for p, e in files.items() if (s := clean_secs(e['secs']))
+    }
 
 
 def record_fault(rec: object) -> str:
@@ -591,7 +585,6 @@ class Priced(NamedTuple):
     measured: float  # the part of them measures set
     source: str  # 'measured', 'prior', 'partial' or 'unknown'
     worst: int | None  # the index of the costliest measured mutant, None for none
-    reached: int  # how many of the mutants a measure holds
 
 
 def price(mutants: Sequence[tuple[float | None, float | None]]) -> Priced:
@@ -610,13 +603,13 @@ def price(mutants: Sequence[tuple[float | None, float | None]]) -> Priced:
     worst = max(got)[1] if got else None
     rest = [p for p, m in mutants if m is None]
     if any(p is None for p in rest):
-        return Priced(None, measured, 'unknown', worst, len(got))
+        return Priced(None, measured, 'unknown', worst)
     source = 'measured' if not rest else 'prior' if len(got) == 0 else 'partial'
-    return Priced(measured + sum(rest) * PRIOR_ERROR, measured, source, worst, len(got))
+    return Priced(measured + sum(rest) * PRIOR_ERROR, measured, source, worst)
 
 
 def totals(files: dict[str, dict[str, list[float]]]) -> tuple[float, int]:
-    """The worker-seconds and mutant count of one record's measures, for slowdown."""
+    """The worker-seconds and value count of FILES' measures."""
     values = [v for secs in files.values() for vs in secs.values() for v in vs]
     return sum(values), len(values)
 

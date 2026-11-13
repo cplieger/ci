@@ -860,7 +860,9 @@ class Ranges(unittest.TestCase):
         plan = json.loads((self.tmp / 'out' / 'r~web.json').read_text())
         self.assertEqual((plan['shards'], plan['ids']), (1, {}))
         self.assertIn("src/s.ts projects 1513 min, past a shard's 135 min", err.getvalue())
-        self.assertIn('gave no mutant ids', err.getvalue())
+        self.assertIn(
+            'it has no Stryker directive list (no git blob, or more than 100', err.getvalue()
+        )
 
     def test_openers_are_the_file_scope_directives_where_babel_counts_them(self):
         text = (
@@ -2378,8 +2380,7 @@ class RecordedRun(unittest.TestCase):
         for path, f in self.FIXTURE['sizing']['files'].items():
             self.assertEqual(sum(len(v) for v in history['files'][path]['secs'].values()), f['run'])
 
-    def test_a_first_week_entry_ends_every_shard_by_the_safe_limit_on_the_slowest_runner(self):
-        limit = ss.mutation_cost.SAFE_JOB_MINUTES
+    def test_a_first_week_entry_ends_every_shard_but_a_lone_nest_by_the_safe_limit(self):
         cut = self.FIXTURE['planned_from']['files']['scroll-controller.ts']
         for name, history in (
             ('no history', None),
@@ -2395,7 +2396,7 @@ class RecordedRun(unittest.TestCase):
             with self.subTest(history=name):
                 plan, jobs = self.slowest(history)
                 self.assertGreater(plan['shards'], 1)
-                self.assertLessEqual(max(jobs), limit, [round(j, 1) for j in jobs])
+                self.assert_bounded(plan, jobs, first_week=True)
 
     def test_the_run_s_own_history_plans_shards_within_the_bar(self):
         plan, jobs = self.slowest(self.history())
@@ -2406,18 +2407,25 @@ class RecordedRun(unittest.TestCase):
             ss.mutation_cost.bar_faults(plan['projected_minutes'], [measured]), [], measured
         )
 
-    def assert_bounded(self, plan: dict, jobs: list[float]) -> None:
+    def assert_bounded(self, plan: dict, jobs: list[float], first_week: bool = False) -> None:
         """Every shard of PLAN projects within the bound but one that runs a unit alone under its
-        job's deadline, named; and every job ends by SAFE_JOB_MINUTES on the slowest runner."""
+        job's deadline, named; and every job ends by SAFE_JOB_MINUTES on the slowest runner, but
+        in a FIRST_WEEK plan one of those lone units."""
         mc = ss.mutation_cost
         alone = set(plan['deadline'])
+        unbounded = set()
         for n, minutes in enumerate(plan['projected_minutes'], start=1):
             held = sorted(u for u, f in (plan['files'] or {}).items() if f['shard'] == n)
             self.assertTrue(held, n)
             if minutes > mc.BOUND_SECS / 60:
                 self.assertEqual(len(held), 1, (n, minutes, held))
                 self.assertIn(held[0], alone)
-        self.assertLessEqual(max(jobs), mc.SAFE_JOB_MINUTES, [round(j, 1) for j in jobs])
+            if first_week and len(held) == 1 and held[0] in alone:
+                unbounded.add(n)
+        # actual() spreads each recorded range's total over its mutants by prior, so it cannot
+        # show that a nest inside scroll-controller.ts:767-1344 or :1347-1873 ends in time.
+        rest = [round(j, 1) for n, j in enumerate(jobs, start=1) if n not in unbounded]
+        self.assertLessEqual(max(rest), mc.SAFE_JOB_MINUTES, rest)
 
     def test_a_first_week_plans_each_nest_past_the_bound_alone_and_every_other_shard_within_it(
         self,
@@ -2432,7 +2440,7 @@ class RecordedRun(unittest.TestCase):
         )
         self.assertLessEqual(plan['shards'], mc.MATRIX_LIMIT)
         self.assertTrue(all(plan['files'][u]['cost'] == 'prior' for u in plan['deadline']))
-        self.assert_bounded(plan, jobs)
+        self.assert_bounded(plan, jobs, first_week=True)
 
     def test_a_split_file_with_one_range_unmeasured_keeps_every_shard_within_the_bound(self):
         a, b = 767, 1344
@@ -2449,7 +2457,7 @@ class RecordedRun(unittest.TestCase):
         # Measured lines are cut by their measure, never up to the unmeasured nest's size.
         self.assertIn('measured', {x['cost'] for x in units.values()})
         self.assertEqual(plan['deadline'], ['scroll-controller.ts:767-785'])
-        self.assert_bounded(plan, jobs)
+        self.assert_bounded(plan, jobs, first_week=True)
 
     def test_a_measured_nest_past_the_bound_fails_the_plan_named(self):
         sizing = self.sizing()

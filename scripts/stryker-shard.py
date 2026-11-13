@@ -602,8 +602,8 @@ def assign(
         elif shardable and work > top - setup and paired is not None and 'directives' not in f:
             warnings.append(
                 t"{where}: {path:.200} projects {work / 60:.0f} min, past a shard's "
-                t'{(top - setup) / 60:.0f} min of work, but its plan pass gave no mutant ids or '
-                t'more than {MAX_DIRECTIVES} Stryker directives, so it runs whole'
+                t'{(top - setup) / 60:.0f} min of work, but it has no Stryker directive list (no '
+                t'git blob, or more than {MAX_DIRECTIVES} directives), so it runs whole'
             )
         for unit, run, early, w in pieces:
             priced, worst, prior = whole if unit == path else priced_unit(unit, f, paired)
