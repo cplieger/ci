@@ -36,24 +36,29 @@ _spec = importlib.util.spec_from_file_location('workflow_replay', SCRIPTS / 'wor
 workflow_replay = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(workflow_replay)
 
-# Weekly jobs that run a target repository's code.
+# Scheduled jobs that run a target repository's code.
 TARGET_CODE_JOBS = {
-    ('weekly-stryker.yaml', 'run'),
-    ('weekly-gremlins.yaml', 'plan'),
-    ('weekly-gremlins.yaml', 'run'),
+    ('mutation-stryker-repo.yaml', 'plan'),
+    ('mutation-stryker-repo.yaml', 'run'),
+    ('mutation-gremlins-repo.yaml', 'plan'),
+    ('mutation-gremlins-repo.yaml', 'run'),
     ('weekly-fuzz.yaml', 'fuzz'),
     ('weekly-bench.yaml', 'smoke'),
     ('weekly-bench.yaml', 'run'),
 }
-# Weekly jobs that hold CI_SCHEDULE or the run's token and run no target code.
+# Scheduled jobs that hold CI_SCHEDULE or the run's token and run no target code; a
+# `repo` job only passes CI_SCHEDULE to the per-repository workflow it calls.
 NO_TARGET_CODE = {
     ('weekly-stryker.yaml', 'fanout'),
-    ('weekly-stryker.yaml', 'badge'),
-    ('weekly-stryker.yaml', 'aggregate'),
+    ('weekly-stryker.yaml', 'repo'),
+    ('mutation-stryker-repo.yaml', 'shard'),
+    ('mutation-stryker-repo.yaml', 'badge'),
+    ('mutation-stryker-repo.yaml', 'aggregate'),
     ('weekly-gremlins.yaml', 'fanout'),
-    ('weekly-gremlins.yaml', 'shard'),
-    ('weekly-gremlins.yaml', 'badge'),
-    ('weekly-gremlins.yaml', 'aggregate'),
+    ('weekly-gremlins.yaml', 'repo'),
+    ('mutation-gremlins-repo.yaml', 'shard'),
+    ('mutation-gremlins-repo.yaml', 'badge'),
+    ('mutation-gremlins-repo.yaml', 'aggregate'),
     ('weekly-fuzz.yaml', 'fanout'),
     ('weekly-fuzz.yaml', 'report'),
     ('weekly-bench.yaml', 'fanout'),
@@ -62,7 +67,14 @@ NO_TARGET_CODE = {
     ('weekly-links.yaml', 'fanout'),
     ('weekly-links.yaml', 'run'),
 }
-TARGET_WORKFLOWS = sorted({name for name, _ in TARGET_CODE_JOBS})
+# The workflows that list repositories, and the per-repository ones they call.
+LISTING_WORKFLOWS = [
+    'weekly-bench.yaml',
+    'weekly-fuzz.yaml',
+    'weekly-gremlins.yaml',
+    'weekly-stryker.yaml',
+]
+SCHEDULED = ('weekly-*.yaml', 'mutation-*-repo.yaml')
 TOOLCHAIN = ('actions/setup-go@', 'actions/setup-node@')
 
 
@@ -82,9 +94,9 @@ class TokenScope(unittest.TestCase):
                 self.assertFalse(references_secret(workflow.get('env', {})))
                 self.assertFalse(references_secret(workflow['jobs'][job_name]))
 
-    def test_every_weekly_job_referencing_a_secret_runs_no_target_code(self):
+    def test_every_scheduled_job_referencing_a_secret_runs_no_target_code(self):
         found = set()
-        for path in sorted(WORKFLOWS.glob('weekly-*.yaml')):
+        for path in sorted(p for g in SCHEDULED for p in WORKFLOWS.glob(g)):
             workflow = yaml.safe_load(path.read_text())
             self.assertFalse(references_secret(workflow.get('env', {})), path.name)
             for job_name, job in workflow['jobs'].items():
@@ -94,12 +106,12 @@ class TokenScope(unittest.TestCase):
 
     def test_a_job_classified_as_running_no_target_code_sets_up_no_toolchain(self):
         for name, job_name in sorted(NO_TARGET_CODE):
-            for s in load(name)['jobs'][job_name]['steps']:
+            for s in load(name)['jobs'][job_name].get('steps', []):
                 with self.subTest(f'{name}:{job_name}', step=s.get('name')):
                     self.assertFalse(s.get('uses', '').startswith(TOOLCHAIN))
 
-    def test_no_weekly_clone_carries_an_auth_header(self):
-        for path in sorted(WORKFLOWS.glob('weekly-*.yaml')):
+    def test_no_scheduled_clone_carries_an_auth_header(self):
+        for path in sorted(p for g in SCHEDULED for p in WORKFLOWS.glob(g)):
             with self.subTest(path.name):
                 self.assertNotIn('extraheader', path.read_text())
         self.assertNotIn('extraheader', (SCRIPTS / 'gremlins-prepare.sh').read_text())
@@ -137,7 +149,12 @@ case "$*" in
       shift
     done
     exit 1 ;;
-  */contents/go.mod*) exit 0 ;;
+  */contents/go.mod*)
+    p="$*"
+    r=${p#*/repos/cplieger/}
+    r=${r%%/*}
+    if [ -f "$TREES/$r.noroot" ]; then echo 'gh: Not Found (HTTP 404)' >&2; exit 1; fi
+    exit 0 ;;
   */git/trees/*) echo 20000 ;;
   *) exit 1 ;;
 esac
@@ -146,7 +163,8 @@ esac
 # that file exists) and a benchmark, and a stryker config in each dir
 # $TREES/<repo> lists (the root when it lists none). Each dir $TREES/<repo>.mods
 # lists is a nested module with one fuzz target and one benchmark, and with
-# $TREES/<repo>.noroot the root holds no module. With $TREES/<repo>.nohead the
+# $TREES/<repo>.noroot the root holds no module. Every clone holds 12000 bytes
+# of non-test Go, past the gremlins fanout's size floor. With $TREES/<repo>.nohead the
 # clone succeeds but leaves no resolvable HEAD, and with $TREES/<repo>.noclone it
 # fails.
 FANOUT_GIT_STUB = """#!/usr/bin/env bash
@@ -157,6 +175,7 @@ r=$(basename "${@: -2:1}" .git)
 [ -f "$TREES/$r.noclone" ] && exit 128
 mkdir -p "$dest"
 [ -f "$TREES/$r.nohead" ] && : >"$dest/.nohead"
+head -c 12000 /dev/zero | tr '\0' ' ' >"$dest/big.go"
 if [ ! -f "$TREES/$r.noroot" ]; then
   printf 'module example.com/%s\n' "$r" >"$dest/go.mod"
   printf 'package x\nfunc FuzzX(f *testing.F) {}\nfunc BenchmarkX(b *testing.B) {}\n' >"$dest/x_test.go"
@@ -226,6 +245,8 @@ class FanoutReplay:
             (trees / f'{repo}.noroot').write_text('')
         for repo in noclone:
             (trees / f'{repo}.noclone').write_text('')
+        (tmp / 'cwd').mkdir()
+        (tmp / 'cwd' / 'scripts').symlink_to(SCRIPTS)
         rc, result, log = replay_job(
             tmp,
             name,
@@ -243,17 +264,19 @@ class FanoutReplay:
         self.assertEqual(rc, 0, result.get('failed'))
         for line in log:
             self.assertNotIn('extraheader', line)
-        clones = [line.split()[-2] for line in log if line.startswith('clone ')]
+        clones = [line.split()[-2] for line in log if 'clone' in line.split()]
         self.clones = clones
         names = '|'.join(('xmlx', 'zpub', *extra))
         self.assertTrue(all(re.search(rf'/({names})\.git$', url) for url in clones), clones)
-        return result['steps']['fanout']['outputs']
+        return {
+            k: v for step in result['steps'].values() for k, v in step.get('outputs', {}).items()
+        }
 
 
 class PublicOnly(FanoutReplay, unittest.TestCase):
     def test_every_listing_keeps_only_public_live_repositories_it_owns(self):
         listing = json.dumps(LISTING)
-        for name in TARGET_WORKFLOWS:
+        for name in LISTING_WORKFLOWS:
             programs = listing_programs(name)
             self.assertTrue(programs, name)
             for program in programs:
@@ -265,7 +288,7 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
                     self.assertEqual(out.stdout.split(), PUBLIC)
 
     def test_no_target_workflow_lists_repositories_another_way(self):
-        for name in TARGET_WORKFLOWS:
+        for name in sorted({*LISTING_WORKFLOWS, *(n for n, _ in TARGET_CODE_JOBS)}):
             for job in load(name)['jobs'].values():
                 for s in job.get('steps', []):
                     code = '\n'.join(
@@ -276,19 +299,49 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
                     with self.subTest(name, step=s.get('name')):
                         self.assertNotRegex(code, r'gh repo list|users/[^/]+/repos|orgs/')
 
-    def test_the_stryker_fanout_emits_public_entries_with_their_slugs(self):
+    def test_the_stryker_fanout_emits_public_repositories(self):
         outputs = self.fanout('weekly-stryker.yaml')
-        self.assertEqual(
-            json.loads(outputs['matrix']),
-            [
-                {'repo': 'xmlx', 'sha': SHA, 'dir': '.', 'slug': 'root'},
-                {'repo': 'xmlx', 'sha': SHA, 'dir': 'web/app', 'slug': 'web_app'},
-                {'repo': 'zpub', 'sha': SHA, 'dir': '.', 'slug': 'root'},
-            ],
-        )
+        self.assertEqual(json.loads(outputs['repos']), PUBLIC)
 
     def test_the_gremlins_fanout_emits_public_repositories(self):
         outputs = self.fanout('weekly-gremlins.yaml')
+        self.assertEqual(json.loads(outputs['repos']), PUBLIC)
+
+    def test_the_gremlins_fanout_keeps_a_repo_of_nested_modules_through_go_units(self):
+        outputs = self.fanout(
+            'weekly-gremlins.yaml',
+            extra=('go',),
+            mods={'go': ['keyenc', 'urlform']},
+            noroot=('go',),
+        )
+        self.assertEqual(json.loads(outputs['repos']), [*PUBLIC, 'go'])
+        self.assertIn('https://github.com/cplieger/go.git', self.clones)
+
+    def test_the_gremlins_fanout_skips_a_repo_with_no_go_module_and_keeps_a_root_one(self):
+        outputs = self.fanout('weekly-gremlins.yaml', noroot=('zpub',))
+        self.assertEqual(json.loads(outputs['repos']), [r for r in PUBLIC if r != 'zpub'])
+        self.assertEqual(
+            sorted(self.clones), sorted(f'https://github.com/cplieger/{r}.git' for r in PUBLIC)
+        )
+
+    def test_every_fanout_clone_in_a_repo_loop_is_bounded(self):
+        # One stalled clone in a serial loop would hold the job until its timeout.
+        seen = 0
+        for name in ('weekly-gremlins.yaml', 'weekly-fuzz.yaml', 'weekly-bench.yaml'):
+            for job, spec in load(name)['jobs'].items():
+                for s in spec.get('steps', []):
+                    lines = s.get('run', '').splitlines()
+                    for i, line in enumerate(lines):
+                        if re.search(r'\bclone\b.*cplieger/\$\{r\}\.git', line):
+                            seen += 1
+                            with self.subTest(name, job=job, line=line.strip()):
+                                self.assertIn(
+                                    'timeout 120 git', ' '.join(lines[max(0, i - 1) : i + 1])
+                                )
+        self.assertEqual(seen, 4)
+
+    def test_the_gremlins_fanout_runs_a_repo_it_cannot_clone_so_its_call_shows_it(self):
+        outputs = self.fanout('weekly-gremlins.yaml', noclone=('zpub',))
         self.assertEqual(json.loads(outputs['repos']), PUBLIC)
 
     def test_the_fuzz_fanout_emits_public_repositories(self):
@@ -333,8 +386,6 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
         )
 
     def test_a_clone_with_no_head_drops_only_that_repository(self):
-        stryker = self.fanout('weekly-stryker.yaml', nohead=('zpub',))
-        self.assertEqual({e['repo'] for e in json.loads(stryker['matrix'])}, {'xmlx'})
         fuzz = self.fanout('weekly-fuzz.yaml', nohead=('zpub',))
         self.assertEqual([e['repo'] for e in json.loads(fuzz['repo_matrix'])], ['xmlx'])
         self.assertEqual([e['repo'] for e in json.loads(fuzz['shard_matrix'])], ['xmlx'])
@@ -514,6 +565,7 @@ def replay_job(
         'github': github or {},
         'secrets': {'CI_SCHEDULE': 'tok'},
         'matrix': matrix or {'repo': 'a', 'sha': 'f00d'},
+        'inputs': {'repository': 'a', 'dir': '', 'module': '', 'honour-opt-out': False},
         'needs': {
             'fanout': {'result': 'success', 'outputs': {'matrix': MATRIX}},
             'run': {'result': 'success', 'outputs': {}},
@@ -536,14 +588,14 @@ def replay_job(
 
 
 def stryker_step(job: str, name: str) -> dict:
-    steps = load('weekly-stryker.yaml')['jobs'][job]['steps']
+    steps = load('mutation-stryker-repo.yaml')['jobs'][job]['steps']
     return next(s for s in steps if s.get('name') == name)
 
 
 PUBLISHER_STUB_PATH = pathlib.Path('actions', 'publish-badge', 'publish-badge.sh')
 
 
-BADGE_ENTRY = {'repo': 'a', 'sha': 'f00d', 'dir': 'web', 'slug': 'web'}
+BADGE_ENTRY = {'repo': 'a', 'sha': 'f00d', 'dir': 'web', 'key': 'a~web'}
 
 
 class StrykerBadge(unittest.TestCase):
@@ -556,7 +608,10 @@ class StrykerBadge(unittest.TestCase):
             (tmp / 'cwd' / 'artifact').mkdir()
             (tmp / 'cwd' / 'artifact' / 'meta.json').write_text(json.dumps(meta))
         args = ['--skip', "Download this entry's report"]
-        return replay_job(tmp, 'weekly-stryker.yaml', 'badge', args, matrix=BADGE_ENTRY, **env)
+        needs = {'shard': {'result': 'success', 'outputs': {'merge': json.dumps([BADGE_ENTRY])}}}
+        return replay_job(
+            tmp, 'mutation-stryker-repo.yaml', 'badge', args, matrix=BADGE_ENTRY, needs=needs, **env
+        )
 
     @staticmethod
     def badge(repo: str, score: str, color: str) -> str:
@@ -609,18 +664,18 @@ class StrykerBadge(unittest.TestCase):
         self.assertIn("Publish this entry's mutation-ts badge", result['failed'])
 
     def test_each_entry_downloads_the_artifact_its_run_entry_uploaded(self):
-        job = load('weekly-stryker.yaml')['jobs']['badge']
+        job = load('mutation-stryker-repo.yaml')['jobs']['badge']
         self.assertEqual(
-            job['strategy']['matrix']['include'], '${{ fromJSON(needs.fanout.outputs.matrix) }}'
+            job['strategy']['matrix']['include'], '${{ fromJSON(needs.shard.outputs.merge) }}'
         )
         download = stryker_step('badge', "Download this entry's report")['with']
-        upload = stryker_step('run', 'Upload report (artifact, 90-day retention)')['with']
-        self.assertEqual(download['pattern'], 'stryker-${{ matrix.repo }}-${{ matrix.slug }}')
+        upload = stryker_step('merge', 'Upload the report (artifact, 90-day retention)')['with']
+        self.assertEqual(download['pattern'], 'stryker-${{ matrix.key }}')
         self.assertEqual(upload['name'], download['pattern'])
         self.assertNotIn('merge-multiple', download)
 
     def test_a_cancelled_run_publishes_nothing(self):
-        cond = load('weekly-stryker.yaml')['jobs']['badge']['if']
+        cond = load('mutation-stryker-repo.yaml')['jobs']['badge']['if']
         self.assertIn('!cancelled()', cond)
         self.assertNotIn('always()', cond)
 
@@ -667,46 +722,71 @@ SURVIVED = {
 
 
 class StrykerStage(unittest.TestCase):
-    def stage(self) -> dict:
-        step = stryker_step('run', 'Stage report for the badge and tracker jobs')
+    """The merge job stages one shard's report as the unsharded run job staged it."""
+
+    def stage(self) -> tuple[dict, dict]:
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
-        (tmp / 'target' / 'web' / 'reports').mkdir(parents=True)
-        (tmp / 'target' / 'web' / 'reports' / 'm.json').write_text(json.dumps(REPORT))
-        stage = tmp / 'stage'
-        body = step['run'].replace('/tmp/stage', str(stage))
-        env = {'REPORT': 'reports/m.json', 'REPO': 'r', 'DIR': 'web', 'SCORE': '61.2'}
+        plan = tmp / 'plan.json'
+        plan.write_text(
+            json.dumps(
+                {'repo': 'r', 'dir': 'web', 'sha': SHA, 'shards': 1, 'files': None, 'break': None}
+            )
+        )
+        shard = tmp / 'shards'
+        shard.mkdir()
+        (shard / 'result.json').write_text(json.dumps(REPORT))
+        (shard / 'meta.json').write_text(
+            json.dumps(
+                {
+                    'repo': 'r',
+                    'dir': 'web',
+                    'shard': 1,
+                    'shards': 1,
+                    'complete': True,
+                    'skipped': False,
+                }
+            )
+        )
         proc = subprocess.run(
-            ['bash', '-e', '-c', body],
-            cwd=tmp,
-            env={'PATH': os.environ['PATH'], **env},
+            [
+                sys.executable,
+                str(SCRIPTS / 'stryker-shard.py'),
+                'merge',
+                '--plan',
+                str(plan),
+                '--shards',
+                str(shard),
+                '--stage',
+                str(tmp / 'stage'),
+                '--costs',
+                str(tmp / 'costs'),
+            ],
             capture_output=True,
             text=True,
+            check=False,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        meta = json.loads((stage / 'meta.json').read_text())
-        self.assertEqual(meta, {'repo': 'r', 'dir': 'web', 'score': '61.2'})
-        return json.loads((stage / 'mutation.json').read_text())
-
-    def test_the_stage_step_reads_the_entry_and_its_score(self):
-        env = stryker_step('run', 'Stage report for the badge and tracker jobs')['env']
-        self.assertEqual(
-            env,
-            {
-                'REPORT': '${{ steps.stryker.outputs.report }}',
-                'REPO': '${{ matrix.repo }}',
-                'DIR': '${{ matrix.dir }}',
-                'SCORE': '${{ steps.stryker.outputs.score }}',
-            },
+        return (
+            json.loads((tmp / 'stage' / 'mutation.json').read_text()),
+            json.loads((tmp / 'stage' / 'meta.json').read_text()),
         )
 
-    def test_a_report_loses_only_the_sources(self):
+    def test_the_merge_step_reads_its_entry_s_plan_and_shards(self):
+        step = stryker_step('merge', 'Merge the shards')
+        self.assertEqual(step['env'], {'KEY': '${{ matrix.key }}'})
+        self.assertIn('--plan "plan/${KEY}.json" --shards shards', step['run'])
+        self.assertIn('--stage stage --costs costs', step['run'])
+
+    def test_a_report_loses_only_the_sources_and_its_score_is_computed(self):
         want = json.loads(json.dumps(REPORT))
         del want['files']['src/a.ts']['source']
         del want['testFiles']['src/a.test.ts']['source']
-        self.assertEqual(self.stage(), want)
+        staged, meta = self.stage()
+        self.assertEqual(staged, want)
+        self.assertEqual(meta, {'repo': 'r', 'dir': 'web', 'score': '100.0'})
 
     def test_the_tracker_reads_a_staged_report(self):
-        staged = self.stage()
+        staged, _ = self.stage()
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         (tmp / 'artifacts').mkdir()
         (tmp / 'artifacts' / 'mutation.json').write_text(json.dumps(staged))
@@ -733,21 +813,26 @@ class StrykerStage(unittest.TestCase):
         self.assertEqual((tmp / 'entries').read_text().strip(), '1')
 
 
-# Each reader of the run artifacts: (workflow, job, the job and output its matrix
-# comes from, the run job's upload step).
+# Each reader of the run artifacts: (workflow, job, the shard job output naming
+# its downloads, the job and step whose uploads they are).
 ARTIFACT_READERS = (
-    ('weekly-stryker.yaml', 'aggregate', 'fanout', 'Upload report (artifact, 90-day retention)'),
     (
-        'weekly-gremlins.yaml',
-        'badge',
-        'shard',
-        'Upload full mutants.json (artifact, 90-day retention)',
+        'mutation-stryker-repo.yaml',
+        'aggregate',
+        'reports',
+        ('merge', 'Upload the report (artifact, 90-day retention)'),
     ),
     (
-        'weekly-gremlins.yaml',
+        'mutation-gremlins-repo.yaml',
+        'badge',
+        'artifacts',
+        ('run', 'Upload full mutants.json (artifact, 90-day retention)'),
+    ),
+    (
+        'mutation-gremlins-repo.yaml',
         'aggregate',
-        'shard',
-        'Upload full mutants.json (artifact, 90-day retention)',
+        'artifacts',
+        ('run', 'Upload full mutants.json (artifact, 90-day retention)'),
     ),
 )
 GLOB_CHARACTERS = re.compile(r'[*?\[\]{}()!+@,]')
@@ -763,13 +848,13 @@ def expand(pattern: str) -> set[str]:
 
 
 def upload_names(
-    workflow: str, upload: str, entries: list[dict], job: str = 'run'
+    workflow: str, upload: str, entries: list[dict], job: str = 'run', needs: dict | None = None
 ) -> dict[str, set[str]]:
     """The artifact name each run entry uploads, by repo, rendered as GitHub would."""
     expr = next(s for s in load(workflow)['jobs'][job]['steps'] if s.get('name') == upload)
     names: dict[str, set[str]] = {}
     for entry in entries:
-        scope = workflow_replay.Scope({'matrix': entry}, {}, [])
+        scope = workflow_replay.Scope({'matrix': entry, 'needs': needs or {}}, {}, [])
         names.setdefault(entry['repo'], set()).add(scope.render(expr['with']['name']))
     return names
 
@@ -784,18 +869,6 @@ SHARD_STUB = """import json, os, sys
 with open(os.environ['STUB_LOG'], 'a') as log:
     log.write('shard ' + ' '.join(sys.argv[1:]) + '\\n')
 print(json.dumps(json.loads(os.environ['STUB_MATRIX'])))
-"""
-# gh api answers the run's shard-plan artifact names, as its --jq leaves them.
-# Applies the step's --jq to a listing that repeats a rerun's upload and holds an
-# expired one.
-ARTIFACTS_GH_STUB = """#!/usr/bin/env bash
-printf 'gh %s\\n' "$*" >>"$STUB_LOG"
-while [ "$#" -gt 0 ] && [ "$1" != --jq ]; do shift; done
-jq -r "${2:?no --jq}" <<'JSON'
-{"artifacts": [{"name": "shard-plan-a", "expired": false}, {"name": "shard-plan-b", "expired": false},
- {"name": "shard-plan-b", "expired": false}, {"name": "shard-plan-c", "expired": true},
- {"name": "gremlins-a-1", "expired": false}]}
-JSON
 """
 TRACKER_STUB = """import os, pathlib, sys
 a = sys.argv[1:]
@@ -822,95 +895,111 @@ def gremlins_out(efficacy: float) -> dict:
 
 
 class ArtifactBinding(FanoutReplay, unittest.TestCase):
-    def test_each_reader_runs_per_repo_on_the_artifacts_named_for_it(self):
-        for name, job_name, source, _ in ARTIFACT_READERS:
+    def test_each_reader_runs_on_the_artifacts_named_for_its_repo(self):
+        for name, job_name, output, _ in ARTIFACT_READERS:
             with self.subTest(f'{name}:{job_name}'):
                 job = load(name)['jobs'][job_name]
-                self.assertIn(source, job['needs'])
-                self.assertIn(f"needs.{source}.result == 'success'", job['if'])
-                self.assertEqual(
-                    job['strategy']['matrix']['include'],
-                    f'${{{{ fromJSON(needs.{source}.outputs.repos) }}}}',
-                )
+                self.assertIn('shard', job['needs'])
+                self.assertIn("needs.shard.result == 'success'", job['if'])
                 download = next(
                     s
                     for s in job['steps']
                     if s.get('uses', '').startswith('actions/download-artifact@')
                 )['with']
                 self.assertEqual(
-                    download, {'path': 'artifacts', 'pattern': '${{ matrix.artifacts }}'}
+                    download,
+                    {'path': 'artifacts', 'pattern': f'${{{{ needs.shard.outputs.{output} }}}}'},
                 )
                 reads = [s for s in job['steps'] if 'artifacts' in s.get('run', '')]
                 self.assertEqual(len(reads), 1)
                 self.assertIn(
                     'discover-artifact-repos.sh --allow "$REPO" artifacts', reads[0]['run']
                 )
-                self.assertEqual(reads[0]['env']['REPO'], '${{ matrix.repo }}')
+                self.assertEqual(reads[0]['env']['REPO'], '${{ inputs.repository }}')
+        record = load('mutation-gremlins-repo.yaml')['jobs']['record']
+        costs = next(s for s in record['steps'] if 'gremlins-shard.py history' in s.get('run', ''))
+        # gremlins-shard.py history binds each cost record by its meta.json.
+        self.assertIn('--repo "$REPO" --artifacts-dir artifacts', costs['run'])
+        self.assertEqual(costs['env']['REPO'], '${{ inputs.repository }}')
 
-    def test_the_stryker_readers_download_exactly_each_repo_s_upload_names(self):
-        outputs = self.fanout('weekly-stryker.yaml')
-        repos = json.loads(outputs['repos'])
-        self.assertEqual(
-            repos,
-            [
-                {'repo': 'xmlx', 'artifacts': '{stryker-xmlx-root,stryker-xmlx-web_app}'},
-                {'repo': 'zpub', 'artifacts': 'stryker-zpub-root'},
-            ],
+    def test_the_stryker_readers_download_exactly_each_entry_s_upload_names(self):
+        body = stryker_step('shard', 'Build the run and merge matrices')['run']
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (tmp / 'scripts').symlink_to(SCRIPTS)
+        entries = [
+            {'repo': 'xmlx', 'sha': SHA, 'dir': d, 'key': k}
+            for d, k in (('.', 'xmlx~'), ('web/app', 'xmlx~web=app'))
+        ]
+        out = tmp / 'out'
+        proc = subprocess.run(
+            ['bash', '-c', body],
+            cwd=tmp,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                **os.environ,
+                'ENTRIES': json.dumps(entries),
+                'GITHUB_OUTPUT': str(out),
+            },
         )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        outputs = dict(line.split('=', 1) for line in out.read_text().splitlines())
+        self.assertEqual(outputs['reports'], '{stryker-xmlx~,stryker-xmlx~web=app}')
         want = upload_names(
-            'weekly-stryker.yaml', ARTIFACT_READERS[0][3], json.loads(outputs['matrix'])
+            'mutation-stryker-repo.yaml',
+            ARTIFACT_READERS[0][3][1],
+            json.loads(outputs['merge']),
+            'merge',
         )
-        self.assertEqual({r['repo']: expand(r['artifacts']) for r in repos}, want)
+        self.assertEqual({'xmlx': expand(outputs['reports'])}, want)
 
     def test_the_gremlins_readers_download_exactly_each_repo_s_upload_names(self):
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         (tmp / 'cwd' / 'scripts').mkdir(parents=True)
         (tmp / 'cwd' / 'scripts' / 'gremlins-shard.py').write_text(SHARD_STUB)
-        (tmp / 'bin').mkdir()
-        (tmp / 'bin' / 'gh').write_text(ARTIFACTS_GH_STUB)
-        (tmp / 'bin' / 'gh').chmod(0o755)
-        args = ['--skip', 'Checkout ci (for scripts/)', '--skip', 'Download the shard plans']
+        args = [
+            '--skip',
+            'Checkout ci (for scripts/)',
+            '--skip',
+            'Download the shard plan',
+            '--skip',
+            'Fetch the cost history',
+            '--skip',
+            'Upload the run plan',
+        ]
         needs = {
             'plan': {'result': 'success', 'outputs': {}},
-            'fanout': {'result': 'success', 'outputs': {'repos': '["a", "a-1", "b"]'}},
+            'setup': {'result': 'success', 'outputs': {'key': 'a'}},
         }
+        matrix = [r for r in GREMLINS_MATRIX if r['repo'] == 'a']
         rc, result, log = replay_job(
             tmp,
-            'weekly-gremlins.yaml',
+            'mutation-gremlins-repo.yaml',
             'shard',
             args,
             needs=needs,
-            STUB_MATRIX=json.dumps(GREMLINS_MATRIX),
-            PATH=f'{tmp / "bin"}:{os.environ["PATH"]}',
-            GITHUB_REPOSITORY='owner/ci',
-            GITHUB_RUN_ID='42',
+            STUB_MATRIX=json.dumps(matrix),
         )
         self.assertEqual(rc, 0, result.get('failed'))
         self.assertEqual(
             log,
             [
                 (
-                    'gh api --paginate repos/owner/ci/actions/runs/42/artifacts?per_page=100 '
-                    '--jq .artifacts[] | select(.expired | not) | .name '
-                    '| select(startswith("shard-plan-"))'
-                ),
-                (
-                    'shard matrix --repos ["a", "a-1", "b"] --plans plans --attempts 3 '
-                    '--artifacts ["shard-plan-a","shard-plan-b"]'
-                ),
+                    'shard matrix --repo a --plan sizing/plan.json --attempts 3 '
+                    '--history history/costs.json --out-plan run-plans/plan.json'
+                )
             ],
         )
         self.assertEqual(
-            load('weekly-gremlins.yaml')['jobs']['shard']['permissions']['actions'], 'read'
+            load('mutation-gremlins-repo.yaml')['jobs']['shard']['permissions']['actions'], 'read'
         )
-        repos = json.loads(result['outputs']['repos'])
-        self.assertEqual([r['repo'] for r in repos], ['a', 'a-1', 'b'])
-        self.assertEqual(repos[2]['artifacts'], 'gremlins-b-1')
-        want = upload_names('weekly-gremlins.yaml', ARTIFACT_READERS[1][3], GREMLINS_MATRIX)
-        got = {r['repo']: expand(r['artifacts']) for r in repos}
-        self.assertEqual(got, want)
-        self.assertEqual(len(got['a']), 6)
-        self.assertNotIn('gremlins-a-1-1', got['a'])
+        got = expand(result['steps']['matrix']['outputs']['artifacts'])
+        want = upload_names(
+            'mutation-gremlins-repo.yaml', ARTIFACT_READERS[1][3][1], matrix, needs=needs
+        )
+        self.assertEqual({'a': got}, want)
+        self.assertEqual(len(got), 6)
 
     def test_the_fuzz_report_downloads_exactly_each_repo_s_shard_names(self):
         report = load('weekly-fuzz.yaml')['jobs']['report']
@@ -958,18 +1047,15 @@ class ArtifactBinding(FanoutReplay, unittest.TestCase):
             (tmp / 'cwd' / 'artifacts' / name / file).write_text(json.dumps(content))
         steps = [s.get('name') for s in load(workflow)['jobs'][job]['steps']]
         args = [a for s in steps[:-1] for a in ('--skip', s)]
-        source = 'fanout' if workflow == 'weekly-stryker.yaml' else 'shard'
         needs = {
-            n: {'result': 'success', 'outputs': {'repos': '[]'}}
-            for n in ('fanout', 'plan', 'shard')
+            n: {'result': 'success', 'outputs': {'merge': '[{"key": "a~"}]', 'artifacts': 'x'}}
+            for n in ('discover', 'setup', 'plan', 'shard', 'run', 'merge')
         }
-        needs[source]['outputs']['repos'] = json.dumps([{'repo': 'a', 'artifacts': 'x'}])
         rc, result, log = replay_job(
             tmp,
             workflow,
             job,
             args,
-            matrix={'repo': 'a', 'artifacts': 'x'},
             needs=needs,
             GITHUB_SERVER_URL='https://github.com',
             GITHUB_REPOSITORY='cplieger/ci',
@@ -997,8 +1083,20 @@ class ArtifactBinding(FanoutReplay, unittest.TestCase):
             ),
         }
         cases = (
-            ('weekly-stryker.yaml', 'aggregate', stryker, 'entries.txt', '100.0% mutation score'),
-            ('weekly-gremlins.yaml', 'aggregate', gremlins, 'attempts.txt', '80.0% efficacy'),
+            (
+                'mutation-stryker-repo.yaml',
+                'aggregate',
+                stryker,
+                'entries.txt',
+                '100.0% mutation score',
+            ),
+            (
+                'mutation-gremlins-repo.yaml',
+                'aggregate',
+                gremlins,
+                'attempts.txt',
+                '80.0% efficacy',
+            ),
         )
         for workflow, job, artifacts, marker, week in cases:
             with self.subTest(f'{workflow}:{job}'):
@@ -1011,7 +1109,7 @@ class ArtifactBinding(FanoutReplay, unittest.TestCase):
                 body = pathlib.Path(result['runner_temp'], 'body.md').read_text()
                 self.assertIn(f'**This week**: {week}', body)
                 self.assertIn("an artifact names 'victim'", out)
-        rc, result, log, out = self.reader('weekly-gremlins.yaml', 'badge', gremlins)
+        rc, result, log, out = self.reader('mutation-gremlins-repo.yaml', 'badge', gremlins)
         self.assertEqual(rc, 0, result.get('failed'))
         self.assertEqual(len(log), 1)
         target, file, rest = log[0].split(' ', 2)
@@ -1022,9 +1120,9 @@ class ArtifactBinding(FanoutReplay, unittest.TestCase):
 
     def test_a_reader_whose_download_names_only_another_repo_writes_nothing(self):
         cases = (
-            ('weekly-stryker.yaml', 'aggregate', 'mutation.json', REPORT),
-            ('weekly-gremlins.yaml', 'aggregate', 'gremlins-out.json', gremlins_out(80.0)),
-            ('weekly-gremlins.yaml', 'badge', 'gremlins-out.json', gremlins_out(80.0)),
+            ('mutation-stryker-repo.yaml', 'aggregate', 'mutation.json', REPORT),
+            ('mutation-gremlins-repo.yaml', 'aggregate', 'gremlins-out.json', gremlins_out(80.0)),
+            ('mutation-gremlins-repo.yaml', 'badge', 'gremlins-out.json', gremlins_out(80.0)),
         )
         for workflow, job, file, content in cases:
             for artifacts in ({'x': ({'repo': 'victim'}, file, content)}, {}):

@@ -7,6 +7,7 @@ gremlins-aggregate.py turns the attempts into the tracker body, history and
 badge, and gremlins-run.sh's coefficient and mode decision are extracted and
 run. Nothing else executes them before the weekly run publishes their number.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -22,6 +23,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import mutation_cost  # noqa: E402
+
 _spec = importlib.util.spec_from_file_location('gremlins_aggregate', HERE / 'gremlins-aggregate.py')
 gremlins_aggregate = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gremlins_aggregate)
@@ -33,6 +36,7 @@ SHARD = HERE / 'gremlins-shard.py'
 CONTAINER = HERE / 'gremlins-container.sh'
 PREPARE = HERE / 'gremlins-prepare.sh'
 WORKFLOW = HERE.parent / '.github' / 'workflows' / 'weekly-gremlins.yaml'
+REPO_WORKFLOW = HERE.parent / '.github' / 'workflows' / 'mutation-gremlins-repo.yaml'
 CENTRAL = HERE.parent / 'configs' / 'gremlins.yaml'
 
 FAILURES: list[str] = []
@@ -69,13 +73,15 @@ def result(module: str, files: list[tuple[str, list[tuple[str, str]]]]) -> dict:
     stats: dict[str, int] = {}
     out_files = []
     for name, muts in files:
-        out_files.append({
-            'file_name': name,
-            'mutations': [
-                {'type': t, 'status': s, 'line': 10 + i, 'column': 3}
-                for i, (s, t) in enumerate(muts)
-            ],
-        })
+        out_files.append(
+            {
+                'file_name': name,
+                'mutations': [
+                    {'type': t, 'status': s, 'line': 10 + i, 'column': 3}
+                    for i, (s, t) in enumerate(muts)
+                ],
+            }
+        )
         for s, t in muts:
             counts[s] += 1
             stats[stat_key[t]] = stats.get(stat_key[t], 0) + 1
@@ -84,7 +90,9 @@ def result(module: str, files: list[tuple[str, list[tuple[str, str]]]]) -> dict:
     return {
         'go_module': module,
         'test_efficacy': (killed / (killed + lived) * 100) if killed else 0.0,
-        'mutations_coverage': ((killed + lived) / (killed + lived + nc) * 100) if killed + lived else 0.0,
+        'mutations_coverage': ((killed + lived) / (killed + lived + nc) * 100)
+        if killed + lived
+        else 0.0,
         'mutants_total': killed + lived + nv,
         'mutants_killed': killed,
         'mutants_lived': lived,
@@ -96,8 +104,13 @@ def result(module: str, files: list[tuple[str, list[tuple[str, str]]]]) -> dict:
     }
 
 
-def run_merge(tmp: Path, modules: list[tuple[str, dict | None]], out_name: str = 'merged.json',
-              modes: dict[str, str] | None = None, skip: tuple[str, ...] = ()):
+def run_merge(
+    tmp: Path,
+    modules: list[tuple[str, dict | None]],
+    out_name: str = 'merged.json',
+    modes: dict[str, str] | None = None,
+    skip: tuple[str, ...] = (),
+):
     """Write each module's JSON (None = no file at all) and merge them.
 
     modes: {dir: text} written as the `<result>.mode` file gremlins-run.sh leaves.
@@ -114,7 +127,9 @@ def run_merge(tmp: Path, modules: list[tuple[str, dict | None]], out_name: str =
     out = tmp / out_name
     proc = subprocess.run(
         [sys.executable, str(MERGE), '--out', str(out), *args],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     merged = json.loads(out.read_text()) if proc.returncode == 0 and out.exists() else None
     return proc, merged
@@ -123,36 +138,83 @@ def run_merge(tmp: Path, modules: list[tuple[str, dict | None]], out_name: str =
 # ---------------------------------------------------------------------------
 # gremlins-merge.py
 # ---------------------------------------------------------------------------
+def test_merge_takes_a_repo_of_nested_modules_with_no_root(tmp: Path) -> None:
+    keyenc = result('github.com/cplieger/go/keyenc', [('k.go', [('KILLED', 'ARITHMETIC_BASE')])])
+    jsonx = result('github.com/cplieger/go/jsonx', [('j.go', [('LIVED', 'INVERT_LOGICAL')])])
+    proc, merged = run_merge(tmp, [('keyenc', keyenc), ('jsonx', jsonx)])
+    check(
+        "nested only: cplieger/go's modules merge with no root module",
+        ok=proc.returncode == 0
+        and merged is not None
+        and [m['dir'] for m in merged['modules']] == ['keyenc', 'jsonx']
+        and (merged['mutants_killed'], merged['mutants_lived']) == (1, 1)
+        and sorted(f['file_name'] for f in merged['files']) == ['jsonx/j.go', 'keyenc/k.go'],
+        detail=proc.stderr[-300:],
+    )
+    one, merged = run_merge(tmp, [('keyenc', keyenc)], out_name='one.json', skip=('jsonx',))
+    check(
+        'nested only: a one-module call merges that module and skips the rest',
+        ok=one.returncode == 0 and merged is not None and merged['mutants_killed'] == 1,
+        detail=one.stderr[-300:],
+    )
+
+
 def test_single_module_is_identity(tmp: Path) -> None:
     """A repo with no nested module must publish exactly what gremlins said.
 
     ~40 cplieger repos are single-module, so this is the path the merge
     takes almost every time: it must not shift a single number.
     """
-    root = result('github.com/cplieger/thing/v2', [
-        ('thing.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY'),
-                      ('NOT COVERED', 'INVERT_LOOPCTRL'), ('NOT VIABLE', 'INVERT_BWASSIGN')]),
-        ('other.go', [('KILLED', 'CONDITIONALS_NEGATION'), ('TIMED OUT', 'ARITHMETIC_BASE')]),
-    ])
+    root = result(
+        'github.com/cplieger/thing/v2',
+        [
+            (
+                'thing.go',
+                [
+                    ('KILLED', 'ARITHMETIC_BASE'),
+                    ('LIVED', 'CONDITIONALS_BOUNDARY'),
+                    ('NOT COVERED', 'INVERT_LOOPCTRL'),
+                    ('NOT VIABLE', 'INVERT_BWASSIGN'),
+                ],
+            ),
+            ('other.go', [('KILLED', 'CONDITIONALS_NEGATION'), ('TIMED OUT', 'ARITHMETIC_BASE')]),
+        ],
+    )
     proc, merged = run_merge(tmp, [('.', root)])
     check('single module: merge succeeds', ok=proc.returncode == 0, detail=proc.stderr)
     if merged is None:
         return
     same = all(
         merged[k] == root[k]
-        for k in ('go_module', 'mutants_total', 'mutants_killed', 'mutants_lived',
-                  'mutants_not_viable', 'mutants_not_covered', 'mutator_statistics')
+        for k in (
+            'go_module',
+            'mutants_total',
+            'mutants_killed',
+            'mutants_lived',
+            'mutants_not_viable',
+            'mutants_not_covered',
+            'mutator_statistics',
+        )
     )
-    check('single module: counters unchanged', ok=same,
-          detail=f'{ {k: merged[k] for k in ("mutants_total", "mutants_killed")} }')
-    check('single module: efficacy unchanged',
-          ok=abs(merged['test_efficacy'] - root['test_efficacy']) < 0.001,
-          detail=f'{merged["test_efficacy"]} vs {root["test_efficacy"]}')
-    check('single module: coverage unchanged',
-          ok=abs(merged['mutations_coverage'] - root['mutations_coverage']) < 0.001,
-          detail=f'{merged["mutations_coverage"]} vs {root["mutations_coverage"]}')
-    check('single module: mutation positions preserved',
-          ok=sorted(f['file_name'] for f in merged['files']) == ['other.go', 'thing.go'])
+    check(
+        'single module: counters unchanged',
+        ok=same,
+        detail=f'{ {k: merged[k] for k in ("mutants_total", "mutants_killed")} }',
+    )
+    check(
+        'single module: efficacy unchanged',
+        ok=abs(merged['test_efficacy'] - root['test_efficacy']) < 0.001,
+        detail=f'{merged["test_efficacy"]} vs {root["test_efficacy"]}',
+    )
+    check(
+        'single module: coverage unchanged',
+        ok=abs(merged['mutations_coverage'] - root['mutations_coverage']) < 0.001,
+        detail=f'{merged["mutations_coverage"]} vs {root["mutations_coverage"]}',
+    )
+    check(
+        'single module: mutation positions preserved',
+        ok=sorted(f['file_name'] for f in merged['files']) == ['other.go', 'thing.go'],
+    )
 
 
 def default_mutators_config(tmp: Path) -> tuple[str, ...]:
@@ -197,24 +259,33 @@ def test_upstream_fixture_roundtrips(tmp: Path) -> None:
         'elapsed_time': 142.123,
         'mutator_statistics': {'arithmetic_base': 1, 'conditionals_boundary': 1},
         'files': [
-            {'file_name': 'file1.go', 'mutations': [
-                {'type': 'ARITHMETIC_BASE', 'status': 'KILLED', 'line': 1, 'column': 1},
-                {'type': 'CONDITIONALS_BOUNDARY', 'status': 'KILLED', 'line': 2, 'column': 1},
-                {'type': 'ARITHMETIC_BASE', 'status': 'LIVED', 'line': 3, 'column': 1},
-                {'type': 'ARITHMETIC_BASE', 'status': 'NOT COVERED', 'line': 4, 'column': 1},
-            ]},
-            {'file_name': 'file2.go', 'mutations': [
-                {'type': 'ARITHMETIC_BASE', 'status': 'KILLED', 'line': 1, 'column': 1},
-                {'type': 'ARITHMETIC_BASE', 'status': 'KILLED', 'line': 2, 'column': 1},
-                {'type': 'ARITHMETIC_BASE', 'status': 'LIVED', 'line': 3, 'column': 1},
-                {'type': 'ARITHMETIC_BASE', 'status': 'LIVED', 'line': 4, 'column': 1},
-                {'type': 'ARITHMETIC_BASE', 'status': 'NOT COVERED', 'line': 5, 'column': 1},
-                {'type': 'ARITHMETIC_BASE', 'status': 'NOT VIABLE', 'line': 6, 'column': 1},
-            ]},
-            {'file_name': 'file3.go', 'mutations': [
-                {'type': 'ARITHMETIC_BASE', 'status': 'NOT COVERED', 'line': 1, 'column': 1},
-                {'type': 'ARITHMETIC_BASE', 'status': 'NOT VIABLE', 'line': 2, 'column': 1},
-            ]},
+            {
+                'file_name': 'file1.go',
+                'mutations': [
+                    {'type': 'ARITHMETIC_BASE', 'status': 'KILLED', 'line': 1, 'column': 1},
+                    {'type': 'CONDITIONALS_BOUNDARY', 'status': 'KILLED', 'line': 2, 'column': 1},
+                    {'type': 'ARITHMETIC_BASE', 'status': 'LIVED', 'line': 3, 'column': 1},
+                    {'type': 'ARITHMETIC_BASE', 'status': 'NOT COVERED', 'line': 4, 'column': 1},
+                ],
+            },
+            {
+                'file_name': 'file2.go',
+                'mutations': [
+                    {'type': 'ARITHMETIC_BASE', 'status': 'KILLED', 'line': 1, 'column': 1},
+                    {'type': 'ARITHMETIC_BASE', 'status': 'KILLED', 'line': 2, 'column': 1},
+                    {'type': 'ARITHMETIC_BASE', 'status': 'LIVED', 'line': 3, 'column': 1},
+                    {'type': 'ARITHMETIC_BASE', 'status': 'LIVED', 'line': 4, 'column': 1},
+                    {'type': 'ARITHMETIC_BASE', 'status': 'NOT COVERED', 'line': 5, 'column': 1},
+                    {'type': 'ARITHMETIC_BASE', 'status': 'NOT VIABLE', 'line': 6, 'column': 1},
+                ],
+            },
+            {
+                'file_name': 'file3.go',
+                'mutations': [
+                    {'type': 'ARITHMETIC_BASE', 'status': 'NOT COVERED', 'line': 1, 'column': 1},
+                    {'type': 'ARITHMETIC_BASE', 'status': 'NOT VIABLE', 'line': 2, 'column': 1},
+                ],
+            },
         ],
     }
     # mutator_statistics is asserted separately by the self-check; strip it so
@@ -224,12 +295,21 @@ def test_upstream_fixture_roundtrips(tmp: Path) -> None:
     check('upstream fixture: merge succeeds', ok=proc.returncode == 0, detail=proc.stderr)
     if merged is None:
         return
-    check('upstream fixture: efficacy 57.14%',
-          ok=abs(merged['test_efficacy'] - 57.14285714285714) < 0.001,
-          detail=str(merged['test_efficacy']))
-    check('upstream fixture: coverage 70%',
-          ok=abs(merged['mutations_coverage'] - 70) < 0.001, detail=str(merged['mutations_coverage']))
-    check('upstream fixture: total 9', ok=merged['mutants_total'] == 9, detail=str(merged['mutants_total']))
+    check(
+        'upstream fixture: efficacy 57.14%',
+        ok=abs(merged['test_efficacy'] - 57.14285714285714) < 0.001,
+        detail=str(merged['test_efficacy']),
+    )
+    check(
+        'upstream fixture: coverage 70%',
+        ok=abs(merged['mutations_coverage'] - 70) < 0.001,
+        detail=str(merged['mutations_coverage']),
+    )
+    check(
+        'upstream fixture: total 9',
+        ok=merged['mutants_total'] == 9,
+        detail=str(merged['mutants_total']),
+    )
 
 
 def test_nested_module_is_measured_not_counted_uncovered(tmp: Path) -> None:
@@ -243,38 +323,73 @@ def test_nested_module_is_measured_not_counted_uncovered(tmp: Path) -> None:
     the root's copies must be dropped exactly once, and paths must stay
     repo-relative.
     """
-    root = result('github.com/cplieger/envx/v2', [
-        ('envx.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY'),
-                     ('KILLED', 'CONDITIONALS_NEGATION'), ('KILLED', 'INVERT_LOOPCTRL'),
-                     ('KILLED', 'INVERT_BWASSIGN'), ('LIVED', 'ARITHMETIC_BASE')]),
-        ('yamlenv/yamlenv.go', [('NOT COVERED', 'ARITHMETIC_BASE')] * 3),
-        ('yamlenv/parse.go', [('NOT COVERED', 'CONDITIONALS_BOUNDARY')]),
-    ])
-    nested = result('github.com/cplieger/envx/yamlenv/v2', [
-        ('yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')] * 3),
-        ('parse.go', [('KILLED', 'CONDITIONALS_BOUNDARY')]),
-    ])
-    check('nested: root run alone reports 60% coverage (the defect)',
-          ok=abs(root['mutations_coverage'] - 60.0) < 0.001, detail=str(root['mutations_coverage']))
+    root = result(
+        'github.com/cplieger/envx/v2',
+        [
+            (
+                'envx.go',
+                [
+                    ('KILLED', 'ARITHMETIC_BASE'),
+                    ('KILLED', 'CONDITIONALS_BOUNDARY'),
+                    ('KILLED', 'CONDITIONALS_NEGATION'),
+                    ('KILLED', 'INVERT_LOOPCTRL'),
+                    ('KILLED', 'INVERT_BWASSIGN'),
+                    ('LIVED', 'ARITHMETIC_BASE'),
+                ],
+            ),
+            ('yamlenv/yamlenv.go', [('NOT COVERED', 'ARITHMETIC_BASE')] * 3),
+            ('yamlenv/parse.go', [('NOT COVERED', 'CONDITIONALS_BOUNDARY')]),
+        ],
+    )
+    nested = result(
+        'github.com/cplieger/envx/yamlenv/v2',
+        [
+            ('yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')] * 3),
+            ('parse.go', [('KILLED', 'CONDITIONALS_BOUNDARY')]),
+        ],
+    )
+    check(
+        'nested: root run alone reports 60% coverage (the defect)',
+        ok=abs(root['mutations_coverage'] - 60.0) < 0.001,
+        detail=str(root['mutations_coverage']),
+    )
 
     proc, merged = run_merge(tmp, [('.', root), ('yamlenv', nested)], out_name='nested.json')
     check('nested: merge succeeds', ok=proc.returncode == 0, detail=proc.stderr)
     if merged is None:
         return
-    check('nested: merged coverage is 100% (no module-boundary uncovered)',
-          ok=abs(merged['mutations_coverage'] - 100.0) < 0.001, detail=str(merged['mutations_coverage']))
-    check('nested: merged efficacy is weighted, not averaged',
-          ok=abs(merged['test_efficacy'] - 9 / 10 * 100) < 0.001, detail=str(merged['test_efficacy']))
-    check('nested: killed = 5 root + 4 nested', ok=merged['mutants_killed'] == 9,
-          detail=str(merged['mutants_killed']))
-    check('nested: no uncovered mutants survive the merge', ok=merged['mutants_not_covered'] == 0,
-          detail=str(merged['mutants_not_covered']))
+    check(
+        'nested: merged coverage is 100% (no module-boundary uncovered)',
+        ok=abs(merged['mutations_coverage'] - 100.0) < 0.001,
+        detail=str(merged['mutations_coverage']),
+    )
+    check(
+        'nested: merged efficacy is weighted, not averaged',
+        ok=abs(merged['test_efficacy'] - 9 / 10 * 100) < 0.001,
+        detail=str(merged['test_efficacy']),
+    )
+    check(
+        'nested: killed = 5 root + 4 nested',
+        ok=merged['mutants_killed'] == 9,
+        detail=str(merged['mutants_killed']),
+    )
+    check(
+        'nested: no uncovered mutants survive the merge',
+        ok=merged['mutants_not_covered'] == 0,
+        detail=str(merged['mutants_not_covered']),
+    )
     names = sorted(f['file_name'] for f in merged['files'])
-    check('nested: paths stay repo-relative and unduplicated',
-          ok=names == ['envx.go', 'yamlenv/parse.go', 'yamlenv/yamlenv.go'], detail=str(names))
+    check(
+        'nested: paths stay repo-relative and unduplicated',
+        ok=names == ['envx.go', 'yamlenv/parse.go', 'yamlenv/yamlenv.go'],
+        detail=str(names),
+    )
     dropped = {m['dir']: m['dropped_nested_mutations'] for m in merged['modules']}
-    check('nested: per-module split records the 4 dropped root copies',
-          ok=dropped == {'.': 4, 'yamlenv': 0}, detail=str(dropped))
+    check(
+        'nested: per-module split records the 4 dropped root copies',
+        ok=dropped == {'.': 4, 'yamlenv': 0},
+        detail=str(dropped),
+    )
 
 
 def test_nested_verdict_in_root_run_is_fatal(tmp: Path) -> None:
@@ -284,20 +399,31 @@ def test_nested_verdict_in_root_run_is_fatal(tmp: Path) -> None:
     root run ever DOES kill a mutant in a nested module, silently dropping it
     would bias the number, so the attempt has to go red instead.
     """
-    root = result('github.com/cplieger/envx/v2', [
-        ('envx.go', [('KILLED', 'ARITHMETIC_BASE')]),
-        ('yamlenv/yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')]),
-    ])
-    nested = result('github.com/cplieger/envx/yamlenv/v2', [
-        ('yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')]),
-    ])
+    root = result(
+        'github.com/cplieger/envx/v2',
+        [
+            ('envx.go', [('KILLED', 'ARITHMETIC_BASE')]),
+            ('yamlenv/yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')]),
+        ],
+    )
+    nested = result(
+        'github.com/cplieger/envx/yamlenv/v2',
+        [
+            ('yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')]),
+        ],
+    )
     proc, _ = run_merge(tmp, [('.', root), ('yamlenv', nested)], out_name='verdict.json')
     check('nested verdict in root run: exits non-zero', ok=proc.returncode != 0)
-    check('nested verdict in root run: says which file and status',
-          ok='yamlenv/yamlenv.go' in proc.stderr and 'KILLED' in proc.stderr,
-          detail=proc.stderr[-300:])
-    check('nested verdict in root run: blames the scope exclusion',
-          ok='gremlins-scope.py' in proc.stderr, detail=proc.stderr[-300:])
+    check(
+        'nested verdict in root run: says which file and status',
+        ok='yamlenv/yamlenv.go' in proc.stderr and 'KILLED' in proc.stderr,
+        detail=proc.stderr[-300:],
+    )
+    check(
+        'nested verdict in root run: blames the scope exclusion',
+        ok='gremlins-scope.py' in proc.stderr,
+        detail=proc.stderr[-300:],
+    )
 
 
 def test_inconsistent_input_is_fatal(tmp: Path) -> None:
@@ -307,68 +433,85 @@ def test_inconsistent_input_is_fatal(tmp: Path) -> None:
     differently, instead of publishing a number derived from a formula that no
     longer matches the tool.
     """
-    root = result('github.com/cplieger/thing/v2', [
-        ('thing.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'ARITHMETIC_BASE')]),
-    ])
+    root = result(
+        'github.com/cplieger/thing/v2',
+        [
+            ('thing.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'ARITHMETIC_BASE')]),
+        ],
+    )
     root['mutants_killed'] = 7
     proc, _ = run_merge(tmp, [('.', root)], out_name='inconsistent.json')
     check('inconsistent input: exits non-zero', ok=proc.returncode != 0)
-    check('inconsistent input: names the field',
-          ok='mutants_killed' in proc.stderr, detail=proc.stderr[-300:])
+    check(
+        'inconsistent input: names the field',
+        ok='mutants_killed' in proc.stderr,
+        detail=proc.stderr[-300:],
+    )
 
 
 def test_missing_module_output_is_zero_not_error(tmp: Path) -> None:
     """gremlins writes no file when a module has no mutants at all."""
-    root = result('github.com/cplieger/thing/v2', [
-        ('thing.go', [('KILLED', 'ARITHMETIC_BASE')]),
-    ])
+    root = result(
+        'github.com/cplieger/thing/v2',
+        [
+            ('thing.go', [('KILLED', 'ARITHMETIC_BASE')]),
+        ],
+    )
     proc, merged = run_merge(tmp, [('.', root), ('tools', None)], out_name='missing.json')
     check('missing module output: merge succeeds', ok=proc.returncode == 0, detail=proc.stderr)
     if merged is None:
         return
-    check('missing module output: contributes nothing', ok=merged['mutants_total'] == 1,
-          detail=str(merged['mutants_total']))
-    check('missing module output: still listed in the split',
-          ok=[m['dir'] for m in merged['modules']] == ['.', 'tools'])
+    check(
+        'missing module output: contributes nothing',
+        ok=merged['mutants_total'] == 1,
+        detail=str(merged['mutants_total']),
+    )
+    check(
+        'missing module output: still listed in the split',
+        ok=[m['dir'] for m in merged['modules']] == ['.', 'tools'],
+    )
 
 
 def test_module_nested_in_nested(tmp: Path) -> None:
     """Three levels: each mutant must land in exactly one bucket."""
-    root = result('github.com/cplieger/thing/v2', [
-        ('thing.go', [('KILLED', 'ARITHMETIC_BASE')]),
-        ('a/a.go', [('NOT COVERED', 'ARITHMETIC_BASE')]),
-        ('a/b/b.go', [('NOT COVERED', 'ARITHMETIC_BASE')]),
-    ])
-    mid = result('github.com/cplieger/thing/a/v2', [
-        ('a.go', [('KILLED', 'ARITHMETIC_BASE')]),
-        ('b/b.go', [('NOT COVERED', 'ARITHMETIC_BASE')]),
-    ])
-    leaf = result('github.com/cplieger/thing/a/b/v2', [
-        ('b.go', [('KILLED', 'ARITHMETIC_BASE')]),
-    ])
+    root = result(
+        'github.com/cplieger/thing/v2',
+        [
+            ('thing.go', [('KILLED', 'ARITHMETIC_BASE')]),
+            ('a/a.go', [('NOT COVERED', 'ARITHMETIC_BASE')]),
+            ('a/b/b.go', [('NOT COVERED', 'ARITHMETIC_BASE')]),
+        ],
+    )
+    mid = result(
+        'github.com/cplieger/thing/a/v2',
+        [
+            ('a.go', [('KILLED', 'ARITHMETIC_BASE')]),
+            ('b/b.go', [('NOT COVERED', 'ARITHMETIC_BASE')]),
+        ],
+    )
+    leaf = result(
+        'github.com/cplieger/thing/a/b/v2',
+        [
+            ('b.go', [('KILLED', 'ARITHMETIC_BASE')]),
+        ],
+    )
     proc, merged = run_merge(tmp, [('.', root), ('a', mid), ('a/b', leaf)], out_name='deep.json')
     check('nested-in-nested: merge succeeds', ok=proc.returncode == 0, detail=proc.stderr)
     if merged is None:
         return
     names = sorted(f['file_name'] for f in merged['files'])
-    check('nested-in-nested: every file counted once',
-          ok=names == ['a/a.go', 'a/b/b.go', 'thing.go'], detail=str(names))
-    check('nested-in-nested: all three killed, none uncovered',
-          ok=(merged['mutants_killed'], merged['mutants_not_covered']) == (3, 0),
-          detail=f'{merged["mutants_killed"]}/{merged["mutants_not_covered"]}')
+    check(
+        'nested-in-nested: every file counted once',
+        ok=names == ['a/a.go', 'a/b/b.go', 'thing.go'],
+        detail=str(names),
+    )
+    check(
+        'nested-in-nested: all three killed, none uncovered',
+        ok=(merged['mutants_killed'], merged['mutants_not_covered']) == (3, 0),
+        detail=f'{merged["mutants_killed"]}/{merged["mutants_not_covered"]}',
+    )
 
 
-def test_root_module_required(tmp: Path) -> None:
-    nested = result('github.com/cplieger/envx/yamlenv/v2', [
-        ('yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')]),
-    ])
-    proc, _ = run_merge(tmp, [('yamlenv', nested)], out_name='norootmod.json')
-    check('root module required: exits non-zero', ok=proc.returncode != 0)
-
-
-# ---------------------------------------------------------------------------
-# gremlins-scope.py and gremlins-prepare.sh, which calls it
-# ---------------------------------------------------------------------------
 def exclude_patterns(config: str) -> list[str]:
     """The quoted `unleash.exclude-files` entries of a gremlins config."""
     m = re.search(r'^  exclude-files:[ \t]*\n((?:(?:    .*|[ \t]*)\n)*)', config, re.MULTILINE)
@@ -382,10 +525,15 @@ def gremlins_scope(module_root: Path) -> list[str]:
     module root, minus those whose module-relative path an exclude-files regexp
     matches (internal/exclusion/rules.go uses regexp.MatchString, unanchored).
     """
-    patterns = [re.compile(p) for p in exclude_patterns((module_root / '.gremlins.yaml').read_text())]
+    patterns = [
+        # Go's \x{h} escape is Python's \U form.
+        re.compile(re.sub(r'\\x\{([0-9a-f]+)\}', lambda m: f'\\U{int(m[1], 16):08x}', p))
+        for p in exclude_patterns((module_root / '.gremlins.yaml').read_text())
+    ]
     out = []
     for p in sorted(module_root.rglob('*.go')):
-        rel = p.relative_to(module_root).as_posix()
+        # Go's regexp reads a byte that is not UTF-8 as U+FFFD.
+        rel = os.fsencode(p.relative_to(module_root).as_posix()).decode(errors='replace')
         if rel.startswith('.git/') or rel.endswith('_test.go'):
             continue
         if not any(r.search(rel) for r in patterns):
@@ -426,21 +574,35 @@ def commit_fixture(repo: Path, files: dict[str, str], message: str = 'fixture') 
         subprocess.run(['git', 'init', '-q', str(repo)], check=True)
     subprocess.run([*git, 'add', '--', *files], check=True)
     subprocess.run([*git, 'commit', '-qm', message], check=True)
-    return subprocess.run([*git, 'rev-parse', 'HEAD'], capture_output=True, text=True,
-                          check=True).stdout.strip()
-
-
-def run_scope(target: Path, *modules: str, config: Path = CENTRAL,
-              excludes: tuple[str, ...] = ()) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, str(SCOPE), '--config', str(config), '--target', str(target),
-         *(f'--exclude-dir={d}' for d in excludes), '--', *modules],
-        capture_output=True, text=True, check=False,
+        [*git, 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def run_scope(
+    target: Path, *modules: str, config: Path = CENTRAL, excludes: tuple[str, ...] = ()
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(SCOPE),
+            '--config',
+            str(config),
+            '--target',
+            str(target),
+            *(f'--exclude-dir={d}' for d in excludes),
+            '--',
+            *modules,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
 
-def prepare(tmp: Path, repo: str, *args: str,
-            extra_env: dict[str, str] | None = None) -> tuple[subprocess.CompletedProcess, dict]:
+def prepare(
+    tmp: Path, repo: str, *args: str, extra_env: dict[str, str] | None = None
+) -> tuple[subprocess.CompletedProcess, dict]:
     """Run gremlins-prepare.sh from a ci-checkout-shaped tmp, cloning tmp/src/<repo>.git.
 
     git's url.insteadOf sends the script's own https://github.com/cplieger/ URL
@@ -450,21 +612,105 @@ def prepare(tmp: Path, repo: str, *args: str,
     for name, dest in (('scripts', HERE), ('configs', CENTRAL.parent)):
         if not (tmp / name).exists():
             (tmp / name).symlink_to(dest)
-    (tmp / 'gitconfig').write_text(f'[url "file://{tmp}/src/"]\n\tinsteadOf = https://github.com/cplieger/\n')
+    (tmp / 'gitconfig').write_text(
+        f'[url "file://{tmp}/src/"]\n\tinsteadOf = https://github.com/cplieger/\n'
+    )
     out = tmp / 'github-output'
     out.write_text('')
-    env = {**os.environ, 'GIT_CONFIG_GLOBAL': str(tmp / 'gitconfig'), 'GIT_CONFIG_NOSYSTEM': '1',
-           'GITHUB_OUTPUT': str(out), **(extra_env or {})}
-    proc = subprocess.run(['bash', str(PREPARE), repo, *args], cwd=tmp, env=env,
-                          capture_output=True, text=True, check=False)
+    env = {
+        **os.environ,
+        'GIT_CONFIG_GLOBAL': str(tmp / 'gitconfig'),
+        'GIT_CONFIG_NOSYSTEM': '1',
+        'GITHUB_OUTPUT': str(out),
+        **(extra_env or {}),
+    }
+    proc = subprocess.run(
+        ['bash', str(PREPARE), repo, *args],
+        cwd=tmp,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     return proc, dict(line.split('=', 1) for line in out.read_text().splitlines())
 
 
 def publish_fixture(tmp: Path, repo: str, work: Path) -> None:
     """Make the fixture repo at work the bare tmp/src/<repo>.git that prepare clones."""
     (tmp / 'src').mkdir(exist_ok=True)
-    subprocess.run(['git', 'clone', '-q', '--bare', str(work), str(tmp / 'src' / f'{repo}.git')],
-                   check=True)
+    subprocess.run(
+        ['git', 'clone', '-q', '--bare', str(work), str(tmp / 'src' / f'{repo}.git')], check=True
+    )
+
+
+def nested_only_fixture(work: Path, modules: list[str], *, root: bool) -> None:
+    """A repository of nested Go modules, as cplieger/go is, with a root module too when ROOT."""
+    work.mkdir(parents=True)
+
+    def run(*a: str) -> None:
+        subprocess.run(['git', '-C', str(work), *a], check=True, capture_output=True)
+
+    run('init', '-q')
+    (work / 'README.md').write_text('fixture\n')
+    if root:
+        (work / 'go.mod').write_text('module example.com/r\n\ngo 1.26\n')
+        (work / 'r.go').write_text('package r\n')
+    for m in modules:
+        (work / m).mkdir(parents=True)
+        (work / m / 'go.mod').write_text(f'module example.com/go/{m}\n\ngo 1.26\n')
+        (work / m / 'm.go').write_text('package m\n\nfunc One() int { return 1 }\n')
+    run('add', '.')
+    run('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'fixture')
+
+
+def test_prepare_seeds_the_root_only_when_it_has_a_go_mod(tmp: Path) -> None:
+    for repo, root, want in (('go', False, 'jsonx keyenc'), ('knell', True, '. jsonx keyenc')):
+        work = tmp / f'work-{repo}'
+        nested_only_fixture(work, ['keyenc', 'jsonx'], root=root)
+        publish_fixture(tmp, repo, work)
+        shutil.rmtree(tmp / 'target', ignore_errors=True)
+        proc, outputs = prepare(tmp, repo)
+        check(
+            f'prepare seeding: {repo} ({"a" if root else "no"} root go.mod) measures {want}',
+            ok=proc.returncode == 0 and outputs.get('modules') == want,
+            detail=f'rc={proc.returncode} {outputs!r} {proc.stderr[-300:]}',
+        )
+    shutil.rmtree(tmp / 'target', ignore_errors=True)
+    one, got = prepare(tmp, 'go', extra_env={'GREMLINS_MODULE': 'keyenc'})
+    check(
+        'prepare seeding: a one-module call on a nested-only repo measures that module and lists '
+        'the others untested, with no root among them',
+        ok=one.returncode == 0
+        and got.get('modules') == 'keyenc'
+        and got.get('untested') == 'jsonx',
+        detail=f'rc={one.returncode} {got!r} {one.stderr[-300:]}',
+    )
+    work = tmp / 'work-none'
+    nested_only_fixture(work, [], root=False)
+    publish_fixture(tmp, 'none', work)
+    shutil.rmtree(tmp / 'target', ignore_errors=True)
+    none, _ = prepare(tmp, 'none')
+    check(
+        'prepare seeding: a repo with no Go module fails, naming it',
+        ok=none.returncode != 0 and 'none has no Go module to measure' in none.stdout,
+        detail=f'rc={none.returncode} {none.stdout[-300:]} {none.stderr[-300:]}',
+    )
+    work = tmp / 'work-spaced'
+    nested_only_fixture(work, ['my mod'], root=False)
+    publish_fixture(tmp, 'spaced', work)
+    shutil.rmtree(tmp / 'target', ignore_errors=True)
+    spaced, outputs = prepare(tmp, 'spaced')
+    refused = json.loads(outputs.get('refused') or 'null')
+    check(
+        'prepare seeding: a nested-only repo whose every module dir is refused fails, '
+        'writing the refused dir for its record',
+        ok=spaced.returncode != 0
+        and (outputs.get('modules'), outputs.get('untested')) == ('', '')
+        and isinstance(refused, list)
+        and [r.get('dir') for r in refused] == ['my mod']
+        and 'has no Go module to measure' not in spaced.stdout,
+        detail=f'rc={spaced.returncode} {outputs!r} {spaced.stdout[-300:]}',
+    )
 
 
 def test_prepare_scopes_root_run_off_nested_module(tmp: Path) -> None:
@@ -480,27 +726,126 @@ def test_prepare_scopes_root_run_off_nested_module(tmp: Path) -> None:
     animap_fixture(tmp / 'work')
     publish_fixture(tmp, 'animap', tmp / 'work')
     proc, outputs = prepare(tmp, 'animap')
-    head = subprocess.run(['git', '-C', str(tmp / 'work'), 'rev-parse', 'HEAD'],
-                          capture_output=True, text=True, check=True).stdout.strip()
-    check('prepare scope: measures the root and mapread, not the pruned module, at the head',
-          ok=proc.returncode == 0 and outputs == {'sha': head, 'modules': '. mapread'},
-          detail=f'rc={proc.returncode} {outputs!r} {proc.stderr[-300:]}')
+    head = subprocess.run(
+        ['git', '-C', str(tmp / 'work'), 'rev-parse', 'HEAD'],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    check(
+        'prepare scope: measures the root and mapread, not the pruned module, at the head',
+        ok=proc.returncode == 0
+        and outputs == {'sha': head, 'modules': '. mapread', 'untested': '', 'refused': '[]'},
+        detail=f'rc={proc.returncode} {outputs!r} {proc.stderr[-300:]}',
+    )
     if proc.returncode != 0:
         return
+    for module, want in (('mapread', 'mapread'), ('.', '.')):
+        shutil.rmtree(tmp / 'target')
+        one, got = prepare(tmp, 'animap', extra_env={'GREMLINS_MODULE': module})
+        check(
+            f'prepare scope: the module input {module!r} measures that module alone',
+            ok=one.returncode == 0
+            and got.get('modules') == want
+            and got.get('untested') == ' '.join(d for d in ('.', 'mapread') if d != want),
+            detail=f'rc={one.returncode} {got!r} {one.stderr[-300:]}',
+        )
+    shutil.rmtree(tmp / 'target')
+    bad, _ = prepare(tmp, 'animap', extra_env={'GREMLINS_MODULE': 'nope'})
+    check(
+        'prepare scope: a module input naming no measurable module fails',
+        ok=bad.returncode != 0 and 'the module input names no measurable Go module' in bad.stdout,
+        detail=f'rc={bad.returncode} {bad.stdout[-300:]}',
+    )
+    shutil.rmtree(tmp / 'target')
+    proc, _ = prepare(tmp, 'animap')
+    check(
+        'prepare scope: a repo with a root module and a nested one prepares',
+        ok=proc.returncode == 0,
+        detail=f'rc={proc.returncode} {proc.stdout[-300:]}',
+    )
     git_config = (tmp / 'target' / '.git' / 'config').read_text()
-    check('prepare scope: no auth header is written into the clone',
-          ok='extraheader' not in git_config)
+    check(
+        'prepare scope: no auth header is written into the clone',
+        ok='extraheader' not in git_config,
+    )
     root_scope = gremlins_scope(tmp / 'target')
-    check('prepare scope: the root run mutates no file of the nested module',
-          ok=root_scope == ['animap.go', 'cmd/animap/verify.go', 'mapreader/reader.go'],
-          detail=str(root_scope))
-    check('prepare scope: the pruned module gets no config of its own',
-          ok=not (tmp / 'target' / 'static' / 'ui' / '.gremlins.yaml').exists())
+    check(
+        'prepare scope: the root run mutates no file of the nested module',
+        ok=root_scope == ['animap.go', 'cmd/animap/verify.go', 'mapreader/reader.go'],
+        detail=str(root_scope),
+    )
+    check(
+        'prepare scope: the pruned module gets no config of its own',
+        ok=not (tmp / 'target' / 'static' / 'ui' / '.gremlins.yaml').exists(),
+    )
     nested_scope = gremlins_scope(tmp / 'target' / 'mapread')
-    check('prepare scope: the nested run still mutates its own files',
-          ok=nested_scope == ['decode.go', 'encode.go'], detail=str(nested_scope))
-    check('prepare scope: a leaf module gets the central config unchanged',
-          ok=(tmp / 'target' / 'mapread' / '.gremlins.yaml').read_text() == CENTRAL.read_text())
+    check(
+        'prepare scope: the nested run still mutates its own files',
+        ok=nested_scope == ['decode.go', 'encode.go'],
+        detail=str(nested_scope),
+    )
+    check(
+        'prepare scope: a leaf module gets the central config unchanged',
+        ok=(tmp / 'target' / 'mapread' / '.gremlins.yaml').read_text() == CENTRAL.read_text(),
+    )
+
+
+def test_prepare_refuses_a_module_entry_key_refuses_and_measures_the_rest(tmp: Path) -> None:
+    """mutation_cost.entry_key's rule, as Stryker's discover applies it: refused, named, excluded."""
+    (tmp / 'work').mkdir()
+    animap_fixture(tmp / 'work')
+    odd = 'odd dir:x'
+    # A name that is not UTF-8: byte 0xff, surrogateescaped as a str path.
+    raw = 'raw\udcffdir'
+    commit_fixture(
+        tmp / 'work',
+        {
+            **{
+                f'{d}/go.mod': f'module example.com/{n}\n\ngo 1.26\n'
+                for d, n in ((odd, 'odd'), (raw, 'raw'))
+            },
+            **{f'{d}/{n}.go': f'package {n}\n' for d, n in ((odd, 'odd'), (raw, 'raw'))},
+        },
+    )
+    publish_fixture(tmp, 'animap', tmp / 'work')
+    proc, outputs = prepare(tmp, 'animap')
+    refused = json.loads(outputs.get('refused') or 'null')
+    check(
+        'prepare refused: the other modules are measured and each refused one is listed with its reason',
+        ok=proc.returncode == 0
+        and outputs.get('modules') == '. mapread'
+        and refused
+        == [
+            {
+                'dir': odd,
+                'reason': f'directory {odd!r} is not a relative path of [A-Za-z0-9._-] names',
+            },
+            {'dir': 'raw\\xffdir', 'reason': "directory 'raw\\\\xffdir' is not UTF-8"},
+        ],
+        detail=f'rc={proc.returncode} {outputs!r} {proc.stderr[-300:]}',
+    )
+    check(
+        'prepare refused: the refusal is an error annotation naming the dir',
+        ok=f'::error::animap: directory {odd!r} is not a relative path'
+        in proc.stdout + proc.stderr,
+        detail=(proc.stdout + proc.stderr)[-400:],
+    )
+    if proc.returncode != 0:
+        return
+    root_scope = gremlins_scope(tmp / 'target')
+    check(
+        'prepare refused: the root run mutates no file of the refused module',
+        ok=root_scope == ['animap.go', 'cmd/animap/verify.go', 'mapreader/reader.go'],
+        detail=str(root_scope),
+    )
+    shutil.rmtree(tmp / 'target')
+    one, got = prepare(tmp, 'animap', extra_env={'GREMLINS_MODULE': 'mapread'})
+    check(
+        'prepare refused: a one-module call lists no refusal of a dir it does not test',
+        ok=one.returncode == 0 and got.get('refused') == '[]' and got.get('modules') == 'mapread',
+        detail=f'rc={one.returncode} {got!r}',
+    )
 
 
 def test_scope_excludes_every_deeper_module(tmp: Path) -> None:
@@ -512,16 +857,29 @@ def test_scope_excludes_every_deeper_module(tmp: Path) -> None:
     if proc.returncode != 0:
         return
     central = exclude_patterns(CENTRAL.read_text())
-    added = {d: [p for p in exclude_patterns((tmp / d / '.gremlins.yaml').read_text())
-                 if p not in central] for d in ('.', 'a.b', 'a.b/c', 'tools')}
-    check('scope nesting: each copy adds exactly its deeper modules',
-          ok=added == {'.': [r'^a\.b/', r'^a\.b/c/', '^tools/'], 'a.b': ['^c/'],
-                       'a.b/c': [], 'tools': []}, detail=str(added))
+    added = {
+        d: [
+            p
+            for p in exclude_patterns((tmp / d / '.gremlins.yaml').read_text())
+            if p not in central
+        ]
+        for d in ('.', 'a.b', 'a.b/c', 'tools')
+    }
+    check(
+        'scope nesting: each copy adds exactly its deeper modules',
+        ok=added
+        == {'.': [r'^a\.b/', r'^a\.b/c/', '^tools/'], 'a.b': ['^c/'], 'a.b/c': [], 'tools': []},
+        detail=str(added),
+    )
     root = [re.compile(p) for p in added['.']]
-    check('scope nesting: a dotted dir does not swallow its look-alikes',
-          ok=not any(r.search(f) for r in root for f in ('aXb/x.go', 'x/a.b/y.go', 'toolsx/z.go')))
-    check('scope nesting: the central entries all survive',
-          ok=all(p in exclude_patterns((tmp / '.gremlins.yaml').read_text()) for p in central))
+    check(
+        'scope nesting: a dotted dir does not swallow its look-alikes',
+        ok=not any(r.search(f) for r in root for f in ('aXb/x.go', 'x/a.b/y.go', 'toolsx/z.go')),
+    )
+    check(
+        'scope nesting: the central entries all survive',
+        ok=all(p in exclude_patterns((tmp / '.gremlins.yaml').read_text()) for p in central),
+    )
 
 
 def test_scope_excludes_an_unmeasured_module(tmp: Path) -> None:
@@ -532,12 +890,23 @@ def test_scope_excludes_an_unmeasured_module(tmp: Path) -> None:
     if proc.returncode != 0:
         return
     central = exclude_patterns(CENTRAL.read_text())
-    added = {d: [p for p in exclude_patterns((tmp / d / '.gremlins.yaml').read_text())
-                 if p not in central] for d in ('.', 'x')}
-    check('scope unmeasured: each outer copy excludes it',
-          ok=added == {'.': ['^x/', '^x/static/y/'], 'x': ['^static/y/']}, detail=str(added))
-    check('scope unmeasured: it gets no config of its own',
-          ok=not (tmp / 'x' / 'static' / 'y' / '.gremlins.yaml').exists())
+    added = {
+        d: [
+            p
+            for p in exclude_patterns((tmp / d / '.gremlins.yaml').read_text())
+            if p not in central
+        ]
+        for d in ('.', 'x')
+    }
+    check(
+        'scope unmeasured: each outer copy excludes it',
+        ok=added == {'.': ['^x/', '^x/static/y/'], 'x': ['^static/y/']},
+        detail=str(added),
+    )
+    check(
+        'scope unmeasured: it gets no config of its own',
+        ok=not (tmp / 'x' / 'static' / 'y' / '.gremlins.yaml').exists(),
+    )
 
 
 def test_scope_takes_a_dash_dir_as_a_module(tmp: Path) -> None:
@@ -545,64 +914,135 @@ def test_scope_takes_a_dash_dir_as_a_module(tmp: Path) -> None:
     (tmp / '-h').mkdir()
     proc = run_scope(tmp, '.', '-h')
     written = proc.returncode == 0 and (tmp / '-h' / '.gremlins.yaml').is_file()
-    check('scope dash dir: succeeds and writes -h/.gremlins.yaml', ok=written,
-          detail=f'rc={proc.returncode} {proc.stderr[-300:]}')
+    check(
+        'scope dash dir: succeeds and writes -h/.gremlins.yaml',
+        ok=written,
+        detail=f'rc={proc.returncode} {proc.stderr[-300:]}',
+    )
     if not written:
         return
-    check('scope dash dir: the root copy excludes it',
-          ok='^-h/' in exclude_patterns((tmp / '.gremlins.yaml').read_text()))
+    check(
+        'scope dash dir: the root copy excludes it',
+        ok='^-h/' in exclude_patterns((tmp / '.gremlins.yaml').read_text()),
+    )
     work = tmp / 'work'
-    commit_fixture(work, {'go.mod': 'module example.com/dash\n', 'dash.go': 'package dash\n',
-                          '-h/go.mod': 'module example.com/dash/h\n', '-h/h.go': 'package h\n'})
+    commit_fixture(
+        work,
+        {
+            'go.mod': 'module example.com/dash\n',
+            'dash.go': 'package dash\n',
+            '-h/go.mod': 'module example.com/dash/h\n',
+            '-h/h.go': 'package h\n',
+        },
+    )
     publish_fixture(tmp, 'dash', work)
     proc, outputs = prepare(tmp, 'dash')
-    check('scope dash dir: prepare discovers it and scopes it as a dir',
-          ok=proc.returncode == 0 and outputs.get('modules') == '. -h'
-          and (tmp / 'target' / '-h' / '.gremlins.yaml').is_file()
-          and '^-h/' in exclude_patterns((tmp / 'target' / '.gremlins.yaml').read_text()),
-          detail=f'rc={proc.returncode} {outputs!r} {proc.stderr[-300:]}')
+    check(
+        'scope dash dir: prepare discovers it and scopes it as a dir',
+        ok=proc.returncode == 0
+        and outputs.get('modules') == '. -h'
+        and (tmp / 'target' / '-h' / '.gremlins.yaml').is_file()
+        and '^-h/' in exclude_patterns((tmp / 'target' / '.gremlins.yaml').read_text()),
+        detail=f'rc={proc.returncode} {outputs!r} {proc.stderr[-300:]}',
+    )
 
 
 def test_prepare_pins_a_shard_to_its_plan(tmp: Path) -> None:
-    """A shard clones the commit its plan sized and mutates its packages; the plan job the head."""
+    """A shard clones the commit its plan sized and mutates its files; the plan job the head."""
     work = tmp / 'work'
-    sized = commit_fixture(work, {'go.mod': 'module example.com/pin\n', 'pin.go': 'package pin\n',
-                                  'a/a.go': 'package a\n', 'b/b.go': 'package b\n'})
+    sized = commit_fixture(
+        work,
+        {
+            'go.mod': 'module example.com/pin\n',
+            'pin.go': 'package pin\n',
+            'a/a.go': 'package a\n',
+            'b/b.go': 'package b\n',
+        },
+    )
     head = commit_fixture(work, {'c/c.go': 'package c\n'}, message='after the plan')
     publish_fixture(tmp, 'pin', work)
     plan = tmp / 'plan.json'
-    plan.write_text(json.dumps({'repo': 'pin', 'sha': sized, 'shards': 2, 'modules': {'.': {
-        'mode': 'per-package', 'workers': 4, 'shards': [1, 2],
-        'packages': {'.': {'shard': 1}, 'a': {'shard': 1}, 'b': {'shard': 2}}}}}))
+    plan.write_text(
+        json.dumps(
+            {
+                'repo': 'pin',
+                'sha': sized,
+                'shards': 2,
+                'modules': {
+                    '.': {
+                        'mode': 'per-package',
+                        'workers': 4,
+                        'setup_secs': 1.0,
+                        'shards': [1, 2],
+                        'packages': {},
+                        'files': {
+                            f: {'runnable': 1, 'prior_secs': 1.0, 'shard': n}
+                            for f, n in (('pin.go', 1), ('a/a.go', 1), ('b/b.go', 2))
+                        },
+                    }
+                },
+            }
+        )
+    )
     proc, outputs = prepare(tmp, 'pin', str(plan), '2')
-    check('prepare pin: a shard checks out the commit its plan sized',
-          ok=proc.returncode == 0 and outputs.get('sha') == sized
-          and not (tmp / 'target' / 'c').exists(),
-          detail=f'rc={proc.returncode} {outputs!r} {proc.stderr[-300:]}')
+    check(
+        'prepare pin: a shard checks out the commit its plan sized',
+        ok=proc.returncode == 0
+        and outputs.get('sha') == sized
+        and not (tmp / 'target' / 'c').exists(),
+        detail=f'rc={proc.returncode} {outputs!r} {proc.stderr[-300:]}',
+    )
     if proc.returncode == 0:
-        check('prepare pin: the shard mutates only the packages its plan gives it',
-              ok=gremlins_scope(tmp / 'target') == ['b/b.go'],
-              detail=str(gremlins_scope(tmp / 'target')))
+        check(
+            'prepare pin: the shard mutates only the files its plan gives it',
+            ok=gremlins_scope(tmp / 'target') == ['b/b.go'],
+            detail=str(gremlins_scope(tmp / 'target')),
+        )
     shutil.rmtree(tmp / 'target', ignore_errors=True)
     proc, outputs = prepare(tmp, 'pin')
-    check('prepare pin: the plan job measures the head, whole',
-          ok=proc.returncode == 0 and outputs.get('sha') == head
-          and gremlins_scope(tmp / 'target') == ['a/a.go', 'b/b.go', 'c/c.go', 'pin.go'],
-          detail=f'rc={proc.returncode} {outputs!r} {proc.stderr[-300:]}')
+    check(
+        'prepare pin: the plan job measures the head, whole',
+        ok=proc.returncode == 0
+        and outputs.get('sha') == head
+        and gremlins_scope(tmp / 'target') == ['a/a.go', 'b/b.go', 'c/c.go', 'pin.go'],
+        detail=f'rc={proc.returncode} {outputs!r} {proc.stderr[-300:]}',
+    )
     shutil.rmtree(tmp / 'target', ignore_errors=True)
     proc, _ = prepare(tmp, 'pin', str(plan))
-    check('prepare pin: a plan without its shard fails before cloning',
-          ok=proc.returncode != 0 and not (tmp / 'target').exists(), detail=proc.stderr[-300:])
+    check(
+        'prepare pin: a plan without its shard fails before cloning',
+        ok=proc.returncode != 0 and not (tmp / 'target').exists(),
+        detail=proc.stderr[-300:],
+    )
 
 
 def test_prepare_clones_anonymously(tmp: Path) -> None:
     """The clone and the plan fetch carry no auth header, even with GH_TOKEN set."""
     work = tmp / 'work'
-    sized = commit_fixture(work, {'go.mod': 'module example.com/anon\n', 'anon.go': 'package anon\n'})
+    sized = commit_fixture(
+        work, {'go.mod': 'module example.com/anon\n', 'anon.go': 'package anon\n'}
+    )
     publish_fixture(tmp, 'anon', work)
     plan = tmp / 'plan.json'
-    plan.write_text(json.dumps({'repo': 'anon', 'sha': sized, 'shards': 1, 'modules': {'.': {
-        'mode': 'per-package', 'workers': 4, 'shards': [1], 'packages': {'.': {'shard': 1}}}}}))
+    plan.write_text(
+        json.dumps(
+            {
+                'repo': 'anon',
+                'sha': sized,
+                'shards': 1,
+                'modules': {
+                    '.': {
+                        'mode': 'per-package',
+                        'workers': 4,
+                        'setup_secs': 1.0,
+                        'shards': [1],
+                        'packages': {},
+                        'files': {'anon.go': {'runnable': 1, 'prior_secs': 1.0, 'shard': 1}},
+                    }
+                },
+            }
+        )
+    )
     log = tmp / 'seen.log'
     bindir = tmp / 'bin'
     bindir.mkdir()
@@ -611,19 +1051,31 @@ def test_prepare_clones_anonymously(tmp: Path) -> None:
         'h=no; case "$*" in *extraheader*|*AUTHORIZATION*) h=yes;; esac\n'
         'sub=; for a in "$@"; do case "$a" in clone|fetch|checkout|rev-parse|ls-files) sub=$a; break;; esac; done\n'
         f'printf "git %s header=%s\\n" "$sub" "$h" >>{str(log)!r}\n'
-        f'exec {shutil.which("git")!r} "$@"\n')
+        f'exec {shutil.which("git")!r} "$@"\n'
+    )
     (bindir / 'git').chmod(0o755)
-    proc, outputs = prepare(tmp, 'anon', str(plan), '1', extra_env={
-        'PATH': f'{bindir}:{os.environ["PATH"]}', 'GH_TOKEN': 'stand-in-credential'})
+    proc, outputs = prepare(
+        tmp,
+        'anon',
+        str(plan),
+        '1',
+        extra_env={'PATH': f'{bindir}:{os.environ["PATH"]}', 'GH_TOKEN': 'stand-in-credential'},
+    )
     seen = log.read_text().splitlines() if log.exists() else []
-    check('prepare anonymous: the clone and the plan fetch run without a header',
-          ok=proc.returncode == 0 and outputs.get('sha') == sized
-          and 'git clone header=no' in seen and 'git fetch header=no' in seen
-          and not any('header=yes' in line for line in seen),
-          detail=f'rc={proc.returncode} {seen} {proc.stderr[-300:]}')
+    check(
+        'prepare anonymous: the clone and the plan fetch run without a header',
+        ok=proc.returncode == 0
+        and outputs.get('sha') == sized
+        and 'git clone header=no' in seen
+        and 'git fetch header=no' in seen
+        and not any('header=yes' in line for line in seen),
+        detail=f'rc={proc.returncode} {seen} {proc.stderr[-300:]}',
+    )
     git_config = (tmp / 'target' / '.git' / 'config').read_text() if proc.returncode == 0 else ''
-    check('prepare anonymous: the clone records no credential',
-          ok=proc.returncode == 0 and 'stand-in-credential' not in git_config)
+    check(
+        'prepare anonymous: the clone records no credential',
+        ok=proc.returncode == 0 and 'stand-in-credential' not in git_config,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -635,9 +1087,17 @@ def test_prepare_clones_anonymously(tmp: Path) -> None:
 GREMLINS_LAYOUT = {
     'silent': None,
     'unleash': {
-        'dry-run': None, 'output-statuses': None, 'output': None, 'tags': None,
-        'coverpkg': None, 'workers': None, 'test-cpu': None, 'timeout-coefficient': None,
-        'integration': None, 'exclude-files': None, 'diff': None,
+        'dry-run': None,
+        'output-statuses': None,
+        'output': None,
+        'tags': None,
+        'coverpkg': None,
+        'workers': None,
+        'test-cpu': None,
+        'timeout-coefficient': None,
+        'integration': None,
+        'exclude-files': None,
+        'diff': None,
         'threshold': {'efficacy': None, 'mutant-coverage': None},
     },
     'mutants': {name: {'enabled': None} for name in gremlins_aggregate.GREMLINS_MUTATORS},
@@ -659,26 +1119,35 @@ def unread_keys(config: object, layout: dict, prefix: str = '') -> list[str]:
 
 
 def test_central_config_keys_are_read(tmp: Path) -> None:
-    pinned = re.search(r'^\s*GREMLINS_VERSION: (\S+)$', WORKFLOW.read_text(), re.MULTILINE)
-    check('central config: the key table matches the pinned gremlins',
-          ok=bool(pinned) and pinned.group(1) == 'v0.6.0',
-          detail=f'workflow pins {pinned and pinned.group(1)}: re-check GREMLINS_LAYOUT and '
-                 'gremlins-aggregate.GREMLINS_MUTATORS against that release, then update the pin here')
+    pinned = re.search(r'^\s*GREMLINS_VERSION: (\S+)$', REPO_WORKFLOW.read_text(), re.MULTILINE)
+    check(
+        'central config: the key table matches the pinned gremlins',
+        ok=bool(pinned) and pinned.group(1) == 'v0.6.0',
+        detail=f'workflow pins {pinned and pinned.group(1)}: re-check GREMLINS_LAYOUT and '
+        'gremlins-aggregate.GREMLINS_MUTATORS against that release, then update the pin here',
+    )
     config = gremlins_aggregate.load_config(CENTRAL.read_text())
     unread = unread_keys(config, GREMLINS_LAYOUT)
     check('central config: every key is one gremlins reads', ok=not unread, detail=str(unread))
     entries = (config.get('mutants') or {}).values()
-    check('central config: every mutants entry sets a bool enabled',
-          ok=all(isinstance(e, dict) and isinstance(e.get('enabled'), bool) for e in entries))
+    check(
+        'central config: every mutants entry sets a bool enabled',
+        ok=all(isinstance(e, dict) and isinstance(e.get('enabled'), bool) for e in entries),
+    )
     enabled = gremlins_aggregate.enabled_mutators(config)
-    check('central config: gremlins runs every mutator type',
-          ok=enabled == set(gremlins_aggregate.GREMLINS_MUTATORS),
-          detail=f'off: {sorted(set(gremlins_aggregate.GREMLINS_MUTATORS) - enabled)}')
+    check(
+        'central config: gremlins runs every mutator type',
+        ok=enabled == set(gremlins_aggregate.GREMLINS_MUTATORS),
+        detail=f'off: {sorted(set(gremlins_aggregate.GREMLINS_MUTATORS) - enabled)}',
+    )
     nested = gremlins_aggregate.load_config(
-        'unleash:\n  mutants:\n    invert-logical:\n      enabled: true\n')
-    check('central config: a mutants block nested under unleash is caught',
-          ok=unread_keys(nested, GREMLINS_LAYOUT) == ['unleash.mutants']
-          and gremlins_aggregate.enabled_mutators(nested) == gremlins_aggregate.DEFAULT_MUTATORS)
+        'unleash:\n  mutants:\n    invert-logical:\n      enabled: true\n'
+    )
+    check(
+        'central config: a mutants block nested under unleash is caught',
+        ok=unread_keys(nested, GREMLINS_LAYOUT) == ['unleash.mutants']
+        and gremlins_aggregate.enabled_mutators(nested) == gremlins_aggregate.DEFAULT_MUTATORS,
+    )
 
 
 def test_scope_refuses_what_it_cannot_scope(tmp: Path) -> None:
@@ -686,14 +1155,24 @@ def test_scope_refuses_what_it_cannot_scope(tmp: Path) -> None:
     bare = tmp / 'bare.yaml'
     bare.write_text('unleash:\n  threshold:\n    efficacy: 0\n')
     proc = run_scope(tmp, '.', 'sub', config=bare)
-    check('scope refusal: a config without one exclude-files anchor exits non-zero',
-          ok=proc.returncode != 0 and 'exclude-files' in proc.stderr, detail=proc.stderr[-300:])
+    check(
+        'scope refusal: a config without one exclude-files anchor exits non-zero',
+        ok=proc.returncode != 0 and 'exclude-files' in proc.stderr,
+        detail=proc.stderr[-300:],
+    )
     proc = run_scope(tmp, '.', 'a b')
-    check('scope refusal: a dir outside the safe charset exits non-zero',
-          ok=proc.returncode != 0 and 'characters' in proc.stderr, detail=proc.stderr[-300:])
-    proc = run_scope(tmp, '.', excludes=('a b',))
-    check('scope refusal: an --exclude-dir outside the safe charset exits non-zero',
-          ok=proc.returncode != 0 and 'characters' in proc.stderr, detail=proc.stderr[-300:])
+    check(
+        'scope refusal: a dir outside the safe charset exits non-zero',
+        ok=proc.returncode != 0 and 'characters' in proc.stderr,
+        detail=proc.stderr[-300:],
+    )
+    proc = run_scope(tmp, '.', excludes=("a b\n'c.d",))
+    written = (tmp / '.gremlins.yaml').read_text() if proc.returncode == 0 else ''
+    check(
+        'scope: an --exclude-dir of any characters is excluded as an escaped Go regexp',
+        ok="    - '^a\\x{20}b\\x{a}\\x{27}c\\.d/'\n" in written,
+        detail=proc.stderr[-300:] + written[-300:],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -709,16 +1188,29 @@ def test_aggregate_consumes_merged_output(tmp: Path) -> None:
     art = tmp / 'artifacts'
     for attempt in (1, 2, 3):
         d = attempt_dir(art, 'envx', attempt)
-        root = result('github.com/cplieger/envx/v2', [
-            ('envx.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY'),
-                         ('LIVED', 'CONDITIONALS_NEGATION')]),
-            ('yamlenv/yamlenv.go', [('NOT COVERED', 'ARITHMETIC_BASE')]),
-        ])
-        nested = result('github.com/cplieger/envx/yamlenv/v2', [
-            ('yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')]),
-        ])
-        proc, merged = run_merge(tmp, [('.', root), ('yamlenv', nested)],
-                                 out_name=f'attempt-{attempt}.json')
+        root = result(
+            'github.com/cplieger/envx/v2',
+            [
+                (
+                    'envx.go',
+                    [
+                        ('KILLED', 'ARITHMETIC_BASE'),
+                        ('KILLED', 'CONDITIONALS_BOUNDARY'),
+                        ('LIVED', 'CONDITIONALS_NEGATION'),
+                    ],
+                ),
+                ('yamlenv/yamlenv.go', [('NOT COVERED', 'ARITHMETIC_BASE')]),
+            ],
+        )
+        nested = result(
+            'github.com/cplieger/envx/yamlenv/v2',
+            [
+                ('yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')]),
+            ],
+        )
+        proc, merged = run_merge(
+            tmp, [('.', root), ('yamlenv', nested)], out_name=f'attempt-{attempt}.json'
+        )
         if merged is None:
             check(f'aggregate: attempt {attempt} merged', ok=False, detail=proc.stderr)
             return
@@ -727,25 +1219,52 @@ def test_aggregate_consumes_merged_output(tmp: Path) -> None:
     badge = tmp / 'badge.json'
     attempts_marker = tmp / 'attempts.txt'
     proc = subprocess.run(
-        [sys.executable, str(AGGREGATE), '--repo', 'envx', '--artifacts-dir', str(art),
-         '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1',
-         '--badge-file', str(badge), '--attempts-marker-file', str(attempts_marker)],
-        capture_output=True, text=True, check=False,
+        [
+            sys.executable,
+            str(AGGREGATE),
+            '--repo',
+            'envx',
+            '--artifacts-dir',
+            str(art),
+            '--week',
+            '2026-08-23 22:00',
+            '--run-url',
+            'https://example.invalid/run/1',
+            '--badge-file',
+            str(badge),
+            '--attempts-marker-file',
+            str(attempts_marker),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     check('aggregate: exits 0 on merged input', ok=proc.returncode == 0, detail=proc.stderr[-400:])
     if proc.returncode != 0:
         return
     body = proc.stdout
-    check('aggregate: read all three attempts', ok=attempts_marker.read_text() == '3',
-          detail=attempts_marker.read_text())
-    check('aggregate: efficacy is the merged 75%', ok='75.0% efficacy' in body,
-          detail=body.splitlines()[4] if len(body.splitlines()) > 4 else body[:200])
-    check('aggregate: coverage is 100% (nested module measured)',
-          ok='100.0% mutant coverage' in body)
-    check('aggregate: nested path renders repo-relative in the live-mutant list',
-          ok='`envx.go`' in body)
-    check('aggregate: badge written', ok=badge.exists() and 'mutation' in badge.read_text(),
-          detail=badge.read_text() if badge.exists() else 'missing')
+    check(
+        'aggregate: read all three attempts',
+        ok=attempts_marker.read_text() == '3',
+        detail=attempts_marker.read_text(),
+    )
+    check(
+        'aggregate: efficacy is the merged 75%',
+        ok='75.0% efficacy' in body,
+        detail=body.splitlines()[4] if len(body.splitlines()) > 4 else body[:200],
+    )
+    check(
+        'aggregate: coverage is 100% (nested module measured)', ok='100.0% mutant coverage' in body
+    )
+    check(
+        'aggregate: nested path renders repo-relative in the live-mutant list',
+        ok='`envx.go`' in body,
+    )
+    check(
+        'aggregate: badge written',
+        ok=badge.exists() and 'mutation' in badge.read_text(),
+        detail=badge.read_text() if badge.exists() else 'missing',
+    )
 
 
 def test_aggregate_flags_disagreeing_verdicts(tmp: Path) -> None:
@@ -761,20 +1280,36 @@ def test_aggregate_flags_disagreeing_verdicts(tmp: Path) -> None:
     for attempt, lived_in in enumerate(survivors, start=1):
         d = attempt_dir(art, 'rsync', attempt)
         files = [
-            (f, [('LIVED' if f == lived_in else 'KILLED', 'ARITHMETIC_BASE')])
-            for f in survivors
+            (f, [('LIVED' if f == lived_in else 'KILLED', 'ARITHMETIC_BASE')]) for f in survivors
         ]
         (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', files)))
     proc = subprocess.run(
-        [sys.executable, str(AGGREGATE), '--repo', 'rsync', '--artifacts-dir', str(art),
-         '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1'],
-        capture_output=True, text=True, check=False,
+        [
+            sys.executable,
+            str(AGGREGATE),
+            '--repo',
+            'rsync',
+            '--artifacts-dir',
+            str(art),
+            '--week',
+            '2026-08-23 22:00',
+            '--run-url',
+            'https://example.invalid/run/1',
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     check('disagreeing verdicts: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
-    check('disagreeing verdicts: body carries the caution',
-          ok='Verdicts disagree' in proc.stdout, detail=proc.stdout[:600])
-    check('disagreeing verdicts: caution names the worker-interference cause',
-          ok='workers' in proc.stdout.lower())
+    check(
+        'disagreeing verdicts: body carries the caution',
+        ok='Verdicts disagree' in proc.stdout,
+        detail=proc.stdout[:600],
+    )
+    check(
+        'disagreeing verdicts: caution names the worker-interference cause',
+        ok='workers' in proc.stdout.lower(),
+    )
 
 
 def test_aggregate_flags_sudden_perfect_week(tmp: Path) -> None:
@@ -782,9 +1317,19 @@ def test_aggregate_flags_sudden_perfect_week(tmp: Path) -> None:
     art = tmp / 'artifacts-perfect'
     for attempt in (1, 2, 3):
         d = attempt_dir(art, 'rsync', attempt)
-        (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
-            ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')]),
-        ])))
+        (d / 'gremlins-out.json').write_text(
+            json.dumps(
+                result(
+                    'github.com/cplieger/x/v2',
+                    [
+                        (
+                            'a.go',
+                            [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')],
+                        ),
+                    ],
+                )
+            )
+        )
     existing = tmp / 'existing.md'
     existing.write_text(
         '# Gremlins mutation testing tracker\n\n'
@@ -796,14 +1341,31 @@ def test_aggregate_flags_sudden_perfect_week(tmp: Path) -> None:
         '<!-- /gremlins-data -->\n'
     )
     proc = subprocess.run(
-        [sys.executable, str(AGGREGATE), '--repo', 'rsync', '--artifacts-dir', str(art),
-         '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1',
-         '--existing-body-file', str(existing), *default_mutators_config(tmp)],
-        capture_output=True, text=True, check=False,
+        [
+            sys.executable,
+            str(AGGREGATE),
+            '--repo',
+            'rsync',
+            '--artifacts-dir',
+            str(art),
+            '--week',
+            '2026-08-23 22:00',
+            '--run-url',
+            'https://example.invalid/run/1',
+            '--existing-body-file',
+            str(existing),
+            *default_mutators_config(tmp),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     check('sudden perfect week: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
-    check('sudden perfect week: body carries the caution',
-          ok='A jump to 100% efficacy' in proc.stdout, detail=proc.stdout[:600])
+    check(
+        'sudden perfect week: body carries the caution',
+        ok='A jump to 100% efficacy' in proc.stdout,
+        detail=proc.stdout[:600],
+    )
     check('sudden perfect week: history row preserved', ok='2026-08-16 22:00' in proc.stdout)
 
 
@@ -819,9 +1381,19 @@ def test_aggregate_never_names_an_older_week_as_last_week(tmp: Path) -> None:
     art = tmp / 'artifacts-legacy-row'
     for attempt in (1, 2, 3):
         d = attempt_dir(art, 'rsync', attempt)
-        (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
-            ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')]),
-        ])))
+        (d / 'gremlins-out.json').write_text(
+            json.dumps(
+                result(
+                    'github.com/cplieger/x/v2',
+                    [
+                        (
+                            'a.go',
+                            [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')],
+                        ),
+                    ],
+                )
+            )
+        )
     existing = tmp / 'existing.md'
     existing.write_text(
         '# Gremlins mutation testing tracker\n\n'
@@ -834,18 +1406,40 @@ def test_aggregate_never_names_an_older_week_as_last_week(tmp: Path) -> None:
         '<!-- /gremlins-data -->\n'
     )
     proc = subprocess.run(
-        [sys.executable, str(AGGREGATE), '--repo', 'rsync', '--artifacts-dir', str(art),
-         '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1',
-         '--existing-body-file', str(existing), *default_mutators_config(tmp)],
-        capture_output=True, text=True, check=False,
+        [
+            sys.executable,
+            str(AGGREGATE),
+            '--repo',
+            'rsync',
+            '--artifacts-dir',
+            str(art),
+            '--week',
+            '2026-08-23 22:00',
+            '--run-url',
+            'https://example.invalid/run/1',
+            '--existing-body-file',
+            str(existing),
+            *default_mutators_config(tmp),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     check('unreadable newest row: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
-    check('unreadable newest row: caution does not name the older week',
-          ok='7 live mutant' not in proc.stdout, detail=proc.stdout[:800])
-    check('unreadable newest row: jump caution stays silent',
-          ok='jump to 100%' not in proc.stdout.lower(), detail=proc.stdout[:800])
-    check('unreadable newest row: both history rows preserved',
-          ok='2026-08-16 22:00' in proc.stdout and '2026-08-09 22:00' in proc.stdout)
+    check(
+        'unreadable newest row: caution does not name the older week',
+        ok='7 live mutant' not in proc.stdout,
+        detail=proc.stdout[:800],
+    )
+    check(
+        'unreadable newest row: jump caution stays silent',
+        ok='jump to 100%' not in proc.stdout.lower(),
+        detail=proc.stdout[:800],
+    )
+    check(
+        'unreadable newest row: both history rows preserved',
+        ok='2026-08-16 22:00' in proc.stdout and '2026-08-09 22:00' in proc.stdout,
+    )
 
 
 def test_aggregate_reads_last_week_from_the_newest_row(tmp: Path) -> None:
@@ -853,9 +1447,19 @@ def test_aggregate_reads_last_week_from_the_newest_row(tmp: Path) -> None:
     art = tmp / 'artifacts-newest-row'
     for attempt in (1, 2, 3):
         d = attempt_dir(art, 'rsync', attempt)
-        (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
-            ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')]),
-        ])))
+        (d / 'gremlins-out.json').write_text(
+            json.dumps(
+                result(
+                    'github.com/cplieger/x/v2',
+                    [
+                        (
+                            'a.go',
+                            [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')],
+                        ),
+                    ],
+                )
+            )
+        )
     existing = tmp / 'existing.md'
     existing.write_text(
         '# Gremlins mutation testing tracker\n\n'
@@ -868,16 +1472,36 @@ def test_aggregate_reads_last_week_from_the_newest_row(tmp: Path) -> None:
         '<!-- /gremlins-data -->\n'
     )
     proc = subprocess.run(
-        [sys.executable, str(AGGREGATE), '--repo', 'rsync', '--artifacts-dir', str(art),
-         '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1',
-         '--existing-body-file', str(existing), *default_mutators_config(tmp)],
-        capture_output=True, text=True, check=False,
+        [
+            sys.executable,
+            str(AGGREGATE),
+            '--repo',
+            'rsync',
+            '--artifacts-dir',
+            str(art),
+            '--week',
+            '2026-08-23 22:00',
+            '--run-url',
+            'https://example.invalid/run/1',
+            '--existing-body-file',
+            str(existing),
+            *default_mutators_config(tmp),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     check('newest row read: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
-    check('newest row read: caution quotes the newest row count',
-          ok='3 live mutant' in proc.stdout, detail=proc.stdout[:800])
-    check('newest row read: caution does not quote the older row count',
-          ok='7 live mutant' not in proc.stdout, detail=proc.stdout[:800])
+    check(
+        'newest row read: caution quotes the newest row count',
+        ok='3 live mutant' in proc.stdout,
+        detail=proc.stdout[:800],
+    )
+    check(
+        'newest row read: caution does not quote the older row count',
+        ok='7 live mutant' not in proc.stdout,
+        detail=proc.stdout[:800],
+    )
 
 
 def test_aggregate_quiet_on_a_stable_week(tmp: Path) -> None:
@@ -885,18 +1509,42 @@ def test_aggregate_quiet_on_a_stable_week(tmp: Path) -> None:
     art = tmp / 'artifacts-stable'
     for attempt in (1, 2, 3):
         d = attempt_dir(art, 'stable', attempt)
-        (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
-            ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY')]),
-        ])))
+        (d / 'gremlins-out.json').write_text(
+            json.dumps(
+                result(
+                    'github.com/cplieger/x/v2',
+                    [
+                        (
+                            'a.go',
+                            [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY')],
+                        ),
+                    ],
+                )
+            )
+        )
     proc = subprocess.run(
-        [sys.executable, str(AGGREGATE), '--repo', 'stable', '--artifacts-dir', str(art),
-         '--week', '2026-08-23 22:00', '--run-url', 'https://example.invalid/run/1'],
-        capture_output=True, text=True, check=False,
+        [
+            sys.executable,
+            str(AGGREGATE),
+            '--repo',
+            'stable',
+            '--artifacts-dir',
+            str(art),
+            '--week',
+            '2026-08-23 22:00',
+            '--run-url',
+            'https://example.invalid/run/1',
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     check('stable week: exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
-    check('stable week: no caution line',
-          ok='Verdicts disagree' not in proc.stdout and 'measurement failure' not in proc.stdout,
-          detail=proc.stdout[:400])
+    check(
+        'stable week: no caution line',
+        ok='Verdicts disagree' not in proc.stdout and 'measurement failure' not in proc.stdout,
+        detail=proc.stdout[:400],
+    )
 
 
 def test_aggregate_rerun_replaces_its_own_row(tmp: Path) -> None:
@@ -911,19 +1559,38 @@ def test_aggregate_rerun_replaces_its_own_row(tmp: Path) -> None:
     """
     art = tmp / 'artifacts-rerun'
     d = attempt_dir(art, 'rerun', 1)
-    (d / 'gremlins-out.json').write_text(json.dumps(result('github.com/cplieger/x/v2', [
-        ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY')]),
-    ])))
+    (d / 'gremlins-out.json').write_text(
+        json.dumps(
+            result(
+                'github.com/cplieger/x/v2',
+                [
+                    ('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY')]),
+                ],
+            )
+        )
+    )
 
     def run(week: str, run_id: str, existing: Path | None) -> str:
-        args = [sys.executable, str(AGGREGATE), '--repo', 'rerun',
-                '--artifacts-dir', str(art), '--week', week,
-                '--run-url', f'https://github.com/cplieger/ci/actions/runs/{run_id}']
+        args = [
+            sys.executable,
+            str(AGGREGATE),
+            '--repo',
+            'rerun',
+            '--artifacts-dir',
+            str(art),
+            '--week',
+            week,
+            '--run-url',
+            f'https://github.com/cplieger/ci/actions/runs/{run_id}',
+        ]
         if existing:
             args += ['--existing-body-file', str(existing)]
         p = subprocess.run(args, capture_output=True, text=True, check=False)
-        check(f'rerun fixture: aggregate exits 0 ({week})', ok=p.returncode == 0,
-              detail=p.stderr[-400:])
+        check(
+            f'rerun fixture: aggregate exits 0 ({week})',
+            ok=p.returncode == 0,
+            detail=p.stderr[-400:],
+        )
         return p.stdout
 
     def rows(body: str) -> list[str]:
@@ -932,22 +1599,32 @@ def test_aggregate_rerun_replaces_its_own_row(tmp: Path) -> None:
 
     first = tmp / 'b1.md'
     first.write_text(run('2026-07-06 01:31', '28756935137', None))
-    check('rerun: attempt 1 writes one row', ok=len(rows(first.read_text())) == 1,
-          detail=str(rows(first.read_text())))
+    check(
+        'rerun: attempt 1 writes one row',
+        ok=len(rows(first.read_text())) == 1,
+        detail=str(rows(first.read_text())),
+    )
 
     second = tmp / 'b2.md'
     second.write_text(run('2026-07-07 23:28', '28756935137', first))
     got = rows(second.read_text())
-    check('rerun: same run REPLACES its row rather than adding one', ok=len(got) == 1,
-          detail=str(got))
-    check('rerun: the retained row carries the later timestamp',
-          ok=bool(got) and '2026-07-07 23:28' in got[0], detail=str(got))
+    check(
+        'rerun: same run REPLACES its row rather than adding one', ok=len(got) == 1, detail=str(got)
+    )
+    check(
+        'rerun: the retained row carries the later timestamp',
+        ok=bool(got) and '2026-07-07 23:28' in got[0],
+        detail=str(got),
+    )
 
     third = tmp / 'b3.md'
     third.write_text(run('2026-08-21 15:35', '32460445600', second))
     got3 = rows(third.read_text())
-    check('rerun: a DIFFERENT run appends, so real history still accumulates',
-          ok=len(got3) == 2, detail=str(got3))
+    check(
+        'rerun: a DIFFERENT run appends, so real history still accumulates',
+        ok=len(got3) == 2,
+        detail=str(got3),
+    )
 
 
 def test_aggregate_reads_a_flat_single_artifact(tmp: Path) -> None:
@@ -973,16 +1650,35 @@ def test_aggregate_reads_a_flat_single_artifact(tmp: Path) -> None:
     badge = tmp / 'badge.json'
     marker = tmp / 'attempts.txt'
     proc = subprocess.run(
-        [sys.executable, str(AGGREGATE), '--repo', 'solo', '--artifacts-dir', str(art),
-         '--week', '2026-09-13 22:00', '--run-url', 'https://example.invalid/run/1',
-         '--badge-file', str(badge), '--attempts-marker-file', str(marker)],
-        capture_output=True, text=True,
+        [
+            sys.executable,
+            str(AGGREGATE),
+            '--repo',
+            'solo',
+            '--artifacts-dir',
+            str(art),
+            '--week',
+            '2026-09-13 22:00',
+            '--run-url',
+            'https://example.invalid/run/1',
+            '--badge-file',
+            str(badge),
+            '--attempts-marker-file',
+            str(marker),
+        ],
+        capture_output=True,
+        text=True,
     )
     check('flat layout: aggregate exits 0', ok=proc.returncode == 0, detail=proc.stderr)
-    check('flat layout: the one attempt is found', ok='found 1 attempt files' in proc.stderr,
-          detail=proc.stderr)
-    check('flat layout: the attempts marker is 1',
-          ok=marker.is_file() and marker.read_text().strip() == '1')
+    check(
+        'flat layout: the one attempt is found',
+        ok='found 1 attempt files' in proc.stderr,
+        detail=proc.stderr,
+    )
+    check(
+        'flat layout: the attempts marker is 1',
+        ok=marker.is_file() and marker.read_text().strip() == '1',
+    )
     check('flat layout: a badge is written', ok=badge.is_file() and badge.stat().st_size > 0)
     check('flat layout: the body carries a row', ok='| 2026-09-13 22:00 |' in proc.stdout)
 
@@ -1003,18 +1699,40 @@ def test_aggregate_skips_an_attempt_it_cannot_attribute(tmp: Path) -> None:
     badge = tmp / 'badge.json'
     marker = tmp / 'attempts.txt'
     proc = subprocess.run(
-        [sys.executable, str(AGGREGATE), '--repo', 'solo', '--artifacts-dir', str(art),
-         '--week', '2026-09-13 22:00', '--run-url', 'https://example.invalid/run/1',
-         '--badge-file', str(badge), '--attempts-marker-file', str(marker)],
-        capture_output=True, text=True,
+        [
+            sys.executable,
+            str(AGGREGATE),
+            '--repo',
+            'solo',
+            '--artifacts-dir',
+            str(art),
+            '--week',
+            '2026-09-13 22:00',
+            '--run-url',
+            'https://example.invalid/run/1',
+            '--badge-file',
+            str(badge),
+            '--attempts-marker-file',
+            str(marker),
+        ],
+        capture_output=True,
+        text=True,
     )
     check('unattributable attempt: aggregate exits 0', ok=proc.returncode == 0, detail=proc.stderr)
-    check('unattributable attempt: it is not counted',
-          ok='found 0 attempt files' in proc.stderr, detail=proc.stderr)
-    check('unattributable attempt: it says which file it skipped',
-          ok='no readable meta.json' in proc.stderr, detail=proc.stderr)
-    check('unattributable attempt: no badge is written, so a good one survives',
-          ok=not badge.is_file() or badge.stat().st_size == 0)
+    check(
+        'unattributable attempt: it is not counted',
+        ok='found 0 attempt files' in proc.stderr,
+        detail=proc.stderr,
+    )
+    check(
+        'unattributable attempt: it says which file it skipped',
+        ok='no readable meta.json' in proc.stderr,
+        detail=proc.stderr,
+    )
+    check(
+        'unattributable attempt: no badge is written, so a good one survives',
+        ok=not badge.is_file() or badge.stat().st_size == 0,
+    )
 
 
 def test_aggregate_ignores_another_repos_attempt(tmp: Path) -> None:
@@ -1030,14 +1748,29 @@ def test_aggregate_ignores_another_repos_attempt(tmp: Path) -> None:
     )
     marker = tmp / 'attempts.txt'
     proc = subprocess.run(
-        [sys.executable, str(AGGREGATE), '--repo', 'mine', '--artifacts-dir', str(art),
-         '--week', '2026-09-13 22:00', '--run-url', 'https://example.invalid/run/1',
-         '--attempts-marker-file', str(marker)],
-        capture_output=True, text=True,
+        [
+            sys.executable,
+            str(AGGREGATE),
+            '--repo',
+            'mine',
+            '--artifacts-dir',
+            str(art),
+            '--week',
+            '2026-09-13 22:00',
+            '--run-url',
+            'https://example.invalid/run/1',
+            '--attempts-marker-file',
+            str(marker),
+        ],
+        capture_output=True,
+        text=True,
     )
     check('repo filter: aggregate exits 0', ok=proc.returncode == 0, detail=proc.stderr)
-    check('repo filter: only this repo\'s attempt is counted',
-          ok='found 1 attempt files' in proc.stderr, detail=proc.stderr)
+    check(
+        "repo filter: only this repo's attempt is counted",
+        ok='found 1 attempt files' in proc.stderr,
+        detail=proc.stderr,
+    )
 
 
 def shell_function(name: str) -> str:
@@ -1046,8 +1779,13 @@ def shell_function(name: str) -> str:
     return m.group(0) if m else ''
 
 
-def call_shell(name: str, *args: str, deps: tuple[str, ...] = (), prelude: str = '',
-               env: dict[str, str] | None = None) -> tuple[str, subprocess.CompletedProcess]:
+def call_shell(
+    name: str,
+    *args: str,
+    deps: tuple[str, ...] = (),
+    prelude: str = '',
+    env: dict[str, str] | None = None,
+) -> tuple[str, subprocess.CompletedProcess]:
     """Run gremlins-run.sh's own `name` (after `prelude` and `deps`) under its shell options.
 
     Returns the extracted `name` source, empty when it or a dep was not found.
@@ -1055,9 +1793,19 @@ def call_shell(name: str, *args: str, deps: tuple[str, ...] = (), prelude: str =
     srcs = [shell_function(fn) for fn in (*deps, name)]
     body = prelude + '\n'.join(srcs)
     proc = subprocess.run(
-        ['bash', '--norc', '--noprofile', '-c', f'set -euo pipefail\n{body}\n{name} "$@"',
-         name, *args],
-        capture_output=True, text=True, check=False, env=env,
+        [
+            'bash',
+            '--norc',
+            '--noprofile',
+            '-c',
+            f'set -euo pipefail\n{body}\n{name} "$@"',
+            name,
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
     )
     return srcs[-1] if all(srcs) else '', proc
 
@@ -1069,9 +1817,11 @@ def test_timeout_coefficient_scales_with_workers(tmp: Path) -> None:
         return
     for workers, want in (('4', '12'), ('2', '6'), ('1', '3')):
         _, proc = call_shell('timeout_coefficient', workers)
-        check(f'coefficient: {workers} worker(s) -> {want}',
-              ok=proc.returncode == 0 and proc.stdout.strip() == want,
-              detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+        check(
+            f'coefficient: {workers} worker(s) -> {want}',
+            ok=proc.returncode == 0 and proc.stdout.strip() == want,
+            detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}',
+        )
 
 
 def test_integration_decision(tmp: Path) -> None:
@@ -1080,19 +1830,34 @@ def test_integration_decision(tmp: Path) -> None:
     if not src:
         return
     _, proc = call_shell('integration_wanted', '60', '20', '4', '350')
-    check('integration: under a quarter of the cap -> integration', ok=proc.returncode == 0,
-          detail=f'rc={proc.returncode} err={proc.stderr!r}')
-    check('integration: prints the estimate and the budget',
-          ok=proc.stdout.strip() == 'estimate=300s budget=5250s', detail=repr(proc.stdout))
+    check(
+        'integration: under a quarter of the cap -> integration',
+        ok=proc.returncode == 0,
+        detail=f'rc={proc.returncode} err={proc.stderr!r}',
+    )
+    check(
+        'integration: prints the estimate and the budget',
+        ok=proc.stdout.strip() == 'estimate=300s budget=5250s',
+        detail=repr(proc.stdout),
+    )
     _, proc = call_shell('integration_wanted', '100', '419', '4', '350')
-    check('integration: over a quarter of the cap -> per-package', ok=proc.returncode == 1,
-          detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+    check(
+        'integration: over a quarter of the cap -> per-package',
+        ok=proc.returncode == 1,
+        detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}',
+    )
     _, proc = call_shell('integration_wanted', '5250', '4', '4', '350')
-    check('integration: exactly a quarter of the cap -> per-package', ok=proc.returncode == 1,
-          detail=f'rc={proc.returncode} out={proc.stdout!r}')
+    check(
+        'integration: exactly a quarter of the cap -> per-package',
+        ok=proc.returncode == 1,
+        detail=f'rc={proc.returncode} out={proc.stdout!r}',
+    )
     _, proc = call_shell('integration_wanted', '60', '20', '1', '350')
-    check('integration: divides by the workers gremlins is given', ok=proc.returncode == 0
-          and proc.stdout.strip() == 'estimate=1200s budget=5250s', detail=repr(proc.stdout))
+    check(
+        'integration: divides by the workers gremlins is given',
+        ok=proc.returncode == 0 and proc.stdout.strip() == 'estimate=1200s budget=5250s',
+        detail=repr(proc.stdout),
+    )
     for label, args in (
         ('suite unmeasured', ('', '20', '4', '350')),
         ('dry run gave no count', ('60', '', '4', '350')),
@@ -1103,44 +1868,98 @@ def test_integration_decision(tmp: Path) -> None:
         ('wrong arity', ('60', '20', '4')),
     ):
         _, proc = call_shell('integration_wanted', *args)
-        check(f'integration: measurement failed ({label}) -> per-package',
-              ok=proc.returncode == 1 and proc.stdout == '' and proc.stderr == '',
-              detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+        check(
+            f'integration: measurement failed ({label}) -> per-package',
+            ok=proc.returncode == 1 and proc.stdout == '' and proc.stderr == '',
+            detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}',
+        )
 
 
 def test_runner_mode_selection(tmp: Path) -> None:
     guards = ''.join(re.findall(r'^: "\$\{.*\n', RUNNER.read_text(), re.MULTILINE))
-    check('runner mode: env guards extracted from gremlins-run.sh', ok='OUT:?' in guards,
-          detail=repr(guards))
-    base = {'PATH': '/usr/bin:/bin', **dict.fromkeys((
-        'GREMLINS_VERSION', 'GREMLINS_PATCHES', 'WORKERS_MAX', 'GOMEM_MAX_MB', 'GOMEM_SOLO_MB',
-        'PROBE_TIMEOUT', 'OUT'), 'x')}
-    src, proc = call_shell('select_mode', '60', '20', '4', deps=('integration_wanted',),
-                           prelude=guards, env=base)
+    check(
+        'runner mode: env guards extracted from gremlins-run.sh',
+        ok='OUT:?' in guards,
+        detail=repr(guards),
+    )
+    base = {
+        'PATH': '/usr/bin:/bin',
+        **dict.fromkeys(
+            (
+                'GREMLINS_VERSION',
+                'GREMLINS_PATCHES',
+                'WORKERS_MAX',
+                'GOMEM_MAX_MB',
+                'GOMEM_SOLO_MB',
+                'PROBE_TIMEOUT',
+                'OUT',
+            ),
+            'x',
+        ),
+    }
+    src, proc = call_shell(
+        'select_mode', '60', '20', '4', deps=('integration_wanted',), prelude=guards, env=base
+    )
     check('runner mode: select_mode extracted from gremlins-run.sh', ok=bool(src))
-    check('runner mode: no cap passes the env guards and keeps per-package',
-          ok=proc.returncode == 0 and proc.stdout == 'per-package\n',
-          detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
-    check('runner mode: no cap is logged as unmeasured',
-          ok=proc.stderr == 'mode=per-package (suite=60s mutants=20 workers=4 cap=unmeasured)\n',
-          detail=repr(proc.stderr))
-    _, proc = call_shell('select_mode', '60', '20', '4', deps=('integration_wanted',),
-                         prelude=guards, env={**base, 'JOB_TIMEOUT_MINUTES': ''})
-    check('runner mode: an empty cap keeps per-package',
-          ok=proc.returncode == 0 and proc.stdout == 'per-package\n',
-          detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
-    _, proc = call_shell('select_mode', '60', '20', '4', deps=('integration_wanted',),
-                         prelude=guards, env={**base, 'JOB_TIMEOUT_MINUTES': '350'})
-    check('runner mode: under the cap -> integration, logged with its inputs',
-          ok=proc.returncode == 0 and proc.stdout == 'integration\n' and proc.stderr
-          == 'mode=integration (suite=60s mutants=20 workers=4 cap=350min estimate=300s '
-          'budget=5250s)\n', detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
-    _, proc = call_shell('select_mode', '', '', '1', deps=('integration_wanted',),
-                         prelude=guards, env={**base, 'JOB_TIMEOUT_MINUTES': '350'})
-    check('runner mode: unmeasured suite -> per-package, logged as unmeasured',
-          ok=proc.returncode == 0 and proc.stdout == 'per-package\n' and proc.stderr
-          == 'mode=per-package (suite=unmeasured mutants=unmeasured workers=1 cap=350min)\n',
-          detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+    check(
+        'runner mode: no cap passes the env guards and keeps per-package',
+        ok=proc.returncode == 0 and proc.stdout == 'per-package\n',
+        detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}',
+    )
+    check(
+        'runner mode: no cap is logged as unmeasured',
+        ok=proc.stderr == 'mode=per-package (suite=60s mutants=20 workers=4 cap=unmeasured)\n',
+        detail=repr(proc.stderr),
+    )
+    _, proc = call_shell(
+        'select_mode',
+        '60',
+        '20',
+        '4',
+        deps=('integration_wanted',),
+        prelude=guards,
+        env={**base, 'JOB_TIMEOUT_MINUTES': ''},
+    )
+    check(
+        'runner mode: an empty cap keeps per-package',
+        ok=proc.returncode == 0 and proc.stdout == 'per-package\n',
+        detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}',
+    )
+    _, proc = call_shell(
+        'select_mode',
+        '60',
+        '20',
+        '4',
+        deps=('integration_wanted',),
+        prelude=guards,
+        env={**base, 'JOB_TIMEOUT_MINUTES': '350'},
+    )
+    check(
+        'runner mode: under the cap -> integration, logged with its inputs',
+        ok=proc.returncode == 0
+        and proc.stdout == 'integration\n'
+        and proc.stderr
+        == 'mode=integration (suite=60s mutants=20 workers=4 cap=350min estimate=300s '
+        'budget=5250s)\n',
+        detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}',
+    )
+    _, proc = call_shell(
+        'select_mode',
+        '',
+        '',
+        '1',
+        deps=('integration_wanted',),
+        prelude=guards,
+        env={**base, 'JOB_TIMEOUT_MINUTES': '350'},
+    )
+    check(
+        'runner mode: unmeasured suite -> per-package, logged as unmeasured',
+        ok=proc.returncode == 0
+        and proc.stdout == 'per-package\n'
+        and proc.stderr
+        == 'mode=per-package (suite=unmeasured mutants=unmeasured workers=1 cap=350min)\n',
+        detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}',
+    )
 
 
 def test_workflow_applies_every_patch(tmp: Path) -> None:
@@ -1148,54 +1967,87 @@ def test_workflow_applies_every_patch(tmp: Path) -> None:
     step = CONTAINER.read_text() if CONTAINER.exists() else ''
     check('patches: scripts/gremlins-container.sh exists', ok=bool(step))
     on_disk = sorted(p.name for p in HERE.glob('gremlins-*.patch'))
-    mounts = dict(re.findall(
-        r'-v "\$\{PWD\}/scripts/(gremlins-[^"]+\.patch)":(/[^:"]+):ro', step))
+    mounts = dict(re.findall(r'-v "\$\{PWD\}/scripts/(gremlins-[^"]+\.patch)":(/[^:"]+):ro', step))
     listed = re.search(r'-e GREMLINS_PATCHES="([^"]*)"', step)
     paths = listed.group(1).split() if listed else []
-    check('patches: every scripts/gremlins-*.patch is mounted',
-          ok=bool(on_disk) and sorted(mounts) == on_disk, detail=f'{sorted(mounts)} != {on_disk}')
-    check('patches: GREMLINS_PATCHES lists every mounted patch once',
-          ok=sorted(paths) == sorted(mounts.values()) and len(set(paths)) == len(paths),
-          detail=f'{paths} vs {sorted(mounts.values())}')
+    check(
+        'patches: every scripts/gremlins-*.patch is mounted',
+        ok=bool(on_disk) and sorted(mounts) == on_disk,
+        detail=f'{sorted(mounts)} != {on_disk}',
+    )
+    check(
+        'patches: GREMLINS_PATCHES lists every mounted patch once',
+        ok=sorted(paths) == sorted(mounts.values()) and len(set(paths)) == len(paths),
+        detail=f'{paths} vs {sorted(mounts.values())}',
+    )
     runner = RUNNER.read_text()
-    check('patches: gremlins-run.sh says when to delete each patch',
-          ok=all(name in runner for name in on_disk),
-          detail=str([n for n in on_disk if n not in runner]))
+    check(
+        'patches: gremlins-run.sh says when to delete each patch',
+        ok=all(name in runner for name in on_disk),
+        detail=str([n for n in on_disk if n not in runner]),
+    )
     # gremlins' own tests cover the parse and the executor, not cmd/unleash.go;
     # without this line the patch builds, passes and changes no timeout.
     pkgtimeout = (HERE / 'gremlins-pkgtimeout.patch').read_text()
-    check('patches: gremlins-pkgtimeout.patch wires the per-package times into the executor',
-          ok=bool(re.search(r'^\+.*engine\.WithPackageElapsed\(cProfile\.PackageElapsed\)',
-                            pkgtimeout, re.MULTILINE)))
+    check(
+        'patches: gremlins-pkgtimeout.patch wires the per-package times into the executor',
+        ok=bool(
+            re.search(
+                r'^\+.*engine\.WithPackageElapsed\(cProfile\.PackageElapsed\)',
+                pkgtimeout,
+                re.MULTILINE,
+            )
+        ),
+    )
 
 
 def test_merge_records_the_mode(tmp: Path) -> None:
-    root = result('github.com/cplieger/envx/v2', [
-        ('envx.go', [('KILLED', 'ARITHMETIC_BASE')]),
-        ('yamlenv/yamlenv.go', [('NOT COVERED', 'ARITHMETIC_BASE')]),
-    ])
-    nested = result('github.com/cplieger/envx/yamlenv/v2', [
-        ('yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')]),
-    ])
+    root = result(
+        'github.com/cplieger/envx/v2',
+        [
+            ('envx.go', [('KILLED', 'ARITHMETIC_BASE')]),
+            ('yamlenv/yamlenv.go', [('NOT COVERED', 'ARITHMETIC_BASE')]),
+        ],
+    )
+    nested = result(
+        'github.com/cplieger/envx/yamlenv/v2',
+        [
+            ('yamlenv.go', [('KILLED', 'ARITHMETIC_BASE')]),
+        ],
+    )
     _, merged = run_merge(tmp, [('.', root)], out_name='m1.json', modes={'.': 'integration\n'})
-    check('merge mode: one integration module -> integration',
-          ok=merged is not None and merged['mode'] == 'integration',
-          detail=str(merged and merged.get('mode')))
-    _, merged = run_merge(tmp, [('.', root), ('yamlenv', nested)], out_name='m2.json',
-                          modes={'.': 'integration\n', 'yamlenv': 'per-package\n'})
-    check('merge mode: modules that differ -> mixed',
-          ok=merged is not None and merged['mode'] == 'mixed'
-          and [m['mode'] for m in merged['modules']] == ['integration', 'per-package'],
-          detail=str(merged and merged.get('modules')))
+    check(
+        'merge mode: one integration module -> integration',
+        ok=merged is not None and merged['mode'] == 'integration',
+        detail=str(merged and merged.get('mode')),
+    )
+    _, merged = run_merge(
+        tmp,
+        [('.', root), ('yamlenv', nested)],
+        out_name='m2.json',
+        modes={'.': 'integration\n', 'yamlenv': 'per-package\n'},
+    )
+    check(
+        'merge mode: modules that differ -> mixed',
+        ok=merged is not None
+        and merged['mode'] == 'mixed'
+        and [m['mode'] for m in merged['modules']] == ['integration', 'per-package'],
+        detail=str(merged and merged.get('modules')),
+    )
     for p in tmp.glob('*.mode'):
         p.unlink()
     _, merged = run_merge(tmp, [('.', root)], out_name='m3.json')
-    check('merge mode: no mode file -> per-package',
-          ok=merged is not None and merged['mode'] == 'per-package',
-          detail=str(merged and merged.get('mode')))
+    check(
+        'merge mode: no mode file -> per-package',
+        ok=merged is not None and merged['mode'] == 'per-package',
+        detail=str(merged and merged.get('mode')),
+    )
     proc, _ = run_merge(tmp, [('.', root)], out_name='m4.json', modes={'.': 'sharded\n'})
-    check('merge mode: an unknown mode fails the attempt',
-          ok=proc.returncode != 0 and 'sharded' in proc.stderr, detail=proc.stderr[-300:])
+    check(
+        'merge mode: an unknown mode fails the attempt',
+        ok=proc.returncode != 0 and 'sharded' in proc.stderr,
+        detail=proc.stderr[-300:],
+    )
 
 
 MODE_HISTORY = (
@@ -1211,8 +2063,15 @@ MODE_HISTORY = (
 )
 
 
-def aggregate_week(tmp: Path, name: str, mode: str, files: list, existing: str,
-                   run_id: str, config: tuple[str, ...] = ()) -> tuple[subprocess.CompletedProcess, str]:
+def aggregate_week(
+    tmp: Path,
+    name: str,
+    mode: str,
+    files: list,
+    existing: str,
+    run_id: str,
+    config: tuple[str, ...] = (),
+) -> tuple[subprocess.CompletedProcess, str]:
     art = tmp / f'art-{name}'
     for attempt in (1, 2, 3):
         doc = result('github.com/cplieger/x/v2', files)
@@ -1222,11 +2081,26 @@ def aggregate_week(tmp: Path, name: str, mode: str, files: list, existing: str,
     body.write_text(existing)
     marker = tmp / f'regression-{name}.txt'
     proc = subprocess.run(
-        [sys.executable, str(AGGREGATE), '--repo', 'sw', '--artifacts-dir', str(art),
-         '--week', f'2026-10-{int(run_id):02d} 22:00', '--run-url',
-         f'https://github.com/cplieger/ci/actions/runs/{run_id}',
-         '--existing-body-file', str(body), '--regression-marker-file', str(marker), *config],
-        capture_output=True, text=True, check=False,
+        [
+            sys.executable,
+            str(AGGREGATE),
+            '--repo',
+            'sw',
+            '--artifacts-dir',
+            str(art),
+            '--week',
+            f'2026-10-{int(run_id):02d} 22:00',
+            '--run-url',
+            f'https://github.com/cplieger/ci/actions/runs/{run_id}',
+            '--existing-body-file',
+            str(body),
+            '--regression-marker-file',
+            str(marker),
+            *config,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     return proc, marker.read_text() if marker.exists() else ''
 
@@ -1235,39 +2109,59 @@ def test_aggregate_marks_a_mode_switch(tmp: Path) -> None:
     half = [('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY')])]
     proc, flag = aggregate_week(tmp, 'control', 'per-package', half, MODE_HISTORY, '4')
     check('mode switch: control week exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
-    check('mode switch: the same drop without a switch raises the label', ok=flag == 'true',
-          detail=flag)
-    check('mode switch: control row records per-package with no switch mark',
-          ok='| per-package | all | <!-- run:4 -->' in proc.stdout, detail=proc.stdout[:900])
+    check(
+        'mode switch: the same drop without a switch raises the label',
+        ok=flag == 'true',
+        detail=flag,
+    )
+    check(
+        'mode switch: control row records per-package with no switch mark',
+        ok='| per-package | all | <!-- run:4 -->' in proc.stdout,
+        detail=proc.stdout[:900],
+    )
 
     proc, flag = aggregate_week(tmp, 'switch', 'integration', half, MODE_HISTORY, '4')
     check('mode switch: switch week exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
-    check('mode switch: the row marks the switch and the expected jump',
-          ok='| integration (switched from per-package; score jump expected) | all | <!-- run:4 -->'
-          in proc.stdout, detail=proc.stdout[:900])
+    check(
+        'mode switch: the row marks the switch and the expected jump',
+        ok='| integration (switched from per-package; score jump expected) | all | <!-- run:4 -->'
+        in proc.stdout,
+        detail=proc.stdout[:900],
+    )
     check('mode switch: the switch week does not raise the label', ok=flag == 'false', detail=flag)
-    check('mode switch: the header says why', ok='Mode switched from per-package to integration'
-          in proc.stdout, detail=proc.stdout[:900])
+    check(
+        'mode switch: the header says why',
+        ok='Mode switched from per-package to integration' in proc.stdout,
+        detail=proc.stdout[:900],
+    )
 
     # Re-aggregating the same run must still see the switch, not its own row.
     rerun, flag = aggregate_week(tmp, 'rerun', 'integration', half, proc.stdout, '4')
-    check('mode switch: a re-aggregate of the switch run keeps the mark',
-          ok='(switched from per-package; score jump expected) | all | <!-- run:4 -->'
-          in rerun.stdout
-          and rerun.stdout.count('<!-- run:4 -->') == 1 and flag == 'false',
-          detail=rerun.stdout[:900])
+    check(
+        'mode switch: a re-aggregate of the switch run keeps the mark',
+        ok='(switched from per-package; score jump expected) | all | <!-- run:4 -->' in rerun.stdout
+        and rerun.stdout.count('<!-- run:4 -->') == 1
+        and flag == 'false',
+        detail=rerun.stdout[:900],
+    )
 
     after, flag = aggregate_week(tmp, 'after', 'integration', half, proc.stdout, '5')
-    check('mode switch: the next week in the new mode is unmarked',
-          ok='| integration | all | <!-- run:5 -->' in after.stdout, detail=after.stdout[:900])
-    check('mode switch: the next week compares only integration rows', ok=flag == 'false',
-          detail=flag)
+    check(
+        'mode switch: the next week in the new mode is unmarked',
+        ok='| integration | all | <!-- run:5 -->' in after.stdout,
+        detail=after.stdout[:900],
+    )
+    check(
+        'mode switch: the next week compares only integration rows', ok=flag == 'false', detail=flag
+    )
 
     perfect = [('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'CONDITIONALS_BOUNDARY')])]
     proc, _ = aggregate_week(tmp, 'perfect', 'integration', perfect, MODE_HISTORY, '4')
-    check('mode switch: a switch to 100% is not called a measurement failure',
-          ok='jump to 100%' not in proc.stdout.lower() and 'Mode switched' in proc.stdout,
-          detail=proc.stdout[:900])
+    check(
+        'mode switch: a switch to 100% is not called a measurement failure',
+        ok='jump to 100%' not in proc.stdout.lower() and 'Mode switched' in proc.stdout,
+        detail=proc.stdout[:900],
+    )
 
 
 # The rows the weekly runner wrote while configs/gremlins.yaml nested its
@@ -1288,43 +2182,83 @@ def test_aggregate_starts_a_baseline_when_the_mutators_change(tmp: Path) -> None
     half = [('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'INVERT_LOGICAL')])]
     legacy = default_mutators_config(tmp)
     proc, flag = aggregate_week(tmp, 'm-control', 'per-package', half, LEGACY_HISTORY, '4', legacy)
-    check('mutator switch: control week exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:])
-    check('mutator switch: the same drop on the same mutators raises the label', ok=flag == 'true',
-          detail=flag)
-    check('mutator switch: control row records the default set unmarked',
-          ok='| per-package | default | <!-- run:4 -->' in proc.stdout, detail=proc.stdout[:900])
+    check(
+        'mutator switch: control week exits 0', ok=proc.returncode == 0, detail=proc.stderr[-400:]
+    )
+    check(
+        'mutator switch: the same drop on the same mutators raises the label',
+        ok=flag == 'true',
+        detail=flag,
+    )
+    check(
+        'mutator switch: control row records the default set unmarked',
+        ok='| per-package | default | <!-- run:4 -->' in proc.stdout,
+        detail=proc.stdout[:900],
+    )
 
     proc, flag = aggregate_week(tmp, 'm-switch', 'per-package', half, LEGACY_HISTORY, '4')
-    check('mutator switch: the first all-mutators week exits 0', ok=proc.returncode == 0,
-          detail=proc.stderr[-400:])
-    check('mutator switch: the row marks the switch',
-          ok='| per-package | all (switched from default; score shift expected) | <!-- run:4 -->'
-          in proc.stdout, detail=proc.stdout[:900])
-    check('mutator switch: the first all-mutators week does not raise the label', ok=flag == 'false',
-          detail=flag)
-    check('mutator switch: the header says why',
-          ok='Mutators switched from default to all' in proc.stdout and '**Trend**' not in proc.stdout,
-          detail=proc.stdout[:900])
+    check(
+        'mutator switch: the first all-mutators week exits 0',
+        ok=proc.returncode == 0,
+        detail=proc.stderr[-400:],
+    )
+    check(
+        'mutator switch: the row marks the switch',
+        ok='| per-package | all (switched from default; score shift expected) | <!-- run:4 -->'
+        in proc.stdout,
+        detail=proc.stdout[:900],
+    )
+    check(
+        'mutator switch: the first all-mutators week does not raise the label',
+        ok=flag == 'false',
+        detail=flag,
+    )
+    check(
+        'mutator switch: the header says why',
+        ok='Mutators switched from default to all' in proc.stdout
+        and '**Trend**' not in proc.stdout,
+        detail=proc.stdout[:900],
+    )
 
     rerun, flag = aggregate_week(tmp, 'm-rerun', 'per-package', half, proc.stdout, '4')
-    check('mutator switch: a re-aggregate of the switch run keeps the mark',
-          ok='all (switched from default; score shift expected) | <!-- run:4 -->' in rerun.stdout
-          and rerun.stdout.count('<!-- run:4 -->') == 1 and flag == 'false',
-          detail=rerun.stdout[:900])
+    check(
+        'mutator switch: a re-aggregate of the switch run keeps the mark',
+        ok='all (switched from default; score shift expected) | <!-- run:4 -->' in rerun.stdout
+        and rerun.stdout.count('<!-- run:4 -->') == 1
+        and flag == 'false',
+        detail=rerun.stdout[:900],
+    )
 
-    worse = [('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'INVERT_LOGICAL'),
-                       ('LIVED', 'INVERT_BITWISE'), ('LIVED', 'INVERT_LOOPCTRL')])]
+    worse = [
+        (
+            'a.go',
+            [
+                ('KILLED', 'ARITHMETIC_BASE'),
+                ('LIVED', 'INVERT_LOGICAL'),
+                ('LIVED', 'INVERT_BITWISE'),
+                ('LIVED', 'INVERT_LOOPCTRL'),
+            ],
+        )
+    ]
     after, flag = aggregate_week(tmp, 'm-after', 'per-package', worse, proc.stdout, '5')
-    check('mutator switch: the next week on all mutators is unmarked',
-          ok='| per-package | all | <!-- run:5 -->' in after.stdout, detail=after.stdout[:900])
-    check('mutator switch: the next week compares against the new baseline only', ok=flag == 'true'
-          and '-25.0% from 12-week mean (50.0%)' in after.stdout, detail=after.stdout[:900])
+    check(
+        'mutator switch: the next week on all mutators is unmarked',
+        ok='| per-package | all | <!-- run:5 -->' in after.stdout,
+        detail=after.stdout[:900],
+    )
+    check(
+        'mutator switch: the next week compares against the new baseline only',
+        ok=flag == 'true' and '-25.0% from 12-week mean (50.0%)' in after.stdout,
+        detail=after.stdout[:900],
+    )
 
     perfect = [('a.go', [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'INVERT_LOGICAL')])]
     proc, _ = aggregate_week(tmp, 'm-perfect', 'per-package', perfect, LEGACY_HISTORY, '4')
-    check('mutator switch: a switch to 100% is not called a measurement failure',
-          ok='jump to 100%' not in proc.stdout.lower() and 'Mutators switched' in proc.stdout,
-          detail=proc.stdout[:900])
+    check(
+        'mutator switch: a switch to 100% is not called a measurement failure',
+        ok='jump to 100%' not in proc.stdout.lower() and 'Mutators switched' in proc.stdout,
+        detail=proc.stdout[:900],
+    )
 
 
 def test_enabled_mutators_follows_gremlins(tmp: Path) -> None:
@@ -1333,17 +2267,27 @@ def test_enabled_mutators_follows_gremlins(tmp: Path) -> None:
     default = gremlins_aggregate.DEFAULT_MUTATORS
     cases = {
         'no mutants key keeps the defaults': ({}, default),
-        'an explicit false turns a default type off':
-            ({'mutants': {'arithmetic-base': {'enabled': False}}}, default - {'arithmetic-base'}),
+        'an explicit false turns a default type off': (
+            {'mutants': {'arithmetic-base': {'enabled': False}}},
+            default - {'arithmetic-base'},
+        ),
         'a string is not true': ({'mutants': {'invert-logical': {'enabled': 'true'}}}, default),
-        'a non-bool turns a default type off':
-            ({'mutants': {'arithmetic-base': {'enabled': 'yes'}}}, default - {'arithmetic-base'}),
-        'a null enabled keeps the default':
-            ({'mutants': {'arithmetic-base': {'enabled': None}}}, default),
-        'an entry without enabled keeps the default':
-            ({'mutants': {'invert-logical': True, 'arithmetic-base': {}}}, default),
-        'a top-level entry turns a type on':
-            ({'mutants': {'invert-logical': {'enabled': True}}}, default | {'invert-logical'}),
+        'a non-bool turns a default type off': (
+            {'mutants': {'arithmetic-base': {'enabled': 'yes'}}},
+            default - {'arithmetic-base'},
+        ),
+        'a null enabled keeps the default': (
+            {'mutants': {'arithmetic-base': {'enabled': None}}},
+            default,
+        ),
+        'an entry without enabled keeps the default': (
+            {'mutants': {'invert-logical': True, 'arithmetic-base': {}}},
+            default,
+        ),
+        'a top-level entry turns a type on': (
+            {'mutants': {'invert-logical': {'enabled': True}}},
+            default | {'invert-logical'},
+        ),
     }
     for name, (config, want) in cases.items():
         check(f'enabled mutators: {name}', ok=em(config) == want, detail=str(sorted(em(config))))
@@ -1351,23 +2295,44 @@ def test_enabled_mutators_follows_gremlins(tmp: Path) -> None:
         doc = gremlins_aggregate.load_config(f'mutants:\n  invert-logical:\n    enabled: {word}\n')
         value = doc['mutants']['invert-logical']['enabled']
         on = word == 'True'
-        check(f'enabled mutators: YAML 1.2 reads enabled: {word} as gremlins does',
-              ok=isinstance(value, bool) == on and ('invert-logical' in em(doc)) == on,
-              detail=repr(value))
+        check(
+            f'enabled mutators: YAML 1.2 reads enabled: {word} as gremlins does',
+            ok=isinstance(value, bool) == on and ('invert-logical' in em(doc)) == on,
+            detail=repr(value),
+        )
     label = gremlins_aggregate.mutators_label
-    check('mutators label: all, default, and a sorted list otherwise',
-          ok=label(frozenset(gremlins_aggregate.GREMLINS_MUTATORS)) == 'all'
-          and label(default) == 'default'
-          and label(frozenset({'invert-logical', 'arithmetic-base'})) == 'arithmetic-base+invert-logical'
-          and label(frozenset()) == 'none')
-    proc = subprocess.run(
-        [sys.executable, str(AGGREGATE), '--repo', 'x', '--artifacts-dir', str(tmp),
-         '--week', '2026-10-04 22:00', '--run-url', 'https://example.invalid/run/1',
-         '--config', str(tmp / 'missing.yaml')],
-        capture_output=True, text=True, check=False,
+    check(
+        'mutators label: all, default, and a sorted list otherwise',
+        ok=label(frozenset(gremlins_aggregate.GREMLINS_MUTATORS)) == 'all'
+        and label(default) == 'default'
+        and label(frozenset({'invert-logical', 'arithmetic-base'}))
+        == 'arithmetic-base+invert-logical'
+        and label(frozenset()) == 'none',
     )
-    check('mutators label: an unreadable --config fails loudly',
-          ok=proc.returncode == 1 and 'cannot read' in proc.stderr, detail=proc.stderr[-300:])
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(AGGREGATE),
+            '--repo',
+            'x',
+            '--artifacts-dir',
+            str(tmp),
+            '--week',
+            '2026-10-04 22:00',
+            '--run-url',
+            'https://example.invalid/run/1',
+            '--config',
+            str(tmp / 'missing.yaml'),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    check(
+        'mutators label: an unreadable --config fails loudly',
+        ok=proc.returncode == 1 and 'cannot read' in proc.stderr,
+        detail=proc.stderr[-300:],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1390,33 +2355,69 @@ def load_script(name: str, path: Path):
 # and dry-run count from its mode line, setup from job start to it.
 DEADSET_GO = {
     'module': 'github.com/cplieger/deadset-go/v2',
-    'env': {'workers': '4', 'mode': 'per-package', 'suite_secs': '132', 'mutants': '5632',
-            'setup_secs': '500'},
+    'env': {
+        'workers': '4',
+        'mode': 'per-package',
+        'suite_secs': '132',
+        'mutants': '5632',
+        'setup_secs': '500',
+    },
     'packages': {
-        'cmd/deadset-go': (228, 58, 132755), 'internal/buildconstraint': (48, 20, 737),
-        'internal/config': (167, 10, 1576), 'internal/conventions': (52, 50, 547),
-        'internal/deps': (57, 1, 2183), 'internal/edges': (10, 1, 894),
-        'internal/exempt': (1576, 274, 27768), 'internal/facts': (62, 719, 2384),
-        'internal/failure': (10, 5, 416), 'internal/findings': (969, 110, 39016),
-        'internal/gotypes': (0, 11, 195), 'internal/inventory': (52, 181, 1304),
-        'internal/jsondoc': (5, 0, 532), 'internal/liveness': (391, 76, 19247),
-        'internal/load': (586, 129, 10337), 'internal/matrix': (29, 10, 1375),
-        'internal/memory': (136, 63, 1224), 'internal/resolve': (0, 65, 693),
-        'internal/roots': (43, 199, 1284), 'internal/run': (98, 172, 3452),
-        'internal/scope': (40, 2, 972), 'internal/suppress': (47, 3, 3023),
+        'cmd/deadset-go': (228, 58, 132755),
+        'internal/buildconstraint': (48, 20, 737),
+        'internal/config': (167, 10, 1576),
+        'internal/conventions': (52, 50, 547),
+        'internal/deps': (57, 1, 2183),
+        'internal/edges': (10, 1, 894),
+        'internal/exempt': (1576, 274, 27768),
+        'internal/facts': (62, 719, 2384),
+        'internal/failure': (10, 5, 416),
+        'internal/findings': (969, 110, 39016),
+        'internal/gotypes': (0, 11, 195),
+        'internal/inventory': (52, 181, 1304),
+        'internal/jsondoc': (5, 0, 532),
+        'internal/liveness': (391, 76, 19247),
+        'internal/load': (586, 129, 10337),
+        'internal/matrix': (29, 10, 1375),
+        'internal/memory': (136, 63, 1224),
+        'internal/resolve': (0, 65, 693),
+        'internal/roots': (43, 199, 1284),
+        'internal/run': (98, 172, 3452),
+        'internal/scope': (40, 2, 972),
+        'internal/suppress': (47, 3, 3023),
     },
 }
-# Longest-first over the fixture: 2 shards project 256 and 294 min, 3 project
-# 193, 174 and 193. Run 42520923530 spent 163 min in internal/exempt alone.
-FIXTURE_SHARDS = 3
+# Never measured, every package is priced at PRIOR_ERROR times its probe, so the three
+# slowest each pass a shard alone and the rest fill two more. Run 42520923530 spent 163
+# min in internal/exempt alone.
+FIXTURE_SHARDS = 5
 # Wall minutes on 4 workers of the slow packages run 42520923530's attempt 1
 # finished, from its log. internal/conventions (1.2 min) is left out: 4 hangs at
 # the 60 s floor are most of it, and the projection has no term for hangs.
-RUN_42520923530_MINUTES = {'internal/exempt': 162.9, 'internal/findings': 96.9,
-                           'cmd/deadset-go': 32.0, 'internal/liveness': 23.4}
+RUN_42520923530_MINUTES = {
+    'internal/exempt': 162.9,
+    'internal/findings': 96.9,
+    'cmd/deadset-go': 32.0,
+    'internal/liveness': 23.4,
+}
 CI_CAP_MINUTES = 350
-SHARD_TARGET_MINUTES = 240
 FIXTURE_SHA = '8ea1867888623f3fab42af9c0404571c0ae8e851'
+
+
+def dry_file(pkg: str, runnable: int, uncovered: int) -> dict:
+    """A dry run's entry of PKG's x.go: RUNNABLE mutants on lines 1 up, then UNCOVERED ones."""
+    return {
+        'file_name': 'x.go' if pkg == '.' else f'{pkg}/x.go',
+        'mutations': [
+            {'type': 'ARITHMETIC_BASE', 'status': status, 'line': i + 1, 'column': 1}
+            for i, status in enumerate(['RUNNABLE'] * runnable + ['NOT COVERED'] * uncovered)
+        ],
+    }
+
+
+def keys(n: int, start: int = 1) -> list[str]:
+    """dry_file's first N runnable mutant keys from line START, as a cost record holds them."""
+    return [f'{i}:1 ARITHMETIC_BASE' for i in range(start, start + n)]
 
 
 def write_plan_dir(d: Path, module: str, env: dict | None, packages: dict | None) -> None:
@@ -1432,16 +2433,19 @@ def write_plan_dir(d: Path, module: str, env: dict | None, packages: dict | None
     lines = {**env, 'sized': env.get('sized', '1')}
     (d / 'plan.env').write_text(''.join(f'{k}={v}\n' for k, v in lines.items() if v is not None))
     if env.get('mode') != 'per-package':
+        if packages is not None:
+            files = [
+                dry_file(pkg, runnable, uncovered)
+                for pkg, (runnable, uncovered, _) in packages.items()
+            ]
+            (d / 'dry-run.json').write_text(json.dumps({'go_module': module, 'files': files}))
         return
     if packages is None:
         (d / 'mutant-ms.tsv').write_text(f'{module}\t900\n')
         return
     files, times = [], []
     for pkg, (runnable, uncovered, mutant_ms) in packages.items():
-        files.append({'file_name': 'x.go' if pkg == '.' else f'{pkg}/x.go', 'mutations': [
-            {'type': 'ARITHMETIC_BASE', 'status': status, 'line': i + 1, 'column': 1}
-            for i, status in enumerate(['RUNNABLE'] * runnable + ['NOT COVERED'] * uncovered)
-        ]})
+        files.append(dry_file(pkg, runnable, uncovered))
         if mutant_ms is not None:
             times.append(f'{module if pkg == "." else f"{module}/{pkg}"}\t{mutant_ms}\n')
     (d / 'dry-run.json').write_text(json.dumps({'go_module': module, 'files': files}))
@@ -1449,396 +2453,1431 @@ def write_plan_dir(d: Path, module: str, env: dict | None, packages: dict | None
 
 
 def run_shard(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, str(SHARD), *args], capture_output=True, text=True,
-                          check=False)
+    return subprocess.run(
+        [sys.executable, str(SHARD), *args], capture_output=True, text=True, check=False
+    )
 
 
-def plan_repo(tmp: Path, repo: str, modules: dict[str, tuple[str, dict | None, dict | None]],
-              target: int = SHARD_TARGET_MINUTES) -> tuple[subprocess.CompletedProcess, dict | None]:
-    """Run `gremlins-shard.py plan` over fixture plan dirs; modules: {dir: (go module, env, packages)}.
+def plan_repo(
+    tmp: Path,
+    repo: str,
+    modules: dict[str, tuple[str, dict | None, dict | None]],
+) -> tuple[subprocess.CompletedProcess, dict | None]:
+    """Size fixture plan dirs with `gremlins-shard.py plan`, then plan the run with `matrix`.
 
-    The plan comes back only when the planner exits 0; written_plan reads one it wrote anyway.
+    modules: {dir: (go module, env, packages)}. The run plan comes back only when
+    the sizing exits 0; written_plan reads one planned from a failed sizing anyway,
+    as the shard job does, and sizing_of the plan job's own output.
     """
     args = []
     for dir_, (module, env, packages) in modules.items():
         d = tmp / f'plan-{repo}' / dir_.replace('/', '_')
         write_plan_dir(d, module, env, packages)
         args += ['--module', f'{dir_}={d}']
-    out = tmp / f'plan-{repo}.json'
-    proc = run_shard('plan', '--repo', repo, '--sha', FIXTURE_SHA, '--target-minutes', str(target),
-                     *args, '--out', str(out))
-    return proc, json.loads(out.read_text()) if proc.returncode == 0 and out.exists() else None
+    plans = tmp / f'plans-{repo}' / f'shard-plan-{repo}'
+    plans.mkdir(parents=True)
+    proc = run_shard(
+        'plan', '--repo', repo, '--sha', FIXTURE_SHA, *args, '--out', str(plans / 'plan.json')
+    )
+    if (plans / 'plan.json').exists():
+        planned = run_shard(
+            'matrix',
+            '--repo',
+            repo,
+            '--plan',
+            str(plans / 'plan.json'),
+            '--attempts',
+            '1',
+            '--out-plan',
+            str(tmp / f'run-plans-{repo}' / f'{repo}.json'),
+        )
+        if planned.returncode != 0:
+            raise SystemExit(f'matrix failed: {planned.stderr[-400:]}')
+        proc.stderr += planned.stderr
+    plan = written_plan(tmp, repo)
+    return proc, plan if proc.returncode == 0 else None
 
 
 def written_plan(tmp: Path, repo: str) -> dict | None:
-    out = tmp / f'plan-{repo}.json'
+    out = tmp / f'run-plans-{repo}' / f'{repo}.json'
     return json.loads(out.read_text()) if out.exists() else None
 
 
+def sizing_of(tmp: Path, repo: str) -> dict:
+    return json.loads((tmp / f'plans-{repo}' / f'shard-plan-{repo}' / 'plan.json').read_text())
+
+
+def by_package(module: dict) -> dict[str, dict]:
+    """A one-file-per-package fixture module's files, keyed by package dir."""
+    return {f.rsplit('/', 1)[0] if '/' in f else '.': e for f, e in module['files'].items()}
+
+
 def fixture_work_secs(packages: dict) -> dict[str, float]:
-    """Each package's projected worker-seconds: RUNNABLE x its mutant time."""
+    """Each package's projected worker-seconds, never measured: RUNNABLE x its mutant time x PRIOR_ERROR."""
     dearest = max((c for *_, c in packages.values() if c is not None), default=0)
-    return {pkg: runnable * (ms if ms is not None else dearest) / 1000
-            for pkg, (runnable, _, ms) in packages.items()}
+    return {
+        pkg: runnable * (ms if ms is not None else dearest) / 1000 * mutation_cost.PRIOR_ERROR
+        for pkg, (runnable, _, ms) in packages.items()
+    }
 
 
 def test_shard_projects_deadset_go_past_one_job(tmp: Path) -> None:
     check('shard: scripts/gremlins-shard.py exists', ok=SHARD.exists())
     env, packages = DEADSET_GO['env'], DEADSET_GO['packages']
     proc, plan = plan_repo(tmp, 'deadset-go', {'.': (DEADSET_GO['module'], env, packages)})
-    check('shard projection: plan succeeds', ok=plan is not None,
-          detail=f'rc={proc.returncode} {proc.stderr[-400:]}')
+    check(
+        'shard projection: plan succeeds',
+        ok=plan is not None,
+        detail=f'rc={proc.returncode} {proc.stderr[-400:]}',
+    )
     if plan is None:
         return
     work = fixture_work_secs(packages)
     setup = float(env['setup_secs']) + float(env['suite_secs'])
     one_job = (setup + sum(work.values()) / int(env['workers'])) / 60
-    check('shard projection: one job is setup + suite + sum(RUNNABLE x mutant time) / workers',
-          ok=abs(plan['one_job_minutes'] - one_job) < 0.1,
-          detail=f'{plan["one_job_minutes"]} vs {one_job:.1f}')
-    check('shard projection: one job would pass the cap run 42520923530 was cancelled at',
-          ok=plan['one_job_minutes'] > CI_CAP_MINUTES, detail=str(plan['one_job_minutes']))
-    got = plan['modules']['.']['packages']
+    check(
+        'shard projection: one job is setup + suite + sum(RUNNABLE x mutant time x PRIOR_ERROR) / workers',
+        ok=abs(plan['one_job_minutes'] - one_job) < 0.1,
+        detail=f'{plan["one_job_minutes"]} vs {one_job:.1f}',
+    )
+    check(
+        'shard projection: one job would pass the cap run 42520923530 was cancelled at',
+        ok=plan['one_job_minutes'] > CI_CAP_MINUTES,
+        detail=str(plan['one_job_minutes']),
+    )
+    got = by_package(plan['modules']['.'])
     with_mutants = {p for p, (r, n, *_) in packages.items() if r + n}
-    check('shard projection: every package with a mutant is assigned, none twice',
-          ok=set(got) == with_mutants and all(isinstance(v['shard'], int) for v in got.values()),
-          detail=str(sorted(set(got) ^ with_mutants)))
+    check(
+        'shard projection: every package with a mutant is assigned, none twice',
+        ok=set(got) == with_mutants and all(isinstance(v['shard'], int) for v in got.values()),
+        detail=str(sorted(set(got) ^ with_mutants)),
+    )
     k = plan['shards']
-    check(f'shard projection: deadset-go needs {FIXTURE_SHARDS} shards',
-          ok=k == FIXTURE_SHARDS, detail=str(k))
+    check(
+        f'shard projection: deadset-go needs {FIXTURE_SHARDS} shards',
+        ok=k == FIXTURE_SHARDS,
+        detail=str(k),
+    )
     projected = {p: e['work_secs'] / 60 for p, e in got.items()}
-    check('shard projection: no package projects under its wall time in run 42520923530',
-          ok=all(projected[p] >= observed for p, observed in RUN_42520923530_MINUTES.items()),
-          detail=str({p: round(projected[p], 1) for p in RUN_42520923530_MINUTES}))
-    check('shard projection: every shard fits the target',
-          ok=len(plan['projected_minutes']) == k
-          and all(m <= SHARD_TARGET_MINUTES for m in plan['projected_minutes']),
-          detail=str(plan['projected_minutes']))
+    check(
+        'shard projection: no package projects under its wall time in run 42520923530',
+        ok=all(projected[p] >= observed for p, observed in RUN_42520923530_MINUTES.items()),
+        detail=str({p: round(projected[p], 1) for p in RUN_42520923530_MINUTES}),
+    )
+    check(
+        'shard projection: every shard ends by the top that runner speed and the job limit allow, '
+        'but one running a package alone, which no count shortens',
+        ok=len(plan['projected_minutes']) == k
+        and plan['top_minutes'] == round(mutation_cost.TOP_SECS / 60, 1)
+        and all(
+            m <= plan['top_minutes'] or sum(e['shard'] == n for e in got.values()) == 1
+            for n, m in enumerate(plan['projected_minutes'], start=1)
+        ),
+        detail=str(plan['projected_minutes']),
+    )
     loads = [0.0] * k
     for pkg, entry in got.items():
         loads[entry['shard'] - 1] += work[pkg] / int(env['workers'])
-    check('shard projection: each shard projects its own packages plus one setup',
-          ok=all(abs((setup + w) / 60 - m) < 0.1 for w, m in zip(loads, plan['projected_minutes'], strict=False)),
-          detail=f'{[round((setup + w) / 60, 1) for w in loads]} vs {plan["projected_minutes"]}')
-    check('shard projection: the two slowest packages land in different shards',
-          ok=got['internal/exempt']['shard'] != got['internal/findings']['shard'])
+    check(
+        'shard projection: each shard projects its own packages plus one setup',
+        ok=all(
+            abs((setup + w) / 60 - m) < 0.1
+            for w, m in zip(loads, plan['projected_minutes'], strict=False)
+        ),
+        detail=f'{[round((setup + w) / 60, 1) for w in loads]} vs {plan["projected_minutes"]}',
+    )
+    check(
+        'shard projection: the two slowest packages land in different shards',
+        ok=got['internal/exempt']['shard'] != got['internal/findings']['shard'],
+    )
+    items = [
+        mutation_cost.Item('.', p, w / int(env['workers']))
+        for p, w in work.items()
+        if sum(packages[p][:2])
+    ]
+    fewer = mutation_cost.pack(items, k - 1, {'.': setup})
+    check(
+        "shard projection: one shard fewer would end past the band's top",
+        ok=max(b.load for b in fewer) > plan['top_minutes'] * 60,
+        detail=str([round(b.load / 60, 1) for b in fewer]),
+    )
+
+
+RECORDED_RUN = HERE / 'testdata' / 'mutation-cost' / 'deadset-go-42584241747.json.gz'
+RECORDED_COMPLETION = re.compile(r'^\s*(?:KILLED|LIVED|TIMED OUT|NOT VIABLE) \S+ at (\S+):\d+:\d+$')
+
+
+def recorded_file_secs(times: str) -> dict[str, float]:
+    """Worker-seconds per file of one recorded shard, independently of mutation_cost.py.
+
+    Each completion line carries the wall time since the line before it (the
+    end of the coverage pass first), times the 4 workers.
+    """
+    out: dict[str, float] = {}
+    prev = None
+    for row in times.splitlines():
+        stamp, _, line = row.partition('\t')
+        if stamp.startswith('#'):
+            continue
+        if prev is None:
+            if 'Gathering coverage... done' in line:
+                prev = float(stamp)
+            continue
+        if m := RECORDED_COMPLETION.match(line):
+            out[m.group(1)] = out.get(m.group(1), 0.0) + (float(stamp) - prev) * 4
+            prev = float(stamp)
+    return out
+
+
+def test_shard_plans_a_recorded_run_from_its_costs(tmp: Path) -> None:
+    """Run 42584241747 (deadset-go, 4 package shards x 3 attempts) priced from its own costs.
+
+    The fixture holds that run's plan inputs (its per-package probe and the dry
+    run's per-file mutants, from attempt 1's results) and, per attempt and
+    shard, every mutant completion its job log timestamped, as
+    gremlins-run.sh's stamp_lines records them.
+    """
+    import gzip
+
+    fx = json.loads(gzip.open(RECORDED_RUN, 'rt').read())
+    d = tmp / 'plan-dir'
+    d.mkdir()
+    (d / 'plan.env').write_text(''.join(f'{k}={v}\n' for k, v in fx['env'].items()) + 'sized=1\n')
+    (d / 'dry-run.json').write_text(json.dumps(fx['dry_run']))
+    (d / 'mutant-ms.tsv').write_text(''.join(f'{k}\t{v}\n' for k, v in fx['mutant_ms'].items()))
+    plans = tmp / 'plans' / 'shard-plan-deadset-go'
+    plans.mkdir(parents=True)
+    target = tmp / 'target'
+    sources = {f['file_name']: f'package x // {f["file_name"]}\n' for f in fx['dry_run']['files']}
+    commit_fixture(
+        target, {**sources, 'go.mod': 'module x\n', 'internal/load/x_test.go': 'package x\n'}
+    )
+
+    def size(out: Path) -> subprocess.CompletedProcess:
+        return run_shard(
+            'plan',
+            *('--repo', 'deadset-go', '--sha', fx['sha'], '--module', f'.={d}'),
+            *('--target', str(target), '--out', str(out)),
+        )
+
+    proc = size(plans / 'plan.json')
+    blobs = (
+        json.loads((plans / 'plan.json').read_text())['modules']['.'].get('blobs', {})
+        if proc.returncode == 0
+        else {}
+    )
+    check(
+        "recorded run: the plan job sizes the module and records each sized file's git blob",
+        ok=proc.returncode == 0
+        and sorted(blobs) == sorted(sources)
+        and all(mutation_cost.GIT_BLOB.fullmatch(b) for b in blobs.values()),
+        detail=proc.stderr[-400:] + str(sorted(set(blobs) ^ set(sources))[:5]),
+    )
+    art = tmp / 'artifacts'
+    measured: dict[str, dict[str, float]] = {}
+    for key, times in sorted(fx['times'].items()):
+        attempt, shard = key[1], key[3]
+        (tmp / f'{key}.times').write_text(times)
+        a = art / f'gremlins-deadset-go-{attempt}-shard{shard}'
+        a.mkdir(parents=True)
+        (a / 'meta.json').write_text(
+            json.dumps({'repo': 'deadset-go', 'attempt': attempt, 'shard': shard, 'shards': '4'})
+        )
+        proc = run_shard(
+            'costs',
+            '--module',
+            f'.={tmp / f"{key}.times"}',
+            '--out',
+            str(a / 'gremlins-costs.json'),
+        )
+        check(
+            f'recorded run: shard {key} records its costs',
+            ok=proc.returncode == 0,
+            detail=proc.stderr[-300:],
+        )
+        measured.setdefault(attempt, {}).update(recorded_file_secs(times))
+    history = tmp / 'history'
+    proc = run_shard(
+        'history',
+        '--repo',
+        'deadset-go',
+        '--artifacts-dir',
+        str(art),
+        '--plan',
+        str(plans / 'plan.json'),
+        '--out',
+        str(history / 'deadset-go.json'),
+    )
+    check(
+        'recorded run: the aggregate job folds every attempt into one history',
+        ok=proc.returncode == 0 and (history / 'deadset-go.json').exists(),
+        detail=proc.stderr[-300:],
+    )
+    plan_path = tmp / 'run-plans' / 'plan.json'
+    proc = run_shard(
+        'matrix',
+        '--repo',
+        'deadset-go',
+        '--plan',
+        str(plans / 'plan.json'),
+        '--attempts',
+        '3',
+        '--history',
+        str(history / 'deadset-go.json'),
+        '--out-plan',
+        str(plan_path),
+    )
+    check(
+        'recorded run: the shard job writes the run plan',
+        ok=proc.returncode == 0 and plan_path.exists(),
+        detail=proc.stderr[-400:],
+    )
+    if not plan_path.exists():
+        return
+    plan = json.loads(plan_path.read_text())
+    files = plan['modules']['.']['files']
+    dry = {f['file_name'] for f in fx['dry_run']['files']}
+    check(
+        'recorded run: every file of the dry run is in exactly one shard',
+        ok=set(files) == dry
+        and all(1 <= f.get('shard', 0) <= plan['shards'] for f in files.values()),
+        detail=str(sorted(set(files) ^ dry)[:5]),
+    )
+    exempt = {f['shard'] for p, f in files.items() if p.startswith('internal/exempt/')}
+    check(
+        'recorded run: internal/exempt, over the target alone, is split by file',
+        ok=len(exempt) > 1,
+        detail=str(exempt),
+    )
+    by_pkg: dict[str, float] = {}
+    for p, f in files.items():
+        by_pkg[p.rsplit('/', 1)[0]] = by_pkg.get(p.rsplit('/', 1)[0], 0.0) + f['work_secs']
+    probe = {
+        p: n * fx['mutant_ms'][f'{fx["go_module"]}/{p}'] / 1000 / 4
+        for p, n in (('cmd/deadset-go', 228), ('internal/load', 586))
+    }
+    check(
+        'recorded run: history prices cmd/deadset-go under its probe and internal/load over it',
+        ok=by_pkg['cmd/deadset-go'] < probe['cmd/deadset-go'] / 2
+        and by_pkg['internal/load'] > probe['internal/load'] * 1.4,
+        detail=f'{ {p: round(by_pkg[p]) for p in probe} } vs probe { {p: round(v) for p, v in probe.items()} }',
+    )
+    setup = json.loads((history / 'deadset-go.json').read_text())['modules']['.']['setup_secs']
+    attempts = []
+    for _, secs in sorted(measured.items()):
+        loads = [setup] * plan['shards']
+        for p, f in files.items():
+            loads[f['shard'] - 1] += secs.get(p, 0.0) / 4
+        attempts.append([load / 60 for load in loads])
+    faults = mutation_cost.bar_faults(plan['projected_minutes'], attempts)
+    check(
+        f"recorded run: the run ends within {mutation_cost.BAND:.0%} of its projection, no shard's mean "
+        f'more than {mutation_cost.BAND:.0%} over, and every attempt by {mutation_cost.SAFE_JOB_MINUTES} min',
+        ok=not faults,
+        detail=f'{faults} {[[round(x, 1) for x in a] for a in attempts]} vs {plan["projected_minutes"]}',
+    )
+    edited = 'cmd/deadset-go/analyze.go'
+    commit_fixture(target, {edited: 'package x // edited\n'})
+    procs = [size(plans / 'edited.json')]
+    procs.append(
+        run_shard(
+            'matrix',
+            *('--repo', 'deadset-go', '--plan', str(plans / 'edited.json'), '--attempts', '3'),
+            *(
+                '--history',
+                str(history / 'deadset-go.json'),
+                '--out-plan',
+                str(tmp / 'edited.json'),
+            ),
+        )
+    )
+    procs.append(
+        run_shard(
+            'matrix',
+            *('--repo', 'deadset-go', '--plan', str(plans / 'edited.json'), '--attempts', '3'),
+            *('--out-plan', str(tmp / 'first.json')),
+        )
+    )
+    check(
+        'recorded run: the edited tree plans, and its matrix plans with and without history',
+        ok=all(p.returncode == 0 for p in procs),
+        detail=' | '.join(f'rc={p.returncode} {p.stderr[-200:]}' for p in procs),
+    )
+    again = json.loads((tmp / 'edited.json').read_text())['modules']['.']['files']
+    sized = json.loads((plans / 'edited.json').read_text())['modules']['.']['files'][edited]
+    check(
+        'recorded run: a file whose blob changed since its measure is priced at its prior times '
+        'PRIOR_ERROR, the rest from history',
+        ok=again[edited]['cost'] == 'prior'
+        and again[edited]['work_secs']
+        == round(sized['prior_secs'] * mutation_cost.PRIOR_ERROR / 4, 1)
+        and {f['cost'] for p, f in again.items() if p != edited}
+        == {f['cost'] for f in files.values()},
+        detail=f'{again.get(edited)} {sized}',
+    )
+    first = json.loads((tmp / 'first.json').read_text())['modules']['.']['files']
+    sizes = json.loads((plans / 'edited.json').read_text())['modules']['.']['files']
+    for label, priced in (('no history', first), ('its own history, one file edited', again)):
+        off = [
+            p
+            for p, f in priced.items()
+            if f['cost'] == 'prior'
+            and abs(f['work_secs'] - sizes[p]['prior_secs'] * mutation_cost.PRIOR_ERROR / 4) > 0.05
+        ]
+        check(
+            f'recorded run, {label}: every file priced from its prior costs its prior times '
+            'PRIOR_ERROR, never a rate taken from other files',
+            ok=not off and any(f['cost'] == 'prior' for f in priced.values()),
+            detail=str(off[:5]),
+        )
+    old = [setup] * 4
+    for p in files:
+        old[fx['old_plan_shards'][p.rsplit('/', 1)[0]] - 1] += measured['2'].get(p, 0.0) / 4
+    check(
+        "recorded run: the run's own package plan, under the same measure, overshot its 240-min target by 15%",
+        ok=max(old) > 240 * 60 * 1.15,
+        detail=str([round(x / 60, 1) for x in old]),
+    )
+
+
+def test_runner_stamps_each_output_line(tmp: Path) -> None:
+    src = shell_function('stamp_lines')
+    check('runner stamps: stamp_lines extracted from gremlins-run.sh', ok=bool(src))
+    text = RUNNER.read_text()
+    check(
+        'runner stamps: the mutation run writes its workers and launch, then pipes through stamp_lines',
+        ok=re.search(
+            r"^  printf '#workers\\t%s\\n#launch\\t%s\\n' \"\$\{workers\}\" "
+            r'"\$\(\(EPOCHSECONDS - SECONDS\)\)" >"\$\{OUT\}\.times"\n'
+            r'  "\$\{limit\[@\]\}" gremlins unleash .*\\\n'
+            r'    .*--output "\$\{OUT\}" \. \| stamp_lines "\$\{OUT\}\.times"$',
+            text,
+            re.MULTILINE,
+        )
+        is not None
+        and re.search(r'^unleash_mutants$', text, re.MULTILINE) is not None,
+    )
+    if not src:
+        return
+    rec = tmp / 'out.times'
+    rec.write_text('#workers\t4\n')
+    proc = subprocess.run(
+        [
+            'bash',
+            '--norc',
+            '--noprofile',
+            '-c',
+            f'set -euo pipefail\n{src}\nprintf "a b\\n  KILLED x\\nlast" | stamp_lines "$1"',
+            'bash',
+            str(rec),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    rows = rec.read_text().splitlines()
+    check(
+        'runner stamps: every line passes through unchanged, the unterminated last one too',
+        ok=proc.returncode == 0 and proc.stdout == 'a b\n  KILLED x\nlast\n',
+        detail=repr(proc.stdout),
+    )
+    check(
+        'runner stamps: each line is appended behind its epoch time, after what the file held',
+        ok=rows[0] == '#workers\t4'
+        and [r.split('\t', 1)[1] for r in rows[1:]] == ['a b', '  KILLED x', 'last']
+        and all(re.fullmatch(r'\d{10}\.\d+', r.split('\t', 1)[0]) for r in rows[1:]),
+        detail=str(rows),
+    )
+    rec.write_text('')
+    proc = subprocess.run(
+        [
+            'bash',
+            '--norc',
+            '--noprofile',
+            '-c',
+            f'set -euo pipefail\n{src}\n{{ echo x; exit 7; }} | stamp_lines "$1"',
+            'bash',
+            str(rec),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    check(
+        "runner stamps: under pipefail the run keeps gremlins' exit status",
+        ok=proc.returncode == 7,
+        detail=str(proc.returncode),
+    )
+
+
+REPLAY_RUN = HERE / 'testdata' / 'mutation-cost' / 'deadset-go-43328219246.json.gz'
+
+
+def test_shard_replays_a_recorded_run_per_mutant(tmp: Path) -> None:
+    """Run 43328219246 (deadset-go, 5 shards x 3 attempts) replayed per mutant.
+
+    The fixture holds that run's sizing, each file's runnable mutant keys (every
+    one completed in each attempt) and, per attempt and shard, each completion
+    its job log timestamped, with the launch set so the record's setup is the
+    one that shard's cost artifact measured.
+    """
+    import contextlib
+    import gzip
+    import io
+
     shard = load_script('gremlins_shard', SHARD)
-    items = [shard.Item('.', p, w / int(env['workers'])) for p, w in work.items()
-             if sum(packages[p][:2])]
-    fewer = shard.pack(items, k - 1, {'.': setup})
-    check('shard projection: one shard fewer would miss the target',
-          ok=max(b.load for b in fewer) / 60 > SHARD_TARGET_MINUTES,
-          detail=str([round(b.load / 60, 1) for b in fewer]))
+    fx = json.loads(gzip.open(REPLAY_RUN, 'rt').read())
+    sizing = fx['sizing']
+    files = sizing['modules']['.']['files']
+    art = tmp / 'artifacts'
+    per: dict[str, dict[str, dict[str, list[float]]]] = {}
+    setups = []
+    for key, times in sorted(fx['times'].items()):
+        attempt, n = key[1], key[3]
+        (tmp / f'{key}.times').write_text(times)
+        rec = shard.module_costs(tmp / f'{key}.times')
+        setups.append(rec['setup_secs'])
+        for path, secs in rec['files'].items():
+            per.setdefault(attempt, {}).setdefault(path, {}).update(secs)
+        a = art / f'gremlins-deadset-go-{attempt}-shard{n}'
+        a.mkdir(parents=True)
+        (a / 'meta.json').write_text(
+            json.dumps({'repo': 'deadset-go', 'attempt': attempt, 'shard': n, 'shards': '5'})
+        )
+        (a / 'gremlins-costs.json').write_text(json.dumps({'modules': {'.': rec}}))
+    plan_path = tmp / 'plan.json'
+    plan_path.write_text(json.dumps(sizing))
+    history = shard.history('deadset-go', art, None, plan_path)
+    measured = history['modules']['.']['files']
+    check(
+        'replay: every runnable mutant has one measure, its mean over the three attempts',
+        ok=all(
+            sum(len(v) for v in measured.get(p, {}).get('secs', {}).values()) == f['runnable']
+            for p, f in files.items()
+        )
+        and history['slowdown'] is not None,
+        detail=str([p for p, f in files.items() if p not in measured and f['runnable']][:5]),
+    )
+
+    def replay(plan: dict) -> list[list[float]]:
+        """Each attempt's minutes per shard of PLAN from what the attempt measured of its mutants."""
+        setup = sum(setups) / len(setups)
+        out = []
+        for attempt in sorted(per):
+            jobs = [setup] * plan['shards']
+            for p, f in plan['modules']['.']['files'].items():
+                secs = sum(v for vs in per[attempt].get(p, {}).values() for v in vs)
+                jobs[f['shard'] - 1] += secs / sizing['modules']['.']['workers']
+            out.append([j / 60 for j in jobs])
+        return out
+
+    bound = mutation_cost.BOUND_SECS / 60
+    for label, hist in (('its own history', history), ('no history', None)):
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan, _ = shard.assign(sizing, hist)
+        attempts = replay(plan)
+        slowest = max(max(a) for a in attempts)
+        held: dict[int, list[str]] = {}
+        for p, f in plan['modules']['.']['files'].items():
+            held.setdefault(f['shard'], []).append(f'.:{p}')
+        # A shard projected past the bound runs one estimated file alone under its job's deadline.
+        over = [
+            n
+            for n, m in enumerate(plan['projected_minutes'], start=1)
+            if m is not None and m > bound
+        ]
+        check(
+            f'replay: planned from {label}, every job of every attempt ends by '
+            f'{mutation_cost.SAFE_JOB_MINUTES} min, every shard holds a file and only a lone '
+            'estimate passes the bound',
+            ok=slowest <= mutation_cost.SAFE_JOB_MINUTES
+            and shard.valid_plan(plan) == ''
+            and all(len(held.get(n, [])) == 1 and held[n][0] in plan['deadline'] for n in over)
+            and (hist is None or not over),
+            detail=f'{plan["shards"]} shards, slowest {slowest:.1f} {plan["projected_minutes"]}',
+        )
+        if hist is not None:
+            costs = {f['cost'] for f in plan['modules']['.']['files'].values()}
+            faults = mutation_cost.bar_faults(plan['projected_minutes'], attempts)
+            check(
+                'replay: priced from its own measures, the plan meets the bar on its own attempts',
+                ok=costs == {'measured'} and faults == [],
+                detail=f'{costs} {faults}',
+            )
+
+
+def test_runner_stops_at_the_run_deadline_with_its_costs_on_record(tmp: Path) -> None:
+    srcs = [shell_function(fn) for fn in ('stamp_lines', 'unleash_mutants')]
+    check('runner deadline: unleash_mutants extracted from gremlins-run.sh', ok=all(srcs))
+    if not all(srcs):
+        return
+    bin_dir = tmp / 'bin'
+    bin_dir.mkdir()
+    (bin_dir / 'gremlins').write_text(
+        '#!/bin/bash\necho "Gathering coverage... done in 1s"\n'
+        'echo "        KILLED ARITHMETIC_BASE at a.go:3:4"\n'
+        'echo "         LIVED ARITHMETIC_BASE at a.go:5:6"\n'
+        'exec sleep "${STUB_SLEEP:-0}"\n'
+    )
+    (bin_dir / 'gremlins').chmod(0o755)
+    out = tmp / 'out.json'
+
+    def run(deadline: str, sleep: str) -> tuple[subprocess.CompletedProcess, float]:
+        out.with_name('out.json.times').unlink(missing_ok=True)
+        started = time.monotonic()
+        proc = subprocess.run(
+            [
+                'bash',
+                '--norc',
+                '--noprofile',
+                '-c',
+                f'set -euo pipefail\n{srcs[0]}\n{srcs[1]}\nworkers=2 coefficient=3\nmode_flags=()\nunleash_mutants',
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                **os.environ,
+                'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+                'OUT': str(out),
+                'RUN_DEADLINE': deadline,
+                'STUB_SLEEP': sleep,
+            },
+        )
+        return proc, time.monotonic() - started
+
+    proc, took = run(str(int(time.time()) + 4), '120')
+    check(
+        'runner deadline: a pass still running at the deadline is stopped there with exit 124',
+        ok=proc.returncode == 124 and took < 30,
+        detail=f'rc={proc.returncode} {took:.1f}s {proc.stderr[-200:]}',
+    )
+    costs = tmp / 'costs.json'
+    rec = run_shard('costs', '--module', f'.={out}.times', '--out', str(costs))
+    doc = json.loads(costs.read_text()) if rec.returncode == 0 else {}
+    check(
+        'runner deadline: the stopped pass leaves a cost record of the mutants it finished',
+        ok=sorted(doc.get('modules', {}).get('.', {}).get('files', {}).get('a.go', {}))
+        == ['3:4 ARITHMETIC_BASE', '5:6 ARITHMETIC_BASE'],
+        detail=f'{doc} {rec.stderr[-200:]}',
+    )
+    proc, _ = run(str(int(time.time()) - 1), '0')
+    check(
+        'runner deadline: a deadline already passed runs no pass and exits 124',
+        ok=proc.returncode == 124
+        and 'run deadline passed' in proc.stdout
+        and not out.with_name('out.json.times').exists(),
+        detail=f'rc={proc.returncode} {proc.stdout[-200:]}',
+    )
+    proc, _ = run('', '0')
+    check(
+        'runner deadline: with no deadline the pass runs to its end',
+        ok=proc.returncode == 0 and 'LIVED' in proc.stdout,
+        detail=f'rc={proc.returncode} {proc.stderr[-200:]}',
+    )
+    container = CONTAINER.read_text()
+    check(
+        'runner deadline: the container hands RUN_DEADLINE to a run, never to a plan',
+        ok='[ -z "${RUN_DEADLINE:-}" ] || role_env+=(-e RUN_DEADLINE="${RUN_DEADLINE}")'
+        in container,
+    )
+
+
+def at(secs: dict, blob: str = 'a' * 40) -> dict:
+    """A cost history's entry of one file: its measures per mutant key at BLOB."""
+    return {'blob': blob, 'secs': secs}
+
+
+def test_shard_history_carries_each_unmeasured_file_from_the_last_run(tmp: Path) -> None:
+    art = tmp / 'artifacts'
+    for n, doc in (
+        (
+            1,
+            {
+                'modules': {
+                    '.': {
+                        'workers': 4,
+                        'setup_secs': 100.0,
+                        'files': {'a.go': {'1:1 X': [8.0]}},
+                    }
+                }
+            },
+        ),
+        (2, {'modules': [1]}),
+        (3, {'modules': {'.': 'junk'}}),
+    ):
+        d = art / f'gremlins-r-1-shard{n}'
+        d.mkdir(parents=True)
+        (d / 'meta.json').write_text(json.dumps({'repo': 'r', 'attempt': '1', 'shard': n}))
+        (d / 'gremlins-costs.json').write_text(json.dumps(doc))
+    prev = tmp / 'prev.json'
+    prev.write_text(
+        json.dumps(
+            {
+                'repo': 'r',
+                'modules': {
+                    '.': {
+                        'files': {
+                            'a.go': at({'1:1 X': [50.0], '2:1 X': [5.0]}),
+                            'b.go': at({'1:1 X': [30.0]}),
+                            'gone.go': at({'1:1 X': [1.0]}),
+                            'edited.go': at({'1:1 X': [1.0]}),
+                        },
+                        'setup_secs': 90.0,
+                    },
+                    'tools': {'files': {'t.go': at({'1:1 X': [4.0]})}, 'setup_secs': 20.0},
+                    'removed': {'files': {'r.go': at({'1:1 X': [4.0]})}, 'setup_secs': 20.0},
+                },
+            }
+        )
+    )
+    plan = tmp / 'plan.json'
+    plan.write_text(
+        json.dumps(
+            {
+                'repo': 'r',
+                'modules': {
+                    '.': {
+                        'mode': 'per-package',
+                        'files': {'a.go': {}, 'b.go': {}, 'c.go': {}, 'edited.go': {}},
+                        'blobs': {
+                            **dict.fromkeys(('a.go', 'b.go', 'c.go'), 'a' * 40),
+                            'edited.go': 'b' * 40,
+                        },
+                    },
+                    'tools': {'mode': 'integration', 'files': {}, 'blobs': {'t.go': 'a' * 40}},
+                },
+            }
+        )
+    )
+    out = tmp / 'h.json'
+    proc = run_shard(
+        'history',
+        '--repo',
+        'r',
+        '--artifacts-dir',
+        str(art),
+        '--previous',
+        str(prev),
+        '--plan',
+        str(plan),
+        '--out',
+        str(out),
+    )
+    doc = json.loads(out.read_text()) if proc.returncode == 0 and out.exists() else {}
+    check(
+        'shard history: a record whose modules are not an object is skipped, not a crash',
+        ok=proc.returncode == 0,
+        detail=proc.stderr[-300:],
+    )
+    check(
+        "shard history: this run's measure of a mutant wins, an unmeasured mutant keeps its last "
+        'at its blob, an edited or deleted file goes',
+        ok=doc.get('modules', {}).get('.')
+        == {
+            'files': {'a.go': at({'1:1 X': [8.0], '2:1 X': [5.0]}), 'b.go': at({'1:1 X': [30.0]})},
+            'setup_secs': 100.0,
+        },
+        detail=str(doc),
+    )
+    check(
+        'shard history: a module this run never measured keeps its history, a removed one goes',
+        ok=doc.get('modules', {}).get('tools')
+        == {'files': {'t.go': at({'1:1 X': [4.0]})}, 'setup_secs': 20.0}
+        and 'removed' not in doc.get('modules', {}),
+        detail=str(doc),
+    )
+    proc = run_shard(
+        'history',
+        '--repo',
+        'r',
+        '--artifacts-dir',
+        str(art),
+        '--previous',
+        str(tmp / 'none'),
+        '--plan',
+        str(tmp / 'none'),
+        '--out',
+        str(out),
+    )
+    doc = json.loads(out.read_text()) if proc.returncode == 0 else {}
+    check(
+        "shard history: with no previous history or plan, no file's version is known, so only "
+        'the setup is kept',
+        ok=doc.get('modules', {}).get('.') == {'files': {}, 'setup_secs': 100.0},
+        detail=f'{doc} {proc.stderr[-200:]}',
+    )
+
+
+def test_shard_costs_read_the_stamped_record(tmp: Path) -> None:
+    rec = tmp / 'm.times'
+    rec.write_text(
+        '#workers\t2\n#launch\t1000.0\n'
+        '1001.0\tbuilding\n'
+        '1100.0\tGathering coverage... done in 1m39s\n'
+        '1101.0\t   NOT COVERED ARITHMETIC_BASE at a.go:1:2\n'
+        '1110.0\t        KILLED ARITHMETIC_BASE at a.go:3:4\n'
+        '1130.0\t         LIVED INVERT_LOGICAL at pkg/b.go:5:6\n'
+        '1131.0\t     TIMED OUT INVERT_LOGICAL at pkg/b.go:7:8\n'
+        'junk line\n'
+        '1140.0\tMutation testing completed in 40s\n'
+    )
+    out = tmp / 'costs.json'
+    proc = run_shard(
+        'costs', '--module', f'.={rec}', '--module', f'gone={tmp / "none.times"}', '--out', str(out)
+    )
+    doc = json.loads(out.read_text()) if proc.returncode == 0 else {}
+    check(
+        'shard costs: each run mutant is charged its gap from the end of the coverage pass, '
+        'times the workers, and a NOT COVERED line nothing',
+        ok=doc.get('modules', {}).get('.')
+        == {
+            'setup_secs': 100.0 + 120,
+            'files': {
+                'a.go': {'3:4 ARITHMETIC_BASE': [20.0]},
+                'pkg/b.go': {'5:6 INVERT_LOGICAL': [40.0], '7:8 INVERT_LOGICAL': [2.0]},
+            },
+        },
+        detail=f'{doc} {proc.stderr[-300:]}',
+    )
+    check(
+        'shard costs: a module with no record is left out with a warning',
+        ok='gone' not in doc.get('modules', {}) and 'module gone: no cost record' in proc.stderr,
+        detail=proc.stderr[-300:],
+    )
+    rec.write_text('1100.0\tGathering coverage... done\n')
+    proc = run_shard('costs', '--module', f'.={rec}', '--out', str(out))
+    check(
+        'shard costs: a record with no worker count or launch time is no record',
+        ok=proc.returncode == 0 and json.loads(out.read_text()) == {'modules': {}},
+        detail=proc.stderr[-300:],
+    )
 
 
 def test_shard_bin_pack_longest_first(tmp: Path) -> None:
-    shard = load_script('gremlins_shard', SHARD)
-    check('bin pack: gremlins-shard.py importable', ok=shard is not None)
-    if shard is None:
-        return
+    shard = mutation_cost
 
     def assignment(bins) -> list[list[str]]:
-        return [sorted(it.package for it in b.items) for b in bins]
+        return [sorted(it.unit for it in b.items) for b in bins]
 
-    items = [shard.Item('.', name, work) for name, work in
-             (('p1', 1), ('p7', 7), ('p3', 3), ('p6', 6), ('p2', 2), ('p5', 5), ('p4', 4))]
+    items = [
+        shard.Item('.', name, work)
+        for name, work in (
+            ('p1', 1),
+            ('p7', 7),
+            ('p3', 3),
+            ('p6', 6),
+            ('p2', 2),
+            ('p5', 5),
+            ('p4', 4),
+        )
+    ]
     bins = shard.pack(items, 2, {'.': 0})
-    check('bin pack: longest first into the least loaded shard, ties to the lower index',
-          ok=assignment(bins) == [['p3', 'p4', 'p7'], ['p1', 'p2', 'p5', 'p6']]
-          and [b.load for b in bins] == [14, 14], detail=str(assignment(bins)))
-    check('bin pack: a setup every shard pays does not change the packing',
-          ok=assignment(shard.pack(items, 2, {'.': 100})) == assignment(bins))
-    check('bin pack: the same input packs the same way', ok=assignment(shard.pack(
-        list(reversed(items)), 2, {'.': 0})) == assignment(bins))
-    mixed = [shard.Item('x', 'a', 5), shard.Item('x', 'b', 5), shard.Item('y', 'c', 10),
-             shard.Item('x', 'z', 0)]
+    check(
+        'bin pack: longest first into the least loaded shard, ties to the lower index',
+        ok=assignment(bins) == [['p3', 'p4', 'p7'], ['p1', 'p2', 'p5', 'p6']]
+        and [b.load for b in bins] == [14, 14],
+        detail=str(assignment(bins)),
+    )
+    check(
+        'bin pack: a setup every shard pays does not change the packing',
+        ok=assignment(shard.pack(items, 2, {'.': 100})) == assignment(bins),
+    )
+    check(
+        'bin pack: the same input packs the same way',
+        ok=assignment(shard.pack(list(reversed(items)), 2, {'.': 0})) == assignment(bins),
+    )
+    mixed = [
+        shard.Item('x', 'a', 5),
+        shard.Item('x', 'b', 5),
+        shard.Item('y', 'c', 10),
+        shard.Item('x', 'z', 0),
+    ]
     bins = shard.pack(mixed, 2, {'x': 100, 'y': 0})
-    check('bin pack: a second setup keeps a module whole when splitting it buys nothing',
-          ok=assignment(bins) == [['c'], ['a', 'b', 'z']], detail=str(assignment(bins)))
+    check(
+        'bin pack: a second setup keeps a module whole when splitting it buys nothing',
+        ok=assignment(bins) == [['c'], ['a', 'b', 'z']],
+        detail=str(assignment(bins)),
+    )
     k, bins = shard.choose(items, {'.': 0}, 15)
-    check('bin pack: the fewest shards that fit the target', ok=k == 2, detail=str(k))
+    check(
+        'bin pack: the fewest shards that land in the band around the target',
+        ok=k == 2,
+        detail=str(k),
+    )
     k, bins = shard.choose(items, {'.': 0}, 6)
-    check('bin pack: a package over the target alone stops at the shard count that isolates it',
-          ok=k == 4 and max(b.load for b in bins) == 7, detail=f'{k} {[b.load for b in bins]}')
+    check(
+        'bin pack: an item past the band runs alone, and no shard of several items passes the top',
+        ok=k == 5 and sorted(b.load for b in bins) == [5, 5, 5, 6, 7],
+        detail=f'{k} {[b.load for b in bins]}',
+    )
     k, bins = shard.choose([], {'.': 0}, 6)
     check('bin pack: no items is one shard', ok=k == 1 and len(bins) == 1)
 
 
-SMALL_PACKAGES = {'.': (40, 3, 9000), 'internal/a': (20, 0, 2500), 'internal/b': (0, 4, None),
-                  'internal/c': (7, 1, None)}
-SMALL_ENV = {'workers': '4', 'mode': 'per-package', 'suite_secs': '9', 'mutants': '400',
-             'setup_secs': '120'}
+SMALL_PACKAGES = {
+    '.': (40, 3, 9000),
+    'internal/a': (20, 0, 2500),
+    'internal/b': (0, 4, None),
+    'internal/c': (7, 1, None),
+}
+SMALL_ENV = {
+    'workers': '4',
+    'mode': 'per-package',
+    'suite_secs': '9',
+    'mutants': '400',
+    'setup_secs': '120',
+}
 
 
 def test_shard_small_module_stays_one_unchanged_job(tmp: Path) -> None:
-    proc, plan = plan_repo(tmp, 'small', {'.': ('github.com/cplieger/small/v2', SMALL_ENV,
-                                                SMALL_PACKAGES)})
+    proc, plan = plan_repo(
+        tmp, 'small', {'.': ('github.com/cplieger/small/v2', SMALL_ENV, SMALL_PACKAGES)}
+    )
     check('one shard: plan succeeds', ok=plan is not None, detail=proc.stderr[-400:])
     if plan is None:
         return
-    check('one shard: a module under the target gets one shard', ok=plan['shards'] == 1,
-          detail=str(plan['shards']))
-    check('one shard: a package with no timing row costs as much as the dearest one',
-          ok=plan['modules']['.']['packages']['internal/c']['mutant_secs'] == 9.0,
-          detail=str(plan['modules']['.']['packages'].get('internal/c')))
+    check(
+        'one shard: a module under the target gets one shard',
+        ok=plan['shards'] == 1,
+        detail=str(plan['shards']),
+    )
+    check(
+        'one shard: a package with no timing row costs as much as the dearest one',
+        ok=sizing_of(tmp, 'small')['modules']['.']['packages']['internal/c']['mutant_secs'] == 9.0
+        and plan['modules']['.']['files']['internal/c/x.go']['prior_secs'] == 7 * 9.0,
+        detail=str(plan['modules']['.']['files'].get('internal/c/x.go')),
+    )
     plans = tmp / 'plans'
     plans.mkdir()
-    (plans / 'plan.json').write_text(json.dumps(plan))
-    proc = run_shard('matrix', '--repos', json.dumps(['small']), '--plans', str(plans),
-                     '--attempts', '3', '--artifacts', json.dumps(['shard-plan-small']))
+    (plans / 'plan.json').write_text(json.dumps(sizing_of(tmp, 'small')))
+    proc = run_shard(
+        'matrix',
+        '--repo',
+        'small',
+        '--plan',
+        str(plans / 'plan.json'),
+        '--attempts',
+        '3',
+    )
     matrix = json.loads(proc.stdout) if proc.returncode == 0 else None
-    check('one shard: its matrix entries are the unsharded ones the fanout always built',
-          ok=matrix == [{'repo': 'small', 'attempt': n} for n in (1, 2, 3)],
-          detail=f'rc={proc.returncode} {proc.stdout[:300]} {proc.stderr[-300:]}')
-    integration = {'workers': '4', 'mode': 'integration', 'suite_secs': '30', 'mutants': '300',
-                   'setup_secs': '200'}
+    check(
+        'one shard: its matrix entries are the unsharded ones the fanout always built',
+        ok=matrix == [{'repo': 'small', 'attempt': n} for n in (1, 2, 3)],
+        detail=f'rc={proc.returncode} {proc.stdout[:300]} {proc.stderr[-300:]}',
+    )
+    integration = {
+        'workers': '4',
+        'mode': 'integration',
+        'suite_secs': '30',
+        'mutants': '300',
+        'setup_secs': '200',
+    }
     proc, plan = plan_repo(tmp, 'integ', {'.': ('github.com/cplieger/integ/v2', integration, {})})
-    check('one shard: an integration module plans from the run inputs alone',
-          ok=plan is not None and plan['shards'] == 1
-          and abs(plan['one_job_minutes'] - (200 + 30 + 30 * 300 / 4) / 60) < 0.1,
-          detail=f'{plan and plan["one_job_minutes"]} {proc.stderr[-300:]}')
+    check(
+        'one shard: an integration module plans from the run inputs alone',
+        ok=plan is not None
+        and plan['shards'] == 1
+        and abs(
+            plan['one_job_minutes'] - (200 + 30 + 30 * 300 * mutation_cost.PRIOR_ERROR / 4) / 60
+        )
+        < 0.1,
+        detail=f'{plan and plan["one_job_minutes"]} {proc.stderr[-300:]}',
+    )
 
 
 def test_shard_never_splits_an_integration_module(tmp: Path) -> None:
-    heavy = {'workers': '4', 'mode': 'integration', 'suite_secs': '60', 'mutants': '1200',
-             'setup_secs': '300'}
-    modules = {'.': ('github.com/cplieger/multi/v2', heavy, {}),
-               'tools': ('github.com/cplieger/multi/tools', DEADSET_GO['env'],
-                         DEADSET_GO['packages'])}
+    heavy = {
+        'workers': '4',
+        'mode': 'integration',
+        'suite_secs': '60',
+        'mutants': '1200',
+        'setup_secs': '300',
+    }
+    modules = {
+        '.': ('github.com/cplieger/multi/v2', heavy, {}),
+        'tools': ('github.com/cplieger/multi/tools', DEADSET_GO['env'], DEADSET_GO['packages']),
+    }
     proc, plan = plan_repo(tmp, 'multi', modules)
     check('integration item: plan succeeds', ok=plan is not None, detail=proc.stderr[-400:])
     if plan is None:
         return
     root = plan['modules']['.']
-    check('integration item: the integration module runs whole in exactly one shard',
-          ok=len(root['shards']) == 1 and root['packages'] == {}, detail=str(root))
+    check(
+        'integration item: the integration module runs whole in exactly one shard',
+        ok=len(root['shards']) == 1 and root['files'] == {},
+        detail=str(root),
+    )
     tools = plan['modules']['tools']
-    used = {e['shard'] for e in tools['packages'].values()}
-    check('integration item: the per-package module lists the shards its packages use',
-          ok=sorted(used) == tools['shards'], detail=f'{sorted(used)} vs {tools["shards"]}')
+    used = {e['shard'] for e in tools['files'].values()}
+    check(
+        'integration item: the per-package module lists the shards its files use',
+        ok=sorted(used) == tools['shards'],
+        detail=f'{sorted(used)} vs {tools["shards"]}',
+    )
 
 
 def matrix_of(tmp: Path, plan: dict) -> tuple[subprocess.CompletedProcess, list | None]:
-    plans = tmp / f'plans-{plan["repo"]}'
+    plans = tmp / f'matrix-plans-{plan["repo"]}'
     plans.mkdir()
     (plans / 'plan.json').write_text(json.dumps(plan))
-    proc = run_shard('matrix', '--repos', json.dumps([plan['repo']]), '--plans', str(plans),
-                     '--attempts', '1', '--artifacts', json.dumps([f'shard-plan-{plan["repo"]}']))
+    proc = run_shard(
+        'matrix',
+        '--repo',
+        plan['repo'],
+        '--plan',
+        str(plans / 'plan.json'),
+        '--attempts',
+        '1',
+    )
     return proc, json.loads(proc.stdout) if proc.returncode == 0 else None
 
 
 def test_shard_sizes_a_zero_mutant_module_as_zero(tmp: Path) -> None:
     deadset = (DEADSET_GO['module'], DEADSET_GO['env'], DEADSET_GO['packages'])
     _, alone = plan_repo(tmp, 'alone', {'.': deadset})
-    proc, plan = plan_repo(tmp, 'zero', {'.': deadset,
-                                         'empty': ('github.com/cplieger/zero/empty', SMALL_ENV, None)})
-    check('zero mutants: a per-package module with no dry run report plans',
-          ok=plan is not None, detail=f'rc={proc.returncode} {proc.stderr[-400:]}')
+    proc, plan = plan_repo(
+        tmp, 'zero', {'.': deadset, 'empty': ('github.com/cplieger/zero/empty', SMALL_ENV, None)}
+    )
+    check(
+        'zero mutants: a per-package module with no dry run report plans',
+        ok=plan is not None,
+        detail=f'rc={proc.returncode} {proc.stderr[-400:]}',
+    )
     if plan is None or alone is None:
         return
     empty = plan['modules']['empty']
-    check('zero mutants: the module runs whole in exactly one shard with no packages',
-          ok=len(empty['shards']) == 1 and empty['packages'] == {}, detail=str(empty))
-    check('zero mutants: the module costs its setup alone, so the other module shards as before',
-          ok=plan['shards'] == alone['shards']
-          and plan['modules']['.']['packages'] == alone['modules']['.']['packages'],
-          detail=f'{plan["shards"]} vs {alone["shards"]}')
+    check(
+        'zero mutants: the module runs whole in exactly one shard with no files',
+        ok=len(empty['shards']) == 1 and empty['files'] == {},
+        detail=str(empty),
+    )
+    check(
+        'zero mutants: the module costs its setup alone, so the other module shards as before',
+        ok=plan['shards'] == alone['shards']
+        and plan['modules']['.']['files'] == alone['modules']['.']['files'],
+        detail=f'{plan["shards"]} vs {alone["shards"]}',
+    )
     shard = load_script('gremlins_shard', SHARD)
-    check('zero mutants: the plan is valid', ok=shard.valid_plan(plan) == '',
-          detail=shard.valid_plan(plan))
+    check(
+        'zero mutants: the plan is valid',
+        ok=shard.valid_plan(plan) == '',
+        detail=shard.valid_plan(plan),
+    )
 
 
 def test_shard_falls_back_for_a_module_it_cannot_size(tmp: Path) -> None:
     deadset = (DEADSET_GO['module'], DEADSET_GO['env'], DEADSET_GO['packages'])
     _, alone = plan_repo(tmp, 'alone', {'.': deadset})
     untimed = {'internal/a': (20, 0, None)}
-    proc, _ = plan_repo(tmp, 'gap', {
-        '.': deadset,
-        'failed': ('github.com/cplieger/gap/failed', None, None),
-        'stopped': ('github.com/cplieger/gap/stopped', {**SMALL_ENV, 'sized': None}, SMALL_PACKAGES),
-        'untimed': ('github.com/cplieger/gap/untimed', SMALL_ENV, untimed),
-    })
+    proc, _ = plan_repo(
+        tmp,
+        'gap',
+        {
+            '.': deadset,
+            'failed': ('github.com/cplieger/gap/failed', None, None),
+            'stopped': (
+                'github.com/cplieger/gap/stopped',
+                {**SMALL_ENV, 'sized': None},
+                SMALL_PACKAGES,
+            ),
+            'untimed': ('github.com/cplieger/gap/untimed', SMALL_ENV, untimed),
+        },
+    )
     plan = written_plan(tmp, 'gap')
     unsized = ('failed', 'stopped', 'untimed')
-    check('unsized module: the planner fails and names each module it could not size',
-          ok=proc.returncode != 0 and all(f'module {d} ' in proc.stderr for d in unsized)
-          and '::error::' in proc.stderr, detail=f'rc={proc.returncode} {proc.stderr[-600:]}')
+    check(
+        'unsized module: the planner fails and names each module it could not size',
+        ok=proc.returncode != 0
+        and all(f'module {d} ' in proc.stderr for d in unsized)
+        and '::error::' in proc.stderr,
+        detail=f'rc={proc.returncode} {proc.stderr[-600:]}',
+    )
     check('unsized module: it still writes the plan', ok=plan is not None and alone is not None)
     if plan is None or alone is None:
         return
     shard = load_script('gremlins_shard', SHARD)
-    check('unsized module: the plan is valid', ok=shard.valid_plan(plan) == '',
-          detail=shard.valid_plan(plan))
+    check(
+        'unsized module: the plan is valid',
+        ok=shard.valid_plan(plan) == '',
+        detail=shard.valid_plan(plan),
+    )
     k = alone['shards']
-    check('unsized module: the sized module shards exactly as it does alone',
-          ok=plan['modules']['.']['packages'] == alone['modules']['.']['packages']
-          and plan['modules']['.']['shards'] == list(range(1, k + 1)),
-          detail=str(plan['modules']['.']['shards']))
+    check(
+        'unsized module: the sized module shards exactly as it does alone',
+        ok=plan['modules']['.']['files'] == alone['modules']['.']['files']
+        and plan['modules']['.']['shards'] == list(range(1, k + 1)),
+        detail=str(plan['modules']['.']['shards']),
+    )
     own = [plan['modules'][d] for d in unsized]
-    check('unsized module: each runs whole and unmeasured in a shard of its own',
-          ok=plan['shards'] == k + 3
-          and sorted(e['shards'][0] for e in own) == [k + 1, k + 2, k + 3]
-          and all(len(e['shards']) == 1 and e['packages'] == {} and e['mode'] is None
-                  and e['workers'] is None for e in own),
-          detail=str(own))
-    check('unsized module: its shard has no projection',
-          ok=plan['projected_minutes'][:k] == alone['projected_minutes']
-          and plan['projected_minutes'][k:] == [None] * 3, detail=str(plan['projected_minutes']))
+    check(
+        'unsized module: each runs whole and unmeasured in a shard of its own',
+        ok=plan['shards'] == k + 3
+        and sorted(e['shards'][0] for e in own) == [k + 1, k + 2, k + 3]
+        and all(
+            len(e['shards']) == 1
+            and e['files'] == {}
+            and e['mode'] is None
+            and e['workers'] is None
+            for e in own
+        ),
+        detail=str(own),
+    )
+    check(
+        'unsized module: its shard has no projection',
+        ok=plan['projected_minutes'][:k] == alone['projected_minutes']
+        and plan['projected_minutes'][k:] == [None] * 3,
+        detail=str(plan['projected_minutes']),
+    )
     path = tmp / 'gap.json'
     path.write_text(json.dumps(plan))
-    proc = run_shard('modules', '--plan', str(path), '--shard', str(k + 1),
-                     '--modules', '. failed stopped untimed')
-    check('unsized module: its shard runs it with no plan mode or workers and skips the rest',
-          ok=proc.returncode == 0 and proc.stdout.splitlines()
-          == ['skip .', 'run failed', 'skip stopped', 'skip untimed'],
-          detail=f'{proc.stdout!r} {proc.stderr[-300:]}')
+    proc = run_shard(
+        'modules',
+        '--plan',
+        str(path),
+        '--shard',
+        str(k + 1),
+        '--modules',
+        '. failed stopped untimed',
+    )
+    check(
+        'unsized module: its shard runs it with no plan mode or workers and skips the rest',
+        ok=proc.returncode == 0
+        and proc.stdout.splitlines() == ['skip .', 'run failed', 'skip stopped', 'skip untimed'],
+        detail=f'{proc.stdout!r} {proc.stderr[-300:]}',
+    )
     proc, matrix = matrix_of(tmp, plan)
-    check('unsized module: the repo still shards', ok=matrix is not None and len(matrix) == k + 3,
-          detail=f'{matrix} {proc.stderr[-300:]}')
-    proc, _ = plan_repo(tmp, 'tiny', {'.': ('github.com/cplieger/tiny', SMALL_ENV, SMALL_PACKAGES),
-                                      'failed': ('github.com/cplieger/tiny/failed', None, None)})
+    check(
+        'unsized module: the repo still shards',
+        ok=matrix is not None and len(matrix) == k + 3,
+        detail=f'{matrix} {proc.stderr[-300:]}',
+    )
+    proc, _ = plan_repo(
+        tmp,
+        'tiny',
+        {
+            '.': ('github.com/cplieger/tiny', SMALL_ENV, SMALL_PACKAGES),
+            'failed': ('github.com/cplieger/tiny/failed', None, None),
+        },
+    )
     plan = written_plan(tmp, 'tiny')
-    check('unsized module: in a repo that fits one job it joins that job',
-          ok=proc.returncode != 0 and plan is not None and plan['shards'] == 1
-          and plan['modules']['failed']['shards'] == [1] and shard.valid_plan(plan) == '',
-          detail=f'{plan and plan["modules"]} {proc.stderr[-300:]}')
-    for label, entry in (('a mode without workers', {'mode': 'per-package', 'workers': None}),
-                         ('workers without a mode', {'mode': None, 'workers': 4}),
-                         ('an unknown mode', {'mode': 'sharded', 'workers': 4})):
+    check(
+        'unsized module: in a repo that fits one job it still gets a shard of its own',
+        ok=proc.returncode != 0
+        and plan is not None
+        and plan['shards'] == 2
+        and plan['modules']['failed']['shards'] == [2]
+        and shard.valid_plan(plan) == '',
+        detail=f'{plan and plan["modules"]} {proc.stderr[-300:]}',
+    )
+    for label, entry in (
+        ('a mode without workers', {'mode': 'per-package', 'workers': None}),
+        ('workers without a mode', {'mode': None, 'workers': 4}),
+        ('an unknown mode', {'mode': 'sharded', 'workers': 4}),
+    ):
         bad = json.loads(path.read_text())
         bad['modules']['failed'].update(entry)
-        check(f'unsized module: a plan entry with {label} is refused',
-              ok=shard.valid_plan(bad) != '', detail=str(entry))
+        check(
+            f'unsized module: a plan entry with {label} is refused',
+            ok=shard.valid_plan(bad) != '',
+            detail=str(entry),
+        )
+
+
+def call_matrix(
+    tmp: Path, repo: str, doc: object = None, history: str | None = None, attempts: int = 3
+) -> tuple[subprocess.CompletedProcess, list | None, dict | None]:
+    """`gremlins-shard.py matrix` for one repo as the shard job runs it: DOC as its sizing
+    (None: no plan), HISTORY as its cost history's text; the matrix and run plan back."""
+    d = tmp / f'call-{len(list(tmp.iterdir()))}'
+    d.mkdir()
+    args = ['--plan', str(d / 'sizing.json'), '--out-plan', str(d / 'plan.json')]
+    if doc is not None:
+        (d / 'sizing.json').write_text(doc if isinstance(doc, str) else json.dumps(doc))
+    if history is not None:
+        (d / 'history.json').write_text(history)
+        args += ['--history', str(d / 'history.json')]
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SHARD),
+            'matrix',
+            '--repo',
+            repo,
+            '--attempts',
+            str(attempts),
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    matrix = json.loads(proc.stdout) if proc.returncode == 0 else None
+    plan = json.loads((d / 'plan.json').read_text()) if (d / 'plan.json').exists() else None
+    return proc, matrix, plan
 
 
 def test_shard_matrix_falls_back_to_one_job(tmp: Path) -> None:
-    proc, plan = plan_repo(tmp, 'deadset-go', {'.': (DEADSET_GO['module'], DEADSET_GO['env'],
-                                                     DEADSET_GO['packages'])})
+    proc, plan = plan_repo(
+        tmp, 'deadset-go', {'.': (DEADSET_GO['module'], DEADSET_GO['env'], DEADSET_GO['packages'])}
+    )
     if plan is None:
         check('matrix: deadset-go plan', ok=False, detail=proc.stderr[-400:])
         return
-    plans = tmp / 'plans'
-    gap = json.loads(json.dumps({**plan, 'repo': 'gap'}))
-    gap['modules']['.']['packages']['internal/exempt']['shard'] = 99
-    spaced = json.loads(json.dumps({**plan, 'repo': 'spaced'}))
-    spaced['modules']['.']['packages']['a b'] = spaced['modules']['.']['packages'].pop('internal/exempt')
-    for name, doc in (('shard-plan-deadset-go', plan),
-                      ('shard-plan-bad', {**plan, 'repo': 'bad', 'sha': 'HEAD; rm -rf /'}),
-                      ('shard-plan-gap', gap), ('shard-plan-spaced', spaced)):
-        (plans / name).mkdir(parents=True)
-        (plans / name / 'plan.json').write_text(json.dumps(doc))
-    proc = run_shard('matrix', '--repos', json.dumps(['deadset-go', 'thing', 'bad', 'gap', 'spaced']),
-                     '--plans', str(plans), '--attempts', '3',
-                     '--artifacts', json.dumps(sorted(d.name for d in plans.iterdir())))
-    matrix = json.loads(proc.stdout) if proc.returncode == 0 else []
+    sized = sizing_of(tmp, 'deadset-go')
+    gap = json.loads(json.dumps({**sized, 'repo': 'gap'}))
+    gap['modules']['.']['files']['internal/exempt/x.go']['prior_secs'] = -99
+    spaced = json.loads(json.dumps({**sized, 'repo': 'spaced'}))
+    spaced['modules']['.']['files']['a b/x.go'] = spaced['modules']['.']['files'].pop(
+        'internal/exempt/x.go'
+    )
     k = plan['shards']
-    want = [{'repo': 'deadset-go', 'attempt': a, 'shard': s, 'shards': k}
-            for a in (1, 2, 3) for s in range(1, k + 1)]
-    want += [{'repo': r, 'attempt': a} for r in ('thing', 'bad', 'gap', 'spaced') for a in (1, 2, 3)]
-    check('matrix: attempt x shard for a sharded repo, one job per attempt otherwise',
-          ok=matrix == want, detail=f'rc={proc.returncode} {proc.stdout[:400]} {proc.stderr[-300:]}')
-    check('matrix: a repo without a plan says it runs in one job',
-          ok='thing' in proc.stderr and 'one job' in proc.stderr, detail=proc.stderr[-400:])
-    check('matrix: a plan that fails validation is not trusted',
-          ok='bad' in proc.stderr and 'sha' in proc.stderr, detail=proc.stderr[-400:])
-    check('matrix: a plan that gives a package no shard its module runs is not trusted',
-          ok='gap: shard plan refused' in proc.stderr and '99' in proc.stderr,
-          detail=proc.stderr[-400:])
-    check('matrix: a plan with a package dir the scope cannot exclude is not trusted',
-          ok="spaced: shard plan refused" in proc.stderr and "'a b'" in proc.stderr,
-          detail=proc.stderr[-400:])
-    proc, _ = plan_repo(tmp, 'spaced-dry', {'.': ('github.com/cplieger/spaced', SMALL_ENV,
-                                                  {'a b': (3, 0, 500)})})
-    spaced_plan = written_plan(tmp, 'spaced-dry')
-    check('matrix: the planner fails on a dry run listing a package dir it cannot scope, '
-          'and runs that module whole',
-          ok=proc.returncode != 0 and "'a b'" in proc.stderr and spaced_plan is not None
-          and spaced_plan['modules']['.']['packages'] == {}
-          and spaced_plan['modules']['.']['mode'] is None,
-          detail=f'{spaced_plan} {proc.stderr[-300:]}')
-    proc = run_shard('matrix', '--repos', '[]', '--plans', str(tmp / 'none'), '--attempts', '3',
-                     '--artifacts', '[]')
-    check('matrix: no repos is an empty matrix', ok=proc.returncode == 0 and
-          json.loads(proc.stdout or 'null') == [], detail=f'{proc.stdout!r} {proc.stderr[-200:]}')
-
-
-def test_shard_matrix_binds_each_plan_to_its_artifact(tmp: Path) -> None:
-    proc, plan = plan_repo(tmp, 'b', {'.': (DEADSET_GO['module'], DEADSET_GO['env'],
-                                            DEADSET_GO['packages'])})
-    if plan is None or plan['shards'] < 2:
-        check('binding: a plan of 2 or more shards', ok=False, detail=proc.stderr[-400:])
-        return
-    k = plan['shards']
-    fewer = json.loads(json.dumps(plan))
-    fewer['shards'] = 1
-    for e in fewer['modules'].values():
-        e['shards'] = [1]
-        for p in e['packages'].values():
-            p['shard'] = 1
+    _, matrix, _ = call_matrix(tmp, 'deadset-go', sized)
+    check(
+        'matrix: attempt x shard for a sharded repo',
+        ok=matrix
+        == [
+            {'repo': 'deadset-go', 'attempt': a, 'shard': s, 'shards': k}
+            for a in (1, 2, 3)
+            for s in range(1, k + 1)
+        ],
+        detail=str(matrix)[:400],
+    )
+    one = [{'repo': 'x', 'attempt': a} for a in (1, 2, 3)]
+    for repo, doc, says in (
+        ('thing', None, 'thing: no shard plan, so each attempt runs in one job'),
+        ('bad', {**sized, 'repo': 'bad', 'sha': 'HEAD; rm -rf /'}, 'bad: shard plan refused (sha'),
+        ('gap', gap, "gap: shard plan refused (module '.' file 'internal/exempt/x.go'"),
+        ('spaced', spaced, "spaced: shard plan refused (module '.' has file 'a b/x.go'"),
+        ('other', sized, "other: shard plan refused (it names repo 'deadset-go')"),
+        ('torn', '{"repo": "torn", "sha"', 'torn: its shard plan failed to load (JSONDecodeError'),
+    ):
+        proc, matrix, out = call_matrix(tmp, repo, doc)
+        check(
+            f'matrix: {repo} runs one job per attempt and says why',
+            ok=matrix == [{**r, 'repo': repo} for r in one] and out is None and says in proc.stderr,
+            detail=f'{matrix} {proc.stderr[-400:]}',
+        )
     shard = load_script('gremlins_shard', SHARD)
-    check('binding: the forged plan alone would be trusted', ok=shard.valid_plan(fewer) == '',
-          detail=shard.valid_plan(fewer))
+    off = json.loads(json.dumps(plan))
+    off['modules']['.']['files']['internal/exempt/x.go']['shard'] = 99
+    check(
+        'matrix: a run plan that gives a file a shard its module does not run is refused',
+        ok='99' in shard.valid_plan(off),
+        detail=shard.valid_plan(off),
+    )
+    proc, _ = plan_repo(
+        tmp, 'spaced-dry', {'.': ('github.com/cplieger/spaced', SMALL_ENV, {'a b': (3, 0, 500)})}
+    )
+    spaced_plan = written_plan(tmp, 'spaced-dry')
+    check(
+        'matrix: the planner fails on a dry run listing a file it cannot scope, '
+        'and runs that module whole',
+        ok=proc.returncode != 0
+        and "'a b/x.go'" in proc.stderr
+        and spaced_plan is not None
+        and spaced_plan['modules']['.']['files'] == {}
+        and spaced_plan['modules']['.']['mode'] is None,
+        detail=f'{spaced_plan} {proc.stderr[-300:]}',
+    )
+    proc, _, _ = call_matrix(tmp, 'a\n::stop-commands::x', None)
+    check(
+        'matrix: a repository name outside the key characters fails the call, escaped',
+        ok=proc.returncode != 0 and '::stop-commands::x' not in proc.stderr.split('\n')[1:],
+        detail=proc.stderr[-300:],
+    )
 
-    def matrix_for(repos: list[str], files: dict[str, dict],
-                   artifacts: list[str] | None = None) -> tuple[list | None, str]:
-        """ARTIFACTS defaults to the top-level directories FILES names."""
-        plans = tmp / f'plans-{len(list(tmp.iterdir()))}'
-        for rel, doc in files.items():
-            (plans / rel).parent.mkdir(parents=True, exist_ok=True)
-            (plans / rel).write_text(json.dumps(doc))
-        if artifacts is None:
-            artifacts = sorted({rel.split('/')[0] for rel in files if '/' in rel})
-        p = run_shard('matrix', '--repos', json.dumps(repos), '--plans', str(plans), '--attempts', '1',
-                      '--artifacts', json.dumps(artifacts))
-        return (json.loads(p.stdout) if p.returncode == 0 else None), p.stderr
 
-    sharded_b = [{'repo': 'b', 'attempt': 1, 'shard': s, 'shards': k} for s in range(1, k + 1)]
-    # 'a' and 'z' sort either side of 'b', so neither order lets a forgery win.
-    for forger in ('a', 'z'):
-        got, err = matrix_for([forger, 'b'], {'shard-plan-b/plan.json': plan,
-                                              f'shard-plan-{forger}/plan.json': fewer})
-        check(f'binding: a plan uploaded by {forger} naming b does not replace b\'s own',
-              ok=got == [{'repo': forger, 'attempt': 1}, *sharded_b],
-              detail=f'{got} {err[-300:]}')
-        check(f'binding: the warning names {forger} and the repo its artifact claims',
-              ok=f"{forger}: its shard-plan artifact names repo 'b'" in err, detail=err[-300:])
-    got, err = matrix_for(['a', 'b'], {'plan.json': plan}, ['shard-plan-b'])
-    check('binding: with two repos planned and one plan uploaded, the lone root plan is its uploader\'s',
-          ok=got == [{'repo': 'a', 'attempt': 1}, *sharded_b], detail=f'{got} {err[-300:]}')
-    for listed in ([], ['shard-plan-a', 'shard-plan-b'], ['shard-plan-c'], ['plan-b']):
-        got, err = matrix_for(['a', 'b'], {'plan.json': plan}, listed)
-        check(f'binding: a lone root plan with the artifacts {listed} is ignored',
-              ok=got == [{'repo': 'a', 'attempt': 1}, {'repo': 'b', 'attempt': 1}]
-              and 'is not one repo\'s shard-plan artifact' in err, detail=f'{got} {err[-300:]}')
-    got, err = matrix_for(['a'], {'plan.json': plan}, ['shard-plan-a'])
-    check('binding: a lone root plan naming another repo is ignored',
-          ok=got == [{'repo': 'a', 'attempt': 1}] and "names repo 'b'" in err,
-          detail=f'{got} {err[-300:]}')
-    got, err = matrix_for(['b'], {'plan.json': plan}, ['shard-plan-b'])
-    check('binding: a lone root plan is its one repo\'s', ok=got == sharded_b, detail=f'{got} {err[-300:]}')
-    for repos in (['b'], ['a', 'b']):
-        got, err = matrix_for(repos, {'plan.json': plan}, ['shard-plan-b', 'shard-plan-b'])
-        check(f'binding: a lone root plan listed once per rerun attempt is still b\'s ({repos})',
-              ok=got == [{'repo': r, 'attempt': 1} for r in repos if r != 'b'] + sharded_b,
-              detail=f'{got} {err[-300:]}')
-    got, err = matrix_for(['a', 'b'], {'shard-plan-b/nested/plan.json': plan,
-                                       'shard-plan-c/plan.json': {**plan, 'repo': 'c'}})
-    check('binding: a nested plan or one from a repo outside the fanout is ignored',
-          ok=got == [{'repo': 'a', 'attempt': 1}, {'repo': 'b', 'attempt': 1}]
-          and err.count('is not one repo\'s shard-plan artifact') == 2, detail=f'{got} {err[-300:]}')
+HOSTILE_PRICES = (1e300, 0, -1, float('nan'), 10**400, None, 'x', 1.7e308)
+
+
+def hostile_sizing(repo: str, variant: int) -> dict:
+    """A plan job's sizing as the target's code could write it: 300 files, priced by VARIANT."""
+    price = HOSTILE_PRICES[variant % len(HOSTILE_PRICES)]
+    files = {
+        f'p{i}/x.go': {
+            'runnable': 2**53 if variant % 3 == 0 else 100,
+            **({} if price is None else {'prior_secs': price}),
+        }
+        for i in range(300)
+    }
+    return {
+        'repo': repo,
+        'sha': FIXTURE_SHA,
+        'modules': {
+            '.': {
+                'mode': 'per-package',
+                'workers': 10**400 if variant == 5 else 4,
+                'setup_secs': 1e308 if variant % 4 == 1 else 60.0,
+                'packages': {},
+                'files': files,
+            }
+        },
+    }
+
+
+def hostile_history(variant: int) -> str:
+    """A cost history as each shard's stamped record could leave it, the JSON text included."""
+    price = HOSTILE_PRICES[(variant + 3) % len(HOSTILE_PRICES)]
+    rows = {
+        f'p{i}/x.go': {'secs': price, 'mutants': 10**400 if i % 5 == 0 else 1} for i in range(300)
+    }
+    return json.dumps({'repo': 'r', 'modules': {'.': {'files': rows, 'setup_secs': price}}})
+
+
+def test_shard_matrix_stays_within_the_cap_whatever_the_prices(tmp: Path) -> None:
+    """The target's code writes every price the shard job reads: the probe, and the record each shard stamps."""
+    results = {}
+    started = time.monotonic()
+    for i in range(16):
+        repo = f'r{i}'
+        doc = hostile_sizing(repo, i)
+        if i % 2 == 0:
+            for f in doc['modules']['.']['files'].values():
+                f.update(runnable=100, prior_secs=3.6e5)
+        history = hostile_history(i).replace('"repo": "r"', f'"repo": "{repo}"')
+        try:
+            results[repo] = call_matrix(tmp, repo, doc, history)
+        except subprocess.TimeoutExpired:
+            check(f'hostile prices: {repo} ends', ok=False, detail='still running after 120 s')
+            return
+    check(
+        'hostile prices: every plan ends, planned or failed, and in seconds',
+        ok=all(
+            p.returncode in (0, 1) and 'Traceback' not in p.stderr for p, _, _ in results.values()
+        )
+        and time.monotonic() - started < 120,
+        detail=str({r: p.stderr[-200:] for r, (p, _, _) in results.items() if p.returncode > 1}),
+    )
+    per_attempt = mutation_cost.MATRIX_LIMIT // 3
+    outcomes = {}
+    for r, (p, m, plan) in results.items():
+        if p.returncode == 0:
+            k = {e.get('shards', 1) for e in m}
+            sized = [x for x in (plan or {}).get('projected_minutes') or [] if x is not None]
+            bound = mutation_cost.BOUND_SECS / 60
+            lone = set((plan or {}).get('deadline') or [])
+            outcomes[r] = (
+                len(k) == 1
+                and 1 <= next(iter(k)) <= per_attempt
+                and len(m) == 3 * next(iter(k))
+                and (all(x <= bound for x in sized) or bool(lone))
+            )
+        else:
+            outcomes[r] = f'::error::{r}: ' in p.stderr and 'so its plan fails' in p.stderr
+    check(
+        'hostile prices: every repo runs all 3 attempts within the run matrix, each job within the '
+        'bound or alone under its deadline, or its plan fails, named',
+        ok=all(outcomes.values()),
+        detail=str({r: results[r][0].stderr[-300:] for r, ok in outcomes.items() if not ok}),
+    )
+    capped_doc = {
+        'repo': 'wide',
+        'sha': FIXTURE_SHA,
+        'modules': {
+            '.': {
+                'mode': 'per-package',
+                'workers': 1,
+                'setup_secs': 60.0,
+                'packages': {},
+                # 30 files at 70 min each: 16 shards keep the bound but not the band's top.
+                'files': {
+                    f'p{i}/x.go': {
+                        'runnable': 10,
+                        'prior_secs': 70 * 60 / mutation_cost.PRIOR_ERROR,
+                    }
+                    for i in range(30)
+                },
+            }
+        },
+    }
+    wide = call_matrix(tmp, 'wide', capped_doc)
+    results['wide'] = wide
+    capped = [r for r, (_, _, plan) in results.items() if plan and plan.get('capped')]
+    check(
+        'hostile prices: a repo whose band wants more than MAX_SHARDS that keep the bound runs '
+        'capped, and says so',
+        ok='wide' in capped
+        and wide[2]['shards'] == mutation_cost.MAX_SHARDS
+        and all(f'::warning::{r}: runs in ' in results[r][0].stderr for r in capped),
+        detail=f'{capped} {wide[0].stderr[-300:]}',
+    )
+    check(
+        'hostile prices: an over-range measured price is refused and that file priced from its probe',
+        ok=any('refused' in p.stderr for p, _, _ in results.values()),
+    )
+    summary = tmp / 'summary.md'
+    plan_file = tmp / 'capped.json'
+    plan_file.write_text(json.dumps(results[capped[0]][2] if capped else {}))
+    named = subprocess.run(
+        [
+            sys.executable,
+            str(SHARD),
+            'capped',
+            '--repo',
+            capped[0] if capped else 'r0',
+            '--plan',
+            str(plan_file),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, 'GITHUB_STEP_SUMMARY': str(summary)},
+    )
+    check(
+        'hostile prices: the record job names a capped repo with a warning in its summary',
+        ok=named.returncode == 0
+        and '::warning::' in named.stderr
+        and summary.exists()
+        and 'runs in' in summary.read_text(),
+        detail=f'{named.returncode} {named.stderr[-300:]}',
+    )
+    quiet = run_shard('capped', '--repo', 'none', '--plan', str(tmp / 'none.json'))
+    check(
+        'hostile prices: a repo with no capped plan names nothing',
+        ok=quiet.returncode == 0 and '::warning::' not in quiet.stdout + quiet.stderr,
+        detail=quiet.stderr[-300:],
+    )
 
 
 def three_module_plan(tmp: Path) -> Path:
-    """A plan whose root packages split across two shards, beside an integration module."""
+    """A plan whose root files split across two shards, one package's two files apart, beside an integration module."""
     doc = {
-        'repo': 'tree', 'sha': FIXTURE_SHA, 'target_minutes': 240, 'shards': 2,
-        'one_job_minutes': 400.0, 'projected_minutes': [200.0, 200.0],
+        'repo': 'tree',
+        'sha': FIXTURE_SHA,
+        'shards': 2,
+        'one_job_minutes': 400.0,
+        'projected_minutes': [200.0, 200.0],
         'modules': {
-            '.': {'mode': 'per-package', 'workers': 4, 'setup_secs': 60.0, 'shards': [1, 2],
-                  'packages': {p: {'shard': s} for p, s in (('.', 1), ('a', 2), ('a/b', 1),
-                                                           ('c.d', 2), ('cXd', 1))}},
-            'tools': {'mode': 'integration', 'workers': 2, 'setup_secs': 60.0, 'shards': [2],
-                      'packages': {}},
+            '.': {
+                'mode': 'per-package',
+                'workers': 4,
+                'setup_secs': 60.0,
+                'shards': [1, 2],
+                'packages': {},
+                'files': {
+                    f: {'runnable': 1, 'prior_secs': 1.0, 'shard': s}
+                    for f, s in (
+                        ('root.go', 1),
+                        ('a/a.go', 2),
+                        ('a/a2.go', 1),
+                        ('a/b/b.go', 1),
+                        ('c.d/c.go', 2),
+                        ('cXd/look.go', 1),
+                    )
+                },
+            },
+            'tools': {
+                'mode': 'integration',
+                'workers': 2,
+                'setup_secs': 60.0,
+                'mutants': 10,
+                'prior_secs': 100.0,
+                'shards': [2],
+                'packages': {},
+                'files': {},
+            },
         },
     }
     path = tmp / 'plan.json'
@@ -1852,10 +3891,16 @@ def test_shard_lists_each_shards_modules(tmp: Path) -> None:
     for n in (1, 2):
         proc = run_shard('modules', '--plan', str(plan), '--shard', str(n), '--modules', '. tools')
         got[n] = proc.stdout.splitlines() if proc.returncode == 0 else proc.stderr
-    check('shard modules: each shard runs its modules in their planned mode and worker count, '
-          'and skips the rest',
-          ok=got == {1: ['run . per-package 4', 'skip tools'],
-                     2: ['run . per-package 4', 'run tools integration 2']}, detail=str(got))
+    check(
+        'shard modules: each shard runs its modules in their planned mode and worker count, '
+        'and skips the rest',
+        ok=got
+        == {
+            1: ['run . per-package 4', 'skip tools'],
+            2: ['run . per-package 4', 'run tools integration 2'],
+        },
+        detail=str(got),
+    )
     for label, workers in (('zero', 0), ('missing', None), ('not a number', '4'), ('a bool', True)):
         doc = json.loads(plan.read_text())
         if workers is None:
@@ -1865,21 +3910,38 @@ def test_shard_lists_each_shards_modules(tmp: Path) -> None:
         bad = tmp / 'bad-workers.json'
         bad.write_text(json.dumps(doc))
         proc = run_shard('modules', '--plan', str(bad), '--shard', '1', '--modules', '. tools')
-        check(f'shard modules: a plan whose worker count is {label} is refused',
-              ok=proc.returncode != 0 and 'workers' in proc.stderr, detail=proc.stderr[-300:])
+        check(
+            f'shard modules: a plan whose worker count is {label} is refused',
+            ok=proc.returncode != 0 and 'workers' in proc.stderr,
+            detail=proc.stderr[-300:],
+        )
     proc = run_shard('modules', '--plan', str(plan), '--shard', '1', '--modules', '. tools extra')
-    check('shard modules: a module set that differs from the plan fails the shard',
-          ok=proc.returncode != 0 and 'extra' in proc.stderr, detail=proc.stderr[-300:])
+    check(
+        'shard modules: a module set that differs from the plan fails the shard',
+        ok=proc.returncode != 0 and 'extra' in proc.stderr,
+        detail=proc.stderr[-300:],
+    )
     proc = run_shard('modules', '--plan', str(plan), '--shard', '3', '--modules', '. tools')
-    check('shard modules: a shard the plan does not have fails',
-          ok=proc.returncode != 0, detail=proc.stderr[-300:])
+    check(
+        'shard modules: a shard the plan does not have fails',
+        ok=proc.returncode != 0,
+        detail=proc.stderr[-300:],
+    )
 
 
 def test_shard_scope_partitions_the_module(tmp: Path) -> None:
     plan = three_module_plan(tmp)
     target = tmp / 'target'
-    for name in ('root.go', 'a/a.go', 'a/b/b.go', 'a/b/b_test.go', 'c.d/c.go',
-                 'cXd/look.go', 'tools/t.go'):
+    for name in (
+        'root.go',
+        'a/a.go',
+        'a/a2.go',
+        'a/b/b.go',
+        'a/b/b_test.go',
+        'c.d/c.go',
+        'cXd/look.go',
+        'tools/t.go',
+    ):
         (target / name).parent.mkdir(parents=True, exist_ok=True)
         (target / name).write_text('package x\n')
     proc = run_scope(target, '.', 'tools')
@@ -1887,37 +3949,75 @@ def test_shard_scope_partitions_the_module(tmp: Path) -> None:
     scopes = {}
     for n in (1, 2):
         proc = subprocess.run(
-            [sys.executable, str(SCOPE), '--config', str(CENTRAL), '--target', str(target),
-             '--plan', str(plan), '--shard', str(n), '--', '.', 'tools'],
-            capture_output=True, text=True, check=False)
+            [
+                sys.executable,
+                str(SCOPE),
+                '--config',
+                str(CENTRAL),
+                '--target',
+                str(target),
+                '--plan',
+                str(plan),
+                '--shard',
+                str(n),
+                '--',
+                '.',
+                'tools',
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         scopes[n] = gremlins_scope(target) if proc.returncode == 0 else proc.stderr[-300:]
-    check('shard scope: each shard mutates only its own packages, a dotted dir only itself',
-          ok=scopes == {1: ['a/b/b.go', 'cXd/look.go', 'root.go'], 2: ['a/a.go', 'c.d/c.go']},
-          detail=str(scopes))
+    check(
+        "shard scope: each shard mutates only its own files, a package's two files in two "
+        'shards and a dotted dir only itself',
+        ok=scopes
+        == {1: ['a/a2.go', 'a/b/b.go', 'cXd/look.go', 'root.go'], 2: ['a/a.go', 'c.d/c.go']},
+        detail=str(scopes),
+    )
     union = sorted(f for s in scopes.values() if isinstance(s, list) for f in s)
-    check('shard scope: the shards together mutate exactly what one job does, once each',
-          ok=union == whole, detail=f'{union} vs {whole}')
-    check('shard scope: the nested module stays excluded from every shard',
-          ok=all('tools/t.go' not in s for s in scopes.values()))
+    check(
+        'shard scope: the shards together mutate exactly what one job does, once each',
+        ok=union == whole,
+        detail=f'{union} vs {whole}',
+    )
+    check(
+        'shard scope: the nested module stays excluded from every shard',
+        ok=all('tools/t.go' not in s for s in scopes.values()),
+    )
 
 
 def test_merge_skips_a_module_the_shard_did_not_run(tmp: Path) -> None:
     root = result('github.com/cplieger/envx/v2', [('envx.go', [('KILLED', 'ARITHMETIC_BASE')])])
-    proc, merged = run_merge(tmp, [('.', root)], out_name='skip.json',
-                             modes={'.': 'per-package\n'}, skip=('yamlenv',))
+    proc, merged = run_merge(
+        tmp, [('.', root)], out_name='skip.json', modes={'.': 'per-package\n'}, skip=('yamlenv',)
+    )
     check('skip module: merge succeeds', ok=merged is not None, detail=proc.stderr[-300:])
     if merged is None:
         return
-    check('skip module: a skipped module adds no entry and no mode',
-          ok=[m['dir'] for m in merged['modules']] == ['.'] and merged['mode'] == 'per-package',
-          detail=str(merged['modules']))
-    nested = result('github.com/cplieger/envx/yamlenv/v2', [('y.go', [('LIVED', 'ARITHMETIC_BASE')])])
-    proc, merged = run_merge(tmp, [('yamlenv', nested)], out_name='skiproot.json',
-                             modes={'yamlenv': 'integration\n'}, skip=('.',))
-    check('skip module: a shard that skips the root module still merges',
-          ok=merged is not None and merged['mode'] == 'integration'
-          and [f['file_name'] for f in merged['files']] == ['yamlenv/y.go'],
-          detail=proc.stderr[-300:])
+    check(
+        'skip module: a skipped module adds no entry and no mode',
+        ok=[m['dir'] for m in merged['modules']] == ['.'] and merged['mode'] == 'per-package',
+        detail=str(merged['modules']),
+    )
+    nested = result(
+        'github.com/cplieger/envx/yamlenv/v2', [('y.go', [('LIVED', 'ARITHMETIC_BASE')])]
+    )
+    proc, merged = run_merge(
+        tmp,
+        [('yamlenv', nested)],
+        out_name='skiproot.json',
+        modes={'yamlenv': 'integration\n'},
+        skip=('.',),
+    )
+    check(
+        'skip module: a shard that skips the root module still merges',
+        ok=merged is not None
+        and merged['mode'] == 'integration'
+        and [f['file_name'] for f in merged['files']] == ['yamlenv/y.go'],
+        detail=proc.stderr[-300:],
+    )
     proc, _ = run_merge(tmp, [('.', root)], out_name='skipdup.json', skip=('.',))
     check('skip module: a module both run and skipped is refused', ok=proc.returncode != 0)
 
@@ -1925,22 +4025,39 @@ def test_merge_skips_a_module_the_shard_did_not_run(tmp: Path) -> None:
 def shard_docs(tmp: Path) -> tuple[dict, list[dict]]:
     """One job's merged result for a two-module repo, and the same work split over two shards."""
     files = {
-        'envx.go': [('KILLED', 'ARITHMETIC_BASE'), ('LIVED', 'CONDITIONALS_BOUNDARY'),
-                    ('TIMED OUT', 'INVERT_LOGICAL')],
+        'envx.go': [
+            ('KILLED', 'ARITHMETIC_BASE'),
+            ('LIVED', 'CONDITIONALS_BOUNDARY'),
+            ('TIMED OUT', 'INVERT_LOGICAL'),
+        ],
         'parse/parse.go': [('KILLED', 'CONDITIONALS_NEGATION'), ('NOT COVERED', 'INVERT_LOOPCTRL')],
         'walk/walk.go': [('LIVED', 'ARITHMETIC_BASE'), ('NOT VIABLE', 'INVERT_BWASSIGN')],
     }
     nested = {'y.go': [('KILLED', 'ARITHMETIC_BASE'), ('KILLED', 'INVERT_LOGICAL')]}
     mod, sub = 'github.com/cplieger/envx/v2', 'github.com/cplieger/envx/yamlenv/v2'
     modes = {'.': 'per-package\n', 'yamlenv': 'integration\n'}
-    _, whole = run_merge(tmp, [('.', result(mod, list(files.items()))),
-                               ('yamlenv', result(sub, list(nested.items())))],
-                         out_name='whole.json', modes=modes)
-    _, s1 = run_merge(tmp, [('.', result(mod, [(f, files[f]) for f in ('envx.go', 'walk/walk.go')]))],
-                      out_name='s1.json', modes=modes, skip=('yamlenv',))
-    _, s2 = run_merge(tmp, [('.', result(mod, [('parse/parse.go', files['parse/parse.go'])])),
-                            ('yamlenv', result(sub, list(nested.items())))],
-                      out_name='s2.json', modes=modes)
+    _, whole = run_merge(
+        tmp,
+        [('.', result(mod, list(files.items()))), ('yamlenv', result(sub, list(nested.items())))],
+        out_name='whole.json',
+        modes=modes,
+    )
+    _, s1 = run_merge(
+        tmp,
+        [('.', result(mod, [(f, files[f]) for f in ('envx.go', 'walk/walk.go')]))],
+        out_name='s1.json',
+        modes=modes,
+        skip=('yamlenv',),
+    )
+    _, s2 = run_merge(
+        tmp,
+        [
+            ('.', result(mod, [('parse/parse.go', files['parse/parse.go'])])),
+            ('yamlenv', result(sub, list(nested.items()))),
+        ],
+        out_name='s2.json',
+        modes=modes,
+    )
     return whole, [s1, s2]
 
 
@@ -1955,28 +4072,47 @@ def test_merge_shards_reads_as_one_job(tmp: Path) -> None:
         check('merge shards: fixture merged', ok=False)
         return
     merged = merge_mod.merge_shards(shards)
-    keys = ('go_module', 'mutants_total', 'mutants_killed', 'mutants_lived', 'mutants_not_viable',
-            'mutants_not_covered', 'mutator_statistics', 'mode')
-    check('merge shards: counters, statistics and mode equal one job',
-          ok={k: merged[k] for k in keys} == {k: whole[k] for k in keys},
-          detail=f'{ {k: merged[k] for k in keys} } vs { {k: whole[k] for k in keys} }')
-    check('merge shards: efficacy and coverage equal one job',
-          ok=abs(merged['test_efficacy'] - whole['test_efficacy']) < 1e-9
-          and abs(merged['mutations_coverage'] - whole['mutations_coverage']) < 1e-9)
-    check('merge shards: every file once, as one job lists them',
-          ok=sorted(merged['files'], key=lambda f: f['file_name'])
-          == sorted(whole['files'], key=lambda f: f['file_name']))
-    check('merge shards: per-module counters sum across shards',
-          ok=sorted(merged['modules'], key=lambda m: m['dir'])
-          == sorted(whole['modules'], key=lambda m: m['dir']),
-          detail=f'{merged["modules"]} vs {whole["modules"]}')
+    keys = (
+        'go_module',
+        'mutants_total',
+        'mutants_killed',
+        'mutants_lived',
+        'mutants_not_viable',
+        'mutants_not_covered',
+        'mutator_statistics',
+        'mode',
+    )
+    check(
+        'merge shards: counters, statistics and mode equal one job',
+        ok={k: merged[k] for k in keys} == {k: whole[k] for k in keys},
+        detail=f'{ {k: merged[k] for k in keys} } vs { {k: whole[k] for k in keys} }',
+    )
+    check(
+        'merge shards: efficacy and coverage equal one job',
+        ok=abs(merged['test_efficacy'] - whole['test_efficacy']) < 1e-9
+        and abs(merged['mutations_coverage'] - whole['mutations_coverage']) < 1e-9,
+    )
+    check(
+        'merge shards: every file once, as one job lists them',
+        ok=sorted(merged['files'], key=lambda f: f['file_name'])
+        == sorted(whole['files'], key=lambda f: f['file_name']),
+    )
+    check(
+        'merge shards: per-module counters sum across shards',
+        ok=sorted(merged['modules'], key=lambda m: m['dir'])
+        == sorted(whole['modules'], key=lambda m: m['dir']),
+        detail=f'{merged["modules"]} vs {whole["modules"]}',
+    )
     try:
         merge_mod.merge_shards([shards[0], shards[0]])
         refused = ''
     except SystemExit as exc:
         refused = str(exc)
-    check('merge shards: a file measured in two shards is refused',
-          ok='envx.go' in refused, detail=refused[-300:])
+    check(
+        'merge shards: a file measured in two shards is refused',
+        ok='envx.go' in refused,
+        detail=refused[-300:],
+    )
     bad = json.loads(json.dumps(shards[1]))
     bad['mutants_killed'] += 1
     try:
@@ -1984,8 +4120,11 @@ def test_merge_shards_reads_as_one_job(tmp: Path) -> None:
         refused = ''
     except SystemExit as exc:
         refused = str(exc)
-    check('merge shards: a shard whose totals disagree with its files is refused',
-          ok='mutants_killed' in refused, detail=refused[-300:])
+    check(
+        'merge shards: a shard whose totals disagree with its files is refused',
+        ok='mutants_killed' in refused,
+        detail=refused[-300:],
+    )
 
 
 def test_aggregate_merges_shards_per_attempt(tmp: Path) -> None:
@@ -1996,11 +4135,26 @@ def test_aggregate_merges_shards_per_attempt(tmp: Path) -> None:
 
     def aggregate_run(art: Path) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, str(AGGREGATE), '--repo', 'envx', '--artifacts-dir', str(art),
-             '--week', '2026-11-15 22:00', '--run-url', 'https://example.invalid/run/9',
-             '--badge-file', str(art / 'badge.json'),
-             '--attempts-marker-file', str(art / 'attempts.txt')],
-            capture_output=True, text=True, check=False)
+            [
+                sys.executable,
+                str(AGGREGATE),
+                '--repo',
+                'envx',
+                '--artifacts-dir',
+                str(art),
+                '--week',
+                '2026-11-15 22:00',
+                '--run-url',
+                'https://example.invalid/run/9',
+                '--badge-file',
+                str(art / 'badge.json'),
+                '--attempts-marker-file',
+                str(art / 'attempts.txt'),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
     one = tmp / 'one-job'
     for attempt in (1, 2, 3):
@@ -2010,59 +4164,131 @@ def test_aggregate_merges_shards_per_attempt(tmp: Path) -> None:
         for n, doc in enumerate(shards, start=1):
             d = split / f'gremlins-envx-{attempt}-shard{n}'
             d.mkdir(parents=True)
-            (d / 'meta.json').write_text(json.dumps(
-                {'repo': 'envx', 'attempt': str(attempt), 'shard': str(n), 'shards': '2'}))
+            (d / 'meta.json').write_text(
+                json.dumps(
+                    {'repo': 'envx', 'attempt': str(attempt), 'shard': str(n), 'shards': '2'}
+                )
+            )
             (d / 'gremlins-out.json').write_text(json.dumps(doc))
     want, got = aggregate_run(one), aggregate_run(split)
     check('aggregate shards: exits 0', ok=got.returncode == 0, detail=got.stderr[-400:])
-    check('aggregate shards: the tracker body reads exactly as one job per attempt',
-          ok=got.stdout == want.stdout and bool(want.stdout), detail=got.stdout[:600])
-    check('aggregate shards: the badge reads exactly as one job per attempt',
-          ok=(split / 'badge.json').read_text() == (one / 'badge.json').read_text())
-    check('aggregate shards: three attempts counted, not six',
-          ok=(split / 'attempts.txt').read_text() == '3')
+    check(
+        'aggregate shards: the tracker body reads exactly as one job per attempt',
+        ok=got.stdout == want.stdout and bool(want.stdout),
+        detail=got.stdout[:600],
+    )
+    check(
+        'aggregate shards: the badge reads exactly as one job per attempt',
+        ok=(split / 'badge.json').read_text() == (one / 'badge.json').read_text(),
+    )
+    check(
+        'aggregate shards: three attempts counted, not six',
+        ok=(split / 'attempts.txt').read_text() == '3',
+    )
     (split / 'gremlins-envx-3-shard2' / 'gremlins-out.json').write_text('{"gremlins_error": true}')
     got = aggregate_run(split)
-    check('aggregate shards: an attempt with a failed shard is skipped, not half-counted',
-          ok=got.returncode == 0 and (split / 'attempts.txt').read_text() == '2'
-          and 'attempt 3' in got.stderr, detail=got.stderr[-400:])
+    check(
+        'aggregate shards: an attempt with a failed shard is skipped, not half-counted',
+        ok=got.returncode == 0
+        and (split / 'attempts.txt').read_text() == '2'
+        and 'attempt 3' in got.stderr,
+        detail=got.stderr[-400:],
+    )
     for p in (split / 'gremlins-envx-3-shard2').iterdir():
         p.unlink()
     (split / 'gremlins-envx-3-shard2').rmdir()
     got = aggregate_run(split)
-    check('aggregate shards: an attempt missing a shard is skipped',
-          ok=got.returncode == 0 and (split / 'attempts.txt').read_text() == '2'
-          and 'attempt 3' in got.stderr, detail=got.stderr[-400:])
+    check(
+        'aggregate shards: an attempt missing a shard is skipped',
+        ok=got.returncode == 0
+        and (split / 'attempts.txt').read_text() == '2'
+        and 'attempt 3' in got.stderr,
+        detail=got.stderr[-400:],
+    )
 
 
 def test_runner_takes_the_mode_the_plan_set(tmp: Path) -> None:
     guards = ''.join(re.findall(r'^: "\$\{.*\n', RUNNER.read_text(), re.MULTILINE))
-    base = {'PATH': '/usr/bin:/bin', **dict.fromkeys((
-        'GREMLINS_VERSION', 'GREMLINS_PATCHES', 'WORKERS_MAX', 'GOMEM_MAX_MB', 'GOMEM_SOLO_MB',
-        'PROBE_TIMEOUT', 'OUT'), 'x'), 'JOB_TIMEOUT_MINUTES': '350', 'GREMLINS_WORKERS': '4'}
-    _, proc = call_shell('select_mode', '60', '20', '4', deps=('integration_wanted',),
-                         prelude=guards, env={**base, 'GREMLINS_MODE': 'per-package'})
-    check('runner forced mode: the plan overrides a fitting integration estimate',
-          ok=proc.returncode == 0 and proc.stdout == 'per-package\n'
-          and proc.stderr == 'mode=per-package (set by the shard plan)\n',
-          detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
-    _, proc = call_shell('select_mode', '', '', '4', deps=('integration_wanted',),
-                         prelude=guards, env={**base, 'GREMLINS_MODE': 'integration'})
-    check('runner forced mode: integration without a dry-run count',
-          ok=proc.returncode == 0 and proc.stdout == 'integration\n',
-          detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
-    _, proc = call_shell('select_mode', '60', '20', '4', deps=('integration_wanted',),
-                         prelude=guards, env={**base, 'GREMLINS_MODE': 'sharded'})
-    check('runner forced mode: an unknown mode fails',
-          ok=proc.returncode != 0 and proc.stdout == '' and 'sharded' in proc.stderr,
-          detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+    base = {
+        'PATH': '/usr/bin:/bin',
+        **dict.fromkeys(
+            (
+                'GREMLINS_VERSION',
+                'GREMLINS_PATCHES',
+                'WORKERS_MAX',
+                'GOMEM_MAX_MB',
+                'GOMEM_SOLO_MB',
+                'PROBE_TIMEOUT',
+                'OUT',
+            ),
+            'x',
+        ),
+        'JOB_TIMEOUT_MINUTES': '350',
+        'GREMLINS_WORKERS': '4',
+    }
+    _, proc = call_shell(
+        'select_mode',
+        '60',
+        '20',
+        '4',
+        deps=('integration_wanted',),
+        prelude=guards,
+        env={**base, 'GREMLINS_MODE': 'per-package'},
+    )
+    check(
+        'runner forced mode: the plan overrides a fitting integration estimate',
+        ok=proc.returncode == 0
+        and proc.stdout == 'per-package\n'
+        and proc.stderr == 'mode=per-package (set by the shard plan)\n',
+        detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}',
+    )
+    _, proc = call_shell(
+        'select_mode',
+        '',
+        '',
+        '4',
+        deps=('integration_wanted',),
+        prelude=guards,
+        env={**base, 'GREMLINS_MODE': 'integration'},
+    )
+    check(
+        'runner forced mode: integration without a dry-run count',
+        ok=proc.returncode == 0 and proc.stdout == 'integration\n',
+        detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}',
+    )
+    _, proc = call_shell(
+        'select_mode',
+        '60',
+        '20',
+        '4',
+        deps=('integration_wanted',),
+        prelude=guards,
+        env={**base, 'GREMLINS_MODE': 'sharded'},
+    )
+    check(
+        'runner forced mode: an unknown mode fails',
+        ok=proc.returncode != 0 and proc.stdout == '' and 'sharded' in proc.stderr,
+        detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}',
+    )
     unpaired = {k: v for k, v in base.items() if k != 'GREMLINS_WORKERS'}
-    for label, extra in (('a plan mode without the plan\'s workers', {'GREMLINS_MODE': 'per-package'}),
-                         ('the plan\'s workers without its mode', {'GREMLINS_WORKERS': '4'})):
-        _, proc = call_shell('select_mode', '60', '20', '4', deps=('integration_wanted',),
-                             prelude=guards, env={**unpaired, **extra})
-        check(f'runner forced mode: {label} is refused', ok=proc.returncode != 0 and proc.stdout == '',
-              detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+    for label, extra in (
+        ("a plan mode without the plan's workers", {'GREMLINS_MODE': 'per-package'}),
+        ("the plan's workers without its mode", {'GREMLINS_WORKERS': '4'}),
+    ):
+        _, proc = call_shell(
+            'select_mode',
+            '60',
+            '20',
+            '4',
+            deps=('integration_wanted',),
+            prelude=guards,
+            env={**unpaired, **extra},
+        )
+        check(
+            f'runner forced mode: {label} is refused',
+            ok=proc.returncode != 0 and proc.stdout == '',
+            detail=f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}',
+        )
 
 
 def stub_tools(d: Path, tools: dict[str, str]) -> str:
@@ -2082,124 +4308,234 @@ def test_runner_shard_takes_the_plans_workers(tmp: Path) -> None:
     log, state = tmp / 'go.log', tmp / 'solo-passed'
     # The solo suite passes and every later run fails, as a suite that cannot
     # share /tmp with a copy of itself does.
-    path = stub_tools(tmp / 'bin', {
-        'go': f'echo "$*" >>"{log}"\ncase "$1" in test) [ -e "{state}" ] && exit 1; '
-              f'touch "{state}" ;; esac\nexit 0',
-        'gremlins': 'exit 1',
-    })
+    path = stub_tools(
+        tmp / 'bin',
+        {
+            'go': f'echo "$*" >>"{log}"\ncase "$1" in test) [ -e "{state}" ] && exit 1; '
+            f'touch "{state}" ;; esac\nexit 0',
+            'gremlins': 'exit 1',
+        },
+    )
     (tmp / 'mod').mkdir()
-    env = {'PATH': path, 'HOME': str(tmp), 'WORKERS_MAX': '4', 'GOMEM_MAX_MB': '3000',
-           'GOMEM_SOLO_MB': '12000', 'PROBE_TIMEOUT': '60'}
+    env = {
+        'PATH': path,
+        'HOME': str(tmp),
+        'WORKERS_MAX': '4',
+        'GOMEM_MAX_MB': '3000',
+        'GOMEM_SOLO_MB': '12000',
+        'PROBE_TIMEOUT': '60',
+    }
 
     def run(extra: dict[str, str]) -> subprocess.CompletedProcess:
         log.unlink(missing_ok=True)
         state.unlink(missing_ok=True)
         return subprocess.run(
-            ['bash', '--norc', '--noprofile', '-c', (f'set -euo pipefail\n{src}\nchoose_workers\n'
-             'printf "workers=%s GOMEMLIMIT=%s\\n" "${workers}" "${GOMEMLIMIT}"')],
-            cwd=tmp / 'mod', env={**env, **extra}, capture_output=True, text=True, check=False)
+            [
+                'bash',
+                '--norc',
+                '--noprofile',
+                '-c',
+                (
+                    f'set -euo pipefail\n{src}\nchoose_workers\n'
+                    'printf "workers=%s GOMEMLIMIT=%s\\n" "${workers}" "${GOMEMLIMIT}"'
+                ),
+            ],
+            cwd=tmp / 'mod',
+            env={**env, **extra},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
     proc = run({'GREMLINS_WORKERS': '4', 'GREMLINS_MODE': 'per-package'})
-    check('runner workers: a shard given the plan\'s count runs at it without probing',
-          ok=proc.returncode == 0 and proc.stdout.endswith('workers=4 GOMEMLIMIT=3000MiB\n')
-          and not log.exists(),
-          detail=f'rc={proc.returncode} out={proc.stdout[-300:]!r} go={log.exists() and log.read_text()!r}')
+    check(
+        "runner workers: a shard given the plan's count runs at it without probing",
+        ok=proc.returncode == 0
+        and proc.stdout.endswith('workers=4 GOMEMLIMIT=3000MiB\n')
+        and not log.exists(),
+        detail=f'rc={proc.returncode} out={proc.stdout[-300:]!r} go={log.exists() and log.read_text()!r}',
+    )
     proc = run({'GREMLINS_WORKERS': '1', 'GREMLINS_MODE': 'per-package'})
-    check('runner workers: a plan count of 1 takes the heap the container sized for it',
-          ok=proc.returncode == 0 and proc.stdout.endswith('workers=1 GOMEMLIMIT=3000MiB\n')
-          and not log.exists(), detail=f'rc={proc.returncode} out={proc.stdout[-300:]!r}')
+    check(
+        'runner workers: a plan count of 1 takes the heap the container sized for it',
+        ok=proc.returncode == 0
+        and proc.stdout.endswith('workers=1 GOMEMLIMIT=3000MiB\n')
+        and not log.exists(),
+        detail=f'rc={proc.returncode} out={proc.stdout[-300:]!r}',
+    )
     proc = run({})
-    check('runner workers: with no plan count a suite that fails beside itself runs at 1 worker',
-          ok=proc.returncode == 0 and proc.stdout.endswith('workers=1 GOMEMLIMIT=12000MiB\n')
-          and log.exists() and log.read_text().count('test') == 3,
-          detail=f'rc={proc.returncode} out={proc.stdout[-300:]!r} go={log.exists() and log.read_text()!r}')
+    check(
+        'runner workers: with no plan count a suite that fails beside itself runs at 1 worker',
+        ok=proc.returncode == 0
+        and proc.stdout.endswith('workers=1 GOMEMLIMIT=12000MiB\n')
+        and log.exists()
+        and log.read_text().count('test') == 3,
+        detail=f'rc={proc.returncode} out={proc.stdout[-300:]!r} go={log.exists() and log.read_text()!r}',
+    )
 
 
 def test_runner_plan_probe_ends_by_the_deadline(tmp: Path) -> None:
     srcs = [shell_function(fn) for fn in ('plan_time_left', 'choose_workers')]
     text = RUNNER.read_text()
-    check('runner plan deadline: plan_time_left runs right before choose_workers',
-          ok=all(srcs) and re.search(r'^plan_time_left\nchoose_workers$', text, re.MULTILINE) is not None)
+    check(
+        'runner plan deadline: plan_time_left runs right before choose_workers',
+        ok=all(srcs)
+        and re.search(r'^plan_time_left\nchoose_workers$', text, re.MULTILINE) is not None,
+    )
     if not all(srcs):
         return
     log = tmp / 'go.log'
     path = stub_tools(tmp / 'bin', {'go': f'echo "$*" >>"{log}"', 'gremlins': 'exit 1'})
     (tmp / 'mod').mkdir()
-    env = {'PATH': path, 'HOME': str(tmp), 'WORKERS_MAX': '4', 'GOMEM_MAX_MB': '3000',
-           'GOMEM_SOLO_MB': '12000', 'PROBE_TIMEOUT': '600'}
+    env = {
+        'PATH': path,
+        'HOME': str(tmp),
+        'WORKERS_MAX': '4',
+        'GOMEM_MAX_MB': '3000',
+        'GOMEM_SOLO_MB': '12000',
+        'PROBE_TIMEOUT': '600',
+    }
 
     def run(extra: dict[str, str]) -> subprocess.CompletedProcess:
         log.unlink(missing_ok=True)
         return subprocess.run(
-            ['bash', '--norc', '--noprofile', '-c', (f'set -euo pipefail\n{"".join(srcs)}\n'
-             'plan_time_left\nprintf "probe=%s\\n" "${PROBE_TIMEOUT}"\nchoose_workers')],
-            cwd=tmp / 'mod', env={**env, **extra}, capture_output=True, text=True, check=False)
+            [
+                'bash',
+                '--norc',
+                '--noprofile',
+                '-c',
+                (
+                    f'set -euo pipefail\n{"".join(srcs)}\n'
+                    'plan_time_left\nprintf "probe=%s\\n" "${PROBE_TIMEOUT}"\nchoose_workers'
+                ),
+            ],
+            cwd=tmp / 'mod',
+            env={**env, **extra},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
     now = int(time.time())
     proc = run({'PLAN_DIR': str(tmp), 'PLAN_DEADLINE': str(now - 1)})
-    check('runner plan deadline: a plan past its deadline exits before the probe',
-          ok=proc.returncode == 1 and '::error::' in proc.stdout and 'probe=' not in proc.stdout
-          and not log.exists(),
-          detail=f'rc={proc.returncode} out={proc.stdout[-300:]!r} go={log.exists() and log.read_text()!r}')
+    check(
+        'runner plan deadline: a plan past its deadline exits before the probe',
+        ok=proc.returncode == 1
+        and '::error::' in proc.stdout
+        and 'probe=' not in proc.stdout
+        and not log.exists(),
+        detail=f'rc={proc.returncode} out={proc.stdout[-300:]!r} go={log.exists() and log.read_text()!r}',
+    )
     proc = run({'PLAN_DIR': str(tmp), 'PLAN_DEADLINE': str(now + 2)})
-    check('runner plan deadline: under 3 s left is past it, so no probe phase gets timeout 0',
-          ok=proc.returncode == 1 and not log.exists(), detail=f'rc={proc.returncode} out={proc.stdout[-300:]!r}')
+    check(
+        'runner plan deadline: under 3 s left is past it, so no probe phase gets timeout 0',
+        ok=proc.returncode == 1 and not log.exists(),
+        detail=f'rc={proc.returncode} out={proc.stdout[-300:]!r}',
+    )
     proc = run({'PLAN_DIR': str(tmp), 'PLAN_DEADLINE': str(now + 90)})
     probe = re.search(r'^probe=(\d+)$', proc.stdout, re.MULTILINE)
-    check('runner plan deadline: each of the three probe phases gets a third of the time left',
-          ok=proc.returncode == 0 and probe is not None and 28 <= int(probe.group(1)) <= 30,
-          detail=f'rc={proc.returncode} out={proc.stdout[-300:]!r}')
+    check(
+        'runner plan deadline: each of the three probe phases gets a third of the time left',
+        ok=proc.returncode == 0 and probe is not None and 28 <= int(probe.group(1)) <= 30,
+        detail=f'rc={proc.returncode} out={proc.stdout[-300:]!r}',
+    )
     proc = run({'PLAN_DIR': str(tmp), 'PLAN_DEADLINE': str(now + 3600)})
-    check('runner plan deadline: a PROBE_TIMEOUT under the share is kept',
-          ok=proc.returncode == 0 and 'probe=600\n' in proc.stdout, detail=f'out={proc.stdout[-300:]!r}')
+    check(
+        'runner plan deadline: a PROBE_TIMEOUT under the share is kept',
+        ok=proc.returncode == 0 and 'probe=600\n' in proc.stdout,
+        detail=f'out={proc.stdout[-300:]!r}',
+    )
     proc = run({})
-    check('runner plan deadline: a run with no plan keeps PROBE_TIMEOUT',
-          ok=proc.returncode == 0 and 'probe=600\n' in proc.stdout, detail=f'out={proc.stdout[-300:]!r}')
+    check(
+        'runner plan deadline: a run with no plan keeps PROBE_TIMEOUT',
+        ok=proc.returncode == 0 and 'probe=600\n' in proc.stdout,
+        detail=f'out={proc.stdout[-300:]!r}',
+    )
 
 
-def run_container(tmp: Path, extra: dict[str, str]) -> tuple[subprocess.CompletedProcess, list[str]]:
+def run_container(
+    tmp: Path, extra: dict[str, str]
+) -> tuple[subprocess.CompletedProcess, list[str]]:
     """Run gremlins-container.sh with a stub docker; returns the process and `docker run`'s args."""
     work = tmp / 'container'
     (work / 'target').mkdir(parents=True, exist_ok=True)
     (work / 'target' / 'go.mod').write_text('module example.com/m\n\ngo 1.26.1\n')
     args = work / 'docker-run.args'
     args.unlink(missing_ok=True)
-    path = stub_tools(tmp / 'container-bin', {
-        'docker': f'[ "$1" = run ] || exit 0\nshift\nprintf "%s\\n" "$@" >"{args}"',
-    })
+    path = stub_tools(
+        tmp / 'container-bin',
+        {
+            'docker': f'[ "$1" = run ] || exit 0\nshift\nprintf "%s\\n" "$@" >"{args}"',
+        },
+    )
     proc = subprocess.run(
-        ['bash', str(CONTAINER), '.'], cwd=work, capture_output=True, text=True, check=False,
-        env={'PATH': path, 'GREMLINS_VERSION': 'v0.6.0', 'PROBE_TIMEOUT': '600',
-             'JOB_TIMEOUT_MINUTES': '350', 'OUT': '/work/./gremlins-out.json', **extra})
+        ['bash', str(CONTAINER), '.'],
+        cwd=work,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            'PATH': path,
+            'GREMLINS_VERSION': 'v0.6.0',
+            'PROBE_TIMEOUT': '600',
+            'JOB_TIMEOUT_MINUTES': '350',
+            'OUT': '/work/./gremlins-out.json',
+            **extra,
+        },
+    )
     return proc, args.read_text().splitlines() if args.exists() else []
 
 
 def test_container_passes_the_plans_workers(tmp: Path) -> None:
     proc, args = run_container(tmp, {})
     sized = next((a for a in args if a.startswith('WORKERS_MAX=')), '')
-    check('container workers: an unsharded run sizes its own workers and passes no plan count',
-          ok=proc.returncode == 0 and bool(sized) and not any(
-              a.startswith('GREMLINS_WORKERS=') for a in args),
-          detail=f'rc={proc.returncode} {args} {proc.stderr[-300:]}')
+    check(
+        'container workers: an unsharded run sizes its own workers and passes no plan count',
+        ok=proc.returncode == 0
+        and bool(sized)
+        and not any(a.startswith('GREMLINS_WORKERS=') for a in args),
+        detail=f'rc={proc.returncode} {args} {proc.stderr[-300:]}',
+    )
     proc, args = run_container(tmp, {'GREMLINS_WORKERS': '3', 'GREMLINS_MODE': 'per-package'})
     gomem = next((a for a in args if a.startswith('GOMEM_MAX_MB=')), '=0')
-    check('container workers: a shard passes the plan\'s count as its workers and sizes the heap for it',
-          ok=proc.returncode == 0 and 'GREMLINS_WORKERS=3' in args and 'WORKERS_MAX=3' in args
-          and int(gomem.split('=')[1]) >= 1024,
-          detail=f'rc={proc.returncode} {args} {proc.stderr[-300:]}')
+    check(
+        "container workers: a shard passes the plan's count as its workers and sizes the heap for it",
+        ok=proc.returncode == 0
+        and 'GREMLINS_WORKERS=3' in args
+        and 'WORKERS_MAX=3' in args
+        and int(gomem.split('=')[1]) >= 1024,
+        detail=f'rc={proc.returncode} {args} {proc.stderr[-300:]}',
+    )
     for bad in ('0', '4x', '-1', '08'):
         proc, args = run_container(tmp, {'GREMLINS_WORKERS': bad, 'GREMLINS_MODE': 'per-package'})
-        check(f'container workers: a plan count of {bad!r} is refused before docker runs',
-              ok=proc.returncode != 0 and args == [] and 'GREMLINS_WORKERS' in proc.stderr + proc.stdout,
-              detail=f'rc={proc.returncode} {args} {proc.stdout[-200:]} {proc.stderr[-200:]}')
+        check(
+            f'container workers: a plan count of {bad!r} is refused before docker runs',
+            ok=proc.returncode != 0
+            and args == []
+            and 'GREMLINS_WORKERS' in proc.stderr + proc.stdout,
+            detail=f'rc={proc.returncode} {args} {proc.stdout[-200:]} {proc.stderr[-200:]}',
+        )
 
 
-def time_mutants(src: str, mod: Path, deadline: int, gocache: Path) -> tuple[subprocess.CompletedProcess, dict]:
+def time_mutants(
+    src: str, mod: Path, deadline: int, gocache: Path
+) -> tuple[subprocess.CompletedProcess, dict]:
     """Run the extracted time_package_mutants in mod; returns the process and its rows by path."""
     env = {**os.environ, 'GOFLAGS': '', 'GOCACHE': str(gocache), 'GOTOOLCHAIN': 'local'}
-    proc = subprocess.run(['bash', '--norc', '--noprofile', '-c',
-                           f'set -euo pipefail\n{src}\ntime_package_mutants {deadline}'],
-                          cwd=mod, env=env, capture_output=True, text=True, check=False)
+    proc = subprocess.run(
+        [
+            'bash',
+            '--norc',
+            '--noprofile',
+            '-c',
+            f'set -euo pipefail\n{src}\ntime_package_mutants {deadline}',
+        ],
+        cwd=mod,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     rows = [line.split('\t') for line in proc.stdout.splitlines()]
     return proc, {r[0]: int(r[1]) if len(r) == 2 and r[1].isdigit() else r[1:] for r in rows}
 
@@ -2210,8 +4546,10 @@ def write_module(mod: Path, files: dict[str, str]) -> None:
         (mod / name).write_text(text)
 
 
-SLEEP_TEST = ('package {pkg}\n\nimport (\n\t"testing"\n\t"time"\n)\n\n'
-              'func TestWait(t *testing.T) {{ time.Sleep({secs} * time.Second) }}\n')
+SLEEP_TEST = (
+    'package {pkg}\n\nimport (\n\t"testing"\n\t"time"\n)\n\n'
+    'func TestWait(t *testing.T) {{ time.Sleep({secs} * time.Second) }}\n'
+)
 
 
 def test_runner_times_each_package_mutant(tmp: Path) -> None:
@@ -2220,219 +4558,1556 @@ def test_runner_times_each_package_mutant(tmp: Path) -> None:
     if not src:
         return
     mod = tmp / 'mod'
-    write_module(mod, {
-        'go.mod': 'module example.com/m\n\ngo 1.21\n',
-        'm.go': 'package m\n\nfunc M() int { return 1 }\n',
-        'sub/s.go': 'package sub\n\nfunc S() int { return 2 }\n',
-        'sub/s_test.go': 'package sub\n\nimport "testing"\n\nfunc TestS(t *testing.T) {}\n',
-        'broken/b.go': 'package broken\n\nfunc B() int { return 3 }\n',
-        'broken/b_test.go': 'package broken\n\nimport "testing"\n\n'
-                            'func TestB(t *testing.T) { t.Fatal("red") }\n',
-        'onlytests/x_test.go': 'package onlytests\n',
-        'wait/w.go': 'package wait\n\nfunc W() int { return 4 }\n',
-        'wait/w_test.go': SLEEP_TEST.format(pkg='wait', secs=2),
-    })
+    write_module(
+        mod,
+        {
+            'go.mod': 'module example.com/m\n\ngo 1.21\n',
+            'm.go': 'package m\n\nfunc M() int { return 1 }\n',
+            'sub/s.go': 'package sub\n\nfunc S() int { return 2 }\n',
+            'sub/s_test.go': 'package sub\n\nimport "testing"\n\nfunc TestS(t *testing.T) {}\n',
+            'broken/b.go': 'package broken\n\nfunc B() int { return 3 }\n',
+            'broken/b_test.go': 'package broken\n\nimport "testing"\n\n'
+            'func TestB(t *testing.T) { t.Fatal("red") }\n',
+            'onlytests/x_test.go': 'package onlytests\n',
+            'wait/w.go': 'package wait\n\nfunc W() int { return 4 }\n',
+            'wait/w_test.go': SLEEP_TEST.format(pkg='wait', secs=2),
+        },
+    )
     before = {p: p.read_text() for p in mod.rglob('*') if p.is_file()}
     proc, rows = time_mutants(src, mod, int(time.time()) + 600, tmp / 'gocache')
-    check('runner mutant times: one millisecond row per package whose tests pass',
-          ok=proc.returncode == 0
-          and list(rows) == ['example.com/m', 'example.com/m/sub', 'example.com/m/wait']
-          and all(isinstance(ms, int) and ms > 0 for ms in rows.values()),
-          detail=f'rc={proc.returncode} {rows} {proc.stderr[-300:]}')
-    check('runner mutant times: a test that waits is charged at least its wall time',
-          ok=isinstance(rows.get('example.com/m/wait'), int) and rows['example.com/m/wait'] >= 2000,
-          detail=str(rows.get('example.com/m/wait')))
-    check('runner mutant times: every file is left as it was',
-          ok={p: p.read_text() for p in mod.rglob('*') if p.is_file()} == before)
+    check(
+        'runner mutant times: one millisecond row per package whose tests pass',
+        ok=proc.returncode == 0
+        and list(rows) == ['example.com/m', 'example.com/m/sub', 'example.com/m/wait']
+        and all(isinstance(ms, int) and ms > 0 for ms in rows.values()),
+        detail=f'rc={proc.returncode} {rows} {proc.stderr[-300:]}',
+    )
+    check(
+        'runner mutant times: a test that waits is charged at least its wall time',
+        ok=isinstance(rows.get('example.com/m/wait'), int) and rows['example.com/m/wait'] >= 2000,
+        detail=str(rows.get('example.com/m/wait')),
+    )
+    check(
+        'runner mutant times: every file is left as it was',
+        ok={p: p.read_text() for p in mod.rglob('*') if p.is_file()} == before,
+    )
     proc, rows = time_mutants(src, mod, int(time.time()) - 1, tmp / 'gocache')
-    check('runner mutant times: past the plan deadline no package is timed, and it says so',
-          ok=proc.returncode == 0 and rows == {} and 'deadline' in proc.stderr
-          and {p: p.read_text() for p in mod.rglob('*') if p.is_file()} == before,
-          detail=f'rc={proc.returncode} {rows} {proc.stderr[-300:]}')
+    check(
+        'runner mutant times: past the plan deadline no package is timed, and it says so',
+        ok=proc.returncode == 0
+        and rows == {}
+        and 'deadline' in proc.stderr
+        and {p: p.read_text() for p in mod.rglob('*') if p.is_file()} == before,
+        detail=f'rc={proc.returncode} {rows} {proc.stderr[-300:]}',
+    )
 
 
 def test_runner_marks_a_finished_plan(tmp: Path) -> None:
     text = RUNNER.read_text()
-    block = re.search(r'^if \[ -n "\$\{PLAN_DIR:-\}" \]; then\n(.*?)^fi$', text, re.MULTILINE | re.DOTALL)
+    block = re.search(
+        r'^if \[ -n "\$\{PLAN_DIR:-\}" \]; then\n(.*?)^fi$', text, re.MULTILINE | re.DOTALL
+    )
     tail = [line.strip() for line in block.group(1).splitlines()][-2:] if block else []
-    check('runner plan: the plan says it finished only as its last write before exiting',
-          ok=tail == ['printf \'sized=1\\n\' >>"${PLAN_DIR}/plan.env"', 'exit 0']
-          and text.count('sized=') == 1, detail=str(tail))
+    check(
+        'runner plan: the plan says it finished only as its last write before exiting',
+        ok=tail == ['printf \'sized=1\\n\' >>"${PLAN_DIR}/plan.env"', 'exit 0']
+        and text.count('sized=') == 1,
+        detail=str(tail),
+    )
 
 
-def workflow_jobs() -> dict:
+def workflow_jobs(path: Path = REPO_WORKFLOW) -> dict:
     import yaml
-    return yaml.safe_load(WORKFLOW.read_text())['jobs']
+
+    return yaml.safe_load(path.read_text())['jobs']
 
 
 def test_workflow_plans_then_shards_the_run(tmp: Path) -> None:
     import workflow_replay as wr
+
     jobs = workflow_jobs()
-    check('workflow shards: fanout, plan and shard jobs feed the run',
-          ok={'fanout', 'plan', 'shard', 'run'} <= set(jobs)
-          and jobs.get('run', {}).get('needs') == ['fanout', 'shard'], detail=str(list(jobs)))
+    check(
+        'workflow shards: setup, plan and shard jobs feed the run',
+        ok={'setup', 'plan', 'shard', 'run'} <= set(jobs)
+        and jobs.get('run', {}).get('needs') == ['setup', 'shard'],
+        detail=str(list(jobs)),
+    )
     if not {'plan', 'shard', 'run'} <= set(jobs):
         return
-    check('workflow shards: notify needs every other job',
-          ok=sorted(jobs['notify']['needs']) == sorted(set(jobs) - {'notify'}),
-          detail=str(jobs['notify']['needs']))
+    check(
+        "workflow shards: the result job needs every other job, so it reports each one's result",
+        ok=sorted(jobs['result']['needs']) == sorted(set(jobs) - {'result'}),
+        detail=str(jobs['result']['needs']),
+    )
 
     def steps(job: str) -> dict[str, str]:
         return {s['name']: s.get('run', '') for s in jobs[job]['steps'] if 'name' in s}
 
     plan_steps, run_steps = steps('plan'), steps('run')
     prep = 'Clone the target repo and scope its modules'
-    gone = ('Clone target repo', 'Discover Go modules to measure',
-            'Sync central .gremlins.yaml (authoritative for the weekly run)')
-    check('workflow shards: the plan and run jobs prepare the target through one script',
-          ok=all('scripts/gremlins-prepare.sh' in s.get(prep, '') for s in (plan_steps, run_steps))
-          and not any(n in s for s in (plan_steps, run_steps) for n in gone),
-          detail=f'{plan_steps.get(prep)!r} {run_steps.get(prep)!r}')
+    gone = (
+        'Clone target repo',
+        'Discover Go modules to measure',
+        'Sync central .gremlins.yaml (authoritative for the weekly run)',
+    )
+    check(
+        'workflow shards: the plan and run jobs prepare the target through one script',
+        ok=all('scripts/gremlins-prepare.sh' in s.get(prep, '') for s in (plan_steps, run_steps))
+        and not any(n in s for s in (plan_steps, run_steps) for n in gone),
+        detail=f'{plan_steps.get(prep)!r} {run_steps.get(prep)!r}',
+    )
     (tmp / 'wire' / 'scripts').mkdir(parents=True)
     stub = tmp / 'wire' / 'scripts' / 'gremlins-prepare.sh'
     stub.write_text('printf \'%s\\n\' "$@" >args\n')
     for label, body, env, want in (
         ('the plan job prepares the head', plan_steps.get(prep, ''), {}, ['x']),
-        ('an unsharded run prepares the head', run_steps.get(prep, ''),
-         {'SHARDS': '', 'SHARD': ''}, ['x']),
-        ('a shard prepares from its plan', run_steps.get(prep, ''),
-         {'SHARDS': '3', 'SHARD': '2'}, ['x', 'plan/plan.json', '2']),
+        (
+            'an unsharded run prepares the head',
+            run_steps.get(prep, ''),
+            {'SHARDS': '', 'SHARD': ''},
+            ['x'],
+        ),
+        (
+            'a shard prepares from its plan',
+            run_steps.get(prep, ''),
+            {'SHARDS': '3', 'SHARD': '2'},
+            ['x', 'plan/plan.json', '2'],
+        ),
     ):
         (tmp / 'wire' / 'args').unlink(missing_ok=True)
-        proc = subprocess.run(['bash', '-e', '-c', body], cwd=tmp / 'wire',
-                              env={**os.environ, 'REPO': 'x', **env}, capture_output=True,
-                              text=True, check=False)
+        proc = subprocess.run(
+            ['bash', '-e', '-c', body],
+            cwd=tmp / 'wire',
+            env={**os.environ, 'REPO': 'x', **env},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         out = tmp / 'wire' / 'args'
         args = out.read_text().splitlines() if proc.returncode == 0 and out.exists() else None
         check(f'workflow shards: {label}', ok=args == want, detail=f'{args} {proc.stderr[-200:]}')
-    size = next((s for s in jobs['plan']['steps'] if s.get('name') == "Size each module's mutation work"), {})
-    cap = '${{ needs.fanout.outputs.plan_timeout_minutes }}'
-    check('workflow shards: the plan deadline derives from the plan job\'s own cap',
-          ok=str(jobs['plan'].get('timeout-minutes')) == '${{ fromJSON(needs.fanout.outputs.plan_timeout_minutes) }}'
-          and size.get('env', {}).get('PLAN_TIMEOUT_MINUTES') == cap,
-          detail=f'{jobs["plan"].get("timeout-minutes")} {size.get("env")}')
+    size = next(
+        (s for s in jobs['plan']['steps'] if s.get('name') == "Size each module's mutation work"),
+        {},
+    )
+    cap = '${{ needs.setup.outputs.plan_timeout_minutes }}'
+    check(
+        "workflow shards: the plan deadline derives from the plan job's own cap",
+        ok=str(jobs['plan'].get('timeout-minutes'))
+        == '${{ fromJSON(needs.setup.outputs.plan_timeout_minutes) }}'
+        and size.get('env', {}).get('PLAN_TIMEOUT_MINUTES') == cap,
+        detail=f'{jobs["plan"].get("timeout-minutes")} {size.get("env")}',
+    )
     sized = tmp / 'size'
     stub_tools(sized / 'scripts', {})
     (sized / 'scripts' / 'gremlins-container.sh').write_text(
-        'printf \'%s|%s|%s\\n\' "$1" "${PLAN_DEADLINE:-}" "${PLAN_DIR#"$PWD"/}" >>container.log\n')
+        'printf \'%s|%s|%s\\n\' "$1" "${PLAN_DEADLINE:-}" "${PLAN_DIR#"$PWD"/}" >>container.log\n'
+    )
     (sized / 'scripts' / 'gremlins-shard.py').write_text(
-        'import sys\nopen("shard.args", "w").write(" ".join(sys.argv[1:]))\n')
+        'import sys\nopen("shard.args", "w").write(" ".join(sys.argv[1:]))\n'
+    )
     start = int(time.time())
     proc = subprocess.run(
-        ['bash', '-c', size.get('run', 'false')], cwd=sized, capture_output=True, text=True,
-        check=False, env={**os.environ, 'REPO': 'x', 'SHA': FIXTURE_SHA, 'MODULES': '. tools',
-                          'JOB_TIMEOUT_MINUTES': '350', 'TARGET_MINUTES': '240',
-                          'PLAN_TIMEOUT_MINUTES': '90'})
-    calls = [line.split('|') for line in (sized / 'container.log').read_text().splitlines()] if (
-        sized / 'container.log').exists() else []
+        ['bash', '-c', size.get('run', 'false')],
+        cwd=sized,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            'REPO': 'x',
+            'SHA': FIXTURE_SHA,
+            'MODULES': '. tools',
+            'JOB_TIMEOUT_MINUTES': '350',
+            'PLAN_TIMEOUT_MINUTES': '90',
+        },
+    )
+    calls = (
+        [line.split('|') for line in (sized / 'container.log').read_text().splitlines()]
+        if (sized / 'container.log').exists()
+        else []
+    )
     deadlines = {int(c[1]) for c in calls if len(c) == 3 and c[1].isdigit()}
-    check('workflow shards: every module is sized against one deadline inside the plan job\'s cap',
-          ok=proc.returncode == 0 and [(c[0], c[-1]) for c in calls]
-          == [('.', 'plan/modules/.'), ('tools', 'plan/modules/tools')] and len(deadlines) == 1
-          and start + 50 * 60 <= min(deadlines) <= int(time.time()) + 80 * 60,
-          detail=f'rc={proc.returncode} {calls} start={start} {proc.stderr[-300:]}')
+    check(
+        "workflow shards: every module is sized against one deadline inside the plan job's cap",
+        ok=proc.returncode == 0
+        and [(c[0], c[-1]) for c in calls]
+        == [('.', 'plan/modules/.'), ('tools', 'plan/modules/tools')]
+        and len(deadlines) == 1
+        and start + 50 * 60 <= min(deadlines) <= int(time.time()) + 80 * 60,
+        detail=f'rc={proc.returncode} {calls} start={start} {proc.stderr[-300:]}',
+    )
     shard_args = (sized / 'shard.args').read_text() if (sized / 'shard.args').exists() else ''
-    check('workflow shards: the plan step hands every module to the planner',
-          ok='--module .=plan/modules/. --module tools=plan/modules/tools' in shard_args
-          and '--target-minutes 240' in shard_args, detail=shard_args)
+    check(
+        'workflow shards: the plan step hands every module to the planner',
+        ok='--module .=plan/modules/. --module tools=plan/modules/tools' in shard_args
+        and '--target-minutes' not in shard_args,
+        detail=shard_args,
+    )
     (sized / 'scripts' / 'gremlins-container.sh').write_text(
-        'echo "$1" >>container.log\n[ "$1" != "${FAIL_MODULE:-}" ]\n')
+        'echo "$1" >>container.log\n[ "$1" != "${FAIL_MODULE:-}" ]\n'
+    )
     for label, extra, want_calls, want_errors in (
-        ('a module whose sizing fails leaves the rest sized and every module planned',
-         {'FAIL_MODULE': '.', 'PLAN_TIMEOUT_MINUTES': '90'}, ['.', 'tools'], ['.']),
-        ('no module starts after the plan deadline',
-         {'PLAN_TIMEOUT_MINUTES': '20'}, [], ['.', 'tools']),
+        (
+            'a module whose sizing fails leaves the rest sized and every module planned',
+            {'FAIL_MODULE': '.', 'PLAN_TIMEOUT_MINUTES': '90'},
+            ['.', 'tools'],
+            ['.'],
+        ),
+        (
+            'no module starts after the plan deadline',
+            {'PLAN_TIMEOUT_MINUTES': '20'},
+            [],
+            ['.', 'tools'],
+        ),
     ):
         for name in ('container.log', 'shard.args'):
             (sized / name).unlink(missing_ok=True)
         proc = subprocess.run(
-            ['bash', '-c', size.get('run', 'false')], cwd=sized, capture_output=True, text=True,
-            check=False, env={**os.environ, 'REPO': 'x', 'SHA': FIXTURE_SHA, 'MODULES': '. tools',
-                              'JOB_TIMEOUT_MINUTES': '350', 'TARGET_MINUTES': '240', **extra})
-        calls = (sized / 'container.log').read_text().splitlines() if (
-            sized / 'container.log').exists() else []
+            ['bash', '-c', size.get('run', 'false')],
+            cwd=sized,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                **os.environ,
+                'REPO': 'x',
+                'SHA': FIXTURE_SHA,
+                'MODULES': '. tools',
+                'JOB_TIMEOUT_MINUTES': '350',
+                **extra,
+            },
+        )
+        calls = (
+            (sized / 'container.log').read_text().splitlines()
+            if (sized / 'container.log').exists()
+            else []
+        )
         errors = re.findall(r'^::error::.*module (\S+)', proc.stdout, re.MULTILINE)
         shard_args = (sized / 'shard.args').read_text() if (sized / 'shard.args').exists() else ''
-        check(f'workflow shards: {label}',
-              ok=proc.returncode == 0 and calls == want_calls and errors == want_errors
-              and '--module .=plan/modules/. --module tools=plan/modules/tools' in shard_args,
-              detail=f'rc={proc.returncode} {calls} {errors} {shard_args!r} {proc.stdout[-300:]}')
+        check(
+            f'workflow shards: {label}',
+            ok=proc.returncode == 0
+            and calls == want_calls
+            and errors == want_errors
+            and '--module .=plan/modules/. --module tools=plan/modules/tools' in shard_args,
+            detail=f'rc={proc.returncode} {calls} {errors} {shard_args!r} {proc.stdout[-300:]}',
+        )
 
     def render(template: str, matrix: dict) -> str:
-        return wr.Scope({'matrix': matrix}, {}, []).render(template)
+        contexts = {
+            'matrix': matrix,
+            'needs': {'setup': {'outputs': {'key': 'x'}}},
+            'inputs': {'repository': 'x', 'module': ''},
+        }
+        return wr.Scope(contexts, {}, []).render(template)
 
-    gremlins_step = next((s.get('run', '') for s in jobs['run']['steps']
-                          if s.get('name', '').startswith('Run gremlins')), '')
+    gremlins_step = next(
+        (
+            s.get('run', '')
+            for s in jobs['run']['steps']
+            if s.get('name', '').startswith('Run gremlins')
+        ),
+        '',
+    )
     ran = tmp / 'run'
     stub_tools(ran / 'scripts', {})
     (ran / 'scripts' / 'gremlins-shard.py').write_text(
-        'import os, sys\nopen("shard.args", "w").write(" ".join(sys.argv[1:]))\n'
-        'print(os.environ.get("PLAN_LINES", "run . per-package 4\\nskip tools"))\n')
+        'import os, sys\nopen("shard.args", "a").write(" ".join(sys.argv[1:]) + "\\n")\n'
+        'if sys.argv[1] == "modules":\n'
+        '    print(os.environ.get("PLAN_LINES", "run . per-package 4\\nskip tools"))\n'
+    )
     (ran / 'scripts' / 'gremlins-container.sh').write_text(
         'printf \'%s|%s|%s|%s\\n\' "$1" "${GREMLINS_MODE-unset}" "${GREMLINS_WORKERS-unset}" '
-        '"${OUT}" >>container.log\n')
+        '"${OUT}" >>container.log\n'
+    )
     (ran / 'scripts' / 'gremlins-merge.py').write_text(
-        'import sys\nopen("merge.args", "w").write(" ".join(sys.argv[1:]))\n')
+        'import sys\nopen("merge.args", "w").write(" ".join(sys.argv[1:]))\n'
+    )
     for label, matrix, env, want_container, want_merge in (
-        ('a shard runs its planned modules at the plan\'s mode and workers and skips the rest',
-         {'repo': 'x', 'attempt': 1, 'shard': 2, 'shards': 3}, {'SHARDS': '3', 'SHARD': '2'},
-         ['.|per-package|4|/work/./gremlins-out.json'],
-         '--skip-module tools --module .=target/./gremlins-out.json'),
-        ('a shard runs a module the plan could not size with no plan mode or workers',
-         {'repo': 'x', 'attempt': 1, 'shard': 2, 'shards': 3},
-         {'SHARDS': '3', 'SHARD': '2', 'PLAN_LINES': 'skip .\nrun tools'},
-         ['tools|||/work/tools/gremlins-out.json'],
-         '--skip-module . --module tools=target/tools/gremlins-out.json'),
-        ('an unsharded attempt runs every module with no plan mode or workers',
-         {'repo': 'x', 'attempt': 1}, {'SHARDS': '', 'SHARD': ''},
-         ['.|||/work/./gremlins-out.json', 'tools|||/work/tools/gremlins-out.json'],
-         '--module .=target/./gremlins-out.json --module tools=target/tools/gremlins-out.json'),
+        (
+            "a shard runs its planned modules at the plan's mode and workers and skips the rest",
+            {'repo': 'x', 'attempt': 1, 'shard': 2, 'shards': 3},
+            {'SHARDS': '3', 'SHARD': '2'},
+            ['.|per-package|4|/work/./gremlins-out.json'],
+            '--skip-module tools --module .=target/./gremlins-out.json',
+        ),
+        (
+            'a shard runs a module the plan could not size with no plan mode or workers',
+            {'repo': 'x', 'attempt': 1, 'shard': 2, 'shards': 3},
+            {'SHARDS': '3', 'SHARD': '2', 'PLAN_LINES': 'skip .\nrun tools'},
+            ['tools|||/work/tools/gremlins-out.json'],
+            '--skip-module . --module tools=target/tools/gremlins-out.json',
+        ),
+        (
+            'an unsharded attempt runs every module with no plan mode or workers',
+            {'repo': 'x', 'attempt': 1},
+            {'SHARDS': '', 'SHARD': ''},
+            ['.|||/work/./gremlins-out.json', 'tools|||/work/tools/gremlins-out.json'],
+            '--module .=target/./gremlins-out.json --module tools=target/tools/gremlins-out.json',
+        ),
+        (
+            'a one-module call runs that module and skips the ones the module input left out',
+            {'repo': 'x', 'attempt': 1},
+            {'SHARDS': '', 'SHARD': '', 'MODULES': 'tools', 'UNTESTED': '.'},
+            ['tools|||/work/tools/gremlins-out.json'],
+            '--skip-module . --module tools=target/tools/gremlins-out.json',
+        ),
     ):
         for name in ('container.log', 'merge.args', 'shard.args'):
             (ran / name).unlink(missing_ok=True)
-        body = render(gremlins_step, matrix).replace('/tmp/gremlins-out.json', str(ran / 'out.json'))
-        proc = subprocess.run(['bash', '-c', body], cwd=ran, capture_output=True, text=True,
-                              check=False, env={**os.environ, 'MODULES': '. tools',
-                                                'JOB_TIMEOUT_MINUTES': '350', **env})
-        got = (ran / 'container.log').read_text().splitlines() if (ran / 'container.log').exists() else []
+        body = render(gremlins_step, matrix).replace(
+            '/tmp/gremlins-out.json', str(ran / 'out.json')
+        )
+        proc = subprocess.run(
+            ['bash', '-c', body],
+            cwd=ran,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                **os.environ,
+                'REPO': 'x',
+                'MODULES': '. tools',
+                'JOB_TIMEOUT_MINUTES': '350',
+                **env,
+            },
+        )
+        got = (
+            (ran / 'container.log').read_text().splitlines()
+            if (ran / 'container.log').exists()
+            else []
+        )
         merge = (ran / 'merge.args').read_text() if (ran / 'merge.args').exists() else ''
-        check(f'workflow shards: {label}',
-              ok=proc.returncode == 0 and got == want_container
-              and merge == f'--out {ran / "out.json"} {want_merge}',
-              detail=f'rc={proc.returncode} {got} {merge!r} {proc.stdout[-200:]} {proc.stderr[-200:]}')
+        check(
+            f'workflow shards: {label}',
+            ok=proc.returncode == 0
+            and got == want_container
+            and merge == f'--out {ran / "out.json"} {want_merge}',
+            detail=f'rc={proc.returncode} {got} {merge!r} {proc.stdout[-200:]} {proc.stderr[-200:]}',
+        )
         if env['SHARDS']:
-            asked = (ran / 'shard.args').read_text() if (ran / 'shard.args').exists() else ''
-            check('workflow shards: a shard asks the plan for its own shard\'s modules',
-                  ok=asked == 'modules --plan plan/plan.json --shard 2 --modules . tools',
-                  detail=asked)
+            asked = (
+                (ran / 'shard.args').read_text().splitlines()
+                if (ran / 'shard.args').exists()
+                else []
+            )
+            check(
+                "workflow shards: a shard asks its repo's run plan for its own shard's modules",
+                ok=asked[:1] == ['modules --plan plan/plan.json --shard 2 --modules . tools'],
+                detail=str(asked),
+            )
+        check(
+            f'workflow shards: with no stamped record ({label}) no costs are asked for, with a warning',
+            ok='::warning::no cost record for x' in proc.stdout
+            and not any(
+                line.startswith('costs')
+                for line in (
+                    (ran / 'shard.args').read_text().splitlines()
+                    if (ran / 'shard.args').exists()
+                    else []
+                )
+            ),
+            detail=proc.stdout[-300:],
+        )
+    for name in ('container.log', 'merge.args', 'shard.args'):
+        (ran / name).unlink(missing_ok=True)
+    (ran / 'target' / 'tools').mkdir(parents=True)
+    (ran / 'target' / 'tools' / 'gremlins-out.json.times').write_text('#workers\t1\n')
+    body = render(gremlins_step, {'repo': 'x', 'attempt': 1}).replace(
+        '/tmp/gremlins-out.json', str(ran / 'out.json')
+    )
+    proc = subprocess.run(
+        ['bash', '-c', body],
+        cwd=ran,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            'REPO': 'x',
+            'MODULES': '. tools',
+            'JOB_TIMEOUT_MINUTES': '350',
+            'SHARDS': '',
+            'SHARD': '',
+        },
+    )
+    asked = (ran / 'shard.args').read_text().splitlines() if (ran / 'shard.args').exists() else []
+    check(
+        'workflow shards: each module run with a stamped record is handed to the cost record',
+        ok=proc.returncode == 0
+        and asked
+        == [
+            'costs --module tools=target/tools/gremlins-out.json.times --out /tmp/gremlins-costs.json'
+        ],
+        detail=f'{asked} {proc.stdout[-200:]}',
+    )
 
-    upload = next(s for s in jobs['run']['steps'] if s.get('uses', '').startswith(
-        'actions/upload-artifact'))
-    unsharded, sharded = {'repo': 'x', 'attempt': 1}, {'repo': 'x', 'attempt': 1, 'shard': 2,
-                                                         'shards': 3}
-    check('workflow shards: an unsharded job keeps its name and artifact',
-          ok=render(jobs['run']['name'], unsharded) == 'run (x, 1)'
-          and render(upload['with']['name'], unsharded) == 'gremlins-x-1',
-          detail=f'{render(jobs["run"]["name"], unsharded)} {render(upload["with"]["name"], unsharded)}')
-    check('workflow shards: a shard job names its shard',
-          ok=render(jobs['run']['name'], sharded) == 'run (x, 1, shard 2 of 3)'
-          and render(upload['with']['name'], sharded) == 'gremlins-x-1-shard2',
-          detail=f'{render(jobs["run"]["name"], sharded)} {render(upload["with"]["name"], sharded)}')
+    upload = next(
+        s for s in jobs['run']['steps'] if s.get('uses', '').startswith('actions/upload-artifact')
+    )
+    unsharded, sharded = (
+        {'repo': 'x', 'attempt': 1},
+        {'repo': 'x', 'attempt': 1, 'shard': 2, 'shards': 3},
+    )
+    check(
+        'workflow shards: an unsharded job keeps its name and artifact',
+        ok=render(jobs['run']['name'], unsharded) == 'run (1)'
+        and render(upload['with']['name'], unsharded) == 'gremlins-x-1',
+        detail=f'{render(jobs["run"]["name"], unsharded)} {render(upload["with"]["name"], unsharded)}',
+    )
+    check(
+        'workflow shards: a shard job names its shard',
+        ok=render(jobs['run']['name'], sharded) == 'run (1, shard 2 of 3)'
+        and render(upload['with']['name'], sharded) == 'gremlins-x-1-shard2',
+        detail=f'{render(jobs["run"]["name"], sharded)} {render(upload["with"]["name"], sharded)}',
+    )
     meta = steps('run')['Record which repo and attempt this artifact is']
     for label, env, want in (
-        ('an unsharded attempt', {'REPO': 'x', 'ATTEMPT': '1', 'SHARD': '', 'SHARDS': ''},
-         {'repo': 'x', 'attempt': '1'}),
-        ('a shard', {'REPO': 'x', 'ATTEMPT': '1', 'SHARD': '2', 'SHARDS': '3'},
-         {'repo': 'x', 'attempt': '1', 'shard': '2', 'shards': '3'}),
+        (
+            'an unsharded attempt',
+            {'REPO': 'x', 'ATTEMPT': '1', 'SHARD': '', 'SHARDS': ''},
+            {'repo': 'x', 'attempt': '1'},
+        ),
+        (
+            'a shard',
+            {'REPO': 'x', 'ATTEMPT': '1', 'SHARD': '2', 'SHARDS': '3'},
+            {'repo': 'x', 'attempt': '1', 'shard': '2', 'shards': '3'},
+        ),
     ):
         out = tmp / 'meta'
         out.mkdir(exist_ok=True)
         body = meta.replace('/tmp/meta.json', str(out / 'meta.json'))
-        proc = subprocess.run(['bash', '-c', body], env={**os.environ, **env},
-                              capture_output=True, text=True, check=False)
+        proc = subprocess.run(
+            ['bash', '-c', body],
+            env={**os.environ, **env},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         got = json.loads((out / 'meta.json').read_text()) if proc.returncode == 0 else None
-        check(f'workflow shards: meta.json for {label}', ok=got == want,
-              detail=f'{got} {proc.stderr[-200:]}')
+        check(
+            f'workflow shards: meta.json for {label}',
+            ok=got == want,
+            detail=f'{got} {proc.stderr[-200:]}',
+        )
+
+
+def test_workflow_carries_costs_between_runs(tmp: Path) -> None:
+    jobs = workflow_jobs()
+
+    def step(job: str, name: str) -> dict:
+        return next((s for s in jobs[job]['steps'] if s.get('name') == name), {})
+
+    def uploads(job: str) -> list[dict]:
+        return [
+            s for s in jobs[job]['steps'] if s.get('uses', '').startswith('actions/upload-artifact')
+        ]
+
+    def flat(run: str) -> str:
+        return re.sub(r'\\\n\s*', '', run).strip()
+
+    fetch = step('shard', 'Fetch the cost history')
+    check(
+        "workflow costs: the shard job reads the call's history with the run's own token and ref",
+        ok=fetch.get('env', {}).get('GH_TOKEN') == '${{ github.token }}'
+        and fetch.get('env', {}).get('REF') == '${{ github.ref_name }}'
+        and fetch.get('env', {}).get('KEY') == '${{ needs.setup.outputs.key }}'
+        and fetch.get('continue-on-error') is True
+        and fetch.get('timeout-minutes') == 4
+        and jobs['shard'].get('permissions') == {'actions': 'read', 'contents': 'read'}
+        and 'CI_SCHEDULE' not in json.dumps(jobs['shard']),
+        detail=str(fetch),
+    )
+    work = tmp / 'fetch'
+    stub_tools(work / 'scripts', {})
+    (work / 'scripts' / 'mutation-history.sh').write_text('printf \'%s \' "$@" >>calls\n')
+    proc = subprocess.run(
+        ['bash', '-c', fetch.get('run', 'false')],
+        cwd=work,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, 'KEY': 'b-c~tools', 'REF': 'main'},
+    )
+    calls = (work / 'calls').read_text() if (work / 'calls').exists() else ''
+    check(
+        "workflow costs: one history lookup, by the call's gremlinscosts key",
+        ok=proc.returncode == 0 and calls == 'gremlinscosts-b-c~tools main history costs.json ',
+        detail=f'{calls!r} {proc.stderr[-200:]}',
+    )
+    build = step('shard', 'Build the run matrix')
+    check(
+        "workflow costs: the matrix plans the call's repo from its history, with no target a caller sets",
+        ok='--history history/costs.json' in build.get('run', '')
+        and '--out-plan run-plans/plan.json' in build.get('run', '')
+        and '--plan sizing/plan.json' in build.get('run', '')
+        and 'TARGET_MINUTES' not in json.dumps(build)
+        and 'cp history/costs.json run-plans/history.json' in build.get('run', ''),
+        detail=build.get('run', '')[-400:],
+    )
+    plans = 'gremlinsplans-${{ needs.setup.outputs.key }}'
+    plans_up = [u['with'] for u in uploads('shard')]
+    check(
+        'workflow costs: the shard job uploads the run plan the run and record jobs download',
+        ok=plans_up
+        == [{'name': plans, 'path': 'run-plans', 'if-no-files-found': 'error', 'retention-days': 7}]
+        and step('run', 'Download the run plan').get('with') == {'name': plans, 'path': 'plan'}
+        and step('record', 'Download the run plan and the history it priced from').get('with')
+        == {'name': plans, 'path': 'run-plans'},
+        detail=str(plans_up),
+    )
+    check(
+        "workflow costs: the shard job downloads the call's own sizing by name",
+        ok=step('shard', 'Download the shard plan').get('with')
+        == {'name': 'shard-plan-${{ needs.setup.outputs.key }}', 'path': 'sizing'},
+    )
+    run_up = uploads('run')[0]['with']['path'].split()
+    check(
+        "workflow costs: each shard's artifact carries its cost record",
+        ok='/tmp/gremlins-costs.json' in run_up,
+        detail=str(run_up),
+    )
+    names = [s.get('name') for s in jobs['record']['steps']]
+    record = step('record', "Record this repo's measured costs")
+    check(
+        'workflow costs: the record job folds the history from the plan and history the shard job used',
+        ok=flat(record.get('run', ''))
+        == 'python3 scripts/gremlins-shard.py history --repo "$REPO" --artifacts-dir artifacts '
+        '--previous run-plans/history.json --plan run-plans/plan.json --out costs/costs.json'
+        and names.index('Download the run plan and the history it priced from')
+        < names.index("Record this repo's measured costs")
+        and 'CI_SCHEDULE' not in json.dumps(jobs['record'])
+        and jobs['record'].get('needs') == ['setup', 'shard', 'run'],
+        detail=f'{names} {record}',
+    )
+    run_step = step('run', 'Run gremlins (attempt ${{ matrix.attempt }})').get('run', '')
+    check(
+        'workflow costs: every module of a run stops by one deadline 20 min inside the cap, before the record',
+        ok='RUN_DEADLINE=$(($(date +%s) + (JOB_TIMEOUT_MINUTES - 20) * 60))\nexport RUN_DEADLINE'
+        in run_step.replace('          ', '')
+        and run_step.index('export RUN_DEADLINE')
+        < run_step.index('gremlins-container.sh')
+        < run_step.index('gremlins-shard.py costs')
+        and 'if [ "$rc" -eq 124 ]; then' in run_step,
+        detail=run_step[:300],
+    )
+    capped = step('record', 'Name a capped shard plan')
+    check(
+        'workflow costs: the record job names a capped plan from the run plan it downloaded',
+        ok=capped.get('run', '').strip()
+        == 'python3 scripts/gremlins-shard.py capped --repo "$REPO" --plan run-plans/plan.json'
+        and capped.get('env') == {'REPO': '${{ inputs.repository }}'}
+        and names.index('Download the run plan and the history it priced from')
+        < names.index('Name a capped shard plan'),
+        detail=str(capped),
+    )
+    check(
+        "workflow costs: the history is kept 90 days under the call's own key",
+        ok=[u['with'] for u in uploads('record')]
+        == [
+            {
+                'name': 'gremlinscosts-${{ needs.setup.outputs.key }}',
+                'path': 'costs/costs.json',
+                'if-no-files-found': 'error',
+                'retention-days': 90,
+            }
+        ],
+    )
+    check(
+        'workflow costs: the plan job no longer packs, so it takes no target',
+        ok='TARGET_MINUTES' not in json.dumps(jobs['plan']),
+    )
+
+
+def test_shard_matrix_fuzz_plans_each_bad_input(tmp: Path) -> None:
+    """Every bad plan or history the target's code could leave still plans the repo, and says so."""
+    import contextlib
+    import io
+
+    shard = load_script('gremlins_shard', SHARD)
+    fuzz = load_script('mutation_fuzz', HERE / 'mutation_fuzz.py')
+    repo = 'r1'
+    files = {f'p{n}/x.go': {'runnable': 100, 'prior_secs': 3000.0} for n in range(6)}
+    plan_doc = {
+        'repo': repo,
+        'sha': FIXTURE_SHA,
+        'modules': {
+            '.': {
+                'mode': 'per-package',
+                'workers': 1,
+                'setup_secs': 60.0,
+                'packages': {'p0': {'mutant_secs': 30.0}},
+                'files': files,
+            }
+        },
+    }
+    hist_doc = {
+        'repo': repo,
+        'modules': {
+            '.': {'files': {'p0/x.go': {'secs': 3000.0, 'mutants': 100}}, 'setup_secs': 60.0}
+        },
+    }
+    n = [0]
+
+    def plan(p_data: bytes | None, h_data: bytes | None) -> tuple[list | None, bytes | None, str]:
+        n[0] += 1
+        root = tmp / str(n[0])
+        root.mkdir()
+        if p_data is not None:
+            (root / 'sizing.json').write_bytes(p_data)
+        if h_data is not None:
+            (root / 'history.json').write_bytes(h_data)
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                rows = shard.matrix(
+                    repo,
+                    root / 'sizing.json',
+                    3,
+                    history_path=root / 'history.json',
+                    out_plan=root / 'plan.json',
+                )
+        except Exception as exc:
+            return None, None, f'{err.getvalue()} raised {exc!r:.200}'
+        out = root / 'plan.json'
+        return rows, out.read_bytes() if out.exists() else None, err.getvalue()
+
+    clean = [json.dumps(plan_doc).encode(), json.dumps(hist_doc).encode()]
+    clean_rows, clean_out, _ = plan(*clean)
+    check(
+        'fuzz: the fault-free repo shards',
+        ok=bool(clean_rows) and all(r.get('shards', 1) > 1 for r in clean_rows),
+        detail=str(clean_rows)[:300],
+    )
+    for kind, valid, i in (('plan', plan_doc, 0), ('history', hist_doc, 1)):
+        failed = []
+        for label, data in fuzz.bad_inputs(valid, seed=4 + i):
+            inputs = list(clean)
+            inputs[i] = data
+            rows, out, err = plan(*inputs)
+            doc = json.loads(data) if fuzz.usable(data) else None
+            accepted = (data is None and kind == 'history') or (
+                kind == 'plan'
+                and doc is not None
+                and shard.valid_sizing(doc) == ''
+                and doc.get('repo') == repo
+            )
+            runs = bool(rows) and all(r['repo'] == repo for r in rows) and len(rows) % 3 == 0
+            reported = accepted or out == clean_out or f'::warning::{repo}:' in err
+            if not (runs and reported):
+                failed.append(f'{label} (runs={runs} reported={reported}) {err[-120:]}')
+        check(
+            f'fuzz: a bad {kind} file still plans every attempt of the repo and is reported',
+            ok=not failed,
+            detail='; '.join(failed)[:900],
+        )
+
+
+def test_shard_keeps_every_shard_under_the_safe_limit_beside_a_slow_setup(tmp: Path) -> None:
+    import contextlib
+    import io
+
+    shard = load_script('gremlins_shard', SHARD)
+    # Three shards' worth of work at the band's top beside an 80-min setup.
+    files = int((3 * 0.99 * mutation_cost.TOP_SECS - 80 * 60 - 3600) / 300)
+    doc = {
+        'repo': 'r',
+        'sha': FIXTURE_SHA,
+        'modules': {
+            'slow': {
+                'mode': 'per-package',
+                'workers': 1,
+                'setup_secs': 80 * 60.0,
+                'packages': {},
+                'files': {
+                    's/x.go': {'runnable': 10, 'prior_secs': 3600.0 / mutation_cost.PRIOR_ERROR}
+                },
+            },
+            'fast': {
+                'mode': 'per-package',
+                'workers': 1,
+                'setup_secs': 0.0,
+                'packages': {},
+                'files': {
+                    f'p{n:03d}/x.go': {
+                        'runnable': 10,
+                        'prior_secs': 300.0 / mutation_cost.PRIOR_ERROR,
+                    }
+                    for n in range(files)
+                },
+            },
+        },
+    }
+    with contextlib.redirect_stderr(io.StringIO()):
+        plan, _ = shard.assign(doc, None)
+    slowest = []
+    for n in range(1, plan['shards'] + 1):
+        setups = sum(
+            doc['modules'][d]['setup_secs'] for d, e in plan['modules'].items() if n in e['shards']
+        )
+        work = sum(
+            f['work_secs']
+            for e in plan['modules'].values()
+            for f in e['files'].values()
+            if f['shard'] == n
+        )
+        slowest.append(mutation_cost.SLOWDOWN * (setups + work) / 60)
+    check(
+        'band: beside an 80-min setup, every shard of a 0-min-setup module ends by '
+        f'{mutation_cost.SAFE_JOB_MINUTES} min on a {mutation_cost.SLOWDOWN}x runner',
+        ok=shard.valid_plan(plan) == ''
+        and all(m <= mutation_cost.SAFE_JOB_MINUTES for m in slowest),
+        detail=f'{[round(m, 1) for m in slowest]} top={plan["top_minutes"]}',
+    )
+
+
+def unsized_doc(unsized: int, files: int = 6) -> dict:
+    """A sizing: one per-package module of FILES files priced at 66.7 min on 1 worker, beside UNSIZED unsized modules."""
+    modules = {
+        '.': {
+            'mode': 'per-package',
+            'workers': 1,
+            'setup_secs': 60.0,
+            'packages': {},
+            'files': {
+                f'p{n}/x.go': {'runnable': 100, 'prior_secs': 4000.0 / mutation_cost.PRIOR_ERROR}
+                for n in range(files)
+            },
+        }
+    }
+    modules |= {
+        f'u{n:02d}': {
+            'mode': None,
+            'workers': None,
+            'setup_secs': None,
+            'packages': {},
+            'files': {},
+        }
+        for n in range(unsized)
+    }
+    return {'repo': 'r', 'sha': FIXTURE_SHA, 'modules': modules}
+
+
+def test_shard_prices_a_probe_under_its_tick_as_unknown(tmp: Path) -> None:
+    import contextlib
+    import io
+
+    shard = load_script('gremlins_shard', SHARD)
+    fast = {'workers': '4', 'mode': 'integration', 'suite_secs': '0', 'mutants': '3000'}
+    fast['setup_secs'] = '60'
+    sub_ms = {'internal/a': (40, 0, 0), 'internal/b': (40, 0, 900)}
+    hist_int = {'modules': {'.': {'files': {'x.go': at({key: [0.9] for key in keys(3000)})}}}}
+    hist_pkg = {
+        'modules': {'.': {'files': {'internal/a/x.go': at({key: [2.0] for key in keys(40)})}}}
+    }
+    dry = {'.': (3000, 5, None)}
+    rows = (
+        ('zero probe, no history', fast, dry, None, '.', 'unknown'),
+        ('zero probe, real history', fast, dry, hist_int, '.', 'measured'),
+        ('sub-floor probe, no history', SMALL_ENV, sub_ms, None, 'internal/a/x.go', 'unknown'),
+        (
+            'sub-floor probe, real history',
+            SMALL_ENV,
+            sub_ms,
+            hist_pkg,
+            'internal/a/x.go',
+            'measured',
+        ),
+    )
+    for n, (label, env, packages, history, unit, want) in enumerate(rows):
+        d = tmp / f'tick-{n}'
+        write_plan_dir(d, 'github.com/cplieger/tick', env, packages)
+        try:
+            entry = shard.size_module(d)
+        except Exception as exc:
+            check(f'tick: {label}: sizes', ok=False, detail=repr(exc))
+            continue
+        prior = entry['prior_secs'] if unit == '.' else entry['files'][unit]['prior_secs']
+        check(
+            f'tick: {label}: the probe prices no work, so the prior is unknown, never 0',
+            ok=prior is None,
+            detail=f'prior_secs={prior!r}',
+        )
+        entry['blobs'] = {'x.go': 'a' * 40, 'internal/a/x.go': 'a' * 40}
+        if unit == '.':
+            check(
+                f'tick: {label}: an integration module keys its mutants from its dry run',
+                ok=entry.get('keys') == {'x.go': keys(3000)},
+                detail=str(entry.get('keys', {}).keys()),
+            )
+        doc = {'repo': 'tick', 'sha': FIXTURE_SHA, 'modules': {'.': entry}}
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan, warnings = shard.assign(doc, history)
+        e = plan['modules']['.']
+        cost, work = (
+            (e['cost'], e['work_secs'])
+            if unit == '.'
+            else (
+                e['files'][unit]['cost'],
+                e['files'][unit]['work_secs'],
+            )
+        )
+        texts = [mutation_cost.render(w) for w in warnings]
+        if want == 'measured':
+            check(
+                f'tick: {label}: measured history wins over the unknown probe',
+                ok=cost == 'measured' and work is not None and work > 0 and not texts,
+                detail=f'{cost} {work} {texts}',
+            )
+            continue
+        alone = [
+            k
+            for k in range(1, plan['shards'] + 1)
+            if (unit == '.' and k in e['shards'])
+            or (unit != '.' and e['files'][unit]['shard'] == k)
+        ]
+        others = [f for f, v in e['files'].items() if unit not in ('.', f) and v['shard'] in alone]
+        check(
+            f'tick: {label}: unknown cost is planned as a full shard of its own and named',
+            ok=cost == 'unknown'
+            and work is None
+            and len(alone) == 1
+            and not others
+            and shard.valid_plan(plan) == ''
+            and any(
+                'full shard of its own' in w and ('.' if unit == '.' else unit) in w for w in texts
+            ),
+            detail=f'{cost} {work} shards={plan["shards"]} alone={alone} others={others} {texts}',
+        )
+    src, proc = call_shell('integration_wanted', '0', '3000', '4', '350')
+    check(
+        'tick: a 0 s suite is unmeasured, so the run keeps per-package mode',
+        ok=bool(src) and proc.returncode == 1 and proc.stdout == '',
+        detail=f'rc={proc.returncode} out={proc.stdout!r}',
+    )
+
+
+def test_shard_prices_an_integration_module_with_no_mutants_at_nothing(tmp: Path) -> None:
+    import contextlib
+    import io
+
+    shard = load_script('gremlins_shard', SHARD)
+    env = {'workers': '4', 'mode': 'integration', 'suite_secs': '60', 'mutants': '0'}
+    env['setup_secs'] = '60'
+    history = {'modules': {'.': {'files': {'a.go': at({'1:1 X': [100.0]})}}}}
+    write_plan_dir(tmp / 'none', 'github.com/cplieger/none', env, None)
+    doc = {'repo': 'none', 'sha': FIXTURE_SHA, 'modules': {'.': shard.size_module(tmp / 'none')}}
+    with contextlib.redirect_stderr(io.StringIO()):
+        plan, warnings = shard.assign(doc, history)
+    e = plan['modules']['.']
+    texts = [mutation_cost.render(w) for w in warnings]
+    check(
+        'integration: no mutants with a cost history is priced at 0, with no mutant to estimate',
+        ok=e['cost'] == 'measured' and e['work_secs'] == 0.0 and not texts,
+        detail=f'{e["cost"]} {e["work_secs"]} {texts}',
+    )
+
+
+def test_history_measures_the_runner_slowdown_on_identical_work(tmp: Path) -> None:
+    shard = load_script('gremlins_shard', SHARD)
+    # Shard 3 of run 43153682226 ran 160 and 282 min on one runner pair; a cut-short attempt is not its work.
+    runs = {
+        '3': {'1': (160.0, 10), '2': (282.0, 10), '3': (200.0, 10)},
+        '1': {'1': (50.0, 5), '2': (10.0, 1)},
+        '': {'1': (5.0, 5)},
+    }
+    check(
+        "slowdown: the widest ratio of two attempts that did one shard's whole work",
+        ok=shard.slowdown(runs) == 1.76 and shard.slowdown({'': {'1': (5.0, 5)}}) is None,
+        detail=str(shard.slowdown(runs)),
+    )
+    art = tmp / 'slowdown'
+    for attempt, secs in (('1', 100.0), ('2', 200.0)):
+        d = art / f'gremlins-r-{attempt}'
+        d.mkdir(parents=True)
+        (d / 'meta.json').write_text(json.dumps({'repo': 'r', 'attempt': attempt}))
+        (d / 'gremlins-costs.json').write_text(
+            json.dumps(
+                {
+                    'modules': {
+                        '.': {
+                            'setup_secs': 10.0,
+                            'files': {'a.go': {f'{n}:1 X': [secs / 10] for n in range(10)}},
+                        }
+                    }
+                }
+            )
+        )
+    out = tmp / 'slowdown-history.json'
+    proc = run_shard('history', '--repo', 'r', '--artifacts-dir', str(art), '--out', str(out))
+    doc = json.loads(out.read_text()) if out.exists() else {}
+    check(
+        "slowdown: the record job stores the week's slowdown and warns past mutation_cost.SLOWDOWN",
+        ok=proc.returncode == 0
+        and doc.get('slowdown') == 2.0
+        and '- r: runner slowdown this week 2.0x on identical work' in proc.stderr
+        and '::warning::r: attempts ran 2.0x apart on identical work, past the 1.9x' in proc.stderr
+        and shard.history_fault(doc, 'r') == '',
+        detail=f'{doc.get("slowdown")} {proc.stderr[-400:]}',
+    )
+    check(
+        'slowdown: a history whose slowdown is not a ratio is refused',
+        ok='slowdown' in shard.history_fault({**doc, 'slowdown': 'x'}, 'r'),
+    )
+
+
+def test_shard_history_measures_prior_priced_work_per_shard(tmp: Path) -> None:
+    shard = load_script('gremlins_shard', SHARD)
+    files = {
+        'a/x.go': {'shard': 1, 'cost': 'prior', 'prior_secs': 100.0, 'runnable': 1},
+        'a/y.go': {'shard': 1, 'cost': 'prior', 'prior_secs': 10.0, 'runnable': 1},
+        'b/x.go': {'shard': 2, 'cost': 'measured', 'prior_secs': 1.0, 'runnable': 1},
+        'c/x.go': {'shard': 2, 'cost': 'partial', 'prior_secs': 50.0, 'runnable': 1},
+        'd/x.go': {'shard': 4, 'cost': 'prior', 'prior_secs': 1.0, 'runnable': 10},
+    }
+    measured = {
+        'a/x.go': {'1:1 X': [200.0]},
+        'a/y.go': {'1:1 X': [90.0]},
+        'b/x.go': {'1:1 X': [900.0]},
+        'c/x.go': {'1:1 X': [25.0]},
+        'd/x.go': {'1:1 X': [30.0], '2:1 X': [30.0], '3:1 X': [30.0]},
+    }
+    rows = shard.prior_rows({'mode': 'per-package', 'files': files}, measured)
+    integ = {
+        'mode': 'integration',
+        'shards': [3],
+        'cost': 'prior',
+        'prior_secs': 40.0,
+        'mutants': 9,
+    }
+    nine = {'x.go': {f'{n}:1 X': [100.0 / 9] for n in range(9)}}
+    rows += shard.prior_rows(integ, nine)
+    rows += shard.prior_rows({**integ, 'shards': [5]}, {'x.go': {'1:1 X': [900.0]}})
+    rows = [(n, round(m, 6), p) for n, m, p in rows]
+    check(
+        "prior error: the record job takes each shard's prior-priced work against its prior, "
+        'never a file a measure priced in part or whole, nor a deadline-cut sample',
+        ok=sorted(rows) == [(1, 90.0, 10.0), (1, 200.0, 100.0), (3, 100.0, 40.0)]
+        and mutation_cost.prior_error(rows) == 2.64,
+        detail=str(rows),
+    )
+    check(
+        'prior error: a history keeps it as a ratio or refuses it',
+        ok=shard.history_fault({'repo': 'r', 'modules': {}, 'prior_error': 2.5}, 'r') == ''
+        and 'prior_error'
+        in shard.history_fault({'repo': 'r', 'modules': {}, 'prior_error': -1}, 'r'),
+    )
+
+
+def test_shard_prices_only_history_at_the_current_blob(tmp: Path) -> None:
+    import contextlib
+    import io
+
+    shard = load_script('gremlins_shard', SHARD)
+    a, b = 'a' * 40, 'b' * 40
+    integ = {
+        'mode': 'integration',
+        'workers': 4,
+        'setup_secs': 60.0,
+        'mutants': 100,
+        'prior_secs': 400.0,
+        'mutant_prior': 4.0,
+        'keys': {'a.go': keys(60), 'b.go': keys(40)},
+        'packages': {},
+        'files': {},
+    }
+    history = {
+        'repo': 'r',
+        'modules': {
+            '.': {
+                'files': {
+                    'a.go': at({key: [50.0 / 60] for key in keys(60)}, a),
+                    'b.go': at({key: [30.0 / 40] for key in keys(40)}, a),
+                },
+            }
+        },
+    }
+    for label, blobs, want in (
+        ('every file at its measured blob', {'a.go': a, 'b.go': a}, (80.0, 'measured')),
+        ('every file at its measured blob, keys lost', {'a.go': a, 'b.go': a, 'k': None}, None),
+        (
+            'one file edited since',
+            {'a.go': a, 'b.go': b},
+            (50.0 + 400.0 * 40 / 100 * mutation_cost.PRIOR_ERROR, 'partial'),
+        ),
+        ('no blob known', {}, (400.0 * mutation_cost.PRIOR_ERROR, 'prior')),
+    ):
+        module = {**integ, 'blobs': blobs}
+        if want is None:
+            # With no keys to pair measures by, the module is one unmeasured unit of its prior.
+            del module['blobs']['k'], module['keys']
+            want = (400.0 * mutation_cost.PRIOR_ERROR, 'prior')
+        doc = {'repo': 'r', 'sha': FIXTURE_SHA, 'modules': {'.': module}}
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan, _ = shard.assign(doc, history)
+        e = plan['modules']['.']
+        check(
+            f'blob: an integration module with {label} is priced {want[1]}',
+            ok=(e['cost'], e['work_secs']) == (want[1], round(want[0] / 4, 1))
+            and shard.valid_plan(plan) == '',
+            detail=f'{e.get("cost")} {e.get("work_secs")} {shard.valid_plan(plan)}',
+        )
+    check(
+        'blob: a module whose blobs are not all git object ids is refused',
+        ok='blobs' in shard.valid_module('.', {**integ, 'blobs': {'a.go': 'nope'}}, planned=None),
+    )
+    check(
+        'blob: a module whose keys do not number its mutants is refused',
+        ok='keys' in shard.valid_module('.', {**integ, 'keys': {'a.go': keys(3)}}, planned=None),
+    )
+
+
+def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
+    import contextlib
+    import io
+
+    shard = load_script('gremlins_shard', SHARD)
+    top = mutation_cost.TOP_SECS
+
+    def split(plan: dict) -> tuple[int, list[list[str]], list[int]]:
+        """The sized module's shard count, each shard's unsized modules, and the shards mixing both."""
+        sized = plan['modules']['.']['shards']
+        per = [
+            sorted(d for d, e in plan['modules'].items() if d != '.' and n in e['shards'])
+            for n in range(1, plan['shards'] + 1)
+        ]
+        return len(sized), per, [n for n in sized if per[n - 1]]
+
+    def want(doc: dict, room: int) -> int:
+        items = [
+            mutation_cost.Item('.', p, f['prior_secs'] * mutation_cost.PRIOR_ERROR)
+            for p, f in doc['modules']['.']['files'].items()
+        ]
+        return mutation_cost.choose(items, {'.': 60.0}, top, room)[0]
+
+    for unsized, limit in ((13, 16), (15, 16), (1, 2), (1, 16), (3, 5)):
+        doc = unsized_doc(unsized)
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan, warnings = shard.assign(doc, None, limit)
+        k, per, mixed = split(plan)
+        holders = sum(1 for m in per if m)
+        sized = [m for m in plan['projected_minutes'] if m is not None]
+        check(
+            f'unsized: {unsized} unsized module(s) at a limit of {limit} each take a shard of their '
+            'own, beside sized shards that keep the bound',
+            ok=plan['shards'] == unsized + k
+            and holders == unsized
+            and not mixed
+            and k >= want(doc, max(1, limit - unsized))
+            and all(m <= mutation_cost.BOUND_SECS / 60 for m in sized)
+            and shard.valid_plan(plan) == ''
+            and 'unsized_shared' not in plan,
+            detail=f'k={k} per={per} {sized} {warnings}',
+        )
+
+    def note(plan: dict) -> str:
+        return mutation_cost.render(mutation_cost.cap_note('r', plan) or t'')
+
+    sized = {'capped': 'a cap of 16 shards', 'shards': 2, 'projected_minutes': [250.0, None]}
+    sized['top_minutes'] = 137.3
+    check(
+        'cap note: a numeric projection past the top is stated with its number',
+        ok='projects 250.0 min, past the' in note(sized) and 'None' not in note(sized),
+        detail=note(sized),
+    )
+    doc = unsized_doc(1, files=1)
+    with contextlib.redirect_stderr(io.StringIO()):
+        plan, _ = shard.assign(doc, None, 16)
+        lone, _ = shard.assign(doc, None, 1)
+    check(
+        'unsized: beside a module that fits one job it still gets its own, at any limit',
+        ok=all(
+            split(x)[0] == 1 and split(x)[2] == [] and x['shards'] == 2 and 'capped' not in x
+            for x in (plan, lone)
+        ),
+        detail=f'{plan["shards"]} {lone}',
+    )
+    only = {**unsized_doc(0), 'modules': unsized_doc(20)['modules']}
+    del only['modules']['.']
+    with contextlib.redirect_stderr(io.StringIO()):
+        plan, warnings = shard.assign(only, None, 16)
+    check(
+        'unsized: a repo of only unsized modules runs each in a shard of its own, past the limit',
+        ok=plan['shards'] == 20
+        and shard.valid_plan(plan) == ''
+        and 'capped' not in plan
+        and sorted(n for e in plan['modules'].values() for n in e['shards']) == list(range(1, 21)),
+        detail=f'{plan["shards"]} {warnings}',
+    )
+    many = {**unsized_doc(0), 'modules': unsized_doc(85)['modules']}
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            shard.assign(many, None, 16, 85)
+        why = ''
+    except mutation_cost.UnsafePlanError as exc:
+        why = str(exc)
+    check(
+        'unsized: more units of unknown cost than the run matrix holds fail the plan, named',
+        ok='85 unit(s) of unknown cost' in why and 'so its plan fails' in why,
+        detail=why,
+    )
+
+
+def test_shard_history_ignores_a_refused_previous_history_whole(tmp: Path) -> None:
+    import contextlib
+    import io
+
+    shard = load_script('gremlins_shard', SHARD)
+    (tmp / 'artifacts').mkdir()
+    good = {
+        'repo': 'r',
+        'modules': {'.': {'files': {'a.go': at({'1:1 X': [1]})}, 'setup_secs': 1}},
+    }
+    bad = json.loads(json.dumps(good))
+    bad['modules']['.']['files']['b.go'] = {'secs': 1, 'mutants': 1}
+    other = {**good, 'repo': 'q'}
+    for label, doc, want_none in (
+        ('a history with one file entry of another shape', bad, True),
+        ("another repo's history", other, True),
+        ('a whole history', good, False),
+    ):
+        prev = tmp / f'{label}.json'
+        prev.write_text(json.dumps(doc))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got = shard.history('r', tmp / 'artifacts', prev)
+        check(
+            f'history: {label} the shard job refused is {"ignored whole, with a warning" if want_none else "carried"}',
+            ok=(
+                got is None
+                and '::warning::r: the history this run priced from failed to load'
+                in err.getvalue()
+            )
+            if want_none
+            else got is not None and 'a.go' in got['modules']['.']['files'],
+            detail=f'{got} {err.getvalue()[-200:]}',
+        )
+
+
+def test_shard_history_keeps_a_fuller_measure_over_a_short_sample(tmp: Path) -> None:
+    for attempt, files in (
+        ('1', {'a.go': {'1:1 X': [10.0], '2:1 X': [20.0], '3:1 X': [30.0]}}),
+        ('2', {'a.go': {'1:1 X': [30.0], '2:1 X': [40.0], '3:1 X': [50.0]}}),
+        # A deadline cut attempt 3 after one mutant.
+        ('3', {'a.go': {'1:1 X': [5.0]}}),
+    ):
+        art = tmp / 'artifacts' / f'gremlins-r-{attempt}-shard1'
+        art.mkdir(parents=True)
+        (art / 'meta.json').write_text(
+            json.dumps({'repo': 'r', 'attempt': attempt, 'shard': '1', 'shards': '2'})
+        )
+        tools = {'t.go': {'1:1 X': [9.0]}} if attempt == '1' else {}
+        (art / 'gremlins-costs.json').write_text(
+            json.dumps(
+                {
+                    'modules': {
+                        '.': {'setup_secs': 100.0, 'files': files},
+                        'tools': {'setup_secs': 50.0, 'files': tools},
+                    }
+                }
+            )
+        )
+    plan = tmp / 'plan.json'
+    plan.write_text(
+        json.dumps(
+            {
+                'repo': 'r',
+                'modules': {
+                    '.': {
+                        'mode': 'per-package',
+                        'files': {'a.go': {'runnable': 3}, 'b.go': {'runnable': 2}},
+                        'blobs': dict.fromkeys(('a.go', 'b.go'), 'a' * 40),
+                    },
+                    'tools': {
+                        'mode': 'integration',
+                        'mutants': 2,
+                        'files': {},
+                        'blobs': {'t.go': 'a' * 40},
+                    },
+                },
+            }
+        )
+    )
+    previous = tmp / 'previous.json'
+    previous.write_text(
+        json.dumps(
+            {
+                'repo': 'r',
+                'modules': {
+                    '.': {'setup_secs': 90.0, 'files': {'b.go': at({'1:1 X': [7.0]})}},
+                    'tools': {
+                        'setup_secs': 40.0,
+                        'files': {'t.go': at({'1:1 X': [60.0], '2:1 X': [70.0]})},
+                    },
+                },
+            }
+        )
+    )
+    shard = load_script('gremlins_shard', SHARD)
+    got = shard.history('r', tmp / 'artifacts', previous, plan)
+    check(
+        'history: each mutant is its mean over the attempts that measured it, so a cut attempt '
+        'beside two whole ones adds only what it reached, and an unreached file keeps its last',
+        ok=got['modules']['.']['files']
+        == {
+            'a.go': at({'1:1 X': [15.0], '2:1 X': [30.0], '3:1 X': [40.0]}),
+            'b.go': at({'1:1 X': [7.0]}),
+        },
+        detail=str(got),
+    )
+    check(
+        "history: an integration module's cut sample replaces only the mutants it measured, "
+        'and the new setup',
+        ok=got['modules']['tools']
+        == {'files': {'t.go': at({'1:1 X': [9.0], '2:1 X': [70.0]})}, 'setup_secs': 50.0},
+        detail=str(got['modules'].get('tools')),
+    )
+    # Two whole attempts and a cut one price the file at its measured mutants, whole.
+    module = {
+        'mode': 'per-package',
+        'workers': 1,
+        'setup_secs': 10.0,
+        'packages': {},
+        'files': {
+            'a.go': {
+                'runnable': 3,
+                'prior_secs': 3.0,
+                'mutant_prior': 1.0,
+                'keys': ['1:1 X', '2:1 X', '3:1 X'],
+            }
+        },
+        'blobs': {'a.go': 'a' * 40},
+    }
+    import contextlib
+    import io
+
+    with contextlib.redirect_stderr(io.StringIO()):
+        priced, _ = shard.assign({'repo': 'r', 'sha': FIXTURE_SHA, 'modules': {'.': module}}, got)
+    f = priced['modules']['.']['files']['a.go']
+    check(
+        'history: a file two whole attempts measured is priced measured beside a cut attempt',
+        ok=(f['cost'], f['work_secs']) == ('measured', 85.0),
+        detail=str(f),
+    )
+
+
+# The listing is the only API call the fanout makes.
+FANOUT_GH = r"""#!/bin/bash
+case "$*" in
+  *user/repos*) cat "$TREES/repos" ;;
+  *) exit 1 ;;
+esac
+"""
+# A clone holds a root module of 12000 bytes of non-test Go (100 with
+# $TREES/<repo>.small), none with $TREES/<repo>.nogo, nested ones only with
+# $TREES/<repo>.nested, one nested module in `my mod` with $TREES/<repo>.space;
+# it fails with $TREES/<repo>.err and stalls 30 s with $TREES/<repo>.hang.
+FANOUT_GIT = r"""#!/bin/bash
+dest="${@: -1}"
+r=$(basename "${@: -2:1}" .git)
+[ -f "$TREES/$r.err" ] && exit 128
+[ -f "$TREES/$r.hang" ] && exec sleep 30
+mkdir -p "$dest/.git"
+size=12000
+[ -f "$TREES/$r.small" ] && size=100
+if [ -f "$TREES/$r.nested" ]; then
+  for m in keyenc jsonx; do
+    mkdir -p "$dest/$m"
+    printf 'module example.com/%s\n' "$m" >"$dest/$m/go.mod"
+    head -c "$size" /dev/zero | tr '\0' ' ' >"$dest/$m/m.go"
+  done
+elif [ -f "$TREES/$r.space" ]; then
+  mkdir -p "$dest/my mod"
+  printf 'module example.com/m\n' >"$dest/my mod/go.mod"
+  head -c "$size" /dev/zero | tr '\0' ' ' >"$dest/my mod/m.go"
+elif [ ! -f "$TREES/$r.nogo" ]; then
+  printf 'module example.com/%s\n' "$r" >"$dest/go.mod"
+  head -c "$size" /dev/zero | tr '\0' ' ' >"$dest/r.go"
+  head -c 50000 /dev/zero | tr '\0' ' ' >"$dest/r_test.go"
+  head -c 50000 /dev/zero | tr '\0' ' ' >"$dest/.git/x.go"
+fi
+"""
+# The fanout's clone bound, logged and shortened to 1 s.
+FANOUT_TIMEOUT = r"""#!/bin/bash
+printf '%s\n' "$1" >>"$TREES/../timeout.log"
+shift
+exec REAL 1 "$@"
+"""
+
+
+def test_workflow_runs_a_repo_it_cannot_read_in_its_own_call(tmp: Path) -> None:
+    jobs = workflow_jobs(WORKFLOW)
+    body = next((s.get('run', '') for s in jobs['fanout']['steps'] if s.get('id') == 'fanout'), '')
+    (tmp / 'bin').mkdir()
+    real_timeout = shutil.which('timeout') or '/usr/bin/timeout'
+    for name, stub in (
+        ('gh', FANOUT_GH),
+        ('git', FANOUT_GIT),
+        ('timeout', FANOUT_TIMEOUT.replace('REAL', real_timeout)),
+    ):
+        (tmp / 'bin' / name).write_text(stub)
+        (tmp / 'bin' / name).chmod(0o755)
+    (tmp / '_ci').mkdir()
+    (tmp / '_ci' / 'scripts').symlink_to(HERE)
+    trees = tmp / 'trees'
+    trees.mkdir()
+
+    def fanout(repos: dict[str, str]) -> tuple[int, dict, str, str]:
+        for p in trees.iterdir():
+            p.unlink()
+        (tmp / 'timeout.log').unlink(missing_ok=True)
+        (trees / 'repos').write_text(''.join(f'{r}\n' for r in repos))
+        for r, flag in repos.items():
+            if flag:
+                (trees / f'{r}.{flag}').write_text('')
+        out, summary = tmp / 'out', tmp / 'summary'
+        out.unlink(missing_ok=True)
+        summary.unlink(missing_ok=True)
+        proc = subprocess.run(
+            ['bash', '-c', body],
+            cwd=tmp,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                **os.environ,
+                'PATH': f'{tmp / "bin"}:{os.environ["PATH"]}',
+                'ONLY': '',
+                'TREES': str(trees),
+                'GITHUB_OUTPUT': str(out),
+                'GITHUB_STEP_SUMMARY': str(summary),
+            },
+        )
+        outputs = (
+            dict(line.split('=', 1) for line in out.read_text().splitlines())
+            if out.exists()
+            else {}
+        )
+        return (
+            proc.returncode,
+            {k: json.loads(v) for k, v in outputs.items()},
+            proc.stdout,
+            (summary.read_text() if summary.exists() else ''),
+        )
+
+    rc, outputs, log, summary = fanout(
+        {'a': '', 'nogo': 'nogo', 'down': 'err', 'go': 'nested', 'tiny': 'small', 'z': ''}
+    )
+    check(
+        'workflow fan-out: a repo with no Go module is left out quietly, one of nested modules '
+        'only is kept, one whose reads fail runs, named, and one under 10000 bytes of non-test '
+        'Go in its clone is skipped',
+        ok=rc == 0
+        and outputs == {'repos': ['a', 'down', 'go', 'z']}
+        and '::warning::down: its Go modules could not be read' in log
+        and '### down: its Go modules could not be read' in summary
+        and '  include: a (12000 bytes of non-test Go)' in log
+        and '  include: go (24000 bytes of non-test Go)' in log
+        and '  skip:    tiny (100 bytes' in log,
+        detail=f'{rc} {outputs} {log[-600:]}',
+    )
+    t0 = time.monotonic()
+    rc, outputs, log, summary = fanout({'a': '', 'stall': 'hang', 'z': ''})
+    took = time.monotonic() - t0
+    bounds = (tmp / 'timeout.log').read_text().split() if (tmp / 'timeout.log').exists() else []
+    check(
+        'workflow fan-out: a stalled clone is cut at its bound and the repo runs, named, '
+        'beside the others',
+        ok=rc == 0
+        and outputs == {'repos': ['a', 'stall', 'z']}
+        and '::warning::stall: its Go modules could not be read' in log
+        and bounds == ['120', '120', '120']
+        and took < 25,
+        detail=f'{rc} {outputs} {bounds} {took:.1f}s {log[-300:]}',
+    )
+    rc, outputs, log, summary = fanout({'a': '', 'odd': 'space'})
+    check(
+        'workflow fan-out: a nested-only repo whose every module dir go-units skips runs, '
+        'named, so its call refuses the dir',
+        ok=rc == 0
+        and outputs == {'repos': ['a', 'odd']}
+        and '::warning::odd: every Go module dir it holds was skipped' in log
+        and '### odd: every Go module dir it holds was skipped' in summary,
+        detail=f'{rc} {outputs} {log[-300:]}',
+    )
+    rc, outputs, log, summary = fanout({'nogo': 'nogo'})
+    check(
+        'workflow fan-out: a fanout with no repo to run fails, with a line in the summary',
+        ok=rc != 0
+        and '::error::no Go repo was found to run' in log
+        and 'no Go repo was found' in summary,
+        detail=f'{rc} {log[-300:]}',
+    )
+    repo = jobs.get('repo', {})
+    check(
+        'workflow fan-out: one call of mutation-gremlins-repo.yaml per repo, none cancelling another',
+        ok=repo.get('uses') == './.github/workflows/mutation-gremlins-repo.yaml'
+        and repo.get('strategy', {}).get('fail-fast') is False
+        and repo.get('strategy', {}).get('max-parallel') == 2
+        and repo.get('strategy', {}).get('matrix')
+        == {'repo': '${{ fromJSON(needs.fanout.outputs.repos) }}'}
+        and repo.get('with') == {'repository': '${{ matrix.repo }}'}
+        and repo.get('secrets') == {'CI_SCHEDULE': '${{ secrets.CI_SCHEDULE }}'},
+        detail=str(repo),
+    )
+    check(
+        'workflow fan-out: only fan-out, call and summary jobs, and notify needs every other one',
+        ok=set(jobs) == {'fanout', 'repo', 'summary', 'notify'}
+        and sorted(jobs['notify']['needs']) == ['fanout', 'repo', 'summary'],
+        detail=str(list(jobs)),
+    )
+    summ = jobs.get('summary', {})
+    down = next((s for s in summ.get('steps', []) if 'download-artifact' in s.get('uses', '')), {})
+    check(
+        "workflow fan-out: the summary reads every call's result, whatever any call's result",
+        ok=summ.get('if') == "${{ !cancelled() && needs.fanout.result == 'success' }}"
+        and down.get('with')
+        == {'path': 'results', 'pattern': 'gremlinsresult-*', 'merge-multiple': True}
+        and 'CI_SCHEDULE' not in json.dumps(summ),
+        detail=str(summ),
+    )
+    called = workflow_jobs()
+    holders = sorted(j for j, d in called.items() if 'CI_SCHEDULE' in json.dumps(d))
+    check(
+        'workflow fan-out: inside the call only the badge and aggregate jobs see CI_SCHEDULE',
+        ok=holders == ['aggregate', 'badge'],
+        detail=str(holders),
+    )
+
+
+def test_workflow_shard_step_plans_the_call(tmp: Path) -> None:
+    jobs = workflow_jobs()
+    build = next(s for s in jobs['shard']['steps'] if s.get('name') == 'Build the run matrix')
+    work = tmp / 'build'
+    work.mkdir()
+    (work / 'scripts').symlink_to(HERE)
+    out = work / 'output'
+    for label, sizing, want_rows, want_names in (
+        (
+            'with no sizing each attempt runs in one job',
+            None,
+            [{'repo': 'a', 'attempt': n} for n in (1, 2, 3)],
+            '{gremlins-a~-1,gremlins-a~-2,gremlins-a~-3}',
+        ),
+    ):
+        out.unlink(missing_ok=True)
+        if sizing is not None:
+            (work / 'sizing').mkdir(exist_ok=True)
+            (work / 'sizing' / 'plan.json').write_text(json.dumps(sizing))
+        proc = subprocess.run(
+            ['bash', '-c', build.get('run', 'false')],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                **os.environ,
+                'REPO': 'a',
+                'KEY': 'a~',
+                'GITHUB_OUTPUT': str(out),
+            },
+        )
+        outputs = (
+            dict(line.split('=', 1) for line in out.read_text().splitlines())
+            if out.exists()
+            else {}
+        )
+        check(
+            f'workflow shard step: {label}',
+            ok=proc.returncode == 0
+            and json.loads(outputs.get('matrix', 'null')) == want_rows
+            and outputs.get('artifacts') == want_names
+            and '::warning::a: no shard plan' in proc.stderr,
+            detail=f'{proc.returncode} {outputs} {proc.stderr[-300:]}',
+        )
+
+
+def test_workflow_artifact_names_are_distinct_per_job(tmp: Path) -> None:
+    import workflow_replay as wr
+
+    jobs = workflow_jobs()
+    fleet = json.loads((HERE / 'testdata' / 'mutation-cost' / 'fleet.json').read_text())['gremlins']
+    adversarial = [
+        'x',
+        'x-1',
+        'x-1-1',
+        'x-1-shard2',
+        'x-shard2',
+        'x-1-shard',
+        'a-b',
+        'a',
+        'b',
+        '1',
+        '1-1',
+        'plans-x',
+        'result-x',
+        'plans',
+        'result',
+    ]
+    keys = [mutation_cost.entry_key(r) for r in [*fleet, *adversarial]]
+    keys += [mutation_cost.entry_key(r, d) for r in ('x', 'x-1') for d in ('.', 'a', 'a/b', '1')]
+
+    def uploads(job: str) -> list[str]:
+        return [
+            s['with']['name']
+            for s in jobs[job]['steps']
+            if s.get('uses', '').startswith('actions/upload-artifact')
+        ]
+
+    names: dict[str, tuple] = {}
+    clashes = []
+    rows = []
+    for key in keys:
+        call_rows = []
+        for attempt in (1, 2, 3):
+            call_rows.append({'repo': key, 'attempt': attempt})
+            call_rows += [
+                {'repo': key, 'attempt': attempt, 'shard': n, 'shards': mutation_cost.MAX_SHARDS}
+                for n in range(1, mutation_cost.MAX_SHARDS + 1)
+            ]
+        rows.append((key, call_rows))
+        ctx = {'needs': {'setup': {'outputs': {'key': key}}}}
+        for job in ('plan', 'shard', 'record', 'result'):
+            for t in uploads(job):
+                n = wr.Scope(ctx, {}, []).render(t)
+                if n in names:
+                    clashes.append((n, names[n], (key, job)))
+                names[n] = (key, job)
+        for r in call_rows:
+            for t in uploads('run'):
+                n = wr.Scope({**ctx, 'matrix': r}, {}, []).render(t)
+                if n in names:
+                    clashes.append((n, names[n], (key, r)))
+                names[n] = (key, r)
+    check(
+        'workflow names: every artifact of every call of the fleet and of adversarial keys is its own',
+        ok=not clashes,
+        detail=str(clashes[:5]),
+    )
+    program = re.search(
+        r"artifacts=\$\(jq -r --arg k \"\$KEY\" \\\n\s*'(.*?)' <<<",
+        next(s['run'] for s in jobs['shard']['steps'] if s.get('name') == 'Build the run matrix'),
+        re.DOTALL,
+    )
+    wrong = []
+    for key, call_rows in rows:
+        got = subprocess.run(
+            ['jq', '-r', '--arg', 'k', key, program.group(1) if program else '.'],
+            input=json.dumps(call_rows),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        listed = set(got.stdout.strip().strip('{}').split(','))
+        mine = {n for n, owner in names.items() if owner[0] == key and isinstance(owner[1], dict)}
+        if listed != mine:
+            wrong.append(key)
+    check(
+        'workflow names: each call downloads exactly the names its own run jobs upload',
+        ok=program is not None and not wrong,
+        detail=str(wrong[:5]),
+    )
 
 
 def main() -> int:
@@ -2447,8 +6122,8 @@ def main() -> int:
         test_inconsistent_input_is_fatal,
         test_missing_module_output_is_zero_not_error,
         test_module_nested_in_nested,
-        test_root_module_required,
         test_prepare_scopes_root_run_off_nested_module,
+        test_prepare_refuses_a_module_entry_key_refuses_and_measures_the_rest,
         test_scope_excludes_every_deeper_module,
         test_scope_excludes_an_unmeasured_module,
         test_scope_takes_a_dash_dir_as_a_module,
@@ -2475,13 +6150,19 @@ def main() -> int:
         test_aggregate_starts_a_baseline_when_the_mutators_change,
         test_enabled_mutators_follows_gremlins,
         test_shard_projects_deadset_go_past_one_job,
+        test_shard_plans_a_recorded_run_from_its_costs,
+        test_shard_replays_a_recorded_run_per_mutant,
+        test_runner_stamps_each_output_line,
+        test_runner_stops_at_the_run_deadline_with_its_costs_on_record,
+        test_shard_history_carries_each_unmeasured_file_from_the_last_run,
+        test_shard_costs_read_the_stamped_record,
         test_shard_bin_pack_longest_first,
         test_shard_small_module_stays_one_unchanged_job,
         test_shard_never_splits_an_integration_module,
         test_shard_sizes_a_zero_mutant_module_as_zero,
         test_shard_falls_back_for_a_module_it_cannot_size,
         test_shard_matrix_falls_back_to_one_job,
-        test_shard_matrix_binds_each_plan_to_its_artifact,
+        test_shard_matrix_stays_within_the_cap_whatever_the_prices,
         test_shard_lists_each_shards_modules,
         test_shard_scope_partitions_the_module,
         test_merge_skips_a_module_the_shard_did_not_run,
@@ -2494,7 +6175,25 @@ def main() -> int:
         test_runner_times_each_package_mutant,
         test_runner_marks_a_finished_plan,
         test_workflow_plans_then_shards_the_run,
+        test_workflow_carries_costs_between_runs,
+        test_shard_matrix_fuzz_plans_each_bad_input,
+        test_history_measures_the_runner_slowdown_on_identical_work,
+        test_prepare_seeds_the_root_only_when_it_has_a_go_mod,
+        test_merge_takes_a_repo_of_nested_modules_with_no_root,
+        test_shard_history_measures_prior_priced_work_per_shard,
+        test_shard_prices_only_history_at_the_current_blob,
+        test_shard_gives_each_unsized_module_a_shard_of_its_own,
+        test_shard_keeps_every_shard_under_the_safe_limit_beside_a_slow_setup,
+        test_shard_prices_a_probe_under_its_tick_as_unknown,
+        test_shard_prices_an_integration_module_with_no_mutants_at_nothing,
+        test_shard_history_ignores_a_refused_previous_history_whole,
+        test_shard_history_keeps_a_fuller_measure_over_a_short_sample,
+        test_workflow_runs_a_repo_it_cannot_read_in_its_own_call,
+        test_workflow_shard_step_plans_the_call,
+        test_workflow_artifact_names_are_distinct_per_job,
     ]
+    if wanted := set(sys.argv[1:]):
+        tests = [t for t in tests if t.__name__ in wanted]
     for t in tests:
         print(f'{t.__name__}:')
         with tempfile.TemporaryDirectory() as td:

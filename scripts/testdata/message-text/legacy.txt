@@ -6,7 +6,6 @@ ${VERSION} already exists; nothing to push.
 ${VERSION} already exists; skipping creation.
 ${VERSION} already exists; skipping.
 ${VERSION} not recorded; deleting the tag
-${valid} mutants — measured nothing, no
 '{rname}' unreadable (API); rulesets not graded
 '{s['used_by_package']}' (want '{s['expected_package']}'; no API —
 (TLS verification disabled; want \'0\')
@@ -30,13 +29,11 @@ attempt ${attempt}/${max} failed; retrying in ${delay}s
 before SHA — treating all tracked
 changed since review; skipping (re-run to
 characters outside [A-Za-z0-9._/-]; not a valid
-clone failed — skipping this repo
 contains the other); restructure so lane
 content_type={h["content_type"]} (want json; the orchestrator parses
 could not run; ${VERSION} published WITHOUT
 did not finish; rerun it or
 every major — drop the suffix
-exactly {\"weekly\": false}; mutation-testing the dir
 failed for {p.tag}; STOPPING. Restore with:
 failed for {p.tag}; aborting before any
 for ${r} — dropping it from
@@ -55,7 +52,6 @@ linux/amd64 sub-manifest found; skipping size badge
 listed no files; cannot verify the
 listing truncated ({err}); version tags not
 locked (read-only — nothing can merge;
-meta.json beside {out_path}; skipping
 must be '$expected'; a module path
 names this commit; publishing.
 no .ts targets; nothing to close
@@ -78,12 +74,10 @@ path (want '{want}'; unfetchable by Go
 path element — a sentinel/local module,
 produced no output; the compiler could
 published manifest — dropped from significance
-readable in '${meta}'; that artifact is
 repo (want main; {s["name"]} publishes from
 repo cannot self-approve; every PR blocks
 report diffs only; no push, no
 required_linear_history=on (want off; the merge model
-resolvable HEAD — skipping this repo
 rewrite internal imports; apps use the
 rulesets unreadable (API); rulesets not graded
 run (phantom — blocks every PR

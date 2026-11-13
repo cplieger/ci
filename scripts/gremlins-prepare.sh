@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Clone cplieger/REPO into ./target, find the Go modules to measure and write
-# each one's .gremlins.yaml, from the ci checkout root. weekly-gremlins.yaml's
-# plan and run jobs both call it, so a shard measures the modules its plan
-# sized. A shard passes its PLAN (scripts/gremlins-shard.py's plan.json) and
-# SHARD. Writes sha and modules to GITHUB_OUTPUT. The clone is anonymous,
-# because the fanout lists only public repositories.
-#
+# each one's .gremlins.yaml, from the ci checkout root. The plan and run jobs of
+# mutation-gremlins-repo.yaml both call it; a shard passes its run PLAN and SHARD
+# so it measures the modules its plan sized. GREMLINS_MODULE measures that one
+# module and lists the rest as `untested`. Writes sha, modules, untested and
+# refused to GITHUB_OUTPUT. The clone is anonymous: the callers name public repositories.
 # Usage: gremlins-prepare.sh REPO [PLAN SHARD]
 set -euo pipefail
 
@@ -20,7 +19,7 @@ fi
 
 # git over HTTPS draws no API quota, so a rate-limited run still clones.
 git clone --depth 1 "https://github.com/cplieger/${repo}.git" target
-# Every shard measures the commit its plan sized, so its packages are the ones
+# Every shard measures the commit its plan sized, so its files are the ones
 # the plan assigned even if the repo moved since.
 if [ -n "${plan}" ]; then
   sha=$(jq -er '.sha | select(test("^[0-9a-f]{40}$"))' "${plan}")
@@ -31,38 +30,89 @@ echo "sha=$(git -C target rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
 
 # One gremlins run per module: its coverage pass cannot run a nested module's
 # tests. Eligibility mirrors ci.yaml's detect step; keep the two in sync.
-safe_dir() {
-  case "$1" in
-    *[!A-Za-z0-9._/-]*)
-      echo "::error::nested go.mod dir '$1' contains characters outside [A-Za-z0-9._/-]"
-      exit 1
-      ;;
-  esac
-}
+# A dir mutation_cost.py's entry_key refuses is not measured, is excluded from
+# its outer module as a pruned one is, and is written to `refused`, which makes
+# the call red without failing its other modules.
+# shellcheck source=scripts/gha-log.sh
+. scripts/gha-log.sh
 pruned_re='(^|/)(node_modules|vendor|testdata|static|dist)/'
-modules=(.)
-while IFS= read -r f; do
-  [ -z "${f}" ] && continue
+mapfile -d '' gomods < <(git -C target ls-files -z -- '*/go.mod')
+nested=()
+unmeasured=()
+for f in "${gomods[@]}"; do
   d=$(dirname -- "${f}")
-  safe_dir "${d}"
+  if [[ ${f} =~ ${pruned_re} ]]; then
+    unmeasured+=("${d}")
+    gha_say 'exclude: %s (pruned tree, not measured)' "${d}"
+  else
+    nested+=("${d}")
+  fi
+done
+# Looked up by index into nested, because a name that is not UTF-8 is not one JSON can carry.
+refused='[]'
+if [ "${#nested[@]}" -gt 0 ]; then
+  refused=$(printf '%s\0' "${nested[@]}" | python3 scripts/mutation_cost.py refused --repo "${repo}")
+fi
+declare -A is_refused=()
+mapfile -t bad < <(jq -r '.[].index' <<<"${refused}")
+for i in "${bad[@]}"; do is_refused["${nested[i]}"]=1; done
+refused=$(jq -c 'map(del(.index))' <<<"${refused}")
+# The root is a module, and listed first, only when it has a go.mod: a repo of
+# nested modules alone (cplieger/go) has none.
+modules=()
+[ -f target/go.mod ] && modules=(.)
+for d in "${nested[@]}"; do
+  if [ -n "${is_refused["${d}"]:-}" ]; then
+    unmeasured+=("${d}")
+    continue
+  fi
   if [ -z "$(git -C target ls-files -- "${d}/*.go" | head -1)" ]; then
     echo "  skip:    ${d} (no tracked .go files, nothing to mutate)"
     continue
   fi
   modules+=("${d}")
-  echo "  measure: ${d} ($(awk '$1=="module"{print $2; exit}' "target/${f}"))"
-done < <(git -C target ls-files '*/go.mod' | grep -Ev "${pruned_re}" || true)
-# A pruned module is not measured, yet the outer module's run walks its files
-# all the same, so its config excludes it too.
-unmeasured=()
-while IFS= read -r f; do
-  [ -z "${f}" ] && continue
-  d=$(dirname -- "${f}")
-  safe_dir "${d}"
-  unmeasured+=("${d}")
-  echo "  exclude: ${d} (pruned tree, not measured)"
-done < <(git -C target ls-files '*/go.mod' | grep -E "${pruned_re}" || true)
-echo "modules=${modules[*]}" >>"${GITHUB_OUTPUT}"
+  gha_say 'measure: %s (%s)' "${d}" "$(awk '$1=="module"{print $2; exit}' "target/${d}/go.mod")"
+done
+if [ "${#modules[@]}" -eq 0 ]; then
+  if [ "${refused}" = '[]' ]; then
+    echo "::error::${repo} has no Go module to measure"
+    exit 1
+  fi
+  # The runner keeps a failed step's outputs (actions/runner ActionRunner.cs
+  # processes file commands in a finally), so the record names each refused dir.
+  {
+    echo "modules="
+    echo "untested="
+    echo "refused=$(jq -c . <<<"${refused}")"
+  } >>"${GITHUB_OUTPUT}"
+  echo "::error::every Go module dir of ${repo} was refused"
+  exit 1
+fi
+untested=()
+if [ -n "${GREMLINS_MODULE:-}" ]; then
+  selected=()
+  for d in "${modules[@]}"; do
+    if [ "${d}" = "${GREMLINS_MODULE}" ]; then
+      selected+=("${d}")
+    else
+      untested+=("${d}")
+      # A deeper module left out is excluded from its outer one, as a pruned one is.
+      [ "${d}" != . ] && unmeasured+=("${d}")
+    fi
+  done
+  if [ "${#selected[@]}" -eq 0 ]; then
+    echo "::error::the module input names no measurable Go module of ${repo}"
+    exit 1
+  fi
+  modules=("${selected[@]}")
+  # The other dirs are not this call's entries.
+  refused='[]'
+fi
+{
+  echo "modules=${modules[*]}"
+  echo "untested=${untested[*]}"
+  echo "refused=$(jq -c . <<<"${refused}")"
+} >>"${GITHUB_OUTPUT}"
 echo "modules to measure: ${modules[*]}"
 
 # One copy per module, because gremlins reads .gremlins.yaml from the module

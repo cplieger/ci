@@ -20,7 +20,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 # The branch is one squashed commit that several writers share: size.json on
 # every published image (docker-release.yaml), mutation.json and mutation-ts.json
-# weekly (weekly-gremlins.yaml, weekly-stryker.yaml). Each attempt rebuilds that
+# weekly (mutation-gremlins-repo.yaml, mutation-stryker-repo.yaml). Each attempt rebuilds that
 # commit from the tip it fetched and pushes it with a lease on that tip, so a
 # writer that moved the branch in between makes the push fail rather than lose
 # its file, and the next attempt carries that file forward.

@@ -66,8 +66,10 @@ jobs:
             rm -rf scan
             # Plain git over HTTPS draws no API quota, so a rate-limited run can
             # still clone, where `gh repo clone` would spend GraphQL budget.
-            if ! git clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
-              echo "::warning::clone failed for ${r} — dropping it from the fuzz matrix this week"
+            # Bounded so a stalled clone drops this repo, not the job's timeout.
+            if ! timeout 120 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+              clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
+              echo "::warning::clone failed or timed out for ${r} — dropping it from the fuzz matrix this week"
               continue
             fi
             # A clone can exit 0 with no resolvable HEAD; unguarded under
