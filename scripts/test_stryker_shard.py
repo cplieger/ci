@@ -1789,7 +1789,8 @@ r.onMutationTestReportReady({ schemaVersion: '2', files: { 'src/a.ts': { mutants
         proc, tmp = self.run_harness({'CI_STRYKER_PLAN': 'plan.json'}, {'HARNESS_RANGED': '1'})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         plan = json.loads((tmp / 'plan.json').read_text())
-        self.assertTrue(plan['ranged'] is True)
+        self.assertIsInstance(plan['ranged'], bool)
+        self.assertTrue(plan['ranged'])
         self.assertIn('src/r.ts', plan['files'])
 
     def test_a_ranged_shard_records_each_finish_under_its_file_and_plan_pass_id(self):

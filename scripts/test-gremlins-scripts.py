@@ -758,7 +758,12 @@ def test_prepare_scopes_root_run_off_nested_module(tmp: Path) -> None:
         detail=f'rc={bad.returncode} {bad.stdout[-300:]}',
     )
     shutil.rmtree(tmp / 'target')
-    proc, outputs = prepare(tmp, 'animap')
+    proc, _ = prepare(tmp, 'animap')
+    check(
+        'prepare scope: a repo with a root module and a nested one prepares',
+        ok=proc.returncode == 0,
+        detail=f'rc={proc.returncode} {proc.stdout[-300:]}',
+    )
     git_config = (tmp / 'target' / '.git' / 'config').read_text()
     check(
         'prepare scope: no auth header is written into the clone',
@@ -2773,11 +2778,30 @@ def test_shard_plans_a_recorded_run_from_its_costs(tmp: Path) -> None:
     )
     edited = 'cmd/deadset-go/analyze.go'
     commit_fixture(target, {edited: 'package x // edited\n'})
-    proc = size(plans / 'edited.json')
-    run_shard(
-        'matrix',
-        *('--repo', 'deadset-go', '--plan', str(plans / 'edited.json'), '--attempts', '3'),
-        *('--history', str(history / 'deadset-go.json'), '--out-plan', str(tmp / 'edited.json')),
+    procs = [size(plans / 'edited.json')]
+    procs.append(
+        run_shard(
+            'matrix',
+            *('--repo', 'deadset-go', '--plan', str(plans / 'edited.json'), '--attempts', '3'),
+            *(
+                '--history',
+                str(history / 'deadset-go.json'),
+                '--out-plan',
+                str(tmp / 'edited.json'),
+            ),
+        )
+    )
+    procs.append(
+        run_shard(
+            'matrix',
+            *('--repo', 'deadset-go', '--plan', str(plans / 'edited.json'), '--attempts', '3'),
+            *('--out-plan', str(tmp / 'first.json')),
+        )
+    )
+    check(
+        'recorded run: the edited tree plans, and its matrix plans with and without history',
+        ok=all(p.returncode == 0 for p in procs),
+        detail=' | '.join(f'rc={p.returncode} {p.stderr[-200:]}' for p in procs),
     )
     again = json.loads((tmp / 'edited.json').read_text())['modules']['.']['files']
     sized = json.loads((plans / 'edited.json').read_text())['modules']['.']['files'][edited]
@@ -2790,11 +2814,6 @@ def test_shard_plans_a_recorded_run_from_its_costs(tmp: Path) -> None:
         and {f['cost'] for p, f in again.items() if p != edited}
         == {f['cost'] for f in files.values()},
         detail=f'{again.get(edited)} {sized}',
-    )
-    proc = run_shard(
-        'matrix',
-        *('--repo', 'deadset-go', '--plan', str(plans / 'edited.json'), '--attempts', '3'),
-        *('--out-plan', str(tmp / 'first.json')),
     )
     first = json.loads((tmp / 'first.json').read_text())['modules']['.']['files']
     sizes = json.loads((plans / 'edited.json').read_text())['modules']['.']['files']

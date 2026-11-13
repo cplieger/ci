@@ -192,7 +192,7 @@ class Harness(unittest.TestCase):
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
-                    pass
+                    pass  # it exited between the session scan and the kill
             proc.wait()
             log.seek(0)
             out = log.read().decode(errors='replace')

@@ -76,7 +76,7 @@ def oom_kills(proc: Path) -> str:
             if name == 'oom_kill':
                 return value.strip()
     except OSError:
-        pass
+        pass  # no readable vmstat on this host: the sample reports '-'
     return '-'
 
 
