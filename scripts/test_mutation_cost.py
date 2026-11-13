@@ -294,13 +294,13 @@ class Choose(unittest.TestCase):
 
     def test_the_target_holds_the_slowest_runner_and_the_top_holds_the_band_under_it(self):
         mc = mutation_cost
-        self.assertEqual((mc.SAFE_JOB_MINUTES, mc.SLOWDOWN, mc.BAND), (300, 1.8, 0.15))
+        self.assertEqual((mc.SAFE_JOB_MINUTES, mc.SLOWDOWN, mc.BAND), (300, 1.9, 0.15))
         # gremlins' 3-min setup, marotte static-src's 31.2 min and a slow 80 min.
         for minutes in (0.0, 3.0, 31.2, 80.0):
             setup = minutes * 60
             with self.subTest(setup=minutes):
                 target = mc.target_secs(setup)
-                self.assertAlmostEqual(target, 300 * 60 / 1.8 - setup)
+                self.assertAlmostEqual(target, 300 * 60 / 1.9 - setup)
                 # The runner slows the setup too (1.46x in run 43153682226), so the whole job scales.
                 self.assertAlmostEqual(mc.SLOWDOWN * (setup + target), mc.SAFE_JOB_MINUTES * 60)
                 # A shard at the top whose mean runs BAND over still ends in time on the slowest runner.
@@ -308,9 +308,9 @@ class Choose(unittest.TestCase):
                     mc.SLOWDOWN * (1 + mc.BAND) * mc.TOP_SECS, mc.SAFE_JOB_MINUTES * 60 + 1e-6
                 )
                 self.assertAlmostEqual(mc.TOP_SECS * (1 + mc.BAND), setup + target)
-        self.assertAlmostEqual(mc.target_secs(180) / 60, 163.7, places=1)
-        self.assertAlmostEqual(mc.target_secs(1872) / 60, 135.5, places=1)
-        self.assertAlmostEqual(mc.TOP_SECS / 60, 144.9, places=1)
+        self.assertAlmostEqual(mc.target_secs(180) / 60, 154.9, places=1)
+        self.assertAlmostEqual(mc.target_secs(1872) / 60, 126.7, places=1)
+        self.assertAlmostEqual(mc.TOP_SECS / 60, 137.3, places=1)
         self.assertEqual(mc.target_secs(400 * 60), 0.0)
 
     def test_a_run_past_the_top_splits_and_none_of_its_shards_passes_it(self):
@@ -353,9 +353,34 @@ class Bar(unittest.TestCase):
         self.assertEqual(mutation_cost.bar_faults([200.0], [[160.0], [282.0]]), [])
         self.assertEqual(
             mutation_cost.bar_faults([200.0], [[240.0], [242.0]]),
-            ['shard 1 averaged 241.0 min against 200.0 projected'],
+            ['the run averaged 241.0 min over its shards against 200.0 projected'],
         )
         self.assertEqual(mutation_cost.bar_faults([150.0], [[180.0]]), [])
+
+    def test_a_shard_over_its_projection_misses_the_bar(self):
+        # The run is 10% over, within the band, but shard 1 averages 20% over.
+        self.assertEqual(
+            mutation_cost.bar_faults([100.0, 100.0], [[120.0, 100.0], [120.0, 100.0]]),
+            ['shard 1 averaged 120.0 min against 100.0 projected'],
+        )
+
+    def test_a_shard_under_its_projection_is_no_fault_while_the_run_is_within_the_band(self):
+        self.assertEqual(
+            mutation_cost.bar_faults([100.0, 100.0], [[75.0, 100.0], [75.0, 100.0]]), []
+        )
+        # Run 43328219246: shards 3 and 4 averaged 17.1% and 22.7% under, the run 9.8% under.
+        attempts = [
+            [120.5, 125.5, 110.2, 91.3, 131.6],
+            [147.4, 85.0, 119.5, 129.4, 133.1],
+            [133.5, 161.3, 113.5, 99.5, 165.9],
+        ]
+        self.assertEqual(mutation_cost.bar_faults([138.0] * 5, attempts), [])
+
+    def test_a_run_under_its_projection_misses_the_bar(self):
+        self.assertEqual(
+            mutation_cost.bar_faults([100.0, 100.0], [[60.0, 80.0], [60.0, 80.0]]),
+            ['the run averaged 140.0 min over its shards against 200.0 projected'],
+        )
 
     def test_one_attempt_per_shard_is_judged_once_over_the_run(self):
         # Stryker's one job per shard: 180 + 100 against 150 + 150 is within the band.

@@ -2741,8 +2741,8 @@ def test_shard_plans_a_recorded_run_from_its_costs(tmp: Path) -> None:
         attempts.append([load / 60 for load in loads])
     faults = mutation_cost.bar_faults(plan['projected_minutes'], attempts)
     check(
-        f"recorded run: each shard's mean over the attempts ends within {mutation_cost.BAND:.0%} "
-        f'of its projection, and every attempt by {mutation_cost.SAFE_JOB_MINUTES} min',
+        f"recorded run: the run ends within {mutation_cost.BAND:.0%} of its projection, no shard's mean "
+        f'more than {mutation_cost.BAND:.0%} over, and every attempt by {mutation_cost.SAFE_JOB_MINUTES} min',
         ok=not faults,
         detail=f'{faults} {[[round(x, 1) for x in a] for a in attempts]} vs {plan["projected_minutes"]}',
     )
@@ -5164,7 +5164,7 @@ def test_history_measures_the_runner_slowdown_on_identical_work(tmp: Path) -> No
         detail=str(shard.slowdown(runs)),
     )
     art = tmp / 'slowdown'
-    for attempt, secs in (('1', 100.0), ('2', 190.0)):
+    for attempt, secs in (('1', 100.0), ('2', 200.0)):
         d = art / f'gremlins-r-{attempt}'
         d.mkdir(parents=True)
         (d / 'meta.json').write_text(json.dumps({'repo': 'r', 'attempt': attempt}))
@@ -5183,9 +5183,9 @@ def test_history_measures_the_runner_slowdown_on_identical_work(tmp: Path) -> No
     check(
         "slowdown: the record job stores the week's slowdown and warns past mutation_cost.SLOWDOWN",
         ok=proc.returncode == 0
-        and doc.get('slowdown') == 1.9
-        and '- r: runner slowdown this week 1.9x on identical work' in proc.stderr
-        and '::warning::r: attempts ran 1.9x apart on identical work, past the 1.8x' in proc.stderr
+        and doc.get('slowdown') == 2.0
+        and '- r: runner slowdown this week 2.0x on identical work' in proc.stderr
+        and '::warning::r: attempts ran 2.0x apart on identical work, past the 1.9x' in proc.stderr
         and shard.history_fault(doc, 'r') == '',
         detail=f'{doc.get("slowdown")} {proc.stderr[-400:]}',
     )

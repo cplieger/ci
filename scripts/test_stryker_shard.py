@@ -528,15 +528,15 @@ class Ranges(unittest.TestCase):
         room = ss.mutation_cost.TOP_SECS - 31.2 * 60
         # Five one-line atoms of 80 min: four pieces can do no better than 160/160/80.
         five = [[10 * n + 1, 10 * n + 1, 10.0] for n in range(5)]
-        # Three methods of 100, 180 and 100 mutants, each one atom through its body's
-        # BlockStatement mutant: 227.7 min of work as assign() prices them at 72.4 s a
-        # mutant with 2 test runners on 4 workers; two pieces give 167.8/59.9.
+        # Three methods of 100, 170 and 100 mutants, each one atom through its body's
+        # BlockStatement mutant: 221.7 min of work as assign() prices them at 72.4 s a
+        # mutant with 2 test runners on 4 workers; two pieces give 161.8/59.9.
         methods, line = [], 1
-        for size in (100, 180, 100):
+        for size in (100, 170, 100):
             methods.append([line, line + size, 10.0])
             methods += [[line + 1 + i, line + 1 + i, 10.0] for i in range(size - 1)]
             line += size + 2
-        rows = [(five, 400 * 60.0, 5), (methods, 227.7 * 60, 3)]
+        rows = [(five, 400 * 60.0, 5), (methods, 221.7 * 60, 3)]
         for spans, work, count in rows:
             with self.subTest(atoms=count):
                 pieces, atom = ss.split('src/s.ts', heavy(spans), work, room, None)
@@ -708,7 +708,7 @@ class Ranges(unittest.TestCase):
             self.matrix(doc)
         plan = json.loads((self.tmp / 'out' / 'r~web.json').read_text())
         self.assertEqual((plan['shards'], plan['ids']), (1, {}))
-        self.assertIn("src/s.ts projects 504 min, past a shard's 143 min", err.getvalue())
+        self.assertIn("src/s.ts projects 504 min, past a shard's 135 min", err.getvalue())
         self.assertIn('gave no mutant ids', err.getvalue())
 
     def test_openers_are_the_file_scope_directives_where_babel_counts_them(self):

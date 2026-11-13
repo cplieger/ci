@@ -29,15 +29,16 @@ if TYPE_CHECKING:
 # Every plain log line starts with this, so the runner never reads one as a command.
 SAY_PREFIX = '- '
 
-# The bar a sharded run meets (bar_faults): the measured time within BAND of the
-# projection, and every job, slowest runner included, ended by SAFE_JOB_MINUTES,
-# 60 min under the hosted runner's 360-min job limit.
+# The bar a sharded run meets (bar_faults): the run's measured time within BAND of
+# its projection, no shard more than BAND over its own, and every job, slowest
+# runner included, ended by SAFE_JOB_MINUTES, 60 min under the hosted runner's
+# 360-min job limit.
 BAND = 0.15
 SAFE_JOB_MINUTES = 300
-# The largest ratio of two jobs' times on identical work: 1.76 in gremlins run
-# 43153682226 (one shard's work took 160 and 282 min), rounded up.
-# gremlins-shard.py's record job measures it each week and warns past this.
-SLOWDOWN = 1.8
+# The largest ratio of two jobs' times on identical work, rounded up to 0.1: 1.9 in
+# gremlins run 43328219246 (shard 2's work took 85, 125 and 161 min), past the 1.76
+# of run 43153682226. gremlins-shard.py's record job measures it each week and warns past this.
+SLOWDOWN = 1.9
 # A job matrix runs at most 256 jobs (https://docs.github.com/en/actions/reference/limits),
 # which one call's run matrix keeps: MAX_SHARDS dirs of MAX_SHARDS shards (Stryker),
 # or 3 attempts of MAX_SHARDS shards (gremlins).
@@ -155,29 +156,32 @@ TOP_SECS = SAFE_JOB_MINUTES * 60 / (SLOWDOWN * (1 + BAND))
 def bar_faults(projected: list[float], attempts: list[list[float | None]]) -> list[str]:
     """How a run misses the bar, or []: PROJECTED minutes per shard, and per attempt each shard's measured minutes.
 
-    Bar (a) never judges one job: with two or more attempts each shard's mean is
-    judged against its projection, and with one attempt the run's total against
-    its projected total, when it has two or more shards. Bar (b) judges every
-    job. A shard with no measure in some attempt has no mean, which misses the bar.
+    Bar (a) never judges one job. The run's measured time, the sum of its shards'
+    means over the attempts, lands within BAND of its projected total either way,
+    and with two or more shards no shard's mean over two or more attempts runs
+    more than BAND over its projection. A shard under its projection costs only
+    parallelism, so it is no fault. Bar (b) judges every job. A shard with no
+    measure in some attempt has no mean, which misses the bar.
     """
     faults = []
-    measured: list[list[float]] = []
+    means: list[float] = []
     for i, want in enumerate(projected):
         got = [a[i] for a in attempts if i < len(a) and a[i] is not None]
         if len(got) < len(attempts) or not got:
             faults.append(f'shard {i + 1} has no measure in every attempt')
             continue
-        measured.append(got)
         mean = sum(got) / len(got)
-        if len(got) > 1 and abs(mean - want) > want * BAND:
+        means.append(mean)
+        if len(projected) > 1 and len(got) > 1 and mean > want * (1 + BAND):
             faults.append(f'shard {i + 1} averaged {mean:.1f} min against {want:.1f} projected')
         if max(got) > SAFE_JOB_MINUTES:
             faults.append(f'shard {i + 1} took {max(got):.1f} min, past {SAFE_JOB_MINUTES}')
-    if len(attempts) == 1 and len(projected) > 1 and len(measured) == len(projected):
-        want, got = sum(projected), sum(m[0] for m in measured)
+    if len(means) == len(projected) and len(projected) * len(attempts) > 1:
+        want, got = sum(projected), sum(means)
         if abs(got - want) > want * BAND:
+            verb = 'took' if len(attempts) == 1 else 'averaged'
             faults.append(
-                f'the run took {got:.1f} min over its shards against {want:.1f} projected'
+                f'the run {verb} {got:.1f} min over its shards against {want:.1f} projected'
             )
     return faults
 
