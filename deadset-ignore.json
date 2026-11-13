@@ -36,12 +36,6 @@
       "symbol": "ts://./scripts/stryker-ci-reporter.mjs#CiReporter.onMutationTestReportReady",
       "path": "scripts/stryker-ci-reporter.mjs",
       "reason": "Stryker's plugin factory calls it through strykerPlugins; deadset-ts false positive D12, remove when fixed"
-    },
-    {
-      "code": "DS1003",
-      "symbol": "ts://./scripts/stryker-ci-reporter.mjs#CiReporter.unit",
-      "path": "scripts/stryker-ci-reporter.mjs",
-      "reason": "Called by onMutantTested, which Stryker's plugin factory calls through strykerPlugins; deadset-ts false positive D12, remove when fixed"
     }
   ]
 }
