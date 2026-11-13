@@ -30,7 +30,7 @@ runs:
         # renovate: datasource=github-releases depName=prometheus/prometheus
         PROMTOOL_VERSION: v3.16.0
         # renovate: datasource=github-releases depName=grafana/loki
-        LOKITOOL_VERSION: v3.7.9
+        LOKITOOL_VERSION: v3.7.10
       run: |
         bash "${GITHUB_ACTION_PATH}/check.sh" \
           || { echo "Alert rules" >> /tmp/_ci_failures; exit 1; }
