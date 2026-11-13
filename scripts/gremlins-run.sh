@@ -328,6 +328,9 @@ if [ -n "${PLAN_DIR:-}" ]; then
     rm -rf "${plan_tree}"
     cp -a . "${plan_tree}"
     (cd "${plan_tree}" && time_package_mutants "${PLAN_DEADLINE}") >"${PLAN_DIR}/mutant-ms.tsv"
+  elif [ -s /tmp/gremlins-dry.json ]; then
+    # The --coverpkg dry run lists the mutants an integration run executes, which its cost history is keyed by.
+    cp /tmp/gremlins-dry.json "${PLAN_DIR}/dry-run.json"
   fi
   # gremlins-shard.py size_module trusts the files above only after this line.
   printf 'sized=1\n' >>"${PLAN_DIR}/plan.env"

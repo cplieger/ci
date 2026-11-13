@@ -23,151 +23,130 @@ import mutation_cost  # noqa: E402
 
 class Attribute(unittest.TestCase):
     def test_each_completion_is_charged_its_gap_times_the_workers(self):
-        got = mutation_cost.attribute([(12.0, 'a.go'), (13.0, 'a.go'), (17.0, 'b.go')], 10.0, 4)
-        self.assertEqual(
-            got, {'a.go': {'secs': 12.0, 'mutants': 2}, 'b.go': {'secs': 16.0, 'mutants': 1}}
+        got = mutation_cost.attribute(
+            [(12.0, 'a.go', '1:1 X'), (13.0, 'a.go', '2:1 X'), (17.0, 'b.go', '1:1 X')], 10.0, 4
         )
+        self.assertEqual(got, {'a.go': {'1:1 X': [8.0], '2:1 X': [4.0]}, 'b.go': {'1:1 X': [16.0]}})
 
     def test_a_completion_stamped_out_of_order_costs_nothing(self):
-        got = mutation_cost.attribute([(14.0, 'a.go'), (12.0, 'b.go'), (15.0, 'b.go')], 10.0, 2)
-        self.assertEqual(
-            got, {'a.go': {'secs': 8.0, 'mutants': 1}, 'b.go': {'secs': 2.0, 'mutants': 2}}
+        got = mutation_cost.attribute(
+            [(14.0, 'a.go', 'k'), (12.0, 'b.go', 'k'), (15.0, 'b.go', 'k')], 10.0, 2
         )
+        self.assertEqual(got, {'a.go': {'k': [8.0]}, 'b.go': {'k': [0.0, 2.0]}})
 
     def test_a_completion_before_the_start_costs_nothing(self):
         self.assertEqual(
-            mutation_cost.attribute([(9.0, 'a.go')], 10.0, 4), {'a.go': {'secs': 0.0, 'mutants': 1}}
+            mutation_cost.attribute([(9.0, 'a.go', 'k')], 10.0, 4), {'a.go': {'k': [0.0]}}
         )
 
 
 class History(unittest.TestCase):
-    def test_combine_averages_each_file_over_the_runs_that_measured_it(self):
-        got = mutation_cost.combine(
-            [
-                {
-                    'files': {'a': {'secs': 10, 'mutants': 2}, 'b': {'secs': 4, 'mutants': 1}},
-                    'setup_secs': 100,
-                },
-                {'files': {'a': {'secs': 30, 'mutants': 2}}, 'setup_secs': 200},
-                {'files': {'b': {'secs': 8, 'mutants': 1}}},
-            ]
-        )
-        self.assertEqual(
-            got,
-            {
-                'files': {'a': {'secs': 20.0, 'mutants': 2}, 'b': {'secs': 6.0, 'mutants': 1}},
-                'setup_secs': 150.0,
-            },
-        )
+    BLOB = 'a' * 40
 
-    def test_unusable_rows_of_an_untrusted_record_are_dropped(self):
-        rows = {
-            'ok': {'secs': 1, 'mutants': 1},
-            'neg': {'secs': -1, 'mutants': 1},
-            'nan': {'secs': float('nan'), 'mutants': 1},
-            'zero': {'secs': 1, 'mutants': 0},
-            'bool': {'secs': True, 'mutants': 1},
-            'str': {'secs': '1', 'mutants': 1},
-            'list': [1],
+    def test_only_a_value_that_is_no_measure_is_dropped(self):
+        secs = {
+            'ok': [1, 2.5],
+            'mixed': [1.0, -1, float('nan'), True, '1', 10**400, 1e300],
+            'none': [-1],
+            'list': 'x',
+            7: [1.0],
         }
-        self.assertEqual(mutation_cost.clean_files(rows), {'ok': {'secs': 1.0, 'mutants': 1}})
-        self.assertEqual(mutation_cost.clean_files(['a']), {})
+        self.assertEqual(mutation_cost.clean_secs(secs), {'ok': [1.0, 2.5], 'mixed': [1.0, 1e300]})
+        self.assertEqual(mutation_cost.clean_secs(['a']), {})
 
-    def test_combine_of_nothing_has_no_setup(self):
-        self.assertEqual(mutation_cost.combine([]), {'files': {}, 'setup_secs': None})
+    def test_an_implausibly_high_measure_is_kept(self):
+        # A measure is never priced below itself, so only garbage is refused.
+        files = {'a': {'blob': self.BLOB, 'secs': {'k': [1e9]}}}
+        self.assertEqual(mutation_cost.at_blobs(files, {'a': self.BLOB}), {'a': {'k': [1e9]}})
 
+    def test_a_file_s_measures_count_only_at_its_current_blob(self):
+        files = {
+            'a': {'blob': self.BLOB, 'secs': {'k': [1.0]}},
+            'b': {'blob': self.BLOB, 'secs': {'k': [2.0]}},
+            'c': {'blob': 'not a blob', 'secs': {'k': [3.0]}},
+        }
+        got = mutation_cost.at_blobs(files, {'a': self.BLOB, 'b': 'b' * 40, 'c': 'not a blob'})
+        self.assertEqual(got, {'a': {'k': [1.0]}})
+        self.assertEqual(mutation_cost.at_blobs(None, {}), {})
 
-class Project(unittest.TestCase):
-    def test_history_prices_a_file_per_mutant_and_the_rest_at_its_prior_times_the_error(self):
-        e = mutation_cost.PRIOR_ERROR
-        units = {'a': (4, 100.0), 'b': (2, 50.0), 'new': (3, 30.0)}
-        hist = {'files': {'a': {'secs': 160.0, 'mutants': 4}, 'b': {'secs': 30.0, 'mutants': 3}}}
-        got = mutation_cost.project(units, hist)
-        # Measured files set no ratio for the rest: one file's prior error says nothing of another's.
+    def test_a_record_is_refused_only_for_its_shape(self):
+        ok = {'files': {'a': {'blob': self.BLOB, 'secs': {'k': [1.0, -5]}}}, 'setup_secs': 1.0}
+        self.assertEqual(mutation_cost.record_fault(ok), '')
+        for bad in (
+            [],
+            {'files': {}, 'extra': 1},
+            {'files': {'a': {'secs': 1.0, 'mutants': 1}}},
+            {'files': {'a': {'blob': 'x', 'secs': {}}}},
+            {'files': {'a': {'blob': self.BLOB, 'secs': {'k': 1.0}}}},
+            {'files': {}, 'setup_secs': -1},
+        ):
+            with self.subTest(bad=bad):
+                self.assertNotEqual(mutation_cost.record_fault(bad), '')
+
+    def test_merged_takes_new_measures_first_and_keeps_the_last_of_the_rest(self):
+        new = {'a': [5.0], 'b': [1.0, 2.0]}
+        old = {'a': [9.0, 8.0], 'c': [3.0]}
         self.assertEqual(
-            got, {'a': (160.0, 'measured'), 'b': (20.0, 'measured'), 'new': (30.0 * e, 'prior')}
+            mutation_cost.merged(new, old), {'a': [5.0, 8.0], 'b': [1.0, 2.0], 'c': [3.0]}
         )
 
-    def test_no_history_is_the_prior_times_the_error(self):
-        want = {'a': (7.0 * mutation_cost.PRIOR_ERROR, 'prior')}
-        self.assertEqual(mutation_cost.project({'a': (1, 7.0)}, None), want)
-        self.assertEqual(mutation_cost.project({'a': (1, 7.0)}, {'files': 'junk'}), want)
-
-    def test_a_sample_short_of_the_unit_s_mutants_prices_what_it_measured_and_the_rest_at_the_error(
-        self,
-    ):
-        e = mutation_cost.PRIOR_ERROR
-        # 987 of 1672 mutants measured at 72.4 s each before a deadline cut the shard.
-        row = {'secs': 987 * 72.4, 'mutants': 987}
-        got = mutation_cost.project({'s.ts': (1672, 1672 * 30.0)}, {'files': {'s.ts': row}})
-        self.assertEqual(got, {'s.ts': (987 * 72.4 + 685 * 30.0 * e, 'partial')})
-        self.assertEqual(mutation_cost.measured_part(got['s.ts'], row), 987 * 72.4)
-        # With each mutant's prior, the ones it did not reach are taken as the costliest.
-        each = [1.0, 9.0, 2.0, 8.0]
-        cut = {'secs': 6.0, 'mutants': 2}
-        self.assertEqual(mutation_cost.price(4, 20.0, cut, each), (6.0 + 17.0 * e, 'partial'))
-        self.assertEqual(mutation_cost.measured_part((1.0, 'prior'), None), 0.0)
-        self.assertEqual(mutation_cost.measured_part((5.0, 'measured'), None), 5.0)
-        # With no prior either, its cost is unknown.
-        hist = {'files': {'u.ts': {'secs': 20.0, 'mutants': 2}}}
+    def test_attempts_average_per_mutant_over_those_that_measured_it(self):
+        # Two whole attempts and one a deadline cut after one mutant.
+        whole = {'m1': [10.0], 'm2': [20.0]}
+        got = mutation_cost.attempt_mean([whole, {'m1': [30.0], 'm2': [40.0]}, {'m1': [5.0]}])
+        self.assertEqual(got, {'m1': [15.0], 'm2': [30.0]})
         self.assertEqual(
-            mutation_cost.project({'u.ts': (5, None)}, hist), {'u.ts': (None, 'unknown')}
-        )
-        hist['files']['u.ts']['mutants'] = 5
-        self.assertEqual(
-            mutation_cost.project({'u.ts': (5, None)}, hist), {'u.ts': (20.0, 'measured')}
+            mutation_cost.attempt_mean([{'k': [1.0, 3.0]}, {'k': [3.0]}]), {'k': [2.0, 3.0]}
         )
 
-    def test_spread_shares_a_total_by_weight_and_keeps_its_sum(self):
-        self.assertEqual(mutation_cost.spread(90.0, [1.0, 2.0]), [30.0, 60.0])
-        self.assertEqual(mutation_cost.spread(10.0, [0.0, 0.0]), [5.0, 5.0])
+    def test_setup_is_a_measure_or_the_probe(self):
+        for measured, want in (
+            (80.0, 80.0),
+            (6000.0, 6000.0),
+            (0.0, 0.0),
+            (None, 60.0),
+            (float('nan'), 60.0),
+            (10**400, 60.0),
+            (True, 60.0),
+        ):
+            with self.subTest(measured=measured):
+                self.assertEqual(mutation_cost.setup_price(measured, 60.0), want)
+        self.assertEqual(mutation_cost.mean_of([10, None, 20.0, -1]), 15.0)
+        self.assertIsNone(mutation_cost.mean_of([None, 'x']))
 
-    def test_a_row_of_another_blob_is_dropped(self):
-        hist = {
-            'files': {
-                'a': {'secs': 1.0, 'mutants': 1},
-                'b': {'secs': 2.0, 'mutants': 1},
-                'c': {'secs': 3.0, 'mutants': 1},
-            },
-            'blobs': {'a': 'a' * 40, 'b': 'a' * 40},
-        }
-        got = mutation_cost.at_blobs(hist, {'a': 'a' * 40, 'b': 'b' * 40, 'c': 'a' * 40})
-        self.assertEqual(sorted(got['files']), ['a'])
-        self.assertIsNone(mutation_cost.at_blobs(None, {}))
 
-    def test_a_file_with_no_mutant_left_costs_nothing(self):
-        got = mutation_cost.project({'a': (0, 5.0)}, {'files': {'a': {'secs': 9.0, 'mutants': 3}}})
-        self.assertEqual(got, {'a': (0.0, 'measured')})
+class Price(unittest.TestCase):
+    E = mutation_cost.PRIOR_ERROR
 
-    def test_a_price_outside_the_factor_of_its_probe_is_refused_and_the_file_takes_the_prior(self):
-        f = mutation_cost.PRICE_FACTOR
-        units = {
-            'ok': (1, 10.0),
-            'edge': (1, 10.0),
-            'zero': (1, 10.0),
-            'huge': (2, 10.0),
-            'tiny': (1, 10.0),
-            'free': (1, 0.0),
-            'new': (1, 10.0),
-        }
-        hist = {
-            'files': {
-                'ok': {'secs': 20.0, 'mutants': 1},
-                'edge': {'secs': 10.0 * f, 'mutants': 1},
-                'zero': {'secs': 0.0, 'mutants': 1},
-                'huge': {'secs': 1e300, 'mutants': 2},
-                'tiny': {'secs': 10.0 / f / 1.01, 'mutants': 1},
-                'free': {'secs': 1.0, 'mutants': 1},
-            }
-        }
-        got = mutation_cost.project(units, hist)
-        self.assertEqual(got['ok'], (20.0, 'measured'))
-        self.assertEqual(got['edge'], (10.0 * f, 'measured'))
-        for name in ('zero', 'huge', 'tiny', 'new'):
-            with self.subTest(name=name):
-                self.assertAlmostEqual(got[name][0], 10.0 * mutation_cost.PRIOR_ERROR)
-                self.assertEqual(got[name][1], 'prior' if name == 'new' else 'refused')
-        self.assertEqual(got['free'], (0.0, 'refused'))
+    def test_a_unit_costs_its_measured_mutants_and_the_rest_at_the_error(self):
+        got = mutation_cost.price([(10.0, 4.0), (10.0, None), (20.0, 9.0)])
+        self.assertEqual(got, (13.0 + 10.0 * self.E, 13.0, 'partial', 2, 2))
+        self.assertEqual(mutation_cost.price([(10.0, 4.0)]).source, 'measured')
+        self.assertEqual(
+            mutation_cost.price([(10.0, None)]), (10.0 * self.E, 0.0, 'prior', None, 0)
+        )
+        self.assertEqual(mutation_cost.price([]), (0.0, 0.0, 'measured', None, 0))
+
+    def test_a_cut_sample_is_never_priced_below_what_it_measured(self):
+        # 10 of 500 mutants measured 48000 s against a 2-s prior each.
+        mutants = [(2.0, 4800.0)] * 10 + [(2.0, None)] * 490
+        got = mutation_cost.price(mutants)
+        self.assertEqual(
+            (got.secs, got.measured, got.source), (48000 + 490 * 2.0 * self.E, 48000, 'partial')
+        )
+        # A cheap measure prices what it took, as does a dear one.
+        self.assertEqual(mutation_cost.price([(1000.0, 0.5)]).secs, 0.5)
+
+    def test_an_unmeasured_mutant_of_no_prior_is_unknown_never_zero(self):
+        self.assertEqual(mutation_cost.price([(None, None), (1.0, 2.0)]).source, 'unknown')
+        self.assertIsNone(mutation_cost.price([(None, None)]).secs)
+        self.assertEqual(mutation_cost.price([(None, 2700.0)]), (2700.0, 2700.0, 'measured', 0, 1))
+
+    def test_pair_gives_each_planned_mutant_its_own_measure(self):
+        got = mutation_cost.pair(
+            ['k', 'k', 'j', 'gone'], [1.0, 1.0, 2.0, 3.0], {'k': [5.0], 'j': [6.0, 7.0], 'x': [9.0]}
+        )
+        self.assertEqual(got, [(1.0, 5.0), (1.0, None), (2.0, 6.0), (3.0, None)])
 
     def test_a_probe_under_its_clock_is_unknown_never_zero(self):
         for probe, clock, want in (
@@ -179,59 +158,12 @@ class Project(unittest.TestCase):
             with self.subTest(probe=probe):
                 self.assertEqual(mutation_cost.known(probe, clock), want)
 
-    def test_history_is_judged_only_against_a_known_probe(self):
-        self.assertTrue(mutation_cost.plausible(2700.0, None))
-        self.assertFalse(mutation_cost.plausible(0.0, None))
-        self.assertFalse(mutation_cost.plausible(2700.0, 1.0))
-
-    def test_an_unknown_prior_takes_its_measured_history_and_is_unknown_without_one(self):
-        units = {'hist': (3000, None), 'none': (5, None), 'zero': (5, None), 'empty': (0, None)}
-        hist = {
-            'files': {
-                'hist': {'secs': 2700.0, 'mutants': 3000},
-                'zero': {'secs': 0.0, 'mutants': 5},
-            }
-        }
-        got = mutation_cost.project(units, hist)
-        self.assertEqual(got['hist'], (2700.0, 'measured'))
-        self.assertEqual(got['none'], (None, 'unknown'))
-        self.assertEqual(got['zero'], (None, 'unknown'))
-        self.assertEqual(got['empty'], (0.0, 'prior'))
-
-    def test_an_unknown_prior_does_not_change_the_price_of_the_rest(self):
-        units = {'a': (4, 100.0), 'u': (10, None), 'new': (3, 30.0)}
-        hist = {'files': {'a': {'secs': 80.0, 'mutants': 2}, 'u': {'secs': 1e4, 'mutants': 10}}}
-        got = mutation_cost.project(units, hist)
-        self.assertEqual(got['u'], (1e4, 'measured'))
-        self.assertEqual(got['new'], (30.0 * mutation_cost.PRIOR_ERROR, 'prior'))
-
-    def test_a_measured_setup_outside_the_factor_of_its_probe_is_refused(self):
-        f = mutation_cost.PRICE_FACTOR
-        for measured, want in (
-            (80.0, 80.0),
-            (60.0 * f, 60.0 * f),
-            (60.0 * f * 1.01, 60.0),
-            (0.0, 60.0),
-            (None, 60.0),
-            (float('nan'), 60.0),
-            (10**400, 60.0),
-            (True, 60.0),
-        ):
-            with self.subTest(measured=measured):
-                self.assertEqual(mutation_cost.setup_price(measured, 60.0), want)
-
     def test_overflowing_prices_never_raise(self):
-        units = {f'f{i}': (2**53, 1e308) for i in range(4)}
-        hist = {
-            'files': {
-                'f0': {'secs': 1e308, 'mutants': 1},
-                'f1': {'secs': 10**400, 'mutants': 1},
-                'f2': {'secs': 1.0, 'mutants': 10**400},
-            }
-        }
-        got = mutation_cost.project(units, hist)
-        self.assertEqual(set(got), set(units))
-        self.assertTrue(all(secs >= 0 for secs, _ in got.values()))
+        got = mutation_cost.price([(1e308, 1e308), (1e308, None), (1e308, None)])
+        self.assertEqual(got.secs, float('inf'))
+        self.assertEqual(
+            mutation_cost.totals({'a': {'k': [1.0, 2.0]}, 'b': {'j': [3.0]}}), (6.0, 3)
+        )
 
 
 class Numbers(unittest.TestCase):
@@ -262,7 +194,6 @@ class Numbers(unittest.TestCase):
         ):
             with self.subTest(v=v):
                 self.assertIs(mutation_cost.count(v), ok)
-        self.assertEqual(mutation_cost.clean_files({'a': {'secs': 1, 'mutants': 10**400}}), {})
 
 
 class Pack(unittest.TestCase):
@@ -331,10 +262,10 @@ class Choose(unittest.TestCase):
         self.assertEqual(k, 4)
         self.assertEqual(sorted(b.load for b in bins), [60, 90, 300, 500])
         items = self.items(500, 300, 60, 50, 40)
-        self.assertFalse(mutation_cost.capped(k, bins, items, {'m': 0}, 115, 4))
+        self.assertFalse(mutation_cost.capped(k, bins, items, 115, 4))
         k, bins = mutation_cost.choose(items, {'m': 0}, 115, 3)
         self.assertEqual(sorted(b.load for b in bins), [150, 300, 500])
-        self.assertTrue(mutation_cost.capped(k, bins, items, {'m': 0}, 115, 3))
+        self.assertTrue(mutation_cost.capped(k, bins, items, 115, 3))
 
     def test_two_thousand_items_with_one_over_the_target_choose_in_seconds(self):
         items = self.items(5000, *[1.0 + i % 7 for i in range(1999)])
@@ -351,7 +282,7 @@ class Choose(unittest.TestCase):
         for minutes in (0.0, 3.0, 31.2, 80.0):
             setup = minutes * 60
             with self.subTest(setup=minutes):
-                target = mc.target_secs(setup)
+                target = mc.BOUND_SECS - setup
                 self.assertAlmostEqual(target, 300 * 60 / 1.9 - setup)
                 # The runner slows the setup too (1.46x in run 43153682226), so the whole job scales.
                 self.assertAlmostEqual(mc.SLOWDOWN * (setup + target), mc.SAFE_JOB_MINUTES * 60)
@@ -360,10 +291,9 @@ class Choose(unittest.TestCase):
                     mc.SLOWDOWN * (1 + mc.BAND) * mc.TOP_SECS, mc.SAFE_JOB_MINUTES * 60 + 1e-6
                 )
                 self.assertAlmostEqual(mc.TOP_SECS * (1 + mc.BAND), setup + target)
-        self.assertAlmostEqual(mc.target_secs(180) / 60, 154.9, places=1)
-        self.assertAlmostEqual(mc.target_secs(1872) / 60, 126.7, places=1)
+        self.assertAlmostEqual((mc.BOUND_SECS - 180) / 60, 154.9, places=1)
+        self.assertAlmostEqual((mc.BOUND_SECS - 1872) / 60, 126.7, places=1)
         self.assertAlmostEqual(mc.TOP_SECS / 60, 137.3, places=1)
-        self.assertEqual(mc.target_secs(400 * 60), 0.0)
 
     def test_a_run_past_the_top_splits_and_none_of_its_shards_passes_it(self):
         top = mutation_cost.TOP_SECS
@@ -389,14 +319,14 @@ class Choose(unittest.TestCase):
     def test_capped_says_whether_more_shards_would_have_shortened_the_longest(self):
         items = self.items(*[60 * 60] * 30)
         k, bins = mutation_cost.choose(items, {'m': 0}, 230 * 60, limit=4)
-        self.assertTrue(mutation_cost.capped(k, bins, items, {'m': 0}, 230 * 60, limit=4))
+        self.assertTrue(mutation_cost.capped(k, bins, items, 230 * 60, limit=4))
         k, bins = mutation_cost.choose(items, {'m': 0}, 230 * 60)
         self.assertFalse(
-            mutation_cost.capped(k, bins, items, {'m': 0}, 230 * 60, limit=mutation_cost.MAX_SHARDS)
+            mutation_cost.capped(k, bins, items, 230 * 60, limit=mutation_cost.MAX_SHARDS)
         )
         lone = self.items(500 * 60, 10, 10)
         k, bins = mutation_cost.choose(lone, {'m': 0}, 230 * 60, limit=2)
-        self.assertFalse(mutation_cost.capped(k, bins, lone, {'m': 0}, 230 * 60, limit=2))
+        self.assertFalse(mutation_cost.capped(k, bins, lone, 230 * 60, limit=2))
 
 
 class Bound(unittest.TestCase):
@@ -411,7 +341,6 @@ class Bound(unittest.TestCase):
     def test_the_bound_holds_the_slowest_runner_to_the_safe_limit(self):
         mc = mutation_cost
         self.assertAlmostEqual(mc.SLOWDOWN * mc.BOUND_SECS, mc.SAFE_JOB_MINUTES * 60)
-        self.assertAlmostEqual(mc.target_secs(600.0), mc.BOUND_SECS - 600.0)
 
     def test_a_count_past_the_limit_is_taken_where_the_bound_needs_it(self):
         items = self.items(*[self.B * 0.6] * 40)
@@ -419,6 +348,7 @@ class Bound(unittest.TestCase):
         self.assertTrue(mutation_cost.breaches(bins, {'m': 0}))
         k, bins = mutation_cost.fit(items, {'m': 0}, mutation_cost.TOP_SECS)
         self.assertEqual((k, mutation_cost.breaches(bins, {'m': 0})), (40, []))
+        self.assertEqual([len(b.items) for b in bins], [1] * 40)
         self.assertGreater(k, mutation_cost.MAX_SHARDS)
 
     def test_an_estimate_past_the_bound_runs_alone_under_the_deadline(self):
@@ -458,17 +388,34 @@ class Bound(unittest.TestCase):
         for plan in ({'deadline': []}, {}, None, {'deadline': [1]}):
             self.assertIsNone(mutation_cost.deadline_note('r', plan))
 
-    def test_a_unit_s_source_is_partial_where_its_parts_mix(self):
-        for parts, want in (
-            (['measured'], 'measured'),
-            (['prior', 'prior'], 'prior'),
-            (['measured', 'prior'], 'partial'),
-            (['partial', 'measured'], 'partial'),
-            (['refused', 'measured'], 'refused'),
-            (['unknown', 'prior'], 'unknown'),
-            ([], 'measured'),
-        ):
-            self.assertEqual(mutation_cost.source_of(parts), want, parts)
+    def test_fit_never_plans_more_shards_than_units(self):
+        # Prior-only units past the bound, each one the deadline's alone.
+        for n, size, want in ((18, 1.2, 18), (20, 4.0, 20), (100, 3.0, 100)):
+            with self.subTest(n=n, size=size):
+                items = self.items(*[self.B * size] * n, known=0.0)
+                k, bins = mutation_cost.fit(items, {'m': 60}, mutation_cost.TOP_SECS)
+                self.assertEqual(k, want)
+                self.assertTrue(all(b.items for b in bins))
+                self.assertEqual(mutation_cost.breaches(bins, {'m': 60}), [])
+
+    def test_exempt_units_are_counted_out_of_the_lower_bound(self):
+        items = [*self.items(*[self.B * 2] * 3, known=0.0), *self.items(*[self.B * 0.5] * 4)]
+        # With one shard allowed in the band the search starts at 3 alone + 2 for the rest.
+        k, bins = mutation_cost.fit(items, {'m': 0}, mutation_cost.TOP_SECS, limit=1)
+        self.assertEqual(k, 5)
+        self.assertTrue(all(b.items for b in bins))
+        self.assertEqual(mutation_cost.breaches(bins, {'m': 0}), [])
+
+    def test_a_measured_mutant_past_the_bound_fails_the_plan_naming_it(self):
+        # A cut sample measured 48000 s, so its unit cannot share a shard or fit one.
+        priced = mutation_cost.price([(2.0, 4800.0)] * 10 + [(2.0, None)] * 490)
+        item = mutation_cost.Item(
+            'm', 'a.ts', priced.secs / 4, priced.measured / 4, 'a.ts 3:1-3:9 X'
+        )
+        with self.assertRaises(mutation_cost.UnsafePlanError) as ctx:
+            mutation_cost.fit([item, *self.items(10.0)], {'m': 60}, mutation_cost.TOP_SECS)
+        self.assertIn('a.ts alone projects', str(ctx.exception))
+        self.assertIn('its costliest measured mutant a.ts 3:1-3:9 X', str(ctx.exception))
 
 
 class Bar(unittest.TestCase):
@@ -534,46 +481,73 @@ class Bar(unittest.TestCase):
 
 
 class PriceOwner(unittest.TestCase):
-    """mutation_cost.price is the one place a unit's price is set: nothing else scales a prior."""
+    """mutation_cost.price is the one place a unit's price is set: nothing else scales a prior or
+    does arithmetic on a cost history's measures."""
 
     COST_SCRIPTS = ('mutation_cost.py', 'stryker-shard.py', 'gremlins-shard.py')
-    # Where a prior meets a measure by right: price sets prices, prior_error measures the ratio.
-    OWNERS = frozenset({'price', 'prior_error'})
-    PRIOR = frozenset({'prior', 'priors', 'prior_secs', 'PRIOR_ERROR'})
-    # A history row's key, or a local that names its measure.
-    MEASURE = frozenset({"'secs'", 'measured'})
+    # The functions that read measures by right: price and pair set prices, the rest record,
+    # count or ratio them.
+    OWNERS = frozenset(
+        {'price', 'pair', 'attribute', 'attempt_mean', 'merged', 'totals', 'mean_of', 'prior_error'}
+    )
+    # Calls that hand out a cost history's measures, and parameters that hold them.
+    SOURCES = frozenset(
+        {
+            'at_blobs',
+            'clean_secs',
+            'clean_files',
+            'unit_measures',
+            'attempt_mean',
+            'merged',
+            'pair',
+            'span_pairs',
+        }
+    )
+    HELD = frozenset({'measured', 'paired', 'history'})
+    # Calls whose value is a price or a count, no longer a measure.
+    PRICES = frozenset(
+        {
+            'price',
+            'priced_unit',
+            'integration_price',
+            'setup_price',
+            'totals',
+            'prior_rows',
+            'prior_error',
+            'mean_of',
+            'len',
+        }
+    )
+    ARITHMETIC = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow)
 
-    def taint(self, node: ast.AST, names: dict[str, set[str]]) -> set[str]:
-        """What NODE reads: 'prior' (a prior or PRIOR_ERROR) and 'measure' (a measured secs),
-        through NAMES, the local names already assigned from either."""
-        out: set[str] = set()
-        for n in ast.walk(node):
-            word = (
-                n.id
-                if isinstance(n, ast.Name)
-                else n.attr
-                if isinstance(n, ast.Attribute)
-                else repr(n.value)
-                if isinstance(n, ast.Constant) and n.value == 'secs'
-                else n.value
-                if isinstance(n, ast.Constant) and isinstance(n.value, str)
-                else None
-            )
-            out |= {'prior'} if word in self.PRIOR else set()
-            out |= {'measure'} if word in self.MEASURE else set()
-            if isinstance(n, ast.Name):
-                out |= names.get(n.id, set())
-        return out
+    @staticmethod
+    def called(node: ast.AST) -> str | None:
+        f = node.func if isinstance(node, ast.Call) else None
+        return f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
 
-    def mixed(self, fn: ast.FunctionDef) -> list[int]:
-        """The lines of FN where a multiply or divide reads both a prior and a measure, through any
-        chain of local assignments, loops and comprehensions."""
-        names: dict[str, set[str]] = {}
+    def reads(self, node: ast.AST, names: set[str]) -> bool:
+        """NODE reads a measure: a source call, or a tainted name, outside a price call."""
+        if isinstance(node, ast.Call) and self.called(node) in self.PRICES:
+            return False
+        if isinstance(node, ast.Call) and self.called(node) in self.SOURCES:
+            return True
+        if isinstance(node, ast.Name) and node.id in names:
+            return True
+        # A comprehension's value is its element; its loops only bind the names tainted() follows.
+        if isinstance(node, ast.ListComp | ast.SetComp | ast.GeneratorExp):
+            return self.reads(node.elt, names)
+        if isinstance(node, ast.DictComp):
+            return self.reads(node.key, names) or self.reads(node.value, names)
+        return any(self.reads(c, names) for c in ast.iter_child_nodes(node))
+
+    def tainted(self, fn: ast.FunctionDef) -> set[str]:
+        """FN's local names that hold a measure, through assignments, loops and comprehensions."""
+        names = {a.arg for a in fn.args.args if a.arg in self.HELD}
         flows = []
         for n in ast.walk(fn):
             if isinstance(n, ast.Assign):
                 flows += [(t, n.value) for t in n.targets]
-            elif isinstance(n, ast.AugAssign | ast.AnnAssign | ast.NamedExpr) and n.value:
+            elif isinstance(n, ast.AnnAssign | ast.NamedExpr) and n.value:
                 flows.append((n.target, n.value))
             elif isinstance(n, ast.For | ast.comprehension):
                 flows.append((n.target, n.iter))
@@ -581,20 +555,23 @@ class PriceOwner(unittest.TestCase):
         while changed:
             changed = False
             for target, value in flows:
-                got = self.taint(value, names)
-                for t in ast.walk(target):
-                    if isinstance(t, ast.Name) and not got <= names.get(t.id, set()):
-                        names[t.id] = names.get(t.id, set()) | got
+                if not self.reads(value, names):
+                    continue
+                # Only the names a value is bound to, never a subscript's index.
+                bound = (
+                    [target]
+                    if isinstance(target, ast.Name)
+                    else (
+                        [e for e in ast.walk(target) if isinstance(e, ast.Name)]
+                        if isinstance(target, ast.Tuple | ast.List)
+                        else []
+                    )
+                )
+                for t in bound:
+                    if t.id not in names:
+                        names.add(t.id)
                         changed = True
-        return sorted(
-            {
-                n.lineno
-                for n in ast.walk(fn)
-                if isinstance(n, ast.BinOp)
-                and isinstance(n.op, ast.Mult | ast.Div)
-                and self.taint(n, names) >= {'prior', 'measure'}
-            }
-        )
+        return names
 
     @staticmethod
     def priced(node: ast.expr) -> bool:
@@ -625,13 +602,26 @@ class PriceOwner(unittest.TestCase):
                     out.append(f'{name}:{child.lineno} in {owner}')
                 visit(child, owner)
 
-        visit(ast.parse(source), '<module>')
-        for fn in ast.walk(ast.parse(source)):
-            if isinstance(fn, ast.FunctionDef) and fn.name not in self.OWNERS:
-                out += [f'{name}:{line} in {fn.name}' for line in self.mixed(fn)]
+        tree = ast.parse(source)
+        visit(tree, '<module>')
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef) or fn.name in self.OWNERS:
+                continue
+            names = self.tainted(fn)
+            for n in ast.walk(fn):
+                if isinstance(n, ast.BinOp) and isinstance(n.op, self.ARITHMETIC):
+                    hit = self.reads(n.left, names) or self.reads(n.right, names)
+                elif isinstance(n, ast.AugAssign) and isinstance(n.op, self.ARITHMETIC):
+                    hit = self.reads(n.value, names) or self.reads(n.target, names)
+                elif self.called(n) in ('sum', 'max', 'min', 'round'):
+                    hit = any(self.reads(a, names) for a in n.args)
+                else:
+                    continue
+                if hit:
+                    out.append(f'{name}:{n.lineno} in {fn.name}')
         return sorted(set(out), key=lambda x: int(x.split(':')[1].split()[0]))
 
-    def test_no_cost_script_scales_a_prior_outside_price(self):
+    def test_no_cost_script_prices_outside_price(self):
         for name in self.COST_SCRIPTS:
             with self.subTest(name):
                 self.assertEqual(self.sites((SCRIPTS / name).read_text(), name), [])
@@ -640,25 +630,25 @@ class PriceOwner(unittest.TestCase):
         source = 'def assign(f, r):\n    return f["prior_secs"] * r\n\ndef g(p):\n    return p * PRIOR_ERROR\n'
         self.assertEqual(self.sites(source, 'x.py'), ['x.py:2 in assign', 'x.py:5 in g'])
 
-    def test_the_check_follows_a_prior_and_a_measure_through_locals(self):
-        # The cross-file calibration of an earlier project(), and an earlier weights()' cross-range one.
-        source = """def project(units, hist):
-    measured = sum(hist[p]['secs'] for p in hist)
-    prior = sum(units[p][1] for p in hist)
-    ratio = measured / prior
-    return {p: v * ratio for p, v in units.items()}
+    def test_the_check_follows_a_history_measure_through_locals(self):
+        # A per-unit row scaled, smeared or combined into a price, and a function that prices right.
+        source = """def span_prices(f, history):
+    rows = mutation_cost.at_blobs(history['files'], {})
+    total = sum(v for vs in rows['a'].values() for v in vs)
+    return [total * w for w in f]
 
-def weights(spans, rows):
-    prior = [s[2] for s in spans]
-    rates = [r['secs'] / p for r, p in zip(rows, prior)]
-    return [p * rates[0] for p in prior]
+def combine(records):
+    acc = [mutation_cost.clean_secs(r) for r in records]
+    return {k: acc[0][k][0] / len(acc) for k in acc[0]}
 
-def fine(secs, workers):
-    return secs / workers
+def fine(measured, workers):
+    priced = mutation_cost.price(mutation_cost.pair(['k'], [1.0], measured))
+    n = len(measured)
+    return priced.secs / workers + n
 """
         self.assertEqual(
             self.sites(source, 'x.py'),
-            ['x.py:4 in project', 'x.py:5 in project', 'x.py:9 in weights', 'x.py:10 in weights'],
+            ['x.py:3 in span_prices', 'x.py:4 in span_prices', 'x.py:8 in combine'],
         )
 
 
@@ -700,61 +690,6 @@ class MatrixBound(unittest.TestCase):
             mutation_cost.MAX_SHARDS * mutation_cost.MAX_SHARDS, mutation_cost.MATRIX_LIMIT
         )
         self.assertLessEqual(3 * mutation_cost.MAX_SHARDS, mutation_cost.MATRIX_LIMIT)
-
-
-class CarryForward(unittest.TestCase):
-    def test_a_file_measured_now_takes_its_new_cost_and_one_not_measured_keeps_its_last(self):
-        new = {'files': {'a': {'secs': 5.0, 'mutants': 1}}, 'setup_secs': None}
-        old = {
-            'files': {
-                'a': {'secs': 9.0, 'mutants': 1},
-                'b': {'secs': 3.0, 'mutants': 2},
-                'gone': {'secs': 1.0, 'mutants': 1},
-            },
-            'setup_secs': 80,
-        }
-        got = mutation_cost.carry_forward(new, old, keep={'a', 'b'})
-        self.assertEqual(
-            got,
-            {
-                'files': {'a': {'secs': 5.0, 'mutants': 1}, 'b': {'secs': 3.0, 'mutants': 2}},
-                'setup_secs': 80.0,
-            },
-        )
-        self.assertIn('gone', mutation_cost.carry_forward(new, old)['files'])
-
-    def test_an_untrusted_old_history_adds_nothing(self):
-        new = {'files': {'a': {'secs': 5.0, 'mutants': 1}}, 'setup_secs': 60.0}
-        for old in (None, [], {'files': [1], 'setup_secs': -1}):
-            self.assertEqual(mutation_cost.carry_forward(new, old), new)
-
-    def test_a_sample_short_of_its_planned_mutants_replaces_only_a_measure_of_fewer(self):
-        new = {
-            'files': {
-                'cut': {'secs': 2.0, 'mutants': 4},
-                'new': {'secs': 1.0, 'mutants': 1},
-                'half': {'secs': 6.0, 'mutants': 5},
-                'whole': {'secs': 7.0, 'mutants': 10},
-            },
-            'setup_secs': 60.0,
-        }
-        old = {
-            'files': {'cut': {'secs': 90.0, 'mutants': 10}, 'half': {'secs': 9.0, 'mutants': 10}}
-        }
-        planned = {'cut': 10, 'new': 10, 'half': 10, 'whole': 10}
-        got = mutation_cost.carry_forward(new, old, planned=planned)['files']
-        self.assertEqual(
-            got,
-            {
-                'cut': {'secs': 90.0, 'mutants': 10},
-                'half': {'secs': 9.0, 'mutants': 10},
-                'new': {'secs': 1.0, 'mutants': 1},
-                'whole': {'secs': 7.0, 'mutants': 10},
-            },
-        )
-        old['files']['cut']['mutants'] = 3
-        got = mutation_cost.carry_forward(new, old, planned=planned)['files']
-        self.assertEqual(got['cut'], {'secs': 2.0, 'mutants': 4})
 
 
 FLEET = json.loads((SCRIPTS / 'testdata' / 'mutation-cost' / 'fleet.json').read_text())

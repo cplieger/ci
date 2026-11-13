@@ -1,11 +1,12 @@
-"""Per-file mutation cost from a recorded run, and the shard packing of both weekly mutation runs.
+"""Per-mutant mutation cost from a recorded run, and the shard packing of both weekly mutation runs.
 
 gremlins and Stryker each report one completion per mutant while a fixed pool of
-workers runs the mutants in file order. A file's measured cost is the gap before
-each of its completions times the workers (attribute). The next run prices a file
-from that history while the file is unchanged, or from its tool's prior times
-PRIOR_ERROR (price), and packs files into shards that each end near a target
-(choose), more than MAX_SHARDS only where the bound on every job needs them (fit).
+workers runs the mutants. A mutant's measured cost is the gap before its
+completion times the workers (attribute), kept per file blob and mutant identity.
+The next run prices each unit as its measured mutants' seconds plus its tool's
+prior times PRIOR_ERROR for the rest (price), and packs units into shards that each
+end near a target (choose), more than MAX_SHARDS only where the bound on every job
+needs them (fit).
 """
 
 from __future__ import annotations
@@ -20,10 +21,10 @@ import sys
 import traceback
 from dataclasses import dataclass, field
 from string.templatelib import Template, convert
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Sequence
     from pathlib import Path
 
 # Every plain log line starts with this, so the runner never reads one as a command.
@@ -39,7 +40,7 @@ SAFE_JOB_MINUTES = 300
 # gremlins run 43328219246 (shard 2's work took 85, 125 and 161 min), past the 1.76
 # of run 43153682226. gremlins-shard.py's record job measures it each week and warns past this.
 SLOWDOWN = 1.9
-# A unit with no measured history at its current git blob is planned at its tool's prior times
+# A mutant with no measure at its file's current git blob is planned at its tool's prior times
 # this, a ruled margin: in Stryker run 43328238671 prior-priced work took at most 0.48x its prior
 # per shard, and 3.53x in the largest single-file ratio (platform.ts, too small to move a shard);
 # store.ts's 2.69x was against a price another file's ratio had already scaled down. Both weekly
@@ -52,9 +53,6 @@ MATRIX_LIMIT = 256
 # only for the bound. deadset-ts's full Stryker run, about 36 machine-hours, needs about
 # 16 to 19 shards at the band's top (5 to 31 min of setup).
 MAX_SHARDS = 16
-# A measured cost per mutant more than this factor either way from its probe's is
-# refused: run 42584241747's files measured 0.052 to 9.3 times their package's.
-PRICE_FACTOR = 50
 # A float holds every int up to this exactly; a larger count is not a measure.
 MAX_COUNT = 2**53
 # gremlins-run.sh times a suite with `date +%s` and a package's mutant in whole
@@ -68,7 +66,7 @@ MAX_INPUT_BYTES = 32 * 2**20
 # holds '~' or '=', which entry_key uses as its separators.
 REPO_NAME = re.compile(r'[A-Za-z0-9._-]+')
 DIR_PART = re.compile(r'[A-Za-z0-9._-]+')
-# A git object id, SHA-1 or SHA-256: the file version a Stryker cost history's range rows belong to.
+# A git object id, SHA-1 or SHA-256: the file version a cost history's measures belong to.
 GIT_BLOB = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
 
 
@@ -100,6 +98,9 @@ class Item:
     unit: str | None
     work: float  # wall seconds on the group's workers
     known: float | None = None  # the part of work a measure priced; None for all of it
+    worst: str | None = (
+        None  # its costliest measured mutant, named when the measures alone break the bound
+    )
 
 
 @dataclass
@@ -153,13 +154,8 @@ def pack(items: list[Item], k: int, setup: dict[str, float]) -> list[Bin]:
 BOUND_SECS = SAFE_JOB_MINUTES * 60 / SLOWDOWN
 
 
-def target_secs(setup: float) -> float:
-    """The most work one shard of SETUP seconds' setup takes within BOUND_SECS."""
-    return max(0.0, BOUND_SECS - setup)
-
-
 # The band's top, setup and work together: a shard whose jobs average BAND over a projection
-# this long holds setup + target_secs(setup) whatever its setup.
+# this long still holds BOUND_SECS, whatever its setup.
 TOP_SECS = SAFE_JOB_MINUTES * 60 / (SLOWDOWN * (1 + BAND))
 
 
@@ -254,6 +250,13 @@ def measured_load(b: Bin, setup: dict[str, float]) -> float:
     )
 
 
+def exempt(it: Item, setup: dict[str, float]) -> bool:
+    """IT holds an estimate that passes BOUND_SECS while its measured part fits, so alone in a
+    shard it is the job deadline's (breaches)."""
+    alone = Bin(load=setup[it.group] + it.work, groups={it.group}, items=[it])
+    return alone.load > BOUND_SECS and not breaches([alone], setup)
+
+
 def breaches(bins: list[Bin], setup: dict[str, float], *, whole: bool = False) -> list[int]:
     """The indices of BINS that project past BOUND_SECS, but for a shard the job's deadline bounds.
 
@@ -307,10 +310,11 @@ def fit(
     if over:
         it = max(over, key=lambda x: x.work if x.known is None else x.known)
         measured = it.work if it.known is None else it.known
+        worst = f', its costliest measured mutant {it.worst}' if it.worst else ''
         raise UnsafePlanError(
             f'{it.unit or it.group} alone projects {(setup[it.group] + measured) / 60:.4g} min of '
-            f'measured setup and work, past the {BOUND_SECS / 60:.0f} min a job may project, and no '
-            f'cut or shard count shortens it'
+            f'measured setup and work{worst}, past the {BOUND_SECS / 60:.0f} min a job may '
+            f'project, and no cut or shard count shortens it'
         )
     k, bins = choose(items, setup, top, max(1, min(limit, most)))
     if not breaches(bins, setup, whole=whole):
@@ -320,9 +324,15 @@ def fit(
             f'its one job projects {bins[0].load / 60:.4g} min, past the '
             f'{BOUND_SECS / 60:.0f} min a job may project, and it cannot be sharded'
         )
-    groups = {it.group for it in items}
-    least = (sum(it.work for it in items) + sum(setup[g] for g in groups)) / BOUND_SECS
-    for n in range(max(k + 1, math.ceil(least) if math.isfinite(least) else 0), most + 1):
+    # One shard per item is the most that helps: pack() then gives each item a shard of its own.
+    hi = min(most, len(items))
+    alone = [it for it in items if exempt(it, setup)]
+    rest = [it for it in items if not exempt(it, setup)]
+    least = len(alone) + math.ceil(
+        (sum(it.work for it in rest) + sum(setup[g] for g in {it.group for it in rest}))
+        / BOUND_SECS
+    )
+    for n in range(min(hi, max(k + 1, least)), hi + 1):
         bins = pack(items, n, setup)
         if not breaches(bins, setup):
             return n, bins
@@ -337,9 +347,7 @@ def crowded(bins: list[Bin]) -> float:
     return max((b.load for b in bins if len(b.items) > 1), default=0.0)
 
 
-def capped(
-    k: int, bins: list[Bin], items: list[Item], setup: dict[str, float], top: float, limit: int
-) -> bool:
+def capped(k: int, bins: list[Bin], items: list[Item], top: float, limit: int) -> bool:
     """Whether LIMIT, not the prices, set choose's K: more shards would have ended a shard of
     several items, past the top, sooner."""
     return k == limit < len(items) and crowded(bins) > top
@@ -457,22 +465,23 @@ def summarize(msg: Template, *, table: bool = False) -> None:
             f.write(line + '\n')
 
 
-def attribute(events: Iterable[tuple[float, str]], start: float, workers: int) -> dict[str, dict]:
-    """Worker-seconds and completions per file from one run's (time, file) completions.
+def attribute(
+    events: Iterable[tuple[float, str, str]], start: float, workers: int
+) -> dict[str, dict[str, list[float]]]:
+    """Worker-seconds per mutant from one run's (time, file, mutant key) completions, as
+    {file: {key: [seconds, ...]}}, one value per completion of that key in completion order.
 
     Each completion is charged the wall time since the one before it (or since
     START, the moment the workers began), times the workers. A completion
     stamped before the previous one is charged nothing.
     """
-    out: dict[str, dict] = {}
+    out: dict[str, dict[str, list[float]]] = {}
     prev = start
-    for t, path in events:
+    for t, path, key in events:
         gap = max(0.0, t - prev)
         prev = max(prev, t)
-        e = out.setdefault(path, {'secs': 0.0, 'mutants': 0})
-        e['secs'] += gap * workers
-        e['mutants'] += 1
-    return {p: {'secs': round(e['secs'], 3), 'mutants': e['mutants']} for p, e in out.items()}
+        out.setdefault(path, {}).setdefault(key, []).append(round(gap * workers, 3))
+    return out
 
 
 def count(v: object) -> bool:
@@ -492,191 +501,146 @@ def known(probe: float, tick: float) -> float | None:
     return probe if probe >= tick else None
 
 
-def plausible(measured: float, probe: float | None) -> bool:
-    """MEASURED is within PRICE_FACTOR of PROBE either way; against an unknown PROBE, any positive measure."""
-    if probe is None:
-        return measured > 0
-    return probe > 0 and probe / PRICE_FACTOR <= measured <= probe * PRICE_FACTOR
-
-
 def setup_price(measured: object, probe: float) -> float:
-    """The setup a plan prices: MEASURED when it is a plausible measure of PROBE, else PROBE."""
-    usable = nonnegative(measured) and plausible(float(measured), known(probe, SECOND_TICK))
-    return float(measured) if usable else probe
+    """The setup a plan prices: MEASURED when it is a measure, else PROBE."""
+    return float(measured) if nonnegative(measured) else probe
+
+
+def mean_of(values: Iterable[object]) -> float | None:
+    """The mean of the measures among VALUES, rounded to 0.1 s, or None for none."""
+    kept = [float(v) for v in values if nonnegative(v)]
+    return round(sum(kept) / len(kept), 1) if kept else None
+
+
+def clean_secs(secs: object) -> dict[str, list[float]]:
+    """The measures of an untrusted {mutant key: [seconds, ...]} map: each value that is a finite
+    number at or above 0, and each key that keeps one."""
+    if not isinstance(secs, dict):
+        return {}
+    out = {
+        k: [float(x) for x in v if nonnegative(x)]
+        for k, v in secs.items()
+        if isinstance(k, str) and isinstance(v, list)
+    }
+    return {k: v for k, v in out.items() if v}
 
 
 def clean_files(files: object) -> dict[str, dict]:
-    """The usable {path: {secs, mutants}} rows of an untrusted cost record."""
+    """The usable {path: {blob, secs}} entries of an untrusted cost history: a git blob and the
+    measures clean_secs keeps."""
     if not isinstance(files, dict):
         return {}
-    return {
-        p: {'secs': float(e['secs']), 'mutants': e['mutants']}
-        for p, e in files.items()
-        if isinstance(p, str)
-        and isinstance(e, dict)
-        and nonnegative(e.get('secs'))
-        and count(e.get('mutants'))
-        and e['mutants'] > 0
-    }
+    out = {}
+    for p, e in files.items():
+        if not (isinstance(p, str) and isinstance(e, dict)):
+            continue
+        blob, secs = e.get('blob'), clean_secs(e.get('secs'))
+        if isinstance(blob, str) and GIT_BLOB.fullmatch(blob) and secs:
+            out[p] = {'blob': blob, 'secs': secs}
+    return out
 
 
 def record_fault(rec: object) -> str:
-    """Why REC is not a cost record ({files: {path: {secs, mutants}}, setup_secs}, Stryker's with
-    blobs and prior_error), or ''."""
-    if not isinstance(rec, dict) or not set(rec) <= {'files', 'setup_secs', 'blobs', 'prior_error'}:
-        return 'it is not a {files, setup_secs, blobs, prior_error} object'
-    if rec.get('prior_error') is not None and not nonnegative(rec['prior_error']):
-        return f'its prior_error {rec["prior_error"]!r:.200} is not a ratio'
-    blobs = rec.get('blobs', {})
-    if not isinstance(blobs, dict) or not all(
-        isinstance(v, str) and GIT_BLOB.fullmatch(v) for v in blobs.values()
-    ):
-        return 'its blobs are not all git object ids'
+    """Why REC is not a cost history ({files: {path: {blob, secs}}, setup_secs, prior_error}), or ''.
+
+    Only its shape is judged: a value that is no measure is dropped where it is
+    read (clean_secs), and a key no planned mutant holds prices nothing (pair).
+    """
+    if not isinstance(rec, dict) or not set(rec) <= {'files', 'setup_secs', 'prior_error'}:
+        return 'it is not a {files, setup_secs, prior_error} object'
     files = rec.get('files', {})
-    if (
-        not isinstance(files, dict)
-        or len(clean_files(files)) != len(files)
-        or any(set(e) != {'secs', 'mutants'} for e in files.values())
+    if not isinstance(files, dict) or not all(
+        isinstance(e, dict)
+        and set(e) == {'blob', 'secs'}
+        and isinstance(e['blob'], str)
+        and GIT_BLOB.fullmatch(e['blob'])
+        and isinstance(e['secs'], dict)
+        and all(isinstance(v, list) for v in e['secs'].values())
+        for e in files.values()
     ):
-        return 'its file rows are not all {secs, mutants} measures'
-    if rec.get('setup_secs') is not None and not nonnegative(rec['setup_secs']):
-        return f'its setup_secs {rec["setup_secs"]!r:.200} is not a measure'
+        return 'its file entries are not all {blob, secs: {mutant: [seconds]}} measures'
+    for key in ('setup_secs', 'prior_error'):
+        if rec.get(key) is not None and not nonnegative(rec[key]):
+            return f'its {key} {rec[key]!r:.200} is not a measure'
     return ''
 
 
-def at_blobs(
-    history: dict | None, blobs: dict[str, str], file_of: Callable[[str], str] = str
-) -> dict | None:
-    """HISTORY with only the rows measured on the version BLOBS gives their file (FILE_OF a row's
-    unit): a row whose file's blob is missing on either side, or differs, prices nothing now."""
-    if not isinstance(history, dict):
-        return history
-    old = history.get('blobs') if isinstance(history.get('blobs'), dict) else {}
+def at_blobs(files: object, blobs: dict[str, str]) -> dict[str, dict[str, list[float]]]:
+    """Each file's measures from history FILES taken at the git blob BLOBS gives it now; a file
+    whose blob is missing on either side, or differs, has none."""
+    return {p: e['secs'] for p, e in clean_files(files).items() if blobs.get(p) == e['blob']}
+
+
+def pair(
+    keys: Sequence[str], priors: Sequence[float | None], measured: dict[str, list[float]]
+) -> list[tuple[float | None, float | None]]:
+    """Each planned mutant's (prior, measure) for price, from its KEYS and PRIORS: the i-th
+    mutant of one key takes MEASURED's i-th value of it, and a value no planned mutant takes,
+    of an unknown key or past its count, prices nothing."""
+    seen: dict[str, int] = {}
+    out = []
+    for key, prior in zip(keys, priors, strict=True):
+        i = seen[key] = seen.get(key, -1) + 1
+        values = measured.get(key) or []
+        out.append((prior, values[i] if i < len(values) else None))
+    return out
+
+
+class Priced(NamedTuple):
+    secs: float | None  # worker-seconds, None for an unknown cost
+    measured: float  # the part of them measures set
+    source: str  # 'measured', 'prior', 'partial' or 'unknown'
+    worst: int | None  # the index of the costliest measured mutant, None for none
+    reached: int  # how many of the mutants a measure holds
+
+
+def price(mutants: Sequence[tuple[float | None, float | None]]) -> Priced:
+    """A unit's worker-seconds for the next run: the one place either tool sets a price.
+
+    MUTANTS holds, per mutant the unit (a file, range or module) runs, its tool's
+    prior worker-seconds (None when its probe measured nothing) and its measure at
+    the file's current blob (None for none). A measured mutant costs what it took,
+    so a measure is never priced below itself, and any other PRIOR_ERROR times its
+    prior. The source is 'measured' when every mutant is, 'prior' when none is,
+    else 'partial'; with an unmeasured mutant of no prior the price is None and
+    the source 'unknown', never 0.
+    """
+    got = [(m, i) for i, (_, m) in enumerate(mutants) if m is not None]
+    measured = sum(m for m, _ in got)
+    worst = max(got)[1] if got else None
+    rest = [p for p, m in mutants if m is None]
+    if any(p is None for p in rest):
+        return Priced(None, measured, 'unknown', worst, len(got))
+    source = 'measured' if not rest else 'prior' if len(got) == 0 else 'partial'
+    return Priced(measured + sum(rest) * PRIOR_ERROR, measured, source, worst, len(got))
+
+
+def totals(files: dict[str, dict[str, list[float]]]) -> tuple[float, int]:
+    """The worker-seconds and mutant count of one record's measures, for slowdown."""
+    values = [v for secs in files.values() for vs in secs.values() for v in vs]
+    return sum(values), len(values)
+
+
+def merged(new: dict[str, list[float]], old: dict[str, list[float]]) -> dict[str, list[float]]:
+    """One file's measures: NEW's values of each key, then OLD's past as many, so a cut sample
+    keeps the last measure of each mutant it did not reach."""
     return {
-        **history,
-        'files': {
-            u: e
-            for u, e in clean_files(history.get('files')).items()
-            if blobs.get(file_of(u)) and old.get(file_of(u)) == blobs[file_of(u)]
-        },
+        k: [*new.get(k, []), *old.get(k, [])[len(new.get(k, [])) :]]
+        for k in sorted(set(new) | set(old))
     }
 
 
-def combine(records: list[dict]) -> dict:
-    """One history from several runs of the same work: the mean per file and of the setup.
-
-    Each record is {'files': {path: {secs, mutants}}, 'setup_secs': float}; a file
-    or setup a record lacks is averaged over the records that have it.
-    """
-    acc: dict[str, list[dict]] = {}
-    setups = []
-    for r in records:
-        for p, e in clean_files(r.get('files')).items():
-            acc.setdefault(p, []).append(e)
-        if nonnegative(r.get('setup_secs')):
-            setups.append(float(r['setup_secs']))
-    files = {
-        p: {
-            'secs': round(sum(e['secs'] for e in es) / len(es), 3),
-            'mutants': round(sum(e['mutants'] for e in es) / len(es)),
-        }
-        for p, es in sorted(acc.items())
-    }
-    return {'files': files, 'setup_secs': round(sum(setups) / len(setups), 1) if setups else None}
-
-
-def carry_forward(
-    new: dict, old: object, keep: set[str] | None = None, planned: dict[str, int] | None = None
-) -> dict:
-    """NEW's history with OLD's last measure of each file NEW did not measure, limited to KEEP when given.
-
-    A file a run never reached before its job stopped, or whose shard left no
-    record, has no new measure, so its last one still prices it. A new sample
-    of fewer than its PLANNED mutants, the ones a job finished before its
-    deadline cut it, prices what it measured (price), and replaces a last
-    measure of as many mutants or fewer.
-    """
-    old = old if isinstance(old, dict) else {}
-    last = clean_files(old.get('files'))
-    fresh = {
-        p: e
-        for p, e in clean_files(new.get('files')).items()
-        if planned is None
-        or e['mutants'] >= planned.get(p, 0)
-        or e['mutants'] > last.get(p, {}).get('mutants', 0)
-    }
-    files = {**last, **fresh}
-    setup = new.get('setup_secs') if nonnegative(new.get('setup_secs')) else old.get('setup_secs')
-    return {
-        'files': {p: e for p, e in sorted(files.items()) if keep is None or p in keep},
-        'setup_secs': float(setup) if nonnegative(setup) else None,
-    }
-
-
-def price(
-    n: int, prior: float | None, row: dict | None, each: list[float] | None = None
-) -> tuple[float | None, str]:
-    """A unit's worker-seconds for the next run and their source: the one place either tool sets a price.
-
-    N is the mutants the unit (a file, range or module) now runs, PRIOR its
-    tool's prior worker-seconds (None when its probe measured nothing), ROW its
-    {secs, mutants} history at the unit's current blob, or None. A ROW plausible
-    against PRIOR prices N at its cost per mutant ('measured') when it measured
-    at least N mutants. A plausible ROW of fewer, a sample a job's deadline cut,
-    costs what it measured plus PRIOR_ERROR times the prior of the mutants it did
-    not reach ('partial'): the costliest of EACH, the N mutants' own priors, when
-    given, else their share of PRIOR. Anything else costs PRIOR x PRIOR_ERROR,
-    'refused' for an implausible ROW, else 'prior'; with no PRIOR it is
-    (None, 'unknown'), never 0.
-    """
-    refused = False
-    if row is not None:
-        cost = row['secs'] / row['mutants']
-        if n == 0 or plausible(cost, None if prior is None else prior / n):
-            if row['mutants'] >= n:
-                return n * cost, 'measured'
-            if prior is not None:
-                left = n - row['mutants']
-                rest = sum(sorted(each, reverse=True)[:left]) if each else prior * left / n
-                return row['secs'] + rest * PRIOR_ERROR, 'partial'
-        else:
-            refused = True
-    if prior is None:
-        return (None, 'unknown') if n else (0.0, 'prior')
-    return prior * PRIOR_ERROR, 'refused' if refused else 'prior'
-
-
-def measured_part(priced: tuple[float | None, str], row: dict | None) -> float:
-    """The seconds of a price() that a measure set: all of a 'measured' one, a 'partial' one's ROW, else none."""
-    secs, source = priced
-    if source == 'measured':
-        return secs or 0.0
-    return row['secs'] if source == 'partial' and row is not None else 0.0
-
-
-def source_of(sources: Iterable[str]) -> str:
-    """One source for a unit whose parts have SOURCES: 'unknown' or 'refused' when any part is,
-    'prior' or 'measured' when every part is, else 'partial'."""
-    have = set(sources)
-    if found := next((s for s in ('unknown', 'refused') if s in have), None):
-        return found
-    if len(have) == 1 and have <= {'prior', 'measured'}:
-        return have.pop()
-    return 'partial' if have else 'measured'
-
-
-def spread(total: float, weights: list[float]) -> list[float]:
-    """TOTAL shared over WEIGHTS in proportion, evenly when they sum to 0; the parts sum to TOTAL."""
-    whole = sum(weights)
-    return [total * w / whole if whole > 0 else total / len(weights) for w in weights]
-
-
-def project(
-    units: dict[str, tuple[int, float | None]], history: dict | None
-) -> dict[str, tuple[float | None, str]]:
-    """Each file's price for the next run (price); units: {path: (mutants it runs, prior)}."""
-    hist = clean_files(history.get('files') if isinstance(history, dict) else None)
-    return {path: price(n, p, hist.get(path)) for path, (n, p) in units.items()}
+def attempt_mean(attempts: Sequence[dict[str, list[float]]]) -> dict[str, list[float]]:
+    """One file's measures over several attempts at the same work: each mutant's mean over the
+    attempts that measured it, so a cut attempt adds only the mutants it reached."""
+    out = {}
+    for k in sorted({k for a in attempts for k in a}):
+        runs = [a[k] for a in attempts if k in a]
+        out[k] = [
+            round(sum(v[i] for v in runs if i < len(v)) / sum(1 for v in runs if i < len(v)), 3)
+            for i in range(max(len(v) for v in runs))
+        ]
+    return out
 
 
 def prior_error(rows: Iterable[tuple[object, float, float]]) -> float | None:
@@ -710,11 +674,6 @@ def note_prior_error(where: str, measured: float | None) -> None:
             t'{PRIOR_ERROR}x mutation_cost.PRIOR_ERROR plans it at',
             summary=True,
         )
-
-
-def refusals(priced: dict[str, tuple[float, str]]) -> int:
-    """How many of the priced files had their history refused."""
-    return sum(1 for v in priced.values() if v[1] == 'refused')
 
 
 def load_json(path: Path, limit: int | None = MAX_INPUT_BYTES) -> object:

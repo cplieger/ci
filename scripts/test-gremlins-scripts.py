@@ -2399,6 +2399,22 @@ CI_CAP_MINUTES = 350
 FIXTURE_SHA = '8ea1867888623f3fab42af9c0404571c0ae8e851'
 
 
+def dry_file(pkg: str, runnable: int, uncovered: int) -> dict:
+    """A dry run's entry of PKG's x.go: RUNNABLE mutants on lines 1 up, then UNCOVERED ones."""
+    return {
+        'file_name': 'x.go' if pkg == '.' else f'{pkg}/x.go',
+        'mutations': [
+            {'type': 'ARITHMETIC_BASE', 'status': status, 'line': i + 1, 'column': 1}
+            for i, status in enumerate(['RUNNABLE'] * runnable + ['NOT COVERED'] * uncovered)
+        ],
+    }
+
+
+def keys(n: int, start: int = 1) -> list[str]:
+    """dry_file's first N runnable mutant keys from line START, as a cost record holds them."""
+    return [f'{i}:1 ARITHMETIC_BASE' for i in range(start, start + n)]
+
+
 def write_plan_dir(d: Path, module: str, env: dict | None, packages: dict | None) -> None:
     """The files gremlins-run.sh writes under PLAN_DIR, built from a fixture.
 
@@ -2412,23 +2428,19 @@ def write_plan_dir(d: Path, module: str, env: dict | None, packages: dict | None
     lines = {**env, 'sized': env.get('sized', '1')}
     (d / 'plan.env').write_text(''.join(f'{k}={v}\n' for k, v in lines.items() if v is not None))
     if env.get('mode') != 'per-package':
+        if packages is not None:
+            files = [
+                dry_file(pkg, runnable, uncovered)
+                for pkg, (runnable, uncovered, _) in packages.items()
+            ]
+            (d / 'dry-run.json').write_text(json.dumps({'go_module': module, 'files': files}))
         return
     if packages is None:
         (d / 'mutant-ms.tsv').write_text(f'{module}\t900\n')
         return
     files, times = [], []
     for pkg, (runnable, uncovered, mutant_ms) in packages.items():
-        files.append(
-            {
-                'file_name': 'x.go' if pkg == '.' else f'{pkg}/x.go',
-                'mutations': [
-                    {'type': 'ARITHMETIC_BASE', 'status': status, 'line': i + 1, 'column': 1}
-                    for i, status in enumerate(
-                        ['RUNNABLE'] * runnable + ['NOT COVERED'] * uncovered
-                    )
-                ],
-            }
-        )
+        files.append(dry_file(pkg, runnable, uncovered))
         if mutant_ms is not None:
             times.append(f'{module if pkg == "." else f"{module}/{pkg}"}\t{mutant_ms}\n')
     (d / 'dry-run.json').write_text(json.dumps({'go_module': module, 'files': files}))
@@ -2879,6 +2891,102 @@ def test_runner_stamps_each_output_line(tmp: Path) -> None:
     )
 
 
+REPLAY_RUN = HERE / 'testdata' / 'mutation-cost' / 'deadset-go-43328219246.json.gz'
+
+
+def test_shard_replays_a_recorded_run_per_mutant(tmp: Path) -> None:
+    """Run 43328219246 (deadset-go, 5 shards x 3 attempts) replayed per mutant.
+
+    The fixture holds that run's sizing, each file's runnable mutant keys (every
+    one completed in each attempt) and, per attempt and shard, each completion
+    its job log timestamped, with the launch set so the record's setup is the
+    one that shard's cost artifact measured.
+    """
+    import contextlib
+    import gzip
+    import io
+
+    shard = load_script('gremlins_shard', SHARD)
+    fx = json.loads(gzip.open(REPLAY_RUN, 'rt').read())
+    sizing = fx['sizing']
+    files = sizing['modules']['.']['files']
+    art = tmp / 'artifacts'
+    per: dict[str, dict[str, dict[str, list[float]]]] = {}
+    setups = []
+    for key, times in sorted(fx['times'].items()):
+        attempt, n = key[1], key[3]
+        (tmp / f'{key}.times').write_text(times)
+        rec = shard.module_costs(tmp / f'{key}.times')
+        setups.append(rec['setup_secs'])
+        for path, secs in rec['files'].items():
+            per.setdefault(attempt, {}).setdefault(path, {}).update(secs)
+        a = art / f'gremlins-deadset-go-{attempt}-shard{n}'
+        a.mkdir(parents=True)
+        (a / 'meta.json').write_text(
+            json.dumps({'repo': 'deadset-go', 'attempt': attempt, 'shard': n, 'shards': '5'})
+        )
+        (a / 'gremlins-costs.json').write_text(json.dumps({'modules': {'.': rec}}))
+    plan_path = tmp / 'plan.json'
+    plan_path.write_text(json.dumps(sizing))
+    history = shard.history('deadset-go', art, None, plan_path)
+    measured = history['modules']['.']['files']
+    check(
+        'replay: every runnable mutant has one measure, its mean over the three attempts',
+        ok=all(
+            sum(len(v) for v in measured.get(p, {}).get('secs', {}).values()) == f['runnable']
+            for p, f in files.items()
+        )
+        and history['slowdown'] is not None,
+        detail=str([p for p, f in files.items() if p not in measured and f['runnable']][:5]),
+    )
+
+    def replay(plan: dict) -> list[list[float]]:
+        """Each attempt's minutes per shard of PLAN from what the attempt measured of its mutants."""
+        setup = sum(setups) / len(setups)
+        out = []
+        for attempt in sorted(per):
+            jobs = [setup] * plan['shards']
+            for p, f in plan['modules']['.']['files'].items():
+                secs = sum(v for vs in per[attempt].get(p, {}).values() for v in vs)
+                jobs[f['shard'] - 1] += secs / sizing['modules']['.']['workers']
+            out.append([j / 60 for j in jobs])
+        return out
+
+    bound = mutation_cost.BOUND_SECS / 60
+    for label, hist in (('its own history', history), ('no history', None)):
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan, _ = shard.assign(sizing, hist)
+        attempts = replay(plan)
+        slowest = max(max(a) for a in attempts)
+        held: dict[int, list[str]] = {}
+        for p, f in plan['modules']['.']['files'].items():
+            held.setdefault(f['shard'], []).append(f'.:{p}')
+        # A shard projected past the bound runs one estimated file alone under its job's deadline.
+        over = [
+            n
+            for n, m in enumerate(plan['projected_minutes'], start=1)
+            if m is not None and m > bound
+        ]
+        check(
+            f'replay: planned from {label}, every job of every attempt ends by '
+            f'{mutation_cost.SAFE_JOB_MINUTES} min, every shard holds a file and only a lone '
+            'estimate passes the bound',
+            ok=slowest <= mutation_cost.SAFE_JOB_MINUTES
+            and shard.valid_plan(plan) == ''
+            and all(len(held.get(n, [])) == 1 and held[n][0] in plan['deadline'] for n in over)
+            and (hist is None or not over),
+            detail=f'{plan["shards"]} shards, slowest {slowest:.1f} {plan["projected_minutes"]}',
+        )
+        if hist is not None:
+            costs = {f['cost'] for f in plan['modules']['.']['files'].values()}
+            faults = mutation_cost.bar_faults(plan['projected_minutes'], attempts)
+            check(
+                'replay: priced from its own measures, the plan meets the bar on its own attempts',
+                ok=costs == {'measured'} and faults == [],
+                detail=f'{costs} {faults}',
+            )
+
+
 def test_runner_stops_at_the_run_deadline_with_its_costs_on_record(tmp: Path) -> None:
     srcs = [shell_function(fn) for fn in ('stamp_lines', 'unleash_mutants')]
     check('runner deadline: unleash_mutants extracted from gremlins-run.sh', ok=all(srcs))
@@ -2930,7 +3038,8 @@ def test_runner_stops_at_the_run_deadline_with_its_costs_on_record(tmp: Path) ->
     doc = json.loads(costs.read_text()) if rec.returncode == 0 else {}
     check(
         'runner deadline: the stopped pass leaves a cost record of the mutants it finished',
-        ok=doc.get('modules', {}).get('.', {}).get('files', {}).get('a.go', {}).get('mutants') == 2,
+        ok=sorted(doc.get('modules', {}).get('.', {}).get('files', {}).get('a.go', {}))
+        == ['3:4 ARITHMETIC_BASE', '5:6 ARITHMETIC_BASE'],
         detail=f'{doc} {rec.stderr[-200:]}',
     )
     proc, _ = run(str(int(time.time()) - 1), '0')
@@ -2955,6 +3064,11 @@ def test_runner_stops_at_the_run_deadline_with_its_costs_on_record(tmp: Path) ->
     )
 
 
+def at(secs: dict, blob: str = 'a' * 40) -> dict:
+    """A cost history's entry of one file: its measures per mutant key at BLOB."""
+    return {'blob': blob, 'secs': secs}
+
+
 def test_shard_history_carries_each_unmeasured_file_from_the_last_run(tmp: Path) -> None:
     art = tmp / 'artifacts'
     for n, doc in (
@@ -2965,7 +3079,7 @@ def test_shard_history_carries_each_unmeasured_file_from_the_last_run(tmp: Path)
                     '.': {
                         'workers': 4,
                         'setup_secs': 100.0,
-                        'files': {'a.go': {'secs': 8.0, 'mutants': 2}},
+                        'files': {'a.go': {'1:1 X': [8.0]}},
                     }
                 }
             },
@@ -2985,20 +3099,15 @@ def test_shard_history_carries_each_unmeasured_file_from_the_last_run(tmp: Path)
                 'modules': {
                     '.': {
                         'files': {
-                            'a.go': {'secs': 50.0, 'mutants': 2},
-                            'b.go': {'secs': 30.0, 'mutants': 3},
-                            'gone.go': {'secs': 1.0, 'mutants': 1},
-                            'edited.go': {'secs': 1.0, 'mutants': 1},
+                            'a.go': at({'1:1 X': [50.0], '2:1 X': [5.0]}),
+                            'b.go': at({'1:1 X': [30.0]}),
+                            'gone.go': at({'1:1 X': [1.0]}),
+                            'edited.go': at({'1:1 X': [1.0]}),
                         },
                         'setup_secs': 90.0,
-                        'blobs': dict.fromkeys(('a.go', 'b.go', 'gone.go', 'edited.go'), 'a' * 40),
                     },
-                    'tools': {
-                        'files': {'t.go': {'secs': 4.0, 'mutants': 1}},
-                        'setup_secs': 20.0,
-                        'blobs': {'t.go': 'a' * 40},
-                    },
-                    'removed': {'files': {'r.go': {'secs': 4.0, 'mutants': 1}}, 'setup_secs': 20.0},
+                    'tools': {'files': {'t.go': at({'1:1 X': [4.0]})}, 'setup_secs': 20.0},
+                    'removed': {'files': {'r.go': at({'1:1 X': [4.0]})}, 'setup_secs': 20.0},
                 },
             }
         )
@@ -3043,24 +3152,19 @@ def test_shard_history_carries_each_unmeasured_file_from_the_last_run(tmp: Path)
         detail=proc.stderr[-300:],
     )
     check(
-        "shard history: this run's measure wins, an unmeasured file keeps its last at its blob, "
-        'an edited or deleted one goes',
+        "shard history: this run's measure of a mutant wins, an unmeasured mutant keeps its last "
+        'at its blob, an edited or deleted file goes',
         ok=doc.get('modules', {}).get('.')
         == {
-            'files': {'a.go': {'secs': 8.0, 'mutants': 2}, 'b.go': {'secs': 30.0, 'mutants': 3}},
+            'files': {'a.go': at({'1:1 X': [8.0], '2:1 X': [5.0]}), 'b.go': at({'1:1 X': [30.0]})},
             'setup_secs': 100.0,
-            'blobs': {'a.go': 'a' * 40, 'b.go': 'a' * 40},
         },
         detail=str(doc),
     )
     check(
         'shard history: a module this run never measured keeps its history, a removed one goes',
         ok=doc.get('modules', {}).get('tools')
-        == {
-            'files': {'t.go': {'secs': 4.0, 'mutants': 1}},
-            'setup_secs': 20.0,
-            'blobs': {'t.go': 'a' * 40},
-        }
+        == {'files': {'t.go': at({'1:1 X': [4.0]})}, 'setup_secs': 20.0}
         and 'removed' not in doc.get('modules', {}),
         detail=str(doc),
     )
@@ -3081,7 +3185,7 @@ def test_shard_history_carries_each_unmeasured_file_from_the_last_run(tmp: Path)
     check(
         "shard history: with no previous history or plan, no file's version is known, so only "
         'the setup is kept',
-        ok=doc.get('modules', {}).get('.') == {'files': {}, 'setup_secs': 100.0, 'blobs': {}},
+        ok=doc.get('modules', {}).get('.') == {'files': {}, 'setup_secs': 100.0},
         detail=f'{doc} {proc.stderr[-200:]}',
     )
 
@@ -3111,8 +3215,8 @@ def test_shard_costs_read_the_stamped_record(tmp: Path) -> None:
         == {
             'setup_secs': 100.0 + 120,
             'files': {
-                'a.go': {'secs': 20.0, 'mutants': 1},
-                'pkg/b.go': {'secs': 42.0, 'mutants': 2},
+                'a.go': {'3:4 ARITHMETIC_BASE': [20.0]},
+                'pkg/b.go': {'5:6 INVERT_LOGICAL': [40.0], '7:8 INVERT_LOGICAL': [2.0]},
             },
         },
         detail=f'{doc} {proc.stderr[-300:]}',
@@ -5174,22 +5278,14 @@ def test_shard_prices_a_probe_under_its_tick_as_unknown(tmp: Path) -> None:
     fast = {'workers': '4', 'mode': 'integration', 'suite_secs': '0', 'mutants': '3000'}
     fast['setup_secs'] = '60'
     sub_ms = {'internal/a': (40, 0, 0), 'internal/b': (40, 0, 900)}
-    hist_int = {
-        'modules': {
-            '.': {'files': {'a.go': {'secs': 2700.0, 'mutants': 3000}}, 'blobs': {'a.go': 'a' * 40}}
-        }
-    }
+    hist_int = {'modules': {'.': {'files': {'x.go': at({key: [0.9] for key in keys(3000)})}}}}
     hist_pkg = {
-        'modules': {
-            '.': {
-                'files': {'internal/a/x.go': {'secs': 80.0, 'mutants': 40}},
-                'blobs': {'internal/a/x.go': 'a' * 40},
-            }
-        }
+        'modules': {'.': {'files': {'internal/a/x.go': at({key: [2.0] for key in keys(40)})}}}
     }
+    dry = {'.': (3000, 5, None)}
     rows = (
-        ('zero probe, no history', fast, None, None, '.', 'unknown'),
-        ('zero probe, real history', fast, None, hist_int, '.', 'measured'),
+        ('zero probe, no history', fast, dry, None, '.', 'unknown'),
+        ('zero probe, real history', fast, dry, hist_int, '.', 'measured'),
         ('sub-floor probe, no history', SMALL_ENV, sub_ms, None, 'internal/a/x.go', 'unknown'),
         (
             'sub-floor probe, real history',
@@ -5214,7 +5310,13 @@ def test_shard_prices_a_probe_under_its_tick_as_unknown(tmp: Path) -> None:
             ok=prior is None,
             detail=f'prior_secs={prior!r}',
         )
-        entry['blobs'] = {'a.go': 'a' * 40, 'internal/a/x.go': 'a' * 40}
+        entry['blobs'] = {'x.go': 'a' * 40, 'internal/a/x.go': 'a' * 40}
+        if unit == '.':
+            check(
+                f'tick: {label}: an integration module keys its mutants from its dry run',
+                ok=entry.get('keys') == {'x.go': keys(3000)},
+                detail=str(entry.get('keys', {}).keys()),
+            )
         doc = {'repo': 'tick', 'sha': FIXTURE_SHA, 'modules': {'.': entry}}
         with contextlib.redirect_stderr(io.StringIO()):
             plan, warnings = shard.assign(doc, history)
@@ -5269,7 +5371,7 @@ def test_shard_prices_an_integration_module_with_no_mutants_at_nothing(tmp: Path
     shard = load_script('gremlins_shard', SHARD)
     env = {'workers': '4', 'mode': 'integration', 'suite_secs': '60', 'mutants': '0'}
     env['setup_secs'] = '60'
-    history = {'modules': {'.': {'files': {'a.go': {'secs': 100.0, 'mutants': 10}}}}}
+    history = {'modules': {'.': {'files': {'a.go': at({'1:1 X': [100.0]})}}}}
     write_plan_dir(tmp / 'none', 'github.com/cplieger/none', env, None)
     doc = {'repo': 'none', 'sha': FIXTURE_SHA, 'modules': {'.': shard.size_module(tmp / 'none')}}
     with contextlib.redirect_stderr(io.StringIO()):
@@ -5277,8 +5379,8 @@ def test_shard_prices_an_integration_module_with_no_mutants_at_nothing(tmp: Path
     e = plan['modules']['.']
     texts = [mutation_cost.render(w) for w in warnings]
     check(
-        'integration: no mutants with a cost history is priced at 0 from the prior, refusing nothing',
-        ok=e['cost'] == 'prior' and e['work_secs'] == 0.0 and not texts,
+        'integration: no mutants with a cost history is priced at 0, with no mutant to estimate',
+        ok=e['cost'] == 'measured' and e['work_secs'] == 0.0 and not texts,
         detail=f'{e["cost"]} {e["work_secs"]} {texts}',
     )
 
@@ -5305,7 +5407,10 @@ def test_history_measures_the_runner_slowdown_on_identical_work(tmp: Path) -> No
             json.dumps(
                 {
                     'modules': {
-                        '.': {'setup_secs': 10.0, 'files': {'a.go': {'secs': secs, 'mutants': 10}}}
+                        '.': {
+                            'setup_secs': 10.0,
+                            'files': {'a.go': {f'{n}:1 X': [secs / 10] for n in range(10)}},
+                        }
                     }
                 }
             )
@@ -5334,15 +5439,15 @@ def test_shard_history_measures_prior_priced_work_per_shard(tmp: Path) -> None:
         'a/x.go': {'shard': 1, 'cost': 'prior', 'prior_secs': 100.0, 'runnable': 1},
         'a/y.go': {'shard': 1, 'cost': 'prior', 'prior_secs': 10.0, 'runnable': 1},
         'b/x.go': {'shard': 2, 'cost': 'measured', 'prior_secs': 1.0, 'runnable': 1},
-        'c/x.go': {'shard': 2, 'cost': 'refused', 'prior_secs': 50.0, 'runnable': 1},
+        'c/x.go': {'shard': 2, 'cost': 'partial', 'prior_secs': 50.0, 'runnable': 1},
         'd/x.go': {'shard': 4, 'cost': 'prior', 'prior_secs': 1.0, 'runnable': 10},
     }
     measured = {
-        'a/x.go': {'secs': 200.0, 'mutants': 1},
-        'a/y.go': {'secs': 90.0, 'mutants': 1},
-        'b/x.go': {'secs': 900.0, 'mutants': 1},
-        'c/x.go': {'secs': 25.0, 'mutants': 1},
-        'd/x.go': {'secs': 90.0, 'mutants': 3},
+        'a/x.go': {'1:1 X': [200.0]},
+        'a/y.go': {'1:1 X': [90.0]},
+        'b/x.go': {'1:1 X': [900.0]},
+        'c/x.go': {'1:1 X': [25.0]},
+        'd/x.go': {'1:1 X': [30.0], '2:1 X': [30.0], '3:1 X': [30.0]},
     }
     rows = shard.prior_rows({'mode': 'per-package', 'files': files}, measured)
     integ = {
@@ -5352,12 +5457,14 @@ def test_shard_history_measures_prior_priced_work_per_shard(tmp: Path) -> None:
         'prior_secs': 40.0,
         'mutants': 9,
     }
-    rows += shard.prior_rows(integ, {'.': {'secs': 100.0, 'mutants': 9}})
-    rows += shard.prior_rows({**integ, 'shards': [5]}, {'.': {'secs': 900.0, 'mutants': 4}})
+    nine = {'x.go': {f'{n}:1 X': [100.0 / 9] for n in range(9)}}
+    rows += shard.prior_rows(integ, nine)
+    rows += shard.prior_rows({**integ, 'shards': [5]}, {'x.go': {'1:1 X': [900.0]}})
+    rows = [(n, round(m, 6), p) for n, m, p in rows]
     check(
         "prior error: the record job takes each shard's prior-priced work against its prior, "
-        'never a measured file or a deadline-cut sample',
-        ok=sorted(rows) == [(1, 90.0, 10.0), (1, 200.0, 100.0), (2, 25.0, 50.0), (3, 100.0, 40.0)]
+        'never a file a measure priced in part or whole, nor a deadline-cut sample',
+        ok=sorted(rows) == [(1, 90.0, 10.0), (1, 200.0, 100.0), (3, 100.0, 40.0)]
         and mutation_cost.prior_error(rows) == 2.64,
         detail=str(rows),
     )
@@ -5381,6 +5488,8 @@ def test_shard_prices_only_history_at_the_current_blob(tmp: Path) -> None:
         'setup_secs': 60.0,
         'mutants': 100,
         'prior_secs': 400.0,
+        'mutant_prior': 4.0,
+        'keys': {'a.go': keys(60), 'b.go': keys(40)},
         'packages': {},
         'files': {},
     }
@@ -5389,15 +5498,15 @@ def test_shard_prices_only_history_at_the_current_blob(tmp: Path) -> None:
         'modules': {
             '.': {
                 'files': {
-                    'a.go': {'secs': 50.0, 'mutants': 60},
-                    'b.go': {'secs': 30.0, 'mutants': 40},
+                    'a.go': at({key: [50.0 / 60] for key in keys(60)}, a),
+                    'b.go': at({key: [30.0 / 40] for key in keys(40)}, a),
                 },
-                'blobs': {'a.go': a, 'b.go': a},
             }
         },
     }
     for label, blobs, want in (
         ('every file at its measured blob', {'a.go': a, 'b.go': a}, (80.0, 'measured')),
+        ('every file at its measured blob, keys lost', {'a.go': a, 'b.go': a, 'k': None}, None),
         (
             'one file edited since',
             {'a.go': a, 'b.go': b},
@@ -5405,7 +5514,12 @@ def test_shard_prices_only_history_at_the_current_blob(tmp: Path) -> None:
         ),
         ('no blob known', {}, (400.0 * mutation_cost.PRIOR_ERROR, 'prior')),
     ):
-        doc = {'repo': 'r', 'sha': FIXTURE_SHA, 'modules': {'.': {**integ, 'blobs': blobs}}}
+        module = {**integ, 'blobs': blobs}
+        if want is None:
+            # With no keys to pair measures by, the module is one unmeasured unit of its prior.
+            del module['blobs']['k'], module['keys']
+            want = (400.0 * mutation_cost.PRIOR_ERROR, 'prior')
+        doc = {'repo': 'r', 'sha': FIXTURE_SHA, 'modules': {'.': module}}
         with contextlib.redirect_stderr(io.StringIO()):
             plan, _ = shard.assign(doc, history)
         e = plan['modules']['.']
@@ -5418,6 +5532,10 @@ def test_shard_prices_only_history_at_the_current_blob(tmp: Path) -> None:
     check(
         'blob: a module whose blobs are not all git object ids is refused',
         ok='blobs' in shard.valid_module('.', {**integ, 'blobs': {'a.go': 'nope'}}, planned=None),
+    )
+    check(
+        'blob: a module whose keys do not number its mutants is refused',
+        ok='keys' in shard.valid_module('.', {**integ, 'keys': {'a.go': keys(3)}}, planned=None),
     )
 
 
@@ -5520,19 +5638,13 @@ def test_shard_history_ignores_a_refused_previous_history_whole(tmp: Path) -> No
     (tmp / 'artifacts').mkdir()
     good = {
         'repo': 'r',
-        'modules': {
-            '.': {
-                'files': {'a.go': {'secs': 1, 'mutants': 1}},
-                'setup_secs': 1,
-                'blobs': {'a.go': 'a' * 40},
-            }
-        },
+        'modules': {'.': {'files': {'a.go': at({'1:1 X': [1]})}, 'setup_secs': 1}},
     }
     bad = json.loads(json.dumps(good))
-    bad['modules']['.']['files']['b.go'] = {'secs': 1, 'mutants': 1, 'x': 1}
+    bad['modules']['.']['files']['b.go'] = {'secs': 1, 'mutants': 1}
     other = {**good, 'repo': 'q'}
     for label, doc, want_none in (
-        ('a history with one malformed row', bad, True),
+        ('a history with one file entry of another shape', bad, True),
         ("another repo's history", other, True),
         ('a whole history', good, False),
     ):
@@ -5555,28 +5667,28 @@ def test_shard_history_ignores_a_refused_previous_history_whole(tmp: Path) -> No
 
 
 def test_shard_history_keeps_a_fuller_measure_over_a_short_sample(tmp: Path) -> None:
-    art = tmp / 'artifacts' / 'gremlins-r-1-shard1'
-    art.mkdir(parents=True)
-    (art / 'meta.json').write_text(
-        json.dumps({'repo': 'r', 'attempt': '1', 'shard': '1', 'shards': '2'})
-    )
-    (art / 'gremlins-costs.json').write_text(
-        json.dumps(
-            {
-                'modules': {
-                    '.': {
-                        'setup_secs': 100.0,
-                        'files': {
-                            'a.go': {'secs': 4.0, 'mutants': 2},
-                            'b.go': {'secs': 30.0, 'mutants': 6},
-                            'c.go': {'secs': 3.0, 'mutants': 9},
-                        },
-                    },
-                    'tools': {'setup_secs': 50.0, 'files': {'t.go': {'secs': 9.0, 'mutants': 3}}},
-                }
-            }
+    for attempt, files in (
+        ('1', {'a.go': {'1:1 X': [10.0], '2:1 X': [20.0], '3:1 X': [30.0]}}),
+        ('2', {'a.go': {'1:1 X': [30.0], '2:1 X': [40.0], '3:1 X': [50.0]}}),
+        # A deadline cut attempt 3 after one mutant.
+        ('3', {'a.go': {'1:1 X': [5.0]}}),
+    ):
+        art = tmp / 'artifacts' / f'gremlins-r-{attempt}-shard1'
+        art.mkdir(parents=True)
+        (art / 'meta.json').write_text(
+            json.dumps({'repo': 'r', 'attempt': attempt, 'shard': '1', 'shards': '2'})
         )
-    )
+        tools = {'t.go': {'1:1 X': [9.0]}} if attempt == '1' else {}
+        (art / 'gremlins-costs.json').write_text(
+            json.dumps(
+                {
+                    'modules': {
+                        '.': {'setup_secs': 100.0, 'files': files},
+                        'tools': {'setup_secs': 50.0, 'files': tools},
+                    }
+                }
+            )
+        )
     plan = tmp / 'plan.json'
     plan.write_text(
         json.dumps(
@@ -5585,16 +5697,12 @@ def test_shard_history_keeps_a_fuller_measure_over_a_short_sample(tmp: Path) -> 
                 'modules': {
                     '.': {
                         'mode': 'per-package',
-                        'files': {
-                            'a.go': {'runnable': 10},
-                            'b.go': {'runnable': 6},
-                            'c.go': {'runnable': 10},
-                        },
-                        'blobs': dict.fromkeys(('a.go', 'b.go', 'c.go'), 'a' * 40),
+                        'files': {'a.go': {'runnable': 3}, 'b.go': {'runnable': 2}},
+                        'blobs': dict.fromkeys(('a.go', 'b.go'), 'a' * 40),
                     },
                     'tools': {
                         'mode': 'integration',
-                        'mutants': 10,
+                        'mutants': 2,
                         'files': {},
                         'blobs': {'t.go': 'a' * 40},
                     },
@@ -5608,15 +5716,10 @@ def test_shard_history_keeps_a_fuller_measure_over_a_short_sample(tmp: Path) -> 
             {
                 'repo': 'r',
                 'modules': {
-                    '.': {
-                        'setup_secs': 90.0,
-                        'files': {'a.go': {'secs': 50.0, 'mutants': 10}},
-                        'blobs': {'a.go': 'a' * 40},
-                    },
+                    '.': {'setup_secs': 90.0, 'files': {'b.go': at({'1:1 X': [7.0]})}},
                     'tools': {
                         'setup_secs': 40.0,
-                        'files': {'t.go': {'secs': 60.0, 'mutants': 10}},
-                        'blobs': {'t.go': 'a' * 40},
+                        'files': {'t.go': at({'1:1 X': [60.0], '2:1 X': [70.0]})},
                     },
                 },
             }
@@ -5625,25 +5728,48 @@ def test_shard_history_keeps_a_fuller_measure_over_a_short_sample(tmp: Path) -> 
     shard = load_script('gremlins_shard', SHARD)
     got = shard.history('r', tmp / 'artifacts', previous, plan)
     check(
-        "history: a file's sample short of its planned mutants keeps a fuller last measure, else "
-        'records what it measured; a whole one replaces it',
+        'history: each mutant is its mean over the attempts that measured it, so a cut attempt '
+        'beside two whole ones adds only what it reached, and an unreached file keeps its last',
         ok=got['modules']['.']['files']
         == {
-            'a.go': {'secs': 50.0, 'mutants': 10},
-            'b.go': {'secs': 30.0, 'mutants': 6},
-            'c.go': {'secs': 3.0, 'mutants': 9},
+            'a.go': at({'1:1 X': [15.0], '2:1 X': [30.0], '3:1 X': [40.0]}),
+            'b.go': at({'1:1 X': [7.0]}),
         },
         detail=str(got),
     )
     check(
-        "history: an integration module's short sample keeps a fuller last measure whole, and the new setup",
+        "history: an integration module's cut sample replaces only the mutants it measured, "
+        'and the new setup',
         ok=got['modules']['tools']
-        == {
-            'files': {'t.go': {'secs': 60.0, 'mutants': 10}},
-            'setup_secs': 50.0,
-            'blobs': {'t.go': 'a' * 40},
-        },
+        == {'files': {'t.go': at({'1:1 X': [9.0], '2:1 X': [70.0]})}, 'setup_secs': 50.0},
         detail=str(got['modules'].get('tools')),
+    )
+    # Two whole attempts and a cut one price the file at its measured mutants, whole.
+    module = {
+        'mode': 'per-package',
+        'workers': 1,
+        'setup_secs': 10.0,
+        'packages': {},
+        'files': {
+            'a.go': {
+                'runnable': 3,
+                'prior_secs': 3.0,
+                'mutant_prior': 1.0,
+                'keys': ['1:1 X', '2:1 X', '3:1 X'],
+            }
+        },
+        'blobs': {'a.go': 'a' * 40},
+    }
+    import contextlib
+    import io
+
+    with contextlib.redirect_stderr(io.StringIO()):
+        priced, _ = shard.assign({'repo': 'r', 'sha': FIXTURE_SHA, 'modules': {'.': module}}, got)
+    f = priced['modules']['.']['files']['a.go']
+    check(
+        'history: a file two whole attempts measured is priced measured beside a cut attempt',
+        ok=(f['cost'], f['work_secs']) == ('measured', 85.0),
+        detail=str(f),
     )
 
 
@@ -6006,6 +6132,7 @@ def main() -> int:
         test_enabled_mutators_follows_gremlins,
         test_shard_projects_deadset_go_past_one_job,
         test_shard_plans_a_recorded_run_from_its_costs,
+        test_shard_replays_a_recorded_run_per_mutant,
         test_runner_stamps_each_output_line,
         test_runner_stops_at_the_run_deadline_with_its_costs_on_record,
         test_shard_history_carries_each_unmeasured_file_from_the_last_run,

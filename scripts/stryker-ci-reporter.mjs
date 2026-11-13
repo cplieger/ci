@@ -4,8 +4,8 @@
 // mutants, their netTime, each mutant's [first, last line, netTime | null] and its id [start line,
 // column, end line, column, mutator, early status | null, reason | null], then exit 0.
 // CI_STRYKER_TIMES=<file>, CI_STRYKER_RESULT=<file>: after "#workers", "#launch" and "#start" rows,
-// append "<epoch ms>\t<unit>" as each planned mutant finishes (its file, or the "file:first-last"
-// range holding it); then write the report as the json reporter would and append "#done".
+// append "<epoch ms>\t<file>\t<start line>:<column>-<end line>:<column> <mutator>" (its plan pass
+// id) as each planned mutant finishes; then write the report as the json reporter would, and "#done".
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,18 +40,6 @@ class CiReporter {
     const mutated = Object.entries(fileDescriptions).filter(([, d]) => d.mutate);
     this.mutated = mutated.map(([f]) => relative(f));
     this.ranged = mutated.some(([, d]) => Array.isArray(d.mutate));
-    // Stryker's ranges hold 0-based lines; --mutate and the plan write them 1-based. A range with
-    // columns is a directive comment's opener (stryker-shard.py mutate_list), which holds no unit.
-    this.ranges = Object.fromEntries(
-      mutated
-        .filter(([, d]) => Array.isArray(d.mutate))
-        .map(([f, d]) => [
-          relative(f),
-          d.mutate
-            .filter((r) => r.start.column === 0 && r.end.column === Number.MAX_SAFE_INTEGER)
-            .map((r) => [r.start.line + 1, r.end.line + 1]),
-        ]),
-    );
     this.plan = process.env.CI_STRYKER_PLAN || '';
     this.times = process.env.CI_STRYKER_TIMES || '';
     this.result = process.env.CI_STRYKER_RESULT || '';
@@ -86,18 +74,12 @@ class CiReporter {
     }
   }
 
-  // result.location is already a 1-based schema location (core's toSchemaLocation).
-  unit(result) {
-    const file = relative(result.fileName);
-    const first = result.location.start.line;
-    const last = result.location.end.line;
-    const range = (this.ranges[file] ?? []).find(([a, b]) => a <= first && last <= b);
-    return range ? `${file}:${range[0]}-${range[1]}` : file;
-  }
-
+  // result.location is already a 1-based schema location (core's toSchemaLocation), as the plan's ids are.
   onMutantTested(result) {
     if (this.times && this.run.has(result.id)) {
-      fs.appendFileSync(this.times, `${Date.now()}\t${this.unit(result)}\n`);
+      const { start, end } = result.location;
+      const key = `${start.line}:${start.column}-${end.line}:${end.column} ${result.mutatorName}`;
+      fs.appendFileSync(this.times, `${Date.now()}\t${relative(result.fileName)}\t${key}\n`);
     }
   }
 

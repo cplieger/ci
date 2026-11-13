@@ -6,7 +6,7 @@ plan    (plan job): the entry's sizing from scripts/stryker-ci-reporter.mjs's pl
 matrix  (shard job): each of the repository's run plans, files packed by measured cost
         (scripts/mutation_cost.py) from its cost history, and the run and merge matrices.
 mutate  (run job): one shard's --mutate list.
-costs   (run job): one shard's measured cost per file.
+costs   (run job): one shard's measured cost per mutant.
 merge   (merge job): the shards' results as one run's report, its score, and the next cost history.
 """
 
@@ -52,6 +52,8 @@ SAFE_PATH = re.compile(r'[A-Za-z0-9._/-]+')
 # babel-transformer.ts shouldMutate), so ranges cut where no mutant spans the cut.
 RANGE = re.compile(r'(?P<file>[A-Za-z0-9._/-]+):(?P<first>[1-9][0-9]*)-(?P<last>[1-9][0-9]*)')
 SHA = re.compile(r'[0-9a-f]{40}')
+# A mutant in a cost record: its 1-based start and end line and column, then its mutator.
+KEY = re.compile(r'(?P<first>[1-9][0-9]*):[0-9]+-(?P<last>[1-9][0-9]*):[0-9]+ \S+')
 BLOB = mutation_cost.GIT_BLOB
 # A comment Stryker reads as a directive (stryker-js 10.1.1 instrumenter
 # directive-bookkeeper.js strykerCommentDirectiveRegex, matched on the comment's
@@ -312,9 +314,10 @@ def sizing(
             doc['files'][path]['spans'] = spans
             ids = f.get('ids')
             marked = (marks or {}).get(path)
-            if valid_ids(ids, spans) and isinstance(marked, list) and len(marked) <= MAX_DIRECTIVES:
+            if valid_ids(ids, spans):
                 doc['files'][path]['ids'] = ids
-                doc['files'][path]['directives'] = marked
+                if isinstance(marked, list) and len(marked) <= MAX_DIRECTIVES:
+                    doc['files'][path]['directives'] = marked
         if isinstance(blob := (versions or {}).get(path), str) and BLOB.fullmatch(blob):
             doc['files'][path]['blob'] = blob
         if not SAFE_PATH.fullmatch(path):
@@ -352,12 +355,10 @@ def valid_sizing(doc: object, entry: dict) -> str:
             return f'file {path!r:.200} has blob {f["blob"]!r:.200}'
         if 'spans' in f and not valid_spans(f['spans'], f['run'], f['early']):
             return f'file {path!r:.200} has spans that are not its run and early mutants'
-        if ('ids' in f or 'directives' in f) and not (
-            'spans' in f
-            and valid_ids(f.get('ids'), f['spans'])
-            and valid_directives(f.get('directives'))
-        ):
-            return f'file {path!r:.200} has ids or directives that are not its mutants and comments'
+        if 'ids' in f and not ('spans' in f and valid_ids(f['ids'], f['spans'])):
+            return f'file {path!r:.200} has ids that are not its mutants'
+        if 'directives' in f and not ('ids' in f and valid_directives(f['directives'])):
+            return f'file {path!r:.200} has directives that are not its comments'
     if doc.get('shardable') is True and (
         bad := next((p for p in files if not SAFE_PATH.fullmatch(p)), None)
     ):
@@ -402,14 +403,18 @@ def valid_directives(marks: object) -> bool:
 def read_history(path: Path) -> dict | None:
     """The entry's last cost history from the shard job's own fetch, or None when it has none.
 
-    Raises what mutation_cost.load_json raises, and ValueError for a value that is not a cost record.
+    Raises what mutation_cost.load_json raises, and ValueError for a value that is not a cost history.
     """
     if not path.is_file():
         return None
     doc = mutation_cost.load_json(path)
     if why := mutation_cost.record_fault(doc):
         raise ValueError(why)
-    return {**mutation_cost.carry_forward({}, doc), 'blobs': dict(doc.get('blobs') or {})}
+    return {
+        'files': mutation_cost.clean_files(doc.get('files')),
+        'setup_secs': doc.get('setup_secs'),
+        'prior_error': doc.get('prior_error'),
+    }
 
 
 def file_of(unit: str) -> str:
@@ -424,78 +429,66 @@ def lines_of(unit: str) -> tuple[float, float]:
     return (int(m['first']), int(m['last'])) if m else (1, float('inf'))
 
 
-def overlaps(u: str, v: str) -> bool:
-    """Whether units U and V share a line of one file."""
-    (a, b), (c, d) = lines_of(u), lines_of(v)
-    return file_of(u) == file_of(v) and a <= d and c <= b
+def mutant_key(row: list) -> str:
+    """A plan pass id's key in a cost record, as scripts/stryker-ci-reporter.mjs writes it."""
+    return f'{row[0]}:{row[1]}-{row[2]}:{row[3]} {row[4]}'
 
 
-def span_prices(path: str, f: dict, history: dict | None) -> list[tuple[float, str, float]]:
-    """Each of F's spans' worker-seconds, source and the part of them a measure set, from
-    mutation_cost.price.
+def key_lines(key: str) -> tuple[int, int] | None:
+    """The first and last line of a cost record's mutant key, or None for a key of no mutant."""
+    m = KEY.fullmatch(key)
+    return (int(m['first']), int(m['last'])) if m else None
 
-    HISTORY holds only rows at F's current blob. The run spans one of PATH's rows
-    holds (a range, or the whole file) share that row's price by prior; a span in
-    no row is priced alone; an early span costs nothing.
-    """
-    spans = f['spans']
-    rows = [
-        (*lines_of(u), e)
-        for u, e in mutation_cost.clean_files((history or {}).get('files')).items()
-        if file_of(u) == path
-    ]
-    inside = [
-        next((i for i, (a, b, _) in enumerate(rows) if a <= first and last <= b), None)
-        for first, last, _ in spans
-    ]
-    out = [(0.0, 'prior', 0.0)] * len(spans)
-    for n, (_, _, e) in enumerate(rows):
-        held = [j for j, i in enumerate(inside) if i == n and spans[j][2] is not None]
-        each = [spans[j][2] for j in held]
-        priced = mutation_cost.price(len(held), sum(each), e, each)
-        known = mutation_cost.spread(mutation_cost.measured_part(priced, e), each)
-        for j, part, k in zip(held, mutation_cost.spread(priced[0], each), known, strict=True):
-            out[j] = (part, priced[1], k)
-    for j, i in enumerate(inside):
-        if i is None and spans[j][2] is not None:
-            out[j] = (*mutation_cost.price(1, spans[j][2], None), 0.0)
+
+def inside(unit: str, key: str) -> bool:
+    """Whether the mutant KEY names lies in UNIT's lines; any key lies in a whole file."""
+    if not RANGE.fullmatch(unit):
+        return True
+    lines, (first, last) = key_lines(key), lines_of(unit)
+    return lines is not None and first <= lines[0] and lines[1] <= last
+
+
+def unit_measures(unit: str, measured: dict[str, dict[str, list[float]]]) -> dict[str, list[float]]:
+    """The measures of MEASURED ({file: {key: [seconds]}}) that UNIT holds."""
+    return {k: v for k, v in measured.get(file_of(unit), {}).items() if inside(unit, k)}
+
+
+def span_pairs(f: dict, measured: dict[str, list[float]]) -> list[tuple[str | None, tuple] | None]:
+    """Each of F's spans as (its mutant key, its (prior, measure) for mutation_cost.price), None
+    for an early span; with no ids a run span has no key and no measure (mutation_cost.pair)."""
+    run = [j for j, s in enumerate(f['spans']) if s[2] is not None]
+    priors = [f['spans'][j][2] for j in run]
+    keys = [mutant_key(f['ids'][j]) for j in run] if 'ids' in f else None
+    paired = mutation_cost.pair(keys, priors, measured) if keys else [(p, None) for p in priors]
+    out: list = [None] * len(f['spans'])
+    for i, (j, pr) in enumerate(zip(run, paired, strict=True)):
+        out[j] = (keys[i] if keys else None, pr)
     return out
 
 
-def file_price(path: str, f: dict, history: dict | None) -> tuple[float, str]:
-    """PATH's price and source: its spans' sum where it has spans, its least measured span's source."""
-    if not f.get('spans'):
-        rows = mutation_cost.clean_files((history or {}).get('files'))
-        return mutation_cost.price(f['run'], f['prior_secs'], rows.get(path))
-    each = span_prices(path, f, history)
-    sources = [
-        src for (_, _, p), (_, src, _) in zip(f['spans'], each, strict=True) if p is not None
-    ]
-    return sum(c for c, _, _ in each), mutation_cost.source_of(sources)
-
-
-def unit_parts(
-    unit: str, f: dict, each: list[tuple[float, str, float]] | None, whole: tuple
-) -> tuple[str, float, float | None]:
-    """UNIT's source, the worker-seconds of it a measure priced, and its prior seconds when no
-    measure priced any of it (for prior_error), else None.
-
-    EACH is F's span_prices; a file with no spans is priced WHOLE, its (price, history row).
-    """
-    if each is None:
-        priced, row = whole
-        prior = f['prior_secs'] if priced[1] in ('prior', 'refused') else None
-        return priced[1], mutation_cost.measured_part(priced, row), prior
+def priced_unit(
+    unit: str, f: dict, paired: list | None
+) -> tuple[mutation_cost.Priced, str | None, float]:
+    """UNIT's price over the run spans of F it holds (PAIRED, F's span_pairs; None for a file with
+    no spans, priced from its prior), its costliest measured mutant's key, and its prior seconds."""
+    if paired is None:
+        return (
+            mutation_cost.price([(f['prior_secs'], None)] if f['run'] else []),
+            None,
+            f['prior_secs'],
+        )
     first, last = lines_of(unit)
     held = [
-        (s[2], e)
-        for s, e in zip(f['spans'], each, strict=True)
-        if first <= s[0] and s[1] <= last and s[2] is not None
+        kp
+        for s, kp in zip(f['spans'], paired, strict=True)
+        if kp is not None and first <= s[0] and s[1] <= last
     ]
-    source = mutation_cost.source_of(src for _, (_, src, _) in held)
-    priced_alone = all(src in ('prior', 'refused') for _, (_, src, _) in held)
-    prior = sum(p for p, _ in held) if priced_alone else None
-    return source, sum(k for _, (_, _, k) in held), prior
+    priced = mutation_cost.price([pr for _, pr in held])
+    worst = None if priced.worst is None else held[priced.worst][0]
+    prior = sum(
+        sp[2] for sp in f['spans'] if sp[2] is not None and first <= sp[0] and sp[1] <= last
+    )
+    return priced, worst, prior
 
 
 def atoms(spans: list[list], costs: list[float]) -> list[list]:
@@ -552,25 +545,16 @@ def even(groups: list[list], room: float) -> list[list]:
     return [list(g) for g in groups]
 
 
-def split(
-    path: str, f: dict, work: float, room: float, history: dict | None
-) -> tuple[list[tuple], float]:
-    """PATH as (unit, run, early, work) pieces cut by span_prices over HISTORY (rows at its current
-    blob), and its largest atom's seconds.
+def split(path: str, f: dict, room: float, costs: list[float]) -> list[tuple]:
+    """PATH as (unit, run, early, work) line ranges, COSTS being each of its spans' work.
 
     Every piece holds at most ROOM seconds of work but an atom past it, which
     stands alone, so no atom sets another piece's size; the atoms between such
-    atoms are cut into the fewest even pieces that fit. A file that fits ROOM,
-    or has no spans to cut or no ids to check its ranges' results against, is
-    one whole-file piece.
+    atoms are cut into the fewest even pieces that fit.
     """
-    if work <= room or room <= 0 or not f.get('spans') or 'ids' not in f:
-        return [(path, f['run'], f['early'], work)], 0.0
-    costs = mutation_cost.spread(work, [c for c, _, _ in span_prices(path, f, history)])
-    groups = atoms(f['spans'], costs)
     pieces: list[list] = []
     run: list[list] = []
-    for g in [*groups, None]:
+    for g in [*atoms(f['spans'], costs), None]:
         if g is not None and g[4] <= room:
             run.append(g)
             continue
@@ -578,16 +562,15 @@ def split(
         run = []
         if g is not None:
             pieces.append(g)
-    ranges = [(f'{path}:{a}-{b}', run_, early, c) for a, b, run_, early, c in pieces]
-    return ranges, max(g[4] for g in groups)
+    return [(f'{path}:{a}-{b}', run_, early, c) for a, b, run_, early, c in pieces]
 
 
 def assign(
     doc: dict, history: dict | None, limit: int = mutation_cost.MAX_SHARDS
 ) -> tuple[dict, list[Template]]:
-    """The entry's run plan, its files priced from HISTORY, any file past one shard split into
-    line ranges, packed by mutation_cost.fit into at most LIMIT shards or more where the bound
-    needs them, and its warnings.
+    """The entry's run plan, its units priced per mutant from HISTORY (mutation_cost.price), any
+    file past one shard split into line ranges, packed by mutation_cost.fit into at most LIMIT
+    shards or more where the bound needs them, and its warnings.
 
     Raises mutation_cost.UnsafePlanError, naming the entry and the unit or the count,
     when no plan keeps every job within mutation_cost.BOUND_SECS.
@@ -596,44 +579,39 @@ def assign(
     where = f'{doc["repo"]}:{doc["dir"]}'
     setup = mutation_cost.setup_price((history or {}).get('setup_secs'), doc['setup_secs'])
     top = mutation_cost.TOP_SECS
-    current = mutation_cost.at_blobs(
-        history, {p: f['blob'] for p, f in doc['files'].items() if f.get('blob')}, file_of
+    measured = mutation_cost.at_blobs(
+        (history or {}).get('files'),
+        {p: f['blob'] for p, f in doc['files'].items() if f.get('blob')},
     )
-    rows = mutation_cost.clean_files((current or {}).get('files'))
-    priced = {p: file_price(p, f, current) for p, f in doc['files'].items()}
     warnings: list[Template] = []
-    if refused := mutation_cost.refusals(priced):
-        warnings.append(
-            t'{where}: {refused} measured price(s) more than {mutation_cost.PRICE_FACTOR}x from '
-            t"the plan pass's were refused, so those files are priced from it"
-        )
     shardable = doc.get('shardable') is True and bool(doc['files'])
     units: dict[str, tuple[str, int, int]] = {}
     sources: dict[str, str] = {}
     priors: dict[str, float] = {}
     items = []
     for path, f in doc['files'].items():
-        work = priced[path][0] / workers
-        each = span_prices(path, f, current) if f.get('spans') else None
-        pieces, _ = (
-            split(path, f, work, top - setup, current)
-            if shardable
-            else ([(path, f['run'], f['early'], work)], 0.0)
-        )
-        if shardable and work > top - setup and f.get('spans') and 'ids' not in f:
+        paired = span_pairs(f, measured.get(path, {})) if f.get('spans') else None
+        whole = priced_unit(path, f, paired)
+        work = whole[0].secs / workers
+        pieces = [(path, f['run'], f['early'], work)]
+        if shardable and work > top - setup > 0 and paired is not None and 'directives' in f:
+            costs = [
+                mutation_cost.price([] if kp is None else [kp[1]]).secs / workers for kp in paired
+            ]
+            pieces = split(path, f, top - setup, costs)
+        elif shardable and work > top - setup and paired is not None and 'directives' not in f:
             warnings.append(
                 t"{where}: {path:.200} projects {work / 60:.0f} min, past a shard's "
                 t'{(top - setup) / 60:.0f} min of work, but its plan pass gave no mutant ids or '
                 t'more than {MAX_DIRECTIVES} Stryker directives, so it runs whole'
             )
         for unit, run, early, w in pieces:
-            source, known, prior = unit_parts(unit, f, each, (priced[path], rows.get(path)))
+            priced, worst, prior = whole if unit == path else priced_unit(unit, f, paired)
             units[unit] = (path, run, early)
-            sources[unit] = source
-            items.append(
-                mutation_cost.Item('.', unit, w, None if source == 'measured' else known / workers)
-            )
-            if prior is not None:
+            sources[unit] = priced.source
+            known = None if priced.source == 'measured' else priced.measured / workers
+            items.append(mutation_cost.Item('.', unit, w, known, worst and f'{path} {worst}'))
+            if priced.source == 'prior':
                 priors[unit] = prior
     one_job = setup + sum(it.work for it in items)
     most = mutation_cost.MATRIX_LIMIT if shardable else 1
@@ -666,10 +644,10 @@ def assign(
         one_job_minutes=round(one_job / 60, 1),
         projected_minutes=[round(b.load / 60, 1) for b in bins],
         top_minutes=round(top / 60, 1),
-        deadline=sorted(it.unit for i in alone for it in bins[i].items),
+        deadline=sorted(it.unit for i in alone for it in bins[i].items if it.known is not None),
         history=history,
     )
-    if shardable and mutation_cost.capped(k, bins, items, {'.': setup}, top, limit):
+    if shardable and mutation_cost.capped(k, bins, items, top, limit):
         plan['capped'] = mutation_cost.cap_reason(limit)
         return plan, [*warnings, mutation_cost.cap_note(where, plan)]
     if max(plan['projected_minutes']) > plan['top_minutes']:
@@ -817,19 +795,20 @@ def mutate_list(plan: dict, shard: int) -> str:
 
 
 def costs(times: Path) -> dict:
-    """One shard's measured cost per file from the reporter's CI_STRYKER_TIMES record."""
+    """One shard's measured cost per mutant from the reporter's CI_STRYKER_TIMES record."""
     header: dict[str, float] = {}
     events = []
     for row in times.read_text(errors='replace').splitlines():
         stamp, _, value = row.partition('\t')
+        path, _, key = value.partition('\t')
         try:
             number = float(value if stamp.startswith('#') else stamp)
         except ValueError:
             continue
         if stamp.startswith('#'):
             header.setdefault(stamp, number)
-        elif value:
-            events.append((number / 1000, value))
+        elif path and key:
+            events.append((number / 1000, path, key))
     workers = int(header.get('#workers', 0))
     if workers < 1 or '#launch' not in header or '#start' not in header:
         raise ValueError(f'{times} has no worker count, launch or start row')
@@ -1035,59 +1014,32 @@ def resolved_break(report: dict, planned: object) -> object:
 
 def write_history(
     out: Path,
-    setups: list[dict],
+    setups: list[object],
     plan: dict,
-    measured: dict,
+    measured: dict[str, dict[str, list[float]]],
     keep: set[str] | None,
     prior_error: float | None = None,
 ) -> None:
-    """OUT/costs.json: this run's measure of each unit, else its last one, for the files of KEEP when given.
+    """OUT/costs.json: each mutant's measure from this run, else its last one at the same blob,
+    for the files of the units in KEEP when given (mutation_cost.merged).
 
-    Every row of one file comes from the version its blob names: an old row of
-    a file this run measured stays only when the file is unchanged and the row
-    overlaps no unit measured now. A new sample of fewer than a unit's planned
-    mutants, a deadline's cut, prices what it measured (mutation_cost.price), so
-    it is kept unless the old rows at its blob that overlap it measured as many.
+    A file with no blob in PLAN, or whose blob changed, keeps only this run's measures.
     """
     out.mkdir(parents=True, exist_ok=True)
-    planned = plan.get('mutants') if isinstance(plan.get('mutants'), dict) else {}
     old = plan.get('history') if isinstance(plan.get('history'), dict) else {}
-    old_blobs, new_blobs = old.get('blobs') or {}, plan.get('blobs') or {}
-    last = mutation_cost.clean_files(
-        (mutation_cost.at_blobs(old, new_blobs, file_of) or {}).get('files')
-    )
-    fresh = {
-        u: e
-        for u, e in mutation_cost.clean_files(measured).items()
-        if e['mutants'] >= planned.get(u, 0)
-        or e['mutants'] > sum(x['mutants'] for v, x in last.items() if overlaps(u, v))
-    }
-    touched = {file_of(u) for u in fresh}
-    blobs = {f: new_blobs[f] for f in touched if f in new_blobs}
-    rows = dict(fresh)
-    for u, e in mutation_cost.clean_files(old.get('files')).items():
-        f = file_of(u)
-        if u in rows:
-            continue
-        if f in touched:
-            if f not in blobs or old_blobs.get(f) != blobs[f]:
-                continue
-            if any(overlaps(u, v) for v in fresh):
-                continue
-        elif f in old_blobs:
-            blobs[f] = old_blobs[f]
-        rows[u] = e
+    blobs = plan.get('blobs') if isinstance(plan.get('blobs'), dict) else {}
+    last = mutation_cost.at_blobs(old.get('files'), blobs)
     files = None if keep is None else {file_of(u) for u in keep}
-    rows = {u: e for u, e in sorted(rows.items()) if files is None or file_of(u) in files}
-    setup = mutation_cost.combine(setups)['setup_secs']
+    rows = {}
+    for path in sorted(set(measured) | set(last)):
+        if (files is None or path in files) and isinstance(blobs.get(path), str):
+            secs = mutation_cost.merged(measured.get(path, {}), last.get(path, {}))
+            if secs:
+                rows[path] = {'blob': blobs[path], 'secs': secs}
+    setup = mutation_cost.mean_of(setups)
     if setup is None and mutation_cost.nonnegative(old.get('setup_secs')):
         setup = float(old['setup_secs'])
-    history = {
-        'files': rows,
-        'setup_secs': setup,
-        'blobs': {f: b for f, b in sorted(blobs.items()) if any(file_of(u) == f for u in rows)},
-        'prior_error': prior_error,
-    }
+    history = {'files': rows, 'setup_secs': setup, 'prior_error': prior_error}
     (out / 'costs.json').write_text(json.dumps(history, indent=1) + '\n')
 
 
@@ -1096,6 +1048,33 @@ def write_history(
 # may move by that share rounded up to 0.5% of the file's mutants, and at least COUNT_SLACK.
 COUNT_VARIANCE = 0.005
 COUNT_SLACK = 2
+
+
+def report_fault(report: object) -> str:
+    """Why REPORT is not a Stryker report whose files each list their mutants as objects, or ''."""
+    files = report.get('files') if isinstance(report, dict) else None
+    if not isinstance(files, dict):
+        return 'it has no file map'
+    bad = next(
+        (
+            p
+            for p, f in files.items()
+            if not isinstance(f, dict)
+            or not isinstance(f.get('mutants'), list)
+            or not all(isinstance(m, dict) for m in f['mutants'])
+        ),
+        None,
+    )
+    return '' if bad is None else f'its file {bad!r:.200} lists no mutant objects'
+
+
+def blob_fault(blobs: object) -> str:
+    """Why BLOBS is not a {file: git blob} map, or ''."""
+    if isinstance(blobs, dict) and all(
+        isinstance(p, str) and isinstance(b, str) and BLOB.fullmatch(b) for p, b in blobs.items()
+    ):
+        return ''
+    return 'it is not a {file: git blob} map'
 
 
 def file_counts(report: object) -> dict[str, dict[str, int]]:
@@ -1157,15 +1136,14 @@ def prior_rows(plan: dict, files: dict | None, measured: dict) -> list[tuple[obj
     run measured whole, for mutation_cost.prior_error; a one-job plan's units are its lone shard's."""
     priors = plan.get('priors') if isinstance(plan.get('priors'), dict) else {}
     mutants = plan.get('mutants') if isinstance(plan.get('mutants'), dict) else {}
-    return [
-        (files[u]['shard'] if files else 1, measured[u]['secs'], p)
-        for u, p in priors.items()
-        if u in measured
-        and (not files or u in files)
-        and mutation_cost.nonnegative(p)
-        and mutation_cost.count(mutants.get(u))
-        and measured[u]['mutants'] >= mutants[u]
-    ]
+    out = []
+    for u, p in priors.items():
+        if (files and u not in files) or not mutation_cost.nonnegative(p):
+            continue
+        secs, n = mutation_cost.totals({u: unit_measures(u, measured)})
+        if mutation_cost.count(mutants.get(u)) and n >= mutants[u] > 0:
+            out.append((files[u]['shard'] if files else 1, secs, p))
+    return out
 
 
 def unreached(plan: dict, shard: int, measured: dict) -> str:
@@ -1177,12 +1155,26 @@ def unreached(plan: dict, shard: int, measured: dict) -> str:
         for u, want in sorted(mutants.items())
         if mutation_cost.count(want)
         and (files[u]['shard'] if files and u in files else 1) == shard
-        and want > (got := measured.get(u, {}).get('mutants', 0))
+        and want > (got := mutation_cost.totals({u: unit_measures(u, measured)})[1])
     ]
     if not short:
         return ''
     more = f' and {len(short) - 3} more units' if len(short) > 3 else ''
     return f': {", ".join(short[:3])}{more} not run'
+
+
+def owner_of(owner: dict[str, int], path: str, key: str) -> int | None:
+    """The shard that owns the mutant KEY of PATH: its file's, or that of its range holding it."""
+    if path in owner:
+        return owner[path]
+    return next(
+        (
+            n
+            for u, n in owner.items()
+            if RANGE.fullmatch(u) and file_of(u) == path and inside(u, key)
+        ),
+        None,
+    )
 
 
 def merge(plan: dict, shards_dir: Path, stage: Path, costs_out: Path) -> int:
@@ -1208,10 +1200,16 @@ def merge(plan: dict, shards_dir: Path, stage: Path, costs_out: Path) -> int:
         if isinstance(report, dict) and isinstance(report.get('files'), dict):
             reports[n] = report
         rec = read_json(d / 'costs.json') if d else None
-        if isinstance(rec, dict):
-            mine = mutation_cost.clean_files(rec.get('files'))
-            measured.update({p: e for p, e in mine.items() if owner is None or owner.get(p) == n})
-            setups.append({'setup_secs': rec.get('setup_secs')})
+        if isinstance(rec, dict) and isinstance(rec.get('files'), dict):
+            for p, secs in rec['files'].items():
+                mine = {
+                    key: v
+                    for key, v in mutation_cost.clean_secs(secs).items()
+                    if owner is None or owner_of(owner, p, key) == n
+                }
+                if isinstance(p, str) and mine:
+                    measured.setdefault(p, {}).update(mine)
+            setups.append(rec.get('setup_secs'))
         if meta is None or not isinstance(report, dict):
             problems.append(f'shard {n} has no result')
         elif meta.get('complete') is not True:
@@ -1362,11 +1360,15 @@ def main() -> int:
             doc = read_json(
                 path, None if name in ('baseline', 'proof') else mutation_cost.MAX_INPUT_BYTES
             )
-            report = name in ('baseline', 'proof')
-            if not isinstance(doc, dict) or (report and not isinstance(doc.get('files'), dict)):
-                mutation_cost.annotate(
-                    'error', t'counts: {str(path):.200} is not a readable JSON object of its kind'
-                )
+            why = (
+                'it is unreadable'
+                if doc is None
+                else report_fault(doc)
+                if name in ('baseline', 'proof')
+                else blob_fault(doc)
+            )
+            if why:
+                mutation_cost.annotate('error', t'counts: {str(path):.200}: {why}')
                 return 2
             docs[name] = doc
         rows = count_rows(

@@ -2,12 +2,13 @@
 """Size each repo's weekly gremlins work and split it across jobs when one job cannot hold it.
 
 The plan job sizes each module (`plan`): per file of a per-package module its
-RUNNABLE mutants and a prior cost, RUNNABLE x the package's measured cost of one
-surviving mutant (gremlins-run.sh time_package_mutants); an integration module,
-suite x mutants, with each module's git blob per Go file (`blobs`). The shard
-job prices each file from the repo's last measured run (`history`, built from
-each shard's `costs`) where it measured the file's current blob, the prior times
-PRIOR_ERROR where not (scripts/mutation_cost.py price),
+RUNNABLE mutants, keyed by position and type, and a prior cost per mutant, the
+package's measured cost of one surviving mutant (gremlins-run.sh
+time_package_mutants); an integration module, a suite per mutant, with each
+module's git blob per Go file (`blobs`). The shard job prices each mutant from
+the repo's last measured runs (`history`, built from each shard's `costs`) where
+they measured it at its file's current blob, its prior times PRIOR_ERROR where
+not (scripts/mutation_cost.py price),
 and packs files into shards that each end inside the band mutation_cost.TOP_SECS
 derives from runner speed, longest first, with more shards where the bound on every
 job needs them (`matrix`, mutation_cost.fit). A file is the smallest unit gremlins can scope, and a mutant's
@@ -42,7 +43,9 @@ SAFE_PATH = re.compile(r'[A-Za-z0-9._/-]+')
 JOB_OVERHEAD_SECS = 120
 # gremlins prints one of these per mutant it ran, as it finishes; NOT COVERED
 # lines cost nothing.
-COMPLETION = re.compile(r'^\s*(?:KILLED|LIVED|TIMED OUT|NOT VIABLE)\s+\S+ at (\S+?):\d+:\d+\s*$')
+COMPLETION = re.compile(
+    r'^\s*(?:KILLED|LIVED|TIMED OUT|NOT VIABLE)\s+(?P<type>\S+) at (?P<file>\S+?):(?P<line>\d+):(?P<col>\d+)\s*$'
+)
 MUTATION_START = 'Gathering coverage... done'
 
 
@@ -93,6 +96,22 @@ def file_counts(dry: dict) -> dict[str, int]:
     return out
 
 
+def mutant_keys(dry: object) -> dict[str, list[str]]:
+    """Each file's RUNNABLE mutants in a dry run, as the '<line>:<column> <type>' keys a cost record
+    holds; a file whose entries are not well formed has none."""
+    out: dict[str, list[str]] = {}
+    for fe in (dry.get('files') if isinstance(dry, dict) else None) or []:
+        name = fe.get('file_name') if isinstance(fe, dict) else None
+        if not isinstance(name, str):
+            continue
+        for m in fe.get('mutations') or []:
+            if isinstance(m, dict) and (m.get('status') or '').upper() == 'RUNNABLE':
+                line, col, kind = m.get('line'), m.get('column'), m.get('type')
+                if mutation_cost.count(line) and mutation_cost.count(col) and isinstance(kind, str):
+                    out.setdefault(name, []).append(f'{line}:{col} {kind}')
+    return out
+
+
 def package_of(path: str) -> str:
     return path.rsplit('/', 1)[0] if '/' in path else '.'
 
@@ -118,15 +137,25 @@ def size_module(plan_dir: Path) -> dict:
         suite = number(env, 'suite_secs')
         mutants = number(env, 'mutants')
         per_mutant = mutation_cost.known(suite, mutation_cost.SECOND_TICK)
-        return {
+        entry = {
             'mode': mode,
             'workers': workers,
             'setup_secs': setup + suite,
             'mutants': int(mutants),
             'prior_secs': None if per_mutant is None else round(per_mutant * mutants, 1),
+            'mutant_prior': per_mutant,
             'packages': {},
             'files': {},
         }
+        dry_path = plan_dir / 'dry-run.json'
+        try:
+            keys = mutant_keys(mutation_cost.load_json(dry_path)) if dry_path.is_file() else {}
+        except Exception:
+            keys = {}
+        # Keys that do not number the mutants priced would pair measures with the wrong mutants.
+        if sum(len(v) for v in keys.values()) == entry['mutants']:
+            entry['keys'] = dict(sorted(keys.items()))
+        return entry
 
     # The run's own coverage pass comes after its setup and takes about a suite.
     suite = number(env, 'suite_secs', required=False) or 0.0
@@ -150,6 +179,7 @@ def size_module(plan_dir: Path) -> dict:
     module = dry.get('go_module') if isinstance(dry, dict) else None
     if not module:
         raise UnsizedError('dry-run.json names no go_module')
+    keys = mutant_keys(dry)
     for path, runnable in sorted(file_counts(dry).items()):
         if not SAFE_PATH.fullmatch(path):
             raise UnsizedError(f'file {path!r:.200} has characters outside [A-Za-z0-9._/-]')
@@ -168,7 +198,10 @@ def size_module(plan_dir: Path) -> dict:
         entry['files'][path] = {
             'runnable': runnable,
             'prior_secs': None if runnable and secs is None else round(runnable * (secs or 0.0), 3),
+            'mutant_prior': None if runnable and secs is None else secs or 0.0,
         }
+        if len(keys.get(path, [])) == runnable:
+            entry['files'][path]['keys'] = keys.get(path, [])
     return entry
 
 
@@ -234,22 +267,44 @@ def module_history(history: dict | None, dir_: str) -> dict:
     return h if isinstance(h, dict) else {}
 
 
-def integration_price(e: dict, h: dict) -> tuple[tuple[float | None, str], dict | None]:
-    """An integration module's price (mutation_cost.price) from its history rows at their current
-    blobs, summed into one, and that row; a module with no mutants costs 0 whatever its history."""
-    if not e['mutants']:
-        return (0.0, 'prior'), None
-    hist = mutation_cost.clean_files(h.get('files'))
-    done = sum(f['mutants'] for f in hist.values())
-    total = {'secs': sum(f['secs'] for f in hist.values()), 'mutants': done} if done else None
-    return mutation_cost.price(e['mutants'], e['prior_secs'], total), total
+def pairs(
+    keys: object, mutant_prior: float | None, n: int, prior: float | None, measured: dict
+) -> list[tuple[float | None, float | None]]:
+    """A unit's mutants for mutation_cost.price: each of its N KEYS with MUTANT_PRIOR and its
+    measure in MEASURED ({key: [seconds]}); with no keys to pair measures by, one mutant of its
+    whole PRIOR, unmeasured."""
+    if isinstance(keys, list) and len(keys) == n:
+        return mutation_cost.pair(keys, [mutant_prior] * n, measured)
+    return [(prior, None)] if n else []
 
 
-def item(group: str, unit: str | None, priced: tuple, row: dict | None, workers: int) -> Item:
-    """The packed unit of a price (mutation_cost.price) on WORKERS, with the part a measure set."""
-    secs, source = priced
-    known = None if source == 'measured' else mutation_cost.measured_part(priced, row) / workers
-    return Item(group, unit, secs / workers, known)
+def integration_price(e: dict, measured: dict) -> mutation_cost.Priced:
+    """An integration module's price over all its files' mutants, from MEASURED at their current blobs."""
+    keys = e.get('keys') if isinstance(e.get('keys'), dict) else None
+    if keys is None:
+        return mutation_cost.price(pairs(None, None, e['mutants'], e['prior_secs'], {}))
+    return mutation_cost.price(
+        [
+            pr
+            for path, ks in sorted(keys.items())
+            for pr in pairs(ks, e.get('mutant_prior'), len(ks), None, measured.get(path, {}))
+        ]
+    )
+
+
+def item(
+    group: str, unit: str | None, priced: mutation_cost.Priced, workers: int, worst: str | None
+) -> Item:
+    """The packed unit of a price on WORKERS, with the part a measure set."""
+    known = None if priced.source == 'measured' else priced.measured / workers
+    return Item(group, unit, priced.secs / workers, known, worst)
+
+
+def worst_key(keys: object, priced: mutation_cost.Priced, where: str) -> str | None:
+    """The costliest measured mutant of a unit as '<where> <key>', or None."""
+    if priced.worst is None or not isinstance(keys, list) or priced.worst >= len(keys):
+        return None
+    return f'{where} {keys[priced.worst]}'
 
 
 def assign(
@@ -269,7 +324,7 @@ def assign(
     shards keeps every job within mutation_cost.BOUND_SECS.
     """
     plan = json.loads(json.dumps(doc))
-    entries, items, setup, refused = plan['modules'], [], {}, 0
+    entries, items, setup = plan['modules'], [], {}
     unsized: list[Item] = []
     unknown: list[str] = []
     for dir_, e in entries.items():
@@ -277,34 +332,42 @@ def assign(
         if e['mode'] is None:
             unsized.append(Item(dir_, None, 0.0))
             continue
-        h = mutation_cost.at_blobs(module_history(history, dir_), e.get('blobs') or {})
+        h = module_history(history, dir_)
+        measured = mutation_cost.at_blobs(h.get('files'), e.get('blobs') or {})
         setup[dir_] = mutation_cost.setup_price(h.get('setup_secs'), e['setup_secs'])
         workers = e['workers']
         if e['mode'] == 'integration':
-            priced, row = integration_price(e, h)
-            e['cost'] = priced[1]
-            refused += e['cost'] == 'refused'
-            e['work_secs'] = None if priced[0] is None else round(priced[0] / workers, 1)
-            if priced[0] is None:
+            priced = integration_price(e, measured) if e['mutants'] else mutation_cost.price([])
+            e['cost'] = priced.source
+            e['work_secs'] = None if priced.secs is None else round(priced.secs / workers, 1)
+            if priced.secs is None:
                 unsized.append(Item(dir_, None, 0.0))
                 unknown.append(dir_)
             else:
-                items.append(item(dir_, None, priced, row, workers))
+                flat = [f'{p} {k}' for p, ks in sorted((e.get('keys') or {}).items()) for k in ks]
+                items.append(item(dir_, None, priced, workers, worst_key(flat, priced, dir_)))
             continue
-        rows = mutation_cost.clean_files(h.get('files'))
-        priced = mutation_cost.project(
-            {p: (f['runnable'], f['prior_secs']) for p, f in e['files'].items()}, h
-        )
-        refused += mutation_cost.refusals(priced)
-        for p, (secs, source) in priced.items():
-            e['files'][p].update(
-                work_secs=None if secs is None else round(secs / workers, 1), cost=source
+        for p, f in e['files'].items():
+            priced = mutation_cost.price(
+                pairs(
+                    f.get('keys'),
+                    f.get('mutant_prior'),
+                    f['runnable'],
+                    f['prior_secs'],
+                    measured.get(p, {}),
+                )
             )
-            if secs is None:
+            f.update(
+                work_secs=None if priced.secs is None else round(priced.secs / workers, 1),
+                cost=priced.source,
+            )
+            if priced.secs is None:
                 unsized.append(Item(dir_, p, 0.0))
                 unknown.append(f'{dir_}:{p}')
             else:
-                items.append(item(dir_, p, priced[p], rows.get(p), workers))
+                items.append(
+                    item(dir_, p, priced, workers, worst_key(f.get('keys'), priced, f'{dir_}:{p}'))
+                )
         if not e['files']:
             items.append(Item(dir_, None, 0.0))
     warnings: list[Template] = []
@@ -312,11 +375,6 @@ def assign(
         warnings.append(
             t'{plan["repo"]}: no measured or probed cost for {len(unknown)} item(s), so each is '
             t'planned as a full shard of its own: {", ".join(unknown):.1000}'
-        )
-    if refused:
-        warnings.append(
-            t'{plan["repo"]}: {refused} measured price(s) more than {mutation_cost.PRICE_FACTOR}x '
-            t"from the probe's were refused, so those files are priced from it"
         )
     one_job = sum(setup.values()) + sum(it.work for it in items)
     top_secs = mutation_cost.TOP_SECS
@@ -337,8 +395,9 @@ def assign(
         it.group if it.unit is None else f'{it.group}:{it.unit}'
         for i in mutation_cost.deadline_bound(bins, setup)
         for it in bins[i].items
+        if it.known is not None
     ]
-    if items and mutation_cost.capped(k, bins, items, setup, top_secs, room):
+    if items and mutation_cost.capped(k, bins, items, top_secs, room):
         plan['capped'] = mutation_cost.cap_reason(limit)
     elif items and max(projected) > top:
         slowest = max(items, key=lambda it: it.work)
@@ -374,10 +433,17 @@ def assign(
 
 
 def priced_or_unknown(entry: dict) -> bool:
-    """ENTRY holds a prior: a measure, or None for a probe that measured nothing."""
-    return 'prior_secs' in entry and (
-        entry['prior_secs'] is None or mutation_cost.nonnegative(entry['prior_secs'])
+    """ENTRY holds a prior: a measure, or None for a probe that measured nothing, and the same of
+    one mutant when it gives one."""
+    return all(
+        k in entry and (entry[k] is None or mutation_cost.nonnegative(entry[k]))
+        for k in ('prior_secs', *(['mutant_prior'] if 'mutant_prior' in entry else []))
     )
+
+
+def key_list(keys: object, n: int) -> bool:
+    """KEYS is N mutant keys."""
+    return isinstance(keys, list) and len(keys) == n and all(isinstance(k, str) for k in keys)
 
 
 def valid_module(dir_: str, e: object, *, planned: int | None) -> str:
@@ -408,6 +474,15 @@ def valid_module(dir_: str, e: object, *, planned: int | None) -> str:
         return (
             f'module {dir_!r:.200} is an integration module with no usable mutants and prior_secs'
         )
+    keys = e.get('keys', {})
+    if not isinstance(keys, dict) or not all(
+        isinstance(p, str) and key_list(v, len(v) if isinstance(v, list) else -1)
+        for p, v in keys.items()
+    ):
+        return f'module {dir_!r:.200} has mutant keys that are not lists of keys per file'
+    if keys and sum(len(v) for v in keys.values()) != e.get('mutants'):
+        return f'module {dir_!r:.200} has mutant keys that do not number its mutants'
+
     packages = e.get('packages', {})
     if not isinstance(packages, dict) or not all(
         isinstance(p, dict)
@@ -436,6 +511,11 @@ def valid_module(dir_: str, e: object, *, planned: int | None) -> str:
             return (
                 f'module {dir_!r:.200} file {p!r:.200} has no usable runnable count and prior_secs'
             )
+        if 'keys' in f and not key_list(f['keys'], f['runnable']):
+            return (
+                f'module {dir_!r:.200} file {p!r:.200} has keys that are not its runnable mutants'
+            )
+
     if planned is None:
         return ''
     # Each shard of a module mutates only the files given to it, so the files'
@@ -645,7 +725,7 @@ def module_costs(path: Path) -> dict:
         elif start is None and MUTATION_START in line:
             start = value
         elif m := COMPLETION.match(line):
-            events.append((value, m.group(1)))
+            events.append((value, m['file'], f'{m["line"]}:{m["col"]} {m["type"]}'))
     workers = int(header.get('#workers', 0))
     if workers < 1 or '#launch' not in header or start is None:
         raise ValueError(
@@ -697,56 +777,65 @@ def slowdown(runs: dict[str, dict[str, tuple[float, int]]]) -> float | None:
 
 def prior_rows(e: object, measured: dict) -> list[tuple[object, float, float]]:
     """(shard, measured seconds, prior seconds) of each unit of plan module E priced from its prior alone,
-    and measured whole, for mutation_cost.prior_error; MEASURED is this run's mean per file over
-    its attempts."""
+    and measured whole, for mutation_cost.prior_error; MEASURED is this run's mean per mutant over
+    its attempts, {file: {key: [seconds]}}."""
     if not isinstance(e, dict):
         return []
-    prior_priced = ('prior', 'refused')
     if e.get('mode') == 'integration':
         shards = e.get('shards') or [None]
-        if e.get('cost') not in prior_priced or not measured or not e.get('prior_secs'):
+        if e.get('cost') != 'prior' or not mutation_cost.nonnegative(e.get('prior_secs')):
             return []
-        if not mutation_cost.count(e.get('mutants')) or (
-            sum(f['mutants'] for f in measured.values()) < e['mutants']
-        ):
+        secs, n = mutation_cost.totals(measured)
+        if not mutation_cost.count(e.get('mutants')) or not 0 < e['mutants'] <= n:
             return []
-        return [(shards[0], sum(f['secs'] for f in measured.values()), e['prior_secs'])]
+        return [(shards[0], secs, e['prior_secs'])]
     files = e.get('files') if isinstance(e.get('files'), dict) else {}
-    return [
-        (f.get('shard'), measured[p]['secs'], f['prior_secs'])
-        for p, f in files.items()
-        if isinstance(f, dict)
-        and f.get('cost') in prior_priced
-        and p in measured
-        and mutation_cost.nonnegative(f.get('prior_secs'))
-        and mutation_cost.count(f.get('runnable'))
-        and measured[p]['mutants'] >= f['runnable']
-    ]
+    out = []
+    for p, f in files.items():
+        if not isinstance(f, dict) or f.get('cost') != 'prior' or p not in measured:
+            continue
+        secs, n = mutation_cost.totals({p: measured[p]})
+        if (
+            mutation_cost.nonnegative(f.get('prior_secs'))
+            and mutation_cost.count(f.get('runnable'))
+            and 0 < f['runnable'] <= n
+        ):
+            out.append((f.get('shard'), secs, f['prior_secs']))
+    return out
 
 
 def history(
     repo: str, artifacts_dir: Path, previous: Path | None = None, plan: Path | None = None
 ) -> dict | None:
-    """The repo's history: this run's cost records bound to it by meta.json, carried over PREVIOUS.
+    """The repo's history: this run's cost records bound to it by meta.json, over PREVIOUS.
 
-    A file this run did not measure keeps its PREVIOUS measure while its blob is
-    the one PLAN gives it; with this run's PLAN, only its modules, and in a
-    per-package module only its files, are kept, each with its blob. A module no
-    PLAN gives blobs keeps its PREVIOUS record and records no new measure.
+    Each mutant's measure is its mean over the attempts that measured it
+    (mutation_cost.attempt_mean), and a mutant this run did not reach keeps its
+    PREVIOUS measure while its file's blob is the one PLAN gives it. With this
+    run's PLAN, only its modules, and in a per-package module only its files,
+    are kept, each with its blob. A module no PLAN gives blobs keeps its
+    PREVIOUS record and records no new measure.
     """
-    records: dict[str, list[dict]] = {}
+    attempts: dict[str, dict[str, dict[str, dict]]] = {}
+    setups: dict[str, list[object]] = {}
     runs: dict[str, dict[str, tuple[float, int]]] = {}
     for meta_path in sorted(artifacts_dir.rglob('meta.json')):
         meta, doc = read_doc(meta_path), read_doc(meta_path.parent / 'gremlins-costs.json')
         if meta.get('repo') != repo or not isinstance(doc.get('modules'), dict):
             continue
-        secs, mutants = 0.0, 0
+        attempt = str(meta.get('attempt'))
+        shard_files: dict[str, dict[str, list[float]]] = {}
         for dir_, rec in doc['modules'].items():
-            if isinstance(dir_, str) and isinstance(rec, dict):
-                records.setdefault(dir_, []).append(rec)
-                for e in mutation_cost.clean_files(rec.get('files')).values():
-                    secs, mutants = secs + e['secs'], mutants + e['mutants']
-        runs.setdefault(str(meta.get('shard', '')), {})[str(meta.get('attempt'))] = (secs, mutants)
+            if not (isinstance(dir_, str) and isinstance(rec, dict)):
+                continue
+            setups.setdefault(dir_, []).append(rec.get('setup_secs'))
+            files = rec.get('files') if isinstance(rec.get('files'), dict) else {}
+            mine = attempts.setdefault(dir_, {}).setdefault(attempt, {})
+            for path, secs in files.items():
+                if isinstance(path, str) and (clean := mutation_cost.clean_secs(secs)):
+                    mine.setdefault(path, {}).update(clean)
+                    shard_files[f'{dir_}\0{path}'] = clean
+        runs.setdefault(str(meta.get('shard', '')), {})[attempt] = mutation_cost.totals(shard_files)
     try:
         old = read_history(previous, repo)
     except Exception as exc:
@@ -758,46 +847,40 @@ def history(
         old = None
     old = old['modules'] if old else {}
     planned = read_doc(plan).get('modules')
-    dirs = set(records) | {d for d in old if isinstance(d, str)}
+    dirs = set(attempts) | set(setups) | {d for d in old if isinstance(d, str)}
     if isinstance(planned, dict):
         dirs &= set(planned)
     modules = {}
     rows: list[tuple[object, float, float]] = []
     for d in sorted(dirs):
         e = planned.get(d) if isinstance(planned, dict) else None
-        files = e.get('files') if isinstance(e, dict) and e.get('mode') == 'per-package' else None
-        keep = set(files) if isinstance(files, dict) else None
-        counts = (
-            {
-                p: f['runnable']
-                for p, f in files.items()
-                if isinstance(f, dict) and mutation_cost.count(f.get('runnable'))
-            }
-            if keep
-            else None
-        )
-        new = mutation_cost.combine(records.get(d, []))
         prev = old.get(d) if isinstance(old.get(d), dict) else {}
+        by_attempt = list(attempts.get(d, {}).values())
+        new = {
+            path: mutation_cost.attempt_mean([a[path] for a in by_attempt if path in a])
+            for path in sorted({path for a in by_attempt for path in a})
+        }
+        setup = mutation_cost.mean_of(setups.get(d, []))
+        if setup is None and mutation_cost.nonnegative(prev.get('setup_secs')):
+            setup = float(prev['setup_secs'])
         versions = e.get('blobs') if isinstance(e, dict) else None
         if not isinstance(versions, dict):
             # No plan names this run's versions, so its measures price nothing and the last stay as they were.
-            versions = prev.get('blobs') if isinstance(prev.get('blobs'), dict) else {}
-            new = {**new, 'files': {}}
-        last = mutation_cost.at_blobs(prev, versions)
-        if (
-            isinstance(e, dict)
-            and e.get('mode') == 'integration'
-            and mutation_cost.count(e.get('mutants'))
-            and (got := sum(f['mutants'] for f in new['files'].values())) < e['mutants']
-            and sum(f['mutants'] for f in mutation_cost.clean_files(last.get('files')).values())
-            >= got
-        ):
-            # integration_price prices the module from its total, so a cut sample replaces no fuller one.
-            new = {**new, 'files': {}}
-        rows += prior_rows(e, new['files'])
-        rec = mutation_cost.carry_forward(new, last, keep, counts)
-        rec['blobs'] = {p: versions[p] for p in rec['files'] if isinstance(versions.get(p), str)}
-        modules[d] = rec
+            modules[d] = {
+                'files': mutation_cost.clean_files(prev.get('files')),
+                'setup_secs': setup,
+            }
+            continue
+        rows += prior_rows(e, new)
+        files = e.get('files') if e.get('mode') == 'per-package' else None
+        keep = set(files) if isinstance(files, dict) and files else None
+        last = mutation_cost.at_blobs(prev.get('files'), versions)
+        out = {}
+        for path in sorted(set(new) | set(last)):
+            if (keep is None or path in keep) and isinstance(versions.get(path), str):
+                if secs := mutation_cost.merged(new.get(path, {}), last.get(path, {})):
+                    out[path] = {'blob': versions[path], 'secs': secs}
+        modules[d] = {'files': out, 'setup_secs': setup}
     if not any(m['files'] or m['setup_secs'] is not None for m in modules.values()):
         return None
     return {
@@ -838,7 +921,7 @@ def main() -> int:
     md.add_argument('--plan', required=True, type=Path)
     md.add_argument('--shard', required=True, type=int)
     md.add_argument('--modules', required=True, help='space-separated module dirs of this checkout')
-    co = sub.add_parser('costs', help="one shard's measured cost per file")
+    co = sub.add_parser('costs', help="one shard's measured cost per mutant")
     co.add_argument('--module', action='append', required=True, metavar='DIR=TIMES')
     co.add_argument('--out', required=True, type=Path)
     hi = sub.add_parser(
