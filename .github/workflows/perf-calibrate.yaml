@@ -77,7 +77,8 @@ jobs:
       ref: ${{ inputs.ref }}
       set: ${{ inputs.set }}
       only: ${{ inputs.only }}
-      runs: ${{ inputs.runs }}
+      # A dispatched number arrives as a string, which perf-ci.yaml's number input refuses.
+      runs: ${{ fromJSON(inputs.runs) }}
       mode: calibrate
       # The account's concurrent-job limit is shared with every repository's
       # pull requests, so a calibration takes half of GitHub Free's 20.
