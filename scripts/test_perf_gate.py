@@ -112,6 +112,14 @@ class TheRule(unittest.TestCase):
     def test_a_duplicate_key_fails(self):
         self.assertTrue(perf_gate.check_rule(budgets([entry(), entry()])))
 
+    def test_a_headroom_of_zero_or_below_fails(self):
+        for h in (0, -1.5):
+            with self.subTest(own=h):
+                self.assertTrue(perf_gate.check_rule(budgets([entry(headroom=h, budget=50.0)])))
+            with self.subTest(file=h):
+                doc = budgets([entry(budget=50.0)], headroom={'cpu_ms': h})
+                self.assertTrue(perf_gate.check_rule(doc))
+
 
 class Compare(unittest.TestCase):
     def test_an_exact_count_that_differs_from_its_baseline_fails_at_compare(self):
@@ -194,6 +202,22 @@ class Compare(unittest.TestCase):
         )
         self.assertEqual(out.failures, [])
         self.assertEqual([keyof(c) for c in out.over_target], [keyof(entry())])
+
+    def test_a_zero_headroom_never_divides(self):
+        b = budgets([entry(budget=50.0)], headroom={'cpu_ms': 0})
+        out = perf_gate.compare(b, results([cell(reps=(40.0, 40.0, 40.0))]))
+        self.assertEqual((out.failures, out.notices), ([], []))
+
+    def test_a_gated_or_exact_entry_the_set_lists_and_no_shard_measured_fails(self):
+        b = budgets([entry(), entry('dom', 'exact', 640), entry('frames', 'reported', 9.0)])
+        units = {perf_gate.unit_key(CELL)}
+        out = perf_gate.compare(b, results([]), units)
+        self.assertEqual(len(out.failures), 2)
+        self.assertTrue(all('no shard measured' in f for f in out.failures))
+        measured = [cell(), cell('dom', (640,) * 3, kind='count')]
+        self.assertEqual(perf_gate.compare(b, results(measured), units).failures, [])
+        self.assertEqual(perf_gate.compare(b, results([]), set()).failures, [])
+        self.assertEqual(perf_gate.compare(b, results([], runner='x'), units).failures, [])
 
 
 class Verdict(unittest.TestCase):
@@ -498,6 +522,64 @@ class Provenance(unittest.TestCase):
         head = budgets([entry(baseline=900.0, source='https://example.com/runs/111')])
         self.assertTrue(self.check(head, base))
 
+    def test_a_runner_edit_alone_rechecks_every_entry(self):
+        self.write('111', calibration_file([cal_cell()]))
+        base = budgets([entry(), entry('dom', 'exact', 640)])
+        head = budgets(base['budgets'], runner='self-hosted-x')
+        errors = self.check(head, base)
+        self.assertTrue(errors)
+        self.assertIn('self-hosted-x', ' '.join(errors))
+        dom = cal_cell('dom', baseline=640, tier='exact', kind='count')
+        self.write('111', calibration_file([cal_cell(), dom], runner='self-hosted-x'))
+        self.assertEqual(self.check(head, base), [])
+
+    def test_a_headroom_or_floor_edit_needs_accepted_for_every_budget_it_raises(self):
+        wide = {'cpu_ms': 2.0, 'heap_mb': 1.25, 'rss_mb': 1.25}
+        high = {'cpu_ms': 100, 'heap_mb': 1}
+        cases = (
+            ('headroom', 1000.0, 2000.0, {'headroom': wide}),
+            ('floor', 20.0, 100.0, {'floor': high}),
+        )
+        for name, baseline, raised, edit in cases:
+            for doc_edit in ({}, edit):
+                with self.subTest(name, calibration_carries_it=bool(doc_edit)):
+                    cal = calibration_file([cal_cell(baseline=baseline)], **doc_edit)
+                    self.write('111', cal)
+                    base = budgets([entry(baseline=baseline)])
+                    head = budgets([entry(baseline=baseline, budget=raised)], **edit)
+                    self.assertEqual(perf_gate.check_rule(head), [])
+                    errors = self.check(head, base)
+                    self.assertTrue(errors)
+                    self.assertIn('accepted', ' '.join(errors))
+                    why = entry(baseline=baseline, budget=raised, accepted='slower parse')
+                    self.assertEqual(self.check(budgets([why], **edit), base), [])
+
+    def test_a_headroom_edit_rechecks_an_entry_whose_fields_did_not_change(self):
+        lowered = {'cpu_ms': 1.4, 'heap_mb': 1.25, 'rss_mb': 1.25}
+        heap = entry('heap_mb', baseline=20.0, budget=25.0, source=RUN_URL + '100')
+        base = budgets([entry(), heap])
+        head = budgets([entry(budget=1400.0), heap], headroom=lowered)
+        self.write('111', calibration_file([cal_cell()]))
+        errors = self.check(head, base)
+        self.assertTrue(errors)
+        self.assertIn('calibration 100', ' '.join(errors))
+
+
+class Coverage(unittest.TestCase):
+    def test_a_gated_or_exact_entry_no_set_lists_fails_unless_retired(self):
+        gone = {**CELL, 'scenario': 'gone'}
+        dropped = {**entry(), **gone}
+        exact = {**entry('dom', 'exact', 640), **gone}
+        reported = {**entry('frames', 'reported', 9.0), **gone}
+        doc = budgets([entry(), dropped, exact, reported])
+        errors = perf_gate.check_plan(doc, PLAN)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(all(e.startswith('gone/') for e in errors))
+        retired = [
+            {**gone, 'metric': m, 'reason': 'the view was removed'} for m in ('cpu_ms', 'dom')
+        ]
+        self.assertEqual(perf_gate.check_plan({**doc, 'retired': retired}, PLAN), [])
+
 
 @unittest.skipUnless(shutil.which('cosign') or os.environ.get('CI'), 'cosign is not installed')
 class RealCosign(unittest.TestCase):
@@ -590,6 +672,23 @@ class Plan(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '256'):
             perf_gate.plan(PLAN, 'pr', runs=129)
 
+    def test_a_line_break_in_node_or_a_cell_field_fails(self):
+        cells = [unit('files', 80)]
+        cases = {
+            'node': {'node': 'static-src\nsha=0', 'sets': {'pr': {'shards': 1, 'cells': cells}}},
+            'scenario': {
+                'node': '.',
+                'sets': {'pr': {'shards': 1, 'cells': [unit('files\nsha=0', 80)]}},
+            },
+            'extra field': {
+                'node': '.',
+                'sets': {'pr': {'shards': 1, 'cells': [unit('files', 80, note='a\rb')]}},
+            },
+        }
+        for name, doc in cases.items():
+            with self.subTest(name), self.assertRaisesRegex(ValueError, 'line break'):
+                perf_gate.plan(doc, 'pr')
+
     def test_a_cell_keeps_the_fields_the_harness_reads(self):
         doc = {
             'node': '.',
@@ -658,6 +757,25 @@ class ResultFiles(unittest.TestCase):
                     self.assertRegex(job['name'], rf'^{perf_gate.SHARD_NAME}$')
 
 
+def github_outputs(text):
+    """$GITHUB_OUTPUT as the runner reads it: `name=value` lines and
+    `name<<DELIMITER` blocks, a later name replacing an earlier one."""
+    out, lines = {}, iter(text.splitlines())
+    for line in lines:
+        name, sep, value = line.partition('<<')
+        if sep and '=' not in name:
+            block = []
+            for more in lines:
+                if more == value:
+                    break
+                block.append(more)
+            out[name] = '\n'.join(block)
+        else:
+            name, _, value = line.partition('=')
+            out[name] = value
+    return out
+
+
 class Cli(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -687,6 +805,7 @@ class Cli(unittest.TestCase):
             self.put(f'results/{OTHER}-measure-shard-1-of-1/results.json', results(other))
         argv = ('--budgets', b, '--base', b, '--results', str(self.dir / 'results'))
         argv += ('--calibrations', str(self.dir / 'cal'), '--repo', REPO, '--head', HEAD)
+        argv += ('--plan-doc', self.put('plan.json', PLAN), '--set', 'pr')
         argv += (
             '--remeasure-out',
             str(self.dir / 'remeasure.json'),
@@ -708,6 +827,19 @@ class Cli(unittest.TestCase):
         rc = self.compare([cell(), cell('dom', (700,) * 3, kind='count')])
         self.assertEqual(rc, 1)
         self.assertEqual(json.loads((self.dir / 'remeasure.json').read_text())['cells'], [])
+
+    def test_compare_fails_on_a_listed_cell_no_shard_measured(self):
+        self.assertEqual(self.compare([cell()]), 1)
+        self.assertIn('no shard measured', (self.dir / 'summary.md').read_text())
+
+    def test_compare_needs_the_plan(self):
+        b = self.put('budgets.json', budgets([]))
+        self.put('results/shard-1/results.json', results([cell()]))
+        argv = ('--budgets', b, '--base', b, '--results', str(self.dir / 'results'))
+        argv += ('--calibrations', str(self.dir / 'cal'), '--repo', REPO, '--head', HEAD)
+        argv += ('--remeasure-out', str(self.dir / 'remeasure.json'))
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.main(*argv)
 
     def test_check_file_fails_a_rule_break(self):
         b = self.put('budgets.json', budgets([entry(budget=1600.0, source=RUN_URL + '100')]))
@@ -751,9 +883,24 @@ class Cli(unittest.TestCase):
         matrix = json.loads(out.read_text())
         self.assertEqual(list(matrix), ['include'])
         self.assertEqual(len(matrix['include']), 4)
-        lines = outputs.read_text().splitlines()
-        self.assertEqual(lines[0], f'matrix={json.dumps(matrix)}')
-        self.assertEqual(lines[1:], ['node=static-src', 'scenarios=docs tabs'])
+        written = github_outputs(outputs.read_text())
+        self.assertEqual(written['matrix'], json.dumps(matrix))
+        self.assertEqual((written['node'], written['scenarios']), ('static-src', 'docs tabs'))
+
+    def test_plan_writes_no_output_line_from_a_line_break_in_plan_json(self):
+        injected = {
+            'node': {**PLAN, 'node': 'static-src\nsha=0'},
+            'scenario': {**PLAN, 'sets': {'pr': {'shards': 1, 'cells': [unit('a\nsha=0', 9)]}}},
+        }
+        for name, doc in injected.items():
+            with self.subTest(name):
+                outputs = self.dir / f'github-output-{name}'
+                outputs.write_text('sha=c0ffee\n')
+                argv = ('--plan', self.put(f'{name}.json', doc), '--set', 'pr')
+                argv += ('--out', str(self.dir / 'm.json'), '--outputs', str(outputs))
+                with redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.main(*argv), 1)
+                self.assertEqual(github_outputs(outputs.read_text()), {'sha': 'c0ffee'})
 
     def test_plan_fails_on_an_unknown_scenario(self):
         p = self.put('plan.json', PLAN)

@@ -22,6 +22,7 @@ import re
 import statistics
 import subprocess
 import sys
+import uuid
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -92,6 +93,19 @@ def check_rule(budgets: dict) -> list[str]:
         errors.append('budgets.json: schema must be 1')
     if not isinstance(budgets.get('runner'), str) or not budgets['runner']:
         errors.append('budgets.json: runner must name the runner the budgets were calibrated on')
+    for field, ok, want in (
+        ('headroom', lambda x: is_number(x) and x > 0, 'a number above 0'),
+        ('floor', lambda x: is_number(x) and x >= 0, 'a number of 0 or more'),
+    ):
+        values = budgets.get(field, {})
+        if not isinstance(values, dict):
+            errors.append(f'budgets.json: {field} must map a metric family to {want}')
+            continue
+        errors.extend(
+            f'budgets.json: {field}.{fam} is {v!r}, not {want}'
+            for fam, v in values.items()
+            if not ok(v)
+        )
     seen = set()
     for i, e in enumerate(budgets.get('budgets', [])):
         missing = [f for f in KEY_FIELDS if not isinstance(e.get(f), str) or not e[f]]
@@ -136,6 +150,8 @@ def entry_errors(budgets: dict, e: dict) -> list[str]:
         h = entry_headroom(budgets, e)
         if not is_number(h):
             out.append(f'no headroom for {family(e["metric"])}')
+        elif h <= 0:
+            out.append(f'headroom {h} is not above 0')
         else:
             want = budget_for(baseline, h, entry_floor(budgets, e))
             if abs(budget - want) > TOLERANCE:
@@ -161,10 +177,12 @@ class Outcome:
     six: list[dict] = dataclasses.field(default_factory=list)
 
 
-def compare(budgets: dict, results: dict) -> Outcome:
+def compare(budgets: dict, results: dict, units: set[tuple] | None = None) -> Outcome:
     """Judge each measured cell on its median of three. A gated cell over its
     budget is listed in `remeasure`, never failed here; an exact count that
-    differs from its budget fails."""
+    differs from its budget fails, and so does a gated or exact entry of a
+    unit (`unit_key`) in `units`, the cells this call planned, that no shard
+    measured."""
     out = Outcome(runner=results.get('runner', ''))
     out.runner_mismatch = out.runner != budgets.get('runner')
     entries = {key(e): e for e in budgets.get('budgets', [])}
@@ -181,6 +199,13 @@ def compare(budgets: dict, results: dict) -> Outcome:
         else:
             status = judge(budgets, e, c, value, out)
         out.rows.append({'cell': c, 'entry': e, 'value': value, 'status': status})
+    if not out.runner_mismatch and units:
+        measured = {key(c) for c in results.get('cells', [])}
+        out.failures.extend(
+            f'{key_text(k)}: a {e["tier"]} entry of the measured set that no shard measured'
+            for k, e in entries.items()
+            if e.get('tier') != 'reported' and unit_key(e) in units and k not in measured
+        )
     return out
 
 
@@ -208,7 +233,7 @@ def judge(budgets: dict, e: dict, c: dict, value: float | None, out: Outcome) ->
         out.remeasure.append(c)
         return 'remeasure'
     h = entry_headroom(budgets, e)
-    if kind == 'time' and is_number(h) and value < e['baseline'] / h:
+    if kind == 'time' and is_number(h) and h > 0 and value < e['baseline'] / h:
         out.notices.append(
             f'{name}: median {value} is under baseline {e["baseline"]} / {h}, '
             'so its budget can come down'
@@ -433,6 +458,40 @@ MAX_JOBS = 256
 SHARD_NAME = r'(?:run-\d+-)?shard-\d+-of-\d+'
 
 
+def unit_key(d: dict) -> tuple:
+    """What one measure job runs for a cell: its scenario, scale, engine and
+    width, every window and metric of them."""
+    return tuple(d.get(f) for f in UNIT_FIELDS)
+
+
+def has_line_break(x: object) -> bool:
+    if isinstance(x, str):
+        return '\n' in x or '\r' in x
+    if isinstance(x, dict):
+        return any(has_line_break(v) for v in x.values())
+    if isinstance(x, list):
+        return any(has_line_break(v) for v in x)
+    return False
+
+
+def check_plan(budgets: dict, doc: dict) -> list[str]:
+    """A gated or exact entry whose unit no set of plan.json lists leaves the
+    gate unmeasured, so it fails unless `retired` names its key."""
+    listed = {
+        unit_key(u) for spec in (doc.get('sets') or {}).values() for u in spec.get('cells') or []
+    }
+    retired = {key(r) for r in budgets.get('retired', []) if all(f in r for f in KEY_FIELDS)}
+    return [
+        f'{key_text(key(e))}: a {e["tier"]} entry no set of plan.json measures, '
+        'and retired does not name it'
+        for e in budgets.get('budgets', [])
+        if e.get('tier') != 'reported'
+        and all(f in e for f in KEY_FIELDS)
+        and unit_key(e) not in listed
+        and key(e) not in retired
+    ]
+
+
 def plan(
     doc: dict,
     set_name: str,
@@ -460,6 +519,9 @@ def plan(
         raise ValueError(f'set {set_name} lists no cells')
     seen = set()
     for u in units:
+        # Cell fields reach $GITHUB_OUTPUT and the job's shell.
+        if has_line_break(u):
+            raise ValueError(f'set {set_name}: a cell field holds a line break: {u!r}')
         k = tuple(u.get(f) for f in UNIT_FIELDS)
         if not all(isinstance(x, str) and x for x in k):
             raise ValueError(f'set {set_name}: a cell needs {", ".join(UNIT_FIELDS)}: {u}')
@@ -476,6 +538,8 @@ def plan(
     node = doc.get('node')
     if not isinstance(node, str) or not node:
         raise ValueError('plan.json needs `node`, the npm package directory that pins Playwright')
+    if has_line_break(node):
+        raise ValueError(f'plan.json: node {node!r} holds a line break')
     if remeasure is not None:
         wanted = {tuple(c[f] for f in UNIT_FIELDS) for c in remeasure.get('cells', [])}
         units = [u for u in units if tuple(u[f] for f in UNIT_FIELDS) in wanted]
@@ -531,12 +595,16 @@ def check_provenance(
     is_ancestor: Callable[[str], bool],
 ) -> list[str]:
     """Every entry the head adds or whose baseline, budget, tier, headroom or
-    source differs from the base must match a signed calibration file; a gated
-    or exact entry leaves only through `retired`; every calibration file is
-    named by an entry."""
+    source differs from the base must match a signed calibration file, every
+    entry when the file's runner, headroom or floor differs; a gated or exact
+    entry leaves only through `retired`; every calibration file is named by an
+    entry."""
     errors = []
     base_entries = {key(e): e for e in base.get('budgets', [])}
     head_entries = {key(e): e for e in head.get('budgets', [])}
+    # No entry holds these, and each changes how every entry gates.
+    moved = any(head.get(f) != base.get(f) for f in ('headroom', 'floor'))
+    file_edit = moved or head.get('runner') != base.get('runner')
     files: dict[str, tuple[dict | None, str | None]] = {}
     named = set()
     for k, e in head_entries.items():
@@ -544,7 +612,7 @@ def check_provenance(
         if m:
             named.add(m.group(1))
         b = base_entries.get(k)
-        if b is not None and all(e.get(f) == b.get(f) for f in CHANGE_FIELDS):
+        if b is not None and not file_edit and all(e.get(f) == b.get(f) for f in CHANGE_FIELDS):
             continue
         name = key_text(k)
         if not m:
@@ -559,7 +627,7 @@ def check_provenance(
                 errors.append(files[run_id][1])
         doc = files[run_id][0]
         if doc is not None:
-            errors.extend(f'{name}: {x}' for x in entry_provenance(head, e, b, doc))
+            errors.extend(f'{name}: {x}' for x in entry_provenance(head, e, b, doc, moved))
     retired = {key(r): r for r in head.get('retired', []) if all(f in r for f in KEY_FIELDS)}
     for k, b in base_entries.items():
         if k in head_entries or b.get('tier') == 'reported':
@@ -596,7 +664,10 @@ def load_calibration(run_id, calibrations, repo, runner, head_sha, verify, is_an
     return doc, None
 
 
-def entry_provenance(head: dict, e: dict, b: dict | None, doc: dict) -> list[str]:
+def entry_provenance(head: dict, e: dict, b: dict | None, doc: dict, file_moved: bool) -> list[str]:
+    """Why entry e of head does not match calibration doc. With file_moved
+    (the file's headroom or floor differs from the base's), a budget above
+    the base's needs `accepted` even when its baseline did not rise."""
     cells = {key(c): c for c in doc.get('cells', [])}
     c = cells.get(key(e))
     run_id = doc.get('run_id')
@@ -629,6 +700,13 @@ def entry_provenance(head: dict, e: dict, b: dict | None, doc: dict) -> list[str
     if b is not None and is_number(b.get('baseline')) and is_number(e.get('baseline')):
         if e['baseline'] > b['baseline'] and not str(e.get('accepted', '')).strip():
             out.append(f'raises its baseline from {b["baseline"]} without `accepted`')
+    raised = b is not None and is_number(b.get('budget')) and is_number(e.get('budget'))
+    if file_moved and raised and e['budget'] > b['budget']:
+        if not str(e.get('accepted', '')).strip():
+            out.append(
+                f'the file headroom or floor raises its budget from {b["budget"]} '
+                f'to {e["budget"]} without `accepted`'
+            )
     return out
 
 
@@ -716,6 +794,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     mode.add_argument('--plan', metavar='PLAN', help='write the measure matrix of plan.json')
     mode.add_argument('--bench', metavar='DIR', help='write the chart points of the results in DIR')
     p.add_argument('--set', help='the plan.json set to measure')
+    p.add_argument(
+        '--plan-doc',
+        help='plan.json: fail a gated or exact entry no set lists, or that --set and --only '
+        'list and no shard measured',
+    )
     p.add_argument('--only', default='', help='comma or space separated scenarios to keep')
     p.add_argument('--runs', type=int, default=1, help='how many times to measure the set')
     p.add_argument('--remeasure', help="compare's remeasure.json: plan only its cells")
@@ -754,6 +837,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         need = ('budgets', 'results')
     else:
         need = ('budgets', 'base', 'results', 'calibrations', 'repo', 'head', 'remeasure_out')
+        need += ('plan_doc', 'set')
     missing = [f'--{n.replace("_", "-")}' for n in need if not getattr(a, n)]
     if missing:
         p.error(f'missing {", ".join(missing)}')
@@ -767,6 +851,8 @@ def load_base(path: str) -> dict:
 
 def file_errors(a: argparse.Namespace, head: dict) -> list[str]:
     errors = check_rule(head)
+    if a.plan_doc:
+        errors += check_plan(head, load(a.plan_doc))
     errors += check_provenance(
         head,
         load_base(a.base),
@@ -809,16 +895,26 @@ def run_calibrate(a: argparse.Namespace) -> int:
     return 0
 
 
+def github_output(name: str, value: str) -> str:
+    """One $GITHUB_OUTPUT value in the `name<<DELIMITER` form, whose random
+    delimiter no value can end early."""
+    delimiter = f'ghadelimiter_{uuid.uuid4()}'
+    return f'{name}<<{delimiter}\n{value}\n{delimiter}\n'
+
+
 def run_plan(a: argparse.Namespace) -> int:
     only = a.only.replace(',', ' ').split()
     remeasure = load(a.remeasure) if a.remeasure else None
     matrix = plan(load(a.plan), a.set, only=only, runs=a.runs, remeasure=remeasure)
     pathlib.Path(a.out).write_text(json.dumps({'include': matrix['include']}) + '\n')
     if a.outputs:
+        written = {
+            'matrix': json.dumps({'include': matrix['include']}),
+            'node': matrix['node'],
+            'scenarios': ' '.join(matrix['scenarios']),
+        }
         with pathlib.Path(a.outputs).open('a') as f:
-            f.write(f'matrix={json.dumps({"include": matrix["include"]})}\n')
-            f.write(f'node={matrix["node"]}\n')
-            f.write(f'scenarios={" ".join(matrix["scenarios"])}\n')
+            f.writelines(github_output(name, value) for name, value in written.items())
     print(
         f'{a.out}: {len(matrix["include"])} jobs over {", ".join(matrix["scenarios"]) or "nothing"}'
     )
@@ -846,7 +942,10 @@ def run(a: argparse.Namespace) -> int:
         out = verdict(budgets, results, merge_results(a.verdict, a.prefix, 'remeasure'))
     else:
         errors = file_errors(a, budgets)
-        out = compare(budgets, results)
+        only = a.only.replace(',', ' ').split()
+        matrix = plan(load(a.plan_doc), a.set, only=only)
+        units = {unit_key(c) for job in matrix['include'] for c in job['cells']}
+        out = compare(budgets, results, units)
         out.failures = errors + out.failures
         scenarios = sorted({c['scenario'] for c in out.remeasure})
         doc = {'cells': out.remeasure, 'scenarios': scenarios}

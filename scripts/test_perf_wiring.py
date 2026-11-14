@@ -76,6 +76,12 @@ class PerfCi(unittest.TestCase):
                 self.assertEqual(step['env']['PREFIX'], '${{ needs.plan.outputs.prefix }}')
                 self.assertIn('--prefix "$PREFIX"', step['run'])
 
+    def test_compare_judges_against_the_set_the_plan_measured(self):
+        step = next(s for s in self.jobs['compare']['steps'] if s.get('name') == 'Compare')
+        self.assertEqual(step['env']['ONLY'], '${{ inputs.only }}')
+        gate = step['run'].split('--remeasure-out')[0]
+        self.assertIn('--plan-doc tests/perf/plan.json --set "$SET" --only "$ONLY"', gate)
+
 
 class Release(unittest.TestCase):
     def internal(self) -> set[str]:
