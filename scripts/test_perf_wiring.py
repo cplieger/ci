@@ -8,6 +8,7 @@ import subprocess
 import unittest
 from pathlib import Path
 
+import perf_gate
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -81,6 +82,13 @@ class PerfCi(unittest.TestCase):
         self.assertEqual(step['env']['ONLY'], '${{ inputs.only }}')
         gate = step['run'].split('--remeasure-out')[0]
         self.assertIn('--plan-doc tests/perf/plan.json --set "$SET" --only "$ONLY"', gate)
+
+    def test_the_sets_check_plan_counts_are_the_sets_the_workflows_gate(self):
+        plan = next(s for s in self.jobs['plan']['steps'] if s.get('id') == 'plan')
+        on_a_pull_request = re.findall(r"^\s*SET='([^']+)'$", plan['run'], re.MULTILINE)
+        weekly = load('weekly-perf.yaml')['jobs']['perf']['with']['set']
+        self.assertEqual(on_a_pull_request, ['pr'])
+        self.assertEqual(set(perf_gate.RUN_SETS), {*on_a_pull_request, weekly})
 
 
 class Release(unittest.TestCase):

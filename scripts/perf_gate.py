@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import pathlib
 import re
 import statistics
@@ -61,7 +62,17 @@ def family(metric: str) -> str:
 
 
 def is_number(x: object) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool)
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def refuse_constant(name: str) -> float:
+    raise ValueError(f'{name} is not a finite number')
+
+
+def loads(text: str) -> Any:
+    """JSON without NaN or Infinity, which pass every comparison a budget
+    makes and so would ungate a cell."""
+    return json.loads(text, parse_constant=refuse_constant)
 
 
 def headroom_cap(metric: str) -> float:
@@ -177,12 +188,11 @@ class Outcome:
     six: list[dict] = dataclasses.field(default_factory=list)
 
 
-def compare(budgets: dict, results: dict, units: set[tuple] | None = None) -> Outcome:
+def compare(budgets: dict, results: dict, units: dict | None = None) -> Outcome:
     """Judge each measured cell on its median of three. A gated cell over its
     budget is listed in `remeasure`, never failed here; an exact count that
-    differs from its budget fails, and so does a gated or exact entry of a
-    unit (`unit_key`) in `units`, the cells this call planned, that no shard
-    measured."""
+    differs from its budget fails, and so does a gated or exact entry no
+    shard measured whose unit and window `units` (`planned_windows`) holds."""
     out = Outcome(runner=results.get('runner', ''))
     out.runner_mismatch = out.runner != budgets.get('runner')
     entries = {key(e): e for e in budgets.get('budgets', [])}
@@ -204,7 +214,7 @@ def compare(budgets: dict, results: dict, units: set[tuple] | None = None) -> Ou
         out.failures.extend(
             f'{key_text(k)}: a {e["tier"]} entry of the measured set that no shard measured'
             for k, e in entries.items()
-            if e.get('tier') != 'reported' and unit_key(e) in units and k not in measured
+            if e.get('tier') != 'reported' and planned(units, e) and k not in measured
         )
     return out
 
@@ -458,10 +468,42 @@ MAX_JOBS = 256
 SHARD_NAME = r'(?:run-\d+-)?shard-\d+-of-\d+'
 
 
+# The sets a workflow gates: perf-ci.yaml's pull-request default and
+# weekly-perf.yaml's; test_perf_wiring holds this equal to both.
+RUN_SETS = ('pr', 'full')
+
+
 def unit_key(d: dict) -> tuple:
-    """What one measure job runs for a cell: its scenario, scale, engine and
-    width, every window and metric of them."""
+    """A plan cell's scenario, scale, engine and width. A measure job runs
+    every window and metric of it, or only the windows its `windows` lists."""
     return tuple(d.get(f) for f in UNIT_FIELDS)
+
+
+def windows_error(u: dict) -> str | None:
+    w = u.get('windows')
+    if w is None:
+        return None
+    ok = isinstance(w, list) and w and all(isinstance(x, str) and x for x in w)
+    if not ok or len(set(w)) != len(w):
+        return f'windows must be a non-empty list of distinct window names, not {w!r}'
+    return None
+
+
+def planned_windows(cells: Iterable[dict]) -> dict[tuple, set[str] | None]:
+    """Each planned unit with the windows its cells list, None for every window."""
+    out: dict[tuple, set[str] | None] = {}
+    for c in cells:
+        k, w = unit_key(c), c.get('windows')
+        if w is None or (k in out and out[k] is None):
+            out[k] = None
+        else:
+            out[k] = {*out.get(k, set()), *w}
+    return out
+
+
+def planned(units: dict[tuple, set[str] | None], e: dict) -> bool:
+    k = unit_key(e)
+    return k in units and (units[k] is None or e.get('window') in units[k])
 
 
 def has_line_break(x: object) -> bool:
@@ -475,19 +517,37 @@ def has_line_break(x: object) -> bool:
 
 
 def check_plan(budgets: dict, doc: dict) -> list[str]:
-    """A gated or exact entry whose unit no set of plan.json lists leaves the
-    gate unmeasured, so it fails unless `retired` names its key."""
-    listed = {
-        unit_key(u) for spec in (doc.get('sets') or {}).values() for u in spec.get('cells') or []
-    }
+    """A gated or exact entry whose unit and window no set of RUN_SETS lists
+    leaves the gate unmeasured, so it fails unless `retired` names its key.
+    A set or cell of any set that is not an object is an error line."""
+    sets = doc.get('sets', {})
+    if not isinstance(sets, dict):
+        return ['plan.json: sets must be an object of named sets']
+    errors, cells = [], []
+    for name, spec in sets.items():
+        if not isinstance(spec, dict):
+            errors.append(f'plan.json: set {name} must be an object')
+            continue
+        units = spec.get('cells') or []
+        if not isinstance(units, list):
+            errors.append(f'plan.json: set {name}: cells must be a list')
+            continue
+        for u in units:
+            if not isinstance(u, dict):
+                errors.append(f'plan.json: set {name}: a cell must be an object, not {u!r}')
+            elif windows_error(u):
+                errors.append(f'plan.json: set {name}: {key_text(unit_key(u))}: {windows_error(u)}')
+            elif name in RUN_SETS:
+                cells.append(u)
+    units = planned_windows(cells)
     retired = {key(r) for r in budgets.get('retired', []) if all(f in r for f in KEY_FIELDS)}
-    return [
-        f'{key_text(key(e))}: a {e["tier"]} entry no set of plan.json measures, '
-        'and retired does not name it'
+    return errors + [
+        f'{key_text(key(e))}: a {e["tier"]} entry no set of plan.json measures '
+        f'({", ".join(RUN_SETS)}), and retired does not name it'
         for e in budgets.get('budgets', [])
         if e.get('tier') != 'reported'
         and all(f in e for f in KEY_FIELDS)
-        and unit_key(e) not in listed
+        and not planned(units, e)
         and key(e) not in retired
     ]
 
@@ -501,24 +561,29 @@ def plan(
     remeasure: dict | None = None,
 ) -> dict:
     """The measure matrix of one set of plan.json: its cells (a scenario at a
-    scale, engine and width, every window) split into at most `shards` jobs,
-    longest first onto the least-loaded shard, repeated `runs` times. With
-    `remeasure`, only the cells compare listed, once each. `include` alone is
-    the GitHub matrix: any other key there would be a matrix dimension."""
-    sets = doc.get('sets') or {}
-    if set_name not in sets:
+    scale, engine and width, every window or those its `windows` lists) split
+    into at most `shards` jobs, longest first onto the least-loaded shard,
+    repeated `runs` times. With `remeasure`, only the cells compare listed,
+    once each. `include` alone is the GitHub matrix: any other key there
+    would be a matrix dimension."""
+    sets = doc.get('sets', {})
+    if not isinstance(sets, dict) or set_name not in sets:
         raise ValueError(f'plan.json has no set {set_name!r}')
     spec = sets[set_name]
+    if not isinstance(spec, dict):
+        raise TypeError(f'set {set_name} must be an object, not {spec!r}')
     shards = spec.get('shards')
     if not isinstance(shards, int) or isinstance(shards, bool) or shards < 1:
         raise ValueError(f'set {set_name}: shards must be a positive integer, not {shards!r}')
     if not isinstance(runs, int) or runs < 1:
         raise ValueError(f'runs must be a positive integer, not {runs!r}')
     units = spec.get('cells') or []
-    if not units:
+    if not units or not isinstance(units, list):
         raise ValueError(f'set {set_name} lists no cells')
     seen = set()
     for u in units:
+        if not isinstance(u, dict):
+            raise TypeError(f'set {set_name}: a cell must be an object, not {u!r}')
         # Cell fields reach $GITHUB_OUTPUT and the job's shell.
         if has_line_break(u):
             raise ValueError(f'set {set_name}: a cell field holds a line break: {u!r}')
@@ -530,6 +595,8 @@ def plan(
         seen.add(k)
         if not is_number(u.get('seconds')) or u['seconds'] <= 0:
             raise ValueError(f'set {set_name}: {key_text(k)} needs its seconds per cell')
+        if windows_error(u):
+            raise ValueError(f'set {set_name}: {key_text(k)}: {windows_error(u)}')
     if only:
         missing = sorted(set(only) - {u['scenario'] for u in units})
         if missing:
@@ -602,7 +669,7 @@ def check_provenance(
     errors = []
     base_entries = {key(e): e for e in base.get('budgets', [])}
     head_entries = {key(e): e for e in head.get('budgets', [])}
-    # No entry holds these, and each changes how every entry gates.
+    # The file-level maps sit outside CHANGE_FIELDS, and each changes how every entry gates.
     moved = any(head.get(f) != base.get(f) for f in ('headroom', 'floor'))
     file_edit = moved or head.get('runner') != base.get('runner')
     files: dict[str, tuple[dict | None, str | None]] = {}
@@ -653,7 +720,7 @@ def load_calibration(run_id, calibrations, repo, runner, head_sha, verify, is_an
     if failure:
         return None, f'calibration {run_id}: the bundle does not verify: {failure}'
     try:
-        doc = json.loads(blob.read_text())
+        doc = loads(blob.read_text())
     except ValueError as exc:
         return None, f'calibration {run_id}: {exc}'
     for field, want in (('run_id', run_id), ('repo', repo), ('runner', runner)):
@@ -667,7 +734,8 @@ def load_calibration(run_id, calibrations, repo, runner, head_sha, verify, is_an
 def entry_provenance(head: dict, e: dict, b: dict | None, doc: dict, file_moved: bool) -> list[str]:
     """Why entry e of head does not match calibration doc. With file_moved
     (the file's headroom or floor differs from the base's), a budget above
-    the base's needs `accepted` even when its baseline did not rise."""
+    the base's needs `accepted` even when its baseline did not rise, and a
+    server CPU budget, which is its target, always does."""
     cells = {key(c): c for c in doc.get('cells', [])}
     c = cells.get(key(e))
     run_id = doc.get('run_id')
@@ -701,12 +769,15 @@ def entry_provenance(head: dict, e: dict, b: dict | None, doc: dict, file_moved:
         if e['baseline'] > b['baseline'] and not str(e.get('accepted', '')).strip():
             out.append(f'raises its baseline from {b["baseline"]} without `accepted`')
     raised = b is not None and is_number(b.get('budget')) and is_number(e.get('budget'))
-    if file_moved and raised and e['budget'] > b['budget']:
+    server = family(e['metric']) == SERVER_CPU
+    if (file_moved or server) and raised and e['budget'] > b['budget']:
         if not str(e.get('accepted', '')).strip():
-            out.append(
-                f'the file headroom or floor raises its budget from {b["budget"]} '
-                f'to {e["budget"]} without `accepted`'
+            what = (
+                'raises its target and budget'
+                if server
+                else ('the file headroom or floor raises its budget')
             )
+            out.append(f'{what} from {b["budget"]} to {e["budget"]} without `accepted`')
     return out
 
 
@@ -729,7 +800,7 @@ def cosign_verify(blob, bundle, identity: str = IDENTITY) -> str | None:
 
 
 def load(path: str) -> dict:
-    return json.loads(pathlib.Path(path).read_text())
+    return loads(pathlib.Path(path).read_text())
 
 
 def result_files(
@@ -764,7 +835,7 @@ def merge(paths: list[pathlib.Path]) -> dict:
     merged['seconds'] = []
     seen = set()
     for p in paths:
-        doc = json.loads(p.read_text())
+        doc = loads(p.read_text())
         if merged['runner'] is None:
             merged['runner'] = doc.get('runner')
         elif doc.get('runner') != merged['runner']:
@@ -796,8 +867,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument('--set', help='the plan.json set to measure')
     p.add_argument(
         '--plan-doc',
-        help='plan.json: fail a gated or exact entry no set lists, or that --set and --only '
-        'list and no shard measured',
+        help='plan.json: fail a gated or exact entry neither the pr nor the full set lists, '
+        'or that --set and --only list and no shard measured',
     )
     p.add_argument('--only', default='', help='comma or space separated scenarios to keep')
     p.add_argument('--runs', type=int, default=1, help='how many times to measure the set')
@@ -846,7 +917,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def load_base(path: str) -> dict:
     p = pathlib.Path(path)
-    return json.loads(p.read_text()) if p.is_file() else {'budgets': []}
+    return loads(p.read_text()) if p.is_file() else {'budgets': []}
 
 
 def file_errors(a: argparse.Namespace, head: dict) -> list[str]:
@@ -944,7 +1015,7 @@ def run(a: argparse.Namespace) -> int:
         errors = file_errors(a, budgets)
         only = a.only.replace(',', ' ').split()
         matrix = plan(load(a.plan_doc), a.set, only=only)
-        units = {unit_key(c) for job in matrix['include'] for c in job['cells']}
+        units = planned_windows(c for job in matrix['include'] for c in job['cells'])
         out = compare(budgets, results, units)
         out.failures = errors + out.failures
         scenarios = sorted({c['scenario'] for c in out.remeasure})
@@ -960,7 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
     a = parse_args(argv)
     try:
         return run(a)
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f'::error::perf_gate: {exc!r}', file=sys.stderr)
         return 1
 

@@ -120,6 +120,21 @@ class TheRule(unittest.TestCase):
                 doc = budgets([entry(budget=50.0)], headroom={'cpu_ms': h})
                 self.assertTrue(perf_gate.check_rule(doc))
 
+    def test_a_non_finite_budget_baseline_headroom_or_floor_fails(self):
+        nan, inf = float('nan'), float('inf')
+        cases = {
+            'NaN budget': budgets([entry(budget=nan)]),
+            'NaN baseline': budgets([entry(baseline=nan, budget=50.0)]),
+            'Infinity headroom': budgets([entry(budget=inf)], headroom={'cpu_ms': inf}),
+            'Infinity floor': budgets([entry(budget=inf)], floor={'cpu_ms': inf}),
+            'NaN server target': budgets(
+                [entry('server_cpu_ms', baseline=20.0, budget=nan, target=nan)]
+            ),
+        }
+        for name, doc in cases.items():
+            with self.subTest(name):
+                self.assertTrue(perf_gate.check_rule(doc))
+
 
 class Compare(unittest.TestCase):
     def test_an_exact_count_that_differs_from_its_baseline_fails_at_compare(self):
@@ -210,14 +225,36 @@ class Compare(unittest.TestCase):
 
     def test_a_gated_or_exact_entry_the_set_lists_and_no_shard_measured_fails(self):
         b = budgets([entry(), entry('dom', 'exact', 640), entry('frames', 'reported', 9.0)])
-        units = {perf_gate.unit_key(CELL)}
+        units = perf_gate.planned_windows([unit('files', 80)])
         out = perf_gate.compare(b, results([]), units)
         self.assertEqual(len(out.failures), 2)
         self.assertTrue(all('no shard measured' in f for f in out.failures))
         measured = [cell(), cell('dom', (640,) * 3, kind='count')]
         self.assertEqual(perf_gate.compare(b, results(measured), units).failures, [])
-        self.assertEqual(perf_gate.compare(b, results([]), set()).failures, [])
+        self.assertEqual(perf_gate.compare(b, results([]), {}).failures, [])
         self.assertEqual(perf_gate.compare(b, results([], runner='x'), units).failures, [])
+
+    def test_a_cell_that_lists_windows_needs_a_result_only_for_those(self):
+        # The pr set measures WebKit x10 cold only; budgets.json holds the
+        # full set's WebKit live CPU and back count too.
+        webkit = {'engine': 'webkit'}
+        doc = {
+            'node': '.',
+            'sets': {
+                'pr': {'shards': 1, 'cells': [unit('files', 25, windows=['cold'], **webkit)]},
+            },
+        }
+        matrix = perf_gate.plan(doc, 'pr')
+        units = perf_gate.planned_windows(c for job in matrix['include'] for c in job['cells'])
+        cold = {**entry('rss_mb', baseline=200.0, budget=250.0), **webkit}
+        live = {**entry(), **webkit, 'window': 'live'}
+        back = {**entry('dom', 'exact', 640), **webkit, 'window': 'back'}
+        b = budgets([cold, live, back])
+        measured = results([{**cell('rss_mb', (200.0,) * 3), **webkit}])
+        self.assertEqual(perf_gate.compare(b, measured, units).failures, [])
+        dropped = perf_gate.compare(b, results([]), units).failures
+        self.assertEqual(len(dropped), 1)
+        self.assertTrue(dropped[0].startswith('files/x10/webkit/desktop/cold/rss_mb:'))
 
 
 class Verdict(unittest.TestCase):
@@ -564,6 +601,32 @@ class Provenance(unittest.TestCase):
         self.assertTrue(errors)
         self.assertIn('calibration 100', ' '.join(errors))
 
+    def test_a_server_cpu_target_and_budget_raised_together_need_accepted(self):
+        def server(target, **kw):
+            return entry('server_cpu_ms', baseline=20.0, budget=target, target=target, **kw)
+
+        srv = cal_cell('server_cpu_ms', baseline=20.0, kind='server_cpu')
+        self.write('111', calibration_file([srv]))
+        base = budgets([server(63.0)])
+        head = budgets([server(1000.0)])
+        self.assertEqual(perf_gate.check_rule(head), [])
+        errors = self.check(head, base)
+        self.assertTrue(errors)
+        self.assertIn('target', ' '.join(errors))
+        self.assertIn('accepted', ' '.join(errors))
+        why = budgets([server(1000.0, accepted='the export reads the whole log')])
+        self.assertEqual(self.check(why, base), [])
+        self.assertEqual(self.check(budgets([server(40.0)]), base), [])
+
+    def test_a_calibration_file_holding_nan_or_infinity_fails(self):
+        for constant in (float('nan'), float('inf')):
+            with self.subTest(constant=constant):
+                self.write('111', calibration_file([cal_cell(baseline=900.0, spread=constant)]))
+                base = budgets([entry(baseline=1000.0, source=RUN_URL + '100')])
+                errors = self.check(budgets([entry(baseline=900.0)]), base)
+                self.assertTrue(errors)
+                self.assertIn('not a finite number', ' '.join(errors))
+
 
 class Coverage(unittest.TestCase):
     def test_a_gated_or_exact_entry_no_set_lists_fails_unless_retired(self):
@@ -579,6 +642,44 @@ class Coverage(unittest.TestCase):
             {**gone, 'metric': m, 'reason': 'the view was removed'} for m in ('cpu_ms', 'dom')
         ]
         self.assertEqual(perf_gate.check_plan({**doc, 'retired': retired}, PLAN), [])
+
+    def test_a_unit_only_a_set_no_workflow_runs_lists_fails(self):
+        doc = budgets([entry()])
+        docs = {'shards': 1, 'cells': [unit('docs', 75)]}
+        files = {'shards': 1, 'cells': [unit('files', 80)]}
+        spare = {'node': '.', 'sets': {'pr': docs, 'full': docs, 'spare': files}}
+        errors = perf_gate.check_plan(doc, spare)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('no set of plan.json measures', errors[0])
+        weekly = {'node': '.', 'sets': {'pr': docs, 'full': files}}
+        self.assertEqual(perf_gate.check_plan(doc, weekly), [])
+
+    def test_a_window_no_run_set_lists_for_its_unit_fails(self):
+        webkit = {'engine': 'webkit'}
+        cold = {**entry('rss_mb', baseline=200.0, budget=250.0), **webkit}
+        live = {**entry(), **webkit, 'window': 'live'}
+        doc = budgets([cold, live])
+        pr = {'shards': 1, 'cells': [unit('files', 25, windows=['cold'], **webkit)]}
+        chromium = {'shards': 1, 'cells': [unit('files', 80)]}
+        errors = perf_gate.check_plan(doc, {'node': '.', 'sets': {'pr': pr, 'full': chromium}})
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(errors[0].startswith('files/x10/webkit/desktop/live/cpu_ms:'))
+        full = {'shards': 1, 'cells': [unit('files', 25, **webkit)]}
+        self.assertEqual(
+            perf_gate.check_plan(doc, {'node': '.', 'sets': {'pr': pr, 'full': full}}), []
+        )
+
+    def test_a_set_or_cell_that_is_not_an_object_is_an_error_line(self):
+        for sets in (
+            [],
+            {'full': []},
+            {'full': {'cells': 'files'}},
+            {'full': {'cells': ['files']}},
+            {'full': {'cells': [unit('files', 80, windows='cold')]}},
+        ):
+            with self.subTest(sets=sets):
+                errors = perf_gate.check_plan(budgets([entry()]), {'node': '.', 'sets': sets})
+                self.assertTrue(any(e.startswith('plan.json: ') for e in errors), errors)
 
 
 @unittest.skipUnless(shutil.which('cosign') or os.environ.get('CI'), 'cosign is not installed')
@@ -689,6 +790,22 @@ class Plan(unittest.TestCase):
             with self.subTest(name), self.assertRaisesRegex(ValueError, 'line break'):
                 perf_gate.plan(doc, 'pr')
 
+    def test_a_cell_s_windows_are_a_list_of_distinct_window_names(self):
+        for windows in ([], 'cold', [''], [1], ['cold', 'cold']):
+            cells = [unit('files', 80, windows=windows)]
+            doc = {'node': '.', 'sets': {'pr': {'shards': 1, 'cells': cells}}}
+            with self.subTest(windows=windows), self.assertRaisesRegex(ValueError, 'windows'):
+                perf_gate.plan(doc, 'pr')
+        cells = [unit('files', 80, windows=['cold', 'back'])]
+        doc = {'node': '.', 'sets': {'pr': {'shards': 1, 'cells': cells}}}
+        planned = perf_gate.plan(doc, 'pr')['include'][0]['cells'][0]
+        self.assertEqual(planned['windows'], ['cold', 'back'])
+
+    def test_a_set_or_cell_that_is_not_an_object_fails_the_plan(self):
+        for sets in ({'pr': []}, {'pr': {'shards': 1, 'cells': ['files']}}):
+            with self.subTest(sets=sets), self.assertRaisesRegex(TypeError, 'must be an object'):
+                perf_gate.plan({'node': '.', 'sets': sets}, 'pr')
+
     def test_a_cell_keeps_the_fields_the_harness_reads(self):
         doc = {
             'node': '.',
@@ -790,12 +907,16 @@ class Cli(unittest.TestCase):
         return str(path)
 
     def main(self, *argv):
-        with redirect_stdout(io.StringIO()):
-            return perf_gate.main(list(argv))
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = perf_gate.main(list(argv))
+        self.output = out.getvalue() + err.getvalue()
+        return rc
 
-    def compare(self, cells, *extra, other=None):
+    def compare(self, cells, *extra, other=None, entries=(), **doc):
         b = self.put(
-            'budgets.json', budgets([entry(source=RUN_URL + '100'), entry('dom', 'exact', 640)])
+            'budgets.json',
+            budgets([entry(source=RUN_URL + '100'), entry('dom', 'exact', 640), *entries], **doc),
         )
         if other is None:
             self.put('results/shard-1/results.json', results(cells))
@@ -831,6 +952,34 @@ class Cli(unittest.TestCase):
     def test_compare_fails_on_a_listed_cell_no_shard_measured(self):
         self.assertEqual(self.compare([cell()]), 1)
         self.assertIn('no shard measured', (self.dir / 'summary.md').read_text())
+
+    def test_compare_fails_a_gated_entry_no_set_of_the_plan_measures(self):
+        gone = {**entry(source=RUN_URL + '100'), 'scenario': 'gone'}
+        measured = [cell(), cell('dom', (640,) * 3, kind='count')]
+        self.assertEqual(self.compare(measured, entries=[gone]), 1)
+        self.assertIn('no set of plan.json measures', (self.dir / 'summary.md').read_text())
+        retired = [{**CELL, 'scenario': 'gone', 'metric': 'cpu_ms', 'reason': 'view removed'}]
+        self.assertEqual(self.compare(measured, entries=[gone], retired=retired), 0)
+
+    def test_compare_refuses_nan_or_infinity_in_budgets_or_results(self):
+        measured = [cell(), cell('dom', (640,) * 3, kind='count')]
+        cases = {
+            'NaN budget': ([*measured], [entry(budget=float('nan'), window='live')]),
+            'Infinity rep': ([cell(reps=(float('inf'),) * 3), measured[1]], []),
+        }
+        for name, (cells, entries) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.compare(cells, entries=entries), 1)
+                self.assertIn('is not a finite number', self.output)
+
+    def test_check_file_refuses_a_nan_budget(self):
+        base = self.put('base.json', budgets([entry(source=RUN_URL + '100')]))
+        head = self.put(
+            'budgets.json', budgets([entry(budget=float('nan'), source=RUN_URL + '100')])
+        )
+        argv = ('--check-file', head, '--base', base, '--calibrations', str(self.dir / 'cal'))
+        self.assertEqual(self.main(*argv, '--repo', REPO, '--head', HEAD), 1)
+        self.assertIn('NaN is not a finite number', self.output)
 
     def test_compare_needs_the_plan(self):
         b = self.put('budgets.json', budgets([]))
