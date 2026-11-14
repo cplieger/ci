@@ -10,8 +10,8 @@ import pathlib
 import shutil
 import tempfile
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr, redirect_stdout
-from unittest import mock
 
 import perf_gate
 
@@ -1062,8 +1062,8 @@ class Cli(unittest.TestCase):
         head = self.put('budgets.json', budgets([entry(metric=1, source=RUN_URL + '111')]))
         argv = ('--check-file', head, '--base', base, '--calibrations', str(self.dir / 'cal'))
         with (
-            mock.patch.object(perf_gate, 'cosign_verify', return_value=None),
-            mock.patch.object(perf_gate, 'git_is_ancestor', return_value=True),
+            unittest.mock.patch.object(perf_gate, 'cosign_verify', return_value=None),
+            unittest.mock.patch.object(perf_gate, 'git_is_ancestor', return_value=True),
         ):
             self.assertEqual(self.main(*argv, '--repo', REPO, '--head', HEAD), 1)
         self.assertIn('::error::budgets[0]: missing metric', self.output)
