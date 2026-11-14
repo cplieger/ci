@@ -934,12 +934,21 @@ jobs:
       - name: Alert rules
         uses: ./.cplieger-ci/actions/alert-rules
 
+      # A soft step's outcome is checked as well as its marker: a step killed
+      # whole (the OOM killer takes its shell with the test) writes none. A
+      # step whose id ends in -attempt is retried by a later step.
       - name: Check results
         if: always()
+        env:
+          STEP_OUTCOMES: ${{ toJSON(steps) }}
         run: |
-          if [ -f /tmp/_ci_failures ]; then
+          set -euo pipefail
+          failures="/tmp/_ci_failures"
+          jq -r 'to_entries[] | select(.value.outcome == "failure" and (.key | endswith("-attempt") | not)) | "step " + .key' \
+            <<<"$STEP_OUTCOMES" >> "$failures"
+          if [ -s "$failures" ]; then
             echo "::error::Failed validation steps:"
-            sort -u /tmp/_ci_failures >&2
+            sort -u "$failures" >&2
             exit 1
           fi
           echo "All validation steps passed"
@@ -948,7 +957,8 @@ jobs:
   # and a working-tree gitleaks scan, run exactly once per repo.
   #
   # Soft-gated like the language jobs: one failing check does not hide the
-  # others. CONTRACT: any step added to the block below MUST end with
+  # others. CONTRACT (scripts/test_soft_gate.py): any step added to the block
+  # below has an `id`, so "Check results" sees its outcome, and ends with
   #   || { echo "<step name>" >> /tmp/_ci_failures; exit 1; }
   repo:
     needs: detect
@@ -1014,6 +1024,7 @@ jobs:
       # is not the fix. The regex is scoped to those two labels, so a typo in
       # any other label still fails. Delete the flag once a release ships #682.
       - name: Workflows (actionlint)
+        id: workflows-actionlint
         continue-on-error: true
         run: |
           (
@@ -1027,6 +1038,7 @@ jobs:
       # .github/zizmor.yml with the rationale; none is synced, because a
       # scan of every consumer repo measured all clean at the default persona.
       - name: Audit workflows (zizmor)
+        id: audit-workflows-zizmor
         continue-on-error: true
         run: |
           (
@@ -1037,6 +1049,7 @@ jobs:
       # scan in security-scan.yaml: this one gates, so it stays fast and
       # tree-scoped.
       - name: Scan for secrets (gitleaks)
+        id: scan-for-secrets-gitleaks
         continue-on-error: true
         run: |
           (
@@ -1054,17 +1067,20 @@ jobs:
       # that introduces it. Consumers use the released action because their
       # checkout does not contain cplieger/ci's action directory.
       - name: Comment ratio
+        id: comment-ratio
         if: ${{ github.repository == 'cplieger/ci' }}
         continue-on-error: true
         uses: ./actions/comment-audit
 
       - name: Comment ratio
+        id: comment-ratio-2
         if: ${{ github.repository != 'cplieger/ci' }}
         continue-on-error: true
         uses: cplieger/ci/actions/comment-audit@c736bfa6ca8fa1679f95212a90440919525c40a7 # v3
 
       # No denylist, unlike comment-audit: a NOTICE is owed by every repo.
       - name: NOTICE audit
+        id: notice-audit
         if: ${{ github.repository == 'cplieger/ci' }}
         continue-on-error: true
         uses: ./actions/notice-audit
@@ -1072,6 +1088,7 @@ jobs:
       # The runner resolves every `uses:` at job setup, before any `if:`, so
       # this consumer arm must pin a tag that already contains the action.
       - name: NOTICE audit
+        id: notice-audit-2
         if: ${{ github.repository != 'cplieger/ci' }}
         continue-on-error: true
         uses: cplieger/ci/actions/notice-audit@c736bfa6ca8fa1679f95212a90440919525c40a7 # v3
@@ -1100,6 +1117,7 @@ jobs:
           ) || { echo "List the dashboards" >> /tmp/_ci_failures; exit 1; }
 
       - name: Dashboard check
+        id: dashboard-check
         # Every step using the ci source repeats the checkout's guard (scripts/test_workflow_source.py).
         if: ${{ hashFiles('grafana-dashboard.json', 'grafana-dashboard-*.json') != '' && steps.dashboards.outputs.files != '' }}
         continue-on-error: true
@@ -1107,12 +1125,21 @@ jobs:
         with:
           path: ${{ steps.dashboards.outputs.files }}
 
+      # A soft step's outcome is checked as well as its marker: a step killed
+      # whole (the OOM killer takes its shell with the test) writes none. A
+      # step whose id ends in -attempt is retried by a later step.
       - name: Check results
         if: always()
+        env:
+          STEP_OUTCOMES: ${{ toJSON(steps) }}
         run: |
-          if [ -f /tmp/_ci_failures ]; then
+          set -euo pipefail
+          failures="/tmp/_ci_failures"
+          jq -r 'to_entries[] | select(.value.outcome == "failure" and (.key | endswith("-attempt") | not)) | "step " + .key' \
+            <<<"$STEP_OUTCOMES" >> "$failures"
+          if [ -s "$failures" ]; then
             echo "::error::Failed validation steps:"
-            sort -u /tmp/_ci_failures >&2
+            sort -u "$failures" >&2
             exit 1
           fi
           echo "All validation steps passed"
@@ -1241,9 +1268,9 @@ jobs:
 
   # Config + tooling/docs lint for repos with no go.mod/jsr.json/Dockerfile;
   # detect owns the routing. It covers their shell (lint, format, unit tests),
-  # YAML, TOML and the probes. Soft-gated like shell-ci.yaml: each step records
-  # its name to /tmp/_ci_failures on failure and the final step fails the job
-  # if any did.
+  # YAML, TOML and the probes. Soft-gated like shell-ci.yaml: each step has an
+  # id and records its name to /tmp/_ci_failures on failure, and the final step
+  # fails the job on any failed outcome.
   scripts:
     needs: detect
     if: ${{ needs.detect.outputs.run_scripts == 'true' }}
@@ -1302,6 +1329,7 @@ jobs:
           echo "$bin" >> "$GITHUB_PATH"
 
       - name: Lint shell scripts (shellcheck)
+        id: lint-shell-scripts-shellcheck
         continue-on-error: true
         run: |
           (
@@ -1315,6 +1343,7 @@ jobs:
           ) || { echo "Lint shell scripts (shellcheck)" >> /tmp/_ci_failures; exit 1; }
 
       - name: Format check shell scripts (shfmt)
+        id: format-check-shell-scripts-shfmt
         continue-on-error: true
         run: |
           (
@@ -1329,6 +1358,7 @@ jobs:
 
       # shell-ci.yaml's step of the same name owns this body's shape.
       - name: Run shell unit tests
+        id: run-shell-unit-tests
         continue-on-error: true
         run: |
           (
@@ -1344,6 +1374,7 @@ jobs:
       # line cap. Non-strict, so line-length etc. surface as warnings (exit 0),
       # not failures — matching the private repos' bespoke behaviour.
       - name: Lint YAML (yamllint)
+        id: lint-yaml-yamllint
         continue-on-error: true
         run: |
           (
@@ -1355,6 +1386,7 @@ jobs:
           ) || { echo "Lint YAML (yamllint)" >> /tmp/_ci_failures; exit 1; }
 
       - name: Validate TOML
+        id: validate-toml
         continue-on-error: true
         run: |
           (
@@ -1375,6 +1407,7 @@ jobs:
       # cliff-config edit) cannot merge if the new combination breaks the
       # release-gate contract.
       - name: Probe git-cliff bump semantics
+        id: probe-git-cliff-bump-semantics
         continue-on-error: true
         run: |
           (
@@ -1394,6 +1427,7 @@ jobs:
       # prune list, the classification loop, the probe folders or the OS file
       # rule cannot merge if it breaks the pinned contract.
       - name: Probe lane and web-probe shell semantics
+        id: probe-lane-and-web-probe-shell-semantics
         continue-on-error: true
         run: |
           (
@@ -1412,6 +1446,7 @@ jobs:
       # release.yaml at runtime and drives it against a stub curl, so what is
       # tested cannot drift away from what ships.
       - name: Probe verify-publish shell semantics
+        id: probe-verify-publish-shell-semantics
         continue-on-error: true
         run: |
           (
@@ -1428,6 +1463,7 @@ jobs:
       # the BUILD_VERSION stamp. Same extract-and-execute shape as the probe
       # above, for the same reason.
       - name: Probe docker-release shell semantics
+        id: probe-docker-release-shell-semantics
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -1442,6 +1478,7 @@ jobs:
       # The release path-significance script and the ci-source checkout that
       # ships it; `-f` + `bash`, so a non-executable file cannot skip silently.
       - name: Probe release path significance
+        id: probe-release-path-significance
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -1454,6 +1491,7 @@ jobs:
           ) || { echo "Probe release path significance" >> /tmp/_ci_failures; exit 1; }
 
       - name: Probe reconciliation recogniser
+        id: probe-reconciliation-recogniser
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -1466,6 +1504,7 @@ jobs:
           ) || { echo "Probe reconciliation recogniser" >> /tmp/_ci_failures; exit 1; }
 
       - name: Probe release notes renderer
+        id: probe-release-notes-renderer
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -1478,6 +1517,7 @@ jobs:
           ) || { echo "Probe release notes renderer" >> /tmp/_ci_failures; exit 1; }
 
       - name: Probe release detect state machine
+        id: probe-release-detect-state-machine
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -1490,6 +1530,7 @@ jobs:
           ) || { echo "Probe release detect state machine" >> /tmp/_ci_failures; exit 1; }
 
       - name: Probe two-branch release model end to end
+        id: probe-two-branch-release-model-end-to-end
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -1505,6 +1546,7 @@ jobs:
       # here; the probe extracts and runs them against fixture checkouts.
       # Gated on `-f` + `bash` because an `-x` gate would skip silently.
       - name: Probe image-test slot
+        id: probe-image-test-slot
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -1521,6 +1563,7 @@ jobs:
       # Gated on `-f` + `bash`: the synced files are tracked 100644, so an `-x`
       # gate would skip silently and report green.
       - name: Probe shell unit-test harness
+        id: probe-shell-unit-test-harness
         continue-on-error: true
         run: |
           (
@@ -1535,6 +1578,7 @@ jobs:
       # "Comment ratio" step SKIPs and this probe is the scanner's only executor at
       # the source. Gated on `-f` + `python3` for the harness step's reason.
       - name: Probe comment-ratio gate
+        id: probe-comment-ratio-gate
         continue-on-error: true
         run: |
           (
@@ -1548,6 +1592,7 @@ jobs:
       # The NOTICE gate does run here (no denylist), but only against this
       # repo's own NOTICE; the probe is what exercises its refusals.
       - name: Probe NOTICE gate
+        id: probe-notice-gate
         continue-on-error: true
         run: |
           (
@@ -1562,6 +1607,7 @@ jobs:
       # in this repo, so its fail-closed contract is measured here or nowhere.
       # Go is on the runner image; the fixture module needs no network.
       - name: Probe license collector
+        id: probe-license-collector
         continue-on-error: true
         run: |
           (
@@ -1575,6 +1621,7 @@ jobs:
       # actions/dashboard-check runs only in repos that ship a dashboard, which
       # this one does not, so its rules and its CUE vet are exercised here.
       - name: Probe dashboard check
+        id: probe-dashboard-check
         continue-on-error: true
         run: |
           (
@@ -1589,12 +1636,21 @@ jobs:
             fi
           ) || { echo "Probe dashboard check" >> /tmp/_ci_failures; exit 1; }
 
+      # A soft step's outcome is checked as well as its marker: a step killed
+      # whole (the OOM killer takes its shell with the test) writes none. A
+      # step whose id ends in -attempt is retried by a later step.
       - name: Check results
         if: always()
+        env:
+          STEP_OUTCOMES: ${{ toJSON(steps) }}
         run: |
-          if [ -f /tmp/_ci_failures ]; then
+          set -euo pipefail
+          failures="/tmp/_ci_failures"
+          jq -r 'to_entries[] | select(.value.outcome == "failure" and (.key | endswith("-attempt") | not)) | "step " + .key' \
+            <<<"$STEP_OUTCOMES" >> "$failures"
+          if [ -s "$failures" ]; then
             echo "::error::Failed validation steps:"
-            sort -u /tmp/_ci_failures >&2
+            sort -u "$failures" >&2
             exit 1
           fi
           echo "All validation steps passed"
