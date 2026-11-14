@@ -19,6 +19,7 @@ This page lists what each reusable workflow and composite action in cplieger/ci 
 | a `package.json` or `jsr.json` in the `web/` folder of a `go-nested` module | `ts-nested` | `ts-ci.yaml` once per such folder |
 | a `Dockerfile`, or a root `go.mod` or `jsr.json` and a tracked `.sh` file outside `node_modules`, `vendor`, `testdata` and `dist` | `shell` | `shell-ci.yaml`, with hadolint only when there is a `Dockerfile` |
 | any files | `deadset` | `deadset-ci.yaml` at the repository root, and, when the root has a `go.mod`, once per nested Go module folder with tracked Go files |
+| `tests/perf/plan.json` | `perf` | `perf-ci.yaml`, [the performance gate](#the-performance-gate), which measures the plan's `pr` set on a pull request or in a merge queue and nothing on a push |
 | a `Dockerfile` | `docker`, `docker-arm64` | an image build on `amd64`, and on `arm64` in public repositories, with no push and no scan; the `docker` job also builds each `images/<name>/Dockerfile` beside the `Dockerfile` on `amd64` into the Docker daemon (the release's runner images, below). When that build passes and the repository has a root `go.mod` and a tracked `*_integration_test.go` file, the job then runs the root module's `go test -tags integration` |
 | `*.py` files | `python` | Ruff |
 | shell scripts or workflow files, and no `go.mod`, `jsr.json` or `Dockerfile` | `scripts` | shellcheck, shfmt, `tests/shell/run.sh` when the repository has one, yamllint, a TOML check, and the probe scripts present in the repository |
@@ -45,14 +46,15 @@ The integration tests run when that build passes and the repository has a root `
 
 ## Choosing the runner
 
-`ci.yaml`, `security-scan.yaml` and the four workflows `ci.yaml` calls (`go-ci.yaml`, `ts-ci.yaml`, `shell-ci.yaml` and `deadset-ci.yaml`) take a `runner` input, a runner label that is empty by default. Empty runs every job on `ubuntu-26.04`. `ci.yaml` passes its input on to the workflows it calls, and the synced `ci.yml` and `security.yml` pass the repository's `CI_RUNNER` variable, so setting that variable to a self-hosted runner's label moves the repository's jobs there, and deleting it moves them back.
+`ci.yaml`, `security-scan.yaml` and the five workflows `ci.yaml` calls (`go-ci.yaml`, `ts-ci.yaml`, `shell-ci.yaml`, `deadset-ci.yaml` and `perf-ci.yaml`) take a `runner` input, a runner label that is empty by default. Empty runs every job on `ubuntu-26.04`. `ci.yaml` passes its input on to the workflows it calls, and the synced `ci.yml` and `security.yml` pass the repository's `CI_RUNNER` variable, so setting that variable to a self-hosted runner's label moves the repository's jobs there, and deleting it moves them back.
 
 These jobs stay on GitHub's runners whatever the input says:
 
 - `docker`, which builds the image, and `docker-arm64`, which builds it on `arm64`;
 - `shell`, when the repository has a `Dockerfile`, because hadolint runs in Docker;
 - `go-os`, on Windows and macOS;
-- the `trivy` job of `security-scan.yaml`, which builds the image.
+- the `trivy` job of `security-scan.yaml`, which builds the image;
+- the `plan` job of `perf-ci.yaml`, which installs cosign with `sigstore/cosign-installer`, a step that needs `envsubst`.
 
 `codeql.yaml` takes no `runner` input. It runs only in public repositories, and its Go build uses the Go that GitHub's image carries.
 
@@ -61,6 +63,7 @@ The jobs that move install their tools into `$RUNNER_TEMP/bin` with no `sudo`, a
 - `go test -race`, in `go-ci.yaml` and `go-work`, needs a C compiler.
 - A `ts-ci.yaml` package with `@vitest/browser-playwright` needs the system libraries of each engine it tests on, Chromium or those named in `cplieger.browsers`, because on a self-hosted runner the job installs the browsers without their system libraries.
 - deadset over a large Go module peaks near 3 GB of memory.
+- The performance gate's measure jobs need the system libraries of Chromium and WebKit. Its budgets name the runner they were calibrated on, so on any other runner every metric is reported and none gates.
 
 ## The language workflows
 
@@ -106,6 +109,23 @@ Any finding at `deny` severity fails the check. So does a run that gives no answ
 Each run also writes SARIF and uploads it to code scanning, under the category `deadset`, or `deadset/<folder>` for a nested module. Each analyzer's findings stay a separate analysis inside that category. The upload needs `security-events: write`, which the synced `ci.yml` grants. It is skipped in private repositories, and a failed upload never fails the check.
 
 In `cplieger/ci` itself, a `deadset-canary` job runs the same workflow with the pinned deadset, deadset-go and deadset-ts over seven public repositories at fixed commits, and ignores their findings. A version bump that makes deadset refuse a run or give no answer fails that job before a release carries it.
+
+## The performance gate
+
+`perf-ci.yaml` measures a web app in real browsers and holds each measured cell to its budget. A repository enrols by committing `tests/perf/plan.json`, and the repository owns everything it measures:
+
+- `plan.json` holds `node`, the npm package folder whose lockfile pins Playwright, and `sets`. Each set, such as `pr` and `full`, has `shards`, the most measure jobs it splits into, and `cells`, each a `scenario`, `scale`, `engine` and `width` with the `seconds` it takes to measure. A cell may list `windows`, a non-empty list of distinct window names, to measure only those windows; a cell without it measures every window. A set or cell that is not an object, and a line break in `node` or in a cell's field, fail the plan, because those values reach the job's outputs and shell. Jobs get the longest cells first, each onto the shard with the least work so far.
+- `tests/perf/build.sh <dir>` writes the build into the folder. It runs once, with Go set up from `go.mod` when the root has one and Node 26.
+- `tests/perf/run.sh <cells.json> <out>` measures the listed cells against the build, whose folder `PERF_BUILD` names, and writes `<out>/results.json`. Each measured cell is the plan's four fields plus a `window`, a `metric` such as `cpu_ms` or `reads:/api/chats`, a `kind` and its `reps`. The kind is `time` (judged against its budget), `server_cpu` (judged against its target), `count` (must equal its budget) or `report` (never gated). Each measure job is a call of `perf-measure.yaml`, which installs Chromium and WebKit and stamps the runner label and the CPU model into the file itself.
+- `tests/perf/budgets.json` holds `schema` 1, the `runner` the budgets were calibrated on, a `headroom` above 0 and a `floor` of 0 or more per metric family, and `budgets`. Each entry names its cell by the six fields and carries a `tier`, a `source` (the calibration run's URL) and `rows`, a non-empty list. A `gated` entry's `budget` is `max(floor, baseline × headroom)`, from its own `headroom` when it has one, which must also be above 0. A server CPU entry's budget is its `target`. An `exact` entry's budget is its baseline. A `reported` entry gates nothing.
+
+The `compare` job judges each cell on the median of its three reps. A gated cell over its budget does not fail there: the `remeasure` jobs measure it again on new virtual machines, and the `verdict` job fails it only when the median of all six reps is over its budget. An exact count that differs from its budget fails at once. A cell whose median is under its baseline divided by its headroom gets a notice that its budget can come down, and a cell with no entry is reported. The job reads `plan.json` too: a gated or exact entry whose cell and window the run planned but no shard measured fails, and so does one whose cell and window neither the `pr` nor the `full` set lists, the two sets a workflow runs, unless a `retired` entry names it. Results from a runner other than the file's `runner` report every metric and gate none. A budget file that breaks the rule above fails, and so does a number a float cannot hold in any file the gate reads, such as `NaN`, `Infinity`, `1e999` or a 400-digit integer. A file that is not a JSON object, or a budget entry or `retired` item that is not one, fails with an error line naming it, and the gate then judges no cell. The run summary lists every measured cell.
+
+Every budget a pull request changes must come from a signed calibration. An entry is changed when it is new or its baseline, budget, tier, headroom or source differs from the base branch's file, and every entry is changed when the file's `runner`, `headroom` or `floor` differs. Its `source` names a run of `perf-calibrate.yaml` in cplieger/ci, and `tests/perf/calibrations/` holds that run's `<run id>.json` and `<run id>.sigstore.json`. The check fails when the bundle does not verify as signed keyless by `perf-calibrate.yaml` on `refs/heads/main`. It also fails when the file was made for another repository or runner, measured a commit the head does not contain, or holds another baseline for the cell. An entry may raise its baseline only with an `accepted` reason, and after a `headroom` or `floor` edit it needs one to raise its budget too, whatever the calibration file holds. A server CPU entry needs one to raise its target. A gated or exact entry leaves only through a `retired` entry naming its cell and a `reason`. A file in `calibrations/` that no entry names fails too.
+
+`perf-calibrate.yaml` is started by hand with a `repo`, a `ref`, a `set` (default `pr`), an `only` list of scenarios and a number of `runs` (default 10), and measures public repositories only. It uploads a `budgets-proposed` artifact for 90 days, holding `budgets.proposed.json` and the same bytes as `<run id>.json` with its `<run id>.sigstore.json` bundle, the two files to check in. Only ten runs or more decide a tier. A count is exact when every rep of every run agrees. A time takes each run in turn as a pull request against the median of the other runs, at the metric's headroom: a cell whose median of six passes stays gated, and one that trips gets the smallest 0.05 step of headroom at which none does, up to 2.0 for CPU and 1.5 for heap and RSS, past which it is reported. `whole_pr` lists the runs that would have needed a re-measure, and the cells widened or demoted. A run of fewer than ten re-measures baselines: its entries keep the base file's tier and headroom, a new entry from it is `reported`, and a gated cell whose spread trips the second stage at its headroom fails the check, which asks for a ten-run calibration.
+
+`weekly-perf.yaml` measures the `full` set of every public cplieger repository that carries `tests/perf/plan.json`, on its default branch, through the same gate. Each cell's median goes to `perf/` on the repository's `benchmarks` branch, and a chart's alert never fails the run.
 
 ## The release workflow
 
@@ -236,7 +256,7 @@ Each run is named `Promote <repo>`, with `(dry run)` after a dry run. Runs for o
 
 ## Workflows for this repository only
 
-Every other file in `.github/workflows/` runs inside cplieger/ci and is not meant to be called. These workflows sync the configs, cut and move release tags, run the daily settings audit, and run the scheduled mutation, fuzz, benchmark, link and security jobs. Others rebuild images older than seven days by default, promote a `dev` commit to `main` in a two-branch repository, delete aged dev images from GitHub Container Registry, and run this repository's own CI.
+Every other file in `.github/workflows/` runs inside cplieger/ci and is not meant to be called. These workflows sync the configs, cut and move release tags, run the daily settings audit, and run the scheduled mutation, fuzz, benchmark, performance, link and security jobs. `perf-calibrate.yaml` calibrates a repository's performance budgets, as [the performance gate](#the-performance-gate) describes. Others rebuild images older than seven days by default, promote a `dev` commit to `main` in a two-branch repository, delete aged dev images from GitHub Container Registry, and run this repository's own CI.
 
 In a two-branch repository, the rebuild job reads when the published `:latest` and `:dev` images were built. For each one older than the limit, it opens a pull request into `main` or `dev`, unless a rebuild request merged into that branch within the limit. A rebuild that published nothing is therefore not requested again the next day. The daily security job runs each two-branch repository's security workflow on `dev` and again on `main`.
 
@@ -268,7 +288,7 @@ It also keeps one issue per repository, labelled `release-blocked`, and closes i
 
 ## The scheduled runs
 
-The weekly workflows run each repository's mutation tests, fuzz targets, benchmarks and link checks here in cplieger/ci, so one place holds the schedule, the matrix and its `max-parallel` cap. Stryker runs on Saturdays, gremlins on Sundays, benchmarks on Tuesdays, fuzzing on Wednesdays and the link check on Thursdays, all at 22:00 UTC.
+The weekly workflows run each repository's mutation tests, fuzz targets, benchmarks, browser performance runs and link checks here in cplieger/ci, so one place holds the schedule, the matrix and its `max-parallel` cap. The performance run goes on Mondays, Stryker on Saturdays, gremlins on Sundays, benchmarks on Tuesdays, fuzzing on Wednesdays and the link check on Thursdays, all at 22:00 UTC.
 
 They take only repositories that are public, not archived and not forks, because anyone signed in to GitHub can read this repository's run logs and artifacts. A private repository that wants these runs runs them in its own CI. A job that runs a repository's code clones it anonymously and references no secret. The jobs that publish a badge, update a tracker issue or file a finding run no repository code. They take each repository from their own matrix and download only the artifacts that repository's run entries uploaded, by exact name.
 

@@ -428,6 +428,7 @@ VALIDATE_JOBS = [
     'SHELL',
     'DEADSET',
     'DEADSET_CANARY',
+    'PERF',
     'DOCKER',
     'DOCKER_ARM64',
     'MARKDOWN',

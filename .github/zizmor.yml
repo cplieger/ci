@@ -25,6 +25,8 @@ rules:
       - release.yaml
       - self-ci.yaml
       - self-codeql.yml
+      - perf-ci.yaml
+      - perf-calibrate.yaml
       # The workflows calling notify-failure.yaml.
       - audit.yaml
       - backfill-release-sbom-sigs.yaml
@@ -44,6 +46,7 @@ rules:
       - weekly-fuzz.yaml
       - weekly-gremlins.yaml
       - weekly-links.yaml
+      - weekly-perf.yaml
       - weekly-stryker.yaml
 
   github-app:

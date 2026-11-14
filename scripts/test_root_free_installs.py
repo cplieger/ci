@@ -28,6 +28,8 @@ CI_WORKFLOWS = (
     'shell-ci.yaml',
     'deadset-ci.yaml',
     'security-scan.yaml',
+    'perf-ci.yaml',
+    'perf-measure.yaml',
 )
 ACTION = re.compile(r'^(?:\./\.cplieger-ci/actions/|\./actions/|cplieger/ci/actions/)([\w-]+)')
 ROOT_ONLY = re.compile(r'\bsudo\b|/usr/local\b')
@@ -315,6 +317,27 @@ class CosignInstall(unittest.TestCase):
                 proc, _, tmp = self.run_body(body, {'COSIGN_SHA256': sha}, fake_tool('cosign'))
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertFalse((tmp / 'github_path').exists())
+
+    def test_the_perf_compare_job_installs_the_cosign_its_hosted_plan_job_verified(self):
+        spec = jobs('perf-ci.yaml')
+        self.assertEqual(
+            spec['plan']['outputs']['cosign-sha256'], '${{ steps.cosign.outputs.sha256 }}'
+        )
+        self.assertEqual(spec['plan']['runs-on'], 'ubuntu-26.04')
+        names = [x.get('name') for x in spec['plan']['steps']]
+        self.assertLess(
+            names.index('Install cosign'), names.index("Record the verified cosign's digest")
+        )
+        self.assertIn('plan', spec['compare']['needs'])
+        s = step('perf-ci.yaml', 'compare', 'Install cosign')
+        self.assertNotIn('uses', s)
+        self.assertEqual(s['env']['COSIGN_SHA256'], '${{ needs.plan.outputs.cosign-sha256 }}')
+        data = fake_tool('cosign')
+        for sha, ok in ((hashlib.sha256(data).hexdigest(), True), ('0' * 64, False), ('', False)):
+            with self.subTest(sha=sha):
+                proc, _, tmp = self.run_body(s['run'], {'COSIGN_SHA256': sha}, data)
+                self.assertEqual(proc.returncode == 0, ok, proc.stderr)
+                self.assertEqual((tmp / 'github_path').exists(), ok)
 
     def test_the_hosted_job_records_the_digest_of_the_cosign_it_verified(self):
         s = step('security-scan.yaml', 'trivy', "Record the verified cosign's digest")
