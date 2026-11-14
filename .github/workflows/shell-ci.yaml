@@ -100,12 +100,13 @@ jobs:
           "$bin/shellcheck" --version
 
       # Soft-gate block: each step below runs to completion (continue-on-error)
-      # and records its own name to /tmp/_ci_failures on failure; the final
-      # "Check results" step fails the job if that file exists. CONTRACT: any
-      # step added to this block MUST end with
+      # and the final "Check results" step fails the job on any step's failed
+      # outcome. CONTRACT (scripts/test_soft_gate.py): a step added here has an
+      # `id`, without which its outcome is invisible, and ends with
       #   || { echo "<step name>" >> /tmp/_ci_failures; exit 1; }
-      # or its failure is silently tolerated by continue-on-error.
+      # to name the failure in the log.
       - name: Lint shell scripts
+        id: lint-shell-scripts
         continue-on-error: true
         env:
           # Via env, never inline ${{ }} in the script body, so the input can't
@@ -152,6 +153,7 @@ jobs:
       # lint it directly, with -s sh for the missing shebang and -e SC2034
       # because the SMOKE_* knobs are consumed by the sourcing harness.
       - name: Lint image-smoke config
+        id: lint-image-smoke-config
         continue-on-error: true
         run: |
           (
@@ -163,6 +165,7 @@ jobs:
           ) || { echo "Lint image-smoke config" >> /tmp/_ci_failures; exit 1; }
 
       - name: Format check image-smoke config (shfmt)
+        id: format-check-image-smoke-config-shfmt
         continue-on-error: true
         run: |
           (
@@ -177,6 +180,7 @@ jobs:
           }
 
       - name: Format check shell scripts (shfmt)
+        id: format-check-shell-scripts-shfmt
         continue-on-error: true
         run: |
           (
@@ -193,6 +197,7 @@ jobs:
           ) || { echo "Format check shell scripts (shfmt)" >> /tmp/_ci_failures; exit 1; }
 
       - name: Validate Dockerfile
+        id: validate-dockerfile
         if: ${{ inputs.dockerfile != '' }}
         continue-on-error: true
         env:
@@ -234,6 +239,7 @@ jobs:
       # the suite skip SILENTLY and report green. Runs after the linters, so a
       # test file meets the same shellcheck/shfmt bar as the code it tests.
       - name: Run shell unit tests
+        id: run-shell-unit-tests
         continue-on-error: true
         run: |
           (
@@ -244,12 +250,21 @@ jobs:
             fi
           ) || { echo "Run shell unit tests" >> /tmp/_ci_failures; exit 1; }
 
+      # A soft step's outcome is checked as well as its marker: a step killed
+      # whole (the OOM killer takes its shell with the test) writes none. A
+      # step whose id ends in -attempt is retried by a later step.
       - name: Check results
         if: always()
+        env:
+          STEP_OUTCOMES: ${{ toJSON(steps) }}
         run: |
-          if [ -f /tmp/_ci_failures ]; then
+          set -euo pipefail
+          failures="/tmp/_ci_failures"
+          jq -r 'to_entries[] | select(.value.outcome == "failure" and (.key | endswith("-attempt") | not)) | "step " + .key' \
+            <<<"$STEP_OUTCOMES" >> "$failures"
+          if [ -s "$failures" ]; then
             echo "::error::Failed validation steps:"
-            sort -u /tmp/_ci_failures >&2
+            sort -u "$failures" >&2
             exit 1
           fi
           echo "All validation steps passed"

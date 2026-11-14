@@ -384,18 +384,20 @@ jobs:
           echo "SSE_FIXTURE=$RUNNER_TEMP/sse-fixture" >> "$GITHUB_ENV"
 
       # Soft-gate block: each step below runs to completion (continue-on-error)
-      # and records its own name to /tmp/_ci_failures on failure; the final
-      # "Check results" step fails the job if that file exists. CONTRACT: any
-      # step added to this block MUST end with
+      # and the final "Check results" step fails the job on any step's failed
+      # outcome. CONTRACT (scripts/test_soft_gate.py): a step added here has an
+      # `id`, without which its outcome is invisible, and ends with
       #   || { echo "<step name>" >> /tmp/_ci_failures; exit 1; }
-      # or its failure is silently tolerated by continue-on-error.
+      # to name the failure in the log.
       # Every check but the tests runs once, in shard 1.
       - name: Lint (eslint)
+        id: lint-eslint
         if: ${{ matrix.shard == 1 }}
         continue-on-error: true
         run: ( npx eslint . ) || { echo "eslint" >> /tmp/_ci_failures; exit 1; }
 
       - name: Typecheck (tsc)
+        id: typecheck-tsc
         if: ${{ matrix.shard == 1 }}
         continue-on-error: true
         run: ( npm run typecheck && npm run typecheck:tests ) || { echo "typecheck" >> /tmp/_ci_failures; exit 1; }
@@ -409,6 +411,7 @@ jobs:
       # --no-config-hints: every ignore entry for an unchecked type reads as unused.
       # A cycle fails only where the config sets `rules: { cycles: error }`.
       - name: Import cycles and undeclared dependencies (knip)
+        id: import-cycles-and-undeclared-dependencies-knip
         if: ${{ matrix.shard == 1 }}
         continue-on-error: true
         run: |
@@ -434,6 +437,7 @@ jobs:
           ) || { echo "knip" >> /tmp/_ci_failures; exit 1; }
 
       - name: Test (vitest)
+        id: test-vitest
         continue-on-error: true
         env:
           SHARD: ${{ matrix.shard }}
@@ -455,6 +459,7 @@ jobs:
           ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
       - name: Fuzz (fast-check)
+        id: fuzz-fast-check
         # Fuzzing is intentionally non-deterministic: a push/PR failing because
         # the fuzzer found a new input is a real bug caught early. Public repos
         # fuzz on push/PR (shift-left) at the budget configured in each test;
@@ -498,6 +503,7 @@ jobs:
           ) || { echo "fuzz" >> /tmp/_ci_failures; exit 1; }
 
       - name: Format (prettier)
+        id: format-prettier
         if: ${{ matrix.shard == 1 }}
         continue-on-error: true
         run: ( npx prettier --check . ) || { echo "prettier" >> /tmp/_ci_failures; exit 1; }
@@ -507,6 +513,7 @@ jobs:
       # marks a manifest edit that touched one file. Scans from the git root so a
       # root library and a subpackage (web/) are both covered; no jsr.json no-ops.
       - name: Version parity (package.json == jsr.json)
+        id: version-parity-package-json-jsr-json
         if: ${{ matrix.shard == 1 }}
         continue-on-error: true
         run: |
@@ -540,22 +547,13 @@ jobs:
         with:
           package-dir: ${{ inputs.working-directory }}
 
-      # This block's contract is a trailing
-      # `|| { echo "<name>" >> /tmp/_ci_failures; exit 1; }`, which a `uses:` step
-      # cannot carry inline. Record the outcome in a separate step so
-      # continue-on-error does not silently swallow a failure. No `exit 1` here:
-      # the marker file is what the final "Check results" step fails the job on,
-      # and exiting non-zero would abort the remaining soft-gate steps.
-      - name: Record publish-surface result
-        if: ${{ always() && steps.publish_surface.outcome == 'failure' }}
-        run: echo "publish surface" >> /tmp/_ci_failures
-
       # Every bare-specifier value-import in shippable front-end source needs a key
       # in the page's importmap: the browser resolves bare specifiers only through
       # it, while tsc and eslint resolve through node_modules and stay green. Scans
       # from the git root; no importmap no-ops. web-lint only: a library's
       # importmap is a dev scaffold, not a shipped page contract.
       - name: Import map coverage
+        id: import-map-coverage
         if: ${{ inputs.web-lint && matrix.shard == 1 }}
         continue-on-error: true
         env:
@@ -647,6 +645,7 @@ jobs:
           ) || { echo "Import map coverage" >> /tmp/_ci_failures; exit 1; }
 
       - name: Lint web (CSS/HTML)
+        id: lint-web-css-html
         if: ${{ inputs.web-lint && matrix.shard == 1 }}
         continue-on-error: true
         run: |
@@ -690,7 +689,7 @@ jobs:
       # only — the dependency-review API needs the dependency graph, which
       # private repos on the free plan don't expose.
       - name: Dependency review
-        id: dependency-review
+        id: dependency-review-attempt
         if: ${{ matrix.shard == 1 && inputs.working-directory == '.' && github.event_name == 'pull_request' && github.event.repository.private == false }}
         continue-on-error: true
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
@@ -698,21 +697,30 @@ jobs:
           fail-on-severity: high
 
       - name: Wait before retrying dependency review
-        if: ${{ steps.dependency-review.outcome == 'failure' }}
+        if: ${{ steps.dependency-review-attempt.outcome == 'failure' }}
         run: sleep 30
 
       - name: Dependency review (retry)
-        if: ${{ steps.dependency-review.outcome == 'failure' }}
+        if: ${{ steps.dependency-review-attempt.outcome == 'failure' }}
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
 
+      # A soft step's outcome is checked as well as its marker: a step killed
+      # whole (the OOM killer takes its shell with the test) writes none. A
+      # step whose id ends in -attempt is retried by a later step.
       - name: Check results
         if: always()
+        env:
+          STEP_OUTCOMES: ${{ toJSON(steps) }}
         run: |
-          if [ -f /tmp/_ci_failures ]; then
+          set -euo pipefail
+          failures="/tmp/_ci_failures"
+          jq -r 'to_entries[] | select(.value.outcome == "failure" and (.key | endswith("-attempt") | not)) | "step " + .key' \
+            <<<"$STEP_OUTCOMES" >> "$failures"
+          if [ -s "$failures" ]; then
             echo "::error::Failed validation steps:"
-            sort -u /tmp/_ci_failures >&2
+            sort -u "$failures" >&2
             exit 1
           fi
           echo "All validation steps passed"

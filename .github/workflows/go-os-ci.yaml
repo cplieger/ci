@@ -90,11 +90,13 @@ jobs:
           echo "$dest/$name" >> "$GITHUB_PATH"
           "$dest/$name/golangci-lint" --version
 
-      # Soft-gate block, as in go-ci.yaml: any step added here MUST end with
+      # Soft-gate block, as in go-ci.yaml: any step added here has an `id` and
+      # ends with
       #   || { echo "<step name>" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
-      # or continue-on-error hides its failure from "Check results". RUNNER_TEMP
-      # rather than /tmp, so the marker has one path on every runner OS.
+      # (scripts/test_soft_gate.py). RUNNER_TEMP rather than /tmp, so the
+      # marker has one path on every runner OS.
       - name: C toolchain
+        id: c-toolchain
         continue-on-error: true
         # CGO_ENABLED=1 (which -race needs) is set on this step and the race step
         # only: job-wide, it would make the cross-vet need a C compiler per target.
@@ -119,14 +121,17 @@ jobs:
           ) || { echo "c-toolchain" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
 
       - name: Vet
+        id: vet
         continue-on-error: true
         run: ( go vet ./... ) || { echo "vet" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
 
       - name: Lint (golangci-lint)
+        id: lint-golangci-lint
         continue-on-error: true
         run: ( golangci-lint run --allow-parallel-runners --timeout=5m ./... ) || { echo "golangci-lint" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
 
       - name: Test (race)
+        id: test-race
         continue-on-error: true
         env:
           CGO_ENABLED: '1'
@@ -134,6 +139,7 @@ jobs:
 
       # vet type-checks test files, which a cross `go build` skips.
       - name: Cross-vet release targets
+        id: cross-vet-release-targets
         continue-on-error: true
         run: |
           rc=0
@@ -146,12 +152,21 @@ jobs:
           done
           [ "$rc" -eq 0 ] || { echo "cross-vet" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
 
+      # A soft step's outcome is checked as well as its marker: a step killed
+      # whole (the OOM killer takes its shell with the test) writes none. A
+      # step whose id ends in -attempt is retried by a later step.
       - name: Check results
         if: always()
+        env:
+          STEP_OUTCOMES: ${{ toJSON(steps) }}
         run: |
-          if [ -f "$RUNNER_TEMP/_ci_failures" ]; then
+          set -euo pipefail
+          failures="$RUNNER_TEMP/_ci_failures"
+          jq -r 'to_entries[] | select(.value.outcome == "failure" and (.key | endswith("-attempt") | not)) | "step " + .key' \
+            <<<"$STEP_OUTCOMES" >> "$failures"
+          if [ -s "$failures" ]; then
             echo "::error::Failed validation steps:"
-            sort -u "$RUNNER_TEMP/_ci_failures" >&2
+            sort -u "$failures" >&2
             exit 1
           fi
           echo "All validation steps passed"
