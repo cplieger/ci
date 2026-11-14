@@ -91,6 +91,25 @@ class PerfCi(unittest.TestCase):
         self.assertEqual(set(perf_gate.RUN_SETS), {*on_a_pull_request, weekly})
 
 
+class DispatchInputs(unittest.TestCase):
+    def test_a_dispatched_number_reaches_a_called_workflow_as_a_number(self):
+        # A called workflow's number input refuses the string a dispatch delivers,
+        # failing the run before any of its jobs exists ("Unexpected value '10'").
+        for path in sorted(WORKFLOWS.glob('*.yaml')):
+            doc = yaml.safe_load(path.read_text())
+            dispatch = (doc.get(True) or {}).get('workflow_dispatch') or {}
+            numbers = {
+                k for k, v in (dispatch.get('inputs') or {}).items() if v.get('type') == 'number'
+            }
+            for job, spec in doc['jobs'].items():
+                if 'uses' not in spec:
+                    continue
+                for key, value in (spec.get('with') or {}).items():
+                    for name in numbers:
+                        with self.subTest(workflow=path.name, job=job, input=key):
+                            self.assertNotEqual(value, f'${{{{ inputs.{name} }}}}')
+
+
 class Release(unittest.TestCase):
     def internal(self) -> set[str]:
         run = '\n'.join(
