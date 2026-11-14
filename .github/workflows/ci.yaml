@@ -934,21 +934,12 @@ jobs:
       - name: Alert rules
         uses: ./.cplieger-ci/actions/alert-rules
 
-      # A soft step's outcome is checked as well as its marker: a step killed
-      # whole (the OOM killer takes its shell with the test) writes none. A
-      # step whose id ends in -attempt is retried by a later step.
       - name: Check results
         if: always()
-        env:
-          STEP_OUTCOMES: ${{ toJSON(steps) }}
         run: |
-          set -euo pipefail
-          failures="/tmp/_ci_failures"
-          jq -r 'to_entries[] | select(.value.outcome == "failure" and (.key | endswith("-attempt") | not)) | "step " + .key' \
-            <<<"$STEP_OUTCOMES" >> "$failures"
-          if [ -s "$failures" ]; then
+          if [ -f /tmp/_ci_failures ]; then
             echo "::error::Failed validation steps:"
-            sort -u "$failures" >&2
+            sort -u /tmp/_ci_failures >&2
             exit 1
           fi
           echo "All validation steps passed"
@@ -1131,12 +1122,22 @@ jobs:
       - name: Check results
         if: always()
         env:
-          STEP_OUTCOMES: ${{ toJSON(steps) }}
+          # One `<id> <outcome>` line per soft step: never toJSON(steps), whose
+          # step outputs can pass the kernel's 128 KiB limit for one variable.
+          STEP_OUTCOMES: |
+            workflows-actionlint ${{ steps.workflows-actionlint.outcome }}
+            audit-workflows-zizmor ${{ steps.audit-workflows-zizmor.outcome }}
+            scan-for-secrets-gitleaks ${{ steps.scan-for-secrets-gitleaks.outcome }}
+            comment-ratio ${{ steps.comment-ratio.outcome }}
+            comment-ratio-2 ${{ steps.comment-ratio-2.outcome }}
+            notice-audit ${{ steps.notice-audit.outcome }}
+            notice-audit-2 ${{ steps.notice-audit-2.outcome }}
+            dashboards ${{ steps.dashboards.outcome }}
+            dashboard-check ${{ steps.dashboard-check.outcome }}
         run: |
           set -euo pipefail
           failures="/tmp/_ci_failures"
-          jq -r 'to_entries[] | select(.value.outcome == "failure" and (.key | endswith("-attempt") | not)) | "step " + .key' \
-            <<<"$STEP_OUTCOMES" >> "$failures"
+          awk '$2 == "failure" { print "step " $1 }' <<<"$STEP_OUTCOMES" >> "$failures"
           if [ -s "$failures" ]; then
             echo "::error::Failed validation steps:"
             sort -u "$failures" >&2
@@ -1642,12 +1643,33 @@ jobs:
       - name: Check results
         if: always()
         env:
-          STEP_OUTCOMES: ${{ toJSON(steps) }}
+          # One `<id> <outcome>` line per soft step: never toJSON(steps), whose
+          # step outputs can pass the kernel's 128 KiB limit for one variable.
+          STEP_OUTCOMES: |
+            lint-shell-scripts-shellcheck ${{ steps.lint-shell-scripts-shellcheck.outcome }}
+            format-check-shell-scripts-shfmt ${{ steps.format-check-shell-scripts-shfmt.outcome }}
+            run-shell-unit-tests ${{ steps.run-shell-unit-tests.outcome }}
+            lint-yaml-yamllint ${{ steps.lint-yaml-yamllint.outcome }}
+            validate-toml ${{ steps.validate-toml.outcome }}
+            probe-git-cliff-bump-semantics ${{ steps.probe-git-cliff-bump-semantics.outcome }}
+            probe-lane-and-web-probe-shell-semantics ${{ steps.probe-lane-and-web-probe-shell-semantics.outcome }}
+            probe-verify-publish-shell-semantics ${{ steps.probe-verify-publish-shell-semantics.outcome }}
+            probe-docker-release-shell-semantics ${{ steps.probe-docker-release-shell-semantics.outcome }}
+            probe-release-path-significance ${{ steps.probe-release-path-significance.outcome }}
+            probe-reconciliation-recogniser ${{ steps.probe-reconciliation-recogniser.outcome }}
+            probe-release-notes-renderer ${{ steps.probe-release-notes-renderer.outcome }}
+            probe-release-detect-state-machine ${{ steps.probe-release-detect-state-machine.outcome }}
+            probe-two-branch-release-model-end-to-end ${{ steps.probe-two-branch-release-model-end-to-end.outcome }}
+            probe-image-test-slot ${{ steps.probe-image-test-slot.outcome }}
+            probe-shell-unit-test-harness ${{ steps.probe-shell-unit-test-harness.outcome }}
+            probe-comment-ratio-gate ${{ steps.probe-comment-ratio-gate.outcome }}
+            probe-notice-gate ${{ steps.probe-notice-gate.outcome }}
+            probe-license-collector ${{ steps.probe-license-collector.outcome }}
+            probe-dashboard-check ${{ steps.probe-dashboard-check.outcome }}
         run: |
           set -euo pipefail
           failures="/tmp/_ci_failures"
-          jq -r 'to_entries[] | select(.value.outcome == "failure" and (.key | endswith("-attempt") | not)) | "step " + .key' \
-            <<<"$STEP_OUTCOMES" >> "$failures"
+          awk '$2 == "failure" { print "step " $1 }' <<<"$STEP_OUTCOMES" >> "$failures"
           if [ -s "$failures" ]; then
             echo "::error::Failed validation steps:"
             sort -u "$failures" >&2
