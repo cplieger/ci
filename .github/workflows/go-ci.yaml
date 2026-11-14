@@ -202,12 +202,19 @@ jobs:
       - name: Check results
         if: always()
         env:
-          STEP_OUTCOMES: ${{ toJSON(steps) }}
+          # One `<id> <outcome>` line per soft step: never toJSON(steps), whose
+          # step outputs can pass the kernel's 128 KiB limit for one variable.
+          STEP_OUTCOMES: |
+            vet ${{ steps.vet.outcome }}
+            lint-golangci-lint ${{ steps.lint-golangci-lint.outcome }}
+            test-race ${{ steps.test-race.outcome }}
+            govulncheck ${{ steps.govulncheck.outcome }}
+            verify-modules ${{ steps.verify-modules.outcome }}
+            wiregen-drift ${{ steps.wiregen-drift.outcome }}
         run: |
           set -euo pipefail
           failures="/tmp/_ci_failures"
-          jq -r 'to_entries[] | select(.value.outcome == "failure" and (.key | endswith("-attempt") | not)) | "step " + .key' \
-            <<<"$STEP_OUTCOMES" >> "$failures"
+          awk '$2 == "failure" { print "step " $1 }' <<<"$STEP_OUTCOMES" >> "$failures"
           if [ -s "$failures" ]; then
             echo "::error::Failed validation steps:"
             sort -u "$failures" >&2

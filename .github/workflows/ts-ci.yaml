@@ -411,7 +411,7 @@ jobs:
       # --no-config-hints: every ignore entry for an unchecked type reads as unused.
       # A cycle fails only where the config sets `rules: { cycles: error }`.
       - name: Import cycles and undeclared dependencies (knip)
-        id: import-cycles-and-undeclared-dependencies-knip
+        id: import-cycles-and-undeclared-dependencies
         if: ${{ matrix.shard == 1 }}
         continue-on-error: true
         run: |
@@ -712,12 +712,23 @@ jobs:
       - name: Check results
         if: always()
         env:
-          STEP_OUTCOMES: ${{ toJSON(steps) }}
+          # One `<id> <outcome>` line per soft step: never toJSON(steps), whose
+          # step outputs can pass the kernel's 128 KiB limit for one variable.
+          STEP_OUTCOMES: |
+            lint-eslint ${{ steps.lint-eslint.outcome }}
+            typecheck-tsc ${{ steps.typecheck-tsc.outcome }}
+            import-cycles-and-undeclared-dependencies ${{ steps.import-cycles-and-undeclared-dependencies.outcome }}
+            test-vitest ${{ steps.test-vitest.outcome }}
+            fuzz-fast-check ${{ steps.fuzz-fast-check.outcome }}
+            format-prettier ${{ steps.format-prettier.outcome }}
+            version-parity-package-json-jsr-json ${{ steps.version-parity-package-json-jsr-json.outcome }}
+            publish_surface ${{ steps.publish_surface.outcome }}
+            import-map-coverage ${{ steps.import-map-coverage.outcome }}
+            lint-web-css-html ${{ steps.lint-web-css-html.outcome }}
         run: |
           set -euo pipefail
           failures="/tmp/_ci_failures"
-          jq -r 'to_entries[] | select(.value.outcome == "failure" and (.key | endswith("-attempt") | not)) | "step " + .key' \
-            <<<"$STEP_OUTCOMES" >> "$failures"
+          awk '$2 == "failure" { print "step " $1 }' <<<"$STEP_OUTCOMES" >> "$failures"
           if [ -s "$failures" ]; then
             echo "::error::Failed validation steps:"
             sort -u "$failures" >&2
