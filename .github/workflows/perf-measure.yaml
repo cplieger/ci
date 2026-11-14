@@ -20,7 +20,7 @@ on:
         type: string
         required: true
       cells:
-        description: The shard's cells, a JSON list of {scenario, scale, engine, width, seconds}.
+        description: The shard's cells, a JSON list of {scenario, scale, engine, width, seconds} and optional windows, the only ones to measure.
         type: string
         required: true
       node:

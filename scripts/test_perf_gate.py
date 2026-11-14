@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 import perf_gate
 
@@ -134,6 +135,25 @@ class TheRule(unittest.TestCase):
         for name, doc in cases.items():
             with self.subTest(name):
                 self.assertTrue(perf_gate.check_rule(doc))
+
+    def test_a_file_or_entry_of_the_wrong_shape_is_an_error_line(self):
+        cases = {
+            'list file': ([], 'budgets.json: must be a JSON object'),
+            'string entry': (budgets(['files']), 'budgets[0]: must be an object'),
+            'string retired': (budgets([], retired=['files']), 'retired[0]: must be an object'),
+            'budgets object': (budgets({'files': entry()}), 'budgets.json: budgets must be a list'),
+            'headroom list': (budgets([entry()], headroom=[]), 'budgets.json: headroom must map'),
+            'numeric metric': (budgets([entry(metric=1)]), 'budgets[0]: missing metric'),
+            'list tier': (budgets([entry(tier=['gated'], budget=1500.0)]), "tier ['gated']"),
+            'string budget': (budgets([entry(budget='1500')]), 'must be numbers'),
+        }
+        for name, (doc, want) in cases.items():
+            with self.subTest(name):
+                errors = perf_gate.check_rule(doc)
+                self.assertTrue(errors)
+                self.assertTrue(perf_gate.check_shape(doc))
+                self.assertIn(want, ' '.join(errors))
+        self.assertEqual(perf_gate.check_shape(budgets([entry(budget=1600.0)])), [])
 
 
 class Compare(unittest.TestCase):
@@ -899,11 +919,17 @@ class Cli(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = pathlib.Path(self.tmp.name)
         (self.dir / 'cal').mkdir()
+        # Text put() replaces in every file it writes, for JSON that
+        # json.dumps cannot produce.
+        self.swap = {}
 
     def put(self, name, doc):
         path = self.dir / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(doc))
+        text = json.dumps(doc)
+        for old, new in self.swap.items():
+            text = text.replace(old, new)
+        path.write_text(text)
         return str(path)
 
     def main(self, *argv):
@@ -913,20 +939,20 @@ class Cli(unittest.TestCase):
         self.output = out.getvalue() + err.getvalue()
         return rc
 
-    def compare(self, cells, *extra, other=None, entries=(), **doc):
-        b = self.put(
-            'budgets.json',
-            budgets([entry(source=RUN_URL + '100'), entry('dom', 'exact', 640), *entries], **doc),
-        )
+    def compare(
+        self, cells, *extra, other=None, entries=(), listed=True, plan=PLAN, shard=None, **doc
+    ):
+        own = [entry(source=RUN_URL + '100'), entry('dom', 'exact', 640)] if listed else []
+        b = self.put('budgets.json', budgets([*own, *entries], **doc))
         if other is None:
-            self.put('results/shard-1/results.json', results(cells))
+            self.put('results/shard-1/results.json', results(cells) if shard is None else shard)
         else:
             own = 'results/perf-results-cplieger-a-measure-shard-1-of-1/results.json'
             self.put(own, results(cells))
             self.put(f'results/{OTHER}-measure-shard-1-of-1/results.json', results(other))
         argv = ('--budgets', b, '--base', b, '--results', str(self.dir / 'results'))
         argv += ('--calibrations', str(self.dir / 'cal'), '--repo', REPO, '--head', HEAD)
-        argv += ('--plan-doc', self.put('plan.json', PLAN), '--set', 'pr')
+        argv += ('--plan-doc', self.put('plan.json', plan), '--set', 'pr')
         argv += (
             '--remeasure-out',
             str(self.dir / 'remeasure.json'),
@@ -961,16 +987,92 @@ class Cli(unittest.TestCase):
         retired = [{**CELL, 'scenario': 'gone', 'metric': 'cpu_ms', 'reason': 'view removed'}]
         self.assertEqual(self.compare(measured, entries=[gone], retired=retired), 0)
 
-    def test_compare_refuses_nan_or_infinity_in_budgets_or_results(self):
+    def test_compare_needs_a_result_only_for_the_windows_a_pr_cell_lists(self):
+        # The pr set measures WebKit x10 cold only; budgets.json holds the
+        # full set's WebKit live CPU and back count too.
+        webkit = {'engine': 'webkit', 'source': RUN_URL + '100'}
+        plan = {
+            'node': '.',
+            'sets': {
+                'pr': {'shards': 1, 'cells': [unit('files', 25, windows=['cold'], **webkit)]},
+                'full': {'shards': 1, 'cells': [unit('files', 25, **webkit)]},
+            },
+        }
+        cold = {**entry('rss_mb', baseline=200.0, budget=250.0), **webkit}
+        live = {**entry(), **webkit, 'window': 'live'}
+        back = {**entry('dom', 'exact', 640), **webkit, 'window': 'back'}
+        measured = [{**cell('rss_mb', (200.0,) * 3), 'engine': 'webkit'}]
+        doc = {'entries': [cold, live, back], 'listed': False, 'plan': plan}
+        self.assertEqual(self.compare(measured, **doc), 0, self.output)
+        self.assertEqual(self.compare([], **doc), 1)
+        errors = [line for line in self.output.splitlines() if line.startswith('::error::')]
+        self.assertEqual(len(errors), 1, self.output)
+        self.assertIn('::error::files/x10/webkit/desktop/cold/rss_mb:', errors[0])
+        self.assertIn('no shard measured', errors[0])
+
+    def test_compare_refuses_a_non_finite_number_in_budgets_or_results(self):
         measured = [cell(), cell('dom', (640,) * 3, kind='count')]
         cases = {
-            'NaN budget': ([*measured], [entry(budget=float('nan'), window='live')]),
-            'Infinity rep': ([cell(reps=(float('inf'),) * 3), measured[1]], []),
+            'NaN budget': ([*measured], [entry(budget=float('nan'), window='live')], {}),
+            'Infinity rep': ([cell(reps=(float('inf'),) * 3), measured[1]], [], {}),
+            '1e999 rep': ([cell(reps=(-123.25,) * 3), measured[1]], [], {'-123.25': '-1e999'}),
+            '400-digit budget': (
+                [*measured],
+                [entry(budget=987.25, window='live')],
+                {'987.25': '1' + '0' * 400},
+            ),
         }
-        for name, (cells, entries) in cases.items():
+        for name, (cells, entries, swap) in cases.items():
             with self.subTest(name):
+                self.swap = swap
                 self.assertEqual(self.compare(cells, entries=entries), 1)
                 self.assertIn('is not a finite number', self.output)
+
+    def test_a_document_or_entry_of_the_wrong_shape_is_an_error_line(self):
+        measured = [cell(), cell('dom', (640,) * 3, kind='count')]
+        cases = {
+            'list plan.json': (lambda: self.compare(measured, plan=[]), 'must be a JSON object'),
+            'list results': (lambda: self.compare(measured, shard=[]), 'must be a JSON object'),
+            'string entry': (
+                lambda: self.compare(measured, entries=['files']),
+                '::error::budgets[2]: must be an object',
+            ),
+            'list plan for --plan': (
+                lambda: self.main(
+                    '--plan',
+                    self.put('p.json', []),
+                    '--set',
+                    'pr',
+                    '--out',
+                    str(self.dir / 'm.json'),
+                ),
+                'must be a JSON object',
+            ),
+        }
+        for name, (call, want) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(call(), 1)
+                self.assertIn(want, self.output)
+
+    def test_check_file_reports_a_numeric_metric_and_reads_no_calibration_for_it(self):
+        numeric = cal_cell(metric=1)
+        self.put('cal/111.json', calibration_file([numeric]))
+        self.put('cal/111.sigstore.json', {})
+        base = self.put('base.json', budgets([]))
+        head = self.put('budgets.json', budgets([entry(metric=1, source=RUN_URL + '111')]))
+        argv = ('--check-file', head, '--base', base, '--calibrations', str(self.dir / 'cal'))
+        with (
+            mock.patch.object(perf_gate, 'cosign_verify', return_value=None),
+            mock.patch.object(perf_gate, 'git_is_ancestor', return_value=True),
+        ):
+            self.assertEqual(self.main(*argv, '--repo', REPO, '--head', HEAD), 1)
+        self.assertIn('::error::budgets[0]: missing metric', self.output)
+
+    def test_check_file_refuses_a_list_budgets_json(self):
+        head = self.put('budgets.json', [entry(source=RUN_URL + '100')])
+        argv = ('--check-file', head, '--base', head, '--calibrations', str(self.dir / 'cal'))
+        self.assertEqual(self.main(*argv, '--repo', REPO, '--head', HEAD), 1)
+        self.assertIn('must be a JSON object', self.output)
 
     def test_check_file_refuses_a_nan_budget(self):
         base = self.put('base.json', budgets([entry(source=RUN_URL + '100')]))

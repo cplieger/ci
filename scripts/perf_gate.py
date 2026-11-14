@@ -65,14 +65,27 @@ def is_number(x: object) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
-def refuse_constant(name: str) -> float:
-    raise ValueError(f'{name} is not a finite number')
+def finite(text: str, number: Callable[[str], Any]) -> Any:
+    x = number(text)
+    try:
+        ok = math.isfinite(x)
+    except OverflowError:
+        ok = False
+    if not ok:
+        raise ValueError(f'{text} is not a finite number')
+    return x
 
 
 def loads(text: str) -> Any:
-    """JSON without NaN or Infinity, which pass every comparison a budget
-    makes and so would ungate a cell."""
-    return json.loads(text, parse_constant=refuse_constant)
+    """JSON whose every number a float holds: NaN, an infinity and 1e999 pass
+    every comparison a budget makes and so would ungate a cell, and a larger
+    integer is an OverflowError wherever it meets a float."""
+    return json.loads(
+        text,
+        parse_constant=lambda s: finite(s, float),
+        parse_float=lambda s: finite(s, float),
+        parse_int=lambda s: finite(s, int),
+    )
 
 
 def headroom_cap(metric: str) -> float:
@@ -97,13 +110,43 @@ def entry_floor(budgets: dict, e: dict) -> float:
 # --- the rule --------------------------------------------------------------
 
 
-def check_rule(budgets: dict) -> list[str]:
-    """Every way the budget file breaks its own rule, one line each."""
+def check_rule(budgets: object) -> list[str]:
+    """Every way the budget file breaks its own rule, one line each. A file
+    with a check_shape error gets those and its schema and runner lines only,
+    since entry_errors reads its maps and entries."""
+    shape = check_shape(budgets)
+    if not isinstance(budgets, dict):
+        return shape
     errors = []
     if budgets.get('schema') != 1:
         errors.append('budgets.json: schema must be 1')
     if not isinstance(budgets.get('runner'), str) or not budgets['runner']:
         errors.append('budgets.json: runner must name the runner the budgets were calibrated on')
+    if shape:
+        return errors + shape
+    seen = set()
+    for e in budgets.get('budgets', []):
+        name = key_text(key(e))
+        if key(e) in seen:
+            errors.append(f'{name}: listed twice')
+        seen.add(key(e))
+        errors.extend(f'{name}: {m}' for m in entry_errors(budgets, e))
+    return errors
+
+
+def check_shape(budgets: object) -> list[str]:
+    """The rule errors that stop the gate before it reads an entry, each a value
+    the code reading one would raise on or misjudge: a document, list, map or
+    item of the wrong type, an entry without its key or a known tier, a gated
+    or exact entry whose baseline or budget is no number, a headroom or floor
+    value out of range, and a retired item without its key and reason."""
+    if not isinstance(budgets, dict):
+        return ['budgets.json: must be a JSON object']
+    errors = [
+        f'budgets.json: {field} must be a list'
+        for field in ('budgets', 'retired')
+        if not isinstance(budgets.get(field, []), list)
+    ]
     for field, ok, want in (
         ('headroom', lambda x: is_number(x) and x > 0, 'a number above 0'),
         ('floor', lambda x: is_number(x) and x >= 0, 'a number of 0 or more'),
@@ -117,28 +160,42 @@ def check_rule(budgets: dict) -> list[str]:
             for fam, v in values.items()
             if not ok(v)
         )
-    seen = set()
-    for i, e in enumerate(budgets.get('budgets', [])):
-        missing = [f for f in KEY_FIELDS if not isinstance(e.get(f), str) or not e[f]]
-        if missing:
-            errors.append(f'budgets[{i}]: missing {", ".join(missing)}')
+    errors.extend(
+        filter(None, (entry_shape(i, e) for i, e in enumerate(items(budgets, 'budgets'))))
+    )
+    for i, r in enumerate(items(budgets, 'retired')):
+        if not isinstance(r, dict):
+            errors.append(f'retired[{i}]: must be an object')
             continue
-        name = key_text(key(e))
-        if key(e) in seen:
-            errors.append(f'{name}: listed twice')
-        seen.add(key(e))
-        errors.extend(f'{name}: {m}' for m in entry_errors(budgets, e))
-    for i, r in enumerate(budgets.get('retired', [])):
         named = all(isinstance(r.get(f), str) and r[f] for f in KEY_FIELDS)
         if not named or not str(r.get('reason', '')).strip():
             errors.append(f'retired[{i}]: needs the retired key and a reason')
     return errors
 
 
-def entry_errors(budgets: dict, e: dict) -> list[str]:
-    tier = e.get('tier')
+def items(budgets: dict, field: str) -> list:
+    """budgets[field] when it is a list, else none: check_shape reports it."""
+    values = budgets.get(field, [])
+    return values if isinstance(values, list) else []
+
+
+def entry_shape(i: int, e: object) -> str | None:
+    if not isinstance(e, dict):
+        return f'budgets[{i}]: must be an object'
+    missing = [f for f in KEY_FIELDS if not isinstance(e.get(f), str) or not e[f]]
+    if missing:
+        return f'budgets[{i}]: missing {", ".join(missing)}'
+    name, tier = key_text(key(e)), e.get('tier')
     if tier not in TIERS:
-        return [f'tier {tier!r} is not one of {", ".join(TIERS)}']
+        return f'{name}: tier {tier!r} is not one of {", ".join(TIERS)}'
+    if tier != 'reported' and not (is_number(e.get('baseline')) and is_number(e.get('budget'))):
+        return f'{name}: baseline and budget must be numbers'
+    return None
+
+
+def entry_errors(budgets: dict, e: dict) -> list[str]:
+    """The rule errors of an entry check_shape passed."""
+    tier = e['tier']
     out = []
     if not isinstance(e.get('source'), str) or not e['source']:
         out.append('no source')
@@ -148,9 +205,7 @@ def entry_errors(budgets: dict, e: dict) -> list[str]:
         out.append('only a gated entry carries its own headroom')
     if tier == 'reported':
         return out
-    baseline, budget = e.get('baseline'), e.get('budget')
-    if not is_number(baseline) or not is_number(budget):
-        return [*out, 'baseline and budget must be numbers']
+    baseline, budget = e['baseline'], e['budget']
     if tier == 'exact':
         if budget != baseline:
             out.append(f'an exact budget is its baseline {baseline}, not {budget}')
@@ -720,8 +775,8 @@ def load_calibration(run_id, calibrations, repo, runner, head_sha, verify, is_an
     if failure:
         return None, f'calibration {run_id}: the bundle does not verify: {failure}'
     try:
-        doc = loads(blob.read_text())
-    except ValueError as exc:
+        doc = load(blob)
+    except (ValueError, TypeError) as exc:
         return None, f'calibration {run_id}: {exc}'
     for field, want in (('run_id', run_id), ('repo', repo), ('runner', runner)):
         if str(doc.get(field)) != str(want):
@@ -799,8 +854,12 @@ def cosign_verify(blob, bundle, identity: str = IDENTITY) -> str | None:
 # --- files and the command line --------------------------------------------
 
 
-def load(path: str) -> dict:
-    return loads(pathlib.Path(path).read_text())
+def load(path: str | pathlib.Path) -> dict:
+    """The JSON object at path, read by loads; any other document is a TypeError."""
+    doc = loads(pathlib.Path(path).read_text())
+    if not isinstance(doc, dict):
+        raise TypeError(f'{path}: must be a JSON object')
+    return doc
 
 
 def result_files(
@@ -835,7 +894,7 @@ def merge(paths: list[pathlib.Path]) -> dict:
     merged['seconds'] = []
     seen = set()
     for p in paths:
-        doc = loads(p.read_text())
+        doc = load(p)
         if merged['runner'] is None:
             merged['runner'] = doc.get('runner')
         elif doc.get('runner') != merged['runner']:
@@ -917,11 +976,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def load_base(path: str) -> dict:
     p = pathlib.Path(path)
-    return loads(p.read_text()) if p.is_file() else {'budgets': []}
+    return load(p) if p.is_file() else {'budgets': []}
 
 
 def file_errors(a: argparse.Namespace, head: dict) -> list[str]:
     errors = check_rule(head)
+    if check_shape(head):
+        return errors
     if a.plan_doc:
         errors += check_plan(head, load(a.plan_doc))
     errors += check_provenance(
@@ -1008,15 +1069,17 @@ def run(a: argparse.Namespace) -> int:
             print(f'::error::{e}')
         return 1 if errors else 0
     budgets = load(a.budgets)
-    results = merge_results(a.results, a.prefix)
-    if a.verdict:
+    if check_shape(budgets):
+        out = Outcome(failures=check_rule(budgets))
+    elif a.verdict:
+        results = merge_results(a.results, a.prefix)
         out = verdict(budgets, results, merge_results(a.verdict, a.prefix, 'remeasure'))
     else:
         errors = file_errors(a, budgets)
         only = a.only.replace(',', ' ').split()
         matrix = plan(load(a.plan_doc), a.set, only=only)
         units = planned_windows(c for job in matrix['include'] for c in job['cells'])
-        out = compare(budgets, results, units)
+        out = compare(budgets, merge_results(a.results, a.prefix), units)
         out.failures = errors + out.failures
         scenarios = sorted({c['scenario'] for c in out.remeasure})
         doc = {'cells': out.remeasure, 'scenarios': scenarios}
