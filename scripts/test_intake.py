@@ -789,7 +789,7 @@ class Workflow(unittest.TestCase):
         proc, summary = self.aggregate()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn('pr-policy: skipped', proc.stdout)
-        self.assertIn('of 17 dispatched jobs', summary)
+        self.assertIn('of 18 dispatched jobs', summary)
         self.assertIn('| pr-policy | skipped |\n', summary)
 
     def test_validate_fails_on_a_failed_pr_policy(self):
@@ -805,9 +805,9 @@ class Workflow(unittest.TestCase):
                 proc, summary = self.aggregate('dev', go='success', **flags)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertNotIn('pr-policy', proc.stdout + summary)
-                self.assertIn('of 16 dispatched jobs', summary)
+                self.assertIn('of 17 dispatched jobs', summary)
 
-    def test_a_main_default_validate_reports_sixteen_jobs_and_no_pr_policy(self):
+    def test_a_main_default_validate_reports_seventeen_jobs_and_no_pr_policy(self):
         proc, summary = self.aggregate('main', go='success')
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn('pr-policy', proc.stdout)
@@ -824,6 +824,7 @@ class Workflow(unittest.TestCase):
                 ('ts-nested', 'skipped'),
                 ('shell', 'skipped'),
                 ('deadset', 'skipped'),
+                ('perf', 'skipped'),
                 ('docker', 'skipped'),
                 ('docker-arm64', 'skipped'),
                 ('markdown', 'success'),
@@ -835,7 +836,7 @@ class Workflow(unittest.TestCase):
         self.assertEqual(
             summary,
             '## CI validate\n\n'
-            '**ran 3 / skipped 13** (of 16 dispatched jobs; detect: success)\n\n'
+            '**ran 3 / skipped 14** (of 17 dispatched jobs; detect: success)\n\n'
             '| Job | Result |\n|---|---|\n' + rows,
         )
 

@@ -1,0 +1,297 @@
+# Weekly performance run of every public cplieger repository that carries
+# tests/perf/plan.json. Pattern C, like weekly-bench: this workflow owns the
+# matrix and the max-parallel cap. A pull request measures only the `pr` set,
+# so this measures the `full` set on the default branch, gated on its budgets,
+# and charts each cell's median on the repository's `benchmarks` branch.
+# Mondays 22:00 UTC, the one evening no other weekly run holds.
+name: Weekly perf
+
+on:
+  schedule:
+    - cron: "0 22 * * 1"   # Monday 22:00 UTC
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Comma/space-separated repo names to limit the run. Empty measures every enrolled repository."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  # Chart pushes happen in CONSUMER repos via the CI_SCHEDULE PAT.
+
+concurrency:
+  group: weekly-perf
+  cancel-in-progress: false
+
+jobs:
+  fanout:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.fanout.outputs.matrix }}
+      unread: ${{ steps.fanout.outputs.unread }}
+    steps:
+      - name: Discover repositories carrying tests/perf/plan.json
+        id: fanout
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          # Injected via env (never inline ${{ }} in the body) so a crafted
+          # dispatch input cannot expand into shell code.
+          ONLY: ${{ github.event.inputs.only }}
+        run: |
+          set -euo pipefail
+
+          # REST, not the GraphQL `gh repo list`. Public only: this repository's
+          # run logs and artifacts are world-readable (CONTRIBUTING.md).
+          live=$(gh api --paginate 'user/repos?per_page=100&affiliation=owner' --jq '
+            .[] | select(.archived == false and .fork == false and .visibility == "public") | .name
+          ' | tr '\n' ' ')
+          repos=${live% }
+          if [ -z "$repos" ]; then
+            echo "::error::the listing returned no public live repository - refusing to report a green run"
+            exit 1
+          fi
+
+          if [ -n "${ONLY:-}" ]; then
+            wanted=" $(echo "$ONLY" | tr ',' ' ') "
+            filtered=""
+            for r in $repos; do
+              case "$wanted" in *" $r "*) filtered="$filtered $r" ;; esac
+            done
+            repos=${filtered# }
+            echo "manual 'only' filter active -> ${repos:-<none matched>}"
+          fi
+
+          # Enrolment is a file, so every listed repository is read: a tree-only
+          # clone (no blobs, no checkout) draws no API quota and answers ls-tree.
+          # A repository that cannot be read is named in `unread`, which fails
+          # the run after the readable ones are measured.
+          matrix='[]'
+          unread=""
+          for r in $repos; do
+            rm -rf scan
+            if ! timeout 120 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+              clone --quiet --depth 1 --filter=blob:none --no-checkout "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
+              echo "::warning::clone failed or timed out for ${r}"
+              unread="$unread $r"
+              continue
+            fi
+            if ! sha=$(git -C scan rev-parse HEAD 2>/dev/null) \
+              || ! found=$(git -C scan ls-tree --name-only "$sha" -- tests/perf/plan.json 2>/dev/null); then
+              echo "::warning::cannot read the default branch of ${r}"
+              unread="$unread $r"
+              continue
+            fi
+            [ -n "$found" ] || continue
+            echo "  include ${r} @ ${sha:0:12}"
+            matrix=$(printf '%s' "$matrix" | jq -c --arg r "$r" --arg s "$sha" '. + [{repo: $r, sha: $s}]')
+          done
+          rm -rf scan
+
+          {
+            echo "matrix=${matrix}"
+            echo "unread=${unread# }"
+          } >> "$GITHUB_OUTPUT"
+          echo "Total entries: $(printf '%s' "$matrix" | jq 'length')"
+
+          # No enrolled repository is a real state of the fleet, but a dispatch
+          # that names repositories expects them measured.
+          if [ "$(printf '%s' "$matrix" | jq 'length')" -eq 0 ]; then
+            if [ -n "${ONLY:-}" ]; then
+              echo "::error::'only' named no readable repository carrying tests/perf/plan.json"
+              exit 1
+            fi
+            echo "::notice::no public repository carries tests/perf/plan.json"
+          fi
+
+  unread:
+    needs: fanout
+    if: ${{ needs.fanout.outputs.unread != '' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Fail on an unread repository
+        env:
+          UNREAD: ${{ needs.fanout.outputs.unread }}
+        run: |
+          echo "::error::could not read ${UNREAD}, so a repository carrying tests/perf/plan.json may have gone unmeasured"
+          exit 1
+
+  # One repository at a time with ten measure jobs each: the full set's 20
+  # shards run in two waves and leave the account's 20-job cap its margin.
+  perf:
+    needs: fanout
+    if: ${{ needs.fanout.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/perf-ci.yaml
+    with:
+      repository: cplieger/${{ matrix.repo }}
+      ref: ${{ matrix.sha }}
+      set: full
+      max-parallel: 10
+
+  # Writes each repository's medians to its `benchmarks` branch, from the
+  # artifacts its perf entry uploaded, in a job that runs no measured code.
+  publish:
+    needs: [fanout, perf]
+    if: ${{ !cancelled() && needs.fanout.result == 'success' && needs.fanout.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout ci (for the chart points and the attribution fix)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this job pushes with checkout-persisted credentials;
+          # the chart push authenticates via CI_SCHEDULE below.
+          persist-credentials: false
+          path: _ci
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      # perf-ci.yaml names its artifacts after the repository with `/` as `-`.
+      - name: Download this entry's results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: results
+          pattern: perf-results-cplieger-${{ matrix.repo }}-measure-shard-*
+
+      # perf_gate.py --prefix reads only this repository's shards: the pattern
+      # also matches a repository named `<repo>-measure-shard-<x>`.
+      - name: Chart points
+        id: points
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 _ci/scripts/perf_gate.py --bench results --prefix "cplieger-${REPO}" --out bench.json
+          if jq -e 'type == "array" and length > 0' bench.json >/dev/null; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::${REPO}: no measured cell from the perf entry, so nothing was published"
+          fi
+
+      # The action cannot bootstrap a missing data branch (weekly-bench.yaml's
+      # step of the same name); two entries never race here, one per repo.
+      - name: Ensure benchmarks branch exists
+        if: ${{ steps.points.outputs.ok == 'true' }}
+        env:
+          REPO: ${{ matrix.repo }}
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads \
+            "https://github.com/cplieger/${REPO}.git" benchmarks >/dev/null 2>&1; then
+            echo "benchmarks branch exists in ${REPO}"
+            exit 0
+          fi
+          tmp=$(mktemp -d)
+          git -C "$tmp" init -q -b benchmarks
+          git -C "$tmp" config user.name 'github-actions[bot]'
+          git -C "$tmp" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$tmp" commit -q --allow-empty -m 'ci: bootstrap benchmark data branch'
+          git -C "$tmp" push -q \
+            "https://x-access-token:${GH_TOKEN}@github.com/cplieger/${REPO}.git" \
+            benchmarks:benchmarks
+          rm -rf "$tmp"
+          echo "benchmarks branch ready in ${REPO}"
+
+      # Under `perf/`, beside weekly-bench's Go series. Report-only: a
+      # wall-clock change on a shared runner is evidence, and the budgets are
+      # the gate.
+      - name: Publish + compare
+        if: ${{ steps.points.outputs.ok == 'true' }}
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
+        with:
+          tool: customSmallerIsBetter
+          output-file-path: bench.json
+          github-token: ${{ secrets.CI_SCHEDULE }}
+          gh-repository: github.com/cplieger/${{ matrix.repo }}
+          gh-pages-branch: benchmarks
+          benchmark-data-dir-path: perf
+          auto-push: true
+          alert-threshold: "150%"
+          # The action comments on github.context.repo, which is cplieger/ci
+          # under Pattern C (weekly-bench.yaml's same setting).
+          comment-on-alert: false
+          summary-always: true
+          fail-on-alert: false
+          max-items-in-chart: 100
+
+      # The action stamps the point with the cplieger/ci commit it runs in;
+      # bench-fix-attribution.py re-points it at the measured commit.
+      - name: Re-point the data point at the measured commit
+        if: ${{ steps.points.outputs.ok == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
+          REPO: ${{ matrix.repo }}
+          SHA: ${{ matrix.sha }}
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          data=perf/data.js
+
+          gh api "repos/cplieger/${REPO}/commits/${SHA}" > "$work/commit.json"
+
+          for attempt in 1 2 3 4 5; do
+            rm -rf "$work/data"
+            git clone --quiet --depth 1 --branch benchmarks \
+              "https://x-access-token:${GH_TOKEN}@github.com/cplieger/${REPO}.git" \
+              "$work/data"
+
+            python3 _ci/scripts/bench-fix-attribution.py \
+              --data-file "$work/data/${data}" \
+              --expect-commit "$GITHUB_SHA" \
+              --commit-json "$work/commit.json" \
+              --repo-url "https://github.com/cplieger/${REPO}"
+
+            if git -C "$work/data" diff --quiet -- "$data"; then
+              echo "${data} already correct - nothing to push"
+              exit 0
+            fi
+
+            git -C "$work/data" \
+              -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit --quiet -m "ci: attribute performance data to ${SHA}" -- "$data"
+            if git -C "$work/data" push --quiet origin benchmarks; then
+              echo "re-pointed ${REPO} ${data} at ${SHA}"
+              exit 0
+            fi
+            echo "::warning::push of ${REPO} ${data} refused (attempt ${attempt}), retrying from a fresh clone"
+            sleep $((attempt * 3))
+          done
+          echo "::error::could not push ${REPO} ${data} after 5 attempts"
+          exit 1
+
+  # `needs:` must list every other job in this workflow.
+  notify:
+    needs: [fanout, unread, perf, publish]
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/notify-failure.yaml
+    with:
+      workflow: ${{ github.workflow }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      scope: ${{ inputs.only }}

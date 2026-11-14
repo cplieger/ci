@@ -24,6 +24,8 @@ TAKES_RUNNER = (
     'shell-ci.yaml',
     'deadset-ci.yaml',
     'security-scan.yaml',
+    'perf-ci.yaml',
+    'perf-measure.yaml',
 )
 POOL = "${{ inputs.runner || 'ubuntu-26.04' }}"
 FORWARD = '${{ inputs.runner }}'
@@ -31,6 +33,7 @@ HOSTED = {
     ('ci.yaml', 'docker'): 'ubuntu-26.04',
     ('ci.yaml', 'docker-arm64'): 'ubuntu-26.04-arm',
     ('security-scan.yaml', 'trivy'): 'ubuntu-26.04',
+    ('perf-ci.yaml', 'plan'): 'ubuntu-26.04',
 }
 CONDITIONAL = {
     (

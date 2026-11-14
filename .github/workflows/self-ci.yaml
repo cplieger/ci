@@ -173,6 +173,9 @@ jobs:
     timeout-minutes: 8
     permissions:
       contents: read
+    env:
+      # renovate: datasource=github-releases depName=sigstore/cosign
+      COSIGN_VERSION: v3.1.4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -212,6 +215,13 @@ jobs:
         with:
           go-version: stable
           cache: false
+
+      # test_perf_gate.py verifies a real Sigstore bundle, and fails in CI when
+      # cosign is missing rather than skipping.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
 
       - name: Probe the release-channel scripts
         env:
