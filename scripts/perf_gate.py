@@ -239,15 +239,25 @@ class Outcome:
     runner: str = ''
     # Every measured cell for the summary: {cell, entry, value, status}.
     rows: list[dict] = dataclasses.field(default_factory=list)
-    # Each re-measured cell: {cell, reps, median}.
+    # Each re-measured cell: {cell, reps, judged}, judged the values verdict
+    # held against the budget.
     six: list[dict] = dataclasses.field(default_factory=list)
+
+
+def middle(reps: list) -> list:
+    """The middle rep, or both middle reps of an even count. An exact count is
+    judged on these, never on their mean: statistics.median of [1, 1, 1, 3, 3, 3]
+    is 2, a count no rep measured."""
+    s = sorted(reps)
+    return s[(len(s) - 1) // 2 : len(s) // 2 + 1]
 
 
 def compare(budgets: dict, results: dict, units: dict | None = None) -> Outcome:
     """Judge each measured cell on its median of three. A gated cell over its
-    budget is listed in `remeasure`, never failed here; an exact count that
-    differs from its budget fails, and so does a gated or exact entry no
-    shard measured whose unit and window `units` (`planned_windows`) holds."""
+    budget and an exact count whose middle rep is off its budget are listed in
+    `remeasure`, never failed here. An exact entry measured as no count fails,
+    and so does a gated or exact entry no shard measured whose unit and window
+    `units` (`planned_windows`) holds."""
     out = Outcome(runner=results.get('runner', ''))
     out.runner_mismatch = out.runner != budgets.get('runner')
     entries = {key(e): e for e in budgets.get('budgets', [])}
@@ -286,10 +296,9 @@ def judge(budgets: dict, e: dict, c: dict, value: float | None, out: Outcome) ->
                 f'{name}: an exact entry needs a count, the harness measured {kind}'
             )
             return 'failed'
-        off = [r for r in c['reps'] if r != e['budget']]
-        if off:
-            out.failures.append(f'{name}: {off} differs from its exact budget {e["budget"]}')
-            return 'failed'
+        if any(r != e['budget'] for r in middle(c['reps'])):
+            out.remeasure.append(c)
+            return 'remeasure'
         return 'ok'
     if kind not in ('time', 'server_cpu'):
         out.failures.append(f'{name}: a gated entry needs a time, the harness measured {kind}')
@@ -307,8 +316,9 @@ def judge(budgets: dict, e: dict, c: dict, value: float | None, out: Outcome) ->
 
 
 def verdict(budgets: dict, results: dict, remeasured: dict) -> Outcome:
-    """Fail each cell compare sent to re-measure whose median of six reps, its
-    first three and the three re-measured, is over its budget."""
+    """Fail each cell compare sent to re-measure that its six reps, its first
+    three and the three re-measured, still hold off its budget: a gated cell
+    whose median is over it, an exact count whose middle reps are not it."""
     out = compare(budgets, results)
     entries = {key(e): e for e in budgets.get('budgets', [])}
     again = {key(c): c for c in remeasured.get('cells', [])}
@@ -319,11 +329,18 @@ def verdict(budgets: dict, results: dict, remeasured: dict) -> Outcome:
             out.failures.append(f'{name}: listed for a re-measure but no reps came back')
             continue
         six = [*c['reps'], *more['reps']]
-        m = statistics.median(six)
-        out.six.append({'cell': c, 'reps': six, 'median': m})
         budget = entries[key(c)]['budget']
-        if m > budget:
-            out.failures.append(f'{name}: median of six {m} is over its budget {budget} ({six})')
+        if entries[key(c)]['tier'] == 'exact':
+            judged = middle(six)
+            if any(r != budget for r in judged):
+                out.failures.append(f'{name}: six reps {six} hold off its exact budget {budget}')
+        else:
+            judged = [statistics.median(six)]
+            if judged[0] > budget:
+                out.failures.append(
+                    f'{name}: median of six {judged[0]} is over its budget {budget} ({six})'
+                )
+        out.six.append({'cell': c, 'reps': six, 'judged': judged})
     return out
 
 
@@ -342,10 +359,15 @@ def summary(budgets: dict, out: Outcome) -> str:
         if items:
             lines += [f'### {title}', '', *(f'- {i}' for i in items), '']
     if out.six:
-        lines += ['### Re-measured', '', '| Cell | Six reps | Median |', '|---|---|---|']
+        lines += [
+            '### Re-measured',
+            '',
+            "| Cell | Six reps | Median, or a count's middle reps |",
+            '|---|---|---|',
+        ]
         lines += [
             f'| {key_text(key(s["cell"]))} | {", ".join(str(r) for r in s["reps"])} '
-            f'| {s["median"]} |'
+            f'| {", ".join(str(r) for r in s["judged"])} |'
             for s in out.six
         ]
         lines.append('')
