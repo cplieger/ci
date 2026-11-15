@@ -2,8 +2,8 @@ name: Performance
 
 # The tier 2 performance gate of a repository that carries tests/perf/plan.json:
 # plan, build once, measure in shards, compare against tests/perf/budgets.json,
-# re-measure a red time or memory cell on new runners, then judge it on six
-# reps. scripts/perf_gate.py owns the rule; the repository owns build.sh,
+# re-measure a red cell (a time, memory or count) on new runners, then judge it
+# on six reps. scripts/perf_gate.py owns the rule; the repository owns build.sh,
 # run.sh, the scenarios and the budgets.
 
 on:

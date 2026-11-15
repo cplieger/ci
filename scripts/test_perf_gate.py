@@ -157,15 +157,27 @@ class TheRule(unittest.TestCase):
 
 
 class Compare(unittest.TestCase):
-    def test_an_exact_count_that_differs_from_its_baseline_fails_at_compare(self):
+    def test_an_exact_count_whose_middle_rep_is_its_budget_passes(self):
         b = budgets([entry(metric='dom', tier='exact', baseline=640)])
-        for reps in ((641, 641, 641), (639, 639, 639)):
+        for reps in ((640, 640, 640), (641, 640, 640), (640, 639, 640), (639, 640, 641)):
             with self.subTest(reps=reps):
                 out = perf_gate.compare(b, results([cell('dom', reps, kind='count')]))
-                self.assertTrue(out.failures)
-                self.assertEqual(out.remeasure, [])
-        out = perf_gate.compare(b, results([cell('dom', (640, 640, 640), kind='count')]))
-        self.assertEqual(out.failures, [])
+                self.assertEqual((out.failures, out.remeasure), ([], []))
+
+    def test_an_exact_count_whose_middle_rep_is_off_is_remeasured_not_failed(self):
+        b = budgets([entry(metric='dom', tier='exact', baseline=640)])
+        for reps in ((641, 641, 640), (639, 640, 639), (641, 641, 641), (639, 639, 639)):
+            with self.subTest(reps=reps):
+                out = perf_gate.compare(b, results([cell('dom', reps, kind='count')]))
+                self.assertEqual(out.failures, [])
+                self.assertEqual([keyof(c) for c in out.remeasure], [keyof(entry('dom'))])
+
+    def test_an_exact_entry_the_harness_measured_as_a_time_fails_at_compare(self):
+        b = budgets([entry(metric='dom', tier='exact', baseline=640)])
+        out = perf_gate.compare(b, results([cell('dom', (640.0,) * 3, kind='time')]))
+        self.assertEqual(len(out.failures), 1)
+        self.assertIn('needs a count', out.failures[0])
+        self.assertEqual(out.remeasure, [])
 
     def test_a_gated_cell_is_red_only_when_its_median_of_three_is_over(self):
         b = budgets([entry(budget=1500.0)])
@@ -290,6 +302,75 @@ class Verdict(unittest.TestCase):
         b = budgets([entry(budget=1500.0)])
         out = perf_gate.verdict(b, results([cell(reps=(1400.0, 1400.0, 1400.0))]), results([]))
         self.assertEqual(out.failures, [])
+
+    def test_an_exact_count_fails_only_when_the_middle_of_its_six_reps_is_off(self):
+        b = budgets([entry(metric='dom', tier='exact', baseline=640)])
+        first = results([cell('dom', (641, 641, 640), kind='count')])
+        for more, fails in (
+            ((640, 640, 640), False),
+            ((640, 639, 640), False),
+            ((641, 640, 640), True),
+            ((641, 641, 641), True),
+        ):
+            with self.subTest(more=more):
+                again = results([cell('dom', more, kind='count')])
+                out = perf_gate.verdict(b, first, again)
+                self.assertEqual(bool(out.failures), fails)
+                self.assertEqual(len(out.six), 1)
+
+    def test_an_exact_count_whose_six_reps_straddle_its_budget_fails(self):
+        # Their median is the budget, 2, though no rep measured it.
+        b = budgets([entry(metric='reads', tier='exact', baseline=2)])
+        first = results([cell('reads', (1, 1, 3), kind='count')])
+        out = perf_gate.verdict(b, first, results([cell('reads', (3, 3, 1), kind='count')]))
+        self.assertEqual(len(out.failures), 1)
+        self.assertIn('| 1, 3 |', perf_gate.summary(b, out))
+
+    def test_a_count_every_rep_moved_fails_on_its_six_reps(self):
+        b = budgets([entry(metric='dom', tier='exact', baseline=640)])
+        first = results([cell('dom', (641,) * 3, kind='count')])
+        self.assertEqual(perf_gate.compare(b, first).failures, [])
+        out = perf_gate.verdict(b, first, results([cell('dom', (641,) * 3, kind='count')]))
+        self.assertEqual(len(out.failures), 1)
+        self.assertIn('exact budget 640', out.failures[0])
+
+    def test_the_held_out_runs_that_failed_an_agreed_count_pass(self):
+        entries, first, again = [], [], []
+        for name, budget, reps, more in HELD_OUT:
+            k = dict(zip(perf_gate.KEY_FIELDS, name.split('/', 5), strict=True))
+            entries.append({**entry(tier='exact', baseline=budget), **k})
+            first.append({**cell(reps=reps, kind='count'), **k})
+            again.append({**cell(reps=more, kind='count'), **k})
+        b = budgets(entries)
+        out = perf_gate.compare(b, results(first))
+        self.assertEqual(out.failures, [])
+        self.assertEqual(len(out.remeasure), 3)
+        self.assertEqual(perf_gate.verdict(b, results(first), results(again)).failures, [])
+
+
+# Count cells of marotte's calibrations 43591500420 and 43598120088 that every
+# rep of the other runs agreed on, as one held-out run and the next run
+# measured them: (cell, the agreed count, its reps, the re-measure's reps).
+HELD_OUT = (
+    ('chat-long/x10/chromium/desktop/live/sse_frames', 226, (227, 226, 226), (226,) * 3),
+    ('history-runs/x10/chromium/desktop/cold/reads:GET /api/chats', 2, (2, 1, 2), (2,) * 3),
+    (
+        'run-page/x10/chromium/desktop/back/reads:GET /api/runs/{run}?view=glance',
+        2,
+        (3, 2, 2),
+        (2,) * 3,
+    ),
+    (
+        'git-prs/x1/chromium/phone/cold/max_bytes:GET /api/forges/inventory',
+        69180,
+        (69180, 69180, 68200),
+        (69180,) * 3,
+    ),
+    ('chat-stream/x1/chromium/phone/back/dom', 6570, (6570, 8102, 6570), (6570,) * 3),
+    ('chat-long/x1/chromium/phone/cold/sse_frames', 3, (4, 4, 3), (3,) * 3),
+    ('run-page/x1/chromium/desktop/cold/sse_frames', 3, (4, 4, 3), (3,) * 3),
+    ('tabs/x1/chromium/desktop/cold/sse_frames', 3, (4, 3, 4), (3,) * 3),
+)
 
 
 def run_doc(reps_by_cell, seconds=70.0):
@@ -970,10 +1051,23 @@ class Cli(unittest.TestCase):
         self.assertEqual([keyof(c) for c in remeasure['cells']], [keyof(entry())])
         self.assertEqual(remeasure['scenarios'], ['files'])
 
-    def test_compare_fails_on_an_exact_count(self):
+    def test_compare_writes_an_exact_count_off_its_budget_to_remeasure_and_passes(self):
         rc = self.compare([cell(), cell('dom', (700,) * 3, kind='count')])
-        self.assertEqual(rc, 1)
-        self.assertEqual(json.loads((self.dir / 'remeasure.json').read_text())['cells'], [])
+        self.assertEqual(rc, 0)
+        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
+        self.assertEqual([keyof(c) for c in remeasure['cells']], [keyof(entry('dom'))])
+
+    def test_verdict_fails_an_exact_count_whose_six_reps_are_off(self):
+        b = self.put('budgets.json', budgets([entry('dom', 'exact', 640)]))
+        self.put(
+            'results/shard-1/results.json', results([cell('dom', (700, 640, 700), kind='count')])
+        )
+        argv = ('--budgets', b, '--results', str(self.dir / 'results'))
+        for more, rc in (((640,) * 3, 0), ((700, 640, 700), 1)):
+            with self.subTest(more=more):
+                again = results([cell('dom', more, kind='count')])
+                self.put('again/shard-1/results.json', again)
+                self.assertEqual(self.main('--verdict', str(self.dir / 'again'), *argv), rc)
 
     def test_compare_fails_on_a_listed_cell_no_shard_measured(self):
         self.assertEqual(self.compare([cell()]), 1)
