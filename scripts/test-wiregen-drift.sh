@@ -245,6 +245,28 @@ run_step "$t"
 expect_rc 'empty: passes' 0
 expect_has 'empty: skips' 'skipping'
 
+echo 'a generated file never committed'
+t="$WORK/uncommitted"
+root_app "$t"
+rm "$t/api.gen.go"
+commit "$t"
+run_step "$t"
+expect_rc 'uncommitted: a generated file never committed fails' 1
+expect_has 'uncommitted: the new file is listed' 'api.gen.go'
+expect_marker 'uncommitted: writes the failure marker'
+
+echo 'a generator module whose go directive is ahead of the toolchain'
+t="$WORK/newgo"
+root_app "$t"
+gomod "$t/gen" example.com/gen "$(uses_wiregen github.com/cplieger/wiregen)"
+sed -i 's/^go .*/go 1.99/' "$t/gen/go.mod"
+generator "$t/gen" github.com/cplieger/wiregen gen.gen.json '"{}\n"'
+commit "$t"
+run_step "$t"
+expect_rc 'toolchain: a newer go directive is fetched, not refused' 1
+expect_has 'toolchain: the newer toolchain is fetched' 'downloading go1.99'
+expect_lacks 'toolchain: no local-toolchain refusal' 'GOTOOLCHAIN=local'
+
 echo 'an index git cannot write'
 t="$WORK/locked"
 root_app "$t"

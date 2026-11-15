@@ -126,9 +126,9 @@ jobs:
       # `*.gen.*` is wiregen's output naming and scopes both the presence test and
       # the diff, so a generator emitting another name goes unmeasured. Discovery
       # is per module: each generator runs from its nearest go.mod's directory.
-      # Discovery and the presence list prune testdata, fixtures, node_modules and
-      # vendor (a corpus can hold Buf's buf.gen.yaml); the diff covers every
-      # `*.gen.*`. scripts/test-wiregen-drift.sh runs this body by its step name.
+      # Discovery prunes testdata, fixtures, node_modules and vendor; the presence
+      # list also prunes static and dist (a corpus can hold Buf's buf.gen.yaml);
+      # the diff covers every `*.gen.*`. scripts/test-wiregen-drift.sh runs this body.
       - name: Wiregen drift
         id: wiregen-drift
         continue-on-error: true
