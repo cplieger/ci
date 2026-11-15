@@ -1,7 +1,8 @@
 """security-scan.yaml and daily-security.yaml: a repository whose default branch is
 main runs HEAD's steps and calls (testdata/security-scan/head.json, generated from
 HEAD before the published mode existed), and a two-branch repository's main scans
-its published image."""
+its published image. Since then the profile step moved into its own job, which
+picks trivy's runner, and cosign installs from its pinned digest."""
 
 from __future__ import annotations
 
@@ -36,7 +37,6 @@ BUILD_STEPS = (
     'Trivy image scan (advisory)',
 )
 PUBLISHED_STEPS = (
-    "Record the verified cosign's digest",
     'Trivy filesystem scan for the main summary',
     'Upload the filesystem report',
 )
@@ -49,6 +49,10 @@ TODAY = [
     ('dev', 'workflow_dispatch', 'refs/heads/dev'),
 ]
 PUBLISHED = ('dev', 'workflow_dispatch', 'refs/heads/main')
+# HEAD's trivy steps that changed on purpose: the profile moved to the profile
+# job, and cosign-installer, which a pool runner cannot run, became a download.
+MOVED = 'Resolve profile'
+RENAMED = {'Install Cosign': 'Install cosign'}
 
 
 class Scope(workflow_replay.Scope):
@@ -116,9 +120,11 @@ def profile(
 
 
 def running(job: dict, ctx: tuple[str, str, str], outputs: dict[str, str]) -> list[str]:
+    """The steps that run, given the profile as HEAD's step or the new job outputs it."""
     sc = scope(
         github=github(*ctx),
         steps={'profile': {'outputs': outputs}},
+        needs={'profile': {'outputs': outputs, 'result': 'success'}},
         inputs={'severity': 'HIGH,CRITICAL', 'dockerfile': './Dockerfile'},
         env={},
     )
@@ -127,7 +133,7 @@ def running(job: dict, ctx: tuple[str, str, str], outputs: dict[str, str]) -> li
 
 def needs(published: str, image: str = 'true', platforms: str = '') -> dict:
     return {
-        'trivy': {'outputs': {'published': published, 'image': image}, 'result': 'success'},
+        'profile': {'outputs': {'published': published, 'image': image}, 'result': 'success'},
         'published-image': {'outputs': {'platforms': platforms}, 'result': 'success'},
     }
 
@@ -138,20 +144,24 @@ class SecurityScanForMainDefaultRepos(unittest.TestCase):
         self.head = unpinned(HEAD['security-scan.yaml'])
 
     def test_every_run_today_resolves_head_s_profile_and_runs_head_s_steps(self):
-        new, old = self.wf['jobs']['trivy'], self.head['trivy']
+        new, old = self.wf['jobs'], self.head['trivy']
         for ctx in TODAY:
             for dockerfile in (True, False):
                 with self.subTest(ctx=ctx, dockerfile=dockerfile):
-                    got = profile(new, ctx, dockerfile=dockerfile)
+                    got = profile(new['profile'], ctx, dockerfile=dockerfile)
                     want = profile(old, ctx, dockerfile=dockerfile)
                     self.assertEqual(got, {**want, 'published': 'false'})
-                    self.assertEqual(running(new, ctx, got), running(old, ctx, want))
+                    head = [RENAMED.get(n, n) for n in running(old, ctx, want) if n != MOVED]
+                    self.assertEqual(running(new['trivy'], ctx, got), head)
 
     def test_every_head_step_is_unchanged_but_for_its_condition(self):
         new = {s['name']: s for s in self.wf['jobs']['trivy']['steps']}
+        moved = {s['name']: s for s in self.wf['jobs']['profile']['steps']}
         for step in self.head['trivy']['steps']:
+            if step['name'] in RENAMED:
+                continue
             with self.subTest(step=step['name']):
-                got = dict(new[step['name']])
+                got = dict((moved if step['name'] == MOVED else new)[step['name']])
                 if step.get('id') == 'profile':
                     self.assertTrue(got.pop('run').startswith(step['run']))
                     got.pop('env')
@@ -163,12 +173,25 @@ class SecurityScanForMainDefaultRepos(unittest.TestCase):
         names = [s['name'] for s in self.wf['jobs']['trivy']['steps']]
         self.assertEqual(
             [n for n in names if n not in PUBLISHED_STEPS],
-            [s['name'] for s in self.head['trivy']['steps']],
+            [
+                RENAMED.get(s['name'], s['name'])
+                for s in self.head['trivy']['steps']
+                if s['name'] != MOVED
+            ],
         )
+        self.assertEqual(list(moved), ['Checkout', MOVED])
 
-    def test_the_trivy_job_only_gains_outputs_and_the_history_scan_is_untouched(self):
-        job = {k: v for k, v in self.wf['jobs']['trivy'].items() if k not in ('outputs', 'steps')}
-        self.assertEqual(job, {k: v for k, v in self.head['trivy'].items() if k != 'steps'})
+    def test_the_trivy_job_only_gains_its_runner_choice_and_the_history_scan_is_untouched(self):
+        job = {k: v for k, v in self.wf['jobs']['trivy'].items() if k != 'steps'}
+        self.assertEqual(job.pop('needs'), 'profile')
+        runs_on = job.pop('runs-on')
+        for image in ('true', 'false'):
+            with self.subTest(image=image):
+                sc = scope(needs=needs('false', image=image), inputs={'runner': ''})
+                self.assertEqual(sc.render(runs_on), 'ubuntu-26.04')
+        head = {k: v for k, v in self.head['trivy'].items() if k != 'steps'}
+        self.assertEqual(head.pop('runs-on'), 'ubuntu-26.04')
+        self.assertEqual(job, head)
         history, head = (
             dict(self.wf['jobs']['gitleaks-history']),
             dict(self.head['gitleaks-history']),
@@ -176,7 +199,9 @@ class SecurityScanForMainDefaultRepos(unittest.TestCase):
         self.assertEqual(history.pop('runs-on'), "${{ inputs.runner || 'ubuntu-26.04' }}")
         self.assertEqual(head.pop('runs-on'), 'ubuntu-26.04')
         self.assertEqual(history, head)
-        self.assertEqual(sorted(self.wf['jobs']), sorted([*self.head['jobs'], *PUBLISHED_JOBS]))
+        self.assertEqual(
+            sorted(self.wf['jobs']), sorted([*self.head['jobs'], 'profile', *PUBLISHED_JOBS])
+        )
 
     def test_no_published_job_runs_outside_the_published_mode(self):
         for ctx in TODAY:
@@ -192,7 +217,7 @@ class SecurityScanPublishedMode(unittest.TestCase):
         self.jobs = self.wf['jobs']
 
     def test_main_of_a_two_branch_repo_scans_instead_of_building(self):
-        out = profile(self.jobs['trivy'], PUBLISHED, dockerfile=True)
+        out = profile(self.jobs['profile'], PUBLISHED, dockerfile=True)
         self.assertEqual(out, {'image': 'true', 'published': 'true'})
         steps = running(self.jobs['trivy'], PUBLISHED, out)
         self.assertLessEqual(set(PUBLISHED_STEPS), set(steps))
@@ -206,13 +231,13 @@ class SecurityScanPublishedMode(unittest.TestCase):
             ('dev', 'push', 'refs/heads/dev'),
         ):
             with self.subTest(ctx=ctx):
-                out = profile(self.jobs['trivy'], ctx, dockerfile=True)
+                out = profile(self.jobs['profile'], ctx, dockerfile=True)
                 self.assertEqual(out['published'], 'false')
 
     def test_main_of_a_private_or_forked_dev_default_repo_is_not_published(self):
         for repo in ({'private': True}, {'fork': True}):
             with self.subTest(**repo):
-                out = profile(self.jobs['trivy'], PUBLISHED, dockerfile=True, **repo)
+                out = profile(self.jobs['profile'], PUBLISHED, dockerfile=True, **repo)
                 self.assertEqual(out, {'image': 'true', 'published': 'false'})
 
     def test_the_jobs_chain_on_the_profile_and_the_resolved_platforms(self):
@@ -227,7 +252,7 @@ class SecurityScanPublishedMode(unittest.TestCase):
         for platforms in ('', '[]'):
             sc = scope(github=github(*PUBLISHED), needs=needs('true', platforms=platforms))
             self.assertFalse(sc.condition(self.jobs['trivy-published']['if']))
-        self.assertEqual(self.jobs['summary']['needs'], ['trivy', *PUBLISHED_JOBS[:-1]])
+        self.assertEqual(self.jobs['summary']['needs'], ['profile', 'trivy', *PUBLISHED_JOBS[:-1]])
 
     def test_each_platform_uploads_its_own_sarif_category_and_report(self):
         steps = {s['name']: s for s in self.jobs['trivy-published']['steps']}

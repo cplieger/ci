@@ -32,7 +32,6 @@ FORWARD = '${{ inputs.runner }}'
 HOSTED = {
     ('ci.yaml', 'docker'): 'ubuntu-26.04',
     ('ci.yaml', 'docker-arm64'): 'ubuntu-26.04-arm',
-    ('security-scan.yaml', 'trivy'): 'ubuntu-26.04',
     ('perf-ci.yaml', 'plan'): 'ubuntu-26.04',
 }
 CONDITIONAL = {
@@ -40,6 +39,10 @@ CONDITIONAL = {
         'shell-ci.yaml',
         'validate',
     ): "${{ (inputs.dockerfile == '' && inputs.runner) || 'ubuntu-26.04' }}",
+    (
+        'security-scan.yaml',
+        'trivy',
+    ): "${{ (needs.profile.outputs.image == 'true' && 'ubuntu-26.04') || inputs.runner || 'ubuntu-26.04' }}",
 }
 # go-os-ci.yaml's own `runner` input names its Windows or macOS runner.
 OS_RUNNER = 'go-os-ci.yaml'
@@ -190,9 +193,17 @@ class RunnerInput(unittest.TestCase):
 
 
 class Routing(unittest.TestCase):
-    def runs_on(self, workflow: str, job: str, **context: str) -> str:
+    def runs_on(
+        self,
+        workflow: str,
+        job: str,
+        needs: dict[str, dict[str, str]] | None = None,
+        **context: str,
+    ) -> str:
         spec = load(WORKFLOWS / workflow)['jobs'][job]
         names = {f'inputs.{k}': v for k, v in context.items()}
+        for name, outputs in (needs or {}).items():
+            names |= {f'needs.{name}.outputs.{k}': v for k, v in outputs.items()}
         return Evaluate(spec['runs-on'], names).value()
 
     def test_an_empty_input_runs_on_github(self):
@@ -212,6 +223,24 @@ class Routing(unittest.TestCase):
                 )
                 self.assertEqual(got, want)
 
+    def test_trivy_stays_on_github_only_when_it_builds_a_dockerfile(self):
+        for image, runner, want in (
+            ('true', 'pool', 'ubuntu-26.04'),
+            ('true', '', 'ubuntu-26.04'),
+            ('false', 'pool', 'pool'),
+            ('false', '', 'ubuntu-26.04'),
+        ):
+            with self.subTest(image=image, runner=runner):
+                needs = {'profile': {'image': image}}
+                got = self.runs_on('security-scan.yaml', 'trivy', needs, runner=runner)
+                self.assertEqual(got, want)
+
+    def test_the_profile_job_reads_the_dockerfile_on_the_runner_input(self):
+        jobs = load(WORKFLOWS / 'security-scan.yaml')['jobs']
+        self.assertEqual(jobs['profile']['runs-on'], POOL)
+        self.assertEqual(jobs['trivy']['needs'], 'profile')
+        self.assertEqual(jobs['trivy']['runs-on'], CONDITIONAL[('security-scan.yaml', 'trivy')])
+
     def test_the_evaluator_follows_github_short_circuit_rules(self):
         cases = (
             ("${{ a || 'x' }}", {'a': ''}, 'x'),
@@ -219,6 +248,9 @@ class Routing(unittest.TestCase):
             ("${{ (a == '' && b) || 'x' }}", {'a': '', 'b': ''}, 'x'),
             ("${{ (a == '' && b) || 'x' }}", {'a': 'z', 'b': 'y'}, 'x'),
             ("${{ (a == '' && b) || 'x' }}", {'a': '', 'b': 'y'}, 'y'),
+            ("${{ (a == 'true' && 'h') || b || 'x' }}", {'a': 'true', 'b': 'y'}, 'h'),
+            ("${{ (a == 'true' && 'h') || b || 'x' }}", {'a': 'false', 'b': 'y'}, 'y'),
+            ("${{ (a == 'true' && 'h') || b || 'x' }}", {'a': 'false', 'b': ''}, 'x'),
         )
         for expression, context, want in cases:
             with self.subTest(expression=expression, context=context):
@@ -243,7 +275,8 @@ class PoolReady(unittest.TestCase):
                 for action, binary in NEEDS_HOSTED_IMAGE.items():
                     with self.subTest(workflow=name, job=job, step=s.get('name'), needs=binary):
                         self.assertFalse(s.get('uses', '').startswith(action))
-        hosted = load(WORKFLOWS / 'security-scan.yaml')['jobs']['trivy']['steps']
+        # The check matches a real step: perf-ci.yaml's hosted plan job still uses one.
+        hosted = load(WORKFLOWS / 'perf-ci.yaml')['jobs']['plan']['steps']
         self.assertTrue(
             any(s.get('uses', '').startswith(tuple(NEEDS_HOSTED_IMAGE)) for s in hosted)
         )

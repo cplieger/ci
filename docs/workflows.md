@@ -53,7 +53,7 @@ These jobs stay on GitHub's runners whatever the input says:
 - `docker`, which builds the image, and `docker-arm64`, which builds it on `arm64`;
 - `shell`, when the repository has a `Dockerfile`, because hadolint runs in Docker;
 - `go-os`, on Windows and macOS;
-- the `trivy` job of `security-scan.yaml`, which builds the image;
+- the `trivy` job of `security-scan.yaml`, when the repository has a `Dockerfile`, because it then builds the image;
 - the `plan` job of `perf-ci.yaml`, which installs cosign with `sigstore/cosign-installer`, a step that needs `envsubst`.
 
 `codeql.yaml` takes no `runner` input. It runs only in public repositories, and its Go build uses the Go that GitHub's image carries.
