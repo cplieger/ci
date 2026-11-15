@@ -97,21 +97,43 @@ class Plan(unittest.TestCase):
         )
         self.assertEqual(plan[1]['dockerfile'], 'images/build/Dockerfile')
 
-    def test_dev_tags_the_dev_version_and_moves_the_dev_tag(self):
+    def test_dev_tags_the_dev_version_and_moves_the_dev_and_major_dev_tags(self):
         self.write(POOL)
         _, plan, _ = self.run_plan('dev', 'v1.3.0-dev.4')
         self.assertEqual(
-            (plan[0]['version_tag'], plan[0]['moving_tag']), ('base-v1.3.0-dev.4', 'base-dev')
+            (plan[0]['version_tag'], plan[0]['moving_tags']),
+            ('base-v1.3.0-dev.4', ['base-dev', 'base-v1-dev']),
         )
         self.assertEqual(plan[0]['index_tag'], f'base-sha-{SHA}')
 
-    def test_stable_tags_the_version_and_moves_the_bare_name(self):
+    def test_stable_tags_the_version_and_moves_the_bare_name_and_the_major(self):
         self.write(POOL)
         _, plan, _ = self.run_plan('stable', 'v1.3.0')
         self.assertEqual(
-            (plan[2]['version_tag'], plan[2]['moving_tag']), ('browser-v1.3.0', 'browser')
+            (plan[2]['version_tag'], plan[2]['moving_tags']),
+            ('browser-v1.3.0', ['browser', 'browser-v1']),
         )
         self.assertEqual(plan[2]['index_tag'], f'browser-sha-{SHA}')
+
+    def test_the_major_tag_is_the_versions_whole_major_number(self):
+        self.write({'base': 'FROM scratch\n'})
+        for channel, tag, want in (
+            ('dev', 'v12.0.0-dev.3', ['base-dev', 'base-v12-dev']),
+            ('dev', 'v0.4.1-dev.1', ['base-dev', 'base-v0-dev']),
+            ('stable', 'v2.10.3', ['base', 'base-v2']),
+        ):
+            with self.subTest(tag=tag):
+                _, plan, _ = self.run_plan(channel, tag)
+                self.assertEqual(plan[0]['moving_tags'], want)
+
+    def test_a_tag_that_is_not_a_version_moves_the_channel_tag_alone(self):
+        self.write({'base': 'FROM scratch\n'})
+        for tag in ('ci', 'v1.3', 'v1.3.0.1', 'version-1.3.0', 'v1.3.0-'):
+            with self.subTest(tag=tag):
+                _, plan, _ = self.run_plan('dev', tag)
+                self.assertEqual(
+                    (plan[0]['version_tag'], plan[0]['moving_tags']), (f'base-{tag}', ['base-dev'])
+                )
 
     def test_a_stable_moving_tag_names_a_sibling_too(self):
         self.write({'base': 'FROM scratch\n', 'build': f'FROM {PKG}:base\n'})
@@ -222,13 +244,21 @@ class Plan(unittest.TestCase):
                 self.root = Path(self.tmp.name) / str(i)
                 self.assertIn(f'images/{bad}/Dockerfile', self.refused({bad: 'FROM scratch\n'}))
 
-    def test_a_sibling_is_named_only_by_its_moving_tag(self):
-        refs = (f'{PKG}:base-v1.2.3', PKG, f'{PKG}:base-dev@sha256:{"0" * 64}', f'{PKG}:nope')
+    def test_a_sibling_is_named_only_by_its_channel_tag(self):
+        refs = (
+            f'{PKG}:base-v1.2.3',
+            f'{PKG}:base-v1-dev',
+            f'{PKG}:base-v1',
+            PKG,
+            f'{PKG}:base-dev@sha256:{"0" * 64}',
+            f'{PKG}:nope',
+        )
         for i, ref in enumerate(refs):
             with self.subTest(ref=ref):
                 self.root = Path(self.tmp.name) / str(i)
                 err = self.refused({'base': 'FROM scratch\n', 'build': f'FROM {ref}\n'})
                 self.assertIn(f'names {ref}', err)
+                self.assertIn('names a sibling only by its channel tag', err)
 
     def test_an_image_cannot_name_itself(self):
         self.assertIn('the image itself', self.refused({'base': f'FROM {PKG}:base-dev\n'}))
@@ -238,6 +268,18 @@ class Plan(unittest.TestCase):
             {'a': f'FROM {PKG}:b-dev\n', 'b': f'FROM {PKG}:a\n', 'c': 'FROM scratch\n'}
         )
         self.assertIn('cycle: a on b, b on a', err)
+
+    def test_bake_loads_each_image_under_every_moving_tag_and_its_version_tag(self):
+        self.write({'base': 'FROM scratch\n', 'build': f'FROM {PKG}:base-dev\n'})
+        _, plan, _ = self.run_plan('dev', 'v1.3.0-dev.4')
+        targets = ri.bake(json.dumps(plan), 'linux/amd64', '/ctx', PKG)['target']
+        self.assertEqual(
+            {n: t['tags'] for n, t in targets.items()},
+            {
+                n: [f'{PKG}:{n}-dev', f'{PKG}:{n}-v1-dev', f'{PKG}:{n}-v1.3.0-dev.4']
+                for n in ('base', 'build')
+            },
+        )
 
 
 # The token endpoint answers STUB_TOKEN_STATUS (curl exits STUB_TOKEN_EXIT). A

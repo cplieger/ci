@@ -105,6 +105,9 @@ class RunnerPackage(unittest.TestCase):
     def test_moving_and_stable_runner_tags_are_never_candidates(self):
         for tags in (
             ['base-v1.3.0-dev.7', 'base-dev', f'base-sha-{self.C}'],
+            ['base-v1.3.0-dev.7', 'base-dev', 'base-v1-dev', f'base-sha-{self.C}'],
+            ['base-v1-dev'],
+            ['base-v1.3.0', 'base', 'base-v1'],
             ['base-v1.3.0', 'base'],
             ['base'],
             ['base-v1.3.0-dev.7', 'base-v1.3.0'],

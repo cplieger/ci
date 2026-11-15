@@ -66,27 +66,35 @@ case "$MODE" in
   tags)
     DIR=${2:?$USAGE}
     mapfile -t names < <(jq -r '.[].name' <<<"$PLAN")
-    # Every digest is read before the first write, and every version tag is written and read back
-    # before the first moving tag, so a missing digest or a failed version tag moves no moving tag.
-    # A pass writes all its tags before its first read-back and zeroes the clock they share, which
-    # await_registry allows only for what was published before the first check (retry.sh).
-    declare -A digests=() pass=()
+    # Every digest and tag is read before the first write, and every version tag is written and read
+    # back before the first moving tag, so a missing digest or a failed version tag moves no moving
+    # tag. A pass writes all its tags before its first read-back and zeroes the clock they share,
+    # which await_registry allows only for what was published before the first check (retry.sh).
+    declare -A digests=() tags_of=()
     for n in "${names[@]}"; do
       d=$(cat "$DIR/$n" 2>/dev/null) || d=""
       case "$d" in sha256:*) digests[$n]=$d ;; *) fail "no signed build of ${n} in ${DIR}, so no runner image is tagged" ;; esac
+      entry=$(entry_of "$n")
+      tags_of["version:$n"]=$(jq -er '.version_tag' <<<"$entry") || fail "the runner image plan gives ${n} no version tag"
+      tags_of["moving:$n"]=$(jq -er '.moving_tags | if length > 0 then join(" ") else empty end' <<<"$entry") \
+        || fail "the runner image plan gives ${n} no moving tag list"
     done
-    for field in version_tag moving_tag; do
+    for field in version moving; do
+      written=()
       for n in "${names[@]}"; do
-        tag=$(entry_of "$n" | jq -er --arg f "$field" '.[$f]')
-        got=$(create -t "${PACKAGE}:${tag}" "${PACKAGE}@${digests[$n]}") || fail "imagetools could not write ${PACKAGE}:${tag}"
-        [ "$got" = "${digests[$n]}" ] \
-          || fail "tagging changed ${n}'s digest from ${digests[$n]} to ${got}, and a tagged image must be the build it signed"
-        pass[$n]=$tag
+        read -ra tags <<<"${tags_of["$field:$n"]}"
+        for tag in "${tags[@]}"; do
+          got=$(create -t "${PACKAGE}:${tag}" "${PACKAGE}@${digests[$n]}") || fail "imagetools could not write ${PACKAGE}:${tag}"
+          [ "$got" = "${digests[$n]}" ] \
+            || fail "tagging changed ${n}'s digest from ${digests[$n]} to ${got}, and a tagged image must be the build it signed"
+          written+=("$n $tag")
+        done
       done
       REGISTRY_WAITED=0
-      for n in "${names[@]}"; do
-        read_back "${pass[$n]}" "${digests[$n]}"
-        echo "${PACKAGE}:${pass[$n]} is ${digests[$n]}"
+      for w in "${written[@]}"; do
+        n=${w%% *} tag=${w#* }
+        read_back "$tag" "${digests[$n]}"
+        echo "${PACKAGE}:${tag} is ${digests[$n]}"
       done
     done
     ;;

@@ -20,6 +20,8 @@ import tempfile
 from pathlib import Path
 
 NAME_RE = re.compile(r'^[a-z0-9]{1,32}$')
+# A release version (vX.Y.Z or vX.Y.Z-pre) also moves its major's tag; CI's `ci` moves none.
+VERSION_RE = re.compile(r'^v(?P<major>0|[1-9][0-9]*)\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')
 INDEX_TYPES = (
     'application/vnd.oci.image.index.v1+json, '
     'application/vnd.docker.distribution.manifest.list.v2+json'
@@ -81,31 +83,32 @@ def swapped_spans(line: str) -> set[tuple[int, int]]:
 def sibling_refs(
     dockerfile: str, text: str, package: str, name: str, names: list[str]
 ) -> dict[str, str]:
-    """{reference as written: sibling image} for every mention of the package."""
+    """{reference as written: sibling image} for every mention of the package, each a channel
+    tag."""
     ref_re = re.compile(
         rf'(?<![\w./-]){re.escape(package)}'
         r'(?::(?P<tag>[\w][\w.-]{0,127}))?(?P<digest>@sha256:[0-9a-f]{64})?(?![\w./:@-])'
     )
-    moving = {f'{n}{suffix}': n for n in names for suffix in ('', '-dev')}
+    channel = {f'{n}{suffix}': n for n in names for suffix in ('', '-dev')}
     refs: dict[str, str] = {}
     for line in instruction_lines(text):
         spans = swapped_spans(line)
         for m in ref_re.finditer(line):
             tag = m.group('tag')
-            if m.group('digest') or not tag or tag not in moving:
+            if m.group('digest') or not tag or tag not in channel:
                 raise PlanError(
                     f'{dockerfile} names {m.group(0)}, but a runner image names a sibling only by '
-                    f'its moving tag ({" or ".join(sorted(f"{package}:{t}" for t in moving))}) '
+                    f'its channel tag ({" or ".join(sorted(f"{package}:{t}" for t in channel))}) '
                     f'as {SWAPPED_FORMS}, which the release replaces with the build of the same run'
                 )
-            if moving[tag] == name:
+            if channel[tag] == name:
                 raise PlanError(f'{dockerfile} names {m.group(0)}, which is the image itself')
             if m.span() not in spans:
                 raise PlanError(
                     f'{dockerfile} names {m.group(0)} in a {line.split()[0].upper()} instruction, '
                     f'which the release does not rewrite: it swaps a sibling only as {SWAPPED_FORMS}'
                 )
-            refs[f'{package}:{tag}'] = moving[tag]
+            refs[f'{package}:{tag}'] = channel[tag]
     return refs
 
 
@@ -152,10 +155,14 @@ def plan(root: Path, args: argparse.Namespace) -> list[dict]:
     refs = {
         n: sibling_refs(f'images/{n}/Dockerfile', texts[n], args.package, n, names) for n in names
     }
+    dev = args.channel == 'dev'
+    major = m['major'] if (m := VERSION_RE.match(args.tag)) else None
     images = []
     for n in build_order({n: set(r.values()) for n, r in refs.items()}):
         version = f'{n}-{args.tag}'
-        moving = f'{n}-dev' if args.channel == 'dev' else n
+        moving = [f'{n}-dev' if dev else n]
+        if major is not None:
+            moving.append(f'{n}-v{major}-dev' if dev else f'{n}-v{major}')
         build_args = []
         if declares(texts[n], 'PKG_REFRESH'):
             build_args.append(f'PKG_REFRESH={args.date}')
@@ -180,7 +187,7 @@ def plan(root: Path, args: argparse.Namespace) -> list[dict]:
                 'labels': labels,
                 'index_tag': f'{n}-sha-{args.sha}',
                 'version_tag': version,
-                'moving_tag': moving,
+                'moving_tags': moving,
             }
         )
     return images
@@ -283,8 +290,8 @@ def promoted(package: str, source: str, names: list[str]) -> dict[str, str]:
 
 
 def bake(plan_json: str, platform: str, context: str, package: str) -> dict:
-    """Each image as a bake target loaded into the daemon under its moving and version tags in
-    package, a sibling it names built by its own target."""
+    """Each image as a bake target loaded into the daemon under its moving tags and version tag
+    in package, a sibling it names built by its own target."""
     targets = {}
     for image in json.loads(plan_json):
         targets[image['name']] = {
@@ -296,7 +303,7 @@ def bake(plan_json: str, platform: str, context: str, package: str) -> dict:
                 a.split('=', 1) for a in image['build_args'] if a.startswith('PKG_REFRESH=')
             ),
             'contexts': {ref: f'target:{parent}' for ref, parent in image['parents'].items()},
-            'tags': [f'{package}:{image["moving_tag"]}', f'{package}:{image["version_tag"]}'],
+            'tags': [f'{package}:{t}' for t in [*image['moving_tags'], image['version_tag']]],
             'output': ['type=docker'],
         }
     return {'group': {'default': {'targets': list(targets)}}, 'target': targets}

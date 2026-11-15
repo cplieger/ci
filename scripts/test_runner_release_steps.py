@@ -92,7 +92,7 @@ def plan_entry(name: str) -> dict:
         'name': name,
         'index_tag': f'{name}-sha-{"c" * 40}',
         'version_tag': f'{name}-v1.3.0-dev.4',
-        'moving_tag': f'{name}-dev',
+        'moving_tags': [f'{name}-dev', f'{name}-v1-dev'],
     }
 
 
@@ -190,7 +190,10 @@ class Publish(unittest.TestCase):
             for c in self.calls()
         ]
         want = []
-        for tags in (('base-v1.3.0-dev.4', 'build-v1.3.0-dev.4'), ('base-dev', 'build-dev')):
+        for tags in (
+            ('base-v1.3.0-dev.4', 'build-v1.3.0-dev.4'),
+            ('base-dev', 'base-v1-dev', 'build-dev', 'build-v1-dev'),
+        ):
             want += [f'create -t {PKG}:{tag} {PKG}@{DIGEST}' for tag in tags]
             want += [f'buildx imagetools inspect --raw {PKG}:{tag}' for tag in tags]
         self.assertEqual(calls, want)
@@ -202,7 +205,8 @@ class Publish(unittest.TestCase):
         lags.mkdir()
         # 13 waits (5, 10, 20, 40, eight of 60, then 45) spend the 600 s budget.
         (lags / f'{PKG}:base-v1.3.0-dev.4'.replace('/', '_').replace(':', '_')).write_text('13\n')
-        for tag in ('base-dev', 'build-dev'):
+        moving = ('base-dev', 'base-v1-dev', 'build-dev', 'build-v1-dev')
+        for tag in moving:
             (lags / f'{PKG}:{tag}'.replace('/', '_').replace(':', '_')).write_text('1\n')
         r = self.tags(STUB_LAGS=str(lags), REGISTRY_WAIT_SECONDS='600')
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -210,7 +214,7 @@ class Publish(unittest.TestCase):
             c.rsplit(' ', 1)[1] for c in self.calls() if c.startswith('buildx imagetools inspect')
         ]
         self.assertEqual(reads.count(f'{PKG}:base-v1.3.0-dev.4'), 14)
-        for tag in ('base-dev', 'build-dev'):
+        for tag in moving:
             self.assertEqual(reads.count(f'{PKG}:{tag}'), 2)
             self.assertIn(f'{PKG}:{tag} is {DIGEST}', r.stdout)
 
@@ -240,11 +244,44 @@ class Publish(unittest.TestCase):
                     'build-v1.3.0-dev.4',
                     'base-dev',
                     'base-dev',
+                    'base-v1-dev',
                     'build-dev',
+                    'build-v1-dev',
                 )
             ],
         )
         self.assertIn('::warning::imagetools_create attempt 1/5 failed', r.stderr)
+
+    def test_an_image_with_one_moving_tag_moves_that_tag_alone(self):
+        for name in ('base', 'build'):
+            (self.digests / name).write_text(f'{DIGEST}\n')
+        plan = [
+            {**plan_entry(n), 'version_tag': f'{n}-ci', 'moving_tags': [f'{n}-dev']}
+            for n in ('base', 'build')
+        ]
+        r = self.tags(PLAN=json.dumps(plan))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            self.creates(),
+            [
+                f'-t {PKG}:{tag} {PKG}@{DIGEST}'
+                for tag in ('base-ci', 'build-ci', 'base-dev', 'build-dev')
+            ],
+        )
+
+    def test_a_plan_entry_without_moving_tags_writes_no_tag(self):
+        for name in ('base', 'build'):
+            (self.digests / name).write_text(f'{DIGEST}\n')
+        for moving in ([], None, 'build-dev'):
+            with self.subTest(moving=moving):
+                self.log.unlink(missing_ok=True)
+                plan = [plan_entry('base'), {**plan_entry('build'), 'moving_tags': moving}]
+                r = self.tags(PLAN=json.dumps(plan))
+                self.assertEqual(r.returncode, 1)
+                self.assertIn(
+                    '::error::the runner image plan gives build no moving tag list', r.stderr
+                )
+                self.assertEqual(self.calls(), [])
 
     def test_a_missing_signed_digest_moves_no_tag(self):
         (self.digests / 'base').write_text(f'{DIGEST}\n')
