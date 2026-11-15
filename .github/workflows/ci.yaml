@@ -1173,7 +1173,7 @@ jobs:
       - name: Install markdownlint-cli2
         run: |
           # renovate: datasource=npm depName=markdownlint-cli2
-          VERSION=0.24.0
+          VERSION=0.24.1
           npm install --global --prefix "$RUNNER_TEMP" "markdownlint-cli2@${VERSION}"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
