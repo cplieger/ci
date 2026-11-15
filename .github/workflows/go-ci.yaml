@@ -124,10 +124,11 @@ jobs:
       # Regenerates wiregen output in the runner's tree and fails when the
       # committed files differ; a repository with no wiregen generator no-ops.
       # `*.gen.*` is wiregen's output naming and scopes both the presence test and
-      # the diff, so a generator emitting another name goes unmeasured. testdata/
-      # and fixtures/ are pruned: a fixture is not shipped output (a corpus can
-      # hold Buf's own buf.gen.yaml), and the wiregen repo has fixtures and no
-      # generator.
+      # the diff, so a generator emitting another name goes unmeasured. Discovery
+      # is per module: each generator runs from its nearest go.mod's directory.
+      # testdata/ and fixtures/ are pruned from both lists: a fixture is not
+      # shipped output (a corpus can hold Buf's buf.gen.yaml) and never runs.
+      # scripts/test-wiregen-drift.sh runs this body by its step name.
       - name: Wiregen drift
         id: wiregen-drift
         continue-on-error: true
@@ -137,7 +138,9 @@ jobs:
             # trailing token; `package mainly` and `main_test` still do not match.
             # Both import paths: main branches keep the standalone module until
             # their promotion, dev branches import it from cplieger/go.
-            gens=$(grep -rlZE --include='*.go' 'cplieger/(go/)?wiregen' . 2>/dev/null \
+            gens=$(find . \( -name .git -o -name node_modules -o -name vendor -o -name testdata -o -name fixtures \) -prune \
+                -o -type f -name '*.go' -print0 2>/dev/null \
+              | xargs -0 -r grep -lZE 'cplieger/(go/)?wiregen' 2>/dev/null \
               | xargs -0 -r -n1 dirname | sort -u \
               | while IFS= read -r d; do
                   grep -qE '^package main([[:space:]]|$)' "$d"/*.go 2>/dev/null && echo "$d" || true
@@ -147,7 +150,7 @@ jobs:
             if [ -z "$gens" ]; then
               # Tracked generated output with no generator to regenerate it is
               # the exact state this check exists to catch: the discovery above
-              # is two greps, and either one can be defeated by an ordinary
+              # is two text matches, either defeated by an ordinary
               # edit (an import moved behind a helper package, a build tag).
               # Skipping there means the committed artifacts stop being
               # compared against their source of truth with nothing going red.
@@ -161,11 +164,17 @@ jobs:
               echo "wiregen: no generator command imports the library and no generated files are tracked; skipping"
               exit 0
             fi
-            # 2. Regenerate from the Go source of truth.
-            for d in $gens; do
-              echo "wiregen: go run ./$d"
-              go run "./$d"
-            done
+            # A nested module (one keeping wiregen out of its importers' module
+            # graph) builds only from its own root. The explicit exit is needed
+            # because errexit is off left of the `||` below, and a generator that
+            # never ran leaves its committed output looking up to date.
+            while IFS= read -r -u3 d; do
+              m=$d
+              while [ "$m" != . ] && [ ! -f "$m/go.mod" ]; do m=$(dirname "$m"); done
+              pkg=.${d#"$m"}
+              echo "wiregen: go -C $m run $pkg"
+              go -C "$m" run "$pkg" || { echo "::error::wiregen: the generator $d failed in the module at $m"; exit 1; }
+            done 3<<<"$gens"
             # Compare regenerated output against the committed tree
             # (catches modified + added files via the staged index). Scoped to
             # the generated-file pathspec, not the whole tree: an unscoped

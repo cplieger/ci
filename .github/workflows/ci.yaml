@@ -1629,6 +1629,20 @@ jobs:
             fi
           ) || { echo "Probe license collector" >> /tmp/_ci_failures; exit 1; }
 
+      # go-ci.yaml's Wiregen drift step runs in Go consumers only; the probe
+      # extracts its body and runs it against fixture repositories.
+      - name: Probe wiregen drift
+        id: probe-wiregen-drift
+        continue-on-error: true
+        run: |
+          (
+            if [ -f scripts/test-wiregen-drift.sh ]; then
+              bash scripts/test-wiregen-drift.sh
+            else
+              echo "no wiregen drift probe in this repo - skipping"
+            fi
+          ) || { echo "Probe wiregen drift" >> /tmp/_ci_failures; exit 1; }
+
       # actions/dashboard-check runs only in repos that ship a dashboard, which
       # this one does not, so its rules and its CUE vet are exercised here.
       - name: Probe dashboard check
@@ -1675,6 +1689,7 @@ jobs:
             probe-comment-ratio-gate ${{ steps.probe-comment-ratio-gate.outcome }}
             probe-notice-gate ${{ steps.probe-notice-gate.outcome }}
             probe-license-collector ${{ steps.probe-license-collector.outcome }}
+            probe-wiregen-drift ${{ steps.probe-wiregen-drift.outcome }}
             probe-dashboard-check ${{ steps.probe-dashboard-check.outcome }}
         run: |
           set -euo pipefail
