@@ -14,6 +14,13 @@ on:
           when it lints a Dockerfile stay hosted.
         type: string
         default: ''
+      go-test-timeout:
+        description: >-
+          The `-timeout` of the race tests, a Go duration such as `20m`, for a Go module
+          whose test binaries run longer than the go command's default; empty keeps
+          that default of 10 minutes per test binary.
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -478,6 +485,7 @@ jobs:
     uses: ./.github/workflows/go-ci.yaml
     with:
       runner: ${{ inputs.runner }}
+      go-test-timeout: ${{ inputs.go-test-timeout }}
 
   # Nested Go modules (independent release lanes — see release.yaml's
   # go-nested job): `go test ./...` at the root does not cross module
@@ -495,6 +503,7 @@ jobs:
       working-directory: ${{ matrix.dir }}
       go-version-file: ${{ matrix.dir }}/go.mod
       runner: ${{ inputs.runner }}
+      go-test-timeout: ${{ inputs.go-test-timeout }}
 
   # Builds every module's head against the others' heads, so a change that breaks
   # a sibling fails before it is tagged; the go.work exists only in this checkout.
@@ -548,6 +557,7 @@ jobs:
       runner: ${{ matrix.runner }}
       working-directory: ${{ matrix.dir }}
       go-version-file: ${{ matrix.dir }}/go.mod
+      go-test-timeout: ${{ inputs.go-test-timeout }}
 
   ts:
     needs: detect

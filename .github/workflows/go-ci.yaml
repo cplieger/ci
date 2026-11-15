@@ -17,6 +17,13 @@ on:
           on ubuntu-26.04. `go test -race` needs a C compiler on the runner.
         type: string
         default: ''
+      go-test-timeout:
+        description: >-
+          The `-timeout` of the race tests, a Go duration such as `20m`, for a module
+          whose test binaries run longer than the go command's default; empty keeps
+          that default of 10 minutes per test binary.
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -100,7 +107,9 @@ jobs:
       - name: Test (race)
         id: test-race
         continue-on-error: true
-        run: ( go test -count=1 -race ./... ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
+        env:
+          GO_TEST_TIMEOUT: ${{ inputs.go-test-timeout }}
+        run: ( go test -count=1 -race ${GO_TEST_TIMEOUT:+"-timeout=$GO_TEST_TIMEOUT"} ./... ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
 
       - name: Govulncheck
         id: govulncheck
