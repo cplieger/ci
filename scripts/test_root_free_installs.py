@@ -250,12 +250,12 @@ COSIGN_JOBS = {
     'security-scan.yaml': ('trivy', 'published-image', 'trivy-published'),
     'perf-ci.yaml': ('compare',),
 }
-# Renovate's workflow tool-pin manager bumps COSIGN_VERSION from the comment
-# above it; the digest on the next line must move in the same pull request.
+# The block shape of the custom.cosign manager in cplieger/.github's
+# default.json, which moves COSIGN_VERSION and COSIGN_SHA256 in one pull
+# request; keep the two in sync.
 COSIGN_PIN = re.compile(
-    r'#\s*renovate:\s*datasource=github-releases\s+depName=sigstore/cosign\s*\n'
+    r'#\s*renovate:\s*datasource=custom\.cosign\s+depName=sigstore/cosign\s*\n'
     r'\s*COSIGN_VERSION:\s*(v\S+)\s*\n'
-    r'(?:\s*#[^\n]*\n)*'
     r'\s*COSIGN_SHA256:\s*([a-f0-9]{64})\s*\n'
 )
 
