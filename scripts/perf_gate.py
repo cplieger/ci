@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import math
 import pathlib
@@ -736,13 +737,15 @@ def check_provenance(
     repo: str,
     head_sha: str,
     verify: Callable[[pathlib.Path, pathlib.Path], str | None],
-    is_ancestor: Callable[[str], bool],
+    is_ancestor: Callable[[str, str], bool],
 ) -> list[str]:
     """Every entry the head adds or whose baseline, budget, tier, headroom or
     source differs from the base must match a signed calibration file, every
-    entry when the file's runner, headroom or floor differs; a gated or exact
+    entry when the file's runner, headroom or floor differs; no entry's source
+    is older than another checked-in calibration of its cell; a gated or exact
     entry leaves only through `retired`; every calibration file is named by an
-    entry."""
+    entry. is_ancestor(sha, of) is git's: true when sha is of or one of its
+    ancestors."""
     errors = []
     base_entries = {key(e): e for e in base.get('budgets', [])}
     head_entries = {key(e): e for e in head.get('budgets', [])}
@@ -785,6 +788,41 @@ def check_provenance(
                 errors.append(f'{p.name}: not a calibration file or bundle')
             elif stem not in named:
                 errors.append(f'{p.name}: no budget entry names calibration run {stem}')
+    errors += superseded_entries(head_entries, calibrations, is_ancestor)
+    return errors
+
+
+def superseded_entries(
+    entries: dict, calibrations: pathlib.Path, is_ancestor: Callable[[str, str], bool]
+) -> list[str]:
+    """Each entry whose source measured a strict ancestor of the commit another
+    checked-in calibration of its cell measured. Run ids order dispatches, not
+    commits, so only git ancestry says which file measured the newer code."""
+    measured: dict[str, tuple[str, set]] = {}
+    if calibrations.is_dir():
+        for p in sorted(calibrations.glob('*.json')):
+            if p.name.endswith('.sigstore.json'):
+                continue
+            try:
+                doc = load(p)
+                cells = {key(c) for c in doc.get('cells', [])}
+            except ValueError, TypeError, KeyError, AttributeError:
+                continue
+            measured[p.stem] = (str(doc.get('commit')), cells)
+    newer = functools.cache(lambda old, new: old != new and is_ancestor(old, new))
+    errors = []
+    for k, e in entries.items():
+        m = SOURCE_RE.match(str(e.get('source', '')))
+        if not m or m.group(1) not in measured:
+            continue
+        mine = measured[m.group(1)][0]
+        for run_id, (commit, cells) in measured.items():
+            if k in cells and newer(mine, commit):
+                errors.append(
+                    f'{key_text(k)}: calibration {run_id} measured this cell at {commit}, '
+                    f"which descends from source {m.group(1)}'s {mine}; take the entry from it"
+                )
+                break
     return errors
 
 
@@ -803,7 +841,7 @@ def load_calibration(run_id, calibrations, repo, runner, head_sha, verify, is_an
     for field, want in (('run_id', run_id), ('repo', repo), ('runner', runner)):
         if str(doc.get(field)) != str(want):
             return None, f'calibration {run_id}: {field} is {doc.get(field)!r}, not {want!r}'
-    if not is_ancestor(str(doc.get('commit'))):
+    if not is_ancestor(str(doc.get('commit')), head_sha):
         return None, f'calibration {run_id}: commit {doc.get("commit")} is not in {head_sha}'
     return doc, None
 
@@ -1014,7 +1052,7 @@ def file_errors(a: argparse.Namespace, head: dict) -> list[str]:
         repo=a.repo,
         head_sha=a.head,
         verify=cosign_verify,
-        is_ancestor=lambda sha: git_is_ancestor(sha, a.head),
+        is_ancestor=git_is_ancestor,
     )
     return errors
 

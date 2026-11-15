@@ -513,6 +513,8 @@ class Provenance(unittest.TestCase):
         self.dir = pathlib.Path(self.tmp.name)
         self.verified = []
         self.bad_bundles = set()
+        # (ancestor, descendant) commit pairs besides each commit's own.
+        self.lineage = set()
 
     def write(self, run_id, doc):
         doc = {**doc, 'run_id': run_id, 'run_url': RUN_URL + run_id}
@@ -531,8 +533,43 @@ class Provenance(unittest.TestCase):
             repo=REPO,
             head_sha=HEAD,
             verify=self.verify,
-            is_ancestor=lambda sha: sha == HEAD,
+            is_ancestor=lambda sha, of: sha == of or (sha, of) in self.lineage,
         )
+
+    def two_commits(self, old_reps, new_reps, new_commit=HEAD):
+        """Calibration 200 of an older commit and 100 of new_commit, dispatched later and
+        earlier, so run-id order says the opposite of commit order."""
+        self.lineage = {('0ld', HEAD), ('0ld', 'sibling')}
+        exact = {'metric': 'dom', 'kind': 'count', 'tier': 'exact'}
+        self.write('200', calibration_file([cal_cell(**exact, baseline=old_reps)], commit='0ld'))
+        self.write(
+            '100', calibration_file([cal_cell(**exact, baseline=new_reps)], commit=new_commit)
+        )
+
+    def test_an_entry_sourced_from_an_ancestor_of_a_calibration_of_its_cell_fails(self):
+        self.two_commits(4384.0, 4400.0)
+        stale = entry(metric='dom', tier='exact', baseline=4384.0, source=RUN_URL + '200')
+        errors = self.check(budgets([stale]), budgets([]))
+        self.assertTrue(any('calibration 100' in x and 'descends' in x for x in errors), errors)
+
+    def test_an_entry_sourced_from_the_newest_commit_of_its_cell_passes(self):
+        self.two_commits(4384.0, 4400.0)
+        fresh = entry(metric='dom', tier='exact', baseline=4400.0, source=RUN_URL + '100')
+        errors = self.check(budgets([fresh]), budgets([]))
+        self.assertEqual([x for x in errors if 'descends' in x], [])
+
+    def test_calibrations_of_commits_neither_descends_from_pass(self):
+        self.two_commits(4384.0, 4400.0, new_commit='sibling')
+        self.lineage.discard(('0ld', 'sibling'))
+        e = entry(metric='dom', tier='exact', baseline=4384.0, source=RUN_URL + '200')
+        self.assertEqual([x for x in self.check(budgets([e]), budgets([])) if 'descends' in x], [])
+
+    def test_an_unchanged_entry_a_newer_calibration_supersedes_fails(self):
+        self.two_commits(4384.0, 4400.0)
+        stale = budgets(
+            [entry(metric='dom', tier='exact', baseline=4384.0, source=RUN_URL + '200')]
+        )
+        self.assertTrue(any('descends' in x for x in self.check(stale, stale)))
 
     def test_a_raise_naming_a_file_whose_baseline_differs_fails(self):
         self.write('111', calibration_file([cal_cell(baseline=1000.0)]))
