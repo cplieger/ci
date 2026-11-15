@@ -15,6 +15,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / '.github' / 'workflows'
+TEMPLATE = ROOT / '.github' / 'workflow-templates' / 'ci.yml'
 INPUT = 'go-test-timeout'
 FORWARD = '${{ inputs.go-test-timeout }}'
 GO_CALLEES = ('./.github/workflows/go-ci.yaml', './.github/workflows/go-os-ci.yaml')
@@ -53,6 +54,10 @@ class GoTestTimeoutTest(unittest.TestCase):
         for key, job in callers.items():
             with self.subTest(job=key):
                 self.assertEqual((job.get('with') or {}).get(INPUT), FORWARD)
+
+    def test_the_synced_caller_passes_the_repository_variable(self) -> None:
+        job = yaml.safe_load(TEMPLATE.read_text())['jobs']['ci']
+        self.assertEqual(job['with'].get(INPUT), '${{ vars.GO_TEST_TIMEOUT }}')
 
     def test_the_race_step_passes_it_only_when_set(self) -> None:
         for name in ('go-ci.yaml', 'go-os-ci.yaml'):
