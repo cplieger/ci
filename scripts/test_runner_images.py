@@ -119,12 +119,24 @@ class Plan(unittest.TestCase):
         self.write({'base': 'FROM scratch\n'})
         for channel, tag, want in (
             ('dev', 'v12.0.0-dev.3', ['base-dev', 'base-v12-dev']),
-            ('dev', 'v0.4.1-dev.1', ['base-dev', 'base-v0-dev']),
             ('stable', 'v2.10.3', ['base', 'base-v2']),
         ):
             with self.subTest(tag=tag):
                 _, plan, _ = self.run_plan(channel, tag)
                 self.assertEqual(plan[0]['moving_tags'], want)
+
+    def test_a_version_below_1_0_0_moves_the_channel_tag_alone(self):
+        # Below 1.0.0 a breaking change takes the next minor, so major 0 promises nothing.
+        self.write({'base': 'FROM scratch\n'})
+        for channel, tag, want in (
+            ('dev', 'v0.9.0-dev.1', ['base-dev']),
+            ('stable', 'v0.9.0', ['base']),
+        ):
+            with self.subTest(channel=channel, tag=tag):
+                _, plan, _ = self.run_plan(channel, tag)
+                self.assertEqual(
+                    (plan[0]['version_tag'], plan[0]['moving_tags']), (f'base-{tag}', want)
+                )
 
     def test_a_tag_that_is_not_a_version_moves_the_channel_tag_alone(self):
         self.write({'base': 'FROM scratch\n'})

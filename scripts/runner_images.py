@@ -20,8 +20,10 @@ import tempfile
 from pathlib import Path
 
 NAME_RE = re.compile(r'^[a-z0-9]{1,32}$')
-# A release version (vX.Y.Z or vX.Y.Z-pre) also moves its major's tag; CI's `ci` moves none.
-VERSION_RE = re.compile(r'^v(?P<major>0|[1-9][0-9]*)\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')
+# A release version from 1.0.0 on (vX.Y.Z or vX.Y.Z-pre) also moves its major's tag.
+# Major 0 moves none, because a breaking change below 1.0.0 takes only the next
+# minor; CI's `ci` moves none either.
+VERSION_RE = re.compile(r'^v(?P<major>[1-9][0-9]*)\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')
 INDEX_TYPES = (
     'application/vnd.oci.image.index.v1+json, '
     'application/vnd.docker.distribution.manifest.list.v2+json'

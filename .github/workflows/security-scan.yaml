@@ -18,8 +18,8 @@ on:
       runner:
         description: >-
           The runner label for every job, such as a self-hosted pool's; empty runs
-          them on ubuntu-26.04. trivy stays on ubuntu-26.04 when the repository has
-          a Dockerfile, because it then builds the image.
+          them on ubuntu-26.04. trivy stays on ubuntu-26.04 when it builds the
+          repository's Dockerfile into an image.
         type: string
         default: ''
 
@@ -41,8 +41,8 @@ env:
   COSIGN_SHA256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
 
 jobs:
-  # Every other job reads this profile: whether the repository has a Dockerfile
-  # picks trivy's runner, and the published mode picks the jobs that run.
+  # Whether the repository has a Dockerfile picks trivy's runner, and the
+  # published mode picks the jobs that run.
   profile:
     runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 5
@@ -79,7 +79,7 @@ jobs:
   trivy:
     needs: profile
     # GitHub's runner when it builds the image; otherwise wherever the input says.
-    runs-on: ${{ (needs.profile.outputs.image == 'true' && 'ubuntu-26.04') || inputs.runner || 'ubuntu-26.04' }}
+    runs-on: ${{ (needs.profile.outputs.image == 'true' && needs.profile.outputs.published != 'true' && 'ubuntu-26.04') || inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 15
     permissions:
       contents: read

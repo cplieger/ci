@@ -32,7 +32,6 @@ FORWARD = '${{ inputs.runner }}'
 HOSTED = {
     ('ci.yaml', 'docker'): 'ubuntu-26.04',
     ('ci.yaml', 'docker-arm64'): 'ubuntu-26.04-arm',
-    ('perf-ci.yaml', 'plan'): 'ubuntu-26.04',
 }
 CONDITIONAL = {
     (
@@ -42,7 +41,10 @@ CONDITIONAL = {
     (
         'security-scan.yaml',
         'trivy',
-    ): "${{ (needs.profile.outputs.image == 'true' && 'ubuntu-26.04') || inputs.runner || 'ubuntu-26.04' }}",
+    ): (
+        "${{ (needs.profile.outputs.image == 'true' && needs.profile.outputs.published != 'true'"
+        " && 'ubuntu-26.04') || inputs.runner || 'ubuntu-26.04' }}"
+    ),
 }
 # go-os-ci.yaml's own `runner` input names its Windows or macOS runner.
 OS_RUNNER = 'go-os-ci.yaml'
@@ -66,9 +68,9 @@ def code(run: str) -> str:
 
 
 class Evaluate:
-    """The `||`, `&&`, `==`, parenthesis and string subset of GitHub's expression syntax."""
+    """The `||`, `&&`, `==`, `!=`, parenthesis and string subset of GitHub's expression syntax."""
 
-    TOKEN = re.compile(r"\s*(\|\||&&|==|\(|\)|'[^']*'|[A-Za-z_][\w.-]*)")
+    TOKEN = re.compile(r"\s*(\|\||&&|==|!=|\(|\)|'[^']*'|[A-Za-z_][\w.-]*)")
 
     def __init__(self, expression: str, context: dict[str, str]):
         body = re.fullmatch(r'\$\{\{(.*)\}\}', expression).group(1).strip()
@@ -106,9 +108,9 @@ class Evaluate:
 
     def equal(self) -> str:
         left = self.atom()
-        if self.tokens[:1] == ['==']:
-            self.tokens.pop(0)
-            return 'true' if left == self.atom() else ''
+        if self.tokens[:1] in (['=='], ['!=']):
+            same = self.tokens.pop(0) == '=='
+            return 'true' if (left == self.atom()) == same else ''
         return left
 
     def atom(self) -> str:
@@ -224,14 +226,18 @@ class Routing(unittest.TestCase):
                 self.assertEqual(got, want)
 
     def test_trivy_stays_on_github_only_when_it_builds_a_dockerfile(self):
-        for image, runner, want in (
-            ('true', 'pool', 'ubuntu-26.04'),
-            ('true', '', 'ubuntu-26.04'),
-            ('false', 'pool', 'pool'),
-            ('false', '', 'ubuntu-26.04'),
+        # Published mode scans the published image and builds nothing.
+        for image, published, runner, want in (
+            ('true', 'false', 'pool', 'ubuntu-26.04'),
+            ('true', 'false', '', 'ubuntu-26.04'),
+            ('true', 'true', 'pool', 'pool'),
+            ('true', 'true', '', 'ubuntu-26.04'),
+            ('false', 'false', 'pool', 'pool'),
+            ('false', 'false', '', 'ubuntu-26.04'),
+            ('false', 'true', 'pool', 'pool'),
         ):
-            with self.subTest(image=image, runner=runner):
-                needs = {'profile': {'image': image}}
+            with self.subTest(image=image, published=published, runner=runner):
+                needs = {'profile': {'image': image, 'published': published}}
                 got = self.runs_on('security-scan.yaml', 'trivy', needs, runner=runner)
                 self.assertEqual(got, want)
 
@@ -251,6 +257,23 @@ class Routing(unittest.TestCase):
             ("${{ (a == 'true' && 'h') || b || 'x' }}", {'a': 'true', 'b': 'y'}, 'h'),
             ("${{ (a == 'true' && 'h') || b || 'x' }}", {'a': 'false', 'b': 'y'}, 'y'),
             ("${{ (a == 'true' && 'h') || b || 'x' }}", {'a': 'false', 'b': ''}, 'x'),
+            ("${{ a != 'true' }}", {'a': 'true'}, ''),
+            ("${{ a != 'true' }}", {'a': 'false'}, 'true'),
+            (
+                "${{ (a == 'true' && c != 'true' && 'h') || b }}",
+                {'a': 'true', 'c': 'false', 'b': 'y'},
+                'h',
+            ),
+            (
+                "${{ (a == 'true' && c != 'true' && 'h') || b }}",
+                {'a': 'true', 'c': 'true', 'b': 'y'},
+                'y',
+            ),
+            (
+                "${{ (a == 'true' && c != 'true' && 'h') || b }}",
+                {'a': 'false', 'c': 'false', 'b': 'y'},
+                'y',
+            ),
         )
         for expression, context, want in cases:
             with self.subTest(expression=expression, context=context):
@@ -275,11 +298,10 @@ class PoolReady(unittest.TestCase):
                 for action, binary in NEEDS_HOSTED_IMAGE.items():
                     with self.subTest(workflow=name, job=job, step=s.get('name'), needs=binary):
                         self.assertFalse(s.get('uses', '').startswith(action))
-        # The check matches a real step: perf-ci.yaml's hosted plan job still uses one.
-        hosted = load(WORKFLOWS / 'perf-ci.yaml')['jobs']['plan']['steps']
-        self.assertTrue(
-            any(s.get('uses', '').startswith(tuple(NEEDS_HOSTED_IMAGE)) for s in hosted)
-        )
+
+    def test_the_hosted_image_check_matches_a_pinned_action_reference(self):
+        pinned = 'sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532'
+        self.assertTrue(pinned.startswith(tuple(NEEDS_HOSTED_IMAGE)))
 
     def test_no_moving_job_installs_with_pipx(self):
         for name, job, steps in self.moving_jobs():
