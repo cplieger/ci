@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
 import tempfile
 import unittest
 import unittest.mock
@@ -506,6 +507,38 @@ def cal_cell(metric='cpu_ms', baseline=1000.0, tier='gated', runs=10, slow_runs=
     return c
 
 
+class FakeGit:
+    """perf_gate.Git over a made-up history. lineage holds (ancestor, descendant) pairs
+    besides each commit's own, added maps a calibration file's name to the commit that
+    added it, same holds the (measured, added) pairs whose code matches, and a commit in
+    broken is one git cannot answer for."""
+
+    def __init__(self):
+        self.lineage = set()
+        self.added = {}
+        self.same = set()
+        self.broken = set()
+
+    def commit(self, sha):
+        if sha in self.broken:
+            raise perf_gate.GitError(f'git fetch exited 128: no such commit {sha}')
+        return sha
+
+    def is_ancestor(self, sha, of):
+        if {sha, of} & self.broken:
+            raise perf_gate.GitError('git merge-base exited 128')
+        return sha == of or (sha, of) in self.lineage
+
+    def added_by(self, path, head):
+        name = pathlib.Path(path).name
+        if name not in self.added:
+            raise perf_gate.GitError(f'no first-parent commit of {head} added {path}')
+        return self.added[name]
+
+    def same_code(self, measured, added):
+        return (measured, added) in self.same
+
+
 class Provenance(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -513,8 +546,7 @@ class Provenance(unittest.TestCase):
         self.dir = pathlib.Path(self.tmp.name)
         self.verified = []
         self.bad_bundles = set()
-        # (ancestor, descendant) commit pairs besides each commit's own.
-        self.lineage = set()
+        self.git = FakeGit()
 
     def write(self, run_id, doc):
         doc = {**doc, 'run_id': run_id, 'run_url': RUN_URL + run_id}
@@ -533,43 +565,137 @@ class Provenance(unittest.TestCase):
             repo=REPO,
             head_sha=HEAD,
             verify=self.verify,
-            is_ancestor=lambda sha, of: sha == of or (sha, of) in self.lineage,
+            git=self.git,
         )
 
-    def two_commits(self, old_reps, new_reps, new_commit=HEAD):
-        """Calibration 200 of an older commit and 100 of new_commit, dispatched later and
-        earlier, so run-id order says the opposite of commit order."""
-        self.lineage = {('0ld', HEAD), ('0ld', 'sibling')}
+    def dom(self, run_id, baseline, commit, *more):
         exact = {'metric': 'dom', 'kind': 'count', 'tier': 'exact'}
-        self.write('200', calibration_file([cal_cell(**exact, baseline=old_reps)], commit='0ld'))
-        self.write(
-            '100', calibration_file([cal_cell(**exact, baseline=new_reps)], commit=new_commit)
-        )
+        cells = [cal_cell(**exact, baseline=baseline), *more]
+        self.write(run_id, calibration_file(cells, commit=commit))
+
+    def exact(self, run_id, baseline, **kw):
+        return entry(metric='dom', tier='exact', baseline=baseline, source=RUN_URL + run_id, **kw)
+
+    def two_commits(self):
+        """Calibration 200 of an older commit and 100 of the head, dispatched later and
+        earlier, so run-id order says the opposite of commit order. The x1 entry names 100."""
+        self.git.lineage = {('0ld', HEAD)}
+        self.dom('200', 4384.0, '0ld')
+        x1 = cal_cell(metric='dom', kind='count', tier='exact', baseline=1.0, scale='x1')
+        self.dom('100', 4400.0, HEAD, x1)
+        return self.exact('100', 1.0, scale='x1')
+
+    def unchanged(self, *entries):
+        b = budgets(list(entries))
+        return self.check(b, b)
 
     def test_an_entry_sourced_from_an_ancestor_of_a_calibration_of_its_cell_fails(self):
-        self.two_commits(4384.0, 4400.0)
-        stale = entry(metric='dom', tier='exact', baseline=4384.0, source=RUN_URL + '200')
-        errors = self.check(budgets([stale]), budgets([]))
-        self.assertTrue(any('calibration 100' in x and 'descends' in x for x in errors), errors)
+        x1 = self.two_commits()
+        errors = self.check(budgets([self.exact('200', 4384.0), x1]), budgets([]))
+        self.assertTrue(any('take the entry from 100' in x for x in errors), errors)
 
     def test_an_entry_sourced_from_the_newest_commit_of_its_cell_passes(self):
-        self.two_commits(4384.0, 4400.0)
-        fresh = entry(metric='dom', tier='exact', baseline=4400.0, source=RUN_URL + '100')
-        errors = self.check(budgets([fresh]), budgets([]))
-        self.assertEqual([x for x in errors if 'descends' in x], [])
+        self.git.lineage = {('0ld', HEAD)}
+        self.dom('200', 4384.0, '0ld', cal_cell(baseline=900.0))
+        self.dom('100', 4400.0, HEAD)
+        head = budgets([self.exact('100', 4400.0), entry(baseline=900.0, source=RUN_URL + '200')])
+        self.assertEqual(self.check(head, budgets([])), [])
 
     def test_calibrations_of_commits_neither_descends_from_pass(self):
-        self.two_commits(4384.0, 4400.0, new_commit='sibling')
-        self.lineage.discard(('0ld', 'sibling'))
-        e = entry(metric='dom', tier='exact', baseline=4384.0, source=RUN_URL + '200')
-        self.assertEqual([x for x in self.check(budgets([e]), budgets([])) if 'descends' in x], [])
+        self.git.lineage = {('0ld', HEAD), ('sibling', HEAD)}
+        self.dom('200', 4384.0, '0ld')
+        x1 = cal_cell(metric='dom', kind='count', tier='exact', baseline=1.0, scale='x1')
+        self.dom('100', 4400.0, 'sibling', x1)
+        self.assertEqual(
+            self.unchanged(self.exact('200', 4384.0), self.exact('100', 1.0, scale='x1')), []
+        )
 
     def test_an_unchanged_entry_a_newer_calibration_supersedes_fails(self):
-        self.two_commits(4384.0, 4400.0)
-        stale = budgets(
-            [entry(metric='dom', tier='exact', baseline=4384.0, source=RUN_URL + '200')]
+        x1 = self.two_commits()
+        errors = self.unchanged(self.exact('200', 4384.0), x1)
+        self.assertTrue(any('take the entry from 100' in x for x in errors), errors)
+
+    def test_a_newer_calibration_that_did_not_measure_the_cell_supersedes_nothing(self):
+        self.git.lineage = {('0ld', HEAD)}
+        self.dom('200', 4384.0, '0ld', cal_cell(baseline=900.0))
+        self.dom('100', 4400.0, HEAD)
+        gated = entry(baseline=900.0, source=RUN_URL + '200')
+        self.assertEqual(self.unchanged(gated, self.exact('100', 4400.0)), [])
+
+    def test_the_newest_of_several_later_calibrations_is_named(self):
+        self.git.lineage = {('a', 'b'), ('a', HEAD), ('b', HEAD)}
+        x1 = cal_cell(metric='dom', kind='count', tier='exact', baseline=1.0, scale='x1')
+        self.dom('100', 4384.0, 'a')
+        self.dom('200', 4392.0, 'b', x1)
+        self.dom('300', 4400.0, HEAD, {**x1, 'scale': 'x2'})
+        errors = self.unchanged(
+            self.exact('100', 4384.0),
+            self.exact('200', 1.0, scale='x1'),
+            self.exact('300', 1.0, scale='x2'),
         )
-        self.assertTrue(any('descends' in x for x in self.check(stale, stale)))
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('take the entry from 300', errors[0])
+
+    def test_a_squash_merged_calibration_is_placed_at_its_squash_commit(self):
+        # pr-tip is in no commit of the head after its pull request squash-merged as squash.
+        self.git.lineage = {('squash', HEAD)}
+        self.git.added = {'200.json': 'squash'}
+        self.git.same = {('pr-tip', 'squash')}
+        x1 = self.two_commits()
+        self.git.lineage.add(('squash', HEAD))
+        self.dom('200', 4384.0, 'pr-tip')
+        errors = self.unchanged(self.exact('200', 4384.0), x1)
+        self.assertTrue(any('take the entry from 100' in x for x in errors), errors)
+        self.git.lineage = {('0ld', 'squash'), ('0ld', HEAD), ('squash', HEAD)}
+        self.dom(
+            '100',
+            4400.0,
+            '0ld',
+            cal_cell(metric='dom', kind='count', tier='exact', baseline=1.0, scale='x1'),
+        )
+        self.assertEqual(
+            self.unchanged(self.exact('200', 4384.0), self.exact('100', 1.0, scale='x1')), []
+        )
+
+    def test_a_squash_merge_holding_other_code_than_its_calibration_measured_fails(self):
+        self.git.added = {'200.json': 'squash'}
+        self.git.lineage = {('squash', HEAD)}
+        self.dom('200', 4384.0, 'pr-tip')
+        errors = self.unchanged(self.exact('200', 4384.0))
+        self.assertTrue(
+            any(x.startswith('calibration 200:') and 're-calibrate' in x for x in errors), errors
+        )
+        changed = self.check(budgets([self.exact('200', 4384.0)]), budgets([]))
+        self.assertTrue(
+            any(x.startswith('calibration 200:') and 're-calibrate' in x for x in changed), changed
+        )
+
+    def test_a_named_calibration_that_does_not_load_fails(self):
+        x1 = self.two_commits()
+        bad_cell = json.dumps(calibration_file([cal_cell(), {'metric': 'dom'}], commit=HEAD))
+        for text in ('{', bad_cell, json.dumps(calibration_file({}, commit=HEAD))):
+            with self.subTest(text=text[:20]):
+                (self.dir / '100.json').write_text(text)
+                errors = self.unchanged(self.exact('200', 4384.0), x1)
+                self.assertTrue(any(x.startswith('calibration 100:') for x in errors), errors)
+
+    def test_a_commit_git_cannot_answer_for_fails(self):
+        x1 = self.two_commits()
+        self.git.broken = {'0ld'}
+        for head, base in (
+            (budgets([self.exact('200', 4384.0), x1]),) * 2,
+            (budgets([self.exact('200', 4384.0), x1]), budgets([])),
+        ):
+            with self.subTest(changed=base != head):
+                errors = self.check(head, base)
+                self.assertTrue(
+                    any(x.startswith('calibration 200:') and '128' in x for x in errors), errors
+                )
+
+    def test_an_unchanged_entry_its_calibration_did_not_measure_fails(self):
+        self.dom('100', 4400.0, HEAD)
+        errors = self.unchanged(self.exact('100', 4400.0), self.exact('100', 1.0, scale='x1'))
+        self.assertTrue(any('x1' in x and 'did not measure this cell' in x for x in errors), errors)
 
     def test_a_raise_naming_a_file_whose_baseline_differs_fails(self):
         self.write('111', calibration_file([cal_cell(baseline=1000.0)]))
@@ -764,6 +890,91 @@ class Provenance(unittest.TestCase):
                 errors = self.check(budgets([entry(baseline=900.0)]), base)
                 self.assertTrue(errors)
                 self.assertIn('not a finite number', ' '.join(errors))
+
+
+class GitHistory(unittest.TestCase):
+    """perf_gate.Git on a real repository: a pull request's tip, its squash merge with the
+    calibration's check-in, and a squash merge that also carries a dev change."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.sh('init', '-q', '-b', 'main')
+        self.put('tests/perf/plan.json', {'sets': {'pr': {'shards': 5, 'cells': [{'seconds': 9}]}}})
+        self.put('app.txt', 'one')
+        self.base = self.commit('base')
+        self.sh('checkout', '-q', '-b', 'pr')
+        self.put('app.txt', 'two')
+        self.tip = self.commit('the change')
+        self.sh('checkout', '-q', 'main')
+
+    def sh(self, *args):
+        env = {
+            **os.environ,
+            'GIT_AUTHOR_NAME': 't',
+            'GIT_AUTHOR_EMAIL': 't@t',
+            'GIT_COMMITTER_NAME': 't',
+            'GIT_COMMITTER_EMAIL': 't@t',
+        }
+        done = subprocess.run(
+            ['git', *args], cwd=self.root, env=env, capture_output=True, text=True, check=True
+        )
+        return done.stdout.strip()
+
+    def put(self, path, value):
+        p = self.root / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(value if isinstance(value, str) else json.dumps(value))
+
+    def commit(self, message):
+        self.sh('add', '-A')
+        self.sh('commit', '-q', '-m', message)
+        return self.sh('rev-parse', 'HEAD')
+
+    def squash(self, *, dev_change=False, plan=None):
+        if dev_change:
+            self.put('other.txt', 'dev')
+            self.commit('dev moved')
+        self.put('app.txt', 'two')
+        self.put('tests/perf/calibrations/200.json', '{}')
+        self.put('tests/perf/budgets.json', '{}')
+        self.put(
+            'tests/perf/plan.json',
+            plan or {'sets': {'pr': {'shards': 6, 'cells': [{'seconds': 12}]}}},
+        )
+        return self.commit('squash')
+
+    def git(self):
+        cwd = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, cwd)
+        return perf_gate.Git()
+
+    def test_a_squash_of_the_measured_tip_holds_its_code(self):
+        squash = self.squash()
+        git = self.git()
+        self.assertFalse(git.is_ancestor(self.tip, squash))
+        self.assertEqual(git.added_by('tests/perf/calibrations/200.json', squash), squash)
+        self.assertTrue(git.same_code(self.tip, squash))
+
+    def test_a_squash_that_carries_a_dev_change_holds_other_code(self):
+        squash = self.squash(dev_change=True)
+        self.assertFalse(self.git().same_code(self.tip, squash))
+
+    def test_a_squash_that_changes_the_plan_beyond_its_seconds_holds_other_code(self):
+        squash = self.squash(
+            plan={'sets': {'pr': {'shards': 5, 'cells': [{'seconds': 9, 'x': 1}]}}}
+        )
+        self.assertFalse(self.git().same_code(self.tip, squash))
+
+    def test_git_errors_raise_and_a_short_sha_is_refused(self):
+        git = self.git()
+        with self.assertRaises(perf_gate.GitError):
+            git.is_ancestor('0' * 40, self.base)
+        with self.assertRaises(perf_gate.GitError):
+            git.commit(self.tip[:12])
+        self.assertEqual(git.commit(self.tip), self.tip)
 
 
 class Coverage(unittest.TestCase):
@@ -1194,7 +1405,7 @@ class Cli(unittest.TestCase):
         argv = ('--check-file', head, '--base', base, '--calibrations', str(self.dir / 'cal'))
         with (
             unittest.mock.patch.object(perf_gate, 'cosign_verify', return_value=None),
-            unittest.mock.patch.object(perf_gate, 'git_is_ancestor', return_value=True),
+            unittest.mock.patch.object(perf_gate.Git, 'is_ancestor', return_value=True),
         ):
             self.assertEqual(self.main(*argv, '--repo', REPO, '--head', HEAD), 1)
         self.assertIn('::error::budgets[0]: missing metric', self.output)

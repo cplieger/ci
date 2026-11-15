@@ -41,6 +41,10 @@ TIER_RUNS = 10
 IDENTITY = 'https://github.com/cplieger/ci/.github/workflows/perf-calibrate.yaml@refs/heads/main'
 ISSUER = 'https://token.actions.githubusercontent.com'
 SOURCE_RE = re.compile(r'^https://github\.com/cplieger/ci/actions/runs/(\d+)$')
+SHA_RE = re.compile(r'^[0-9a-f]{40}$')
+# What a calibration's check-in writes; the rest of the tree is the code it measured.
+PLAN_PATH = 'tests/perf/plan.json'
+CHECK_IN_PATHS = ('tests/perf/budgets.json', 'tests/perf/calibrations', PLAN_PATH)
 # Budgets are written to two decimals, and a widened headroom times a baseline
 # is not exact in binary floating point.
 TOLERANCE = 0.005
@@ -737,15 +741,14 @@ def check_provenance(
     repo: str,
     head_sha: str,
     verify: Callable[[pathlib.Path, pathlib.Path], str | None],
-    is_ancestor: Callable[[str, str], bool],
+    git: Git,
 ) -> list[str]:
     """Every entry the head adds or whose baseline, budget, tier, headroom or
     source differs from the base must match a signed calibration file, every
-    entry when the file's runner, headroom or floor differs; no entry's source
-    is older than another checked-in calibration of its cell; a gated or exact
-    entry leaves only through `retired`; every calibration file is named by an
-    entry. is_ancestor(sha, of) is git's: true when sha is of or one of its
-    ancestors."""
+    entry when the file's runner, headroom or floor differs; every entry comes
+    from the newest checked-in calibration of its cell (superseded_entries); a
+    gated or exact entry leaves only through `retired`; every calibration file
+    is named by an entry."""
     errors = []
     base_entries = {key(e): e for e in base.get('budgets', [])}
     head_entries = {key(e): e for e in head.get('budgets', [])}
@@ -754,12 +757,14 @@ def check_provenance(
     file_edit = moved or head.get('runner') != base.get('runner')
     files: dict[str, tuple[dict | None, str | None]] = {}
     named = set()
+    unchanged = set()
     for k, e in head_entries.items():
         m = SOURCE_RE.match(str(e.get('source', '')))
         if m:
             named.add(m.group(1))
         b = base_entries.get(k)
         if b is not None and not file_edit and all(e.get(f) == b.get(f) for f in CHANGE_FIELDS):
+            unchanged.add(k)
             continue
         name = key_text(k)
         if not m:
@@ -768,7 +773,7 @@ def check_provenance(
         run_id = m.group(1)
         if run_id not in files:
             files[run_id] = load_calibration(
-                run_id, calibrations, repo, head.get('runner'), head_sha, verify, is_ancestor
+                run_id, calibrations, repo, head.get('runner'), head_sha, verify, git
             )
             if files[run_id][1]:
                 errors.append(files[run_id][1])
@@ -788,45 +793,99 @@ def check_provenance(
                 errors.append(f'{p.name}: not a calibration file or bundle')
             elif stem not in named:
                 errors.append(f'{p.name}: no budget entry names calibration run {stem}')
-    errors += superseded_entries(head_entries, calibrations, is_ancestor)
+    errors += superseded_entries(
+        head_entries, unchanged, calibrations, git, head_sha, {r for r, f in files.items() if f[1]}
+    )
     return errors
 
 
 def superseded_entries(
-    entries: dict, calibrations: pathlib.Path, is_ancestor: Callable[[str, str], bool]
+    entries: dict,
+    unchanged: set,
+    calibrations: pathlib.Path,
+    git: Git,
+    head_sha: str,
+    failed: set,
 ) -> list[str]:
-    """Each entry whose source measured a strict ancestor of the commit another
-    checked-in calibration of its cell measured. Run ids order dispatches, not
-    commits, so only git ancestry says which file measured the newer code."""
-    measured: dict[str, tuple[str, set]] = {}
+    """Why an entry is not from the newest checked-in calibration of its cell, and why a
+    calibration cannot be placed in head's history; failed holds the run ids whose load
+    error the caller reported. A file is placed at the commit it measured when head
+    contains it, else at the commit that added the file, provided that commit brought
+    exactly the code it measured (a squash merge of the pull request it calibrated). Run
+    ids order dispatches, not commits, so only that place says which file is newer."""
+    errors: list[str] = []
+    placed: dict[str, tuple[str, set]] = {}
     if calibrations.is_dir():
         for p in sorted(calibrations.glob('*.json')):
-            if p.name.endswith('.sigstore.json'):
-                continue
-            try:
-                doc = load(p)
-                cells = {key(c) for c in doc.get('cells', [])}
-            except ValueError, TypeError, KeyError, AttributeError:
-                continue
-            measured[p.stem] = (str(doc.get('commit')), cells)
-    newer = functools.cache(lambda old, new: old != new and is_ancestor(old, new))
-    errors = []
+            if p.stem.isdigit() and p.stem not in failed:
+                found = place_calibration(p, git, head_sha)
+                if isinstance(found, str):
+                    errors.append(f'calibration {p.stem}: {found}')
+                else:
+                    placed[p.stem] = found
+    newer = functools.cache(lambda old, new: old != new and git.is_ancestor(old, new))
     for k, e in entries.items():
         m = SOURCE_RE.match(str(e.get('source', '')))
-        if not m or m.group(1) not in measured:
+        if not m or m.group(1) not in placed:
             continue
-        mine = measured[m.group(1)][0]
-        for run_id, (commit, cells) in measured.items():
-            if k in cells and newer(mine, commit):
-                errors.append(
-                    f'{key_text(k)}: calibration {run_id} measured this cell at {commit}, '
-                    f"which descends from source {m.group(1)}'s {mine}; take the entry from it"
-                )
-                break
+        mine, cells = placed[m.group(1)]
+        if k in unchanged and k not in cells:
+            errors.append(f'{key_text(k)}: calibration {m.group(1)} did not measure this cell')
+        try:
+            later = [r for r, (at, cs) in placed.items() if k in cs and newer(mine, at)]
+            newest = [r for r in later if not any(newer(placed[r][0], placed[o][0]) for o in later)]
+        except GitError as exc:
+            errors.append(f'{key_text(k)}: {exc}')
+            continue
+        if newest:
+            r = newest[0]
+            errors.append(
+                f'{key_text(k)}: calibration {r} measured this cell at {placed[r][0]}, which '
+                f"descends from source {m.group(1)}'s {mine}; take the entry from {r}"
+            )
     return errors
 
 
-def load_calibration(run_id, calibrations, repo, runner, head_sha, verify, is_ancestor):
+def place_calibration(path: pathlib.Path, git: Git, head_sha: str) -> tuple[str, set] | str:
+    """The commit in head's history whose code the calibration at path measured, and the
+    cells it measured; or why it has no such commit."""
+    try:
+        doc = load(path)
+    except (ValueError, TypeError) as exc:
+        return str(exc)
+    cells = doc.get('cells')
+    if not isinstance(cells, list):
+        return 'cells is not a list'
+    keys = set()
+    for i, c in enumerate(cells):
+        if not isinstance(c, dict) or any(f not in c for f in KEY_FIELDS):
+            return f'cells[{i}] does not name a cell by {", ".join(KEY_FIELDS)}'
+        keys.add(key(c))
+    at, why = placed_commit(doc, path, git, head_sha)
+    return why if at is None else (at, keys)
+
+
+def placed_commit(doc: dict, path: pathlib.Path, git: Git, head_sha: str) -> tuple:
+    """(the commit in head's history whose code calibration doc at path measured, None), or
+    (None, why it has none). That is its `commit` when head contains it; else the commit that
+    added path, when its tree holds exactly the measured code: a squash merge of the pull
+    request whose final head the calibration measured."""
+    try:
+        measured = git.commit(str(doc.get('commit')))
+        if git.is_ancestor(measured, head_sha):
+            return measured, None
+        added = git.added_by(str(path), head_sha)
+        if git.same_code(measured, added):
+            return added, None
+    except GitError as exc:
+        return None, str(exc)
+    return None, (
+        f'measured {measured}, which {head_sha} does not contain, and {added}, which added '
+        'the file, holds other code; re-calibrate at a commit of this branch'
+    )
+
+
+def load_calibration(run_id, calibrations, repo, runner, head_sha, verify, git):
     blob = calibrations / f'{run_id}.json'
     bundle = calibrations / f'{run_id}.sigstore.json'
     if not blob.is_file() or not bundle.is_file():
@@ -841,9 +900,8 @@ def load_calibration(run_id, calibrations, repo, runner, head_sha, verify, is_an
     for field, want in (('run_id', run_id), ('repo', repo), ('runner', runner)):
         if str(doc.get(field)) != str(want):
             return None, f'calibration {run_id}: {field} is {doc.get(field)!r}, not {want!r}'
-    if not is_ancestor(str(doc.get('commit')), head_sha):
-        return None, f'calibration {run_id}: commit {doc.get("commit")} is not in {head_sha}'
-    return doc, None
+    _, why = placed_commit(doc, blob, git, head_sha)
+    return (None, f'calibration {run_id}: {why}') if why else (doc, None)
 
 
 def entry_provenance(head: dict, e: dict, b: dict | None, doc: dict, file_moved: bool) -> list[str]:
@@ -970,9 +1028,66 @@ def merge(paths: list[pathlib.Path]) -> dict:
     return merged
 
 
-def git_is_ancestor(sha: str, head: str) -> bool:
-    done = subprocess.run(['git', 'merge-base', '--is-ancestor', sha, head], capture_output=True)
-    return done.returncode == 0
+def plan_shape(doc: Any) -> Any:
+    """doc without the `seconds` and `shards` a calibration's check-in rewrites."""
+    if isinstance(doc, dict):
+        return {k: plan_shape(v) for k, v in doc.items() if k not in ('seconds', 'shards')}
+    if isinstance(doc, list):
+        return [plan_shape(v) for v in doc]
+    return doc
+
+
+class GitError(Exception):
+    """git could not answer, which the provenance check reports instead of reading as a pass."""
+
+
+class Git:
+    """The history questions the provenance check asks of the checkout in the working
+    directory, which perf-ci.yaml's compare job checks out with every branch's history."""
+
+    def git(self, *args: str) -> str:
+        done = subprocess.run(['git', *args], capture_output=True, text=True)
+        if done.returncode:
+            raise GitError(f'git {args[0]} exited {done.returncode}: {done.stderr.strip()}')
+        return done.stdout
+
+    def ok(self, *args: str) -> bool:
+        """True on exit 0, False on 1, GitError on any other status: the convention of
+        merge-base --is-ancestor, rev-parse --verify --quiet and diff --quiet."""
+        done = subprocess.run(['git', *args], capture_output=True, text=True)
+        if done.returncode not in (0, 1):
+            raise GitError(f'git {args[0]} exited {done.returncode}: {done.stderr.strip()}')
+        return done.returncode == 0
+
+    def commit(self, sha: str) -> str:
+        """sha, fetched from origin when the checkout lacks it: a squash merge leaves a pull
+        request's own commits only under its refs/pull head, which a clone does not fetch."""
+        if not SHA_RE.match(sha):
+            raise GitError(f'commit {sha!r} is not a full lowercase SHA')
+        if not self.ok('rev-parse', '--verify', '--quiet', f'{sha}^{{commit}}'):
+            self.git('fetch', '--quiet', '--no-tags', 'origin', sha)
+        return sha
+
+    def is_ancestor(self, sha: str, of: str) -> bool:
+        """True when sha is of or one of its ancestors."""
+        return self.ok('merge-base', '--is-ancestor', sha, of)
+
+    def added_by(self, path: str, head: str) -> str:
+        """The newest first-parent commit of head that added path."""
+        args = ('log', '--first-parent', '--diff-filter=A', '--format=%H', '-1', head, '--')
+        found = self.git(*args, path).strip()
+        if not found:
+            raise GitError(f'no first-parent commit of {head} added {path}')
+        return found
+
+    def same_code(self, measured: str, added: str) -> bool:
+        """Whether commits measured and added hold the same tree outside CHECK_IN_PATHS and
+        one plan but for its seconds and shards."""
+        plans = [loads(self.git('show', f'{c}:{PLAN_PATH}')) for c in (measured, added)]
+        if plan_shape(plans[0]) != plan_shape(plans[1]):
+            return False
+        skip = [f':(top,exclude){p}' for p in CHECK_IN_PATHS]
+        return self.ok('diff', '--quiet', measured, added, '--', *skip)
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -1052,7 +1167,7 @@ def file_errors(a: argparse.Namespace, head: dict) -> list[str]:
         repo=a.repo,
         head_sha=a.head,
         verify=cosign_verify,
-        is_ancestor=git_is_ancestor,
+        git=Git(),
     )
     return errors
 
