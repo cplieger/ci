@@ -132,8 +132,10 @@ def running(job: dict, ctx: tuple[str, str, str], outputs: dict[str, str]) -> li
 
 
 def needs(published: str, image: str = 'true', platforms: str = '') -> dict:
+    build = 'true' if image == 'true' and published == 'false' else 'false'
+    outputs = {'published': published, 'image': image, 'build': build}
     return {
-        'profile': {'outputs': {'published': published, 'image': image}, 'result': 'success'},
+        'profile': {'outputs': outputs, 'result': 'success'},
         'published-image': {'outputs': {'platforms': platforms}, 'result': 'success'},
     }
 
@@ -150,7 +152,7 @@ class SecurityScanForMainDefaultRepos(unittest.TestCase):
                 with self.subTest(ctx=ctx, dockerfile=dockerfile):
                     got = profile(new['profile'], ctx, dockerfile=dockerfile)
                     want = profile(old, ctx, dockerfile=dockerfile)
-                    self.assertEqual(got, {**want, 'published': 'false'})
+                    self.assertEqual(got, {**want, 'published': 'false', 'build': want['image']})
                     head = [RENAMED.get(n, n) for n in running(old, ctx, want) if n != MOVED]
                     self.assertEqual(running(new['trivy'], ctx, got), head)
 
@@ -218,11 +220,25 @@ class SecurityScanPublishedMode(unittest.TestCase):
 
     def test_main_of_a_two_branch_repo_scans_instead_of_building(self):
         out = profile(self.jobs['profile'], PUBLISHED, dockerfile=True)
-        self.assertEqual(out, {'image': 'true', 'published': 'true'})
+        self.assertEqual(out, {'image': 'true', 'published': 'true', 'build': 'false'})
         steps = running(self.jobs['trivy'], PUBLISHED, out)
         self.assertLessEqual(set(PUBLISHED_STEPS), set(steps))
         self.assertFalse(set(BUILD_STEPS) & set(steps))
         self.assertIn('Trivy filesystem scan (advisory)', steps)
+
+    def test_the_profile_builds_only_a_dockerfile_outside_the_published_mode(self):
+        for dockerfile, ctx, want in (
+            (True, TODAY[1], {'image': 'true', 'published': 'false', 'build': 'true'}),
+            (False, TODAY[1], {'image': 'false', 'published': 'false', 'build': 'false'}),
+            (True, PUBLISHED, {'image': 'true', 'published': 'true', 'build': 'false'}),
+            (False, PUBLISHED, {'image': 'false', 'published': 'true', 'build': 'false'}),
+        ):
+            with self.subTest(dockerfile=dockerfile, ctx=ctx):
+                self.assertEqual(profile(self.jobs['profile'], ctx, dockerfile=dockerfile), want)
+        self.assertEqual(
+            self.jobs['profile']['outputs'],
+            {k: f'${{{{ steps.profile.outputs.{k} }}}}' for k in ('image', 'published', 'build')},
+        )
 
     def test_a_pull_request_into_main_or_a_main_default_main_is_not_published(self):
         for ctx in (
@@ -238,7 +254,7 @@ class SecurityScanPublishedMode(unittest.TestCase):
         for repo in ({'private': True}, {'fork': True}):
             with self.subTest(**repo):
                 out = profile(self.jobs['profile'], PUBLISHED, dockerfile=True, **repo)
-                self.assertEqual(out, {'image': 'true', 'published': 'false'})
+                self.assertEqual(out, {'image': 'true', 'published': 'false', 'build': 'true'})
 
     def test_the_jobs_chain_on_the_profile_and_the_resolved_platforms(self):
         rows = json.dumps([{'platform': 'linux/amd64', 'slug': 'linux-amd64', 'ref': 'r'}])

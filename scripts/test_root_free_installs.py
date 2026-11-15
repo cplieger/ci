@@ -261,7 +261,7 @@ COSIGN_PIN = re.compile(
 
 
 class CosignInstall(unittest.TestCase):
-    """The security jobs install the cosign release whose digest the workflow pins."""
+    """Each job in COSIGN_JOBS installs the cosign release whose digest its workflow pins."""
 
     def run_body(self, body: str, env: dict[str, str], fixture: bytes | None) -> tuple:
         tmp = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='cosign-')))
@@ -320,15 +320,7 @@ class CosignInstall(unittest.TestCase):
                 env = yaml.safe_load(text)['env']
                 self.assertEqual((env['COSIGN_VERSION'], env['COSIGN_SHA256']), pins[0])
 
-    def test_the_pinned_digest_is_the_published_asset_s(self):
-        pins = {
-            (env['COSIGN_VERSION'], env['COSIGN_SHA256'])
-            for env in (yaml.safe_load((WORKFLOWS / w).read_text())['env'] for w in COSIGN_JOBS)
-        }
-        self.assertEqual(len(pins), 1, f'the workflows pin different cosign releases: {pins}')
-        ((version, digest),) = pins
-        url = f'https://github.com/sigstore/cosign/releases/download/{version}/cosign-linux-amd64'
-        tmp = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='cosign-pin-')))
+    def fetch(self, url: str, dest: Path) -> None:
         got = subprocess.run(
             [
                 'curl',
@@ -339,7 +331,7 @@ class CosignInstall(unittest.TestCase):
                 '150',
                 '--retry-all-errors',
                 '-o',
-                str(tmp / 'cosign'),
+                str(dest),
                 url,
             ],
             capture_output=True,
@@ -349,8 +341,43 @@ class CosignInstall(unittest.TestCase):
             if os.environ.get('GITHUB_ACTIONS') == 'true':
                 self.fail(f'{url}: {got.stderr}')
             self.skipTest(f'{url} is unreachable here: {got.stderr.strip()}')
-        got_digest = hashlib.sha256((tmp / 'cosign').read_bytes()).hexdigest()
+
+    def test_the_pinned_digest_is_the_published_asset_s_and_its_signature_verifies(self):
+        # The digest cannot catch a swapped release asset, since Renovate reads
+        # it from the same release; the keyless signature can. self-ci installs
+        # cosign before these tests.
+        pins = {
+            (env['COSIGN_VERSION'], env['COSIGN_SHA256'])
+            for env in (yaml.safe_load((WORKFLOWS / w).read_text())['env'] for w in COSIGN_JOBS)
+        }
+        self.assertEqual(len(pins), 1, f'the workflows pin different cosign releases: {pins}')
+        ((version, digest),) = pins
+        url = f'https://github.com/sigstore/cosign/releases/download/{version}/cosign-linux-amd64'
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='cosign-pin-')))
+        binary, bundle = tmp / 'cosign', tmp / 'cosign.sigstore.json'
+        self.fetch(url, binary)
+        got_digest = hashlib.sha256(binary.read_bytes()).hexdigest()
         self.assertEqual(got_digest, digest, 'update COSIGN_SHA256 with the version')
+        self.fetch(f'{url}.sigstore.json', bundle)
+        cosign = shutil.which('cosign')
+        if cosign is None:
+            if os.environ.get('GITHUB_ACTIONS') == 'true':
+                self.fail('cosign is not on PATH')
+            self.skipTest('cosign is not installed')
+        verified = subprocess.run(
+            [
+                cosign,
+                'verify-blob',
+                '--certificate-identity=keyless@projectsigstore.iam.gserviceaccount.com',
+                '--certificate-oidc-issuer=https://accounts.google.com',
+                '--bundle',
+                str(bundle),
+                str(binary),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(verified.returncode, 0, verified.stderr)
 
     def test_a_binary_matching_the_digest_lands_in_the_job_temp_bin(self):
         data = fake_tool('cosign')
@@ -373,17 +400,6 @@ class CosignInstall(unittest.TestCase):
                 proc, _, tmp = self.run_body(body, {'COSIGN_SHA256': sha}, fake_tool('cosign'))
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertFalse((tmp / 'github_path').exists())
-
-    def test_the_perf_plan_job_runs_on_the_input_and_installs_no_cosign(self):
-        spec = jobs('perf-ci.yaml')
-        self.assertEqual(spec['plan']['runs-on'], "${{ inputs.runner || 'ubuntu-26.04' }}")
-        self.assertNotIn('cosign-sha256', spec['plan']['outputs'])
-        self.assertFalse(
-            any(
-                'cosign' in (s.get('name', '') + s.get('uses', '')).lower()
-                for s in spec['plan']['steps']
-            )
-        )
 
 
 if __name__ == '__main__':

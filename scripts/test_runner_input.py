@@ -42,8 +42,8 @@ CONDITIONAL = {
         'security-scan.yaml',
         'trivy',
     ): (
-        "${{ (needs.profile.outputs.image == 'true' && needs.profile.outputs.published != 'true'"
-        " && 'ubuntu-26.04') || inputs.runner || 'ubuntu-26.04' }}"
+        "${{ (needs.profile.outputs.build == 'true' && 'ubuntu-26.04')"
+        " || inputs.runner || 'ubuntu-26.04' }}"
     ),
 }
 # go-os-ci.yaml's own `runner` input names its Windows or macOS runner.
@@ -226,18 +226,14 @@ class Routing(unittest.TestCase):
                 self.assertEqual(got, want)
 
     def test_trivy_stays_on_github_only_when_it_builds_a_dockerfile(self):
-        # Published mode scans the published image and builds nothing.
-        for image, published, runner, want in (
-            ('true', 'false', 'pool', 'ubuntu-26.04'),
-            ('true', 'false', '', 'ubuntu-26.04'),
-            ('true', 'true', 'pool', 'pool'),
-            ('true', 'true', '', 'ubuntu-26.04'),
-            ('false', 'false', 'pool', 'pool'),
-            ('false', 'false', '', 'ubuntu-26.04'),
-            ('false', 'true', 'pool', 'pool'),
+        for build, runner, want in (
+            ('true', 'pool', 'ubuntu-26.04'),
+            ('true', '', 'ubuntu-26.04'),
+            ('false', 'pool', 'pool'),
+            ('false', '', 'ubuntu-26.04'),
         ):
-            with self.subTest(image=image, published=published, runner=runner):
-                needs = {'profile': {'image': image, 'published': published}}
+            with self.subTest(build=build, runner=runner):
+                needs = {'profile': {'build': build}}
                 got = self.runs_on('security-scan.yaml', 'trivy', needs, runner=runner)
                 self.assertEqual(got, want)
 
@@ -299,9 +295,19 @@ class PoolReady(unittest.TestCase):
                     with self.subTest(workflow=name, job=job, step=s.get('name'), needs=binary):
                         self.assertFalse(s.get('uses', '').startswith(action))
 
-    def test_the_hosted_image_check_matches_a_pinned_action_reference(self):
-        pinned = 'sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532'
-        self.assertTrue(pinned.startswith(tuple(NEEDS_HOSTED_IMAGE)))
+    def test_the_hosted_image_check_matches_how_the_repository_writes_the_reference(self):
+        # The jobs that stay on GitHub still use the action, so a guard key that
+        # matches none of their references would pass every moving job unread.
+        uses = [
+            s.get('uses', '')
+            for path in sorted(WORKFLOWS.glob('*.yaml'))
+            if path.name not in TAKES_RUNNER
+            for spec in load(path)['jobs'].values()
+            for s in spec.get('steps', [])
+        ]
+        for action in NEEDS_HOSTED_IMAGE:
+            with self.subTest(action=action):
+                self.assertTrue(any(u.startswith(action) for u in uses))
 
     def test_no_moving_job_installs_with_pipx(self):
         for name, job, steps in self.moving_jobs():

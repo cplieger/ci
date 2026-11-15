@@ -41,8 +41,8 @@ env:
   COSIGN_SHA256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
 
 jobs:
-  # Whether the repository has a Dockerfile picks trivy's runner, and the
-  # published mode picks the jobs that run.
+  # Whether trivy builds the Dockerfile picks its runner, and the published mode
+  # picks the jobs that run.
   profile:
     runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 5
@@ -51,6 +51,7 @@ jobs:
     outputs:
       image: ${{ steps.profile.outputs.image }}
       published: ${{ steps.profile.outputs.published }}
+      build: ${{ steps.profile.outputs.build }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -69,17 +70,19 @@ jobs:
           if [ -f Dockerfile ]; then echo 'image=true' >> "$GITHUB_OUTPUT"; else echo 'image=false' >> "$GITHUB_OUTPUT"; fi
           # Published mode: a two-branch repository's main is what users run, so
           # its scan reads the published :latest instead of building the tree.
+          published=false
           if [ "$DEFAULT_BRANCH" = dev ] && [ "$REPO_PRIVATE" != true ] && [ "$REPO_FORK" != true ] \
             && [ "$GITHUB_REF" = refs/heads/main ] && [ "$EVENT_NAME" != pull_request ]; then
-            echo 'published=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'published=false' >> "$GITHUB_OUTPUT"
+            published=true
           fi
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+          if [ -f Dockerfile ] && [ "$published" = false ]; then build=true; else build=false; fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
 
   trivy:
     needs: profile
     # GitHub's runner when it builds the image; otherwise wherever the input says.
-    runs-on: ${{ (needs.profile.outputs.image == 'true' && needs.profile.outputs.published != 'true' && 'ubuntu-26.04') || inputs.runner || 'ubuntu-26.04' }}
+    runs-on: ${{ (needs.profile.outputs.build == 'true' && 'ubuntu-26.04') || inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -100,7 +103,7 @@ jobs:
         run: printf '%s\n' AVD-DS-0002 AVD-DS-0026 DS-0002 DS-0026 > .trivyignore
 
       - name: Set up Docker Buildx
-        if: ${{ needs.profile.outputs.image == 'true' && needs.profile.outputs.published != 'true' }}
+        if: ${{ needs.profile.outputs.build == 'true' }}
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Without this the advisory scan reports on a phantom image: the build
@@ -110,7 +113,7 @@ jobs:
       # "Resolve OS package refresh key" step.
       - name: Resolve OS package refresh key
         id: pkgrefresh
-        if: ${{ needs.profile.outputs.image == 'true' && needs.profile.outputs.published != 'true' }}
+        if: ${{ needs.profile.outputs.build == 'true' }}
         env:
           DOCKERFILE: ${{ inputs.dockerfile }}
         run: |
@@ -127,7 +130,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build image (no push)
-        if: ${{ needs.profile.outputs.image == 'true' && needs.profile.outputs.published != 'true' }}
+        if: ${{ needs.profile.outputs.build == 'true' }}
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ inputs.build-context }}
@@ -227,7 +230,7 @@ jobs:
       # families gitleaks lacks (dockerconfig-secret, azure-*, maven-settings-*).
       # Pinning the value keeps a future Trivy default change from removing it.
       - name: Trivy image scan (advisory)
-        if: ${{ needs.profile.outputs.image == 'true' && needs.profile.outputs.published != 'true' }}
+        if: ${{ needs.profile.outputs.build == 'true' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           skip-setup-trivy: true
