@@ -55,7 +55,12 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.request
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # `jsr publish --dry-run` prints one `file:///abs/path (size)` line per file.
 JSR_FILE_LINE = re.compile(r'file://(/[^\s]*?)(?:\s+\([^)]*\))?\s*$')
@@ -68,6 +73,13 @@ NODE_MODULES_PKG = re.compile(r'.*/node_modules/(?P<name>@[^/]+/[^/]+|[^/@][^/]*
 # Pinned to match the release workflow's JSR_VERSION, so the checked surface is the published surface.
 # renovate: datasource=npm depName=jsr
 JSR_VERSION = '0.14.3'
+
+# A first-party jsr.json import of a dev build: `jsr:@cplieger/<name>@<op><X.Y.Z-dev.N>`.
+FIRST_PARTY_DEV_IMPORT = re.compile(
+    r'^jsr:(?P<name>@cplieger/[a-z0-9._-]+)@(?P<op>[\^~]?)(?P<major>\d+)\.\d+\.\d+-dev\.\d+$'
+)
+STABLE_VERSION = re.compile(r'^(\d+)\.(\d+)\.(\d+)$')
+JSR_META_URL = 'https://jsr.io/{name}/meta.json'
 
 
 class SurfaceError(RuntimeError):
@@ -331,18 +343,89 @@ def pack_entry(stdout: str) -> dict:
     return entries[0]
 
 
+def jsr_stable_versions(name: str) -> list[str]:
+    """The non-yanked stable versions JSR holds for `name`, from its meta.json."""
+    url = JSR_META_URL.format(name=name)
+    # jsr.io answers 403 to urllib's default User-Agent.
+    req = urllib.request.Request(url, headers={'User-Agent': 'cplieger-ci-publish-surface'})  # noqa: S310 - fixed https JSR URL
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 - fixed https JSR URL
+            meta = json.load(resp)
+    except (OSError, ValueError) as exc:
+        raise SurfaceError(f'{url}: could not read the JSR versions ({exc})') from exc
+    versions = meta.get('versions') if isinstance(meta, dict) else None
+    if not isinstance(versions, dict):
+        raise SurfaceError(f'{url}: no `versions` object')
+    return [
+        v
+        for v, info in versions.items()
+        if STABLE_VERSION.match(v) and not (isinstance(info, dict) and info.get('yanked'))
+    ]
+
+
+def dev_import_swaps(
+    config: dict, stable_versions: Callable[[str], list[str]]
+) -> dict[str, tuple[str, str]]:
+    """Rewrite `config`'s first-party dev-build imports to the newest stable JSR version.
+
+    The release publishes dev builds to npm only and promotion moves each dev pin
+    to its stable twin, so a dev branch's jsr.json may name a version JSR does not
+    hold, and the dry run would refuse to resolve it. The swap keeps the pin's
+    operator and major; a third-party or stable import is never touched. Returns
+    {import key: (old specifier, new specifier)}, and mutates `config` in place.
+    """
+    imports = config.get('imports')
+    if not isinstance(imports, dict):
+        return {}
+    swaps: dict[str, tuple[str, str]] = {}
+    for key, spec in imports.items():
+        match = FIRST_PARTY_DEV_IMPORT.match(spec) if isinstance(spec, str) else None
+        if not match:
+            continue
+        name, major = match['name'], int(match['major'])
+        same_major = [
+            tuple(int(p) for p in v.split('.'))
+            for v in stable_versions(name)
+            if int(v.split('.', 1)[0]) == major
+        ]
+        if not same_major:
+            raise SurfaceError(
+                f'jsr.json imports {spec}, a dev build, and JSR holds no stable '
+                f'{name} {major}.x to check the dry run against.'
+            )
+        newest = '.'.join(str(p) for p in max(same_major))
+        new = f'jsr:{name}@{match["op"]}{newest}'
+        imports[key] = new
+        swaps[key] = (spec, new)
+    return swaps
+
+
 def jsr_shipped(pkg_dir: Path) -> set[Path]:
     """The exact file set `jsr publish` would upload, from the jsr CLI.
 
     `--dry-run` needs no credentials and no network beyond fetching the pinned
     CLI. `--allow-dirty` is required because CI checks out a working tree the
-    CLI considers dirty; it does not relax any file selection.
+    CLI considers dirty; it does not relax any file selection. A dev-build
+    import is swapped for the dry run only (dev_import_swaps), and jsr.json's
+    bytes are restored afterwards.
     """
-    proc = run(
-        ['npx', '--yes', f'jsr@{JSR_VERSION}', 'publish', '--dry-run', '--allow-dirty'],
-        cwd=pkg_dir,
-        check=False,
-    )
+    jsr_path = pkg_dir / 'jsr.json'
+    original = jsr_path.read_bytes()
+    config = read_json(jsr_path)
+    swaps = dev_import_swaps(config, jsr_stable_versions)
+    for key, (old, new) in swaps.items():
+        print(f'jsr dry run:  {key} {old} -> {new} (dev builds are not on JSR)')
+    if swaps:
+        jsr_path.write_text(json.dumps(config, indent=2) + '\n')
+    try:
+        proc = run(
+            ['npx', '--yes', f'jsr@{JSR_VERSION}', 'publish', '--dry-run', '--allow-dirty'],
+            cwd=pkg_dir,
+            check=False,
+        )
+    finally:
+        if swaps:
+            jsr_path.write_bytes(original)
     combined = proc.stdout + '\n' + proc.stderr
     pkg_root = pkg_dir.resolve()
     shipped: set[Path] = set()
