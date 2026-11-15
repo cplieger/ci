@@ -245,11 +245,23 @@ class InstallSteps(unittest.TestCase):
                 self.assertEqual(len(versions), 1, versions)
 
 
-POOL_COSIGN = ('published-image', 'trivy-published')
+# The jobs that install cosign, in each workflow that may run them on a pool runner.
+COSIGN_JOBS = {
+    'security-scan.yaml': ('trivy', 'published-image', 'trivy-published'),
+    'perf-ci.yaml': ('compare',),
+}
+# The block shape of the custom.cosign manager in cplieger/.github's
+# default.json, which moves COSIGN_VERSION and COSIGN_SHA256 in one pull
+# request; keep the two in sync.
+COSIGN_PIN = re.compile(
+    r'#\s*renovate:\s*datasource=custom\.cosign\s+depName=sigstore/cosign\s*\n'
+    r'\s*COSIGN_VERSION:\s*(v\S+)\s*\n'
+    r'\s*COSIGN_SHA256:\s*([a-f0-9]{64})\s*\n'
+)
 
 
 class CosignInstall(unittest.TestCase):
-    """The pool-capable security jobs install the cosign the hosted trivy job verified."""
+    """Each job in COSIGN_JOBS installs the cosign release whose digest its workflow pins."""
 
     def run_body(self, body: str, env: dict[str, str], fixture: bytes | None) -> tuple:
         tmp = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='cosign-')))
@@ -277,24 +289,95 @@ class CosignInstall(unittest.TestCase):
         )
         return proc, runner_temp / 'bin', tmp
 
-    def test_both_jobs_take_the_digest_from_the_hosted_job_and_skip_the_installer(self):
-        spec = jobs('security-scan.yaml')
-        self.assertEqual(
-            spec['trivy']['outputs']['cosign-sha256'], '${{ steps.cosign.outputs.sha256 }}'
-        )
+    def test_every_cosign_job_verifies_the_pinned_digest_and_skips_the_installer(self):
         bodies = set()
-        for job in POOL_COSIGN:
-            with self.subTest(job=job):
-                needs = spec[job]['needs']
-                self.assertIn('trivy', [needs] if isinstance(needs, str) else needs)
-                s = step('security-scan.yaml', job, 'Install cosign')
-                self.assertNotIn('uses', s)
-                self.assertEqual(
-                    s['env']['COSIGN_SHA256'], '${{ needs.trivy.outputs.cosign-sha256 }}'
-                )
-                self.assertIn('--retry 7 --retry-max-time 150 --retry-all-errors', s['run'])
-                bodies.add(s['run'])
+        for workflow, names in COSIGN_JOBS.items():
+            for job in names:
+                with self.subTest(workflow=workflow, job=job):
+                    s = step(workflow, job, 'Install cosign')
+                    self.assertNotIn('uses', s)
+                    self.assertNotIn('COSIGN_SHA256', s.get('env') or {})
+                    self.assertIn('--retry 7 --retry-max-time 150 --retry-all-errors', s['run'])
+                    bodies.add(s['run'])
+            with self.subTest(workflow=workflow):
+                installers = {
+                    job
+                    for job, js in jobs(workflow).items()
+                    for s in js.get('steps', [])
+                    if 'cosign' in s.get('uses', '')
+                    or s.get('name', '').lower() == 'install cosign'
+                }
+                self.assertEqual(installers, set(names))
+                self.assertNotIn('cosign-sha256', (WORKFLOWS / workflow).read_text())
         self.assertEqual(len(bodies), 1)
+
+    def test_the_workflow_pins_the_cosign_digest_beside_its_version(self):
+        for workflow in COSIGN_JOBS:
+            with self.subTest(workflow=workflow):
+                text = (WORKFLOWS / workflow).read_text()
+                pins = COSIGN_PIN.findall(text)
+                self.assertEqual(len(pins), 1, 'one renovate, COSIGN_VERSION, COSIGN_SHA256 block')
+                env = yaml.safe_load(text)['env']
+                self.assertEqual((env['COSIGN_VERSION'], env['COSIGN_SHA256']), pins[0])
+
+    def fetch(self, url: str, dest: Path) -> None:
+        got = subprocess.run(
+            [
+                'curl',
+                '-fsSL',
+                '--retry',
+                '7',
+                '--retry-max-time',
+                '150',
+                '--retry-all-errors',
+                '-o',
+                str(dest),
+                url,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if got.returncode != 0:
+            if os.environ.get('GITHUB_ACTIONS') == 'true':
+                self.fail(f'{url}: {got.stderr}')
+            self.skipTest(f'{url} is unreachable here: {got.stderr.strip()}')
+
+    def test_the_pinned_digest_is_the_published_asset_s_and_its_signature_verifies(self):
+        # The digest cannot catch a swapped release asset, since Renovate reads
+        # it from the same release; the keyless signature can. self-ci installs
+        # cosign before these tests.
+        pins = {
+            (env['COSIGN_VERSION'], env['COSIGN_SHA256'])
+            for env in (yaml.safe_load((WORKFLOWS / w).read_text())['env'] for w in COSIGN_JOBS)
+        }
+        self.assertEqual(len(pins), 1, f'the workflows pin different cosign releases: {pins}')
+        ((version, digest),) = pins
+        url = f'https://github.com/sigstore/cosign/releases/download/{version}/cosign-linux-amd64'
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='cosign-pin-')))
+        binary, bundle = tmp / 'cosign', tmp / 'cosign.sigstore.json'
+        self.fetch(url, binary)
+        got_digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        self.assertEqual(got_digest, digest, 'update COSIGN_SHA256 with the version')
+        self.fetch(f'{url}.sigstore.json', bundle)
+        cosign = shutil.which('cosign')
+        if cosign is None:
+            if os.environ.get('GITHUB_ACTIONS') == 'true':
+                self.fail('cosign is not on PATH')
+            self.skipTest('cosign is not installed')
+        verified = subprocess.run(
+            [
+                cosign,
+                'verify-blob',
+                '--certificate-identity=keyless@projectsigstore.iam.gserviceaccount.com',
+                '--certificate-oidc-issuer=https://accounts.google.com',
+                '--bundle',
+                str(bundle),
+                str(binary),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(verified.returncode, 0, verified.stderr)
 
     def test_a_binary_matching_the_digest_lands_in_the_job_temp_bin(self):
         data = fake_tool('cosign')
@@ -317,44 +400,6 @@ class CosignInstall(unittest.TestCase):
                 proc, _, tmp = self.run_body(body, {'COSIGN_SHA256': sha}, fake_tool('cosign'))
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertFalse((tmp / 'github_path').exists())
-
-    def test_the_perf_compare_job_installs_the_cosign_its_hosted_plan_job_verified(self):
-        spec = jobs('perf-ci.yaml')
-        self.assertEqual(
-            spec['plan']['outputs']['cosign-sha256'], '${{ steps.cosign.outputs.sha256 }}'
-        )
-        self.assertEqual(spec['plan']['runs-on'], 'ubuntu-26.04')
-        names = [x.get('name') for x in spec['plan']['steps']]
-        self.assertLess(
-            names.index('Install cosign'), names.index("Record the verified cosign's digest")
-        )
-        self.assertIn('plan', spec['compare']['needs'])
-        s = step('perf-ci.yaml', 'compare', 'Install cosign')
-        self.assertNotIn('uses', s)
-        self.assertEqual(s['env']['COSIGN_SHA256'], '${{ needs.plan.outputs.cosign-sha256 }}')
-        data = fake_tool('cosign')
-        for sha, ok in ((hashlib.sha256(data).hexdigest(), True), ('0' * 64, False), ('', False)):
-            with self.subTest(sha=sha):
-                proc, _, tmp = self.run_body(s['run'], {'COSIGN_SHA256': sha}, data)
-                self.assertEqual(proc.returncode == 0, ok, proc.stderr)
-                self.assertEqual((tmp / 'github_path').exists(), ok)
-
-    def test_the_hosted_job_records_the_digest_of_the_cosign_it_verified(self):
-        s = step('security-scan.yaml', 'trivy', "Record the verified cosign's digest")
-        self.assertEqual(s['id'], 'cosign')
-        names = [x.get('name') for x in jobs('security-scan.yaml')['trivy']['steps']]
-        self.assertLess(names.index('Install Cosign'), names.index(s['name']))
-        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        (tmp / 'cosign').write_bytes(fake_tool('cosign'))
-        (tmp / 'cosign').chmod(0o755)
-        out = tmp / 'out'
-        env = {'PATH': os.pathsep.join([str(tmp), '/usr/bin', '/bin']), 'GITHUB_OUTPUT': str(out)}
-        proc = subprocess.run(
-            ['bash', '-e', '-c', s['run']], env=env, capture_output=True, text=True
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        want = hashlib.sha256(fake_tool('cosign')).hexdigest()
-        self.assertEqual(out.read_text(), f'sha256={want}\n')
 
 
 if __name__ == '__main__':

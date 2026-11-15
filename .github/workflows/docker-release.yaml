@@ -432,7 +432,7 @@ jobs:
             echo "runner_images=${plan}"
             echo "runner_names=$(jq -c 'map(.name)' <<<"$plan")"
           } >> "$GITHUB_OUTPUT"
-          jq -r --arg p "${REGISTRY}/${RUNNER_IMAGE_NAME}" '.[] | "\($p): \(.index_tag), \(.version_tag), \(.moving_tag)"' <<<"$plan"
+          jq -r --arg p "${REGISTRY}/${RUNNER_IMAGE_NAME}" '.[] | "\($p): \(.index_tag), \(.version_tag), \(.moving_tags | join(", "))"' <<<"$plan"
 
       - name: Resolve promoted digest
         id: promote
