@@ -28,6 +28,13 @@ on:
         description: The commit of `repository` to test.
         type: string
         default: ''
+      go-test-timeout:
+        description: >-
+          The `-timeout` of the race tests, a Go duration such as `20m`, for a module
+          whose test binaries run longer than the go command's default; empty keeps
+          that default of 10 minutes per test binary.
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -135,7 +142,8 @@ jobs:
         continue-on-error: true
         env:
           CGO_ENABLED: '1'
-        run: ( go test -count=1 -race ./... ) || { echo "test" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
+          GO_TEST_TIMEOUT: ${{ inputs.go-test-timeout }}
+        run: ( go test -count=1 -race ${GO_TEST_TIMEOUT:+"-timeout=$GO_TEST_TIMEOUT"} ./... ) || { echo "test" >> "$RUNNER_TEMP/_ci_failures"; exit 1; }
 
       # vet type-checks test files, which a cross `go build` skips.
       - name: Cross-vet release targets
