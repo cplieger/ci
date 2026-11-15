@@ -535,7 +535,7 @@ class FakeGit:
             raise perf_gate.GitError(f'no first-parent commit of {head} added {path}')
         return self.added[name]
 
-    def same_code(self, measured, added):
+    def same_change(self, measured, added):
         return (measured, added) in self.same
 
 
@@ -678,6 +678,8 @@ class Provenance(unittest.TestCase):
                 (self.dir / '100.json').write_text(text)
                 errors = self.unchanged(self.exact('200', 4384.0), x1)
                 self.assertTrue(any(x.startswith('calibration 100:') for x in errors), errors)
+                changed = self.check(budgets([self.exact('200', 4384.0), x1]), budgets([]))
+                self.assertEqual(sum(x.startswith('calibration 100:') for x in changed), 1, changed)
 
     def test_a_commit_git_cannot_answer_for_fails(self):
         x1 = self.two_commits()
@@ -797,12 +799,20 @@ class Provenance(unittest.TestCase):
         base = budgets([entry(tier='reported', source=RUN_URL + '100')])
         self.assertEqual(self.check(budgets([]), base), [])
 
-    def test_an_unchanged_entry_whose_file_is_absent_is_not_rechecked(self):
+    def test_an_unchanged_entry_whose_file_is_absent_fails_without_reverifying(self):
         b = budgets([entry(source=RUN_URL + '100')])
-        self.assertEqual(self.check(b, b), [])
+        self.assertEqual(
+            self.check(b, b),
+            ['files/x10/chromium/desktop/cold/cpu_ms: calibration 100 is not checked in'],
+        )
         self.assertEqual(self.verified, [])
 
+    def test_an_unchanged_entry_whose_source_is_not_a_run_url_fails(self):
+        b = budgets([entry(source='https://example.com/1')])
+        self.assertTrue(any('not a perf-calibrate run URL' in x for x in self.check(b, b)))
+
     def test_a_change_to_rows_or_target_alone_is_not_rechecked(self):
+        self.write('100', calibration_file([cal_cell()]))
         base = budgets([entry(source=RUN_URL + '100')])
         head = budgets([entry(source=RUN_URL + '100', rows=['F1', 'F2'], target=300.0)])
         self.assertEqual(self.check(head, base), [])
@@ -893,8 +903,8 @@ class Provenance(unittest.TestCase):
 
 
 class GitHistory(unittest.TestCase):
-    """perf_gate.Git on a real repository: a pull request's tip, its squash merge with the
-    calibration's check-in, and a squash merge that also carries a dev change."""
+    """perf_gate.Git on a real repository: a pull request's tip, which changes app.txt and
+    the last line of lib.txt, and its squash merge with the calibration's check-in."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -903,9 +913,11 @@ class GitHistory(unittest.TestCase):
         self.sh('init', '-q', '-b', 'main')
         self.put('tests/perf/plan.json', {'sets': {'pr': {'shards': 5, 'cells': [{'seconds': 9}]}}})
         self.put('app.txt', 'one')
+        self.put('lib.txt', ''.join(f'l{i}\n' for i in range(1, 11)))
         self.base = self.commit('base')
         self.sh('checkout', '-q', '-b', 'pr')
         self.put('app.txt', 'two')
+        self.put('lib.txt', (self.root / 'lib.txt').read_text().replace('l10', 'L10'))
         self.tip = self.commit('the change')
         self.sh('checkout', '-q', 'main')
 
@@ -932,11 +944,14 @@ class GitHistory(unittest.TestCase):
         self.sh('commit', '-q', '-m', message)
         return self.sh('rev-parse', 'HEAD')
 
-    def squash(self, *, dev_change=False, plan=None):
-        if dev_change:
-            self.put('other.txt', 'dev')
+    def squash(self, *, dev=None, app='two', plan=None):
+        """The squash of the pull request onto main after dev's commit, which writes the
+        files of dev ({path: text}) first."""
+        for path, text in (dev or {}).items():
+            self.put(path, text)
             self.commit('dev moved')
-        self.put('app.txt', 'two')
+        self.put('app.txt', app)
+        self.put('lib.txt', (self.root / 'lib.txt').read_text().replace('l10', 'L10'))
         self.put('tests/perf/calibrations/200.json', '{}')
         self.put('tests/perf/budgets.json', '{}')
         self.put(
@@ -956,17 +971,65 @@ class GitHistory(unittest.TestCase):
         git = self.git()
         self.assertFalse(git.is_ancestor(self.tip, squash))
         self.assertEqual(git.added_by('tests/perf/calibrations/200.json', squash), squash)
-        self.assertTrue(git.same_code(self.tip, squash))
+        self.assertTrue(git.same_change(self.tip, squash))
 
-    def test_a_squash_that_carries_a_dev_change_holds_other_code(self):
-        squash = self.squash(dev_change=True)
-        self.assertFalse(self.git().same_code(self.tip, squash))
+    def test_a_squash_after_an_unrelated_dev_merge_brings_the_measured_change(self):
+        squash = self.squash(dev={'other.txt': 'dev'})
+        self.assertTrue(self.git().same_change(self.tip, squash))
+
+    def test_a_squash_after_a_dev_edit_elsewhere_in_a_changed_file_brings_it(self):
+        lines = ''.join(f'l{i}\n' for i in range(1, 11))
+        squash = self.squash(dev={'lib.txt': 'dev\n' * 3 + lines})
+        self.assertTrue(self.git().same_change(self.tip, squash))
+
+    def test_a_squash_of_other_pull_request_code_than_was_measured_is_refused(self):
+        squash = self.squash(app='three')
+        self.assertFalse(self.git().same_change(self.tip, squash))
+
+    def test_a_squash_after_a_dev_merge_of_other_pull_request_code_is_refused(self):
+        squash = self.squash(dev={'other.txt': 'dev'}, app='three')
+        self.assertFalse(self.git().same_change(self.tip, squash))
+
+    def test_a_squash_that_drops_part_of_the_measured_change_is_refused(self):
+        squash = self.squash(app='one')
+        self.assertFalse(self.git().same_change(self.tip, squash))
 
     def test_a_squash_that_changes_the_plan_beyond_its_seconds_holds_other_code(self):
         squash = self.squash(
             plan={'sets': {'pr': {'shards': 5, 'cells': [{'seconds': 9, 'x': 1}]}}}
         )
-        self.assertFalse(self.git().same_code(self.tip, squash))
+        self.assertFalse(self.git().same_change(self.tip, squash))
+
+    def test_a_commit_the_checkout_lacks_is_fetched_from_origin(self):
+        clone = self.root / 'clone'
+        self.sh(
+            'clone',
+            '-q',
+            '--no-local',
+            '--single-branch',
+            '--branch',
+            'main',
+            str(self.root),
+            str(clone),
+        )
+        cwd = os.getcwd()
+        os.chdir(clone)
+        self.addCleanup(os.chdir, cwd)
+        git = perf_gate.Git()
+        self.assertFalse(git.ok('rev-parse', '--verify', '--quiet', f'{self.tip}^{{commit}}'))
+        self.assertEqual(git.commit(self.tip), self.tip)
+        self.assertTrue(git.ok('rev-parse', '--verify', '--quiet', f'{self.tip}^{{commit}}'))
+        with self.assertRaises(perf_gate.GitError):
+            git.commit('f' * 40)
+
+    def test_the_file_a_merged_branch_added_is_placed_at_the_merge(self):
+        self.sh('checkout', '-q', 'pr')
+        self.put('tests/perf/calibrations/200.json', '{}')
+        self.commit('check in')
+        self.sh('checkout', '-q', 'main')
+        self.sh('merge', '-q', '--no-ff', '-m', 'merge', 'pr')
+        merge = self.sh('rev-parse', 'HEAD')
+        self.assertEqual(self.git().added_by('tests/perf/calibrations/200.json', merge), merge)
 
     def test_git_errors_raise_and_a_short_sha_is_refused(self):
         git = self.git()
@@ -1273,6 +1336,19 @@ class Cli(unittest.TestCase):
     ):
         own = [entry(source=RUN_URL + '100'), entry('dom', 'exact', 640)] if listed else []
         b = self.put('budgets.json', budgets([*own, *entries], **doc))
+        # Each entry's calibration, checked in at the head, as the provenance check needs.
+        for e in [*own, *entries]:
+            if not isinstance(e, dict) or not str(e.get('source', '')).startswith(RUN_URL):
+                continue
+            run_id = e['source'].rsplit('/', 1)[1]
+            path = self.dir / 'cal' / f'{run_id}.json'
+            held = json.loads(path.read_text())['cells'] if path.is_file() else []
+            c = cal_cell(e['metric'], e.get('baseline', 0.0), e['tier'], **{f: e[f] for f in CELL})
+            self.put(f'cal/{run_id}.json', calibration_file([*held, c], run_id=run_id))
+            self.put(f'cal/{run_id}.sigstore.json', {})
+        patch = unittest.mock.patch.object(perf_gate, 'Git', FakeGit)
+        patch.start()
+        self.addCleanup(patch.stop)
         if other is None:
             self.put('results/shard-1/results.json', results(cells) if shard is None else shard)
         else:

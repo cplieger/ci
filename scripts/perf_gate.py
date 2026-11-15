@@ -809,34 +809,37 @@ def superseded_entries(
 ) -> list[str]:
     """Why an entry is not from the newest checked-in calibration of its cell, and why a
     calibration cannot be placed in head's history; failed holds the run ids whose load
-    error the caller reported. A file is placed at the commit it measured when head
-    contains it, else at the commit that added the file, provided that commit brought
-    exactly the code it measured (a squash merge of the pull request it calibrated). Run
-    ids order dispatches, not commits, so only that place says which file is newer."""
+    error the caller reported. placed_commit decides each file's place. Run ids order
+    dispatches, not commits, so only that place says which file is newer."""
     errors: list[str] = []
     placed: dict[str, tuple[str, set]] = {}
+    reported = set(failed)
     if calibrations.is_dir():
         for p in sorted(calibrations.glob('*.json')):
             if p.stem.isdigit() and p.stem not in failed:
                 found = place_calibration(p, git, head_sha)
                 if isinstance(found, str):
                     errors.append(f'calibration {p.stem}: {found}')
+                    reported.add(p.stem)
                 else:
                     placed[p.stem] = found
     newer = functools.cache(lambda old, new: old != new and git.is_ancestor(old, new))
     for k, e in entries.items():
         m = SOURCE_RE.match(str(e.get('source', '')))
-        if not m or m.group(1) not in placed:
+        if k in unchanged and not m:
+            errors.append(
+                f'{key_text(k)}: source {e.get("source")!r} is not a perf-calibrate run URL'
+            )
+        if not m or m.group(1) in reported:
+            continue
+        if m.group(1) not in placed:
+            errors.append(f'{key_text(k)}: calibration {m.group(1)} is not checked in')
             continue
         mine, cells = placed[m.group(1)]
         if k in unchanged and k not in cells:
             errors.append(f'{key_text(k)}: calibration {m.group(1)} did not measure this cell')
-        try:
-            later = [r for r, (at, cs) in placed.items() if k in cs and newer(mine, at)]
-            newest = [r for r in later if not any(newer(placed[r][0], placed[o][0]) for o in later)]
-        except GitError as exc:
-            errors.append(f'{key_text(k)}: {exc}')
-            continue
+        later = [r for r, (at, cs) in placed.items() if k in cs and newer(mine, at)]
+        newest = [r for r in later if not any(newer(placed[r][0], placed[o][0]) for o in later)]
         if newest:
             r = newest[0]
             errors.append(
@@ -851,14 +854,14 @@ def place_calibration(path: pathlib.Path, git: Git, head_sha: str) -> tuple[str,
     cells it measured; or why it has no such commit."""
     try:
         doc = load(path)
-    except (ValueError, TypeError) as exc:
+    except (OSError, ValueError, TypeError) as exc:
         return str(exc)
     cells = doc.get('cells')
     if not isinstance(cells, list):
         return 'cells is not a list'
     keys = set()
     for i, c in enumerate(cells):
-        if not isinstance(c, dict) or any(f not in c for f in KEY_FIELDS):
+        if not isinstance(c, dict) or any(not isinstance(c.get(f), str) for f in KEY_FIELDS):
             return f'cells[{i}] does not name a cell by {", ".join(KEY_FIELDS)}'
         keys.add(key(c))
     at, why = placed_commit(doc, path, git, head_sha)
@@ -868,20 +871,20 @@ def place_calibration(path: pathlib.Path, git: Git, head_sha: str) -> tuple[str,
 def placed_commit(doc: dict, path: pathlib.Path, git: Git, head_sha: str) -> tuple:
     """(the commit in head's history whose code calibration doc at path measured, None), or
     (None, why it has none). That is its `commit` when head contains it; else the commit that
-    added path, when its tree holds exactly the measured code: a squash merge of the pull
-    request whose final head the calibration measured."""
+    added path, when it makes the change the measured commit made: a squash merge of the
+    pull request whose final head the calibration measured."""
     try:
         measured = git.commit(str(doc.get('commit')))
         if git.is_ancestor(measured, head_sha):
             return measured, None
         added = git.added_by(str(path), head_sha)
-        if git.same_code(measured, added):
+        if git.same_change(measured, added):
             return added, None
-    except GitError as exc:
+    except (GitError, ValueError) as exc:
         return None, str(exc)
     return None, (
         f'measured {measured}, which {head_sha} does not contain, and {added}, which added '
-        'the file, holds other code; re-calibrate at a commit of this branch'
+        'the file, makes another change; re-calibrate at a commit of this branch'
     )
 
 
@@ -1043,10 +1046,10 @@ class GitError(Exception):
 
 class Git:
     """The history questions the provenance check asks of the checkout in the working
-    directory, which perf-ci.yaml's compare job checks out with every branch's history."""
+    directory."""
 
-    def git(self, *args: str) -> str:
-        done = subprocess.run(['git', *args], capture_output=True, text=True)
+    def git(self, *args: str, stdin: str | None = None) -> str:
+        done = subprocess.run(['git', *args], input=stdin, capture_output=True, text=True)
         if done.returncode:
             raise GitError(f'git {args[0]} exited {done.returncode}: {done.stderr.strip()}')
         return done.stdout
@@ -1080,14 +1083,21 @@ class Git:
             raise GitError(f'no first-parent commit of {head} added {path}')
         return found
 
-    def same_code(self, measured: str, added: str) -> bool:
-        """Whether commits measured and added hold the same tree outside CHECK_IN_PATHS and
-        one plan but for its seconds and shards."""
+    def same_change(self, measured: str, added: str) -> bool:
+        """Whether commit added makes, outside CHECK_IN_PATHS, the change measured makes
+        from where it forked from added's parent, and both hold one plan but for its seconds
+        and shards. Dev commits merged in between move neither diff; patch-id --verbatim
+        ignores only line numbers, so they may also shift the changed lines."""
         plans = [loads(self.git('show', f'{c}:{PLAN_PATH}')) for c in (measured, added)]
         if plan_shape(plans[0]) != plan_shape(plans[1]):
             return False
+        fork = self.git('merge-base', measured, f'{added}^').strip()
         skip = [f':(top,exclude){p}' for p in CHECK_IN_PATHS]
-        return self.ok('diff', '--quiet', measured, added, '--', *skip)
+        ids = []
+        for old, new in ((fork, measured), (f'{added}^', added)):
+            diff = self.git('diff', '--binary', '--full-index', old, new, '--', *skip)
+            ids.append(self.git('patch-id', '--verbatim', stdin=diff).split()[:1])
+        return ids[0] == ids[1]
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
