@@ -36,6 +36,14 @@ $got
 want:
 $2"; fi
 }
+expect_lacks() { # expect_lacks <label> <needle>
+  case "$out" in
+    *"$2"*) fail "$1" "output has '$2'
+--- output ---
+$out" ;;
+    *) pass "$1" ;;
+  esac
+}
 expect_absent() { # expect_absent <label> <path>
   if [ ! -e "$2" ]; then pass "$1"; else fail "$1" "unexpected $2"; fi
 }
@@ -50,7 +58,7 @@ fi
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-export GOPROXY=off GOFLAGS=-mod=mod GOTOOLCHAIN=local GOWORK=off GIT_CONFIG_GLOBAL=/dev/null
+export GOPROXY=off GOFLAGS='' GOTOOLCHAIN=local GOWORK=off GIT_CONFIG_GLOBAL=/dev/null
 export GOMODCACHE="$WORK/modcache" GOCACHE="$WORK/gocache"
 export GIT_AUTHOR_NAME=probe GIT_AUTHOR_EMAIL=probe@example.com
 export GIT_COMMITTER_NAME=probe GIT_COMMITTER_EMAIL=probe@example.com
@@ -124,7 +132,7 @@ commit() { # commit <tree>
 }
 run_step() { # run_step <tree>; sets $out $rc
   rm -f "$WORK/failures"
-  out=$(cd "$1" && bash --noprofile --norc -eo pipefail "$WORK/step.sh" 2>&1)
+  out=$(cd "$1" && bash --noprofile --norc -e "$WORK/step.sh" 2>&1)
   rc=$?
 }
 root_app() { # root_app <tree>: a root module whose cmd/gen writes api.gen.go
@@ -169,11 +177,18 @@ expect_rc 'nested: up-to-date output passes' 0
 expect_runs 'nested: each generator runs from its own module root' \
   "$(printf '%s\n' 'wiregen: go -C ./internal/gen run .' 'wiregen: go -C ./tools run ./cmd/schema' | sort)"
 expect_has 'nested: both tracked files are counted' 'generated files up to date (2 tracked)'
+# go-nested runs go-ci with the nested module as its working directory.
+run_step "$t/internal/gen"
+expect_rc 'nested job: passes' 0
+expect_runs 'nested job: runs its own generator' 'wiregen: go -C . run .'
+expect_lacks 'nested job: an empty generated-file pathspec raises no git error' 'fatal:'
 sed -i 's/v1/v2/' "$t/chartdata.go"
 run_step "$t"
 expect_rc 'nested: stale output fails' 1
 expect_has 'nested: the stale file is listed' 'chart.gen.go'
 expect_marker 'nested: stale output writes the failure marker'
+run_step "$t/internal/gen"
+expect_rc 'nested job: the parent module owns the stale parent file' 0
 
 echo 'nested modules with no generator'
 t="$WORK/nogen"
@@ -204,6 +219,11 @@ expect_absent 'fixtures: a testdata generator never runs' "$t/RAN-testdata"
 expect_absent 'fixtures: a fixtures module generator never runs' "$t/RAN-fixtures"
 expect_absent 'fixtures: a node_modules generator never runs' "$t/RAN-node-modules"
 expect_has 'fixtures: fixture output is not counted' 'generated files up to date (1 tracked)'
+run_step "$t/fixtures/mod"
+expect_rc 'fixture job: passes' 0
+expect_has 'fixture job: skips' 'this module is a fixture; skipping'
+expect_runs 'fixture job: runs no generator' ''
+expect_absent 'fixture job: its generator never runs' "$t/RAN-fixtures"
 
 echo 'tracked generated files and no generator'
 t="$WORK/orphan"
@@ -224,6 +244,16 @@ commit "$t"
 run_step "$t"
 expect_rc 'empty: passes' 0
 expect_has 'empty: skips' 'skipping'
+
+echo 'an index git cannot write'
+t="$WORK/locked"
+root_app "$t"
+commit "$t"
+sed -i 's/v1/v2/' "$t/app.go"
+: >"$t/.git/index.lock"
+run_step "$t"
+expect_rc 'locked: a failed git add fails the step' 1
+expect_marker 'locked: writes the failure marker'
 
 echo 'a generator that fails'
 t="$WORK/broken"
