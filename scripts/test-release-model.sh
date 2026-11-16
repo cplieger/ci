@@ -647,4 +647,28 @@ chk "M34 a main-default repository's release run is refused at detect" "$(result
   "refused: ::error::release.yaml publishes only from a public, non-fork repository whose default branch is dev (this one: default branch main, private <unknown>, fork <unknown>). Make dev the default branch, or remove the release.yaml caller and publish from the repository's own workflow."
 chk "M34 running no step after Select channel" "$(jq -r '.ran | join(",")' "$RUN.detect.json")" "Checkout (checkout: --cwd),Select channel"
 
+# ── 17. queued dev merges: one version each, and a handoff ships in the next ─
+# Runs on one ref queue, so the second merge's detect reads the tags the
+# first run claimed (docker-release.yaml's and the ts job's claim steps).
+Q1=$(commit_on dev "fix: queued merge one" main.go='package main\n// queued 1')
+Q2=$(commit_on dev "fix: queued merge two" main.go='package main\n// queued 2')
+AT=$Q1 run_release dev q1
+q1_ver=$(result)
+AT=$Q2 run_release dev q2
+q2_ver=$(result)
+chk "M43 the first of two queued dev merges takes a dev version" "$(grep -cE '^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$' <<<"$q1_ver")" "1"
+chk "M43 and the second takes the next counter on the same base" "$q2_ver" "${q1_ver%.*}.$((${q1_ver##*.} + 1))"
+chk "M43 each version names its own merge" "$(tag_of "$q1_ver")|$(tag_of "$q2_ver")" "$Q1|$Q2"
+# A merge whose run handed its version off leaves no tag, and the sync-only
+# commit after it releases the range from the last tag, which holds the merge.
+H1=$(commit_on dev "fix: a merge whose run hands off" main.go='package main\n// handed off')
+NO_PUBLISH=1 AT=$H1 run_release dev h1
+h1_ver=$(jq -r .outputs.version "$RUN.detect.json")
+chk "M44 a handed-off merge's run numbers the next version and tags nothing" "$h1_ver|$(tag_of "$h1_ver")" "${q2_ver%.*}.$((${q2_ver##*.} + 1))|"
+H2=$(commit_on dev "chore: sync the shared workflows" .github/workflows/ci.yaml='name: ci')
+AT=$H2 run_release dev h2
+chk "M44 the sync commit after it releases that version" "$(result)|$(tag_of "$h1_ver")" "$h1_ver|$H2"
+chk "M44 over a changed-path range from the last dev tag, which holds the handed-off merge" \
+  "$(step_out cliff anchor_sha)|$(detect root_changed)|$(git -C "$O" merge-base --is-ancestor "$H1" "$H2" && echo held)" "$Q2|true|held"
+
 echo "PASS: two-branch release model end to end ($PASS checks)"

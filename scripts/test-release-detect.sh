@@ -353,7 +353,7 @@ facts["tmpl-with"] = "with" in t["jobs"]["release"]
 facts["tmpl-uses"] = bool(re.fullmatch(r"cplieger/ci/\.github/workflows/release\.yaml@[0-9a-f]{40}",
                                        t["jobs"]["release"]["uses"])) and "# v3\n" in open(tmpl).read()
 facts["tmpl-perms"] = t["jobs"]["release"]["permissions"]
-for key, job, name in (("go", "go", "Tag + GitHub Release"), ("ts", "ts", "Tag + GitHub Release"),
+for key, job, name in (("go", "go", "Tag + GitHub Release"), ("ts", "ts", "GitHub Release"),
                        ("lane", "go-nested", "Tag + GitHub Release (lane)")):
     open(f"{out}/publish-{key}.sh", "w").write(step(jobs, job, name)["run"])
     names = [s.get("name") for s in jobs[job]["steps"]]
@@ -362,9 +362,10 @@ for key, job, name in (("go", "go", "Tag + GitHub Release"), ("ts", "ts", "Tag +
         step(jobs, job, name)["env"].get("CI_TOOLS", ""), ci_src["with"]["path"],
         str(names.index("Check out the ci source") < names.index(name)), ci_src.get("if", "")))
     move = next((s for s in jobs[job]["steps"] if str(s.get("name", "")).startswith("Move the ci source")), None)
+    order = [] if move is None else [names.index("Check out the ci source"), names.index(move["name"])] + [
+        names.index(n) for n in ("API compatibility (gorelease)", "Claim the version") if n in names] + [names.index(name)]
     facts[f"publish-move:{key}"] = "none" if move is None else "|".join((
-        str(names.index("Check out the ci source") < names.index(move["name"])
-            < names.index("API compatibility (gorelease)") < names.index(name)),
+        str(order == sorted(order)),
         move.get("if", ""), str('mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"' in move["run"])))
 facts["release-view-sites"] = " ".join(str(open(new.replace("release.yaml", wf)).read().count("gh release view"))
                                        for wf in ("release.yaml", "docker-release.yaml"))
@@ -2522,11 +2523,39 @@ chk "U2 by digest under the new pre-release" "$(cat "$DOCKER_LOG")" \
   "buildx imagetools create --metadata-file $(sed -n 's/.*--metadata-file \([^ ]*\).*/\1/p' "$DOCKER_LOG") -t ghcr.io/o/app:v1.2.0-dev.1 ghcr.io/o/app@$DIGEST"
 chk "U2 the git tag lands on the built commit" "$(grep -c "^api repos/o/app/git/refs -f ref=refs/tags/v1.2.0-dev.1 -f sha=$D3$" "$GH_LOG")" "1"
 chk "U2 with its dev tag receipt" "$(grep -c "statuses/$D3 -f state=success -f context=release/tag/v1.2.0-dev.1 " "$GH_LOG")" "1"
+# The git tag claims the version, so it precedes every write under it: an
+# image re-tagged before a failed create would be a version no tag records.
+touch "$GH_DIR/fail-ref"
+out_u=$(renumber docker v1.2.0-dev.1)
+rm "$GH_DIR/fail-ref"
+chk "U43 a renumber whose tag create fails re-tags no image" "$out_u|$(wc -l <"$DOCKER_LOG")" "EXIT=1|0"
+chk_has "U43 and says why" "$(cat "$WORK/renumber.log")" "tag v1.2.0-dev.1 is not at $D3, so the build is not renumbered"
+touch "$GH_DIR/fail-post"
+out_u=$(renumber docker v1.2.0-dev.1)
+rm "$GH_DIR/fail-post"
+chk "U43 as does one whose receipt fails, deleting the tag it created" \
+  "$out_u|$(wc -l <"$DOCKER_LOG")|$(grep -c '^api -X DELETE repos/o/app/git/refs/tags/v1.2.0-dev.1$' "$GH_LOG")" "EXIT=1|0|1"
+# A renumber that claimed its version and died before the re-tag is
+# completed by its rerun, which finds the version already on the build.
+git -C "$W" tag v1.2.0-dev.1 "$D3"
+echo "$D3" >"$GH_DIR/tag-v1.2.0-dev.1"
+out_u=$(renumber docker v1.2.0-dev.1)
+chk "U44 a rerun of a claimed renumber re-tags the build" "$out_u|$(sed 's/--metadata-file [^ ]* //' "$DOCKER_LOG")" \
+  "|buildx imagetools create -t ghcr.io/o/app:v1.2.0-dev.1 ghcr.io/o/app@$DIGEST"
+chk "U44 reusing the tag and recording its receipt" \
+  "$(grep -c '^api repos/o/app/git/refs ' "$GH_LOG" || true)|$(grep -c "statuses/$D3 -f state=success -f context=release/tag/v1.2.0-dev.1 " "$GH_LOG")" "0|1"
+git -C "$W" tag -d v1.2.0-dev.1 >/dev/null
+rm "$GH_DIR/tag-v1.2.0-dev.1"
 DOCKER_DIGEST="sha256:$(printf 'c%.0s' $(seq 64))"
+DOCKER_DIGEST_U3=$DOCKER_DIGEST
 export DOCKER_DIGEST
 out_u=$(renumber docker v1.2.0-dev.1)
 unset DOCKER_DIGEST
-chk "U3 a re-tag that changes the digest is refused before any git tag" "$out_u|$(grep -c 'git/refs' "$GH_LOG" || true)" "EXIT=1|0"
+# The claim precedes the write, so the digest is read back after the tag,
+# which names the build being renumbered and so holds the version for it.
+chk "U3 a re-tag that changes the digest is refused, the version's tag staying on the build" \
+  "$out_u|$(grep -c "^api repos/o/app/git/refs -f ref=refs/tags/v1.2.0-dev.1 -f sha=$D3$" "$GH_LOG")" "EXIT=1|1"
+chk_has "U3 naming the changed digest" "$(cat "$WORK/renumber.log")" "re-tagging $DIGEST as o/app:v1.2.0-dev.1 changed the digest to $DOCKER_DIGEST_U3"
 echo "$DIGEST" >"$CURL_DIR/manifest-v1.2.0-dev.1"
 chk "U13 a version tag already serving the build is not written again" "$(renumber docker v1.2.0-dev.1)|$(wc -l <"$DOCKER_LOG")" "|0"
 chk "U13 and the build is tagged" "$(grep -c "^api repos/o/app/git/refs -f ref=refs/tags/v1.2.0-dev.1 -f sha=$D3$" "$GH_LOG")" "1"
@@ -2652,12 +2681,18 @@ chk "U10 a TS root publishes the build to npm under the dev dist-tag" "$out_u|$(
   "|npm pkg set version=1.2.0-dev.2;npm publish --access public --tag dev;"
 pub=$(grep -n '^npm publish' "$GH_LOG" | cut -d: -f1)
 tagged=$(grep -n "git/refs -f ref=refs/tags/v1.2.0-dev.2 -f sha=$UF$" "$GH_LOG" | cut -d: -f1)
-chk "U10 then tags the build" "$([ -n "$pub" ] && [ -n "$tagged" ] && [ "$pub" -lt "$tagged" ] && echo after)" "after"
+chk "U10 having tagged the build first" "$([ -n "$pub" ] && [ -n "$tagged" ] && [ "$tagged" -lt "$pub" ] && echo before)" "before"
+touch "$GH_DIR/fail-ref"
+out_u=$(renumber ts v1.2.0-dev.4)
+rm "$GH_DIR/fail-ref"
+chk "U45 a TS renumber whose tag create fails publishes nothing to npm" "$out_u|$(grep -c '^npm p' "$GH_LOG" || true)" "EXIT=1|0"
 touch "$NPM_DIR/silent"
 out_u=$(renumber ts v1.2.0-dev.3)
 rm "$NPM_DIR/silent"
-chk "U11 an npm version that does not read back is never tagged" "$out_u|$(grep -c 'git/refs' "$GH_LOG" || true)" "EXIT=1|0"
-chk_has "U11 and says so" "$(cat "$WORK/renumber.log")" "npm @o/app@1.2.0-dev.3 does not read back, so v1.2.0-dev.3 is not tagged"
+# The claim came first, so the version stays the build's and a rerun resumes it (U44).
+chk "U11 an npm version that does not read back fails the renumber after its claim" \
+  "$out_u|$(grep -c "^api repos/o/app/git/refs -f ref=refs/tags/v1.2.0-dev.3 -f sha=$UF$" "$GH_LOG")" "EXIT=1|1"
+chk_has "U11 and says so" "$(cat "$WORK/renumber.log")" "npm @o/app@1.2.0-dev.3 does not read back, so v1.2.0-dev.3 is not published"
 chk_has "U11 after npm's 1200 s scan bound" "$(cat "$WORK/renumber.log")" \
   "npm @o/app@1.2.0-dev.3: absent after 24 attempt(s) and 1200s of waiting"
 NPM_URL=https://registry.npmjs.org/@o/app
@@ -3617,21 +3652,26 @@ for s in go ts lane; do
   # The tag step sources retry.sh and tag-ref.sh on every channel, so the checkout runs on every channel.
   # The go job moves the checkout out of the module before gorelease, so its tag step reads the moved copy.
   tools='${{ github.workspace }}/.cplieger-ci/scripts' move=none moved="leaves that source where it checked it out"
+  # The ts job claims its tag in an earlier step, so its Release step reads no tag.
+  pre="$REF_S;"
   if [ "$s" = go ]; then
     tools='${{ runner.temp }}/cplieger-ci/scripts' move='True||True'
     moved="moves that source to the runner temp dir before gorelease and the tag step, on every channel"
+  elif [ "$s" = ts ]; then
+    tools='${{ runner.temp }}/cplieger-ci/scripts' move='True||True' pre=""
+    moved="moves that source out of the package before the claim and npm's publish, on every channel"
   fi
   chk "W26 the $s site runs the helper from the ci source it checked out first, on every channel" \
     "$(fact ".\"publish-tools:$s\"")" "$tools|.cplieger-ci|True|"
   chk "W26 the $s site $moved" "$(fact ".\"publish-move:$s\"")" "$move"
-  chk "W26 the $s site leaves a present Release alone" "$(publish_site "$s" 200)" "0|$REF_S;$READ_S"
+  chk "W26 the $s site leaves a present Release alone" "$(publish_site "$s" 200)" "0|$pre$READ_S"
   chk "W26 the $s site creates the Release on a 404, reading no draft listing" "$(publish_site "$s" 404)" \
-    "0|$REF_S;$READ_S;$CREATE_S"
-  chk "W26 the $s site fails on a rate limit and creates nothing" "$(publish_site "$s" 403)" "1|$REF_S;$READ_S"
+    "0|$pre$READ_S;$CREATE_S"
+  chk "W26 the $s site fails on a rate limit and creates nothing" "$(publish_site "$s" 403)" "1|$pre$READ_S"
   chk_has "W26 naming the read and the limit" "$(cat "$WORK/ps.log")" \
     "::error::could not determine whether Release $rtag exists:
 gh: API rate limit exceeded for user ID 1. (HTTP 403)"
-  chk "W26 and on an outage" "$(publish_site "$s" 502)" "1|$REF_S;$READ_S"
+  chk "W26 and on an outage" "$(publish_site "$s" 502)" "1|$pre$READ_S"
 done
 REL_LOG="$WORK/rex.log" REL_READ=403 VERSION=v9.9.9 GITHUB_SHA=c0ffee PATH="$RBIN:$PATH" \
   bash "$ROOT/scripts/release-exists.sh" v9.9.9 >"$WORK/rex.out" 2>"$WORK/rex.err" || echo "EXIT=$?" >>"$WORK/rex.out"

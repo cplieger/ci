@@ -884,10 +884,10 @@ newest_built() { # <key> <T> -> the newest first-parent dev commit past T carryi
     fi
   done <<<"$revs"
 }
-# Dev publishes a TS root's npm version and an image's GHCR tags before its git
-# tag, so a run that died in between left a build no dev tag shows. A newer
-# tagged build carries that build's content and renumber lifts it, so only a
-# build past the newest tagged one holds.
+# A build published under no dev tag (a run that wrote its registries before
+# it held the version's tag) is one no dev tag shows. A newer tagged build
+# carries that build's content and renumber lifts it, so only a build past the
+# newest tagged one holds.
 untagged_past() { # <key> <T> -> a dev commit past T whose build is published untagged, newer than every tagged build; fails when a registry answer, a first-parent walk of dev or the dev-tag list cannot be read
   local c got res code pkg newest at revs heads
   [ "$1" = . ] || return 0
@@ -1317,18 +1317,16 @@ cmd_renumber_target() {
 }
 
 # A git tag cannot move an npm consumer: the package at the build is published
-# under the new pre-release and `dev` dist-tag, and read back, before the tag.
-# An existing version is accepted only when npm recorded it from this commit.
-publish_npm_dev() { # <dev tag> <commit>
+# under the new pre-release and `dev` dist-tag, and read back. npm_dev_state
+# reads before the claim, publish_npm_dev writes after it. An existing version
+# is accepted only when npm recorded it from this commit.
+npm_dev_state() { # <dev tag> <commit> -> "publish" when npm lacks the version, nothing when it holds this commit's; dies otherwise
   local pkg ver="${1#v}" res code head
   pkg=$(jq -r .name package.json) || die "no package.json name to publish ${1} under"
   res=$(http_read "https://registry.npmjs.org/${pkg}/${ver}") || res=$'\n000'
   code=${res##*$'\n'}
   case "$code" in
-    404)
-      npm pkg set version="$ver"
-      npm publish --access public --tag dev
-      ;;
+    404) echo publish ;;
     200)
       head=$(jq -r '.gitHead // ""' <<<"${res%$'\n'*}") || head=""
       [ "$head" = "$2" ] \
@@ -1337,10 +1335,18 @@ publish_npm_dev() { # <dev tag> <commit>
       ;;
     *) die "npm cannot tell whether ${pkg}@${ver} exists (HTTP ${code}), so ${1} is not published or tagged" ;;
   esac
-  npm_answers "$pkg" "$ver" || die "npm ${pkg}@${ver} does not read back, so ${1} is not tagged"
+}
+publish_npm_dev() { # <dev tag> <npm_dev_state's answer>
+  local pkg ver="${1#v}"
+  pkg=$(jq -r .name package.json) || die "no package.json name to publish ${1} under"
+  if [ "$2" = publish ]; then
+    npm pkg set version="$ver"
+    npm publish --access public --tag dev
+  fi
+  npm_answers "$pkg" "$ver" || die "npm ${pkg}@${ver} does not read back, so ${1} is not published"
 }
 
-renumber_build() { # <key> <new dev version> -> the build at HEAD to renumber, or nothing when it already ranks there
+renumber_build() { # <key> <new dev version> [resume] -> the build at HEAD to renumber, or nothing when it already ranks there
   local key=$1 new=$2 d_tag d
   [ "${CHANNEL:-}" = dev ] || die "renumber runs on the dev channel only"
   [[ $new =~ $(dev_re "$key") ]] || die "'${new}' is not a dev version of lane ${key}"
@@ -1352,6 +1358,12 @@ renumber_build() { # <key> <new dev version> -> the build at HEAD to renumber, o
   d=$(git rev-list -n1 "$d_tag")
   [ "$d" = "$(git rev-parse HEAD)" ] \
     || die "lane ${key}: ${new} was computed at HEAD, but the newest build is ${d_tag} at ${d}. Check that build out first."
+  # The tagging job's rerun after it claimed the version and died before its
+  # writes resumes; a version computed fresh never equals an existing tag.
+  if [ "${3:-}" = resume ] && [ "$d_tag" = "$new" ]; then
+    printf '%s\n' "$d"
+    return 0
+  fi
   if ! gt "$(core "$new")" "$(core "$d_tag")"; then
     note "lane ${key}: ${d_tag} already ranks at or above ${new}, so nothing is renumbered"
     return 0
@@ -1464,8 +1476,8 @@ cmd_renumber_subpackages() {
   out "version=${d_tag}" "dirs=${dirs}"
 }
 
-# Dev publication pushes a version tag before the git tag, so a version tag
-# serving another digest belongs to a newer build and must not move.
+# A version tag serving another digest is another build's published version,
+# which never moves.
 retag_state() { # <repository> <digest> <new tag> <commit> -> "write" when the tag is absent, nothing when it serves the digest; dies otherwise
   local served
   served=$(ghcr_state "$1" "$3") || die "cannot tell whether ghcr.io/${1}:${3} exists, because ${served}, so it is not written"
@@ -1486,10 +1498,13 @@ retag() { # <repository> <digest> <new tag>
   [ "$got" = "$2" ] || die "re-tagging ${2} as ${1}:${3} changed the digest to ${got}"
 }
 
+# Every read and refusal comes first, then the claim (the tag and its receipt),
+# then the writes under the version, so a refused or failed claim writes
+# nothing a later run could overwrite.
 cmd_renumber() {
-  local key="${LANE_KEY:?}" new="${DEV_VERSION:?}" repo="${GITHUB_REPOSITORY:?}" d digest names n state w rc
+  local key="${LANE_KEY:?}" new="${DEV_VERSION:?}" repo="${GITHUB_REPOSITORY:?}" d digest names n state w rc npm=""
   local -a writes=()
-  d=$(renumber_build "$key" "$new") || exit 1
+  d=$(renumber_build "$key" "$new" resume) || exit 1
   [ -n "$d" ] || return 0
   if [ "$key" = . ] && [ "${REPO_TYPE:-}" = docker ]; then
     digest=$(ghcr_digest "${IMAGE:?}" "sha-${d}")
@@ -1511,13 +1526,9 @@ cmd_renumber() {
       w=$(retag_state "${IMAGE}-runner" "$state" "${n}-${new}" "$d") || exit 1
       [ -z "$w" ] || writes+=("${IMAGE}-runner $state ${n}-${new}")
     done
-    for w in "${writes[@]}"; do
-      # shellcheck disable=SC2086 # three words
-      retag $w
-    done
   fi
   if [ "$key" = . ] && [ "${REPO_TYPE:-}" = ts ]; then
-    publish_npm_dev "$new" "$d"
+    npm=$(npm_dev_state "$new" "$d") || exit 1
   elif [ "$key" != . ]; then
     cmd_half_free "$key" "$new" "$d"
   fi
@@ -1529,6 +1540,13 @@ cmd_renumber() {
       gh api -X DELETE "repos/${repo}/git/refs/tags/${new}" >/dev/null
     fi
     die "receipt for ${new} not recorded"
+  fi
+  for w in "${writes[@]}"; do
+    # shellcheck disable=SC2086 # three words
+    retag $w
+  done
+  if [ "$key" = . ] && [ "${REPO_TYPE:-}" = ts ]; then
+    publish_npm_dev "$new" "$npm"
   fi
   echo "lane ${key}: the build at ${d} is now also ${new}"
 }

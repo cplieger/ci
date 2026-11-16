@@ -32,6 +32,10 @@ if args[:1] == ['api'] and args[1] == 'repos/o/app/git/ref/heads/dev':
     if state.get('head'):
         done(0, state['head'] + '\n')
     done(1, err='gh: Bad credentials (HTTP 401)\n')
+if args[:4] == ['api', '-X', 'POST', f'repos/o/app/statuses/{args[3].rsplit("/", 1)[-1]}']:
+    if state.get('status_fail'):
+        done(1, err='gh: Server Error (HTTP 502)\n')
+    done(0, '{}\n')
 if args[:2] == ['api', 'repos/o/app/git/refs']:
     fields = dict(a.split('=', 1) for a in args[2:] if '=' in a)
     tag, sha = fields['ref'].removeprefix('refs/tags/'), fields['sha']
@@ -54,14 +58,24 @@ class RunsTagRef:
 
     head_reads: list
 
-    def run_tag_ref(self, tags=None, creates=(), head=None, call='tag_ref o/app v1.2.0'):
+    def run_tag_ref(
+        self, tags=None, creates=(), head=None, call='tag_ref o/app v1.2.0', status_fail=False
+    ):
         tmp = pathlib.Path(tempfile.mkdtemp(prefix='tag-ref-'))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         (tmp / 'gh').write_text(GH_STUB)
         (tmp / 'gh').chmod(0o755)
         state = tmp / 'state.json'
         state.write_text(
-            json.dumps({'tags': tags or {}, 'creates': list(creates), 'calls': [], 'head': head})
+            json.dumps(
+                {
+                    'tags': tags or {},
+                    'creates': list(creates),
+                    'calls': [],
+                    'head': head,
+                    'status_fail': status_fail,
+                }
+            )
         )
         script = (
             'set -euo pipefail\n'
@@ -76,6 +90,8 @@ class RunsTagRef:
             'PATH': f'{tmp}:{os.environ["PATH"]}',
             'STUB_STATE': str(state),
             'READBACK_SLEEP': '0',
+            'GITHUB_SERVER_URL': 'https://gh',
+            'GITHUB_RUN_ID': '7',
         }
         res = subprocess.run(
             ['bash', '-c', script], env=env, capture_output=True, text=True, check=False
@@ -84,6 +100,7 @@ class RunsTagRef:
         doc = json.loads(state.read_text())
         creates = [c for c in doc['calls'] if c[:2] == ['api', 'repos/o/app/git/refs']]
         self.head_reads = [c for c in doc['calls'] if any('git/ref/heads/' in a for a in c)]
+        self.posts = [c for c in doc['calls'] if c[:3] == ['api', '-X', 'POST']]
         return res.stdout, doc['tags'], creates
 
 
@@ -109,7 +126,8 @@ class TagRef(RunsTagRef, unittest.TestCase):
         out, tags, creates = self.run_tag_ref(tags={'v1.2.0': 'b' * 40})
         self.assertNotIn('so it is reused', out)
         self.assertIn(
-            f'::error::Tag v1.2.0 exists at {"b" * 40}, not {COMMIT}, so it is not moved.', out
+            f'::error::Tag v1.2.0 exists at {"b" * 40}, not {COMMIT}. A published version never moves, so nothing is published under it.',
+            out,
         )
         self.assertTrue(out.endswith('rc=1 created=false\n'), out)
         self.assertEqual((tags, creates), ({'v1.2.0': 'b' * 40}, []))
@@ -161,6 +179,32 @@ class TagRefOrHandoff(RunsTagRef, unittest.TestCase):
         self.assertNotIn('::error::tag create', out)
         self.assertTrue(out.endswith('rc=2 created=false\n'), out)
         self.assertEqual(tags, {})
+
+    def test_a_handoff_records_on_its_commit_the_head_that_releases_it(self):
+        out, _, _ = self.run_tag_ref(creates=['refused'] * 5, head='d' * 40, call=HANDOFF)
+        self.assertTrue(out.endswith('rc=2 created=false\n'), out)
+        self.assertEqual(len(self.posts), 1, self.posts)
+        post = self.posts[0]
+        fields = dict(a.split('=', 1) for a in post[4:] if '=' in a)
+        self.assertEqual(post[3], f'repos/o/app/statuses/{COMMIT}')
+        self.assertEqual(
+            (fields['state'], fields['context'], fields['target_url']),
+            ('success', 'release/handoff/v1.2.0', 'https://gh/o/app/actions/runs/7'),
+        )
+        self.assertIn('d' * 40, fields['description'])
+        self.assertLessEqual(len(fields['description']), 140)
+
+    def test_a_handoff_whose_record_fails_still_hands_off_and_says_so(self):
+        out, tags, _ = self.run_tag_ref(
+            creates=['refused'] * 5, head='d' * 40, call=HANDOFF, status_fail=True
+        )
+        self.assertTrue(out.endswith('rc=2 created=false\n'), out)
+        self.assertIn('::warning::handoff record for v1.2.0 not posted on', out)
+        self.assertEqual(tags, {})
+
+    def test_a_refusal_records_no_handoff(self):
+        self.run_tag_ref(creates=['refused'] * 5, head=COMMIT, call=HANDOFF)
+        self.assertEqual(self.posts, [])
 
     def test_a_failed_create_still_at_the_head_is_refused(self):
         out, _, _ = self.run_tag_ref(creates=['refused'] * 5, head=COMMIT, call=HANDOFF)

@@ -71,8 +71,7 @@ wanted = {
         "Publish channel tags on GHCR": "manifest.sh",
         "Fetch the previous release's SBOM": "prevsbom.sh",
         "Generate release notes": "notes.sh",
-        "Prepare tag-create helper": "taghelper.sh",
-        "Create dev tag": "devtag.sh",
+        "Claim the version": "claim.sh",
         "Stage and sign the release assets": "stagesign.sh",
         "Create release": "createrel.sh",
         "Verify the release assets": "verifyassets.sh",
@@ -117,7 +116,8 @@ gates = {
     "provenance-if": step_if("finalize", "Verify the promoted build's signature and SBOM"),
     "before-provenance": fin[: fin.index("Verify the promoted build's signature and SBOM")],
     "after-provenance": fin[fin.index("Verify the promoted build's signature and SBOM") + 1],
-    "first-write": fin[fin.index("Verify the promoted build's signature and SBOM") + 2],
+    "claim": fin[fin.index("Verify the promoted build's signature and SBOM") + 2],
+    "first-write": fin[fin.index("Verify the promoted build's signature and SBOM") + 3],
     "promotedsbom-if": step_if("finalize", "Read the promoted build's SBOM"),
     "scan-ifs": sorted({
         " ".join(str(s.get("if", "")).split()) for s in jobs["finalize"]["steps"]
@@ -252,13 +252,13 @@ import re
 def dgx(expr, o):
     e = " ".join(str(expr).split())
     e = e[3:-2] if e.startswith("${{") else e
-    e = re.sub(r"needs\.(prepare|rebuild-gate)\.outputs\.(\w+)", lambda m: repr(o[m.group(1)][m.group(2)]), e)
+    e = re.sub(r"needs\.(prepare|rebuild-gate|finalize)\.outputs\.(\w+)", lambda m: repr(o[m.group(1)][m.group(2)]), e)
     e = re.sub(r"needs\.[\w-]+\.result", "'success'", e)
     e = e.replace("!cancelled()", "True").replace("always()", "True")
     return eval(e.replace("&&", " and ").replace("||", " or "), {}, {})
 publish_cases = {}
 for publish, skip in (("true", "true"), ("true", ""), ("true", "false"), ("false", "")):
-    o = {"prepare": {"publish": publish, "promote_digest": ""}, "rebuild-gate": {"skip": skip}}
+    o = {"prepare": {"publish": publish, "promote_digest": ""}, "rebuild-gate": {"skip": skip}, "finalize": {"claimed": "true"}}
     publish_cases[f"{publish}/{skip}"] = "|".join(
         str(dgx(x, o)).lower() for x in (jobs["finalize"]["env"]["PUBLISH"], jobs["build"]["if"], jobs["verify-publish"]["if"])
     )
@@ -312,12 +312,11 @@ for job in ("go", "ts"):
     open(f"{out}/{job}-notes.sh", "w").write(notes["run"])
 # The dev tag receipt: every dev tag path posts it, and every job that does
 # holds the statuses scope, the caller template included.
-for job, name in (("go", "Tag + GitHub Release"), ("ts", "Tag + GitHub Release"), ("go-nested", "Tag + GitHub Release (lane)")):
+for job, name in (("go", "Tag + GitHub Release"), ("ts", "Claim the version"), ("go-nested", "Tag + GitHub Release (lane)")):
     step = next(s for s in rjobs[job]["steps"] if s.get("name") == name)
     open(f"{out}/{job}-tag.sh", "w").write(step["run"])
 # The handoff steps a superseded run takes before it publishes.
 for job, name, file in (
-    ("ts", "Hand off to a newer push", "ts-handoff.sh"),
     ("subpackage", "Hand off with the root tag", "sub-handoff.sh"),
     ("lane-halves", "Find the lane's tag", "lanetag.sh"),
 ):
@@ -415,7 +414,7 @@ policy_keys() { # <repo name> <spdx id> -> the policy step's output keys
 }
 chk "D-P11 every release SBOM scan reads the published image" "$(gate '."sbom-sources" | join(",")')" "image"
 chk "D-P11 and runs only on a build, so a promotion scans nothing" "$(gate '."scan-ifs" | join(",")')" \
-  "\${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' }}"
+  "\${{ steps.claim.outputs.claimed == 'true' && steps.manifest.outputs.built == 'true' }}"
 chk "D-P11 and no input, output or policy chooses another source" "$(gate '."sbom-knobs" | join(",")')" ""
 chk "D-P11 the policy hands every image repository the same keys" \
   "$(policy_keys marotte AGPL-3.0)/$(policy_keys web-terminal-kiro MPL-2.0)/$(policy_keys docker-age Apache-2.0)" \
@@ -1642,7 +1641,7 @@ prev_sbom >/dev/null
 chk "D-Q11 where an undeclared package.json carried the earlier image" "$(prev_file)|$(asked)" "file|$TP2 $TP1 "
 : >"$TAGS"
 chk_has "D-Q7 runs on stable publishes only" "$(gate '."prevsbom-if"')" \
-  "env.PUBLISH == 'true' && inputs.channel == 'stable'"
+  "steps.claim.outputs.claimed == 'true' && inputs.channel == 'stable'"
 chk "D-Q7 after the new SBOM and before the notes" "$(gate '."prevsbom-order"')" "true"
 
 # ── Repair: the signed assets of a missing image Release ─────────────────────
@@ -1789,7 +1788,7 @@ stage_signed() { # <commit> -> rc|the files the finalize step staged, with a log
   echo "$rc|$(find "$SSRT/release-assets" -mindepth 1 -printf '%f\n' 2>/dev/null | sort | tr '\n' ' ')"
 }
 [ -s "$WORK/stagesign.sh" ] || fail "D-S0 the finalize step staging the release assets was not extracted"
-chk "D-S0 it runs on stable publishes only" "$(cat "$WORK/stagesign.sh.if")" "\${{ env.PUBLISH == 'true' && inputs.channel == 'stable' }}"
+chk "D-S0 it runs on stable publishes only" "$(cat "$WORK/stagesign.sh.if")" "\${{ steps.claim.outputs.claimed == 'true' && inputs.channel == 'stable' }}"
 chk "D-S1 a release commit holding docs/openapi.json stages and signs it beside the SBOM and the dashboard" \
   "$(stage_signed "$OAPI")|$(signed)" "0|$DASH_NAMES $OAPI_ASSETS sbom.spdx.json sbom.spdx.json.sigstore.json |3"
 chk "D-S1 the release commit's document, not the working tree's" \
@@ -1916,7 +1915,7 @@ chk "D-B1 the step hands the caller's binaries input to the build" \
   "$(sed -n 's/^BINARIES=//p;s/^GOTOOLCHAIN=//p' "$WORK/stagesign.sh.envmap" | tr '\n' ' ')" '${{ inputs.binaries }} auto '
 chk "D-B1 Go is set up only for an opted-in stable publish, before the step" \
   "$(gate '."binaries-go-if"')|$(gate '."binaries-go-order"')|$(gate '."binaries-go-with" | tojson')" \
-  "\${{ env.PUBLISH == 'true' && inputs.channel == 'stable' && inputs.binaries != '' }}|true|{\"go-version\":\"stable\",\"cache\":false}"
+  "\${{ steps.claim.outputs.claimed == 'true' && inputs.channel == 'stable' && inputs.binaries != '' }}|true|{\"go-version\":\"stable\",\"cache\":false}"
 : >"$GO_LOG"
 chk "D-B2 without BINARIES nothing is built" "$(stage_signed "$DSH" | cut -d'|' -f1)|$(wc -l <"$GO_LOG" | tr -d ' ')" "0|0"
 printf 'v9-working-tree\n' >"$NOTESREPO/main.go"
@@ -2068,7 +2067,7 @@ grep -q "$WORK/manifest-meta.json" "$WORK/manifest-local.sh" || fail "D-PS6 the 
   GITHUB_OUTPUT="$WORK/manifest-out" bash "$WORK/manifest-local.sh") >/dev/null 2>&1 || fail "D-PS6 the channel-tag step failed on a promotion"
 chk "D-PS6 a promotion's channel tags report built=false, so the scan, gated on built, is skipped" \
   "$(sed -n 's/^built=//p' "$WORK/manifest-out")|$(gate '."scan-ifs" | join(",")')" \
-  "false|\${{ env.PUBLISH == 'true' && steps.manifest.outputs.built == 'true' }}"
+  "false|\${{ steps.claim.outputs.claimed == 'true' && steps.manifest.outputs.built == 'true' }}"
 chk "D-PS6 with the exclusion list and subpackages the digest walk used" "$(tr '\n' ' ' <"$WORK/promotedsbom.sh.envmap")" \
   'CI_TOOLS=${{ github.workspace }}/.cplieger-ci/scripts EXCLUDE_RE=${{ inputs.exclude-re }} SUBPACKAGES_JSON=${{ inputs.subpackages }} '
 chk "D-PS7 the summary, the signature and the attestation read the SBOM after either step writes it" "$(gate '."sbom-readers-after"')" "true"
@@ -2097,9 +2096,9 @@ chk "D-G5 asking the source first, then that ancestor" "$(sed 's/.*-sha \([0-9a-
 chk_has "D-G6 runs on publishes of a promoted digest only" "$(gate '."provenance-if"')" \
   "env.PUBLISH == 'true' && env.PROMOTE_DIGEST != ''"
 chk "D-G6 after cosign and the tools are in place, before every registry write" "$(gate '."before-provenance" | join("|")')" \
-  "Checkout|Check out the ci source|Version ownership gate|Download digests|Download the signed runner digests|Set up Docker Buildx|Log in to GHCR|Install Cosign|Setup Python"
-chk "D-G6 the next step reads the promoted SBOM, and the one after is the first write" \
-  "$(gate '."after-provenance"')|$(gate '."first-write"')" "Read the promoted build's SBOM|Publish channel tags on GHCR"
+  "Checkout|Check out the ci source|Download digests|Download the signed runner digests|Set up Docker Buildx|Log in to GHCR|Install Cosign|Setup Python"
+chk "D-G6 the next step reads the promoted SBOM, then the version is claimed, then comes the first write" \
+  "$(gate '."after-provenance"')|$(gate '.claim')|$(gate '."first-write"')" "Read the promoted build's SBOM|Claim the version|Publish channel tags on GHCR"
 chk "D-G6 the source is the one the digest walk named" "$(sed -n 's/^PROMOTE_SOURCE=//p' "$WORK/provenance.sh.envmap")" \
   '${{ needs.prepare.outputs.promote_source }}'
 chk "D-G6 with the exclusion list and subpackages that walk used" \
@@ -2150,10 +2149,8 @@ exit 22
 SH
 chmod 755 "$BIN/gh"
 : >"$GH_LOG"
-GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" GITHUB_REF_NAME=dev GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 \
-  run_step taghelper.sh >/dev/null
 out_tag=$(GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" GITHUB_REF_NAME=dev GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 \
-  TAG=v1.3.0-dev.4 run_step devtag.sh)
+  CHANNEL=dev TAG=v1.3.0-dev.4 run_step claim.sh)
 chk "D-T1 the dev tag is created at this commit" "$(grep -c "git/refs -f ref=refs/tags/v1.3.0-dev.4 -f sha=$C_BUILT" "$GH_LOG")" "1"
 chk "D-T2 the receipt is posted on the same commit after the tag" \
   "$(sed -n '/git\/refs -f ref=/,$p' "$GH_LOG" | grep -c "api -X POST repos/owner/app/statuses/$C_BUILT -f state=success -f context=release/tag/v1.3.0-dev.4 ")" "1"
@@ -2161,20 +2158,21 @@ chk "D-T3 the receipt links the run" "$(grep -c 'target_url=https://gh/owner/app
 chk "D-T4 the step exits 0" "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)" "0"
 : >"$GH_LOG"
 out_tag=$(GH_REF_FAIL=1 GH_HEAD="$C_DOCS" GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" GITHUB_REF_NAME=dev \
-  GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 TAG=v1.3.0-dev.4 run_step devtag.sh)
-chk "D-T5 a superseded run hands off without a receipt" "$(grep -c 'statuses/' "$GH_LOG")" "0"
+  GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 CHANNEL=dev TAG=v1.3.0-dev.4 run_step claim.sh)
+chk "D-T5 a superseded run hands off without a receipt, recording the handoff" \
+  "$(grep -c 'context=release/tag/' "$GH_LOG" || true)|$(grep -c "statuses/$C_BUILT -f state=success -f context=release/handoff/v1.3.0-dev.4 -f description=the run on $C_DOCS " "$GH_LOG")" "0|1"
 chk_has "D-T5 and warns" "$out_tag" "::warning::tag v1.3.0-dev.4 not created"
 chk "D-T5 and exits 0" "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)" "0"
 : >"$GH_LOG"
 out_tag=$(GH_TAG_EXISTS="$C_DOCS" GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" GITHUB_REF_NAME=dev \
-  GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 TAG=v1.3.0-dev.4 run_step devtag.sh)
+  GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 CHANNEL=dev TAG=v1.3.0-dev.4 run_step claim.sh)
 chk "D-T6 a tag elsewhere refuses and leaves no receipt" "$(grep -c 'statuses/' "$GH_LOG")" "0"
 chk "D-T6 and exits 1" "$(printf '%s' "$out_tag" | sed -n 's/^EXIT=//p')" "1"
 # A tag without its receipt makes every rerun compute release=false, so the
 # failed POST takes the tag this attempt created with it and a rerun makes both.
 export GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" GITHUB_REF_NAME=dev GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7
 : >"$GH_LOG"
-out_tag=$(GH_STATUS_FAIL=1 TAG=v1.3.0-dev.4 run_step devtag.sh)
+out_tag=$(GH_STATUS_FAIL=1 CHANNEL=dev TAG=v1.3.0-dev.4 run_step claim.sh)
 chk "D-T10 a failed receipt POST deletes the tag this attempt created" \
   "$(grep -c "api -X DELETE repos/owner/app/git/refs/tags/v1.3.0-dev.4" "$GH_LOG")" "1"
 chk "D-T10 the deletion follows the create and the failed POST" \
@@ -2182,12 +2180,12 @@ chk "D-T10 the deletion follows the create and the failed POST" \
 chk "D-T10 and exits 1" "$(printf '%s' "$out_tag" | sed -n 's/^EXIT=//p')" "1"
 chk_has "D-T10 and says why" "$out_tag" "::error::receipt for v1.3.0-dev.4 not recorded"
 : >"$GH_LOG"
-out_tag=$(TAG=v1.3.0-dev.4 run_step devtag.sh)
+out_tag=$(CHANNEL=dev TAG=v1.3.0-dev.4 run_step claim.sh)
 chk "D-T11 the rerun recreates the tag once" "$(grep -c "git/refs -f ref=refs/tags/v1.3.0-dev.4 -f sha=$C_BUILT" "$GH_LOG")" "1"
 chk "D-T11 and records one receipt" "$(grep -c "api -X POST repos/owner/app/statuses/$C_BUILT -f state=success -f context=release/tag/v1.3.0-dev.4 " "$GH_LOG")" "1"
 chk "D-T11 and exits 0" "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)" "0"
 : >"$GH_LOG"
-out_tag=$(GH_STATUS_FAIL=1 GH_TAG_EXISTS="$C_BUILT" TAG=v1.3.0-dev.4 run_step devtag.sh)
+out_tag=$(GH_STATUS_FAIL=1 GH_TAG_EXISTS="$C_BUILT" CHANNEL=dev TAG=v1.3.0-dev.4 run_step claim.sh)
 chk "D-T12 a failed POST never deletes a tag that predated the attempt" "$(grep -c -- '-X DELETE' "$GH_LOG")" "0"
 chk "D-T12 and still exits 1" "$(printf '%s' "$out_tag" | sed -n 's/^EXIT=//p')" "1"
 chk_has "D-T12 saying the tag at this commit is reused" "$out_tag" "::notice::Tag v1.3.0-dev.4 already exists at $C_BUILT, so it is reused"
@@ -2212,7 +2210,7 @@ done
 # A release run's lanes create their tags in one repository at once, and GitHub
 # can refuse one of two concurrent ref writes: each tag step reads the tag again
 # and retries, so one refusal still tags once and records the receipt.
-for step in go-tag.sh ts-tag.sh go-nested-tag.sh devtag.sh; do
+for step in go-tag.sh ts-tag.sh go-nested-tag.sh claim.sh; do
   : >"$GH_LOG"
   touch "$WORK/refuse-once"
   out_tag=$(GH_REF_REFUSE_ONCE="$WORK/refuse-once" GH_HEAD="$C_BUILT" VERSION=v1.3.0-dev.4 CHANNEL=dev TAG=v1.3.0-dev.4 \
@@ -2226,11 +2224,11 @@ done
 # A push that edits workflow files and lands past the run's commit takes the
 # integration token's ref-create (ui#42): every tag step hands off to the run
 # on the new head, with no receipt, and fails only while still at the head.
-for step in go-tag.sh ts-tag.sh go-nested-tag.sh devtag.sh; do
+for step in go-tag.sh ts-tag.sh go-nested-tag.sh claim.sh; do
   : >"$GH_LOG"
   out_tag=$(GH_REF_FAIL=1 GH_HEAD="$C_DOCS" VERSION=v1.3.0-dev.4 CHANNEL=dev TAG=v1.3.0-dev.4 run_step "$step")
-  chk "D-T17 $step hands off once the branch moved past it" \
-    "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)|$(grep -c 'statuses/' "$GH_LOG" || true)" "0|0"
+  chk "D-T17 $step hands off once the branch moved past it, with no receipt but the handoff record" \
+    "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)|$(grep -c 'context=release/tag/' "$GH_LOG" || true)|$(grep -c "statuses/$C_BUILT -f state=success -f context=release/handoff/v1.3.0-dev.4 " "$GH_LOG" || true)" "0|0|1"
   chk_has "D-T17 $step warns the handoff" "$out_tag" \
     "::warning::tag v1.3.0-dev.4 not created: dev advanced past $C_BUILT (now $C_DOCS)"
   : >"$GH_LOG"
@@ -2243,7 +2241,7 @@ done
 # A superseded run stops before npm too: ts and subpackage publish ahead of a
 # tag, and a lane's half needs the lane's tag.
 cat >"$WORK/handoff-ifs.want" <<'JSON'
-{"lane-halves": ["Publish the lane's TS half"], "subpackage": ["Publish subpackage to npm + JSR"], "ts": ["Publish to npm + JSR", "Generate release notes", "Tag + GitHub Release"]}
+{"lane-halves": ["Publish the lane's TS half"], "subpackage": ["Publish subpackage to npm + JSR"], "ts": []}
 JSON
 chk "D-T19 the publishes and tags each handoff gates" "$(cat "$WORK/handoff-ifs.json")" "$(cat "$WORK/handoff-ifs.want")"
 run_step_in() { # <script in cwd>: run_step's environment, in the current directory
@@ -2251,21 +2249,6 @@ run_step_in() { # <script in cwd>: run_step's environment, in the current direct
   PATH="$PBIN:$BIN:$PATH" GITHUB_OUTPUT="$WORK/out" CI_TOOLS="$ROOT/scripts" GITHUB_REPOSITORY=owner/app READBACK_SLEEP=0 \
     bash "$1" 2>&1 || echo "EXIT=$?"
 }
-out_h=$(GH_HEAD="$C_DOCS" VERSION=v1.3.0-dev.4 run_step ts-handoff.sh)
-chk "D-T20 ts hands off when the branch moved before its publish" "$(out handoff)" "true"
-chk_has "D-T20 and warns" "$out_h" "::warning::dev advanced past $C_BUILT (now $C_DOCS) before the publish"
-GH_HEAD="$C_BUILT" VERSION=v1.3.0-dev.4 run_step ts-handoff.sh >/dev/null
-chk "D-T21 ts publishes while still at the head" "$(out handoff)" "false"
-GH_HEAD="" VERSION=v1.3.0-dev.4 run_step ts-handoff.sh >/dev/null
-chk "D-T21 ts publishes when the head is unreadable" "$(out handoff)" "false"
-TSREPO="$WORK/ts-handoff"
-rm -rf "$TSREPO"
-git init -q -b dev "$TSREPO"
-git -C "$TSREPO" -c user.email=p@ci.local -c user.name=p -c commit.gpgsign=false commit -q --allow-empty -m "feat: ts root"
-git -C "$TSREPO" tag v1.3.0-dev.4
-(cd "$TSREPO" && cp "$WORK/ts-handoff.sh" ./.t.sh && GH_HEAD="$C_DOCS" GITHUB_SHA="$(git rev-parse HEAD)" VERSION=v1.3.0-dev.4 \
-  run_step_in .t.sh) >/dev/null
-chk "D-T28 a ts rerun whose version is already tagged here repairs on though the branch moved" "$(out handoff)" "false"
 SUBREPO="$WORK/sub-handoff"
 rm -rf "$SUBREPO"
 git init -q -b dev "$SUBREPO"
@@ -2499,7 +2482,7 @@ staged "${ALL_ASSETS[@]}"
 chk "D-I0 the verify step reads whether the Release is immutable from the create step" \
   "$(sed -n 's/^IMMUTABLE=//p' "$WORK/verifyassets.sh.envmap")" '${{ steps.release.outputs.immutable }}'
 chk "D-I0 and runs on every Release the create step published" \
-  "$(cat "$WORK/verifyassets.sh.if")" "\${{ env.PUBLISH == 'true' && steps.release.outputs.published == 'true' }}"
+  "$(cat "$WORK/verifyassets.sh.if")" "\${{ steps.claim.outputs.claimed == 'true' && steps.release.outputs.published == 'true' }}"
 
 for on in "" 1; do
   release_store absent
@@ -2647,7 +2630,7 @@ chk_has "D-L4 naming the failure" "$out_l" "::error::login_once failed after 5 a
 chk "D-L5 the build job moves the ci source out of the build context before building" \
   "$(gate '."build-steps" | (index("Move the ci source out of the build context") < index("Build and push by digest")) and (index("Check out the ci source") < index("Log in to GHCR"))')" "true"
 chk "D-L6 the SARIF upload runs only when the scan wrote its file" "$(gate '."sarif-if"')" \
-  "\${{ always() && env.PUBLISH == 'true' && hashFiles('trivy-image.sarif') != '' }}"
+  "\${{ always() && steps.claim.outputs.claimed == 'true' && hashFiles('trivy-image.sarif') != '' }}"
 # ── image-test: the consumer's image tests, on the pushed amd64 digest ───────
 chk "D-IT1 image-test follows a successful build that has an amd64 leg" \
   "$(gate '."image-test".needs | join(",")')|$(gate '."image-test".if')" \
@@ -2756,5 +2739,214 @@ chk "D-X6 a package GHCR gives no anonymous token for fails, the others still re
   "$(printf '%s' "$out_v" | sed -n 's/^EXIT=//p')|$(grep -cx dash "$VCURL_LOG" || true)|$(grep -cx dashm "$VCURL_LOG" || true)" "1|0|1"
 chk_has "D-X6 saying what the owner does" "$out_v" \
   "::error::ghcr.io/owner/app/dashboard: no anonymous pull token. A package's first publish leaves it private until its owner makes it public. Then rerun this job."
+
+# ── A version's claim: its git tag before any registry write under it ───────
+# finalize replayed on the dev channel (scripts/workflow_replay.py) through its
+# channel tags, in a fixture repository whose dev holds A then B. The fake
+# GitHub keeps the tags in CL/refs (CL/refs/.refuse refuses every create, as
+# GitHub does once a workflow-editing push lands past the run's commit, and
+# CL/refs/.head is dev's head); the fake docker records each registry write.
+# Both append to one event log, so order across them is visible.
+CL="$WORK/claim"
+mkdir -p "$CL/bin" "$CL/refs" "$CL/digests"
+export CL_EVENTS="$CL/events" CL_REFS="$CL/refs" CL_REPO="$CL/repo"
+sed -e "s|/tmp/digests|$CL/digests|g" -e "s|/tmp/manifest-meta.json|$CL/manifest-meta.json|g" "$WORKFLOW" >"$CL/docker-release.yaml"
+grep -q "$CL/digests/\*" "$CL/docker-release.yaml" || fail "D-CL0 the channel-tag step no longer reads /tmp/digests"
+git init -q -b dev "$CL_REPO"
+git -C "$CL_REPO" -c commit.gpgsign=false commit -q --allow-empty -m "fix: merge A"
+CL_A=$(git -C "$CL_REPO" rev-parse HEAD)
+git -C "$CL_REPO" -c commit.gpgsign=false commit -q --allow-empty -m "chore: sync the shared workflows (B)"
+CL_B=$(git -C "$CL_REPO" rev-parse HEAD)
+echo "sha256:$(printf '1%.0s' $(seq 64))" >"$CL/digests/amd64"
+cat >"$CL/bin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'gh %s\n' "$*" >>"$CL_EVENTS"
+R=repos/owner/app
+nf() { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+case "$*" in
+  "api $R/git/ref/tags/"*" --jq .object.sha")
+    t=${2#"$R"/git/ref/tags/}
+    [ -f "$CL_REFS/$t" ] || nf
+    cat "$CL_REFS/$t" ;;
+  "api $R/git/refs -f ref=refs/tags/"*" -f sha="*)
+    t=${4#ref=refs/tags/}
+    if [ -f "$CL_REFS/.refuse" ]; then echo "gh: Reference update failed (HTTP 422)" >&2; exit 1; fi
+    [ ! -f "$CL_REFS/$t" ] || { echo "gh: Reference already exists (HTTP 422)" >&2; exit 1; }
+    printf '%s\n' "${6#sha=}" >"$CL_REFS/$t"
+    git -C "$CL_REPO" tag "$t" "${6#sha=}"
+    echo '{}' ;;
+  "api $R/git/ref/heads/dev --jq .object.sha") cat "$CL_REFS/.head" ;;
+  "api $R/compare/"*"..."*" --jq .status")
+    range=${2#"$R"/compare/} base=${range%...*} head=${range#*...}
+    if git -C "$CL_REPO" merge-base --is-ancestor "$head" "$base"; then echo behind
+    elif git -C "$CL_REPO" merge-base --is-ancestor "$base" "$head"; then echo ahead
+    else echo diverged; fi ;;
+  "api -X POST $R/statuses/"*) echo '{}' ;;
+  "api -X DELETE $R/git/refs/tags/"*) rm -f "$CL_REFS/${4#"$R"/git/refs/tags/}" ;;
+  *) printf 'stub: unexpected gh %s\n' "$*" >&2; exit 22 ;;
+esac
+SH
+cat >"$CL/bin/docker" <<'SH'
+#!/usr/bin/env bash
+case "$1 ${2:-} ${3:-}" in
+  "login "*) cat >/dev/null; exit 0 ;;
+  "buildx imagetools create")
+    shift 3
+    meta="" tags=()
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --metadata-file) meta=$2; shift 2 ;;
+        -t) tags+=("$2"); shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf 'write %s\n' "${tags[*]}" >>"$CL_EVENTS"
+    printf '{"containerimage.descriptor":{"digest":"sha256:%s"}}\n' "$(printf '2%.0s' $(seq 64))" >"$meta" ;;
+  *) printf 'stub: unexpected docker %s\n' "$*" >&2; exit 22 ;;
+esac
+SH
+chmod 755 "$CL/bin/gh" "$CL/bin/docker"
+finalize_at() { # <commit> <dev version> <dev's head>: replays finalize at the commit; the events in CL/events, the result in CL/out.json, rc echoed
+  local rc=0
+  : >"$CL_EVENTS"
+  printf '%s\n' "$3" >"$CL_REFS/.head"
+  git -C "$CL_REPO" checkout -q --detach "$1"
+  jq -n --arg sha "$1" --arg tag "$2" '{
+    github: {repository: "owner/app", repository_owner: "owner", sha: $sha, ref: "refs/heads/dev", ref_name: "dev",
+      server_url: "https://gh", run_id: "7", actor: "probe", token: "t", event: {}},
+    job: {workflow_repository: "cplieger/ci", workflow_sha: "0000000000000000000000000000000000000000"},
+    inputs: {channel: "dev", "image-name": "app", registries: "ghcr", "exclude-re": "", subpackages: "[]", binaries: "",
+      version: ($tag | sub("-dev\\..*"; ""))},
+    needs: {
+      prepare: {result: "success", outputs: {publish: "true", tag: $tag, version: ($tag | sub("-dev\\..*"; "")),
+        tags: "ghcr.io/owner/app:\($tag)\nghcr.io/owner/app:dev\nghcr.io/owner/app:sha-\($sha)",
+        promote_digest: "", promote_source: "", "runner-images": ""}},
+      "rebuild-gate": {result: "skipped", outputs: {}}, build: {result: "success"}, "image-test": {result: "success"},
+      "runner-publish": {result: "skipped"}},
+    secrets: {}, matrix: {}}' >"$CL/ctx.json"
+  PATH="$CL/bin:$PATH" GITHUB_SHA="$1" GITHUB_REPOSITORY=owner/app GITHUB_REF_NAME=dev GITHUB_SERVER_URL=https://gh \
+    GITHUB_RUN_ID=7 READBACK_SLEEP=0 python3 "$ROOT/scripts/workflow_replay.py" --workflow "$CL/docker-release.yaml" \
+    --job finalize --actions-root "$ROOT" --context "$CL/ctx.json" --cwd "$CL_REPO" --out "$CL/out.json" \
+    --skip "Download digests" --skip "Set up Docker Buildx" --skip "Install Cosign" \
+    --stop-before "Publish the runner images' channel tags on GHCR" >"$CL/replay.log" 2>&1 || rc=$?
+  echo "$rc"
+}
+writes_of() { grep -c "^write .*ghcr.io/owner/app:$1\( \|$\)" "$CL_EVENTS" || true; }
+line_of() { grep -n -m1 "$1" "$CL_EVENTS" | cut -d: -f1; }
+claim_order() { # <tag> <commit> -> "claim<write" when the tag's create precedes the first registry write
+  local c w
+  c=$(line_of "^gh api repos/owner/app/git/refs -f ref=refs/tags/$1 -f sha=$2\$")
+  w=$(line_of '^write ')
+  if [ -n "$c" ] && [ -n "$w" ] && [ "$c" -lt "$w" ]; then echo "claim<write"; else echo "create line '${c}', first write line '${w}'"; fi
+}
+tagged() { # <tag> <commit>: the version as an earlier run left it, tagged at the commit
+  printf '%s\n' "$2" >"$CL_REFS/$1"
+  git -C "$CL_REPO" tag -f "$1" "$2" >/dev/null
+}
+receipt_on() { grep -c "^gh api -X POST repos/owner/app/statuses/$1 -f state=success -f context=release/tag/$2 " "$CL_EVENTS" || true; }
+# knell's sequence: B lands (a workflow-editing sync) while A's run is queued
+# behind nothing, so A's create is refused; A publishes nothing under the
+# version and records where it went, and B's run then claims and publishes it.
+touch "$CL_REFS/.refuse"
+rc=$(finalize_at "$CL_A" v1.3.0-dev.1 "$CL_B")
+rm "$CL_REFS/.refuse"
+chk "D-CL1 a run whose claim is refused after dev moved hands off green" "$rc" "0"
+chk "D-CL1 and writes no image under the version" "$(writes_of v1.3.0-dev.1)|$(grep -c '^write ' "$CL_EVENTS" || true)" "0|0"
+chk "D-CL1 with no receipt, and a handoff record on its commit naming dev's new head" \
+  "$(receipt_on "$CL_A" v1.3.0-dev.1)|$(grep -c "^gh api -X POST repos/owner/app/statuses/$CL_A -f state=success -f context=release/handoff/v1.3.0-dev.1 -f description=.*$CL_B" "$CL_EVENTS" || true)" "0|1"
+chk "D-CL1 its claim output says so" "$(jq -r '.steps.claim.outputs.claimed // "absent"' "$CL/out.json")" "false"
+rc=$(finalize_at "$CL_B" v1.3.0-dev.1 "$CL_B")
+chk "D-CL1 the run on the new head then claims the version at its commit and publishes it" \
+  "$rc|$(cat "$CL_REFS/v1.3.0-dev.1")|$(claim_order v1.3.0-dev.1 "$CL_B")|$(writes_of v1.3.0-dev.1)|$(receipt_on "$CL_B" v1.3.0-dev.1)" \
+  "0|$CL_B|claim<write|1|1"
+rm -f "$CL_REFS/v1.3.0-dev.1"
+git -C "$CL_REPO" tag -d v1.3.0-dev.1 >/dev/null 2>&1 || true
+# Two queued dev runs on consecutive commits: A claims dev.1 before it writes,
+# so B's run, admitted after A's, numbers the next version.
+eval "$(sed -n '/^dev_version() {/,/^}/p' "$ROOT/actions/git-cliff-version/compute.sh")"
+declare -F dev_version >/dev/null || fail "D-CL2 compute.sh has no dev_version to number with"
+rc=$(finalize_at "$CL_A" "$(cd "$CL_REPO" && dev_version v1.3.0)" "$CL_B")
+chk "D-CL2 the first queued run takes dev.1, claimed at A before its first write" \
+  "$rc|$(cat "$CL_REFS/v1.3.0-dev.1" 2>/dev/null)|$(claim_order v1.3.0-dev.1 "$CL_A")|$(writes_of v1.3.0-dev.1)|$(receipt_on "$CL_A" v1.3.0-dev.1)" \
+  "0|$CL_A|claim<write|1|1"
+b_ver=$(cd "$CL_REPO" && dev_version v1.3.0)
+rc=$(finalize_at "$CL_B" "$b_ver" "$CL_B")
+chk "D-CL2 the second takes dev.2, claimed at B before its first write" \
+  "$b_ver|$rc|$(cat "$CL_REFS/v1.3.0-dev.2" 2>/dev/null)|$(claim_order v1.3.0-dev.2 "$CL_B")|$(writes_of v1.3.0-dev.1)|$(writes_of v1.3.0-dev.2)" \
+  "v1.3.0-dev.2|0|$CL_B|claim<write|0|1"
+# A different commit arriving with a version already published at A refuses,
+# naming both commits, and writes nothing.
+tagged v1.3.0-dev.1 "$CL_A"
+rc=$(finalize_at "$CL_B" v1.3.0-dev.1 "$CL_B")
+chk "D-CL3 a newer commit holding a version published at an older one is refused" "$rc|$(grep -c '^write ' "$CL_EVENTS" || true)" "1|0"
+chk "D-CL3 and creates no tag" "$(grep -c '^gh api repos/owner/app/git/refs ' "$CL_EVENTS" || true)|$(cat "$CL_REFS/v1.3.0-dev.1")" "0|$CL_A"
+chk_has "D-CL3 naming the commit that holds it" "$(grep '::error::' "$CL/replay.log")" "$CL_A"
+chk_has "D-CL3 and the one this run built" "$(grep '::error::' "$CL/replay.log")" "$CL_B"
+# The existing rerun guard: an older run rerun after its successor took the
+# version refuses too.
+tagged v1.3.0-dev.2 "$CL_B"
+rc=$(finalize_at "$CL_A" v1.3.0-dev.2 "$CL_B")
+chk "D-CL4 a rerun of an older run whose version names a newer commit is refused" \
+  "$rc|$(grep -c '^write ' "$CL_EVENTS" || true)|$(cat "$CL_REFS/v1.3.0-dev.2")" "1|0|$CL_B"
+# A rerun of the same commit reuses its tag and publishes again.
+tagged v1.3.0-dev.1 "$CL_A"
+rc=$(finalize_at "$CL_A" v1.3.0-dev.1 "$CL_B")
+chk "D-CL5 a rerun of the commit the version names publishes it again" \
+  "$rc|$(writes_of v1.3.0-dev.1)|$(grep -c '^gh api repos/owner/app/git/refs ' "$CL_EVENTS" || true)" "0|1|0"
+python3 - "$WORKFLOW" >"$CL/structure.txt" <<'PY'
+import sys, yaml
+jobs = yaml.safe_load(open(sys.argv[1]))["jobs"]
+fin = jobs["finalize"]["steps"]
+names = [s.get("name") for s in fin]
+at = next((i for i, s in enumerate(fin) if s.get("id") == "claim"), None)
+if at is None:
+    print("no claim step")
+    sys.exit()
+later = [s.get("name") for s in fin[at + 1:] if "env.PUBLISH" in str(s.get("if", ""))]
+print("|".join([
+    names[at + 1],
+    ",".join(later),
+    jobs["finalize"]["outputs"].get("claimed", ""),
+    str("needs.finalize.outputs.claimed == 'true'" in " ".join(str(jobs["verify-publish"]["if"]).split())),
+]))
+PY
+chk "D-CL6 the claim is the step before the first registry write, and every later step reads it, not PUBLISH" \
+  "$(cat "$CL/structure.txt")" "Publish channel tags on GHCR||\${{ steps.claim.outputs.claimed }}|True"
+# The ts job claims its version the same way before npm, which keeps every
+# version it receives.
+python3 - "$RELEASE_YAML" "$CL" >"$CL/ts-claim.json" <<'PY'
+import json, sys, yaml
+steps = yaml.safe_load(open(sys.argv[1]))["jobs"]["ts"]["steps"]
+names = [s.get("name") for s in steps]
+claim = next((s for s in steps if s.get("id") == "claim"), None)
+open(f"{sys.argv[2]}/ts-claim.sh", "w").write(claim["run"] if claim else "echo 'no claim step'; exit 99\n")
+pub = names.index("Publish to npm + JSR")
+print(json.dumps({
+    "before-publish": claim is not None and names.index(claim["name"]) < pub,
+    "publish-if": " ".join(str(steps[pub].get("if", "")).split()),
+    "handoff-readers": [s.get("name") for s in steps if "steps.handoff" in str(s.get("if", ""))],
+}))
+PY
+ts_claim() { # <commit> <dev's head> -> rc|claimed, the step's output in CL/ts-claim.log
+  local rc=0
+  : >"$CL_EVENTS"
+  : >"$CL/ts-out"
+  printf '%s\n' "$2" >"$CL_REFS/.head"
+  (cd "$CL_REPO" && PATH="$CL/bin:$PATH" GITHUB_OUTPUT="$CL/ts-out" CI_TOOLS="$ROOT/scripts" GITHUB_REPOSITORY=owner/app \
+    GITHUB_SHA="$1" GITHUB_REF_NAME=dev GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 READBACK_SLEEP=0 VERSION=v1.4.0-dev.1 \
+    CHANNEL=dev bash "$CL/ts-claim.sh") >"$CL/ts-claim.log" 2>&1 || rc=$?
+  echo "$rc|$(sed -n 's/^claimed=//p' "$CL/ts-out")"
+}
+chk "D-CL7 a ts run whose branch moved but whose create succeeds claims its version" \
+  "$(ts_claim "$CL_A" "$CL_B")|$(cat "$CL_REFS/v1.4.0-dev.1" 2>/dev/null)|$(receipt_on "$CL_A" v1.4.0-dev.1)" "0|true|$CL_A|1"
+rm -f "$CL_REFS/v1.4.0-dev.1"
+touch "$CL_REFS/.refuse"
+chk "D-CL8 one whose create is refused after the branch moved hands off, claiming nothing" \
+  "$(ts_claim "$CL_A" "$CL_B")|$(receipt_on "$CL_A" v1.4.0-dev.1)|$(grep -c "statuses/$CL_A -f state=success -f context=release/handoff/v1.4.0-dev.1 " "$CL_EVENTS" || true)" \
+  "0|false|0|1"
+rm "$CL_REFS/.refuse"
+chk "D-CL9 the claim precedes npm's publish, which runs only on a claim" \
+  "$(jq -r '[."before-publish", ."publish-if", (."handoff-readers" | join(","))] | join("|")' "$CL/ts-claim.json")" \
+  "true|\${{ steps.claim.outputs.claimed == 'true' }}|"
 
 echo "PASS ($PASS checks)"

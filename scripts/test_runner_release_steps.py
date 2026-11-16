@@ -406,60 +406,6 @@ class Build(unittest.TestCase):
         self.assertFalse((self.out / f'build.{self.ARCH}').exists())
 
 
-# gh api answers the tag's commit (STUB_TAG_SHA, none when empty) and the
-# compare status of this run's commit against it (STUB_STATUS, fails when empty).
-GH_STUB = r"""#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >>"$STUB_LOG"
-case "$2" in
-  repos/owner/app/git/ref/tags/v1.3.0) [ -n "$STUB_TAG_SHA" ] && printf '%s\n' "$STUB_TAG_SHA" ;;
-  "repos/owner/app/compare/${GITHUB_SHA}...${STUB_TAG_SHA}") [ -n "$STUB_STATUS" ] && printf '%s\n' "$STUB_STATUS" ;;
-  *) exit 64 ;;
-esac
-"""
-
-
-class VersionOwner(unittest.TestCase):
-    def owner(self, tag_sha: str, status: str = ''):
-        with tempfile.TemporaryDirectory() as tmp:
-            t = Path(tmp)
-            (t / 'gh').write_text(GH_STUB)
-            (t / 'gh').chmod(0o755)
-            return subprocess.run(
-                ['bash', str(SCRIPTS / 'version-owner.sh'), 'v1.3.0'],
-                capture_output=True,
-                text=True,
-                env={
-                    **os.environ,
-                    'PATH': f'{t}:{os.environ["PATH"]}',
-                    'STUB_LOG': str(t / 'log'),
-                    'STUB_TAG_SHA': tag_sha,
-                    'STUB_STATUS': status,
-                    'GITHUB_REPOSITORY': 'owner/app',
-                    'GITHUB_SHA': 'c' * 40,
-                },
-                check=False,
-            )
-
-    def test_an_absent_equal_or_ancestor_tag_publishes(self):
-        for tag_sha, status in (('', ''), ('c' * 40, ''), ('a' * 40, 'behind')):
-            with self.subTest(tag_sha=tag_sha, status=status):
-                r = self.owner(tag_sha, status)
-                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-                self.assertNotIn('::error::', r.stdout)
-
-    def test_a_tag_this_commit_does_not_descend_from_is_refused(self):
-        for status in ('ahead', 'diverged', ''):
-            with self.subTest(status=status):
-                r = self.owner('a' * 40, status)
-                self.assertEqual(r.returncode, 1)
-                self.assertIn(
-                    f'::error::refusing to publish v1.3.0: its tag names {"a" * 40} and this run built {"c" * 40}',
-                    r.stdout,
-                )
-                self.assertIn(f'compare status: {status or "unknown"}', r.stdout)
-
-
 class Summary(unittest.TestCase):
     def summary(self, doc: dict, *title: str) -> list[str]:
         with tempfile.NamedTemporaryFile('w', suffix='.json') as f:
@@ -644,9 +590,9 @@ class RunnerPublishJob(unittest.TestCase):
         upload = step('runner-publish', 'Upload the signed digest')['with']
         self.assertEqual(upload['name'], 'runner-index-${{ matrix.image }}')
 
-    def test_no_channel_tag_and_no_version_gate_in_a_leg(self):
+    def test_no_channel_tag_and_no_version_claim_in_a_leg(self):
         runs = ' '.join(s.get('run', '') for s in self.job['steps'])
-        self.assertNotIn('version-owner.sh', runs)
+        self.assertNotIn('tag-ref.sh', runs)
         self.assertNotIn('runner-images-publish.sh" tags', runs)
         self.assertIn('runner-images-publish.sh" index', runs)
 
@@ -695,6 +641,9 @@ class RunnerPublishJob(unittest.TestCase):
 
 class FinalizeRunnerTags(unittest.TestCase):
     GUARD = "${{ env.PUBLISH == 'true' && needs.prepare.outputs.runner-images != '' }}"
+    CLAIMED = (
+        "${{ steps.claim.outputs.claimed == 'true' && needs.prepare.outputs.runner-images != '' }}"
+    )
     WRITE = "Publish the runner images' channel tags on GHCR"
 
     def setUp(self):
@@ -704,7 +653,7 @@ class FinalizeRunnerTags(unittest.TestCase):
         at = self.names.index(self.WRITE)
         self.assertEqual(at, self.names.index('Publish channel tags on GHCR') + 1)
         for refusal in (
-            'Version ownership gate',
+            'Claim the version',
             "Verify the promoted build's signature and SBOM",
             "Read the promoted build's SBOM",
             'Download the signed runner digests',
@@ -720,7 +669,7 @@ class FinalizeRunnerTags(unittest.TestCase):
         self.assertEqual(download['with']['pattern'], 'runner-index-*')
         self.assertEqual(download['with']['path'], '${{ runner.temp }}/runner-index')
         write = step('finalize', self.WRITE)
-        self.assertEqual(write['if'], self.GUARD)
+        self.assertEqual(write['if'], self.CLAIMED)
         self.assertIn('runner-images-publish.sh" tags "$RUNNER_TEMP/runner-index"', write['run'])
         self.assertEqual(write['env']['PLAN'], '${{ needs.prepare.outputs.runner-images }}')
 

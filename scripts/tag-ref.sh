@@ -14,7 +14,7 @@ tag_ref() {
   TAG_CREATED=false TAG_ELSEWHERE=""
   retry tag_ref_once "$1" "$2" "$3" || return 2
   [ -n "$TAG_ELSEWHERE" ] || return 0
-  echo "::error::Tag $2 exists at ${TAG_ELSEWHERE}, not $3, so it is not moved."
+  echo "::error::Tag $2 exists at ${TAG_ELSEWHERE}, not $3. A published version never moves, so nothing is published under it."
   return 1
 }
 tag_ref_once() { # <owner/repo> <tag> <commit>
@@ -45,10 +45,11 @@ branch_moved_past() {
 # tag_ref_or_handoff <owner/repo> <branch> <tag> <commit>: tag_ref for a release run on <branch>.
 # Once a push that edits workflow files lands past <commit>, GitHub refuses the
 # integration token's ref create (ui#42, deadset#281, toolbelt#506), and runs
-# queue per ref, so the run on the new head releases this range. Returns 0 when
-# the tag is at <commit>, 2 when the create failed after <branch> moved on (a
-# handoff, warned), 1 otherwise: the tag sits elsewhere, or the create failed
-# while <commit> is still the head or the head cannot be read.
+# queue per ref, so the run on the new head releases this range under its own
+# claim. Returns 0 when the tag is at <commit>, 2 when the create failed after
+# <branch> moved on (a handoff, warned and recorded on <commit>), 1 otherwise:
+# the tag sits elsewhere, or the create failed while <commit> is still the head
+# or the head cannot be read.
 tag_ref_or_handoff() {
   local rc=0 head mrc=0
   tag_ref "$1" "$3" "$4" || rc=$?
@@ -57,10 +58,21 @@ tag_ref_or_handoff() {
   case "$mrc" in
     0)
       echo "::warning::tag $3 not created: $2 advanced past $4 (now ${head}), and a superseded run loses ref-create. The run on the new head releases this range."
+      handoff_record "$1" "$3" "$4" "$head"
       return 2
       ;;
     1) echo "::error::tag create for $3 failed while this run is still $2's head. It is not a superseded run, so check the token's permissions and the API." ;;
     *) echo "::error::tag create for $3 failed and $2's head is unreadable, so a handoff cannot be confirmed." ;;
   esac
   return 1
+}
+
+# handoff_record <owner/repo> <tag> <commit> <head>: the release/handoff/<tag>
+# status on the handed-off <commit>, naming the <head> whose run releases its
+# changes. Best effort: the handoff stands without it.
+handoff_record() {
+  gh api -X POST "repos/$1/statuses/$3" -f state=success -f context="release/handoff/$2" \
+    -f description="the run on $4 releases this commit's changes" \
+    -f target_url="${GITHUB_SERVER_URL:-https://github.com}/$1/actions/runs/${GITHUB_RUN_ID:-0}" >/dev/null \
+    || echo "::warning::handoff record for $2 not posted on $3, so only this log names $4 as the head that releases it."
 }

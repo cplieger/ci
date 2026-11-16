@@ -1975,32 +1975,59 @@ jobs:
           set -euo pipefail
           npm ci
 
-      # Before npm's publish, which a handed-off tag would leave behind: once
-      # the branch has moved past this commit, the run on the new head
-      # releases this range. A version already tagged here is this run's own
-      # (a rerun after a failed Release), so it repairs on. branch_moved_past's
-      # rule (tag-ref.sh), read inline because the ci source is checked out
-      # only after the package's lifecycle scripts have run.
-      - name: Hand off to a newer push
-        id: handoff
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.detect.outputs.version }}
+      # The ci source arrives after the dependencies' install scripts have
+      # run, and leaves the workspace because npm publish packs its root.
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Move the ci source out of the package
         run: |
           set -euo pipefail
-          at=$(git rev-list -n1 "$VERSION" 2>/dev/null || true)
-          head=""
-          [ "$at" = "$GITHUB_SHA" ] \
-            || head=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha 2>/dev/null || true)
-          if [ -n "$head" ] && [ "$head" != "$GITHUB_SHA" ]; then
-            echo "::warning::${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${head}) before the publish. The run on the new head releases this range."
-            echo "handoff=true" >>"$GITHUB_OUTPUT"
-          else
-            echo "handoff=false" >>"$GITHUB_OUTPUT"
+          mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
+
+      # npm keeps every version it is given, so the version's git tag claims
+      # it first (docker-release.yaml's step of the same name).
+      - name: Claim the version
+        id: claim
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          VERSION: ${{ needs.detect.outputs.version }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          . "$CI_TOOLS/tag-ref.sh"
+          rc=0
+          tag_ref_or_handoff "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" || rc=$?
+          if [ "$rc" -eq 2 ]; then
+            echo "claimed=false" >>"$GITHUB_OUTPUT"
+            exit 0
           fi
+          [ "$rc" -eq 0 ] || exit 1
+          # The audit reads this receipt: a dev tag has no Release to show
+          # that the pipeline, not a hand, created it. A tag without it would
+          # make a rerun compute release=false, so the tag this attempt
+          # created is deleted with the failed POST and a rerun makes both.
+          if [ "$CHANNEL" != "stable" ] && ! gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=success -f context="release/tag/${VERSION}" \
+            -f description="created by the dev release run" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
+            if [ "$TAG_CREATED" = true ]; then
+              echo "::error::receipt for ${VERSION} not recorded; deleting the tag this run created so a rerun recreates both"
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}" >/dev/null
+            fi
+            exit 1
+          fi
+          echo "claimed=true" >>"$GITHUB_OUTPUT"
 
       - name: Publish to npm + JSR
-        if: ${{ steps.handoff.outputs.handoff != 'true' }}
+        if: ${{ steps.claim.outputs.claimed == 'true' }}
         # The version-exists guards below make a rerun of the publish path
         # skip what already landed.
         env:
@@ -2034,8 +2061,8 @@ jobs:
           fi
           # Skip JSR if the version already exists. JSR has no overwrite and
           # `jsr publish` errors on a duplicate, which would wedge a re-run
-          # after a partial/cancelled release (npm can publish but the run
-          # dies before tagging). Mirror of the npm guard above.
+          # after a partial/cancelled release (the run can die once JSR took
+          # the version). Mirror of the npm guard above.
           if curl -fsSL "https://jsr.io/${pkg}/meta.json" \
                | jq -e --arg v "$ver" '.versions[$v]' >/dev/null 2>&1; then
             echo "::notice::jsr: $pkg@$ver already published — skipping"
@@ -2047,14 +2074,6 @@ jobs:
             npx -y "jsr@${JSR_VERSION}" publish --allow-dirty
           fi
 
-      - name: Check out the ci source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: .cplieger-ci
-          persist-credentials: false
-
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -2063,9 +2082,9 @@ jobs:
       - name: Generate release notes
         # Stable only; deliberately token-free — this step executes the
         # downloaded git-cliff binary; see the go job's identical split.
-        if: ${{ steps.handoff.outputs.handoff != 'true' && needs.detect.outputs.channel == 'stable' }}
+        if: ${{ steps.claim.outputs.claimed == 'true' && needs.detect.outputs.channel == 'stable' }}
         env:
-          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
           KIND_NOTE: ${{ needs.detect.outputs.release_kind_note }}
@@ -2089,45 +2108,15 @@ jobs:
           args+=(--repo "$GITHUB_REPOSITORY" --release-commit "$GITHUB_SHA" --security-shas "$RUNNER_TEMP/security-shas")
           bash "$CI_TOOLS/render-notes.sh" "${args[@]}"
 
-      - name: Tag + GitHub Release
-        if: ${{ steps.handoff.outputs.handoff != 'true' }}
+      # The claim made the tag, so the Release attaches to it (no --target).
+      - name: GitHub Release
+        if: ${{ steps.claim.outputs.claimed == 'true' && needs.detect.outputs.channel == 'stable' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
-          CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
           set -euo pipefail
-          # Tag ref created first via the git data API, pinned to the trigger
-          # commit; release then attaches to the existing tag (no --target).
-          # Once a push that edits workflow files lands past $GITHUB_SHA, the
-          # integration token loses ref-create, and the run on the new head
-          # releases this range, so that failure hands off (tag-ref.sh). A dev
-          # build gets the tag, its receipt and no Release.
-          . "$CI_TOOLS/retry.sh"
-          . "$CI_TOOLS/tag-ref.sh"
-          rc=0
-          tag_ref_or_handoff "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" || rc=$?
-          [ "$rc" -ne 2 ] || exit 0
-          [ "$rc" -eq 0 ] || exit 1
-          if [ "$CHANNEL" != "stable" ]; then
-            # The audit reads this receipt: a dev tag has no Release to show
-            # that the pipeline, not a hand, created it. A tag without it would
-            # make a rerun compute release=false, so the tag this attempt
-            # created is deleted with the failed POST and a rerun makes both.
-            if ! gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
-              -f state=success -f context="release/tag/${VERSION}" \
-              -f description="created by the dev release run" \
-              -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
-              if [ "$TAG_CREATED" = true ]; then
-                echo "::error::receipt for ${VERSION} not recorded; deleting the tag this run created so a rerun recreates both"
-                gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}" >/dev/null
-              fi
-              exit 1
-            fi
-            echo "dev channel: tagged ${VERSION} with its receipt, no GitHub Release"
-            exit 0
-          fi
           state=$(bash "$CI_TOOLS/release-exists.sh" "$VERSION")
           if [ "$state" = absent ]; then
             gh release create "$VERSION" --title "$VERSION" --notes-file NOTES.md

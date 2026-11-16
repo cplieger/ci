@@ -21,7 +21,6 @@ PRs (want absent; Renovate owns deps)
 a reproducer — broken seed corpus
 a stale/decommissioned app; remove it
 already published — skipping
-ancestor of ${GITHUB_SHA}; publishing forward.
 anchor failed — treating all tracked
 approving reviews={s["required_review_count"]} — a single-maintainer repo
 at {path} — treating as 0
@@ -53,7 +52,6 @@ listed no files; cannot verify the
 listing truncated ({err}); version tags not
 locked (read-only — nothing can merge;
 must be '$expected'; a module path
-names this commit; publishing.
 no .ts targets; nothing to close
 no API — fix by hand:
 no commit sha; not graded
@@ -61,7 +59,6 @@ no deploy hook; remove it)
 no engines.node floor; nothing to test
 no vulnerability statements; refusing to pass
 not found locally; run `git fetch
-not tagged yet; publishing.
 nothing can merge; want unlocked)
 numeric major — applying the base-path
 of '$*' failed; retrying in ${delay}s
