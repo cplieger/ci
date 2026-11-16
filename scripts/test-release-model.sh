@@ -630,6 +630,37 @@ run_release main held2
 chk "M42 at its seed version, promoted from its newest dev build" "$(result)|$(lane_notes wire)" \
   'wire/v1.0.0|Promoted from `wire/v1.0.0-dev.2`'
 
+# ── 14c. a promotion followed at once by an unrelated main merge ────────────
+# knell's v4.0.0: a sync of shared files lands on main right after the promotion. The
+# promotion's run holds the queue first; when its claim lands, the sync's run
+# finds the version tagged and ships nothing new.
+commit_on dev "fix: a fix promoted before a sync" main.go='package main\n// promoted before a sync' >/dev/null
+out=$(run_promote quick)
+RQ=$(head_of main)
+chk "M45 the promotion lands on main" "$out|$(is_r "$RQ")" "promoted $RQ|yes"
+SQ=$(commit_on main "chore: sync the shared files" .editorconfig='root = true')
+AT=$RQ run_release main quick-r
+rq_ver=$(result)
+chk "M45 the promotion's own run publishes its stable version at the promotion" \
+  "$(grep -cE '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$rq_ver")|$(tag_of "$rq_ver")" "1|$RQ"
+AT=$SQ run_release main quick-s
+chk "M45 and the sync's run after it publishes nothing new" "$(result)|$(tag_of "$rq_ver")" "|$RQ"
+# When GitHub refuses the promotion run's claim (a sync editing workflow files),
+# that run publishes nothing, and the sync's run releases the version over a
+# tree holding the promotion, its notes naming the promotion.
+commit_on dev "chore: sync the shared files" .editorconfig='root = true' >/dev/null
+commit_on dev "fix: a fix promoted under a sync" main.go='package main\n// promoted under a sync' >/dev/null
+out=$(run_promote handed)
+RH=$(head_of main)
+SH=$(commit_on main "chore: sync the shared files again" .editorconfig='root = true\n# again')
+NO_PUBLISH=1 AT=$RH run_release main handed-r
+rh_ver=$(jq -r .outputs.version "$RUN.detect.json")
+chk "M46 a promotion whose claim is handed off tags nothing" "$out|$(tag_of "$rh_ver")" "promoted $RH|"
+AT=$SH run_release main handed-s
+chk "M46 the sync's run releases that version at the sync, whose tree holds the promotion" \
+  "$(result)|$(tag_of "$rh_ver")|$(git -C "$O" merge-base --is-ancestor "$RH" "$SH" && echo held)" "$rh_ver|$SH|held"
+chk_has "M46 its notes name the promotion" "$(detect release_kind_note)" "including the promotion of"
+
 # ── 15. a lockfile-only commit on main ───────────────────────────────────────
 commit_on main "chore(deps): lock file maintenance" package-lock.json='{"lockfileVersion": 3}' >/dev/null
 run_release main lock

@@ -2043,18 +2043,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
           set -euo pipefail
           . "$CI_TOOLS/retry.sh"
           . "$CI_TOOLS/tag-ref.sh"
-          rc=0
-          tag_ref_or_handoff "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" || rc=$?
-          if [ "$rc" -eq 2 ]; then
-            echo "claimed=false" >>"$GITHUB_OUTPUT"
-            exit 0
-          fi
-          [ "$rc" -eq 0 ] || exit 1
-          echo "claimed=true" >>"$GITHUB_OUTPUT"
+          claim_version "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL"
 
       - name: Publish to npm + JSR
         if: ${{ steps.claim.outputs.claimed == 'true' }}
@@ -2214,10 +2208,9 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
-      # A subpackage publishes at the root version, so without the root tag
-      # here it would leave npm a version no tag names. A root job that handed
-      # its tag off (tag_ref_or_handoff) left none, and the run on the new
-      # head publishes both; a root with no tag and the branch still here
+      # A subpackage publishes at the root version, so it hands off with the
+      # root (tag-ref.sh root_handed_off): the version that releases the root's
+      # changes publishes it too. A root with no tag and the branch still here
       # publishes as before.
       - name: Hand off with the root tag
         id: handoff
@@ -2225,27 +2218,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
           DIR: ${{ matrix.dir }}
         run: |
           set -euo pipefail
-          handoff=false
-          if [ "$(git rev-list -n1 "$VERSION" 2>/dev/null || true)" != "$GITHUB_SHA" ]; then
-            . "$CI_TOOLS/tag-ref.sh"
-            rc=0
-            head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA") || rc=$?
-            case "$rc" in
-              0)
-                echo "::warning::${VERSION} is not tagged here and ${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${head}). The run on the new head publishes ${DIR}."
-                handoff=true
-                ;;
-              1) ;;
-              *)
-                echo "::error::${VERSION} is not tagged here and ${GITHUB_REF_NAME}'s head is unreadable, so a handoff cannot be confirmed and ${DIR} is not published."
-                exit 1
-                ;;
-            esac
-          fi
-          echo "handoff=${handoff}" >>"$GITHUB_OUTPUT"
+          . "$CI_TOOLS/tag-ref.sh"
+          rc=0
+          root_handed_off "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL" || rc=$?
+          case "$rc" in
+            0) echo "handoff=true" >>"$GITHUB_OUTPUT" ;;
+            1) echo "handoff=false" >>"$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::whether the root handed ${VERSION} off cannot be told (${GITHUB_REF_NAME}'s head or its tags are unreadable), so ${DIR} is not published."
+              exit 1
+              ;;
+          esac
 
       - name: Publish subpackage to npm + JSR
         if: ${{ steps.handoff.outputs.handoff != 'true' }}
@@ -2679,14 +2666,13 @@ jobs:
             fi
           }
 
-          # A root job that handed its tag off to a newer push (tag_ref_or_handoff)
-          # succeeded with no root tag here; the run on the new head publishes
-          # and verifies the root, so its artifacts are not awaited here.
+          # A root job that handed its version off (tag-ref.sh root_handed_off)
+          # succeeded publishing nothing; the version that releases its changes
+          # is verified by its own run. When that cannot be told, all is read.
           root=true
-          if [ -n "$VERSION" ] && [ "$(git rev-list -n1 "$VERSION" 2>/dev/null || true)" != "$GITHUB_SHA" ]; then
+          if [ -n "$VERSION" ]; then
             . "$CI_TOOLS/tag-ref.sh"
-            if head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA"); then
-              echo "::warning::${VERSION} is not tagged at ${GITHUB_SHA} and ${GITHUB_REF_NAME} advanced past it (now ${head}). The root was handed off, so its artifacts are not verified here."
+            if root_handed_off "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL"; then
               root=false
             fi
           fi

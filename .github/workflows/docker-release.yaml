@@ -1,8 +1,9 @@
 # Reusable Docker publish workflow, called only by release.yaml. dev: build on
-# native amd64 and arm64 runners, push `:<dev-version>`, `:dev`, `:sha-<commit>`,
-# sign, attest the SBOM, scan, create the dev tag. stable: tag `:vX.Y.Z`, `:vX.Y`,
-# `:vX`, `:latest` on the promoted dev digest (promote-digest.sh) or a source
-# build, copy to Docker Hub, re-scan, create the Release. Each
+# native amd64 and arm64 runners, claim the version with its dev tag, push
+# `:<dev-version>`, `:dev`, `:sha-<commit>`, sign, attest the SBOM, scan, then
+# post the receipt. stable: claim the version with its tag, tag `:vX.Y.Z`,
+# `:vX.Y`, `:vX`, `:latest` on the promoted dev digest (promote-digest.sh) or a
+# source build, copy to Docker Hub, re-scan, create the Release. Each
 # images/<name>/Dockerfile is a runner image of <image>-runner at the same
 # version (scripts/runner_images.py), pushed and signed before finalize, which
 # tags them after the app image.
@@ -1252,18 +1253,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
           . "$CI_TOOLS/retry.sh"
           . "$CI_TOOLS/tag-ref.sh"
-          rc=0
-          tag_ref_or_handoff "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$TAG" "$GITHUB_SHA" || rc=$?
-          if [ "$rc" -eq 2 ]; then
-            echo "claimed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          [ "$rc" -eq 0 ] || exit 1
-          echo "claimed=true" >> "$GITHUB_OUTPUT"
+          claim_version "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$TAG" "$GITHUB_SHA" "$CHANNEL"
 
       # Build arm: assemble the multi-arch index at the channel tags from the
       # per-arch digests. Promote arm: `imagetools create` with a single

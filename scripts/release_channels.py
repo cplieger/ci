@@ -80,9 +80,14 @@ SECURITY_AUTOMERGE_LABELS = frozenset(
 )
 
 # The receipt a dev tag path leaves on its commit: a commit status in this
-# context, posted right after the tag ref. Stable tags need none because their
+# context, posted after the version's last write (with the tag, for a Go root or
+# lane tag, whose tag is its publication). Stable tags need none because their
 # GitHub Release, authored by the Actions token, is the receipt.
 TAG_RECEIPT_PREFIX = 'release/tag/'
+# A dev tag whose run published nothing under it, because a later version
+# ships its commit's changes, carries this status instead (tag-ref.sh
+# handoff_record).
+HANDOFF_PREFIX = 'release/handoff/'
 RELEASE_AUTHORS = frozenset({'github-actions[bot]'})
 
 # The completion receipt of a two-branch stable publication: a commit status on
@@ -109,6 +114,18 @@ def has_tag_receipt(tag: str, statuses: Iterable[dict]) -> bool:
     """Whether `statuses` (a commit's combined statuses) carry the tag's receipt."""
     context = tag_receipt_context(tag)
     return any(s.get('context') == context and s.get('state') == 'success' for s in statuses)
+
+
+def has_handoff_record(tag: str, statuses: Iterable[dict]) -> bool:
+    """Whether `statuses` carry the record that the tag was handed off."""
+    context = HANDOFF_PREFIX + tag
+    return any(s.get('context') == context and s.get('state') == 'success' for s in statuses)
+
+
+def dev_tag_accounted(tag: str, statuses: Iterable[dict]) -> bool:
+    """Whether a dev tag's commit shows it published or handed off."""
+    statuses = list(statuses)
+    return has_tag_receipt(tag, statuses) or has_handoff_record(tag, statuses)
 
 
 def is_two_branch(repo: Mapping[str, Any]) -> bool:

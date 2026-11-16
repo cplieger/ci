@@ -913,11 +913,15 @@ cmd_claims() {
   out "unproven=${unproven# }"
 }
 
-dev_published() { # <key> <dev tag> <commit> -> 0 once the tag's build is published and every registry its dev channel writes serves it
+dev_proven() { # <key> <dev tag> <commit> -> 0 when the tag needs no proof (a Go root or lane) or its receipt exists
+  ! claims_proof "$1" || tag_proven "$2" "$3"
+}
+# A root image's receipt follows verify-publish's registry readback, a TS
+# root's follows npm publish alone, so npm is read here.
+dev_published() { # <key> <dev tag> <commit> -> 0 when dev_proven and, for a TS root, npm serves the version
   local pkg
-  claims_proof "$1" || return 0
-  tag_proven "$2" "$3" || return 1
-  [ "${REPO_TYPE:-}" = ts ] || return 0
+  dev_proven "$1" "$2" "$3" || return 1
+  [ "$1" = . ] && [ "${REPO_TYPE:-}" = ts ] || return 0
   pkg=$(jq -r .name package.json) || return 1
   npm_answers "$pkg" "${2#v}" >/dev/null
 }
@@ -934,12 +938,14 @@ has_dev_above() { # <key> <X.Y.Z> -> 0 when a published dev build of the lane on
   done <<<"$tags"
   return 1
 }
-built_past() { # <key> <T> -> 0 when dev's history holds a dev build of the lane that T cannot reach
+# An unproven claim is no build: renumber would publish its unchecked image, and
+# settle_dev_head's dev run of the head finishes it instead.
+built_past() { # <key> <T> -> 0 when dev's history holds a proven dev build of the lane that T cannot reach
   local name c tags
   tags=$(tags_of "$(dev_re "$1")") || die "cannot read lane ${1}'s dev tags"
   while read -r name c; do
     [ -n "$name" ] || continue
-    if is_ancestor "$c" refs/remotes/origin/dev && ! is_ancestor "$c" "$2"; then
+    if is_ancestor "$c" refs/remotes/origin/dev && ! is_ancestor "$c" "$2" && dev_proven "$1" "$name" "$c"; then
       return 0
     fi
   done <<<"$tags"
@@ -1119,10 +1125,11 @@ head_unfinished() { # <commit> -> how many push release runs of the commit are u
 # A queued renumber run replaces the dev run pending in their concurrency group
 # and builds nothing, and a push run can still fail, so the hold releases only
 # once a release run of dev's head succeeded: an unfinished push run is waited
-# for, else a normal dev run (which republishes nothing already tagged) is
-# dispatched and its own run waited for. A dev tag at the head proves one lane
-# only. A newer queued run cancels the dispatched one, so a cancelled one is
-# dispatched again for dev's head as it then stands. dev_moved is set when it waited.
+# for, else a normal dev run (which republishes only an unproven claim at the
+# head) is dispatched and its own run waited for. A dev tag at the head proves
+# one lane only. A newer queued run cancels the dispatched one, so a cancelled
+# one is dispatched again for dev's head as it then stands. dev_moved is set
+# when it waited.
 settled="" dev_moved=""
 settle_dev_head() {
   local head runs
@@ -1335,6 +1342,14 @@ publish_npm_dev() { # <dev tag> <npm_dev_state's answer>
   npm_answers "$pkg" "$ver" || die "npm ${pkg}@${ver} does not read back, so ${1} is not published"
 }
 
+carries_lower() { # <key> <dev tag> <commit> -> 0 when the commit also carries a lower dev tag of the lane
+  local name c tags
+  tags=$(tags_of "$(dev_re "$1")") || die "cannot read lane ${1}'s dev tags"
+  while read -r name c; do
+    [ -n "$name" ] && [ "$c" = "$3" ] && tag_gt "$2" "$name" && return 0
+  done <<<"$tags"
+  return 1
+}
 renumber_build() { # <key> <new dev version> -> the build at HEAD to renumber, or nothing when it already ranks there
   local key=$1 new=$2 d_tag d
   [ "${CHANNEL:-}" = dev ] || die "renumber runs on the dev channel only"
@@ -1348,8 +1363,11 @@ renumber_build() { # <key> <new dev version> -> the build at HEAD to renumber, o
   [ "$d" = "$(git rev-parse HEAD)" ] \
     || die "lane ${key}: ${new} was computed at HEAD, but the newest build is ${d_tag} at ${d}. Check that build out first."
   # compute.sh answers the build's own newest tag only when that claim is
-  # unproven (UNPROVEN), so the renumber resumes it.
+  # unproven (UNPROVEN). It is a renumber's own when the build also carries the
+  # lower number it lifts; a dev release run's claim is that run's to finish.
   if [ "$d_tag" = "$new" ]; then
+    carries_lower "$key" "$new" "$d" \
+      || die "lane ${key}: ${new} at ${d} is a dev release run's unfinished claim, so it is not renumbered. Rerun all jobs of that run, then rerun this renumber."
     printf '%s\n' "$d"
     return 0
   fi

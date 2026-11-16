@@ -3,6 +3,9 @@
 # shell options).
 # shellcheck disable=SC2034 # TAG_CREATED is the caller's to read
 
+# release_channels.HANDOFF_PREFIX reads this context.
+TAG_HANDOFF_PREFIX='release/handoff/'
+
 # tag_ref <owner/repo> <tag> <commit>: makes refs/tags/<tag> point at <commit>
 # through retry, reading the tag again before each attempt: a release run's lanes
 # create tags in one repository at once, and GitHub has refused concurrent writes
@@ -58,7 +61,7 @@ tag_ref_or_handoff() {
   case "$mrc" in
     0)
       echo "::warning::tag $3 not created: $2 advanced past $4 (now ${head}), and a superseded run loses ref-create. The run on the new head releases this range."
-      handoff_record "$1" "$3" "$4" "$head"
+      handoff_record "$1" "$3" "$4" "the run on ${head}"
       return 2
       ;;
     1) echo "::error::tag create for $3 failed while this run is still $2's head. It is not a superseded run, so check the token's permissions and the API." ;;
@@ -67,12 +70,88 @@ tag_ref_or_handoff() {
   return 1
 }
 
-# handoff_record <owner/repo> <tag> <commit> <head>: the release/handoff/<tag>
-# status on the handed-off <commit>, naming the <head> whose run releases its
-# changes. Best effort: the handoff stands without it.
+# handoff_record <owner/repo> <tag> <commit> <what releases it>: the
+# release/handoff/<tag> status on the handed-off <commit>, naming the run or the
+# later version that releases its changes. Best effort: the handoff stands
+# without it.
 handoff_record() {
-  gh api -X POST "repos/$1/statuses/$3" -f state=success -f context="release/handoff/$2" \
-    -f description="the run on $4 releases this commit's changes" \
+  gh api -X POST "repos/$1/statuses/$3" -f state=success -f context="${TAG_HANDOFF_PREFIX}$2" \
+    -f description="$4 releases this commit's changes" \
     -f target_url="${GITHUB_SERVER_URL:-https://github.com}/$1/actions/runs/${GITHUB_RUN_ID:-0}" >/dev/null \
-    || echo "::warning::handoff record for $2 not posted on $3, so only this log names $4 as the head that releases it."
+    || echo "::warning::handoff record for $2 not posted on $3, so only this log names $4 as what releases it."
+}
+
+# later_dev_tag <branch> <tag> <commit>: prints "<tag> <commit>" of the newest
+# root dev tag other than <tag> on a descendant of <commit> that
+# origin/<branch> holds, nothing when none; returns 1 when git cannot tell. It
+# reads the job's checkout (fetch-depth 0) unfetched: only release runs, queued
+# one at a time per branch, create a root dev tag, so none appears while this
+# run holds the queue.
+later_dev_tag() {
+  local -A at=()
+  local name obj peeled refs revs c
+  refs=$(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)') || return 1
+  while read -r name obj peeled; do
+    if [[ $name =~ ^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$ ]] && [ "$name" != "$2" ]; then
+      at[${peeled:-$obj}]=$name
+    fi
+  done <<<"$refs"
+  revs=$(git rev-list --ancestry-path "$3..refs/remotes/origin/$1") || return 1
+  while read -r c; do
+    if [ -n "$c" ] && [ -n "${at[$c]:-}" ]; then
+      printf '%s %s\n' "${at[$c]}" "$c"
+      return 0
+    fi
+  done <<<"$revs"
+}
+
+# claim_version <owner/repo> <branch> <tag> <commit> <channel>: the version's
+# claim before its first write, as claimed=true or claimed=false (a handoff) in
+# GITHUB_OUTPUT; returns 1 when the version cannot be claimed. A dev claim
+# reused at <commit> under a later dev tag on <branch> is a handoff too: that
+# tag ships this commit's changes, and publishing again would move the dev
+# channel back to this older build.
+claim_version() {
+  local rc=0 later
+  tag_ref_or_handoff "$1" "$2" "$3" "$4" || rc=$?
+  case "$rc" in
+    0) ;;
+    2)
+      echo "claimed=false" >>"${GITHUB_OUTPUT:?}"
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+  if [ "$5" = dev ] && [ "$TAG_CREATED" = false ]; then
+    if ! later=$(later_dev_tag "$2" "$3" "$4"); then
+      echo "::error::git cannot tell whether a later dev tag on $2 holds $4, so $3 is not published again."
+      return 1
+    fi
+    if [ -n "$later" ]; then
+      echo "::notice::${later% *} at ${later#* } already ships the changes of $4, so nothing is published under $3."
+      handoff_record "$1" "$3" "$4" "${later% *} at ${later#* }"
+      echo "claimed=false" >>"${GITHUB_OUTPUT:?}"
+      return 0
+    fi
+  fi
+  echo "claimed=true" >>"${GITHUB_OUTPUT:?}"
+}
+
+# root_handed_off <owner/repo> <branch> <version> <commit> <channel>: for a job
+# after the root's claim, 0 when the root handed <version> off by either of
+# claim_version's handoffs (warned here), 1 when the root claimed it at
+# <commit>, 2 when that cannot be told.
+root_handed_off() {
+  local head later rc=0
+  if [ "$(git rev-list -n1 "$3" 2>/dev/null || true)" != "$4" ]; then
+    head=$(branch_moved_past "$1" "$2" "$4") || rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+    echo "::warning::$3 is not tagged at $4 and $2 advanced past it (now ${head}), so the run on the new head releases it."
+    return 0
+  fi
+  [ "$5" = dev ] || return 1
+  later=$(later_dev_tag "$2" "$3" "$4") || return 2
+  [ -n "$later" ] || return 1
+  echo "::warning::$3 at $4 was handed off to ${later% *} at ${later#* }, which ships its changes."
+  return 0
 }

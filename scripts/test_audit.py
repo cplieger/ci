@@ -365,7 +365,11 @@ class TwoChannel(unittest.TestCase):
             hard,
         )
         self.assertTrue(
-            any('dev tag v5.1.0-dev.3 carries no release/tag receipt' in h for h in hard), hard
+            any(
+                'dev tag v5.1.0-dev.3 carries no release/tag receipt or release/handoff record' in h
+                for h in hard
+            ),
+            hard,
         )
 
     def test_excluding_the_protected_branch_is_hard(self):
@@ -633,6 +637,35 @@ class TagProvenance(unittest.TestCase):
         # No run is read as provenance evidence: the only Actions reads are the
         # deferral's three, which say whether a receipt is still on its way.
         self.assertEqual([a for a in asked if '/actions/' in a], list(self.runs('httpx')))
+
+    def test_a_handed_off_dev_tag_is_accounted_for(self):
+        # dev.1 at A was claimed, then superseded by dev.2 at B, which ships A's
+        # changes; the rerun of A's run recorded the handoff instead of a receipt.
+        tags = [
+            {'name': 'v1.4.0-dev.2', 'commit': {'sha': self.B}},
+            {'name': 'v1.4.0-dev.1', 'commit': {'sha': self.A}},
+        ]
+        answers = {
+            'repos/cplieger/httpx/tags?per_page=100&page=1': tags,
+            f'repos/cplieger/httpx/commits/{self.A}/status?per_page=100': {
+                'statuses': [{'context': 'release/handoff/v1.4.0-dev.1', 'state': 'success'}]
+            },
+            f'repos/cplieger/httpx/commits/{self.B}/status?per_page=100': {
+                'statuses': [{'context': 'release/tag/v1.4.0-dev.2', 'state': 'success'}]
+            },
+            **self.commits('httpx', self.A, self.B),
+            **self.runs('httpx'),
+        }
+        s = self.collect('httpx', answers, [])
+        self.assertEqual(s['dev_tags_without_receipt'], [])
+        self.assertEqual(s['errors'], [])
+
+    def test_a_handoff_record_of_another_tag_accounts_for_nothing(self):
+        statuses = {self.A: [{'context': 'release/handoff/v1.4.0-dev.2', 'state': 'success'}]}
+        missing = audit.tags_without_receipt(
+            [('v1.4.0-dev.1', self.A)], statuses.get, audit.release_channels.dev_tag_accounted
+        )
+        self.assertEqual(missing, ['v1.4.0-dev.1'])
 
     def test_a_tag_on_a_commit_inside_the_grace_window_is_not_graded(self):
         # v1.5.0 was tagged seconds ago and its Release is not there yet; v1.4.0

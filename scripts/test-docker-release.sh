@@ -2179,10 +2179,33 @@ chk "D-T6 a tag elsewhere refuses and leaves no receipt" "$(grep -c 'statuses/' 
 chk "D-T6 and exits 1" "$(printf '%s' "$out_tag" | sed -n 's/^EXIT=//p')" "1"
 export GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" GITHUB_REF_NAME=dev GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7
 : >"$GH_LOG"
-out_tag=$(GH_TAG_EXISTS="$C_BUILT" TAG=v1.3.0-dev.4 run_step claim.sh)
+# A reused dev claim reads the checkout's tags and origin/dev for a later one.
+git -C "$REPO" update-ref refs/remotes/origin/dev "$(git -C "$REPO" rev-parse HEAD)"
+[ -z "$(git -C "$REPO" tag --list 'v*-dev.*')" ] || fail "D-T11 needs a fixture with no dev tag yet"
+claim_in_repo() { (cd "$REPO" && CHANNEL="${CHANNEL:-dev}" run_step claim.sh); }
+out_tag=$(GH_TAG_EXISTS="$C_BUILT" TAG=v1.3.0-dev.4 CHANNEL=dev claim_in_repo)
 chk "D-T11 a claim at the commit already tagged reuses the tag and writes nothing" \
-  "$(grep -c -E 'git/refs -f|/statuses/|-X DELETE' "$GH_LOG" || true)|$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)" "0|0"
+  "$(grep -c -E 'git/refs -f|/statuses/|-X DELETE' "$GH_LOG" || true)|$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)|$(out claimed)" "0|0|true"
 chk_has "D-T11 saying the tag at this commit is reused" "$out_tag" "::notice::Tag v1.3.0-dev.4 already exists at $C_BUILT, so it is reused"
+# A later dev tag on the branch ships this commit's changes, so the reused
+# claim publishes nothing and records the version that does.
+git -C "$REPO" tag v1.3.0-dev.5 "$C_SHIP"
+: >"$GH_LOG"
+out_tag=$(GH_TAG_EXISTS="$C_BUILT" TAG=v1.3.0-dev.4 CHANNEL=dev claim_in_repo)
+chk "D-T29 a reused dev claim under a later dev tag on the branch hands off green" \
+  "$(out claimed)|$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)|$(grep -c -E 'git/refs -f|-X DELETE|context=release/tag/' "$GH_LOG" || true)" "false|0|0"
+chk "D-T29 recording on its commit the later version and its commit" \
+  "$(grep -c "statuses/$C_BUILT -f state=success -f context=release/handoff/v1.3.0-dev.4 -f description=v1.3.0-dev.5 at $C_SHIP releases this commit's changes " "$GH_LOG" || true)" "1"
+: >"$GH_LOG"
+out_tag=$(GH_TAG_EXISTS="$C_BUILT" TAG=v1.3.0-dev.4 CHANNEL=stable claim_in_repo)
+chk "D-T29 a stable claim never hands off to a dev tag" "$(out claimed)|$(grep -c '/statuses/' "$GH_LOG" || true)" "true|0"
+git -C "$REPO" tag -d v1.3.0-dev.5 >/dev/null
+git -C "$REPO" update-ref -d refs/remotes/origin/dev
+: >"$GH_LOG"
+out_tag=$(GH_TAG_EXISTS="$C_BUILT" TAG=v1.3.0-dev.4 CHANNEL=dev claim_in_repo)
+chk "D-T30 a reused dev claim whose branch git cannot walk is refused, writing nothing" \
+  "$(printf '%s' "$out_tag" | sed -n 's/^EXIT=//p')|$(out claimed)|$(grep -c '/statuses/' "$GH_LOG" || true)" "1||0"
+chk_has "D-T30 saying why" "$out_tag" "::error::git cannot tell whether a later dev tag on dev holds $C_BUILT"
 # The receipt is the dev version's proof, so a failed one deletes no tag: the
 # claim stays, and the commit's next attempt republishes it.
 for f in dr-receipt.sh ts-receipt.sh; do
@@ -2267,20 +2290,30 @@ git init -q -b dev "$SUBREPO"
 git -C "$SUBREPO" -c user.email=p@ci.local -c user.name=p -c commit.gpgsign=false commit -q --allow-empty -m "feat: root"
 SUB_SHA=$(git -C "$SUBREPO" rev-parse HEAD)
 sub_handoff() { # <head> -> runs the subpackage handoff in SUBREPO at SUB_SHA
-  (cd "$SUBREPO" && cp "$WORK/sub-handoff.sh" ./.h.sh && GH_HEAD="$1" GITHUB_SHA="$SUB_SHA" VERSION=v1.3.0-dev.4 DIR=web run_step_in .h.sh)
+  (cd "$SUBREPO" && cp "$WORK/sub-handoff.sh" ./.h.sh && GH_HEAD="$1" GITHUB_SHA="$SUB_SHA" VERSION=v1.3.0-dev.4 CHANNEL=dev DIR=web run_step_in .h.sh)
 }
 out_h=$(sub_handoff "$C_DOCS")
 chk "D-T22 a subpackage with no root tag here hands off once the branch moved" "$(out handoff)" "true"
-chk_has "D-T22 and names the subpackage" "$out_h" "The run on the new head publishes web."
+chk_has "D-T22 and says the run on the new head releases it" "$out_h" "so the run on the new head releases it."
 sub_handoff "$SUB_SHA" >/dev/null
 chk "D-T23 a subpackage with no root tag and the branch still here publishes" "$(out handoff)" "false"
 out_h=$(sub_handoff "")
 chk "D-T28 a subpackage with no root tag whose branch head cannot be read fails, publishing nothing" \
   "$(printf '%s' "$out_h" | sed -n 's/^EXIT=//p')|$(out handoff)" "1|"
-chk_has "D-T28 and says why" "$out_h" "head is unreadable, so a handoff cannot be confirmed and web is not published"
+chk_has "D-T28 and says why" "$out_h" "cannot be told (dev's head or its tags are unreadable), so web is not published"
 git -C "$SUBREPO" tag v1.3.0-dev.4
+git -C "$SUBREPO" update-ref refs/remotes/origin/dev "$SUB_SHA"
 sub_handoff "$C_DOCS" >/dev/null
 chk "D-T24 a subpackage whose root tag is here publishes though the branch moved" "$(out handoff)" "false"
+# The root's claim here reused under a later dev tag on dev publishes nothing
+# (tag-ref.sh claim_version), so the subpackage hands off with it.
+git -C "$SUBREPO" -c user.email=p@ci.local -c user.name=p -c commit.gpgsign=false commit -q --allow-empty -m "fix: later"
+git -C "$SUBREPO" tag v1.3.0-dev.5
+git -C "$SUBREPO" update-ref refs/remotes/origin/dev HEAD
+git -C "$SUBREPO" checkout -q --detach "$SUB_SHA"
+out_h=$(sub_handoff "$C_DOCS")
+chk "D-T31 a subpackage whose root claim a later dev tag supersedes hands off with it" "$(out handoff)" "true"
+chk_has "D-T31 naming that tag" "$out_h" "was handed off to v1.3.0-dev.5 at"
 LANEREPO="$WORK/lane-handoff"
 rm -rf "$LANEREPO"
 git init -q -b dev "$LANEREPO"
@@ -2829,6 +2862,7 @@ finalize_at() { # <commit> <version tag> <branch head> [channel]: replays finali
   [ "$channel" = dev ] || branch=main
   : >"$CL_EVENTS"
   printf '%s\n' "$3" >"$CL_REFS/.head"
+  git -C "$CL_REPO" update-ref "refs/remotes/origin/$branch" "$3"
   git -C "$CL_REPO" checkout -q --detach "$1"
   jq -n --arg sha "$1" --arg tag "$2" --arg channel "$channel" --arg branch "$branch" '{
     github: {repository: "owner/app", repository_owner: "owner", sha: $sha, ref: "refs/heads/\($branch)", ref_name: $branch,
@@ -2911,11 +2945,25 @@ tagged v1.3.0-dev.2 "$CL_B"
 rc=$(finalize_at "$CL_A" v1.3.0-dev.2 "$CL_B")
 chk "D-CL4 a rerun of an older run whose version names a newer commit is refused" \
   "$rc|$(grep -c '^write ' "$CL_EVENTS" || true)|$(cat "$CL_REFS/v1.3.0-dev.2")" "1|0|$CL_B"
-# A rerun of the same commit reuses its tag and publishes again.
+# A rerun of the same commit, with no later dev tag on dev, reuses its tag and
+# publishes again.
+rm -f "$CL_REFS/v1.3.0-dev.2"
+git -C "$CL_REPO" tag -d v1.3.0-dev.2 >/dev/null
 tagged v1.3.0-dev.1 "$CL_A"
 rc=$(finalize_at "$CL_A" v1.3.0-dev.1 "$CL_B")
 chk "D-CL5 a rerun of the commit the version names publishes it again" \
   "$rc|$(writes_of v1.3.0-dev.1)|$(grep -c '^gh api repos/owner/app/git/refs ' "$CL_EVENTS" || true)" "0|1|0"
+# A claim left unproven at A after B's run published dev.2, which ships A's
+# changes: rerunning A's run would move :dev back to A's older build, so it
+# publishes nothing and records dev.2 as the version carrying A.
+tagged v1.3.0-dev.2 "$CL_B"
+rc=$(finalize_at "$CL_A" v1.3.0-dev.1 "$CL_B")
+chk "D-CL14 a rerun of an unproven claim a later dev tag supersedes ends green, writing no image and no :dev" \
+  "$rc|$(grep -c '^write ' "$CL_EVENTS" || true)|$(jq -r '.steps.claim.outputs.claimed // "absent"' "$CL/out.json")" "0|0|false"
+chk "D-CL14 recording on A the later version and its commit, and no receipt" \
+  "$(grep -c "^gh api -X POST repos/owner/app/statuses/$CL_A -f state=success -f context=release/handoff/v1.3.0-dev.1 -f description=v1.3.0-dev.2 at $CL_B " "$CL_EVENTS" || true)|$(receipt_on "$CL_A" v1.3.0-dev.1)" "1|0"
+rm -f "$CL_REFS/v1.3.0-dev.2"
+git -C "$CL_REPO" tag -d v1.3.0-dev.2 >/dev/null
 # A failure after the claim keeps it: the tag stays at the commit, unproven
 # (no receipt), so the commit's next attempt republishes it (compute.sh).
 rm -f "$CL_REFS/v1.3.0-dev.1" "$CL_REFS/v1.3.0-dev.2"
@@ -2944,6 +2992,19 @@ chk "D-CL13 a stable rerun at the tagged commit whose write fails keeps the clai
 rc=$(finalize_at "$CL_B" v1.3.0 "$CL_B" stable)
 chk "D-CL13 and the next one reuses it and publishes" \
   "$rc|$(writes_of v1.3.0)|$(grep -c '^gh api repos/owner/app/git/refs ' "$CL_EVENTS" || true)" "0|1|0"
+# knell's stable sequence: a sync merges on main right after the promotion,
+# so GitHub refuses the promotion run's tag create. That run writes no image
+# tag under the version and records the head whose run releases it.
+touch "$CL_REFS/.refuse"
+rc=$(finalize_at "$CL_A" v1.4.0 "$CL_B" stable)
+rm "$CL_REFS/.refuse"
+chk "D-CL16 a stable claim refused after main moved hands off green, writing nothing" \
+  "$rc|$(grep -c '^write ' "$CL_EVENTS" || true)|$(jq -r '.steps.claim.outputs.claimed // "absent"' "$CL/out.json")|$([ -f "$CL_REFS/v1.4.0" ] && echo tagged)" "0|0|false|"
+chk "D-CL16 recording on the promotion the head whose run releases it" \
+  "$(grep -c "^gh api -X POST repos/owner/app/statuses/$CL_A -f state=success -f context=release/handoff/v1.4.0 -f description=the run on $CL_B releases this commit's changes " "$CL_EVENTS" || true)" "1"
+rc=$(finalize_at "$CL_B" v1.4.0 "$CL_B" stable)
+chk "D-CL16 and that run claims the version at its own commit before its first write" \
+  "$rc|$(cat "$CL_REFS/v1.4.0" 2>/dev/null)|$(claim_order v1.4.0 "$CL_B")" "0|$CL_B|claim<write"
 python3 - "$WORKFLOW" >"$CL/structure.txt" <<'PY'
 import sys, yaml
 jobs = yaml.safe_load(open(sys.argv[1]))["jobs"]
@@ -2983,6 +3044,7 @@ ts_claim() { # <commit> <dev's head> -> rc|claimed, the step's output in CL/ts-c
   : >"$CL_EVENTS"
   : >"$CL/ts-out"
   printf '%s\n' "$2" >"$CL_REFS/.head"
+  git -C "$CL_REPO" update-ref refs/remotes/origin/dev "$2"
   (cd "$CL_REPO" && PATH="$CL/bin:$PATH" GITHUB_OUTPUT="$CL/ts-out" CI_TOOLS="$ROOT/scripts" GITHUB_REPOSITORY=owner/app \
     GITHUB_SHA="$1" GITHUB_REF_NAME=dev GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 READBACK_SLEEP=0 VERSION=v1.4.0-dev.1 \
     CHANNEL=dev bash "$CL/ts-claim.sh") >"$CL/ts-claim.log" 2>&1 || rc=$?
@@ -2996,6 +3058,13 @@ chk "D-CL8 one whose create is refused after the branch moved hands off, claimin
   "$(ts_claim "$CL_A" "$CL_B")|$(receipt_on "$CL_A" v1.4.0-dev.1)|$(grep -c "statuses/$CL_A -f state=success -f context=release/handoff/v1.4.0-dev.1 " "$CL_EVENTS" || true)" \
   "0|false|0|1"
 rm "$CL_REFS/.refuse"
+tagged v1.4.0-dev.1 "$CL_A"
+tagged v1.4.0-dev.2 "$CL_B"
+chk "D-CL15 a ts rerun of an unproven claim a later dev tag supersedes claims nothing, recording the later version" \
+  "$(ts_claim "$CL_A" "$CL_B")|$(receipt_on "$CL_A" v1.4.0-dev.1)|$(grep -c "statuses/$CL_A -f state=success -f context=release/handoff/v1.4.0-dev.1 -f description=v1.4.0-dev.2 at $CL_B " "$CL_EVENTS" || true)" \
+  "0|false|0|1"
+rm -f "$CL_REFS/v1.4.0-dev.1" "$CL_REFS/v1.4.0-dev.2"
+git -C "$CL_REPO" tag -d v1.4.0-dev.1 v1.4.0-dev.2 >/dev/null
 chk "D-CL9 the claim precedes npm's publish, which runs only on a claim" \
   "$(jq -r '[."before-publish", ."publish-if", (."handoff-readers" | join(","))] | join("|")' "$CL/ts-claim.json")" \
   "true|\${{ steps.claim.outputs.claimed == 'true' }}|"

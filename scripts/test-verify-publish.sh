@@ -582,5 +582,25 @@ spec "*registry.npmjs.org* 22 {}" "*jsr.io* 0 {}"
 run_step "$TAGGED"
 chk "V-R4 a root tagged here is verified though the branch moved" "$RC" "1"
 chk_lacks "V-R4 no handoff is claimed" "$OUT" "advanced past"
+# A dev claim reused here under a later dev tag on dev published nothing
+# (tag-ref.sh claim_version), so the later version's run verifies the root.
+TAGGED_SHA=$GITHUB_SHA
+git -C "$TAGGED" tag v1.2.3-dev.1
+git -C "$TAGGED" commit -q --allow-empty -m "fix: later"
+git -C "$TAGGED" tag v1.2.3-dev.2
+git -C "$TAGGED" update-ref refs/remotes/origin/dev HEAD
+git -C "$TAGGED" checkout -q --detach "$TAGGED_SHA"
+defaults
+export CHANNEL=dev VERSION=v1.2.3-dev.1 TS_RESULT=success GH_HEAD=$moved GITHUB_SHA=$TAGGED_SHA
+spec "*registry.npmjs.org* 22 {}"
+run_step "$TAGGED"
+chk "V-R5 a dev root whose reused claim a later dev tag supersedes is not awaited" "$RC|$(lines "$CURL_LOG")" "0|0"
+chk_has "V-R5 naming that tag" "$OUT" "v1.2.3-dev.1 at $GITHUB_SHA was handed off to v1.2.3-dev.2 at"
+git -C "$TAGGED" update-ref -d refs/remotes/origin/dev
+defaults
+export CHANNEL=dev VERSION=v1.2.3-dev.1 TS_RESULT=success GH_HEAD=$moved GITHUB_SHA=$TAGGED_SHA
+spec "*registry.npmjs.org* 22 {}"
+run_step "$TAGGED"
+chk "V-R6 one whose branch git cannot walk is verified, and fails" "$RC" "1"
 
 echo "PASS: verify-publish probe contract holds (${PASS} checks)"

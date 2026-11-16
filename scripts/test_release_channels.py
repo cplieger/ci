@@ -235,6 +235,19 @@ class TagReceipts(unittest.TestCase):
         script = (pathlib.Path(__file__).parent / 'release-state.sh').read_text()
         self.assertIn(f"COMPLETION_PREFIX='{rc.COMPLETION_RECEIPT_PREFIX}'", script)
         self.assertIn(f"TAG_RECEIPT_PREFIX='{rc.TAG_RECEIPT_PREFIX}'", script)
+        tag_ref = (pathlib.Path(__file__).parent / 'tag-ref.sh').read_text()
+        self.assertIn(f"TAG_HANDOFF_PREFIX='{rc.HANDOFF_PREFIX}'", tag_ref)
+
+    def test_a_dev_tag_is_accounted_for_by_its_receipt_or_its_handoff_record(self):
+        receipt = [{'context': 'release/tag/v1.3.0-dev.4', 'state': 'success'}]
+        handoff = [{'context': 'release/handoff/v1.3.0-dev.4', 'state': 'success'}]
+        pending = [{'context': 'release/handoff/v1.3.0-dev.4', 'state': 'pending'}]
+        other = [{'context': 'release/handoff/v1.3.0-dev.5', 'state': 'success'}]
+        self.assertTrue(rc.dev_tag_accounted('v1.3.0-dev.4', iter(receipt)))
+        self.assertTrue(rc.dev_tag_accounted('v1.3.0-dev.4', iter(handoff)))
+        self.assertFalse(rc.dev_tag_accounted('v1.3.0-dev.4', pending))
+        self.assertFalse(rc.dev_tag_accounted('v1.3.0-dev.4', other))
+        self.assertFalse(rc.has_tag_receipt('v1.3.0-dev.4', handoff))
 
     def test_release_receipt_is_the_actions_author(self):
         self.assertTrue(

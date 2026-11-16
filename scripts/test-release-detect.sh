@@ -1069,6 +1069,11 @@ git -C "$K" tag yamlenv/v1.1.0-dev.1 dev~1
 chk "A11 a lane with a dev tag above its stable keeps its build" "$(ahead_at go true '[]' '["yamlenv"]')" 'true|[]|["yamlenv"]'
 chk "A11 and so does a root sharing its version with subpackages" \
   "$(ahead_at go true '["web"]' '[]' '["web"]')" 'true|["web"]|[]'
+# A TS root's claim at HEAD, never proven, ranks above the stable too, so the
+# build that resumes it (compute.sh's RESUME) is kept, not dropped.
+git -C "$K" tag v1.1.0-dev.2 dev
+chk "A18 a TS root holding an unproven claim at HEAD above its stable keeps its build" "$(ahead_at ts true '[]' '[]')" 'true|[]|[]'
+git -C "$K" tag -d v1.1.0-dev.2 >/dev/null
 git -C "$K" tag -d v1.1.0-dev.1 yamlenv/v1.1.0-dev.1 >/dev/null
 git -C "$K" tag v1.0.1-dev.1 dev~1
 git -C "$K" tag yamlenv/v1.0.1-dev.1 dev~1
@@ -2070,9 +2075,9 @@ DT=$(git -C "$O" rev-list -n1 v1.2.0-dev.1)
 [ ! -f "$GH_DIR/statuses-$DT.json" ] || fail "B36 needs the commit of v1.2.0-dev.1 to carry no status yet"
 make_hook success ""
 out_b=$(REPO_TYPE=docker IMAGE=o/app barrier)
-chk "B36 an image's dev tag above the version with no receipt, a claim never proven published, does not release the hold" \
-  "$out_b|$(dispatched)" "EXIT=1|1"
-chk_has "B36 the renumber must leave a published build" "$(cat "$WORK/barrier.log")" "lane .: renumber run 99 left no dev build above v1.1.0"
+chk "B36 an image's dev tag above the version with no receipt, a claim never proven published, is no build to renumber" \
+  "$out_b|$(dispatched)" "|0"
+chk_has "B36 so dev holds no build past the promoted commit" "$(cat "$WORK/barrier.log")" "lane .: dev holds no build past the promoted commit"
 echo '[{"context":"release/tag/v1.2.0-dev.1","state":"success"}]' >"$GH_DIR/statuses-$DT.json"
 rm -f "$GH_DIR/on-dispatch"
 out_b=$(REPO_TYPE=docker IMAGE=o/app barrier)
@@ -2091,7 +2096,8 @@ out_b=$(REPO_TYPE=ts barrier)
 chk "B11 the same tag once npm serves it releases the hold" "$out_b|$(dispatched)" "|0"
 rm "$GH_DIR/statuses-$DT.json"
 out_b=$(REPO_TYPE=ts barrier)
-chk "B36 as does a TS root's tag npm serves, until its receipt is gone" "$out_b|$(dispatched)" "EXIT=1|1"
+chk "B36 as does a TS root's tag npm serves, until its receipt is gone" "$out_b|$(dispatched)" "|0"
+chk_has "B36 which is no build past the promoted commit" "$(cat "$WORK/barrier.log")" "lane .: dev holds no build past the promoted commit"
 rm -f "$GH_DIR/on-dispatch" "$W/package.json"
 
 # One read budget covers every wait: what the dev runs spent, the renumber run's wait cannot.
@@ -2265,6 +2271,26 @@ out_b=$(barrier)
 untag v1.2.0-dev.1
 chk "B23 a dispatched dev release of the head that fails holds the publish" "$out_b|$(dispatched)|$(rebuilt)" "EXIT=1|0|1"
 chk_has "B23 naming that run" "$(cat "$WORK/barrier.log")" "of dev's head $DEVH concluded 'failure', so the stable publish stays held"
+
+# An unproven image claim at dev's head whose push run failed is no build to
+# renumber: the dev release the barrier dispatches for the head finishes it.
+git -C "$O" tag v1.2.0-dev.1 "$DEVH"
+head_runs "65 completed failure push 2026-10-01T12:02:00Z"
+make_hook success ""
+{
+  echo '#!/usr/bin/env bash'
+  rebuild_run success
+  echo "echo '[{\"context\":\"release/tag/v1.2.0-dev.1\",\"state\":\"success\"}]' >\"$GH_DIR/statuses-$DEVH.json\""
+} >"$GH_DIR/on-rebuild"
+out_b=$(REPO_TYPE=docker IMAGE=o/app barrier)
+chk "B37 an unproven claim at dev's head past the promoted commit gets a dev release dispatched, not a renumber" \
+  "$out_b|$(dispatched)|$(rebuilt)" "|0|1"
+chk_has "B37 first finding no build to renumber" "$(cat "$WORK/barrier.log")" "lane .: dev holds no build past the promoted commit"
+chk_has "B37 then the finished claim ranking dev above" "$(cat "$WORK/barrier.log")" "lane .: dev already ranks above v1.1.0"
+rm -f "$GH_DIR/statuses-$DEVH.json" "$GH_DIR/on-dispatch"
+untag v1.2.0-dev.1
+make_rebuild failure
+head_runs "$CANCELLED" "$RENUMBER"
 
 # The dispatch answers with its own run, and another dispatch of the workflow
 # (a renumber, a manual run) can replace it in dev's concurrency group.
@@ -2463,6 +2489,23 @@ chk "U44 reusing the tag and recording its receipt" \
   "$(grep -c '^api repos/o/app/git/refs ' "$GH_LOG" || true)|$(grep -c "statuses/$D3 -f state=success -f context=release/tag/v1.2.0-dev.1 " "$GH_LOG")" "0|1"
 git -C "$W" tag -d v1.2.0-dev.1 >/dev/null
 rm "$GH_DIR/tag-v1.2.0-dev.1"
+# A build whose only dev tag is the version is a dev release run's own claim:
+# renumber would prove an image nobody signed, so it refuses.
+U_HEAD=$(git -C "$W" rev-parse HEAD)
+UC=$(git -C "$W" commit-tree "$U_HEAD^{tree}" -p "$U_HEAD" -m "fix: a claim whose run failed")
+git -C "$W" checkout -q --detach "$UC"
+git -C "$W" tag v1.3.0-dev.1 "$UC"
+echo "$UC" >"$GH_DIR/tag-v1.3.0-dev.1"
+echo "$DIGEST" >"$CURL_DIR/manifest-sha-$UC"
+[ "$(git -C "$W" tag --points-at "$UC" | wc -l)" = 1 ] || fail "U47 needs a build carrying one dev tag"
+out_u=$(renumber docker v1.3.0-dev.1)
+chk "U47 a renumber of a dev release run's unproven claim refuses, re-tagging nothing and posting no receipt" \
+  "$out_u|$(wc -l <"$DOCKER_LOG")|$(grep -c -E 'git/refs|/statuses/' "$GH_LOG" || true)" "EXIT=1|0|0"
+chk_has "U47 naming the claim and the remedy" "$(cat "$WORK/renumber.log")" \
+  "lane .: v1.3.0-dev.1 at $UC is a dev release run's unfinished claim, so it is not renumbered. Rerun all jobs of that run, then rerun this renumber."
+git -C "$W" tag -d v1.3.0-dev.1 >/dev/null
+rm "$GH_DIR/tag-v1.3.0-dev.1" "$CURL_DIR/manifest-sha-$UC"
+git -C "$W" checkout -q --detach "$U_HEAD"
 DOCKER_DIGEST="sha256:$(printf 'c%.0s' $(seq 64))"
 DOCKER_DIGEST_U3=$DOCKER_DIGEST
 export DOCKER_DIGEST
@@ -2651,9 +2694,14 @@ chk "U19 a TS root hands its renumber on, naming the build" "$(handoff ts v1.2.0
 chk "U19 publishing and tagging nothing itself" "$(wc -l <"$GH_LOG")" "0"
 chk "U19 a build already ranking there hands nothing on" "$(handoff ts v1.1.0-dev.2)" ""
 # compute.sh answers the build's own newest tag only for a claim never proven
-# published, so a fresh renumber resumes that version.
-chk "U46 a version that is the build's own newest tag is handed on, resuming its claim" \
+# published, so a fresh renumber resumes that version when it is a renumber's
+# own: the build also carries the lower number it lifts.
+chk "U47 a version that is the build's only dev tag, a dev release run's claim, is not handed on" \
+  "$(handoff ts v1.1.0-dev.3)" "EXIT=1"
+git -C "$W" tag v1.0.99-dev.1 "$UF"
+chk "U46 a version that is the build's own newest tag above a lower one is handed on, resuming its claim" \
   "$(handoff ts v1.1.0-dev.3)" "version=v1.1.0-dev.3 commit=$UF "
+git -C "$W" tag -d v1.0.99-dev.1 >/dev/null
 chk "U19 every lane hands its renumber on" "$(handoff go v1.2.0-dev.8)" "version=v1.2.0-dev.8 commit=$UF "
 chk "U19 a stable version is refused" "$(handoff ts v1.2.0)" "EXIT=1"
 # The tagging job reads what a job that ran the config wrote, as data.
