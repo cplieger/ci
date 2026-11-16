@@ -448,6 +448,7 @@ chk "D-P13 manade's four runner images carry GitHub's runner and Docker's binari
 BIN="$WORK/bin"
 mkdir -p "$BIN"
 export BUILT="$WORK/built" PKGS="$WORK/pkgs" TAGS="$WORK/tags" CURL_DOWN="" TOKEN_STATUS=200
+export NPM_LOG="$WORK/npm.log" NPM_DIST_DEV="" NPM_DOWN=""
 : >"$PKGS"
 : >"$TAGS"
 cat >"$BIN/curl" <<'SH'
@@ -490,6 +491,17 @@ answer() { # <status> [digest]
   exit 0
 }
 case "$URL" in
+  https://registry.npmjs.org/*)
+    # npm's abbreviated packument: NPM_DIST_DEV is its dev dist-tag, absent
+    # a 404; NPM_DOWN answers nothing. NPM_LOG records each read.
+    printf '%s\n' "$URL" >>"$NPM_LOG"
+    [ -z "${NPM_DOWN:-}" ] || exit 7
+    status=404 body='{"error":"Not found"}'
+    [ -z "${NPM_DIST_DEV:-}" ] || status=200 body="{\"dist-tags\":{\"dev\":\"${NPM_DIST_DEV}\"}}"
+    if [ -n "$OUT" ]; then printf '%s\n' "$body" >"$OUT"; else printf '%s\n' "$body"; fi
+    [ "$CODE" = 0 ] || printf '%s' "$status"
+    exit 0
+    ;;
   https://github.com/orhun/*)
     : >"$OUT"
     exit 0
@@ -2320,7 +2332,11 @@ run_step_in() { # <script in cwd>: run_step's environment, in the current direct
 SUBREPO="$WORK/sub-handoff"
 rm -rf "$SUBREPO"
 git init -q -b dev "$SUBREPO"
-git -C "$SUBREPO" -c user.email=p@ci.local -c user.name=p -c commit.gpgsign=false commit -q --allow-empty -m "feat: root"
+mkdir -p "$SUBREPO/web"
+printf 'module example.com/app\n' >"$SUBREPO/go.mod"
+printf '{"name":"@cplieger/web","version":"0.0.0"}\n' >"$SUBREPO/web/package.json"
+git -C "$SUBREPO" add go.mod web/package.json
+git -C "$SUBREPO" -c user.email=p@ci.local -c user.name=p -c commit.gpgsign=false commit -q -m "feat(web): root"
 SUB_SHA=$(git -C "$SUBREPO" rev-parse HEAD)
 sub_handoff() { # <head> -> runs the subpackage handoff in SUBREPO at SUB_SHA
   (cd "$SUBREPO" && cp "$WORK/sub-handoff.sh" ./.h.sh && GH_HEAD="$1" GITHUB_SHA="$SUB_SHA" VERSION=v1.3.0-dev.4 CHANNEL=dev DIR=web run_step_in .h.sh)
@@ -2333,24 +2349,43 @@ chk "D-T23 a subpackage with no root tag and the branch still here publishes" "$
 out_h=$(sub_handoff "")
 chk "D-T28 a subpackage with no root tag whose branch head cannot be read fails, publishing nothing" \
   "$(printf '%s' "$out_h" | sed -n 's/^EXIT=//p')|$(out handoff)" "1|"
-chk_has "D-T28 and says why" "$out_h" "cannot be told (dev's head or its tags are unreadable), so web is not published"
+chk_has "D-T28 and says why" "$out_h" "cannot be told (dev's head, its tags or npm are unreadable), so web is not published"
 git -C "$SUBREPO" tag v1.3.0-dev.4
 git -C "$SUBREPO" update-ref refs/remotes/origin/dev "$SUB_SHA"
 sub_handoff "$C_DOCS" >/dev/null
 chk "D-T24 a subpackage whose root tag is here publishes though the branch moved" "$(out handoff)" "false"
-# The root's claim here reused under a later dev tag on dev publishes nothing
-# (tag-ref.sh claim_version), so the subpackage hands off with it.
+# A Go root tagged here, then a later dev tag on a child that leaves web alone:
+# the later run's range starts at this tag, so web publishes here, a rerun
+# included, until npm's dev names a later build (tag-ref.sh package_handed_off).
 git -C "$SUBREPO" -c user.email=p@ci.local -c user.name=p -c commit.gpgsign=false commit -q --allow-empty -m "fix: later"
 git -C "$SUBREPO" tag v1.3.0-dev.5
 git -C "$SUBREPO" update-ref refs/remotes/origin/dev HEAD
 git -C "$SUBREPO" checkout -q --detach "$SUB_SHA"
+: >"$NPM_LOG"
+sub_handoff "$C_DOCS" >/dev/null
+chk "D-T31 a subpackage tagged here under a later dev tag publishes while npm has no dev build" \
+  "$(out handoff)|$(cat "$NPM_LOG")" "false|https://registry.npmjs.org/@cplieger/web"
+for NPM_DIST_DEV in 1.3.0-dev.3 1.3.0-dev.4; do
+  sub_handoff "$C_DOCS" >/dev/null
+  chk "D-T31 and while npm's dev is $NPM_DIST_DEV, not above v1.3.0-dev.4" "$(out handoff)" "false"
+done
+NPM_DIST_DEV=1.3.0-dev.5
 out_h=$(sub_handoff "$C_DOCS")
-chk "D-T31 a subpackage whose root claim a later dev tag supersedes hands off with it" "$(out handoff)" "true"
-chk_has "D-T31 naming that tag" "$out_h" "was handed off to v1.3.0-dev.5 at"
+chk "D-T36 one npm's dev already names a later build of is not published here" "$(out handoff)" "true"
+chk_has "D-T36 naming that build and the later tag" "$out_h" \
+  "::warning::@cplieger/web is not published at v1.3.0-dev.4: npm's dev dist-tag already names 1.3.0-dev.5, and v1.3.0-dev.5 at $(git -C "$SUBREPO" rev-parse v1.3.0-dev.5) holds $SUB_SHA."
+NPM_DIST_DEV="" NPM_DOWN=1
+out_h=$(sub_handoff "$C_DOCS")
+chk "D-T36 one whose npm cannot be read fails, publishing nothing" \
+  "$(printf '%s' "$out_h" | sed -n 's/^EXIT=//p')|$(out handoff)" "1|"
+NPM_DOWN=""
 LANEREPO="$WORK/lane-handoff"
 rm -rf "$LANEREPO"
 git init -q -b dev "$LANEREPO"
-git -C "$LANEREPO" -c user.email=p@ci.local -c user.name=p -c commit.gpgsign=false commit -q --allow-empty -m "feat: lane"
+mkdir -p "$LANEREPO/yamlenv/web"
+printf '{"name":"@cplieger/yamlenv-web","version":"0.0.0"}\n' >"$LANEREPO/yamlenv/web/package.json"
+git -C "$LANEREPO" add yamlenv/web/package.json
+git -C "$LANEREPO" -c user.email=p@ci.local -c user.name=p -c commit.gpgsign=false commit -q -m "feat(yamlenv): web half"
 LANE_SHA=$(git -C "$LANEREPO" rev-parse HEAD)
 lanetag() { # <head> -> runs the lane-tag lookup in LANEREPO
   (cd "$LANEREPO" && cp "$WORK/lanetag.sh" ./.l.sh && GH_HEAD="$1" GITHUB_SHA="$LANE_SHA" LANE=yamlenv CHANNEL=dev run_step_in .l.sh)
@@ -2363,22 +2398,37 @@ git -C "$LANEREPO" tag yamlenv/v1.1.0-dev.2
 out_h=$(lanetag "$C_DOCS")
 chk "D-T35 a lane's tag here whose branch git cannot walk fails, publishing nothing" \
   "$(printf '%s' "$out_h" | sed -n 's/^EXIT=//p')|$(out tag)" "1|"
-chk_has "D-T35 and says why" "$out_h" "::error::git cannot tell whether a later dev tag of lane yamlenv on dev holds $LANE_SHA"
+chk_has "D-T35 and says why" "$out_h" "::error::whether this run publishes lane yamlenv's TS half at yamlenv/v1.1.0-dev.2 cannot be told"
 git -C "$LANEREPO" update-ref refs/remotes/origin/dev "$LANE_SHA"
 lanetag "$C_DOCS" >/dev/null
 chk "D-T27 a lane's tag here is its half's version" "$(out tag)" "yamlenv/v1.1.0-dev.2"
-# A later dev tag of the lane on dev ships this half too (tag-ref.sh
-# later_dev_tag): publishing it again would move npm's dev back to this tree.
+# A later dev tag of the lane on a child that leaves yamlenv/web alone: its
+# range starts at this tag, so the half publishes here until npm's dev names a
+# later build (tag-ref.sh package_handed_off).
 LANE_LATER=$(git -C "$LANEREPO" commit-tree "${LANE_SHA}^{tree}" -p "$LANE_SHA" -m "fix: later")
 git -C "$LANEREPO" update-ref refs/remotes/origin/dev "$LANE_LATER"
 git -C "$LANEREPO" tag v1.1.0-dev.3 "$LANE_LATER"
 lanetag "$C_DOCS" >/dev/null
 chk "D-T34 a lane's tag here beside a later root dev tag is still its half's version" "$(out tag)" "yamlenv/v1.1.0-dev.2"
 git -C "$LANEREPO" tag yamlenv/v1.1.0-dev.3 "$LANE_LATER"
+: >"$NPM_LOG"
+lanetag "$C_DOCS" >/dev/null
+chk "D-T34 a lane tag here under a later lane dev tag still publishes its half while npm has no dev build" \
+  "$(out tag)|$(cat "$NPM_LOG")" "yamlenv/v1.1.0-dev.2|https://registry.npmjs.org/@cplieger/yamlenv-web"
+NPM_DIST_DEV=1.1.0-dev.1
+lanetag "$C_DOCS" >/dev/null
+chk "D-T34 and while npm's dev is below it" "$(out tag)" "yamlenv/v1.1.0-dev.2"
+NPM_DIST_DEV=1.1.0-dev.3
 out_h=$(lanetag "$C_DOCS")
-chk "D-T34 one a later dev tag of the lane supersedes hands its half off green" \
+chk "D-T34 one npm's dev already names a later build of skips its half green" \
   "$(out tag)|$(printf '%s' "$out_h" | grep -c '^EXIT=' || true)" "|0"
-chk_has "D-T34 naming that tag" "$out_h" "yamlenv/v1.1.0-dev.2 at $LANE_SHA was handed off to yamlenv/v1.1.0-dev.3 at $LANE_LATER"
+chk_has "D-T34 naming that build and the later tag" "$out_h" \
+  "::warning::@cplieger/yamlenv-web is not published at yamlenv/v1.1.0-dev.2: npm's dev dist-tag already names 1.1.0-dev.3, and yamlenv/v1.1.0-dev.3 at $LANE_LATER holds $LANE_SHA."
+NPM_DIST_DEV="" NPM_DOWN=1
+out_h=$(lanetag "$C_DOCS")
+chk "D-T34 one whose npm cannot be read fails, publishing nothing" \
+  "$(printf '%s' "$out_h" | sed -n 's/^EXIT=//p')|$(out tag)" "1|"
+NPM_DOWN=""
 
 # ── The image lane's completion receipt ──────────────────────────────────────
 : >"$GH_LOG"

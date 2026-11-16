@@ -228,7 +228,7 @@ class TagRefOrHandoff(RunsTagRef, unittest.TestCase):
 class ClaimUnderALaterDevTag(unittest.TestCase):
     """claim_version and root_handed_off on one checkout: dev holds A then B, the run is at A."""
 
-    def run_claim(self, tags_at_b=(), tags_at_a=(), version='v1.0.0-dev.2'):
+    def run_claim(self, tags_at_b=(), tags_at_a=(), version='v1.0.0-dev.2', claim_rc=0):
         tmp = pathlib.Path(tempfile.mkdtemp(prefix='claim-'))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         repo = tmp / 'repo'
@@ -258,7 +258,7 @@ class ClaimUnderALaterDevTag(unittest.TestCase):
             'set -euo pipefail\n'
             f'. "{SCRIPTS}/retry.sh"\n'
             f'. "{SCRIPTS}/tag-ref.sh"\n'
-            f'claim_version o/app dev {version} {a} dev\n'
+            f'claim_version o/app dev {version} {a} dev || exit 3\n'
             f'[ "$TAG_CREATED" != true ] || git tag {version} {a}\n'
             'rc=0\n'
             f'root_handed_off o/app dev {version} {a} dev >/dev/null || rc=$?\n'
@@ -275,12 +275,14 @@ class ClaimUnderALaterDevTag(unittest.TestCase):
         res = subprocess.run(
             ['bash', '-c', script], cwd=repo, env=env, capture_output=True, text=True, check=False
         )
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(res.returncode, 3 if claim_rc else 0, res.stdout + res.stderr)
+        self.log = res.stdout + res.stderr
         calls = json.loads(state.read_text())['calls']
         self.creates = [c for c in calls if c[:2] == ['api', 'repos/o/app/git/refs']]
         self.posts = [c for c in calls if c[:3] == ['api', '-X', 'POST']]
-        self.output = (tmp / 'out').read_text()
-        return res.stdout.splitlines()[-1], a, b
+        out = tmp / 'out'
+        self.output = out.read_text() if out.exists() else ''
+        return (res.stdout.splitlines() or [''])[-1], a, b
 
     def handoff_descriptions(self, version):
         return [
@@ -326,6 +328,20 @@ class ClaimUnderALaterDevTag(unittest.TestCase):
         result, _, _ = self.run_claim(tags_at_b=later, version='web/v1.0.0-dev.2')
         self.assertTrue(result.startswith('claimed=true '), result)
         self.assertEqual(len(self.creates), 1, self.creates)
+
+    def test_a_version_held_at_another_commit_is_refused_whatever_later_tag_exists(self):
+        _, a, b = self.run_claim(tags_at_b=['v1.0.0-dev.2', 'v1.0.0-dev.3'], claim_rc=1)
+        self.assertIn(f'Tag v1.0.0-dev.2 exists at {b}, not {a}', self.log)
+        self.assertEqual((self.creates, self.posts, self.output), ([], [], ''))
+
+    def test_the_handoff_names_the_highest_of_two_dev_tags_on_one_commit(self):
+        _, _, b = self.run_claim(
+            tags_at_b=['v1.9.0-dev.4', 'v1.10.0-dev.1'], version='v1.9.0-dev.3'
+        )
+        self.assertEqual(
+            self.handoff_descriptions('v1.9.0-dev.3'),
+            [f"v1.10.0-dev.1 at {b} releases this commit's changes"],
+        )
 
     def test_a_root_claim_ignores_a_later_lane_dev_tag(self):
         result, _, _ = self.run_claim(tags_at_b=['web/v1.0.0-dev.3'])

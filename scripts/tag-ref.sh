@@ -91,7 +91,9 @@ later_dev_tag() {
   local -A at=()
   local name obj peeled refs revs c lane=""
   [[ $2 != */* ]] || lane=${2%/*}/
-  refs=$(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)') || return 1
+  # Version order, so a commit carrying two of the lane's dev tags (a renumbered
+  # build) maps to the higher one.
+  refs=$(git for-each-ref --sort=v:refname refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)') || return 1
   while read -r name obj peeled; do
     if [[ $name == "$lane"* && ${name#"$lane"} =~ ^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$ ]] && [ "$name" != "$2" ]; then
       at[${peeled:-$obj}]=$name
@@ -106,17 +108,19 @@ later_dev_tag() {
   done <<<"$revs"
 }
 
-# claim_version <owner/repo> <branch> <tag> <commit> <channel>: every release
-# tag's claim, before the version's first write. Sets CLAIMED, and claimed= in
+# claim_version <owner/repo> <branch> <tag> <commit> <channel>: a release job's
+# claim, before the version's first write. Sets CLAIMED, and claimed= in
 # GITHUB_OUTPUT: true once <tag> is at <commit>, false on a handoff; returns 1
 # when the version cannot be claimed. On dev, a later dev tag of the lane on a
 # descendant already ships this commit's changes, so the claim hands off
 # before any create: a new tag would rank this older tree above it, and a
-# reused one would move the dev channel back.
+# reused one would move the dev channel back. <tag> held at another commit
+# is refused whatever later tag exists.
 claim_version() {
-  local rc=0 later
+  local rc=0 later at
   CLAIMED=false TAG_CREATED=false
-  if [ "$5" = dev ]; then
+  at=$(git rev-list -n1 "$3" 2>/dev/null || true)
+  if [ "$5" = dev ] && { [ -z "$at" ] || [ "$at" = "$4" ]; }; then
     if ! later=$(later_dev_tag "$2" "$3" "$4"); then
       echo "::error::git cannot tell whether a later dev tag on $2 holds $4, so $3 is not claimed."
       return 1
@@ -137,22 +141,76 @@ claim_version() {
   echo "claimed=$CLAIMED" >>"${GITHUB_OUTPUT:?}"
 }
 
+# untagged_handed_off <owner/repo> <branch> <tag> <commit>: for <tag> not at
+# <commit>, 0 when the branch moved past it (warned here), so the run on the
+# new head releases it; 1 when <commit> is still the head, 2 when that cannot
+# be told.
+untagged_handed_off() {
+  local head rc=0
+  head=$(branch_moved_past "$1" "$2" "$4") || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  echo "::warning::$3 is not tagged at $4 and $2 advanced past it (now ${head}), so the run on the new head releases it."
+}
+
 # root_handed_off <owner/repo> <branch> <version> <commit> <channel>: for a job
 # after the root's claim, 0 when that claim handed <version> off (warned
-# here): no tag at <commit> and the branch moved past it, or a later dev tag
-# over the one at <commit>. 1 when the root claimed it at <commit>, 2 when
-# that cannot be told.
+# here), as claim_version decides: untagged, or a later dev tag over the one
+# at <commit>. 1 when the root claimed it at <commit>, 2 when that cannot be
+# told.
 root_handed_off() {
-  local head later rc=0
+  local later
   if [ "$(git rev-list -n1 "$3" 2>/dev/null || true)" != "$4" ]; then
-    head=$(branch_moved_past "$1" "$2" "$4") || rc=$?
-    [ "$rc" -eq 0 ] || return "$rc"
-    echo "::warning::$3 is not tagged at $4 and $2 advanced past it (now ${head}), so the run on the new head releases it."
-    return 0
+    untagged_handed_off "$1" "$2" "$3" "$4"
+    return
   fi
   [ "$5" = dev ] || return 1
   later=$(later_dev_tag "$2" "$3" "$4") || return 2
   [ -n "$later" ] || return 1
   echo "::warning::$3 at $4 was handed off to ${later% *} at ${later#* }, which ships its changes."
   return 0
+}
+
+# package_handed_off <owner/repo> <branch> <tag> <commit> <channel> <package.json>:
+# for a package published at <tag>'s version after its root or lane claim, 0
+# when it is not published here (warned): <tag> handed off untagged, or on
+# dev a later dev tag of the lane exists and npm's dev dist-tag ranks above
+# the version. A later tag alone is not enough, since its range starts at
+# <tag>; the dev channel is linear, so an npm dev build above the version
+# comes from a descendant. 1 when it is published here, 2 when that cannot be
+# told.
+package_handed_off() {
+  local later dev ver=${3##*/}
+  if [ "$(git rev-list -n1 "$3" 2>/dev/null || true)" != "$4" ]; then
+    untagged_handed_off "$1" "$2" "$3" "$4"
+    return
+  fi
+  [ "$5" = dev ] || return 1
+  later=$(later_dev_tag "$2" "$3" "$4") || return 2
+  [ -n "$later" ] || return 1
+  dev=$(npm_dev_above "$6" "${ver#v}") || return
+  echo "::warning::$(jq -r .name "$6") is not published at $3: npm's dev dist-tag already names ${dev}, and ${later% *} at ${later#* } holds $4."
+}
+
+# npm_dev_above <package.json> <X.Y.Z-dev.N>: prints npm's dev dist-tag of the
+# package and returns 0 when it ranks above the version; 1 when it is absent
+# or not above it, or the package is private (a dry run, on no registry); 2
+# when npm cannot be read. Equal is this version's own build, which a publish
+# skips as published and verify-publish reads back.
+npm_dev_above() {
+  local pkg body code dev=""
+  [ "$(jq -r '.private // false' "$1" 2>/dev/null)" != true ] || return 1
+  pkg=$(jq -er .name "$1") || return 2
+  body=$(mktemp)
+  code=$(curl -sS --retry 3 --connect-timeout 10 --max-time 30 -H 'Accept: application/vnd.npm.install-v1+json' \
+    -o "$body" -w '%{http_code}' "https://registry.npmjs.org/${pkg}") || code=000
+  if [ "$code" = 200 ]; then
+    dev=$(jq -r '."dist-tags".dev // ""' "$body") || code=000
+  fi
+  rm -f "$body"
+  case "$code" in
+    200 | 404) ;;
+    *) return 2 ;;
+  esac
+  [ -n "$dev" ] && [ "$dev" != "$2" ] && [ "$(printf '%s\n%s\n' "$2" "$dev" | sort -V | tail -n1)" = "$dev" ] || return 1
+  printf '%s' "$dev"
 }

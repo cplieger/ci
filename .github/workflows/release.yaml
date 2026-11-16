@@ -2205,10 +2205,8 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
-      # A subpackage publishes at the root version, so it hands off with the
-      # root (tag-ref.sh root_handed_off): the version that releases the root's
-      # changes publishes it too. A root with no tag and the branch still here
-      # publishes as before.
+      # A subpackage publishes at the root version, so tag-ref.sh
+      # package_handed_off decides whether this run publishes it.
       - name: Hand off with the root tag
         id: handoff
         env:
@@ -2221,12 +2219,12 @@ jobs:
           set -euo pipefail
           . "$CI_TOOLS/tag-ref.sh"
           rc=0
-          root_handed_off "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL" || rc=$?
+          package_handed_off "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL" "$DIR/package.json" || rc=$?
           case "$rc" in
             0) echo "handoff=true" >>"$GITHUB_OUTPUT" ;;
             1) echo "handoff=false" >>"$GITHUB_OUTPUT" ;;
             *)
-              echo "::error::whether the root handed ${VERSION} off cannot be told (${GITHUB_REF_NAME}'s head or its tags are unreadable), so ${DIR} is not published."
+              echo "::error::whether this run publishes ${DIR} at ${VERSION} cannot be told (${GITHUB_REF_NAME}'s head, its tags or npm are unreadable), so ${DIR} is not published."
               exit 1
               ;;
           esac
@@ -2489,8 +2487,8 @@ jobs:
 
       # The lane's tag at HEAD is the version: a matrix job's outputs are
       # last-writer-wins across its legs, so go-nested cannot hand it on. A
-      # lane whose claim handed off (tag-ref.sh claim_version) leaves none,
-      # and a later dev tag of the lane publishes the half at its own version.
+      # lane whose claim handed off (tag-ref.sh claim_version) leaves none;
+      # tag-ref.sh package_handed_off decides whether a tag here publishes.
       - name: Find the lane's tag
         id: lanetag
         env:
@@ -2516,17 +2514,16 @@ jobs:
             echo "::error::lane ${LANE} has no ${CHANNEL} tag at $(git rev-parse HEAD), though go-nested released it. Its TS half is not published without one."
             exit 1
           fi
-          if [ "$CHANNEL" != stable ]; then
-            if ! later=$(later_dev_tag "$GITHUB_REF_NAME" "$tag" "$GITHUB_SHA"); then
-              echo "::error::git cannot tell whether a later dev tag of lane ${LANE} on ${GITHUB_REF_NAME} holds ${GITHUB_SHA}, so its TS half is not published."
+          rc=0
+          package_handed_off "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$tag" "$GITHUB_SHA" "$CHANNEL" "$LANE/web/package.json" || rc=$?
+          case "$rc" in
+            0) tag="" ;;
+            1) ;;
+            *)
+              echo "::error::whether this run publishes lane ${LANE}'s TS half at ${tag} cannot be told (git cannot walk ${GITHUB_REF_NAME}, or npm is unreadable), so it is not published."
               exit 1
-            fi
-            if [ -n "$later" ]; then
-              echo "::warning::${tag} at ${GITHUB_SHA} was handed off to ${later% *} at ${later#* }, which ships its TS half."
-              echo "tag=" >>"$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
+              ;;
+          esac
           echo "tag=${tag}" >>"$GITHUB_OUTPUT"
 
       - name: Publish the lane's TS half
@@ -2672,7 +2669,9 @@ jobs:
 
           # A root job that handed its version off (tag-ref.sh root_handed_off)
           # succeeded publishing nothing; the version that releases its changes
-          # is verified by its own run. When that cannot be told, all is read.
+          # is verified by its own run. A subpackage or half is read back
+          # unless package_handed_off skipped its publish. When that cannot be
+          # told, all is read.
           . "$CI_TOOLS/tag-ref.sh"
           root=true
           if [ -n "$VERSION" ]; then
@@ -2686,9 +2685,13 @@ jobs:
           if [ "$root" = true ] && [ "$TS_RESULT" = "success" ]; then
             probe_ts package.json
           fi
-          if [ "$root" = true ] && [ "$SUBPACKAGE_RESULT" = "success" ]; then
+          if [ -n "$VERSION" ] && [ "$SUBPACKAGE_RESULT" = "success" ]; then
             while IFS= read -r d; do
               [ -z "$d" ] && continue
+              if package_handed_off "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL" "$d/package.json"; then
+                echo "skip: ${d} at ${VERSION} is not published by this run"
+                continue
+              fi
               probe_ts "$d/package.json"
             done < <(jq -r '.[]' <<<"$SUBPACKAGES_JSON")
           fi
@@ -2697,9 +2700,8 @@ jobs:
               [ -z "$d" ] && continue
               while IFS= read -r tag; do
                 [ -z "$tag" ] && continue
-                # A half handed off to a later dev tag of its lane (lane-halves).
-                if [ "$CHANNEL" != stable ] && later=$(later_dev_tag "$GITHUB_REF_NAME" "$tag" "$GITHUB_SHA") && [ -n "$later" ]; then
-                  echo "skip: ${d}/web at ${tag} was handed off to ${later% *} at ${later#* }"
+                if package_handed_off "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$tag" "$GITHUB_SHA" "$CHANNEL" "$d/web/package.json"; then
+                  echo "skip: ${d}/web at ${tag} is not published by this run"
                   continue
                 fi
                 probe_ts "$d/web/package.json" "${tag#"$d"/v}"
