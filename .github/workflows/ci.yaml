@@ -62,8 +62,6 @@ jobs:
           # tip to decide whether any code (non-docs) files changed.
           fetch-depth: 0
 
-      # The go-os matcher detect runs, from this workflow's own commit. Its binary
-      # is cached by its source, so Go is set up only to rebuild it.
       - name: Check out the ci source
         if: ${{ hashFiles('**/go.mod') != '' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -252,38 +250,42 @@ jobs:
               go_work_dirs=$(jq -cR '[., inputs | select(. != "")]' <<< "$mod_dirs")
             fi
 
-            # A module tracking a Go file built for windows or darwin is also tested
-            # on that OS's runner, because the Linux go-ci leg may compile none of it.
-            # GO_OS_FILES (scripts/go-os-files) applies go/build's file-name and
-            # build-constraint rules. A file belongs to the deepest module folder
-            # above it, and Go skips it when a name below that folder starts with _ or .
-            # Captured in a variable, so errexit sees a matcher failure.
+            # A module tracking a Go file that Go builds for windows or darwin, and that
+            # linux, darwin or windows excludes, is also tested on that OS's runner:
+            # go-ci vets the Linux GOOS only. GO_OS_FILES (scripts/go-os-files) owns
+            # the rule. A file belongs to the deepest module folder above it, and Go
+            # skips it when a name below that folder starts with _ or ., so only the
+            # files Go reads reach the matcher, which fails on one it cannot parse.
             # scripts/test-lane-semantics.sh runs this block, to the matrix dedup.
+            go_os_inputs() {
+              git -c core.quotePath=false ls-files '*.go' | MOD_DIRS="$mod_dirs" awk '
+                BEGIN { n = split(ENVIRON["MOD_DIRS"], m, "\n"); for (i = 1; i <= n; i++) if (m[i] != "") mod[m[i]] = 1 }
+                /(^|\/)(node_modules|vendor|testdata)\// { next }
+                {
+                  d = $0
+                  do {
+                    if (index(d, "/")) sub(/\/[^\/]*$/, "", d); else d = "."
+                  } while (d != "." && !(d in mod))
+                  if (!(d in mod)) next
+                  rel = d == "." ? $0 : substr($0, length(d) + 2)
+                  if (("/" rel) ~ /\/[_.]/) next
+                  printf "%s\t%s\n", d, $0
+                }'
+            }
             os_files=""
             if [ -n "$mod_dirs" ]; then
               if [ ! -x "${GO_OS_FILES:-}" ]; then
                 echo "::error::the go-os file matcher '${GO_OS_FILES:-}' was not built"
                 exit 1
               fi
-              os_files=$(git ls-files '*.go' | { grep -Ev '(^|/)(node_modules|vendor|testdata)/' || true; } \
-                | "$GO_OS_FILES")
+              os_files=$(go_os_inputs | "$GO_OS_FILES")
             fi
-            while IFS=$'\t' read -r os f; do
+            while IFS=$'\t' read -r os d f; do
               [ -z "$f" ] && continue
               case "$os" in
                 windows) runner=windows-latest ;;
                 *) runner=macos-latest ;;
               esac
-              d=$(dirname -- "$f")
-              while [ "$d" != . ] && ! grep -qxF -- "$d" <<< "$mod_dirs"; do
-                d=$(dirname -- "$d")
-              done
-              grep -qxF -- "$d" <<< "$mod_dirs" || continue
-              rel=$f
-              [ "$d" = . ] || rel=${f#"$d"/}
-              if [[ /$rel =~ /[_.] ]]; then
-                continue
-              fi
               go_os_matrix=$(jq -c --arg d "$d" --arg r "$runner" '. + [{dir: $d, runner: $r}]' <<< "$go_os_matrix")
             done <<< "$os_files"
             go_os_matrix=$(jq -c 'unique_by([.dir, .runner])' <<< "$go_os_matrix")
