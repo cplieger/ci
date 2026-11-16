@@ -276,14 +276,17 @@ chk "L-W3 a folder with neither package.json nor jsr.json is no frontend" \
   "$(web_probe "$W")" "web_dir= run_web=false"
 
 # ── go-os runner detection states ────────────────────────────────────────────
-# Expected rows follow Go's build constraints (go help buildconstraint): a file
-# name whose part before the first dot ends _GOOS, _GOOS_GOARCH with a known
-# GOARCH, or either plus _test, or a //go:build line above the package clause
-# naming the OS outside an odd number of negations; Go ignores a name starting
-# with _ or . below the module folder (go help packages). mod_dirs is MIRRORED from
-# ci.yaml's detect (nested validation discovery plus the root go.mod).
+# Expected rows follow Go's build constraints (go help buildconstraint): a module
+# gets an OS's leg for a file Go builds for that OS and not for linux at the same
+# GOARCH, amd64 or arm64; Go ignores a name starting with _ or . below the module
+# folder (go help packages). mod_dirs is MIRRORED from ci.yaml's detect (nested
+# validation discovery plus the root go.mod).
 # The block runs in a fresh bash with the runner's options (bash -eo pipefail),
 # because a command substitution here would run it with errexit off.
+command -v go >/dev/null || fail "no go on PATH to build scripts/go-os-files"
+GOWORK=off GOFLAGS='' go build -C "$ROOT/scripts/go-os-files" -o "$WORK/go-os-files" . \
+  || fail "scripts/go-os-files does not build"
+export GO_OS_FILES="$WORK/go-os-files"
 cat >"$WORK/go-os-run.sh" <<'SH'
 mod_dirs=$1
 go_os_matrix="[]"
@@ -395,20 +398,64 @@ put tool/u_windows.go "package tool"
 os_rows
 chk "L-O5 a file under no module, or untracked, gains no leg" "$rows" "tool=macos-latest"
 
-# go_build_positive_terms decides polarity alone; each expression pins one rule.
-awk '/^go_build_positive_terms\(\) \{/,/^}/' "$WORK/go-os.sh" >"$WORK/positive-terms.sh"
-[ -s "$WORK/positive-terms.sh" ] || fail "go_build_positive_terms not found in ci.yaml's go-os block"
-# shellcheck source=/dev/null
-. "$WORK/positive-terms.sh"
-positive() { go_build_positive_terms "$1" | sort | paste -sd' ' -; }
-chk "L-P1 a bare term" "$(positive 'windows')" "windows"
-chk "L-P2 a negated term" "$(positive '!windows')" ""
-chk "L-P3 a double negation" "$(positive '!!windows')" "windows"
-chk "L-P4 an alternation" "$(positive 'linux || darwin')" "darwin linux"
-chk "L-P5 a negated group" "$(positive '!(linux || darwin)')" ""
-chk "L-P6 a negation inside a negated group" "$(positive '!(!windows)')" "windows"
-chk "L-P7 nested groups" "$(positive 'a && !(b || !(c && darwin))')" "a c darwin"
-chk "L-P8 a version term" "$(positive 'go1.21 && windows')" "go1.21 windows"
+mkrepo goos-eval
+put go.mod "module github.com/cplieger/eval" "go 1.26.5"
+put main.go "package main"
+case_mod() { # <module dir> <file> <line>...: a module whose one file holds the lines
+  put "$1/go.mod" "module github.com/cplieger/eval/$1" "go 1.26.5"
+  put "$1/$2" "${@:3}"
+}
+case_mod notlinux n.go "//go:build !linux" "" "package p"
+case_mod notlinuxwin n.go "//go:build !linux && !windows" "" "package p"
+case_mod notunix n.go "//go:build !unix" "" "package p"
+case_mod darwinbsd n.go "//go:build darwin || freebsd" "" "package p"
+case_mod linux n.go "//go:build linux" "" "package p"
+case_mod notlinuxorwin n.go "//go:build !(linux || windows)" "" "package p"
+case_mod notunixordarwin n.go "//go:build !unix || darwin" "" "package p"
+case_mod notlinuxorbsd n.go "//go:build !(linux || freebsd)" "" "package p"
+case_mod name n_darwin.go "package p"
+case_mod ignore n.go "//go:build darwin && ignore" "" "package p"
+case_mod fixture testdata/n.go "//go:build !linux" "" "package p"
+case_mod armonly n.go "//go:build arm64" "" "package p"
+case_mod plusbuild n.go "// +build !linux" "" "package p"
+commit_all
+os_rows
+legs() { # <module dir> -> its runners in $rows, space-separated
+  tr ' ' '\n' <<<"$rows" | awk -F= -v d="$1" '$1 == d { print $2 }' | paste -sd' ' -
+}
+chk "L-O7 !linux builds on darwin and windows" "$(legs notlinux)" "macos-latest windows-latest"
+chk "L-O7 !linux && !windows builds on darwin alone" "$(legs notlinuxwin)" "macos-latest"
+chk "L-O7 !unix builds on windows alone, darwin being unix" "$(legs notunix)" "windows-latest"
+chk "L-O7 darwin || freebsd builds on darwin" "$(legs darwinbsd)" "macos-latest"
+chk "L-O7 linux builds on neither" "$(legs linux)" ""
+chk "L-O7 !(linux || windows) builds on darwin alone" "$(legs notlinuxorwin)" "macos-latest"
+chk "L-O7 !unix || darwin builds on darwin and windows" "$(legs notunixordarwin)" "macos-latest windows-latest"
+chk "L-O7 !(linux || freebsd) builds on darwin and windows" "$(legs notlinuxorbsd)" "macos-latest windows-latest"
+chk "L-O7 a _darwin file name builds on darwin" "$(legs name)" "macos-latest"
+chk "L-O7 the ignore tag is never set" "$(legs ignore)" ""
+chk "L-O7 a testdata file is never built" "$(legs fixture)" ""
+chk "L-O7 an arch constraint alone builds on linux at that arch too" "$(legs armonly)" ""
+chk "L-O7 a +build line counts where no //go:build line does" "$(legs plusbuild)" "macos-latest windows-latest"
+chk "L-O7 the root module's file builds everywhere" "$(legs .)" ""
+
+os_status() { # -> the go-os block's exit status for the repo at $R
+  local mod_dirs rc=0
+  mod_dirs=$(cd "$R" && discover_ci | jq -r '.[]')
+  if [ -f "$R/go.mod" ]; then mod_dirs=$(printf '.\n%s' "$mod_dirs"); fi
+  (cd "$R" && bash -eo pipefail "$WORK/go-os-run.sh" "$mod_dirs" "$WORK/go-os.sh") >/dev/null 2>&1 || rc=$?
+  echo "$rc"
+}
+mkrepo goos-unreadable
+put go.mod "module github.com/cplieger/unreadable" "go 1.26.5"
+put main.go "package main"
+printf '//go:build !linux\n\npackage p\0\n' >"$R/bad.go" # go/build refuses a NUL byte
+commit_all
+chk "L-O8 a file go/build cannot read fails detect" "$(os_status)" "1"
+chk "L-O8 and so does a missing matcher in a repo with a module" "$(GO_OS_FILES='' os_status)" "1"
+mkrepo goos-nomodule
+put x_windows.go "package x"
+commit_all
+chk "L-O8 a repo with no module needs no matcher" "$(GO_OS_FILES='' os_status)" "0"
 
 # ── Classification states ────────────────────────────────────────────────────
 # No lane carries a tag yet, so every lane is judged on the root range: its

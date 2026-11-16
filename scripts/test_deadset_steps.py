@@ -195,6 +195,8 @@ class Harness(unittest.TestCase):
             write_exec(self.bin / 'deadset', DEADSET_STUB)
         write_exec(self.bin / 'go', GO_STUB)
         write_exec(self.bin / 'npm', NPM_STUB)
+        # scripts/test-lane-semantics.sh runs the real go-os matcher; no fixture here tracks an OS file.
+        write_exec(self.bin / 'go-os-files', '#!/bin/sh\ncat > /dev/null\n')
 
     def run_body(
         self, body: str, cwd: Path, env: dict[str, str] | None = None, deadset: bool = True
@@ -218,6 +220,7 @@ class Harness(unittest.TestCase):
             'GITHUB_STEP_SUMMARY': str(self.tmp / 'github_summary'),
             'GIT_CONFIG_GLOBAL': '/dev/null',
             'STUB_LOG': str(self.log),
+            'GO_OS_FILES': str(self.bin / 'go-os-files'),
             **(env or {}),
         }
         proc = subprocess.run(
