@@ -70,6 +70,8 @@ NO_TARGET_CODE = {
     ('weekly-bench.yaml', 'aggregate'),
     ('weekly-perf.yaml', 'fanout'),
     ('weekly-perf.yaml', 'publish'),
+    ('weekly-perf-calibrate.yaml', 'fanout'),
+    ('weekly-perf-calibrate.yaml', 'calibrate'),
     ('weekly-links.yaml', 'fanout'),
     ('weekly-links.yaml', 'run'),
 }
@@ -79,6 +81,7 @@ LISTING_WORKFLOWS = [
     'weekly-fuzz.yaml',
     'weekly-gremlins.yaml',
     'weekly-perf.yaml',
+    'weekly-perf-calibrate.yaml',
     'weekly-stryker.yaml',
 ]
 SCHEDULED = ('weekly-*.yaml', 'mutation-*-repo.yaml')
@@ -355,6 +358,7 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
             'weekly-fuzz.yaml',
             'weekly-bench.yaml',
             'weekly-perf.yaml',
+            'weekly-perf-calibrate.yaml',
         ):
             for job, spec in load(name)['jobs'].items():
                 for s in spec.get('steps', []):
@@ -366,7 +370,7 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
                                 self.assertIn(
                                     'timeout 120 git', ' '.join(lines[max(0, i - 1) : i + 1])
                                 )
-        self.assertEqual(seen, 5)
+        self.assertEqual(seen, 6)
 
     def test_the_gremlins_fanout_runs_a_repo_it_cannot_clone_so_its_call_shows_it(self):
         outputs = self.fanout('weekly-gremlins.yaml', noclone=('zpub',))
@@ -474,6 +478,17 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
         self.assertEqual(
             sorted(self.clones), sorted(f'https://github.com/cplieger/{r}.git' for r in PUBLIC)
         )
+
+    def test_the_calibration_fanout_emits_each_enrolled_repository(self):
+        outputs = self.fanout('weekly-perf-calibrate.yaml', perf=('zpub',))
+        self.assertEqual(json.loads(outputs['matrix']), [{'repo': 'zpub'}])
+        self.assertEqual(outputs['unread'], '')
+        jobs = load('weekly-perf-calibrate.yaml')['jobs']
+        self.assertEqual(jobs['calibrate']['if'], "${{ needs.fanout.outputs.matrix != '[]' }}")
+        self.assertEqual(jobs['unread']['if'], "${{ needs.fanout.outputs.unread != '' }}")
+        outputs = self.fanout('weekly-perf-calibrate.yaml', perf=('xmlx',), noclone=('zpub',))
+        self.assertEqual(json.loads(outputs['matrix']), [{'repo': 'xmlx'}])
+        self.assertEqual(outputs['unread'], 'zpub')
 
     def test_the_perf_fanout_with_no_enrolled_repository_measures_nothing_and_passes(self):
         outputs = self.fanout('weekly-perf.yaml')

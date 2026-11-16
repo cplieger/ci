@@ -539,13 +539,18 @@ class Record(unittest.TestCase):
         self.assertEqual(len(out.failures), 1, out.failures)
         self.assertIn('reads', out.failures[0])
 
-    def test_a_stale_key_is_recorded_though_it_equals_its_budget(self):
+    def test_a_stale_key_is_re_measured_and_recorded_though_it_equals_its_budget(self):
         b = budgets([entry('dom', 'exact', 640)])
         first = results([cell('dom', (640, 640, 641), kind='count')])
-        out = perf_gate.verdict(b, first, results([]), decision(stale=[keyof(entry('dom'))]))
-        self.assertEqual(self.recorded(out), [(keyof(entry('dom')), 640, [640, 640, 641])])
+        again = results([cell('dom', (640,) * 3, kind='count')])
+        out = perf_gate.verdict(b, first, again, decision(stale=[keyof(entry('dom'))]))
+        six = [640, 640, 641, 640, 640, 640]
+        self.assertEqual(self.recorded(out), [(keyof(entry('dom')), 640, six)])
         self.assertEqual(len(out.failures), 1, out.failures)
         self.assertIn('check in the measured file this run wrote', out.failures[0])
+        missing = perf_gate.verdict(b, first, results([]), decision(stale=[keyof(entry('dom'))]))
+        self.assertEqual(self.recorded(missing), [])
+        self.assertIn('no reps came back', missing.failures[0])
 
     def test_an_extension_cell_is_judged_on_its_three_reps_and_its_times_are_reported(self):
         x1 = {'scale': 'x1'}
@@ -2758,7 +2763,7 @@ class Cli(unittest.TestCase):
         first = 'results/perf-results-cplieger-a-measure-shard-1-of-1-attempt-1/results.json'
         self.put(first, results([cell('dom', (700, 640, 700), kind='count')]))
         argv = ('--budgets', b, '--results', str(self.dir / 'results'), '--prefix', 'cplieger-a')
-        argv += ('--remeasure-attempt', '1')
+        argv += ('--remeasure-attempt', '1', '--remeasure', self.put('remeasure.json', decision()))
         for more, rc in (((640,) * 3, 0), ((700, 640, 700), 1)):
             with self.subTest(more=more):
                 again = results([cell('dom', more, kind='count')])
@@ -2774,6 +2779,7 @@ class Cli(unittest.TestCase):
         again = 'again/perf-results-cplieger-a-remeasure-shard-1-of-1-attempt-2/results.json'
         argv = ('--verdict', str(self.dir / 'again'), '--budgets', b, '--prefix', 'cplieger-a')
         argv += ('--results', str(self.dir / 'results'), '--remeasure-attempt', '2')
+        argv += ('--remeasure', self.put('remeasure.json', decision()))
         argv += ('--record-out', str(self.dir / 'measured'), '--commit', 'pr-head')
         argv += ('--head', 'merge', '--repo', REPO, '--run-id', '900', '--run-attempt', '2')
         argv += ('--workflow-repository', REPO, '--summary', str(self.dir / 'summary.md'))
@@ -2798,7 +2804,7 @@ class Cli(unittest.TestCase):
         self.put(again, results([cell(reps=(1600.0,) * 3)]))
         argv = ('--verdict', str(self.dir / 'again'), '--budgets', b, '--prefix', 'cplieger-a')
         argv += ('--results', str(self.dir / 'results'), '--remeasure-attempt', '1')
-        self.assertEqual(self.main(*argv), 1)
+        self.assertEqual(self.main(*argv, '--remeasure', self.put('none.json', decision())), 1)
         decided = self.put('remeasure.json', decision(accepted()))
         self.assertEqual(self.main(*argv, '--remeasure', decided), 0, self.output)
         self.assertIn('Slower on purpose', self.output)
@@ -2818,6 +2824,25 @@ class Cli(unittest.TestCase):
         self.assertEqual(remeasure['cells'], [])
         self.assertEqual(remeasure['extend'], [unit('files', 60, scale='x1')])
         self.assertEqual(remeasure['accepted'], [])
+
+    def test_compare_re_measures_a_stale_key_the_set_measured_though_nothing_extends(self):
+        url = MEASURED_URL + '900/attempts/1'
+        moved = entry('dom', 'exact', 641, source=url, reason='one more node')
+        plan = {
+            **PLAN,
+            'sets': {**PLAN['sets'], 'full': {'shards': 1, 'cells': [unit('files', 80)]}},
+        }
+        rc = self.compare(
+            [cell(), cell('dom', (641,) * 3, kind='count')],
+            plan=plan,
+            listed=False,
+            entries=[entry(source=RUN_URL + '100'), moved],
+        )
+        self.assertEqual(rc, 1)
+        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
+        self.assertEqual(remeasure['stale'], [perf_gate.key_dict(keyof(moved))])
+        self.assertEqual(remeasure['extend'], [])
+        self.assertEqual([keyof(c) for c in remeasure['cells']], [keyof(moved)])
 
     def test_compare_judges_an_accepted_slowdown_and_hands_it_to_the_verdict(self):
         class Git(FakeGit):
@@ -2980,7 +3005,7 @@ class Cli(unittest.TestCase):
             ),
             'verdict': (
                 ('--verdict', d, '--budgets', f, '--results', d),
-                ['--prefix', '--remeasure-attempt'],
+                ['--prefix', '--remeasure-attempt', '--remeasure'],
             ),
             'verdict recording': (
                 (
@@ -2997,6 +3022,7 @@ class Cli(unittest.TestCase):
                 ),
                 [
                     '--remeasure-attempt',
+                    '--remeasure',
                     '--repo',
                     '--head',
                     '--commit',
@@ -3154,6 +3180,7 @@ class Cli(unittest.TestCase):
         self.put(stale, results([red]))
         argv = ('--verdict', str(self.dir / 'again'), '--budgets', b)
         argv += ('--results', str(self.dir / 'results'), '--prefix', 'cplieger-a')
+        argv += ('--remeasure', self.put('remeasure.json', decision()))
         self.assertEqual(self.main(*argv, '--remeasure-attempt', '2'), 0)
         self.assertEqual(self.main(*argv, '--remeasure-attempt', '1'), 1)
         self.assertIn('shard counts', self.output)

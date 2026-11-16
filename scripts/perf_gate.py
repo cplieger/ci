@@ -416,6 +416,7 @@ def verdict(budgets: dict, results: dict, remeasured: dict, decided: dict | None
     accepted = accepted_cells(decided.get('accepted', []))
     stale = {key(k) for k in decided.get('stale', [])}
     out = compare(budgets, results, accepted=accepted)
+    out.remeasure = with_stale(out.remeasure, results.get('cells', []), stale)
     entries = {key(e): e for e in budgets.get('budgets', [])}
     again = {key(c): c for c in remeasured.get('cells', [])}
     judged_keys = set()
@@ -450,13 +451,14 @@ def verdict(budgets: dict, results: dict, remeasured: dict, decided: dict | None
         out.failures.append(
             f'{key_text(k)}: compare found its value stale, and no shard measured it again'
         )
-    unjudged = set(first) - {key(c) for c in out.remeasure}
-    for k in sorted(stale & unjudged):
-        c, e = first[k], entries.get(k, {})
-        exact = e.get('tier') == 'exact' and c.get('kind') == 'count' and c.get('reps')
-        if exact and not out.runner_mismatch:
-            exact_judgement(e, c, list(c['reps']), middle(c['reps']), stale=True, out=out)
     return out
+
+
+def with_stale(cells: list[dict], measured: Iterable[dict], stale: set) -> list[dict]:
+    """cells with each measured cell of a stale key appended once: a stale value is
+    re-measured like a red one, so the verdict that records it always runs."""
+    listed = {key(c) for c in cells}
+    return [*cells, *(c for c in measured if key(c) in stale and key(c) not in listed)]
 
 
 def exact_judgement(
@@ -2077,7 +2079,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     elif a.check_file:
         need = ('base', 'sources', 'repo', 'head', 'base_sha')
     elif a.verdict:
-        need = ('budgets', 'results', 'prefix', 'remeasure_attempt')
+        need = ('budgets', 'results', 'prefix', 'remeasure_attempt', 'remeasure')
         if a.record_out:
             need += ('repo', 'head', 'commit', 'run_id', 'run_attempt', 'workflow_repository')
     elif a.take:
@@ -2299,7 +2301,7 @@ def run(a: argparse.Namespace) -> int:
     elif a.verdict:
         results = merge_results(a.results, a.prefix)
         again = merge_results(a.verdict, a.prefix, 'remeasure', since=a.remeasure_attempt)
-        out = verdict(budgets, results, again, load(a.remeasure) if a.remeasure else None)
+        out = verdict(budgets, results, again, load(a.remeasure))
         if a.record_out:
             write_record(a, out, [*results['cpu_models'], *again['cpu_models']])
     else:
@@ -2310,6 +2312,8 @@ def run(a: argparse.Namespace) -> int:
         units = planned_windows(c for job in matrix['include'] for c in job['cells'])
         results = merge_results(a.results, a.prefix)
         out = compare(budgets, results, units, checked.accepted)
+        judged = [c for c in results['cells'] if planned(units, c)]
+        out.remeasure = with_stale(out.remeasure, judged, checked.stale)
         out.failures = checked.errors + out.failures
         out.exact_moves = checked.moves
         entries = {key(e): e for e in budgets.get('budgets', [])}

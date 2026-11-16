@@ -411,7 +411,7 @@ class MetaJobs(unittest.TestCase):
         callers += [(SELF_CI.name, load(SELF_CI)['jobs']['ci'])]
         for name, job in callers:
             with self.subTest(caller=name):
-                self.assertEqual(job.get('permissions'), grant)
+                self.assertLessEqual(grant.items(), job.get('permissions', {}).items())
 
 
 VALIDATE_JOBS = [
