@@ -33,6 +33,9 @@ if TYPE_CHECKING:
 KEY_FIELDS = ('scenario', 'scale', 'engine', 'width', 'window', 'metric')
 TIERS = ('gated', 'exact', 'reported')
 CHANGE_FIELDS = ('baseline', 'budget', 'tier', 'headroom', 'source')
+ENTRY_FIELDS = (*KEY_FIELDS, *CHANGE_FIELDS, 'reason')
+FILE_FIELDS = ('schema', 'runner', 'headroom', 'floor', 'target', 'budgets', 'retired')
+SCHEMA = 2
 SERVER_CPU = 'server_cpu_ms'
 DEFAULT_HEADROOM = {'cpu_ms': 1.5, 'heap_mb': 1.25, 'rss_mb': 1.25}
 DEFAULT_FLOOR = {'cpu_ms': 50, 'heap_mb': 1}
@@ -112,6 +115,10 @@ def entry_floor(budgets: dict, e: dict) -> float:
     return budgets.get('floor', {}).get(family(e['metric']), 0)
 
 
+def file_target(budgets: dict, metric: str) -> float | None:
+    return budgets.get('target', {}).get(family(metric))
+
+
 # --- the rule --------------------------------------------------------------
 
 
@@ -123,10 +130,11 @@ def check_rule(budgets: object) -> list[str]:
     if not isinstance(budgets, dict):
         return shape
     errors = []
-    if budgets.get('schema') != 1:
-        errors.append('budgets.json: schema must be 1')
+    if budgets.get('schema') != SCHEMA:
+        errors.append(f'budgets.json: schema must be {SCHEMA}')
     if not isinstance(budgets.get('runner'), str) or not budgets['runner']:
         errors.append('budgets.json: runner must name the runner the budgets were calibrated on')
+    errors.extend(f'budgets.json: unknown field {f}' for f in budgets if f not in FILE_FIELDS)
     if shape:
         return errors + shape
     seen = set()
@@ -143,8 +151,8 @@ def check_shape(budgets: object) -> list[str]:
     """The rule errors that stop the gate before it reads an entry, each a value
     the code reading one would raise on or misjudge: a document, list, map or
     item of the wrong type, an entry without its key or a known tier, a gated
-    or exact entry whose baseline or budget is no number, a headroom or floor
-    value out of range, and a retired item without its key and reason."""
+    or exact entry whose baseline or budget is no number, a headroom, floor
+    or target value out of range, and a retired item without its key and reason."""
     if not isinstance(budgets, dict):
         return ['budgets.json: must be a JSON object']
     errors = [
@@ -155,6 +163,7 @@ def check_shape(budgets: object) -> list[str]:
     for field, ok, want in (
         ('headroom', lambda x: is_number(x) and x > 0, 'a number above 0'),
         ('floor', lambda x: is_number(x) and x >= 0, 'a number of 0 or more'),
+        ('target', lambda x: is_number(x) and x > 0, 'a number above 0'),
     ):
         values = budgets.get(field, {})
         if not isinstance(values, dict):
@@ -201,11 +210,11 @@ def entry_shape(i: int, e: object) -> str | None:
 def entry_errors(budgets: dict, e: dict) -> list[str]:
     """The rule errors of an entry check_shape passed."""
     tier = e['tier']
-    out = []
+    out = [f'unknown field {f}' for f in e if f not in ENTRY_FIELDS]
     if not isinstance(e.get('source'), str) or not e['source']:
         out.append('no source')
-    if not isinstance(e.get('rows'), list) or not e['rows']:
-        out.append('no rows')
+    if 'reason' in e:
+        out.extend(reason_errors(e))
     if 'headroom' in e and tier != 'gated':
         out.append('only a gated entry carries its own headroom')
     if tier == 'reported':
@@ -215,8 +224,11 @@ def entry_errors(budgets: dict, e: dict) -> list[str]:
         if budget != baseline:
             out.append(f'an exact budget is its baseline {baseline}, not {budget}')
     elif family(e['metric']) == SERVER_CPU:
-        if budget != e.get('target'):
-            out.append(f'a server CPU budget is its target {e.get("target")}, not {budget}')
+        target = file_target(budgets, e['metric'])
+        if target is None:
+            out.append(f'no target for {SERVER_CPU}')
+        elif budget != target:
+            out.append(f'a server CPU budget is its target {target}, not {budget}')
     else:
         h = entry_headroom(budgets, e)
         if not is_number(h):
@@ -228,6 +240,19 @@ def entry_errors(budgets: dict, e: dict) -> list[str]:
             if abs(budget - want) > TOLERANCE:
                 out.append(f'budget {budget} is not max(floor, {baseline} x {h}) = {want}')
     return out
+
+
+def reason_errors(e: dict) -> list[str]:
+    """Why e's reason breaks the rule that reads no base: one non-empty line, and none on
+    an entry no headroom, floor or target edit can move."""
+    r = e['reason']
+    if not isinstance(r, str) or not r.strip() or has_line_break(r):
+        return [f'reason must be one non-empty line, not {r!r}']
+    if e['tier'] == 'reported':
+        return ['a reported entry carries no reason']
+    if e['tier'] == 'exact' and SOURCE_RE.match(str(e.get('source', ''))):
+        return ['an exact entry from a calibration carries no reason']
+    return []
 
 
 # --- compare and verdict ---------------------------------------------------
@@ -270,9 +295,9 @@ def compare(budgets: dict, results: dict, units: dict | None = None) -> Outcome:
         e = entries.get(key(c))
         reps = c.get('reps') or []
         value = statistics.median(reps) if reps else None
-        if e is not None and is_number(e.get('target')) and value is not None:
-            if value > e['target']:
-                out.over_target.append(c)
+        target = file_target(budgets, c['metric'])
+        if is_number(target) and value is not None and value > target:
+            out.over_target.append(c)
         if out.runner_mismatch or e is None or e['tier'] == 'reported':
             out.reported.append(c)
             status = 'reported'
@@ -385,7 +410,8 @@ def summary(budgets: dict, out: Outcome) -> str:
     ]
     for r in out.rows:
         e = r['entry'] or {}
-        target = e.get('target', '')
+        target = file_target(budgets, r['cell']['metric'])
+        target = '' if target is None else target
         flag = ' (over target)' if key(r['cell']) in over else ''
         lines.append(
             f'| {key_text(key(r["cell"]))} | {e.get("tier", "none")} | {r["value"]} '
@@ -596,14 +622,38 @@ def has_line_break(x: object) -> bool:
     return False
 
 
+def reported_patterns(doc: dict) -> tuple[list[dict], list[str]]:
+    """plan.json's `reported`: the {metric, window?} patterns of cells the consumer never
+    gates, and an error line for each item that is no such pattern."""
+    found = doc.get('reported', [])
+    if not isinstance(found, list):
+        return [], ['plan.json: reported must be a list of {metric, window} patterns']
+    patterns, errors = [], []
+    for i, p in enumerate(found):
+        named = isinstance(p, dict) and set(p) <= {'metric', 'window'} and 'metric' in p
+        if not named or not all(isinstance(v, str) and v for v in p.values()):
+            errors.append(f'plan.json: reported[{i}] is not a {{metric, window}} pattern: {p!r}')
+        else:
+            patterns.append(p)
+    return patterns, errors
+
+
+def plan_reports(patterns: list[dict], c: dict) -> bool:
+    return any(
+        p['metric'] == c['metric'] and p.get('window', c['window']) == c['window'] for p in patterns
+    )
+
+
 def check_plan(budgets: dict, doc: dict) -> list[str]:
     """A gated or exact entry whose unit and window no set of RUN_SETS lists
-    leaves the gate unmeasured, so it fails unless `retired` names its key.
-    A set or cell of any set that is not an object is an error line."""
+    leaves the gate unmeasured, so it fails unless `retired` names its key; one
+    of a cell `reported` lists fails. A set or cell of any set that is not an
+    object, and a `reported` item that is no pattern, is an error line."""
     sets = doc.get('sets', {})
     if not isinstance(sets, dict):
         return ['plan.json: sets must be an object of named sets']
-    errors, cells = [], []
+    patterns, errors = reported_patterns(doc)
+    cells = []
     for name, spec in sets.items():
         if not isinstance(spec, dict):
             errors.append(f'plan.json: set {name} must be an object')
@@ -621,15 +671,26 @@ def check_plan(budgets: dict, doc: dict) -> list[str]:
                 cells.append(u)
     units = planned_windows(cells)
     retired = {key(r) for r in budgets.get('retired', []) if all(f in r for f in KEY_FIELDS)}
-    return errors + [
-        f'{key_text(key(e))}: a {e["tier"]} entry no set of plan.json measures '
-        f'({", ".join(RUN_SETS)}), and retired does not name it'
+    gating = [
+        e
         for e in budgets.get('budgets', [])
-        if e.get('tier') != 'reported'
-        and all(f in e for f in KEY_FIELDS)
-        and not planned(units, e)
-        and key(e) not in retired
+        if e.get('tier') != 'reported' and all(f in e for f in KEY_FIELDS)
     ]
+    return (
+        errors
+        + [
+            f'{key_text(key(e))}: a {e["tier"]} entry no set of plan.json measures '
+            f'({", ".join(RUN_SETS)}), and retired does not name it'
+            for e in gating
+            if not planned(units, e) and key(e) not in retired
+        ]
+        + [
+            f'{key_text(key(e))}: plan.json reports this cell, so its entry is reported, '
+            f'not {e["tier"]}'
+            for e in gating
+            if plan_reports(patterns, e)
+        ]
+    )
 
 
 def plan(
@@ -751,7 +812,7 @@ def check_provenance(
     base_entries = {key(e): e for e in base.get('budgets', [])}
     head_entries = {key(e): e for e in head.get('budgets', [])}
     # The file-level maps sit outside CHANGE_FIELDS, and each changes how every entry gates.
-    moved = any(head.get(f) != base.get(f) for f in ('headroom', 'floor'))
+    moved = any(head.get(f) != base.get(f) for f in ('headroom', 'floor', 'target'))
     file_edit = moved or head.get('runner') != base.get('runner')
     files: dict[str, tuple[dict | None, str | None]] = {}
     named = set()
@@ -908,9 +969,8 @@ def load_calibration(run_id, calibrations, repo, runner, head_sha, verify, git):
 
 def entry_provenance(head: dict, e: dict, b: dict | None, doc: dict, file_moved: bool) -> list[str]:
     """Why entry e of head does not match calibration doc. With file_moved
-    (the file's headroom or floor differs from the base's), a budget above
-    the base's needs `accepted` even when its baseline did not rise, and a
-    server CPU budget, which is its target, always does."""
+    (the file's headroom, floor or target differs from the base's), a budget
+    above the base's needs a `reason` even when its baseline did not rise."""
     cells = {key(c): c for c in doc.get('cells', [])}
     c = cells.get(key(e))
     run_id = doc.get('run_id')
@@ -941,18 +1001,17 @@ def entry_provenance(head: dict, e: dict, b: dict | None, doc: dict, file_moved:
                     f'calibrate {e["scenario"]} with ten runs'
                 )
     if b is not None and is_number(b.get('baseline')) and is_number(e.get('baseline')):
-        if e['baseline'] > b['baseline'] and not str(e.get('accepted', '')).strip():
-            out.append(f'raises its baseline from {b["baseline"]} without `accepted`')
+        if e['baseline'] > b['baseline'] and not str(e.get('reason', '')).strip():
+            out.append(f'raises its baseline from {b["baseline"]} without a reason')
     raised = b is not None and is_number(b.get('budget')) and is_number(e.get('budget'))
-    server = family(e['metric']) == SERVER_CPU
-    if (file_moved or server) and raised and e['budget'] > b['budget']:
-        if not str(e.get('accepted', '')).strip():
+    if file_moved and raised and e['budget'] > b['budget']:
+        if not str(e.get('reason', '')).strip():
             what = (
                 'raises its target and budget'
-                if server
-                else ('the file headroom or floor raises its budget')
+                if family(e['metric']) == SERVER_CPU
+                else 'the file headroom or floor raises its budget'
             )
-            out.append(f'{what} from {b["budget"]} to {e["budget"]} without `accepted`')
+            out.append(f'{what} from {b["budget"]} to {e["budget"]} without a reason')
     return out
 
 
@@ -1117,9 +1176,11 @@ class Git:
         return self.ok('merge-base', '--is-ancestor', sha, of)
 
     def added_by(self, path: str, head: str) -> str:
-        """The newest first-parent commit of head that added path."""
-        args = ('log', '--first-parent', '--diff-filter=A', '--format=%H', '-1', head, '--')
-        found = self.git(*args, path).strip()
+        """The newest first-parent commit of head that added path. A move adds its new
+        path: rename detection, which `log.follow` turns on, would name the commit that
+        added the old one."""
+        args = ('log', '--no-follow', '--first-parent', '--diff-filter=A', '--format=%H')
+        found = self.git(*args, '-1', head, '--', path).strip()
         if not found:
             raise GitError(f'no first-parent commit of {head} added {path}')
         return found

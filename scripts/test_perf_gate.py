@@ -45,17 +45,17 @@ def entry(metric='cpu_ms', tier='gated', baseline=1000.0, budget=None, **kw):
     if budget is not None:
         e['budget'] = budget
     e['source'] = kw.pop('source', RUN_URL + '111')
-    e['rows'] = kw.pop('rows', ['F1'])
     e.update(kw)
     return e
 
 
 def budgets(entries, **kw):
     doc = {
-        'schema': 1,
+        'schema': 2,
         'runner': RUNNER,
         'headroom': {'cpu_ms': 1.5, 'heap_mb': 1.25, 'rss_mb': 1.25},
         'floor': {'cpu_ms': 50, 'heap_mb': 1},
+        'target': {'server_cpu_ms': 63.0},
         'budgets': entries,
     }
     doc.update(kw)
@@ -94,20 +94,61 @@ class TheRule(unittest.TestCase):
         bad = entry(metric='dom', tier='exact', baseline=640, budget=700)
         self.assertTrue(perf_gate.check_rule(budgets([bad])))
 
-    def test_server_cpu_per_request_budget_is_its_target(self):
-        good = entry(metric='server_cpu_ms', baseline=20.0, budget=63.0, target=63.0)
+    def test_server_cpu_per_request_budget_is_its_familys_target(self):
+        good = entry(metric='server_cpu_ms:GET /api/chats', baseline=20.0, budget=63.0)
         self.assertEqual(perf_gate.check_rule(budgets([good])), [])
-        bad = entry(metric='server_cpu_ms', baseline=20.0, budget=30.0, target=63.0)
-        self.assertTrue(perf_gate.check_rule(budgets([bad])))
+        bad = entry(metric='server_cpu_ms:GET /api/chats', baseline=20.0, budget=30.0)
+        self.assertIn(
+            'is its target 63.0, not 30.0', ' '.join(perf_gate.check_rule(budgets([bad])))
+        )
+        untargeted = perf_gate.check_rule(budgets([good], target={}))
+        self.assertIn('no target for server_cpu_ms', ' '.join(untargeted))
 
-    def test_an_entry_missing_source_or_rows_fails(self):
-        for field, value in (('source', ''), ('rows', [])):
+    def test_the_target_map_holds_a_number_above_0_per_family(self):
+        for target in ([], {'server_cpu_ms': 0}, {'server_cpu_ms': '63'}):
+            with self.subTest(target=target):
+                doc = budgets([entry()], target=target)
+                self.assertTrue(perf_gate.check_shape(doc))
+                self.assertIn('target', ' '.join(perf_gate.check_rule(doc)))
+
+    def test_a_file_of_another_schema_fails(self):
+        for schema in (1, 3, None):
+            with self.subTest(schema=schema):
+                errors = perf_gate.check_rule(budgets([entry()], schema=schema))
+                self.assertIn('budgets.json: schema must be 2', errors)
+
+    def test_an_entry_missing_its_source_fails(self):
+        self.assertTrue(perf_gate.check_rule(budgets([entry(source='')])))
+        e = entry()
+        del e['source']
+        self.assertTrue(perf_gate.check_rule(budgets([e])))
+
+    def test_an_entry_field_outside_the_schema_fails(self):
+        for field, value in (('rows', ['F1']), ('target', 63.0), ('accepted', 'why'), ('x', 1)):
             with self.subTest(field=field):
-                self.assertTrue(perf_gate.check_rule(budgets([entry(**{field: value})])))
-            with self.subTest(field=field, removed=True):
-                e = entry()
-                del e[field]
-                self.assertTrue(perf_gate.check_rule(budgets([e])))
+                errors = perf_gate.check_rule(budgets([entry(**{field: value})]))
+                self.assertIn(
+                    f'files/x10/chromium/desktop/cold/cpu_ms: unknown field {field}', errors
+                )
+
+    def test_a_file_field_outside_the_schema_fails(self):
+        errors = perf_gate.check_rule(budgets([entry()], headrom={'cpu_ms': 2.0}))
+        self.assertIn('budgets.json: unknown field headrom', errors)
+
+    def test_a_reason_is_one_non_empty_line(self):
+        self.assertEqual(perf_gate.check_rule(budgets([entry(reason='a slower parse')])), [])
+        for reason in ('', '  ', 'one\ntwo', 'one\rtwo', 7):
+            with self.subTest(reason=reason):
+                errors = perf_gate.check_rule(budgets([entry(reason=reason)]))
+                self.assertIn('reason', ' '.join(errors))
+
+    def test_a_reason_on_an_entry_no_file_edit_can_move_fails(self):
+        exact = entry(metric='dom', tier='exact', baseline=640, reason='a new view')
+        reported = entry(tier='reported', reason='noisy')
+        for e in (exact, reported):
+            with self.subTest(tier=e['tier']):
+                errors = perf_gate.check_rule(budgets([e]))
+                self.assertTrue(any('carries no reason' in x for x in errors), errors)
 
     def test_an_unknown_tier_fails(self):
         self.assertTrue(perf_gate.check_rule(budgets([entry(tier='maybe', budget=1500.0)])))
@@ -131,7 +172,7 @@ class TheRule(unittest.TestCase):
             'Infinity headroom': budgets([entry(budget=inf)], headroom={'cpu_ms': inf}),
             'Infinity floor': budgets([entry(budget=inf)], floor={'cpu_ms': inf}),
             'NaN server target': budgets(
-                [entry('server_cpu_ms', baseline=20.0, budget=nan, target=nan)]
+                [entry('server_cpu_ms', baseline=20.0, budget=nan)], target={'server_cpu_ms': nan}
             ),
         }
         for name, doc in cases.items():
@@ -201,7 +242,7 @@ class Compare(unittest.TestCase):
         self.assertEqual(none.notices, [])
 
     def test_server_cpu_per_request_gates_at_its_target(self):
-        b = budgets([entry(metric='server_cpu_ms', baseline=20.0, budget=63.0, target=63.0)])
+        b = budgets([entry(metric='server_cpu_ms', baseline=20.0, budget=63.0)])
         over = perf_gate.compare(
             b, results([cell('server_cpu_ms', (70.0, 70.0, 70.0), kind='server_cpu')])
         )
@@ -245,12 +286,14 @@ class Compare(unittest.TestCase):
         low = perf_gate.compare(budgets([wide]), results([cell(reps=(640.0, 640.0, 640.0))]))
         self.assertEqual(low.notices, [])
 
-    def test_a_cell_over_its_target_is_flagged_and_does_not_fail(self):
+    def test_a_cell_over_its_familys_target_is_flagged_and_does_not_fail(self):
+        srv = entry('server_cpu_ms:GET /api/tools', tier='reported')
         out = perf_gate.compare(
-            budgets([entry(target=300.0)]), results([cell(reps=(900.0, 900.0, 900.0))])
+            budgets([srv]), results([cell(srv['metric'], (70.0, 70.0, 70.0), kind='server_cpu')])
         )
         self.assertEqual(out.failures, [])
-        self.assertEqual([keyof(c) for c in out.over_target], [keyof(entry())])
+        self.assertEqual([keyof(c) for c in out.over_target], [keyof(srv)])
+        self.assertIn('| 63.0 | reported (over target) |', perf_gate.summary(budgets([srv]), out))
 
     def test_a_zero_headroom_never_divides(self):
         b = budgets([entry(budget=50.0)], headroom={'cpu_ms': 0})
@@ -748,14 +791,14 @@ class Provenance(unittest.TestCase):
     def test_a_raise_naming_a_file_whose_baseline_differs_fails(self):
         self.write('111', calibration_file([cal_cell(baseline=1000.0)]))
         base = budgets([entry(baseline=1000.0)])
-        head = budgets([entry(baseline=1200.0, accepted='a new view costs this')])
+        head = budgets([entry(baseline=1200.0, reason='a new view costs this')])
         self.assertTrue(self.check(head, base))
 
     def test_a_raise_naming_a_file_whose_bundle_does_not_verify_fails(self):
         self.write('222', calibration_file([cal_cell(baseline=1200.0)]))
         self.bad_bundles.add('222.sigstore.json')
         base = budgets([entry(baseline=1000.0)])
-        head = budgets([entry(baseline=1200.0, accepted='why', source=RUN_URL + '222')])
+        head = budgets([entry(baseline=1200.0, reason='why', source=RUN_URL + '222')])
         errors = self.check(head, base)
         self.assertTrue(errors)
         self.assertIn(('222.json', '222.sigstore.json'), self.verified)
@@ -780,12 +823,12 @@ class Provenance(unittest.TestCase):
             self.check(budgets([entry(baseline=900.0)]), budgets([entry(baseline=1000.0)]))
         )
 
-    def test_a_raised_baseline_needs_accepted(self):
+    def test_a_raised_baseline_needs_a_reason(self):
         self.write('111', calibration_file([cal_cell(baseline=1200.0)]))
         base = budgets([entry(baseline=1000.0, source=RUN_URL + '100')])
         self.assertTrue(self.check(budgets([entry(baseline=1200.0)]), base))
         self.assertEqual(
-            self.check(budgets([entry(baseline=1200.0, accepted='costs 200 ms for X')]), base), []
+            self.check(budgets([entry(baseline=1200.0, reason='costs 200 ms for X')]), base), []
         )
 
     def test_a_lowered_entry_matching_its_signed_file_passes(self):
@@ -857,11 +900,21 @@ class Provenance(unittest.TestCase):
         b = budgets([entry(source='https://example.com/1')])
         self.assertTrue(any('not a perf-calibrate run URL' in x for x in self.check(b, b)))
 
-    def test_a_change_to_rows_or_target_alone_is_not_rechecked(self):
+    def test_a_target_edit_rechecks_an_entry_whose_fields_did_not_change(self):
+        srv = entry('server_cpu_ms', baseline=20.0, budget=63.0, source=RUN_URL + '100')
         self.write('100', calibration_file([cal_cell()]))
-        base = budgets([entry(source=RUN_URL + '100')])
-        head = budgets([entry(source=RUN_URL + '100', rows=['F1', 'F2'], target=300.0)])
-        self.assertEqual(self.check(head, base), [])
+        base = budgets([entry(source=RUN_URL + '100'), srv])
+        head = budgets(
+            [entry(source=RUN_URL + '100'), {**srv, 'budget': 50.0}],
+            target={'server_cpu_ms': 50.0},
+        )
+        errors = self.check(head, base)
+        self.assertEqual(
+            errors,
+            [
+                'files/x10/chromium/desktop/cold/server_cpu_ms: calibration 100 did not measure this cell'
+            ],
+        )
 
     def test_a_calibration_file_no_entry_names_fails(self):
         self.write('333', calibration_file([cal_cell()]))
@@ -907,8 +960,8 @@ class Provenance(unittest.TestCase):
                     self.assertEqual(perf_gate.check_rule(head), [])
                     errors = self.check(head, base)
                     self.assertTrue(errors)
-                    self.assertIn('accepted', ' '.join(errors))
-                    why = entry(baseline=baseline, budget=raised, accepted='slower parse')
+                    self.assertIn('without a reason', ' '.join(errors))
+                    why = entry(baseline=baseline, budget=raised, reason='slower parse')
                     self.assertEqual(self.check(budgets([why], **edit), base), [])
 
     def test_a_headroom_edit_rechecks_an_entry_whose_fields_did_not_change(self):
@@ -921,22 +974,23 @@ class Provenance(unittest.TestCase):
         self.assertTrue(errors)
         self.assertIn('calibration 100', ' '.join(errors))
 
-    def test_a_server_cpu_target_and_budget_raised_together_need_accepted(self):
+    def test_a_server_cpu_target_and_budget_raised_together_need_a_reason(self):
         def server(target, **kw):
-            return entry('server_cpu_ms', baseline=20.0, budget=target, target=target, **kw)
+            e = entry('server_cpu_ms', baseline=20.0, budget=target, **kw)
+            return budgets([e], target={'server_cpu_ms': target})
 
         srv = cal_cell('server_cpu_ms', baseline=20.0, kind='server_cpu')
         self.write('111', calibration_file([srv]))
-        base = budgets([server(63.0)])
-        head = budgets([server(1000.0)])
+        base = server(63.0)
+        head = server(1000.0)
         self.assertEqual(perf_gate.check_rule(head), [])
         errors = self.check(head, base)
         self.assertTrue(errors)
         self.assertIn('target', ' '.join(errors))
-        self.assertIn('accepted', ' '.join(errors))
-        why = budgets([server(1000.0, accepted='the export reads the whole log')])
+        self.assertIn('without a reason', ' '.join(errors))
+        why = server(1000.0, reason='the export reads the whole log')
         self.assertEqual(self.check(why, base), [])
-        self.assertEqual(self.check(budgets([server(40.0)]), base), [])
+        self.assertEqual(self.check(server(40.0), base), [])
 
     def test_a_calibration_file_holding_nan_or_infinity_fails(self):
         for constant in (float('nan'), float('inf')):
@@ -1146,6 +1200,22 @@ class GitHistory(unittest.TestCase):
         merge = self.sh('rev-parse', 'HEAD')
         self.assertEqual(self.git().added_by('tests/perf/calibrations/200.json', merge), merge)
 
+    def test_a_moved_calibration_is_placed_at_its_measured_commit(self):
+        self.put('tests/perf/calibrations/200.json', json.dumps({'commit': self.base}))
+        self.commit('check in')
+        self.sh('mv', 'tests/perf/calibrations', 'tests/perf/sources')
+        moved = self.commit('move the sources')
+        path = pathlib.Path('tests/perf/sources/200.json')
+        git = self.git()
+        follow = {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'log.follow'}
+        for config in ({}, {**follow, 'GIT_CONFIG_VALUE_0': 'true'}):
+            with self.subTest(config=config), unittest.mock.patch.dict(os.environ, config):
+                self.assertEqual(git.added_by(str(path), moved), moved)
+                self.assertEqual(
+                    perf_gate.placed_commit({'commit': self.base}, path, git, moved),
+                    (self.base, None),
+                )
+
     def test_git_errors_raise_and_a_short_sha_is_refused(self):
         git = self.git()
         with self.assertRaises(perf_gate.GitError):
@@ -1195,6 +1265,40 @@ class Coverage(unittest.TestCase):
         self.assertEqual(
             perf_gate.check_plan(doc, {'node': '.', 'sets': {'pr': pr, 'full': full}}), []
         )
+
+    def test_a_gated_or_exact_entry_of_a_cell_the_plan_reports_fails(self):
+        frames = entry('sse_frames', 'exact', 3)
+        live = {**frames, 'window': 'live'}
+        engine = entry('max_bytes:GET /api/engine', 'exact', 900)
+        doc = budgets([entry(), frames, live, engine])
+        reported = [
+            {'metric': 'max_bytes:GET /api/engine'},
+            {'metric': 'sse_frames', 'window': 'cold'},
+        ]
+        errors = perf_gate.check_plan(doc, {**PLAN, 'reported': reported})
+        tail = ': plan.json reports this cell, so its entry is reported, not exact'
+        self.assertEqual(
+            sorted(errors),
+            [
+                f'files/x10/chromium/desktop/cold/max_bytes:GET /api/engine{tail}',
+                f'files/x10/chromium/desktop/cold/sse_frames{tail}',
+            ],
+        )
+        quiet = budgets([entry(), {**frames, 'tier': 'reported'}, live])
+        self.assertEqual(perf_gate.check_plan(quiet, {**PLAN, 'reported': reported}), [])
+
+    def test_a_reported_pattern_of_the_wrong_shape_is_an_error_line(self):
+        for reported in (
+            {},
+            ['sse_frames'],
+            [{'window': 'cold'}],
+            [{'metric': ''}],
+            [{'metric': 'dom', 'window': 1}],
+            [{'metric': 'dom', 'scale': 'x1'}],
+        ):
+            with self.subTest(reported=reported):
+                errors = perf_gate.check_plan(budgets([entry()]), {**PLAN, 'reported': reported})
+                self.assertTrue(any(e.startswith('plan.json: reported') for e in errors), errors)
 
     def test_a_set_or_cell_that_is_not_an_object_is_an_error_line(self):
         for sets in (
