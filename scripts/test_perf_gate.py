@@ -509,14 +509,16 @@ def cal_cell(metric='cpu_ms', baseline=1000.0, tier='gated', runs=10, slow_runs=
 
 class FakeGit:
     """perf_gate.Git over a made-up history. lineage holds (ancestor, descendant) pairs
-    besides each commit's own, added maps a calibration file's name to the commit that
-    added it, same holds the (measured, added) pairs whose code matches, and a commit in
-    broken is one git cannot answer for."""
+    besides each commit's own; added maps a calibration file's name to the commit that
+    added it, the head when unnamed, and a commit's parent `c^` has c's ancestors; same
+    holds the (measured, added) pairs whose code matches, and same_raises is what
+    same_change raises; a commit in broken is one git cannot answer for."""
 
     def __init__(self):
         self.lineage = set()
         self.added = {}
         self.same = set()
+        self.same_raises = None
         self.broken = set()
 
     def commit(self, sha):
@@ -525,17 +527,17 @@ class FakeGit:
         return sha
 
     def is_ancestor(self, sha, of):
+        of = of.removesuffix('^')
         if {sha, of} & self.broken:
             raise perf_gate.GitError('git merge-base exited 128')
         return sha == of or (sha, of) in self.lineage
 
     def added_by(self, path, head):
-        name = pathlib.Path(path).name
-        if name not in self.added:
-            raise perf_gate.GitError(f'no first-parent commit of {head} added {path}')
-        return self.added[name]
+        return self.added.get(pathlib.Path(path).name, head)
 
     def same_change(self, measured, added):
+        if self.same_raises:
+            raise self.same_raises
         return (measured, added) in self.same
 
 
@@ -669,6 +671,49 @@ class Provenance(unittest.TestCase):
         self.assertTrue(
             any(x.startswith('calibration 200:') and 're-calibrate' in x for x in changed), changed
         )
+
+    def test_a_push_after_the_calibration_fails_in_the_pull_requests_own_run(self):
+        # The merge ref contains the calibrated tip, but its own change is not the tip's.
+        self.git.lineage = {('pr-tip', HEAD), ('merge', HEAD)}
+        self.git.added = {'200.json': 'merge'}
+        self.dom('200', 4384.0, 'pr-tip')
+        errors = self.check(budgets([self.exact('200', 4384.0)]), budgets([]))
+        self.assertTrue(
+            any(x.startswith('calibration 200:') and 're-calibrate' in x for x in errors), errors
+        )
+        self.git.same = {('pr-tip', 'merge')}
+        self.assertEqual(self.check(budgets([self.exact('200', 4384.0)]), budgets([])), [])
+
+    def test_an_unplaceable_calibration_is_one_error_for_the_entries_naming_it(self):
+        self.git.added = {'200.json': 'squash'}
+        self.git.lineage = {('squash', HEAD)}
+        self.dom('200', 4384.0, 'pr-tip')
+        errors = self.unchanged(self.exact('200', 4384.0))
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith('calibration 200:'), errors)
+
+    def test_a_change_check_that_cannot_read_the_plan_fails(self):
+        self.git.added = {'200.json': 'squash'}
+        self.git.lineage = {('squash', HEAD)}
+        self.git.same_raises = ValueError('Expecting property name')
+        self.dom('200', 4384.0, 'pr-tip')
+        errors = self.unchanged(self.exact('200', 4384.0))
+        self.assertTrue(any(x.startswith('calibration 200:') for x in errors), errors)
+
+    def test_a_calibration_path_that_is_a_directory_fails(self):
+        x1 = self.two_commits()
+        (self.dir / '300.json').mkdir()
+        errors = self.unchanged(self.exact('100', 4400.0), x1)
+        self.assertTrue(
+            any(x.startswith('calibration 300:') and 'directory' in x for x in errors), errors
+        )
+
+    def test_a_cell_key_field_that_is_not_a_string_fails(self):
+        x1 = self.two_commits()
+        bad = json.dumps(calibration_file([cal_cell(), {**cal_cell(), 'metric': 1}], commit=HEAD))
+        (self.dir / '100.json').write_text(bad)
+        errors = self.unchanged(self.exact('200', 4384.0), x1)
+        self.assertTrue(any('does not name a cell' in x for x in errors), errors)
 
     def test_a_named_calibration_that_does_not_load_fails(self):
         x1 = self.two_commits()
@@ -937,7 +982,10 @@ class GitHistory(unittest.TestCase):
     def put(self, path, value):
         p = self.root / path
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(value if isinstance(value, str) else json.dumps(value))
+        if isinstance(value, bytes):
+            p.write_bytes(value)
+        else:
+            p.write_text(value if isinstance(value, str) else json.dumps(value))
 
     def commit(self, message):
         self.sh('add', '-A')
@@ -989,6 +1037,65 @@ class GitHistory(unittest.TestCase):
     def test_a_squash_after_a_dev_merge_of_other_pull_request_code_is_refused(self):
         squash = self.squash(dev={'other.txt': 'dev'}, app='three')
         self.assertFalse(self.git().same_change(self.tip, squash))
+
+    def pr_tip(self, app):
+        """A second pull request off base whose tip writes app (bytes) to app.txt."""
+        self.sh('checkout', '-q', '-b', f'pr-{len(app)}-{app[:1].hex()}', self.base)
+        self.put('app.txt', app)
+        tip = self.commit('another change')
+        self.sh('checkout', '-q', 'main')
+        return tip
+
+    def squash_of(self, app):
+        self.put('app.txt', app)
+        self.put('tests/perf/calibrations/200.json', '{}')
+        return self.commit('squash')
+
+    def test_a_squash_differing_by_a_carriage_return_is_refused(self):
+        tip = self.pr_tip(b'two\n')
+        self.assertFalse(self.git().same_change(tip, self.squash_of(b'two\r\n')))
+
+    def test_a_squash_of_a_measured_crlf_change_is_accepted(self):
+        tip = self.pr_tip(b'two\r\n')
+        self.assertTrue(self.git().same_change(tip, self.squash_of(b'two\r\n')))
+
+    def test_a_squash_of_a_measured_latin_1_change_is_accepted(self):
+        tip = self.pr_tip(b'caf\xe9\n')
+        self.assertTrue(self.git().same_change(tip, self.squash_of(b'caf\xe9\n')))
+
+    def test_a_squash_differing_by_whitespace_is_refused(self):
+        self.assertFalse(self.git().same_change(self.tip, self.squash(app='two ')))
+
+    def test_a_push_after_the_calibration_is_refused_at_the_merge_ref(self):
+        self.sh('checkout', '-q', 'pr')
+        self.put('app.txt', 'three')
+        self.commit('a push after calibrating')
+        self.put('tests/perf/calibrations/200.json', '{}')
+        self.commit('check in')
+        self.sh('checkout', '-q', 'main')
+        self.put('other.txt', 'dev')
+        self.commit('dev moved')
+        self.sh('merge', '-q', '--no-ff', '-m', 'merge', 'pr')
+        merge = self.sh('rev-parse', 'HEAD')
+        path = pathlib.Path('tests/perf/calibrations/200.json')
+        at, why = perf_gate.placed_commit({'commit': self.tip}, path, self.git(), merge)
+        self.assertIsNone(at)
+        self.assertIn('re-calibrate', why)
+
+    def test_a_calibration_of_the_pull_requests_final_head_is_placed_at_the_merge_ref(self):
+        self.sh('checkout', '-q', 'pr')
+        self.put('tests/perf/calibrations/200.json', '{}')
+        self.commit('check in')
+        self.sh('checkout', '-q', 'main')
+        self.put('other.txt', 'dev')
+        self.commit('dev moved')
+        self.sh('merge', '-q', '--no-ff', '-m', 'merge', 'pr')
+        merge = self.sh('rev-parse', 'HEAD')
+        path = pathlib.Path('tests/perf/calibrations/200.json')
+        self.assertEqual(
+            perf_gate.placed_commit({'commit': self.tip}, path, self.git(), merge),
+            (self.tip, None),
+        )
 
     def test_a_squash_that_drops_part_of_the_measured_change_is_refused(self):
         squash = self.squash(app='one')

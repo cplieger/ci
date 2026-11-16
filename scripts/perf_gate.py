@@ -870,21 +870,22 @@ def place_calibration(path: pathlib.Path, git: Git, head_sha: str) -> tuple[str,
 
 def placed_commit(doc: dict, path: pathlib.Path, git: Git, head_sha: str) -> tuple:
     """(the commit in head's history whose code calibration doc at path measured, None), or
-    (None, why it has none). That is its `commit` when head contains it; else the commit that
-    added path, when it makes the change the measured commit made: a squash merge of the
-    pull request whose final head the calibration measured."""
+    (None, why it has none). That is its `commit` when the commit that added path already
+    held it. Otherwise the calibration measured the pull request that added path, and the
+    adding commit (its merge ref, or its squash) must make the change it measured; the
+    place is then its `commit` when head contains it, else the squash."""
     try:
         measured = git.commit(str(doc.get('commit')))
-        if git.is_ancestor(measured, head_sha):
-            return measured, None
         added = git.added_by(str(path), head_sha)
+        if git.is_ancestor(measured, f'{added}^'):
+            return measured, None
         if git.same_change(measured, added):
-            return added, None
+            return (measured if git.is_ancestor(measured, head_sha) else added), None
     except (GitError, ValueError) as exc:
         return None, str(exc)
     return None, (
-        f'measured {measured}, which {head_sha} does not contain, and {added}, which added '
-        'the file, makes another change; re-calibrate at a commit of this branch'
+        f'{added}, which added the file, makes another change than measured {measured} '
+        'made; re-calibrate at the final commit'
     )
 
 
@@ -1048,19 +1049,23 @@ class Git:
     """The history questions the provenance check asks of the checkout in the working
     directory."""
 
+    def run(self, args: tuple, stdin: str | None, ok: tuple) -> tuple[int, str]:
+        """git's exit status and stdout. Bytes go through surrogateescape, never text mode,
+        whose newline translation drops a CR and whose strict decoding refuses non-UTF-8."""
+        data = None if stdin is None else stdin.encode('utf-8', 'surrogateescape')
+        done = subprocess.run(['git', *args], input=data, capture_output=True)
+        if done.returncode not in ok:
+            err = done.stderr.decode('utf-8', 'replace').strip()
+            raise GitError(f'git {args[0]} exited {done.returncode}: {err}')
+        return done.returncode, done.stdout.decode('utf-8', 'surrogateescape')
+
     def git(self, *args: str, stdin: str | None = None) -> str:
-        done = subprocess.run(['git', *args], input=stdin, capture_output=True, text=True)
-        if done.returncode:
-            raise GitError(f'git {args[0]} exited {done.returncode}: {done.stderr.strip()}')
-        return done.stdout
+        return self.run(args, stdin, (0,))[1]
 
     def ok(self, *args: str) -> bool:
         """True on exit 0, False on 1, GitError on any other status: the convention of
-        merge-base --is-ancestor, rev-parse --verify --quiet and diff --quiet."""
-        done = subprocess.run(['git', *args], capture_output=True, text=True)
-        if done.returncode not in (0, 1):
-            raise GitError(f'git {args[0]} exited {done.returncode}: {done.stderr.strip()}')
-        return done.returncode == 0
+        merge-base --is-ancestor and rev-parse --verify --quiet."""
+        return self.run(args, None, (0, 1))[0] == 0
 
     def commit(self, sha: str) -> str:
         """sha, fetched from origin when the checkout lacks it: a squash merge leaves a pull
@@ -1086,8 +1091,9 @@ class Git:
     def same_change(self, measured: str, added: str) -> bool:
         """Whether commit added makes, outside CHECK_IN_PATHS, the change measured makes
         from where it forked from added's parent, and both hold one plan but for its seconds
-        and shards. Dev commits merged in between move neither diff; patch-id --verbatim
-        ignores only line numbers, so they may also shift the changed lines."""
+        and shards. patch-id --verbatim ignores hunk positions, so dev commits merged in
+        between that only shift the changed lines pass; one that edits their three lines of
+        context does not."""
         plans = [loads(self.git('show', f'{c}:{PLAN_PATH}')) for c in (measured, added)]
         if plan_shape(plans[0]) != plan_shape(plans[1]):
             return False
@@ -1095,7 +1101,7 @@ class Git:
         skip = [f':(top,exclude){p}' for p in CHECK_IN_PATHS]
         ids = []
         for old, new in ((fork, measured), (f'{added}^', added)):
-            diff = self.git('diff', '--binary', '--full-index', old, new, '--', *skip)
+            diff = self.git('diff', '--full-index', old, new, '--', *skip)
             ids.append(self.git('patch-id', '--verbatim', stdin=diff).split()[:1])
         return ids[0] == ids[1]
 
