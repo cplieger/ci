@@ -1392,7 +1392,7 @@ class ResultFiles(unittest.TestCase):
             perf_gate.merge_results(self.dir, 'cplieger-b')
 
     def test_a_shard_without_its_attempt_is_not_read(self):
-        for name, scenario in (('shard-1-of-1', 'legacy'), ('shard-1-of-1-attempt-1', 'files')):
+        for name, scenario in (('shard-1-of-2', 'legacy'), ('shard-1-of-1-attempt-1', 'files')):
             d = self.dir / f'perf-results-cplieger-b-measure-{name}'
             d.mkdir()
             (d / 'results.json').write_text(json.dumps(results([cell(scenario=scenario)])))
@@ -1438,7 +1438,7 @@ class Attempts(unittest.TestCase):
         self.assertEqual(self.scenarios(since=2), [('s1', 1002.0), ('s2', 1002.0)])
 
     def test_the_incident_re_plan_reads_the_re_run_s_shards_and_refuses_both(self):
-        # Attempt 1's compare planned three remeasure shards and attempt 2's two, of one cell.
+        # Attempt 1 planned three shards and attempt 2 two; w1 and w2 sit in both plans.
         for i, m, attempt in ((1, 3, 1), (2, 3, 1), (3, 3, 1), (1, 2, 2), (2, 2, 2)):
             name = f'perf-results-cplieger-a-remeasure-shard-{i}-of-{m}-attempt-{attempt}'
             (self.dir / name).mkdir()
@@ -1449,6 +1449,12 @@ class Attempts(unittest.TestCase):
         self.assertEqual(sorted(c['reps'][0] for c in merged['cells']), [1002.0, 1002.0])
         with self.assertRaisesRegex(ValueError, 'mixes shard counts'):
             perf_gate.merge_results(self.dir, 'cplieger-a', 'remeasure', since=1)
+
+    def test_a_shard_folder_with_no_results_file_fails(self):
+        self.shard('measure', 1, 2, 1)
+        (self.dir / 'perf-results-cplieger-a-measure-shard-2-of-2-attempt-1').mkdir()
+        with self.assertRaisesRegex(ValueError, 'shard-2-of-2-attempt-1 holds no results file'):
+            self.scenarios('measure')
 
     def test_a_partial_rerun_takes_each_shard_from_its_newest_attempt(self):
         for i in range(1, 6):
@@ -1696,6 +1702,45 @@ class Cli(unittest.TestCase):
         argv = ('--check-file', head, '--base', base, '--calibrations', str(self.dir / 'cal'))
         self.assertEqual(self.main(*argv, '--repo', REPO, '--head', HEAD), 1)
         self.assertIn('NaN is not a finite number', self.output)
+
+    def test_the_results_readers_need_their_prefix_and_the_verdict_its_attempt(self):
+        d, f = str(self.dir), str(self.dir / 'f.json')
+        cases = {
+            'compare': (
+                (
+                    '--budgets',
+                    f,
+                    '--base',
+                    f,
+                    '--results',
+                    d,
+                    '--calibrations',
+                    d,
+                    '--repo',
+                    REPO,
+                    '--head',
+                    HEAD,
+                    '--remeasure-out',
+                    f,
+                    '--plan-doc',
+                    f,
+                    '--set',
+                    'pr',
+                ),
+                ['--prefix'],
+            ),
+            'verdict': (
+                ('--verdict', d, '--budgets', f, '--results', d),
+                ['--prefix', '--remeasure-attempt'],
+            ),
+            'bench': (('--bench', d, '--out', f), ['--prefix']),
+        }
+        for name, (argv, missing) in cases.items():
+            with self.subTest(name):
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit):
+                    perf_gate.main(list(argv))
+                self.assertIn(f'missing {", ".join(missing)}', err.getvalue())
 
     def test_compare_needs_the_plan(self):
         b = self.put('budgets.json', budgets([]))

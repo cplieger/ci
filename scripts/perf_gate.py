@@ -1017,12 +1017,16 @@ def shard_groups(
     directory: str | pathlib.Path, prefix: str, stage: str = 'measure', since: int = 1
 ) -> dict[str, list[pathlib.Path]]:
     """newest_shards' results files by run (`run-NN`, or '' for a run of one), each run
-    holding every shard of one shard count; anything else is an error."""
+    holding every shard of one shard count, each with a results file; anything else is an
+    error."""
     runs: dict[str, dict[int, set]] = {}
     files: dict[str, list[pathlib.Path]] = {}
     for (run, i, m), d in newest_shards(directory, prefix, stage, since).items():
+        found = sorted(d.rglob('*.json'))
+        if not found:
+            raise ValueError(f'{d.name} holds no results file under {directory}')
         runs.setdefault(run, {}).setdefault(m, set()).add(i)
-        files.setdefault(run, []).extend(sorted(d.rglob('*.json')))
+        files.setdefault(run, []).extend(found)
     if not runs:
         raise ValueError(f'no results of perf-results-{prefix}-{stage}-* under {directory}')
     for run, counts in runs.items():
@@ -1161,7 +1165,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         '--base', help="the base ref's budgets.json, where a missing file is an empty one"
     )
-    p.add_argument('--results', help='the directory of measured results files')
+    p.add_argument('--results', help='the downloaded perf-results-<prefix>-measure-* folders')
     p.add_argument(
         '--prefix',
         help="perf-ci.yaml's artifact prefix: read only that call's shard directories",
