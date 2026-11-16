@@ -11,7 +11,7 @@ tools=${DASHBOARD_CHECK_TOOLS:-${RUNNER_TEMP:?}/dashboard-check}
 
 bash "$here/install.sh" "$tools"
 
-args=(--github --cue "$tools/cue")
+args=(--github --cue "$tools/cue" --promql "$tools/promql-check")
 for schema in "$tools"/schema-*.cue; do
   tag=${schema##*/schema-}
   args+=(--schema "${tag%.cue}=${schema}")

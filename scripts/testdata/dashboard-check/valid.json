@@ -334,7 +334,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "delta(queue_depth{worker=~\"$worker\"}[$__interval])"
+                        "expr": "delta(queue_depth{worker=~\"$worker\"}[$__rate_interval])"
                       }
                     },
                     "refId": "A",

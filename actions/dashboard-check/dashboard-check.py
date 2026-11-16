@@ -75,6 +75,7 @@ class Finding:
 class Checker:
     def __init__(self) -> None:
         self.findings: list[Finding] = []
+        self.query_input = QueryInput()
 
     def fail(self, where: str, rule: str, message: str, fix: str) -> None:
         self.findings.append(Finding(where, rule, message, fix))
@@ -258,6 +259,7 @@ class Checker:
         spec = obj(var.get('spec'))
         name = spec.get('name', '?')
         at = f'{where} variable {name}'
+        self.query_input.variable(at, kind, spec, var.get('group'))
         if kind in CLOSED_SET_VARIABLES and spec.get('allowCustomValue') is not False:
             self.fail(
                 at,
@@ -305,6 +307,7 @@ class Checker:
             )
         for i, query in enumerate(queries):
             self.datasource(query.get('datasource'), f'{at} query {i}', query.get('group'))
+            self.query_input.query(f'{at} query {i}', 'panel', query, 'expr')
 
         if not title.strip():
             self.fail(at, 'standard', 'the panel has no title.', 'give it a title in reader words.')
@@ -480,14 +483,15 @@ class Checker:
             if isinstance(e, dict)
         }
         self.layout_order(ctx)
+        self.layout_overlap(ctx, elements)
         self.cursor_sync(spec, ctx, types)
 
         for i, annotation in objs(spec.get('annotations')):
             a_spec = obj(annotation.get('spec'))
             if not a_spec.get('builtIn'):
-                self.datasource(
-                    obj(a_spec.get('query')).get('datasource'), f'spec.annotations[{i}]'
-                )
+                query = obj(a_spec.get('query'))
+                self.datasource(query.get('datasource'), f'spec.annotations[{i}]')
+                self.query_input.query(f'spec.annotations[{i}]', 'annotation', query, 'expr')
         ctx.variables[:0] = (('spec.variables', v) for _, v in objs(spec.get('variables')))
         for where, var in ctx.variables:
             self.variable(var, where, ctx)
@@ -532,6 +536,22 @@ class Checker:
                     'grid items are not listed in y-then-x order, so the file order differs from the reading order.',
                     'sort the items by y, then x.',
                 )
+
+    def layout_overlap(self, ctx: Layout, elements: dict) -> None:
+        for where, items in ctx.grids:
+            boxes = [grid_box(item, elements) for item in items]
+            for i, a in enumerate(boxes):
+                for b in boxes[i + 1 :]:
+                    if overlaps(a[1], b[1]):
+                        self.fail(
+                            where,
+                            'layout',
+                            f'{a[0]} {box_text(a[1])} and {b[0]} {box_text(b[1])} cover the same '
+                            'grid cells, so Grafana draws one over the other or moves one from '
+                            'where the file puts it.',
+                            "move one so the boxes only touch: its y at or past the other's "
+                            "y + height, or its x at or past the other's x + width.",
+                        )
 
     def cursor_sync(self, spec: dict, ctx: Layout, types: dict) -> None:
         if spec.get('cursorSync') == 'Crosshair':
@@ -645,6 +665,152 @@ class Layout:
         self.refs.append((name, where))
 
 
+@dataclasses.dataclass
+class QueryInput:
+    """promql-check's input: every variable, which Grafana substitutes, and every Prometheus
+    query. Other groups are skipped: LogQL is not PromQL."""
+
+    variables: list = dataclasses.field(default_factory=list)
+    queries: list = dataclasses.field(default_factory=list)
+
+    def variable(self, where: str, kind: object, spec: dict, group: object = None) -> None:
+        if isinstance(kind, str) and isinstance(spec.get('name'), str):
+            self.variables.append(
+                {
+                    'name': spec['name'],
+                    'kind': kind,
+                    'multi': spec.get('multi') is True,
+                    'includeAll': spec.get('includeAll') is True,
+                }
+                | (interval_choices(spec) if kind == 'IntervalVariable' else {})
+                | ({'values': variable_values(kind, spec)} if kind in VALUED_VARIABLES else {})
+            )
+        if kind == 'QueryVariable':
+            # Grafana runs spec.query.spec.__legacyStringValue when that key is present, null as
+            # '', else spec.query.spec.query (getDataQueryForVariable); definition is only the
+            # editor's text.
+            query = obj(spec.get('query'))
+            legacy = '__legacyStringValue' in obj(query.get('spec'))
+            field = '__legacyStringValue' if legacy else 'query'
+            self.query(where, 'variable', query, field, spec.get('name'))
+        if kind == 'AdhocVariable' and group == 'prometheus':
+            # Grafana adds filters to every query; baseFilters only scope the key and value
+            # suggestions.
+            for i, f in objs(spec.get('filters')):
+                if (text := filter_matcher(f)) is not None:
+                    self.queries.append(
+                        {'where': f'{where} filters[{i}]', 'kind': 'filter', 'expr': text}
+                    )
+
+    def query(
+        self, where: str, kind: str, query: dict, field: str, variable: object = None
+    ) -> None:
+        if query.get('group') != 'prometheus':
+            return
+        spec = obj(query.get('spec'))
+        text = spec.get(field)
+        sent = {'where': where, 'kind': kind, 'expr': text if isinstance(text, str) else ''}
+        if isinstance(variable, str):
+            sent['variable'] = variable
+        if kind != 'variable':
+            sent |= {flag: True for flag in ('instant', 'range') if spec.get(flag) is True}
+        self.queries.append(sent)
+
+
+def filter_matcher(f: dict) -> str | None:
+    """The matcher @grafana/prometheus 13.1.2 adds to every query for one ad-hoc filter
+    (datasource.ts enhanceExprWithAdHocFilters, remapOneOf; rendering/labels.ts), or None for a
+    filter scenes 8.13.5 does not apply: incomplete, group-by or non-applicable."""
+    key, op, value = f.get('key'), f.get('operator'), f.get('value')
+    if not isinstance(key, str) or not isinstance(op, str) or not key or op in {'', 'groupBy'}:
+        return None
+    if f.get('nonApplicable') is True or not isinstance(value, str) or not value:
+        return None
+    if op in {'=|', '!=|'}:
+        values = f.get('values') if isinstance(f.get('values'), list) else []
+        op = '=~' if op == '=|' else '!~'
+        value = '|'.join(grafana_escape(v) for v in values if isinstance(v, str))
+    if op in {'=~', '!~'}:
+        value = grafana_escape(value)
+    name = key if re.fullmatch(r'[a-zA-Z_:][a-zA-Z0-9_:]*', key) else f'"{key}"'
+    return f'{name}{op}"{value}"'
+
+
+def grafana_escape(value: str) -> str:
+    """@grafana/prometheus 13.1.2 escaping.ts prometheusRegularEscape with
+    prometheusSpecialCharsInLabelValues off, its grafana v13.2.3 default."""
+    return value.replace('\\', '\\\\').replace("'", "\\\\'")
+
+
+VALUED_VARIABLES = {'CustomVariable', 'ConstantVariable'}
+
+
+def variable_values(kind: str, spec: dict) -> list[str]:
+    """The values a CustomVariable offers, its query read as scenes 8.13.5 CustomVariable.ts
+    does (JSON objects' values, else comma-separated with `\\,` a comma and `key : value`
+    giving the value), or the one a ConstantVariable holds."""
+    query = spec.get('query')
+    if not isinstance(query, str):
+        return []
+    if kind == 'ConstantVariable':
+        return [query]
+    if spec.get('valuesFormat') == 'json':
+        try:
+            options = json.loads(query)
+        except ValueError:
+            return []
+        if not isinstance(options, list):
+            return []
+        return [str(o.get('value')).strip() for o in options if isinstance(o, dict)]
+    out = []
+    for text in re.findall(r'(?:\\,|[^,])+', query):
+        text = text.replace('\\,', ',')
+        pair = re.fullmatch(r'\s*([^\n\r\u2028\u2029]+)\s:\s([^\n\r\u2028\u2029]+)', text)
+        out.append((pair.group(2) if pair else text).strip())
+    return out
+
+
+# grafana v13.2.3 variables/interval/reducer.ts initialIntervalVariableModelState.query.
+DEFAULT_INTERVALS = ('1m', '10m', '30m', '1h', '6h', '12h', '1d', '7d', '14d', '30d')
+
+
+def interval_choices(spec: dict) -> dict:
+    """What an IntervalVariable can send, as grafana v13.2.3 transformSaveModelSchemaV2ToScene.ts
+    reads it: the intervals of its query, else of its options, else Grafana's defaults, and its
+    auto option."""
+    query = spec.get('query')
+    if isinstance(query, str) and query:
+        intervals = intervals_of(query)
+    elif options := objs(spec.get('options')):
+        values = (o.get('value') or o.get('text') for _, o in options)
+        intervals = [v for v in values if isinstance(v, str)]
+    else:
+        intervals = list(DEFAULT_INTERVALS)
+    count = spec.get('auto_count')
+    return {
+        'intervals': intervals,
+        'auto': spec.get('auto') is True,
+        'autoMin': spec.get('auto_min') if isinstance(spec.get('auto_min'), str) else '',
+        'autoCount': count if isinstance(count, int) and not isinstance(count, bool) else 0,
+    }
+
+
+def intervals_of(query: str) -> list[str]:
+    """grafana v13.2.3 dashboard-scene/utils/utils.ts getIntervalsFromQueryString, with
+    JavaScript's ASCII \\w and line-ending `.`."""
+    found = [
+        m.group(0) for m in re.finditer(r'(["\'])([^\n\r\u2028\u2029]*?)\1|\w+', query, re.ASCII)
+    ]
+    if not found:
+        return list(DEFAULT_INTERVALS)
+    out = []
+    for text in found:
+        value = re.sub(r'["\']+', '', text)
+        if not value.startswith('$__auto_interval_') and value not in out:
+            out.append(value)
+    return out
+
+
 def thresholds_visible(ptype: str, options: dict, dflt: dict) -> bool:
     steps = objs(obj(dflt.get('thresholds')).get('steps'))
     return len(steps) >= 2 and paints_thresholds(ptype, options, dflt)
@@ -678,6 +844,26 @@ def side_by_side(a: tuple, b: tuple) -> bool:
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
     return ay < by + bh and by < ay + ah and (ax + aw <= bx or bx + bw <= ax)
+
+
+def overlaps(a: tuple, b: tuple) -> bool:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah
+
+
+def grid_box(item: dict, elements: dict) -> tuple[str, tuple]:
+    """(the item's element and panel title, its x, y, width, height)."""
+    s = obj(item.get('spec'))
+    name = obj(s.get('element')).get('name')
+    title = obj(obj(elements.get(name)).get('spec')).get('title')
+    label = f'{name} "{title}"' if isinstance(title, str) else str(name)
+    return label, (s.get('x', 0), s.get('y', 0), s.get('width', 0), s.get('height', 0))
+
+
+def box_text(box: tuple) -> str:
+    x, y, width, height = box
+    return f'(x={x}, y={y}, width={width}, height={height})'
 
 
 def obj(value: object) -> dict:
@@ -724,7 +910,10 @@ def is_classic(doc: dict) -> bool:
 
 
 def check(
-    doc: object, base: object = None, vet_spec: Callable[[], list[Finding]] | None = None
+    doc: object,
+    base: object = None,
+    vet_spec: Callable[[], list[Finding]] | None = None,
+    query_check: Callable[[QueryInput], list[Finding]] | None = None,
 ) -> tuple[list[Finding], list[str]]:
     """The spec rules run only on a spec vet_spec accepts: they read schema-typed fields unguarded."""
     checker = Checker()
@@ -771,7 +960,63 @@ def check(
         if vetted:
             return checker.findings + vetted, []
     checker.spec(spec)
+    if query_check is not None:
+        checker.findings += query_check(checker.query_input)
     return checker.findings, []
+
+
+APP_DASHBOARD = re.compile(r'grafana-dashboard(-.+)?\.json')
+
+
+def is_app_dashboard(path: pathlib.Path) -> bool:
+    """An app's bundled dashboard sits at the repository root, which the action's paths are
+    relative to."""
+    return len(path.parts) == 1 and APP_DASHBOARD.fullmatch(path.name) is not None
+
+
+@dataclasses.dataclass
+class QueryCheck:
+    """Runs promql-check, which owns every PromQL fact, on one file's queries."""
+
+    binary: str
+    app: bool
+    checked: int = 0
+
+    def __call__(self, queries: QueryInput) -> list[Finding]:
+        try:
+            report = self.run(queries)
+            found = [
+                Finding(f['where'], f['rule'], f['message'], f['fix']) for f in report['findings']
+            ]
+            self.checked = report['checked']
+        except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as err:
+            return [
+                Finding(
+                    'spec',
+                    'promql',
+                    f'the PromQL query check did not run: {err}.',
+                    'check --promql.',
+                )
+            ]
+        return found
+
+    def run(self, queries: QueryInput) -> dict:
+        payload = {'app': self.app, 'variables': queries.variables, 'queries': queries.queries}
+        result = subprocess.run(
+            [self.binary],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ValueError(f'exit {result.returncode}: {result.stderr.strip()}')
+        return json.loads(result.stdout)
+
+    def summary(self) -> str:
+        rules = 'app dashboard: Q1, Q2, Q3' if self.app else 'not an app dashboard: Q1 only'
+        return f'{self.checked} Prometheus queries parsed, {rules}'
 
 
 STRICT_CUE = """package {package}
@@ -954,6 +1199,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--github', action='store_true', help='print GitHub workflow annotations')
     parser.add_argument('--cue', required=True, help='path to the cue binary')
+    parser.add_argument('--promql', required=True, help='path to the promql-check binary')
     parser.add_argument(
         '--schema', action='append', required=True, type=parse_schema, metavar='TAG=FILE'
     )
@@ -975,6 +1221,7 @@ def main(argv: list[str] | None = None) -> int:
     failed = False
     for path in args.files:
         doc, error = load(path)
+        queries = QueryCheck(args.promql, is_app_dashboard(path))
         if base_error:
             found, notices = (
                 [
@@ -994,7 +1241,7 @@ def main(argv: list[str] | None = None) -> int:
                 [],
             )
         else:
-            found, notices = check(doc, base, lambda p=path: vet(p, args.cue, args.schema))
+            found, notices = check(doc, base, lambda p=path: vet(p, args.cue, args.schema), queries)
         for note in notices:
             if args.github:
                 print(f'::notice file={escape_property(str(path))}::{escape_data(note)}')
@@ -1013,7 +1260,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f'{path}: {len(found)} finding(s)', file=sys.stderr)
         elif not notices:
             tags = ', '.join(tag for tag, _ in args.schema)
-            print(f'{path}: ok (schema v2, vetted against {tags})')
+            print(f'{path}: ok (schema v2, vetted against {tags}; {queries.summary()})')
     return 1 if failed else 0
 
 
