@@ -120,6 +120,7 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: perf-results-${{ needs.measure.outputs.prefix }}-measure-*
+          merge-multiple: true
           path: ${{ runner.temp }}/artifacts
 
       - name: Propose and sign
@@ -132,32 +133,11 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          # perf_gate.py --calibrate reads one directory per run, its shards
-          # beneath; a single run's artifacts carry no run-NN- part.
-          runs="$RUNNER_TEMP/runs"
-          mkdir -p "$runs"
-          shopt -s nullglob
-          for d in "$RUNNER_TEMP/artifacts/perf-results-${PREFIX}-measure-"*/; do
-            name=$(basename "$d")
-            name=${name#"perf-results-${PREFIX}-measure-"}
-            case "$name" in
-              run-[0-9]*-shard-*) run=${name%%-shard-*}; shard=${name#"${run}-"} ;;
-              shard-*) run='run-01'; shard=$name ;;
-              *) echo "::error::unexpected results artifact ${name}"; exit 1 ;;
-            esac
-            mkdir -p "$runs/$run"
-            mv "$d" "$runs/$run/$shard"
-          done
-          found=$(find "$runs" -mindepth 1 -maxdepth 1 -type d | wc -l)
-          if [ "$found" -ne "$RUNS" ]; then
-            echo "::error::found results of ${found} runs, not the ${RUNS} dispatched"
-            exit 1
-          fi
           out="$RUNNER_TEMP/proposed"
           mkdir -p "$out"
           defaults=()
           [ -f measured/tests/perf/budgets.json ] && defaults=(--budgets measured/tests/perf/budgets.json)
-          python3 ci/scripts/perf_gate.py --calibrate "$runs" "${defaults[@]}" \
+          python3 ci/scripts/perf_gate.py --calibrate "$RUNNER_TEMP/artifacts" --prefix "$PREFIX" --runs "$RUNS" "${defaults[@]}" \
             --out "$out/budgets.proposed.json" --repo "$REPO" --commit "$COMMIT" \
             --runner ubuntu-26.04 --run-id "$RUN_ID" --run-url "$RUN_URL"
           # The names tests/perf/calibrations/ holds, so the file is checked in as

@@ -191,6 +191,8 @@ jobs:
     outputs:
       remeasure: ${{ steps.compare.outputs.remeasure }}
       matrix: ${{ steps.compare.outputs.matrix }}
+      # A re-run compare plans its own remeasure shards; the verdict reads only theirs.
+      attempt: ${{ github.run_attempt }}
     steps:
       # The provenance check runs `git merge-base --is-ancestor` against each
       # calibrated commit and reads the base ref's budgets.json.
@@ -230,6 +232,7 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: perf-results-${{ needs.plan.outputs.prefix }}-measure-*
+          merge-multiple: true
           path: ${{ runner.temp }}/results
 
       - name: Compare
@@ -323,12 +326,14 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: perf-results-${{ needs.plan.outputs.prefix }}-measure-*
+          merge-multiple: true
           path: ${{ runner.temp }}/results
 
       - name: Download the re-measured reps
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: perf-results-${{ needs.plan.outputs.prefix }}-remeasure-*
+          merge-multiple: true
           path: ${{ runner.temp }}/again
 
       - name: Verdict
@@ -336,6 +341,7 @@ jobs:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           PREFIX: ${{ needs.plan.outputs.prefix }}
           REMEASURED: ${{ needs.remeasure.result }}
+          COMPARED: ${{ needs.compare.outputs.attempt }}
         run: |
           set -euo pipefail
           if [ "$REMEASURED" != success ]; then
@@ -344,6 +350,7 @@ jobs:
           fi
           python3 "$CI_TOOLS/perf_gate.py" \
             --verdict "$RUNNER_TEMP/again" \
+            --remeasure-attempt "$COMPARED" \
             --budgets tests/perf/budgets.json \
             --results "$RUNNER_TEMP/results" \
             --prefix "$PREFIX" \

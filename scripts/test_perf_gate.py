@@ -30,6 +30,7 @@ CELL = {
     'window': 'cold',
 }
 RUN_URL = 'https://github.com/cplieger/ci/actions/runs/'
+PREFIX = 'cplieger-marotte'
 # The artifact prefix of a repository cplieger/a-measure-x, whose shards a
 # `perf-results-cplieger-a-measure-*` download pattern also matches.
 OTHER = 'perf-results-cplieger-a-measure-x'
@@ -1359,13 +1360,13 @@ class Bench(unittest.TestCase):
 
 class ResultFiles(unittest.TestCase):
     NAMES = (
-        'perf-results-cplieger-a-measure-shard-1-of-2',
-        'perf-results-cplieger-a-measure-run-03-shard-2-of-2',
-        'perf-results-cplieger-a-measure-x-measure-shard-1-of-1',
-        'perf-results-cplieger-a-remeasure-shard-1-of-1',
-        'perf-results-cplieger-a-remeasure-x-remeasure-shard-1-of-1',
-        'perf-results-cplieger-.kiro-measure-shard-1-of-1',
-        'perf-results-cplieger-xkiro-measure-shard-1-of-1',
+        'perf-results-cplieger-a-measure-shard-1-of-2-attempt-1',
+        'perf-results-cplieger-a-measure-run-03-shard-2-of-2-attempt-1',
+        'perf-results-cplieger-a-measure-x-measure-shard-1-of-1-attempt-1',
+        'perf-results-cplieger-a-remeasure-shard-1-of-1-attempt-1',
+        'perf-results-cplieger-a-remeasure-x-remeasure-shard-1-of-1-attempt-1',
+        'perf-results-cplieger-.kiro-measure-shard-1-of-1-attempt-1',
+        'perf-results-cplieger-xkiro-measure-shard-1-of-1-attempt-1',
     )
 
     def setUp(self):
@@ -1393,11 +1394,71 @@ class ResultFiles(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no results'):
             perf_gate.merge_results(self.dir, 'cplieger-b')
 
+    def test_a_shard_without_its_attempt_is_not_read(self):
+        (self.dir / 'perf-results-cplieger-b-measure-shard-1-of-1').mkdir()
+        with self.assertRaisesRegex(ValueError, 'no results'):
+            perf_gate.merge_results(self.dir, 'cplieger-b')
+
     def test_every_name_the_plan_writes_is_read(self):
         for runs in (1, 2):
             for job in perf_gate.plan(PLAN, 'pr', runs=runs)['include']:
                 with self.subTest(name=job['name']):
                     self.assertRegex(job['name'], rf'^{perf_gate.SHARD_NAME}$')
+
+
+class Attempts(unittest.TestCase):
+    """merge_results across a run's attempts: each artifact name ends `-attempt-<n>`."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = pathlib.Path(tmp.name)
+
+    def shard(self, stage, i, m, attempt, metric='cpu_ms', run=''):
+        name = f'perf-results-cplieger-a-{stage}-{run}shard-{i}-of-{m}-attempt-{attempt}'
+        doc = results([cell(metric, (1000.0 + attempt,) * 3, scenario=f'{run}s{i}')])
+        (self.dir / name).mkdir()
+        (self.dir / name / 'results.json').write_text(json.dumps(doc))
+
+    def scenarios(self, stage='remeasure', since=1):
+        merged = perf_gate.merge_results(self.dir, 'cplieger-a', stage, since=since)
+        return sorted((c['scenario'], c['reps'][0]) for c in merged['cells'])
+
+    def test_a_rerun_reads_only_the_shards_of_the_compare_it_follows(self):
+        for i in (1, 2, 3):
+            self.shard('remeasure', i, 3, 1)
+        for i in (1, 2):
+            self.shard('remeasure', i, 2, 2)
+        self.assertEqual(self.scenarios(since=2), [('s1', 1002.0), ('s2', 1002.0)])
+
+    def test_a_partial_rerun_takes_each_shard_from_its_newest_attempt(self):
+        for i in range(1, 6):
+            self.shard('measure', i, 5, 1)
+        self.shard('measure', 3, 5, 2)
+        got = self.scenarios('measure')
+        self.assertEqual(
+            got, [('s1', 1001.0), ('s2', 1001.0), ('s3', 1002.0), ('s4', 1001.0), ('s5', 1001.0)]
+        )
+
+    def test_a_missing_shard_fails(self):
+        self.shard('measure', 1, 3, 1)
+        self.shard('measure', 3, 3, 1)
+        with self.assertRaisesRegex(ValueError, 'shard 2 of 3'):
+            self.scenarios('measure')
+
+    def test_shards_of_two_plans_fail(self):
+        self.shard('remeasure', 1, 2, 1)
+        self.shard('remeasure', 1, 3, 1)
+        with self.assertRaisesRegex(ValueError, 'shard counts'):
+            self.scenarios()
+
+    def test_runs_are_grouped_and_each_must_be_whole(self):
+        for run in ('run-01-', 'run-02-'):
+            for i in (1, 2):
+                self.shard('measure', i, 2, 1, run=run)
+        groups = perf_gate.shard_groups(self.dir, 'cplieger-a')
+        self.assertEqual(sorted(groups), ['run-01', 'run-02'])
+        self.assertEqual([len(v) for v in groups.values()], [2, 2])
 
 
 def github_outputs(text):
@@ -1466,9 +1527,9 @@ class Cli(unittest.TestCase):
         if other is None:
             self.put('results/shard-1/results.json', results(cells) if shard is None else shard)
         else:
-            own = 'results/perf-results-cplieger-a-measure-shard-1-of-1/results.json'
+            own = 'results/perf-results-cplieger-a-measure-shard-1-of-1-attempt-1/results.json'
             self.put(own, results(cells))
-            self.put(f'results/{OTHER}-measure-shard-1-of-1/results.json', results(other))
+            self.put(f'results/{OTHER}-measure-shard-1-of-1-attempt-1/results.json', results(other))
         argv = ('--budgets', b, '--base', b, '--results', str(self.dir / 'results'))
         argv += ('--calibrations', str(self.dir / 'cal'), '--repo', REPO, '--head', HEAD)
         argv += ('--plan-doc', self.put('plan.json', plan), '--set', 'pr')
@@ -1640,11 +1701,16 @@ class Cli(unittest.TestCase):
 
     def test_calibrate_writes_the_proposed_file(self):
         for i in range(10):
-            self.put(f'runs/run-{i:02d}/shard-1/results.json', run_doc({'cpu_ms': (1000.0,) * 3}))
+            name = f'perf-results-{PREFIX}-measure-run-{i + 1:02d}-shard-1-of-1-attempt-1'
+            self.put(f'runs/{name}/results.json', run_doc({'cpu_ms': (1000.0,) * 3}))
         out = self.dir / 'budgets.proposed.json'
         argv = (
             '--calibrate',
             str(self.dir / 'runs'),
+            '--prefix',
+            PREFIX,
+            '--runs',
+            '10',
             '--out',
             str(out),
             '--repo',
@@ -1656,6 +1722,8 @@ class Cli(unittest.TestCase):
         self.assertEqual(self.main(*argv), 0)
         proposed = json.loads(out.read_text())
         self.assertEqual((proposed['runs'], only_cell(proposed)['tier']), (10, 'gated'))
+        self.assertEqual(self.main(*argv[:5], '9', *argv[6:]), 1)
+        self.assertIn('10 runs, not the 9 dispatched', self.output)
 
     def test_plan_writes_the_matrix(self):
         p = self.put('plan.json', PLAN)
@@ -1714,15 +1782,20 @@ class Cli(unittest.TestCase):
         b = self.put('budgets.json', budgets([entry(source=RUN_URL + '100')]))
         red = cell(reps=(1600.0, 1600.0, 1600.0))
         self.put(
-            'results/perf-results-cplieger-a-measure-shard-1-of-1/results.json', results([red])
+            'results/perf-results-cplieger-a-measure-shard-1-of-1-attempt-1/results.json',
+            results([red]),
         )
-        again = 'again/perf-results-cplieger-a-remeasure-shard-1-of-1/results.json'
+        again = 'again/perf-results-cplieger-a-remeasure-shard-1-of-1-attempt-2/results.json'
         self.put(again, results([cell(reps=(1000.0,) * 3)]))
-        other = 'again/perf-results-cplieger-a-remeasure-x-remeasure-shard-1-of-1/results.json'
+        other = 'again/perf-results-cplieger-a-remeasure-x-remeasure-shard-1-of-1-attempt-2/results.json'
         self.put(other, results([red]))
+        stale = 'again/perf-results-cplieger-a-remeasure-shard-1-of-2-attempt-1/results.json'
+        self.put(stale, results([red]))
         argv = ('--verdict', str(self.dir / 'again'), '--budgets', b)
         argv += ('--results', str(self.dir / 'results'), '--prefix', 'cplieger-a')
-        self.assertEqual(self.main(*argv), 0)
+        self.assertEqual(self.main(*argv, '--remeasure-attempt', '2'), 0)
+        self.assertEqual(self.main(*argv, '--remeasure-attempt', '1'), 1)
+        self.assertIn('shard counts', self.output)
 
 
 if __name__ == '__main__':

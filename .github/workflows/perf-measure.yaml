@@ -102,6 +102,7 @@ jobs:
           CELLS: ${{ inputs.cells }}
           PERF_BUILD: ${{ runner.temp }}/perf-build
           RUNNER_LABEL: ${{ inputs.runner || 'ubuntu-26.04' }}
+          ARTIFACT: perf-results-${{ inputs.name }}-attempt-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/perf-results"
@@ -122,11 +123,15 @@ jobs:
           doc['runner'], doc['cpu_model'] = sys.argv[2], sys.argv[3]
           path.write_text(json.dumps(doc) + '\n')
           EOF
+          # The artifact holds a folder named after it, so a merged download lays
+          # out one artifact as it does many.
+          mkdir -p "$RUNNER_TEMP/perf-upload/$ARTIFACT"
+          cp "$out/results.json" "$RUNNER_TEMP/perf-upload/$ARTIFACT/results.json"
 
       - name: Upload the results
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: perf-results-${{ inputs.name }}
-          path: ${{ runner.temp }}/perf-results/results.json
+          name: perf-results-${{ inputs.name }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/perf-upload
           if-no-files-found: error
           retention-days: 7
