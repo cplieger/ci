@@ -1683,8 +1683,8 @@ commit_in "$NX" "feat: initial" go.mod='module example.com/nx' main.go=v1 \
   node_modules/flatted/go.mod='module github.com/vendored/flatted' node_modules/flatted/f.go=v1 >/dev/null
 NXD=$(disc "$NX")
 chk "H11 a go root's lanes skip the internal and sentinel modules" "$NXD" '["web"]|["alpha","tools/gen"]|[]'
-chk "H11 and its version leaves out every nested module but the subpackage's sentinel and vendored trees" \
-  "$(root_scope "$NX" "$NXD" go)" 'alpha alpha/internal/gen internal/gen tools tools/gen '
+chk "H11 and its version leaves out every nested module but the subpackage's sentinel" \
+  "$(root_scope "$NX" "$NXD" go)" 'alpha alpha/internal/gen internal/gen node_modules/flatted tools tools/gen '
 chk "H11 a docker root keeps a module outside every lane, its image built from the tree" \
   "$(root_scope "$NX" "$NXD" docker)" 'alpha alpha/internal/gen tools/gen '
 mkdir -p "$L/beta/web"
