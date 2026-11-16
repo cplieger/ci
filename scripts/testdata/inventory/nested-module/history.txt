@@ -80,14 +80,19 @@ require (
 	example.com/lane v1.0.0
 	example.com/sys v0.30.0
 )
-@@ commit T_sys_split parent T_sys
+@@ commit T_sys_split_go parent T_sys
 @@ file internal/other/go.mod
 module github.com/cplieger/app/internal/other
 
 go 1.27.1
 
 require example.com/sys v0.30.0
+@@ commit T_sys_split parent T_sys_split_go
+@@ file Dockerfile
+FROM scratch
 @@ commit T_sys_split_fresh parent T_sys
+@@ file Dockerfile
+FROM scratch
 @@ file internal/other/go.mod
 module github.com/cplieger/app/internal/other
 
@@ -129,3 +134,9 @@ module github.com/cplieger/app
 go 1.27.1
 
 require example.com/root v1.2.0 // indirect
+@@ commit B_docker parent B
+@@ file Dockerfile
+FROM scratch
+@@ commit B_sys_docker parent B_sys
+@@ file Dockerfile
+FROM scratch

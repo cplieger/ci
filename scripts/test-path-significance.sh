@@ -508,9 +508,9 @@ chk "S38 and MODE=paths names it" "$(paths "$E1" "$E2")" 'false|[]|["lane"]|["la
 put docs/guide.md 'v3'
 E3=$(commit "docs: the guide")
 chk "S39 an unembedded doc alone still releases nothing" "$(paths "$E2" "$E3")" 'false|[]|[]|[]'
-# The first ls-tree is go-modules.sh's, the second the embed check's.
+# The first two ls-trees are go-modules.sh's (TO, then FROM), the third the embed check's.
 chk "S40 a tree the embed check cannot read fails the run, never drops the path" \
-  "$(failing_paths 'ls-tree*' 2 "$E2" "$E3")" '2|2'
+  "$(failing_paths 'ls-tree*' 3 "$E2" "$E3")" '2|3'
 chk_has "S40 and says why" "$(cat "$WORK/perr")" "cannot read the //go:embed directives at $E3"
 # Go's embed skips a subdirectory that holds its own go.mod, so a directory
 # pattern above a nested module never names that module's files.
@@ -745,6 +745,66 @@ W2=$(commit "fix(keyenc): the half alone")
 chk "S54 as half_changed reads the half" \
   "$(SUBPACKAGES_JSON='["keyenc/web"]' GO_LANES_JSON='[]' REPO_TYPE=none paths "$W1" "$W2")" \
   'false|["keyenc/web"]|[]|["keyenc/web/mod.ts"]'
+
+# A module is left out only when it is one at both ends of the range: the
+# commit that carves it out of a lane changes the lane's module zip.
+export REPO_TYPE=go SUBPACKAGES_JSON='[]' GO_LANES_JSON='["chartdata"]'
+newrepo carve-out
+put go.mod 'module example.com/go'
+put main.go 'package main'
+put chartdata/go.mod 'module example.com/go/chartdata'
+put chartdata/c.go 'package chartdata'
+put chartdata/internal/gen/gen.go 'package gen'
+put internal/gen/gen.go 'package gen'
+K0=$(commit "feat: initial")
+git tag v1.0.0 "$K0"
+put chartdata/internal/gen/go.mod 'module example.com/go/chartdata/internal/gen'
+K1=$(commit "feat(chartdata)!: move gen into its own module")
+chk "S55 carving a nested module out of an untagged lane releases the lane" \
+  "$(release S55 dev "$K0" "$K0" "$K1")" 'false|[]|["chartdata"]'
+chk "S55 MODE=paths names the new go.mod" "$(paths "$K0" "$K1")" \
+  'false|[]|["chartdata"]|["chartdata/internal/gen/go.mod"]'
+git tag chartdata/v1.0.0-dev.1 "$K0"
+chk "S55 as it does a lane measured from its own tag" "$(release S55t dev "$K0" "$K0" "$K1")" 'false|[]|["chartdata"]'
+git tag chartdata/v2.0.0-dev.1 "$K1"
+put chartdata/internal/gen/gen.go 'package gen // v2'
+K2=$(commit "chore(chartdata): regenerate")
+chk "S55 once it is a module at both ends its changes release nothing" \
+  "$(release S55s dev "$K1" "$K1" "$K2")" 'false|[]|[]'
+git rm -q chartdata/internal/gen/go.mod
+K3=$(commit "feat(chartdata): fold gen back into the lane")
+chk "S55 folding it back into the lane releases the lane" "$(release S55f dev "$K2" "$K2" "$K3")" 'false|[]|["chartdata"]'
+put internal/gen/go.mod 'module example.com/go/internal/gen'
+K4=$(commit "feat!: move the root's gen into its own module")
+chk "S55 carving one out of a go root releases the root" "$(paths "$K3" "$K4")" 'true|[]|[]|["internal/gen/go.mod"]'
+
+# Only <lane>/web is a TS package inside a lane: a lane that is a root
+# subpackage, or sits under one, still leaves out its nested modules.
+export REPO_TYPE=go SUBPACKAGES_JSON='["ui","pkg"]' GO_LANES_JSON='["ui","pkg/lane"]'
+newrepo lane-in-package
+put go.mod 'module example.com/app'
+put main.go 'package main'
+put ui/jsr.json '{"name":"@o/ui","version":"1.0.0"}'
+put ui/go.mod 'module example.com/app/ui'
+put ui/u.go 'package ui'
+put ui/internal/gen/go.mod 'module example.com/app/ui/internal/gen'
+put ui/internal/gen/g.go 'package gen'
+put ui/web/go.mod 'module web-ignore'
+put ui/web/jsr.json '{"name":"@o/ui-web","version":"1.0.0"}'
+put pkg/jsr.json '{"name":"@o/pkg","version":"1.0.0"}'
+put pkg/lane/go.mod 'module example.com/app/pkg/lane'
+put pkg/lane/l.go 'package lane'
+put pkg/lane/internal/gen/go.mod 'module example.com/app/pkg/lane/internal/gen'
+put pkg/lane/internal/gen/g.go 'package gen'
+put pkg/web/go.mod 'module web-ignore'
+I0=$(commit "feat: initial")
+chk "S56 go-modules.sh leaves out a lane's nested module, though the lane is or sits in a TS package" \
+  "$(bash "$TOOLS/go-modules.sh" boundaries HEAD | tr '\n' ' ')" 'pkg/lane pkg/lane/internal/gen ui ui/internal/gen '
+put ui/internal/gen/g.go 'package gen // v2'
+put pkg/lane/internal/gen/g.go 'package gen // v2'
+I1=$(commit "chore: regenerate both")
+chk "S56 so a change confined to them releases no lane; the packages ship their trees" \
+  "$(release S56 dev "$I0" "$I0" "$I1")" 'false|["ui","pkg"]|[]'
 cd "$WORK" || exit 1
 
 echo "PASS: path significance ($PASS checks)"

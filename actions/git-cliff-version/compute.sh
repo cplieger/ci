@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Version arithmetic for the release channels, configured by environment
-# (CHANNEL, EXCLUDE_PATHS, LANE, CLIFF_BIN, PENDING_VERSION, PENDING_COMMIT,
-# PENDING_IN_RANGE); results go to $GITHUB_OUTPUT.
+# (CHANNEL, LANE, GO_LANES_JSON and REPO_TYPE for the root, CLIFF_BIN,
+# PENDING_VERSION, PENDING_COMMIT, PENDING_IN_RANGE); results go to $GITHUB_OUTPUT.
 # `compute.sh pending-version <commit> [lane]` prints a pending promotion's
 # version instead. Callers: action.yml, scripts/release-state.sh,
 # test-cliff-bump-semantics.sh.
@@ -25,8 +25,9 @@ case "${1:-}" in
 esac
 
 CHANNEL="${CHANNEL:-stable}"
-EXCLUDE_PATHS="${EXCLUDE_PATHS:-}"
 LANE="${LANE:-}"
+GO_LANES_JSON="${GO_LANES_JSON:-[]}"
+REPO_TYPE="${REPO_TYPE:-}"
 CLIFF_BIN="${CLIFF_BIN:-git-cliff}"
 
 case "$CHANNEL" in
@@ -64,24 +65,17 @@ if [ -n "$LANE" ]; then
     fi
   fi
   export GIT_CLIFF__BUMP__INITIAL_TAG="${LANE}/${FIRST}"
-  # A nested module inside the lane is not in the lane's module zip, so its
-  # commits are not the lane's (go-modules.sh owns which modules those are).
-  if ! inner="$(GO_LANES_JSON="$(jq -cn --arg l "$LANE" '[$l]')" REPO_TYPE="" \
-    bash "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-modules.sh" boundaries "$SEED_AT")"; then
-    echo "::error::cannot list the nested modules of ${LANE} at ${SEED_AT}"
-    exit 1
-  fi
-  while IFS= read -r d; do
-    [[ $d != "${LANE}/"* ]] || ARGS+=(--exclude-path "${d}/**")
-  done <<<"$inner"
 else
   PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+$'
   PREFIX=""
   ARGS=(--tag-pattern "$PATTERN")
-  while IFS= read -r p; do
-    [ -z "$p" ] && continue
-    ARGS+=(--exclude-path "$p")
-  done <<<"$EXCLUDE_PATHS"
+  case "$REPO_TYPE" in
+    docker | go | ts | none) ;;
+    *)
+      echo "::error::repo-type must be docker, go, ts or none for the root version, got '${REPO_TYPE}'"
+      exit 1
+      ;;
+  esac
 fi
 
 # The dev counter reads existing tags, so a shallow or stale tag list would
@@ -197,6 +191,25 @@ is_ancestor() { # <a> <b> -> 0 when a is an ancestor of b, 1 when not; exits whe
   fi
   return "$rc"
 }
+# A commit counts for the lane only through the paths the lane ships: never
+# under a lane or a nested module it leaves out over the range (go-modules.sh
+# boundaries owns which those are).
+scope_of() { # <from> <to> -> sets SCOPE to ARGS plus an --exclude-path per such dir
+  local lanes out d
+  lanes="$GO_LANES_JSON"
+  [ -z "$LANE" ] || lanes="$(jq -cn --arg l "$LANE" '[$l]')"
+  if ! out="$(GO_LANES_JSON="$lanes" REPO_TYPE="$REPO_TYPE" \
+    bash "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-modules.sh" boundaries "$2" "$1")"; then
+    echo "::error::cannot list the nested modules over ${1:+${1}..}${2}"
+    exit 1
+  fi
+  SCOPE=("${ARGS[@]}")
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    [ -z "$LANE" ] || [[ $d == "${LANE}/"* ]] || continue
+    SCOPE+=(--exclude-path "${d}/**")
+  done <<<"$out"
+}
 # git-cliff supplies the change level only, read as its proposal against its
 # own base under the repo's [bump] rules (a 0.x breaking change is a minor on
 # cliff-alpha). An empty <from> means no stable tag, so git-cliff reads <to>'s
@@ -227,10 +240,11 @@ cliff_level() { # <from> <to> -> sets LEVEL and CLIFF_VERSION (its proposal)
   # names ships, so its type counts (go-embeds.py; render-notes.sh lists it).
   local -a with=() scope=(--config "${GIT_CLIFF_CONFIG:-cliff.toml}")
   local msg i
-  for ((i = 0; i < ${#ARGS[@]}; i++)); do
-    case "${ARGS[$i]}" in
-      --include-path) scope+=(--include "${ARGS[$((i + 1))]}") ;;
-      --exclude-path) scope+=(--exclude "${ARGS[$((i + 1))]}") ;;
+  scope_of "$1" "$to"
+  for ((i = 0; i < ${#SCOPE[@]}; i++)); do
+    case "${SCOPE[$i]}" in
+      --include-path) scope+=(--include "${SCOPE[$((i + 1))]}") ;;
+      --exclude-path) scope+=(--exclude "${SCOPE[$((i + 1))]}") ;;
     esac
   done
   python3 "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-embeds.py" --with-commits "${range[0]}" "${scope[@]}" \
@@ -241,7 +255,7 @@ cliff_level() { # <from> <to> -> sets LEVEL and CLIFF_VERSION (its proposal)
   while IFS= read -r -d '' msg; do
     with+=(--with-commit "$msg")
   done <"$err.embeds"
-  if ! ctx="$("$CLIFF_BIN" --bump --context "${ARGS[@]}" "${with[@]}" "${range[@]}" 2>"$err")"; then
+  if ! ctx="$("$CLIFF_BIN" --bump --context "${SCOPE[@]}" "${with[@]}" "${range[@]}" 2>"$err")"; then
     echo "::error::git-cliff --bump --context failed over ${range[*]}:"
     sed 's/^/  /' "$err" >&2 || true
     exit 1

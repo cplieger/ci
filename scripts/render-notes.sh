@@ -5,9 +5,8 @@
 #   [--security-shas F] [--inventory PATH] [--config FILE]; --print-previous, without --out,
 #   prints the lane's previous stable tag by version (the range start) and stops.
 #   [--sbom-changes] --sbom-prev F --sbom-new F alone prints the number of package
-#   changes the System packages block would list, and stops.
-# The notes cover previous..--release-commit plus the dependency and package diffs.
-# git-cliff executes the repo's cliff config: no token here.
+#   changes the System packages block would list, and stops. The notes cover
+#   previous..--release-commit and its diffs; git-cliff runs the repo's config, so no token.
 set -euo pipefail
 
 die() {
@@ -124,19 +123,19 @@ else
   SCOPE_ARGS=()
 fi
 
-# The nested modules whose commits and manifests are not the lane's: every
+# The dirs whose commits are not the lane's over <prev>..<commit>: every
 # boundary go-modules.sh lists for the root, those inside it for a lane.
-foreign_modules() { # <commit> -> one dir per line
+foreign_modules() { # <commit> <prev> -> one dir per line
   local all d
   if [ "$SITE" = lane ]; then
-    all=$(GO_LANES_JSON="$(jq -cn --arg l "$LANE" '[$l]')" REPO_TYPE="" bash "$(dirname "$0")/go-modules.sh" boundaries "$1") \
-      || die "cannot list the nested modules of ${LANE} at $1"
+    all=$(GO_LANES_JSON="$(jq -cn --arg l "$LANE" '[$l]')" REPO_TYPE="" bash "$(dirname "$0")/go-modules.sh" boundaries "$1" "$2") \
+      || die "cannot list the nested modules of ${LANE} over ${2:+$2..}$1"
     while IFS= read -r d; do
       [[ $d != "${LANE}/"* ]] || printf '%s\n' "$d"
     done <<<"$all"
   else
-    GO_LANES_JSON="$GO_LANES_JSON" REPO_TYPE="$SITE" bash "$(dirname "$0")/go-modules.sh" boundaries "$1" \
-      || die "cannot list the nested modules at $1"
+    GO_LANES_JSON="$GO_LANES_JSON" REPO_TYPE="$SITE" bash "$(dirname "$0")/go-modules.sh" boundaries "$1" "$2" \
+      || die "cannot list the nested modules over ${2:+$2..}$1"
   fi
 }
 
@@ -168,14 +167,11 @@ render() {
   local commit prev range changes deps="" sbom="" parts=()
   commit=$(git rev-parse --verify "${COMMIT}^{commit}") || die "--release-commit ${COMMIT} is not a commit"
   local foreign d
-  local -a inv_out=()
-  foreign=$(foreign_modules "$commit") || exit 2
-  while IFS= read -r d; do
-    [ -n "$d" ] || continue
-    SCOPE_ARGS+=(--exclude-path "$d/**")
-    inv_out+=(--exclude-dir "$d")
-  done <<<"$foreign"
   prev=$(previous_stable_tag)
+  foreign=$(foreign_modules "$commit" "$prev") || exit 2
+  while IFS= read -r d; do
+    [ -z "$d" ] || SCOPE_ARGS+=(--exclude-path "$d/**")
+  done <<<"$foreign"
   range=$commit
   [ -z "$prev" ] || range="${prev}..${commit}"
   # A commit the path filter drops that changes a file a non-test //go:embed
@@ -215,7 +211,7 @@ render() {
   fi
   if [ -n "$prev" ]; then
     changes+=$'\n\n'"**Full changelog**: https://github.com/${REPO}/compare/${prev}...${VERSION}"
-    local inv=(diff --git-dir . --from "$prev" --to "$commit" --lane "${LANE:-.}" "${inv_out[@]}" --format markdown)
+    local inv=(diff --git-dir . --from "$prev" --to "$commit" --lane "${LANE:-.}" --format markdown)
     [ -z "$SECURITY_SHAS" ] || inv+=(--security-shas "$SECURITY_SHAS")
     deps=$(python3 "$INVENTORY" "${inv[@]}")
   fi

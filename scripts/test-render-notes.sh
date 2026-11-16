@@ -461,4 +461,35 @@ PATH="$WORK/nm-stub:$PATH" refused "N20 a tree go-modules.sh cannot read fails t
   "cannot list the nested modules of chartdata" "$NM" --repo owner/nm --release-commit HEAD --site lane \
   --lane chartdata --version chartdata/v1.0.1 --out "$WORK/out"
 
+# The commit that carves a nested module out of a lane changes the lane's
+# module zip, so the lane's notes list it.
+CO="$WORK/carve-out"
+new_repo "$CO"
+mkdir -p "$CO/chartdata/internal/gen"
+printf 'module example.com/co\n\ngo 1.26\n' >"$CO/go.mod"
+printf 'module example.com/co/chartdata\n\ngo 1.26\n' >"$CO/chartdata/go.mod"
+c "$CO" chartdata/internal/gen/gen.go "feat: initial (#1)"
+c "$CO" chartdata/c.go "feat: the lane (#2)"
+git -C "$CO" tag chartdata/v1.0.0
+printf 'module example.com/co/chartdata/internal/gen\n\ngo 1.26\n' >"$CO/chartdata/internal/gen/go.mod"
+c "$CO" chartdata/internal/gen/go.mod "feat(chartdata)!: move gen into its own module (#3)"
+rn "$CO" --repo owner/co --release-commit HEAD --site lane --lane chartdata --version chartdata/v2.0.0
+expect "N21 a lane's notes list the commit that carves a nested module out of it" <<'EOF'
+### Added
+
+- [**breaking**] Move gen into its own module (#3)
+
+**Full changelog**: https://github.com/owner/co/compare/chartdata/v1.0.0...chartdata/v2.0.0
+EOF
+git -C "$CO" tag chartdata/v2.0.0
+c "$CO" chartdata/internal/gen/gen.go "fix(chartdata): regenerate (#4)"
+c "$CO" chartdata/c.go "fix(chartdata): a lane fix (#5)"
+rn "$CO" --repo owner/co --release-commit HEAD --site lane --lane chartdata --version chartdata/v2.0.1
+expect "N21 and the next notes leave out the module, one at both ends" <<'EOF'
+### Fixed
+
+- A lane fix (#5)
+
+**Full changelog**: https://github.com/owner/co/compare/chartdata/v2.0.0...chartdata/v2.0.1
+EOF
 echo "PASS: render-notes ($CHECKS checks)"

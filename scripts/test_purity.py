@@ -20,6 +20,11 @@ DEV_PIN = 'require github.com/cplieger/go/filesafe v1.0.0-dev.6\n'
 STABLE_PIN = 'require github.com/cplieger/go/filesafe v1.0.0\n'
 
 
+def owner(lanes, nested=()):
+    """inventory.Repo.owner's callable for `lanes` and the other `nested` modules."""
+    return lambda path: inventory.owner_of(path, lanes, {*lanes, *nested})
+
+
 class LaneHolds(unittest.TestCase):
     def test_a_nested_lane_with_a_dev_pin_is_held_with_its_violations(self):
         files = {
@@ -27,14 +32,14 @@ class LaneHolds(unittest.TestCase):
             'filesafe/go.mod': GO_MOD.format(sub='/filesafe'),
         }
         self.assertEqual(
-            purity.lane_holds(files, ['filesafe', 'wiregen']),
+            purity.lane_holds(files, owner(['filesafe', 'wiregen'])),
             {'wiregen': ['wiregen/go.mod: github.com/cplieger/go/filesafe v1.0.0-dev.6']},
         )
 
     def test_a_root_pin_is_no_hold(self):
         # The root cannot be held back; promote.py refuses it instead.
         files = {'go.mod': GO_MOD.format(sub='') + DEV_PIN}
-        self.assertEqual(purity.lane_holds(files, ['wiregen']), {})
+        self.assertEqual(purity.lane_holds(files, owner(['wiregen'])), {})
 
     def test_a_lane_half_counts_for_its_lane(self):
         files = {
@@ -42,7 +47,7 @@ class LaneHolds(unittest.TestCase):
             'sse/web/package.json': json.dumps({'dependencies': {'@cplieger/ui': '1.2.0-dev.3'}}),
         }
         self.assertEqual(
-            purity.lane_holds(files, ['sse']),
+            purity.lane_holds(files, owner(['sse'])),
             {'sse': ['sse/web/package.json: dependencies @cplieger/ui 1.2.0-dev.3']},
         )
 
@@ -54,15 +59,27 @@ class LaneHolds(unittest.TestCase):
                 {'dependencies': {'@cplieger/ui': '1.2.0-dev.3'}}
             ),
         }
-        self.assertEqual(purity.lane_holds(files, ['wiregen']), {})
+        self.assertEqual(purity.lane_holds(files, owner(['wiregen'])), {})
 
     def test_a_lane_is_matched_by_its_directory_not_its_prefix(self):
         files = {'wiregenx/go.mod': GO_MOD.format(sub='/wiregenx') + DEV_PIN}
-        self.assertEqual(purity.lane_holds(files, ['wiregen']), {})
+        self.assertEqual(purity.lane_holds(files, owner(['wiregen'])), {})
+
+    def test_a_nested_module_inside_a_lane_holds_nothing_and_the_lanes_own_pin_does(self):
+        files = {
+            'wiregen/go.mod': GO_MOD.format(sub='/wiregen'),
+            'wiregen/internal/gen/go.mod': GO_MOD.format(sub='/wiregen/internal/gen') + DEV_PIN,
+        }
+        self.assertEqual(purity.lane_holds(files, owner(['wiregen'], ['wiregen/internal/gen'])), {})
+        files['wiregen/go.mod'] += DEV_PIN
+        self.assertEqual(
+            purity.lane_holds(files, owner(['wiregen'], ['wiregen/internal/gen'])),
+            {'wiregen': ['wiregen/go.mod: github.com/cplieger/go/filesafe v1.0.0-dev.6']},
+        )
 
     def test_an_unreadable_manifest_raises(self):
         with self.assertRaises(purity.PurityInputError):
-            purity.lane_holds({'sse/web/package.json': '{'}, ['sse'])
+            purity.lane_holds({'sse/web/package.json': '{'}, owner(['sse']))
 
     def test_purity_file_selection(self):
         self.assertTrue(purity.is_purity_file('go.mod'))
@@ -134,6 +151,17 @@ class HeldLanesCli(unittest.TestCase):
             {'wiregen': ['wiregen/go.mod: github.com/cplieger/go/filesafe v1.0.0-dev.6']},
         )
         got = self.cli(pure)
+        self.assertEqual((got.returncode, got.stdout.strip()), (0, '{}'), got.stderr)
+
+    def test_a_dev_pin_in_a_nested_module_of_a_lane_holds_nothing(self):
+        c = self.commit(
+            {
+                'go.mod': GO_MOD.format(sub=''),
+                'wiregen/go.mod': GO_MOD.format(sub='/wiregen') + STABLE_PIN,
+                'wiregen/internal/gen/go.mod': GO_MOD.format(sub='/wiregen/internal/gen') + DEV_PIN,
+            }
+        )
+        got = self.cli(c)
         self.assertEqual((got.returncode, got.stdout.strip()), (0, '{}'), got.stderr)
 
     def test_an_unreadable_manifest_exits_2(self):

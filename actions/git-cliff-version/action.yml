@@ -12,11 +12,17 @@ inputs:
     description: "'dev' or 'stable'; decides which tags anchor the changed-path range (anchor_sha)."
     required: false
     default: stable
-  exclude-paths:
+  go-lanes:
     description: >-
-      Newline-separated globs excluded from the root version compute (one
-      `<dir>/**` per directory `scripts/go-modules.sh boundaries` lists).
-      Ignored when `lane` is set.
+      JSON array of the nested Go module lane dirs. The root version leaves
+      out their commits and those of every nested module the root does not
+      ship. Ignored when `lane` is set.
+    required: false
+    default: "[]"
+  repo-type:
+    description: >-
+      The root's type, `docker`, `go`, `ts` or `none` (release.yaml detect's
+      `type`). Required unless `lane` is set.
     required: false
     default: ""
   lane:
@@ -115,7 +121,8 @@ runs:
       shell: bash
       env:
         CHANNEL: ${{ inputs.channel }}
-        EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
+        GO_LANES_JSON: ${{ inputs.go-lanes }}
+        REPO_TYPE: ${{ inputs.repo-type }}
         LANE: ${{ inputs.lane }}
         PENDING_VERSION: ${{ inputs.pending-version }}
         PENDING_COMMIT: ${{ inputs.pending-commit }}

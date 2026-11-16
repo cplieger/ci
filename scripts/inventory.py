@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import posixpath
 import re
 import subprocess
@@ -25,6 +26,10 @@ import tomllib
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Collection
 
 
 class InventoryError(Exception):
@@ -372,11 +377,24 @@ def discover_lanes(paths: list[str]) -> list[str]:
     return sorted(lanes, key=len, reverse=True)
 
 
-def lane_of(path: str, lanes: list[str]) -> str:
-    for lane in lanes:
-        if path.startswith(lane + '/'):
-            return lane
+GO_MODULES = Path(__file__).resolve().with_name('go-modules.sh')
+
+
+def module_of(path: str, boundaries: Collection[str]) -> str:
+    """The nearest ancestor dir of `path` among go-modules.sh's `boundaries`, '.' for none."""
+    d = path
+    while '/' in d:
+        d = d.rsplit('/', 1)[0]
+        if d in boundaries:
+            return d
     return '.'
+
+
+def owner_of(path: str, lanes: Collection[str], boundaries: Collection[str]) -> str | None:
+    """The lane dir or '.' whose artifact ships `path`; None when a nested module
+    that is no lane owns it, so no artifact does."""
+    module = module_of(path, boundaries)
+    return module if module == '.' or module in lanes else None
 
 
 # Every parser returns (records without lane, skeleton). The skeleton is the
@@ -894,6 +912,7 @@ class Repo:
         self._parsed: dict[tuple[str, str], tuple[list[Record], str] | None] = {}
         self._trees: dict[str, list[str]] = {}
         self._present: dict[str, set[str]] = {}
+        self._boundaries: dict[tuple[str, tuple[str, ...]], frozenset[str]] = {}
 
     def git(self, *args: str) -> str:
         proc = subprocess.run(
@@ -966,12 +985,45 @@ class Repo:
     def lanes(self, sha: str) -> list[str]:
         return [d for d in discover_lanes(self.paths(sha)) if self._lane_has_go(sha, d)]
 
+    def repo_type(self, sha: str) -> str:
+        """release.yaml detect's type of the root at `sha`: Dockerfile, then jsr.json, then go.mod."""
+        root = {p for p in self.paths(sha) if '/' not in p}
+        kinds = (('Dockerfile', 'docker'), ('jsr.json', 'ts'), ('go.mod', 'go'))
+        return next((kind for name, kind in kinds if name in root), 'none')
+
+    def boundaries(self, sha: str, lanes: Collection[str]) -> frozenset[str]:
+        """go-modules.sh boundaries at `sha` for `lanes` and the root's type there."""
+        key = (sha, tuple(sorted(lanes)))
+        if key not in self._boundaries:
+            proc = subprocess.run(
+                ['bash', str(GO_MODULES), 'boundaries', sha],
+                cwd=self.git_dir,
+                capture_output=True,
+                text=True,
+                check=False,
+                env={
+                    **os.environ,
+                    'GO_LANES_JSON': json.dumps(list(key[1])),
+                    'REPO_TYPE': self.repo_type(sha),
+                },
+            )
+            if proc.returncode != 0:
+                raise GitReadError(f'go-modules.sh boundaries {sha}: {proc.stderr.strip()}')
+            self._boundaries[key] = frozenset(proc.stdout.splitlines())
+        return self._boundaries[key]
+
+    def owner(self, sha: str, lanes: Collection[str] | None = None) -> Callable[[str], str | None]:
+        """owner_of at `sha` for `lanes` (default: the lanes found there)."""
+        lanes = self.lanes(sha) if lanes is None else list(lanes)
+        found = self.boundaries(sha, lanes)
+        return lambda path: owner_of(path, lanes, found)
+
     def records(self, sha: str, lane: str | None = None) -> list[Record]:
-        lanes = self.lanes(sha)
+        owner = self.owner(sha)
         out = []
         for path in self.surfaces(sha):
-            file_lane = lane_of(path, lanes)
-            if lane is not None and file_lane != lane:
+            file_lane = owner(path)
+            if file_lane is None or (lane is not None and file_lane != lane):
                 continue
             records, _ = self.parsed(sha, path) or ([], '')
             out += [replace(r, lane=file_lane) for r in records]
@@ -1048,14 +1100,8 @@ def _named_change(named_a: set, named_b: set, indirect_a: set, indirect_b: set) 
     return 'no longer direct' if indirect_b else 'removed'
 
 
-def diff(
-    repo: Repo, a: str, b: str, lane: str | None, security: set[str], exclude: tuple[str, ...] = ()
-) -> dict:
-    """`exclude`: dirs whose records are left out (nested modules the lane does not ship)."""
-    ra, rb = (
-        [r for r in repo.records(rev, lane) if not any(r.file.startswith(d + '/') for d in exclude)]
-        for rev in (a, b)
-    )
+def diff(repo: Repo, a: str, b: str, lane: str | None, security: set[str]) -> dict:
+    ra, rb = repo.records(a, lane), repo.records(b, lane)
     kinds = {
         (r.lane, r.ecosystem, r.file, r.identity): r.kind for r in ra + rb if r.kind != 'indirect'
     }
@@ -1458,12 +1504,12 @@ def _judged(records: list[Record]) -> dict[tuple, list[Record]]:
 
 def _elsewhere(repo: Repo, main: str, target: str, path: str) -> dict[tuple, list[Record]]:
     """Where a slot that left `path` (a moved or split file) can still be carried:
-    the target's other surfaces of the same lane, each only for the slots it did
+    the target's other surfaces of the same module, each only for the slots it did
     not hold at main, since a surface that did is judged on its own."""
-    lanes = repo.lanes(target)
+    modules = repo.boundaries(target, repo.lanes(target))
     found: list[Record] = []
     for p in repo.surfaces(target):
-        if p == path or lane_of(p, lanes) != lane_of(path, lanes):
+        if p == path or module_of(p, modules) != module_of(path, modules):
             continue
         at_main = {r.slot for r in (repo.parsed(main, p) or ([], ''))[0]}
         found += [r for r in (repo.parsed(target, p) or ([], ''))[0] if r.slot not in at_main]
@@ -1630,9 +1676,6 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument('--lane', help="lane dir ('.' for the root artifact)")
     p.add_argument('--format', choices=('json', 'markdown'), default='json')
     p.add_argument('--security-shas', help='file of commit SHAs merged from Renovate security PRs')
-    p.add_argument(
-        '--exclude-dir', action='append', default=[], help='a dir whose records are left out'
-    )
     p = sub.add_parser('dominance')
     p.add_argument('--git-dir', required=True)
     p.add_argument('--base', required=True)
@@ -1660,9 +1703,7 @@ def run(args) -> int:
         return 2 if refused else 0
     if args.cmd == 'diff':
         a, b = repo.commit(args.from_rev), repo.commit(args.to_rev)
-        result = diff(
-            repo, a, b, args.lane, _security_shas(args.security_shas), tuple(args.exclude_dir)
-        )
+        result = diff(repo, a, b, args.lane, _security_shas(args.security_shas))
         print(
             render_markdown(result) if args.format == 'markdown' else json.dumps(result, indent=2),
             end='',

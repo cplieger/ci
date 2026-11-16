@@ -21,8 +21,12 @@ import json
 import os
 import re
 import sys
+from typing import TYPE_CHECKING
 
 import inventory
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def first_party(spec: str) -> bool:
@@ -174,17 +178,18 @@ def is_purity_file(path: str) -> bool:
     return base in ('go.mod', 'package.json', 'jsr.json') or base.startswith('Dockerfile')
 
 
-def lane_holds(files: dict[str, str], lanes: list[str]) -> dict[str, list[str]]:
+def lane_holds(files: dict[str, str], owner: Callable[[str], str | None]) -> dict[str, list[str]]:
     """{lane: [violation, ...]} of each nested lane whose own purity files, among
-    {path: text}, pin a first-party dependency at a dev version. A root
-    violation is no hold: the root cannot be held back, so promote.py refuses
-    it. Raises PurityInputError for a manifest it cannot read."""
+    {path: text}, pin a first-party dependency at a dev version; `owner` is
+    inventory.Repo.owner's. A root violation is no hold: the root cannot be
+    held back, so promote.py refuses it. A file no artifact ships holds
+    nothing. Raises PurityInputError for a manifest it cannot read."""
     held: dict[str, list[str]] = {}
     for path in sorted(files):
         if not is_purity_file(path):
             continue
-        lane = inventory.lane_of(path, lanes)
-        if lane == '.':
+        lane = owner(path)
+        if lane is None or lane == '.':
             continue
         found = purity_violations({path: files[path]})
         if found:
@@ -200,7 +205,8 @@ def tree_files(repo: inventory.Repo, commit: str) -> dict[str, str]:
 
 def held_lanes(commit: str, lanes: list[str]) -> dict[str, list[str]]:
     """lane_holds over the purity files at `commit` in the working directory's repository."""
-    return lane_holds(tree_files(inventory.Repo('.'), commit), lanes)
+    repo = inventory.Repo('.')
+    return lane_holds(tree_files(repo, commit), repo.owner(commit, lanes))
 
 
 def main(argv: list[str]) -> int:

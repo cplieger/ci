@@ -61,7 +61,6 @@ jobs:
       repair_publishes: ${{ steps.receipts.outputs.repair_publishes }}
       repair_images: ${{ steps.receipts.outputs.repair_images }}
       security_shas: ${{ steps.receipts.outputs.security_shas }}
-      exclude_paths: ${{ steps.gomodules.outputs.exclude_paths }}
       registries: ${{ steps.policy.outputs.registries }}
       platforms: ${{ steps.policy.outputs.platforms }}
       syft_config: ${{ steps.policy.outputs.syft_config }}
@@ -172,7 +171,6 @@ jobs:
         id: gomodules
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
-          REPO_TYPE: ${{ steps.type.outputs.type }}
         run: |
           set -euo pipefail
           # Nested Go modules (scripts/go-modules.sh list) each get their
@@ -198,8 +196,7 @@ jobs:
           #     not a valid Go module path element and would mis-scope the
           #     glob/regex/tag machinery downstream — fail loud, not weird.
           #   - overlapping lanes (one dir an ancestor of another) are
-          #     rejected: prefix classification would assign files to a
-          #     parent lane nondeterministically.
+          #     rejected.
           MODS=$(bash "$CI_TOOLS/go-modules.sh" list HEAD)
           LANES="[]"
           while IFS= read -r d; do
@@ -251,14 +248,9 @@ jobs:
             fi
             HALVES=$(echo "$HALVES" | jq -c --arg v "$d" '. + [$v]')
           done < <(echo "$LANES" | jq -r '.[]')
-          # The root's version and notes leave out every module it does not ship.
-          BOUNDARIES=$(GO_LANES_JSON="$LANES" bash "$CI_TOOLS/go-modules.sh" boundaries HEAD)
           {
             echo "go_modules=$LANES"
             echo "go_halves=$HALVES"
-            echo "exclude_paths<<EOF"
-            sed '/^$/d; s|$|/**|' <<<"$BOUNDARIES"
-            echo "EOF"
           } >> "$GITHUB_OUTPUT"
           echo "nested Go module lanes: $LANES, TS halves: $HALVES"
 
@@ -289,7 +281,8 @@ jobs:
         uses: ./.cplieger-ci/actions/git-cliff-version
         with:
           channel: ${{ steps.channel.outputs.channel }}
-          exclude-paths: ${{ steps.gomodules.outputs.exclude_paths }}
+          go-lanes: ${{ steps.gomodules.outputs.go_modules }}
+          repo-type: ${{ steps.type.outputs.type }}
 
       - name: Number pending promotions
         id: number
@@ -298,7 +291,8 @@ jobs:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           CLIFF_SCRIPT: ${{ steps.cliff0.outputs.script }}
           STATE: ${{ steps.pending.outputs.state }}
-          EXCLUDE_PATHS: ${{ steps.gomodules.outputs.exclude_paths }}
+          GO_LANES_JSON: ${{ steps.gomodules.outputs.go_modules }}
+          REPO_TYPE: ${{ steps.type.outputs.type }}
         run: |
           set -euo pipefail
           bash "$CI_TOOLS/release-state.sh" number
@@ -309,7 +303,8 @@ jobs:
         uses: ./.cplieger-ci/actions/git-cliff-version
         with:
           channel: ${{ steps.channel.outputs.channel }}
-          exclude-paths: ${{ steps.gomodules.outputs.exclude_paths }}
+          go-lanes: ${{ steps.gomodules.outputs.go_modules }}
+          repo-type: ${{ steps.type.outputs.type }}
           pending-version: ${{ steps.channel.outputs.channel == 'dev' && steps.number.outputs.root_version || '' }}
           pending-commit: ${{ steps.channel.outputs.channel == 'dev' && steps.pending.outputs.root_commit || '' }}
           pending-in-range: ${{ steps.pending.outputs.root_in_range || 'false' }}
@@ -643,6 +638,8 @@ jobs:
         uses: ./.cplieger-ci/actions/git-cliff-version
         with:
           lane: ${{ matrix.lane }}
+          go-lanes: ${{ needs.detect.outputs.go_modules }}
+          repo-type: ${{ needs.detect.outputs.type }}
 
       # Token-free: renders with the repository's cliff config.
       - name: Render the missing Release notes
@@ -1032,7 +1029,8 @@ jobs:
         with:
           channel: dev
           lane: ${{ matrix.lane }}
-          exclude-paths: ${{ matrix.lane == '' && needs.detect.outputs.exclude_paths || '' }}
+          go-lanes: ${{ needs.detect.outputs.go_modules }}
+          repo-type: ${{ needs.detect.outputs.type }}
           pending-version: ${{ fromJSON(needs.detect.outputs.lane_state)[matrix.key].version }}
           pending-commit: ${{ fromJSON(needs.detect.outputs.lane_state)[matrix.key].commit }}
 
@@ -1217,7 +1215,8 @@ jobs:
         uses: ./.cplieger-ci/actions/git-cliff-version
         with:
           channel: dev
-          exclude-paths: ${{ needs.detect.outputs.exclude_paths }}
+          go-lanes: ${{ needs.detect.outputs.go_modules }}
+          repo-type: ${{ needs.detect.outputs.type }}
           pending-version: ${{ fromJSON(needs.detect.outputs.lane_state)['.'].version }}
           pending-commit: ${{ fromJSON(needs.detect.outputs.lane_state)['.'].commit }}
 

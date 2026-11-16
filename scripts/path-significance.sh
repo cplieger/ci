@@ -207,12 +207,21 @@ shipped() {
 }
 
 # A path ships with the module that owns it: its nearest ancestor among
-# go-modules.sh's boundaries at HEAD, else the root.
-BOUNDARIES=$(bash "$TOOLS_DIR/go-modules.sh" boundaries "$HEAD") || exit 2
+# go-modules.sh's boundaries over the range measured, else the root.
 declare -A BOUNDARY=() IS_LANE=()
-while IFS= read -r d; do
-  [ -z "$d" ] || BOUNDARY["$d"]=1
-done <<<"$BOUNDARIES"
+load_boundaries() { # <from>: BOUNDARY holds the boundaries over <from>..HEAD, HEAD's alone for an empty <from>
+  local d out
+  out=$(bash "$TOOLS_DIR/go-modules.sh" boundaries "$HEAD" "$1") || exit 2
+  BOUNDARY=()
+  while IFS= read -r d; do
+    [ -z "$d" ] || BOUNDARY["$d"]=1
+  done <<<"$out"
+}
+if [ "$MODE" = paths ]; then
+  load_boundaries "$FROM"
+else
+  load_boundaries "$RANGE_START"
+fi
 for l in "${GO_LANES[@]}"; do
   IS_LANE["$l"]=1
 done
@@ -463,6 +472,7 @@ for l in "${GO_LANES[@]}"; do
   lane_diff=$(refine_manifests "$anchor" "$lane_diff")
   if [ -n "$lane_diff" ]; then
     lane_shipped=$(shipped "$lane_diff") || exit 2
+    load_boundaries "$anchor"
     lane_shipped=$(drop_unowned "$lane_shipped")
     [ -z "$lane_shipped" ] || LANE_CHANGED["$l"]=true
   fi
