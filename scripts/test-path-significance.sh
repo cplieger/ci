@@ -789,11 +789,25 @@ git rm -q -r chartdata/internal/wire
 K7=$(commit "chore(chartdata): drop the module")
 chk "S55 nor does removing it whole" "$(paths "$K6" "$K7")" 'false|[]|[]|[]'
 
-# A go.mod added or removed over files its container's zip leaves out, those
-# inside a deeper module or a vendored package, moves nothing to or from it.
+# A go.mod added or removed over files its container's zip leaves out moves
+# nothing to or from it: those in any dir holding a go.mod, a vendored package
+# by the zip's own go line (golang.org/x/mod/zip isVendoredPackage), a symlink.
+# The root is on go 1.27, the lane has no go line.
 newrepo carve-out-of-nothing
-put go.mod 'module example.com/go'
+put go.mod 'module example.com/go
+
+go 1.27'
 put main.go 'package main'
+ln -s main.go alias.go
+put tools/testdata/mod/go.mod 'module example.com/fixture'
+put tools/testdata/mod/a.go 'package mod'
+put chartdata/tools/testdata/mod/go.mod 'module example.com/fixture'
+put chartdata/tools/testdata/mod/a.go 'package mod'
+put case/deep/GO.MOD 'module example.com/go/case/deep'
+put case/deep/c.go 'package deep'
+put links/deep/sub/go.mod 'module example.com/go/links/deep/sub'
+put links/deep/sub/s.go 'package sub'
+ln -s ../main.go links/l.go
 put internal/deep/sub/go.mod 'module example.com/go/internal/deep/sub'
 put internal/deep/sub/s.go 'package sub'
 put third_party/vendor/example.com/x/x.go 'package x'
@@ -831,7 +845,7 @@ put third_party/vendor/modules.txt '# example.com/x v1.0.0'
 V8=$(commit "chore: a vendor manifest")
 git rm -q third_party/go.mod
 V9=$(commit "feat: fold third_party back into the root")
-chk "S59 as does a file a vendor dir holds directly, which some go versions zip" "$(paths "$V8" "$V9")" \
+chk "S59 as does a file a nested vendor dir holds directly, which go 1.24 zips" "$(paths "$V8" "$V9")" \
   'true|[]|[]|["third_party/go.mod"]'
 put chartdata/internal/k.go 'package internal'
 V10=$(commit "feat(chartdata): a package in the nested module")
@@ -839,6 +853,64 @@ git rm -q chartdata/internal/go.mod
 V11=$(commit "feat(chartdata): fold it back into the lane")
 chk "S59 and a lane gaining a file it ships releases the lane" "$(paths "$V10" "$V11")" \
   'false|[]|["chartdata"]|["chartdata/internal/go.mod"]'
+put chartdata/gen/vendor/modules.txt '# example.com/x v1.0.0'
+V12=$(commit "chore(chartdata): a vendor manifest")
+git rm -q chartdata/gen/go.mod
+V13=$(commit "chore(chartdata): fold gen back into the lane")
+chk "S59 but a zip with no go line, as before go 1.24, leaves that file out" "$(paths "$V12" "$V13")" 'false|[]|[]|[]'
+put tools/go.mod 'module example.com/go/tools'
+V14=$(commit "chore: a module over a testdata module")
+chk "S59 a go.mod over a dir holding only a testdata module releases nothing" "$(paths "$V13" "$V14")" 'false|[]|[]|[]'
+put chartdata/tools/go.mod 'module example.com/go/chartdata/tools'
+V15=$(commit "chore(chartdata): a module over a testdata module")
+chk "S59 nor a testdata module in a lane" "$(paths "$V14" "$V15")" 'false|[]|[]|[]'
+put case/go.mod 'module example.com/go/case'
+V16=$(commit "chore: a module over a GO.MOD")
+chk "S59 nor over a dir whose go.mod is named in another case" "$(paths "$V15" "$V16")" 'false|[]|[]|[]'
+put links/go.mod 'module example.com/go/links'
+V17=$(commit "chore: a module over a nested one and a symlink")
+chk "S59 nor over a deeper module and a symlink" "$(paths "$V16" "$V17")" 'false|[]|[]|[]'
+put tools/keep.go 'package tools'
+V18=$(commit "feat(tools): a package")
+git rm -q tools/go.mod
+V19=$(commit "feat: fold tools into the root")
+chk "S59 while a file beside the testdata module carves it" "$(paths "$V18" "$V19")" 'true|[]|[]|["tools/go.mod"]'
+
+# The same zip rule decides a path's own change.
+put third_party/vendor/example.com/x/x.go 'package x // v2'
+V20=$(commit "chore: bump a vendored package")
+chk "S59 a vendored package's change does not release a go root" "$(paths "$V19" "$V20")" 'false|[]|[]|[]'
+chk "S59 but releases a docker root, built from the tree" "$(REPO_TYPE=docker paths "$V19" "$V20")" \
+  'true|[]|[]|["third_party/vendor/example.com/x/x.go"]'
+put tools/testdata/mod/a.go 'package mod // v2'
+put chartdata/tools/testdata/mod/a.go 'package mod // v2'
+V21=$(commit "test: the testdata modules")
+chk "S59 nor does a testdata module's change, for the root or a lane" \
+  "$(
+    bash "$TOOLS/go-modules.sh" commits "$V20" "$V21" .
+    bash "$TOOLS/go-modules.sh" commits "$V20" "$V21" chartdata
+  )" ''
+chk "S59 which a docker root ships" "$(REPO_TYPE=docker bash "$TOOLS/go-modules.sh" commits "$V20" "$V21" .)" \
+  "$V21"$'\t'tools/testdata/mod/a.go
+ln -sfn tools/keep.go alias.go
+V22=$(commit "chore: retarget the symlink")
+chk "S59 nor does a symlink's change" "$(paths "$V21" "$V22")" 'false|[]|[]|[]'
+chk "S59 which a docker root ships" "$(REPO_TYPE=docker paths "$V21" "$V22")" 'true|[]|[]|["alias.go"]'
+put vendor/modules.txt '# example.com/x v1.0.0'
+put go.mod 'module example.com/go
+
+go 1.23'
+V23=$(commit "chore: an older go line and a vendor manifest")
+put go.mod 'module example.com/go
+
+go 1.27'
+commit "chore: go 1.27" >/dev/null
+put vendor/modules.txt '# example.com/x v1.1.0'
+V25=$(commit "chore: the vendor manifest")
+chk "S59 the zip's go line is read per commit: go 1.24 leaves out vendor/modules.txt" \
+  "$(bash "$TOOLS/go-modules.sh" commits "$V23" "$V25" . | cut -f2 | tr '\n' ' ')" 'go.mod '
+chk "S59 a symlink no commit changes is no go root's either" \
+  "$(printf 'alias.go\nmain.go\n' | bash "$TOOLS/go-modules.sh" paths "" "$V22" . | LC_ALL=C sort | tr '\t\n' ': ')" '.:main.go '
 
 # Ownership is read per commit, never at the range's ends: a range from a
 # stable tag older than a carve-out holds both the carve-out, which is the

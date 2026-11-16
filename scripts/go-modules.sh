@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Go module ownership. A module is a dir below the root with a tracked go.mod,
-# less those under node_modules, vendor, testdata, static or dist; in a tree a
-# path belongs to its nearest owner (owners_in), else to the root '.'.
-#   list <rev> | boundaries <rev>: the modules, or the lanes plus the modules
-#   their container does not ship. commits and paths: see walk. Env
+# less those under node_modules, vendor, testdata, static or dist. In a tree a
+# path belongs to the units whose artifact ships it (owners_in): the root '.'
+# or a lane, each a module zip but a docker or ts root, built from the tree.
+#   list <rev> | boundaries <rev>: the modules, or the lanes plus the go.mod
+#   dirs their container does not ship. commits and paths: see walk. Env
 #   GO_LANES_JSON, REPO_TYPE (docker|go|ts|none|empty). Prints sorted dirs or
 #   tab-separated lines; exit 2 on an unreadable rev or input.
 set -euo pipefail
@@ -22,8 +23,8 @@ case "$cmd" in
   *) die "unknown command '${cmd}'" ;;
 esac
 
-tree_of() { # <rev> -> every tracked path at <rev>
-  git -c core.quotePath=false ls-tree -r --name-only "$1" || die "cannot list the tree of $1"
+tree_of() { # <rev> -> "<mode> <type> <object>\t<path>" per tracked path at <rev>
+  git -c core.quotePath=false ls-tree -r "$1" || die "cannot list the tree of $1"
 }
 modules_of() { # <paths> -> the dirs holding a go.mod among them
   # A committed node_modules or vendor tree carries upstream go.mod files.
@@ -31,7 +32,7 @@ modules_of() { # <paths> -> the dirs holding a go.mod among them
     | sed 's|/go\.mod$||' | LC_ALL=C sort -u || true
 }
 if [ "$cmd" = list ]; then
-  FILES=$(tree_of "$2") || exit 2
+  FILES=$(tree_of "$2" | cut -f2-) || exit 2
   modules_of "$FILES" | sed '/^$/d'
   exit 0
 fi
@@ -59,15 +60,34 @@ lane_holding() { # <dir> -> the lane <dir> sits strictly inside; status 1 for no
   done <<<"$LANES"
   return 1
 }
-# MOD[<state>|<dir>] marks a module, NEST[<state>|<dir>] one that is no lane
-# and that its container does not ship; STATE[<rev>] names <rev>'s state.
-declare -A MOD=() NEST=() STATE=()
-load_state() { # <rev>: fills MOD and NEST for the state named <rev>
-  local k=$1 files modules packages m l p skip
-  files=$(tree_of "$k") || exit 2
-  modules=$(modules_of "$files")
-  packages=$(grep -E '^[^/]+/jsr\.json$' <<<"$files" | sed 's|/jsr\.json$||' || true)
+go_new() { # <rev> <go.mod path>: status 0 when its go line is 1.24 or later
+  local v maj min
+  v=$(git cat-file -p "$1:$2" 2>/dev/null \
+    | sed -nE '/^[[:space:]]*go[[:space:]]/{s/^[[:space:]]*go[[:space:]]+([0-9]+)\.([0-9]+).*/\1 \2/p;q;}') || true
+  read -r maj min <<<"$v" || true
+  [ -n "${min:-}" ] && ((10#$maj > 1 || (10#$maj == 1 && 10#$min >= 24)))
+}
+# MOD[<state>|<dir>] marks a dir holding a go.mod, NEST[<state>|<dir>] one that
+# is no lane and that its container does not ship, PKG[<state>|<dir>] a TS
+# package, NEWVENDOR[<state>|<unit>] a zip unit on go 1.24 or later;
+# STATE[<rev>] names <rev>'s state.
+declare -A MOD=() NEST=() PKG=() NEWVENDOR=() STATE=()
+load_state() { # <rev>: fills MOD, NEST, PKG and NEWVENDOR for the state named <rev>
+  local k=$1 tree files dirs m l p
+  tree=$(tree_of "$k") || exit 2
+  files=$(cut -f2- <<<"$tree")
+  # golang.org/x/mod/zip leaves out every dir holding a regular go.mod, its
+  # name matched under case folding, wherever it sits.
+  dirs=$(grep -E '^100' <<<"$tree" | cut -f2- | grep -iE '/go\.mod$' | sed 's|/[^/]*$||' | LC_ALL=C sort -u || true)
   STATE["$k"]=$k
+  while IFS= read -r p; do
+    [ -z "$p" ] || PKG["$k|$p"]=1
+  done < <(grep -E '^[^/]+/jsr\.json$' <<<"$files" | sed 's|/jsr\.json$||' || true)
+  while IFS= read -r l; do
+    [ -z "$l" ] || ! grep -qxF -- "$l/web/jsr.json" <<<"$files" || PKG["$k|$l/web"]=1
+    if [ -n "$l" ] && go_new "$k" "$l/go.mod"; then NEWVENDOR["$k|$l"]=1; fi
+  done <<<"$LANES"
+  if $ZIP_ROOT && go_new "$k" go.mod; then NEWVENDOR["$k|."]=1; fi
   while IFS= read -r m; do
     [ -n "$m" ] || continue
     MOD["$k|$m"]=1
@@ -75,21 +95,16 @@ load_state() { # <rev>: fills MOD and NEST for the state named <rev>
     # A go.mod in a TS package (<lane>/web, or a root subpackage outside every
     # lane) only keeps Go tooling out: the package ships its tree.
     if l=$(lane_holding "$m"); then
-      [[ $m != "$l/web" && $m != "$l/web/"* ]] || ! grep -qxF -- "$l/web/jsr.json" <<<"$files" \
-        || continue
+      [ -z "${PKG["$k|$l/web"]:-}" ] || [[ $m != "$l/web" && $m != "$l/web/"* ]] || continue
       NEST["$k|$m"]=1
       continue
     fi
-    skip=false
-    while IFS= read -r p; do
-      [[ -z $p || ($m != "$p" && $m != "$p/"*) ]] || skip=true
-    done <<<"$packages"
-    # A lane is a module zip, which leaves out every nested module. So is a
-    # go root; a docker or ts root builds its artifact from the whole tree.
-    if ! $skip && $ZIP_ROOT; then
+    # A lane is a module zip. So is a go root; a docker or ts root builds its
+    # artifact from the whole tree.
+    if $ZIP_ROOT && [ -z "${PKG["$k|${m%%/*}"]:-}" ]; then
       NEST["$k|$m"]=1
     fi
-  done <<<"$modules"
+  done <<<"$dirs"
 }
 
 if [ "$cmd" = boundaries ]; then
@@ -100,29 +115,57 @@ if [ "$cmd" = boundaries ]; then
   exit 0
 fi
 
+ships() { # <state> <unit> <path> <mode>, <path> one <unit> owns there: status 0 when <unit>'s artifact holds it
+  local rel=$3 pkg=${3%%/*}
+  if [ "$2" = . ]; then
+    $ZIP_ROOT || return 0
+  else
+    rel=${3#"$2"/} pkg=$2/web
+  fi
+  [[ -z ${PKG["$1|$pkg"]:-} || $3 != "$pkg/"* ]] || return 0
+  # golang.org/x/mod/zip leaves out a symlink, a gitlink and a vendored package
+  # (isVendoredPackage): from go 1.24 vendor/modules.txt too, but not a file
+  # directly in a nested <dir>/vendor/ (golang.org/issue/37397).
+  [[ $4 == 100* ]] || return 1
+  if [ -n "${NEWVENDOR["$1|$2"]:-}" ]; then
+    case $rel in
+      vendor/modules.txt | vendor/*/* | */vendor/*/*) return 1 ;;
+    esac
+  else
+    case $rel in
+      vendor/*/* | */vendor/*) return 1 ;;
+    esac
+  fi
+}
 OWN=()
-owners_in() { # <state> <path>: OWN gets the units owning <path> in that state's tree
-  local k=$1 d=$2 key
-  OWN=()
+owners_in() { # <state> <path> <mode>: OWN gets the units whose artifact holds <path> in that state's tree
+  local k=$1 d=$2 key u root=true
+  local -a found=()
   while [[ $d == */* ]]; do
     d=${d%/*}
     key="$k|$d"
     if [ -n "${IS_LANE[$d]:-}" ]; then
-      OWN+=("$d")
+      found+=("$d")
       # A go root's zip holds a lane's files until the lane has its go.mod.
       if ! $ZIP_ROOT || [ -n "${MOD[$key]:-}" ]; then
-        return 0
+        root=false
+        break
       fi
     elif [ -n "${NEST[$key]:-}" ]; then
-      return 0
+      root=false
+      break
     fi
   done
-  OWN+=(.)
+  ! $root || found+=(.)
+  OWN=()
+  for u in "${found[@]}"; do
+    ! ships "$k" "$u" "$2" "$3" || OWN+=("$u")
+  done
 }
 
 # walk: each non-merge commit of <from>..<to> and each path it changes; a path
-# counts for its owner in each tree holding it, and a go.mod added or removed
-# for its dir's owners that ship a file under it in the tree without it.
+# counts for the units holding it in each tree holding it, a regular go.mod
+# added or removed for those also holding a file under its dir without it.
 #   commits <from> <to> <unit>: "<sha>\t<path>" per path <unit> owns so; an empty
 #   or non-commit <from> (half_changed's empty tree) walks all of <to>.
 #   paths <from> <to> <unit>...: "<unit>\t<path>" per such path on stdin; one no
@@ -146,8 +189,8 @@ state_of() { # <rev>: K names <rev>'s state, loaded once
   fi
   K=${STATE[$1]}
 }
-emit() { # <state> <sha> <path>: prints the asked units owning <path> in that state
-  owners_in "$1" "$3"
+emit() { # <state> <sha> <path> <mode>: prints the asked units holding <path> in that state
+  owners_in "$1" "$3" "$4"
   emit_units "$2" "$3" "${OWN[@]}"
 }
 emit_units() { # <sha> <path> <unit>...: prints the asked units among them for <path>
@@ -166,65 +209,69 @@ emit_units() { # <sha> <path> <unit>...: prints the asked units among them for <
     fi
   done
 }
-ships() { # <unit> <path>: status 0 when <unit>'s artifact holds <path>
-  local rel=$2
-  if [ "$1" = . ]; then
-    $ZIP_ROOT || return 0
-  else
-    rel=${2#"$1"/}
-  fi
-  # A module zip leaves out a package below a vendor dir; golang.org/x/mod/zip
-  # isVendoredPackage, which differs by go version on vendor/modules.txt and
-  # <dir>/vendor/<file> (golang.org/issue/37397), so those two count.
-  case $rel in
-    vendor/*/* | */vendor/*/*) return 1 ;;
-  esac
-}
 CARVED=()
-carved() { # <state> <rev> <dir>: CARVED gets the owners of <dir>/go.mod in that state shipping a file under <dir> at <rev>
-  local files f u
-  local -A held=()
-  files=$(git -c core.quotePath=false ls-tree -r --name-only "$2" -- "$3/") || die "cannot list ${3}/ at $2"
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    owners_in "$1" "$f"
-    for u in "${OWN[@]}"; do
-      ! ships "$u" "$f" || held["$u"]=1
-    done
-  done <<<"$files"
-  owners_in "$1" "$3/go.mod"
+carved() { # <state> <rev> <dir>: CARVED gets the asked units holding <dir>/go.mod in that state and a file under <dir> at <rev>
+  local files meta f u n=0
+  local -a mods=()
+  local -A want=() held=()
   CARVED=()
+  owners_in "$1" "$3/go.mod" 100644
   for u in "${OWN[@]}"; do
+    [ -z "${ASKED[$u]:-}" ] || mods+=("$u")
+  done
+  [ "${#mods[@]}" -gt 0 ] || return 0
+  for u in "${mods[@]}"; do
+    want["$u"]=1
+  done
+  files=$(git -c core.quotePath=false ls-tree -r "$2" -- "$3/") || die "cannot list ${3}/ at $2"
+  while IFS=$'\t' read -r meta f; do
+    [ -n "$f" ] || continue
+    owners_in "$1" "$f" "${meta%% *}"
+    for u in "${OWN[@]}"; do
+      [[ -n ${want[$u]:-} && -z ${held[$u]:-} ]] || continue
+      held["$u"]=1
+      n=$((n + 1))
+    done
+    [ "$n" -lt "${#mods[@]}" ] || break
+  done <<<"$files"
+  for u in "${mods[@]}"; do
     [ -z "${held[$u]:-}" ] || CARVED+=("$u")
   done
 }
 commit_done() { # SHA PARENT CHANGES: emits one commit's paths
-  local pk=- ck st f
+  local pk=- ck meta om nm st f
   [ -n "$SHA" ] || return 0
   if [ -n "$PARENT" ]; then
     state_of "$PARENT"
     pk=$K
   fi
   # Only a go.mod or a jsr.json moves an owner: else the parent's state holds.
-  if grep -qE '(^|/)(go\.mod|jsr\.json)$' <<<"$CHANGES"; then
+  if grep -qiE $'[\t/](go\\.mod|jsr\\.json)$' <<<"$CHANGES"; then
     state_of "$SHA"
     ck=$K
   else
     STATE["$SHA"]=$pk
     ck=$pk
   fi
-  while IFS=$'\t' read -r st f; do
+  while IFS=$'\t' read -r meta f; do
     [ -n "$f" ] || continue
     if [ "$cmd" = paths ]; then
       [ -n "${WANT[$f]:-}" ] || continue
       COVERED["$f"]=1
     fi
-    [ "$st" = A ] || emit "$pk" "$SHA" "$f"
-    [ "$st" = D ] || emit "$ck" "$SHA" "$f"
-    if [[ -n $PARENT && $f == */go.mod && ($st == A || $st == D) ]]; then
-      if [ "$st" = A ]; then carved "$pk" "$PARENT" "${f%/go.mod}"; else carved "$ck" "$SHA" "${f%/go.mod}"; fi
-      emit_units "$SHA" "$f" "${CARVED[@]}"
+    meta=${meta#:}
+    om=${meta%% *} nm=${meta#* } st=${meta##* }
+    nm=${nm%% *}
+    [ "$st" = A ] || emit "$pk" "$SHA" "$f" "$om"
+    [ "$st" = D ] || emit "$ck" "$SHA" "$f" "$nm"
+    [[ -n $PARENT && ${f,,} == */go.mod ]] || continue
+    CARVED=()
+    if [[ $nm == 100* && $om != 100* ]]; then
+      carved "$pk" "$PARENT" "${f%/*}"
+    elif [[ $om == 100* && $nm != 100* ]]; then
+      carved "$ck" "$SHA" "${f%/*}"
     fi
+    emit_units "$SHA" "$f" "${CARVED[@]}"
   done <<<"$CHANGES"
 }
 
@@ -234,7 +281,7 @@ if [ "$cmd" = commits ] || [ -n "$FROM" ]; then
     RANGE=("${FROM}..${TO}")
   fi
   LOG=$(git -c core.quotePath=false log --no-merges --root --no-renames --reverse --topo-order \
-    --format='%x01%H %P' --name-status "${RANGE[@]}" --) || die "cannot walk ${RANGE[*]}"
+    --format='%x01%H %P' --raw "${RANGE[@]}" --) || die "cannot walk ${RANGE[*]}"
   SHA="" PARENT="" CHANGES=""
   while IFS= read -r line; do
     if [[ $line == $'\x01'* ]]; then
@@ -250,12 +297,19 @@ fi
 if [ "$cmd" = paths ]; then
   ENDS=("$TO")
   [ -z "$FROM" ] || ENDS+=("$FROM")
+  declare -A ODD=()
   for end in "${ENDS[@]}"; do
     state_of "$end"
+    [ "${#COVERED[@]}" -lt "${#WANT[@]}" ] || continue
+    ODD=()
+    TREE=$(tree_of "$end") || exit 2
+    while IFS=$'\t' read -r meta f; do
+      ODD["$f"]=${meta%% *}
+    done < <(grep -Ev '^100' <<<"$TREE" || true)
     for f in "${!WANT[@]}"; do
       [ -z "${COVERED[$f]:-}" ] || continue
       [ -z "$FROM" ] || git cat-file -e "${end}:${f}" 2>/dev/null || continue
-      emit "$K" - "$f"
+      emit "$K" - "$f" "${ODD[$f]:-100644}"
     done
   done
 fi

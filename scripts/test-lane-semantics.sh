@@ -203,8 +203,8 @@ chk "L-A2 ci discovery: adds internal/ (has code), still skips sentinel/empty/ve
 boundaries() { # <repo type> -> go-modules.sh's boundaries for the release lanes, space-separated; run in a repo
   GO_LANES_JSON="$(discover_release)" REPO_TYPE="$1" bash "$ROOT/scripts/go-modules.sh" boundaries HEAD | tr '\n' ' '
 }
-chk "L-A10 a go root's module owners: every nested module but the vendored one" \
-  "$(cd "$R" && boundaries go)" 'empty internal/mod tools/gen web yamlenv '
+chk "L-A10 a go root's module owners: every dir holding a go.mod, as its zip leaves each out" \
+  "$(cd "$R" && boundaries go)" 'empty internal/mod node_modules/flatted tools/gen web yamlenv '
 chk "L-A10 a docker root's: its lanes alone, the image built from the rest of the tree" \
   "$(cd "$R" && boundaries docker)" 'tools/gen yamlenv '
 
