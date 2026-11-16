@@ -1097,6 +1097,13 @@ class GitHistory(unittest.TestCase):
             (self.tip, None),
         )
 
+    def test_a_calibration_no_commit_of_head_added_is_refused_naming_it(self):
+        self.put('tests/perf/calibrations/300.json', '{}')
+        path = pathlib.Path('tests/perf/calibrations/300.json')
+        at, why = perf_gate.placed_commit({'commit': self.tip}, path, self.git(), self.base)
+        self.assertIsNone(at)
+        self.assertIn('no first-parent commit', why)
+
     def test_a_squash_that_drops_part_of_the_measured_change_is_refused(self):
         squash = self.squash(app='one')
         self.assertFalse(self.git().same_change(self.tip, squash))
