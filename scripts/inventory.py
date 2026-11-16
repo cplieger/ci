@@ -1048,8 +1048,14 @@ def _named_change(named_a: set, named_b: set, indirect_a: set, indirect_b: set) 
     return 'no longer direct' if indirect_b else 'removed'
 
 
-def diff(repo: Repo, a: str, b: str, lane: str | None, security: set[str]) -> dict:
-    ra, rb = repo.records(a, lane), repo.records(b, lane)
+def diff(
+    repo: Repo, a: str, b: str, lane: str | None, security: set[str], exclude: tuple[str, ...] = ()
+) -> dict:
+    """`exclude`: dirs whose records are left out (nested modules the lane does not ship)."""
+    ra, rb = (
+        [r for r in repo.records(rev, lane) if not any(r.file.startswith(d + '/') for d in exclude)]
+        for rev in (a, b)
+    )
     kinds = {
         (r.lane, r.ecosystem, r.file, r.identity): r.kind for r in ra + rb if r.kind != 'indirect'
     }
@@ -1624,6 +1630,9 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument('--lane', help="lane dir ('.' for the root artifact)")
     p.add_argument('--format', choices=('json', 'markdown'), default='json')
     p.add_argument('--security-shas', help='file of commit SHAs merged from Renovate security PRs')
+    p.add_argument(
+        '--exclude-dir', action='append', default=[], help='a dir whose records are left out'
+    )
     p = sub.add_parser('dominance')
     p.add_argument('--git-dir', required=True)
     p.add_argument('--base', required=True)
@@ -1651,7 +1660,9 @@ def run(args) -> int:
         return 2 if refused else 0
     if args.cmd == 'diff':
         a, b = repo.commit(args.from_rev), repo.commit(args.to_rev)
-        result = diff(repo, a, b, args.lane, _security_shas(args.security_shas))
+        result = diff(
+            repo, a, b, args.lane, _security_shas(args.security_shas), tuple(args.exclude_dir)
+        )
         print(
             render_markdown(result) if args.format == 'markdown' else json.dumps(result, indent=2),
             end='',

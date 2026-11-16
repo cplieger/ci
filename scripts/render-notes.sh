@@ -122,11 +122,23 @@ else
   PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+$'
   PREFIX=""
   SCOPE_ARGS=()
-  while IFS= read -r d; do
-    [ -z "$d" ] && continue
-    SCOPE_ARGS+=(--exclude-path "$d/**")
-  done < <(jq -r '.[]' <<<"$GO_LANES_JSON")
 fi
+
+# The nested modules whose commits and manifests are not the lane's: every
+# boundary go-modules.sh lists for the root, those inside it for a lane.
+foreign_modules() { # <commit> -> one dir per line
+  local all d
+  if [ "$SITE" = lane ]; then
+    all=$(GO_LANES_JSON="$(jq -cn --arg l "$LANE" '[$l]')" REPO_TYPE="" bash "$(dirname "$0")/go-modules.sh" boundaries "$1") \
+      || die "cannot list the nested modules of ${LANE} at $1"
+    while IFS= read -r d; do
+      [[ $d != "${LANE}/"* ]] || printf '%s\n' "$d"
+    done <<<"$all"
+  else
+    GO_LANES_JSON="$GO_LANES_JSON" REPO_TYPE="$SITE" bash "$(dirname "$0")/go-modules.sh" boundaries "$1" \
+      || die "cannot list the nested modules at $1"
+  fi
+}
 
 version_key() { # X.Y.Z -> fixed-width sortable key
   local IFS=. parts
@@ -155,6 +167,14 @@ render() {
   fi
   local commit prev range changes deps="" sbom="" parts=()
   commit=$(git rev-parse --verify "${COMMIT}^{commit}") || die "--release-commit ${COMMIT} is not a commit"
+  local foreign d
+  local -a inv_out=()
+  foreign=$(foreign_modules "$commit") || exit 2
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    SCOPE_ARGS+=(--exclude-path "$d/**")
+    inv_out+=(--exclude-dir "$d")
+  done <<<"$foreign"
   prev=$(previous_stable_tag)
   range=$commit
   [ -z "$prev" ] || range="${prev}..${commit}"
@@ -195,7 +215,7 @@ render() {
   fi
   if [ -n "$prev" ]; then
     changes+=$'\n\n'"**Full changelog**: https://github.com/${REPO}/compare/${prev}...${VERSION}"
-    local inv=(diff --git-dir . --from "$prev" --to "$commit" --lane "${LANE:-.}" --format markdown)
+    local inv=(diff --git-dir . --from "$prev" --to "$commit" --lane "${LANE:-.}" "${inv_out[@]}" --format markdown)
     [ -z "$SECURITY_SHAS" ] || inv+=(--security-shas "$SECURITY_SHAS")
     deps=$(python3 "$INVENTORY" "${inv[@]}")
   fi

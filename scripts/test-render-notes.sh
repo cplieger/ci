@@ -416,4 +416,49 @@ for args in "--site go --version v2.0.0" "--site docker --version v2.0.0" "--sit
 done
 ok "N14 a git-cliff error fails every site's render"
 
+# A path belongs to its nearest ancestor go.mod's module: a commit or manifest
+# under a nested module that is no lane is neither its container lane's nor
+# the root's.
+NM="$WORK/nested-module"
+new_repo "$NM"
+mkdir -p "$NM/chartdata/internal/gen" "$NM/internal/gen"
+printf 'module example.com/nm\n\ngo 1.26\n' >"$NM/go.mod"
+printf 'module example.com/nm/chartdata\n\ngo 1.26\n' >"$NM/chartdata/go.mod"
+gen_mod() { # <dir> <wiregen version>
+  printf 'module example.com/nm/%s\n\ngo 1.26\n\nrequire example.com/wiregen %s\n' "$1" "$2" >"$NM/$1/go.mod"
+}
+gen_mod chartdata/internal/gen v1.0.0
+gen_mod internal/gen v1.0.0
+c "$NM" chartdata/c.go "feat: initial (#1)"
+git -C "$NM" tag v1.0.0
+git -C "$NM" tag chartdata/v1.0.0
+gen_mod chartdata/internal/gen v1.1.0
+c "$NM" chartdata/internal/gen/gen.go "fix(chartdata): regenerate with wiregen v1.1.0 (#2)"
+gen_mod internal/gen v1.1.0
+c "$NM" internal/gen/gen.go "fix: regenerate the root tool (#3)"
+c "$NM" chartdata/c.go "fix(chartdata): a lane fix (#4)"
+c "$NM" main.go "fix: a root fix (#5)"
+rn "$NM" --repo owner/nm --release-commit HEAD --site lane --lane chartdata --version chartdata/v1.0.1
+expect "N20 a lane's notes leave out the commits and manifests of a module nested in it" <<'EOF'
+### Fixed
+
+- A lane fix (#4)
+
+**Full changelog**: https://github.com/owner/nm/compare/chartdata/v1.0.0...chartdata/v1.0.1
+EOF
+rn "$NM" --repo owner/nm --release-commit HEAD --site go --version v1.0.1 --go-lanes '["chartdata"]'
+expect "N20 and a go root's notes leave out every nested module" <<'EOF'
+### Fixed
+
+- A root fix (#5)
+
+**Full changelog**: https://github.com/owner/nm/compare/v1.0.0...v1.0.1
+EOF
+mkdir -p "$WORK/nm-stub"
+printf '#!/usr/bin/env bash\n[[ "$*" != ls-tree\\ -r* ]] || exit 92\nexec %q "$@"\n' "$(command -v git)" >"$WORK/nm-stub/git"
+chmod 755 "$WORK/nm-stub/git"
+PATH="$WORK/nm-stub:$PATH" refused "N20 a tree go-modules.sh cannot read fails the render" \
+  "cannot list the nested modules of chartdata" "$NM" --repo owner/nm --release-commit HEAD --site lane \
+  --lane chartdata --version chartdata/v1.0.1 --out "$WORK/out"
+
 echo "PASS: render-notes ($CHECKS checks)"

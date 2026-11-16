@@ -147,6 +147,8 @@ facts["publish-after"] = facts["names"].index("Detect changed paths") < facts["n
     "Add pending promotions to the publication") < facts["names"].index("Select version")
 open(f"{out}/type.sh", "w").write(d["Detect type + subpackages"]["run"])
 open(f"{out}/gomodules.sh", "w").write(d["Detect nested Go modules"]["run"])
+facts["gomodules-env"] = d["Detect nested Go modules"].get("env", {})
+facts["gomodules-order"] = facts["names"].index("Check out the ci source") < facts["names"].index("Detect nested Go modules")
 hd = d.get("Hold back lanes that pin a dev version", {})
 facts["hold-if"] = " ".join(hd.get("if", "").split())
 facts["hold-env"] = hd.get("env", {})
@@ -1642,7 +1644,8 @@ L0=$(commit_in "$L" "feat: initial" go.work='go 1.26' alpha/go.mod='module examp
   web/jsr.json='{"name":"@o/web","version":"0.0.0"}' web/package.json='{"name":"@o/web","version":"0.0.0"}')
 disc() { # <repo> -> subpackages|go_modules|go_halves of the extracted detect steps, or EXIT=n
   : >"$WORK/out"
-  (cd "$1" && GITHUB_OUTPUT="$WORK/out" bash "$WORK/type.sh" && GITHUB_OUTPUT="$WORK/out" bash "$WORK/gomodules.sh") \
+  (cd "$1" && GITHUB_OUTPUT="$WORK/out" bash "$WORK/type.sh" \
+    && GITHUB_OUTPUT="$WORK/out" CI_TOOLS="$ROOT/scripts" REPO_TYPE="$(outkey type)" bash "$WORK/gomodules.sh") \
     >"$WORK/disc.log" 2>&1 || {
     echo "EXIT=$?"
     return 0
@@ -1651,6 +1654,30 @@ disc() { # <repo> -> subpackages|go_modules|go_halves of the extracted detect st
 }
 chk "H1 a lane's web/ package is its TS half, and a first-level one stays a root subpackage" "$(disc "$L")" \
   '["web"]|["alpha","beta"]|["alpha"]'
+excluded() { sed -n '/^exclude_paths<<EOF$/,/^EOF$/{/^exclude_paths<<EOF$/d;/^EOF$/d;p}' "$WORK/out" | tr '\n' ' '; }
+chk "H1 the root's version and notes exclude every lane, and the half's sentinel stays its lane's" "$(excluded)" 'alpha/** beta/** '
+chk "H11 discovery runs the ci source's scripts, so the checkout comes first" "$(fact '."gomodules-order"')" "true"
+# shellcheck disable=SC2016 # literal workflow expressions
+chk "H11 with that copy's scripts and the detected type" "$(fact '."gomodules-env" | tojson')" \
+  '{"CI_TOOLS":"${{ github.workspace }}/.cplieger-ci/scripts","REPO_TYPE":"${{ steps.type.outputs.type }}"}'
+# A path belongs to its nearest ancestor go.mod's module, so the root leaves
+# out every nested module its artifact does not ship.
+NX="$WORK/nested-excludes"
+git init -q -b main "$NX"
+commit_in "$NX" "feat: initial" go.mod='module example.com/nx' main.go=v1 \
+  alpha/go.mod='module example.com/nx/alpha' alpha/a.go=v1 \
+  alpha/internal/gen/go.mod='module example.com/nx/alpha/internal/gen' alpha/internal/gen/g.go=v1 \
+  internal/gen/go.mod='module example.com/nx/internal/gen' internal/gen/g.go=v1 \
+  tools/go.mod='module tools-ignore' tools/run.sh=v1 \
+  tools/gen/go.mod='module example.com/nx/tools/gen' tools/gen/g.go=v1 \
+  web/go.mod='module web-ignore' web/jsr.json='{"name":"@o/web","version":"0.0.0"}' \
+  node_modules/flatted/go.mod='module github.com/vendored/flatted' node_modules/flatted/f.go=v1 >/dev/null
+chk "H11 a go root's lanes skip the internal and sentinel modules" "$(disc "$NX")" '["web"]|["alpha","tools/gen"]|[]'
+chk "H11 and its exclusions name every nested module but the subpackage's sentinel and vendored trees" "$(excluded)" \
+  'alpha/** alpha/internal/gen/** internal/gen/** tools/** tools/gen/** '
+commit_in "$NX" "feat: an image" Dockerfile='FROM scratch' >/dev/null
+chk "H11 a docker root keeps a module outside every lane, its image built from the tree" \
+  "$(disc "$NX" >/dev/null && excluded)" 'alpha/** alpha/internal/gen/** tools/gen/** '
 mkdir -p "$L/beta/web"
 printf '{}\n' >"$L/beta/web/jsr.json"
 printf '{}\n' >"$L/beta/web/package.json"

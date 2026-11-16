@@ -64,6 +64,16 @@ if [ -n "$LANE" ]; then
     fi
   fi
   export GIT_CLIFF__BUMP__INITIAL_TAG="${LANE}/${FIRST}"
+  # A nested module inside the lane is not in the lane's module zip, so its
+  # commits are not the lane's (go-modules.sh owns which modules those are).
+  if ! inner="$(GO_LANES_JSON="$(jq -cn --arg l "$LANE" '[$l]')" REPO_TYPE="" \
+    bash "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-modules.sh" boundaries "$SEED_AT")"; then
+    echo "::error::cannot list the nested modules of ${LANE} at ${SEED_AT}"
+    exit 1
+  fi
+  while IFS= read -r d; do
+    [[ $d != "${LANE}/"* ]] || ARGS+=(--exclude-path "${d}/**")
+  done <<<"$inner"
 else
   PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+$'
   PREFIX=""

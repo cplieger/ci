@@ -1658,6 +1658,17 @@ class NestedModule(FixtureCase):
     def test_dominance(self):
         self.assertEqual(self.fx.dominance('B', 'M', 'T')['verdict'], 'pass')
 
+    def test_diff_leaves_out_an_excluded_dir_and_only_that_dir(self):
+        def files(exclude):
+            result = inventory.diff(
+                self.fx.repo, self.fx.sha['B'], self.fx.sha['B_sys'], '.', set(), exclude
+            )
+            return sorted(d['file'] for d in result['direct'])
+
+        self.assertEqual(files(()), ['go.mod', 'internal/sub/go.mod'])
+        self.assertEqual(files(('internal/sub',)), ['go.mod'])
+        self.assertEqual(files(('internal/su',)), ['go.mod', 'internal/sub/go.mod'])
+
     def test_a_requirement_that_turns_direct_is_one_line_and_no_transitive_count(self):
         self.assertEqual(
             inventory.render_markdown(self.fx.diff('B_indirect', 'B')),

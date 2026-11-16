@@ -34,10 +34,11 @@ trap 'rm -rf "$WORK"' EXIT
 
 # release.yaml detect/gomodules: RELEASE-lane discovery (full eligibility).
 discover_release() { # run in a repo; prints JSON array or fails
-  local LANES="[]" f d modpath a b
-  while IFS= read -r f; do
-    [ -z "$f" ] && continue
-    d=$(dirname -- "$f")
+  local LANES="[]" f d modpath a b mods
+  mods=$(bash "$ROOT/scripts/go-modules.sh" list HEAD)
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    f="$d/go.mod"
     case "$d" in
       *[!A-Za-z0-9._/-]*)
         echo "CHARSET_ERROR"
@@ -56,7 +57,7 @@ discover_release() { # run in a repo; prints JSON array or fails
       continue
     fi
     LANES=$(echo "$LANES" | jq -c --arg v "$d" '. + [$v]')
-  done < <(git ls-files '*/go.mod' | grep -Ev '(^|/)(node_modules|vendor|testdata|static|dist)/' || true)
+  done <<<"$mods"
   while IFS= read -r a; do
     [ -z "$a" ] && continue
     while IFS= read -r b; do
@@ -199,6 +200,13 @@ chk "L-A1 release discovery: lanes only (sentinel, internal, empty, vendored exc
   "$(cd "$R" && discover_release)" '["tools/gen","yamlenv"]'
 chk "L-A2 ci discovery: adds internal/ (has code), still skips sentinel/empty/vendored" \
   "$(cd "$R" && discover_ci)" '["internal/mod","tools/gen","yamlenv"]'
+boundaries() { # <repo type> -> go-modules.sh's boundaries for the release lanes, space-separated; run in a repo
+  GO_LANES_JSON="$(discover_release)" REPO_TYPE="$1" bash "$ROOT/scripts/go-modules.sh" boundaries HEAD | tr '\n' ' '
+}
+chk "L-A10 a go root's module owners: every nested module but the vendored one" \
+  "$(cd "$R" && boundaries go)" 'empty internal/mod tools/gen web yamlenv '
+chk "L-A10 a docker root's: its lanes alone, the image built from the rest of the tree" \
+  "$(cd "$R" && boundaries docker)" 'tools/gen yamlenv '
 
 mkrepo single
 put go.mod "module github.com/cplieger/single" "go 1.26.5"
@@ -419,10 +427,13 @@ mkrepo classify
 put go.mod "module github.com/cplieger/envx" "go 1.26.5"
 put yamlenv/go.mod "module github.com/cplieger/envx/yamlenv" "go 1.26.5"
 put tools/gen/go.mod "module github.com/cplieger/envx/tools/gen" "go 1.26.5"
+put yamlenv/internal/gen/go.mod "module github.com/cplieger/envx/yamlenv/internal/gen" "go 1.26.5"
+put internal/gen/go.mod "module github.com/cplieger/envx/internal/gen" "go 1.26.5"
 put web/jsr.json '{"name":"@o/web","version":"1.0.0"}'
 export SUBPACKAGES_JSON='["web"]'
 export GO_LANES_JSON='["yamlenv","tools/gen"]'
-K0=$(commit "feat: initial" envx.go yamlenv/yamlenv.go tools/gen/x.go web/index.ts yamlenv2/file.go)
+K0=$(commit "feat: initial" envx.go yamlenv/yamlenv.go tools/gen/x.go web/index.ts yamlenv2/file.go \
+  yamlenv/internal/gen/g.go internal/gen/g.go)
 git -C "$R" tag v1.0.0 "$K0"
 K1=$(commit "fix: lane" yamlenv/yamlenv.go)
 K2=$(commit "fix: root" envx.go)
@@ -430,6 +441,8 @@ K3=$(commit "fix: mixed" envx.go yamlenv/go.mod tools/gen/x.go)
 K4=$(commit "fix: web" web/index.ts)
 K5=$(commit "fix: root sibling" yamlenv2/file.go)
 K6=$(commit "docs: readme" README.md)
+K7=$(commit "chore(deps): a lane's nested module" yamlenv/internal/gen/go.mod yamlenv/internal/gen/g.go)
+K8=$(commit "chore(deps): the root's nested module" internal/gen/go.mod internal/gen/g.go)
 cd "$R" || exit 1
 chk "L-B1 lane-only change" "$(classify dev "$K0" "$K1")" 'root=false lanes=["yamlenv"]'
 chk "L-B2 root-only change" "$(classify dev "$K1" "$K2")" 'root=true lanes=[]'
@@ -437,6 +450,8 @@ chk "L-B3 mixed change" "$(classify dev "$K2" "$K3")" 'root=true lanes=["yamlenv
 chk "L-B4 subpackage change is neither root nor lane" "$(classify dev "$K3" "$K4")" 'root=false lanes=[]'
 chk "L-B5 lane prefix is dir-anchored (yamlenv2/ is root)" "$(classify dev "$K4" "$K5")" 'root=true lanes=[]'
 chk "L-B6 empty significant set" "$(classify dev "$K5" "$K6")" 'root=false lanes=[]'
+chk "L-B7 a nested module inside a lane is neither the lane nor the root" "$(classify dev "$K6" "$K7")" 'root=false lanes=[]'
+chk "L-B8 a nested module outside every lane is not a go root's" "$(classify dev "$K7" "$K8")" 'root=false lanes=[]'
 cd "$WORK" || exit 1
 
 # ── Lane anchor states ───────────────────────────────────────────────────────

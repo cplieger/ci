@@ -1842,9 +1842,41 @@ class Preview(unittest.TestCase):
             with (
                 self.subTest(modules=modules),
                 unittest.mock.patch.object(promote, 'run_tool', run_tool),
+                unittest.mock.patch.object(promote, 'root_exclusions', return_value=''),
                 self.assertRaisesRegex(promote.GhError, 'printed malformed go_modules_to_release$'),
             ):
                 promote.release_plan(Path('.'), 'm', 'r', promote.Layout('go', [], []))
+
+
+class RootExclusions(unittest.TestCase):
+    """The root's version leaves out every module release.yaml detect excludes."""
+
+    def test_every_nested_module_a_go_root_does_not_ship_and_a_failure_is_an_error(self):
+        with tempfile.TemporaryDirectory() as d, unittest.mock.patch.dict(os.environ, GIT_ENV):
+            clone = Path(d)
+            files = {
+                'go.mod': GO_MOD,
+                'alpha/go.mod': 'module github.com/cplieger/demo/alpha\n',
+                'alpha/a.go': 'package alpha\n',
+                'alpha/internal/gen/go.mod': 'module github.com/cplieger/demo/alpha/internal/gen\n',
+                'internal/gen/go.mod': 'module github.com/cplieger/demo/internal/gen\n',
+                'vendor/x/go.mod': 'module example.com/x\n',
+            }
+            for path, text in files.items():
+                (clone / path).parent.mkdir(parents=True, exist_ok=True)
+                (clone / path).write_text(text)
+            for args in (['init', '-q'], ['add', '.'], ['commit', '-qm', 'init']):
+                subprocess.run(['git', *args], cwd=clone, check=True)
+            self.assertEqual(
+                promote.root_exclusions(clone, 'HEAD', promote.Layout('go', [], ['alpha'])),
+                'alpha/**\nalpha/internal/gen/**\ninternal/gen/**',
+            )
+            self.assertEqual(
+                promote.root_exclusions(clone, 'HEAD', promote.Layout('docker', [], ['alpha'])),
+                'alpha/**\nalpha/internal/gen/**',
+            )
+            with self.assertRaisesRegex(promote.GhError, 'cannot list the tree of nope'):
+                promote.root_exclusions(clone, 'nope', promote.Layout('go', [], ['alpha']))
 
 
 class RestTransport(unittest.TestCase):

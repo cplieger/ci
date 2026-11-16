@@ -863,6 +863,21 @@ def _lane_rows(state, tool: str) -> dict[str, dict]:
     return rows
 
 
+def root_exclusions(clone: Path, r: str, layout: Layout) -> str:
+    """release.yaml detect's exclude_paths at R: `<dir>/**` per go-modules.sh boundary."""
+    proc = subprocess.run(
+        ['bash', str(SCRIPTS / 'go-modules.sh'), 'boundaries', r],
+        cwd=clone,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=token_free_env(**layout.env()),
+    )
+    if proc.returncode != 0:
+        raise GhError(f'go-modules.sh boundaries failed: {proc.stderr.strip()[-600:]}')
+    return '\n'.join(f'{d}/**' for d in proc.stdout.splitlines() if d)
+
+
 def release_plan(clone: Path, main: str, r: str, layout: Layout) -> dict[str, dict[str, str]]:
     """{lane key: {version, h_tag, kind_note, held}} for every lane of main's stable run at R,
     checked out in `clone`, from release.yaml detect's own steps; version '' for no release,
@@ -876,7 +891,7 @@ def release_plan(clone: Path, main: str, r: str, layout: Layout) -> dict[str, di
         clone,
         COMPUTE,
         CHANNEL='stable',
-        EXCLUDE_PATHS='\n'.join(f'{lane}/**' for lane in layout.lanes),
+        EXCLUDE_PATHS=root_exclusions(clone, r, layout),
         PENDING_IN_RANGE=_field(pending, 'root_in_range', tool),
     )
     sig = run_tool(

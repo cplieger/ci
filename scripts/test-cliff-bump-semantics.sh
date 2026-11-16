@@ -882,4 +882,41 @@ fc "$ER2" help.md "feat!: rewrite the root help"
 compute "$ER2" dev
 assert_eq "$OUT_BASE" "v2.0.0" "S16: a breaking change to an embedded root file alone is a major"
 
+# ── S17: a nested module's commit is not the lane that contains it ─────────
+# chartdata's module zip leaves out chartdata/internal/gen, which holds its
+# own go.mod, so a commit confined to it sets no level for chartdata.
+NM=$(mkfixture nested-lane)
+mkdir -p "$NM/chartdata/internal/gen"
+printf 'module example.com/nm\n\ngo 1.26\n' >"$NM/go.mod"
+printf 'module example.com/nm/chartdata\n\ngo 1.26\n' >"$NM/chartdata/go.mod"
+printf 'module example.com/nm/chartdata/internal/gen\n\ngo 1.26\n' >"$NM/chartdata/internal/gen/go.mod"
+git -C "$NM" add -A
+fc "$NM" chartdata/c.go "feat(chartdata): initial"
+git -C "$NM" tag v1.0.0
+git -C "$NM" tag chartdata/v1.0.0
+fc "$NM" chartdata/internal/gen/gen.go "feat(chartdata)!: regenerate with the new wiregen"
+publish_main "$NM"
+compute "$NM" stable chartdata
+assert_eq "$OUT_LEVEL" "none" "S17a: a breaking commit confined to the nested module sets no level for its lane"
+compute "$NM" dev chartdata
+assert_eq "$OUT_LEVEL" "none" "S17b: nor for the lane's dev build"
+fc "$NM" chartdata/c.go "fix(chartdata): a lane fix"
+publish_main "$NM"
+compute "$NM" stable chartdata
+assert_eq "$OUT_LEVEL" "patch" "S17c: the lane's own fix is a patch, the nested module's breaking commit still left out"
+assert_eq "$OUT_BASE" "chartdata/v1.0.1" "S17d: and numbers the next patch"
+mkdir -p "$NM/chartdata/web"
+printf 'module web-ignore\n' >"$NM/chartdata/web/go.mod"
+printf '{"name":"@o/chartdata","version":"0.0.0"}\n' >"$NM/chartdata/web/jsr.json"
+git -C "$NM" add -A
+fc "$NM" chartdata/web/mod.ts "feat(chartdata): the TS half"
+publish_main "$NM"
+compute "$NM" stable chartdata
+assert_eq "$OUT_LEVEL" "minor" "S17e: the lane's TS half stays the lane's though a sentinel go.mod sits in it"
+mkdir -p "$WORK/nm-stub"
+printf '#!/usr/bin/env bash\n[[ "$*" != ls-tree\\ -r* ]] || exit 92\nexec %q "$@"\n' "$(command -v git)" >"$WORK/nm-stub/git"
+chmod 755 "$WORK/nm-stub/git"
+refused "S17f: a tree go-modules.sh cannot read fails the lane's numbering" \
+  "cannot list the nested modules of chartdata at HEAD" "$NM" PATH="$WORK/nm-stub:$PATH" CHANNEL=stable LANE=chartdata bash "$ACTION"
+
 echo "PASS: git-cliff $VERSION semantics match the release-gate contract"

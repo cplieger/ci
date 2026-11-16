@@ -206,10 +206,52 @@ shipped() {
   printf '%s\n%s\n' "$kept" "$embedded" | LC_ALL=C sort -u | sed '/^$/d'
 }
 
+# A path ships with the module that owns it: its nearest ancestor among
+# go-modules.sh's boundaries at HEAD, else the root.
+BOUNDARIES=$(bash "$TOOLS_DIR/go-modules.sh" boundaries "$HEAD") || exit 2
+declare -A BOUNDARY=() IS_LANE=()
+while IFS= read -r d; do
+  [ -z "$d" ] || BOUNDARY["$d"]=1
+done <<<"$BOUNDARIES"
+for l in "${GO_LANES[@]}"; do
+  IS_LANE["$l"]=1
+done
+OWNER=""
+owner_of() { # <path>: sets OWNER to the boundary owning <path>, empty for the root
+  local d=$1
+  OWNER=""
+  while [[ $d == */* ]]; do
+    d=${d%/*}
+    if [ -n "${BOUNDARY[$d]:-}" ]; then
+      OWNER=$d
+      return 0
+    fi
+  done
+}
+drop_unowned() { # <paths> -> the paths less those a nested module that is not a lane owns; a subpackage keeps its own
+  local f s
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    for s in "${SUBPACKAGES[@]}"; do
+      if [[ $f == "$s/"* ]]; then
+        printf '%s\n' "$f"
+        continue 2
+      fi
+    done
+    owner_of "$f"
+    if [ -n "$OWNER" ] && [ -z "${IS_LANE[$OWNER]:-}" ]; then
+      note "$f belongs to the nested module ${OWNER}, which is not a release lane, so it is not significant" >&2
+      continue
+    fi
+    printf '%s\n' "$f"
+  done <<<"$1"
+}
+
 if [ -z "$CHANGED" ]; then
   SIGNIFICANT=""
 else
   SIGNIFICANT=$(shipped "$CHANGED") || exit 2
+  SIGNIFICANT=$(drop_unowned "$SIGNIFICANT")
 fi
 
 # rebuild-stale.sh's empty commit forces an image rebuild against refreshed
@@ -309,7 +351,7 @@ refine_manifests() { # <from> <paths> -> the paths less each manifest file that 
 }
 [ -z "$SIGNIFICANT" ] || SIGNIFICANT=$(refine_manifests "$BEFORE" "$SIGNIFICANT")
 
-# A path under a subpackage or a nested lane belongs to that one, never to
+# A path under a subpackage or owned by a lane belongs to that one, never to
 # the root.
 ROOT_CHANGED=false
 declare -A SUBPKG_CHANGED
@@ -365,19 +407,14 @@ if [ -n "$SIGNIFICANT" ]; then
         break
       fi
     done
-    in_lane=false
-    for l in "${GO_LANES[@]}"; do
-      if [[ "$f" == "$l/"* ]]; then
-        in_lane=true
-        # Without a tag on this channel the lane's first release is owed by
-        # whatever the root range shows under it.
-        if [ -z "${LANE_ANCHOR[$l]}" ]; then
-          LANE_CHANGED["$l"]=true
-        fi
-        break
+    owner_of "$f"
+    if [ -n "$OWNER" ] && [ -n "${IS_LANE[$OWNER]:-}" ]; then
+      # Without a tag on this channel the lane's first release is owed by
+      # whatever the root range shows under it.
+      if [ -z "${LANE_ANCHOR[$OWNER]}" ]; then
+        LANE_CHANGED["$OWNER"]=true
       fi
-    done
-    if ! $in_subpkg && ! $in_lane; then
+    elif [ -z "$OWNER" ] && ! $in_subpkg; then
       ROOT_CHANGED=true
     fi
   done <<<"$SIGNIFICANT"
@@ -426,6 +463,7 @@ for l in "${GO_LANES[@]}"; do
   lane_diff=$(refine_manifests "$anchor" "$lane_diff")
   if [ -n "$lane_diff" ]; then
     lane_shipped=$(shipped "$lane_diff") || exit 2
+    lane_shipped=$(drop_unowned "$lane_shipped")
     [ -z "$lane_shipped" ] || LANE_CHANGED["$l"]=true
   fi
 done

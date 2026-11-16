@@ -15,13 +15,15 @@ inputs:
   exclude-paths:
     description: >-
       Newline-separated globs excluded from the root version compute (one
-      `<dir>/**` per nested Go module lane). Ignored when `lane` is set.
+      `<dir>/**` per directory `scripts/go-modules.sh boundaries` lists).
+      Ignored when `lane` is set.
     required: false
     default: ""
   lane:
     description: >-
       A nested Go module directory. Computes that lane's `<dir>/vX.Y.Z`
-      version from the commits under it instead of the root version.
+      version from the commits under it, less those of the nested modules
+      inside it, instead of the root version.
     required: false
     default: ""
   pending-version:
