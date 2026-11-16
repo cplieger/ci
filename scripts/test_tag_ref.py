@@ -343,6 +343,24 @@ class ClaimUnderALaterDevTag(unittest.TestCase):
             [f"v1.10.0-dev.1 at {b} releases this commit's changes"],
         )
 
+    def test_a_lower_version_on_a_commit_a_renumber_tagged_higher_hands_off(self):
+        result, a, _ = self.run_claim(
+            tags_at_a=['v1.2.0-dev.1', 'v1.10.0-dev.1'], version='v1.2.0-dev.1'
+        )
+        self.assertEqual(result, 'claimed=false handed_off_rc=0')
+        self.assertEqual(self.creates, [])
+        self.assertEqual(
+            self.handoff_descriptions('v1.2.0-dev.1'),
+            [f"v1.10.0-dev.1 at {a} releases this commit's changes"],
+        )
+
+    def test_the_higher_version_on_a_renumbered_commit_is_claimed_and_published(self):
+        result, _, _ = self.run_claim(
+            tags_at_a=['v1.2.0-dev.1', 'v1.10.0-dev.1'], version='v1.10.0-dev.1'
+        )
+        self.assertEqual(result, 'claimed=true handed_off_rc=1')
+        self.assertEqual((self.creates, self.posts), ([], []))
+
     def test_a_root_claim_ignores_a_later_lane_dev_tag(self):
         result, _, _ = self.run_claim(tags_at_b=['web/v1.0.0-dev.3'])
         self.assertEqual(result, 'claimed=true handed_off_rc=1')

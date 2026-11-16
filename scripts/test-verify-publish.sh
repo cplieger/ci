@@ -206,6 +206,8 @@ spec() { # <line>...
   : >"$CURL_LOG"
   : >"$SLEEP_LOG"
 }
+# The curl log with the packument's per-read cache-busting query dropped.
+packument_log() { sed 's/?t=[0-9]\{1,\}$//' "$CURL_LOG"; }
 casedir() { # <name> -> path of a fresh fixture dir
   rm -rf "$WORK/case-$1"
   mkdir -p "$WORK/case-$1"
@@ -535,16 +537,18 @@ git -C "$HALF" update-ref refs/remotes/origin/dev "$HALF_LATER"
 PACKUMENT="https://registry.npmjs.org/@cplieger/alpha"
 defaults
 export CHANNEL=dev HALVES_RESULT=success HALVES_JSON='["alpha"]' VERSION="" GITHUB_SHA=$HALF_SHA
-spec "$PACKUMENT 0 {\"dist-tags\":{\"dev\":\"1.4.0-dev.2\"}}" "*registry.npmjs.org* 0 {}"
+spec "${PACKUMENT}[?]t=* 0 {\"dist-tags\":{\"dev\":\"1.4.0-dev.2\"}}" "*registry.npmjs.org* 0 {}"
 run_step "$HALF"
 chk "V-H8 a dev half tagged here under a later lane dev tag, npm's dev below it, is read back" \
-  "$RC|$(cat "$CURL_LOG")" "0|$PACKUMENT
+  "$RC|$(packument_log)" "0|$PACKUMENT
 https://registry.npmjs.org/@cplieger/alpha/1.4.0-dev.3"
+chk "V-H8 and its dist-tag read carries a query past npm's CDN cache" \
+  "$(grep -c '^https://registry.npmjs.org/@cplieger/alpha?t=[0-9]\{1,\}$' "$CURL_LOG" || true)" "1"
 defaults
 export CHANNEL=dev HALVES_RESULT=success HALVES_JSON='["alpha"]' VERSION="" GITHUB_SHA=$HALF_SHA
-spec "$PACKUMENT 0 {\"dist-tags\":{\"dev\":\"1.4.0-dev.4\"}}" "*registry.npmjs.org* 22 {}"
+spec "${PACKUMENT}[?]t=* 0 {\"dist-tags\":{\"dev\":\"1.4.0-dev.4\"}}" "*registry.npmjs.org* 22 {}"
 run_step "$HALF"
-chk "V-H6 one npm's dev already names a later build of is not awaited" "$RC|$(cat "$CURL_LOG")" "0|$PACKUMENT"
+chk "V-H6 one npm's dev already names a later build of is not awaited" "$RC|$(packument_log)" "0|$PACKUMENT"
 chk_has "V-H6 saying this run did not publish it" "$OUT" "skip: alpha/web at alpha/v1.4.0-dev.3 is not published by this run"
 git -C "$HALF" tag -d alpha/v1.4.0-dev.4 >/dev/null
 git -C "$HALF" tag v1.4.0-dev.4 "$HALF_LATER"
@@ -652,13 +656,13 @@ export CHANNEL=dev VERSION=v1.2.3-dev.1 SUBPACKAGE_RESULT=success SUBPACKAGES_JS
 spec "*registry.npmjs.org* 0 {}"
 run_step "$TAGGED"
 chk "V-R7 a dev subpackage tagged here under a later dev tag, npm's dev absent, is read back" \
-  "$RC|$(cat "$CURL_LOG")" "0|$WEB_PACKUMENT
+  "$RC|$(packument_log)" "0|$WEB_PACKUMENT
 https://registry.npmjs.org/@cplieger/web/1.2.3-dev.1"
 defaults
 export CHANNEL=dev VERSION=v1.2.3-dev.1 SUBPACKAGE_RESULT=success SUBPACKAGES_JSON='["web"]' GH_HEAD=$moved GITHUB_SHA=$TAGGED_SHA
-spec "$WEB_PACKUMENT 0 {\"dist-tags\":{\"dev\":\"1.2.3-dev.2\"}}" "*registry.npmjs.org* 22 {}"
+spec "${WEB_PACKUMENT}[?]t=* 0 {\"dist-tags\":{\"dev\":\"1.2.3-dev.2\"}}" "*registry.npmjs.org* 22 {}"
 run_step "$TAGGED"
-chk "V-R7 one npm's dev already names a later build of is not awaited" "$RC|$(cat "$CURL_LOG")" "0|$WEB_PACKUMENT"
+chk "V-R7 one npm's dev already names a later build of is not awaited" "$RC|$(packument_log)" "0|$WEB_PACKUMENT"
 chk_has "V-R7 saying this run did not publish it" "$OUT" "skip: web at v1.2.3-dev.1 is not published by this run"
 rm -rf "$TAGGED/web"
 git -C "$TAGGED" update-ref -d refs/remotes/origin/dev

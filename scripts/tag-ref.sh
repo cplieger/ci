@@ -81,10 +81,11 @@ handoff_record() {
     || echo "::warning::handoff record for $2 not posted on $3, so only this log names $4 as what releases it."
 }
 
-# later_dev_tag <branch> <tag> <commit>: prints "<tag> <commit>" of the newest
-# dev tag of <tag>'s lane (its dir/ prefix, none for the root), other than
-# <tag>, on a descendant of <commit> that origin/<branch> holds, nothing when
-# none; returns 1 when git cannot tell. It reads the job's checkout
+# later_dev_tag <branch> <tag> <commit>: prints "<tag> <commit>" of a dev tag
+# of <tag>'s lane (its dir/ prefix, none for the root) that supersedes <tag>:
+# one ranking above it on <commit> itself (a renumbered build), else the
+# newest on a descendant of <commit> that origin/<branch> holds; nothing when
+# none, 1 when git cannot tell. It reads the job's checkout
 # (fetch-depth 0) unfetched: only release runs, queued one at a time per
 # branch, create a dev tag, and a lane's only from its own job.
 later_dev_tag() {
@@ -99,6 +100,11 @@ later_dev_tag() {
       at[${peeled:-$obj}]=$name
     fi
   done <<<"$refs"
+  c=$(git rev-parse --verify -q "$3^{commit}") || return 1
+  if [ -n "${at[$c]:-}" ] && [ "$(printf '%s\n%s\n' "${2#"$lane"}" "${at[$c]#"$lane"}" | sort -V | tail -n1)" != "${2#"$lane"}" ]; then
+    printf '%s %s\n' "${at[$c]}" "$c"
+    return 0
+  fi
   revs=$(git rev-list --ancestry-path "$3..refs/remotes/origin/$1") || return 1
   while read -r c; do
     if [ -n "$c" ] && [ -n "${at[$c]:-}" ]; then
@@ -111,11 +117,11 @@ later_dev_tag() {
 # claim_version <owner/repo> <branch> <tag> <commit> <channel>: a release job's
 # claim, before the version's first write. Sets CLAIMED, and claimed= in
 # GITHUB_OUTPUT: true once <tag> is at <commit>, false on a handoff; returns 1
-# when the version cannot be claimed. On dev, a later dev tag of the lane on a
-# descendant already ships this commit's changes, so the claim hands off
-# before any create: a new tag would rank this older tree above it, and a
-# reused one would move the dev channel back. <tag> held at another commit
-# is refused whatever later tag exists.
+# when the version cannot be claimed. On dev, a dev tag of the lane that
+# supersedes <tag> (later_dev_tag) already ships this commit's changes, so the
+# claim hands off before any create: a new tag would rank this older tree
+# above it, and a reused one would move the dev channel back. <tag> held at
+# another commit is refused whatever later tag exists.
 claim_version() {
   local rc=0 later at
   CLAIMED=false TAG_CREATED=false
@@ -201,8 +207,10 @@ npm_dev_above() {
   [ "$(jq -r '.private // false' "$1" 2>/dev/null)" != true ] || return 1
   pkg=$(jq -er .name "$1") || return 2
   body=$(mktemp)
+  # npm's CDN serves the packument up to 300 s stale (cache-control max-age=300)
+  # and ignores a no-cache request header; a unique query string misses it.
   code=$(curl -sS --retry 3 --connect-timeout 10 --max-time 30 -H 'Accept: application/vnd.npm.install-v1+json' \
-    -o "$body" -w '%{http_code}' "https://registry.npmjs.org/${pkg}") || code=000
+    -o "$body" -w '%{http_code}' "https://registry.npmjs.org/${pkg}?t=${EPOCHREALTIME//[!0-9]/}") || code=000
   if [ "$code" = 200 ]; then
     dev=$(jq -r '."dist-tags".dev // ""' "$body") || code=000
   fi

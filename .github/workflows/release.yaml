@@ -1278,7 +1278,7 @@ jobs:
           set -euo pipefail
           bash "$CI_TOOLS/release-state.sh" renumber-handoff
 
-  # Publish the package under the new pre-release, then tag. Runs no cliff
+  # Tag the new pre-release, then publish the package. Runs no cliff
   # config; npm ci and npm publish run the package's lifecycle scripts under
   # OIDC, as the ts job's publish does. It re-selects the build and refuses a
   # newer one.

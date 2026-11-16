@@ -2364,7 +2364,9 @@ git -C "$SUBREPO" checkout -q --detach "$SUB_SHA"
 : >"$NPM_LOG"
 sub_handoff "$C_DOCS" >/dev/null
 chk "D-T31 a subpackage tagged here under a later dev tag publishes while npm has no dev build" \
-  "$(out handoff)|$(cat "$NPM_LOG")" "false|https://registry.npmjs.org/@cplieger/web"
+  "$(out handoff)|$(sed 's/?t=[0-9]\{1,\}$//' "$NPM_LOG")" "false|https://registry.npmjs.org/@cplieger/web"
+chk "D-T31 and that read carries a query past npm's CDN cache" \
+  "$(grep -c '^https://registry.npmjs.org/@cplieger/web?t=[0-9]\{1,\}$' "$NPM_LOG" || true)" "1"
 for NPM_DIST_DEV in 1.3.0-dev.3 1.3.0-dev.4; do
   sub_handoff "$C_DOCS" >/dev/null
   chk "D-T31 and while npm's dev is $NPM_DIST_DEV, not above v1.3.0-dev.4" "$(out handoff)" "false"
@@ -2379,6 +2381,18 @@ out_h=$(sub_handoff "$C_DOCS")
 chk "D-T36 one whose npm cannot be read fails, publishing nothing" \
   "$(printf '%s' "$out_h" | sed -n 's/^EXIT=//p')|$(out handoff)" "1|"
 NPM_DOWN=""
+# A renumber tags a higher dev version on the same commit and publishes web
+# under it: with no later commit tagged, that tag still supersedes this one.
+git -C "$SUBREPO" update-ref refs/remotes/origin/dev "$SUB_SHA"
+git -C "$SUBREPO" tag v1.4.0-dev.1 "$SUB_SHA"
+NPM_DIST_DEV=1.4.0-dev.1
+out_h=$(sub_handoff "$C_DOCS")
+chk "D-T37 a subpackage whose commit a renumber tagged higher is not published at the lower version" "$(out handoff)" "true"
+chk_has "D-T37 naming the renumbered build" "$out_h" \
+  "::warning::@cplieger/web is not published at v1.3.0-dev.4: npm's dev dist-tag already names 1.4.0-dev.1, and v1.4.0-dev.1 at $SUB_SHA holds $SUB_SHA."
+NPM_DIST_DEV=""
+git -C "$SUBREPO" tag -d v1.4.0-dev.1 >/dev/null
+git -C "$SUBREPO" update-ref refs/remotes/origin/dev "$(git -C "$SUBREPO" rev-parse v1.3.0-dev.5)"
 LANEREPO="$WORK/lane-handoff"
 rm -rf "$LANEREPO"
 git init -q -b dev "$LANEREPO"
@@ -2414,7 +2428,7 @@ git -C "$LANEREPO" tag yamlenv/v1.1.0-dev.3 "$LANE_LATER"
 : >"$NPM_LOG"
 lanetag "$C_DOCS" >/dev/null
 chk "D-T34 a lane tag here under a later lane dev tag still publishes its half while npm has no dev build" \
-  "$(out tag)|$(cat "$NPM_LOG")" "yamlenv/v1.1.0-dev.2|https://registry.npmjs.org/@cplieger/yamlenv-web"
+  "$(out tag)|$(sed 's/?t=[0-9]\{1,\}$//' "$NPM_LOG")" "yamlenv/v1.1.0-dev.2|https://registry.npmjs.org/@cplieger/yamlenv-web"
 NPM_DIST_DEV=1.1.0-dev.1
 lanetag "$C_DOCS" >/dev/null
 chk "D-T34 and while npm's dev is below it" "$(out tag)" "yamlenv/v1.1.0-dev.2"
