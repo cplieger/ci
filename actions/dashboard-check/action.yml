@@ -4,14 +4,22 @@ description: >-
   resource meeting the dashboard standard: strict CUE vet against Grafana's
   pinned dashboard schema, element references, layout, fields Grafana 13.2
   does not render, datasource references, descriptions, no-value text,
-  thresholds and prose. A classic dashboard gets a notice and passes, unless the base
-  revision's copy is already schema v2.
+  thresholds and prose, and every Prometheus query read by Prometheus's own
+  PromQL parser after Grafana's variable substitution, with the query rules
+  Q1 (no rate-like function over one $__interval), and, on an app's root
+  dashboard, Q2 (every selector scoped to the instance, matched exactly as
+  instance="$instance") and Q3 (no job, hostname or container matcher). A
+  classic dashboard gets a notice and passes, unless the base revision's copy
+  is already schema v2.
 
 inputs:
   path:
     description: >-
       The dashboard file, relative to the repository root, or several separated
-      by whitespace. Each is checked against its own base copy.
+      by whitespace. Each is checked against its own base copy. A
+      grafana-dashboard.json or grafana-dashboard-<suffix>.json at the root is
+      an app dashboard and gets Q2 and Q3 as well as Q1; any other path gets Q1
+      only.
     default: grafana-dashboard.json
   base-ref:
     description: >-
@@ -33,6 +41,42 @@ runs:
       with:
         python-version: "3.15"
 
+    # hashFiles reads only the caller's workspace, and a `uses: cplieger/ci/...`
+    # checkout of this action lies outside it, so install.sh computes the key.
+    - name: Key the tools cache
+      id: tools-key
+      shell: bash
+      run: |
+        set -euo pipefail
+        key=$(bash "${GITHUB_ACTION_PATH}/install.sh" --key)
+        echo "key=${key}" >>"$GITHUB_OUTPUT"
+
+    - name: Restore the tools
+      id: tools-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/dashboard-check
+        key: dashboard-check-${{ runner.os }}-${{ runner.arch }}-${{ steps.tools-key.outputs.key }}
+
+    # A restored directory is checked against every pin again, so a stale or
+    # partial cache is rebuilt rather than trusted.
+    - name: Install the tools
+      shell: bash
+      env:
+        DASHBOARD_CHECK_TOOLS: ${{ runner.temp }}/dashboard-check
+      run: |
+        bash "${GITHUB_ACTION_PATH}/install.sh" "$DASHBOARD_CHECK_TOOLS" \
+          || { echo "Dashboard check tools" >> /tmp/_ci_failures; exit 1; }
+
+    # Saved before the check, so a dashboard that fails still leaves the next
+    # run a built promql-check.
+    - name: Save the tools
+      if: ${{ steps.tools-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/dashboard-check
+        key: dashboard-check-${{ runner.os }}-${{ runner.arch }}-${{ steps.tools-key.outputs.key }}
+
     - name: Check the dashboard
       shell: bash
       env:
@@ -40,6 +84,7 @@ runs:
         BASE_REF: ${{ inputs.base-ref }}
         EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         TOKEN: ${{ inputs.token }}
+        DASHBOARD_CHECK_TOOLS: ${{ runner.temp }}/dashboard-check
       run: |
         bash "${GITHUB_ACTION_PATH}/check.sh" \
           || { echo "Dashboard check" >> /tmp/_ci_failures; exit 1; }

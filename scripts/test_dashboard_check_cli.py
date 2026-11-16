@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import os
 import pathlib
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,6 +24,10 @@ from dashboard_check_fixtures import (
     valid,
 )
 
+CUE = os.environ.get('DASHBOARD_CHECK_CUE', '')
+SCHEMAS = os.environ.get('DASHBOARD_CHECK_SCHEMAS', '')
+PROMQL = os.environ.get('DASHBOARD_CHECK_PROMQL', '')
+
 
 class CommandLine(unittest.TestCase):
     def write(self, tmp: str, name: str, doc: dict) -> str:
@@ -31,7 +39,14 @@ class CommandLine(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write(tmp, 'grafana-dashboard.json', CLASSIC)
             code, out = run_cli(
-                '--github', '--cue', '/nonexistent/cue', '--schema', 'v13.2.3=/x', path
+                '--github',
+                '--cue',
+                '/nonexistent/cue',
+                '--promql',
+                '/nonexistent/promql-check',
+                '--schema',
+                'v13.2.3=/x',
+                path,
             )
         self.assertEqual(code, 0, out)
         self.assertIn('::notice file=', out)
@@ -42,7 +57,15 @@ class CommandLine(unittest.TestCase):
             path = self.write(tmp, 'grafana-dashboard.json', CLASSIC)
             base = self.write(tmp, 'base.json', valid())
             code, out = run_cli(
-                '--cue', '/nonexistent/cue', '--schema', 'v13.2.3=/x', '--base-file', base, path
+                '--cue',
+                '/nonexistent/cue',
+                '--promql',
+                '/nonexistent/promql-check',
+                '--schema',
+                'v13.2.3=/x',
+                '--base-file',
+                base,
+                path,
             )
         self.assertEqual(code, 1, out)
         self.assertIn('regresses to the classic schema', out)
@@ -53,7 +76,14 @@ class CommandLine(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write(tmp, 'grafana-dashboard.json', doc)
             code, out = run_cli(
-                '--github', '--cue', '/nonexistent/cue', '--schema', 'v13.2.3=/x', path
+                '--github',
+                '--cue',
+                '/nonexistent/cue',
+                '--promql',
+                '/nonexistent/promql-check',
+                '--schema',
+                'v13.2.3=/x',
+                path,
             )
         self.assertEqual(code, 1, out)
         self.assertIn('::error file=', out)
@@ -62,7 +92,15 @@ class CommandLine(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write(tmp, 'grafana-dashboard.json', valid())
             schema = self.write(tmp, 'schema.cue', {})
-            code, out = run_cli('--cue', '/nonexistent/cue', '--schema', f'v13.2.3={schema}', path)
+            code, out = run_cli(
+                '--cue',
+                '/nonexistent/cue',
+                '--promql',
+                '/nonexistent/promql-check',
+                '--schema',
+                f'v13.2.3={schema}',
+                path,
+            )
         self.assertEqual(code, 1, out)
         self.assertIn('cue vet against v13.2.3 did not run', out)
 
@@ -70,7 +108,15 @@ class CommandLine(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / 'grafana-dashboard.json'
             path.write_text('{"uid": ')
-            code, out = run_cli('--cue', '/nonexistent/cue', '--schema', 'v13.2.3=/x', str(path))
+            code, out = run_cli(
+                '--cue',
+                '/nonexistent/cue',
+                '--promql',
+                '/nonexistent/promql-check',
+                '--schema',
+                'v13.2.3=/x',
+                str(path),
+            )
         self.assertEqual(code, 1, out)
         self.assertIn('not valid JSON', out)
 
@@ -90,6 +136,8 @@ class CommandLine(unittest.TestCase):
                 code, out = run_cli(
                     '--cue',
                     '/nonexistent/cue',
+                    '--promql',
+                    '/nonexistent/promql-check',
                     '--schema',
                     'v13.2.3=/x',
                     '--base-file',
@@ -121,6 +169,8 @@ class CommandLine(unittest.TestCase):
                 code, out = run_cli(
                     '--cue',
                     '/nonexistent/cue',
+                    '--promql',
+                    '/nonexistent/promql-check',
                     '--schema',
                     'v13.2.3=/x',
                     '--base-file',
@@ -136,7 +186,18 @@ class CommandLine(unittest.TestCase):
             a = self.write(tmp, 'a.json', CLASSIC)
             b = self.write(tmp, 'b.json', CLASSIC)
             with self.assertRaises(SystemExit) as raised:
-                run_cli('--cue', 'cue', '--schema', 'v13.2.3=/x', '--base-file', a, a, b)
+                run_cli(
+                    '--cue',
+                    'cue',
+                    '--promql',
+                    'promql-check',
+                    '--schema',
+                    'v13.2.3=/x',
+                    '--base-file',
+                    a,
+                    a,
+                    b,
+                )
         self.assertEqual(raised.exception.code, 2)
 
 
@@ -330,6 +391,299 @@ class BaseFetch(unittest.TestCase):
                 result, _, out = self.fetch(ref, code, stale=True)
                 self.assertEqual(result.returncode, rc, result.stderr)
                 self.assertFalse(out.exists())
+
+
+@unittest.skipUnless(
+    CUE and SCHEMAS and PROMQL,
+    'DASHBOARD_CHECK_CUE, DASHBOARD_CHECK_SCHEMAS and DASHBOARD_CHECK_PROMQL not set',
+)
+class QueryCheckCLI(unittest.TestCase):
+    """The command line runs promql-check on every file, judging the app rules by its path."""
+
+    def check(self, relative: str, doc: dict) -> tuple[int, str]:
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = tmp / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc))
+        schemas = []
+        for schema in sorted(pathlib.Path(SCHEMAS).glob('schema-*.cue')):
+            schemas += ['--schema', f'{schema.stem.removeprefix("schema-")}={schema}']
+        with contextlib.chdir(tmp):
+            return run_cli('--cue', CUE, '--promql', PROMQL, *schemas, relative)
+
+    def with_query(self, expr: str) -> dict:
+        doc = valid()
+        query = doc['spec']['elements']['panel-2']['spec']['data']['spec']['queries'][0]
+        query['spec']['query']['spec']['expr'] = expr
+        return doc
+
+    def test_cli_runs_the_query_check(self):
+        code, out = self.check(
+            'grafana-dashboard.json', self.with_query('sum(rate(x{job="y"}[$__interval]))')
+        )
+        self.assertEqual(code, 1, out)
+        prefix = 'grafana-dashboard.json: element panel-2 "Jobs finished" query 0: '
+        self.assertIn(prefix + '[Q1] a window that follows $__interval', out)
+        self.assertIn(prefix + '[Q3] a matcher on a label', out)
+        self.assertIn('Fix: use [$__rate_interval]', out)
+
+    def test_parse_error_names_file_and_panel(self):
+        code, out = self.check('grafana-dashboard.json', self.with_query('sum(rate(x[5m])'))
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            'grafana-dashboard.json: element panel-2 "Jobs finished" query 0: [promql] '
+            "Prometheus's parser cannot read the query: ",
+            out,
+        )
+
+    def test_ok_line_names_the_rules_that_ran(self):
+        cases = {
+            'grafana-dashboard.json': 'app dashboard: Q1, Q2, Q3',
+            'grafana-dashboard-messages.json': 'app dashboard: Q1, Q2, Q3',
+            'grafana-dashboards/live-operations.json': 'not an app dashboard: Q1 only',
+        }
+        for relative, rules in cases.items():
+            with self.subTest(path=relative):
+                code, out = self.check(relative, valid())
+                self.assertEqual(code, 0, out)
+                self.assertIn(f'6 Prometheus queries parsed, {rules})', out)
+
+    def test_a_dashboard_off_the_root_gets_q1_only(self):
+        doc = self.with_query('sum(rate(x{hostname="h"}[5m]))')
+        code, out = self.check('grafana-dashboards/live-operations.json', doc)
+        self.assertEqual(code, 0, out)
+        code, out = self.check('grafana-dashboard.json', doc)
+        self.assertEqual(code, 1, out)
+        self.assertIn('[Q3]', out)
+
+
+class Install(unittest.TestCase):
+    """install.sh pins, keys and keeps the tools it installs."""
+
+    def copy_action(self) -> pathlib.Path:
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        action = tmp / 'dashboard-check'
+        shutil.copytree(ACTION, action, ignore=shutil.ignore_patterns('__pycache__'))
+        return action
+
+    def key(self, action: pathlib.Path) -> str:
+        result = subprocess.run(
+            ['bash', str(action / 'install.sh'), '--key'],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    def test_go_directive_is_not_newer_than_the_pinned_toolchain(self):
+        # GOTOOLCHAIN=local refuses to build a module asking for a newer Go.
+        install = (ACTION / 'install.sh').read_text()
+        go_mod = (ACTION / 'promql-check' / 'go.mod').read_text()
+        pinned = re.search(r'^GO_VERSION=go(\S+)$', install, re.MULTILINE)
+        wanted = re.search(r'^go (\S+)$', go_mod, re.MULTILINE)
+        self.assertTrue(pinned and wanted)
+        self.assertLessEqual(
+            tuple(map(int, wanted[1].split('.'))), tuple(map(int, pinned[1].split('.')))
+        )
+
+    def test_cache_key_follows_what_is_built(self):
+        action = self.copy_action()
+        start = self.key(action)
+        self.assertRegex(start, r'^[0-9a-f]{64}$')
+        (action / 'promql-check' / 'check_test.go').write_text('package main\n')
+        self.assertEqual(self.key(action), start, 'a test file is not built')
+        for changed in ('promql-check/main.go', 'promql-check/go.sum', 'install.sh'):
+            with self.subTest(file=changed):
+                action = self.copy_action()
+                with (action / changed).open('a') as f:
+                    f.write('\n')
+                self.assertNotEqual(self.key(action), start)
+
+    def test_the_action_keys_its_cache_with_install_sh(self):
+        action = yaml.safe_load((ACTION / 'action.yml').read_text())
+        steps = {s.get('name'): s for s in action['runs']['steps']}
+        self.assertIn('install.sh" --key', steps['Key the tools cache']['run'])
+        key = '${{ steps.tools-key.outputs.key }}'
+        for name in ('Restore the tools', 'Save the tools'):
+            with self.subTest(step=name):
+                self.assertIn(key, steps[name]['with']['key'])
+
+    @unittest.skipUnless(
+        CUE and SCHEMAS and PROMQL,
+        'DASHBOARD_CHECK_CUE, DASHBOARD_CHECK_SCHEMAS and DASHBOARD_CHECK_PROMQL not set',
+    )
+    def test_a_rerun_with_every_pin_matched_downloads_nothing(self):
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        tools = tmp / 'tools'
+        shutil.copytree(SCHEMAS, tools)
+        bin_dir = tmp / 'bin'
+        bin_dir.mkdir()
+        curl = bin_dir / 'curl'
+        curl.write_text('#!/bin/sh\necho "curl $*" >&2\nexit 97\n')
+        curl.chmod(0o755)
+        env = {**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}'}
+
+        def install() -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ['bash', str(ACTION / 'install.sh'), str(tools)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        kept = install()
+        self.assertEqual(kept.returncode, 0, kept.stderr)
+        self.assertNotIn('curl ', kept.stderr)
+        (tools / 'promql-check.stamp').write_text('stale\n')
+        rebuilt = install()
+        self.assertNotEqual(rebuilt.returncode, 0)
+        self.assertIn('https://go.dev/dl/', rebuilt.stderr)
+
+    @unittest.skipUnless(
+        CUE and SCHEMAS and PROMQL,
+        'DASHBOARD_CHECK_CUE, DASHBOARD_CHECK_SCHEMAS and DASHBOARD_CHECK_PROMQL not set',
+    )
+    def test_a_cue_that_writes_past_its_version_line_is_kept(self):
+        # cue version prints more lines after the one install.sh matches.
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        tools = tmp / 'tools'
+        shutil.copytree(SCHEMAS, tools)
+        cue = tools / 'cue'
+        cue.write_text('#!/bin/sh\necho "cue version v0.17.1"\nsleep 0.2\necho "go version"\n')
+        cue.chmod(0o755)
+        bin_dir = tmp / 'bin'
+        bin_dir.mkdir()
+        curl = bin_dir / 'curl'
+        curl.write_text('#!/bin/sh\necho "curl $*" >&2\nexit 97\n')
+        curl.chmod(0o755)
+        result = subprocess.run(
+            ['bash', str(ACTION / 'install.sh'), str(tools)],
+            env={**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}'},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('curl ', result.stderr)
+
+    @unittest.skipUnless(
+        CUE and SCHEMAS and PROMQL,
+        'DASHBOARD_CHECK_CUE, DASHBOARD_CHECK_SCHEMAS and DASHBOARD_CHECK_PROMQL not set',
+    )
+    def test_a_go_archive_that_misses_its_sha256_is_never_run(self):
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        tools = tmp / 'tools'
+        shutil.copytree(SCHEMAS, tools)
+        built = (tools / 'promql-check').read_bytes()
+        (tools / 'promql-check.stamp').write_text('stale\n')
+        # A Go archive whose go would install its own promql-check if it ran.
+        go = tmp / 'archive' / 'go' / 'bin' / 'go'
+        go.parent.mkdir(parents=True)
+        go.write_text(
+            '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n'
+            'echo hostile >"$out"; chmod +x "$out"\n'
+        )
+        go.chmod(0o755)
+        archive = tmp / 'go.tgz'
+        subprocess.run(['tar', '-czf', archive, '-C', tmp / 'archive', 'go'], check=True)
+        bin_dir = tmp / 'bin'
+        bin_dir.mkdir()
+        curl = bin_dir / 'curl'
+        curl.write_text(
+            '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n'
+            f'cp {archive} "$out"\n'
+        )
+        curl.chmod(0o755)
+        result = subprocess.run(
+            ['bash', str(ACTION / 'install.sh'), str(tools)],
+            env={**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}'},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('did NOT match', result.stderr)
+        self.assertEqual((tools / 'promql-check').read_bytes(), built)
+        self.assertEqual((tools / 'promql-check.stamp').read_text(), 'stale\n')
+
+    @unittest.skipUnless(
+        CUE and SCHEMAS and PROMQL,
+        'DASHBOARD_CHECK_CUE, DASHBOARD_CHECK_SCHEMAS and DASHBOARD_CHECK_PROMQL not set',
+    )
+    def test_the_build_ignores_the_callers_go_settings(self):
+        action = self.copy_action()
+        tmp = action.parent
+        tools = tmp / 'tools'
+        shutil.copytree(SCHEMAS, tools)
+        (tools / 'promql-check.stamp').write_text('stale\n')
+        record = tmp / 'go-env'
+        go = tmp / 'archive' / 'go' / 'bin' / 'go'
+        go.parent.mkdir(parents=True)
+        go.write_text(
+            f'#!/bin/sh\nenv >{record}\n'
+            'while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n'
+            'printf "#!/bin/sh\\n" >"$out"\n'
+        )
+        go.chmod(0o755)
+        archive = tmp / 'go.tgz'
+        subprocess.run(['tar', '-czf', archive, '-C', tmp / 'archive', 'go'], check=True)
+        sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+        install = action / 'install.sh'
+        install.write_text(
+            re.sub(
+                r'^(GO_SHA256_(?:AMD|ARM)64)=\S+$',
+                rf'\1={sha}',
+                install.read_text(),
+                flags=re.MULTILINE,
+            )
+        )
+        bin_dir = tmp / 'bin'
+        bin_dir.mkdir()
+        curl = bin_dir / 'curl'
+        curl.write_text(
+            '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n'
+            f'cp {archive} "$out"\n'
+        )
+        curl.chmod(0o755)
+        hostile = {
+            'GOFLAGS': '-mod=vendor',
+            'GOWORK': '/nonexistent/go.work',
+            'GOTOOLCHAIN': 'go1.1',
+            'GOROOT': '/nonexistent',
+            'GOPROXY': 'off',
+            'GONOSUMDB': '*',
+            'GOENV': '/nonexistent/env',
+            'CGO_ENABLED': '1',
+        }
+        result = subprocess.run(
+            ['bash', str(install), str(tools)],
+            env={**os.environ, **hostile, 'PATH': f'{bin_dir}:{os.environ["PATH"]}'},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = dict(line.split('=', 1) for line in record.read_text().splitlines() if '=' in line)
+        self.assertNotIn('GOROOT', seen)
+        # A module cache Go leaves read-only cannot be deleted by a non-root
+        # runner user, and the EXIT trap's failed rm then fails install.sh.
+        self.assertEqual(seen['GOFLAGS'].split(), ['-mod=readonly', '-modcacherw'])
+        wanted = {
+            'GOWORK': 'off',
+            'GOTOOLCHAIN': 'local',
+            'GOENV': 'off',
+            'CGO_ENABLED': '0',
+            'GOPROXY': 'https://proxy.golang.org',
+            'GOSUMDB': 'sum.golang.org',
+            'GONOSUMDB': '',
+            'GONOPROXY': '',
+            'GOPRIVATE': '',
+            'GOINSECURE': '',
+        }
+        for name, value in wanted.items():
+            with self.subTest(setting=name):
+                self.assertEqual(seen.get(name), value)
 
 
 if __name__ == '__main__':

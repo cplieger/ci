@@ -1,7 +1,9 @@
 """testdata/dashboard-check/valid.json must pass every check: each rule test mutates a copy.
 
-The CUE tests run only when DASHBOARD_CHECK_CUE (the cue binary) and
-DASHBOARD_CHECK_SCHEMAS (the directory install.sh filled) are set.
+The CUE tests run only when DASHBOARD_CHECK_CUE (the cue binary),
+DASHBOARD_CHECK_SCHEMAS (the directory install.sh filled) and
+DASHBOARD_CHECK_PROMQL (the promql-check binary) are set; the PromQL tests
+need only DASHBOARD_CHECK_PROMQL.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from dashboard_check_fixtures import (
 
 CUE = os.environ.get('DASHBOARD_CHECK_CUE', '')
 SCHEMAS = os.environ.get('DASHBOARD_CHECK_SCHEMAS', '')
+PROMQL = os.environ.get('DASHBOARD_CHECK_PROMQL', '')
 
 
 class RuleCase(unittest.TestCase):
@@ -337,6 +340,33 @@ class Layout(RuleCase):
         defaults(doc, 'panel-4')['min'] = 0
         self.assert_finding(doc, 'layout', 'Crosshair')
 
+    def test_overlapping_items_fail(self):
+        doc = valid()
+        grid_items(doc)[2]['spec'].update(x=6, y=4)
+        grid_items(doc)[1]['spec']['height'] = 9
+        self.assert_finding(
+            doc,
+            'layout',
+            'panel-2 "Jobs finished" (x=0, y=4, width=12, height=9) and '
+            'panel-3 "Jobs failed" (x=6, y=4, width=12, height=8) cover the same grid cells',
+        )
+
+    def test_each_overlapping_pair_is_reported_once(self):
+        doc = valid()
+        grid_items(doc)[0]['spec']['height'] = 5
+        found = [f for f in self.findings(doc) if 'cover the same grid cells' in f.message]
+        self.assertEqual(len(found), 2, [str(f) for f in found])
+        self.assertIn('panel-1', found[0].message)
+        self.assertIn('panel-2', found[0].message)
+        self.assertIn('panel-3', found[1].message)
+
+    def test_touching_items_pass(self):
+        doc = valid()
+        self.assertEqual(
+            [(i['spec']['x'], i['spec']['y']) for i in grid_items(doc)], [(0, 0), (0, 4), (12, 4)]
+        )
+        self.assert_clean(doc)
+
 
 class HouseStandard(RuleCase):
     def test_rejects_missing_dashboard_title(self):
@@ -634,7 +664,583 @@ class Prose(RuleCase):
         self.assert_finding(doc, 'prose', 'em dash')
 
 
-@unittest.skipUnless(CUE and SCHEMAS, 'DASHBOARD_CHECK_CUE and DASHBOARD_CHECK_SCHEMAS not set')
+def with_instance(doc: dict) -> dict:
+    """Adds a single-select instance variable, which Q2 matches every instance matcher against,
+    and scopes every other query to it, as an app dashboard does."""
+    scope = 'instance="$instance", worker=~"$worker"'
+    for name in doc['spec']['elements']:
+        query = panel_query(doc, name)['spec']
+        query['expr'] = query['expr'].replace('worker=~"$worker"', scope)
+    variable(doc, 'worker')['spec']['query']['spec']['query'] = (
+        'label_values(worker_info{instance="$instance"}, worker)'
+    )
+    var = copy.deepcopy(variable(doc, 'worker'))
+    var['spec'].update(
+        name='instance',
+        label='Instance',
+        description='The instance to show.',
+        multi=False,
+        includeAll=False,
+        definition='label_values(worker_info, instance)',
+    )
+    var['spec'].pop('allValue')
+    var['spec']['query']['spec']['query'] = 'label_values(worker_info, instance)'
+    doc['spec']['variables'].append(var)
+    return doc
+
+
+def interval_variable(name: str, **spec: object) -> dict:
+    return {
+        'kind': 'IntervalVariable',
+        'spec': {
+            'name': name,
+            'current': {'text': '1m', 'value': '1m'},
+            'refresh': 'onTimeRangeChanged',
+            'label': 'Window',
+            'description': 'The rate window.',
+            'hide': 'dontHide',
+            'skipUrlSync': False,
+        }
+        | spec,
+    }
+
+
+def adhoc_variable(group: str = 'prometheus', **spec: object) -> dict:
+    return {
+        'kind': 'AdhocVariable',
+        'group': group,
+        'datasource': {'name': '${datasource}'},
+        'spec': {
+            'name': 'filters',
+            'label': 'Filters',
+            'hide': 'dontHide',
+            'skipUrlSync': False,
+            'allowCustomValue': True,
+            'defaultKeys': [],
+            'baseFilters': [],
+            'filters': [],
+        }
+        | spec,
+    }
+
+
+def panel_query(doc: dict, name: str) -> dict:
+    return element(doc, name)['data']['spec']['queries'][0]['spec']['query']
+
+
+def annotation(expr: str) -> dict:
+    return {
+        'kind': 'AnnotationQuery',
+        'spec': {
+            'query': {
+                'kind': 'DataQuery',
+                'group': 'prometheus',
+                'version': 'v0',
+                'datasource': {'name': '${datasource}'},
+                'spec': {'expr': expr},
+            },
+            'enable': True,
+            'hide': False,
+            'iconColor': 'red',
+            'name': 'Restarts',
+        },
+    }
+
+
+class QueryExtraction(RuleCase):
+    """What the checker hands promql-check, read without the binary."""
+
+    def collected(self, doc: dict) -> dc.QueryInput:
+        seen = []
+        dc.check(doc, None, None, lambda queries: seen.append(queries) or [])
+        self.assertEqual(len(seen), 1)
+        return seen[0]
+
+    def test_reads_every_prometheus_query_and_variable(self):
+        got = self.collected(valid())
+        self.assertEqual(
+            got.queries,
+            [
+                {
+                    'where': 'element panel-1 "Queue depth" query 0',
+                    'kind': 'panel',
+                    'expr': 'sum(queue_depth{worker=~"$worker"})',
+                },
+                {
+                    'where': 'element panel-2 "Jobs finished" query 0',
+                    'kind': 'panel',
+                    'expr': 'sum by (worker) (rate(jobs_finished_total{worker=~"$worker"}[5m]))',
+                },
+                {
+                    'where': 'element panel-3 "Jobs failed" query 0',
+                    'kind': 'panel',
+                    'expr': 'sum by (worker) (rate(jobs_failed_total{worker=~"$worker"}[5m]))',
+                },
+                {
+                    'where': 'element panel-4 "Workers" query 0',
+                    'kind': 'panel',
+                    'expr': 'max by (worker, version) (worker_info{worker=~"$worker"})',
+                },
+                {
+                    'where': 'element panel-5 "Queue change" query 0',
+                    'kind': 'panel',
+                    'expr': 'delta(queue_depth{worker=~"$worker"}[$__rate_interval])',
+                },
+                {
+                    'where': 'spec.variables variable worker',
+                    'kind': 'variable',
+                    'expr': 'label_values(worker_info, worker)',
+                    'variable': 'worker',
+                },
+            ],
+        )
+        self.assertEqual(
+            got.variables,
+            [
+                {
+                    'name': 'datasource',
+                    'kind': 'DatasourceVariable',
+                    'multi': False,
+                    'includeAll': False,
+                },
+                {'name': 'worker', 'kind': 'QueryVariable', 'multi': True, 'includeAll': True},
+                {'name': 'window', 'kind': 'TextVariable', 'multi': False, 'includeAll': False},
+            ],
+        )
+
+    def test_multi_and_include_all_are_sent_only_when_true(self):
+        doc = valid()
+        variable(doc, 'worker')['spec'].update(multi='yes', includeAll=1)
+        worker = [v for v in self.collected(doc).variables if v['name'] == 'worker']
+        self.assertEqual(
+            worker,
+            [{'name': 'worker', 'kind': 'QueryVariable', 'multi': False, 'includeAll': False}],
+        )
+
+    def test_an_interval_variable_sends_its_choices(self):
+        doc = valid()
+        doc['spec']['variables'].append(
+            interval_variable(
+                'iv',
+                query="1m,'15s', 1m, '$__auto_interval_iv'",
+                auto=True,
+                auto_min='10s',
+                auto_count=30,
+            )
+        )
+        got = [v for v in self.collected(doc).variables if v['name'] == 'iv']
+        self.assertEqual(
+            got,
+            [
+                {
+                    'name': 'iv',
+                    'kind': 'IntervalVariable',
+                    'multi': False,
+                    'includeAll': False,
+                    'intervals': ['1m', '15s'],
+                    'auto': True,
+                    'autoMin': '10s',
+                    'autoCount': 30,
+                }
+            ],
+        )
+
+    def test_interval_choices_follow_grafanas_reading(self):
+        cases = {
+            'query': ({'query': '"1m30s",10m'}, ['1m30s', '10m']),
+            'options when the query is empty': (
+                {'query': '', 'options': [{'value': '', 'text': '5m'}, {'value': '1h'}]},
+                ['5m', '1h'],
+            ),
+            'defaults with neither': ({}, list(dc.DEFAULT_INTERVALS)),
+            'defaults when the query holds no interval': (
+                {'query': ', ,'},
+                list(dc.DEFAULT_INTERVALS),
+            ),
+        }
+        for label, (spec, want) in cases.items():
+            with self.subTest(case=label):
+                got = dc.interval_choices(spec)
+                self.assertEqual(got['intervals'], want)
+                self.assertEqual((got['auto'], got['autoMin'], got['autoCount']), (False, '', 0))
+        odd = dc.interval_choices({'auto': 'yes', 'auto_min': 10, 'auto_count': True})
+        self.assertEqual((odd['auto'], odd['autoMin'], odd['autoCount']), (False, '', 0))
+
+    def test_a_panel_query_sends_its_instant_and_range_flags(self):
+        doc = valid()
+        panel_query(doc, 'panel-1')['spec'].update(instant=True, range=False)
+        panel_query(doc, 'panel-2')['spec'].update(instant=True, range=True)
+        panel_query(doc, 'panel-3')['spec'].update(instant='yes')
+        flags = [
+            {k: q[k] for k in ('instant', 'range') if k in q}
+            for q in self.collected(doc).queries[:3]
+        ]
+        self.assertEqual(flags, [{'instant': True}, {'instant': True, 'range': True}, {}])
+
+    def test_an_adhoc_filter_reaches_the_input(self):
+        doc = valid()
+        doc['spec']['variables'].append(
+            adhoc_variable(
+                filters=[
+                    {'key': 'job', 'operator': '=', 'value': 'x'},
+                    {'key': 'instance', 'operator': '=|', 'value': 'a', 'values': ['a.b', 'c']},
+                    {'key': 'job', 'operator': 'groupBy', 'value': 'y'},
+                    {'key': 'job', 'operator': '=', 'value': ''},
+                    {'key': 'job', 'operator': '=', 'value': 'y', 'nonApplicable': True},
+                    {'key': 'a.b', 'operator': '=~', 'value': "o'k"},
+                ],
+            )
+        )
+        got = [q for q in self.collected(doc).queries if q['kind'] == 'filter']
+        at = 'spec.variables variable filters'
+        self.assertEqual(
+            got,
+            [
+                {'where': f'{at} filters[0]', 'kind': 'filter', 'expr': 'job="x"'},
+                {'where': f'{at} filters[1]', 'kind': 'filter', 'expr': 'instance=~"a.b|c"'},
+                {'where': f'{at} filters[5]', 'kind': 'filter', 'expr': '"a.b"=~"o\\\\\'k"'},
+            ],
+        )
+
+    def test_a_base_filter_sends_no_filter_query(self):
+        doc = valid()
+        doc['spec']['variables'].append(
+            adhoc_variable(baseFilters=[{'key': 'job', 'operator': '=', 'value': 'x'}])
+        )
+        self.assertEqual([q for q in self.collected(doc).queries if q['kind'] == 'filter'], [])
+
+    def test_a_custom_or_constant_variable_sends_its_values(self):
+        cases = {
+            'comma separated': ('CustomVariable', {'query': '1, 2.5 ,3'}, ['1', '2.5', '3']),
+            'escaped comma': ('CustomVariable', {'query': 'a\\,b,c'}, ['a,b', 'c']),
+            'key and value': ('CustomVariable', {'query': 'one : 1,two : 2'}, ['1', '2']),
+            'a colon with no spaces is text': ('CustomVariable', {'query': 'a:1'}, ['a:1']),
+            'json': (
+                'CustomVariable',
+                {
+                    'query': '[{"text": "a", "value": 5}, {"value": " 6 "}, 7]',
+                    'valuesFormat': 'json',
+                },
+                ['5', '6'],
+            ),
+            'bad json': ('CustomVariable', {'query': '[', 'valuesFormat': 'json'}, []),
+            'json that is no array': (
+                'CustomVariable',
+                {'query': '{}', 'valuesFormat': 'json'},
+                [],
+            ),
+            'empty': ('CustomVariable', {'query': ''}, []),
+            'no query': ('CustomVariable', {}, []),
+            'constant': ('ConstantVariable', {'query': '5m'}, ['5m']),
+        }
+        for label, (kind, spec, want) in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(dc.variable_values(kind, spec), want)
+        got = dc.QueryInput()
+        got.variable('v', 'CustomVariable', {'name': 'n', 'query': '1,2'})
+        got.variable('v', 'ConstantVariable', {'name': 'c', 'query': '5m'})
+        got.variable('v', 'TextVariable', {'name': 't', 'query': 'x'})
+        self.assertEqual(
+            [(v['name'], v.get('values')) for v in got.variables],
+            [('n', ['1', '2']), ('c', ['5m']), ('t', None)],
+        )
+
+    def test_a_loki_adhoc_filter_is_skipped(self):
+        doc = valid()
+        doc['spec']['variables'].append(
+            adhoc_variable('loki', filters=[{'key': 'job', 'operator': '=', 'value': 'x'}])
+        )
+        self.assertEqual([q for q in self.collected(doc).queries if q['kind'] == 'filter'], [])
+
+    def test_loki_queries_are_skipped(self):
+        doc = valid()
+        panel_query(doc, 'panel-2').update(group='loki', spec={'expr': 'rate({app="x"}[1m])'})
+        wheres = [q['where'] for q in self.collected(doc).queries]
+        self.assertNotIn('element panel-2 "Jobs finished" query 0', wheres)
+        self.assertIn('element panel-3 "Jobs failed" query 0', wheres)
+
+    def test_a_variable_sends_its_query_not_its_definition(self):
+        doc = valid()
+        variable(doc, 'worker')['spec']['definition'] = 'not what Grafana runs'
+        got = [q for q in self.collected(doc).queries if q['kind'] == 'variable']
+        self.assertEqual([q['expr'] for q in got], ['label_values(worker_info, worker)'])
+
+    def test_a_variable_stored_as_a_legacy_string_sends_that_string(self):
+        doc = valid()
+        spec = variable(doc, 'worker')['spec']['query']['spec']
+        spec['__legacyStringValue'] = 'query_result(rate(x[$__interval]))'
+        got = [q['expr'] for q in self.collected(doc).queries if q['kind'] == 'variable']
+        self.assertEqual(got, ['query_result(rate(x[$__interval]))'])
+
+    def test_a_null_legacy_string_sends_an_empty_query(self):
+        doc = valid()
+        variable(doc, 'worker')['spec']['query']['spec']['__legacyStringValue'] = None
+        got = [q['expr'] for q in self.collected(doc).queries if q['kind'] == 'variable']
+        self.assertEqual(got, [''])
+
+    def test_reads_row_and_tab_variables(self):
+        doc = valid()
+        row_var = copy.deepcopy(variable(doc, 'worker'))
+        row_var['spec']['name'] = 'row_worker'
+        rows(doc)[1]['spec']['variables'] = [row_var]
+        tab_var = copy.deepcopy(variable(doc, 'worker'))
+        tab_var['spec']['name'] = 'tab_worker'
+        doc['spec']['layout'] = tabs_of(('Overview', doc['spec']['layout']))
+        doc['spec']['layout']['spec']['tabs'][0]['spec']['variables'] = [tab_var]
+        got = self.collected(doc)
+        names = [v['name'] for v in got.variables]
+        self.assertIn('row_worker', names)
+        self.assertIn('tab_worker', names)
+        variable_wheres = [q['where'] for q in got.queries if q['kind'] == 'variable']
+        self.assertTrue(any(w.endswith('variable row_worker') for w in variable_wheres))
+        self.assertTrue(any(w.endswith('variable tab_worker') for w in variable_wheres))
+
+    def test_reads_annotation_queries_but_not_the_built_in(self):
+        doc = valid()
+        doc['spec']['annotations'].append(annotation('changes(up[5m]) > 0'))
+        got = [q for q in self.collected(doc).queries if q['kind'] == 'annotation']
+        self.assertEqual(
+            got,
+            [{'where': 'spec.annotations[1]', 'kind': 'annotation', 'expr': 'changes(up[5m]) > 0'}],
+        )
+
+    def test_a_query_text_that_is_not_a_string_is_sent_empty(self):
+        doc = valid()
+        panel_query(doc, 'panel-1')['spec']['expr'] = 7
+        got = self.collected(doc).queries[0]
+        self.assertEqual(got['expr'], '')
+
+    def test_the_query_check_runs_only_on_a_spec_the_vet_accepts(self):
+        seen = []
+        dc.check(
+            valid(),
+            None,
+            lambda: [dc.Finding('spec', 'cue', 'bad', 'fix')],
+            lambda queries: seen.append(queries) or [],
+        )
+        self.assertEqual(seen, [])
+
+
+class AppDashboard(unittest.TestCase):
+    def test_app_dashboard_by_path(self):
+        cases = {
+            'grafana-dashboard.json': True,
+            'grafana-dashboard-messages.json': True,
+            'grafana-dashboard-.json': False,
+            'grafana-dashboard.json.bak': False,
+            'my-grafana-dashboard.json': False,
+            'sub/grafana-dashboard.json': False,
+            'grafana-dashboards/live-operations.json': False,
+            '/abs/grafana-dashboard.json': False,
+        }
+        for path, want in cases.items():
+            with self.subTest(path=path):
+                self.assertIs(dc.is_app_dashboard(pathlib.Path(path)), want)
+
+
+class QueryCheckRun(unittest.TestCase):
+    """QueryCheck fails the file when promql-check cannot answer."""
+
+    def fake(self, tmp: str, body: str) -> str:
+        path = pathlib.Path(tmp) / 'promql-check'
+        path.write_text(f'#!/bin/sh\n{body}\n')
+        path.chmod(0o755)
+        return str(path)
+
+    def test_a_check_that_cannot_answer_fails_the_file(self):
+        cases = {
+            'missing binary': None,
+            'non-zero exit': 'echo \'{"checked": 0, "findings": []}\'; echo broken >&2; exit 2',
+            'not JSON': 'echo nope',
+            'no findings key': 'echo \'{"checked": 1}\'',
+        }
+        for label, body in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                binary = '/nonexistent/promql-check' if body is None else self.fake(tmp, body)
+                found, _ = dc.check(valid(), None, None, dc.QueryCheck(binary, app=True))
+                self.assertEqual([f.rule for f in found], ['promql'], [str(f) for f in found])
+                self.assertIn('the PromQL query check did not run', found[0].message)
+
+    def test_findings_are_passed_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = {
+                'checked': 6,
+                'findings': [{'where': 'w', 'rule': 'Q1', 'message': 'm.', 'fix': 'f.'}],
+            }
+            binary = self.fake(tmp, f"cat >/dev/null; echo '{json.dumps(report)}'")
+            query_check = dc.QueryCheck(binary, app=False)
+            found, _ = dc.check(valid(), None, None, query_check)
+        self.assertEqual(found, [dc.Finding('w', 'Q1', 'm.', 'f.')])
+        self.assertEqual(
+            query_check.summary(), '6 Prometheus queries parsed, not an app dashboard: Q1 only'
+        )
+
+
+@unittest.skipUnless(PROMQL, 'DASHBOARD_CHECK_PROMQL not set')
+class PromQL(unittest.TestCase):
+    """The checker and promql-check together, on the fixture."""
+
+    def findings(self, doc: dict, app: bool = True) -> list:
+        found, _ = dc.check(doc, None, None, dc.QueryCheck(PROMQL, app=app))
+        return found
+
+    def test_valid_fixture_passes(self):
+        query_check = dc.QueryCheck(PROMQL, app=True)
+        found, _ = dc.check(valid(), None, None, query_check)
+        self.assertEqual([str(f) for f in found], [])
+        self.assertEqual(query_check.checked, 6)
+
+    def test_each_rule_names_the_panel_and_quotes_the_query(self):
+        doc = with_instance(valid())
+        expr = 'sum(increase(up{instance=~"$instance|", job="x"}[${__interval_ms}ms]))'
+        panel_query(doc, 'panel-2')['spec']['expr'] = expr
+        found = self.findings(doc)
+        self.assertEqual([f.rule for f in found], ['Q1', 'Q2', 'Q3'], [str(f) for f in found])
+        for f in found:
+            with self.subTest(rule=f.rule):
+                self.assertEqual(f.where, 'element panel-2 "Jobs finished" query 0')
+                self.assertIn(f'The query: {json.dumps(expr)}.', f.message)
+                self.assertTrue(f.fix)
+
+    def test_parse_error_names_the_panel(self):
+        doc = valid()
+        panel_query(doc, 'panel-3')['spec']['expr'] = 'sum(rate(x[5m])'
+        found = self.findings(doc)
+        self.assertEqual([f.rule for f in found], ['promql'], [str(f) for f in found])
+        self.assertEqual(found[0].where, 'element panel-3 "Jobs failed" query 0')
+        self.assertIn('unclosed left parenthesis', found[0].message)
+
+    def test_loki_queries_are_skipped(self):
+        doc = valid()
+        panel_query(doc, 'panel-2').update(
+            group='loki', spec={'expr': 'sum(rate({app="x", job="y"} |= "a|b" [$__interval]))'}
+        )
+        self.assertEqual([str(f) for f in self.findings(doc)], [])
+
+    def test_an_adhoc_filter_is_held_to_q2_and_q3(self):
+        for label, f, rule in (
+            ('job', {'key': 'job', 'operator': '=', 'value': 'x'}, 'Q3'),
+            ('instance regex', {'key': 'instance', 'operator': '=~', 'value': 'a|b'}, 'Q2'),
+        ):
+            with self.subTest(filter=label):
+                doc = with_instance(valid())
+                doc['spec']['variables'].append(adhoc_variable(filters=[f]))
+                found = self.findings(doc)
+                self.assertEqual(
+                    [(f.where, f.rule) for f in found],
+                    [('spec.variables variable filters filters[0]', rule)],
+                    [str(f) for f in found],
+                )
+
+    def test_an_instant_query_refuses_a_range_window(self):
+        doc = with_instance(valid())
+        spec = panel_query(doc, 'panel-1')['spec']
+        spec.update(
+            expr='sum(max_over_time(queue_depth{instance="$instance"}[range()]))', instant=True
+        )
+        found = self.findings(doc)
+        self.assertEqual([f.rule for f in found], ['promql'], [str(f) for f in found])
+        self.assertIn('as an instant query, where step() and range() are 0', found[0].message)
+
+    def test_variable_queries_are_checked(self):
+        doc = with_instance(valid())
+        variable(doc, 'instance')['spec']['query']['spec']['query'] = (
+            'label_values(worker_info{job="x"}, instance)'
+        )
+        found = self.findings(doc)
+        self.assertEqual([f.rule for f in found], ['Q3'], [str(f) for f in found])
+        self.assertEqual(found[0].where, 'spec.variables variable instance')
+
+    def test_a_multi_value_instance_variable_fails_q2(self):
+        for field in ('multi', 'includeAll'):
+            with self.subTest(field=field):
+                doc = with_instance(valid())
+                variable(doc, 'instance')['spec'][field] = True
+                found = self.findings(doc)
+                self.assertEqual(len(found), 6, [str(f) for f in found])
+                for f in found:
+                    self.assertEqual(f.rule, 'Q2')
+                    self.assertIn('multi-select or includes All', f.message)
+
+    def test_a_formatted_instance_reference_fails_q2(self):
+        doc = with_instance(valid())
+        panel_query(doc, 'panel-1')['spec']['expr'] = 'sum(up{instance="${instance:regex}"})'
+        found = self.findings(doc)
+        self.assertEqual([f.rule for f in found], ['Q2'], [str(f) for f in found])
+        self.assertIn('regex-escaped', found[0].message)
+
+    def test_a_selector_without_the_instance_fails_q2(self):
+        for where, at in (
+            ('panel', 'element panel-3 "Jobs failed" query 0'),
+            ('variable', 'spec.variables variable worker'),
+        ):
+            with self.subTest(where=where):
+                doc = with_instance(valid())
+                if where == 'panel':
+                    panel_query(doc, 'panel-3')['spec']['expr'] = (
+                        'sum(up{instance="$instance"}) or sum(up)'
+                    )
+                else:
+                    variable(doc, 'worker')['spec']['query']['spec']['query'] = (
+                        'label_values(worker_info, worker)'
+                    )
+                found = self.findings(doc)
+                self.assertEqual([(f.where, f.rule) for f in found], [(at, 'Q2')])
+                self.assertIn(
+                    "has no instance matcher, so it reads every instance's", found[0].message
+                )
+
+    def test_the_instance_variable_query_needs_no_instance_matcher(self):
+        self.assertEqual([str(f) for f in self.findings(with_instance(valid()))], [])
+
+    def test_a_legacy_stored_variable_query_is_checked(self):
+        doc = valid()
+        spec = variable(doc, 'worker')['spec']['query']['spec']
+        spec['__legacyStringValue'] = 'query_result(sum(rate(x[$__interval])))'
+        found = self.findings(doc)
+        self.assertEqual(
+            [(f.where, f.rule) for f in found], [('spec.variables variable worker', 'Q1')]
+        )
+
+    def test_an_interval_variable_reaches_q1_at_its_shortest_choice(self):
+        for label, spec, want in (
+            (
+                'auto',
+                {'query': '1m,10m', 'auto': True, 'auto_min': '10s', 'auto_count': 30},
+                ['Q1'],
+            ),
+            ('a 15s option', {'query': '15s,1m'}, ['Q1']),
+            ('options from 1m, auto off', {'query': '1m,10m'}, []),
+        ):
+            with self.subTest(case=label):
+                doc = valid()
+                doc['spec']['variables'].append(interval_variable('iv', **spec))
+                panel_query(doc, 'panel-2')['spec']['expr'] = 'sum(rate(jobs_finished_total[$iv]))'
+                self.assertEqual([f.rule for f in self.findings(doc)], want)
+
+    def test_variable_definition_is_not_read(self):
+        doc = valid()
+        variable(doc, 'worker')['spec']['definition'] = 'rate(x{job="y"}[$__interval]'
+        self.assertEqual([str(f) for f in self.findings(doc)], [])
+
+    def test_annotation_queries_are_checked(self):
+        doc = valid()
+        doc['spec']['annotations'].append(annotation('irate(x[$__interval]) > 0'))
+        found = self.findings(doc)
+        self.assertEqual([(f.where, f.rule) for f in found], [('spec.annotations[1]', 'Q1')])
+
+    def test_not_an_app_dashboard_gets_q1_only(self):
+        doc = valid()
+        panel_query(doc, 'panel-1')['spec']['expr'] = 'sum(up{instance=~".+", hostname="h"})'
+        panel_query(doc, 'panel-2')['spec']['expr'] = 'sum(rate(x[$__interval]))'
+        self.assertEqual([f.rule for f in self.findings(doc, app=False)], ['Q1'])
+        self.assertEqual([f.rule for f in self.findings(doc, app=True)], ['Q2', 'Q3', 'Q1'])
+
+
+@unittest.skipUnless(
+    CUE and SCHEMAS and PROMQL,
+    'DASHBOARD_CHECK_CUE, DASHBOARD_CHECK_SCHEMAS and DASHBOARD_CHECK_PROMQL not set',
+)
 class StrictVet(unittest.TestCase):
     def schema_args(self) -> list[str]:
         args = []
@@ -647,7 +1253,7 @@ class StrictVet(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / 'grafana-dashboard.json'
             path.write_text(json.dumps(doc, indent=2))
-            return run_cli('--cue', CUE, *self.schema_args(), str(path))
+            return run_cli('--cue', CUE, '--promql', PROMQL, *self.schema_args(), str(path))
 
     def test_valid_fixture_vets_against_every_schema(self):
         code, out = self.check(valid())
@@ -659,7 +1265,9 @@ class StrictVet(unittest.TestCase):
             self.assertEqual(len(paths), count, repo)
             for path in paths:
                 with self.subTest(file=f'{repo.name}/{path.name}'):
-                    code, out = run_cli('--cue', CUE, *self.schema_args(), str(path))
+                    code, out = run_cli(
+                        '--cue', CUE, '--promql', PROMQL, *self.schema_args(), str(path)
+                    )
                     self.assertEqual(code, 0, out)
 
     def test_rejects_an_element_of_unknown_kind(self):

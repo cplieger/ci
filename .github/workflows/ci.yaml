@@ -1644,7 +1644,8 @@ jobs:
           ) || { echo "Probe wiregen drift" >> /tmp/_ci_failures; exit 1; }
 
       # actions/dashboard-check runs only in repos that ship a dashboard, which
-      # this one does not, so its rules and its CUE vet are exercised here.
+      # this one does not, so its rules, its CUE vet and its PromQL query
+      # check are exercised here.
       - name: Probe dashboard check
         id: probe-dashboard-check
         continue-on-error: true
@@ -1654,6 +1655,7 @@ jobs:
               bash actions/dashboard-check/install.sh "$RUNNER_TEMP/dashboard-check" \
                 && DASHBOARD_CHECK_CUE="$RUNNER_TEMP/dashboard-check/cue" \
                   DASHBOARD_CHECK_SCHEMAS="$RUNNER_TEMP/dashboard-check" \
+                  DASHBOARD_CHECK_PROMQL="$RUNNER_TEMP/dashboard-check/promql-check" \
                   python3 -m unittest -v scripts.test_dashboard_check scripts.test_dashboard_check_cli \
                     scripts.test_dashboard_publish_gate
             else
