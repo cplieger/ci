@@ -8,6 +8,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -455,11 +456,27 @@ class Accepted(unittest.TestCase):
     """A gated cell slower on purpose, judged against the budget its accepted file gives."""
 
     def test_the_one_seam_judging_a_time_gives_the_larger_accepted_budget(self):
-        e, c = entry(budget=1500.0), cell()
-        self.assertEqual(perf_gate.gated_budget(e, c, {}), (1500.0, None))
+        b, e, c = budgets([entry(budget=1500.0)]), entry(budget=1500.0), cell()
+        self.assertEqual(perf_gate.gated_budget(b, e, [c], {}), (1500.0, None))
         a = accepted()
-        self.assertEqual(perf_gate.gated_budget(e, c, a), (1700.0, a[keyof(e)]))
-        self.assertEqual(perf_gate.gated_budget(e, c, accepted(1400.0)), (1500.0, None))
+        self.assertEqual(perf_gate.gated_budget(b, e, [c], a), (1700.0, a[keyof(e)]))
+        self.assertEqual(perf_gate.gated_budget(b, e, [c], accepted(1400.0)), (1500.0, None))
+
+    def test_the_seam_sees_every_shard_whose_reps_are_judged(self):
+        b = budgets([entry(budget=1500.0)])
+        first = {**cell(reps=(1600.0,) * 3), 'cpu_model': 'AMD EPYC 7763'}
+        more = {**cell(reps=(1400.0,) * 3), 'cpu_model': 'Intel Xeon 8370C'}
+        seen = []
+
+        def seam(budgets_doc, e, cells, accepted):
+            seen.append((budgets_doc is b, [c['cpu_model'] for c in cells]))
+            return e['budget'], None
+
+        with unittest.mock.patch.object(perf_gate, 'gated_budget', seam):
+            perf_gate.verdict(b, results([first]), results([more]))
+        self.assertEqual(
+            seen, [(True, ['AMD EPYC 7763']), (True, ['AMD EPYC 7763', 'Intel Xeon 8370C'])]
+        )
 
     def test_an_accepted_slowdown_passes_with_its_note(self):
         b = budgets([entry(budget=1500.0)])
@@ -539,15 +556,46 @@ class Record(unittest.TestCase):
         self.assertEqual(len(out.failures), 1, out.failures)
         self.assertIn('reads', out.failures[0])
 
+    def test_six_reps_whose_middle_agrees_off_the_budget_record_nothing(self):
+        b = budgets([entry('dom', 'exact', 640)])
+        first = results([cell('dom', (640, 641, 641), kind='count')])
+        again = results([cell('dom', (641, 641, 642), kind='count')])
+        out = perf_gate.verdict(b, first, again)
+        self.assertEqual(out.recorded, [])
+        self.assertEqual(
+            out.failures,
+            [
+                (
+                    f'{DOM}: reps [640, 641, 641, 641, 641, 642] disagree (exact budget 640), '
+                    'so no exact value can be recorded and the cell may no longer be exact'
+                )
+            ],
+        )
+        on_budget = perf_gate.verdict(
+            b,
+            results([cell('dom', (639, 641, 641), kind='count')]),
+            results([cell('dom', (640,) * 3, kind='count')]),
+        )
+        self.assertEqual((on_budget.recorded, on_budget.failures), ([], []))
+        self.assertEqual(on_budget.six[0]['judged'], [640, 640])
+
     def test_a_stale_key_is_re_measured_and_recorded_though_it_equals_its_budget(self):
         b = budgets([entry('dom', 'exact', 640)])
-        first = results([cell('dom', (640, 640, 641), kind='count')])
+        first = results([cell('dom', (640,) * 3, kind='count')])
         again = results([cell('dom', (640,) * 3, kind='count')])
         out = perf_gate.verdict(b, first, again, decision(stale=[keyof(entry('dom'))]))
-        six = [640, 640, 641, 640, 640, 640]
-        self.assertEqual(self.recorded(out), [(keyof(entry('dom')), 640, six)])
+        self.assertEqual(self.recorded(out), [(keyof(entry('dom')), 640, [640] * 6)])
         self.assertEqual(len(out.failures), 1, out.failures)
         self.assertIn('check in the measured file this run wrote', out.failures[0])
+        spread = perf_gate.verdict(
+            b,
+            results([cell('dom', (640, 640, 641), kind='count')]),
+            again,
+            decision(stale=[keyof(entry('dom'))]),
+        )
+        self.assertEqual(spread.recorded, [])
+        self.assertEqual(len(spread.failures), 1, spread.failures)
+        self.assertIn('so no exact value can be recorded', spread.failures[0])
         missing = perf_gate.verdict(b, first, results([]), decision(stale=[keyof(entry('dom'))]))
         self.assertEqual(self.recorded(missing), [])
         self.assertIn('no reps came back', missing.failures[0])
@@ -558,22 +606,31 @@ class Record(unittest.TestCase):
             [
                 {**entry('dom', 'exact', 640), **x1},
                 {**entry('reads', 'exact', 2), **x1},
+                {**entry('nodes', 'exact', 7), **x1},
                 {**entry(budget=1500.0), **x1},
             ]
         )
         d = decision(extend=[unit('files', 60, scale='x1')])
         again = results(
             [
-                {**cell('dom', (641, 640, 641), kind='count'), **x1},
+                {**cell('dom', (641,) * 3, kind='count'), **x1},
                 {**cell('reads', (3, 2, 2), kind='count'), **x1},
+                {**cell('nodes', (8, 9, 10), kind='count'), **x1},
                 {**cell(reps=(9000.0,) * 3), **x1},
             ]
         )
         out = perf_gate.verdict(b, results([]), again, d)
         x1_dom = keyof({**entry('dom'), **x1})
-        self.assertEqual(self.recorded(out), [(x1_dom, 641, [641, 640, 641])])
-        self.assertEqual(len(out.failures), 1, out.failures)
+        self.assertEqual(self.recorded(out), [(x1_dom, 641, [641] * 3)])
+        self.assertEqual(len(out.failures), 2, out.failures)
         self.assertTrue(out.failures[0].startswith('files/x1/chromium/desktop/cold/dom:'))
+        self.assertEqual(
+            out.failures[1],
+            (
+                'files/x1/chromium/desktop/cold/nodes: reps [8, 9, 10] disagree (exact budget 7), '
+                'so no exact value can be recorded and the cell may no longer be exact'
+            ),
+        )
         self.assertEqual([keyof(c) for c in out.reported], [keyof({**entry(), **x1})])
         missing = perf_gate.verdict(b, results([]), results(again['cells'][1:]), d)
         self.assertIn(
@@ -857,7 +914,8 @@ class Provenance(unittest.TestCase):
         self.verified = []
         self.signers = []
         self.bad_bundles = set()
-        # The signer that made each stem's bundle, when another than the one asked for.
+        # The (identity, workflow repository) of the certificate each stem's bundle
+        # carries, matched as cosign matches a Signer; a stem it lacks verifies.
         self.signed_by = {}
         self.git = FakeGit()
         self.stale = set()
@@ -877,8 +935,16 @@ class Provenance(unittest.TestCase):
         self.signers.append(signer)
         if pathlib.Path(bundle).name in self.bad_bundles:
             return 'bundle does not verify'
-        made = self.signed_by.get(pathlib.Path(blob).stem, signer)
-        return None if made == signer else f'no matching CertificateIdentity for {made}'
+        made = self.signed_by.get(pathlib.Path(blob).stem)
+        if made is None:
+            return None
+        identity, repository = made
+        ok = (
+            signer.identity in (None, identity)
+            and (signer.identity_regexp is None or re.match(signer.identity_regexp, identity))
+            and signer.workflow_repository in (None, repository)
+        )
+        return None if ok else f'no matching CertificateIdentity for {identity} in {repository}'
 
     def check(self, head, base, base_sha=HEAD, verify=None):
         self.checked = perf_gate.check_provenance(
@@ -1170,7 +1236,9 @@ class Provenance(unittest.TestCase):
 
     def test_a_measured_value_without_verifiable_provenance_fails_closed(self):
         head = budgets([self.moved(2056)])
-        other_run = dataclasses.replace(MEASURED_SIGNER, workflow_repository='cplieger/other')
+        perf_ci = 'https://github.com/cplieger/ci/.github/workflows/perf-ci.yaml@refs/heads/main'
+        # stale: a fresh measured file of this head cures the refusal, so compare
+        # re-measures the cell; a bundle that does not verify is no such refusal.
         cases = {
             'no file': ({}, lambda: self.dir.joinpath('900-1.json').unlink(), 'checked in'),
             'no bundle': (
@@ -1182,16 +1250,21 @@ class Provenance(unittest.TestCase):
                 {},
                 lambda: self.bad_bundles.add('900-1.sigstore.json'),
                 'the bundle does not verify',
+                False,
             ),
             'signed by perf-calibrate': (
                 {},
-                lambda: self.signed_by.update({'900-1': perf_gate.CALIBRATION_SIGNER}),
+                lambda: self.signed_by.update(
+                    {'900-1': (perf_gate.CALIBRATION_IDENTITY, perf_gate.CI_REPO)}
+                ),
                 'the bundle does not verify',
+                False,
             ),
             'signed in another repository': (
                 {},
-                lambda: self.signed_by.update({'900-1': other_run}),
+                lambda: self.signed_by.update({'900-1': (perf_ci, 'cplieger/other')}),
                 'the bundle does not verify',
+                False,
             ),
             'another repository': ({'repo': 'cplieger/other'}, None, 'repo is'),
             'another runner': ({'runner': 'self-hosted'}, None, 'runner is'),
@@ -1210,7 +1283,7 @@ class Provenance(unittest.TestCase):
                 'value',
             ),
         }
-        for name, (doc, setup, want) in cases.items():
+        for name, (doc, setup, want, *curable) in cases.items():
             with self.subTest(name):
                 self.bad_bundles.clear()
                 self.signed_by.clear()
@@ -1222,7 +1295,52 @@ class Provenance(unittest.TestCase):
                 self.assertEqual(len(errors), 1, errors)
                 self.assertTrue(errors[0].startswith('measured file 900-1: '), errors)
                 self.assertIn(want, errors[0])
-                self.assertEqual(self.stale, {keyof(self.moved(2056))})
+                stale = {keyof(self.moved(2056))} if curable != [False] else set()
+                self.assertEqual(self.stale, stale)
+
+    def test_a_calibration_without_verifiable_provenance_fails_closed(self):
+        self.assertEqual(
+            perf_gate.CALIBRATION_SIGNER,
+            perf_gate.Signer(
+                identity=perf_gate.CALIBRATION_IDENTITY, workflow_repository=perf_gate.CI_REPO
+            ),
+        )
+        b = budgets([entry()])
+        cases = {
+            'signed in another repository': (
+                lambda: self.signed_by.update(
+                    {'111': (perf_gate.CALIBRATION_IDENTITY, 'cplieger/other')}
+                ),
+                'calibration 111: the bundle does not verify',
+            ),
+            'a run URL of another run': (
+                lambda: self.retarget('111', run_url=RUN_URL + '999'),
+                f"calibration 111: run_url is '{RUN_URL}999', not '{RUN_URL}111'",
+            ),
+            'no run URL': (
+                lambda: self.retarget('111', run_url=None),
+                f"calibration 111: run_url is None, not '{RUN_URL}111'",
+            ),
+        }
+        for name, (setup, want) in cases.items():
+            with self.subTest(name):
+                self.signed_by.clear()
+                self.write('111', calibration_file([cal_cell()]))
+                setup()
+                errors = self.check(b, b)
+                self.assertEqual(len(errors), 1, errors)
+                self.assertTrue(errors[0].startswith(want), errors)
+
+    def retarget(self, stem, **fields):
+        path = self.dir / f'{stem}.json'
+        path.write_text(json.dumps({**json.loads(path.read_text()), **fields}))
+
+    def test_a_calibration_refusal_marks_no_exact_key_stale(self):
+        self.write('111', calibration_file([cal_cell('dom', 640.0, 'exact', kind='count')], runs=5))
+        b = budgets([entry('dom', 'exact', 640.0)])
+        errors = self.check(b, b)
+        self.assertEqual(errors, ['calibration 111: 5 runs decide no tier; a calibration needs 10'])
+        self.assertEqual(self.stale, set())
 
     def test_a_source_checked_without_cosign_fails_closed(self):
         self.pr_measured(m_cell(2056))
@@ -1233,6 +1351,7 @@ class Provenance(unittest.TestCase):
         self.assertEqual(
             errors, ['measured file 900-1: the bundle does not verify: cosign is not installed']
         )
+        self.assertEqual(self.stale, set())
 
     def test_a_source_url_names_the_repository_whose_run_wrote_the_file(self):
         self.pr_measured(m_cell(2056))
@@ -1465,6 +1584,26 @@ class Provenance(unittest.TestCase):
         self.assertEqual(self.check(budgets([], retired=retired), base), [])
         no_reason = [{**CELL, 'metric': 'cpu_ms', 'reason': ''}]
         self.assertTrue(self.check(budgets([], retired=no_reason), base))
+
+    def test_a_retired_cell_is_listed_with_its_tier_and_reason(self):
+        base = budgets([entry(source=RUN_URL + '100'), entry('dom', 'exact', 640.0)])
+        retired = [
+            {**CELL, 'metric': 'cpu_ms', 'reason': 'the view was removed'},
+            {**CELL, 'metric': 'dom', 'reason': 'the list is virtual now'},
+        ]
+        self.assertEqual(self.check(budgets([], retired=retired), base), [])
+        self.assertEqual(
+            self.checked.retires,
+            [
+                {'key': keyof(entry()), 'tier': 'gated', 'reason': 'the view was removed'},
+                {'key': keyof(entry('dom')), 'tier': 'exact', 'reason': 'the list is virtual now'},
+            ],
+        )
+        text = perf_gate.summary(budgets([]), perf_gate.Outcome(retires=self.checked.retires))
+        self.assertIn('### Cells this pull request retires', text)
+        self.assertIn('| Cell | Tier | Reason |', text)
+        self.assertIn(f'| {DOM} | exact | the list is virtual now |', text)
+        self.assertIn(f'| {CPU} | gated | the view was removed |', text)
 
     def test_a_reported_entry_dropped_needs_no_retired(self):
         base = budgets([entry(tier='reported', source=RUN_URL + '100')])
@@ -2707,6 +2846,7 @@ class Cli(unittest.TestCase):
         plan=PLAN,
         shard=None,
         git=FakeGit,
+        cosign=None,
         **doc,
     ):
         own = [entry(source=RUN_URL + '100'), entry('dom', 'exact', 640)] if listed else []
@@ -2719,11 +2859,12 @@ class Cli(unittest.TestCase):
             path = self.dir / 'sources' / f'{run_id}.json'
             held = json.loads(path.read_text())['cells'] if path.is_file() else []
             c = cal_cell(e['metric'], e.get('baseline', 0.0), e['tier'], **{f: e[f] for f in CELL})
-            self.put(f'sources/{run_id}.json', calibration_file([*held, c], run_id=run_id))
+            doc = calibration_file([*held, c], run_id=run_id, run_url=RUN_URL + run_id)
+            self.put(f'sources/{run_id}.json', doc)
             self.put(f'sources/{run_id}.sigstore.json', {})
         for patch in (
             unittest.mock.patch.object(perf_gate, 'Git', git),
-            unittest.mock.patch.object(perf_gate, 'cosign_verify', return_value=None),
+            unittest.mock.patch.object(perf_gate, 'cosign_verify', return_value=cosign),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -2824,6 +2965,19 @@ class Cli(unittest.TestCase):
         self.assertEqual(remeasure['cells'], [])
         self.assertEqual(remeasure['extend'], [unit('files', 60, scale='x1')])
         self.assertEqual(remeasure['accepted'], [])
+
+    def test_compare_extends_nothing_for_a_source_that_cannot_be_verified(self):
+        url = MEASURED_URL + '900/attempts/1'
+        moved = {**entry('dom', 'exact', 2056, source=url, reason='one more node'), 'scale': 'x1'}
+        self.put('sources/900-1.json', measured_file([{**m_cell(2056), 'scale': 'x1'}]))
+        self.put('sources/900-1.sigstore.json', {})
+        measured = [cell(), cell('dom', (640,) * 3, kind='count')]
+        rc = self.compare(measured, entries=[moved], cosign='cosign is not installed')
+        self.assertEqual(rc, 1)
+        self.assertIn('the bundle does not verify: cosign is not installed', self.output)
+        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
+        self.assertEqual((remeasure['stale'], remeasure['extend']), ([], []))
+        self.assertEqual(remeasure['cells'], [])
 
     def test_compare_re_measures_a_stale_key_the_set_measured_though_nothing_extends(self):
         url = MEASURED_URL + '900/attempts/1'

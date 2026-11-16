@@ -3,9 +3,10 @@
 # write the calibration with scripts/perf_gate.py --calibrate, sign it keyless,
 # and open the pull request that checks it in. perf_gate.py accepts a
 # calibration only from a file whose bundle names this workflow at
-# refs/heads/main as its signer, so a run dispatched from any other ref
-# proposes numbers no budget can cite. weekly-perf-calibrate.yaml calls it
-# every week; a dispatch calibrates one repository now.
+# refs/heads/main as its signer in a cplieger/ci run, so a run dispatched from
+# any other ref, or a call from another repository, proposes numbers no budget
+# can cite. weekly-perf-calibrate.yaml calls it every week; a dispatch
+# calibrates one repository now.
 name: Performance calibrate
 run-name: Calibrate ${{ inputs.repo }} full x10
 
@@ -258,9 +259,13 @@ jobs:
           id=$(gh api "users/${bot}" --jq .id)
           git -c user.name="$bot" -c user.email="${id}+${bot}@users.noreply.github.com" \
             commit --quiet -m "$title"
-          # The branch is this run's own, so a re-run replaces it.
+          # The branch is this run's own, so a re-run replaces it. The token goes
+          # in a local auth header, kept out of the remote URL and process args.
           branch="perf/calibration-${RUN_ID}"
-          git push --quiet "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "+HEAD:refs/heads/${branch}"
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic ${auth}"
+          trap 'git config --unset-all "http.https://github.com/.extraheader" || true' EXIT
+          git push --quiet "https://github.com/${REPO}.git" "+HEAD:refs/heads/${branch}"
           # GitHub refuses a body over 65,536 characters; the run summary keeps all of it.
           if [ "$(wc -c < "$body")" -gt 60000 ]; then
             { head -c 60000 "$body"; printf '\n\nCut at 60,000 bytes; %s lists every change.\n' "$RUN_URL"; } > "$body.cut"
