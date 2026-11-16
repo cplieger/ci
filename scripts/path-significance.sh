@@ -47,7 +47,7 @@ if [ "$MODE" = paths ]; then
     "" | dev | stable) ;;
     *) die "REQUEST_CHANNEL must be dev or stable, got '${REQUEST_CHANNEL}'" ;;
   esac
-  if ! CHANGED=$(git diff --no-renames --name-only "$FROM..$TO"); then
+  if ! CHANGED=$(git -c core.quotePath=false diff --no-renames --name-only "$FROM..$TO"); then
     echo "::error::path-significance: cannot diff ${FROM}..${TO}" >&2
     exit 2
   fi
@@ -57,21 +57,21 @@ if [ "$MODE" = paths ]; then
   ANCHOR_SHA=""
 elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
   note "No before SHA — treating all tracked files as changed"
-  CHANGED=$(git ls-files)
+  CHANGED=$(git -c core.quotePath=false ls-files)
 elif [ -n "$ANCHOR_SHA" ]; then
-  if CHANGED=$(git diff --no-renames --name-only "$ANCHOR_SHA..$HEAD" 2>/dev/null); then
+  if CHANGED=$(git -c core.quotePath=false diff --no-renames --name-only "$ANCHOR_SHA..$HEAD" 2>/dev/null); then
     RANGE_START="$ANCHOR_SHA"
     BEFORE="$ANCHOR_SHA"
     note "deriving changed paths from ${ANCHOR_SHA}..HEAD (newest tag on this channel)"
   else
     note "git diff from the anchor failed — treating all tracked files as changed"
-    CHANGED=$(git ls-files)
+    CHANGED=$(git -c core.quotePath=false ls-files)
   fi
-elif CHANGED=$(git diff --no-renames --name-only "$BEFORE..$HEAD" 2>/dev/null); then
+elif CHANGED=$(git -c core.quotePath=false diff --no-renames --name-only "$BEFORE..$HEAD" 2>/dev/null); then
   RANGE_START="$BEFORE"
 else
   note "git diff failed (force push or unreachable history) — treating all tracked files as changed"
-  CHANGED=$(git ls-files)
+  CHANGED=$(git -c core.quotePath=false ls-files)
 fi
 
 # Paths that never ship in an artifact (extended regex), unless a non-test
@@ -258,7 +258,7 @@ fi
 REBUILD_SUBJECT='fix(deps): rebuild against refreshed base packages'
 is_rebuild_request() { # <commit> -> 0 when it changes no file and carries REBUILD_SUBJECT, 1 when it changes a file, 3 when it is another empty commit; dies when git cannot read it
   local files subject
-  files=$(git diff-tree --root --no-commit-id --name-only -r "$1") || die "cannot read the files commit $1 changes"
+  files=$(git -c core.quotePath=false diff-tree --root --no-commit-id --name-only -r "$1") || die "cannot read the files commit $1 changes"
   [ -z "$files" ] || return 1
   subject=$(git log -1 --format=%s "$1") || die "cannot read the subject of commit $1"
   case "$subject" in
@@ -451,7 +451,7 @@ for l in "${GO_LANES[@]}"; do
     continue
   fi
   note "lane ${l}: deriving changed paths from ${anchor}..HEAD (newest lane tag on this channel)"
-  lane_diff=$(git diff --no-renames --name-only "$anchor..$HEAD" -- "$l/")
+  lane_diff=$(git -c core.quotePath=false diff --no-renames --name-only "$anchor..$HEAD" -- "$l/")
   lane_diff=$(refine_manifests "$anchor" "$lane_diff")
   if [ -n "$lane_diff" ]; then
     lane_shipped=$(shipped "$lane_diff") || exit 2

@@ -925,7 +925,7 @@ publish_main "$NM"
 compute "$NM" stable chartdata
 assert_eq "$OUT_LEVEL" "minor" "S17e: the lane's TS half stays the lane's though a sentinel go.mod sits in it"
 mkdir -p "$WORK/nm-stub"
-printf '#!/usr/bin/env bash\n[[ "$*" != ls-tree\\ -r* ]] || exit 92\nexec %q "$@"\n' "$(command -v git)" >"$WORK/nm-stub/git"
+printf '#!/usr/bin/env bash\n[[ "$*" != *ls-tree\\ -r* ]] || exit 92\nexec %q "$@"\n' "$(command -v git)" >"$WORK/nm-stub/git"
 chmod 755 "$WORK/nm-stub/git"
 refused "S17f: a tree go-modules.sh cannot read fails the lane's numbering" \
   "cannot tell which commits of" "$NM" PATH="$WORK/nm-stub:$PATH" CHANNEL=stable LANE=chartdata bash "$ACTION"

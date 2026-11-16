@@ -23,7 +23,7 @@ case "$cmd" in
 esac
 
 tree_of() { # <rev> -> every tracked path at <rev>
-  git ls-tree -r --name-only "$1" || die "cannot list the tree of $1"
+  git -c core.quotePath=false ls-tree -r --name-only "$1" || die "cannot list the tree of $1"
 }
 modules_of() { # <paths> -> the dirs holding a go.mod among them
   # A committed node_modules or vendor tree carries upstream go.mod files.
@@ -120,13 +120,15 @@ owners_in() { # <state> <path>: OWN gets the units owning <path> in that state's
   OWN+=(.)
 }
 
-# walk: each non-merge commit of <from>..<to> (<to>'s whole history for an
-# empty <from> or one that is no commit) and each path it changes; a path
+# walk: each non-merge commit of <from>..<to> and each path it changes; a path
 # counts for its owner in each tree holding it, and a go.mod added or removed
 # over other files for its dir's owner in the tree without it.
-#   commits <from> <to> <unit>: "<sha>\t<path>" per path <unit> owns so.
+#   commits <from> <to> <unit>: "<sha>\t<path>" per path <unit> owns so, over
+#   <to>'s whole history for an empty <from> or a non-commit one (release-state.sh
+#   half_changed passes the empty tree for a first build).
 #   paths <from> <to> <unit>...: "<unit>\t<path>" per such path on stdin; one no
-#   commit changes counts at <from>'s tree and <to>'s, an empty <from> at <to>'s.
+#   commit changes counts at <from>'s tree and <to>'s; an empty <from> walks
+#   nothing and judges every path at <to>'s tree.
 FROM=$2 TO=$3
 shift 3
 declare -A ASKED=() WANT=() COVERED=() SEEN=()
@@ -163,7 +165,7 @@ emit() { # <state> <sha> <path>: prints the asked units owning <path> in that st
 }
 holds_under() { # <rev> <dir>: status 0 when <rev>'s tree holds a file under <dir>
   local out
-  out=$(git ls-tree --name-only "$1" -- "$2/") || die "cannot list ${2}/ at $1"
+  out=$(git -c core.quotePath=false ls-tree --name-only "$1" -- "$2/") || die "cannot list ${2}/ at $1"
   [ -n "$out" ]
 }
 commit_done() { # SHA PARENT CHANGES: emits one commit's paths

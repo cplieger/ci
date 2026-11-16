@@ -407,7 +407,7 @@ half_changed() { # <lane> <from commit or ''> <to> [promotions] -> 0 when the ha
     done <<<"$recs"
   fi
   while read -r f t; do
-    res=$(MODE=paths FROM="$f" TO="$t" REPO_TYPE=none SUBPACKAGES_JSON="$(jq -cn --arg d "$1/web" '[$d]')" GO_LANES_JSON='[]' \
+    res=$(MODE=paths FROM="$f" TO="$t" REPO_TYPE=none SUBPACKAGES_JSON="$(jq -cn --arg d "$1/web" '[$d]')" GO_LANES_JSON="$(jq -cn --arg d "$1" '[$d]')" \
       bash "$TOOLS/path-significance.sh") || die "path significance of ${f}..${t} failed"
     subs=$(sed -n 's/^subpackages_to_publish=//p' <<<"$res")
     if in_list "subpackages_to_publish of ${f}..${t}" "$1/web" "$subs"; then

@@ -455,7 +455,7 @@ expect "N20 and a go root's notes leave out every nested module" <<'EOF'
 **Full changelog**: https://github.com/owner/nm/compare/v1.0.0...v1.0.1
 EOF
 mkdir -p "$WORK/nm-stub"
-printf '#!/usr/bin/env bash\n[[ "$*" != ls-tree\\ -r* ]] || exit 92\nexec %q "$@"\n' "$(command -v git)" >"$WORK/nm-stub/git"
+printf '#!/usr/bin/env bash\n[[ "$*" != *ls-tree\\ -r* ]] || exit 92\nexec %q "$@"\n' "$(command -v git)" >"$WORK/nm-stub/git"
 chmod 755 "$WORK/nm-stub/git"
 PATH="$WORK/nm-stub:$PATH" refused "N20 a tree go-modules.sh cannot read fails the render" \
   "cannot tell which commits of chartdata/v1.0.0.." "$NM" --repo owner/nm --release-commit HEAD --site lane \

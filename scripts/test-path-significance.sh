@@ -229,7 +229,7 @@ D11=$(commit "$REBUILD_SUBJECT")
 chk "S27 a commit under the rebuild subject that changes a file is no rebuild request" \
   "$(release S27f stable "$D10" "$D10" "$D11")" "false|[]|[]"
 chk "S27 and one whose files git cannot read fails the step" \
-  "$(failing_release "diff-tree --root --no-commit-id --name-only -r $D11" 1 stable "$D10" "$D10" "$D11")" "2|1"
+  "$(failing_release "-c core.quotePath=false diff-tree --root --no-commit-id --name-only -r $D11" 1 stable "$D10" "$D10" "$D11")" "2|1"
 chk_has "S27 and says so" "$(cat "$WORK/log")" "path-significance: cannot read the files commit $D11 changes"
 chk "S28 a subpackage list that is not JSON fails" "$(SUBPACKAGES_JSON='["web"' paths_rc "$D10" "$D11")" "2"
 chk_has "S28 and says so" "$(cat "$WORK/perr")" "path-significance: SUBPACKAGES_JSON must be a JSON array of dirs, got '[\"web\"'"
@@ -270,7 +270,7 @@ chk "S31 as does a rebuild request whose subject git cannot read" \
   "$(failing_paths "log -1 --format=%s $D3R" 1 "$D3S" "$D3R")" "2|1"
 chk_has "S31 and says so" "$(cat "$WORK/perr")" "::error::path-significance: cannot read the subject of commit $D3R"
 chk "S31 and one whose files git cannot read" \
-  "$(failing_paths "diff-tree --root --no-commit-id --name-only -r $D11" 1 "$D10" "$D11")" "2|1"
+  "$(failing_paths "-c core.quotePath=false diff-tree --root --no-commit-id --name-only -r $D11" 1 "$D10" "$D11")" "2|1"
 chk_has "S31 and says so" "$(cat "$WORK/perr")" "::error::path-significance: cannot read the files commit $D11 changes"
 
 # ── Docker repos whose rebuild request sits beside a change the image ignores ─
@@ -510,7 +510,7 @@ E3=$(commit "docs: the guide")
 chk "S39 an unembedded doc alone still releases nothing" "$(paths "$E2" "$E3")" 'false|[]|[]|[]'
 # The first ls-tree is the embed check's, which runs before go-modules.sh.
 chk "S40 a tree the embed check cannot read fails the run, never drops the path" \
-  "$(failing_paths 'ls-tree*' 1 "$E2" "$E3")" '2|1'
+  "$(failing_paths '*ls-tree*' 1 "$E2" "$E3")" '2|1'
 chk_has "S40 and says why" "$(cat "$WORK/perr")" "cannot read the //go:embed directives at $E3"
 # Go's embed skips a subdirectory that holds its own go.mod, so a directory
 # pattern above a nested module never names that module's files.
@@ -700,9 +700,9 @@ chk "S51 a lane nested inside a module that is no lane still releases" \
 put tools/run.sh '#!/bin/sh # v2'
 G7=$(commit "chore(tools): the sentinel module's own file")
 chk "S51 and the outer module's own file releases nothing" "$(paths "$G6" "$G7")" 'false|[]|[]|[]'
-chk "S52 a tree go-modules.sh cannot read fails MODE=paths" "$(failing_paths 'ls-tree*' 1 "$G6" "$G7")" '2|1'
+chk "S52 a tree go-modules.sh cannot read fails MODE=paths" "$(failing_paths '*ls-tree*' 1 "$G6" "$G7")" '2|1'
 chk_has "S52 and says why" "$(cat "$WORK/perr")" "::error::go-modules: cannot list the tree of $G6"
-chk "S52 as it fails the release step" "$(failing_release 'ls-tree*' 1 dev "$G6" "$G6" "$G7")" '2|1'
+chk "S52 as it fails the release step" "$(failing_release '*ls-tree*' 1 dev "$G6" "$G6" "$G7")" '2|1'
 
 # A docker or ts root builds its artifact from the whole tree, so a sentinel
 # module outside every lane is still the root's: web-terminal-kiro's image
@@ -884,6 +884,21 @@ done
 chk "S56 as it does for the lanes measured from their own tags" "$(release S56t dev "$I0" "$I0" "$I1")" \
   'false|["ui","pkg"]|[]'
 chk "S56 and on stable" "$(release S56s stable "$I0" "$I0" "$I1")" 'false|["ui","pkg"]|[]'
+# git quotes a non-ASCII path name by default; go-modules.sh judges raw names.
+export REPO_TYPE=go SUBPACKAGES_JSON='[]' GO_LANES_JSON='["chartdata"]'
+newrepo non-ascii
+put go.mod 'module example.com/go'
+put main.go 'package main'
+put chartdata/go.mod 'module example.com/go/chartdata'
+put chartdata/c.go 'package chartdata'
+U0=$(commit "feat: initial")
+put café.go 'package main'
+U1=$(commit "fix: a root file with an accented name")
+chk "S57 a change confined to a non-ASCII root file releases the root" "$(paths "$U0" "$U1")" 'true|[]|[]|["café.go"]'
+put chartdata/é.go 'package chartdata'
+U2=$(commit "fix(chartdata): a lane file with an accented name")
+chk "S57 and one in a lane releases the lane" "$(paths "$U1" "$U2")" 'false|[]|["chartdata"]|["chartdata/é.go"]'
+chk "S57 as the release step reads it" "$(release S57 dev "$U1" "$U1" "$U2")" 'false|[]|["chartdata"]'
 cd "$WORK" || exit 1
 
 echo "PASS: path significance ($PASS checks)"

@@ -364,8 +364,9 @@ def surface_kind(path: str) -> str | None:
 
 
 def discover_lanes(modules: list[str]) -> list[str]:
-    """The lane-eligible dirs among go-modules.sh `list`'s, by release.yaml's
-    `Detect nested Go modules` rules."""
+    """The lane-eligible dirs among go-modules.sh `list`'s: those with only
+    [A-Za-z0-9._/-] characters and no `internal/` segment. Repo._lane_has_go
+    owns the dotless-path and tracked-.go rules."""
     lanes = [
         d for d in modules if not re.search(r'[^A-Za-z0-9._/-]', d) and '/internal/' not in f'/{d}/'
     ]
