@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
-# Shipped paths of a range per lane, for release.yaml detect and promotion.
-# MODE=release (default): env BEFORE HEAD ANCHOR_SHA CHANNEL REPO_TYPE
-#   SUBPACKAGES_JSON GO_LANES_JSON; writes root_changed, subpackages_to_publish,
-#   go_modules_to_release and exclude_re to $GITHUB_OUTPUT, and a summary.
-# MODE=paths: env FROM TO REPO_TYPE SUBPACKAGES_JSON GO_LANES_JSON; the same
-#   keys plus `significant` (JSON array) and `rebuild_request` (the newest
-#   rebuild request in FROM..TO whatever REPO_TYPE is, empty for none) on
-#   stdout. REQUEST_CHANNEL=stable counts only TO's first-parent commits as
-#   rebuild requests, since a promotion's second parent brings dev's; unset or
-#   dev counts every non-merge commit. Tree diff FROM..TO only: the
-#   empty-commit rule sets no root_changed, no lane tags. Exits 2 when the
-#   diff or a commit read fails, or on another REQUEST_CHANNEL.
-# Either mode exits 2 on malformed directory JSON.
+# Shipped paths of a range per lane, for release.yaml detect and promotion. Env
+#   REPO_TYPE SUBPACKAGES_JSON GO_LANES_JSON, then per mode. MODE=release (default),
+#   env BEFORE HEAD ANCHOR_SHA CHANNEL: root_changed, subpackages_to_publish,
+#   go_modules_to_release, exclude_re to $GITHUB_OUTPUT, plus a summary. MODE=paths,
+#   env FROM TO: those keys, `significant` (JSON) and `rebuild_request` (FROM..TO's newest,
+#   any REPO_TYPE, or empty) on stdout, from the tree diff alone (no empty-commit rule, no
+#   lane tags); REQUEST_CHANNEL=stable counts only TO's first-parent requests (a promotion's
+#   second parent brings dev's), unset or dev every non-merge one. Exits 2 on bad input or git.
 set -euo pipefail
 
 MODE="${MODE:-release}"
@@ -206,50 +201,35 @@ shipped() {
   printf '%s\n%s\n' "$kept" "$embedded" | LC_ALL=C sort -u | sed '/^$/d'
 }
 
-# A path ships with the module that owns it: its nearest ancestor among
-# go-modules.sh's boundaries over the range measured, else the root.
-declare -A BOUNDARY=() IS_LANE=()
-load_boundaries() { # <from>: BOUNDARY holds the boundaries over <from>..HEAD, HEAD's alone for an empty <from>
-  local d out
-  out=$(bash "$TOOLS_DIR/go-modules.sh" boundaries "$HEAD" "$1") || exit 2
-  BOUNDARY=()
-  while IFS= read -r d; do
-    [ -z "$d" ] || BOUNDARY["$d"]=1
+# A path ships with the units owning it over the range (go-modules.sh paths):
+# '.' for the root, else a lane.
+declare -A UNITS=()
+attribute() { # <from> <paths> <unit>...: UNITS[<path>] gets " <unit> " per unit owning it over <from>..HEAD
+  local from=$1 paths=$2 out u f
+  shift 2
+  UNITS=()
+  [ -n "$paths" ] || return 0
+  out=$(bash "$TOOLS_DIR/go-modules.sh" paths "$from" "$HEAD" "$@" <<<"$paths") || exit 2
+  while IFS=$'\t' read -r u f; do
+    [ -z "$f" ] || UNITS["$f"]+=" $u "
   done <<<"$out"
 }
-if [ "$MODE" = paths ]; then
-  load_boundaries "$FROM"
-else
-  load_boundaries "$RANGE_START"
-fi
-for l in "${GO_LANES[@]}"; do
-  IS_LANE["$l"]=1
-done
-OWNER=""
-owner_of() { # <path>: sets OWNER to the boundary owning <path>, empty for the root
-  local d=$1
-  OWNER=""
-  while [[ $d == */* ]]; do
-    d=${d%/*}
-    if [ -n "${BOUNDARY[$d]:-}" ]; then
-      OWNER=$d
-      return 0
-    fi
-  done
-}
-drop_unowned() { # <paths> -> the paths less those a nested module that is not a lane owns; a subpackage keeps its own
+owned() { # <paths> [<unit>] -> those UNITS gives <unit>, or any unit; a subpackage keeps its own
   local f s
   while IFS= read -r f; do
     [ -n "$f" ] || continue
+    if [ -n "${2:-}" ]; then
+      [[ ${UNITS[$f]:-} != *" $2 "* ]] || printf '%s\n' "$f"
+      continue
+    fi
     for s in "${SUBPACKAGES[@]}"; do
       if [[ $f == "$s/"* ]]; then
         printf '%s\n' "$f"
         continue 2
       fi
     done
-    owner_of "$f"
-    if [ -n "$OWNER" ] && [ -z "${IS_LANE[$OWNER]:-}" ]; then
-      note "$f belongs to the nested module ${OWNER}, which is not a release lane, so it is not significant" >&2
+    if [ -z "${UNITS[$f]:-}" ]; then
+      note "$f ships with no lane and not the root (a nested module owns it), so it is not significant" >&2
       continue
     fi
     printf '%s\n' "$f"
@@ -260,7 +240,12 @@ if [ -z "$CHANGED" ]; then
   SIGNIFICANT=""
 else
   SIGNIFICANT=$(shipped "$CHANGED") || exit 2
-  SIGNIFICANT=$(drop_unowned "$SIGNIFICANT")
+  if [ "$MODE" = paths ]; then
+    attribute "$FROM" "$SIGNIFICANT" . "${GO_LANES[@]}"
+  else
+    attribute "$RANGE_START" "$SIGNIFICANT" . "${GO_LANES[@]}"
+  fi
+  SIGNIFICANT=$(owned "$SIGNIFICANT")
 fi
 
 # rebuild-stale.sh's empty commit forces an image rebuild against refreshed
@@ -289,12 +274,11 @@ is_rebuild_commit() { # <commit>: is_rebuild_request, noting an empty commit tha
 }
 
 # package.json ships only as a published manifest (a declared TS subpackage's,
-# the root one in a ts repo, or a nested lane's TS half at <lane>/web, which
-# release.yaml finds by its jsr.json and publishes at the lane's version), and
-# there only through its fields other than devDependencies, overrides and
-# version: npm reads overrides from the installing project's root manifest
-# alone (https://docs.npmjs.com/cli/v11/configuring-npm/package-json), and
-# every publish rewrites version. A published manifest's jsr.json ships
+# the root one in a ts repo, or a lane's TS half at <lane>/web, which release.yaml
+# finds by its jsr.json), and there only through its fields other than
+# devDependencies, overrides and version: npm reads overrides from the installing
+# project's root manifest alone (https://docs.npmjs.com/cli/v11/configuring-npm/package-json),
+# and every publish rewrites version. A published manifest's jsr.json ships
 # through every field but version. Any other package.json is dev tooling.
 # With no <from> to compare, stay significant.
 MANIFESTS=""
@@ -416,16 +400,15 @@ if [ -n "$SIGNIFICANT" ]; then
         break
       fi
     done
-    owner_of "$f"
-    if [ -n "$OWNER" ] && [ -n "${IS_LANE[$OWNER]:-}" ]; then
-      # Without a tag on this channel the lane's first release is owed by
-      # whatever the root range shows under it.
-      if [ -z "${LANE_ANCHOR[$OWNER]}" ]; then
-        LANE_CHANGED["$OWNER"]=true
+    for u in ${UNITS[$f]:-}; do
+      if [ "$u" = . ]; then
+        $in_subpkg || ROOT_CHANGED=true
+      elif [ -z "${LANE_ANCHOR[$u]}" ]; then
+        # Without a tag on this channel the lane's first release is owed by
+        # whatever the root range shows it owns.
+        LANE_CHANGED["$u"]=true
       fi
-    elif [ -z "$OWNER" ] && ! $in_subpkg; then
-      ROOT_CHANGED=true
-    fi
+    done
   done <<<"$SIGNIFICANT"
 fi
 
@@ -472,8 +455,8 @@ for l in "${GO_LANES[@]}"; do
   lane_diff=$(refine_manifests "$anchor" "$lane_diff")
   if [ -n "$lane_diff" ]; then
     lane_shipped=$(shipped "$lane_diff") || exit 2
-    load_boundaries "$anchor"
-    lane_shipped=$(drop_unowned "$lane_shipped")
+    attribute "$anchor" "$lane_shipped" "$l"
+    lane_shipped=$(owned "$lane_shipped" "$l")
     [ -z "$lane_shipped" ] || LANE_CHANGED["$l"]=true
   fi
 done

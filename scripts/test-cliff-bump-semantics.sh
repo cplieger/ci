@@ -436,6 +436,7 @@ Q=$(mkfixture chan-q)
 fc "$Q" src/main.go "feat: initial"
 mkdir -p "$Q/yamlenv"
 echo y >"$Q/yamlenv/y.go"
+echo 'module example.com/q/yamlenv' >"$Q/yamlenv/go.mod"
 git -C "$Q" add -A
 git -C "$Q" commit -qm "feat: introduce nested module"
 git -C "$Q" tag v1.0.0
@@ -445,10 +446,14 @@ publish_main "$Q"
 compute "$Q" dev yamlenv
 assert_eq "$OUT_DEV" "yamlenv/v1.1.0-dev.1" "Q1: lane dev version carries the lane prefix"
 assert_eq "$OUT_LATEST" "yamlenv/v1.0.0" "Q2: lane latest is the lane's own stable tag"
-compute "$Q" stable "" '["yamlenv"]'
+# A docker root builds from its whole tree, so only the go-lanes input keeps
+# the lane's commits out of it; a go root's zip leaves out any nested module.
+REPO_TYPE=docker compute "$Q" stable "" '["yamlenv"]'
 assert_eq "$OUT_LEVEL" "none" "Q3: with yamlenv a lane, the lane feat is no root change"
+REPO_TYPE=docker compute "$Q" stable
+assert_eq "$OUT_LEVEL" "minor" "Q4: without the lane the same feat is a docker root minor (the go-lanes input is load-bearing)"
 compute "$Q" stable
-assert_eq "$OUT_LEVEL" "minor" "Q4: without the lane the same feat is a root minor (the go-lanes input is load-bearing)"
+assert_eq "$OUT_LEVEL" "none" "Q4: on a go root a nested module that is no lane is still left out"
 
 # ── State R: an rc tag at HEAD is outside both channels' tag universes ───────
 # A glob-shaped tag filter (v[0-9]*.[0-9]*.[0-9]*) admits v1.3.0-rc.1; it then
@@ -664,6 +669,8 @@ assert_eq "$(pending_of "$X8" "$X8R")" "v1.3.0" "S8c: the pending helper agrees 
 # ── State S9: each lane computes from its own H ─────────────────────────────
 L9=$(mkfixture tb-lanes)
 fc "$L9" src/main.go "feat: initial"
+mkdir -p "$L9/yamlenv"
+echo 'module example.com/l9/yamlenv' >"$L9/yamlenv/go.mod"
 fc "$L9" yamlenv/y.go "feat: introduce nested module"
 git -C "$L9" tag v1.0.0
 git -C "$L9" tag yamlenv/v1.0.0
@@ -921,7 +928,7 @@ mkdir -p "$WORK/nm-stub"
 printf '#!/usr/bin/env bash\n[[ "$*" != ls-tree\\ -r* ]] || exit 92\nexec %q "$@"\n' "$(command -v git)" >"$WORK/nm-stub/git"
 chmod 755 "$WORK/nm-stub/git"
 refused "S17f: a tree go-modules.sh cannot read fails the lane's numbering" \
-  "cannot list the nested modules over" "$NM" PATH="$WORK/nm-stub:$PATH" CHANNEL=stable LANE=chartdata bash "$ACTION"
+  "cannot tell which commits of" "$NM" PATH="$WORK/nm-stub:$PATH" CHANNEL=stable LANE=chartdata bash "$ACTION"
 
 # A commit that carves a nested module out of the lane changes the lane's
 # module zip, so it is the lane's; the module stays out of later ranges.
@@ -945,7 +952,37 @@ git -C "$CO" tag chartdata/v2.0.0
 fc "$CO" chartdata/internal/gen/gen.go "feat(chartdata)!: regenerate"
 publish_main "$CO"
 compute "$CO" dev chartdata
-assert_eq "$OUT_LEVEL" "none" "S17i: once carved out at both ends, the nested module's commit sets no level"
+assert_eq "$OUT_LEVEL" "none" "S17i: once carved out, the nested module's commit sets no level"
+
+# Ownership is read per commit: a dev range from a stable tag older than the
+# carve-out holds the carve-out, the lane's, and a later breaking commit
+# confined to the new module, which is not.
+PC=$(mkfixture carve-then-nested)
+mkdir -p "$PC/chartdata/internal/gen"
+printf 'module example.com/pc\n\ngo 1.26\n' >"$PC/go.mod"
+printf 'module example.com/pc/chartdata\n\ngo 1.26\n' >"$PC/chartdata/go.mod"
+printf 'package gen\n' >"$PC/chartdata/internal/gen/gen.go"
+git -C "$PC" add -A
+fc "$PC" chartdata/c.go "feat(chartdata): initial"
+git -C "$PC" tag v1.0.0
+git -C "$PC" tag chartdata/v1.0.0
+printf 'module example.com/pc/chartdata/internal/gen\n\ngo 1.26\n' >"$PC/chartdata/internal/gen/go.mod"
+git -C "$PC" add -A
+git -C "$PC" commit -qm "fix(chartdata): move gen into its own module"
+fc "$PC" chartdata/internal/gen/gen.go "feat(chartdata)!: regenerate the generator"
+publish_main "$PC"
+compute "$PC" dev chartdata
+assert_eq "$OUT_LEVEL" "patch" "S17j: the carve-out's fix sets the lane's level, the later nested-only breaking commit none"
+assert_eq "$OUT_BASE" "chartdata/v1.1.0" "S17k: so the lane's dev base is the next minor, not a major"
+compute "$PC" stable chartdata
+assert_eq "$OUT_BASE" "chartdata/v1.0.1" "S17l: and its stable version the next patch"
+git -C "$PC" rm -q chartdata/internal/gen/go.mod
+git -C "$PC" commit -qm "fix(chartdata): fold gen back into the lane"
+git -C "$PC" tag chartdata/v1.0.1 HEAD~2
+fc "$PC" chartdata/internal/gen/gen.go "feat(chartdata): gen grows"
+publish_main "$PC"
+compute "$PC" stable chartdata
+assert_eq "$OUT_LEVEL" "minor" "S17m: past a fold-back, a commit under the folded dir counts for the lane"
 
 # ── S18: the root leaves out every nested module it does not ship ──────────
 NR=$(mkfixture nested-root)
@@ -961,5 +998,28 @@ compute "$NR" stable
 assert_eq "$OUT_LEVEL" "none" "S18a: a go root's version leaves out a nested module its module zip does not hold"
 REPO_TYPE=docker compute "$NR" stable
 assert_eq "$OUT_LEVEL" "major" "S18b: a docker root builds its image from the tree, so the same commit is its major"
+
+# A go root's zip holds a lane's files until the lane has its go.mod, so the
+# commit carving a lane out of it is the root's too.
+LC=$(mkfixture lane-carve-out)
+mkdir -p "$LC/pkg/split"
+printf 'module example.com/lc\n\ngo 1.26\n' >"$LC/go.mod"
+printf 'package split\n' >"$LC/pkg/split/s.go"
+git -C "$LC" add -A
+fc "$LC" main.go "feat: initial"
+git -C "$LC" tag v1.0.0
+printf 'module example.com/lc/pkg/split\n\ngo 1.26\n' >"$LC/pkg/split/go.mod"
+git -C "$LC" add -A
+git -C "$LC" commit -qm "feat!: move pkg/split into its own module"
+publish_main "$LC"
+compute "$LC" stable "" '["pkg/split"]'
+assert_eq "$OUT_LEVEL" "major" "S18c: carving a lane out of a go root is the root's major"
+REPO_TYPE=docker compute "$LC" stable "" '["pkg/split"]'
+assert_eq "$OUT_LEVEL" "none" "S18d: a docker root never counted the lane's files"
+git -C "$LC" tag v2.0.0
+fc "$LC" pkg/split/s.go "feat(split)!: a lane-only break"
+publish_main "$LC"
+compute "$LC" stable "" '["pkg/split"]'
+assert_eq "$OUT_LEVEL" "none" "S18e: a later lane-only commit sets no root level"
 
 echo "PASS: git-cliff $VERSION semantics match the release-gate contract"

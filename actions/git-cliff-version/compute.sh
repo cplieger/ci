@@ -46,7 +46,7 @@ if [ -n "$LANE" ]; then
   esc=$(printf '%s' "$LANE" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
   PATTERN="^${esc}/v[0-9]+\\.[0-9]+\\.[0-9]+\$"
   PREFIX="${LANE}/"
-  ARGS=(--tag-pattern "$PATTERN" --include-path "${LANE}/**")
+  ARGS=(--tag-pattern "$PATTERN")
   # The synced config's initial_tag is root-shaped and would fail the pattern.
   # git-cliff reads it only while the lane has no stable tag, so a committed
   # <lane>/.first-version, read at the revision numbered, seeds the lane's
@@ -83,7 +83,7 @@ fi
 git fetch --tags --quiet origin 2>/dev/null || true
 
 err="$(mktemp)"
-trap 'rm -f "$err" "$err.embeds"' EXIT
+trap 'rm -f "$err" "$err.embeds" "$err.owned" "$err.skips"' EXIT
 
 nearest_tag() { # <regex> -> the tag matching it on the commit nearest HEAD, or nothing; fails when git cannot list the tags or walk HEAD
   local -A tag_at=()
@@ -191,25 +191,6 @@ is_ancestor() { # <a> <b> -> 0 when a is an ancestor of b, 1 when not; exits whe
   fi
   return "$rc"
 }
-# A commit counts for the lane only through the paths the lane ships: never
-# under a lane or a nested module it leaves out over the range (go-modules.sh
-# boundaries owns which those are).
-scope_of() { # <from> <to> -> sets SCOPE to ARGS plus an --exclude-path per such dir
-  local lanes out d
-  lanes="$GO_LANES_JSON"
-  [ -z "$LANE" ] || lanes="$(jq -cn --arg l "$LANE" '[$l]')"
-  if ! out="$(GO_LANES_JSON="$lanes" REPO_TYPE="$REPO_TYPE" \
-    bash "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-modules.sh" boundaries "$2" "$1")"; then
-    echo "::error::cannot list the nested modules over ${1:+${1}..}${2}"
-    exit 1
-  fi
-  SCOPE=("${ARGS[@]}")
-  while IFS= read -r d; do
-    [ -n "$d" ] || continue
-    [ -z "$LANE" ] || [[ $d == "${LANE}/"* ]] || continue
-    SCOPE+=(--exclude-path "${d}/**")
-  done <<<"$out"
-}
 # git-cliff supplies the change level only, read as its proposal against its
 # own base under the repo's [bump] rules (a 0.x breaking change is a minor on
 # cliff-alpha). An empty <from> means no stable tag, so git-cliff reads <to>'s
@@ -236,26 +217,31 @@ cliff_level() { # <from> <to> -> sets LEVEL and CLIFF_VERSION (its proposal)
       exit 1
     fi
   fi
-  # A commit the path filter drops that changes a file a non-test //go:embed
-  # names ships, so its type counts (go-embeds.py; render-notes.sh lists it).
-  local -a with=() scope=(--config "${GIT_CLIFF_CONFIG:-cliff.toml}")
-  local msg i
-  scope_of "$1" "$to"
-  for ((i = 0; i < ${#SCOPE[@]}; i++)); do
-    case "${SCOPE[$i]}" in
-      --include-path) scope+=(--include "${SCOPE[$((i + 1))]}") ;;
-      --exclude-path) scope+=(--exclude "${SCOPE[$((i + 1))]}") ;;
-    esac
-  done
-  python3 "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-embeds.py" --with-commits "${range[0]}" "${scope[@]}" \
-    >"$err.embeds" || {
+  # git-cliff counts only the commits go-modules.sh commits gives this module,
+  # and one changing only an embedded doc of it ships (go-embeds.py).
+  local -a with=() skip=()
+  local msg sha unit=. lanes="$GO_LANES_JSON"
+  if [ -n "$LANE" ]; then
+    unit="$LANE"
+    lanes="$(jq -cn --arg l "$LANE" '[$l]')"
+  fi
+  if ! GO_LANES_JSON="$lanes" REPO_TYPE="$REPO_TYPE" bash "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-modules.sh" \
+    commits "$1" "$to" "$unit" >"$err.owned"; then
+    echo "::error::cannot tell which commits of ${range[*]} belong to ${LANE:-the root}"
+    exit 1
+  fi
+  python3 "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-embeds.py" --with-commits "${range[0]}" \
+    --owned "$err.owned" --skips "$err.skips" --config "${GIT_CLIFF_CONFIG:-cliff.toml}" >"$err.embeds" || {
     echo "::error::cannot read the //go:embed directives over ${range[*]}"
     exit 1
   }
   while IFS= read -r -d '' msg; do
     with+=(--with-commit "$msg")
   done <"$err.embeds"
-  if ! ctx="$("$CLIFF_BIN" --bump --context "${SCOPE[@]}" "${with[@]}" "${range[@]}" 2>"$err")"; then
+  while IFS= read -r sha; do
+    skip+=(--skip-commit "$sha")
+  done <"$err.skips"
+  if ! ctx="$("$CLIFF_BIN" --bump --context "${ARGS[@]}" "${skip[@]}" "${with[@]}" "${range[@]}" 2>"$err")"; then
     echo "::error::git-cliff --bump --context failed over ${range[*]}:"
     sed 's/^/  /' "$err" >&2 || true
     exit 1

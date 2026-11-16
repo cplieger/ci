@@ -140,3 +140,8 @@ FROM scratch
 @@ commit B_sys_docker parent B_sys
 @@ file Dockerfile
 FROM scratch
+@@ commit B_vendor parent B
+@@ file vendor/example.com/dep/go.mod
+module example.com/dep
+@@ file vendor/example.com/dep/dep.go
+package dep

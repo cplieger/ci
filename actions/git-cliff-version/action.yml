@@ -14,9 +14,10 @@ inputs:
     default: stable
   go-lanes:
     description: >-
-      JSON array of the nested Go module lane dirs. The root version leaves
-      out their commits and those of every nested module the root does not
-      ship. Ignored when `lane` is set.
+      JSON array of the nested Go module lane dirs. The root version counts
+      only the commits that change a file the root ships, never one confined
+      to a lane or to a nested module the root does not ship. Ignored when
+      `lane` is set.
     required: false
     default: "[]"
   repo-type:
@@ -28,8 +29,8 @@ inputs:
   lane:
     description: >-
       A nested Go module directory. Computes that lane's `<dir>/vX.Y.Z`
-      version from the commits under it, less those of the nested modules
-      inside it, instead of the root version.
+      version from the commits that change a file it ships, instead of the
+      root version.
     required: false
     default: ""
   pending-version:

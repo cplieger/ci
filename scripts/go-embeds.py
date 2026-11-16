@@ -3,12 +3,13 @@
 release excludes call them docs (grelot's `grelot help` is an embedded .md).
 
 `go-embeds.py <commit> < paths` prints the paths a directive at <commit> names
-(path-significance.sh). `go-embeds.py --with-commits <range> [--include G]
-[--exclude G] [--config cliff.toml] [--positions FILE]` prints, NUL-separated
-and oldest first, the message of each commit git-cliff's path filter drops
-though it changes an embedded file (compute.sh and render-notes.sh); FILE gets
-each commit's index in the range, by sha and by printed message. Exits 2 when
-git cannot read the tree.
+(path-significance.sh). `go-embeds.py --with-commits <range> --owned FILE
+--skips FILE [--config cliff.toml] [--positions FILE]` scopes git-cliff to one
+module (compute.sh and render-notes.sh): --skips gets each commit of the range
+that changes no file the module owns (--owned: go-modules.sh commits) but docs,
+and stdout, NUL-separated and oldest first, the message of each such commit
+that changes an embedded doc of it; --positions gets each commit's index in the
+range, by sha and by printed message. Exits 2 when git cannot read the tree.
 """
 
 from __future__ import annotations
@@ -265,49 +266,58 @@ def with_commits(args: list[str]) -> int:
     newline, which would lose a BREAKING CHANGE footer. Such a commit has an
     empty id in git-cliff's context, so --positions also keys each one by its
     message, for render-notes.sh to sort the release in the range's order."""
-    # Scope globs (--include, --exclude) say which lane a file belongs to; the
-    # config's exclude_paths say which files are docs. git-cliff drops a commit
-    # unless a changed file is in scope and not a doc; this keeps a dropped
-    # one when a file in scope is a doc a directive embeds.
-    rng, includes, scope_out, docs, positions = args[0], [], [], [], None
+    # The config's include_paths and exclude_paths still filter what git-cliff
+    # keeps, so a commit counts when a file the module owns passes them; one
+    # whose owned files in scope are all docs counts only through an embed.
+    rng, includes, docs = args[0], [], []
+    owned_file = skips_file = positions = None
     rest = iter(args[1:])
     for flag in rest:
         value = next(rest, None)
-        if flag not in ('--include', '--exclude', '--config', '--positions') or value is None:
+        if flag not in ('--owned', '--skips', '--config', '--positions') or value is None:
             sys.stderr.write(f'go-embeds: unexpected argument {flag!r}\n')
             return 2
-        if flag == '--positions':
+        if flag == '--owned':
+            owned_file = value
+        elif flag == '--skips':
+            skips_file = value
+        elif flag == '--positions':
             positions = value
-        elif flag == '--config':
-            if os.path.exists(value):
-                with open(value, 'rb') as f:
-                    cfg = tomllib.load(f).get('git', {})
-                docs += [glob_re(g) for g in cfg.get('exclude_paths', [])]
-                includes += [glob_re(g) for g in cfg.get('include_paths', [])]
-        elif flag == '--include':
-            includes.append(glob_re(value))
-        else:
-            scope_out.append(glob_re(value))
+        elif os.path.exists(value):
+            with open(value, 'rb') as f:
+                cfg = tomllib.load(f).get('git', {})
+            docs += [glob_re(g) for g in cfg.get('exclude_paths', [])]
+            includes += [glob_re(g) for g in cfg.get('include_paths', [])]
+    if owned_file is None or skips_file is None:
+        sys.stderr.write('go-embeds: --with-commits needs --owned and --skips\n')
+        return 2
+    owned: dict[str, list[str]] = {}
+    with open(owned_file) as f:
+        for line in f:
+            sha, _, path = line.rstrip('\n').partition('\t')
+            if path:
+                owned.setdefault(sha, []).append(path)
     end = rng.split('..')[-1]
     at: dict[str, dict[str, int]] = {'commits': {}, 'messages': {}}
-    for i, sha in enumerate(git('rev-list', '--reverse', '--no-merges', rng).split()):
-        at['commits'][sha] = i
-        files = git('diff-tree', '--root', '--no-commit-id', '--name-only', '-r', '-z', sha).split(
-            '\0'
-        )
-        scoped = [
-            f
-            for f in files
-            if f
-            and (not includes or any(r.match(f) for r in includes))
-            and not any(r.match(f) for r in scope_out)
-        ]
-        if not scoped or any(not any(r.match(f) for r in docs) for f in scoped):
+
+    def scoped(sha: str) -> list[str]:
+        return [f for f in owned.get(sha, ()) if not includes or any(r.match(f) for r in includes)]
+
+    order = git('rev-list', '--reverse', '--no-merges', rng).split()
+    skips = []
+    for sha in git('rev-list', '--reverse', rng).split():
+        if any(not any(r.match(f) for r in docs) for f in scoped(sha)):
             continue
-        if embedded_at(end, scoped):
+        skips.append(sha)
+    skipped = set(skips)
+    for i, sha in enumerate(order):
+        at['commits'][sha] = i
+        if sha in skipped and scoped(sha) and embedded_at(end, scoped(sha)):
             message = git('log', '-1', '--format=%B', sha).strip()
             at['messages'].setdefault(message, i)
             sys.stdout.write(message + '\0')
+    with open(skips_file, 'w') as f:
+        f.writelines(f'{sha}\n' for sha in skips)
     if positions:
         with open(positions, 'w') as f:
             json.dump(at, f)

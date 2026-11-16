@@ -116,26 +116,16 @@ if [ "$SITE" = lane ]; then
   ESC=$(printf '%s' "$LANE" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
   PATTERN="^${ESC}/v[0-9]+\\.[0-9]+\\.[0-9]+\$"
   PREFIX="${LANE}/"
-  SCOPE_ARGS=(--include-path "${LANE}/**")
 else
   PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+$'
   PREFIX=""
-  SCOPE_ARGS=()
 fi
 
-# The dirs whose commits are not the lane's over <prev>..<commit>: every
-# boundary go-modules.sh lists for the root, those inside it for a lane.
-foreign_modules() { # <commit> <prev> -> one dir per line
-  local all d
+owned_commits() { # <range start> <commit> -> go-modules.sh commits of this lane, or the root's
   if [ "$SITE" = lane ]; then
-    all=$(GO_LANES_JSON="$(jq -cn --arg l "$LANE" '[$l]')" REPO_TYPE="" bash "$(dirname "$0")/go-modules.sh" boundaries "$1" "$2") \
-      || die "cannot list the nested modules of ${LANE} over ${2:+$2..}$1"
-    while IFS= read -r d; do
-      [[ $d != "${LANE}/"* ]] || printf '%s\n' "$d"
-    done <<<"$all"
+    GO_LANES_JSON="$(jq -cn --arg l "$LANE" '[$l]')" bash "$(dirname "$0")/go-modules.sh" commits "$1" "$2" "$LANE"
   else
-    GO_LANES_JSON="$GO_LANES_JSON" REPO_TYPE="$SITE" bash "$(dirname "$0")/go-modules.sh" boundaries "$1" "$2" \
-      || die "cannot list the nested modules over ${2:+$2..}$1"
+    GO_LANES_JSON="$GO_LANES_JSON" REPO_TYPE="$SITE" bash "$(dirname "$0")/go-modules.sh" commits "$1" "$2" .
   fi
 }
 
@@ -166,35 +156,30 @@ render() {
   fi
   local commit prev range changes deps="" sbom="" parts=()
   commit=$(git rev-parse --verify "${COMMIT}^{commit}") || die "--release-commit ${COMMIT} is not a commit"
-  local foreign d
   prev=$(previous_stable_tag)
-  foreign=$(foreign_modules "$commit" "$prev") || exit 2
-  while IFS= read -r d; do
-    [ -z "$d" ] || SCOPE_ARGS+=(--exclude-path "$d/**")
-  done <<<"$foreign"
   range=$commit
   [ -z "$prev" ] || range="${prev}..${commit}"
-  # A commit the path filter drops that changes a file a non-test //go:embed
-  # names ships, so its line belongs here (go-embeds.py; compute.sh counts it).
-  local -a with=() scope=(--config "${CONFIG:-${GIT_CLIFF_CONFIG:-cliff.toml}}")
-  local msg i embeds order
-  for ((i = 0; i < ${#SCOPE_ARGS[@]}; i += 2)); do
-    case "${SCOPE_ARGS[$i]}" in
-      --include-path) scope+=(--include "${SCOPE_ARGS[$((i + 1))]}") ;;
-      --exclude-path) scope+=(--exclude "${SCOPE_ARGS[$((i + 1))]}") ;;
-    esac
-  done
+  # go-modules.sh commits and go-embeds.py decide which commits git-cliff lists.
+  local -a with=() skip=()
+  local msg sha embeds order owned skips
   embeds=$(mktemp)
   order=$(mktemp)
+  owned=$(mktemp)
+  skips=$(mktemp)
   # shellcheck disable=SC2064 # the paths are fixed now
-  trap "rm -f '$embeds' '$order'" EXIT
-  python3 "$(dirname "$0")/go-embeds.py" --with-commits "$range" "${scope[@]}" --positions "$order" >"$embeds" \
+  trap "rm -f '$embeds' '$order' '$owned' '$skips'" EXIT
+  owned_commits "$prev" "$commit" >"$owned" || die "cannot tell which commits of ${range} belong to ${LANE:-the root}"
+  python3 "$(dirname "$0")/go-embeds.py" --with-commits "$range" --owned "$owned" --skips "$skips" \
+    --config "${CONFIG:-${GIT_CLIFF_CONFIG:-cliff.toml}}" --positions "$order" >"$embeds" \
     || die "cannot read the //go:embed directives over ${range}"
   while IFS= read -r -d '' msg; do
     with+=(--with-commit "$msg")
   done <"$embeds"
+  while IFS= read -r sha; do
+    skip+=(--skip-commit "$sha")
+  done <"$skips"
   if [ "${#with[@]}" -eq 0 ]; then
-    changes=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" --strip header "$range")
+    changes=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${skip[@]}" "${CLIFF_ARGS[@]}" --strip header "$range")
   else
     # git-cliff 2.14.2 adds --with-commit commits to its last release, an empty
     # one after the tagged release, which renders as a second block; so the
@@ -202,7 +187,7 @@ render() {
     # range's order (a --with-commit commit has an empty id, so it is found by
     # its message), and rendered once.
     local ctx
-    ctx=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" "${with[@]}" --context "$range")
+    ctx=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${skip[@]}" "${CLIFF_ARGS[@]}" "${with[@]}" --context "$range")
     changes=$(jq --slurpfile at "$order" '
       (map(select(.version != null)) + map(select(.version == null))) as $r
       | [$r[0] + {commits: ($r | map(.commits) | add

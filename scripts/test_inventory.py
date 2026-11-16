@@ -559,15 +559,8 @@ class Surfaces(unittest.TestCase):
                 self.assertEqual(inventory.surface_kind(path), want)
 
     def test_lanes_follow_the_release_discovery_rules(self):
-        paths = [
-            'go.mod',
-            'a/go.mod',
-            'a/b/go.mod',
-            'internal/x/go.mod',
-            'node_modules/m/go.mod',
-            'bad dir/go.mod',
-        ]
-        self.assertEqual(inventory.discover_lanes(paths), ['a/b', 'a'])
+        modules = ['a', 'a/b', 'internal/x', 'x/internal', 'bad dir']
+        self.assertEqual(inventory.discover_lanes(modules), ['a/b', 'a'])
 
     def test_a_path_belongs_to_its_nearest_boundary(self):
         lanes, found = ['a'], {'a', 'a/gen', 'b/gen'}
@@ -1636,6 +1629,10 @@ class NestedModule(FixtureCase):
         lanes = {(r.file, r.lane) for r in self.fx.records('B')}
         # A go root's module zip leaves internal/sub out, so no artifact ships its go.mod.
         self.assertEqual(lanes, {('go.mod', '.'), ('tools/go.mod', 'tools')})
+
+    def test_repo_lanes_read_go_modules_list(self):
+        # internal/sub is no lane, web holds no .go file and vendor's go.mod is pruned.
+        self.assertEqual(self.fx.repo.lanes(self.fx.sha['B_vendor']), ['tools'])
 
     def test_lane_filter(self):
         self.assertEqual(
