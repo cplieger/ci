@@ -122,10 +122,9 @@ owners_in() { # <state> <path>: OWN gets the units owning <path> in that state's
 
 # walk: each non-merge commit of <from>..<to> and each path it changes; a path
 # counts for its owner in each tree holding it, and a go.mod added or removed
-# over other files for its dir's owner in the tree without it.
-#   commits <from> <to> <unit>: "<sha>\t<path>" per path <unit> owns so, over
-#   <to>'s whole history for an empty <from> or a non-commit one (release-state.sh
-#   half_changed passes the empty tree for a first build).
+# for its dir's owners that ship a file under it in the tree without it.
+#   commits <from> <to> <unit>: "<sha>\t<path>" per path <unit> owns so; an empty
+#   or non-commit <from> (half_changed's empty tree) walks all of <to>.
 #   paths <from> <to> <unit>...: "<unit>\t<path>" per such path on stdin; one no
 #   commit changes counts at <from>'s tree and <to>'s; an empty <from> walks
 #   nothing and judges every path at <to>'s tree.
@@ -148,28 +147,59 @@ state_of() { # <rev>: K names <rev>'s state, loaded once
   K=${STATE[$1]}
 }
 emit() { # <state> <sha> <path>: prints the asked units owning <path> in that state
-  local u key
   owners_in "$1" "$3"
-  for u in "${OWN[@]}"; do
+  emit_units "$2" "$3" "${OWN[@]}"
+}
+emit_units() { # <sha> <path> <unit>...: prints the asked units among them for <path>
+  local sha=$1 f=$2 u key
+  shift 2
+  for u in "$@"; do
     [ -n "${ASKED[$u]:-}" ] || continue
-    key="$u|$3"
-    [ "$cmd" = paths ] || key="$2|$3"
+    key="$u|$f"
+    [ "$cmd" = paths ] || key="$sha|$f"
     [ -z "${SEEN[$key]:-}" ] || continue
     SEEN["$key"]=1
     if [ "$cmd" = commits ]; then
-      printf '%s\t%s\n' "$2" "$3"
+      printf '%s\t%s\n' "$sha" "$f"
     else
-      printf '%s\t%s\n' "$u" "$3"
+      printf '%s\t%s\n' "$u" "$f"
     fi
   done
 }
-holds_under() { # <rev> <dir>: status 0 when <rev>'s tree holds a file under <dir>
-  local out
-  out=$(git -c core.quotePath=false ls-tree --name-only "$1" -- "$2/") || die "cannot list ${2}/ at $1"
-  [ -n "$out" ]
+ships() { # <unit> <path>: status 0 when <unit>'s artifact holds <path>
+  local rel=$2
+  if [ "$1" = . ]; then
+    $ZIP_ROOT || return 0
+  else
+    rel=${2#"$1"/}
+  fi
+  # A module zip leaves out a package below a vendor dir; golang.org/x/mod/zip
+  # isVendoredPackage, which differs by go version on vendor/modules.txt and
+  # <dir>/vendor/<file> (golang.org/issue/37397), so those two count.
+  case $rel in
+    vendor/*/* | */vendor/*/*) return 1 ;;
+  esac
+}
+CARVED=()
+carved() { # <state> <rev> <dir>: CARVED gets the owners of <dir>/go.mod in that state shipping a file under <dir> at <rev>
+  local files f u
+  local -A held=()
+  files=$(git -c core.quotePath=false ls-tree -r --name-only "$2" -- "$3/") || die "cannot list ${3}/ at $2"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    owners_in "$1" "$f"
+    for u in "${OWN[@]}"; do
+      ! ships "$u" "$f" || held["$u"]=1
+    done
+  done <<<"$files"
+  owners_in "$1" "$3/go.mod"
+  CARVED=()
+  for u in "${OWN[@]}"; do
+    [ -z "${held[$u]:-}" ] || CARVED+=("$u")
+  done
 }
 commit_done() { # SHA PARENT CHANGES: emits one commit's paths
-  local pk=- ck st f other
+  local pk=- ck st f
   [ -n "$SHA" ] || return 0
   if [ -n "$PARENT" ]; then
     state_of "$PARENT"
@@ -191,12 +221,9 @@ commit_done() { # SHA PARENT CHANGES: emits one commit's paths
     fi
     [ "$st" = A ] || emit "$pk" "$SHA" "$f"
     [ "$st" = D ] || emit "$ck" "$SHA" "$f"
-    if [[ $f == */go.mod && ($st == A || $st == D) ]]; then
-      other=$PARENT
-      [ "$st" = A ] || other=$SHA
-      if [ -n "$other" ] && holds_under "$other" "${f%/go.mod}"; then
-        if [ "$st" = A ]; then emit "$pk" "$SHA" "$f"; else emit "$ck" "$SHA" "$f"; fi
-      fi
+    if [[ -n $PARENT && $f == */go.mod && ($st == A || $st == D) ]]; then
+      if [ "$st" = A ]; then carved "$pk" "$PARENT" "${f%/go.mod}"; else carved "$ck" "$SHA" "${f%/go.mod}"; fi
+      emit_units "$SHA" "$f" "${CARVED[@]}"
     fi
   done <<<"$CHANGES"
 }

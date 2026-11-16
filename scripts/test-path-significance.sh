@@ -789,6 +789,57 @@ git rm -q -r chartdata/internal/wire
 K7=$(commit "chore(chartdata): drop the module")
 chk "S55 nor does removing it whole" "$(paths "$K6" "$K7")" 'false|[]|[]|[]'
 
+# A go.mod added or removed over files its container's zip leaves out, those
+# inside a deeper module or a vendored package, moves nothing to or from it.
+newrepo carve-out-of-nothing
+put go.mod 'module example.com/go'
+put main.go 'package main'
+put internal/deep/sub/go.mod 'module example.com/go/internal/deep/sub'
+put internal/deep/sub/s.go 'package sub'
+put third_party/vendor/example.com/x/x.go 'package x'
+put chartdata/go.mod 'module example.com/go/chartdata'
+put chartdata/c.go 'package chartdata'
+put chartdata/internal/deep/sub/go.mod 'module example.com/go/chartdata/internal/deep/sub'
+put chartdata/internal/deep/sub/s.go 'package sub'
+put chartdata/gen/vendor/example.com/x/x.go 'package x'
+V0=$(commit "feat: initial")
+git tag v1.0.0 "$V0"
+put internal/go.mod 'module example.com/go/internal'
+V1=$(commit "chore: a module over a nested one")
+chk "S59 a go.mod over a dir holding only a deeper module releases nothing" "$(paths "$V0" "$V1")" 'false|[]|[]|[]'
+chk "S59 as the release step reads it" "$(release S59 dev "$V0" "$V0" "$V1")" 'false|[]|[]'
+git rm -q internal/go.mod
+V2=$(commit "chore: drop it")
+chk "S59 nor does removing it" "$(paths "$V1" "$V2")" 'false|[]|[]|[]'
+put chartdata/internal/go.mod 'module example.com/go/chartdata/internal'
+V3=$(commit "chore(chartdata): a module over a nested one")
+chk "S59 nor in a lane" "$(paths "$V2" "$V3")" 'false|[]|[]|[]'
+put third_party/go.mod 'module example.com/go/third_party'
+V4=$(commit "chore: a module over vendored packages")
+chk "S59 a go.mod over a dir holding only vendored packages releases nothing" "$(paths "$V3" "$V4")" 'false|[]|[]|[]'
+put chartdata/gen/go.mod 'module example.com/go/chartdata/gen'
+V5=$(commit "chore(chartdata): a module over vendored packages")
+chk "S59 nor over vendored packages in a lane" "$(paths "$V4" "$V5")" 'false|[]|[]|[]'
+chk "S59 nor does the range as the release step reads it" "$(release S59r dev "$V0" "$V0" "$V5")" 'false|[]|[]'
+put internal/keep.go 'package internal'
+V6=$(commit "feat: a root package beside the nested module")
+put internal/go.mod 'module example.com/go/internal'
+V7=$(commit "feat!: move it into its own module")
+chk "S59 one file of the container's beside them makes it a carve-out" "$(paths "$V6" "$V7")" \
+  'true|[]|[]|["internal/go.mod"]'
+put third_party/vendor/modules.txt '# example.com/x v1.0.0'
+V8=$(commit "chore: a vendor manifest")
+git rm -q third_party/go.mod
+V9=$(commit "feat: fold third_party back into the root")
+chk "S59 as does a file a vendor dir holds directly, which some go versions zip" "$(paths "$V8" "$V9")" \
+  'true|[]|[]|["third_party/go.mod"]'
+put chartdata/internal/k.go 'package internal'
+V10=$(commit "feat(chartdata): a package in the nested module")
+git rm -q chartdata/internal/go.mod
+V11=$(commit "feat(chartdata): fold it back into the lane")
+chk "S59 and a lane gaining a file it ships releases the lane" "$(paths "$V10" "$V11")" \
+  'false|[]|["chartdata"]|["chartdata/internal/go.mod"]'
+
 # Ownership is read per commit, never at the range's ends: a range from a
 # stable tag older than a carve-out holds both the carve-out, which is the
 # lane's, and later commits confined to the new module, which are not.
