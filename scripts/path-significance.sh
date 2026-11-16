@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
-# Shipped paths of a range per lane, for release.yaml detect and promotion.
-# MODE=release (default): env BEFORE HEAD ANCHOR_SHA CHANNEL REPO_TYPE
-#   SUBPACKAGES_JSON GO_LANES_JSON; writes root_changed, subpackages_to_publish,
-#   go_modules_to_release and exclude_re to $GITHUB_OUTPUT, and a summary.
-# MODE=paths: env FROM TO REPO_TYPE SUBPACKAGES_JSON GO_LANES_JSON; the same
-#   keys plus `significant` (JSON array) and `rebuild_request` (the newest
-#   rebuild request in FROM..TO whatever REPO_TYPE is, empty for none) on
-#   stdout. REQUEST_CHANNEL=stable counts only TO's first-parent commits as
-#   rebuild requests, since a promotion's second parent brings dev's; unset or
-#   dev counts every non-merge commit. Tree diff FROM..TO only: the
-#   empty-commit rule sets no root_changed, no lane tags. Exits 2 when the
-#   diff or a commit read fails, or on another REQUEST_CHANNEL.
-# Either mode exits 2 on malformed directory JSON.
+# Shipped paths of a range per lane, for release.yaml detect and promotion. Env
+#   REPO_TYPE SUBPACKAGES_JSON GO_LANES_JSON, then per mode. MODE=release (default),
+#   env BEFORE HEAD ANCHOR_SHA CHANNEL: root_changed, subpackages_to_publish,
+#   go_modules_to_release, exclude_re to $GITHUB_OUTPUT, plus a summary. MODE=paths,
+#   env FROM TO: those keys, `significant` (JSON) and `rebuild_request` (FROM..TO's newest,
+#   any REPO_TYPE, or empty) on stdout, from the tree diff alone (no empty-commit rule, no
+#   lane tags); REQUEST_CHANNEL=stable counts only TO's first-parent requests (a promotion's
+#   second parent brings dev's), unset or dev every non-merge one. Exits 2 on bad input or git.
 set -euo pipefail
 
 MODE="${MODE:-release}"
@@ -52,7 +47,7 @@ if [ "$MODE" = paths ]; then
     "" | dev | stable) ;;
     *) die "REQUEST_CHANNEL must be dev or stable, got '${REQUEST_CHANNEL}'" ;;
   esac
-  if ! CHANGED=$(git diff --no-renames --name-only "$FROM..$TO"); then
+  if ! CHANGED=$(git -c core.quotePath=false diff --no-renames --name-only "$FROM..$TO"); then
     echo "::error::path-significance: cannot diff ${FROM}..${TO}" >&2
     exit 2
   fi
@@ -62,21 +57,21 @@ if [ "$MODE" = paths ]; then
   ANCHOR_SHA=""
 elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
   note "No before SHA — treating all tracked files as changed"
-  CHANGED=$(git ls-files)
+  CHANGED=$(git -c core.quotePath=false ls-files)
 elif [ -n "$ANCHOR_SHA" ]; then
-  if CHANGED=$(git diff --no-renames --name-only "$ANCHOR_SHA..$HEAD" 2>/dev/null); then
+  if CHANGED=$(git -c core.quotePath=false diff --no-renames --name-only "$ANCHOR_SHA..$HEAD" 2>/dev/null); then
     RANGE_START="$ANCHOR_SHA"
     BEFORE="$ANCHOR_SHA"
     note "deriving changed paths from ${ANCHOR_SHA}..HEAD (newest tag on this channel)"
   else
     note "git diff from the anchor failed — treating all tracked files as changed"
-    CHANGED=$(git ls-files)
+    CHANGED=$(git -c core.quotePath=false ls-files)
   fi
-elif CHANGED=$(git diff --no-renames --name-only "$BEFORE..$HEAD" 2>/dev/null); then
+elif CHANGED=$(git -c core.quotePath=false diff --no-renames --name-only "$BEFORE..$HEAD" 2>/dev/null); then
   RANGE_START="$BEFORE"
 else
   note "git diff failed (force push or unreachable history) — treating all tracked files as changed"
-  CHANGED=$(git ls-files)
+  CHANGED=$(git -c core.quotePath=false ls-files)
 fi
 
 # Paths that never ship in an artifact (extended regex), unless a non-test
@@ -206,10 +201,51 @@ shipped() {
   printf '%s\n%s\n' "$kept" "$embedded" | LC_ALL=C sort -u | sed '/^$/d'
 }
 
+# A path ships with the units owning it over the range (go-modules.sh paths):
+# '.' for the root, else a lane.
+declare -A UNITS=()
+attribute() { # <from> <paths> <unit>...: UNITS[<path>] gets " <unit> " per unit owning it over <from>..HEAD
+  local from=$1 paths=$2 out u f
+  shift 2
+  UNITS=()
+  [ -n "$paths" ] || return 0
+  out=$(bash "$TOOLS_DIR/go-modules.sh" paths "$from" "$HEAD" "$@" <<<"$paths") || exit 2
+  while IFS=$'\t' read -r u f; do
+    [ -z "$f" ] || UNITS["$f"]+=" $u "
+  done <<<"$out"
+}
+owned() { # <paths> [<unit>] -> those UNITS gives <unit>, or any unit; a subpackage keeps its own
+  local f s
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ -n "${2:-}" ]; then
+      [[ ${UNITS[$f]:-} != *" $2 "* ]] || printf '%s\n' "$f"
+      continue
+    fi
+    for s in "${SUBPACKAGES[@]}"; do
+      if [[ $f == "$s/"* ]]; then
+        printf '%s\n' "$f"
+        continue 2
+      fi
+    done
+    if [ -z "${UNITS[$f]:-}" ]; then
+      note "$f ships with no lane and not the root (a nested module owns it), so it is not significant" >&2
+      continue
+    fi
+    printf '%s\n' "$f"
+  done <<<"$1"
+}
+
 if [ -z "$CHANGED" ]; then
   SIGNIFICANT=""
 else
   SIGNIFICANT=$(shipped "$CHANGED") || exit 2
+  if [ "$MODE" = paths ]; then
+    attribute "$FROM" "$SIGNIFICANT" . "${GO_LANES[@]}"
+  else
+    attribute "$RANGE_START" "$SIGNIFICANT" . "${GO_LANES[@]}"
+  fi
+  SIGNIFICANT=$(owned "$SIGNIFICANT")
 fi
 
 # rebuild-stale.sh's empty commit forces an image rebuild against refreshed
@@ -222,7 +258,7 @@ fi
 REBUILD_SUBJECT='fix(deps): rebuild against refreshed base packages'
 is_rebuild_request() { # <commit> -> 0 when it changes no file and carries REBUILD_SUBJECT, 1 when it changes a file, 3 when it is another empty commit; dies when git cannot read it
   local files subject
-  files=$(git diff-tree --root --no-commit-id --name-only -r "$1") || die "cannot read the files commit $1 changes"
+  files=$(git -c core.quotePath=false diff-tree --root --no-commit-id --name-only -r "$1") || die "cannot read the files commit $1 changes"
   [ -z "$files" ] || return 1
   subject=$(git log -1 --format=%s "$1") || die "cannot read the subject of commit $1"
   case "$subject" in
@@ -238,12 +274,11 @@ is_rebuild_commit() { # <commit>: is_rebuild_request, noting an empty commit tha
 }
 
 # package.json ships only as a published manifest (a declared TS subpackage's,
-# the root one in a ts repo, or a nested lane's TS half at <lane>/web, which
-# release.yaml finds by its jsr.json and publishes at the lane's version), and
-# there only through its fields other than devDependencies, overrides and
-# version: npm reads overrides from the installing project's root manifest
-# alone (https://docs.npmjs.com/cli/v11/configuring-npm/package-json), and
-# every publish rewrites version. A published manifest's jsr.json ships
+# the root one in a ts repo, or a lane's TS half at <lane>/web, which release.yaml
+# finds by its jsr.json), and there only through its fields other than
+# devDependencies, overrides and version: npm reads overrides from the installing
+# project's root manifest alone (https://docs.npmjs.com/cli/v11/configuring-npm/package-json),
+# and every publish rewrites version. A published manifest's jsr.json ships
 # through every field but version. Any other package.json is dev tooling.
 # With no <from> to compare, stay significant.
 MANIFESTS=""
@@ -309,7 +344,7 @@ refine_manifests() { # <from> <paths> -> the paths less each manifest file that 
 }
 [ -z "$SIGNIFICANT" ] || SIGNIFICANT=$(refine_manifests "$BEFORE" "$SIGNIFICANT")
 
-# A path under a subpackage or a nested lane belongs to that one, never to
+# A path under a subpackage or owned by a lane belongs to that one, never to
 # the root.
 ROOT_CHANGED=false
 declare -A SUBPKG_CHANGED
@@ -365,21 +400,15 @@ if [ -n "$SIGNIFICANT" ]; then
         break
       fi
     done
-    in_lane=false
-    for l in "${GO_LANES[@]}"; do
-      if [[ "$f" == "$l/"* ]]; then
-        in_lane=true
+    for u in ${UNITS[$f]:-}; do
+      if [ "$u" = . ]; then
+        $in_subpkg || ROOT_CHANGED=true
+      elif [ -z "${LANE_ANCHOR[$u]}" ]; then
         # Without a tag on this channel the lane's first release is owed by
-        # whatever the root range shows under it.
-        if [ -z "${LANE_ANCHOR[$l]}" ]; then
-          LANE_CHANGED["$l"]=true
-        fi
-        break
+        # whatever the root range shows it owns.
+        LANE_CHANGED["$u"]=true
       fi
     done
-    if ! $in_subpkg && ! $in_lane; then
-      ROOT_CHANGED=true
-    fi
   done <<<"$SIGNIFICANT"
 fi
 
@@ -422,10 +451,12 @@ for l in "${GO_LANES[@]}"; do
     continue
   fi
   note "lane ${l}: deriving changed paths from ${anchor}..HEAD (newest lane tag on this channel)"
-  lane_diff=$(git diff --no-renames --name-only "$anchor..$HEAD" -- "$l/")
+  lane_diff=$(git -c core.quotePath=false diff --no-renames --name-only "$anchor..$HEAD" -- "$l/")
   lane_diff=$(refine_manifests "$anchor" "$lane_diff")
   if [ -n "$lane_diff" ]; then
     lane_shipped=$(shipped "$lane_diff") || exit 2
+    attribute "$anchor" "$lane_shipped" "$l"
+    lane_shipped=$(owned "$lane_shipped" "$l")
     [ -z "$lane_shipped" ] || LANE_CHANGED["$l"]=true
   fi
 done

@@ -165,8 +165,9 @@ _PIN_SURFACES = frozenset({'pins', 'bundled-tools'})
 
 def pin_violations(repo: inventory.Repo, target: str) -> list[str]:
     found = []
+    owner = repo.owner(target)
     for path in repo.surfaces(target):
-        if inventory.surface_kind(path) not in _PIN_SURFACES:
+        if inventory.surface_kind(path) not in _PIN_SURFACES or owner(path) is None:
             continue
         records, _ = repo.parsed(target, path) or ([], '')
         found += [
@@ -181,24 +182,27 @@ def check_purity(repo: inventory.Repo, target: str) -> list[str]:
     """Refusals: a root manifest or a shipped pin file pinning a first-party
     dependency at a dev version, and any manifest the check cannot read. A
     nested lane's own dev pin is no refusal: the stable run holds that lane
-    back (held_lanes) and the rest of the promotion publishes."""
+    back (held_lanes) and the rest of the promotion publishes. A file no
+    artifact ships (inventory.owner_of) is neither."""
     files = tree_files(repo, target)
-    lanes = repo.lanes(target)
+    owner = repo.owner(target)
     refusals, found = [], []
     for path in sorted(files):
+        if owner(path) is None:
+            continue
         try:
             violations = purity_violations({path: files[path]})
         except PurityInputError as err:
             refusals.append(
-                f'lane {inventory.lane_of(path, lanes)}: {err}, so the first-party pins in '
+                f'lane {owner(path)}: {err}, so the first-party pins in '
                 f'{path} cannot be judged. Fix {path} on dev'
             )
             continue
-        if inventory.lane_of(path, lanes) == '.':
+        if owner(path) == '.':
             found += violations
     found += pin_violations(repo, target)
     return refusals + [
-        f'lane {inventory.lane_of(v.split(":", 1)[0], lanes)}: a first-party dependency is '
+        f'lane {owner(v.split(":", 1)[0])}: a first-party dependency is '
         f'pinned at a dev version ({v}). Promote it first and stabilize this commit'
         for v in found
     ]
@@ -208,7 +212,7 @@ def held_lanes(repo: inventory.Repo, target: str) -> dict[str, list[str]]:
     """{lane: [violation, ...]} of the nested lanes `target` holds back, the
     rule release.yaml's stable run applies through purity.py. A manifest the
     check cannot read is skipped here; check_purity refuses it."""
-    files, lanes = tree_files(repo, target), repo.lanes(target)
+    files = tree_files(repo, target)
     readable = {}
     for path, text in files.items():
         try:
@@ -216,7 +220,7 @@ def held_lanes(repo: inventory.Repo, target: str) -> dict[str, list[str]]:
         except PurityInputError:
             continue
         readable[path] = text
-    return lane_holds(readable, lanes)
+    return lane_holds(readable, repo.owner(target))
 
 
 def held_lines(held: dict[str, list[str]]) -> list[str]:
@@ -249,12 +253,7 @@ class Layout:
 
 def layout_of(repo: inventory.Repo, sha: str) -> Layout:
     paths = repo.paths(sha)
-    root = {p for p in paths if '/' not in p}
-    kind = 'none'
-    for name, value in (('Dockerfile', 'docker'), ('jsr.json', 'ts'), ('go.mod', 'go')):
-        if name in root:
-            kind = value
-            break
+    kind = repo.repo_type(sha)
     subs = sorted(
         {p.split('/', 1)[0] for p in paths if p.count('/') == 1 and p.endswith('/jsr.json')}
     )
@@ -876,8 +875,8 @@ def release_plan(clone: Path, main: str, r: str, layout: Layout) -> dict[str, di
         clone,
         COMPUTE,
         CHANNEL='stable',
-        EXCLUDE_PATHS='\n'.join(f'{lane}/**' for lane in layout.lanes),
         PENDING_IN_RANGE=_field(pending, 'root_in_range', tool),
+        **env,
     )
     sig = run_tool(
         clone,

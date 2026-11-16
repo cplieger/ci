@@ -112,28 +112,66 @@ class WithCommits(unittest.TestCase):
         self.git('commit', '-qm', message)
         return self.git('rev-parse', 'HEAD')
 
-    def run_mode(self, *args):
+    def owned_by_all(self):
+        """An --owned file giving every changed path of HEAD~3..HEAD to the module."""
+        log = self.git('log', '--no-merges', '--format=@%H', '--name-only', 'HEAD~3..HEAD')
+        lines, sha = [], ''
+        for line in log.splitlines():
+            if line.startswith('@'):
+                sha = line[1:]
+            elif line:
+                lines.append(f'{sha}\t{line}\n')
+        return ''.join(lines)
+
+    def run_mode(self, *args, owned=None):
+        """The printed messages and the --skips lines of HEAD~3..HEAD."""
+        owned_file, skips = self.repo / 'owned.tsv', self.repo / 'skips.txt'
+        owned_file.write_text(self.owned_by_all() if owned is None else owned)
         proc = subprocess.run(
-            [sys.executable, str(SCRIPT), '--with-commits', 'HEAD~3..HEAD', *args],
+            [
+                sys.executable,
+                str(SCRIPT),
+                '--with-commits',
+                'HEAD~3..HEAD',
+                '--owned',
+                str(owned_file),
+                '--skips',
+                str(skips),
+                *args,
+            ],
             cwd=self.repo,
             env=self.env,
             check=True,
             capture_output=True,
             text=True,
         )
-        return [m for m in proc.stdout.split('\0') if m]
+        return [m for m in proc.stdout.split('\0') if m], skips.read_text().split()
 
     def test_config_include_paths_scope_the_embedded_commits(self):
-        self.commit('fix: reword the help', 'help.md')
-        self.commit('fix: reword the manual', 'cli/manual.md')
-        self.commit('fix: a kept change', 'cli/run.go')
+        help_sha = self.commit('fix: reword the help', 'help.md')
+        manual = self.commit('fix: reword the manual', 'cli/manual.md')
+        kept = self.commit('fix: a kept change', 'cli/run.go')
         self.write('cliff.toml', '[git]\nexclude_paths = ["**/*.md"]\n')
         self.assertEqual(
             self.run_mode('--config', 'cliff.toml'),
-            ['fix: reword the help', 'fix: reword the manual'],
+            (['fix: reword the help', 'fix: reword the manual'], [help_sha, manual]),
         )
         self.write('cliff.toml', '[git]\nexclude_paths = ["**/*.md"]\ninclude_paths = ["cli/**"]\n')
-        self.assertEqual(self.run_mode('--config', 'cliff.toml'), ['fix: reword the manual'])
+        self.assertEqual(
+            self.run_mode('--config', 'cliff.toml'),
+            (['fix: reword the manual'], [help_sha, manual]),
+        )
+        self.assertNotIn(kept, self.run_mode('--config', 'cliff.toml')[1])
+
+    def test_a_commit_counts_only_through_the_files_the_module_owns(self):
+        both = self.commit('fix: both', 'cli/run.go', 'help.md')
+        other = self.commit('feat!: elsewhere', 'other/x.go')
+        mine = self.commit('fix: mine', 'cli/run.go')
+        self.write('cliff.toml', '[git]\nexclude_paths = ["**/*.md"]\n')
+        owned = f'{both}\thelp.md\n{mine}\tcli/run.go\n'
+        self.assertEqual(
+            self.run_mode('--config', 'cliff.toml', owned=owned), (['fix: both'], [both, other])
+        )
 
     def test_positions_give_the_range_order_by_sha_and_message(self):
         one = self.commit('fix: one', 'help.md')
@@ -143,7 +181,7 @@ class WithCommits(unittest.TestCase):
         out = self.repo / 'positions.json'
         self.assertEqual(
             self.run_mode('--config', 'cliff.toml', '--positions', str(out)),
-            ['fix: one', 'fix: three'],
+            (['fix: one', 'fix: three'], [one, three]),
         )
         self.assertEqual(
             json.loads(out.read_text()),
@@ -151,6 +189,20 @@ class WithCommits(unittest.TestCase):
                 'commits': {one: 0, two: 1, three: 2},
                 'messages': {'fix: one': 0, 'fix: three': 2},
             },
+        )
+
+    def test_owned_and_skips_are_required(self):
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT), '--with-commits', 'HEAD', '--config', 'cliff.toml'],
+            cwd=self.repo,
+            env=self.env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            (proc.returncode, proc.stderr),
+            (2, 'go-embeds: --with-commits needs --owned and --skips\n'),
         )
 
 

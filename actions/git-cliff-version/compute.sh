@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Version arithmetic for the release channels, configured by environment
-# (CHANNEL, EXCLUDE_PATHS, LANE, CLIFF_BIN, PENDING_VERSION, PENDING_COMMIT,
-# PENDING_IN_RANGE); results go to $GITHUB_OUTPUT.
+# (CHANNEL, LANE, GO_LANES_JSON and REPO_TYPE for the root, CLIFF_BIN,
+# PENDING_VERSION, PENDING_COMMIT, PENDING_IN_RANGE); results go to $GITHUB_OUTPUT.
 # `compute.sh pending-version <commit> [lane]` prints a pending promotion's
 # version instead. Callers: action.yml, scripts/release-state.sh,
 # test-cliff-bump-semantics.sh.
@@ -25,8 +25,9 @@ case "${1:-}" in
 esac
 
 CHANNEL="${CHANNEL:-stable}"
-EXCLUDE_PATHS="${EXCLUDE_PATHS:-}"
 LANE="${LANE:-}"
+GO_LANES_JSON="${GO_LANES_JSON:-[]}"
+REPO_TYPE="${REPO_TYPE:-}"
 CLIFF_BIN="${CLIFF_BIN:-git-cliff}"
 
 case "$CHANNEL" in
@@ -45,7 +46,7 @@ if [ -n "$LANE" ]; then
   esc=$(printf '%s' "$LANE" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
   PATTERN="^${esc}/v[0-9]+\\.[0-9]+\\.[0-9]+\$"
   PREFIX="${LANE}/"
-  ARGS=(--tag-pattern "$PATTERN" --include-path "${LANE}/**")
+  ARGS=(--tag-pattern "$PATTERN")
   # The synced config's initial_tag is root-shaped and would fail the pattern.
   # git-cliff reads it only while the lane has no stable tag, so a committed
   # <lane>/.first-version, read at the revision numbered, seeds the lane's
@@ -68,10 +69,13 @@ else
   PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+$'
   PREFIX=""
   ARGS=(--tag-pattern "$PATTERN")
-  while IFS= read -r p; do
-    [ -z "$p" ] && continue
-    ARGS+=(--exclude-path "$p")
-  done <<<"$EXCLUDE_PATHS"
+  case "$REPO_TYPE" in
+    docker | go | ts | none) ;;
+    *)
+      echo "::error::repo-type must be docker, go, ts or none for the root version, got '${REPO_TYPE}'"
+      exit 1
+      ;;
+  esac
 fi
 
 # The dev counter reads existing tags, so a shallow or stale tag list would
@@ -79,7 +83,7 @@ fi
 git fetch --tags --quiet origin 2>/dev/null || true
 
 err="$(mktemp)"
-trap 'rm -f "$err" "$err.embeds"' EXIT
+trap 'rm -f "$err" "$err.embeds" "$err.owned" "$err.skips"' EXIT
 
 nearest_tag() { # <regex> -> the tag matching it on the commit nearest HEAD, or nothing; fails when git cannot list the tags or walk HEAD
   local -A tag_at=()
@@ -213,25 +217,31 @@ cliff_level() { # <from> <to> -> sets LEVEL and CLIFF_VERSION (its proposal)
       exit 1
     fi
   fi
-  # A commit the path filter drops that changes a file a non-test //go:embed
-  # names ships, so its type counts (go-embeds.py; render-notes.sh lists it).
-  local -a with=() scope=(--config "${GIT_CLIFF_CONFIG:-cliff.toml}")
-  local msg i
-  for ((i = 0; i < ${#ARGS[@]}; i++)); do
-    case "${ARGS[$i]}" in
-      --include-path) scope+=(--include "${ARGS[$((i + 1))]}") ;;
-      --exclude-path) scope+=(--exclude "${ARGS[$((i + 1))]}") ;;
-    esac
-  done
-  python3 "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-embeds.py" --with-commits "${range[0]}" "${scope[@]}" \
-    >"$err.embeds" || {
+  # git-cliff counts only the commits go-modules.sh commits gives this module,
+  # and one changing only an embedded doc of it ships (go-embeds.py).
+  local -a with=() skip=()
+  local msg sha unit=. lanes="$GO_LANES_JSON"
+  if [ -n "$LANE" ]; then
+    unit="$LANE"
+    lanes="$(jq -cn --arg l "$LANE" '[$l]')"
+  fi
+  if ! GO_LANES_JSON="$lanes" REPO_TYPE="$REPO_TYPE" bash "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-modules.sh" \
+    commits "$1" "$to" "$unit" >"$err.owned"; then
+    echo "::error::cannot tell which commits of ${range[*]} belong to ${LANE:-the root}"
+    exit 1
+  fi
+  python3 "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-embeds.py" --with-commits "${range[0]}" \
+    --owned "$err.owned" --skips "$err.skips" --config "${GIT_CLIFF_CONFIG:-cliff.toml}" >"$err.embeds" || {
     echo "::error::cannot read the //go:embed directives over ${range[*]}"
     exit 1
   }
   while IFS= read -r -d '' msg; do
     with+=(--with-commit "$msg")
   done <"$err.embeds"
-  if ! ctx="$("$CLIFF_BIN" --bump --context "${ARGS[@]}" "${with[@]}" "${range[@]}" 2>"$err")"; then
+  while IFS= read -r sha; do
+    skip+=(--skip-commit "$sha")
+  done <"$err.skips"
+  if ! ctx="$("$CLIFF_BIN" --bump --context "${ARGS[@]}" "${skip[@]}" "${with[@]}" "${range[@]}" 2>"$err")"; then
     echo "::error::git-cliff --bump --context failed over ${range[*]}:"
     sed 's/^/  /' "$err" >&2 || true
     exit 1

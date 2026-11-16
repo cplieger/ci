@@ -354,18 +354,20 @@ Migrate first' "T4: a group left holding only a footer-bearing commit renders no
 # these states execute it rather than restate its arithmetic.
 ACTION="$ROOT/actions/git-cliff-version/compute.sh"
 [ -f "$ACTION" ] || fail "compute.sh not found at $ACTION"
-compute_tb() { # <repo> <channel> <pending-version> <pending-in-range> <pending-commit> [lane] [exclude-paths]
+# The fixtures' roots version as a go root unless a state says otherwise.
+export REPO_TYPE=go
+compute_tb() { # <repo> <channel> <pending-version> <pending-in-range> <pending-commit> [lane] [go-lanes]
   local repo="$1" channel="$2" outfile
   outfile="$(mktemp "$WORK/compute-out.XXXXXX")"
   (
     cd "$repo" && GIT_CLIFF_CONFIG="$CFG" CLIFF_BIN="$CLIFF" GITHUB_OUTPUT="$outfile" \
       CHANNEL="$channel" PENDING_VERSION="$3" PENDING_IN_RANGE="$4" PENDING_COMMIT="$5" \
-      LANE="${6:-}" EXCLUDE_PATHS="${7:-}" bash "$ACTION" >"$WORK/compute.log" 2>&1
+      LANE="${6:-}" GO_LANES_JSON="${7:-[]}" bash "$ACTION" >"$WORK/compute.log" 2>&1
   ) || fail "compute.sh failed in $repo (channel=$channel pending=${3:-<none>} in-range=$4 pending-commit=${5:-<none>} lane=${6:-<none>}): $(cat "$WORK/compute.log")"
   read_outputs "$outfile"
   [ -n "$OUT_BASE" ] || fail "compute.sh wrote no base output in $repo"
 }
-compute() { # <repo> <channel> [lane] [exclude-paths]: nothing pending
+compute() { # <repo> <channel> [lane] [go-lanes]: nothing pending
   compute_tb "$1" "$2" "" false "" "${3:-}" "${4:-}"
 }
 read_outputs() { # <GITHUB_OUTPUT file> -> OUT_* variables
@@ -434,6 +436,7 @@ Q=$(mkfixture chan-q)
 fc "$Q" src/main.go "feat: initial"
 mkdir -p "$Q/yamlenv"
 echo y >"$Q/yamlenv/y.go"
+echo 'module example.com/q/yamlenv' >"$Q/yamlenv/go.mod"
 git -C "$Q" add -A
 git -C "$Q" commit -qm "feat: introduce nested module"
 git -C "$Q" tag v1.0.0
@@ -443,10 +446,14 @@ publish_main "$Q"
 compute "$Q" dev yamlenv
 assert_eq "$OUT_DEV" "yamlenv/v1.1.0-dev.1" "Q1: lane dev version carries the lane prefix"
 assert_eq "$OUT_LATEST" "yamlenv/v1.0.0" "Q2: lane latest is the lane's own stable tag"
-compute "$Q" stable "" 'yamlenv/**'
-assert_eq "$OUT_LEVEL" "none" "Q3: with the lane dir excluded, the lane feat is no root change"
+# A docker root builds from its whole tree, so only the go-lanes input keeps
+# the lane's commits out of it; a go root's zip leaves out any nested module.
+REPO_TYPE=docker compute "$Q" stable "" '["yamlenv"]'
+assert_eq "$OUT_LEVEL" "none" "Q3: with yamlenv a lane, the lane feat is no root change"
+REPO_TYPE=docker compute "$Q" stable
+assert_eq "$OUT_LEVEL" "minor" "Q4: without the lane the same feat is a docker root minor (the go-lanes input is load-bearing)"
 compute "$Q" stable
-assert_eq "$OUT_LEVEL" "minor" "Q4: without the exclusion the same feat is a root minor (the exclude-paths input is load-bearing)"
+assert_eq "$OUT_LEVEL" "none" "Q4: on a go root a nested module that is no lane is still left out"
 
 # ── State R: an rc tag at HEAD is outside both channels' tag universes ───────
 # A glob-shaped tag filter (v[0-9]*.[0-9]*.[0-9]*) admits v1.3.0-rc.1; it then
@@ -467,9 +474,9 @@ compute "$M" stable
 assert_eq "$OUT_LATEST" "v1.2.0" "R6: a beta tag beside the dev tag is invisible too"
 
 # ── Release states: main and dev branches, promotions, lanes ────────────────
-pending_of() { # <repo> <commit> [lane] [exclude-paths] -> the pending promotion's version
+pending_of() { # <repo> <commit> [lane] [go-lanes] -> the pending promotion's version
   (
-    cd "$1" && GIT_CLIFF_CONFIG="$CFG" CLIFF_BIN="$CLIFF" EXCLUDE_PATHS="${4:-}" \
+    cd "$1" && GIT_CLIFF_CONFIG="$CFG" CLIFF_BIN="$CLIFF" GO_LANES_JSON="${4:-[]}" \
       bash "$ACTION" pending-version "$2" ${3:+"$3"} 2>"$WORK/pending.log"
   ) || fail "compute.sh pending-version $2 failed in $1: $(cat "$WORK/pending.log")"
 }
@@ -501,7 +508,7 @@ promote() { # <repo> <dev commit T> -> R: tree T, parents [main, T], main fast-f
 commit_of() { git -C "$1" rev-list -n1 "$2"; }
 
 # The action forwards every input compute.sh reads; an input it drops is inert.
-for pair in channel:CHANNEL exclude-paths:EXCLUDE_PATHS lane:LANE \
+for pair in channel:CHANNEL go-lanes:GO_LANES_JSON repo-type:REPO_TYPE lane:LANE \
   pending-version:PENDING_VERSION pending-commit:PENDING_COMMIT pending-in-range:PENDING_IN_RANGE; do
   grep -qE "^  ${pair%%:*}:\$" "$ROOT/actions/git-cliff-version/action.yml" \
     || fail "action.yml declares no '${pair%%:*}' input"
@@ -509,6 +516,8 @@ for pair in channel:CHANNEL exclude-paths:EXCLUDE_PATHS lane:LANE \
     || fail "action.yml does not forward input '${pair%%:*}' as ${pair#*:}"
 done
 echo "ok: action.yml forwards every compute.sh input"
+refused "Q5: the root version needs the repo type" "repo-type must be docker, go, ts or none" "$Q" \
+  REPO_TYPE= CHANNEL=stable bash "$ACTION"
 
 # ── State L: <lane>/.first-version seeds a lane with no stable tag ──────────
 L=$(mkfixture chan-seed)
@@ -660,6 +669,8 @@ assert_eq "$(pending_of "$X8" "$X8R")" "v1.3.0" "S8c: the pending helper agrees 
 # ── State S9: each lane computes from its own H ─────────────────────────────
 L9=$(mkfixture tb-lanes)
 fc "$L9" src/main.go "feat: initial"
+mkdir -p "$L9/yamlenv"
+echo 'module example.com/l9/yamlenv' >"$L9/yamlenv/go.mod"
 fc "$L9" yamlenv/y.go "feat: introduce nested module"
 git -C "$L9" tag v1.0.0
 git -C "$L9" tag yamlenv/v1.0.0
@@ -671,7 +682,7 @@ git -C "$L9" checkout -q main
 fc "$L9" yamlenv/go.mod "fix(deps): update a lane dependency"
 git -C "$L9" tag yamlenv/v1.0.1
 L9R=$(promote "$L9" "$L9T")
-compute_tb "$L9" stable "" true "" "" 'yamlenv/**'
+compute_tb "$L9" stable "" true "" "" '["yamlenv"]'
 assert_eq "$OUT_BASE" "v1.1.0" "S9a: the root lane publishes the promotion's minor"
 compute_tb "$L9" stable "" false "" yamlenv
 assert_eq "$OUT_BASE" "yamlenv/v1.0.2" "S9b: the lane a root-only promotion left alone publishes its next patch"
@@ -680,7 +691,7 @@ git -C "$L9" checkout -q dev
 fc "$L9" yamlenv/y.go "fix: a lane fix on dev"
 compute_tb "$L9" dev "" false "" yamlenv
 assert_eq "$OUT_BASE" "yamlenv/v1.1.0" "S9d: a lane dev build takes the next minor above the lane's H"
-compute_tb "$L9" dev "v1.1.0" false "$L9R" "" 'yamlenv/**'
+compute_tb "$L9" dev "v1.1.0" false "$L9R" "" '["yamlenv"]'
 assert_eq "$OUT_BASE" "v1.2.0" "S9e: the root dev build numbers above the root's pending promotion"
 assert_eq "$OUT_LEVEL" "none" "S9f: the lane fix is outside the root range"
 
@@ -858,13 +869,13 @@ fc "$EB" cli/manual.md "fix: add the embedded manual"
 fc "$EB" lane/README.md "fix(lane): add the lane readme"
 git -C "$EB" tag lane/v1.0.0
 publish_main "$EB"
-compute "$EB" dev "" "lane/**"
+compute "$EB" dev "" '["lane"]'
 assert_eq "$OUT_BASE" "v1.3.0" "S16 precondition: fixes alone number the next minor"
 fc "$EB" README.md "feat!: rewrite the readme"
-compute "$EB" dev "" "lane/**"
+compute "$EB" dev "" '["lane"]'
 assert_eq "$OUT_BASE" "v1.3.0" "S16: an unembedded .md sets no level"
 fc "$EB" cli/manual.md "feat!: rewrite the help text"
-compute "$EB" dev "" "lane/**"
+compute "$EB" dev "" '["lane"]'
 assert_eq "$OUT_BASE" "v2.0.0" "S16: a breaking change to an embedded file alone is a major"
 fc "$EB" lane/README.md "feat(lane)!: rewrite the lane readme"
 compute "$EB" dev lane
@@ -881,5 +892,134 @@ publish_main "$ER2"
 fc "$ER2" help.md "feat!: rewrite the root help"
 compute "$ER2" dev
 assert_eq "$OUT_BASE" "v2.0.0" "S16: a breaking change to an embedded root file alone is a major"
+
+# ── S17: a nested module's commit is not the lane that contains it ─────────
+# chartdata's module zip leaves out chartdata/internal/gen, which holds its
+# own go.mod, so a commit confined to it sets no level for chartdata.
+NM=$(mkfixture nested-lane)
+mkdir -p "$NM/chartdata/internal/gen"
+printf 'module example.com/nm\n\ngo 1.26\n' >"$NM/go.mod"
+printf 'module example.com/nm/chartdata\n\ngo 1.26\n' >"$NM/chartdata/go.mod"
+printf 'module example.com/nm/chartdata/internal/gen\n\ngo 1.26\n' >"$NM/chartdata/internal/gen/go.mod"
+git -C "$NM" add -A
+fc "$NM" chartdata/c.go "feat(chartdata): initial"
+git -C "$NM" tag v1.0.0
+git -C "$NM" tag chartdata/v1.0.0
+fc "$NM" chartdata/internal/gen/gen.go "feat(chartdata)!: regenerate with the new wiregen"
+publish_main "$NM"
+compute "$NM" stable chartdata
+assert_eq "$OUT_LEVEL" "none" "S17a: a breaking commit confined to the nested module sets no level for its lane"
+compute "$NM" dev chartdata
+assert_eq "$OUT_LEVEL" "none" "S17b: nor for the lane's dev build"
+fc "$NM" chartdata/c.go "fix(chartdata): a lane fix"
+publish_main "$NM"
+compute "$NM" stable chartdata
+assert_eq "$OUT_LEVEL" "patch" "S17c: the lane's own fix is a patch, the nested module's breaking commit still left out"
+assert_eq "$OUT_BASE" "chartdata/v1.0.1" "S17d: and numbers the next patch"
+mkdir -p "$NM/chartdata/web"
+printf 'module web-ignore\n' >"$NM/chartdata/web/go.mod"
+printf '{"name":"@o/chartdata","version":"0.0.0"}\n' >"$NM/chartdata/web/jsr.json"
+git -C "$NM" add -A
+fc "$NM" chartdata/web/mod.ts "feat(chartdata): the TS half"
+publish_main "$NM"
+compute "$NM" stable chartdata
+assert_eq "$OUT_LEVEL" "minor" "S17e: the lane's TS half stays the lane's though a sentinel go.mod sits in it"
+mkdir -p "$WORK/nm-stub"
+printf '#!/usr/bin/env bash\n[[ "$*" != *ls-tree\\ -r* ]] || exit 92\nexec %q "$@"\n' "$(command -v git)" >"$WORK/nm-stub/git"
+chmod 755 "$WORK/nm-stub/git"
+refused "S17f: a tree go-modules.sh cannot read fails the lane's numbering" \
+  "cannot tell which commits of" "$NM" PATH="$WORK/nm-stub:$PATH" CHANNEL=stable LANE=chartdata bash "$ACTION"
+
+# A commit that carves a nested module out of the lane changes the lane's
+# module zip, so it is the lane's; the module stays out of later ranges.
+CO=$(mkfixture carve-out)
+mkdir -p "$CO/chartdata/internal/gen"
+printf 'module example.com/co\n\ngo 1.26\n' >"$CO/go.mod"
+printf 'module example.com/co/chartdata\n\ngo 1.26\n' >"$CO/chartdata/go.mod"
+printf 'package gen\n' >"$CO/chartdata/internal/gen/gen.go"
+git -C "$CO" add -A
+fc "$CO" chartdata/c.go "feat(chartdata): initial"
+git -C "$CO" tag v1.0.0
+git -C "$CO" tag chartdata/v1.0.0
+printf 'module example.com/co/chartdata/internal/gen\n\ngo 1.26\n' >"$CO/chartdata/internal/gen/go.mod"
+git -C "$CO" add -A
+fc "$CO" chartdata/internal/gen/go.mod "feat(chartdata)!: move gen into its own module"
+publish_main "$CO"
+compute "$CO" dev chartdata
+assert_eq "$OUT_LEVEL" "major" "S17g: a breaking carve-out of a nested module is the lane's major"
+assert_eq "$OUT_BASE" "chartdata/v2.0.0" "S17h: and numbers the next major"
+git -C "$CO" tag chartdata/v2.0.0
+fc "$CO" chartdata/internal/gen/gen.go "feat(chartdata)!: regenerate"
+publish_main "$CO"
+compute "$CO" dev chartdata
+assert_eq "$OUT_LEVEL" "none" "S17i: once carved out, the nested module's commit sets no level"
+
+# Ownership is read per commit: a dev range from a stable tag older than the
+# carve-out holds the carve-out, the lane's, and a later breaking commit
+# confined to the new module, which is not.
+PC=$(mkfixture carve-then-nested)
+mkdir -p "$PC/chartdata/internal/gen"
+printf 'module example.com/pc\n\ngo 1.26\n' >"$PC/go.mod"
+printf 'module example.com/pc/chartdata\n\ngo 1.26\n' >"$PC/chartdata/go.mod"
+printf 'package gen\n' >"$PC/chartdata/internal/gen/gen.go"
+git -C "$PC" add -A
+fc "$PC" chartdata/c.go "feat(chartdata): initial"
+git -C "$PC" tag v1.0.0
+git -C "$PC" tag chartdata/v1.0.0
+printf 'module example.com/pc/chartdata/internal/gen\n\ngo 1.26\n' >"$PC/chartdata/internal/gen/go.mod"
+git -C "$PC" add -A
+git -C "$PC" commit -qm "fix(chartdata): move gen into its own module"
+fc "$PC" chartdata/internal/gen/gen.go "feat(chartdata)!: regenerate the generator"
+publish_main "$PC"
+compute "$PC" dev chartdata
+assert_eq "$OUT_LEVEL" "patch" "S17j: the carve-out's fix sets the lane's level, the later nested-only breaking commit none"
+assert_eq "$OUT_BASE" "chartdata/v1.1.0" "S17k: so the lane's dev base is the next minor, not a major"
+compute "$PC" stable chartdata
+assert_eq "$OUT_BASE" "chartdata/v1.0.1" "S17l: and its stable version the next patch"
+git -C "$PC" rm -q chartdata/internal/gen/go.mod
+git -C "$PC" commit -qm "fix(chartdata): fold gen back into the lane"
+git -C "$PC" tag chartdata/v1.0.1 HEAD~2
+fc "$PC" chartdata/internal/gen/gen.go "feat(chartdata): gen grows"
+publish_main "$PC"
+compute "$PC" stable chartdata
+assert_eq "$OUT_LEVEL" "minor" "S17m: past a fold-back, a commit under the folded dir counts for the lane"
+
+# ── S18: the root leaves out every nested module it does not ship ──────────
+NR=$(mkfixture nested-root)
+mkdir -p "$NR/internal/gen"
+printf 'module example.com/nr\n\ngo 1.26\n' >"$NR/go.mod"
+printf 'module example.com/nr/internal/gen\n\ngo 1.26\n' >"$NR/internal/gen/go.mod"
+git -C "$NR" add -A
+fc "$NR" main.go "feat: initial"
+git -C "$NR" tag v1.0.0
+fc "$NR" internal/gen/gen.go "feat!: regenerate with the new wiregen"
+publish_main "$NR"
+compute "$NR" stable
+assert_eq "$OUT_LEVEL" "none" "S18a: a go root's version leaves out a nested module its module zip does not hold"
+REPO_TYPE=docker compute "$NR" stable
+assert_eq "$OUT_LEVEL" "major" "S18b: a docker root builds its image from the tree, so the same commit is its major"
+
+# A go root's zip holds a lane's files until the lane has its go.mod, so the
+# commit carving a lane out of it is the root's too.
+LC=$(mkfixture lane-carve-out)
+mkdir -p "$LC/pkg/split"
+printf 'module example.com/lc\n\ngo 1.26\n' >"$LC/go.mod"
+printf 'package split\n' >"$LC/pkg/split/s.go"
+git -C "$LC" add -A
+fc "$LC" main.go "feat: initial"
+git -C "$LC" tag v1.0.0
+printf 'module example.com/lc/pkg/split\n\ngo 1.26\n' >"$LC/pkg/split/go.mod"
+git -C "$LC" add -A
+git -C "$LC" commit -qm "feat!: move pkg/split into its own module"
+publish_main "$LC"
+compute "$LC" stable "" '["pkg/split"]'
+assert_eq "$OUT_LEVEL" "major" "S18c: carving a lane out of a go root is the root's major"
+REPO_TYPE=docker compute "$LC" stable "" '["pkg/split"]'
+assert_eq "$OUT_LEVEL" "none" "S18d: a docker root never counted the lane's files"
+git -C "$LC" tag v2.0.0
+fc "$LC" pkg/split/s.go "feat(split)!: a lane-only break"
+publish_main "$LC"
+compute "$LC" stable "" '["pkg/split"]'
+assert_eq "$OUT_LEVEL" "none" "S18e: a later lane-only commit sets no root level"
 
 echo "PASS: git-cliff $VERSION semantics match the release-gate contract"

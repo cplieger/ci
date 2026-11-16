@@ -5,9 +5,8 @@
 #   [--security-shas F] [--inventory PATH] [--config FILE]; --print-previous, without --out,
 #   prints the lane's previous stable tag by version (the range start) and stops.
 #   [--sbom-changes] --sbom-prev F --sbom-new F alone prints the number of package
-#   changes the System packages block would list, and stops.
-# The notes cover previous..--release-commit plus the dependency and package diffs.
-# git-cliff executes the repo's cliff config: no token here.
+#   changes the System packages block would list, and stops. The notes cover
+#   previous..--release-commit and its diffs; git-cliff runs the repo's config, so no token.
 set -euo pipefail
 
 die() {
@@ -117,16 +116,18 @@ if [ "$SITE" = lane ]; then
   ESC=$(printf '%s' "$LANE" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
   PATTERN="^${ESC}/v[0-9]+\\.[0-9]+\\.[0-9]+\$"
   PREFIX="${LANE}/"
-  SCOPE_ARGS=(--include-path "${LANE}/**")
 else
   PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+$'
   PREFIX=""
-  SCOPE_ARGS=()
-  while IFS= read -r d; do
-    [ -z "$d" ] && continue
-    SCOPE_ARGS+=(--exclude-path "$d/**")
-  done < <(jq -r '.[]' <<<"$GO_LANES_JSON")
 fi
+
+owned_commits() { # <range start> <commit> -> go-modules.sh commits of this lane, or the root's
+  if [ "$SITE" = lane ]; then
+    GO_LANES_JSON="$(jq -cn --arg l "$LANE" '[$l]')" bash "$(dirname "$0")/go-modules.sh" commits "$1" "$2" "$LANE"
+  else
+    GO_LANES_JSON="$GO_LANES_JSON" REPO_TYPE="$SITE" bash "$(dirname "$0")/go-modules.sh" commits "$1" "$2" .
+  fi
+}
 
 version_key() { # X.Y.Z -> fixed-width sortable key
   local IFS=. parts
@@ -158,27 +159,27 @@ render() {
   prev=$(previous_stable_tag)
   range=$commit
   [ -z "$prev" ] || range="${prev}..${commit}"
-  # A commit the path filter drops that changes a file a non-test //go:embed
-  # names ships, so its line belongs here (go-embeds.py; compute.sh counts it).
-  local -a with=() scope=(--config "${CONFIG:-${GIT_CLIFF_CONFIG:-cliff.toml}}")
-  local msg i embeds order
-  for ((i = 0; i < ${#SCOPE_ARGS[@]}; i += 2)); do
-    case "${SCOPE_ARGS[$i]}" in
-      --include-path) scope+=(--include "${SCOPE_ARGS[$((i + 1))]}") ;;
-      --exclude-path) scope+=(--exclude "${SCOPE_ARGS[$((i + 1))]}") ;;
-    esac
-  done
+  # go-modules.sh commits and go-embeds.py decide which commits git-cliff lists.
+  local -a with=() skip=()
+  local msg sha embeds order owned skips
   embeds=$(mktemp)
   order=$(mktemp)
+  owned=$(mktemp)
+  skips=$(mktemp)
   # shellcheck disable=SC2064 # the paths are fixed now
-  trap "rm -f '$embeds' '$order'" EXIT
-  python3 "$(dirname "$0")/go-embeds.py" --with-commits "$range" "${scope[@]}" --positions "$order" >"$embeds" \
+  trap "rm -f '$embeds' '$order' '$owned' '$skips'" EXIT
+  owned_commits "$prev" "$commit" >"$owned" || die "cannot tell which commits of ${range} belong to ${LANE:-the root}"
+  python3 "$(dirname "$0")/go-embeds.py" --with-commits "$range" --owned "$owned" --skips "$skips" \
+    --config "${CONFIG:-${GIT_CLIFF_CONFIG:-cliff.toml}}" --positions "$order" >"$embeds" \
     || die "cannot read the //go:embed directives over ${range}"
   while IFS= read -r -d '' msg; do
     with+=(--with-commit "$msg")
   done <"$embeds"
+  while IFS= read -r sha; do
+    skip+=(--skip-commit "$sha")
+  done <"$skips"
   if [ "${#with[@]}" -eq 0 ]; then
-    changes=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" --strip header "$range")
+    changes=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${skip[@]}" "${CLIFF_ARGS[@]}" --strip header "$range")
   else
     # git-cliff 2.14.2 adds --with-commit commits to its last release, an empty
     # one after the tagged release, which renders as a second block; so the
@@ -186,7 +187,7 @@ render() {
     # range's order (a --with-commit commit has an empty id, so it is found by
     # its message), and rendered once.
     local ctx
-    ctx=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${SCOPE_ARGS[@]}" "${CLIFF_ARGS[@]}" "${with[@]}" --context "$range")
+    ctx=$("$CLIFF" --tag-pattern "$PATTERN" --tag "$VERSION" "${skip[@]}" "${CLIFF_ARGS[@]}" "${with[@]}" --context "$range")
     changes=$(jq --slurpfile at "$order" '
       (map(select(.version != null)) + map(select(.version == null))) as $r
       | [$r[0] + {commits: ($r | map(.commits) | add

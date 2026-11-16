@@ -147,6 +147,12 @@ facts["publish-after"] = facts["names"].index("Detect changed paths") < facts["n
     "Add pending promotions to the publication") < facts["names"].index("Select version")
 open(f"{out}/type.sh", "w").write(d["Detect type + subpackages"]["run"])
 open(f"{out}/gomodules.sh", "w").write(d["Detect nested Go modules"]["run"])
+facts["gomodules-env"] = d["Detect nested Go modules"].get("env", {})
+facts["cliff-scopes"] = sorted(
+    "|".join((name, s.get("with", {}).get("go-lanes", ""), s.get("with", {}).get("repo-type", "")))
+    for name, j in jobs.items() for s in j.get("steps", [])
+    if s.get("uses") == "./.cplieger-ci/actions/git-cliff-version" and name != "go-nested")
+facts["gomodules-order"] = facts["names"].index("Check out the ci source") < facts["names"].index("Detect nested Go modules")
 hd = d.get("Hold back lanes that pin a dev version", {})
 facts["hold-if"] = " ".join(hd.get("if", "").split())
 facts["hold-env"] = hd.get("env", {})
@@ -864,7 +870,7 @@ chk "P5 and writes no kind line" "$(outkey root_kind_note)" ""
 chk "P5 and names the root's pending commit" "$(outkey root_commit)" "$R1"
 dev_floor_at() { # <dir> <pending-version> <pending-commit> -> base|range_from of a root dev compute.sh run
   : >"$WORK/cout"
-  (cd "$1" && CHANNEL=dev PENDING_VERSION="$2" PENDING_COMMIT="$3" EXCLUDE_PATHS='yamlenv/**' CLIFF_BIN="$CLIFF" \
+  (cd "$1" && CHANNEL=dev PENDING_VERSION="$2" PENDING_COMMIT="$3" GO_LANES_JSON='["yamlenv"]' REPO_TYPE=go CLIFF_BIN="$CLIFF" \
     GITHUB_OUTPUT="$WORK/cout" bash "$COMPUTE") >"$WORK/compute.log" 2>&1 || fail "compute.sh failed: $(cat "$WORK/compute.log")"
   printf '%s|%s' "$(sed -n 's/^base=//p' "$WORK/cout")" "$(sed -n 's/^range_from=//p' "$WORK/cout")"
 }
@@ -878,7 +884,7 @@ chk "P6 a dev run without origin/main is refused" \
 # ── Numbering and the version arithmetic it feeds ────────────────────────────
 number() { # <state> -> the state with versions; outputs in $WORK/out
   : >"$WORK/out"
-  (cd "$O" && STATE="$1" CLIFF_SCRIPT="$COMPUTE" CLIFF_BIN="$CLIFF" EXCLUDE_PATHS='yamlenv/**' \
+  (cd "$O" && STATE="$1" CLIFF_SCRIPT="$COMPUTE" CLIFF_BIN="$CLIFF" GO_LANES_JSON='["yamlenv"]' REPO_TYPE=go \
     GITHUB_OUTPUT="$WORK/out" bash "$RS" number) >"$WORK/number.log" 2>&1 || fail "number failed: $(cat "$WORK/number.log")"
   sed -n 's/^state=//p' "$WORK/out"
 }
@@ -887,7 +893,7 @@ chk "N1 the root promotion is numbered from its feature" "$(outkey root_version)
 chk "N1 a lane with nothing pending gets no version" "$(lane yamlenv version "$s")" ""
 compute_at() { # <pending-in-range> -> the stable version compute.sh selects at main's head
   : >"$WORK/cout"
-  (cd "$O" && CHANNEL=stable PENDING_IN_RANGE="$1" EXCLUDE_PATHS='yamlenv/**' CLIFF_BIN="$CLIFF" \
+  (cd "$O" && CHANNEL=stable PENDING_IN_RANGE="$1" GO_LANES_JSON='["yamlenv"]' REPO_TYPE=go CLIFF_BIN="$CLIFF" \
     GITHUB_OUTPUT="$WORK/cout" bash "$COMPUTE") >/dev/null 2>&1 || fail "compute.sh failed"
   sed -n 's/^base=//p' "$WORK/cout"
 }
@@ -1642,7 +1648,8 @@ L0=$(commit_in "$L" "feat: initial" go.work='go 1.26' alpha/go.mod='module examp
   web/jsr.json='{"name":"@o/web","version":"0.0.0"}' web/package.json='{"name":"@o/web","version":"0.0.0"}')
 disc() { # <repo> -> subpackages|go_modules|go_halves of the extracted detect steps, or EXIT=n
   : >"$WORK/out"
-  (cd "$1" && GITHUB_OUTPUT="$WORK/out" bash "$WORK/type.sh" && GITHUB_OUTPUT="$WORK/out" bash "$WORK/gomodules.sh") \
+  (cd "$1" && GITHUB_OUTPUT="$WORK/out" bash "$WORK/type.sh" \
+    && GITHUB_OUTPUT="$WORK/out" CI_TOOLS="$ROOT/scripts" bash "$WORK/gomodules.sh") \
     >"$WORK/disc.log" 2>&1 || {
     echo "EXIT=$?"
     return 0
@@ -1651,6 +1658,35 @@ disc() { # <repo> -> subpackages|go_modules|go_halves of the extracted detect st
 }
 chk "H1 a lane's web/ package is its TS half, and a first-level one stays a root subpackage" "$(disc "$L")" \
   '["web"]|["alpha","beta"]|["alpha"]'
+chk "H11 discovery runs the ci source's scripts, so the checkout comes first" "$(fact '."gomodules-order"')" "true"
+# shellcheck disable=SC2016 # literal workflow expressions
+chk "H11 with that copy's scripts" "$(fact '."gomodules-env" | tojson')" \
+  '{"CI_TOOLS":"${{ github.workspace }}/.cplieger-ci/scripts"}'
+# shellcheck disable=SC2016 # literal workflow expressions
+chk "H11 every compute that can number the root scopes it by detect's lanes and type" \
+  "$(fact '."cliff-scopes" | join(" ")')" \
+  'detect|${{ steps.gomodules.outputs.go_modules }}|${{ steps.type.outputs.type }} detect|${{ steps.gomodules.outputs.go_modules }}|${{ steps.type.outputs.type }} renumber-ts|${{ needs.detect.outputs.go_modules }}|${{ needs.detect.outputs.type }} renumber|${{ needs.detect.outputs.go_modules }}|${{ needs.detect.outputs.type }} repair-notes|${{ needs.detect.outputs.go_modules }}|${{ needs.detect.outputs.type }}'
+root_scope() { # <repo> <disc output> <type> -> the dirs the root's version leaves out, for the lanes disc found
+  (cd "$1" && GO_LANES_JSON="$(cut -d'|' -f2 <<<"$2")" REPO_TYPE="$3" bash "$ROOT/scripts/go-modules.sh" boundaries HEAD) | tr '\n' ' '
+}
+# A path belongs to its nearest ancestor go.mod's module, so the root leaves
+# out every nested module its artifact does not ship.
+NX="$WORK/nested-excludes"
+git init -q -b main "$NX"
+commit_in "$NX" "feat: initial" go.mod='module example.com/nx' main.go=v1 \
+  alpha/go.mod='module example.com/nx/alpha' alpha/a.go=v1 \
+  alpha/internal/gen/go.mod='module example.com/nx/alpha/internal/gen' alpha/internal/gen/g.go=v1 \
+  internal/gen/go.mod='module example.com/nx/internal/gen' internal/gen/g.go=v1 \
+  tools/go.mod='module tools-ignore' tools/run.sh=v1 \
+  tools/gen/go.mod='module example.com/nx/tools/gen' tools/gen/g.go=v1 \
+  web/go.mod='module web-ignore' web/jsr.json='{"name":"@o/web","version":"0.0.0"}' \
+  node_modules/flatted/go.mod='module github.com/vendored/flatted' node_modules/flatted/f.go=v1 >/dev/null
+NXD=$(disc "$NX")
+chk "H11 a go root's lanes skip the internal and sentinel modules" "$NXD" '["web"]|["alpha","tools/gen"]|[]'
+chk "H11 and its version leaves out every nested module but the subpackage's sentinel and vendored trees" \
+  "$(root_scope "$NX" "$NXD" go)" 'alpha alpha/internal/gen internal/gen tools tools/gen '
+chk "H11 a docker root keeps a module outside every lane, its image built from the tree" \
+  "$(root_scope "$NX" "$NXD" docker)" 'alpha alpha/internal/gen tools/gen '
 mkdir -p "$L/beta/web"
 printf '{}\n' >"$L/beta/web/jsr.json"
 printf '{}\n' >"$L/beta/web/package.json"
@@ -2598,7 +2634,7 @@ git -C "$W" tag v1.1.0-dev.3 "$UF"
 UB=$(commit_in "$W" "feat!: an unbuilt break" main.go=v4)
 dev_compute() { # -> the dev version compute.sh selects at W's HEAD
   : >"$WORK/cout"
-  (cd "$W" && CHANNEL=dev EXCLUDE_PATHS='yamlenv/**' CLIFF_BIN="$CLIFF" \
+  (cd "$W" && CHANNEL=dev GO_LANES_JSON='["yamlenv"]' REPO_TYPE=go CLIFF_BIN="$CLIFF" \
     GITHUB_OUTPUT="$WORK/cout" bash "$COMPUTE") >/dev/null 2>&1 || fail "compute.sh failed in $W"
   sed -n 's/^dev_version=//p' "$WORK/cout"
 }

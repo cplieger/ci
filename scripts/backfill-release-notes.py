@@ -21,8 +21,8 @@ Scope guarantees:
       match the remote tag SHA (stale/moved tags abort before any edit).
     - The oldest release (no predecessor tag) is left untouched: bootstrap
       bodies ("Initial release") aren't regenerable from a commit range.
-    - Nested Go module lanes are excluded from these root bodies, as
-      release.yaml renders them.
+    - Nested Go modules the root does not ship are excluded from these root
+      bodies, as release.yaml renders them.
     - The system-package diff is read from the two releases' SBOM assets when
       both carry one whose Sigstore bundle verifies (cosign) as signed by this
       repository's release run at the tag's commit (or, for a repaired

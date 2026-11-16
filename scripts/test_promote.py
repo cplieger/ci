@@ -278,6 +278,36 @@ class PurityPerLane(unittest.TestCase):
         self.assertIn('(entrypoint.sh: cplieger/toolbelt v3.3.0-dev.2)', got[1])
         self.assertEqual(held, {'sub': ['sub/go.mod: github.com/cplieger/envx v2.2.0-dev.3']})
 
+    def test_a_dev_pin_in_a_nested_module_no_artifact_ships_refuses_and_holds_nothing(self):
+        dev = 'require github.com/cplieger/envx v2.2.0-dev.3\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            fx.commit(
+                'feat: init',
+                {
+                    'go.mod': GO_MOD,
+                    'main.go': 'package main\n',
+                    'internal/gen/go.mod': 'module github.com/cplieger/demo/internal/gen\n\n' + dev,
+                    'sub/go.mod': 'module github.com/cplieger/demo/sub\n',
+                    'sub/x.go': 'package sub\n',
+                    'sub/internal/gen/go.mod': 'module github.com/cplieger/demo/sub/internal/gen\n\n'
+                    + dev,
+                },
+            )
+            repo = promote.inventory.Repo(str(fx.src))
+            head = fx.g('rev-parse', 'HEAD')
+            self.assertEqual(
+                (promote.check_purity(repo, head), promote.held_lanes(repo, head)), ([], {})
+            )
+            # A docker root builds its image from the whole tree, so it ships the root-level one.
+            fx.commit('feat: image', {'Dockerfile': 'FROM scratch\n'})
+            head = fx.g('rev-parse', 'HEAD')
+            got = promote.check_purity(repo, head)
+            held = promote.held_lanes(repo, head)
+        self.assertEqual(len(got), 1, got)
+        self.assertIn('(internal/gen/go.mod: github.com/cplieger/envx v2.2.0-dev.3)', got[0])
+        self.assertEqual(held, {})
+
 
 class Reconciliation(unittest.TestCase):
     """The writer here and scripts/reconciliation.sh, the stable pipeline's reader, agree."""
@@ -1845,6 +1875,28 @@ class Preview(unittest.TestCase):
                 self.assertRaisesRegex(promote.GhError, 'printed malformed go_modules_to_release$'),
             ):
                 promote.release_plan(Path('.'), 'm', 'r', promote.Layout('go', [], []))
+
+    def test_the_root_version_is_scoped_by_the_layouts_lanes_and_type(self):
+        state = json.dumps({'.': {'h_tag': '', 'kind_note': '', 'in_range': False}})
+        seen: dict[str, str] = {}
+
+        def run_tool(clone, script, *args, **env):
+            if args == ('pending',):
+                return {'state': state, 'root_in_range': 'false', 'in_range_any': 'false'}
+            if script == promote.COMPUTE:
+                seen.update(env)
+                return {'anchor_sha': 'a' * 40, 'base': 'v0.1.0'}
+            return {'root_changed': 'false', 'subpackages_to_publish': '[]'}
+
+        with (
+            unittest.mock.patch.object(promote, 'run_tool', run_tool),
+            self.assertRaisesRegex(promote.GhError, 'printed no go_modules_to_release$'),
+        ):
+            promote.release_plan(Path('.'), 'm', 'r', promote.Layout('go', [], ['alpha']))
+        self.assertEqual(
+            (seen.get('GO_LANES_JSON'), seen.get('REPO_TYPE'), seen.get('CHANNEL')),
+            ('["alpha"]', 'go', 'stable'),
+        )
 
 
 class RestTransport(unittest.TestCase):

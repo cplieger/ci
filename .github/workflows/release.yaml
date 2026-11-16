@@ -61,7 +61,6 @@ jobs:
       repair_publishes: ${{ steps.receipts.outputs.repair_publishes }}
       repair_images: ${{ steps.receipts.outputs.repair_images }}
       security_shas: ${{ steps.receipts.outputs.security_shas }}
-      exclude_paths: ${{ steps.gomodules.outputs.exclude_paths }}
       registries: ${{ steps.policy.outputs.registries }}
       platforms: ${{ steps.policy.outputs.platforms }}
       syft_config: ${{ steps.policy.outputs.syft_config }}
@@ -157,19 +156,28 @@ jobs:
           echo "subpackages=$SUBS" >> "$GITHUB_OUTPUT"
           echo "type=$TYPE  subpackages=$SUBS"
 
+      # Every job runs the scripts and actions of the commit this workflow
+      # runs from, checked out beside the consumer's tree: a `uses:` ref to
+      # this repository would run another commit's code under the caller's pin.
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       - name: Detect nested Go modules
         id: gomodules
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
-          # Nested Go modules — a TRACKED subdirectory go.mod — each get their
+          # Nested Go modules (scripts/go-modules.sh list) each get their
           # own release lane: independent conventional-commit versioning and
           # <dir>/vX.Y.Z tags (the go-nested job below). Works for any repo
           # type; a repo without nested modules produces [] and nothing below
-          # changes behavior. Discovery prunes vendored/generated trees: a
-          # committed node_modules (e.g. subflux's embedded frontend deps) can
-          # carry upstream go.mod files that are not release lanes. git
-          # pathspec '*/go.mod' matches at any depth (git wildmatch '*'
-          # crosses slashes) but never the root go.mod.
+          # changes behavior.
           #
           # Eligibility filters (keep in sync with ci.yaml's detect step and
           # scripts/test-lane-semantics.sh, which pins them):
@@ -188,12 +196,12 @@ jobs:
           #     not a valid Go module path element and would mis-scope the
           #     glob/regex/tag machinery downstream — fail loud, not weird.
           #   - overlapping lanes (one dir an ancestor of another) are
-          #     rejected: prefix classification would assign files to a
-          #     parent lane nondeterministically.
+          #     rejected.
+          MODS=$(bash "$CI_TOOLS/go-modules.sh" list HEAD)
           LANES="[]"
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            d=$(dirname -- "$f")
+          while IFS= read -r d; do
+            [ -z "$d" ] && continue
+            f="$d/go.mod"
             case "$d" in
               *[!A-Za-z0-9._/-]*)
                 echo "::error::nested go.mod dir '$d' contains characters outside [A-Za-z0-9._/-]; not a valid Go module path element"
@@ -216,7 +224,7 @@ jobs:
               continue
             fi
             LANES=$(echo "$LANES" | jq -c --arg v "$d" '. + [$v]')
-          done < <(git ls-files '*/go.mod' | grep -Ev '(^|/)(node_modules|vendor|testdata|static|dist)/' || true)
+          done <<<"$MODS"
           # Reject overlapping lanes (ancestor/descendant pairs).
           while IFS= read -r a; do
             [ -z "$a" ] && continue
@@ -243,22 +251,8 @@ jobs:
           {
             echo "go_modules=$LANES"
             echo "go_halves=$HALVES"
-            echo "exclude_paths<<EOF"
-            echo "$LANES" | jq -r '.[] | . + "/**"'
-            echo "EOF"
           } >> "$GITHUB_OUTPUT"
           echo "nested Go module lanes: $LANES, TS halves: $HALVES"
-
-      # Every job runs the scripts and actions of the commit this workflow
-      # runs from, checked out beside the consumer's tree: a `uses:` ref to
-      # this repository would run another commit's code under the caller's pin.
-      - name: Check out the ci source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: .cplieger-ci
-          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -287,7 +281,8 @@ jobs:
         uses: ./.cplieger-ci/actions/git-cliff-version
         with:
           channel: ${{ steps.channel.outputs.channel }}
-          exclude-paths: ${{ steps.gomodules.outputs.exclude_paths }}
+          go-lanes: ${{ steps.gomodules.outputs.go_modules }}
+          repo-type: ${{ steps.type.outputs.type }}
 
       - name: Number pending promotions
         id: number
@@ -296,7 +291,8 @@ jobs:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           CLIFF_SCRIPT: ${{ steps.cliff0.outputs.script }}
           STATE: ${{ steps.pending.outputs.state }}
-          EXCLUDE_PATHS: ${{ steps.gomodules.outputs.exclude_paths }}
+          GO_LANES_JSON: ${{ steps.gomodules.outputs.go_modules }}
+          REPO_TYPE: ${{ steps.type.outputs.type }}
         run: |
           set -euo pipefail
           bash "$CI_TOOLS/release-state.sh" number
@@ -307,7 +303,8 @@ jobs:
         uses: ./.cplieger-ci/actions/git-cliff-version
         with:
           channel: ${{ steps.channel.outputs.channel }}
-          exclude-paths: ${{ steps.gomodules.outputs.exclude_paths }}
+          go-lanes: ${{ steps.gomodules.outputs.go_modules }}
+          repo-type: ${{ steps.type.outputs.type }}
           pending-version: ${{ steps.channel.outputs.channel == 'dev' && steps.number.outputs.root_version || '' }}
           pending-commit: ${{ steps.channel.outputs.channel == 'dev' && steps.pending.outputs.root_commit || '' }}
           pending-in-range: ${{ steps.pending.outputs.root_in_range || 'false' }}
@@ -641,6 +638,8 @@ jobs:
         uses: ./.cplieger-ci/actions/git-cliff-version
         with:
           lane: ${{ matrix.lane }}
+          go-lanes: ${{ needs.detect.outputs.go_modules }}
+          repo-type: ${{ needs.detect.outputs.type }}
 
       # Token-free: renders with the repository's cliff config.
       - name: Render the missing Release notes
@@ -1030,7 +1029,8 @@ jobs:
         with:
           channel: dev
           lane: ${{ matrix.lane }}
-          exclude-paths: ${{ matrix.lane == '' && needs.detect.outputs.exclude_paths || '' }}
+          go-lanes: ${{ needs.detect.outputs.go_modules }}
+          repo-type: ${{ needs.detect.outputs.type }}
           pending-version: ${{ fromJSON(needs.detect.outputs.lane_state)[matrix.key].version }}
           pending-commit: ${{ fromJSON(needs.detect.outputs.lane_state)[matrix.key].commit }}
 
@@ -1215,7 +1215,8 @@ jobs:
         uses: ./.cplieger-ci/actions/git-cliff-version
         with:
           channel: dev
-          exclude-paths: ${{ needs.detect.outputs.exclude_paths }}
+          go-lanes: ${{ needs.detect.outputs.go_modules }}
+          repo-type: ${{ needs.detect.outputs.type }}
           pending-version: ${{ fromJSON(needs.detect.outputs.lane_state)['.'].version }}
           pending-commit: ${{ fromJSON(needs.detect.outputs.lane_state)['.'].commit }}
 

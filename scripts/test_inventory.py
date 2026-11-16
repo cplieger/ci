@@ -559,18 +559,18 @@ class Surfaces(unittest.TestCase):
                 self.assertEqual(inventory.surface_kind(path), want)
 
     def test_lanes_follow_the_release_discovery_rules(self):
-        paths = [
-            'go.mod',
-            'a/go.mod',
-            'a/b/go.mod',
-            'internal/x/go.mod',
-            'node_modules/m/go.mod',
-            'bad dir/go.mod',
-        ]
-        self.assertEqual(inventory.discover_lanes(paths), ['a/b', 'a'])
-        self.assertEqual(inventory.lane_of('a/b/c.go', ['a/b', 'a']), 'a/b')
-        self.assertEqual(inventory.lane_of('a/x.go', ['a/b', 'a']), 'a')
-        self.assertEqual(inventory.lane_of('ab/x.go', ['a/b', 'a']), '.')
+        modules = ['a', 'a/b', 'internal/x', 'x/internal', 'bad dir']
+        self.assertEqual(inventory.discover_lanes(modules), ['a/b', 'a'])
+
+    def test_a_path_belongs_to_its_nearest_boundary(self):
+        lanes, found = ['a'], {'a', 'a/gen', 'b/gen'}
+        self.assertEqual(inventory.owner_of('a/x.go', lanes, found), 'a')
+        self.assertEqual(inventory.owner_of('a/gen/go.mod', lanes, found), None)
+        self.assertEqual(inventory.owner_of('a/genx/go.mod', lanes, found), 'a')
+        self.assertEqual(inventory.owner_of('ab/x.go', lanes, found), '.')
+        self.assertEqual(inventory.owner_of('b/gen/x/y.go', lanes, found), None)
+        self.assertEqual(inventory.module_of('b/gen/x/y.go', found), 'b/gen')
+        self.assertEqual(inventory.module_of('go.mod', found), '.')
 
 
 GO_MOD = """module github.com/cplieger/app
@@ -1627,9 +1627,12 @@ class NestedModule(FixtureCase):
 
     def test_lanes(self):
         lanes = {(r.file, r.lane) for r in self.fx.records('B')}
-        self.assertEqual(
-            lanes, {('go.mod', '.'), ('tools/go.mod', 'tools'), ('internal/sub/go.mod', '.')}
-        )
+        # A go root's module zip leaves internal/sub out, so no artifact ships its go.mod.
+        self.assertEqual(lanes, {('go.mod', '.'), ('tools/go.mod', 'tools')})
+
+    def test_repo_lanes_read_go_modules_list(self):
+        # internal/sub is no lane, web holds no .go file and vendor's go.mod is pruned.
+        self.assertEqual(self.fx.repo.lanes(self.fx.sha['B_vendor']), ['tools'])
 
     def test_lane_filter(self):
         self.assertEqual(
@@ -1657,6 +1660,15 @@ class NestedModule(FixtureCase):
 
     def test_dominance(self):
         self.assertEqual(self.fx.dominance('B', 'M', 'T')['verdict'], 'pass')
+
+    def test_the_roots_diff_leaves_out_a_nested_module_it_does_not_ship(self):
+        result = self.fx.diff('B', 'B_sys', '.')
+        self.assertEqual(sorted(d['file'] for d in result['direct']), ['go.mod'])
+        # A docker root builds its image from the tree, so it ships that module.
+        result = self.fx.diff('B_docker', 'B_sys_docker', '.')
+        self.assertEqual(
+            sorted(d['file'] for d in result['direct']), ['go.mod', 'internal/sub/go.mod']
+        )
 
     def test_a_requirement_that_turns_direct_is_one_line_and_no_transitive_count(self):
         self.assertEqual(
@@ -1693,6 +1705,7 @@ class NestedModule(FixtureCase):
         self.assertEqual(self.fx.dominance('B', 'M_root_bump', 'T_root_newer')['verdict'], 'pass')
 
     def test_a_slot_moved_to_a_new_surface_of_the_lane_must_dominate_there(self):
+        # On a docker root internal/other ships in the image, so it is the root's.
         result = self.fx.dominance('B_sys', 'M_sys', 'T_sys_split')
         self.assertEqual(self.failing(result), [('go.mod', 'example.com/sys')])
         self.assertEqual(
@@ -1702,6 +1715,12 @@ class NestedModule(FixtureCase):
         self.assertEqual(
             self.fx.dominance('B_sys', 'M_sys', 'T_sys_split_fresh')['verdict'], 'pass'
         )
+
+    def test_a_slot_moved_into_another_module_is_not_sought_there(self):
+        result = self.fx.dominance('B_sys', 'M_sys', 'T_sys_split_go')
+        self.assertEqual(result['verdict'], 'pass')
+        reasons = {r['identity']: r['reason'] for r in result['paths'][0]['records']}
+        self.assertEqual(reasons['example.com/sys'], 'removed on dev')
 
 
 class TypeScriptSubpackage(FixtureCase):

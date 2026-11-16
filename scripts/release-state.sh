@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Two-branch release state, one subcommand per release.yaml step: pending, publish, ahead, halves,
-# number (CLIFF_SCRIPT), receipts, receipt TAG COMMIT, readback SITE TAG [LANE], provenance and
-# complete (IMAGE@DIGEST SOURCE), hold (drop the nested lanes HEAD holds back from a stable run),
-# barrier, renumber-target, renumber-handoff, renumber (re-tag LANE_KEY's newest dev build as
-# DEV_VERSION), renumber-subpackages, half-free LANE TAG COMMIT, signing-window TAG (EXCLUDE_RE,
-# SUBPACKAGES_JSON), release-digest TAG (IMAGE), security-shas [FLOOR]. Lane keys: '.' for the
-# root, else the lane dir. pending, publish, hold, ahead, halves, number and half-free hold no token.
+# number (CLIFF_SCRIPT, GO_LANES_JSON, REPO_TYPE), receipts, receipt TAG COMMIT, readback SITE TAG
+# [LANE], provenance and complete (IMAGE@DIGEST SOURCE), hold (drop the nested lanes HEAD holds
+# back from a stable run), barrier, renumber-target, renumber-handoff, renumber (re-tag LANE_KEY's
+# newest dev build as DEV_VERSION), renumber-subpackages, half-free LANE TAG COMMIT, signing-window
+# TAG (EXCLUDE_RE, SUBPACKAGES_JSON), release-digest TAG (IMAGE), security-shas [FLOOR]. Lane keys:
+# '.' for the root, else the lane dir. pending, publish, hold, ahead, halves, number and half-free
+# hold no token.
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -359,10 +360,10 @@ cmd_number() {
   while IFS=$'\t' read -r key r; do
     [ -n "$key" ] || continue
     if [ "$key" = . ]; then
-      res=$(LANE="" EXCLUDE_PATHS="${EXCLUDE_PATHS:-}" bash "$CLIFF_SCRIPT" pending-version "$r") \
+      res=$(LANE="" bash "$CLIFF_SCRIPT" pending-version "$r") \
         || die "could not number the pending promotion ${r}: ${res}"
     else
-      res=$(LANE="" EXCLUDE_PATHS="" bash "$CLIFF_SCRIPT" pending-version "$r" "$key") \
+      res=$(LANE="" bash "$CLIFF_SCRIPT" pending-version "$r" "$key") \
         || die "could not number the pending promotion ${r} of lane ${key}: ${res}"
     fi
     v=$(tail -n1 <<<"$res")
@@ -406,7 +407,7 @@ half_changed() { # <lane> <from commit or ''> <to> [promotions] -> 0 when the ha
     done <<<"$recs"
   fi
   while read -r f t; do
-    res=$(MODE=paths FROM="$f" TO="$t" REPO_TYPE=none SUBPACKAGES_JSON="$(jq -cn --arg d "$1/web" '[$d]')" GO_LANES_JSON='[]' \
+    res=$(MODE=paths FROM="$f" TO="$t" REPO_TYPE=none SUBPACKAGES_JSON="$(jq -cn --arg d "$1/web" '[$d]')" GO_LANES_JSON="$(jq -cn --arg d "$1" '[$d]')" \
       bash "$TOOLS/path-significance.sh") || die "path significance of ${f}..${t} failed"
     subs=$(sed -n 's/^subpackages_to_publish=//p' <<<"$res")
     if in_list "subpackages_to_publish of ${f}..${t}" "$1/web" "$subs"; then

@@ -229,7 +229,7 @@ D11=$(commit "$REBUILD_SUBJECT")
 chk "S27 a commit under the rebuild subject that changes a file is no rebuild request" \
   "$(release S27f stable "$D10" "$D10" "$D11")" "false|[]|[]"
 chk "S27 and one whose files git cannot read fails the step" \
-  "$(failing_release "diff-tree --root --no-commit-id --name-only -r $D11" 1 stable "$D10" "$D10" "$D11")" "2|1"
+  "$(failing_release "-c core.quotePath=false diff-tree --root --no-commit-id --name-only -r $D11" 1 stable "$D10" "$D10" "$D11")" "2|1"
 chk_has "S27 and says so" "$(cat "$WORK/log")" "path-significance: cannot read the files commit $D11 changes"
 chk "S28 a subpackage list that is not JSON fails" "$(SUBPACKAGES_JSON='["web"' paths_rc "$D10" "$D11")" "2"
 chk_has "S28 and says so" "$(cat "$WORK/perr")" "path-significance: SUBPACKAGES_JSON must be a JSON array of dirs, got '[\"web\"'"
@@ -270,7 +270,7 @@ chk "S31 as does a rebuild request whose subject git cannot read" \
   "$(failing_paths "log -1 --format=%s $D3R" 1 "$D3S" "$D3R")" "2|1"
 chk_has "S31 and says so" "$(cat "$WORK/perr")" "::error::path-significance: cannot read the subject of commit $D3R"
 chk "S31 and one whose files git cannot read" \
-  "$(failing_paths "diff-tree --root --no-commit-id --name-only -r $D11" 1 "$D10" "$D11")" "2|1"
+  "$(failing_paths "-c core.quotePath=false diff-tree --root --no-commit-id --name-only -r $D11" 1 "$D10" "$D11")" "2|1"
 chk_has "S31 and says so" "$(cat "$WORK/perr")" "::error::path-significance: cannot read the files commit $D11 changes"
 
 # ── Docker repos whose rebuild request sits beside a change the image ignores ─
@@ -508,8 +508,9 @@ chk "S38 and MODE=paths names it" "$(paths "$E1" "$E2")" 'false|[]|["lane"]|["la
 put docs/guide.md 'v3'
 E3=$(commit "docs: the guide")
 chk "S39 an unembedded doc alone still releases nothing" "$(paths "$E2" "$E3")" 'false|[]|[]|[]'
+# The first ls-tree is the embed check's, which runs before go-modules.sh.
 chk "S40 a tree the embed check cannot read fails the run, never drops the path" \
-  "$(failing_paths 'ls-tree*' 1 "$E2" "$E3")" '2|1'
+  "$(failing_paths '*ls-tree*' 1 "$E2" "$E3")" '2|1'
 chk_has "S40 and says why" "$(cat "$WORK/perr")" "cannot read the //go:embed directives at $E3"
 # Go's embed skips a subdirectory that holds its own go.mod, so a directory
 # pattern above a nested module never names that module's files.
@@ -636,5 +637,268 @@ git tag keyenc/v1.2.7 "$N15"
 put keyenc/tools/jsr.json '{"name":"@o/tools","version":"1.0.0"}'
 N16=$(commit "chore(keyenc): tool jsr")
 chk "S46 a lane's jsr.json beside no half is dev tooling" "$(release S46c stable "$N15" "$N15" "$N16")" 'false|[]|[]'
+
+# ── A path belongs to the module of its nearest ancestor go.mod ──────────────
+# cplieger/go cut chartdata/v1.0.0-dev.2 for a change confined to
+# chartdata/internal/gen, a module of its own that chartdata's zip leaves out.
+# tools holds a dotless sentinel go.mod and tools/gen is a lane inside it.
+export REPO_TYPE=go SUBPACKAGES_JSON='[]' GO_LANES_JSON='["chartdata","tools/gen"]'
+newrepo nested
+put go.mod 'module example.com/go'
+put main.go 'package main'
+put chartdata/go.mod 'module example.com/go/chartdata'
+put chartdata/c.go 'package chartdata'
+put chartdata/internal/gen/go.mod 'module example.com/go/chartdata/internal/gen'
+put chartdata/internal/gen/gen.go 'package main'
+put internal/gen/go.mod 'module example.com/go/internal/gen'
+put internal/gen/gen.go 'package main'
+put tools/go.mod 'module tools-ignore'
+put tools/run.sh '#!/bin/sh'
+put tools/gen/go.mod 'module example.com/go/tools/gen'
+put tools/gen/g.go 'package gen'
+G0=$(commit "feat: initial")
+git tag v1.0.0 "$G0"
+put chartdata/internal/gen/go.mod 'module example.com/go/chartdata/internal/gen
+
+require example.com/wiregen v1.1.0'
+put chartdata/internal/gen/gen.go 'package main // v2'
+G1=$(commit "chore(deps): update wiregen (#248)")
+chk "S47 a change confined to a nested module inside an untagged lane releases neither the lane nor the root" \
+  "$(release S47 dev "$G0" "$G0" "$G1")" 'false|[]|[]'
+chk_has "S47 and says a nested module owns it" "$(cat "$WORK/log")" \
+  "chartdata/internal/gen/gen.go ships with no lane and not the root (a nested module owns it), so it is not significant"
+chk "S47 MODE=paths finds nothing significant" "$(paths "$G0" "$G1")" 'false|[]|[]|[]'
+git tag chartdata/v1.0.0-dev.1 "$G0"
+chk "S47 nor does it release a lane measured from its own tag" "$(release S47t dev "$G0" "$G0" "$G1")" 'false|[]|[]'
+chk_has "S47 which detect measured from that tag" "$(cat "$WORK/log")" "lane chartdata: deriving changed paths from ${G0}..HEAD"
+put chartdata/c.go 'package chartdata // v2'
+G2=$(commit "fix(chartdata): a lane change")
+chk "S48 a change in the lane itself still releases the lane" "$(release S48 dev "$G1" "$G1" "$G2")" 'false|[]|["chartdata"]'
+put chartdata/c.go 'package chartdata // v3'
+put chartdata/internal/gen/gen.go 'package main // v3'
+G3=$(commit "fix(chartdata): the lane and its nested module")
+chk "S49 a commit touching the lane and its nested module releases the lane once" \
+  "$(release S49 dev "$G2" "$G2" "$G3")" 'false|[]|["chartdata"]'
+chk "S49 MODE=paths lists only the lane's path" "$(paths "$G2" "$G3")" 'false|[]|["chartdata"]|["chartdata/c.go"]'
+git tag chartdata/v1.0.0-dev.2 "$G3"
+put internal/gen/go.mod 'module example.com/go/internal/gen
+
+require example.com/tool v1.1.0'
+put internal/gen/gen.go 'package main // v2'
+G4=$(commit "chore(deps): update tool")
+chk "S50 a change under a root-level nested module does not release a go root" \
+  "$(release S50 dev "$G3" "$G3" "$G4")" 'false|[]|[]'
+chk "S50 MODE=paths agrees" "$(paths "$G3" "$G4")" 'false|[]|[]|[]'
+put main.go 'package main // v2'
+put internal/gen/gen.go 'package main // v3'
+G5=$(commit "fix: the root beside its nested module")
+chk "S50 the root's own file beside it still releases the root" "$(paths "$G4" "$G5")" 'true|[]|[]|["main.go"]'
+put tools/gen/g.go 'package gen // v2'
+G6=$(commit "fix(tools/gen): a lane inside a sentinel module")
+chk "S51 a lane nested inside a module that is no lane still releases" \
+  "$(release S51 dev "$G5" "$G5" "$G6")" 'false|[]|["tools/gen"]'
+put tools/run.sh '#!/bin/sh # v2'
+G7=$(commit "chore(tools): the sentinel module's own file")
+chk "S51 and the outer module's own file releases nothing" "$(paths "$G6" "$G7")" 'false|[]|[]|[]'
+chk "S52 a tree go-modules.sh cannot read fails MODE=paths" "$(failing_paths '*ls-tree*' 1 "$G6" "$G7")" '2|1'
+chk_has "S52 and says why" "$(cat "$WORK/perr")" "::error::go-modules: cannot list the tree of $G6"
+chk "S52 as it fails the release step" "$(failing_release '*ls-tree*' 1 dev "$G6" "$G6" "$G7")" '2|1'
+
+# A docker or ts root builds its artifact from the whole tree, so a sentinel
+# module outside every lane is still the root's: web-terminal-kiro's image
+# builds the static-src client its static-src-ignore go.mod keeps from Go.
+export REPO_TYPE=docker SUBPACKAGES_JSON='[]' GO_LANES_JSON='[]'
+newrepo docker-sentinel
+put Dockerfile 'FROM scratch'
+put go.mod 'module example.com/app'
+put main.go 'package main'
+put static-src/go.mod 'module static-src-ignore'
+put static-src/main.ts 'export {}'
+Q0=$(commit "feat: initial")
+put static-src/main.ts 'export const x = 1'
+Q1=$(commit "feat: the client")
+chk "S53 a docker root still ships a sentinel module's tree" "$(release S53 stable "$Q0" "$Q0" "$Q1")" 'true|[]|[]'
+# A go.mod inside a TS package (a root subpackage or a lane's half) keeps Go
+# tooling out of a tree the package ships.
+export REPO_TYPE=go SUBPACKAGES_JSON='["web"]' GO_LANES_JSON='["keyenc"]'
+newrepo package-sentinel
+put go.mod 'module example.com/app'
+put main.go 'package main'
+put web/go.mod 'module web-ignore'
+put web/jsr.json '{"name":"@o/web","version":"1.0.0"}'
+put web/package.json '{"name":"@o/web","version":"1.0.0"}'
+put web/src/index.ts 'export {}'
+put keyenc/go.mod 'module example.com/app/keyenc'
+put keyenc/k.go 'package keyenc'
+put keyenc/web/go.mod 'module web-ignore'
+put keyenc/web/jsr.json '{"name":"@o/keyenc","version":"1.0.0"}'
+put keyenc/web/package.json '{"name":"@o/keyenc","version":"1.0.0"}'
+put keyenc/web/mod.ts 'export {}'
+W0=$(commit "feat: initial")
+put web/src/index.ts 'export const x = 1'
+put keyenc/web/mod.ts 'export const y = 1'
+W1=$(commit "feat: both packages")
+chk "S54 a subpackage and a lane's half ship past their sentinel go.mod" "$(release S54 dev "$W0" "$W0" "$W1")" \
+  'false|["web"]|["keyenc"]'
+put keyenc/web/mod.ts 'export const y = 2'
+W2=$(commit "fix(keyenc): the half alone")
+chk "S54 as half_changed reads the half" \
+  "$(SUBPACKAGES_JSON='["keyenc/web"]' GO_LANES_JSON='[]' REPO_TYPE=none paths "$W1" "$W2")" \
+  'false|["keyenc/web"]|[]|["keyenc/web/mod.ts"]'
+
+# A path counts for its owner in each tree of the commit that changes it: the
+# commit that carves a module out of a lane changes the lane's module zip.
+export REPO_TYPE=go SUBPACKAGES_JSON='[]' GO_LANES_JSON='["chartdata"]'
+newrepo carve-out
+put go.mod 'module example.com/go'
+put main.go 'package main'
+put chartdata/go.mod 'module example.com/go/chartdata'
+put chartdata/c.go 'package chartdata'
+put chartdata/internal/gen/gen.go 'package gen'
+put internal/gen/gen.go 'package gen'
+K0=$(commit "feat: initial")
+git tag v1.0.0 "$K0"
+put chartdata/internal/gen/go.mod 'module example.com/go/chartdata/internal/gen'
+K1=$(commit "feat(chartdata)!: move gen into its own module")
+chk "S55 carving a nested module out of an untagged lane releases the lane" \
+  "$(release S55 dev "$K0" "$K0" "$K1")" 'false|[]|["chartdata"]'
+chk "S55 MODE=paths names the new go.mod" "$(paths "$K0" "$K1")" \
+  'false|[]|["chartdata"]|["chartdata/internal/gen/go.mod"]'
+git tag chartdata/v1.0.0-dev.1 "$K0"
+chk "S55 as it does a lane measured from its own tag" "$(release S55t dev "$K0" "$K0" "$K1")" 'false|[]|["chartdata"]'
+git tag chartdata/v2.0.0-dev.1 "$K1"
+put chartdata/internal/gen/gen.go 'package gen // v2'
+K2=$(commit "chore(chartdata): regenerate")
+chk "S55 once carved out its changes release nothing" \
+  "$(release S55s dev "$K1" "$K1" "$K2")" 'false|[]|[]'
+git rm -q chartdata/internal/gen/go.mod
+K3=$(commit "feat(chartdata): fold gen back into the lane")
+chk "S55 folding it back into the lane releases the lane" "$(release S55f dev "$K2" "$K2" "$K3")" 'false|[]|["chartdata"]'
+put internal/gen/go.mod 'module example.com/go/internal/gen'
+K4=$(commit "feat!: move the root's gen into its own module")
+chk "S55 carving one out of a go root releases the root" "$(paths "$K3" "$K4")" 'true|[]|[]|["internal/gen/go.mod"]'
+put chartdata/internal/gen/gen.go 'package gen // v3'
+K5=$(commit "fix(chartdata): gen, folded back")
+chk "S55 and once folded back its files are the lane's again" "$(paths "$K4" "$K5")" \
+  'false|[]|["chartdata"]|["chartdata/internal/gen/gen.go"]'
+put chartdata/internal/wire/go.mod 'module example.com/go/chartdata/internal/wire'
+put chartdata/internal/wire/w.go 'package wire'
+K6=$(commit "feat(chartdata): a new module of its own")
+chk "S55 a new module added with its own files takes nothing from the lane" "$(paths "$K5" "$K6")" 'false|[]|[]|[]'
+git rm -q -r chartdata/internal/wire
+K7=$(commit "chore(chartdata): drop the module")
+chk "S55 nor does removing it whole" "$(paths "$K6" "$K7")" 'false|[]|[]|[]'
+
+# Ownership is read per commit, never at the range's ends: a range from a
+# stable tag older than a carve-out holds both the carve-out, which is the
+# lane's, and later commits confined to the new module, which are not.
+newrepo carve-then-nested
+put go.mod 'module example.com/go'
+put chartdata/go.mod 'module example.com/go/chartdata'
+put chartdata/c.go 'package chartdata'
+put chartdata/internal/gen/gen.go 'package gen'
+P0=$(commit "feat(chartdata): initial")
+git tag v1.0.0 "$P0"
+git tag chartdata/v1.0.0 "$P0"
+put chartdata/internal/gen/go.mod 'module example.com/go/chartdata/internal/gen'
+P1=$(commit "chore(chartdata): move gen into its own module")
+git tag chartdata/v1.1.0-dev.1 "$P1"
+put chartdata/c.go 'package chartdata // v2'
+P2=$(commit "fix(chartdata): a lane fix")
+git tag chartdata/v1.1.0-dev.2 "$P2"
+put chartdata/internal/gen/gen.go 'package gen // v2'
+P3=$(commit "feat(chartdata)!: regenerate the generator")
+chk "S57 a range spanning a carve-out ships the carve-out and the lane's fix, not the later nested change" \
+  "$(paths "$P0" "$P3")" 'false|[]|["chartdata"]|["chartdata/c.go","chartdata/internal/gen/go.mod"]'
+chk "S57 the stable run from the lane's stable tag releases the lane" "$(release S57 stable "$P0" "$P0" "$P3")" \
+  'false|[]|["chartdata"]'
+chk "S57 the dev run past the lane's last dev tag releases nothing" "$(release S57d dev "$P2" "$P2" "$P3")" 'false|[]|[]'
+git checkout -q -b side "$P1"
+put chartdata/internal/gen/gen.go 'package gen // side'
+put chartdata/c.go 'package chartdata // side'
+P4=$(commit "fix: a side branch")
+git checkout -q main
+chk "S57 a path only the range's start changed counts for its owner at either end" \
+  "$(paths "$P4" "$P1")" 'false|[]|["chartdata"]|["chartdata/c.go"]'
+
+# A go root's zip holds a lane's files until the lane's go.mod exists, so the
+# commit carving a lane out of a go root releases both; a docker root never
+# counted the lane's files.
+export REPO_TYPE=go SUBPACKAGES_JSON='[]' GO_LANES_JSON='["pkg/split"]'
+newrepo lane-carve-out
+put go.mod 'module example.com/go'
+put main.go 'package main'
+put pkg/split/s.go 'package split'
+Q0=$(commit "feat: initial")
+git tag v1.0.0 "$Q0"
+put pkg/split/go.mod 'module example.com/go/pkg/split'
+Q1=$(commit "feat!: move pkg/split into its own module")
+chk "S58 carving a lane out of a go root releases the root and the lane" "$(release S58 dev "$Q0" "$Q0" "$Q1")" \
+  'true|[]|["pkg/split"]'
+chk "S58 MODE=paths agrees" "$(paths "$Q0" "$Q1")" 'true|[]|["pkg/split"]|["pkg/split/go.mod"]'
+git tag pkg/split/v1.0.0-dev.1 "$Q1"
+git tag v2.0.0-dev.1 "$Q1"
+put pkg/split/s.go 'package split // v2'
+Q2=$(commit "fix(split): a lane change")
+chk "S58 a later lane-only change releases only the lane" "$(release S58l dev "$Q1" "$Q1" "$Q2")" 'false|[]|["pkg/split"]'
+export REPO_TYPE=docker
+newrepo docker-lane-carve-out
+put Dockerfile 'FROM scratch'
+put main.go 'package main'
+put pkg/split/s.go 'package split'
+Q3=$(commit "feat: initial")
+put pkg/split/go.mod 'module example.com/go/pkg/split'
+Q4=$(commit "feat!: move pkg/split into its own module")
+chk "S58 a docker root's carve-out releases the lane alone" "$(paths "$Q3" "$Q4")" 'false|[]|["pkg/split"]|["pkg/split/go.mod"]'
+
+# Only <lane>/web is a TS package inside a lane: a lane that is a root
+# subpackage, or sits under one, still leaves out its nested modules.
+export REPO_TYPE=go SUBPACKAGES_JSON='["ui","pkg"]' GO_LANES_JSON='["ui","pkg/lane"]'
+newrepo lane-in-package
+put go.mod 'module example.com/app'
+put main.go 'package main'
+put ui/jsr.json '{"name":"@o/ui","version":"1.0.0"}'
+put ui/go.mod 'module example.com/app/ui'
+put ui/u.go 'package ui'
+put ui/internal/gen/go.mod 'module example.com/app/ui/internal/gen'
+put ui/internal/gen/g.go 'package gen'
+put ui/web/go.mod 'module web-ignore'
+put ui/web/jsr.json '{"name":"@o/ui-web","version":"1.0.0"}'
+put pkg/jsr.json '{"name":"@o/pkg","version":"1.0.0"}'
+put pkg/lane/go.mod 'module example.com/app/pkg/lane'
+put pkg/lane/l.go 'package lane'
+put pkg/lane/internal/gen/go.mod 'module example.com/app/pkg/lane/internal/gen'
+put pkg/lane/internal/gen/g.go 'package gen'
+put pkg/web/go.mod 'module web-ignore'
+I0=$(commit "feat: initial")
+chk "S56 go-modules.sh leaves out a lane's nested module, though the lane is or sits in a TS package" \
+  "$(bash "$TOOLS/go-modules.sh" boundaries HEAD | tr '\n' ' ')" 'pkg/lane pkg/lane/internal/gen ui ui/internal/gen '
+put ui/internal/gen/g.go 'package gen // v2'
+put pkg/lane/internal/gen/g.go 'package gen // v2'
+I1=$(commit "chore: regenerate both")
+chk "S56 so a change confined to them releases no lane; the packages ship their trees" \
+  "$(release S56 dev "$I0" "$I0" "$I1")" 'false|["ui","pkg"]|[]'
+for t in ui/v1.0.0 ui/v1.0.0-dev.1 pkg/lane/v1.0.0 pkg/lane/v1.0.0-dev.1; do
+  git tag "$t" "$I0"
+done
+chk "S56 as it does for the lanes measured from their own tags" "$(release S56t dev "$I0" "$I0" "$I1")" \
+  'false|["ui","pkg"]|[]'
+chk "S56 and on stable" "$(release S56s stable "$I0" "$I0" "$I1")" 'false|["ui","pkg"]|[]'
+# git quotes a non-ASCII path name by default; go-modules.sh judges raw names.
+export REPO_TYPE=go SUBPACKAGES_JSON='[]' GO_LANES_JSON='["chartdata"]'
+newrepo non-ascii
+put go.mod 'module example.com/go'
+put main.go 'package main'
+put chartdata/go.mod 'module example.com/go/chartdata'
+put chartdata/c.go 'package chartdata'
+U0=$(commit "feat: initial")
+put café.go 'package main'
+U1=$(commit "fix: a root file with an accented name")
+chk "S57 a change confined to a non-ASCII root file releases the root" "$(paths "$U0" "$U1")" 'true|[]|[]|["café.go"]'
+put chartdata/é.go 'package chartdata'
+U2=$(commit "fix(chartdata): a lane file with an accented name")
+chk "S57 and one in a lane releases the lane" "$(paths "$U1" "$U2")" 'false|[]|["chartdata"]|["chartdata/é.go"]'
+chk "S57 as the release step reads it" "$(release S57 dev "$U1" "$U1" "$U2")" 'false|[]|["chartdata"]'
+cd "$WORK" || exit 1
 
 echo "PASS: path significance ($PASS checks)"

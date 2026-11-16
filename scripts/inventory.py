@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import posixpath
 import re
 import subprocess
@@ -25,6 +26,10 @@ import tomllib
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Collection
 
 
 class InventoryError(Exception):
@@ -358,25 +363,34 @@ def surface_kind(path: str) -> str | None:
     return 'dockerfile' if _DOCKERFILE.search(path) else None
 
 
-def discover_lanes(paths: list[str]) -> list[str]:
-    """Nested Go module lanes, by release.yaml's `Detect nested Go modules` rules."""
-    lanes = []
-    pruned = re.compile(r'(^|/)(node_modules|vendor|testdata|static|dist)/')
-    for path in paths:
-        if not path.endswith('/go.mod') or pruned.search(path):
-            continue
-        d = posixpath.dirname(path)
-        if re.search(r'[^A-Za-z0-9._/-]', d) or '/internal/' in f'/{d}/':
-            continue
-        lanes.append(d)
+def discover_lanes(modules: list[str]) -> list[str]:
+    """The lane-eligible dirs among go-modules.sh `list`'s: those with only
+    [A-Za-z0-9._/-] characters and no `internal/` segment. Repo._lane_has_go
+    owns the dotless-path and tracked-.go rules."""
+    lanes = [
+        d for d in modules if not re.search(r'[^A-Za-z0-9._/-]', d) and '/internal/' not in f'/{d}/'
+    ]
     return sorted(lanes, key=len, reverse=True)
 
 
-def lane_of(path: str, lanes: list[str]) -> str:
-    for lane in lanes:
-        if path.startswith(lane + '/'):
-            return lane
+GO_MODULES = Path(__file__).resolve().with_name('go-modules.sh')
+
+
+def module_of(path: str, boundaries: Collection[str]) -> str:
+    """The nearest ancestor dir of `path` among go-modules.sh's `boundaries`, '.' for none."""
+    d = path
+    while '/' in d:
+        d = d.rsplit('/', 1)[0]
+        if d in boundaries:
+            return d
     return '.'
+
+
+def owner_of(path: str, lanes: Collection[str], boundaries: Collection[str]) -> str | None:
+    """The lane dir or '.' whose artifact ships `path`; None when a nested module
+    that is no lane owns it, so no artifact does."""
+    module = module_of(path, boundaries)
+    return module if module == '.' or module in lanes else None
 
 
 # Every parser returns (records without lane, skeleton). The skeleton is the
@@ -894,6 +908,7 @@ class Repo:
         self._parsed: dict[tuple[str, str], tuple[list[Record], str] | None] = {}
         self._trees: dict[str, list[str]] = {}
         self._present: dict[str, set[str]] = {}
+        self._go_modules_out: dict[tuple[str, str, tuple[str, ...]], str] = {}
 
     def git(self, *args: str) -> str:
         proc = subprocess.run(
@@ -964,14 +979,52 @@ class Repo:
         return [p for p in self.paths(sha) if surface_kind(p) not in (None, 'gosum')]
 
     def lanes(self, sha: str) -> list[str]:
-        return [d for d in discover_lanes(self.paths(sha)) if self._lane_has_go(sha, d)]
+        modules = self._go_modules(sha, 'list').splitlines()
+        return [d for d in discover_lanes(modules) if self._lane_has_go(sha, d)]
+
+    def repo_type(self, sha: str) -> str:
+        """release.yaml detect's type of the root at `sha`: Dockerfile, then jsr.json, then go.mod."""
+        root = {p for p in self.paths(sha) if '/' not in p}
+        kinds = (('Dockerfile', 'docker'), ('jsr.json', 'ts'), ('go.mod', 'go'))
+        return next((kind for name, kind in kinds if name in root), 'none')
+
+    def _go_modules(self, sha: str, cmd: str, lanes: Collection[str] = ()) -> str:
+        """go-modules.sh `cmd` at `sha` for `lanes` and the root's type there, read once."""
+        key = (sha, cmd, tuple(sorted(lanes)))
+        if key not in self._go_modules_out:
+            proc = subprocess.run(
+                ['bash', str(GO_MODULES), cmd, sha],
+                cwd=self.git_dir,
+                capture_output=True,
+                text=True,
+                check=False,
+                env={
+                    **os.environ,
+                    'GO_LANES_JSON': json.dumps(list(key[2])),
+                    'REPO_TYPE': self.repo_type(sha),
+                },
+            )
+            if proc.returncode != 0:
+                raise GitReadError(f'go-modules.sh {cmd} {sha}: {proc.stderr.strip()}')
+            self._go_modules_out[key] = proc.stdout
+        return self._go_modules_out[key]
+
+    def boundaries(self, sha: str, lanes: Collection[str]) -> frozenset[str]:
+        """go-modules.sh boundaries at `sha` for `lanes` and the root's type there."""
+        return frozenset(self._go_modules(sha, 'boundaries', lanes).splitlines())
+
+    def owner(self, sha: str, lanes: Collection[str] | None = None) -> Callable[[str], str | None]:
+        """owner_of at `sha` for `lanes` (default: the lanes found there)."""
+        lanes = self.lanes(sha) if lanes is None else list(lanes)
+        found = self.boundaries(sha, lanes)
+        return lambda path: owner_of(path, lanes, found)
 
     def records(self, sha: str, lane: str | None = None) -> list[Record]:
-        lanes = self.lanes(sha)
+        owner = self.owner(sha)
         out = []
         for path in self.surfaces(sha):
-            file_lane = lane_of(path, lanes)
-            if lane is not None and file_lane != lane:
+            file_lane = owner(path)
+            if file_lane is None or (lane is not None and file_lane != lane):
                 continue
             records, _ = self.parsed(sha, path) or ([], '')
             out += [replace(r, lane=file_lane) for r in records]
@@ -1452,12 +1505,12 @@ def _judged(records: list[Record]) -> dict[tuple, list[Record]]:
 
 def _elsewhere(repo: Repo, main: str, target: str, path: str) -> dict[tuple, list[Record]]:
     """Where a slot that left `path` (a moved or split file) can still be carried:
-    the target's other surfaces of the same lane, each only for the slots it did
+    the target's other surfaces of the same module, each only for the slots it did
     not hold at main, since a surface that did is judged on its own."""
-    lanes = repo.lanes(target)
+    modules = repo.boundaries(target, repo.lanes(target))
     found: list[Record] = []
     for p in repo.surfaces(target):
-        if p == path or lane_of(p, lanes) != lane_of(path, lanes):
+        if p == path or module_of(p, modules) != module_of(path, modules):
             continue
         at_main = {r.slot for r in (repo.parsed(main, p) or ([], ''))[0]}
         found += [r for r in (repo.parsed(target, p) or ([], ''))[0] if r.slot not in at_main]

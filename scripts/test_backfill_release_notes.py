@@ -280,8 +280,10 @@ class BackfillRenderTest(unittest.TestCase):
         ):
             self.assertIn(line, out)
         argv = self.cliff_argv()
+        lane_commit = self.git('log', '-1', '--format=%H', '--grep', '^feat: lane feature')
         self.assertIn(
-            r'--tag-pattern ^v[0-9]+\.[0-9]+\.[0-9]+$ --tag v1.1.0 --exclude-path yamlenv/**', argv
+            rf'--tag-pattern ^v[0-9]+\.[0-9]+\.[0-9]+$ --tag v1.1.0 --skip-commit {lane_commit} --config',
+            argv,
         )
         self.assertIn(f'v1.0.0..{self.git("rev-parse", "v1.1.0")}', argv)
         verified = (self.tmp / 'cosign.argv').read_text()
