@@ -437,7 +437,7 @@ jobs:
           set -euo pipefail
           # GitHub gives a pull request from a fork no id token.
           if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-            echo "::warning::this run has no id token, as on a pull request from a fork, so its measured file is not signed; push the head to a branch of the repository to measure it there"
+            echo "::warning::this run has no id token, as on a pull request from a fork, so its measured file is not signed. Push the head to a branch of the repository to measure it there"
             exit 0
           fi
           . "$CI_TOOLS/retry.sh"

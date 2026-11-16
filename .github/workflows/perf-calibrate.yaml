@@ -111,7 +111,9 @@ jobs:
       - name: Check out the ci source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: ci
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
           persist-credentials: false
 
       - name: Setup Python
@@ -133,6 +135,7 @@ jobs:
 
       - name: Propose and sign
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           REPO: ${{ needs.check.outputs.repository }}
           COMMIT: ${{ needs.measure.outputs.sha }}
           PREFIX: ${{ needs.measure.outputs.prefix }}
@@ -144,14 +147,14 @@ jobs:
           mkdir -p "$out"
           defaults=()
           [ -f measured/tests/perf/budgets.json ] && defaults=(--budgets measured/tests/perf/budgets.json)
-          python3 ci/scripts/perf_gate.py --calibrate "$RUNNER_TEMP/artifacts" --prefix "$PREFIX" --runs 10 "${defaults[@]}" \
+          python3 "$CI_TOOLS/perf_gate.py" --calibrate "$RUNNER_TEMP/artifacts" --prefix "$PREFIX" --runs 10 "${defaults[@]}" \
             --plan-doc measured/tests/perf/plan.json \
             --out "$out/budgets.proposed.json" --repo "$REPO" --commit "$COMMIT" \
             --runner ubuntu-26.04 --run-id "$RUN_ID" --run-url "$RUN_URL"
           # The names tests/perf/sources/ holds, so the file is checked in as
           # downloaded and its bundle verifies against those exact bytes.
           cp "$out/budgets.proposed.json" "$out/${RUN_ID}.json"
-          . ci/scripts/retry.sh
+          . "$CI_TOOLS/retry.sh"
           retry cosign sign-blob --yes "$out/${RUN_ID}.json" --bundle "$out/${RUN_ID}.sigstore.json"
           python3 - "$out/budgets.proposed.json" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
           import json, sys
@@ -197,7 +200,9 @@ jobs:
       - name: Check out the ci source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: ci
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
           persist-credentials: false
 
       - name: Setup Python
@@ -226,7 +231,7 @@ jobs:
       - name: Check in the calibration
         working-directory: repo
         env:
-          CI_TOOLS: ${{ github.workspace }}/ci/scripts
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           REPO: ${{ needs.check.outputs.repository }}

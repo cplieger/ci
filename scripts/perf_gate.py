@@ -1706,7 +1706,9 @@ def calibration_source(cal: dict, budgets: dict, repo: str) -> Source:
             raise ValueError(f'the calibration: {field} is {cal.get(field)!r}, not {want!r}')
     runs = cal.get('runs')
     if not (is_number(runs) and runs >= TIER_RUNS):
-        raise ValueError(f'the calibration has {runs!r} runs; a calibration needs {TIER_RUNS} runs')
+        raise ValueError(
+            f'the calibration has {runs!r} runs, and a calibration needs {TIER_RUNS} runs'
+        )
     src = parse_source(cal.get('run_url'))
     if src is None or src.kind != 'calibration' or src.run_id != str(cal.get('run_id')):
         raise ValueError(
@@ -2004,7 +2006,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         '--plan-doc',
         help='plan.json: fail a gated or exact entry neither the pr nor the full set lists, '
-        'or that --set and --only list and no shard measured; --calibrate reads its '
+        'or that --set and --only list and no shard measured. --calibrate reads its '
         '`reported` patterns',
     )
     p.add_argument('--only', default='', help='comma or space separated scenarios to keep')
@@ -2026,7 +2028,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument('--sources', help='tests/perf/sources, the signed files entries come from')
     p.add_argument(
         '--accepted',
-        help='tests/perf/accepted, the gated cells slower on purpose; unset accepts none',
+        help='tests/perf/accepted, the gated cells slower on purpose. Unset accepts none',
     )
     p.add_argument('--repo', help='owner/name of the measured repository')
     p.add_argument('--head', help='the commit the gate checks out: the merge ref of a pull request')
@@ -2065,8 +2067,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         '--cells',
         action='append',
-        help='--take: a glob on the cell text (scenario/scale/engine/width/window/metric); '
-        'repeatable, every cell when unset',
+        help='--take: a glob on the cell text (scenario/scale/engine/width/window/metric), '
+        'repeatable, and every cell when unset',
     )
     p.add_argument('--pr-body', help='--check-in: where the pull request body is written')
     a = p.parse_args(argv)
