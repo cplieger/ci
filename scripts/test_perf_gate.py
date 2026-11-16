@@ -436,6 +436,181 @@ class Verdict(unittest.TestCase):
         self.assertEqual(perf_gate.verdict(b, results(first), results(again)).failures, [])
 
 
+def accepted(budget=1700.0, reason='a slower parse on purpose', file='slow.json', **kw):
+    """compare's view of one accepted slowdown, {key: {budget, reason, file}}."""
+    return {keyof({**entry(), **kw}): {'budget': budget, 'reason': reason, 'file': file}}
+
+
+def decision(accepted_cells=None, stale=(), extend=()):
+    """compare's remeasure.json as the verdict reads it."""
+    return {
+        'cells': [],
+        'stale': [perf_gate.key_dict(k) for k in stale],
+        'extend': list(extend),
+        'accepted': [{**perf_gate.key_dict(k), **a} for k, a in (accepted_cells or {}).items()],
+    }
+
+
+class Accepted(unittest.TestCase):
+    """A gated cell slower on purpose, judged against the budget its accepted file gives."""
+
+    def test_the_one_seam_judging_a_time_gives_the_larger_accepted_budget(self):
+        e, c = entry(budget=1500.0), cell()
+        self.assertEqual(perf_gate.gated_budget(e, c, {}), (1500.0, None))
+        a = accepted()
+        self.assertEqual(perf_gate.gated_budget(e, c, a), (1700.0, a[keyof(e)]))
+        self.assertEqual(perf_gate.gated_budget(e, c, accepted(1400.0)), (1500.0, None))
+
+    def test_an_accepted_slowdown_passes_with_its_note(self):
+        b = budgets([entry(budget=1500.0)])
+        out = perf_gate.compare(b, results([cell(reps=(1600.0,) * 3)]), accepted=accepted())
+        self.assertEqual((out.failures, out.remeasure), ([], []))
+        self.assertEqual(len(out.slower), 1)
+        text = perf_gate.summary(b, out)
+        self.assertIn('### Slower on purpose', text)
+        self.assertIn(f'| {CPU} | 1500.0 | 1700.0 | 1600.0 | a slower parse on purpose |', text)
+        self.assertIn('slow.json', text)
+        six = perf_gate.verdict(
+            b,
+            results([cell(reps=(1800.0,) * 3)]),
+            results([cell(reps=(1600.0,) * 3)]),
+            decision(accepted()),
+        )
+        self.assertEqual(six.failures, [])
+        self.assertIn('### Slower on purpose', perf_gate.summary(b, six))
+
+    def test_a_timing_regression_still_fails(self):
+        b = budgets([entry(budget=1500.0)])
+        first = results([cell(reps=(1600.0, 1600.0, 1400.0))])
+        again = results([cell(reps=(1600.0, 1550.0, 1600.0))])
+        for name, d in (
+            ('no accepted file', decision()),
+            ('an accepted file of another cell', decision(accepted(window='live'))),
+        ):
+            with self.subTest(name):
+                out = perf_gate.verdict(b, first, again, d)
+                self.assertEqual(len(out.failures), 1, out.failures)
+                self.assertIn('median of six 1600.0 is over its budget 1500.0', out.failures[0])
+        over = perf_gate.verdict(
+            b,
+            results([cell(reps=(1800.0,) * 3)]),
+            results([cell(reps=(1800.0,) * 3)]),
+            decision(accepted()),
+        )
+        self.assertEqual(len(over.failures), 1, over.failures)
+        self.assertIn('over its budget 1700.0', over.failures[0])
+
+    def test_an_accepted_budget_at_or_under_the_entrys_is_an_unused_notice(self):
+        b = budgets([entry(budget=1500.0)])
+        out = perf_gate.compare(b, results([cell()]), accepted=accepted(1500.0))
+        self.assertEqual((out.failures, out.slower), ([], []))
+        self.assertEqual(len(out.notices), 1, out.notices)
+        self.assertIn('slow.json', out.notices[0])
+        self.assertIn('changes nothing', out.notices[0])
+
+
+class Record(unittest.TestCase):
+    """The exact counts a verdict measured off their budgets, for the measured file."""
+
+    def recorded(self, out):
+        return [(keyof(r['cell']), r['value'], r['reps']) for r in out.recorded]
+
+    def test_a_moved_count_is_recorded_with_its_six_reps_and_fails(self):
+        b = budgets([entry('dom', 'exact', 640)])
+        first = results([cell('dom', (641,) * 3, kind='count')])
+        out = perf_gate.verdict(b, first, results([cell('dom', (641,) * 3, kind='count')]))
+        self.assertEqual(self.recorded(out), [(keyof(entry('dom')), 641, [641] * 6)])
+        self.assertEqual(len(out.failures), 1, out.failures)
+        text = perf_gate.summary(b, out)
+        self.assertIn('### Measured moves to check in', text)
+        self.assertIn(f'| {DOM} | 640 | 641 | 641, 641, 641, 641, 641, 641 |', text)
+        self.assertIn('perf_gate.py --take', text)
+
+    def test_an_unmoved_or_noisy_count_is_not_recorded(self):
+        b = budgets([entry('dom', 'exact', 640), entry('reads', 'exact', 2)])
+        first = results(
+            [cell('dom', (641, 641, 640), kind='count'), cell('reads', (1, 1, 3), kind='count')]
+        )
+        again = results(
+            [cell('dom', (640,) * 3, kind='count'), cell('reads', (3, 3, 1), kind='count')]
+        )
+        out = perf_gate.verdict(b, first, again)
+        self.assertEqual(out.recorded, [])
+        self.assertEqual(len(out.failures), 1, out.failures)
+        self.assertIn('reads', out.failures[0])
+
+    def test_a_stale_key_is_recorded_though_it_equals_its_budget(self):
+        b = budgets([entry('dom', 'exact', 640)])
+        first = results([cell('dom', (640, 640, 641), kind='count')])
+        out = perf_gate.verdict(b, first, results([]), decision(stale=[keyof(entry('dom'))]))
+        self.assertEqual(self.recorded(out), [(keyof(entry('dom')), 640, [640, 640, 641])])
+        self.assertEqual(len(out.failures), 1, out.failures)
+        self.assertIn('check in the measured file this run wrote', out.failures[0])
+
+    def test_an_extension_cell_is_judged_on_its_three_reps_and_its_times_are_reported(self):
+        x1 = {'scale': 'x1'}
+        b = budgets(
+            [
+                {**entry('dom', 'exact', 640), **x1},
+                {**entry('reads', 'exact', 2), **x1},
+                {**entry(budget=1500.0), **x1},
+            ]
+        )
+        d = decision(extend=[unit('files', 60, scale='x1')])
+        again = results(
+            [
+                {**cell('dom', (641, 640, 641), kind='count'), **x1},
+                {**cell('reads', (3, 2, 2), kind='count'), **x1},
+                {**cell(reps=(9000.0,) * 3), **x1},
+            ]
+        )
+        out = perf_gate.verdict(b, results([]), again, d)
+        x1_dom = keyof({**entry('dom'), **x1})
+        self.assertEqual(self.recorded(out), [(x1_dom, 641, [641, 640, 641])])
+        self.assertEqual(len(out.failures), 1, out.failures)
+        self.assertTrue(out.failures[0].startswith('files/x1/chromium/desktop/cold/dom:'))
+        self.assertEqual([keyof(c) for c in out.reported], [keyof({**entry(), **x1})])
+        missing = perf_gate.verdict(b, results([]), results(again['cells'][1:]), d)
+        self.assertIn(
+            'files/x1/chromium/desktop/cold/dom: an exact entry of the extension that no shard '
+            'measured',
+            missing.failures,
+        )
+        # A cell of a unit the extension does not list is no extension cell.
+        self.assertEqual(perf_gate.verdict(b, results([]), again, decision()).failures, [])
+
+    def test_merge_keeps_the_cpu_model_of_each_cells_shard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for i, model in enumerate(('AMD EPYC 7763', 'Intel Xeon 8370C')):
+                p = pathlib.Path(tmp) / f'{i}.json'
+                doc = {**results([{**cell(), 'scale': f'x{i}'}]), 'cpu_model': model}
+                p.write_text(json.dumps(doc))
+                paths.append(p)
+            merged = perf_gate.merge(paths)
+        self.assertEqual(
+            [c['cpu_model'] for c in merged['cells']], ['AMD EPYC 7763', 'Intel Xeon 8370C']
+        )
+
+
+class Extension(unittest.TestCase):
+    def test_a_scenario_extends_to_the_full_units_its_set_does_not_cover(self):
+        units = perf_gate.planned_windows(PLAN['sets']['pr']['cells'])
+        self.assertEqual(
+            perf_gate.extension(PLAN, units, {'files'}), [unit('files', 60, scale='x1')]
+        )
+        self.assertEqual(perf_gate.extension(PLAN, units, set()), [])
+        cold = perf_gate.planned_windows([unit('files', 80, windows=['cold'])])
+        self.assertEqual(
+            perf_gate.extension(PLAN, cold, {'files'}),
+            [unit('files', 80), unit('files', 60, scale='x1')],
+        )
+        full = perf_gate.planned_windows(PLAN['sets']['full']['cells'])
+        self.assertEqual(perf_gate.extension(PLAN, full, {'files'}), [])
+        with self.assertRaisesRegex(TypeError, 'no full set'):
+            perf_gate.extension({'sets': {'pr': PLAN['sets']['pr']}}, units, {'files'})
+
+
 # Count cells of marotte's calibrations 43591500420 and 43598120088 that every
 # rep of the other runs agreed on, as one held-out run and the next run
 # measured them: (cell, the agreed count, its reps, the re-measure's reps).
@@ -669,6 +844,10 @@ class Provenance(unittest.TestCase):
         self.signed_by = {}
         self.git = FakeGit()
         self.stale = set()
+        accepted = tempfile.TemporaryDirectory()
+        self.addCleanup(accepted.cleanup)
+        self.accepted = pathlib.Path(accepted.name)
+        self.checked = None
 
     def write(self, stem, doc):
         if '-' not in stem:
@@ -685,17 +864,141 @@ class Provenance(unittest.TestCase):
         return None if made == signer else f'no matching CertificateIdentity for {made}'
 
     def check(self, head, base, base_sha=HEAD, verify=None):
-        errors, self.stale = perf_gate.check_provenance(
+        self.checked = perf_gate.check_provenance(
             head,
             base,
             sources=self.dir,
+            accepted=self.accepted,
             repo=REPO,
             head_sha=HEAD,
             base_sha=base_sha,
             verify=verify or self.verify,
             git=self.git,
         )
-        return errors
+        self.stale = self.checked.stale
+        return self.checked.errors
+
+    def accept(self, name, cells, reason='a slower parse on purpose'):
+        """An accepted file, added after the calibrations of HEAD the tests check in."""
+        self.git.added.setdefault(name, 'ovr')
+        (self.accepted / name).write_text(json.dumps({'reason': reason, 'cells': cells}))
+
+    def test_an_accepted_slowdown_is_read_with_its_reason_and_file(self):
+        self.write('111', calibration_file([cal_cell()]))
+        self.accept('slow.json', [{**CELL, 'metric': 'cpu_ms', 'budget': 1700.0}])
+        self.assertEqual(self.unchanged(entry()), [])
+        self.assertEqual(
+            self.checked.accepted,
+            {
+                keyof(entry()): {
+                    'budget': 1700.0,
+                    'reason': 'a slower parse on purpose',
+                    'file': 'slow.json',
+                }
+            },
+        )
+
+    def test_an_accepted_file_names_gated_entries_once_with_one_reason_line(self):
+        dom_cell = cal_cell('dom', 640.0, 'exact', kind='count')
+        self.write('111', calibration_file([cal_cell(), dom_cell]))
+        dom = {**CELL, 'metric': 'dom', 'budget': 700}
+        cpu = {**CELL, 'metric': 'cpu_ms', 'budget': 1700.0}
+        exact = entry('dom', 'exact', 640.0)
+        cases = {
+            'an exact entry': ({'a.json': ([dom], 'x')}, 'has no gated entry'),
+            'no entry': ({'a.json': ([{**cpu, 'window': 'live'}], 'x')}, 'has no gated entry'),
+            'two files': ({'a.json': ([cpu], 'x'), 'b.json': ([cpu], 'y')}, 'also accepted by'),
+            'a blank reason': ({'a.json': ([cpu], ' ')}, 'reason'),
+            'two reason lines': ({'a.json': ([cpu], 'one\ntwo')}, 'reason'),
+            'no cells': ({'a.json': ([], 'x')}, 'cells'),
+            'a budget of 0': ({'a.json': ([{**cpu, 'budget': 0}], 'x')}, 'budget'),
+            'an unknown cell field': ({'a.json': ([{**cpu, 'tier': 'gated'}], 'x')}, 'tier'),
+            'no json name': ({'a.txt': ([cpu], 'x')}, 'not an accepted file'),
+        }
+        for name, (files, want) in cases.items():
+            with self.subTest(name):
+                for p in self.accepted.iterdir():
+                    p.unlink()
+                for file, (cells, reason) in files.items():
+                    self.accept(file, cells, reason)
+                errors = self.unchanged(entry(), {**exact, 'source': RUN_URL + '111'})
+                self.assertEqual(len(errors), 1, errors)
+                self.assertTrue(errors[0].startswith('accepted/'), errors)
+                self.assertIn(want, errors[0])
+        (self.accepted / 'a.json').write_text('[]')
+        self.assertIn('must be a JSON object', ' '.join(self.unchanged(entry())))
+
+    def test_an_accepted_slowdown_expires_when_a_calibration_holding_it_measured_the_cell(self):
+        self.git.added = {'slow.json': 'ovr'}
+        self.git.lineage = {('ovr', HEAD), ('0ld', HEAD), ('0ld', 'ovr')}
+        self.write('111', calibration_file([cal_cell()], commit='0ld'))
+        self.accept('slow.json', [{**CELL, 'metric': 'cpu_ms', 'budget': 1700.0}])
+        self.assertEqual(self.unchanged(entry()), [])
+        # The scheduled dev calibration after the pull request merged.
+        for p in self.dir.iterdir():
+            p.unlink()
+        self.git.lineage |= {('ovr', 'new'), ('new', HEAD), ('0ld', 'new')}
+        self.write('222', calibration_file([cal_cell()], commit='new'))
+        errors = self.unchanged(entry(source=RUN_URL + '222'))
+        self.assertEqual(
+            errors,
+            [
+                (
+                    f'accepted/slow.json: {CPU}: calibration 222 measured this cell at new, '
+                    'which holds the override; delete accepted/slow.json'
+                )
+            ],
+        )
+        self.assertEqual(self.checked.accepted, {})
+
+    def test_the_moved_exact_counts_list_each_change_with_its_reason_and_check(self):
+        self.pr_measured(m_cell(2056))
+        self.check(budgets([self.moved(2056)]), self.moved_from())
+        self.assertEqual(
+            self.checked.moves,
+            [
+                {
+                    'key': keyof(entry('dom')),
+                    'base': 2055.0,
+                    'head': 2056,
+                    'source': f'{MEASURED_URL}900/attempts/1',
+                    'reason': 'one more node in the view',
+                    'refused': [],
+                }
+            ],
+        )
+        self.check(budgets([self.moved(2057)]), self.moved_from())
+        (move,) = self.checked.moves
+        self.assertEqual(move['head'], 2057)
+        self.assertIn('is not what run', move['refused'][0])
+        text = perf_gate.summary(budgets([]), perf_gate.Outcome(exact_moves=self.checked.moves))
+        self.assertIn('### Exact counts this pull request moves', text)
+        self.assertIn(f'| {DOM} | 2055.0 | 2057 |', text)
+        self.assertIn('one more node in the view', text)
+        self.assertIn('take the value with perf_gate.py --take', text)
+
+    def test_a_recorded_verdict_is_a_measured_file_the_gate_accepts(self):
+        b = budgets([entry('dom', 'exact', 2055.0)])
+        out = perf_gate.verdict(
+            b,
+            results([cell('dom', (2056,) * 3, kind='count')]),
+            results([cell('dom', (2056,) * 3, kind='count')]),
+        )
+        doc = perf_gate.record(
+            out,
+            repo=REPO,
+            commit='pr-head',
+            measured_sha='merge',
+            run_id='900',
+            run_attempt='1',
+            run_url=f'{MEASURED_URL}900/attempts/1',
+            workflow_repository=REPO,
+            cpu_models=['AMD EPYC 7763'],
+        )
+        self.assertEqual(doc, measured_file([m_cell(2056)]))
+        self.git.lineage.add(('pr-head', HEAD))
+        self.write('900-1', doc)
+        self.assertEqual(self.check(budgets([self.moved(2056)]), self.moved_from()), [])
 
     def dom(self, run_id, baseline, commit, *more):
         exact = {'metric': 'dom', 'kind': 'count', 'tier': 'exact'}
@@ -1524,12 +1827,52 @@ class GitHistory(unittest.TestCase):
             head,
             budgets([entry('dom', 'exact', 2055, source=RUN_URL + '100')]),
             sources=pathlib.Path('tests/perf/sources'),
+            accepted=pathlib.Path('tests/perf/accepted'),
             repo=REPO,
             head_sha=head_sha,
             base_sha=self.sh('rev-parse', 'main'),
             verify=lambda blob, bundle, signer: None,
             git=git,
         )
+
+    def test_an_accepted_slowdown_expires_at_the_first_calibration_of_a_commit_holding_it(self):
+        git = self.git()
+        slow = {'reason': 'a slower parse', 'cells': [{**CELL, 'metric': 'cpu_ms', 'budget': 1700}]}
+        self.put('tests/perf/accepted/slow.json', slow)
+        merged = self.commit('accept a slowdown')
+        self.put('other.txt', 'dev')
+        later = self.commit('dev moved')
+        for run_id, measured, errors in (
+            ('300', self.base, 0),
+            ('301', merged, 1),
+            ('302', later, 1),
+        ):
+            with self.subTest(measured=measured):
+                self.sh('rm', '-q', '-r', '--ignore-unmatch', 'tests/perf/sources')
+                doc = calibration_file(
+                    [cal_cell()], commit=measured, run_id=run_id, run_url=RUN_URL + run_id
+                )
+                self.put(f'tests/perf/sources/{run_id}.json', doc)
+                self.put(f'tests/perf/sources/{run_id}.sigstore.json', '{}')
+                head = self.commit(f'check in {run_id}')
+                b = budgets([entry(source=RUN_URL + run_id)])
+                found = perf_gate.check_provenance(
+                    b,
+                    b,
+                    sources=pathlib.Path('tests/perf/sources'),
+                    accepted=pathlib.Path('tests/perf/accepted'),
+                    repo=REPO,
+                    head_sha=head,
+                    base_sha=head,
+                    verify=lambda blob, bundle, signer: None,
+                    git=git,
+                )
+                self.assertEqual(len(found.errors), errors, found.errors)
+                if errors:
+                    self.assertIn(f'calibration {run_id} measured this cell at', found.errors[0])
+                    self.assertIn('delete accepted/slow.json', found.errors[0])
+                else:
+                    self.assertEqual(next(iter(found.accepted.values()))['file'], 'slow.json')
 
     def test_a_measured_file_of_the_head_before_a_dev_merge_near_the_change_is_retaken(self):
         git = self.git()
@@ -1543,7 +1886,8 @@ class GitHistory(unittest.TestCase):
         self.sh('checkout', '-q', 'pr')
         self.sh('merge', '-q', '--no-edit', 'main')
         merged = self.sh('rev-parse', 'HEAD')
-        errors, stale = self.provenance(git, '900-1', self.merge_ref())
+        found = self.provenance(git, '900-1', self.merge_ref())
+        errors, stale = found.errors, found.stale
         self.assertEqual(len(errors), 1, errors)
         self.assertTrue(errors[0].startswith('measured file 900-1: '), errors)
         self.assertIn(f'than measured {self.tip} made', errors[0])
@@ -1555,7 +1899,8 @@ class GitHistory(unittest.TestCase):
         )
         self.measured(merged, '901-1')
         self.commit('take the new head measured file')
-        self.assertEqual(self.provenance(git, '901-1', self.merge_ref()), ([], set()))
+        found = self.provenance(git, '901-1', self.merge_ref())
+        self.assertEqual((found.errors, found.stale), ([], set()))
 
     def test_git_errors_raise_and_a_short_sha_is_refused(self):
         git = self.git()
@@ -1740,6 +2085,32 @@ class Plan(unittest.TestCase):
 
     def test_an_empty_remeasure_plans_nothing(self):
         self.assertEqual(perf_gate.plan(PLAN, 'pr', remeasure={'cells': []})['include'], [])
+
+    def test_a_remeasure_adds_the_extension_s_full_units_over_a_unit_they_cover(self):
+        cold = {
+            **PLAN,
+            'sets': {
+                **PLAN['sets'],
+                'pr': {
+                    'shards': 2,
+                    'cells': [unit('files', 25, windows=['cold']), unit('docs', 75)],
+                },
+            },
+        }
+        red = {**CELL, 'metric': 'cpu_ms'}
+        extend = [unit('files', 80), unit('files', 60, scale='x1')]
+        matrix = perf_gate.plan(cold, 'pr', remeasure={'cells': [red], 'extend': extend})
+        planned = sorted(
+            (c['scale'], c.get('windows'), c['seconds'])
+            for job in matrix['include']
+            for c in job['cells']
+        )
+        self.assertEqual(planned, [('x1', None, 60), ('x10', None, 80)])
+        bad = {'cells': [], 'extend': [unit('files', 0)]}
+        with self.assertRaisesRegex(
+            ValueError, 'extend: files/x10/chromium/desktop needs its seconds'
+        ):
+            perf_gate.plan(cold, 'pr', remeasure=bad)
 
     def test_a_plan_that_breaks_its_shape_fails(self):
         cases = {
@@ -1990,7 +2361,16 @@ class Cli(unittest.TestCase):
         return rc
 
     def compare(
-        self, cells, *extra, other=None, entries=(), listed=True, plan=PLAN, shard=None, **doc
+        self,
+        cells,
+        *extra,
+        other=None,
+        entries=(),
+        listed=True,
+        plan=PLAN,
+        shard=None,
+        git=FakeGit,
+        **doc,
     ):
         own = [entry(source=RUN_URL + '100'), entry('dom', 'exact', 640)] if listed else []
         b = self.put('budgets.json', budgets([*own, *entries], **doc))
@@ -2005,7 +2385,7 @@ class Cli(unittest.TestCase):
             self.put(f'sources/{run_id}.json', calibration_file([*held, c], run_id=run_id))
             self.put(f'sources/{run_id}.sigstore.json', {})
         for patch in (
-            unittest.mock.patch.object(perf_gate, 'Git', FakeGit),
+            unittest.mock.patch.object(perf_gate, 'Git', git),
             unittest.mock.patch.object(perf_gate, 'cosign_verify', return_value=None),
         ):
             patch.start()
@@ -2056,6 +2436,19 @@ class Cli(unittest.TestCase):
                 )
                 self.assertEqual(self.main('--verdict', str(self.dir / 'again'), *argv), rc)
 
+    def test_verdict_judges_against_the_slowdowns_compare_accepted(self):
+        b = self.put('budgets.json', budgets([entry(budget=1500.0)]))
+        first = 'results/perf-results-cplieger-a-measure-shard-1-of-1-attempt-1/results.json'
+        self.put(first, results([cell(reps=(1600.0,) * 3)]))
+        again = 'again/perf-results-cplieger-a-remeasure-shard-1-of-1-attempt-1/results.json'
+        self.put(again, results([cell(reps=(1600.0,) * 3)]))
+        argv = ('--verdict', str(self.dir / 'again'), '--budgets', b, '--prefix', 'cplieger-a')
+        argv += ('--results', str(self.dir / 'results'), '--remeasure-attempt', '1')
+        self.assertEqual(self.main(*argv), 1)
+        decided = self.put('remeasure.json', decision(accepted()))
+        self.assertEqual(self.main(*argv, '--remeasure', decided), 0, self.output)
+        self.assertIn('Slower on purpose', self.output)
+
     def test_compare_lists_the_exact_keys_a_fresh_measured_file_would_cure(self):
         url = MEASURED_URL + '900/attempts/1'
         moved = {**entry('dom', 'exact', 2056, source=url, reason='one more node'), 'scale': 'x1'}
@@ -2069,6 +2462,29 @@ class Cli(unittest.TestCase):
         remeasure = json.loads((self.dir / 'remeasure.json').read_text())
         self.assertEqual(remeasure['stale'], [perf_gate.key_dict(keyof(moved))])
         self.assertEqual(remeasure['cells'], [])
+        self.assertEqual(remeasure['extend'], [unit('files', 60, scale='x1')])
+        self.assertEqual(remeasure['accepted'], [])
+
+    def test_compare_judges_an_accepted_slowdown_and_hands_it_to_the_verdict(self):
+        class Git(FakeGit):
+            def __init__(self):
+                super().__init__()
+                self.added = {'slow.json': 'ovr'}
+
+        slow = {
+            'reason': 'a slower parse on purpose',
+            'cells': [{**CELL, 'metric': 'cpu_ms', 'budget': 1700.0}],
+        }
+        self.put('accepted/slow.json', slow)
+        measured = [cell(reps=(1600.0,) * 3), cell('dom', (640,) * 3, kind='count')]
+        argv = ('--accepted', str(self.dir / 'accepted'))
+        self.assertEqual(self.compare(measured, *argv, git=Git), 0, self.output)
+        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
+        self.assertEqual(remeasure['cells'], [])
+        self.assertEqual(remeasure['accepted'], decision(accepted())['accepted'])
+        self.assertIn('Slower on purpose', self.output)
+        self.assertEqual(self.compare(measured, *argv), 1)
+        self.assertIn('delete accepted/slow.json', self.output)
 
     def test_compare_fails_on_a_listed_cell_no_shard_measured(self):
         self.assertEqual(self.compare([cell()]), 1)
