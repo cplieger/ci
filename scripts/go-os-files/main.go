@@ -2,8 +2,10 @@
 // to the working directory, and prints "<goos>\t<module dir>\t<path>" for each
 // leg OS, darwin or windows, that builds the file at a GOARCH, amd64 or arm64,
 // where linux, darwin or windows excludes it. go/build decides each with the
-// module's Go release tags and the target's own tool tags. It exits 1 when
-// go/build cannot read a file or the module's go.mod.
+// module's Go release tags and the target's tool tags, under each cgo and race
+// setting the leg compiles with; a module on another Go minor than this binary's
+// is also judged with every experiment off. It exits 1 when go/build cannot read
+// a file or the module's go.mod.
 package main
 
 import (
@@ -15,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -26,6 +29,9 @@ var (
 	runnerOSes = []string{"linux", "darwin", "windows"}
 	legs       = []string{"darwin", "windows"}
 )
+
+// go-os-ci.yaml's Vet and Test (race) compile with cgo, its Cross-vet without.
+var variants = []variant{{cgo: true}, {cgo: true, race: true}, {}}
 
 const toolTagsFlag = "-print-tool-tags"
 
@@ -39,9 +45,16 @@ var (
 
 type target struct{ goos, goarch string }
 
+type variant struct{ cgo, race, noExperiments bool }
+
+type module struct {
+	releaseTags []string
+	skewed      bool
+}
+
 type matcher struct {
-	toolTags    map[target][]string
-	releaseTags map[string][]string
+	toolTags map[target][]string
+	modules  map[string]module
 }
 
 func main() {
@@ -86,7 +99,7 @@ func newMatcher(ctx context.Context) (*matcher, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &matcher{toolTags: map[target][]string{}, releaseTags: map[string][]string{}}
+	m := &matcher{toolTags: map[target][]string{}, modules: map[string]module{}}
 	for _, goos := range runnerOSes {
 		for _, goarch := range goarches {
 			tags, err := toolTags(ctx, self, goos, goarch)
@@ -121,13 +134,13 @@ func toolTags(ctx context.Context, self, goos, goarch string) ([]string, error) 
 	return strings.Fields(string(out)), nil
 }
 
-func (m *matcher) moduleReleaseTags(mod string) ([]string, error) {
-	if tags, ok := m.releaseTags[mod]; ok {
-		return tags, nil
+func (m *matcher) module(mod string) (module, error) {
+	if info, ok := m.modules[mod]; ok {
+		return info, nil
 	}
 	data, err := os.ReadFile(filepath.Join(mod, "go.mod"))
 	if err != nil {
-		return nil, err
+		return module{}, err
 	}
 	version := ""
 	if v := toolchainLine.FindSubmatch(data); v != nil {
@@ -141,11 +154,12 @@ func (m *matcher) moduleReleaseTags(mod string) ([]string, error) {
 	if version != "" {
 		tags, err = releaseTagsFor(version)
 		if err != nil {
-			return nil, fmt.Errorf("%s/go.mod: %w", mod, err)
+			return module{}, fmt.Errorf("%s/go.mod: %w", mod, err)
 		}
 	}
-	m.releaseTags[mod] = tags
-	return tags, nil
+	info := module{releaseTags: tags, skewed: !slices.Equal(tags, build.Default.ReleaseTags)}
+	m.modules[mod] = info
+	return info, nil
 }
 
 // releaseTagsFor returns go1.1 through go1.N for Go 1.N, a release candidate
@@ -174,31 +188,27 @@ func releaseTagsFor(version string) ([]string, error) {
 }
 
 func (m *matcher) legsFor(mod, path string) ([]string, error) {
-	release, err := m.moduleReleaseTags(mod)
+	info, err := m.module(mod)
 	if err != nil {
 		return nil, err
+	}
+	judged := variants
+	if info.skewed {
+		// Experiment defaults change between Go releases, and only that release's
+		// toolchain knows them.
+		judged = slices.Clone(variants)
+		for _, v := range variants {
+			v.noExperiments = true
+			judged = append(judged, v)
+		}
 	}
 	dir, name := filepath.Dir(path), filepath.Base(path)
 	found := map[string]bool{}
 	for _, goarch := range goarches {
-		builds := map[string]bool{}
-		excluded := false
-		for _, goos := range runnerOSes {
-			c := build.Default
-			c.GOOS, c.GOARCH = goos, goarch
-			// go-ci.yaml and go-os-ci.yaml run the race tests with CGO_ENABLED=1.
-			c.CgoEnabled = true
-			c.ToolTags = m.toolTags[target{goos, goarch}]
-			c.ReleaseTags = release
-			ok, err := c.MatchFile(dir, name)
-			if err != nil {
+		for _, v := range judged {
+			if err := m.schedule(found, info, v, goarch, dir, name); err != nil {
 				return nil, err
 			}
-			builds[goos] = ok
-			excluded = excluded || !ok
-		}
-		for _, leg := range legs {
-			found[leg] = found[leg] || (builds[leg] && excluded)
 		}
 	}
 	var oses []string
@@ -208,4 +218,41 @@ func (m *matcher) legsFor(mod, path string) ([]string, error) {
 		}
 	}
 	return oses, nil
+}
+
+// schedule sets found[leg] for each leg OS that builds the file under v at
+// goarch where another runner OS excludes it.
+func (m *matcher) schedule(found map[string]bool, info module, v variant, goarch, dir, name string) error {
+	builds := map[string]bool{}
+	excluded := false
+	for _, goos := range runnerOSes {
+		c := build.Default
+		c.GOOS, c.GOARCH = goos, goarch
+		c.CgoEnabled = v.cgo
+		c.ToolTags = v.toolTags(m.toolTags[target{goos, goarch}])
+		c.ReleaseTags = info.releaseTags
+		ok, err := c.MatchFile(dir, name)
+		if err != nil {
+			return err
+		}
+		builds[goos] = ok
+		excluded = excluded || !ok
+	}
+	for _, leg := range legs {
+		found[leg] = found[leg] || (builds[leg] && excluded)
+	}
+	return nil
+}
+
+func (v variant) toolTags(base []string) []string {
+	tags := make([]string, 0, len(base)+1)
+	for _, t := range base {
+		if !v.noExperiments || !strings.HasPrefix(t, "goexperiment.") {
+			tags = append(tags, t)
+		}
+	}
+	if v.race {
+		tags = append(tags, "race")
+	}
+	return tags
 }

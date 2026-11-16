@@ -250,26 +250,31 @@ jobs:
               go_work_dirs=$(jq -cR '[., inputs | select(. != "")]' <<< "$mod_dirs")
             fi
 
-            # A module tracking a Go file that Go builds for windows or darwin, and that
-            # linux, darwin or windows excludes, is also tested on that OS's runner:
-            # go-ci vets the Linux GOOS only. GO_OS_FILES (scripts/go-os-files) owns
-            # the rule. A file belongs to the deepest module folder above it, and Go
-            # skips it when a name below that folder starts with _ or ., so only the
-            # files Go reads reach the matcher, which fails on one it cannot parse.
+            # A module gets a windows or darwin runner for each file GO_OS_FILES
+            # (scripts/go-os-files) schedules: go-ci vets the Linux GOOS only. Like Go,
+            # the walk gives a file to the deepest folder above it holding a tracked
+            # go.mod, a CI module or not, and skips it when a name below that folder
+            # starts with _ or ., so only the files a CI module's Go reads reach the
+            # matcher.
             # scripts/test-lane-semantics.sh runs this block, to the matrix dedup.
             go_os_inputs() {
-              git -c core.quotePath=false ls-files '*.go' | MOD_DIRS="$mod_dirs" awk '
-                BEGIN { n = split(ENVIRON["MOD_DIRS"], m, "\n"); for (i = 1; i <= n; i++) if (m[i] != "") mod[m[i]] = 1 }
+              git ls-files -z go.mod '*/go.mod' '*.go' | MOD_DIRS="$mod_dirs" awk '
+                BEGIN { RS = "\0"; n = split(ENVIRON["MOD_DIRS"], m, "\n"); for (i = 1; i <= n; i++) if (m[i] != "") mod[m[i]] = 1 }
                 /(^|\/)(node_modules|vendor|testdata)\// { next }
-                {
-                  d = $0
-                  do {
-                    if (index(d, "/")) sub(/\/[^\/]*$/, "", d); else d = "."
-                  } while (d != "." && !(d in mod))
-                  if (!(d in mod)) next
-                  rel = d == "." ? $0 : substr($0, length(d) + 2)
-                  if (("/" rel) ~ /\/[_.]/) next
-                  printf "%s\t%s\n", d, $0
+                $0 == "go.mod" { bound["."] = 1; next }
+                /\/go\.mod$/ { bound[substr($0, 1, length($0) - 7)] = 1; next }
+                { file[++nf] = $0 }
+                END {
+                  for (i = 1; i <= nf; i++) {
+                    d = file[i]
+                    do {
+                      if (index(d, "/")) sub(/\/[^\/]*$/, "", d); else d = "."
+                    } while (d != "." && !(d in bound))
+                    if (!(d in mod)) continue
+                    rel = d == "." ? file[i] : substr(file[i], length(d) + 2)
+                    if (("/" rel) ~ /\/[_.]/) continue
+                    printf "%s\t%s\n", d, file[i]
+                  }
                 }'
             }
             os_files=""

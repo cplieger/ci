@@ -113,7 +113,7 @@ start = next(i for i, l in enumerate(lines) if l.strip().startswith("# Probe kno
 end = next(i for i in range(start, len(lines)) if lines[i].strip() == "done")
 open(f"{out}/web-probe.sh", "w").write(textwrap.dedent("\n".join(lines[start : end + 1])) + "\n")
 
-start = next(i for i, l in enumerate(lines) if l.strip().startswith("# A module tracking a Go file that Go builds for windows or darwin"))
+start = next(i for i, l in enumerate(lines) if l.strip().startswith("# A module gets a windows or darwin runner for each file GO_OS_FILES"))
 end = next(i for i in range(start, len(lines)) if lines[i].strip().startswith("go_os_matrix=$(jq -c 'unique_by"))
 open(f"{out}/go-os.sh", "w").write(textwrap.dedent("\n".join(lines[start : end + 1])) + "\n")
 
@@ -278,9 +278,8 @@ chk "L-W3 a folder with neither package.json nor jsr.json is no frontend" \
 # ── go-os runner detection states ────────────────────────────────────────────
 # Expected rows follow Go's build constraints (go help buildconstraint): a module
 # gets an OS's leg for a file Go builds for that OS, darwin or windows, at a
-# GOARCH, amd64 or arm64, where linux, darwin or windows excludes it, under the
-# module's go line; Go ignores a name starting with _ or . below the module
-# folder (go help packages). mod_dirs is MIRRORED from ci.yaml's detect (nested
+# GOARCH, amd64 or arm64, where linux, darwin or windows excludes it; Go ignores
+# a name starting with _ or . below the module folder (go help packages). mod_dirs is MIRRORED from ci.yaml's detect (nested
 # validation discovery plus the root go.mod).
 # The block runs in a fresh bash with the runner's options (bash -e, no
 # pipefail), because a command substitution here would run it with errexit off.
@@ -288,6 +287,8 @@ command -v go >/dev/null || fail "no go on PATH to build scripts/go-os-files"
 GOWORK=off GOFLAGS='' go build -C "$ROOT/scripts/go-os-files" -o "$WORK/go-os-files" . \
   || fail "scripts/go-os-files does not build"
 export GO_OS_FILES="$WORK/go-os-files"
+helper_go=$(go version "$GO_OS_FILES" | awk '{ print $2 }')
+case "$helper_go" in go1.*) ;; *) fail "no Go release in the matcher's version: '$helper_go'" ;; esac
 cat >"$WORK/go-os-run.sh" <<'SH'
 mod_dirs=$1
 go_os_matrix="[]"
@@ -403,10 +404,11 @@ chk "L-O5 a file under no module, or untracked, gains no leg" "$rows" "tool=maco
 mkrepo goos-eval
 put go.mod "module github.com/cplieger/eval" "go 1.26.5"
 put main.go "package main"
-case_mod() { # <module dir> <file> <line>...: a module whose one file holds the lines
-  put "$1/go.mod" "module github.com/cplieger/eval/$1" "go 1.26.5"
-  put "$1/$2" "${@:3}"
+case_mod_at() { # <go version> <module dir> <file> <line>...: a module whose one file holds the lines
+  put "$2/go.mod" "module github.com/cplieger/eval/$2" "go $1"
+  put "$2/$3" "${@:4}"
 }
+case_mod() { case_mod_at 1.26.5 "$@"; }
 case_mod notlinux n.go "//go:build !linux" "" "package p"
 case_mod notlinuxwin n.go "//go:build !linux && !windows" "" "package p"
 case_mod notunix n.go "//go:build !unix" "" "package p"
@@ -424,10 +426,19 @@ case_mod linuxdarwin n.go "//go:build linux || darwin" "" "package p"
 case_mod unix n.go "//go:build unix" "" "package p"
 case_mod notplan9 n.go "//go:build !plan9" "" "package p"
 case_mod nonascii café_darwin.go "package p"
-case_mod nodwarf n.go "//go:build !goexperiment.dwarf5 && !linux" "" "package p"
-case_mod dwarf n.go "//go:build goexperiment.dwarf5 && darwin" "" "package p"
+case_mod quote 'a"b_darwin.go' "package p"
+case_mod_at "${helper_go#go}" nodwarf n.go "//go:build !goexperiment.dwarf5 && !linux" "" "package p"
+case_mod_at "${helper_go#go}" dwarf n.go "//go:build goexperiment.dwarf5 && darwin" "" "package p"
+case_mod notjson n.go "//go:build !goexperiment.jsonv2 && !linux" "" "package p"
+case_mod json n.go "//go:build goexperiment.jsonv2 && darwin" "" "package p"
 case_mod newgo n.go "//go:build go1.27 && darwin" "" "package p"
 case_mod oldgo n.go "//go:build !go1.27 && darwin" "" "package p"
+put toolchain/go.mod "module github.com/cplieger/eval/toolchain" "go 1.26.5" "toolchain go1.27.4"
+put toolchain/n.go "//go:build go1.27 && darwin" "" "package p"
+case_mod race n.go "//go:build race && !linux" "" "package p"
+case_mod racealone n.go "//go:build race" "" "package p"
+case_mod nocgo n.go "//go:build !cgo && darwin" "" "package p"
+case_mod nocgoalone n.go "//go:build !cgo" "" "package p"
 commit_all
 os_rows
 legs() { # <module dir> -> its runners in $rows, space-separated
@@ -450,10 +461,18 @@ chk "L-O7 linux || darwin builds on darwin, which windows excludes" "$(legs linu
 chk "L-O7 unix builds on darwin, which windows excludes" "$(legs unix)" "macos-latest"
 chk "L-O7 !plan9 builds on every runner OS" "$(legs notplan9)" ""
 chk "L-O7 a non-ASCII _darwin file name builds on darwin" "$(legs nonascii)" "macos-latest"
+chk "L-O7 a _darwin file name holding a double quote builds on darwin" "$(legs quote)" "macos-latest"
 chk "L-O7 darwin lacks the dwarf5 experiment, and windows has it" "$(legs nodwarf)" "macos-latest"
 chk "L-O7 goexperiment.dwarf5 && darwin builds nowhere" "$(legs dwarf)" ""
+chk "L-O7 a module on another Go minor is also judged with every experiment off" "$(legs notjson)" "macos-latest windows-latest"
+chk "L-O7 and still with the matcher's experiments on" "$(legs json)" "macos-latest"
 chk "L-O7 go1.27 is unset under a go 1.26.5 module" "$(legs newgo)" ""
 chk "L-O7 !go1.27 && darwin builds on darwin under a go 1.26.5 module" "$(legs oldgo)" "macos-latest"
+chk "L-O7 the toolchain line outranks the go line" "$(legs toolchain)" "macos-latest"
+chk "L-O7 the race leg sets the race tag" "$(legs race)" "macos-latest windows-latest"
+chk "L-O7 the race tag alone builds on every runner OS" "$(legs racealone)" ""
+chk "L-O7 the cross-vet leg turns cgo off" "$(legs nocgo)" "macos-latest"
+chk "L-O7 cgo off alone builds on every runner OS" "$(legs nocgoalone)" ""
 chk "L-O7 the root module's file builds everywhere" "$(legs .)" ""
 
 os_status() { # -> the go-os block's exit status for the repo at $R
@@ -488,6 +507,16 @@ put tool/t.go "package tool"
 printf '//go:build !linux\n\npackage p\0\n' >"$R/bad.go"
 commit_all
 chk "L-O8 an unreadable file outside every module passes detect" "$(os_status)" "0"
+mkrepo goos-pruned
+put go.mod "module github.com/cplieger/pruned" "go 1.26.5"
+put main.go "package main"
+put static/gen/go.mod "module github.com/cplieger/pruned/static/gen" "go 1.26.5"
+put static/gen/x.go "//go:build {{.Tags}}" "" "package {{.Name}}"
+put static/gen/n.go "//go:build !linux" "" "package gen"
+commit_all
+chk "L-O8 a module CI prunes is its own boundary, so its template passes detect" "$(os_status)" "0"
+os_rows
+chk "L-O8 and gives its parent no leg" "$rows" ""
 
 # ── Classification states ────────────────────────────────────────────────────
 # No lane carries a tag yet, so every lane is judged on the root range: its
