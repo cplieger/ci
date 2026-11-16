@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tag creation for the release workflows; source it after retry.sh (it sets no
 # shell options).
-# shellcheck disable=SC2034 # TAG_CREATED is the caller's to read
+# shellcheck disable=SC2034 # TAG_CREATED and CLAIMED are the caller's to read
 
 # release_channels.HANDOFF_PREFIX reads this context.
 TAG_HANDOFF_PREFIX='release/handoff/'
@@ -82,17 +82,18 @@ handoff_record() {
 }
 
 # later_dev_tag <branch> <tag> <commit>: prints "<tag> <commit>" of the newest
-# root dev tag other than <tag> on a descendant of <commit> that
-# origin/<branch> holds, nothing when none; returns 1 when git cannot tell. It
-# reads the job's checkout (fetch-depth 0) unfetched: only release runs, queued
-# one at a time per branch, create a root dev tag, so none appears while this
-# run holds the queue.
+# dev tag of <tag>'s lane (its dir/ prefix, none for the root), other than
+# <tag>, on a descendant of <commit> that origin/<branch> holds, nothing when
+# none; returns 1 when git cannot tell. It reads the job's checkout
+# (fetch-depth 0) unfetched: only release runs, queued one at a time per
+# branch, create a dev tag, and a lane's only from its own job.
 later_dev_tag() {
   local -A at=()
-  local name obj peeled refs revs c
+  local name obj peeled refs revs c lane=""
+  [[ $2 != */* ]] || lane=${2%/*}/
   refs=$(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)') || return 1
   while read -r name obj peeled; do
-    if [[ $name =~ ^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$ ]] && [ "$name" != "$2" ]; then
+    if [[ $name == "$lane"* && ${name#"$lane"} =~ ^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$ ]] && [ "$name" != "$2" ]; then
       at[${peeled:-$obj}]=$name
     fi
   done <<<"$refs"
@@ -105,26 +106,19 @@ later_dev_tag() {
   done <<<"$revs"
 }
 
-# claim_version <owner/repo> <branch> <tag> <commit> <channel>: the version's
-# claim before its first write, as claimed=true or claimed=false (a handoff) in
-# GITHUB_OUTPUT; returns 1 when the version cannot be claimed. A dev claim
-# reused at <commit> under a later dev tag on <branch> is a handoff too: that
-# tag ships this commit's changes, and publishing again would move the dev
-# channel back to this older build.
+# claim_version <owner/repo> <branch> <tag> <commit> <channel>: every release
+# tag's claim, before the version's first write. Sets CLAIMED, and claimed= in
+# GITHUB_OUTPUT: true once <tag> is at <commit>, false on a handoff; returns 1
+# when the version cannot be claimed. On dev, a later dev tag of the lane on a
+# descendant already ships this commit's changes, so the claim hands off
+# before any create: a new tag would rank this older tree above it, and a
+# reused one would move the dev channel back.
 claim_version() {
   local rc=0 later
-  tag_ref_or_handoff "$1" "$2" "$3" "$4" || rc=$?
-  case "$rc" in
-    0) ;;
-    2)
-      echo "claimed=false" >>"${GITHUB_OUTPUT:?}"
-      return 0
-      ;;
-    *) return 1 ;;
-  esac
-  if [ "$5" = dev ] && [ "$TAG_CREATED" = false ]; then
+  CLAIMED=false TAG_CREATED=false
+  if [ "$5" = dev ]; then
     if ! later=$(later_dev_tag "$2" "$3" "$4"); then
-      echo "::error::git cannot tell whether a later dev tag on $2 holds $4, so $3 is not published again."
+      echo "::error::git cannot tell whether a later dev tag on $2 holds $4, so $3 is not claimed."
       return 1
     fi
     if [ -n "$later" ]; then
@@ -134,13 +128,20 @@ claim_version() {
       return 0
     fi
   fi
-  echo "claimed=true" >>"${GITHUB_OUTPUT:?}"
+  tag_ref_or_handoff "$1" "$2" "$3" "$4" || rc=$?
+  case "$rc" in
+    0) CLAIMED=true ;;
+    2) ;;
+    *) return 1 ;;
+  esac
+  echo "claimed=$CLAIMED" >>"${GITHUB_OUTPUT:?}"
 }
 
 # root_handed_off <owner/repo> <branch> <version> <commit> <channel>: for a job
-# after the root's claim, 0 when the root handed <version> off by either of
-# claim_version's handoffs (warned here), 1 when the root claimed it at
-# <commit>, 2 when that cannot be told.
+# after the root's claim, 0 when that claim handed <version> off (warned
+# here): no tag at <commit> and the branch moved past it, or a later dev tag
+# over the one at <commit>. 1 when the root claimed it at <commit>, 2 when
+# that cannot be told.
 root_handed_off() {
   local head later rc=0
   if [ "$(git rev-list -n1 "$3" 2>/dev/null || true)" != "$4" ]; then

@@ -511,6 +511,28 @@ chk "V-H5 the half's npm read waits before the lane's proxy read, as npm's bound
   "$RC|$(head -1 "$CURL_LOG")|$(tail -1 "$CURL_LOG")" \
   "0|$HALF_NPM|https://proxy.golang.org/github.com/cplieger/probe/alpha/@v/v1.4.0.info"
 
+# A later dev tag of the lane on dev ships the half (lane-halves hands it off).
+HALF_SHA=$(git -C "$HALF" rev-parse HEAD)
+HALF_LATER=$(git -C "$HALF" -c user.email=probe@ci.local -c user.name=probe commit-tree "HEAD^{tree}" -p HEAD -m "fix: later")
+git -C "$HALF" tag alpha/v1.4.0-dev.4 "$HALF_LATER"
+git -C "$HALF" update-ref refs/remotes/origin/dev "$HALF_LATER"
+defaults
+export CHANNEL=dev HALVES_RESULT=success HALVES_JSON='["alpha"]' VERSION="" GITHUB_SHA=$HALF_SHA
+spec "*registry.npmjs.org* 22 {}"
+run_step "$HALF"
+chk "V-H6 a dev half a later dev tag of its lane supersedes is not awaited" "$RC|$(lines "$CURL_LOG")" "0|0"
+chk_has "V-H6 naming that tag" "$OUT" "skip: alpha/web at alpha/v1.4.0-dev.3 was handed off to alpha/v1.4.0-dev.4 at $HALF_LATER"
+git -C "$HALF" tag -d alpha/v1.4.0-dev.4 >/dev/null
+git -C "$HALF" tag v1.4.0-dev.4 "$HALF_LATER"
+defaults
+export CHANNEL=dev HALVES_RESULT=success HALVES_JSON='["alpha"]' VERSION="" GITHUB_SHA=$HALF_SHA
+spec "*registry.npmjs.org* 0 {}"
+run_step "$HALF"
+chk "V-H7 one beside only a later root dev tag is read back" "$RC|$(cat "$CURL_LOG")" \
+  "0|https://registry.npmjs.org/@cplieger/alpha/1.4.0-dev.3"
+git -C "$HALF" tag -d v1.4.0-dev.4 >/dev/null
+git -C "$HALF" update-ref -d refs/remotes/origin/dev
+
 # ── V-K: a private package is dry-run, so no registry holds it ──────────────
 printf '{"name":"@cplieger/alpha","version":"0.0.0","private":true}\n' >"$HALF/alpha/web/package.json"
 mkdir -p "$HALF/web"

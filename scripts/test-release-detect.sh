@@ -3737,7 +3737,7 @@ publish_site() { # <site> <read status> -> rc|the gh calls joined by ';'
   d=$(mktemp -d "$WORK/ps.XXXXXX")
   echo notes >"$d/NOTES.md"
   : >"$d/log"
-  (cd "$d" && PATH="$RBIN:$PATH" REL_LOG="$d/log" REL_READ="$2" GH_TOKEN=t GITHUB_REPOSITORY=o/app \
+  (cd "$d" && PATH="$RBIN:$PATH" REL_LOG="$d/log" REL_READ="$2" GH_TOKEN=t GITHUB_REPOSITORY=o/app GITHUB_OUTPUT="$d/out" \
     GITHUB_REF_NAME=main GITHUB_SHA=c0ffee VERSION="$rtag" CHANNEL=stable CI_TOOLS="$ROOT/scripts" bash -e "$body") >"$WORK/ps.log" 2>&1 || rc=$?
   echo "$rc|$(paste -sd ';' "$d/log")"
 }

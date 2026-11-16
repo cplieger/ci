@@ -2012,8 +2012,8 @@ jobs:
   # The claim's tag precedes every write, so only this receipt, after the
   # read back, shows the version published (release-state.sh claims reads
   # it). A dev tag has no Release, so the audit also reads it as the
-  # pipeline's mark. A failed POST leaves the claim unproven, and the
-  # commit's next attempt republishes it.
+  # pipeline's mark. A failed POST leaves the claim unproven for the
+  # commit's next attempt (tag-ref.sh claim_version).
   dev-receipt:
     needs: [prepare, verify-publish]
     if: ${{ always() && needs.verify-publish.result == 'success' && inputs.channel == 'dev' }}

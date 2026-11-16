@@ -1941,18 +1941,14 @@ jobs:
           CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
           set -euo pipefail
-          # Tag ref created first via the git data API, pinned to the trigger
-          # commit; release then attaches to the existing tag (no --target).
-          # Once a push that edits workflow files lands past $GITHUB_SHA, the
-          # integration token loses ref-create, and the run on the new head
-          # releases this range, so that failure hands off (tag-ref.sh). A dev
+          # The tag is the module version itself, claimed at the trigger commit
+          # (tag-ref.sh claim_version); a handoff publishes nothing and posts
+          # no receipt. The Release attaches to the tag (no --target). A dev
           # build gets the tag, its receipt and no Release.
           . "$CI_TOOLS/retry.sh"
           . "$CI_TOOLS/tag-ref.sh"
-          rc=0
-          tag_ref_or_handoff "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" || rc=$?
-          [ "$rc" -ne 2 ] || exit 0
-          [ "$rc" -eq 0 ] || exit 1
+          claim_version "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL"
+          [ "$CLAIMED" = true ] || exit 0
           if [ "$CHANNEL" != "stable" ]; then
             # The audit reads this receipt: a dev tag has no Release to show
             # that the pipeline, not a hand, created it. A tag without it would
@@ -2099,7 +2095,8 @@ jobs:
           fi
 
       # The dev version's proof, after its last write (release-state.sh
-      # claims reads it); a failed POST leaves the claim for a rerun to resume.
+      # claims reads it); a failed POST leaves the claim for the next attempt
+      # (tag-ref.sh claim_version).
       - name: Record the dev receipt
         if: ${{ steps.claim.outputs.claimed == 'true' && needs.detect.outputs.channel == 'dev' }}
         env:
@@ -2418,17 +2415,13 @@ jobs:
           CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
           set -euo pipefail
-          # Tag ref via the git data API pinned to the trigger commit, with
-          # the exists-at-different-SHA refuse guard and the superseded-run
-          # handoff (mirrors the root go job; slash tags are ordinary
-          # multi-segment refs). A dev lane build gets the tag, its receipt
-          # and no Release.
+          # The root go job's claim, at the lane's slash tag (an ordinary
+          # multi-segment ref). A dev lane build gets the tag, its receipt and
+          # no Release.
           . "$CI_TOOLS/retry.sh"
           . "$CI_TOOLS/tag-ref.sh"
-          rc=0
-          tag_ref_or_handoff "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" || rc=$?
-          [ "$rc" -ne 2 ] || exit 0
-          [ "$rc" -eq 0 ] || exit 1
+          claim_version "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL"
+          [ "$CLAIMED" = true ] || exit 0
           if [ "$CHANNEL" != "stable" ]; then
             # The audit reads this receipt: a dev tag has no Release to show
             # that the pipeline, not a hand, created it. A tag without it would
@@ -2496,8 +2489,8 @@ jobs:
 
       # The lane's tag at HEAD is the version: a matrix job's outputs are
       # last-writer-wins across its legs, so go-nested cannot hand it on. A
-      # lane that handed its tag off to a newer push (tag_ref_or_handoff)
-      # leaves none, and the run on the new head publishes the half.
+      # lane whose claim handed off (tag-ref.sh claim_version) leaves none,
+      # and a later dev tag of the lane publishes the half at its own version.
       - name: Find the lane's tag
         id: lanetag
         env:
@@ -2513,8 +2506,8 @@ jobs:
             tags=$(git tag --points-at HEAD --list "$LANE/v[0-9]*-dev.*")
           fi
           tag=$(sort -V <<<"$tags" | tail -n1)
+          . "$CI_TOOLS/tag-ref.sh"
           if [ -z "$tag" ]; then
-            . "$CI_TOOLS/tag-ref.sh"
             if head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA"); then
               echo "::warning::lane ${LANE} has no ${CHANNEL} tag at ${GITHUB_SHA} and ${GITHUB_REF_NAME} advanced past it (now ${head}). The run on the new head publishes its TS half."
               echo "tag=" >>"$GITHUB_OUTPUT"
@@ -2522,6 +2515,17 @@ jobs:
             fi
             echo "::error::lane ${LANE} has no ${CHANNEL} tag at $(git rev-parse HEAD), though go-nested released it. Its TS half is not published without one."
             exit 1
+          fi
+          if [ "$CHANNEL" != stable ]; then
+            if ! later=$(later_dev_tag "$GITHUB_REF_NAME" "$tag" "$GITHUB_SHA"); then
+              echo "::error::git cannot tell whether a later dev tag of lane ${LANE} on ${GITHUB_REF_NAME} holds ${GITHUB_SHA}, so its TS half is not published."
+              exit 1
+            fi
+            if [ -n "$later" ]; then
+              echo "::warning::${tag} at ${GITHUB_SHA} was handed off to ${later% *} at ${later#* }, which ships its TS half."
+              echo "tag=" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
           echo "tag=${tag}" >>"$GITHUB_OUTPUT"
 
@@ -2669,9 +2673,9 @@ jobs:
           # A root job that handed its version off (tag-ref.sh root_handed_off)
           # succeeded publishing nothing; the version that releases its changes
           # is verified by its own run. When that cannot be told, all is read.
+          . "$CI_TOOLS/tag-ref.sh"
           root=true
           if [ -n "$VERSION" ]; then
-            . "$CI_TOOLS/tag-ref.sh"
             if root_handed_off "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL"; then
               root=false
             fi
@@ -2693,6 +2697,11 @@ jobs:
               [ -z "$d" ] && continue
               while IFS= read -r tag; do
                 [ -z "$tag" ] && continue
+                # A half handed off to a later dev tag of its lane (lane-halves).
+                if [ "$CHANNEL" != stable ] && later=$(later_dev_tag "$GITHUB_REF_NAME" "$tag" "$GITHUB_SHA") && [ -n "$later" ]; then
+                  echo "skip: ${d}/web at ${tag} was handed off to ${later% *} at ${later#* }"
+                  continue
+                fi
                 probe_ts "$d/web/package.json" "${tag#"$d"/v}"
               done < <(lane_tags_at_head "$d")
             done < <(jq -r '.[]' <<<"$HALVES_JSON")

@@ -2158,31 +2158,33 @@ printf 'stub: unexpected gh %s\n' "$*" >&2
 exit 22
 SH
 chmod 755 "$BIN/gh"
+# A dev claim reads the checkout's tags and origin/dev for a later dev tag
+# (tag-ref.sh claim_version), so the tag steps run in the fixture repository.
+git -C "$REPO" update-ref refs/remotes/origin/dev "$(git -C "$REPO" rev-parse HEAD)"
+[ -z "$(git -C "$REPO" tag --list 'v*-dev.*' '*/v*-dev.*')" ] || fail "D-T1 needs a fixture with no dev tag yet"
+run_tag() { (cd "$REPO" && run_step "$1"); }
 : >"$GH_LOG"
 out_tag=$(GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" GITHUB_REF_NAME=dev GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 \
-  CHANNEL=dev TAG=v1.3.0-dev.4 run_step claim.sh)
+  CHANNEL=dev TAG=v1.3.0-dev.4 run_tag claim.sh)
 chk "D-T1 the dev tag is created at this commit" "$(grep -c "git/refs -f ref=refs/tags/v1.3.0-dev.4 -f sha=$C_BUILT" "$GH_LOG")" "1"
 # The claim is the tag alone: the version's proof follows its writes.
 chk "D-T2 the claim posts no status" "$(grep -c '/statuses/' "$GH_LOG" || true)" "0"
 chk "D-T4 the step exits 0" "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)" "0"
 : >"$GH_LOG"
 out_tag=$(GH_REF_FAIL=1 GH_HEAD="$C_DOCS" GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" GITHUB_REF_NAME=dev \
-  GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 CHANNEL=dev TAG=v1.3.0-dev.4 run_step claim.sh)
+  GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 CHANNEL=dev TAG=v1.3.0-dev.4 run_tag claim.sh)
 chk "D-T5 a superseded run hands off without a receipt, recording the handoff" \
   "$(grep -c 'context=release/tag/' "$GH_LOG" || true)|$(grep -c "statuses/$C_BUILT -f state=success -f context=release/handoff/v1.3.0-dev.4 -f description=the run on $C_DOCS " "$GH_LOG")" "0|1"
 chk_has "D-T5 and warns" "$out_tag" "::warning::tag v1.3.0-dev.4 not created"
 chk "D-T5 and exits 0" "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)" "0"
 : >"$GH_LOG"
 out_tag=$(GH_TAG_EXISTS="$C_DOCS" GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" GITHUB_REF_NAME=dev \
-  GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 CHANNEL=dev TAG=v1.3.0-dev.4 run_step claim.sh)
+  GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 CHANNEL=dev TAG=v1.3.0-dev.4 run_tag claim.sh)
 chk "D-T6 a tag elsewhere refuses and leaves no receipt" "$(grep -c 'statuses/' "$GH_LOG")" "0"
 chk "D-T6 and exits 1" "$(printf '%s' "$out_tag" | sed -n 's/^EXIT=//p')" "1"
 export GITHUB_REPOSITORY=owner/app GITHUB_SHA="$C_BUILT" GITHUB_REF_NAME=dev GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7
 : >"$GH_LOG"
-# A reused dev claim reads the checkout's tags and origin/dev for a later one.
-git -C "$REPO" update-ref refs/remotes/origin/dev "$(git -C "$REPO" rev-parse HEAD)"
-[ -z "$(git -C "$REPO" tag --list 'v*-dev.*')" ] || fail "D-T11 needs a fixture with no dev tag yet"
-claim_in_repo() { (cd "$REPO" && CHANNEL="${CHANNEL:-dev}" run_step claim.sh); }
+claim_in_repo() { CHANNEL="${CHANNEL:-dev}" run_tag claim.sh; }
 out_tag=$(GH_TAG_EXISTS="$C_BUILT" TAG=v1.3.0-dev.4 CHANNEL=dev claim_in_repo)
 chk "D-T11 a claim at the commit already tagged reuses the tag and writes nothing" \
   "$(grep -c -E 'git/refs -f|/statuses/|-X DELETE' "$GH_LOG" || true)|$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)|$(out claimed)" "0|0|true"
@@ -2206,6 +2208,37 @@ out_tag=$(GH_TAG_EXISTS="$C_BUILT" TAG=v1.3.0-dev.4 CHANNEL=dev claim_in_repo)
 chk "D-T30 a reused dev claim whose branch git cannot walk is refused, writing nothing" \
   "$(printf '%s' "$out_tag" | sed -n 's/^EXIT=//p')|$(out claimed)|$(grep -c '/statuses/' "$GH_LOG" || true)" "1||0"
 chk_has "D-T30 saying why" "$out_tag" "::error::git cannot tell whether a later dev tag on dev holds $C_BUILT"
+git -C "$REPO" update-ref refs/remotes/origin/dev "$(git -C "$REPO" rev-parse HEAD)"
+# With no tag yet for the version, a later dev tag of its lane on a descendant
+# still ships this commit's changes, so each claim hands off before its create.
+for step in claim.sh ts-tag.sh go-tag.sh go-nested-tag.sh; do
+  v=v1.3.0-dev.4 later=v1.3.0-dev.5
+  [ "$step" != go-nested-tag.sh ] || v=yamlenv/v1.3.0-dev.4 later=yamlenv/v1.3.0-dev.5
+  git -C "$REPO" tag "$later" "$C_SHIP"
+  : >"$GH_LOG"
+  out_tag=$(VERSION="$v" TAG="$v" CHANNEL=dev run_tag "$step")
+  chk "D-T32 $step with its version untagged under a later dev tag of its lane creates no tag and writes nothing" \
+    "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)|$(grep -c -E 'git/refs -f|-X DELETE|context=release/tag/|release create' "$GH_LOG" || true)|$(out claimed)" "0|0|false"
+  chk "D-T32 $step recording on its commit the later version and its commit" \
+    "$(grep -c "statuses/$C_BUILT -f state=success -f context=release/handoff/$v -f description=$later at $C_SHIP releases this commit's changes " "$GH_LOG" || true)" "1"
+  git -C "$REPO" tag -d "$later" >/dev/null
+done
+# A claim reads its own lane's dev tags only: the root's, another lane's or a
+# nested lane's later tag ships none of its module.
+git -C "$REPO" tag v1.3.0-dev.5 "$C_SHIP"
+git -C "$REPO" tag other/v1.3.0-dev.5 "$C_SHIP"
+git -C "$REPO" tag yamlenv/sub/v1.3.0-dev.5 "$C_SHIP"
+: >"$GH_LOG"
+out_tag=$(VERSION=yamlenv/v1.3.0-dev.4 CHANNEL=dev run_tag go-nested-tag.sh)
+chk "D-T33 a lane claim beside later dev tags of the root and other lanes tags its commit" \
+  "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)|$(grep -c "git/refs -f ref=refs/tags/yamlenv/v1.3.0-dev.4 -f sha=$C_BUILT" "$GH_LOG")|$(out claimed)" "0|1|true"
+git -C "$REPO" tag -d v1.3.0-dev.5 other/v1.3.0-dev.5 >/dev/null
+git -C "$REPO" tag yamlenv/v1.3.0-dev.5 "$C_SHIP"
+: >"$GH_LOG"
+out_tag=$(VERSION=v1.3.0-dev.4 CHANNEL=dev run_tag go-tag.sh)
+chk "D-T33 a root claim beside a later lane dev tag tags its commit" \
+  "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)|$(grep -c "git/refs -f ref=refs/tags/v1.3.0-dev.4 -f sha=$C_BUILT" "$GH_LOG")|$(out claimed)" "0|1|true"
+git -C "$REPO" tag -d yamlenv/v1.3.0-dev.5 yamlenv/sub/v1.3.0-dev.5 >/dev/null
 # The receipt is the dev version's proof, so a failed one deletes no tag: the
 # claim stays, and the commit's next attempt republishes it.
 for f in dr-receipt.sh ts-receipt.sh; do
@@ -2226,16 +2259,16 @@ chk "D-T12 the TS receipt follows the publish, on a claimed dev run" "$(jq -c . 
 # their bodies read VERSION and CHANNEL and never reach `gh release` on dev.
 for job in go go-nested; do
   : >"$GH_LOG"
-  out_tag=$(GH_STATUS_FAIL=1 VERSION=v1.3.0-dev.4 CHANNEL=dev run_step "$job-tag.sh")
+  out_tag=$(GH_STATUS_FAIL=1 VERSION=v1.3.0-dev.4 CHANNEL=dev run_tag "$job-tag.sh")
   chk "D-T13 the $job step deletes the tag it created when the receipt POST fails" \
     "$(grep -c "api -X DELETE repos/owner/app/git/refs/tags/v1.3.0-dev.4" "$GH_LOG")" "1"
   chk "D-T13 the $job step exits 1" "$(printf '%s' "$out_tag" | sed -n 's/^EXIT=//p')" "1"
   : >"$GH_LOG"
-  out_tag=$(GH_STATUS_FAIL=1 GH_TAG_EXISTS="$C_BUILT" VERSION=v1.3.0-dev.4 CHANNEL=dev run_step "$job-tag.sh")
+  out_tag=$(GH_STATUS_FAIL=1 GH_TAG_EXISTS="$C_BUILT" VERSION=v1.3.0-dev.4 CHANNEL=dev run_tag "$job-tag.sh")
   chk "D-T14 the $job step keeps a pre-existing tag on a failed POST" "$(grep -c -- '-X DELETE' "$GH_LOG")" "0"
   chk_has "D-T14 the $job step says it reuses that tag" "$out_tag" "::notice::Tag v1.3.0-dev.4 already exists at $C_BUILT, so it is reused"
   : >"$GH_LOG"
-  out_tag=$(VERSION=v1.3.0-dev.4 CHANNEL=dev run_step "$job-tag.sh")
+  out_tag=$(VERSION=v1.3.0-dev.4 CHANNEL=dev run_tag "$job-tag.sh")
   chk "D-T15 the $job step tags and records the receipt on a clean run" \
     "$(grep -c -E "git/refs -f ref=refs/tags/v1.3.0-dev.4 -f sha=$C_BUILT|api -X POST repos/owner/app/statuses/$C_BUILT -f state=success -f context=release/tag/v1.3.0-dev.4 " "$GH_LOG")" "2"
   chk "D-T15 the $job step exits 0" "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)" "0"
@@ -2247,7 +2280,7 @@ for step in go-tag.sh ts-tag.sh go-nested-tag.sh claim.sh; do
   : >"$GH_LOG"
   touch "$WORK/refuse-once"
   out_tag=$(GH_REF_REFUSE_ONCE="$WORK/refuse-once" GH_HEAD="$C_BUILT" VERSION=v1.3.0-dev.4 CHANNEL=dev TAG=v1.3.0-dev.4 \
-    run_step "$step")
+    run_tag "$step")
   chk "D-T16 $step retries a refused tag create" \
     "$(grep -c "git/refs -f ref=refs/tags/v1.3.0-dev.4 -f sha=$C_BUILT" "$GH_LOG")|$(grep -c "git/ref/tags/v1.3.0-dev.4" "$GH_LOG")" "2|2"
   receipts=1
@@ -2261,13 +2294,13 @@ done
 # on the new head, with no receipt, and fails only while still at the head.
 for step in go-tag.sh ts-tag.sh go-nested-tag.sh claim.sh; do
   : >"$GH_LOG"
-  out_tag=$(GH_REF_FAIL=1 GH_HEAD="$C_DOCS" VERSION=v1.3.0-dev.4 CHANNEL=dev TAG=v1.3.0-dev.4 run_step "$step")
+  out_tag=$(GH_REF_FAIL=1 GH_HEAD="$C_DOCS" VERSION=v1.3.0-dev.4 CHANNEL=dev TAG=v1.3.0-dev.4 run_tag "$step")
   chk "D-T17 $step hands off once the branch moved past it, with no receipt but the handoff record" \
     "$(printf '%s' "$out_tag" | grep -c '^EXIT=' || true)|$(grep -c 'context=release/tag/' "$GH_LOG" || true)|$(grep -c "statuses/$C_BUILT -f state=success -f context=release/handoff/v1.3.0-dev.4 " "$GH_LOG" || true)" "0|0|1"
   chk_has "D-T17 $step warns the handoff" "$out_tag" \
     "::warning::tag v1.3.0-dev.4 not created: dev advanced past $C_BUILT (now $C_DOCS)"
   : >"$GH_LOG"
-  out_tag=$(GH_REF_FAIL=1 GH_HEAD="$C_BUILT" VERSION=v1.3.0-dev.4 CHANNEL=dev TAG=v1.3.0-dev.4 run_step "$step")
+  out_tag=$(GH_REF_FAIL=1 GH_HEAD="$C_BUILT" VERSION=v1.3.0-dev.4 CHANNEL=dev TAG=v1.3.0-dev.4 run_tag "$step")
   chk "D-T18 $step fails a refused create while still at the head" \
     "$(printf '%s' "$out_tag" | sed -n 's/^EXIT=//p')" "1"
   chk_has "D-T18 $step says it is not a superseded run" "$out_tag" \
@@ -2327,8 +2360,25 @@ chk "D-T25 a lane with no tag hands its half off once the branch moved" "$(out t
 out_h=$(lanetag "$LANE_SHA")
 chk "D-T26 a lane with no tag and the branch still here fails" "$(printf '%s' "$out_h" | sed -n 's/^EXIT=//p')" "1"
 git -C "$LANEREPO" tag yamlenv/v1.1.0-dev.2
+out_h=$(lanetag "$C_DOCS")
+chk "D-T35 a lane's tag here whose branch git cannot walk fails, publishing nothing" \
+  "$(printf '%s' "$out_h" | sed -n 's/^EXIT=//p')|$(out tag)" "1|"
+chk_has "D-T35 and says why" "$out_h" "::error::git cannot tell whether a later dev tag of lane yamlenv on dev holds $LANE_SHA"
+git -C "$LANEREPO" update-ref refs/remotes/origin/dev "$LANE_SHA"
 lanetag "$C_DOCS" >/dev/null
 chk "D-T27 a lane's tag here is its half's version" "$(out tag)" "yamlenv/v1.1.0-dev.2"
+# A later dev tag of the lane on dev ships this half too (tag-ref.sh
+# later_dev_tag): publishing it again would move npm's dev back to this tree.
+LANE_LATER=$(git -C "$LANEREPO" commit-tree "${LANE_SHA}^{tree}" -p "$LANE_SHA" -m "fix: later")
+git -C "$LANEREPO" update-ref refs/remotes/origin/dev "$LANE_LATER"
+git -C "$LANEREPO" tag v1.1.0-dev.3 "$LANE_LATER"
+lanetag "$C_DOCS" >/dev/null
+chk "D-T34 a lane's tag here beside a later root dev tag is still its half's version" "$(out tag)" "yamlenv/v1.1.0-dev.2"
+git -C "$LANEREPO" tag yamlenv/v1.1.0-dev.3 "$LANE_LATER"
+out_h=$(lanetag "$C_DOCS")
+chk "D-T34 one a later dev tag of the lane supersedes hands its half off green" \
+  "$(out tag)|$(printf '%s' "$out_h" | grep -c '^EXIT=' || true)" "|0"
+chk_has "D-T34 naming that tag" "$out_h" "yamlenv/v1.1.0-dev.2 at $LANE_SHA was handed off to yamlenv/v1.1.0-dev.3 at $LANE_LATER"
 
 # ── The image lane's completion receipt ──────────────────────────────────────
 : >"$GH_LOG"
@@ -2962,6 +3012,14 @@ chk "D-CL14 a rerun of an unproven claim a later dev tag supersedes ends green, 
   "$rc|$(grep -c '^write ' "$CL_EVENTS" || true)|$(jq -r '.steps.claim.outputs.claimed // "absent"' "$CL/out.json")" "0|0|false"
 chk "D-CL14 recording on A the later version and its commit, and no receipt" \
   "$(grep -c "^gh api -X POST repos/owner/app/statuses/$CL_A -f state=success -f context=release/handoff/v1.3.0-dev.1 -f description=v1.3.0-dev.2 at $CL_B " "$CL_EVENTS" || true)|$(receipt_on "$CL_A" v1.3.0-dev.1)" "1|0"
+# The same supersession with the version untagged: a rerun of an older run
+# that failed before its claim numbers past B's tag (compute.sh counts every
+# dev tag), and a claim at A would rank A's older tree above B's.
+rc=$(finalize_at "$CL_A" v1.3.0-dev.3 "$CL_B")
+chk "D-CL17 an older run under a later dev tag, its version untagged, ends green creating no tag and writing no image" \
+  "$rc|$(grep -c '^gh api repos/owner/app/git/refs ' "$CL_EVENTS" || true)|$(grep -c '^write ' "$CL_EVENTS" || true)|$([ -f "$CL_REFS/v1.3.0-dev.3" ] && echo tagged)|$(jq -r '.steps.claim.outputs.claimed // "absent"' "$CL/out.json")" "0|0|0||false"
+chk "D-CL17 recording on A the later version and its commit, and no receipt" \
+  "$(grep -c "^gh api -X POST repos/owner/app/statuses/$CL_A -f state=success -f context=release/handoff/v1.3.0-dev.3 -f description=v1.3.0-dev.2 at $CL_B " "$CL_EVENTS" || true)|$(receipt_on "$CL_A" v1.3.0-dev.3)" "1|0"
 rm -f "$CL_REFS/v1.3.0-dev.2"
 git -C "$CL_REPO" tag -d v1.3.0-dev.2 >/dev/null
 # A failure after the claim keeps it: the tag stays at the commit, unproven
@@ -3058,8 +3116,11 @@ chk "D-CL8 one whose create is refused after the branch moved hands off, claimin
   "$(ts_claim "$CL_A" "$CL_B")|$(receipt_on "$CL_A" v1.4.0-dev.1)|$(grep -c "statuses/$CL_A -f state=success -f context=release/handoff/v1.4.0-dev.1 " "$CL_EVENTS" || true)" \
   "0|false|0|1"
 rm "$CL_REFS/.refuse"
-tagged v1.4.0-dev.1 "$CL_A"
 tagged v1.4.0-dev.2 "$CL_B"
+chk "D-CL18 a ts run under a later dev tag, its version untagged, creates no tag, recording the later version" \
+  "$(ts_claim "$CL_A" "$CL_B")|$(grep -c '^gh api repos/owner/app/git/refs ' "$CL_EVENTS" || true)|$([ -f "$CL_REFS/v1.4.0-dev.1" ] && echo tagged)|$(grep -c "statuses/$CL_A -f state=success -f context=release/handoff/v1.4.0-dev.1 -f description=v1.4.0-dev.2 at $CL_B " "$CL_EVENTS" || true)" \
+  "0|false|0||1"
+tagged v1.4.0-dev.1 "$CL_A"
 chk "D-CL15 a ts rerun of an unproven claim a later dev tag supersedes claims nothing, recording the later version" \
   "$(ts_claim "$CL_A" "$CL_B")|$(receipt_on "$CL_A" v1.4.0-dev.1)|$(grep -c "statuses/$CL_A -f state=success -f context=release/handoff/v1.4.0-dev.1 -f description=v1.4.0-dev.2 at $CL_B " "$CL_EVENTS" || true)" \
   "0|false|0|1"
