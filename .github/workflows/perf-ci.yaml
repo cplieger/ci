@@ -261,9 +261,10 @@ jobs:
             --base "$RUNNER_TEMP/base-budgets.json" \
             --results "$RUNNER_TEMP/results" \
             --prefix "$PREFIX" \
-            --calibrations tests/perf/calibrations \
+            --sources tests/perf/sources \
             --repo "$REPO" \
             --head "$head" \
+            --base-sha "$base" \
             --plan-doc tests/perf/plan.json --set "$SET" --only "$ONLY" \
             --remeasure-out "$RUNNER_TEMP/remeasure.json" \
             --summary "$GITHUB_STEP_SUMMARY"

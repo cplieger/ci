@@ -3,6 +3,7 @@ red cell, the ten-run calibration and the provenance of a changed entry."""
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import os
@@ -30,6 +31,9 @@ CELL = {
     'window': 'cold',
 }
 RUN_URL = 'https://github.com/cplieger/ci/actions/runs/'
+MEASURED_URL = f'https://github.com/{REPO}/actions/runs/'
+DOM = 'files/x10/chromium/desktop/cold/dom'
+CPU = 'files/x10/chromium/desktop/cold/cpu_ms'
 PREFIX = 'cplieger-marotte'
 # The artifact prefix of a repository cplieger/a-measure-x, whose shards a
 # `perf-results-cplieger-a-measure-*` download pattern also matches.
@@ -149,6 +153,45 @@ class TheRule(unittest.TestCase):
             with self.subTest(tier=e['tier']):
                 errors = perf_gate.check_rule(budgets([e]))
                 self.assertTrue(any('carries no reason' in x for x in errors), errors)
+
+    def test_a_measured_file_sources_an_exact_entry_with_its_reason(self):
+        url = MEASURED_URL + '900/attempts/1'
+        moved = entry('dom', 'exact', 2056, source=url, reason='one more node in the view')
+        self.assertEqual(perf_gate.check_rule(budgets([moved])), [])
+        silent = entry('dom', 'exact', 2056, source=url)
+        self.assertEqual(
+            perf_gate.check_rule(budgets([silent])),
+            [f'{DOM}: a value from a measured file needs its one-line reason'],
+        )
+        gated = entry(source=url, reason='slower')
+        self.assertEqual(
+            perf_gate.check_rule(budgets([gated])),
+            [f'{CPU}: only an exact entry takes its value from a measured file'],
+        )
+
+    def test_a_source_url_is_a_calibration_run_or_a_measured_run_attempt(self):
+        cases = {
+            RUN_URL + '111': ('calibration', 'cplieger/ci', '111', '', 'calibration 111'),
+            MEASURED_URL + '900/attempts/2': ('measured', REPO, '900', '2', 'measured file 900-2'),
+        }
+        for url, (kind, repository, run_id, attempt, label) in cases.items():
+            with self.subTest(url=url):
+                s = perf_gate.parse_source(url)
+                self.assertEqual(
+                    (s.kind, s.repository, s.run_id, s.attempt), (kind, repository, run_id, attempt)
+                )
+                self.assertEqual((s.url, s.label), (url, label))
+        ci = perf_gate.parse_source(RUN_URL + '111/attempts/1')
+        self.assertEqual((ci.kind, ci.repository, ci.stem), ('measured', 'cplieger/ci', '111-1'))
+        for url in (
+            'https://github.com/cplieger/other/actions/runs/111',
+            MEASURED_URL + '900',
+            MEASURED_URL + '900/attempts/x',
+            'https://example.com/cplieger/ci/actions/runs/111',
+            None,
+        ):
+            with self.subTest(url=url):
+                self.assertIsNone(perf_gate.parse_source(url))
 
     def test_an_unknown_tier_fails(self):
         self.assertTrue(perf_gate.check_rule(budgets([entry(tier='maybe', budget=1500.0)])))
@@ -551,6 +594,35 @@ def cal_cell(metric='cpu_ms', baseline=1000.0, tier='gated', runs=10, slow_runs=
     return c
 
 
+def measured_file(cells, commit='pr-head', run_id='900', attempt='1', **kw):
+    """A perf-ci verdict's measured file of the pull request head commit."""
+    doc = {
+        'schema': 2,
+        'kind': 'measured',
+        'repo': REPO,
+        'commit': commit,
+        'measured_sha': 'merge',
+        'runner': RUNNER,
+        'run_id': run_id,
+        'run_attempt': attempt,
+        'run_url': f'{MEASURED_URL}{run_id}/attempts/{attempt}',
+        'workflow_repository': REPO,
+        'cpu_models': ['AMD EPYC 7763'],
+        'cells': cells,
+    }
+    doc.update(kw)
+    return doc
+
+
+def m_cell(value, metric='dom', **kw):
+    return {**CELL, 'metric': metric, 'value': value, 'reps': [value] * 6, **kw}
+
+
+MEASURED_SIGNER = perf_gate.Signer(
+    identity_regexp=perf_gate.MEASURED_IDENTITY, workflow_repository=REPO
+)
+
+
 class FakeGit:
     """perf_gate.Git over a made-up history. lineage holds (ancestor, descendant) pairs
     besides each commit's own; added maps a calibration file's name to the commit that
@@ -591,28 +663,39 @@ class Provenance(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = pathlib.Path(self.tmp.name)
         self.verified = []
+        self.signers = []
         self.bad_bundles = set()
+        # The signer that made each stem's bundle, when another than the one asked for.
+        self.signed_by = {}
         self.git = FakeGit()
+        self.stale = set()
 
-    def write(self, run_id, doc):
-        doc = {**doc, 'run_id': run_id, 'run_url': RUN_URL + run_id}
-        (self.dir / f'{run_id}.json').write_text(json.dumps(doc))
-        (self.dir / f'{run_id}.sigstore.json').write_text('{}')
+    def write(self, stem, doc):
+        if '-' not in stem:
+            doc = {**doc, 'run_id': stem, 'run_url': RUN_URL + stem}
+        (self.dir / f'{stem}.json').write_text(json.dumps(doc))
+        (self.dir / f'{stem}.sigstore.json').write_text('{}')
 
-    def verify(self, blob, bundle):
+    def verify(self, blob, bundle, signer):
         self.verified.append((pathlib.Path(blob).name, pathlib.Path(bundle).name))
-        return 'bundle does not verify' if pathlib.Path(bundle).name in self.bad_bundles else None
+        self.signers.append(signer)
+        if pathlib.Path(bundle).name in self.bad_bundles:
+            return 'bundle does not verify'
+        made = self.signed_by.get(pathlib.Path(blob).stem, signer)
+        return None if made == signer else f'no matching CertificateIdentity for {made}'
 
-    def check(self, head, base):
-        return perf_gate.check_provenance(
+    def check(self, head, base, base_sha=HEAD, verify=None):
+        errors, self.stale = perf_gate.check_provenance(
             head,
             base,
-            calibrations=self.dir,
+            sources=self.dir,
             repo=REPO,
             head_sha=HEAD,
-            verify=self.verify,
+            base_sha=base_sha,
+            verify=verify or self.verify,
             git=self.git,
         )
+        return errors
 
     def dom(self, run_id, baseline, commit, *more):
         exact = {'metric': 'dom', 'kind': 'count', 'tier': 'exact'}
@@ -708,25 +791,216 @@ class Provenance(unittest.TestCase):
         self.git.lineage = {('squash', HEAD)}
         self.dom('200', 4384.0, 'pr-tip')
         errors = self.unchanged(self.exact('200', 4384.0))
-        self.assertTrue(
-            any(x.startswith('calibration 200:') and 're-calibrate' in x for x in errors), errors
-        )
+        tail = 'take entries only from a calibration of the default branch'
+        self.assertTrue(any(x.startswith('calibration 200:') and tail in x for x in errors), errors)
         changed = self.check(budgets([self.exact('200', 4384.0)]), budgets([]))
         self.assertTrue(
-            any(x.startswith('calibration 200:') and 're-calibrate' in x for x in changed), changed
+            any(x.startswith('calibration 200:') and tail in x for x in changed), changed
         )
 
-    def test_a_push_after_the_calibration_fails_in_the_pull_requests_own_run(self):
-        # The merge ref contains the calibrated tip, but its own change is not the tip's.
-        self.git.lineage = {('pr-tip', HEAD), ('merge', HEAD)}
-        self.git.added = {'200.json': 'merge'}
-        self.dom('200', 4384.0, 'pr-tip')
-        errors = self.check(budgets([self.exact('200', 4384.0)]), budgets([]))
-        self.assertTrue(
-            any(x.startswith('calibration 200:') and 're-calibrate' in x for x in errors), errors
+    def moved(self, value, stem='900-1', reason='one more node in the view', **kw):
+        run_id, attempt = stem.split('-')
+        url = f'{MEASURED_URL}{run_id}/attempts/{attempt}'
+        return entry(metric='dom', tier='exact', baseline=value, source=url, reason=reason, **kw)
+
+    def pr_measured(self, *cells, stem='900-1', commit='pr-head', **kw):
+        """stem's measured file of commit, checked in on top of it."""
+        self.git.lineage.add((commit, HEAD))
+        run_id, attempt = stem.split('-')
+        doc = measured_file(list(cells), commit=commit, run_id=run_id, attempt=attempt, **kw)
+        self.write(stem, doc)
+
+    def moved_from(self, base_value=2055.0):
+        return budgets([self.exact('100', base_value)])
+
+    def test_an_exact_change_from_the_pull_requests_own_measured_file_passes(self):
+        self.pr_measured(m_cell(2056))
+        head = budgets([self.moved(2056)])
+        self.assertEqual(self.check(head, self.moved_from(), base_sha='ba5e'), [])
+        self.assertEqual(self.stale, set())
+        self.assertEqual(self.verified, [('900-1.json', '900-1.sigstore.json')])
+        self.assertEqual(self.signers, [MEASURED_SIGNER])
+
+    def test_a_hand_edited_exact_value_fails_naming_the_measured_one(self):
+        self.pr_measured(m_cell(2056))
+        errors = self.check(budgets([self.moved(2057)]), self.moved_from())
+        self.assertEqual(
+            errors,
+            [
+                (
+                    f'{DOM}: baseline 2057 is not what run {MEASURED_URL}900/attempts/1 measured '
+                    '(2056); take the value with perf_gate.py --take'
+                )
+            ],
         )
-        self.git.same = {('pr-tip', 'merge')}
-        self.assertEqual(self.check(budgets([self.exact('200', 4384.0)]), budgets([])), [])
+        self.assertEqual(self.stale, {keyof(self.moved(2057))})
+
+    def test_a_measured_file_of_another_head_fails_unless_patch_equivalent(self):
+        # The merge ref's own change is not the measured head's: a push after the run.
+        self.write('900-1', measured_file([m_cell(2056)], commit='other-head'))
+        head = budgets([self.moved(2056)])
+        errors = self.check(head, self.moved_from())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith('measured file 900-1: '), errors)
+        self.assertIn('take the measured file this run wrote', errors[0])
+        self.assertEqual(self.stale, {keyof(self.moved(2056))})
+        self.git.same = {('other-head', HEAD)}
+        self.assertEqual(self.check(head, self.moved_from()), [])
+        self.assertEqual(self.stale, set())
+
+    def test_a_measured_value_without_verifiable_provenance_fails_closed(self):
+        head = budgets([self.moved(2056)])
+        other_run = dataclasses.replace(MEASURED_SIGNER, workflow_repository='cplieger/other')
+        cases = {
+            'no file': ({}, lambda: self.dir.joinpath('900-1.json').unlink(), 'checked in'),
+            'no bundle': (
+                {},
+                lambda: self.dir.joinpath('900-1.sigstore.json').unlink(),
+                'checked in',
+            ),
+            'a bundle that fails': (
+                {},
+                lambda: self.bad_bundles.add('900-1.sigstore.json'),
+                'the bundle does not verify',
+            ),
+            'signed by perf-calibrate': (
+                {},
+                lambda: self.signed_by.update({'900-1': perf_gate.CALIBRATION_SIGNER}),
+                'the bundle does not verify',
+            ),
+            'signed in another repository': (
+                {},
+                lambda: self.signed_by.update({'900-1': other_run}),
+                'the bundle does not verify',
+            ),
+            'another repository': ({'repo': 'cplieger/other'}, None, 'repo is'),
+            'another runner': ({'runner': 'self-hosted'}, None, 'runner is'),
+            'a run outside the repository and ci': (
+                {'workflow_repository': 'cplieger/other'},
+                None,
+                'workflow_repository',
+            ),
+            'a calibration doc': ({'kind': 'calibration'}, None, 'kind'),
+            'another schema': ({'schema': 1}, None, 'schema'),
+            'another run': ({'run_id': '901'}, None, 'run_id'),
+            'another attempt': ({'run_attempt': '2'}, None, 'run_attempt'),
+            'a cell without a value': (
+                {'cells': [{**m_cell(2056), 'value': None}]},
+                None,
+                'value',
+            ),
+        }
+        for name, (doc, setup, want) in cases.items():
+            with self.subTest(name):
+                self.bad_bundles.clear()
+                self.signed_by.clear()
+                self.write('900-1', {**measured_file([m_cell(2056)]), **doc})
+                self.git.lineage.add(('pr-head', HEAD))
+                if setup:
+                    setup()
+                errors = self.check(head, self.moved_from())
+                self.assertEqual(len(errors), 1, errors)
+                self.assertTrue(errors[0].startswith('measured file 900-1: '), errors)
+                self.assertIn(want, errors[0])
+                self.assertEqual(self.stale, {keyof(self.moved(2056))})
+
+    def test_a_source_checked_without_cosign_fails_closed(self):
+        self.pr_measured(m_cell(2056))
+        with unittest.mock.patch.dict(os.environ, {'PATH': ''}):
+            errors = self.check(
+                budgets([self.moved(2056)]), self.moved_from(), verify=perf_gate.cosign_verify
+            )
+        self.assertEqual(
+            errors, ['measured file 900-1: the bundle does not verify: cosign is not installed']
+        )
+
+    def test_a_source_url_names_the_repository_whose_run_wrote_the_file(self):
+        self.pr_measured(m_cell(2056))
+        moved = self.moved(2056)
+        elsewhere = {
+            **moved,
+            'source': 'https://github.com/cplieger/ci/actions/runs/900/attempts/1',
+        }
+        errors = self.check(budgets([elsewhere]), self.moved_from())
+        self.assertEqual(
+            errors,
+            [
+                (
+                    f'{DOM}: source https://github.com/cplieger/ci/actions/runs/900/attempts/1 is not '
+                    f'the run that wrote 900-1.json, {MEASURED_URL}900/attempts/1'
+                )
+            ],
+        )
+        self.pr_measured(
+            m_cell(2056), workflow_repository='cplieger/ci', run_url=elsewhere['source']
+        )
+        self.assertEqual(self.check(budgets([elsewhere]), self.moved_from()), [])
+        self.assertEqual(
+            self.signers[-1],
+            dataclasses.replace(MEASURED_SIGNER, workflow_repository='cplieger/ci'),
+        )
+
+    def test_a_measured_file_never_adds_an_entry_or_moves_a_tier(self):
+        self.pr_measured(m_cell(2056))
+        self.assertEqual(
+            self.check(budgets([self.moved(2056)]), budgets([])),
+            [f'{DOM}: measured file 900-1 moves the value of an exact entry, and adds none'],
+        )
+        gated = entry('dom', 'gated', 2055.0, budget=2100.0, source=RUN_URL + '100')
+        self.assertEqual(
+            self.check(budgets([self.moved(2056)]), budgets([gated])),
+            [f'{DOM}: measured file 900-1 moves the value of an exact entry, not a gated one'],
+        )
+
+    def test_a_pull_request_branch_calibration_moves_no_entry(self):
+        self.git.lineage = {('pr-head', HEAD)}
+        self.dom('200', 2056.0, 'pr-head')
+        head = budgets([self.exact('200', 2056.0)])
+        errors = self.check(head, self.moved_from(), base_sha='ba5e')
+        self.assertEqual(
+            errors,
+            [
+                (
+                    f'{DOM}: calibration 200 measured pr-head, which the base ba5e does not hold; '
+                    'a calibration of a pull request moves no entry'
+                )
+            ],
+        )
+        self.assertEqual(self.stale, {keyof(self.exact('200', 2056.0))})
+        self.assertEqual(self.check(head, head, base_sha='ba5e'), [])
+        self.git.lineage.add(('pr-head', 'ba5e'))
+        self.assertEqual(self.check(head, self.moved_from(), base_sha='ba5e'), [])
+
+    def test_the_newest_source_spans_calibrations_and_measured_files(self):
+        x1 = cal_cell(metric='dom', kind='count', tier='exact', baseline=1.0, scale='x1')
+        x1_entry = self.exact('100', 1.0, scale='x1')
+        self.git.lineage = {('0ld', HEAD), ('0ld', 'pr-head')}
+        self.dom('100', 2055.0, '0ld', x1)
+        self.pr_measured(m_cell(2056), m_cell(5, scale='x2'))
+        x2 = self.moved(5, scale='x2')
+        errors = self.unchanged(self.exact('100', 2055.0), x1_entry, x2)
+        self.assertEqual(
+            errors,
+            [
+                (
+                    f'{DOM}: measured file 900-1 measured this cell at pr-head, which descends from '
+                    "source calibration 100's 0ld; take the entry from 900-1"
+                )
+            ],
+        )
+        self.assertEqual(self.unchanged(self.moved(2056), x1_entry, x2), [])
+        # The scheduled calibration of the merged change measured it again.
+        self.git.lineage = {('pr-head', '0ld'), ('pr-head', HEAD), ('0ld', HEAD)}
+        errors = self.unchanged(self.moved(2056), x1_entry, x2)
+        self.assertEqual(
+            errors,
+            [
+                (
+                    f'{DOM}: calibration 100 measured this cell at 0ld, which descends from '
+                    "source measured file 900-1's pr-head; take the entry from 100"
+                )
+            ],
+        )
 
     def test_an_unplaceable_calibration_is_one_error_for_the_entries_naming_it(self):
         self.git.added = {'200.json': 'squash'}
@@ -744,12 +1018,13 @@ class Provenance(unittest.TestCase):
         errors = self.unchanged(self.exact('200', 4384.0))
         self.assertTrue(any(x.startswith('calibration 200:') for x in errors), errors)
 
-    def test_a_calibration_path_that_is_a_directory_fails(self):
+    def test_a_source_path_that_is_a_directory_fails(self):
         x1 = self.two_commits()
-        (self.dir / '300.json').mkdir()
-        errors = self.unchanged(self.exact('100', 4400.0), x1)
-        self.assertTrue(
-            any(x.startswith('calibration 300:') and 'directory' in x for x in errors), errors
+        (self.dir / '100.json').unlink()
+        (self.dir / '100.json').mkdir()
+        errors = self.unchanged(self.exact('200', 4384.0), x1)
+        self.assertIn(
+            'calibration 100: 100.json and 100.sigstore.json must both be checked in', errors
         )
 
     def test_a_cell_key_field_that_is_not_a_string_fails(self):
@@ -823,13 +1098,26 @@ class Provenance(unittest.TestCase):
             self.check(budgets([entry(baseline=900.0)]), budgets([entry(baseline=1000.0)]))
         )
 
-    def test_a_raised_baseline_needs_a_reason(self):
+    def test_a_calibration_raises_a_baseline_without_a_reason(self):
         self.write('111', calibration_file([cal_cell(baseline=1200.0)]))
         base = budgets([entry(baseline=1000.0, source=RUN_URL + '100')])
-        self.assertTrue(self.check(budgets([entry(baseline=1200.0)]), base))
+        self.assertEqual(self.check(budgets([entry(baseline=1200.0)]), base), [])
+
+    def test_a_reason_on_a_calibration_entry_needs_a_raise_this_change_makes(self):
+        self.write('111', calibration_file([cal_cell()]))
+        why = budgets([entry(reason='slower parse')])
         self.assertEqual(
-            self.check(budgets([entry(baseline=1200.0, reason='costs 200 ms for X')]), base), []
+            self.check(why, budgets([entry()])),
+            [
+                (
+                    f'{CPU}: a reason belongs on a measured value, or on a budget a headroom, floor '
+                    'or target edit raises'
+                )
+            ],
         )
+        self.assertEqual(self.check(why, why), [])
+        lower = {'cpu_ms': 50, 'heap_mb': 0.5}
+        self.assertEqual(self.check(budgets(why['budgets'], floor=lower), why), [])
 
     def test_a_lowered_entry_matching_its_signed_file_passes(self):
         self.write('111', calibration_file([cal_cell(baseline=900.0)]))
@@ -843,38 +1131,12 @@ class Provenance(unittest.TestCase):
         self.assertEqual(self.check(budgets([entry(baseline=900.0, headroom=1.6)]), base), [])
         self.assertTrue(self.check(budgets([entry(baseline=900.0)]), base))
 
-    def test_a_five_run_file_lowers_a_gated_baseline_and_keeps_its_tier(self):
+    def test_a_calibration_of_fewer_than_ten_runs_fails(self):
         self.write('111', calibration_file([cal_cell(baseline=900.0, tier=None, runs=5)], runs=5))
         base = budgets([entry(baseline=1000.0, source=RUN_URL + '100')])
-        self.assertEqual(self.check(budgets([entry(baseline=900.0)]), base), [])
-
-    def test_a_five_run_file_never_promotes_demotes_or_widens(self):
-        self.write('111', calibration_file([cal_cell(baseline=900.0, tier=None, runs=5)], runs=5))
-        gated = budgets([entry(baseline=1000.0, source=RUN_URL + '100')])
-        reported = budgets([entry(baseline=1000.0, tier='reported', source=RUN_URL + '100')])
-        cases = (
-            ('promotes', budgets([entry(baseline=900.0)]), reported),
-            ('demotes', budgets([entry(baseline=900.0, tier='reported')]), gated),
-            ('widens', budgets([entry(baseline=900.0, headroom=1.6)]), gated),
-        )
-        for name, head, base in cases:
-            with self.subTest(name):
-                self.assertTrue(self.check(head, base))
-
-    def test_a_five_run_file_adds_only_reported_entries(self):
-        self.write('111', calibration_file([cal_cell(baseline=900.0, tier=None, runs=5)], runs=5))
-        self.assertTrue(self.check(budgets([entry(baseline=900.0)]), budgets([])))
-        self.assertEqual(
-            self.check(budgets([entry(baseline=900.0, tier='reported')]), budgets([])), []
-        )
-
-    def test_a_five_run_file_whose_leave_one_out_trips_a_gated_cell_fails_naming_ten_runs(self):
-        noisy = cal_cell(baseline=1000.0, tier=None, runs=5, slow_runs=(1, 2))
-        self.write('111', calibration_file([noisy], runs=5))
-        base = budgets([entry(baseline=1100.0, source=RUN_URL + '100')])
-        errors = self.check(budgets([entry(baseline=1000.0)]), base)
-        self.assertTrue(errors)
-        self.assertIn('ten', ' '.join(errors))
+        want = ['calibration 111: 5 runs decide no tier; a calibration needs 10']
+        self.assertEqual(self.check(budgets([entry(baseline=900.0)]), base), want)
+        self.assertEqual(self.unchanged(entry(baseline=900.0)), want)
 
     def test_a_gated_entry_dropped_without_retired_fails(self):
         base = budgets([entry(source=RUN_URL + '100')])
@@ -888,17 +1150,33 @@ class Provenance(unittest.TestCase):
         base = budgets([entry(tier='reported', source=RUN_URL + '100')])
         self.assertEqual(self.check(budgets([]), base), [])
 
-    def test_an_unchanged_entry_whose_file_is_absent_fails_without_reverifying(self):
+    def test_an_unchanged_entry_whose_file_is_absent_fails(self):
         b = budgets([entry(source=RUN_URL + '100')])
         self.assertEqual(
             self.check(b, b),
-            ['files/x10/chromium/desktop/cold/cpu_ms: calibration 100 is not checked in'],
+            ['calibration 100: 100.json and 100.sigstore.json must both be checked in'],
         )
         self.assertEqual(self.verified, [])
 
+    def test_a_source_an_unchanged_entry_names_still_verifies(self):
+        self.write('111', calibration_file([cal_cell()]))
+        b = budgets([entry()])
+        self.assertEqual(self.check(b, b), [])
+        self.assertEqual(self.verified, [('111.json', '111.sigstore.json')])
+        self.assertEqual(self.signers, [perf_gate.CALIBRATION_SIGNER])
+        self.bad_bundles.add('111.sigstore.json')
+        self.assertEqual(
+            self.check(b, b),
+            ['calibration 111: the bundle does not verify: bundle does not verify'],
+        )
+        self.assertEqual(self.stale, set())
+
     def test_an_unchanged_entry_whose_source_is_not_a_run_url_fails(self):
         b = budgets([entry(source='https://example.com/1')])
-        self.assertTrue(any('not a perf-calibrate run URL' in x for x in self.check(b, b)))
+        self.assertEqual(
+            self.check(b, b),
+            [f"{CPU}: source 'https://example.com/1' is not a calibration or measured run URL"],
+        )
 
     def test_a_target_edit_rechecks_an_entry_whose_fields_did_not_change(self):
         srv = entry('server_cpu_ms', baseline=20.0, budget=63.0, source=RUN_URL + '100')
@@ -916,12 +1194,22 @@ class Provenance(unittest.TestCase):
             ],
         )
 
-    def test_a_calibration_file_no_entry_names_fails(self):
+    def test_a_source_file_no_entry_names_fails(self):
+        self.write('111', calibration_file([cal_cell()]))
         self.write('333', calibration_file([cal_cell()]))
-        b = budgets([entry(source=RUN_URL + '100')])
-        errors = self.check(b, b)
-        self.assertTrue(errors)
-        self.assertIn('333', ' '.join(errors))
+        self.write('901-1', measured_file([m_cell(2056)], run_id='901'))
+        (self.dir / 'notes.txt').write_text('')
+        b = budgets([entry()])
+        self.assertEqual(
+            self.check(b, b),
+            [
+                '333.json: no budget entry names source 333',
+                '333.sigstore.json: no budget entry names source 333',
+                '901-1.json: no budget entry names source 901-1',
+                '901-1.sigstore.json: no budget entry names source 901-1',
+                'notes.txt: not a source file or bundle',
+            ],
+        )
 
     def test_a_changed_entry_whose_file_is_missing_fails(self):
         base = budgets([entry(baseline=1000.0, source=RUN_URL + '100')])
@@ -943,7 +1231,7 @@ class Provenance(unittest.TestCase):
         self.write('111', calibration_file([cal_cell(), dom], runner='self-hosted-x'))
         self.assertEqual(self.check(head, base), [])
 
-    def test_a_headroom_or_floor_edit_needs_accepted_for_every_budget_it_raises(self):
+    def test_a_headroom_or_floor_edit_needs_a_reason_for_every_budget_it_raises(self):
         wide = {'cpu_ms': 2.0, 'heap_mb': 1.25, 'rss_mb': 1.25}
         high = {'cpu_ms': 100, 'heap_mb': 1}
         cases = (
@@ -1055,7 +1343,7 @@ class GitHistory(unittest.TestCase):
             self.commit('dev moved')
         self.put('app.txt', app)
         self.put('lib.txt', (self.root / 'lib.txt').read_text().replace('l10', 'L10'))
-        self.put('tests/perf/calibrations/200.json', '{}')
+        self.put('tests/perf/sources/200.json', '{}')
         self.put('tests/perf/budgets.json', '{}')
         self.put(
             'tests/perf/plan.json',
@@ -1073,7 +1361,7 @@ class GitHistory(unittest.TestCase):
         squash = self.squash()
         git = self.git()
         self.assertFalse(git.is_ancestor(self.tip, squash))
-        self.assertEqual(git.added_by('tests/perf/calibrations/200.json', squash), squash)
+        self.assertEqual(git.added_by('tests/perf/sources/200.json', squash), squash)
         self.assertTrue(git.same_change(self.tip, squash))
 
     def test_a_squash_after_an_unrelated_dev_merge_brings_the_measured_change(self):
@@ -1103,7 +1391,7 @@ class GitHistory(unittest.TestCase):
 
     def squash_of(self, app):
         self.put('app.txt', app)
-        self.put('tests/perf/calibrations/200.json', '{}')
+        self.put('tests/perf/sources/200.json', '{}')
         return self.commit('squash')
 
     def test_a_squash_differing_by_a_carriage_return_is_refused(self):
@@ -1125,36 +1413,36 @@ class GitHistory(unittest.TestCase):
         self.sh('checkout', '-q', 'pr')
         self.put('app.txt', 'three')
         self.commit('a push after calibrating')
-        self.put('tests/perf/calibrations/200.json', '{}')
+        self.put('tests/perf/sources/200.json', '{}')
         self.commit('check in')
         self.sh('checkout', '-q', 'main')
         self.put('other.txt', 'dev')
         self.commit('dev moved')
         self.sh('merge', '-q', '--no-ff', '-m', 'merge', 'pr')
         merge = self.sh('rev-parse', 'HEAD')
-        path = pathlib.Path('tests/perf/calibrations/200.json')
+        path = pathlib.Path('tests/perf/sources/200.json')
         at, why = perf_gate.placed_commit({'commit': self.tip}, path, self.git(), merge)
         self.assertIsNone(at)
-        self.assertIn('re-calibrate', why)
+        self.assertIn('take entries only from a calibration of the default branch', why)
 
     def test_a_calibration_of_the_pull_requests_final_head_is_placed_at_the_merge_ref(self):
         self.sh('checkout', '-q', 'pr')
-        self.put('tests/perf/calibrations/200.json', '{}')
+        self.put('tests/perf/sources/200.json', '{}')
         self.commit('check in')
         self.sh('checkout', '-q', 'main')
         self.put('other.txt', 'dev')
         self.commit('dev moved')
         self.sh('merge', '-q', '--no-ff', '-m', 'merge', 'pr')
         merge = self.sh('rev-parse', 'HEAD')
-        path = pathlib.Path('tests/perf/calibrations/200.json')
+        path = pathlib.Path('tests/perf/sources/200.json')
         self.assertEqual(
             perf_gate.placed_commit({'commit': self.tip}, path, self.git(), merge),
             (self.tip, None),
         )
 
     def test_a_calibration_no_commit_of_head_added_is_refused_naming_it(self):
-        self.put('tests/perf/calibrations/300.json', '{}')
-        path = pathlib.Path('tests/perf/calibrations/300.json')
+        self.put('tests/perf/sources/300.json', '{}')
+        path = pathlib.Path('tests/perf/sources/300.json')
         at, why = perf_gate.placed_commit({'commit': self.tip}, path, self.git(), self.base)
         self.assertIsNone(at)
         self.assertIn('no first-parent commit', why)
@@ -1193,12 +1481,12 @@ class GitHistory(unittest.TestCase):
 
     def test_the_file_a_merged_branch_added_is_placed_at_the_merge(self):
         self.sh('checkout', '-q', 'pr')
-        self.put('tests/perf/calibrations/200.json', '{}')
+        self.put('tests/perf/sources/200.json', '{}')
         self.commit('check in')
         self.sh('checkout', '-q', 'main')
         self.sh('merge', '-q', '--no-ff', '-m', 'merge', 'pr')
         merge = self.sh('rev-parse', 'HEAD')
-        self.assertEqual(self.git().added_by('tests/perf/calibrations/200.json', merge), merge)
+        self.assertEqual(self.git().added_by('tests/perf/sources/200.json', merge), merge)
 
     def test_a_moved_calibration_is_placed_at_its_measured_commit(self):
         self.put('tests/perf/calibrations/200.json', json.dumps({'commit': self.base}))
@@ -1215,6 +1503,59 @@ class GitHistory(unittest.TestCase):
                     perf_gate.placed_commit({'commit': self.base}, path, git, moved),
                     (self.base, None),
                 )
+
+    def measured(self, commit, stem):
+        run_id, attempt = stem.split('-')
+        doc = measured_file([m_cell(2056)], commit=commit, run_id=run_id, attempt=attempt)
+        self.put(f'tests/perf/sources/{stem}.json', doc)
+        self.put(f'tests/perf/sources/{stem}.sigstore.json', '{}')
+
+    def merge_ref(self):
+        """GitHub's merge ref of pr: main with pr merged into it, checked out."""
+        self.sh('checkout', '-q', '--detach', 'main')
+        self.sh('merge', '-q', '--no-ff', '-m', 'merge ref', 'pr')
+        return self.sh('rev-parse', 'HEAD')
+
+    def provenance(self, git, stem, head_sha):
+        run_id, attempt = stem.split('-')
+        url = f'{MEASURED_URL}{run_id}/attempts/{attempt}'
+        head = budgets([entry('dom', 'exact', 2056, source=url, reason='one more node')])
+        return perf_gate.check_provenance(
+            head,
+            budgets([entry('dom', 'exact', 2055, source=RUN_URL + '100')]),
+            sources=pathlib.Path('tests/perf/sources'),
+            repo=REPO,
+            head_sha=head_sha,
+            base_sha=self.sh('rev-parse', 'main'),
+            verify=lambda blob, bundle, signer: None,
+            git=git,
+        )
+
+    def test_a_measured_file_of_the_head_before_a_dev_merge_near_the_change_is_retaken(self):
+        git = self.git()
+        self.sh('checkout', '-q', 'pr')
+        self.measured(self.tip, '900-1')
+        self.commit('take the measured file')
+        self.sh('checkout', '-q', 'main')
+        # Generated code regenerated on dev two lines above the pull request's change.
+        self.put('lib.txt', (self.root / 'lib.txt').read_text().replace('l8', 'L8'))
+        self.commit('dev regenerates')
+        self.sh('checkout', '-q', 'pr')
+        self.sh('merge', '-q', '--no-edit', 'main')
+        merged = self.sh('rev-parse', 'HEAD')
+        errors, stale = self.provenance(git, '900-1', self.merge_ref())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith('measured file 900-1: '), errors)
+        self.assertIn(f'than measured {self.tip} made', errors[0])
+        self.assertIn('take the measured file this run wrote', errors[0])
+        self.assertEqual(stale, {keyof(entry('dom'))})
+        self.sh('checkout', '-q', 'pr')
+        self.sh(
+            'rm', '-q', 'tests/perf/sources/900-1.json', 'tests/perf/sources/900-1.sigstore.json'
+        )
+        self.measured(merged, '901-1')
+        self.commit('take the new head measured file')
+        self.assertEqual(self.provenance(git, '901-1', self.merge_ref()), ([], set()))
 
     def test_git_errors_raise_and_a_short_sha_is_refused(self):
         git = self.git()
@@ -1319,11 +1660,24 @@ class RealCosign(unittest.TestCase):
     BUNDLE = TESTDATA / 'trivy_0.76.2_checksums.txt.sigstore.json'
 
     def test_a_bundle_signed_by_another_identity_fails(self):
-        self.assertIsNotNone(perf_gate.cosign_verify(self.BLOB, self.BUNDLE))
+        for signer in (perf_gate.CALIBRATION_SIGNER, MEASURED_SIGNER):
+            with self.subTest(signer=signer):
+                self.assertIsNotNone(perf_gate.cosign_verify(self.BLOB, self.BUNDLE, signer))
 
     def test_the_same_bundle_verifies_for_its_own_signer(self):
         trivy = 'https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v0.76.2'
-        self.assertIsNone(perf_gate.cosign_verify(self.BLOB, self.BUNDLE, identity=trivy))
+        pattern = r'^https://github\.com/aquasecurity/trivy/\.github/workflows/[a-z-]+\.yaml@refs/tags/v[0-9.]+$'
+        for signer in (
+            perf_gate.Signer(identity=trivy),
+            perf_gate.Signer(identity_regexp=pattern),
+            perf_gate.Signer(identity=trivy, workflow_repository='aquasecurity/trivy'),
+        ):
+            with self.subTest(signer=signer):
+                self.assertIsNone(perf_gate.cosign_verify(self.BLOB, self.BUNDLE, signer))
+        elsewhere = perf_gate.Signer(identity=trivy, workflow_repository='cplieger/ci')
+        self.assertIn(
+            'GithubWorkflowRepository', perf_gate.cosign_verify(self.BLOB, self.BUNDLE, elsewhere)
+        )
 
 
 def unit(scenario, seconds, scale='x10', engine='chromium', width='desktop', **kw):
@@ -1614,7 +1968,7 @@ class Cli(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dir = pathlib.Path(self.tmp.name)
-        (self.dir / 'cal').mkdir()
+        (self.dir / 'sources').mkdir()
         # Text put() replaces in every file it writes, for JSON that
         # json.dumps cannot produce.
         self.swap = {}
@@ -1645,22 +1999,25 @@ class Cli(unittest.TestCase):
             if not isinstance(e, dict) or not str(e.get('source', '')).startswith(RUN_URL):
                 continue
             run_id = e['source'].rsplit('/', 1)[1]
-            path = self.dir / 'cal' / f'{run_id}.json'
+            path = self.dir / 'sources' / f'{run_id}.json'
             held = json.loads(path.read_text())['cells'] if path.is_file() else []
             c = cal_cell(e['metric'], e.get('baseline', 0.0), e['tier'], **{f: e[f] for f in CELL})
-            self.put(f'cal/{run_id}.json', calibration_file([*held, c], run_id=run_id))
-            self.put(f'cal/{run_id}.sigstore.json', {})
-        patch = unittest.mock.patch.object(perf_gate, 'Git', FakeGit)
-        patch.start()
-        self.addCleanup(patch.stop)
+            self.put(f'sources/{run_id}.json', calibration_file([*held, c], run_id=run_id))
+            self.put(f'sources/{run_id}.sigstore.json', {})
+        for patch in (
+            unittest.mock.patch.object(perf_gate, 'Git', FakeGit),
+            unittest.mock.patch.object(perf_gate, 'cosign_verify', return_value=None),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
         own = 'results/perf-results-cplieger-a-measure-shard-1-of-1-attempt-1/results.json'
         self.put(own, results(cells) if shard is None else shard)
         if other is not None:
             self.put(f'results/{OTHER}-measure-shard-1-of-1-attempt-1/results.json', results(other))
         argv = ('--budgets', b, '--base', b, '--results', str(self.dir / 'results'))
         argv += ('--prefix', 'cplieger-a')
-        argv += ('--calibrations', str(self.dir / 'cal'), '--repo', REPO, '--head', HEAD)
-        argv += ('--plan-doc', self.put('plan.json', plan), '--set', 'pr')
+        argv += ('--sources', str(self.dir / 'sources'), '--repo', REPO, '--head', HEAD)
+        argv += ('--base-sha', HEAD, '--plan-doc', self.put('plan.json', plan), '--set', 'pr')
         argv += (
             '--remeasure-out',
             str(self.dir / 'remeasure.json'),
@@ -1698,6 +2055,20 @@ class Cli(unittest.TestCase):
                     again,
                 )
                 self.assertEqual(self.main('--verdict', str(self.dir / 'again'), *argv), rc)
+
+    def test_compare_lists_the_exact_keys_a_fresh_measured_file_would_cure(self):
+        url = MEASURED_URL + '900/attempts/1'
+        moved = {**entry('dom', 'exact', 2056, source=url, reason='one more node'), 'scale': 'x1'}
+        measured = [
+            cell(),
+            cell('dom', (640,) * 3, kind='count'),
+            {**cell('dom', (2056,) * 3, kind='count'), 'scale': 'x1'},
+        ]
+        self.assertEqual(self.compare(measured, entries=[moved]), 1)
+        self.assertIn('measured file 900-1: 900-1.json and 900-1.sigstore.json', self.output)
+        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
+        self.assertEqual(remeasure['stale'], [perf_gate.key_dict(keyof(moved))])
+        self.assertEqual(remeasure['cells'], [])
 
     def test_compare_fails_on_a_listed_cell_no_shard_measured(self):
         self.assertEqual(self.compare([cell()]), 1)
@@ -1780,22 +2151,24 @@ class Cli(unittest.TestCase):
 
     def test_check_file_reports_a_numeric_metric_and_reads_no_calibration_for_it(self):
         numeric = cal_cell(metric=1)
-        self.put('cal/111.json', calibration_file([numeric]))
-        self.put('cal/111.sigstore.json', {})
+        self.put('sources/111.json', calibration_file([numeric]))
+        self.put('sources/111.sigstore.json', {})
         base = self.put('base.json', budgets([]))
         head = self.put('budgets.json', budgets([entry(metric=1, source=RUN_URL + '111')]))
-        argv = ('--check-file', head, '--base', base, '--calibrations', str(self.dir / 'cal'))
+        argv = ('--check-file', head, '--base', base, '--sources', str(self.dir / 'sources'))
         with (
             unittest.mock.patch.object(perf_gate, 'cosign_verify', return_value=None),
             unittest.mock.patch.object(perf_gate.Git, 'is_ancestor', return_value=True),
         ):
-            self.assertEqual(self.main(*argv, '--repo', REPO, '--head', HEAD), 1)
+            self.assertEqual(
+                self.main(*argv, '--repo', REPO, '--head', HEAD, '--base-sha', HEAD), 1
+            )
         self.assertIn('::error::budgets[0]: missing metric', self.output)
 
     def test_check_file_refuses_a_list_budgets_json(self):
         head = self.put('budgets.json', [entry(source=RUN_URL + '100')])
-        argv = ('--check-file', head, '--base', head, '--calibrations', str(self.dir / 'cal'))
-        self.assertEqual(self.main(*argv, '--repo', REPO, '--head', HEAD), 1)
+        argv = ('--check-file', head, '--base', head, '--sources', str(self.dir / 'sources'))
+        self.assertEqual(self.main(*argv, '--repo', REPO, '--head', HEAD, '--base-sha', HEAD), 1)
         self.assertIn('must be a JSON object', self.output)
 
     def test_check_file_refuses_a_nan_budget(self):
@@ -1803,8 +2176,8 @@ class Cli(unittest.TestCase):
         head = self.put(
             'budgets.json', budgets([entry(budget=float('nan'), source=RUN_URL + '100')])
         )
-        argv = ('--check-file', head, '--base', base, '--calibrations', str(self.dir / 'cal'))
-        self.assertEqual(self.main(*argv, '--repo', REPO, '--head', HEAD), 1)
+        argv = ('--check-file', head, '--base', base, '--sources', str(self.dir / 'sources'))
+        self.assertEqual(self.main(*argv, '--repo', REPO, '--head', HEAD, '--base-sha', HEAD), 1)
         self.assertIn('NaN is not a finite number', self.output)
 
     def test_the_results_readers_need_their_prefix_and_the_verdict_its_attempt(self):
@@ -1818,11 +2191,13 @@ class Cli(unittest.TestCase):
                     f,
                     '--results',
                     d,
-                    '--calibrations',
+                    '--sources',
                     d,
                     '--repo',
                     REPO,
                     '--head',
+                    HEAD,
+                    '--base-sha',
                     HEAD,
                     '--remeasure-out',
                     f,
@@ -1838,6 +2213,10 @@ class Cli(unittest.TestCase):
                 ['--prefix', '--remeasure-attempt'],
             ),
             'bench': (('--bench', d, '--out', f), ['--prefix']),
+            'check-file': (
+                ('--check-file', f, '--base', f, '--sources', d, '--repo', REPO, '--head', HEAD),
+                ['--base-sha'],
+            ),
         }
         for name, (argv, missing) in cases.items():
             with self.subTest(name):
@@ -1854,8 +2233,8 @@ class Cli(unittest.TestCase):
         )
         argv = ('--budgets', b, '--base', b, '--results', str(self.dir / 'results'))
         argv += ('--prefix', 'cplieger-a')
-        argv += ('--calibrations', str(self.dir / 'cal'), '--repo', REPO, '--head', HEAD)
-        argv += ('--remeasure-out', str(self.dir / 'remeasure.json'))
+        argv += ('--sources', str(self.dir / 'sources'), '--repo', REPO, '--head', HEAD)
+        argv += ('--base-sha', HEAD, '--remeasure-out', str(self.dir / 'remeasure.json'))
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.main(*argv)
 
@@ -1866,12 +2245,12 @@ class Cli(unittest.TestCase):
             b,
             '--base',
             b,
-            '--calibrations',
-            str(self.dir / 'cal'),
+            '--sources',
+            str(self.dir / 'sources'),
             '--repo',
             REPO,
         )
-        self.assertEqual(self.main(*argv, '--head', HEAD), 1)
+        self.assertEqual(self.main(*argv, '--head', HEAD, '--base-sha', HEAD), 1)
 
     def test_calibrate_writes_the_proposed_file(self):
         for i in range(10):

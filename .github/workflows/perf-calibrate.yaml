@@ -140,7 +140,7 @@ jobs:
           python3 ci/scripts/perf_gate.py --calibrate "$RUNNER_TEMP/artifacts" --prefix "$PREFIX" --runs "$RUNS" "${defaults[@]}" \
             --out "$out/budgets.proposed.json" --repo "$REPO" --commit "$COMMIT" \
             --runner ubuntu-26.04 --run-id "$RUN_ID" --run-url "$RUN_URL"
-          # The names tests/perf/calibrations/ holds, so the file is checked in as
+          # The names tests/perf/sources/ holds, so the file is checked in as
           # downloaded and its bundle verifies against those exact bytes.
           cp "$out/budgets.proposed.json" "$out/${RUN_ID}.json"
           cosign sign-blob --yes "$out/${RUN_ID}.json" --bundle "$out/${RUN_ID}.sigstore.json"
@@ -150,7 +150,7 @@ jobs:
           print(f"## Calibration of {doc['repo']} at `{doc['commit'][:12]}`\n")
           print(f"{doc['runs']} runs on `{doc['runner']}` ({', '.join(doc['cpu_models']) or 'CPU model unknown'}), "
                 f"{len(doc['cells'])} cells. Check in `{doc['run_id']}.json` and `{doc['run_id']}.sigstore.json` "
-                "under tests/perf/calibrations/.\n")
+                "under tests/perf/sources/.\n")
           whole = doc.get('whole_pr')
           if whole is None:
               print('Fewer than ten runs: baselines only, every cell keeps its tier and headroom.')
