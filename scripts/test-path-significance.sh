@@ -792,7 +792,7 @@ chk "S55 nor does removing it whole" "$(paths "$K6" "$K7")" 'false|[]|[]|[]'
 # A go.mod added or removed over files its container's zip leaves out moves
 # nothing to or from it: those in any dir holding a go.mod, a vendored package
 # by the zip's own go line (golang.org/x/mod/zip isVendoredPackage), a symlink.
-# The root is on go 1.27, the lane has no go line.
+# The root is on go 1.27, the lane has no go line until it takes go 1.27.
 newrepo carve-out-of-nothing
 put go.mod 'module example.com/go
 
@@ -911,6 +911,38 @@ chk "S59 the zip's go line is read per commit: go 1.24 leaves out vendor/modules
   "$(bash "$TOOLS/go-modules.sh" commits "$V23" "$V25" . | cut -f2 | tr '\n' ' ')" 'go.mod '
 chk "S59 a symlink no commit changes is no go root's either" \
   "$(printf 'alias.go\nmain.go\n' | bash "$TOOLS/go-modules.sh" paths "" "$V22" . | LC_ALL=C sort | tr '\t\n' ': ')" '.:main.go '
+put .hg_archival.txt 'repo: 0'
+V26=$(commit "chore: an hg archive stamp")
+chk "S59 nor does a module's .hg_archival.txt, which the zip drops" "$(paths "$V25" "$V26")" 'false|[]|[]|[]'
+chk "S59 which a docker root ships" "$(REPO_TYPE=docker paths "$V25" "$V26")" 'true|[]|[]|[".hg_archival.txt"]'
+put chartdata/.hg_archival.txt 'repo: 0'
+put docs/.hg_archival.txt 'repo: 0'
+V27=$(commit "chore: more hg archive stamps")
+chk "S59 in a lane too, while one in a subdir ships" "$(paths "$V26" "$V27")" 'true|[]|[]|["docs/.hg_archival.txt"]'
+chmod +x main.go chartdata/c.go
+V28=$(commit "chore: executable bits")
+chk "S59 nor does a change of mode alone, which the zip keeps no trace of" "$(paths "$V27" "$V28")" 'false|[]|[]|[]'
+chk "S59 which a docker root ships" "$(REPO_TYPE=docker paths "$V27" "$V28")" 'true|[]|[]|["main.go"]'
+put symlinked/x.go 'package symlinked'
+V29=$(commit "feat: a root package")
+ln -s ../main.go symlinked/go.mod
+V30=$(commit "chore: a symlinked go.mod")
+chk "S59 a symlinked go.mod is no file of the zip" "$(paths "$V29" "$V30")" 'false|[]|[]|[]'
+put symlinked/x.go 'package symlinked // v2'
+V31=$(commit "fix: the root package")
+chk "S59 nor a module boundary, so its dir stays the root's" "$(paths "$V30" "$V31")" 'true|[]|[]|["symlinked/x.go"]'
+put chartdata/go.mod 'module example.com/go/chartdata
+
+go 1.27'
+V32=$(commit "chore(chartdata): go 1.27")
+put chartdata/gen/go.mod 'module example.com/go/chartdata/gen'
+V33=$(commit "feat(chartdata)!: gen into its own module again")
+chk "S59 a lane on go 1.24 or later ships a file a nested vendor dir holds directly" "$(paths "$V32" "$V33")" \
+  'false|[]|["chartdata"]|["chartdata/gen/go.mod"]'
+git rm -q chartdata/gen/go.mod
+V34=$(commit "feat(chartdata): fold gen back")
+chk "S59 so carving it out and folding it back both release the lane" "$(paths "$V33" "$V34")" \
+  'false|[]|["chartdata"]|["chartdata/gen/go.mod"]'
 
 # Ownership is read per commit, never at the range's ends: a range from a
 # stable tag older than a carve-out holds both the carve-out, which is the

@@ -69,25 +69,26 @@ go_new() { # <rev> <go.mod path>: status 0 when its go line is 1.24 or later
 }
 # MOD[<state>|<dir>] marks a dir holding a go.mod, NEST[<state>|<dir>] one that
 # is no lane and that its container does not ship, PKG[<state>|<dir>] a TS
-# package, NEWVENDOR[<state>|<unit>] a zip unit on go 1.24 or later;
+# package, NEWVENDOR[<state>|<unit>] an asked zip unit on go 1.24 or later;
 # STATE[<rev>] names <rev>'s state.
-declare -A MOD=() NEST=() PKG=() NEWVENDOR=() STATE=()
+declare -A MOD=() NEST=() PKG=() NEWVENDOR=() STATE=() ASKED=()
 load_state() { # <rev>: fills MOD, NEST, PKG and NEWVENDOR for the state named <rev>
   local k=$1 tree files dirs m l p
   tree=$(tree_of "$k") || exit 2
   files=$(cut -f2- <<<"$tree")
-  # golang.org/x/mod/zip leaves out every dir holding a regular go.mod, its
-  # name matched under case folding, wherever it sits.
+  # golang.org/x/mod/zip leaves out every dir holding a regular go.mod, in any case.
   dirs=$(grep -E '^100' <<<"$tree" | cut -f2- | grep -iE '/go\.mod$' | sed 's|/[^/]*$||' | LC_ALL=C sort -u || true)
   STATE["$k"]=$k
   while IFS= read -r p; do
     [ -z "$p" ] || PKG["$k|$p"]=1
   done < <(grep -E '^[^/]+/jsr\.json$' <<<"$files" | sed 's|/jsr\.json$||' || true)
   while IFS= read -r l; do
-    [ -z "$l" ] || ! grep -qxF -- "$l/web/jsr.json" <<<"$files" || PKG["$k|$l/web"]=1
-    if [ -n "$l" ] && go_new "$k" "$l/go.mod"; then NEWVENDOR["$k|$l"]=1; fi
+    [ -n "$l" ] || continue
+    ! grep -qxF -- "$l/web/jsr.json" <<<"$files" || PKG["$k|$l/web"]=1
+    [ -n "${ASKED[$l]:-}" ] || continue
+    if go_new "$k" "$l/go.mod"; then NEWVENDOR["$k|$l"]=1; fi
   done <<<"$LANES"
-  if $ZIP_ROOT && go_new "$k" go.mod; then NEWVENDOR["$k|."]=1; fi
+  if $ZIP_ROOT && [ -n "${ASKED["."]:-}" ] && go_new "$k" go.mod; then NEWVENDOR["$k|."]=1; fi
   while IFS= read -r m; do
     [ -n "$m" ] || continue
     MOD["$k|$m"]=1
@@ -99,8 +100,7 @@ load_state() { # <rev>: fills MOD, NEST, PKG and NEWVENDOR for the state named <
       NEST["$k|$m"]=1
       continue
     fi
-    # A lane is a module zip. So is a go root; a docker or ts root builds its
-    # artifact from the whole tree.
+    # A lane and a go root are module zips; a docker or ts root ships its whole tree.
     if $ZIP_ROOT && [ -z "${PKG["$k|${m%%/*}"]:-}" ]; then
       NEST["$k|$m"]=1
     fi
@@ -115,7 +115,7 @@ if [ "$cmd" = boundaries ]; then
   exit 0
 fi
 
-ships() { # <state> <unit> <path> <mode>, <path> one <unit> owns there: status 0 when <unit>'s artifact holds it
+ships() { # <state> <unit> <path> <mode> [same], <path> one <unit> owns there: status 0 when <unit>'s artifact holds it; a non-empty same marks a change of mode alone
   local rel=$3 pkg=${3%%/*}
   if [ "$2" = . ]; then
     $ZIP_ROOT || return 0
@@ -123,10 +123,10 @@ ships() { # <state> <unit> <path> <mode>, <path> one <unit> owns there: status 0
     rel=${3#"$2"/} pkg=$2/web
   fi
   [[ -z ${PKG["$1|$pkg"]:-} || $3 != "$pkg/"* ]] || return 0
-  # golang.org/x/mod/zip leaves out a symlink, a gitlink and a vendored package
-  # (isVendoredPackage): from go 1.24 vendor/modules.txt too, but not a file
-  # directly in a nested <dir>/vendor/ (golang.org/issue/37397).
-  [[ $4 == 100* ]] || return 1
+  # golang.org/x/mod/zip keeps no mode and leaves out a symlink, a gitlink,
+  # .hg_archival.txt and a vendored package (isVendoredPackage): from go 1.24 vendor/modules.txt
+  # too, but not a file directly in a nested <dir>/vendor/ (golang.org/issue/37397).
+  [[ $4 == 100* && -z ${5:-} && $rel != .hg_archival.txt ]] || return 1
   if [ -n "${NEWVENDOR["$1|$2"]:-}" ]; then
     case $rel in
       vendor/modules.txt | vendor/*/* | */vendor/*/*) return 1 ;;
@@ -138,7 +138,7 @@ ships() { # <state> <unit> <path> <mode>, <path> one <unit> owns there: status 0
   fi
 }
 OWN=()
-owners_in() { # <state> <path> <mode>: OWN gets the units whose artifact holds <path> in that state's tree
+owners_in() { # <state> <path> <mode> [same]: OWN gets the units whose artifact holds <path> in that state's tree
   local k=$1 d=$2 key u root=true
   local -a found=()
   while [[ $d == */* ]]; do
@@ -159,7 +159,7 @@ owners_in() { # <state> <path> <mode>: OWN gets the units whose artifact holds <
   ! $root || found+=(.)
   OWN=()
   for u in "${found[@]}"; do
-    ! ships "$k" "$u" "$2" "$3" || OWN+=("$u")
+    ! ships "$k" "$u" "$2" "$3" "${4:-}" || OWN+=("$u")
   done
 }
 
@@ -173,7 +173,7 @@ owners_in() { # <state> <path> <mode>: OWN gets the units whose artifact holds <
 #   nothing and judges every path at <to>'s tree.
 FROM=$2 TO=$3
 shift 3
-declare -A ASKED=() WANT=() COVERED=() SEEN=()
+declare -A WANT=() COVERED=() SEEN=()
 for u in "$@"; do
   [ "$u" = . ] || [ -n "${IS_LANE[$u]:-}" ] || die "unit '${u}' is neither '.' nor a lane of GO_LANES_JSON"
   ASKED["$u"]=1
@@ -189,8 +189,8 @@ state_of() { # <rev>: K names <rev>'s state, loaded once
   fi
   K=${STATE[$1]}
 }
-emit() { # <state> <sha> <path> <mode>: prints the asked units holding <path> in that state
-  owners_in "$1" "$3" "$4"
+emit() { # <state> <sha> <path> <mode> [same]: prints the asked units holding <path> in that state
+  owners_in "$1" "$3" "$4" "${5:-}"
   emit_units "$2" "$3" "${OWN[@]}"
 }
 emit_units() { # <sha> <path> <unit>...: prints the asked units among them for <path>
@@ -239,7 +239,7 @@ carved() { # <state> <rev> <dir>: CARVED gets the asked units holding <dir>/go.m
   done
 }
 commit_done() { # SHA PARENT CHANGES: emits one commit's paths
-  local pk=- ck meta om nm st f
+  local pk=- ck meta om nm oo no st f same
   [ -n "$SHA" ] || return 0
   if [ -n "$PARENT" ]; then
     state_of "$PARENT"
@@ -259,11 +259,11 @@ commit_done() { # SHA PARENT CHANGES: emits one commit's paths
       [ -n "${WANT[$f]:-}" ] || continue
       COVERED["$f"]=1
     fi
-    meta=${meta#:}
-    om=${meta%% *} nm=${meta#* } st=${meta##* }
-    nm=${nm%% *}
-    [ "$st" = A ] || emit "$pk" "$SHA" "$f" "$om"
-    [ "$st" = D ] || emit "$ck" "$SHA" "$f" "$nm"
+    read -r om nm oo no st <<<"${meta#:}"
+    same=""
+    [[ $om != 100* || $nm != 100* || $oo != "$no" ]] || same=1
+    [ "$st" = A ] || emit "$pk" "$SHA" "$f" "$om" "$same"
+    [ "$st" = D ] || emit "$ck" "$SHA" "$f" "$nm" "$same"
     [[ -n $PARENT && ${f,,} == */go.mod ]] || continue
     CARVED=()
     if [[ $nm == 100* && $om != 100* ]]; then
