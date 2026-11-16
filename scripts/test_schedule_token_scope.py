@@ -1288,8 +1288,10 @@ class PerfPublish(unittest.TestCase):
     def test_only_this_repository_s_shards_are_charted(self):
         rc, result, cwd = self.points(
             {
-                'perf-results-cplieger-marotte-measure-shard-1-of-2': perf_results('files', 2.0),
-                'perf-results-cplieger-marotte-measure-shard-x-measure-shard-1-of-1': (
+                'perf-results-cplieger-marotte-measure-shard-1-of-2-attempt-1': (
+                    perf_results('files', 2.0)
+                ),
+                'perf-results-cplieger-marotte-measure-shard-x-measure-shard-1-of-1-attempt-1': (
                     perf_results('docs', 9.0)
                 ),
             }
@@ -1310,7 +1312,7 @@ class PerfPublish(unittest.TestCase):
     def test_only_another_repository_s_shards_publish_nothing(self):
         rc, result, _ = self.points(
             {
-                'perf-results-cplieger-marotte-measure-shard-x-measure-shard-1-of-1': (
+                'perf-results-cplieger-marotte-measure-shard-x-measure-shard-1-of-1-attempt-1': (
                     perf_results('docs', 9.0)
                 ),
             }

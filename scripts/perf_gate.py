@@ -546,8 +546,6 @@ def seconds_per_cell(runs: list[dict]) -> list[dict]:
 UNIT_FIELDS = KEY_FIELDS[:4]
 # GitHub runs at most 256 jobs from one matrix.
 MAX_JOBS = 256
-# Every shard name plan() writes; newest_shards reads artifacts by it.
-SHARD_NAME = r'(?:run-\d+-)?shard-\d+-of-\d+'
 
 
 # The sets a workflow gates: perf-ci.yaml's pull-request default and
@@ -1008,11 +1006,9 @@ def newest_shards(
 
 
 def result_files(
-    directory: str | pathlib.Path, prefix: str | None = None, stage: str = 'measure'
+    directory: str | pathlib.Path, prefix: str, stage: str = 'measure'
 ) -> list[pathlib.Path]:
-    """The `*.json` results files under directory; with prefix, those of newest_shards."""
-    if prefix is None:
-        return sorted(pathlib.Path(directory).rglob('*.json'))
+    """The `*.json` results files of newest_shards."""
     dirs = newest_shards(directory, prefix, stage).values()
     return sorted(p for d in dirs for p in d.rglob('*.json'))
 
@@ -1040,20 +1036,10 @@ def shard_groups(
 
 
 def merge_results(
-    directory: str | pathlib.Path,
-    prefix: str | None = None,
-    stage: str = 'measure',
-    since: int = 1,
+    directory: str | pathlib.Path, prefix: str, stage: str = 'measure', since: int = 1
 ) -> dict:
-    """The results under directory as one results file: with prefix, every shard of
-    shard_groups; none is an error."""
-    if prefix is None:
-        paths = result_files(directory)
-    else:
-        paths = [p for ps in shard_groups(directory, prefix, stage, since).values() for p in ps]
-    if not paths:
-        raise ValueError(f'no results under {directory}')
-    return merge(paths)
+    """Every shard of shard_groups as one results file."""
+    return merge([p for ps in shard_groups(directory, prefix, stage, since).values() for p in ps])
 
 
 def merge(paths: list[pathlib.Path]) -> dict:
@@ -1157,7 +1143,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--check-file', metavar='BUDGETS', help='check the rule and provenance only')
     mode.add_argument('--verdict', metavar='DIR', help='judge the re-measured results in DIR')
-    mode.add_argument('--calibrate', metavar='DIR', help='one subdirectory of results per run')
+    mode.add_argument(
+        '--calibrate', metavar='DIR', help='the downloaded perf-results-<prefix>-measure-* folders'
+    )
     mode.add_argument('--plan', metavar='PLAN', help='write the measure matrix of plan.json')
     mode.add_argument('--bench', metavar='DIR', help='write the chart points of the results in DIR')
     p.add_argument('--set', help='the plan.json set to measure')
@@ -1185,7 +1173,6 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         '--remeasure-attempt',
         type=int,
-        default=1,
         help='the run attempt of the compare whose remeasure.json --verdict judges',
     )
     p.add_argument('--summary', help='a file the Markdown summary is appended to')
@@ -1203,13 +1190,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     elif a.plan:
         need = ('set', 'out')
     elif a.bench:
-        need = ('out',)
+        need = ('prefix', 'out')
     elif a.check_file:
         need = ('base', 'calibrations', 'repo', 'head')
     elif a.verdict:
-        need = ('budgets', 'results')
+        need = ('budgets', 'results', 'prefix', 'remeasure_attempt')
     else:
-        need = ('budgets', 'base', 'results', 'calibrations', 'repo', 'head', 'remeasure_out')
+        need = ('budgets', 'base', 'results', 'prefix', 'calibrations', 'repo', 'head')
+        need += ('remeasure_out',)
         need += ('plan_doc', 'set')
     missing = [f'--{n.replace("_", "-")}' for n in need if not getattr(a, n)]
     if missing:
