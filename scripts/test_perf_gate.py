@@ -655,9 +655,10 @@ def runs_with(metric, base, slow, slow_runs, n=10, kind='time'):
     ]
 
 
-def calibrate(runs):
+def calibrate(runs, **kw):
     return perf_gate.calibrate(
         runs,
+        **kw,
         headroom={'cpu_ms': 1.5, 'heap_mb': 1.25, 'rss_mb': 1.25},
         floor={'cpu_ms': 50, 'heap_mb': 1},
         repo=REPO,
@@ -705,14 +706,25 @@ class Calibrate(unittest.TestCase):
         c = only_cell(p, 'heap_mb')
         self.assertEqual((c['tier'], c['headroom']), ('gated', 1.5))
 
-    def test_fewer_than_ten_runs_write_no_tier_or_headroom(self):
-        p = calibrate(runs_with('cpu_ms', 1000.0, 1580.0, {1, 2}, n=5))
-        self.assertEqual(p['runs'], 5)
-        c = only_cell(p)
-        self.assertNotIn('tier', c)
-        self.assertNotIn('headroom', c)
-        self.assertEqual(c['baseline'], 1000.0)
-        self.assertEqual(len(c['reps_by_run']), 5)
+    def test_a_calibration_needs_ten_runs(self):
+        with self.assertRaisesRegex(ValueError, 'needs 10 runs, not 9'):
+            calibrate(runs_with('cpu_ms', 1000.0, 1580.0, {1, 2}, n=9))
+
+    def test_a_cell_plan_json_reports_is_reported_though_its_reps_agree(self):
+        runs = [
+            run_doc({('dom', 'count'): (640,) * 3, ('max_bytes:GET /x', 'count'): (9,) * 3})
+            for _ in range(10)
+        ]
+        cases = {
+            'a metric': ([{'metric': 'dom'}], 'reported'),
+            'its window': ([{'metric': 'dom', 'window': 'cold'}], 'reported'),
+            'another window': ([{'metric': 'dom', 'window': 'live'}], 'exact'),
+        }
+        for name, (patterns, tier) in cases.items():
+            with self.subTest(name):
+                p = calibrate(runs, reported=patterns)
+                self.assertEqual(only_cell(p, 'dom')['tier'], tier)
+                self.assertEqual(only_cell(p, 'max_bytes:GET /x')['tier'], 'exact')
 
     def test_an_exact_count_gates_only_when_the_ten_agree(self):
         same = calibrate([run_doc({('dom', 'count'): (640, 640, 640)}) for _ in range(10)])
@@ -730,8 +742,8 @@ class Calibrate(unittest.TestCase):
         runs = [run_doc({'cpu_ms': (1000.0,) * 3}, seconds=60.0 + i) for i in range(10)]
         p = calibrate(runs)
         self.assertEqual(
-            (p['repo'], p['commit'], p['runner'], p['runs'], p['run_id']),
-            (REPO, HEAD, RUNNER, 10, '111'),
+            (p['schema'], p['kind'], p['repo'], p['commit'], p['runner'], p['runs'], p['run_id']),
+            (2, 'calibration', REPO, HEAD, RUNNER, 10, '111'),
         )
         self.assertEqual(p['seconds'][0]['seconds'], 64.5)
         self.assertEqual(p['cpu_models'], ['AMD EPYC 7763'])
@@ -2315,6 +2327,326 @@ class Attempts(unittest.TestCase):
         self.assertEqual([len(v) for v in groups.values()], [2, 2])
 
 
+def run_main(*argv):
+    """perf_gate.main's exit status and everything it printed."""
+    out = io.StringIO()
+    with redirect_stdout(out), redirect_stderr(out):
+        rc = perf_gate.main(list(argv))
+    return rc, out.getvalue()
+
+
+class PlacedGit(FakeGit):
+    """FakeGit with the pull request head of measured_file() in HEAD's history."""
+
+    def __init__(self):
+        super().__init__()
+        self.lineage = {('pr-head', HEAD)}
+
+
+class Take(unittest.TestCase):
+    """--take: a measured file's counts into budgets.json with their reason."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = pathlib.Path(tmp.name)
+        self.sources = self.dir / 'sources'
+        self.sources.mkdir()
+        self.budgets = self.dir / 'budgets.json'
+        x1 = {'scale': 'x1'}
+        self.old = budgets(
+            [
+                {**entry('dom', 'exact', 975.0, source=RUN_URL + '111'), **x1},
+                entry('dom', 'exact', 2055.0, source=MEASURED_URL + '800/attempts/1', reason='r'),
+                entry(source=RUN_URL + '111'),
+            ]
+        )
+        self.budgets.write_text(json.dumps(self.old))
+        self.put('111', calibration_file([cal_cell()]))
+        self.put('800-1', measured_file([m_cell(2055.0)], run_id='800', commit='m-old'))
+        self.put('900-1', measured_file([m_cell(2056.0), m_cell(976.0, scale='x1')]))
+
+    def put(self, stem, doc):
+        (self.sources / f'{stem}.json').write_text(json.dumps(doc))
+        (self.sources / f'{stem}.sigstore.json').write_text('{}')
+
+    def take(self, *argv, stem='900-1'):
+        path = str(self.sources / f'{stem}.json')
+        return run_main('--take', path, '--budgets', str(self.budgets), *argv)
+
+    def entries(self):
+        return {keyof(e): e for e in json.loads(self.budgets.read_text())['budgets']}
+
+    def test_take_writes_value_source_and_reason_and_deletes_an_unnamed_source(self):
+        rc, output = self.take('--reason', 'one more node')
+        self.assertEqual(rc, 0, output)
+        url = MEASURED_URL + '900/attempts/1'
+        got = self.entries()
+        x1 = keyof({**entry('dom'), 'scale': 'x1'})
+        for k, value in ((keyof(entry('dom')), 2056.0), (x1, 976.0)):
+            want = {'baseline': value, 'budget': value, 'source': url, 'reason': 'one more node'}
+            self.assertEqual({f: got[k][f] for f in want}, want)
+        self.assertEqual(got[keyof(entry())], entry(source=RUN_URL + '111'))
+        kept = ['111.json', '111.sigstore.json', '900-1.json', '900-1.sigstore.json']
+        self.assertEqual(sorted(p.name for p in self.sources.iterdir()), kept)
+        text = self.budgets.read_text()
+        self.assertIn(f'    {json.dumps(got[keyof(entry())])}\n', text)
+        self.assertEqual(json.loads(text)['budgets'][2], entry(source=RUN_URL + '111'))
+        with (
+            unittest.mock.patch.object(perf_gate, 'Git', PlacedGit),
+            unittest.mock.patch.object(perf_gate, 'cosign_verify', return_value=None),
+        ):
+            base = self.dir / 'base.json'
+            base.write_text(json.dumps(self.old))
+            argv = ('--check-file', str(self.budgets), '--base', str(base))
+            argv += ('--sources', str(self.sources), '--repo', REPO, '--head', HEAD)
+            self.assertEqual(run_main(*argv, '--base-sha', HEAD), (0, ''))
+
+    def test_take_with_cells_takes_only_the_cells_its_glob_matches(self):
+        self.assertEqual(self.take('--reason', 'a', '--cells', 'files/x1/*')[0], 0)
+        got = self.entries()
+        self.assertEqual(got[keyof(entry('dom'))]['reason'], 'r')
+        self.assertIn('800-1.json', {p.name for p in self.sources.iterdir()})
+        self.assertEqual(self.take('--reason', 'b', '--cells', 'files/x10/*')[0], 0)
+        reasons = sorted(e.get('reason', '') for e in self.entries().values())
+        self.assertEqual(reasons, ['', 'a', 'b'])
+        self.assertNotIn('800-1.json', {p.name for p in self.sources.iterdir()})
+
+    def test_take_refuses_and_writes_nothing(self):
+        self.put('901-1', measured_file([m_cell(2000.0, 'cpu_ms')], run_id='901'))
+        before = self.budgets.read_text()
+        cases = {
+            'two reason lines': (('--reason', 'a\nb'), '900-1', 'one non-empty line'),
+            'a glob of no cell': (('--reason', 'a', '--cells', 'no/*'), '900-1', 'matches no cell'),
+            'a cell with no exact entry': (('--reason', 'a'), '901-1', 'has no exact entry'),
+            'a calibration': (('--reason', 'a'), '111', 'is not a measured file'),
+        }
+        for name, (argv, stem, want) in cases.items():
+            with self.subTest(name):
+                rc, output = self.take(*argv, stem=stem)
+                self.assertEqual(rc, 1, output)
+                self.assertIn(want, output)
+                self.assertEqual(self.budgets.read_text(), before)
+        (self.sources / '900-1.sigstore.json').unlink()
+        rc, output = self.take('--reason', 'a')
+        self.assertEqual(rc, 1)
+        self.assertIn('900-1.sigstore.json', output)
+        self.assertEqual(self.budgets.read_text(), before)
+
+
+X1 = {'scale': 'x1'}
+
+
+def cal_222(*cells, **kw):
+    """The scheduled calibration 222 of the default branch at commit `cal`."""
+    seconds = [{**{f: CELL[f] for f in ('scenario', 'scale', 'engine', 'width')}, 'seconds': 64.5}]
+    doc = calibration_file(list(cells), schema=2, kind='calibration', commit='cal', seconds=seconds)
+    return {**doc, 'run_id': '222', 'run_url': RUN_URL + '222', **kw}
+
+
+class CheckIn(unittest.TestCase):
+    """--check-in: every cell the scheduled calibration measured from it, a newer measured
+    value kept, absorbed or unused slowdowns and unnamed sources removed."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = pathlib.Path(tmp.name)
+        self.sources, self.accepted = self.dir / 'sources', self.dir / 'accepted'
+        self.sources.mkdir()
+        self.accepted.mkdir()
+        # 0ld and m-old came before the calibrated commit `cal`; m-new and ovr2 after it.
+        self.git = FakeGit()
+        self.git.lineage = {
+            *((c, HEAD) for c in ('0ld', 'm-old', 'cal', 'm-new', 'ovr', 'ovr2')),
+            *((c, 'cal') for c in ('0ld', 'm-old', 'ovr')),
+            *((c, 'm-new') for c in ('0ld', 'm-old', 'cal', 'ovr')),
+        }
+        self.git.added = {'slow.json': 'ovr', 'mixed.json': 'ovr2'}
+        x1 = X1
+        self.old = budgets(
+            [
+                entry(),
+                entry(window='live'),
+                entry('dom', 'exact', 640.0),
+                entry('heap_mb', baseline=20.0, budget=25.0),
+                {**entry('reads', 'exact', 2.0, source=MEASURED_URL + '800/attempts/1'), **x1},
+                {**entry('dom', 'exact', 976.0, source=MEASURED_URL + '900/attempts/1'), **x1},
+            ]
+        )
+        for e in self.old['budgets'][4:]:
+            e['reason'] = 'a measured move'
+        old_cells = [
+            cal_cell(),
+            cal_cell(window='live'),
+            cal_cell('dom', 640.0, 'exact', kind='count'),
+            cal_cell('heap_mb', 20.0),
+        ]
+        self.put('111', calibration_file(old_cells, commit='0ld'))
+        self.put('800-1', measured_file([m_cell(2.0, 'reads', **x1)], run_id='800', commit='m-old'))
+        self.put('900-1', measured_file([m_cell(976.0, **x1)], commit='m-new'))
+        self.cal = cal_222(
+            cal_cell(baseline=1100.0),
+            cal_cell('dom', 640.5, 'reported', kind='count'),
+            cal_cell('reads', 3.0, 'exact', kind='count', **x1),
+            cal_cell('dom', 975.0, 'exact', kind='count', **x1),
+            cal_cell('rss_mb', 200.0),
+            cal_cell('heap_mb', 24.0),
+        )
+        self.put('222', self.cal)
+        cpu, heap = {**CELL, 'metric': 'cpu_ms'}, {**CELL, 'metric': 'heap_mb'}
+        self.slowdown('slow.json', {**cpu, 'budget': 1700.0})
+        self.slowdown('mixed.json', {**cpu, 'window': 'live', 'budget': 1700.0})
+        self.slowdown('mixed.json', {**heap, 'budget': 28.0})
+        self.plan = {
+            'node': '.',
+            'sets': {
+                'pr': {'shards': 1, 'cells': [unit('files', 60, windows=['cold'])]},
+                'full': {'shards': 1, 'cells': [unit('files', 60), unit('files', 60, **x1)]},
+            },
+        }
+
+    def put(self, stem, doc):
+        (self.sources / f'{stem}.json').write_text(json.dumps(doc))
+        (self.sources / f'{stem}.sigstore.json').write_text('{}')
+
+    def slowdown(self, name, c):
+        p = self.accepted / name
+        doc = json.loads(p.read_text()) if p.is_file() else {'reason': 'slower', 'cells': []}
+        doc['cells'].append(c)
+        p.write_text(json.dumps(doc))
+
+    def check_in(self, cal=None, old=None):
+        return perf_gate.check_in(
+            cal or self.cal,
+            old or self.old,
+            self.plan,
+            sources=self.sources,
+            accepted=self.accepted,
+            repo=REPO,
+            head_sha=HEAD,
+            git=self.git,
+        )
+
+    def test_check_in_takes_every_measured_cell_but_a_newer_measured_value(self):
+        done = self.check_in()
+        got = {keyof(e): e for e in done.budgets['budgets']}
+        self.assertEqual([keyof(e) for e in done.budgets['budgets']], sorted(got))
+        url = RUN_URL + '222'
+        x1 = X1
+        self.assertEqual(got[keyof(entry())], entry(baseline=1100.0, budget=1650.0, source=url))
+        self.assertEqual(got[keyof(entry(window='live'))], entry(window='live'))
+        dom = {**entry('dom', 'reported', 640.5, source=url)}
+        self.assertEqual(got[keyof(dom)], dom)
+        reads = {**entry('reads', 'exact', 3.0, source=url), **x1}
+        self.assertEqual(got[keyof(reads)], reads)
+        self.assertEqual(got[keyof({**entry('dom'), **x1})], self.old['budgets'][5])
+        self.assertEqual(
+            got[keyof(entry('rss_mb'))], entry('rss_mb', baseline=200.0, budget=250.0, source=url)
+        )
+        self.assertEqual(got[keyof(entry('heap_mb'))]['budget'], 30.0)
+        self.assertEqual(sorted(done.drop), ['800-1.json', '800-1.sigstore.json'])
+        cpu_live = {**CELL, 'metric': 'cpu_ms', 'window': 'live', 'budget': 1700.0}
+        self.assertEqual(
+            done.accepted,
+            {'slow.json': None, 'mixed.json': {'reason': 'slower', 'cells': [cpu_live]}},
+        )
+        self.assertEqual(
+            [[u['seconds'] for u in s['cells']] for s in done.plan['sets'].values()],
+            [[60], [65, 60]],
+        )
+        for want in (
+            '## Calibration 222 of cplieger/marotte at `cal`',
+            '### Tier changes',
+            f'| {DOM} | exact | reported |',
+            '| files/x10/chromium/desktop/cold/rss_mb | none | gated |',
+            '### Raised gated baselines',
+            f'| {CPU} | 1000.0 | 1100.0 | 1.1 |',
+            '| files/x10/chromium/desktop/cold/heap_mb | 20.0 | 24.0 | 1.2 |',
+            '### Measured values kept',
+            '| files/x1/chromium/desktop/cold/dom | 976.0 | 975.0 | measured file 900-1 |',
+            '| accepted/slow.json | files/x10/chromium/desktop/cold/cpu_ms | calibration 222 measured it |',
+            '| accepted/mixed.json | files/x10/chromium/desktop/cold/heap_mb | budget 30.0 is at or over 28.0 |',
+            '### Sources dropped',
+            '- measured file 800-1',
+        ):
+            self.assertIn(want, done.body)
+
+    def test_a_check_in_passes_the_gate_against_the_file_it_rewrote(self):
+        done = self.check_in()
+        for name in done.drop:
+            (self.sources / name).unlink()
+        for name, doc in done.accepted.items():
+            p = self.accepted / name
+            p.unlink() if doc is None else p.write_text(json.dumps(doc))
+        self.assertEqual(perf_gate.check_rule(done.budgets), [])
+        checked = perf_gate.check_provenance(
+            done.budgets,
+            self.old,
+            sources=self.sources,
+            accepted=self.accepted,
+            repo=REPO,
+            head_sha=HEAD,
+            base_sha=HEAD,
+            verify=lambda *_: None,
+            git=self.git,
+        )
+        self.assertEqual(checked.errors, [])
+        self.assertEqual(list(checked.accepted), [keyof(entry(window='live'))])
+
+    def test_check_in_refuses_a_file_that_is_no_ten_run_calibration_of_this_repository(self):
+        cases = {
+            'nine runs': ({'runs': 9}, 'needs 10 runs'),
+            'no kind': ({'kind': None}, 'kind'),
+            'schema 1': ({'schema': 1}, 'schema'),
+            'another runner': ({'runner': 'ubuntu-24.04'}, 'runner'),
+            'another repository': ({'repo': 'cplieger/other'}, 'repo'),
+            'a run url of another run': ({'run_url': RUN_URL + '333'}, 'run_url'),
+        }
+        for name, (swap, want) in cases.items():
+            with self.subTest(name), self.assertRaisesRegex(ValueError, want):
+                self.check_in({**self.cal, **swap})
+
+    def test_check_in_writes_the_files_and_its_pull_request_body(self):
+        artifacts = self.dir / 'proposed'
+        artifacts.mkdir()
+        for name in ('222.json', '222.sigstore.json'):
+            (self.sources / name).rename(artifacts / name)
+        b, plan = self.dir / 'budgets.json', self.dir / 'plan.json'
+        b.write_text(json.dumps(self.old))
+        plan.write_text(json.dumps(self.plan))
+        git = self.git
+        argv = ('--check-in', str(artifacts / '222.json'), '--budgets', str(b))
+        argv += ('--plan-doc', str(plan), '--sources', str(self.sources))
+        argv += ('--accepted', str(self.accepted), '--repo', REPO, '--head', HEAD)
+        argv += ('--pr-body', str(self.dir / 'body.md'))
+        with unittest.mock.patch.object(perf_gate, 'Git', lambda: git):
+            rc, output = run_main(*argv)
+        self.assertEqual(rc, 0, output)
+        self.assertEqual(
+            (self.sources / '222.json').read_bytes(), (artifacts / '222.json').read_bytes()
+        )
+        self.assertEqual(
+            sorted(p.name for p in self.sources.iterdir()),
+            [
+                '111.json',
+                '111.sigstore.json',
+                '222.json',
+                '222.sigstore.json',
+                '900-1.json',
+                '900-1.sigstore.json',
+            ],
+        )
+        self.assertEqual(sorted(p.name for p in self.accepted.iterdir()), ['mixed.json'])
+        self.assertEqual(len(json.loads((self.accepted / 'mixed.json').read_text())['cells']), 1)
+        self.assertEqual(json.loads(plan.read_text())['sets']['full']['cells'][0]['seconds'], 65)
+        self.assertIn('### Tier changes', (self.dir / 'body.md').read_text())
+        self.assertEqual(
+            {e['source'] for e in json.loads(b.read_text())['budgets']},
+            {RUN_URL + '111', RUN_URL + '222', MEASURED_URL + '900/attempts/1'},
+        )
+
+
 def github_outputs(text):
     """$GITHUB_OUTPUT as the runner reads it: `name=value` lines and
     `name<<DELIMITER` blocks, a later name replacing an earlier one."""
@@ -2435,6 +2767,28 @@ class Cli(unittest.TestCase):
                     again,
                 )
                 self.assertEqual(self.main('--verdict', str(self.dir / 'again'), *argv), rc)
+
+    def test_verdict_records_the_moved_counts_in_a_measured_file_named_for_its_run(self):
+        b = self.put('budgets.json', budgets([entry('dom', 'exact', 640), entry()]))
+        first = 'results/perf-results-cplieger-a-measure-shard-1-of-1-attempt-1/results.json'
+        again = 'again/perf-results-cplieger-a-remeasure-shard-1-of-1-attempt-2/results.json'
+        argv = ('--verdict', str(self.dir / 'again'), '--budgets', b, '--prefix', 'cplieger-a')
+        argv += ('--results', str(self.dir / 'results'), '--remeasure-attempt', '2')
+        argv += ('--record-out', str(self.dir / 'measured'), '--commit', 'pr-head')
+        argv += ('--head', 'merge', '--repo', REPO, '--run-id', '900', '--run-attempt', '2')
+        argv += ('--workflow-repository', REPO, '--summary', str(self.dir / 'summary.md'))
+        self.put(first, results([cell('dom', (641,) * 3, kind='count'), cell()]))
+        self.put(again, results([cell('dom', (641,) * 3, kind='count')]))
+        self.assertEqual(self.main(*argv), 1)
+        written = json.loads((self.dir / 'measured' / '900-2.json').read_text())
+        self.assertEqual(written, measured_file([m_cell(641)], attempt='2'))
+        text = (self.dir / 'summary.md').read_text()
+        self.assertIn('-n perf-measured-cplieger-a-attempt-2 -D tests/perf/sources', text)
+        self.assertIn('--take tests/perf/sources/900-2.json', text)
+        (self.dir / 'measured' / '900-2.json').unlink()
+        self.put(first, results([cell('dom', (640,) * 3, kind='count'), cell()]))
+        self.assertEqual(self.main(*argv), 0, self.output)
+        self.assertEqual(list((self.dir / 'measured').iterdir()), [])
 
     def test_verdict_judges_against_the_slowdowns_compare_accepted(self):
         b = self.put('budgets.json', budgets([entry(budget=1500.0)]))
@@ -2628,6 +2982,34 @@ class Cli(unittest.TestCase):
                 ('--verdict', d, '--budgets', f, '--results', d),
                 ['--prefix', '--remeasure-attempt'],
             ),
+            'verdict recording': (
+                (
+                    '--verdict',
+                    d,
+                    '--budgets',
+                    f,
+                    '--results',
+                    d,
+                    '--prefix',
+                    'p',
+                    '--record-out',
+                    d,
+                ),
+                [
+                    '--remeasure-attempt',
+                    '--repo',
+                    '--head',
+                    '--commit',
+                    '--run-id',
+                    '--run-attempt',
+                    '--workflow-repository',
+                ],
+            ),
+            'take': (('--take', f, '--budgets', f), ['--reason']),
+            'check-in': (
+                ('--check-in', f, '--budgets', f, '--sources', d),
+                ['--plan-doc', '--repo', '--head', '--pr-body'],
+            ),
             'bench': (('--bench', d, '--out', f), ['--prefix']),
             'check-file': (
                 ('--check-file', f, '--base', f, '--sources', d, '--repo', REPO, '--head', HEAD),
@@ -2691,6 +3073,12 @@ class Cli(unittest.TestCase):
         self.assertEqual(self.main(*argv), 0)
         proposed = json.loads(out.read_text())
         self.assertEqual((proposed['runs'], only_cell(proposed)['tier']), (10, 'gated'))
+        reported = self.put('plan.json', {**PLAN, 'reported': [{'metric': 'cpu_ms'}]})
+        self.assertEqual(self.main(*argv, '--plan-doc', reported), 0, self.output)
+        self.assertEqual(only_cell(json.loads(out.read_text()))['tier'], 'reported')
+        broken = self.put('plan.json', {**PLAN, 'reported': [{'window': 'cold'}]})
+        self.assertEqual(self.main(*argv, '--plan-doc', broken), 1)
+        self.assertIn('is not a {metric, window} pattern', self.output)
         self.assertEqual(self.main(*argv[:5], '9', *argv[6:]), 1)
         self.assertIn('10 runs, not the 9 dispatched', self.output)
 

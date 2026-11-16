@@ -15,12 +15,15 @@ target), `count` (exact) or `report` (never gated).
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
+import fnmatch
 import functools
 import json
 import math
 import pathlib
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -725,13 +728,14 @@ def calibrate(
     runner: str,
     run_id: str,
     run_url: str,
+    reported: list[dict] | None = None,
 ) -> dict:
-    """The proposed budget file of `runs` measurements of one commit. Only a
-    file of at least ten runs carries a tier, a widened headroom and
-    `whole_pr`; a smaller one re-measures baselines."""
-    if not runs:
-        raise ValueError('calibrate: no runs')
+    """The calibration file of TIER_RUNS or more measurements of one commit: each cell's
+    baseline, tier and widened headroom, and `whole_pr`. A cell a `reported` pattern of
+    plan.json names (reported_patterns) is reported whatever its reps."""
     n = len(runs)
+    if n < TIER_RUNS:
+        raise ValueError(f'calibrate: a calibration needs {TIER_RUNS} runs, not {n}')
     found: dict[tuple, list[dict]] = {}
     for run in runs:
         for c in run.get('cells', []):
@@ -750,12 +754,16 @@ def calibrate(
             'spread': spread(medians),
             'reps_by_run': reps_by_run,
         }
-        if n >= TIER_RUNS:
+        if plan_reports(reported or [], cell):
+            cell['tier'] = 'reported'
+        else:
             complete = len(reps_by_run) == n and cell['kind'] != 'mixed'
             decide_tier(cell, reps_by_run, complete, headroom, floor, whole)
         cells.append(cell)
-    doc = {
-        'schema': 1,
+    whole['first_stage_runs'] = sorted(whole['first_stage_runs'])
+    return {
+        'schema': SCHEMA,
+        'kind': 'calibration',
         'repo': repo,
         'commit': commit,
         'runner': runner,
@@ -767,11 +775,8 @@ def calibrate(
         'floor': floor,
         'seconds': seconds_per_cell(runs),
         'cells': cells,
+        'whole_pr': whole,
     }
-    if n >= TIER_RUNS:
-        whole['first_stage_runs'] = sorted(whole['first_stage_runs'])
-        doc['whole_pr'] = whole
-    return doc
 
 
 def cpu_models(runs: list[dict]) -> set[str]:
@@ -1558,6 +1563,243 @@ def cosign_verify(blob, bundle, signer: Signer) -> str | None:
     return (done.stderr or done.stdout).strip() or f'cosign exited {done.returncode}'
 
 
+# --- take and check-in -----------------------------------------------------
+
+
+def dump_budgets(doc: dict) -> str:
+    """budgets.json with one top-level field, and one item of a list, per line, so that a
+    moved value is a one-line diff."""
+    lines = []
+    for k, v in doc.items():
+        if isinstance(v, list) and v:
+            body = ',\n'.join(f'    {json.dumps(x)}' for x in v)
+            lines.append(f'  {json.dumps(k)}: [\n{body}\n  ]')
+        else:
+            lines.append(f'  {json.dumps(k)}: {json.dumps(v)}')
+    return '{\n' + ',\n'.join(lines) + '\n}\n'
+
+
+def unnamed_sources(directory: pathlib.Path, budgets: dict) -> list[str]:
+    """The source files and bundles under directory that no entry of budgets names."""
+    named = {s.stem for e in budgets.get('budgets', []) if (s := parse_source(e.get('source')))}
+    if not directory.is_dir():
+        return []
+    return sorted(
+        p.name
+        for p in directory.iterdir()
+        if (m := SOURCE_FILE_RE.match(p.name)) and m[1] not in named
+    )
+
+
+def take(budgets: dict, doc: dict, *, reason: str, cells: list[str]) -> list[tuple]:
+    """The keys of measured file doc whose key text a glob of cells matches, each written
+    into its budgets entry: the value as baseline and budget, the run as source, and
+    reason. A file that is no measured file, a reason that is not one line, globs that
+    match no cell and a cell with no exact entry raise before any entry changes."""
+    if doc.get('kind') != 'measured':
+        raise ValueError(f'kind {doc.get("kind")!r}: it is not a measured file')
+    src = parse_source(doc.get('run_url'))
+    if src is None or src.kind != 'measured':
+        raise ValueError(f'run_url {doc.get("run_url")!r} is not a perf-ci run attempt')
+    if not isinstance(reason, str) or not reason.strip() or has_line_break(reason):
+        raise ValueError(f'the reason must be one non-empty line, not {reason!r}')
+    found, why = source_cells(doc, 'measured')
+    if why:
+        raise ValueError(why)
+    entries = {key(e): e for e in budgets.get('budgets', [])}
+    chosen = [k for k in found if any(fnmatch.fnmatchcase(key_text(k), g) for g in cells)]
+    if not chosen:
+        raise ValueError(f'{", ".join(cells)} matches no cell of the measured file')
+    for k in chosen:
+        if entries.get(k, {}).get('tier') != 'exact':
+            raise ValueError(f'{key_text(k)} has no exact entry to take its value')
+    for k in chosen:
+        value = found[k]['value']
+        entries[k].update(baseline=value, budget=value, source=src.url, reason=reason)
+    return chosen
+
+
+@dataclasses.dataclass
+class CheckedIn:
+    """check_in's answer: the new budgets and plan, each changed accepted file's new doc
+    (None deletes it), the source files to delete and the pull request body."""
+
+    budgets: dict
+    plan: dict
+    accepted: dict[str, dict | None]
+    drop: list[str]
+    body: str
+
+
+def check_in(
+    cal: dict,
+    budgets: dict,
+    plan_doc: dict,
+    *,
+    sources: pathlib.Path,
+    accepted: pathlib.Path | None,
+    repo: str,
+    head_sha: str,
+    git: Git,
+) -> CheckedIn:
+    """The default branch's files once calibration cal is checked in under sources. Each
+    cell cal measured takes its entry from it (calibrated_entry), but one whose entry comes
+    from a measured file placed after cal's commit; every other entry stays. An accepted
+    cell cal absorbed (absorbed_by's rule) or whose budget no longer exceeds its entry's
+    goes, plan.json takes cal's seconds, and a source no entry names is dropped."""
+    src = calibration_source(cal, budgets, repo)
+    at = git.commit(str(cal.get('commit')))
+    measured, why = source_cells(cal, 'calibration')
+    if why:
+        raise ValueError(f'the calibration: {why}')
+    entries = {key(e): e for e in budgets.get('budgets', [])}
+    places = functools.cache(lambda stem: measured_place(sources, stem, head_sha, git))
+    tiers, raises, kept = [], [], []
+    for k, c in measured.items():
+        old = entries.get(k)
+        s = parse_source(old.get('source')) if old else None
+        if s and s.kind == 'measured' and (m := places(s.stem)) and not git.is_ancestor(m, at):
+            kept.append((key_text(k), old['baseline'], c.get('baseline'), s.label))
+            continue
+        new = entries[k] = calibrated_entry(budgets, c, src.url)
+        before = old['tier'] if old else 'none'
+        if before != new['tier']:
+            tiers.append((key_text(k), before, new['tier']))
+        if old and old['tier'] == new['tier'] == 'gated' and new['baseline'] > old['baseline']:
+            ratio = round(new['baseline'] / old['baseline'], 3) if old['baseline'] else ''
+            raises.append((key_text(k), old['baseline'], new['baseline'], ratio))
+    head = {**budgets, 'budgets': [entries[k] for k in sorted(entries)]}
+    files, removed = check_in_accepted(accepted, entries, (src, measured, at), head_sha, git)
+    drop = unnamed_sources(sources, head)
+    dropped = sorted({SOURCE_FILE_RE.match(n)[1] for n in drop})
+    lines = [
+        f'## Calibration {src.run_id} of {repo} at `{str(cal["commit"])[:12]}`',
+        '',
+        (
+            f'{cal["runs"]} runs on `{cal["runner"]}` '
+            f'({", ".join(cal.get("cpu_models") or []) or "CPU model unknown"}), '
+            f'{len(measured)} cells: {src.url}'
+        ),
+        '',
+        *table('Tier changes', ('Cell', 'Before', 'After'), tiers),
+        *table('Raised gated baselines', ('Cell', 'Before', 'After', 'Ratio'), raises),
+        *table('Measured values kept', ('Cell', 'Measured', 'Calibrated', 'Source'), kept),
+        *table('Accepted slowdowns removed', ('File', 'Cell', 'Why'), removed),
+    ]
+    if dropped:
+        labels = (f'{"measured file" if "-" in d else "calibration"} {d}' for d in dropped)
+        lines += ['### Sources dropped', '', *(f'- {x}' for x in labels), '']
+    return CheckedIn(head, check_in_plan(plan_doc, cal), files, drop, '\n'.join(lines) + '\n')
+
+
+def calibration_source(cal: dict, budgets: dict, repo: str) -> Source:
+    """The source of cal, once it is a ten-run calibration of repo on budgets' runner."""
+    for field, want in (
+        ('kind', 'calibration'),
+        ('schema', SCHEMA),
+        ('repo', repo),
+        ('runner', budgets.get('runner')),
+    ):
+        if cal.get(field) != want:
+            raise ValueError(f'the calibration: {field} is {cal.get(field)!r}, not {want!r}')
+    runs = cal.get('runs')
+    if not (is_number(runs) and runs >= TIER_RUNS):
+        raise ValueError(f'the calibration has {runs!r} runs; a calibration needs {TIER_RUNS} runs')
+    src = parse_source(cal.get('run_url'))
+    if src is None or src.kind != 'calibration' or src.run_id != str(cal.get('run_id')):
+        raise ValueError(
+            f'the calibration: run_url {cal.get("run_url")!r} is not run {cal.get("run_id")!r}'
+        )
+    return src
+
+
+def calibrated_entry(budgets: dict, c: dict, url: str) -> dict:
+    """The entry calibration cell c gives under budgets' headroom, floor and target, which
+    entry_errors and calibration_provenance hold it to; it carries no reason."""
+    tier, baseline, name = c.get('tier'), c.get('baseline'), key_text(key(c))
+    if tier not in TIERS or not is_number(baseline):
+        raise ValueError(f'{name}: the calibration gives tier {tier!r}, baseline {baseline!r}')
+    e = {**key_dict(key(c)), 'tier': tier, 'baseline': baseline}
+    fam = family(c['metric'])
+    if tier == 'exact':
+        e['budget'] = baseline
+    elif tier == 'gated' and fam == SERVER_CPU:
+        target = file_target(budgets, c['metric'])
+        if target is None:
+            raise ValueError(f'{name}: no target for {SERVER_CPU}')
+        e['budget'] = target
+    elif tier == 'gated':
+        h = c.get('headroom', budgets.get('headroom', {}).get(fam))
+        if not is_number(h) or h <= 0:
+            raise ValueError(f'{name}: no headroom for {fam}')
+        e['budget'] = budget_for(baseline, h, entry_floor(budgets, c))
+    if 'headroom' in c:
+        e['headroom'] = c['headroom']
+    e['source'] = url
+    return e
+
+
+def measured_place(sources: pathlib.Path, stem: str, head_sha: str, git: Git) -> str | None:
+    """Where placed_commit puts measured file stem under sources, None when it cannot."""
+    path = sources / f'{stem}.json'
+    if not path.is_file():
+        return None
+    at, _ = placed_commit(load(path), path, git, head_sha)
+    return at
+
+
+def check_in_accepted(
+    directory: pathlib.Path | None,
+    entries: dict,
+    cal: tuple[Source, dict, str],
+    head_sha: str,
+    git: Git,
+) -> tuple[dict[str, dict | None], list[tuple]]:
+    """Each accepted file check_in changes, with its new doc or None, and a (file, cell,
+    why) line for each cell it removes. cal is the calibration's source, cells and commit."""
+    src, measured, at = cal
+    files: dict[str, dict | None] = {}
+    removed = []
+    if directory is None or not directory.is_dir():
+        return files, removed
+    for p in sorted(directory.iterdir()):
+        reason, cells, why = accepted_file(p)
+        if why:
+            raise ValueError(f'accepted/{p.name}: {why}')
+        added = git.added_by(str(p), head_sha)
+        keep = []
+        for c in cells:
+            e = entries.get(key(c))
+            if key(c) in measured and git.is_ancestor(added, at):
+                gone = f'{src.label} measured it'
+            elif e is None or e['tier'] != 'gated':
+                gone = f'its entry is {e["tier"] if e else "gone"}, not gated'
+            elif e['budget'] >= c['budget']:
+                gone = f'budget {e["budget"]} is at or over {c["budget"]}'
+            else:
+                keep.append(c)
+                continue
+            removed.append((f'accepted/{p.name}', key_text(key(c)), gone))
+        if len(keep) < len(cells):
+            files[p.name] = {'reason': reason, 'cells': keep} if keep else None
+    return files, removed
+
+
+def check_in_plan(plan_doc: dict, cal: dict) -> dict:
+    """plan_doc with each unit's seconds the calibration measured, rounded up."""
+    seconds = {
+        unit_key(s): s['seconds'] for s in cal.get('seconds', []) if is_number(s.get('seconds'))
+    }
+    doc = copy.deepcopy(plan_doc)
+    sets = doc.get('sets')
+    for spec in sets.values() if isinstance(sets, dict) else ():
+        for u in spec.get('cells') or [] if isinstance(spec, dict) else ():
+            # A unit listing some windows runs for less than the full measure timed.
+            if isinstance(u, dict) and 'windows' not in u and unit_key(u) in seconds:
+                u['seconds'] = math.ceil(seconds[unit_key(u)])
+    return doc
+
+
 # --- files and the command line --------------------------------------------
 
 
@@ -1744,11 +1986,24 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     mode.add_argument('--plan', metavar='PLAN', help='write the measure matrix of plan.json')
     mode.add_argument('--bench', metavar='DIR', help='write the chart points of the results in DIR')
+    mode.add_argument(
+        '--take',
+        metavar='MEASURED',
+        help='write the counts of a measured file under tests/perf/sources into --budgets, '
+        'and delete the source files there no entry names',
+    )
+    mode.add_argument(
+        '--check-in',
+        metavar='CALIBRATION',
+        help='check in a calibration of the default branch: --budgets, --plan-doc, '
+        '--sources and --accepted are rewritten, and --pr-body says what moved',
+    )
     p.add_argument('--set', help='the plan.json set to measure')
     p.add_argument(
         '--plan-doc',
         help='plan.json: fail a gated or exact entry neither the pr nor the full set lists, '
-        'or that --set and --only list and no shard measured',
+        'or that --set and --only list and no shard measured; --calibrate reads its '
+        '`reported` patterns',
     )
     p.add_argument('--only', default='', help='comma or space separated scenarios to keep')
     p.add_argument('--runs', type=int, default=1, help='how many times to measure the set')
@@ -1788,10 +2043,30 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         '--outputs', help='--plan: a $GITHUB_OUTPUT file to append matrix, node, scenarios to'
     )
-    p.add_argument('--commit', help='the commit --calibrate measured')
+    p.add_argument(
+        '--commit',
+        help='the commit --calibrate measured, or the pull request head --record-out names',
+    )
     p.add_argument('--runner', help='the runner --calibrate measured on')
-    p.add_argument('--run-id', help='the perf-calibrate run id')
+    p.add_argument('--run-id', help='the run id of the perf-calibrate or perf-ci run')
     p.add_argument('--run-url', help='the perf-calibrate run URL')
+    p.add_argument('--run-attempt', help='the attempt of the perf-ci run --record-out names')
+    p.add_argument(
+        '--workflow-repository', help='owner/name of the repository whose perf-ci run this is'
+    )
+    p.add_argument(
+        '--record-out',
+        metavar='DIR',
+        help='--verdict: write the counts it recorded to DIR/<run id>-<attempt>.json',
+    )
+    p.add_argument('--reason', help='--take: the one-line reason the counts moved')
+    p.add_argument(
+        '--cells',
+        action='append',
+        help='--take: a glob on the cell text (scenario/scale/engine/width/window/metric); '
+        'repeatable, every cell when unset',
+    )
+    p.add_argument('--pr-body', help='--check-in: where the pull request body is written')
     a = p.parse_args(argv)
     if a.calibrate:
         need = ('prefix', 'out', 'repo', 'commit', 'runner', 'run_id', 'run_url')
@@ -1803,6 +2078,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         need = ('base', 'sources', 'repo', 'head', 'base_sha')
     elif a.verdict:
         need = ('budgets', 'results', 'prefix', 'remeasure_attempt')
+        if a.record_out:
+            need += ('repo', 'head', 'commit', 'run_id', 'run_attempt', 'workflow_repository')
+    elif a.take:
+        need = ('budgets', 'reason')
+    elif a.check_in:
+        need = ('budgets', 'plan_doc', 'sources', 'repo', 'head', 'pr_body')
     else:
         need = ('budgets', 'base', 'results', 'prefix', 'sources', 'repo', 'head', 'base_sha')
         need += ('remeasure_out',)
@@ -1854,6 +2135,9 @@ def run_calibrate(a: argparse.Namespace) -> int:
         raise ValueError(
             f'{a.calibrate} holds results of {len(groups)} runs, not the {a.runs} dispatched'
         )
+    reported, errors = reported_patterns(load(a.plan_doc)) if a.plan_doc else ([], [])
+    if errors:
+        raise ValueError('; '.join(errors))
     runs = []
     for name, paths in sorted(groups.items()):
         run = merge(paths)
@@ -1871,6 +2155,7 @@ def run_calibrate(a: argparse.Namespace) -> int:
         runner=a.runner,
         run_id=a.run_id,
         run_url=a.run_url,
+        reported=reported,
     )
     pathlib.Path(a.out).write_text(json.dumps(proposed, indent=2) + '\n')
     print(f'{a.out}: {len(proposed["cells"])} cells from {len(runs)} runs')
@@ -1903,9 +2188,99 @@ def run_plan(a: argparse.Namespace) -> int:
     return 0
 
 
+def run_take(a: argparse.Namespace) -> int:
+    path = pathlib.Path(a.take)
+    doc, budgets = load(path), load(a.budgets)
+    errors = check_shape(budgets)
+    if errors:
+        raise ValueError('; '.join(errors))
+    taken = take(budgets, doc, reason=a.reason, cells=a.cells or ['*'])
+    stem = parse_source(doc['run_url']).stem
+    bundle = path.with_name(f'{stem}.sigstore.json')
+    if path.name != f'{stem}.json' or not bundle.is_file():
+        raise ValueError(f'{path} must be {stem}.json, beside its bundle {bundle.name}')
+    pathlib.Path(a.budgets).write_text(dump_budgets(budgets))
+    print(f'{a.budgets}: took {len(taken)} cells from {stem}')
+    for name in unnamed_sources(path.parent, budgets):
+        (path.parent / name).unlink()
+        print(f'deleted {path.parent / name}: no entry names it')
+    return 0
+
+
+def run_check_in(a: argparse.Namespace) -> int:
+    path = pathlib.Path(a.check_in)
+    cal, budgets, sources = load(path), load(a.budgets), pathlib.Path(a.sources)
+    errors = check_shape(budgets)
+    if errors:
+        raise ValueError('; '.join(errors))
+    bundle = path.with_name(f'{path.stem}.sigstore.json')
+    if path.name != f'{cal.get("run_id")}.json' or not bundle.is_file():
+        raise ValueError(f'{path} must be <run id>.json, beside its bundle {bundle.name}')
+    accepted = pathlib.Path(a.accepted) if a.accepted else None
+    done = check_in(
+        cal,
+        budgets,
+        load(a.plan_doc),
+        sources=sources,
+        accepted=accepted,
+        repo=a.repo,
+        head_sha=a.head,
+        git=Git(),
+    )
+    errors = check_rule(done.budgets)
+    if errors:
+        raise ValueError('the checked-in budgets.json breaks the rule: ' + '; '.join(errors))
+    sources.mkdir(parents=True, exist_ok=True)
+    for p in (path, bundle):
+        if p.resolve() != (sources / p.name).resolve():
+            shutil.copyfile(p, sources / p.name)
+    pathlib.Path(a.budgets).write_text(dump_budgets(done.budgets))
+    pathlib.Path(a.plan_doc).write_text(json.dumps(done.plan, indent=2) + '\n')
+    for name, doc in done.accepted.items():
+        if doc is None:
+            (accepted / name).unlink()
+        else:
+            (accepted / name).write_text(json.dumps(doc, indent=2) + '\n')
+    for name in done.drop:
+        (sources / name).unlink()
+    pathlib.Path(a.pr_body).write_text(done.body)
+    print(done.body)
+    return 0
+
+
+def write_record(a: argparse.Namespace, out: Outcome, cpu: Iterable[str]) -> None:
+    """The measured file of the counts out recorded, as --record-out/<run id>-<attempt>.json,
+    named in out.measured_as for the summary; none when it recorded none."""
+    if not out.recorded:
+        return
+    url = f'https://github.com/{a.workflow_repository}/actions/runs/{a.run_id}/attempts/{a.run_attempt}'
+    src = parse_source(url)
+    if src is None:
+        raise ValueError(f'{url} is not a perf-ci run attempt the gate can name')
+    doc = record(
+        out,
+        repo=a.repo,
+        commit=a.commit,
+        measured_sha=a.head,
+        run_id=a.run_id,
+        run_attempt=a.run_attempt,
+        run_url=url,
+        workflow_repository=a.workflow_repository,
+        cpu_models=sorted(set(cpu)),
+    )
+    d = pathlib.Path(a.record_out)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f'{src.stem}.json').write_text(json.dumps(doc, indent=2) + '\n')
+    out.measured_as = (f'perf-measured-{a.prefix}-attempt-{a.run_attempt}', src.stem)
+
+
 def run(a: argparse.Namespace) -> int:
     if a.calibrate:
         return run_calibrate(a)
+    if a.take:
+        return run_take(a)
+    if a.check_in:
+        return run_check_in(a)
     if a.plan:
         return run_plan(a)
     if a.bench:
@@ -1925,6 +2300,8 @@ def run(a: argparse.Namespace) -> int:
         results = merge_results(a.results, a.prefix)
         again = merge_results(a.verdict, a.prefix, 'remeasure', since=a.remeasure_attempt)
         out = verdict(budgets, results, again, load(a.remeasure) if a.remeasure else None)
+        if a.record_out:
+            write_record(a, out, [*results['cpu_models'], *again['cpu_models']])
     else:
         checked = file_errors(a, budgets)
         only = a.only.replace(',', ' ').split()
@@ -1957,7 +2334,7 @@ def main(argv: list[str] | None = None) -> int:
     a = parse_args(argv)
     try:
         return run(a)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, GitError) as exc:
         print(f'::error::perf_gate: {exc!r}', file=sys.stderr)
         return 1
 
