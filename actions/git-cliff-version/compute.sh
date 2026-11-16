@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Version arithmetic for the release channels, configured by environment
 # (CHANNEL, LANE, GO_LANES_JSON and REPO_TYPE for the root, CLIFF_BIN,
-# PENDING_VERSION, PENDING_COMMIT, PENDING_IN_RANGE); results go to $GITHUB_OUTPUT.
+# PENDING_VERSION, PENDING_COMMIT, PENDING_IN_RANGE, UNPROVEN); results go to
+# $GITHUB_OUTPUT.
 # `compute.sh pending-version <commit> [lane]` prints a pending promotion's
 # version instead. Callers: action.yml, scripts/release-state.sh,
 # test-cliff-bump-semantics.sh.
@@ -29,6 +30,7 @@ LANE="${LANE:-}"
 GO_LANES_JSON="${GO_LANES_JSON:-[]}"
 REPO_TYPE="${REPO_TYPE:-}"
 CLIFF_BIN="${CLIFF_BIN:-git-cliff}"
+UNPROVEN="${UNPROVEN:-}"
 
 case "$CHANNEL" in
   dev | stable) ;;
@@ -91,6 +93,7 @@ nearest_tag() { # <regex> -> the tag matching it on the commit nearest HEAD, or 
   refs="$(git for-each-ref refs/tags --format='%(refname:strip=2) %(objectname) %(*objectname)')" || return 1
   while read -r name obj peeled; do
     [[ $name =~ $1 ]] || continue
+    [[ " $UNPROVEN " != *" $name "* ]] || continue
     tag_at["${peeled:-$obj}"]="$name"
   done <<<"$refs"
   [ "${#tag_at[@]}" -gt 0 ] || return 0
@@ -332,6 +335,16 @@ if [ -n "$PENDING_OF" ]; then
 fi
 
 DEV_PATTERN="${PATTERN%\$}-dev\\.[0-9]+\$"
+# UNPROVEN (release-state.sh claims): the root's tags claimed before their
+# writes and never proven published. Such a tag anchors no range, so its
+# changes ship in the next version, and dev_version still counts it; one at
+# HEAD is the version this commit still has to publish.
+for t in $UNPROVEN; do
+  if [ -n "$LANE" ] || ! [[ $t =~ $PATTERN || $t =~ $DEV_PATTERN ]]; then
+    echo "::error::unproven tag '${t}' is not a root version tag"
+    exit 1
+  fi
+done
 REACHABLE_STABLE="$(nearest_tag "$PATTERN")" || {
   echo "::error::git cannot list the tags or walk HEAD, so the nearest stable tag is unknown"
   exit 1
@@ -456,6 +469,30 @@ DEV_VERSION="$(dev_version "$BASE")" || {
   echo "::error::git cannot list the ${BASE}-dev.* tags, so the dev counter is unknown"
   exit 1
 }
+dev_gt() { # <a> <b>, dev tags -> status 0 when a ranks above b
+  if [ "${1%-dev.*}" != "${2%-dev.*}" ]; then
+    version_gt "${1%-dev.*}" "${2%-dev.*}"
+    return
+  fi
+  [ "${1##*-dev.}" -gt "${2##*-dev.}" ]
+}
+RESUME=""
+if [ "$CHANNEL" = dev ] && [ -n "$UNPROVEN" ]; then
+  AT_HEAD="$(git tag --points-at HEAD)" || {
+    echo "::error::git cannot list the tags at HEAD, so a claim there is unknown"
+    exit 1
+  }
+  for t in $UNPROVEN; do
+    if [[ $t =~ $DEV_PATTERN ]] && grep -qxF -- "$t" <<<"$AT_HEAD" && { [ -z "$RESUME" ] || dev_gt "$t" "$RESUME"; }; then
+      RESUME="$t"
+    fi
+  done
+fi
+if [ -n "$RESUME" ]; then
+  DEV_VERSION="$RESUME"
+  BASE="${RESUME%-dev.*}"
+  echo "::notice::${RESUME} is claimed at HEAD and was never proven published, so this run publishes it"
+fi
 if [ "$BASE" = "$LATEST" ]; then
   RELEASE=false
 else

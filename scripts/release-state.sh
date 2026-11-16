@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Two-branch release state, one subcommand per release.yaml step: pending, publish, ahead, halves,
+# Two-branch release state, one subcommand per release.yaml step: claims, pending, publish, ahead, halves,
 # number (CLIFF_SCRIPT, GO_LANES_JSON, REPO_TYPE), receipts, receipt TAG COMMIT, readback SITE TAG
 # [LANE], provenance and complete (IMAGE@DIGEST SOURCE), hold (drop the nested lanes HEAD holds
 # back from a stable run), barrier, renumber-target, renumber-handoff, renumber (re-tag LANE_KEY's
@@ -477,6 +477,15 @@ cmd_receipts() {
     || die "STATE is not the pending step's state"
   while IFS=$'\t' read -r key tag commit kind; do
     [ -n "$key" ] || continue
+    # cmd_claims found no Release: the claim's writes may not have run, which
+    # only a run at its commit can redo.
+    if [ "$key" = . ] && [[ " ${UNPROVEN:-} " == *" ${tag} "* ]]; then
+      if [ "$commit" = "$(git rev-parse HEAD)" ]; then
+        echo "lane .: ${tag} is claimed here with no Release, so this run publishes it"
+        continue
+      fi
+      die "${tag} is claimed at ${commit} with no Release, so its release run did not finish publishing it, and no repair can. Re-run all jobs of the release run of ${commit}, which publishes ${tag}, then rerun this run."
+    fi
     if ! contexts=$(gh api --paginate "repos/${repo}/commits/${commit}/statuses?per_page=100" \
       --jq '.[] | select(.state == "success") | .context'); then
       die "could not read the statuses of ${commit}, the commit of ${tag}, so its completion is not guessed"
@@ -842,9 +851,73 @@ cmd_readback() { # <site> <tag> [lane]; SUBPACKAGES: the root release's subpacka
   done <<<"$subs"
 }
 
-dev_published() { # <key> <dev tag> -> 0 once every registry the lane's dev channel writes serves the tag
+# A root docker or ts version's tag is its claim, made before its first write,
+# and only its proof, written after its last, shows it published: a dev tag's
+# release/tag receipt, a stable tag's Release. A Go tag and a lane's tag are
+# their own publication.
+claims_proof() { # <key> -> 0 when the lane's tag is a claim that needs a proof
+  [ "$1" = . ] && { [ "${REPO_TYPE:-}" = docker ] || [ "${REPO_TYPE:-}" = ts ]; }
+}
+tag_proven() { # <tag> <commit> -> 0 when the root tag's proof exists, 1 when not; dies when GitHub cannot tell
+  local contexts state
+  if [[ $1 =~ $(dev_re .) ]]; then
+    contexts=$(gh api --paginate "repos/${GITHUB_REPOSITORY:?}/commits/${2}/statuses?per_page=100" \
+      --jq '.[] | select(.state == "success") | .context') \
+      || die "could not read the statuses of ${2}, so whether ${1} was published is not guessed"
+    grep -qxF "${TAG_RECEIPT_PREFIX}${1}" <<<"$contexts"
+  else
+    state=$(bash "$TOOLS/release-exists.sh" "$1") || die "cannot tell whether ${1} has a Release, so whether it was published is not guessed"
+    [ "$state" = present ]
+  fi
+}
+# Before the cliff config runs: the root's claimed and unproven channel tags
+# that compute.sh reads (UNPROVEN). On dev, every dev tag nearer HEAD than its
+# newest proven one or a stable tag; on stable, HEAD's tags and the highest.
+cmd_claims() {
+  local unproven="" c name stop head tags revs high
+  local -A dev_at=() stable_at=()
+  if ! claims_proof .; then
+    out "unproven="
+    return 0
+  fi
+  tags=$(tags_of "$(stable_re .)") || die "cannot read the root's stable tags"
+  while read -r name c; do
+    [ -n "$name" ] || continue
+    stable_at[$c]+="$name "
+  done <<<"$tags"
+  if [ "${CHANNEL:?}" = dev ]; then
+    tags=$(tags_of "$(dev_re .)") || die "cannot read the root's dev tags"
+    while read -r name c; do
+      [ -n "$name" ] || continue
+      dev_at[$c]+="$name "
+    done <<<"$tags"
+    revs=$(git rev-list --topo-order HEAD) || die "git cannot walk HEAD's history"
+    while read -r c; do
+      [ -z "${stable_at[$c]:-}" ] || break
+      [ -n "${dev_at[$c]:-}" ] || continue
+      stop=""
+      for name in ${dev_at[$c]}; do
+        if tag_proven "$name" "$c"; then stop=1; else unproven+=" $name"; fi
+      done
+      [ -z "$stop" ] || break
+    done <<<"$revs"
+  else
+    head=$(git rev-parse HEAD) || die "git cannot resolve HEAD"
+    high=$(highest_stable .) || die "cannot read the root's stable tags"
+    for name in ${stable_at[$head]:-} ${high%% *}; do
+      case " $unproven " in *" $name "*) continue ;; esac
+      tag_proven "$name" "" || unproven+=" $name"
+    done
+  fi
+  [ -z "$unproven" ] || note "claimed with no proof of publication:${unproven}"
+  out "unproven=${unproven# }"
+}
+
+dev_published() { # <key> <dev tag> <commit> -> 0 once the tag's build is published and every registry its dev channel writes serves it
   local pkg
-  [ "$1" = . ] && [ "${REPO_TYPE:-}" = ts ] || return 0
+  claims_proof "$1" || return 0
+  tag_proven "$2" "$3" || return 1
+  [ "${REPO_TYPE:-}" = ts ] || return 0
   pkg=$(jq -r .name package.json) || return 1
   npm_answers "$pkg" "${2#v}" >/dev/null
 }
@@ -855,7 +928,7 @@ has_dev_above() { # <key> <X.Y.Z> -> 0 when a published dev build of the lane on
   tags=$(tags_of "$(dev_re "$1")") || die "cannot read lane ${1}'s dev tags"
   while read -r name c; do
     [ -n "$name" ] || continue
-    if gt "$(core "$name")" "$2" && is_ancestor "$c" refs/remotes/origin/dev && dev_published "$1" "$name"; then
+    if gt "$(core "$name")" "$2" && is_ancestor "$c" refs/remotes/origin/dev && dev_published "$1" "$name" "$c"; then
       return 0
     fi
   done <<<"$tags"
@@ -871,73 +944,6 @@ built_past() { # <key> <T> -> 0 when dev's history holds a dev build of the lane
     fi
   done <<<"$tags"
   return 1
-}
-newest_built() { # <key> <T> -> the newest first-parent dev commit past T carrying a dev tag of the lane, or nothing; fails when git cannot walk dev or list the tags
-  local c at revs
-  revs=$(git rev-list --first-parent "$2..refs/remotes/origin/dev") || return 1
-  while IFS= read -r c; do
-    [ -n "$c" ] || continue
-    at=$(tags_at "$c" "$1") || return 1
-    if [ -n "$at" ]; then
-      printf '%s' "$c"
-      return 0
-    fi
-  done <<<"$revs"
-}
-# A build published under no dev tag (a run that wrote its registries before
-# it held the version's tag) is one no dev tag shows. A newer tagged build
-# carries that build's content and renumber lifts it, so only a build past the
-# newest tagged one holds.
-untagged_past() { # <key> <T> -> a dev commit past T whose build is published untagged, newer than every tagged build; fails when a registry answer, a first-parent walk of dev or the dev-tag list cannot be read
-  local c got res code pkg newest at revs heads
-  [ "$1" = . ] || return 0
-  newest=$(newest_built "$1" "$2") || return 1
-  case "${REPO_TYPE:-}" in
-    docker)
-      revs=$(git rev-list --first-parent "$2..refs/remotes/origin/dev") || return 1
-      while IFS= read -r c; do
-        [ -n "$c" ] || continue
-        [ "$c" != "$newest" ] || return 0
-        got=$(ghcr_state "${IMAGE:?}" "sha-${c}") || return 1
-        if [ "$got" != absent ]; then
-          printf '%s' "$c"
-          return 0
-        fi
-      done <<<"$revs"
-      ;;
-    ts)
-      pkg=$(jq -r .name package.json) || return 1
-      res=$(http_read "https://registry.npmjs.org/${pkg}") || return 1
-      code=${res##*$'\n'}
-      case "$code" in
-        404) return 0 ;;
-        200) ;;
-        *) return 1 ;;
-      esac
-      heads=$(jq -r '.versions // {} | to_entries[] | select(.key | test("-dev\\.[0-9]+$")) | .value.gitHead // empty' <<<"${res%$'\n'*}" | sort -u) \
-        || return 1
-      while IFS= read -r c; do
-        [ -n "$c" ] || continue
-        # npm's gitHead may name a commit this checkout never fetched.
-        has_commit "$c" || continue
-        if ! is_ancestor "$c" refs/remotes/origin/dev || is_ancestor "$c" "$2"; then
-          continue
-        fi
-        at=$(tags_at "$c" "$1") || return 1
-        if [ -z "$at" ] && { [ -z "$newest" ] || ! is_ancestor "$c" "$newest"; }; then
-          printf '%s' "$c"
-          return 0
-        fi
-      done <<<"$heads"
-      ;;
-  esac
-}
-tags_at() { # <commit> <key> -> the lane's dev tags on the commit; fails with tags_of
-  local name c tags
-  tags=$(tags_of "$(dev_re "$2")") || return 1
-  while read -r name c; do
-    [ -z "$name" ] || [ "$c" != "$1" ] || printf '%s\n' "$name"
-  done <<<"$tags"
 }
 
 # A dev run publishes a TS subpackage only when its range changed it, and only
@@ -1152,7 +1158,7 @@ settle_dev_head() {
 # R finished, a release run of dev's head succeeded, and dev ranks above the
 # version published.
 cmd_barrier() {
-  local state="${STATE:?}" plan cutoff key r v c p held need="" subrows="" subs s t st lacking waited="" recs rows
+  local state="${STATE:?}" plan cutoff key r v c p need="" subrows="" subs s t st lacking waited="" recs rows
   : "${GITHUB_REPOSITORY:?}" "${WORKFLOW:?}" "${GITHUB_RUN_ID:?}"
   plan=$(jq -r --arg root "${ROOT_VERSION:-}" \
     'to_entries[] | select(.value.in_range) | [.key, .value.commit, (if .key == "." then $root else .value.version end)] | @tsv' <<<"$state")
@@ -1189,23 +1195,6 @@ cmd_barrier() {
   read_floor=$RENUMBER_READS
   poll "dev release runs created before ${cutoff}" 2 pending_runs "$cutoff"
   git fetch --quiet --force --tags origin '+refs/heads/dev:refs/remotes/origin/dev' || die "cannot fetch dev"
-  # A build published but untagged is invisible to the rank checks below, so
-  # its run must finish first: every dev run, as a later one may own it.
-  held=""
-  while IFS=$'\t' read -r key r v; do
-    p=$(git rev-parse "$r^2") || die "lane ${key}: cannot read the commit ${r} promoted"
-    c=$(untagged_past "$key" "$p") || die "lane ${key}: cannot tell whether dev holds a published, untagged build"
-    [ -z "$c" ] || held="${held}${key} "
-  done <<<"$plan"
-  if [ -n "$held" ]; then
-    poll "every dev release run, as dev holds a published build with no dev tag" 2 pending_runs
-    git fetch --quiet --force --tags origin '+refs/heads/dev:refs/remotes/origin/dev' || die "cannot fetch dev"
-    while IFS=$'\t' read -r key r v; do
-      p=$(git rev-parse "$r^2") || die "lane ${key}: cannot read the commit ${r} promoted"
-      c=$(untagged_past "$key" "$p") || die "lane ${key}: cannot tell whether dev holds a published, untagged build"
-      [ -z "$c" ] || die "lane ${key}: dev's build of ${c} is published with no dev tag and no newer build is tagged, so its version cannot rank above ${v}. Dispatch ${WORKFLOW} on dev to build and tag dev's head, then rerun this run."
-    done <<<"$plan"
-  fi
   # The rank checks below see a root dev tag only, and a dev run publishes a
   # subpackage after that tag: each subpackage the run publishes (every root
   # promotion's, as cmd_publish takes them) needs a dev build of its newest dev
@@ -1219,14 +1208,14 @@ cmd_barrier() {
     subs=$(jq -c --argjson add "$s" 'reduce $add[] as $x (.; if any(.[]; . == $x) then . else . + [$x] end)' <<<"$subs")
   done <<<"$recs"
   if [ -n "$recs" ]; then
-    t=$(git rev-parse "$(tail -n1 <<<"$recs")^2")
+    c=$(tail -n1 <<<"$recs")
+    t=$(git rev-parse "$c^2") || die "lane .: cannot read the commit ${c} promoted"
     rows=$(jq -r '.[]' <<<"$subs")
     while IFS= read -r s; do
       [ -z "$s" ] || subrows+="${s}"$'\t'"${t}"$'\t'"${ROOT_VERSION:-}"$'\n'
     done <<<"$rows"
   fi
   subrows+=$(half_rows "$state" "$plan") || exit 1
-  [ -z "$held" ] || waited=1
   lacking=$(subs_lacking "$subrows" incomplete)
   if [ -n "$lacking" ]; then
     poll "every dev release run, as a subpackage's newest dev change has no dev build on npm" 2 pending_runs
@@ -1330,7 +1319,7 @@ npm_dev_state() { # <dev tag> <commit> -> "publish" when npm lacks the version, 
     200)
       head=$(jq -r '.gitHead // ""' <<<"${res%$'\n'*}") || head=""
       [ "$head" = "$2" ] \
-        || die "npm ${pkg}@${ver} is already published from '${head:-an unrecorded commit}', not ${2}. A dev release run published it without tagging it, so rerun that run instead of renumbering over it."
+        || die "npm ${pkg}@${ver} is already published from '${head:-an unrecorded commit}', not ${2}. A published version never moves, so the build is not renumbered over it."
       note "npm ${pkg}@${ver} already published from ${2}"
       ;;
     *) die "npm cannot tell whether ${pkg}@${ver} exists (HTTP ${code}), so ${1} is not published or tagged" ;;
@@ -1346,7 +1335,7 @@ publish_npm_dev() { # <dev tag> <npm_dev_state's answer>
   npm_answers "$pkg" "$ver" || die "npm ${pkg}@${ver} does not read back, so ${1} is not published"
 }
 
-renumber_build() { # <key> <new dev version> [resume] -> the build at HEAD to renumber, or nothing when it already ranks there
+renumber_build() { # <key> <new dev version> -> the build at HEAD to renumber, or nothing when it already ranks there
   local key=$1 new=$2 d_tag d
   [ "${CHANNEL:-}" = dev ] || die "renumber runs on the dev channel only"
   [[ $new =~ $(dev_re "$key") ]] || die "'${new}' is not a dev version of lane ${key}"
@@ -1358,9 +1347,9 @@ renumber_build() { # <key> <new dev version> [resume] -> the build at HEAD to re
   d=$(git rev-list -n1 "$d_tag")
   [ "$d" = "$(git rev-parse HEAD)" ] \
     || die "lane ${key}: ${new} was computed at HEAD, but the newest build is ${d_tag} at ${d}. Check that build out first."
-  # The tagging job's rerun after it claimed the version and died before its
-  # writes resumes; a version computed fresh never equals an existing tag.
-  if [ "${3:-}" = resume ] && [ "$d_tag" = "$new" ]; then
+  # compute.sh answers the build's own newest tag only when that claim is
+  # unproven (UNPROVEN), so the renumber resumes it.
+  if [ "$d_tag" = "$new" ]; then
     printf '%s\n' "$d"
     return 0
   fi
@@ -1476,15 +1465,14 @@ cmd_renumber_subpackages() {
   out "version=${d_tag}" "dirs=${dirs}"
 }
 
-# A version tag serving another digest is another build's published version,
-# which never moves.
+# A version tag serving another digest is another build's published version.
 retag_state() { # <repository> <digest> <new tag> <commit> -> "write" when the tag is absent, nothing when it serves the digest; dies otherwise
   local served
   served=$(ghcr_state "$1" "$3") || die "cannot tell whether ghcr.io/${1}:${3} exists, because ${served}, so it is not written"
   if [ "$served" = "$2" ]; then
     note "ghcr.io/${1}:${3} already serves the build at ${4}"
   elif [ "$served" != absent ]; then
-    die "ghcr.io/${1}:${3} already serves ${served}, not the build at ${4} (${2}). A dev release run published it without tagging it, so rerun that run instead of renumbering over it."
+    die "ghcr.io/${1}:${3} already serves ${served}, not the build at ${4} (${2}). A published version never moves, so the build is not renumbered over it."
   else
     echo write
   fi
@@ -1498,13 +1486,13 @@ retag() { # <repository> <digest> <new tag>
   [ "$got" = "$2" ] || die "re-tagging ${2} as ${1}:${3} changed the digest to ${got}"
 }
 
-# Every read and refusal comes first, then the claim (the tag and its receipt),
-# then the writes under the version, so a refused or failed claim writes
-# nothing a later run could overwrite.
+# Every read and refusal comes first, then the claim (the tag), the writes
+# under the version, and the receipt that proves them, so a refused claim
+# writes nothing and a failed write leaves the claim for compute.sh to resume.
 cmd_renumber() {
   local key="${LANE_KEY:?}" new="${DEV_VERSION:?}" repo="${GITHUB_REPOSITORY:?}" d digest names n state w rc npm=""
   local -a writes=()
-  d=$(renumber_build "$key" "$new" resume) || exit 1
+  d=$(renumber_build "$key" "$new") || exit 1
   [ -n "$d" ] || return 0
   if [ "$key" = . ] && [ "${REPO_TYPE:-}" = docker ]; then
     digest=$(ghcr_digest "${IMAGE:?}" "sha-${d}")
@@ -1533,14 +1521,6 @@ cmd_renumber() {
     cmd_half_free "$key" "$new" "$d"
   fi
   tag_ref "$repo" "$new" "$d" || die "tag ${new} is not at ${d}, so the build is not renumbered"
-  if ! gh api -X POST "repos/${repo}/statuses/${d}" -f state=success -f context="${TAG_RECEIPT_PREFIX}${new}" \
-    -f description="created by the dev renumber run" \
-    -f target_url="${GITHUB_SERVER_URL:-https://github.com}/${repo}/actions/runs/${GITHUB_RUN_ID:-0}" >/dev/null; then
-    if [ "$TAG_CREATED" = true ]; then
-      gh api -X DELETE "repos/${repo}/git/refs/tags/${new}" >/dev/null
-    fi
-    die "receipt for ${new} not recorded"
-  fi
   for w in "${writes[@]}"; do
     # shellcheck disable=SC2086 # three words
     retag $w
@@ -1548,11 +1528,21 @@ cmd_renumber() {
   if [ "$key" = . ] && [ "${REPO_TYPE:-}" = ts ]; then
     publish_npm_dev "$new" "$npm"
   fi
+  # A tag that is its own publication (not claims_proof) goes with a failed
+  # receipt, which the audit would read as a hand-made tag.
+  if ! gh api -X POST "repos/${repo}/statuses/${d}" -f state=success -f context="${TAG_RECEIPT_PREFIX}${new}" \
+    -f description="created by the dev renumber run" \
+    -f target_url="${GITHUB_SERVER_URL:-https://github.com}/${repo}/actions/runs/${GITHUB_RUN_ID:-0}" >/dev/null; then
+    if ! claims_proof "$key" && [ "$TAG_CREATED" = true ]; then
+      gh api -X DELETE "repos/${repo}/git/refs/tags/${new}" >/dev/null
+    fi
+    die "receipt for ${new} not recorded"
+  fi
   echo "lane ${key}: the build at ${d} is now also ${new}"
 }
 
 case "${1:-}" in
-  pending | publish | hold | ahead | halves | number | receipts | renumber) "cmd_$1" ;;
+  pending | publish | hold | ahead | halves | number | receipts | renumber | claims) "cmd_$1" ;;
   barrier)
     rc=0
     timeout --kill-after=10 "$BARRIER_SECONDS" "$BASH" "${BASH_SOURCE[0]}" barrier-wait || rc=$?
@@ -1580,5 +1570,5 @@ case "${1:-}" in
     shift
     "$cmd" "$@"
     ;;
-  *) die "usage: release-state.sh pending|publish|ahead|halves|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|half-free|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
+  *) die "usage: release-state.sh claims|pending|publish|ahead|halves|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|half-free|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
 esac

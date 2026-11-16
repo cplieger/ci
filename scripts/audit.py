@@ -1440,8 +1440,9 @@ def compliance(s):
             )
         for tag in s.get('dev_tags_without_receipt') or []:
             hard.append(
-                f'dev tag {tag} carries no release/tag receipt on its commit (a hand-made '
-                'dev tag skews the -dev.N counter and the change anchor; delete it)'
+                f'dev tag {tag} carries no release/tag receipt on its commit: the release '
+                'run that claimed it did not finish (rerun all its jobs), or it was made by hand, '
+                'which skews the -dev.N counter and the change anchor (delete it)'
             )
         for tag in s.get('stable_tags_without_receipt') or []:
             hard.append(

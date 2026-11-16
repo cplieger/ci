@@ -1927,102 +1927,13 @@ out_b=$(barrier)
 chk "B3 a dev run that never finishes holds the publish" "$out_b" "EXIT=1"
 chk_has "B3 and says why" "$(cat "$WORK/barrier.log")" "gave up waiting for dev release runs"
 
-# A dev run past T pushed its image or npm version, then died before its git
-# tag: no dev tag shows the build, so the rank checks cannot see it.
 GH_BUSY_CALLS=0
-echo "sha256:$(printf 'e%.0s' $(seq 64))" >"$CURL_DIR/manifest-sha-$D3"
-out_b=$(POLLS=5 REPO_TYPE=docker IMAGE=o/app barrier)
-chk "B19 an untagged image past T waits for every dev run, the later one included" \
-  "$out_b|$(dispatched)|$(grep -c '^waiting for every dev release run' "$WORK/barrier.log")" "EXIT=1|0|3"
-chk_has "B19 and gives up holding the publish" "$(cat "$WORK/barrier.log")" "gave up waiting for every dev release run"
-cp "$GH_DIR/runs-idle.json" "$GH_DIR/runs-idle.saved"
-jq '.workflow_runs[].status = "completed"' "$GH_DIR/runs-idle.saved" >"$GH_DIR/runs-idle.json"
-out_b=$(REPO_TYPE=docker IMAGE=o/app barrier)
-chk "B19 once every run finished, an image still untagged holds the publish and dispatches nothing" "$out_b|$(dispatched)" "EXIT=1|0"
-chk_has "B19 naming the build" "$(cat "$WORK/barrier.log")" \
-  "lane .: dev's build of $D3 is published with no dev tag and no newer build is tagged, so its version cannot rank above v1.1.0"
-chk_has "B19 and the dev release that supersedes it, not a rerun of its own" "$(cat "$WORK/barrier.log")" \
-  "Dispatch release.yaml on dev to build and tag dev's head, then rerun this run."
-# Walk 1 of dev past T looks for the newest tagged build, walk 2 for an image.
-chk "B30 a dev history git cannot walk for the newest tagged build holds the publish" \
-  "$(REPO_TYPE=docker IMAGE=o/app failing_git 'rev-list --first-parent *..refs/remotes/origin/dev' 1 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
-chk_has "B30 and says it cannot tell" "$(cat "$WORK/barrier.log")" "lane .: cannot tell whether dev holds a published, untagged build"
-chk "B30 as does one for the untagged image" \
-  "$(REPO_TYPE=docker IMAGE=o/app failing_git 'rev-list --first-parent *..refs/remotes/origin/dev' 2 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|2"
-chk_has "B30 and says so" "$(cat "$WORK/barrier.log")" "lane .: cannot tell whether dev holds a published, untagged build"
 chk "B31 a promoted commit git cannot read holds the publish" \
   "$(REPO_TYPE=docker IMAGE=o/app failing_git 'rev-parse *^2' 1 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
 chk_has "B31 and names it" "$(cat "$WORK/barrier.log")" "lane .: cannot read the commit $R1 promoted"
-chk "B31 as does one after the hold" \
-  "$(REPO_TYPE=docker IMAGE=o/app failing_git 'rev-parse *^2' 2 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|2"
-chk_has "B31 and names it" "$(cat "$WORK/barrier.log")" "lane .: cannot read the commit $R1 promoted"
-# An older tagged build past T does not cover a newer untagged one.
-git -C "$O" tag v1.1.0-dev.9 "$D2"
-out_b=$(REPO_TYPE=docker IMAGE=o/app barrier)
-git -C "$O" tag -d v1.1.0-dev.9 >/dev/null
-git -C "$W" tag -d v1.1.0-dev.9 >/dev/null
-chk "B19 an untagged image newer than every tagged build past T still holds the publish" "$out_b|$(dispatched)" "EXIT=1|0"
-chk_has "B19 naming the newer build" "$(cat "$WORK/barrier.log")" "lane .: dev's build of $D3 is published with no dev tag"
-echo 503 >"$CURL_DIR/status-sha-$D3"
-rm "$CURL_DIR/manifest-sha-$D3"
-out_b=$(REPO_TYPE=docker IMAGE=o/app barrier)
-rm "$CURL_DIR/status-sha-$D3"
-chk "B19 a GHCR that cannot answer holds the publish" "$out_b|$(dispatched)" "EXIT=1|0"
-chk_has "B19 and says so" "$(cat "$WORK/barrier.log")" "lane .: cannot tell whether dev holds a published, untagged build"
-out_b=$(REPO_TYPE=docker IMAGE=o/app barrier)
-chk "B19 with no image past T, nothing is held" "$out_b|$(dispatched)" "|0"
-printf '{"name":"@o/app"}\n' >"$W/package.json"
-echo "https://registry.npmjs.org/@o/app {\"versions\":{\"1.0.0-dev.4\":{\"gitHead\":\"$D3\"}}}" >"$CURL_DIR/docs"
-out_b=$(REPO_TYPE=ts barrier)
-chk "B19 an npm dev version published from a commit past T with no tag holds the publish" "$out_b|$(dispatched)" "EXIT=1|0"
-chk_has "B19 naming that commit" "$(cat "$WORK/barrier.log")" "lane .: dev's build of $D3 is published with no dev tag"
-chk "B35 an npm build whose ancestry on dev git cannot tell holds the publish, not read as off dev" \
-  "$(REPO_TYPE=ts failing_git 'merge-base --is-ancestor *' 1 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
-chk_has "B35 and says git cannot tell" "$(cat "$WORK/barrier.log")" "git cannot tell whether $D3 is an ancestor of refs/remotes/origin/dev"
-chk "B35 as does one whose ancestry to the promoted commit git cannot tell" \
-  "$(REPO_TYPE=ts failing_git 'merge-base --is-ancestor *' 2 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|2"
-chk_has "B35 and says so" "$(cat "$WORK/barrier.log")" "git cannot tell whether $D3 is an ancestor of $D1"
-chk "B35 or the commit npm names, when git cannot tell whether the checkout holds it" \
-  "$(REPO_TYPE=ts failing_git "rev-parse --verify --quiet ${D3}^{commit}" 1 barrier)|$(dispatched)|$(git_calls)" "EXIT=1|0|1"
-chk_has "B35 and says so" "$(cat "$WORK/barrier.log")" "git cannot tell whether this checkout holds $D3"
-git -C "$O" tag v1.1.0-dev.9 "$D2"
-got=$(REPO_TYPE=ts failing_git 'merge-base --is-ancestor *' 3 barrier)
-git -C "$O" tag -d v1.1.0-dev.9 >/dev/null
-git -C "$W" tag -d v1.1.0-dev.9 >/dev/null
-chk "B35 or its ancestry to the newest tagged build" "$got|$(git_calls)" "EXIT=1|3"
-chk_has "B35 and says so" "$(cat "$WORK/barrier.log")" "git cannot tell whether $D3 is an ancestor of $D2"
-cp "$CURL_DIR/docs" "$WORK/docs.saved"
-echo "https://registry.npmjs.org/@o/app {\"versions\":{\"1.1.0-dev.6\":{\"gitHead\":\"0123456789abcdef0123456789abcdef01234567\"}}}" >"$CURL_DIR/docs"
-out_b=$(REPO_TYPE=ts barrier)
-mv "$WORK/docs.saved" "$CURL_DIR/docs"
-chk "B35 an npm build from a commit this checkout lacks holds nothing" "$out_b|$(dispatched)" "|0"
-# Listings 1 and 2 find no tagged build on D3 or D2; 3 asks whether npm's D3 is tagged.
-chk "B19 a dev tag list git cannot read beside an untagged npm version holds the publish" \
-  "$(REPO_TYPE=ts failing_tag_read 3 barrier)|$(dispatched)" "EXIT=1|0"
-chk_has "B19 and says it cannot tell" "$(cat "$WORK/barrier.log")" "lane .: cannot tell whether dev holds a published, untagged build"
-cp "$CURL_DIR/docs" "$WORK/docs.saved"
-echo "https://registry.npmjs.org/@o/app {\"versions\":" >"$CURL_DIR/docs"
-out_b=$(REPO_TYPE=ts barrier)
-mv "$WORK/docs.saved" "$CURL_DIR/docs"
-chk "B19 a packument that is not JSON holds the publish" "$out_b|$(dispatched)" "EXIT=1|0"
-chk_has "B19 and says it cannot tell" "$(cat "$WORK/barrier.log")" "lane .: cannot tell whether dev holds a published, untagged build"
-git -C "$O" tag v1.1.0-dev.9 "$D2"
-out_b=$(REPO_TYPE=ts barrier)
-git -C "$O" tag -d v1.1.0-dev.9 >/dev/null
-git -C "$W" tag -d v1.1.0-dev.9 >/dev/null
-chk "B19 an npm dev version newer than every tagged build past T still holds the publish" "$out_b|$(dispatched)" "EXIT=1|0"
-FIRST=$(git -C "$O" rev-list --max-parents=0 "$D1")
-chk "B19 the fixture's first commit carries no dev tag" "$(git -C "$O" tag --points-at "$FIRST" | grep -c -- '-dev\.' || true)" "0"
-echo "https://registry.npmjs.org/@o/app {\"versions\":{\"1.0.0-dev.4\":{\"gitHead\":\"$FIRST\"},\"1.0.0\":{\"gitHead\":\"$D3\"}}}" >"$CURL_DIR/docs"
-out_b=$(REPO_TYPE=ts barrier)
-chk "B19 npm dev versions T reaches, and stable versions, hold nothing" "$out_b|$(dispatched)" "|0"
-rm "$CURL_DIR/docs"
-echo "https://registry.npmjs.org/@o/app" >"$CURL_DIR/down"
-out_b=$(REPO_TYPE=ts barrier)
-rm "$CURL_DIR/down" "$W/package.json"
-chk "B19 an npm registry that cannot answer holds the publish" "$out_b|$(dispatched)" "EXIT=1|0"
 # Every dev run has finished from here on, so a renumber dispatch waits for none.
-rm "$GH_DIR/runs-idle.saved"
+jq '.workflow_runs[].status = "completed"' "$GH_DIR/runs-idle.json" >"$GH_DIR/runs-idle.new"
+mv "$GH_DIR/runs-idle.new" "$GH_DIR/runs-idle.json"
 
 GH_BUSY_CALLS=0
 git -C "$O" tag v1.1.0-dev.2 "$D3"
@@ -2036,20 +1947,6 @@ SH
   chmod 755 "$GH_DIR/on-dispatch"
 }
 make_hook success ""
-# A run whose tag create failed once dev moved on left its build untagged; the
-# next run's tagged build carries it, so renumber covers it.
-echo "sha256:$(printf 'e%.0s' $(seq 64))" >"$CURL_DIR/manifest-sha-$D2"
-out_b=$(REPO_TYPE=docker IMAGE=o/app barrier)
-rm "$CURL_DIR/manifest-sha-$D2"
-chk "B19 an untagged image below a newer tagged build past T holds nothing and dispatches renumber" \
-  "$(dispatched)|$(grep -c 'published with no dev tag' "$WORK/barrier.log" || true)" "1|0"
-make_hook success ""
-printf '{"name":"@o/app"}\n' >"$W/package.json"
-echo "https://registry.npmjs.org/@o/app {\"versions\":{\"1.1.0-dev.5\":{\"gitHead\":\"$D2\"}}}" >"$CURL_DIR/docs"
-out_b=$(REPO_TYPE=ts barrier)
-rm "$CURL_DIR/docs" "$W/package.json"
-chk "B19 as does an npm dev version below a newer tagged build" \
-  "$(dispatched)|$(grep -c 'published with no dev tag' "$WORK/barrier.log" || true)" "1|0"
 SIDE=$(git -C "$O" commit-tree "$D3^{tree}" -p "$D3" -m "feat: a side-branch experiment")
 git -C "$O" tag v1.3.0-dev.1 "$SIDE"
 make_hook success ""
@@ -2075,15 +1972,13 @@ renumbered_failing() { # <N> -> EXIT=n|renumber dispatches of B6's barrier with 
   git -C "$W" tag -d v1.2.0-dev.1 >/dev/null 2>&1 || true
   echo "$got|$(dispatched)"
 }
-# Listing 1 is the untagged-build check's, 2 and 3 the rank and build-past
-# reads before the renumber, 6 and 7 the build-past and rank reads after it.
-chk "B29 a dev tag list git cannot read in the untagged-build check holds the publish" "$(renumbered_failing 1)" "EXIT=1|0"
-chk_has "B29 and says it cannot tell" "$(cat "$WORK/barrier.log")" "lane .: cannot tell whether dev holds a published, untagged build"
-chk "B29 one git cannot read for the rank holds it" "$(renumbered_failing 2)" "EXIT=1|0"
+# Listings 1 and 2 are the rank and build-past reads before the renumber, 5
+# and 6 the build-past and rank reads after it.
+chk "B29 one git cannot read for the rank holds it" "$(renumbered_failing 1)" "EXIT=1|0"
 chk_has "B29 naming the lane" "$(cat "$WORK/barrier.log")" "cannot read lane .'s dev tags"
-chk "B29 as does one for the build past the promoted commit" "$(renumbered_failing 3)" "EXIT=1|0"
-chk "B29 and after the renumber, one for the build past it" "$(renumbered_failing 6)" "EXIT=1|1"
-chk "B29 or for the rank it left" "$(renumbered_failing 7)" "EXIT=1|1"
+chk "B29 as does one for the build past the promoted commit" "$(renumbered_failing 2)" "EXIT=1|0"
+chk "B29 and after the renumber, one for the build past it" "$(renumbered_failing 5)" "EXIT=1|1"
+chk "B29 or for the rank it left" "$(renumbered_failing 6)" "EXIT=1|1"
 chk_has "B29 naming the lane" "$(cat "$WORK/barrier.log")" "cannot read lane .'s dev tags"
 renumbered_git_failing() { # <argv glob> <N> -> EXIT=n|renumber dispatches|matching git calls of B6's barrier with call N failing
   local got
@@ -2093,11 +1988,13 @@ renumbered_git_failing() { # <argv glob> <N> -> EXIT=n|renumber dispatches|match
   git -C "$W" tag -d v1.2.0-dev.1 >/dev/null 2>&1 || true
   echo "$got|$(dispatched)|$(git_calls)"
 }
-# Promoted-commit reads 1 and 2 are the untagged-build check's and the
-# subpackage rows', 3 the rank check's, 5 the one after the renumber.
-chk "B33 a promoted commit git cannot read for the rank check holds the publish" "$(renumbered_git_failing 'rev-parse *^2' 3)" "EXIT=1|0|3"
+# Promoted-commit read 1 is the subpackage rows', 2 the rank check's, 4 the
+# one after the renumber.
+chk "B33 a promoted commit git cannot read for the subpackage rows holds the publish" "$(renumbered_git_failing 'rev-parse *^2' 1)" "EXIT=1|0|1"
 chk_has "B33 and names it" "$(cat "$WORK/barrier.log")" "lane .: cannot read the commit $R1 promoted"
-chk "B33 as does one after the renumber" "$(renumbered_git_failing 'rev-parse *^2' 5)" "EXIT=1|1|5"
+chk "B33 as does one for the rank check" "$(renumbered_git_failing 'rev-parse *^2' 2)" "EXIT=1|0|2"
+chk_has "B33 and names it" "$(cat "$WORK/barrier.log")" "lane .: cannot read the commit $R1 promoted"
+chk "B33 as does one after the renumber" "$(renumbered_git_failing 'rev-parse *^2' 4)" "EXIT=1|1|4"
 chk_has "B33 naming it" "$(cat "$WORK/barrier.log")" "lane .: cannot read the commit $R1 promoted"
 # Ancestry reads 1 to 4 are the build-past check's (D1's dev tag, then D3's),
 # 5 to 8 its repeat once no dev run is unfinished, 9 to 12 its repeat after the
@@ -2167,6 +2064,19 @@ mv "$GH_DIR/runs-busy.saved" "$GH_DIR/runs-busy.json"
 mv "$GH_DIR/runs-idle.saved" "$GH_DIR/runs-idle.json"
 GH_BUSY_CALLS=0
 
+# An image or TS root's dev tag claims its version before the run's writes, so
+# only the release/tag receipt written after them shows a published build.
+DT=$(git -C "$O" rev-list -n1 v1.2.0-dev.1)
+[ ! -f "$GH_DIR/statuses-$DT.json" ] || fail "B36 needs the commit of v1.2.0-dev.1 to carry no status yet"
+make_hook success ""
+out_b=$(REPO_TYPE=docker IMAGE=o/app barrier)
+chk "B36 an image's dev tag above the version with no receipt, a claim never proven published, does not release the hold" \
+  "$out_b|$(dispatched)" "EXIT=1|1"
+chk_has "B36 the renumber must leave a published build" "$(cat "$WORK/barrier.log")" "lane .: renumber run 99 left no dev build above v1.1.0"
+echo '[{"context":"release/tag/v1.2.0-dev.1","state":"success"}]' >"$GH_DIR/statuses-$DT.json"
+rm -f "$GH_DIR/on-dispatch"
+out_b=$(REPO_TYPE=docker IMAGE=o/app barrier)
+chk "B36 the same tag with its receipt releases the hold" "$out_b|$(dispatched)" "|0"
 # A TS root's dev channel is npm: a git tag alone does not rank dev above.
 printf '{"name":"@o/app"}\n' >"$W/package.json"
 make_hook success ""
@@ -2179,7 +2089,10 @@ echo "https://registry.npmjs.org/@o/app/1.2.0-dev.1" >>"$CURL_DIR/ok"
 rm -f "$GH_DIR/on-dispatch"
 out_b=$(REPO_TYPE=ts barrier)
 chk "B11 the same tag once npm serves it releases the hold" "$out_b|$(dispatched)" "|0"
-rm "$W/package.json"
+rm "$GH_DIR/statuses-$DT.json"
+out_b=$(REPO_TYPE=ts barrier)
+chk "B36 as does a TS root's tag npm serves, until its receipt is gone" "$out_b|$(dispatched)" "EXIT=1|1"
+rm -f "$GH_DIR/on-dispatch" "$W/package.json"
 
 # One read budget covers every wait: what the dev runs spent, the renumber run's wait cannot.
 git -C "$O" tag -d v1.2.0-dev.1 >/dev/null
@@ -2533,10 +2446,14 @@ chk_has "U43 and says why" "$(cat "$WORK/renumber.log")" "tag v1.2.0-dev.1 is no
 touch "$GH_DIR/fail-post"
 out_u=$(renumber docker v1.2.0-dev.1)
 rm "$GH_DIR/fail-post"
-chk "U43 as does one whose receipt fails, deleting the tag it created" \
-  "$out_u|$(wc -l <"$DOCKER_LOG")|$(grep -c '^api -X DELETE repos/o/app/git/refs/tags/v1.2.0-dev.1$' "$GH_LOG")" "EXIT=1|0|1"
+# The receipt proves the re-tag, so it follows it, and a failed one leaves the
+# claim in place for compute.sh to resume.
+chk "U43 a renumber whose receipt fails re-tagged the build first and deletes no tag" \
+  "$out_u|$(wc -l <"$DOCKER_LOG")|$(grep -c '^api -X DELETE ' "$GH_LOG" || true)" "EXIT=1|1|0"
+chk "U43 the receipt is its last call" "$(tail -n1 "$GH_LOG")" \
+  "api -X POST repos/o/app/statuses/$D3 -f state=success -f context=release/tag/v1.2.0-dev.1 -f description=created by the dev renumber run -f target_url=https://gh/o/app/actions/runs/7"
 # A renumber that claimed its version and died before the re-tag is
-# completed by its rerun, which finds the version already on the build.
+# completed by the next renumber, whose computation resumes the version.
 git -C "$W" tag v1.2.0-dev.1 "$D3"
 echo "$D3" >"$GH_DIR/tag-v1.2.0-dev.1"
 out_u=$(renumber docker v1.2.0-dev.1)
@@ -2732,7 +2649,11 @@ handoff() { # <repo type> <dev version> -> the outputs, or EXIT=n
 }
 chk "U19 a TS root hands its renumber on, naming the build" "$(handoff ts v1.2.0-dev.8)" "version=v1.2.0-dev.8 commit=$UF "
 chk "U19 publishing and tagging nothing itself" "$(wc -l <"$GH_LOG")" "0"
-chk "U19 a build already ranking there hands nothing on" "$(handoff ts v1.1.0-dev.3)" ""
+chk "U19 a build already ranking there hands nothing on" "$(handoff ts v1.1.0-dev.2)" ""
+# compute.sh answers the build's own newest tag only for a claim never proven
+# published, so a fresh renumber resumes that version.
+chk "U46 a version that is the build's own newest tag is handed on, resuming its claim" \
+  "$(handoff ts v1.1.0-dev.3)" "version=v1.1.0-dev.3 commit=$UF "
 chk "U19 every lane hands its renumber on" "$(handoff go v1.2.0-dev.8)" "version=v1.2.0-dev.8 commit=$UF "
 chk "U19 a stable version is refused" "$(handoff ts v1.2.0)" "EXIT=1"
 # The tagging job reads what a job that ran the config wrote, as data.
@@ -2945,7 +2866,9 @@ chk "B20 a root-only promotion reads no subpackage registry" "$(grep -c "^$NPM_W
 Y="$WORK/two-epoch" YC="$WORK/two-epoch-clone" CLOCK="$WORK/clock"
 cp -a "$X" "$Y"
 git -C "$Y" checkout -q dev
-git -C "$Y" tag v1.2.0-dev.1 "$(commit_in "$Y" "fix: root past the promotion" main.go=v9)"
+YT=$(commit_in "$Y" "fix: root past the promotion" main.go=v9)
+git -C "$Y" tag v1.2.0-dev.1 "$YT"
+echo '[{"context":"release/tag/v1.2.0-dev.1","state":"success"}]' >"$GH_DIR/statuses-$YT.json"
 git clone -q "$Y" "$YC"
 git -C "$YC" checkout -q --detach "$XR1"
 printf '{"name":"@o/x"}\n' >"$YC/package.json"
@@ -3290,6 +3213,133 @@ chk_has "U24 and says it cannot tell" "$(cat "$WORK/zsub.log")" "subpackage web:
 chk_lacks "U24 having diffed no range from an empty start" "$(cat "$WORK/zsub.log")" "MODE=paths needs FROM"
 rm -f "$CURL_DIR/docs"
 
+# ── A claim never proven: one version per commit, no change dropped ────────
+# A root image or TS package's tag claims its version before the run's first
+# write; the proof follows its last: the release/tag receipt on dev, the
+# Release on stable. A run that died between leaves the claim unproven.
+P="$WORK/claims"
+git init -q -b dev "$P"
+cp "$ROOT/configs/cliff-stable.toml" "$P/cliff.toml"
+git -C "$P" add cliff.toml
+P0=$(commit_in "$P" "feat: initial" Dockerfile='FROM scratch')
+git -C "$P" tag v1.0.0 "$P0"
+P1=$(commit_in "$P" "fix: merge one" app.sh=1)
+git -C "$P" tag v1.1.0-dev.1 "$P1"
+echo '[{"context":"release/tag/v1.1.0-dev.1","state":"success"}]' >"$GH_DIR/statuses-$P1.json"
+P2=$(commit_in "$P" "fix: merge two, whose run claimed its version and died" app.sh=2)
+git -C "$P" tag v1.1.0-dev.2 "$P2"
+P3=$(commit_in "$P" "chore: sync the shared workflows" .github/workflows/ci.yaml='name: ci')
+claims_at() { # <repo> <commit> <channel> [repo type] -> the unproven list, or EXIT=n
+  git -C "$1" checkout -q --detach "$2"
+  : >"$WORK/out"
+  : >"$GH_LOG"
+  (cd "$1" && CHANNEL="$3" REPO_TYPE="${4:-docker}" GITHUB_OUTPUT="$WORK/out" bash "$RS" claims) >"$WORK/claims.log" 2>&1 || {
+    echo "EXIT=$?"
+    return 0
+  }
+  outkey unproven
+}
+compute_at() { # <repo> <commit> <channel> <unproven> -> "dev_version|base|anchor_sha", or EXIT=n
+  git -C "$1" checkout -q --detach "$2"
+  : >"$WORK/cout"
+  (cd "$1" && CHANNEL="$3" GO_LANES_JSON='[]' REPO_TYPE=docker CLIFF_BIN="$CLIFF" UNPROVEN="$4" \
+    GITHUB_OUTPUT="$WORK/cout" bash "$COMPUTE") >"$WORK/compute.log" 2>&1 || {
+    echo "EXIT=$?"
+    return 0
+  }
+  printf '%s|%s|%s' "$(sed -n 's/^dev_version=//p' "$WORK/cout")" "$(sed -n 's/^base=//p' "$WORK/cout")" \
+    "$(sed -n 's/^anchor_sha=//p' "$WORK/cout")"
+}
+changed_over() { # <repo> <channel> <anchor> <head> -> path-significance's root_changed for the run at head
+  : >"$WORK/out"
+  (cd "$1" && BEFORE="$4^1" HEAD="$4" ANCHOR_SHA="$3" CHANNEL="$2" REPO_TYPE=docker SUBPACKAGES_JSON='[]' GO_LANES_JSON='[]' \
+    GITHUB_OUTPUT="$WORK/out" GITHUB_STEP_SUMMARY=/dev/null bash "$ROOT/scripts/path-significance.sh") >/dev/null 2>&1 \
+    || fail "path-significance failed in the claims fixture"
+  outkey root_changed
+}
+chk "V1 a dev run reads the claims nearer HEAD than the newest proven dev tag" "$(claims_at "$P" "$P3" dev)" "v1.1.0-dev.2"
+chk "V1 reading each tagged commit's statuses once, back to the proven one" \
+  "$(grep -c '/statuses?per_page=100' "$GH_LOG")|$(grep -c "commits/$P1/statuses" "$GH_LOG")" "2|1"
+echo '[{"context":"release/tag/v1.1.0-dev.2","state":"success"}]' >"$GH_DIR/statuses-$P2.json"
+chk "V1 a claim with its receipt is proven" "$(claims_at "$P" "$P3" dev)|$(grep -c '/statuses?' "$GH_LOG")" "|1"
+rm "$GH_DIR/statuses-$P2.json"
+chk "V1 a Go root's tag is its own publication, so it reads nothing" "$(claims_at "$P" "$P3" dev go)|$(wc -l <"$GH_LOG")" "|0"
+touch "$GH_DIR/fail-statuses"
+chk "V1 statuses GitHub cannot read stop the run" "$(claims_at "$P" "$P3" dev)" "EXIT=1"
+rm "$GH_DIR/fail-statuses"
+chk_has "V1 and say so" "$(cat "$WORK/claims.log")" "so whether v1.1.0-dev.2 was published is not guessed"
+# A fresh attempt at the claimed commit (all its jobs rerun): its version is the
+# claim, measured from the last proven tag, so it publishes.
+chk "V2 a run at the claimed commit publishes the claimed version" "$(compute_at "$P" "$P2" dev v1.1.0-dev.2)" \
+  "v1.1.0-dev.2|v1.1.0|$P1"
+chk "V2 over a range with the commit's shipped change" "$(changed_over "$P" dev "$P1" "$P2")" "true"
+# The next commit numbers past the claim and ships the claimed commit's change.
+chk "V3 a later commit never anchors at an unproven tag and numbers past it" "$(compute_at "$P" "$P3" dev v1.1.0-dev.2)" \
+  "v1.1.0-dev.3|v1.1.0|$P1"
+chk "V3 so a sync-only commit still ships the merge the claim left unpublished" "$(changed_over "$P" dev "$P1" "$P3")" "true"
+chk "V3 which an anchor at the claim would have dropped" "$(changed_over "$P" dev "$P2" "$P3")" "false"
+chk "V4 an unproven entry that is no root version tag is refused" "$(compute_at "$P" "$P3" dev yamlenv/v1.0.0)" "EXIT=1"
+chk_has "V4 by name" "$(cat "$WORK/compute.log")" "unproven tag 'yamlenv/v1.0.0' is not a root version tag"
+# Stable: the Release is the proof.
+S="$WORK/claims-stable"
+git init -q -b main "$S"
+cp "$ROOT/configs/cliff-stable.toml" "$S/cliff.toml"
+git -C "$S" add cliff.toml
+S0=$(commit_in "$S" "feat: initial" Dockerfile='FROM scratch')
+git -C "$S" tag v1.0.0 "$S0"
+touch "$GH_DIR/release-v1.0.0"
+S1=$(commit_in "$S" "fix: a stable fix whose run claimed v1.0.1 and died" app.sh=1)
+git -C "$S" tag v1.0.1 "$S1"
+chk "V5 a stable run reads its commit's tag and the highest as unproven with no Release" "$(claims_at "$S" "$S1" stable)" "v1.0.1"
+touch "$GH_DIR/release-v1.0.1"
+chk "V5 and a tag with its Release as proven" "$(claims_at "$S" "$S1" stable)" ""
+rm "$GH_DIR/release-v1.0.1"
+chk "V6 a stable run at the claimed commit publishes the claimed version" \
+  "$(compute_at "$S" "$S1" stable v1.0.1 | cut -d'|' -f2,3)" "v1.0.1|$S0"
+chk "V6 over a range with the commit's shipped change" "$(changed_over "$S" stable "$S0" "$S1")" "true"
+receipts_at() { # <commit> <unproven> -> the repairs, or EXIT=n
+  local state
+  state=$(jq -nc --arg c "$S1" '{".": {h_tag: "v1.0.1", h_commit: $c, repair_kind_note: ""}}')
+  git -C "$S" checkout -q --detach "$1"
+  : >"$WORK/out"
+  (cd "$S" && STATE="$state" REPO_TYPE=docker UNPROVEN="$2" GITHUB_OUTPUT="$WORK/out" bash "$RS" receipts) >"$WORK/receipts.log" 2>&1 || {
+    echo "EXIT=$?"
+    return 0
+  }
+  outkey repairs
+}
+chk "V7 the claimed commit's own run owes no repair: it publishes the version" "$(receipts_at "$S1" v1.0.1)" "[]"
+chk_has "V7 saying so" "$(cat "$WORK/receipts.log")" "v1.0.1 is claimed here with no Release, so this run publishes it"
+S2=$(commit_in "$S" "fix: a later main commit" app.sh=2)
+chk "V8 a later stable run refuses an unproven tag elsewhere, which no repair can complete" "$(receipts_at "$S2" v1.0.1)" "EXIT=1"
+chk_has "V8 naming the claimed commit and the rerun that publishes it" "$(cat "$WORK/receipts.log")" \
+  "v1.0.1 is claimed at $S1 with no Release, so its release run did not finish publishing it, and no repair can. Re-run all jobs of the release run of $S1, which publishes v1.0.1, then rerun this run."
+chk "V8 a proven tag elsewhere is repaired as before" "$(receipts_at "$S2" "" | jq -r '.[0].tag')" "v1.0.1"
+claims_wiring() { # -> per root computation: job|claims before every cliff config step|claims holds the token|compute's unproven input
+  python3 - "$RELEASE_YAML" <<'PY'
+import sys, yaml
+jobs = yaml.safe_load(open(sys.argv[1]))["jobs"]
+out = []
+for job, cliff in (("detect", "Compute version (cliff)"), ("renumber", "Compute lane version (cliff)"),
+                   ("renumber-ts", "Compute version (cliff)")):
+    steps = jobs[job]["steps"]
+    names = [s.get("name") for s in steps]
+    if "Read the version claims" not in names:
+        out.append(f"{job}: no claims step")
+        continue
+    at = names.index("Read the version claims")
+    config = [i for i, s in enumerate(steps) if "git-cliff" in str(s.get("uses", "")) + str(s.get("run", ""))]
+    out.append("|".join([job, str(all(i > at for i in config)), str("GH_TOKEN" in steps[at].get("env", {})),
+                         next(s for s in steps if s.get("name") == cliff)["with"].get("unproven", "")]))
+receipts = next(s for s in jobs["detect"]["steps"] if s.get("name") == "Read release receipts")
+out.append(receipts["env"].get("UNPROVEN", ""))
+print(";".join(out))
+PY
+}
+chk "V9 every root computation reads the claims first, before any step runs the cliff config, and the receipts read them too" \
+  "$(claims_wiring)" \
+  'detect|True|True|${{ steps.claims.outputs.unproven }};renumber|True|True|${{ steps.claims.outputs.unproven }};renumber-ts|True|True|${{ steps.claims.outputs.unproven }};${{ steps.claims.outputs.unproven }}'
+
 # ── Wiring ───────────────────────────────────────────────────────────────────
 chk "W1 pending promotions are read on every run" "$(fact '."if:Find pending promotions"')" ""
 chk "W1 numbering runs only when something is pending" \
@@ -3352,7 +3402,7 @@ chk "W13 from the version and build renumber-ts handed on" \
   "\${{ steps.handoff.outputs.version }} \${{ steps.handoff.outputs.commit }}|\${{ needs.renumber-ts.outputs.npm_version }}|\${{ needs.renumber-ts.outputs.npm_commit }}"
 chk "W13 renumber-ts is one job for the TS root in renumber mode, computing then handing on" \
   "$(fact '."jobif:renumber-ts"')|$(fact '."renumber-ts-steps" | join(",")')" \
-  "\${{ needs.detect.outputs.mode == 'renumber' && needs.detect.outputs.type == 'ts' }}|Checkout,Check out the ci source,Setup Python,Check out the newest build,Compute version (cliff),Hand the version on"
+  "\${{ needs.detect.outputs.mode == 'renumber' && needs.detect.outputs.type == 'ts' }}|Checkout,Check out the ci source,Setup Python,Check out the newest build,Read the version claims,Compute version (cliff),Hand the version on"
 chk "W13 and the renumber matrix skips the TS root and exports nothing" \
   "$(fact '."renumber-if"."Check out the newest build"')|$(fact '."renumber-matrix-outputs"')" \
   "\${{ matrix.key != '.' || needs.detect.outputs.type != 'ts' }}|false"

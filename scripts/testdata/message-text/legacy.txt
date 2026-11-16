@@ -1,7 +1,6 @@
 # Messages whose text is at HEAD of main, one key per line (the text three words either side of
 # the semicolon or dash). Rewriting a message deletes its line here, and a line is added only for
 # a message whose text is at HEAD that a wider reader first sees.
-${TAG} not recorded; deleting the tag
 ${VERSION} already exists; nothing to push.
 ${VERSION} already exists; skipping creation.
 ${VERSION} already exists; skipping.
@@ -88,7 +87,6 @@ sum layer sizes; skipping size badge
 sync failed — {detail}
 test -bench` output; reads stdin when
 the canonical — the next sync
-the change anchor; delete it)
 the concurrency probe; letting gremlins report
 the form ${PREFIX}vX.Y.Z; refusing
 the newest point; 0 means leave

@@ -259,6 +259,20 @@ jobs:
         with:
           python-version: "3.15"
 
+      # Before any step runs the repository's cliff config, since it holds a
+      # token: the root's tags claimed and never proven published, which
+      # compute.sh reads (release-state.sh claims).
+      - name: Read the version claims
+        id: claims
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+          REPO_TYPE: ${{ steps.type.outputs.type }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" claims
+
       # Token-free: the steps up to Compute version run the repository's
       # cliff config.
       - name: Find pending promotions
@@ -308,6 +322,7 @@ jobs:
           pending-version: ${{ steps.channel.outputs.channel == 'dev' && steps.number.outputs.root_version || '' }}
           pending-commit: ${{ steps.channel.outputs.channel == 'dev' && steps.pending.outputs.root_commit || '' }}
           pending-in-range: ${{ steps.pending.outputs.root_in_range || 'false' }}
+          unproven: ${{ steps.claims.outputs.unproven }}
 
       - name: Detect changed paths
         id: changes
@@ -392,8 +407,8 @@ jobs:
           bash "$CI_TOOLS/release-state.sh" halves
 
       # The release decision is "a shipped path changed and this commit is
-      # not already tagged on this channel"; git-cliff only decides the bump
-      # level. A changed TS subpackage counts: it
+      # not already published on this channel" (the anchor compute.sh picks);
+      # git-cliff only decides the bump level. A changed TS subpackage counts: it
       # shares the root version, so its publish needs the root tag the go job
       # creates, while the root image rebuilds on root_changed alone. A
       # renumber run publishes nothing here; the renumber jobs tag it. A
@@ -465,6 +480,7 @@ jobs:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           STATE: ${{ steps.number.outputs.state || steps.pending.outputs.state }}
           REPO_TYPE: ${{ steps.type.outputs.type }}
+          UNPROVEN: ${{ steps.claims.outputs.unproven }}
         run: |
           set -euo pipefail
           bash "$CI_TOOLS/release-state.sh" receipts
@@ -575,9 +591,10 @@ jobs:
           echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS syft_config='$SYFT_CONFIG' image_licenses='$IMAGE_LICENSES' runner_image_licenses='$RUNNER_IMAGE_LICENSES' binaries='$BINARIES'"
 
   # ─── Repair each lane's unreceipted stable tag first ───────────────────────
-  # A lane's tag follows its registry writes, so a failed run can leave only
-  # its Release, its readback and the TS subpackages (published after the root
-  # tag) missing. These jobs complete them at the tag's own commit and range in
+  # A Go or lane tag follows its writes, and a root image or TS package with no
+  # Release stops detect (release-state.sh receipts), so a failed run can leave
+  # only a Release, its readback and the TS subpackages (published after the
+  # root tag) missing. These jobs complete them at the tag's own commit and range in
   # this run, with no dispatch, so the per-ref concurrency group cannot
   # deadlock. A step reaches its job's later steps through GITHUB_PATH and
   # GITHUB_ENV, so the job running the cliff config holds no write scope.
@@ -1022,6 +1039,19 @@ jobs:
           set -euo pipefail
           bash "$CI_TOOLS/release-state.sh" renumber-target
 
+      # Before the cliff config runs, as in detect.
+      - name: Read the version claims
+        id: claims
+        if: ${{ steps.target.outputs.commit != '' && matrix.key == '.' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: dev
+          REPO_TYPE: ${{ needs.detect.outputs.type }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" claims
+
       - name: Compute lane version (cliff)
         id: cliff
         if: ${{ steps.target.outputs.commit != '' }}
@@ -1033,6 +1063,7 @@ jobs:
           repo-type: ${{ needs.detect.outputs.type }}
           pending-version: ${{ fromJSON(needs.detect.outputs.lane_state)[matrix.key].version }}
           pending-commit: ${{ fromJSON(needs.detect.outputs.lane_state)[matrix.key].commit }}
+          unproven: ${{ steps.claims.outputs.unproven }}
 
       - name: Hand the version on
         id: handoff
@@ -1209,6 +1240,19 @@ jobs:
           set -euo pipefail
           bash "$CI_TOOLS/release-state.sh" renumber-target
 
+      # Before the cliff config runs, as in detect.
+      - name: Read the version claims
+        id: claims
+        if: ${{ steps.target.outputs.commit != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: dev
+          REPO_TYPE: ${{ needs.detect.outputs.type }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" claims
+
       - name: Compute version (cliff)
         id: cliff
         if: ${{ steps.target.outputs.commit != '' }}
@@ -1219,6 +1263,7 @@ jobs:
           repo-type: ${{ needs.detect.outputs.type }}
           pending-version: ${{ fromJSON(needs.detect.outputs.lane_state)['.'].version }}
           pending-commit: ${{ fromJSON(needs.detect.outputs.lane_state)['.'].commit }}
+          unproven: ${{ steps.claims.outputs.unproven }}
 
       - name: Hand the version on
         id: handoff
@@ -1998,7 +2043,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
-          CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
           set -euo pipefail
           . "$CI_TOOLS/retry.sh"
@@ -2010,20 +2054,6 @@ jobs:
             exit 0
           fi
           [ "$rc" -eq 0 ] || exit 1
-          # The audit reads this receipt: a dev tag has no Release to show
-          # that the pipeline, not a hand, created it. A tag without it would
-          # make a rerun compute release=false, so the tag this attempt
-          # created is deleted with the failed POST and a rerun makes both.
-          if [ "$CHANNEL" != "stable" ] && ! gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
-            -f state=success -f context="release/tag/${VERSION}" \
-            -f description="created by the dev release run" \
-            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
-            if [ "$TAG_CREATED" = true ]; then
-              echo "::error::receipt for ${VERSION} not recorded; deleting the tag this run created so a rerun recreates both"
-              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}" >/dev/null
-            fi
-            exit 1
-          fi
           echo "claimed=true" >>"$GITHUB_OUTPUT"
 
       - name: Publish to npm + JSR
@@ -2073,6 +2103,20 @@ jobs:
             JSR_VERSION=0.14.3
             npx -y "jsr@${JSR_VERSION}" publish --allow-dirty
           fi
+
+      # The dev version's proof, after its last write (release-state.sh
+      # claims reads it); a failed POST leaves the claim for a rerun to resume.
+      - name: Record the dev receipt
+        if: ${{ steps.claim.outputs.claimed == 'true' && needs.detect.outputs.channel == 'dev' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=success -f context="release/tag/${VERSION}" \
+            -f description="created by the dev release run" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
 
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -2187,10 +2231,19 @@ jobs:
           handoff=false
           if [ "$(git rev-list -n1 "$VERSION" 2>/dev/null || true)" != "$GITHUB_SHA" ]; then
             . "$CI_TOOLS/tag-ref.sh"
-            if head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA"); then
-              echo "::warning::${VERSION} is not tagged here and ${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${head}). The run on the new head publishes ${DIR}."
-              handoff=true
-            fi
+            rc=0
+            head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA") || rc=$?
+            case "$rc" in
+              0)
+                echo "::warning::${VERSION} is not tagged here and ${GITHUB_REF_NAME} advanced past ${GITHUB_SHA} (now ${head}). The run on the new head publishes ${DIR}."
+                handoff=true
+                ;;
+              1) ;;
+              *)
+                echo "::error::${VERSION} is not tagged here and ${GITHUB_REF_NAME}'s head is unreadable, so a handoff cannot be confirmed and ${DIR} is not published."
+                exit 1
+                ;;
+            esac
           fi
           echo "handoff=${handoff}" >>"$GITHUB_OUTPUT"
 
