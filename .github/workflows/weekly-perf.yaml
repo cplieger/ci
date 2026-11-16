@@ -171,6 +171,7 @@ jobs:
         with:
           path: results
           pattern: perf-results-cplieger-${{ matrix.repo }}-measure-shard-*
+          merge-multiple: true
 
       # perf_gate.py --prefix reads only this repository's shards: the pattern
       # also matches a repository named `<repo>-measure-shard-<x>`.

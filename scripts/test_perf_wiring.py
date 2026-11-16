@@ -110,6 +110,50 @@ class DispatchInputs(unittest.TestCase):
                             self.assertNotEqual(value, f'${{{{ inputs.{name} }}}}')
 
 
+class ResultArtifacts(unittest.TestCase):
+    """Each results artifact holds a directory named after it, and every download merges,
+    so one artifact lands where many do; its name carries the run attempt."""
+
+    def downloads(self):
+        for path in sorted(WORKFLOWS.glob('*.yaml')):
+            for job, spec in load(path.name)['jobs'].items():
+                for step in spec.get('steps', []):
+                    pattern = (step.get('with') or {}).get('pattern', '')
+                    if str(step.get('uses', '')).startswith('actions/download-artifact@') and (
+                        str(pattern).startswith('perf-results-')
+                    ):
+                        yield path.name, job, step
+
+    def test_every_results_download_merges_its_artifacts(self):
+        found = list(self.downloads())
+        self.assertGreaterEqual(len(found), 5)
+        for name, job, step in found:
+            with self.subTest(workflow=name, job=job, step=step['name']):
+                self.assertTrue(step['with'].get('merge-multiple') is True)
+
+    def test_the_upload_holds_a_directory_named_after_the_attempt_s_artifact(self):
+        steps = load('perf-measure.yaml')['jobs']['measure']['steps']
+        upload = next(s for s in steps if s['name'] == 'Upload the results')
+        name = 'perf-results-${{ inputs.name }}-attempt-${{ github.run_attempt }}'
+        self.assertEqual(upload['with']['name'], name)
+        self.assertEqual(upload['with']['path'], '${{ runner.temp }}/perf-upload')
+        measure = next(s for s in steps if s['name'] == 'Measure')
+        self.assertIn('$RUNNER_TEMP/perf-upload/$ARTIFACT/results.json', measure['run'])
+        self.assertEqual(measure['env']['ARTIFACT'], name)
+
+    def test_the_verdict_reads_the_remeasure_of_the_compare_it_follows(self):
+        jobs = load('perf-ci.yaml')['jobs']
+        self.assertEqual(jobs['compare']['outputs']['attempt'], '${{ github.run_attempt }}')
+        step = next(s for s in jobs['verdict']['steps'] if s['name'] == 'Verdict')
+        self.assertEqual(step['env']['COMPARED'], '${{ needs.compare.outputs.attempt }}')
+        self.assertIn('--remeasure-attempt "$COMPARED"', step['run'])
+
+    def test_calibrate_reads_the_artifacts_by_prefix_and_counts_its_runs(self):
+        steps = load('perf-calibrate.yaml')['jobs']['propose']['steps']
+        run = next(s for s in steps if s['name'] == 'Propose and sign')['run']
+        self.assertIn('--calibrate "$RUNNER_TEMP/artifacts" --prefix "$PREFIX" --runs "$RUNS"', run)
+
+
 class Release(unittest.TestCase):
     def internal(self) -> set[str]:
         run = '\n'.join(

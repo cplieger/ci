@@ -546,8 +546,6 @@ def seconds_per_cell(runs: list[dict]) -> list[dict]:
 UNIT_FIELDS = KEY_FIELDS[:4]
 # GitHub runs at most 256 jobs from one matrix.
 MAX_JOBS = 256
-# Every shard name plan() writes; result_files reads artifacts by it.
-SHARD_NAME = r'(?:run-\d+-)?shard-\d+-of-\d+'
 
 
 # The sets a workflow gates: perf-ci.yaml's pull-request default and
@@ -984,30 +982,68 @@ def load(path: str | pathlib.Path) -> dict:
     return doc
 
 
+def newest_shards(
+    directory: str | pathlib.Path, prefix: str, stage: str = 'measure', since: int = 1
+) -> dict[tuple[str, int, int], pathlib.Path]:
+    """perf-ci.yaml's `perf-results-<prefix>-<stage>-<shard>-attempt-<n>` artifact folders
+    under directory, by (run, shard, shard count), each from its newest attempt from since
+    on: a partial re-run repeats only some shards, and a re-run compare plans other ones.
+    Inside one run a download pattern also matches a repository whose name extends this
+    one's (`<repo>-measure-x`), which the full match leaves out."""
+    name = re.compile(
+        rf'perf-results-{re.escape(prefix)}-{stage}-(?:(run-\d+)-)?'
+        r'shard-(\d+)-of-(\d+)-attempt-(\d+)'
+    )
+    found: dict[tuple[str, int, int], tuple[int, pathlib.Path]] = {}
+    for d in pathlib.Path(directory).iterdir():
+        m = name.fullmatch(d.name) if d.is_dir() else None
+        if m is None or int(m[4]) < since:
+            continue
+        shard = (m[1] or '', int(m[2]), int(m[3]))
+        if shard not in found or found[shard][0] < int(m[4]):
+            found[shard] = (int(m[4]), d)
+    return {k: d for k, (_, d) in sorted(found.items())}
+
+
 def result_files(
-    directory: str | pathlib.Path, prefix: str | None = None, stage: str = 'measure'
+    directory: str | pathlib.Path, prefix: str, stage: str = 'measure'
 ) -> list[pathlib.Path]:
-    """The `*.json` results files under directory. With prefix, only those of
-    perf-ci.yaml's `perf-results-<prefix>-<stage>-<shard>` artifacts: inside one
-    run a download pattern also matches a repository whose name extends this
-    one's (`<repo>-measure-x`)."""
-    root = pathlib.Path(directory)
-    if prefix is None:
-        return sorted(root.rglob('*.json'))
-    name = re.compile(rf'perf-results-{re.escape(prefix)}-{stage}-{SHARD_NAME}')
-    dirs = [d for d in root.iterdir() if d.is_dir() and name.fullmatch(d.name)]
+    """The `*.json` results files of newest_shards."""
+    dirs = newest_shards(directory, prefix, stage).values()
     return sorted(p for d in dirs for p in d.rglob('*.json'))
 
 
+def shard_groups(
+    directory: str | pathlib.Path, prefix: str, stage: str = 'measure', since: int = 1
+) -> dict[str, list[pathlib.Path]]:
+    """newest_shards' results files by run (`run-NN`, or '' for a run of one), each run
+    holding every shard of one shard count, each with a results file; anything else is an
+    error."""
+    runs: dict[str, dict[int, set]] = {}
+    files: dict[str, list[pathlib.Path]] = {}
+    for (run, i, m), d in newest_shards(directory, prefix, stage, since).items():
+        found = sorted(d.rglob('*.json'))
+        if not found:
+            raise ValueError(f'{d.name} holds no results file under {directory}')
+        runs.setdefault(run, {}).setdefault(m, set()).add(i)
+        files.setdefault(run, []).extend(found)
+    if not runs:
+        raise ValueError(f'no results of perf-results-{prefix}-{stage}-* under {directory}')
+    for run, counts in runs.items():
+        label = f'{stage} {run}'.strip()
+        if len(counts) > 1:
+            raise ValueError(f'{label} mixes shard counts {sorted(counts)} under {directory}')
+        ((m, got),) = counts.items()
+        for i in sorted(set(range(1, m + 1)) - got):
+            raise ValueError(f'{label} has no results of shard {i} of {m} under {directory}')
+    return files
+
+
 def merge_results(
-    directory: str | pathlib.Path, prefix: str | None = None, stage: str = 'measure'
+    directory: str | pathlib.Path, prefix: str, stage: str = 'measure', since: int = 1
 ) -> dict:
-    """result_files as one results file; none is an error."""
-    paths = result_files(directory, prefix, stage)
-    if not paths:
-        of = f' of perf-results-{prefix}-{stage}-*' if prefix else ''
-        raise ValueError(f'no results{of} under {directory}')
-    return merge(paths)
+    """Every shard of shard_groups as one results file."""
+    return merge([p for ps in shard_groups(directory, prefix, stage, since).values() for p in ps])
 
 
 def merge(paths: list[pathlib.Path]) -> dict:
@@ -1111,7 +1147,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--check-file', metavar='BUDGETS', help='check the rule and provenance only')
     mode.add_argument('--verdict', metavar='DIR', help='judge the re-measured results in DIR')
-    mode.add_argument('--calibrate', metavar='DIR', help='one subdirectory of results per run')
+    mode.add_argument(
+        '--calibrate', metavar='DIR', help='the downloaded perf-results-<prefix>-measure-* folders'
+    )
     mode.add_argument('--plan', metavar='PLAN', help='write the measure matrix of plan.json')
     mode.add_argument('--bench', metavar='DIR', help='write the chart points of the results in DIR')
     p.add_argument('--set', help='the plan.json set to measure')
@@ -1127,7 +1165,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         '--base', help="the base ref's budgets.json, where a missing file is an empty one"
     )
-    p.add_argument('--results', help='the directory of measured results files')
+    p.add_argument('--results', help='the downloaded perf-results-<prefix>-measure-* folders')
     p.add_argument(
         '--prefix',
         help="perf-ci.yaml's artifact prefix: read only that call's shard directories",
@@ -1136,6 +1174,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument('--repo', help='owner/name of the measured repository')
     p.add_argument('--head', help='the pull request head commit')
     p.add_argument('--remeasure-out', help='where compare writes the cells to re-measure')
+    p.add_argument(
+        '--remeasure-attempt',
+        type=int,
+        help='the run attempt of the compare whose remeasure.json --verdict judges',
+    )
     p.add_argument('--summary', help='a file the Markdown summary is appended to')
     p.add_argument('--out', help='where --calibrate, --plan or --bench writes its file')
     p.add_argument(
@@ -1147,17 +1190,18 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument('--run-url', help='the perf-calibrate run URL')
     a = p.parse_args(argv)
     if a.calibrate:
-        need = ('out', 'repo', 'commit', 'runner', 'run_id', 'run_url')
+        need = ('prefix', 'out', 'repo', 'commit', 'runner', 'run_id', 'run_url')
     elif a.plan:
         need = ('set', 'out')
     elif a.bench:
-        need = ('out',)
+        need = ('prefix', 'out')
     elif a.check_file:
         need = ('base', 'calibrations', 'repo', 'head')
     elif a.verdict:
-        need = ('budgets', 'results')
+        need = ('budgets', 'results', 'prefix', 'remeasure_attempt')
     else:
-        need = ('budgets', 'base', 'results', 'calibrations', 'repo', 'head', 'remeasure_out')
+        need = ('budgets', 'base', 'results', 'prefix', 'calibrations', 'repo', 'head')
+        need += ('remeasure_out',)
         need += ('plan_doc', 'set')
     missing = [f'--{n.replace("_", "-")}' for n in need if not getattr(a, n)]
     if missing:
@@ -1197,11 +1241,18 @@ def report(a: argparse.Namespace, text: str) -> None:
 
 def run_calibrate(a: argparse.Namespace) -> int:
     defaults = load(a.budgets) if a.budgets else {}
+    groups = shard_groups(a.calibrate, a.prefix)
+    if len(groups) != a.runs:
+        raise ValueError(
+            f'{a.calibrate} holds results of {len(groups)} runs, not the {a.runs} dispatched'
+        )
     runs = []
-    for d in sorted(p for p in pathlib.Path(a.calibrate).iterdir() if p.is_dir()):
-        run = merge_results(d)
+    for name, paths in sorted(groups.items()):
+        run = merge(paths)
         if run['runner'] != a.runner:
-            raise ValueError(f'{d}: measured on {run["runner"]!r}, not {a.runner!r}')
+            raise ValueError(
+                f'{name or "the run"}: measured on {run["runner"]!r}, not {a.runner!r}'
+            )
         runs.append(run)
     proposed = calibrate(
         runs,
@@ -1264,7 +1315,8 @@ def run(a: argparse.Namespace) -> int:
         out = Outcome(failures=check_rule(budgets))
     elif a.verdict:
         results = merge_results(a.results, a.prefix)
-        out = verdict(budgets, results, merge_results(a.verdict, a.prefix, 'remeasure'))
+        again = merge_results(a.verdict, a.prefix, 'remeasure', since=a.remeasure_attempt)
+        out = verdict(budgets, results, again)
     else:
         errors = file_errors(a, budgets)
         only = a.only.replace(',', ' ').split()
