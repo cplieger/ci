@@ -145,9 +145,12 @@ jobs:
             # `package main // comment` is legal, so the clause match takes a
             # trailing token; `package mainly` and `main_test` still do not match.
             # Both import paths: main branches keep the standalone module until
-            # their promotion, dev branches import it from cplieger/go.
+            # their promotion, dev branches import it from cplieger/go. A test
+            # file's import never makes its package a generator: a root
+            # `package main` that imports wiregen only from a _test.go is the
+            # app, and running it starts the app.
             gens=$(find . \( -name .git -o -name node_modules -o -name vendor -o -name testdata -o -name fixtures \) -prune \
-                -o -type f -name '*.go' -print0 2>/dev/null \
+                -o -type f -name '*.go' ! -name '*_test.go' -print0 2>/dev/null \
               | xargs -0 -r grep -lZE 'cplieger/(go/)?wiregen' 2>/dev/null \
               | xargs -0 -r -n1 dirname | sort -u \
               | while IFS= read -r d; do
