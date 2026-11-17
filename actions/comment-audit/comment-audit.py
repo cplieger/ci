@@ -101,6 +101,7 @@ POINTER_EXEMPT = {'generated/vendor', 'synced from cplieger/ci'}
 # unpadded digit, a hyphen and a number; POINTER_TRUE in scripts/test-comment-audit.py
 # lists examples. SHA3-256 is FIPS 202's name; zero-padded pairs are episode ranges.
 PLAN_ID = r'(?:[A-Z]{1,2}-)?(?!SHA3-)[A-Z]{1,4}[1-9][0-9]?-[0-9]{1,3}[a-z]?'
+DESIGN_DOC = r"(?:'s)?(?:\s+doc(?:ument)?)?"
 POINTER_RULES: dict[str, re.Pattern[str]] = {
     'plan id': re.compile(rf'(?<![\w.\-/\\"\'`]){PLAN_ID}(?![\w\-])'),
     # Two capitals, a hyphen and two capitals, or three or more letter segments, then a
@@ -109,15 +110,26 @@ POINTER_RULES: dict[str, re.Pattern[str]] = {
     'finding id': re.compile(
         r'(?<![\w\-])(?:[A-Z]{2}-[A-Z]{2}|[A-Z]{2,5}(?:-[A-Z]{2,4}){2,})-[0-9]{1,3}[a-z]?(?![\w\-])'
     ),
-    'letter id': re.compile(r'(?<![\w\-])[A-Z]-[A-Z]{2}(?![\w\-])'),
+    # Only where a finding would follow: a colon, a parenthesis or a number. One capital,
+    # a hyphen and two more is as often an acronym in prose as an id.
+    'letter id': re.compile(r'(?<![\w\-])[A-Z]-[A-Z]{2}(?=[:()]|\s+[(0-9])'),
     'document id': re.compile(
         r'\b(?:BRIEF|PLAN|DESIGN|DIGEST|REPORT|FINDING|GATE|TASK)-[0-9]+\b|\bADR-[0-9]{3,4}\b'
     ),
     'requirement id': re.compile(r"\bN?FR[0-9]{1,3}\b|\(AC[0-9]{1,3}\)|\bAC[0-9]{1,3}'s\b"),
-    'decision': re.compile(r'\b(?:DECISIONS|[Dd]ecisions?)\s+[0-9]+\b'),
+    # A singular decision number only before 's, punctuation or the line's end: a title
+    # ("Decision 3012") or a count ("for decision 5 too") runs on into words or quotes.
+    'decision': re.compile(
+        r'\bDECISIONS\s+[0-9]+\b|\b[Dd]ecisions?\s*§\s*[0-9]'
+        r"|\b[Dd]ecision\s+[0-9]+(?:\.[0-9]+)*(?='s\b|[),;:]|\.(?![0-9])|\s*$)"
+    ),
+    # A bare number only after lowercase design or DESIGN, and with no unit letter: a
+    # capitalised Design before one is a product name (Material Design 3), and the
+    # design's 2s is a duration.
     'design section': re.compile(
-        r"(?<!Material )\b(?:[Dd]esign|DESIGN)(?:'s)?(?:\s+doc(?:ument)?)?"
-        r'(?:\s+section\s+|\s*§\s*|\s+)[0-9]+(?:\.[0-9]+)*[a-z]?\b'
+        rf'(?<!Material )\b(?:[Dd]esign|DESIGN){DESIGN_DOC}'
+        r'(?:(?:\s+section\s+|\s*§\s*)[0-9]+(?:\.[0-9]+)*[a-z]?\b|\s+[0-9]+(?:\.[0-9]+)+[a-z]?\b)'
+        rf'|\b(?:design|DESIGN){DESIGN_DOC}\s+[0-9]+\b'
         r"|\b(?:DESIGN|REPORT|PLAN|research)(?:'s)?\s+(?:section\s+|§\s*)[0-9]"
     ),
     'private file': re.compile(
@@ -563,14 +575,18 @@ def scan(path: Path, text: str, kind: str) -> FileCount:
     return FileCount(str(path), comments, code, tuple(notes), tuple(literals))
 
 
-def pointers(counted: FileCount) -> list[Pointer]:
-    """Every comment line and test literal of counted that names a private document."""
+def pointers(counted: FileCount, public_names: frozenset[str] = frozenset()) -> list[Pointer]:
+    """Every comment line and test literal of counted that names a private document. A
+    private file hit is skipped when public_names, the base names of the repository's
+    visible files, holds it: the comment then names a public file."""
     found = []
     for line, text in counted.notes:
         for rule, pattern in POINTER_RULES.items():
-            match = pattern.search(text)
-            if match:
+            for match in pattern.finditer(text):
+                if rule == 'private file' and match.group(0) in public_names:
+                    continue
                 found.append(Pointer(counted.path, line, rule, match.group(0)))
+                break
     found.extend(
         Pointer(counted.path, line, 'plan id literal', value) for line, value in counted.literals
     )
@@ -611,7 +627,9 @@ def pointer_kind(path: Path) -> str | None:
 
 def pointer_audit(root: Path) -> list[Pointer]:
     found: list[Pointer] = []
-    for path in visible_files(root):
+    visible = visible_files(root)
+    public_names = frozenset(path.name for path in visible)
+    for path in visible:
         kind = pointer_kind(path)
         if kind is None or path.is_symlink() or not path.exists():
             continue
@@ -622,7 +640,7 @@ def pointer_audit(root: Path) -> list[Pointer]:
             raise RuntimeError(f'cannot read {relative}: {exc}') from exc
         if exclusion(relative, text) in POINTER_EXEMPT:
             continue
-        found.extend(pointers(scan(relative, text, kind)))
+        found.extend(pointers(scan(relative, text, kind), public_names))
     return found
 
 

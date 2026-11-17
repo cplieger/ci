@@ -283,13 +283,23 @@ POINTER_TRUE = {
     'refuses redirects (PLEX-LS-SEC-01)': 'finding id',
     'sends (DECISIONS 41, D-UA).': 'decision',
     'keeps it (D-UA) for this exception': 'letter id',
+    'D-UA: the agent header': 'letter id',
+    'D-UA 3 sets the cap': 'letter id',
     'TestNoStoreEverywhere is BRIEF-8 over every route': 'document id',
     'opened inside its repository (ADR-0104).': 'document id',
     'The queue bounds (NFR4).': 'requirement id',
     'must reserve no revision (AC1).': 'requirement id',
     "checkCut asserts AC19's bar": 'requirement id',
     "decision 28's change cost": 'decision',
+    'referenceGate = 0.6, decision 28': 'decision',
+    'audioGate, decision 27, on peak': 'decision',
+    'the spellings (decision 16)': 'decision',
+    'decision §4 keeps it': 'decision',
     'design 5.4 removes the source': 'design section',
+    'Design 9.5 "Provisioning": a refusing Policy': 'design section',
+    "pins design 7's refusal step": 'design section',
+    'the boundary error (design 7).': 'design section',
+    'design 5 names the error Failure': 'design section',
     'the tick (design section 6).': 'design section',
     "the case grammar of the design's section 7.2.": 'design section',
     'DESIGN §7.1: a lock write': 'design section',
@@ -321,6 +331,12 @@ POINTER_FALSE = [
     'access offers ML-DSA-44 and ML-KEM-768',
     'RFC 5737 TEST-NET-1, HMAC-SHA-1, AVD-DS-0002, DS-0026',
     'the X-UA-Compatible header',
+    'the X-UI panel and an A-OK reply, then T-UI.',
+    '"eng": "Decision 3012",',
+    'for decision 5 too',
+    'decisions 3 times over',
+    'Design 3 is the product line',
+    "want within the design's 2s",
     'ids are [a-zA-Z0-9]+',
     'a name like "JDK-21" or "Z3-9" is ordinary',
     'Show S01E01 E05-05 and S2 EP01-12',
@@ -380,6 +396,25 @@ def test_pointer_notes_per_language() -> None:
             ok=got == want[name],
             detail=str(got),
         )
+
+
+def test_private_file_the_repository_carries() -> None:
+    counted = CA.FileCount('a.go', 1, 0, ((1, 'the REPORT.md format, then PLAN.md'),))
+    got = [(item.rule, item.token) for item in CA.pointers(counted)]
+    check(
+        'a private file name is refused', ok=got == [('private file', 'REPORT.md')], detail=str(got)
+    )
+    got = [(item.rule, item.token) for item in CA.pointers(counted, frozenset({'REPORT.md'}))]
+    check(
+        'a file name the repository carries is skipped, and the next private one is reported',
+        ok=got == [('private file', 'PLAN.md')],
+        detail=str(got),
+    )
+    counted = CA.FileCount('a.go', 1, 0, ((1, 'as gate.json records'),))
+    check(
+        'a gate.json fixture of the repository makes gate.json public',
+        ok=not CA.pointers(counted, frozenset({'gate.json'})),
+    )
 
 
 def test_go_test_literal_naming_a_plan_id() -> None:
@@ -684,6 +719,29 @@ def test_private_flag_falls_back_to_the_api(td: Path) -> None:
     )
 
 
+def test_private_file_name_against_the_visible_files(td: Path) -> None:
+    comment = 'package main\n// The layout REPORT.md documents, as gate.json records.\n'
+    carries, lacks = td / 'carries', td / 'lacks'
+    make_repo(
+        carries,
+        {'main.go': comment, 'docs/REPORT.md': '# Report\n', 'testdata/gate.json': '{}\n'},
+        origin='cplieger/probe',
+    )
+    make_repo(lacks, {'main.go': comment, 'report.md': '# lowercase\n'}, origin='cplieger/probe')
+    got = run_audit(carries, check='pointers', private='false')
+    check(
+        'a repository that carries REPORT.md and gate.json passes',
+        ok=got.returncode == 0 and 'Private pointers: PASS' in got.stdout,
+        detail=got.stdout.strip() + got.stderr.strip(),
+    )
+    got = run_audit(lacks, check='pointers', private='false')
+    check(
+        'a repository that carries no REPORT.md fails on it',
+        ok=got.returncode == 1 and '"main.go":2: private file \'REPORT.md\'' in got.stdout,
+        detail=got.stdout.strip() + got.stderr.strip(),
+    )
+
+
 def test_clean_repo_passes_the_pointer_check(td: Path) -> None:
     make_repo(td, {'main.go': 'package main\n// UTF-8 per RFC 3629.\n'}, origin='cplieger/probe')
     got = run_audit(td, check='pointers', private='false')
@@ -721,6 +779,7 @@ def main() -> int:
         test_pointer_rules_catch_each_private_shape,
         test_pointer_rules_pass_public_text,
         test_pointer_notes_per_language,
+        test_private_file_the_repository_carries,
         test_go_test_literal_naming_a_plan_id,
         test_pointer_kind_covers_yaml_without_a_ratio_budget,
     ]
@@ -734,6 +793,7 @@ def main() -> int:
         test_untracked_but_visible_file_is_measured,
         test_pointer_verdicts,
         test_private_flag_falls_back_to_the_api,
+        test_private_file_name_against_the_visible_files,
         test_clean_repo_passes_the_pointer_check,
     ]
     for t in unit_tests:
