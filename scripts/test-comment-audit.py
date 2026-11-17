@@ -624,8 +624,8 @@ def test_private_flag_falls_back_to_the_api(td: Path) -> None:
     for answer, code, want_rc, want, label in (
         ('true', 0, 0, 'Private pointers: SKIP', 'an API answer of true skips'),
         ('false', 0, 1, 'Private pointers: FAIL — 1 line', 'an API answer of false checks'),
-        ('', 1, 2, 'refusing to treat the repository as public', 'a failed API call fails'),
-        ('null', 0, 2, 'refusing to treat the repository as public', 'a non-boolean fails'),
+        ('', 1, 2, 'so the repository is not treated as public', 'a failed API call fails'),
+        ('null', 0, 2, 'so the repository is not treated as public', 'a non-boolean fails'),
     ):
         with tempfile.TemporaryDirectory() as bin_name:
             bin_dir = Path(bin_name)

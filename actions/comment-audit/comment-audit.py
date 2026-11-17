@@ -212,7 +212,7 @@ def repository_private(root: Path) -> bool:
     if not repository:
         raise RuntimeError(
             f'the {event} event payload carries no repository.private and no repository '
-            'name was found; refusing to treat the repository as public'
+            'name was found, so the repository is not treated as public'
         )
     try:
         result = subprocess.run(
@@ -232,8 +232,8 @@ def repository_private(root: Path) -> bool:
         )
     raise RuntimeError(
         f'the {event} event payload carries no repository.private, and gh api '
-        f'repos/{repository} --jq .private answered {answer}; refusing to treat the '
-        'repository as public'
+        f'repos/{repository} --jq .private answered {answer}, so the repository is not '
+        'treated as public'
     )
 
 
