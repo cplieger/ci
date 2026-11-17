@@ -52,7 +52,8 @@ CI_REPO = 'cplieger/ci'
 CALIBRATION_IDENTITY = (
     'https://github.com/cplieger/ci/.github/workflows/perf-calibrate.yaml@refs/heads/main'
 )
-# perf-ci.yaml's verdict signs at the ref its caller pinned: a full sha, or main for weekly-perf.
+# A measured file an earlier perf-ci.yaml verdict signed, at the ref its caller pinned: a full
+# sha, or main for weekly-perf.
 MEASURED_IDENTITY = (
     r'^https://github\.com/cplieger/ci/\.github/workflows/perf-ci\.yaml'
     r'@(refs/heads/main|[0-9a-f]{40})$'
@@ -299,310 +300,20 @@ class Outcome:
     failures: list[str] = dataclasses.field(default_factory=list)
     remeasure: list[dict] = dataclasses.field(default_factory=list)
     notices: list[str] = dataclasses.field(default_factory=list)
-    reported: list[dict] = dataclasses.field(default_factory=list)
-    over_target: list[dict] = dataclasses.field(default_factory=list)
     runner_mismatch: bool = False
     runner: str = ''
-    # Every measured cell for the summary: {cell, entry, value, status}.
+    # Every measured cell for the summary: {cell, baseline, value, status}.
     rows: list[dict] = dataclasses.field(default_factory=list)
-    # Each re-measured cell: {cell, reps, judged}, judged the values verdict
-    # held against the budget.
+    # Each re-measured cell: {cell, baseline, reps, value, status}, value the median of six.
     six: list[dict] = dataclasses.field(default_factory=list)
-    # Each gated cell an accepted file judged: {cell, budget, accepted, value, reason, file}.
-    slower: list[dict] = dataclasses.field(default_factory=list)
-    # Each exact count the verdict measured for a measured file: {cell, budget, value, reps}.
-    recorded: list[dict] = dataclasses.field(default_factory=list)
-    # check_provenance's moves and retires, for the summary.
-    exact_moves: list[dict] = dataclasses.field(default_factory=list)
-    retires: list[dict] = dataclasses.field(default_factory=list)
-    # The measured file the verdict wrote, for the summary's commands.
-    measured_as: MeasuredAs | None = None
-
-
-@dataclasses.dataclass(frozen=True)
-class MeasuredAs:
-    """The run that wrote a measured file, its repository, the cplieger/ci commit whose
-    perf_gate.py takes it, its artifact and its stem."""
-
-    run_id: str
-    repository: str
-    workflow_sha: str
-    artifact: str
-    stem: str
 
 
 def middle(reps: list) -> list:
-    """The middle rep, or both middle reps of an even count. An exact count is
-    judged on these, never on their mean: statistics.median of [1, 1, 1, 3, 3, 3]
-    is 2, a count no rep measured."""
+    """The middle rep, or both middle reps of an even count. A count is compared on
+    these, never on their mean: statistics.median of [1, 1, 1, 3, 3, 3] is 2, a count
+    no rep measured."""
     s = sorted(reps)
     return s[(len(s) - 1) // 2 : len(s) // 2 + 1]
-
-
-def compare(
-    budgets: dict,
-    results: dict,
-    units: dict | None = None,
-    accepted: dict | None = None,
-    reported: list[dict] | None = None,
-) -> Outcome:
-    """Judge each measured cell on its median of three. A gated cell over its
-    budget (gated_budget, with `accepted` slowdowns) and an exact count whose middle
-    rep is off its budget are listed in `remeasure`, never failed here. An exact entry
-    measured as no count fails, and so does a gated or exact entry no shard measured
-    whose unit and window `units` (`planned_windows`) holds. An entry of a cell a
-    `reported` pattern (held_patterns) matches is judged reported (as_planned)."""
-    budgets = as_planned(budgets, reported or [])
-    out = Outcome(runner=results.get('runner', ''))
-    out.runner_mismatch = out.runner != budgets.get('runner')
-    entries = {key(e): e for e in budgets.get('budgets', [])}
-    for c in results.get('cells', []):
-        e = entries.get(key(c))
-        reps = c.get('reps') or []
-        value = statistics.median(reps) if reps else None
-        target = file_target(budgets, c['metric'])
-        if is_number(target) and value is not None and value > target:
-            out.over_target.append(c)
-        if out.runner_mismatch or e is None or e['tier'] == 'reported':
-            out.reported.append(c)
-            status = 'reported'
-        else:
-            status = judge(budgets, e, c, value, out, accepted or {})
-        out.rows.append({'cell': c, 'entry': e, 'value': value, 'status': status})
-    if not out.runner_mismatch and units:
-        measured = {key(c) for c in results.get('cells', [])}
-        out.failures.extend(
-            f'{key_text(k)}: a {e["tier"]} entry of the measured set that no shard measured'
-            for k, e in entries.items()
-            if e.get('tier') != 'reported' and planned(units, e) and k not in measured
-        )
-    return out
-
-
-def gated_budget(
-    budgets: dict, e: dict, cells: list[dict], accepted: dict
-) -> tuple[float, dict | None]:
-    """The budget the reps of cells, one gated cell of entry e in budgets, are judged
-    against, and the accepted slowdown that set it, if any. Every timing judgement goes
-    through here, and cells carry the cpu_model of each shard whose reps are judged."""
-    a = accepted.get(key(cells[0]))
-    if a is not None and a['budget'] > e['budget']:
-        return a['budget'], a
-    return e['budget'], None
-
-
-def judge(
-    budgets: dict, e: dict, c: dict, value: float | None, out: Outcome, accepted: dict
-) -> str:
-    name = key_text(key(c))
-    kind = c.get('kind')
-    if value is None:
-        out.failures.append(f'{name}: measured no reps')
-        return 'failed'
-    if e['tier'] == 'exact':
-        if kind != 'count':
-            out.failures.append(
-                f'{name}: an exact entry needs a count, the harness measured {kind}'
-            )
-            return 'failed'
-        if any(r != e['budget'] for r in middle(c['reps'])):
-            out.remeasure.append(c)
-            return 'remeasure'
-        return 'ok'
-    if kind not in ('time', 'server_cpu'):
-        out.failures.append(f'{name}: a gated entry needs a time, the harness measured {kind}')
-        return 'failed'
-    budget, note = gated_budget(budgets, e, [c], accepted)
-    if note is not None:
-        out.slower.append(
-            {**note, 'cell': c, 'budget': e['budget'], 'accepted': budget, 'value': value}
-        )
-    elif key(c) in accepted:
-        a = accepted[key(c)]
-        out.notices.append(
-            f'{name}: accepted/{a["file"]} gives budget {a["budget"]}, at or under its '
-            f'budget {e["budget"]}, so it changes nothing; delete it'
-        )
-    if value > budget:
-        out.remeasure.append(c)
-        return 'remeasure'
-    h = entry_headroom(budgets, e)
-    if kind == 'time' and is_number(h) and h > 0 and value < e['baseline'] / h:
-        out.notices.append(
-            f'{name}: median {value} is under baseline {e["baseline"]} / {h}, '
-            'so its budget can come down'
-        )
-    return 'ok'
-
-
-def verdict(budgets: dict, results: dict, remeasured: dict, decided: dict | None = None) -> Outcome:
-    """Fail each cell compare sent to re-measure that its six reps, its first
-    three and the three re-measured, still hold off its budget: a gated cell
-    whose median is over it, an exact count whose middle reps are not it.
-    decided is compare's remeasure.json: its accepted slowdowns, its stale keys, the
-    extension units (judge_extension) and the plan patterns both branches hold, which
-    make an entry reported (as_planned) and excuse a retired cell the extension measured
-    (retired_measured). An exact count off its budget, or on a stale key, fails, and is
-    recorded for the measured file when its reps all agree."""
-    decided = decided or {}
-    budgets = as_planned(budgets, decided.get('reported', []))
-    accepted = accepted_cells(decided.get('accepted', []))
-    stale = {key(k) for k in decided.get('stale', [])}
-    out = compare(budgets, results, accepted=accepted)
-    # A measured file of another runner is one load_source refuses, so nothing is recorded.
-    if out.runner_mismatch:
-        stale = set()
-    out.remeasure = with_stale(out.remeasure, results.get('cells', []), stale)
-    entries = {key(e): e for e in budgets.get('budgets', [])}
-    again = {key(c): c for c in remeasured.get('cells', [])}
-    judged_keys = set()
-    for c in out.remeasure:
-        name = key_text(key(c))
-        judged_keys.add(key(c))
-        more = again.get(key(c))
-        if more is None or not more.get('reps'):
-            out.failures.append(f'{name}: listed for a re-measure but no reps came back')
-            continue
-        six = [*c['reps'], *more['reps']]
-        e = entries[key(c)]
-        if e['tier'] == 'exact':
-            judged = middle(six)
-            exact_judgement(e, c, six, judged, stale=key(c) in stale, out=out)
-        else:
-            budget, _ = gated_budget(budgets, e, [c, more], accepted)
-            judged = [statistics.median(six)]
-            if judged[0] > budget:
-                out.failures.append(
-                    f'{name}: median of six {judged[0]} is over its budget {budget} ({six})'
-                )
-            for s in out.slower:
-                if key(s['cell']) == key(c):
-                    s['value'] = judged[0]
-        out.six.append({'cell': c, 'reps': six, 'judged': judged})
-    first = {key(c): c for c in results.get('cells', [])}
-    if not out.runner_mismatch:
-        judge_extension(entries, first, again, decided.get('extend', []), stale, out)
-    units = planned_windows(decided.get('extend', []))
-    extended = [c for k, c in again.items() if k not in first and planned(units, c)]
-    out.failures += retired_measured(budgets, extended, decided.get('reported', []))
-    judged_keys |= {key(r['cell']) for r in out.rows}
-    for k in sorted(stale - judged_keys):
-        out.failures.append(
-            f'{key_text(k)}: compare found its value stale, and no shard measured it again'
-        )
-    return out
-
-
-def with_stale(cells: list[dict], measured: Iterable[dict], stale: set) -> list[dict]:
-    """cells with each measured cell of a stale key appended once: a stale value is
-    re-measured like a red one, so the verdict that records it always runs."""
-    listed = {key(c) for c in cells}
-    return [*cells, *(c for c in measured if key(c) in stale and key(c) not in listed)]
-
-
-def exact_judgement(
-    e: dict, c: dict, reps: list, judged: list, *, stale: bool, out: Outcome
-) -> None:
-    """Fail an exact count whose judged values are off its budget, or are on a stale
-    key. Only reps that all agree are recorded, since a value they disagree on would
-    become an exact budget that flaps; a stale key whose judged values are its budget is
-    recorded at it, which moves no budget."""
-    name, budget = key_text(key(c)), e['budget']
-    on_budget = all(v == budget for v in judged)
-    if not stale and on_budget:
-        return
-    if len(set(reps)) == 1 or on_budget:
-        value = reps[0] if len(set(reps)) == 1 else budget
-        out.recorded.append({'cell': c, 'budget': budget, 'value': value, 'reps': reps})
-        why = 'is stale' if value == budget else f'hold off its exact budget {budget}'
-        out.failures.append(f'{name}: reps {reps} {why}; check in the measured file this run wrote')
-    else:
-        out.failures.append(
-            f'{name}: reps {reps} disagree (exact budget {budget}), so no exact value can be '
-            'recorded and the cell may no longer be exact'
-        )
-
-
-def judge_extension(
-    entries: dict, first: dict, again: dict, extend: list, stale: set, out: Outcome
-) -> None:
-    """The cells of compare's extension units, which the first measure did not plan: an
-    exact one on its three reps' middle, a gated one reported only, and an exact entry
-    of them no shard measured fails."""
-    units = planned_windows(extend)
-    for k, c in again.items():
-        if k in first or not planned(units, c):
-            continue
-        e = entries.get(k)
-        value = statistics.median(c['reps']) if c.get('reps') else None
-        status = 'reported'
-        if e is None or e['tier'] != 'exact':
-            out.reported.append(c)
-        elif c.get('kind') != 'count' or value is None:
-            out.failures.append(f'{key_text(k)}: an exact entry needs a count of reps')
-            status = 'failed'
-        else:
-            before = len(out.failures)
-            exact_judgement(e, c, list(c['reps']), middle(c['reps']), stale=k in stale, out=out)
-            status = 'failed' if len(out.failures) > before else 'ok'
-        out.rows.append({'cell': c, 'entry': e, 'value': value, 'status': status})
-    out.failures.extend(
-        f'{key_text(k)}: an exact entry of the extension that no shard measured'
-        for k, e in entries.items()
-        if e.get('tier') == 'exact' and planned(units, e) and k not in again and k not in first
-    )
-
-
-def unmeasured_accepted(accepted: dict, out: Outcome) -> list[str]:
-    """A notice for each accepted slowdown of a cell compare measured no rep of, since
-    only judge() on a measured cell lists the others."""
-    measured = {key(r['cell']) for r in out.rows}
-    return [
-        f'{key_text(k)}: accepted/{a["file"]} gives budget {a["budget"]} ({a["reason"]}); '
-        'this run did not measure the cell'
-        for k, a in sorted(accepted.items())
-        if k not in measured
-    ]
-
-
-def accepted_cells(found: list) -> dict:
-    """compare's accepted list as {key: {budget, reason, file}}."""
-    return {
-        key(a): {'budget': a['budget'], 'reason': a['reason'], 'file': a['file']} for a in found
-    }
-
-
-def record(
-    out: Outcome,
-    *,
-    repo: str,
-    commit: str,
-    measured_sha: str,
-    run_id: str,
-    run_attempt: str,
-    run_url: str,
-    workflow_repository: str,
-    cpu_models: list[str],
-) -> dict:
-    """The measured file of the counts a verdict recorded: what --take checks in and
-    measured_provenance holds an entry to. commit is the pull request head."""
-    return {
-        'schema': SCHEMA,
-        'kind': 'measured',
-        'repo': repo,
-        'commit': commit,
-        'measured_sha': measured_sha,
-        'runner': out.runner,
-        'run_id': str(run_id),
-        'run_attempt': str(run_attempt),
-        'run_url': run_url,
-        'workflow_repository': workflow_repository,
-        'cpu_models': sorted(cpu_models),
-        'cells': [
-            {**key_dict(key(r['cell'])), 'value': r['value'], 'reps': r['reps']}
-            for r in sorted(out.recorded, key=lambda r: key(r['cell']))
-        ],
-    }
 
 
 def table(title: str | None, head: tuple, rows: Iterable[tuple]) -> list[str]:
@@ -613,116 +324,6 @@ def table(title: str | None, head: tuple, rows: Iterable[tuple]) -> list[str]:
         return []
     heading = [f'### {title}', ''] if title else []
     return [*heading, '| ' + ' | '.join(head) + ' |', '|' + '---|' * len(head), *body, '']
-
-
-def take_steps(m: MeasuredAs | None) -> str:
-    """How the recorded counts reach budgets.json: from measured file m, or, when the run
-    wrote none, from the pull request's own run."""
-    lead = 'Each count below moved, or its checked-in source no longer holds. '
-    if m is None:
-        return lead + (
-            'This run wrote no signed measured file: a merge queue run measures no pull '
-            'request head, and a pull request from a fork gets no id token. Take the counts '
-            'from a run of the head on a branch of the repository.'
-        )
-    return lead + (
-        f'Take them: `gh run download {m.run_id} -R {m.repository} -n {m.artifact} '
-        f'-D tests/perf/sources`, then, in a cplieger/ci checkout at {m.workflow_sha} '
-        f'as `<ci>`, `python3 <ci>/scripts/perf_gate.py --take tests/perf/sources/{m.stem}.json '
-        "--budgets tests/perf/budgets.json --reason '<why it moved>'`, and commit both."
-    )
-
-
-def summary(budgets: dict, out: Outcome) -> str:
-    lines = ['## Performance gate', '']
-    if out.runner_mismatch:
-        lines += [
-            (
-                f'The results come from runner `{out.runner}`, and `budgets.json` is calibrated '
-                f'on `{budgets.get("runner")}`, so every metric is reported and none gates. '
-                f'Measure on `{budgets.get("runner")}` to gate it.'
-            ),
-            '',
-        ]
-    for title, items in (('Failures', out.failures), ('Notices', out.notices)):
-        if items:
-            lines += [f'### {title}', '', *(f'- {i}' for i in items), '']
-    lines += table(
-        'Exact counts this pull request moves',
-        ('Cell', 'Base', 'Head', 'Source', 'Reason', 'Check'),
-        (
-            (
-                key_text(m['key']),
-                m['base'],
-                m['head'],
-                m['source'],
-                m['reason'],
-                '; '.join(m['refused']) or 'accepted',
-            )
-            for m in out.exact_moves
-        ),
-    )
-    lines += table(
-        'Cells this pull request retires',
-        ('Cell', 'Tier', 'Reason'),
-        ((key_text(r['key']), r['tier'], r['reason']) for r in out.retires),
-    )
-    if out.recorded:
-        lines += ['### Measured moves to check in', '', take_steps(out.measured_as), '']
-        lines += table(
-            None,
-            ('Cell', 'Budget', 'Measured', 'Reps judged'),
-            (
-                (key_text(key(r['cell'])), r['budget'], r['value'], ', '.join(map(str, r['reps'])))
-                for r in out.recorded
-            ),
-        )
-    lines += table(
-        'Slower on purpose',
-        ('Cell', 'Budget', 'Accepted budget', 'Median', 'Reason', 'File'),
-        (
-            (
-                key_text(key(s['cell'])),
-                s['budget'],
-                s['accepted'],
-                s['value'],
-                s['reason'],
-                f'accepted/{s["file"]}',
-            )
-            for s in out.slower
-        ),
-    )
-    if out.six:
-        lines += [
-            '### Re-measured',
-            '',
-            "| Cell | Six reps | Median, or a count's middle reps |",
-            '|---|---|---|',
-        ]
-        lines += [
-            f'| {key_text(key(s["cell"]))} | {", ".join(str(r) for r in s["reps"])} '
-            f'| {", ".join(str(r) for r in s["judged"])} |'
-            for s in out.six
-        ]
-        lines.append('')
-    over = {key(c) for c in out.over_target}
-    lines += [
-        '### Every measured cell',
-        '',
-        '| Cell | Tier | Median | Budget | Baseline | Target | Status |',
-        '|---|---|---|---|---|---|---|',
-    ]
-    for r in out.rows:
-        e = r['entry'] or {}
-        target = file_target(budgets, r['cell']['metric'])
-        target = '' if target is None else target
-        flag = ' (over target)' if key(r['cell']) in over else ''
-        lines.append(
-            f'| {key_text(key(r["cell"]))} | {e.get("tier", "none")} | {r["value"]} '
-            f'| {e.get("budget", "")} | {e.get("baseline", "")} | {target} '
-            f'| {r["status"]}{flag} |'
-        )
-    return '\n'.join(lines) + '\n'
 
 
 # --- the pull request guard ------------------------------------------------
@@ -774,17 +375,28 @@ def ratio_text(value: float, baseline: float) -> str:
     return f'{value / baseline:.2f}' if baseline > 0 else ''
 
 
+def over_text(metric: str, value: float, baseline: float) -> str:
+    ratio = ratio_text(value, baseline)
+    return (
+        f'{value} is {value - baseline:g} over its baseline {baseline}'
+        f'{f" ({ratio}x)" if ratio else ""}, past the guard of {guard_rule(metric)}'
+    )
+
+
 def guard(
     baselines: dict[tuple, float],
     runner: str | None,
     results: dict,
     units: dict | None = None,
+    *,
+    windows: dict[str, set[str]] | None = None,
 ) -> Outcome:
     """Judge each measured timing cell's median of three against its base baseline: one
     over the guard is listed in `remeasure`, never failed here. Counts and reports are
     information. On the baselines' runner, a baselined timing cell of `units`
-    (planned_windows) that no shard measured fails, a server route a notice, and so does
-    a run that guarded no cell fail, since a guard that checks nothing must not pass."""
+    (planned_windows) that no shard measured fails, unless it is a server route or its
+    window is one `windows` (scenario_windows) no longer lists, which are notices; and a
+    run that guarded no cell fails, since a guard that checks nothing must not pass."""
     out = Outcome(runner=results.get('runner', ''))
     out.runner_mismatch = out.runner != runner
     guarded = 0
@@ -813,18 +425,24 @@ def guard(
             for k in sorted(baselines)
             if family(k[5]) in GUARD and planned(units, key_dict(k)) and k not in measured
         ]
-        # A server cell exists only when its window requested the route, so a missing one
-        # is a change in what the page requests, not a cell the harness lost.
-        out.failures.extend(
-            f'{key_text(k)}: the base has a baseline for it, and no shard measured it'
-            for k in missed
-            if family(k[5]) != SERVER_CPU
-        )
-        out.notices.extend(
-            f'{key_text(k)}: the base has a baseline for this route, and no shard measured it'
-            for k in missed
-            if family(k[5]) == SERVER_CPU
-        )
+        for k in missed:
+            dropped = windows is not None and k[0] in windows and k[4] not in windows[k[0]]
+            # A server cell exists only when its window requested the route, so a missing one
+            # is a change in what the page requests, not a cell the harness lost.
+            if family(k[5]) == SERVER_CPU:
+                out.notices.append(
+                    f'{key_text(k)}: the base has a baseline for this route, and no shard '
+                    'measured it'
+                )
+            elif dropped:
+                out.notices.append(
+                    f'{key_text(k)}: the base has a baseline for it, and the head plan.json no '
+                    f'longer measures window {k[4]}'
+                )
+            else:
+                out.failures.append(
+                    f'{key_text(k)}: the base has a baseline for it, and no shard measured it'
+                )
     if not guarded:
         out.failures.append(
             'nothing to guard: the base has a baseline for none of the timing cells this run '
@@ -846,6 +464,14 @@ def guard_verdict(decided: dict, results: dict, remeasured: dict) -> Outcome:
             raise ValueError(f'{name}: the decision holds no numeric baseline for it')
         more = again.get(key(d))
         reps = (first.get(key(d)) or {}).get('reps') or []
+        if reps and family(d['metric']) == SERVER_CPU and not (more or {}).get('reps'):
+            # A route is measured only when the window requests it, so a re-measure can
+            # miss one; the cell was over the guard on its first reps, which still judge it.
+            out.failures.append(
+                f'{name}: the re-measure did not request this route, so its first three reps '
+                f'judge it: median {over_text(d["metric"], statistics.median(reps), baseline)}'
+            )
+            continue
         if more is None or not more.get('reps') or not reps:
             out.failures.append(f'{name}: listed for a re-measure but no reps came back')
             continue
@@ -854,11 +480,8 @@ def guard_verdict(decided: dict, results: dict, remeasured: dict) -> Outcome:
         status = 'ok'
         if over_guard(d['metric'], value, baseline):
             status = 'failed'
-            ratio = ratio_text(value, baseline)
             out.failures.append(
-                f'{name}: median of six {value} is {value - baseline:g} over its baseline '
-                f'{baseline}{f" ({ratio}x)" if ratio else ""}, past the guard of '
-                f'{guard_rule(d["metric"])}; reps {six}'
+                f'{name}: median of six {over_text(d["metric"], value, baseline)}; reps {six}'
             )
         out.six.append(
             {'cell': d, 'baseline': baseline, 'reps': six, 'value': value, 'status': status}
@@ -1138,6 +761,18 @@ def planned_windows(cells: Iterable[dict]) -> dict[tuple, set[str] | None]:
     return out
 
 
+def scenario_windows(doc: dict) -> dict[str, set[str]]:
+    """Each plan.json scenario with the windows the harness measures for a cell that lists
+    none; a scenario without a list of window names is left out."""
+    scenarios = doc.get('scenarios')
+    out = {}
+    for name, s in (scenarios if isinstance(scenarios, dict) else {}).items():
+        w = s.get('windows') if isinstance(s, dict) else None
+        if isinstance(w, list) and all(isinstance(x, str) for x in w):
+            out[name] = set(w)
+    return out
+
+
 def planned(units: dict[tuple, set[str] | None], e: dict) -> bool:
     k = unit_key(e)
     return k in units and (units[k] is None or e.get('window') in units[k])
@@ -1182,8 +817,7 @@ def base_plan(git: Git, base_sha: str, path: str) -> dict:
 def held_patterns(head: dict, base: dict) -> list[dict]:
     """The `reported` patterns of plan head that plan base lists too: a pattern decides a
     tier only once the base lists it, so a pull request cannot demote a class by adding
-    one, and from then its cells are judged reported (as_planned) until a calibration
-    rewrites them."""
+    one."""
     found, _ = reported_patterns(base)
     return [p for p in reported_patterns(head)[0] if p in found]
 
@@ -1192,19 +826,6 @@ def plan_reports(patterns: list[dict], c: dict) -> bool:
     return any(
         p['metric'] == c['metric'] and p.get('window', c['window']) == c['window'] for p in patterns
     )
-
-
-def as_planned(budgets: dict, held: list[dict]) -> dict:
-    """budgets with each entry a pattern of held (held_patterns) matches made reported:
-    the plan's tier binds once the base lists the pattern, before the next calibration's
-    check-in rewrites the entry."""
-    if not held:
-        return budgets
-    entries = [
-        {**e, 'tier': 'reported'} if plan_reports(held, e) else e
-        for e in budgets.get('budgets', [])
-    ]
-    return {**budgets, 'budgets': entries}
 
 
 def plan_refusal(tier: str) -> str:
@@ -1264,18 +885,6 @@ def check_plan(budgets: dict, doc: dict, *, reported: list[dict], base: dict) ->
     )
 
 
-def retired_measured(budgets: dict, cells: Iterable[dict], patterns: list[dict]) -> list[str]:
-    """A retired key a shard measured fails: the scheduled calibration tiers every measured
-    cell, but one a pattern of patterns (held_patterns) matches, whose tier is the plan's."""
-    retired = {key(r) for r in budgets.get('retired', [])}
-    return [
-        f"{key_text(key(c))}: retired, yet a shard measured it; a measured cell's tier is the "
-        "scheduled calibration's"
-        for c in cells
-        if key(c) in retired and not plan_reports(patterns, c)
-    ]
-
-
 def plan(
     doc: dict,
     set_name: str,
@@ -1316,13 +925,8 @@ def plan(
     if has_line_break(node):
         raise ValueError(f'plan.json: node {node!r} holds a line break')
     if remeasure is not None:
-        wanted = {tuple(c[f] for f in UNIT_FIELDS) for c in remeasure.get('cells', [])}
-        extend = remeasure.get('extend', [])
-        check_units('extend', extend)
-        # An extension unit measures every window of a unit the set lists only some of.
-        chosen = {unit_key(u): u for u in units if unit_key(u) in wanted}
-        chosen.update((unit_key(u), u) for u in extend)
-        units = list(chosen.values())
+        wanted = {unit_key(c) for c in remeasure.get('cells', [])}
+        units = [u for u in units if unit_key(u) in wanted]
     count = min(shards, len(units))
     bins: list[list[dict]] = [[] for _ in range(count)]
     load = [0.0] * count
@@ -1366,24 +970,6 @@ def check_units(label: str, units: list) -> None:
             raise ValueError(f'{label}: {key_text(k)} needs its seconds per cell')
         if windows_error(u):
             raise ValueError(f'{label}: {key_text(k)}: {windows_error(u)}')
-
-
-def extension(doc: dict, units: dict, scenarios: set[str]) -> list[dict]:
-    """The full set's units of scenarios that units (planned_windows of the set compare
-    judged) leaves some window of: a count a change moves at one scale or width moves at
-    the others, which the pr set does not measure."""
-    full = doc.get('sets', {}).get('full') if isinstance(doc.get('sets'), dict) else None
-    if not isinstance(full, dict):
-        raise TypeError('plan.json has no full set to extend a re-measure from')
-    out = []
-    for u in full.get('cells') or []:
-        if not isinstance(u, dict) or u.get('scenario') not in scenarios:
-            continue
-        have = units.get(unit_key(u), set())
-        if have is None or (u.get('windows') is not None and set(u['windows']) <= have):
-            continue
-        out.append(dict(u))
-    return out
 
 
 def bench(results: dict) -> list[dict]:
@@ -1470,19 +1056,10 @@ class Loaded:
 
 @dataclasses.dataclass
 class Checked:
-    """check_provenance's answer. stale: exact entries of an exact base entry refused for
-    a Curable reason. accepted: each gated cell an accepted file slows on purpose,
-    {key: {budget, reason, file}}. moves: each exact entry whose value differs from its
-    exact base entry, {key, base, head, source, reason, refused}, refused the provenance
-    errors of that entry. retires: each gated or exact base entry the head retires,
-    {key, tier, reason}. notices: summary lines, such as a base of another schema
+    """check_provenance's answer. notices: summary lines, such as a base of another schema
     skipping moves_to_older."""
 
     errors: list[str]
-    stale: set
-    accepted: dict
-    moves: list[dict]
-    retires: list[dict]
     notices: list[str] = dataclasses.field(default_factory=list)
 
 
@@ -1508,7 +1085,6 @@ def check_provenance(
     by an entry; and every accepted file holds (load_accepted)."""
     errors = []
     notices = []
-    refused: dict[tuple, list[str]] = {}
     base_entries = {key(e): e for e in base.get('budgets', [])}
     head_entries = {key(e): e for e in head.get('budgets', [])}
     # The file-level maps sit outside CHANGE_FIELDS, and each changes how every entry gates.
@@ -1554,10 +1130,11 @@ def check_provenance(
         name, b = key_text(k), base_entries.get(k)
         src = parse_source(e.get('source'))
         if src is None:
-            refused[k] = [f'source {e.get("source")!r} is not a calibration or measured run URL']
-            errors.append(f'{name}: {refused[k][0]}')
+            errors.append(
+                f'{name}: source {e.get("source")!r} is not a calibration or measured run URL'
+            )
             continue
-        mine = refused[k] = []
+        mine = []
         raised_by_file = map_moved(head, base, e)
         if 'reason' in e:
             mine += reason_provenance(e, b, src, raised_by_file)
@@ -1568,18 +1145,11 @@ def check_provenance(
             if base_placeable:
                 mine += moves_to_older(e, b, found, placed_at_base, git)
         errors.extend(f'{name}: {x}' for x in mine)
-        if src.stem not in loaded:
-            # errors holds the source's own line once; the entry's refusals still name it.
-            mine.append(unloaded[src.stem])
     retired = {key(r): r for r in head.get('retired', []) if all(f in r for f in KEY_FIELDS)}
-    retires = []
     for k, b in sorted(base_entries.items()):
         if k in head_entries or b.get('tier') == 'reported':
             continue
-        reason = str(retired.get(k, {}).get('reason', '')).strip()
-        if reason:
-            retires.append({'key': k, 'tier': b.get('tier'), 'reason': reason})
-        else:
+        if not str(retired.get(k, {}).get('reason', '')).strip():
             errors.append(f'{key_text(k)}: a {b.get("tier")} entry left without a retired reason')
     if sources.is_dir():
         for p in sorted(sources.iterdir()):
@@ -1588,33 +1158,11 @@ def check_provenance(
                 errors.append(f'{p.name}: not a source file or bundle')
             elif m[1] not in named:
                 errors.append(f'{p.name}: no budget entry names source {m[1]}')
-    for k, why in superseded_entries(head_entries, loaded, git):
-        refused.setdefault(k, []).append(why)
-        errors.append(f'{key_text(k)}: {why}')
-    slower, why = load_accepted(accepted, head_entries, loaded, head_sha, git)
-    errors += why
-    stale = {
-        k
-        for k, why in refused.items()
-        if any(isinstance(w, Curable) for w in why)
-        and head_entries[k]['tier'] == 'exact'
-        and base_entries.get(k, {}).get('tier') == 'exact'
-    }
-    moves = [
-        {
-            'key': k,
-            'base': base_entries[k]['baseline'],
-            'head': e['baseline'],
-            'source': e['source'],
-            'reason': e.get('reason', ''),
-            'refused': refused.get(k, []),
-        }
-        for k, e in sorted(head_entries.items())
-        if e['tier'] == 'exact'
-        and base_entries.get(k, {}).get('tier') == 'exact'
-        and e['baseline'] != base_entries[k].get('baseline')
-    ]
-    return Checked(errors, stale, slower, moves, retires, notices)
+    errors.extend(
+        f'{key_text(k)}: {why}' for k, why in superseded_entries(head_entries, loaded, git)
+    )
+    errors += load_accepted(accepted, head_entries, loaded, head_sha, git)
+    return Checked(errors, notices)
 
 
 def map_moved(head: dict, base: dict, e: dict) -> bool:
@@ -1641,19 +1189,19 @@ def load_accepted(
     loaded: dict[str, Loaded],
     head_sha: str,
     git: Git,
-) -> tuple[dict, list[str]]:
-    """The accepted slowdowns under directory, {key: {budget, reason, file}}, and the
-    error of each file or cell that breaks the rule: `<name>.json` holding
-    {reason: one line, cells: [{six key fields, budget above 0}]}, each cell a gated entry
-    of entries and in one file. A cell a loaded calibration measured at a commit holding
-    the commit that added its file is absorbed, so it is an error and no slowdown."""
-    found: dict[tuple, dict] = {}
+) -> list[str]:
+    """The error of each accepted file or cell under directory that breaks the rule:
+    `<name>.json` holding {reason: one line, cells: [{six key fields, budget above 0}]},
+    each cell a gated entry of entries and in one file. A cell a loaded calibration
+    measured at a commit holding the commit that added its file is absorbed, so it is an
+    error."""
+    found: dict[tuple, str] = {}
     errors: list[str] = []
     if directory is None or not directory.is_dir():
-        return found, errors
+        return errors
     for p in sorted(directory.iterdir()):
         label = f'accepted/{p.name}'
-        reason, cells, why = accepted_file(p)
+        _, cells, why = accepted_file(p)
         if why:
             errors.append(f'{label}: {why}')
             continue
@@ -1663,7 +1211,7 @@ def load_accepted(
             if entries.get(k, {}).get('tier') != 'gated':
                 errors.append(f'{label}: {name}: has no gated entry')
             elif k in found:
-                errors.append(f'{label}: {name}: also accepted by accepted/{found[k]["file"]}')
+                errors.append(f'{label}: {name}: also accepted by accepted/{found[k]}')
             else:
                 try:
                     at = at or git.added_by(str(p), head_sha)
@@ -1677,8 +1225,8 @@ def load_accepted(
                         f'{absorbed.at}, which holds the override; delete {label}'
                     )
                 else:
-                    found[k] = {'budget': c['budget'], 'reason': reason, 'file': p.name}
-    return found, errors
+                    found[k] = p.name
+    return errors
 
 
 def accepted_file(p: pathlib.Path) -> tuple[str, list[dict], str | None]:
@@ -2363,7 +1911,6 @@ def merge(paths: list[pathlib.Path]) -> dict:
             if key(c) in seen:
                 raise ValueError(f'{p}: {key_text(key(c))} was measured by two shards')
             seen.add(key(c))
-            # Each cell keeps its shard's cpu_model for the timing seam (gated_budget).
             merged['cells'].append(
                 {**c, 'cpu_model': doc['cpu_model']} if doc.get('cpu_model') else c
             )
@@ -2481,16 +2028,16 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument('--set', help='the plan.json set to measure')
     p.add_argument(
         '--plan-doc',
-        help='plan.json: fail a gated or exact entry neither the pr nor the full set lists, '
-        'or that --set and --only list and no shard measured. --calibrate reads its '
-        '`reported` patterns',
+        help='plan.json. The guard fails a baselined timing cell of a window --set and --only '
+        'measure that no shard measured. --check-file fails a gated or exact entry neither '
+        'the pr nor the full set lists, and --calibrate reads its `reported` patterns',
     )
     p.add_argument('--only', default='', help='comma or space separated scenarios to keep')
     p.add_argument('--runs', type=int, default=1, help='how many times to measure the set')
     p.add_argument(
         '--remeasure',
-        help="compare's remeasure.json: --plan plans only its cells and extension, "
-        '--verdict reads its stale keys, extension and accepted slowdowns',
+        help="compare's remeasure.json: --plan plans only the units of its cells, and "
+        '--verdict judges each cell on the baseline it carries',
     )
     p.add_argument('--budgets', help='the head budgets.json')
     p.add_argument(
@@ -2527,7 +2074,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     p.add_argument('--commit', help='the commit --calibrate measured')
     p.add_argument('--runner', help='the runner --calibrate measured on')
-    p.add_argument('--run-id', help='the run id of the perf-calibrate or perf-ci run')
+    p.add_argument('--run-id', help='the perf-calibrate run id')
     p.add_argument('--run-url', help='the perf-calibrate run URL')
     p.add_argument('--reason', help='--take: the one-line reason the counts moved')
     p.add_argument(
@@ -2578,7 +2125,7 @@ def file_errors(a: argparse.Namespace, head: dict, held: list[dict]) -> Checked:
     held_reported's."""
     errors = check_rule(head)
     if check_shape(head):
-        return Checked(errors, set(), {}, [], [])
+        return Checked(errors)
     added = []
     if a.plan_doc:
         doc = load(a.plan_doc)
@@ -2774,15 +2321,13 @@ def run_guard(a: argparse.Namespace) -> Outcome:
             failures=['the base holds no tests/perf/budgets.json, so the guard has no baseline']
         )
     runner, baselines = baselines_from_budgets(load(a.base))
-    matrix = plan(load(a.plan_doc), a.set, only=a.only.replace(',', ' ').split())
+    doc = load(a.plan_doc)
+    matrix = plan(doc, a.set, only=a.only.replace(',', ' ').split())
     units = planned_windows(c for job in matrix['include'] for c in job['cells'])
-    out = guard(baselines, runner, merge_results(a.results, a.prefix), units)
-    doc = {
-        'cells': [{**c, 'baseline': baselines[key(c)]} for c in out.remeasure],
-        'scenarios': sorted({c['scenario'] for c in out.remeasure}),
-        'extend': [],
-    }
-    pathlib.Path(a.remeasure_out).write_text(json.dumps(doc, indent=2) + '\n')
+    results = merge_results(a.results, a.prefix)
+    out = guard(baselines, runner, results, units, windows=scenario_windows(doc))
+    decision = {'cells': [{**c, 'baseline': baselines[key(c)]} for c in out.remeasure]}
+    pathlib.Path(a.remeasure_out).write_text(json.dumps(decision, indent=2) + '\n')
     return out
 
 

@@ -254,215 +254,6 @@ class TheRule(unittest.TestCase):
         self.assertEqual(perf_gate.check_shape(budgets([entry(budget=1600.0)])), [])
 
 
-class Compare(unittest.TestCase):
-    def test_an_exact_count_whose_middle_rep_is_its_budget_passes(self):
-        b = budgets([entry(metric='dom', tier='exact', baseline=640)])
-        for reps in ((640, 640, 640), (641, 640, 640), (640, 639, 640), (639, 640, 641)):
-            with self.subTest(reps=reps):
-                out = perf_gate.compare(b, results([cell('dom', reps, kind='count')]))
-                self.assertEqual((out.failures, out.remeasure), ([], []))
-
-    def test_an_exact_count_whose_middle_rep_is_off_is_remeasured_not_failed(self):
-        b = budgets([entry(metric='dom', tier='exact', baseline=640)])
-        for reps in ((641, 641, 640), (639, 640, 639), (641, 641, 641), (639, 639, 639)):
-            with self.subTest(reps=reps):
-                out = perf_gate.compare(b, results([cell('dom', reps, kind='count')]))
-                self.assertEqual(out.failures, [])
-                self.assertEqual([keyof(c) for c in out.remeasure], [keyof(entry('dom'))])
-
-    def test_an_exact_entry_the_harness_measured_as_a_time_fails_at_compare(self):
-        b = budgets([entry(metric='dom', tier='exact', baseline=640)])
-        out = perf_gate.compare(b, results([cell('dom', (640.0,) * 3, kind='time')]))
-        self.assertEqual(len(out.failures), 1)
-        self.assertIn('needs a count', out.failures[0])
-        self.assertEqual(out.remeasure, [])
-
-    def test_a_gated_cell_is_red_only_when_its_median_of_three_is_over(self):
-        b = budgets([entry(budget=1500.0)])
-        red = perf_gate.compare(b, results([cell(reps=(1600.0, 1400.0, 1600.0))]))
-        self.assertEqual(red.failures, [])
-        self.assertEqual([keyof(c) for c in red.remeasure], [keyof(entry())])
-        one = perf_gate.compare(b, results([cell(reps=(1600.0, 1400.0, 1400.0))]))
-        self.assertEqual((one.failures, one.remeasure), ([], []))
-
-    def test_a_cell_under_its_budget_is_never_remeasured(self):
-        out = perf_gate.compare(budgets([entry()]), results([cell(reps=(1490.0, 1490.0, 1490.0))]))
-        self.assertEqual((out.failures, out.remeasure), ([], []))
-
-    def test_a_cell_under_baseline_over_headroom_yields_a_lowering_notice(self):
-        out = perf_gate.compare(budgets([entry()]), results([cell(reps=(600.0, 600.0, 600.0))]))
-        self.assertEqual((out.failures, out.remeasure), ([], []))
-        self.assertEqual(len(out.notices), 1)
-        none = perf_gate.compare(budgets([entry()]), results([cell(reps=(700.0, 700.0, 700.0))]))
-        self.assertEqual(none.notices, [])
-
-    def test_server_cpu_per_request_gates_at_its_target(self):
-        b = budgets([entry(metric='server_cpu_ms', baseline=20.0, budget=63.0)])
-        over = perf_gate.compare(
-            b, results([cell('server_cpu_ms', (70.0, 70.0, 70.0), kind='server_cpu')])
-        )
-        self.assertEqual(len(over.remeasure), 1)
-        under = perf_gate.compare(
-            b, results([cell('server_cpu_ms', (40.0, 40.0, 40.0), kind='server_cpu')])
-        )
-        self.assertEqual((under.failures, under.remeasure), ([], []))
-
-    def test_another_runner_reports_every_metric_and_gates_none(self):
-        b = budgets([entry(), entry(metric='dom', tier='exact', baseline=640)])
-        cells = [cell(reps=(9000.0, 9000.0, 9000.0)), cell('dom', (9, 9, 9), kind='count')]
-        out = perf_gate.compare(b, results(cells, runner='self-hosted-x'))
-        self.assertTrue(out.runner_mismatch)
-        self.assertEqual((out.failures, out.remeasure), ([], []))
-        self.assertEqual(len(out.reported), 2)
-        text = perf_gate.summary(b, out)
-        self.assertIn(f'Measure on `{b["runner"]}` to gate it.', text)
-        # perf-calibrate.yaml takes no runner, so it is no step that gates this one.
-        self.assertNotIn('perf-calibrate.yaml', text)
-
-    def test_an_empty_budget_list_reports_every_cell_and_fails_nothing(self):
-        cells = [cell(reps=(9000.0, 9000.0, 9000.0)), cell('dom', (9, 9, 9), kind='count')]
-        out = perf_gate.compare(budgets([]), results(cells))
-        self.assertEqual((out.failures, out.remeasure), ([], []))
-        self.assertEqual(len(out.reported), 2)
-
-    def test_a_measured_cell_with_no_entry_is_reported(self):
-        other = {**cell(reps=(9000.0, 9000.0, 9000.0)), 'window': 'rest'}
-        out = perf_gate.compare(budgets([entry()]), results([cell(), other]))
-        self.assertEqual((out.failures, out.remeasure), ([], []))
-        self.assertEqual([keyof(r) for r in out.reported], [keyof(other)])
-
-    def test_a_reported_entry_never_gates(self):
-        e = entry(tier='reported')
-        out = perf_gate.compare(budgets([e]), results([cell(reps=(9000.0, 9000.0, 9000.0))]))
-        self.assertEqual((out.failures, out.remeasure), ([], []))
-        self.assertEqual(len(out.reported), 1)
-
-    def test_an_entrys_own_headroom_sets_its_budget(self):
-        wide = entry(headroom=1.6, budget=1600.0)
-        out = perf_gate.compare(budgets([wide]), results([cell(reps=(1550.0, 1550.0, 1550.0))]))
-        self.assertEqual(out.remeasure, [])
-        low = perf_gate.compare(budgets([wide]), results([cell(reps=(640.0, 640.0, 640.0))]))
-        self.assertEqual(low.notices, [])
-
-    def test_a_cell_over_its_familys_target_is_flagged_and_does_not_fail(self):
-        srv = entry('server_cpu_ms:GET /api/tools', tier='reported')
-        out = perf_gate.compare(
-            budgets([srv]), results([cell(srv['metric'], (70.0, 70.0, 70.0), kind='server_cpu')])
-        )
-        self.assertEqual(out.failures, [])
-        self.assertEqual([keyof(c) for c in out.over_target], [keyof(srv)])
-        self.assertIn('| 63.0 | reported (over target) |', perf_gate.summary(budgets([srv]), out))
-
-    def test_a_zero_headroom_never_divides(self):
-        b = budgets([entry(budget=50.0)], headroom={'cpu_ms': 0})
-        out = perf_gate.compare(b, results([cell(reps=(40.0, 40.0, 40.0))]))
-        self.assertEqual((out.failures, out.notices), ([], []))
-
-    def test_a_gated_or_exact_entry_the_set_lists_and_no_shard_measured_fails(self):
-        b = budgets([entry(), entry('dom', 'exact', 640), entry('frames', 'reported', 9.0)])
-        units = perf_gate.planned_windows([unit('files', 80)])
-        out = perf_gate.compare(b, results([]), units)
-        self.assertEqual(len(out.failures), 2)
-        self.assertTrue(all('no shard measured' in f for f in out.failures))
-        measured = [cell(), cell('dom', (640,) * 3, kind='count')]
-        self.assertEqual(perf_gate.compare(b, results(measured), units).failures, [])
-        self.assertEqual(perf_gate.compare(b, results([]), {}).failures, [])
-        self.assertEqual(perf_gate.compare(b, results([], runner='x'), units).failures, [])
-
-    def test_an_entry_of_a_cell_a_held_pattern_matches_is_judged_reported(self):
-        b = budgets([entry(), entry('dom', 'exact', 640)])
-        units = perf_gate.planned_windows([unit('files', 80)])
-        held = [{'metric': 'dom'}]
-        off = results([cell(), cell('dom', (700,) * 3, kind='count')])
-        judged = perf_gate.compare(b, off, units)
-        self.assertEqual([keyof(c) for c in judged.remeasure], [keyof(entry('dom'))])
-        out = perf_gate.compare(b, off, units, reported=held)
-        self.assertEqual((out.remeasure, out.failures), ([], []))
-        self.assertEqual([keyof(c) for c in out.reported], [keyof(entry('dom'))])
-        self.assertEqual(perf_gate.compare(b, results([cell()]), units, reported=held).failures, [])
-
-    def test_a_cell_that_lists_windows_needs_a_result_only_for_those(self):
-        # The pr set measures WebKit x10 cold only; budgets.json holds the
-        # full set's WebKit live CPU and back count too.
-        webkit = {'engine': 'webkit'}
-        doc = {
-            'node': '.',
-            'sets': {
-                'pr': {'shards': 1, 'cells': [unit('files', 25, windows=['cold'], **webkit)]},
-            },
-        }
-        matrix = perf_gate.plan(doc, 'pr')
-        units = perf_gate.planned_windows(c for job in matrix['include'] for c in job['cells'])
-        cold = {**entry('rss_mb', baseline=200.0, budget=250.0), **webkit}
-        live = {**entry(), **webkit, 'window': 'live'}
-        back = {**entry('dom', 'exact', 640), **webkit, 'window': 'back'}
-        b = budgets([cold, live, back])
-        measured = results([{**cell('rss_mb', (200.0,) * 3), **webkit}])
-        self.assertEqual(perf_gate.compare(b, measured, units).failures, [])
-        dropped = perf_gate.compare(b, results([]), units).failures
-        self.assertEqual(len(dropped), 1)
-        self.assertTrue(dropped[0].startswith('files/x10/webkit/desktop/cold/rss_mb:'))
-
-
-class Verdict(unittest.TestCase):
-    def test_a_red_cell_fails_only_on_its_median_of_six(self):
-        b = budgets([entry(budget=1500.0)])
-        first = results([cell(reps=(1600.0, 1600.0, 1400.0))])
-        for more, fails in (((1400.0, 1400.0, 1400.0), False), ((1600.0, 1550.0, 1600.0), True)):
-            with self.subTest(more=more):
-                out = perf_gate.verdict(b, first, results([cell(reps=more)]))
-                self.assertEqual(bool(out.failures), fails)
-
-    def test_a_cell_that_was_not_remeasured_is_not_judged_again(self):
-        b = budgets([entry(budget=1500.0)])
-        out = perf_gate.verdict(b, results([cell(reps=(1400.0, 1400.0, 1400.0))]), results([]))
-        self.assertEqual(out.failures, [])
-
-    def test_an_exact_count_fails_only_when_the_middle_of_its_six_reps_is_off(self):
-        b = budgets([entry(metric='dom', tier='exact', baseline=640)])
-        first = results([cell('dom', (641, 641, 640), kind='count')])
-        for more, fails in (
-            ((640, 640, 640), False),
-            ((640, 639, 640), False),
-            ((641, 640, 640), True),
-            ((641, 641, 641), True),
-        ):
-            with self.subTest(more=more):
-                again = results([cell('dom', more, kind='count')])
-                out = perf_gate.verdict(b, first, again)
-                self.assertEqual(bool(out.failures), fails)
-                self.assertEqual(len(out.six), 1)
-
-    def test_an_exact_count_whose_six_reps_straddle_its_budget_fails(self):
-        # Their median is the budget, 2, though no rep measured it.
-        b = budgets([entry(metric='reads', tier='exact', baseline=2)])
-        first = results([cell('reads', (1, 1, 3), kind='count')])
-        out = perf_gate.verdict(b, first, results([cell('reads', (3, 3, 1), kind='count')]))
-        self.assertEqual(len(out.failures), 1)
-        self.assertIn('| 1, 3 |', perf_gate.summary(b, out))
-
-    def test_a_count_every_rep_moved_fails_on_its_six_reps(self):
-        b = budgets([entry(metric='dom', tier='exact', baseline=640)])
-        first = results([cell('dom', (641,) * 3, kind='count')])
-        self.assertEqual(perf_gate.compare(b, first).failures, [])
-        out = perf_gate.verdict(b, first, results([cell('dom', (641,) * 3, kind='count')]))
-        self.assertEqual(len(out.failures), 1)
-        self.assertIn('exact budget 640', out.failures[0])
-
-    def test_the_held_out_runs_that_failed_an_agreed_count_pass(self):
-        entries, first, again = [], [], []
-        for name, budget, reps, more in HELD_OUT:
-            k = dict(zip(perf_gate.KEY_FIELDS, name.split('/', 5), strict=True))
-            entries.append({**entry(tier='exact', baseline=budget), **k})
-            first.append({**cell(reps=reps, kind='count'), **k})
-            again.append({**cell(reps=more, kind='count'), **k})
-        b = budgets(entries)
-        out = perf_gate.compare(b, results(first))
-        self.assertEqual(out.failures, [])
-        self.assertEqual(len(out.remeasure), 3)
-        self.assertEqual(perf_gate.verdict(b, results(first), results(again)).failures, [])
-
-
 def base_file(entries, runner=RUNNER, schema=2):
     return {'schema': schema, 'runner': runner, 'budgets': entries}
 
@@ -471,10 +262,12 @@ def baselined(metric='cpu_ms', baseline=1000.0, **kw):
     return {**CELL, 'metric': metric, 'tier': 'gated', 'baseline': baseline, **kw}
 
 
-def guarded(entries, cells, runner=RUNNER, units=None):
+def guarded(entries, cells, runner=RUNNER, units=None, windows=None):
     """guard() of cells, measured on runner, against the base file of entries."""
     base_runner, baselines = perf_gate.baselines_from_budgets(base_file(entries))
-    return perf_gate.guard(baselines, base_runner, results(cells, runner=runner), units)
+    return perf_gate.guard(
+        baselines, base_runner, results(cells, runner=runner), units, windows=windows
+    )
 
 
 def decided(out, entries):
@@ -621,6 +414,30 @@ class Guard(unittest.TestCase):
         self.assertEqual(out.notices, [notice])
         self.assertIn(f'### Notices\n\n- {out.notices[0]}\n', perf_gate.guard_summary(out))
 
+    def test_a_baselined_window_the_head_plan_no_longer_lists_is_information(self):
+        units = perf_gate.planned_windows([unit('files', 60)])
+        live = {**baselined(), 'window': 'live'}
+        entries = [baselined(), live, baselined('heap_mb', 40.0)]
+        out = guarded(entries, [cell()], units=units, windows={'files': {'cold'}})
+        self.assertEqual(
+            out.failures,
+            [
+                (
+                    'files/x10/chromium/desktop/cold/heap_mb: the base has a baseline for it, '
+                    'and no shard measured it'
+                )
+            ],
+        )
+        self.assertEqual(
+            out.notices,
+            [
+                (
+                    f'{CPU.replace("cold", "live")}: the base has a baseline for it, and the '
+                    'head plan.json no longer measures window live'
+                )
+            ],
+        )
+
     def test_a_timing_cell_with_no_reps_fails(self):
         out = guarded([baselined()], [cell(reps=())])
         self.assertEqual(out.failures, [f'{CPU}: measured no reps'])
@@ -648,6 +465,24 @@ class Guard(unittest.TestCase):
                     v.failures, [f'{CPU}: listed for a re-measure but no reps came back']
                 )
 
+    def test_a_red_server_route_the_re_measure_did_not_request_fails_on_its_first_reps(self):
+        route = 'server_cpu_ms:GET /api/chats'
+        entries = [baselined(), baselined(route, 22.0, window='replay')]
+        first = [cell(), cell(route, (46.0, 47.0, 48.0), 'server_cpu', window='replay')]
+        out = guarded(entries, first)
+        self.assertEqual(len(out.remeasure), 1)
+        v = perf_gate.guard_verdict(decided(out, entries), results(first), results([cell()]))
+        self.assertEqual(
+            v.failures,
+            [
+                (
+                    f'files/x10/chromium/desktop/replay/{route}: the re-measure did not request '
+                    'this route, so its first three reps judge it: median 47.0 is 25 over its '
+                    'baseline 22.0 (2.14x), past the guard of 2.0x and 10'
+                )
+            ],
+        )
+
     def test_a_decision_without_a_numeric_baseline_is_an_error(self):
         first = results([cell(reps=(3000.0,) * 3)])
         again = results([cell(reps=(3000.0,) * 3)])
@@ -670,299 +505,6 @@ class Guard(unittest.TestCase):
             f'| {CPU} | 3000.0 | 9700.0, 9800.0, 9900.0, 9750.0, 9850.0, 9800.0 | 9800.0 | 3.27 | failed |',
             text,
         )
-
-
-def accepted(budget=1700.0, reason='a slower parse on purpose', file='slow.json', **kw):
-    """compare's view of one accepted slowdown, {key: {budget, reason, file}}."""
-    return {keyof({**entry(), **kw}): {'budget': budget, 'reason': reason, 'file': file}}
-
-
-def decision(accepted_cells=None, stale=(), extend=(), reported=()):
-    """compare's remeasure.json as the verdict reads it."""
-    return {
-        'cells': [],
-        'stale': [perf_gate.key_dict(k) for k in stale],
-        'extend': list(extend),
-        'accepted': [{**perf_gate.key_dict(k), **a} for k, a in (accepted_cells or {}).items()],
-        'reported': list(reported),
-    }
-
-
-class Accepted(unittest.TestCase):
-    """A gated cell slower on purpose, judged against the budget its accepted file gives."""
-
-    def test_the_one_seam_judging_a_time_gives_the_larger_accepted_budget(self):
-        b, e, c = budgets([entry(budget=1500.0)]), entry(budget=1500.0), cell()
-        self.assertEqual(perf_gate.gated_budget(b, e, [c], {}), (1500.0, None))
-        a = accepted()
-        self.assertEqual(perf_gate.gated_budget(b, e, [c], a), (1700.0, a[keyof(e)]))
-        self.assertEqual(perf_gate.gated_budget(b, e, [c], accepted(1400.0)), (1500.0, None))
-
-    def test_the_seam_sees_every_shard_whose_reps_are_judged(self):
-        b = budgets([entry(budget=1500.0)])
-        first = {**cell(reps=(1600.0,) * 3), 'cpu_model': 'AMD EPYC 7763'}
-        more = {**cell(reps=(1400.0,) * 3), 'cpu_model': 'Intel Xeon 8370C'}
-        seen = []
-
-        def seam(budgets_doc, e, cells, accepted):
-            seen.append((budgets_doc is b, [c['cpu_model'] for c in cells]))
-            return e['budget'], None
-
-        with unittest.mock.patch.object(perf_gate, 'gated_budget', seam):
-            perf_gate.verdict(b, results([first]), results([more]))
-        self.assertEqual(
-            seen, [(True, ['AMD EPYC 7763']), (True, ['AMD EPYC 7763', 'Intel Xeon 8370C'])]
-        )
-
-    def test_an_accepted_slowdown_passes_with_its_note(self):
-        b = budgets([entry(budget=1500.0)])
-        out = perf_gate.compare(b, results([cell(reps=(1600.0,) * 3)]), accepted=accepted())
-        self.assertEqual((out.failures, out.remeasure), ([], []))
-        self.assertEqual(len(out.slower), 1)
-        text = perf_gate.summary(b, out)
-        self.assertIn('### Slower on purpose', text)
-        self.assertIn(f'| {CPU} | 1500.0 | 1700.0 | 1600.0 | a slower parse on purpose |', text)
-        self.assertIn('slow.json', text)
-        six = perf_gate.verdict(
-            b,
-            results([cell(reps=(1800.0,) * 3)]),
-            results([cell(reps=(1600.0,) * 3)]),
-            decision(accepted()),
-        )
-        self.assertEqual(six.failures, [])
-        self.assertIn('### Slower on purpose', perf_gate.summary(b, six))
-
-    def test_a_timing_regression_still_fails(self):
-        b = budgets([entry(budget=1500.0)])
-        first = results([cell(reps=(1600.0, 1600.0, 1400.0))])
-        again = results([cell(reps=(1600.0, 1550.0, 1600.0))])
-        for name, d in (
-            ('no accepted file', decision()),
-            ('an accepted file of another cell', decision(accepted(window='live'))),
-        ):
-            with self.subTest(name):
-                out = perf_gate.verdict(b, first, again, d)
-                self.assertEqual(len(out.failures), 1, out.failures)
-                self.assertIn('median of six 1600.0 is over its budget 1500.0', out.failures[0])
-        over = perf_gate.verdict(
-            b,
-            results([cell(reps=(1800.0,) * 3)]),
-            results([cell(reps=(1800.0,) * 3)]),
-            decision(accepted()),
-        )
-        self.assertEqual(len(over.failures), 1, over.failures)
-        self.assertIn('over its budget 1700.0', over.failures[0])
-
-    def test_an_accepted_budget_at_or_under_the_entrys_is_an_unused_notice(self):
-        b = budgets([entry(budget=1500.0)])
-        out = perf_gate.compare(b, results([cell()]), accepted=accepted(1500.0))
-        self.assertEqual((out.failures, out.slower), ([], []))
-        self.assertEqual(len(out.notices), 1, out.notices)
-        self.assertIn('slow.json', out.notices[0])
-        self.assertIn('changes nothing', out.notices[0])
-
-
-class Record(unittest.TestCase):
-    """The exact counts a verdict measured off their budgets, for the measured file."""
-
-    def recorded(self, out):
-        return [(keyof(r['cell']), r['value'], r['reps']) for r in out.recorded]
-
-    def test_a_moved_count_is_recorded_with_its_six_reps_and_fails(self):
-        b = budgets([entry('dom', 'exact', 640)])
-        first = results([cell('dom', (641,) * 3, kind='count')])
-        out = perf_gate.verdict(b, first, results([cell('dom', (641,) * 3, kind='count')]))
-        self.assertEqual(self.recorded(out), [(keyof(entry('dom')), 641, [641] * 6)])
-        self.assertEqual(len(out.failures), 1, out.failures)
-        text = perf_gate.summary(b, out)
-        self.assertIn('### Measured moves to check in', text)
-        self.assertIn(f'| {DOM} | 640 | 641 | 641, 641, 641, 641, 641, 641 |', text)
-        self.assertIn(
-            'This run wrote no signed measured file: a merge queue run measures no pull '
-            'request head, and a pull request from a fork gets no id token. Take the counts '
-            'from a run of the head on a branch of the repository.',
-            text,
-        )
-        self.assertNotIn('--take', text)
-
-    def test_an_unmoved_or_noisy_count_is_not_recorded(self):
-        b = budgets([entry('dom', 'exact', 640), entry('reads', 'exact', 2)])
-        first = results(
-            [cell('dom', (641, 641, 640), kind='count'), cell('reads', (1, 1, 3), kind='count')]
-        )
-        again = results(
-            [cell('dom', (640,) * 3, kind='count'), cell('reads', (3, 3, 1), kind='count')]
-        )
-        out = perf_gate.verdict(b, first, again)
-        self.assertEqual(out.recorded, [])
-        self.assertEqual(len(out.failures), 1, out.failures)
-        self.assertIn('reads', out.failures[0])
-
-    def test_six_reps_whose_middle_agrees_off_the_budget_record_nothing(self):
-        b = budgets([entry('dom', 'exact', 640)])
-        first = results([cell('dom', (640, 641, 641), kind='count')])
-        again = results([cell('dom', (641, 641, 642), kind='count')])
-        out = perf_gate.verdict(b, first, again)
-        self.assertEqual(out.recorded, [])
-        self.assertEqual(
-            out.failures,
-            [
-                (
-                    f'{DOM}: reps [640, 641, 641, 641, 641, 642] disagree (exact budget 640), '
-                    'so no exact value can be recorded and the cell may no longer be exact'
-                )
-            ],
-        )
-        on_budget = perf_gate.verdict(
-            b,
-            results([cell('dom', (639, 641, 641), kind='count')]),
-            results([cell('dom', (640,) * 3, kind='count')]),
-        )
-        self.assertEqual((on_budget.recorded, on_budget.failures), ([], []))
-        self.assertEqual(on_budget.six[0]['judged'], [640, 640])
-
-    def test_a_stale_key_is_re_measured_and_recorded_though_it_equals_its_budget(self):
-        b = budgets([entry('dom', 'exact', 640)])
-        first = results([cell('dom', (640,) * 3, kind='count')])
-        again = results([cell('dom', (640,) * 3, kind='count')])
-        out = perf_gate.verdict(b, first, again, decision(stale=[keyof(entry('dom'))]))
-        self.assertEqual(self.recorded(out), [(keyof(entry('dom')), 640, [640] * 6)])
-        self.assertEqual(len(out.failures), 1, out.failures)
-        self.assertIn('check in the measured file this run wrote', out.failures[0])
-        spread = perf_gate.verdict(
-            b,
-            results([cell('dom', (640, 640, 641), kind='count')]),
-            again,
-            decision(stale=[keyof(entry('dom'))]),
-        )
-        # Its middle values are its budget, so recording the budget moves nothing.
-        self.assertEqual(
-            self.recorded(spread), [(keyof(entry('dom')), 640, [640, 640, 641, 640, 640, 640])]
-        )
-        self.assertEqual(
-            spread.failures,
-            [
-                (
-                    f'{DOM}: reps [640, 640, 641, 640, 640, 640] is stale; '
-                    'check in the measured file this run wrote'
-                )
-            ],
-        )
-        moved = perf_gate.verdict(
-            b,
-            results([cell('dom', (641, 641, 640), kind='count')]),
-            results([cell('dom', (641,) * 3, kind='count')]),
-            decision(stale=[keyof(entry('dom'))]),
-        )
-        self.assertEqual(moved.recorded, [])
-        self.assertEqual(len(moved.failures), 1, moved.failures)
-        self.assertIn('so no exact value can be recorded', moved.failures[0])
-        missing = perf_gate.verdict(b, first, results([]), decision(stale=[keyof(entry('dom'))]))
-        self.assertEqual(self.recorded(missing), [])
-        self.assertIn('no reps came back', missing.failures[0])
-
-    def test_an_extension_cell_is_judged_on_its_three_reps_and_its_times_are_reported(self):
-        x1 = {'scale': 'x1'}
-        b = budgets(
-            [
-                {**entry('dom', 'exact', 640), **x1},
-                {**entry('reads', 'exact', 2), **x1},
-                {**entry('nodes', 'exact', 7), **x1},
-                {**entry(budget=1500.0), **x1},
-            ]
-        )
-        d = decision(extend=[unit('files', 60, scale='x1')])
-        again = results(
-            [
-                {**cell('dom', (641,) * 3, kind='count'), **x1},
-                {**cell('reads', (3, 2, 2), kind='count'), **x1},
-                {**cell('nodes', (8, 9, 10), kind='count'), **x1},
-                {**cell(reps=(9000.0,) * 3), **x1},
-            ]
-        )
-        out = perf_gate.verdict(b, results([]), again, d)
-        x1_dom = keyof({**entry('dom'), **x1})
-        self.assertEqual(self.recorded(out), [(x1_dom, 641, [641] * 3)])
-        self.assertEqual(len(out.failures), 2, out.failures)
-        self.assertTrue(out.failures[0].startswith('files/x1/chromium/desktop/cold/dom:'))
-        self.assertEqual(
-            out.failures[1],
-            (
-                'files/x1/chromium/desktop/cold/nodes: reps [8, 9, 10] disagree (exact budget 7), '
-                'so no exact value can be recorded and the cell may no longer be exact'
-            ),
-        )
-        self.assertEqual([keyof(c) for c in out.reported], [keyof({**entry(), **x1})])
-        missing = perf_gate.verdict(b, results([]), results(again['cells'][1:]), d)
-        self.assertIn(
-            'files/x1/chromium/desktop/cold/dom: an exact entry of the extension that no shard '
-            'measured',
-            missing.failures,
-        )
-        # A cell of a unit the extension does not list is no extension cell.
-        self.assertEqual(perf_gate.verdict(b, results([]), again, decision()).failures, [])
-
-    def test_merge_keeps_the_cpu_model_of_each_cells_shard(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            paths = []
-            for i, model in enumerate(('AMD EPYC 7763', 'Intel Xeon 8370C')):
-                p = pathlib.Path(tmp) / f'{i}.json'
-                doc = {**results([{**cell(), 'scale': f'x{i}'}]), 'cpu_model': model}
-                p.write_text(json.dumps(doc))
-                paths.append(p)
-            merged = perf_gate.merge(paths)
-        self.assertEqual(
-            [c['cpu_model'] for c in merged['cells']], ['AMD EPYC 7763', 'Intel Xeon 8370C']
-        )
-
-
-class Extension(unittest.TestCase):
-    def test_a_scenario_extends_to_the_full_units_its_set_does_not_cover(self):
-        units = perf_gate.planned_windows(PLAN['sets']['pr']['cells'])
-        self.assertEqual(
-            perf_gate.extension(PLAN, units, {'files'}), [unit('files', 60, scale='x1')]
-        )
-        self.assertEqual(perf_gate.extension(PLAN, units, set()), [])
-        cold = perf_gate.planned_windows([unit('files', 80, windows=['cold'])])
-        self.assertEqual(
-            perf_gate.extension(PLAN, cold, {'files'}),
-            [unit('files', 80), unit('files', 60, scale='x1')],
-        )
-        full = perf_gate.planned_windows(PLAN['sets']['full']['cells'])
-        self.assertEqual(perf_gate.extension(PLAN, full, {'files'}), [])
-        with self.assertRaisesRegex(TypeError, 'no full set'):
-            perf_gate.extension({'sets': {'pr': PLAN['sets']['pr']}}, units, {'files'})
-
-    def test_a_cell_a_held_pattern_matches_is_reported_in_the_verdict(self):
-        x1 = {'scale': 'x1'}
-        b = budgets([entry('dom', 'exact', 640), {**entry('dom', 'exact', 640), **x1}])
-        first = results([cell('dom', (700,) * 3, kind='count')])
-        extend = [unit('files', 60, scale='x1')]
-        again = results([{**cell('dom', (700,) * 3, kind='count'), **x1}])
-        judged = perf_gate.verdict(b, first, again, decision(extend=extend))
-        self.assertEqual(len(judged.failures), 2, judged.failures)
-        held = decision(extend=extend, reported=[{'metric': 'dom'}])
-        out = perf_gate.verdict(b, first, again, held)
-        self.assertEqual(out.failures, [])
-        self.assertEqual(
-            sorted(keyof(c) for c in out.reported),
-            sorted([keyof(entry('dom')), keyof({**entry('dom'), **x1})]),
-        )
-        self.assertEqual(perf_gate.verdict(b, first, results([]), held).failures, [])
-
-    def test_a_retired_cell_the_extension_measured_fails(self):
-        retired = [{**CELL, 'scale': 'x1', 'metric': 'dom', 'reason': 'the list is virtual now'}]
-        b = budgets([entry()], retired=retired)
-        x1 = {**cell('dom', (640,) * 3, kind='count'), 'scale': 'x1'}
-        extend = [unit('files', 60, scale='x1')]
-        out = perf_gate.verdict(b, results([cell()]), results([x1]), decision(extend=extend))
-        why = "retired, yet a shard measured it; a measured cell's tier is the scheduled calibration's"
-        self.assertEqual(out.failures, [f'files/x1/chromium/desktop/cold/dom: {why}'])
-        held = decision(extend=extend, reported=[{'metric': 'dom'}])
-        self.assertEqual(perf_gate.verdict(b, results([cell()]), results([x1]), held).failures, [])
-        # A metric the extension no longer emits is a retirement.
-        none = perf_gate.verdict(b, results([cell()]), results([]), decision(extend=extend))
-        self.assertEqual(none.failures, [])
 
 
 # Count cells of marotte's calibrations 43591500420 and 43598120088 that every
@@ -1227,7 +769,6 @@ class Provenance(unittest.TestCase):
         # carries, matched as cosign matches a Signer; a stem it lacks verifies.
         self.signed_by = {}
         self.git = FakeGit()
-        self.stale = set()
         accepted = tempfile.TemporaryDirectory()
         self.addCleanup(accepted.cleanup)
         self.accepted = pathlib.Path(accepted.name)
@@ -1267,7 +808,6 @@ class Provenance(unittest.TestCase):
             verify=verify or self.verify,
             git=self.git,
         )
-        self.stale = self.checked.stale
         return self.checked.errors
 
     def accept(self, name, cells, reason='a slower parse on purpose'):
@@ -1275,20 +815,10 @@ class Provenance(unittest.TestCase):
         self.git.added.setdefault(name, 'ovr')
         (self.accepted / name).write_text(json.dumps({'reason': reason, 'cells': cells}))
 
-    def test_an_accepted_slowdown_is_read_with_its_reason_and_file(self):
+    def test_an_accepted_slowdown_of_a_gated_entry_passes(self):
         self.write('111', calibration_file([cal_cell()]))
         self.accept('slow.json', [{**CELL, 'metric': 'cpu_ms', 'budget': 1700.0}])
         self.assertEqual(self.unchanged(entry()), [])
-        self.assertEqual(
-            self.checked.accepted,
-            {
-                keyof(entry()): {
-                    'budget': 1700.0,
-                    'reason': 'a slower parse on purpose',
-                    'file': 'slow.json',
-                }
-            },
-        )
 
     def test_an_accepted_file_names_gated_entries_once_with_one_reason_line(self):
         dom_cell = cal_cell('dom', 640.0, 'exact', kind='count')
@@ -1341,56 +871,6 @@ class Provenance(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual(self.checked.accepted, {})
-
-    def test_the_moved_exact_counts_list_each_change_with_its_reason_and_check(self):
-        self.pr_measured(m_cell(2056))
-        self.check(budgets([self.moved(2056)]), self.moved_from())
-        self.assertEqual(
-            self.checked.moves,
-            [
-                {
-                    'key': keyof(entry('dom')),
-                    'base': 2055.0,
-                    'head': 2056,
-                    'source': f'{MEASURED_URL}900/attempts/1',
-                    'reason': 'one more node in the view',
-                    'refused': [],
-                }
-            ],
-        )
-        self.check(budgets([self.moved(2057)]), self.moved_from())
-        (move,) = self.checked.moves
-        self.assertEqual(move['head'], 2057)
-        self.assertIn('is not what run', move['refused'][0])
-        text = perf_gate.summary(budgets([]), perf_gate.Outcome(exact_moves=self.checked.moves))
-        self.assertIn('### Exact counts this pull request moves', text)
-        self.assertIn(f'| {DOM} | 2055.0 | 2057 |', text)
-        self.assertIn('one more node in the view', text)
-        self.assertIn('take the value with perf_gate.py --take', text)
-
-    def test_a_recorded_verdict_is_a_measured_file_the_gate_accepts(self):
-        b = budgets([entry('dom', 'exact', 2055.0)])
-        out = perf_gate.verdict(
-            b,
-            results([cell('dom', (2056,) * 3, kind='count')]),
-            results([cell('dom', (2056,) * 3, kind='count')]),
-        )
-        doc = perf_gate.record(
-            out,
-            repo=REPO,
-            commit='pr-head',
-            measured_sha='merge',
-            run_id='900',
-            run_attempt='1',
-            run_url=f'{MEASURED_URL}900/attempts/1',
-            workflow_repository=REPO,
-            cpu_models=['AMD EPYC 7763'],
-        )
-        self.assertEqual(doc, measured_file([m_cell(2056)]))
-        self.git.lineage.add(('pr-head', HEAD))
-        self.write('900-1', doc)
-        self.assertEqual(self.check(budgets([self.moved(2056)]), self.moved_from()), [])
 
     def dom(self, run_id, baseline, commit, *more):
         exact = {'metric': 'dom', 'kind': 'count', 'tier': 'exact'}
@@ -1512,7 +992,6 @@ class Provenance(unittest.TestCase):
         self.pr_measured(m_cell(2056))
         head = budgets([self.moved(2056)])
         self.assertEqual(self.check(head, self.moved_from(), base_sha='ba5e'), [])
-        self.assertEqual(self.stale, set())
         self.assertEqual(self.verified, [('900-1.json', '900-1.sigstore.json')])
         self.assertEqual(self.signers, [MEASURED_SIGNER])
 
@@ -1528,7 +1007,6 @@ class Provenance(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual(self.stale, {keyof(self.moved(2057))})
 
     def test_a_measured_file_of_another_head_fails_unless_patch_equivalent(self):
         # The merge ref's own change is not the measured head's: a push after the run.
@@ -1538,16 +1016,12 @@ class Provenance(unittest.TestCase):
         self.assertEqual(len(errors), 1, errors)
         self.assertTrue(errors[0].startswith('measured file 900-1: '), errors)
         self.assertIn('take the measured file this run wrote', errors[0])
-        self.assertEqual(self.stale, {keyof(self.moved(2056))})
         self.git.same = {('other-head', HEAD)}
         self.assertEqual(self.check(head, self.moved_from()), [])
-        self.assertEqual(self.stale, set())
 
     def test_a_measured_value_without_verifiable_provenance_fails_closed(self):
         head = budgets([self.moved(2056)])
         perf_ci = 'https://github.com/cplieger/ci/.github/workflows/perf-ci.yaml@refs/heads/main'
-        # stale: a fresh measured file of this head cures the refusal, so compare
-        # re-measures the cell; a bundle that does not verify is no such refusal.
         cases = {
             'no file': ({}, lambda: self.dir.joinpath('900-1.json').unlink(), 'checked in'),
             'no bundle': (
@@ -1559,7 +1033,6 @@ class Provenance(unittest.TestCase):
                 {},
                 lambda: self.bad_bundles.add('900-1.sigstore.json'),
                 'the bundle does not verify',
-                False,
             ),
             'signed by perf-calibrate': (
                 {},
@@ -1567,13 +1040,11 @@ class Provenance(unittest.TestCase):
                     {'900-1': (perf_gate.CALIBRATION_IDENTITY, perf_gate.CI_REPO)}
                 ),
                 'the bundle does not verify',
-                False,
             ),
             'signed in another repository': (
                 {},
                 lambda: self.signed_by.update({'900-1': (perf_ci, 'cplieger/other')}),
                 'the bundle does not verify',
-                False,
             ),
             'another repository': ({'repo': 'cplieger/other'}, None, 'repo is'),
             'another runner': ({'runner': 'self-hosted'}, None, 'runner is'),
@@ -1592,7 +1063,7 @@ class Provenance(unittest.TestCase):
                 'value',
             ),
         }
-        for name, (doc, setup, want, *curable) in cases.items():
+        for name, (doc, setup, want) in cases.items():
             with self.subTest(name):
                 self.bad_bundles.clear()
                 self.signed_by.clear()
@@ -1604,8 +1075,6 @@ class Provenance(unittest.TestCase):
                 self.assertEqual(len(errors), 1, errors)
                 self.assertTrue(errors[0].startswith('measured file 900-1: '), errors)
                 self.assertIn(want, errors[0])
-                stale = {keyof(self.moved(2056))} if curable != [False] else set()
-                self.assertEqual(self.stale, stale)
 
     def test_a_calibration_without_verifiable_provenance_fails_closed(self):
         self.assertEqual(
@@ -1644,13 +1113,6 @@ class Provenance(unittest.TestCase):
         path = self.dir / f'{stem}.json'
         path.write_text(json.dumps({**json.loads(path.read_text()), **fields}))
 
-    def test_a_calibration_refusal_marks_no_exact_key_stale(self):
-        self.write('111', calibration_file([cal_cell('dom', 640.0, 'exact', kind='count')], runs=5))
-        b = budgets([entry('dom', 'exact', 640.0)])
-        errors = self.check(b, b)
-        self.assertEqual(errors, ['calibration 111: 5 runs decide no tier; a calibration needs 10'])
-        self.assertEqual(self.stale, set())
-
     def test_a_source_checked_without_cosign_fails_closed(self):
         self.pr_measured(m_cell(2056))
         with unittest.mock.patch.dict(os.environ, {'PATH': ''}):
@@ -1660,7 +1122,6 @@ class Provenance(unittest.TestCase):
         self.assertEqual(
             errors, ['measured file 900-1: the bundle does not verify: cosign is not installed']
         )
-        self.assertEqual(self.stale, set())
 
     def test_a_source_url_names_the_repository_whose_run_wrote_the_file(self):
         self.pr_measured(m_cell(2056))
@@ -1714,7 +1175,6 @@ class Provenance(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual(self.stale, {keyof(self.exact('200', 2056.0))})
         self.assertEqual(self.check(head, head, base_sha='ba5e'), [])
         self.git.lineage.add(('pr-head', 'ba5e'))
         self.assertEqual(self.check(head, self.moved_from(), base_sha='ba5e'), [])
@@ -1796,7 +1256,6 @@ class Provenance(unittest.TestCase):
                     + self.older('calibration 100', '0ld', 'calibration 200', 'new'),
                     errors,
                 )
-                self.assertEqual(self.stale, set())
 
     def test_an_exact_value_never_moves_back_to_an_older_measured_file(self):
         self.git.lineage = {('m-old', 'm-new'), ('m-old', HEAD), ('m-new', HEAD)}
@@ -1812,9 +1271,6 @@ class Provenance(unittest.TestCase):
                 + self.older('measured file 900-1', 'm-old', 'measured file 901-1', 'm-new')
             ],
         )
-        self.assertEqual(self.stale, set())
-        (move,) = self.checked.moves
-        self.assertIn('an entry moves only to a newer source', move['refused'][0])
 
     def test_a_newer_or_concurrent_source_than_the_base_entrys_holds(self):
         self.git.lineage = {('0ld', 'new'), ('0ld', HEAD), ('new', HEAD), ('pr-head', HEAD)}
@@ -1856,7 +1312,6 @@ class Provenance(unittest.TestCase):
                     errors[0].startswith(f"{DOM}: the base's calibration 100: "), errors
                 )
                 self.assertIn(want, errors[0])
-                self.assertEqual(self.stale, set())
 
     def schema_1_base(self, *entries):
         """A base budgets.json of schema 1, whose sources the base tree holds under another
@@ -2084,26 +1539,6 @@ class Provenance(unittest.TestCase):
         no_reason = [{**CELL, 'metric': 'cpu_ms', 'reason': ''}]
         self.assertTrue(self.check(budgets([], retired=no_reason), base))
 
-    def test_a_retired_cell_is_listed_with_its_tier_and_reason(self):
-        base = budgets([entry(source=RUN_URL + '100'), entry('dom', 'exact', 640.0)])
-        retired = [
-            {**CELL, 'metric': 'cpu_ms', 'reason': 'the view was removed'},
-            {**CELL, 'metric': 'dom', 'reason': 'the list is virtual now'},
-        ]
-        self.assertEqual(self.check(budgets([], retired=retired), base), [])
-        self.assertEqual(
-            self.checked.retires,
-            [
-                {'key': keyof(entry()), 'tier': 'gated', 'reason': 'the view was removed'},
-                {'key': keyof(entry('dom')), 'tier': 'exact', 'reason': 'the list is virtual now'},
-            ],
-        )
-        text = perf_gate.summary(budgets([]), perf_gate.Outcome(retires=self.checked.retires))
-        self.assertIn('### Cells this pull request retires', text)
-        self.assertIn('| Cell | Tier | Reason |', text)
-        self.assertIn(f'| {DOM} | exact | the list is virtual now |', text)
-        self.assertIn(f'| {CPU} | gated | the view was removed |', text)
-
     def test_a_reported_entry_dropped_needs_no_retired(self):
         base = budgets([entry(tier='reported', source=RUN_URL + '100')])
         self.assertEqual(self.check(budgets([]), base), [])
@@ -2127,7 +1562,6 @@ class Provenance(unittest.TestCase):
             self.check(b, b),
             ['calibration 111: the bundle does not verify: bundle does not verify'],
         )
-        self.assertEqual(self.stale, set())
 
     def test_an_unchanged_entry_whose_source_is_not_a_run_url_fails(self):
         b = budgets([entry(source='https://example.com/1')])
@@ -2557,8 +1991,6 @@ class GitHistory(unittest.TestCase):
                 if errors:
                     self.assertIn(f'calibration {run_id} measured this cell at', found.errors[0])
                     self.assertIn('delete accepted/slow.json', found.errors[0])
-                else:
-                    self.assertEqual(next(iter(found.accepted.values()))['file'], 'slow.json')
 
     def test_a_measured_file_of_the_head_before_a_dev_merge_near_the_change_is_retaken(self):
         git = self.git()
@@ -2581,12 +2013,11 @@ class GitHistory(unittest.TestCase):
         self.sh('rm', '-q', 'tests/perf/sources/100.json', 'tests/perf/sources/100.sigstore.json')
         merged = self.commit('drop the calibration no entry names')
         found = self.provenance(git, '900-1', self.merge_ref())
-        errors, stale = found.errors, found.stale
+        errors = found.errors
         self.assertEqual(len(errors), 1, errors)
         self.assertTrue(errors[0].startswith('measured file 900-1: '), errors)
         self.assertIn(f'than measured {self.tip} made', errors[0])
         self.assertIn('take the measured file this run wrote', errors[0])
-        self.assertEqual(stale, {keyof(entry('dom'))})
         self.sh('checkout', '-q', 'pr')
         self.sh(
             'rm', '-q', 'tests/perf/sources/900-1.json', 'tests/perf/sources/900-1.sigstore.json'
@@ -2594,7 +2025,7 @@ class GitHistory(unittest.TestCase):
         self.measured(merged, '901-1')
         self.commit('take the new head measured file')
         found = self.provenance(git, '901-1', self.merge_ref())
-        self.assertEqual((found.errors, found.stale), ([], set()))
+        self.assertEqual(found.errors, [])
 
     def test_the_base_plan_is_read_from_the_base_tree(self):
         git = self.git()
@@ -2659,8 +2090,7 @@ class GitHistory(unittest.TestCase):
             )
 
         found = check(later)
-        self.assertEqual((found.errors, found.stale), ([], set()))
-        self.assertEqual([m['key'] for m in found.moves], [keyof(moved)])
+        self.assertEqual(found.errors, [])
         frozen = check(opened)
         self.assertIn(
             f'{CPU}: calibration 200 measured {dev}, which the base {opened} does not hold; ',
@@ -2895,7 +2325,7 @@ class Plan(unittest.TestCase):
     def test_an_empty_remeasure_plans_nothing(self):
         self.assertEqual(perf_gate.plan(PLAN, 'pr', remeasure={'cells': []})['include'], [])
 
-    def test_a_remeasure_adds_the_extension_s_full_units_over_a_unit_they_cover(self):
+    def test_a_remeasure_plans_the_set_s_own_unit_of_each_red_cell(self):
         cold = {
             **PLAN,
             'sets': {
@@ -2907,19 +2337,9 @@ class Plan(unittest.TestCase):
             },
         }
         red = {**CELL, 'metric': 'cpu_ms'}
-        extend = [unit('files', 80), unit('files', 60, scale='x1')]
-        matrix = perf_gate.plan(cold, 'pr', remeasure={'cells': [red], 'extend': extend})
-        planned = sorted(
-            (c['scale'], c.get('windows'), c['seconds'])
-            for job in matrix['include']
-            for c in job['cells']
-        )
-        self.assertEqual(planned, [('x1', None, 60), ('x10', None, 80)])
-        bad = {'cells': [], 'extend': [unit('files', 0)]}
-        with self.assertRaisesRegex(
-            ValueError, 'extend: files/x10/chromium/desktop needs its seconds'
-        ):
-            perf_gate.plan(cold, 'pr', remeasure=bad)
+        matrix = perf_gate.plan(cold, 'pr', remeasure={'cells': [red, red]})
+        planned = [c for job in matrix['include'] for c in job['cells']]
+        self.assertEqual(planned, [unit('files', 25, windows=['cold'])])
 
     def test_a_plan_that_breaks_its_shape_fails(self):
         cases = {
@@ -3389,7 +2809,6 @@ class CheckIn(unittest.TestCase):
             git=self.git,
         )
         self.assertEqual(checked.errors, [])
-        self.assertEqual(list(checked.accepted), [keyof(entry(window='live'))])
 
     def test_check_in_keeps_a_measured_value_only_where_it_can_place_its_file(self):
         x1_dom = keyof({**entry('dom'), **X1})
@@ -3551,11 +2970,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(rc, 0, self.output)
         self.assertEqual(
             self.decision(),
-            {
-                'cells': [{**red, 'cpu_model': 'AMD EPYC 7763', 'baseline': 1000.0}],
-                'scenarios': ['files'],
-                'extend': [],
-            },
+            {'cells': [{**red, 'cpu_model': 'AMD EPYC 7763', 'baseline': 1000.0}]},
         )
 
     def test_compare_passes_a_count_off_its_base_and_re_measures_nothing(self):
@@ -3598,6 +3013,19 @@ class Cli(unittest.TestCase):
                 '::error::files/x10/webkit/desktop/cold/heap_mb: the base has a baseline for it, and no shard measured it'
             ],
         )
+
+    def test_compare_passes_a_baselined_window_the_head_plan_no_longer_lists(self):
+        plan = {**PLAN, 'scenarios': {'files': {'windows': ['cold']}}}
+        live = {**baselined(), 'window': 'live'}
+        rc = self.guard([cell()], entries=[baselined(), live], plan=plan)
+        self.assertEqual(rc, 0, self.output)
+        summary = (self.dir / 'summary.md').read_text()
+        self.assertIn(
+            f'- {CPU.replace("cold", "live")}: the base has a baseline for it, and the head '
+            'plan.json no longer measures window live\n',
+            summary,
+        )
+        self.assertEqual(self.guard([cell()], entries=[baselined(), live]), 1)
 
     def test_compare_refuses_a_non_finite_number_in_the_base_or_the_results(self):
         cases = {

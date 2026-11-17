@@ -215,7 +215,7 @@ if [ -n "$matrix" ]; then
   exit 0
 fi
 [ "$GATE" = crash ] && exit 1
-echo '{"cells": [], "extend": []}' > "$out"
+echo '{"cells": []}' > "$out"
 exit "$GATE"
 """
 GIT_STUB = """#!/usr/bin/env bash

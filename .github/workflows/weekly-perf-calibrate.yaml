@@ -2,8 +2,7 @@
 # tests/perf/plan.json, on dispatch only: perf-calibrate.yaml measures its
 # default branch's `full` set ten times and opens the pull request that checks
 # the signed calibration in, which also deletes the accepted slowdowns it
-# absorbed. A full x10 takes about ten hours and 4,900 runner-minutes, and the
-# pull request guard needs no calibration.
+# absorbed. A full x10 takes about ten hours and 4,900 runner-minutes.
 name: Weekly perf calibrate
 
 on:
