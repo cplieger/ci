@@ -15,12 +15,16 @@ target), `count` (exact) or `report` (never gated).
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
+import fnmatch
 import functools
 import json
 import math
+import os
 import pathlib
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -33,18 +37,38 @@ if TYPE_CHECKING:
 KEY_FIELDS = ('scenario', 'scale', 'engine', 'width', 'window', 'metric')
 TIERS = ('gated', 'exact', 'reported')
 CHANGE_FIELDS = ('baseline', 'budget', 'tier', 'headroom', 'source')
+ENTRY_FIELDS = (*KEY_FIELDS, *CHANGE_FIELDS, 'reason')
+FILE_FIELDS = ('schema', 'runner', 'headroom', 'floor', 'target', 'budgets', 'retired')
+SCHEMA = 2
 SERVER_CPU = 'server_cpu_ms'
 DEFAULT_HEADROOM = {'cpu_ms': 1.5, 'heap_mb': 1.25, 'rss_mb': 1.25}
 DEFAULT_FLOOR = {'cpu_ms': 50, 'heap_mb': 1}
 HEADROOM_STEP = 0.05
 TIER_RUNS = 10
-IDENTITY = 'https://github.com/cplieger/ci/.github/workflows/perf-calibrate.yaml@refs/heads/main'
+CI_REPO = 'cplieger/ci'
+CALIBRATION_IDENTITY = (
+    'https://github.com/cplieger/ci/.github/workflows/perf-calibrate.yaml@refs/heads/main'
+)
+# perf-ci.yaml's verdict signs at the ref its caller pinned: a full sha, or main for weekly-perf.
+MEASURED_IDENTITY = (
+    r'^https://github\.com/cplieger/ci/\.github/workflows/perf-ci\.yaml'
+    r'@(refs/heads/main|[0-9a-f]{40})$'
+)
 ISSUER = 'https://token.actions.githubusercontent.com'
-SOURCE_RE = re.compile(r'^https://github\.com/cplieger/ci/actions/runs/(\d+)$')
+CALIBRATION_RE = re.compile(r'^https://github\.com/cplieger/ci/actions/runs/(\d+)$')
+MEASURED_RE = re.compile(
+    r'^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/actions/runs/(\d+)/attempts/(\d+)$'
+)
+SOURCE_FILE_RE = re.compile(r'^(\d+(?:-\d+)?)(?:\.sigstore)?\.json$')
 SHA_RE = re.compile(r'^[0-9a-f]{40}$')
-# What a calibration's check-in writes; the rest of the tree is the code it measured.
+# What checking in a source writes; the rest of the tree is the code it measured.
 PLAN_PATH = 'tests/perf/plan.json'
-CHECK_IN_PATHS = ('tests/perf/budgets.json', 'tests/perf/calibrations', PLAN_PATH)
+CHECK_IN_PATHS = (
+    'tests/perf/budgets.json',
+    'tests/perf/sources',
+    'tests/perf/accepted',
+    PLAN_PATH,
+)
 # Budgets are written to two decimals, and a widened headroom times a baseline
 # is not exact in binary floating point.
 TOLERANCE = 0.005
@@ -112,6 +136,10 @@ def entry_floor(budgets: dict, e: dict) -> float:
     return budgets.get('floor', {}).get(family(e['metric']), 0)
 
 
+def file_target(budgets: dict, metric: str) -> float | None:
+    return budgets.get('target', {}).get(family(metric))
+
+
 # --- the rule --------------------------------------------------------------
 
 
@@ -123,10 +151,11 @@ def check_rule(budgets: object) -> list[str]:
     if not isinstance(budgets, dict):
         return shape
     errors = []
-    if budgets.get('schema') != 1:
-        errors.append('budgets.json: schema must be 1')
+    if budgets.get('schema') != SCHEMA:
+        errors.append(f'budgets.json: schema must be {SCHEMA}')
     if not isinstance(budgets.get('runner'), str) or not budgets['runner']:
         errors.append('budgets.json: runner must name the runner the budgets were calibrated on')
+    errors.extend(f'budgets.json: unknown field {f}' for f in budgets if f not in FILE_FIELDS)
     if shape:
         return errors + shape
     seen = set()
@@ -136,6 +165,11 @@ def check_rule(budgets: object) -> list[str]:
             errors.append(f'{name}: listed twice')
         seen.add(key(e))
         errors.extend(f'{name}: {m}' for m in entry_errors(budgets, e))
+    errors.extend(
+        f'{key_text(key(r))}: retired, yet budgets lists it'
+        for r in budgets.get('retired', [])
+        if key(r) in seen
+    )
     return errors
 
 
@@ -143,8 +177,8 @@ def check_shape(budgets: object) -> list[str]:
     """The rule errors that stop the gate before it reads an entry, each a value
     the code reading one would raise on or misjudge: a document, list, map or
     item of the wrong type, an entry without its key or a known tier, a gated
-    or exact entry whose baseline or budget is no number, a headroom or floor
-    value out of range, and a retired item without its key and reason."""
+    or exact entry whose baseline or budget is no number, a headroom, floor
+    or target value out of range, and a retired item without its key and reason."""
     if not isinstance(budgets, dict):
         return ['budgets.json: must be a JSON object']
     errors = [
@@ -155,6 +189,7 @@ def check_shape(budgets: object) -> list[str]:
     for field, ok, want in (
         ('headroom', lambda x: is_number(x) and x > 0, 'a number above 0'),
         ('floor', lambda x: is_number(x) and x >= 0, 'a number of 0 or more'),
+        ('target', lambda x: is_number(x) and x > 0, 'a number above 0'),
     ):
         values = budgets.get(field, {})
         if not isinstance(values, dict):
@@ -201,11 +236,17 @@ def entry_shape(i: int, e: object) -> str | None:
 def entry_errors(budgets: dict, e: dict) -> list[str]:
     """The rule errors of an entry check_shape passed."""
     tier = e['tier']
-    out = []
+    out = [f'unknown field {f}' for f in e if f not in ENTRY_FIELDS]
     if not isinstance(e.get('source'), str) or not e['source']:
         out.append('no source')
-    if not isinstance(e.get('rows'), list) or not e['rows']:
-        out.append('no rows')
+    src = parse_source(e.get('source'))
+    if src and src.kind == 'measured':
+        if tier != 'exact':
+            out.append('only an exact entry takes its value from a measured file')
+        elif 'reason' not in e:
+            out.append('a value from a measured file needs its one-line reason')
+    if 'reason' in e:
+        out.extend(reason_errors(e))
     if 'headroom' in e and tier != 'gated':
         out.append('only a gated entry carries its own headroom')
     if tier == 'reported':
@@ -215,8 +256,11 @@ def entry_errors(budgets: dict, e: dict) -> list[str]:
         if budget != baseline:
             out.append(f'an exact budget is its baseline {baseline}, not {budget}')
     elif family(e['metric']) == SERVER_CPU:
-        if budget != e.get('target'):
-            out.append(f'a server CPU budget is its target {e.get("target")}, not {budget}')
+        target = file_target(budgets, e['metric'])
+        if target is None:
+            out.append(f'no target for {SERVER_CPU}')
+        elif budget != target:
+            out.append(f'a server CPU budget is its target {target}, not {budget}')
     else:
         h = entry_headroom(budgets, e)
         if not is_number(h):
@@ -228,6 +272,20 @@ def entry_errors(budgets: dict, e: dict) -> list[str]:
             if abs(budget - want) > TOLERANCE:
                 out.append(f'budget {budget} is not max(floor, {baseline} x {h}) = {want}')
     return out
+
+
+def reason_errors(e: dict) -> list[str]:
+    """Why e's reason breaks the rule that reads no base: one non-empty line, and none on
+    an entry no headroom, floor or target edit can move."""
+    r = e['reason']
+    if not isinstance(r, str) or not r.strip() or has_line_break(r):
+        return [f'reason must be one non-empty line, not {r!r}']
+    if e['tier'] == 'reported':
+        return ['a reported entry carries no reason']
+    src = parse_source(e.get('source'))
+    if e['tier'] == 'exact' and src and src.kind == 'calibration':
+        return ['an exact entry from a calibration carries no reason']
+    return []
 
 
 # --- compare and verdict ---------------------------------------------------
@@ -247,6 +305,27 @@ class Outcome:
     # Each re-measured cell: {cell, reps, judged}, judged the values verdict
     # held against the budget.
     six: list[dict] = dataclasses.field(default_factory=list)
+    # Each gated cell an accepted file judged: {cell, budget, accepted, value, reason, file}.
+    slower: list[dict] = dataclasses.field(default_factory=list)
+    # Each exact count the verdict measured for a measured file: {cell, budget, value, reps}.
+    recorded: list[dict] = dataclasses.field(default_factory=list)
+    # check_provenance's moves and retires, for the summary.
+    exact_moves: list[dict] = dataclasses.field(default_factory=list)
+    retires: list[dict] = dataclasses.field(default_factory=list)
+    # The measured file the verdict wrote, for the summary's commands.
+    measured_as: MeasuredAs | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class MeasuredAs:
+    """The run that wrote a measured file, its repository, the cplieger/ci commit whose
+    perf_gate.py takes it, its artifact and its stem."""
+
+    run_id: str
+    repository: str
+    workflow_sha: str
+    artifact: str
+    stem: str
 
 
 def middle(reps: list) -> list:
@@ -257,12 +336,14 @@ def middle(reps: list) -> list:
     return s[(len(s) - 1) // 2 : len(s) // 2 + 1]
 
 
-def compare(budgets: dict, results: dict, units: dict | None = None) -> Outcome:
+def compare(
+    budgets: dict, results: dict, units: dict | None = None, accepted: dict | None = None
+) -> Outcome:
     """Judge each measured cell on its median of three. A gated cell over its
-    budget and an exact count whose middle rep is off its budget are listed in
-    `remeasure`, never failed here. An exact entry measured as no count fails,
-    and so does a gated or exact entry no shard measured whose unit and window
-    `units` (`planned_windows`) holds."""
+    budget (gated_budget, with `accepted` slowdowns) and an exact count whose middle
+    rep is off its budget are listed in `remeasure`, never failed here. An exact entry
+    measured as no count fails, and so does a gated or exact entry no shard measured
+    whose unit and window `units` (`planned_windows`) holds."""
     out = Outcome(runner=results.get('runner', ''))
     out.runner_mismatch = out.runner != budgets.get('runner')
     entries = {key(e): e for e in budgets.get('budgets', [])}
@@ -270,14 +351,14 @@ def compare(budgets: dict, results: dict, units: dict | None = None) -> Outcome:
         e = entries.get(key(c))
         reps = c.get('reps') or []
         value = statistics.median(reps) if reps else None
-        if e is not None and is_number(e.get('target')) and value is not None:
-            if value > e['target']:
-                out.over_target.append(c)
+        target = file_target(budgets, c['metric'])
+        if is_number(target) and value is not None and value > target:
+            out.over_target.append(c)
         if out.runner_mismatch or e is None or e['tier'] == 'reported':
             out.reported.append(c)
             status = 'reported'
         else:
-            status = judge(budgets, e, c, value, out)
+            status = judge(budgets, e, c, value, out, accepted or {})
         out.rows.append({'cell': c, 'entry': e, 'value': value, 'status': status})
     if not out.runner_mismatch and units:
         measured = {key(c) for c in results.get('cells', [])}
@@ -289,7 +370,21 @@ def compare(budgets: dict, results: dict, units: dict | None = None) -> Outcome:
     return out
 
 
-def judge(budgets: dict, e: dict, c: dict, value: float | None, out: Outcome) -> str:
+def gated_budget(
+    budgets: dict, e: dict, cells: list[dict], accepted: dict
+) -> tuple[float, dict | None]:
+    """The budget the reps of cells, one gated cell of entry e in budgets, are judged
+    against, and the accepted slowdown that set it, if any. Every timing judgement goes
+    through here, and cells carry the cpu_model of each shard whose reps are judged."""
+    a = accepted.get(key(cells[0]))
+    if a is not None and a['budget'] > e['budget']:
+        return a['budget'], a
+    return e['budget'], None
+
+
+def judge(
+    budgets: dict, e: dict, c: dict, value: float | None, out: Outcome, accepted: dict
+) -> str:
     name = key_text(key(c))
     kind = c.get('kind')
     if value is None:
@@ -308,7 +403,18 @@ def judge(budgets: dict, e: dict, c: dict, value: float | None, out: Outcome) ->
     if kind not in ('time', 'server_cpu'):
         out.failures.append(f'{name}: a gated entry needs a time, the harness measured {kind}')
         return 'failed'
-    if value > e['budget']:
+    budget, note = gated_budget(budgets, e, [c], accepted)
+    if note is not None:
+        out.slower.append(
+            {**note, 'cell': c, 'budget': e['budget'], 'accepted': budget, 'value': value}
+        )
+    elif key(c) in accepted:
+        a = accepted[key(c)]
+        out.notices.append(
+            f'{name}: accepted/{a["file"]} gives budget {a["budget"]}, at or under its '
+            f'budget {e["budget"]}, so it changes nothing; delete it'
+        )
+    if value > budget:
         out.remeasure.append(c)
         return 'remeasure'
     h = entry_headroom(budgets, e)
@@ -320,33 +426,201 @@ def judge(budgets: dict, e: dict, c: dict, value: float | None, out: Outcome) ->
     return 'ok'
 
 
-def verdict(budgets: dict, results: dict, remeasured: dict) -> Outcome:
+def verdict(budgets: dict, results: dict, remeasured: dict, decided: dict | None = None) -> Outcome:
     """Fail each cell compare sent to re-measure that its six reps, its first
     three and the three re-measured, still hold off its budget: a gated cell
-    whose median is over it, an exact count whose middle reps are not it."""
-    out = compare(budgets, results)
+    whose median is over it, an exact count whose middle reps are not it.
+    decided is compare's remeasure.json: its accepted slowdowns, its stale keys, the
+    extension units (judge_extension) and the plan patterns both branches hold, which
+    excuse a retired cell the extension measured (retired_measured). An exact count off
+    its budget, or on a stale key, fails, and is recorded for the measured file when its
+    reps all agree."""
+    decided = decided or {}
+    accepted = accepted_cells(decided.get('accepted', []))
+    stale = {key(k) for k in decided.get('stale', [])}
+    out = compare(budgets, results, accepted=accepted)
+    # A measured file of another runner is one load_source refuses, so nothing is recorded.
+    if out.runner_mismatch:
+        stale = set()
+    out.remeasure = with_stale(out.remeasure, results.get('cells', []), stale)
     entries = {key(e): e for e in budgets.get('budgets', [])}
     again = {key(c): c for c in remeasured.get('cells', [])}
+    judged_keys = set()
     for c in out.remeasure:
         name = key_text(key(c))
+        judged_keys.add(key(c))
         more = again.get(key(c))
         if more is None or not more.get('reps'):
             out.failures.append(f'{name}: listed for a re-measure but no reps came back')
             continue
         six = [*c['reps'], *more['reps']]
-        budget = entries[key(c)]['budget']
-        if entries[key(c)]['tier'] == 'exact':
+        e = entries[key(c)]
+        if e['tier'] == 'exact':
             judged = middle(six)
-            if any(r != budget for r in judged):
-                out.failures.append(f'{name}: six reps {six} hold off its exact budget {budget}')
+            exact_judgement(e, c, six, judged, stale=key(c) in stale, out=out)
         else:
+            budget, _ = gated_budget(budgets, e, [c, more], accepted)
             judged = [statistics.median(six)]
             if judged[0] > budget:
                 out.failures.append(
                     f'{name}: median of six {judged[0]} is over its budget {budget} ({six})'
                 )
+            for s in out.slower:
+                if key(s['cell']) == key(c):
+                    s['value'] = judged[0]
         out.six.append({'cell': c, 'reps': six, 'judged': judged})
+    first = {key(c): c for c in results.get('cells', [])}
+    if not out.runner_mismatch:
+        judge_extension(entries, first, again, decided.get('extend', []), stale, out)
+    units = planned_windows(decided.get('extend', []))
+    extended = [c for k, c in again.items() if k not in first and planned(units, c)]
+    out.failures += retired_measured(budgets, extended, decided.get('reported', []))
+    judged_keys |= {key(r['cell']) for r in out.rows}
+    for k in sorted(stale - judged_keys):
+        out.failures.append(
+            f'{key_text(k)}: compare found its value stale, and no shard measured it again'
+        )
     return out
+
+
+def with_stale(cells: list[dict], measured: Iterable[dict], stale: set) -> list[dict]:
+    """cells with each measured cell of a stale key appended once: a stale value is
+    re-measured like a red one, so the verdict that records it always runs."""
+    listed = {key(c) for c in cells}
+    return [*cells, *(c for c in measured if key(c) in stale and key(c) not in listed)]
+
+
+def exact_judgement(
+    e: dict, c: dict, reps: list, judged: list, *, stale: bool, out: Outcome
+) -> None:
+    """Fail an exact count whose judged values are off its budget, or are on a stale
+    key. Only reps that all agree are recorded, since a value they disagree on would
+    become an exact budget that flaps; a stale key whose judged values are its budget is
+    recorded at it, which moves no budget."""
+    name, budget = key_text(key(c)), e['budget']
+    on_budget = all(v == budget for v in judged)
+    if not stale and on_budget:
+        return
+    if len(set(reps)) == 1 or on_budget:
+        value = reps[0] if len(set(reps)) == 1 else budget
+        out.recorded.append({'cell': c, 'budget': budget, 'value': value, 'reps': reps})
+        why = 'is stale' if value == budget else f'hold off its exact budget {budget}'
+        out.failures.append(f'{name}: reps {reps} {why}; check in the measured file this run wrote')
+    else:
+        out.failures.append(
+            f'{name}: reps {reps} disagree (exact budget {budget}), so no exact value can be '
+            'recorded and the cell may no longer be exact'
+        )
+
+
+def judge_extension(
+    entries: dict, first: dict, again: dict, extend: list, stale: set, out: Outcome
+) -> None:
+    """The cells of compare's extension units, which the first measure did not plan: an
+    exact one on its three reps' middle, a gated one reported only, and an exact entry
+    of them no shard measured fails."""
+    units = planned_windows(extend)
+    for k, c in again.items():
+        if k in first or not planned(units, c):
+            continue
+        e = entries.get(k)
+        value = statistics.median(c['reps']) if c.get('reps') else None
+        status = 'reported'
+        if e is None or e['tier'] != 'exact':
+            out.reported.append(c)
+        elif c.get('kind') != 'count' or value is None:
+            out.failures.append(f'{key_text(k)}: an exact entry needs a count of reps')
+            status = 'failed'
+        else:
+            before = len(out.failures)
+            exact_judgement(e, c, list(c['reps']), middle(c['reps']), stale=k in stale, out=out)
+            status = 'failed' if len(out.failures) > before else 'ok'
+        out.rows.append({'cell': c, 'entry': e, 'value': value, 'status': status})
+    out.failures.extend(
+        f'{key_text(k)}: an exact entry of the extension that no shard measured'
+        for k, e in entries.items()
+        if e.get('tier') == 'exact' and planned(units, e) and k not in again and k not in first
+    )
+
+
+def unmeasured_accepted(accepted: dict, out: Outcome) -> list[str]:
+    """A notice for each accepted slowdown of a cell compare measured no rep of, since
+    only judge() on a measured cell lists the others."""
+    measured = {key(r['cell']) for r in out.rows}
+    return [
+        f'{key_text(k)}: accepted/{a["file"]} gives budget {a["budget"]} ({a["reason"]}); '
+        'this run did not measure the cell'
+        for k, a in sorted(accepted.items())
+        if k not in measured
+    ]
+
+
+def accepted_cells(found: list) -> dict:
+    """compare's accepted list as {key: {budget, reason, file}}."""
+    return {
+        key(a): {'budget': a['budget'], 'reason': a['reason'], 'file': a['file']} for a in found
+    }
+
+
+def record(
+    out: Outcome,
+    *,
+    repo: str,
+    commit: str,
+    measured_sha: str,
+    run_id: str,
+    run_attempt: str,
+    run_url: str,
+    workflow_repository: str,
+    cpu_models: list[str],
+) -> dict:
+    """The measured file of the counts a verdict recorded: what --take checks in and
+    measured_provenance holds an entry to. commit is the pull request head."""
+    return {
+        'schema': SCHEMA,
+        'kind': 'measured',
+        'repo': repo,
+        'commit': commit,
+        'measured_sha': measured_sha,
+        'runner': out.runner,
+        'run_id': str(run_id),
+        'run_attempt': str(run_attempt),
+        'run_url': run_url,
+        'workflow_repository': workflow_repository,
+        'cpu_models': sorted(cpu_models),
+        'cells': [
+            {**key_dict(key(r['cell'])), 'value': r['value'], 'reps': r['reps']}
+            for r in sorted(out.recorded, key=lambda r: key(r['cell']))
+        ],
+    }
+
+
+def table(title: str | None, head: tuple, rows: Iterable[tuple]) -> list[str]:
+    """A Markdown table under its heading, or no lines when rows is empty. A `|` in a
+    value is escaped, since a reason or a refusal can hold one."""
+    body = ['| ' + ' | '.join(str(v).replace('|', '\\|') for v in row) + ' |' for row in rows]
+    if not body:
+        return []
+    heading = [f'### {title}', ''] if title else []
+    return [*heading, '| ' + ' | '.join(head) + ' |', '|' + '---|' * len(head), *body, '']
+
+
+def take_steps(m: MeasuredAs | None) -> str:
+    """How the recorded counts reach budgets.json: from measured file m, or, when the run
+    wrote none, from the pull request's own run."""
+    lead = 'Each count below moved, or its checked-in source no longer holds. '
+    if m is None:
+        return lead + (
+            'This run wrote no signed measured file: a merge queue run measures no pull '
+            'request head, and a pull request from a fork gets no id token. Take the counts '
+            'from a run of the head on a branch of the repository.'
+        )
+    return lead + (
+        f'Take them: `gh run download {m.run_id} -R {m.repository} -n {m.artifact} '
+        f'-D tests/perf/sources`, then, in a cplieger/ci checkout at {m.workflow_sha} '
+        f'as `<ci>`, `python3 <ci>/scripts/perf_gate.py --take tests/perf/sources/{m.stem}.json '
+        "--budgets tests/perf/budgets.json --reason '<why it moved>'`, and commit both."
+    )
 
 
 def summary(budgets: dict, out: Outcome) -> str:
@@ -360,9 +634,54 @@ def summary(budgets: dict, out: Outcome) -> str:
             ),
             '',
         ]
-    for title, items in (('Failures', out.failures), ('Budgets that can come down', out.notices)):
+    for title, items in (('Failures', out.failures), ('Notices', out.notices)):
         if items:
             lines += [f'### {title}', '', *(f'- {i}' for i in items), '']
+    lines += table(
+        'Exact counts this pull request moves',
+        ('Cell', 'Base', 'Head', 'Source', 'Reason', 'Check'),
+        (
+            (
+                key_text(m['key']),
+                m['base'],
+                m['head'],
+                m['source'],
+                m['reason'],
+                '; '.join(m['refused']) or 'accepted',
+            )
+            for m in out.exact_moves
+        ),
+    )
+    lines += table(
+        'Cells this pull request retires',
+        ('Cell', 'Tier', 'Reason'),
+        ((key_text(r['key']), r['tier'], r['reason']) for r in out.retires),
+    )
+    if out.recorded:
+        lines += ['### Measured moves to check in', '', take_steps(out.measured_as), '']
+        lines += table(
+            None,
+            ('Cell', 'Budget', 'Measured', 'Reps judged'),
+            (
+                (key_text(key(r['cell'])), r['budget'], r['value'], ', '.join(map(str, r['reps'])))
+                for r in out.recorded
+            ),
+        )
+    lines += table(
+        'Slower on purpose',
+        ('Cell', 'Budget', 'Accepted budget', 'Median', 'Reason', 'File'),
+        (
+            (
+                key_text(key(s['cell'])),
+                s['budget'],
+                s['accepted'],
+                s['value'],
+                s['reason'],
+                f'accepted/{s["file"]}',
+            )
+            for s in out.slower
+        ),
+    )
     if out.six:
         lines += [
             '### Re-measured',
@@ -385,7 +704,8 @@ def summary(budgets: dict, out: Outcome) -> str:
     ]
     for r in out.rows:
         e = r['entry'] or {}
-        target = e.get('target', '')
+        target = file_target(budgets, r['cell']['metric'])
+        target = '' if target is None else target
         flag = ' (over target)' if key(r['cell']) in over else ''
         lines.append(
             f'| {key_text(key(r["cell"]))} | {e.get("tier", "none")} | {r["value"]} '
@@ -471,13 +791,14 @@ def calibrate(
     runner: str,
     run_id: str,
     run_url: str,
+    reported: list[dict] | None = None,
 ) -> dict:
-    """The proposed budget file of `runs` measurements of one commit. Only a
-    file of at least ten runs carries a tier, a widened headroom and
-    `whole_pr`; a smaller one re-measures baselines."""
-    if not runs:
-        raise ValueError('calibrate: no runs')
+    """The calibration file of TIER_RUNS or more measurements of one commit: each cell's
+    baseline, tier and widened headroom, and `whole_pr`. A cell a `reported` pattern of
+    plan.json names (reported_patterns) is reported whatever its reps."""
     n = len(runs)
+    if n < TIER_RUNS:
+        raise ValueError(f'calibrate: a calibration needs {TIER_RUNS} runs, not {n}')
     found: dict[tuple, list[dict]] = {}
     for run in runs:
         for c in run.get('cells', []):
@@ -496,12 +817,16 @@ def calibrate(
             'spread': spread(medians),
             'reps_by_run': reps_by_run,
         }
-        if n >= TIER_RUNS:
+        if plan_reports(reported or [], cell):
+            cell['tier'] = 'reported'
+        else:
             complete = len(reps_by_run) == n and cell['kind'] != 'mixed'
             decide_tier(cell, reps_by_run, complete, headroom, floor, whole)
         cells.append(cell)
-    doc = {
-        'schema': 1,
+    whole['first_stage_runs'] = sorted(whole['first_stage_runs'])
+    return {
+        'schema': SCHEMA,
+        'kind': 'calibration',
         'repo': repo,
         'commit': commit,
         'runner': runner,
@@ -513,11 +838,8 @@ def calibrate(
         'floor': floor,
         'seconds': seconds_per_cell(runs),
         'cells': cells,
+        'whole_pr': whole,
     }
-    if n >= TIER_RUNS:
-        whole['first_stage_runs'] = sorted(whole['first_stage_runs'])
-        doc['whole_pr'] = whole
-    return doc
 
 
 def cpu_models(runs: list[dict]) -> set[str]:
@@ -596,14 +918,56 @@ def has_line_break(x: object) -> bool:
     return False
 
 
-def check_plan(budgets: dict, doc: dict) -> list[str]:
+def reported_patterns(doc: dict) -> tuple[list[dict], list[str]]:
+    """plan.json's `reported`: the {metric, window?} patterns of cells the consumer never
+    gates, and an error line for each item that is no such pattern."""
+    found = doc.get('reported', [])
+    if not isinstance(found, list):
+        return [], ['plan.json: reported must be a list of {metric, window} patterns']
+    patterns, errors = [], []
+    for i, p in enumerate(found):
+        named = isinstance(p, dict) and set(p) <= {'metric', 'window'} and 'metric' in p
+        if not named or not all(isinstance(v, str) and v for v in p.values()):
+            errors.append(f'plan.json: reported[{i}] is not a {{metric, window}} pattern: {p!r}')
+        else:
+            patterns.append(p)
+    return patterns, errors
+
+
+def base_plan(git: Git, base_sha: str, path: str) -> dict:
+    """plan.json as base_sha's tree holds it at path, {} when it holds none."""
+    if not git.has(base_sha, path):
+        return {}
+    doc = loads(git.show(base_sha, path))
+    if not isinstance(doc, dict):
+        raise TypeError(f'{path} at {base_sha} is not a JSON object')
+    return doc
+
+
+def held_patterns(head: dict, base: dict) -> list[dict]:
+    """The `reported` patterns of plan head that plan base lists too: a pattern decides a
+    tier only once it is on the base branch, so a pull request cannot demote a class by
+    adding one, and the next scheduled calibration applies it."""
+    found, _ = reported_patterns(base)
+    return [p for p in reported_patterns(head)[0] if p in found]
+
+
+def plan_reports(patterns: list[dict], c: dict) -> bool:
+    return any(
+        p['metric'] == c['metric'] and p.get('window', c['window']) == c['window'] for p in patterns
+    )
+
+
+def check_plan(budgets: dict, doc: dict, *, reported: list[dict]) -> list[str]:
     """A gated or exact entry whose unit and window no set of RUN_SETS lists
-    leaves the gate unmeasured, so it fails unless `retired` names its key.
-    A set or cell of any set that is not an object is an error line."""
+    leaves the gate unmeasured, so it fails; one of a cell a pattern of reported
+    (held_patterns) matches fails. A set or cell of any set that is not an object,
+    and a `reported` item of doc that is no pattern, is an error line."""
     sets = doc.get('sets', {})
     if not isinstance(sets, dict):
         return ['plan.json: sets must be an object of named sets']
-    errors, cells = [], []
+    patterns, errors = reported, reported_patterns(doc)[1]
+    cells = []
     for name, spec in sets.items():
         if not isinstance(spec, dict):
             errors.append(f'plan.json: set {name} must be an object')
@@ -620,15 +984,37 @@ def check_plan(budgets: dict, doc: dict) -> list[str]:
             elif name in RUN_SETS:
                 cells.append(u)
     units = planned_windows(cells)
-    retired = {key(r) for r in budgets.get('retired', []) if all(f in r for f in KEY_FIELDS)}
-    return errors + [
-        f'{key_text(key(e))}: a {e["tier"]} entry no set of plan.json measures '
-        f'({", ".join(RUN_SETS)}), and retired does not name it'
+    gating = [
+        e
         for e in budgets.get('budgets', [])
-        if e.get('tier') != 'reported'
-        and all(f in e for f in KEY_FIELDS)
-        and not planned(units, e)
-        and key(e) not in retired
+        if e.get('tier') != 'reported' and all(f in e for f in KEY_FIELDS)
+    ]
+    return (
+        errors
+        + [
+            f'{key_text(key(e))}: a {e["tier"]} entry no set of plan.json measures '
+            f'({", ".join(RUN_SETS)}); remove it and name it in retired'
+            for e in gating
+            if not planned(units, e)
+        ]
+        + [
+            f'{key_text(key(e))}: plan.json reports this cell, so its entry is reported, '
+            f'not {e["tier"]}'
+            for e in gating
+            if plan_reports(patterns, e)
+        ]
+    )
+
+
+def retired_measured(budgets: dict, cells: Iterable[dict], patterns: list[dict]) -> list[str]:
+    """A retired key a shard measured fails: the scheduled calibration tiers every measured
+    cell, but one a pattern of patterns (held_patterns) matches, whose tier is the plan's."""
+    retired = {key(r) for r in budgets.get('retired', [])}
+    return [
+        f"{key_text(key(c))}: retired, yet a shard measured it; a measured cell's tier is the "
+        "scheduled calibration's"
+        for c in cells
+        if key(c) in retired and not plan_reports(patterns, c)
     ]
 
 
@@ -660,23 +1046,7 @@ def plan(
     units = spec.get('cells') or []
     if not units or not isinstance(units, list):
         raise ValueError(f'set {set_name} lists no cells')
-    seen = set()
-    for u in units:
-        if not isinstance(u, dict):
-            raise TypeError(f'set {set_name}: a cell must be an object, not {u!r}')
-        # Cell fields reach $GITHUB_OUTPUT and the job's shell.
-        if has_line_break(u):
-            raise ValueError(f'set {set_name}: a cell field holds a line break: {u!r}')
-        k = tuple(u.get(f) for f in UNIT_FIELDS)
-        if not all(isinstance(x, str) and x for x in k):
-            raise ValueError(f'set {set_name}: a cell needs {", ".join(UNIT_FIELDS)}: {u}')
-        if k in seen:
-            raise ValueError(f'set {set_name}: {key_text(k)} is listed twice')
-        seen.add(k)
-        if not is_number(u.get('seconds')) or u['seconds'] <= 0:
-            raise ValueError(f'set {set_name}: {key_text(k)} needs its seconds per cell')
-        if windows_error(u):
-            raise ValueError(f'set {set_name}: {key_text(k)}: {windows_error(u)}')
+    check_units(f'set {set_name}', units)
     if only:
         missing = sorted(set(only) - {u['scenario'] for u in units})
         if missing:
@@ -689,7 +1059,12 @@ def plan(
         raise ValueError(f'plan.json: node {node!r} holds a line break')
     if remeasure is not None:
         wanted = {tuple(c[f] for f in UNIT_FIELDS) for c in remeasure.get('cells', [])}
-        units = [u for u in units if tuple(u[f] for f in UNIT_FIELDS) in wanted]
+        extend = remeasure.get('extend', [])
+        check_units('extend', extend)
+        # An extension unit measures every window of a unit the set lists only some of.
+        chosen = {unit_key(u): u for u in units if unit_key(u) in wanted}
+        chosen.update((unit_key(u), u) for u in extend)
+        units = list(chosen.values())
     count = min(shards, len(units))
     bins: list[list[dict]] = [[] for _ in range(count)]
     load = [0.0] * count
@@ -713,6 +1088,46 @@ def plan(
     }
 
 
+def check_units(label: str, units: list) -> None:
+    """Raise on a unit plan() cannot shard: not an object, a line break, a missing key
+    field, a unit listed twice, no positive seconds, or a bad windows list."""
+    seen = set()
+    for u in units:
+        if not isinstance(u, dict):
+            raise TypeError(f'{label}: a cell must be an object, not {u!r}')
+        # Cell fields reach $GITHUB_OUTPUT and the job's shell.
+        if has_line_break(u):
+            raise ValueError(f'{label}: a cell field holds a line break: {u!r}')
+        k = unit_key(u)
+        if not all(isinstance(x, str) and x for x in k):
+            raise ValueError(f'{label}: a cell needs {", ".join(UNIT_FIELDS)}: {u}')
+        if k in seen:
+            raise ValueError(f'{label}: {key_text(k)} is listed twice')
+        seen.add(k)
+        if not is_number(u.get('seconds')) or u['seconds'] <= 0:
+            raise ValueError(f'{label}: {key_text(k)} needs its seconds per cell')
+        if windows_error(u):
+            raise ValueError(f'{label}: {key_text(k)}: {windows_error(u)}')
+
+
+def extension(doc: dict, units: dict, scenarios: set[str]) -> list[dict]:
+    """The full set's units of scenarios that units (planned_windows of the set compare
+    judged) leaves some window of: a count a change moves at one scale or width moves at
+    the others, which the pr set does not measure."""
+    full = doc.get('sets', {}).get('full') if isinstance(doc.get('sets'), dict) else None
+    if not isinstance(full, dict):
+        raise TypeError('plan.json has no full set to extend a re-measure from')
+    out = []
+    for u in full.get('cells') or []:
+        if not isinstance(u, dict) or u.get('scenario') not in scenarios:
+            continue
+        have = units.get(unit_key(u), set())
+        if have is None or (u.get('windows') is not None and set(u['windows']) <= have):
+            continue
+        out.append(dict(u))
+    return out
+
+
 def bench(results: dict) -> list[dict]:
     """Each measured cell's median as a github-action-benchmark
     `customSmallerIsBetter` point."""
@@ -731,145 +1146,551 @@ def bench(results: dict) -> list[dict]:
 # --- provenance ------------------------------------------------------------
 
 
+@dataclasses.dataclass(frozen=True)
+class Signer:
+    """The certificate a keyless bundle must carry: an exact identity or a pattern of one,
+    and the repository whose workflow run requested it when set."""
+
+    identity: str | None = None
+    identity_regexp: str | None = None
+    workflow_repository: str | None = None
+
+
+# Any public repository can call perf-calibrate.yaml, and its run's certificate names the
+# same workflow ref, so only the workflow repository says the run was cplieger/ci's.
+CALIBRATION_SIGNER = Signer(identity=CALIBRATION_IDENTITY, workflow_repository=CI_REPO)
+
+
+@dataclasses.dataclass(frozen=True)
+class Source:
+    """The signed file an entry's source URL names: `kind` calibration (a perf-calibrate
+    run, `<run id>.json`) or measured (a perf-ci run attempt, `<run id>-<attempt>.json`)."""
+
+    kind: str
+    repository: str
+    run_id: str
+    attempt: str
+    url: str
+
+    @property
+    def stem(self) -> str:
+        return self.run_id if self.kind == 'calibration' else f'{self.run_id}-{self.attempt}'
+
+    @property
+    def label(self) -> str:
+        return f'{"calibration" if self.kind == "calibration" else "measured file"} {self.stem}'
+
+
+def parse_source(url: object) -> Source | None:
+    if not isinstance(url, str):
+        return None
+    if m := CALIBRATION_RE.match(url):
+        return Source('calibration', CI_REPO, m[1], '', url)
+    if m := MEASURED_RE.match(url):
+        return Source('measured', m[1], m[2], m[3], url)
+    return None
+
+
+class Curable(str):
+    """A refusal a measured file of this head cures, so its exact entry is stale: a
+    measured file's content, a source made for another change or a pull request, a
+    superseded entry or a hand-edited value. A bundle that does not verify, or git
+    failing, is no such refusal: re-measuring cures neither."""
+
+    __slots__ = ()
+
+
+@dataclasses.dataclass
+class Loaded:
+    """A source file that verified, with the commit placed_commit put it at and its cells."""
+
+    source: Source
+    doc: dict
+    at: str
+    cells: dict
+
+
+@dataclasses.dataclass
+class Checked:
+    """check_provenance's answer. stale: exact entries of an exact base entry refused for
+    a Curable reason. accepted: each gated cell an accepted file slows on purpose,
+    {key: {budget, reason, file}}. moves: each exact entry whose value differs from its
+    exact base entry, {key, base, head, source, reason, refused}, refused the provenance
+    errors of that entry. retires: each gated or exact base entry the head retires,
+    {key, tier, reason}."""
+
+    errors: list[str]
+    stale: set
+    accepted: dict
+    moves: list[dict]
+    retires: list[dict]
+
+
 def check_provenance(
     head: dict,
     base: dict,
     *,
-    calibrations: pathlib.Path,
+    sources: pathlib.Path,
+    accepted: pathlib.Path | None,
     repo: str,
     head_sha: str,
-    verify: Callable[[pathlib.Path, pathlib.Path], str | None],
+    base_sha: str,
+    verify: Callable[[pathlib.Path, pathlib.Path, Signer], str | None],
     git: Git,
-) -> list[str]:
-    """Every entry the head adds or whose baseline, budget, tier, headroom or
-    source differs from the base must match a signed calibration file, every
-    entry when the file's runner, headroom or floor differs; every entry comes
-    from the newest checked-in calibration of its cell (superseded_entries); a
-    gated or exact entry leaves only through `retired`; every calibration file
-    is named by an entry."""
+) -> Checked:
+    """The provenance of head against base. Every source an entry names must load
+    (load_source) and list its cell; an entry the head adds or whose baseline, budget,
+    tier, headroom or source differs from the base, every entry when the file's runner,
+    headroom, floor or target differs, must match it (entry_provenance); every entry
+    comes from the newest source of its cell (superseded_entries) and from none older than
+    its base entry's (moves_to_older); a gated or exact entry
+    leaves only through `retired`; every file under sources is named by an entry; and
+    every accepted file holds (load_accepted)."""
     errors = []
+    refused: dict[tuple, list[str]] = {}
     base_entries = {key(e): e for e in base.get('budgets', [])}
     head_entries = {key(e): e for e in head.get('budgets', [])}
     # The file-level maps sit outside CHANGE_FIELDS, and each changes how every entry gates.
-    moved = any(head.get(f) != base.get(f) for f in ('headroom', 'floor'))
+    moved = any(head.get(f) != base.get(f) for f in ('headroom', 'floor', 'target'))
     file_edit = moved or head.get('runner') != base.get('runner')
-    files: dict[str, tuple[dict | None, str | None]] = {}
-    named = set()
-    unchanged = set()
+    named: dict[str, Source] = {}
+    for e in head_entries.values():
+        src = parse_source(e.get('source'))
+        if src:
+            named.setdefault(src.stem, src)
+    loaded: dict[str, Loaded] = {}
+    unloaded: dict[str, str] = {}
+    base_places: dict[str, tuple[str | None, str | None]] = {}
+
+    def placed_at_base(src: Source) -> tuple[str | None, str | None]:
+        if src.stem not in base_places:
+            base_places[src.stem] = base_place(src, sources, git, base_sha)
+        return base_places[src.stem]
+
+    for stem, src in sorted(named.items()):
+        found = load_source(
+            src,
+            sources,
+            repo=repo,
+            runner=head.get('runner'),
+            head_sha=head_sha,
+            verify=verify,
+            git=git,
+        )
+        if isinstance(found, str):
+            unloaded[stem] = type(found)(f'{src.label}: {found}')
+            errors.append(unloaded[stem])
+        else:
+            loaded[stem] = found
     for k, e in head_entries.items():
-        m = SOURCE_RE.match(str(e.get('source', '')))
-        if m:
-            named.add(m.group(1))
-        b = base_entries.get(k)
-        if b is not None and not file_edit and all(e.get(f) == b.get(f) for f in CHANGE_FIELDS):
-            unchanged.add(k)
+        name, b = key_text(k), base_entries.get(k)
+        src = parse_source(e.get('source'))
+        if src is None:
+            refused[k] = [f'source {e.get("source")!r} is not a calibration or measured run URL']
+            errors.append(f'{name}: {refused[k][0]}')
             continue
-        name = key_text(k)
-        if not m:
-            errors.append(f'{name}: source {e.get("source")!r} is not a perf-calibrate run URL')
-            continue
-        run_id = m.group(1)
-        if run_id not in files:
-            files[run_id] = load_calibration(
-                run_id, calibrations, repo, head.get('runner'), head_sha, verify, git
-            )
-            if files[run_id][1]:
-                errors.append(files[run_id][1])
-        doc = files[run_id][0]
-        if doc is not None:
-            errors.extend(f'{name}: {x}' for x in entry_provenance(head, e, b, doc, moved))
+        mine = refused[k] = []
+        if 'reason' in e:
+            mine += reason_provenance(e, b, src, moved)
+        if src.stem in loaded:
+            changed = b is None or file_edit or any(e.get(f) != b.get(f) for f in CHANGE_FIELDS)
+            mine += entry_provenance(e, b, loaded[src.stem], changed, moved, base_sha, git)
+            mine += moves_to_older(e, b, loaded[src.stem], placed_at_base, git)
+        errors.extend(f'{name}: {x}' for x in mine)
+        if src.stem not in loaded:
+            # errors holds the source's own line once; the entry's refusals still name it.
+            mine.append(unloaded[src.stem])
     retired = {key(r): r for r in head.get('retired', []) if all(f in r for f in KEY_FIELDS)}
-    for k, b in base_entries.items():
+    retires = []
+    for k, b in sorted(base_entries.items()):
         if k in head_entries or b.get('tier') == 'reported':
             continue
-        if not str(retired.get(k, {}).get('reason', '')).strip():
+        reason = str(retired.get(k, {}).get('reason', '')).strip()
+        if reason:
+            retires.append({'key': k, 'tier': b.get('tier'), 'reason': reason})
+        else:
             errors.append(f'{key_text(k)}: a {b.get("tier")} entry left without a retired reason')
-    if calibrations.is_dir():
-        for p in sorted(calibrations.iterdir()):
-            stem = p.name.removesuffix('.sigstore.json').removesuffix('.json')
-            if stem == p.name:
-                errors.append(f'{p.name}: not a calibration file or bundle')
-            elif stem not in named:
-                errors.append(f'{p.name}: no budget entry names calibration run {stem}')
-    errors += superseded_entries(
-        head_entries, unchanged, calibrations, git, head_sha, {r for r, f in files.items() if f[1]}
-    )
-    return errors
+    if sources.is_dir():
+        for p in sorted(sources.iterdir()):
+            m = SOURCE_FILE_RE.match(p.name)
+            if m is None:
+                errors.append(f'{p.name}: not a source file or bundle')
+            elif m[1] not in named:
+                errors.append(f'{p.name}: no budget entry names source {m[1]}')
+    for k, why in superseded_entries(head_entries, loaded, git):
+        refused.setdefault(k, []).append(why)
+        errors.append(f'{key_text(k)}: {why}')
+    slower, why = load_accepted(accepted, head_entries, loaded, head_sha, git)
+    errors += why
+    stale = {
+        k
+        for k, why in refused.items()
+        if any(isinstance(w, Curable) for w in why)
+        and head_entries[k]['tier'] == 'exact'
+        and base_entries.get(k, {}).get('tier') == 'exact'
+    }
+    moves = [
+        {
+            'key': k,
+            'base': base_entries[k]['baseline'],
+            'head': e['baseline'],
+            'source': e['source'],
+            'reason': e.get('reason', ''),
+            'refused': refused.get(k, []),
+        }
+        for k, e in sorted(head_entries.items())
+        if e['tier'] == 'exact'
+        and base_entries.get(k, {}).get('tier') == 'exact'
+        and e['baseline'] != base_entries[k].get('baseline')
+    ]
+    return Checked(errors, stale, slower, moves, retires)
+
+
+ACCEPTED_FIELDS = ('reason', 'cells')
+ACCEPTED_CELL_FIELDS = (*KEY_FIELDS, 'budget')
+
+
+def load_accepted(
+    directory: pathlib.Path | None,
+    entries: dict,
+    loaded: dict[str, Loaded],
+    head_sha: str,
+    git: Git,
+) -> tuple[dict, list[str]]:
+    """The accepted slowdowns under directory, {key: {budget, reason, file}}, and the
+    error of each file or cell that breaks the rule: `<name>.json` holding
+    {reason: one line, cells: [{six key fields, budget above 0}]}, each cell a gated entry
+    of entries and in one file. A cell a loaded calibration measured at a commit holding
+    the commit that added its file is absorbed, so it is an error and no slowdown."""
+    found: dict[tuple, dict] = {}
+    errors: list[str] = []
+    if directory is None or not directory.is_dir():
+        return found, errors
+    for p in sorted(directory.iterdir()):
+        label = f'accepted/{p.name}'
+        reason, cells, why = accepted_file(p)
+        if why:
+            errors.append(f'{label}: {why}')
+            continue
+        at = None
+        for c in cells:
+            k, name = key(c), key_text(key(c))
+            if entries.get(k, {}).get('tier') != 'gated':
+                errors.append(f'{label}: {name}: has no gated entry')
+            elif k in found:
+                errors.append(f'{label}: {name}: also accepted by accepted/{found[k]["file"]}')
+            else:
+                try:
+                    at = at or git.added_by(str(p), head_sha)
+                    absorbed = absorbed_by(k, at, loaded, git)
+                except GitError as exc:
+                    errors.append(f'{label}: {exc}')
+                    break
+                if absorbed:
+                    errors.append(
+                        f'{label}: {name}: {absorbed.source.label} measured this cell at '
+                        f'{absorbed.at}, which holds the override; delete {label}'
+                    )
+                else:
+                    found[k] = {'budget': c['budget'], 'reason': reason, 'file': p.name}
+    return found, errors
+
+
+def accepted_file(p: pathlib.Path) -> tuple[str, list[dict], str | None]:
+    """The reason and cells of accepted file p, or why it is not one."""
+    if not p.is_file() or not p.name.endswith('.json'):
+        return '', [], 'not an accepted file, a <name>.json'
+    try:
+        doc = loads(p.read_text())
+    except (OSError, ValueError) as exc:
+        return '', [], str(exc)
+    if not isinstance(doc, dict):
+        return '', [], 'must be a JSON object'
+    unknown = [f for f in doc if f not in ACCEPTED_FIELDS]
+    if unknown:
+        return '', [], f'unknown field {", ".join(unknown)}'
+    r = doc.get('reason')
+    if not isinstance(r, str) or not r.strip() or has_line_break(r):
+        return '', [], f'reason must be one non-empty line, not {r!r}'
+    cells = doc.get('cells')
+    if not isinstance(cells, list) or not cells:
+        return r, [], 'cells must be a non-empty list of cells'
+    for i, c in enumerate(cells):
+        if not isinstance(c, dict) or any(not isinstance(c.get(f), str) for f in KEY_FIELDS):
+            return r, [], f'cells[{i}] does not name a cell by {", ".join(KEY_FIELDS)}'
+        name = key_text(key(c))
+        unknown = [f for f in c if f not in ACCEPTED_CELL_FIELDS]
+        if unknown:
+            return r, [], f'{name}: unknown field {", ".join(unknown)}'
+        if not is_number(c.get('budget')) or c['budget'] <= 0:
+            return r, [], f'{name}: budget {c.get("budget")!r} is not a number above 0'
+    return r, cells, None
+
+
+def absorbed_by(k: tuple, at: str, loaded: dict[str, Loaded], git: Git) -> Loaded | None:
+    """A loaded calibration that measured cell k at a commit holding at, if any."""
+    for s in loaded.values():
+        if s.source.kind == 'calibration' and k in s.cells and git.is_ancestor(at, s.at):
+            return s
+    return None
+
+
+def load_source(
+    src: Source,
+    directory: pathlib.Path,
+    *,
+    repo: str,
+    runner: object,
+    head_sha: str,
+    verify: Callable[[pathlib.Path, pathlib.Path, Signer], str | None],
+    git: Git,
+) -> Loaded | str:
+    """src's checked-in file, once its bundle verifies for the workflow that signs its kind,
+    it names this repository, runner and run, and placed_commit puts it in head's history;
+    else why not, Curable for what a fresh measured file replaces."""
+
+    def refuse(why: str) -> str:
+        return Curable(why) if src.kind == 'measured' else why
+
+    blob = directory / f'{src.stem}.json'
+    bundle = directory / f'{src.stem}.sigstore.json'
+    if not blob.is_file() or not bundle.is_file():
+        return refuse(f'{blob.name} and {bundle.name} must both be checked in')
+    try:
+        doc = load(blob)
+    except (OSError, ValueError, TypeError) as exc:
+        return refuse(str(exc))
+    cells, why = source_cells(doc, src.kind)
+    if why:
+        return refuse(why)
+    if src.kind == 'measured':
+        for field, want in (('kind', 'measured'), ('schema', SCHEMA)):
+            if doc.get(field) != want:
+                return refuse(f'{field} is {doc.get(field)!r}, not {want!r}')
+        signed_in = doc.get('workflow_repository')
+        if signed_in not in (repo, CI_REPO):
+            return refuse(f'workflow_repository is {signed_in!r}, not {repo} or {CI_REPO}')
+        signer = Signer(identity_regexp=MEASURED_IDENTITY, workflow_repository=signed_in)
+        url = f'https://github.com/{signed_in}/actions/runs/{src.run_id}/attempts/{src.attempt}'
+        fields = (('run_id', src.run_id), ('run_attempt', src.attempt), ('run_url', url))
+    else:
+        signer = CALIBRATION_SIGNER
+        fields = (('run_id', src.run_id), ('run_url', src.url))
+    failure = verify(blob, bundle, signer)
+    if failure:
+        return f'the bundle does not verify: {failure}'
+    for field, want in (*fields, ('repo', repo), ('runner', runner)):
+        if str(doc.get(field)) != str(want):
+            return refuse(f'{field} is {doc.get(field)!r}, not {want!r}')
+    runs = doc.get('runs')
+    if src.kind == 'calibration' and not (is_number(runs) and runs >= TIER_RUNS):
+        return f'{runs} runs decide no tier; a calibration needs {TIER_RUNS}'
+    at, why = placed_commit(doc, blob, git, head_sha)
+    return why if at is None else Loaded(src, doc, at, cells)
+
+
+def source_cells(doc: dict, kind: str) -> tuple[dict, str | None]:
+    """A source doc's cells by key, or why they are not cells: a measured cell needs its value."""
+    cells = doc.get('cells')
+    if not isinstance(cells, list):
+        return {}, 'cells is not a list'
+    out = {}
+    for i, c in enumerate(cells):
+        if not isinstance(c, dict) or any(not isinstance(c.get(f), str) for f in KEY_FIELDS):
+            return {}, f'cells[{i}] does not name a cell by {", ".join(KEY_FIELDS)}'
+        if kind == 'measured' and not is_number(c.get('value')):
+            return {}, f'cells[{i}]: value {c.get("value")!r} is not a number'
+        out[key(c)] = c
+    return out, None
+
+
+def entry_provenance(
+    e: dict,
+    b: dict | None,
+    found: Loaded,
+    changed: bool,
+    file_moved: bool,
+    base_sha: str,
+    git: Git,
+) -> list[str]:
+    """Why entry e, b its base entry, does not come from source found: the source lists its
+    cell, and a changed entry matches it (measured_provenance, calibration_provenance)."""
+    src, c = found.source, found.cells.get(key(e))
+    if c is None:
+        return [f'{src.label} did not measure this cell']
+    # A stem names one run attempt, and the URL's repository is the part it leaves out.
+    if src.kind == 'measured' and e['source'] != found.doc['run_url']:
+        return [
+            (
+                f'source {e["source"]} is not the run that wrote {src.stem}.json, '
+                f'{found.doc["run_url"]}'
+            )
+        ]
+    if not changed:
+        return []
+    if src.kind == 'measured':
+        return measured_provenance(e, b, src, c)
+    return calibration_provenance(e, b, found, c, file_moved, base_sha, git)
+
+
+def measured_provenance(e: dict, b: dict | None, src: Source, c: dict) -> list[str]:
+    """A measured file moves the value of an exact base entry to the value it measured, and
+    never adds an entry or moves a tier: those come from the scheduled calibration."""
+    if b is None:
+        return [f'{src.label} moves the value of an exact entry, and adds none']
+    if b.get('tier') != 'exact':
+        return [f'{src.label} moves the value of an exact entry, not a {b.get("tier")} one']
+    if e.get('baseline') != c['value']:
+        return [
+            Curable(
+                f'baseline {e.get("baseline")} is not what run {src.url} measured ({c["value"]}); '
+                'take the value with perf_gate.py --take'
+            )
+        ]
+    return []
+
+
+def calibration_provenance(
+    e: dict,
+    b: dict | None,
+    found: Loaded,
+    c: dict,
+    file_moved: bool,
+    base_sha: str,
+    git: Git,
+) -> list[str]:
+    """A changed entry takes baseline, tier and headroom from a calibration the base holds,
+    since only the default branch is calibrated. With file_moved (a headroom, floor or target
+    edit), a budget above the base's needs a `reason` even when its baseline did not rise."""
+    label = found.source.label
+    out = []
+    if e.get('baseline') != c.get('baseline'):
+        out.append(Curable(f"baseline {e.get('baseline')} is not {label}'s {c['baseline']}"))
+    if (e.get('tier'), e.get('headroom')) != (c.get('tier'), c.get('headroom')):
+        out.append(f'tier and headroom must be {c.get("tier")}, {c.get("headroom")} ({label})')
+    try:
+        if not git.is_ancestor(found.at, base_sha):
+            out.append(
+                Curable(
+                    f'{label} measured {found.at}, which the base {base_sha} does not hold; '
+                    'a calibration of a pull request moves no entry'
+                )
+            )
+    except GitError as exc:
+        out.append(str(exc))
+    raised = b is not None and is_number(b.get('budget')) and is_number(e.get('budget'))
+    if file_moved and raised and e['budget'] > b['budget']:
+        if not str(e.get('reason', '')).strip():
+            what = (
+                'raises its target and budget'
+                if family(e['metric']) == SERVER_CPU
+                else 'the file headroom or floor raises its budget'
+            )
+            out.append(f'{what} from {b["budget"]} to {e["budget"]} without a reason')
+    return out
+
+
+def reason_provenance(e: dict, b: dict | None, src: Source, file_moved: bool) -> list[str]:
+    """Why a gated calibration entry may not carry its reason: one the base entry does not
+    already carry is allowed only on a budget a file-level edit raises."""
+    if src.kind != 'calibration' or e['tier'] != 'gated':
+        return []
+    if b is not None and b.get('reason') == e['reason']:
+        return []
+    if file_moved and b is not None and is_number(b.get('budget')) and e['budget'] > b['budget']:
+        return []
+    return [
+        (
+            'a reason belongs on a measured value, or on a budget a headroom, floor or target '
+            'edit raises'
+        )
+    ]
 
 
 def superseded_entries(
-    entries: dict,
-    unchanged: set,
-    calibrations: pathlib.Path,
-    git: Git,
-    head_sha: str,
-    failed: set,
-) -> list[str]:
-    """Why an entry is not from the newest checked-in calibration of its cell, and why a
-    calibration cannot be placed in head's history; failed holds the run ids whose load
-    error the caller reported. placed_commit decides each file's place. Run ids order
-    dispatches, not commits, so only that place says which file is newer."""
-    errors: list[str] = []
-    placed: dict[str, tuple[str, set]] = {}
-    reported = set(failed)
-    if calibrations.is_dir():
-        for p in sorted(calibrations.glob('*.json')):
-            if p.stem.isdigit() and p.stem not in failed:
-                found = place_calibration(p, git, head_sha)
-                if isinstance(found, str):
-                    errors.append(f'calibration {p.stem}: {found}')
-                    reported.add(p.stem)
-                else:
-                    placed[p.stem] = found
+    entries: dict, loaded: dict[str, Loaded], git: Git
+) -> list[tuple[tuple, str]]:
+    """(key, why) for each entry not from the newest loaded source of its cell. Run ids
+    order dispatches, not commits, so only the place of each source in head's history
+    says which is newer."""
     newer = functools.cache(lambda old, new: old != new and git.is_ancestor(old, new))
+    errors = []
     for k, e in entries.items():
-        m = SOURCE_RE.match(str(e.get('source', '')))
-        if k in unchanged and not m:
-            errors.append(
-                f'{key_text(k)}: source {e.get("source")!r} is not a perf-calibrate run URL'
-            )
-        if not m or m.group(1) in reported:
+        src = parse_source(e.get('source'))
+        mine = loaded.get(src.stem) if src else None
+        if mine is None or k not in mine.cells:
             continue
-        if m.group(1) not in placed:
-            errors.append(f'{key_text(k)}: calibration {m.group(1)} is not checked in')
+        try:
+            later = [s for s in loaded.values() if k in s.cells and newer(mine.at, s.at)]
+            newest = [s for s in later if not any(newer(s.at, o.at) for o in later)]
+        except GitError as exc:
+            errors.append((k, str(exc)))
             continue
-        mine, cells = placed[m.group(1)]
-        if k in unchanged and k not in cells:
-            errors.append(f'{key_text(k)}: calibration {m.group(1)} did not measure this cell')
-        later = [r for r, (at, cs) in placed.items() if k in cs and newer(mine, at)]
-        newest = [r for r in later if not any(newer(placed[r][0], placed[o][0]) for o in later)]
         if newest:
             r = newest[0]
             errors.append(
-                f'{key_text(k)}: calibration {r} measured this cell at {placed[r][0]}, which '
-                f"descends from source {m.group(1)}'s {mine}; take the entry from {r}"
+                (
+                    k,
+                    Curable(
+                        f'{r.source.label} measured this cell at {r.at}, which descends from '
+                        f"source {mine.source.label}'s {mine.at}; "
+                        f'take the entry from {r.source.stem}'
+                    ),
+                )
             )
     return errors
 
 
-def place_calibration(path: pathlib.Path, git: Git, head_sha: str) -> tuple[str, set] | str:
-    """The commit in head's history whose code the calibration at path measured, and the
-    cells it measured; or why it has no such commit."""
+def base_place(
+    src: Source, sources: pathlib.Path, git: Git, base_sha: str
+) -> tuple[str | None, str | None]:
+    """(where placed_commit puts src's file in base_sha's tree, None), or (None, why not)."""
+    path = sources / f'{src.stem}.json'
     try:
-        doc = load(path)
-    except (OSError, ValueError, TypeError) as exc:
-        return str(exc)
-    cells = doc.get('cells')
-    if not isinstance(cells, list):
-        return 'cells is not a list'
-    keys = set()
-    for i, c in enumerate(cells):
-        if not isinstance(c, dict) or any(not isinstance(c.get(f), str) for f in KEY_FIELDS):
-            return f'cells[{i}] does not name a cell by {", ".join(KEY_FIELDS)}'
-        keys.add(key(c))
-    at, why = placed_commit(doc, path, git, head_sha)
-    return why if at is None else (at, keys)
+        doc = loads(git.show(base_sha, str(path)))
+    except (GitError, ValueError) as exc:
+        return None, str(exc)
+    if not isinstance(doc, dict):
+        return None, f'{path.name} is not a JSON object'
+    at, why = placed_commit(doc, path, git, base_sha)
+    return at, None if why is None else str(why)
+
+
+def moves_to_older(
+    e: dict,
+    b: dict | None,
+    found: Loaded,
+    placed_at_base: Callable[[Source], tuple[str | None, str | None]],
+    git: Git,
+) -> list[str]:
+    """Why entry e may not leave its base entry b's source for found: superseded_entries
+    sees only the sources the head names, so deleting the base's newer source would let
+    an entry demote, raise or move back through an older one."""
+    bs = parse_source(b.get('source')) if b else None
+    if bs is None or b['source'] == e['source']:
+        return []
+    label = f"the base's {bs.label}"
+    place, why = placed_at_base(bs)
+    if place is None:
+        return [f'{label}: {why}']
+    try:
+        older = found.at != place and git.is_ancestor(found.at, place)
+    except GitError as exc:
+        return [f'{label}: {exc}']
+    if not older:
+        return []
+    return [
+        (
+            f'{found.source.label} measured {found.at}, older than {label} at {place}; '
+            'an entry moves only to a newer source'
+        )
+    ]
 
 
 def placed_commit(doc: dict, path: pathlib.Path, git: Git, head_sha: str) -> tuple:
-    """(the commit in head's history whose code calibration doc at path measured, None), or
-    (None, why it has none). That is its `commit` when the commit that added path already
-    held it. Otherwise the calibration measured the pull request that added path, and the
+    """(the commit in head's history whose code source doc at path measured, None), or
+    (None, why it has none), Curable unless git failed. That is its `commit` when the commit that added path already
+    held it. Otherwise the source measured the pull request that added path, and the
     adding commit (its merge ref, or its squash) must make the change it measured; the
     place is then its `commit` when head contains it, else the squash."""
     try:
@@ -881,85 +1702,27 @@ def placed_commit(doc: dict, path: pathlib.Path, git: Git, head_sha: str) -> tup
             return (measured if git.is_ancestor(measured, head_sha) else added), None
     except (GitError, ValueError) as exc:
         return None, str(exc)
-    return None, (
+    retake = (
+        'take the measured file this run wrote'
+        if doc.get('kind') == 'measured'
+        else 'take entries only from a calibration of the default branch'
+    )
+    return None, Curable(
         f'{added}, which added the file, makes another change than measured {measured} '
-        'made; re-calibrate at the final commit'
+        f'made; {retake}'
     )
 
 
-def load_calibration(run_id, calibrations, repo, runner, head_sha, verify, git):
-    blob = calibrations / f'{run_id}.json'
-    bundle = calibrations / f'{run_id}.sigstore.json'
-    if not blob.is_file() or not bundle.is_file():
-        return None, f'calibration {run_id}: {blob.name} and {bundle.name} must both be checked in'
-    failure = verify(blob, bundle)
-    if failure:
-        return None, f'calibration {run_id}: the bundle does not verify: {failure}'
-    try:
-        doc = load(blob)
-    except (ValueError, TypeError) as exc:
-        return None, f'calibration {run_id}: {exc}'
-    for field, want in (('run_id', run_id), ('repo', repo), ('runner', runner)):
-        if str(doc.get(field)) != str(want):
-            return None, f'calibration {run_id}: {field} is {doc.get(field)!r}, not {want!r}'
-    _, why = placed_commit(doc, blob, git, head_sha)
-    return (None, f'calibration {run_id}: {why}') if why else (doc, None)
-
-
-def entry_provenance(head: dict, e: dict, b: dict | None, doc: dict, file_moved: bool) -> list[str]:
-    """Why entry e of head does not match calibration doc. With file_moved
-    (the file's headroom or floor differs from the base's), a budget above
-    the base's needs `accepted` even when its baseline did not rise, and a
-    server CPU budget, which is its target, always does."""
-    cells = {key(c): c for c in doc.get('cells', [])}
-    c = cells.get(key(e))
-    run_id = doc.get('run_id')
-    if c is None:
-        return [f'calibration {run_id} did not measure this cell']
-    out = []
-    if e.get('baseline') != c.get('baseline'):
-        out.append(f"baseline {e.get('baseline')} is not calibration {run_id}'s {c['baseline']}")
-    runs = doc.get('runs', 0)
-    if runs >= TIER_RUNS:
-        want_tier, want_h = c.get('tier'), c.get('headroom')
-        decided = f'calibration {run_id}'
-    elif b is not None:
-        want_tier, want_h = b.get('tier'), b.get('headroom')
-        decided = f'the base, since {runs} runs decide no tier'
-    else:
-        want_tier, want_h = 'reported', None
-        decided = f'a new entry from {runs} runs'
-    if (e.get('tier'), e.get('headroom')) != (want_tier, want_h):
-        out.append(f'tier and headroom must be {want_tier}, {want_h} ({decided})')
-    if runs < TIER_RUNS and e.get('tier') == 'gated' and c.get('kind') == 'time':
-        h = entry_headroom(head, e)
-        if is_number(h):
-            _, second, _ = leave_one_out(c.get('reps_by_run', []), h, entry_floor(head, e))
-            if second:
-                out.append(
-                    f'run(s) {second} of calibration {run_id} trip the second stage; '
-                    f'calibrate {e["scenario"]} with ten runs'
-                )
-    if b is not None and is_number(b.get('baseline')) and is_number(e.get('baseline')):
-        if e['baseline'] > b['baseline'] and not str(e.get('accepted', '')).strip():
-            out.append(f'raises its baseline from {b["baseline"]} without `accepted`')
-    raised = b is not None and is_number(b.get('budget')) and is_number(e.get('budget'))
-    server = family(e['metric']) == SERVER_CPU
-    if (file_moved or server) and raised and e['budget'] > b['budget']:
-        if not str(e.get('accepted', '')).strip():
-            what = (
-                'raises its target and budget'
-                if server
-                else ('the file headroom or floor raises its budget')
-            )
-            out.append(f'{what} from {b["budget"]} to {e["budget"]} without `accepted`')
-    return out
-
-
-def cosign_verify(blob, bundle, identity: str = IDENTITY) -> str | None:
-    """None when the keyless bundle verifies for identity, else why not."""
-    cmd = ['cosign', 'verify-blob', '--bundle', str(bundle)]
-    cmd += ['--certificate-identity', identity, '--certificate-oidc-issuer', ISSUER, str(blob)]
+def cosign_verify(blob, bundle, signer: Signer) -> str | None:
+    """None when the keyless bundle verifies for signer, else why not."""
+    cmd = ['cosign', 'verify-blob', '--bundle', str(bundle), '--certificate-oidc-issuer', ISSUER]
+    if signer.identity:
+        cmd += ['--certificate-identity', signer.identity]
+    if signer.identity_regexp:
+        cmd += ['--certificate-identity-regexp', signer.identity_regexp]
+    if signer.workflow_repository:
+        cmd += ['--certificate-github-workflow-repository', signer.workflow_repository]
+    cmd.append(str(blob))
     try:
         done = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     except FileNotFoundError:
@@ -969,6 +1732,258 @@ def cosign_verify(blob, bundle, identity: str = IDENTITY) -> str | None:
     if done.returncode == 0:
         return None
     return (done.stderr or done.stdout).strip() or f'cosign exited {done.returncode}'
+
+
+# --- take and check-in -----------------------------------------------------
+
+
+def dump_budgets(doc: dict) -> str:
+    """budgets.json with one top-level field, and one item of a list, per line, so that a
+    moved value is a one-line diff."""
+    lines = []
+    for k, v in doc.items():
+        if isinstance(v, list) and v:
+            body = ',\n'.join(f'    {json.dumps(x)}' for x in v)
+            lines.append(f'  {json.dumps(k)}: [\n{body}\n  ]')
+        else:
+            lines.append(f'  {json.dumps(k)}: {json.dumps(v)}')
+    return '{\n' + ',\n'.join(lines) + '\n}\n'
+
+
+def unnamed_sources(directory: pathlib.Path, budgets: dict) -> list[str]:
+    """The source files and bundles under directory that no entry of budgets names."""
+    named = {s.stem for e in budgets.get('budgets', []) if (s := parse_source(e.get('source')))}
+    if not directory.is_dir():
+        return []
+    return sorted(
+        p.name
+        for p in directory.iterdir()
+        if (m := SOURCE_FILE_RE.match(p.name)) and m[1] not in named
+    )
+
+
+def take(budgets: dict, doc: dict, *, reason: str, cells: list[str]) -> list[tuple]:
+    """The keys of measured file doc whose key text a glob of cells matches, each written
+    into its budgets entry: the value as baseline and budget, the run as source, and
+    reason. A file that is no measured file, a reason that is not one line, globs that
+    match no cell and a cell with no exact entry raise before any entry changes."""
+    if doc.get('kind') != 'measured':
+        raise ValueError(f'kind {doc.get("kind")!r}: it is not a measured file')
+    src = parse_source(doc.get('run_url'))
+    if src is None or src.kind != 'measured':
+        raise ValueError(f'run_url {doc.get("run_url")!r} is not a perf-ci run attempt')
+    if not isinstance(reason, str) or not reason.strip() or has_line_break(reason):
+        raise ValueError(f'the reason must be one non-empty line, not {reason!r}')
+    found, why = source_cells(doc, 'measured')
+    if why:
+        raise ValueError(why)
+    entries = {key(e): e for e in budgets.get('budgets', [])}
+    chosen = [k for k in found if any(fnmatch.fnmatchcase(key_text(k), g) for g in cells)]
+    if not chosen:
+        raise ValueError(f'{", ".join(cells)} matches no cell of the measured file')
+    for k in chosen:
+        if entries.get(k, {}).get('tier') != 'exact':
+            raise ValueError(f'{key_text(k)} has no exact entry to take its value')
+    for k in chosen:
+        value = found[k]['value']
+        entries[k].update(baseline=value, budget=value, source=src.url, reason=reason)
+    return chosen
+
+
+@dataclasses.dataclass
+class CheckedIn:
+    """check_in's answer: the new budgets and plan, each changed accepted file's new doc
+    (None deletes it), the source files to delete and the pull request body."""
+
+    budgets: dict
+    plan: dict
+    accepted: dict[str, dict | None]
+    drop: list[str]
+    body: str
+
+
+def check_in(
+    cal: dict,
+    budgets: dict,
+    plan_doc: dict,
+    *,
+    sources: pathlib.Path,
+    accepted: pathlib.Path | None,
+    repo: str,
+    head_sha: str,
+    git: Git,
+) -> CheckedIn:
+    """The default branch's files once calibration cal is checked in under sources. Each
+    cell cal measured takes its entry from it (calibrated_entry), but one whose entry comes
+    from a measured file placed after cal's commit; every other entry stays. An accepted
+    cell cal absorbed (absorbed_by's rule) or whose budget no longer exceeds its entry's
+    goes, plan.json takes cal's seconds, a source no entry names is dropped, and so is a
+    retired item of a cell cal measured, whose tier is cal's again."""
+    src = calibration_source(cal, budgets, repo)
+    at = git.commit(str(cal.get('commit')))
+    measured, why = source_cells(cal, 'calibration')
+    if why:
+        raise ValueError(f'the calibration: {why}')
+    entries = {key(e): e for e in budgets.get('budgets', [])}
+    places = functools.cache(lambda stem: measured_place(sources, stem, head_sha, git))
+    tiers, raises, kept = [], [], []
+    for k, c in measured.items():
+        old = entries.get(k)
+        s = parse_source(old.get('source')) if old else None
+        if s and s.kind == 'measured' and (m := places(s.stem)) and not git.is_ancestor(m, at):
+            kept.append((key_text(k), old['baseline'], c.get('baseline'), s.label))
+            continue
+        new = entries[k] = calibrated_entry(budgets, c, src.url)
+        before = old['tier'] if old else 'none'
+        if before != new['tier']:
+            tiers.append((key_text(k), before, new['tier']))
+        if old and old['tier'] == new['tier'] == 'gated' and new['baseline'] > old['baseline']:
+            ratio = round(new['baseline'] / old['baseline'], 3) if old['baseline'] else ''
+            raises.append((key_text(k), old['baseline'], new['baseline'], ratio))
+    head = {**budgets, 'budgets': [entries[k] for k in sorted(entries)]}
+    back = [r for r in budgets.get('retired', []) if key(r) in measured]
+    if back:
+        head['retired'] = [r for r in budgets['retired'] if key(r) not in measured]
+    files, removed = check_in_accepted(accepted, entries, (src, measured, at), head_sha, git)
+    drop = unnamed_sources(sources, head)
+    dropped = sorted({SOURCE_FILE_RE.match(n)[1] for n in drop})
+    lines = [
+        f'## Calibration {src.run_id} of {repo} at `{str(cal["commit"])[:12]}`',
+        '',
+        (
+            f'{cal["runs"]} runs on `{cal["runner"]}` '
+            f'({", ".join(cal.get("cpu_models") or []) or "CPU model unknown"}), '
+            f'{len(measured)} cells: {src.url}'
+        ),
+        '',
+        *table('Tier changes', ('Cell', 'Before', 'After'), tiers),
+        *table('Raised gated baselines', ('Cell', 'Before', 'After', 'Ratio'), raises),
+        *table('Measured values kept', ('Cell', 'Measured', 'Calibrated', 'Source'), kept),
+        *table('Accepted slowdowns removed', ('File', 'Cell', 'Why'), removed),
+        *table(
+            'Retired cells measured again',
+            ('Cell', 'Reason'),
+            ((key_text(key(r)), r['reason']) for r in back),
+        ),
+    ]
+    if dropped:
+        labels = (f'{"measured file" if "-" in d else "calibration"} {d}' for d in dropped)
+        lines += ['### Sources dropped', '', *(f'- {x}' for x in labels), '']
+    return CheckedIn(head, check_in_plan(plan_doc, cal), files, drop, '\n'.join(lines) + '\n')
+
+
+def calibration_source(cal: dict, budgets: dict, repo: str) -> Source:
+    """The source of cal, once it is a ten-run calibration of repo on budgets' runner."""
+    for field, want in (
+        ('kind', 'calibration'),
+        ('schema', SCHEMA),
+        ('repo', repo),
+        ('runner', budgets.get('runner')),
+    ):
+        if cal.get(field) != want:
+            raise ValueError(f'the calibration: {field} is {cal.get(field)!r}, not {want!r}')
+    runs = cal.get('runs')
+    if not (is_number(runs) and runs >= TIER_RUNS):
+        raise ValueError(
+            f'the calibration has {runs!r} runs, and a calibration needs {TIER_RUNS} runs'
+        )
+    src = parse_source(cal.get('run_url'))
+    if src is None or src.kind != 'calibration' or src.run_id != str(cal.get('run_id')):
+        raise ValueError(
+            f'the calibration: run_url {cal.get("run_url")!r} is not run {cal.get("run_id")!r}'
+        )
+    return src
+
+
+def calibrated_entry(budgets: dict, c: dict, url: str) -> dict:
+    """The entry calibration cell c gives under budgets' headroom, floor and target, which
+    entry_errors and calibration_provenance hold it to; it carries no reason."""
+    tier, baseline, name = c.get('tier'), c.get('baseline'), key_text(key(c))
+    if tier not in TIERS or not is_number(baseline):
+        raise ValueError(f'{name}: the calibration gives tier {tier!r}, baseline {baseline!r}')
+    e = {**key_dict(key(c)), 'tier': tier, 'baseline': baseline}
+    fam = family(c['metric'])
+    if tier == 'exact':
+        e['budget'] = baseline
+    elif tier == 'gated' and fam == SERVER_CPU:
+        target = file_target(budgets, c['metric'])
+        if target is None:
+            raise ValueError(f'{name}: no target for {SERVER_CPU}')
+        e['budget'] = target
+    elif tier == 'gated':
+        h = c.get('headroom', budgets.get('headroom', {}).get(fam))
+        if not is_number(h) or h <= 0:
+            raise ValueError(f'{name}: no headroom for {fam}')
+        e['budget'] = budget_for(baseline, h, entry_floor(budgets, c))
+    if 'headroom' in c:
+        e['headroom'] = c['headroom']
+    e['source'] = url
+    return e
+
+
+def measured_place(sources: pathlib.Path, stem: str, head_sha: str, git: Git) -> str | None:
+    """Where placed_commit puts measured file stem under sources, None when the file is
+    absent or its place is a Curable refusal, which the gate holds against its entry too.
+    A git failure raises, since reading it as no place would overwrite the file's value."""
+    path = sources / f'{stem}.json'
+    if not path.is_file():
+        return None
+    at, why = placed_commit(load(path), path, git, head_sha)
+    if at is None and not isinstance(why, Curable):
+        raise GitError(f'measured file {stem}: {why}')
+    return at
+
+
+def check_in_accepted(
+    directory: pathlib.Path | None,
+    entries: dict,
+    cal: tuple[Source, dict, str],
+    head_sha: str,
+    git: Git,
+) -> tuple[dict[str, dict | None], list[tuple]]:
+    """Each accepted file check_in changes, with its new doc or None, and a (file, cell,
+    why) line for each cell it removes. cal is the calibration's source, cells and commit."""
+    src, measured, at = cal
+    files: dict[str, dict | None] = {}
+    removed = []
+    if directory is None or not directory.is_dir():
+        return files, removed
+    for p in sorted(directory.iterdir()):
+        reason, cells, why = accepted_file(p)
+        if why:
+            raise ValueError(f'accepted/{p.name}: {why}')
+        added = git.added_by(str(p), head_sha)
+        keep = []
+        for c in cells:
+            e = entries.get(key(c))
+            if key(c) in measured and git.is_ancestor(added, at):
+                gone = f'{src.label} measured it'
+            elif e is None or e['tier'] != 'gated':
+                gone = f'its entry is {e["tier"] if e else "gone"}, not gated'
+            elif e['budget'] >= c['budget']:
+                gone = f'budget {e["budget"]} is at or over {c["budget"]}'
+            else:
+                keep.append(c)
+                continue
+            removed.append((f'accepted/{p.name}', key_text(key(c)), gone))
+        if len(keep) < len(cells):
+            files[p.name] = {'reason': reason, 'cells': keep} if keep else None
+    return files, removed
+
+
+def check_in_plan(plan_doc: dict, cal: dict) -> dict:
+    """plan_doc with each unit's seconds the calibration measured, rounded up."""
+    seconds = {
+        unit_key(s): s['seconds'] for s in cal.get('seconds', []) if is_number(s.get('seconds'))
+    }
+    doc = copy.deepcopy(plan_doc)
+    sets = doc.get('sets')
+    for spec in sets.values() if isinstance(sets, dict) else ():
+        for u in spec.get('cells') or [] if isinstance(spec, dict) else ():
+            # A unit listing some windows runs for less than the full measure timed.
+            if isinstance(u, dict) and 'windows' not in u and unit_key(u) in seconds:
+                u['seconds'] = math.ceil(seconds[unit_key(u)])
+    return doc
 
 
 # --- files and the command line --------------------------------------------
@@ -1063,7 +2078,10 @@ def merge(paths: list[pathlib.Path]) -> dict:
             if key(c) in seen:
                 raise ValueError(f'{p}: {key_text(key(c))} was measured by two shards')
             seen.add(key(c))
-            merged['cells'].append(c)
+            # Each cell keeps its shard's cpu_model for the timing seam (gated_budget).
+            merged['cells'].append(
+                {**c, 'cpu_model': doc['cpu_model']} if doc.get('cpu_model') else c
+            )
         merged['seconds'].extend(doc.get('seconds', []))
     return merged
 
@@ -1116,10 +2134,21 @@ class Git:
         """True when sha is of or one of its ancestors."""
         return self.ok('merge-base', '--is-ancestor', sha, of)
 
+    def show(self, sha: str, path: str) -> str:
+        """The file at path, from the working directory, as commit sha's tree holds it."""
+        return self.git('cat-file', 'blob', f'{sha}:./{os.path.relpath(path)}')
+
+    def has(self, sha: str, path: str) -> bool:
+        """Whether commit sha's tree holds path, from the working directory; GitError when
+        git cannot read sha."""
+        return bool(self.git('ls-tree', '--name-only', sha, '--', os.path.relpath(path)).strip())
+
     def added_by(self, path: str, head: str) -> str:
-        """The newest first-parent commit of head that added path."""
-        args = ('log', '--first-parent', '--diff-filter=A', '--format=%H', '-1', head, '--')
-        found = self.git(*args, path).strip()
+        """The newest first-parent commit of head that added path. A move adds its new
+        path: rename detection, which `log.follow` turns on, would name the commit that
+        added the old one."""
+        args = ('log', '--no-follow', '--first-parent', '--diff-filter=A', '--format=%H')
+        found = self.git(*args, '-1', head, '--', path).strip()
         if not found:
             raise GitError(f'no first-parent commit of {head} added {path}')
         return found
@@ -1152,15 +2181,32 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     mode.add_argument('--plan', metavar='PLAN', help='write the measure matrix of plan.json')
     mode.add_argument('--bench', metavar='DIR', help='write the chart points of the results in DIR')
+    mode.add_argument(
+        '--take',
+        metavar='MEASURED',
+        help='write the counts of a measured file under tests/perf/sources into --budgets, '
+        'and delete the source files there no entry names',
+    )
+    mode.add_argument(
+        '--check-in',
+        metavar='CALIBRATION',
+        help='check in a calibration of the default branch: --budgets, --plan-doc, '
+        '--sources and --accepted are rewritten, and --pr-body says what moved',
+    )
     p.add_argument('--set', help='the plan.json set to measure')
     p.add_argument(
         '--plan-doc',
         help='plan.json: fail a gated or exact entry neither the pr nor the full set lists, '
-        'or that --set and --only list and no shard measured',
+        'or that --set and --only list and no shard measured. --calibrate reads its '
+        '`reported` patterns',
     )
     p.add_argument('--only', default='', help='comma or space separated scenarios to keep')
     p.add_argument('--runs', type=int, default=1, help='how many times to measure the set')
-    p.add_argument('--remeasure', help="compare's remeasure.json: plan only its cells")
+    p.add_argument(
+        '--remeasure',
+        help="compare's remeasure.json: --plan plans only its cells and extension, "
+        '--verdict reads its stale keys, extension and accepted slowdowns',
+    )
     p.add_argument('--budgets', help='the head budgets.json')
     p.add_argument(
         '--base', help="the base ref's budgets.json, where a missing file is an empty one"
@@ -1170,9 +2216,17 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         '--prefix',
         help="perf-ci.yaml's artifact prefix: read only that call's shard directories",
     )
-    p.add_argument('--calibrations', help='tests/perf/calibrations')
+    p.add_argument('--sources', help='tests/perf/sources, the signed files entries come from')
+    p.add_argument(
+        '--accepted',
+        help='tests/perf/accepted, the gated cells slower on purpose. Unset accepts none',
+    )
     p.add_argument('--repo', help='owner/name of the measured repository')
-    p.add_argument('--head', help='the pull request head commit')
+    p.add_argument('--head', help='the commit the gate checks out: the merge ref of a pull request')
+    p.add_argument(
+        '--base-sha',
+        help='the base branch commit: a changed entry takes only a calibration it holds',
+    )
     p.add_argument('--remeasure-out', help='where compare writes the cells to re-measure')
     p.add_argument(
         '--remeasure-attempt',
@@ -1184,10 +2238,35 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         '--outputs', help='--plan: a $GITHUB_OUTPUT file to append matrix, node, scenarios to'
     )
-    p.add_argument('--commit', help='the commit --calibrate measured')
+    p.add_argument(
+        '--commit',
+        help='the commit --calibrate measured, or the pull request head --record-out names',
+    )
     p.add_argument('--runner', help='the runner --calibrate measured on')
-    p.add_argument('--run-id', help='the perf-calibrate run id')
+    p.add_argument('--run-id', help='the run id of the perf-calibrate or perf-ci run')
     p.add_argument('--run-url', help='the perf-calibrate run URL')
+    p.add_argument('--run-attempt', help='the attempt of the perf-ci run --record-out names')
+    p.add_argument(
+        '--workflow-repository', help='owner/name of the repository whose perf-ci run this is'
+    )
+    p.add_argument(
+        '--workflow-sha',
+        help='--record-out: the cplieger/ci commit the perf-ci run ran, whose perf_gate.py '
+        'the summary tells the author to take the file with',
+    )
+    p.add_argument(
+        '--record-out',
+        metavar='DIR',
+        help='--verdict: write the counts it recorded to DIR/<run id>-<attempt>.json',
+    )
+    p.add_argument('--reason', help='--take: the one-line reason the counts moved')
+    p.add_argument(
+        '--cells',
+        action='append',
+        help='--take: a glob on the cell text (scenario/scale/engine/width/window/metric), '
+        'repeatable, and every cell when unset',
+    )
+    p.add_argument('--pr-body', help='--check-in: where the pull request body is written')
     a = p.parse_args(argv)
     if a.calibrate:
         need = ('prefix', 'out', 'repo', 'commit', 'runner', 'run_id', 'run_url')
@@ -1196,11 +2275,18 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     elif a.bench:
         need = ('prefix', 'out')
     elif a.check_file:
-        need = ('base', 'calibrations', 'repo', 'head')
+        need = ('base', 'sources', 'repo', 'head', 'base_sha')
     elif a.verdict:
-        need = ('budgets', 'results', 'prefix', 'remeasure_attempt')
+        need = ('budgets', 'results', 'prefix', 'remeasure_attempt', 'remeasure')
+        if a.record_out:
+            need += ('repo', 'head', 'commit', 'run_id', 'run_attempt', 'workflow_repository')
+            need += ('workflow_sha',)
+    elif a.take:
+        need = ('budgets', 'reason')
+    elif a.check_in:
+        need = ('budgets', 'plan_doc', 'sources', 'repo', 'head', 'pr_body')
     else:
-        need = ('budgets', 'base', 'results', 'prefix', 'calibrations', 'repo', 'head')
+        need = ('budgets', 'base', 'results', 'prefix', 'sources', 'repo', 'head', 'base_sha')
         need += ('remeasure_out',)
         need += ('plan_doc', 'set')
     missing = [f'--{n.replace("_", "-")}' for n in need if not getattr(a, n)]
@@ -1214,22 +2300,34 @@ def load_base(path: str) -> dict:
     return load(p) if p.is_file() else {'budgets': []}
 
 
-def file_errors(a: argparse.Namespace, head: dict) -> list[str]:
+def held_reported(a: argparse.Namespace) -> list[dict]:
+    """The `reported` patterns --plan-doc and its copy at --base-sha both list."""
+    if not a.plan_doc:
+        return []
+    return held_patterns(load(a.plan_doc), base_plan(Git(), a.base_sha, a.plan_doc))
+
+
+def file_errors(a: argparse.Namespace, head: dict, held: list[dict]) -> Checked:
+    """check_provenance of head, its errors led by the rule and plan errors; held is
+    held_reported's."""
     errors = check_rule(head)
     if check_shape(head):
-        return errors
+        return Checked(errors, set(), {}, [], [])
     if a.plan_doc:
-        errors += check_plan(head, load(a.plan_doc))
-    errors += check_provenance(
+        errors += check_plan(head, load(a.plan_doc), reported=held)
+    found = check_provenance(
         head,
         load_base(a.base),
-        calibrations=pathlib.Path(a.calibrations),
+        sources=pathlib.Path(a.sources),
+        accepted=pathlib.Path(a.accepted) if a.accepted else None,
         repo=a.repo,
         head_sha=a.head,
+        base_sha=a.base_sha,
         verify=cosign_verify,
         git=Git(),
     )
-    return errors
+    found.errors = errors + found.errors
+    return found
 
 
 def report(a: argparse.Namespace, text: str) -> None:
@@ -1246,6 +2344,9 @@ def run_calibrate(a: argparse.Namespace) -> int:
         raise ValueError(
             f'{a.calibrate} holds results of {len(groups)} runs, not the {a.runs} dispatched'
         )
+    reported, errors = reported_patterns(load(a.plan_doc)) if a.plan_doc else ([], [])
+    if errors:
+        raise ValueError('; '.join(errors))
     runs = []
     for name, paths in sorted(groups.items()):
         run = merge(paths)
@@ -1263,6 +2364,7 @@ def run_calibrate(a: argparse.Namespace) -> int:
         runner=a.runner,
         run_id=a.run_id,
         run_url=a.run_url,
+        reported=reported,
     )
     pathlib.Path(a.out).write_text(json.dumps(proposed, indent=2) + '\n')
     print(f'{a.out}: {len(proposed["cells"])} cells from {len(runs)} runs')
@@ -1295,9 +2397,105 @@ def run_plan(a: argparse.Namespace) -> int:
     return 0
 
 
+def run_take(a: argparse.Namespace) -> int:
+    path = pathlib.Path(a.take)
+    doc, budgets = load(path), load(a.budgets)
+    errors = check_shape(budgets)
+    if errors:
+        raise ValueError('; '.join(errors))
+    taken = take(budgets, doc, reason=a.reason, cells=a.cells or ['*'])
+    stem = parse_source(doc['run_url']).stem
+    bundle = path.with_name(f'{stem}.sigstore.json')
+    if path.name != f'{stem}.json' or not bundle.is_file():
+        raise ValueError(f'{path} must be {stem}.json, beside its bundle {bundle.name}')
+    pathlib.Path(a.budgets).write_text(dump_budgets(budgets))
+    print(f'{a.budgets}: took {len(taken)} cells from {stem}')
+    for name in unnamed_sources(path.parent, budgets):
+        (path.parent / name).unlink()
+        print(f'deleted {path.parent / name}: no entry names it')
+    return 0
+
+
+def run_check_in(a: argparse.Namespace) -> int:
+    path = pathlib.Path(a.check_in)
+    cal, budgets, sources = load(path), load(a.budgets), pathlib.Path(a.sources)
+    errors = check_shape(budgets)
+    if errors:
+        raise ValueError('; '.join(errors))
+    bundle = path.with_name(f'{path.stem}.sigstore.json')
+    if path.name != f'{cal.get("run_id")}.json' or not bundle.is_file():
+        raise ValueError(f'{path} must be <run id>.json, beside its bundle {bundle.name}')
+    accepted = pathlib.Path(a.accepted) if a.accepted else None
+    done = check_in(
+        cal,
+        budgets,
+        load(a.plan_doc),
+        sources=sources,
+        accepted=accepted,
+        repo=a.repo,
+        head_sha=a.head,
+        git=Git(),
+    )
+    errors = check_rule(done.budgets)
+    if errors:
+        raise ValueError('the checked-in budgets.json breaks the rule: ' + '; '.join(errors))
+    sources.mkdir(parents=True, exist_ok=True)
+    for p in (path, bundle):
+        if p.resolve() != (sources / p.name).resolve():
+            shutil.copyfile(p, sources / p.name)
+    pathlib.Path(a.budgets).write_text(dump_budgets(done.budgets))
+    pathlib.Path(a.plan_doc).write_text(json.dumps(done.plan, indent=2) + '\n')
+    for name, doc in done.accepted.items():
+        if doc is None:
+            (accepted / name).unlink()
+        else:
+            (accepted / name).write_text(json.dumps(doc, indent=2) + '\n')
+    for name in done.drop:
+        (sources / name).unlink()
+    pathlib.Path(a.pr_body).write_text(done.body)
+    print(done.body)
+    return 0
+
+
+def write_record(a: argparse.Namespace, out: Outcome, cpu: Iterable[str]) -> None:
+    """The measured file of the counts out recorded, as --record-out/<run id>-<attempt>.json,
+    named in out.measured_as for the summary; none when it recorded none."""
+    if not out.recorded:
+        return
+    url = f'https://github.com/{a.workflow_repository}/actions/runs/{a.run_id}/attempts/{a.run_attempt}'
+    src = parse_source(url)
+    if src is None:
+        raise ValueError(f'{url} is not a perf-ci run attempt the gate can name')
+    doc = record(
+        out,
+        repo=a.repo,
+        commit=a.commit,
+        measured_sha=a.head,
+        run_id=a.run_id,
+        run_attempt=a.run_attempt,
+        run_url=url,
+        workflow_repository=a.workflow_repository,
+        cpu_models=sorted(set(cpu)),
+    )
+    d = pathlib.Path(a.record_out)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f'{src.stem}.json').write_text(json.dumps(doc, indent=2) + '\n')
+    out.measured_as = MeasuredAs(
+        run_id=str(a.run_id),
+        repository=a.workflow_repository,
+        workflow_sha=a.workflow_sha,
+        artifact=f'perf-measured-{a.prefix}-attempt-{a.run_attempt}',
+        stem=src.stem,
+    )
+
+
 def run(a: argparse.Namespace) -> int:
     if a.calibrate:
         return run_calibrate(a)
+    if a.take:
+        return run_take(a)
+    if a.check_in:
+        return run_check_in(a)
     if a.plan:
         return run_plan(a)
     if a.bench:
@@ -1306,7 +2504,7 @@ def run(a: argparse.Namespace) -> int:
         pathlib.Path(a.out).write_text(json.dumps(points, indent=2) + '\n')
         return 0
     if a.check_file:
-        errors = file_errors(a, load(a.check_file))
+        errors = file_errors(a, load(a.check_file), held_reported(a)).errors
         for e in errors:
             print(f'::error::{e}')
         return 1 if errors else 0
@@ -1316,16 +2514,45 @@ def run(a: argparse.Namespace) -> int:
     elif a.verdict:
         results = merge_results(a.results, a.prefix)
         again = merge_results(a.verdict, a.prefix, 'remeasure', since=a.remeasure_attempt)
-        out = verdict(budgets, results, again)
+        out = verdict(budgets, results, again, load(a.remeasure))
+        if a.record_out:
+            write_record(a, out, [*results['cpu_models'], *again['cpu_models']])
     else:
-        errors = file_errors(a, budgets)
+        held = held_reported(a)
+        checked = file_errors(a, budgets, held)
         only = a.only.replace(',', ' ').split()
-        matrix = plan(load(a.plan_doc), a.set, only=only)
+        plan_doc = load(a.plan_doc)
+        matrix = plan(plan_doc, a.set, only=only)
         units = planned_windows(c for job in matrix['include'] for c in job['cells'])
-        out = compare(budgets, merge_results(a.results, a.prefix), units)
-        out.failures = errors + out.failures
-        scenarios = sorted({c['scenario'] for c in out.remeasure})
-        doc = {'cells': out.remeasure, 'scenarios': scenarios}
+        results = merge_results(a.results, a.prefix)
+        out = compare(budgets, results, units, checked.accepted)
+        out.notices += unmeasured_accepted(checked.accepted, out)
+        # A measured file of another runner is one load_source refuses, so nothing is stale.
+        stale = set() if out.runner_mismatch else checked.stale
+        judged = [c for c in results['cells'] if planned(units, c)]
+        out.remeasure = with_stale(out.remeasure, judged, stale)
+        out.failures = (
+            checked.errors + out.failures + retired_measured(budgets, results['cells'], held)
+        )
+        out.exact_moves = checked.moves
+        out.retires = checked.retires
+        entries = {key(e): e for e in budgets.get('budgets', [])}
+        moved = {c['scenario'] for c in out.remeasure if entries[key(c)]['tier'] == 'exact'}
+        moved |= {k[0] for k in stale}
+        # A cell this pull request retires that only the full set measures is measured
+        # once more, so the verdict fails it if a shard still emits it.
+        for r in checked.retires:
+            if planned(planned_windows(extension(plan_doc, {}, {r['key'][0]})), key_dict(r['key'])):
+                moved.add(r['key'][0])
+        extend = extension(plan_doc, units, moved)
+        doc = {
+            'cells': out.remeasure,
+            'scenarios': sorted({c['scenario'] for c in [*out.remeasure, *extend]}),
+            'stale': [key_dict(k) for k in sorted(stale)],
+            'extend': extend,
+            'accepted': [{**key_dict(k), **v} for k, v in sorted(checked.accepted.items())],
+            'reported': held,
+        }
         pathlib.Path(a.remeasure_out).write_text(json.dumps(doc, indent=2) + '\n')
     report(a, summary(budgets, out))
     for f in out.failures:
@@ -1337,7 +2564,7 @@ def main(argv: list[str] | None = None) -> int:
     a = parse_args(argv)
     try:
         return run(a)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, GitError) as exc:
         print(f'::error::perf_gate: {exc!r}', file=sys.stderr)
         return 1
 

@@ -248,7 +248,7 @@ class InstallSteps(unittest.TestCase):
 # The jobs that install cosign, in each workflow that may run them on a pool runner.
 COSIGN_JOBS = {
     'security-scan.yaml': ('trivy', 'published-image', 'trivy-published'),
-    'perf-ci.yaml': ('compare',),
+    'perf-ci.yaml': ('compare', 'verdict'),
 }
 # The block shape of the custom.cosign manager in cplieger/.github's
 # default.json, which moves COSIGN_VERSION and COSIGN_SHA256 in one pull

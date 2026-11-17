@@ -47,6 +47,7 @@ rules:
       - weekly-gremlins.yaml
       - weekly-links.yaml
       - weekly-perf.yaml
+      - weekly-perf-calibrate.yaml
       - weekly-stryker.yaml
 
   github-app:

@@ -63,7 +63,7 @@ GitHub lets any public repository call a reusable workflow stored in a public re
 
 - Versioning reads a `cliff.toml`, and the lint jobs read the synced configs. Copy them from `configs/` and the repository root.
 - The sync job, the daily settings audit and the scheduled mutation, fuzz, benchmark and performance runs cover cplieger repositories only.
-- The performance gate accepts only budgets that cplieger/ci's own calibration workflow signed, and that workflow calibrates cplieger repositories only. Another repository can therefore commit only an empty budget list, which reports every measured cell and gates none.
+- The performance gate takes a new budget only from cplieger/ci's own calibration workflow, which calibrates cplieger repositories only; a pull request's own run can only move a count that is already exact. Another repository can therefore commit only an empty budget list, which reports every measured cell and gates none.
 - The release workflow sets the image license label for the cplieger repositories it names. Any other repository gets the defaults, which are both registries, `amd64` and `arm64` images, and its own license in the label.
 
 Copying a workflow and adapting it is the other way to reuse one. To build your own, GitHub's [reusable workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows) are the built-in way. If you only need to keep files in step across your repositories, [repo-file-sync-action](https://github.com/BetaHuhn/repo-file-sync-action) opens a pull request in each target repository from a `sync.yml` list.
