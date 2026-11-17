@@ -133,7 +133,7 @@ class ResultArtifacts(unittest.TestCase):
         self.assertGreaterEqual(len(found), 5)
         for name, job, step in found:
             with self.subTest(workflow=name, job=job, step=step['name']):
-                self.assertTrue(step['with'].get('merge-multiple') is True)
+                self.assertIs(step['with'].get('merge-multiple'), expr2=True)
 
     def test_the_upload_holds_a_directory_named_after_the_attempt_s_artifact(self):
         steps = load('perf-measure.yaml')['jobs']['measure']['steps']
