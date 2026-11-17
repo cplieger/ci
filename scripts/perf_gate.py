@@ -2580,8 +2580,13 @@ def run(a: argparse.Namespace) -> int:
         results = merge_results(a.results, a.prefix)
         out = compare(budgets, results, units, checked.accepted, held)
         out.notices += checked.notices + unmeasured_accepted(checked.accepted, out)
-        # A measured file of another runner is one load_source refuses, so nothing is stale.
-        stale = set() if out.runner_mismatch else checked.stale
+        # A measured file of another runner is one load_source refuses, so nothing is stale,
+        # and a cell a held pattern reports records no exact value.
+        stale = (
+            set()
+            if out.runner_mismatch
+            else {k for k in checked.stale if not plan_reports(held, key_dict(k))}
+        )
         judged = [c for c in results['cells'] if planned(units, c)]
         out.remeasure = with_stale(out.remeasure, judged, stale)
         out.failures = (

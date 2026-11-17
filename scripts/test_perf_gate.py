@@ -3507,6 +3507,13 @@ class Cli(unittest.TestCase):
         self.assertEqual(self.compare(measured, plan=reports), 0, self.output)
         remeasure = json.loads((self.dir / 'remeasure.json').read_text())
         self.assertEqual((remeasure['cells'], remeasure['reported']), ([], [{'metric': 'dom'}]))
+        # Its entry's provenance still fails, but it is no stale exact value to re-measure.
+        url = MEASURED_URL + '900/attempts/1'
+        moved = {**entry('dom', 'exact', 2056, source=url, reason='one more node'), 'scale': 'x1'}
+        self.assertEqual(self.compare(measured, entries=[moved], plan=reports), 1)
+        self.assertIn('measured file 900-1: 900-1.json and 900-1.sigstore.json', self.output)
+        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
+        self.assertEqual((remeasure['stale'], remeasure['extend']), ([], []))
         # An exact entry the pull request adds for it fails.
         rc = self.compare(measured, plan=reports, base=[entry(source=RUN_URL + '100')])
         self.assertEqual(rc, 1)
