@@ -3039,7 +3039,7 @@ claim_at() { # <commit> <version tag> <branch head> [channel]: replays release.y
       version: $tag, channel: $channel, lane_state: "{}"}}},
     inputs: {}, secrets: {}, matrix: {}}' >"$CL/claim-ctx.json"
   PATH="$CL/bin:$PATH" GITHUB_SHA="$1" GITHUB_REPOSITORY=owner/app GITHUB_REF_NAME="$branch" GITHUB_SERVER_URL=https://gh \
-    GITHUB_RUN_ID=7 python3 "$ROOT/scripts/workflow_replay.py" --workflow "$RELEASE_YAML" \
+    GITHUB_RUN_ID=7 READBACK_SLEEP=0 python3 "$ROOT/scripts/workflow_replay.py" --workflow "$RELEASE_YAML" \
     --job claim --actions-root "$ROOT" --context "$CL/claim-ctx.json" --cwd "$CL_REPO" --out "$CL/claim-out.json" \
     >>"$CL/replay.log" 2>&1 || rc=$?
   echo "$rc"
@@ -3053,7 +3053,7 @@ unclaim_at() { # <commit> <version tag>: replays release.yaml's unclaim job at t
     needs: {detect: {result: "success", outputs: {version: $tag}}},
     inputs: {}, secrets: {}, matrix: {}}' >"$CL/unclaim-ctx.json"
   PATH="$CL/bin:$PATH" GITHUB_SHA="$1" GITHUB_REPOSITORY=owner/app GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 \
-    python3 "$ROOT/scripts/workflow_replay.py" --workflow "$RELEASE_YAML" --job unclaim --actions-root "$ROOT" \
+    READBACK_SLEEP=0 python3 "$ROOT/scripts/workflow_replay.py" --workflow "$RELEASE_YAML" --job unclaim --actions-root "$ROOT" \
     --context "$CL/unclaim-ctx.json" --cwd "$CL_REPO" --out "$CL/unclaim-out.json" >>"$CL/replay.log" 2>&1 || rc=$?
   echo "$rc"
 }
