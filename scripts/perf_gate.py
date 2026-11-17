@@ -2495,8 +2495,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument('--budgets', help='the head budgets.json')
     p.add_argument(
         '--base',
-        help="the base ref's budgets.json: the guard's baselines, and --check-file's base, "
-        'where a missing file is an empty one',
+        help="the base ref's budgets.json: the guard's baselines, where a missing file "
+        "fails, or --check-file's base, where it is an empty one",
     )
     p.add_argument('--results', help='the downloaded perf-results-<prefix>-measure-* folders')
     p.add_argument(
