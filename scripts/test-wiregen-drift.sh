@@ -203,6 +203,26 @@ run_step "$t"
 expect_rc 'no-generator: passes' 0
 expect_runs 'no-generator: only the root generator runs' 'wiregen: go -C . run ./cmd/gen'
 
+# grelot's shape: the root is `package main` (the server) and imports wiregen only
+# from a test file, to check its import graph; the real generator is cmd/gen.
+echo 'a package main root whose only wiregen import is a test file'
+t="$WORK/testimport"
+gomod "$t" example.com/app "$(uses_wiregen github.com/cplieger/wiregen)"
+printf 'package main\n\nimport "os"\n\nfunc main() { _ = os.WriteFile("RAN-server", nil, 0o644); os.Exit(2) }\n' \
+  >"$t/main.go"
+printf 'package main\n\nimport (\n\t"testing"\n\n\t_ "github.com/cplieger/wiregen"\n)\n\nfunc TestImports(t *testing.T) {}\n' \
+  >"$t/architecture_test.go"
+mkdir -p "$t/api"
+printf 'package api\n\nconst Version = "v1"\n' >"$t/api/api.go"
+generator "$t/cmd/gen" github.com/cplieger/wiregen api/api.gen.go \
+  '"// generated from "+api.Version+"\n\npackage api\n"' '"example.com/app/api"'
+printf '// generated from v1\n\npackage api\n' >"$t/api/api.gen.go"
+commit "$t"
+run_step "$t"
+expect_rc 'test import: passes' 0
+expect_runs 'test import: only the real generator runs' 'wiregen: go -C . run ./cmd/gen'
+expect_absent 'test import: the root package never runs' "$t/RAN-server"
+
 echo 'generators in fixture directories'
 t="$WORK/fixtures"
 root_app "$t"
