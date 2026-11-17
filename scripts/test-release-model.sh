@@ -266,6 +266,14 @@ run_release() { # <branch> <label>
     return 0
   fi
   outs=$(jq -c .outputs "$RUN.detect.json")
+  # The claim job follows detect on a release; on stable it writes the kind
+  # line, and a Go root's tag is the go job's to create.
+  if [ "$(jq -r .release <<<"$outs")" = true ]; then
+    jq --argjson outs "$outs" '.needs = {detect: {result: "success", outputs: $outs}}' "$RUN.ctx" >"$RUN.claim.ctx"
+    GITHUB_SHA=$sha GITHUB_REF="refs/heads/$branch" GITHUB_REF_NAME=$branch "$REAL_PY" "$REPLAY" \
+      --workflow "$tree/.github/workflows/release.yaml" --job claim --actions-root "$tree" --context "$RUN.claim.ctx" \
+      --cwd "$RUN" --out "$RUN.claim.json" 2>"$RUN.claim.err" || fail "$label: the claim job failed: $(tail -n5 "$RUN.claim.err")"
+  fi
   repairs=$(jq -r '.repairs // ""' <<<"$outs")
   local printed=""
   if [ -n "$repairs" ] && [ "$repairs" != '[]' ]; then
@@ -300,6 +308,7 @@ run_release() { # <branch> <label>
 }
 result() { cat "$RUN.result"; }
 detect() { jq -r ".outputs.$1" "$RUN.detect.json"; }
+kind_line() { jq -r '.outputs.kind_note // ""' "$RUN.claim.json"; }
 lane_state() { detect lane_state | jq -r --arg k "$1" ".[\$k].$2"; }
 step_out() { jq -r ".steps.$1.outputs.$2" "$RUN.detect.json"; }
 step_log() { # <step name>: what the detect step printed, stdout then stderr
@@ -403,7 +412,7 @@ M1=$(commit_on main "feat(deps): update module example.org/dep to v1.3.0" go.mod
 run_release main m1
 chk "M4 a feat on main with nothing pending publishes a patch" "$(result)" "v1.0.1"
 chk "M4 although git-cliff read a minor" "$(step_out cliff change_level)" "minor"
-chk "M4 and the release says it was built from main" "$(detect release_kind_note)" "$BUILT"
+chk "M4 and the release says it was built from main" "$(kind_line)" "$BUILT"
 chk "M4 the nested-only promotion is no longer pending for the lane" "$(lane_state yamlenv in_range)|$(detect go_modules_to_release)" 'false|[]'
 
 # ── 3. dev floors over a stable tag it cannot reach ──────────────────────────
@@ -441,7 +450,7 @@ chk "M9 it numbered R1 itself" "$(lane_state . commit)|$(lane_state . version)" 
 # ── 7. the stable run at R1, whose receipt never lands ───────────────────────
 NO_RECEIPT=. run_release main r1
 chk "M10 the root-only promotion publishes its minor at R1" "$(result)" "v1.1.0"
-chk "M10 with the promoted build in its kind line" "$(detect release_kind_note)" 'Promoted from `v1.1.0-dev.2`'
+chk "M10 with the promoted build in its kind line" "$(kind_line)" 'Promoted from `v1.1.0-dev.2`'
 chk "M10 and leaves the lane alone" "$(lane_state yamlenv commit)|$(detect go_modules_to_release)" '|[]'
 commit_on dev "fix: say goodbye politely" main.go='package main\n// v4' >/dev/null
 run_release dev d4
@@ -453,7 +462,7 @@ S1=$(commit_on main "fix(deps): update module example.org/dep to v1.3.1" go.mod=
 run_release main s1
 chk "M12 the unreceipted version is completed at its own commit before S1 publishes a patch" \
   "$(result)" "repaired:v1.1.0@${R1:0:12} v1.1.1"
-chk "M12 S1 is built from main" "$(detect release_kind_note)" "$BUILT"
+chk "M12 S1 is built from main" "$(kind_line)" "$BUILT"
 
 # ── 9. a multi-lane promotion whose lane fails, then S ───────────────────────
 commit_on dev "fix(deps): update module example.org/dep to v1.3.1" go.mod="$(gomod v1.3.1)" >/dev/null
@@ -496,7 +505,7 @@ chk "M19 its version" "$(detect version)|$(detect release)" "v2.0.0|true"
 S3=$(commit_on main "fix(deps): update module example.org/dep to v1.3.3" go.mod="$(gomod v1.3.3)")
 run_release main s3
 chk "M20 S, merged before R3 was tagged, publishes the major" "$(result)" "v2.0.0"
-chk "M20 and says it carried the promotion" "$(detect release_kind_note)" 'Built from `main`, including the promotion of `v2.0.0-dev.1`'
+chk "M20 and says it carried the promotion" "$(kind_line)" 'Built from `main`, including the promotion of `v2.0.0-dev.1`'
 AT=$R3 run_release main r3-rerun
 out=$(result)
 chk_has "M21 a re-run at R3 is refused" "$out" "refused:"
@@ -564,7 +573,7 @@ R6=$(head_of main)
 chk "M32 promoting dev's head" "$out" "promoted $R6"
 run_release main r6
 chk "M32 publishes the major the earlier promotion's breaking commit owed" "$(result)" "v3.0.0"
-chk "M32 naming the newest dev build" "$(detect release_kind_note)" 'Promoted from `v3.0.0-dev.2`'
+chk "M32 naming the newest dev build" "$(kind_line)" 'Promoted from `v3.0.0-dev.2`'
 
 # ── 14. main's release still running when a promotion starts ─────────────────
 commit_on dev "fix(deps): update module example.org/dep to v1.3.6" go.mod="$(gomod v1.3.6)" >/dev/null
@@ -659,7 +668,7 @@ chk "M46 a promotion whose claim is handed off tags nothing" "$out|$(tag_of "$rh
 AT=$SH run_release main handed-s
 chk "M46 the sync's run releases that version at the sync, whose tree holds the promotion" \
   "$(result)|$(tag_of "$rh_ver")|$(git -C "$O" merge-base --is-ancestor "$RH" "$SH" && echo held)" "$rh_ver|$SH|held"
-chk_has "M46 its notes name the promotion" "$(detect release_kind_note)" "including the promotion of"
+chk_has "M46 its notes name the promotion" "$(kind_line)" "including the promotion of"
 
 # ── 15. a lockfile-only commit on main ───────────────────────────────────────
 commit_on main "chore(deps): lock file maintenance" package-lock.json='{"lockfileVersion": 3}' >/dev/null
