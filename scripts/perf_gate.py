@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""The tier 2 performance gate: a web app's tests/perf/budgets.json against
-the results its harness measured, the provenance of every budget a pull
-request changes, and the ten-run calibration that proposes the budgets.
+"""The tier 2 performance gate: the guard of the timing cells a web app's harness
+measured against the baselines of its base tests/perf/budgets.json, the provenance
+check of that file, and the ten-run calibration that proposes it.
 
 A results file (`results.json`, one per measure shard) is
   {"schema": 1, "runner": str, "cpu_model": str,
    "cells": [{scenario, scale, engine, width, window, metric, kind, reps}],
    "seconds": [{scenario, scale, engine, width, seconds}]}
 where a metric is `<family>[:<qualifier>]` (`reads:/api/chats`) and kind is
-`time` (gated through its family's headroom), `server_cpu` (gated at its
-target), `count` (exact) or `report` (never gated).
+`time` or `server_cpu` (guarded when GUARD holds its family), `count` or `report`
+(information to the guard).
 """
 
 from __future__ import annotations
@@ -722,6 +722,231 @@ def summary(budgets: dict, out: Outcome) -> str:
             f'| {e.get("budget", "")} | {e.get("baseline", "")} | {target} '
             f'| {r["status"]}{flag} |'
         )
+    return '\n'.join(lines) + '\n'
+
+
+# --- the pull request guard ------------------------------------------------
+
+# Family to (ratio, floor): a cell fails over ratio x baseline and more than floor over it.
+# Four ten-run calibrations over seven runner classes put the worst one-job ratio of a pr
+# set cell clearing the floor at 1.88 for cpu_ms and 1.64 for server_cpu_ms, and of any
+# memory cell at 1.09.
+GUARD = {
+    'cpu_ms': (2.0, 250.0),
+    SERVER_CPU: (2.0, 10.0),
+    'heap_mb': (1.25, 2.0),
+    'rss_mb': (1.25, 50.0),
+}
+TIMING_KINDS = ('time', 'server_cpu')
+
+
+def baselines_from_budgets(doc: dict) -> tuple[str | None, dict[tuple, float]]:
+    """A budgets.json of any schema as its runner and each entry's numeric baseline by
+    key; every other field is ignored."""
+    entries = doc.get('budgets', [])
+    if not isinstance(entries, list):
+        raise TypeError('budgets.json: budgets must be a list')
+    out = {}
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict) or not all(isinstance(e.get(f), str) for f in KEY_FIELDS):
+            raise ValueError(f'budgets[{i}]: must be an object naming {", ".join(KEY_FIELDS)}')
+        if is_number(e.get('baseline')):
+            out[key(e)] = e['baseline']
+    runner = doc.get('runner')
+    return (runner if isinstance(runner, str) else None), out
+
+
+def is_timing(c: dict) -> bool:
+    return c.get('kind') in TIMING_KINDS and family(c['metric']) in GUARD
+
+
+def over_guard(metric: str, value: float, baseline: float) -> bool:
+    ratio, floor = GUARD[family(metric)]
+    return value > ratio * baseline and value - baseline > floor
+
+
+def guard_rule(metric: str) -> str:
+    ratio, floor = GUARD[family(metric)]
+    return f'{ratio}x and {floor:g}'
+
+
+def ratio_text(value: float, baseline: float) -> str:
+    return f'{value / baseline:.2f}' if baseline > 0 else ''
+
+
+def guard(
+    baselines: dict[tuple, float],
+    runner: str | None,
+    results: dict,
+    units: dict | None = None,
+) -> Outcome:
+    """Judge each measured timing cell's median of three against its base baseline: one
+    over the guard is listed in `remeasure`, never failed here. Counts and reports are
+    information. On the baselines' runner, a baselined timing cell of `units`
+    (planned_windows) that no shard measured fails, a server route a notice, and so does
+    a run that guarded no cell fail, since a guard that checks nothing must not pass."""
+    out = Outcome(runner=results.get('runner', ''))
+    out.runner_mismatch = out.runner != runner
+    guarded = 0
+    for c in results.get('cells', []):
+        reps = c.get('reps') or []
+        value = statistics.median(reps) if reps else None
+        baseline = baselines.get(key(c))
+        status = 'reported'
+        if not out.runner_mismatch and is_timing(c) and baseline is not None:
+            guarded += 1
+            if value is None:
+                out.failures.append(f'{key_text(key(c))}: measured no reps')
+                status = 'failed'
+            elif over_guard(c['metric'], value, baseline):
+                out.remeasure.append(c)
+                status = 'remeasure'
+            else:
+                status = 'ok'
+        out.rows.append({'cell': c, 'baseline': baseline, 'value': value, 'status': status})
+    if out.runner_mismatch:
+        return out
+    if units:
+        measured = {key(c) for c in results.get('cells', [])}
+        missed = [
+            k
+            for k in sorted(baselines)
+            if family(k[5]) in GUARD and planned(units, key_dict(k)) and k not in measured
+        ]
+        # A server cell exists only when its window requested the route, so a missing one
+        # is a change in what the page requests, not a cell the harness lost.
+        out.failures.extend(
+            f'{key_text(k)}: the base has a baseline for it, and no shard measured it'
+            for k in missed
+            if family(k[5]) != SERVER_CPU
+        )
+        out.notices.extend(
+            f'{key_text(k)}: the base has a baseline for this route, and no shard measured it'
+            for k in missed
+            if family(k[5]) == SERVER_CPU
+        )
+    if not guarded:
+        out.failures.append(
+            'nothing to guard: the base has a baseline for none of the timing cells this run '
+            'measured'
+        )
+    return out
+
+
+def guard_verdict(decided: dict, results: dict, remeasured: dict) -> Outcome:
+    """Fail each cell of compare's decision (its remeasure.json, every cell carrying its
+    base baseline) whose median of six reps, its first three and the three re-measured,
+    is still over the guard."""
+    out = Outcome(runner=results.get('runner', ''))
+    first = {key(c): c for c in results.get('cells', [])}
+    again = {key(c): c for c in remeasured.get('cells', [])}
+    for d in decided.get('cells', []):
+        name, baseline = key_text(key(d)), d.get('baseline')
+        if not is_number(baseline):
+            raise ValueError(f'{name}: the decision holds no numeric baseline for it')
+        more = again.get(key(d))
+        reps = (first.get(key(d)) or {}).get('reps') or []
+        if more is None or not more.get('reps') or not reps:
+            out.failures.append(f'{name}: listed for a re-measure but no reps came back')
+            continue
+        six = [*reps, *more['reps']]
+        value = statistics.median(six)
+        status = 'ok'
+        if over_guard(d['metric'], value, baseline):
+            status = 'failed'
+            ratio = ratio_text(value, baseline)
+            out.failures.append(
+                f'{name}: median of six {value} is {value - baseline:g} over its baseline '
+                f'{baseline}{f" ({ratio}x)" if ratio else ""}, past the guard of '
+                f'{guard_rule(d["metric"])}; reps {six}'
+            )
+        out.six.append(
+            {'cell': d, 'baseline': baseline, 'reps': six, 'value': value, 'status': status}
+        )
+    return out
+
+
+def differs(c: dict, baseline: float | None) -> bool:
+    return (
+        c.get('kind') == 'count'
+        and baseline is not None
+        and bool(c.get('reps'))
+        and any(v != baseline for v in middle(c['reps']))
+    )
+
+
+def guard_summary(out: Outcome) -> str:
+    lines = ['## Performance guard', '']
+    if out.runner_mismatch:
+        lines += [
+            (
+                f'The results come from runner `{out.runner}`, which the base baselines were '
+                'not measured on, so every metric is reported and none is guarded.'
+            ),
+            '',
+        ]
+    if out.failures:
+        lines += ['### Failures', '', *(f'- {f}' for f in out.failures), '']
+    if out.notices:
+        lines += ['### Notices', '', *(f'- {n}' for n in out.notices), '']
+    lines += table(
+        'Re-measured',
+        ('Cell', 'Baseline', 'Six reps', 'Median', 'Ratio', 'Status'),
+        (
+            (
+                key_text(key(s['cell'])),
+                s['baseline'],
+                ', '.join(map(str, s['reps'])),
+                s['value'],
+                ratio_text(s['value'], s['baseline']),
+                s['status'],
+            )
+            for s in out.six
+        ),
+    )
+    timed = [r for r in out.rows if r['status'] != 'reported']
+    lines += table(
+        'Guarded timing cells',
+        ('Cell', 'Baseline', 'Median', 'Ratio', 'Guard', 'Status'),
+        (
+            (
+                key_text(key(r['cell'])),
+                r['baseline'],
+                r['value'],
+                '' if r['value'] is None else ratio_text(r['value'], r['baseline']),
+                guard_rule(r['cell']['metric']),
+                r['status'],
+            )
+            for r in timed
+        ),
+    )
+    lines += table(
+        'Counts that differ from the base (information)',
+        ('Cell', 'Base', 'Measured'),
+        (
+            (
+                key_text(key(r['cell'])),
+                r['baseline'],
+                ', '.join(map(str, middle(r['cell']['reps']))),
+            )
+            for r in out.rows
+            if differs(r['cell'], r['baseline'])
+        ),
+    )
+    lines += table(
+        'Every other measured cell (information)',
+        ('Cell', 'Kind', 'Median', 'Base'),
+        (
+            (
+                key_text(key(r['cell'])),
+                r['cell'].get('kind', ''),
+                r['value'],
+                '' if r['baseline'] is None else r['baseline'],
+            )
+            for r in out.rows
+            if r['status'] == 'reported'
+        ),
+    )
     return '\n'.join(lines) + '\n'
 
 
@@ -2269,7 +2494,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     p.add_argument('--budgets', help='the head budgets.json')
     p.add_argument(
-        '--base', help="the base ref's budgets.json, where a missing file is an empty one"
+        '--base',
+        help="the base ref's budgets.json: the guard's baselines, and --check-file's base, "
+        'where a missing file is an empty one',
     )
     p.add_argument('--results', help='the downloaded perf-results-<prefix>-measure-* folders')
     p.add_argument(
@@ -2298,27 +2525,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         '--outputs', help='--plan: a $GITHUB_OUTPUT file to append matrix, node, scenarios to'
     )
-    p.add_argument(
-        '--commit',
-        help='the commit --calibrate measured, or the pull request head --record-out names',
-    )
+    p.add_argument('--commit', help='the commit --calibrate measured')
     p.add_argument('--runner', help='the runner --calibrate measured on')
     p.add_argument('--run-id', help='the run id of the perf-calibrate or perf-ci run')
     p.add_argument('--run-url', help='the perf-calibrate run URL')
-    p.add_argument('--run-attempt', help='the attempt of the perf-ci run --record-out names')
-    p.add_argument(
-        '--workflow-repository', help='owner/name of the repository whose perf-ci run this is'
-    )
-    p.add_argument(
-        '--workflow-sha',
-        help='--record-out: the cplieger/ci commit the perf-ci run ran, whose perf_gate.py '
-        'the summary tells the author to take the file with',
-    )
-    p.add_argument(
-        '--record-out',
-        metavar='DIR',
-        help='--verdict: write the counts it recorded to DIR/<run id>-<attempt>.json',
-    )
     p.add_argument('--reason', help='--take: the one-line reason the counts moved')
     p.add_argument(
         '--cells',
@@ -2337,18 +2547,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     elif a.check_file:
         need = ('base', 'sources', 'repo', 'head', 'base_sha')
     elif a.verdict:
-        need = ('budgets', 'results', 'prefix', 'remeasure_attempt', 'remeasure')
-        if a.record_out:
-            need += ('repo', 'head', 'commit', 'run_id', 'run_attempt', 'workflow_repository')
-            need += ('workflow_sha',)
+        need = ('results', 'prefix', 'remeasure_attempt', 'remeasure')
     elif a.take:
         need = ('budgets', 'reason')
     elif a.check_in:
         need = ('budgets', 'plan_doc', 'sources', 'repo', 'head', 'pr_body')
     else:
-        need = ('budgets', 'base', 'results', 'prefix', 'sources', 'repo', 'head', 'base_sha')
-        need += ('remeasure_out',)
-        need += ('plan_doc', 'set')
+        need = ('base', 'results', 'prefix', 'remeasure_out', 'plan_doc', 'set')
     missing = [f'--{n.replace("_", "-")}' for n in need if not getattr(a, n)]
     if missing:
         p.error(f'missing {", ".join(missing)}')
@@ -2527,38 +2732,6 @@ def run_check_in(a: argparse.Namespace) -> int:
     return 0
 
 
-def write_record(a: argparse.Namespace, out: Outcome, cpu: Iterable[str]) -> None:
-    """The measured file of the counts out recorded, as --record-out/<run id>-<attempt>.json,
-    named in out.measured_as for the summary; none when it recorded none."""
-    if not out.recorded:
-        return
-    url = f'https://github.com/{a.workflow_repository}/actions/runs/{a.run_id}/attempts/{a.run_attempt}'
-    src = parse_source(url)
-    if src is None:
-        raise ValueError(f'{url} is not a perf-ci run attempt the gate can name')
-    doc = record(
-        out,
-        repo=a.repo,
-        commit=a.commit,
-        measured_sha=a.head,
-        run_id=a.run_id,
-        run_attempt=a.run_attempt,
-        run_url=url,
-        workflow_repository=a.workflow_repository,
-        cpu_models=sorted(set(cpu)),
-    )
-    d = pathlib.Path(a.record_out)
-    d.mkdir(parents=True, exist_ok=True)
-    (d / f'{src.stem}.json').write_text(json.dumps(doc, indent=2) + '\n')
-    out.measured_as = MeasuredAs(
-        run_id=str(a.run_id),
-        repository=a.workflow_repository,
-        workflow_sha=a.workflow_sha,
-        artifact=f'perf-measured-{a.prefix}-attempt-{a.run_attempt}',
-        stem=src.stem,
-    )
-
-
 def run(a: argparse.Namespace) -> int:
     if a.calibrate:
         return run_calibrate(a)
@@ -2581,66 +2754,36 @@ def run(a: argparse.Namespace) -> int:
         for e in errors:
             print(f'::error::{e}')
         return 1 if errors else 0
-    budgets = load(a.budgets)
-    if check_shape(budgets):
-        out = Outcome(failures=check_rule(budgets))
-    elif a.verdict:
+    if a.verdict:
         results = merge_results(a.results, a.prefix)
         again = merge_results(a.verdict, a.prefix, 'remeasure', since=a.remeasure_attempt)
-        out = verdict(budgets, results, again, load(a.remeasure))
-        if a.record_out:
-            write_record(a, out, [*results['cpu_models'], *again['cpu_models']])
+        out = guard_verdict(load(a.remeasure), results, again)
     else:
-        held = held_reported(a)
-        checked = file_errors(a, budgets, held)
-        only = a.only.replace(',', ' ').split()
-        plan_doc = load(a.plan_doc)
-        matrix = plan(plan_doc, a.set, only=only)
-        units = planned_windows(c for job in matrix['include'] for c in job['cells'])
-        results = merge_results(a.results, a.prefix)
-        out = compare(budgets, results, units, checked.accepted, held)
-        out.notices += checked.notices + unmeasured_accepted(checked.accepted, out)
-        # A measured file of another runner is one load_source refuses, so nothing is stale,
-        # and a cell a held pattern reports records no exact value.
-        stale = (
-            set()
-            if out.runner_mismatch
-            else {k for k in checked.stale if not plan_reports(held, key_dict(k))}
-        )
-        judged = [c for c in results['cells'] if planned(units, c)]
-        out.remeasure = with_stale(out.remeasure, judged, stale)
-        out.failures = (
-            checked.errors + out.failures + retired_measured(budgets, results['cells'], held)
-        )
-        out.exact_moves = [
-            {**m, 'refused': [*m['refused'], plan_refusal('exact')]}
-            if plan_reports(held, key_dict(m['key']))
-            else m
-            for m in checked.moves
-        ]
-        out.retires = checked.retires
-        entries = {key(e): e for e in budgets.get('budgets', [])}
-        moved = {c['scenario'] for c in out.remeasure if entries[key(c)]['tier'] == 'exact'}
-        moved |= {k[0] for k in stale}
-        # A cell this pull request retires that only the full set measures is measured
-        # once more, so the verdict fails it if a shard still emits it.
-        for r in checked.retires:
-            if planned(planned_windows(extension(plan_doc, {}, {r['key'][0]})), key_dict(r['key'])):
-                moved.add(r['key'][0])
-        extend = extension(plan_doc, units, moved)
-        doc = {
-            'cells': out.remeasure,
-            'scenarios': sorted({c['scenario'] for c in [*out.remeasure, *extend]}),
-            'stale': [key_dict(k) for k in sorted(stale)],
-            'extend': extend,
-            'accepted': [{**key_dict(k), **v} for k, v in sorted(checked.accepted.items())],
-            'reported': held,
-        }
-        pathlib.Path(a.remeasure_out).write_text(json.dumps(doc, indent=2) + '\n')
-    report(a, summary(budgets, out))
+        out = run_guard(a)
+    report(a, guard_summary(out))
     for f in out.failures:
         print(f'::error::{f}')
     return 1 if out.failures else 0
+
+
+def run_guard(a: argparse.Namespace) -> Outcome:
+    """The guard's compare of --results against the baselines of --base, writing the red
+    cells with their baselines to --remeasure-out; a base with no file writes nothing."""
+    if not pathlib.Path(a.base).is_file():
+        return Outcome(
+            failures=['the base holds no tests/perf/budgets.json, so the guard has no baseline']
+        )
+    runner, baselines = baselines_from_budgets(load(a.base))
+    matrix = plan(load(a.plan_doc), a.set, only=a.only.replace(',', ' ').split())
+    units = planned_windows(c for job in matrix['include'] for c in job['cells'])
+    out = guard(baselines, runner, merge_results(a.results, a.prefix), units)
+    doc = {
+        'cells': [{**c, 'baseline': baselines[key(c)]} for c in out.remeasure],
+        'scenarios': sorted({c['scenario'] for c in out.remeasure}),
+        'extend': [],
+    }
+    pathlib.Path(a.remeasure_out).write_text(json.dumps(doc, indent=2) + '\n')
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
