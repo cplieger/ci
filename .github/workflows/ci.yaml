@@ -81,7 +81,7 @@ jobs:
 
       - name: Setup Go for the go-os matcher
         if: ${{ hashFiles('**/go.mod') != '' && steps.go-os-files-cache.outputs.cache-hit != 'true' }}
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: .cplieger-ci/scripts/go-os-files/go.mod
           cache: false
@@ -523,7 +523,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: ${{ fromJSON(needs.detect.outputs.go_work_dirs)[0] }}/go.mod
           cache-dependency-path: '**/go.sum'
@@ -858,7 +858,7 @@ jobs:
       - name: Setup Go
         id: integration-go
         if: ${{ !cancelled() && steps.integration.outputs.found == 'true' }}
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: true
@@ -1438,7 +1438,7 @@ jobs:
       # the tool cache, off PATH.
       - name: Setup Go for the lane probe
         if: ${{ hashFiles('scripts/go-os-files/go.mod') != '' }}
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: scripts/go-os-files/go.mod
           cache: false
