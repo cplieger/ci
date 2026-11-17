@@ -49,7 +49,8 @@ jobs:
       go_modules_to_release: ${{ steps.hold.outputs.go_modules_to_release || steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}
       go_halves: ${{ steps.gomodules.outputs.go_halves }}
       halves_to_publish: ${{ steps.halves.outputs.halves_to_publish || '[]' }}
-      # The root lane's release-kind line.
+      # The root's kind line, but an image or TS root with a pending promotion
+      # takes the barrier's, written after its wait.
       release_kind_note: ${{ steps.pending.outputs.root_kind_note }}
       # Per-lane state keyed '.' (root) or the lane dir, the lane matrix, the
       # repairs owed (those completing TS subpackages, and the image's, apart)
@@ -590,6 +591,56 @@ jobs:
 
           echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS syft_config='$SYFT_CONFIG' image_licenses='$IMAGE_LICENSES' runner_image_licenses='$RUNNER_IMAGE_LICENSES' binaries='$BINARIES'"
 
+  # ─── Claim the root version before any build ───────────────────────────────
+  # A push that edits workflow files and lands during the build makes GitHub
+  # refuse this run's ref create (tag-ref.sh tag_ref_or_handoff), so an image
+  # or TS root claims its tag here, minutes after the merge, and its publishing
+  # job only verifies it. A Go root's tag is its publication, so the go job
+  # tags after its API check. The condition is the root publishers' own, and
+  # the unclaim job deletes a claim nothing was written under.
+  claim:
+    needs: detect
+    if: |
+      needs.detect.outputs.release == 'true'
+      && ((needs.detect.outputs.type == 'docker'
+           && (needs.detect.outputs.root_changed == 'true' || needs.detect.outputs.subpackages_to_publish != '[]'))
+          || (needs.detect.outputs.type == 'ts' && needs.detect.outputs.root_changed == 'true'))
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    # statuses: write posts the handoff record (tag-ref.sh handoff_record).
+    permissions:
+      contents: write
+      statuses: write
+    outputs:
+      claimed: ${{ steps.claim.outputs.claimed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Claim the version
+        id: claim
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          VERSION: ${{ needs.detect.outputs.version }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          . "$CI_TOOLS/tag-ref.sh"
+          claim_version "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL"
+
   # ─── Repair each lane's unreceipted stable tag first ───────────────────────
   # A Go or lane tag follows its writes, and a root image or TS package with no
   # Release stops detect (release-state.sh receipts), so a failed run can leave
@@ -944,6 +995,8 @@ jobs:
     permissions:
       actions: write
       contents: read
+    outputs:
+      kind_note: ${{ steps.kind.outputs.kind_note }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -988,6 +1041,20 @@ jobs:
               ;;
           esac
           WORKFLOW="${path##*/}" bash "$CI_TOOLS/release-state.sh" barrier
+
+      # After the wait, which lets the dev run building the promoted commit
+      # post its receipt, so the line can name that build as proven.
+      - name: Write the release's kind line
+        id: kind
+        if: ${{ needs.detect.outputs.type == 'docker' || needs.detect.outputs.type == 'ts' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          STATE: ${{ needs.detect.outputs.lane_state }}
+          REPO_TYPE: ${{ needs.detect.outputs.type }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" kind-note
 
   # ─── Dev, mode=renumber: re-tag dev's newest builds ────────────────────────
   # Dispatched by a stable run's barrier. Checks out each lane's newest dev
@@ -1525,11 +1592,12 @@ jobs:
   # image too, so the shared version has its image, tag and Release before the
   # subpackage job.
   docker:
-    needs: [detect, repair, barrier]
+    needs: [detect, claim, repair, barrier]
     if: |
       !cancelled() && needs.detect.result == 'success'
       && (needs.repair.result == 'success' || needs.repair.result == 'skipped')
       && (needs.barrier.result == 'success' || needs.barrier.result == 'skipped')
+      && (needs.claim.result == 'success' || needs.claim.result == 'skipped')
       && needs.detect.outputs.type == 'docker'
       && (needs.detect.outputs.channel == 'stable'
           || (needs.detect.outputs.release == 'true'
@@ -1551,14 +1619,11 @@ jobs:
       version: ${{ needs.detect.outputs.base }}
       dev-version: ${{ needs.detect.outputs.dev_version }}
       exclude-re: ${{ needs.detect.outputs.exclude_re }}
-      release-needed: >-
-        ${{ (needs.detect.outputs.release == 'true' && (needs.detect.outputs.root_changed == 'true'
-        || needs.detect.outputs.subpackages_to_publish != '[]'))
-        && 'true' || 'false' }}
+      release-needed: ${{ needs.claim.outputs.claimed == 'true' && 'true' || 'false' }}
       go-modules: ${{ needs.detect.outputs.go_modules }}
       subpackages: ${{ needs.detect.outputs.subpackages }}
       defer-receipt: ${{ needs.detect.outputs.subpackages_to_publish != '[]' }}
-      release-kind-note: ${{ needs.detect.outputs.release_kind_note }}
+      release-kind-note: ${{ needs.barrier.outputs.kind_note || needs.detect.outputs.release_kind_note }}
       security-shas: ${{ needs.detect.outputs.security_shas }}
       registries: ${{ needs.detect.outputs.registries }}
       platforms: ${{ needs.detect.outputs.platforms }}
@@ -1974,13 +2039,13 @@ jobs:
 
   # ─── TypeScript library release (npm + JSR + tag + GitHub Release) ─────────
   ts:
-    needs: [detect, repair, barrier]
+    needs: [detect, claim, repair, barrier]
     if: |
       !cancelled() && needs.detect.result == 'success'
       && (needs.repair.result == 'success' || needs.repair.result == 'skipped')
       && (needs.barrier.result == 'success' || needs.barrier.result == 'skipped')
-      && needs.detect.outputs.type == 'ts' && needs.detect.outputs.root_changed == 'true'
-      && needs.detect.outputs.release == 'true'
+      && needs.detect.outputs.type == 'ts'
+      && needs.claim.result == 'success' && needs.claim.outputs.claimed == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
@@ -2031,9 +2096,9 @@ jobs:
           set -euo pipefail
           mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
 
-      # npm keeps every version it is given, so the version's git tag claims
-      # it first (docker-release.yaml's step of the same name).
-      - name: Claim the version
+      # npm keeps every version it is given, so the claim job's tag is verified
+      # before the first write (tag-ref.sh claim_held).
+      - name: Verify the claim
         id: claim
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2044,7 +2109,7 @@ jobs:
           set -euo pipefail
           . "$CI_TOOLS/retry.sh"
           . "$CI_TOOLS/tag-ref.sh"
-          claim_version "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL"
+          claim_held "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL"
 
       - name: Publish to npm + JSR
         if: ${{ steps.claim.outputs.claimed == 'true' }}
@@ -2095,8 +2160,8 @@ jobs:
           fi
 
       # The dev version's proof, after its last write (release-state.sh
-      # claims reads it); a failed POST leaves the claim for the next attempt
-      # (tag-ref.sh claim_version).
+      # claims reads it); a failed POST leaves the claim unproven, and the
+      # commit's next attempt reuses it (the claim job, or claim_held on a failed-jobs rerun).
       - name: Record the dev receipt
         if: ${{ steps.claim.outputs.claimed == 'true' && needs.detect.outputs.channel == 'dev' }}
         env:
@@ -2122,7 +2187,7 @@ jobs:
           CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
-          KIND_NOTE: ${{ needs.detect.outputs.release_kind_note }}
+          KIND_NOTE: ${{ needs.barrier.outputs.kind_note || needs.detect.outputs.release_kind_note }}
           SECURITY_SHAS: ${{ needs.detect.outputs.security_shas }}
         run: |
           set -euo pipefail
@@ -2159,14 +2224,15 @@ jobs:
 
   # ─── Subpackage publish (matrix over `*/jsr.json` dirs that changed) ───────
   subpackage:
-    needs: [detect, repair, barrier, docker, ts, go]
+    needs: [detect, claim, repair, barrier, docker, ts, go]
     # Publishes AFTER the root go/ts/docker job (needs-ordered), so the root
-    # tag precedes it. A failed repair or barrier skips the root jobs, so it
-    # is read directly.
+    # tag precedes it. A failed claim, repair or barrier skips the root jobs,
+    # so it is read directly.
     if: |
       always()
       && needs.detect.outputs.subpackages_to_publish != '[]'
       && needs.detect.outputs.release == 'true'
+      && (needs.claim.result == 'success' || needs.claim.result == 'skipped')
       && (needs.repair.result == 'success' || needs.repair.result == 'skipped')
       && (needs.barrier.result == 'success' || needs.barrier.result == 'skipped')
       && (needs.docker.result == 'success' || needs.docker.result == 'skipped')
@@ -2243,6 +2309,41 @@ jobs:
         run: |
           set -euo pipefail
           bash "$CI_TOOLS/publish-subpackage.sh"
+
+  # ─── Delete a claim nothing was written under ──────────────────────────────
+  # A root tag nothing was written under claims a version never published (on
+  # stable it stops the next run, release-state.sh receipts), so a run that
+  # ends before its first write under the claim job's tag (a failed gate, a
+  # skipped rebuild, a cancel) deletes it. The signal is the release/claim status claim_held posts before
+  # the first write, never a job output, which a failed job may not pass on.
+  unclaim:
+    needs: [detect, claim, docker, ts, subpackage]
+    if: ${{ always() && needs.claim.result != 'skipped' }}
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    # statuses: read finds the release/claim status.
+    permissions:
+      contents: write
+      statuses: read
+    steps:
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Delete an unused claim
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          . "$CI_TOOLS/tag-ref.sh"
+          claim_unused "$GITHUB_REPOSITORY" "$VERSION" "$GITHUB_SHA"
 
   # ─── Nested Go module lanes (matrix; independent <dir>/vX.Y.Z versions) ────
   # Each tracked nested go.mod is its own release lane: its version is

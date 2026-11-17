@@ -1,12 +1,12 @@
 # Reusable Docker publish workflow, called only by release.yaml. dev: build on
-# native amd64 and arm64 runners, claim the version with its dev tag, push
-# `:<dev-version>`, `:dev`, `:sha-<commit>`, sign, attest the SBOM, scan, then
-# post the receipt. stable: claim the version with its tag, tag `:vX.Y.Z`,
-# `:vX.Y`, `:vX`, `:latest` on the promoted dev digest (promote-digest.sh) or a
-# source build, copy to Docker Hub, re-scan, create the Release. Each
-# images/<name>/Dockerfile is a runner image of <image>-runner at the same
-# version (scripts/runner_images.py), pushed and signed before finalize, which
-# tags them after the app image.
+# native amd64 and arm64 runners, verify the caller's claim of the version's
+# dev tag, push `:<dev-version>`, `:dev`, `:sha-<commit>`, sign, attest the
+# SBOM, scan, then post the receipt. stable: verify the caller's claim of the
+# version's tag, tag `:vX.Y.Z`, `:vX.Y`, `:vX`, `:latest` on the promoted dev
+# digest (promote-digest.sh) or a source build, copy to Docker Hub, re-scan,
+# create the Release. Each images/<name>/Dockerfile is a runner image of
+# <image>-runner at the same version (scripts/runner_images.py), pushed and
+# signed before finalize, which tags them after the app image.
 name: Docker Release
 
 on:
@@ -75,8 +75,10 @@ on:
         default: ""
       release-kind-note:
         description: >-
-          The sentence saying how this stable release was made (release.yaml's
-          release_kind_note), handed to the notes renderer. Empty adds nothing.
+          The sentence saying how this stable release was made: the root's kind
+          line release.yaml computes (the barrier's after its wait, or detect's
+          when no promotion is pending), handed to the notes renderer. Empty
+          adds nothing.
         type: string
         default: ""
       subpackages:
@@ -1241,13 +1243,11 @@ jobs:
             exit 1
           fi
 
-      # The version's git tag is its claim, created before the first write
-      # under the version and never moved (tag-ref.sh): a version tagged at
-      # another commit refuses here, and a handoff publishes nothing, so no
-      # two commits share a version. A rerun at the tagged commit reuses it.
-      # The proof that the writes ran comes after them: the dev-receipt job's
-      # receipt, or the Release.
-      - name: Claim the version
+      # The caller's claim job took the version's tag before the build; this step
+      # only verifies it, and marks the writes as begun (tag-ref.sh claim_held owns
+      # its outcomes). The proof that the writes ran comes after them: the
+      # dev-receipt job's receipt, or the Release.
+      - name: Verify the claim
         id: claim
         if: ${{ env.PUBLISH == 'true' }}
         env:
@@ -1258,7 +1258,7 @@ jobs:
           set -euo pipefail
           . "$CI_TOOLS/retry.sh"
           . "$CI_TOOLS/tag-ref.sh"
-          claim_version "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$TAG" "$GITHUB_SHA" "$CHANNEL"
+          claim_held "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$TAG" "$GITHUB_SHA" "$CHANNEL"
 
       # Build arm: assemble the multi-arch index at the channel tags from the
       # per-arch digests. Promote arm: `imagetools create` with a single
@@ -2012,8 +2012,8 @@ jobs:
   # The claim's tag precedes every write, so only this receipt, after the
   # read back, shows the version published (release-state.sh claims reads
   # it). A dev tag has no Release, so the audit also reads it as the
-  # pipeline's mark. A failed POST leaves the claim unproven for the
-  # commit's next attempt (tag-ref.sh claim_version).
+  # pipeline's mark. A failed POST leaves the claim unproven, and the
+  # commit's next attempt reuses it (the caller's claim job).
   dev-receipt:
     needs: [prepare, verify-publish]
     if: ${{ always() && needs.verify-publish.result == 'success' && inputs.channel == 'dev' }}

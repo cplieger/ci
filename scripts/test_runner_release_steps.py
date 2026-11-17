@@ -653,7 +653,7 @@ class FinalizeRunnerTags(unittest.TestCase):
         at = self.names.index(self.WRITE)
         self.assertEqual(at, self.names.index('Publish channel tags on GHCR') + 1)
         for refusal in (
-            'Claim the version',
+            'Verify the claim',
             "Verify the promoted build's signature and SBOM",
             "Read the promoted build's SBOM",
             'Download the signed runner digests',

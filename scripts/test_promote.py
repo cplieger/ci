@@ -1807,6 +1807,54 @@ class Preview(unittest.TestCase):
         self.assertIn('### root: no release', text)
         self.assertEqual(self.plan_line(stdout), 'release-plan: {".":""}')
 
+    def test_an_image_promotion_previews_its_notes_with_no_token_and_no_kind_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m = fx.commit(
+                'feat: init',
+                {
+                    'Dockerfile': 'FROM scratch\n',
+                    'main.go': 'package main\n',
+                    'cliff.toml': CLIFF_STABLE,
+                },
+            )
+            fx.g('tag', 'v1.0.0')
+            fx.g('checkout', '-q', '-b', 'dev')
+            t = fx.commit('feat: add greeting (#7)', {'main.go': 'package main\n\n// hi\n'})
+            fx.g('tag', 'v1.1.0-dev.1')
+            fx.publish()
+            tokens, plans = [], []
+            real_run, real_plan = subprocess.run, promote.release_plan
+
+            def run(cmd, **kw):
+                if cmd[0] == 'bash':
+                    tokens.append((Path(cmd[1]).name, kw.get('env', os.environ).get('GH_TOKEN')))
+                return real_run(cmd, **kw)
+
+            def release_plan(*a):
+                plans.append(real_plan(*a))
+                return plans[-1]
+
+            with (
+                unittest.mock.patch.object(promote.subprocess, 'run', run),
+                unittest.mock.patch.object(promote, 'release_plan', release_plan),
+            ):
+                rc, text, stdout, _ = self.run_preview(fx, m, t)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":"v1.1.0"}')
+        tools = {'release-state.sh', 'compute.sh', 'path-significance.sh'}
+        self.assertEqual({name for name, _ in tokens} & tools, tools)
+        self.assertEqual({token for name, token in tokens if name in tools}, {None})
+        self.assertEqual(plans[0]['.']['kind_note'], '')
+        self.assertNotIn('Promoted from', text)
+        self.assertIn('### root v1.1.0\n\n### Added\n\n- Add greeting (#7)', text)
+        self.assertIn(
+            'compare/v1.0.0...v1.1.0\n\nWhen the release run writes these notes, their first line '
+            "names the promoted commit's nearest `dev` build when it is proven published by then, "
+            'or the `dev` commit otherwise.',
+            text,
+        )
+
     def test_a_repository_with_no_release_lane_says_so(self):
         with tempfile.TemporaryDirectory() as tmp:
             fx = Fixture(tmp)
