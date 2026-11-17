@@ -202,7 +202,8 @@ class Wiring(unittest.TestCase):
         )
 
     def test_a_sampler_that_exits_first_does_not_fail_a_finished_shard(self):
-        # GitHub runs a step with no shell: as `bash --noprofile --norc -eo pipefail {0}`.
+        # The runner runs a step with no `shell:` as `bash -e {0}`, without pipefail
+        # (actions/runner src/Runner.Worker/Handlers/ScriptHandler.cs).
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         (tmp / 'scripts').mkdir()
         (tmp / 'scripts' / 'runner-sample.py').write_text('raise SystemExit(0)\n')
@@ -211,7 +212,7 @@ class Wiring(unittest.TestCase):
         body.write_text(self.step('Run stryker')['run'])
         out = tmp / 'output'
         proc = subprocess.run(
-            ['bash', '--noprofile', '--norc', '-eo', 'pipefail', str(body)],
+            ['bash', '-e', str(body)],
             cwd=tmp,
             env={
                 **os.environ,

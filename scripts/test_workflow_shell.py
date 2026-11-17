@@ -1,7 +1,9 @@
 """Every bash `run:` block of the covered workflows opens with strict mode.
 
-GitHub's default bash invocation supplies errexit and pipefail but not nounset,
-and shellcheck does not report a missing prologue, so this is the only gate.
+The runner runs a block with no `shell:` as `bash -e {0}`, errexit alone
+(actions/runner src/Runner.Worker/Handlers/ScriptHandler.cs), so the prologue is what
+adds pipefail and nounset; shellcheck does not report a missing one, so this is
+the only gate.
 """
 
 from __future__ import annotations

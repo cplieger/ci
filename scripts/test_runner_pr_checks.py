@@ -50,7 +50,7 @@ def repo(root: Path, files: dict[str, str]) -> Path:
 
 def run_body(body: str, cwd: Path, env: dict) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ['bash', '-eo', 'pipefail', '-c', body],
+        ['bash', '-e', '-c', body],
         cwd=cwd,
         capture_output=True,
         text=True,

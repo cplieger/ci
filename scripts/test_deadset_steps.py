@@ -224,7 +224,7 @@ class Harness(unittest.TestCase):
             **(env or {}),
         }
         proc = subprocess.run(
-            ['bash', '--noprofile', '--norc', '-eo', 'pipefail', str(script)],
+            ['bash', '-e', str(script)],
             cwd=cwd,
             env=full_env,
             capture_output=True,
