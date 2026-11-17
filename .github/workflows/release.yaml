@@ -1592,9 +1592,9 @@ jobs:
     needs: [detect, claim, repair, barrier]
     if: |
       !cancelled() && needs.detect.result == 'success'
-      && (needs.claim.result == 'success' || needs.claim.result == 'skipped')
       && (needs.repair.result == 'success' || needs.repair.result == 'skipped')
       && (needs.barrier.result == 'success' || needs.barrier.result == 'skipped')
+      && (needs.claim.result == 'success' || needs.claim.result == 'skipped')
       && needs.detect.outputs.type == 'docker'
       && (needs.detect.outputs.channel == 'stable'
           || (needs.detect.outputs.release == 'true'
