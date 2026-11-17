@@ -552,7 +552,12 @@ class Record(unittest.TestCase):
         text = perf_gate.summary(b, out)
         self.assertIn('### Measured moves to check in', text)
         self.assertIn(f'| {DOM} | 640 | 641 | 641, 641, 641, 641, 641, 641 |', text)
-        self.assertIn('This run wrote no measured file', text)
+        self.assertIn(
+            'This run wrote no signed measured file: a merge queue run measures no pull '
+            'request head, and a pull request from a fork gets no id token. Take the counts '
+            'from a run of the head on a branch of the repository.',
+            text,
+        )
         self.assertNotIn('--take', text)
 
     def test_an_unmoved_or_noisy_count_is_not_recorded(self):
@@ -3433,6 +3438,31 @@ class Cli(unittest.TestCase):
         self.assertIn('Slower on purpose', self.output)
         self.assertEqual(self.compare(measured, *argv), 1)
         self.assertIn('delete accepted/slow.json', self.output)
+
+    def test_compare_names_an_accepted_slowdown_of_a_cell_it_did_not_measure(self):
+        class Git(FakeGit):
+            def __init__(self):
+                super().__init__()
+                self.added = {'slow.json': 'ovr'}
+
+        # The full set alone lists files x1, so the pr set never measures it.
+        x1 = {**entry(source=RUN_URL + '100'), 'scale': 'x1'}
+        slow = {
+            'reason': 'a slower parse on purpose',
+            'cells': [{**CELL, 'scale': 'x1', 'metric': 'cpu_ms', 'budget': 1700.0}],
+        }
+        self.put('accepted/slow.json', slow)
+        measured = [cell(), cell('dom', (640,) * 3, kind='count')]
+        argv = ('--accepted', str(self.dir / 'accepted'))
+        self.assertEqual(self.compare(measured, *argv, entries=[x1], git=Git), 0, self.output)
+        text = (self.dir / 'summary.md').read_text()
+        notices = text.split('### Notices', 1)[1]
+        self.assertIn(
+            'files/x1/chromium/desktop/cold/cpu_ms: accepted/slow.json gives budget 1700.0 '
+            '(a slower parse on purpose); this run did not measure the cell',
+            notices,
+        )
+        self.assertNotIn('Slower on purpose', text)
 
     def test_compare_fails_on_a_listed_cell_no_shard_measured(self):
         self.assertEqual(self.compare([cell()]), 1)

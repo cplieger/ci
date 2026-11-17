@@ -5,8 +5,7 @@
 # calibration only from a file whose bundle names this workflow at
 # refs/heads/main as its signer in a cplieger/ci run, so a run dispatched from
 # any other ref, or a call from another repository, proposes numbers no budget
-# can cite. weekly-perf-calibrate.yaml calls it every week; a dispatch
-# calibrates one repository now.
+# can cite.
 name: Performance calibrate
 run-name: Calibrate ${{ inputs.repo }} full x10
 
@@ -180,8 +179,7 @@ jobs:
 
   # Rewrites the default branch's budgets from the signed calibration and opens
   # the pull request, which merges on its own ci / validate. It runs only
-  # perf_gate.py and git on the checkout, never the repository's code, so the
-  # App token it holds meets nothing the repository wrote.
+  # perf_gate.py and git on the checkout, never the repository's code.
   check-in:
     needs: [check, propose]
     runs-on: ubuntu-26.04

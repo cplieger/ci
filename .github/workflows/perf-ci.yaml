@@ -414,9 +414,12 @@ jobs:
             echo "::error::a remeasure shard ended ${REMEASURED}, so no red cell can be judged on six reps"
             exit 1
           fi
-          # The plan names no head on a merge queue run, which records no measured file.
+          # The plan names no head on a merge queue run, and GitHub gives a pull
+          # request from a fork no id token to sign with: neither records a measured file.
           record=()
-          if [ -n "$COMMIT" ]; then
+          if [ -n "$COMMIT" ] && [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::warning::this run has no id token, as on a pull request from a fork, so it records no measured file. Push the head to a branch of the repository to measure it there"
+          elif [ -n "$COMMIT" ]; then
             record=(
               --record-out "$RUNNER_TEMP/measured"
               --repo "$REPO"
@@ -454,11 +457,6 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          # GitHub gives a pull request from a fork no id token.
-          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-            echo "::warning::this run has no id token, as on a pull request from a fork, so its measured file is not signed. Push the head to a branch of the repository to measure it there"
-            exit 0
-          fi
           . "$CI_TOOLS/retry.sh"
           file="$RUNNER_TEMP/measured/${RUN_ID}-${RUN_ATTEMPT}.json"
           retry cosign sign-blob --yes "$file" --bundle "${file%.json}.sigstore.json"

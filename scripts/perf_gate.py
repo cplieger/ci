@@ -543,6 +543,18 @@ def judge_extension(
     )
 
 
+def unmeasured_accepted(accepted: dict, out: Outcome) -> list[str]:
+    """A notice for each accepted slowdown of a cell compare measured no rep of, since
+    only judge() on a measured cell lists the others."""
+    measured = {key(r['cell']) for r in out.rows}
+    return [
+        f'{key_text(k)}: accepted/{a["file"]} gives budget {a["budget"]} ({a["reason"]}); '
+        'this run did not measure the cell'
+        for k, a in sorted(accepted.items())
+        if k not in measured
+    ]
+
+
 def accepted_cells(found: list) -> dict:
     """compare's accepted list as {key: {budget, reason, file}}."""
     return {
@@ -599,8 +611,9 @@ def take_steps(m: MeasuredAs | None) -> str:
     lead = 'Each count below moved, or its checked-in source no longer holds. '
     if m is None:
         return lead + (
-            'This run wrote no measured file, as a merge queue run measures no pull request '
-            "head, so take the counts from the measured file of the pull request's own run."
+            'This run wrote no signed measured file: a merge queue run measures no pull '
+            'request head, and a pull request from a fork gets no id token. Take the counts '
+            'from a run of the head on a branch of the repository.'
         )
     return lead + (
         f'Take them: `gh run download {m.run_id} -R {m.repository} -n {m.artifact} '
@@ -2513,6 +2526,7 @@ def run(a: argparse.Namespace) -> int:
         units = planned_windows(c for job in matrix['include'] for c in job['cells'])
         results = merge_results(a.results, a.prefix)
         out = compare(budgets, results, units, checked.accepted)
+        out.notices += unmeasured_accepted(checked.accepted, out)
         # A measured file of another runner is one load_source refuses, so nothing is stale.
         stale = set() if out.runner_mismatch else checked.stale
         judged = [c for c in results['cells'] if planned(units, c)]

@@ -376,16 +376,31 @@ class Gate(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(outputs(tmp)['head'], want)
         v = step(self.jobs['verdict'], 'Verdict')
+        token = {'ACTIONS_ID_TOKEN_REQUEST_URL': 'https://token'}
         for commit, records in (('abc', True), ('', False)):
             with self.subTest(commit=commit):
                 env = dict.fromkeys(v['env'], '') | {'REMEASURED': 'success', 'COMMIT': commit}
                 stub = '#!/usr/bin/env bash\necho "python3 $*" >> "$STUB_LOG"\n'
-                proc, tmp = run_body(self, v['run'], env, {'python3': stub})
+                proc, tmp = run_body(self, v['run'], env | token, {'python3': stub})
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 log = (tmp / 'log').read_text()
                 self.assertIn('--verdict', log)
                 self.assertEqual('--record-out' in log, records, log)
                 self.assertEqual('--commit' in log, records, log)
+                self.assertNotIn('::warning::', proc.stdout)
+
+    def test_a_run_with_no_id_token_records_nothing_and_says_why(self):
+        v = step(self.jobs['verdict'], 'Verdict')
+        env = dict.fromkeys(v['env'], '') | {'REMEASURED': 'success', 'COMMIT': 'abc'}
+        stub = '#!/usr/bin/env bash\necho "python3 $*" >> "$STUB_LOG"\n'
+        proc, tmp = run_body(self, v['run'], env, {'python3': stub})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log = (tmp / 'log').read_text()
+        self.assertIn('--verdict', log)
+        self.assertNotIn('--record-out', log)
+        self.assertEqual(outputs(tmp), {})
+        self.assertIn('::warning::', proc.stdout)
+        self.assertIn('fork', proc.stdout)
 
 
 COSIGN_STUB = """#!/usr/bin/env bash
@@ -466,14 +481,6 @@ class Signing(unittest.TestCase):
         self.assertEqual(
             sign['if'], "${{ !cancelled() && steps.verdict.outputs.recorded == 'true' }}"
         )
-
-    def test_a_run_with_no_id_token_signs_nothing_and_says_why(self):
-        proc, out, tmp = self.sign()
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(out, {})
-        self.assertFalse((tmp / 'log').exists())
-        self.assertIn('::warning::', proc.stdout)
-        self.assertIn('fork', proc.stdout)
 
     def test_a_signature_that_fails_fails_the_step(self):
         failing = '#!/usr/bin/env bash\necho "cosign $*" >> "$STUB_LOG"\nexit 1\n'
