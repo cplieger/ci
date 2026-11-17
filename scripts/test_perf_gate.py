@@ -313,7 +313,10 @@ class Compare(unittest.TestCase):
         self.assertTrue(out.runner_mismatch)
         self.assertEqual((out.failures, out.remeasure), ([], []))
         self.assertEqual(len(out.reported), 2)
-        self.assertIn('calibrate', perf_gate.summary(b, out).lower())
+        text = perf_gate.summary(b, out)
+        self.assertIn(f'Measure on `{b["runner"]}` to gate it.', text)
+        # perf-calibrate.yaml takes no runner, so it is no step that gates this one.
+        self.assertNotIn('perf-calibrate.yaml', text)
 
     def test_an_empty_budget_list_reports_every_cell_and_fails_nothing(self):
         cells = [cell(reps=(9000.0, 9000.0, 9000.0)), cell('dom', (9, 9, 9), kind='count')]
@@ -364,6 +367,18 @@ class Compare(unittest.TestCase):
         self.assertEqual(perf_gate.compare(b, results(measured), units).failures, [])
         self.assertEqual(perf_gate.compare(b, results([]), {}).failures, [])
         self.assertEqual(perf_gate.compare(b, results([], runner='x'), units).failures, [])
+
+    def test_an_entry_of_a_cell_a_held_pattern_matches_is_judged_reported(self):
+        b = budgets([entry(), entry('dom', 'exact', 640)])
+        units = perf_gate.planned_windows([unit('files', 80)])
+        held = [{'metric': 'dom'}]
+        off = results([cell(), cell('dom', (700,) * 3, kind='count')])
+        judged = perf_gate.compare(b, off, units)
+        self.assertEqual([keyof(c) for c in judged.remeasure], [keyof(entry('dom'))])
+        out = perf_gate.compare(b, off, units, reported=held)
+        self.assertEqual((out.remeasure, out.failures), ([], []))
+        self.assertEqual([keyof(c) for c in out.reported], [keyof(entry('dom'))])
+        self.assertEqual(perf_gate.compare(b, results([cell()]), units, reported=held).failures, [])
 
     def test_a_cell_that_lists_windows_needs_a_result_only_for_those(self):
         # The pr set measures WebKit x10 cold only; budgets.json holds the
@@ -707,6 +722,23 @@ class Extension(unittest.TestCase):
         self.assertEqual(perf_gate.extension(PLAN, full, {'files'}), [])
         with self.assertRaisesRegex(TypeError, 'no full set'):
             perf_gate.extension({'sets': {'pr': PLAN['sets']['pr']}}, units, {'files'})
+
+    def test_a_cell_a_held_pattern_matches_is_reported_in_the_verdict(self):
+        x1 = {'scale': 'x1'}
+        b = budgets([entry('dom', 'exact', 640), {**entry('dom', 'exact', 640), **x1}])
+        first = results([cell('dom', (700,) * 3, kind='count')])
+        extend = [unit('files', 60, scale='x1')]
+        again = results([{**cell('dom', (700,) * 3, kind='count'), **x1}])
+        judged = perf_gate.verdict(b, first, again, decision(extend=extend))
+        self.assertEqual(len(judged.failures), 2, judged.failures)
+        held = decision(extend=extend, reported=[{'metric': 'dom'}])
+        out = perf_gate.verdict(b, first, again, held)
+        self.assertEqual(out.failures, [])
+        self.assertEqual(
+            sorted(keyof(c) for c in out.reported),
+            sorted([keyof(entry('dom')), keyof({**entry('dom'), **x1})]),
+        )
+        self.assertEqual(perf_gate.verdict(b, first, results([]), held).failures, [])
 
     def test_a_retired_cell_the_extension_measured_fails(self):
         retired = [{**CELL, 'scale': 'x1', 'metric': 'dom', 'reason': 'the list is virtual now'}]
@@ -1616,6 +1648,74 @@ class Provenance(unittest.TestCase):
                 self.assertIn(want, errors[0])
                 self.assertEqual(self.stale, set())
 
+    def schema_1_base(self, *entries):
+        """A base budgets.json of schema 1, whose sources the base tree holds under another
+        directory: git shows none of them under sources."""
+        base = budgets(list(entries), schema=1)
+        del base['target']
+        for e in entries:
+            self.git.shown[f'{e["source"].rsplit("/", 1)[1]}.json'] = perf_gate.GitError
+        return base
+
+    def resourced(self):
+        """A head whose exact entry leaves the base's calibration 100 for calibration 200 of
+        the base commit, ba5e."""
+        self.git.lineage = {('ba5e', HEAD)}
+        self.dom('200', 2056.0, 'ba5e')
+        return budgets([self.exact('200', 2056.0)])
+
+    def test_a_schema_1_base_holds_no_entry_to_its_base_entrys_source(self):
+        head = self.resourced()
+        errors = self.check(head, self.schema_1_base(self.exact('100', 2055.0)), base_sha='ba5e')
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            self.checked.notices,
+            [
+                (
+                    'the base budgets.json is schema 1, which names no source this gate can '
+                    "place, so no entry was held to a source as new as its base entry's"
+                )
+            ],
+        )
+        # The same base at schema 2 places its source, or fails closed.
+        base = self.moved_from()
+        self.git.shown['100.json'] = perf_gate.GitError
+        errors = self.check(head, base, base_sha='ba5e')
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith(f"{DOM}: the base's calibration 100: "), errors)
+        self.assertEqual(self.checked.notices, [])
+
+    def test_a_schema_1_base_keeps_every_head_side_check(self):
+        cases = {
+            'a bundle that does not verify': (
+                lambda: self.bad_bundles.add('200.sigstore.json'),
+                'calibration 200: the bundle does not verify',
+            ),
+            'a calibration of a pull request': (
+                lambda: self.dom('200', 2056.0, 'pr-tip'),
+                'which the base ba5e does not hold',
+            ),
+            'a baseline its calibration did not measure': (
+                lambda: self.dom('200', 2057.0, 'ba5e'),
+                "baseline 2056.0 is not calibration 200's 2057.0",
+            ),
+        }
+        for name, (setup, want) in cases.items():
+            with self.subTest(name):
+                self.bad_bundles = set()
+                head = self.resourced()
+                self.git.lineage.add(('pr-tip', HEAD))
+                setup()
+                errors = self.check(
+                    head, self.schema_1_base(self.exact('100', 2055.0)), base_sha='ba5e'
+                )
+                self.assertTrue(any(want in x for x in errors), errors)
+
+    def test_a_base_with_no_entries_logs_no_skip(self):
+        head = self.resourced()
+        self.assertEqual(self.check(head, {'budgets': []}, base_sha='ba5e'), [])
+        self.assertEqual(self.checked.notices, [])
+
     def test_an_unplaceable_calibration_is_one_error_for_the_entries_naming_it(self):
         self.git.added = {'200.json': 'squash'}
         self.git.lineage = {('squash', HEAD)}
@@ -1732,6 +1832,20 @@ class Provenance(unittest.TestCase):
         self.assertEqual(self.check(why, why), [])
         lower = {'cpu_ms': 50, 'heap_mb': 0.5}
         self.assertEqual(self.check(budgets(why['budgets'], floor=lower), why), [])
+        # Only an edit of the entry's own family excuses its reason.
+        self.write('111', calibration_file([cal_cell(baseline=1200.0)]))
+        heap = {'cpu_ms': 1.5, 'heap_mb': 1.4, 'rss_mb': 1.25}
+        raised = budgets([entry(baseline=1200.0, reason='slower parse')], headroom=heap)
+        base = budgets([entry(baseline=1000.0, source=RUN_URL + '100')])
+        self.assertEqual(
+            self.check(raised, base),
+            [
+                (
+                    f'{CPU}: a reason belongs on a measured value, or on a budget a headroom, floor '
+                    'or target edit raises'
+                )
+            ],
+        )
 
     def test_a_lowered_entry_matching_its_signed_file_passes(self):
         self.write('111', calibration_file([cal_cell(baseline=900.0)]))
@@ -1885,6 +1999,37 @@ class Provenance(unittest.TestCase):
                     self.assertIn('without a reason', ' '.join(errors))
                     why = entry(baseline=baseline, budget=raised, reason='slower parse')
                     self.assertEqual(self.check(budgets([why], **edit), base), [])
+
+    def test_a_file_edit_asks_a_reason_only_of_the_budgets_its_family_moves(self):
+        srv = entry('server_cpu_ms', baseline=20.0, budget=63.0)
+        dom = {'tier': 'exact', 'kind': 'count'}
+        cells = [
+            cal_cell(baseline=1100.0),
+            cal_cell('dom', baseline=641, **dom),
+            cal_cell('server_cpu_ms', baseline=20.0, kind='server_cpu'),
+        ]
+        self.write('111', calibration_file(cells))
+        base = budgets(
+            [entry(), entry('dom', 'exact', 640), {**srv, 'budget': 70.0}],
+            target={'server_cpu_ms': 70.0},
+        )
+        # A target edit moves no cpu_ms budget, and no file edit moves an exact one.
+        head = budgets([entry(baseline=1100.0), entry('dom', 'exact', 641), srv])
+        self.assertEqual(self.check(head, base), [])
+        wide = {'cpu_ms': 1.6, 'heap_mb': 1.25, 'rss_mb': 1.25}
+        head = budgets(
+            [entry(baseline=1100.0, budget=1760.0), entry('dom', 'exact', 641), srv],
+            headroom=wide,
+        )
+        self.assertEqual(
+            self.check(head, base),
+            [
+                (
+                    f'{CPU}: the file headroom or floor raises its budget from 1500.0 to 1760.0 '
+                    'without a reason'
+                )
+            ],
+        )
 
     def test_a_headroom_edit_rechecks_an_entry_whose_fields_did_not_change(self):
         lowered = {'cpu_ms': 1.4, 'heap_mb': 1.25, 'rss_mb': 1.25}
@@ -2329,10 +2474,11 @@ class GitHistory(unittest.TestCase):
 
 
 class Coverage(unittest.TestCase):
-    def check(self, doc, plan, base=None):
-        """check_plan with the patterns plan and base, plan itself when unset, both hold."""
+    def check(self, doc, plan, base=None, was=None):
+        """check_plan with the patterns plan and base, plan itself when unset, both hold,
+        against the base budgets was, which holds no entry when unset."""
         held = perf_gate.held_patterns(plan, plan if base is None else base)
-        return perf_gate.check_plan(doc, plan, reported=held)
+        return perf_gate.check_plan(doc, plan, reported=held, base=was or budgets([]))
 
     def test_a_pattern_only_the_head_plan_lists_decides_no_tier(self):
         frames = entry('sse_frames', 'exact', 3)
@@ -2390,7 +2536,7 @@ class Coverage(unittest.TestCase):
         full = {'shards': 1, 'cells': [unit('files', 25, **webkit)]}
         self.assertEqual(self.check(doc, {'node': '.', 'sets': {'pr': pr, 'full': full}}), [])
 
-    def test_a_gated_or_exact_entry_of_a_cell_the_plan_reports_fails(self):
+    def test_a_gated_or_exact_entry_added_or_changed_for_a_cell_the_plan_reports_fails(self):
         frames = entry('sse_frames', 'exact', 3)
         live = {**frames, 'window': 'live'}
         engine = entry('max_bytes:GET /api/engine', 'exact', 900)
@@ -2410,6 +2556,21 @@ class Coverage(unittest.TestCase):
         )
         quiet = budgets([entry(), {**frames, 'tier': 'reported'}, live])
         self.assertEqual(self.check(quiet, {**PLAN, 'reported': reported}), [])
+        # An entry the base holds as it is waits for the calibration to rewrite it.
+        self.assertEqual(self.check(doc, {**PLAN, 'reported': reported}, was=doc), [])
+        moved = budgets([entry(), {**frames, 'baseline': 4, 'budget': 4}, live, engine])
+        errors = self.check(moved, {**PLAN, 'reported': reported}, was=doc)
+        self.assertEqual(errors, [f'files/x10/chromium/desktop/cold/sse_frames{tail}'])
+        # A file headroom edit recomputes a held gated budget; only a calibrated field fails.
+        cpu = {**PLAN, 'reported': [{'metric': 'cpu_ms'}]}
+        wide = {'cpu_ms': 1.6, 'heap_mb': 1.25, 'rss_mb': 1.25}
+        edit = budgets([entry(budget=1600.0, reason='wider headroom')], headroom=wide)
+        self.assertEqual(self.check(edit, cpu, was=budgets([entry()])), [])
+        rebased = budgets([entry(baseline=1100.0, budget=1760.0)], headroom=wide)
+        self.assertEqual(
+            self.check(rebased, cpu, was=budgets([entry()])),
+            [f'{CPU}: plan.json reports this cell, so its entry is reported, not gated'],
+        )
 
     def test_a_reported_pattern_of_the_wrong_shape_is_an_error_line(self):
         for reported in (
@@ -3155,8 +3316,10 @@ class Cli(unittest.TestCase):
     ):
         own = [entry(source=RUN_URL + '100'), entry('dom', 'exact', 640)] if listed else []
         b = self.put('budgets.json', budgets([*own, *entries], **doc))
-        # The base branch's file is the head's unless base lists its entries.
-        was = b if base is None else self.put('base.json', budgets(base))
+        # The base branch's file is the head's unless base lists its entries or is a document.
+        if base is not None and not isinstance(base, dict):
+            base = budgets(base)
+        was = b if base is None else self.put('base.json', base)
         # Each entry's calibration, checked in at the head, as the provenance check needs.
         for e in [*own, *entries]:
             if not isinstance(e, dict) or not str(e.get('source', '')).startswith(RUN_URL):
@@ -3364,13 +3527,52 @@ class Cli(unittest.TestCase):
         remeasure = json.loads((self.dir / 'remeasure.json').read_text())
         self.assertEqual([keyof(c) for c in remeasure['cells']], [keyof(entry('dom'))])
         self.assertEqual(remeasure['reported'], [])
-        # A pattern the base plan holds too decides the tier.
-        self.assertEqual(self.compare(measured, plan=reports), 1)
+        demoted = (
+            f'{DOM}: plan.json adds a reported pattern that matches this exact entry, so it '
+            'stops gating once this pull request merges'
+        )
+        self.assertIn(f'- {demoted}\n', (self.dir / 'summary.md').read_text())
+        self.assertNotIn(f'{CPU}: plan.json adds', self.output)
+        argv = ('--check-file', str(self.dir / 'budgets.json'))
+        argv += ('--base', str(self.dir / 'budgets.json'), '--sources', str(self.dir / 'sources'))
+        argv += ('--repo', REPO, '--head', HEAD)
+        argv += ('--base-sha', HEAD, '--plan-doc', str(self.dir / 'plan.json'))
+        self.assertEqual(self.main(*argv), 0, self.output)
+        self.assertEqual(self.output, f'::notice::{demoted}\n')
+        # A pattern the base plan holds too decides the tier: the base's entry is reported.
+        self.assertEqual(self.compare(measured, plan=reports), 0, self.output)
+        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
+        self.assertEqual((remeasure['cells'], remeasure['reported']), ([], [{'metric': 'dom'}]))
+        self.assertNotIn('plan.json adds', self.output)
+        # Its entry's provenance still fails, but it is no stale exact value to re-measure.
+        url = MEASURED_URL + '900/attempts/1'
+        moved = {**entry('dom', 'exact', 2056, source=url, reason='one more node'), 'scale': 'x1'}
+        self.assertEqual(self.compare(measured, entries=[moved], plan=reports), 1)
+        self.assertIn('measured file 900-1: 900-1.json and 900-1.sigstore.json', self.output)
+        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
+        self.assertEqual((remeasure['stale'], remeasure['extend']), ([], []))
+        # An exact entry the pull request adds for it fails.
+        rc = self.compare(measured, plan=reports, base=[entry(source=RUN_URL + '100')])
+        self.assertEqual(rc, 1)
         self.assertIn(
             'plan.json reports this cell, so its entry is reported, not exact', self.output
         )
-        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
-        self.assertEqual(remeasure['reported'], [{'metric': 'dom'}])
+
+    def test_an_exact_move_a_held_pattern_matches_is_refused_in_its_check_column(self):
+        own = entry(source=RUN_URL + '100')
+        moved = entry('dom', 'exact', 641, source=RUN_URL + '200')
+        base = [own, entry('dom', 'exact', 640, source=RUN_URL + '100')]
+        measured = [cell(), cell('dom', (641,) * 3, kind='count')]
+        row = f'| {DOM} | 640 | 641 | {RUN_URL}200 |  |'
+        rc = self.compare(measured, listed=False, entries=[own, moved], base=base)
+        self.assertEqual(rc, 0, self.output)
+        self.assertIn(f'{row} accepted |', self.output)
+        reports = {**PLAN, 'reported': [{'metric': 'dom'}]}
+        rc = self.compare(measured, listed=False, entries=[own, moved], base=base, plan=reports)
+        self.assertEqual(rc, 1)
+        refusal = 'plan.json reports this cell, so its entry is reported, not exact'
+        self.assertIn(f'{row} {refusal} |', self.output)
+        self.assertIn(f'::error::{DOM}: {refusal}', self.output)
 
     def test_a_base_with_no_plan_holds_no_pattern_and_a_git_failure_fails(self):
         class Absent(FakeGit):
@@ -3559,6 +3761,33 @@ class Cli(unittest.TestCase):
                 self.main(*argv, '--repo', REPO, '--head', HEAD, '--base-sha', HEAD), 1
             )
         self.assertIn('::error::budgets[0]: missing metric', self.output)
+
+    def test_a_schema_1_base_is_a_notice_of_compare_and_check_file(self):
+        class Git(FakeGit):
+            def __init__(self):
+                super().__init__()
+                self.shown = {'100.json': perf_gate.GitError}
+
+        base = budgets([entry('dom', 'exact', 640, source=RUN_URL + '100')], schema=1)
+        del base['target']
+        e = entry('dom', 'exact', 640, source=RUN_URL + '200')
+        counts = [cell(), cell('dom', (640,) * 3, kind='count')]
+        rc = self.compare(counts, entries=[e], listed=False, git=Git, base=base)
+        self.assertEqual(rc, 0, self.output)
+        skip = (
+            'the base budgets.json is schema 1, which names no source this gate can place, '
+            "so no entry was held to a source as new as its base entry's"
+        )
+        self.assertIn(f'### Notices\n\n- {skip}\n', (self.dir / 'summary.md').read_text())
+        argv = (
+            '--check-file',
+            str(self.dir / 'budgets.json'),
+            '--base',
+            str(self.dir / 'base.json'),
+        )
+        argv += ('--sources', str(self.dir / 'sources'), '--repo', REPO, '--head', HEAD)
+        self.assertEqual(self.main(*argv, '--base-sha', HEAD), 0, self.output)
+        self.assertEqual(self.output, f'::notice::{skip}\n')
 
     def test_check_file_refuses_a_list_budgets_json(self):
         head = self.put('budgets.json', [entry(source=RUN_URL + '100')])

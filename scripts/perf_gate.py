@@ -37,8 +37,11 @@ if TYPE_CHECKING:
 KEY_FIELDS = ('scenario', 'scale', 'engine', 'width', 'window', 'metric')
 TIERS = ('gated', 'exact', 'reported')
 CHANGE_FIELDS = ('baseline', 'budget', 'tier', 'headroom', 'source')
+# What a calibration writes: budget follows from these and the file maps (check_rule).
+CALIBRATED_FIELDS = ('baseline', 'tier', 'headroom', 'source')
 ENTRY_FIELDS = (*KEY_FIELDS, *CHANGE_FIELDS, 'reason')
 FILE_FIELDS = ('schema', 'runner', 'headroom', 'floor', 'target', 'budgets', 'retired')
+FILE_MAPS = ('headroom', 'floor', 'target')
 SCHEMA = 2
 SERVER_CPU = 'server_cpu_ms'
 DEFAULT_HEADROOM = {'cpu_ms': 1.5, 'heap_mb': 1.25, 'rss_mb': 1.25}
@@ -337,13 +340,19 @@ def middle(reps: list) -> list:
 
 
 def compare(
-    budgets: dict, results: dict, units: dict | None = None, accepted: dict | None = None
+    budgets: dict,
+    results: dict,
+    units: dict | None = None,
+    accepted: dict | None = None,
+    reported: list[dict] | None = None,
 ) -> Outcome:
     """Judge each measured cell on its median of three. A gated cell over its
     budget (gated_budget, with `accepted` slowdowns) and an exact count whose middle
     rep is off its budget are listed in `remeasure`, never failed here. An exact entry
     measured as no count fails, and so does a gated or exact entry no shard measured
-    whose unit and window `units` (`planned_windows`) holds."""
+    whose unit and window `units` (`planned_windows`) holds. An entry of a cell a
+    `reported` pattern (held_patterns) matches is judged reported (as_planned)."""
+    budgets = as_planned(budgets, reported or [])
     out = Outcome(runner=results.get('runner', ''))
     out.runner_mismatch = out.runner != budgets.get('runner')
     entries = {key(e): e for e in budgets.get('budgets', [])}
@@ -432,10 +441,11 @@ def verdict(budgets: dict, results: dict, remeasured: dict, decided: dict | None
     whose median is over it, an exact count whose middle reps are not it.
     decided is compare's remeasure.json: its accepted slowdowns, its stale keys, the
     extension units (judge_extension) and the plan patterns both branches hold, which
-    excuse a retired cell the extension measured (retired_measured). An exact count off
-    its budget, or on a stale key, fails, and is recorded for the measured file when its
-    reps all agree."""
+    make an entry reported (as_planned) and excuse a retired cell the extension measured
+    (retired_measured). An exact count off its budget, or on a stale key, fails, and is
+    recorded for the measured file when its reps all agree."""
     decided = decided or {}
+    budgets = as_planned(budgets, decided.get('reported', []))
     accepted = accepted_cells(decided.get('accepted', []))
     stale = {key(k) for k in decided.get('stale', [])}
     out = compare(budgets, results, accepted=accepted)
@@ -630,7 +640,7 @@ def summary(budgets: dict, out: Outcome) -> str:
             (
                 f'The results come from runner `{out.runner}`, and `budgets.json` is calibrated '
                 f'on `{budgets.get("runner")}`, so every metric is reported and none gates. '
-                'Calibrate on this runner (`perf-calibrate.yaml`) to gate it.'
+                f'Measure on `{budgets.get("runner")}` to gate it.'
             ),
             '',
         ]
@@ -946,8 +956,9 @@ def base_plan(git: Git, base_sha: str, path: str) -> dict:
 
 def held_patterns(head: dict, base: dict) -> list[dict]:
     """The `reported` patterns of plan head that plan base lists too: a pattern decides a
-    tier only once it is on the base branch, so a pull request cannot demote a class by
-    adding one, and the next scheduled calibration applies it."""
+    tier only once the base lists it, so a pull request cannot demote a class by adding
+    one, and from then its cells are judged reported (as_planned) until a calibration
+    rewrites them."""
     found, _ = reported_patterns(base)
     return [p for p in reported_patterns(head)[0] if p in found]
 
@@ -958,15 +969,35 @@ def plan_reports(patterns: list[dict], c: dict) -> bool:
     )
 
 
-def check_plan(budgets: dict, doc: dict, *, reported: list[dict]) -> list[str]:
+def as_planned(budgets: dict, held: list[dict]) -> dict:
+    """budgets with each entry a pattern of held (held_patterns) matches made reported:
+    the plan's tier binds once the base lists the pattern, before the next calibration's
+    check-in rewrites the entry."""
+    if not held:
+        return budgets
+    entries = [
+        {**e, 'tier': 'reported'} if plan_reports(held, e) else e
+        for e in budgets.get('budgets', [])
+    ]
+    return {**budgets, 'budgets': entries}
+
+
+def plan_refusal(tier: str) -> str:
+    return f'plan.json reports this cell, so its entry is reported, not {tier}'
+
+
+def check_plan(budgets: dict, doc: dict, *, reported: list[dict], base: dict) -> list[str]:
     """A gated or exact entry whose unit and window no set of RUN_SETS lists
     leaves the gate unmeasured, so it fails; one of a cell a pattern of reported
-    (held_patterns) matches fails. A set or cell of any set that is not an object,
-    and a `reported` item of doc that is no pattern, is an error line."""
+    (held_patterns) matches fails when base holds no entry for it or one whose
+    CALIBRATED_FIELDS differ, since only a calibration writes those. A set or cell of
+    any set that is not an object, and a `reported` item of doc that is no pattern, is
+    an error line."""
     sets = doc.get('sets', {})
     if not isinstance(sets, dict):
         return ['plan.json: sets must be an object of named sets']
     patterns, errors = reported, reported_patterns(doc)[1]
+    was = {key(e): e for e in base.get('budgets', [])}
     cells = []
     for name, spec in sets.items():
         if not isinstance(spec, dict):
@@ -998,10 +1029,12 @@ def check_plan(budgets: dict, doc: dict, *, reported: list[dict]) -> list[str]:
             if not planned(units, e)
         ]
         + [
-            f'{key_text(key(e))}: plan.json reports this cell, so its entry is reported, '
-            f'not {e["tier"]}'
+            f'{key_text(key(e))}: {plan_refusal(e["tier"])}'
             for e in gating
             if plan_reports(patterns, e)
+            and (
+                key(e) not in was or any(e.get(f) != was[key(e)].get(f) for f in CALIBRATED_FIELDS)
+            )
         ]
     )
 
@@ -1217,13 +1250,15 @@ class Checked:
     {key: {budget, reason, file}}. moves: each exact entry whose value differs from its
     exact base entry, {key, base, head, source, reason, refused}, refused the provenance
     errors of that entry. retires: each gated or exact base entry the head retires,
-    {key, tier, reason}."""
+    {key, tier, reason}. notices: summary lines, such as a base of another schema
+    skipping moves_to_older."""
 
     errors: list[str]
     stale: set
     accepted: dict
     moves: list[dict]
     retires: list[dict]
+    notices: list[str] = dataclasses.field(default_factory=list)
 
 
 def check_provenance(
@@ -1242,17 +1277,25 @@ def check_provenance(
     (load_source) and list its cell; an entry the head adds or whose baseline, budget,
     tier, headroom or source differs from the base, every entry when the file's runner,
     headroom, floor or target differs, must match it (entry_provenance); every entry
-    comes from the newest source of its cell (superseded_entries) and from none older than
-    its base entry's (moves_to_older); a gated or exact entry
-    leaves only through `retired`; every file under sources is named by an entry; and
-    every accepted file holds (load_accepted)."""
+    comes from the newest source of its cell (superseded_entries) and, over a base of this
+    schema, from none older than its base entry's (moves_to_older), else notices says so;
+    a gated or exact entry leaves only through `retired`; every file under sources is named
+    by an entry; and every accepted file holds (load_accepted)."""
     errors = []
+    notices = []
     refused: dict[tuple, list[str]] = {}
     base_entries = {key(e): e for e in base.get('budgets', [])}
     head_entries = {key(e): e for e in head.get('budgets', [])}
     # The file-level maps sit outside CHANGE_FIELDS, and each changes how every entry gates.
-    moved = any(head.get(f) != base.get(f) for f in ('headroom', 'floor', 'target'))
+    moved = any(head.get(f) != base.get(f) for f in FILE_MAPS)
     file_edit = moved or head.get('runner') != base.get('runner')
+    # A base of another schema keeps its sources outside `sources`, so none can be placed.
+    base_placeable = base.get('schema') == SCHEMA
+    if base_entries and not base_placeable:
+        notices.append(
+            f'the base budgets.json is schema {base.get("schema")!r}, which names no source '
+            "this gate can place, so no entry was held to a source as new as its base entry's"
+        )
     named: dict[str, Source] = {}
     for e in head_entries.values():
         src = parse_source(e.get('source'))
@@ -1290,12 +1333,15 @@ def check_provenance(
             errors.append(f'{name}: {refused[k][0]}')
             continue
         mine = refused[k] = []
+        raised_by_file = map_moved(head, base, e)
         if 'reason' in e:
-            mine += reason_provenance(e, b, src, moved)
+            mine += reason_provenance(e, b, src, raised_by_file)
         if src.stem in loaded:
             changed = b is None or file_edit or any(e.get(f) != b.get(f) for f in CHANGE_FIELDS)
-            mine += entry_provenance(e, b, loaded[src.stem], changed, moved, base_sha, git)
-            mine += moves_to_older(e, b, loaded[src.stem], placed_at_base, git)
+            found = loaded[src.stem]
+            mine += entry_provenance(e, b, found, changed, raised_by_file, base_sha, git)
+            if base_placeable:
+                mine += moves_to_older(e, b, found, placed_at_base, git)
         errors.extend(f'{name}: {x}' for x in mine)
         if src.stem not in loaded:
             # errors holds the source's own line once; the entry's refusals still name it.
@@ -1343,7 +1389,21 @@ def check_provenance(
         and base_entries.get(k, {}).get('tier') == 'exact'
         and e['baseline'] != base_entries[k].get('baseline')
     ]
-    return Checked(errors, stale, slower, moves, retires)
+    return Checked(errors, stale, slower, moves, retires, notices)
+
+
+def map_moved(head: dict, base: dict, e: dict) -> bool:
+    """Whether a file-level map moves entry e's budget: e is gated and its family's headroom,
+    floor or target in head differs from base's. An exact budget is its baseline."""
+    if e.get('tier') != 'gated':
+        return False
+    fam = family(e['metric'])
+
+    def value(doc: dict, field: str) -> object:
+        m = doc.get(field)
+        return m.get(fam) if isinstance(m, dict) else None
+
+    return any(value(head, f) != value(base, f) for f in FILE_MAPS)
 
 
 ACCEPTED_FIELDS = ('reason', 'cells')
@@ -1560,8 +1620,8 @@ def calibration_provenance(
     git: Git,
 ) -> list[str]:
     """A changed entry takes baseline, tier and headroom from a calibration the base holds,
-    since only the default branch is calibrated. With file_moved (a headroom, floor or target
-    edit), a budget above the base's needs a `reason` even when its baseline did not rise."""
+    since only the default branch is calibrated. With file_moved (map_moved), a budget above
+    the base's needs a `reason` even when its baseline did not rise."""
     label = found.source.label
     out = []
     if e.get('baseline') != c.get('baseline'):
@@ -1592,7 +1652,7 @@ def calibration_provenance(
 
 def reason_provenance(e: dict, b: dict | None, src: Source, file_moved: bool) -> list[str]:
     """Why a gated calibration entry may not carry its reason: one the base entry does not
-    already carry is allowed only on a budget a file-level edit raises."""
+    already carry is allowed only on a budget a file-level edit raises (map_moved)."""
     if src.kind != 'calibration' or e['tier'] != 'gated':
         return []
     if b is not None and b.get('reason') == e['reason']:
@@ -2308,13 +2368,17 @@ def held_reported(a: argparse.Namespace) -> list[dict]:
 
 
 def file_errors(a: argparse.Namespace, head: dict, held: list[dict]) -> Checked:
-    """check_provenance of head, its errors led by the rule and plan errors; held is
+    """check_provenance of head, its errors led by the rule and plan errors and its notices
+    naming each gating entry a pattern only the head plan lists matches; held is
     held_reported's."""
     errors = check_rule(head)
     if check_shape(head):
         return Checked(errors, set(), {}, [], [])
+    added = []
     if a.plan_doc:
-        errors += check_plan(head, load(a.plan_doc), reported=held)
+        doc = load(a.plan_doc)
+        errors += check_plan(head, doc, reported=held, base=load_base(a.base))
+        added = [p for p in reported_patterns(doc)[0] if p not in held]
     found = check_provenance(
         head,
         load_base(a.base),
@@ -2327,6 +2391,12 @@ def file_errors(a: argparse.Namespace, head: dict, held: list[dict]) -> Checked:
         git=Git(),
     )
     found.errors = errors + found.errors
+    found.notices += [
+        f'{key_text(key(e))}: plan.json adds a reported pattern that matches this '
+        f'{e["tier"]} entry, so it stops gating once this pull request merges'
+        for e in head.get('budgets', [])
+        if e['tier'] != 'reported' and plan_reports(added, e)
+    ]
     return found
 
 
@@ -2504,7 +2574,10 @@ def run(a: argparse.Namespace) -> int:
         pathlib.Path(a.out).write_text(json.dumps(points, indent=2) + '\n')
         return 0
     if a.check_file:
-        errors = file_errors(a, load(a.check_file), held_reported(a)).errors
+        checked = file_errors(a, load(a.check_file), held_reported(a))
+        for n in checked.notices:
+            print(f'::notice::{n}')
+        errors = checked.errors
         for e in errors:
             print(f'::error::{e}')
         return 1 if errors else 0
@@ -2525,16 +2598,26 @@ def run(a: argparse.Namespace) -> int:
         matrix = plan(plan_doc, a.set, only=only)
         units = planned_windows(c for job in matrix['include'] for c in job['cells'])
         results = merge_results(a.results, a.prefix)
-        out = compare(budgets, results, units, checked.accepted)
-        out.notices += unmeasured_accepted(checked.accepted, out)
-        # A measured file of another runner is one load_source refuses, so nothing is stale.
-        stale = set() if out.runner_mismatch else checked.stale
+        out = compare(budgets, results, units, checked.accepted, held)
+        out.notices += checked.notices + unmeasured_accepted(checked.accepted, out)
+        # A measured file of another runner is one load_source refuses, so nothing is stale,
+        # and a cell a held pattern reports records no exact value.
+        stale = (
+            set()
+            if out.runner_mismatch
+            else {k for k in checked.stale if not plan_reports(held, key_dict(k))}
+        )
         judged = [c for c in results['cells'] if planned(units, c)]
         out.remeasure = with_stale(out.remeasure, judged, stale)
         out.failures = (
             checked.errors + out.failures + retired_measured(budgets, results['cells'], held)
         )
-        out.exact_moves = checked.moves
+        out.exact_moves = [
+            {**m, 'refused': [*m['refused'], plan_refusal('exact')]}
+            if plan_reports(held, key_dict(m['key']))
+            else m
+            for m in checked.moves
+        ]
         out.retires = checked.retires
         entries = {key(e): e for e in budgets.get('budgets', [])}
         moved = {c['scenario'] for c in out.remeasure if entries[key(c)]['tier'] == 'exact'}
