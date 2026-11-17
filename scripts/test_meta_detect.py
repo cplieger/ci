@@ -290,7 +290,7 @@ class GoWorkStep(Harness):
             'GIT_CONFIG_GLOBAL': '/dev/null',
         }
         return subprocess.run(
-            ['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', step['run']],
+            ['bash', '-e', '-c', step['run']],
             cwd=repo,
             env=env,
             capture_output=True,
