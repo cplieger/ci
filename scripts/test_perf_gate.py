@@ -931,8 +931,8 @@ class FakeGit:
     base file from shown by name, else the file on disk, else a source of ROOT, the
     commit every commit descends from; has finds every name but those in absent."""
 
-    def __init__(self):
-        self.lineage = set()
+    def __init__(self, lineage=()):
+        self.lineage = set(lineage)
         self.added = {}
         self.same = set()
         self.same_raises = None
@@ -2766,8 +2766,7 @@ class PlacedGit(FakeGit):
     commit 0ld, which neither descends from, in HEAD's history."""
 
     def __init__(self):
-        super().__init__()
-        self.lineage = {('pr-head', HEAD), ('0ld', HEAD)}
+        super().__init__(lineage={('pr-head', HEAD), ('0ld', HEAD)})
 
 
 class Take(unittest.TestCase):
