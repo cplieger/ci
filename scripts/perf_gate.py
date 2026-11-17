@@ -341,7 +341,7 @@ GUARD = {
 TIMING_KINDS = ('time', 'server_cpu')
 
 
-def baselines_from_budgets(doc: dict) -> tuple[str | None, dict[tuple, float]]:
+def baselines_from_budgets(doc: dict) -> tuple[str, dict[tuple, float]]:
     """A budgets.json of any schema as its runner and each entry's numeric baseline by
     key; every other field is ignored."""
     entries = doc.get('budgets', [])
@@ -354,7 +354,9 @@ def baselines_from_budgets(doc: dict) -> tuple[str | None, dict[tuple, float]]:
         if is_number(e.get('baseline')):
             out[key(e)] = e['baseline']
     runner = doc.get('runner')
-    return (runner if isinstance(runner, str) else None), out
+    if not isinstance(runner, str) or not runner:
+        raise ValueError('budgets.json: runner must name the runner the baselines were measured on')
+    return runner, out
 
 
 def is_timing(c: dict) -> bool:
@@ -385,7 +387,7 @@ def over_text(metric: str, value: float, baseline: float) -> str:
 
 def guard(
     baselines: dict[tuple, float],
-    runner: str | None,
+    runner: str,
     results: dict,
     units: dict | None = None,
     *,

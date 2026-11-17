@@ -373,6 +373,17 @@ class Guard(unittest.TestCase):
             with self.subTest(broken=broken), self.assertRaises((TypeError, ValueError)):
                 perf_gate.baselines_from_budgets(broken)
 
+    def test_a_base_file_that_names_no_runner_is_refused(self):
+        for runner in (None, '', 26.04):
+            doc = base_file([baselined()], runner=runner)
+            with (
+                self.subTest(runner=runner),
+                self.assertRaisesRegex(
+                    ValueError, 'runner must name the runner the baselines were measured on'
+                ),
+            ):
+                perf_gate.baselines_from_budgets(doc)
+
     def test_another_runner_reports_every_cell_and_fails_nothing(self):
         out = guarded([baselined()], [cell(reps=(9000.0,) * 3)], runner='self-hosted')
         self.assertTrue(out.runner_mismatch)
@@ -444,15 +455,19 @@ class Guard(unittest.TestCase):
 
     def test_a_red_cell_fails_the_verdict_only_on_its_median_of_six(self):
         entries = [baselined(baseline=1000.0)]
-        first = [cell(reps=(2400.0, 2500.0, 2600.0))]
-        out = guarded(entries, first)
-        for more, fails in (((1000.0,) * 3, False), ((2300.0, 2400.0, 2500.0), True)):
-            with self.subTest(more=more):
+        for reps, more, fails in (
+            ((2400.0, 2500.0, 2600.0), (1000.0,) * 3, False),
+            ((2400.0, 2500.0, 2600.0), (2300.0, 2400.0, 2500.0), True),
+            ((3000.0,) * 3, (1900.0,) * 3, True),
+        ):
+            with self.subTest(reps=reps, more=more):
+                first = [cell(reps=reps)]
+                out = guarded(entries, first)
                 v = perf_gate.guard_verdict(
                     decided(out, entries), results(first), results([cell(reps=more)])
                 )
                 self.assertEqual(bool(v.failures), fails, v.failures)
-                self.assertEqual([s['reps'] for s in v.six], [[2400.0, 2500.0, 2600.0, *more]])
+                self.assertEqual([s['reps'] for s in v.six], [[*reps, *more]])
 
     def test_a_red_cell_with_no_re_measured_reps_fails_the_verdict(self):
         entries = [baselined()]
