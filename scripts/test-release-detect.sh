@@ -762,10 +762,13 @@ pending_at() { # <dir> <channel> -> the state JSON; outputs in $WORK/out
   sed -n 's/^state=//p' "$WORK/out"
 }
 outkey() { sed -n "s/^$1=//p" "$WORK/out" | head -1; }
-kind_at() { # <dir> <state> [repo type] -> the root's kind line the claim job writes from pending's state; refused on a failure, its log in WORK/kind.log
+kind_at() { # <dir> <state> [repo type] [tags] -> the root's kind line the claim job writes from pending's state; refused on a failure, its log in WORK/kind.log
   local o="$WORK/kind-out"
   : >"$o"
-  (cd "$1" && STATE="$2" REPO_TYPE="${3:-go}" GITHUB_OUTPUT="$o" bash "$RS" kind-note) >"$WORK/kind.log" 2>&1 || { echo refused; return 0; }
+  (cd "$1" && STATE="$2" REPO_TYPE="${3:-go}" GITHUB_OUTPUT="$o" bash "$RS" kind-note ${4:+"$4"}) >"$WORK/kind.log" 2>&1 || {
+    echo refused
+    return 0
+  }
   sed -n 's/^kind_note=//p' "$o"
 }
 lane() { jq -r --arg k "$1" ".[\$k].$2" <<<"$3"; }
@@ -889,6 +892,9 @@ chk "P20 a Go root's dev tag is its publication, so it needs no receipt" "$(kind
   'Built from `main`, including the promotion of `v1.1.0-dev.2`'
 touch "$GH_DIR/fail-statuses"
 chk "P20 statuses GitHub cannot read stop the claim job rather than guess" "$(kind_at "$O" "$S4_STATE" docker)" "refused"
+chk "P20 the token-free promotion preview reads the tags alone" "$(kind_at "$O" "$S4_STATE" docker tags)" \
+  'Built from `main`, including the promotion of `v1.1.0-dev.2`'
+chk "P20 and kind-note takes no other argument" "$(kind_at "$O" "$S4_STATE" docker proven)" "refused"
 rm "$GH_DIR/fail-statuses" "$GH_DIR/statuses-$D1.json"
 git -C "$O" tag -d v1.1.0-dev.2 >/dev/null
 chk "P16 a lane list that is not JSON stops the run" \

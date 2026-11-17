@@ -916,6 +916,17 @@ def release_plan(clone: Path, main: str, r: str, layout: Layout) -> dict[str, di
     # release.yaml's hold step: a lane whose own manifests pin a first-party dev
     # version publishes nothing at R.
     held = held_lanes(inventory.Repo(str(clone)), r)
+    # The token-free preview reads the root's kind line from the tags alone;
+    # the release's claim job names only a proven dev build.
+    root_kind = ''
+    if '.' in rows:
+        root_kind = _field(
+            run_tool(
+                clone, SCRIPTS / 'release-state.sh', 'kind-note', 'tags', STATE=raw_state, **env
+            ),
+            'kind_note',
+            'release-state.sh kind-note',
+        )
     plan = {}
     for key, row in rows.items():
         version = ''
@@ -933,7 +944,7 @@ def release_plan(clone: Path, main: str, r: str, layout: Layout) -> dict[str, di
         plan[key] = {
             'version': version,
             'h_tag': row['h_tag'],
-            'kind_note': row['kind_note'],
+            'kind_note': root_kind if key == '.' else row['kind_note'],
             'held': '; '.join(held.get(key, [])),
         }
     return plan

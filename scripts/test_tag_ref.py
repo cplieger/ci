@@ -406,25 +406,33 @@ class ClaimCheck(unittest.TestCase):
         )
         self.assertEqual(res.returncode, 0, res.stderr)
         doc = json.loads(state.read_text())
-        writes = [c for c in doc['calls'] if c[:2] == ['api', 'repos/o/app/git/refs'] or 'DELETE' in c]
+        writes = [
+            c for c in doc['calls'] if c[:2] == ['api', 'repos/o/app/git/refs'] or 'DELETE' in c
+        ]
         return res.stdout, out.read_text(), doc['tags'], writes
 
     def test_a_tag_at_this_commit_is_held(self):
         stdout, out, tags, writes = self.run_claim('claim_held', tags={'v1.2.0': COMMIT})
-        self.assertEqual((stdout, out, tags, writes), ('rc=0\n', 'claimed=true\n', {'v1.2.0': COMMIT}, []))
+        self.assertEqual(
+            (stdout, out, tags, writes), ('rc=0\n', 'claimed=true\n', {'v1.2.0': COMMIT}, [])
+        )
 
     def test_a_tag_at_another_commit_fails_closed(self):
-        stdout, out, tags, writes = self.run_claim('claim_held', tags={'v1.2.0': 'b' * 40})
-        self.assertIn(f'::error::tag v1.2.0 is at {"b" * 40}, not this run\'s commit {COMMIT}', stdout)
+        stdout, out, _, writes = self.run_claim('claim_held', tags={'v1.2.0': 'b' * 40})
+        self.assertIn(
+            f"::error::tag v1.2.0 is at {'b' * 40}, not this run's commit {COMMIT}", stdout
+        )
         self.assertEqual((stdout[-5:], out, writes), ('rc=1\n', '', []))
 
     def test_an_absent_tag_fails_closed_and_is_never_created(self):
         stdout, out, tags, writes = self.run_claim('claim_held')
-        self.assertIn(f'::error::tag v1.2.0 is at <none>, not this run\'s commit {COMMIT}', stdout)
+        self.assertIn(f"::error::tag v1.2.0 is at <none>, not this run's commit {COMMIT}", stdout)
         self.assertEqual((stdout[-5:], out, tags, writes), ('rc=1\n', '', {}, []))
 
     def test_an_unreadable_tag_fails_closed_after_the_retries(self):
-        stdout, out, _, writes = self.run_claim('claim_held', tags={'v1.2.0': COMMIT}, read_fail=True)
+        stdout, out, _, writes = self.run_claim(
+            'claim_held', tags={'v1.2.0': COMMIT}, read_fail=True
+        )
         self.assertIn('::error::tag v1.2.0 cannot be read', stdout)
         self.assertEqual((stdout[-5:], out, writes), ('rc=1\n', '', []))
 
@@ -435,14 +443,16 @@ class ClaimCheck(unittest.TestCase):
 
     def test_a_dropped_claim_leaves_another_commits_tag(self):
         stdout, _, tags, writes = self.run_claim('claim_drop', tags={'v1.2.0': 'b' * 40})
-        self.assertIn('not this run\'s claim to delete', stdout)
+        self.assertIn("not this run's claim to delete", stdout)
         self.assertEqual((stdout[-5:], tags, writes), ('rc=1\n', {'v1.2.0': 'b' * 40}, []))
 
     def test_a_dropped_claim_already_gone_is_done(self):
         self.assertEqual(self.run_claim('claim_drop')[0::3], ('rc=0\n', []))
 
     def test_a_dropped_claim_github_cannot_read_is_kept(self):
-        stdout, _, tags, writes = self.run_claim('claim_drop', tags={'v1.2.0': COMMIT}, read_fail=True)
+        stdout, _, tags, writes = self.run_claim(
+            'claim_drop', tags={'v1.2.0': COMMIT}, read_fail=True
+        )
         self.assertIn('::error::tag v1.2.0 cannot be read', stdout)
         self.assertEqual((stdout[-5:], tags, writes), ('rc=1\n', {'v1.2.0': COMMIT}, []))
 
