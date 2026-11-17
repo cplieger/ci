@@ -32,6 +32,10 @@ if args[:1] == ['api'] and args[1] == 'repos/o/app/git/ref/heads/dev':
     if state.get('head'):
         done(0, state['head'] + '\n')
     done(1, err='gh: Bad credentials (HTTP 401)\n')
+if args[:4] == ['api', '-X', 'POST', f'repos/o/app/statuses/{args[3].rsplit("/", 1)[-1]}']:
+    if state.get('status_fail'):
+        done(1, err='gh: Server Error (HTTP 502)\n')
+    done(0, '{}\n')
 if args[:2] == ['api', 'repos/o/app/git/refs']:
     fields = dict(a.split('=', 1) for a in args[2:] if '=' in a)
     tag, sha = fields['ref'].removeprefix('refs/tags/'), fields['sha']
@@ -54,14 +58,24 @@ class RunsTagRef:
 
     head_reads: list
 
-    def run_tag_ref(self, tags=None, creates=(), head=None, call='tag_ref o/app v1.2.0'):
+    def run_tag_ref(
+        self, tags=None, creates=(), head=None, call='tag_ref o/app v1.2.0', status_fail=False
+    ):
         tmp = pathlib.Path(tempfile.mkdtemp(prefix='tag-ref-'))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         (tmp / 'gh').write_text(GH_STUB)
         (tmp / 'gh').chmod(0o755)
         state = tmp / 'state.json'
         state.write_text(
-            json.dumps({'tags': tags or {}, 'creates': list(creates), 'calls': [], 'head': head})
+            json.dumps(
+                {
+                    'tags': tags or {},
+                    'creates': list(creates),
+                    'calls': [],
+                    'head': head,
+                    'status_fail': status_fail,
+                }
+            )
         )
         script = (
             'set -euo pipefail\n'
@@ -76,6 +90,8 @@ class RunsTagRef:
             'PATH': f'{tmp}:{os.environ["PATH"]}',
             'STUB_STATE': str(state),
             'READBACK_SLEEP': '0',
+            'GITHUB_SERVER_URL': 'https://gh',
+            'GITHUB_RUN_ID': '7',
         }
         res = subprocess.run(
             ['bash', '-c', script], env=env, capture_output=True, text=True, check=False
@@ -84,6 +100,7 @@ class RunsTagRef:
         doc = json.loads(state.read_text())
         creates = [c for c in doc['calls'] if c[:2] == ['api', 'repos/o/app/git/refs']]
         self.head_reads = [c for c in doc['calls'] if any('git/ref/heads/' in a for a in c)]
+        self.posts = [c for c in doc['calls'] if c[:3] == ['api', '-X', 'POST']]
         return res.stdout, doc['tags'], creates
 
 
@@ -109,7 +126,8 @@ class TagRef(RunsTagRef, unittest.TestCase):
         out, tags, creates = self.run_tag_ref(tags={'v1.2.0': 'b' * 40})
         self.assertNotIn('so it is reused', out)
         self.assertIn(
-            f'::error::Tag v1.2.0 exists at {"b" * 40}, not {COMMIT}, so it is not moved.', out
+            f'::error::Tag v1.2.0 exists at {"b" * 40}, not {COMMIT}. A published version never moves, so nothing is published under it.',
+            out,
         )
         self.assertTrue(out.endswith('rc=1 created=false\n'), out)
         self.assertEqual((tags, creates), ({'v1.2.0': 'b' * 40}, []))
@@ -162,6 +180,32 @@ class TagRefOrHandoff(RunsTagRef, unittest.TestCase):
         self.assertTrue(out.endswith('rc=2 created=false\n'), out)
         self.assertEqual(tags, {})
 
+    def test_a_handoff_records_on_its_commit_the_head_that_releases_it(self):
+        out, _, _ = self.run_tag_ref(creates=['refused'] * 5, head='d' * 40, call=HANDOFF)
+        self.assertTrue(out.endswith('rc=2 created=false\n'), out)
+        self.assertEqual(len(self.posts), 1, self.posts)
+        post = self.posts[0]
+        fields = dict(a.split('=', 1) for a in post[4:] if '=' in a)
+        self.assertEqual(post[3], f'repos/o/app/statuses/{COMMIT}')
+        self.assertEqual(
+            (fields['state'], fields['context'], fields['target_url']),
+            ('success', 'release/handoff/v1.2.0', 'https://gh/o/app/actions/runs/7'),
+        )
+        self.assertIn('d' * 40, fields['description'])
+        self.assertLessEqual(len(fields['description']), 140)
+
+    def test_a_handoff_whose_record_fails_still_hands_off_and_says_so(self):
+        out, tags, _ = self.run_tag_ref(
+            creates=['refused'] * 5, head='d' * 40, call=HANDOFF, status_fail=True
+        )
+        self.assertTrue(out.endswith('rc=2 created=false\n'), out)
+        self.assertIn('::warning::handoff record for v1.2.0 not posted on', out)
+        self.assertEqual(tags, {})
+
+    def test_a_refusal_records_no_handoff(self):
+        self.run_tag_ref(creates=['refused'] * 5, head=COMMIT, call=HANDOFF)
+        self.assertEqual(self.posts, [])
+
     def test_a_failed_create_still_at_the_head_is_refused(self):
         out, _, _ = self.run_tag_ref(creates=['refused'] * 5, head=COMMIT, call=HANDOFF)
         self.assertIn(
@@ -179,6 +223,148 @@ class TagRefOrHandoff(RunsTagRef, unittest.TestCase):
         self.assertTrue(out.endswith('rc=1 created=false\n'), out)
         self.assertNotIn('advanced past', out)
         self.assertEqual(self.head_reads, [])
+
+
+class ClaimUnderALaterDevTag(unittest.TestCase):
+    """claim_version and root_handed_off on one checkout: dev holds A then B, the run is at A."""
+
+    def run_claim(self, tags_at_b=(), tags_at_a=(), version='v1.0.0-dev.2', claim_rc=0):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix='claim-'))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo = tmp / 'repo'
+        git = ['git', '-C', str(repo), '-c', 'user.name=p', '-c', 'user.email=p@p']
+        git += ['-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false']
+        subprocess.run(['git', 'init', '-q', '-b', 'dev', str(repo)], check=True)
+        shas = []
+        for msg in ('base', 'A', 'B'):
+            subprocess.run([*git, 'commit', '-q', '--allow-empty', '-m', msg], check=True)
+            head = subprocess.run([*git, 'rev-parse', 'HEAD'], capture_output=True, text=True)
+            shas.append(head.stdout.strip())
+        a, b = shas[1], shas[2]
+        subprocess.run([*git, 'update-ref', 'refs/remotes/origin/dev', b], check=True)
+        for tag in tags_at_b:
+            subprocess.run([*git, 'tag', tag, b], check=True)
+        for tag in tags_at_a:
+            subprocess.run([*git, 'tag', tag, a], check=True)
+        subprocess.run([*git, 'checkout', '-q', '--detach', a], check=True)
+        (tmp / 'gh').write_text(GH_STUB)
+        (tmp / 'gh').chmod(0o755)
+        state = tmp / 'state.json'
+        tags = dict.fromkeys(tags_at_a, a) | dict.fromkeys(tags_at_b, b)
+        doc = {'tags': tags, 'creates': [], 'calls': [], 'head': b}
+        state.write_text(json.dumps(doc))
+        # The later job's checkout holds the tag the claim created.
+        script = (
+            'set -euo pipefail\n'
+            f'. "{SCRIPTS}/retry.sh"\n'
+            f'. "{SCRIPTS}/tag-ref.sh"\n'
+            f'claim_version o/app dev {version} {a} dev || exit 3\n'
+            f'[ "$TAG_CREATED" != true ] || git tag {version} {a}\n'
+            'rc=0\n'
+            f'root_handed_off o/app dev {version} {a} dev >/dev/null || rc=$?\n'
+            'echo "claimed=${CLAIMED} handed_off_rc=${rc}"\n'
+        )
+        env = {
+            **os.environ,
+            'PATH': f'{tmp}:{os.environ["PATH"]}',
+            'STUB_STATE': str(state),
+            'READBACK_SLEEP': '0',
+            'GITHUB_OUTPUT': str(tmp / 'out'),
+            'GIT_CONFIG_GLOBAL': '/dev/null',
+        }
+        res = subprocess.run(
+            ['bash', '-c', script], cwd=repo, env=env, capture_output=True, text=True, check=False
+        )
+        self.assertEqual(res.returncode, 3 if claim_rc else 0, res.stdout + res.stderr)
+        self.log = res.stdout + res.stderr
+        calls = json.loads(state.read_text())['calls']
+        self.creates = [c for c in calls if c[:2] == ['api', 'repos/o/app/git/refs']]
+        self.posts = [c for c in calls if c[:3] == ['api', '-X', 'POST']]
+        out = tmp / 'out'
+        self.output = out.read_text() if out.exists() else ''
+        return (res.stdout.splitlines() or [''])[-1], a, b
+
+    def handoff_descriptions(self, version):
+        return [
+            dict(a.split('=', 1) for a in p[4:] if '=' in a)['description']
+            for p in self.posts
+            if f'context=release/handoff/{version}' in p
+        ]
+
+    def test_an_untagged_version_under_a_later_dev_tag_hands_off_before_any_create(self):
+        result, _, b = self.run_claim(tags_at_b=['v1.1.0-dev.1'])
+        self.assertEqual(result, 'claimed=false handed_off_rc=0')
+        self.assertEqual((self.creates, self.output), ([], 'claimed=false\n'))
+        self.assertEqual(
+            self.handoff_descriptions('v1.0.0-dev.2'),
+            [f"v1.1.0-dev.1 at {b} releases this commit's changes"],
+        )
+
+    def test_a_reused_claim_under_a_later_dev_tag_hands_off_with_the_root_readers(self):
+        result, _, _ = self.run_claim(tags_at_b=['v1.0.0-dev.3'], tags_at_a=['v1.0.0-dev.2'])
+        self.assertEqual(result, 'claimed=false handed_off_rc=0')
+        self.assertEqual(self.creates, [])
+
+    def test_with_no_later_dev_tag_the_claim_tags_and_the_root_readers_publish(self):
+        result, a, _ = self.run_claim()
+        self.assertEqual(result, 'claimed=true handed_off_rc=1')
+        self.assertEqual(
+            self.creates,
+            [['api', 'repos/o/app/git/refs', '-f', 'ref=refs/tags/v1.0.0-dev.2', '-f', f'sha={a}']],
+        )
+        self.assertEqual(self.posts, [])
+
+    def test_a_lane_claim_hands_off_to_its_own_lanes_later_dev_tag(self):
+        result, _, b = self.run_claim(tags_at_b=['web/v1.0.0-dev.3'], version='web/v1.0.0-dev.2')
+        self.assertTrue(result.startswith('claimed=false '), result)
+        self.assertEqual(self.creates, [])
+        self.assertEqual(
+            self.handoff_descriptions('web/v1.0.0-dev.2'),
+            [f"web/v1.0.0-dev.3 at {b} releases this commit's changes"],
+        )
+
+    def test_a_lane_claim_ignores_the_later_dev_tags_of_the_root_and_other_lanes(self):
+        later = ['v1.0.0-dev.3', 'api/v1.0.0-dev.3', 'web/sub/v1.0.0-dev.3']
+        result, _, _ = self.run_claim(tags_at_b=later, version='web/v1.0.0-dev.2')
+        self.assertTrue(result.startswith('claimed=true '), result)
+        self.assertEqual(len(self.creates), 1, self.creates)
+
+    def test_a_version_held_at_another_commit_is_refused_whatever_later_tag_exists(self):
+        _, a, b = self.run_claim(tags_at_b=['v1.0.0-dev.2', 'v1.0.0-dev.3'], claim_rc=1)
+        self.assertIn(f'Tag v1.0.0-dev.2 exists at {b}, not {a}', self.log)
+        self.assertEqual((self.creates, self.posts, self.output), ([], [], ''))
+
+    def test_the_handoff_names_the_highest_of_two_dev_tags_on_one_commit(self):
+        _, _, b = self.run_claim(
+            tags_at_b=['v1.9.0-dev.4', 'v1.10.0-dev.1'], version='v1.9.0-dev.3'
+        )
+        self.assertEqual(
+            self.handoff_descriptions('v1.9.0-dev.3'),
+            [f"v1.10.0-dev.1 at {b} releases this commit's changes"],
+        )
+
+    def test_a_lower_version_on_a_commit_a_renumber_tagged_higher_hands_off(self):
+        result, a, _ = self.run_claim(
+            tags_at_a=['v1.2.0-dev.1', 'v1.10.0-dev.1'], version='v1.2.0-dev.1'
+        )
+        self.assertEqual(result, 'claimed=false handed_off_rc=0')
+        self.assertEqual(self.creates, [])
+        self.assertEqual(
+            self.handoff_descriptions('v1.2.0-dev.1'),
+            [f"v1.10.0-dev.1 at {a} releases this commit's changes"],
+        )
+
+    def test_the_higher_version_on_a_renumbered_commit_is_claimed_and_published(self):
+        result, _, _ = self.run_claim(
+            tags_at_a=['v1.2.0-dev.1', 'v1.10.0-dev.1'], version='v1.10.0-dev.1'
+        )
+        self.assertEqual(result, 'claimed=true handed_off_rc=1')
+        self.assertEqual((self.creates, self.posts), ([], []))
+
+    def test_a_root_claim_ignores_a_later_lane_dev_tag(self):
+        result, _, _ = self.run_claim(tags_at_b=['web/v1.0.0-dev.3'])
+        self.assertEqual(result, 'claimed=true handed_off_rc=1')
+        self.assertEqual(len(self.creates), 1, self.creates)
 
 
 class BranchMovedPast(unittest.TestCase):

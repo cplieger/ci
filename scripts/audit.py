@@ -686,7 +686,9 @@ def collect_version_tags(name, s, now=None):
         s['stable_tags_without_release'] += without
         s['hand_made_stable_tags'] += hand_made
         s['dev_tags_without_receipt'] += tags_without_receipt(
-            [(t, sha_by_tag.get(t, '')) for t in settled(dev[:PROVENANCE_TAGS])], statuses_of
+            [(t, sha_by_tag.get(t, '')) for t in settled(dev[:PROVENANCE_TAGS])],
+            statuses_of,
+            release_channels.dev_tag_accounted,
         )
         # Only the highest: a receipt covers the history below it, so older
         # tags (every one made before the receipt existed) carry none.
@@ -1440,8 +1442,11 @@ def compliance(s):
             )
         for tag in s.get('dev_tags_without_receipt') or []:
             hard.append(
-                f'dev tag {tag} carries no release/tag receipt on its commit (a hand-made '
-                'dev tag skews the -dev.N counter and the change anchor; delete it)'
+                f'dev tag {tag} carries no release/tag receipt or release/handoff record on '
+                'its commit: rerun all jobs of the release run that claimed it, which '
+                'publishes it or records the later version that ships its changes. Delete '
+                'it only when no release run created it, since a hand-made tag skews the '
+                '-dev.N counter and, for a Go lane, the change anchor'
             )
         for tag in s.get('stable_tags_without_receipt') or []:
             hard.append(

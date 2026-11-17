@@ -112,20 +112,30 @@ exit 0
 SH
 
 # Honours -o, because `probe` passes -o /dev/null and a body on stdout would
-# land in the captured output the assertions grep.
+# land in the captured output the assertions grep. With -w '%{http_code}' an
+# entry's rc 0 answers 200 and any other 404, and curl itself exits 0.
 cat >"$BIN/curl" <<'SH'
 #!/bin/sh
 OUT=
 URL=
+CODE=0
 take_out=0
+take_w=0
 for a in "$@"; do
   if [ "$take_out" = 1 ]; then
     OUT=$a
     take_out=0
     continue
   fi
+  if [ "$take_w" = 1 ]; then
+    [ "$a" = '%{http_code}' ] || { printf 'stub: unexpected -w %s\n' "$a" >&2 && exit 22; }
+    CODE=1
+    take_w=0
+    continue
+  fi
   case $a in
     -o) take_out=1 ;;
+    -w) take_w=1 ;;
     http*) URL=$a ;;
   esac
 done
@@ -152,6 +162,10 @@ while read -r pat rc body; do
         printf '%s\n' "$body" >"$OUT"
       else
         printf '%s\n' "$body"
+      fi
+      if [ "$CODE" = 1 ]; then
+        [ "$rc" = 0 ] && printf 200 || printf 404
+        exit 0
       fi
       exit "$rc"
       ;;
@@ -192,6 +206,8 @@ spec() { # <line>...
   : >"$CURL_LOG"
   : >"$SLEEP_LOG"
 }
+# The curl log with the packument's per-read cache-busting query dropped.
+packument_log() { sed 's/?t=[0-9]\{1,\}$//' "$CURL_LOG"; }
 casedir() { # <name> -> path of a fresh fixture dir
   rm -rf "$WORK/case-$1"
   mkdir -p "$WORK/case-$1"
@@ -511,6 +527,40 @@ chk "V-H5 the half's npm read waits before the lane's proxy read, as npm's bound
   "$RC|$(head -1 "$CURL_LOG")|$(tail -1 "$CURL_LOG")" \
   "0|$HALF_NPM|https://proxy.golang.org/github.com/cplieger/probe/alpha/@v/v1.4.0.info"
 
+# A later dev tag of the lane on a child with the same tree: the half lane-halves
+# publishes here is read back, unless npm's dev already names a later build,
+# which lane-halves skipped (tag-ref.sh package_handed_off).
+HALF_SHA=$(git -C "$HALF" rev-parse HEAD)
+HALF_LATER=$(git -C "$HALF" -c user.email=probe@ci.local -c user.name=probe commit-tree "HEAD^{tree}" -p HEAD -m "fix: later")
+git -C "$HALF" tag alpha/v1.4.0-dev.4 "$HALF_LATER"
+git -C "$HALF" update-ref refs/remotes/origin/dev "$HALF_LATER"
+PACKUMENT="https://registry.npmjs.org/@cplieger/alpha"
+defaults
+export CHANNEL=dev HALVES_RESULT=success HALVES_JSON='["alpha"]' VERSION="" GITHUB_SHA=$HALF_SHA
+spec "${PACKUMENT}[?]t=* 0 {\"dist-tags\":{\"dev\":\"1.4.0-dev.2\"}}" "*registry.npmjs.org* 0 {}"
+run_step "$HALF"
+chk "V-H8 a dev half tagged here under a later lane dev tag, npm's dev below it, is read back" \
+  "$RC|$(packument_log)" "0|$PACKUMENT
+https://registry.npmjs.org/@cplieger/alpha/1.4.0-dev.3"
+chk "V-H8 and its dist-tag read carries a query past npm's CDN cache" \
+  "$(grep -c '^https://registry.npmjs.org/@cplieger/alpha?t=[0-9]\{1,\}$' "$CURL_LOG" || true)" "1"
+defaults
+export CHANNEL=dev HALVES_RESULT=success HALVES_JSON='["alpha"]' VERSION="" GITHUB_SHA=$HALF_SHA
+spec "${PACKUMENT}[?]t=* 0 {\"dist-tags\":{\"dev\":\"1.4.0-dev.4\"}}" "*registry.npmjs.org* 22 {}"
+run_step "$HALF"
+chk "V-H6 one npm's dev already names a later build of is not awaited" "$RC|$(packument_log)" "0|$PACKUMENT"
+chk_has "V-H6 saying this run did not publish it" "$OUT" "skip: alpha/web at alpha/v1.4.0-dev.3 is not published by this run"
+git -C "$HALF" tag -d alpha/v1.4.0-dev.4 >/dev/null
+git -C "$HALF" tag v1.4.0-dev.4 "$HALF_LATER"
+defaults
+export CHANNEL=dev HALVES_RESULT=success HALVES_JSON='["alpha"]' VERSION="" GITHUB_SHA=$HALF_SHA
+spec "*registry.npmjs.org* 0 {}"
+run_step "$HALF"
+chk "V-H7 one beside only a later root dev tag is read back, with no dist-tag read" "$RC|$(cat "$CURL_LOG")" \
+  "0|https://registry.npmjs.org/@cplieger/alpha/1.4.0-dev.3"
+git -C "$HALF" tag -d v1.4.0-dev.4 >/dev/null
+git -C "$HALF" update-ref -d refs/remotes/origin/dev
+
 # ── V-K: a private package is dry-run, so no registry holds it ──────────────
 printf '{"name":"@cplieger/alpha","version":"0.0.0","private":true}\n' >"$HALF/alpha/web/package.json"
 mkdir -p "$HALF/web"
@@ -582,5 +632,44 @@ spec "*registry.npmjs.org* 22 {}" "*jsr.io* 0 {}"
 run_step "$TAGGED"
 chk "V-R4 a root tagged here is verified though the branch moved" "$RC" "1"
 chk_lacks "V-R4 no handoff is claimed" "$OUT" "advanced past"
+# A dev claim reused here under a later dev tag on dev published nothing
+# (tag-ref.sh claim_version), so the later version's run verifies the root.
+TAGGED_SHA=$GITHUB_SHA
+git -C "$TAGGED" tag v1.2.3-dev.1
+git -C "$TAGGED" commit -q --allow-empty -m "fix: later"
+git -C "$TAGGED" tag v1.2.3-dev.2
+git -C "$TAGGED" update-ref refs/remotes/origin/dev HEAD
+git -C "$TAGGED" checkout -q --detach "$TAGGED_SHA"
+defaults
+export CHANNEL=dev VERSION=v1.2.3-dev.1 TS_RESULT=success GH_HEAD=$moved GITHUB_SHA=$TAGGED_SHA
+spec "*registry.npmjs.org* 22 {}"
+run_step "$TAGGED"
+chk "V-R5 a dev root whose reused claim a later dev tag supersedes is not awaited" "$RC|$(lines "$CURL_LOG")" "0|0"
+chk_has "V-R5 naming that tag" "$OUT" "v1.2.3-dev.1 at $GITHUB_SHA was handed off to v1.2.3-dev.2 at"
+# A subpackage of that root, tagged here: the later tag's range starts at it,
+# so the subpackage job published it unless npm's dev names a later build.
+mkdir -p "$TAGGED/web"
+printf '{"name":"@cplieger/web","version":"0.0.0"}\n' >"$TAGGED/web/package.json"
+WEB_PACKUMENT="https://registry.npmjs.org/@cplieger/web"
+defaults
+export CHANNEL=dev VERSION=v1.2.3-dev.1 SUBPACKAGE_RESULT=success SUBPACKAGES_JSON='["web"]' GH_HEAD=$moved GITHUB_SHA=$TAGGED_SHA
+spec "*registry.npmjs.org* 0 {}"
+run_step "$TAGGED"
+chk "V-R7 a dev subpackage tagged here under a later dev tag, npm's dev absent, is read back" \
+  "$RC|$(packument_log)" "0|$WEB_PACKUMENT
+https://registry.npmjs.org/@cplieger/web/1.2.3-dev.1"
+defaults
+export CHANNEL=dev VERSION=v1.2.3-dev.1 SUBPACKAGE_RESULT=success SUBPACKAGES_JSON='["web"]' GH_HEAD=$moved GITHUB_SHA=$TAGGED_SHA
+spec "${WEB_PACKUMENT}[?]t=* 0 {\"dist-tags\":{\"dev\":\"1.2.3-dev.2\"}}" "*registry.npmjs.org* 22 {}"
+run_step "$TAGGED"
+chk "V-R7 one npm's dev already names a later build of is not awaited" "$RC|$(packument_log)" "0|$WEB_PACKUMENT"
+chk_has "V-R7 saying this run did not publish it" "$OUT" "skip: web at v1.2.3-dev.1 is not published by this run"
+rm -rf "$TAGGED/web"
+git -C "$TAGGED" update-ref -d refs/remotes/origin/dev
+defaults
+export CHANNEL=dev VERSION=v1.2.3-dev.1 TS_RESULT=success GH_HEAD=$moved GITHUB_SHA=$TAGGED_SHA
+spec "*registry.npmjs.org* 22 {}"
+run_step "$TAGGED"
+chk "V-R6 one whose branch git cannot walk is verified, and fails" "$RC" "1"
 
 echo "PASS: verify-publish probe contract holds (${PASS} checks)"

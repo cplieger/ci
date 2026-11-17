@@ -462,10 +462,13 @@ cd "$WORK" || exit 1
 awk '/^nearest_tag\(\) \{/,/^}/' "$ROOT/actions/git-cliff-version/compute.sh" >"$WORK/nearest_tag.sh"
 lane_anchor_of_compute() { # <channel> <lane> -> compute.sh's anchor_sha for the lane at HEAD; run in a repo
   local esc pattern dev_pattern tag
+  # shellcheck disable=SC2034 # read by the sourced nearest_tag
+  local UNPROVEN=""
   esc=$(printf '%s' "$2" | sed -e 's/[][\.|(){}?+*^$]/\\&/g')
   pattern="^${esc}/v[0-9]+\\.[0-9]+\\.[0-9]+\$"
   dev_pattern="${pattern%\$}-dev\\.[0-9]+\$"
-  # The function body extracted above, not a script of its own.
+  # The function body extracted above, not a script of its own; compute.sh
+  # defaults UNPROVEN (the root's unproven claims) to empty, so a lane has none.
   # shellcheck source=/dev/null
   . "$WORK/nearest_tag.sh"
   if [ "$1" = dev ]; then

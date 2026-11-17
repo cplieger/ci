@@ -630,6 +630,37 @@ run_release main held2
 chk "M42 at its seed version, promoted from its newest dev build" "$(result)|$(lane_notes wire)" \
   'wire/v1.0.0|Promoted from `wire/v1.0.0-dev.2`'
 
+# ── 14c. a promotion followed at once by an unrelated main merge ────────────
+# knell's v4.0.0: a sync of shared files lands on main right after the promotion. The
+# promotion's run holds the queue first; when its claim lands, the sync's run
+# finds the version tagged and ships nothing new.
+commit_on dev "fix: a fix promoted before a sync" main.go='package main\n// promoted before a sync' >/dev/null
+out=$(run_promote quick)
+RQ=$(head_of main)
+chk "M45 the promotion lands on main" "$out|$(is_r "$RQ")" "promoted $RQ|yes"
+SQ=$(commit_on main "chore: sync the shared files" .editorconfig='root = true')
+AT=$RQ run_release main quick-r
+rq_ver=$(result)
+chk "M45 the promotion's own run publishes its stable version at the promotion" \
+  "$(grep -cE '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$rq_ver")|$(tag_of "$rq_ver")" "1|$RQ"
+AT=$SQ run_release main quick-s
+chk "M45 and the sync's run after it publishes nothing new" "$(result)|$(tag_of "$rq_ver")" "|$RQ"
+# When GitHub refuses the promotion run's claim (a sync editing workflow files),
+# that run publishes nothing, and the sync's run releases the version over a
+# tree holding the promotion, its notes naming the promotion.
+commit_on dev "chore: sync the shared files" .editorconfig='root = true' >/dev/null
+commit_on dev "fix: a fix promoted under a sync" main.go='package main\n// promoted under a sync' >/dev/null
+out=$(run_promote handed)
+RH=$(head_of main)
+SH=$(commit_on main "chore: sync the shared files again" .editorconfig='root = true\n# again')
+NO_PUBLISH=1 AT=$RH run_release main handed-r
+rh_ver=$(jq -r .outputs.version "$RUN.detect.json")
+chk "M46 a promotion whose claim is handed off tags nothing" "$out|$(tag_of "$rh_ver")" "promoted $RH|"
+AT=$SH run_release main handed-s
+chk "M46 the sync's run releases that version at the sync, whose tree holds the promotion" \
+  "$(result)|$(tag_of "$rh_ver")|$(git -C "$O" merge-base --is-ancestor "$RH" "$SH" && echo held)" "$rh_ver|$SH|held"
+chk_has "M46 its notes name the promotion" "$(detect release_kind_note)" "including the promotion of"
+
 # ── 15. a lockfile-only commit on main ───────────────────────────────────────
 commit_on main "chore(deps): lock file maintenance" package-lock.json='{"lockfileVersion": 3}' >/dev/null
 run_release main lock
@@ -646,5 +677,29 @@ DEFAULT_BRANCH=main run_release main maindefault
 chk "M34 a main-default repository's release run is refused at detect" "$(result)" \
   "refused: ::error::release.yaml publishes only from a public, non-fork repository whose default branch is dev (this one: default branch main, private <unknown>, fork <unknown>). Make dev the default branch, or remove the release.yaml caller and publish from the repository's own workflow."
 chk "M34 running no step after Select channel" "$(jq -r '.ran | join(",")' "$RUN.detect.json")" "Checkout (checkout: --cwd),Select channel"
+
+# ── 17. queued dev merges: one version each, and a handoff ships in the next ─
+# Runs on one ref queue, so the second merge's detect reads the tags the
+# first run claimed (docker-release.yaml's and the ts job's claim steps).
+Q1=$(commit_on dev "fix: queued merge one" main.go='package main\n// queued 1')
+Q2=$(commit_on dev "fix: queued merge two" main.go='package main\n// queued 2')
+AT=$Q1 run_release dev q1
+q1_ver=$(result)
+AT=$Q2 run_release dev q2
+q2_ver=$(result)
+chk "M43 the first of two queued dev merges takes a dev version" "$(grep -cE '^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$' <<<"$q1_ver")" "1"
+chk "M43 and the second takes the next counter on the same base" "$q2_ver" "${q1_ver%.*}.$((${q1_ver##*.} + 1))"
+chk "M43 each version names its own merge" "$(tag_of "$q1_ver")|$(tag_of "$q2_ver")" "$Q1|$Q2"
+# A merge whose run handed its version off leaves no tag, and the sync-only
+# commit after it releases the range from the last tag, which holds the merge.
+H1=$(commit_on dev "fix: a merge whose run hands off" main.go='package main\n// handed off')
+NO_PUBLISH=1 AT=$H1 run_release dev h1
+h1_ver=$(jq -r .outputs.version "$RUN.detect.json")
+chk "M44 a handed-off merge's run numbers the next version and tags nothing" "$h1_ver|$(tag_of "$h1_ver")" "${q2_ver%.*}.$((${q2_ver##*.} + 1))|"
+H2=$(commit_on dev "chore: sync the shared workflows" .github/workflows/ci.yaml='name: ci')
+AT=$H2 run_release dev h2
+chk "M44 the sync commit after it releases that version" "$(result)|$(tag_of "$h1_ver")" "$h1_ver|$H2"
+chk "M44 over a changed-path range from the last dev tag, which holds the handed-off merge" \
+  "$(step_out cliff anchor_sha)|$(detect root_changed)|$(git -C "$O" merge-base --is-ancestor "$H1" "$H2" && echo held)" "$Q2|true|held"
 
 echo "PASS: two-branch release model end to end ($PASS checks)"

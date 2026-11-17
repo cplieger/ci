@@ -53,6 +53,13 @@ inputs:
       promotion for the lane, so it publishes the promotion's version.
     required: false
     default: "false"
+  unproven:
+    description: >-
+      The root's claimed tags with no proof of publication (`release-state.sh
+      claims`), space-separated: none anchors the range, and one at HEAD is
+      the version this commit publishes. Empty for a lane.
+    required: false
+    default: ""
 
 outputs:
   base:
@@ -69,7 +76,8 @@ outputs:
   anchor_sha:
     description: >-
       Commit of the newest reachable tag on the channel (any version tag on
-      dev, stable tags only on stable); empty when there is none.
+      dev, stable tags only on stable) that is not unproven; empty when there
+      is none.
     value: ${{ steps.compute.outputs.anchor_sha }}
   version:
     description: Same as `base`.
@@ -128,6 +136,7 @@ runs:
         PENDING_VERSION: ${{ inputs.pending-version }}
         PENDING_COMMIT: ${{ inputs.pending-commit }}
         PENDING_IN_RANGE: ${{ inputs.pending-in-range }}
+        UNPROVEN: ${{ inputs.unproven }}
         CLIFF_BIN: git-cliff
       run: |
         set -euo pipefail

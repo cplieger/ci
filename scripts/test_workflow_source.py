@@ -101,11 +101,20 @@ class SourceCheckout(unittest.TestCase):
                 # A conditional checkout leaves the source missing for a use that runs without it.
                 guard = condition(steps[at])
                 if guard:
-                    unguarded = [
-                        s.get('name', '')
-                        for s in steps[at + 1 :]
-                        if uses_source(s) and guard not in condition(s)
-                    ]
+                    # An output equal to a non-empty value is set only when its step ran,
+                    # so a step gated on a guarded step's output inherits that step's guard.
+                    guarded_ids: set[str] = set()
+                    unguarded = []
+                    for s in steps[at + 1 :]:
+                        cond = condition(s)
+                        held = guard in cond or any(
+                            re.search(rf"\bsteps\.{re.escape(i)}\.outputs\.[\w-]+ == '[^']+'", cond)
+                            for i in guarded_ids
+                        )
+                        if held and 'id' in s:
+                            guarded_ids.add(s['id'])
+                        if uses_source(s) and not held:
+                            unguarded.append(s.get('name', ''))
                     self.assertEqual(unguarded, [])
                 # A later root checkout would empty the workspace and the source with it.
                 later = [
