@@ -49,7 +49,8 @@ jobs:
       go_modules_to_release: ${{ steps.hold.outputs.go_modules_to_release || steps.publish.outputs.go_modules_to_release || steps.ahead.outputs.go_modules_to_release || steps.changes.outputs.go_modules_to_release }}
       go_halves: ${{ steps.gomodules.outputs.go_halves }}
       halves_to_publish: ${{ steps.halves.outputs.halves_to_publish || '[]' }}
-      # A Go root's release-kind line; an image or TS root's is the claim job's.
+      # The root's kind line, but an image or TS root with a pending promotion
+      # takes the barrier's, written after its wait.
       release_kind_note: ${{ steps.pending.outputs.root_kind_note }}
       # Per-lane state keyed '.' (root) or the lane dir, the lane matrix, the
       # repairs owed (those completing TS subpackages, and the image's, apart)
@@ -606,14 +607,12 @@ jobs:
           || (needs.detect.outputs.type == 'ts' && needs.detect.outputs.root_changed == 'true'))
     runs-on: ubuntu-slim
     timeout-minutes: 5
-    # statuses: write posts the handoff record (tag-ref.sh handoff_record) and
-    # reads the dev receipts the kind line needs.
+    # statuses: write posts the handoff record (tag-ref.sh handoff_record).
     permissions:
       contents: write
       statuses: write
     outputs:
       claimed: ${{ steps.claim.outputs.claimed }}
-      kind_note: ${{ steps.kind.outputs.kind_note }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -629,11 +628,6 @@ jobs:
           path: .cplieger-ci
           persist-credentials: false
 
-      - name: Setup Python
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.15"
-
       - name: Claim the version
         id: claim
         env:
@@ -646,18 +640,6 @@ jobs:
           . "$CI_TOOLS/retry.sh"
           . "$CI_TOOLS/tag-ref.sh"
           claim_version "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL"
-
-      - name: Write the release's kind line
-        id: kind
-        if: ${{ needs.detect.outputs.channel == 'stable' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
-          STATE: ${{ needs.detect.outputs.lane_state }}
-          REPO_TYPE: ${{ needs.detect.outputs.type }}
-        run: |
-          set -euo pipefail
-          bash "$CI_TOOLS/release-state.sh" kind-note
 
   # ─── Repair each lane's unreceipted stable tag first ───────────────────────
   # A Go or lane tag follows its writes, and a root image or TS package with no
@@ -1013,6 +995,8 @@ jobs:
     permissions:
       actions: write
       contents: read
+    outputs:
+      kind_note: ${{ steps.kind.outputs.kind_note }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1057,6 +1041,20 @@ jobs:
               ;;
           esac
           WORKFLOW="${path##*/}" bash "$CI_TOOLS/release-state.sh" barrier
+
+      # After the wait, which lets the dev run building the promoted commit
+      # post its receipt, so the line can name that build as proven.
+      - name: Write the release's kind line
+        id: kind
+        if: ${{ needs.detect.outputs.type == 'docker' || needs.detect.outputs.type == 'ts' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          STATE: ${{ needs.detect.outputs.lane_state }}
+          REPO_TYPE: ${{ needs.detect.outputs.type }}
+        run: |
+          set -euo pipefail
+          bash "$CI_TOOLS/release-state.sh" kind-note
 
   # ─── Dev, mode=renumber: re-tag dev's newest builds ────────────────────────
   # Dispatched by a stable run's barrier. Checks out each lane's newest dev
@@ -1625,7 +1623,7 @@ jobs:
       go-modules: ${{ needs.detect.outputs.go_modules }}
       subpackages: ${{ needs.detect.outputs.subpackages }}
       defer-receipt: ${{ needs.detect.outputs.subpackages_to_publish != '[]' }}
-      release-kind-note: ${{ needs.claim.outputs.kind_note }}
+      release-kind-note: ${{ needs.barrier.outputs.kind_note || needs.detect.outputs.release_kind_note }}
       security-shas: ${{ needs.detect.outputs.security_shas }}
       registries: ${{ needs.detect.outputs.registries }}
       platforms: ${{ needs.detect.outputs.platforms }}
@@ -2046,7 +2044,8 @@ jobs:
       !cancelled() && needs.detect.result == 'success'
       && (needs.repair.result == 'success' || needs.repair.result == 'skipped')
       && (needs.barrier.result == 'success' || needs.barrier.result == 'skipped')
-      && needs.detect.outputs.type == 'ts' && needs.claim.outputs.claimed == 'true'
+      && needs.detect.outputs.type == 'ts'
+      && needs.claim.result == 'success' && needs.claim.outputs.claimed == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
@@ -2187,7 +2186,7 @@ jobs:
           CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
           GO_LANES_JSON: ${{ needs.detect.outputs.go_modules }}
-          KIND_NOTE: ${{ needs.claim.outputs.kind_note }}
+          KIND_NOTE: ${{ needs.barrier.outputs.kind_note || needs.detect.outputs.release_kind_note }}
           SECURITY_SHAS: ${{ needs.detect.outputs.security_shas }}
         run: |
           set -euo pipefail

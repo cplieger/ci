@@ -75,8 +75,10 @@ on:
         default: ""
       release-kind-note:
         description: >-
-          The sentence saying how this stable release was made (release.yaml's
-          release_kind_note), handed to the notes renderer. Empty adds nothing.
+          The sentence saying how this stable release was made: the root's kind
+          line release.yaml computes (the barrier's after its wait, or detect's
+          when no promotion is pending), handed to the notes renderer. Empty
+          adds nothing.
         type: string
         default: ""
       subpackages:

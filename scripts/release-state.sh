@@ -190,7 +190,8 @@ newest_affecting() { # <from> <to> <key> -> the newest reconciliation of from..t
 }
 # A docker or TS root's dev tag is a claim that may never have been published
 # or may have been handed off, so its kind line needs a token: cmd_kind_note
-# and cmd_receipts write it, and cmd_pending every other lane's.
+# and cmd_receipts write it, and cmd_pending every other lane's and the
+# root's when no promotion is pending (no dev build to name).
 kind_note() { # <release commit> <pending R or ''> <key> -> the release body's opening kind line, naming only a proven dev build; fails with git rev-parse or nearest_dev_tag
   local t d from
   if [ -z "$2" ]; then
@@ -234,7 +235,7 @@ cmd_pending() {
     in_range=false kind="" repair_kind="" prev_r=""
     if [ "$CHANNEL" = stable ]; then
       [ -z "$r" ] || in_range=true
-      if ! claims_proof "$key"; then
+      if ! claims_proof "$key" || [ -z "$r" ]; then
         kind=$(kind_note "$head" "$r" "$key") || die "cannot find lane ${key}'s promoted dev build for its kind line"
       fi
       if [ -n "$h_tag" ]; then

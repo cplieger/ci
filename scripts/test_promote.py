@@ -1807,6 +1807,53 @@ class Preview(unittest.TestCase):
         self.assertIn('### root: no release', text)
         self.assertEqual(self.plan_line(stdout), 'release-plan: {".":""}')
 
+    def test_an_image_promotion_previews_its_notes_with_no_token_and_no_kind_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            m = fx.commit(
+                'feat: init',
+                {
+                    'Dockerfile': 'FROM scratch\n',
+                    'main.go': 'package main\n',
+                    'cliff.toml': CLIFF_STABLE,
+                },
+            )
+            fx.g('tag', 'v1.0.0')
+            fx.g('checkout', '-q', '-b', 'dev')
+            t = fx.commit('feat: add greeting (#7)', {'main.go': 'package main\n\n// hi\n'})
+            fx.g('tag', 'v1.1.0-dev.1')
+            fx.publish()
+            tokens, plans = [], []
+            real_run, real_plan = subprocess.run, promote.release_plan
+
+            def run(cmd, **kw):
+                if cmd[0] == 'bash':
+                    tokens.append((Path(cmd[1]).name, kw.get('env', os.environ).get('GH_TOKEN')))
+                return real_run(cmd, **kw)
+
+            def release_plan(*a):
+                plans.append(real_plan(*a))
+                return plans[-1]
+
+            with (
+                unittest.mock.patch.object(promote.subprocess, 'run', run),
+                unittest.mock.patch.object(promote, 'release_plan', release_plan),
+            ):
+                rc, text, stdout, _ = self.run_preview(fx, m, t)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":"v1.1.0"}')
+        tools = {'release-state.sh', 'compute.sh', 'path-significance.sh'}
+        self.assertEqual({name for name, _ in tokens} & tools, tools)
+        self.assertEqual({token for name, token in tokens if name in tools}, {None})
+        self.assertEqual(plans[0]['.']['kind_note'], '')
+        self.assertNotIn('Promoted from', text)
+        self.assertIn('### root v1.1.0\n\n### Added\n\n- Add greeting (#7)', text)
+        self.assertIn(
+            'compare/v1.0.0...v1.1.0\n\nWhen the release run writes these notes, their first line '
+            'names the nearest `dev` build proven published by then.',
+            text,
+        )
+
     def test_a_repository_with_no_release_lane_says_so(self):
         with tempfile.TemporaryDirectory() as tmp:
             fx = Fixture(tmp)
@@ -1852,7 +1899,7 @@ class Preview(unittest.TestCase):
                     promote.GhError, f'^release-state.sh pending printed {why}$'
                 ),
             ):
-                promote.release_plan(Path('.'), 'demo', 'm', 'r', promote.Layout('go', [], []))
+                promote.release_plan(Path('.'), 'm', 'r', promote.Layout('go', [], []))
 
     def test_a_malformed_module_list_fails_the_release_plan(self):
         state = json.dumps({'.': {'h_tag': '', 'kind_note': '', 'in_range': False}})
@@ -1874,53 +1921,7 @@ class Preview(unittest.TestCase):
                 unittest.mock.patch.object(promote, 'run_tool', run_tool),
                 self.assertRaisesRegex(promote.GhError, 'printed malformed go_modules_to_release$'),
             ):
-                promote.release_plan(Path('.'), 'demo', 'm', 'r', promote.Layout('go', [], []))
-
-    def test_the_root_kind_line_is_read_with_the_token_and_proofs(self):
-        state = json.dumps({'.': {'h_tag': '', 'kind_note': '', 'in_range': False}})
-        kind_calls = []
-
-        def run_tool(clone, script, *args, token=False, **env):
-            if args == ('pending',):
-                return {'state': state, 'root_in_range': 'false', 'in_range_any': 'false'}
-            if args == ('kind-note',):
-                kind_calls.append((token, env.get('GITHUB_REPOSITORY'), env.get('STATE')))
-                return {'kind_note': 'Promoted from `v1.1.0-dev.1`'}
-            if script == promote.COMPUTE:
-                return {'anchor_sha': 'a' * 40, 'base': 'v1.1.0'}
-            return {
-                'root_changed': 'true',
-                'subpackages_to_publish': '[]',
-                'go_modules_to_release': '[]',
-            }
-
-        with (
-            unittest.mock.patch.object(promote, 'run_tool', run_tool),
-            unittest.mock.patch.object(promote, 'held_lanes', return_value={}),
-            unittest.mock.patch.object(promote.inventory, 'Repo'),
-        ):
-            plan = promote.release_plan(
-                Path('.'), 'demo', 'm', 'r', promote.Layout('docker', [], [])
-            )
-        self.assertEqual(kind_calls, [(True, f'{promote.OWNER}/demo', state)])
-        self.assertEqual(plan['.']['kind_note'], 'Promoted from `v1.1.0-dev.1`')
-
-    def test_only_a_token_run_tool_keeps_the_token(self):
-        seen = []
-
-        def run(cmd, **kw):
-            seen.append(kw['env'].get('GH_TOKEN'))
-            return subprocess.CompletedProcess(cmd, 0, '', '')
-
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            unittest.mock.patch.dict(os.environ, {'GH_TOKEN': 'test-key'}),
-            unittest.mock.patch.object(promote.subprocess, 'run', run),
-        ):
-            clone = Path(tmp) / 'demo'
-            promote.run_tool(clone, Path('x.sh'))
-            promote.run_tool(clone, Path('x.sh'), token=True)
-        self.assertEqual(seen, [None, 'test-key'])
+                promote.release_plan(Path('.'), 'm', 'r', promote.Layout('go', [], []))
 
     def test_the_root_version_is_scoped_by_the_layouts_lanes_and_type(self):
         state = json.dumps({'.': {'h_tag': '', 'kind_note': '', 'in_range': False}})
@@ -1938,7 +1939,7 @@ class Preview(unittest.TestCase):
             unittest.mock.patch.object(promote, 'run_tool', run_tool),
             self.assertRaisesRegex(promote.GhError, 'printed no go_modules_to_release$'),
         ):
-            promote.release_plan(Path('.'), 'demo', 'm', 'r', promote.Layout('go', [], ['alpha']))
+            promote.release_plan(Path('.'), 'm', 'r', promote.Layout('go', [], ['alpha']))
         self.assertEqual(
             (seen.get('GO_LANES_JSON'), seen.get('REPO_TYPE'), seen.get('CHANNEL')),
             ('["alpha"]', 'go', 'stable'),

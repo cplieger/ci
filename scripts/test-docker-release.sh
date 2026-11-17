@@ -307,9 +307,11 @@ json.dump(gates, open(f"{out}/gates.json", "w"))
 # The release-kind line: detect hands the root lane's sentence to every
 # stable notes step, docker-release included.
 open(f"{out}/detect-steps.txt", "w").write("".join(f"{s.get('name')}\n" for s in rjobs["detect"]["steps"]))
-open(f"{out}/kind-output.txt", "w").write(str(rjobs["claim"]["outputs"].get("kind_note", "")))
-for name, file in (("Claim the version", "claim.sh"), ("Write the release's kind line", "kind.sh")):
-    step = next(s for s in rjobs["claim"]["steps"] if s.get("name") == name)
+open(f"{out}/kind-output.txt", "w").write(str(rjobs["barrier"]["outputs"].get("kind_note", "")))
+barrier_steps = [s.get("name") for s in rjobs["barrier"]["steps"]]
+open(f"{out}/kind-last.txt", "w").write(str(barrier_steps[-1] == "Write the release's kind line"))
+for job, name, file in (("claim", "Claim the version", "claim.sh"), ("barrier", "Write the release's kind line", "kind.sh")):
+    step = next(s for s in rjobs[job]["steps"] if s.get("name") == name)
     open(f"{out}/{file}", "w").write(step["run"])
     open(f"{out}/{file}.envmap", "w").write("".join(f"{k}={v}\n" for k, v in sorted(step.get("env", {}).items())))
     open(f"{out}/{file}.if", "w").write(" ".join(str(step.get("if", "")).split()))
@@ -1424,20 +1426,21 @@ rm -f "$WORK"/g-*.json
 # ── Release-kind line ────────────────────────────────────────────────────────
 chk "D-S1 detect reads no soak record" "$(grep -c 'Read promotion record' "$WORK/detect-steps.txt" || true)" "0"
 chk "D-S1 release.yaml reads no soak-override status" "$(grep -c 'soak-override' "$RELEASE_YAML" || true)" "0"
-chk "D-S1 the root kind line is the claim job's, written on stable from pending's state" \
-  "$(cat "$WORK/kind-output.txt")|$(cat "$WORK/kind.sh.if")|$(sed -n 's/^STATE=//p' "$WORK/kind.sh.envmap")" \
-  "\${{ steps.kind.outputs.kind_note }}|\${{ needs.detect.outputs.channel == 'stable' }}|\${{ needs.detect.outputs.lane_state }}"
+chk "D-S1 an image or TS root's kind line is the barrier's last step, after its wait, from pending's state" \
+  "$(cat "$WORK/kind-output.txt")|$(cat "$WORK/kind-last.txt")|$(cat "$WORK/kind.sh.if")|$(sed -n 's/^STATE=//p' "$WORK/kind.sh.envmap")" \
+  "\${{ steps.kind.outputs.kind_note }}|True|\${{ needs.detect.outputs.type == 'docker' || needs.detect.outputs.type == 'ts' }}|\${{ needs.detect.outputs.lane_state }}"
 chk_has "D-S1 by release-state.sh, which reads the dev receipts" "$(cat "$WORK/kind.sh")|$(sed -n 's/^GH_TOKEN=//p' "$WORK/kind.sh.envmap")" \
   'release-state.sh" kind-note|${{ github.token }}'
-chk "D-S2 the docker job forwards the kind line" "$(jq -r '."release-kind-note"' "$WORK/docker-with.json")" \
-  '${{ needs.claim.outputs.kind_note }}'
+chk "D-S2 the docker job forwards the barrier's kind line, else detect's" "$(jq -r '."release-kind-note"' "$WORK/docker-with.json")" \
+  '${{ needs.barrier.outputs.kind_note || needs.detect.outputs.release_kind_note }}'
 chk "D-S2 and the security merges, and no promotion note" \
   "$(jq -r '[."security-shas", (has("promotion-note") | tostring)] | join(" ")' "$WORK/docker-with.json")" \
   '${{ needs.detect.outputs.security_shas }} false'
 chk "D-S3 docker notes read the kind-line input" "$(sed -n 's/^KIND_NOTE=//p' "$WORK/notes.sh.envmap")" \
   '${{ inputs.release-kind-note }}'
 chk "D-S5 go notes read detect's kind line, which needs no proof" "$(cat "$WORK/go-notes.env")" '${{ needs.detect.outputs.release_kind_note }}'
-chk "D-S5 ts notes read the claim job's" "$(cat "$WORK/ts-notes.env")" '${{ needs.claim.outputs.kind_note }}'
+chk "D-S5 ts notes read the barrier's, else detect's" "$(cat "$WORK/ts-notes.env")" \
+  '${{ needs.barrier.outputs.kind_note || needs.detect.outputs.release_kind_note }}'
 for job in go ts; do
   chk_has "D-S6 $job notes hand it to the renderer" "$(cat "$WORK/$job-notes.sh")" '--kind-note "$KIND_NOTE"'
 done
@@ -3038,7 +3041,7 @@ claim_at() { # <commit> <version tag> <branch head> [channel]: replays release.y
   PATH="$CL/bin:$PATH" GITHUB_SHA="$1" GITHUB_REPOSITORY=owner/app GITHUB_REF_NAME="$branch" GITHUB_SERVER_URL=https://gh \
     GITHUB_RUN_ID=7 python3 "$ROOT/scripts/workflow_replay.py" --workflow "$RELEASE_YAML" \
     --job claim --actions-root "$ROOT" --context "$CL/claim-ctx.json" --cwd "$CL_REPO" --out "$CL/claim-out.json" \
-    --stop-before "Write the release's kind line" >>"$CL/replay.log" 2>&1 || rc=$?
+    >>"$CL/replay.log" 2>&1 || rc=$?
   echo "$rc"
 }
 claimed_out() { jq -r '.steps.claim.outputs.claimed // "absent"' "$CL/claim-out.json"; }
@@ -3303,9 +3306,8 @@ for case in "stable v1.8.0" "dev v1.9.0-dev.1"; do
   rm -f "$CL_REFS/$v"
   git -C "$CL_REPO" tag -d "$v" >/dev/null
 done
-# When a sync lands during the build and the build then fails, GitHub refuses
-# the delete as it refuses the superseded run's ref create, so the run's end
-# fails red, naming the tag to delete by hand.
+# When GitHub refuses the delete, the run's end fails red, naming the tag to
+# delete by hand.
 rc=$(claim_at "$CL_A" v1.10.0 "$CL_A" stable)
 touch "$CL_REFS/.refuse"
 u=$(unclaim_at "$CL_A" v1.10.0)
@@ -3317,6 +3319,8 @@ rm -f "$CL_REFS/v1.10.0"
 git -C "$CL_REPO" tag -d v1.10.0 >/dev/null
 chk "D-CL23 the claim job runs right after detect, with the ref and status scopes alone" \
   "$(jq -c '[.needs, .permissions]' "$WORK/claim-job.json")" '["detect",{"contents":"write","statuses":"write"}]'
+chk "D-CL23 and only claims, passing on the claim alone" \
+  "$(jq -c '[.steps, (.outputs | keys)]' "$WORK/claim-job.json")" '[["Checkout","Check out the ci source","Claim the version"],["claimed"]]'
 chk "D-CL23 the image job publishes only on its claim, and passes it nothing else" \
   "$(jq -r '."release-needed"' "$WORK/docker-with.json")|$(jq -r 'keys | map(select(test("claim"))) | join(",")' "$WORK/docker-with.json")" \
   "\${{ needs.claim.outputs.claimed == 'true' && 'true' || 'false' }}|"
