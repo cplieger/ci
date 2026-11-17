@@ -910,6 +910,9 @@ chk "P20 a Go root's dev tag is its publication, so it needs no receipt" "$(kind
 touch "$GH_DIR/fail-statuses"
 chk "P20 statuses GitHub cannot read stop the barrier rather than guess" "$(kind_at "$O" "$S4_STATE" docker)" "refused"
 rm "$GH_DIR/fail-statuses" "$GH_DIR/statuses-$D1.json"
+chk "P20 a state that is not pending's, malformed or without the root, stops the barrier rather than writing a line" \
+  "$(kind_at "$O" '{' docker)|$(grep -c 'STATE is not the pending step' "$WORK/kind.log")|$(kind_at "$O" '{}' docker)|$(grep -c 'STATE is not the pending step' "$WORK/kind.log")" \
+  "refused|1|refused|1"
 git -C "$O" tag -d v1.1.0-dev.2 >/dev/null
 chk "P16 a lane list that is not JSON stops the run" \
   "$( (cd "$O" && CHANNEL=stable GO_LANES_JSON='["yamlenv"' GITHUB_OUTPUT="$WORK/out" bash "$RS" pending) >"$WORK/pending.log" 2>&1 && echo ran || echo refused)" \

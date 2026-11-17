@@ -240,11 +240,10 @@ class TagRefOrHandoff(RunsTagRef, unittest.TestCase):
 
 
 class ClaimUnderALaterDevTag(unittest.TestCase):
-    """claim_version and root_handed_off on one checkout: dev holds A then B, the run is at A."""
+    """claim_version, claim_held and root_handed_off on one checkout: dev holds A then B, the
+    run is at A."""
 
-    def run_claim(self, tags_at_b=(), tags_at_a=(), version='v1.0.0-dev.2', claim_rc=0):
-        tmp = pathlib.Path(tempfile.mkdtemp(prefix='claim-'))
-        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+    def checkout(self, tmp, tags_at_b, tags_at_a):
         repo = tmp / 'repo'
         git = ['git', '-C', str(repo), '-c', 'user.name=p', '-c', 'user.email=p@p']
         git += ['-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false']
@@ -267,17 +266,9 @@ class ClaimUnderALaterDevTag(unittest.TestCase):
         tags = dict.fromkeys(tags_at_a, a) | dict.fromkeys(tags_at_b, b)
         doc = {'tags': tags, 'creates': [], 'calls': [], 'head': b}
         state.write_text(json.dumps(doc))
-        # The later job's checkout holds the tag the claim created.
-        script = (
-            'set -euo pipefail\n'
-            f'. "{SCRIPTS}/retry.sh"\n'
-            f'. "{SCRIPTS}/tag-ref.sh"\n'
-            f'claim_version o/app dev {version} {a} dev || exit 3\n'
-            f'[ "$TAG_CREATED" != true ] || git tag {version} {a}\n'
-            'rc=0\n'
-            f'root_handed_off o/app dev {version} {a} dev >/dev/null || rc=$?\n'
-            'echo "claimed=${CLAIMED} handed_off_rc=${rc}"\n'
-        )
+        return repo, git, state, a, b
+
+    def run_bash(self, tmp, repo, state, script):
         env = {
             **os.environ,
             'PATH': f'{tmp}:{os.environ["PATH"]}',
@@ -289,13 +280,50 @@ class ClaimUnderALaterDevTag(unittest.TestCase):
         res = subprocess.run(
             ['bash', '-c', script], cwd=repo, env=env, capture_output=True, text=True, check=False
         )
-        self.assertEqual(res.returncode, 3 if claim_rc else 0, res.stdout + res.stderr)
         self.log = res.stdout + res.stderr
         calls = json.loads(state.read_text())['calls']
         self.creates = [c for c in calls if c[:2] == ['api', 'repos/o/app/git/refs']]
         self.posts = [c for c in calls if c[:3] == ['api', '-X', 'POST']]
         out = tmp / 'out'
         self.output = out.read_text() if out.exists() else ''
+        return res
+
+    def run_claim(self, tags_at_b=(), tags_at_a=(), version='v1.0.0-dev.2', claim_rc=0):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix='claim-'))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo, _, state, a, b = self.checkout(tmp, tags_at_b, tags_at_a)
+        # The later job's checkout holds the tag the claim created.
+        script = (
+            'set -euo pipefail\n'
+            f'. "{SCRIPTS}/retry.sh"\n'
+            f'. "{SCRIPTS}/tag-ref.sh"\n'
+            f'claim_version o/app dev {version} {a} dev || exit 3\n'
+            f'[ "$TAG_CREATED" != true ] || git tag {version} {a}\n'
+            'rc=0\n'
+            f'root_handed_off o/app dev {version} {a} dev >/dev/null || rc=$?\n'
+            'echo "claimed=${CLAIMED} handed_off_rc=${rc}"\n'
+        )
+        res = self.run_bash(tmp, repo, state, script)
+        self.assertEqual(res.returncode, 3 if claim_rc else 0, self.log)
+        return (res.stdout.splitlines() or [''])[-1], a, b
+
+    def run_held(self, tags_at_b=(), version='v1.0.0-dev.2', unfetched=False):
+        """claim_held at A with <version> tagged there, as a publishing job's rerun sees it."""
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix='held-'))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo, git, state, a, b = self.checkout(tmp, tags_at_b, [version])
+        if unfetched:
+            subprocess.run([*git, 'update-ref', '-d', 'refs/remotes/origin/dev'], check=True)
+        script = (
+            'set -euo pipefail\n'
+            f'. "{SCRIPTS}/retry.sh"\n'
+            f'. "{SCRIPTS}/tag-ref.sh"\n'
+            'rc=0\n'
+            f'claim_held o/app dev {version} {a} dev || rc=$?\n'
+            'echo "rc=${rc}"\n'
+        )
+        res = self.run_bash(tmp, repo, state, script)
+        self.assertEqual(res.returncode, 0, self.log)
         return (res.stdout.splitlines() or [''])[-1], a, b
 
     def handoff_descriptions(self, version):
@@ -375,6 +403,26 @@ class ClaimUnderALaterDevTag(unittest.TestCase):
         self.assertEqual(result, 'claimed=true handed_off_rc=1')
         self.assertEqual((self.creates, self.posts), ([], []))
 
+    def test_a_held_claim_under_a_later_dev_tag_hands_off_without_marking(self):
+        result, _, b = self.run_held(tags_at_b=['v1.0.0-dev.3'])
+        self.assertEqual((result, self.output), ('rc=0', 'claimed=false\n'))
+        self.assertEqual(
+            self.handoff_descriptions('v1.0.0-dev.2'),
+            [f"v1.0.0-dev.3 at {b} releases this commit's changes"],
+        )
+        self.assertEqual([p for p in self.posts if 'context=release/claim/v1.0.0-dev.2' in p], [])
+
+    def test_a_held_claim_git_cannot_place_fails_closed(self):
+        result, _, _ = self.run_held(unfetched=True)
+        self.assertEqual((result, self.output, self.posts), ('rc=1', '', []))
+        self.assertIn('::error::git cannot tell whether a later dev tag on dev holds', self.log)
+
+    def test_a_held_claim_with_no_later_dev_tag_is_marked(self):
+        result, _, _ = self.run_held(tags_at_b=['web/v1.0.0-dev.3'])
+        self.assertEqual((result, self.output), ('rc=0', 'claimed=true\n'))
+        self.assertEqual(len(self.posts), 1, self.posts)
+        self.assertIn('context=release/claim/v1.0.0-dev.2', self.posts[0])
+
     def test_a_root_claim_ignores_a_later_lane_dev_tag(self):
         result, _, _ = self.run_claim(tags_at_b=['web/v1.0.0-dev.3'])
         self.assertEqual(result, 'claimed=true handed_off_rc=1')
@@ -386,6 +434,10 @@ class ClaimCheck(unittest.TestCase):
     one, and marks it before its first write; the run's end deletes an unmarked claim."""
 
     def run_claim(self, call, tags=None, statuses=(), **fail):
+        args = {
+            'claim_held': f'o/app main v1.2.0 {COMMIT} stable',
+            'claim_unused': f'o/app v1.2.0 {COMMIT}',
+        }[call]
         tmp = pathlib.Path(tempfile.mkdtemp(prefix='claim-'))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         (tmp / 'gh').write_text(GH_STUB)
@@ -403,7 +455,7 @@ class ClaimCheck(unittest.TestCase):
             f'. "{SCRIPTS}/retry.sh"\n'
             f'. "{SCRIPTS}/tag-ref.sh"\n'
             'rc=0\n'
-            f'{call} o/app v1.2.0 {COMMIT} || rc=$?\n'
+            f'{call} {args} || rc=$?\n'
             'echo "rc=${rc}"\n'
         )
         env = {

@@ -991,7 +991,8 @@ def cmd_preview(args) -> int:
                     lines += [
                         (
                             'When the release run writes these notes, their first line names the '
-                            'nearest `dev` build proven published by then.'
+                            'nearest `dev` build proven published by then, or the `dev` commit when '
+                            'none is.'
                         ),
                         '',
                     ]

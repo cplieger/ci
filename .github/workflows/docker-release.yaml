@@ -1246,20 +1246,23 @@ jobs:
       # The version's git tag is its claim, which the caller's claim job takes
       # before the build and this step only verifies (tag-ref.sh claim_held):
       # a tag at another commit publishes nothing, so no two commits share a
-      # version. Its release/claim status marks the writes as begun, so the
-      # caller's unclaim job keeps the tag. The proof that the writes ran comes
-      # after them: the dev-receipt job's receipt, or the Release.
+      # version, and on dev a later dev tag shipping this commit hands off, so
+      # a rerun never moves :dev back. Its release/claim status marks the
+      # writes as begun, so the caller's unclaim job keeps the tag. The proof
+      # that the writes ran comes after them: the dev-receipt job's receipt,
+      # or the Release.
       - name: Verify the claim
         id: claim
         if: ${{ env.PUBLISH == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
           . "$CI_TOOLS/retry.sh"
           . "$CI_TOOLS/tag-ref.sh"
-          claim_held "$GITHUB_REPOSITORY" "$TAG" "$GITHUB_SHA"
+          claim_held "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$TAG" "$GITHUB_SHA" "$CHANNEL"
 
       # Build arm: assemble the multi-arch index at the channel tags from the
       # per-arch digests. Promote arm: `imagetools create` with a single

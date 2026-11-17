@@ -263,9 +263,11 @@ cmd_pending() {
 
 # The root's kind line on stable, from the promotion pending found (STATE).
 cmd_kind_note() {
-  local kind
-  kind=$(kind_note "$(git rev-parse HEAD)" "$(jq -r '.["."].commit // ""' <<<"${STATE:?}")" .) \
-    || die "cannot find the root's promoted dev build for its kind line"
+  local kind head r
+  head=$(git rev-parse HEAD) || die "cannot read HEAD for the root's kind line"
+  r=$(jq -er 'if has(".") then .["."].commit else error end' <<<"${STATE:?}") \
+    || die "STATE is not the pending step's state"
+  kind=$(kind_note "$head" "$r" .) || die "cannot find the root's promoted dev build for its kind line"
   out "kind_note=${kind}"
 }
 

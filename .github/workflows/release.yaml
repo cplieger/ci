@@ -2097,18 +2097,21 @@ jobs:
           mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
 
       # npm keeps every version it is given, so the claim job's tag must hold
-      # this commit before the first write (tag-ref.sh claim_held).
+      # this commit before the first write, and on dev a later dev tag
+      # shipping this commit hands off, so a rerun never moves npm's dev
+      # dist-tag back (tag-ref.sh claim_held).
       - name: Verify the claim
         id: claim
         env:
           GH_TOKEN: ${{ github.token }}
           CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
+          CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
           set -euo pipefail
           . "$CI_TOOLS/retry.sh"
           . "$CI_TOOLS/tag-ref.sh"
-          claim_held "$GITHUB_REPOSITORY" "$VERSION" "$GITHUB_SHA"
+          claim_held "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL"
 
       - name: Publish to npm + JSR
         if: ${{ steps.claim.outputs.claimed == 'true' }}

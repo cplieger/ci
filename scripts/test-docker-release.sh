@@ -3185,6 +3185,14 @@ chk "D-CL14 a rerun of an unproven claim a later dev tag supersedes ends green, 
   "$rc|$(grep -c '^write ' "$CL_EVENTS" || true)|$(claimed_out)" "0|0|false"
 chk "D-CL14 recording on A the later version and its commit, and no receipt" \
   "$(grep -c "^gh api -X POST repos/owner/app/statuses/$CL_A -f state=success -f context=release/handoff/v1.3.0-dev.1 -f description=v1.3.0-dev.2 at $CL_B " "$CL_EVENTS" || true)|$(receipt_on "$CL_A" v1.3.0-dev.1)" "1|0"
+# "Re-run failed jobs" reruns finalize alone, the claim job keeping its first
+# claimed=true, so finalize's own check hands off too.
+: >"$CL_EVENTS"
+rc=$(finalize_at "$CL_A" v1.3.0-dev.1 "$CL_B")
+chk "D-CL14 a finalize-only rerun under the later dev tag ends green, writing no image and no :dev" \
+  "$rc|$(grep -c '^write ' "$CL_EVENTS" || true)|$(jq -r '.steps.claim.outputs.claimed // "absent"' "$CL/out.json")" "0|0|false"
+chk "D-CL14 the finalize-only rerun records on A the later version, and neither marks the claim nor posts a receipt" \
+  "$(grep -c "^gh api -X POST repos/owner/app/statuses/$CL_A -f state=success -f context=release/handoff/v1.3.0-dev.1 -f description=v1.3.0-dev.2 at $CL_B " "$CL_EVENTS" || true)|$(grep -c "context=release/claim/v1.3.0-dev.1 " "$CL_EVENTS" || true)|$(receipt_on "$CL_A" v1.3.0-dev.1)" "1|0|0"
 # The same supersession with the version untagged: a rerun of an older run
 # that failed before its claim numbers past B's tag (compute.sh counts every
 # dev tag), and a claim at A would rank A's older tree above B's.
@@ -3356,6 +3364,7 @@ names = [s.get("name") for s in steps]
 claim = next((s for s in steps if s.get("id") == "claim"), None)
 early = next((s for s in jobs["claim"]["steps"] if s.get("id") == "claim"), None)
 open(f"{sys.argv[2]}/ts-claim.sh", "w").write(early["run"] if early else "echo 'no claim step'; exit 99\n")
+open(f"{sys.argv[2]}/ts-verify.sh", "w").write(claim["run"] if claim else "echo 'no verify step'; exit 99\n")
 pub = names.index("Publish to npm + JSR")
 print(json.dumps({
     "before-publish": claim is not None and names.index(claim["name"]) < pub and "claim_held " in claim["run"],
@@ -3364,7 +3373,7 @@ print(json.dumps({
     "handoff-readers": [s.get("name") for s in steps if "steps.handoff" in str(s.get("if", ""))],
 }))
 PY
-ts_claim() { # <commit> <dev's head> -> rc|claimed, the step's output in CL/ts-claim.log
+ts_claim() { # <commit> <dev's head> [step file, default ts-claim.sh] -> rc|claimed, the step's output in CL/ts-claim.log
   local rc=0
   : >"$CL_EVENTS"
   : >"$CL/ts-out"
@@ -3372,7 +3381,7 @@ ts_claim() { # <commit> <dev's head> -> rc|claimed, the step's output in CL/ts-c
   git -C "$CL_REPO" update-ref refs/remotes/origin/dev "$2"
   (cd "$CL_REPO" && PATH="$CL/bin:$PATH" GITHUB_OUTPUT="$CL/ts-out" CI_TOOLS="$ROOT/scripts" GITHUB_REPOSITORY=owner/app \
     GITHUB_SHA="$1" GITHUB_REF_NAME=dev GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 READBACK_SLEEP=0 VERSION=v1.4.0-dev.1 \
-    CHANNEL=dev bash "$CL/ts-claim.sh") >"$CL/ts-claim.log" 2>&1 || rc=$?
+    CHANNEL=dev bash "$CL/${3:-ts-claim.sh}") >"$CL/ts-claim.log" 2>&1 || rc=$?
   echo "$rc|$(sed -n 's/^claimed=//p' "$CL/ts-out")"
 }
 chk "D-CL7 a ts run whose branch moved but whose create succeeds claims its version, its proof left to after the publish" \
@@ -3391,6 +3400,9 @@ tagged v1.4.0-dev.1 "$CL_A"
 chk "D-CL15 a ts rerun of an unproven claim a later dev tag supersedes claims nothing, recording the later version" \
   "$(ts_claim "$CL_A" "$CL_B")|$(receipt_on "$CL_A" v1.4.0-dev.1)|$(grep -c "statuses/$CL_A -f state=success -f context=release/handoff/v1.4.0-dev.1 -f description=v1.4.0-dev.2 at $CL_B " "$CL_EVENTS" || true)" \
   "0|false|0|1"
+chk "D-CL15 a ts-only rerun's verify under the later dev tag publishes nothing, recording the later version and marking nothing" \
+  "$(ts_claim "$CL_A" "$CL_B" ts-verify.sh)|$(receipt_on "$CL_A" v1.4.0-dev.1)|$(grep -c "statuses/$CL_A -f state=success -f context=release/handoff/v1.4.0-dev.1 -f description=v1.4.0-dev.2 at $CL_B " "$CL_EVENTS" || true)|$(grep -c "context=release/claim/v1.4.0-dev.1 " "$CL_EVENTS" || true)" \
+  "0|false|0|1|0"
 rm -f "$CL_REFS/v1.4.0-dev.1" "$CL_REFS/v1.4.0-dev.2"
 git -C "$CL_REPO" tag -d v1.4.0-dev.1 v1.4.0-dev.2 >/dev/null
 chk "D-CL9 the claim's check precedes npm's publish, which runs only on a held claim" \

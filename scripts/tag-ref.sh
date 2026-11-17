@@ -149,30 +149,46 @@ claim_version() {
   echo "claimed=$CLAIMED" >>"${GITHUB_OUTPUT:?}"
 }
 
-# claim_held <owner/repo> <tag> <commit>: a publishing job's check of the claim
-# job's claim_version, which it never repeats: a ref create it sent after a
-# newer push would be refused. When <tag> is at <commit>, posts the
-# release/claim/<tag> status on <commit> (claim_unused keeps the tag once it
-# exists), writes claimed=true in GITHUB_OUTPUT and returns 0; returns 1 when
-# the tag is elsewhere, absent or unreadable, or the status is not posted, so
-# nothing is published under it.
+# claim_held <owner/repo> <branch> <tag> <commit> <channel>: a publishing
+# job's check of the claim job's claim_version, which it never repeats: a ref
+# create it sent after a newer push would be refused. When <tag> is at
+# <commit>, posts the release/claim/<tag> status on <commit> (claim_unused
+# keeps the tag once it exists), writes claimed=true in GITHUB_OUTPUT and
+# returns 0; returns 1 when the tag is elsewhere, absent or unreadable, or the
+# status is not posted, so nothing is published under it. On dev it first
+# hands off, as claim_version does, when a later dev tag of the lane
+# supersedes <tag>: a rerun of only the failed jobs keeps the claim job's
+# first answer, and publishing would move the dev channel back.
 claim_held() {
-  if ! retry claim_read "$1" "$2"; then
-    echo "::error::tag $2 cannot be read, so this run's claim of it at $3 is unconfirmed and nothing is published under it."
+  local later
+  if ! retry claim_read "$1" "$3"; then
+    echo "::error::tag $3 cannot be read, so this run's claim of it at $4 is unconfirmed and nothing is published under it."
     return 1
   fi
   if [ -z "$CLAIM_AT" ]; then
-    echo "::error::tag $2 does not exist, so nothing is published under it. An attempt that ended before its first write deleted this run's claim: rerun all jobs so the claim job claims it again."
+    echo "::error::tag $3 does not exist, so nothing is published under it. An attempt that ended before its first write deleted this run's claim: rerun all jobs so the claim job claims it again."
     return 1
   fi
-  if [ "$CLAIM_AT" != "$3" ]; then
-    echo "::error::tag $2 is at ${CLAIM_AT}, not this run's commit $3, so nothing is published under it."
+  if [ "$CLAIM_AT" != "$4" ]; then
+    echo "::error::tag $3 is at ${CLAIM_AT}, not this run's commit $4, so nothing is published under it."
     return 1
   fi
-  if ! retry gh api -X POST "repos/$1/statuses/$3" -f state=success -f context="${TAG_CLAIM_PREFIX}$2" \
+  if [ "$5" = dev ]; then
+    if ! later=$(later_dev_tag "$2" "$3" "$4"); then
+      echo "::error::git cannot tell whether a later dev tag on $2 holds $4, so nothing is published under $3."
+      return 1
+    fi
+    if [ -n "$later" ]; then
+      echo "::notice::${later% *} at ${later#* } already ships the changes of $4, so nothing is published under $3."
+      handoff_record "$1" "$3" "$4" "${later% *} at ${later#* }"
+      echo "claimed=false" >>"${GITHUB_OUTPUT:?}"
+      return 0
+    fi
+  fi
+  if ! retry gh api -X POST "repos/$1/statuses/$4" -f state=success -f context="${TAG_CLAIM_PREFIX}$3" \
     -f description="the release run writes under this claim" \
     -f target_url="${GITHUB_SERVER_URL:-https://github.com}/$1/actions/runs/${GITHUB_RUN_ID:-0}" >/dev/null; then
-    echo "::error::the ${TAG_CLAIM_PREFIX}$2 status was not posted on $3, so nothing is published under $2, which would let the run's end delete it."
+    echo "::error::the ${TAG_CLAIM_PREFIX}$3 status was not posted on $4, so nothing is published under $3, which would let the run's end delete it."
     return 1
   fi
   echo "claimed=true" >>"${GITHUB_OUTPUT:?}"
