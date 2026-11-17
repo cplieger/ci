@@ -39,6 +39,7 @@ TIERS = ('gated', 'exact', 'reported')
 CHANGE_FIELDS = ('baseline', 'budget', 'tier', 'headroom', 'source')
 ENTRY_FIELDS = (*KEY_FIELDS, *CHANGE_FIELDS, 'reason')
 FILE_FIELDS = ('schema', 'runner', 'headroom', 'floor', 'target', 'budgets', 'retired')
+FILE_MAPS = ('headroom', 'floor', 'target')
 SCHEMA = 2
 SERVER_CPU = 'server_cpu_ms'
 DEFAULT_HEADROOM = {'cpu_ms': 1.5, 'heap_mb': 1.25, 'rss_mb': 1.25}
@@ -1224,6 +1225,7 @@ class Checked:
     accepted: dict
     moves: list[dict]
     retires: list[dict]
+    notices: list[str] = dataclasses.field(default_factory=list)
 
 
 def check_provenance(
@@ -1242,17 +1244,25 @@ def check_provenance(
     (load_source) and list its cell; an entry the head adds or whose baseline, budget,
     tier, headroom or source differs from the base, every entry when the file's runner,
     headroom, floor or target differs, must match it (entry_provenance); every entry
-    comes from the newest source of its cell (superseded_entries) and from none older than
-    its base entry's (moves_to_older); a gated or exact entry
-    leaves only through `retired`; every file under sources is named by an entry; and
-    every accepted file holds (load_accepted)."""
+    comes from the newest source of its cell (superseded_entries) and, over a base of this
+    schema, from none older than its base entry's (moves_to_older), else notices says so;
+    a gated or exact entry leaves only through `retired`; every file under sources is named
+    by an entry; and every accepted file holds (load_accepted)."""
     errors = []
+    notices = []
     refused: dict[tuple, list[str]] = {}
     base_entries = {key(e): e for e in base.get('budgets', [])}
     head_entries = {key(e): e for e in head.get('budgets', [])}
     # The file-level maps sit outside CHANGE_FIELDS, and each changes how every entry gates.
-    moved = any(head.get(f) != base.get(f) for f in ('headroom', 'floor', 'target'))
+    moved = any(head.get(f) != base.get(f) for f in FILE_MAPS)
     file_edit = moved or head.get('runner') != base.get('runner')
+    # A base of another schema keeps its sources outside `sources`, so none can be placed.
+    base_placeable = base.get('schema') == SCHEMA
+    if base_entries and not base_placeable:
+        notices.append(
+            f'the base budgets.json is schema {base.get("schema")!r}, which names no source '
+            "this gate can place, so no entry was held to a source as new as its base entry's"
+        )
     named: dict[str, Source] = {}
     for e in head_entries.values():
         src = parse_source(e.get('source'))
@@ -1290,12 +1300,15 @@ def check_provenance(
             errors.append(f'{name}: {refused[k][0]}')
             continue
         mine = refused[k] = []
+        raised_by_file = map_moved(head, base, e)
         if 'reason' in e:
-            mine += reason_provenance(e, b, src, moved)
+            mine += reason_provenance(e, b, src, raised_by_file)
         if src.stem in loaded:
             changed = b is None or file_edit or any(e.get(f) != b.get(f) for f in CHANGE_FIELDS)
-            mine += entry_provenance(e, b, loaded[src.stem], changed, moved, base_sha, git)
-            mine += moves_to_older(e, b, loaded[src.stem], placed_at_base, git)
+            found = loaded[src.stem]
+            mine += entry_provenance(e, b, found, changed, raised_by_file, base_sha, git)
+            if base_placeable:
+                mine += moves_to_older(e, b, found, placed_at_base, git)
         errors.extend(f'{name}: {x}' for x in mine)
         if src.stem not in loaded:
             # errors holds the source's own line once; the entry's refusals still name it.
@@ -1343,7 +1356,21 @@ def check_provenance(
         and base_entries.get(k, {}).get('tier') == 'exact'
         and e['baseline'] != base_entries[k].get('baseline')
     ]
-    return Checked(errors, stale, slower, moves, retires)
+    return Checked(errors, stale, slower, moves, retires, notices)
+
+
+def map_moved(head: dict, base: dict, e: dict) -> bool:
+    """Whether a file-level map moves entry e's budget: e is gated and its family's headroom,
+    floor or target in head differs from base's. An exact budget is its baseline."""
+    if e.get('tier') != 'gated':
+        return False
+    fam = family(e['metric'])
+
+    def value(doc: dict, field: str) -> object:
+        m = doc.get(field)
+        return m.get(fam) if isinstance(m, dict) else None
+
+    return any(value(head, f) != value(base, f) for f in FILE_MAPS)
 
 
 ACCEPTED_FIELDS = ('reason', 'cells')
@@ -1560,8 +1587,8 @@ def calibration_provenance(
     git: Git,
 ) -> list[str]:
     """A changed entry takes baseline, tier and headroom from a calibration the base holds,
-    since only the default branch is calibrated. With file_moved (a headroom, floor or target
-    edit), a budget above the base's needs a `reason` even when its baseline did not rise."""
+    since only the default branch is calibrated. With file_moved (map_moved), a budget above
+    the base's needs a `reason` even when its baseline did not rise."""
     label = found.source.label
     out = []
     if e.get('baseline') != c.get('baseline'):
@@ -1592,7 +1619,7 @@ def calibration_provenance(
 
 def reason_provenance(e: dict, b: dict | None, src: Source, file_moved: bool) -> list[str]:
     """Why a gated calibration entry may not carry its reason: one the base entry does not
-    already carry is allowed only on a budget a file-level edit raises."""
+    already carry is allowed only on a budget a file-level edit raises (map_moved)."""
     if src.kind != 'calibration' or e['tier'] != 'gated':
         return []
     if b is not None and b.get('reason') == e['reason']:
@@ -2504,7 +2531,10 @@ def run(a: argparse.Namespace) -> int:
         pathlib.Path(a.out).write_text(json.dumps(points, indent=2) + '\n')
         return 0
     if a.check_file:
-        errors = file_errors(a, load(a.check_file), held_reported(a)).errors
+        checked = file_errors(a, load(a.check_file), held_reported(a))
+        for n in checked.notices:
+            print(f'::notice::{n}')
+        errors = checked.errors
         for e in errors:
             print(f'::error::{e}')
         return 1 if errors else 0
@@ -2526,7 +2556,7 @@ def run(a: argparse.Namespace) -> int:
         units = planned_windows(c for job in matrix['include'] for c in job['cells'])
         results = merge_results(a.results, a.prefix)
         out = compare(budgets, results, units, checked.accepted)
-        out.notices += unmeasured_accepted(checked.accepted, out)
+        out.notices += checked.notices + unmeasured_accepted(checked.accepted, out)
         # A measured file of another runner is one load_source refuses, so nothing is stale.
         stale = set() if out.runner_mismatch else checked.stale
         judged = [c for c in results['cells'] if planned(units, c)]

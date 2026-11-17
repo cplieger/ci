@@ -1616,6 +1616,74 @@ class Provenance(unittest.TestCase):
                 self.assertIn(want, errors[0])
                 self.assertEqual(self.stale, set())
 
+    def schema_1_base(self, *entries):
+        """A base budgets.json of schema 1, whose sources the base tree holds under another
+        directory: git shows none of them under sources."""
+        base = budgets(list(entries), schema=1)
+        del base['target']
+        for e in entries:
+            self.git.shown[f'{e["source"].rsplit("/", 1)[1]}.json'] = perf_gate.GitError
+        return base
+
+    def resourced(self):
+        """A head whose exact entry leaves the base's calibration 100 for calibration 200 of
+        the base commit, ba5e."""
+        self.git.lineage = {('ba5e', HEAD)}
+        self.dom('200', 2056.0, 'ba5e')
+        return budgets([self.exact('200', 2056.0)])
+
+    def test_a_schema_1_base_holds_no_entry_to_its_base_entrys_source(self):
+        head = self.resourced()
+        errors = self.check(head, self.schema_1_base(self.exact('100', 2055.0)), base_sha='ba5e')
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            self.checked.notices,
+            [
+                (
+                    'the base budgets.json is schema 1, which names no source this gate can '
+                    "place, so no entry was held to a source as new as its base entry's"
+                )
+            ],
+        )
+        # The same base at schema 2 places its source, or fails closed.
+        base = self.moved_from()
+        self.git.shown['100.json'] = perf_gate.GitError
+        errors = self.check(head, base, base_sha='ba5e')
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith(f"{DOM}: the base's calibration 100: "), errors)
+        self.assertEqual(self.checked.notices, [])
+
+    def test_a_schema_1_base_keeps_every_head_side_check(self):
+        cases = {
+            'a bundle that does not verify': (
+                lambda: self.bad_bundles.add('200.sigstore.json'),
+                'calibration 200: the bundle does not verify',
+            ),
+            'a calibration of a pull request': (
+                lambda: self.dom('200', 2056.0, 'pr-tip'),
+                'which the base ba5e does not hold',
+            ),
+            'a baseline its calibration did not measure': (
+                lambda: self.dom('200', 2057.0, 'ba5e'),
+                "baseline 2056.0 is not calibration 200's 2057.0",
+            ),
+        }
+        for name, (setup, want) in cases.items():
+            with self.subTest(name):
+                self.bad_bundles = set()
+                head = self.resourced()
+                self.git.lineage.add(('pr-tip', HEAD))
+                setup()
+                errors = self.check(
+                    head, self.schema_1_base(self.exact('100', 2055.0)), base_sha='ba5e'
+                )
+                self.assertTrue(any(want in x for x in errors), errors)
+
+    def test_a_base_with_no_entries_logs_no_skip(self):
+        head = self.resourced()
+        self.assertEqual(self.check(head, {'budgets': []}, base_sha='ba5e'), [])
+        self.assertEqual(self.checked.notices, [])
+
     def test_an_unplaceable_calibration_is_one_error_for_the_entries_naming_it(self):
         self.git.added = {'200.json': 'squash'}
         self.git.lineage = {('squash', HEAD)}
@@ -1885,6 +1953,37 @@ class Provenance(unittest.TestCase):
                     self.assertIn('without a reason', ' '.join(errors))
                     why = entry(baseline=baseline, budget=raised, reason='slower parse')
                     self.assertEqual(self.check(budgets([why], **edit), base), [])
+
+    def test_a_file_edit_asks_a_reason_only_of_the_budgets_its_family_moves(self):
+        srv = entry('server_cpu_ms', baseline=20.0, budget=63.0)
+        dom = {'tier': 'exact', 'kind': 'count'}
+        cells = [
+            cal_cell(baseline=1100.0),
+            cal_cell('dom', baseline=641, **dom),
+            cal_cell('server_cpu_ms', baseline=20.0, kind='server_cpu'),
+        ]
+        self.write('111', calibration_file(cells))
+        base = budgets(
+            [entry(), entry('dom', 'exact', 640), {**srv, 'budget': 70.0}],
+            target={'server_cpu_ms': 70.0},
+        )
+        # A target edit moves no cpu_ms budget, and no file edit moves an exact one.
+        head = budgets([entry(baseline=1100.0), entry('dom', 'exact', 641), srv])
+        self.assertEqual(self.check(head, base), [])
+        wide = {'cpu_ms': 1.6, 'heap_mb': 1.25, 'rss_mb': 1.25}
+        head = budgets(
+            [entry(baseline=1100.0, budget=1760.0), entry('dom', 'exact', 641), srv],
+            headroom=wide,
+        )
+        self.assertEqual(
+            self.check(head, base),
+            [
+                (
+                    f'{CPU}: the file headroom or floor raises its budget from 1500.0 to 1760.0 '
+                    'without a reason'
+                )
+            ],
+        )
 
     def test_a_headroom_edit_rechecks_an_entry_whose_fields_did_not_change(self):
         lowered = {'cpu_ms': 1.4, 'heap_mb': 1.25, 'rss_mb': 1.25}
@@ -3155,8 +3254,10 @@ class Cli(unittest.TestCase):
     ):
         own = [entry(source=RUN_URL + '100'), entry('dom', 'exact', 640)] if listed else []
         b = self.put('budgets.json', budgets([*own, *entries], **doc))
-        # The base branch's file is the head's unless base lists its entries.
-        was = b if base is None else self.put('base.json', budgets(base))
+        # The base branch's file is the head's unless base lists its entries or is a document.
+        if base is not None and not isinstance(base, dict):
+            base = budgets(base)
+        was = b if base is None else self.put('base.json', base)
         # Each entry's calibration, checked in at the head, as the provenance check needs.
         for e in [*own, *entries]:
             if not isinstance(e, dict) or not str(e.get('source', '')).startswith(RUN_URL):
@@ -3559,6 +3660,33 @@ class Cli(unittest.TestCase):
                 self.main(*argv, '--repo', REPO, '--head', HEAD, '--base-sha', HEAD), 1
             )
         self.assertIn('::error::budgets[0]: missing metric', self.output)
+
+    def test_a_schema_1_base_is_a_notice_of_compare_and_check_file(self):
+        class Git(FakeGit):
+            def __init__(self):
+                super().__init__()
+                self.shown = {'100.json': perf_gate.GitError}
+
+        base = budgets([entry('dom', 'exact', 640, source=RUN_URL + '100')], schema=1)
+        del base['target']
+        e = entry('dom', 'exact', 640, source=RUN_URL + '200')
+        counts = [cell(), cell('dom', (640,) * 3, kind='count')]
+        rc = self.compare(counts, entries=[e], listed=False, git=Git, base=base)
+        self.assertEqual(rc, 0, self.output)
+        skip = (
+            'the base budgets.json is schema 1, which names no source this gate can place, '
+            "so no entry was held to a source as new as its base entry's"
+        )
+        self.assertIn(f'### Notices\n\n- {skip}\n', (self.dir / 'summary.md').read_text())
+        argv = (
+            '--check-file',
+            str(self.dir / 'budgets.json'),
+            '--base',
+            str(self.dir / 'base.json'),
+        )
+        argv += ('--sources', str(self.dir / 'sources'), '--repo', REPO, '--head', HEAD)
+        self.assertEqual(self.main(*argv, '--base-sha', HEAD), 0, self.output)
+        self.assertEqual(self.output, f'::notice::{skip}\n')
 
     def test_check_file_refuses_a_list_budgets_json(self):
         head = self.put('budgets.json', [entry(source=RUN_URL + '100')])
