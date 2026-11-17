@@ -1247,23 +1247,6 @@ jobs:
             exit 1
           fi
 
-      # The version's git tag is its claim, which the caller's claim job takes
-      # before the build and this step only verifies (tag-ref.sh claim_held):
-      # a tag at another commit publishes nothing, so no two commits share a
-      # version. The proof that the writes ran comes after them: the
-      # dev-receipt job's receipt, or the Release.
-      - name: Verify the claim
-        id: claim
-        if: ${{ env.PUBLISH == 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
-        run: |
-          set -euo pipefail
-          . "$CI_TOOLS/retry.sh"
-          . "$CI_TOOLS/tag-ref.sh"
-          claim_held "$GITHUB_REPOSITORY" "$TAG" "$GITHUB_SHA"
-
       # A rebuild the gate skips publishes nothing under the version, and an
       # unproven claim below a later stable run stops it (release-state.sh
       # receipts), so the tag the claim job created is deleted.
@@ -1280,6 +1263,23 @@ jobs:
           fi
           gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" >/dev/null
           echo "::notice::the image matched ${TAG}'s compared release, so nothing is published and the claim of ${TAG} is deleted."
+
+      # The version's git tag is its claim, which the caller's claim job takes
+      # before the build and this step only verifies (tag-ref.sh claim_held):
+      # a tag at another commit publishes nothing, so no two commits share a
+      # version. The proof that the writes ran comes after them: the
+      # dev-receipt job's receipt, or the Release.
+      - name: Verify the claim
+        id: claim
+        if: ${{ env.PUBLISH == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/retry.sh"
+          . "$CI_TOOLS/tag-ref.sh"
+          claim_held "$GITHUB_REPOSITORY" "$TAG" "$GITHUB_SHA"
 
       # Build arm: assemble the multi-arch index at the channel tags from the
       # per-arch digests. Promote arm: `imagetools create` with a single
