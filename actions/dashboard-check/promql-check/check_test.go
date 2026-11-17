@@ -75,7 +75,6 @@ func TestQueries(t *testing.T) {
 		{name: "nameless_window", expr: `sum(increase({__name__="x_total", instance="$instance"}[$__interval]))`, want: "Q1"},
 		{name: "nameless_regex_instance", expr: `sum({__name__="x", instance=~".+"})`, want: "Q2"},
 		{name: "bare_braces_instance", expr: `sum({instance=~"$instance"})`, want: "Q2"},
-		{name: "two_instance_matchers", expr: `sum(up{instance=~".+", instance="$instance"})`, want: "Q2"},
 		{name: "single_quoted_value", expr: `sum(up{instance=~'$instance|'})`, want: "Q2"},
 		{name: "backtick_value", expr: "sum(up{instance=~`$instance|`})", want: "Q2"},
 		{name: "quoted_name", expr: `sum({"instance"=~"$instance|", __name__="up"})`, want: "Q2"},
@@ -91,7 +90,6 @@ func TestQueries(t *testing.T) {
 		{name: "empty_beside_literal_stand_in", expr: `sum(up{instance="__var_instance__"}) or sum(up{instance=""})`, want: "Q2"},
 		{name: "empty_beside_formatted", expr: `sum(up{instance="${instance:regex}"}) or sum(up{instance=""})`, want: "Q2"},
 		{name: "empty_beside_sentinel", expr: `sum(up{instance="$instance"}) or sum(up{instance=""})`, want: ""},
-		{name: "alerts_pair", expr: `ALERTS{alertname="X", instance="$instance"} or ALERTS{alertname="X", instance=""}`, want: ""},
 		{name: "empty_beside_regex", expr: `sum(up{instance=~"$instance"}) or sum(up{instance=""})`, want: "Q2"},
 		{name: "variable_query_result", kind: "variable", expr: `query_result(up{instance=~".+"})`, want: "Q2"},
 		{name: "variable_query_result_window", kind: "variable", expr: `query_result(sum(rate(x_total{instance="$instance"}[$__interval])))`, want: "Q1"},
@@ -140,17 +138,6 @@ func TestQueries(t *testing.T) {
 		{name: "presence_variable_query_result", kind: "variable", variable: "attention", expr: `query_result(count(up))`, want: "Q2"},
 		{name: "presence_variable_label_values", kind: "variable", variable: "version", expr: `label_values(x_build_info, version)`, want: "Q2"},
 		{name: "presence_instance_variable_exempt", kind: "variable", variable: "instance", expr: `label_values(x_build_info, instance)`, want: ""},
-		{name: "presence_target_alert_exempt", expr: `0 * max(ALERTS{alertname="XTargetAbsent", alertstate="firing"})`, want: ""},
-		{name: "presence_target_alert_nameless_exempt", expr: `max({__name__="ALERTS", alertname="XTargetAbsent"})`, want: ""},
-		{name: "presence_alert_other_label", expr: `max(ALERTS{alertname="X", alertstate="firing", severity="page"})`, want: "Q2"},
-		{name: "presence_alert_no_alertname", expr: `max(ALERTS{alertstate="firing"})`, want: "Q2"},
-		{name: "presence_alert_regex_name", expr: `max({__name__=~"ALERTS", alertname="X"})`, want: "Q2"},
-		{name: "presence_other_metric_by_alertname", expr: `max(ALERTS_FOR_STATE{alertname="X"})`, want: "Q2"},
-		{name: "presence_alert_regex_alertname", expr: `count(ALERTS{alertname=~".+"})`, want: "Q2"},
-		{name: "presence_alert_negated_alertname", expr: `count(ALERTS{alertname!=""})`, want: "Q2"},
-		{name: "presence_alert_empty_alertname", expr: `count(ALERTS{alertname=""})`, want: "Q2"},
-		{name: "presence_alert_negated_alertstate", expr: `count(ALERTS{alertname="X", alertstate!="firing"})`, want: "Q2"},
-		{name: "presence_alert_regex_beside_scoped", expr: `sum(ALERTS{alertname=~".+"}) or sum(up{instance="$instance"})`, want: "Q2"},
 		{name: "Q3_variable_label_name", expr: `sum(up{instance="$instance", $label="x"})`, want: "Q3"},
 		// An ad-hoc filter is one matcher Grafana adds to every query.
 		{name: "filter_job", kind: "filter", expr: `job="x"`, want: "Q3"},
@@ -358,6 +345,116 @@ func TestOneSampleFunctions(t *testing.T) {
 	}
 }
 
+// On a dashboard with an instance variable an ALERTS selector carries an instance matcher like any
+// other. An alert about an absent target has no instance label, so instance="" alone reads it on
+// ALERTS matched only by alertname and alertstate equalities.
+func TestAlertsScope(t *testing.T) {
+	for _, c := range []struct{ name, expr, want string }{
+		{name: "alertname_only", expr: `0 * max(ALERTS{alertname="XTargetAbsent", alertstate="firing"})`, want: "Q2"},
+		{name: "nameless_alertname_only", expr: `max({__name__="ALERTS", alertname="XTargetAbsent"})`, want: "Q2"},
+		{name: "empty_alone_passes", expr: `max(ALERTS{alertname="XTargetAbsent", alertstate="firing", instance=""})`, want: ""},
+		{name: "nameless_empty_alone_passes", expr: `max({instance="", __name__="ALERTS", alertname="XTargetAbsent"})`, want: ""},
+		{name: "exact_passes", expr: `max(ALERTS{alertname="XDown", alertstate="firing", instance="$instance"})`, want: ""},
+		{name: "pair_passes", expr: `max(ALERTS{alertname="X", instance="$instance"}) or max(ALERTS{alertname="X", instance=""})`, want: ""},
+		{name: "pair_regex_name", expr: `ALERTS{alertname=~"X|Y", instance="$instance"} or ALERTS{alertname=~"X|Y", instance=""}`, want: "Q2"},
+		{name: "wide_empty_beside_exact", expr: `max(up{instance="$instance"}) or count(ALERTS{alertname=~".+", instance=""})`, want: "Q2"},
+		{name: "negated_state_empty_beside_exact", expr: `max(up{instance="$instance"}) or count(ALERTS{alertname="X", alertstate!="firing", instance=""})`, want: "Q2"},
+		{name: "nameless_empty_beside_exact", expr: `max(up{instance="$instance"}) or max({alertname="X", instance=""})`, want: "Q2"},
+		{name: "name_regex_empty_beside_exact", expr: `up{instance="$instance"} or {__name__=~"ALERTS|up", instance=""}`, want: "Q2"},
+		{name: "other_name_regex_beside_exact", expr: `up{instance="$instance"} or {__name__=~"up|x", instance=""}`, want: ""},
+		{name: "target_alert_and_exact", expr: `ALERTS{alertname="X", instance="$instance"} and ALERTS{alertname="X", instance=""}`, want: "Q2"},
+		// The parser decodes names, quotes and comments, so none of these hides a selector.
+		{name: "escaped_metric_name", expr: `max({__name__="\x41LERTS", alertname="XTargetAbsent"})`, want: "Q2"},
+		{name: "space_before_brace", expr: `max(ALERTS {alertname="XTargetAbsent"})`, want: "Q2"},
+		{name: "reordered_matchers", expr: `max(ALERTS{alertstate="firing", alertname="XTargetAbsent"})`, want: "Q2"},
+		{name: "instance_in_comment", expr: "max(ALERTS{alertname=\"XTargetAbsent\" # , instance=\"$instance\"\n})", want: "Q2"},
+		{name: "or_nameless", expr: `max(up{instance="$instance"}) or max({__name__="ALERTS", alertname="XTargetAbsent"})`, want: "Q2"},
+		{name: "keyword_before_brace", expr: `max without (alertstate) ({__name__="ALERTS", alertname="XTargetAbsent"})`, want: "Q2"},
+		// instance="" alone passes on that closed shape only; any other matcher is refused.
+		{name: "empty_other_label", expr: `max(ALERTS{alertname="X", alertstate="firing", severity="page", instance=""})`, want: "Q2"},
+		{name: "empty_no_alertname", expr: `max(ALERTS{alertstate="firing", instance=""})`, want: "Q2"},
+		{name: "empty_regex_metric_name", expr: `max({__name__=~"ALERTS", alertname="X", instance=""})`, want: "Q2"},
+		{name: "empty_other_metric", expr: `max(ALERTS_FOR_STATE{alertname="X", instance=""})`, want: "Q2"},
+		{name: "empty_double_metric_name", expr: `max({__name__=~".+", __name__="ALERTS", alertname="X", instance=""})`, want: "Q2"},
+		{name: "for_state_empty_beside_exact", expr: `up{instance="$instance"} or ALERTS_FOR_STATE{alertname="X", instance=""}`, want: "Q2"},
+		{name: "for_state_regex_empty_beside_exact", expr: `up{instance="$instance"} or {__name__=~"ALERTS_.*", instance=""}`, want: "Q2"},
+		// A metric name taken from a variable can be ALERTS at run time.
+		{name: "variable_metric_name_empty_beside_exact", expr: `up{instance="$instance"} or {__name__="$label", instance=""}`, want: "Q2"},
+		{name: "variable_metric_name_regex_empty_beside_exact", expr: `up{instance="$instance"} or {__name__=~"$label", alertname=~".+", instance=""}`, want: "Q2"},
+		{name: "variable_metric_empty_beside_exact", expr: `up{instance="$instance"} or $label{instance=""}`, want: "Q2"},
+		{name: "empty_regex_alertname", expr: `count(ALERTS{alertname=~".+", instance=""})`, want: "Q2"},
+		{name: "empty_negated_alertname", expr: `count(ALERTS{alertname!="", instance=""})`, want: "Q2"},
+		{name: "empty_empty_alertname", expr: `count(ALERTS{alertname="", instance=""})`, want: "Q2"},
+		{name: "empty_negated_alertstate", expr: `count(ALERTS{alertname="X", alertstate!="firing", instance=""})`, want: "Q2"},
+		{name: "regex_beside_scoped", expr: `sum(ALERTS{alertname=~".+"}) or sum(up{instance="$instance"})`, want: "Q2"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			assertRules(t, appQuery("panel", c.expr), c.want)
+		})
+	}
+}
+
+// A series meets every matcher of its selector, so two instance matchers in one read nothing or
+// hide one another.
+func TestOneInstanceMatcherPerSelector(t *testing.T) {
+	for _, c := range []struct{ name, expr string }{
+		{name: "alerts_exact_and_empty", expr: `max(ALERTS{alertname="X", instance="$instance", instance=""})`},
+		{name: "alerts_empty_first", expr: `max(ALERTS{instance="", alertname="X", instance="$instance"})`},
+		{name: "alerts_escaped_name", expr: `max(ALERTS{alertname="X", "inst\x61nce"="$instance", instance=""})`},
+		{name: "alerts_in_pair", expr: `max(ALERTS{alertname="X", instance="$instance", instance=""}) or max(ALERTS{alertname="X", instance=""})`},
+		{name: "metric_exact_and_empty", expr: `sum(up{instance="$instance", instance=""})`},
+		{name: "metric_exact_twice", expr: `sum(up{instance="$instance", instance="$instance"})`},
+		{name: "regex_and_exact", expr: `sum(up{instance=~".+", instance="$instance"})`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := run(t, appQuery("panel", c.expr))
+			if got := rulesOf(r); !slices.Equal(got, []string{"Q2"}) {
+				t.Fatalf("rules = %v, want [Q2]; findings: %+v", got, r.Findings)
+			}
+			if !strings.Contains(r.Findings[0].Message, " instance matchers, and a series must meet every one") {
+				t.Errorf("message %q does not name the instance matchers of one selector", r.Findings[0].Message)
+			}
+		})
+	}
+}
+
+// instance="" selects series with no instance label, so beside instance="$instance" it is a second
+// arm joined by or. The nearest join to a selector holding instance="$instance" decides.
+func TestEmptyInstanceJoin(t *testing.T) {
+	for _, c := range []struct{ name, expr, why string }{
+		{name: "or_join", expr: `up{instance="$instance"} or up{instance=""}`},
+		{name: "exact_on_right", expr: `up{instance=""} or up{instance="$instance"}`},
+		{name: "or_through_parens_and_arithmetic", expr: `(sum(up{instance="$instance"})) or (0 * sum(up{instance=""}))`},
+		{name: "or_ignoring", expr: `up{instance="$instance"} or ignoring(instance) up{instance=""}`},
+		{name: "nearest_or_decides", expr: `(up{instance="$instance"} or up{instance=""}) and on() x{instance="$instance"}`},
+		{name: "and_join", expr: `up{instance="$instance"} and up{instance=""}`, why: `instance="" is joined to the instance="$instance" selector by and;`},
+		{name: "and_join_aggregated", expr: `count(up{instance="$instance"}) and count(up{instance=""})`, why: `instance="" is joined to the instance="$instance" selector by and;`},
+		{name: "empty_on_left_and", expr: `up{instance=""} and up{instance="$instance"}`, why: `instance="" is joined to the instance="$instance" selector by and;`},
+		{name: "unless_join", expr: `up{instance="$instance"} unless up{instance=""}`, why: `instance="" is joined to the instance="$instance" selector by unless;`},
+		{name: "arithmetic_join", expr: `up{instance="$instance"} + up{instance=""}`, why: `instance="" is joined to the instance="$instance" selector by +;`},
+		{name: "nearest_and_decides", expr: `x{instance="$instance"} or (y{instance="$instance"} and z{instance=""})`, why: `instance="" is joined to the instance="$instance" selector by and;`},
+		{name: "or_of_empty_arms", expr: `up{instance="$instance"} and on() (a{instance=""} or b{instance=""})`, why: `instance="" is joined to the instance="$instance" selector by and;`},
+		{name: "and_in_call_argument_under_or", expr: `w{instance="$instance"} or sum(clamp_min(x{instance="$instance"} and y{instance=""}, scalar(sum(v{instance="$instance"}))))`, why: `instance="" is joined to the instance="$instance" selector by and;`},
+		{name: "exact_in_call_argument", expr: `histogram_quantile(scalar(x{instance="$instance"}), up{instance=""})`, why: `instance="" selects only series with no instance label`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := run(t, appQuery("panel", c.expr))
+			if c.why == "" {
+				if len(r.Findings) != 0 {
+					t.Errorf("findings = %+v, want none", r.Findings)
+				}
+				return
+			}
+			if got := rulesOf(r); !slices.Equal(got, []string{"Q2"}) {
+				t.Fatalf("rules = %v, want [Q2]; findings: %+v", got, r.Findings)
+			}
+			if !strings.Contains(r.Findings[0].Message, c.why) {
+				t.Errorf("message %q does not say %q", r.Findings[0].Message, c.why)
+			}
+		})
+	}
+}
+
 func TestFindingText(t *testing.T) {
 	expr := `sum(increase(up{instance=~"$instance|", job="x"}[${__interval_ms}ms]))`
 	in := appQuery("panel", expr)
@@ -365,7 +462,7 @@ func TestFindingText(t *testing.T) {
 	r := run(t, in)
 	want := map[string]struct{ message, fix string }{
 		"Q1": {"increase returns nothing from a single sample", "use [$__rate_interval], or [$__range] for a total over the picked range, and give a subquery a range of at least twice its step. An interval variable there needs every choice, auto_min included when auto is on, of at least twice the 15s scrape interval."},
-		"Q2": {`instance=~"$instance|" matches it as a regular expression`, `match the instance exactly in every selector with instance="$instance"; instance="" may stay only beside it.`},
+		"Q2": {`instance=~"$instance|" matches it as a regular expression`, `match the instance exactly with one instance="$instance" in every selector. Put instance="" in a second selector joined by or beside it, or alone in ALERTS{alertname="<name>", instance=""}, optionally with alertstate="<state>"; a selector that can read ALERTS or ALERTS_FOR_STATE takes instance="" in that shape only.`},
 		"Q3": {`job="x"`, `delete the matcher; the metric name and instance="$instance" select the app's series.`},
 	}
 	if len(r.Findings) != len(want) {
