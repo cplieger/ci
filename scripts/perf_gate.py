@@ -338,13 +338,19 @@ def middle(reps: list) -> list:
 
 
 def compare(
-    budgets: dict, results: dict, units: dict | None = None, accepted: dict | None = None
+    budgets: dict,
+    results: dict,
+    units: dict | None = None,
+    accepted: dict | None = None,
+    reported: list[dict] | None = None,
 ) -> Outcome:
     """Judge each measured cell on its median of three. A gated cell over its
     budget (gated_budget, with `accepted` slowdowns) and an exact count whose middle
     rep is off its budget are listed in `remeasure`, never failed here. An exact entry
     measured as no count fails, and so does a gated or exact entry no shard measured
-    whose unit and window `units` (`planned_windows`) holds."""
+    whose unit and window `units` (`planned_windows`) holds. An entry of a cell a
+    `reported` pattern (held_patterns) matches is judged reported (as_planned)."""
+    budgets = as_planned(budgets, reported or [])
     out = Outcome(runner=results.get('runner', ''))
     out.runner_mismatch = out.runner != budgets.get('runner')
     entries = {key(e): e for e in budgets.get('budgets', [])}
@@ -433,10 +439,12 @@ def verdict(budgets: dict, results: dict, remeasured: dict, decided: dict | None
     whose median is over it, an exact count whose middle reps are not it.
     decided is compare's remeasure.json: its accepted slowdowns, its stale keys, the
     extension units (judge_extension) and the plan patterns both branches hold, which
-    excuse a retired cell the extension measured (retired_measured). An exact count off
+    make an entry reported (as_planned) and excuse a retired cell the extension measured
+    (retired_measured). An exact count off
     its budget, or on a stale key, fails, and is recorded for the measured file when its
     reps all agree."""
     decided = decided or {}
+    budgets = as_planned(budgets, decided.get('reported', []))
     accepted = accepted_cells(decided.get('accepted', []))
     stale = {key(k) for k in decided.get('stale', [])}
     out = compare(budgets, results, accepted=accepted)
@@ -959,15 +967,30 @@ def plan_reports(patterns: list[dict], c: dict) -> bool:
     )
 
 
-def check_plan(budgets: dict, doc: dict, *, reported: list[dict]) -> list[str]:
+def as_planned(budgets: dict, held: list[dict]) -> dict:
+    """budgets with each entry a pattern of held (held_patterns) matches made reported:
+    the plan's tier binds once the base lists the pattern, before the next calibration's
+    check-in rewrites the entry."""
+    if not held:
+        return budgets
+    entries = [
+        {**e, 'tier': 'reported'} if plan_reports(held, e) else e
+        for e in budgets.get('budgets', [])
+    ]
+    return {**budgets, 'budgets': entries}
+
+
+def check_plan(budgets: dict, doc: dict, *, reported: list[dict], base: dict) -> list[str]:
     """A gated or exact entry whose unit and window no set of RUN_SETS lists
     leaves the gate unmeasured, so it fails; one of a cell a pattern of reported
-    (held_patterns) matches fails. A set or cell of any set that is not an object,
+    (held_patterns) matches fails when it differs from base's entry, since only a
+    calibration writes such an entry. A set or cell of any set that is not an object,
     and a `reported` item of doc that is no pattern, is an error line."""
     sets = doc.get('sets', {})
     if not isinstance(sets, dict):
         return ['plan.json: sets must be an object of named sets']
     patterns, errors = reported, reported_patterns(doc)[1]
+    was = {key(e): e for e in base.get('budgets', []) if all(f in e for f in KEY_FIELDS)}
     cells = []
     for name, spec in sets.items():
         if not isinstance(spec, dict):
@@ -1002,7 +1025,7 @@ def check_plan(budgets: dict, doc: dict, *, reported: list[dict]) -> list[str]:
             f'{key_text(key(e))}: plan.json reports this cell, so its entry is reported, '
             f'not {e["tier"]}'
             for e in gating
-            if plan_reports(patterns, e)
+            if plan_reports(patterns, e) and e != was.get(key(e))
         ]
     )
 
@@ -2341,7 +2364,7 @@ def file_errors(a: argparse.Namespace, head: dict, held: list[dict]) -> Checked:
     if check_shape(head):
         return Checked(errors, set(), {}, [], [])
     if a.plan_doc:
-        errors += check_plan(head, load(a.plan_doc), reported=held)
+        errors += check_plan(head, load(a.plan_doc), reported=held, base=load_base(a.base))
     found = check_provenance(
         head,
         load_base(a.base),
@@ -2555,7 +2578,7 @@ def run(a: argparse.Namespace) -> int:
         matrix = plan(plan_doc, a.set, only=only)
         units = planned_windows(c for job in matrix['include'] for c in job['cells'])
         results = merge_results(a.results, a.prefix)
-        out = compare(budgets, results, units, checked.accepted)
+        out = compare(budgets, results, units, checked.accepted, held)
         out.notices += checked.notices + unmeasured_accepted(checked.accepted, out)
         # A measured file of another runner is one load_source refuses, so nothing is stale.
         stale = set() if out.runner_mismatch else checked.stale

@@ -368,6 +368,18 @@ class Compare(unittest.TestCase):
         self.assertEqual(perf_gate.compare(b, results([]), {}).failures, [])
         self.assertEqual(perf_gate.compare(b, results([], runner='x'), units).failures, [])
 
+    def test_an_entry_of_a_cell_a_held_pattern_matches_is_judged_reported(self):
+        b = budgets([entry(), entry('dom', 'exact', 640)])
+        units = perf_gate.planned_windows([unit('files', 80)])
+        held = [{'metric': 'dom'}]
+        off = results([cell(), cell('dom', (700,) * 3, kind='count')])
+        judged = perf_gate.compare(b, off, units)
+        self.assertEqual([keyof(c) for c in judged.remeasure], [keyof(entry('dom'))])
+        out = perf_gate.compare(b, off, units, reported=held)
+        self.assertEqual((out.remeasure, out.failures), ([], []))
+        self.assertEqual([keyof(c) for c in out.reported], [keyof(entry('dom'))])
+        self.assertEqual(perf_gate.compare(b, results([cell()]), units, reported=held).failures, [])
+
     def test_a_cell_that_lists_windows_needs_a_result_only_for_those(self):
         # The pr set measures WebKit x10 cold only; budgets.json holds the
         # full set's WebKit live CPU and back count too.
@@ -710,6 +722,23 @@ class Extension(unittest.TestCase):
         self.assertEqual(perf_gate.extension(PLAN, full, {'files'}), [])
         with self.assertRaisesRegex(TypeError, 'no full set'):
             perf_gate.extension({'sets': {'pr': PLAN['sets']['pr']}}, units, {'files'})
+
+    def test_a_cell_a_held_pattern_matches_is_reported_in_the_verdict(self):
+        x1 = {'scale': 'x1'}
+        b = budgets([entry('dom', 'exact', 640), {**entry('dom', 'exact', 640), **x1}])
+        first = results([cell('dom', (700,) * 3, kind='count')])
+        extend = [unit('files', 60, scale='x1')]
+        again = results([{**cell('dom', (700,) * 3, kind='count'), **x1}])
+        judged = perf_gate.verdict(b, first, again, decision(extend=extend))
+        self.assertEqual(len(judged.failures), 2, judged.failures)
+        held = decision(extend=extend, reported=[{'metric': 'dom'}])
+        out = perf_gate.verdict(b, first, again, held)
+        self.assertEqual(out.failures, [])
+        self.assertEqual(
+            sorted(keyof(c) for c in out.reported),
+            sorted([keyof(entry('dom')), keyof({**entry('dom'), **x1})]),
+        )
+        self.assertEqual(perf_gate.verdict(b, first, results([]), held).failures, [])
 
     def test_a_retired_cell_the_extension_measured_fails(self):
         retired = [{**CELL, 'scale': 'x1', 'metric': 'dom', 'reason': 'the list is virtual now'}]
@@ -2431,10 +2460,11 @@ class GitHistory(unittest.TestCase):
 
 
 class Coverage(unittest.TestCase):
-    def check(self, doc, plan, base=None):
-        """check_plan with the patterns plan and base, plan itself when unset, both hold."""
+    def check(self, doc, plan, base=None, was=None):
+        """check_plan with the patterns plan and base, plan itself when unset, both hold,
+        against the base budgets was, which holds no entry when unset."""
         held = perf_gate.held_patterns(plan, plan if base is None else base)
-        return perf_gate.check_plan(doc, plan, reported=held)
+        return perf_gate.check_plan(doc, plan, reported=held, base=was or budgets([]))
 
     def test_a_pattern_only_the_head_plan_lists_decides_no_tier(self):
         frames = entry('sse_frames', 'exact', 3)
@@ -2492,7 +2522,7 @@ class Coverage(unittest.TestCase):
         full = {'shards': 1, 'cells': [unit('files', 25, **webkit)]}
         self.assertEqual(self.check(doc, {'node': '.', 'sets': {'pr': pr, 'full': full}}), [])
 
-    def test_a_gated_or_exact_entry_of_a_cell_the_plan_reports_fails(self):
+    def test_a_gated_or_exact_entry_added_or_changed_for_a_cell_the_plan_reports_fails(self):
         frames = entry('sse_frames', 'exact', 3)
         live = {**frames, 'window': 'live'}
         engine = entry('max_bytes:GET /api/engine', 'exact', 900)
@@ -2512,6 +2542,11 @@ class Coverage(unittest.TestCase):
         )
         quiet = budgets([entry(), {**frames, 'tier': 'reported'}, live])
         self.assertEqual(self.check(quiet, {**PLAN, 'reported': reported}), [])
+        # An entry the base holds as it is waits for the calibration to rewrite it.
+        self.assertEqual(self.check(doc, {**PLAN, 'reported': reported}, was=doc), [])
+        moved = budgets([entry(), {**frames, 'baseline': 4, 'budget': 4}, live, engine])
+        errors = self.check(moved, {**PLAN, 'reported': reported}, was=doc)
+        self.assertEqual(errors, [f'files/x10/chromium/desktop/cold/sse_frames{tail}'])
 
     def test_a_reported_pattern_of_the_wrong_shape_is_an_error_line(self):
         for reported in (
@@ -3468,13 +3503,16 @@ class Cli(unittest.TestCase):
         remeasure = json.loads((self.dir / 'remeasure.json').read_text())
         self.assertEqual([keyof(c) for c in remeasure['cells']], [keyof(entry('dom'))])
         self.assertEqual(remeasure['reported'], [])
-        # A pattern the base plan holds too decides the tier.
-        self.assertEqual(self.compare(measured, plan=reports), 1)
+        # A pattern the base plan holds too decides the tier: the base's entry is reported.
+        self.assertEqual(self.compare(measured, plan=reports), 0, self.output)
+        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
+        self.assertEqual((remeasure['cells'], remeasure['reported']), ([], [{'metric': 'dom'}]))
+        # An exact entry the pull request adds for it fails.
+        rc = self.compare(measured, plan=reports, base=[entry(source=RUN_URL + '100')])
+        self.assertEqual(rc, 1)
         self.assertIn(
             'plan.json reports this cell, so its entry is reported, not exact', self.output
         )
-        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
-        self.assertEqual(remeasure['reported'], [{'metric': 'dom'}])
 
     def test_a_base_with_no_plan_holds_no_pattern_and_a_git_failure_fails(self):
         class Absent(FakeGit):
