@@ -631,7 +631,7 @@ def summary(budgets: dict, out: Outcome) -> str:
             (
                 f'The results come from runner `{out.runner}`, and `budgets.json` is calibrated '
                 f'on `{budgets.get("runner")}`, so every metric is reported and none gates. '
-                'Calibrate on this runner (`perf-calibrate.yaml`) to gate it.'
+                f'Measure on `{budgets.get("runner")}` to gate it.'
             ),
             '',
         ]

@@ -313,7 +313,10 @@ class Compare(unittest.TestCase):
         self.assertTrue(out.runner_mismatch)
         self.assertEqual((out.failures, out.remeasure), ([], []))
         self.assertEqual(len(out.reported), 2)
-        self.assertIn('calibrate', perf_gate.summary(b, out).lower())
+        text = perf_gate.summary(b, out)
+        self.assertIn(f'Measure on `{b["runner"]}` to gate it.', text)
+        # perf-calibrate.yaml takes no runner, so it is no step that gates this one.
+        self.assertNotIn('perf-calibrate.yaml', text)
 
     def test_an_empty_budget_list_reports_every_cell_and_fails_nothing(self):
         cells = [cell(reps=(9000.0, 9000.0, 9000.0)), cell('dom', (9, 9, 9), kind='count')]
