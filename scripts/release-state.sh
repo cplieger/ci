@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Two-branch release state, one subcommand per release.yaml step: claims, pending, publish, ahead, halves,
+# Two-branch release state, one subcommand per release.yaml step: claims, pending, kind-note, publish, ahead, halves,
 # number (CLIFF_SCRIPT, GO_LANES_JSON, REPO_TYPE), receipts, receipt TAG COMMIT, readback SITE TAG
 # [LANE], provenance and complete (IMAGE@DIGEST SOURCE), hold (drop the nested lanes HEAD holds
 # back from a stable run), barrier, renumber-target, renumber-handoff, renumber (re-tag LANE_KEY's
@@ -119,21 +119,27 @@ highest_stable() { # <key> [below X.Y.Z] -> "<tag> <commit>" of the lane's highe
   done <<<"$tags"
   [ -z "$best" ] || printf '%s %s\n' "$best" "$at"
 }
-nearest_dev_tag() { # <commit> <key> -> the highest dev tag of the lane on the commit nearest <commit>; fails when git cannot list the tags or walk <commit>'s history
+nearest_dev_tag() { # <commit> <key> [proven] -> the highest dev tag of the lane on the commit nearest <commit>, with proven the highest dev_proven one; fails when git cannot list the tags or walk <commit>'s history, or GitHub cannot tell a proof
   local -A at=()
-  local name c tags revs
+  local name c tags revs best
   tags=$(tags_of "$(dev_re "$2")") || return 1
   while read -r name c; do
     [ -n "$name" ] || continue
-    if [ -z "${at[$c]:-}" ] || tag_gt "$name" "${at[$c]}"; then
-      at[$c]=$name
-    fi
+    at[$c]+="$name "
   done <<<"$tags"
   [ "${#at[@]}" -gt 0 ] || return 0
   revs=$(git rev-list --topo-order "$1") || return 1
   while read -r c; do
-    if [ -n "${at[$c]:-}" ]; then
-      printf '%s' "${at[$c]}"
+    [ -n "${at[$c]:-}" ] || continue
+    best=""
+    for name in ${at[$c]}; do
+      [ -z "${3:-}" ] || dev_proven "$2" "$name" "$c" || continue
+      if [ -z "$best" ] || tag_gt "$name" "$best"; then
+        best=$name
+      fi
+    done
+    if [ -n "$best" ]; then
+      printf '%s' "$best"
       return 0
     fi
   done <<<"$revs"
@@ -182,14 +188,17 @@ newest_affecting() { # <from> <to> <key> -> the newest reconciliation of from..t
   done <<<"$recs"
   printf '%s' "$found"
 }
-kind_note() { # <release commit> <pending R or ''> <key> -> the release body's opening kind line; fails with git rev-parse or nearest_dev_tag
+# A docker or TS root's dev tag is a claim that may never have been published
+# or may have been handed off, so its kind line needs a token: the root's is
+# written by cmd_kind_note and cmd_receipts, a lane's by cmd_pending.
+kind_note() { # <release commit> <pending R or ''> <key> -> the release body's opening kind line, naming only a proven dev build; fails with git rev-parse or nearest_dev_tag
   local t d from
   if [ -z "$2" ]; then
     printf '%s' "$BUILT_FROM_MAIN"
     return 0
   fi
   t=$(git rev-parse "$2^2") || return 1
-  d=$(nearest_dev_tag "$t" "$3") || return 1
+  d=$(nearest_dev_tag "$t" "$3" proven) || return 1
   if [ -n "$d" ]; then from="\`$d\`"; else from="\`dev\` at \`${t:0:12}\`"; fi
   if [ "$1" = "$2" ]; then
     printf 'Promoted from %s' "$from"
@@ -222,20 +231,24 @@ cmd_pending() {
       die "lane ${key}: the highest stable tag ${h_tag} is on ${h_commit}, which HEAD does not contain, so an older commit is not published above it"
     fi
     r=$(newest_affecting "$h_commit" "$main" "$key") || die "cannot tell which of lane ${key}'s promotions on ${main} is pending"
-    in_range=false kind="" repair_kind=""
+    in_range=false kind="" repair_kind="" prev_r=""
     if [ "$CHANNEL" = stable ]; then
       [ -z "$r" ] || in_range=true
-      kind=$(kind_note "$head" "$r" "$key") || die "cannot find lane ${key}'s promoted dev build for its kind line"
+      if [ "$key" != . ]; then
+        kind=$(kind_note "$head" "$r" "$key") || die "cannot find lane ${key}'s promoted dev build for its kind line"
+      fi
       if [ -n "$h_tag" ]; then
         prev=$(highest_stable "$key" "$(core "$h_tag")") || die "cannot read lane ${key}'s stable tags"
         prev_r=$(newest_affecting "${prev#* }" "$h_commit" "$key") || die "cannot tell which of lane ${key}'s promotions up to ${h_tag} it published"
-        repair_kind=$(kind_note "$h_commit" "$prev_r" "$key") || die "cannot find lane ${key}'s promoted dev build for its kind line"
+        if [ "$key" != . ]; then
+          repair_kind=$(kind_note "$h_commit" "$prev_r" "$key") || die "cannot find lane ${key}'s promoted dev build for its kind line"
+        fi
       fi
     fi
     state=$(jq -c --arg k "$key" --arg lane "$(lane_dir "$key")" --arg h_tag "$h_tag" --arg h_commit "$h_commit" \
-      --arg commit "$r" --argjson in_range "$in_range" --arg kind "$kind" --arg repair "$repair_kind" \
+      --arg commit "$r" --argjson in_range "$in_range" --arg kind "$kind" --arg repair "$repair_kind" --arg repair_r "$prev_r" \
       '. + {($k): {lane: $lane, h_tag: $h_tag, h_commit: $h_commit, commit: $commit, version: "",
-        in_range: $in_range, kind_note: $kind, repair_kind_note: $repair}}' <<<"$state")
+        in_range: $in_range, kind_note: $kind, repair_kind_note: $repair, repair_commit: $repair_r}}' <<<"$state")
     lanes=$(jq -c --arg k "$key" --arg lane "$(lane_dir "$key")" '. + [{key: $k, lane: $lane}]' <<<"$lanes")
     echo "lane ${key}: highest stable ${h_tag:-<none>}, pending promotion ${r:-<none>}, in range ${in_range}"
   done <<<"$keys"
@@ -243,8 +256,15 @@ cmd_pending() {
     "any=$(jq -r 'any(.[]; .commit != "")' <<<"$state")" \
     "in_range_any=$(jq -r 'any(.[]; .in_range)' <<<"$state")" \
     "root_in_range=$(jq -r '.["."].in_range // false' <<<"$state")" \
-    "root_commit=$(jq -r '.["."].commit // ""' <<<"$state")" \
-    "root_kind_note=$(jq -r '.["."].kind_note // ""' <<<"$state")"
+    "root_commit=$(jq -r '.["."].commit // ""' <<<"$state")"
+}
+
+# The root's kind line on stable, from the promotion pending found (STATE).
+cmd_kind_note() {
+  local kind
+  kind=$(kind_note "$(git rev-parse HEAD)" "$(jq -r '.["."].commit // ""' <<<"${STATE:?}")" .) \
+    || die "cannot find the root's promoted dev build for its kind line"
+  out "kind_note=${kind}"
 }
 
 # The root publishes every promotion past its stable tag, since an earlier one
@@ -472,7 +492,7 @@ published_subpackages() { # <root tag> <commit> -> JSON array of subpackage dirs
 }
 
 cmd_receipts() {
-  local state="${STATE:?}" repo="${GITHUB_REPOSITORY:?}" repairs='[]' key tag commit kind contexts site subs shas floor rows prev
+  local state="${STATE:?}" repo="${GITHUB_REPOSITORY:?}" repairs='[]' key tag commit kind contexts site subs shas floor rows prev repair_r
   rows=$(jq -r 'to_entries[] | select(.value.h_tag != "") | [.key, .value.h_tag, .value.h_commit, .value.repair_kind_note] | @tsv' <<<"$state") \
     || die "STATE is not the pending step's state"
   while IFS=$'\t' read -r key tag commit kind; do
@@ -506,6 +526,10 @@ cmd_receipts() {
           subs=$(jq -cn --arg d "$key/web" '[$d]')
         fi
       fi
+    fi
+    if [ "$key" = . ]; then
+      repair_r=$(jq -r '.["."].repair_commit // ""' <<<"$state")
+      kind=$(kind_note "$commit" "$repair_r" .) || die "cannot find the root's promoted dev build for ${tag}'s kind line"
     fi
     note "lane ${key}: ${tag} has no completion receipt, so this run repairs it at ${commit} first"
     repairs=$(jq -c --arg k "$key" --arg lane "$(lane_dir "$key")" --arg tag "$tag" --arg commit "$commit" \
@@ -1161,9 +1185,10 @@ settle_dev_head() {
 }
 
 # Invariant: a stable release never outranks newer dev content, so nothing is
-# tagged or pushed before every dev release run that started before main held
-# R finished, a release run of dev's head succeeded, and dev ranks above the
-# version published.
+# pushed before every dev release run that started before main held R
+# finished, a release run of dev's head succeeded, and dev ranks above the
+# version published. The root's tag is claimed earlier, which dev's numbering
+# already counts: compute.sh numbers dev above the pending promotion's version.
 cmd_barrier() {
   local state="${STATE:?}" plan cutoff key r v c p need="" subrows="" subs s t st lacking waited="" recs rows
   : "${GITHUB_REPOSITORY:?}" "${WORKFLOW:?}" "${GITHUB_RUN_ID:?}"
@@ -1571,6 +1596,7 @@ case "${1:-}" in
     esac
     ;;
   barrier-wait) cmd_barrier ;;
+  kind-note) cmd_kind_note ;;
   renumber-target) cmd_renumber_target ;;
   renumber-handoff) cmd_renumber_handoff ;;
   renumber-subpackages) cmd_renumber_subpackages ;;
@@ -1588,5 +1614,5 @@ case "${1:-}" in
     shift
     "$cmd" "$@"
     ;;
-  *) die "usage: release-state.sh claims|pending|publish|ahead|halves|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|half-free|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
+  *) die "usage: release-state.sh claims|pending|kind-note|publish|ahead|halves|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|half-free|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
 esac

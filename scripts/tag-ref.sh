@@ -147,6 +147,25 @@ claim_version() {
   echo "claimed=$CLAIMED" >>"${GITHUB_OUTPUT:?}"
 }
 
+# claim_held <owner/repo> <tag> <commit>: a publishing job's check of the claim
+# job's claim_version, which it never repeats: a ref create it sent after a
+# newer push would be refused. Writes claimed=true in GITHUB_OUTPUT and returns
+# 0 when <tag> is at <commit>; returns 1 when it is elsewhere, absent or
+# unreadable, so nothing is published under it.
+claim_held() {
+  CLAIM_AT=""
+  if ! retry claim_read "$1" "$2"; then
+    echo "::error::tag $2 cannot be read, so this run's claim of it at $3 is unconfirmed and nothing is published under it."
+    return 1
+  fi
+  if [ "$CLAIM_AT" != "$3" ]; then
+    echo "::error::tag $2 is at ${CLAIM_AT:-<none>}, not this run's commit $3, so nothing is published under it."
+    return 1
+  fi
+  echo "claimed=true" >>"${GITHUB_OUTPUT:?}"
+}
+claim_read() { CLAIM_AT=$(gh api "repos/$1/git/ref/tags/$2" --jq .object.sha); } # <owner/repo> <tag>
+
 # untagged_handed_off <owner/repo> <branch> <tag> <commit>: for <tag> not at
 # <commit>, 0 when the branch moved past it (warned here), so the run on the
 # new head releases it; 1 when <commit> is still the head, 2 when that cannot
