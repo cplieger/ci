@@ -347,7 +347,7 @@ func TestOneSampleFunctions(t *testing.T) {
 
 // On a dashboard with an instance variable an ALERTS selector carries an instance matcher like any
 // other. An alert about an absent target has no instance label, so instance="" alone reads it on
-// ALERTS matched by alertname and at most alertstate.
+// ALERTS matched only by alertname and alertstate equalities.
 func TestAlertsScope(t *testing.T) {
 	for _, c := range []struct{ name, expr, want string }{
 		{name: "alertname_only", expr: `0 * max(ALERTS{alertname="XTargetAbsent", alertstate="firing"})`, want: "Q2"},
@@ -364,7 +364,7 @@ func TestAlertsScope(t *testing.T) {
 		{name: "instance_in_comment", expr: "max(ALERTS{alertname=\"XTargetAbsent\" # , instance=\"$instance\"\n})", want: "Q2"},
 		{name: "or_nameless", expr: `max(up{instance="$instance"}) or max({__name__="ALERTS", alertname="XTargetAbsent"})`, want: "Q2"},
 		{name: "keyword_before_brace", expr: `max without (alertstate) ({__name__="ALERTS", alertname="XTargetAbsent"})`, want: "Q2"},
-		// instance="" alone reads every instance-less series a matcher beside it lets through.
+		// instance="" alone passes on that closed shape only; any other matcher is refused.
 		{name: "empty_other_label", expr: `max(ALERTS{alertname="X", alertstate="firing", severity="page", instance=""})`, want: "Q2"},
 		{name: "empty_no_alertname", expr: `max(ALERTS{alertstate="firing", instance=""})`, want: "Q2"},
 		{name: "empty_regex_metric_name", expr: `max({__name__=~"ALERTS", alertname="X", instance=""})`, want: "Q2"},
@@ -412,7 +412,7 @@ func TestFindingText(t *testing.T) {
 	r := run(t, in)
 	want := map[string]struct{ message, fix string }{
 		"Q1": {"increase returns nothing from a single sample", "use [$__rate_interval], or [$__range] for a total over the picked range, and give a subquery a range of at least twice its step. An interval variable there needs every choice, auto_min included when auto is on, of at least twice the 15s scrape interval."},
-		"Q2": {`instance=~"$instance|" matches it as a regular expression`, `match the instance exactly with one instance="$instance" in every selector; instance="" goes in a selector of its own, joined by or beside it, or alone on ALERTS matched by alertname.`},
+		"Q2": {`instance=~"$instance|" matches it as a regular expression`, `match the instance exactly with one instance="$instance" in every selector; instance="" goes in a selector of its own, joined by or beside it, or alone on ALERTS whose other matchers are alertname="<name>" and optionally alertstate="<state>".`},
 		"Q3": {`job="x"`, `delete the matcher; the metric name and instance="$instance" select the app's series.`},
 	}
 	if len(r.Findings) != len(want) {

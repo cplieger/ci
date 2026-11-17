@@ -74,8 +74,7 @@ func (r *rules) apply(q query, first parsed, second parser.Expr) []finding {
 	return r.findings(q, &p)
 }
 
-// selection adds the Q2 and Q3 phrases of one selector's matchers. exact says the query holds
-// instance="$instance".
+// selection's exact says the query holds instance="$instance".
 func (p *problems) selection(r *rules, s selection, exact bool) {
 	instances := 0
 	for _, m := range s.matchers {
@@ -93,7 +92,7 @@ func (p *problems) selection(r *rules, s selection, exact bool) {
 		}
 	}
 	if instances > 1 {
-		p.q2 = appendNew(p.q2, fmt.Sprintf(`%s has %d instance matchers, and a series must meet every one, so instance="$instance" beside instance="" reads nothing; put instance="" in a second selector joined by or`, r.display(s.vs.String()), instances))
+		p.q2 = appendNew(p.q2, fmt.Sprintf(`%s has %d instance matchers, and a series must meet every one; keep one instance="$instance" and put instance="" in a second selector joined by or`, r.display(s.vs.String()), instances))
 	}
 }
 
@@ -131,9 +130,9 @@ func (r *rules) unscoped(q query, expr parser.Expr) []string {
 	return out
 }
 
-// targetAlert is ALERTS matched by alertname="<name>", at most an alertstate="<state>" and its
-// instance matchers: an alert about a target that is absent carries no instance label, so
-// instance="" alone reads it. Any other matcher reads other apps' alerts too.
+// targetAlert is ALERTS matched only by alertname="<name>", alertstate="<state>" equalities and
+// its instance matchers: an alert about a target that is absent carries no instance label, so
+// instance="" alone reads it. Any other matcher is refused rather than judged.
 func targetAlert(vs *parser.VectorSelector) bool {
 	alerts, named := false, false
 	for _, m := range vs.LabelMatchers {
@@ -234,7 +233,7 @@ func (r *rules) findings(q query, p *problems) []finding {
 		})
 	}
 	if len(p.q2) > 0 {
-		fix := `match the instance exactly with one instance="$instance" in every selector; instance="" goes in a selector of its own, joined by or beside it, or alone on ALERTS matched by alertname.`
+		fix := `match the instance exactly with one instance="$instance" in every selector; instance="" goes in a selector of its own, joined by or beside it, or alone on ALERTS whose other matchers are alertname="<name>" and optionally alertstate="<state>".`
 		switch {
 		case r.instanceVar == nil:
 			fix = `add a single-select instance variable and match instance="$instance".`
@@ -273,7 +272,7 @@ func (r *rules) instanceMatcher(pair matcher, emptyOK bool) string {
 	case m.Value == "" && emptyOK:
 		return ""
 	case m.Value == "":
-		return shown + ` selects only series with no instance label; it may stand alone only on ALERTS matched by alertname, and elsewhere only beside instance="$instance"`
+		return shown + ` selects only series with no instance label; it may stand alone only on ALERTS whose other matchers are alertname="<name>" and optionally alertstate="<state>", and elsewhere only beside instance="$instance"`
 	}
 	return r.instanceValue(pair, shown)
 }
