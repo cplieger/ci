@@ -16,9 +16,9 @@ on:
         default: ''
       go-test-timeout:
         description: >-
-          The `-timeout` of the race tests, a Go duration such as `20m`, for a Go module
-          whose test binaries run longer than the go command's default; empty keeps
-          that default of 10 minutes per test binary.
+          The `-timeout` of the race tests and the noui tests, a Go duration such as
+          `20m`, for a Go module whose test binaries run longer than the go command's
+          default; empty keeps that default of 10 minutes per test binary.
         type: string
         default: ''
 

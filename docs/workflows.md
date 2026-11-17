@@ -68,13 +68,19 @@ The jobs that move install their tools into `$RUNNER_TEMP/bin` with no `sudo`, a
 
 | Workflow | What it runs |
 | --- | --- |
-| `go-ci.yaml` | `go vet`, golangci-lint, `go test -race`, govulncheck, `go mod verify`, a wiregen drift check, dependency review on public pull requests |
+| `go-ci.yaml` | `go vet`, golangci-lint, `go test -race`, `go vet`, golangci-lint and `go test` again under `-tags noui` when that tag changes the module's build, govulncheck, `go mod verify`, a wiregen drift check, dependency review on public pull requests |
 | `go-os-ci.yaml` | on the `runner` input's Windows or macOS runner: `go vet`, golangci-lint, `go test -race`, and `go vet` for Linux, macOS and Windows on amd64 and arm64 |
 | `ts-ci.yaml` | `npm ci`, ESLint, `tsc`, knip for import cycles and undeclared dependencies, vitest (after building the Go test server a package names in `sseFixture`), fast-check fuzz tests, Prettier, `package.json` and `jsr.json` version parity, a publish-surface check, dependency review |
 | `ts-ci.yaml` with `web-lint: true` | the above, plus Stylelint, html-validate and an import-map coverage check |
 | `shell-ci.yaml` | shellcheck, shfmt, hadolint on the `dockerfile` input and every `images/<name>/Dockerfile` unless the input is empty, and `tests/shell/run.sh` when the repository has one |
 
-`ci.yaml`, `go-ci.yaml` and `go-os-ci.yaml` take a `go-test-timeout` input, empty by default. It is the `-timeout` of `go test -race`, a Go duration such as `20m`, for a module whose test binaries run longer than the go command's default of 10 minutes each. `ci.yaml` passes it to the root module's job, each nested module's and each Windows or macOS leg. The synced `ci.yml` passes the repository's `GO_TEST_TIMEOUT` variable, so setting that variable raises the timeout and deleting it restores the default. Keep it below the job's 30-minute limit, so a hung test still fails with its stack traces.
+`ci.yaml`, `go-ci.yaml` and `go-os-ci.yaml` take a `go-test-timeout` input, empty by default. It is the `-timeout` of `go test -race`, and in `go-ci.yaml` of the `noui` tests too. Set it to a Go duration such as `20m` for a module whose test binaries run longer than the go command's default of 10 minutes each.
+
+`ci.yaml` passes it to the root module's job, each nested module's and each Windows or macOS leg. The synced `ci.yml` passes the repository's `GO_TEST_TIMEOUT` variable, so setting that variable raises the timeout and deleting it restores the default. Keep it below the job's 30-minute limit, so a hung test still fails with its stack traces.
+
+`noui` is the one build tag for an app built without its web UI, which leaves the API alone. When the tag changes which files of the module build, `go-ci.yaml` runs `go vet`, golangci-lint and `go test` again with `-tags noui`. A module the tag does not change skips that step, and the step needs no input or repository variable.
+
+The step compares the files `go list` leaves out with and without the tag, so a constraint on any Go, C or assembly source file counts. That covers `//go:build noui`, `!noui`, an expression holding the tag and an old `// +build` line. The step runs without `-race`, because a second race run can put a large module past the job's 30-minute limit. So files only the `noui` build compiles are in no race run.
 
 With `web-lint: true`, a package that declares a `lint:web` script in `package.json` runs that script in place of Stylelint and html-validate, so a local `npm run lint:web` is the same check. The script must lint every tracked CSS file with Stylelint and the synced `.stylelintrc.json`, lint every tracked HTML file with html-validate, and exit non-zero when either fails.
 
