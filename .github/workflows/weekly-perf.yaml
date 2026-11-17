@@ -1,8 +1,9 @@
 # Weekly performance run of every public cplieger repository that carries
 # tests/perf/plan.json. Pattern C, like weekly-bench: this workflow owns the
 # matrix and the max-parallel cap. A pull request measures only the `pr` set,
-# so this measures the `full` set on the default branch, gated on its budgets,
-# and charts each cell's median on the repository's `benchmarks` branch.
+# so this measures the `full` set on the default branch, guarded against its
+# budgets' baselines, and charts each cell's median on the repository's
+# `benchmarks` branch.
 # Mondays 22:00 UTC, the one evening no other weekly run holds.
 name: Weekly perf
 
@@ -128,10 +129,8 @@ jobs:
       max-parallel: 1
       matrix:
         include: ${{ fromJSON(needs.fanout.outputs.matrix) }}
-    # perf-ci.yaml's verdict signs the counts it found moved.
     permissions:
       contents: read
-      id-token: write
     uses: ./.github/workflows/perf-ci.yaml
     with:
       repository: cplieger/${{ matrix.repo }}

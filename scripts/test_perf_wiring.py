@@ -16,7 +16,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / '.github' / 'workflows'
 TEMPLATE = ROOT / '.github' / 'workflow-templates' / 'ci.yml'
-SIGNS = {'contents': 'read', 'id-token': 'write'}
+READS = {'contents': 'read'}
 
 
 def load(name: str) -> dict:
@@ -312,19 +312,18 @@ class Gate(unittest.TestCase):
             with self.subTest(job=job):
                 self.assertEqual(self.jobs[job]['if'], want)
 
-    def test_compare_passes_the_base_commit_and_the_sources(self):
+    def test_compare_guards_against_the_base_budgets_alone(self):
         run = step(self.jobs['compare'], 'Compare')['run']
-        self.assertIn('--sources tests/perf/sources', run)
-        self.assertIn('--accepted tests/perf/accepted', run)
-        self.assertIn('--base-sha "$base"', run)
+        gate = run.split('--remeasure-out')[0]
+        self.assertIn('--base "$RUNNER_TEMP/base-budgets.json"', gate)
+        for flag in ('--budgets', '--sources', '--accepted', '--repo', '--head', '--base-sha'):
+            with self.subTest(flag=flag):
+                self.assertNotIn(flag, gate)
 
     def test_compare_judges_against_the_base_the_merge_ref_was_built_on(self):
         s = step(self.jobs['compare'], 'Compare')
         self.assertEqual(s['env']['EVENT'], '${{ github.event_name }}')
         repo, shas = merge_ref(self)
-        merge = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'], cwd=repo, capture_output=True, text=True, check=True
-        ).stdout.strip()
         # The event's base SHA is the base tip when the pull request opened.
         for event, base_sha, want in (
             ('pull_request', shas['opened'], 'later'),
@@ -336,104 +335,60 @@ class Gate(unittest.TestCase):
                 env |= {'EVENT': event, 'BASE_SHA': base_sha}
                 proc, tmp = run_body(self, s['run'], env, {'python3': BASE_STUB}, cwd=repo)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-                log = (tmp / 'log').read_text()
-                self.assertIn(f'--head {merge} ', log)
-                self.assertIn(f'--base-sha {shas[want] if want else merge} ', log)
+                self.assertIn('--base ', (tmp / 'log').read_text())
                 held = (tmp / 'log.base').read_text()
                 self.assertEqual(held, f'{{"at": "{want or "later"}"}}\n')
 
-    def test_the_verdict_records_what_it_measured_for_the_pull_request_s_head(self):
-        plan = self.jobs['plan']
-        self.assertEqual(plan['outputs']['head'], '${{ steps.plan.outputs.head }}')
-        env = step(plan, 'Plan')['env']
-        self.assertEqual(env['HEAD_COMMIT'], '${{ github.event.pull_request.head.sha }}')
-        s = step(self.jobs['verdict'], 'Verdict')
-        self.assertEqual(s['env']['COMMIT'], '${{ needs.plan.outputs.head }}')
-        self.assertEqual(s['env']['RUN_ID'], '${{ github.run_id }}')
-        self.assertEqual(s['env']['RUN_ATTEMPT'], '${{ github.run_attempt }}')
-        self.assertEqual(s['env']['WORKFLOW_REPOSITORY'], '${{ github.repository }}')
-        self.assertEqual(s['env']['WORKFLOW_SHA'], '${{ job.workflow_sha }}')
-        for flag in (
-            '--record-out "$RUNNER_TEMP/measured"',
-            '--commit "$COMMIT"',
-            '--run-id "$RUN_ID"',
-            '--run-attempt "$RUN_ATTEMPT"',
-            '--workflow-repository "$WORKFLOW_REPOSITORY"',
-            '--workflow-sha "$WORKFLOW_SHA"',
+    def test_the_verdict_judges_the_re_measure_and_records_nothing(self):
+        verdict = self.jobs['verdict']
+        self.assertNotIn('permissions', verdict)
+        names = [s.get('name') for s in verdict['steps']]
+        for gone in (
+            'Checkout',
+            'Install cosign',
+            'Sign the measured file',
+            'Upload the measured file',
         ):
-            self.assertIn(flag, s['run'])
-
-    def test_a_merge_queue_run_names_no_head_and_records_nothing(self):
-        s = step(self.jobs['plan'], 'Plan')
-        for event, head_commit, want in (
-            ('pull_request', 'abc', 'abc'),
-            ('merge_group', '', ''),
-            ('workflow_dispatch', '', 'f00d'),
-        ):
-            with self.subTest(event=event):
-                env = dict.fromkeys(s['env'], '') | {'EVENT': event, 'HEAD_COMMIT': head_commit}
-                proc, tmp = run_body(self, s['run'], env, {'git': GIT_STUB})
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                self.assertEqual(outputs(tmp)['head'], want)
-        v = step(self.jobs['verdict'], 'Verdict')
-        token = {'ACTIONS_ID_TOKEN_REQUEST_URL': 'https://token'}
-        for commit, records in (('abc', True), ('', False)):
-            with self.subTest(commit=commit):
-                env = dict.fromkeys(v['env'], '') | {'REMEASURED': 'success', 'COMMIT': commit}
-                stub = '#!/usr/bin/env bash\necho "python3 $*" >> "$STUB_LOG"\n'
-                proc, tmp = run_body(self, v['run'], env | token, {'python3': stub})
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                log = (tmp / 'log').read_text()
-                self.assertIn('--verdict', log)
-                self.assertEqual('--record-out' in log, records, log)
-                self.assertEqual('--commit' in log, records, log)
-                self.assertNotIn('::warning::', proc.stdout)
-
-    def test_a_run_with_no_id_token_records_nothing_and_says_why(self):
-        v = step(self.jobs['verdict'], 'Verdict')
-        env = dict.fromkeys(v['env'], '') | {'REMEASURED': 'success', 'COMMIT': 'abc'}
+            with self.subTest(step=gone):
+                self.assertNotIn(gone, names)
+        self.assertNotIn('head', self.jobs['plan']['outputs'])
+        s = step(verdict, 'Verdict')
         stub = '#!/usr/bin/env bash\necho "python3 $*" >> "$STUB_LOG"\n'
-        proc, tmp = run_body(self, v['run'], env, {'python3': stub})
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        log = (tmp / 'log').read_text()
-        self.assertIn('--verdict', log)
-        self.assertNotIn('--record-out', log)
-        self.assertEqual(outputs(tmp), {})
-        self.assertIn('::warning::', proc.stdout)
-        self.assertIn('fork', proc.stdout)
+        for remeasured, rc in (('success', 0), ('failure', 1), ('cancelled', 1)):
+            with self.subTest(remeasured=remeasured):
+                env = dict.fromkeys(s['env'], '') | {'REMEASURED': remeasured}
+                proc, tmp = run_body(self, s['run'], env, {'python3': stub})
+                self.assertEqual(proc.returncode, rc, proc.stdout + proc.stderr)
+                log = (tmp / 'log').read_text() if rc == 0 else ''
+                self.assertEqual('--verdict' in log, rc == 0)
+                self.assertNotIn('--budgets', log)
+                self.assertNotIn('--record-out', log)
 
 
-COSIGN_STUB = """#!/usr/bin/env bash
-echo "cosign $*" >> "$STUB_LOG"
-"""
+class NoIdToken(unittest.TestCase):
+    """The guard signs nothing, so no perf workflow or caller of one holds an id token."""
 
-
-class Signing(unittest.TestCase):
-    jobs = load('perf-ci.yaml')['jobs']
-
-    def sign(self, **env) -> tuple[subprocess.CompletedProcess, dict, Path]:
-        s = step(self.jobs['verdict'], 'Sign the measured file')
-        full = {'CI_TOOLS': str(ROOT / 'scripts'), 'RUN_ID': '900', 'RUN_ATTEMPT': '2', **env}
-        proc, tmp = run_body(self, s['run'], full, {'cosign': COSIGN_STUB})
-        return proc, outputs(tmp), tmp
-
-    def test_only_the_verdict_of_perf_ci_requests_an_id_token(self):
+    def test_no_job_of_perf_ci_requests_an_id_token_or_installs_cosign(self):
         doc = load('perf-ci.yaml')
-        self.assertEqual(doc['permissions'], {'contents': 'read'})
+        self.assertEqual(doc['permissions'], READS)
         for job, spec in doc['jobs'].items():
             with self.subTest(job=job):
-                self.assertEqual(spec.get('permissions'), SIGNS if job == 'verdict' else None)
-        self.assertNotIn('id-token', json.dumps(load('perf-measure.yaml')))
+                self.assertIsNone(spec.get('permissions'))
+        for name in ('perf-ci.yaml', 'perf-measure.yaml'):
+            with self.subTest(workflow=name):
+                text = (WORKFLOWS / name).read_text()
+                self.assertNotIn('id-token', text)
+                self.assertNotIn('cosign', text.lower())
 
-    def test_every_caller_of_a_signing_workflow_grants_the_id_token(self):
+    def test_no_caller_of_perf_ci_or_the_meta_workflow_grants_an_id_token(self):
         callers = []
         for path in [*sorted(WORKFLOWS.glob('*.y*ml')), TEMPLATE]:
             for job, spec in yaml.safe_load(path.read_text())['jobs'].items():
                 called = re.search(r'workflows/([\w.-]+?)(?:@|$)', spec.get('uses', ''))
-                if called and called[1] in ('perf-ci.yaml', 'ci.yaml', 'perf-calibrate.yaml'):
+                if called and called[1] in ('perf-ci.yaml', 'ci.yaml'):
                     callers.append((path.name, job))
                     with self.subTest(caller=path.name, job=job):
-                        self.assertEqual((spec.get('permissions') or {}).get('id-token'), 'write')
+                        self.assertNotIn('id-token', spec.get('permissions') or {})
         self.assertEqual(
             sorted(callers),
             [
@@ -441,56 +396,15 @@ class Signing(unittest.TestCase):
                 ('ci.yml', 'ci'),
                 ('perf-calibrate.yaml', 'measure'),
                 ('self-ci.yaml', 'ci'),
-                ('weekly-perf-calibrate.yaml', 'calibrate'),
                 ('weekly-perf.yaml', 'perf'),
             ],
         )
 
-    def test_no_other_job_of_the_meta_workflow_is_granted_the_id_token(self):
+    def test_no_job_of_the_meta_workflow_is_granted_the_id_token(self):
         for job, spec in load('ci.yaml')['jobs'].items():
-            if job != 'perf':
-                with self.subTest(job=job):
-                    self.assertNotIn('id-token', spec.get('permissions') or {})
-        self.assertEqual(load('ci.yaml')['jobs']['perf']['permissions'], SIGNS)
-
-    def test_the_verdict_signs_the_file_under_its_run_attempt_s_name(self):
-        proc, out, tmp = self.sign(ACTIONS_ID_TOKEN_REQUEST_URL='https://token')
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(out, {'signed': 'true'})
-        measured = tmp / 'runner' / 'measured'
-        self.assertEqual(
-            (tmp / 'log').read_text().split(),
-            [
-                'cosign',
-                'sign-blob',
-                '--yes',
-                f'{measured}/900-2.json',
-                '--bundle',
-                f'{measured}/900-2.sigstore.json',
-            ],
-        )
-        upload = step(self.jobs['verdict'], 'Upload the measured file')
-        self.assertEqual(upload['if'], "${{ !cancelled() && steps.sign.outputs.signed == 'true' }}")
-        self.assertEqual(
-            upload['with']['name'],
-            'perf-measured-${{ needs.plan.outputs.prefix }}-attempt-${{ github.run_attempt }}',
-        )
-        self.assertEqual(upload['with']['path'], '${{ runner.temp }}/measured/')
-        self.assertEqual(upload['with']['retention-days'], 90)
-        sign = step(self.jobs['verdict'], 'Sign the measured file')
-        self.assertEqual(
-            sign['if'], "${{ !cancelled() && steps.verdict.outputs.recorded == 'true' }}"
-        )
-
-    def test_a_signature_that_fails_fails_the_step(self):
-        failing = '#!/usr/bin/env bash\necho "cosign $*" >> "$STUB_LOG"\nexit 1\n'
-        s = step(self.jobs['verdict'], 'Sign the measured file')
-        env = {'CI_TOOLS': str(ROOT / 'scripts'), 'RUN_ID': '900', 'RUN_ATTEMPT': '2'}
-        env |= {'ACTIONS_ID_TOKEN_REQUEST_URL': 'https://token', 'READBACK_SLEEP': '0'}
-        proc, tmp = run_body(self, s['run'], env, {'cosign': failing})
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertEqual(outputs(tmp), {})
-        self.assertEqual(len((tmp / 'log').read_text().splitlines()), 5)
+            with self.subTest(job=job):
+                self.assertNotIn('id-token', spec.get('permissions') or {})
+        self.assertEqual(load('ci.yaml')['jobs']['perf']['permissions'], READS)
 
 
 class Calibration(unittest.TestCase):
@@ -506,7 +420,7 @@ class Calibration(unittest.TestCase):
             set(on['workflow_call']['secrets']), {'SYNC_APP_ID', 'SYNC_APP_PRIVATE_KEY'}
         )
         measure = self.jobs['measure']
-        self.assertEqual(measure['permissions'], SIGNS)
+        self.assertEqual(measure['permissions'], READS)
         self.assertEqual(
             measure['with'],
             {
@@ -554,13 +468,9 @@ class Calibration(unittest.TestCase):
         self.assertIn('chore(perf): calibrate budgets at ${COMMIT:0:12}', run)
         self.assertNotIn('extraheader', json.dumps(step(job, 'Checkout')))
 
-    def test_the_weekly_calibration_holds_an_evening_no_other_weekly_run_holds(self):
-        crons: dict[str, list[str]] = {}
-        for path in sorted(WORKFLOWS.glob('weekly-*.yaml')):
-            for s in load(path.name)[True].get('schedule') or []:
-                crons.setdefault(s['cron'], []).append(path.name)
-        self.assertEqual(crons['0 22 * * 5'], ['weekly-perf-calibrate.yaml'])
-        self.assertEqual({k: v for k, v in crons.items() if len(v) > 1}, {})
+    def test_the_weekly_calibration_runs_only_when_dispatched(self):
+        on = load('weekly-perf-calibrate.yaml')[True]
+        self.assertEqual(set(on), {'workflow_dispatch'})
         weekly = load('weekly-perf-calibrate.yaml')['jobs']
         self.assertEqual(weekly['calibrate']['uses'], './.github/workflows/perf-calibrate.yaml')
         self.assertEqual(weekly['calibrate']['strategy']['max-parallel'], 1)

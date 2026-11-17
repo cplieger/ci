@@ -729,8 +729,8 @@ def summary(budgets: dict, out: Outcome) -> str:
 
 # Family to (ratio, floor): a cell fails over ratio x baseline and more than floor over it.
 # Four ten-run calibrations over seven runner classes put the worst one-job ratio of a pr
-# set cell clearing the floor at 1.88 for cpu_ms and 1.64 for server_cpu_ms, and of any
-# memory cell at 1.09.
+# set cell at 1.88 for cpu_ms over 50 ms and 1.64 for server_cpu_ms over 10 ms, and of
+# any memory cell at 1.09.
 GUARD = {
     'cpu_ms': (2.0, 250.0),
     SERVER_CPU: (2.0, 10.0),

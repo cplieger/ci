@@ -14,10 +14,9 @@ permissions:
 
 jobs:
   ci:
-    # The meta workflow's deadset and perf jobs request them.
+    # The meta workflow's deadset job uploads to code scanning.
     permissions:
       contents: read
-      id-token: write
       security-events: write
     uses: ./.github/workflows/ci.yaml
 
