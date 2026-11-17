@@ -1850,8 +1850,8 @@ class Preview(unittest.TestCase):
         self.assertIn('### root v1.1.0\n\n### Added\n\n- Add greeting (#7)', text)
         self.assertIn(
             'compare/v1.0.0...v1.1.0\n\nWhen the release run writes these notes, their first line '
-            'names the nearest `dev` build proven published by then, or the `dev` commit when none '
-            'is.',
+            "names the promoted commit's nearest `dev` build when it is proven published by then, "
+            'or the `dev` commit otherwise.',
             text,
         )
 

@@ -119,7 +119,7 @@ highest_stable() { # <key> [below X.Y.Z] -> "<tag> <commit>" of the lane's highe
   done <<<"$tags"
   [ -z "$best" ] || printf '%s %s\n' "$best" "$at"
 }
-nearest_dev_tag() { # <commit> <key> [proven] -> the highest dev tag of the lane on the commit nearest <commit>, with proven the highest dev_proven one; fails when git cannot list the tags or walk <commit>'s history, or GitHub cannot tell a proof
+nearest_dev_tag() { # <commit> <key> [proven] -> the highest dev tag of the lane on the commit nearest <commit> that carries one, with proven that commit's highest dev_proven one or nothing; fails when git cannot list the tags or walk <commit>'s history, or GitHub cannot tell a proof
   local -A at=()
   local name c tags revs best
   tags=$(tags_of "$(dev_re "$2")") || return 1
@@ -138,10 +138,8 @@ nearest_dev_tag() { # <commit> <key> [proven] -> the highest dev tag of the lane
         best=$name
       fi
     done
-    if [ -n "$best" ]; then
-      printf '%s' "$best"
-      return 0
-    fi
+    printf '%s' "$best"
+    return 0
   done <<<"$revs"
 }
 
@@ -189,9 +187,7 @@ newest_affecting() { # <from> <to> <key> -> the newest reconciliation of from..t
   printf '%s' "$found"
 }
 # A docker or TS root's dev tag is a claim that may never have been published
-# or may have been handed off, so its kind line needs a token: cmd_kind_note
-# and cmd_receipts write it, and cmd_pending every other lane's and the
-# root's when no promotion is pending (no dev build to name).
+# or may have been handed off, so naming one needs GitHub's receipts (a token).
 kind_note() { # <release commit> <pending R or ''> <key> -> the release body's opening kind line, naming only a proven dev build; fails with git rev-parse or nearest_dev_tag
   local t d from
   if [ -z "$2" ]; then

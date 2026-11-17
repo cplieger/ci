@@ -150,15 +150,12 @@ claim_version() {
 }
 
 # claim_held <owner/repo> <branch> <tag> <commit> <channel>: a publishing
-# job's check of the claim job's claim_version, which it never repeats: a ref
-# create it sent after a newer push would be refused. When <tag> is at
-# <commit>, posts the release/claim/<tag> status on <commit> (claim_unused
-# keeps the tag once it exists), writes claimed=true in GITHUB_OUTPUT and
-# returns 0; returns 1 when the tag is elsewhere, absent or unreadable, or the
-# status is not posted, so nothing is published under it. On dev it first
-# hands off, as claim_version does, when a later dev tag of the lane
-# supersedes <tag>: a rerun of only the failed jobs keeps the claim job's
-# first answer, and publishing would move the dev channel back.
+# job's check of the claim job's claim, never a create (one sent after a
+# newer push is refused). With <tag> at <commit>: on dev, when a later dev
+# tag of the lane supersedes <tag> (a failed-jobs rerun keeps the claim job's
+# first answer), hands off with claimed=false; else posts release/claim/<tag>
+# on <commit> and writes claimed=true. Returns 1 when the tag is elsewhere,
+# absent or unreadable, git cannot tell, or the status is not posted.
 claim_held() {
   local later
   if ! retry claim_read "$1" "$3"; then

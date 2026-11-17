@@ -985,14 +985,15 @@ def cmd_preview(args) -> int:
                 notes = render_lane_notes(clone, args.repo, key, lane, layout, r)
                 lines += [f'### {name} {lane["version"]}', '', notes, '']
                 # pending leaves an image or TS root's kind line to the release
-                # run, which names only a dev build proven published, a read
-                # this token-free job cannot make.
+                # run, which names the promoted commit's nearest dev build only
+                # when it is proven published, a read this token-free job
+                # cannot make.
                 if not lane['kind_note']:
                     lines += [
                         (
                             'When the release run writes these notes, their first line names the '
-                            'nearest `dev` build proven published by then, or the `dev` commit when '
-                            'none is.'
+                            "promoted commit's nearest `dev` build when it is proven published by "
+                            'then, or the `dev` commit otherwise.'
                         ),
                         '',
                     ]

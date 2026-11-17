@@ -894,9 +894,10 @@ chk_has "P15 and names the lane" "$(cat "$WORK/pending.log")" "cannot find lane 
 chk "P15 and an image root's barrier" "$got_kind" "refused"
 chk_has "P15 naming the root" "$(cat "$WORK/kind.log")" "cannot find the root's promoted dev build for its kind line"
 # An image or TS root's dev tag is a claim, so the kind line names the nearest
-# proven one: an unproven or handed-off claim never shipped the build it names.
+# tagged build only when it is proven: an unproven or handed-off claim never
+# shipped the build it names.
 git -C "$O" tag v1.1.0-dev.2 "$D1"
-chk "P20 an image's kind line skips the promoted commit's unproven dev claims for a proven one, else names the commit" \
+chk "P20 an image's kind line names the nearest tagged build only when it is proven, else the commit" \
   "$(kind_at "$O" "$S4_STATE" docker)" 'Built from `main`, including the promotion of `dev` at `'"${D1:0:12}"'`'
 printf '[{"context":"release/tag/v1.1.0-dev.1","state":"success"}]\n' >"$GH_DIR/statuses-$D1.json"
 chk "P20 and names the highest proven one, not a higher unproven claim at the same commit" \
@@ -913,6 +914,14 @@ rm "$GH_DIR/fail-statuses" "$GH_DIR/statuses-$D1.json"
 chk "P20 a state that is not pending's, malformed or without the root, stops the barrier rather than writing a line" \
   "$(kind_at "$O" '{' docker)|$(grep -c 'STATE is not the pending step' "$WORK/kind.log")|$(kind_at "$O" '{}' docker)|$(grep -c 'STATE is not the pending step' "$WORK/kind.log")" \
   "refused|1|refused|1"
+# A proven build below the promoted commit's unproven claims lacks the
+# promoted change, so the line names the commit, not that build.
+git -C "$O" tag v1.1.0-dev.0 "$C0"
+printf '[{"context":"release/tag/v1.1.0-dev.0","state":"success"}]\n' >"$GH_DIR/statuses-$C0.json"
+chk "P20 a proven build below the promoted commit's unproven claims is never named" \
+  "$(kind_at "$O" "$S4_STATE" docker)" 'Built from `main`, including the promotion of `dev` at `'"${D1:0:12}"'`'
+rm "$GH_DIR/statuses-$C0.json"
+git -C "$O" tag -d v1.1.0-dev.0 >/dev/null
 git -C "$O" tag -d v1.1.0-dev.2 >/dev/null
 chk "P16 a lane list that is not JSON stops the run" \
   "$( (cd "$O" && CHANNEL=stable GO_LANES_JSON='["yamlenv"' GITHUB_OUTPUT="$WORK/out" bash "$RS" pending) >"$WORK/pending.log" 2>&1 && echo ran || echo refused)" \
