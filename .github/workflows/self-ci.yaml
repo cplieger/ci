@@ -171,7 +171,8 @@ jobs:
   # strict-mode scan of the release-channel workflows' run blocks.
   release-channel-scripts:
     runs-on: ubuntu-26.04
-    timeout-minutes: 8
+    # A hang guard above the job's longest green run, 7.5 minutes on 2026-11-17, as for ci.yaml's scripts job.
+    timeout-minutes: 12
     permissions:
       contents: read
     env:
