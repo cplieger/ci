@@ -253,6 +253,7 @@ jobs:
           REPO: ${{ inputs.repository || github.repository }}
           PREFIX: ${{ needs.plan.outputs.prefix }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          EVENT: ${{ github.event_name }}
           SET: ${{ needs.plan.outputs.set }}
           ONLY: ${{ inputs.only }}
           MEASURED: ${{ needs.measure.result }}
@@ -264,6 +265,12 @@ jobs:
           fi
           head=$(git rev-parse HEAD)
           base="${BASE_SHA:-$head}"
+          # A pull request's base SHA is the base tip when it opened, and GitHub does not
+          # move it, so a calibration checked in since would be one the base lacks. The
+          # merge ref's first parent is the base commit the checkout was built on.
+          if [ "$EVENT" = pull_request ] && git rev-parse -q --verify 'HEAD^2^{commit}' > /dev/null; then
+            base=$(git rev-parse 'HEAD^1')
+          fi
           # A base without the file is an empty budget list.
           git show "${base}:tests/perf/budgets.json" > "$RUNNER_TEMP/base-budgets.json" 2>/dev/null \
             || rm -f "$RUNNER_TEMP/base-budgets.json"

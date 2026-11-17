@@ -164,9 +164,14 @@ def step(job: dict, name: str) -> dict:
 
 
 def run_body(
-    case: unittest.TestCase, body: str, env: dict, stubs: dict[str, str]
+    case: unittest.TestCase,
+    body: str,
+    env: dict,
+    stubs: dict[str, str],
+    cwd: Path | None = None,
 ) -> tuple[subprocess.CompletedProcess, Path]:
-    """Runs a step body under bash -e in a temp dir with stub commands first on PATH."""
+    """Runs a step body under bash -e, in cwd or else a temp dir, with stub commands first
+    on PATH."""
     tmp = Path(case.enterContext(tempfile.TemporaryDirectory(prefix='perf-wiring-')))
     (tmp / 'bin').mkdir()
     (tmp / 'runner').mkdir()
@@ -182,7 +187,7 @@ def run_body(
         **env,
     }
     proc = subprocess.run(
-        ['bash', '-e', '-c', body], cwd=tmp, env=full, capture_output=True, text=True
+        ['bash', '-e', '-c', body], cwd=cwd or tmp, env=full, capture_output=True, text=True
     )
     return proc, tmp
 
@@ -216,6 +221,49 @@ exit "$GATE"
 GIT_STUB = """#!/usr/bin/env bash
 case "$1" in rev-parse) echo f00d ;; show) exit 128 ;; esac
 """
+# perf_gate.py logging its arguments and keeping the --base budgets it was handed.
+BASE_STUB = """#!/usr/bin/env bash
+echo "python3 $*" >> "$STUB_LOG"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --base) cp "$2" "$STUB_LOG.base" ;;
+    --remeasure-out) echo '{}' > "$2" ;;
+    --out) echo '{"include": []}' > "$2" ;;
+  esac
+  shift
+done
+"""
+
+
+def merge_ref(case: unittest.TestCase) -> tuple[Path, dict[str, str]]:
+    """A repository checked out at GitHub's merge ref of a pull request opened on commit
+    `opened`, built on `later`, a base commit that changed budgets.json since."""
+    repo = Path(case.enterContext(tempfile.TemporaryDirectory(prefix='perf-merge-')))
+    env = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t'}
+    env |= {'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
+
+    def git(*args: str) -> str:
+        done = subprocess.run(
+            ['git', *args], cwd=repo, env=env, capture_output=True, text=True, check=True
+        )
+        return done.stdout.strip()
+
+    def commit(path: str, text: str) -> str:
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(text)
+        git('add', path)
+        git('commit', '-q', '-m', path)
+        return git('rev-parse', 'HEAD')
+
+    git('init', '-q', '-b', 'main')
+    shas = {'opened': commit('tests/perf/budgets.json', '{"at": "opened"}\n')}
+    git('checkout', '-q', '-b', 'pr')
+    shas['pr'] = commit('app.txt', 'the change\n')
+    git('checkout', '-q', 'main')
+    shas['later'] = commit('tests/perf/budgets.json', '{"at": "later"}\n')
+    git('checkout', '-q', '--detach')
+    git('merge', '-q', '--no-ff', '-m', 'merge ref', 'pr')
+    return repo, shas
 
 
 class Gate(unittest.TestCase):
@@ -269,6 +317,30 @@ class Gate(unittest.TestCase):
         self.assertIn('--sources tests/perf/sources', run)
         self.assertIn('--accepted tests/perf/accepted', run)
         self.assertIn('--base-sha "$base"', run)
+
+    def test_compare_judges_against_the_base_the_merge_ref_was_built_on(self):
+        s = step(self.jobs['compare'], 'Compare')
+        self.assertEqual(s['env']['EVENT'], '${{ github.event_name }}')
+        repo, shas = merge_ref(self)
+        merge = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'], cwd=repo, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        # The event's base SHA is the base tip when the pull request opened.
+        for event, base_sha, want in (
+            ('pull_request', shas['opened'], 'later'),
+            ('merge_group', shas['opened'], 'opened'),
+            ('workflow_dispatch', '', None),
+        ):
+            with self.subTest(event=event):
+                env = dict.fromkeys(s['env'], '') | {'MEASURED': 'success', 'CI_TOOLS': 'ci'}
+                env |= {'EVENT': event, 'BASE_SHA': base_sha}
+                proc, tmp = run_body(self, s['run'], env, {'python3': BASE_STUB}, cwd=repo)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                log = (tmp / 'log').read_text()
+                self.assertIn(f'--head {merge} ', log)
+                self.assertIn(f'--base-sha {shas[want] if want else merge} ', log)
+                held = (tmp / 'log.base').read_text()
+                self.assertEqual(held, f'{{"at": "{want or "later"}"}}\n')
 
     def test_the_verdict_records_what_it_measured_for_the_pull_request_s_head(self):
         plan = self.jobs['plan']

@@ -430,9 +430,11 @@ def verdict(budgets: dict, results: dict, remeasured: dict, decided: dict | None
     """Fail each cell compare sent to re-measure that its six reps, its first
     three and the three re-measured, still hold off its budget: a gated cell
     whose median is over it, an exact count whose middle reps are not it.
-    decided is compare's remeasure.json: its accepted slowdowns, its stale keys and
-    the extension units (judge_extension). An exact count off its budget, or on a
-    stale key, fails, and is recorded for the measured file when its reps all agree."""
+    decided is compare's remeasure.json: its accepted slowdowns, its stale keys, the
+    extension units (judge_extension) and the plan patterns both branches hold, which
+    excuse a retired cell the extension measured (retired_measured). An exact count off
+    its budget, or on a stale key, fails, and is recorded for the measured file when its
+    reps all agree."""
     decided = decided or {}
     accepted = accepted_cells(decided.get('accepted', []))
     stale = {key(k) for k in decided.get('stale', [])}
@@ -470,6 +472,9 @@ def verdict(budgets: dict, results: dict, remeasured: dict, decided: dict | None
     first = {key(c): c for c in results.get('cells', [])}
     if not out.runner_mismatch:
         judge_extension(entries, first, again, decided.get('extend', []), stale, out)
+    units = planned_windows(decided.get('extend', []))
+    extended = [c for k, c in again.items() if k not in first and planned(units, c)]
+    out.failures += retired_measured(budgets, extended, decided.get('reported', []))
     judged_keys |= {key(r['cell']) for r in out.rows}
     for k in sorted(stale - judged_keys):
         out.failures.append(
@@ -916,21 +921,39 @@ def reported_patterns(doc: dict) -> tuple[list[dict], list[str]]:
     return patterns, errors
 
 
+def base_plan(git: Git, base_sha: str, path: str) -> dict:
+    """plan.json as base_sha's tree holds it at path, {} when it holds none."""
+    if not git.has(base_sha, path):
+        return {}
+    doc = loads(git.show(base_sha, path))
+    if not isinstance(doc, dict):
+        raise TypeError(f'{path} at {base_sha} is not a JSON object')
+    return doc
+
+
+def held_patterns(head: dict, base: dict) -> list[dict]:
+    """The `reported` patterns of plan head that plan base lists too: a pattern decides a
+    tier only once it is on the base branch, so a pull request cannot demote a class by
+    adding one, and the next scheduled calibration applies it."""
+    found, _ = reported_patterns(base)
+    return [p for p in reported_patterns(head)[0] if p in found]
+
+
 def plan_reports(patterns: list[dict], c: dict) -> bool:
     return any(
         p['metric'] == c['metric'] and p.get('window', c['window']) == c['window'] for p in patterns
     )
 
 
-def check_plan(budgets: dict, doc: dict) -> list[str]:
+def check_plan(budgets: dict, doc: dict, *, reported: list[dict]) -> list[str]:
     """A gated or exact entry whose unit and window no set of RUN_SETS lists
-    leaves the gate unmeasured, so it fails; one of a cell `reported` lists fails.
-    A set or cell of any set that is not an object, and a `reported` item that is
-    no pattern, is an error line."""
+    leaves the gate unmeasured, so it fails; one of a cell a pattern of reported
+    (held_patterns) matches fails. A set or cell of any set that is not an object,
+    and a `reported` item of doc that is no pattern, is an error line."""
     sets = doc.get('sets', {})
     if not isinstance(sets, dict):
         return ['plan.json: sets must be an object of named sets']
-    patterns, errors = reported_patterns(doc)
+    patterns, errors = reported, reported_patterns(doc)[1]
     cells = []
     for name, spec in sets.items():
         if not isinstance(spec, dict):
@@ -972,7 +995,7 @@ def check_plan(budgets: dict, doc: dict) -> list[str]:
 
 def retired_measured(budgets: dict, cells: Iterable[dict], patterns: list[dict]) -> list[str]:
     """A retired key a shard measured fails: the scheduled calibration tiers every measured
-    cell, but one plan.json reports, whose tier is the plan's."""
+    cell, but one a pattern of patterns (held_patterns) matches, whose tier is the plan's."""
     retired = {key(r) for r in budgets.get('retired', [])}
     return [
         f"{key_text(key(c))}: retired, yet a shard measured it; a measured cell's tier is the "
@@ -2102,6 +2125,11 @@ class Git:
         """The file at path, from the working directory, as commit sha's tree holds it."""
         return self.git('cat-file', 'blob', f'{sha}:./{os.path.relpath(path)}')
 
+    def has(self, sha: str, path: str) -> bool:
+        """Whether commit sha's tree holds path, from the working directory; GitError when
+        git cannot read sha."""
+        return bool(self.git('ls-tree', '--name-only', sha, '--', os.path.relpath(path)).strip())
+
     def added_by(self, path: str, head: str) -> str:
         """The newest first-parent commit of head that added path. A move adds its new
         path: rename detection, which `log.follow` turns on, would name the commit that
@@ -2259,13 +2287,21 @@ def load_base(path: str) -> dict:
     return load(p) if p.is_file() else {'budgets': []}
 
 
-def file_errors(a: argparse.Namespace, head: dict) -> Checked:
-    """check_provenance of head, its errors led by the rule and plan errors."""
+def held_reported(a: argparse.Namespace) -> list[dict]:
+    """The `reported` patterns --plan-doc and its copy at --base-sha both list."""
+    if not a.plan_doc:
+        return []
+    return held_patterns(load(a.plan_doc), base_plan(Git(), a.base_sha, a.plan_doc))
+
+
+def file_errors(a: argparse.Namespace, head: dict, held: list[dict]) -> Checked:
+    """check_provenance of head, its errors led by the rule and plan errors; held is
+    held_reported's."""
     errors = check_rule(head)
     if check_shape(head):
         return Checked(errors, set(), {}, [], [])
     if a.plan_doc:
-        errors += check_plan(head, load(a.plan_doc))
+        errors += check_plan(head, load(a.plan_doc), reported=held)
     found = check_provenance(
         head,
         load_base(a.base),
@@ -2455,7 +2491,7 @@ def run(a: argparse.Namespace) -> int:
         pathlib.Path(a.out).write_text(json.dumps(points, indent=2) + '\n')
         return 0
     if a.check_file:
-        errors = file_errors(a, load(a.check_file)).errors
+        errors = file_errors(a, load(a.check_file), held_reported(a)).errors
         for e in errors:
             print(f'::error::{e}')
         return 1 if errors else 0
@@ -2469,7 +2505,8 @@ def run(a: argparse.Namespace) -> int:
         if a.record_out:
             write_record(a, out, [*results['cpu_models'], *again['cpu_models']])
     else:
-        checked = file_errors(a, budgets)
+        held = held_reported(a)
+        checked = file_errors(a, budgets, held)
         only = a.only.replace(',', ' ').split()
         plan_doc = load(a.plan_doc)
         matrix = plan(plan_doc, a.set, only=only)
@@ -2480,15 +2517,19 @@ def run(a: argparse.Namespace) -> int:
         stale = set() if out.runner_mismatch else checked.stale
         judged = [c for c in results['cells'] if planned(units, c)]
         out.remeasure = with_stale(out.remeasure, judged, stale)
-        patterns, _ = reported_patterns(plan_doc)
         out.failures = (
-            checked.errors + out.failures + retired_measured(budgets, results['cells'], patterns)
+            checked.errors + out.failures + retired_measured(budgets, results['cells'], held)
         )
         out.exact_moves = checked.moves
         out.retires = checked.retires
         entries = {key(e): e for e in budgets.get('budgets', [])}
         moved = {c['scenario'] for c in out.remeasure if entries[key(c)]['tier'] == 'exact'}
         moved |= {k[0] for k in stale}
+        # A cell this pull request retires that only the full set measures is measured
+        # once more, so the verdict fails it if a shard still emits it.
+        for r in checked.retires:
+            if planned(planned_windows(extension(plan_doc, {}, {r['key'][0]})), key_dict(r['key'])):
+                moved.add(r['key'][0])
         extend = extension(plan_doc, units, moved)
         doc = {
             'cells': out.remeasure,
@@ -2496,6 +2537,7 @@ def run(a: argparse.Namespace) -> int:
             'stale': [key_dict(k) for k in sorted(stale)],
             'extend': extend,
             'accepted': [{**key_dict(k), **v} for k, v in sorted(checked.accepted.items())],
+            'reported': held,
         }
         pathlib.Path(a.remeasure_out).write_text(json.dumps(doc, indent=2) + '\n')
     report(a, summary(budgets, out))

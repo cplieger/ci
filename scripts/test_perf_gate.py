@@ -452,13 +452,14 @@ def accepted(budget=1700.0, reason='a slower parse on purpose', file='slow.json'
     return {keyof({**entry(), **kw}): {'budget': budget, 'reason': reason, 'file': file}}
 
 
-def decision(accepted_cells=None, stale=(), extend=()):
+def decision(accepted_cells=None, stale=(), extend=(), reported=()):
     """compare's remeasure.json as the verdict reads it."""
     return {
         'cells': [],
         'stale': [perf_gate.key_dict(k) for k in stale],
         'extend': list(extend),
         'accepted': [{**perf_gate.key_dict(k), **a} for k, a in (accepted_cells or {}).items()],
+        'reported': list(reported),
     }
 
 
@@ -702,6 +703,20 @@ class Extension(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, 'no full set'):
             perf_gate.extension({'sets': {'pr': PLAN['sets']['pr']}}, units, {'files'})
 
+    def test_a_retired_cell_the_extension_measured_fails(self):
+        retired = [{**CELL, 'scale': 'x1', 'metric': 'dom', 'reason': 'the list is virtual now'}]
+        b = budgets([entry()], retired=retired)
+        x1 = {**cell('dom', (640,) * 3, kind='count'), 'scale': 'x1'}
+        extend = [unit('files', 60, scale='x1')]
+        out = perf_gate.verdict(b, results([cell()]), results([x1]), decision(extend=extend))
+        why = "retired, yet a shard measured it; a measured cell's tier is the scheduled calibration's"
+        self.assertEqual(out.failures, [f'files/x1/chromium/desktop/cold/dom: {why}'])
+        held = decision(extend=extend, reported=[{'metric': 'dom'}])
+        self.assertEqual(perf_gate.verdict(b, results([cell()]), results([x1]), held).failures, [])
+        # A metric the extension no longer emits is a retirement.
+        none = perf_gate.verdict(b, results([cell()]), results([]), decision(extend=extend))
+        self.assertEqual(none.failures, [])
+
 
 # Count cells of marotte's calibrations 43591500420 and 43598120088 that every
 # rep of the other runs agreed on, as one held-out run and the next run
@@ -909,7 +924,7 @@ class FakeGit:
     holds the (measured, added) pairs whose code matches, and same_raises is what
     same_change raises; a commit in broken is one git cannot answer for. show reads a
     base file from shown by name, else the file on disk, else a source of ROOT, the
-    commit every commit descends from."""
+    commit every commit descends from; has finds every name but those in absent."""
 
     def __init__(self):
         self.lineage = set()
@@ -918,6 +933,12 @@ class FakeGit:
         self.same_raises = None
         self.broken = set()
         self.shown = {}
+        self.absent = set()
+
+    def has(self, sha, path):
+        if sha in self.broken:
+            raise perf_gate.GitError(f'git ls-tree exited 128: no such commit {sha}')
+        return pathlib.Path(path).name not in self.absent
 
     def commit(self, sha):
         if sha in self.broken:
@@ -2215,9 +2236,84 @@ class GitHistory(unittest.TestCase):
         found = self.provenance(git, '901-1', self.merge_ref())
         self.assertEqual((found.errors, found.stale), ([], set()))
 
+    def test_the_base_plan_is_read_from_the_base_tree(self):
+        git = self.git()
+        plan = {'sets': {'pr': {'shards': 5, 'cells': [{'seconds': 9}]}}}
+        self.assertEqual(perf_gate.base_plan(git, self.base, 'tests/perf/plan.json'), plan)
+        self.assertEqual(perf_gate.base_plan(git, self.base, 'tests/perf/none.json'), {})
+        self.put('tests/perf/plan.json', '[]')
+        listed = self.commit('a plan that is no object')
+        with self.assertRaisesRegex(TypeError, 'not a JSON object'):
+            perf_gate.base_plan(git, listed, 'tests/perf/plan.json')
+        with self.assertRaises(perf_gate.GitError):
+            perf_gate.base_plan(git, '0' * 40, 'tests/perf/plan.json')
+
+    def test_a_pull_request_passes_after_a_calibration_lands_on_its_base(self):
+        """The weekly check-in merges after the pull request opened: the merge ref's first
+        parent holds its calibration, and the base the pull request opened on does not."""
+        git = self.git()
+
+        def check_in(run_id, commit, cpu):
+            cells = [cal_cell('cpu_ms', cpu), cal_cell('dom', 2055, 'exact', kind='count')]
+            doc = calibration_file(cells, commit=commit, run_id=run_id, run_url=RUN_URL + run_id)
+            self.put(f'tests/perf/sources/{run_id}.json', doc)
+            self.put(f'tests/perf/sources/{run_id}.sigstore.json', '{}')
+            dom = entry('dom', 'exact', 2055, source=RUN_URL + run_id)
+            gated = entry(baseline=cpu, source=RUN_URL + run_id)
+            self.put('tests/perf/budgets.json', budgets([gated, dom]))
+
+        check_in('100', self.base, 1000.0)
+        opened = self.commit('check in calibration 100')
+        self.sh('checkout', '-q', '-b', 'pr2')
+        self.put('app.txt', 'two')
+        tip = self.commit('the change')
+        self.measured(tip, '900-1')
+        moved = entry('dom', 'exact', 2056, source=MEASURED_URL + '900/attempts/1', reason='+1')
+        self.put('tests/perf/budgets.json', budgets([entry(source=RUN_URL + '100'), moved]))
+        self.commit('take the measured file')
+        self.sh('checkout', '-q', 'main')
+        self.put('other.txt', 'dev')
+        dev = self.commit('dev moved')
+        self.sh('rm', '-q', 'tests/perf/sources/100.json', 'tests/perf/sources/100.sigstore.json')
+        check_in('200', dev, 1010.0)
+        later = self.commit('the weekly check-in')
+        # GitHub's merge ref, budgets.json merged as its one-entry-per-line form merges.
+        self.sh('checkout', '-q', '--detach', later)
+        self.sh('merge', '-q', '--no-ff', '--no-commit', '-X', 'theirs', 'pr2')
+        merged = budgets([entry(baseline=1010.0, source=RUN_URL + '200'), moved])
+        self.put('tests/perf/budgets.json', merged)
+        merge = self.commit('merge ref')
+        self.assertEqual(self.sh('rev-parse', 'HEAD^1'), later)
+
+        def check(base_sha):
+            return perf_gate.check_provenance(
+                merged,
+                json.loads(git.show(base_sha, 'tests/perf/budgets.json')),
+                sources=pathlib.Path('tests/perf/sources'),
+                accepted=pathlib.Path('tests/perf/accepted'),
+                repo=REPO,
+                head_sha=merge,
+                base_sha=base_sha,
+                verify=lambda blob, bundle, signer: None,
+                git=git,
+            )
+
+        found = check(later)
+        self.assertEqual((found.errors, found.stale), ([], set()))
+        self.assertEqual([m['key'] for m in found.moves], [keyof(moved)])
+        frozen = check(opened)
+        self.assertIn(
+            f'{CPU}: calibration 200 measured {dev}, which the base {opened} does not hold; ',
+            '\n'.join(frozen.errors),
+        )
+
     def test_git_errors_raise_and_a_short_sha_is_refused(self):
         git = self.git()
         self.assertEqual(git.show(self.base, 'app.txt'), 'one')
+        self.assertTrue(git.has(self.base, 'app.txt'))
+        self.assertFalse(git.has(self.base, 'tests/perf/sources/100.json'))
+        with self.assertRaises(perf_gate.GitError):
+            git.has('0' * 40, 'app.txt')
         with self.assertRaises(perf_gate.GitError):
             git.show(self.base, 'tests/perf/sources/100.json')
         with self.assertRaises(perf_gate.GitError):
@@ -2228,13 +2324,32 @@ class GitHistory(unittest.TestCase):
 
 
 class Coverage(unittest.TestCase):
+    def check(self, doc, plan, base=None):
+        """check_plan with the patterns plan and base, plan itself when unset, both hold."""
+        held = perf_gate.held_patterns(plan, plan if base is None else base)
+        return perf_gate.check_plan(doc, plan, reported=held)
+
+    def test_a_pattern_only_the_head_plan_lists_decides_no_tier(self):
+        frames = entry('sse_frames', 'exact', 3)
+        doc = budgets([entry(), frames])
+        head = {**PLAN, 'reported': [{'metric': 'sse_frames'}]}
+        self.assertEqual(perf_gate.held_patterns(head, head), [{'metric': 'sse_frames'}])
+        self.assertEqual(perf_gate.held_patterns(head, PLAN), [])
+        narrower = {**PLAN, 'reported': [{'metric': 'sse_frames', 'window': 'cold'}]}
+        self.assertEqual(perf_gate.held_patterns(head, narrower), [])
+        self.assertEqual(self.check(doc, head, base=PLAN), [])
+        self.assertEqual(len(self.check(doc, head)), 1)
+        # The head's own malformed items still fail, whatever the base holds.
+        broken = {**PLAN, 'reported': ['sse_frames']}
+        self.assertTrue(self.check(doc, broken, base=PLAN)[0].startswith('plan.json: reported'))
+
     def test_a_gated_or_exact_entry_no_set_lists_fails(self):
         gone = {**CELL, 'scenario': 'gone'}
         dropped = {**entry(), **gone}
         exact = {**entry('dom', 'exact', 640), **gone}
         reported = {**entry('frames', 'reported', 9.0), **gone}
         doc = budgets([entry(), dropped, exact, reported])
-        errors = perf_gate.check_plan(doc, PLAN)
+        errors = self.check(doc, PLAN)
         self.assertEqual(len(errors), 2)
         self.assertTrue(all(e.startswith('gone/') for e in errors))
         self.assertIn('no set of plan.json measures', errors[0])
@@ -2242,20 +2357,20 @@ class Coverage(unittest.TestCase):
         retired = [
             {**gone, 'metric': m, 'reason': 'the view was removed'} for m in ('cpu_ms', 'dom')
         ]
-        self.assertEqual(perf_gate.check_plan({**doc, 'retired': retired}, PLAN), errors)
+        self.assertEqual(self.check({**doc, 'retired': retired}, PLAN), errors)
         left = budgets([entry(), reported], retired=retired)
-        self.assertEqual(perf_gate.check_plan(left, PLAN), [])
+        self.assertEqual(self.check(left, PLAN), [])
 
     def test_a_unit_only_a_set_no_workflow_runs_lists_fails(self):
         doc = budgets([entry()])
         docs = {'shards': 1, 'cells': [unit('docs', 75)]}
         files = {'shards': 1, 'cells': [unit('files', 80)]}
         spare = {'node': '.', 'sets': {'pr': docs, 'full': docs, 'spare': files}}
-        errors = perf_gate.check_plan(doc, spare)
+        errors = self.check(doc, spare)
         self.assertEqual(len(errors), 1)
         self.assertIn('no set of plan.json measures', errors[0])
         weekly = {'node': '.', 'sets': {'pr': docs, 'full': files}}
-        self.assertEqual(perf_gate.check_plan(doc, weekly), [])
+        self.assertEqual(self.check(doc, weekly), [])
 
     def test_a_window_no_run_set_lists_for_its_unit_fails(self):
         webkit = {'engine': 'webkit'}
@@ -2264,13 +2379,11 @@ class Coverage(unittest.TestCase):
         doc = budgets([cold, live])
         pr = {'shards': 1, 'cells': [unit('files', 25, windows=['cold'], **webkit)]}
         chromium = {'shards': 1, 'cells': [unit('files', 80)]}
-        errors = perf_gate.check_plan(doc, {'node': '.', 'sets': {'pr': pr, 'full': chromium}})
+        errors = self.check(doc, {'node': '.', 'sets': {'pr': pr, 'full': chromium}})
         self.assertEqual(len(errors), 1)
         self.assertTrue(errors[0].startswith('files/x10/webkit/desktop/live/cpu_ms:'))
         full = {'shards': 1, 'cells': [unit('files', 25, **webkit)]}
-        self.assertEqual(
-            perf_gate.check_plan(doc, {'node': '.', 'sets': {'pr': pr, 'full': full}}), []
-        )
+        self.assertEqual(self.check(doc, {'node': '.', 'sets': {'pr': pr, 'full': full}}), [])
 
     def test_a_gated_or_exact_entry_of_a_cell_the_plan_reports_fails(self):
         frames = entry('sse_frames', 'exact', 3)
@@ -2281,7 +2394,7 @@ class Coverage(unittest.TestCase):
             {'metric': 'max_bytes:GET /api/engine'},
             {'metric': 'sse_frames', 'window': 'cold'},
         ]
-        errors = perf_gate.check_plan(doc, {**PLAN, 'reported': reported})
+        errors = self.check(doc, {**PLAN, 'reported': reported})
         tail = ': plan.json reports this cell, so its entry is reported, not exact'
         self.assertEqual(
             sorted(errors),
@@ -2291,7 +2404,7 @@ class Coverage(unittest.TestCase):
             ],
         )
         quiet = budgets([entry(), {**frames, 'tier': 'reported'}, live])
-        self.assertEqual(perf_gate.check_plan(quiet, {**PLAN, 'reported': reported}), [])
+        self.assertEqual(self.check(quiet, {**PLAN, 'reported': reported}), [])
 
     def test_a_reported_pattern_of_the_wrong_shape_is_an_error_line(self):
         for reported in (
@@ -2303,7 +2416,7 @@ class Coverage(unittest.TestCase):
             [{'metric': 'dom', 'scale': 'x1'}],
         ):
             with self.subTest(reported=reported):
-                errors = perf_gate.check_plan(budgets([entry()]), {**PLAN, 'reported': reported})
+                errors = self.check(budgets([entry()]), {**PLAN, 'reported': reported})
                 self.assertTrue(any(e.startswith('plan.json: reported') for e in errors), errors)
 
     def test_a_set_or_cell_that_is_not_an_object_is_an_error_line(self):
@@ -2315,7 +2428,7 @@ class Coverage(unittest.TestCase):
             {'full': {'cells': [unit('files', 80, windows='cold')]}},
         ):
             with self.subTest(sets=sets):
-                errors = perf_gate.check_plan(budgets([entry()]), {'node': '.', 'sets': sets})
+                errors = self.check(budgets([entry()]), {'node': '.', 'sets': sets})
                 self.assertTrue(any(e.startswith('plan.json: ') for e in errors), errors)
 
 
@@ -3033,10 +3146,13 @@ class Cli(unittest.TestCase):
         shard=None,
         git=FakeGit,
         cosign=None,
+        base=None,
         **doc,
     ):
         own = [entry(source=RUN_URL + '100'), entry('dom', 'exact', 640)] if listed else []
         b = self.put('budgets.json', budgets([*own, *entries], **doc))
+        # The base branch's file is the head's unless base lists its entries.
+        was = b if base is None else self.put('base.json', budgets(base))
         # Each entry's calibration, checked in at the head, as the provenance check needs.
         for e in [*own, *entries]:
             if not isinstance(e, dict) or not str(e.get('source', '')).startswith(RUN_URL):
@@ -3058,7 +3174,7 @@ class Cli(unittest.TestCase):
         self.put(own, results(cells) if shard is None else shard)
         if other is not None:
             self.put(f'results/{OTHER}-measure-shard-1-of-1-attempt-1/results.json', results(other))
-        argv = ('--budgets', b, '--base', b, '--results', str(self.dir / 'results'))
+        argv = ('--budgets', b, '--base', was, '--results', str(self.dir / 'results'))
         argv += ('--prefix', 'cplieger-a')
         argv += ('--sources', str(self.dir / 'sources'), '--repo', REPO, '--head', HEAD)
         argv += ('--base-sha', HEAD, '--plan-doc', self.put('plan.json', plan), '--set', 'pr')
@@ -3208,6 +3324,69 @@ class Cli(unittest.TestCase):
         reports = {**PLAN, 'reported': [{'metric': 'dom'}]}
         rc = self.compare(measured, listed=False, entries=own, retired=[dom], plan=reports)
         self.assertEqual(rc, 0, self.output)
+
+    def test_compare_extends_the_full_units_of_a_cell_it_retires(self):
+        dom = {**CELL, 'scale': 'x1', 'metric': 'dom', 'reason': 'the list is virtual now'}
+        own = [entry(source=RUN_URL + '100')]
+        gone = {**entry('dom', 'exact', 640), 'scale': 'x1'}
+        rc = self.compare([cell()], listed=False, entries=own, retired=[dom], base=[*own, gone])
+        self.assertEqual(rc, 0, self.output)
+        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
+        self.assertEqual(remeasure['extend'], [unit('files', 60, scale='x1')])
+        self.assertEqual(remeasure['scenarios'], ['files'])
+        # A retired item the base already holds leaves no entry, so nothing extends.
+        rc = self.compare([cell()], listed=False, entries=own, retired=[dom])
+        self.assertEqual(rc, 0, self.output)
+        self.assertEqual(json.loads((self.dir / 'remeasure.json').read_text())['extend'], [])
+
+    def test_a_reported_pattern_only_the_head_plan_lists_decides_no_tier(self):
+        class Base(FakeGit):
+            def __init__(self):
+                super().__init__()
+                self.shown = {'plan.json': json.dumps(PLAN)}
+
+        reports = {**PLAN, 'reported': [{'metric': 'dom'}]}
+        dom = {**CELL, 'metric': 'dom', 'reason': 'the list is virtual now'}
+        own = [entry(source=RUN_URL + '100')]
+        measured = [cell(), cell('dom', (700,) * 3, kind='count')]
+        # Retiring the cells of a pattern the pull request adds retires measured cells.
+        rc = self.compare(
+            measured, listed=False, entries=own, retired=[dom], plan=reports, git=Base
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn(f'::error::{DOM}: retired, yet a shard measured it', self.output)
+        # Kept, the entry is judged as before: its count off the budget is re-measured.
+        self.assertEqual(self.compare(measured, plan=reports, git=Base), 0, self.output)
+        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
+        self.assertEqual([keyof(c) for c in remeasure['cells']], [keyof(entry('dom'))])
+        self.assertEqual(remeasure['reported'], [])
+        # A pattern the base plan holds too decides the tier.
+        self.assertEqual(self.compare(measured, plan=reports), 1)
+        self.assertIn(
+            'plan.json reports this cell, so its entry is reported, not exact', self.output
+        )
+        remeasure = json.loads((self.dir / 'remeasure.json').read_text())
+        self.assertEqual(remeasure['reported'], [{'metric': 'dom'}])
+
+    def test_a_base_with_no_plan_holds_no_pattern_and_a_git_failure_fails(self):
+        class Absent(FakeGit):
+            def __init__(self):
+                super().__init__()
+                self.absent = {'plan.json'}
+
+        class Broken(FakeGit):
+            def __init__(self):
+                super().__init__()
+                self.shown = {'plan.json': perf_gate.GitError}
+
+        reports = {**PLAN, 'reported': [{'metric': 'dom'}]}
+        measured = [cell(), cell('dom', (640,) * 3, kind='count')]
+        self.assertEqual(self.compare(measured, plan=reports, git=Absent), 0, self.output)
+        self.assertEqual(json.loads((self.dir / 'remeasure.json').read_text())['reported'], [])
+        (self.dir / 'remeasure.json').unlink()
+        self.assertEqual(self.compare(measured, plan=reports, git=Broken), 1)
+        self.assertIn('perf_gate: GitError', self.output)
+        self.assertFalse((self.dir / 'remeasure.json').exists())
 
     def test_compare_marks_nothing_stale_on_a_runner_the_budgets_do_not_name(self):
         url = MEASURED_URL + '900/attempts/1'
