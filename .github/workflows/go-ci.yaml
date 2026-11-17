@@ -19,9 +19,9 @@ on:
         default: ''
       go-test-timeout:
         description: >-
-          The `-timeout` of the race tests, a Go duration such as `20m`, for a module
-          whose test binaries run longer than the go command's default; empty keeps
-          that default of 10 minutes per test binary.
+          The `-timeout` of the race tests and the noui tests, a Go duration such as
+          `20m`, for a module whose test binaries run longer than the go command's
+          default; empty keeps that default of 10 minutes per test binary.
         type: string
         default: ''
 
@@ -110,6 +110,33 @@ jobs:
         env:
           GO_TEST_TIMEOUT: ${{ inputs.go-test-timeout }}
         run: ( go test -count=1 -race ${GO_TEST_TIMEOUT:+"-timeout=$GO_TEST_TIMEOUT"} ./... ) || { echo "test" >> /tmp/_ci_failures; exit 1; }
+
+      # Files only the `noui` build compiles are not in the race run above.
+      # They run here without -race, because a second race run can put a large
+      # module past the job's 30 minutes. Go's own file selection decides
+      # whether the tag changes the build: a constraint on any source file moves
+      # it into or out of go list's ignored lists.
+      # errexit is off left of the `||`. scripts/test_go_noui.py runs this body.
+      - name: Test (noui)
+        id: test-noui
+        continue-on-error: true
+        env:
+          GO_TEST_TIMEOUT: ${{ inputs.go-test-timeout }}
+        run: |
+          (
+            files='{{.ImportPath}}:{{range .IgnoredGoFiles}} {{.}}{{end}}{{range .IgnoredOtherFiles}} {{.}}{{end}}'
+            plain=$(go list -e -f "$files" ./...) && tagged=$(go list -e -tags noui -f "$files" ./...) \
+              || { echo "::error::noui: go list could not list this module's packages"; exit 1; }
+            if [ "$plain" = "$tagged" ]; then
+              echo "noui: the noui build tag changes no file of this module; skipping"
+              exit 0
+            fi
+            echo "noui: the noui build tag changes the files these packages leave out (< without it, > with it):"
+            diff <(printf '%s\n' "$plain") <(printf '%s\n' "$tagged") | grep '^[<>]'
+            go vet -tags noui ./... \
+              && golangci-lint run --allow-parallel-runners --timeout=5m --build-tags=noui ./... \
+              && go test -count=1 -tags noui ${GO_TEST_TIMEOUT:+"-timeout=$GO_TEST_TIMEOUT"} ./...
+          ) || { echo "noui" >> /tmp/_ci_failures; exit 1; }
 
       - name: Govulncheck
         id: govulncheck
@@ -242,6 +269,7 @@ jobs:
             vet ${{ steps.vet.outcome }}
             lint-golangci-lint ${{ steps.lint-golangci-lint.outcome }}
             test-race ${{ steps.test-race.outcome }}
+            test-noui ${{ steps.test-noui.outcome }}
             govulncheck ${{ steps.govulncheck.outcome }}
             verify-modules ${{ steps.verify-modules.outcome }}
             wiregen-drift ${{ steps.wiregen-drift.outcome }}
