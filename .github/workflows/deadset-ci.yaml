@@ -37,7 +37,7 @@ permissions:
 # this workflow over fixed repositories to prove each set before it ships.
 env:
   # renovate: datasource=go depName=github.com/cplieger/deadset/v2
-  DEADSET_VERSION: v2.0.0-dev.45
+  DEADSET_VERSION: v2.0.0-dev.46
   # renovate: datasource=go depName=github.com/cplieger/deadset-go/v2
   DEADSET_GO_VERSION: v2.0.0-dev.53
   # renovate: datasource=npm depName=@cplieger/deadset-ts
@@ -307,6 +307,83 @@ jobs:
             echo "npm ci in $dir"
             (cd "$dir" && npm ci --ignore-scripts --no-audit --no-fund)
           done < <(printf '%s\n' "$NPM_DIRS")
+
+      - name: Setup Python
+        if: ${{ steps.census.outputs.analyze == 'true' && inputs.repository != '' }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      # deadset refuses a report value its own deadset-spec lacks, and a spec dev
+      # tag may add one without moving schema_version, so a deadset pin on an
+      # older spec than an analyzer pin fails any run whose analyzer writes such
+      # a value (exit 3), which the canary's targets may never do. The pins move
+      # only in a cplieger/ci pull request, whose deadset-canary (the one caller
+      # that passes repository) checks each pin set here before it merges. A Go
+      # product's spec is its build info's deadset-spec dependency; deadset-ts's
+      # npm package names none, so its corpus.lock.json does.
+      - name: Spec skew (deadset)
+        if: ${{ steps.census.outputs.analyze == 'true' && inputs.repository != '' }}
+        env:
+          GO: ${{ steps.census.outputs.go }}
+          TS: ${{ steps.census.outputs.ts }}
+        run: |
+          set -euo pipefail
+          spec_go() {
+            go version -m "$(command -v "$1")" | awk '
+              held { if ($1 != "=>") print version; held = 0 }
+              $1 == "dep" && $2 ~ /^github\.com\/cplieger\/deadset-spec(\/v[0-9]+)?$/ && $3 != "(devel)" { version = $3; held = 1 }
+              END { if (held) print version }'
+          }
+          # SemVer 2.0.0 precedence (semver.org, item 11): exit 0 when $1 precedes $2.
+          precedes() {
+            python3 - "$1" "$2" <<'PY'
+          import re, sys
+          def key(v):
+              m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", v)
+              if not m:
+                  sys.exit(2)
+              pre = m.group(4)
+              ids = [(0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split(".")] if pre else []
+              return [int(m.group(i)) for i in (1, 2, 3)], pre is None, ids
+          sys.exit(0 if key(sys.argv[1]) < key(sys.argv[2]) else 1)
+          PY
+          }
+          host="$(spec_go deadset)"
+          if [ -z "$host" ]; then
+            echo "::error::deadset $DEADSET_VERSION records no deadset-spec version in its build info, so its spec cannot be checked against the analyzers'."
+            exit 1
+          fi
+          analyzers=()
+          if [ "$GO" = true ]; then
+            analyzers+=("deadset-go $DEADSET_GO_VERSION $(spec_go deadset-go)")
+          fi
+          if [ "$TS" = true ]; then
+            lock="$RUNNER_TEMP/deadset-ts-corpus.lock.json"
+            curl -fsSL --connect-timeout 10 --max-time 60 --retry 7 --retry-max-time 150 --retry-all-errors -o "$lock" \
+              "https://raw.githubusercontent.com/cplieger/deadset-ts/v${DEADSET_TS_VERSION}/corpus.lock.json"
+            analyzers+=("deadset-ts $DEADSET_TS_VERSION $(jq -r '.tag // empty' "$lock")")
+          fi
+          skewed=0
+          for entry in "${analyzers[@]}"; do
+            read -r name version spec <<<"$entry"
+            if [ -z "${spec:-}" ]; then
+              echo "::error::$name $version names no deadset-spec version, so its spec cannot be checked against deadset's."
+              exit 1
+            fi
+            rc=0
+            precedes "$host" "$spec" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "::error::deadset $DEADSET_VERSION is on deadset-spec $host, older than $name $version on deadset-spec $spec, so deadset refuses report values that analyzer may write. Move the deadset pin to a release on deadset-spec $spec or newer."
+              skewed=1
+              continue
+            elif [ "$rc" -ne 1 ]; then
+              echo "::error::the deadset-spec versions $host and $spec cannot be ordered."
+              exit 1
+            fi
+            echo "$name $version on deadset-spec $spec; deadset $DEADSET_VERSION on deadset-spec $host"
+          done
+          [ "$skewed" -eq 0 ] || exit 1
 
       # deadset reads deadset.json, deadset-ignore.json, deadset-baseline.json
       # and deadset-edges.json at the target root only.

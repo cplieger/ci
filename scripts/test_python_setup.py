@@ -18,9 +18,9 @@ import unittest
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-# A python3 call (an option, a script path or a variable after it) or a pip install,
-# which lands in whichever interpreter is first on PATH.
-PYTHON_CALL = re.compile(r'(?<![\w./-])python3?\s+(-[A-Za-z]|["\']?\$|[\w./{}$"-]*\.py\b)')
+# A python3 call (an option, `-` for a script on stdin, a script path or a variable
+# after it) or a pip install, which lands in whichever interpreter is first on PATH.
+PYTHON_CALL = re.compile(r'(?<![\w./-])python3?\s+(-[A-Za-z]|-(?=\s)|["\']?\$|[\w./{}$"-]*\.py\b)')
 PIP_INSTALL = re.compile(r'(?<![\w./-])pip3?\s+install\b')
 SETUP = 'actions/setup-python@'
 SCRIPT_TOKEN = re.compile(r'([\w./-]+)\.py\b')

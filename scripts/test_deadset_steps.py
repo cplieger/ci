@@ -266,6 +266,10 @@ TS_ONLY = {
 IMAGE_ONLY = {'Dockerfile': 'FROM scratch\n', 'run.sh': '#!/bin/sh\n'}
 CENSUS_STEP = 'Languages in scope (deadset)'
 INSTALL_STEP = 'Install analyzers and dependencies'
+SKEW_STEP = 'Spec skew (deadset)'
+# The pin-set checks run only where a caller passes repository, which only
+# cplieger/ci's own deadset-canary does.
+CANARY_ONLY = "${{ steps.census.outputs.analyze == 'true' && inputs.repository != '' }}"
 # The class lines deadset v2.0.0-dev.28 prints for a tree with no program and
 # for a tree holding only Protocol Buffers.
 NO_PROGRAM = (
@@ -772,6 +776,8 @@ class Census(Harness):
         gated = {
             'Setup Node.js': "${{ steps.census.outputs.ts == 'true' }}",
             INSTALL_STEP: "${{ steps.census.outputs.analyze == 'true' }}",
+            'Setup Python': CANARY_ONLY,
+            SKEW_STEP: CANARY_ONLY,
             STEP: "${{ steps.census.outputs.analyze == 'true' }}",
         }
         for name in names[names.index(CENSUS_STEP) + 1 :]:
@@ -809,7 +815,7 @@ class Analyze(Harness):
         self.assertNotIn('continue-on-error', step)
         self.assertNotIn(MARKER, step['run'])
         names = step_names(DEADSET_CI, 'analyze')
-        after_setup = names[names.index(INSTALL_STEP) + 1 :]
+        after_setup = names[names.index(SKEW_STEP) + 1 :]
         hard = [n for n in after_setup if analyze_step(n).get('continue-on-error') is not True]
         self.assertEqual(hard, [STEP])
 
@@ -1247,6 +1253,112 @@ def uris(sarif_run: dict) -> tuple[str, str]:
     uri = result['locations'][0]['physicalLocation']['artifactLocation']['uri']
     related = result['relatedLocations'][0]['physicalLocation']['artifactLocation']['uri']
     return uri, related
+
+
+# go version -m for a product built on deadset-spec $SPEC_<NAME>; REPLACED_<NAME>
+# adds the => line a replace directive writes after the dependency.
+BUILD_INFO_GO_STUB = """#!/usr/bin/env bash
+[ "$1 $2" = "version -m" ] || exit 0
+name="$(basename "$3" | tr a-z- A-Z_)"
+spec="SPEC_$name" replaced="REPLACED_$name"
+printf '%s: go1.27.4\\n\\tpath\\tgithub.com/cplieger/x\\n' "$3"
+printf '\\tdep\\tgithub.com/cplieger/deadset-spec/v8\\t%s\\th1:x=\\n' "${!spec}"
+if [ -n "${!replaced:-}" ]; then printf '\\t=>\\t../spec\\t(devel)\\n'; fi
+"""
+
+# curl -o <file> <url>: deadset-ts's corpus.lock.json, whose tag is $SPEC_DEADSET_TS.
+LOCK_CURL_STUB = """#!/usr/bin/env bash
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -o ]; then out="$2"; shift; fi
+  shift
+done
+printf '{"tag":"%s"}\\n' "${SPEC_DEADSET_TS:-}" > "$out"
+"""
+
+
+class SpecSkew(Harness):
+    def stub(self, deadset: bool = True) -> None:
+        super().stub(deadset)
+        write_exec(self.bin / 'go', BUILD_INFO_GO_STUB)
+        write_exec(self.bin / 'deadset-go', '#!/bin/sh\n')
+        write_exec(self.bin / 'curl', LOCK_CURL_STUB)
+        for tool in ('python3', 'jq'):
+            found = shutil.which(tool)
+            if found and not (self.bin / tool).exists():
+                (self.bin / tool).symlink_to(found)
+
+    def skew(self, go: bool = True, ts: bool = True, **env: str) -> StepRun:
+        return self.run_step(
+            SKEW_STEP, self.tmp, {'GO': str(go).lower(), 'TS': str(ts).lower(), **env}
+        )
+
+    def errors(self, run: StepRun) -> list[str]:
+        return [line for line in run.out.splitlines() if line.startswith('::error::')]
+
+    def test_a_host_on_every_analyzers_spec_or_newer_passes(self):
+        run = self.skew(
+            SPEC_DEADSET='v8.0.0-dev.63',
+            SPEC_DEADSET_GO='v8.0.0-dev.62',
+            SPEC_DEADSET_TS='v8.0.0-dev.63',
+        )
+        self.assertEqual(run.rc, 0, run.out)
+        self.assertEqual(self.errors(run), [])
+        self.assertIn('deadset-go v2.0.0-dev.53 on deadset-spec v8.0.0-dev.62', run.out)
+        self.assertIn('on deadset-spec v8.0.0-dev.63; deadset ', run.out)
+
+    def test_a_host_on_an_older_spec_than_an_analyzer_fails_naming_both(self):
+        cases = (
+            ({'go': True, 'ts': False}, ['deadset-go']),
+            ({'go': False, 'ts': True}, ['deadset-ts']),
+            ({'go': True, 'ts': True}, ['deadset-go', 'deadset-ts']),
+        )
+        for langs, skewed in cases:
+            with self.subTest(**langs):
+                run = self.skew(
+                    **langs,
+                    SPEC_DEADSET='v8.0.0-dev.53',
+                    SPEC_DEADSET_GO='v8.0.0-dev.62',
+                    SPEC_DEADSET_TS='v8.0.0-dev.63',
+                )
+                self.assertEqual(run.rc, 1, run.out)
+                errors = self.errors(run)
+                self.assertEqual([e.split(' older than ')[1].split(' ')[0] for e in errors], skewed)
+                for error in errors:
+                    self.assertIn('is on deadset-spec v8.0.0-dev.53', error)
+
+    def test_precedence_is_semver_not_text(self):
+        run = self.skew(ts=False, SPEC_DEADSET='v8.0.0-dev.10', SPEC_DEADSET_GO='v8.0.0-dev.9')
+        self.assertEqual(run.rc, 0, run.out)
+        run = self.skew(ts=False, SPEC_DEADSET='v8.0.0-dev.63', SPEC_DEADSET_GO='v8.0.0')
+        self.assertEqual(run.rc, 1, run.out)
+
+    def test_an_unreadable_spec_fails(self):
+        cases = (
+            (
+                {'REPLACED_DEADSET': '1', 'SPEC_DEADSET_GO': 'v8.0.0-dev.62'},
+                'records no deadset-spec version',
+            ),
+            (
+                {'SPEC_DEADSET': 'v8.0.0-dev.63', 'REPLACED_DEADSET_GO': '1'},
+                'deadset-go v2.0.0-dev.53 names no',
+            ),
+            (
+                {
+                    'SPEC_DEADSET': 'v8.0.0-dev.63',
+                    'SPEC_DEADSET_GO': 'v8.0.0-dev.62',
+                    'SPEC_DEADSET_TS': '',
+                },
+                'names no',
+            ),
+            ({'SPEC_DEADSET': 'garbage', 'SPEC_DEADSET_GO': 'v8.0.0-dev.62'}, 'cannot be ordered'),
+        )
+        for env, want in cases:
+            with self.subTest(**env):
+                run = self.skew(
+                    ts='SPEC_DEADSET_TS' in env, **{'SPEC_DEADSET': 'v8.0.0-dev.63', **env}
+                )
+                self.assertEqual(run.rc, 1, run.out)
+                self.assertTrue(any(want in e for e in self.errors(run)), run.out)
 
 
 class Sarif(Harness):
