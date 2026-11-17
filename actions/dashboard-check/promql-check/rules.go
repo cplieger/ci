@@ -37,6 +37,10 @@ var twoSampleFunctions = map[string]string{
 // instanceLabel is the label Q2 holds to the dashboard variable of the same name.
 const instanceLabel = "instance"
 
+// alertSeries are the series Prometheus's rule manager writes with each alert's labels:
+// ALERTS and, for restoring an alert's for state, ALERTS_FOR_STATE (rules/alerting.go).
+var alertSeries = []string{"ALERTS", "ALERTS_FOR_STATE"}
+
 // userChosenLabels are set by the user's scrape config or log collector, never by the app.
 var userChosenLabels = []string{"job", "hostname", "container"}
 
@@ -135,11 +139,11 @@ func (r *rules) unscoped(q query, expr parser.Expr) []string {
 
 // emptyArm says why instance="" fails on s, or "" when it passes: s is joined by or to a selector
 // holding instance="$instance", or s is a targetAlert with no such join. A selector that can read
-// ALERTS takes instance="" only as a targetAlert.
+// an alert series takes instance="" only as a targetAlert.
 func emptyArm(s selection, exact map[*parser.VectorSelector]bool) string {
 	switch op, joined := exactJoin(s, exact); {
-	case readsAlerts(s.vs) && !targetAlert(s.vs):
-		return ` can read ALERTS, where instance="" also selects other apps' alerts; there it passes only in ALERTS{alertname="<name>", instance=""}, optionally with alertstate="<state>"`
+	case readsAlerts(s) && !targetAlert(s.vs):
+		return ` is in a selector that can read ALERTS or ALERTS_FOR_STATE, where instance="" passes only in ALERTS{alertname="<name>", instance=""}, optionally with alertstate="<state>", and no other matcher`
 	case joined && op == parser.LOR:
 		return ""
 	case joined:
@@ -169,22 +173,28 @@ func exactJoin(s selection, exact map[*parser.VectorSelector]bool) (parser.ItemT
 	return 0, false
 }
 
-// readsAlerts says vs can select ALERTS: each of its metric-name matchers, if any, matches it.
-func readsAlerts(vs *parser.VectorSelector) bool {
-	return !slices.ContainsFunc(vs.LabelMatchers, func(m *labels.Matcher) bool {
-		return m.Name == model.MetricNameLabel && !m.Matches("ALERTS")
+// readsAlerts says s can select an alert series: no metric-name matcher rules them out at both
+// readings, so a name taken from a variable can select one.
+func readsAlerts(s selection) bool {
+	return !slices.ContainsFunc(s.matchers, func(m matcher) bool {
+		return m.first.Name == model.MetricNameLabel && m.second != nil && m.second.Value == m.first.Value &&
+			!slices.ContainsFunc(alertSeries, m.first.Matches)
 	})
 }
 
 // targetAlert is ALERTS matched only by alertname="<name>", alertstate="<state>" equalities and
-// its instance matchers: an alert about a target that is absent carries no instance label, so
-// instance="" alone reads it. Any other matcher is refused rather than judged.
+// its instance matchers, with one metric-name matcher: an alert about a target that is absent
+// carries no instance label, so instance="" alone reads it. Any other matcher is refused rather
+// than judged.
 func targetAlert(vs *parser.VectorSelector) bool {
 	alerts, named := false, false
 	for _, m := range vs.LabelMatchers {
 		switch m.Name {
 		case model.MetricNameLabel:
-			alerts = m.Type == labels.MatchEqual && m.Value == "ALERTS"
+			if alerts || m.Type != labels.MatchEqual || m.Value != "ALERTS" {
+				return false
+			}
+			alerts = true
 		case "alertname":
 			if m.Type != labels.MatchEqual || m.Value == "" {
 				return false
@@ -287,7 +297,7 @@ func (r *rules) findings(q query, p *problems) []finding {
 		})
 	}
 	if len(p.q2) > 0 {
-		fix := `match the instance exactly with one instance="$instance" in every selector. Put instance="" in a second selector joined by or beside it, or alone in ALERTS{alertname="<name>", instance=""}, optionally with alertstate="<state>"; a selector that can read ALERTS takes instance="" in that shape only.`
+		fix := `match the instance exactly with one instance="$instance" in every selector. Put instance="" in a second selector joined by or beside it, or alone in ALERTS{alertname="<name>", instance=""}, optionally with alertstate="<state>"; a selector that can read ALERTS or ALERTS_FOR_STATE takes instance="" in that shape only.`
 		switch {
 		case r.instanceVar == nil:
 			fix = `add a single-select instance variable and match instance="$instance".`
