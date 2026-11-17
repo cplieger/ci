@@ -5,6 +5,8 @@
 
 # release_channels.HANDOFF_PREFIX reads this context.
 TAG_HANDOFF_PREFIX='release/handoff/'
+# claim_held posts it and claim_unused reads it.
+TAG_CLAIM_PREFIX='release/claim/'
 
 # tag_ref <owner/repo> <tag> <commit>: makes refs/tags/<tag> point at <commit>
 # through retry, reading the tag again before each attempt: a release run's lanes
@@ -149,36 +151,62 @@ claim_version() {
 
 # claim_held <owner/repo> <tag> <commit>: a publishing job's check of the claim
 # job's claim_version, which it never repeats: a ref create it sent after a
-# newer push would be refused. Writes claimed=true in GITHUB_OUTPUT and returns
-# 0 when <tag> is at <commit>; returns 1 when it is elsewhere, absent or
-# unreadable, so nothing is published under it.
+# newer push would be refused. When <tag> is at <commit>, posts the
+# release/claim/<tag> status on <commit> (claim_unused keeps the tag once it
+# exists), writes claimed=true in GITHUB_OUTPUT and returns 0; returns 1 when
+# the tag is elsewhere, absent or unreadable, or the status is not posted, so
+# nothing is published under it.
 claim_held() {
   if ! retry claim_read "$1" "$2"; then
     echo "::error::tag $2 cannot be read, so this run's claim of it at $3 is unconfirmed and nothing is published under it."
     return 1
   fi
+  if [ -z "$CLAIM_AT" ]; then
+    echo "::error::tag $2 does not exist, so nothing is published under it. An attempt that ended before its first write deleted this run's claim: rerun all jobs so the claim job claims it again."
+    return 1
+  fi
   if [ "$CLAIM_AT" != "$3" ]; then
-    echo "::error::tag $2 is at ${CLAIM_AT:-<none>}, not this run's commit $3, so nothing is published under it."
+    echo "::error::tag $2 is at ${CLAIM_AT}, not this run's commit $3, so nothing is published under it."
+    return 1
+  fi
+  if ! retry gh api -X POST "repos/$1/statuses/$3" -f state=success -f context="${TAG_CLAIM_PREFIX}$2" \
+    -f description="the release run writes under this claim" \
+    -f target_url="${GITHUB_SERVER_URL:-https://github.com}/$1/actions/runs/${GITHUB_RUN_ID:-0}" >/dev/null; then
+    echo "::error::the ${TAG_CLAIM_PREFIX}$2 status was not posted on $3, so nothing is published under $2, which would let the run's end delete it."
     return 1
   fi
   echo "claimed=true" >>"${GITHUB_OUTPUT:?}"
 }
 
-# claim_drop <owner/repo> <tag> <commit>: deletes the claim job's tag when a
-# run publishes nothing under it after all, so no unproven claim is left
-# behind. Returns 0 once <tag> is gone, 1 when it is at another commit (not
-# this run's to delete) or GitHub cannot read or delete it.
-claim_drop() {
+# claim_unused <owner/repo> <tag> <commit>: at a run's end, deletes <tag> when
+# it is at <commit> with no release/claim/<tag> status there, since then no
+# write ran under it (claim_held posts the status first). A tag at <commit>
+# for a version the run releases is never proven: a proven one is an anchor,
+# and a run never releases its anchor's commit. Returns 0 when the tag is
+# absent, elsewhere, kept or deleted; 1 when GitHub cannot read or delete it.
+claim_unused() {
+  local contexts
   if ! retry claim_read "$1" "$2"; then
-    echo "::error::tag $2 cannot be read, so this run's claim of it at $3 is not deleted."
+    echo "::error::tag $2 cannot be read, so whether this run left an unused claim of it at $3 is unknown."
     return 1
   fi
-  [ -n "$CLAIM_AT" ] || return 0
   if [ "$CLAIM_AT" != "$3" ]; then
-    echo "::error::tag $2 is at ${CLAIM_AT}, not this run's commit $3, so it is not this run's claim to delete."
+    echo "::notice::tag $2 is not at $3, so this run holds no claim of it."
+    return 0
+  fi
+  if ! contexts=$(retry gh api --paginate "repos/$1/commits/$3/statuses?per_page=100" --jq '.[] | select(.state == "success") | .context'); then
+    echo "::error::the statuses of $3 cannot be read, so tag $2 is kept and may be an unused claim: delete refs/tags/$2 when no release run wrote under it."
     return 1
   fi
-  retry gh api -X DELETE "repos/$1/git/refs/tags/$2" >/dev/null
+  if grep -qxF "${TAG_CLAIM_PREFIX}$2" <<<"$contexts"; then
+    echo "::notice::a release run wrote under tag $2 at $3, so the tag stays."
+    return 0
+  fi
+  if ! retry gh api -X DELETE "repos/$1/git/refs/tags/$2" >/dev/null; then
+    echo "::error::tag $2 at $3 has nothing written under it, and GitHub refused its delete. Delete refs/tags/$2 by hand, or a later stable run stops at it."
+    return 1
+  fi
+  echo "::notice::nothing was written under tag $2, so this run's claim of it is deleted."
 }
 
 # claim_read <owner/repo> <tag>: CLAIM_AT is the tag's commit, empty when

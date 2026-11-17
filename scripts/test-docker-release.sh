@@ -71,7 +71,6 @@ wanted = {
         "Publish channel tags on GHCR": "manifest.sh",
         "Fetch the previous release's SBOM": "prevsbom.sh",
         "Generate release notes": "notes.sh",
-        "Release the claim": "unclaim.sh",
         "Verify the claim": "verify.sh",
         "Stage and sign the release assets": "stagesign.sh",
         "Create release": "createrel.sh",
@@ -118,8 +117,8 @@ gates = {
     "provenance-if": step_if("finalize", "Verify the promoted build's signature and SBOM"),
     "before-provenance": fin[: fin.index("Verify the promoted build's signature and SBOM")],
     "after-provenance": fin[fin.index("Verify the promoted build's signature and SBOM") + 1],
-    "claim": fin[fin.index("Verify the promoted build's signature and SBOM") + 2 : fin.index("Verify the promoted build's signature and SBOM") + 4],
-    "first-write": fin[fin.index("Verify the promoted build's signature and SBOM") + 4],
+    "claim": fin[fin.index("Verify the promoted build's signature and SBOM") + 2],
+    "first-write": fin[fin.index("Verify the promoted build's signature and SBOM") + 3],
     "promotedsbom-if": step_if("finalize", "Read the promoted build's SBOM"),
     "scan-ifs": sorted({
         " ".join(str(s.get("if", "")).split()) for s in jobs["finalize"]["steps"]
@@ -319,6 +318,10 @@ open(f"{out}/claim-job.json", "w").write(json.dumps({
     "if": " ".join(str(rjobs["claim"]["if"]).split()), "outputs": rjobs["claim"]["outputs"],
     "steps": [s.get("name") for s in rjobs["claim"]["steps"]],
 }))
+open(f"{out}/unclaim-job.json", "w").write(json.dumps({
+    "needs": rjobs["unclaim"]["needs"], "permissions": rjobs["unclaim"]["permissions"],
+    "if": " ".join(str(rjobs["unclaim"]["if"]).split()),
+}))
 ts_verify = next(s for s in rjobs["ts"]["steps"] if s.get("name") == "Verify the claim")
 open(f"{out}/ts-verify.sh", "w").write(ts_verify["run"])
 open(f"{out}/docker-with.json", "w").write(json.dumps({k: str(v) for k, v in rjobs["docker"]["with"].items()}))
@@ -392,9 +395,19 @@ for channel in ("dev", "stable"):
         d = rjobs["docker"]
         # The claim job runs on its own condition and claims (a refused claim
         # is the D-CL cases'); a skipped job's outputs are empty.
-        claim = {"claimed": "true", "created": "true"} if ghx(rjobs["claim"]["if"], o) else {}
+        claim = {"claimed": "true"} if ghx(rjobs["claim"]["if"], o) else {}
         cases[f"{channel}/{name}"] = f"{bool(ghx(d['if'], o, claim))}|{ghx(d['with']['release-needed'], o, claim)}"
 json.dump(cases, open(f"{out}/docker-gate.json", "w"))
+claims = {}
+for kind in ("docker", "ts", "go"):
+    for name, release, root, subs in (
+        ("root", "true", "true", "[]"),
+        ("sub", "true", "false", '["web"]'),
+        ("none", "false", "true", "[]"),
+    ):
+        o = {"type": kind, "release": release, "root_changed": root, "subpackages_to_publish": subs}
+        claims[f"{kind}/{name}"] = bool(ghx(rjobs["claim"]["if"], o))
+json.dump(claims, open(f"{out}/claim-gate.json", "w"))
 PY
 
 for f in derive modpath promote buildargs; do
@@ -1068,8 +1081,8 @@ chk "D-R6 a root change is the root's alone" "$r" 'true|[]'
 chk "D-R6 and releases" "$(select_at dev true '[]' "$S_WEB" "$S_ROOT")" "true|v1.3.0-dev.1"
 # The job gates: the root tag job and the subpackage job fire on `release`
 # without a channel condition, needs-ordered tag before publish.
-chk "D-R7 the go job fires on a subpackage change, through the claim job's condition" \
-  "$(grep -c "needs.claim.result == 'success'" "$WORK/go.if")|$(jq -r .if "$WORK/claim-job.json" | grep -c "needs.detect.outputs.type != 'ts' && needs.detect.outputs.subpackages_to_publish != '\[\]'")" "1|1"
+chk "D-R7 the go job fires on a subpackage change, needing no claim job" \
+  "$(grep -c "needs.detect.outputs.subpackages_to_publish != '\[\]'" "$WORK/go.if")|$(grep -c "needs.claim" "$WORK/go.if" || true)" "1|0"
 chk_has "D-R7 the subpackage job fires on release" "$(cat "$WORK/subpackage.if")" "needs.detect.outputs.release == 'true'"
 chk "D-R7 the subpackage job has no channel condition" "$(grep -c 'channel' "$WORK/subpackage.if" || true)" "0"
 chk_has "D-R7 the subpackage job runs after the root tag job" "$(cat "$WORK/subpackage.needs")" "go"
@@ -1423,8 +1436,9 @@ chk "D-S2 and the security merges, and no promotion note" \
   '${{ needs.detect.outputs.security_shas }} false'
 chk "D-S3 docker notes read the kind-line input" "$(sed -n 's/^KIND_NOTE=//p' "$WORK/notes.sh.envmap")" \
   '${{ inputs.release-kind-note }}'
+chk "D-S5 go notes read detect's kind line, which needs no proof" "$(cat "$WORK/go-notes.env")" '${{ needs.detect.outputs.release_kind_note }}'
+chk "D-S5 ts notes read the claim job's" "$(cat "$WORK/ts-notes.env")" '${{ needs.claim.outputs.kind_note }}'
 for job in go ts; do
-  chk "D-S5 $job notes read the kind line" "$(cat "$WORK/$job-notes.env")" '${{ needs.claim.outputs.kind_note }}'
   chk_has "D-S6 $job notes hand it to the renderer" "$(cat "$WORK/$job-notes.sh")" '--kind-note "$KIND_NOTE"'
 done
 
@@ -2139,8 +2153,8 @@ chk_has "D-G6 runs on publishes of a promoted digest only" "$(gate '."provenance
   "env.PUBLISH == 'true' && env.PROMOTE_DIGEST != ''"
 chk "D-G6 after cosign and the tools are in place, before every registry write" "$(gate '."before-provenance" | join("|")')" \
   "Checkout|Check out the ci source|Download digests|Download the signed runner digests|Set up Docker Buildx|Log in to GHCR|Install Cosign|Setup Python"
-chk "D-G6 the next step reads the promoted SBOM, then a skipped rebuild releases the claim, then the claim is verified, then comes the first write" \
-  "$(gate '."after-provenance"')|$(gate '.claim | join("|")')|$(gate '."first-write"')" "Read the promoted build's SBOM|Release the claim|Verify the claim|Publish channel tags on GHCR"
+chk "D-G6 the next step reads the promoted SBOM, then the claim is verified, then comes the first write" \
+  "$(gate '."after-provenance"')|$(gate '.claim')|$(gate '."first-write"')" "Read the promoted build's SBOM|Verify the claim|Publish channel tags on GHCR"
 chk "D-G6 the source is the one the digest walk named" "$(sed -n 's/^PROMOTE_SOURCE=//p' "$WORK/provenance.sh.envmap")" \
   '${{ needs.prepare.outputs.promote_source }}'
 chk "D-G6 with the exclusion list and subpackages that walk used" \
@@ -2966,8 +2980,19 @@ case "$*" in
     if git -C "$CL_REPO" merge-base --is-ancestor "$head" "$base"; then echo behind
     elif git -C "$CL_REPO" merge-base --is-ancestor "$base" "$head"; then echo ahead
     else echo diverged; fi ;;
-  "api -X POST $R/statuses/"*) echo '{}' ;;
-  "api -X DELETE $R/git/refs/tags/"*) rm -f "$CL_REFS/${4#"$R"/git/refs/tags/}" ;;
+  "api -X POST $R/statuses/"*)
+    for a in "$@"; do
+      case "$a" in context=*) printf '%s\n' "${a#context=}" >>"$CL_REFS/.statuses-${4##*/}" ;; esac
+    done
+    echo '{}' ;;
+  "api --paginate $R/commits/"*"/statuses?per_page=100 --jq "*)
+    c=${3#"$R"/commits/}
+    cat "$CL_REFS/.statuses-${c%%/*}" 2>/dev/null || true ;;
+  "api -X DELETE $R/git/refs/tags/"*)
+    if [ -f "$CL_REFS/.refuse" ]; then echo "gh: Resource not accessible by integration (HTTP 403)" >&2; exit 1; fi
+    t=${4#"$R"/git/refs/tags/}
+    rm -f "$CL_REFS/$t"
+    git -C "$CL_REPO" tag -d "$t" >/dev/null 2>&1 || true ;;
   *) printf 'stub: unexpected gh %s\n' "$*" >&2; exit 22 ;;
 esac
 SH
@@ -3017,18 +3042,36 @@ claim_at() { # <commit> <version tag> <branch head> [channel]: replays release.y
   echo "$rc"
 }
 claimed_out() { jq -r '.steps.claim.outputs.claimed // "absent"' "$CL/claim-out.json"; }
-release_at() { # <commit> <version tag> <branch head at the claim> [channel] [branch head at finalize]: one release run, the claim job then, on a claim, finalize; rc echoed
+unclaim_at() { # <commit> <version tag>: replays release.yaml's unclaim job at the commit, appending to CL/events and CL/replay.log; rc echoed
+  local rc=0
+  jq -n --arg sha "$1" --arg tag "$2" '{
+    github: {repository: "owner/app", repository_owner: "owner", sha: $sha, server_url: "https://gh", run_id: "7", actor: "probe", token: "t", event: {}},
+    job: {workflow_repository: "cplieger/ci", workflow_sha: "0000000000000000000000000000000000000000"},
+    needs: {detect: {result: "success", outputs: {version: $tag}}},
+    inputs: {}, secrets: {}, matrix: {}}' >"$CL/unclaim-ctx.json"
+  PATH="$CL/bin:$PATH" GITHUB_SHA="$1" GITHUB_REPOSITORY=owner/app GITHUB_SERVER_URL=https://gh GITHUB_RUN_ID=7 \
+    python3 "$ROOT/scripts/workflow_replay.py" --workflow "$RELEASE_YAML" --job unclaim --actions-root "$ROOT" \
+    --context "$CL/unclaim-ctx.json" --cwd "$CL_REPO" --out "$CL/unclaim-out.json" >>"$CL/replay.log" 2>&1 || rc=$?
+  echo "$rc"
+}
+unclaim_rc() { cat "$CL/unclaim-rc"; }
+release_at() { # <commit> <version tag> <branch head at the claim> [channel] [branch head at finalize]: one release run, the claim job then, on a claim, finalize (CL_BUILD_FAIL=true: the build failed, so finalize never ran), then unclaim (its rc in CL/unclaim-rc); rc echoed
   local rc
   : >"$CL_EVENTS"
   : >"$CL/replay.log"
-  rm -f "$CL/claim-out.json" "$CL/out.json"
+  rm -f "$CL/claim-out.json" "$CL/out.json" "$CL/unclaim-rc"
   rc=$(claim_at "$1" "$2" "$3" "${4:-dev}")
   if [ "$rc" = 0 ] && [ "$(claimed_out)" = true ]; then
-    rc=$(finalize_at "$1" "$2" "${5:-$3}" "${4:-dev}")
+    if [ "${CL_BUILD_FAIL:-}" = true ]; then
+      rc=1
+    else
+      rc=$(finalize_at "$1" "$2" "${5:-$3}" "${4:-dev}")
+    fi
   fi
+  unclaim_at "$1" "$2" >"$CL/unclaim-rc"
   echo "$rc"
 }
-finalize_at() { # <commit> <version tag> <branch head> [channel]: replays finalize at the commit (CL_GATE_SKIP=true: the rebuild gate skipped a claim the claim job created), appending to CL/events and CL/replay.log; the result in CL/out.json, rc echoed
+finalize_at() { # <commit> <version tag> <branch head> [channel]: replays finalize at the commit (CL_GATE_SKIP=true: the rebuild gate skipped it), appending to CL/events and CL/replay.log; the result in CL/out.json, rc echoed
   local rc=0 channel=${4:-dev} branch=dev
   [ "$channel" = dev ] || branch=main
   cl_branch "$1" "$3" "$channel"
@@ -3036,7 +3079,7 @@ finalize_at() { # <commit> <version tag> <branch head> [channel]: replays finali
     github: {repository: "owner/app", repository_owner: "owner", sha: $sha, ref: "refs/heads/\($branch)", ref_name: $branch,
       server_url: "https://gh", run_id: "7", actor: "probe", token: "t", event: {}},
     job: {workflow_repository: "cplieger/ci", workflow_sha: "0000000000000000000000000000000000000000"},
-    inputs: {channel: $channel, "claim-created": ($skip == "true"), "image-name": "app", registries: "ghcr", "exclude-re": "", subpackages: "[]", binaries: "",
+    inputs: {channel: $channel, "image-name": "app", registries: "ghcr", "exclude-re": "", subpackages: "[]", binaries: "",
       version: ($tag | sub("-dev\\..*"; ""))},
     needs: {
       prepare: {result: "success", outputs: {publish: "true", tag: $tag, version: ($tag | sub("-dev\\..*"; "")),
@@ -3062,12 +3105,20 @@ claim_order() { # <tag> <commit> -> "claim<write" when the tag's create precedes
   w=$(line_of '^write ')
   if [ -n "$c" ] && [ -n "$w" ] && [ "$c" -lt "$w" ]; then echo "claim<write"; else echo "create line '${c}', first write line '${w}'"; fi
 }
-tagged() { # <tag> <commit>: the version as an earlier run left it, tagged at the commit
+claimed_unmarked() { # <tag> <commit>: a claim at the commit that nothing was written under
   printf '%s\n' "$2" >"$CL_REFS/$1"
   git -C "$CL_REPO" tag -f "$1" "$2" >/dev/null
 }
+tagged() { # <tag> <commit>: the version as an earlier run left it, tagged at the commit and written under
+  claimed_unmarked "$1" "$2"
+  printf 'release/claim/%s\n' "$1" >>"$CL_REFS/.statuses-$2"
+}
+marked() { # <tag> <commit> -> 1 when the commit carries the tag's release/claim status, else 0
+  if { cat "$CL_REFS/.statuses-$2" 2>/dev/null || true; } | grep -qxF "release/claim/$1"; then echo 1; else echo 0; fi
+}
+deletes_of() { grep -c "^gh api -X DELETE repos/owner/app/git/refs/tags/$1\$" "$CL_EVENTS" || true; }
 receipt_on() { grep -c "^gh api -X POST repos/owner/app/statuses/$1 -f state=success -f context=release/tag/$2 " "$CL_EVENTS" || true; }
-statuses_posted() { grep -c '^gh api -X POST repos/owner/app/statuses/' "$CL_EVENTS" || true; }
+statuses_posted() { grep '^gh api -X POST repos/owner/app/statuses/' "$CL_EVENTS" | grep -vc 'context=release/claim/' || true; }
 # knell's sequence: B lands (a workflow-editing sync) while A's run is queued
 # behind nothing, so A's create is refused; A publishes nothing under the
 # version and records where it went, and B's run then claims and publishes it.
@@ -3141,8 +3192,9 @@ chk "D-CL17 recording on A the later version and its commit, and no receipt" \
   "$(grep -c "^gh api -X POST repos/owner/app/statuses/$CL_A -f state=success -f context=release/handoff/v1.3.0-dev.3 -f description=v1.3.0-dev.2 at $CL_B " "$CL_EVENTS" || true)|$(receipt_on "$CL_A" v1.3.0-dev.3)" "1|0"
 rm -f "$CL_REFS/v1.3.0-dev.2"
 git -C "$CL_REPO" tag -d v1.3.0-dev.2 >/dev/null
-# A failure after the claim keeps it: the tag stays at the commit, unproven
-# (no receipt), so the commit's next attempt republishes it (compute.sh).
+# A failure after the first write keeps the claim: the verify step marked it,
+# so the tag stays at the commit, unproven (no receipt), and the commit's next
+# attempt republishes it (compute.sh).
 rm -f "$CL_REFS/v1.3.0-dev.1" "$CL_REFS/v1.3.0-dev.2"
 git -C "$CL_REPO" tag -d v1.3.0-dev.1 v1.3.0-dev.2 >/dev/null 2>&1 || true
 touch "$CL_REFS/.fail-write"
@@ -3150,12 +3202,13 @@ rc=$(release_at "$CL_A" v1.3.0-dev.1 "$CL_A")
 rm "$CL_REFS/.fail-write"
 chk "D-CL10 a dev run whose registry write fails after its claim fails, keeping the tag at its commit unproven" \
   "$rc|$(cat "$CL_REFS/v1.3.0-dev.1" 2>/dev/null)|$(statuses_posted)|$(grep -c -- '-X DELETE' "$CL_EVENTS" || true)" "1|$CL_A|0|0"
+chk "D-CL10 marked before that write, so the run's end keeps it" "$(marked v1.3.0-dev.1 "$CL_A")|$(unclaim_rc)" "1|0"
 rc=$(release_at "$CL_A" v1.3.0-dev.1 "$CL_A")
 chk "D-CL10 and the commit's next attempt reuses the claim and publishes" \
   "$rc|$(writes_of v1.3.0-dev.1)|$(grep -c '^gh api repos/owner/app/git/refs ' "$CL_EVENTS" || true)" "0|1|0"
 # Stable: the same claim, whose proof is the Release (Create release, later).
 rc=$(release_at "$CL_B" v1.3.0 "$CL_B" stable)
-chk "D-CL11 a stable run claims its version at its commit before its first write, posting no status" \
+chk "D-CL11 a stable run claims its version at its commit before its first write, posting no status but the claim's mark" \
   "$rc|$(cat "$CL_REFS/v1.3.0" 2>/dev/null)|$(claim_order v1.3.0 "$CL_B")|$(writes_of v1.3.0)|$(statuses_posted)" "0|$CL_B|claim<write|1|0"
 rc=$(release_at "$CL_A" v1.3.0 "$CL_B" stable)
 chk "D-CL12 a stable run holding a version tagged at another commit is refused, writing nothing" \
@@ -3164,8 +3217,8 @@ chk_has "D-CL12 naming both commits" "$(grep '::error::' "$CL/replay.log")" "Tag
 touch "$CL_REFS/.fail-write"
 rc=$(release_at "$CL_B" v1.3.0 "$CL_B" stable)
 rm "$CL_REFS/.fail-write"
-chk "D-CL13 a stable rerun at the tagged commit whose write fails keeps the claim" \
-  "$rc|$(cat "$CL_REFS/v1.3.0")|$(grep -c -- '-X DELETE' "$CL_EVENTS" || true)" "1|$CL_B|0"
+chk "D-CL13 a stable rerun at the tagged commit whose write fails keeps the claim, marked, through the run's end" \
+  "$rc|$(cat "$CL_REFS/v1.3.0")|$(grep -c -- '-X DELETE' "$CL_EVENTS" || true)|$(marked v1.3.0 "$CL_B")|$(unclaim_rc)" "1|$CL_B|0|1|0"
 rc=$(release_at "$CL_B" v1.3.0 "$CL_B" stable)
 chk "D-CL13 and the next one reuses it and publishes" \
   "$rc|$(writes_of v1.3.0)|$(grep -c '^gh api repos/owner/app/git/refs ' "$CL_EVENTS" || true)" "0|1|0"
@@ -3194,14 +3247,15 @@ cl_race() { # <version tag> <channel>: A's claim job with A the head, then final
   c=$(claim_at "$CL_A" "$1" "$CL_A" "$2")
   touch "$CL_REFS/.refuse"
   f=$(finalize_at "$CL_A" "$1" "$CL_B" "$2")
+  u=$(unclaim_at "$CL_A" "$1")
   rm "$CL_REFS/.refuse"
-  echo "$c|$(claimed_out)|$f"
+  echo "$c|$(claimed_out)|$f|$u"
 }
 for race in "stable v1.5.0" "dev v1.5.0-dev.1"; do
   ch=${race% *} v=${race#* }
   what=promotion && [ "$ch" = stable ] || what="dev merge"
   chk "D-CL19 a $what claims $v at its own commit before the sync lands, and publishes it after" \
-    "$(cl_race "$v" "$ch")|$(cat "$CL_REFS/$v" 2>/dev/null)|$(writes_of "$v")" "0|true|0|$CL_A|1"
+    "$(cl_race "$v" "$ch")|$(cat "$CL_REFS/$v" 2>/dev/null)|$(writes_of "$v")|$(deletes_of "$v")" "0|true|0|0|$CL_A|1|0"
   chk "D-CL19 the $what's run sends one ref create, the claim, and hands nothing off" \
     "$(grep -c '^gh api repos/owner/app/git/refs ' "$CL_EVENTS" || true)|$(grep -c 'context=release/handoff/' "$CL_EVENTS" || true)" "1|0"
   rc=$(release_at "$CL_B" "$v" "$CL_B" "$ch")
@@ -3219,29 +3273,56 @@ rc=$(release_at "$CL_A" v1.6.0 "$CL_B" stable)
 rm "$CL_REFS/.refuse"
 chk "D-CL21 a refused early claim hands off green, creating no tag and running no publish" \
   "$rc|$(claimed_out)|$([ -f "$CL_REFS/v1.6.0" ] && echo tagged)|$([ -f "$CL/out.json" ] && echo finalized)|$(grep -c '^write ' "$CL_EVENTS" || true)" "0|false|||0"
+chk "D-CL21 and its end deletes nothing" "$(unclaim_rc)|$(deletes_of v1.6.0)" "0|0"
 chk "D-CL21 recording the handoff on its commit" \
   "$(grep -c "^gh api -X POST repos/owner/app/statuses/$CL_A -f state=success -f context=release/handoff/v1.6.0 -f description=the run on $CL_B releases this commit's changes " "$CL_EVENTS" || true)" "1"
-# A rebuild the gate skips publishes nothing, so the claim the claim job made
-# is deleted rather than left unproven to stop the next stable run.
-: >"$CL_EVENTS"
-rc=$(CL_GATE_SKIP=true finalize_at "$CL_A" v1.7.0 "$CL_A" stable)
-chk "D-CL22 a skipped rebuild with no claim of its version deletes nothing" "$rc|$(grep -c -- '-X DELETE' "$CL_EVENTS" || true)" "0|0"
-tagged v1.7.0 "$CL_A"
-: >"$CL_EVENTS"
-rc=$(CL_GATE_SKIP=true finalize_at "$CL_A" v1.7.0 "$CL_A" stable)
-chk "D-CL22 a skipped rebuild deletes the claim at its commit and writes nothing" \
-  "$rc|$([ -f "$CL_REFS/v1.7.0" ] && echo tagged)|$(grep -c '^write ' "$CL_EVENTS" || true)" "0||0"
-tagged v1.7.0 "$CL_B"
-: >"$CL_EVENTS"
-rc=$(CL_GATE_SKIP=true finalize_at "$CL_A" v1.7.0 "$CL_A" stable)
-chk "D-CL22 and fails rather than delete a tag at another commit" "$rc|$(cat "$CL_REFS/v1.7.0")|$(grep -c -- '-X DELETE' "$CL_EVENTS" || true)" "1|$CL_B|0"
-rm -f "$CL_REFS/v1.7.0"
-git -C "$CL_REPO" tag -d v1.7.0 >/dev/null
+# A rebuild the gate skips publishes nothing, so the run's end deletes its
+# claim rather than leave it unproven to stop the next stable run, whether
+# this attempt created the tag or reused one an earlier attempt left unmarked.
+rc=$(CL_GATE_SKIP=true release_at "$CL_A" v1.7.0 "$CL_A" stable)
+chk "D-CL22 a skipped rebuild claims, writes and marks nothing, and its end deletes the claim" \
+  "$rc|$(unclaim_rc)|$(grep -c '^gh api repos/owner/app/git/refs ' "$CL_EVENTS" || true)|$(grep -c '^write ' "$CL_EVENTS" || true)|$(marked v1.7.0 "$CL_A")|$([ -f "$CL_REFS/v1.7.0" ] && echo tagged)|$(deletes_of v1.7.0)" \
+  "0|0|1|0|0||1"
+claimed_unmarked v1.7.0 "$CL_A"
+rc=$(CL_GATE_SKIP=true release_at "$CL_A" v1.7.0 "$CL_A" stable)
+chk "D-CL22 a rerun that reuses an earlier attempt's unmarked tag and skips again deletes it too" \
+  "$rc|$(unclaim_rc)|$(grep -c '^gh api repos/owner/app/git/refs ' "$CL_EVENTS" || true)|$([ -f "$CL_REFS/v1.7.0" ] && echo tagged)|$(deletes_of v1.7.0)" \
+  "0|0|0||1"
+# A build, image test or gate that fails after the claim ends the run before
+# its first write: its end deletes the claim, so the next commit's run takes
+# the version instead of stopping at an unproven tag (release-state.sh
+# receipts).
+for case in "stable v1.8.0" "dev v1.9.0-dev.1"; do
+  ch=${case% *} v=${case#* }
+  rc=$(CL_BUILD_FAIL=true release_at "$CL_A" "$v" "$CL_A" "$ch")
+  chk "D-CL24 a $ch run whose build fails after its claim writes nothing, and its end deletes the claim" \
+    "$rc|$(unclaim_rc)|$([ -f "$CL_REFS/$v" ] && echo tagged)|$(grep -c '^write ' "$CL_EVENTS" || true)|$(deletes_of "$v")" "1|0||0|1"
+  rc=$(release_at "$CL_B" "$v" "$CL_B" "$ch")
+  chk "D-CL24 the next $ch commit's run then claims $v at its own commit and publishes it" \
+    "$rc|$(cat "$CL_REFS/$v" 2>/dev/null)|$(claim_order "$v" "$CL_B")|$(writes_of "$v")|$(unclaim_rc)|$(deletes_of "$v")" "0|$CL_B|claim<write|1|0|0"
+  rm -f "$CL_REFS/$v"
+  git -C "$CL_REPO" tag -d "$v" >/dev/null
+done
+# When a sync lands during the build and the build then fails, GitHub refuses
+# the delete as it refuses the superseded run's ref create, so the run's end
+# fails red, naming the tag to delete by hand.
+rc=$(claim_at "$CL_A" v1.10.0 "$CL_A" stable)
+touch "$CL_REFS/.refuse"
+u=$(unclaim_at "$CL_A" v1.10.0)
+rm "$CL_REFS/.refuse"
+chk "D-CL25 an unused claim whose delete GitHub refuses stays, and the run's end fails" \
+  "$rc|$u|$(cat "$CL_REFS/v1.10.0")" "0|1|$CL_A"
+chk_has "D-CL25 naming the manual delete" "$(grep '::error::' "$CL/replay.log")" "Delete refs/tags/v1.10.0 by hand"
+rm -f "$CL_REFS/v1.10.0"
+git -C "$CL_REPO" tag -d v1.10.0 >/dev/null
 chk "D-CL23 the claim job runs right after detect, with the ref and status scopes alone" \
   "$(jq -c '[.needs, .permissions]' "$WORK/claim-job.json")" '["detect",{"contents":"write","statuses":"write"}]'
-chk "D-CL23 the image job publishes only on its claim, and drops a claim it created on a skipped rebuild" \
-  "$(jq -r '[."release-needed", ."claim-created"] | join("|")' "$WORK/docker-with.json")" \
-  "\${{ needs.claim.outputs.claimed == 'true' && 'true' || 'false' }}|\${{ needs.claim.outputs.created == 'true' }}"
+chk "D-CL23 the image job publishes only on its claim, and passes it nothing else" \
+  "$(jq -r '."release-needed"' "$WORK/docker-with.json")|$(jq -r 'keys | map(select(test("claim"))) | join(",")' "$WORK/docker-with.json")" \
+  "\${{ needs.claim.outputs.claimed == 'true' && 'true' || 'false' }}|"
+chk "D-CL23 the unclaim job follows every writer under the claim, whatever their result, with the ref scope and a statuses read" \
+  "$(jq -c '[.needs, .permissions, .if]' "$WORK/unclaim-job.json")" \
+  '[["detect","claim","docker","ts","subpackage"],{"contents":"write","statuses":"read"},"${{ always() && needs.claim.result != '"'"'skipped'"'"' }}"]'
 python3 - "$WORKFLOW" >"$CL/structure.txt" <<'PY'
 import sys, yaml
 jobs = yaml.safe_load(open(sys.argv[1]))["jobs"]
@@ -3311,7 +3392,9 @@ git -C "$CL_REPO" tag -d v1.4.0-dev.1 v1.4.0-dev.2 >/dev/null
 chk "D-CL9 the claim's check precedes npm's publish, which runs only on a held claim" \
   "$(jq -r '[."before-publish", ."publish-if", (."handoff-readers" | join(","))] | join("|")' "$CL/ts-claim.json")" \
   "true|\${{ steps.claim.outputs.claimed == 'true' }}|"
-chk "D-CL9 the claim job claims a TS root as it does an image" "$(jq -r '."early-if"' "$CL/ts-claim.json")" \
-  "\${{ needs.detect.outputs.type == 'docker' || needs.detect.outputs.type == 'ts' }}"
+chk "D-CL9 the claim job claims an image root and its subpackages, a TS root's own change, and no Go root" \
+  "$(jq -r 'to_entries | map("\(.key)=\(.value)") | join(" ")' "$WORK/claim-gate.json")" \
+  "docker/root=true docker/sub=true docker/none=false ts/root=true ts/sub=false ts/none=false go/root=false go/sub=false go/none=false"
+chk "D-CL9 and its claim step runs whenever the job does" "$(jq -r '."early-if"' "$CL/ts-claim.json")" ""
 
 echo "PASS ($PASS checks)"

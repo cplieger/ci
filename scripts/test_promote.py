@@ -1852,7 +1852,7 @@ class Preview(unittest.TestCase):
                     promote.GhError, f'^release-state.sh pending printed {why}$'
                 ),
             ):
-                promote.release_plan(Path('.'), 'm', 'r', promote.Layout('go', [], []))
+                promote.release_plan(Path('.'), 'demo', 'm', 'r', promote.Layout('go', [], []))
 
     def test_a_malformed_module_list_fails_the_release_plan(self):
         state = json.dumps({'.': {'h_tag': '', 'kind_note': '', 'in_range': False}})
@@ -1874,7 +1874,53 @@ class Preview(unittest.TestCase):
                 unittest.mock.patch.object(promote, 'run_tool', run_tool),
                 self.assertRaisesRegex(promote.GhError, 'printed malformed go_modules_to_release$'),
             ):
-                promote.release_plan(Path('.'), 'm', 'r', promote.Layout('go', [], []))
+                promote.release_plan(Path('.'), 'demo', 'm', 'r', promote.Layout('go', [], []))
+
+    def test_the_root_kind_line_is_read_with_the_token_and_proofs(self):
+        state = json.dumps({'.': {'h_tag': '', 'kind_note': '', 'in_range': False}})
+        kind_calls = []
+
+        def run_tool(clone, script, *args, token=False, **env):
+            if args == ('pending',):
+                return {'state': state, 'root_in_range': 'false', 'in_range_any': 'false'}
+            if args == ('kind-note',):
+                kind_calls.append((token, env.get('GITHUB_REPOSITORY'), env.get('STATE')))
+                return {'kind_note': 'Promoted from `v1.1.0-dev.1`'}
+            if script == promote.COMPUTE:
+                return {'anchor_sha': 'a' * 40, 'base': 'v1.1.0'}
+            return {
+                'root_changed': 'true',
+                'subpackages_to_publish': '[]',
+                'go_modules_to_release': '[]',
+            }
+
+        with (
+            unittest.mock.patch.object(promote, 'run_tool', run_tool),
+            unittest.mock.patch.object(promote, 'held_lanes', return_value={}),
+            unittest.mock.patch.object(promote.inventory, 'Repo'),
+        ):
+            plan = promote.release_plan(
+                Path('.'), 'demo', 'm', 'r', promote.Layout('docker', [], [])
+            )
+        self.assertEqual(kind_calls, [(True, f'{promote.OWNER}/demo', state)])
+        self.assertEqual(plan['.']['kind_note'], 'Promoted from `v1.1.0-dev.1`')
+
+    def test_only_a_token_run_tool_keeps_the_token(self):
+        seen = []
+
+        def run(cmd, **kw):
+            seen.append(kw['env'].get('GH_TOKEN'))
+            return subprocess.CompletedProcess(cmd, 0, '', '')
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            unittest.mock.patch.dict(os.environ, {'GH_TOKEN': 'test-key'}),
+            unittest.mock.patch.object(promote.subprocess, 'run', run),
+        ):
+            clone = Path(tmp) / 'demo'
+            promote.run_tool(clone, Path('x.sh'))
+            promote.run_tool(clone, Path('x.sh'), token=True)
+        self.assertEqual(seen, [None, 'test-key'])
 
     def test_the_root_version_is_scoped_by_the_layouts_lanes_and_type(self):
         state = json.dumps({'.': {'h_tag': '', 'kind_note': '', 'in_range': False}})
@@ -1892,7 +1938,7 @@ class Preview(unittest.TestCase):
             unittest.mock.patch.object(promote, 'run_tool', run_tool),
             self.assertRaisesRegex(promote.GhError, 'printed no go_modules_to_release$'),
         ):
-            promote.release_plan(Path('.'), 'm', 'r', promote.Layout('go', [], ['alpha']))
+            promote.release_plan(Path('.'), 'demo', 'm', 'r', promote.Layout('go', [], ['alpha']))
         self.assertEqual(
             (seen.get('GO_LANES_JSON'), seen.get('REPO_TYPE'), seen.get('CHANNEL')),
             ('["alpha"]', 'go', 'stable'),

@@ -14,6 +14,7 @@ SCRIPTS = pathlib.Path(__file__).resolve().parent
 
 GH_STUB = r"""#!/usr/bin/env python3
 import json, os, sys
+COMMIT = 'c' * 40
 state_path = os.environ['STUB_STATE']
 state = json.load(open(state_path))
 args = sys.argv[1:]
@@ -37,8 +38,16 @@ if args[:1] == ['api'] and args[1] == 'repos/o/app/git/ref/heads/dev':
 if args[:4] == ['api', '-X', 'POST', f'repos/o/app/statuses/{args[3].rsplit("/", 1)[-1]}']:
     if state.get('status_fail'):
         done(1, err='gh: Server Error (HTTP 502)\n')
+    fields = dict(a.split('=', 1) for a in args[4:] if '=' in a)
+    state.setdefault('statuses', []).append(fields['context'])
     done(0, '{}\n')
+if args[:3] == ['api', '--paginate', f'repos/o/app/commits/{COMMIT}/statuses?per_page=100']:
+    if state.get('status_read_fail'):
+        done(1, err='gh: Server Error (HTTP 502)\n')
+    done(0, ''.join(f'{c}\n' for c in state.get('statuses', [])))
 if args[:3] == ['api', '-X', 'DELETE'] and args[3].startswith('repos/o/app/git/refs/tags/'):
+    if state.get('delete_fail'):
+        done(1, err='gh: Resource not accessible by integration (HTTP 403)\n')
     state['tags'].pop(args[3].removeprefix('repos/o/app/git/refs/tags/'), None)
     done(0)
 if args[:2] == ['api', 'repos/o/app/git/refs']:
@@ -373,16 +382,19 @@ class ClaimUnderALaterDevTag(unittest.TestCase):
 
 
 class ClaimCheck(unittest.TestCase):
-    """claim_held and claim_drop: a publishing job reads the claim job's tag, never creating one."""
+    """claim_held and claim_unused: a publishing job reads the claim job's tag, never creating
+    one, and marks it before its first write; the run's end deletes an unmarked claim."""
 
-    def run_claim(self, call, tags=None, read_fail=False):
+    def run_claim(self, call, tags=None, statuses=(), **fail):
         tmp = pathlib.Path(tempfile.mkdtemp(prefix='claim-'))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         (tmp / 'gh').write_text(GH_STUB)
         (tmp / 'gh').chmod(0o755)
         state = tmp / 'state.json'
         state.write_text(
-            json.dumps({'tags': tags or {}, 'creates': [], 'calls': [], 'read_fail': read_fail})
+            json.dumps(
+                {'tags': tags or {}, 'creates': [], 'calls': [], 'statuses': list(statuses), **fail}
+            )
         )
         out = tmp / 'out'
         out.write_text('')
@@ -409,52 +421,92 @@ class ClaimCheck(unittest.TestCase):
         writes = [
             c for c in doc['calls'] if c[:2] == ['api', 'repos/o/app/git/refs'] or 'DELETE' in c
         ]
-        return res.stdout, out.read_text(), doc['tags'], writes
+        return res.stdout, out.read_text(), doc['tags'], writes, doc['statuses']
 
-    def test_a_tag_at_this_commit_is_held(self):
-        stdout, out, tags, writes = self.run_claim('claim_held', tags={'v1.2.0': COMMIT})
+    def test_a_tag_at_this_commit_is_held_and_marked_before_any_write(self):
+        stdout, out, tags, writes, statuses = self.run_claim('claim_held', tags={'v1.2.0': COMMIT})
         self.assertEqual(
-            (stdout, out, tags, writes), ('rc=0\n', 'claimed=true\n', {'v1.2.0': COMMIT}, [])
+            (stdout, out, tags, writes, statuses),
+            ('rc=0\n', 'claimed=true\n', {'v1.2.0': COMMIT}, [], ['release/claim/v1.2.0']),
         )
 
+    def test_a_mark_github_refuses_fails_closed(self):
+        stdout, out, _, _, statuses = self.run_claim(
+            'claim_held', tags={'v1.2.0': COMMIT}, status_fail=True
+        )
+        self.assertIn('::error::the release/claim/v1.2.0 status was not posted', stdout)
+        self.assertEqual((stdout[-5:], out, statuses), ('rc=1\n', '', []))
+
     def test_a_tag_at_another_commit_fails_closed(self):
-        stdout, out, _, writes = self.run_claim('claim_held', tags={'v1.2.0': 'b' * 40})
+        stdout, out, _, writes, statuses = self.run_claim('claim_held', tags={'v1.2.0': 'b' * 40})
         self.assertIn(
             f"::error::tag v1.2.0 is at {'b' * 40}, not this run's commit {COMMIT}", stdout
         )
-        self.assertEqual((stdout[-5:], out, writes), ('rc=1\n', '', []))
+        self.assertEqual((stdout[-5:], out, writes, statuses), ('rc=1\n', '', [], []))
 
-    def test_an_absent_tag_fails_closed_and_is_never_created(self):
-        stdout, out, tags, writes = self.run_claim('claim_held')
-        self.assertIn(f"::error::tag v1.2.0 is at <none>, not this run's commit {COMMIT}", stdout)
-        self.assertEqual((stdout[-5:], out, tags, writes), ('rc=1\n', '', {}, []))
+    def test_an_absent_tag_fails_closed_naming_the_full_rerun(self):
+        stdout, out, tags, writes, statuses = self.run_claim('claim_held')
+        self.assertIn('::error::tag v1.2.0 does not exist', stdout)
+        self.assertIn('rerun all jobs so the claim job claims it again', stdout)
+        self.assertEqual((stdout[-5:], out, tags, writes, statuses), ('rc=1\n', '', {}, [], []))
 
     def test_an_unreadable_tag_fails_closed_after_the_retries(self):
-        stdout, out, _, writes = self.run_claim(
+        stdout, out, _, writes, statuses = self.run_claim(
             'claim_held', tags={'v1.2.0': COMMIT}, read_fail=True
         )
         self.assertIn('::error::tag v1.2.0 cannot be read', stdout)
-        self.assertEqual((stdout[-5:], out, writes), ('rc=1\n', '', []))
+        self.assertEqual((stdout[-5:], out, writes, statuses), ('rc=1\n', '', [], []))
 
-    def test_a_dropped_claim_deletes_this_commits_tag(self):
-        stdout, _, tags, writes = self.run_claim('claim_drop', tags={'v1.2.0': COMMIT})
-        self.assertEqual((stdout, tags), ('rc=0\n', {}))
+    def test_an_unmarked_claim_at_this_commit_is_deleted(self):
+        stdout, _, tags, writes, _ = self.run_claim('claim_unused', tags={'v1.2.0': COMMIT})
+        self.assertIn("so this run's claim of it is deleted", stdout)
+        self.assertEqual((stdout[-5:], tags), ('rc=0\n', {}))
         self.assertEqual(writes, [['api', '-X', 'DELETE', 'repos/o/app/git/refs/tags/v1.2.0']])
 
-    def test_a_dropped_claim_leaves_another_commits_tag(self):
-        stdout, _, tags, writes = self.run_claim('claim_drop', tags={'v1.2.0': 'b' * 40})
-        self.assertIn("not this run's claim to delete", stdout)
-        self.assertEqual((stdout[-5:], tags, writes), ('rc=1\n', {'v1.2.0': 'b' * 40}, []))
+    def test_a_marked_claim_stays(self):
+        stdout, _, tags, writes, _ = self.run_claim(
+            'claim_unused', tags={'v1.2.0': COMMIT}, statuses=['release/claim/v1.2.0']
+        )
+        self.assertIn('a release run wrote under tag v1.2.0', stdout)
+        self.assertEqual((stdout[-5:], tags, writes), ('rc=0\n', {'v1.2.0': COMMIT}, []))
 
-    def test_a_dropped_claim_already_gone_is_done(self):
-        self.assertEqual(self.run_claim('claim_drop')[0::3], ('rc=0\n', []))
+    def test_another_versions_mark_does_not_keep_the_claim(self):
+        _, _, tags, writes, _ = self.run_claim(
+            'claim_unused',
+            tags={'v1.2.0': COMMIT},
+            statuses=['release/claim/v1.1.0', 'release/handoff/v1.2.0'],
+        )
+        self.assertEqual((tags, len(writes)), ({}, 1))
 
-    def test_a_dropped_claim_github_cannot_read_is_kept(self):
-        stdout, _, tags, writes = self.run_claim(
-            'claim_drop', tags={'v1.2.0': COMMIT}, read_fail=True
+    def test_another_commits_tag_is_left_alone(self):
+        stdout, _, tags, writes, _ = self.run_claim('claim_unused', tags={'v1.2.0': 'b' * 40})
+        self.assertIn('so this run holds no claim of it', stdout)
+        self.assertEqual((stdout[-5:], tags, writes), ('rc=0\n', {'v1.2.0': 'b' * 40}, []))
+
+    def test_an_absent_tag_needs_no_delete(self):
+        stdout, _, _, writes, _ = self.run_claim('claim_unused')
+        self.assertEqual((stdout[-5:], writes), ('rc=0\n', []))
+
+    def test_an_unreadable_tag_is_kept_and_fails(self):
+        stdout, _, tags, writes, _ = self.run_claim(
+            'claim_unused', tags={'v1.2.0': COMMIT}, read_fail=True
         )
         self.assertIn('::error::tag v1.2.0 cannot be read', stdout)
         self.assertEqual((stdout[-5:], tags, writes), ('rc=1\n', {'v1.2.0': COMMIT}, []))
+
+    def test_unreadable_statuses_keep_the_tag_and_fail(self):
+        stdout, _, tags, writes, _ = self.run_claim(
+            'claim_unused', tags={'v1.2.0': COMMIT}, status_read_fail=True
+        )
+        self.assertIn('so tag v1.2.0 is kept and may be an unused claim', stdout)
+        self.assertEqual((stdout[-5:], tags, writes), ('rc=1\n', {'v1.2.0': COMMIT}, []))
+
+    def test_a_refused_delete_fails_naming_the_manual_delete(self):
+        stdout, _, tags, _, _ = self.run_claim(
+            'claim_unused', tags={'v1.2.0': COMMIT}, delete_fail=True
+        )
+        self.assertIn('Delete refs/tags/v1.2.0 by hand', stdout)
+        self.assertEqual((stdout[-5:], tags), ('rc=1\n', {'v1.2.0': COMMIT}))
 
 
 class BranchMovedPast(unittest.TestCase):

@@ -295,10 +295,8 @@ writers = [n for n, j in jobs.items() if n not in EXEMPT and (
     or {k for k, v in (j.get("permissions") or {}).items() if v == "write"} & {"id-token", "packages", "contents"})]
 facts["stable-writers"] = writers
 # A job whose condition has no status function runs as success(): only when
-# every job it needs succeeded. The claim job writes only through its claim
-# step, which claims an image or TS root and leaves a Go root's tag to the go
-# job; a claim that ran is taken (a refused one is test-docker-release.sh's).
-claim_step_if = step(jobs, "claim", "Claim the version")["if"]
+# every job it needs succeeded. A claim job that ran takes its claim (a
+# refused one is test-docker-release.sh's).
 def simulate(gates, outs):
     res = {"detect": "success", **gates}
     job_outs = {"claim": {}}
@@ -312,13 +310,15 @@ def simulate(gates, outs):
             runs = all(res.get(d) == "success" for d in needs) and ev(cond, res, outs, job_outs)
         res[n] = "success" if runs else "skipped"
         if n == "claim" and runs:
-            job_outs["claim"] = {"claimed": "true", "created": "true"} if ev(claim_step_if, res, outs) else {}
-    return " ".join(n for n in writers if res[n] == "success" and (n != "claim" or job_outs["claim"]))
+            job_outs["claim"] = {"claimed": "true"}
+    return " ".join(n for n in writers if res[n] == "success")
 sim = {}
 for t in ("docker", "go", "ts"):
     outs = {"type": t, "channel": "stable", "mode": "normal", "release": "true", "root_changed": "true", "subpackages_to_publish": '["web"]', "go_modules_to_release": '["yamlenv"]', "halves_to_publish": '["yamlenv"]'}
     for r, b in (("success", "success"), ("skipped", "skipped"), ("failure", "skipped"), ("skipped", "failure"), ("cancelled", "skipped")):
         sim[f"{t} repair={r} barrier={b}"] = simulate({"repair": r, "barrier": b}, outs)
+outs = {"type": "ts", "channel": "stable", "mode": "normal", "release": "true", "root_changed": "false", "subpackages_to_publish": '["web"]', "go_modules_to_release": "[]", "halves_to_publish": "[]"}
+sim["ts subpackage only"] = simulate({"repair": "skipped", "barrier": "skipped"}, outs)
 for r in ("true", "false"):
     outs = {"type": "none", "channel": "stable", "mode": "normal", "release": r, "root_changed": "true", "subpackages_to_publish": "[]", "go_modules_to_release": '["alpha", "beta"]', "halves_to_publish": '["alpha"]'}
     sim[f"none release={r}"] = simulate({"repair": "skipped", "barrier": "skipped"}, outs)
@@ -762,10 +762,10 @@ pending_at() { # <dir> <channel> -> the state JSON; outputs in $WORK/out
   sed -n 's/^state=//p' "$WORK/out"
 }
 outkey() { sed -n "s/^$1=//p" "$WORK/out" | head -1; }
-kind_at() { # <dir> <state> [repo type] [tags] -> the root's kind line the claim job writes from pending's state; refused on a failure, its log in WORK/kind.log
+kind_at() { # <dir> <state> [repo type] -> the root's kind line the claim job writes from pending's state; refused on a failure, its log in WORK/kind.log
   local o="$WORK/kind-out"
   : >"$o"
-  (cd "$1" && STATE="$2" REPO_TYPE="${3:-go}" GITHUB_OUTPUT="$o" bash "$RS" kind-note ${4:+"$4"}) >"$WORK/kind.log" 2>&1 || {
+  (cd "$1" && STATE="$2" REPO_TYPE="${3:-go}" GITHUB_OUTPUT="$o" bash "$RS" kind-note) >"$WORK/kind.log" 2>&1 || {
     echo refused
     return 0
   }
@@ -833,7 +833,10 @@ s=$(pending_at "$O" stable)
 chk "P1 at R a root promotion is pending for the root" "$(lane . commit "$s")" "$R1"
 chk "P1 and in this run's range" "$(lane . in_range "$s")|$(outkey root_in_range)|$(outkey in_range_any)" "true|true|true"
 chk "P1 the root kind line names the promoted dev build" "$(kind_at "$O" "$s")" 'Promoted from `v1.1.0-dev.1`'
-chk "P1 which pending leaves to the claim job, which holds a token" "$(outkey root_kind_note)|$(lane . kind_note "$s")" "|"
+chk "P1 which pending writes itself for a Go root, whose dev tags need no proof" "$(outkey root_kind_note)|$(lane . kind_note "$s")" \
+  'Promoted from `v1.1.0-dev.1`|Promoted from `v1.1.0-dev.1`'
+s_img=$(REPO_TYPE=docker pending_at "$O" stable)
+chk "P1 and leaves to the claim job, which holds a token, for an image root" "$(outkey root_kind_note)|$(lane . kind_note "$s_img")" "|"
 chk "P2 a root-only R leaves the nested lane non-pending" "$(lane yamlenv commit "$s")|$(lane yamlenv in_range "$s")" "|false"
 chk "P2 and the lane's kind line is the main-built one" "$(lane yamlenv kind_note "$s")" \
   'Built from `main` for dependency and system-package updates'
@@ -852,30 +855,38 @@ pending_failing() { # <N> -> ran|refused, a stable pending run at S1 whose tag l
   (cd "$O" && failing_tag_read "$1" env CHANNEL=stable GITHUB_OUTPUT="$WORK/out" bash "$RS" pending) >"$WORK/pending.log" 2>&1 \
     && echo ran || echo refused
 }
-kind_failing() { # <N> -> the kind line, or refused, at S1 when the claim job's tag listing N fails
-  failing_tag_read "$1" kind_at "$O" "$S4_STATE"
+kind_failing() { # <N> -> the kind line, or refused, at S1 when the claim job's tag listing N fails for an image root
+  failing_tag_read "$1" kind_at "$O" "$S4_STATE" docker
 }
-# The root lane lists its stable tags (1), then the stable tags below its
-# highest (2); the claim job lists its dev tags for the kind line.
+# The Go root lists its stable tags (1), its dev tags for the kind line (2),
+# then the stable tags below its highest (3).
 chk "P11 a stable tag list git cannot read stops the run" "$(pending_failing 1)" "refused"
 chk_has "P11 and names the lane" "$(cat "$WORK/pending.log")" "cannot read lane .'s stable tags"
-chk "P12 a dev tag list git cannot read for the kind line stops the claim job" "$(kind_failing 1)" "refused"
-chk_has "P12 and names the root" "$(cat "$WORK/kind.log")" "cannot find the root's promoted dev build for its kind line"
-chk "P13 so does the stable tag list below the highest stable" "$(pending_failing 2)" "refused"
+chk "P12 a dev tag list git cannot read for the kind line stops the run" "$(pending_failing 2)" "refused"
+chk_has "P12 and names the lane" "$(cat "$WORK/pending.log")" "cannot find lane .'s promoted dev build for its kind line"
+chk "P12 and an image root's claim job" "$(kind_failing 1)" "refused"
+chk_has "P12 naming the root" "$(cat "$WORK/kind.log")" "cannot find the root's promoted dev build for its kind line"
+chk "P13 so does the stable tag list below the highest stable" "$(pending_failing 3)" "refused"
 chk_has "P13 and names the lane" "$(cat "$WORK/pending.log")" "cannot read lane .'s stable tags"
 pending_git_failing() { # <argv glob> <N> -> ran|refused, a stable pending run at S1 whose Nth matching git call fails
   (cd "$O" && failing_git "$1" "$2" env CHANNEL=stable GITHUB_OUTPUT="$WORK/out" bash "$RS" pending) >"$WORK/pending.log" 2>&1 \
     && echo ran || echo refused
 }
-chk "P14 a history git cannot walk to the kind line's dev build stops the claim job" \
-  "$(failing_git 'rev-list --topo-order *' 1 kind_at "$O" "$S4_STATE")|$(git_calls)" "refused|1"
-chk_has "P14 and names the root" "$(cat "$WORK/kind.log")" "cannot find the root's promoted dev build for its kind line"
+chk "P14 a history git cannot walk to the kind line's dev build stops the run" \
+  "$(pending_git_failing 'rev-list --topo-order *' 1)|$(git_calls)" "refused|1"
+chk_has "P14 and names the lane" "$(cat "$WORK/pending.log")" "cannot find lane .'s promoted dev build for its kind line"
+chk "P14 and an image root's claim job" \
+  "$(failing_git 'rev-list --topo-order *' 1 kind_at "$O" "$S4_STATE" docker)|$(git_calls)" "refused|1"
+chk_has "P14 naming the root" "$(cat "$WORK/kind.log")" "cannot find the root's promoted dev build for its kind line"
 # With no dev tag to look for, only kind_note sees git fail to read R's second parent.
 git -C "$O" tag -d v1.1.0-dev.1 >/dev/null
-got=$(failing_git 'rev-parse *^2' 1 kind_at "$O" "$S4_STATE")
+got=$(pending_git_failing 'rev-parse *^2' 1)
+got_kind=$(failing_git 'rev-parse *^2' 1 kind_at "$O" "$S4_STATE" docker)
 git -C "$O" tag v1.1.0-dev.1 "$D1"
-chk "P15 a promoted commit git cannot read stops the claim job" "$got|$(git_calls)" "refused|1"
-chk_has "P15 and names the root" "$(cat "$WORK/kind.log")" "cannot find the root's promoted dev build for its kind line"
+chk "P15 a promoted commit git cannot read stops the run" "$got|$(git_calls)" "refused|1"
+chk_has "P15 and names the lane" "$(cat "$WORK/pending.log")" "cannot find lane .'s promoted dev build for its kind line"
+chk "P15 and an image root's claim job" "$got_kind" "refused"
+chk_has "P15 naming the root" "$(cat "$WORK/kind.log")" "cannot find the root's promoted dev build for its kind line"
 # An image or TS root's dev tag is a claim, so the kind line names the nearest
 # proven one: an unproven or handed-off claim never shipped the build it names.
 git -C "$O" tag v1.1.0-dev.2 "$D1"
@@ -892,9 +903,6 @@ chk "P20 a Go root's dev tag is its publication, so it needs no receipt" "$(kind
   'Built from `main`, including the promotion of `v1.1.0-dev.2`'
 touch "$GH_DIR/fail-statuses"
 chk "P20 statuses GitHub cannot read stop the claim job rather than guess" "$(kind_at "$O" "$S4_STATE" docker)" "refused"
-chk "P20 the token-free promotion preview reads the tags alone" "$(kind_at "$O" "$S4_STATE" docker tags)" \
-  'Built from `main`, including the promotion of `v1.1.0-dev.2`'
-chk "P20 and kind-note takes no other argument" "$(kind_at "$O" "$S4_STATE" docker proven)" "refused"
 rm "$GH_DIR/fail-statuses" "$GH_DIR/statuses-$D1.json"
 git -C "$O" tag -d v1.1.0-dev.2 >/dev/null
 chk "P16 a lane list that is not JSON stops the run" \
@@ -1159,8 +1167,10 @@ git -C "$O" tag yamlenv/v1.1.0 "$R2"
 STATE_R2=$(pending_at "$O" stable)
 chk "R0 the lane's repair kind line is its promotion's" "$(lane yamlenv repair_kind_note "$STATE_R2")" \
   'Promoted from `yamlenv/v1.0.1-dev.1`'
-chk "R0 the root's is left to receipts, which hold a token, with the promotion it carried" \
-  "$(lane . repair_kind_note "$STATE_R2")|$(lane . repair_commit "$STATE_R2")" "|$R1"
+chk "R0 a Go root's is main-built with the promotion it carried" "$(lane . repair_kind_note "$STATE_R2")|$(lane . repair_commit "$STATE_R2")" \
+  'Built from `main`, including the promotion of `v1.1.0-dev.1`|'"$R1"
+chk "R0 an image root's is left to receipts, which hold a token" \
+  "$(lane . repair_kind_note "$(REPO_TYPE=docker pending_at "$O" stable)")" ""
 printf '[{"context":"release/complete/v1.1.0","state":"success"}]\n' >"$GH_DIR/statuses-$S1.json"
 printf '[{"context":"release/complete/yamlenv/v1.1.0","state":"pending"},{"context":"release/tag/yamlenv/v1.1.0","state":"success"}]\n' >"$GH_DIR/statuses-$R2.json"
 cat >"$GH_DIR/pulls.json" <<JSON
@@ -3488,8 +3498,9 @@ chk_has "W6 repair runs only on repairs owed" "$(fact '."jobif:repair"')" "needs
 chk_has "W6 as does its notes job" "$(fact '."jobif:repair-notes"')" "needs.detect.outputs.repairs != '[]'"
 GATE="!cancelled() && needs.detect.result == 'success' && (needs.repair.result == 'success' || needs.repair.result == 'skipped') && (needs.barrier.result == 'success' || needs.barrier.result == 'skipped')"
 for job in docker go ts go-nested; do
-  want="detect claim repair barrier" && [ "$job" != go-nested ] || want="detect repair barrier"
-  chk "W7 $job waits for the repair and the barrier, a root job for the claim too" "$(fact ".\"needs:$job\" | join(\" \")")" "$want"
+  want="detect claim repair barrier"
+  case "$job" in go | go-nested) want="detect repair barrier" ;; esac
+  chk "W7 $job waits for the repair and the barrier, an image or TS root job for the claim too" "$(fact ".\"needs:$job\" | join(\" \")")" "$want"
   chk_has "W7 $job runs when both were skipped" "$(fact ".\"jobif:$job\"")" "$GATE"
 done
 chk_has "W7 go-nested publishes nothing in renumber mode" "$(fact '."jobif:go-nested"')" "needs.detect.outputs.mode != 'renumber'"
@@ -3618,19 +3629,23 @@ chk_has "W22 said on stderr with the error" "$(cat "$WORK/rex.err")" \
 gh: HTTP 502"
 rm "$GH_DIR/fail-release"
 chk "W21 every job that writes a registry, a tag or a Release on a stable run is simulated" \
-  "$(fact '."stable-writers" | join(" ")')" "claim docker go ts subpackage go-nested lane-halves"
+  "$(fact '."stable-writers" | join(" ")')" "claim docker go ts subpackage unclaim go-nested lane-halves"
 # An image or TS root's version is claimed right after detect, before either
-# gate, so a push during the build cannot take it; the claim alone stays
-# unproven until a rerun publishes it (test-docker-release.sh D-CL10).
+# gate, so a push during the build cannot take it, and the unclaim job then
+# runs whatever the gates did: it deletes a claim nothing was written under
+# (test-docker-release.sh D-CL22, D-CL24). A Go root tags in its own job.
 for t in docker go ts; do
-  claim="claim " && [ "$t" != go ] || claim=""
+  claim="claim " unclaim=" unclaim"
+  [ "$t" != go ] || claim="" unclaim=""
   chk "W21 a $t repo publishes once both gates passed or were skipped" \
     "$(fact ".\"gate-sim\".\"$t repair=success barrier=success\"")|$(fact ".\"gate-sim\".\"$t repair=skipped barrier=skipped\"")" \
-    "${claim}$t subpackage go-nested lane-halves|${claim}$t subpackage go-nested lane-halves"
+    "${claim}$t subpackage${unclaim} go-nested lane-halves|${claim}$t subpackage${unclaim} go-nested lane-halves"
   for g in "repair=failure barrier=skipped" "repair=skipped barrier=failure" "repair=cancelled barrier=skipped"; do
-    chk "W21 a $t repo writes nothing but its root's claim when $g" "$(fact ".\"gate-sim\".\"$t $g\"")" "${claim% }"
+    chk "W21 a $t repo writes nothing but its root's claim and its check when $g" "$(fact ".\"gate-sim\".\"$t $g\"")" "${claim}${unclaim# }"
   done
 done
+chk "W21 a TS root's subpackage-only release publishes the subpackage with no root claim" \
+  "$(fact '."gate-sim"."ts subpackage only"')" "subpackage"
 chk "W21 a root-less repo releases only its lanes, whatever the root's release flag" \
   "$(fact '."gate-sim"."none release=true"')|$(fact '."gate-sim"."none release=false"')" "go-nested lane-halves|go-nested lane-halves"
 chk "W21 a lane's TS half publishes only when detect names it, and never in a renumber run" \
@@ -3842,8 +3857,8 @@ chk "W27 only repair-assets passes repair-tag, which docker-release.yaml's repai
 chk_has "W27 and the docker receipt job runs on stable alone" "$(fact '."dr-receipt-if"')" "&& inputs.channel == 'stable' &&"
 chk "W9 every git-cliff step is token-free" "$(fact '."token-free" | [.[] | length] | add')" "0"
 chk "W9 every notes site renders through render-notes.sh" "$(fact '.renders | [.[]] | all')" "true"
-chk "W10 the root kind line replaces the promotion note, written by the claim job" \
-  "$(fact '.outputs | has("promotion_note")')|$(fact '.outputs | has("release_kind_note")')" 'false|false'
+chk "W10 the root kind line replaces the promotion note, a Go root's from pending" "$(fact '.outputs | has("promotion_note")')|$(fact '.outputs.release_kind_note')" \
+  'false|${{ steps.pending.outputs.root_kind_note }}'
 chk "W11 pending promotions join the publication on stable runs with one in range" "$(fact '."if:publish"')" \
   "steps.channel.outputs.channel == 'stable' && steps.pending.outputs.in_range_any == 'true'"
 chk "W11 between the path diff and the release decision" "$(fact '."publish-after"')" "true"

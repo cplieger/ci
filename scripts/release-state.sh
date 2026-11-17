@@ -189,17 +189,16 @@ newest_affecting() { # <from> <to> <key> -> the newest reconciliation of from..t
   printf '%s' "$found"
 }
 # A docker or TS root's dev tag is a claim that may never have been published
-# or may have been handed off, so its kind line needs a token: the root's is
-# written by cmd_kind_note and cmd_receipts, a lane's by cmd_pending.
-kind_note() { # <release commit> <pending R or ''> <key> [tags] -> the release body's opening kind line, naming only a proven dev build (with tags, the nearest dev tag, proven or not); fails with git rev-parse or nearest_dev_tag
-  local t d from proof=proven
-  [ "${4:-}" != tags ] || proof=""
+# or may have been handed off, so its kind line needs a token: cmd_kind_note
+# and cmd_receipts write it, and cmd_pending every other lane's.
+kind_note() { # <release commit> <pending R or ''> <key> -> the release body's opening kind line, naming only a proven dev build; fails with git rev-parse or nearest_dev_tag
+  local t d from
   if [ -z "$2" ]; then
     printf '%s' "$BUILT_FROM_MAIN"
     return 0
   fi
   t=$(git rev-parse "$2^2") || return 1
-  d=$(nearest_dev_tag "$t" "$3" ${proof:+"$proof"}) || return 1
+  d=$(nearest_dev_tag "$t" "$3" proven) || return 1
   if [ -n "$d" ]; then from="\`$d\`"; else from="\`dev\` at \`${t:0:12}\`"; fi
   if [ "$1" = "$2" ]; then
     printf 'Promoted from %s' "$from"
@@ -235,13 +234,13 @@ cmd_pending() {
     in_range=false kind="" repair_kind="" prev_r=""
     if [ "$CHANNEL" = stable ]; then
       [ -z "$r" ] || in_range=true
-      if [ "$key" != . ]; then
+      if ! claims_proof "$key"; then
         kind=$(kind_note "$head" "$r" "$key") || die "cannot find lane ${key}'s promoted dev build for its kind line"
       fi
       if [ -n "$h_tag" ]; then
         prev=$(highest_stable "$key" "$(core "$h_tag")") || die "cannot read lane ${key}'s stable tags"
         prev_r=$(newest_affecting "${prev#* }" "$h_commit" "$key") || die "cannot tell which of lane ${key}'s promotions up to ${h_tag} it published"
-        if [ "$key" != . ]; then
+        if ! claims_proof "$key"; then
           repair_kind=$(kind_note "$h_commit" "$prev_r" "$key") || die "cannot find lane ${key}'s promoted dev build for its kind line"
         fi
       fi
@@ -257,17 +256,14 @@ cmd_pending() {
     "any=$(jq -r 'any(.[]; .commit != "")' <<<"$state")" \
     "in_range_any=$(jq -r 'any(.[]; .in_range)' <<<"$state")" \
     "root_in_range=$(jq -r '.["."].in_range // false' <<<"$state")" \
-    "root_commit=$(jq -r '.["."].commit // ""' <<<"$state")"
+    "root_commit=$(jq -r '.["."].commit // ""' <<<"$state")" \
+    "root_kind_note=$(jq -r '.["."].kind_note // ""' <<<"$state")"
 }
 
 # The root's kind line on stable, from the promotion pending found (STATE).
-# With tags, read for a caller with no token (promote.py's preview), it names
-# the nearest dev tag without reading its proof, so it can name a dev tag the
-# release itself skips as unproven.
 cmd_kind_note() {
   local kind
-  [ -z "${1:-}" ] || [ "$1" = tags ] || die "usage: release-state.sh kind-note [tags]"
-  kind=$(kind_note "$(git rev-parse HEAD)" "$(jq -r '.["."].commit // ""' <<<"${STATE:?}")" . "${1:-}") \
+  kind=$(kind_note "$(git rev-parse HEAD)" "$(jq -r '.["."].commit // ""' <<<"${STATE:?}")" .) \
     || die "cannot find the root's promoted dev build for its kind line"
   out "kind_note=${kind}"
 }
@@ -532,7 +528,7 @@ cmd_receipts() {
         fi
       fi
     fi
-    if [ "$key" = . ]; then
+    if claims_proof "$key"; then
       repair_r=$(jq -r '.["."].repair_commit // ""' <<<"$state")
       kind=$(kind_note "$commit" "$repair_r" .) || die "cannot find the root's promoted dev build for ${tag}'s kind line"
     fi
@@ -1601,7 +1597,7 @@ case "${1:-}" in
     esac
     ;;
   barrier-wait) cmd_barrier ;;
-  kind-note) cmd_kind_note "${2:-}" ;;
+  kind-note) cmd_kind_note ;;
   renumber-target) cmd_renumber_target ;;
   renumber-handoff) cmd_renumber_handoff ;;
   renumber-subpackages) cmd_renumber_subpackages ;;
@@ -1619,5 +1615,5 @@ case "${1:-}" in
     shift
     "$cmd" "$@"
     ;;
-  *) die "usage: release-state.sh claims|pending|kind-note [tags]|publish|ahead|halves|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|half-free|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
+  *) die "usage: release-state.sh claims|pending|kind-note|publish|ahead|halves|number|receipts|receipt|readback|provenance|complete|barrier|renumber-target|renumber-handoff|renumber-subpackages|half-free|handoff-read|handoff-name|renumber|signing-window|release-digest|security-shas" ;;
 esac

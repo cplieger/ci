@@ -815,21 +815,25 @@ def cmd_snapshot(args) -> int:
 # ── preview ───────────────────────────────────────────────────────────────────
 
 
-def run_tool(clone: Path, script: Path, *args: str, **env: str) -> dict[str, str]:
-    """Run a release script the way release.yaml does; its $GITHUB_OUTPUT as a dict."""
+def run_tool(
+    clone: Path, script: Path, *args: str, token: bool = False, **env: str
+) -> dict[str, str]:
+    """Run a release script the way release.yaml does; its $GITHUB_OUTPUT as a dict.
+    `token` keeps GH_TOKEN for a step that runs no repository code."""
     out = clone.parent / f'{clone.name}.output'
     out.write_text('')
     # path-significance.sh appends its report to the step summary, which must
     # stay out of the preview's own.
     summary = clone.parent / f'{clone.name}.step-summary'
     summary.write_text('')
+    extra = {'GITHUB_OUTPUT': str(out), 'GITHUB_STEP_SUMMARY': str(summary), **env}
     proc = subprocess.run(
         ['bash', str(script), *args],
         cwd=clone,
         capture_output=True,
         text=True,
         check=False,
-        env=token_free_env(GITHUB_OUTPUT=str(out), GITHUB_STEP_SUMMARY=str(summary), **env),
+        env={**os.environ, **extra} if token else token_free_env(**extra),
     )
     if proc.returncode != 0:
         name = ' '.join([script.name, *args])
@@ -862,7 +866,9 @@ def _lane_rows(state, tool: str) -> dict[str, dict]:
     return rows
 
 
-def release_plan(clone: Path, main: str, r: str, layout: Layout) -> dict[str, dict[str, str]]:
+def release_plan(
+    clone: Path, repo: str, main: str, r: str, layout: Layout
+) -> dict[str, dict[str, str]]:
     """{lane key: {version, h_tag, kind_note, held}} for every lane of main's stable run at R,
     checked out in `clone`, from release.yaml detect's own steps; version '' for no release,
     held the violations of a lane the run holds back ('' when it is not held)."""
@@ -916,13 +922,19 @@ def release_plan(clone: Path, main: str, r: str, layout: Layout) -> dict[str, di
     # release.yaml's hold step: a lane whose own manifests pin a first-party dev
     # version publishes nothing at R.
     held = held_lanes(inventory.Repo(str(clone)), r)
-    # The token-free preview reads the root's kind line from the tags alone;
-    # the release's claim job names only a proven dev build.
+    # release.yaml's claim job: the root's kind line names only a proven dev
+    # build, which takes the statuses and Releases read.
     root_kind = ''
     if '.' in rows:
         root_kind = _field(
             run_tool(
-                clone, SCRIPTS / 'release-state.sh', 'kind-note', 'tags', STATE=raw_state, **env
+                clone,
+                SCRIPTS / 'release-state.sh',
+                'kind-note',
+                token=True,
+                STATE=raw_state,
+                GITHUB_REPOSITORY=f'{OWNER}/{repo}',
+                **env,
             ),
             'kind_note',
             'release-state.sh kind-note',
@@ -986,7 +998,7 @@ def cmd_preview(args) -> int:
         r = build_reconciliation(clone, args.main, args.target, '')['sha']
         git(clone, 'checkout', '--quiet', '--detach', r)
         layout = layout_of(inventory.Repo(str(clone)), args.target)
-        plan = release_plan(clone, args.main, r, layout)
+        plan = release_plan(clone, args.repo, args.main, r, layout)
         lines = [f'## Promotion preview: {args.repo}', '']
         if not plan:
             lines.append('This repository has no release lane.')
