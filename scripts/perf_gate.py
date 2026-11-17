@@ -37,6 +37,8 @@ if TYPE_CHECKING:
 KEY_FIELDS = ('scenario', 'scale', 'engine', 'width', 'window', 'metric')
 TIERS = ('gated', 'exact', 'reported')
 CHANGE_FIELDS = ('baseline', 'budget', 'tier', 'headroom', 'source')
+# What a calibration writes: budget follows from these and the file maps (check_rule).
+CALIBRATED_FIELDS = ('baseline', 'tier', 'headroom', 'source')
 ENTRY_FIELDS = (*KEY_FIELDS, *CHANGE_FIELDS, 'reason')
 FILE_FIELDS = ('schema', 'runner', 'headroom', 'floor', 'target', 'budgets', 'retired')
 FILE_MAPS = ('headroom', 'floor', 'target')
@@ -440,9 +442,8 @@ def verdict(budgets: dict, results: dict, remeasured: dict, decided: dict | None
     decided is compare's remeasure.json: its accepted slowdowns, its stale keys, the
     extension units (judge_extension) and the plan patterns both branches hold, which
     make an entry reported (as_planned) and excuse a retired cell the extension measured
-    (retired_measured). An exact count off
-    its budget, or on a stale key, fails, and is recorded for the measured file when its
-    reps all agree."""
+    (retired_measured). An exact count off its budget, or on a stale key, fails, and is
+    recorded for the measured file when its reps all agree."""
     decided = decided or {}
     budgets = as_planned(budgets, decided.get('reported', []))
     accepted = accepted_cells(decided.get('accepted', []))
@@ -955,8 +956,9 @@ def base_plan(git: Git, base_sha: str, path: str) -> dict:
 
 def held_patterns(head: dict, base: dict) -> list[dict]:
     """The `reported` patterns of plan head that plan base lists too: a pattern decides a
-    tier only once it is on the base branch, so a pull request cannot demote a class by
-    adding one, and the next scheduled calibration applies it."""
+    tier only once the base lists it, so a pull request cannot demote a class by adding
+    one, and from then its cells are judged reported (as_planned) until a calibration
+    rewrites them."""
     found, _ = reported_patterns(base)
     return [p for p in reported_patterns(head)[0] if p in found]
 
@@ -980,17 +982,22 @@ def as_planned(budgets: dict, held: list[dict]) -> dict:
     return {**budgets, 'budgets': entries}
 
 
+def plan_refusal(tier: str) -> str:
+    return f'plan.json reports this cell, so its entry is reported, not {tier}'
+
+
 def check_plan(budgets: dict, doc: dict, *, reported: list[dict], base: dict) -> list[str]:
     """A gated or exact entry whose unit and window no set of RUN_SETS lists
     leaves the gate unmeasured, so it fails; one of a cell a pattern of reported
-    (held_patterns) matches fails when it differs from base's entry, since only a
-    calibration writes such an entry. A set or cell of any set that is not an object,
-    and a `reported` item of doc that is no pattern, is an error line."""
+    (held_patterns) matches fails when base holds no entry for it or one whose
+    CALIBRATED_FIELDS differ, since only a calibration writes those. A set or cell of
+    any set that is not an object, and a `reported` item of doc that is no pattern, is
+    an error line."""
     sets = doc.get('sets', {})
     if not isinstance(sets, dict):
         return ['plan.json: sets must be an object of named sets']
     patterns, errors = reported, reported_patterns(doc)[1]
-    was = {key(e): e for e in base.get('budgets', []) if all(f in e for f in KEY_FIELDS)}
+    was = {key(e): e for e in base.get('budgets', [])}
     cells = []
     for name, spec in sets.items():
         if not isinstance(spec, dict):
@@ -1022,10 +1029,12 @@ def check_plan(budgets: dict, doc: dict, *, reported: list[dict], base: dict) ->
             if not planned(units, e)
         ]
         + [
-            f'{key_text(key(e))}: plan.json reports this cell, so its entry is reported, '
-            f'not {e["tier"]}'
+            f'{key_text(key(e))}: {plan_refusal(e["tier"])}'
             for e in gating
-            if plan_reports(patterns, e) and e != was.get(key(e))
+            if plan_reports(patterns, e)
+            and (
+                key(e) not in was or any(e.get(f) != was[key(e)].get(f) for f in CALIBRATED_FIELDS)
+            )
         ]
     )
 
@@ -1241,7 +1250,8 @@ class Checked:
     {key: {budget, reason, file}}. moves: each exact entry whose value differs from its
     exact base entry, {key, base, head, source, reason, refused}, refused the provenance
     errors of that entry. retires: each gated or exact base entry the head retires,
-    {key, tier, reason}."""
+    {key, tier, reason}. notices: summary lines, such as a base of another schema
+    skipping moves_to_older."""
 
     errors: list[str]
     stale: set
@@ -2358,13 +2368,17 @@ def held_reported(a: argparse.Namespace) -> list[dict]:
 
 
 def file_errors(a: argparse.Namespace, head: dict, held: list[dict]) -> Checked:
-    """check_provenance of head, its errors led by the rule and plan errors; held is
+    """check_provenance of head, its errors led by the rule and plan errors and its notices
+    naming each gating entry a pattern only the head plan lists matches; held is
     held_reported's."""
     errors = check_rule(head)
     if check_shape(head):
         return Checked(errors, set(), {}, [], [])
+    added = []
     if a.plan_doc:
-        errors += check_plan(head, load(a.plan_doc), reported=held, base=load_base(a.base))
+        doc = load(a.plan_doc)
+        errors += check_plan(head, doc, reported=held, base=load_base(a.base))
+        added = [p for p in reported_patterns(doc)[0] if p not in held]
     found = check_provenance(
         head,
         load_base(a.base),
@@ -2377,6 +2391,12 @@ def file_errors(a: argparse.Namespace, head: dict, held: list[dict]) -> Checked:
         git=Git(),
     )
     found.errors = errors + found.errors
+    found.notices += [
+        f'{key_text(key(e))}: plan.json adds a reported pattern that matches this '
+        f'{e["tier"]} entry, so it stops gating once this pull request merges'
+        for e in head.get('budgets', [])
+        if e['tier'] != 'reported' and plan_reports(added, e)
+    ]
     return found
 
 
@@ -2592,7 +2612,12 @@ def run(a: argparse.Namespace) -> int:
         out.failures = (
             checked.errors + out.failures + retired_measured(budgets, results['cells'], held)
         )
-        out.exact_moves = checked.moves
+        out.exact_moves = [
+            {**m, 'refused': [*m['refused'], plan_refusal('exact')]}
+            if plan_reports(held, key_dict(m['key']))
+            else m
+            for m in checked.moves
+        ]
         out.retires = checked.retires
         entries = {key(e): e for e in budgets.get('budgets', [])}
         moved = {c['scenario'] for c in out.remeasure if entries[key(c)]['tier'] == 'exact'}

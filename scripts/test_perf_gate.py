@@ -1832,6 +1832,20 @@ class Provenance(unittest.TestCase):
         self.assertEqual(self.check(why, why), [])
         lower = {'cpu_ms': 50, 'heap_mb': 0.5}
         self.assertEqual(self.check(budgets(why['budgets'], floor=lower), why), [])
+        # Only an edit of the entry's own family excuses its reason.
+        self.write('111', calibration_file([cal_cell(baseline=1200.0)]))
+        heap = {'cpu_ms': 1.5, 'heap_mb': 1.4, 'rss_mb': 1.25}
+        raised = budgets([entry(baseline=1200.0, reason='slower parse')], headroom=heap)
+        base = budgets([entry(baseline=1000.0, source=RUN_URL + '100')])
+        self.assertEqual(
+            self.check(raised, base),
+            [
+                (
+                    f'{CPU}: a reason belongs on a measured value, or on a budget a headroom, floor '
+                    'or target edit raises'
+                )
+            ],
+        )
 
     def test_a_lowered_entry_matching_its_signed_file_passes(self):
         self.write('111', calibration_file([cal_cell(baseline=900.0)]))
@@ -2547,6 +2561,16 @@ class Coverage(unittest.TestCase):
         moved = budgets([entry(), {**frames, 'baseline': 4, 'budget': 4}, live, engine])
         errors = self.check(moved, {**PLAN, 'reported': reported}, was=doc)
         self.assertEqual(errors, [f'files/x10/chromium/desktop/cold/sse_frames{tail}'])
+        # A file headroom edit recomputes a held gated budget; only a calibrated field fails.
+        cpu = {**PLAN, 'reported': [{'metric': 'cpu_ms'}]}
+        wide = {'cpu_ms': 1.6, 'heap_mb': 1.25, 'rss_mb': 1.25}
+        edit = budgets([entry(budget=1600.0, reason='wider headroom')], headroom=wide)
+        self.assertEqual(self.check(edit, cpu, was=budgets([entry()])), [])
+        rebased = budgets([entry(baseline=1100.0, budget=1760.0)], headroom=wide)
+        self.assertEqual(
+            self.check(rebased, cpu, was=budgets([entry()])),
+            [f'{CPU}: plan.json reports this cell, so its entry is reported, not gated'],
+        )
 
     def test_a_reported_pattern_of_the_wrong_shape_is_an_error_line(self):
         for reported in (
@@ -3503,10 +3527,23 @@ class Cli(unittest.TestCase):
         remeasure = json.loads((self.dir / 'remeasure.json').read_text())
         self.assertEqual([keyof(c) for c in remeasure['cells']], [keyof(entry('dom'))])
         self.assertEqual(remeasure['reported'], [])
+        demoted = (
+            f'{DOM}: plan.json adds a reported pattern that matches this exact entry, so it '
+            'stops gating once this pull request merges'
+        )
+        self.assertIn(f'- {demoted}\n', (self.dir / 'summary.md').read_text())
+        self.assertNotIn(f'{CPU}: plan.json adds', self.output)
+        argv = ('--check-file', str(self.dir / 'budgets.json'))
+        argv += ('--base', str(self.dir / 'budgets.json'), '--sources', str(self.dir / 'sources'))
+        argv += ('--repo', REPO, '--head', HEAD)
+        argv += ('--base-sha', HEAD, '--plan-doc', str(self.dir / 'plan.json'))
+        self.assertEqual(self.main(*argv), 0, self.output)
+        self.assertEqual(self.output, f'::notice::{demoted}\n')
         # A pattern the base plan holds too decides the tier: the base's entry is reported.
         self.assertEqual(self.compare(measured, plan=reports), 0, self.output)
         remeasure = json.loads((self.dir / 'remeasure.json').read_text())
         self.assertEqual((remeasure['cells'], remeasure['reported']), ([], [{'metric': 'dom'}]))
+        self.assertNotIn('plan.json adds', self.output)
         # Its entry's provenance still fails, but it is no stale exact value to re-measure.
         url = MEASURED_URL + '900/attempts/1'
         moved = {**entry('dom', 'exact', 2056, source=url, reason='one more node'), 'scale': 'x1'}
@@ -3520,6 +3557,22 @@ class Cli(unittest.TestCase):
         self.assertIn(
             'plan.json reports this cell, so its entry is reported, not exact', self.output
         )
+
+    def test_an_exact_move_a_held_pattern_matches_is_refused_in_its_check_column(self):
+        own = entry(source=RUN_URL + '100')
+        moved = entry('dom', 'exact', 641, source=RUN_URL + '200')
+        base = [own, entry('dom', 'exact', 640, source=RUN_URL + '100')]
+        measured = [cell(), cell('dom', (641,) * 3, kind='count')]
+        row = f'| {DOM} | 640 | 641 | {RUN_URL}200 |  |'
+        rc = self.compare(measured, listed=False, entries=[own, moved], base=base)
+        self.assertEqual(rc, 0, self.output)
+        self.assertIn(f'{row} accepted |', self.output)
+        reports = {**PLAN, 'reported': [{'metric': 'dom'}]}
+        rc = self.compare(measured, listed=False, entries=[own, moved], base=base, plan=reports)
+        self.assertEqual(rc, 1)
+        refusal = 'plan.json reports this cell, so its entry is reported, not exact'
+        self.assertIn(f'{row} {refusal} |', self.output)
+        self.assertIn(f'::error::{DOM}: {refusal}', self.output)
 
     def test_a_base_with_no_plan_holds_no_pattern_and_a_git_failure_fails(self):
         class Absent(FakeGit):
