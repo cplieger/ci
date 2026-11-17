@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tag creation for the release workflows; source it after retry.sh (it sets no
 # shell options).
-# shellcheck disable=SC2034 # TAG_CREATED and CLAIMED are the caller's to read
+# shellcheck disable=SC2034 # TAG_CREATED, CLAIMED and CLAIM_AT are the caller's to read
 
 # release_channels.HANDOFF_PREFIX reads this context.
 TAG_HANDOFF_PREFIX='release/handoff/'
@@ -153,7 +153,6 @@ claim_version() {
 # 0 when <tag> is at <commit>; returns 1 when it is elsewhere, absent or
 # unreadable, so nothing is published under it.
 claim_held() {
-  CLAIM_AT=""
   if ! retry claim_read "$1" "$2"; then
     echo "::error::tag $2 cannot be read, so this run's claim of it at $3 is unconfirmed and nothing is published under it."
     return 1
@@ -164,7 +163,38 @@ claim_held() {
   fi
   echo "claimed=true" >>"${GITHUB_OUTPUT:?}"
 }
-claim_read() { CLAIM_AT=$(gh api "repos/$1/git/ref/tags/$2" --jq .object.sha); } # <owner/repo> <tag>
+
+# claim_drop <owner/repo> <tag> <commit>: deletes the claim job's tag when a
+# run publishes nothing under it after all, so no unproven claim is left
+# behind. Returns 0 once <tag> is gone, 1 when it is at another commit (not
+# this run's to delete) or GitHub cannot read or delete it.
+claim_drop() {
+  if ! retry claim_read "$1" "$2"; then
+    echo "::error::tag $2 cannot be read, so this run's claim of it at $3 is not deleted."
+    return 1
+  fi
+  [ -n "$CLAIM_AT" ] || return 0
+  if [ "$CLAIM_AT" != "$3" ]; then
+    echo "::error::tag $2 is at ${CLAIM_AT}, not this run's commit $3, so it is not this run's claim to delete."
+    return 1
+  fi
+  retry gh api -X DELETE "repos/$1/git/refs/tags/$2" >/dev/null
+}
+
+# claim_read <owner/repo> <tag>: CLAIM_AT is the tag's commit, empty when
+# GitHub answers 404; returns 1 on any other failure, said on stderr.
+claim_read() {
+  local err rc=0
+  err=$(mktemp)
+  CLAIM_AT=$(gh api "repos/$1/git/ref/tags/$2" --jq .object.sha 2>"$err") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    CLAIM_AT=""
+    grep -q 'HTTP 404' "$err" && rc=0
+    [ "$rc" -eq 0 ] || cat "$err" >&2
+  fi
+  rm -f "$err"
+  return "$rc"
+}
 
 # untagged_handed_off <owner/repo> <branch> <tag> <commit>: for <tag> not at
 # <commit>, 0 when the branch moved past it (warned here), so the run on the

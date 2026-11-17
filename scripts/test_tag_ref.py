@@ -25,6 +25,8 @@ def done(code, out='', err=''):
     sys.exit(code)
 if args[:1] == ['api'] and args[1].startswith('repos/o/app/git/ref/tags/'):
     tag = args[1].removeprefix('repos/o/app/git/ref/tags/')
+    if state.get('read_fail'):
+        done(1, err='gh: Server Error (HTTP 502)\n')
     if tag in state['tags']:
         done(0, state['tags'][tag] + '\n')
     done(1, err='gh: Not Found (HTTP 404)\n')
@@ -36,6 +38,9 @@ if args[:4] == ['api', '-X', 'POST', f'repos/o/app/statuses/{args[3].rsplit("/",
     if state.get('status_fail'):
         done(1, err='gh: Server Error (HTTP 502)\n')
     done(0, '{}\n')
+if args[:3] == ['api', '-X', 'DELETE'] and args[3].startswith('repos/o/app/git/refs/tags/'):
+    state['tags'].pop(args[3].removeprefix('repos/o/app/git/refs/tags/'), None)
+    done(0)
 if args[:2] == ['api', 'repos/o/app/git/refs']:
     fields = dict(a.split('=', 1) for a in args[2:] if '=' in a)
     tag, sha = fields['ref'].removeprefix('refs/tags/'), fields['sha']
@@ -365,6 +370,81 @@ class ClaimUnderALaterDevTag(unittest.TestCase):
         result, _, _ = self.run_claim(tags_at_b=['web/v1.0.0-dev.3'])
         self.assertEqual(result, 'claimed=true handed_off_rc=1')
         self.assertEqual(len(self.creates), 1, self.creates)
+
+
+class ClaimCheck(unittest.TestCase):
+    """claim_held and claim_drop: a publishing job reads the claim job's tag, never creating one."""
+
+    def run_claim(self, call, tags=None, read_fail=False):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix='claim-'))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / 'gh').write_text(GH_STUB)
+        (tmp / 'gh').chmod(0o755)
+        state = tmp / 'state.json'
+        state.write_text(
+            json.dumps({'tags': tags or {}, 'creates': [], 'calls': [], 'read_fail': read_fail})
+        )
+        out = tmp / 'out'
+        out.write_text('')
+        script = (
+            'set -euo pipefail\n'
+            f'. "{SCRIPTS}/retry.sh"\n'
+            f'. "{SCRIPTS}/tag-ref.sh"\n'
+            'rc=0\n'
+            f'{call} o/app v1.2.0 {COMMIT} || rc=$?\n'
+            'echo "rc=${rc}"\n'
+        )
+        env = {
+            **os.environ,
+            'PATH': f'{tmp}:{os.environ["PATH"]}',
+            'STUB_STATE': str(state),
+            'READBACK_SLEEP': '0',
+            'GITHUB_OUTPUT': str(out),
+        }
+        res = subprocess.run(
+            ['bash', '-c', script], env=env, capture_output=True, text=True, check=False
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        doc = json.loads(state.read_text())
+        writes = [c for c in doc['calls'] if c[:2] == ['api', 'repos/o/app/git/refs'] or 'DELETE' in c]
+        return res.stdout, out.read_text(), doc['tags'], writes
+
+    def test_a_tag_at_this_commit_is_held(self):
+        stdout, out, tags, writes = self.run_claim('claim_held', tags={'v1.2.0': COMMIT})
+        self.assertEqual((stdout, out, tags, writes), ('rc=0\n', 'claimed=true\n', {'v1.2.0': COMMIT}, []))
+
+    def test_a_tag_at_another_commit_fails_closed(self):
+        stdout, out, tags, writes = self.run_claim('claim_held', tags={'v1.2.0': 'b' * 40})
+        self.assertIn(f'::error::tag v1.2.0 is at {"b" * 40}, not this run\'s commit {COMMIT}', stdout)
+        self.assertEqual((stdout[-5:], out, writes), ('rc=1\n', '', []))
+
+    def test_an_absent_tag_fails_closed_and_is_never_created(self):
+        stdout, out, tags, writes = self.run_claim('claim_held')
+        self.assertIn(f'::error::tag v1.2.0 is at <none>, not this run\'s commit {COMMIT}', stdout)
+        self.assertEqual((stdout[-5:], out, tags, writes), ('rc=1\n', '', {}, []))
+
+    def test_an_unreadable_tag_fails_closed_after_the_retries(self):
+        stdout, out, _, writes = self.run_claim('claim_held', tags={'v1.2.0': COMMIT}, read_fail=True)
+        self.assertIn('::error::tag v1.2.0 cannot be read', stdout)
+        self.assertEqual((stdout[-5:], out, writes), ('rc=1\n', '', []))
+
+    def test_a_dropped_claim_deletes_this_commits_tag(self):
+        stdout, _, tags, writes = self.run_claim('claim_drop', tags={'v1.2.0': COMMIT})
+        self.assertEqual((stdout, tags), ('rc=0\n', {}))
+        self.assertEqual(writes, [['api', '-X', 'DELETE', 'repos/o/app/git/refs/tags/v1.2.0']])
+
+    def test_a_dropped_claim_leaves_another_commits_tag(self):
+        stdout, _, tags, writes = self.run_claim('claim_drop', tags={'v1.2.0': 'b' * 40})
+        self.assertIn('not this run\'s claim to delete', stdout)
+        self.assertEqual((stdout[-5:], tags, writes), ('rc=1\n', {'v1.2.0': 'b' * 40}, []))
+
+    def test_a_dropped_claim_already_gone_is_done(self):
+        self.assertEqual(self.run_claim('claim_drop')[0::3], ('rc=0\n', []))
+
+    def test_a_dropped_claim_github_cannot_read_is_kept(self):
+        stdout, _, tags, writes = self.run_claim('claim_drop', tags={'v1.2.0': COMMIT}, read_fail=True)
+        self.assertIn('::error::tag v1.2.0 cannot be read', stdout)
+        self.assertEqual((stdout[-5:], tags, writes), ('rc=1\n', {'v1.2.0': COMMIT}, []))
 
 
 class BranchMovedPast(unittest.TestCase):

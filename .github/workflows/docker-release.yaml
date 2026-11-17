@@ -1254,14 +1254,12 @@ jobs:
         if: ${{ inputs.claim-created && needs.rebuild-gate.outputs.skip == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
-          at=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.sha)
-          if [ "$at" != "$GITHUB_SHA" ]; then
-            echo "::error::tag ${TAG} is at ${at}, not this run's commit ${GITHUB_SHA}, so it is not this run's claim to delete."
-            exit 1
-          fi
-          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" >/dev/null
+          . "$CI_TOOLS/retry.sh"
+          . "$CI_TOOLS/tag-ref.sh"
+          claim_drop "$GITHUB_REPOSITORY" "$TAG" "$GITHUB_SHA"
           echo "::notice::the image matched ${TAG}'s compared release, so nothing is published and the claim of ${TAG} is deleted."
 
       # The version's git tag is its claim, which the caller's claim job takes
