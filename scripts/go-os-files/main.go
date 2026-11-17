@@ -3,9 +3,10 @@
 // leg OS, darwin or windows, that builds the file at a GOARCH, amd64 or arm64,
 // where linux, darwin or windows excludes it. go/build decides each with the
 // module's Go release tags and the target's tool tags, under each cgo and race
-// setting the leg compiles with; a module on another Go minor than this binary's
-// is also judged with every experiment off. It exits 1 when go/build cannot read
-// a file or the module's go.mod.
+// setting the leg compiles with, at either arch, so it may schedule a leg that
+// compiles no extra file but never misses one. A module on another Go minor than
+// this binary's has each experiment its file names tried on and off. It exits 1
+// when go/build cannot read a file or the module's go.mod.
 package main
 
 import (
@@ -13,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"go/build"
+	"go/build/constraint"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,7 +32,7 @@ var (
 	legs       = []string{"darwin", "windows"}
 )
 
-// go-os-ci.yaml's Vet and Test (race) compile with cgo, its Cross-vet without.
+// go-os-ci.yaml's Vet and Test (race) compile with cgo, its Cross-vet of a non-native target without.
 var variants = []variant{{cgo: true}, {cgo: true, race: true}, {}}
 
 const toolTagsFlag = "-print-tool-tags"
@@ -45,7 +47,7 @@ var (
 
 type target struct{ goos, goarch string }
 
-type variant struct{ cgo, race, noExperiments bool }
+type variant struct{ cgo, race bool }
 
 type module struct {
 	releaseTags []string
@@ -192,21 +194,17 @@ func (m *matcher) legsFor(mod, path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	judged := variants
+	var experiments []string
 	if info.skewed {
-		// Experiment defaults change between Go releases, and only that release's
-		// toolchain knows them.
-		judged = slices.Clone(variants)
-		for _, v := range variants {
-			v.noExperiments = true
-			judged = append(judged, v)
+		if experiments, err = experimentsIn(path); err != nil {
+			return nil, err
 		}
 	}
 	dir, name := filepath.Dir(path), filepath.Base(path)
 	found := map[string]bool{}
 	for _, goarch := range goarches {
-		for _, v := range judged {
-			if err := m.schedule(found, info, v, goarch, dir, name); err != nil {
+		for _, v := range variants {
+			if err := m.schedule(found, info, v, experiments, goarch, dir, name); err != nil {
 				return nil, err
 			}
 		}
@@ -221,22 +219,29 @@ func (m *matcher) legsFor(mod, path string) ([]string, error) {
 }
 
 // schedule sets found[leg] for each leg OS that builds the file under v at
-// goarch where another runner OS excludes it.
-func (m *matcher) schedule(found map[string]bool, info module, v variant, goarch, dir, name string) error {
+// goarch where some runner OS excludes it. A skewed module's experiments are
+// each tried on and off, per OS, since the release sets differ by target.
+func (m *matcher) schedule(found map[string]bool, info module, v variant, experiments []string, goarch, dir, name string) error {
 	builds := map[string]bool{}
 	excluded := false
 	for _, goos := range runnerOSes {
-		c := build.Default
-		c.GOOS, c.GOARCH = goos, goarch
-		c.CgoEnabled = v.cgo
-		c.ToolTags = v.toolTags(m.toolTags[target{goos, goarch}])
-		c.ReleaseTags = info.releaseTags
-		ok, err := c.MatchFile(dir, name)
-		if err != nil {
-			return err
+		base := m.toolTags[target{goos, goarch}]
+		if info.skewed {
+			base = slices.DeleteFunc(slices.Clone(base), isExperiment)
 		}
-		builds[goos] = ok
-		excluded = excluded || !ok
+		for mask := range 1 << len(experiments) {
+			c := build.Default
+			c.GOOS, c.GOARCH = goos, goarch
+			c.CgoEnabled = v.cgo
+			c.ToolTags = withTags(base, v.race, experiments, mask)
+			c.ReleaseTags = info.releaseTags
+			ok, err := c.MatchFile(dir, name)
+			if err != nil {
+				return err
+			}
+			builds[goos] = builds[goos] || ok
+			excluded = excluded || !ok
+		}
 	}
 	for _, leg := range legs {
 		found[leg] = found[leg] || (builds[leg] && excluded)
@@ -244,15 +249,59 @@ func (m *matcher) schedule(found map[string]bool, info module, v variant, goarch
 	return nil
 }
 
-func (v variant) toolTags(base []string) []string {
-	tags := make([]string, 0, len(base)+1)
-	for _, t := range base {
-		if !v.noExperiments || !strings.HasPrefix(t, "goexperiment.") {
-			tags = append(tags, t)
+// withTags returns base plus race when set and each experiment whose bit is set in mask.
+func withTags(base []string, race bool, experiments []string, mask int) []string {
+	tags := slices.Clone(base)
+	for i, e := range experiments {
+		if mask&(1<<i) != 0 {
+			tags = append(tags, e)
 		}
 	}
-	if v.race {
+	if race {
 		tags = append(tags, "race")
 	}
 	return tags
+}
+
+func isExperiment(tag string) bool { return strings.HasPrefix(tag, "goexperiment.") }
+
+// experimentsIn returns the goexperiment.* tags named by the build lines before
+// the package clause. Over-collecting is harmless: MatchFile still decides.
+func experimentsIn(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var found []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "package ") {
+			break
+		}
+		if !constraint.IsGoBuild(line) && !constraint.IsPlusBuild(line) {
+			continue
+		}
+		if expr, err := constraint.Parse(line); err == nil {
+			found = collectExperiments(found, expr)
+		}
+	}
+	return found, sc.Err()
+}
+
+func collectExperiments(found []string, e constraint.Expr) []string {
+	switch e := e.(type) {
+	case *constraint.AndExpr:
+		return collectExperiments(collectExperiments(found, e.X), e.Y)
+	case *constraint.OrExpr:
+		return collectExperiments(collectExperiments(found, e.X), e.Y)
+	case *constraint.NotExpr:
+		return collectExperiments(found, e.X)
+	case *constraint.TagExpr:
+		if isExperiment(e.Tag) && !slices.Contains(found, e.Tag) {
+			return append(found, e.Tag)
+		}
+	}
+	return found
 }
