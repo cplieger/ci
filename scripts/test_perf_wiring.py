@@ -274,23 +274,46 @@ class Gate(unittest.TestCase):
         plan = self.jobs['plan']
         self.assertEqual(plan['outputs']['head'], '${{ steps.plan.outputs.head }}')
         env = step(plan, 'Plan')['env']
-        self.assertEqual(
-            env['HEAD_COMMIT'],
-            '${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}',
-        )
+        self.assertEqual(env['HEAD_COMMIT'], '${{ github.event.pull_request.head.sha }}')
         s = step(self.jobs['verdict'], 'Verdict')
         self.assertEqual(s['env']['COMMIT'], '${{ needs.plan.outputs.head }}')
         self.assertEqual(s['env']['RUN_ID'], '${{ github.run_id }}')
         self.assertEqual(s['env']['RUN_ATTEMPT'], '${{ github.run_attempt }}')
         self.assertEqual(s['env']['WORKFLOW_REPOSITORY'], '${{ github.repository }}')
+        self.assertEqual(s['env']['WORKFLOW_SHA'], '${{ job.workflow_sha }}')
         for flag in (
             '--record-out "$RUNNER_TEMP/measured"',
             '--commit "$COMMIT"',
             '--run-id "$RUN_ID"',
             '--run-attempt "$RUN_ATTEMPT"',
             '--workflow-repository "$WORKFLOW_REPOSITORY"',
+            '--workflow-sha "$WORKFLOW_SHA"',
         ):
             self.assertIn(flag, s['run'])
+
+    def test_a_merge_queue_run_names_no_head_and_records_nothing(self):
+        s = step(self.jobs['plan'], 'Plan')
+        for event, head_commit, want in (
+            ('pull_request', 'abc', 'abc'),
+            ('merge_group', '', ''),
+            ('workflow_dispatch', '', 'f00d'),
+        ):
+            with self.subTest(event=event):
+                env = dict.fromkeys(s['env'], '') | {'EVENT': event, 'HEAD_COMMIT': head_commit}
+                proc, tmp = run_body(self, s['run'], env, {'git': GIT_STUB})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(outputs(tmp)['head'], want)
+        v = step(self.jobs['verdict'], 'Verdict')
+        for commit, records in (('abc', True), ('', False)):
+            with self.subTest(commit=commit):
+                env = dict.fromkeys(v['env'], '') | {'REMEASURED': 'success', 'COMMIT': commit}
+                stub = '#!/usr/bin/env bash\necho "python3 $*" >> "$STUB_LOG"\n'
+                proc, tmp = run_body(self, v['run'], env, {'python3': stub})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                log = (tmp / 'log').read_text()
+                self.assertIn('--verdict', log)
+                self.assertEqual('--record-out' in log, records, log)
+                self.assertEqual('--commit' in log, records, log)
 
 
 COSIGN_STUB = """#!/usr/bin/env bash

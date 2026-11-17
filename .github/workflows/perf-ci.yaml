@@ -109,14 +109,17 @@ jobs:
           RUNS: ${{ inputs.runs }}
           REPO: ${{ inputs.repository || github.repository }}
           # A measured file names the pull request's head: its merge ref is not
-          # fetchable once the pull request moves on.
-          HEAD_COMMIT: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          # fetchable once the pull request moves on. A merge queue run measures
+          # the queue's merge commit and names no head, so it records nothing.
+          HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           sha=$(git rev-parse HEAD)
+          head="${HEAD_COMMIT:-$sha}"
+          [ "$EVENT" = merge_group ] && head=''
           {
             echo "sha=${sha}"
-            echo "head=${HEAD_COMMIT:-$sha}"
+            echo "head=${head}"
             echo "prefix=${REPO//\//-}"
           } >> "$GITHUB_OUTPUT"
           # A push measures nothing: its pull request measured the change, and the
@@ -397,11 +400,26 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           # The repository whose run requested the token, which the certificate names.
           WORKFLOW_REPOSITORY: ${{ github.repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
           if [ "$REMEASURED" != success ]; then
             echo "::error::a remeasure shard ended ${REMEASURED}, so no red cell can be judged on six reps"
             exit 1
+          fi
+          # The plan names no head on a merge queue run, which records no measured file.
+          record=()
+          if [ -n "$COMMIT" ]; then
+            record=(
+              --record-out "$RUNNER_TEMP/measured"
+              --repo "$REPO"
+              --head "$MEASURED_SHA"
+              --commit "$COMMIT"
+              --run-id "$RUN_ID"
+              --run-attempt "$RUN_ATTEMPT"
+              --workflow-repository "$WORKFLOW_REPOSITORY"
+              --workflow-sha "$WORKFLOW_SHA"
+            )
           fi
           rc=0
           python3 "$CI_TOOLS/perf_gate.py" \
@@ -411,13 +429,7 @@ jobs:
             --budgets tests/perf/budgets.json \
             --results "$RUNNER_TEMP/results" \
             --prefix "$PREFIX" \
-            --record-out "$RUNNER_TEMP/measured" \
-            --repo "$REPO" \
-            --head "$MEASURED_SHA" \
-            --commit "$COMMIT" \
-            --run-id "$RUN_ID" \
-            --run-attempt "$RUN_ATTEMPT" \
-            --workflow-repository "$WORKFLOW_REPOSITORY" \
+            "${record[@]}" \
             --summary "$GITHUB_STEP_SUMMARY" || rc=$?
           if [ -f "$RUNNER_TEMP/measured/${RUN_ID}-${RUN_ATTEMPT}.json" ]; then
             echo "recorded=true" >> "$GITHUB_OUTPUT"

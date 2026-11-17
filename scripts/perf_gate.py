@@ -21,6 +21,7 @@ import fnmatch
 import functools
 import json
 import math
+import os
 import pathlib
 import re
 import shutil
@@ -164,6 +165,11 @@ def check_rule(budgets: object) -> list[str]:
             errors.append(f'{name}: listed twice')
         seen.add(key(e))
         errors.extend(f'{name}: {m}' for m in entry_errors(budgets, e))
+    errors.extend(
+        f'{key_text(key(r))}: retired, yet budgets lists it'
+        for r in budgets.get('retired', [])
+        if key(r) in seen
+    )
     return errors
 
 
@@ -306,8 +312,20 @@ class Outcome:
     # check_provenance's moves and retires, for the summary.
     exact_moves: list[dict] = dataclasses.field(default_factory=list)
     retires: list[dict] = dataclasses.field(default_factory=list)
-    # The measured file's artifact and stem when the verdict wrote one, for the summary.
-    measured_as: tuple[str, str] | None = None
+    # The measured file the verdict wrote, for the summary's commands.
+    measured_as: MeasuredAs | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class MeasuredAs:
+    """The run that wrote a measured file, its repository, the cplieger/ci commit whose
+    perf_gate.py takes it, its artifact and its stem."""
+
+    run_id: str
+    repository: str
+    workflow_sha: str
+    artifact: str
+    stem: str
 
 
 def middle(reps: list) -> list:
@@ -419,6 +437,9 @@ def verdict(budgets: dict, results: dict, remeasured: dict, decided: dict | None
     accepted = accepted_cells(decided.get('accepted', []))
     stale = {key(k) for k in decided.get('stale', [])}
     out = compare(budgets, results, accepted=accepted)
+    # A measured file of another runner is one load_source refuses, so nothing is recorded.
+    if out.runner_mismatch:
+        stale = set()
     out.remeasure = with_stale(out.remeasure, results.get('cells', []), stale)
     entries = {key(e): e for e in budgets.get('budgets', [])}
     again = {key(c): c for c in remeasured.get('cells', [])}
@@ -469,13 +490,16 @@ def exact_judgement(
 ) -> None:
     """Fail an exact count whose judged values are off its budget, or are on a stale
     key. Only reps that all agree are recorded, since a value they disagree on would
-    become an exact budget that flaps."""
+    become an exact budget that flaps; a stale key whose judged values are its budget is
+    recorded at it, which moves no budget."""
     name, budget = key_text(key(c)), e['budget']
-    if not stale and all(v == budget for v in judged):
+    on_budget = all(v == budget for v in judged)
+    if not stale and on_budget:
         return
-    if len(set(reps)) == 1:
-        out.recorded.append({'cell': c, 'budget': budget, 'value': reps[0], 'reps': reps})
-        why = 'is stale' if reps[0] == budget else f'hold off its exact budget {budget}'
+    if len(set(reps)) == 1 or on_budget:
+        value = reps[0] if len(set(reps)) == 1 else budget
+        out.recorded.append({'cell': c, 'budget': budget, 'value': value, 'reps': reps})
+        why = 'is stale' if value == budget else f'hold off its exact budget {budget}'
         out.failures.append(f'{name}: reps {reps} {why}; check in the measured file this run wrote')
     else:
         out.failures.append(
@@ -564,6 +588,23 @@ def table(title: str | None, head: tuple, rows: Iterable[tuple]) -> list[str]:
     return [*heading, '| ' + ' | '.join(head) + ' |', '|' + '---|' * len(head), *body, '']
 
 
+def take_steps(m: MeasuredAs | None) -> str:
+    """How the recorded counts reach budgets.json: from measured file m, or, when the run
+    wrote none, from the pull request's own run."""
+    lead = 'Each count below moved, or its checked-in source no longer holds. '
+    if m is None:
+        return lead + (
+            'This run wrote no measured file, as a merge queue run measures no pull request '
+            "head, so take the counts from the measured file of the pull request's own run."
+        )
+    return lead + (
+        f'Take them: `gh run download {m.run_id} -R {m.repository} -n {m.artifact} '
+        f'-D tests/perf/sources`, then, in a cplieger/ci checkout at {m.workflow_sha} '
+        f'as `<ci>`, `python3 <ci>/scripts/perf_gate.py --take tests/perf/sources/{m.stem}.json '
+        "--budgets tests/perf/budgets.json --reason '<why it moved>'`, and commit both."
+    )
+
+
 def summary(budgets: dict, out: Outcome) -> str:
     lines = ['## Performance gate', '']
     if out.runner_mismatch:
@@ -599,18 +640,7 @@ def summary(budgets: dict, out: Outcome) -> str:
         ((key_text(r['key']), r['tier'], r['reason']) for r in out.retires),
     )
     if out.recorded:
-        artifact, stem = out.measured_as or ('perf-measured-<prefix>-attempt-<n>', '<run>-<n>')
-        lines += [
-            '### Measured moves to check in',
-            '',
-            (
-                'Each count below moved, or its checked-in source no longer holds. '
-                f'Take them: `gh run download <run> -n {artifact} -D tests/perf/sources`, then '
-                f'`python3 perf_gate.py --take tests/perf/sources/{stem}.json '
-                "--budgets tests/perf/budgets.json --reason '<why it moved>'`, and commit both."
-            ),
-            '',
-        ]
+        lines += ['### Measured moves to check in', '', take_steps(out.measured_as), '']
         lines += table(
             None,
             ('Cell', 'Budget', 'Measured', 'Reps judged'),
@@ -894,9 +924,9 @@ def plan_reports(patterns: list[dict], c: dict) -> bool:
 
 def check_plan(budgets: dict, doc: dict) -> list[str]:
     """A gated or exact entry whose unit and window no set of RUN_SETS lists
-    leaves the gate unmeasured, so it fails unless `retired` names its key; one
-    of a cell `reported` lists fails. A set or cell of any set that is not an
-    object, and a `reported` item that is no pattern, is an error line."""
+    leaves the gate unmeasured, so it fails; one of a cell `reported` lists fails.
+    A set or cell of any set that is not an object, and a `reported` item that is
+    no pattern, is an error line."""
     sets = doc.get('sets', {})
     if not isinstance(sets, dict):
         return ['plan.json: sets must be an object of named sets']
@@ -918,7 +948,6 @@ def check_plan(budgets: dict, doc: dict) -> list[str]:
             elif name in RUN_SETS:
                 cells.append(u)
     units = planned_windows(cells)
-    retired = {key(r) for r in budgets.get('retired', []) if all(f in r for f in KEY_FIELDS)}
     gating = [
         e
         for e in budgets.get('budgets', [])
@@ -928,9 +957,9 @@ def check_plan(budgets: dict, doc: dict) -> list[str]:
         errors
         + [
             f'{key_text(key(e))}: a {e["tier"]} entry no set of plan.json measures '
-            f'({", ".join(RUN_SETS)}), and retired does not name it'
+            f'({", ".join(RUN_SETS)}); remove it and name it in retired'
             for e in gating
-            if not planned(units, e) and key(e) not in retired
+            if not planned(units, e)
         ]
         + [
             f'{key_text(key(e))}: plan.json reports this cell, so its entry is reported, '
@@ -939,6 +968,18 @@ def check_plan(budgets: dict, doc: dict) -> list[str]:
             if plan_reports(patterns, e)
         ]
     )
+
+
+def retired_measured(budgets: dict, cells: Iterable[dict], patterns: list[dict]) -> list[str]:
+    """A retired key a shard measured fails: the scheduled calibration tiers every measured
+    cell, but one plan.json reports, whose tier is the plan's."""
+    retired = {key(r) for r in budgets.get('retired', [])}
+    return [
+        f"{key_text(key(c))}: retired, yet a shard measured it; a measured cell's tier is the "
+        "scheduled calibration's"
+        for c in cells
+        if key(c) in retired and not plan_reports(patterns, c)
+    ]
 
 
 def plan(
@@ -1165,7 +1206,8 @@ def check_provenance(
     (load_source) and list its cell; an entry the head adds or whose baseline, budget,
     tier, headroom or source differs from the base, every entry when the file's runner,
     headroom, floor or target differs, must match it (entry_provenance); every entry
-    comes from the newest source of its cell (superseded_entries); a gated or exact entry
+    comes from the newest source of its cell (superseded_entries) and from none older than
+    its base entry's (moves_to_older); a gated or exact entry
     leaves only through `retired`; every file under sources is named by an entry; and
     every accepted file holds (load_accepted)."""
     errors = []
@@ -1182,6 +1224,13 @@ def check_provenance(
             named.setdefault(src.stem, src)
     loaded: dict[str, Loaded] = {}
     unloaded: dict[str, str] = {}
+    base_places: dict[str, tuple[str | None, str | None]] = {}
+
+    def placed_at_base(src: Source) -> tuple[str | None, str | None]:
+        if src.stem not in base_places:
+            base_places[src.stem] = base_place(src, sources, git, base_sha)
+        return base_places[src.stem]
+
     for stem, src in sorted(named.items()):
         found = load_source(
             src,
@@ -1210,6 +1259,7 @@ def check_provenance(
         if src.stem in loaded:
             changed = b is None or file_edit or any(e.get(f) != b.get(f) for f in CHANGE_FIELDS)
             mine += entry_provenance(e, b, loaded[src.stem], changed, moved, base_sha, git)
+            mine += moves_to_older(e, b, loaded[src.stem], placed_at_base, git)
         errors.extend(f'{name}: {x}' for x in mine)
         if src.stem not in loaded:
             # errors holds the source's own line once; the entry's refusals still name it.
@@ -1555,6 +1605,52 @@ def superseded_entries(
     return errors
 
 
+def base_place(
+    src: Source, sources: pathlib.Path, git: Git, base_sha: str
+) -> tuple[str | None, str | None]:
+    """(where placed_commit puts src's file in base_sha's tree, None), or (None, why not)."""
+    path = sources / f'{src.stem}.json'
+    try:
+        doc = loads(git.show(base_sha, str(path)))
+    except (GitError, ValueError) as exc:
+        return None, str(exc)
+    if not isinstance(doc, dict):
+        return None, f'{path.name} is not a JSON object'
+    at, why = placed_commit(doc, path, git, base_sha)
+    return at, None if why is None else str(why)
+
+
+def moves_to_older(
+    e: dict,
+    b: dict | None,
+    found: Loaded,
+    placed_at_base: Callable[[Source], tuple[str | None, str | None]],
+    git: Git,
+) -> list[str]:
+    """Why entry e may not leave its base entry b's source for found: superseded_entries
+    sees only the sources the head names, so deleting the base's newer source would let
+    an entry demote, raise or move back through an older one."""
+    bs = parse_source(b.get('source')) if b else None
+    if bs is None or b['source'] == e['source']:
+        return []
+    label = f"the base's {bs.label}"
+    place, why = placed_at_base(bs)
+    if place is None:
+        return [f'{label}: {why}']
+    try:
+        older = found.at != place and git.is_ancestor(found.at, place)
+    except GitError as exc:
+        return [f'{label}: {exc}']
+    if not older:
+        return []
+    return [
+        (
+            f'{found.source.label} measured {found.at}, older than {label} at {place}; '
+            'an entry moves only to a newer source'
+        )
+    ]
+
+
 def placed_commit(doc: dict, path: pathlib.Path, git: Git, head_sha: str) -> tuple:
     """(the commit in head's history whose code source doc at path measured, None), or
     (None, why it has none), Curable unless git failed. That is its `commit` when the commit that added path already
@@ -1685,7 +1781,8 @@ def check_in(
     cell cal measured takes its entry from it (calibrated_entry), but one whose entry comes
     from a measured file placed after cal's commit; every other entry stays. An accepted
     cell cal absorbed (absorbed_by's rule) or whose budget no longer exceeds its entry's
-    goes, plan.json takes cal's seconds, and a source no entry names is dropped."""
+    goes, plan.json takes cal's seconds, a source no entry names is dropped, and so is a
+    retired item of a cell cal measured, whose tier is cal's again."""
     src = calibration_source(cal, budgets, repo)
     at = git.commit(str(cal.get('commit')))
     measured, why = source_cells(cal, 'calibration')
@@ -1708,6 +1805,9 @@ def check_in(
             ratio = round(new['baseline'] / old['baseline'], 3) if old['baseline'] else ''
             raises.append((key_text(k), old['baseline'], new['baseline'], ratio))
     head = {**budgets, 'budgets': [entries[k] for k in sorted(entries)]}
+    back = [r for r in budgets.get('retired', []) if key(r) in measured]
+    if back:
+        head['retired'] = [r for r in budgets['retired'] if key(r) not in measured]
     files, removed = check_in_accepted(accepted, entries, (src, measured, at), head_sha, git)
     drop = unnamed_sources(sources, head)
     dropped = sorted({SOURCE_FILE_RE.match(n)[1] for n in drop})
@@ -1724,6 +1824,11 @@ def check_in(
         *table('Raised gated baselines', ('Cell', 'Before', 'After', 'Ratio'), raises),
         *table('Measured values kept', ('Cell', 'Measured', 'Calibrated', 'Source'), kept),
         *table('Accepted slowdowns removed', ('File', 'Cell', 'Why'), removed),
+        *table(
+            'Retired cells measured again',
+            ('Cell', 'Reason'),
+            ((key_text(key(r)), r['reason']) for r in back),
+        ),
     ]
     if dropped:
         labels = (f'{"measured file" if "-" in d else "calibration"} {d}' for d in dropped)
@@ -1781,11 +1886,15 @@ def calibrated_entry(budgets: dict, c: dict, url: str) -> dict:
 
 
 def measured_place(sources: pathlib.Path, stem: str, head_sha: str, git: Git) -> str | None:
-    """Where placed_commit puts measured file stem under sources, None when it cannot."""
+    """Where placed_commit puts measured file stem under sources, None when the file is
+    absent or its place is a Curable refusal, which the gate holds against its entry too.
+    A git failure raises, since reading it as no place would overwrite the file's value."""
     path = sources / f'{stem}.json'
     if not path.is_file():
         return None
-    at, _ = placed_commit(load(path), path, git, head_sha)
+    at, why = placed_commit(load(path), path, git, head_sha)
+    if at is None and not isinstance(why, Curable):
+        raise GitError(f'measured file {stem}: {why}')
     return at
 
 
@@ -1989,6 +2098,10 @@ class Git:
         """True when sha is of or one of its ancestors."""
         return self.ok('merge-base', '--is-ancestor', sha, of)
 
+    def show(self, sha: str, path: str) -> str:
+        """The file at path, from the working directory, as commit sha's tree holds it."""
+        return self.git('cat-file', 'blob', f'{sha}:./{os.path.relpath(path)}')
+
     def added_by(self, path: str, head: str) -> str:
         """The newest first-parent commit of head that added path. A move adds its new
         path: rename detection, which `log.follow` turns on, would name the commit that
@@ -2096,6 +2209,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         '--workflow-repository', help='owner/name of the repository whose perf-ci run this is'
     )
     p.add_argument(
+        '--workflow-sha',
+        help='--record-out: the cplieger/ci commit the perf-ci run ran, whose perf_gate.py '
+        'the summary tells the author to take the file with',
+    )
+    p.add_argument(
         '--record-out',
         metavar='DIR',
         help='--verdict: write the counts it recorded to DIR/<run id>-<attempt>.json',
@@ -2121,6 +2239,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         need = ('budgets', 'results', 'prefix', 'remeasure_attempt', 'remeasure')
         if a.record_out:
             need += ('repo', 'head', 'commit', 'run_id', 'run_attempt', 'workflow_repository')
+            need += ('workflow_sha',)
     elif a.take:
         need = ('budgets', 'reason')
     elif a.check_in:
@@ -2312,7 +2431,13 @@ def write_record(a: argparse.Namespace, out: Outcome, cpu: Iterable[str]) -> Non
     d = pathlib.Path(a.record_out)
     d.mkdir(parents=True, exist_ok=True)
     (d / f'{src.stem}.json').write_text(json.dumps(doc, indent=2) + '\n')
-    out.measured_as = (f'perf-measured-{a.prefix}-attempt-{a.run_attempt}', src.stem)
+    out.measured_as = MeasuredAs(
+        run_id=str(a.run_id),
+        repository=a.workflow_repository,
+        workflow_sha=a.workflow_sha,
+        artifact=f'perf-measured-{a.prefix}-attempt-{a.run_attempt}',
+        stem=src.stem,
+    )
 
 
 def run(a: argparse.Namespace) -> int:
@@ -2351,19 +2476,24 @@ def run(a: argparse.Namespace) -> int:
         units = planned_windows(c for job in matrix['include'] for c in job['cells'])
         results = merge_results(a.results, a.prefix)
         out = compare(budgets, results, units, checked.accepted)
+        # A measured file of another runner is one load_source refuses, so nothing is stale.
+        stale = set() if out.runner_mismatch else checked.stale
         judged = [c for c in results['cells'] if planned(units, c)]
-        out.remeasure = with_stale(out.remeasure, judged, checked.stale)
-        out.failures = checked.errors + out.failures
+        out.remeasure = with_stale(out.remeasure, judged, stale)
+        patterns, _ = reported_patterns(plan_doc)
+        out.failures = (
+            checked.errors + out.failures + retired_measured(budgets, results['cells'], patterns)
+        )
         out.exact_moves = checked.moves
         out.retires = checked.retires
         entries = {key(e): e for e in budgets.get('budgets', [])}
         moved = {c['scenario'] for c in out.remeasure if entries[key(c)]['tier'] == 'exact'}
-        moved |= {k[0] for k in checked.stale}
+        moved |= {k[0] for k in stale}
         extend = extension(plan_doc, units, moved)
         doc = {
             'cells': out.remeasure,
             'scenarios': sorted({c['scenario'] for c in [*out.remeasure, *extend]}),
-            'stale': [key_dict(k) for k in sorted(checked.stale)],
+            'stale': [key_dict(k) for k in sorted(stale)],
             'extend': extend,
             'accepted': [{**key_dict(k), **v} for k, v in sorted(checked.accepted.items())],
         }
