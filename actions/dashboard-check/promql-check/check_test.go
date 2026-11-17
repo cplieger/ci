@@ -356,7 +356,13 @@ func TestAlertsScope(t *testing.T) {
 		{name: "nameless_empty_alone_passes", expr: `max({instance="", __name__="ALERTS", alertname="XTargetAbsent"})`, want: ""},
 		{name: "exact_passes", expr: `max(ALERTS{alertname="XDown", alertstate="firing", instance="$instance"})`, want: ""},
 		{name: "pair_passes", expr: `max(ALERTS{alertname="X", instance="$instance"}) or max(ALERTS{alertname="X", instance=""})`, want: ""},
-		{name: "pair_regex_name_passes", expr: `ALERTS{alertname=~"X|Y", instance="$instance"} or ALERTS{alertname=~"X|Y", instance=""}`, want: ""},
+		{name: "pair_regex_name", expr: `ALERTS{alertname=~"X|Y", instance="$instance"} or ALERTS{alertname=~"X|Y", instance=""}`, want: "Q2"},
+		{name: "wide_empty_beside_exact", expr: `max(up{instance="$instance"}) or count(ALERTS{alertname=~".+", instance=""})`, want: "Q2"},
+		{name: "negated_state_empty_beside_exact", expr: `max(up{instance="$instance"}) or count(ALERTS{alertname="X", alertstate!="firing", instance=""})`, want: "Q2"},
+		{name: "nameless_empty_beside_exact", expr: `max(up{instance="$instance"}) or max({alertname="X", instance=""})`, want: "Q2"},
+		{name: "name_regex_empty_beside_exact", expr: `up{instance="$instance"} or {__name__=~"ALERTS|up", instance=""}`, want: "Q2"},
+		{name: "other_name_regex_beside_exact", expr: `up{instance="$instance"} or {__name__=~"up|x", instance=""}`, want: ""},
+		{name: "target_alert_and_exact", expr: `ALERTS{alertname="X", instance="$instance"} and ALERTS{alertname="X", instance=""}`, want: "Q2"},
 		// The parser decodes names, quotes and comments, so none of these hides a selector.
 		{name: "escaped_metric_name", expr: `max({__name__="\x41LERTS", alertname="XTargetAbsent"})`, want: "Q2"},
 		{name: "space_before_brace", expr: `max(ALERTS {alertname="XTargetAbsent"})`, want: "Q2"},
@@ -405,6 +411,43 @@ func TestOneInstanceMatcherPerSelector(t *testing.T) {
 	}
 }
 
+// instance="" selects series with no instance label, so beside instance="$instance" it is a second
+// arm joined by or. The nearest join to a selector holding instance="$instance" decides.
+func TestEmptyInstanceJoin(t *testing.T) {
+	for _, c := range []struct{ name, expr, why string }{
+		{name: "or_join", expr: `up{instance="$instance"} or up{instance=""}`},
+		{name: "exact_on_right", expr: `up{instance=""} or up{instance="$instance"}`},
+		{name: "or_through_parens_and_arithmetic", expr: `(sum(up{instance="$instance"})) or (0 * sum(up{instance=""}))`},
+		{name: "or_ignoring", expr: `up{instance="$instance"} or ignoring(instance) up{instance=""}`},
+		{name: "nearest_or_decides", expr: `(up{instance="$instance"} or up{instance=""}) and on() x{instance="$instance"}`},
+		{name: "and_join", expr: `up{instance="$instance"} and up{instance=""}`, why: `instance="" is joined to the instance="$instance" selector by and;`},
+		{name: "and_join_aggregated", expr: `count(up{instance="$instance"}) and count(up{instance=""})`, why: `instance="" is joined to the instance="$instance" selector by and;`},
+		{name: "empty_on_left_and", expr: `up{instance=""} and up{instance="$instance"}`, why: `instance="" is joined to the instance="$instance" selector by and;`},
+		{name: "unless_join", expr: `up{instance="$instance"} unless up{instance=""}`, why: `instance="" is joined to the instance="$instance" selector by unless;`},
+		{name: "arithmetic_join", expr: `up{instance="$instance"} + up{instance=""}`, why: `instance="" is joined to the instance="$instance" selector by +;`},
+		{name: "nearest_and_decides", expr: `x{instance="$instance"} or (y{instance="$instance"} and z{instance=""})`, why: `instance="" is joined to the instance="$instance" selector by and;`},
+		{name: "or_of_empty_arms", expr: `up{instance="$instance"} and on() (a{instance=""} or b{instance=""})`, why: `instance="" is joined to the instance="$instance" selector by and;`},
+		{name: "and_in_call_argument_under_or", expr: `w{instance="$instance"} or sum(clamp_min(x{instance="$instance"} and y{instance=""}, scalar(sum(v{instance="$instance"}))))`, why: `instance="" is joined to the instance="$instance" selector by and;`},
+		{name: "exact_in_call_argument", expr: `histogram_quantile(scalar(x{instance="$instance"}), up{instance=""})`, why: `instance="" selects only series with no instance label`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := run(t, appQuery("panel", c.expr))
+			if c.why == "" {
+				if len(r.Findings) != 0 {
+					t.Errorf("findings = %+v, want none", r.Findings)
+				}
+				return
+			}
+			if got := rulesOf(r); !slices.Equal(got, []string{"Q2"}) {
+				t.Fatalf("rules = %v, want [Q2]; findings: %+v", got, r.Findings)
+			}
+			if !strings.Contains(r.Findings[0].Message, c.why) {
+				t.Errorf("message %q does not say %q", r.Findings[0].Message, c.why)
+			}
+		})
+	}
+}
+
 func TestFindingText(t *testing.T) {
 	expr := `sum(increase(up{instance=~"$instance|", job="x"}[${__interval_ms}ms]))`
 	in := appQuery("panel", expr)
@@ -412,7 +455,7 @@ func TestFindingText(t *testing.T) {
 	r := run(t, in)
 	want := map[string]struct{ message, fix string }{
 		"Q1": {"increase returns nothing from a single sample", "use [$__rate_interval], or [$__range] for a total over the picked range, and give a subquery a range of at least twice its step. An interval variable there needs every choice, auto_min included when auto is on, of at least twice the 15s scrape interval."},
-		"Q2": {`instance=~"$instance|" matches it as a regular expression`, `match the instance exactly with one instance="$instance" in every selector; instance="" goes in a selector of its own, joined by or beside it, or alone on ALERTS whose other matchers are alertname="<name>" and optionally alertstate="<state>".`},
+		"Q2": {`instance=~"$instance|" matches it as a regular expression`, `match the instance exactly with one instance="$instance" in every selector. Put instance="" in a second selector joined by or beside it, or alone in ALERTS{alertname="<name>", instance=""}, optionally with alertstate="<state>"; a selector that can read ALERTS takes instance="" in that shape only.`},
 		"Q3": {`job="x"`, `delete the matcher; the metric name and instance="$instance" select the app's series.`},
 	}
 	if len(r.Findings) != len(want) {

@@ -63,7 +63,10 @@ func (r *rules) apply(q query, first parsed, second parser.Expr) []finding {
 	}
 	if r.app {
 		sels := matchers(expr, second)
-		exact := slices.ContainsFunc(sels, func(s selection) bool { return slices.ContainsFunc(s.matchers, r.exact) })
+		exact := map[*parser.VectorSelector]bool{}
+		for _, s := range sels {
+			exact[s.vs] = slices.ContainsFunc(s.matchers, r.exact)
+		}
 		for _, s := range sels {
 			p.selection(r, s, exact)
 		}
@@ -74,14 +77,14 @@ func (r *rules) apply(q query, first parsed, second parser.Expr) []finding {
 	return r.findings(q, &p)
 }
 
-// selection's exact says the query holds instance="$instance".
-func (p *problems) selection(r *rules, s selection, exact bool) {
+// selection's exact marks the query's selectors that hold instance="$instance".
+func (p *problems) selection(r *rules, s selection, exact map[*parser.VectorSelector]bool) {
 	instances := 0
 	for _, m := range s.matchers {
 		switch {
 		case m.first.Name == instanceLabel:
 			instances++
-			if why := r.instanceMatcher(m, exact || targetAlert(s.vs)); why != "" {
+			if why := r.instanceMatcher(m, emptyArm(s, exact)); why != "" {
 				p.q2 = append(p.q2, why)
 			}
 		case m.second != nil && m.second.Name != m.first.Name:
@@ -130,6 +133,49 @@ func (r *rules) unscoped(q query, expr parser.Expr) []string {
 	return out
 }
 
+// emptyArm says why instance="" fails on s, or "" when it passes: s is joined by or to a selector
+// holding instance="$instance", or s is a targetAlert with no such join. A selector that can read
+// ALERTS takes instance="" only as a targetAlert.
+func emptyArm(s selection, exact map[*parser.VectorSelector]bool) string {
+	switch op, joined := exactJoin(s, exact); {
+	case readsAlerts(s.vs) && !targetAlert(s.vs):
+		return ` can read ALERTS, where instance="" also selects other apps' alerts; there it passes only in ALERTS{alertname="<name>", instance=""}, optionally with alertstate="<state>"`
+	case joined && op == parser.LOR:
+		return ""
+	case joined:
+		return ` is joined to the instance="$instance" selector by ` + op.String() + `; join the two by or, which keeps the series of both`
+	case targetAlert(s.vs):
+		return ""
+	}
+	return ` selects only series with no instance label; it passes in a second selector joined by or to one with instance="$instance", or alone in ALERTS{alertname="<name>", instance=""}, optionally with alertstate="<state>"`
+}
+
+// exactJoin is the operator of the nearest binary expression above s whose other operand holds a
+// selector with instance="$instance", and false when there is none.
+func exactJoin(s selection, exact map[*parser.VectorSelector]bool) (parser.ItemType, bool) {
+	child := parser.Node(s.vs)
+	for _, node := range slices.Backward(s.path) {
+		if be, ok := node.(*parser.BinaryExpr); ok {
+			other := be.LHS
+			if parser.Node(be.LHS) == child {
+				other = be.RHS
+			}
+			if slices.ContainsFunc(selectors(other), func(vs *parser.VectorSelector) bool { return exact[vs] }) {
+				return be.Op, true
+			}
+		}
+		child = node
+	}
+	return 0, false
+}
+
+// readsAlerts says vs can select ALERTS: each of its metric-name matchers, if any, matches it.
+func readsAlerts(vs *parser.VectorSelector) bool {
+	return !slices.ContainsFunc(vs.LabelMatchers, func(m *labels.Matcher) bool {
+		return m.Name == model.MetricNameLabel && !m.Matches("ALERTS")
+	})
+}
+
 // targetAlert is ALERTS matched only by alertname="<name>", alertstate="<state>" equalities and
 // its instance matchers: an alert about a target that is absent carries no instance label, so
 // instance="" alone reads it. Any other matcher is refused rather than judged.
@@ -162,27 +208,35 @@ type matcher struct {
 	first, second *labels.Matcher
 }
 
-// selection is one vector selector of the first reading with its matchers at both.
+// selection is one vector selector of the first reading with its ancestors, root first, and its
+// matchers at both readings.
 type selection struct {
 	vs       *parser.VectorSelector
+	path     []parser.Node
 	matchers []matcher
 }
 
 // matchers lists every vector selector's matchers in tree order. The readings differ only in
 // tokens of one shape, so both trees hold the same matchers in the same places.
 func matchers(expr, second parser.Expr) []selection {
-	a, b := selectors(expr), selectors(second)
-	out := make([]selection, 0, len(a))
-	for i, vs := range a {
-		s := selection{vs: vs}
-		for j, m := range vs.LabelMatchers {
+	var out []selection
+	parser.Inspect(expr, func(node parser.Node, path []parser.Node) error {
+		if vs, ok := node.(*parser.VectorSelector); ok {
+			// Walk reuses path's backing array for the next sibling.
+			out = append(out, selection{vs: vs, path: slices.Clone(path)})
+		}
+		return nil
+	})
+	b := selectors(second)
+	for i := range out {
+		s := &out[i]
+		for j, m := range s.vs.LabelMatchers {
 			pair := matcher{first: m}
 			if i < len(b) && j < len(b[i].LabelMatchers) {
 				pair.second = b[i].LabelMatchers[j]
 			}
 			s.matchers = append(s.matchers, pair)
 		}
-		out = append(out, s)
 	}
 	return out
 }
@@ -233,7 +287,7 @@ func (r *rules) findings(q query, p *problems) []finding {
 		})
 	}
 	if len(p.q2) > 0 {
-		fix := `match the instance exactly with one instance="$instance" in every selector; instance="" goes in a selector of its own, joined by or beside it, or alone on ALERTS whose other matchers are alertname="<name>" and optionally alertstate="<state>".`
+		fix := `match the instance exactly with one instance="$instance" in every selector. Put instance="" in a second selector joined by or beside it, or alone in ALERTS{alertname="<name>", instance=""}, optionally with alertstate="<state>"; a selector that can read ALERTS takes instance="" in that shape only.`
 		switch {
 		case r.instanceVar == nil:
 			fix = `add a single-select instance variable and match instance="$instance".`
@@ -253,9 +307,9 @@ func (r *rules) findings(q query, p *problems) []finding {
 	return out
 }
 
-// instanceMatcher says why one instance matcher fails Q2, or "" when it passes. emptyOK says
-// instance="" passes here: the query holds instance="$instance" or the selector is a targetAlert.
-func (r *rules) instanceMatcher(pair matcher, emptyOK bool) string {
+// instanceMatcher says why one instance matcher fails Q2, or "" when it passes. empty is emptyArm's
+// verdict on its selector.
+func (r *rules) instanceMatcher(pair matcher, empty string) string {
 	m := pair.first
 	shown := r.display(m.String())
 	switch {
@@ -269,10 +323,10 @@ func (r *rules) instanceMatcher(pair matcher, emptyOK bool) string {
 		return shown + " selects every other instance"
 	case r.exact(pair):
 		return ""
-	case m.Value == "" && emptyOK:
+	case m.Value == "" && empty == "":
 		return ""
 	case m.Value == "":
-		return shown + ` selects only series with no instance label; it may stand alone only on ALERTS whose other matchers are alertname="<name>" and optionally alertstate="<state>", and elsewhere only beside instance="$instance"`
+		return shown + empty
 	}
 	return r.instanceValue(pair, shown)
 }
