@@ -62,26 +62,39 @@ func (r *rules) apply(q query, first parsed, second parser.Expr) []finding {
 		p.windows(r, q.Expr, first.expr, second, instant)
 	}
 	if r.app {
-		ms := matchers(expr, second)
-		exact := slices.ContainsFunc(ms, r.exact)
-		for _, m := range ms {
-			switch {
-			case m.first.Name == instanceLabel:
-				if why := r.instanceMatcher(m, exact); why != "" {
-					p.q2 = append(p.q2, why)
-				}
-			case m.second != nil && m.second.Name != m.first.Name:
-				// The name holds a variable's stand-in, which differs between the readings.
-				p.q3 = append(p.q3, r.display(m.first.String())+" takes its label name from a variable, so the check cannot hold it to Q2 or Q3")
-			case slices.Contains(userChosenLabels, m.first.Name):
-				p.q3 = append(p.q3, r.display(m.first.String()))
-			}
+		sels := matchers(expr, second)
+		exact := slices.ContainsFunc(sels, func(s selection) bool { return slices.ContainsFunc(s.matchers, r.exact) })
+		for _, s := range sels {
+			p.selection(r, s, exact)
 		}
 		if !first.partial {
 			p.q2 = append(p.q2, r.unscoped(q, expr)...)
 		}
 	}
 	return r.findings(q, &p)
+}
+
+// selection adds the Q2 and Q3 phrases of one selector's matchers. exact says the query holds
+// instance="$instance".
+func (p *problems) selection(r *rules, s selection, exact bool) {
+	instances := 0
+	for _, m := range s.matchers {
+		switch {
+		case m.first.Name == instanceLabel:
+			instances++
+			if why := r.instanceMatcher(m, exact || targetAlert(s.vs)); why != "" {
+				p.q2 = append(p.q2, why)
+			}
+		case m.second != nil && m.second.Name != m.first.Name:
+			// The name holds a variable's stand-in, which differs between the readings.
+			p.q3 = append(p.q3, r.display(m.first.String())+" takes its label name from a variable, so the check cannot hold it to Q2 or Q3")
+		case slices.Contains(userChosenLabels, m.first.Name):
+			p.q3 = append(p.q3, r.display(m.first.String()))
+		}
+	}
+	if instances > 1 {
+		p.q2 = appendNew(p.q2, fmt.Sprintf(`%s has %d instance matchers, and a series must meet every one, so instance="$instance" beside instance="" reads nothing; put instance="" in a second selector joined by or`, r.display(s.vs.String()), instances))
+	}
 }
 
 // windows adds the refused durations and Q1 calls of one way Grafana sends the query, true for
@@ -111,16 +124,16 @@ func (r *rules) unscoped(q query, expr parser.Expr) []string {
 	}
 	var out []string
 	for _, vs := range selectors(expr) {
-		if !slices.ContainsFunc(vs.LabelMatchers, func(m *labels.Matcher) bool { return m.Name == instanceLabel }) && !targetAlert(vs) {
+		if !slices.ContainsFunc(vs.LabelMatchers, func(m *labels.Matcher) bool { return m.Name == instanceLabel }) {
 			out = appendNew(out, r.display(vs.String())+" has no instance matcher, so it reads every instance's series")
 		}
 	}
 	return out
 }
 
-// targetAlert is ALERTS matched only by alertname="<name>" and at most an alertstate="<state>": an
-// alert about a target that is absent carries no instance label, so instance="$instance" would
-// hide it. Any other operator reads every instance's alerts.
+// targetAlert is ALERTS matched by alertname="<name>", at most an alertstate="<state>" and its
+// instance matchers: an alert about a target that is absent carries no instance label, so
+// instance="" alone reads it. Any other matcher reads other apps' alerts too.
 func targetAlert(vs *parser.VectorSelector) bool {
 	alerts, named := false, false
 	for _, m := range vs.LabelMatchers {
@@ -136,6 +149,7 @@ func targetAlert(vs *parser.VectorSelector) bool {
 			if m.Type != labels.MatchEqual {
 				return false
 			}
+		case instanceLabel:
 		default:
 			return false
 		}
@@ -149,19 +163,27 @@ type matcher struct {
 	first, second *labels.Matcher
 }
 
+// selection is one vector selector of the first reading with its matchers at both.
+type selection struct {
+	vs       *parser.VectorSelector
+	matchers []matcher
+}
+
 // matchers lists every vector selector's matchers in tree order. The readings differ only in
 // tokens of one shape, so both trees hold the same matchers in the same places.
-func matchers(expr, second parser.Expr) []matcher {
+func matchers(expr, second parser.Expr) []selection {
 	a, b := selectors(expr), selectors(second)
-	var out []matcher
+	out := make([]selection, 0, len(a))
 	for i, vs := range a {
+		s := selection{vs: vs}
 		for j, m := range vs.LabelMatchers {
 			pair := matcher{first: m}
 			if i < len(b) && j < len(b[i].LabelMatchers) {
 				pair.second = b[i].LabelMatchers[j]
 			}
-			out = append(out, pair)
+			s.matchers = append(s.matchers, pair)
 		}
+		out = append(out, s)
 	}
 	return out
 }
@@ -212,7 +234,7 @@ func (r *rules) findings(q query, p *problems) []finding {
 		})
 	}
 	if len(p.q2) > 0 {
-		fix := `match the instance exactly in every selector with instance="$instance"; instance="" may stay only beside it.`
+		fix := `match the instance exactly with one instance="$instance" in every selector; instance="" goes in a selector of its own, joined by or beside it, or alone on ALERTS matched by alertname.`
 		switch {
 		case r.instanceVar == nil:
 			fix = `add a single-select instance variable and match instance="$instance".`
@@ -232,9 +254,9 @@ func (r *rules) findings(q query, p *problems) []finding {
 	return out
 }
 
-// instanceMatcher says why one instance matcher fails Q2, or "" when it passes. exact says the
-// query also holds instance="$instance".
-func (r *rules) instanceMatcher(pair matcher, exact bool) string {
+// instanceMatcher says why one instance matcher fails Q2, or "" when it passes. emptyOK says
+// instance="" passes here: the query holds instance="$instance" or the selector is a targetAlert.
+func (r *rules) instanceMatcher(pair matcher, emptyOK bool) string {
 	m := pair.first
 	shown := r.display(m.String())
 	switch {
@@ -248,10 +270,10 @@ func (r *rules) instanceMatcher(pair matcher, exact bool) string {
 		return shown + " selects every other instance"
 	case r.exact(pair):
 		return ""
-	case m.Value == "" && exact:
+	case m.Value == "" && emptyOK:
 		return ""
 	case m.Value == "":
-		return shown + ` selects only series with no instance label; it may stay only beside instance="$instance"`
+		return shown + ` selects only series with no instance label; it may stand alone only on ALERTS matched by alertname, and elsewhere only beside instance="$instance"`
 	}
 	return r.instanceValue(pair, shown)
 }
