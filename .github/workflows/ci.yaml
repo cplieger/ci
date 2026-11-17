@@ -62,8 +62,48 @@ jobs:
           # tip to decide whether any code (non-docs) files changed.
           fetch-depth: 0
 
+      - name: Check out the ci source
+        if: ${{ hashFiles('**/go.mod') != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Restore the go-os matcher
+        id: go-os-files-cache
+        if: ${{ hashFiles('**/go.mod') != '' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/go-os-files
+          key: go-os-files-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.cplieger-ci/scripts/go-os-files/**') }}
+
+      - name: Setup Go for the go-os matcher
+        if: ${{ hashFiles('**/go.mod') != '' && steps.go-os-files-cache.outputs.cache-hit != 'true' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .cplieger-ci/scripts/go-os-files/go.mod
+          cache: false
+
+      # The ci checkout goes once the matcher is built: detect's find probes would
+      # count its files as the repo's.
+      - name: Build the go-os matcher
+        if: ${{ hashFiles('**/go.mod') != '' }}
+        env:
+          CACHE_HIT: ${{ steps.go-os-files-cache.outputs.cache-hit }}
+          GOWORK: 'off'
+        run: |
+          set -euo pipefail
+          if [ "$CACHE_HIT" != true ]; then
+            go build -C .cplieger-ci/scripts/go-os-files -trimpath -o "$RUNNER_TEMP/go-os-files/go-os-files" .
+          fi
+          rm -rf .cplieger-ci
+
       - name: Detect repo surfaces
         id: detect
+        env:
+          GO_OS_FILES: ${{ runner.temp }}/go-os-files/go-os-files
         run: |
           run_go=false
           run_go_nested=false
@@ -210,84 +250,49 @@ jobs:
               go_work_dirs=$(jq -cR '[., inputs | select(. != "")]' <<< "$mod_dirs")
             fi
 
-            # A module tracking a Go file built for windows or darwin is also tested
-            # on that OS's runner, because the Linux go-ci leg may compile none of it.
-            # The rules are go/build's: the name before its first dot ends _GOOS or
-            # _GOOS_GOARCH with a known GOARCH, then an optional _test; or a //go:build
-            # line above the package clause names the OS as a non-negated term. A file
-            # belongs to the deepest module folder above it, and Go skips it when a
-            # name below that folder starts with _ or .
+            # A module gets a windows or darwin runner for each file GO_OS_FILES
+            # (scripts/go-os-files) schedules: go-ci vets the Linux GOOS only. Like Go,
+            # the walk gives a file to the deepest folder above it holding a tracked
+            # go.mod, a CI module or not, and skips it when a name below that folder
+            # starts with _ or ., so only the files a CI module's Go reads reach the
+            # matcher.
             # scripts/test-lane-semantics.sh runs this block, to the matrix dedup.
-            go_os_files() {
-              local f b e os
-              local prune='(^|/)(node_modules|vendor|testdata)/'
-              local arch='386|amd64|amd64p32|arm|armbe|arm64|arm64be|loong64|mips|mipsle|mips64|mips64le'
-              arch+='|mips64p32|mips64p32le|ppc|ppc64|ppc64le|riscv|riscv64|s390|s390x|sparc|sparc64|wasm'
-              local suffix="_(windows|darwin)(_($arch))?(_test)?\$"
-              while IFS= read -r f; do
-                b=${f##*/}
-                if [[ ${b%%.*} =~ $suffix ]]; then
-                  printf '%s\t%s\n' "${BASH_REMATCH[1]}" "$f"
-                fi
-              done < <(git ls-files '*.go' | grep -Ev "$prune" || true)
-              while IFS= read -r f; do
-                e=$(awk '/^package[[:space:]]/ { exit } /^\/\/go:build[[:space:]]/ { print; exit }' "$f")
-                for os in $(go_build_positive_terms "${e#//go:build}" | grep -xE 'windows|darwin'); do
-                  printf '%s\t%s\n' "$os" "$f"
-                done
-              done < <(git grep -lE '^//go:build[[:space:]].*(windows|darwin)' -- '*.go' | grep -Ev "$prune" || true)
+            go_os_inputs() {
+              git ls-files -z go.mod '*/go.mod' '*.go' | MOD_DIRS="$mod_dirs" awk '
+                BEGIN { RS = "\0"; n = split(ENVIRON["MOD_DIRS"], m, "\n"); for (i = 1; i <= n; i++) if (m[i] != "") mod[m[i]] = 1 }
+                /(^|\/)(node_modules|vendor|testdata)\// { next }
+                $0 == "go.mod" { bound["."] = 1; next }
+                /\/go\.mod$/ { bound[substr($0, 1, length($0) - 7)] = 1; next }
+                { file[++nf] = $0 }
+                END {
+                  for (i = 1; i <= nf; i++) {
+                    d = file[i]
+                    do {
+                      if (index(d, "/")) sub(/\/[^\/]*$/, "", d); else d = "."
+                    } while (d != "." && !(d in bound))
+                    if (!(d in mod)) continue
+                    rel = d == "." ? file[i] : substr(file[i], length(d) + 2)
+                    if (("/" rel) ~ /\/[_.]/) continue
+                    printf "%s\t%s\n", d, file[i]
+                  }
+                }'
             }
-            # Prints each term of a //go:build expression under an even number of
-            # negations, counting a ! before the term and each enclosing !( ).
-            go_build_positive_terms() {
-              local e=$1 c i p=0 pending=0 word="" stack=()
-              for ((i = 0; i <= ${#e}; i++)); do
-                c=${e:i:1}
-                if [[ $c =~ [A-Za-z0-9_.] ]]; then
-                  word+=$c
-                  continue
-                fi
-                if [ -n "$word" ]; then
-                  if [ $((p ^ pending)) -eq 0 ]; then
-                    printf '%s\n' "$word"
-                  fi
-                  word=""
-                  pending=0
-                fi
-                case "$c" in
-                  '!') pending=$((pending ^ 1)) ;;
-                  '(')
-                    stack+=("$p")
-                    p=$((p ^ pending))
-                    pending=0
-                    ;;
-                  ')')
-                    if [ "${#stack[@]}" -gt 0 ]; then
-                      p=${stack[-1]}
-                      unset 'stack[-1]'
-                    fi
-                    ;;
-                esac
-              done
-            }
-            while IFS=$'\t' read -r os f; do
+            os_files=""
+            if [ -n "$mod_dirs" ]; then
+              if [ ! -x "${GO_OS_FILES:-}" ]; then
+                echo "::error::the go-os file matcher '${GO_OS_FILES:-}' was not built"
+                exit 1
+              fi
+              os_files=$(go_os_inputs | "$GO_OS_FILES")
+            fi
+            while IFS=$'\t' read -r os d f; do
               [ -z "$f" ] && continue
               case "$os" in
                 windows) runner=windows-latest ;;
                 *) runner=macos-latest ;;
               esac
-              d=$(dirname -- "$f")
-              while [ "$d" != . ] && ! grep -qxF -- "$d" <<< "$mod_dirs"; do
-                d=$(dirname -- "$d")
-              done
-              grep -qxF -- "$d" <<< "$mod_dirs" || continue
-              rel=$f
-              [ "$d" = . ] || rel=${f#"$d"/}
-              if [[ /$rel =~ /[_.] ]]; then
-                continue
-              fi
               go_os_matrix=$(jq -c --arg d "$d" --arg r "$runner" '. + [{dir: $d, runner: $r}]' <<< "$go_os_matrix")
-            done < <(go_os_files)
+            done <<< "$os_files"
             go_os_matrix=$(jq -c 'unique_by([.dir, .runner])' <<< "$go_os_matrix")
             if [ "$go_os_matrix" != "[]" ]; then
               run_go_os=true
@@ -1428,6 +1433,15 @@ jobs:
               echo "no cliff semantics probe in this repo - skipping"
             fi
           ) || { echo "Probe git-cliff bump semantics" >> /tmp/_ci_failures; exit 1; }
+
+      # The lane probe builds scripts/go-os-files; ubuntu-26.04 keeps Go only in
+      # the tool cache, off PATH.
+      - name: Setup Go for the lane probe
+        if: ${{ hashFiles('scripts/go-os-files/go.mod') != '' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: scripts/go-os-files/go.mod
+          cache: false
 
       # Lane and web-probe shell-semantics probe (opt-in by file presence).
       # The cliff probe above pins the git-cliff side of the lane contract;

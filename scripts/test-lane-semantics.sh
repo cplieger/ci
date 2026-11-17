@@ -113,7 +113,7 @@ start = next(i for i, l in enumerate(lines) if l.strip().startswith("# Probe kno
 end = next(i for i in range(start, len(lines)) if lines[i].strip() == "done")
 open(f"{out}/web-probe.sh", "w").write(textwrap.dedent("\n".join(lines[start : end + 1])) + "\n")
 
-start = next(i for i, l in enumerate(lines) if l.strip().startswith("# A module tracking a Go file built for windows or darwin"))
+start = next(i for i, l in enumerate(lines) if l.strip().startswith("# A module gets a windows or darwin runner for each file GO_OS_FILES"))
 end = next(i for i in range(start, len(lines)) if lines[i].strip().startswith("go_os_matrix=$(jq -c 'unique_by"))
 open(f"{out}/go-os.sh", "w").write(textwrap.dedent("\n".join(lines[start : end + 1])) + "\n")
 
@@ -276,14 +276,19 @@ chk "L-W3 a folder with neither package.json nor jsr.json is no frontend" \
   "$(web_probe "$W")" "web_dir= run_web=false"
 
 # ── go-os runner detection states ────────────────────────────────────────────
-# Expected rows follow Go's build constraints (go help buildconstraint): a file
-# name whose part before the first dot ends _GOOS, _GOOS_GOARCH with a known
-# GOARCH, or either plus _test, or a //go:build line above the package clause
-# naming the OS outside an odd number of negations; Go ignores a name starting
-# with _ or . below the module folder (go help packages). mod_dirs is MIRRORED from
-# ci.yaml's detect (nested validation discovery plus the root go.mod).
-# The block runs in a fresh bash with the runner's options (bash -eo pipefail),
-# because a command substitution here would run it with errexit off.
+# Expected rows follow Go's build constraints (go help buildconstraint): a module
+# gets an OS's leg for a file Go builds for that OS, darwin or windows, at a
+# GOARCH, amd64 or arm64, where linux, darwin or windows excludes it; Go ignores
+# a name starting with _ or . below the module folder (go help packages). mod_dirs is MIRRORED from ci.yaml's detect (nested
+# validation discovery plus the root go.mod).
+# The block runs in a fresh bash with the runner's options (bash -e, no
+# pipefail), because a command substitution here would run it with errexit off.
+command -v go >/dev/null || fail "no go on PATH to build scripts/go-os-files"
+GOWORK=off GOFLAGS='' go build -C "$ROOT/scripts/go-os-files" -o "$WORK/go-os-files" . \
+  || fail "scripts/go-os-files does not build"
+export GO_OS_FILES="$WORK/go-os-files"
+helper_go=$(go version "$GO_OS_FILES" | awk '{ print $2 }')
+case "$helper_go" in go1.*) ;; *) fail "no Go release in the matcher's version: '$helper_go'" ;; esac
 cat >"$WORK/go-os-run.sh" <<'SH'
 mod_dirs=$1
 go_os_matrix="[]"
@@ -295,7 +300,7 @@ os_rows() { # sets rows to <dir>=<runner>... for the repo at $R
   local mod_dirs
   mod_dirs=$(cd "$R" && discover_ci | jq -r '.[]')
   if [ -f "$R/go.mod" ]; then mod_dirs=$(printf '.\n%s' "$mod_dirs"); fi
-  rows=$(cd "$R" && bash -eo pipefail "$WORK/go-os-run.sh" "$mod_dirs" "$WORK/go-os.sh") \
+  rows=$(cd "$R" && bash -e "$WORK/go-os-run.sh" "$mod_dirs" "$WORK/go-os.sh") \
     || fail "ci.yaml's go-os block failed in $R"
 }
 commit_all() {
@@ -371,7 +376,8 @@ put k.go "//go:build unix && !darwin" "" "package negated"
 put l.go "//go:build linux && !(freebsd || (darwin && arm64))" "" "package negated"
 commit_all
 os_rows
-chk "L-O3 an OS named only under negation gains no leg" "$rows" ""
+chk "L-O3 a !windows file builds on darwin and linux alone; the other negations exclude every leg OS" \
+  "$rows" ".=macos-latest"
 
 mkrepo goos-vendored
 put go.mod "module github.com/cplieger/vendored" "go 1.26.5"
@@ -395,20 +401,124 @@ put tool/u_windows.go "package tool"
 os_rows
 chk "L-O5 a file under no module, or untracked, gains no leg" "$rows" "tool=macos-latest"
 
-# go_build_positive_terms decides polarity alone; each expression pins one rule.
-awk '/^go_build_positive_terms\(\) \{/,/^}/' "$WORK/go-os.sh" >"$WORK/positive-terms.sh"
-[ -s "$WORK/positive-terms.sh" ] || fail "go_build_positive_terms not found in ci.yaml's go-os block"
-# shellcheck source=/dev/null
-. "$WORK/positive-terms.sh"
-positive() { go_build_positive_terms "$1" | sort | paste -sd' ' -; }
-chk "L-P1 a bare term" "$(positive 'windows')" "windows"
-chk "L-P2 a negated term" "$(positive '!windows')" ""
-chk "L-P3 a double negation" "$(positive '!!windows')" "windows"
-chk "L-P4 an alternation" "$(positive 'linux || darwin')" "darwin linux"
-chk "L-P5 a negated group" "$(positive '!(linux || darwin)')" ""
-chk "L-P6 a negation inside a negated group" "$(positive '!(!windows)')" "windows"
-chk "L-P7 nested groups" "$(positive 'a && !(b || !(c && darwin))')" "a c darwin"
-chk "L-P8 a version term" "$(positive 'go1.21 && windows')" "go1.21 windows"
+mkrepo goos-eval
+put go.mod "module github.com/cplieger/eval" "go 1.26.5"
+put main.go "package main"
+case_mod_at() { # <go version> <module dir> <file> <line>...: a module whose one file holds the lines
+  put "$2/go.mod" "module github.com/cplieger/eval/$2" "go $1"
+  put "$2/$3" "${@:4}"
+}
+case_mod() { case_mod_at 1.26.5 "$@"; }
+case_mod notlinux n.go "//go:build !linux" "" "package p"
+case_mod notlinuxwin n.go "//go:build !linux && !windows" "" "package p"
+case_mod notunix n.go "//go:build !unix" "" "package p"
+case_mod darwinbsd n.go "//go:build darwin || freebsd" "" "package p"
+case_mod linux n.go "//go:build linux" "" "package p"
+case_mod notlinuxorwin n.go "//go:build !(linux || windows)" "" "package p"
+case_mod notunixordarwin n.go "//go:build !unix || darwin" "" "package p"
+case_mod notlinuxorbsd n.go "//go:build !(linux || freebsd)" "" "package p"
+case_mod name n_darwin.go "package p"
+case_mod ignore n.go "//go:build darwin && ignore" "" "package p"
+case_mod fixture testdata/n.go "//go:build !linux" "" "package p"
+case_mod armonly n.go "//go:build arm64" "" "package p"
+case_mod plusbuild n.go "// +build !linux" "" "package p"
+case_mod linuxdarwin n.go "//go:build linux || darwin" "" "package p"
+case_mod unix n.go "//go:build unix" "" "package p"
+case_mod notplan9 n.go "//go:build !plan9" "" "package p"
+case_mod nonascii café_darwin.go "package p"
+case_mod quote 'a"b_darwin.go' "package p"
+case_mod_at "${helper_go#go}" nodwarf n.go "//go:build !goexperiment.dwarf5 && !linux" "" "package p"
+case_mod_at "${helper_go#go}" dwarf n.go "//go:build goexperiment.dwarf5 && darwin" "" "package p"
+case_mod notjson n.go "//go:build !goexperiment.jsonv2 && !linux" "" "package p"
+case_mod mixexp n.go "//go:build goexperiment.greenteagc && !goexperiment.jsonv2 && !linux" "" "package p"
+case_mod json n.go "//go:build goexperiment.jsonv2 && darwin" "" "package p"
+case_mod newgo n.go "//go:build go1.27 && darwin" "" "package p"
+case_mod oldgo n.go "//go:build !go1.27 && darwin" "" "package p"
+put toolchain/go.mod "module github.com/cplieger/eval/toolchain" "go 1.26.5" "toolchain go1.27.4"
+put toolchain/n.go "//go:build go1.27 && darwin" "" "package p"
+case_mod race n.go "//go:build race && !linux" "" "package p"
+case_mod racealone n.go "//go:build race" "" "package p"
+case_mod nocgo n.go "//go:build !cgo && darwin" "" "package p"
+case_mod nocgoalone n.go "//go:build !cgo" "" "package p"
+commit_all
+os_rows
+legs() { # <module dir> -> its runners in $rows, space-separated
+  tr ' ' '\n' <<<"$rows" | awk -F= -v d="$1" '$1 == d { print $2 }' | paste -sd' ' -
+}
+chk "L-O7 !linux builds on darwin and windows" "$(legs notlinux)" "macos-latest windows-latest"
+chk "L-O7 !linux && !windows builds on darwin alone" "$(legs notlinuxwin)" "macos-latest"
+chk "L-O7 !unix builds on windows alone, darwin being unix" "$(legs notunix)" "windows-latest"
+chk "L-O7 darwin || freebsd builds on darwin" "$(legs darwinbsd)" "macos-latest"
+chk "L-O7 linux builds on neither" "$(legs linux)" ""
+chk "L-O7 !(linux || windows) builds on darwin alone" "$(legs notlinuxorwin)" "macos-latest"
+chk "L-O7 !unix || darwin builds on darwin and windows" "$(legs notunixordarwin)" "macos-latest windows-latest"
+chk "L-O7 !(linux || freebsd) builds on darwin and windows" "$(legs notlinuxorbsd)" "macos-latest windows-latest"
+chk "L-O7 a _darwin file name builds on darwin" "$(legs name)" "macos-latest"
+chk "L-O7 the ignore tag is never set" "$(legs ignore)" ""
+chk "L-O7 a testdata file is never built" "$(legs fixture)" ""
+chk "L-O7 an arch constraint alone builds on linux at that arch too" "$(legs armonly)" ""
+chk "L-O7 a +build line counts where no //go:build line does" "$(legs plusbuild)" "macos-latest windows-latest"
+chk "L-O7 linux || darwin builds on darwin, which windows excludes" "$(legs linuxdarwin)" "macos-latest"
+chk "L-O7 unix builds on darwin, which windows excludes" "$(legs unix)" "macos-latest"
+chk "L-O7 !plan9 builds on every runner OS" "$(legs notplan9)" ""
+chk "L-O7 a non-ASCII _darwin file name builds on darwin" "$(legs nonascii)" "macos-latest"
+chk "L-O7 a _darwin file name holding a double quote builds on darwin" "$(legs quote)" "macos-latest"
+chk "L-O7 darwin lacks the dwarf5 experiment, and windows has it" "$(legs nodwarf)" "macos-latest"
+chk "L-O7 goexperiment.dwarf5 && darwin builds nowhere" "$(legs dwarf)" ""
+chk "L-O7 a module on another Go minor tries a negated experiment on and off" "$(legs notjson)" "macos-latest windows-latest"
+chk "L-O7 a module on another Go minor tries a mix of experiments on and off" "$(legs mixexp)" "macos-latest windows-latest"
+chk "L-O7 a module on another Go minor tries each experiment its file names on and off: a leg too many, never one too few" "$(legs json)" "macos-latest"
+chk "L-O7 go1.27 is unset under a go 1.26.5 module" "$(legs newgo)" ""
+chk "L-O7 !go1.27 && darwin builds on darwin under a go 1.26.5 module" "$(legs oldgo)" "macos-latest"
+chk "L-O7 the toolchain line outranks the go line" "$(legs toolchain)" "macos-latest"
+chk "L-O7 the race leg sets the race tag" "$(legs race)" "macos-latest windows-latest"
+chk "L-O7 the race tag alone builds on every runner OS" "$(legs racealone)" ""
+chk "L-O7 the cross-vet leg turns cgo off" "$(legs nocgo)" "macos-latest"
+chk "L-O7 cgo off alone builds on every runner OS" "$(legs nocgoalone)" ""
+chk "L-O7 the root module's file builds everywhere" "$(legs .)" ""
+
+os_status() { # -> the go-os block's exit status for the repo at $R
+  local mod_dirs rc=0
+  mod_dirs=$(cd "$R" && discover_ci | jq -r '.[]')
+  if [ -f "$R/go.mod" ]; then mod_dirs=$(printf '.\n%s' "$mod_dirs"); fi
+  (cd "$R" && bash -e "$WORK/go-os-run.sh" "$mod_dirs" "$WORK/go-os.sh") >/dev/null 2>&1 || rc=$?
+  echo "$rc"
+}
+mkrepo goos-unreadable
+put go.mod "module github.com/cplieger/unreadable" "go 1.26.5"
+put main.go "package main"
+printf '//go:build !linux\n\npackage p\0\n' >"$R/bad.go" # go/build refuses a NUL byte
+commit_all
+chk "L-O8 a file go/build cannot read fails detect" "$(os_status)" "1"
+chk "L-O8 and so does a missing matcher in a repo with a module" "$(GO_OS_FILES='' os_status)" "1"
+mkrepo goos-nomodule
+put x_windows.go "package x"
+commit_all
+chk "L-O8 a repo with no module needs no matcher" "$(GO_OS_FILES='' os_status)" "0"
+mkrepo goos-skipped
+put go.mod "module github.com/cplieger/skipped" "go 1.26.5"
+put main.go "package main"
+put _tmpl/x.go "//go:build {{.Tags}}" "" "package {{.Name}}"
+commit_all
+chk "L-O8 a template under a _ folder Go never reads passes detect" "$(os_status)" "0"
+os_rows
+chk "L-O8 and gains no leg" "$rows" ""
+mkrepo goos-outside
+put tool/go.mod "module github.com/cplieger/outside/tool" "go 1.26.5"
+put tool/t.go "package tool"
+printf '//go:build !linux\n\npackage p\0\n' >"$R/bad.go"
+commit_all
+chk "L-O8 an unreadable file outside every module passes detect" "$(os_status)" "0"
+mkrepo goos-pruned
+put go.mod "module github.com/cplieger/pruned" "go 1.26.5"
+put main.go "package main"
+put static/gen/go.mod "module github.com/cplieger/pruned/static/gen" "go 1.26.5"
+put static/gen/x.go "//go:build {{.Tags}}" "" "package {{.Name}}"
+put static/gen/n.go "//go:build !linux" "" "package gen"
+commit_all
+chk "L-O8 a module CI prunes is its own boundary, so its template passes detect" "$(os_status)" "0"
+os_rows
+chk "L-O8 and gives its parent no leg" "$rows" ""
 
 # ── Classification states ────────────────────────────────────────────────────
 # No lane carries a tag yet, so every lane is judged on the root range: its
