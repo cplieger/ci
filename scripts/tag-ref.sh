@@ -216,7 +216,7 @@ claim_unused() {
     return 0
   fi
   if ! retry gh api -X DELETE "repos/$1/git/refs/tags/$2" >/dev/null; then
-    echo "::error::tag $2 at $3 has nothing written under it, and GitHub refused its delete. Delete refs/tags/$2 by hand, or a later stable run stops at it."
+    echo "::error::tag $2 at $3 has nothing written under it, and GitHub refused its delete. Delete refs/tags/$2 by hand: until then it stands as an unproven claim of a version never published."
     return 1
   fi
   echo "::notice::nothing was written under tag $2, so this run's claim of it is deleted."

@@ -2096,10 +2096,8 @@ jobs:
           set -euo pipefail
           mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
 
-      # npm keeps every version it is given, so the claim job's tag must hold
-      # this commit before the first write, and on dev a later dev tag
-      # shipping this commit hands off, so a rerun never moves npm's dev
-      # dist-tag back (tag-ref.sh claim_held).
+      # npm keeps every version it is given, so the claim job's tag is verified
+      # before the first write (tag-ref.sh claim_held).
       - name: Verify the claim
         id: claim
         env:
@@ -2163,7 +2161,7 @@ jobs:
 
       # The dev version's proof, after its last write (release-state.sh
       # claims reads it); a failed POST leaves the claim unproven, and the
-      # commit's next attempt reuses it (the claim job).
+      # commit's next attempt reuses it (the claim job, or claim_held on a failed-jobs rerun).
       - name: Record the dev receipt
         if: ${{ steps.claim.outputs.claimed == 'true' && needs.detect.outputs.channel == 'dev' }}
         env:
@@ -2313,10 +2311,10 @@ jobs:
           bash "$CI_TOOLS/publish-subpackage.sh"
 
   # ─── Delete a claim nothing was written under ──────────────────────────────
-  # An unproven root tag at another commit stops the next stable run
-  # (release-state.sh receipts), so a run that ends before its first write
-  # under the claim job's tag (a failed gate, a skipped rebuild, a cancel)
-  # deletes it. The signal is the release/claim status claim_held posts before
+  # A root tag nothing was written under claims a version never published (on
+  # stable it stops the next run, release-state.sh receipts), so a run that
+  # ends before its first write under the claim job's tag (a failed gate, a
+  # skipped rebuild, a cancel) deletes it. The signal is the release/claim status claim_held posts before
   # the first write, never a job output, which a failed job may not pass on.
   unclaim:
     needs: [detect, claim, docker, ts, subpackage]

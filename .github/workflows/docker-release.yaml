@@ -1243,14 +1243,10 @@ jobs:
             exit 1
           fi
 
-      # The version's git tag is its claim, which the caller's claim job takes
-      # before the build and this step only verifies (tag-ref.sh claim_held):
-      # a tag at another commit publishes nothing, so no two commits share a
-      # version, and on dev a later dev tag shipping this commit hands off, so
-      # a rerun never moves :dev back. Its release/claim status marks the
-      # writes as begun, so the caller's unclaim job keeps the tag. The proof
-      # that the writes ran comes after them: the dev-receipt job's receipt,
-      # or the Release.
+      # The caller's claim job took the version's tag before the build; this step
+      # only verifies it, and marks the writes as begun (tag-ref.sh claim_held owns
+      # its outcomes). The proof that the writes ran comes after them: the
+      # dev-receipt job's receipt, or the Release.
       - name: Verify the claim
         id: claim
         if: ${{ env.PUBLISH == 'true' }}
