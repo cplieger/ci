@@ -620,14 +620,12 @@ jobs:
       runner: ${{ inputs.runner }}
 
   # The tier 2 performance gate. perf-ci.yaml's plan job measures the `pr` set
-  # on a pull request or merge queue and nothing on a push; its verdict signs
-  # the measured file with the id token.
+  # on a pull request or merge queue and nothing on a push.
   perf:
     needs: detect
     if: ${{ needs.detect.outputs.run_perf == 'true' }}
     permissions:
       contents: read
-      id-token: write
     uses: ./.github/workflows/perf-ci.yaml
     with:
       runner: ${{ inputs.runner }}

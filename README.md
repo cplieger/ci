@@ -6,7 +6,7 @@ Reusable GitHub Actions workflows that lint, test, sign and release every cplieg
 
 - One CI entry point, `ci.yaml`, that looks at what a repository contains and runs the matching Go, TypeScript, shell, Docker, Python and Markdown checks. Every result feeds one required check, `ci / validate`.
 - One release workflow, `release.yaml`, that computes the next version from conventional commits with git-cliff. It publishes a Docker image for `amd64` and `arm64` signed with cosign, npm and JSR packages, or a Go module tag.
-- A performance gate for a web app that commits `tests/perf/plan.json`: it measures the app in Chromium and WebKit and holds each measured cell to a budget calibrated on GitHub's runners.
+- A performance gate for a web app that commits `tests/perf/plan.json`: it measures the app in Chromium and WebKit on GitHub's runners and fails a pull request when a timing cell regresses far past its baseline on the base branch, or when it cannot make that check ([the performance gate](docs/workflows.md#the-performance-gate) lists each case).
 - Security scans with CodeQL, Trivy and gitleaks. Trivy and the full-history gitleaks scan report to the Security tab and never block a merge.
 - Lint, format and changelog configs for golangci-lint, ESLint, Prettier, Stylelint, html-validate, Ruff and git-cliff. A sync job copies them into each cplieger repository as pull requests.
 - Eight composite actions.
