@@ -319,6 +319,15 @@ class CosignInstall(unittest.TestCase):
                 env = yaml.safe_load(text)['env']
                 self.assertEqual((env['COSIGN_VERSION'], env['COSIGN_SHA256']), pins[0])
 
+    def test_self_ci_installs_cosign_before_the_signature_test_runs(self):
+        steps = jobs('self-ci.yaml')['release-channel-scripts']['steps']
+        names = [s.get('name') for s in steps]
+        install = steps[names.index('Install cosign')]
+        self.assertTrue(install['uses'].startswith('sigstore/cosign-installer@'))
+        self.assertLess(
+            names.index('Install cosign'), names.index('Probe the release-channel scripts')
+        )
+
     def fetch(self, url: str, dest: Path) -> None:
         got = subprocess.run(
             [
