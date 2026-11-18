@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The tier 2 performance gate: the guard of the timing cells a web app's harness
-measured against the baselines of its base tests/perf/budgets.json, the provenance
-check of that file, and the ten-run calibration that proposes it.
+measured against dev's trend baselines (perf_trend.py), the provenance check of a
+tests/perf/budgets.json, and the ten-run calibration that proposes one.
 
 A results file (`results.json`, one per measure shard) is
   {"schema": 1, "runner": str, "cpu_model": str,
@@ -339,23 +339,26 @@ GUARD = {
     'rss_mb': (1.25, 50.0),
 }
 TIMING_KINDS = ('time', 'server_cpu')
+TREND_BASELINE = 'series/dev/baseline.json'
 
 
-def baselines_from_budgets(doc: dict) -> tuple[str, dict[tuple, float]]:
-    """A budgets.json of any schema as its runner and each entry's numeric baseline by
-    key; every other field is ignored."""
-    entries = doc.get('budgets', [])
-    if not isinstance(entries, list):
-        raise TypeError('budgets.json: budgets must be a list')
+def baselines_from_trend(doc: dict) -> tuple[str, dict[tuple, float]]:
+    """The perf-trend branch's series/dev/baseline.json (perf_trend.guard_baseline) as its
+    runner and each cell's numeric baseline by key; every other field is ignored."""
+    cells = doc.get('cells', [])
+    if not isinstance(cells, list):
+        raise TypeError(f'{TREND_BASELINE}: cells must be a list')
     out = {}
-    for i, e in enumerate(entries):
+    for i, e in enumerate(cells):
         if not isinstance(e, dict) or not all(isinstance(e.get(f), str) for f in KEY_FIELDS):
-            raise ValueError(f'budgets[{i}]: must be an object naming {", ".join(KEY_FIELDS)}')
+            raise ValueError(f'cells[{i}]: must be an object naming {", ".join(KEY_FIELDS)}')
         if is_number(e.get('baseline')):
             out[key(e)] = e['baseline']
     runner = doc.get('runner')
     if not isinstance(runner, str) or not runner:
-        raise ValueError('budgets.json: runner must name the runner the baselines were measured on')
+        raise ValueError(
+            f'{TREND_BASELINE}: runner must name the runner the baselines were measured on'
+        )
     return runner, out
 
 
@@ -393,7 +396,7 @@ def guard(
     *,
     windows: dict[str, set[str]],
 ) -> Outcome:
-    """Judge each measured timing cell's median of three against its base baseline: one
+    """Judge each measured timing cell's median of three against its trend baseline: one
     over the guard is listed in `remeasure`, never failed here. Counts and reports are
     information. On the baselines' runner, a baselined timing cell of `units`
     (planned_windows) that no shard measured fails, unless it is a server route or its
@@ -432,20 +435,21 @@ def guard(
         # is a change in what the page requests, not a cell the harness lost.
         if family(k[5]) == SERVER_CPU:
             out.notices.append(
-                f'{key_text(k)}: the base has a baseline for this route, and no shard measured it'
+                f"{key_text(k)}: dev's trend has a baseline for this route, and no shard "
+                'measured it'
             )
         elif dropped:
             out.notices.append(
-                f'{key_text(k)}: the base has a baseline for it, and the head plan.json no '
+                f"{key_text(k)}: dev's trend has a baseline for it, and the head plan.json no "
                 f'longer measures window {k[4]}'
             )
         else:
             out.failures.append(
-                f'{key_text(k)}: the base has a baseline for it, and no shard measured it'
+                f"{key_text(k)}: dev's trend has a baseline for it, and no shard measured it"
             )
     if not guarded:
         out.failures.append(
-            'nothing to guard: the base has a baseline for none of the timing cells this run '
+            "nothing to guard: dev's trend has a baseline for none of the timing cells this run "
             'measured'
         )
     return out
@@ -453,7 +457,7 @@ def guard(
 
 def guard_verdict(decided: dict, results: dict, remeasured: dict) -> Outcome:
     """Fail each cell of compare's decision (its remeasure.json, every cell carrying its
-    base baseline) whose median of six reps, its first three and the three re-measured,
+    baseline) whose median of six reps, its first three and the three re-measured,
     is still over the guard."""
     out = Outcome(runner=results.get('runner', ''))
     first = {key(c): c for c in results.get('cells', [])}
@@ -503,7 +507,7 @@ def guard_summary(out: Outcome) -> str:
     if out.runner_mismatch:
         lines += [
             (
-                f'The results come from runner `{out.runner}`, which the base baselines were '
+                f"The results come from runner `{out.runner}`, which dev's trend baselines were "
                 'not measured on, so every metric is reported and none is guarded.'
             ),
             '',
@@ -544,8 +548,8 @@ def guard_summary(out: Outcome) -> str:
         ),
     )
     lines += table(
-        'Counts that differ from the base (information)',
-        ('Cell', 'Base', 'Measured'),
+        'Counts that differ from dev (information)',
+        ('Cell', 'Dev', 'Measured'),
         (
             (
                 key_text(key(r['cell'])),
@@ -558,7 +562,7 @@ def guard_summary(out: Outcome) -> str:
     )
     lines += table(
         'Every other measured cell (information)',
-        ('Cell', 'Kind', 'Median', 'Base'),
+        ('Cell', 'Kind', 'Median', 'Dev'),
         (
             (
                 key_text(key(r['cell'])),
@@ -2073,8 +2077,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument('--budgets', help='the head budgets.json')
     p.add_argument(
         '--base',
-        help="the base ref's budgets.json: the guard's baselines, where a missing file "
-        "fails, or --check-file's base, where it is an empty one",
+        help="--check-file's base budgets.json, where a missing file is an empty one",
+    )
+    p.add_argument(
+        '--trend',
+        help=f"the guard's baselines: {TREND_BASELINE} of the perf-trend branch, where a "
+        'missing file fails',
     )
     p.add_argument('--results', help='the downloaded perf-results-<prefix>-measure-* folders')
     p.add_argument(
@@ -2131,7 +2139,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     elif a.check_in:
         need = ('budgets', 'plan_doc', 'sources', 'repo', 'head', 'pr_body')
     else:
-        need = ('base', 'results', 'prefix', 'remeasure_out', 'plan_doc', 'set')
+        need = ('trend', 'results', 'prefix', 'remeasure_out', 'plan_doc', 'set')
     missing = [f'--{n.replace("_", "-")}' for n in need if not getattr(a, n)]
     if missing:
         p.error(f'missing {", ".join(missing)}')
@@ -2345,13 +2353,18 @@ def run(a: argparse.Namespace) -> int:
 
 
 def run_guard(a: argparse.Namespace) -> Outcome:
-    """The guard's compare of --results against the baselines of --base, writing the red
-    cells with their baselines to --remeasure-out; a base with no file writes nothing."""
-    if not pathlib.Path(a.base).is_file():
+    """The guard's compare of --results against the baselines of --trend, writing the red
+    cells with their baselines to --remeasure-out; a missing --trend writes nothing."""
+    if not pathlib.Path(a.trend).is_file():
         return Outcome(
-            failures=['the base holds no tests/perf/budgets.json, so the guard has no baseline']
+            failures=[
+                (
+                    f'the perf-trend branch holds no {TREND_BASELINE}, so the guard has no '
+                    'baseline: the scheduled perf-trend workflow writes it with each dev point'
+                )
+            ]
         )
-    runner, baselines = baselines_from_budgets(load(a.base))
+    runner, baselines = baselines_from_trend(load(a.trend))
     doc = load(a.plan_doc)
     matrix = plan(doc, a.set, only=a.only.replace(',', ' ').split())
     units = planned_windows(c for job in matrix['include'] for c in job['cells'])

@@ -6,10 +6,15 @@ from __future__ import annotations
 import io
 import json
 import pathlib
+import re
+import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr, redirect_stdout
 
+import ghrest
+import perf_gate
 import perf_trend
 
 REPO = 'cplieger/marotte'
@@ -17,6 +22,7 @@ RUNNER = 'ubuntu-26.04'
 PREFIX = 'cplieger-marotte'
 SHA = 'fecc0bc00f7597c3d2e32b7279d47f1cf0299ed6'
 RUN_URL = 'https://github.com/cplieger/marotte/actions/runs/'
+LABEL = 'performance'
 UNIT = {'scale': 'x10', 'engine': 'chromium', 'width': 'desktop'}
 
 
@@ -39,7 +45,7 @@ def write_shard(directory, name, cells, cpu='AMD EPYC 7763', runner=RUNNER):
 
 
 def made_point(directory, **kw):
-    groups = perf_trend.perf_gate.shard_groups(directory, PREFIX)
+    groups = perf_gate.shard_groups(directory, PREFIX)
     args = {
         'repo': REPO,
         'series': 'dev',
@@ -575,6 +581,283 @@ class Skip(unittest.TestCase):
         t.add(GOOD)
         self.assertEqual(t.scenario(), 'recovering')
         self.assertFalse(perf_trend.skip(t.state, t.state['last']['commit']))
+
+
+class FakeGitHub:
+    """The issue endpoints apply and fetch_issues call, answering as `gh api -i` prints."""
+
+    def __init__(self, issues=(), label=True, fail=None):
+        self.issues = {i['number']: dict(i) for i in issues}
+        self.label = label
+        self.fail = fail or {}
+        self.writes = []
+
+    def reply(self, status, body=None):
+        raw = b'' if body is None else json.dumps(body).encode()
+        out = f'HTTP/2.0 {status} Reason\n\r\n'.encode() + raw
+        return subprocess.CompletedProcess(['gh'], 0 if status < 300 else 1, out, b'')
+
+    def __call__(self, args, stdin=None, timeout=None):
+        method = args[args.index('-X') + 1] if '-X' in args else 'GET'
+        path = next(a for a in args[2:] if a.startswith('repos/'))
+        body = json.loads(stdin) if stdin else None
+        for (m, prefix), status in self.fail.items():
+            if m == method and path.startswith(prefix):
+                return self.reply(status, {'message': 'Validation Failed'})
+        if method != 'GET':
+            self.writes.append((method, path.removeprefix(f'repos/{REPO}/'), body))
+        route = path.split('?')[0].removeprefix(f'repos/{REPO}/')
+        if route == 'labels/performance':
+            return self.reply(200, {'name': LABEL}) if self.label else self.reply(404, {})
+        if route == 'labels':
+            self.label = True
+            return self.reply(201, body)
+        if route == 'issues' and method == 'GET':
+            if 'page=1' not in path.split('&per_page')[1]:
+                return self.reply(200, [])
+            state = re.search(r'state=(\w+)', path)[1]
+            rows = [i for i in self.issues.values() if state == 'all' or i['state'] == state]
+            return self.reply(200, rows)
+        if route == 'issues':
+            n = max(self.issues, default=0) + 1
+            self.issues[n] = {'number': n, 'state': 'open', 'created_at': 'now', **body}
+            return self.reply(201, self.issues[n])
+        number = int(route.split('/')[1])
+        if route.endswith('/comments'):
+            return self.reply(201, {'id': 1})
+        self.issues[number].update(body)
+        return self.reply(200, self.issues[number])
+
+
+def issue(number, scenario='files', state='open', series='dev', body='old'):
+    return {
+        'number': number,
+        'state': state,
+        'title': f'Performance regression in {scenario}',
+        'created_at': '2026-11-02T00:00:00Z',
+        'body': f'<!-- perf-trend:{series}:{scenario} -->\n{body}',
+        'labels': [{'name': LABEL}],
+    }
+
+
+def upsert(body='new', comment=None, scenario='files'):
+    a = {
+        'op': 'upsert',
+        'marker': f'perf-trend:dev:{scenario}',
+        'title': f'Performance regression in {scenario}',
+        'labels': [LABEL],
+        'body': f'<!-- perf-trend:dev:{scenario} -->\n{body}',
+    }
+    return {**a, 'comment': comment} if comment else a
+
+
+class Issues(unittest.TestCase):
+    def apply(self, gh, actions):
+        return perf_trend.apply(actions, REPO, ghrest.Client(run=gh, sleep=lambda _s: None))
+
+    def test_an_upsert_with_no_open_issue_creates_it_labelled_and_assigned(self):
+        gh = FakeGitHub(label=False)
+        self.assertEqual(self.apply(gh, [upsert()]), ['opened #1: Performance regression in files'])
+        (label, created) = gh.writes
+        self.assertEqual(label[:2], ('POST', 'labels'))
+        self.assertEqual(label[2]['name'], LABEL)
+        self.assertEqual(
+            created,
+            (
+                'POST',
+                'issues',
+                {
+                    'title': 'Performance regression in files',
+                    'body': '<!-- perf-trend:dev:files -->\nnew',
+                    'labels': [LABEL],
+                    'assignees': ['cplieger'],
+                },
+            ),
+        )
+        again = FakeGitHub()
+        self.apply(again, [upsert()])
+        self.assertEqual([w[1] for w in again.writes], ['issues'])
+
+    def test_an_upsert_edits_the_open_issue_and_never_opens_a_second(self):
+        gh = FakeGitHub([issue(5), issue(6, 'docs')])
+        lines = self.apply(gh, [upsert(comment='Still over.')])
+        self.assertEqual(lines, ['updated #5: Performance regression in files', 'commented on #5'])
+        self.assertEqual(
+            gh.writes,
+            [
+                (
+                    'PATCH',
+                    'issues/5',
+                    {
+                        'title': 'Performance regression in files',
+                        'body': '<!-- perf-trend:dev:files -->\nnew',
+                    },
+                ),
+                ('POST', 'issues/5/comments', {'body': 'Still over.'}),
+            ],
+        )
+        same = FakeGitHub([issue(5, body='new')])
+        self.assertEqual(self.apply(same, [upsert()]), [])
+        self.assertEqual(same.writes, [])
+
+    def test_a_newer_duplicate_is_closed_and_the_oldest_kept(self):
+        gh = FakeGitHub([issue(9), issue(4), issue(7, series='proof')])
+        lines = self.apply(gh, [upsert()])
+        self.assertEqual(lines[0], 'closed #9 as a duplicate of #4')
+        self.assertIn(
+            ('PATCH', 'issues/9', {'state': 'closed', 'state_reason': 'not_planned'}), gh.writes
+        )
+        self.assertEqual(lines[1], 'updated #4: Performance regression in files')
+        self.assertNotIn(7, {int(w[1].split('/')[1]) for w in gh.writes if '/' in w[1]})
+
+    def test_a_close_comments_on_and_closes_each_open_issue_of_its_marker(self):
+        gh = FakeGitHub([issue(3), issue(8, 'docs'), {**issue(2), 'pull_request': {}}])
+        close = {**upsert(), 'op': 'close', 'comment': 'Within the thresholds again.'}
+        del close['body']
+        self.assertEqual(
+            self.apply(gh, [close, upsert()]),
+            [
+                'closed #3: Performance regression in files',
+                'opened #9: Performance regression in files',
+            ],
+        )
+        self.assertEqual(
+            gh.writes[:2],
+            [
+                ('POST', 'issues/3/comments', {'body': 'Within the thresholds again.'}),
+                ('PATCH', 'issues/3', {'state': 'closed', 'state_reason': 'completed'}),
+            ],
+        )
+
+    def test_an_api_error_fails_the_command_naming_its_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            actions = pathlib.Path(tmp) / 'actions.json'
+            actions.write_text(json.dumps([upsert()]))
+            gh = FakeGitHub(fail={('POST', f'repos/{REPO}/issues'): 422})
+            client = ghrest.Client(run=gh, sleep=lambda _s: None)
+            err = io.StringIO()
+            with (
+                unittest.mock.patch.object(perf_trend.ghrest, 'DEFAULT', client),
+                redirect_stderr(err),
+                redirect_stdout(io.StringIO()),
+            ):
+                rc = perf_trend.main(['issues', '--actions', str(actions), '--repo', REPO])
+            self.assertEqual(rc, 1)
+            self.assertIn('HTTP 422 Validation Failed', err.getvalue())
+
+    def test_fetch_reads_open_and_closed_issues_and_no_pull_request(self):
+        gh = FakeGitHub([issue(3), issue(4, state='closed'), {**issue(5), 'pull_request': {}}])
+        got = perf_trend.fetch_issues(REPO, ghrest.Client(run=gh, sleep=lambda _s: None))
+        self.assertEqual([(i['number'], i['state']) for i in got], [(3, 'open'), (4, 'closed')])
+        self.assertEqual(set(got[0]), {'number', 'state', 'created_at', 'body'})
+
+
+class Record(unittest.TestCase):
+    """The record job's writes into a perf-trend checkout."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = pathlib.Path(tmp.name)
+
+    def record(self, values, n, series='dev', issues=None, runner=RUNNER):
+        p = tp(values, n, series=series, runner=runner)
+        return perf_trend.record(self.root, p, repo=REPO, issues=issues)
+
+    def stored(self, series='dev'):
+        d = self.root / 'series' / series
+        return sorted(f.name for f in (d / 'points').iterdir()), json.loads(
+            (d / 'state.json').read_text()
+        )
+
+    def test_a_point_is_stored_with_the_state_and_dev_s_guard_baseline(self):
+        dom = ('files', 'cold', 'dom')
+        for n, (cold, count) in enumerate(
+            ((1000.0, 640), (1200.0, 641), (900.0, 642), (5000.0, 643)), 1
+        ):
+            self.record({**GOOD, ('files', 'cold', 'cpu_ms'): cold, dom: count}, n)
+        names, state = self.stored()
+        self.assertEqual(names, [perf_trend.point_name(tp(GOOD, n)) for n in range(1, 5)])
+        self.assertEqual(state['last']['commit'], PURE_SHA.format(4))
+        self.assertEqual(state['scenarios']['files']['status'], 'suspect')
+        stored = json.loads((self.root / 'series/dev/points' / names[-1]).read_text())
+        cold = next(c for c in stored['cells'] if c['metric'] == 'cpu_ms' and c['window'] == 'cold')
+        self.assertEqual((cold['baseline'], cold['bad']), (1000.0, True))
+        baseline = json.loads((self.root / 'series/dev/baseline.json').read_text())
+        self.assertEqual(baseline['commits'], [PURE_SHA.format(n) for n in (2, 3, 4)])
+        cells = {(c['window'], c['metric']): (c['kind'], c['baseline']) for c in baseline['cells']}
+        self.assertEqual(cells[('cold', 'cpu_ms')], ('time', 1200.0))
+        self.assertEqual(cells[('cold', 'dom')], ('count', 643))
+        runner, read = perf_gate.baselines_from_trend(baseline)
+        self.assertEqual((runner, len(read)), (RUNNER, 3))
+
+    def test_the_guard_baseline_follows_the_newest_point_s_runner(self):
+        self.record(GOOD, 1)
+        self.record(slow(cold=4000.0), 2, runner='self-hosted')
+        baseline = json.loads((self.root / 'series/dev/baseline.json').read_text())
+        self.assertEqual(baseline['runner'], 'self-hosted')
+        self.assertEqual(baseline['commits'], [PURE_SHA.format(2)])
+
+    def test_a_point_already_recorded_or_of_a_bad_series_is_refused(self):
+        self.record(GOOD, 1)
+        with self.assertRaisesRegex(ValueError, 'already recorded'):
+            self.record(GOOD, 1)
+        for series in ('Dev', '-x', 'a' * 32, '../dev'):
+            with self.subTest(series=series), self.assertRaisesRegex(ValueError, 'series'):
+                self.record(GOOD, 2, series=series)
+
+    def test_a_hand_closed_issue_is_written_back_as_accepted(self):
+        for n in range(1, 8):
+            self.record(GOOD, n)
+        self.record(slow(cold=3000.0), 8)
+        self.record(slow(cold=3000.0), 9)
+        _, state = self.stored()
+        body = f'<!-- perf-trend:dev:files -->\n{state["scenarios"]["files"]["status"]}'
+        closed = {
+            'number': 1,
+            'state': 'closed',
+            'created_at': '2026-11-01T10:00:00Z',
+            'body': body,
+        }
+        actions, _ = self.record(slow(cold=3000.0), 10, issues=[closed])
+        self.assertEqual(actions, [])
+        _, state = self.stored()
+        self.assertEqual(
+            state['scenarios']['files'],
+            {
+                'status': 'ok',
+                'accepted': {'from': '2026-11-01T08:00:00Z', 'at': '2026-11-01T09:00:00Z'},
+            },
+        )
+
+    def test_needs_names_the_state_the_last_points_and_dev_s_points_for_a_young_series(self):
+        dev = [f'series/dev/points/2026110{d}T000000Z-aaa.json' for d in range(1, 10)]
+        dev += [f'series/dev/points/2026111{d}T000000Z-aaa.json' for d in range(10)]
+        dev += [f'series/dev/points/2026112{d}T000000Z-aaa.json' for d in range(5)]
+        proof = ['series/proof/points/20261115T120000Z-bbb.json']
+        listing = ['series/dev/state.json', 'series/dev/baseline.json', *dev, *proof]
+        self.assertEqual(
+            perf_trend.needs(listing, 'dev'), ['series/dev/state.json', *dev[-perf_trend.HISTORY :]]
+        )
+        young = perf_trend.needs(listing, 'proof')
+        self.assertEqual(young[:2], ['series/proof/state.json', *proof])
+        self.assertEqual(
+            young[2:],
+            [p for p in dev if p < 'series/dev/points/20261115T120000Z'][-perf_trend.HISTORY :],
+        )
+        self.assertEqual(perf_trend.needs([], 'proof'), ['series/proof/state.json'])
+
+    def test_the_skip_command_reads_a_missing_state_as_never_measured(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = perf_trend.main(['skip', '--state', str(self.root / 'none.json'), '--commit', SHA])
+        self.assertEqual((rc, out.getvalue()), (0, 'false\n'))
+        self.record(GOOD, 1)
+        out = io.StringIO()
+        state = str(self.root / 'series/dev/state.json')
+        with redirect_stdout(out):
+            perf_trend.main(['skip', '--state', state, '--commit', PURE_SHA.format(1)])
+        self.assertEqual(out.getvalue(), 'true\n')
 
 
 if __name__ == '__main__':

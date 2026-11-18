@@ -517,24 +517,27 @@ def skip(state: dict, commit: str) -> bool:
 
 
 def guard_baseline(points: list[dict]) -> dict:
-    """The pull request guard's baselines from judged dev points, oldest first: each
-    timing cell's median over the last GUARD_POINTS points on the newest point's runner."""
+    """The pull request guard's baselines from dev's points, oldest first: each timing
+    cell's median over the last GUARD_POINTS points on the newest point's runner, and
+    each count as the newest of them measured it, which the guard only reports."""
     runner = points[-1]['runner']
     last = [p for p in points if p['runner'] == runner][-GUARD_POINTS:]
-    values: dict[tuple, list[float]] = {}
+    values: dict[tuple, tuple[str, list]] = {}
     for p in last:
         for c in p['cells']:
-            if perf_gate.is_timing(c) and perf_gate.is_number(c.get('value')):
-                values.setdefault(perf_gate.key(c), []).append(c['value'])
+            counted = c['kind'] == 'count' and c.get('value') is not None
+            if counted or (perf_gate.is_timing(c) and perf_gate.is_number(c.get('value'))):
+                values.setdefault(perf_gate.key(c), (c['kind'], []))[1].append(c['value'])
+    cells = []
+    for k, (kind, v) in sorted(values.items()):
+        value = v[-1] if kind == 'count' else statistics.median(v)
+        cells.append({**perf_gate.key_dict(k), 'kind': kind, 'baseline': value})
     return {
         'schema': SCHEMA,
         'series': DEV,
         'runner': runner,
         'commits': [p['commit'] for p in last],
-        'cells': [
-            {**perf_gate.key_dict(k), 'baseline': statistics.median(v)}
-            for k, v in sorted(values.items())
-        ],
+        'cells': cells,
     }
 
 
@@ -600,8 +603,7 @@ def record(
         repo=repo,
         fallback=[seen(h) for h in fallback],
     )
-    closed = {a['marker'] for a in actions}
-    actions += [a for a in judged.actions if a['marker'] not in closed or a['op'] != 'close']
+    actions += judged.actions
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(dumps(judged.point))
     state_file.write_text(dumps(judged.state))
@@ -613,11 +615,23 @@ def record(
 # --- issues ----------------------------------------------------------------
 
 
-def apply(actions: list[dict], repo: str, client: ghrest.Client = ghrest.DEFAULT) -> list[str]:
+def fetch_issues(repo: str, client: ghrest.Client | None = None) -> list[dict]:
+    """Every issue of repo labelled `performance`, open or closed, as observe reads them."""
+    client = client or ghrest.DEFAULT
+    path = f'repos/{repo}/issues?state=all&labels={quote(LABEL, safe="")}'
+    return [
+        {k: i.get(k) for k in ('number', 'state', 'created_at', 'body')}
+        for i in client.pages(path)
+        if 'pull_request' not in i
+    ]
+
+
+def apply(actions: list[dict], repo: str, client: ghrest.Client | None = None) -> list[str]:
     """Send the judge's actions as issue writes: an upsert edits the oldest open
     `performance` issue holding its marker (closing any newer one as its duplicate) or
     creates it, assigned to the repository owner; a close comments on and closes each
     open one. Returns a line per write."""
+    client = client or ghrest.DEFAULT
     issues = client.pages(f'repos/{repo}/issues?state=open&labels={quote(LABEL, safe="")}')
     found = [i for i in issues if 'pull_request' not in i]
     done = []
@@ -627,6 +641,7 @@ def apply(actions: list[dict], repo: str, client: ghrest.Client = ghrest.DEFAULT
         if a['op'] == 'close':
             for i in mine:
                 close(client, repo, i['number'], a['comment'], 'completed')
+                found.remove(i)
                 done.append(f'closed #{i["number"]}: {a["title"]}')
             continue
         if not mine:
@@ -648,6 +663,7 @@ def apply(actions: list[dict], repo: str, client: ghrest.Client = ghrest.DEFAULT
         keep, *dupes = mine
         for i in dupes:
             close(client, repo, i['number'], f'A duplicate of #{keep["number"]}.', 'not_planned')
+            found.remove(i)
             done.append(f'closed #{i["number"]} as a duplicate of #{keep["number"]}')
         if keep.get('body') != a['body'] or keep.get('title') != a['title']:
             client.send(
@@ -715,6 +731,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     jd.add_argument('--actions', required=True, help='where the issue actions are written')
     jd.add_argument('--summary', help='a file the Markdown summary is appended to')
+    fi = sub.add_parser('fetch-issues', help="write the repository's `performance` issues")
+    fi.add_argument('--repo', required=True)
+    fi.add_argument('--out', required=True)
     iss = sub.add_parser('issues', help="apply judge's actions to the repository's issues")
     iss.add_argument('--actions', required=True)
     iss.add_argument('--repo', required=True)
@@ -755,6 +774,10 @@ def run(a: argparse.Namespace) -> int:
         if a.summary:
             with pathlib.Path(a.summary).open('a') as f:
                 f.write(summary)
+    elif a.command == 'fetch-issues':
+        issues = fetch_issues(a.repo)
+        pathlib.Path(a.out).write_text(json.dumps(issues, indent=1) + '\n')
+        print(f'{a.out}: {len(issues)} issues labelled {LABEL}')
     else:
         actions = json.loads(pathlib.Path(a.actions).read_text())
         for line in apply(actions, a.repo):
