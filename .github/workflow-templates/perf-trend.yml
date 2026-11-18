@@ -24,6 +24,10 @@ on:
         description: "Comma/space-separated scenarios to keep, for a series other than dev. Empty keeps all."
         required: false
         default: ""
+      seed:
+        description: "Start a missing perf-trend branch with this point. Refused while the branch exists or an issue is marked with the series."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -36,15 +40,16 @@ concurrency:
 jobs:
   trend:
     # The called workflow narrows these per job: only the job that runs none of
-    # the measured code pushes the perf-trend branch, and only the issue job
-    # writes issues.
+    # the measured code pushes the perf-trend branch, and only the issue job and
+    # the failure notice write issues.
     permissions:
       actions: read
       contents: write
       issues: write
-    uses: cplieger/ci/.github/workflows/perf-trend.yaml@b8d9eaa83ec378f7d474f92f923a8b323e9d26b0 # v3
+    uses: cplieger/ci/.github/workflows/perf-trend.yaml@fdaf212d7c09918ab24cda4fec339249b1bd946c # v3
     with:
       ref: ${{ inputs.ref }}
       series: ${{ inputs.series }}
       only: ${{ inputs.only }}
+      seed: ${{ inputs.seed == true }}
       runner: ${{ vars.CI_RUNNER }}
