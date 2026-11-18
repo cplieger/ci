@@ -6,7 +6,7 @@ Reusable GitHub Actions workflows that lint, test, sign and release every cplieg
 
 - One CI entry point, `ci.yaml`, that looks at what a repository contains and runs the matching Go, TypeScript, shell, Docker, Python and Markdown checks. Every result feeds one required check, `ci / validate`.
 - One release workflow, `release.yaml`, that computes the next version from conventional commits with git-cliff. It publishes a Docker image for `amd64` and `arm64` signed with cosign, npm and JSR packages, or a Go module tag.
-- A performance gate for a web app that commits `tests/perf/plan.json`: it measures the app in Chromium and WebKit on GitHub's runners and fails a pull request when a timing cell regresses far past its baseline on the base branch, or when it cannot make that check ([the performance gate](docs/workflows.md#the-performance-gate) lists each case).
+- A performance gate for a web app that commits `tests/perf/plan.json`: it measures the app in Chromium and WebKit on GitHub's runners and fails a pull request when a timing cell regresses far past the default branch's baseline, or when it cannot make that check ([the performance gate](docs/workflows.md#the-performance-gate) lists each case). A scheduled trend measures the default branch every eight hours and opens an issue when a scenario regresses at two points in a row ([the performance trend](docs/workflows.md#the-performance-trend)).
 - Security scans with CodeQL, Trivy and gitleaks. Trivy and the full-history gitleaks scan report to the Security tab and never block a merge.
 - Lint, format and changelog configs for golangci-lint, ESLint, Prettier, Stylelint, html-validate, Ruff and git-cliff. A sync job copies them into each cplieger repository as pull requests.
 - Eight composite actions.
@@ -63,7 +63,7 @@ GitHub lets any public repository call a reusable workflow stored in a public re
 
 - Versioning reads a `cliff.toml`, and the lint jobs read the synced configs. Copy them from `configs/` and the repository root.
 - The sync job, the daily settings audit and the scheduled mutation, fuzz, benchmark and performance runs cover cplieger repositories only.
-- The performance gate takes a new budget only from cplieger/ci's own calibration workflow, which calibrates cplieger repositories only; a pull request's own run can only move a count that is already exact. Another repository can therefore commit only an empty budget list, which reports every measured cell and gates none.
+- The performance gate's baselines are the ones the repository's own performance trend writes to its `perf-trend` branch, so another repository calls `perf-trend.yaml` on a schedule as the synced `perf-trend.yml` does, and until its first point the gate fails for want of a baseline.
 - The release workflow sets the image license label for the cplieger repositories it names. Any other repository gets the defaults, which are both registries, `amd64` and `arm64` images, and its own license in the label.
 
 Copying a workflow and adapting it is the other way to reuse one. To build your own, GitHub's [reusable workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows) are the built-in way. If you only need to keep files in step across your repositories, [repo-file-sync-action](https://github.com/BetaHuhn/repo-file-sync-action) opens a pull request in each target repository from a `sync.yml` list.

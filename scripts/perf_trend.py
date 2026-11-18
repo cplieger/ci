@@ -717,7 +717,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     pt.add_argument('--run-url', required=True)
     pt.add_argument('--out', required=True)
     sk = sub.add_parser('skip', help='print true when a point of --commit would add nothing')
-    sk.add_argument('--state', required=True, help="the series' state.json; a missing file is none")
+    sk.add_argument(
+        '--state',
+        required=True,
+        help="the series' state.json, where a missing file is a series never measured",
+    )
     sk.add_argument('--commit', required=True)
     nd = sub.add_parser('needs', help='print the perf-trend paths judging a point reads')
     nd.add_argument('--listing', required=True, help='`git ls-tree -r --name-only` of the branch')
@@ -728,7 +732,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     jd.add_argument('--series', required=True, help='the series the point must belong to')
     jd.add_argument('--repo', required=True)
     jd.add_argument(
-        '--issues', help="the repository's `performance` issues as a JSON list; unset reads none"
+        '--issues', help="the repository's `performance` issues as a JSON list, and none when unset"
     )
     jd.add_argument('--actions', required=True, help='where the issue actions are written')
     jd.add_argument('--summary', help='a file the Markdown summary is appended to')

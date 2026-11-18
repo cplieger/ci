@@ -759,6 +759,7 @@ class SyncOwnedSet(unittest.TestCase):
                 '.gitattributes',
                 '.github/workflows/ci.yaml',
                 '.github/workflows/codeql.yml',
+                '.github/workflows/perf-trend.yaml',
                 '.github/workflows/release.yaml',
                 '.github/workflows/security.yml',
                 '.golangci.yaml',
@@ -891,6 +892,15 @@ class LocalTree(unittest.TestCase):
     def test_an_unreadable_tree_gets_nothing(self):
         for releasing in (False, True):
             self.assertEqual(self.dests([], releasing), [])
+
+    def test_a_repository_committing_a_perf_plan_gets_the_trend_caller(self):
+        trend = '.github/workflows/perf-trend.yaml'
+        for releasing in (False, True):
+            with self.subTest(releasing=releasing):
+                app = ['go.mod', 'main.go', 'static-src/package.json', 'tests/perf/plan.json']
+                self.assertIn(trend, self.dests(app, releasing))
+                self.assertNotIn(trend, self.dests(app[:-1], releasing))
+                self.assertNotIn(trend, self.dests(['go.mod', 'tests/perf/plan.json.bak']))
 
     def test_a_single_branch_go_library_gets_ci_and_lint_but_no_release(self):
         dests = self.dests(['go.mod', 'lib.go'])

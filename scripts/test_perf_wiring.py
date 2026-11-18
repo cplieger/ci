@@ -690,6 +690,56 @@ printf 'HTTP/2.0 200 OK\\r\\n\\r\\n[]'
         self.assertIn('push -q origin HEAD:refs/heads/perf-trend', run)
 
 
+class TrendCaller(unittest.TestCase):
+    """The synced caller of perf-trend.yaml."""
+
+    doc = yaml.safe_load((ROOT / '.github' / 'workflow-templates' / 'perf-trend.yml').read_text())
+
+    def test_it_runs_every_eight_hours_clear_of_the_weekly_runs_and_on_dispatch(self):
+        on = self.doc[True]
+        self.assertEqual(on['schedule'], [{'cron': '17 1,9,17 * * *'}])
+        self.assertEqual(set(on['workflow_dispatch']['inputs']), {'ref', 'series', 'only'})
+        weekly = {
+            s['cron']
+            for path in WORKFLOWS.glob('weekly-*.yaml')
+            for s in (load(path.name)[True].get('schedule') or [])
+        }
+        self.assertTrue(weekly)
+        self.assertTrue(all(c.split()[1] == '22' for c in weekly))
+        self.assertNotIn('22', on['schedule'][0]['cron'].split()[1].split(','))
+
+    def test_its_one_job_grants_what_the_called_jobs_narrow(self):
+        self.assertEqual(self.doc['permissions'], READS)
+        (job,) = self.doc['jobs'].values()
+        self.assertEqual(
+            job['permissions'], {'actions': 'read', 'contents': 'write', 'issues': 'write'}
+        )
+        self.assertRegex(
+            job['uses'], r'^cplieger/ci/\.github/workflows/perf-trend\.yaml@[0-9a-f]{40}$'
+        )
+        self.assertEqual(
+            job['with'],
+            {
+                'ref': '${{ inputs.ref }}',
+                'series': '${{ inputs.series }}',
+                'only': '${{ inputs.only }}',
+                'runner': '${{ vars.CI_RUNNER }}',
+            },
+        )
+        level = {'none': 0, 'read': 1, 'write': 2}
+        granted = job['permissions']
+        for name, spec in load('perf-trend.yaml')['jobs'].items():
+            for scope, access in (spec.get('permissions') or {}).items():
+                with self.subTest(job=name, scope=scope):
+                    self.assertLessEqual(level[access], level[granted.get(scope, 'none')])
+
+    def test_points_of_one_series_queue_behind_each_other(self):
+        self.assertEqual(
+            self.doc['concurrency'],
+            {'group': "perf-trend-${{ inputs.series || 'dev' }}", 'cancel-in-progress': False},
+        )
+
+
 class Release(unittest.TestCase):
     def internal(self) -> set[str]:
         run = '\n'.join(

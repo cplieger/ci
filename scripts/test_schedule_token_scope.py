@@ -1344,9 +1344,7 @@ class PerfPublish(unittest.TestCase):
             with self.subTest(step=s.get('name')):
                 self.assertEqual(s.get('if'), "${{ steps.points.outputs.ok == 'true' }}")
         download = steps[names.index("Download this entry's results")]['with']
-        self.assertEqual(
-            download['pattern'], 'perf-results-cplieger-${{ matrix.repo }}-measure-shard-*'
-        )
+        self.assertEqual(download['pattern'], 'perf-results-cplieger-${{ matrix.repo }}-measure-*')
 
 
 # git for the per-module bench steps: a clone is a real repository holding the
