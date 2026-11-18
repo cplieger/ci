@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # playwright-deps.sh <engine...>: installs the engines' system libraries with the
 # pinned `playwright install-deps`, run from the package directory that pins it.
-# A self-hosted runner may grant no root for apt, so there it installs nothing
-# and its image must carry the libraries. PLAYWRIGHT_DEPS_CACHE, when set, is a
-# directory of .deb files that seeds apt and is refreshed after a success; with
-# PLAYWRIGHT_DEPS_CACHE_KEY, a cache key prefix, a non-empty refresh then writes
-# `key=<prefix><sha256 of the sorted .deb names>` to $GITHUB_OUTPUT. Exits 1 with
-# an ::error:: once every attempt failed; apt's own error is in the log above it.
+# A self-hosted runner may grant no root for apt, so it installs nothing there.
+# PLAYWRIGHT_DEPS_CACHE, when set, is a directory of .deb files that seeds apt and
+# is refreshed after a success; PLAYWRIGHT_DEPS_CACHE_KEY, a key prefix, then gets
+# `key=<prefix><sha256 of the sorted .deb names>` in $GITHUB_OUTPUT. Exits 1 with
+# an ::error:: when apt ignores the drop-in's values or every attempt failed.
 set -euo pipefail
 
 [ "$#" -gt 0 ] || {
@@ -23,22 +22,35 @@ fi
 # apt keeps every finished .deb, so a retry fetches only the remainder.
 ATTEMPTS=3
 ATTEMPT_SECONDS=${PLAYWRIGHT_DEPS_ATTEMPT_SECONDS:-180}
+KILL_SECONDS=30
+FIRST_DELAY=15
 CACHE=${PLAYWRIGHT_DEPS_CACHE:-}
 KEY=${PLAYWRIGHT_DEPS_CACHE_KEY:-}
 ARCHIVES=${PLAYWRIGHT_DEPS_ARCHIVES:-/var/cache/apt/archives}
-# playwright runs apt-get through `sudo sh -c`, which drops the environment, so
-# the options reach apt only as a drop-in. apt's defaults are a 30 s timeout and
-# 3 retries (https://salsa.debian.org/apt-team/apt, methods/basehttp.cc and
-# apt-pkg/acquire-item.cc); the lock wait outlasts a killed attempt's apt.
-CONF=${PLAYWRIGHT_DEPS_CONF:-/etc/apt/apt.conf.d/80-cplieger-ci-retries}
-
-sudo tee "$CONF" >/dev/null <<'EOF'
-Acquire::http::Timeout "20";
+# playwright runs apt-get through `sudo sh -c`, which drops the environment, so the
+# options reach apt only as a drop-in; the lock wait outlasts a killed attempt's apt.
+# apt reads apt.conf.d in C-locale order and the last value wins, so the name sorts
+# after the image's zz-retries and the check below fails if a file still overrides it:
+# https://github.com/actions/runner-images/blob/main/images/ubuntu/scripts/build/configure-apt.sh
+CONF=${PLAYWRIGHT_DEPS_CONF:-/etc/apt/apt.conf.d/zzzz-cplieger-ci-retries}
+OPTIONS='Acquire::http::Timeout "20";
 Acquire::https::Timeout "20";
 Acquire::Retries "5";
 APT::Keep-Downloaded-Packages "true";
-DPkg::Lock::Timeout "60";
-EOF
+DPkg::Lock::Timeout "60";'
+
+printf '%s\n' "$OPTIONS" | sudo tee "$CONF" >/dev/null
+overridden=0
+while read -r name value; do
+  want=${value#\"} want=${want%\";}
+  got=$(apt-config dump --no-empty --format '%v' "$name")
+  echo "apt uses ${name} \"${got}\""
+  if [ "$got" != "$want" ]; then
+    echo "::error::apt uses ${name} \"${got}\", not \"${want}\" from ${CONF}: a file that sorts after it in its directory, or apt.conf, sets it"
+    overridden=1
+  fi
+done <<<"$OPTIONS"
+[ "$overridden" -eq 0 ] || exit 1
 
 # apt installs an archived .deb of the expected name and size without hashing it
 # (pkgAcqArchive::QueueNext, apt-pkg/acquire-item.cc). Only the calling repository's
@@ -50,11 +62,11 @@ if [ -n "$CACHE" ] && [ -d "$CACHE" ]; then
     || echo "::warning::could not seed apt's archive from ${CACHE}"
 fi
 
-attempt=1 delay=15
+attempt=1 delay=$FIRST_DELAY
 while :; do
   rc=0
   # -k: a process that ignores TERM would otherwise hold the step to its timeout.
-  timeout -k 30 "$ATTEMPT_SECONDS" npx --no-install playwright install-deps "$@" || rc=$?
+  timeout -k "$KILL_SECONDS" "$ATTEMPT_SECONDS" npx --no-install playwright install-deps "$@" || rc=$?
   [ "$rc" -ne 0 ] || break
   if [ "$attempt" -ge "$ATTEMPTS" ]; then
     echo "::error::playwright install-deps $* failed ${ATTEMPTS} times, the last with exit ${rc} (124 or 137 means it ran past ${ATTEMPT_SECONDS}s). An Ubuntu mirror or DNS outage is the usual cause: rerun the job once it clears."

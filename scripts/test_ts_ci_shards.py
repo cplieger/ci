@@ -463,6 +463,9 @@ exec "$@"
 """
 
 
+@unittest.skipIf(
+    shutil.which('apt-config') is None, 'playwright-deps.sh checks apt with apt-config'
+)
 class InstallStep(Harness):
     """The browser install both test jobs run before their tests."""
 
@@ -470,6 +473,10 @@ class InstallStep(Harness):
 
     def setUp(self):
         super().setUp()
+        (self.tmp / 'apt.conf.d').mkdir()
+        (self.tmp / 'apt-config').write_text(
+            f'Dir::Etc::parts "{self.tmp / "apt.conf.d"}";\nDir::Etc::main "/dev/null";\n'
+        )
         (self.bin / 'npx').unlink()
         (self.bin / 'npx').write_text(NPX_PLAYWRIGHT_STUB)
         (self.bin / 'npx').chmod(0o755)
@@ -488,7 +495,8 @@ class InstallStep(Harness):
         env = {
             'CPLIEGER_BROWSERS': browsers,
             'CI_TOOLS': str(SCRIPTS),
-            'PLAYWRIGHT_DEPS_CONF': str(self.tmp / 'apt.conf'),
+            'PLAYWRIGHT_DEPS_CONF': str(self.tmp / 'apt.conf.d' / 'zzzz-cplieger-ci-retries'),
+            'APT_CONFIG': str(self.tmp / 'apt-config'),
             'PLAYWRIGHT_DEPS_SLEEP': '0',
             **stub,
         }

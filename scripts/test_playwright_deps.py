@@ -50,6 +50,17 @@ esac
 LOG_STUB = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$STUB_LOG/$(basename "$0")"
 """
+# The hosted image's own drop-in, from actions/runner-images configure-apt.sh.
+IMAGE_RETRIES = (
+    'Acquire::Retries "1";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n'
+)
+OURS = {
+    'Acquire::http::Timeout': '20',
+    'Acquire::https::Timeout': '20',
+    'Acquire::Retries': '5',
+    'APT::Keep-Downloaded-Packages': 'true',
+    'DPkg::Lock::Timeout': '60',
+}
 
 
 def load(name: str) -> dict:
@@ -68,6 +79,16 @@ def setting(name: str) -> int:
     return int(
         re.search(rf'^{name}=(?:\$\{{\w+:-)?(\d+)\}}?$', SCRIPT.read_text(), re.MULTILINE)[1]
     )
+
+
+def apt_config(apt_conf: Path, key: str) -> str:
+    return subprocess.run(
+        ['apt-config', 'dump', '--no-empty', '--format', '%v', key],
+        env={**os.environ, 'APT_CONFIG': str(apt_conf)},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
 
 
 BROWSER_LISTS = ('firefox', 'webkit', 'chromium,firefox', 'chromium,firefox,webkit')
@@ -108,12 +129,21 @@ class Run:
         return path.read_text() if path.exists() else ''
 
 
+@unittest.skipIf(shutil.which('apt-config') is None, 'the script checks apt with apt-config')
 class Script(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix='playwright-deps-'))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        for d in ('bin', 'log', 'archives'):
+        for d in ('bin', 'log', 'archives', 'apt.conf.d'):
             (self.tmp / d).mkdir()
+        self.parts = self.tmp / 'apt.conf.d'
+        self.conf = self.parts / 'zzzz-cplieger-ci-retries'
+        (self.parts / 'zz-retries').write_text(IMAGE_RETRIES)
+        # apt-config reads this file, then the parts directory it names, then the main file.
+        self.apt_conf = self.tmp / 'apt-config'
+        self.apt_conf.write_text(
+            f'Dir::Etc::parts "{self.parts}";\nDir::Etc::main "{self.tmp / "apt.conf"}";\n'
+        )
         for name, text in (
             ('sudo', SUDO_STUB),
             ('npx', NPX_STUB),
@@ -131,7 +161,8 @@ class Script(unittest.TestCase):
             'STUB_NPX': npx,
             'ARCHIVES': str(self.tmp / 'archives'),
             'PLAYWRIGHT_DEPS_ARCHIVES': str(self.tmp / 'archives'),
-            'PLAYWRIGHT_DEPS_CONF': str(self.tmp / 'apt.conf'),
+            'PLAYWRIGHT_DEPS_CONF': str(self.conf),
+            'APT_CONFIG': str(self.apt_conf),
             'PLAYWRIGHT_DEPS_ATTEMPT_SECONDS': '1',
             'PLAYWRIGHT_DEPS_SLEEP': '0',
             'GITHUB_OUTPUT': str(self.tmp / 'output'),
@@ -150,34 +181,46 @@ class Script(unittest.TestCase):
     def calls(self, run: Run) -> list[str]:
         return [line.split(' | ')[0] for line in run.logged('npx')]
 
-    def test_the_drop_in_carries_the_per_download_options_before_the_install(self):
+    def test_the_drop_in_is_written_before_the_install(self):
         run = self.run_script('webkit')
         self.assertEqual(run.rc, 0, run.out)
-        conf = (self.tmp / 'apt.conf').read_text()
-        for line in (
-            'Acquire::http::Timeout "20";',
-            'Acquire::https::Timeout "20";',
-            'Acquire::Retries "5";',
-            'DPkg::Lock::Timeout "60";',
-        ):
-            self.assertIn(line, conf.splitlines())
-        self.assertEqual(run.logged('sudo')[0], f'tee {self.tmp / "apt.conf"}')
-        # The real default lands in apt.conf.d, which apt reads after sudo drops the environment.
-        self.assertIn('/etc/apt/apt.conf.d/', SCRIPT.read_text())
+        self.assertEqual(
+            self.conf.read_text().splitlines(), [f'{k} "{v}";' for k, v in OURS.items()]
+        )
+        self.assertEqual(run.logged('sudo')[0], f'tee {self.conf}')
+        self.assertEqual(len(run.logged('npx')), 1)
 
-    def test_the_drop_in_parses_as_apt_configuration(self):
-        if shutil.which('apt-config') is None:
-            self.skipTest('no apt-config on this host')
-        self.run_script('webkit')
-        out = subprocess.run(
-            ['apt-config', 'dump'],
-            env={**os.environ, 'APT_CONFIG': str(self.tmp / 'apt.conf')},
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-        self.assertIn('Acquire::http::Timeout "20";', out)
-        self.assertIn('Acquire::Retries "5";', out)
+    def test_the_drop_in_sorts_after_the_image_s_and_its_values_win(self):
+        default = re.search(
+            r'^CONF=\$\{PLAYWRIGHT_DEPS_CONF:-(.+)\}$', SCRIPT.read_text(), re.MULTILINE
+        )[1]
+        self.assertEqual(os.path.dirname(default), '/etc/apt/apt.conf.d')
+        self.assertEqual(os.path.basename(default), self.conf.name)
+        # apt sorts the directory's names by byte, as str comparison does for ASCII.
+        self.assertGreater(self.conf.name, 'zz-retries')
+        run = self.run_script('webkit')
+        self.assertEqual(run.rc, 0, run.out)
+        for key, value in OURS.items():
+            with self.subTest(key=key):
+                self.assertEqual(apt_config(self.apt_conf, key), value)
+                self.assertIn(f'apt uses {key} "{value}"', run.out)
+
+    def test_a_later_sorting_file_fails_the_step_before_the_install(self):
+        (self.parts / 'zzzzz-later').write_text('Acquire::Retries "1";\n')
+        run = self.run_script('webkit')
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn(
+            f'::error::apt uses Acquire::Retries "1", not "5" from {self.conf}: ', run.out
+        )
+        self.assertNotIn('::error::apt uses Acquire::http::Timeout', run.out)
+        self.assertEqual(run.logged('npx'), [])
+
+    def test_apt_conf_overriding_a_value_fails_the_step(self):
+        (self.tmp / 'apt.conf').write_text('dpkg::lock::timeout "0";\n')
+        run = self.run_script('webkit')
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn('::error::apt uses DPkg::Lock::Timeout "0", not "60"', run.out)
+        self.assertEqual(run.logged('npx'), [])
 
     def test_a_first_success_runs_once_and_repairs_nothing(self):
         run = self.run_script('firefox', 'webkit')
@@ -314,7 +357,11 @@ class Wiring(unittest.TestCase):
 
     def test_the_step_timeout_holds_every_attempt_and_its_backoff(self):
         attempts, bound = setting('ATTEMPTS'), setting('ATTEMPT_SECONDS')
-        kill, delay = 30, 15
+        kill, delay = setting('KILL_SECONDS'), setting('FIRST_DELAY')
+        text = SCRIPT.read_text()
+        self.assertIn('timeout -k "$KILL_SECONDS" "$ATTEMPT_SECONDS" ', text)
+        self.assertIn('delay=$FIRST_DELAY\n', text)
+        self.assertIn('-ge "$ATTEMPTS" ]', text)
         worst = attempts * (bound + kill) + sum(delay * 2**i for i in range(attempts - 1))
         for workflow, job, name in SITES:
             with self.subTest(workflow=workflow, job=job):
