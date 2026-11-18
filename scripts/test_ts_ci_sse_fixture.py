@@ -295,7 +295,9 @@ class FixtureSteps(unittest.TestCase):
             with self.subTest(job=job):
                 steps = ts_ci()['jobs'][job]['steps']
                 names = [s.get('name') for s in steps]
-                at = names.index(INSTALL_STEP)
+                # The install's last step is the .deb cache save after it.
+                at = names.index(INSTALL_STEP) + 1
+                self.assertEqual(names[at], 'Save the browser libraries')
                 self.assertEqual(names[at + 1 : at + 3], [SETUP_STEP, BUILD_STEP])
                 self.assertFalse(
                     [s for s in steps[: at + 3] if s.get('continue-on-error')], 'a setup step'
@@ -338,6 +340,8 @@ class FixtureSteps(unittest.TestCase):
             'needs': needs('.', 'marotte_test'),
             'inputs': {'web-lint': True, 'working-directory': 'static-src'},
             'github': {'event_name': 'pull_request', 'event': {'repository': {'private': False}}},
+            'runner': {'environment': 'github-hosted'},
+            'env': {'CPLIEGER_BROWSERS': 'chromium,webkit'},
             'steps': {},
         }
         scope = wr.Scope(contexts, {}, [])
@@ -348,8 +352,11 @@ class FixtureSteps(unittest.TestCase):
             running,
             [
                 'Checkout',
+                'Check out the ci source',
+                'Move the ci source out of the workspace',
                 'Setup Node.js',
                 'Install deps',
+                'Restore the browser libraries',
                 INSTALL_STEP,
                 SETUP_STEP,
                 BUILD_STEP,

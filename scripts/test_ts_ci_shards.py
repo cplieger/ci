@@ -18,6 +18,7 @@ from test_deadset_steps import META
 from test_package_script_steps import WORKFLOWS, Harness, workflow_step
 
 TS_CI = WORKFLOWS / 'ts-ci.yaml'
+SCRIPTS = WORKFLOWS.parent.parent / 'scripts'
 READ_STEP = 'Read cplieger.vitestShards, cplieger.browsers and engines.node'
 INSTALL_STEP = 'Install browsers (vitest browser mode)'
 # The jobs that run the vitest suite, each split by the read count, with its
@@ -437,6 +438,8 @@ def running_steps(shard: int) -> list[str]:
         'needs': counted(2),
         'inputs': {'web-lint': True, 'working-directory': '.'},
         'github': {'event_name': 'pull_request', 'event': {'repository': {'private': False}}},
+        'runner': {'environment': 'github-hosted'},
+        'env': {'CPLIEGER_BROWSERS': 'chromium,webkit'},
         'steps': {},
     }
     scope = wr.Scope(contexts, {}, [])
@@ -453,6 +456,11 @@ case "$*" in
     [ "${STUB_INSTALL_DEPS:-ok}" = ok ] ;;
 esac
 """
+# playwright-deps.sh's root commands, logged and run as the job's user.
+SUDO_STUB = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$STUB_LOG/sudo"
+exec "$@"
+"""
 
 
 class InstallStep(Harness):
@@ -465,12 +473,25 @@ class InstallStep(Harness):
         (self.bin / 'npx').unlink()
         (self.bin / 'npx').write_text(NPX_PLAYWRIGHT_STUB)
         (self.bin / 'npx').chmod(0o755)
+        for name, text in (
+            ('sudo', SUDO_STUB),
+            ('dpkg', '#!/bin/sh\n'),
+            ('apt-get', '#!/bin/sh\n'),
+        ):
+            (self.bin / name).write_text(text)
+            (self.bin / name).chmod(0o755)
 
     def install(self, browsers: str, enrolled: bool = True, runner: str | None = None, **stub: str):
         dev = {'@vitest/browser-playwright': '5.1.0'} if enrolled else {}
         (self.pkg / 'package.json').write_text(json.dumps({'name': 'f', 'devDependencies': dev}))
         (self.tmp / 'log' / 'npx').unlink(missing_ok=True)
-        env = {'CPLIEGER_BROWSERS': browsers, **stub}
+        env = {
+            'CPLIEGER_BROWSERS': browsers,
+            'CI_TOOLS': str(SCRIPTS),
+            'PLAYWRIGHT_DEPS_CONF': str(self.tmp / 'apt.conf'),
+            'PLAYWRIGHT_DEPS_SLEEP': '0',
+            **stub,
+        }
         if runner is not None:
             env['RUNNER_ENVIRONMENT'] = runner
         return self.run_step(env)
@@ -478,8 +499,16 @@ class InstallStep(Harness):
     def test_both_jobs_run_the_same_install_on_the_read_engines(self):
         floor = workflow_step(TS_CI, 'engines-floor', INSTALL_STEP)
         self.assertEqual(floor, self.STEP)
-        self.assertNotIn('env', self.STEP)
-        self.assertEqual(self.STEP['timeout-minutes'], 10)
+        self.assertEqual(
+            self.STEP['env'],
+            {
+                'CI_TOOLS': '${{ runner.temp }}/cplieger-ci/scripts',
+                'PLAYWRIGHT_DEPS_CACHE': '${{ runner.temp }}/playwright-debs',
+                'PLAYWRIGHT_DEPS_CACHE_KEY': '${{ steps.debs.outputs.cache-primary-key }}',
+            },
+        )
+        # Three bounded library attempts and their backoff, then the engines.
+        self.assertEqual(self.STEP['timeout-minutes'], 15)
         jobs = ts_ci()['jobs']
         for job in SHARDED:
             with self.subTest(job=job):
@@ -517,17 +546,18 @@ class InstallStep(Harness):
                 self.assertEqual(run.rc, 0, run.out)
                 self.assertEqual(run.logged('npx'), want)
 
-    def test_the_library_install_is_bounded_and_a_failure_names_the_outage(self):
-        install = next(
-            line for line in self.STEP['run'].splitlines() if 'playwright install-deps "' in line
-        )
-        self.assertIn('timeout 300 ', install)
+    def test_the_library_install_goes_through_the_retrying_script(self):
+        install = [line.strip() for line in self.STEP['run'].splitlines() if '-deps' in line]
+        self.assertEqual(install, ['bash "$CI_TOOLS/playwright-deps.sh" "${need_libs[@]}"'])
+
+    def test_a_failing_library_install_is_retried_then_fails_naming_the_outage(self):
         run = self.install('webkit', STUB_INSTALL_DEPS='fail')
         self.assertEqual(run.rc, 1, run.out)
+        self.assertIn('failed 3 times', run.out)
         self.assertIn('Ubuntu mirror or DNS outage', run.out)
         # apt's own output reaches the log, and no engine installs without its libraries.
         self.assertIn('E: Unable to fetch some archives', run.out)
-        self.assertEqual(run.logged('npx'), '--no-install playwright install-deps webkit\n')
+        self.assertEqual(run.logged('npx'), '--no-install playwright install-deps webkit\n' * 3)
 
     def test_a_self_hosted_runner_installs_without_the_system_libraries(self):
         """A self-hosted runner may grant no root for apt, so Firefox and WebKit
@@ -560,7 +590,15 @@ class InstallStep(Harness):
 
 
 class ShardSteps(unittest.TestCase):
-    SETUP = ('Checkout', 'Setup Node.js', 'Install deps', INSTALL_STEP)
+    SETUP = (
+        'Checkout',
+        'Check out the ci source',
+        'Move the ci source out of the workspace',
+        'Setup Node.js',
+        'Install deps',
+        'Restore the browser libraries',
+        INSTALL_STEP,
+    )
 
     def test_a_later_shard_runs_only_the_setup_its_tests_and_the_verdict(self):
         self.assertEqual(running_steps(2), [*self.SETUP, 'Test (vitest)', 'Check results'])
@@ -664,12 +702,16 @@ class FloorShardSteps(unittest.TestCase):
     def test_every_shard_runs_every_floor_step(self):
         """The job condition holds the floor gate, so each shard runs the setup,
         the install and its part of the suite, and no step tolerates a failure.
-        Only the Go test server steps take a condition, the package's opt-in."""
+        Only the Go test server steps take a condition, the package's opt-in, and
+        the .deb cache steps validate's."""
         opt_in = "${{ needs.package.outputs.sse-fixture != '' }}"
+        cache = ('Restore the browser libraries', 'Save the browser libraries')
         for step in ts_ci()['jobs']['engines-floor']['steps']:
             with self.subTest(step=step['name']):
                 if 'sseFixture' in step['name']:
                     self.assertEqual(step['if'], opt_in)
+                elif step['name'] in cache:
+                    self.assertEqual(step, workflow_step(TS_CI, 'validate', step['name']))
                 else:
                     self.assertNotIn('if', step)
                 self.assertNotIn('continue-on-error', step)
