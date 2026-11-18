@@ -726,6 +726,8 @@ def seconds_per_cell(runs: list[dict]) -> list[dict]:
 UNIT_FIELDS = KEY_FIELDS[:4]
 # GitHub runs at most 256 jobs from one matrix.
 MAX_JOBS = 256
+# Past three runs a cell's noise is its window's shape (a bimodal window), not its rep count.
+MAX_UNIT_RUNS = 3
 
 
 # The sets a workflow gates: perf-ci.yaml's pull-request default and
@@ -895,10 +897,12 @@ def plan(
 ) -> dict:
     """The measure matrix of one set of plan.json: its cells (a scenario at a
     scale, engine and width, every window or those its `windows` lists) split
-    into at most `shards` jobs, longest first onto the least-loaded shard,
-    repeated `runs` times. With `remeasure`, only the cells compare listed,
-    once each. `include` alone is the GitHub matrix: any other key there
-    would be a matrix dimension."""
+    into at most `shards` jobs, longest first onto the least-loaded shard. A cell
+    is measured in `runs` runs, or in as many as its own `runs` asks when that is
+    more, run 2 on holding only the cells measured again; with more than one run
+    each job is named `run-NN-shard-i-of-n`. With `remeasure`, only the cells
+    compare listed, once each. `include` alone is the GitHub matrix: any other
+    key there would be a matrix dimension."""
     sets = doc.get('sets', {})
     if not isinstance(sets, dict) or set_name not in sets:
         raise ValueError(f'plan.json has no set {set_name!r}')
@@ -927,22 +931,36 @@ def plan(
     if remeasure is not None:
         wanted = {unit_key(c) for c in remeasure.get('cells', [])}
         units = [u for u in units if unit_key(u) in wanted]
-    count = min(shards, len(units))
-    bins: list[list[dict]] = [[] for _ in range(count)]
-    load = [0.0] * count
-    for u in sorted(units, key=lambda u: -u['seconds']):
-        i = load.index(min(load))
-        bins[i].append(dict(u))
-        load[i] += u['seconds']
-    if count * runs > MAX_JOBS:
-        raise ValueError(f'{count} shards x {runs} runs is over the {MAX_JOBS} jobs of a matrix')
+
+    def runs_of(u: dict) -> int:
+        return 1 if remeasure is not None else max(runs, u.get('runs', 1))
+
+    rounds = max((runs_of(u) for u in units), default=1)
     include = []
-    for r in range(1, runs + 1):
+    mean_load = 0.0
+    for r in range(1, rounds + 1):
+        these = [u for u in units if runs_of(u) >= r]
+        count = min(shards, len(these))
+        if r > 1:
+            # A later run re-measures only its own units, so it takes as few shards as
+            # hold them at the first run's mean shard load.
+            needed = math.ceil(sum(u['seconds'] for u in these) / mean_load)
+            count = min(count, max(1, needed))
+        bins: list[list[dict]] = [[] for _ in range(count)]
+        load = [0.0] * count
+        for u in sorted(these, key=lambda u: -u['seconds']):
+            i = load.index(min(load))
+            bins[i].append(dict(u))
+            load[i] += u['seconds']
+        if r == 1:
+            mean_load = sum(load) / max(count, 1)
         for i, cells in enumerate(bins, 1):
             name = f'shard-{i}-of-{count}'
-            if runs > 1:
+            if rounds > 1:
                 name = f'run-{r:02d}-{name}'
             include.append({'name': name, 'run': r, 'seconds': load[i - 1], 'cells': cells})
+    if len(include) > MAX_JOBS:
+        raise ValueError(f'{len(include)} jobs is over the {MAX_JOBS} jobs of a matrix')
     return {
         'include': include,
         'scenarios': sorted({u['scenario'] for u in units}),
@@ -970,6 +988,12 @@ def check_units(label: str, units: list) -> None:
             raise ValueError(f'{label}: {key_text(k)} needs its seconds per cell')
         if windows_error(u):
             raise ValueError(f'{label}: {key_text(k)}: {windows_error(u)}')
+        r = u.get('runs', 1)
+        if not isinstance(r, int) or isinstance(r, bool) or not 1 <= r <= MAX_UNIT_RUNS:
+            raise ValueError(
+                f'{label}: {key_text(k)}: runs must be a whole number from 1 to '
+                f'{MAX_UNIT_RUNS}, not {r!r}'
+            )
 
 
 def bench(results: dict) -> list[dict]:
@@ -1890,8 +1914,15 @@ def shard_groups(
 def merge_results(
     directory: str | pathlib.Path, prefix: str, stage: str = 'measure', since: int = 1
 ) -> dict:
-    """Every shard of shard_groups as one results file."""
-    return merge([p for ps in shard_groups(directory, prefix, stage, since).values() for p in ps])
+    """Every shard of shard_groups as one results file, which holds one run: a cell two
+    runs measured is two cells of one key."""
+    groups = shard_groups(directory, prefix, stage, since)
+    if len(groups) > 1:
+        raise ValueError(
+            f'{stage} results under {directory} must be one run, not {len(groups)}: '
+            f'{", ".join(sorted(groups))}'
+        )
+    return merge([p for ps in groups.values() for p in ps])
 
 
 def merge(paths: list[pathlib.Path]) -> dict:

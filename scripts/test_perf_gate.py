@@ -2371,6 +2371,76 @@ class Plan(unittest.TestCase):
             with self.subTest(name), self.assertRaises(ValueError):
                 perf_gate.plan(doc, set_name)
 
+    def test_a_unit_s_runs_measure_it_again_in_later_runs_only(self):
+        doc = {
+            'node': '.',
+            'sets': {
+                'full': {
+                    'shards': 2,
+                    'cells': [
+                        unit('files', 80),
+                        unit('docs', 75),
+                        unit('tabs', 70, runs=2),
+                        unit('shell', 60, runs=3),
+                    ],
+                },
+            },
+        }
+        jobs = perf_gate.plan(doc, 'full')['include']
+        by_run = {}
+        for job in jobs:
+            by_run.setdefault(job['run'], []).extend(c['scenario'] for c in job['cells'])
+        self.assertEqual(
+            {r: sorted(s) for r, s in by_run.items()},
+            {
+                1: ['docs', 'files', 'shell', 'tabs'],
+                2: ['shell', 'tabs'],
+                3: ['shell'],
+            },
+        )
+        # A later run takes as few shards as hold its units at the first run's mean load.
+        self.assertEqual(
+            [j['name'] for j in jobs],
+            [
+                'run-01-shard-1-of-2',
+                'run-01-shard-2-of-2',
+                'run-02-shard-1-of-1',
+                'run-03-shard-1-of-1',
+            ],
+        )
+
+    def test_a_later_run_takes_more_shards_when_its_units_need_them(self):
+        cells = [unit(f's{i}', 100, runs=2) for i in range(4)] + [unit('one', 100)]
+        doc = {'node': '.', 'sets': {'full': {'shards': 5, 'cells': cells}}}
+        names = [j['name'] for j in perf_gate.plan(doc, 'full')['include']]
+        self.assertEqual(names[5:], [f'run-02-shard-{i}-of-4' for i in range(1, 5)])
+
+    def test_a_unit_s_runs_is_a_whole_number_from_one_to_three(self):
+        for runs in (0, 4, 1.5, True, '2', None):
+            doc = {'node': '.', 'sets': {'pr': {'shards': 1, 'cells': [unit('a', 1, runs=runs)]}}}
+            with self.subTest(runs=runs), self.assertRaisesRegex(ValueError, 'runs'):
+                perf_gate.plan(doc, 'pr')
+        doc = {'node': '.', 'sets': {'pr': {'shards': 1, 'cells': [unit('a', 1, runs=1)]}}}
+        self.assertEqual(
+            [j['name'] for j in perf_gate.plan(doc, 'pr')['include']], ['shard-1-of-1']
+        )
+
+    def test_the_set_s_runs_and_a_unit_s_runs_take_the_larger(self):
+        cells = [unit('files', 80), unit('tabs', 70, runs=3)]
+        doc = {'node': '.', 'sets': {'full': {'shards': 1, 'cells': cells}}}
+        jobs = perf_gate.plan(doc, 'full', runs=2)['include']
+        self.assertEqual(
+            [(j['run'], sorted(c['scenario'] for c in j['cells'])) for j in jobs],
+            [(1, ['files', 'tabs']), (2, ['files', 'tabs']), (3, ['tabs'])],
+        )
+
+    def test_a_remeasure_plans_a_unit_with_runs_once(self):
+        cells = [unit('files', 80, runs=2), unit('docs', 75)]
+        doc = {'node': '.', 'sets': {'full': {'shards': 2, 'cells': cells}}}
+        red = {**CELL, 'metric': 'cpu_ms'}
+        jobs = perf_gate.plan(doc, 'full', remeasure={'cells': [red]})['include']
+        self.assertEqual([j['name'] for j in jobs], ['shard-1-of-1'])
+
     def test_more_jobs_than_one_matrix_holds_fails(self):
         with self.assertRaisesRegex(ValueError, '256'):
             perf_gate.plan(PLAN, 'pr', runs=129)
@@ -2559,6 +2629,13 @@ class Attempts(unittest.TestCase):
         groups = perf_gate.shard_groups(self.dir, 'cplieger-a')
         self.assertEqual(sorted(groups), ['run-01', 'run-02'])
         self.assertEqual([len(v) for v in groups.values()], [2, 2])
+
+    def test_one_results_file_is_never_merged_from_two_runs(self):
+        self.shard('measure', 1, 2, 1, run='run-01-')
+        self.shard('measure', 2, 2, 1, run='run-01-')
+        self.shard('measure', 1, 1, 1, run='run-02-')
+        with self.assertRaisesRegex(ValueError, 'one run, not 2: run-01, run-02'):
+            perf_gate.merge_results(self.dir, 'cplieger-a', 'measure')
 
 
 def run_main(*argv):
