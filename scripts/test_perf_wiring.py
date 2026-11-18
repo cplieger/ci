@@ -92,6 +92,11 @@ class PerfCi(unittest.TestCase):
         gate = step['run'].split('--remeasure-out')[0]
         self.assertIn('--plan-doc tests/perf/plan.json --set "$SET" --only "$ONLY"', gate)
 
+    def test_the_plan_is_made_in_the_call_s_mode(self):
+        plan = next(s for s in self.jobs['plan']['steps'] if s.get('id') == 'plan')
+        self.assertEqual(plan['env']['MODE'], '${{ inputs.mode }}')
+        self.assertIn('--runs "$RUNS" --mode "$MODE"', plan['run'])
+
     def test_the_sets_check_plan_counts_are_the_sets_the_workflows_gate(self):
         plan = next(s for s in self.jobs['plan']['steps'] if s.get('id') == 'plan')
         on_a_pull_request = re.findall(r"^\s*SET='([^']+)'$", plan['run'], re.MULTILINE)
@@ -478,7 +483,7 @@ class Trend(unittest.TestCase):
     def test_each_job_holds_only_its_permissions(self):
         self.assertEqual(self.doc['permissions'], READS)
         want = {
-            'plan': READS,
+            'plan': {'contents': 'read', 'issues': 'read'},
             'measure': READS,
             'record': {'contents': 'write', 'issues': 'read'},
             'issues': {'contents': 'read', 'issues': 'write'},
@@ -504,6 +509,14 @@ class Trend(unittest.TestCase):
                     self.assertNotRegex(body, code)
                     for call in re.findall(r'python3 (\S+)', body):
                         self.assertEqual(call, '"$CI_TOOLS/perf_trend.py"')
+
+    def test_the_token_reaches_git_through_its_environment_never_its_argv(self):
+        body = code_of(step(self.jobs['record'], 'Record')['run'])
+        self.assertIn('export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/', body)
+        self.assertNotRegex(body, r'git -c\b|\$auth\b')
+        for line in body.splitlines():
+            if 'GH_TOKEN' in line:
+                self.assertTrue(line.lstrip().startswith('GIT_CONFIG_VALUE_0='), line)
 
     def test_no_job_names_a_secret_and_no_run_body_expands_an_expression(self):
         self.assertNotIn('secrets.', (WORKFLOWS / 'perf-trend.yaml').read_text())
@@ -554,10 +567,12 @@ class Trend(unittest.TestCase):
         self.assertEqual(set(notify['needs']), set(self.jobs) - {'notify'})
         self.assertEqual(notify['with']['scope'], '${{ inputs.only }}')
 
-    def resolve(self, ref='', series='', only='', state=None, default='dev'):
+    def resolve(self, ref='', series='', only='', state=None, default='dev', issues=()):
         s = step(self.jobs['plan'], 'Resolve')
         gh = f"""#!/usr/bin/env bash
 case "$*" in
+  'api -i repos/cplieger/a/issues?state=all&labels=performance&per_page=100&page=1')
+    printf 'HTTP/2.0 200 OK\r\n\r\n%s' "$ISSUES" ;;
   'api repos/cplieger/a --jq .default_branch') echo {default} ;;
   'api repos/cplieger/a/git/ref/heads/'*' --jq .object.sha') echo "${{2#repos/cplieger/a/git/ref/heads/}}" | sha1sum | cut -c1-40 ;;
   *contents/series/*) [ -n "$STATE" ] && {{ printf '%s' "$STATE"; exit 0; }}; echo '{{"message": "Not Found"}}'; exit 1 ;;
@@ -566,6 +581,7 @@ esac
 """
         env = {'REPO': 'cplieger/a', 'REF': ref, 'SERIES': series, 'ONLY': only}
         env |= {'CI_TOOLS': str(ROOT / 'scripts'), 'GH_TOKEN': 't', 'STATE': state or ''}
+        env |= {'ISSUES': json.dumps(list(issues))}
         proc, tmp = run_body(self, s['run'], env, {'gh': gh})
         return proc, outputs(tmp)
 
@@ -601,6 +617,15 @@ esac
         pending = {**done, 'scenarios': {'files': {'status': 'suspect'}}}
         _, out = self.resolve(state=json.dumps(pending))
         self.assertEqual(out['run'], 'true')
+        body = '<!-- perf-trend:dev:files -->\nbody'
+        tracked = {'status': 'open', 'opened': '2026-11-18T00:00:00Z', 'body': body}
+        tracked |= {'first_bad': {'date': '2026-11-17T16:00:00Z'}}
+        opened = {**done, 'scenarios': {'files': tracked}}
+        filed = {'number': 1, 'state': 'open', 'created_at': '2026-11-18T00:05:00Z', 'body': body}
+        _, out = self.resolve(state=json.dumps(opened), issues=[filed])
+        self.assertEqual(out['run'], 'false')
+        _, out = self.resolve(state=json.dumps(opened))
+        self.assertEqual(out['run'], 'true')
 
     def record(self, remote: Path, sha: str, date: str, *, race: bool = False):
         """The Record step against remote, a local bare repository standing in for GitHub,
@@ -618,7 +643,7 @@ esac
         git = f"""#!/usr/bin/env bash
 args=()
 for a in "$@"; do args+=("${{a//https:\\/\\/github.com\\/cplieger\\/a.git/{remote}}}"); done
-if [ "$1" = -c ] && [[ " $* " == *" push "* ]] && [ -f "$RACE" ]; then
+if [[ " $* " == *" push "* ]] && [ -f "$RACE" ]; then
   rm "$RACE"
   w=$(mktemp -d)
   {real} clone -q --branch perf-trend "{remote}" "$w"
@@ -683,6 +708,11 @@ printf 'HTTP/2.0 200 OK\\r\\n\\r\\n[]'
             log(), [f'perf: dev point at {"b" * 12}', 'other', f'perf: dev point at {"a" * 12}']
         )
         self.assertEqual(len([f for f in files() if '/points/' in f]), 2)
+        proc, runner = self.record(remote, 'b' * 40, '2026-11-18T08:00:00Z')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn('already recorded by this run', proc.stdout)
+        self.assertEqual(log()[0], f'perf: dev point at {"b" * 12}')
+        self.assertEqual(json.loads((runner / 'actions.json').read_text()), [])
 
     def test_the_push_is_fast_forward_only(self):
         run = step(self.jobs['record'], 'Record')['run']

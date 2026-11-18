@@ -46,6 +46,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      issues: read
     outputs:
       run: ${{ steps.resolve.outputs.run }}
       series: ${{ steps.resolve.outputs.series }}
@@ -104,11 +105,13 @@ jobs:
           gh api -H 'Accept: application/vnd.github.raw+json' \
             "repos/${REPO}/contents/series/${series}/state.json?ref=perf-trend" > "$state" 2> /dev/null \
             || rm -f "$state"
-          skip=$(python3 "$CI_TOOLS/perf_trend.py" skip --state "$state" --commit "$sha")
+          python3 "$CI_TOOLS/perf_trend.py" fetch-issues --repo "$REPO" --out "$RUNNER_TEMP/issues.json"
+          skip=$(python3 "$CI_TOOLS/perf_trend.py" skip --state "$state" --commit "$sha" \
+            --issues "$RUNNER_TEMP/issues.json")
           run=true
           if [ "$skip" = true ]; then
             run=false
-            echo "the ${series} series already holds a point of ${sha} and waits on none"
+            echo "the ${series} series already holds a point of ${sha}, waits on none and has no issue to repair"
           fi
           {
             echo "run=${run}"
@@ -181,7 +184,9 @@ jobs:
         run: |
           set -euo pipefail
           url="https://github.com/${REPO}.git"
-          auth="http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          # Through the environment, so the credential is in no command's argv.
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0
           work="$RUNNER_TEMP/perf-trend"
           point="$RUNNER_TEMP/point.json"
           python3 "$CI_TOOLS/perf_trend.py" point --results "$RUNNER_TEMP/results" --prefix "$PREFIX" \
@@ -193,17 +198,17 @@ jobs:
           for attempt in 1 2 3 4 5; do
             rm -rf "$work"
             rc=0
-            git -c "$auth" ls-remote --exit-code --heads "$url" perf-trend > /dev/null || rc=$?
+            git ls-remote --exit-code --heads "$url" perf-trend > /dev/null || rc=$?
             if [ "$rc" -eq 0 ]; then
               # Points accumulate, so only the state and the points judging this
               # one are checked out (perf_trend.py needs).
-              git -c "$auth" clone -q --filter=blob:none --no-checkout --depth 1 \
+              git clone -q --filter=blob:none --no-checkout --depth 1 \
                 --branch perf-trend "$url" "$work"
               git -C "$work" ls-tree -r --name-only HEAD > "$RUNNER_TEMP/listing.txt"
               python3 "$CI_TOOLS/perf_trend.py" needs --listing "$RUNNER_TEMP/listing.txt" --series "$SERIES" \
                 > "$RUNNER_TEMP/needs.txt"
               git -C "$work" sparse-checkout set --no-cone --stdin < "$RUNNER_TEMP/needs.txt"
-              git -c "$auth" -C "$work" checkout -q perf-trend
+              git -C "$work" checkout -q perf-trend
             elif [ "$rc" -eq 2 ]; then
               git init -q -b perf-trend "$work"
               git -C "$work" remote add origin "$url"
@@ -216,10 +221,15 @@ jobs:
               --repo "$REPO" --issues "$RUNNER_TEMP/issues.json" \
               --actions "$RUNNER_TEMP/actions.json" --summary "$RUNNER_TEMP/summary.md"
             git -C "$work" add --sparse -- "series/${SERIES}"
+            # A re-run of a run whose point is on the branch writes only its issues.
+            if git -C "$work" diff --cached --quiet; then
+              cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
             git -C "$work" -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               commit -q -m "perf: ${SERIES} point at ${SHA:0:12}"
-            if git -c "$auth" -C "$work" push -q origin HEAD:refs/heads/perf-trend; then
+            if git -C "$work" push -q origin HEAD:refs/heads/perf-trend; then
               cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi

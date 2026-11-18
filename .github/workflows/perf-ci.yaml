@@ -31,7 +31,7 @@ on:
       runs:
         description: >-
           How many times to measure the set, or more for a unit whose plan.json
-          `runs` asks for more; more than one run needs `measure`.
+          `runs` asks for more; more than one run, either way, needs `measure`.
         type: number
         default: 1
       mode:
@@ -101,6 +101,7 @@ jobs:
           SET: ${{ inputs.set }}
           ONLY: ${{ inputs.only }}
           RUNS: ${{ inputs.runs }}
+          MODE: ${{ inputs.mode }}
           REPO: ${{ inputs.repository || github.repository }}
         run: |
           set -euo pipefail
@@ -119,7 +120,8 @@ jobs:
             exit 0
           fi
           python3 "$CI_TOOLS/perf_gate.py" --plan tests/perf/plan.json --set "$SET" \
-            --only "$ONLY" --runs "$RUNS" --out "$RUNNER_TEMP/matrix.json" --outputs "$GITHUB_OUTPUT"
+            --only "$ONLY" --runs "$RUNS" --mode "$MODE" --out "$RUNNER_TEMP/matrix.json" \
+            --outputs "$GITHUB_OUTPUT"
           echo "set=${SET}" >> "$GITHUB_OUTPUT"
 
   build:

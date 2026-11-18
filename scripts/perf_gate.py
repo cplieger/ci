@@ -898,6 +898,7 @@ def plan(
     only: list[str] | None = None,
     runs: int = 1,
     remeasure: dict | None = None,
+    gate: bool = False,
 ) -> dict:
     """The measure matrix of one set of plan.json: its cells (a scenario at a
     scale, engine and width, every window or those its `windows` lists) split
@@ -905,8 +906,9 @@ def plan(
     is measured in `runs` runs, or in as many as its own `runs` asks when that is
     more, run 2 on holding only the cells measured again; with more than one run
     each job is named `run-NN-shard-i-of-n`. With `remeasure`, only the cells
-    compare listed, once each. `include` alone is the GitHub matrix: any other
-    key there would be a matrix dimension."""
+    compare listed, once each. A `gate` plan, whose results compare merges as one run,
+    refuses more than one. `include` alone is the GitHub matrix: any other key there
+    would be a matrix dimension."""
     sets = doc.get('sets', {})
     if not isinstance(sets, dict) or set_name not in sets:
         raise ValueError(f'plan.json has no set {set_name!r}')
@@ -922,6 +924,14 @@ def plan(
     if not units or not isinstance(units, list):
         raise ValueError(f'set {set_name} lists no cells')
     check_units(f'set {set_name}', units)
+    if gate and runs != 1:
+        raise ValueError(f'a gated set is measured in one run, not {runs}')
+    for u in units if gate else ():
+        if u.get('runs', 1) != 1:
+            raise ValueError(
+                f'set {set_name}: {key_text(unit_key(u))}: runs belongs to the full set the '
+                'trend measures, and a gated set is measured in one run'
+            )
     if only:
         missing = sorted(set(only) - {u['scenario'] for u in units})
         if missing:
@@ -974,7 +984,8 @@ def plan(
 
 def check_units(label: str, units: list) -> None:
     """Raise on a unit plan() cannot shard: not an object, a line break, a missing key
-    field, a unit listed twice, no positive seconds, or a bad windows list."""
+    field or one holding whitespace, `<` or `>`, a unit listed twice, no positive
+    seconds, a bad windows list, or bad runs."""
     seen = set()
     for u in units:
         if not isinstance(u, dict):
@@ -985,6 +996,9 @@ def check_units(label: str, units: list) -> None:
         k = unit_key(u)
         if not all(isinstance(x, str) and x for x in k):
             raise ValueError(f'{label}: a cell needs {", ".join(UNIT_FIELDS)}: {u}')
+        # A scenario names its trend issue in a `<!-- ... -->` marker of the body.
+        if any(re.search(r'[\s<>]', x) for x in k):
+            raise ValueError(f'{label}: {key_text(k)}: a cell field holds whitespace, < or >')
         if k in seen:
             raise ValueError(f'{label}: {key_text(k)} is listed twice')
         seen.add(k)
@@ -2073,6 +2087,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument('--only', default='', help='comma or space separated scenarios to keep')
     p.add_argument('--runs', type=int, default=1, help='how many times to measure the set')
     p.add_argument(
+        '--mode',
+        choices=('gate', 'measure'),
+        default='gate',
+        help="--plan: perf-ci.yaml's mode, where a gate plan is one run",
+    )
+    p.add_argument(
         '--remeasure',
         help="compare's remeasure.json: --plan plans only the units of its cells, and "
         '--verdict judges each cell on the baseline it carries',
@@ -2245,7 +2265,9 @@ def github_output(name: str, value: str) -> str:
 def run_plan(a: argparse.Namespace) -> int:
     only = a.only.replace(',', ' ').split()
     remeasure = load(a.remeasure) if a.remeasure else None
-    matrix = plan(load(a.plan), a.set, only=only, runs=a.runs, remeasure=remeasure)
+    matrix = plan(
+        load(a.plan), a.set, only=only, runs=a.runs, remeasure=remeasure, gate=a.mode == 'gate'
+    )
     pathlib.Path(a.out).write_text(json.dumps({'include': matrix['include']}) + '\n')
     if a.outputs:
         written = {

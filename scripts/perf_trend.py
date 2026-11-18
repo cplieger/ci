@@ -30,7 +30,7 @@ STAMP = '%Y%m%dT%H%M%SZ'
 DATE = '%Y-%m-%dT%H:%M:%SZ'
 DEV = 'dev'
 SERIES_RE = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}$')
-MARKER_RE = re.compile(r'<!-- perf-trend:([a-z0-9-]+):(\S+) -->')
+MARKER_RE = re.compile(r'<!-- perf-trend:([a-z0-9-]+):([^\s<>]+) -->')
 LABEL = 'performance'
 LABEL_COLOR = 'd93f0b'
 LABEL_DESCRIPTION = 'A performance regression the scheduled trend found'
@@ -249,8 +249,20 @@ def judge(
     new = {**state, 'scenarios': {k: dict(v) for k, v in tracked.items()}}
     new['last'] = {**ref_of(p), 'runner': p['runner']}
     actions = []
+    unjudged: dict[str, str] = {}
     for s in scenarios:
-        after, op = step(new['scenarios'].get(s, {'status': 'ok'}), bad[s], p, previous)
+        before = new['scenarios'].get(s, {'status': 'ok'})
+        # A point that judged none of a scenario's cells, or one of another runner than
+        # its regression's, says nothing about it: stepping on it would close an issue
+        # against values no baseline was taken for.
+        if before['status'] != 'ok' and before['runner'] != p['runner']:
+            unjudged[s] = f'its regression was found on `{before["runner"]}`'
+            continue
+        if not any(c['scenario'] == s and 'baseline' in c for c in cells):
+            if before['status'] != 'ok':
+                unjudged[s] = 'no timing cell has a baseline on this runner'
+            continue
+        after, op = step(before, bad[s], p, previous)
         if op is not None:
             action = {'op': op[0], 'marker': marker(series, s), 'title': title(series, s)}
             action['labels'] = [LABEL]
@@ -260,6 +272,7 @@ def judge(
                 action['body'] = render_issue(
                     after, s, rows, groups[s], counts, series=series, repo=repo
                 )
+                after['body'] = action['body']
             if op[1] == 'still':
                 action['comment'] = still_text(p, rows, groups[s])
             elif op[1]:
@@ -269,7 +282,8 @@ def judge(
             new['scenarios'].pop(s, None)
         else:
             new['scenarios'][s] = after
-    return Judged(new, judged, actions, render_summary(judged, new, bad, previous, actions))
+    summary = render_summary(judged, new, bad, previous, actions, unjudged)
+    return Judged(new, judged, actions, summary)
 
 
 def step(
@@ -279,8 +293,9 @@ def step(
     suspect on a bad point; suspect to open (an upsert) when a cell or group of the
     suspicion is bad again, else a new suspicion; open and recovering to open on a bad
     point (an upsert with a comment); open to recovering, and recovering to ok (a
-    close), on a good one. Returns the new entry and the (op, comment) to send, comment
-    'still' for judge's line naming the bad cells."""
+    close), on a good one. A tracked entry holds the runner it was found on. Returns
+    the new entry and the (op, comment) to send, comment 'still' for judge's line
+    naming the bad cells."""
     status = before['status']
     accepted = {'accepted': before['accepted']} if 'accepted' in before else {}
     if not bad:
@@ -298,6 +313,7 @@ def step(
         return {
             'status': 'suspect',
             **accepted,
+            'runner': p['runner'],
             'items': sorted(bad),
             'last_good': ref_of(previous) if previous else None,
             'first_bad': ref_of(p),
@@ -413,14 +429,20 @@ def render_issue(
 
 
 def render_summary(
-    p: dict, state: dict, bad: dict[str, set[str]], previous: dict | None, actions: list[dict]
+    p: dict,
+    state: dict,
+    bad: dict[str, set[str]],
+    previous: dict | None,
+    actions: list[dict],
+    unjudged: dict[str, str],
 ) -> str:
     judged = sum(1 for c in p['cells'] if 'baseline' in c)
+    runs = '1 run' if p['runs'] == 1 else f'up to {p["runs"]} runs a cell'
     lines = [
         '## Performance trend',
         '',
         (
-            f'Point `{p["commit"][:12]}` of the `{p["series"]}` series: {p["runs"]} runs on '
+            f'Point `{p["commit"][:12]}` of the `{p["series"]}` series: {runs} on '
             f'`{p["runner"]}`, {len(p["cells"])} cells, {judged} timing cells judged against '
             'their trailing baseline.'
         ),
@@ -434,6 +456,11 @@ def render_summary(
             for s, v in sorted(state['scenarios'].items())
             if v['status'] != 'ok'
         ),
+    )
+    lines += perf_gate.table(
+        'Scenarios not judged at this point',
+        ('Scenario', 'Status', 'Why'),
+        ((s, state['scenarios'][s]['status'], why) for s, why in sorted(unjudged.items())),
     )
     lines += perf_gate.table(
         'Bad cells',
@@ -466,17 +493,19 @@ def render_summary(
 def observe(state: dict, issues: list[dict], *, series: str) -> tuple[dict, list[dict]]:
     """Fold the repository's `performance` issues into state: a tracked regression whose
     every issue since it opened a person closed is accepted (status ok, its cells'
-    baselines restart from its first bad point), and an open issue of this series whose
-    scenario tracks no regression is closed."""
+    baselines restart from its first bad point); one with no issue since it opened is
+    sent the body it was last sent again, which repairs a run that stored its point and
+    lost its issue writes; and an open issue of this series whose scenario tracks no
+    regression is closed."""
     new = {**state, 'scenarios': {k: dict(v) for k, v in state['scenarios'].items()}}
-    for s, v in state['scenarios'].items():
+    actions = []
+    for s, v in sorted(state['scenarios'].items()):
         if v['status'] not in ('open', 'recovering'):
             continue
-        tag = f'<!-- {marker(series, s)} -->'
         mine = [
             i
             for i in issues
-            if tag in (i.get('body') or '') and i.get('created_at', '') >= v['opened']
+            if marked(i.get('body')) == (series, s) and i.get('created_at', '') >= v['opened']
         ]
         if mine and all(i.get('state') == 'closed' for i in mine):
             at = state['last']['date'] if state.get('last') else v['first_bad']['date']
@@ -484,7 +513,16 @@ def observe(state: dict, issues: list[dict], *, series: str) -> tuple[dict, list
                 'status': 'ok',
                 'accepted': {'from': v['first_bad']['date'], 'at': at},
             }
-    actions = []
+        elif not mine:
+            actions.append(
+                {
+                    'op': 'upsert',
+                    'marker': marker(series, s),
+                    'title': title(series, s),
+                    'labels': [LABEL],
+                    'body': v['body'],
+                }
+            )
     for s in sorted(open_markers(issues, series)):
         if new['scenarios'].get(s, {}).get('status', 'ok') in ('ok', 'suspect'):
             actions.append(
@@ -500,21 +538,34 @@ def observe(state: dict, issues: list[dict], *, series: str) -> tuple[dict, list
     return new, actions
 
 
+def first_line(body: str | None) -> str:
+    return (body or '').split('\n', 1)[0].rstrip('\r')
+
+
+def marked(body: str | None) -> tuple[str, str] | None:
+    """The (series, scenario) of the marker an issue body opens with, the whole first
+    line, or None."""
+    found = MARKER_RE.fullmatch(first_line(body))
+    return (found[1], found[2]) if found else None
+
+
 def open_markers(issues: list[dict], series: str) -> set[str]:
     out = set()
     for i in issues:
-        found = MARKER_RE.search(i.get('body') or '')
-        if i.get('state') == 'open' and found and found[1] == series:
-            out.add(found[2])
+        found = marked(i.get('body'))
+        if i.get('state') == 'open' and found and found[0] == series:
+            out.add(found[1])
     return out
 
 
-def skip(state: dict, commit: str) -> bool:
-    """Whether a point of commit adds nothing: the series' last point measured it and no
-    scenario waits on a confirming point."""
+def skip(state: dict, commit: str, issues: list[dict]) -> bool:
+    """Whether a point of commit adds nothing: the series' last point measured it, no
+    scenario is suspect, waiting on a confirming point, or recovering, waiting on its
+    second good one, and observe has no issue write to repair."""
     last = state.get('last')
     pending = any(v['status'] in ('suspect', 'recovering') for v in state['scenarios'].values())
-    return bool(last) and last['commit'] == commit and not pending
+    repair = bool(observe(state, issues, series=state['series'])[1])
+    return bool(last) and last['commit'] == commit and not pending and not repair
 
 
 def guard_baseline(points: list[dict]) -> dict:
@@ -585,10 +636,15 @@ def record(
         raise ValueError(f'series {series!r} must match {SERIES_RE.pattern}')
     d = series_dir(root, series)
     target = d / 'points' / point_name(p)
-    if target.exists():
-        raise ValueError(f'{target.name} is already recorded')
     state_file = d / 'state.json'
     state = perf_gate.load(state_file) if state_file.is_file() else new_state(series)
+    if target.exists():
+        if perf_gate.load(target).get('run_id') != p['run_id']:
+            raise ValueError(f'{target.name} is already recorded')
+        # A re-run of the run that stored it: the branch holds its point and state, and
+        # only the issue writes may be missing.
+        actions = observe(state, issues, series=series)[1] if issues is not None else []
+        return actions, f'{target.name} is already recorded by this run, so nothing is written.\n'
     actions: list[dict] = []
     if issues is not None:
         state, actions = observe(state, issues, series=series)
@@ -604,7 +660,8 @@ def record(
         repo=repo,
         fallback=[seen(h) for h in fallback],
     )
-    actions += judged.actions
+    stepped = {a['marker'] for a in judged.actions}
+    actions = [a for a in actions if a['marker'] not in stepped] + judged.actions
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(dumps(judged.point))
     state_file.write_text(dumps(judged.state))
@@ -638,7 +695,9 @@ def apply(actions: list[dict], repo: str, client: ghrest.Client | None = None) -
     done = []
     for a in actions:
         tag = f'<!-- {a["marker"]} -->'
-        mine = sorted((i for i in found if tag in (i.get('body') or '')), key=lambda i: i['number'])
+        mine = sorted(
+            (i for i in found if first_line(i.get('body')) == tag), key=lambda i: i['number']
+        )
         if a['op'] == 'close':
             for i in mine:
                 close(client, repo, i['number'], a['comment'], 'completed')
@@ -689,12 +748,19 @@ def close(client: ghrest.Client, repo: str, number: int, comment: str, reason: s
 
 
 def ensure_label(client: ghrest.Client, repo: str) -> None:
-    if client.get_or_none(f'repos/{repo}/labels/{quote(LABEL, safe="")}') is None:
+    path = f'repos/{repo}/labels/{quote(LABEL, safe="")}'
+    if client.get_or_none(path) is not None:
+        return
+    try:
         client.send(
             'POST',
             f'repos/{repo}/labels',
             {'name': LABEL, 'color': LABEL_COLOR, 'description': LABEL_DESCRIPTION},
         )
+    except ghrest.ApiError as exc:
+        # Another series' run, in its own concurrency group, created it first.
+        if exc.status != 422 or client.get_or_none(path) is None:
+            raise
 
 
 # --- command line ----------------------------------------------------------
@@ -723,6 +789,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="the series' state.json, where a missing file is a series never measured",
     )
     sk.add_argument('--commit', required=True)
+    sk.add_argument('--issues', required=True, help="fetch-issues' file")
     nd = sub.add_parser('needs', help='print the perf-trend paths judging a point reads')
     nd.add_argument('--listing', required=True, help='`git ls-tree -r --name-only` of the branch')
     nd.add_argument('--series', required=True)
@@ -762,7 +829,8 @@ def run(a: argparse.Namespace) -> int:
     elif a.command == 'skip':
         path = pathlib.Path(a.state)
         state = perf_gate.load(path) if path.is_file() else new_state('')
-        print('true' if skip(state, a.commit) else 'false')
+        issues = json.loads(pathlib.Path(a.issues).read_text())
+        print('true' if skip(state, a.commit, issues) else 'false')
     elif a.command == 'needs':
         listing = pathlib.Path(a.listing).read_text().splitlines()
         print('\n'.join(needs(listing, a.series)))

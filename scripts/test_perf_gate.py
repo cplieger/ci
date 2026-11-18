@@ -2424,6 +2424,27 @@ class Plan(unittest.TestCase):
             [j['name'] for j in perf_gate.plan(doc, 'pr')['include']], ['shard-1-of-1']
         )
 
+    def test_a_gate_plan_is_one_run_and_refuses_a_unit_s_runs(self):
+        doc = {'node': '.', 'sets': {'pr': {'shards': 1, 'cells': [unit('a', 1, runs=2)]}}}
+        with self.assertRaisesRegex(
+            ValueError, r'a/x10/chromium/desktop: runs belongs to the full set'
+        ):
+            perf_gate.plan(doc, 'pr', gate=True)
+        with self.assertRaisesRegex(ValueError, 'one run, not 2'):
+            perf_gate.plan(PLAN, 'pr', runs=2, gate=True)
+        self.assertEqual(len(perf_gate.plan(doc, 'pr')['include']), 2)
+        self.assertEqual(len(perf_gate.plan(PLAN, 'pr', gate=True)['include']), 2)
+
+    def test_a_cell_field_with_whitespace_or_angle_brackets_fails(self):
+        for name in ('x <!-- perf-trend:dev:files -->', 'a b', 'a>b', 'a\tb'):
+            doc = {'node': '.', 'sets': {'pr': {'shards': 1, 'cells': [unit(name, 1)]}}}
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'whitespace, < or >'):
+                perf_gate.plan(doc, 'pr')
+        cell = {**unit('a', 1), 'engine': 'chro<mium'}
+        doc = {'node': '.', 'sets': {'pr': {'shards': 1, 'cells': [cell]}}}
+        with self.assertRaisesRegex(ValueError, 'whitespace, < or >'):
+            perf_gate.plan(doc, 'pr')
+
     def test_the_set_s_runs_and_a_unit_s_runs_take_the_larger(self):
         cells = [unit('files', 80), unit('tabs', 70, runs=3)]
         doc = {'node': '.', 'sets': {'full': {'shards': 1, 'cells': cells}}}
@@ -3325,6 +3346,10 @@ class Cli(unittest.TestCase):
         out = self.dir / 'matrix.json'
         argv = ('--plan', p, '--set', 'pr', '--only', 'docs, tabs', '--runs', '2')
         outputs = self.dir / 'github-output'
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.main(*argv, '--out', str(out)), 1)
+        self.assertIn('a gated set is measured in one run, not 2', self.output)
+        argv += ('--mode', 'measure')
         self.assertEqual(self.main(*argv, '--out', str(out), '--outputs', str(outputs)), 0)
         matrix = json.loads(out.read_text())
         self.assertEqual(list(matrix), ['include'])
