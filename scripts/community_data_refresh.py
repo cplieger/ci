@@ -40,6 +40,10 @@ WORKFLOW = 'community-data-refresh.yaml'
 # any other path is refused, so a repository's run reaches only its listed
 # generated files through this job's write token.
 REPOS = {
+    'access': {
+        'branch': 'dev',
+        'paths': ('internal/blocklist/common.txt', 'webauthn/aaguids_gen.go'),
+    },
     'langtag': {
         'branch': 'dev',
         'paths': (
@@ -49,6 +53,21 @@ REPOS = {
             'names/table.go',
             'names/testdata/names.golden',
         ),
+    },
+    'subflux': {
+        'branch': 'dev',
+        'paths': (
+            'internal/release/patterns_gen.go',
+            'internal/release/testdata/upstream.json',
+            'internal/release/testdata/golden/fixtures.json',
+            'internal/release/testdata/golden/labels.json',
+        ),
+        'upstreams': {
+            'trash-guides': 'https://github.com/TRaSH-Guides/Guides',
+            'sonarr': 'https://github.com/Sonarr/Sonarr',
+            'radarr': 'https://github.com/Radarr/Radarr',
+        },
+        'labels': ('candidate', 'out-of-model'),
     },
 }
 # The events of a scheduled or hand-started run on the base branch; a pull
@@ -62,10 +81,41 @@ FILES_MAX = 8 * 2**20
 SHA = re.compile(r'^[0-9a-f]{40}$')
 MANIFEST = 'proposal.json'
 FILES = 'files'
+NOTICES = 'notices.json'
+NOTICES_MAX = 50
+NOTICE_ID = re.compile(r'^[a-z0-9][a-z0-9-]*$')
+NOTICE_ID_MAX = 64
+# The label on every issue this job keeps; a notice adds its own from its row.
+ISSUE_LABEL = 'community-data'
+OPENS_MAX = 10
+ISSUES_MAX = 200
+BULK_TITLE = ''
+LABEL_COLOR = ''
 
 
 class RefusedError(Exception):
     """An input or a proposal this job must not act on."""
+
+
+class Notice(NamedTuple):
+    """One validated notice; `body` is the issue body this job writes."""
+
+    id: str
+    title: str
+    body: str
+    labels: tuple[str, ...]
+
+
+def read_issues(gh: ghrest.Client, repo: str) -> list[dict]:
+    raise NotImplementedError
+
+
+def issue_plan(notices: list[Notice], issues: list[dict], managed) -> list[dict]:
+    raise NotImplementedError
+
+
+def apply_issues(gh: ghrest.Client, repo: str, actions: list[dict]) -> list[str]:
+    raise NotImplementedError
 
 
 def write_outputs(values: dict[str, str]) -> None:
@@ -143,11 +193,14 @@ def cmd_locate(a) -> int:
 
 
 class Proposal:
-    """A validated proposal directory: `changes`, the paths it changes, and
-    `title` and `body` when it changes anything."""
+    """A validated proposal directory for one REPOS row: `changes`, the paths
+    it changes, `title` and `body` when it changes anything, and `notices`, None
+    for a row that declares no labels."""
 
-    def __init__(self, root: Path, allowed):
+    def __init__(self, root: Path, row: dict):
         self.root = root
+        allowed = row['paths']
+        self.notices = None
         try:
             doc = json.loads((root / MANIFEST).read_text())
         except (OSError, ValueError) as err:
@@ -208,7 +261,7 @@ class Proposal:
 
 
 def cmd_check(a) -> int:
-    p = Proposal(Path(a.proposal), listed(a.repo)['paths'])
+    p = Proposal(Path(a.proposal), listed(a.repo))
     write_outputs({'changed': 'true' if p.changes else 'false'})
     return 0
 
@@ -328,7 +381,7 @@ def propose(gh: ghrest.Client, repo: str, bot: str, base: str, p: Proposal) -> O
 
 
 def cmd_propose(a) -> int:
-    p = Proposal(Path(a.proposal), listed(a.repo)['paths'])
+    p = Proposal(Path(a.proposal), listed(a.repo))
     if not p.changes:
         print('no change')
         return 0
@@ -342,6 +395,10 @@ def cmd_propose(a) -> int:
         with open(summary, 'a') as fh:
             fh.write(done.text + '\n')
     return 0
+
+
+def cmd_issues(a) -> int:
+    raise NotImplementedError
 
 
 def parse_args(argv: list[str] | None = None):
@@ -358,6 +415,7 @@ def parse_args(argv: list[str] | None = None):
     s = sub.add_parser('check', help='validate a proposal and output changed')
     s.add_argument('--repo', required=True)
     s.add_argument('--proposal', required=True)
+    s.add_argument('--plan', required=True, help='the file the issue plan is written to')
     s.set_defaults(func=cmd_check)
     s = sub.add_parser('propose', help='open or update the pull request')
     s.add_argument('--repo', required=True)
@@ -365,6 +423,10 @@ def parse_args(argv: list[str] | None = None):
     s.add_argument('--proposal', required=True)
     s.add_argument('--bot', required=True, help="the App's bot login, <slug>[bot]")
     s.set_defaults(func=cmd_propose)
+    s = sub.add_parser('issues', help="apply check's issue plan")
+    s.add_argument('--repo', required=True)
+    s.add_argument('--plan', required=True)
+    s.set_defaults(func=cmd_issues)
     return ap.parse_args(argv)
 
 
