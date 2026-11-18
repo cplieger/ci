@@ -297,6 +297,18 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # The package's lint, format and knip steps would read it as the package's own.
+      - name: Move the ci source out of the workspace
+        run: mv "$GITHUB_WORKSPACE/.cplieger-ci" "$RUNNER_TEMP/cplieger-ci"
+
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -313,6 +325,20 @@ jobs:
       - name: Install deps
         run: npm ci
 
+      # playwright-deps.sh seeds apt from these .deb files. The restored key is the
+      # runner label, whether Firefox and WebKit run (only they pick libraries) and
+      # the playwright release; the script appends its .deb set's hash, so a library
+      # update saves anew. No key may hold a comma (checkKey,
+      # https://github.com/actions/toolkit/blob/main/packages/cache/src/cache.ts).
+      - name: Restore the browser libraries
+        id: debs
+        if: ${{ runner.environment == 'github-hosted' && (contains(env.CPLIEGER_BROWSERS, 'firefox') || contains(env.CPLIEGER_BROWSERS, 'webkit')) }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/playwright-debs
+          key: playwright-debs-${{ inputs.runner || 'ubuntu-26.04' }}-firefox-${{ contains(env.CPLIEGER_BROWSERS, 'firefox') }}-webkit-${{ contains(env.CPLIEGER_BROWSERS, 'webkit') }}-${{ hashFiles(format('{0}/node_modules/playwright-core/package.json', inputs.working-directory)) }}-
+          restore-keys: playwright-debs-${{ inputs.runner || 'ubuntu-26.04' }}-firefox-${{ contains(env.CPLIEGER_BROWSERS, 'firefox') }}-webkit-${{ contains(env.CPLIEGER_BROWSERS, 'webkit') }}-${{ hashFiles(format('{0}/node_modules/playwright-core/package.json', inputs.working-directory)) }}-
+
       # Browser Mode enrols by the `@vitest/browser-playwright` devDependency; the
       # engines are the validated `cplieger.browsers` in CPLIEGER_BROWSERS. No library
       # install for Chromium: the image carries its libraries. The pinned `playwright`
@@ -320,7 +346,12 @@ jobs:
       # since the configs use `channel: "chromium"`. Setup, so outside the soft-gate
       # block.
       - name: Install browsers (vitest browser mode)
-        timeout-minutes: 10
+        id: browsers
+        timeout-minutes: 15
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          PLAYWRIGHT_DEPS_CACHE: ${{ runner.temp }}/playwright-debs
+          PLAYWRIGHT_DEPS_CACHE_KEY: ${{ steps.debs.outputs.cache-primary-key }}
         run: |
           if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
             need_libs=()
@@ -336,25 +367,20 @@ jobs:
               esac
             done
             if [ "${#need_libs[@]}" -gt 0 ]; then
-              # The system libraries need root for apt, which a self-hosted
-              # runner may not grant; its image carries them. Unset reads
-              # hosted. The hosted image lacks Firefox's and WebKit's, and an
-              # Ubuntu mirror or DNS outage stalls apt, so the install is bounded
-              # below the step timeout. They go first, so the engines' own host
-              # check finds them.
-              if [ "${RUNNER_ENVIRONMENT:-github-hosted}" = github-hosted ]; then
-                rc=0
-                timeout 300 npx --no-install playwright install-deps "${need_libs[@]}" || rc=$?
-                if [ "$rc" -ne 0 ]; then
-                  echo "::error::playwright install-deps for ${need_libs[*]} failed or ran past 5 minutes (exit ${rc}). An Ubuntu mirror or DNS outage is the usual cause: rerun the job once it clears."
-                  exit 1
-                fi
-              fi
+              # The libraries go first, so the engines' own host check finds them.
+              bash "$CI_TOOLS/playwright-deps.sh" "${need_libs[@]}"
               npx --no-install playwright install "${need_libs[@]}"
             fi
           else
             echo "no @vitest/browser-playwright devDependency; skipping browser install"
           fi
+
+      - name: Save the browser libraries
+        if: ${{ steps.browsers.outputs.key != '' && steps.browsers.outputs.key != steps.debs.outputs.cache-matched-key }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/playwright-debs
+          key: ${{ steps.browsers.outputs.key }}
 
       # The Go test server the package names in `sseFixture`, built for every
       # shard and handed to the tests as SSE_FIXTURE. Setup, so outside the
@@ -772,6 +798,17 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      - name: Move the ci source out of the workspace
+        run: mv "$GITHUB_WORKSPACE/.cplieger-ci" "$RUNNER_TEMP/cplieger-ci"
+
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -782,10 +819,25 @@ jobs:
       - name: Install deps
         run: npm ci
 
+      # Keyed as validate's.
+      - name: Restore the browser libraries
+        id: debs
+        if: ${{ runner.environment == 'github-hosted' && (contains(env.CPLIEGER_BROWSERS, 'firefox') || contains(env.CPLIEGER_BROWSERS, 'webkit')) }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/playwright-debs
+          key: playwright-debs-${{ inputs.runner || 'ubuntu-26.04' }}-firefox-${{ contains(env.CPLIEGER_BROWSERS, 'firefox') }}-webkit-${{ contains(env.CPLIEGER_BROWSERS, 'webkit') }}-${{ hashFiles(format('{0}/node_modules/playwright-core/package.json', inputs.working-directory)) }}-
+          restore-keys: playwright-debs-${{ inputs.runner || 'ubuntu-26.04' }}-firefox-${{ contains(env.CPLIEGER_BROWSERS, 'firefox') }}-webkit-${{ contains(env.CPLIEGER_BROWSERS, 'webkit') }}-${{ hashFiles(format('{0}/node_modules/playwright-core/package.json', inputs.working-directory)) }}-
+
       # The same install as validate's, so a browser-mode suite finds its
       # browsers on the floor too.
       - name: Install browsers (vitest browser mode)
-        timeout-minutes: 10
+        id: browsers
+        timeout-minutes: 15
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          PLAYWRIGHT_DEPS_CACHE: ${{ runner.temp }}/playwright-debs
+          PLAYWRIGHT_DEPS_CACHE_KEY: ${{ steps.debs.outputs.cache-primary-key }}
         run: |
           if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
             need_libs=()
@@ -801,25 +853,20 @@ jobs:
               esac
             done
             if [ "${#need_libs[@]}" -gt 0 ]; then
-              # The system libraries need root for apt, which a self-hosted
-              # runner may not grant; its image carries them. Unset reads
-              # hosted. The hosted image lacks Firefox's and WebKit's, and an
-              # Ubuntu mirror or DNS outage stalls apt, so the install is bounded
-              # below the step timeout. They go first, so the engines' own host
-              # check finds them.
-              if [ "${RUNNER_ENVIRONMENT:-github-hosted}" = github-hosted ]; then
-                rc=0
-                timeout 300 npx --no-install playwright install-deps "${need_libs[@]}" || rc=$?
-                if [ "$rc" -ne 0 ]; then
-                  echo "::error::playwright install-deps for ${need_libs[*]} failed or ran past 5 minutes (exit ${rc}). An Ubuntu mirror or DNS outage is the usual cause: rerun the job once it clears."
-                  exit 1
-                fi
-              fi
+              # The libraries go first, so the engines' own host check finds them.
+              bash "$CI_TOOLS/playwright-deps.sh" "${need_libs[@]}"
               npx --no-install playwright install "${need_libs[@]}"
             fi
           else
             echo "no @vitest/browser-playwright devDependency; skipping browser install"
           fi
+
+      - name: Save the browser libraries
+        if: ${{ steps.browsers.outputs.key != '' && steps.browsers.outputs.key != steps.debs.outputs.cache-matched-key }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/playwright-debs
+          key: ${{ steps.browsers.outputs.key }}
 
       # The same Go test server build as validate's.
       - name: Setup Go (sseFixture)
