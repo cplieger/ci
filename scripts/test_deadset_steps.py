@@ -1303,7 +1303,10 @@ class SpecSkew(Harness):
         )
         self.assertEqual(run.rc, 0, run.out)
         self.assertEqual(self.errors(run), [])
-        self.assertIn('deadset-go v2.0.0-dev.54 on deadset-spec v8.0.0-dev.62', run.out)
+        self.assertIn(
+            f'deadset-go {WORKFLOW_ENV["DEADSET_GO_VERSION"]} on deadset-spec v8.0.0-dev.62',
+            run.out,
+        )
         self.assertIn('on deadset-spec v8.0.0-dev.63; deadset ', run.out)
 
     def test_a_host_on_an_older_spec_than_an_analyzer_fails_naming_both(self):
@@ -1340,7 +1343,7 @@ class SpecSkew(Harness):
             ),
             (
                 {'SPEC_DEADSET': 'v8.0.0-dev.63', 'REPLACED_DEADSET_GO': '1'},
-                'deadset-go v2.0.0-dev.54 names no',
+                f'deadset-go {WORKFLOW_ENV["DEADSET_GO_VERSION"]} names no',
             ),
             (
                 {
