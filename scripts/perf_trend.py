@@ -72,7 +72,8 @@ def point(
     """One point of shard_groups' runs. A timing or report cell's value is the median of
     its runs' medians, and a count's the lower middle of every rep, a count some rep
     measured. A timing cell keeps each run's reps and CPU model, in run order. A cell
-    with no reps has value None. Raises on a cell whose fields identity_error refuses."""
+    with no reps has value None. Raises on a cell whose fields identity_error refuses or
+    with a rep that is not a number."""
     runs = [perf_gate.merge(paths) for _, paths in sorted(groups.items())]
     runners = {r['runner'] for r in runs}
     if len(runners) != 1:
@@ -83,6 +84,8 @@ def point(
             k = perf_gate.key(c)
             if why := identity_error(k):
                 raise ValueError(f'{perf_gate.key_text(k)}: {why}')
+            if not all(perf_gate.is_number(r) for r in c.get('reps') or []):
+                raise ValueError(f'{perf_gate.key_text(k)}: a rep is not a number')
             seen = found.setdefault(k, {'kind': c.get('kind'), 'reps': [], 'cpu_models': []})
             if seen['kind'] != c.get('kind'):
                 raise ValueError(
@@ -543,30 +546,42 @@ def render_summary(
     return '\n'.join(lines) + '\n'
 
 
+def open_issues(issues: list[dict], mark: str) -> list[dict]:
+    """The open issues of the regression mark names, oldest first: each whose body opens
+    with the marker, however old, since apply edits the oldest of them."""
+    tag = f'<!-- {mark} -->'
+    mine = (i for i in issues if i.get('state') == 'open' and first_line(i.get('body')) == tag)
+    return sorted(mine, key=lambda i: i['number'])
+
+
 def observe(state: dict, issues: list[dict], *, series: str) -> tuple[dict, list[dict]]:
-    """Fold the repository's `performance` issues into state: a tracked regression whose
-    every issue since it opened a person closed is accepted (status ok, its cells'
-    baselines restart from its first bad point); one with no issue since it opened is
-    sent the body it was last sent again, which repairs a run that stored its point and
-    lost its issue writes; and an open issue of this series whose scenario tracks no
-    regression is closed."""
+    """Fold the repository's `performance` issues into state: a tracked regression with
+    no open issue and one a person closed since it opened is accepted (status ok, its
+    cells' baselines restart from its first bad point); one with neither is sent the
+    body it was last sent again, which repairs a run that stored its point and lost its
+    issue writes; and an open issue of this series whose scenario tracks no regression
+    is closed."""
     new = {**state, 'scenarios': {k: dict(v) for k, v in state['scenarios'].items()}}
     actions = []
     for s, v in sorted(state['scenarios'].items()):
         if v['status'] not in ('open', 'recovering'):
             continue
-        mine = [
+        if open_issues(issues, marker(series, s)):
+            continue
+        closed = [
             i
             for i in issues
-            if marked(i.get('body')) == (series, s) and i.get('created_at', '') >= v['opened']
+            if i.get('state') == 'closed'
+            and marked(i.get('body')) == (series, s)
+            and (i.get('closed_at') or '') >= v['opened']
         ]
-        if mine and all(i.get('state') == 'closed' for i in mine):
+        if closed:
             at = state['last']['date'] if state.get('last') else v['first_bad']['date']
             new['scenarios'][s] = {
                 'status': 'ok',
                 'accepted': {'from': v['first_bad']['date'], 'at': at},
             }
-        elif not mine:
+        else:
             actions.append(
                 {
                     'op': 'upsert',
@@ -611,27 +626,41 @@ def open_markers(issues: list[dict], series: str) -> set[str]:
     return out
 
 
-def skip(state: dict, commit: str, issues: list[dict], runner: str) -> bool:
+def skip(state: dict, commit: str, runner: str) -> bool:
     """Whether a point of commit on runner adds nothing: the series' last point measured
-    it on runner, no scenario tracked on runner is suspect, waiting on a confirming
-    point, or recovering, waiting on its second good one, and observe has no issue write
-    to repair."""
+    it on runner, and no scenario tracked on runner is suspect, waiting on a confirming
+    point, or recovering, waiting on its second good one. A skipped run still sends
+    observe's issue writes."""
     last = state.get('last')
     pending = any(
         v['status'] in ('suspect', 'recovering') and v.get('runner') == runner
         for v in state['scenarios'].values()
     )
-    repair = bool(observe(state, issues, series=state['series'])[1])
     same = bool(last) and last['commit'] == commit and last.get('runner') == runner
-    return same and not pending and not repair
+    return same and not pending
+
+
+def point_runs(p: dict) -> int:
+    """The runs most of a point's timing cells were measured in."""
+    runs = [len(c['reps']) for c in p['cells'] if perf_gate.is_timing(c) and c.get('reps')]
+    return statistics.median_low(runs) if runs else 0
 
 
 def guard_baseline(points: list[dict]) -> dict:
     """The pull request guard's baselines from dev's points, oldest first: each timing
-    cell's median over the last GUARD_POINTS points on the newest point's runner, and
-    each count as the newest of them measured it, which the guard only reports."""
-    runner = points[-1]['runner']
-    last = [p for p in points if p['runner'] == runner][-GUARD_POINTS:]
+    cell's median over the last GUARD_POINTS points of the newest runner whose last
+    points hold GUARD_POINTS runs between them, or else of the newest point's runner,
+    and each count as the newest of them measured it, which the guard only reports. A
+    new runner's first points are no guard baseline: against one to four one-run points
+    a pull request's median fails 1 to 10 % of the time, against five none."""
+    by_runner: dict[str, list[dict]] = {}
+    for p in points:
+        by_runner[p['runner']] = [*by_runner.pop(p['runner'], []), p]
+    # Re-inserted at each point, so the dict runs from the least to the most recent runner.
+    newest = list(reversed(by_runner))
+    held = [r for r in newest if sum(map(point_runs, by_runner[r][-GUARD_POINTS:])) >= GUARD_POINTS]
+    runner = held[0] if held else newest[0]
+    last = by_runner[runner][-GUARD_POINTS:]
     values: dict[tuple, tuple[str, list]] = {}
     for p in last:
         for c in p['cells']:
@@ -666,16 +695,19 @@ def load_points(root: pathlib.Path, series: str) -> list[dict]:
 
 def needs(listing: list[str], series: str) -> list[str]:
     """The paths of the perf-trend branch (listing, `git ls-tree -r --name-only`) the
-    record job checks out to judge a point of series: its state, its last HISTORY points
-    and, while it has fewer than BASELINE_POINTS, the last HISTORY dev points at or
-    before its first one."""
+    record job checks out to judge a point of series: its state, dev's state for another
+    series, its last HISTORY points and, while it has fewer than BASELINE_POINTS, the
+    last HISTORY dev points at or before its first one."""
 
     def points_of(s: str) -> list[str]:
         prefix = f'series/{s}/points/'
         return sorted(p for p in listing if p.startswith(prefix) and p.endswith('.json'))
 
     own = points_of(series)
-    out = [f'series/{series}/state.json', *own[-HISTORY:]]
+    out = [f'series/{series}/state.json']
+    if series != DEV:
+        out.append(f'series/{DEV}/state.json')
+    out += own[-HISTORY:]
     if series != DEV and len(own) < BASELINE_POINTS:
         first = pathlib.PurePosixPath(own[0]).name if own else None
         dev = [p for p in points_of(DEV) if first is None or pathlib.PurePosixPath(p).name <= first]
@@ -700,8 +732,9 @@ def record(
 ) -> tuple[list[dict], str]:
     """Judge point p against the checkout at root and write it there: the judged point,
     the series' state and, for dev, the guard's baseline.json. Refuses a point older than
-    the series' newest, and a series with no state while issues holds one marked with it.
-    Returns the issue actions and the run summary."""
+    the series' newest, a series with no state while issues holds one marked with it, and
+    a series other than dev on a checkout with no dev series. Returns the issue actions
+    and the run summary."""
     series = p['series']
     if not SERIES_RE.match(series):
         raise ValueError(f'series {series!r} must match {SERIES_RE.pattern}')
@@ -718,6 +751,11 @@ def record(
         return actions, f'{target.name} is already recorded by this run, so nothing is written.\n'
     actions: list[dict] = []
     if not state_file.is_file():
+        if series != DEV and not (series_dir(root, DEV) / 'state.json').is_file():
+            raise ValueError(
+                f'the {series} series cannot start a perf-trend branch that holds no dev '
+                'series: restore the branch from a clone that holds it, or seed it with dev'
+            )
         seedable(issues or [], series)
     points = sorted(f.name for f in (d / 'points').glob('*.json'))
     if points and target.name < points[-1]:
@@ -757,7 +795,7 @@ def fetch_issues(repo: str, client: ghrest.Client | None = None) -> list[dict]:
     client = client or ghrest.DEFAULT
     path = f'repos/{repo}/issues?state=all&labels={quote(LABEL, safe="")}'
     return [
-        {k: i.get(k) for k in ('number', 'state', 'created_at', 'body')}
+        {k: i.get(k) for k in ('number', 'state', 'closed_at', 'body')}
         for i in client.pages(path)
         if 'pull_request' not in i
     ]
@@ -773,10 +811,7 @@ def apply(actions: list[dict], repo: str, client: ghrest.Client | None = None) -
     found = [i for i in issues if 'pull_request' not in i]
     done = []
     for a in actions:
-        tag = f'<!-- {a["marker"]} -->'
-        mine = sorted(
-            (i for i in found if first_line(i.get('body')) == tag), key=lambda i: i['number']
-        )
+        mine = open_issues(found, a['marker'])
         if a['op'] == 'close':
             for i in mine:
                 close(client, repo, i['number'], a['comment'], 'completed')
@@ -871,7 +906,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     sk.add_argument(
         '--runner', required=True, help='the runner label the point would be stamped with'
     )
-    sk.add_argument('--issues', required=True, help="fetch-issues' file")
+    rp = sub.add_parser(
+        'repair', help="write observe's issue writes of a skipped run and print whether any"
+    )
+    rp.add_argument('--state', required=True, help="the series' state.json")
+    rp.add_argument('--issues', required=True, help="fetch-issues' file")
+    rp.add_argument('--out', required=True, help='where the issue actions are written')
     nd = sub.add_parser('needs', help='print the perf-trend paths judging a point reads')
     nd.add_argument('--listing', required=True, help='`git ls-tree -r --name-only` of the branch')
     nd.add_argument('--series', required=True)
@@ -914,8 +954,13 @@ def run(a: argparse.Namespace) -> int:
     elif a.command == 'skip':
         path = pathlib.Path(a.state)
         state = perf_gate.load(path) if path.is_file() else new_state('')
+        print('true' if skip(state, a.commit, a.runner) else 'false')
+    elif a.command == 'repair':
+        state = perf_gate.load(a.state)
         issues = json.loads(pathlib.Path(a.issues).read_text())
-        print('true' if skip(state, a.commit, issues, a.runner) else 'false')
+        actions = observe(state, issues, series=state['series'])[1]
+        pathlib.Path(a.out).write_text(json.dumps(actions, indent=1) + '\n')
+        print('true' if actions else 'false')
     elif a.command == 'needs':
         listing = pathlib.Path(a.listing).read_text().splitlines()
         print('\n'.join(needs(listing, a.series)))

@@ -546,18 +546,28 @@ class Trend(unittest.TestCase):
         self.assertEqual(
             self.jobs['record']['if'], "${{ !cancelled() && needs.measure.result == 'success' }}"
         )
-        self.assertEqual(self.jobs['issues']['needs'], ['record'])
+        self.assertEqual(self.jobs['issues']['needs'], ['plan', 'record'])
         self.assertEqual(
-            self.jobs['issues']['if'], "${{ !cancelled() && needs.record.result == 'success' }}"
+            ' '.join(self.jobs['issues']['if'].split()),
+            "${{ !cancelled() && (needs.record.result == 'success' || "
+            "(needs.plan.result == 'success' && needs.plan.outputs.repair == 'true')) }}",
         )
         download = step(self.jobs['issues'], 'Download the actions')
         self.assertEqual(
             download['with']['name'],
-            'perf-trend-actions-attempt-${{ needs.record.outputs.attempt }}',
+            'perf-trend-actions-attempt-'
+            '${{ needs.record.outputs.attempt || needs.plan.outputs.attempt }}',
         )
-        upload = step(self.jobs['record'], 'Upload the actions')
+        for job, name in (('record', 'Upload the actions'), ('plan', 'Upload the repair')):
+            upload = step(self.jobs[job], name)
+            self.assertEqual(
+                upload['with']['name'], 'perf-trend-actions-attempt-${{ github.run_attempt }}'
+            )
+            self.assertEqual(upload['with']['path'], '${{ runner.temp }}/actions.json')
+        repair = step(self.jobs['plan'], 'Upload the repair')
+        self.assertEqual(repair['if'], "${{ steps.resolve.outputs.repair == 'true' }}")
         self.assertEqual(
-            upload['with']['name'], 'perf-trend-actions-attempt-${{ github.run_attempt }}'
+            self.jobs['plan']['outputs']['attempt'], '${{ steps.resolve.outputs.attempt }}'
         )
 
     def test_notify_reads_every_other_job(self):
@@ -604,7 +614,9 @@ exit "$BRANCH"
             'SEED': seed,
         }
         env |= {'BRANCH': '0' if branch is True else '2' if branch is False else branch}
+        env |= {'GITHUB_RUN_ATTEMPT': '3'}
         proc, tmp = run_body(self, s['run'], env, {'gh': gh, 'git': git})
+        self.actions = tmp / 'runner' / 'actions.json'
         return proc, outputs(tmp)
 
     def test_resolve_runs_on_the_runner_the_measure_job_stamps(self):
@@ -653,11 +665,19 @@ exit "$BRANCH"
         tracked = {'status': 'open', 'runner': 'ubuntu-26.04', 'opened': '2026-11-18T00:00:00Z'}
         tracked |= {'body': body, 'first_bad': {'date': '2026-11-17T16:00:00Z'}}
         opened = {**done, 'scenarios': {'files': tracked}}
-        filed = {'number': 1, 'state': 'open', 'created_at': '2026-11-18T00:05:00Z', 'body': body}
+        filed = {'number': 1, 'state': 'open', 'closed_at': None, 'body': body}
         _, out = self.resolve(state=json.dumps(opened), issues=[filed])
-        self.assertEqual(out['run'], 'false')
+        self.assertEqual((out['run'], out['repair']), ('false', 'false'))
+        self.assertNotIn('attempt', out)
+        self.assertEqual(json.loads(self.actions.read_text()), [])
         _, out = self.resolve(state=json.dumps(opened))
-        self.assertEqual(out['run'], 'true')
+        self.assertEqual((out['run'], out['repair'], out['attempt']), ('false', 'true', '3'))
+        self.assertEqual(
+            [(a['op'], a['marker'], a['body']) for a in json.loads(self.actions.read_text())],
+            [('upsert', 'perf-trend:dev:files', body)],
+        )
+        _, out = self.resolve(state=json.dumps(pending))
+        self.assertEqual((out['run'], out['repair']), ('true', 'false'))
 
     def test_resolve_fails_on_a_missing_branch_unless_seeding_a_history_no_issue_names(self):
         proc, out = self.resolve(branch=False)
@@ -670,11 +690,19 @@ exit "$BRANCH"
         self.assertNotIn('run', out)
         proc, out = self.resolve(branch=False, seed='true')
         self.assertEqual((proc.returncode, out['run']), (0, 'true'), proc.stderr)
-        marked = {'number': 4, 'state': 'closed', 'created_at': '2026-11-01T00:00:00Z'}
+        marked = {'number': 4, 'state': 'closed', 'closed_at': '2026-11-01T00:00:00Z'}
         marked['body'] = '<!-- perf-trend:dev:files -->\nbody'
         proc, out = self.resolve(branch=False, seed='true', issues=[marked])
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn('issue #4 is marked with it, so its history is lost', proc.stderr)
+        self.assertNotIn('run', out)
+        proc, out = self.resolve('x', 'proof', seed='true', branch=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(
+            '::error::the perf-trend branch of cplieger/a is missing: restore it from a clone '
+            'that holds it, or dispatch the dev series with seed to start a new history',
+            proc.stdout,
+        )
         self.assertNotIn('run', out)
         proc, out = self.resolve(seed='true')
         self.assertNotEqual(proc.returncode, 0)
@@ -696,6 +724,7 @@ exit "$BRANCH"
         race: bool = False,
         seed: str = 'false',
         issues=(),
+        series: str = 'dev',
     ):
         """The Record step against remote, a local bare repository standing in for GitHub,
         on a one-shard measure of sha; race pushes another commit to perf-trend first."""
@@ -728,7 +757,7 @@ printf 'HTTP/2.0 200 OK\\r\\n\\r\\n%s' "$ISSUES"
             (tmp / 'race').write_text('')
         s = step(self.jobs['record'], 'Record')
         env = dict.fromkeys(s['env'], '')
-        env |= {'GH_TOKEN': 't', 'REPO': 'cplieger/a', 'SERIES': 'dev', 'REF': 'dev', 'SHA': sha}
+        env |= {'GH_TOKEN': 't', 'REPO': 'cplieger/a', 'SERIES': series, 'REF': 'dev', 'SHA': sha}
         env |= {'DATE': date, 'PREFIX': 'cplieger-a'}
         env |= {'RUN_ID': '1', 'RUN_URL': 'https://github.com/cplieger/a/actions/runs/1'}
         env |= {'CI_TOOLS': str(ROOT / 'scripts'), 'RUNNER_TEMP': str(tmp / 'runner')}
@@ -767,7 +796,7 @@ printf 'HTTP/2.0 200 OK\\r\\n\\r\\n%s' "$ISSUES"
             proc.stdout,
         )
         self.assertFalse((runner / 'actions.json').exists())
-        marked = {'number': 4, 'state': 'closed', 'created_at': '2026-11-01T00:00:00Z'}
+        marked = {'number': 4, 'state': 'closed', 'closed_at': '2026-11-01T00:00:00Z'}
         marked['body'] = '<!-- perf-trend:dev:files -->\nbody'
         proc, runner = self.record(
             remote, 'a' * 40, '2026-11-18T00:00:00Z', seed='true', issues=[marked]
@@ -776,6 +805,13 @@ printf 'HTTP/2.0 200 OK\\r\\n\\r\\n%s' "$ISSUES"
         self.assertIn('issue #4 is marked with it, so its history is lost', proc.stderr)
         self.assertFalse((runner / 'actions.json').exists())
         branches = ['git', '-C', str(remote), 'branch', '--list']
+        self.assertEqual(subprocess.run(branches, capture_output=True, text=True).stdout, '')
+        proc, runner = self.record(
+            remote, 'a' * 40, '2026-11-18T00:00:00Z', seed='true', issues=[marked], series='proof'
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('or dispatch the dev series with seed to start a new history', proc.stdout)
+        self.assertFalse((runner / 'actions.json').exists())
         self.assertEqual(subprocess.run(branches, capture_output=True, text=True).stdout, '')
         proc, runner = self.record(remote, 'a' * 40, '2026-11-18T00:00:00Z', seed='true')
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

@@ -25,7 +25,7 @@ on:
         required: false
         default: ""
       seed:
-        description: "Start a missing perf-trend branch with this point. Refused while the branch exists or an issue is marked with the series."
+        description: "Start a missing perf-trend branch with this point of the dev series. Refused while the branch exists or an issue is marked with dev."
         type: boolean
         default: false
 
