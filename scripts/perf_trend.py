@@ -196,13 +196,15 @@ def ref_of(p: dict) -> dict:
 def baseline(history: list[dict], k: tuple, runner: str, accepted: dict | None) -> float | None:
     """The median of cell k's last BASELINE_POINTS values on runner that were not bad,
     or else the baseline the newest such point carried, and None while fewer than
-    GUARD_POINTS points of runner measured it. Under an accepted regression the points
-    before its first bad point are no baseline, and those up to its acceptance count
-    however they were judged."""
+    GUARD_POINTS points of runner measured it since it last took over. Under an accepted
+    regression the points before its first bad point are no baseline, and those up to
+    its acceptance count however they were judged."""
     good, carried, measured = [], None, 0
     for h in reversed(history):
+        if h['runner'] != runner:
+            break
         c = h['cells'].get(k)
-        if h['runner'] != runner or c is None or c.get('value') is None:
+        if c is None or c.get('value') is None:
             continue
         if accepted and h['date'] < accepted['from']:
             break
@@ -648,14 +650,18 @@ def point_runs(p: dict) -> int:
 
 def guard_baseline(points: list[dict]) -> dict:
     """The pull request guard's baselines from dev's points, oldest first: each timing
-    cell's median over the last GUARD_POINTS points of the newest runner whose last
-    points hold GUARD_POINTS runs between them, or else of the newest point's runner,
-    and each count as the newest of them measured it, which the guard only reports. A
-    new runner's first points are no guard baseline: against one to four one-run points
-    a pull request's median fails 1 to 10 % of the time, against five none."""
+    cell's median over the last GUARD_POINTS points of the newest runner whose points
+    since it last took over hold GUARD_POINTS runs between them, or else of the newest
+    point's runner, and each count as the newest of them measured it, which the guard
+    only reports. A runner's first points after it takes over are no guard baseline:
+    against one to four one-run points a pull request's median fails 1 to 10 % of the
+    time, against five none."""
     by_runner: dict[str, list[dict]] = {}
+    previous = None
     for p in points:
-        by_runner[p['runner']] = [*by_runner.pop(p['runner'], []), p]
+        stretch = by_runner.pop(p['runner'], []) if p['runner'] == previous else []
+        by_runner[p['runner']] = [*stretch, p]
+        previous = p['runner']
     # Re-inserted at each point, so the dict runs from the least to the most recent runner.
     newest = list(reversed(by_runner))
     held = [r for r in newest if sum(map(point_runs, by_runner[r][-GUARD_POINTS:])) >= GUARD_POINTS]

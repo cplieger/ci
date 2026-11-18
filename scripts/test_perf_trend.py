@@ -658,6 +658,19 @@ class Judge(unittest.TestCase):
         cold = next(c for c in judged.point['cells'] if c['window'] == 'cold')
         self.assertEqual((cold['baseline'], cold['bad']), (1000.0, True))
 
+    def test_a_returning_runner_is_judged_only_on_its_points_since_it_last_took_over(self):
+        other = 'self-hosted'
+        t = Trend(points=perf_trend.GUARD_POINTS)
+        for _ in range(8):
+            t.add(slow(cold=3000.0), runner=other)
+        for _ in range(perf_trend.GUARD_POINTS):
+            judged = t.add(slow(cold=3000.0))
+            self.assertFalse(any('baseline' in c for c in judged.point['cells']))
+            self.assertEqual((judged.actions, t.scenario()), ([], 'ok'))
+        judged = t.add(slow(cold=3000.0))
+        cold = next(c for c in judged.point['cells'] if c['window'] == 'cold')
+        self.assertEqual((cold['baseline'], cold['bad']), (3000.0, False))
+
     def test_a_point_judging_none_of_a_scenario_s_cells_leaves_it_as_it_was(self):
         t = Trend(base={**GOOD, ('docs', 'cold', 'cpu_ms'): 500.0})
         t.add(slow(cold=3000.0))
@@ -1037,6 +1050,25 @@ class Record(unittest.TestCase):
                 self.assertEqual((b['runner'], b['commits'][-1]), (RUNNER, PURE_SHA.format(5)), n)
         self.assertEqual(b['runner'], 'self-hosted')
         self.assertEqual(b['commits'], [PURE_SHA.format(n) for n in range(6, 11)])
+        cold = next(c for c in b['cells'] if c['window'] == 'cold')
+        self.assertEqual(cold['baseline'], 4000.0)
+
+    def test_a_returning_runner_is_the_guard_baseline_only_on_points_since_it_last_took_over(self):
+        def guard():
+            return json.loads((self.root / 'series/dev/baseline.json').read_text())
+
+        for n in range(1, 6):
+            self.record(GOOD, n)
+        for n in range(6, 14):
+            self.record(slow(cold=4000.0), n, runner='self-hosted')
+        for n in range(14, 14 + perf_trend.GUARD_POINTS):
+            self.record(slow(cold=4000.0), n)
+            b = guard()
+            if n < 13 + perf_trend.GUARD_POINTS:
+                self.assertEqual(b['runner'], 'self-hosted', n)
+                self.assertEqual(b['commits'], [PURE_SHA.format(k) for k in range(9, 14)], n)
+        self.assertEqual(b['runner'], RUNNER)
+        self.assertEqual(b['commits'], [PURE_SHA.format(n) for n in range(14, 19)])
         cold = next(c for c in b['cells'] if c['window'] == 'cold')
         self.assertEqual(cold['baseline'], 4000.0)
 
