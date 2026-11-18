@@ -1,11 +1,11 @@
 name: Performance
 
 # The tier 2 performance gate of a repository that carries tests/perf/plan.json:
-# plan, build once, measure in shards, guard each timing cell against the
-# baselines of the base ref's tests/perf/budgets.json, re-measure a red cell on
-# new runners, then judge it on six reps. Counts are reported, never judged.
-# scripts/perf_gate.py owns the rule; the repository owns build.sh, run.sh, the
-# scenarios and the budgets.
+# plan, build once, measure in shards, guard each timing cell against dev's
+# trend baselines on the repository's perf-trend branch, re-measure a red cell
+# on new runners, then judge it on six reps. Counts are reported, never judged.
+# scripts/perf_gate.py owns the rule; the repository owns build.sh, run.sh and
+# the scenarios.
 
 on:
   workflow_call:
@@ -29,13 +29,15 @@ on:
         type: string
         default: ''
       runs:
-        description: How many times to measure the set; more than one only calibrates.
+        description: >-
+          How many times to measure the set, or more for a unit whose plan.json
+          `runs` asks for more; more than one run needs `measure`.
         type: number
         default: 1
       mode:
         description: >-
-          `gate` compares and judges; `calibrate` measures only, for
-          perf-calibrate.yaml to read the results.
+          `gate` compares and judges; `measure` measures only, for the caller
+          to read the results.
         type: string
         default: gate
       max-parallel:
@@ -45,8 +47,8 @@ on:
       runner:
         description: >-
           The runner label for every job that can leave GitHub's hosted runners,
-          such as a self-hosted pool's; empty runs them on ubuntu-26.04. A pool the
-          budgets do not name is reported and never gated.
+          such as a self-hosted pool's; empty runs them on ubuntu-26.04. A pool dev's
+          trend baselines were not measured on is reported and never gated.
         type: string
         default: ''
     outputs:
@@ -189,13 +191,23 @@ jobs:
       # A re-run compare plans its own remeasure shards; the verdict reads only theirs.
       attempt: ${{ github.run_attempt }}
     steps:
-      # The guard reads the base commit's budgets.json, which a shallow merge ref lacks.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ needs.plan.outputs.sha }}
-          fetch-depth: 0
+          persist-credentials: false
+
+      # The head never supplies its own baselines: they are the ones the scheduled
+      # trend wrote from dev's last points. A missing branch fails this step.
+      - name: Check out the trend baselines
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: perf-trend
+          path: .perf-trend
+          sparse-checkout: series/dev/baseline.json
+          sparse-checkout-cone-mode: false
           persist-credentials: false
 
       - name: Check out the ci source
@@ -223,8 +235,6 @@ jobs:
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           PREFIX: ${{ needs.plan.outputs.prefix }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-          EVENT: ${{ github.event_name }}
           SET: ${{ needs.plan.outputs.set }}
           ONLY: ${{ inputs.only }}
           MEASURED: ${{ needs.measure.result }}
@@ -234,22 +244,11 @@ jobs:
             echo "::error::a measure shard ended ${MEASURED}, so the set was not measured whole"
             exit 1
           fi
-          head=$(git rev-parse HEAD)
-          base="${BASE_SHA:-$head}"
-          # A pull request's base SHA is the base tip when it opened, and GitHub does not
-          # move it, so baselines merged since would be ones the base lacks. The merge
-          # ref's first parent is the base commit the checkout was built on.
-          if [ "$EVENT" = pull_request ] && git rev-parse -q --verify 'HEAD^2^{commit}' > /dev/null; then
-            base=$(git rev-parse 'HEAD^1')
-          fi
-          # perf_gate.py fails a base without the file: the guard has no baseline.
-          git show "${base}:tests/perf/budgets.json" > "$RUNNER_TEMP/base-budgets.json" 2>/dev/null \
-            || rm -f "$RUNNER_TEMP/base-budgets.json"
           # A red guard still plans its re-measure, so the verdict judges each red
           # cell on six reps beside the failure.
           rc=0
           python3 "$CI_TOOLS/perf_gate.py" \
-            --base "$RUNNER_TEMP/base-budgets.json" \
+            --trend .perf-trend/series/dev/baseline.json \
             --results "$RUNNER_TEMP/results" \
             --prefix "$PREFIX" \
             --plan-doc tests/perf/plan.json --set "$SET" --only "$ONLY" \

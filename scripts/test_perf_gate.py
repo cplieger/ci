@@ -2502,10 +2502,27 @@ class Bench(unittest.TestCase):
         )
 
 
+class BenchRuns(unittest.TestCase):
+    def test_the_chart_reads_the_first_run_of_a_set_some_units_measure_twice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for run, reps in (('run-01', 1000.0), ('run-02', 3000.0)):
+                d = (
+                    pathlib.Path(tmp)
+                    / f'perf-results-cplieger-a-measure-{run}-shard-1-of-1-attempt-1'
+                )
+                d.mkdir()
+                (d / 'results.json').write_text(json.dumps(results([cell(reps=(reps,) * 3)])))
+            out = pathlib.Path(tmp) / 'bench.json'
+            with redirect_stdout(io.StringIO()):
+                rc = perf_gate.main(['--bench', tmp, '--prefix', 'cplieger-a', '--out', str(out)])
+            self.assertEqual(rc, 0)
+            self.assertEqual([p['value'] for p in json.loads(out.read_text())], [1000.0])
+
+
 class ResultFiles(unittest.TestCase):
     NAMES = (
         'perf-results-cplieger-a-measure-shard-1-of-2-attempt-1',
-        'perf-results-cplieger-a-measure-run-03-shard-2-of-2-attempt-1',
+        'perf-results-cplieger-a-measure-shard-2-of-2-attempt-1',
         'perf-results-cplieger-a-measure-x-measure-shard-1-of-1-attempt-1',
         'perf-results-cplieger-a-remeasure-shard-1-of-1-attempt-1',
         'perf-results-cplieger-a-remeasure-x-remeasure-shard-1-of-1-attempt-1',

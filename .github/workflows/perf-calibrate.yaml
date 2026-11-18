@@ -84,7 +84,7 @@ jobs:
       ref: ${{ needs.check.outputs.sha }}
       set: full
       runs: 10
-      mode: calibrate
+      mode: measure
       # The account's concurrent-job limit is shared with every repository's
       # pull requests, so a calibration takes half of GitHub Free's 20.
       max-parallel: 10

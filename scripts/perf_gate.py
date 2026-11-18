@@ -1884,8 +1884,11 @@ def newest_shards(
 def result_files(
     directory: str | pathlib.Path, prefix: str, stage: str = 'measure'
 ) -> list[pathlib.Path]:
-    """The `*.json` results files of newest_shards."""
-    dirs = newest_shards(directory, prefix, stage).values()
+    """The `*.json` results files of newest_shards' first run, which measured every
+    unit; a later run measured some of them again."""
+    shards = newest_shards(directory, prefix, stage)
+    first = min((run for run, _, _ in shards), default='')
+    dirs = [d for (run, _, _), d in shards.items() if run == first]
     return sorted(p for d in dirs for p in d.rglob('*.json'))
 
 

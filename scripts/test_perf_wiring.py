@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -21,6 +22,10 @@ READS = {'contents': 'read'}
 
 def load(name: str) -> dict:
     return yaml.safe_load((WORKFLOWS / name).read_text())
+
+
+def code_of(run: str) -> str:
+    return '\n'.join(line for line in run.splitlines() if not line.lstrip().startswith('#'))
 
 
 def detect_script() -> str:
@@ -221,49 +226,6 @@ exit "$GATE"
 GIT_STUB = """#!/usr/bin/env bash
 case "$1" in rev-parse) echo f00d ;; show) exit 128 ;; esac
 """
-# perf_gate.py logging its arguments and keeping the --base budgets it was handed.
-BASE_STUB = """#!/usr/bin/env bash
-echo "python3 $*" >> "$STUB_LOG"
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --base) cp "$2" "$STUB_LOG.base" ;;
-    --remeasure-out) echo '{}' > "$2" ;;
-    --out) echo '{"include": []}' > "$2" ;;
-  esac
-  shift
-done
-"""
-
-
-def merge_ref(case: unittest.TestCase) -> tuple[Path, dict[str, str]]:
-    """A repository checked out at GitHub's merge ref of a pull request opened on commit
-    `opened`, built on `later`, a base commit that changed budgets.json since."""
-    repo = Path(case.enterContext(tempfile.TemporaryDirectory(prefix='perf-merge-')))
-    env = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t'}
-    env |= {'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
-
-    def git(*args: str) -> str:
-        done = subprocess.run(
-            ['git', *args], cwd=repo, env=env, capture_output=True, text=True, check=True
-        )
-        return done.stdout.strip()
-
-    def commit(path: str, text: str) -> str:
-        (repo / path).parent.mkdir(parents=True, exist_ok=True)
-        (repo / path).write_text(text)
-        git('add', path)
-        git('commit', '-q', '-m', path)
-        return git('rev-parse', 'HEAD')
-
-    git('init', '-q', '-b', 'main')
-    shas = {'opened': commit('tests/perf/budgets.json', '{"at": "opened"}\n')}
-    git('checkout', '-q', '-b', 'pr')
-    shas['pr'] = commit('app.txt', 'the change\n')
-    git('checkout', '-q', 'main')
-    shas['later'] = commit('tests/perf/budgets.json', '{"at": "later"}\n')
-    git('checkout', '-q', '--detach')
-    git('merge', '-q', '--no-ff', '-m', 'merge ref', 'pr')
-    return repo, shas
 
 
 class Gate(unittest.TestCase):
@@ -312,32 +274,61 @@ class Gate(unittest.TestCase):
             with self.subTest(job=job):
                 self.assertEqual(self.jobs[job]['if'], want)
 
-    def test_compare_guards_against_the_base_budgets_alone(self):
+    def test_compare_guards_against_dev_s_trend_baselines_alone(self):
         run = step(self.jobs['compare'], 'Compare')['run']
         gate = run.split('--remeasure-out')[0]
-        self.assertIn('--base "$RUNNER_TEMP/base-budgets.json"', gate)
-        for flag in ('--budgets', '--sources', '--accepted', '--repo', '--head', '--base-sha'):
+        self.assertIn('--trend .perf-trend/series/dev/baseline.json', gate)
+        for flag in ('--base', '--budgets', '--sources', '--accepted', '--repo', '--head'):
             with self.subTest(flag=flag):
-                self.assertNotIn(flag, gate)
+                self.assertNotRegex(gate, rf'{flag}\b')
+        self.assertNotIn('git ', run)
 
-    def test_compare_judges_against_the_base_the_merge_ref_was_built_on(self):
-        s = step(self.jobs['compare'], 'Compare')
-        self.assertEqual(s['env']['EVENT'], '${{ github.event_name }}')
-        repo, shas = merge_ref(self)
-        # The event's base SHA is the base tip when the pull request opened.
-        for event, base_sha, want in (
-            ('pull_request', shas['opened'], 'later'),
-            ('merge_group', shas['opened'], 'opened'),
-            ('workflow_dispatch', '', None),
-        ):
-            with self.subTest(event=event):
-                env = dict.fromkeys(s['env'], '') | {'MEASURED': 'success', 'CI_TOOLS': 'ci'}
-                env |= {'EVENT': event, 'BASE_SHA': base_sha}
-                proc, tmp = run_body(self, s['run'], env, {'python3': BASE_STUB}, cwd=repo)
-                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-                self.assertIn('--base ', (tmp / 'log').read_text())
-                held = (tmp / 'log.base').read_text()
-                self.assertEqual(held, f'{{"at": "{want or "later"}"}}\n')
+    def test_compare_reads_only_the_baselines_file_of_the_perf_trend_branch(self):
+        steps = self.jobs['compare']['steps']
+        trend = step(self.jobs['compare'], 'Check out the trend baselines')
+        self.assertTrue(trend['uses'].startswith('actions/checkout@'))
+        self.assertNotIn('continue-on-error', trend)
+        self.assertEqual(
+            trend['with'],
+            {
+                'repository': '${{ inputs.repository || github.repository }}',
+                'ref': 'perf-trend',
+                'path': '.perf-trend',
+                'sparse-checkout': 'series/dev/baseline.json',
+                'sparse-checkout-cone-mode': False,
+                'persist-credentials': False,
+            },
+        )
+        measured = steps[0]
+        self.assertEqual(measured['with']['ref'], '${{ needs.plan.outputs.sha }}')
+        self.assertNotIn('fetch-depth', measured['with'])
+        self.assertLess(steps.index(measured), steps.index(trend))
+
+    def test_only_the_gate_mode_compares(self):
+        on = load('perf-ci.yaml')[True]['workflow_call']['inputs']
+        self.assertIn('`measure`', on['mode']['description'])
+        self.assertNotIn('calibrate', on['mode']['description'])
+        self.assertIn("inputs.mode == 'gate'", self.jobs['compare']['if'])
+        for path in sorted(WORKFLOWS.glob('*.y*ml')):
+            for job, spec in yaml.safe_load(path.read_text())['jobs'].items():
+                if spec.get('uses') == './.github/workflows/perf-ci.yaml':
+                    with self.subTest(caller=path.name, job=job):
+                        self.assertIn(
+                            (spec.get('with') or {}).get('mode', 'gate'), ('gate', 'measure')
+                        )
+
+    def test_a_full_set_with_per_unit_runs_is_measured_never_compared(self):
+        # The full set runs some units twice, and compare reads one run, so a caller of
+        # the full set measures it and leaves the judging to the trend.
+        for path in sorted(WORKFLOWS.glob('*.y*ml')):
+            for job, spec in yaml.safe_load(path.read_text())['jobs'].items():
+                given = spec.get('with') or {}
+                if (
+                    spec.get('uses') == './.github/workflows/perf-ci.yaml'
+                    and given.get('set') == 'full'
+                ):
+                    with self.subTest(caller=path.name, job=job):
+                        self.assertEqual(given.get('mode'), 'measure')
 
     def test_the_verdict_judges_the_re_measure_and_records_nothing(self):
         verdict = self.jobs['verdict']
@@ -395,6 +386,7 @@ class NoIdToken(unittest.TestCase):
                 ('ci.yaml', 'perf'),
                 ('ci.yml', 'ci'),
                 ('perf-calibrate.yaml', 'measure'),
+                ('perf-trend.yaml', 'measure'),
                 ('self-ci.yaml', 'ci'),
                 ('weekly-perf.yaml', 'perf'),
             ],
@@ -428,7 +420,7 @@ class Calibration(unittest.TestCase):
                 'ref': '${{ needs.check.outputs.sha }}',
                 'set': 'full',
                 'runs': 10,
-                'mode': 'calibrate',
+                'mode': 'measure',
                 'max-parallel': 10,
             },
         )
@@ -477,6 +469,227 @@ class Calibration(unittest.TestCase):
         self.assertEqual(set(weekly['notify']['needs']), set(weekly) - {'notify'})
 
 
+class Trend(unittest.TestCase):
+    """perf-trend.yaml: plan, measure, record, issues and notify, each holding only its token."""
+
+    doc = load('perf-trend.yaml')
+    jobs = doc['jobs']
+
+    def test_each_job_holds_only_its_permissions(self):
+        self.assertEqual(self.doc['permissions'], READS)
+        want = {
+            'plan': READS,
+            'measure': READS,
+            'record': {'contents': 'write', 'issues': 'read'},
+            'issues': {'contents': 'read', 'issues': 'write'},
+            'notify': {'actions': 'read', 'contents': 'read', 'issues': 'write'},
+        }
+        self.assertEqual({j: spec.get('permissions') for j, spec in self.jobs.items()}, want)
+
+    def test_the_writing_jobs_check_out_and_run_none_of_the_measured_code(self):
+        code = re.compile(r'\btests/|\bnpm\b|\bnpx\b|\bgo (build|run|test)\b|\bmake\b|\./')
+        for job in ('plan', 'record', 'issues'):
+            for s in self.jobs[job]['steps']:
+                with self.subTest(job=job, step=s.get('name')):
+                    if str(s.get('uses', '')).startswith('actions/checkout@'):
+                        self.assertEqual(s['with']['repository'], '${{ job.workflow_repository }}')
+                        self.assertEqual(s['with']['ref'], '${{ job.workflow_sha }}')
+                        self.assertIs(s['with']['persist-credentials'], expr2=False)
+                    self.assertFalse(
+                        str(s.get('uses', '')).startswith(
+                            ('actions/setup-node@', 'actions/setup-go@')
+                        )
+                    )
+                    body = code_of(s.get('run', ''))
+                    self.assertNotRegex(body, code)
+                    for call in re.findall(r'python3 (\S+)', body):
+                        self.assertEqual(call, '"$CI_TOOLS/perf_trend.py"')
+
+    def test_no_job_names_a_secret_and_no_run_body_expands_an_expression(self):
+        self.assertNotIn('secrets.', (WORKFLOWS / 'perf-trend.yaml').read_text())
+        for job, spec in self.jobs.items():
+            for s in spec.get('steps', []):
+                with self.subTest(job=job, step=s.get('name')):
+                    self.assertNotIn('${{', s.get('run', ''))
+
+    def test_measure_is_the_full_set_at_the_planned_commit_eight_jobs_at_a_time(self):
+        m = self.jobs['measure']
+        self.assertEqual(m['uses'], './.github/workflows/perf-ci.yaml')
+        self.assertEqual(m['if'], "${{ needs.plan.outputs.run == 'true' }}")
+        self.assertEqual(
+            m['with'],
+            {
+                'ref': '${{ needs.plan.outputs.sha }}',
+                'set': 'full',
+                'only': '${{ inputs.only }}',
+                'mode': 'measure',
+                'max-parallel': 8,
+                'runner': '${{ inputs.runner }}',
+            },
+        )
+
+    def test_a_point_is_recorded_only_from_a_whole_measure_and_issues_follow_the_record(self):
+        self.assertEqual(self.jobs['record']['needs'], ['plan', 'measure'])
+        self.assertEqual(
+            self.jobs['record']['if'], "${{ !cancelled() && needs.measure.result == 'success' }}"
+        )
+        self.assertEqual(self.jobs['issues']['needs'], ['record'])
+        self.assertEqual(
+            self.jobs['issues']['if'], "${{ !cancelled() && needs.record.result == 'success' }}"
+        )
+        download = step(self.jobs['issues'], 'Download the actions')
+        self.assertEqual(
+            download['with']['name'],
+            'perf-trend-actions-attempt-${{ needs.record.outputs.attempt }}',
+        )
+        upload = step(self.jobs['record'], 'Upload the actions')
+        self.assertEqual(
+            upload['with']['name'], 'perf-trend-actions-attempt-${{ github.run_attempt }}'
+        )
+
+    def test_notify_reads_every_other_job(self):
+        notify = self.jobs['notify']
+        self.assertEqual(notify['uses'], './.github/workflows/notify-failure.yaml')
+        self.assertEqual(notify['if'], 'always()')
+        self.assertEqual(set(notify['needs']), set(self.jobs) - {'notify'})
+        self.assertEqual(notify['with']['scope'], '${{ inputs.only }}')
+
+    def resolve(self, ref='', series='', only='', state=None, default='dev'):
+        s = step(self.jobs['plan'], 'Resolve')
+        gh = f"""#!/usr/bin/env bash
+case "$*" in
+  'api repos/cplieger/a --jq .default_branch') echo {default} ;;
+  'api repos/cplieger/a/git/ref/heads/'*' --jq .object.sha') echo "${{2#repos/cplieger/a/git/ref/heads/}}" | sha1sum | cut -c1-40 ;;
+  *contents/series/*) [ -n "$STATE" ] && {{ printf '%s' "$STATE"; exit 0; }}; echo '{{"message": "Not Found"}}'; exit 1 ;;
+  *) echo "unexpected gh $*" >&2; exit 9 ;;
+esac
+"""
+        env = {'REPO': 'cplieger/a', 'REF': ref, 'SERIES': series, 'ONLY': only}
+        env |= {'CI_TOOLS': str(ROOT / 'scripts'), 'GH_TOKEN': 't', 'STATE': state or ''}
+        proc, tmp = run_body(self, s['run'], env, {'gh': gh})
+        return proc, outputs(tmp)
+
+    def test_resolve_names_the_commit_and_series_and_refuses_what_dev_may_not_take(self):
+        proc, out = self.resolve()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual((out['run'], out['series'], out['ref']), ('true', 'dev', 'dev'))
+        self.assertRegex(out['sha'], r'^[0-9a-f]{40}$')
+        self.assertRegex(out['date'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
+        proc, out = self.resolve('perf-proof/trend', 'proof', 'settings')
+        self.assertEqual(
+            (proc.returncode, out['series'], out['ref']), (0, 'proof', 'perf-proof/trend')
+        )
+        for ref, series, only, why in (
+            ('feature', '', '', 'only dev joins the dev series'),
+            ('', 'dev', 'settings', 'only a series other than dev'),
+            ('a..b', 'proof', '', 'not a branch name'),
+            ('x', 'Proof', '', 'series Proof must match ^'),
+            ('x', 'a' * 32, '', 'must match ^[a-z0-9]'),
+        ):
+            with self.subTest(ref=ref, series=series, only=only):
+                proc, out = self.resolve(ref, series, only)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(why, proc.stdout + proc.stderr)
+                self.assertNotIn('run', out)
+
+    def test_resolve_skips_a_measured_commit_with_nothing_pending(self):
+        _, first = self.resolve()
+        sha = first['sha']
+        done = {'schema': 1, 'series': 'dev', 'last': {'commit': sha}, 'scenarios': {}}
+        _, out = self.resolve(state=json.dumps(done))
+        self.assertEqual(out['run'], 'false')
+        pending = {**done, 'scenarios': {'files': {'status': 'suspect'}}}
+        _, out = self.resolve(state=json.dumps(pending))
+        self.assertEqual(out['run'], 'true')
+
+    def record(self, remote: Path, sha: str, date: str, *, race: bool = False):
+        """The Record step against remote, a local bare repository standing in for GitHub,
+        on a one-shard measure of sha; race pushes another commit to perf-trend first."""
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='perf-record-')))
+        shard = (
+            tmp / 'runner' / 'results' / 'perf-results-cplieger-a-measure-shard-1-of-1-attempt-1'
+        )
+        shard.mkdir(parents=True)
+        cell = {'scenario': 'files', 'scale': 'x10', 'engine': 'chromium', 'width': 'desktop'}
+        cell |= {'window': 'cold', 'metric': 'cpu_ms', 'kind': 'time', 'reps': [1000, 1000, 1000]}
+        doc = {'schema': 1, 'runner': 'ubuntu-26.04', 'cpu_model': 'x', 'cells': [cell]}
+        (shard / 'results.json').write_text(json.dumps(doc))
+        real = shutil.which('git')
+        git = f"""#!/usr/bin/env bash
+args=()
+for a in "$@"; do args+=("${{a//https:\\/\\/github.com\\/cplieger\\/a.git/{remote}}}"); done
+if [ "$1" = -c ] && [[ " $* " == *" push "* ]] && [ -f "$RACE" ]; then
+  rm "$RACE"
+  w=$(mktemp -d)
+  {real} clone -q --branch perf-trend "{remote}" "$w"
+  {real} -C "$w" -c user.name=o -c user.email=o@o commit -q --allow-empty -m other
+  {real} -C "$w" push -q origin perf-trend
+fi
+exec {real} "${{args[@]}}"
+"""
+        gh = """#!/usr/bin/env bash
+printf 'HTTP/2.0 200 OK\\r\\n\\r\\n[]'
+"""
+        if race:
+            (tmp / 'race').write_text('')
+        s = step(self.jobs['record'], 'Record')
+        env = dict.fromkeys(s['env'], '')
+        env |= {'GH_TOKEN': 't', 'REPO': 'cplieger/a', 'SERIES': 'dev', 'REF': 'dev', 'SHA': sha}
+        env |= {'DATE': date, 'PREFIX': 'cplieger-a'}
+        env |= {'RUN_ID': '1', 'RUN_URL': 'https://github.com/cplieger/a/actions/runs/1'}
+        env |= {'CI_TOOLS': str(ROOT / 'scripts'), 'RUNNER_TEMP': str(tmp / 'runner')}
+        env |= {'RACE': str(tmp / 'race'), 'HOME': str(tmp)}
+        proc, _ = run_body(self, s['run'], env, {'git': git, 'gh': gh})
+        return proc, tmp / 'runner'
+
+    def test_record_bootstraps_the_branch_then_appends_fast_forward_and_retries_a_race(self):
+        remote = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='perf-remote-')))
+        subprocess.run(['git', 'init', '-q', '--bare', str(remote)], check=True)
+
+        def log():
+            done = subprocess.run(
+                ['git', '-C', str(remote), 'log', '--format=%s', 'perf-trend'],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return done.stdout.splitlines()
+
+        def files():
+            done = subprocess.run(
+                ['git', '-C', str(remote), 'ls-tree', '-r', '--name-only', 'perf-trend'],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return done.stdout.splitlines()
+
+        proc, runner = self.record(remote, 'a' * 40, '2026-11-18T00:00:00Z')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(log(), [f'perf: dev point at {"a" * 12}'])
+        self.assertEqual(
+            files(),
+            [
+                'series/dev/baseline.json',
+                f'series/dev/points/20261118T000000Z-{"a" * 12}.json',
+                'series/dev/state.json',
+            ],
+        )
+        self.assertEqual(json.loads((runner / 'actions.json').read_text()), [])
+        proc, _ = self.record(remote, 'b' * 40, '2026-11-18T08:00:00Z', race=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn('refused', proc.stdout)
+        self.assertEqual(
+            log(), [f'perf: dev point at {"b" * 12}', 'other', f'perf: dev point at {"a" * 12}']
+        )
+        self.assertEqual(len([f for f in files() if '/points/' in f]), 2)
+
+    def test_the_push_is_fast_forward_only(self):
+        run = step(self.jobs['record'], 'Record')['run']
+        self.assertNotRegex(run, r'--force|\s-f\s|\+HEAD|\+refs')
+        self.assertIn('push -q origin HEAD:refs/heads/perf-trend', run)
+
+
 class Release(unittest.TestCase):
     def internal(self) -> set[str]:
         run = '\n'.join(
@@ -489,7 +702,7 @@ class Release(unittest.TestCase):
         self.assertLessEqual(
             {'perf-calibrate.yaml', 'weekly-perf.yaml', 'weekly-perf-calibrate.yaml'}, internal
         )
-        self.assertFalse({'perf-ci.yaml', 'perf-measure.yaml'} & internal)
+        self.assertFalse({'perf-ci.yaml', 'perf-measure.yaml', 'perf-trend.yaml'} & internal)
 
     def test_self_ci_installs_cosign_before_the_suite(self):
         steps = load('self-ci.yaml')['jobs']['release-channel-scripts']['steps']

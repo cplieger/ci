@@ -1,9 +1,8 @@
 # Weekly performance run of every public cplieger repository that carries
 # tests/perf/plan.json. Pattern C, like weekly-bench: this workflow owns the
 # matrix and the max-parallel cap. A pull request measures only the `pr` set,
-# so this measures the `full` set on the default branch, guarded against its
-# budgets' baselines, and charts each cell's median on the repository's
-# `benchmarks` branch.
+# so this measures the `full` set on the default branch and charts each cell's
+# median on the repository's `benchmarks` branch.
 # Mondays 22:00 UTC, the one evening no other weekly run holds.
 name: Weekly perf
 
@@ -136,6 +135,7 @@ jobs:
       repository: cplieger/${{ matrix.repo }}
       ref: ${{ matrix.sha }}
       set: full
+      mode: measure
       max-parallel: 10
 
   # Writes each repository's medians to its `benchmarks` branch, from the
@@ -171,7 +171,7 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: results
-          pattern: perf-results-cplieger-${{ matrix.repo }}-measure-shard-*
+          pattern: perf-results-cplieger-${{ matrix.repo }}-measure-*
           merge-multiple: true
 
       # perf_gate.py --prefix reads only this repository's shards: the pattern
