@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The community data refresh: the pull request a listed repository's own
-refresh run proposes, opened against its base branch.
+refresh run proposes, opened against its base branch, and the issues its
+notices keep in step.
 
 Each repository in REPOS runs its refresh in its own community-data-refresh.yaml
 on the base branch, with no secret, and uploads the proposal as the

@@ -1,12 +1,11 @@
 # Opens or updates one pull request per repository in REPOS
 # (scripts/community_data_refresh.py) from the proposal its own
-# community-data-refresh.yaml uploaded, and keeps the repository's
-# community-data issues in step with the proposal's notices. That workflow runs
-# the repository's refresh on its base branch with no secret; this one runs
-# none of the repository's code and reads the artifact only as data, checked
-# against the row's allowed paths, labels and upstreams. The pull request waits
-# for its ci / validate and a human merge. The proposal format is in
-# docs/workflows.md; sync.yaml documents the App's secrets.
+# community-data-refresh.yaml uploaded, and keeps its community-data issues in
+# step with the proposal's notices. That workflow runs the refresh on the base
+# branch with no secret; this one runs none of the repository's code and reads
+# the artifact only as data, checked against the row. The pull request waits
+# for its ci / validate and a human merge. docs/workflows.md has the proposal
+# format and the issue rules; sync.yaml documents the App's secrets.
 name: Community data refresh
 
 on:
