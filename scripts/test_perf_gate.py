@@ -656,9 +656,6 @@ class Attempts(unittest.TestCase):
             perf_gate.merge_results(self.dir, 'cplieger-a', 'measure')
 
 
-X1 = {'scale': 'x1'}
-
-
 def github_outputs(text):
     """$GITHUB_OUTPUT as the runner reads it: `name=value` lines and
     `name<<DELIMITER` blocks, a later name replacing an earlier one."""

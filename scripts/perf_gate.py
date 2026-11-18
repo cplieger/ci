@@ -618,8 +618,7 @@ def merge_results(
 
 def merge(paths: list[pathlib.Path]) -> dict:
     """Results files as one: shards must share a runner and measure disjoint cells."""
-    merged: dict[str, Any] = {'schema': 1, 'runner': None, 'cpu_models': [], 'cells': []}
-    merged['seconds'] = []
+    merged: dict[str, Any] = {'schema': 1, 'runner': None, 'cells': []}
     seen = set()
     for p in paths:
         doc = load(p)
@@ -627,8 +626,6 @@ def merge(paths: list[pathlib.Path]) -> dict:
             merged['runner'] = doc.get('runner')
         elif doc.get('runner') != merged['runner']:
             raise ValueError(f'{p}: runner {doc.get("runner")!r} is not {merged["runner"]!r}')
-        if doc.get('cpu_model') and doc['cpu_model'] not in merged['cpu_models']:
-            merged['cpu_models'].append(doc['cpu_model'])
         for c in doc.get('cells', []):
             if key(c) in seen:
                 raise ValueError(f'{p}: {key_text(key(c))} was measured by two shards')
@@ -636,7 +633,6 @@ def merge(paths: list[pathlib.Path]) -> dict:
             merged['cells'].append(
                 {**c, 'cpu_model': doc['cpu_model']} if doc.get('cpu_model') else c
             )
-        merged['seconds'].extend(doc.get('seconds', []))
     return merged
 
 
