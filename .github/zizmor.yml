@@ -27,6 +27,7 @@ rules:
       - self-codeql.yml
       - perf-ci.yaml
       - perf-calibrate.yaml
+      - perf-trend.yaml
       # The workflows calling notify-failure.yaml.
       - audit.yaml
       - backfill-release-sbom-sigs.yaml

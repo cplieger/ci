@@ -26,6 +26,7 @@ TAKES_RUNNER = (
     'security-scan.yaml',
     'perf-ci.yaml',
     'perf-measure.yaml',
+    'perf-trend.yaml',
 )
 POOL = "${{ inputs.runner || 'ubuntu-26.04' }}"
 FORWARD = '${{ inputs.runner }}'
@@ -156,10 +157,12 @@ class RunnerInput(unittest.TestCase):
                     given = (spec.get('with') or {}).get('runner')
                     if m.group(1) == OS_RUNNER:
                         self.assertNotEqual(given, FORWARD)
-                    else:
+                    elif 'runner' in inputs(m.group(1)):
                         self.assertIn(m.group(1), TAKES_RUNNER)
                         self.assertEqual(given, FORWARD)
                         calls += 1
+                    else:
+                        self.assertIsNone(given)
         self.assertGreaterEqual(calls, 8)
 
     def pinned_inputs(self, sha: str, name: str) -> dict:
@@ -191,7 +194,14 @@ class RunnerInput(unittest.TestCase):
                         callers[m.group(1)] = path.name
                         self.assertEqual(given.get('runner'), '${{ vars.CI_RUNNER }}')
         self.assertGreaterEqual(calls, 4)
-        self.assertEqual(callers, {'ci.yaml': 'ci.yml', 'security-scan.yaml': 'security.yml'})
+        self.assertEqual(
+            callers,
+            {
+                'ci.yaml': 'ci.yml',
+                'security-scan.yaml': 'security.yml',
+                'perf-trend.yaml': 'perf-trend.yml',
+            },
+        )
 
 
 class Routing(unittest.TestCase):

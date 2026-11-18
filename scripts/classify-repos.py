@@ -66,6 +66,10 @@ SMOKE = Group(
     'Image-smoke harness (repos with a tests/image-smoke.conf opt-in)',
     (('configs/image-smoke.sh', 'tests/image-smoke.sh'),),
 )
+PERF_TREND = Group(
+    'Performance trend caller (repos with a tests/perf/plan.json)',
+    (('.github/workflow-templates/perf-trend.yml', '.github/workflows/perf-trend.yaml'),),
+)
 # The assert/extract library and its self-test carry no repo-specific content,
 # so they sync; tests/shell/run.sh stays repo-owned because it is the opt-in
 # marker, and a synced marker could only arrive once the repo already had it.
@@ -153,6 +157,7 @@ GROUPS = (
     ('artifact_ci', ARTIFACT_CI),
     ('golangci', GOLANGCI),
     ('smoke', SMOKE),
+    ('perf_trend', PERF_TREND),
     ('shell_test', SHELL_TEST),
     ('repin', REPIN),
     ('python', PYTHON),
@@ -394,6 +399,9 @@ def classify_tree(tree, *, releasing=False):
     if lang == 'go' and not is_web:
         is_web = any('static-src' in path or '/web/' in path for path in tree)
     has_smoke = 'tests/image-smoke.conf' in tree
+    # The file perf-ci.yaml enrols a repository by, so the guard and the trend that
+    # feeds its baselines cannot disagree.
+    has_perf = 'tests/perf/plan.json' in tree
     # The same file shell-ci.yaml runs, so enrolment and execution cannot disagree.
     has_shell_tests = 'tests/shell/run.sh' in tree
     # An artifact repo publishes from its own publish.yaml and still needs the
@@ -430,6 +438,7 @@ def classify_tree(tree, *, releasing=False):
         'ts_dirs': ts_dirs,
         'can_release': lang == 'go' or has_jsr or has_dockerfile,
         'has_smoke': has_smoke,
+        'has_perf': has_perf,
         'has_shell_tests': has_shell_tests,
         'has_dockerfile': has_dockerfile,
         'has_publish': has_publish,  # own publish.yaml -> meta CI without release.yaml
@@ -509,6 +518,8 @@ def assign(repo_names, profiles, releasing):
             groups['ts_config'].append(repo)
         if profile['has_smoke']:
             groups['smoke'].append(repo)
+        if profile['has_perf']:
+            groups['perf_trend'].append(repo)
         if profile['has_dockerfile']:
             groups['repin'].append(repo)
         if releasing:

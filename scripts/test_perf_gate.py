@@ -254,30 +254,31 @@ class TheRule(unittest.TestCase):
         self.assertEqual(perf_gate.check_shape(budgets([entry(budget=1600.0)])), [])
 
 
-def base_file(entries, runner=RUNNER, schema=2):
-    return {'schema': schema, 'runner': runner, 'budgets': entries}
+def trend_file(entries, runner=RUNNER):
+    """The perf-trend branch's series/dev/baseline.json holding entries."""
+    return {'schema': 1, 'series': 'dev', 'runner': runner, 'commits': [HEAD], 'cells': entries}
 
 
 def baselined(metric='cpu_ms', baseline=1000.0, **kw):
-    return {**CELL, 'metric': metric, 'tier': 'gated', 'baseline': baseline, **kw}
+    return {**CELL, 'metric': metric, 'baseline': baseline, **kw}
 
 
 def guarded(entries, cells, runner=RUNNER, units=None, windows=None):
-    """guard() of cells, measured on runner, against the base file of entries."""
-    base_runner, baselines = perf_gate.baselines_from_budgets(base_file(entries))
+    """guard() of cells, measured on runner, against the trend baselines of entries."""
+    base_runner, baselines = perf_gate.baselines_from_trend(trend_file(entries))
     return perf_gate.guard(
         baselines, base_runner, results(cells, runner=runner), units or {}, windows=windows or {}
     )
 
 
 def decided(out, entries):
-    """compare's remeasure.json for out: each red cell with its base baseline."""
-    _, baselines = perf_gate.baselines_from_budgets(base_file(entries))
+    """compare's remeasure.json for out: each red cell with its trend baseline."""
+    _, baselines = perf_gate.baselines_from_trend(trend_file(entries))
     return {'cells': [{**c, 'baseline': baselines[keyof(c)]} for c in out.remeasure]}
 
 
 class Guard(unittest.TestCase):
-    """The pull request guard: a timing cell fails only far past its base baseline."""
+    """The pull request guard: a timing cell fails only far past dev's trend baseline."""
 
     def test_the_quadratic_scan_regression_is_red_and_fails_on_six_reps(self):
         entries = [baselined(baseline=3000.0)]
@@ -329,12 +330,12 @@ class Guard(unittest.TestCase):
                 out = guarded([baselined(metric, baseline)], [cell(metric, (value,) * 3)])
                 self.assertEqual(bool(out.remeasure), red)
 
-    def test_a_count_off_its_base_never_fails_and_is_listed_as_information(self):
-        entries = [baselined(), {**baselined('dom', 640), 'tier': 'exact', 'budget': 640}]
+    def test_a_count_off_dev_never_fails_and_is_listed_as_information(self):
+        entries = [baselined(), baselined('dom', 640)]
         out = guarded(entries, [cell(), cell('dom', (700,) * 3, kind='count')])
         self.assertEqual((out.failures, out.remeasure), ([], []))
         text = perf_gate.guard_summary(out)
-        counts = text.split('### Counts that differ from the base (information)', 1)[1]
+        counts = text.split('### Counts that differ from dev (information)', 1)[1]
         self.assertIn(f'| {DOM} | 640 | 700 |', counts)
         self.assertNotIn(CPU, counts)
 
@@ -349,42 +350,40 @@ class Guard(unittest.TestCase):
         self.assertEqual((out.failures, out.remeasure), ([], []))
         self.assertEqual([r['status'] for r in out.rows], ['ok', 'reported', 'reported'])
 
-    def test_baselines_read_from_a_schema_1_and_a_schema_2_file_alike(self):
-        one = {**baselined(budget=1500.0, source=RUN_URL + '1'), 'rows': ['C1', 'X2']}
-        two = {**baselined('dom', 640), 'tier': 'exact', 'budget': 640}
-        for schema in (1, 2):
-            with self.subTest(schema=schema):
-                doc = {**base_file([one, two], schema=schema), 'headroom': {'cpu_ms': 1.5}}
-                runner, baselines = perf_gate.baselines_from_budgets(doc)
-                self.assertEqual(runner, RUNNER)
-                self.assertEqual(baselines, {keyof(one): 1000.0, keyof(two): 640})
+    def test_a_trend_baseline_file_reads_each_cell_s_baseline_and_nothing_else(self):
+        one = {**baselined(), 'kind': 'time', 'extra': ['C1', 'X2']}
+        two = {**baselined('dom', 640), 'kind': 'count'}
+        doc = {**trend_file([one, two]), 'commits': ['a', 'b', 'c'], 'more': 1}
+        runner, baselines = perf_gate.baselines_from_trend(doc)
+        self.assertEqual(runner, RUNNER)
+        self.assertEqual(baselines, {keyof(one): 1000.0, keyof(two): 640})
 
-    def test_a_base_entry_with_no_numeric_baseline_holds_no_baseline(self):
-        doc = base_file(
+    def test_a_trend_cell_with_no_numeric_baseline_holds_no_baseline(self):
+        doc = trend_file(
             [
                 {**baselined(), 'baseline': 'fast'},
                 {**baselined(), 'window': 'live', 'baseline': None},
             ]
         )
-        self.assertEqual(perf_gate.baselines_from_budgets(doc)[1], {})
+        self.assertEqual(perf_gate.baselines_from_trend(doc)[1], {})
         for broken in (
-            {'budgets': {}},
-            {'budgets': ['files']},
-            {'budgets': [{'metric': 'cpu_ms'}]},
+            {'cells': {}},
+            {'cells': ['files']},
+            {'cells': [{'metric': 'cpu_ms'}]},
         ):
             with self.subTest(broken=broken), self.assertRaises((TypeError, ValueError)):
-                perf_gate.baselines_from_budgets(broken)
+                perf_gate.baselines_from_trend(broken)
 
-    def test_a_base_file_that_names_no_runner_is_refused(self):
+    def test_a_trend_file_that_names_no_runner_is_refused(self):
         for runner in (None, '', 26.04):
-            doc = base_file([baselined()], runner=runner)
+            doc = trend_file([baselined()], runner=runner)
             with (
                 self.subTest(runner=runner),
                 self.assertRaisesRegex(
                     ValueError, 'runner must name the runner the baselines were measured on'
                 ),
             ):
-                perf_gate.baselines_from_budgets(doc)
+                perf_gate.baselines_from_trend(doc)
 
     def test_another_runner_reports_every_cell_and_fails_nothing(self):
         out = guarded([baselined()], [cell(reps=(9000.0,) * 3)], runner='self-hosted')
@@ -411,7 +410,7 @@ class Guard(unittest.TestCase):
         self.assertEqual(
             out.failures,
             [
-                f'{CPU.replace("cold", "live")}: the base has a baseline for it, and no shard measured it'
+                f"{CPU.replace('cold', 'live')}: dev's trend has a baseline for it, and no shard measured it"
             ],
         )
 
@@ -421,7 +420,7 @@ class Guard(unittest.TestCase):
         out = guarded([baselined(), baselined(route, 0.0, window='replay')], [cell()], units=units)
         self.assertEqual(out.failures, [])
         notice = (
-            f'files/x10/chromium/desktop/replay/{route}: the base has a baseline for this route, '
+            f"files/x10/chromium/desktop/replay/{route}: dev's trend has a baseline for this route, "
             'and no shard measured it'
         )
         self.assertEqual(out.notices, [notice])
@@ -436,7 +435,7 @@ class Guard(unittest.TestCase):
             out.failures,
             [
                 (
-                    'files/x10/chromium/desktop/cold/heap_mb: the base has a baseline for it, '
+                    "files/x10/chromium/desktop/cold/heap_mb: dev's trend has a baseline for it, "
                     'and no shard measured it'
                 )
             ],
@@ -445,7 +444,7 @@ class Guard(unittest.TestCase):
             out.notices,
             [
                 (
-                    f'{CPU.replace("cold", "live")}: the base has a baseline for it, and the '
+                    f"{CPU.replace('cold', 'live')}: dev's trend has a baseline for it, and the "
                     'head plan.json no longer measures window live'
                 )
             ],
@@ -2371,6 +2370,97 @@ class Plan(unittest.TestCase):
             with self.subTest(name), self.assertRaises(ValueError):
                 perf_gate.plan(doc, set_name)
 
+    def test_a_unit_s_runs_measure_it_again_in_later_runs_only(self):
+        doc = {
+            'node': '.',
+            'sets': {
+                'full': {
+                    'shards': 2,
+                    'cells': [
+                        unit('files', 80),
+                        unit('docs', 75),
+                        unit('tabs', 70, runs=2),
+                        unit('shell', 60, runs=3),
+                    ],
+                },
+            },
+        }
+        jobs = perf_gate.plan(doc, 'full')['include']
+        by_run = {}
+        for job in jobs:
+            by_run.setdefault(job['run'], []).extend(c['scenario'] for c in job['cells'])
+        self.assertEqual(
+            {r: sorted(s) for r, s in by_run.items()},
+            {
+                1: ['docs', 'files', 'shell', 'tabs'],
+                2: ['shell', 'tabs'],
+                3: ['shell'],
+            },
+        )
+        # A later run takes as few shards as hold its units at the first run's mean load.
+        self.assertEqual(
+            [j['name'] for j in jobs],
+            [
+                'run-01-shard-1-of-2',
+                'run-01-shard-2-of-2',
+                'run-02-shard-1-of-1',
+                'run-03-shard-1-of-1',
+            ],
+        )
+
+    def test_a_later_run_takes_more_shards_when_its_units_need_them(self):
+        cells = [unit(f's{i}', 100, runs=2) for i in range(4)] + [unit('one', 100)]
+        doc = {'node': '.', 'sets': {'full': {'shards': 5, 'cells': cells}}}
+        names = [j['name'] for j in perf_gate.plan(doc, 'full')['include']]
+        self.assertEqual(names[5:], [f'run-02-shard-{i}-of-4' for i in range(1, 5)])
+
+    def test_a_unit_s_runs_is_a_whole_number_from_one_to_three(self):
+        for runs in (0, 4, 1.5, True, '2', None):
+            doc = {'node': '.', 'sets': {'pr': {'shards': 1, 'cells': [unit('a', 1, runs=runs)]}}}
+            with self.subTest(runs=runs), self.assertRaisesRegex(ValueError, 'runs'):
+                perf_gate.plan(doc, 'pr')
+        doc = {'node': '.', 'sets': {'pr': {'shards': 1, 'cells': [unit('a', 1, runs=1)]}}}
+        self.assertEqual(
+            [j['name'] for j in perf_gate.plan(doc, 'pr')['include']], ['shard-1-of-1']
+        )
+
+    def test_a_gate_plan_is_one_run_and_refuses_a_unit_s_runs(self):
+        doc = {'node': '.', 'sets': {'pr': {'shards': 1, 'cells': [unit('a', 1, runs=2)]}}}
+        with self.assertRaisesRegex(
+            ValueError, r'a/x10/chromium/desktop: runs belongs to the full set'
+        ):
+            perf_gate.plan(doc, 'pr', gate=True)
+        with self.assertRaisesRegex(ValueError, 'one run, not 2'):
+            perf_gate.plan(PLAN, 'pr', runs=2, gate=True)
+        self.assertEqual(len(perf_gate.plan(doc, 'pr')['include']), 2)
+        self.assertEqual(len(perf_gate.plan(PLAN, 'pr', gate=True)['include']), 2)
+
+    def test_a_cell_field_with_whitespace_or_angle_brackets_fails(self):
+        for name in ('x <!-- perf-trend:dev:files -->', 'a b', 'a>b', 'a\tb'):
+            doc = {'node': '.', 'sets': {'pr': {'shards': 1, 'cells': [unit(name, 1)]}}}
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'whitespace, < or >'):
+                perf_gate.plan(doc, 'pr')
+        cell = {**unit('a', 1), 'engine': 'chro<mium'}
+        doc = {'node': '.', 'sets': {'pr': {'shards': 1, 'cells': [cell]}}}
+        with self.assertRaisesRegex(ValueError, 'whitespace, < or >'):
+            perf_gate.plan(doc, 'pr')
+
+    def test_the_set_s_runs_and_a_unit_s_runs_take_the_larger(self):
+        cells = [unit('files', 80), unit('tabs', 70, runs=3)]
+        doc = {'node': '.', 'sets': {'full': {'shards': 1, 'cells': cells}}}
+        jobs = perf_gate.plan(doc, 'full', runs=2)['include']
+        self.assertEqual(
+            [(j['run'], sorted(c['scenario'] for c in j['cells'])) for j in jobs],
+            [(1, ['files', 'tabs']), (2, ['files', 'tabs']), (3, ['tabs'])],
+        )
+
+    def test_a_remeasure_plans_a_unit_with_runs_once(self):
+        cells = [unit('files', 80, runs=2), unit('docs', 75)]
+        doc = {'node': '.', 'sets': {'full': {'shards': 2, 'cells': cells}}}
+        red = {**CELL, 'metric': 'cpu_ms'}
+        jobs = perf_gate.plan(doc, 'full', remeasure={'cells': [red]})['include']
+        self.assertEqual([j['name'] for j in jobs], ['shard-1-of-1'])
+
     def test_more_jobs_than_one_matrix_holds_fails(self):
         with self.assertRaisesRegex(ValueError, '256'):
             perf_gate.plan(PLAN, 'pr', runs=129)
@@ -2433,10 +2523,27 @@ class Bench(unittest.TestCase):
         )
 
 
+class BenchRuns(unittest.TestCase):
+    def test_the_chart_reads_the_first_run_of_a_set_some_units_measure_twice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for run, reps in (('run-01', 1000.0), ('run-02', 3000.0)):
+                d = (
+                    pathlib.Path(tmp)
+                    / f'perf-results-cplieger-a-measure-{run}-shard-1-of-1-attempt-1'
+                )
+                d.mkdir()
+                (d / 'results.json').write_text(json.dumps(results([cell(reps=(reps,) * 3)])))
+            out = pathlib.Path(tmp) / 'bench.json'
+            with redirect_stdout(io.StringIO()):
+                rc = perf_gate.main(['--bench', tmp, '--prefix', 'cplieger-a', '--out', str(out)])
+            self.assertEqual(rc, 0)
+            self.assertEqual([p['value'] for p in json.loads(out.read_text())], [1000.0])
+
+
 class ResultFiles(unittest.TestCase):
     NAMES = (
         'perf-results-cplieger-a-measure-shard-1-of-2-attempt-1',
-        'perf-results-cplieger-a-measure-run-03-shard-2-of-2-attempt-1',
+        'perf-results-cplieger-a-measure-shard-2-of-2-attempt-1',
         'perf-results-cplieger-a-measure-x-measure-shard-1-of-1-attempt-1',
         'perf-results-cplieger-a-remeasure-shard-1-of-1-attempt-1',
         'perf-results-cplieger-a-remeasure-x-remeasure-shard-1-of-1-attempt-1',
@@ -2559,6 +2666,13 @@ class Attempts(unittest.TestCase):
         groups = perf_gate.shard_groups(self.dir, 'cplieger-a')
         self.assertEqual(sorted(groups), ['run-01', 'run-02'])
         self.assertEqual([len(v) for v in groups.values()], [2, 2])
+
+    def test_one_results_file_is_never_merged_from_two_runs(self):
+        self.shard('measure', 1, 2, 1, run='run-01-')
+        self.shard('measure', 2, 2, 1, run='run-01-')
+        self.shard('measure', 1, 1, 1, run='run-02-')
+        with self.assertRaisesRegex(ValueError, 'one run, not 2: run-01, run-02'):
+            perf_gate.merge_results(self.dir, 'cplieger-a', 'measure')
 
 
 def run_main(*argv):
@@ -2947,19 +3061,20 @@ class Cli(unittest.TestCase):
         return rc
 
     def guard(self, cells, *extra, entries=None, base=True, plan=PLAN, shard=None, other=None):
-        """The default mode, the guard's compare, of cells against a base file of entries:
-        files x10 cold CPU at 1000 ms and its exact DOM count at 640 when entries is None.
-        base False passes a base path that holds no file."""
+        """The default mode, the guard's compare, of cells against a trend baseline file of
+        entries: files x10 cold CPU at 1000 ms and its DOM count at 640 when entries is
+        None. base False passes a path that holds no file."""
         if entries is None:
-            entries = [baselined(), {**baselined('dom', 640), 'tier': 'exact', 'budget': 640}]
-        was = str(self.dir / 'base.json')
+            entries = [baselined(), baselined('dom', 640)]
+        was = str(self.dir / 'baseline.json')
         if base:
-            was = self.put('base.json', base if isinstance(base, dict) else base_file(entries))
+            doc = base if isinstance(base, dict) else trend_file(entries)
+            was = self.put('baseline.json', doc)
         own = 'results/perf-results-cplieger-a-measure-shard-1-of-1-attempt-1/results.json'
         self.put(own, results(cells) if shard is None else shard)
         if other is not None:
             self.put(f'results/{OTHER}-measure-shard-1-of-1-attempt-1/results.json', results(other))
-        argv = ('--base', was, '--results', str(self.dir / 'results'), '--prefix', 'cplieger-a')
+        argv = ('--trend', was, '--results', str(self.dir / 'results'), '--prefix', 'cplieger-a')
         argv += ('--plan-doc', self.put('plan.json', plan), '--set', 'pr')
         argv += ('--remeasure-out', str(self.dir / 'remeasure.json'))
         argv += ('--summary', str(self.dir / 'summary.md'))
@@ -2990,20 +3105,24 @@ class Cli(unittest.TestCase):
             {'cells': [{**red, 'cpu_model': 'AMD EPYC 7763', 'baseline': 1000.0}]},
         )
 
-    def test_compare_passes_a_count_off_its_base_and_re_measures_nothing(self):
+    def test_compare_passes_a_count_off_dev_and_re_measures_nothing(self):
         rc = self.guard([cell(), cell('dom', (700,) * 3, kind='count')])
         self.assertEqual(rc, 0, self.output)
         self.assertEqual(self.decision()['cells'], [])
         summary = (self.dir / 'summary.md').read_text()
         self.assertIn(f'| {DOM} | 640 | 700 |', summary)
 
-    def test_compare_fails_when_the_base_holds_no_budgets_file(self):
+    def test_compare_fails_when_the_trend_branch_holds_no_baseline_file(self):
         self.assertEqual(self.guard([cell()], base=False), 1)
-        self.assertIn('::error::the base holds no tests/perf/budgets.json', self.output)
+        self.assertIn(
+            '::error::the perf-trend branch holds no series/dev/baseline.json, so the guard '
+            'has no baseline',
+            self.output,
+        )
         self.assertFalse((self.dir / 'remeasure.json').exists())
 
     def test_compare_fails_a_baselined_cell_of_the_measured_windows_no_shard_measured(self):
-        # The pr set measures WebKit x10 cold only; the base holds the live CPU too.
+        # The pr set measures WebKit x10 cold only; the trend holds the live CPU too.
         webkit = {'engine': 'webkit'}
         plan = {
             'node': '.',
@@ -3027,7 +3146,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(
             errors,
             [
-                '::error::files/x10/webkit/desktop/cold/heap_mb: the base has a baseline for it, and no shard measured it'
+                "::error::files/x10/webkit/desktop/cold/heap_mb: dev's trend has a baseline for it, and no shard measured it"
             ],
         )
 
@@ -3038,7 +3157,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(rc, 0, self.output)
         summary = (self.dir / 'summary.md').read_text()
         self.assertIn(
-            f'- {CPU.replace("cold", "live")}: the base has a baseline for it, and the head '
+            f"- {CPU.replace('cold', 'live')}: dev's trend has a baseline for it, and the head "
             'plan.json no longer measures window live\n',
             summary,
         )
@@ -3060,8 +3179,8 @@ class Cli(unittest.TestCase):
         cases = {
             'list plan.json': ({'plan': []}, 'must be a JSON object'),
             'list results': ({'shard': []}, 'must be a JSON object'),
-            'list base': ({'base': {'budgets': 'all'}}, 'budgets must be a list'),
-            'string entry': ({'entries': ['files']}, 'budgets[0]: must be an object'),
+            'list trend': ({'base': {'cells': 'all'}}, 'cells must be a list'),
+            'string entry': ({'entries': ['files']}, 'cells[0]: must be an object'),
         }
         for name, (kw, want) in cases.items():
             with self.subTest(name):
@@ -3107,7 +3226,7 @@ class Cli(unittest.TestCase):
         self.assertIn('shard counts', self.output)
 
     def test_compare_needs_the_plan(self):
-        argv = ('--base', 'b.json', '--results', 'r', '--prefix', 'cplieger-a')
+        argv = ('--trend', 'b.json', '--results', 'r', '--prefix', 'cplieger-a')
         argv += ('--remeasure-out', 'remeasure.json')
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.main(*argv)
@@ -3147,11 +3266,11 @@ class Cli(unittest.TestCase):
         d, f = str(self.dir), str(self.dir / 'f.json')
         cases = {
             'compare': (
-                ('--base', f, '--results', d, '--prefix', 'p', '--plan-doc', f, '--set', 'pr'),
+                ('--trend', f, '--results', d, '--prefix', 'p', '--plan-doc', f, '--set', 'pr'),
                 ['--remeasure-out'],
             ),
             'compare without results': (
-                ('--base', f, '--remeasure-out', f, '--plan-doc', f, '--set', 'pr'),
+                ('--trend', f, '--remeasure-out', f, '--plan-doc', f, '--set', 'pr'),
                 ['--results', '--prefix'],
             ),
             'verdict': (
@@ -3227,6 +3346,10 @@ class Cli(unittest.TestCase):
         out = self.dir / 'matrix.json'
         argv = ('--plan', p, '--set', 'pr', '--only', 'docs, tabs', '--runs', '2')
         outputs = self.dir / 'github-output'
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.main(*argv, '--out', str(out)), 1)
+        self.assertIn('a gated set is measured in one run, not 2', self.output)
+        argv += ('--mode', 'measure')
         self.assertEqual(self.main(*argv, '--out', str(out), '--outputs', str(outputs)), 0)
         matrix = json.loads(out.read_text())
         self.assertEqual(list(matrix), ['include'])

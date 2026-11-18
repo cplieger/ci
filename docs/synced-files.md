@@ -22,6 +22,7 @@ A synced file is overwritten on the next sync, so change it here, never in the r
 | `configs/cliff-stable.toml` or `configs/cliff-alpha.toml` | `cliff.toml` | two-branch repositories with a root `go.mod`, `jsr.json`, `package.json` or `Dockerfile`, or with Go modules only in subfolders. One whose latest stable tag starts with `v0.` gets the alpha file |
 | `configs/ruff.toml` | `ruff.toml` | Python repositories |
 | `configs/image-smoke.sh` | `tests/image-smoke.sh` | image repositories that commit a `tests/image-smoke.conf` |
+| `.github/workflow-templates/perf-trend.yml` | `.github/workflows/perf-trend.yaml` | repositories that commit a `tests/perf/plan.json` |
 | `configs/shell/lib.sh`, `configs/shell/harness_test.sh` | `tests/shell/lib.sh`, `tests/shell/harness_test.sh` | repositories that commit a `tests/shell/run.sh` |
 | `configs/repin-sha.sh`, `configs/collect-licenses.sh` | `scripts/repin-sha.sh`, `scripts/collect-licenses.sh` | repositories with a root `Dockerfile` |
 | `configs/renovate-two-branch.json` | `renovate.json` | two-branch repositories, on both branches |

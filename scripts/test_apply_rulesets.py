@@ -47,6 +47,9 @@ else:
     if entry is None:
         sys.stderr.write('gh: Not Found (HTTP 404)\n')
         sys.exit(1)
+    if entry == {'status': 500}:
+        sys.stderr.write('gh: Server Error (HTTP 500)\n')
+        sys.exit(1)
     if isinstance(entry, str):
         sys.stdout.write(entry)
         sys.exit(0)
@@ -58,6 +61,7 @@ sys.stdout.write(text + '\n')
 """
 
 PIN_OK = 'a' * 40
+TREND_CALLER = '.github/workflows/perf-trend.yaml'
 PIN_OLD = 'b' * 40
 
 
@@ -102,6 +106,7 @@ class ApplyRulesets(unittest.TestCase):
         main_ci=None,
         pinned=None,
         rulesets=(),
+        trend=None,
         **meta,
     ):
         if pinned is None:
@@ -122,6 +127,8 @@ class ApplyRulesets(unittest.TestCase):
                 fx[f'repos/cplieger/{repo}/contents/.github/workflows/ci.yaml?ref={base}'] = body
         for pin, body in pinned.items():
             fx[f'repos/cplieger/ci/contents/.github/workflows/ci.yaml?ref={pin}'] = body
+        if trend is not None:
+            fx[f'repos/cplieger/{repo}/contents/{TREND_CALLER}?ref={default}'] = trend
         self.fixture.write_text(json.dumps(fx))
 
     def run_script(self, *args):
@@ -291,7 +298,7 @@ class ApplyRulesets(unittest.TestCase):
                 )
                 self.assertIn(f'main ruleset refused: {reason}', proc.stderr)
 
-    def test_a_repo_that_is_not_two_branch_is_refused_before_any_other_read(self):
+    def test_a_repo_neither_two_branch_nor_running_the_trend_is_refused(self):
         for repo, default, meta in (
             ('tool-catalog', 'main', {}),
             ('httpx', 'main', {}),
@@ -312,8 +319,45 @@ class ApplyRulesets(unittest.TestCase):
                 )
                 proc, calls = self.run_script(repo)
                 self.assertEqual(proc.returncode, 2)
-                self.assertEqual(calls, [['api', f'repos/cplieger/{repo}']])
-                self.assertIn(f'refusing cplieger/{repo}: not a two-branch repository', proc.stderr)
+                self.assertEqual(
+                    [c[-1] for c in calls],
+                    [
+                        f'repos/cplieger/{repo}',
+                        f'repos/cplieger/{repo}/contents/{TREND_CALLER}?ref={default}',
+                    ],
+                )
+                self.assertIn(
+                    f'refusing cplieger/{repo}: not a two-branch repository (want a public, '
+                    'non-fork, non-archived repo whose default branch is dev) and it runs no '
+                    f'performance trend ({TREND_CALLER})',
+                    proc.stderr,
+                )
+
+    def test_a_repo_running_the_trend_gets_the_perf_trend_ruleset(self):
+        self.fx(dev_ci=consumer_ci(PIN_OK), main_ci=consumer_ci(PIN_OK), trend='name: T\n')
+        proc, calls = self.run_script('httpx')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual([name for _, _, name in self.writes(calls)], ['dev', 'main', 'perf-trend'])
+        sent = [
+            json.loads(pathlib.Path(c[c.index('--input') + 1]).read_text())
+            for c in calls
+            if '--input' in c
+        ]
+        self.assertEqual(sent[-1], json.loads((RULESETS / 'perf-trend.json').read_text()))
+        self.fx(repo='tool-catalog', default='main', trend='name: T\n')
+        proc, calls = self.run_script('tool-catalog')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.writes(calls), [('POST', 'repos/cplieger/tool-catalog/rulesets', 'perf-trend')]
+        )
+        self.assertFalse([c for c in calls if 'ci.yaml' in c[-1]])
+
+    def test_an_unreadable_trend_caller_applies_nothing(self):
+        self.fx(dev_ci=consumer_ci(PIN_OK), main_ci=consumer_ci(PIN_OK), trend={'status': 500})
+        proc, calls = self.run_script('httpx')
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(self.writes(calls), [])
+        self.assertIn(f'cplieger/httpx: {TREND_CALLER} unreadable', proc.stderr)
 
     def test_dry_run_prints_the_bodies_and_writes_nothing(self):
         self.fx(dev_ci=consumer_ci(PIN_OK), main_ci=consumer_ci(PIN_OK))

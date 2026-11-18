@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The tier 2 performance gate: the guard of the timing cells a web app's harness
-measured against the baselines of its base tests/perf/budgets.json, the provenance
-check of that file, and the ten-run calibration that proposes it.
+measured against dev's trend baselines (perf_trend.py), the provenance check of a
+tests/perf/budgets.json, and the ten-run calibration that proposes one.
 
 A results file (`results.json`, one per measure shard) is
   {"schema": 1, "runner": str, "cpu_model": str,
@@ -339,23 +339,26 @@ GUARD = {
     'rss_mb': (1.25, 50.0),
 }
 TIMING_KINDS = ('time', 'server_cpu')
+TREND_BASELINE = 'series/dev/baseline.json'
 
 
-def baselines_from_budgets(doc: dict) -> tuple[str, dict[tuple, float]]:
-    """A budgets.json of any schema as its runner and each entry's numeric baseline by
-    key; every other field is ignored."""
-    entries = doc.get('budgets', [])
-    if not isinstance(entries, list):
-        raise TypeError('budgets.json: budgets must be a list')
+def baselines_from_trend(doc: dict) -> tuple[str, dict[tuple, float]]:
+    """The perf-trend branch's series/dev/baseline.json (perf_trend.guard_baseline) as its
+    runner and each cell's numeric baseline by key; every other field is ignored."""
+    cells = doc.get('cells', [])
+    if not isinstance(cells, list):
+        raise TypeError(f'{TREND_BASELINE}: cells must be a list')
     out = {}
-    for i, e in enumerate(entries):
+    for i, e in enumerate(cells):
         if not isinstance(e, dict) or not all(isinstance(e.get(f), str) for f in KEY_FIELDS):
-            raise ValueError(f'budgets[{i}]: must be an object naming {", ".join(KEY_FIELDS)}')
+            raise ValueError(f'cells[{i}]: must be an object naming {", ".join(KEY_FIELDS)}')
         if is_number(e.get('baseline')):
             out[key(e)] = e['baseline']
     runner = doc.get('runner')
     if not isinstance(runner, str) or not runner:
-        raise ValueError('budgets.json: runner must name the runner the baselines were measured on')
+        raise ValueError(
+            f'{TREND_BASELINE}: runner must name the runner the baselines were measured on'
+        )
     return runner, out
 
 
@@ -393,7 +396,7 @@ def guard(
     *,
     windows: dict[str, set[str]],
 ) -> Outcome:
-    """Judge each measured timing cell's median of three against its base baseline: one
+    """Judge each measured timing cell's median of three against its trend baseline: one
     over the guard is listed in `remeasure`, never failed here. Counts and reports are
     information. On the baselines' runner, a baselined timing cell of `units`
     (planned_windows) that no shard measured fails, unless it is a server route or its
@@ -432,20 +435,21 @@ def guard(
         # is a change in what the page requests, not a cell the harness lost.
         if family(k[5]) == SERVER_CPU:
             out.notices.append(
-                f'{key_text(k)}: the base has a baseline for this route, and no shard measured it'
+                f"{key_text(k)}: dev's trend has a baseline for this route, and no shard "
+                'measured it'
             )
         elif dropped:
             out.notices.append(
-                f'{key_text(k)}: the base has a baseline for it, and the head plan.json no '
+                f"{key_text(k)}: dev's trend has a baseline for it, and the head plan.json no "
                 f'longer measures window {k[4]}'
             )
         else:
             out.failures.append(
-                f'{key_text(k)}: the base has a baseline for it, and no shard measured it'
+                f"{key_text(k)}: dev's trend has a baseline for it, and no shard measured it"
             )
     if not guarded:
         out.failures.append(
-            'nothing to guard: the base has a baseline for none of the timing cells this run '
+            "nothing to guard: dev's trend has a baseline for none of the timing cells this run "
             'measured'
         )
     return out
@@ -453,7 +457,7 @@ def guard(
 
 def guard_verdict(decided: dict, results: dict, remeasured: dict) -> Outcome:
     """Fail each cell of compare's decision (its remeasure.json, every cell carrying its
-    base baseline) whose median of six reps, its first three and the three re-measured,
+    baseline) whose median of six reps, its first three and the three re-measured,
     is still over the guard."""
     out = Outcome(runner=results.get('runner', ''))
     first = {key(c): c for c in results.get('cells', [])}
@@ -503,7 +507,7 @@ def guard_summary(out: Outcome) -> str:
     if out.runner_mismatch:
         lines += [
             (
-                f'The results come from runner `{out.runner}`, which the base baselines were '
+                f"The results come from runner `{out.runner}`, which dev's trend baselines were "
                 'not measured on, so every metric is reported and none is guarded.'
             ),
             '',
@@ -544,8 +548,8 @@ def guard_summary(out: Outcome) -> str:
         ),
     )
     lines += table(
-        'Counts that differ from the base (information)',
-        ('Cell', 'Base', 'Measured'),
+        'Counts that differ from dev (information)',
+        ('Cell', 'Dev', 'Measured'),
         (
             (
                 key_text(key(r['cell'])),
@@ -558,7 +562,7 @@ def guard_summary(out: Outcome) -> str:
     )
     lines += table(
         'Every other measured cell (information)',
-        ('Cell', 'Kind', 'Median', 'Base'),
+        ('Cell', 'Kind', 'Median', 'Dev'),
         (
             (
                 key_text(key(r['cell'])),
@@ -726,6 +730,8 @@ def seconds_per_cell(runs: list[dict]) -> list[dict]:
 UNIT_FIELDS = KEY_FIELDS[:4]
 # GitHub runs at most 256 jobs from one matrix.
 MAX_JOBS = 256
+# Past three runs a cell's noise is its window's shape (a bimodal window), not its rep count.
+MAX_UNIT_RUNS = 3
 
 
 # The sets a workflow gates: perf-ci.yaml's pull-request default and
@@ -892,12 +898,16 @@ def plan(
     only: list[str] | None = None,
     runs: int = 1,
     remeasure: dict | None = None,
+    gate: bool = False,
 ) -> dict:
     """The measure matrix of one set of plan.json: its cells (a scenario at a
     scale, engine and width, every window or those its `windows` lists) split
-    into at most `shards` jobs, longest first onto the least-loaded shard,
-    repeated `runs` times. With `remeasure`, only the cells compare listed,
-    once each. `include` alone is the GitHub matrix: any other key there
+    into at most `shards` jobs, longest first onto the least-loaded shard. A cell
+    is measured in `runs` runs, or in as many as its own `runs` asks when that is
+    more, run 2 on holding only the cells measured again; with more than one run
+    each job is named `run-NN-shard-i-of-n`. With `remeasure`, only the cells
+    compare listed, once each. A `gate` plan, whose results compare merges as one run,
+    refuses more than one. `include` alone is the GitHub matrix: any other key there
     would be a matrix dimension."""
     sets = doc.get('sets', {})
     if not isinstance(sets, dict) or set_name not in sets:
@@ -914,6 +924,14 @@ def plan(
     if not units or not isinstance(units, list):
         raise ValueError(f'set {set_name} lists no cells')
     check_units(f'set {set_name}', units)
+    if gate and runs != 1:
+        raise ValueError(f'a gated set is measured in one run, not {runs}')
+    for u in units if gate else ():
+        if u.get('runs', 1) != 1:
+            raise ValueError(
+                f'set {set_name}: {key_text(unit_key(u))}: runs belongs to the full set the '
+                'trend measures, and a gated set is measured in one run'
+            )
     if only:
         missing = sorted(set(only) - {u['scenario'] for u in units})
         if missing:
@@ -927,22 +945,36 @@ def plan(
     if remeasure is not None:
         wanted = {unit_key(c) for c in remeasure.get('cells', [])}
         units = [u for u in units if unit_key(u) in wanted]
-    count = min(shards, len(units))
-    bins: list[list[dict]] = [[] for _ in range(count)]
-    load = [0.0] * count
-    for u in sorted(units, key=lambda u: -u['seconds']):
-        i = load.index(min(load))
-        bins[i].append(dict(u))
-        load[i] += u['seconds']
-    if count * runs > MAX_JOBS:
-        raise ValueError(f'{count} shards x {runs} runs is over the {MAX_JOBS} jobs of a matrix')
+
+    def runs_of(u: dict) -> int:
+        return 1 if remeasure is not None else max(runs, u.get('runs', 1))
+
+    rounds = max((runs_of(u) for u in units), default=1)
     include = []
-    for r in range(1, runs + 1):
+    mean_load = 0.0
+    for r in range(1, rounds + 1):
+        these = [u for u in units if runs_of(u) >= r]
+        count = min(shards, len(these))
+        if r > 1:
+            # A later run re-measures only its own units, so it takes as few shards as
+            # hold them at the first run's mean shard load.
+            needed = math.ceil(sum(u['seconds'] for u in these) / mean_load)
+            count = min(count, max(1, needed))
+        bins: list[list[dict]] = [[] for _ in range(count)]
+        load = [0.0] * count
+        for u in sorted(these, key=lambda u: -u['seconds']):
+            i = load.index(min(load))
+            bins[i].append(dict(u))
+            load[i] += u['seconds']
+        if r == 1:
+            mean_load = sum(load) / max(count, 1)
         for i, cells in enumerate(bins, 1):
             name = f'shard-{i}-of-{count}'
-            if runs > 1:
+            if rounds > 1:
                 name = f'run-{r:02d}-{name}'
             include.append({'name': name, 'run': r, 'seconds': load[i - 1], 'cells': cells})
+    if len(include) > MAX_JOBS:
+        raise ValueError(f'{len(include)} jobs is over the {MAX_JOBS} jobs of a matrix')
     return {
         'include': include,
         'scenarios': sorted({u['scenario'] for u in units}),
@@ -952,7 +984,8 @@ def plan(
 
 def check_units(label: str, units: list) -> None:
     """Raise on a unit plan() cannot shard: not an object, a line break, a missing key
-    field, a unit listed twice, no positive seconds, or a bad windows list."""
+    field or one holding whitespace, `<` or `>`, a unit listed twice, no positive
+    seconds, a bad windows list, or bad runs."""
     seen = set()
     for u in units:
         if not isinstance(u, dict):
@@ -963,6 +996,9 @@ def check_units(label: str, units: list) -> None:
         k = unit_key(u)
         if not all(isinstance(x, str) and x for x in k):
             raise ValueError(f'{label}: a cell needs {", ".join(UNIT_FIELDS)}: {u}')
+        # A scenario names its trend issue in a `<!-- ... -->` marker of the body.
+        if any(re.search(r'[\s<>]', x) for x in k):
+            raise ValueError(f'{label}: {key_text(k)}: a cell field holds whitespace, < or >')
         if k in seen:
             raise ValueError(f'{label}: {key_text(k)} is listed twice')
         seen.add(k)
@@ -970,6 +1006,12 @@ def check_units(label: str, units: list) -> None:
             raise ValueError(f'{label}: {key_text(k)} needs its seconds per cell')
         if windows_error(u):
             raise ValueError(f'{label}: {key_text(k)}: {windows_error(u)}')
+        r = u.get('runs', 1)
+        if not isinstance(r, int) or isinstance(r, bool) or not 1 <= r <= MAX_UNIT_RUNS:
+            raise ValueError(
+                f'{label}: {key_text(k)}: runs must be a whole number from 1 to '
+                f'{MAX_UNIT_RUNS}, not {r!r}'
+            )
 
 
 def bench(results: dict) -> list[dict]:
@@ -1856,8 +1898,11 @@ def newest_shards(
 def result_files(
     directory: str | pathlib.Path, prefix: str, stage: str = 'measure'
 ) -> list[pathlib.Path]:
-    """The `*.json` results files of newest_shards."""
-    dirs = newest_shards(directory, prefix, stage).values()
+    """The `*.json` results files of newest_shards' first run, which measured every
+    unit; a later run measured some of them again."""
+    shards = newest_shards(directory, prefix, stage)
+    first = min((run for run, _, _ in shards), default='')
+    dirs = [d for (run, _, _), d in shards.items() if run == first]
     return sorted(p for d in dirs for p in d.rglob('*.json'))
 
 
@@ -1890,8 +1935,15 @@ def shard_groups(
 def merge_results(
     directory: str | pathlib.Path, prefix: str, stage: str = 'measure', since: int = 1
 ) -> dict:
-    """Every shard of shard_groups as one results file."""
-    return merge([p for ps in shard_groups(directory, prefix, stage, since).values() for p in ps])
+    """Every shard of shard_groups as one results file, which holds one run: a cell two
+    runs measured is two cells of one key."""
+    groups = shard_groups(directory, prefix, stage, since)
+    if len(groups) > 1:
+        raise ValueError(
+            f'{stage} results under {directory} must be one run, not {len(groups)}: '
+            f'{", ".join(sorted(groups))}'
+        )
+    return merge([p for ps in groups.values() for p in ps])
 
 
 def merge(paths: list[pathlib.Path]) -> dict:
@@ -2035,6 +2087,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument('--only', default='', help='comma or space separated scenarios to keep')
     p.add_argument('--runs', type=int, default=1, help='how many times to measure the set')
     p.add_argument(
+        '--mode',
+        choices=('gate', 'measure'),
+        default='gate',
+        help="--plan: perf-ci.yaml's mode, where a gate plan is one run",
+    )
+    p.add_argument(
         '--remeasure',
         help="compare's remeasure.json: --plan plans only the units of its cells, and "
         '--verdict judges each cell on the baseline it carries',
@@ -2042,8 +2100,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument('--budgets', help='the head budgets.json')
     p.add_argument(
         '--base',
-        help="the base ref's budgets.json: the guard's baselines, where a missing file "
-        "fails, or --check-file's base, where it is an empty one",
+        help="--check-file's base budgets.json, where a missing file is an empty one",
+    )
+    p.add_argument(
+        '--trend',
+        help=f"the guard's baselines: {TREND_BASELINE} of the perf-trend branch, where a "
+        'missing file fails',
     )
     p.add_argument('--results', help='the downloaded perf-results-<prefix>-measure-* folders')
     p.add_argument(
@@ -2100,7 +2162,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     elif a.check_in:
         need = ('budgets', 'plan_doc', 'sources', 'repo', 'head', 'pr_body')
     else:
-        need = ('base', 'results', 'prefix', 'remeasure_out', 'plan_doc', 'set')
+        need = ('trend', 'results', 'prefix', 'remeasure_out', 'plan_doc', 'set')
     missing = [f'--{n.replace("_", "-")}' for n in need if not getattr(a, n)]
     if missing:
         p.error(f'missing {", ".join(missing)}')
@@ -2203,7 +2265,9 @@ def github_output(name: str, value: str) -> str:
 def run_plan(a: argparse.Namespace) -> int:
     only = a.only.replace(',', ' ').split()
     remeasure = load(a.remeasure) if a.remeasure else None
-    matrix = plan(load(a.plan), a.set, only=only, runs=a.runs, remeasure=remeasure)
+    matrix = plan(
+        load(a.plan), a.set, only=only, runs=a.runs, remeasure=remeasure, gate=a.mode == 'gate'
+    )
     pathlib.Path(a.out).write_text(json.dumps({'include': matrix['include']}) + '\n')
     if a.outputs:
         written = {
@@ -2314,13 +2378,18 @@ def run(a: argparse.Namespace) -> int:
 
 
 def run_guard(a: argparse.Namespace) -> Outcome:
-    """The guard's compare of --results against the baselines of --base, writing the red
-    cells with their baselines to --remeasure-out; a base with no file writes nothing."""
-    if not pathlib.Path(a.base).is_file():
+    """The guard's compare of --results against the baselines of --trend, writing the red
+    cells with their baselines to --remeasure-out; a missing --trend writes nothing."""
+    if not pathlib.Path(a.trend).is_file():
         return Outcome(
-            failures=['the base holds no tests/perf/budgets.json, so the guard has no baseline']
+            failures=[
+                (
+                    f'the perf-trend branch holds no {TREND_BASELINE}, so the guard has no '
+                    'baseline: the scheduled perf-trend workflow writes it with each dev point'
+                )
+            ]
         )
-    runner, baselines = baselines_from_budgets(load(a.base))
+    runner, baselines = baselines_from_trend(load(a.trend))
     doc = load(a.plan_doc)
     matrix = plan(doc, a.set, only=a.only.replace(',', ' ').split())
     units = planned_windows(c for job in matrix['include'] for c in job['cells'])

@@ -137,8 +137,9 @@ jobs:
             echo "::error::tests/perf/run.sh wrote no ${out}/results.json"
             exit 1
           fi
-          # perf_gate.py gates only results whose runner the budgets name, so the
-          # label the job ran on is stamped here rather than trusted from run.sh.
+          # perf_gate.py and perf_trend.py judge results only against baselines of
+          # the runner they name, so the label the job ran on is stamped here
+          # rather than trusted from run.sh.
           cpu=$(sed -n '/^model name/{s/^model name[[:space:]]*:[[:space:]]*//p;q}' /proc/cpuinfo)
           python3 - "$out/results.json" "$RUNNER_LABEL" "$cpu" <<'EOF'
           import json, pathlib, sys
