@@ -25,6 +25,7 @@ HOST = 'deploy.example'
 MAIN_BRANCH = {'name': 'main'}
 DEV_RULESET = audit.expected_ruleset('dev')
 MAIN_RULESET = audit.expected_ruleset('main')
+PERF_TREND_RULESET = audit.expected_ruleset('perf-trend')
 MAIN_DEFAULT = Path(__file__).resolve().parent / 'testdata' / 'audit' / 'main-default.json'
 RENOVATE_JSON = '{"extends": ["github>cplieger/.github:two-branch"]}\n'
 
@@ -107,6 +108,7 @@ def base_settings(name: str, default_branch: str) -> dict:
         'has_security_scan': True,
         'release_caller': True,
         'own_publisher': False,
+        'perf_trend': False,
         'has_dockerfile': False,
         'go_module': None,
         'expected_package': None,
@@ -1417,6 +1419,68 @@ class RulesetBodies(unittest.TestCase):
                 self.assertFalse(checks['strict_required_status_checks_policy'])
         for rtype in ('pull_request', 'required_status_checks'):
             self.assertEqual(rule(MAIN_RULESET, rtype), rule(DEV_RULESET, rtype))
+
+
+class PerfTrendRuleset(unittest.TestCase):
+    """A repository that runs the performance trend keeps its perf-trend branch."""
+
+    def enrolled(self, base) -> dict:
+        s = base()
+        s['perf_trend'] = True
+        s['rulesets_full']['perf-trend'] = live(PERF_TREND_RULESET)
+        s['custom_rulesets'] = [
+            *s['custom_rulesets'],
+            {'name': 'perf-trend', 'enforcement': 'active'},
+        ]
+        return s
+
+    def test_the_committed_body_forbids_deleting_and_rewriting_the_branch_and_nothing_else(self):
+        self.assertEqual(
+            PERF_TREND_RULESET,
+            {
+                'name': 'perf-trend',
+                'target': 'branch',
+                'enforcement': 'active',
+                'bypass_actors': [],
+                'conditions': {'ref_name': {'include': ['refs/heads/perf-trend'], 'exclude': []}},
+                'rules': [{'type': 'deletion'}, {'type': 'non_fast_forward'}],
+            },
+        )
+
+    def test_an_enrolled_repository_with_the_ruleset_grades_clean(self):
+        for base in (two_channel, main_only):
+            with self.subTest(base=base.__name__):
+                hard, warn, _ = audit.compliance(self.enrolled(base))
+                self.assertEqual((hard, warn), ([], []))
+
+    def test_a_missing_or_changed_ruleset_is_hard(self):
+        s = self.enrolled(two_channel)
+        del s['rulesets_full']['perf-trend']
+        hard, _, _ = audit.compliance(s)
+        self.assertIn(
+            "ruleset 'perf-trend' missing (want the body in configs/rulesets/perf-trend.json)",
+            hard,
+        )
+        s = self.enrolled(main_only)
+        s['rulesets_full']['perf-trend']['rules'] = [{'type': 'non_fast_forward'}]
+        hard, _, _ = audit.compliance(s)
+        self.assertTrue(
+            any("ruleset 'perf-trend' differs" in h and 'rule types' in h for h in hard), hard
+        )
+
+    def test_the_ruleset_is_unexpected_where_the_trend_does_not_run(self):
+        for enrolled in (False, None):
+            with self.subTest(enrolled=enrolled):
+                s = self.enrolled(main_only)
+                s['perf_trend'] = enrolled
+                hard, warn, _ = audit.compliance(s)
+                self.assertEqual([h for h in hard if 'perf-trend' in h], [])
+                unexpected = (
+                    "unexpected custom ruleset 'perf-trend' (active) "
+                    '(standard is classic branch protection)'
+                )
+                want = [] if enrolled is None else [unexpected]
+                self.assertEqual([w for w in warn if 'perf-trend' in w], want)
 
 
 class MainDefaultIdentity(unittest.TestCase):

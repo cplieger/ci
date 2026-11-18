@@ -36,13 +36,15 @@ LABEL_COLOR = 'd93f0b'
 LABEL_DESCRIPTION = 'A performance regression the scheduled trend found'
 # A cell's trend baseline is the median of its last BASELINE_POINTS good points. The
 # record job checks out the last HISTORY points, so a streak up to HISTORY -
-# BASELINE_POINTS long still finds its baseline among them; past that the newest
-# baseline a point carries is carried on.
+# BASELINE_POINTS long still finds BASELINE_POINTS good points, a longer one fewer, and
+# the baseline the newest point carried is used only when the checkout holds no good point.
 BASELINE_POINTS = 7
 HISTORY = 21
 # The pull request guard's baseline: the median of the last GUARD_POINTS dev points. Over
 # five ten-run calibrations a three-point median failed one pr-set cell's median of six in
 # 54,600 one-job samples and five points none; a deliberate change reaches it in three.
+# The trend judges a cell only once GUARD_POINTS points of its runner measured it: against
+# a three-point median one-run points would open 0.0165 false issues a point, five 0.0064.
 GUARD_POINTS = 5
 # Scenario group rule, family to the median ratio over a scenario's cells whose
 # baseline clears the family's guard floor. Over 900 one-run group samples of four
@@ -70,7 +72,7 @@ def point(
     """One point of shard_groups' runs. A timing or report cell's value is the median of
     its runs' medians, and a count's the lower middle of every rep, a count some rep
     measured. A timing cell keeps each run's reps and CPU model, in run order. A cell
-    with no reps has value None."""
+    with no reps has value None. Raises on a cell whose fields identity_error refuses."""
     runs = [perf_gate.merge(paths) for _, paths in sorted(groups.items())]
     runners = {r['runner'] for r in runs}
     if len(runners) != 1:
@@ -79,6 +81,8 @@ def point(
     for run in runs:
         for c in run['cells']:
             k = perf_gate.key(c)
+            if why := identity_error(k):
+                raise ValueError(f'{perf_gate.key_text(k)}: {why}')
             seen = found.setdefault(k, {'kind': c.get('kind'), 'reps': [], 'cpu_models': []})
             if seen['kind'] != c.get('kind'):
                 raise ValueError(
@@ -107,6 +111,18 @@ def point(
         'run_url': run_url,
         'cells': cells,
     }
+
+
+def identity_error(k: tuple) -> str | None:
+    """Why a measured cell's six fields cannot reach an issue's title, table and marker,
+    or None. The metric alone may hold a space, as a server route's does."""
+    if not all(isinstance(x, str) and x for x in k):
+        return 'a cell field is empty'
+    if any(re.search(r'[\s<>]', x) for x in k[:-1]):
+        return 'a cell field holds whitespace, < or >'
+    if re.search(r'[\r\n<>]', k[-1]):
+        return 'its metric holds a line break, < or >'
+    return None
 
 
 def cell_value(seen: dict) -> Any:
@@ -176,16 +192,18 @@ def ref_of(p: dict) -> dict:
 
 def baseline(history: list[dict], k: tuple, runner: str, accepted: dict | None) -> float | None:
     """The median of cell k's last BASELINE_POINTS values on runner that were not bad,
-    or else the baseline the newest such point carried. Under an accepted regression
-    the points before its first bad point are no baseline, and those up to its
-    acceptance count however they were judged."""
-    good, carried = [], None
+    or else the baseline the newest such point carried, and None while fewer than
+    GUARD_POINTS points of runner measured it. Under an accepted regression the points
+    before its first bad point are no baseline, and those up to its acceptance count
+    however they were judged."""
+    good, carried, measured = [], None, 0
     for h in reversed(history):
         c = h['cells'].get(k)
         if h['runner'] != runner or c is None or c.get('value') is None:
             continue
         if accepted and h['date'] < accepted['from']:
             break
+        measured += 1
         if carried is None and perf_gate.is_number(c.get('baseline')):
             carried = c['baseline']
         forgiven = bool(accepted) and h['date'] <= accepted['at']
@@ -194,6 +212,8 @@ def baseline(history: list[dict], k: tuple, runner: str, accepted: dict | None) 
         good.append(c['value'])
         if len(good) == BASELINE_POINTS:
             break
+    if measured < GUARD_POINTS:
+        return None
     return statistics.median(good) if good else carried
 
 
@@ -207,8 +227,10 @@ def judge(
 ) -> Judged:
     """Judge point p against history (seen points of its series, oldest first; fallback's
     dev points go before them while the series has fewer than BASELINE_POINTS) and step
-    each measured scenario's lifecycle in state. Returns the new state, p with each
-    judged timing cell's `baseline` and `bad`, and the issue actions."""
+    each measured scenario's lifecycle in state. A regression tracked on another runner
+    than p's ends, as does, at a dev point, one of a scenario p does not measure: a
+    suspect silently, an open or recovering one with a close. Returns the new state, p
+    with each judged timing cell's `baseline` and `bad`, and the issue actions."""
     series = state['series']
     past = [*(fallback if len(history) < BASELINE_POINTS else ()), *history]
     tracked = state['scenarios']
@@ -250,14 +272,39 @@ def judge(
     new['last'] = {**ref_of(p), 'runner': p['runner']}
     actions = []
     unjudged: dict[str, str] = {}
+    ended: dict[str, tuple[str, str]] = {}
+    for s, v in sorted(tracked.items()):
+        if v['status'] == 'ok':
+            if series == DEV and s not in scenarios:
+                new['scenarios'].pop(s)
+            continue
+        if v['runner'] != p['runner']:
+            why = f'the runner changed to `{p["runner"]}`'
+            comment = (
+                f'The runner changed to `{p["runner"]}`, so this issue is closed and the '
+                'scenario is judged again on that runner, against its own baselines.'
+            )
+        elif series == DEV and s not in scenarios:
+            why = 'the full set no longer measures it'
+            comment = f'The full set no longer measures {s}, so this issue is closed.'
+        else:
+            continue
+        ended[s] = (v['status'], why)
+        new['scenarios'].pop(s)
+        if v['status'] != 'suspect':
+            actions.append(
+                {
+                    'op': 'close',
+                    'marker': marker(series, s),
+                    'title': title(series, s),
+                    'labels': [LABEL],
+                    'comment': comment,
+                }
+            )
     for s in scenarios:
         before = new['scenarios'].get(s, {'status': 'ok'})
-        # A point that judged none of a scenario's cells, or one of another runner than
-        # its regression's, says nothing about it: stepping on it would close an issue
-        # against values no baseline was taken for.
-        if before['status'] != 'ok' and before['runner'] != p['runner']:
-            unjudged[s] = f'its regression was found on `{before["runner"]}`'
-            continue
+        # Stepping on a point that judged none of the scenario's cells would close an
+        # issue against values no baseline was taken for.
         if not any(c['scenario'] == s and 'baseline' in c for c in cells):
             if before['status'] != 'ok':
                 unjudged[s] = 'no timing cell has a baseline on this runner'
@@ -282,7 +329,7 @@ def judge(
             new['scenarios'].pop(s, None)
         else:
             new['scenarios'][s] = after
-    summary = render_summary(judged, new, bad, previous, actions, unjudged)
+    summary = render_summary(judged, new, bad, previous, actions, unjudged, ended)
     return Judged(new, judged, actions, summary)
 
 
@@ -435,6 +482,7 @@ def render_summary(
     previous: dict | None,
     actions: list[dict],
     unjudged: dict[str, str],
+    ended: dict[str, tuple[str, str]],
 ) -> str:
     judged = sum(1 for c in p['cells'] if 'baseline' in c)
     runs = '1 run' if p['runs'] == 1 else f'up to {p["runs"]} runs a cell'
@@ -461,6 +509,11 @@ def render_summary(
         'Scenarios not judged at this point',
         ('Scenario', 'Status', 'Why'),
         ((s, state['scenarios'][s]['status'], why) for s, why in sorted(unjudged.items())),
+    )
+    lines += perf_gate.table(
+        'Regressions ended at this point',
+        ('Scenario', 'Was', 'Why'),
+        ((s, was, why) for s, (was, why) in sorted(ended.items())),
     )
     lines += perf_gate.table(
         'Bad cells',
@@ -558,14 +611,19 @@ def open_markers(issues: list[dict], series: str) -> set[str]:
     return out
 
 
-def skip(state: dict, commit: str, issues: list[dict]) -> bool:
-    """Whether a point of commit adds nothing: the series' last point measured it, no
-    scenario is suspect, waiting on a confirming point, or recovering, waiting on its
-    second good one, and observe has no issue write to repair."""
+def skip(state: dict, commit: str, issues: list[dict], runner: str) -> bool:
+    """Whether a point of commit on runner adds nothing: the series' last point measured
+    it on runner, no scenario tracked on runner is suspect, waiting on a confirming
+    point, or recovering, waiting on its second good one, and observe has no issue write
+    to repair."""
     last = state.get('last')
-    pending = any(v['status'] in ('suspect', 'recovering') for v in state['scenarios'].values())
+    pending = any(
+        v['status'] in ('suspect', 'recovering') and v.get('runner') == runner
+        for v in state['scenarios'].values()
+    )
     repair = bool(observe(state, issues, series=state['series'])[1])
-    return bool(last) and last['commit'] == commit and not pending and not repair
+    same = bool(last) and last['commit'] == commit and last.get('runner') == runner
+    return same and not pending and not repair
 
 
 def guard_baseline(points: list[dict]) -> dict:
@@ -625,12 +683,25 @@ def needs(listing: list[str], series: str) -> list[str]:
     return out
 
 
+def seedable(issues: list[dict], series: str) -> None:
+    """Raise when issues holds one marked with series, whose history a new series would
+    lose: observe would close its open issues and the guard restart from one point."""
+    lost = [i for i in issues if (m := marked(i.get('body'))) and m[0] == series]
+    if lost:
+        raise ValueError(
+            f'the {series} series has no state.json but issue #{lost[0]["number"]} is '
+            'marked with it, so its history is lost: restore the perf-trend branch from '
+            'a clone that holds it'
+        )
+
+
 def record(
     root: pathlib.Path, p: dict, *, repo: str, issues: list[dict] | None
 ) -> tuple[list[dict], str]:
     """Judge point p against the checkout at root and write it there: the judged point,
-    the series' state and, for dev, the guard's baseline.json. Returns the issue actions
-    and the run summary."""
+    the series' state and, for dev, the guard's baseline.json. Refuses a point older than
+    the series' newest, and a series with no state while issues holds one marked with it.
+    Returns the issue actions and the run summary."""
     series = p['series']
     if not SERIES_RE.match(series):
         raise ValueError(f'series {series!r} must match {SERIES_RE.pattern}')
@@ -646,6 +717,14 @@ def record(
         actions = observe(state, issues, series=series)[1] if issues is not None else []
         return actions, f'{target.name} is already recorded by this run, so nothing is written.\n'
     actions: list[dict] = []
+    if not state_file.is_file():
+        seedable(issues or [], series)
+    points = sorted(f.name for f in (d / 'points').glob('*.json'))
+    if points and target.name < points[-1]:
+        raise ValueError(
+            f'{target.name} is older than {points[-1]}, the newest point of the {series} '
+            'series, so it is not recorded: a later run judged the series past it'
+        )
     if issues is not None:
         state, actions = observe(state, issues, series=series)
     history = load_points(root, series)
@@ -789,10 +868,16 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="the series' state.json, where a missing file is a series never measured",
     )
     sk.add_argument('--commit', required=True)
+    sk.add_argument(
+        '--runner', required=True, help='the runner label the point would be stamped with'
+    )
     sk.add_argument('--issues', required=True, help="fetch-issues' file")
     nd = sub.add_parser('needs', help='print the perf-trend paths judging a point reads')
     nd.add_argument('--listing', required=True, help='`git ls-tree -r --name-only` of the branch')
     nd.add_argument('--series', required=True)
+    sd = sub.add_parser('seedable', help='fail when an issue is marked with a series to start')
+    sd.add_argument('--issues', required=True, help="fetch-issues' file")
+    sd.add_argument('--series', required=True)
     jd = sub.add_parser('judge', help='judge a point and write it into the perf-trend checkout')
     jd.add_argument('--root', required=True, help='the perf-trend checkout')
     jd.add_argument('--point', required=True, help="the point command's file")
@@ -830,10 +915,12 @@ def run(a: argparse.Namespace) -> int:
         path = pathlib.Path(a.state)
         state = perf_gate.load(path) if path.is_file() else new_state('')
         issues = json.loads(pathlib.Path(a.issues).read_text())
-        print('true' if skip(state, a.commit, issues) else 'false')
+        print('true' if skip(state, a.commit, issues, a.runner) else 'false')
     elif a.command == 'needs':
         listing = pathlib.Path(a.listing).read_text().splitlines()
         print('\n'.join(needs(listing, a.series)))
+    elif a.command == 'seedable':
+        seedable(json.loads(pathlib.Path(a.issues).read_text()), a.series)
     elif a.command == 'judge':
         p = perf_gate.load(a.point)
         if p.get('series') != a.series:

@@ -36,6 +36,13 @@ on:
           runner dev's newest point was measured on.
         type: string
         default: ''
+      seed:
+        description: >-
+          Start the perf-trend branch with this point. Refused while the branch
+          exists or an issue is marked with the series; without it a missing
+          branch fails the run.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -75,6 +82,8 @@ jobs:
           REF: ${{ inputs.ref }}
           SERIES: ${{ inputs.series }}
           ONLY: ${{ inputs.only }}
+          RUNNER: ${{ inputs.runner || 'ubuntu-26.04' }}
+          SEED: ${{ inputs.seed }}
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
@@ -100,18 +109,40 @@ jobs:
             exit 1
           fi
           sha=$(gh api "repos/${REPO}/git/ref/heads/${ref}" --jq .object.sha)
+          python3 "$CI_TOOLS/perf_trend.py" fetch-issues --repo "$REPO" --out "$RUNNER_TEMP/issues.json"
+          # The branch holds every series' history and the guard's baseline, so its
+          # loss fails the run rather than starting a new history.
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0
+          rc=0
+          git ls-remote --exit-code --heads "https://github.com/${REPO}.git" perf-trend > /dev/null || rc=$?
+          case "${rc}:${SEED}" in
+            0:true)
+              echo "::error::the perf-trend branch of ${REPO} already holds the trend's history, so there is nothing to seed"
+              exit 1
+              ;;
+            0:*) ;;
+            2:true) python3 "$CI_TOOLS/perf_trend.py" seedable --issues "$RUNNER_TEMP/issues.json" --series "$series" ;;
+            2:*)
+              echo "::error::the perf-trend branch of ${REPO} is missing: restore it from a clone that holds it, or dispatch with seed to start a new history"
+              exit 1
+              ;;
+            *)
+              echo "::error::could not read the perf-trend branch of ${REPO} (git ls-remote exit ${rc})"
+              exit 1
+              ;;
+          esac
           state="$RUNNER_TEMP/state.json"
           # No branch or no state yet is a series never measured.
           gh api -H 'Accept: application/vnd.github.raw+json' \
             "repos/${REPO}/contents/series/${series}/state.json?ref=perf-trend" > "$state" 2> /dev/null \
             || rm -f "$state"
-          python3 "$CI_TOOLS/perf_trend.py" fetch-issues --repo "$REPO" --out "$RUNNER_TEMP/issues.json"
           skip=$(python3 "$CI_TOOLS/perf_trend.py" skip --state "$state" --commit "$sha" \
-            --issues "$RUNNER_TEMP/issues.json")
+            --runner "$RUNNER" --issues "$RUNNER_TEMP/issues.json")
           run=true
           if [ "$skip" = true ]; then
             run=false
-            echo "the ${series} series already holds a point of ${sha}, waits on none and has no issue to repair"
+            echo "the ${series} series already holds a point of ${sha} on ${RUNNER}, waits on none and has no issue to repair"
           fi
           {
             echo "run=${run}"
@@ -180,6 +211,7 @@ jobs:
           PREFIX: ${{ needs.measure.outputs.prefix }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SEED: ${{ inputs.seed }}
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
@@ -209,9 +241,12 @@ jobs:
                 > "$RUNNER_TEMP/needs.txt"
               git -C "$work" sparse-checkout set --no-cone --stdin < "$RUNNER_TEMP/needs.txt"
               git -C "$work" checkout -q perf-trend
-            elif [ "$rc" -eq 2 ]; then
+            elif [ "$rc" -eq 2 ] && [ "$SEED" = true ]; then
               git init -q -b perf-trend "$work"
               git -C "$work" remote add origin "$url"
+            elif [ "$rc" -eq 2 ]; then
+              echo "::error::the perf-trend branch of ${REPO} is missing: restore it from a clone that holds it, or dispatch with seed to start a new history"
+              exit 1
             else
               echo "::error::could not read the perf-trend branch of ${REPO} (git ls-remote exit ${rc})"
               exit 1

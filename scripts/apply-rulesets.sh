@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Create or update the dev and main rulesets of one repo from configs/rulesets/,
-# matched by name. Usage: scripts/apply-rulesets.sh [--dry-run] <repo>. Refuses a
-# repo that is not two-branch (exit 2). Applies main only when a job of ci.yaml on
+# Create or update one repo's rulesets from configs/rulesets/, matched by name: dev
+# and main on a two-branch repo, perf-trend on a repo whose default branch runs the
+# synced performance trend. Usage: scripts/apply-rulesets.sh [--dry-run] <repo>.
+# Refuses a repo that is neither (exit 2). Applies main only when a job of ci.yaml on
 # both branches calls a meta-workflow pin whose validate needs the pr-policy intake job, else
 # exit 1: without the intake, main's ruleset would admit any head.
 set -euo pipefail
@@ -26,16 +27,27 @@ if [ "$#" -ne 1 ]; then
   exit 2
 fi
 
-meta="$(gh api "repos/${OWNER}/${repo}")"
-if ! python3 -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import release_channels as rc; sys.exit(0 if rc.is_two_branch(json.loads(sys.stdin.read())) else 1)' \
-  "$ROOT/scripts" <<<"$meta"; then
-  echo "refusing ${OWNER}/${repo}: not a two-branch repository (want a public, non-fork, non-archived repo whose default branch is dev)" >&2
-  exit 2
-fi
-
 raw() { # <path> <ref> -> the file's bytes at <ref>
   gh api -H 'Accept: application/vnd.github.raw+json' "repos/$1?ref=$2"
 }
+
+meta="$(gh api "repos/${OWNER}/${repo}")"
+two_branch=true
+python3 -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import release_channels as rc; sys.exit(0 if rc.is_two_branch(json.loads(sys.stdin.read())) else 1)' \
+  "$ROOT/scripts" <<<"$meta" || two_branch=false
+trend_caller=.github/workflows/perf-trend.yaml
+trend=true
+if ! err="$(raw "${OWNER}/${repo}/contents/${trend_caller}" "$(jq -r .default_branch <<<"$meta")" 2>&1 >/dev/null)"; then
+  if [[ $err != *'(HTTP 404)'* ]]; then
+    echo "${OWNER}/${repo}: ${trend_caller} unreadable: ${err}" >&2
+    exit 1
+  fi
+  trend=false
+fi
+if [ "$two_branch" = false ] && [ "$trend" = false ]; then
+  echo "refusing ${OWNER}/${repo}: not a two-branch repository (want a public, non-fork, non-archived repo whose default branch is dev) and it runs no performance trend (${trend_caller})" >&2
+  exit 2
+fi
 
 # stdin: a workflow. Prints each distinct pin of the meta workflow that a job's
 # `uses:` names, one per line; exits non-zero when the workflow does not parse.
@@ -110,13 +122,20 @@ main_blocker() {
   done
 }
 
-blocker="$(main_blocker)"
-files=("$ROOT/configs/rulesets/dev.json")
-if [ -z "$blocker" ]; then
-  files+=("$ROOT/configs/rulesets/main.json")
-  echo "main ruleset allowed: dev and main pin a cplieger/ci meta workflow whose validate needs pr-policy"
-else
-  echo "main ruleset refused: ${blocker}" >&2
+blocker=''
+files=()
+if [ "$two_branch" = true ]; then
+  blocker="$(main_blocker)"
+  files+=("$ROOT/configs/rulesets/dev.json")
+  if [ -z "$blocker" ]; then
+    files+=("$ROOT/configs/rulesets/main.json")
+    echo "main ruleset allowed: dev and main pin a cplieger/ci meta workflow whose validate needs pr-policy"
+  else
+    echo "main ruleset refused: ${blocker}" >&2
+  fi
+fi
+if [ "$trend" = true ]; then
+  files+=("$ROOT/configs/rulesets/perf-trend.json")
 fi
 
 for file in "${files[@]}"; do

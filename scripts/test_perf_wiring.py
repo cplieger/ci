@@ -567,7 +567,18 @@ class Trend(unittest.TestCase):
         self.assertEqual(set(notify['needs']), set(self.jobs) - {'notify'})
         self.assertEqual(notify['with']['scope'], '${{ inputs.only }}')
 
-    def resolve(self, ref='', series='', only='', state=None, default='dev', issues=()):
+    def resolve(
+        self,
+        ref='',
+        series='',
+        only='',
+        state=None,
+        default='dev',
+        issues=(),
+        runner='',
+        seed='false',
+        branch=True,
+    ):
         s = step(self.jobs['plan'], 'Resolve')
         gh = f"""#!/usr/bin/env bash
 case "$*" in
@@ -579,11 +590,28 @@ case "$*" in
   *) echo "unexpected gh $*" >&2; exit 9 ;;
 esac
 """
+        git = f"""#!/usr/bin/env bash
+if [ "$1" != ls-remote ]; then exec {shutil.which('git')} "$@"; fi
+[ "$*" = 'ls-remote --exit-code --heads https://github.com/cplieger/a.git perf-trend' ] || exit 9
+[ "$GIT_CONFIG_KEY_0" = http.https://github.com/.extraheader ] || exit 9
+exit "$BRANCH"
+"""
         env = {'REPO': 'cplieger/a', 'REF': ref, 'SERIES': series, 'ONLY': only}
         env |= {'CI_TOOLS': str(ROOT / 'scripts'), 'GH_TOKEN': 't', 'STATE': state or ''}
-        env |= {'ISSUES': json.dumps(list(issues))}
-        proc, tmp = run_body(self, s['run'], env, {'gh': gh})
+        env |= {
+            'ISSUES': json.dumps(list(issues)),
+            'RUNNER': runner or 'ubuntu-26.04',
+            'SEED': seed,
+        }
+        env |= {'BRANCH': '0' if branch is True else '2' if branch is False else branch}
+        proc, tmp = run_body(self, s['run'], env, {'gh': gh, 'git': git})
         return proc, outputs(tmp)
+
+    def test_resolve_runs_on_the_runner_the_measure_job_stamps(self):
+        s = step(self.jobs['plan'], 'Resolve')
+        self.assertEqual(s['env']['RUNNER'], "${{ inputs.runner || 'ubuntu-26.04' }}")
+        self.assertEqual(s['env']['SEED'], '${{ inputs.seed }}')
+        self.assertIn('--runner "$RUNNER"', s['run'])
 
     def test_resolve_names_the_commit_and_series_and_refuses_what_dev_may_not_take(self):
         proc, out = self.resolve()
@@ -611,15 +639,19 @@ esac
     def test_resolve_skips_a_measured_commit_with_nothing_pending(self):
         _, first = self.resolve()
         sha = first['sha']
-        done = {'schema': 1, 'series': 'dev', 'last': {'commit': sha}, 'scenarios': {}}
+        last = {'commit': sha, 'runner': 'ubuntu-26.04'}
+        done = {'schema': 1, 'series': 'dev', 'last': last, 'scenarios': {}}
         _, out = self.resolve(state=json.dumps(done))
         self.assertEqual(out['run'], 'false')
-        pending = {**done, 'scenarios': {'files': {'status': 'suspect'}}}
+        _, out = self.resolve(state=json.dumps(done), runner='self-hosted')
+        self.assertEqual(out['run'], 'true')
+        suspect = {'status': 'suspect', 'runner': 'ubuntu-26.04'}
+        pending = {**done, 'scenarios': {'files': suspect}}
         _, out = self.resolve(state=json.dumps(pending))
         self.assertEqual(out['run'], 'true')
         body = '<!-- perf-trend:dev:files -->\nbody'
-        tracked = {'status': 'open', 'opened': '2026-11-18T00:00:00Z', 'body': body}
-        tracked |= {'first_bad': {'date': '2026-11-17T16:00:00Z'}}
+        tracked = {'status': 'open', 'runner': 'ubuntu-26.04', 'opened': '2026-11-18T00:00:00Z'}
+        tracked |= {'body': body, 'first_bad': {'date': '2026-11-17T16:00:00Z'}}
         opened = {**done, 'scenarios': {'files': tracked}}
         filed = {'number': 1, 'state': 'open', 'created_at': '2026-11-18T00:05:00Z', 'body': body}
         _, out = self.resolve(state=json.dumps(opened), issues=[filed])
@@ -627,7 +659,44 @@ esac
         _, out = self.resolve(state=json.dumps(opened))
         self.assertEqual(out['run'], 'true')
 
-    def record(self, remote: Path, sha: str, date: str, *, race: bool = False):
+    def test_resolve_fails_on_a_missing_branch_unless_seeding_a_history_no_issue_names(self):
+        proc, out = self.resolve(branch=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(
+            '::error::the perf-trend branch of cplieger/a is missing: restore it from a clone '
+            'that holds it, or dispatch with seed to start a new history',
+            proc.stdout,
+        )
+        self.assertNotIn('run', out)
+        proc, out = self.resolve(branch=False, seed='true')
+        self.assertEqual((proc.returncode, out['run']), (0, 'true'), proc.stderr)
+        marked = {'number': 4, 'state': 'closed', 'created_at': '2026-11-01T00:00:00Z'}
+        marked['body'] = '<!-- perf-trend:dev:files -->\nbody'
+        proc, out = self.resolve(branch=False, seed='true', issues=[marked])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('issue #4 is marked with it, so its history is lost', proc.stderr)
+        self.assertNotIn('run', out)
+        proc, out = self.resolve(seed='true')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(
+            "::error::the perf-trend branch of cplieger/a already holds the trend's history, "
+            'so there is nothing to seed',
+            proc.stdout,
+        )
+        proc, out = self.resolve(branch='128')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('git ls-remote exit 128', proc.stdout)
+
+    def record(
+        self,
+        remote: Path,
+        sha: str,
+        date: str,
+        *,
+        race: bool = False,
+        seed: str = 'false',
+        issues=(),
+    ):
         """The Record step against remote, a local bare repository standing in for GitHub,
         on a one-shard measure of sha; race pushes another commit to perf-trend first."""
         tmp = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='perf-record-')))
@@ -653,7 +722,7 @@ fi
 exec {real} "${{args[@]}}"
 """
         gh = """#!/usr/bin/env bash
-printf 'HTTP/2.0 200 OK\\r\\n\\r\\n[]'
+printf 'HTTP/2.0 200 OK\\r\\n\\r\\n%s' "$ISSUES"
 """
         if race:
             (tmp / 'race').write_text('')
@@ -663,11 +732,12 @@ printf 'HTTP/2.0 200 OK\\r\\n\\r\\n[]'
         env |= {'DATE': date, 'PREFIX': 'cplieger-a'}
         env |= {'RUN_ID': '1', 'RUN_URL': 'https://github.com/cplieger/a/actions/runs/1'}
         env |= {'CI_TOOLS': str(ROOT / 'scripts'), 'RUNNER_TEMP': str(tmp / 'runner')}
-        env |= {'RACE': str(tmp / 'race'), 'HOME': str(tmp)}
+        env |= {'RACE': str(tmp / 'race'), 'HOME': str(tmp), 'SEED': seed}
+        env |= {'ISSUES': json.dumps(list(issues))}
         proc, _ = run_body(self, s['run'], env, {'git': git, 'gh': gh})
         return proc, tmp / 'runner'
 
-    def test_record_bootstraps_the_branch_then_appends_fast_forward_and_retries_a_race(self):
+    def test_record_seeds_the_branch_only_when_asked_then_appends_and_retries_a_race(self):
         remote = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='perf-remote-')))
         subprocess.run(['git', 'init', '-q', '--bare', str(remote)], check=True)
 
@@ -690,6 +760,24 @@ printf 'HTTP/2.0 200 OK\\r\\n\\r\\n[]'
             return done.stdout.splitlines()
 
         proc, runner = self.record(remote, 'a' * 40, '2026-11-18T00:00:00Z')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(
+            '::error::the perf-trend branch of cplieger/a is missing: restore it from a clone '
+            'that holds it, or dispatch with seed to start a new history',
+            proc.stdout,
+        )
+        self.assertFalse((runner / 'actions.json').exists())
+        marked = {'number': 4, 'state': 'closed', 'created_at': '2026-11-01T00:00:00Z'}
+        marked['body'] = '<!-- perf-trend:dev:files -->\nbody'
+        proc, runner = self.record(
+            remote, 'a' * 40, '2026-11-18T00:00:00Z', seed='true', issues=[marked]
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('issue #4 is marked with it, so its history is lost', proc.stderr)
+        self.assertFalse((runner / 'actions.json').exists())
+        branches = ['git', '-C', str(remote), 'branch', '--list']
+        self.assertEqual(subprocess.run(branches, capture_output=True, text=True).stdout, '')
+        proc, runner = self.record(remote, 'a' * 40, '2026-11-18T00:00:00Z', seed='true')
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(log(), [f'perf: dev point at {"a" * 12}'])
         self.assertEqual(
@@ -728,7 +816,9 @@ class TrendCaller(unittest.TestCase):
     def test_it_runs_every_eight_hours_clear_of_the_weekly_runs_and_on_dispatch(self):
         on = self.doc[True]
         self.assertEqual(on['schedule'], [{'cron': '17 1,9,17 * * *'}])
-        self.assertEqual(set(on['workflow_dispatch']['inputs']), {'ref', 'series', 'only'})
+        inputs = on['workflow_dispatch']['inputs']
+        self.assertEqual(set(inputs), {'ref', 'series', 'only', 'seed'})
+        self.assertEqual((inputs['seed']['type'], inputs['seed']['default']), ('boolean', False))
         weekly = {
             s['cron']
             for path in WORKFLOWS.glob('weekly-*.yaml')
@@ -753,6 +843,7 @@ class TrendCaller(unittest.TestCase):
                 'ref': '${{ inputs.ref }}',
                 'series': '${{ inputs.series }}',
                 'only': '${{ inputs.only }}',
+                'seed': '${{ inputs.seed == true }}',
                 'runner': '${{ vars.CI_RUNNER }}',
             },
         )

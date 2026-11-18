@@ -175,6 +175,18 @@ class Point(unittest.TestCase):
         cpu = by_cell(made_point(self.dir))['files/x10/chromium/desktop/cold/cpu_ms']
         self.assertIsNone(cpu['value'])
 
+    def test_a_cell_field_the_issue_text_cannot_carry_is_refused(self):
+        for cell, why in (
+            (rcell('settings @owner'), 'whitespace'),
+            (rcell(window='<b>'), 'whitespace'),
+            (rcell(''), 'empty'),
+            (rcell(metric='server_cpu_ms:GET /<x>', kind='server_cpu'), '< or >'),
+        ):
+            with self.subTest(cell=cell), tempfile.TemporaryDirectory() as tmp:
+                write_shard(tmp, 'shard-1-of-1', [cell])
+                with self.assertRaisesRegex(ValueError, why):
+                    made_point(tmp)
+
     def test_runs_of_two_runners_or_a_cell_of_two_kinds_are_refused(self):
         write_shard(self.dir, 'run-01-shard-1-of-1', [rcell()])
         write_shard(self.dir, 'run-02-shard-1-of-1', [rcell()], runner='self-hosted')
@@ -523,29 +535,101 @@ class Judge(unittest.TestCase):
             t.history = t.history[-perf_trend.HISTORY :]
         self.assertEqual(t.scenario(), 'open')
 
-    def test_points_of_another_runner_never_step_a_tracked_regression(self):
+    def test_a_runner_change_ends_the_old_runner_s_regressions_and_judges_the_new_one_apart(self):
+        other = 'self-hosted'
         t = Trend()
         t.add(slow(cold=3000.0))
         t.add(slow(cold=3000.0))
         self.assertEqual(t.scenario(), 'open')
-        for _ in range(3):
-            judged = t.add(slow(cold=3000.0), runner='self-hosted')
-            self.assertEqual(judged.actions, [])
-            self.assertEqual(t.scenario(), 'open')
-        self.assertIn('### Scenarios not judged at this point', judged.summary)
-        self.assertIn(
-            '| files | open | its regression was found on `ubuntu-26.04` |', judged.summary
+        self.assertFalse(perf_trend.skip(t.state, t.state['last']['commit'], [], other))
+        switched = t.add(slow(cold=3000.0), runner=other)
+        self.assertEqual(
+            [(a['op'], a['marker']) for a in switched.actions], [('close', 'perf-trend:dev:files')]
         )
-        self.assertEqual([a['op'] for a in t.add(GOOD).actions], [])
-        self.assertEqual([a['op'] for a in t.add(GOOD).actions], ['close'])
+        self.assertEqual(
+            switched.actions[0]['comment'],
+            'The runner changed to `self-hosted`, so this issue is closed and the scenario is '
+            'judged again on that runner, against its own baselines.',
+        )
+        self.assertEqual(t.scenario(), 'ok')
+        self.assertIn('### Regressions ended at this point', switched.summary)
+        self.assertIn('| files | open | the runner changed to `self-hosted` |', switched.summary)
+        for n in range(2, perf_trend.GUARD_POINTS + 1):
+            judged = t.add(slow(cold=99999.0) if n == 3 else GOOD, runner=other)
+            self.assertEqual(judged.actions, [])
+            self.assertFalse(any('baseline' in c for c in judged.point['cells']), n)
+            self.assertTrue(perf_trend.skip(t.state, t.state['last']['commit'], [], other))
+        t.add(slow(cold=5000.0), runner=other)
+        self.assertEqual(t.scenario(), 'suspect')
+        self.assertFalse(perf_trend.skip(t.state, t.state['last']['commit'], [], other))
+        opened = t.add(slow(cold=5000.0), runner=other)
+        self.assertEqual([a['op'] for a in opened.actions], ['upsert'])
+        self.assertIn(
+            '| files/x10/chromium/desktop/cold/cpu_ms | 1000 | 5000 | 5.00x |',
+            opened.actions[0]['body'],
+        )
+        filed = {'number': 2, 'state': 'open', 'created_at': '2026-11-01T20:00:00Z'}
+        filed['body'] = opened.actions[0]['body']
+        self.assertTrue(perf_trend.skip(t.state, t.state['last']['commit'], [filed], other))
+        self.assertEqual(t.add(GOOD, runner=other).actions, [])
+        self.assertEqual([a['op'] for a in t.add(GOOD, runner=other).actions], ['close'])
+        self.assertTrue(perf_trend.skip(t.state, t.state['last']['commit'], [], other))
 
-    def test_a_suspect_is_not_cleared_by_another_runner_s_point(self):
+    def test_a_runner_change_drops_a_suspect_and_closes_a_recovering_regression(self):
         t = Trend()
         t.add(slow(cold=3000.0))
-        for _ in range(7):
-            t.add(GOOD, runner='self-hosted')
+        judged = t.add(GOOD, runner='self-hosted')
+        self.assertEqual(judged.actions, [])
+        self.assertEqual(t.state['scenarios'], {})
+        self.assertTrue(perf_trend.skip(t.state, t.state['last']['commit'], [], 'self-hosted'))
+        u = Trend()
+        u.add(slow(cold=3000.0))
+        u.add(slow(cold=3000.0))
+        u.add(GOOD)
+        self.assertEqual(u.scenario(), 'recovering')
+        self.assertEqual([a['op'] for a in u.add(GOOD, runner='self-hosted').actions], ['close'])
+        self.assertEqual(u.state['scenarios'], {})
+
+    def test_a_scenario_the_full_set_no_longer_measures_is_dropped_from_dev(self):
+        chat = ('chat', 'cold', 'cpu_ms')
+        t = Trend(base={**GOOD, chat: 1000.0})
+        t.add({**slow(cold=5000.0), chat: 1000.0})
         self.assertEqual(t.scenario(), 'suspect')
-        self.assertEqual([a['op'] for a in t.add(slow(cold=3000.0)).actions], ['upsert'])
+        renamed = {('files-v2', 'cold', 'cpu_ms'): 1000.0, chat: 1000.0}
+        for _ in range(2):
+            self.assertEqual(t.add(renamed).actions, [])
+        self.assertEqual(t.state['scenarios'], {})
+        self.assertTrue(perf_trend.skip(t.state, t.state['last']['commit'], [], RUNNER))
+        u = Trend(base={**GOOD, chat: 1000.0})
+        u.add({**slow(cold=5000.0), chat: 1000.0})
+        u.add({**slow(cold=5000.0), chat: 1000.0})
+        self.assertEqual(u.scenario(), 'open')
+        gone = u.add(renamed)
+        self.assertEqual(
+            [(a['op'], a['marker'], a['comment']) for a in gone.actions],
+            [
+                (
+                    'close',
+                    'perf-trend:dev:files',
+                    'The full set no longer measures files, so this issue is closed.',
+                )
+            ],
+        )
+        self.assertEqual(u.state['scenarios'], {})
+        self.assertIn('| files | open | the full set no longer measures it |', gone.summary)
+        proof = Trend('proof', base={**GOOD, chat: 1000.0})
+        proof.add({**slow(cold=5000.0), chat: 1000.0})
+        self.assertEqual(proof.add({chat: 1000.0}).actions, [])
+        self.assertEqual(proof.scenario(), 'suspect')
+
+    def test_a_cell_is_judged_once_five_points_of_its_runner_measured_it(self):
+        t = Trend(points=perf_trend.GUARD_POINTS - 1)
+        early = t.add(slow(cold=99999.0))
+        self.assertFalse(any('baseline' in c for c in early.point['cells']))
+        u = Trend(points=perf_trend.GUARD_POINTS)
+        judged = u.add(slow(cold=99999.0))
+        cold = next(c for c in judged.point['cells'] if c['window'] == 'cold')
+        self.assertEqual((cold['baseline'], cold['bad']), (1000.0, True))
 
     def test_a_point_judging_none_of_a_scenario_s_cells_leaves_it_as_it_was(self):
         t = Trend(base={**GOOD, ('docs', 'cold', 'cpu_ms'): 500.0})
@@ -641,11 +725,11 @@ class Skip(unittest.TestCase):
     def test_skip_only_an_unchanged_commit_with_nothing_pending(self):
         t = Trend()
         last = t.state['last']['commit']
-        self.assertTrue(perf_trend.skip(t.state, last, []))
-        self.assertFalse(perf_trend.skip(t.state, PURE_SHA.format(99), []))
-        self.assertFalse(perf_trend.skip(perf_trend.new_state('dev'), last, []))
+        self.assertTrue(perf_trend.skip(t.state, last, [], RUNNER))
+        self.assertFalse(perf_trend.skip(t.state, PURE_SHA.format(99), [], RUNNER))
+        self.assertFalse(perf_trend.skip(perf_trend.new_state('dev'), last, [], RUNNER))
         t.add(slow(cold=3000.0))
-        self.assertFalse(perf_trend.skip(t.state, t.state['last']['commit'], []))
+        self.assertFalse(perf_trend.skip(t.state, t.state['last']['commit'], [], RUNNER))
         opened = t.add(slow(cold=3000.0))
         filed = {
             'number': 1,
@@ -653,20 +737,26 @@ class Skip(unittest.TestCase):
             'created_at': '2026-11-01T10:00:00Z',
             'body': opened.actions[0]['body'],
         }
-        self.assertTrue(perf_trend.skip(t.state, t.state['last']['commit'], [filed]))
+        self.assertTrue(perf_trend.skip(t.state, t.state['last']['commit'], [filed], RUNNER))
         t.add(GOOD)
         self.assertEqual(t.scenario(), 'recovering')
-        self.assertFalse(perf_trend.skip(t.state, t.state['last']['commit'], [filed]))
+        self.assertFalse(perf_trend.skip(t.state, t.state['last']['commit'], [filed], RUNNER))
 
     def test_a_lost_issue_write_is_not_skipped(self):
         t = Trend()
         t.add(slow(cold=3000.0))
         opened = t.add(slow(cold=3000.0))
         last = t.state['last']['commit']
-        self.assertFalse(perf_trend.skip(t.state, last, []))
+        self.assertFalse(perf_trend.skip(t.state, last, [], RUNNER))
         u = Trend()
         stray = {**opened.actions[0], 'number': 2, 'state': 'open', 'created_at': 'x'}
-        self.assertFalse(perf_trend.skip(u.state, u.state['last']['commit'], [stray]))
+        self.assertFalse(perf_trend.skip(u.state, u.state['last']['commit'], [stray], RUNNER))
+
+    def test_a_point_on_another_runner_than_the_last_is_measured(self):
+        t = Trend()
+        self.assertFalse(perf_trend.skip(t.state, t.state['last']['commit'], [], 'self-hosted'))
+        held = {**t.state, 'scenarios': {'files': {'status': 'suspect', 'runner': 'self-hosted'}}}
+        self.assertTrue(perf_trend.skip(held, t.state['last']['commit'], [], RUNNER))
 
 
 class FakeGitHub:
@@ -886,26 +976,25 @@ class Record(unittest.TestCase):
 
     def test_a_point_is_stored_with_the_state_and_dev_s_guard_baseline(self):
         dom = ('files', 'cold', 'dom')
-        for n, (cold, count) in enumerate(
-            ((1000.0, 640), (1200.0, 641), (900.0, 642), (5000.0, 643)), 1
-        ):
-            self.record({**GOOD, ('files', 'cold', 'cpu_ms'): cold, dom: count}, n)
+        colds = (1000.0, 1200.0, 900.0, 1100.0, 1000.0, 5000.0)
+        for n, cold in enumerate(colds, 1):
+            self.record({**GOOD, ('files', 'cold', 'cpu_ms'): cold, dom: 639 + n}, n)
         names, state = self.stored()
-        self.assertEqual(names, [perf_trend.point_name(tp(GOOD, n)) for n in range(1, 5)])
-        self.assertEqual(state['last']['commit'], PURE_SHA.format(4))
+        self.assertEqual(names, [perf_trend.point_name(tp(GOOD, n)) for n in range(1, 7)])
+        self.assertEqual(state['last']['commit'], PURE_SHA.format(6))
         self.assertEqual(state['scenarios']['files']['status'], 'suspect')
         stored = json.loads((self.root / 'series/dev/points' / names[-1]).read_text())
         cold = next(c for c in stored['cells'] if c['metric'] == 'cpu_ms' and c['window'] == 'cold')
         self.assertEqual((cold['baseline'], cold['bad']), (1000.0, True))
         baseline = json.loads((self.root / 'series/dev/baseline.json').read_text())
-        self.assertEqual(baseline['commits'], [PURE_SHA.format(n) for n in (1, 2, 3, 4)])
+        self.assertEqual(baseline['commits'], [PURE_SHA.format(n) for n in range(2, 7)])
         cells = {(c['window'], c['metric']): (c['kind'], c['baseline']) for c in baseline['cells']}
         self.assertEqual(cells[('cold', 'cpu_ms')], ('time', 1100.0))
-        for n in range(5, 7):
+        self.assertEqual(cells[('cold', 'dom')], ('count', 645))
+        for n in range(7, 9):
             self.record(GOOD, n)
         baseline = json.loads((self.root / 'series/dev/baseline.json').read_text())
-        self.assertEqual(baseline['commits'], [PURE_SHA.format(n) for n in range(2, 7)])
-        self.assertEqual(cells[('cold', 'dom')], ('count', 643))
+        self.assertEqual(baseline['commits'], [PURE_SHA.format(n) for n in range(4, 9)])
         runner, read = perf_gate.baselines_from_trend(baseline)
         self.assertEqual((runner, len(read)), (RUNNER, 3))
 
@@ -942,6 +1031,55 @@ class Record(unittest.TestCase):
         later, _ = self.record(slow(cold=3000.0), 10, issues=[])
         self.assertEqual([a['op'] for a in later], ['upsert'])
         self.assertIn('comment', later[0])
+
+    def test_a_point_older_than_the_series_newest_is_refused_and_writes_nothing(self):
+        for n in range(1, 8):
+            self.record(GOOD, n)
+        self.record(slow(cold=3000.0), 8)
+        self.record(slow(cold=3000.0), 9)
+        _, state = self.stored()
+        self.assertEqual(state['scenarios']['files']['status'], 'open')
+        before = {f: f.read_bytes() for f in self.root.rglob('*') if f.is_file()}
+        stale = tp(GOOD, 99)
+        stale['date'] = '2026-11-01T08:30:00Z'
+        point_file = self.root.parent / f'{self.root.name}-stale.json'
+        self.addCleanup(point_file.unlink, missing_ok=True)
+        point_file.write_text(json.dumps(stale))
+        argv = ['judge', '--root', str(self.root), '--point', str(point_file), '--series', 'dev']
+        issues = self.root.parent / f'{self.root.name}-issues.json'
+        self.addCleanup(issues.unlink, missing_ok=True)
+        issues.write_text('[]')
+        argv += ['--repo', REPO, '--issues', str(issues), '--actions', str(self.root / 'a.json')]
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            self.assertEqual(perf_trend.main(argv), 1)
+        self.assertIn(
+            '::error::perf_trend: 20261101T083000Z-000000000000.json is older than '
+            '20261101T090000Z-000000000000.json, the newest point of the dev series, so it is '
+            'not recorded: a later run judged the series past it',
+            err.getvalue(),
+        )
+        self.assertEqual({f: f.read_bytes() for f in self.root.rglob('*') if f.is_file()}, before)
+
+    def test_a_series_with_no_state_is_refused_while_an_issue_is_marked_with_it(self):
+        marked = {
+            'number': 12,
+            'state': 'closed',
+            'created_at': '2026-11-01T10:00:00Z',
+            'body': '<!-- perf-trend:dev:files -->\nbody',
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            r'^the dev series has no state\.json but issue #12 is marked with it, so its '
+            r'history is lost: restore the perf-trend branch from a clone that holds it$',
+        ):
+            self.record(GOOD, 1, issues=[marked])
+        self.assertEqual(list(self.root.iterdir()), [])
+        other = {**marked, 'body': '<!-- perf-trend:proof:files -->\nbody'}
+        actions, _ = self.record(GOOD, 1, issues=[other])
+        self.assertEqual(actions, [])
+        self.assertEqual(self.stored()[0], [perf_trend.point_name(tp(GOOD, 1))])
+        self.record(GOOD, 2, issues=[marked])
 
     def test_a_hand_closed_issue_is_written_back_as_accepted(self):
         for n in range(1, 8):
@@ -988,7 +1126,15 @@ class Record(unittest.TestCase):
         issues = self.root / 'issues.json'
         issues.write_text('[]')
         out = io.StringIO()
-        argv = ['skip', '--state', str(self.root / 'none.json'), '--commit', SHA]
+        argv = [
+            'skip',
+            '--state',
+            str(self.root / 'none.json'),
+            '--commit',
+            SHA,
+            '--runner',
+            RUNNER,
+        ]
         with redirect_stdout(out):
             rc = perf_trend.main([*argv, '--issues', str(issues)])
         self.assertEqual((rc, out.getvalue()), (0, 'false\n'))
@@ -996,6 +1142,7 @@ class Record(unittest.TestCase):
         out = io.StringIO()
         state = str(self.root / 'series/dev/state.json')
         argv = ['skip', '--state', state, '--commit', PURE_SHA.format(1), '--issues', str(issues)]
+        argv += ['--runner', RUNNER]
         with redirect_stdout(out):
             perf_trend.main(argv)
         self.assertEqual(out.getvalue(), 'true\n')

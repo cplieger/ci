@@ -47,6 +47,8 @@ MANAGED_RULESETS = {'code-scanning-merge-protection'}
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RULESETS_DIR = REPO_ROOT / 'configs' / 'rulesets'
 CHANNEL_RULESETS = ('dev', 'main')
+# A repository running the synced perf-trend.yaml keeps its trend's history on this branch.
+PERF_TREND_RULESET = 'perf-trend'
 # A dev build creates no Release, so a two-channel repo's hook fires on the package push.
 REGISTRY_EVENT = 'registry_package'
 _expected_rulesets_cache = {}
@@ -939,7 +941,7 @@ def collect(meta):
     wf = gh_json(f'repos/{OWNER}/{name}/contents/.github/workflows')
     if wf is API_ERROR:
         s['has_codeql'] = s['has_security_scan'] = None
-        s['release_caller'] = s['own_publisher'] = None
+        s['release_caller'] = s['own_publisher'] = s['perf_trend'] = None
         s['errors'].append('workflow listing unreadable (API)')
     else:
         wf_names = {f['name'] for f in wf} if isinstance(wf, list) else set()
@@ -947,6 +949,7 @@ def collect(meta):
         s['has_security_scan'] = bool({'security.yml', 'security.yaml'} & wf_names)
         s['release_caller'] = bool({'release.yaml', 'release.yml'} & wf_names)
         s['own_publisher'] = bool({'publish.yaml', 'publish.yml'} & wf_names)
+        s['perf_trend'] = 'perf-trend.yaml' in wf_names
 
     # Surface probes as in classify-repos.py: go.mod and package.json are read for
     # their text below, the Dockerfile for its presence.
@@ -1525,11 +1528,24 @@ def compliance(s):
         if s.get('lock_branch'):
             hard.append('branch locked (read-only — nothing can merge; want unlocked)')
 
+    if s.get('perf_trend') and s.get('rulesets_full') is not None:
+        rname = PERF_TREND_RULESET
+        actual = s['rulesets_full'].get(rname)
+        if actual is None:
+            hard.append(
+                f"ruleset '{rname}' missing (want the body in configs/rulesets/{rname}.json)"
+            )
+        for reason in ruleset_matches(expected_ruleset(rname), actual) if actual else ():
+            hard.append(f"ruleset '{rname}' differs from configs/rulesets/{rname}.json: {reason}")
+
     # Rulesets: drift on a single-main repo, and on a two-channel repo any but
     # the two compared above. A bypass actor warns unless the committed body
     # lists it; an Integration bypass is HARD everywhere (a stale app the API
     # cannot remove from a user-owned repo).
     expected_names = set(CHANNEL_RULESETS) if two_channel else set()
+    # An unread workflow listing leaves the trend unknown, so its ruleset is not graded.
+    if s.get('perf_trend') is not False:
+        expected_names.add(PERF_TREND_RULESET)
     for rs in s.get('custom_rulesets') or []:
         if rs['name'] in expected_names:
             continue
