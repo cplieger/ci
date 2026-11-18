@@ -784,9 +784,13 @@ class Record(unittest.TestCase):
         cold = next(c for c in stored['cells'] if c['metric'] == 'cpu_ms' and c['window'] == 'cold')
         self.assertEqual((cold['baseline'], cold['bad']), (1000.0, True))
         baseline = json.loads((self.root / 'series/dev/baseline.json').read_text())
-        self.assertEqual(baseline['commits'], [PURE_SHA.format(n) for n in (2, 3, 4)])
+        self.assertEqual(baseline['commits'], [PURE_SHA.format(n) for n in (1, 2, 3, 4)])
         cells = {(c['window'], c['metric']): (c['kind'], c['baseline']) for c in baseline['cells']}
-        self.assertEqual(cells[('cold', 'cpu_ms')], ('time', 1200.0))
+        self.assertEqual(cells[('cold', 'cpu_ms')], ('time', 1100.0))
+        for n in range(5, 7):
+            self.record(GOOD, n)
+        baseline = json.loads((self.root / 'series/dev/baseline.json').read_text())
+        self.assertEqual(baseline['commits'], [PURE_SHA.format(n) for n in range(2, 7)])
         self.assertEqual(cells[('cold', 'dom')], ('count', 643))
         runner, read = perf_gate.baselines_from_trend(baseline)
         self.assertEqual((runner, len(read)), (RUNNER, 3))

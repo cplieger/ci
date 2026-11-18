@@ -40,9 +40,10 @@ LABEL_DESCRIPTION = 'A performance regression the scheduled trend found'
 # baseline a point carries is carried on.
 BASELINE_POINTS = 7
 HISTORY = 21
-# The pull request guard's baseline: the median of the last GUARD_POINTS dev points, so
-# a deliberate change reaches the guard within two points.
-GUARD_POINTS = 3
+# The pull request guard's baseline: the median of the last GUARD_POINTS dev points. Over
+# five ten-run calibrations a three-point median failed one pr-set cell's median of six in
+# 54,600 one-job samples and five points none; a deliberate change reaches it in three.
+GUARD_POINTS = 5
 # Scenario group rule, family to the median ratio over a scenario's cells whose
 # baseline clears the family's guard floor. Over 900 one-run group samples of four
 # calibrations the worst median ratio was 1.294 for cpu_ms, 1.022 for heap_mb and
