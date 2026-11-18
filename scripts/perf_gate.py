@@ -112,7 +112,7 @@ def table(title: str | None, head: tuple, rows: Iterable[tuple]) -> list[str]:
 # --- the pull request guard ------------------------------------------------
 
 # Family to (ratio, floor): a cell fails over ratio x baseline and more than floor over it.
-# Four ten-run calibrations over seven runner classes put the worst one-job ratio of a pr
+# Four ten-run measurements over seven runner classes put the worst one-job ratio of a pr
 # set cell at 1.88 for cpu_ms over 50 ms and 1.64 for server_cpu_ms over 10 ms, and of
 # any memory cell at 1.09.
 GUARD = {

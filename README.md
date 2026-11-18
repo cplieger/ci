@@ -62,7 +62,7 @@ Merge the repository's pull requests by squash, so each pull request title becom
 GitHub lets any public repository call a reusable workflow stored in a public repository, and the runner minutes are billed to the caller. These workflows assume more than the call, though:
 
 - Versioning reads a `cliff.toml`, and the lint jobs read the synced configs. Copy them from `configs/` and the repository root.
-- The sync job, the daily settings audit and the scheduled mutation, fuzz, benchmark and performance runs cover cplieger repositories only.
+- The sync job, the daily settings audit and the scheduled mutation, fuzz and benchmark runs cover cplieger repositories only.
 - The performance gate's baselines are the ones the repository's own performance trend writes to its `perf-trend` branch, so another repository calls `perf-trend.yaml` on a schedule as the synced `perf-trend.yml` does, and until its first point the gate fails for want of a baseline.
 - The release workflow sets the image license label for the cplieger repositories it names. Any other repository gets the defaults, which are both registries, `amd64` and `arm64` images, and its own license in the label.
 

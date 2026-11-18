@@ -28,16 +28,11 @@ on:
         description: Comma or space separated scenarios of the set to keep; empty keeps all.
         type: string
         default: ''
-      runs:
-        description: >-
-          How many times to measure the set, or more for a unit whose plan.json
-          `runs` asks for more; more than one run, either way, needs `measure`.
-        type: number
-        default: 1
       mode:
         description: >-
           `gate` compares and judges; `measure` measures only, for the caller
-          to read the results.
+          to read the results, and is the one mode for a set with a unit whose
+          plan.json `runs` is more than one.
         type: string
         default: gate
       max-parallel:
@@ -100,7 +95,6 @@ jobs:
           EVENT: ${{ github.event_name }}
           SET: ${{ inputs.set }}
           ONLY: ${{ inputs.only }}
-          RUNS: ${{ inputs.runs }}
           MODE: ${{ inputs.mode }}
           REPO: ${{ inputs.repository || github.repository }}
         run: |
@@ -110,7 +104,7 @@ jobs:
             echo "prefix=${REPO//\//-}"
           } >> "$GITHUB_OUTPUT"
           # A push measures nothing: its pull request measured the change, and the
-          # weekly run measures the default branch.
+          # repository's perf-trend workflow measures the default branch.
           if [ -z "$SET" ] && { [ "$EVENT" = pull_request ] || [ "$EVENT" = merge_group ]; }; then
             SET='pr'
           fi
@@ -120,7 +114,7 @@ jobs:
             exit 0
           fi
           python3 "$CI_TOOLS/perf_gate.py" --plan tests/perf/plan.json --set "$SET" \
-            --only "$ONLY" --runs "$RUNS" --mode "$MODE" --out "$RUNNER_TEMP/matrix.json" \
+            --only "$ONLY" --mode "$MODE" --out "$RUNNER_TEMP/matrix.json" \
             --outputs "$GITHUB_OUTPUT"
           echo "set=${SET}" >> "$GITHUB_OUTPUT"
 

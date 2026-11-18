@@ -45,11 +45,7 @@ TARGET_CODE_JOBS = {
     ('weekly-fuzz.yaml', 'fuzz'),
     ('weekly-bench.yaml', 'smoke'),
     ('weekly-bench.yaml', 'run'),
-    ('weekly-perf.yaml', 'perf'),
 }
-# The reusable workflows weekly-perf's perf entries call, which run the target's
-# build and scenarios.
-PERF_WORKFLOWS = ('perf-ci.yaml', 'perf-measure.yaml')
 # Scheduled jobs that hold CI_SCHEDULE or the run's token and run no target code; a
 # `repo` job only passes CI_SCHEDULE to the per-repository workflow it calls.
 NO_TARGET_CODE = {
@@ -68,10 +64,6 @@ NO_TARGET_CODE = {
     ('weekly-bench.yaml', 'fanout'),
     ('weekly-bench.yaml', 'publish'),
     ('weekly-bench.yaml', 'aggregate'),
-    ('weekly-perf.yaml', 'fanout'),
-    ('weekly-perf.yaml', 'publish'),
-    ('weekly-perf-calibrate.yaml', 'fanout'),
-    ('weekly-perf-calibrate.yaml', 'calibrate'),
     ('weekly-links.yaml', 'fanout'),
     ('weekly-links.yaml', 'run'),
 }
@@ -80,8 +72,6 @@ LISTING_WORKFLOWS = [
     'weekly-bench.yaml',
     'weekly-fuzz.yaml',
     'weekly-gremlins.yaml',
-    'weekly-perf.yaml',
-    'weekly-perf-calibrate.yaml',
     'weekly-stryker.yaml',
 ]
 SCHEDULED = ('weekly-*.yaml', 'mutation-*-repo.yaml')
@@ -103,11 +93,6 @@ class TokenScope(unittest.TestCase):
                 workflow = load(name)
                 self.assertFalse(references_secret(workflow.get('env', {})))
                 self.assertFalse(references_secret(workflow['jobs'][job_name]))
-
-    def test_the_perf_workflows_a_weekly_entry_calls_reference_no_secret(self):
-        for name in PERF_WORKFLOWS:
-            with self.subTest(name):
-                self.assertFalse(references_secret(load(name)))
 
     def test_every_scheduled_job_referencing_a_secret_runs_no_target_code(self):
         found = set()
@@ -181,7 +166,7 @@ esac
 # $TREES/<repo>.noroot the root holds no module. Every clone holds 12000 bytes
 # of non-test Go, past the gremlins fanout's size floor. With $TREES/<repo>.nohead the
 # clone succeeds but leaves no resolvable HEAD, with $TREES/<repo>.noclone it
-# fails, and with $TREES/<repo>.perf it carries tests/perf/plan.json.
+# fails.
 FANOUT_GIT_STUB = """#!/usr/bin/env bash
 printf '%s\n' "$*" >>"$STUB_LOG"
 if [ "$1" = -C ]; then
@@ -194,7 +179,6 @@ r=$(basename "${@: -2:1}" .git)
 [ -f "$TREES/$r.noclone" ] && exit 128
 mkdir -p "$dest"
 [ -f "$TREES/$r.nohead" ] && : >"$dest/.nohead"
-if [ -f "$TREES/$r.perf" ]; then mkdir -p "$dest/tests/perf"; : >"$dest/tests/perf/plan.json"; fi
 head -c 12000 /dev/zero | tr '\0' ' ' >"$dest/big.go"
 if [ ! -f "$TREES/$r.noroot" ]; then
   printf 'module example.com/%s\n' "$r" >"$dest/go.mod"
@@ -240,7 +224,6 @@ class FanoutReplay:
         noroot: tuple[str, ...] = (),
         extra: tuple[str, ...] = (),
         noclone: tuple[str, ...] = (),
-        perf: tuple[str, ...] = (),
         rc: int = 0,
     ) -> dict:
         """Replays a fanout; `extra` adds public live repositories to the listing."""
@@ -267,8 +250,6 @@ class FanoutReplay:
             (trees / f'{repo}.noroot').write_text('')
         for repo in noclone:
             (trees / f'{repo}.noclone').write_text('')
-        for repo in perf:
-            (trees / f'{repo}.perf').write_text('')
         (tmp / 'cwd').mkdir()
         (tmp / 'cwd' / 'scripts').symlink_to(SCRIPTS)
         got, result, log = replay_job(
@@ -357,8 +338,6 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
             'weekly-gremlins.yaml',
             'weekly-fuzz.yaml',
             'weekly-bench.yaml',
-            'weekly-perf.yaml',
-            'weekly-perf-calibrate.yaml',
         ):
             for job, spec in load(name)['jobs'].items():
                 for s in spec.get('steps', []):
@@ -370,7 +349,7 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
                                 self.assertIn(
                                     'timeout 120 git', ' '.join(lines[max(0, i - 1) : i + 1])
                                 )
-        self.assertEqual(seen, 6)
+        self.assertEqual(seen, 4)
 
     def test_the_gremlins_fanout_runs_a_repo_it_cannot_clone_so_its_call_shows_it(self):
         outputs = self.fanout('weekly-gremlins.yaml', noclone=('zpub',))
@@ -470,52 +449,6 @@ class PublicOnly(FanoutReplay, unittest.TestCase):
                     noroot=('go',),
                 )
                 self.assertEqual([e['key'] for e in json.loads(outputs['matrix'])], keys)
-
-    def test_the_perf_fanout_emits_each_enrolled_repository_at_its_head(self):
-        outputs = self.fanout('weekly-perf.yaml', perf=('zpub',))
-        self.assertEqual(json.loads(outputs['matrix']), [{'repo': 'zpub', 'sha': SHA}])
-        self.assertEqual(outputs['unread'], '')
-        self.assertEqual(
-            sorted(self.clones), sorted(f'https://github.com/cplieger/{r}.git' for r in PUBLIC)
-        )
-
-    def test_the_calibration_fanout_emits_each_enrolled_repository(self):
-        outputs = self.fanout('weekly-perf-calibrate.yaml', perf=('zpub',))
-        self.assertEqual(json.loads(outputs['matrix']), [{'repo': 'zpub'}])
-        self.assertEqual(outputs['unread'], '')
-        jobs = load('weekly-perf-calibrate.yaml')['jobs']
-        self.assertEqual(jobs['calibrate']['if'], "${{ needs.fanout.outputs.matrix != '[]' }}")
-        self.assertEqual(jobs['unread']['if'], "${{ needs.fanout.outputs.unread != '' }}")
-        outputs = self.fanout('weekly-perf-calibrate.yaml', perf=('xmlx',), noclone=('zpub',))
-        self.assertEqual(json.loads(outputs['matrix']), [{'repo': 'xmlx'}])
-        self.assertEqual(outputs['unread'], 'zpub')
-
-    def test_the_perf_fanout_with_no_enrolled_repository_measures_nothing_and_passes(self):
-        outputs = self.fanout('weekly-perf.yaml')
-        self.assertEqual(json.loads(outputs['matrix']), [])
-        self.assertEqual(
-            load('weekly-perf.yaml')['jobs']['perf']['if'],
-            "${{ needs.fanout.outputs.matrix != '[]' }}",
-        )
-
-    def test_an_unreadable_repository_is_named_and_the_rest_still_measured(self):
-        for kind in ('noclone', 'nohead'):
-            with self.subTest(kind):
-                outputs = self.fanout('weekly-perf.yaml', perf=('xmlx',), **{kind: ('zpub',)})
-                self.assertEqual(json.loads(outputs['matrix']), [{'repo': 'xmlx', 'sha': SHA}])
-                self.assertEqual(outputs['unread'], 'zpub')
-        jobs = load('weekly-perf.yaml')['jobs']
-        self.assertEqual(jobs['unread']['if'], "${{ needs.fanout.outputs.unread != '' }}")
-        self.assertEqual(set(jobs['notify']['needs']), set(jobs) - {'notify'})
-
-    def test_the_perf_only_filter_must_name_an_enrolled_repository(self):
-        def dispatch(only: str) -> dict:
-            return {'event_name': 'workflow_dispatch', 'event': {'inputs': {'only': only}}}
-
-        outputs = self.fanout('weekly-perf.yaml', github=dispatch('zpub'), perf=('xmlx', 'zpub'))
-        self.assertEqual(json.loads(outputs['matrix']), [{'repo': 'zpub', 'sha': SHA}])
-        self.assertEqual(self.clones, ['https://github.com/cplieger/zpub.git'])
-        self.fanout('weekly-perf.yaml', github=dispatch('xmlx'), perf=('zpub',), rc=1)
 
 
 GIT_STUB = """#!/usr/bin/env bash
@@ -1263,88 +1196,6 @@ class BenchPublish(unittest.TestCase):
 
     def test_the_tracker_reads_the_branch_after_the_publish(self):
         self.assertIn('publish', load('weekly-bench.yaml')['jobs']['aggregate']['needs'])
-
-
-def perf_results(scenario: str, value: float) -> str:
-    cell = {
-        'scenario': scenario,
-        'scale': 'x10',
-        'engine': 'chromium',
-        'width': 'desktop',
-        'window': 'cold',
-        'metric': 'cpu_ms',
-        'reps': [value] * 3,
-    }
-    return json.dumps({'schema': 1, 'runner': 'ubuntu-26.04', 'cells': [cell]})
-
-
-class PerfPublish(unittest.TestCase):
-    ARGS = (
-        '--skip',
-        'Checkout ci (for the chart points and the attribution fix)',
-        '--skip',
-        "Download this entry's results",
-        '--stop-before',
-        'Ensure benchmarks branch exists',
-    )
-
-    def points(self, shards: dict[str, str]) -> tuple[int, dict, pathlib.Path]:
-        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
-        cwd = tmp / 'cwd'
-        (cwd / 'results').mkdir(parents=True)
-        (cwd / '_ci').symlink_to(SCRIPTS.parent)
-        for name, content in shards.items():
-            (cwd / 'results' / name).mkdir()
-            (cwd / 'results' / name / 'results.json').write_text(content)
-        matrix = {'repo': 'marotte', 'sha': SHA}
-        rc, result, _ = replay_job(tmp, 'weekly-perf.yaml', 'publish', list(self.ARGS), matrix)
-        return rc, result, cwd
-
-    def test_only_this_repository_s_shards_are_charted(self):
-        rc, result, cwd = self.points(
-            {
-                'perf-results-cplieger-marotte-measure-shard-1-of-2-attempt-1': (
-                    perf_results('files', 2.0)
-                ),
-                'perf-results-cplieger-marotte-measure-shard-x-measure-shard-1-of-1-attempt-1': (
-                    perf_results('docs', 9.0)
-                ),
-            }
-        )
-        self.assertEqual(rc, 0, result.get('failed'))
-        self.assertEqual(result['steps']['points']['outputs'].get('ok'), 'true')
-        points = json.loads((cwd / 'bench.json').read_text())
-        self.assertEqual(
-            points,
-            [{'name': 'files/x10/chromium/desktop/cold/cpu_ms', 'unit': 'cpu_ms', 'value': 2.0}],
-        )
-
-    def test_no_results_publish_nothing(self):
-        rc, result, _ = self.points({})
-        self.assertEqual(rc, 0, result.get('failed'))
-        self.assertEqual(result['steps']['points']['outputs'].get('ok', ''), '')
-
-    def test_only_another_repository_s_shards_publish_nothing(self):
-        rc, result, _ = self.points(
-            {
-                'perf-results-cplieger-marotte-measure-shard-x-measure-shard-1-of-1-attempt-1': (
-                    perf_results('docs', 9.0)
-                ),
-            }
-        )
-        self.assertEqual(rc, 0, result.get('failed'))
-        self.assertEqual(result['steps']['points']['outputs'].get('ok', ''), '')
-
-    def test_every_step_after_the_points_waits_for_them(self):
-        steps = load('weekly-perf.yaml')['jobs']['publish']['steps']
-        names = [s.get('name') for s in steps]
-        later = steps[names.index('Chart points') + 1 :]
-        self.assertEqual(len(later), 3)
-        for s in later:
-            with self.subTest(step=s.get('name')):
-                self.assertEqual(s.get('if'), "${{ steps.points.outputs.ok == 'true' }}")
-        download = steps[names.index("Download this entry's results")]['with']
-        self.assertEqual(download['pattern'], 'perf-results-cplieger-${{ matrix.repo }}-measure-*')
 
 
 # git for the per-module bench steps: a clone is a real repository holding the

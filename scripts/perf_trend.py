@@ -41,14 +41,14 @@ LABEL_DESCRIPTION = 'A performance regression the scheduled trend found'
 BASELINE_POINTS = 7
 HISTORY = 21
 # The pull request guard's baseline: the median of the last GUARD_POINTS dev points. Over
-# five ten-run calibrations a three-point median failed one pr-set cell's median of six in
+# five ten-run measurements a three-point median failed one pr-set cell's median of six in
 # 54,600 one-job samples and five points none; a deliberate change reaches it in three.
 # The trend judges a cell only once GUARD_POINTS points of its runner measured it: against
 # a three-point median one-run points would open 0.0165 false issues a point, five 0.0064.
 GUARD_POINTS = 5
 # Scenario group rule, family to the median ratio over a scenario's cells whose
 # baseline clears the family's guard floor. Over 900 one-run group samples of four
-# calibrations the worst median ratio was 1.294 for cpu_ms, 1.022 for heap_mb and
+# measurements the worst median ratio was 1.294 for cpu_ms, 1.022 for heap_mb and
 # 1.018 for rss_mb; no scenario has three server routes over the 10 ms floor.
 GROUP = {'cpu_ms': 1.3, 'heap_mb': 1.1, 'rss_mb': 1.1}
 GROUP_CELLS = 3
