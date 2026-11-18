@@ -750,6 +750,7 @@ class Locate(unittest.TestCase):
                 'langtag has no completed community-data-refresh.yaml run on dev',
             ),
             ('no commit', [a_run(head_sha='HEAD')], 'names no run id and commit'),
+            ('a commit and a newline', [a_run(head_sha=f'{BASE}\n')], 'names no run id and commit'),
             ('no id', [a_run(run_id='41')], 'names no run id and commit'),
         ):
             with self.subTest(name), self.assertRaisesRegex(cdr.RefusedError, want):
@@ -1707,8 +1708,7 @@ class WorkflowShape(unittest.TestCase):
     on schedule or by hand, no job checks out or runs a refreshed repository's
     code, the read token can only read its runs and issues, and the write token
     is minted only for a checked change and reaches only the issue and propose
-    steps. Changing any
-    key or step changes TOP or JOBS."""
+    steps. Changing any key or step changes TOP or JOBS."""
 
     def unpinned(self, job):
         """`job` with each action's commit SHA replaced by `SHA`, after checking

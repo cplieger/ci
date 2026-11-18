@@ -10,14 +10,16 @@ of the repository; it reads that artifact as data, one subcommand per step:
     plan     the matrix of REPOS rows a run covers, from the dispatch input.
     locate   the repository's newest completed refresh run on its base branch,
              refusing one that failed: its run id and the commit it ran on.
-    check    validates a downloaded proposal and outputs whether it changes
-             anything.
+    check    validates a downloaded proposal, plans the writes that bring the
+             repository's community-data issues in step with its notices, and
+             outputs whether it changes files and whether it moves an issue.
+    issues   applies check's issue plan.
     propose  commits a proposal onto the commit its run ran on through the
              REST API and opens or updates the pull request from BRANCH,
              refusing when the base branch was rewritten or changed a
              proposed path since that commit.
 
-The proposal format is in docs/workflows.md. Stdlib only.
+The proposal format and the issue rules are in docs/workflows.md. Stdlib only.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import re
 import sys
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import quote
 
 import ghrest
 
@@ -85,12 +88,36 @@ NOTICES = 'notices.json'
 NOTICES_MAX = 50
 NOTICE_ID = re.compile(r'^[a-z0-9][a-z0-9-]*$')
 NOTICE_ID_MAX = 64
+NOTICE_KEYS = frozenset({'id', 'title', 'body', 'labels', 'upstream', 'from', 'to'})
+NOTICE_NEEDS = ('id', 'title', 'body', 'labels')
+# Text GitHub renders as a link, or that names one: a URL, a www. host
+# (autolinked), a markdown inline or reference link, an HTML link or image, and
+# an email address (autolinked). The job writes the only link, from the row.
+LINK = re.compile(
+    r'://|www\.|\]\(|^\s*\[[^\]]*\]:|<a\b|<img\b|href\s*=|mailto:|[\w.+-]+@[\w-]+\.\w',
+    re.IGNORECASE | re.MULTILINE,
+)
 # The label on every issue this job keeps; a notice adds its own from its row.
 ISSUE_LABEL = 'community-data'
 OPENS_MAX = 10
+# The issues check reads, newest update first: two pages of the listing.
 ISSUES_MAX = 200
-BULK_TITLE = ''
-LABEL_COLOR = ''
+ISSUES_PAGE = 100
+# An issue is this job's by its body's last line, so text a person quotes
+# above it cannot claim an id.
+MARKER = re.compile(r'<!-- community-data id=([a-z0-9][a-z0-9-]{0,63}) -->')
+BULK_MARKER = '<!-- community-data bulk -->'
+# issue_plan's key for the bulk issue; no notice id is empty.
+BULK = ''
+BULK_TITLE = 'Community data notices waiting for a later run'
+LABEL_COLOR = 'c5def5'
+# The fields each kind of issue action carries, exactly.
+ACTION_KEYS = {
+    'create': frozenset({'kind', 'title', 'body', 'labels'}),
+    'edit': frozenset({'kind', 'number', 'title', 'body', 'labels'}),
+    'reopen': frozenset({'kind', 'number', 'title', 'body', 'labels'}),
+    'close': frozenset({'kind', 'number'}),
+}
 
 
 class RefusedError(Exception):
@@ -106,16 +133,258 @@ class Notice(NamedTuple):
     labels: tuple[str, ...]
 
 
+def title_fault(title: str) -> str | None:
+    """Why `title` cannot title a pull request or an issue, None when it can."""
+    if not title.strip() or '\n' in title or '\r' in title:
+        return 'the title must be one non-empty line'
+    if len(title) > TITLE_MAX:
+        return f'the title is {len(title)} characters, over {TITLE_MAX}'
+    return None
+
+
+def marker(nid: str) -> str:
+    return f'<!-- community-data id={nid} -->'
+
+
+def read_notice(i: int, entry, row: dict) -> Notice:
+    """Entry `i` of a NOTICES file, validated against `row`, with the issue
+    body this job writes: the notice's body, the compare link from the row's
+    own upstream when it names one with `from` and `to`, and the marker."""
+    if not isinstance(entry, dict):
+        raise RefusedError(f'notice {i} is not an object')
+    unknown = sorted(set(entry) - NOTICE_KEYS)
+    if unknown:
+        raise RefusedError(f'notice {i} holds unknown keys: {", ".join(unknown)}')
+    missing = [k for k in NOTICE_NEEDS if k not in entry]
+    if missing:
+        raise RefusedError(f'notice {i} lacks {", ".join(missing)}')
+    nid = entry['id']
+    if not isinstance(nid, str) or len(nid) > NOTICE_ID_MAX or not NOTICE_ID.fullmatch(nid):
+        raise RefusedError(f'notice {i}: {nid!r} is not a notice id')
+    where = f'notice {nid!r}'
+    labels = entry['labels']
+    if not isinstance(labels, list) or not all(isinstance(n, str) for n in labels):
+        raise RefusedError(f'{where}: labels is not a list of labels')
+    allowed = row['labels']
+    for label in labels:
+        if label not in allowed:
+            raise RefusedError(f'{where}: label {label!r} is not one of {", ".join(allowed)}')
+    if len(set(labels)) != len(labels):
+        raise RefusedError(f'{where}: names a label twice')
+    upstreams = row.get('upstreams', {})
+    upstream = entry.get('upstream')
+    if 'upstream' in entry and (not isinstance(upstream, str) or upstream not in upstreams):
+        raise RefusedError(f'{where}: upstream {upstream!r} is not one of {", ".join(upstreams)}')
+    link = ''
+    commits = [entry[k] for k in ('from', 'to') if k in entry]
+    if commits:
+        if upstream is None:
+            raise RefusedError(f'{where}: from and to need an upstream')
+        if len(commits) != 2 or not all(isinstance(c, str) and SHA.fullmatch(c) for c in commits):
+            raise RefusedError(f'{where}: from and to are two 40-hex commits')
+        link = f'Upstream change: {upstreams[upstream]}/compare/{commits[0]}...{commits[1]}'
+    title, body = entry['title'], entry['body']
+    for field, text in (('title', title), ('body', body)):
+        if not isinstance(text, str):
+            raise RefusedError(f'{where}: the {field} is not text')
+    fault = title_fault(title)
+    if fault:
+        raise RefusedError(f'{where}: {fault}')
+    for field, text in (('title', title), ('body', body)):
+        if LINK.search(text):
+            raise RefusedError(f'{where}: the {field} holds a link')
+    written = '\n\n'.join(b for b in (body.rstrip(), link, marker(nid)) if b) + '\n'
+    if len(written) > BODY_MAX:
+        raise RefusedError(f'{where}: the body is {len(written)} characters, over {BODY_MAX}')
+    return Notice(nid, title, written, tuple(labels))
+
+
+def read_notices(root: Path, row: dict) -> list[Notice] | None:
+    """The notices of the proposal at `root`, None for a row that declares no
+    labels. A row that declares labels carries NOTICES in every proposal (an
+    empty list reports nothing); a row that declares none carries none."""
+    path = root / NOTICES
+    present = os.path.lexists(path)
+    if 'labels' not in row:
+        if present:
+            raise RefusedError(f'{NOTICES} is present, but this row declares no labels')
+        return None
+    if not present:
+        raise RefusedError(f'{NOTICES} is missing, and this row declares labels')
+    if path.is_symlink() or not path.is_file():
+        raise RefusedError(f'{NOTICES} is not a regular file')
+    size = path.stat().st_size
+    if size > FILES_MAX:
+        raise RefusedError(f'{NOTICES} is {size} bytes, over {FILES_MAX}')
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError) as err:
+        raise RefusedError(f'{NOTICES} is unreadable: {err}') from None
+    if not isinstance(doc, list):
+        raise RefusedError(f'{NOTICES} holds no list of notices')
+    if len(doc) > NOTICES_MAX:
+        raise RefusedError(f'{NOTICES} holds {len(doc)} notices, over {NOTICES_MAX}')
+    notices, seen = [], set()
+    for i, entry in enumerate(doc):
+        n = read_notice(i, entry, row)
+        if n.id in seen:
+            raise RefusedError(f'notice {n.id!r} is listed twice')
+        seen.add(n.id)
+        notices.append(n)
+    return notices
+
+
 def read_issues(gh: ghrest.Client, repo: str) -> list[dict]:
-    raise NotImplementedError
+    """`repo`'s ISSUE_LABEL issues, open and closed, at most ISSUES_MAX by
+    newest update; the pull requests the listing also answers are dropped."""
+    path = (
+        f'repos/{OWNER}/{repo}/issues?labels={ISSUE_LABEL}&state=all'
+        f'&sort=updated&direction=desc&per_page={ISSUES_PAGE}'
+    )
+    issues = []
+    for page in range(1, ISSUES_MAX // ISSUES_PAGE + 1):
+        batch = gh.get(f'{path}&page={page}')
+        if not isinstance(batch, list) or not all(
+            isinstance(i, dict) and type(i.get('number')) is int for i in batch
+        ):
+            raise RefusedError(f'GET {path}&page={page} answered no list of issues')
+        issues += [i for i in batch if 'pull_request' not in i]
+        if len(batch) < ISSUES_PAGE:
+            break
+    return issues
+
+
+def issue_key(issue: dict) -> str | None:
+    """The notice id on the last line of `issue`'s body, BULK for the bulk
+    issue, None for an issue this job did not write."""
+    body = issue.get('body')
+    if not isinstance(body, str):
+        return None
+    last = body.rstrip().rpartition('\n')[2]
+    if last == BULK_MARKER:
+        return BULK
+    found = MARKER.fullmatch(last)
+    return found[1] if found else None
+
+
+def is_open(issue: dict) -> bool:
+    return issue.get('state') == 'open'
+
+
+def written(kind: str, title: str, body: str, labels, issue: dict | None, managed) -> dict | None:
+    """The `kind` action writing `title`, `body` and `labels` to `issue` (None
+    to create one), or None for an edit of an issue already in step. The
+    labels a person added outside `managed` are kept."""
+    theirs = [n['name'] for n in issue.get('labels', ()) if isinstance(n, dict)] if issue else []
+    want = [ISSUE_LABEL, *labels, *(n for n in theirs if n not in managed)]
+    if kind == 'edit':
+        now = (issue.get('title'), issue.get('body'), set(theirs))
+        if now == (title, body, set(want)):
+            return None
+    action = {'kind': kind, 'title': title, 'body': body, 'labels': want}
+    if issue:
+        action['number'] = issue['number']
+    return action
+
+
+def bulk_body(titles: list[str]) -> str:
+    listing = ''.join(f'- {t}\n' for t in titles)
+    return (
+        f'This run opened {OPENS_MAX} issues, the most one run opens. These notices'
+        f' wait for a later run:\n\n{listing}\n{BULK_MARKER}\n'
+    )
 
 
 def issue_plan(notices: list[Notice], issues: list[dict], managed) -> list[dict]:
-    raise NotImplementedError
+    """The writes that bring a repository's `issues` in step with `notices`:
+    one issue per notice id, created, reopened or edited in notice order, at
+    most OPENS_MAX created or reopened with the rest listed in one bulk issue,
+    then every open issue no notice lists closed. Of several issues with one
+    id, an open one outranks a closed one, then the higher number, and the
+    other open ones are closed. `managed` is the row's labels, which an edit
+    replaces."""
+    managed = {ISSUE_LABEL, *managed}
+    kept, closes = {}, []
+    for issue in sorted(issues, key=lambda i: (is_open(i), i['number']), reverse=True):
+        key = issue_key(issue)
+        if key is None:
+            continue
+        if key in kept:
+            if is_open(issue):
+                closes.append(issue['number'])
+            continue
+        kept[key] = issue
+    actions, deferred, opens = [], [], 0
+    for n in notices:
+        issue = kept.get(n.id)
+        if issue and is_open(issue):
+            action = written('edit', n.title, n.body, n.labels, issue, managed)
+        elif opens == OPENS_MAX:
+            deferred.append(n.title)
+            continue
+        else:
+            opens += 1
+            action = written(
+                'reopen' if issue else 'create', n.title, n.body, n.labels, issue, managed
+            )
+        if action:
+            actions.append(action)
+    bulk = kept.pop(BULK, None)
+    if deferred:
+        kind = 'create' if bulk is None else 'edit' if is_open(bulk) else 'reopen'
+        action = written(kind, BULK_TITLE, bulk_body(deferred), (), bulk, managed)
+        if action:
+            actions.append(action)
+    elif bulk and is_open(bulk):
+        closes.append(bulk['number'])
+    listed = {n.id for n in notices}
+    closes += [i['number'] for k, i in kept.items() if k not in listed and is_open(i)]
+    return actions + [{'kind': 'close', 'number': n} for n in sorted(closes)]
+
+
+def well_formed(action) -> bool:
+    if not isinstance(action, dict) or not isinstance(action.get('kind'), str):
+        return False
+    if ACTION_KEYS.get(action['kind']) != set(action):
+        return False
+    number = action.get('number', 1)
+    labels = action.get('labels', [])
+    return (
+        type(number) is int
+        and number > 0
+        and all(isinstance(action.get(k, ''), str) for k in ('title', 'body'))
+        and isinstance(labels, list)
+        and all(isinstance(n, str) for n in labels)
+    )
 
 
 def apply_issues(gh: ghrest.Client, repo: str, actions: list[dict]) -> list[str]:
-    raise NotImplementedError
+    """Write `actions`, an issue plan, to `repo`, creating each label it names
+    that `repo` lacks first; one line per action, '<verb> <issue url>'. A plan
+    holding any malformed action writes nothing."""
+    for action in actions:
+        if not well_formed(action):
+            raise RefusedError(f'{action!r} is not an issue action')
+    api = f'repos/{OWNER}/{repo}'
+    for name in dict.fromkeys(n for a in actions for n in a.get('labels', ())):
+        if gh.get_or_none(f'{api}/labels/{quote(name, safe="")}') is None:
+            gh.send('POST', f'{api}/labels', {'name': name, 'color': LABEL_COLOR})
+    said = []
+    for a in actions:
+        text = {k: a[k] for k in ('title', 'body', 'labels') if k in a}
+        match a['kind']:
+            case 'create':
+                verb, done = 'opened', gh.send('POST', f'{api}/issues', text)
+            case 'edit':
+                verb, done = 'edited', gh.send('PATCH', f'{api}/issues/{a["number"]}', text)
+            case 'reopen':
+                body = {'state': 'open', **text}
+                verb, done = 'reopened', gh.send('PATCH', f'{api}/issues/{a["number"]}', body)
+            case _:
+                body = {'state': 'closed', 'state_reason': 'completed'}
+                verb, done = 'closed', gh.send('PATCH', f'{api}/issues/{a["number"]}', body)
+        said.append(f'{verb} {done["html_url"]}')
+    return said
 
 
 def write_outputs(values: dict[str, str]) -> None:
@@ -179,7 +448,7 @@ def locate(gh: ghrest.Client, repo: str) -> Run:
                 f"{repo}'s newest refresh run {r.get('html_url')} concluded"
                 f' {r.get("conclusion")}, so it proposes nothing'
             )
-        if not isinstance(r.get('id'), int) or not SHA.match(str(r.get('head_sha'))):
+        if not isinstance(r.get('id'), int) or not SHA.fullmatch(str(r.get('head_sha'))):
             raise RefusedError(f'run {r.get("html_url")} names no run id and commit')
         return Run(r['id'], r['head_sha'], r['html_url'])
     raise RefusedError(f'{repo} has no completed {WORKFLOW} run on {branch}')
@@ -200,7 +469,6 @@ class Proposal:
     def __init__(self, root: Path, row: dict):
         self.root = root
         allowed = row['paths']
-        self.notices = None
         try:
             doc = json.loads((root / MANIFEST).read_text())
         except (OSError, ValueError) as err:
@@ -223,12 +491,12 @@ class Proposal:
         if changes:
             self.title = self._read('title').removesuffix('\n')
             self.body = self._read('body.md')
-            if not self.title.strip() or '\n' in self.title or '\r' in self.title:
-                raise RefusedError('the title must be one non-empty line')
-            if len(self.title) > TITLE_MAX:
-                raise RefusedError(f'the title is {len(self.title)} characters, over {TITLE_MAX}')
+            fault = title_fault(self.title)
+            if fault:
+                raise RefusedError(fault)
             if len(self.body) > BODY_MAX:
                 raise RefusedError(f'the body is {len(self.body)} characters, over {BODY_MAX}')
+        self.notices = read_notices(root, row)
 
     def _files(self) -> set[str]:
         """The path of every file under FILES, refusing anything but regular
@@ -261,8 +529,18 @@ class Proposal:
 
 
 def cmd_check(a) -> int:
-    p = Proposal(Path(a.proposal), listed(a.repo))
-    write_outputs({'changed': 'true' if p.changes else 'false'})
+    row = listed(a.repo)
+    p = Proposal(Path(a.proposal), row)
+    actions = []
+    if p.notices is not None:
+        actions = issue_plan(p.notices, read_issues(ghrest.DEFAULT, a.repo), row['labels'])
+    Path(a.plan).write_text(json.dumps(actions, indent=2) + '\n')
+    write_outputs(
+        {
+            'changed': 'true' if p.changes else 'false',
+            'notices_changed': 'true' if actions else 'false',
+        }
+    )
     return 0
 
 
@@ -398,7 +676,16 @@ def cmd_propose(a) -> int:
 
 
 def cmd_issues(a) -> int:
-    raise NotImplementedError
+    listed(a.repo)
+    try:
+        actions = json.loads(Path(a.plan).read_text())
+    except (OSError, ValueError) as err:
+        raise RefusedError(f'the issue plan {a.plan} is unreadable: {err}') from None
+    if not isinstance(actions, list):
+        raise RefusedError(f'the issue plan {a.plan} holds no list of actions')
+    for line in apply_issues(ghrest.DEFAULT, a.repo, actions):
+        print(line)
+    return 0
 
 
 def parse_args(argv: list[str] | None = None):
@@ -412,7 +699,7 @@ def parse_args(argv: list[str] | None = None):
     s = sub.add_parser('locate', help="output the newest refresh run's id and commit")
     s.add_argument('--repo', required=True)
     s.set_defaults(func=cmd_locate)
-    s = sub.add_parser('check', help='validate a proposal and output changed')
+    s = sub.add_parser('check', help='validate a proposal, plan its issues and output what moves')
     s.add_argument('--repo', required=True)
     s.add_argument('--proposal', required=True)
     s.add_argument('--plan', required=True, help='the file the issue plan is written to')
