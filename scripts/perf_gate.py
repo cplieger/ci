@@ -389,9 +389,9 @@ def guard(
     baselines: dict[tuple, float],
     runner: str,
     results: dict,
-    units: dict | None = None,
+    units: dict,
     *,
-    windows: dict[str, set[str]] | None = None,
+    windows: dict[str, set[str]],
 ) -> Outcome:
     """Judge each measured timing cell's median of three against its base baseline: one
     over the guard is listed in `remeasure`, never failed here. Counts and reports are
@@ -420,31 +420,29 @@ def guard(
         out.rows.append({'cell': c, 'baseline': baseline, 'value': value, 'status': status})
     if out.runner_mismatch:
         return out
-    if units:
-        measured = {key(c) for c in results.get('cells', [])}
-        missed = [
-            k
-            for k in sorted(baselines)
-            if family(k[5]) in GUARD and planned(units, key_dict(k)) and k not in measured
-        ]
-        for k in missed:
-            dropped = windows is not None and k[0] in windows and k[4] not in windows[k[0]]
-            # A server cell exists only when its window requested the route, so a missing one
-            # is a change in what the page requests, not a cell the harness lost.
-            if family(k[5]) == SERVER_CPU:
-                out.notices.append(
-                    f'{key_text(k)}: the base has a baseline for this route, and no shard '
-                    'measured it'
-                )
-            elif dropped:
-                out.notices.append(
-                    f'{key_text(k)}: the base has a baseline for it, and the head plan.json no '
-                    f'longer measures window {k[4]}'
-                )
-            else:
-                out.failures.append(
-                    f'{key_text(k)}: the base has a baseline for it, and no shard measured it'
-                )
+    measured = {key(c) for c in results.get('cells', [])}
+    missed = [
+        k
+        for k in sorted(baselines)
+        if family(k[5]) in GUARD and planned(units, key_dict(k)) and k not in measured
+    ]
+    for k in missed:
+        dropped = k[0] in windows and k[4] not in windows[k[0]]
+        # A server cell exists only when its window requested the route, so a missing one
+        # is a change in what the page requests, not a cell the harness lost.
+        if family(k[5]) == SERVER_CPU:
+            out.notices.append(
+                f'{key_text(k)}: the base has a baseline for this route, and no shard measured it'
+            )
+        elif dropped:
+            out.notices.append(
+                f'{key_text(k)}: the base has a baseline for it, and the head plan.json no '
+                f'longer measures window {k[4]}'
+            )
+        else:
+            out.failures.append(
+                f'{key_text(k)}: the base has a baseline for it, and no shard measured it'
+            )
     if not guarded:
         out.failures.append(
             'nothing to guard: the base has a baseline for none of the timing cells this run '

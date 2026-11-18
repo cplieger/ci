@@ -266,7 +266,7 @@ def guarded(entries, cells, runner=RUNNER, units=None, windows=None):
     """guard() of cells, measured on runner, against the base file of entries."""
     base_runner, baselines = perf_gate.baselines_from_budgets(base_file(entries))
     return perf_gate.guard(
-        baselines, base_runner, results(cells, runner=runner), units, windows=windows
+        baselines, base_runner, results(cells, runner=runner), units or {}, windows=windows or {}
     )
 
 
@@ -303,9 +303,11 @@ class Guard(unittest.TestCase):
         for metric, baseline, value, red in (
             ('cpu_ms', 9.0, 18.0, False),
             ('cpu_ms', 9.0, 200.0, False),
+            ('cpu_ms', 9.0, 259.0, False),
             ('cpu_ms', 9.0, 260.0, True),
             ('server_cpu_ms:GET /api/chats', 6.0, 12.0, False),
             ('server_cpu_ms:GET /api/chats', 6.0, 15.5, False),
+            ('server_cpu_ms:GET /api/chats', 6.0, 16.0, False),
             ('server_cpu_ms:GET /api/chats', 22.0, 46.0, True),
             ('server_cpu_ms:GET /api/chats', 0.0, 9.0, False),
         ):
