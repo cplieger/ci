@@ -238,8 +238,10 @@ def issue_pages(gh: ghrest.Client, path: str, pages: int) -> tuple[list[dict], i
 def read_issues(gh: ghrest.Client, repo: str) -> list[dict]:
     """`repo`'s ISSUE_LABEL issues in at most ISSUES_MAX listed: every open
     one, then the closed ones newest update first in the pages left, which
-    only a reopen reads. Refused when the open ones fill ISSUES_MAX, since a
-    partial open set would plan a duplicate or miss a close."""
+    only a reopen reads. The bound counts the listing's items, labelled pull
+    requests included, which are then dropped. Refused when the open items
+    fill ISSUES_MAX, since a partial open set would plan a duplicate or miss
+    a close."""
     path = (
         f'repos/{OWNER}/{repo}/issues?labels={ISSUE_LABEL}&state={{}}'
         f'&sort=updated&direction=desc&per_page={ISSUES_PAGE}'
@@ -248,8 +250,8 @@ def read_issues(gh: ghrest.Client, repo: str) -> list[dict]:
     opened, used, ended = issue_pages(gh, path.format('open'), pages)
     if not ended:
         raise RefusedError(
-            f'{OWNER}/{repo} lists {ISSUES_MAX} or more open {ISSUE_LABEL} issues,'
-            f' the most this job reads'
+            f'{OWNER}/{repo} lists {ISSUES_MAX} or more open {ISSUE_LABEL} issues'
+            f' and pull requests, the most this job reads'
         )
     closed, _, _ = issue_pages(gh, path.format('closed'), pages - used)
     return opened + closed

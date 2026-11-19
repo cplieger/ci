@@ -1329,9 +1329,21 @@ class ReadIssues(unittest.TestCase):
         }
         with self.assertRaisesRegex(
             cdr.RefusedError,
-            'cplieger/subflux lists 200 or more open community-data issues, the most this job reads',
+            'cplieger/subflux lists 200 or more open community-data issues and pull requests,'
+            ' the most this job reads',
         ):
             self.read(routes)
+
+    def test_pull_requests_count_toward_the_read_and_are_dropped(self):
+        first = [
+            {**i, 'pull_request': {'url': 'x'}} if i['number'] % 2 else i for i in issue_page(1)
+        ]
+        routes = {
+            ('GET', f'{OPEN}&page=1'): first,
+            ('GET', f'{OPEN}&page=2'): issue_page(101, 99),
+            ('GET', f'{CLOSED}&page=1'): issue_page(300, state='closed'),
+        }
+        self.assertEqual(self.numbers(routes), [*range(2, 101, 2), *range(101, 200)])
 
     def test_a_page_that_is_no_issue_list_is_refused(self):
         for answer in ({'message': 'x'}, [{'number': '3'}], ['x']):
