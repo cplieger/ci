@@ -939,7 +939,8 @@ class Notices(unittest.TestCase):
 
 
 RENDERS_FILE = Path(__file__).resolve().parent / 'testdata/community-data/renders.json'
-# GitHub's answers to POST markdown (mode markdown), keyed by the text sent.
+# GitHub's answers to POST markdown (mode gfm, context cplieger/subflux), keyed by
+# the text sent.
 RENDERS = json.loads(RENDERS_FILE.read_text())
 RATE_LIMITED = 'x-ratelimit-remaining: 0\nx-ratelimit-reset: 1\n'
 
@@ -958,7 +959,7 @@ class RenderingGitHub(FakeGitHub):
             return super().__call__(args, stdin, timeout)
         sent = json.loads(stdin)
         self.rendered.append(sent['text'])
-        if sent != {'text': sent['text'], 'mode': 'markdown'}:
+        if sent != {'text': sent['text'], 'mode': 'gfm', 'context': 'cplieger/subflux'}:
             raise AssertionError(f'POST markdown sent {sent!r}')
         if self.fail:
             status, headers = self.fail
@@ -967,7 +968,7 @@ class RenderingGitHub(FakeGitHub):
         if sent['text'] not in RENDERS:
             raise AssertionError(
                 f'{RENDERS_FILE.name} holds no rendering of {sent["text"]!r}: add the HTML'
-                ' GitHub answers to POST markdown with mode markdown'
+                ' GitHub answers to POST markdown with mode gfm and context cplieger/subflux'
             )
         out = f'HTTP/2.0 200 R\n\r\n{RENDERS[sent["text"]]}'
         return subprocess.CompletedProcess(['gh'], 0, out.encode(), b'')
@@ -987,7 +988,7 @@ class Rendered(unittest.TestCase):
         fake = RenderingGitHub(fail=fail)
         gh = ghrest.Client(run=fake, sleep=lambda _: None)
         notices = notices_of(entries)
-        cdr.check_renders(gh, notices, list(actions))
+        cdr.check_renders(gh, 'subflux', notices, list(actions))
         return notices, fake
 
     def refused(self, entries, want, actions=()):
@@ -996,6 +997,11 @@ class Rendered(unittest.TestCase):
 
     def test_body_with_link_refused(self):
         for name, entry in (
+            ('issue reference', linked('See #12.')),
+            ('GH- reference', linked('See GH-12.')),
+            ('mention', linked('Thanks @cplieger.')),
+            ('cross-repository reference', linked('See Sonarr/Sonarr#7000.')),
+            ('commit reference', linked(f'See Sonarr/Sonarr@{"b" * 40}.')),
             ('inline link', linked('[click](https://evil.example/g)')),
             ('bare URL', linked('see https://evil.example/k')),
             ('www host', linked('see www.evil.example')),
@@ -1007,15 +1013,36 @@ class Rendered(unittest.TestCase):
                 'quote citing a URL',
                 linked('<blockquote cite="https://evil.example/q">x</blockquote>'),
             ),
-            ("a heading's permalink", linked('## Changes\n\nText.')),
-            ('a link with no upstream', a_notice(body='see https://evil.example/k')),
-            ('an empty link with no upstream', a_notice(body='<a href="">x</a>')),
         ):
             with self.subTest(name):
                 self.refused(
                     [entry],
                     "notice 'sonarr-parser': GitHub renders its body with a link or an image"
                     ' other than the compare link',
+                )
+        for name, body in (
+            ('a link with no upstream', 'see https://evil.example/k'),
+            ('an empty link with no upstream', '<a href="">x</a>'),
+        ):
+            with self.subTest(name):
+                self.refused(
+                    [a_notice(body=body)],
+                    "^notice 'sonarr-parser': GitHub renders its body with a link or an image$",
+                )
+
+    def test_math_and_diagrams_refused(self):
+        for name, body in (
+            ('inline math with a link command', '$\\href{//evil.example/t}{x}$'),
+            ('inline math in ticks', 'Math $`x`$ here.'),
+            ('math fence', '```math\nx^2\n```'),
+            ('mermaid fence', '```mermaid\ngraph TD; A-->B\n```'),
+            ('geojson fence', '```geojson\n{"type": "Point", "coordinates": [0, 0]}\n```'),
+        ):
+            with self.subTest(name):
+                self.refused(
+                    [linked(body)],
+                    "^notice 'sonarr-parser': GitHub renders its body with math or a diagram,"
+                    ' which the page builds in the browser$',
                 )
 
     def test_markdown_read_another_way_is_judged_by_githubs_rendering(self):
@@ -1036,7 +1063,9 @@ class Rendered(unittest.TestCase):
             ('span over lines', linked('a `span\nover https://example.com\nlines` here')),
             ('fence in a quote', linked('> ```\n> https://example.com\n> ```')),
             ('version text', linked('Bump eslint@9.0.')),
-            ('references', linked(f'See #12, @cplieger, cplieger/subflux#3 and {FROM}.')),
+            ('references in a span', linked('See `#12, @cplieger, Sonarr/Sonarr#7000`.')),
+            ('references in a fence', linked('```\n#12 @cplieger GH-12\n```')),
+            ('a heading', linked('## Changes\n\nText.')),
             ('no upstream', a_notice()),
         ):
             with self.subTest(name):
@@ -1429,6 +1458,9 @@ with open(os.environ['FAKE_GH_LOG'], 'a') as fh:
     fh.write(json.dumps([method, path, body]) + '\n')
 routes = json.loads(open(os.environ['FAKE_GH_ROUTES']).read())
 if path == 'markdown':
+    if body != {'text': body['text'], 'mode': 'gfm', 'context': os.environ['FAKE_GH_CONTEXT']}:
+        sys.stdout.write('HTTP/2.0 422 R\n\r\n{"message": "unexpected render request"}')
+        sys.exit(1)
     renders = json.loads(open(os.environ['FAKE_GH_RENDERS']).read())
     sys.stdout.write('HTTP/2.0 200 R\n\r\n' + renders[body['text']])
     sys.exit(0)
@@ -1528,6 +1560,7 @@ class WorkflowRun(unittest.TestCase):
                 'FAKE_GH_ROUTES': str(tmp / 'routes.json'),
                 'FAKE_PROPOSAL': str(tmp / 'proposal'),
                 'FAKE_GH_RENDERS': str(RENDERS_FILE),
+                'FAKE_GH_CONTEXT': f'cplieger/{repo}',
             }
             argv = ['--workflow', str(tmp / 'wf.yaml'), '--job', 'propose']
             argv += ['--context', str(tmp / 'ctx.json'), '--cwd', str(cwd)]

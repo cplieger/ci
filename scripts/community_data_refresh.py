@@ -381,7 +381,7 @@ class Rendering(HTMLParser):
         self.text.append(data)
 
 
-def check_renders(gh: ghrest.Client, notices: list[Notice], actions: list[dict]) -> None:
+def check_renders(gh: ghrest.Client, repo: str, notices: list[Notice], actions: list[dict]) -> None:
     """Refuses unless GitHub renders each of `notices`' issue bodies, and the
     bulk issue's body when `actions` write it, with no URL but the notice's
     compare link and with its marker hidden. A failed render refuses too: the
@@ -582,7 +582,7 @@ def cmd_check(a) -> int:
     actions = []
     if p.notices is not None:
         actions = issue_plan(p.notices, read_issues(ghrest.DEFAULT, a.repo), row['labels'])
-        check_renders(ghrest.DEFAULT, p.notices, actions)
+        check_renders(ghrest.DEFAULT, a.repo, p.notices, actions)
     Path(a.plan).write_text(json.dumps(actions, indent=2) + '\n')
     write_outputs(
         {
