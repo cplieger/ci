@@ -22,6 +22,7 @@ import intake
 import mutation_cost
 import runner_images
 import workflow_commands as wc
+import yaml
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
 ACTIONS = SCRIPTS.parent / 'actions'
@@ -72,6 +73,153 @@ def shell_command_lines(text: str) -> list[int]:
         for n, line in enumerate(text.splitlines(), 1)
         if not line.lstrip().startswith('#') and SHELL_RAW.search(line)
     ]
+
+
+# An env value a workflow input or the triggering event fills, which whoever starts the run writes.
+OUTSIDE = re.compile(r'\$\{\{[^}]*\b(?:inputs|github\.event)\.')
+ASSIGNED = re.compile(
+    r'(?:^|[\s;&|(])(?:(?:local|export|readonly|declare)\s+(?:-\w+\s+)*)?([A-Za-z_]\w*)\+?='
+    r'|\bfor\s+([A-Za-z_]\w*)\s+in\b|\bread\s+(?:-\w+\s+)*((?:[A-Za-z_]\w*\s*)+)'
+)
+EXPANDED = re.compile(r'\$\{?[#!]?([A-Za-z_]\w*)')
+# Before a command word: a keyword, a group opener or a case pattern.
+LEAD = re.compile(r'(?:(?:if|then|do|else|elif|while|until|!|\{|\()\s+|[^\s()]+\)\s+)*')
+TO_FILE = re.compile(r'(?:^|[\s;])(?:1|&)?>{1,2}(?!&)')
+
+
+def top_level(line: str) -> tuple[str, list[str]]:
+    """LINE with each `$(...)`'s text and any comment blanked, and the commands it
+    holds split at `;`, `&&` and `||` outside quotes; a command piped on keeps its `|`."""
+    out, quote, depth, i = [], '', 0, 0
+    while i < len(line):
+        c = line[i]
+        if depth:
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+            out.append(' ' if depth else ')')
+        elif quote == "'":
+            out.append(c)
+            quote = '' if c == "'" else quote
+        elif c == '$' and line[i + 1 : i + 2] == '(':
+            out.append('$(')
+            depth, i = 1, i + 1
+        elif c == '\\':
+            out.append(line[i : i + 2])
+            i += 1
+        elif c in '"\'' and quote in ('', c):
+            quote = '' if quote else c
+            out.append(c)
+        elif not quote and c == '#' and (not out or out[-1].isspace()):
+            break
+        else:
+            out.append(c)
+        i += 1
+    flat = ''.join(out)
+    commands, quote, start, i = [], '', 0, 0
+    while i < len(flat):
+        c, pair = flat[i], flat[i : i + 2]
+        if c in '"\'' and quote in ('', c):
+            quote = '' if quote else c
+        elif not quote and (pair in ('&&', '||') or c == ';'):
+            commands.append(flat[start:i])
+            i += len(pair) if pair in ('&&', '||') else 1
+            start = i
+            continue
+        elif not quote and c == '|':
+            commands.append(flat[start : i + 1])
+            start = i + 1
+        i += 1
+    commands.append(flat[start:])
+    return flat, commands
+
+
+def logs_data(command: str, outside: set[str]) -> bool:
+    """Whether COMMAND is an echo or printf to the log that expands an OUTSIDE variable."""
+    words = command[LEAD.match(command.lstrip()).end() :].lstrip()
+    if not re.match(r'(?:echo|printf)\b', words):
+        return False
+    bare = re.sub(r"\"[^\"]*\"|'[^']*'", lambda m: m[0] if m[0][0] == '"' else '', words)
+    return (
+        not bare.rstrip().endswith('|')
+        and not TO_FILE.search(bare)
+        and bool(set(EXPANDED.findall(bare)) & outside)
+    )
+
+
+def captured_block(lines: list[str], n: int) -> bool:
+    """Whether a block around LINES[N] sends its output to a file, a pipe or a capture."""
+    level = len(lines[n]) - len(lines[n].lstrip())
+    for later in lines[n + 1 :]:
+        indent = len(later) - len(later.lstrip())
+        if not later.strip() or indent >= level:
+            continue
+        level, closer = indent, later.strip()
+        head = re.split(r'\|\||&&|;', top_level(closer)[0])[0]
+        if re.match(r'(?:\}|done\b|\))', closer) and (TO_FILE.search(head) or '|' in head):
+            return True
+        if closer.startswith(')'):
+            opener = next(
+                (x for x in reversed(lines[:n]) if len(x) - len(x.lstrip()) == indent), ''
+            )
+            if opener.rstrip().endswith('$('):
+                return True
+    return False
+
+
+def run_step_data_lines(text: str) -> list[int]:
+    """Lines of TEXT, a workflow or an action, where a run step echoes or printfs to the log a
+    variable its env fills from a workflow input or the triggering event, or one set from such
+    a variable."""
+    doc = yaml.safe_load(text) or {}
+    rows = [line.strip() for line in text.splitlines()]
+    found = []
+
+    def steps():
+        for job in (doc.get('jobs') or {}).values():
+            for step in job.get('steps') or []:
+                yield {**(doc.get('env') or {}), **(job.get('env') or {})}, step
+        for step in (doc.get('runs') or {}).get('steps') or []:
+            yield {}, step
+
+    for env, step in steps():
+        run = step.get('run')
+        if not isinstance(run, str):
+            continue
+        env = {**env, **(step.get('env') or {})}
+        outside = {k for k, v in env.items() if OUTSIDE.search(str(v))}
+        lines = run.splitlines()
+        grew = True
+        while grew:
+            grew = False
+            for line in lines:
+                if set(EXPANDED.findall(line)) & outside:
+                    named = {
+                        n
+                        for m in ASSIGNED.finditer(line)
+                        for g in m.groups()
+                        if g
+                        for n in g.split()
+                    }
+                    for name in named:
+                        if name not in outside:
+                            outside.add(name)
+                            grew = True
+        at, n = 0, 0
+        while n < len(lines):
+            first, line = n, lines[n]
+            while line.endswith('\\') and n + 1 < len(lines):
+                n += 1
+                line = line[:-1] + ' ' + lines[n].strip()
+            n += 1
+            if any(logs_data(c, outside) for c in top_level(line)[1]) and not captured_block(
+                lines, first
+            ):
+                head = lines[first].strip()
+                at = rows.index(head, at) if head in rows[at:] else at
+                found.append(at + 1)
+    return sorted(set(found))
 
 
 def bash(snippet: str, *args: str) -> subprocess.CompletedProcess:
@@ -761,6 +909,78 @@ class NoRawCommands(unittest.TestCase):
         }
         self.assertEqual(found, {}, 'write these through gha-log.sh gha_annotate')
         self.assertGreater(len(files), 40)
+
+    def test_no_run_step_logs_outside_data_outside_the_helper(self):
+        root = SCRIPTS.parent
+        files = sorted(
+            [*root.glob('.github/workflows/*.y*ml'), *root.glob('actions/*/action.y*ml')]
+        )
+        found = {
+            str(p.relative_to(root)): lines
+            for p in files
+            if (lines := run_step_data_lines(p.read_text()))
+        }
+        self.assertEqual(found, {}, 'write these through gha-log.sh gha_say')
+        self.assertGreater(len(files), 40)
+
+    def test_the_run_step_check_sees_outside_data_logged(self):
+        workflow = """\
+env:
+  RUN_NAME: ${{ github.event.inputs.name }}
+jobs:
+  j:
+    env:
+      ONLY: ${{ github.event.inputs.only }}
+    steps:
+      - env:
+          SCOPE: ${{ inputs.scope }}
+          FIXED: ci
+        run: |
+          context=$(printf '%s run' "$SCOPE")
+          echo "green, ${context}; left as-is"  # reported
+          echo "red, ${context}; nothing is filed"  # reported
+          printf 'only %s\\n' "$ONLY" >&2  # reported
+          [ -n "$ONLY" ] && echo "only: $ONLY"  # reported
+          case "$SCOPE" in a | b) echo "scope $SCOPE" ;; esac  # reported
+          echo "name -> $RUN_NAME"  # reported
+          echo "$ONLY" \\
+            "more"
+          echo "::endgroup::"
+          echo "fixed $FIXED -> done"
+          echo 'literal $SCOPE'
+          echo "x=$SCOPE" >> "$GITHUB_OUTPUT"
+          {
+            echo "a=$SCOPE"
+          } >> "$GITHUB_OUTPUT"
+          v=$(echo "$SCOPE" | tr a b)
+          echo "$SCOPE" | jq -R .
+          gha_say '%s' "$SCOPE"
+          echo "n: $(jq -n --arg s "$SCOPE" '$s | length')"
+          x=$(
+            echo "$SCOPE"
+          )
+          # echo "$SCOPE"
+      - run: echo "$SCOPE"
+"""
+        action = """\
+runs:
+  steps:
+    - env:
+        PATHS: ${{ inputs.paths }}
+      run: |
+        for p in $PATHS; do
+          echo "  include: ${p}"  # reported
+        done
+        for p in $PATHS; do
+          echo "$p"
+        done > list.txt
+"""
+        for text in (workflow, action):
+            rows = text.splitlines()
+            want = [n for n, line in enumerate(rows, 1) if line.endswith('# reported')]
+            want += [n for n, line in enumerate(rows, 1) if line.endswith('"$ONLY" \\')]
+            with self.subTest(text.split(':')[0]):
+                self.assertEqual(run_step_data_lines(text), sorted(want))
 
     def test_the_shell_check_sees_each_raw_form(self):
         for source, want in (
