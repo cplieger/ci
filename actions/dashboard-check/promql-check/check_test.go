@@ -94,7 +94,7 @@ func TestQueries(t *testing.T) {
 		{name: "variable_query_result", kind: "variable", expr: `query_result(up{instance=~".+"})`, want: "Q2"},
 		{name: "variable_query_result_window", kind: "variable", expr: `query_result(sum(rate(x_total{instance="$instance"}[$__interval])))`, want: "Q1"},
 		{name: "label_values_filter", kind: "variable", expr: `label_values(up{instance=~".+"}, version)`, want: "Q2"},
-		{name: "label_values_job", kind: "variable", variable: "instance", expr: `label_values(up{job="x"}, instance)`, want: "Q3"},
+		{name: "label_values_job", kind: "variable", variable: "instance", expr: `label_values(up{job="x"}, instance)`, want: "Q2,Q3"},
 		{name: "series_selector", kind: "variable", expr: `up{instance=~".+"}`, want: "Q2"},
 		{name: "label_values_bare_label", kind: "variable", expr: `label_values(instance)`, want: ""},
 		{name: "label_values_empty_filter", kind: "variable", expr: `label_values({}, instance)`, want: ""},
@@ -906,4 +906,45 @@ func TestRefusedDuration(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The instance picker lists every instance only as label_values(<metric>, instance) with the
+// metric name alone; any matcher, another label, no metric or another form can hide one.
+func TestInstancePicker(t *testing.T) {
+	for _, c := range []struct{ name, expr, want, says string }{
+		{"metric name only", `label_values(app_build_info, instance)`, "", ""},
+		{"spaced", ` label_values( app_build_info ,  instance ) `, "", ""},
+		{"braced name", `label_values({__name__="app_build_info"}, instance)`, "", ""},
+		{"matcher", `label_values(app_build_info{flag="OB"}, instance)`, "Q2", "holds more than the metric name"},
+		{"instance filter", `label_values(app_build_info{instance=~"a.*"}, instance)`, "Q2", "holds more than the metric name"},
+		{"name regex", `label_values({__name__=~"app_.*"}, instance)`, "Q2", "holds more than the metric name"},
+		{"no metric", `label_values(instance)`, "Q2", "names no metric"},
+		{"other label", `label_values(app_build_info, job)`, "Q2", `lists the "job" label`},
+		{"other form", `query_result(app_build_info)`, "Q2", "is not label_values"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := appQuery("variable", c.expr)
+			in.Queries[0].Variable = "instance"
+			r := run(t, in)
+			got := []string{}
+			for _, f := range r.Findings {
+				if f.Rule == "Q2" && strings.Contains(f.Message, "the instance variable can hide instances") {
+					got = append(got, f.Rule)
+					if !strings.Contains(f.Message, c.says) {
+						t.Errorf("message %q does not hold %q", f.Message, c.says)
+					}
+				}
+			}
+			if want := strings.Join(got, ","); want != c.want {
+				t.Errorf("picker findings = %v, want %q; all: %+v", got, c.want, r.Findings)
+			}
+		})
+	}
+	other := appQuery("variable", `label_values(app_build_info{instance="$instance", flag="OB"}, version)`)
+	other.Queries[0].Variable = "version"
+	assertRules(t, other, "")
+	notApp := appQuery("variable", `label_values(app_build_info{flag="OB"}, instance)`)
+	notApp.Queries[0].Variable = "instance"
+	notApp.App = false
+	assertRules(t, notApp, "")
 }
