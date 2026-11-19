@@ -19,6 +19,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
+import workflow_commands as wc
+
 OWNER = 'cplieger'
 COPYRIGHT_LINE = re.compile(rf'^Copyright [0-9]{{4}} {OWNER}$')
 SKIPPED_SEGMENTS = {'node_modules', 'vendor', 'testdata', 'fixtures', '.git'}
@@ -165,13 +168,13 @@ def main(argv: list[str]) -> int:
         summary = f'root NOTICE matches the template; {packages} published package root(s) checked'
         print(f'NOTICE audit: PASS — {summary}')
         if args.github:
-            print(f'::notice title=NOTICE audit::{summary}')
+            print(wc.command('notice', summary, title='NOTICE audit'))
         return 0
     print(f'NOTICE audit: FAIL — {len(findings)} finding(s):')
     for finding in findings:
         print(f'  {finding}')
         if args.github:
-            print(f'::error title=NOTICE audit::{finding}')
+            print(wc.command('error', finding, title='NOTICE audit'))
     return 1
 
 

@@ -5,9 +5,12 @@ from __future__ import annotations
 import ast
 import importlib.util
 import io
+import os
 import pathlib
 import re
 import subprocess
+import sys
+import tempfile
 import unittest
 import unittest.mock
 from contextlib import redirect_stderr, redirect_stdout
@@ -18,6 +21,7 @@ import runner_images
 import workflow_commands as wc
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
+ACTIONS = SCRIPTS.parent / 'actions'
 HOSTILE = '100%\r\n::add-mask::x'
 ESCAPED = '100%25%0D%0A::add-mask::x'
 OPENS_COMMAND = re.compile(r'::[a-z-]*(::| |$)')
@@ -25,8 +29,8 @@ OPENS_COMMAND = re.compile(r'::[a-z-]*(::| |$)')
 SHELL_RAW = re.compile(r'::\$|::(?:error|warning|notice|group)\b[^\n]*?(?:\$|%[-+ #0-9.]*[a-zA-Z])')
 
 
-def load(name: str):
-    spec = importlib.util.spec_from_file_location(name.replace('-', '_'), SCRIPTS / f'{name}.py')
+def load(path: pathlib.Path):
+    spec = importlib.util.spec_from_file_location(path.stem.replace('-', '_'), path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -124,7 +128,7 @@ class Writers(unittest.TestCase):
     """Each script's own writer passes a hostile value through as one escaped line."""
 
     def test_each_writer_escapes_its_value(self):
-        ga = load('gorelease-accept')
+        ga = load(SCRIPTS / 'gorelease-accept.py')
 
         def title():
             with unittest.mock.patch.object(intake, 'check_title', return_value=[HOSTILE]):
@@ -154,26 +158,156 @@ class Writers(unittest.TestCase):
                 self.assertNotIn('\n::add-mask::', text)
 
 
+class ActionWriters(unittest.TestCase):
+    """Each action's writer passes a hostile value through as one escaped line."""
+
+    PROPERTY = '100%25%0D%0A%3A%3Aadd-mask%3A%3Ax'
+
+    def setUp(self):
+        self.tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    @staticmethod
+    def capture(write) -> tuple[str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            write()
+        return out.getvalue(), err.getvalue()
+
+    def sh(
+        self, script: str, *args: str, stub: str = '', **env: str
+    ) -> subprocess.CompletedProcess:
+        """actions/SCRIPT under bash, with uname and curl stubbed to print STUB."""
+        bin_dir = self.tmp / 'bin'
+        bin_dir.mkdir(exist_ok=True)
+        for tool in ('uname', 'curl'):
+            (bin_dir / tool).write_text('#!/bin/sh\nprintf "%s" "$STUB"\n')
+            (bin_dir / tool).chmod(0o755)
+        return subprocess.run(
+            ['bash', str(ACTIONS / script), *args],
+            cwd=self.tmp,
+            env={**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}', 'STUB': stub, **env},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_alert_table(self):
+        at = load(ACTIONS / 'alert-rules' / 'alert-table.py')
+        out, _ = self.capture(lambda: at.error(HOSTILE, HOSTILE))
+        self.assertEqual(out, f'::error file={self.PROPERTY}::{ESCAPED}\n')
+
+    def test_render_hub_overview(self):
+        rh = load(ACTIONS / 'render-hub-overview' / 'render-hub-overview.py')
+
+        def fail():
+            with self.assertRaises(SystemExit):
+                rh.fail(HOSTILE)
+
+        self.assertEqual(self.capture(fail)[1], f'::error::{ESCAPED}\n')
+
+    def test_publish_surface(self):
+        ps = load(ACTIONS / 'publish-surface' / 'publish-surface.py')
+        argv = ['publish-surface.py', '--github', '--package-dir', str(self.tmp)]
+        refused = ps.SurfaceError(f'a,b:c {HOSTILE}')
+        with (
+            unittest.mock.patch.object(sys, 'argv', argv),
+            unittest.mock.patch.object(ps, 'read_json', side_effect=refused),
+        ):
+            out, _ = self.capture(lambda: self.assertEqual(ps.main(), 1))
+        self.assertEqual(out, '::error::publish-surface check could not complete: a,b:c 100%25\n')
+
+    def test_comment_audit(self):
+        ca = load(ACTIONS / 'comment-audit' / 'comment-audit.py')
+        with (
+            unittest.mock.patch.object(ca, 'EXCLUDED_REPOSITORIES', {HOSTILE}),
+            unittest.mock.patch.dict(os.environ, {'GITHUB_REPOSITORY': HOSTILE}),
+        ):
+            out, _ = self.capture(lambda: self.assertEqual(ca.main(['--github', str(self.tmp)]), 0))
+        want = f'::notice title=Comment ratio::{ESCAPED} is excluded because it is not an app repository'
+        self.assertIn(f'{want}\n', out)
+
+    def test_notice_audit(self):
+        na = load(ACTIONS / 'notice-audit' / 'notice-audit.py')
+        with (
+            unittest.mock.patch.dict(os.environ, {'GITHUB_REPOSITORY': 'cplieger/probe'}),
+            unittest.mock.patch.object(na, 'audit', return_value=([HOSTILE], 0)),
+        ):
+            out, _ = self.capture(lambda: self.assertEqual(na.main(['--github', str(self.tmp)]), 1))
+        self.assertIn(f'::error title=NOTICE audit::{ESCAPED}\n', out)
+
+    def test_dashboard_check(self):
+        dc = load(ACTIONS / 'dashboard-check' / 'dashboard-check.py')
+        path = self.tmp / f'{HOSTILE}.json'
+        argv = ['--github', '--cue', 'cue', '--promql', 'promql', '--schema', 't=f', str(path)]
+        out, _ = self.capture(lambda: self.assertEqual(dc.main(argv), 1))
+        self.assertEqual(
+            out,
+            f'::error file={wc.escape_property(str(path))},title=dashboard-check envelope::'
+            'file: [envelope] the file does not exist. Fix: commit a valid dashboard JSON file.\n',
+        )
+
+    def test_git_cliff_version_compute(self):
+        out = self.sh('git-cliff-version/compute.sh', HOSTILE)
+        self.assertEqual(
+            (out.returncode, out.stdout), (1, f"::error::unknown compute.sh command '{ESCAPED}'\n")
+        )
+
+    def test_dashboard_check_fetch_base(self):
+        out = self.sh(
+            'dashboard-check/fetch-base.sh',
+            HOSTILE,
+            'a,b',
+            str(self.tmp / 'base.json'),
+            stub='500',
+            TOKEN='t',
+            GITHUB_API_URL='https://api.invalid',
+            GITHUB_REPOSITORY='cplieger/probe',
+            GITHUB_EVENT_NAME='push',
+        )
+        want = f'::error::dashboard-check: reading {ESCAPED} at a,b answered HTTP 500\n'
+        self.assertEqual((out.returncode, out.stdout), (1, want))
+
+    def test_dashboard_check_install(self):
+        out = self.sh('dashboard-check/install.sh', str(self.tmp / 'tools'), stub=HOSTILE)
+        want = f'::error::dashboard-check: no cue or Go build pinned for {ESCAPED}\n'
+        self.assertEqual((out.returncode, out.stderr), (1, want))
+
+    def test_alert_rules_install(self):
+        out = self.sh('alert-rules/install.sh', HOSTILE, '1', str(self.tmp / 'tools'), stub=HOSTILE)
+        want = f'::error::alert-rules: no {ESCAPED} build for {ESCAPED}\n'
+        self.assertEqual((out.returncode, out.stderr), (1, want))
+
+
 class NoRawCommands(unittest.TestCase):
     def test_no_script_writes_a_command_outside_the_helper(self):
         scripts = sorted(
             p
-            for p in SCRIPTS.glob('*.py')
+            for p in (*SCRIPTS.glob('*.py'), *ACTIONS.glob('*/*.py'))
             if not p.name.startswith('test') and p.name != 'workflow_commands.py'
         )
-        found = {p.name: lines for p in scripts if (lines := command_literals(p))}
+        found = {
+            str(p.relative_to(SCRIPTS.parent)): lines
+            for p in scripts
+            if (lines := command_literals(p))
+        }
         self.assertEqual(found, {}, 'write these through workflow_commands.command')
         self.assertGreater(len(scripts), 20)
+        self.assertGreater(len([p for p in scripts if p.is_relative_to(ACTIONS)]), 5)
 
     def test_no_shell_script_writes_a_command_with_data_outside_the_helper(self):
         scripts = sorted(
             p
-            for p in SCRIPTS.glob('*.sh')
+            for p in (*SCRIPTS.glob('*.sh'), *ACTIONS.glob('*/*.sh'))
             if not p.name.startswith('test') and p.name != 'gha-log.sh'
         )
-        found = {p.name: lines for p in scripts if (lines := shell_command_lines(p.read_text()))}
+        found = {
+            str(p.relative_to(SCRIPTS.parent)): lines
+            for p in scripts
+            if (lines := shell_command_lines(p.read_text()))
+        }
         self.assertEqual(found, {}, 'write these through gha-log.sh gha_annotate')
         self.assertGreater(len(scripts), 20)
+        self.assertGreater(len([p for p in scripts if p.is_relative_to(ACTIONS)]), 5)
 
     def test_the_shell_check_sees_each_raw_form(self):
         for source, want in (

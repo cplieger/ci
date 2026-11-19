@@ -59,6 +59,9 @@ import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
+import workflow_commands as wc
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -611,7 +614,7 @@ def main() -> int:
     except SurfaceError as exc:
         message = f'publish-surface check could not complete: {exc}'
         if args.github:
-            print(f'::error::{message.splitlines()[0]}')
+            print(wc.command('error', message.splitlines()[0]))
         print(f'error: {message}', file=sys.stderr)
         return 1
 
@@ -624,7 +627,7 @@ def main() -> int:
     print(f'\n{len(findings)} finding(s):', file=sys.stderr)
     for finding in findings:
         if args.github:
-            print(f'::error::{finding}')
+            print(wc.command('error', finding))
         print(f'  {finding}', file=sys.stderr)
     return 1
 

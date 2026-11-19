@@ -8,6 +8,9 @@
 # test-cliff-bump-semantics.sh.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/../../scripts/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/../../scripts/gha-log.sh"
+
 PENDING_OF=""
 case "${1:-}" in
   "") ;;
@@ -20,7 +23,7 @@ case "${1:-}" in
     LANE="${3:-${LANE:-}}"
     ;;
   *)
-    echo "::error::unknown compute.sh command '$1'"
+    gha_annotate error "unknown compute.sh command '%s'" "$1"
     exit 1
     ;;
 esac
@@ -35,7 +38,7 @@ UNPROVEN="${UNPROVEN:-}"
 case "$CHANNEL" in
   dev | stable) ;;
   *)
-    echo "::error::channel must be 'dev' or 'stable', got '${CHANNEL}'"
+    gha_annotate error "channel must be 'dev' or 'stable', got '%s'" "${CHANNEL}"
     exit 1
     ;;
 esac
@@ -56,13 +59,13 @@ if [ -n "$LANE" ]; then
   SEED_AT="${PENDING_OF:-HEAD}"
   FIRST=v1.0.0
   if ! seed_entry="$(git ls-tree --name-only "$SEED_AT" -- "${LANE}/.first-version")"; then
-    echo "::error::git cannot read ${LANE}/.first-version at ${SEED_AT}"
+    gha_annotate error 'git cannot read %s/.first-version at %s' "${LANE}" "${SEED_AT}"
     exit 1
   fi
   if [ -n "$seed_entry" ]; then
     FIRST="$(git show "${SEED_AT}:${LANE}/.first-version")"
     if ! [[ $FIRST =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "::error::${LANE}/.first-version holds '${FIRST}', not one line vX.Y.Z"
+      gha_annotate error "%s/.first-version holds '%s', not one line vX.Y.Z" "${LANE}" "${FIRST}"
       exit 1
     fi
   fi
@@ -74,7 +77,7 @@ else
   case "$REPO_TYPE" in
     docker | go | ts | none) ;;
     *)
-      echo "::error::repo-type must be docker, go, ts or none for the root version, got '${REPO_TYPE}'"
+      gha_annotate error "repo-type must be docker, go, ts or none for the root version, got '%s'" "${REPO_TYPE}"
       exit 1
       ;;
   esac
@@ -189,7 +192,7 @@ is_ancestor() { # <a> <b> -> 0 when a is an ancestor of b, 1 when not; exits whe
   local rc=0
   git merge-base --is-ancestor "$1" "$2" || rc=$?
   if [ "$rc" -gt 1 ]; then
-    echo "::error::git cannot tell whether ${1} is an ancestor of ${2}"
+    gha_annotate error 'git cannot tell whether %s is an ancestor of %s' "${1}" "${2}"
     exit 1
   fi
   return "$rc"
@@ -205,18 +208,18 @@ cliff_level() { # <from> <to> -> sets LEVEL and CLIFF_VERSION (its proposal)
   local -a range
   # git-cliff takes a single revision as a commit id only.
   to="$(git rev-parse --verify "$2^{commit}")" || {
-    echo "::error::git cannot resolve ${2} to a commit, so git-cliff has no revision to read"
+    gha_annotate error 'git cannot resolve %s to a commit, so git-cliff has no revision to read' "${2}"
     exit 1
   }
   range=("$to")
   if [ -n "$1" ]; then
     range=("$1..$2")
     tagged="$(tags_in_range "$1" "$2")" || {
-      echo "::error::git cannot list the stable tags or the commits of ${range[*]}"
+      gha_annotate error 'git cannot list the stable tags or the commits of %s' "${range[*]}"
       exit 1
     }
     if [ -n "$tagged" ]; then
-      echo "::error::stable tags ${tagged}sit inside ${range[*]}, so no change level is read across them"
+      gha_annotate error 'stable tags %ssit inside %s, so no change level is read across them' "${tagged}" "${range[*]}"
       exit 1
     fi
   fi
@@ -230,12 +233,12 @@ cliff_level() { # <from> <to> -> sets LEVEL and CLIFF_VERSION (its proposal)
   fi
   if ! GO_LANES_JSON="$lanes" REPO_TYPE="$REPO_TYPE" bash "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-modules.sh" \
     commits "$1" "$to" "$unit" >"$err.owned"; then
-    echo "::error::cannot tell which commits of ${range[*]} belong to ${LANE:-the root}"
+    gha_annotate error 'cannot tell which commits of %s belong to %s' "${range[*]}" "${LANE:-the root}"
     exit 1
   fi
   python3 "$(dirname "${BASH_SOURCE[0]}")/../../scripts/go-embeds.py" --with-commits "${range[0]}" \
     --owned "$err.owned" --skips "$err.skips" --config "${GIT_CLIFF_CONFIG:-cliff.toml}" >"$err.embeds" || {
-    echo "::error::cannot read the //go:embed directives over ${range[*]}"
+    gha_annotate error 'cannot read the //go:embed directives over %s' "${range[*]}"
     exit 1
   }
   while IFS= read -r -d '' msg; do
@@ -245,7 +248,7 @@ cliff_level() { # <from> <to> -> sets LEVEL and CLIFF_VERSION (its proposal)
     skip+=(--skip-commit "$sha")
   done <"$err.skips"
   if ! ctx="$("$CLIFF_BIN" --bump --context "${ARGS[@]}" "${skip[@]}" "${with[@]}" "${range[@]}" 2>"$err")"; then
-    echo "::error::git-cliff --bump --context failed over ${range[*]}:"
+    gha_annotate error 'git-cliff --bump --context failed over %s:' "${range[*]}"
     sed 's/^/  /' "$err" >&2 || true
     exit 1
   fi
@@ -253,13 +256,13 @@ cliff_level() { # <from> <to> -> sets LEVEL and CLIFF_VERSION (its proposal)
   fields="$(jq -r 'if length == 1 then [(.[0].previous.version // ""), (.[0].version // "")] | join("|") else "releases \(length)" end' <<<"$ctx")"
   case "$fields" in
     releases*)
-      echo "::error::git-cliff returned ${fields#releases } releases over ${range[*]}, expected one"
+      gha_annotate error 'git-cliff returned %s releases over %s, expected one' "${fields#releases }" "${range[*]}"
       exit 1
       ;;
   esac
   IFS='|' read -r prev ver <<<"$fields"
   if ! [[ $ver =~ $PATTERN ]] || { [ -n "$prev" ] && ! [[ $prev =~ $PATTERN ]]; }; then
-    echo "::error::git-cliff proposed '${ver}' over '${prev:-<none>}', which is not of the form ${PREFIX}vX.Y.Z, so it is refused"
+    gha_annotate error "git-cliff proposed '%s' over '%s', which is not of the form %svX.Y.Z, so it is refused" "${ver}" "${prev:-<none>}" "${PREFIX}"
     exit 1
   fi
   CLIFF_VERSION="$ver"
@@ -282,7 +285,7 @@ promotion_version() { # <H> <level> -> the next major for a breaking range, else
 pending_version_of() { # <R> -> the version the pending promotion publishes
   local r="$1" name commit lowest="" p="" p_commit="" tags
   tags="$(stable_tags)" || {
-    echo "::error::git cannot list the tags, so the stable tags on ${r} are unknown"
+    gha_annotate error 'git cannot list the tags, so the stable tags on %s are unknown' "${r}"
     exit 1
   }
   while read -r name commit; do
@@ -315,7 +318,7 @@ is_promotion() { # <commit> -> 0 when it is a reconciliation commit, 1 when not;
   local rc=0
   is_reconciliation "$1" || rc=$?
   if [ "$rc" -gt 1 ]; then
-    echo "::error::cannot tell whether '${1}' is a promotion commit"
+    gha_annotate error "cannot tell whether '%s' is a promotion commit" "${1}"
     exit 1
   fi
   return "$rc"
@@ -323,11 +326,11 @@ is_promotion() { # <commit> -> 0 when it is a reconciliation commit, 1 when not;
 
 if [ -n "$PENDING_OF" ]; then
   if ! is_promotion "$PENDING_OF"; then
-    echo "::error::'${PENDING_OF}' is not a reconciliation commit, so it is not numbered as a promotion"
+    gha_annotate error "'%s' is not a reconciliation commit, so it is not numbered as a promotion" "${PENDING_OF}"
     exit 1
   fi
   R="$(git rev-parse "$PENDING_OF^{commit}")" || {
-    echo "::error::git cannot resolve '${PENDING_OF}' to a commit"
+    gha_annotate error "git cannot resolve '%s' to a commit" "${PENDING_OF}"
     exit 1
   }
   pending_version_of "$R"
@@ -341,7 +344,7 @@ DEV_PATTERN="${PATTERN%\$}-dev\\.[0-9]+\$"
 # HEAD is the version this commit still has to publish.
 for t in $UNPROVEN; do
   if [ -n "$LANE" ] || ! [[ $t =~ $PATTERN || $t =~ $DEV_PATTERN ]]; then
-    echo "::error::unproven tag '${t}' is not a root version tag"
+    gha_annotate error "unproven tag '%s' is not a root version tag" "${t}"
     exit 1
   fi
 done
@@ -360,7 +363,7 @@ fi
 ANCHOR_SHA=""
 if [ -n "$ANCHOR_REF" ]; then
   ANCHOR_SHA="$(git rev-list -n1 "$ANCHOR_REF")" || {
-    echo "::error::git cannot resolve the anchor tag ${ANCHOR_REF} to a commit"
+    gha_annotate error 'git cannot resolve the anchor tag %s to a commit' "${ANCHOR_REF}"
     exit 1
   }
 fi
@@ -371,17 +374,17 @@ case "$PENDING_IN_RANGE" in
   false) ;;
   true)
     if [ "$CHANNEL" != stable ]; then
-      echo "::error::pending-in-range describes a stable run's range, but this run is on the ${CHANNEL} channel"
+      gha_annotate error "pending-in-range describes a stable run's range, but this run is on the %s channel" "${CHANNEL}"
       exit 1
     fi
     ;;
   *)
-    echo "::error::pending-in-range must be 'true' or 'false', got '${PENDING_IN_RANGE}'"
+    gha_annotate error "pending-in-range must be 'true' or 'false', got '%s'" "${PENDING_IN_RANGE}"
     exit 1
     ;;
 esac
 if [ -n "$PENDING_VERSION" ] && ! [[ $PENDING_VERSION =~ $PATTERN ]]; then
-  echo "::error::pending-version '${PENDING_VERSION}' is not of the form ${PREFIX}vX.Y.Z"
+  gha_annotate error "pending-version '%s' is not of the form %svX.Y.Z" "${PENDING_VERSION}" "${PREFIX}"
   exit 1
 fi
 PENDING_COMMIT="${PENDING_COMMIT:-}"
@@ -391,11 +394,11 @@ if [ -n "$PENDING_COMMIT" ]; then
     exit 1
   fi
   if ! [[ $PENDING_COMMIT =~ ^[0-9a-f]{40}$ ]]; then
-    echo "::error::pending-commit '${PENDING_COMMIT}' is not a 40-character commit id"
+    gha_annotate error "pending-commit '%s' is not a 40-character commit id" "${PENDING_COMMIT}"
     exit 1
   fi
   if ! is_promotion "$PENDING_COMMIT"; then
-    echo "::error::'${PENDING_COMMIT}' is not a promotion commit, so it is no range floor"
+    gha_annotate error "'%s' is not a promotion commit, so it is no range floor" "${PENDING_COMMIT}"
     exit 1
   fi
 fi
@@ -426,7 +429,7 @@ done <<<"$TAGS"
 # contain H is an older commit (a re-run after a newer release): numbering it
 # above H would publish older content as the newest version.
 if [ "$CHANNEL" = stable ] && [ -n "$H_COMMIT" ] && ! is_ancestor "$H_COMMIT" HEAD; then
-  echo "::error::the highest stable tag ${H_TAG} is on ${H_COMMIT}, which HEAD does not contain, so an older commit is not published above it"
+  gha_annotate error 'the highest stable tag %s is on %s, which HEAD does not contain, so an older commit is not published above it' "${H_TAG}" "${H_COMMIT}"
   exit 1
 fi
 H="$H_TAG"
@@ -460,13 +463,13 @@ LATEST="$H_TAG"
 case "$BASE" in
   "${PREFIX}"v[0-9]*) ;;
   *)
-    echo "::error::computed version '${BASE}' is not of the form ${PREFIX}vX.Y.Z; refusing"
+    gha_annotate error "computed version '%s' is not of the form %svX.Y.Z, so it is refused" "${BASE}" "${PREFIX}"
     exit 1
     ;;
 esac
 
 DEV_VERSION="$(dev_version "$BASE")" || {
-  echo "::error::git cannot list the ${BASE}-dev.* tags, so the dev counter is unknown"
+  gha_annotate error 'git cannot list the %s-dev.* tags, so the dev counter is unknown' "${BASE}"
   exit 1
 }
 dev_gt() { # <a> <b>, dev tags -> status 0 when a ranks above b
@@ -491,7 +494,7 @@ fi
 if [ -n "$RESUME" ]; then
   DEV_VERSION="$RESUME"
   BASE="${RESUME%-dev.*}"
-  echo "::notice::${RESUME} is claimed at HEAD and was never proven published, so this run publishes it"
+  gha_annotate notice '%s is claimed at HEAD and was never proven published, so this run publishes it' "${RESUME}"
 fi
 if [ "$BASE" = "$LATEST" ]; then
   RELEASE=false

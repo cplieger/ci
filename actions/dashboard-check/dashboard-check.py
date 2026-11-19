@@ -18,6 +18,9 @@ import sys
 import tempfile
 from typing import TYPE_CHECKING
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'scripts'))
+import workflow_commands as wc
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -1171,14 +1174,6 @@ def cue_summary(errors: list[tuple[str, str, str]], limit: int = 12) -> str:
     return ' | '.join(out)
 
 
-def escape_data(text: str) -> str:
-    return text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-
-
-def escape_property(text: str) -> str:
-    return escape_data(text).replace(':', '%3A').replace(',', '%2C')
-
-
 def load(path: pathlib.Path) -> tuple[object, str | None]:
     try:
         return json.loads(path.read_text()), None
@@ -1244,15 +1239,13 @@ def main(argv: list[str] | None = None) -> int:
             found, notices = check(doc, base, lambda p=path: vet(p, args.cue, args.schema), queries)
         for note in notices:
             if args.github:
-                print(f'::notice file={escape_property(str(path))}::{escape_data(note)}')
+                print(wc.command('notice', note, file=path))
             else:
                 print(f'{path}: notice: {note}')
         for finding in found:
             if args.github:
-                title = escape_property(f'dashboard-check {finding.rule}')
-                print(
-                    f'::error file={escape_property(str(path))},title={title}::{escape_data(str(finding))}'
-                )
+                title = f'dashboard-check {finding.rule}'
+                print(wc.command('error', finding, file=path, title=title))
             else:
                 print(f'{path}: {finding}')
         if found:

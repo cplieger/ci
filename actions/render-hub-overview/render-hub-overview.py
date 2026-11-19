@@ -24,6 +24,9 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
+import workflow_commands as wc
+
 # A page built from these inputs lands near 5 KB, so reaching this cap is a
 # defect in the summary region, not a budget to manage.
 HUB_MAX_BYTES = 25000
@@ -41,7 +44,7 @@ FENCE = re.compile(r'^\s{0,3}(`{3,}|~{3,})')
 
 
 def fail(msg: str) -> None:
-    print(f'::error::{msg}', file=sys.stderr)
+    print(wc.command('error', msg), file=sys.stderr)
     sys.exit(1)
 
 
@@ -217,8 +220,10 @@ def main() -> int:
         )
     if size > HUB_WARN_BYTES:
         print(
-            f'::warning::rendered overview is {size} bytes, near the '
-            f'{HUB_MAX_BYTES}-byte Docker Hub limit',
+            wc.command(
+                'warning',
+                f'rendered overview is {size} bytes, near the {HUB_MAX_BYTES}-byte Docker Hub limit',
+            ),
             file=sys.stderr,
         )
 

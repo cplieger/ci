@@ -9,6 +9,9 @@
 # merge commit GITHUB_SHA instead, when the working directory holds it.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/../../scripts/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/../../scripts/gha-log.sh"
+
 [ "$#" -eq 3 ] || {
   echo "usage: fetch-base.sh <path> <base-ref> <out-file>" >&2
   exit 2
@@ -52,7 +55,7 @@ case "$code" in
     ;;
   404) echo "dashboard-check: ${path} does not exist at ${ref}; no base copy" ;;
   *)
-    echo "::error::dashboard-check: reading ${path} at ${ref} answered HTTP ${code}"
+    gha_annotate error 'dashboard-check: reading %s at %s answered HTTP %s' "${path}" "${ref}" "${code}"
     exit 1
     ;;
 esac

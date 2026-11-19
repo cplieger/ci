@@ -87,7 +87,6 @@ sync failed — {detail}
 test -bench` output; reads stdin when
 the canonical — the next sync
 the concurrency probe; letting gremlins report
-the form ${PREFIX}vX.Y.Z; refusing
 the newest point; 0 means leave
 this one reports; list every other
 this tag (repeatable; unknown tags are
