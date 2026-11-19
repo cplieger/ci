@@ -10,19 +10,21 @@
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$TOOLS/gha-log.sh"
 # shellcheck source=SCRIPTDIR/reconciliation.sh
 . "$TOOLS/reconciliation.sh"
 # rebuild-stale.sh's commit subject; test-path-significance.sh holds the copies equal.
 REBUILD_SUBJECT='fix(deps): rebuild against refreshed base packages'
 
 die() {
-  echo "::error::$*" >&2
+  gha_annotate error '%s' "$*" >&2
   exit 1
 }
 # --sources sets QUIET: its walk decides no build, so a build notice there misleads.
 QUIET=false
 notice() {
-  [ "$QUIET" = true ] || echo "::notice::$*" >&2
+  [ "$QUIET" = true ] || gha_annotate notice '%s' "$*" >&2
 }
 # Call as an assignment checked with `|| exit 1`: a die inside $(…) ends only
 # the substitution.

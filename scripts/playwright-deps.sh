@@ -8,6 +8,9 @@
 # an ::error:: when apt ignores the drop-in's values or every attempt failed.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
+
 [ "$#" -gt 0 ] || {
   echo "::error::playwright-deps.sh: name at least one engine"
   exit 2
@@ -46,7 +49,7 @@ while read -r name value; do
   got=$(apt-config dump --no-empty --format '%v' "$name")
   echo "apt uses ${name} \"${got}\""
   if [ "$got" != "$want" ]; then
-    echo "::error::apt uses ${name} \"${got}\", not \"${want}\" from ${CONF}: a file that sorts after it in its directory, or apt.conf, sets it"
+    gha_annotate error 'apt uses %s "%s", not "%s" from %s: a file that sorts after it in its directory, or apt.conf, sets it' "${name}" "${got}" "${want}" "${CONF}"
     overridden=1
   fi
 done <<<"$OPTIONS"
@@ -59,7 +62,7 @@ done <<<"$OPTIONS"
 # https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#restrictions-for-accessing-a-cache
 if [ -n "$CACHE" ] && [ -d "$CACHE" ]; then
   find "$CACHE" -maxdepth 1 -name '*.deb' -exec sudo cp -t "$ARCHIVES" {} + \
-    || echo "::warning::could not seed apt's archive from ${CACHE}"
+    || gha_annotate warning "could not seed apt's archive from %s" "${CACHE}"
 fi
 
 attempt=1 delay=$FIRST_DELAY
@@ -69,23 +72,23 @@ while :; do
   timeout -k "$KILL_SECONDS" "$ATTEMPT_SECONDS" npx --no-install playwright install-deps "$@" || rc=$?
   [ "$rc" -ne 0 ] || break
   if [ "$attempt" -ge "$ATTEMPTS" ]; then
-    echo "::error::playwright install-deps $* failed ${ATTEMPTS} times, the last with exit ${rc} (124 or 137 means it ran past ${ATTEMPT_SECONDS}s). An Ubuntu mirror or DNS outage is the usual cause: rerun the job once it clears."
+    gha_annotate error 'playwright install-deps %s failed %s times, the last with exit %s (124 or 137 means it ran past %ss). An Ubuntu mirror or DNS outage is the usual cause: rerun the job once it clears.' "$*" "${ATTEMPTS}" "${rc}" "${ATTEMPT_SECONDS}"
     exit 1
   fi
-  echo "::warning::playwright install-deps $* attempt ${attempt}/${ATTEMPTS} failed (exit ${rc}), retrying in ${delay}s"
+  gha_annotate warning 'playwright install-deps %s attempt %s/%s failed (exit %s), retrying in %ss' "$*" "${attempt}" "${ATTEMPTS}" "${rc}" "${delay}"
   sleep "${PLAYWRIGHT_DEPS_SLEEP:-$delay}"
   # A killed attempt can leave dpkg half-configured, which refuses every later install.
-  sudo dpkg --configure -a || echo "::warning::dpkg --configure -a failed (exit $?)"
+  sudo dpkg --configure -a || gha_annotate warning 'dpkg --configure -a failed (exit %s)' "$?"
   attempt=$((attempt + 1)) delay=$((delay * 2))
 done
 
 [ -n "$CACHE" ] || exit 0
 # autoclean drops the debs the indexes no longer list: the cache stays one install's worth.
-sudo apt-get autoclean -qq || echo "::warning::apt-get autoclean failed (exit $?)"
+sudo apt-get autoclean -qq || gha_annotate warning 'apt-get autoclean failed (exit %s)' "$?"
 if ! mkdir -p "$CACHE" \
   || ! find "$CACHE" -maxdepth 1 -name '*.deb' -delete \
   || ! find "$ARCHIVES" -maxdepth 1 -name '*.deb' -exec cp -t "$CACHE" {} +; then
-  echo "::warning::could not copy apt's archive to ${CACHE}, so the .deb cache is not saved"
+  gha_annotate warning "could not copy apt's archive to %s, so the .deb cache is not saved" "${CACHE}"
 elif [ -z "$(find "$CACHE" -maxdepth 1 -name '*.deb' -print -quit)" ]; then
   echo "apt kept no .deb files, so the .deb cache is not saved"
 elif [ -n "$KEY" ]; then

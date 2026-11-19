@@ -10,6 +10,8 @@
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$TOOLS/gha-log.sh"
 # shellcheck source=SCRIPTDIR/reconciliation.sh
 . "$TOOLS/reconciliation.sh"
 # shellcheck source=SCRIPTDIR/retry.sh
@@ -24,10 +26,10 @@ TAG_RECEIPT_PREFIX='release/tag/'
 BUILT_FROM_MAIN='Built from `main` for dependency and system-package updates'
 
 die() {
-  echo "::error::$*" >&2
+  gha_annotate error '%s' "$*" >&2
   exit 1
 }
-note() { echo "::notice::$*" >&2; }
+note() { gha_annotate notice '%s' "$*" >&2; }
 out() { printf '%s\n' "$@" >>"${GITHUB_OUTPUT:?}"; }
 
 # Each predicate below answers 0 or 1 and dies when git or jq cannot tell, so
@@ -608,7 +610,7 @@ answers() { # <label> <command...>: retry.sh's await_registry, then the verdict
     echo "ok: ${label}"
     return 0
   fi
-  echo "::error::${label} does not answer"
+  gha_annotate error '%s does not answer' "${label}"
   return 1
 }
 fetch() { curl -fsSL --connect-timeout 10 --max-time 30 -o /dev/null "$1"; }

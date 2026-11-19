@@ -9,8 +9,11 @@
 #   tab-separated lines; exit 2 on an unreadable rev or input.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
+
 die() {
-  echo "::error::go-modules: $*" >&2
+  gha_annotate error 'go-modules: %s' "$*" >&2
   exit 2
 }
 usage="usage: go-modules.sh list <rev> | boundaries <rev> | commits <from> <to> <unit> | paths <from> <to> <unit>..."

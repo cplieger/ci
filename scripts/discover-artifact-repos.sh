@@ -34,7 +34,7 @@ while IFS= read -r -d '' meta; do
   # Target code wrote meta.json, so a name outside GitHub's repository characters names no repo.
   repo=$(jq -r '.repo | select(type == "string" and test("^[A-Za-z0-9._-]+$"))' "$meta" 2>/dev/null) || repo=""
   if [ -z "$repo" ]; then
-    gha_annotate warning "no repo name readable in '%s'; that artifact is skipped" "$meta" >&2
+    gha_annotate warning "no repo name readable in '%s', so that artifact is skipped" "$meta" >&2
     continue
   fi
   repos="${repos}${repo}"$'\n'

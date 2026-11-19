@@ -36,7 +36,9 @@ jobs:
           ref: ${{ github.sha }}
           path: _ci
           persist-credentials: false
-          sparse-checkout: scripts/go-units.sh
+          sparse-checkout: |
+            scripts/go-units.sh
+            scripts/gha-log.sh
           sparse-checkout-cone-mode: false
 
       - name: Discover Go-having repos with non-trivial source

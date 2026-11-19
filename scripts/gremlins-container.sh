@@ -9,6 +9,9 @@
 # shard's GREMLINS_MODE and GREMLINS_WORKERS (the plan's, replacing the count here).
 set -uo pipefail
 
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
+
 m="${1:?module dir}"
 : "${GREMLINS_VERSION:?}" "${PROBE_TIMEOUT:?}" "${JOB_TIMEOUT_MINUTES:?}"
 
@@ -30,12 +33,12 @@ workers=$((nproc_n < max_by_mem ? nproc_n : max_by_mem))
 if [ -n "${GREMLINS_WORKERS:-}" ]; then
   case "${GREMLINS_WORKERS}" in
     0* | *[!0-9]*)
-      echo "::error::GREMLINS_WORKERS=${GREMLINS_WORKERS} is not a positive integer"
+      gha_annotate error 'GREMLINS_WORKERS=%s is not a positive integer' "${GREMLINS_WORKERS}"
       exit 1
       ;;
   esac
   if [ "${GREMLINS_WORKERS}" -gt "${workers}" ]; then
-    echo "::warning::the shard plan's ${GREMLINS_WORKERS} workers exceed the ${workers} this runner sizes"
+    gha_annotate warning "the shard plan's %s workers exceed the %s this runner sizes" "${GREMLINS_WORKERS}" "${workers}"
   fi
   workers="${GREMLINS_WORKERS}"
 fi
@@ -88,6 +91,7 @@ docker run --rm \
   --memory="${cap_mb}m" --memory-swap="${cap_mb}m" \
   -v "${PWD}/target":/work \
   -v "${PWD}/scripts/gremlins-run.sh":/gremlins-run.sh:ro \
+  -v "${PWD}/scripts/gha-log.sh":/gha-log.sh:ro \
   -v "${PWD}/scripts/gremlins-pkgname.patch":/gremlins-pkgname.patch:ro \
   -v "${PWD}/scripts/gremlins-pkgtimeout.patch":/gremlins-pkgtimeout.patch:ro \
   "${node_mount[@]}" \

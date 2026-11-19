@@ -2,6 +2,8 @@
 # Retry helpers for the release workflows; source it (it sets no shell
 # options). READBACK_SLEEP, when set, replaces the length of every wait
 # without changing the schedule.
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
 
 # retry <command...>: a network call safe to repeat (a registry login, a
 # cosign signature or attestation, which is additive, or an oras copy, which
@@ -12,10 +14,10 @@ retry() {
   local attempt=1 max=5 delay=5
   until "$@"; do
     if [ "$attempt" -ge "$max" ]; then
-      echo "::error::$1 failed after ${max} attempts: $*"
+      gha_annotate error '%s failed after %s attempts: %s' "$1" "${max}" "$*"
       return 1
     fi
-    echo "::warning::$1 attempt ${attempt}/${max} failed; retrying in ${delay}s"
+    gha_annotate warning '%s attempt %s/%s failed, so it is retried in %ss' "$1" "${attempt}" "${max}" "${delay}"
     sleep "${READBACK_SLEEP:-$delay}"
     attempt=$((attempt + 1))
     delay=$((delay * 2))
@@ -67,6 +69,6 @@ await_registry() {
     delay=$((delay * 2 > 60 ? 60 : delay * 2))
   done
   if [ "$attempt" -gt 1 ]; then
-    echo "::notice::${label} was served on attempt ${attempt}, after ${waited}s of waiting"
+    gha_annotate notice '%s was served on attempt %s, after %ss of waiting' "${label}" "${attempt}" "${waited}"
   fi
 }

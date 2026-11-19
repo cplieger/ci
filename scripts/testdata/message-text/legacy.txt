@@ -60,7 +60,6 @@ no vulnerability statements; refusing to pass
 not found locally; run `git fetch
 nothing can merge; want unlocked)
 numeric major — applying the base-path
-of '$*' failed; retrying in ${delay}s
 on (want off; Renovate owns deps)
 on its own; skipping the concurrency
 output is stale; re-run the generator(s)
@@ -92,7 +91,6 @@ the form ${PREFIX}vX.Y.Z; refusing
 the newest point; 0 means leave
 this one reports; list every other
 this tag (repeatable; unknown tags are
-timed out (>${PROBE_TIMEOUT}s); keeping ${WORKERS_MAX} workers
 to release $VERSION; a module path
 trigger move-major-tag.yaml — neither is possible
 under internal/ — validated by CI,

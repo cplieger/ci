@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 LEGACY = ROOT / 'scripts' / 'testdata' / 'message-text' / 'legacy.txt'
 EMITTER = re.compile(
     r'::(?:error|warning|notice)[^:\n]*::'
+    r"|\bgha_annotate\s+(?:error|warning|notice)\s+(?:-p\s+\S+\s+)*[\"']"
     r"|\bcommand\(\s*[\"'](?:error|warning|notice)[\"'],\s*f?[\"']"
     r"|\b(?:die|note|fail|warn)\s+[\"']"
     r"|\b\w*Error\((?:[\w.]+,\s*)?f?[\"']"

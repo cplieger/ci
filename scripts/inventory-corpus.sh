@@ -9,6 +9,9 @@
 # Renovate with <cfg> as RENOVATE_ADDITIONAL_CONFIG_FILE, report at --report-path.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
+
 here=$(cd "$(dirname "$0")" && pwd)
 bases=()
 work=
@@ -129,7 +132,7 @@ for base in "${bases[@]}"; do
   "${renovate_cmd[@]}" "$cfg" --dry-run=lookup --report-type=file "--report-path=$report" \
     --autodiscover=false "${repos[@]}"
   if [ ! -s "$report" ]; then
-    echo "::error::Renovate wrote no report at $report" >&2
+    gha_annotate error 'Renovate wrote no report at %s' "$report" >&2
     exit 1
   fi
   for repo in "${repos[@]}"; do
@@ -169,10 +172,10 @@ for base in "${bases[@]}"; do
     if [ "$(<"$count")" -eq 0 ]; then
       records_err="$work/records-$base-${repo//\//_}.txt"
       if ! records_json=$(python3 "$here/inventory.py" records --git-dir "$clone" --rev HEAD 2>"$records_err"); then
-        echo "::error::Renovate extracted no dependency from $repo@$base, and inventory.py cannot read its records: $(tr '\n' ' ' <"$records_err")" >&2
+        gha_annotate error 'Renovate extracted no dependency from %s@%s, and inventory.py cannot read its records: %s' "$repo" "$base" "$(tr '\n' ' ' <"$records_err")" >&2
         failed=1
       elif [ "$(jq length <<<"$records_json")" -ne 0 ]; then
-        echo "::error::Renovate extracted no dependency from $repo@$base, where inventory.py reads $(jq length <<<"$records_json") record(s)" >&2
+        gha_annotate error 'Renovate extracted no dependency from %s@%s, where inventory.py reads %s record(s)' "$repo" "$base" "$(jq length <<<"$records_json")" >&2
         failed=1
       fi
     fi

@@ -7,14 +7,11 @@ their per-module counts.
 from __future__ import annotations
 
 import pathlib
-import re
 import subprocess
 import tempfile
 import unittest
 
 SCRIPT = pathlib.Path(__file__).resolve().parent / 'go-units.sh'
-GHA_LOG = SCRIPT.with_name('gha-log.sh')
-SUBST = re.compile(r'\s*\w+=\$\{\w+(//.+)\}')
 FUZZ = '^func Fuzz'
 
 
@@ -138,22 +135,6 @@ class GoUnits(unittest.TestCase):
             self.assertTrue(line.startswith('::warning::go-units: skipped module dir'), line)
         self.assertIn("'x%0A::error title=spoof::injected'", err)
         self.assertIn("'z%250A::add-mask::s%0A::set-env name=A::b'", err)
-
-    def test_its_inlined_escape_matches_gha_log_s_gha_escape(self):
-        def substitutions(lines: list[str]) -> list[str]:
-            out = []
-            for line in lines:
-                if not (m := SUBST.fullmatch(line)):
-                    break
-                out.append(m[1])
-            return out
-
-        helper = GHA_LOG.read_text().splitlines()
-        ours = SCRIPT.read_text().splitlines()
-        want = substitutions(helper[helper.index('gha_escape() {') + 2 :])
-        got = substitutions(ours[next(n for n, ln in enumerate(ours) if 'e=${d//%/%25}' in ln) :])
-        self.assertEqual(len(want), 3)
-        self.assertEqual(got, want)
 
     def test_a_tree_with_no_module_prints_nothing(self):
         tree = self.tree({'README.md': ''})

@@ -4,11 +4,14 @@
 # any other failure prints the error on stderr and exits 1.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
+
 tag="${1:?usage: release-exists.sh TAG}"
 err=$(mktemp)
 trap 'rm -f "$err"' EXIT
 fail() {
-  echo "::error::could not determine whether Release ${tag} exists:" >&2
+  gha_annotate error 'could not determine whether Release %s exists:' "${tag}" >&2
   cat "$err" >&2
   exit 1
 }

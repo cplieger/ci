@@ -13,6 +13,9 @@
 # dev or stable, and 0 otherwise. Siblings are reached through CI_TOOLS alone.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
+
 usage() {
   echo "usage: rebuild-gate.sh scope | compare NEW COMPARED" >&2
   exit 2
@@ -34,8 +37,8 @@ result() { # <true|false> [tag]
   fi
   exit 0
 }
-publishes() { # <warning|notice> <text>
-  echo "::$1::$2" >&2
+publishes() { # <warning|notice> <format> <arg>...: gha_annotate's arguments
+  gha_annotate "$@" >&2
   result false
 }
 
@@ -46,7 +49,7 @@ scope() {
   case "${CHANNEL:-}" in
     dev | stable) ;;
     *)
-      echo "::error::rebuild-gate: CHANNEL must be dev or stable, got '${CHANNEL:-}'" >&2
+      gha_annotate error "rebuild-gate: CHANNEL must be dev or stable, got '%s'" "${CHANNEL:-}" >&2
       exit 2
       ;;
   esac
@@ -58,7 +61,7 @@ scope() {
     # The notes diff against this same tag, so the rebuild is compared with the
     # release its notes would follow.
     tag=$(bash "$CI_TOOLS/render-notes.sh" --site docker --version "${VERSION:-}" --print-previous) \
-      || publishes warning "The release before ${VERSION:-} could not be resolved, so this release publishes as usual."
+      || publishes warning 'The release before %s could not be resolved, so this release publishes as usual.' "${VERSION:-}"
   else
     tags=$(git tag --list --sort=-version:refname) \
       || publishes warning "The dev tags could not be listed, so this release publishes as usual."
@@ -66,13 +69,13 @@ scope() {
   fi
   [ -n "$tag" ] || result false
   tag_commit=$(git rev-parse --verify --quiet "${tag}^{commit}") \
-    || publishes warning "The commit of ${tag} could not be read, so this release publishes as usual."
+    || publishes warning 'The commit of %s could not be read, so this release publishes as usual.' "${tag}"
   rc=0
   git merge-base --is-ancestor "$tag_commit" HEAD || rc=$?
   case "$rc" in
     0) ;;
     1) result false ;;
-    *) publishes warning "Whether ${tag} is an ancestor of this commit could not be read, so this release publishes as usual." ;;
+    *) publishes warning 'Whether %s is an ancestor of this commit could not be read, so this release publishes as usual.' "${tag}" ;;
   esac
 
   # Paths mode notes what it drops on stderr, which only a failure needs.
@@ -83,7 +86,7 @@ scope() {
   ps_out=$(MODE=paths FROM="$tag_commit" TO=HEAD REQUEST_CHANNEL="$CHANNEL" REPO_TYPE=docker SUBPACKAGES_JSON="${SUBPACKAGES_JSON:-[]}" \
     GO_LANES_JSON="${GO_LANES_JSON:-[]}" bash "$CI_TOOLS/path-significance.sh" 2>"$ps_err") || rc=$?
   if [ "$rc" -ne 0 ]; then
-    echo "::warning::The paths changed since ${tag} could not be classified, so this release publishes as usual." >&2
+    gha_annotate warning 'The paths changed since %s could not be classified, so this release publishes as usual.' "${tag}" >&2
     reason=$(tail -n 1 "$ps_err" | sed 's/^::[a-z]*:://')
     [ -z "$reason" ] || printf '%s\n' "$reason" >&2
     result false
@@ -100,18 +103,19 @@ scope() {
   [ "$amd64" = true ] || publishes notice "This image is not built for linux/amd64, so its rebuild publishes as usual."
   if [ "$CHANNEL" = stable ]; then
     recs=$(reconciliations_in "$tag_commit" HEAD) \
-      || publishes warning "The promotions since ${tag} could not be listed, so this release publishes as usual."
+      || publishes warning 'The promotions since %s could not be listed, so this release publishes as usual.' "${tag}"
     [ -z "$recs" ] || publishes notice "A promotion is in this range beside its rebuild request, so it publishes as usual."
   fi
   sig=$(sed -n 's/^significant=//p' <<<"$ps_out")
   [ "$sig" = '[]' ] || publishes notice "This range ships changes beside its rebuild request, so it publishes as usual."
-  echo "::notice::This range only asks for a rebuild against refreshed base packages, so its image is compared with ${tag} before anything is published." >&2
+  gha_annotate notice 'This range only asks for a rebuild against refreshed base packages, so its image is compared with %s before anything is published.' "${tag}" >&2
   result true "$tag"
 }
 
-decide() { # <true|false> <annotation>
+decide() { # <true|false> <kind> <format> <arg>...: gha_annotate's arguments after the first
   echo "skip=$1" >>"$GITHUB_OUTPUT"
-  echo "$2" >&2
+  shift
+  gha_annotate "$@" >&2
   exit 0
 }
 
@@ -121,25 +125,25 @@ compare() {
   [ "$#" -eq 2 ] || usage
   new=$1 prev=$2
   [ -n "${PREV_REF:-}" ] \
-    || decide false "::warning::Publishing this rebuild, because ${UNREADABLE:-the SBOM of ${COMPARE_TAG:-} could not be read}."
+    || decide false warning 'Publishing this rebuild, because %s.' "${UNREADABLE:-the SBOM of ${COMPARE_TAG:-} could not be read}"
   [ -s "$prev" ] \
-    || decide false "::warning::Publishing this rebuild, because the image of ${COMPARE_TAG:-} could not be scanned."
-  [ -s "$new" ] || decide false "::warning::Publishing this rebuild, because the rebuilt image's SBOM could not be generated."
+    || decide false warning 'Publishing this rebuild, because the image of %s could not be scanned.' "${COMPARE_TAG:-}"
+  [ -s "$new" ] || decide false warning "Publishing this rebuild, because the rebuilt image's SBOM could not be generated."
   # A count that is not a number would fail the -gt test below, which reads as equal sets.
   if ! count=$(bash "$CI_TOOLS/render-notes.sh" --sbom-changes --sbom-prev "$prev" --sbom-new "$new") \
     || ! [[ $count =~ ^[0-9]+$ ]]; then
-    decide false "::warning::Publishing this rebuild, because its SBOM and that of ${COMPARE_TAG:-} could not be compared."
+    decide false warning 'Publishing this rebuild, because its SBOM and that of %s could not be compared.' "${COMPARE_TAG:-}"
   fi
   if [ "$count" -gt 0 ]; then
     [ "$count" -ne 1 ] || noun=package
-    decide false "::notice::${count} ${noun} changed since ${COMPARE_TAG:-}, so this rebuild is published."
+    decide false notice '%s %s changed since %s, so this rebuild is published.' "${count}" "${noun}" "${COMPARE_TAG:-}"
   fi
   {
     echo "## Rebuild"
     echo ""
     echo "Rebuild skipped: no package changed since \`${COMPARE_TAG:-}\` (\`${PREV_REF}\`), so the image built from source for the comparison is discarded and nothing is published."
   } >>"$GITHUB_STEP_SUMMARY"
-  decide true "::notice::No package changed since ${COMPARE_TAG:-}, so this rebuild publishes nothing."
+  decide true notice 'No package changed since %s, so this rebuild publishes nothing.' "${COMPARE_TAG:-}"
 }
 
 case "${1:-}" in

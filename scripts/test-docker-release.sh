@@ -2818,7 +2818,7 @@ done
 out_l=$(DOCKER_FAILS=1 login docker-release-finalize-hub ghcr.io)
 chk "D-L3 a login that hits one reset connection succeeds on its second attempt" \
   "$(wc -l <"$DOCKER_LOG" | tr -d ' ')|$(printf '%s' "$out_l" | grep -c '^EXIT=' || true)" "2|0"
-chk_has "D-L3 and warns about the retry in the legacy words" "$out_l" "::warning::login_once attempt 1/5 failed; retrying in 5s"
+chk_has "D-L3 and warns about the retry" "$out_l" "::warning::login_once attempt 1/5 failed, so it is retried in 5s"
 chk "D-L3 Docker Hub is docker.io, the password on stdin and never in argv" "$(tail -1 "$DOCKER_LOG")" \
   "login --username probe-user --password-stdin docker.io | stdin=probe-secret"
 out_l=$(DOCKER_FAILS=1 login docker-release-build-ghcr ghcr.io)

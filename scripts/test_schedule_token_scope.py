@@ -1435,7 +1435,8 @@ class FuzzPerModule(unittest.TestCase):
         )
         ci = tmp / 'cwd' / 'ci' / 'scripts'
         ci.mkdir(parents=True)
-        (ci / 'go-units.sh').symlink_to(SCRIPTS / 'go-units.sh')
+        for name in ('go-units.sh', 'gha-log.sh'):
+            (ci / name).symlink_to(SCRIPTS / name)
         (ci / 'open.tsv').write_text(''.join(f'1\t{t}\n' for t in open_titles))
         (ci / 'tracker_issue.py').write_text(
             'import pathlib, sys\n'

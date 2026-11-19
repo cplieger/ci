@@ -39,7 +39,9 @@ jobs:
           ref: ${{ github.sha }}
           path: _ci
           persist-credentials: false
-          sparse-checkout: scripts/go-units.sh
+          sparse-checkout: |
+            scripts/go-units.sh
+            scripts/gha-log.sh
           sparse-checkout-cone-mode: false
 
       - name: Discover fuzz targets and compute per-module shard counts
@@ -279,6 +281,7 @@ jobs:
             scripts/ghrest.py
             scripts/workflow_commands.py
             scripts/go-units.sh
+            scripts/gha-log.sh
           sparse-checkout-cone-mode: false
           path: ci
 

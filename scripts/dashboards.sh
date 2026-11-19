@@ -7,19 +7,17 @@
 #   filter               the same for the names on stdin, each once
 #   package <file>       the file's package under the image: dashboard or dashboard-<suffix>
 set -euo pipefail
+
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
 export LC_ALL=C
 
 # Keeps dashboard-<suffix> a valid OCI repository path component:
 # https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pulling-manifests
 SUFFIX_RE='^[a-z0-9]+(-[a-z0-9]+)*$'
 
-# A workflow command's data encoding: https://github.com/actions/toolkit/blob/main/packages/core/src/command.ts
 die() {
-  local msg=$*
-  msg=${msg//\%/%25}
-  msg=${msg//$'\r'/%0D}
-  msg=${msg//$'\n'/%0A}
-  printf '%s\n' "::error::${msg}" >&2
+  gha_annotate error '%s' "$*" >&2
   exit 1
 }
 

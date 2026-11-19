@@ -9,19 +9,22 @@
 #   second parent brings dev's), unset or dev every non-merge one. Exits 2 on bad input or git.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
+
 MODE="${MODE:-release}"
 case "$MODE" in
   release | paths) ;;
   *)
-    echo "::error::path-significance: unknown MODE '$MODE'" >&2
+    gha_annotate error "path-significance: unknown MODE '%s'" "$MODE" >&2
     exit 2
     ;;
 esac
 note() {
-  if [ "$MODE" = paths ]; then echo "::notice::$*" >&2; else echo "::notice::$*"; fi
+  if [ "$MODE" = paths ]; then gha_annotate notice '%s' "$*" >&2; else gha_annotate notice '%s' "$*"; fi
 }
 die() {
-  echo "::error::path-significance: $*" >&2
+  gha_annotate error 'path-significance: %s' "$*" >&2
   exit 2
 }
 dirs_of() { # <name> <JSON> -> one dir per line; an empty <JSON> is no dirs
@@ -48,7 +51,7 @@ if [ "$MODE" = paths ]; then
     *) die "REQUEST_CHANNEL must be dev or stable, got '${REQUEST_CHANNEL}'" ;;
   esac
   if ! CHANGED=$(git -c core.quotePath=false diff --no-renames --name-only "$FROM..$TO"); then
-    echo "::error::path-significance: cannot diff ${FROM}..${TO}" >&2
+    gha_annotate error 'path-significance: cannot diff %s..%s' "${FROM}" "${TO}" >&2
     exit 2
   fi
   BEFORE="$FROM"

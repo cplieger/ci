@@ -3,6 +3,8 @@
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$TOOLS/gha-log.sh"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -119,7 +121,7 @@ rebuild_requested() { # <repo> <base> <since> -> the committer time of the newes
 open_pr() { # <repo> <base> <reason> [since]
   local repo=$1 base=$2 reason=$3 since=${4:-} open req head tree commit branch body url rc
   case "$base" in dev | main) ;; *)
-    echo "::error::open-pr: base must be dev or main, got '${base}'" >&2
+    gha_annotate error "open-pr: base must be dev or main, got '%s'" "${base}" >&2
     exit 2
     ;;
   esac
@@ -131,7 +133,7 @@ open_pr() { # <repo> <base> <reason> [since]
   request_merge() { # <pr url>
     python3 "$TOOLS/release_maintenance.py" merge-checked "$repo" "${1##*/}" \
       --base "$base" --head-prefix "rebuild/${base}-" && return 0
-    echo "::error::cplieger/${repo}: could not enable auto-merge on $1"
+    gha_annotate error 'cplieger/%s: could not enable auto-merge on %s' "${repo}" "$1"
     return 1
   }
   # A fork's branch can carry any name, so only this repository's own heads count.
@@ -152,12 +154,12 @@ open_pr() { # <repo> <base> <reason> [since]
     local url
     url=$(open_rebuild "$branch") || return 1
     [ -n "$url" ] || return 3
-    echo "::notice::cplieger/${repo}: ${url} opened ${branch} concurrently, so its merge is asked for"
+    gha_annotate notice 'cplieger/%s: %s opened %s concurrently, so its merge is asked for' "${repo}" "${url}" "${branch}"
     request_merge "$url"
   }
   open=$(open_rebuild)
   if [ -n "$open" ]; then
-    echo "::notice::cplieger/${repo}: ${open} is already open against ${base}, so its merge is asked for again"
+    gha_annotate notice 'cplieger/%s: %s is already open against %s, so its merge is asked for again' "${repo}" "${open}" "${base}"
     request_merge "$open"
     return 0
   fi
@@ -165,12 +167,12 @@ open_pr() { # <repo> <base> <reason> [since]
   # so only a fresh read of the base keeps a second one from opening.
   if [ -n "$since" ]; then
     if ! req=$(rebuild_requested "$repo" "$base" "$since" 2>"$WORK/requested.err"); then
-      echo "::warning::cplieger/${repo}: the rebuild requests on ${base} could not be read again, so a rebuild pull request is opened"
+      gha_annotate warning 'cplieger/%s: the rebuild requests on %s could not be read again, so a rebuild pull request is opened' "${repo}" "${base}"
       tail -n 1 "$WORK/requested.err"
       req=""
     fi
     if [ -n "$req" ]; then
-      echo "::notice::cplieger/${repo}: a rebuild request merged into ${base} at ${req}, so no other pull request is opened"
+      gha_annotate notice 'cplieger/%s: a rebuild request merged into %s at %s, so no other pull request is opened' "${repo}" "${base}" "${req}"
       return 0
     fi
   fi
@@ -186,7 +188,7 @@ open_pr() { # <repo> <base> <reason> [since]
   # A branch with no open pull request holds a commit nobody vouches for, so it
   # is moved to this run's commit rather than opened as it is.
   move_branch() { # <why>
-    echo "::notice::cplieger/${repo}: ${branch} $1, so it is moved to the new commit"
+    gha_annotate notice 'cplieger/%s: %s %s, so it is moved to the new commit' "${repo}" "${branch}" "$1"
     gh api -X PATCH "repos/cplieger/${repo}/git/refs/heads/${branch}" -f sha="$commit" -F force=true >/dev/null
   }
   create_branch() { gh api -X POST "repos/cplieger/${repo}/git/refs" -f ref="refs/heads/${branch}" -f sha="$commit" >/dev/null 2>"$WORK/ref.err"; }
@@ -225,11 +227,11 @@ open_pr() { # <repo> <base> <reason> [since]
       created) ;;
       0) move_branch "was created concurrently without an open pull request" ;;
       3)
-        echo "::error::cplieger/${repo}: ${branch} could not be created and does not exist, so no rebuild pull request into ${base} was opened"
+        gha_annotate error 'cplieger/%s: %s could not be created and does not exist, so no rebuild pull request into %s was opened' "${repo}" "${branch}" "${base}"
         return 1
         ;;
       *)
-        echo "::error::cplieger/${repo}: ${branch} could not be created, and reading it again failed"
+        gha_annotate error 'cplieger/%s: %s could not be created, and reading it again failed' "${repo}" "${branch}"
         return 1
         ;;
     esac
@@ -243,7 +245,7 @@ open_pr() { # <repo> <base> <reason> [since]
     rc=0
     concurrent || rc=$?
     [ "$rc" -ne 3 ] || {
-      echo "::error::cplieger/${repo}: no rebuild pull request into ${base} was opened, and none is open"
+      gha_annotate error 'cplieger/%s: no rebuild pull request into %s was opened, and none is open' "${repo}" "${base}"
       rc=1
     }
     return "$rc"
@@ -270,7 +272,7 @@ dispatch() { # <repo> <bases JSON: fanout's rows of that repo, main first>
   if ! rows=$(jq -r 'if type == "array" and all(.[]; type == "object" and (.base | type) == "string")
       then .[] | [.base, .channel, .last, .age_days, (.since // ""), (.unreadable // ""), (.image // "")] | join("\u001f")
       else error("not fanout rows") end' <<<"$2" 2>/dev/null); then
-    echo "::error::dispatch: the bases of cplieger/${repo} are not fanout rows: $2" >&2
+    gha_annotate error 'dispatch: the bases of cplieger/%s are not fanout rows: %s' "${repo}" "$2" >&2
     exit 2
   fi
   {
@@ -280,14 +282,14 @@ dispatch() { # <repo> <bases JSON: fanout's rows of that repo, main first>
   while IFS=$'\x1f' read -r base channel last age since unreadable image; do
     [ -n "$base" ] || continue
     if [ -n "$unreadable" ]; then
-      echo "::error::ghcr.io/cplieger/${image:-${repo}:${channel}} (${base}) did not read, so its age is unknown and nothing was rebuilt. ${unreadable}"
+      gha_annotate error 'ghcr.io/cplieger/%s (%s) did not read, so its age is unknown and nothing was rebuilt. %s' "${image:-${repo}:${channel}}" "${base}" "${unreadable}"
       outcome=unreadable
     else
-      echo "::group::cplieger/${repo}: ${base} (:${channel})"
+      gha_annotate group 'cplieger/%s: %s (:%s)' "${repo}" "${base}" "${channel}"
       outcome="done"
       bash "${BASH_SOURCE[0]}" stale-pr "$repo" "$base" "$channel" "$age" "$last" "$since" ${image:+"$image"} </dev/null || outcome=failed
       echo "::endgroup::"
-      [ "$outcome" = "done" ] || echo "::error::cplieger/${repo}: the rebuild of ${base} (:${channel}) failed. Its log is above."
+      [ "$outcome" = "done" ] || gha_annotate error 'cplieger/%s: the rebuild of %s (:%s) failed. Its log is above.' "${repo}" "${base}" "${channel}"
     fi
     [ "$outcome" = "done" ] || failed=1
     echo "| ${repo} | ${base} | :${channel} | ${outcome} |" >>"$GITHUB_STEP_SUMMARY"
@@ -363,7 +365,7 @@ fanout() {
         0) ;;
         3) return 0 ;;
         4)
-          echo "::warning::cplieger/${r}: the ${path} on ${base} installs packages in no layer PKG_REFRESH reaches, so a rebuild would reuse the cached packages"
+          gha_annotate warning 'cplieger/%s: the %s on %s installs packages in no layer PKG_REFRESH reaches, so a rebuild would reuse the cached packages' "${r}" "${path}" "${base}"
           echo "| ${r} (${base}, ${label}) | not refreshed by a rebuild | n/a | ${interval} | **no PKG_REFRESH** |" >>"$GITHUB_STEP_SUMMARY"
           return 0
           ;;
@@ -397,7 +399,7 @@ fanout() {
       if [ "$age_secs" -gt $((interval * 86400)) ]; then
         since=$(date -u -d "@$((now - interval * 86400))" +%Y-%m-%dT%H:%M:%SZ)
         if ! req=$(rebuild_requested "$r" "$base" "$since" 2>"$WORK/requested.err"); then
-          echo "::warning::cplieger/${r}: the rebuild requests on ${base} could not be read, so the image age alone decides"
+          gha_annotate warning 'cplieger/%s: the rebuild requests on %s could not be read, so the image age alone decides' "${r}" "${base}"
           tail -n 1 "$WORK/requested.err"
           req=""
         fi

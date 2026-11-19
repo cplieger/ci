@@ -1,4 +1,4 @@
-"""A sparse checkout of this repo's scripts carries every module they import.
+"""A sparse checkout of this repo's scripts carries every module they import or source.
 
 The suite runs from a full checkout, so a module missing from a workflow's
 sparse list passes here and fails only when the scheduled job imports it.
@@ -8,16 +8,23 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
 import unittest
 
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / 'scripts'
+# `. "$(dirname -- "${BASH_SOURCE[0]}")/x.sh"` or `. "$TOOLS/x.sh"`: a sibling a script sources.
+SOURCED = re.compile(
+    r'^\s*\. "\$(?:\(dirname -- "\$\{BASH_SOURCE\[0\]\}"\)|TOOLS)/([\w.-]+\.sh)"', re.MULTILINE
+)
 
 
 def first_party_imports(path: pathlib.Path) -> set[str]:
-    """The scripts/ modules a script imports by name, at any depth of its body."""
+    """The scripts/ modules a script imports by name, at any depth of its body, or sources."""
+    if path.suffix == '.sh':
+        return set(SOURCED.findall(path.read_text()))
     names = set()
     for node in ast.walk(ast.parse(path.read_text())):
         if isinstance(node, ast.Import):
@@ -35,7 +42,10 @@ def import_closure(entry: str) -> set[str]:
         if rel in seen:
             continue
         seen.add(rel)
-        todo.extend(f'scripts/{n}.py' for n in first_party_imports(ROOT / rel))
+        todo.extend(
+            f'scripts/{n}' if n.endswith('.sh') else f'scripts/{n}.py'
+            for n in first_party_imports(ROOT / rel)
+        )
     return seen
 
 
@@ -59,7 +69,7 @@ class SparseCheckouts(unittest.TestCase):
         checked = 0
         for wf, step, entries in sparse_lists():
             for entry in entries:
-                if not (entry.startswith('scripts/') and entry.endswith('.py')):
+                if not (entry.startswith('scripts/') and entry.endswith(('.py', '.sh'))):
                     continue
                 checked += 1
                 with self.subTest(workflow=wf, step=step, script=entry):
@@ -71,6 +81,11 @@ class SparseCheckouts(unittest.TestCase):
     def test_the_closure_follows_imports_transitively(self):
         self.assertIn('scripts/ghrest.py', import_closure('scripts/tracker_issue.py'))
         self.assertIn('scripts/trackerlib.py', import_closure('scripts/links-body.py'))
+
+    def test_the_closure_follows_sourced_shell(self):
+        self.assertIn('scripts/gha-log.sh', import_closure('scripts/go-units.sh'))
+        self.assertIn('scripts/gha-log.sh', import_closure('scripts/release-assets.sh'))
+        self.assertIn('scripts/retry.sh', import_closure('scripts/release-assets.sh'))
 
 
 if __name__ == '__main__':

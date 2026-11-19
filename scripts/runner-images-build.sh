@@ -3,6 +3,9 @@
 # by digest into <out dir>/<image>.<arch name>, a sibling it names swapped for this run's build.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
+
 PLATFORM=${1:?usage: runner-images-build.sh <platform> <arch name> <out dir>}
 ARCH=${2:?usage: runner-images-build.sh <platform> <arch name> <out dir>}
 OUT=${3:?usage: runner-images-build.sh <platform> <arch name> <out dir>}
@@ -23,12 +26,12 @@ for ((i = 0; i < count; i++)); do
   while IFS=' ' read -r ref parent; do
     [ -n "$ref" ] || continue
     if [ ! -s "$OUT/${parent}.${ARCH}" ]; then
-      echo "::error::${name} names ${ref}, but ${parent} has no ${ARCH} build in this run"
+      gha_annotate error '%s names %s, but %s has no %s build in this run' "${name}" "${ref}" "${parent}" "${ARCH}"
       exit 1
     fi
     args+=(--build-context "${ref}=docker-image://${PACKAGE}@$(cat "$OUT/${parent}.${ARCH}")")
   done < <(jq -r '.parents | to_entries[] | "\(.key) \(.value)"' <<<"$image")
-  echo "::group::${name} (${PLATFORM})"
+  gha_annotate group '%s (%s)' "${name}" "${PLATFORM}"
   : >"$meta"
   docker buildx build "${args[@]}" .
   echo "::endgroup::"
@@ -36,7 +39,7 @@ for ((i = 0; i < count; i++)); do
   case "$digest" in
     sha256:*) printf '%s\n' "$digest" >"$OUT/${name}.${ARCH}" ;;
     *)
-      echo "::error::buildx reported no digest for ${name} (${PLATFORM})"
+      gha_annotate error 'buildx reported no digest for %s (%s)' "${name}" "${PLATFORM}"
       exit 1
       ;;
   esac
