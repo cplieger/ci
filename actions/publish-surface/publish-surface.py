@@ -431,8 +431,8 @@ def jsr_shipped(pkg_dir: Path) -> set[Path]:
         # jsr runs its own publish checks (slow types, exports) in the dry run;
         # it can exit non-zero after it has listed every file.
         raise SurfaceError(
-            f'jsr publish --dry-run refused the package (exit {proc.returncode}); '
-            f'the release would fail the same way.\n{combined[-2000:]}'
+            f'jsr publish --dry-run refused the package (exit {proc.returncode}). '
+            f'The release would fail the same way.\n{combined[-2000:]}'
         )
     pkg_root = pkg_dir.resolve()
     shipped: set[Path] = set()
