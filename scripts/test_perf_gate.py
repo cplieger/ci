@@ -40,26 +40,39 @@ def keyof(d):
     return perf_gate.key(d)
 
 
-def trend_file(entries, runner=RUNNER):
+def trend_file(entries, runner=RUNNER, runs=perf_gate.GUARD_POINTS):
     """The perf-trend branch's series/dev/baseline.json holding entries."""
-    return {'schema': 1, 'series': 'dev', 'runner': runner, 'commits': [HEAD], 'cells': entries}
+    return {
+        'schema': 1,
+        'series': 'dev',
+        'runner': runner,
+        'commits': [HEAD],
+        'runs': runs,
+        'cells': entries,
+    }
 
 
 def baselined(metric='cpu_ms', baseline=1000.0, **kw):
     return {**CELL, 'metric': metric, 'baseline': baseline, **kw}
 
 
-def guarded(entries, cells, runner=RUNNER, units=None, windows=None):
-    """guard() of cells, measured on runner, against the trend baselines of entries."""
-    base_runner, baselines = perf_gate.baselines_from_trend(trend_file(entries))
+def guarded(entries, cells, runner=RUNNER, units=None, windows=None, doc=None):
+    """guard() of cells, measured on runner, against the trend baselines of entries, or of
+    the baseline.json doc."""
+    base_runner, runs, baselines = perf_gate.baselines_from_trend(doc or trend_file(entries))
     return perf_gate.guard(
-        baselines, base_runner, results(cells, runner=runner), units or {}, windows=windows or {}
+        baselines,
+        base_runner,
+        results(cells, runner=runner),
+        units or {},
+        windows=windows or {},
+        runs=runs,
     )
 
 
 def decided(out, entries):
     """compare's remeasure.json for out: each red cell with its trend baseline."""
-    _, baselines = perf_gate.baselines_from_trend(trend_file(entries))
+    _, _, baselines = perf_gate.baselines_from_trend(trend_file(entries))
     return {'cells': [{**c, 'baseline': baselines[keyof(c)]} for c in out.remeasure]}
 
 
@@ -140,8 +153,8 @@ class Guard(unittest.TestCase):
         one = {**baselined(), 'kind': 'time', 'extra': ['C1', 'X2']}
         two = {**baselined('dom', 640), 'kind': 'count'}
         doc = {**trend_file([one, two]), 'commits': ['a', 'b', 'c'], 'more': 1}
-        runner, baselines = perf_gate.baselines_from_trend(doc)
-        self.assertEqual(runner, RUNNER)
+        runner, runs, baselines = perf_gate.baselines_from_trend(doc)
+        self.assertEqual((runner, runs), (RUNNER, perf_gate.GUARD_POINTS))
         self.assertEqual(baselines, {keyof(one): 1000.0, keyof(two): 640})
 
     def test_a_trend_cell_with_no_numeric_baseline_holds_no_baseline(self):
@@ -151,7 +164,7 @@ class Guard(unittest.TestCase):
                 {**baselined(), 'window': 'live', 'baseline': None},
             ]
         )
-        self.assertEqual(perf_gate.baselines_from_trend(doc)[1], {})
+        self.assertEqual(perf_gate.baselines_from_trend(doc)[2], {})
         for broken in (
             {'cells': {}},
             {'cells': ['files']},
@@ -171,11 +184,48 @@ class Guard(unittest.TestCase):
             ):
                 perf_gate.baselines_from_trend(doc)
 
+    def test_a_trend_file_whose_runs_is_no_whole_number_of_runs_is_refused(self):
+        for runs in (None, -1, 2.5, True, '5'):
+            doc = trend_file([baselined()], runs=runs)
+            with (
+                self.subTest(runs=runs),
+                self.assertRaisesRegex(ValueError, 'runs must be the whole number of runs'),
+            ):
+                perf_gate.baselines_from_trend(doc)
+
     def test_another_runner_reports_every_cell_and_fails_nothing(self):
         out = guarded([baselined()], [cell(reps=(9000.0,) * 3)], runner='self-hosted')
-        self.assertTrue(out.runner_mismatch)
+        self.assertIn("which dev's trend baselines were not measured on", out.unguarded)
         self.assertEqual((out.failures, out.remeasure), ([], []))
         self.assertIn('every metric is reported and none is guarded', perf_gate.guard_summary(out))
+
+    def test_a_baseline_of_fewer_than_five_runs_reports_every_cell_and_fails_nothing(self):
+        units = perf_gate.planned_windows([unit('files', 60)])
+        entries = [baselined(), {**baselined(), 'window': 'live'}]
+        absent = trend_file(entries)
+        del absent['runs']
+        for runs, doc in ((0, None), (1, None), (4, None), (0, absent)):
+            with self.subTest(runs=runs, absent=doc is not None):
+                out = guarded(
+                    entries,
+                    [cell(reps=(3000.0,) * 3)],
+                    units=units,
+                    doc=doc or trend_file(entries, runs=runs),
+                )
+                self.assertEqual((out.failures, out.remeasure), ([], []))
+                self.assertEqual([r['status'] for r in out.rows], ['reported'])
+                summary = perf_gate.guard_summary(out)
+                self.assertIn(
+                    f'hold {runs} run{"" if runs == 1 else "s"} of `{RUNNER}`, fewer than 5, so '
+                    'every metric is reported and none is guarded',
+                    summary,
+                )
+                self.assertNotIn('Guarded timing cells', summary)
+
+    def test_a_baseline_of_five_runs_guards(self):
+        out = guarded([baselined()], [cell(reps=(3000.0,) * 3)])
+        self.assertEqual([keyof(c) for c in out.remeasure], [keyof(baselined())])
+        self.assertEqual(out.unguarded, '')
 
     def test_a_guard_with_no_baseline_for_any_measured_timing_cell_fails(self):
         for entries, cells in (
@@ -744,6 +794,12 @@ class Cli(unittest.TestCase):
             self.decision(),
             {'cells': [{**red, 'cpu_model': 'AMD EPYC 7763', 'baseline': 1000.0}]},
         )
+
+    def test_compare_against_a_baseline_of_one_run_reports_a_red_cell_and_passes(self):
+        rc = self.guard([cell(reps=(3000.0,) * 3)], base=trend_file([baselined()], runs=1))
+        self.assertEqual(rc, 0, self.output)
+        self.assertEqual(self.decision(), {'cells': []})
+        self.assertIn('hold 1 run of', (self.dir / 'summary.md').read_text())
 
     def test_compare_passes_a_count_off_dev_and_re_measures_nothing(self):
         rc = self.guard([cell(), cell('dom', (700,) * 3, kind='count')])

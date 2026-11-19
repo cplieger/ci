@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import itertools
 import json
 import pathlib
 import re
@@ -40,12 +41,6 @@ LABEL_DESCRIPTION = 'A performance regression the scheduled trend found'
 # the baseline the newest point carried is used only when the checkout holds no good point.
 BASELINE_POINTS = 7
 HISTORY = 21
-# The pull request guard's baseline: the median of the last GUARD_POINTS dev points. Over
-# five ten-run measurements a three-point median failed one pr-set cell's median of six in
-# 54,600 one-job samples and five points none; a deliberate change reaches it in three.
-# The trend judges a cell only once GUARD_POINTS points of its runner measured it: against
-# a three-point median one-run points would open 0.0165 false issues a point, five 0.0064.
-GUARD_POINTS = 5
 # Scenario group rule, family to the median ratio over a scenario's cells whose
 # baseline clears the family's guard floor. Over 900 one-run group samples of four
 # measurements the worst median ratio was 1.294 for cpu_ms, 1.022 for heap_mb and
@@ -231,9 +226,9 @@ def ref_of(p: dict) -> dict:
 def baseline(history: list[dict], k: tuple, runner: str, accepted: dict | None) -> float | None:
     """The median of cell k's last BASELINE_POINTS values on runner that were not bad,
     or else the baseline the newest such point carried, and None while fewer than
-    GUARD_POINTS points of runner measured it since it last took over. Under an accepted
-    regression the points before its first bad point are no baseline, and those up to
-    its acceptance count however they were judged."""
+    perf_gate.GUARD_POINTS points of runner measured it since it last took over. Under an
+    accepted regression the points before its first bad point are no baseline, and those
+    up to its acceptance count however they were judged."""
     good, carried, measured = [], None, 0
     for h in reversed(history):
         if h['runner'] != runner:
@@ -252,7 +247,7 @@ def baseline(history: list[dict], k: tuple, runner: str, accepted: dict | None) 
         good.append(c['value'])
         if len(good) == BASELINE_POINTS:
             break
-    if measured < GUARD_POINTS:
+    if measured < perf_gate.GUARD_POINTS:
         return None
     return statistics.median(good) if good else carried
 
@@ -679,14 +674,15 @@ def skip(state: dict, commit: str, runner: str) -> bool:
 
 def guard_behind(base: dict, p: dict, pr_units: dict[tuple, set[str] | None]) -> str | None:
     """Why the guard's baseline (guard_baseline) does not hold dev's point p yet, or None:
-    it holds another runner's points or fewer than GUARD_POINTS runs, or a timing cell of
-    pr_units (planned_windows of the pr set) is past the guard against it, so every pull
-    request fails on that cell until more points of p move the median."""
-    if base['runner'] != p['runner']:
-        return f'it holds the `{base["runner"]}` points'
-    if base['runs'] < GUARD_POINTS:
-        runs = base['runs']
-        return f'it holds {runs} run{"" if runs == 1 else "s"} of `{base["runner"]}`, fewer than {GUARD_POINTS}'
+    it holds fewer than perf_gate.GUARD_POINTS runs, or a timing cell of pr_units
+    (planned_windows of the pr set) is past the guard against it, so every pull request
+    fails on that cell until more points of p move the median."""
+    runs = base['runs']
+    if runs < perf_gate.GUARD_POINTS:
+        return (
+            f'it holds {runs} run{"" if runs == 1 else "s"} of `{base["runner"]}`, '
+            f'fewer than {perf_gate.GUARD_POINTS}'
+        )
     held = {perf_gate.key(c): c['baseline'] for c in base['cells'] if perf_gate.is_timing(c)}
     over = sum(
         1
@@ -710,24 +706,12 @@ def point_runs(p: dict) -> int:
 
 def guard_baseline(points: list[dict]) -> dict:
     """The pull request guard's baselines from dev's points, oldest first: each timing
-    cell's median over the last GUARD_POINTS points of the newest runner whose points
-    since it last took over hold GUARD_POINTS runs between them, or else of the newest
-    point's runner, and each count as the newest of them measured it, which the guard
-    only reports. A runner's first points after it takes over are no guard baseline:
-    against one to four one-run points a pull request's median fails 1 to 10 % of the
-    time, against five none."""
-    by_runner: dict[str, list[dict]] = {}
-    previous = None
-    for p in points:
-        stretch = by_runner.pop(p['runner'], [])
-        by_runner[p['runner']] = [*stretch, p] if p['runner'] == previous else [p]
-        previous = p['runner']
-    # Popped and re-inserted at each point, so the dict runs from the least to the most
-    # recent runner.
-    newest = list(reversed(by_runner))
-    held = [r for r in newest if sum(map(point_runs, by_runner[r][-GUARD_POINTS:])) >= GUARD_POINTS]
-    runner = held[0] if held else newest[0]
-    last = by_runner[runner][-GUARD_POINTS:]
+    cell's median over the newest point's runner's last perf_gate.GUARD_POINTS points
+    since it last took over, each count as the newest of them measured it, and `runs`,
+    the runs those points hold."""
+    runner = points[-1]['runner']
+    stretch = list(itertools.takewhile(lambda p: p['runner'] == runner, reversed(points)))
+    last = stretch[: perf_gate.GUARD_POINTS][::-1]
     values: dict[tuple, tuple[str, list]] = {}
     for p in last:
         for c in p['cells']:

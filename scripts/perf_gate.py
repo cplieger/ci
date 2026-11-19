@@ -84,7 +84,9 @@ class Outcome:
     failures: list[str] = dataclasses.field(default_factory=list)
     remeasure: list[dict] = dataclasses.field(default_factory=list)
     notices: list[str] = dataclasses.field(default_factory=list)
-    runner_mismatch: bool = False
+    # Why the baselines guard none of the results, so every cell is reported; empty when
+    # they guard.
+    unguarded: str = ''
     runner: str = ''
     # Every measured cell for the summary: {cell, baseline, value, status}.
     rows: list[dict] = dataclasses.field(default_factory=list)
@@ -122,13 +124,22 @@ GUARD = {
     'heap_mb': (1.25, 2.0),
     'rss_mb': (1.25, 50.0),
 }
+# A runner's guard baseline is each cell's median over its last GUARD_POINTS trend points
+# since it last took over. Over five ten-run measurements a pr-set cell's median of six
+# failed falsely in 28 of 24,570 one-job samples against one one-run point, 6 of 54,600
+# against two, 1 against three and none against five; under GUARD_POINTS runs the guard
+# reports and guards nothing. The trend judges a cell once GUARD_POINTS points of its
+# runner measured it: one-run points open 0.0165 false issues a point against three, 0.0064
+# against five.
+GUARD_POINTS = 5
 TIMING_KINDS = ('time', 'server_cpu')
 TREND_BASELINE = 'series/dev/baseline.json'
 
 
-def baselines_from_trend(doc: dict) -> tuple[str, dict[tuple, float]]:
+def baselines_from_trend(doc: dict) -> tuple[str, int, dict[tuple, float]]:
     """The perf-trend branch's series/dev/baseline.json (perf_trend.guard_baseline) as its
-    runner and each cell's numeric baseline by key; every other field is ignored."""
+    runner, the runs its points hold (0 when it names none) and each cell's numeric
+    baseline by key; every other field is ignored."""
     cells = doc.get('cells', [])
     if not isinstance(cells, list):
         raise TypeError(f'{TREND_BASELINE}: cells must be a list')
@@ -143,7 +154,10 @@ def baselines_from_trend(doc: dict) -> tuple[str, dict[tuple, float]]:
         raise ValueError(
             f'{TREND_BASELINE}: runner must name the runner the baselines were measured on'
         )
-    return runner, out
+    runs = doc.get('runs', 0)
+    if not isinstance(runs, int) or isinstance(runs, bool) or runs < 0:
+        raise ValueError(f'{TREND_BASELINE}: runs must be the whole number of runs its points hold')
+    return runner, runs, out
 
 
 def is_timing(c: dict) -> bool:
@@ -179,22 +193,33 @@ def guard(
     units: dict,
     *,
     windows: dict[str, set[str]],
+    runs: int,
 ) -> Outcome:
     """Judge each measured timing cell's median of three against its trend baseline: one
     over the guard is listed in `remeasure`, never failed here. Counts and reports are
-    information. On the baselines' runner, a baselined timing cell of `units`
-    (planned_windows) that no shard measured fails, unless it is a server route or its
-    window is one `windows` (scenario_windows) no longer lists, which are notices; and a
-    run that guarded no cell fails, since a guard that checks nothing must not pass."""
+    information. Baselines of another runner or of fewer than GUARD_POINTS runs guard
+    nothing. Otherwise a baselined timing cell of `units` (planned_windows) that no shard
+    measured fails, unless it is a server route or its window is one `windows`
+    (scenario_windows) no longer lists, which are notices; and a run that guarded no cell
+    fails, since a guard that checks nothing must not pass."""
     out = Outcome(runner=results.get('runner', ''))
-    out.runner_mismatch = out.runner != runner
+    if out.runner != runner:
+        out.unguarded = (
+            f"The results come from runner `{out.runner}`, which dev's trend baselines were "
+            'not measured on'
+        )
+    elif runs < GUARD_POINTS:
+        out.unguarded = (
+            f"dev's trend baselines hold {runs} run{'' if runs == 1 else 's'} of `{runner}`, "
+            f'fewer than {GUARD_POINTS}'
+        )
     guarded = 0
     for c in results.get('cells', []):
         reps = c.get('reps') or []
         value = statistics.median(reps) if reps else None
         baseline = baselines.get(key(c))
         status = 'reported'
-        if not out.runner_mismatch and is_timing(c) and baseline is not None:
+        if not out.unguarded and is_timing(c) and baseline is not None:
             guarded += 1
             if value is None:
                 out.failures.append(f'{key_text(key(c))}: measured no reps')
@@ -205,7 +230,7 @@ def guard(
             else:
                 status = 'ok'
         out.rows.append({'cell': c, 'baseline': baseline, 'value': value, 'status': status})
-    if out.runner_mismatch:
+    if out.unguarded:
         return out
     measured = {key(c) for c in results.get('cells', [])}
     missed = [
@@ -288,14 +313,8 @@ def differs(c: dict, baseline: float | None) -> bool:
 
 def guard_summary(out: Outcome) -> str:
     lines = ['## Performance guard', '']
-    if out.runner_mismatch:
-        lines += [
-            (
-                f"The results come from runner `{out.runner}`, which dev's trend baselines were "
-                'not measured on, so every metric is reported and none is guarded.'
-            ),
-            '',
-        ]
+    if out.unguarded:
+        lines += [f'{out.unguarded}, so every metric is reported and none is guarded.', '']
     if out.failures:
         lines += ['### Failures', '', *(f'- {f}' for f in out.failures), '']
     if out.notices:
@@ -755,12 +774,12 @@ def run_guard(a: argparse.Namespace) -> Outcome:
                 )
             ]
         )
-    runner, baselines = baselines_from_trend(load(a.trend))
+    runner, runs, baselines = baselines_from_trend(load(a.trend))
     doc = load(a.plan_doc)
     matrix = plan(doc, a.set, only=a.only.replace(',', ' ').split())
     units = planned_windows(c for job in matrix['include'] for c in job['cells'])
     results = merge_results(a.results, a.prefix)
-    out = guard(baselines, runner, results, units, windows=scenario_windows(doc))
+    out = guard(baselines, runner, results, units, windows=scenario_windows(doc), runs=runs)
     decision = {'cells': [{**c, 'baseline': baselines[key(c)]} for c in out.remeasure]}
     pathlib.Path(a.remeasure_out).write_text(json.dumps(decision, indent=2) + '\n')
     return out

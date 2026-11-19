@@ -631,7 +631,7 @@ class Judge(unittest.TestCase):
         self.assertEqual(t.scenario(), 'ok')
         self.assertIn('### Regressions ended at this point', switched.summary)
         self.assertIn('| files | open | the runner changed to `self-hosted` |', switched.summary)
-        for n in range(2, perf_trend.GUARD_POINTS + 1):
+        for n in range(2, perf_gate.GUARD_POINTS + 1):
             judged = t.add(slow(cold=99999.0) if n == 3 else GOOD, runner=other)
             self.assertEqual(judged.actions, [])
             self.assertFalse(any('baseline' in c for c in judged.point['cells']), n)
@@ -700,20 +700,20 @@ class Judge(unittest.TestCase):
         self.assertEqual(proof.scenario(), 'suspect')
 
     def test_a_cell_is_judged_once_five_points_of_its_runner_measured_it(self):
-        t = Trend(points=perf_trend.GUARD_POINTS - 1)
+        t = Trend(points=perf_gate.GUARD_POINTS - 1)
         early = t.add(slow(cold=99999.0))
         self.assertFalse(any('baseline' in c for c in early.point['cells']))
-        u = Trend(points=perf_trend.GUARD_POINTS)
+        u = Trend(points=perf_gate.GUARD_POINTS)
         judged = u.add(slow(cold=99999.0))
         cold = next(c for c in judged.point['cells'] if c['window'] == 'cold')
         self.assertEqual((cold['baseline'], cold['bad']), (1000.0, True))
 
     def test_a_returning_runner_is_judged_only_on_its_points_since_it_last_took_over(self):
         other = 'self-hosted'
-        t = Trend(points=perf_trend.GUARD_POINTS)
+        t = Trend(points=perf_gate.GUARD_POINTS)
         for _ in range(8):
             t.add(slow(cold=3000.0), runner=other)
-        for _ in range(perf_trend.GUARD_POINTS):
+        for _ in range(perf_gate.GUARD_POINTS):
             judged = t.add(slow(cold=3000.0))
             self.assertFalse(any('baseline' in c for c in judged.point['cells']))
             self.assertEqual((judged.actions, t.scenario()), ([], 'ok'))
@@ -1069,6 +1069,17 @@ class Record(unittest.TestCase):
         p = tp(values, n, series=series, runner=runner)
         return perf_trend.record(self.root, p, repo=REPO, issues=issues, pr_units=PR_UNITS)
 
+    def guard_file(self):
+        return json.loads((self.root / 'series/dev/baseline.json').read_text())
+
+    def pr_guard(self, cold, runner=RUNNER):
+        """perf_gate.guard of a pull request on runner whose files x10 cold CPU is cold,
+        against the stored baseline.json."""
+        base_runner, runs, baselines = perf_gate.baselines_from_trend(self.guard_file())
+        pr = {'runner': runner, 'cells': [rcell(reps=(cold,) * 3)]}
+        units = perf_gate.planned_windows([{'scenario': 'files', **UNIT, 'windows': ['cold']}])
+        return perf_gate.guard(baselines, base_runner, pr, units, windows={}, runs=runs)
+
     def stored(self, series='dev'):
         d = self.root / 'series' / series
         return sorted(f.name for f in (d / 'points').iterdir()), json.loads(
@@ -1097,59 +1108,75 @@ class Record(unittest.TestCase):
             self.record(GOOD, n)
         baseline = json.loads((self.root / 'series/dev/baseline.json').read_text())
         self.assertEqual(baseline['commits'], [PURE_SHA.format(n) for n in range(4, 9)])
-        runner, read = perf_gate.baselines_from_trend(baseline)
-        self.assertEqual((runner, len(read)), (RUNNER, 3))
+        runner, runs, read = perf_gate.baselines_from_trend(baseline)
+        self.assertEqual((runner, runs, len(read)), (RUNNER, 5, 3))
 
-    def test_the_guard_baseline_moves_to_a_new_runner_at_its_fifth_run(self):
-        def guard():
-            return json.loads((self.root / 'series/dev/baseline.json').read_text())
-
-        for n in range(1, 6):
+    def test_a_new_runner_s_baseline_reports_a_pull_request_until_it_holds_five_runs(self):
+        for n in range(1, 8):
             self.record(GOOD, n)
-        for n in range(6, 6 + perf_trend.GUARD_POINTS):
-            self.record(slow(cold=4000.0), n, runner='self-hosted')
-            b = guard()
-            if n < 5 + perf_trend.GUARD_POINTS:
-                self.assertEqual((b['runner'], b['commits'][-1]), (RUNNER, PURE_SHA.format(5)), n)
-        self.assertEqual(b['runner'], 'self-hosted')
-        self.assertEqual(b['commits'], [PURE_SHA.format(n) for n in range(6, 11)])
-        cold = next(c for c in b['cells'] if c['window'] == 'cold')
-        self.assertEqual(cold['baseline'], 4000.0)
+        for k in range(1, 1 + perf_gate.GUARD_POINTS):
+            self.record(GOOD, 7 + k, runner='self-hosted')
+            b = self.guard_file()
+            self.assertEqual((b['runner'], b['runs']), ('self-hosted', k))
+            self.assertEqual(b['commits'], [PURE_SHA.format(n) for n in range(8, 8 + k)])
+            out = self.pr_guard(2400.0, runner='self-hosted')
+            self.assertEqual(out.failures, [], k)
+            self.assertEqual(bool(out.remeasure), k == perf_gate.GUARD_POINTS, k)
+            self.assertEqual(self.pr_guard(2400.0).remeasure, [], k)
 
-    def test_a_returning_runner_is_the_guard_baseline_only_on_points_since_it_last_took_over(self):
-        def guard():
-            return json.loads((self.root / 'series/dev/baseline.json').read_text())
+    def test_a_runner_back_from_an_excursion_reports_until_five_points_since_its_return(self):
+        for k in range(1, perf_gate.GUARD_POINTS):
+            with self.subTest(excursion=k):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                self.root = pathlib.Path(tmp.name)
+                for n in range(1, 8):
+                    self.record(GOOD, n)
+                for n in range(8, 8 + k):
+                    self.record(GOOD, n, runner='self-hosted')
+                    self.assertEqual(self.pr_guard(2400.0).remeasure, [], n)
+                for r in range(1, 1 + perf_gate.GUARD_POINTS):
+                    n = 7 + k + r
+                    self.record(GOOD, n)
+                    b, (_, state) = self.guard_file(), self.stored()
+                    self.assertEqual((b['runner'], b['runs']), (RUNNER, r), n)
+                    out = self.pr_guard(2400.0)
+                    self.assertEqual(out.failures, [], n)
+                    if r < perf_gate.GUARD_POINTS:
+                        self.assertEqual(out.remeasure, [], n)
+                        self.assertEqual(
+                            state['last']['guard_behind'],
+                            f'it holds {r} run{"" if r == 1 else "s"} of `{RUNNER}`, fewer than 5',
+                            n,
+                        )
+                        self.assertFalse(perf_trend.skip(state, PURE_SHA.format(n), RUNNER), n)
+                self.assertEqual(len(out.remeasure), 1)
+                self.assertIsNone(state['last']['guard_behind'])
+                self.assertTrue(perf_trend.skip(state, PURE_SHA.format(n), RUNNER))
 
-        for n in range(1, 6):
-            self.record(GOOD, n)
-        for n in range(6, 14):
-            self.record(slow(cold=4000.0), n, runner='self-hosted')
-        for n in range(14, 14 + perf_trend.GUARD_POINTS):
-            self.record(slow(cold=4000.0), n)
-            b = guard()
-            if n < 13 + perf_trend.GUARD_POINTS:
-                self.assertEqual(b['runner'], 'self-hosted', n)
-                self.assertEqual(b['commits'], [PURE_SHA.format(k) for k in range(9, 14)], n)
-        self.assertEqual(b['runner'], RUNNER)
-        self.assertEqual(b['commits'], [PURE_SHA.format(n) for n in range(14, 19)])
-        cold = next(c for c in b['cells'] if c['window'] == 'cold')
-        self.assertEqual(cold['baseline'], 4000.0)
-
-    def test_a_ten_run_point_is_the_guard_baseline_alone_and_a_one_run_point_when_none_is_more(
+    def test_a_ten_run_point_holds_five_runs_alone_and_another_runner_s_point_starts_again(
         self,
     ):
-        seed = tp(GOOD, 1)
-        for c in seed['cells']:
-            c['reps'] = [[c['value']] * 3] * 10
-        seed['runs'] = 10
-        self.assertEqual(perf_trend.guard_baseline([seed])['runner'], RUNNER)
+        def ran(p, runs):
+            p['runs'] = runs
+            for c in p['cells']:
+                c['reps'] = [[c['value']] * 3] * runs
+            return p
+
+        seed = ran(tp(GOOD, 1), 10)
+        b = perf_trend.guard_baseline([seed])
+        self.assertEqual((b['runner'], b['runs']), (RUNNER, 10))
         later = tp(slow(cold=4000.0), 2, runner='self-hosted')
-        self.assertEqual(perf_trend.guard_baseline([seed, later])['runner'], RUNNER)
-        self.assertEqual(perf_trend.guard_baseline([later])['commits'], [PURE_SHA.format(2)])
-        two = tp(GOOD, 3, runner='self-hosted')
-        two['runs'] = 2
-        two['cells'][0]['reps'] = [[1000.0] * 3] * 2
-        self.assertEqual(perf_trend.guard_baseline([seed, later, two])['runner'], RUNNER)
+        b = perf_trend.guard_baseline([seed, later])
+        self.assertEqual(
+            (b['runner'], b['runs'], b['commits']), ('self-hosted', 1, [later['commit']])
+        )
+        two = ran(tp(GOOD, 3, runner='self-hosted'), 2)
+        b = perf_trend.guard_baseline([seed, later, two])
+        self.assertEqual((b['runner'], b['runs']), ('self-hosted', 3))
+        back = tp(GOOD, 4)
+        b = perf_trend.guard_baseline([seed, later, two, back])
+        self.assertEqual((b['runner'], b['runs'], b['commits']), (RUNNER, 1, [back['commit']]))
 
     def test_a_slowdown_at_dev_s_head_is_measured_until_the_guard_baseline_takes_it(self):
         for n in range(1, 8):
@@ -1166,8 +1193,8 @@ class Record(unittest.TestCase):
             )
             _, state = self.stored()
             base = json.loads((self.root / 'series/dev/baseline.json').read_text())
-            runner, baselines = perf_gate.baselines_from_trend(base)
-            red = perf_gate.guard(baselines, runner, pr, units, windows={}).remeasure
+            runner, runs, baselines = perf_gate.baselines_from_trend(base)
+            red = perf_gate.guard(baselines, runner, pr, units, windows={}, runs=runs).remeasure
             skip = perf_trend.skip(state, head, RUNNER)
             return [a['op'] for a in actions], summary, state, bool(red), skip
 
@@ -1195,26 +1222,6 @@ class Record(unittest.TestCase):
         )
         self.assertIsNone(state['last']['guard_behind'])
         self.assertNotIn("guard's baseline does not hold", summary)
-
-    def test_a_runner_back_from_a_one_point_excursion_is_measured_until_it_holds_five_runs(self):
-        for n in range(1, 8):
-            self.record(GOOD, n)
-        self.record(GOOD, 8, runner='self-hosted')
-        for n in range(9, 9 + perf_trend.GUARD_POINTS):
-            self.record(GOOD, n)
-            base = json.loads((self.root / 'series/dev/baseline.json').read_text())
-            _, state = self.stored()
-            runs = n - 8
-            self.assertEqual((base['runner'], base['runs']), (RUNNER, runs), n)
-            if runs < perf_trend.GUARD_POINTS:
-                self.assertEqual(
-                    state['last']['guard_behind'],
-                    f'it holds {runs} run{"" if runs == 1 else "s"} of `{RUNNER}`, fewer than 5',
-                    n,
-                )
-                self.assertFalse(perf_trend.skip(state, PURE_SHA.format(n), RUNNER), n)
-        self.assertIsNone(state['last']['guard_behind'])
-        self.assertTrue(perf_trend.skip(state, PURE_SHA.format(n), RUNNER))
 
     def test_only_a_cell_a_pull_request_measures_holds_the_guard_behind(self):
         points = [tp(GOOD, n) for n in range(1, 6)]
@@ -1254,12 +1261,14 @@ class Record(unittest.TestCase):
                 behind = self.stored()[1]['last']['guard_behind']
                 self.assertEqual(behind and behind[:8], want)
 
-    def test_a_head_the_guard_holds_another_runner_s_points_for_is_measured_again(self):
+    def test_a_head_on_a_new_runner_is_measured_again(self):
         for n in range(1, 6):
             self.record(GOOD, n)
         self.record(GOOD, 6, runner='self-hosted')
         _, state = self.stored()
-        self.assertEqual(state['last']['guard_behind'], f'it holds the `{RUNNER}` points')
+        self.assertEqual(
+            state['last']['guard_behind'], 'it holds 1 run of `self-hosted`, fewer than 5'
+        )
         self.assertFalse(perf_trend.skip(state, PURE_SHA.format(6), 'self-hosted'))
 
     def test_a_point_already_recorded_or_of_a_bad_series_is_refused(self):
@@ -1474,9 +1483,9 @@ class Record(unittest.TestCase):
             rc = perf_trend.main([*argv, '--runner', RUNNER])
         self.assertEqual((rc, out.getvalue()), (0, 'false\n'))
         state = str(self.root / 'series/dev/state.json')
-        for n in range(1, perf_trend.GUARD_POINTS + 1):
+        for n in range(1, perf_gate.GUARD_POINTS + 1):
             self.record(GOOD, n)
-            want = 'true' if n == perf_trend.GUARD_POINTS else 'false'
+            want = 'true' if n == perf_gate.GUARD_POINTS else 'false'
             out = io.StringIO()
             argv = ['skip', '--state', state, '--commit', PURE_SHA.format(n), '--runner', RUNNER]
             with redirect_stdout(out):
