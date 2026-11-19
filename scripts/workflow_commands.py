@@ -78,7 +78,6 @@ def say(msg: Template, *, file: TextIO | None = None) -> None:
 
 
 def say_lines(text: str, *, file: TextIO | None = None) -> None:
-    """Log each line of TEXT through say."""
     for line in text.splitlines():
         say(t'{line}', file=file)
 
