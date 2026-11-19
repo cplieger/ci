@@ -569,7 +569,7 @@ jobs:
         id: publish_surface
         if: ${{ matrix.shard == 1 }}
         continue-on-error: true
-        uses: cplieger/ci/actions/publish-surface@dcad038798c127d91b881ab0cba2899b156498cc # v3
+        uses: cplieger/ci/actions/publish-surface@b11ca15c90f5a56b8e48b33f5e2f89a61c93366c # v3
         with:
           package-dir: ${{ inputs.working-directory }}
 
