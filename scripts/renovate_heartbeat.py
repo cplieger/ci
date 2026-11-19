@@ -28,6 +28,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import ghrest
+import workflow_commands
 
 
 def search_prs(client: ghrest.Client, query: str) -> dict:
@@ -97,20 +98,29 @@ def main(argv=None, client=None, now=None) -> int:
             return 0
         if recent.get('incomplete_results'):
             print(
-                f'::error::GitHub marked the search for {base} incomplete, so this run gives no verdict',
+                workflow_commands.command(
+                    'error',
+                    f'GitHub marked the search for {base} incomplete, so this run gives no verdict',
+                ),
                 file=sys.stderr,
             )
             return 1
         ever = search_prs(client, base)
         if ever.get('incomplete_results') and not ever['items']:
             print(
-                f'::error::GitHub marked the search for {base} incomplete, so this run gives no verdict',
+                workflow_commands.command(
+                    'error',
+                    f'GitHub marked the search for {base} incomplete, so this run gives no verdict',
+                ),
                 file=sys.stderr,
             )
             return 1
         newest = ever['items']
     except ghrest.ApiError as err:
-        print(f'::error::pull request search failed: {err}', file=sys.stderr)
+        print(
+            workflow_commands.command('error', f'pull request search failed: {err}'),
+            file=sys.stderr,
+        )
         return 1
     body = stalled_body(
         args.author, args.owner, args.hours, since, newest[0] if newest else None, args.run_url

@@ -24,6 +24,7 @@ import sys
 from typing import TYPE_CHECKING
 
 import inventory
+import workflow_commands
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -216,18 +217,27 @@ def main(argv: list[str]) -> int:
     try:
         lanes = json.loads(os.environ.get('GO_LANES_JSON') or '[]')
     except json.JSONDecodeError as err:
-        print(f'::error::GO_LANES_JSON is not JSON ({err})', file=sys.stderr)
+        print(
+            workflow_commands.command('error', f'GO_LANES_JSON is not JSON ({err})'),
+            file=sys.stderr,
+        )
         return 1
     if not isinstance(lanes, list) or not all(isinstance(lane, str) and lane for lane in lanes):
-        print('::error::GO_LANES_JSON is not a JSON array of lane dirs', file=sys.stderr)
+        print(
+            workflow_commands.command('error', 'GO_LANES_JSON is not a JSON array of lane dirs'),
+            file=sys.stderr,
+        )
         return 1
     try:
         held = held_lanes(argv[1], lanes)
     except inventory.InventoryError as err:
-        print(f'::error::{err}', file=sys.stderr)
+        print(workflow_commands.command('error', err), file=sys.stderr)
         return 1
     except PurityInputError as err:
-        print(f'::error::{err}, so its first-party pins cannot be judged', file=sys.stderr)
+        print(
+            workflow_commands.command('error', f'{err}, so its first-party pins cannot be judged'),
+            file=sys.stderr,
+        )
         return 2
     print(json.dumps(held, sort_keys=True, separators=(',', ':')))
     return 0

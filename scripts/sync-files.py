@@ -20,6 +20,7 @@ from pathlib import Path
 
 import fanout
 import ghrest
+import workflow_commands
 import yaml
 
 OWNER = 'cplieger'
@@ -189,7 +190,11 @@ def add_label(repo, number):
         if REST.get_or_none(f'repos/{repo}/labels/{PR_LABEL}') is not None:
             REST.send('POST', f'repos/{repo}/issues/{number}/labels', {'labels': [PR_LABEL]})
     except ghrest.ApiError as err:
-        print(f'::warning::{repo}#{number}: label {PR_LABEL} was not applied: {err}')
+        print(
+            workflow_commands.command(
+                'warning', f'{repo}#{number}: label {PR_LABEL} was not applied: {err}'
+            )
+        )
 
 
 def ensure_pr(repo, base, into, changed):
@@ -234,7 +239,11 @@ def close_stale_pr(repo, base, row):
         except ghrest.ApiError as err:
             # 422 is GitHub's answer for a ref that no longer exists.
             if what != 'branch delete' or err.status != 422:
-                print(f'::warning::{label}: stale sync PR #{number}: {what} failed: {err}')
+                print(
+                    workflow_commands.command(
+                        'warning', f'{label}: stale sync PR #{number}: {what} failed: {err}'
+                    )
+                )
     print(f'  closed stale sync PR #{number}')
 
 
@@ -256,7 +265,10 @@ def sync_repo(repo, base, dest_map, source_root, dry_run):
                     row = open_pull(repo, base)
                 except ghrest.ApiError as err:
                     print(
-                        f'::warning::{target_label(repo, base)}: the open sync PR lookup failed: {err}'
+                        workflow_commands.command(
+                            'warning',
+                            f'{target_label(repo, base)}: the open sync PR lookup failed: {err}',
+                        )
                     )
                     return 'clean'
                 if row is not None:
@@ -280,7 +292,7 @@ def sync_target(target, dest_map, source_root, dry_run):
     """sync_repo inside the target's log group; None when the target failed."""
     repo, base = target
     label = target_label(repo, base)
-    print(f'::group::{label}')
+    print(workflow_commands.command('group', label))
     try:
         return sync_repo(repo, base, dest_map, source_root, dry_run)
     except (subprocess.CalledProcessError, ghrest.ApiError, OSError) as exc:
@@ -289,10 +301,10 @@ def sync_target(target, dest_map, source_root, dry_run):
             if isinstance(exc, subprocess.CalledProcessError) and exc.stderr
             else str(exc)
         )
-        print(f'::warning::{label}: sync failed — {detail}')
+        print(workflow_commands.command('warning', f'{label}: sync failed — {detail}'))
         return None
     finally:
-        print('::endgroup::')
+        print(workflow_commands.command('endgroup'))
 
 
 def fork_names():
@@ -324,7 +336,11 @@ def drop_forks(mapping):
     for target, dest_map in mapping.items():
         full_name = target[0]
         if full_name.split('/')[-1] in forks:
-            print(f'::notice::{target_label(*target)}: skipped, repo is a fork')
+            print(
+                workflow_commands.command(
+                    'notice', f'{target_label(*target)}: skipped, repo is a fork'
+                )
+            )
             continue
         kept[target] = dest_map
     return kept
@@ -336,7 +352,11 @@ def sweep_lookup(target):
     try:
         return open_pulls(repo, base)
     except ghrest.ApiError as err:
-        print(f'::warning::{target_label(repo, base)}: the open sync PR lookup failed: {err}')
+        print(
+            workflow_commands.command(
+                'warning', f'{target_label(repo, base)}: the open sync PR lookup failed: {err}'
+            )
+        )
         return []
 
 
@@ -434,7 +454,11 @@ def arm_open_prs(mapping, workers):
         if not ok
     ]
     if left_open:
-        print('::error::a sync pull request into main was left open, as the lines above show')
+        print(
+            workflow_commands.command(
+                'error', 'a sync pull request into main was left open, as the lines above show'
+            )
+        )
         return 1
     return 0
 
@@ -476,7 +500,7 @@ def main():
     try:
         mapping = load_mapping(args.manifest)
     except ManifestError as err:
-        sys.exit(f'::error::sync-files: {err}')
+        sys.exit(workflow_commands.command('error', f'sync-files: {err}'))
     if args.only:
         wanted = {w.strip() for w in args.only.replace(',', ' ').split() if w.strip()}
         mapping = {t: f for t, f in mapping.items() if t[0].split('/')[-1] in wanted}

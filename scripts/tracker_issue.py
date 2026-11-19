@@ -54,6 +54,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import ghrest
+import workflow_commands
 
 ALWAYS_LABEL = 'auto-generated'
 # (color, description) per label this transport creates. Unknown labels get
@@ -184,7 +185,11 @@ def ensure_assignee(repo: str, issue: dict, assignee: str) -> None:
             'POST', f'repos/{repo}/issues/{issue["number"]}/assignees', {'assignees': [assignee]}
         )
     except ghrest.ApiError as err:
-        print(f'::warning::{repo}#{issue["number"]}: could not assign {assignee}: {err}')
+        print(
+            workflow_commands.command(
+                'warning', f'{repo}#{issue["number"]}: could not assign {assignee}: {err}'
+            )
+        )
         return
     print(f'assigned {assignee} to #{issue["number"]}')
 
@@ -213,7 +218,11 @@ def mode_fetch(args: argparse.Namespace) -> int:
         args.title_file.write_text((issue.get('title') or '') if issue else '')
     print(f'fetched #{issue["number"]}' if issue else 'no open issue to fetch')
     for dup in duplicates:
-        print(f'::warning::{args.repo}#{dup["number"]} duplicates #{issue["number"]}')
+        print(
+            workflow_commands.command(
+                'warning', f'{args.repo}#{dup["number"]} duplicates #{issue["number"]}'
+            )
+        )
     return 0
 
 
@@ -362,7 +371,9 @@ def main(argv: list[str] | None = None, *, allow_reserved: bool = False) -> int:
     if not issues_enabled(args.repo):
         subject = args.title or args.label
         print(
-            f'::notice::{args.repo} has issues disabled; skipped {args.mode} for {subject}',
+            workflow_commands.command(
+                'notice', f'{args.repo} has issues disabled; skipped {args.mode} for {subject}'
+            ),
             file=sys.stderr,
         )
         if args.mode == 'fetch':
@@ -373,7 +384,7 @@ def main(argv: list[str] | None = None, *, allow_reserved: bool = False) -> int:
     try:
         return MODES[args.mode](args)
     except GhError as err:
-        print(f'::error::{args.repo}: {err}', file=sys.stderr)
+        print(workflow_commands.command('error', f'{args.repo}: {err}'), file=sys.stderr)
         return 1
 
 

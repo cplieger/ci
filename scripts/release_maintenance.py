@@ -36,6 +36,7 @@ import release_channels as rc
 import scan_coverage
 import tracker_issue
 import trackerlib
+import workflow_commands
 
 OWNER = 'cplieger'
 VALIDATE_CHECK = 'ci / validate'
@@ -1190,7 +1191,10 @@ def merge_checked(
         api.delete_branch(repo, ref)
     except GhError as exc:
         print(
-            f'::warning::{OWNER}/{repo}#{number} merged, but its head branch was not deleted: {exc}'
+            workflow_commands.command(
+                'warning',
+                f'{OWNER}/{repo}#{number} merged, but its head branch was not deleted: {exc}',
+            )
         )
     return 'merged'
 
@@ -1409,7 +1413,7 @@ def cmd_report(args, api: Api, tracker=tracker_main) -> int:
                 + ' |'
             )
             for e in errors:
-                print(f'::error::{repo}: {e}')
+                print(workflow_commands.command('error', f'{repo}: {e}'))
     if not plan['repos']:
         lines.append('| (no repository has `dev` as its default branch) | | | | | | |')
     with open(args.summary, 'a') as fh:

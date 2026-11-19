@@ -25,6 +25,7 @@ from urllib.parse import quote
 
 import ghrest
 import perf_gate
+import workflow_commands
 
 SCHEMA = 1
 STAMP = '%Y%m%dT%H%M%SZ'
@@ -1188,7 +1189,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return run(a)
     except (OSError, ValueError, KeyError, TypeError, ghrest.ApiError) as exc:
-        print(f'::error::perf_trend: {exc}', file=sys.stderr)
+        print(workflow_commands.command('error', f'perf_trend: {exc}'), file=sys.stderr)
         return 1
 
 

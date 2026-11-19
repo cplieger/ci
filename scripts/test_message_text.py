@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 LEGACY = ROOT / 'scripts' / 'testdata' / 'message-text' / 'legacy.txt'
 EMITTER = re.compile(
     r'::(?:error|warning|notice)[^:\n]*::'
+    r"|\bcommand\(\s*[\"'](?:error|warning|notice)[\"'],\s*f?[\"']"
     r"|\b(?:die|note|fail|warn)\s+[\"']"
     r"|\b\w*Error\((?:[\w.]+,\s*)?f?[\"']"
     r"|\.error\(\s*f?[\"']"
@@ -138,6 +139,7 @@ echo "::notice::a label: a value"; exit 0
 echo "plain log line; not read as a message"
     die "no build on npm$([ "$st" = a ] || echo " above"); the run stays held"
 echo "::warning::${r}: is not {\"a\": 1}; read anyway"
+print(workflow_commands.command('error', f'{repo}: {err}; nothing moved'))
 """
         self.assertEqual(
             list(keys(text)),
@@ -149,6 +151,7 @@ echo "::warning::${r}: is not {\"a\": 1}; read anyway"
                 (5, 'carries no bundle; its SBOM is'),
                 (10, 'echo " above"); the run stays'),
                 (11, 'not {\\"a\\": 1}; read anyway'),
+                (12, '{repo}: {err}; nothing moved'),
             ],
         )
 

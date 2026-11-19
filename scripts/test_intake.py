@@ -586,10 +586,6 @@ class Title(unittest.TestCase):
             with self.subTest(config=config):
                 self.assertEqual(set(intake.TITLE_TYPES), named - {'release', 'erge'})
 
-    def test_the_annotation_cannot_open_another_command(self):
-        line = intake.annotate("title 'x\n::add-mask::y%' refused")
-        self.assertEqual(line, "::error::title 'x%0A::add-mask::y%25' refused")
-
 
 def action_body() -> tuple[dict, str]:
     step = next(s for s in yaml.safe_load(ACTION.read_text())['runs']['steps'] if 'run' in s)

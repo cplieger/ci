@@ -20,6 +20,7 @@ from pathlib import Path
 
 import mutation_cost
 import trackerlib
+import workflow_commands
 import yaml
 
 _spec = importlib.util.spec_from_file_location(
@@ -777,7 +778,12 @@ def main() -> int:
     try:
         mutators = mutators_label(enabled_mutators(load_config(args.config.read_text())))
     except (OSError, yaml.YAMLError) as e:
-        print(f'::error::gremlins-aggregate: cannot read {args.config}: {e}', file=sys.stderr)
+        print(
+            workflow_commands.command(
+                'error', f'gremlins-aggregate: cannot read {args.config}: {e}'
+            ),
+            file=sys.stderr,
+        )
         return 1
 
     # Attempts are matched by the meta.json each artifact carries, and searched at

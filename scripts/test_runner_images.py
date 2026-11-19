@@ -342,6 +342,7 @@ class Promoted(unittest.TestCase):
         (self.tmp / 'bin' / 'curl').chmod(0o755)
         # runner_images.py runs release-state.sh from its own directory.
         shutil.copy(Path(ri.__file__), self.tmp / 'runner_images.py')
+        shutil.copy(Path(ri.__file__).with_name('workflow_commands.py'), self.tmp)
         (self.tmp / 'release-state.sh').write_text(STATE_STUB)
         self.log = self.tmp / 'calls.log'
 

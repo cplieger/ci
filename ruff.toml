@@ -12,9 +12,9 @@ extend = "configs/ruff.toml"
 # and sync-files.py import fanout; the dashboard-check tests import
 # dashboard_check_fixtures; the mutation shard planners import mutation_cost, and
 # their fuzz tests mutation_fuzz, whose seeded generator only makes inputs
-# reproducible, S311). Their siblings escape
-# INP001 through their shebang; a library module has none, and scripts/ is not
-# a package.
+# reproducible, S311; every workflow command writer imports workflow_commands).
+# Their siblings escape INP001 through their shebang; a library module has none,
+# and scripts/ is not a package.
 "scripts/trackerlib.py" = ["INP001"]
 "scripts/release_channels.py" = ["INP001"]
 "scripts/ghrest.py" = ["INP001"]
@@ -22,6 +22,7 @@ extend = "configs/ruff.toml"
 "scripts/dashboard_check_fixtures.py" = ["INP001"]
 "scripts/mutation_cost.py" = ["INP001"]
 "scripts/mutation_fuzz.py" = ["INP001", "S311"]
+"scripts/workflow_commands.py" = ["INP001"]
 # scripts/test-*.py and scripts/test_*.py run under the stdlib unittest runner
 # (no pytest here); flake8-pytest-style reads its assertion methods as pytest
 # misuse. The test_*.py modules are discovered by `unittest discover`, carry no

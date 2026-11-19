@@ -26,6 +26,8 @@ import sys
 import uuid
 from typing import TYPE_CHECKING, Any
 
+import workflow_commands
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
@@ -760,7 +762,7 @@ def run(a: argparse.Namespace) -> int:
         out = run_guard(a)
     report(a, guard_summary(out))
     for f in out.failures:
-        print(f'::error::{f}')
+        print(workflow_commands.command('error', f))
     return 1 if out.failures else 0
 
 
@@ -792,7 +794,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return run(a)
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        print(f'::error::perf_gate: {exc!r}', file=sys.stderr)
+        print(workflow_commands.command('error', f'perf_gate: {exc!r}'), file=sys.stderr)
         return 1
 
 

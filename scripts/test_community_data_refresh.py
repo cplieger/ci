@@ -1377,12 +1377,13 @@ class CheckNotices(unittest.TestCase):
     def check(self, root: Path, issues=(), fail=None):
         out, plan = root / 'out', root / 'plan.json'
         gh = ghrest.Client(run=RenderingGitHub(fail=fail), sleep=lambda _: None)
+        self.err = io.StringIO()
         with (
             unittest.mock.patch.dict(os.environ, {'GITHUB_OUTPUT': str(out)}),
             unittest.mock.patch.object(ghrest, 'DEFAULT', gh),
             unittest.mock.patch.object(cdr, 'read_issues', return_value=list(issues)) as read,
             redirect_stdout(io.StringIO()),
-            redirect_stderr(io.StringIO()),
+            redirect_stderr(self.err),
         ):
             argv = ['check', '--repo', 'subflux', '--proposal', str(root / 'p')]
             rc = cdr.main([*argv, '--plan', str(plan)])
@@ -1409,6 +1410,17 @@ class CheckNotices(unittest.TestCase):
             write_proposal(Path(tmp) / 'p', [], notices=[a_notice('a')])
             rc, out, written, _ = self.check(Path(tmp), fail=(502, ''))
         self.assertEqual((rc, out, written), (1, '', None))
+
+    def test_a_refusal_is_logged_as_one_command_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            notice = {**a_notice('a'), 'x\n::warning::injected': 1}
+            write_proposal(Path(tmp) / 'p', [], notices=[notice])
+            rc, _, written, _ = self.check(Path(tmp))
+        self.assertEqual((rc, written), (1, None))
+        self.assertEqual(
+            self.err.getvalue(),
+            '::error::notice 0 holds unknown keys: x%0A::warning::injected\n',
+        )
 
     def test_a_refused_proposal_reads_and_plans_no_issue(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from string.templatelib import Template, convert
 from typing import TYPE_CHECKING, NamedTuple
 
+import workflow_commands
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
     from pathlib import Path
@@ -381,19 +383,14 @@ def deadline_note(where: str, plan: object) -> Template | None:
     )
 
 
-def escape_data(s: str) -> str:
-    """S as an annotation's message, escaped as the Actions toolkit's escapeData does."""
-    return s.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-
-
 def _plain(s: str) -> str:
     # The runner also reads `##[command]` anywhere in a line that is not a `::` command
     # (actions/runner ActionCommand.TryParse), and a plain line is never unescaped.
-    return escape_data(s).replace('#', '%23')
+    return workflow_commands.escape_data(s).replace('#', '%23')
 
 
 def _code_span(s: str) -> str:
-    s = escape_data(s)
+    s = workflow_commands.escape_data(s)
     if not s:
         return ''
     fence = '`' * (max((len(r) for r in re.findall('`+', s)), default=0) + 1)
@@ -429,7 +426,7 @@ def annotate(kind: str, msg: Template, *, summary: bool = False) -> None:
     """Write MSG as a KIND annotation, and to the run summary too when SUMMARY."""
     if kind not in ('notice', 'warning', 'error'):
         raise ValueError(f'{kind!r} is not an annotation')
-    print(f'::{kind}::{render(msg, escape_data)}', file=sys.stderr)
+    print(workflow_commands.command(kind, render(msg)), file=sys.stderr)
     if summary:
         summarize(msg)
 

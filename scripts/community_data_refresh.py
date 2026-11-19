@@ -19,6 +19,7 @@ from typing import NamedTuple
 from urllib.parse import quote
 
 import ghrest
+import workflow_commands
 
 OWNER = 'cplieger'
 BRANCH = 'community-data-refresh'
@@ -711,7 +712,7 @@ def cmd_propose(a) -> int:
     if not done.warning:
         print(done.text)
         return 0
-    print(f'::warning::{done.text}')
+    print(workflow_commands.command('warning', done.text))
     summary = os.environ.get('GITHUB_STEP_SUMMARY')
     if summary:
         with open(summary, 'a') as fh:
@@ -764,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return a.func(a)
     except RefusedError as err:
-        print(f'::error::{err}', file=sys.stderr)
+        print(workflow_commands.command('error', err), file=sys.stderr)
         return 1
 
 

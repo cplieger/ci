@@ -33,6 +33,7 @@ from pathlib import Path
 import ghrest
 import release_channels
 import tracker_issue
+import workflow_commands
 
 OWNER = 'cplieger'
 PRESET = 'github>cplieger/.github'
@@ -1854,7 +1855,7 @@ def write_issue(name, mode, text):
         try:
             return tracker_issue.main(argv, allow_reserved=True)
         except Exception as err:  # one repo's failure must not stop the others
-            print(f'::error::{name}: {err}', file=sys.stderr)
+            print(workflow_commands.command('error', f'{name}: {err}'), file=sys.stderr)
             return 1
 
 
@@ -1905,7 +1906,11 @@ def file_issues(path, dry_run):
         # private ones.
         if row.get('visibility') != 'public':
             counts['private'] += 1
-            print(f'::notice::{name}: not public, so its findings stay in the run summary')
+            print(
+                workflow_commands.command(
+                    'notice', f'{name}: not public, so its findings stay in the run summary'
+                )
+            )
             continue
         if row.get('in_grace') is not False:
             counts['grace'] += 1

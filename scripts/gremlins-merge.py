@@ -71,6 +71,8 @@ import json
 import sys
 from pathlib import Path
 
+import workflow_commands
+
 # gremlins' mutator.Type.String() values are NOT the JSON keys of
 # mutator_statistics for every type: INVERT_BWASSIGN -> invert_bitwise_assignments
 # and INVERT_LOOPCTRL -> invert_loop_ctrl. The rest are the lowercased string.
@@ -308,7 +310,7 @@ def merge(modules: list[tuple[str, Path]], skipped: list[str] = ()) -> dict:
 
     if problems:
         for p in problems:
-            print(f'::error::gremlins-merge: {p}', file=sys.stderr)
+            print(workflow_commands.command('error', f'gremlins-merge: {p}'), file=sys.stderr)
         raise SystemExit(
             'gremlins-merge: refusing to publish a number derived from results that '
             'do not add up (see errors above)'
