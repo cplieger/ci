@@ -344,13 +344,16 @@ def judge(
             if before['status'] != 'ok':
                 unjudged[s] = 'no timing cell has a baseline on this runner'
             continue
-        after, op = step(before, bad[s], p, previous)
+        rows = [c for c in cells if c['scenario'] == s and c.get('bad')]
+        good = (
+            last_good(history, fallback, p, s, [perf_gate.key(c) for c in rows]) if rows else None
+        )
+        after, op = step(before, bad[s], p, good)
         if op is not None:
             action = {'op': op[0], 'marker': marker(series, s), 'title': title(series, s)}
             action['labels'] = [LABEL]
-            rows = [c for c in cells if c['scenario'] == s and c.get('bad')]
             if op[0] == 'upsert':
-                counts = counts_since(past, after, judged, s)
+                counts = counts_since([*fallback, *history], after, judged, s)
                 action['body'] = render_issue(
                     after, s, rows, groups[s], counts, series=series, repo=repo
                 )
@@ -369,9 +372,10 @@ def judge(
 
 
 def step(
-    before: dict, bad: set[str], p: dict, previous: dict | None
+    before: dict, bad: set[str], p: dict, good: dict | None
 ) -> tuple[dict, tuple[str, str | None] | None]:
-    """One scenario's lifecycle step on point p, given its bad cells and groups: ok to
+    """One scenario's lifecycle step on point p, given its bad cells and groups and the
+    last_good point a suspicion starting at p is ranged from: ok to
     suspect on a bad point; suspect to open (an upsert) when a cell or group of the
     suspicion is bad again, else a new suspicion; open and recovering to open on a bad
     point (an upsert with a comment); open to recovering, and recovering to ok (a
@@ -397,7 +401,7 @@ def step(
             **accepted,
             'runner': p['runner'],
             'items': sorted(bad),
-            'last_good': ref_of(previous) if previous else None,
+            'last_good': good,
             'first_bad': ref_of(p),
             'bad_runs': [p['run_url']],
         }, None
@@ -407,6 +411,33 @@ def step(
         after['opened'] = p['date']
         return after, ('upsert', None)
     return after, ('upsert', 'still')
+
+
+def last_good(
+    history: list[dict], fallback: list[dict], p: dict, scenario: str, keys: list[tuple]
+) -> dict | None:
+    """The point a regression of scenario's cells keys, bad at p, is ranged from: the
+    newest of history on p's runner since it last took over that judged every one of keys
+    and found none of scenario's cells bad. Failing that, the newest such point of
+    fallback (dev's points up to a branch series' first) that measured them all, judged
+    or not, since none holds the branch's commits. None when neither holds one."""
+
+    def clean(h: dict, judged: bool) -> bool:
+        cells = h['cells']
+        return all(
+            k in cells
+            and cells[k].get('value') is not None
+            and (not judged or 'baseline' in cells[k])
+            for k in keys
+        ) and not any(c.get('bad') for c in cells.values() if c['scenario'] == scenario)
+
+    for points, judged in ((history, True), (fallback, False)):
+        for h in reversed(points):
+            if h['runner'] != p['runner']:
+                break
+            if clean(h, judged):
+                return ref_of(h)
+    return None
 
 
 def still_text(p: dict, rows: list[dict], groups: list[str]) -> str:
@@ -491,7 +522,10 @@ def render_issue(
             f'https://github.com/{repo}/compare/{good["commit"]}...{first["commit"]}'
         )
     else:
-        lines.append(f'First bad point: `{first["commit"][:12]}`, the first point measured.')
+        lines.append(
+            'No earlier point is known to be within the thresholds, so there is no known-good '
+            f'point and no commit range. The first bad point is `{first["commit"][:12]}`.'
+        )
     lines += ['', 'Runs of the bad points:', '']
     lines += [f'- {u}' for u in tracked['bad_runs'][-BAD_RUNS_SHOWN:]]
     lines.append('')

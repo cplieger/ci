@@ -408,15 +408,63 @@ class Judge(unittest.TestCase):
         self.assertIn(f'{RUN_URL}8', body)
         self.assertIn(f'{RUN_URL}9', body)
 
-    def test_a_different_cell_bad_at_the_next_point_is_a_new_suspicion(self):
+    def test_a_different_cell_bad_at_the_next_point_is_a_new_suspicion_from_the_same_good_point(
+        self,
+    ):
         t = Trend()
         t.add(slow(cold=3000.0))
         self.assertEqual(t.add(slow(live=9000.0)).actions, [])
         self.assertEqual(t.scenario(), 'suspect')
         judged = t.add(slow(live=9000.0))
         self.assertIn(
-            f'https://github.com/{REPO}/compare/{PURE_SHA.format(8)}...{PURE_SHA.format(9)}',
+            f'https://github.com/{REPO}/compare/{PURE_SHA.format(7)}...{PURE_SHA.format(9)}',
             judged.actions[0]['body'],
+        )
+
+    def test_points_never_judged_before_the_first_bad_one_are_no_good_point(self):
+        dev = [perf_trend.seen(tp(GOOD, n)) for n in (1, 2, 3)]
+        history, state = [], perf_trend.new_state('proof')
+        for n in (101, 102, 103, 104):
+            judged = perf_trend.judge(
+                history, tp(slow(cold=3000.0), n, series='proof'), state, repo=REPO, fallback=dev
+            )
+            state = judged.state
+            history.append(perf_trend.seen(judged.point))
+        self.assertFalse(any('baseline' in c for h in history[:2] for c in h['cells'].values()))
+        tracked = state['scenarios']['files']
+        self.assertEqual(
+            (tracked['status'], tracked['last_good']['commit'], tracked['first_bad']['commit']),
+            ('open', PURE_SHA.format(3), PURE_SHA.format(103)),
+        )
+        # From dev's newest point, so the range holds the branch's first commit, 101.
+        self.assertIn(
+            f'https://github.com/{REPO}/compare/{PURE_SHA.format(3)}...{PURE_SHA.format(103)}',
+            judged.actions[0]['body'],
+        )
+
+    def test_a_branch_series_passes_over_a_dev_point_bad_for_the_scenario(self):
+        dev = [perf_trend.seen(tp(GOOD, n)) for n in range(1, 6)]
+        bad_dev = tp(slow(cold=3000.0), 6)
+        bad_dev['cells'][0] |= {'baseline': 1000.0, 'bad': True}
+        dev.append(perf_trend.seen(bad_dev))
+        state = perf_trend.new_state('proof')
+        judged = perf_trend.judge(
+            [], tp(slow(cold=3000.0), 101, series='proof'), state, repo=REPO, fallback=dev
+        )
+        self.assertEqual(
+            judged.state['scenarios']['files']['last_good']['commit'], PURE_SHA.format(5)
+        )
+
+    def test_with_no_known_good_point_the_issue_says_so_and_shows_no_range(self):
+        t = Trend(points=perf_gate.GUARD_POINTS)
+        t.add(slow(cold=3000.0))
+        body = t.add(slow(cold=3000.0)).actions[0]['body']
+        self.assertEqual(t.state['scenarios']['files']['last_good'], None)
+        self.assertNotIn('/compare/', body)
+        self.assertIn(
+            'No earlier point is known to be within the thresholds, so there is no known-good '
+            f'point and no commit range. The first bad point is `{PURE_SHA.format(6)[:12]}`.',
+            body,
         )
 
     def test_a_third_bad_point_with_a_new_cell_updates_the_same_issue(self):
