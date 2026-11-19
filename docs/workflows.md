@@ -303,7 +303,7 @@ Each run is named `Promote <repo>`, with `(dry run)` after a dry run. Runs for o
 | --- | --- |
 | `actions/git-cliff-version` | installs git-cliff and outputs the next stable version under the two-branch numbering, its dev variant, and a `release` boolean. Callable directly |
 | `actions/publish-badge` | writes one shields.io endpoint JSON to the repository's `badges` branch and keeps the other badge files there |
-| `actions/publish-surface` | checks that npm and JSR publish exactly the files the package's `exports` reach, and no undeclared package. Dev builds are not on JSR, so the JSR dry run checks a `jsr:@cplieger/*` import of a dev build against the newest stable version of the same major, and leaves `jsr.json` unchanged |
+| `actions/publish-surface` | checks that npm and JSR publish exactly the files the package's `exports` reach, and no undeclared package. It fails when `jsr publish --dry-run` refuses the package, such as for a slow type in its public API, so a package JSR would reject fails its pull request. Dev builds are not on JSR, so the JSR dry run checks a `jsr:@cplieger/*` import of a dev build against the newest stable version of the same major, and leaves `jsr.json` unchanged |
 | `actions/render-hub-overview` | builds the Docker Hub overview page from the README's marked summary and `compose.yaml` |
 | `actions/comment-audit` | fails when source carries more than 0.55 comment lines per code line |
 | `actions/intake` | runs the pull-request title and `main` intake checks of the `pr-policy` job |

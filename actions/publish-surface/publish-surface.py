@@ -427,6 +427,13 @@ def jsr_shipped(pkg_dir: Path) -> set[Path]:
         if swaps:
             jsr_path.write_bytes(original)
     combined = proc.stdout + '\n' + proc.stderr
+    if proc.returncode != 0:
+        # jsr runs its own publish checks (slow types, exports) in the dry run;
+        # it can exit non-zero after it has listed every file.
+        raise SurfaceError(
+            f'jsr publish --dry-run refused the package (exit {proc.returncode}). '
+            f'The release would fail the same way.\n{combined[-2000:]}'
+        )
     pkg_root = pkg_dir.resolve()
     shipped: set[Path] = set()
     for line in combined.splitlines():
