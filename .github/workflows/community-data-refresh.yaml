@@ -133,7 +133,7 @@ jobs:
           permission-pull-requests: write
 
       - name: Write the notices' issues
-        if: steps.check.outputs.notices_changed == 'true'
+        if: ${{ !cancelled() && steps.app-token.outcome == 'success' && steps.check.outputs.notices_changed == 'true' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ matrix.repo }}
@@ -143,7 +143,7 @@ jobs:
           python3 scripts/community_data_refresh.py issues --repo "$REPO" --plan "$PLAN"
 
       - name: Propose cplieger/${{ matrix.repo }}'s refresh
-        if: steps.check.outputs.changed == 'true'
+        if: ${{ !cancelled() && steps.app-token.outcome == 'success' && steps.check.outputs.changed == 'true' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}

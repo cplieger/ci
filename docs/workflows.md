@@ -339,13 +339,13 @@ This workflow runs none of the repository's code. It reads the newest completed 
 `notices.json` is a JSON list of at most 50 notices. A notice is an object with the keys `id`, `title`, `body` and `labels`, and optionally `upstream`, `from` and `to`; any other key is refused:
 
 - `id` matches `^[a-z0-9][a-z0-9-]*$`, is at most 64 characters, and names one notice in the list.
-- `title` is one non-empty line of at most 256 characters, and `body` is text. Neither may hold a link: a URL, a `www.` host, a markdown or HTML link or image, or an email address.
+- `title` is one non-empty line of at most 256 characters, and `body` is text. Outside code, neither may hold a link (a URL, a `www.` host, a markdown or HTML link or image, or an email address) or open an HTML comment (`<!--`), which would hide the lines the workflow appends. Code is a backtick code span on one line, or in the body a fenced code block; a body whose code fence never closes is refused, since the fence would run over the lines the workflow appends.
 - `labels` lists labels from the row's `labels`, each at most once.
 - `upstream` names one of the row's `upstreams`. `from` and `to` are 40-hex commits of that upstream, given together and only with `upstream`. The issue then ends with `Upstream change: <upstream>/compare/<from>...<to>`, written from the row's own URL, the only link an issue carries.
 
 The issue body is the notice's body, that link, and a last line `<!-- community-data id=<id> -->`, and it may be at most 65,536 characters. The last line is how the workflow finds a notice's issue; a marker anywhere else in the body does not count, so text a person quotes cannot claim a notice.
 
-The issues move only after the refresh run was found successful and its proposal accepted. When the newest refresh run failed, or the proposal is refused, the run fails before it reads or plans any issue, so every issue stays as it was. For a row that declares `labels`, the check reads the repository's `community-data` issues, open and closed, at most 200 by newest update, and plans the writes that bring them in step with the notices, one issue per `id`:
+The issues move only after the refresh run was found successful and its proposal accepted. When the newest refresh run failed, or the proposal is refused, the run fails before it reads or plans any issue, so every issue stays as it was. For a row that declares `labels`, the check reads the repository's `community-data` issues, at most 200 listed in pages of 100: every open one first, then closed ones by newest update in the pages left. A repository with 200 or more open `community-data` issues and pull requests is refused, since a partial list could open a duplicate or miss a close. A closed issue past the pages read is not reopened: its notice opens a new issue. The check then plans the writes that bring them in step with the notices, one issue per `id`:
 
 - A new notice opens an issue labelled `community-data` and the notice's labels.
 - A closed issue whose notice is listed again is reopened with the notice's text and labels.
@@ -355,7 +355,7 @@ The issues move only after the refresh run was found successful and its proposal
 
 A run opens or reopens at most 10 issues per repository. Any further notice that needs one is listed in one `Community data notices waiting for a later run` issue, which the next runs keep in step and close once nothing waits. A label the plan names that the repository lacks is created first.
 
-The run reads the proposal and the issues with a read token holding `actions: read` and `issues: read` on the repository. It mints the App token, scoped to that repository with `contents`, `pull-requests` and `issues` write, only when the proposal changes a file or the issue plan is not empty. It writes the issues only when the plan is not empty, and opens or updates the pull request only when a file changed. The App's installation must grant Issues read and write, or minting either token fails.
+The run reads the proposal and the issues with a read token holding `actions: read` and `issues: read` on the repository. It mints the App token, scoped to that repository with `contents`, `pull-requests` and `issues` write, only when the proposal changes a file or the issue plan is not empty. It writes the issues only when the plan is not empty, and opens or updates the pull request only when a file changed. Each of the two writes runs when the other failed, and the run then fails. The App's installation must grant Issues read and write, or minting either token fails.
 
 `release-maintenance.yaml` runs every hour for two-branch repositories only. It merges a Renovate security pull request on `dev` or `main` when `ci / validate` is green and the pull request carries a patch, minor, digest or pin label.
 

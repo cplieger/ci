@@ -831,6 +831,27 @@ class Notices(unittest.TestCase):
         self.refused(many, 'notices.json holds 51 notices, over 50')
         self.assertEqual(len(notices_of(many[:50])), 50)
 
+    def test_an_id_of_the_longest_length_finds_its_issue(self):
+        nid = 'x' * cdr.NOTICE_ID_MAX
+        (n,) = notices_of([a_notice(nid)])
+        self.assertEqual(cdr.issue_key({'body': n.body}), nid)
+        self.assertIsNone(cdr.issue_key({'body': marker_line(nid + 'x')}))
+
+    def test_an_html_comment_opener_outside_code_is_refused(self):
+        for field, text in (
+            ('title', 'a <!-- b'),
+            ('body', 'see below\n<!--'),
+            ('body', '<!-- x -->'),
+        ):
+            with self.subTest(f'{field}: {text}'):
+                self.refused(
+                    [a_notice(**{field: text})],
+                    f"notice 'sonarr-parser': the {field} opens an HTML comment",
+                )
+        for text in ('the `<!--` opener', '```html\n<!-- x\n```'):
+            with self.subTest(text):
+                notices_of([a_notice(body=text)])
+
     def test_notice_id_pattern(self):
         for nid in ('a', '0', 'a-1', 'x' * 64):
             with self.subTest(nid):
@@ -898,10 +919,49 @@ class Notices(unittest.TestCase):
                         [a_notice(**{field: text})],
                         f"notice 'sonarr-parser': the {field} holds a link",
                     )
-        for text in ('Sonarr parser 4.0.1.2 changed', 'see [candidate] below', 'f(x) = y', 'a: b'):
+        for text in (
+            'Sonarr parser 4.0.1.2 changed',
+            'see [candidate] below',
+            'f(x) = y',
+            'a: b',
+            'needs eslint@9.0',
+            'pkg@v1.2.3',
+            'the `https://example.com` pattern',
+            'the ``[a](b)`` pattern',
+        ):
             for field in ('title', 'body'):
                 with self.subTest(f'{field}: {text}'):
                     notices_of([a_notice(**{field: text})])
+
+    def test_code_is_not_read_for_links(self):
+        parser = r'+    new Regex(@"^\[(?<subgroup>.+?)\](?:_|-|\s|\.)?(?<title>.+?)"),'
+        for body in (
+            f'Sonarr changed its parser.\n\n```diff\n{parser}\n```\n',
+            f'~~~\n{parser}\n~~~',
+            '````\n```\nsee https://example.com\n```\n````\n',
+            f'  ```diff\n{parser}\n  ```  ',
+            'the `x`` https://example.com ``y`',
+        ):
+            with self.subTest(body):
+                self.assertTrue(notices_of([a_notice(body=body)])[0].body.startswith(body.rstrip()))
+        for body in (
+            parser,
+            f'```diff\n{parser}\n```\n{parser}',
+            'the `x` and https://example.com',
+            'a `span\nover https://example.com\nlines` here',
+            '```a`b\nhttps://example.com',
+            '    ```\nhttps://example.com',
+            'write to a@example.com',
+        ):
+            with self.subTest(body):
+                self.refused([a_notice(body=body)], 'the body holds a link')
+        for body in ('```diff\n-a\n', '````\n-a\n```\n', '~~~\n-a\n```\n'):
+            with self.subTest(body):
+                self.refused(
+                    [a_notice(body=body)],
+                    "notice 'sonarr-parser': the body opens a code fence it never closes",
+                )
+        self.refused([a_notice(title='```https://example.com')], 'the title holds a link')
 
     def test_notice_text_caps(self):
         for kw, want in (
@@ -1075,6 +1135,7 @@ class IssuePlan(unittest.TestCase):
             {k: v for k, v in bulk.items() if k != 'body'},
             {'kind': 'create', 'title': cdr.BULK_TITLE, 'labels': [cdr.ISSUE_LABEL]},
         )
+        self.assertTrue(bulk['body'].startswith('This run opened or reopened 10 issues,'))
         self.assertTrue(bulk['body'].endswith(f'\n{BULK_MARKER}\n'))
         listed = [n.title for n in ns if n.title in bulk['body']]
         self.assertEqual(listed, [n.title for n in ns[11:]])
@@ -1098,12 +1159,13 @@ class IssuePlan(unittest.TestCase):
         self.assertEqual(self.plan(ns[:10], [a_bulk(50, state='closed')])[10:], [])
 
 
-ISSUES = f'{SAPI}/issues?labels=community-data&state=all&sort=updated&direction=desc&per_page=100'
+ISSUES = f'{SAPI}/issues?labels=community-data&state={{}}&sort=updated&direction=desc&per_page=100'
+OPEN, CLOSED = ISSUES.format('open'), ISSUES.format('closed')
 
 
-def issue_page(start, count=100):
+def issue_page(start, count=100, state='open'):
     return [
-        {'number': n, 'state': 'open', 'title': 't', 'body': '', 'labels': []}
+        {'number': n, 'state': state, 'title': 't', 'body': '', 'labels': []}
         for n in range(start, start + count)
     ]
 
@@ -1113,19 +1175,48 @@ class ReadIssues(unittest.TestCase):
         fake = FakeGitHub(routes)
         return cdr.read_issues(ghrest.Client(run=fake, sleep=lambda _: None), 'subflux')
 
-    def test_at_most_200_are_read_and_pull_requests_dropped(self):
+    def numbers(self, routes):
+        return [i['number'] for i in self.read(routes)]
+
+    def test_every_open_issue_is_read_then_closed_ones_in_the_pages_left(self):
         first = issue_page(1)
         first[0] = {**first[0], 'pull_request': {'url': 'x'}}
         routes = {
-            ('GET', f'{ISSUES}&page=1'): first,
-            ('GET', f'{ISSUES}&page=2'): issue_page(101),
-            ('GET', f'{ISSUES}&page=3'): issue_page(201),
+            ('GET', f'{OPEN}&page=1'): first,
+            ('GET', f'{OPEN}&page=2'): issue_page(101, 99),
+            ('GET', f'{CLOSED}&page=1'): issue_page(300, state='closed'),
         }
-        self.assertEqual([i['number'] for i in self.read(routes)], list(range(2, 201)))
+        self.assertEqual(self.numbers(routes), list(range(2, 200)))
+        routes[('GET', f'{OPEN}&page=1')] = issue_page(1, 5)
+        self.assertEqual(self.numbers(routes), [1, 2, 3, 4, 5, *range(300, 400)])
 
-    def test_a_short_page_ends_the_read(self):
-        got = self.read({('GET', f'{ISSUES}&page=1'): issue_page(1, 5)})
-        self.assertEqual([i['number'] for i in got], [1, 2, 3, 4, 5])
+    def test_a_short_page_ends_each_read(self):
+        routes = {
+            ('GET', f'{OPEN}&page=1'): issue_page(1, 5),
+            ('GET', f'{CLOSED}&page=1'): issue_page(9, 2, state='closed'),
+        }
+        self.assertEqual(self.numbers(routes), [1, 2, 3, 4, 5, 9, 10])
+        routes[('GET', f'{OPEN}&page=1')] = []
+        self.assertEqual(self.numbers(routes), [9, 10])
+
+    def test_open_issues_filling_the_read_are_refused(self):
+        routes = {
+            ('GET', f'{OPEN}&page=1'): issue_page(1),
+            ('GET', f'{OPEN}&page=2'): issue_page(101),
+        }
+        with self.assertRaisesRegex(
+            cdr.RefusedError,
+            'cplieger/subflux lists 200 or more open community-data issues, the most this job reads',
+        ):
+            self.read(routes)
+
+    def test_a_page_that_is_no_issue_list_is_refused(self):
+        for answer in ({'message': 'x'}, [{'number': '3'}], ['x']):
+            with (
+                self.subTest(repr(answer)),
+                self.assertRaisesRegex(cdr.RefusedError, 'answered no list of issues'),
+            ):
+                self.read({('GET', f'{OPEN}&page=1'): answer})
 
 
 def issue_url(n):
@@ -1385,7 +1476,8 @@ class WorkflowRun(unittest.TestCase):
         run = a_run(41, head_repository={'full_name': 'cplieger/subflux'})
         routes = {
             f'GET {runs_path}': {'workflow_runs': runs or [run]},
-            f'GET {ISSUES}&page=1': list(issues),
+            f'GET {OPEN}&page=1': [i for i in issues if i['state'] == 'open'],
+            f'GET {CLOSED}&page=1': [i for i in issues if i['state'] != 'open'],
             f'POST {SAPI}/issues': {'html_url': issue_url(20)},
             f'POST {SAPI}/labels': {},
         }
@@ -1502,6 +1594,26 @@ class WorkflowRun(unittest.TestCase):
         self.assertIn(ns[11].title, bulk['body'])
         self.assertIn(ns[12].title, bulk['body'])
         self.assertEqual(writes[12][2], {'state': 'closed', 'state_reason': 'completed'})
+
+    def test_a_failed_issue_write_still_opens_the_pull_request(self):
+        path = 'internal/release/patterns_gen.go'
+        routes = self.subflux_routes()
+        del routes[f'POST {SAPI}/issues']
+        for (m, p), v in base_routes().items():
+            routes[f'{m} {p.replace(API, SAPI)}'] = v
+        for ref in (BASE, TIP):
+            routes[f'GET {SAPI}/contents/{path}?ref={ref}'] = {'sha': 'blob'}
+
+        def proposal(root):
+            write_proposal(root, [path], {path: b'new\n'}, notices=[a_notice('a')])
+
+        rc, result, calls, mints = self.replay('subflux', routes, proposal)
+        self.assertEqual(rc, 1)
+        self.assertIn('step "Write the notices\' issues" exited 1', result['failed'])
+        self.assertEqual(mints, [self.mint(READ_MINT), self.mint(APP_MINT)])
+        writes = self.writes(calls)
+        self.assertEqual(writes[0][:2], ('POST', f'{SAPI}/issues'))
+        self.assertEqual(writes[-1][:2], ('POST', f'{SAPI}/pulls'))
 
     def test_files_only_opens_the_pull_request_and_writes_no_issue(self):
         routes = {f'{m} {p}': v for (m, p), v in base_routes().items()}
@@ -1646,7 +1758,8 @@ JOBS = {
             },
             {
                 'name': "Write the notices' issues",
-                'if': "steps.check.outputs.notices_changed == 'true'",
+                'if': "${{ !cancelled() && steps.app-token.outcome == 'success'"
+                " && steps.check.outputs.notices_changed == 'true' }}",
                 'env': {
                     'GH_TOKEN': '${{ steps.app-token.outputs.token }}',
                     'REPO': '${{ matrix.repo }}',
@@ -1657,7 +1770,8 @@ JOBS = {
             },
             {
                 'name': "Propose cplieger/${{ matrix.repo }}'s refresh",
-                'if': "steps.check.outputs.changed == 'true'",
+                'if': "${{ !cancelled() && steps.app-token.outcome == 'success'"
+                " && steps.check.outputs.changed == 'true' }}",
                 'env': {
                     'GH_TOKEN': '${{ steps.app-token.outputs.token }}',
                     'APP_SLUG': '${{ steps.app-token.outputs.app-slug }}',

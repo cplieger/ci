@@ -180,6 +180,34 @@ class Steps(unittest.TestCase):
         self.assertIn("step 'Boom' exited 3", res['failed'])
         self.assertNotIn('After', res['ran'])
 
+    def test_after_a_failed_step_only_the_steps_whose_if_allows_it_run(self):
+        wf = {
+            'jobs': {
+                'j': {
+                    'steps': [
+                        {'name': 'Boom', 'id': 'boom', 'run': 'exit 3'},
+                        {'name': 'Plain', 'if': "inputs.x == 'y'", 'run': 'true'},
+                        {'name': 'Default', 'run': 'true'},
+                        {'name': 'Again', 'run': 'exit 4', 'if': 'always()'},
+                        {
+                            'name': 'Outcome',
+                            'if': "${{ !cancelled() && steps.boom.outcome == 'failure' }}",
+                            'run': 'test "$S" = failure',
+                            'env': {'S': '${{ job.status }}'},
+                        },
+                        {'name': 'Failed', 'if': 'failure()', 'run': 'true'},
+                    ]
+                }
+            }
+        }
+        rc, res = self.replay(wf, {'inputs': {'x': 'y'}})
+        self.assertEqual(rc, 1)
+        self.assertTrue(res['failed'].startswith("step 'Boom' exited 3"), res['failed'])
+        self.assertEqual(
+            res['ran'],
+            ['Boom', 'Plain (if false)', 'Default (if false)', 'Again', 'Outcome', 'Failed'],
+        )
+
     def test_a_failing_hook_fails_the_replay_before_its_step(self):
         wf = {'jobs': {'j': {'steps': [{'name': 'Step', 'run': 'true'}]}}}
         rc, res = self.replay(wf, {}, '--hook', 'Step=exit 4')

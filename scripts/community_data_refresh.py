@@ -46,7 +46,11 @@ WORKFLOW = 'community-data-refresh.yaml'
 REPOS = {
     'access': {
         'branch': 'dev',
-        'paths': ('internal/blocklist/common.txt', 'webauthn/aaguids_gen.go'),
+        'paths': (
+            'internal/blocklist/common.txt',
+            'webauthn/aaguids_gen.go',
+            'webauthn/testdata/aaguid.json',
+        ),
     },
     'langtag': {
         'branch': 'dev',
@@ -91,22 +95,26 @@ NOTICE_ID = re.compile(r'^[a-z0-9][a-z0-9-]*$')
 NOTICE_ID_MAX = 64
 NOTICE_KEYS = frozenset({'id', 'title', 'body', 'labels', 'upstream', 'from', 'to'})
 NOTICE_NEEDS = ('id', 'title', 'body', 'labels')
-# Text GitHub renders as a link, or that names one: a URL, a www. host
-# (autolinked), a markdown inline or reference link, an HTML link or image, and
-# an email address (autolinked). The job writes the only link, from the row.
+# The forms refused in a notice's text outside code (prose()): a URL, a www.
+# host, a markdown inline or reference link, an HTML link or image, an email
+# address. GitHub's own references (#26, a SHA, @name) are not matched. The
+# job writes the only link, from the row.
 LINK = re.compile(
-    r'://|www\.|\]\(|^\s*\[[^\]]*\]:|<a\b|<img\b|href\s*=|mailto:|[\w.+-]+@[\w-]+\.\w',
+    r'://|www\.|\]\(|^\s*\[[^\]]*\]:|<a\b|<img\b|href\s*=|mailto:'
+    r'|[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-z]+\b',
     re.IGNORECASE | re.MULTILINE,
 )
+FENCE = re.compile(r' {0,3}(`{3,}|~{3,})')
+TICKS = re.compile(r'`+')
 # The label on every issue this job keeps; a notice adds its own from its row.
 ISSUE_LABEL = 'community-data'
 OPENS_MAX = 10
-# The issues check reads, newest update first: two pages of the listing.
+# The most issues check lists, in pages of ISSUES_PAGE (read_issues).
 ISSUES_MAX = 200
 ISSUES_PAGE = 100
 # An issue is this job's by its body's last line, so text a person quotes
 # above it cannot claim an id.
-MARKER = re.compile(r'<!-- community-data id=([a-z0-9][a-z0-9-]{0,63}) -->')
+MARKER = re.compile(rf'<!-- community-data id=([a-z0-9][a-z0-9-]{{0,{NOTICE_ID_MAX - 1}}}) -->')
 BULK_MARKER = '<!-- community-data bulk -->'
 # issue_plan's key for the bulk issue; no notice id is empty.
 BULK = ''
@@ -141,6 +149,44 @@ def title_fault(title: str) -> str | None:
     if len(title) > TITLE_MAX:
         return f'the title is {len(title)} characters, over {TITLE_MAX}'
     return None
+
+
+def without_spans(line: str) -> str:
+    """`line` with each code span, a backtick run closed by an equal run on the
+    same line, blanked; a span over several lines stays prose, so it is read
+    and never hides a link GitHub renders."""
+    out, i = [], 0
+    while opened := TICKS.search(line, i):
+        close = re.compile(rf'(?<!`)`{{{len(opened[0])}}}(?!`)').search(line, opened.end())
+        if close is None:
+            out.append(line[i : opened.end()])
+            i = opened.end()
+            continue
+        out.append(line[i : opened.start()] + ' ')
+        i = close.end()
+    out.append(line[i:])
+    return ''.join(out)
+
+
+def prose(text: str, blocks: bool) -> str | None:
+    """`text` with the code GitHub renders as code blanked, its fenced blocks
+    too when `blocks`, or None when a fence never closes: it would run over the
+    compare link and marker the job appends."""
+    lines, fence = [], None
+    for line in text.splitlines():
+        if fence:
+            char, size = fence
+            if re.fullmatch(rf' {{0,3}}{re.escape(char)}{{{size},}}[ \t]*', line):
+                fence = None
+            lines.append('')
+            continue
+        opened = FENCE.match(line) if blocks else None
+        if opened and not (opened[1][0] == '`' and '`' in line[opened.end() :]):
+            fence = (opened[1][0], len(opened[1]))
+            lines.append('')
+            continue
+        lines.append(without_spans(line))
+    return None if fence else '\n'.join(lines)
 
 
 def marker(nid: str) -> str:
@@ -192,8 +238,14 @@ def read_notice(i: int, entry, row: dict) -> Notice:
     if fault:
         raise RefusedError(f'{where}: {fault}')
     for field, text in (('title', title), ('body', body)):
-        if LINK.search(text):
+        read = prose(text, blocks=field == 'body')
+        if read is None:
+            raise RefusedError(f'{where}: the body opens a code fence it never closes')
+        if LINK.search(read):
             raise RefusedError(f'{where}: the {field} holds a link')
+        # An unclosed comment would hide the compare link up to the marker's -->.
+        if '<!--' in read:
+            raise RefusedError(f'{where}: the {field} opens an HTML comment')
     written = '\n\n'.join(b for b in (body.rstrip(), link, marker(nid)) if b) + '\n'
     if len(written) > BODY_MAX:
         raise RefusedError(f'{where}: the body is {len(written)} characters, over {BODY_MAX}')
@@ -235,15 +287,11 @@ def read_notices(root: Path, row: dict) -> list[Notice] | None:
     return notices
 
 
-def read_issues(gh: ghrest.Client, repo: str) -> list[dict]:
-    """`repo`'s ISSUE_LABEL issues, open and closed, at most ISSUES_MAX by
-    newest update; the pull requests the listing also answers are dropped."""
-    path = (
-        f'repos/{OWNER}/{repo}/issues?labels={ISSUE_LABEL}&state=all'
-        f'&sort=updated&direction=desc&per_page={ISSUES_PAGE}'
-    )
+def issue_pages(gh: ghrest.Client, path: str, pages: int) -> tuple[list[dict], int, bool]:
+    """Up to `pages` pages of the issue listing at `path`, pull requests
+    dropped, with the pages read and whether the listing ended within them."""
     issues = []
-    for page in range(1, ISSUES_MAX // ISSUES_PAGE + 1):
+    for page in range(1, pages + 1):
         batch = gh.get(f'{path}&page={page}')
         if not isinstance(batch, list) or not all(
             isinstance(i, dict) and type(i.get('number')) is int for i in batch
@@ -251,8 +299,28 @@ def read_issues(gh: ghrest.Client, repo: str) -> list[dict]:
             raise RefusedError(f'GET {path}&page={page} answered no list of issues')
         issues += [i for i in batch if 'pull_request' not in i]
         if len(batch) < ISSUES_PAGE:
-            break
-    return issues
+            return issues, page, True
+    return issues, pages, False
+
+
+def read_issues(gh: ghrest.Client, repo: str) -> list[dict]:
+    """`repo`'s ISSUE_LABEL issues in at most ISSUES_MAX listed: every open
+    one, then the closed ones newest update first in the pages left, which
+    only a reopen reads. Refused when the open ones fill ISSUES_MAX, since a
+    partial open set would plan a duplicate or miss a close."""
+    path = (
+        f'repos/{OWNER}/{repo}/issues?labels={ISSUE_LABEL}&state={{}}'
+        f'&sort=updated&direction=desc&per_page={ISSUES_PAGE}'
+    )
+    pages = ISSUES_MAX // ISSUES_PAGE
+    opened, used, ended = issue_pages(gh, path.format('open'), pages)
+    if not ended:
+        raise RefusedError(
+            f'{OWNER}/{repo} lists {ISSUES_MAX} or more open {ISSUE_LABEL} issues,'
+            f' the most this job reads'
+        )
+    closed, _, _ = issue_pages(gh, path.format('closed'), pages - used)
+    return opened + closed
 
 
 def issue_key(issue: dict) -> str | None:
@@ -291,7 +359,7 @@ def written(kind: str, title: str, body: str, labels, issue: dict | None, manage
 def bulk_body(titles: list[str]) -> str:
     listing = ''.join(f'- {t}\n' for t in titles)
     return (
-        f'This run opened {OPENS_MAX} issues, the most one run opens. These notices'
+        f'This run opened or reopened {OPENS_MAX} issues, the most one run opens. These notices'
         f' wait for a later run:\n\n{listing}\n{BULK_MARKER}\n'
     )
 
