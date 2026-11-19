@@ -477,7 +477,7 @@ class Judge(unittest.TestCase):
         self.assertEqual(t.state['scenarios']['files']['last_good'], None)
         self.assertNotIn('/compare/', body)
         self.assertIn(
-            'No earlier point the trend holds was within the thresholds for this scenario, so '
+            'No earlier point this run read was within the thresholds for this scenario, so '
             'there is no known-good point and no commit range. The first bad point is '
             f'`{PURE_SHA.format(6)[:12]}`.',
             body,
@@ -515,12 +515,59 @@ class Judge(unittest.TestCase):
 
     def test_the_last_good_point_holds_every_bad_cell_s_value_on_any_runner(self):
         cold = tp(slow(cold=3000.0), 9)['cells'][0] | {'baseline': 1000.0, 'bad': True}
-        without = tp({('files', 'live', 'cpu_ms'): 3000.0}, 2, runner='self-hosted')
-        no_value = tp(GOOD, 3)
+        other = tp(GOOD, 2, runner='self-hosted')
+        without = tp({('files', 'live', 'cpu_ms'): 3000.0}, 3)
+        no_value = tp(GOOD, 4)
         no_value['cells'][0]['value'] = None
-        points = [perf_trend.seen(p) for p in (tp(GOOD, 1), without, no_value)]
+        points = [perf_trend.seen(p) for p in (tp(GOOD, 1), other, without, no_value)]
         self.assertEqual(
-            perf_trend.last_good(points, 'files', [cold], [], None)['commit'], PURE_SHA.format(1)
+            perf_trend.last_good(points, 'files', [cold], [], None)['commit'], PURE_SHA.format(2)
+        )
+
+    def test_a_group_regression_is_ranged_past_a_point_with_one_of_its_cells_over_the_guard(self):
+        back = ('files', 'back', 'cpu_ms')
+        t = Trend(points=0)
+        for _ in range(4):
+            t.add({**slow(1000.0, 1000.0), back: 1000.0})
+        t.add({**slow(3000.0, 1000.0), back: 1000.0})
+        t.add({**slow(1400.0, 1400.0), back: 1400.0})
+        judged = t.add({**slow(1400.0, 1400.0), back: 1400.0})
+        self.assertEqual(t.scenario(), 'open')
+        self.assertIn(
+            f'https://github.com/{REPO}/compare/{PURE_SHA.format(4)}...{PURE_SHA.format(6)}',
+            judged.actions[0]['body'],
+        )
+
+    def test_a_spread_slowdown_is_ranged_past_the_unjudged_point_it_began_at(self):
+        spread = [('files', w, 'cpu_ms') for w in ('cold', 'rest', 'live', 'away')]
+        t = Trend(points=0)
+        for _ in range(4):
+            t.add(dict.fromkeys(spread, 1000.0))
+        for _ in range(3):
+            judged = t.add(dict.fromkeys(spread, 1350.0))
+        self.assertIn(
+            f'https://github.com/{REPO}/compare/{PURE_SHA.format(4)}...{PURE_SHA.format(6)}',
+            judged.actions[0]['body'],
+        )
+
+    def test_a_branch_issue_ranged_from_dev_lists_the_counts_changed_since_that_point(self):
+        dom = ('files', 'cold', 'dom')
+        dev = [perf_trend.seen(tp({**GOOD, dom: 640}, n)) for n in range(1, 6)]
+        history, state = [], perf_trend.new_state('proof')
+        for n in (101, 102):
+            judged = perf_trend.judge(
+                history,
+                tp({**slow(cold=3000.0), dom: 700}, n, series='proof'),
+                state,
+                repo=REPO,
+                fallback=dev,
+            )
+            state = judged.state
+            history.append(perf_trend.seen(judged.point))
+        body = judged.actions[0]['body']
+        self.assertIn(f'/compare/{PURE_SHA.format(5)}...{PURE_SHA.format(101)}', body)
+        self.assertIn(
+            'Counts that changed: `files/x10/chromium/desktop/cold/dom` 640 to 700.', body
         )
 
     def test_points_of_an_accepted_regression_are_good_for_the_next_one(self):
@@ -1560,8 +1607,29 @@ class Record(unittest.TestCase):
             perf_trend.needs([], 'proof'), ['series/proof/state.json', 'series/dev/state.json']
         )
 
+    def test_a_branch_series_takes_dev_s_acceptance_and_files_no_accepted_slowdown(self):
+        for n in range(1, 8):
+            self.record(GOOD, n)
+        self.record(slow(cold=3000.0), 8)
+        opened, _ = self.record(slow(cold=3000.0), 9)
+        closed = {
+            'number': 7,
+            'state': 'closed',
+            'closed_at': '2026-11-01T09:30:00Z',
+            'body': opened[0]['body'],
+        }
+        self.record(slow(cold=3000.0), 10, issues=[closed])
+        self.record(slow(cold=3000.0), 11, issues=[closed])
+        for n in (101, 102):
+            actions, _ = self.record(slow(cold=3000.0), n, series='proof', issues=[closed])
+            self.assertEqual(actions, [])
+        state = json.loads((self.root / 'series/proof/state.json').read_text())
+        self.assertEqual(state['scenarios'], {})
+
     def test_needs_names_the_dev_points_next_to_a_branch_series_first_however_old_the_series(self):
         dev = [f'series/dev/points/202610{d:02d}T000000Z-aaa.json' for d in range(1, 31)]
+        # The same second as the series' first point, though its commit sorts after it.
+        dev.append('series/dev/points/20261101T000000Z-zzz.json')
         later = [f'series/dev/points/202611{d:02d}T120000Z-aaa.json' for d in range(1, 30)]
         proof = [f'series/proof/points/202611{d:02d}T000000Z-bbb.json' for d in range(1, 9)]
         listing = ['series/dev/state.json', *dev, *later, *proof]
