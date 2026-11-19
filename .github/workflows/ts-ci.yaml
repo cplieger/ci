@@ -63,6 +63,14 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       # The read loads the semver library npm bundles beside this Node, and a
       # runner other than GitHub's hosted image may carry no Node, so install
       # the one validate tests on.
@@ -79,18 +87,17 @@ jobs:
       - name: Read cplieger.vitestShards, cplieger.browsers and engines.node
         id: read
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          NOTE: ${{ runner.temp }}/engines-note
           PACKAGE: ${{ inputs.working-directory }}/package.json
           READ_PACKAGE: |
             const { appendFileSync, readFileSync } = require("node:fs");
-            const path = process.env.PACKAGE;
-            // One line only: a newline from the file (JSON.parse quotes the source)
-            // would start a workflow command of the branch's choosing.
             const fail = (why) => {
-              console.error(`::error::${path}: ${why.replace(/[\r\n]+/g, " ")}`);
+              console.error(why);
               process.exit(1);
             };
             let pkg;
-            try { pkg = JSON.parse(readFileSync(path, "utf8")); }
+            try { pkg = JSON.parse(readFileSync(process.env.PACKAGE, "utf8")); }
             catch (err) { fail(`cannot read the package settings: ${err.message}`); }
             const own = pkg?.cplieger;
             if (own !== undefined && (own === null || typeof own !== "object" || Array.isArray(own))) {
@@ -168,13 +175,18 @@ jobs:
             console.log(`vitest shards: ${count}`);
             console.log(`browsers (Vitest Browser Mode only): ${browsers.join(", ")}`);
             if (!range) {
-              console.log("::notice::package.json declares no engines.node floor; nothing to test beyond the publishing Node");
+              appendFileSync(process.env.NOTE, "package.json declares no engines.node floor, so only the publishing Node tests it");
             } else if (floor === "") {
-              console.log(`::notice::engines.node ${shown} allows Node ${major}, older than any Node release from 4 on, so only the publishing Node tests it`);
+              appendFileSync(process.env.NOTE, `engines.node ${shown} allows Node ${major}, older than any Node release from 4 on, so only the publishing Node tests it`);
             } else {
               console.log(`engines.node ${shown}: testing on Node ${floor}`);
             }
-        run: node -e "$READ_PACKAGE"
+        # The script writes a refusal to stderr and a notice to NOTE, both the branch's data,
+        # which gha_annotate escapes.
+        run: |
+          . "$CI_TOOLS/gha-log.sh"
+          { why=$(node -e "$READ_PACKAGE" 2>&1 >&3); } 3>&1 || { gha_annotate error '%s: %s' "$PACKAGE" "$why"; exit 1; }
+          [ ! -s "$NOTE" ] || gha_annotate notice '%s' "$(cat "$NOTE")"
 
       # The Go module of a test server the suite runs against (`sseFixture`,
       # relative to package.json) and its `-tags` (`sseFixtureTags`). The
@@ -184,13 +196,14 @@ jobs:
       - name: Read sseFixture and sseFixtureTags
         id: fixture
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           PACKAGE: ${{ inputs.working-directory }}/package.json
           READ_FIXTURE: |
             const { appendFileSync, readFileSync, realpathSync, statSync } = require("node:fs");
             const { dirname, isAbsolute, join, relative, resolve, sep } = require("node:path");
             const shown = process.env.PACKAGE;
             const fail = (why) => {
-              console.error(`::error::${shown}: ${why.replace(/[\r\n]+/g, " ")}`);
+              console.error(why);
               process.exit(1);
             };
             const root = resolve(process.env.GITHUB_WORKSPACE);
@@ -266,7 +279,10 @@ jobs:
             }
             out(rel, tags, sumRel);
             console.log(`sseFixture: building the Go module in ${rel} with -tags "${tags}"`);
-        run: node -e "$READ_FIXTURE"
+        # A refusal on stderr is the branch's data, which gha_annotate escapes.
+        run: |
+          . "$CI_TOOLS/gha-log.sh"
+          { why=$(node -e "$READ_FIXTURE" 2>&1 >&3); } 3>&1 || { gha_annotate error '%s: %s' "$PACKAGE" "$why"; exit 1; }
 
   validate:
     needs: package
@@ -353,6 +369,7 @@ jobs:
           PLAYWRIGHT_DEPS_CACHE: ${{ runner.temp }}/playwright-debs
           PLAYWRIGHT_DEPS_CACHE_KEY: ${{ steps.debs.outputs.cache-primary-key }}
         run: |
+          . "$CI_TOOLS/gha-log.sh"
           if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
             need_libs=()
             IFS=, read -ra engines <<< "$CPLIEGER_BROWSERS"
@@ -361,7 +378,7 @@ jobs:
                 chromium) npx --no-install playwright install chromium ;;
                 firefox | webkit) need_libs+=("$engine") ;;
                 *)
-                  echo "::error::unknown browser engine '${engine}'"
+                  gha_annotate error "unknown browser engine '%s'" "${engine}"
                   exit 1
                   ;;
               esac
@@ -399,12 +416,14 @@ jobs:
         if: ${{ needs.package.outputs.sse-fixture != '' }}
         timeout-minutes: 10
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           FIXTURE_DIR: ${{ needs.package.outputs.sse-fixture }}
           FIXTURE_TAGS: ${{ needs.package.outputs.sse-fixture-tags }}
         run: |
+          . "$CI_TOOLS/gha-log.sh"
           cd "$GITHUB_WORKSPACE/$FIXTURE_DIR"
           if ! go build -tags "$FIXTURE_TAGS" -o "$RUNNER_TEMP/sse-fixture" .; then
-            echo "::error::the sseFixture test server in ${FIXTURE_DIR} failed to build with -tags \"${FIXTURE_TAGS}\""
+            gha_annotate error 'the sseFixture test server in %s failed to build with -tags "%s"' "${FIXTURE_DIR}" "${FIXTURE_TAGS}"
             exit 1
           fi
           echo "SSE_FIXTURE=$RUNNER_TEMP/sse-fixture" >> "$GITHUB_ENV"
@@ -466,10 +485,12 @@ jobs:
         id: test-vitest
         continue-on-error: true
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           SHARD: ${{ matrix.shard }}
           SHARDS: ${{ needs.package.outputs.count }}
         run: |
           (
+            . "$CI_TOOLS/gha-log.sh"
             if [ "$SHARDS" -eq 1 ]; then
               npm test
               exit "$?"
@@ -478,7 +499,7 @@ jobs:
             # its last command only (and no pre/post script): anything after vitest
             # would take --shard while every shard ran the whole suite.
             if ! node -e "const s=(require('./package.json').scripts||{}).test||''; process.exit(/\bvitest\b/.test(s) && !/[;&|#\n]/.test(s) ? 0 : 1)"; then
-              echo "::error::package.json sets cplieger.vitestShards to ${SHARDS}, so this job runs 'npm test -- --shard=${SHARD}/${SHARDS}': the package.json test script must be one vitest command. Move a command that follows the tests to posttest."
+              gha_annotate error "package.json sets cplieger.vitestShards to %s, so this job runs 'npm test -- --shard=%s/%s': the package.json test script must be one vitest command. Move a command that follows the tests to posttest." "${SHARDS}" "${SHARD}" "${SHARDS}"
               exit 1
             fi
             npm test -- --shard="${SHARD}/${SHARDS}"
@@ -542,8 +563,11 @@ jobs:
         id: version-parity-package-json-jsr-json
         if: ${{ matrix.shard == 1 }}
         continue-on-error: true
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
         run: |
           (
+            . "$CI_TOOLS/gha-log.sh"
             cd "$(git rev-parse --show-toplevel)"
             rc=0
             while IFS= read -r jsr; do
@@ -552,7 +576,7 @@ jobs:
               jv=$(jq -r '.version // ""' "$jsr")
               pv=$(jq -r '.version // ""' "$pkg")
               if [ "$jv" != "$pv" ]; then
-                echo "::error file=${jsr}::version mismatch: ${pkg}=${pv:-<none>} vs ${jsr}=${jv:-<none>}. The two manifests must carry the same version (it is overwritten from the git tag at publish, but must agree in-repo)."
+                gha_annotate error -p file="${jsr}" 'version mismatch: %s=%s vs %s=%s. The two manifests must carry the same version (it is overwritten from the git tag at publish, but must agree in-repo).' "${pkg}" "${pv:-<none>}" "${jsr}" "${jv:-<none>}"
                 rc=1
               fi
             done < <(git ls-files | grep -E '(^|/)jsr\.json$')
@@ -583,8 +607,10 @@ jobs:
         if: ${{ inputs.web-lint && matrix.shard == 1 }}
         continue-on-error: true
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
+          MAP_FILE: ${{ runner.temp }}/importmap-invalid
           IMPORTMAP_CHECK: |
-            const { readFileSync, readdirSync } = require("node:fs");
+            const { readFileSync, readdirSync, writeFileSync } = require("node:fs");
             const { join, relative } = require("node:path");
             const { execSync } = require("node:child_process");
             let root;
@@ -615,7 +641,8 @@ jobs:
               let parsed;
               try { parsed = JSON.parse(m[1]); }
               catch (err) {
-                console.error(`::error file=${relative(root, f)}::invalid importmap JSON: ${err.message}`);
+                writeFileSync(process.env.MAP_FILE, relative(root, f));
+                console.error(`invalid importmap JSON: ${err.message}`);
                 process.exit(1);
               }
               for (const k of Object.keys(parsed.imports || {})) keys.add(k);
@@ -658,16 +685,22 @@ jobs:
               }
             }
             if (violations.length) {
-              console.error("::error::Bare import(s) missing from the page import map(s):");
+              console.error("Bare import(s) missing from the page import map(s):");
               for (const v of violations) console.error("  " + v);
               console.error('Add the key to the served HTML <script type="importmap"> (and vendor the target at build).');
               process.exit(1);
             }
             console.log(`import-map coverage OK (${keys.size} keys / ${mapCount} map(s), ${tsFiles.length} source files).`);
         run: |
+          # A refusal on stderr, and the invalid map's path in MAP_FILE, are the branch's data,
+          # which gha_annotate escapes.
           (
+            . "$CI_TOOLS/gha-log.sh"
             printf '%s' "$IMPORTMAP_CHECK" > "${RUNNER_TEMP:-/tmp}/importmap-check.cjs"
-            node "${RUNNER_TEMP:-/tmp}/importmap-check.cjs"
+            { why=$(node "${RUNNER_TEMP:-/tmp}/importmap-check.cjs" 2>&1 >&3); } 3>&1 || {
+              gha_annotate error -p file="$(cat "$MAP_FILE" 2>/dev/null)" '%s' "$why"
+              exit 1
+            }
           ) || { echo "Import map coverage" >> /tmp/_ci_failures; exit 1; }
 
       - name: Lint web (CSS/HTML)
@@ -839,6 +872,7 @@ jobs:
           PLAYWRIGHT_DEPS_CACHE: ${{ runner.temp }}/playwright-debs
           PLAYWRIGHT_DEPS_CACHE_KEY: ${{ steps.debs.outputs.cache-primary-key }}
         run: |
+          . "$CI_TOOLS/gha-log.sh"
           if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
             need_libs=()
             IFS=, read -ra engines <<< "$CPLIEGER_BROWSERS"
@@ -847,7 +881,7 @@ jobs:
                 chromium) npx --no-install playwright install chromium ;;
                 firefox | webkit) need_libs+=("$engine") ;;
                 *)
-                  echo "::error::unknown browser engine '${engine}'"
+                  gha_annotate error "unknown browser engine '%s'" "${engine}"
                   exit 1
                   ;;
               esac
@@ -881,12 +915,14 @@ jobs:
         if: ${{ needs.package.outputs.sse-fixture != '' }}
         timeout-minutes: 10
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           FIXTURE_DIR: ${{ needs.package.outputs.sse-fixture }}
           FIXTURE_TAGS: ${{ needs.package.outputs.sse-fixture-tags }}
         run: |
+          . "$CI_TOOLS/gha-log.sh"
           cd "$GITHUB_WORKSPACE/$FIXTURE_DIR"
           if ! go build -tags "$FIXTURE_TAGS" -o "$RUNNER_TEMP/sse-fixture" .; then
-            echo "::error::the sseFixture test server in ${FIXTURE_DIR} failed to build with -tags \"${FIXTURE_TAGS}\""
+            gha_annotate error 'the sseFixture test server in %s failed to build with -tags "%s"' "${FIXTURE_DIR}" "${FIXTURE_TAGS}"
             exit 1
           fi
           echo "SSE_FIXTURE=$RUNNER_TEMP/sse-fixture" >> "$GITHUB_ENV"
@@ -894,9 +930,11 @@ jobs:
       # The same hand-off as validate's test step, without its soft gate.
       - name: Test (vitest) on the engines floor
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           SHARD: ${{ matrix.shard }}
           SHARDS: ${{ needs.package.outputs.count }}
         run: |
+          . "$CI_TOOLS/gha-log.sh"
           if [ "$SHARDS" -eq 1 ]; then
             npm test
             exit "$?"
@@ -905,7 +943,7 @@ jobs:
           # its last command only (and no pre/post script): anything after vitest
           # would take --shard while every shard ran the whole suite.
           if ! node -e "const s=(require('./package.json').scripts||{}).test||''; process.exit(/\bvitest\b/.test(s) && !/[;&|#\n]/.test(s) ? 0 : 1)"; then
-            echo "::error::package.json sets cplieger.vitestShards to ${SHARDS}, so this job runs 'npm test -- --shard=${SHARD}/${SHARDS}': the package.json test script must be one vitest command. Move a command that follows the tests to posttest."
+            gha_annotate error "package.json sets cplieger.vitestShards to %s, so this job runs 'npm test -- --shard=%s/%s': the package.json test script must be one vitest command. Move a command that follows the tests to posttest." "${SHARDS}" "${SHARD}" "${SHARDS}"
             exit 1
           fi
           npm test -- --shard="${SHARD}/${SHARDS}"

@@ -53,7 +53,7 @@ class SkipPaths(unittest.TestCase):
         return subprocess.run(
             ['bash', '-e', '-c', step_body()],
             cwd=self.repo,
-            env={**os.environ, 'VERSION': version},
+            env={**os.environ, 'VERSION': version, 'CI_TOOLS': str(RELEASE.parents[2] / 'scripts')},
             capture_output=True,
             text=True,
             timeout=60,

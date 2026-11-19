@@ -25,8 +25,12 @@ ACTIONS = SCRIPTS.parent / 'actions'
 HOSTILE = '100%\r\n::add-mask::x'
 ESCAPED = '100%25%0D%0A::add-mask::x'
 OPENS_COMMAND = re.compile(r'::[a-z-]*(::| |$)')
-# A shell command literal, then data on the same line: an expansion or a printf conversion.
-SHELL_RAW = re.compile(r'::\$|::(?:error|warning|notice|group)\b[^\n]*?(?:\$|%[-+ #0-9.]*[a-zA-Z])')
+# A command literal, then data on the same line: an expansion (shell or a JavaScript template), a
+# printf conversion, a Python f-string field or a string concatenation.
+SHELL_RAW = re.compile(
+    r'::\$|::(?:error|warning|notice|group)\b[^\n]*?'
+    r'(?:\$|%[-+ #0-9.]*[a-zA-Z]|\{[A-Za-z_]|["\'`]\s*\+)'
+)
 
 
 def load(path: pathlib.Path):
@@ -56,7 +60,8 @@ def command_literals(path: pathlib.Path) -> list[int]:
 
 
 def shell_command_lines(text: str) -> list[int]:
-    """Lines of TEXT, a shell script, that write a workflow command holding data outside gha-log.sh."""
+    """Lines of TEXT, a shell script or a workflow, that write a workflow command holding data
+    outside gha-log.sh."""
     return [
         n
         for n, line in enumerate(text.splitlines(), 1)
@@ -309,6 +314,19 @@ class NoRawCommands(unittest.TestCase):
         self.assertGreater(len(scripts), 20)
         self.assertGreater(len([p for p in scripts if p.is_relative_to(ACTIONS)]), 5)
 
+    def test_no_run_step_writes_a_command_with_data_outside_the_helper(self):
+        root = SCRIPTS.parent
+        files = sorted(
+            [*root.glob('.github/workflows/*.y*ml'), *root.glob('actions/*/action.y*ml')]
+        )
+        found = {
+            str(p.relative_to(root)): lines
+            for p in files
+            if (lines := shell_command_lines(p.read_text()))
+        }
+        self.assertEqual(found, {}, 'write these through gha-log.sh gha_annotate')
+        self.assertGreater(len(files), 40)
+
     def test_the_shell_check_sees_each_raw_form(self):
         for source, want in (
             ('echo "::error::${x} failed"', [1]),
@@ -318,6 +336,10 @@ class NoRawCommands(unittest.TestCase):
             ('echo "::group::$(name)"', [1]),
             ('echo "::$kind::m"', [1]),
             ('decide false "::warning::because ${why}."', [1]),
+            ('console.error(`::error::${path}: ${why}`);', [1]),
+            ('console.error("::error file=" + f + "::bad");', [1]),
+            ("print(f'::notice::{name} skipped')", [1]),
+            ('gha_annotate error "series must match ^[a-z]{0,30}$"', []),
             ('echo "::error::fixed text"', []),
             ('echo "::endgroup::"', []),
             ('# echo "::error::$x" in a comment', []),

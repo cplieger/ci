@@ -68,9 +68,17 @@ class PackageSettings(Harness):
             (self.pkg / 'package.json').write_text(raw)
         elif manifest is not None:
             (self.pkg / 'package.json').write_text(json.dumps(manifest))
-        return self.run_step(
-            {'READ_PACKAGE': self.STEP['env']['READ_PACKAGE'], 'PACKAGE': './package.json'}
-        )
+        return self.run_step(self.step_env())
+
+    def step_env(self) -> dict[str, str]:
+        """The step's env, its notice file emptied as each job starts with none."""
+        note = self.tmp / 'note'
+        note.unlink(missing_ok=True)
+        return {
+            'READ_PACKAGE': self.STEP['env']['READ_PACKAGE'],
+            'PACKAGE': './package.json',
+            'NOTE': str(note),
+        }
 
     def assert_refused(self, run, message: str):
         self.assertEqual(run.rc, 1, run.out)
@@ -267,13 +275,7 @@ class PackageSettings(Harness):
         preload = self.tmp / 'no-npm.js'
         preload.write_text('process.execPath = "/nonexistent/bin/node";\n')
         (self.pkg / 'package.json').write_text(json.dumps({'engines': {'node': '>=24'}}))
-        run = self.run_step(
-            {
-                'READ_PACKAGE': self.STEP['env']['READ_PACKAGE'],
-                'PACKAGE': './package.json',
-                'NODE_OPTIONS': f'--require={preload}',
-            }
-        )
+        run = self.run_step({**self.step_env(), 'NODE_OPTIONS': f'--require={preload}'})
         self.assert_refused(run, 'cannot load the semver library npm bundles')
 
     def test_a_long_range_is_cut(self):
@@ -651,7 +653,11 @@ class TestStep(Harness):
     def test_the_step_takes_its_shard_and_the_read_count(self):
         self.assertEqual(
             self.STEP['env'],
-            {'SHARD': '${{ matrix.shard }}', 'SHARDS': '${{ needs.package.outputs.count }}'},
+            {
+                'CI_TOOLS': '${{ runner.temp }}/cplieger-ci/scripts',
+                'SHARD': '${{ matrix.shard }}',
+                'SHARDS': '${{ needs.package.outputs.count }}',
+            },
         )
 
     def test_unsharded_runs_the_test_script_as_it_stands(self):

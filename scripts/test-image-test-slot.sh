@@ -88,7 +88,7 @@ print(bool(STATUS_CALL.search(open(sys.argv[2]).read())))
 
 run_body() {
   RC=0
-  OUT="$(cd "$2" && PROBE_OUT="$2/out" bash -e "$WORK/$1.sh" 2>&1)" || RC=$?
+  OUT="$(cd "$2" && CI_TOOLS="$ROOT/scripts" PROBE_OUT="$2/out" bash -e "$WORK/$1.sh" 2>&1)" || RC=$?
 }
 
 # ── T1-T3, T13-T15: the steps as declared ────────────────────────────────────

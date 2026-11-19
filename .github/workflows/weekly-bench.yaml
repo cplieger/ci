@@ -74,6 +74,7 @@ jobs:
           ENROLLED: ${{ needs.fanout.outputs.enrolled }}
         run: |
           set -uo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
 
           if [ -z "$LIVE" ]; then
             # Without this no repo is cloned, the next step checks none, and the
@@ -94,12 +95,12 @@ jobs:
             # rate-limited run can still clone; the gh CLI would resolve through
             # GraphQL, whose quota this run may already have spent.
             if ! timeout 120 git clone --depth 1 "https://github.com/cplieger/${r}.git" "$dest" >/dev/null 2>&1; then
-              echo "::warning::clone failed or timed out for ${r} - skipping"
+              gha_annotate warning 'clone failed or timed out for %s, so it is skipped' "${r}"
               rm -rf "$dest"
               continue
             fi
             if ! units=$(bash _ci/scripts/go-units.sh "$dest" '^func Benchmark'); then
-              echo "::warning::module discovery failed for ${r} - skipping"
+              gha_annotate warning 'module discovery failed for %s, so it is skipped' "${r}"
               rm -rf "$dest"
               continue
             fi
@@ -136,6 +137,7 @@ jobs:
           SKIPPED: ${{ steps.clone.outputs.skipped }}
         run: |
           set -uo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
 
           broken=""
           checked=0
@@ -195,7 +197,7 @@ jobs:
             # Fail closed. A benchmark that does not run is a process defect,
             # not a finding, so it goes red with the reason rather than opening
             # an issue nothing would ever close.
-            echo "::error::benchmarks fail to execute in:${broken}"
+            gha_annotate error 'benchmarks fail to execute in:%s' "${broken}"
             exit 1
           fi
 
@@ -230,6 +232,7 @@ jobs:
           ONLY: ${{ github.event.inputs.only }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
 
           # The enrolled set, by three criteria: (1) deterministic compute in the
           # TIMED region (no disk, network, sleep or wall clock, enforced per
@@ -264,7 +267,7 @@ jobs:
           for k in $ENROLLED; do
             r=${k%%/*}
             case " $live " in *" $r "*) keys="$keys $k" ;; *)
-              echo "::warning::enrolled repo '$r' is not live (archived, fork, private, or renamed) - skipping $k" ;;
+              gha_annotate warning "enrolled repo '%s' is not live (archived, fork, private, or renamed), so %s is skipped" "$r" "$k" ;;
             esac
           done
 
@@ -311,16 +314,16 @@ jobs:
               # included, is logged as skipped below. Bounded as the fanout's clone is.
               if ! timeout 120 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
                 clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
-                echo "::warning::clone failed or timed out for ${r} - skipping"
+                gha_annotate warning 'clone failed or timed out for %s, so it is skipped' "${r}"
               # Guarded for the same reason as weekly-stryker's copy: a clone that
               # exits 0 with no resolvable HEAD makes rev-parse exit 128, and
               # under `bash -e` that kills the fanout and every other repo's
               # matrix entry with it. One skipped repo is the right blast radius.
               elif ! sha=$(git -C scan rev-parse HEAD 2>/dev/null); then
-                echo "::warning::cannot resolve HEAD for ${r} - skipping"
+                gha_annotate warning 'cannot resolve HEAD for %s, so it is skipped' "${r}"
                 sha=""
               elif ! units=$(bash _ci/scripts/go-units.sh scan '^func Benchmark'); then
-                echo "::warning::module discovery failed for ${r} - skipping"
+                gha_annotate warning 'module discovery failed for %s, so it is skipped' "${r}"
                 units="" sha=""
               fi
             fi
@@ -357,7 +360,7 @@ jobs:
           # clone that failed, a repo that lost its benchmarks, or an `only`
           # filter that matched no enrolled repo.
           if [ "$(printf '%s' "$matrix" | jq 'length')" -eq 0 ]; then
-            echo "::error::matrix is empty after probing '${keys:-<none>}'" \
+            gha_annotate error "matrix is empty after probing '%s'" "${keys:-<none>}" \
                  "- nothing would be benchmarked, failing instead of skipping"
             exit 1
           fi
@@ -424,6 +427,7 @@ jobs:
           GOWORK: "off"
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           case "$COUNT" in
             ''|*[!0-9]*) echo "::error::count must be a positive integer"; exit 1 ;;
           esac
@@ -489,9 +493,9 @@ jobs:
               fn=${alt%%/*}
               sub=${alt#*/}
               if ! grep -rq --include='*_test.go' "func ${fn}(" .; then
-                echo "::warning::skip pattern '${alt}' names ${fn}, which no *_test.go declares - the skip is dead and the series is back in the chart"
+                gha_annotate warning "skip pattern '%s' names %s, which no *_test.go declares, so the skip is dead and the series is back in the chart" "${alt}" "${fn}"
               elif [ "$sub" != "$alt" ] && ! grep -rq --include='*_test.go' -- "$sub" .; then
-                echo "::warning::skip pattern '${alt}' matches ${fn} but its sub-benchmark '${sub}' appears nowhere - that half of the skip is dead"
+                gha_annotate warning "skip pattern '%s' matches %s but its sub-benchmark '%s' appears nowhere, so that half of the skip is dead" "${alt}" "${fn}" "${sub}"
               fi
             done
           fi
@@ -602,10 +606,11 @@ jobs:
           KEY: ${{ matrix.key }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           if jq -e 'type == "array" and length > 0' bench/bench.json >/dev/null 2>&1; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::${KEY}: no medians from the run job, so nothing was published"
+            gha_annotate notice '%s: no medians from the run job, so nothing was published' "${KEY}"
           fi
 
       # The action cannot bootstrap a missing data branch (verified in its
@@ -686,6 +691,7 @@ jobs:
           DIR: ${{ matrix.dir }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           work=$(mktemp -d)
           trap 'rm -rf "$work"' EXIT
           data="${DIR}/data.js"
@@ -718,10 +724,10 @@ jobs:
               echo "re-pointed ${REPO} ${data} at ${SHA}"
               exit 0
             fi
-            echo "::warning::push of ${REPO} ${data} refused (attempt ${attempt}), retrying from a fresh clone"
+            gha_annotate warning 'push of %s %s refused (attempt %s), retrying from a fresh clone' "${REPO}" "${data}" "${attempt}"
             sleep $((attempt * 3))
           done
-          echo "::error::could not push ${REPO} ${data} after 5 attempts"
+          gha_annotate error 'could not push %s %s after 5 attempts' "${REPO}" "${data}"
           exit 1
 
   # ─── Tracker issue per entry (Pattern C, same shape as the siblings) ────────
@@ -759,6 +765,7 @@ jobs:
           # NOT `set -e`: errexit is neutered inside the `if ! process_entry`
           # form, and an earlier sibling reported success while every repo failed.
           set -uo pipefail
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
 
           WEEK=$(date -u +'%Y-%m-%d %H:%M')
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
@@ -822,9 +829,9 @@ jobs:
 
           had_failure=0
           while IFS=$'\t' read -r repo dir slug key; do
-            echo "::group::$key"
+            gha_annotate group '%s' "$key"
             if ! process_entry "$repo" "$dir" "$slug"; then
-              echo "::warning::tracker update failed for ${key} - continuing"
+              gha_annotate warning 'tracker update failed for %s, and the other trackers are still updated' "${key}"
               had_failure=1
             fi
             echo "::endgroup::"

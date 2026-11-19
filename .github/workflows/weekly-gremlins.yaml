@@ -50,6 +50,7 @@ jobs:
           ONLY: ${{ github.event.inputs.only }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           # Repo discovery over REST, not the GraphQL `gh repo list`: the fanout
           # is a single point of failure for the whole run, and GraphQL shares a
           # quota the per-repo reads draw too, so a quota exhaustion there loses
@@ -84,7 +85,7 @@ jobs:
           # visibly if the repo cannot be tested, and the others run on.
           GO_REPOS=()
           fault() {
-            echo "::warning::$1"
+            gha_annotate warning '%s' "$1"
             echo "### $1" >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
           }
           units_err=$(mktemp)

@@ -12,6 +12,8 @@ export GIT_COMMITTER_NAME=probe GIT_COMMITTER_EMAIL=probe@example.invalid
 unset GITHUB_TOKEN GH_TOKEN
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Every job runs beside the ci source, whose gha-log.sh its steps source.
+export CI_TOOLS="$ROOT/scripts"
 RELEASE_YAML="$ROOT/.github/workflows/release.yaml"
 TEMPLATE="$ROOT/.github/workflow-templates/release.yml"
 RS="$ROOT/scripts/release-state.sh"
@@ -402,7 +404,7 @@ channel_out() { # <ref> <default branch> <mode> [private] [fork] -> the step's o
   local rc=0
   : >"$WORK/out"
   GITHUB_REF="$1" DEFAULT_BRANCH="$2" INPUT_MODE="$3" REPO_PRIVATE="${4:-false}" REPO_FORK="${5:-false}" \
-    GITHUB_OUTPUT="$WORK/out" \
+    GITHUB_OUTPUT="$WORK/out" CI_TOOLS="$ROOT/scripts" \
     bash "$WORK/channel.sh" >"$WORK/channel.err" 2>&1 || rc=$?
   cat "$WORK/out"
   [ "$rc" -eq 0 ] || echo "EXIT=$rc"
@@ -444,7 +446,7 @@ chk "C4 the refusal reads the default branch" "$(jq -r .DEFAULT_BRANCH "$WORK/ch
 chk "C4 and the repository's visibility and fork flag" \
   "$(jq -r '.REPO_PRIVATE + " " + .REPO_FORK' "$WORK/channel-env.json")" \
   '${{ github.event.repository.private }} ${{ github.event.repository.fork }}'
-chk "C4 every detect step follows Select channel" "$(fact '.names | index("Select channel")')" "1"
+chk "C4 every detect step but the two checkouts follows Select channel" "$(fact '.names | index("Select channel")')" "2"
 
 # ── Select version: the release decision ─────────────────────────────────────
 select_out() { # <channel> <mode> <root_changed> <subs> <anchor> <base> [repo type] -> outputs on one line
@@ -3593,6 +3595,7 @@ chk "W15 the barrier knows which registries a dev build writes" "$(fact '."barri
 # dispatches that file by name, and refuses a ref naming another repository's workflow.
 mkdir -p "$WORK/barrier-tools"
 printf '%s\n' 'echo "barrier WORKFLOW=$WORKFLOW"' >"$WORK/barrier-tools/release-state.sh"
+ln -s "$ROOT/scripts/gha-log.sh" "$WORK/barrier-tools/gha-log.sh"
 hold() { (GITHUB_REPOSITORY=o/app GITHUB_WORKFLOW_REF="$1" CI_TOOLS="$WORK/barrier-tools" bash "$WORK/barrier-step.sh") 2>&1 || echo "EXIT=$?"; }
 chk "W15 the barrier logs the caller's workflow ref and dispatches the caller's file" \
   "$(hold o/app/.github/workflows/release.yaml@refs/heads/main)" \

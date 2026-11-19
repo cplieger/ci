@@ -89,6 +89,7 @@ jobs:
             scripts/tracker_issue.py
             scripts/ghrest.py
             scripts/workflow_commands.py
+            scripts/gha-log.sh
           sparse-checkout-cone-mode: false
           path: ci
 
@@ -118,6 +119,7 @@ jobs:
           ASSIGNEE: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/ci/scripts/gha-log.sh"
           label='weekly-ci-failure'
           tracker="${GITHUB_WORKSPACE}/ci/scripts/tracker_issue.py"
 
@@ -126,7 +128,7 @@ jobs:
           # This job is always in its own run's list, so an empty read is a
           # failed read; acting on it would close the tracker as green.
           if [ "$(jq length <<<"$jobs")" -eq 0 ]; then
-            echo "::error::the jobs API returned no jobs for run ${RUN_ID}; not touching the tracker"
+            gha_annotate error 'the jobs API returned no jobs for run %s, so the tracker is left alone' "${RUN_ID}"
             exit 1
           fi
 
@@ -138,7 +140,7 @@ jobs:
             <<<"$jobs")
           running=$(jq '[.[] | select(.status != "completed")] | length' <<<"$jobs")
           if [ "$running" -gt 1 ]; then
-            echo "::warning::${running} jobs are still running while this one reports; list every other job in the caller's needs:"
+            gha_annotate warning "%s jobs are still running while this one reports. List every other job in the caller's needs:" "${running}"
           fi
 
           # Duration of THIS attempt, from the run's own start, so a rerun is

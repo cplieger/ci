@@ -943,6 +943,7 @@ class GatePolicyTest(unittest.TestCase):
         tracker_dir = self.workspace / 'ci' / 'scripts'
         tracker_dir.mkdir(parents=True)
         (tracker_dir / 'tracker_issue.py').write_text(GATE_STUB_TRACKER)
+        (tracker_dir / 'gha-log.sh').symlink_to(Path(__file__).resolve().parent / 'gha-log.sh')
         self.runner_temp = self.tmp / 'runner-temp'
         self.runner_temp.mkdir()
         self.scenario = self.tmp / 'gate-scenario.json'

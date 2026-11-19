@@ -174,23 +174,35 @@ jobs:
   caller:
     runs-on: ubuntu-slim
     timeout-minutes: 2
-    permissions: {}
+    # The checkout's read, for the ci source and its gha-log.sh.
+    permissions:
+      contents: read
     steps:
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       - name: Refuse a caller outside the two-branch model
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           REPO_PRIVATE: ${{ github.event.repository.private }}
           REPO_FORK: ${{ github.event.repository.fork }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           if [ "$DEFAULT_BRANCH" != dev ] || [ "$REPO_PRIVATE" = true ] || [ "$REPO_FORK" = true ]; then
-            echo "::error::docker-release.yaml publishes only from a public, non-fork repository whose default branch is dev (this one: default branch ${DEFAULT_BRANCH:-<unknown>}, private ${REPO_PRIVATE:-<unknown>}, fork ${REPO_FORK:-<unknown>}). Make dev the default branch, or remove the release.yaml caller and publish from the repository's own workflow."
+            gha_annotate error "docker-release.yaml publishes only from a public, non-fork repository whose default branch is dev (this one: default branch %s, private %s, fork %s). Make dev the default branch, or remove the release.yaml caller and publish from the repository's own workflow." "${DEFAULT_BRANCH:-<unknown>}" "${REPO_PRIVATE:-<unknown>}" "${REPO_FORK:-<unknown>}"
             exit 1
           fi
           case "${GITHUB_REF:-}" in
             refs/heads/dev | refs/heads/main) ;;
             *)
-              echo "::error::docker-release.yaml publishes only from refs/heads/dev or refs/heads/main, not ${GITHUB_REF:-<unknown>}."
+              gha_annotate error 'docker-release.yaml publishes only from refs/heads/dev or refs/heads/main, not %s.' "${GITHUB_REF:-<unknown>}"
               exit 1
               ;;
           esac
@@ -229,19 +241,34 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      # The version checks write through its gha-log.sh. The stable channel
+      # re-tags what the dev channel already built rather than rebuild it;
+      # promote-digest.sh decides which build that is. GHCR is read anonymously
+      # (the images are public), so no registry login happens before anything
+      # is written. The rebuild scope step reads the same source on both channels.
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       - name: Derive version tags
         id: tags
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           CHANNEL: ${{ inputs.channel }}
           VERSION_INPUT: ${{ inputs.version }}
           DEV_VERSION: ${{ inputs.dev-version }}
           RELEASE_NEEDED: ${{ inputs.release-needed }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           case "$CHANNEL" in
             dev | stable) ;;
             *)
-              echo "::error::channel must be 'dev' or 'stable', got '${CHANNEL}'"
+              gha_annotate error "channel must be 'dev' or 'stable', got '%s'" "${CHANNEL}"
               exit 1
               ;;
           esac
@@ -298,8 +325,11 @@ jobs:
       # Checked before any registry write or tag, on both channels.
       - name: Verify root module path
         if: ${{ steps.tags.outputs.publish == 'true' }}
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           if [ ! -f go.mod ]; then
             echo "no root go.mod; not a Go app, nothing to check"
             exit 0
@@ -315,11 +345,11 @@ jobs:
               exit 1
               ;;
             "$expected"/v[0-9]*)
-              echo "::error::go.mod module path '$modpath' must be '$expected': drop the /vN suffix from go.mod and rewrite internal imports; apps use the plain module path at every major."
+              gha_annotate error "go.mod module path '%s' must be '%s': drop the /vN suffix from go.mod and rewrite internal imports. Apps use the plain module path at every major." "$modpath" "$expected"
               exit 1
               ;;
             *)
-              echo "::error::go.mod module path '$modpath' must be '$expected'; a module path must name its own repository or Go tooling cannot fetch it. Fix the module directive and internal imports, then re-release."
+              gha_annotate error "go.mod module path '%s' must be '%s'. A module path must name its own repository or Go tooling cannot fetch it. Fix the module directive and internal imports, then re-release." "$modpath" "$expected"
               exit 1
               ;;
           esac
@@ -383,20 +413,6 @@ jobs:
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-
-      # The stable channel re-tags what the dev channel already built rather
-      # than rebuild it; promote-digest.sh decides which build that is. GHCR is
-      # read anonymously (the images are public), so no registry login happens
-      # before anything is written. The rebuild scope step reads the same source
-      # on both channels.
-      - name: Check out the ci source
-        if: ${{ steps.tags.outputs.publish == 'true' }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: .cplieger-ci
-          persist-credentials: false
 
       # An image is reused only once its build signed and attested it.
       - name: Install Cosign
@@ -792,13 +808,16 @@ jobs:
 
       - name: Resolve the image reference
         id: image
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           digest=$(cat "$RUNNER_TEMP/digests/linux-amd64")
           case "$digest" in
             sha256:*) ;;
             *)
-              echo "::error::the amd64 digest artifact holds '${digest}', not a sha256 digest"
+              gha_annotate error "the amd64 digest artifact holds '%s', not a sha256 digest" "${digest}"
               exit 1
               ;;
           esac
@@ -1065,8 +1084,9 @@ jobs:
           PACKAGE: ${{ env.REGISTRY }}/${{ env.RUNNER_IMAGE_NAME }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           if ! why=$(bash "$CI_TOOLS/attested-sbom.sh" "${PACKAGE}@${PROMOTED_DIGEST}" "$GITHUB_SHA" sbom.spdx.json); then
-            echo "::warning::the summary lists no packages for ${IMAGE}, because ${why}"
+            gha_annotate warning 'the summary lists no packages for %s, because %s' "${IMAGE}" "${why}"
             exit 1
           fi
 
@@ -1238,8 +1258,9 @@ jobs:
           SUBPACKAGES_JSON: ${{ inputs.subpackages }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           if ! why=$(bash "$CI_TOOLS/attested-sbom.sh" "${REGISTRY}/${IMAGE_NAME}@${PROMOTE_DIGEST}" "$GITHUB_SHA" sbom.spdx.json); then
-            echo "::error::sbom.spdx.json is missing, because ${why}. A promotion publishes the SBOM its build attested, so nothing is published without it."
+            gha_annotate error 'sbom.spdx.json is missing, because %s. A promotion publishes the SBOM its build attested, so nothing is published without it.' "${why}"
             exit 1
           fi
 
@@ -1268,12 +1289,14 @@ jobs:
         if: ${{ steps.claim.outputs.claimed == 'true' }}
         id: manifest
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           TAGS: ${{ needs.prepare.outputs.tags }}
           VERSION: ${{ needs.prepare.outputs.version }}
           MAJOR: ${{ needs.prepare.outputs.major }}
           MINOR: ${{ needs.prepare.outputs.minor }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           tag_args=()
           if [ -n "$PROMOTE_DIGEST" ]; then
             for tg in "$VERSION" "$MINOR" "$MAJOR" latest; do
@@ -1302,7 +1325,7 @@ jobs:
             exit 1
           fi
           if [ -n "$PROMOTE_DIGEST" ] && [ "$digest" != "$PROMOTE_DIGEST" ]; then
-            echo "::error::promotion changed the digest: dev build ${PROMOTE_DIGEST}, stable tags ${digest}; a promoted image must be byte-identical"
+            gha_annotate error 'promotion changed the digest: dev build %s, stable tags %s. A promoted image must be byte-identical.' "${PROMOTE_DIGEST}" "${digest}"
             exit 1
           fi
           {
@@ -1496,6 +1519,7 @@ jobs:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           . "$CI_TOOLS/retry.sh"
           retry cosign verify-attestation --type openvex \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
@@ -1531,7 +1555,7 @@ jobs:
           extract_ids /tmp/vex-predicates.json > /tmp/vex-got
           MISSING=$(comm -23 /tmp/vex-want /tmp/vex-got)
           if [ -n "$MISSING" ]; then
-            echo "::error::uploaded OpenVEX attestations are missing vulnerability ids: $(echo "$MISSING" | tr '\n' ' ')"
+            gha_annotate error 'uploaded OpenVEX attestations are missing vulnerability ids: %s' "$(echo "$MISSING" | tr '\n' ' ')"
             exit 1
           fi
           echo "verified OpenVEX attestations cover: $(tr '\n' ' ' < /tmp/vex-want)"
@@ -1576,6 +1600,7 @@ jobs:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           . "$CI_TOOLS/retry.sh"
           # Docker Hub does not create a repository for every push path: the
           # first-ever `imagetools create` to a brand-new repo failed with HTTP
@@ -1604,7 +1629,7 @@ jobs:
           case "$code" in
             201) echo "Created docker.io/${namespace}/${name}" ;;
             400|409) echo "docker.io/${namespace}/${name} already exists (HTTP ${code})" ;;
-            *) echo "::warning::Unexpected HTTP ${code} for docker.io/${namespace}/${name}"; cat /tmp/dhrepo.json 2>/dev/null || true ;;
+            *) gha_annotate warning 'Unexpected HTTP %s for docker.io/%s/%s' "${code}" "${namespace}" "${name}"; cat /tmp/dhrepo.json 2>/dev/null || true ;;
           esac
 
       # Docker Hub gets the finished GHCR index by digest-preserving copy, with
@@ -1638,6 +1663,7 @@ jobs:
           MAJOR: ${{ needs.prepare.outputs.major }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           . "$CI_TOOLS/retry.sh"
           listing=$(bash "$CI_TOOLS/dashboards.sh" list)
           read -r -d '' -a files <<<"$listing" || true
@@ -1660,7 +1686,7 @@ jobs:
               msg="${file} is neither a classic dashboard (a string uid, no apiVersion)"
               msg="$msg nor a schema v2 resource (exactly apiVersion dashboard.grafana.app/v2, kind Dashboard,"
               msg="$msg a metadata holding only a name, and a spec object)"
-              echo "::error file=${file}::$msg"
+              gha_annotate error -p file="${file}" '%s' "$msg"
               rc=1
             fi
             formats+=("$format")
@@ -1722,13 +1748,14 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           PREV=$(bash "$CI_TOOLS/render-notes.sh" --site docker --version "$VERSION" --print-previous)
           if [ -z "$PREV" ]; then
             echo "::notice::No earlier stable release exists, so the notes carry no system-package diff."
             exit 0
           fi
           if ! ref=$(bash "$CI_TOOLS/release-sbom.sh" "$PREV" "$RUNNER_TEMP/sbom-prev.spdx.json"); then
-            echo "::warning::The notes carry no system-package diff, because ${ref}."
+            gha_annotate warning 'The notes carry no system-package diff, because %s.' "${ref}"
             exit 0
           fi
           echo "previous SBOM: ${PREV} (${ref})"
@@ -1803,6 +1830,7 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           dir="$RUNNER_TEMP/release-assets"
           names=$(bash "$CI_TOOLS/release-assets.sh" names "$VERSION" "$dir")
           mapfile -t assets <<<"$names"
@@ -1812,7 +1840,7 @@ jobs:
           # endpoint returns only PUBLISHED releases, so a draft orphaned by
           # a wedged asset upload reads as absent; cleanup-drafts deletes it.
           if immutable=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" --jq .immutable 2>/tmp/relerr); then
-            echo "::notice::Release ${VERSION} already exists; skipping creation."
+            gha_annotate notice 'Release %s already exists, so it is not created again.' "${VERSION}"
             {
               echo "reused=true"
               echo "immutable=${immutable}"
@@ -1820,7 +1848,7 @@ jobs:
             } >> "$GITHUB_OUTPUT"
             exit 0
           elif ! grep -q 'HTTP 404' /tmp/relerr; then
-            echo "::error::could not determine whether Release ${VERSION} exists:"
+            gha_annotate error 'could not determine whether Release %s exists:' "${VERSION}"
             cat /tmp/relerr
             exit 1
           fi
@@ -1841,6 +1869,7 @@ jobs:
           IMMUTABLE: ${{ steps.release.outputs.immutable }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           dir="$RUNNER_TEMP/release-assets"
           names=$(bash "$CI_TOOLS/release-assets.sh" names "$VERSION" "$dir")
           mapfile -t assets <<<"$names"
@@ -1848,7 +1877,7 @@ jobs:
           # to the fresh build; the assets follow for the same reason. An
           # immutable Release refuses uploads, so its assets stay.
           if [ "$REUSED" = "true" ] && [ "$IMMUTABLE" = "true" ]; then
-            echo "::notice::Release ${VERSION} is immutable, so its assets stay as first published."
+            gha_annotate notice 'Release %s is immutable, so its assets stay as first published.' "${VERSION}"
           elif [ "$REUSED" = "true" ]; then
             gh release upload --clobber "$VERSION" "${assets[@]/#/$dir/}"
           fi
@@ -1939,6 +1968,7 @@ jobs:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           . "$CI_TOOLS/retry.sh"
 
           # Both registries are read through the distribution API with an
@@ -1979,7 +2009,7 @@ jobs:
               return 0
             fi
             got=$(cat "$served")
-            echo "::error::${label}: expected ${want:-any digest}, registry answered '${got:-nothing}'"
+            gha_annotate error "%s: expected %s, registry answered '%s'" "${label}" "${want:-any digest}" "${got:-nothing}"
             return 1
           }
 
@@ -1999,7 +2029,7 @@ jobs:
             [ -n "$package" ] || continue
             repo="${IMAGE_NAME}/${package}"
             if ! dash_token=$(pull_token "$package" "https://${REGISTRY}/token?scope=repository:${repo}:pull"); then
-              echo "::error::${REGISTRY}/${repo}: no anonymous pull token. A package's first publish leaves it private until its owner makes it public. Then rerun this job."
+              gha_annotate error "%s/%s: no anonymous pull token. A package's first publish leaves it private until its owner makes it public. Then rerun this job." "${REGISTRY}" "${repo}"
               rc=1
               continue
             fi
@@ -2103,14 +2133,15 @@ jobs:
           GOTOOLCHAIN: auto
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           out="$RUNNER_TEMP/assets"
           mkdir -p "$out"
           if ! digest=$(IMAGE="$IMAGE_NAME" bash "$CI_TOOLS/release-state.sh" release-digest "$TAG"); then
-            echo "::error::sbom.spdx.json is missing, because the image digest that ${TAG} published is unknown. ${TAG} is not published without it."
+            gha_annotate error 'sbom.spdx.json is missing, because the image digest that %s published is unknown. %s is not published without it.' "${TAG}" "${TAG}"
             exit 1
           fi
           if ! why=$(bash "$CI_TOOLS/attested-sbom.sh" "${REGISTRY}/${IMAGE_NAME}@${digest}" "$TAG" "$out/sbom.spdx.json"); then
-            echo "::error::sbom.spdx.json is missing, because ${why}. ${TAG} is not published without it."
+            gha_annotate error 'sbom.spdx.json is missing, because %s. %s is not published without it.' "${why}" "${TAG}"
             exit 1
           fi
           bash "$CI_TOOLS/release-assets.sh" stage "$TAG" "$out"

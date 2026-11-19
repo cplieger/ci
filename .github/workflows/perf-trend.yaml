@@ -90,25 +90,26 @@ jobs:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           default=$(gh api "repos/${REPO}" --jq .default_branch)
           ref=${REF:-$default}
           series=${SERIES:-dev}
           if ! [[ $series =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]]; then
-            echo "::error::series ${series} must match ^[a-z0-9][a-z0-9-]{0,30}\$"
+            gha_annotate error 'series %s must match ^[a-z0-9][a-z0-9-]{0,30}$' "${series}"
             exit 1
           fi
           if ! git check-ref-format --branch "$ref" > /dev/null 2>&1; then
-            echo "::error::${ref} is not a branch name"
+            gha_annotate error '%s is not a branch name' "${ref}"
             exit 1
           fi
           # The guard and dev's issues read only the dev series, so it holds the
           # whole set of the default branch and nothing else.
           if [ "$series" = dev ] && [ "$ref" != "$default" ]; then
-            echo "::error::only ${default} joins the dev series: dispatch ${ref} with a series of its own"
+            gha_annotate error 'only %s joins the dev series: dispatch %s with a series of its own' "${default}" "${ref}"
             exit 1
           fi
           if [ "$series" = dev ] && [ -n "$ONLY" ]; then
-            echo "::error::only a series other than dev measures part of the set (only: ${ONLY})"
+            gha_annotate error 'only a series other than dev measures part of the set (only: %s)' "${ONLY}"
             exit 1
           fi
           sha=$(gh api "repos/${REPO}/git/ref/heads/${ref}" --jq .object.sha)
@@ -121,24 +122,24 @@ jobs:
           git ls-remote --exit-code --heads "https://github.com/${REPO}.git" perf-trend > /dev/null || rc=$?
           case "${rc}:${SEED}" in
             0:true)
-              echo "::error::the perf-trend branch of ${REPO} already holds the trend's history, so there is nothing to seed"
+              gha_annotate error "the perf-trend branch of %s already holds the trend's history, so there is nothing to seed" "${REPO}"
               exit 1
               ;;
             0:*) ;;
             2:true)
               # Only dev starts the branch: every other series is judged against it.
               if [ "$series" != dev ]; then
-                echo "::error::the perf-trend branch of ${REPO} is missing: restore it from a clone that holds it, or dispatch the dev series with seed to start a new history"
+                gha_annotate error 'the perf-trend branch of %s is missing: restore it from a clone that holds it, or dispatch the dev series with seed to start a new history' "${REPO}"
                 exit 1
               fi
               python3 "$CI_TOOLS/perf_trend.py" seedable --issues "$RUNNER_TEMP/issues.json" --series "$series"
               ;;
             2:*)
-              echo "::error::the perf-trend branch of ${REPO} is missing: restore it from a clone that holds it, or dispatch with seed to start a new history"
+              gha_annotate error 'the perf-trend branch of %s is missing: restore it from a clone that holds it, or dispatch with seed to start a new history' "${REPO}"
               exit 1
               ;;
             *)
-              echo "::error::could not read the perf-trend branch of ${REPO} (git ls-remote exit ${rc})"
+              gha_annotate error 'could not read the perf-trend branch of %s (git ls-remote exit %s)' "${REPO}" "${rc}"
               exit 1
               ;;
           esac
@@ -240,6 +241,7 @@ jobs:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           url="https://github.com/${REPO}.git"
           # Through the environment, so the credential is in no command's argv.
           GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
@@ -273,13 +275,13 @@ jobs:
               git init -q -b perf-trend "$work"
               git -C "$work" remote add origin "$url"
             elif [ "$rc" -eq 2 ] && [ "$SEED" = true ]; then
-              echo "::error::the perf-trend branch of ${REPO} is missing: restore it from a clone that holds it, or dispatch the dev series with seed to start a new history"
+              gha_annotate error 'the perf-trend branch of %s is missing: restore it from a clone that holds it, or dispatch the dev series with seed to start a new history' "${REPO}"
               exit 1
             elif [ "$rc" -eq 2 ]; then
-              echo "::error::the perf-trend branch of ${REPO} is missing: restore it from a clone that holds it, or dispatch with seed to start a new history"
+              gha_annotate error 'the perf-trend branch of %s is missing: restore it from a clone that holds it, or dispatch with seed to start a new history' "${REPO}"
               exit 1
             else
-              echo "::error::could not read the perf-trend branch of ${REPO} (git ls-remote exit ${rc})"
+              gha_annotate error 'could not read the perf-trend branch of %s (git ls-remote exit %s)' "${REPO}" "${rc}"
               exit 1
             fi
             : > "$RUNNER_TEMP/summary.md"
@@ -300,10 +302,10 @@ jobs:
               cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
-            echo "::warning::the push of the ${SERIES} point was refused (attempt ${attempt}), judging it again on the branch's new head"
+            gha_annotate warning "the push of the %s point was refused (attempt %s), judging it again on the branch's new head" "${SERIES}" "${attempt}"
             sleep $((attempt * 3))
           done
-          echo "::error::could not push the ${SERIES} point to perf-trend after 5 attempts"
+          gha_annotate error 'could not push the %s point to perf-trend after 5 attempts' "${SERIES}"
           exit 1
 
       - name: Upload the actions

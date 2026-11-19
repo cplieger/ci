@@ -757,7 +757,9 @@ class Workflow(unittest.TestCase):
     def aggregate(self, default_branch: str = 'dev', *, private=False, fork=False, **results: str):
         validate = self.jobs['validate']
         self.assertIn('pr-policy', validate['needs'])
-        step = validate['steps'][0]
+        step = next(
+            s for s in validate['steps'] if s.get('name') == 'Aggregate CI dispatch results'
+        )
         env = {**os.environ}
         scope = workflow_replay.Scope(
             context('pull_request', default_branch, private=private, fork=fork), {}, []
@@ -770,6 +772,7 @@ class Workflow(unittest.TestCase):
             env[name] = results.get(
                 job, 'skipped' if job not in ('detect', 'repo', 'markdown') else 'success'
             )
+        env['CI_TOOLS'] = str(HERE)
         with tempfile.NamedTemporaryFile(mode='r') as summary:
             env['GITHUB_STEP_SUMMARY'] = summary.name
             proc = subprocess.run(

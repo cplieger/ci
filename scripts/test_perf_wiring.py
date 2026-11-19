@@ -60,7 +60,9 @@ class MetaWorkflow(unittest.TestCase):
     def test_validate_fails_on_a_failed_perf_job(self):
         validate = self.jobs['validate']
         self.assertIn('perf', validate['needs'])
-        step = validate['steps'][0]
+        step = next(
+            s for s in validate['steps'] if s.get('name') == 'Aggregate CI dispatch results'
+        )
         self.assertEqual(step['env']['PERF'], '${{ needs.perf.result }}')
         self.assertIn('"perf=$PERF"', step['run'])
         for result, rc in (('success', 0), ('skipped', 0), ('failure', 1), ('cancelled', 1)):
@@ -68,6 +70,7 @@ class MetaWorkflow(unittest.TestCase):
                 env = dict.fromkeys(step['env'], 'success')
                 env |= {'PERF': result, 'TWO_BRANCH': 'false', 'CI_REPO': 'false'}
                 env |= {'PATH': os.environ['PATH'], 'GITHUB_STEP_SUMMARY': os.devnull}
+                env |= {'CI_TOOLS': str(ROOT / 'scripts')}
                 proc = subprocess.run(
                     ['bash', '-e', '-c', step['run']], env=env, capture_output=True, text=True
                 )
@@ -201,6 +204,8 @@ def run_body(
         'STUB_LOG': str(tmp / 'log'),
         **env,
     }
+    # The job's ci checkout, which a step's gha-log.sh is sourced from.
+    full['CI_TOOLS'] = full.get('CI_TOOLS') or str(ROOT / 'scripts')
     proc = subprocess.run(
         ['bash', '-e', '-c', body], cwd=cwd or tmp, env=full, capture_output=True, text=True
     )
@@ -243,7 +248,7 @@ class Gate(unittest.TestCase):
 
     def compare(self, gate: str, planned: str) -> tuple[int, dict, Path]:
         s = step(self.jobs['compare'], 'Compare')
-        env = dict.fromkeys(s['env'], '') | {'MEASURED': 'success', 'CI_TOOLS': 'ci'}
+        env = dict.fromkeys(s['env'], '') | {'MEASURED': 'success'}
         env |= {'GATE': gate, 'PLANNED': planned}
         proc, tmp = run_body(self, s['run'], env, {'python3': GATE_STUB, 'git': GIT_STUB})
         return proc.returncode, outputs(tmp), tmp

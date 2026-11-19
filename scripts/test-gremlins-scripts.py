@@ -4297,6 +4297,8 @@ def test_runner_takes_the_mode_the_plan_set(tmp: Path) -> None:
 def stub_tools(d: Path, tools: dict[str, str]) -> str:
     """Write each `name: sh body` as an executable in d; returns a PATH with d first."""
     d.mkdir(parents=True, exist_ok=True)
+    if d.name == 'scripts' and not (d / 'gha-log.sh').exists():
+        (d / 'gha-log.sh').symlink_to(HERE / 'gha-log.sh')
     for name, body in tools.items():
         (d / name).write_text(f'#!/bin/sh\n{body}\n')
         (d / name).chmod(0o755)
@@ -4718,6 +4720,7 @@ def test_workflow_plans_then_shards_the_run(tmp: Path) -> None:
         check=False,
         env={
             **os.environ,
+            'GITHUB_WORKSPACE': str(sized),
             'REPO': 'x',
             'SHA': FIXTURE_SHA,
             'MODULES': '. tools',
@@ -4774,6 +4777,7 @@ def test_workflow_plans_then_shards_the_run(tmp: Path) -> None:
             check=False,
             env={
                 **os.environ,
+                'GITHUB_WORKSPACE': str(sized),
                 'REPO': 'x',
                 'SHA': FIXTURE_SHA,
                 'MODULES': '. tools',
@@ -4870,6 +4874,7 @@ def test_workflow_plans_then_shards_the_run(tmp: Path) -> None:
             check=False,
             env={
                 **os.environ,
+                'GITHUB_WORKSPACE': str(ran),
                 'REPO': 'x',
                 'MODULES': '. tools',
                 'JOB_TIMEOUT_MINUTES': '350',
@@ -4928,6 +4933,7 @@ def test_workflow_plans_then_shards_the_run(tmp: Path) -> None:
         check=False,
         env={
             **os.environ,
+            'GITHUB_WORKSPACE': str(ran),
             'REPO': 'x',
             'MODULES': '. tools',
             'JOB_TIMEOUT_MINUTES': '350',
@@ -5031,7 +5037,7 @@ def test_workflow_carries_costs_between_runs(tmp: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
-        env={**os.environ, 'KEY': 'b-c~tools', 'REF': 'main'},
+        env={**os.environ, 'GITHUB_WORKSPACE': str(work), 'KEY': 'b-c~tools', 'REF': 'main'},
     )
     calls = (work / 'calls').read_text() if (work / 'calls').exists() else ''
     check(
@@ -5878,6 +5884,7 @@ def test_workflow_runs_a_repo_it_cannot_read_in_its_own_call(tmp: Path) -> None:
                 'PATH': f'{tmp / "bin"}:{os.environ["PATH"]}',
                 'ONLY': '',
                 'TREES': str(trees),
+                'GITHUB_WORKSPACE': str(tmp),
                 'GITHUB_OUTPUT': str(out),
                 'GITHUB_STEP_SUMMARY': str(summary),
             },
@@ -6006,6 +6013,7 @@ def test_workflow_shard_step_plans_the_call(tmp: Path) -> None:
             check=False,
             env={
                 **os.environ,
+                'GITHUB_WORKSPACE': str(work),
                 'REPO': 'a',
                 'KEY': 'a~',
                 'GITHUB_OUTPUT': str(out),

@@ -236,8 +236,9 @@ jobs:
           MEASURED: ${{ needs.measure.result }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           if [ "$MEASURED" != success ]; then
-            echo "::error::a measure shard ended ${MEASURED}, so the set was not measured whole"
+            gha_annotate error 'a measure shard ended %s, so the set was not measured whole' "${MEASURED}"
             exit 1
           fi
           # A red guard still plans its re-measure, so the verdict judges each red
@@ -340,8 +341,9 @@ jobs:
           COMPARED: ${{ needs.compare.outputs.attempt }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           if [ "$REMEASURED" != success ]; then
-            echo "::error::a remeasure shard ended ${REMEASURED}, so no red cell can be judged on six reps"
+            gha_annotate error 'a remeasure shard ended %s, so no red cell can be judged on six reps' "${REMEASURED}"
             exit 1
           fi
           python3 "$CI_TOOLS/perf_gate.py" \

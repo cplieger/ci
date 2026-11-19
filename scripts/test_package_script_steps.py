@@ -165,6 +165,7 @@ class Harness(unittest.TestCase):
             'STUB_LOG': str(self.tmp / 'log'),
             'REAL_NPM': NPM,
             'npm_config_update_notifier': 'false',
+            'CI_TOOLS': str(ROOT / 'scripts'),
             **(env or {}),
         }
         # A file, not a pipe, takes the output: a process the step leaves behind would hold a

@@ -293,6 +293,8 @@ cat >"$WORK/go-os-run.sh" <<'SH'
 mod_dirs=$1
 go_os_matrix="[]"
 # shellcheck source=/dev/null
+. "$CI_TOOLS/gha-log.sh" # as the detect step does before the block
+# shellcheck source=/dev/null
 . "$2"
 jq -r 'sort_by([.dir, .runner]) | map("\(.dir)=\(.runner)") | join(" ")' <<<"$go_os_matrix"
 SH
@@ -300,7 +302,7 @@ os_rows() { # sets rows to <dir>=<runner>... for the repo at $R
   local mod_dirs
   mod_dirs=$(cd "$R" && discover_ci | jq -r '.[]')
   if [ -f "$R/go.mod" ]; then mod_dirs=$(printf '.\n%s' "$mod_dirs"); fi
-  rows=$(cd "$R" && bash -e "$WORK/go-os-run.sh" "$mod_dirs" "$WORK/go-os.sh") \
+  rows=$(cd "$R" && CI_TOOLS="$ROOT/scripts" bash -e "$WORK/go-os-run.sh" "$mod_dirs" "$WORK/go-os.sh") \
     || fail "ci.yaml's go-os block failed in $R"
 }
 commit_all() {
@@ -481,7 +483,7 @@ os_status() { # -> the go-os block's exit status for the repo at $R
   local mod_dirs rc=0
   mod_dirs=$(cd "$R" && discover_ci | jq -r '.[]')
   if [ -f "$R/go.mod" ]; then mod_dirs=$(printf '.\n%s' "$mod_dirs"); fi
-  (cd "$R" && bash -e "$WORK/go-os-run.sh" "$mod_dirs" "$WORK/go-os.sh") >/dev/null 2>&1 || rc=$?
+  (cd "$R" && CI_TOOLS="$ROOT/scripts" bash -e "$WORK/go-os-run.sh" "$mod_dirs" "$WORK/go-os.sh") >/dev/null 2>&1 || rc=$?
   echo "$rc"
 }
 mkrepo goos-unreadable

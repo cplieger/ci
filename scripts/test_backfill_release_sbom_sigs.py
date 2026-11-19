@@ -76,12 +76,19 @@ def resolve(repos, fleet='app other'):
     with tempfile.TemporaryDirectory() as name:
         out = pathlib.Path(name) / 'output'
         out.write_text('')
+        (pathlib.Path(name) / '_ci').symlink_to(ROOT)
         proc = subprocess.run(
             ['bash', '-e', '-c', step_named('Resolve')['run']],
             capture_output=True,
             text=True,
             cwd=name,
-            env={**os.environ, 'FLEET': fleet, 'INPUT_REPOS': repos, 'GITHUB_OUTPUT': str(out)},
+            env={
+                **os.environ,
+                'FLEET': fleet,
+                'INPUT_REPOS': repos,
+                'GITHUB_OUTPUT': str(out),
+                'GITHUB_WORKSPACE': name,
+            },
             check=False,
         )
         lines = out.read_text().splitlines()
@@ -162,8 +169,10 @@ class SignStep(unittest.TestCase):
                 (tmp / tool).write_text(body)
                 (tmp / tool).chmod(0o755)
             (tmp / 'releases.json').write_text(json.dumps(releases))
+            (tmp / '_ci').symlink_to(ROOT)
             env = {
                 **os.environ,
+                'GITHUB_WORKSPACE': str(tmp),
                 'PATH': f'{tmp}{os.pathsep}{os.environ["PATH"]}',
                 'STUB_LOG': str(tmp / 'log'),
                 'STUB_RELEASES': str(tmp / 'releases.json'),

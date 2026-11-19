@@ -418,9 +418,9 @@ for f in derive modpath promote buildargs; do
   chk "D-P3 $f parses under bash" "$(bash -n "$WORK/$f.sh" 2>/dev/null && echo ok || echo bad)" "ok"
 done
 chk "D-P4 derive reads the four inputs" "$(tr '\n' ' ' <"$WORK/derive.sh.env")" \
-  "CHANNEL DEV_VERSION RELEASE_NEEDED VERSION_INPUT "
+  "CHANNEL CI_TOOLS DEV_VERSION RELEASE_NEEDED VERSION_INPUT "
 chk "D-P4 the caller check reads the event's repository alone" "$(cat "$WORK/caller.sh.envmap" | tr '\n' ' ')" \
-  'DEFAULT_BRANCH=${{ github.event.repository.default_branch }} REPO_FORK=${{ github.event.repository.fork }} REPO_PRIVATE=${{ github.event.repository.private }} '
+  'CI_TOOLS=${{ github.workspace }}/.cplieger-ci/scripts DEFAULT_BRANCH=${{ github.event.repository.default_branch }} REPO_FORK=${{ github.event.repository.fork }} REPO_PRIVATE=${{ github.event.repository.private }} '
 chk "D-P5 promote reads the exclusion list and the subpackages" "$(tr '\n' ' ' <"$WORK/promote.sh.env")" "CI_TOOLS EXCLUDE_RE SUBPACKAGES_JSON "
 chk "D-P5 the subpackages are the caller's declared list" "$(sed -n 's/^SUBPACKAGES_JSON=//p' "$WORK/promote.sh.envmap")" '${{ inputs.subpackages }}'
 chk_has "D-P5 promote runs the shared digest resolver" "$(cat "$WORK/promote.sh")" 'bash "$CI_TOOLS/promote-digest.sh" "$GITHUB_SHA"'
@@ -676,9 +676,9 @@ for ref in refs/heads/feature/probe refs/tags/v1.2.3 refs/pull/7/merge ""; do
   chk "D-V12 failing the step on '${ref:-<unset>}', having written no output" \
     "$(tail -n1 <<<"$said")|$(wc -c <"$WORK/out" | tr -d ' ')" "EXIT=1|0"
 done
-chk "D-V12 the check runs in both modes, first, holding no scope" \
+chk "D-V12 the check runs in both modes, first, holding only the checkout's read" \
   "$(gate '."caller-if"')|$(gate '."caller-needs"')|$(gate '."caller-perms" | tojson')|$(gate '."caller-steps" | join(",")')" \
-  "|null|{}|Refuse a caller outside the two-branch model"
+  '|null|{"contents":"read"}|Check out the ci source,Refuse a caller outside the two-branch model'
 chk "D-V12 and both modes need it" "$(gate '."prepare-needs"')|$(gate '."ra-needs"')" "caller|caller"
 chk "D-V12 so a refused release call starts nothing after it" "$(gate '."release-call-runs-refused" | join(" ")')" "caller"
 chk "D-V12 nor does a refused repair call" "$(gate '."repair-call-runs-refused" | join(" ")')" "caller"
@@ -698,7 +698,7 @@ out_mod=$(modpath_in 'module github.com/owner/app')
 chk "D-M2 the plain repository path passes" "$(printf '%s' "$out_mod" | grep -c '^EXIT=' || true)" "0"
 out_mod=$(modpath_in 'module github.com/owner/app/v4')
 chk "D-M3 a /vN suffix fails" "$(printf '%s' "$out_mod" | sed -n 's/^EXIT=//p')" "1"
-chk_has "D-M3 the /vN error names the fix" "$out_mod" "drop the /vN suffix from go.mod and rewrite internal imports; apps use the plain module path"
+chk_has "D-M3 the /vN error names the fix" "$out_mod" "drop the /vN suffix from go.mod and rewrite internal imports. Apps use the plain module path"
 out_mod=$(modpath_in 'module github.com/owner/other')
 chk "D-M4 another repository's path fails" "$(printf '%s' "$out_mod" | sed -n 's/^EXIT=//p')" "1"
 chk_has "D-M4 the error names the expected path" "$out_mod" "must be 'github.com/owner/app'"
@@ -1304,7 +1304,7 @@ chk "D-RG17 with the caller's inputs and the ci source" "$(tr '\n' ' ' <"$WORK/s
   'CHANNEL=${{ inputs.channel }} CI_TOOLS=${{ github.workspace }}/.cplieger-ci/scripts GO_LANES_JSON=${{ inputs.go-modules }} PLATFORMS=${{ inputs.platforms }} SUBPACKAGES_JSON=${{ inputs.subpackages }} VERSION=${{ inputs.version }} '
 chk "D-RG17 after that source, the digest walk and the build args, before the metadata" \
   "$(gate '."scope-after" | join(",")')|$(gate '."scope-before-meta"')" "Check out the ci source,Resolve promoted digest,Resolve build args|true"
-chk "D-RG17 the ci source is checked out on both channels" "$(gate '."prepare-src-if"')" "\${{ steps.tags.outputs.publish == 'true' }}"
+chk "D-RG17 the ci source is checked out on both channels, whatever the run publishes" "$(gate '."prepare-src-if"')" ""
 chk "D-RG17 prepare hands the decision on" "$(gate '."prepare-outputs" | "\(.rebuild_only)|\(.compare_tag)"')" \
   '${{ steps.rebuild.outputs.rebuild_only }}|${{ steps.rebuild.outputs.compare_tag }}'
 gstep() { jq -c --arg n "$1" ".gate.steps[] | select(.name == \$n) | $2" "$WORK/gates.json"; }
@@ -2122,7 +2122,7 @@ chmod 755 "$SBIN/docker"
 # The step's metadata file is a fixed /tmp path; the probe keeps it in WORK.
 sed "s|/tmp/manifest-meta.json|$WORK/manifest-meta.json|g" "$WORK/manifest.sh" >"$WORK/manifest-local.sh"
 grep -q "$WORK/manifest-meta.json" "$WORK/manifest-local.sh" || fail "D-PS6 the channel-tag step no longer writes /tmp/manifest-meta.json"
-(cd "$WORK" && PATH="$SBIN:$PATH" REGISTRY=ghcr.io IMAGE_NAME=owner/app PROMOTE_DIGEST="$D_P" VERSION=2.1.0 MINOR=2.1 MAJOR=2 TAGS='' \
+(cd "$WORK" && PATH="$SBIN:$PATH" CI_TOOLS="$ROOT/scripts" REGISTRY=ghcr.io IMAGE_NAME=owner/app PROMOTE_DIGEST="$D_P" VERSION=2.1.0 MINOR=2.1 MAJOR=2 TAGS='' \
   GITHUB_OUTPUT="$WORK/manifest-out" bash "$WORK/manifest-local.sh") >/dev/null 2>&1 || fail "D-PS6 the channel-tag step failed on a promotion"
 chk "D-PS6 a promotion's channel tags report built=false, so the scan, gated on built, is skipped" \
   "$(sed -n 's/^built=//p' "$WORK/manifest-out")|$(gate '."scan-ifs" | join(",")')" \
@@ -2847,11 +2847,11 @@ chk "D-IT4 it reads the digest artifact the amd64 build leg uploads" \
 mkdir -p "$WORK/it/digests"
 printf 'sha256:%064d\n' 7 >"$WORK/it/digests/linux-amd64"
 : >"$WORK/it/out"
-(RUNNER_TEMP="$WORK/it" GITHUB_OUTPUT="$WORK/it/out" REGISTRY=ghcr.io IMAGE_NAME=probe/app bash "$WORK/image-ref.sh")
+(CI_TOOLS="$ROOT/scripts" RUNNER_TEMP="$WORK/it" GITHUB_OUTPUT="$WORK/it/out" REGISTRY=ghcr.io IMAGE_NAME=probe/app bash "$WORK/image-ref.sh")
 chk "D-IT5 the reference names the registry, the image and the pushed digest" "$(cat "$WORK/it/out")" \
   "ref=ghcr.io/probe/app@sha256:$(printf '%064d' 7)"
 printf 'not-a-digest\n' >"$WORK/it/digests/linux-amd64"
-out_it=$( (RUNNER_TEMP="$WORK/it" GITHUB_OUTPUT="$WORK/it/out2" REGISTRY=ghcr.io IMAGE_NAME=probe/app bash "$WORK/image-ref.sh" 2>&1) || echo "EXIT=$?")
+out_it=$( (CI_TOOLS="$ROOT/scripts" RUNNER_TEMP="$WORK/it" GITHUB_OUTPUT="$WORK/it/out2" REGISTRY=ghcr.io IMAGE_NAME=probe/app bash "$WORK/image-ref.sh" 2>&1) || echo "EXIT=$?")
 chk_has "D-IT5 an artifact that holds no digest fails the job" "$out_it" "EXIT=1"
 chk "D-IT6 both tests take that reference" \
   "$(gate '."image-test"."Image smoke test".ref')|$(gate '."image-test"."Image test suite".ref')" \

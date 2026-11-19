@@ -31,6 +31,16 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
+      - name: Checkout ci (for gha-log.sh)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _ci
+          persist-credentials: false
+          sparse-checkout: scripts/gha-log.sh
+          sparse-checkout-cone-mode: false
+
       - name: Redeliver push webhook (GitHub-native, via Hookshot)
         env:
           GH_TOKEN: ${{ secrets.RENOVATE_HOOK_PAT }}
@@ -38,13 +48,14 @@ jobs:
           REASON: ${{ inputs.reason }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           echo "Reason: ${REASON}"
 
           # Fail fast with an actionable message when the PAT secret is missing
           # or empty. Without this, gh exits 4 with a generic "set the GH_TOKEN
           # environment variable" error that hides the real cause (the secret).
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::RENOVATE_HOOK_PAT secret is missing or empty on ${REPO}. Set it to a fine-grained PAT scoped to cplieger/ci with Metadata: Read + Webhooks: Read and write."
+            gha_annotate error 'RENOVATE_HOOK_PAT secret is missing or empty on %s. Set it to a fine-grained PAT scoped to cplieger/ci with Metadata: Read + Webhooks: Read and write.' "${REPO}"
             exit 1
           fi
 
@@ -54,7 +65,7 @@ jobs:
           hook_id=$(gh api "repos/${REPO}/hooks" --jq \
             '[.[] | select(.active and (.events | index("push")) and (.config.url | test("/listener/github/procedure/")))][0].id // empty')
           if [ -z "${hook_id}" ]; then
-            echo "::error::No active push webhook found on ${REPO}."
+            gha_annotate error 'No active push webhook found on %s.' "${REPO}"
             exit 1
           fi
           echo "hook_id=${hook_id}"
@@ -80,7 +91,7 @@ jobs:
 
           gh api --method POST \
             "repos/${REPO}/hooks/${hook_id}/deliveries/${delivery_id}/attempts"
-          echo "::notice::Requested GitHub redelivery of delivery ${delivery_id} (reason=${REASON})"
+          gha_annotate notice 'Requested GitHub redelivery of delivery %s (reason=%s)' "${delivery_id}" "${REASON}"
 
   # `needs:` must list every other job in this workflow. Dispatch-only, so a
   # failure files only when the run was long enough to be unwatched.

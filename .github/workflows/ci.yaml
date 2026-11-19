@@ -62,8 +62,15 @@ jobs:
           # tip to decide whether any code (non-docs) files changed.
           fetch-depth: 0
 
-      - name: Check out the ci source
+      # Read before the ci checkout, whose own go.mod files hashFiles would count.
+      - name: Find a Go module
+        id: go
         if: ${{ hashFiles('**/go.mod') != '' }}
+        run: |
+          set -euo pipefail
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the ci source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ job.workflow_repository }}
@@ -73,23 +80,21 @@ jobs:
 
       - name: Restore the go-os matcher
         id: go-os-files-cache
-        if: ${{ hashFiles('**/go.mod') != '' }}
+        if: ${{ steps.go.outputs.found == 'true' }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/go-os-files
           key: go-os-files-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.cplieger-ci/scripts/go-os-files/**') }}
 
       - name: Setup Go for the go-os matcher
-        if: ${{ hashFiles('**/go.mod') != '' && steps.go-os-files-cache.outputs.cache-hit != 'true' }}
+        if: ${{ steps.go.outputs.found == 'true' && steps.go-os-files-cache.outputs.cache-hit != 'true' }}
         uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: .cplieger-ci/scripts/go-os-files/go.mod
           cache: false
 
-      # The ci checkout goes once the matcher is built: detect's find probes would
-      # count its files as the repo's.
       - name: Build the go-os matcher
-        if: ${{ hashFiles('**/go.mod') != '' }}
+        if: ${{ steps.go.outputs.found == 'true' }}
         env:
           CACHE_HIT: ${{ steps.go-os-files-cache.outputs.cache-hit }}
           GOWORK: 'off'
@@ -98,13 +103,20 @@ jobs:
           if [ "$CACHE_HIT" != true ]; then
             go build -C .cplieger-ci/scripts/go-os-files -trimpath -o "$RUNNER_TEMP/go-os-files/go-os-files" .
           fi
-          rm -rf .cplieger-ci
+
+      # detect's find probes would count its files as the repo's.
+      - name: Move the ci source out of the workspace
+        run: |
+          set -euo pipefail
+          mv "$GITHUB_WORKSPACE/.cplieger-ci" "$RUNNER_TEMP/cplieger-ci"
 
       - name: Detect repo surfaces
         id: detect
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           GO_OS_FILES: ${{ runner.temp }}/go-os-files/go-os-files
         run: |
+          . "$CI_TOOLS/gha-log.sh"
           run_go=false
           run_go_nested=false
           go_nested_dirs="[]"
@@ -199,7 +211,7 @@ jobs:
               d=$(dirname -- "$f")
               case "$d" in
                 *[!A-Za-z0-9._/-]*)
-                  echo "::error::nested go.mod dir '$d' contains characters outside [A-Za-z0-9._/-]"
+                  gha_annotate error "nested go.mod dir '%s' contains characters outside [A-Za-z0-9._/-]" "$d"
                   exit 1 ;;
               esac
               if [ -z "$(git ls-files -- "$d/*.go" | head -1)" ]; then
@@ -280,7 +292,7 @@ jobs:
             os_files=""
             if [ -n "$mod_dirs" ]; then
               if [ ! -x "${GO_OS_FILES:-}" ]; then
-                echo "::error::the go-os file matcher '${GO_OS_FILES:-}' was not built"
+                gha_annotate error "the go-os file matcher '%s' was not built" "${GO_OS_FILES:-}"
                 exit 1
               fi
               os_files=$(go_os_inputs | "$GO_OS_FILES")
@@ -522,6 +534,20 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # Every later step reads the workspace as the repository's own.
+      - name: Move the ci source out of the workspace
+        run: |
+          set -euo pipefail
+          mv "$GITHUB_WORKSPACE/.cplieger-ci" "$RUNNER_TEMP/cplieger-ci"
+
       - name: Setup Go
         uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
@@ -533,17 +559,19 @@ jobs:
       # GOTOOLCHAIN=local).
       - name: Build and test every module under one go.work
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           DIRS: ${{ needs.detect.outputs.go_work_dirs }}
           GOTOOLCHAIN: auto
         run: |
+          . "$CI_TOOLS/gha-log.sh"
           mapfile -t dirs < <(jq -r '.[]' <<< "$DIRS")
           go work init
           go work use "${dirs[@]}"
           rc=0
           for d in "${dirs[@]}"; do
-            echo "::group::$d"
+            gha_annotate group '%s' "$d"
             if ! (cd "$d" && go build ./... && go test -count=1 -race ./...); then
-              echo "::error::$d does not build or pass its tests against the other modules' heads"
+              gha_annotate error "%s does not build or pass its tests against the other modules' heads" "$d"
               rc=1
             fi
             echo "::endgroup::"
@@ -743,6 +771,20 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # The build context is the workspace root, so the ci source leaves it.
+      - name: Move the ci source out of the build context
+        run: |
+          set -euo pipefail
+          mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
+
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Keyed identically to the release build so both share cache below the
@@ -792,12 +834,15 @@ jobs:
       # red harness so one run reports both verdicts; needs a built image.
       - name: Image test suite
         if: ${{ !cancelled() && steps.build.outcome == 'success' && hashFiles('tests/image-test.sh') != '' }}
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           if [ ! -x tests/image-test.sh ]; then
             msg="tests/image-test.sh is not executable. CI runs it directly so its shebang picks the interpreter;"
             msg="$msg commit it as mode 100755: git update-index --chmod=+x tests/image-test.sh"
-            echo "::error file=tests/image-test.sh::$msg"
+            gha_annotate error -p file=tests/image-test.sh '%s' "$msg"
             exit 1
           fi
           ./tests/image-test.sh ci-smoke:latest
@@ -805,22 +850,6 @@ jobs:
       # Every runner image builds amd64 into the daemon under its -dev tag, in the release's
       # order, each sibling it names swapped for its own target here as the release swaps it.
       # They need no app image, so they run after a red one and report their own verdict.
-      - name: Check out the ci source
-        if: ${{ !cancelled() && needs.detect.outputs.runner_images == 'true' }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: .cplieger-ci
-          persist-credentials: false
-
-      # The build context is the workspace root, so the ci source leaves it.
-      - name: Move the ci source out of the build context
-        if: ${{ !cancelled() && needs.detect.outputs.runner_images == 'true' }}
-        run: |
-          set -euo pipefail
-          mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
-
       - name: Setup Python
         if: ${{ !cancelled() && needs.detect.outputs.runner_images == 'true' }}
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -1804,8 +1833,17 @@ jobs:
     runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
     timeout-minutes: 1
     steps:
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       - name: Aggregate CI dispatch results
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           DETECT: ${{ needs.detect.result }}
           REPO: ${{ needs.repo.result }}
           GO: ${{ needs.go.result }}
@@ -1830,9 +1868,10 @@ jobs:
           TWO_BRANCH: ${{ github.event.repository.default_branch == 'dev' && !github.event.repository.private && !github.event.repository.fork }}
           CI_REPO: ${{ github.repository == 'cplieger/ci' }}
         run: |
+          . "$CI_TOOLS/gha-log.sh"
           # detect must always succeed (it gates everything else)
           if [ "$DETECT" != "success" ]; then
-            echo "::error::detect job did not succeed: $DETECT"
+            gha_annotate error 'detect job did not succeed: %s' "$DETECT"
             exit 1
           fi
           # Each dispatched job must succeed or be skipped by detection; repo and
@@ -1852,7 +1891,7 @@ jobs:
           for pair in "$@"; do
             name="${pair%%=*}"; result="${pair##*=}"
             if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-              echo "::error::$name job: $result"
+              gha_annotate error '%s job: %s' "$name" "$result"
               exit 1
             fi
             if [ "$result" = "skipped" ]; then

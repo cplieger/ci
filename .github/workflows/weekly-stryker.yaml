@@ -30,6 +30,16 @@ jobs:
     outputs:
       repos: ${{ steps.fanout.outputs.repos }}
     steps:
+      - name: Checkout ci (for gha-log.sh)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _ci
+          persist-credentials: false
+          sparse-checkout: scripts/gha-log.sh
+          sparse-checkout-cone-mode: false
+
       - name: Discover repos with a stryker config
         id: fanout
         env:
@@ -39,6 +49,7 @@ jobs:
           ONLY: ${{ github.event.inputs.only }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           # Repo discovery over REST, not the GraphQL `gh repo list`: the fanout
           # is a single point of failure for the whole run, and the GraphQL
           # budget is shared by every session on the account, so its exhaustion
@@ -73,10 +84,10 @@ jobs:
                  | select(test("(^|/)node_modules/") | not)
                  | select(test("^([^/]+/){0,3}stryker\\.config\\.[^/]+$"))] | length | tostring
               end' 2>/dev/null); then
-              echo "::warning::${r}: its source tree could not be read, so it runs and its call looks for configs"
+              gha_annotate warning '%s: its source tree could not be read, so it runs and its call looks for configs' "${r}"
               found+=("$r")
             elif [ "$hit" = truncated ]; then
-              echo "::warning::${r}: its source tree is truncated, so it runs and its call looks for configs"
+              gha_annotate warning '%s: its source tree is truncated, so it runs and its call looks for configs' "${r}"
               found+=("$r")
             elif [ "$hit" -gt 0 ]; then
               echo "  include: ${r}"

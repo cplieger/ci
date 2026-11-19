@@ -2077,8 +2077,10 @@ class Wiring(unittest.TestCase):
         (tmp / 'bin' / 'gh').chmod(0o755)
         out, summary = tmp / 'output', tmp / 'summary'
         body = next(s['run'] for s in self.weekly['fanout']['steps'] if s.get('id') == 'fanout')
+        (tmp / '_ci').symlink_to(SCRIPTS.parent)
         env = {
             **os.environ,
+            'GITHUB_WORKSPACE': str(tmp),
             'PATH': f'{tmp / "bin"}:{os.environ["PATH"]}',
             'ONLY': '',
             'GITHUB_OUTPUT': str(out),

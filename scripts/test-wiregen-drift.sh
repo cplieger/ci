@@ -132,7 +132,7 @@ commit() { # commit <tree>
 }
 run_step() { # run_step <tree>; sets $out $rc
   rm -f "$WORK/failures"
-  out=$(cd "$1" && bash --noprofile --norc -e "$WORK/step.sh" 2>&1)
+  out=$(cd "$1" && CI_TOOLS="$ROOT/scripts" bash --noprofile --norc -e "$WORK/step.sh" 2>&1)
   rc=$?
 }
 root_app() { # root_app <tree>: a root module whose cmd/gen writes api.gen.go
