@@ -445,6 +445,11 @@ func check(in input) (report, error) {
 	out := report{Findings: []finding{}}
 	for _, q := range in.Queries {
 		out.Findings = append(out.Findings, unreadableIntervals(q, in.Variables)...)
+		if r.app && q.Kind == kindVariable && q.Variable == instanceLabel {
+			if f, bad := instancePicker(q); bad {
+				out.Findings = append(out.Findings, f)
+			}
+		}
 		text := substitute(q.Kind, q.Expr, first)
 		p, ok, err := parseQuery(q, text)
 		switch {

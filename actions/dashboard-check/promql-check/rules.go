@@ -122,6 +122,38 @@ func (p *problems) windows(r *rules, text string, first, second parser.Expr, ins
 	}
 }
 
+// instancePicker reports an instance variable whose query can list fewer instances than the app
+// exports: anything but label_values(<one metric name>, instance), whose series selector holds
+// only the metric name, so no matcher, regex filter or other form narrows the picker. A label
+// value missing from it is an instance no panel can show.
+func instancePicker(q query) (finding, bool) {
+	fail := func(why string) (finding, bool) {
+		return finding{
+			Where:   q.Where,
+			Rule:    "Q2",
+			Message: fmt.Sprintf("the instance variable can hide instances: %s. The query: %q.", why, q.Expr),
+			Fix:     "make the instance variable's query label_values(<one metric the app always exports, such as its build_info>, instance), with no matcher beside the metric name.",
+		}, true
+	}
+	m := labelValuesQuery.FindStringSubmatch(strings.TrimSpace(q.Expr))
+	switch {
+	case m == nil:
+		return fail("it is not label_values(<metric>, instance)")
+	case strings.TrimSpace(m[2]) != instanceLabel:
+		return fail(fmt.Sprintf("it lists the %q label, not instance", strings.TrimSpace(m[2])))
+	case m[1] == "":
+		return fail("it names no metric, so it lists the instance label of every series in the data source")
+	}
+	sel, err := promql.ParseMetricSelector(m[1])
+	if err != nil {
+		return finding{}, false // the parse step reports it
+	}
+	if len(sel) != 1 || sel[0].Name != model.MetricNameLabel || sel[0].Type != labels.MatchEqual {
+		return fail(fmt.Sprintf("its series selector %s holds more than the metric name, so a matcher narrows what it lists", m[1]))
+	}
+	return finding{}, false
+}
+
 // unscoped lists the selectors of q that read every instance: on a dashboard with an instance
 // variable, each selector needs an instance matcher, except in that variable's own query.
 func (r *rules) unscoped(q query, expr parser.Expr) []string {

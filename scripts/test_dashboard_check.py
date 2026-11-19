@@ -1148,8 +1148,11 @@ class PromQL(unittest.TestCase):
             'label_values(worker_info{job="x"}, instance)'
         )
         found = self.findings(doc)
-        self.assertEqual([f.rule for f in found], ['Q3'], [str(f) for f in found])
-        self.assertEqual(found[0].where, 'spec.variables variable instance')
+        # Q2: a matcher beside the metric name narrows the instance picker.
+        self.assertEqual([f.rule for f in found], ['Q2', 'Q3'], [str(f) for f in found])
+        self.assertIn('the instance variable can hide instances', found[0].message)
+        for f in found:
+            self.assertEqual(f.where, 'spec.variables variable instance')
 
     def test_a_multi_value_instance_variable_fails_q2(self):
         for field in ('multi', 'includeAll'):
