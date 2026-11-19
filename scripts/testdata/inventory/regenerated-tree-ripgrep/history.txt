@@ -1,0 +1,42 @@
+@@ commit B
+@@ file Dockerfile
+FROM debian:trixie-slim@sha256:4444444444444444444444444444444444444444444444444444444444444444 AS ripgrep
+# renovate: datasource=github-releases depName=BurntSushi/ripgrep
+ARG RIPGREP_VERSION=15.1.0
+# repin: dep=BurntSushi/ripgrep url=https://example.invalid/{version}.tar.gz
+ARG RIPGREP_AMD64_SHA256=5555555555555555555555555555555555555555555555555555555555555555
+COPY licenses/crates/ /licenses/crates/
+@@ file licenses/crates/MANIFEST
+ripgrep 15.1.0
+aho-corasick 1.1.3
+@@ file licenses/crates/aho-corasick/LICENSE-MIT
+MIT
+@@ commit M parent B
+@@ file Dockerfile
+FROM debian:trixie-slim@sha256:4444444444444444444444444444444444444444444444444444444444444444 AS ripgrep
+# renovate: datasource=github-releases depName=BurntSushi/ripgrep
+ARG RIPGREP_VERSION=15.2.0
+# repin: dep=BurntSushi/ripgrep url=https://example.invalid/{version}.tar.gz
+ARG RIPGREP_AMD64_SHA256=6666666666666666666666666666666666666666666666666666666666666666
+COPY licenses/crates/ /licenses/crates/
+@@ file licenses/crates/MANIFEST
+ripgrep 15.2.0
+aho-corasick 1.1.4
+@@ file licenses/crates/aho-corasick/LICENSE-MIT
+MIT, 2026
+@@ commit T_newer parent B
+@@ file Dockerfile
+FROM debian:trixie-slim@sha256:4444444444444444444444444444444444444444444444444444444444444444 AS ripgrep
+# renovate: datasource=github-releases depName=BurntSushi/ripgrep
+ARG RIPGREP_VERSION=15.3.0
+# repin: dep=BurntSushi/ripgrep url=https://example.invalid/{version}.tar.gz
+ARG RIPGREP_AMD64_SHA256=7777777777777777777777777777777777777777777777777777777777777777
+COPY licenses/crates/ /licenses/crates/
+@@ file licenses/crates/MANIFEST
+ripgrep 15.3.0
+aho-corasick 1.1.4
+@@ file licenses/crates/aho-corasick/LICENSE-MIT
+MIT, 2026
+@@ commit M_alone parent B
+@@ file licenses/crates/MANIFEST
+ripgrep 15.1.0
