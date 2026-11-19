@@ -37,10 +37,14 @@ def rcell(scenario='files', window='cold', metric='cpu_ms', reps=(1000.0,) * 3, 
     }
 
 
-def write_shard(directory, name, cells, cpu='AMD EPYC 7763', runner=RUNNER):
+def write_shard(directory, name, cells, cpu='AMD EPYC 7763', runner=RUNNER, seconds=()):
     d = pathlib.Path(directory) / f'perf-results-{PREFIX}-measure-{name}-attempt-1'
     d.mkdir()
-    doc = {'schema': 1, 'runner': runner, 'cpu_model': cpu, 'cells': cells, 'seconds': []}
+    timed = [
+        {'scenario': s, **UNIT, 'seconds': v, **({'profile_seconds': rest[0]} if rest else {})}
+        for s, v, *rest in seconds
+    ]
+    doc = {'schema': 1, 'runner': runner, 'cpu_model': cpu, 'cells': cells, 'seconds': timed}
     (d / 'results.json').write_text(json.dumps(doc))
 
 
@@ -110,6 +114,7 @@ class Point(unittest.TestCase):
                 'runs': 1,
                 'run_id': '44029121114',
                 'run_url': RUN_URL + '44029121114',
+                'units': [],
             },
         )
         cells = by_cell(p)
@@ -169,6 +174,43 @@ class Point(unittest.TestCase):
         files = cells['files/x10/chromium/desktop/cold/cpu_ms']
         self.assertEqual((files['value'], len(files['reps'])), (1100.0, 2))
         self.assertEqual(len(cells['docs/x10/chromium/desktop/cold/cpu_ms']['reps']), 1)
+
+    def test_a_point_holds_each_unit_s_seconds_the_median_of_its_runs(self):
+        write_shard(self.dir, 'run-01-shard-1-of-2', [rcell()], seconds=[('files', 100.0)])
+        write_shard(self.dir, 'run-01-shard-2-of-2', [rcell('docs')], seconds=[('docs', 80.5)])
+        write_shard(self.dir, 'run-02-shard-1-of-1', [rcell()], seconds=[('files', 120.0)])
+        self.assertEqual(
+            made_point(self.dir)['units'],
+            [
+                {'scenario': 'docs', **UNIT, 'seconds': 80.5},
+                {'scenario': 'files', **UNIT, 'seconds': 110.0},
+            ],
+        )
+        for seconds, why in (
+            ([('files', 'x')], 'files/x10/chromium/desktop: its seconds are not a number'),
+            ([('files', 1.0), ('files', 2.0)], 'files/x10/chromium/desktop: timed twice in run-01'),
+        ):
+            with self.subTest(seconds=seconds), tempfile.TemporaryDirectory() as tmp:
+                write_shard(tmp, 'run-01-shard-1-of-1', [rcell()], seconds=seconds)
+                with self.assertRaisesRegex(ValueError, f'^{re.escape(why)}$'):
+                    made_point(tmp)
+
+    def test_a_unit_s_profiled_rep_is_timed_apart_as_the_median_of_the_runs_that_ran_it(self):
+        write_shard(self.dir, 'run-01-shard-1-of-1', [rcell()], seconds=[('files', 100.0, 40.0)])
+        write_shard(self.dir, 'run-02-shard-1-of-2', [rcell()], seconds=[('files', 120.0, 50.0)])
+        write_shard(self.dir, 'run-02-shard-2-of-2', [rcell('docs')], seconds=[('docs', 80.5)])
+        self.assertEqual(
+            made_point(self.dir)['units'],
+            [
+                {'scenario': 'docs', **UNIT, 'seconds': 80.5},
+                {'scenario': 'files', **UNIT, 'seconds': 110.0, 'profile_seconds': 45.0},
+            ],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            write_shard(tmp, 'run-01-shard-1-of-1', [rcell()], seconds=[('files', 1.0, True)])
+            why = 'files/x10/chromium/desktop: its profile_seconds are not a number'
+            with self.assertRaisesRegex(ValueError, f'^{re.escape(why)}$'):
+                made_point(tmp)
 
     def test_a_timing_cell_with_no_reps_has_no_value(self):
         write_shard(self.dir, 'shard-1-of-1', [rcell(reps=())])
@@ -294,6 +336,7 @@ def tp(values, n, *, series='dev', runner=RUNNER):
         'runs': 1,
         'run_id': str(n),
         'run_url': f'{RUN_URL}{n}',
+        'units': [],
         'cells': cells,
     }
 
@@ -322,6 +365,13 @@ class Trend:
 
     def scenario(self, name='files'):
         return self.state['scenarios'].get(name, {}).get('status', 'ok')
+
+
+PR_UNITS = perf_gate.planned_windows([{'scenario': 'files', **UNIT}])
+PLAN = {
+    'node': 'web',
+    'sets': {'full': {'shards': 1, 'cells': [{'scenario': 'files', **UNIT, 'seconds': 100}]}},
+}
 
 
 def slow(cold=1000.0, live=3000.0, **more):
@@ -581,7 +631,7 @@ class Judge(unittest.TestCase):
         self.assertEqual(t.scenario(), 'ok')
         self.assertIn('### Regressions ended at this point', switched.summary)
         self.assertIn('| files | open | the runner changed to `self-hosted` |', switched.summary)
-        for n in range(2, perf_trend.GUARD_POINTS + 1):
+        for n in range(2, perf_gate.GUARD_POINTS + 1):
             judged = t.add(slow(cold=99999.0) if n == 3 else GOOD, runner=other)
             self.assertEqual(judged.actions, [])
             self.assertFalse(any('baseline' in c for c in judged.point['cells']), n)
@@ -650,20 +700,20 @@ class Judge(unittest.TestCase):
         self.assertEqual(proof.scenario(), 'suspect')
 
     def test_a_cell_is_judged_once_five_points_of_its_runner_measured_it(self):
-        t = Trend(points=perf_trend.GUARD_POINTS - 1)
+        t = Trend(points=perf_gate.GUARD_POINTS - 1)
         early = t.add(slow(cold=99999.0))
         self.assertFalse(any('baseline' in c for c in early.point['cells']))
-        u = Trend(points=perf_trend.GUARD_POINTS)
+        u = Trend(points=perf_gate.GUARD_POINTS)
         judged = u.add(slow(cold=99999.0))
         cold = next(c for c in judged.point['cells'] if c['window'] == 'cold')
         self.assertEqual((cold['baseline'], cold['bad']), (1000.0, True))
 
     def test_a_returning_runner_is_judged_only_on_its_points_since_it_last_took_over(self):
         other = 'self-hosted'
-        t = Trend(points=perf_trend.GUARD_POINTS)
+        t = Trend(points=perf_gate.GUARD_POINTS)
         for _ in range(8):
             t.add(slow(cold=3000.0), runner=other)
-        for _ in range(perf_trend.GUARD_POINTS):
+        for _ in range(perf_gate.GUARD_POINTS):
             judged = t.add(slow(cold=3000.0))
             self.assertFalse(any('baseline' in c for c in judged.point['cells']))
             self.assertEqual((judged.actions, t.scenario()), ([], 'ok'))
@@ -724,6 +774,8 @@ class Judge(unittest.TestCase):
                 p = tp(GOOD, n)
                 (dev / 'points' / perf_trend.point_name(p)).write_text(perf_trend.dumps(p))
             before = {p: p.read_bytes() for p in dev.rglob('*') if p.is_file()}
+            plan_file = root / 'plan.json'
+            plan_file.write_text(json.dumps(PLAN))
             ops = []
             for n in (201, 202):
                 point_file = root / f'point-{n}.json'
@@ -743,6 +795,8 @@ class Judge(unittest.TestCase):
                     str(actions),
                     '--summary',
                     str(root / 'sum.md'),
+                    '--plan',
+                    str(plan_file),
                 ]
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(perf_trend.main(argv), 0)
@@ -790,6 +844,14 @@ class Skip(unittest.TestCase):
         self.assertEqual(
             [a['op'] for a in perf_trend.observe(u.state, [stray], series='dev')[1]], ['close']
         )
+
+    def test_a_head_the_guard_baseline_does_not_hold_yet_is_measured_again(self):
+        t = Trend()
+        last = t.state['last']
+        behind = {**t.state, 'last': {**last, 'guard_behind': '1 timing cell is past the guard'}}
+        self.assertFalse(perf_trend.skip(behind, last['commit'], RUNNER))
+        held = {**t.state, 'last': {**last, 'guard_behind': None}}
+        self.assertTrue(perf_trend.skip(held, last['commit'], RUNNER))
 
     def test_a_point_on_another_runner_than_the_last_is_measured(self):
         t = Trend()
@@ -1005,7 +1067,18 @@ class Record(unittest.TestCase):
 
     def record(self, values, n, series='dev', issues=None, runner=RUNNER):
         p = tp(values, n, series=series, runner=runner)
-        return perf_trend.record(self.root, p, repo=REPO, issues=issues)
+        return perf_trend.record(self.root, p, repo=REPO, issues=issues, pr_units=PR_UNITS)
+
+    def guard_file(self):
+        return json.loads((self.root / 'series/dev/baseline.json').read_text())
+
+    def pr_guard(self, cold, runner=RUNNER):
+        """perf_gate.guard of a pull request on runner whose files x10 cold CPU is cold,
+        against the stored baseline.json."""
+        base_runner, runs, baselines = perf_gate.baselines_from_trend(self.guard_file())
+        pr = {'runner': runner, 'cells': [rcell(reps=(cold,) * 3)]}
+        units = perf_gate.planned_windows([{'scenario': 'files', **UNIT, 'windows': ['cold']}])
+        return perf_gate.guard(baselines, base_runner, pr, units, windows={}, runs=runs)
 
     def stored(self, series='dev'):
         d = self.root / 'series' / series
@@ -1027,6 +1100,7 @@ class Record(unittest.TestCase):
         self.assertEqual((cold['baseline'], cold['bad']), (1000.0, True))
         baseline = json.loads((self.root / 'series/dev/baseline.json').read_text())
         self.assertEqual(baseline['commits'], [PURE_SHA.format(n) for n in range(2, 7)])
+        self.assertEqual(baseline['runs'], 5)
         cells = {(c['window'], c['metric']): (c['kind'], c['baseline']) for c in baseline['cells']}
         self.assertEqual(cells[('cold', 'cpu_ms')], ('time', 1100.0))
         self.assertEqual(cells[('cold', 'dom')], ('count', 645))
@@ -1034,66 +1108,195 @@ class Record(unittest.TestCase):
             self.record(GOOD, n)
         baseline = json.loads((self.root / 'series/dev/baseline.json').read_text())
         self.assertEqual(baseline['commits'], [PURE_SHA.format(n) for n in range(4, 9)])
-        runner, read = perf_gate.baselines_from_trend(baseline)
-        self.assertEqual((runner, len(read)), (RUNNER, 3))
+        runner, runs, read = perf_gate.baselines_from_trend(baseline)
+        self.assertEqual((runner, runs, len(read)), (RUNNER, 5, 3))
 
-    def test_the_guard_baseline_moves_to_a_new_runner_at_its_fifth_run(self):
-        def guard():
-            return json.loads((self.root / 'series/dev/baseline.json').read_text())
-
-        for n in range(1, 6):
+    def test_a_new_runner_s_baseline_reports_a_pull_request_until_it_holds_five_runs(self):
+        for n in range(1, 8):
             self.record(GOOD, n)
-        for n in range(6, 6 + perf_trend.GUARD_POINTS):
-            self.record(slow(cold=4000.0), n, runner='self-hosted')
-            b = guard()
-            if n < 5 + perf_trend.GUARD_POINTS:
-                self.assertEqual((b['runner'], b['commits'][-1]), (RUNNER, PURE_SHA.format(5)), n)
-        self.assertEqual(b['runner'], 'self-hosted')
-        self.assertEqual(b['commits'], [PURE_SHA.format(n) for n in range(6, 11)])
-        cold = next(c for c in b['cells'] if c['window'] == 'cold')
-        self.assertEqual(cold['baseline'], 4000.0)
+        for k in range(1, 1 + perf_gate.GUARD_POINTS):
+            self.record(GOOD, 7 + k, runner='self-hosted')
+            b = self.guard_file()
+            self.assertEqual((b['runner'], b['runs']), ('self-hosted', k))
+            self.assertEqual(b['commits'], [PURE_SHA.format(n) for n in range(8, 8 + k)])
+            out = self.pr_guard(2400.0, runner='self-hosted')
+            self.assertEqual(out.failures, [], k)
+            self.assertEqual(bool(out.remeasure), k == perf_gate.GUARD_POINTS, k)
+            self.assertEqual(self.pr_guard(2400.0).remeasure, [], k)
 
-    def test_a_returning_runner_is_the_guard_baseline_only_on_points_since_it_last_took_over(self):
-        def guard():
-            return json.loads((self.root / 'series/dev/baseline.json').read_text())
+    def test_a_runner_back_from_an_excursion_reports_until_five_points_since_its_return(self):
+        for k in range(1, perf_gate.GUARD_POINTS):
+            with self.subTest(excursion=k):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                self.root = pathlib.Path(tmp.name)
+                for n in range(1, 8):
+                    self.record(GOOD, n)
+                for n in range(8, 8 + k):
+                    self.record(GOOD, n, runner='self-hosted')
+                    self.assertEqual(self.pr_guard(2400.0).remeasure, [], n)
+                for r in range(1, 1 + perf_gate.GUARD_POINTS):
+                    n = 7 + k + r
+                    self.record(GOOD, n)
+                    b, (_, state) = self.guard_file(), self.stored()
+                    self.assertEqual((b['runner'], b['runs']), (RUNNER, r), n)
+                    out = self.pr_guard(2400.0)
+                    self.assertEqual(out.failures, [], n)
+                    if r < perf_gate.GUARD_POINTS:
+                        self.assertEqual(out.remeasure, [], n)
+                        self.assertEqual(
+                            state['last']['guard_behind'],
+                            f'it holds {r} run{"" if r == 1 else "s"} of `{RUNNER}`, fewer than 5',
+                            n,
+                        )
+                        self.assertFalse(perf_trend.skip(state, PURE_SHA.format(n), RUNNER), n)
+                self.assertEqual(len(out.remeasure), 1)
+                self.assertIsNone(state['last']['guard_behind'])
+                self.assertTrue(perf_trend.skip(state, PURE_SHA.format(n), RUNNER))
 
-        for n in range(1, 6):
-            self.record(GOOD, n)
-        for n in range(6, 14):
-            self.record(slow(cold=4000.0), n, runner='self-hosted')
-        for n in range(14, 14 + perf_trend.GUARD_POINTS):
-            self.record(slow(cold=4000.0), n)
-            b = guard()
-            if n < 13 + perf_trend.GUARD_POINTS:
-                self.assertEqual(b['runner'], 'self-hosted', n)
-                self.assertEqual(b['commits'], [PURE_SHA.format(k) for k in range(9, 14)], n)
-        self.assertEqual(b['runner'], RUNNER)
-        self.assertEqual(b['commits'], [PURE_SHA.format(n) for n in range(14, 19)])
-        cold = next(c for c in b['cells'] if c['window'] == 'cold')
-        self.assertEqual(cold['baseline'], 4000.0)
-
-    def test_a_ten_run_point_is_the_guard_baseline_alone_and_a_one_run_point_when_none_is_more(
+    def test_a_ten_run_point_holds_five_runs_alone_and_another_runner_s_point_starts_again(
         self,
     ):
-        seed = tp(GOOD, 1)
-        for c in seed['cells']:
-            c['reps'] = [[c['value']] * 3] * 10
-        seed['runs'] = 10
-        self.assertEqual(perf_trend.guard_baseline([seed])['runner'], RUNNER)
+        def ran(p, runs):
+            p['runs'] = runs
+            for c in p['cells']:
+                c['reps'] = [[c['value']] * 3] * runs
+            return p
+
+        seed = ran(tp(GOOD, 1), 10)
+        b = perf_trend.guard_baseline([seed])
+        self.assertEqual((b['runner'], b['runs']), (RUNNER, 10))
         later = tp(slow(cold=4000.0), 2, runner='self-hosted')
-        self.assertEqual(perf_trend.guard_baseline([seed, later])['runner'], RUNNER)
-        self.assertEqual(perf_trend.guard_baseline([later])['commits'], [PURE_SHA.format(2)])
-        two = tp(GOOD, 3, runner='self-hosted')
-        two['runs'] = 2
-        two['cells'][0]['reps'] = [[1000.0] * 3] * 2
-        self.assertEqual(perf_trend.guard_baseline([seed, later, two])['runner'], RUNNER)
+        b = perf_trend.guard_baseline([seed, later])
+        self.assertEqual(
+            (b['runner'], b['runs'], b['commits']), ('self-hosted', 1, [later['commit']])
+        )
+        two = ran(tp(GOOD, 3, runner='self-hosted'), 2)
+        b = perf_trend.guard_baseline([seed, later, two])
+        self.assertEqual((b['runner'], b['runs']), ('self-hosted', 3))
+        back = tp(GOOD, 4)
+        b = perf_trend.guard_baseline([seed, later, two, back])
+        self.assertEqual((b['runner'], b['runs'], b['commits']), (RUNNER, 1, [back['commit']]))
+
+    def test_a_timing_cell_enters_the_baseline_only_once_five_runs_measured_it(self):
+        new = ('files', 'replay', 'cpu_ms')
+        points = [tp(GOOD, n) for n in range(1, 5)]
+        points.append(tp({**GOOD, new: 500.0, ('files', 'replay', 'dom'): 40}, 5))
+        b = perf_trend.guard_baseline(points)
+        self.assertEqual(b['runs'], 5)
+        windows = {(c['window'], c['metric']) for c in b['cells']}
+        self.assertNotIn(('replay', 'cpu_ms'), windows)
+        self.assertIn(('replay', 'dom'), windows)
+        self.assertIn(('cold', 'cpu_ms'), windows)
+        ten = tp({**GOOD, new: 500.0}, 6, runner='self-hosted')
+        ten['runs'] = 10
+        for c in ten['cells']:
+            c['reps'] = [[c['value']] * 3] * 10
+        b = perf_trend.guard_baseline([*points, ten])
+        self.assertEqual(
+            sorted((c['window'], c['baseline']) for c in b['cells']),
+            [('cold', 1000.0), ('live', 3000.0), ('replay', 500.0)],
+        )
+
+    def test_a_slowdown_at_dev_s_head_is_measured_until_the_guard_baseline_takes_it(self):
+        for n in range(1, 8):
+            self.record(GOOD, n)
+        head = PURE_SHA.format(8)
+        pr = {'runner': RUNNER, 'cells': [rcell(reps=(3000.0,) * 3)]}
+        units = perf_gate.planned_windows([{'scenario': 'files', **UNIT, 'windows': ['cold']}])
+
+        def at_head(n, issues=None):
+            p = tp(slow(cold=3000.0), n)
+            p['commit'] = head
+            actions, summary = perf_trend.record(
+                self.root, p, repo=REPO, issues=issues, pr_units=PR_UNITS
+            )
+            _, state = self.stored()
+            base = json.loads((self.root / 'series/dev/baseline.json').read_text())
+            runner, runs, baselines = perf_gate.baselines_from_trend(base)
+            red = perf_gate.guard(baselines, runner, pr, units, windows={}, runs=runs).remeasure
+            skip = perf_trend.skip(state, head, RUNNER)
+            return [a['op'] for a in actions], summary, state, bool(red), skip
+
+        ops, summary, state, red, skip = at_head(8)
+        self.assertEqual(
+            (ops, state['scenarios']['files']['status'], red, skip), ([], 'suspect', True, False)
+        )
+        ops, summary, state, red, skip = at_head(9)
+        self.assertEqual(
+            (ops, state['scenarios']['files']['status'], red, skip),
+            (['upsert'], 'open', True, False),
+        )
+        self.assertEqual(
+            state['last']['guard_behind'], '1 timing cell is past the guard against it'
+        )
+        self.assertIn(
+            "The pull request guard's baseline does not hold this point yet: 1 timing cell is "
+            f'past the guard against it, so the next run measures `{head[:12]}` again.',
+            summary,
+        )
+        ops, summary, state, red, skip = at_head(10)
+        self.assertEqual(
+            (ops, state['scenarios']['files']['status'], red, skip),
+            (['upsert'], 'open', False, True),
+        )
+        self.assertIsNone(state['last']['guard_behind'])
+        self.assertNotIn("guard's baseline does not hold", summary)
+
+    def test_only_a_cell_a_pull_request_measures_holds_the_guard_behind(self):
+        points = [tp(GOOD, n) for n in range(1, 6)]
+        p = tp(slow(cold=1000.0, live=9000.0), 6)
+        base = perf_trend.guard_baseline([*points, p])
+        for units, want in (
+            (PR_UNITS, '1 timing cell is past the guard against it'),
+            (perf_gate.planned_windows([{'scenario': 'files', **UNIT, 'windows': ['cold']}]), None),
+            ({}, None),
+        ):
+            with self.subTest(units=units):
+                self.assertEqual(perf_trend.guard_behind(base, p, units), want)
+
+    def test_the_judge_command_holds_the_guard_behind_only_for_the_plan_s_pr_set(self):
+        for n in range(1, 8):
+            self.record(GOOD, n)
+        plan = {'node': 'web', 'sets': {'pr': {'shards': 1, 'cells': []}}}
+        files = {'plan': self.root.parent / f'{self.root.name}-plan.json'}
+        files['point'] = self.root.parent / f'{self.root.name}-point.json'
+        for f in files.values():
+            self.addCleanup(f.unlink, missing_ok=True)
+        argv = ['judge', '--root', str(self.root), '--point', str(files['point'])]
+        argv += ['--series', 'dev', '--repo', REPO, '--plan', str(files['plan'])]
+        argv += ['--actions', str(self.root / 'a.json')]
+        for n, cells, want in (
+            (8, [{'scenario': 'docs', **UNIT, 'seconds': 100}], None),
+            (9, [{'scenario': 'files', **UNIT, 'windows': ['live'], 'seconds': 100}], '1 timing'),
+        ):
+            with self.subTest(cells=cells):
+                plan['sets']['pr']['cells'] = cells
+                files['plan'].write_text(json.dumps(plan))
+                p = tp(slow(cold=1000.0, live=9000.0), n)
+                p['commit'] = PURE_SHA.format(8)
+                files['point'].write_text(json.dumps(p))
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(perf_trend.main(argv), 0)
+                behind = self.stored()[1]['last']['guard_behind']
+                self.assertEqual(behind and behind[:8], want)
+
+    def test_a_head_on_a_new_runner_is_measured_again(self):
+        for n in range(1, 6):
+            self.record(GOOD, n)
+        self.record(GOOD, 6, runner='self-hosted')
+        _, state = self.stored()
+        self.assertEqual(
+            state['last']['guard_behind'], 'it holds 1 run of `self-hosted`, fewer than 5'
+        )
+        self.assertFalse(perf_trend.skip(state, PURE_SHA.format(6), 'self-hosted'))
 
     def test_a_point_already_recorded_or_of_a_bad_series_is_refused(self):
         self.record(GOOD, 1)
         p = tp(GOOD, 1)
         p['run_id'] = 'another'
         with self.assertRaisesRegex(ValueError, 'already recorded'):
-            perf_trend.record(self.root, p, repo=REPO, issues=None)
+            perf_trend.record(self.root, p, repo=REPO, issues=None, pr_units=PR_UNITS)
         for series in ('Dev', '-x', 'a' * 32, '../dev'):
             with self.subTest(series=series), self.assertRaisesRegex(ValueError, 'series'):
                 self.record(GOOD, 2, series=series)
@@ -1133,6 +1336,10 @@ class Record(unittest.TestCase):
         self.addCleanup(issues.unlink, missing_ok=True)
         issues.write_text('[]')
         argv += ['--repo', REPO, '--issues', str(issues), '--actions', str(self.root / 'a.json')]
+        plan_file = self.root.parent / f'{self.root.name}-plan.json'
+        self.addCleanup(plan_file.unlink, missing_ok=True)
+        plan_file.write_text(json.dumps(PLAN))
+        argv += ['--plan', str(plan_file)]
         err = io.StringIO()
         with redirect_stderr(err), redirect_stdout(io.StringIO()):
             self.assertEqual(perf_trend.main(argv), 1)
@@ -1217,19 +1424,93 @@ class Record(unittest.TestCase):
             perf_trend.needs([], 'proof'), ['series/proof/state.json', 'series/dev/state.json']
         )
 
+    def test_the_judge_command_lists_each_unit_measured_far_off_its_plan_seconds(self):
+        def unit(scenario, seconds, **kw):
+            return {'scenario': scenario, **UNIT, 'seconds': seconds, **kw}
+
+        plan = {
+            'node': 'web',
+            'sets': {
+                'full': {
+                    'shards': 2,
+                    'cells': [unit('files', 100), unit('docs', 100), unit('tabs', 100)],
+                },
+                'pr': {
+                    'shards': 1,
+                    'cells': [unit('files', 70), unit('docs', 30, windows=['cold'])],
+                },
+            },
+        }
+        p = tp(GOOD, 1)
+        p['units'] = [
+            {'scenario': 'files', **UNIT, 'seconds': 110.0},
+            {'scenario': 'docs', **UNIT, 'seconds': 125.0},
+            {'scenario': 'tabs', **UNIT, 'seconds': 79.0},
+        ]
+        files = {}
+        for name, doc in (('point', p), ('plan', plan), ('issues', [])):
+            files[name] = self.root.parent / f'{self.root.name}-{name}.json'
+            self.addCleanup(files[name].unlink, missing_ok=True)
+            files[name].write_text(json.dumps(doc))
+        argv = ['judge', '--root', str(self.root), '--point', str(files['point'])]
+        argv += ['--series', 'dev', '--repo', REPO, '--issues', str(files['issues'])]
+        argv += ['--actions', str(self.root / 'a.json'), '--plan', str(files['plan'])]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(perf_trend.main(argv), 0)
+        self.assertIn(
+            '### Units measured more than 20 % off their plan.json seconds (information)\n\n'
+            '| Set | Unit | plan.json | Measured |\n'
+            '|---|---|---|---|\n'
+            '| full | docs/x10/chromium/desktop | 100 | 125 |\n'
+            '| full | tabs/x10/chromium/desktop | 100 | 79 |\n'
+            '| pr | files/x10/chromium/desktop | 70 | 110 |\n',
+            out.getvalue(),
+        )
+        p['units'] = [{'scenario': 'files', **UNIT, 'seconds': 110.0}]
+        plan['sets']['pr']['cells'][0]['seconds'] = 100
+        files['point'].write_text(json.dumps(tp(GOOD, 2) | {'units': p['units']}))
+        files['plan'].write_text(json.dumps(plan))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(perf_trend.main(argv), 0)
+        self.assertNotIn('off their plan.json seconds', out.getvalue())
+
+    def test_a_unit_s_profiled_rep_counts_only_toward_a_cell_that_profiles(self):
+        def unit(scenario, seconds, **kw):
+            return {'scenario': scenario, **UNIT, 'seconds': seconds, **kw}
+
+        p = tp(GOOD, 1)
+        p['units'] = [
+            {'scenario': 'git-prs', **UNIT, 'seconds': 900.0, 'profile_seconds': 300.0},
+            {'scenario': 'docs', **UNIT, 'seconds': 180.0},
+        ]
+        full = [unit('git-prs', 1197, profile=True), unit('docs', 240, profile=True)]
+        pr = [unit('git-prs', 896), unit('docs', 180)]
+        plan = {'node': 'web', 'sets': {'full': {'cells': full}, 'pr': {'cells': pr}}}
+        self.assertEqual(perf_trend.seconds_drift(plan, p), '')
+        pr[0]['seconds'] = 1197
+        full[0]['seconds'] = 900
+        drift = perf_trend.seconds_drift(plan, p)
+        self.assertIn('| full | git-prs/x10/chromium/desktop | 900 | 1200 |\n', drift)
+        self.assertIn('| pr | git-prs/x10/chromium/desktop | 1197 | 900 |\n', drift)
+        self.assertNotIn('docs', drift)
+
     def test_the_skip_command_reads_a_missing_state_as_never_measured(self):
         out = io.StringIO()
         argv = ['skip', '--state', str(self.root / 'none.json'), '--commit', SHA]
         with redirect_stdout(out):
             rc = perf_trend.main([*argv, '--runner', RUNNER])
         self.assertEqual((rc, out.getvalue()), (0, 'false\n'))
-        self.record(GOOD, 1)
-        out = io.StringIO()
         state = str(self.root / 'series/dev/state.json')
-        argv = ['skip', '--state', state, '--commit', PURE_SHA.format(1), '--runner', RUNNER]
-        with redirect_stdout(out):
-            perf_trend.main(argv)
-        self.assertEqual(out.getvalue(), 'true\n')
+        for n in range(1, perf_gate.GUARD_POINTS + 1):
+            self.record(GOOD, n)
+            want = 'true' if n == perf_gate.GUARD_POINTS else 'false'
+            out = io.StringIO()
+            argv = ['skip', '--state', state, '--commit', PURE_SHA.format(n), '--runner', RUNNER]
+            with redirect_stdout(out):
+                perf_trend.main(argv)
+            self.assertEqual(out.getvalue(), f'{want}\n', n)
 
     def test_the_repair_command_writes_observe_s_actions_and_says_whether_any(self):
         for n in range(1, 8):

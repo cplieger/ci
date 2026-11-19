@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import itertools
 import json
 import pathlib
 import re
@@ -40,19 +41,19 @@ LABEL_DESCRIPTION = 'A performance regression the scheduled trend found'
 # the baseline the newest point carried is used only when the checkout holds no good point.
 BASELINE_POINTS = 7
 HISTORY = 21
-# The pull request guard's baseline: the median of the last GUARD_POINTS dev points. Over
-# five ten-run calibrations a three-point median failed one pr-set cell's median of six in
-# 54,600 one-job samples and five points none; a deliberate change reaches it in three.
-# The trend judges a cell only once GUARD_POINTS points of its runner measured it: against
-# a three-point median one-run points would open 0.0165 false issues a point, five 0.0064.
-GUARD_POINTS = 5
 # Scenario group rule, family to the median ratio over a scenario's cells whose
 # baseline clears the family's guard floor. Over 900 one-run group samples of four
-# calibrations the worst median ratio was 1.294 for cpu_ms, 1.022 for heap_mb and
+# measurements the worst median ratio was 1.294 for cpu_ms, 1.022 for heap_mb and
 # 1.018 for rss_mb; no scenario has three server routes over the 10 ms floor.
 GROUP = {'cpu_ms': 1.3, 'heap_mb': 1.1, 'rss_mb': 1.1}
 GROUP_CELLS = 3
 BAD_RUNS_SHOWN = 20
+# Over five ten-run measurements one run's seconds for a unit stayed within 0.895 and
+# 1.193 times the median of the other nine runs (3,660 samples), so a unit further than
+# this off its plan.json seconds has moved, not varied.
+SECONDS_DRIFT = 0.2
+# perf-ci.yaml measures and guards this set on a pull request.
+PR_SET = 'pr'
 
 
 # --- points ----------------------------------------------------------------
@@ -72,8 +73,10 @@ def point(
     """One point of shard_groups' runs. A timing or report cell's value is the median of
     its runs' medians, and a count's the lower middle of every rep, a count some rep
     measured. A timing cell keeps each run's reps and CPU model, in run order. A cell
-    with no reps has value None. Raises on a cell whose fields identity_error refuses or
-    with a rep that is not a number."""
+    with no reps has value None. Each unit's seconds are the median of its runs', and its
+    profile_seconds, the time of a profiled rep, the median of the runs that ran one.
+    Raises on a cell whose fields identity_error refuses or with a rep that is not a
+    number, and on a unit timed twice in one run or whose times are not numbers."""
     runs = [perf_gate.merge(paths) for _, paths in sorted(groups.items())]
     runners = {r['runner'] for r in runs}
     if len(runners) != 1:
@@ -93,6 +96,32 @@ def point(
                 )
             seen['reps'].append(list(c.get('reps') or []))
             seen['cpu_models'].append(c.get('cpu_model', ''))
+    timed: dict[tuple, list] = {}
+    profiled: dict[tuple, list] = {}
+    for name, run in zip(sorted(groups), runs, strict=True):
+        mine = set()
+        for s in run['seconds']:
+            k = perf_gate.unit_key(s)
+            if not all(isinstance(x, str) and x for x in k):
+                raise ValueError(
+                    f'a unit timed in {name or "the run"} names no {", ".join(perf_gate.UNIT_FIELDS)}'
+                )
+            if k in mine:
+                raise ValueError(f'{perf_gate.key_text(k)}: timed twice in {name or "the run"}')
+            if not perf_gate.is_number(s.get('seconds')):
+                raise ValueError(f'{perf_gate.key_text(k)}: its seconds are not a number')
+            if 'profile_seconds' in s and not perf_gate.is_number(s['profile_seconds']):
+                raise ValueError(f'{perf_gate.key_text(k)}: its profile_seconds are not a number')
+            mine.add(k)
+            timed.setdefault(k, []).append(s['seconds'])
+            if 'profile_seconds' in s:
+                profiled.setdefault(k, []).append(s['profile_seconds'])
+    units = []
+    for k, v in sorted(timed.items()):
+        u = {**dict(zip(perf_gate.UNIT_FIELDS, k, strict=True)), 'seconds': statistics.median(v)}
+        if k in profiled:
+            u['profile_seconds'] = statistics.median(profiled[k])
+        units.append(u)
     cells = []
     for k in sorted(found):
         seen = found[k]
@@ -112,6 +141,7 @@ def point(
         'runs': len(runs),
         'run_id': run_id,
         'run_url': run_url,
+        'units': units,
         'cells': cells,
     }
 
@@ -196,9 +226,9 @@ def ref_of(p: dict) -> dict:
 def baseline(history: list[dict], k: tuple, runner: str, accepted: dict | None) -> float | None:
     """The median of cell k's last BASELINE_POINTS values on runner that were not bad,
     or else the baseline the newest such point carried, and None while fewer than
-    GUARD_POINTS points of runner measured it since it last took over. Under an accepted
-    regression the points before its first bad point are no baseline, and those up to
-    its acceptance count however they were judged."""
+    perf_gate.GUARD_POINTS points of runner measured it since it last took over. Under an
+    accepted regression the points before its first bad point are no baseline, and those
+    up to its acceptance count however they were judged."""
     good, carried, measured = [], None, 0
     for h in reversed(history):
         if h['runner'] != runner:
@@ -217,7 +247,7 @@ def baseline(history: list[dict], k: tuple, runner: str, accepted: dict | None) 
         good.append(c['value'])
         if len(good) == BASELINE_POINTS:
             break
-    if measured < GUARD_POINTS:
+    if measured < perf_gate.GUARD_POINTS:
         return None
     return statistics.median(good) if good else carried
 
@@ -630,16 +660,42 @@ def open_markers(issues: list[dict], series: str) -> set[str]:
 
 def skip(state: dict, commit: str, runner: str) -> bool:
     """Whether a point of commit on runner adds nothing: the series' last point measured
-    it on runner, and no scenario tracked on runner is suspect, waiting on a confirming
-    point, or recovering, waiting on its second good one. A skipped run still sends
-    observe's issue writes."""
+    it on runner, no scenario tracked on runner is suspect, waiting on a confirming
+    point, or recovering, waiting on its second good one, and the guard's baseline holds
+    that point (guard_behind). A skipped run still sends observe's issue writes."""
     last = state.get('last')
     pending = any(
         v['status'] in ('suspect', 'recovering') and v.get('runner') == runner
         for v in state['scenarios'].values()
     )
     same = bool(last) and last['commit'] == commit and last.get('runner') == runner
-    return same and not pending
+    return same and not pending and not last.get('guard_behind')
+
+
+def guard_behind(base: dict, p: dict, pr_units: dict[tuple, set[str] | None]) -> str | None:
+    """Why the guard's baseline (guard_baseline) does not hold dev's point p yet, or None:
+    it holds fewer than perf_gate.GUARD_POINTS runs, or a timing cell of pr_units
+    (planned_windows of the pr set) is past the guard against it, so every pull request
+    fails on that cell until more points of p move the median."""
+    runs = base['runs']
+    if runs < perf_gate.GUARD_POINTS:
+        return (
+            f'it holds {runs} run{"" if runs == 1 else "s"} of `{base["runner"]}`, '
+            f'fewer than {perf_gate.GUARD_POINTS}'
+        )
+    held = {perf_gate.key(c): c['baseline'] for c in base['cells'] if perf_gate.is_timing(c)}
+    over = sum(
+        1
+        for c in p['cells']
+        if perf_gate.is_timing(c)
+        and perf_gate.planned(pr_units, c)
+        and perf_gate.is_number(c.get('value'))
+        and perf_gate.key(c) in held
+        and perf_gate.over_guard(c['metric'], c['value'], held[perf_gate.key(c)])
+    )
+    if not over:
+        return None
+    return f'{over} timing cell{"" if over == 1 else "s"} {"is" if over == 1 else "are"} past the guard against it'
 
 
 def point_runs(p: dict) -> int:
@@ -650,31 +706,26 @@ def point_runs(p: dict) -> int:
 
 def guard_baseline(points: list[dict]) -> dict:
     """The pull request guard's baselines from dev's points, oldest first: each timing
-    cell's median over the last GUARD_POINTS points of the newest runner whose points
-    since it last took over hold GUARD_POINTS runs between them, or else of the newest
-    point's runner, and each count as the newest of them measured it, which the guard
-    only reports. A runner's first points after it takes over are no guard baseline:
-    against one to four one-run points a pull request's median fails 1 to 10 % of the
-    time, against five none."""
-    by_runner: dict[str, list[dict]] = {}
-    previous = None
-    for p in points:
-        stretch = by_runner.pop(p['runner'], []) if p['runner'] == previous else []
-        by_runner[p['runner']] = [*stretch, p]
-        previous = p['runner']
-    # Re-inserted at each point, so the dict runs from the least to the most recent runner.
-    newest = list(reversed(by_runner))
-    held = [r for r in newest if sum(map(point_runs, by_runner[r][-GUARD_POINTS:])) >= GUARD_POINTS]
-    runner = held[0] if held else newest[0]
-    last = by_runner[runner][-GUARD_POINTS:]
-    values: dict[tuple, tuple[str, list]] = {}
+    cell's median over the newest point's runner's last perf_gate.GUARD_POINTS points
+    since it last took over, when the points that measured it hold GUARD_POINTS runs
+    between them; each count as the newest of them measured it; and `runs`, the runs
+    those points hold."""
+    runner = points[-1]['runner']
+    stretch = list(itertools.takewhile(lambda p: p['runner'] == runner, reversed(points)))
+    last = stretch[: perf_gate.GUARD_POINTS][::-1]
+    values: dict[tuple, tuple[str, list, list]] = {}
     for p in last:
+        p_runs = point_runs(p)
         for c in p['cells']:
             counted = c['kind'] == 'count' and c.get('value') is not None
             if counted or (perf_gate.is_timing(c) and perf_gate.is_number(c.get('value'))):
-                values.setdefault(perf_gate.key(c), (c['kind'], []))[1].append(c['value'])
+                _, v, runs = values.setdefault(perf_gate.key(c), (c['kind'], [], []))
+                v.append(c['value'])
+                runs.append(p_runs)
     cells = []
-    for k, (kind, v) in sorted(values.items()):
+    for k, (kind, v, runs) in sorted(values.items()):
+        if kind != 'count' and sum(runs) < perf_gate.GUARD_POINTS:
+            continue
         value = v[-1] if kind == 'count' else statistics.median(v)
         cells.append({**perf_gate.key_dict(k), 'kind': kind, 'baseline': value})
     return {
@@ -682,6 +733,7 @@ def guard_baseline(points: list[dict]) -> dict:
         'series': DEV,
         'runner': runner,
         'commits': [p['commit'] for p in last],
+        'runs': sum(map(point_runs, last)),
         'cells': cells,
     }
 
@@ -734,10 +786,16 @@ def seedable(issues: list[dict], series: str) -> None:
 
 
 def record(
-    root: pathlib.Path, p: dict, *, repo: str, issues: list[dict] | None
+    root: pathlib.Path,
+    p: dict,
+    *,
+    repo: str,
+    issues: list[dict] | None,
+    pr_units: dict[tuple, set[str] | None],
 ) -> tuple[list[dict], str]:
     """Judge point p against the checkout at root and write it there: the judged point,
-    the series' state and, for dev, the guard's baseline.json. Refuses a point older than
+    the series' state and, for dev, the guard's baseline.json and whether it holds p
+    for the pull requests' units (pr_units, as guard_behind reads them). Refuses a point older than
     the series' newest, a series with no state while issues holds one marked with it, and
     a series other than dev on a checkout with no dev series. Returns the issue actions
     and the run summary."""
@@ -785,12 +843,68 @@ def record(
     )
     stepped = {a['marker'] for a in judged.actions}
     actions = [a for a in actions if a['marker'] not in stepped] + judged.actions
+    state, summary = judged.state, judged.summary
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(dumps(judged.point))
-    state_file.write_text(dumps(judged.state))
     if series == DEV:
-        (d / 'baseline.json').write_text(dumps(guard_baseline([*history, judged.point])))
-    return actions, judged.summary
+        base = guard_baseline([*history, judged.point])
+        behind = guard_behind(base, judged.point, pr_units)
+        state = {**state, 'last': {**state['last'], 'guard_behind': behind}}
+        (d / 'baseline.json').write_text(dumps(base))
+        if behind:
+            summary += (
+                f"The pull request guard's baseline does not hold this point yet: {behind}, "
+                f'so the next run measures `{p["commit"][:12]}` again.\n'
+            )
+    state_file.write_text(dumps(state))
+    return actions, summary
+
+
+def pr_units(plan_doc: dict) -> dict[tuple, set[str] | None]:
+    """planned_windows of plan_doc's PR_SET cells, passing over an entry plan() would
+    refuse; empty when there is no such set."""
+    spec = (plan_doc.get('sets') or {}).get(PR_SET) if isinstance(plan_doc, dict) else None
+    cells = spec.get('cells') if isinstance(spec, dict) else None
+    return perf_gate.planned_windows(
+        c
+        for c in (cells if isinstance(cells, list) else ())
+        if isinstance(c, dict)
+        and all(isinstance(c.get(f), str) for f in perf_gate.UNIT_FIELDS)
+        and perf_gate.windows_error(c) is None
+    )
+
+
+def seconds_drift(plan_doc: dict, p: dict) -> str:
+    """The summary table of each window-less unit of plan_doc's sets whose seconds point
+    p measured more than SECONDS_DRIFT off its `seconds`, which plan() shards on: the
+    unit's seconds, plus its profile_seconds for a cell marked `profile`, and a profiled
+    cell is passed over when p ran no profiled rep of it. Information: an entry plan()
+    would refuse is passed over, never failed."""
+    measured = {perf_gate.unit_key(u): u for u in p['units']}
+    sets = plan_doc.get('sets')
+    rows = []
+    for name, spec in sorted(sets.items()) if isinstance(sets, dict) else ():
+        for u in spec.get('cells') or [] if isinstance(spec, dict) else ():
+            if (
+                not isinstance(u, dict)
+                or 'windows' in u
+                or not perf_gate.is_number(u.get('seconds'))
+            ):
+                continue
+            m = took(measured.get(perf_gate.unit_key(u)), profiled=bool(u.get('profile')))
+            if m is not None and abs(m - u['seconds']) > SECONDS_DRIFT * u['seconds']:
+                rows.append(
+                    (name, perf_gate.key_text(perf_gate.unit_key(u)), num(u['seconds']), num(m))
+                )
+    title = f'Units measured more than {SECONDS_DRIFT * 100:g} % off their plan.json seconds (information)'
+    lines = perf_gate.table(title, ('Set', 'Unit', 'plan.json', 'Measured'), rows)
+    return '\n'.join(lines) + '\n' if lines else ''
+
+
+def took(unit: dict | None, *, profiled: bool) -> float | None:
+    if unit is None or (profiled and 'profile_seconds' not in unit):
+        return None
+    return unit['seconds'] + (unit['profile_seconds'] if profiled else 0)
 
 
 # --- issues ----------------------------------------------------------------
@@ -934,6 +1048,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     jd.add_argument('--actions', required=True, help='where the issue actions are written')
     jd.add_argument('--summary', help='a file the Markdown summary is appended to')
+    jd.add_argument(
+        '--plan', required=True, help="the measured commit's tests/perf/plan.json, read as data"
+    )
     fi = sub.add_parser('fetch-issues', help="write the repository's `performance` issues")
     fi.add_argument('--repo', required=True)
     fi.add_argument('--out', required=True)
@@ -979,7 +1096,11 @@ def run(a: argparse.Namespace) -> int:
                 f'{a.point} is a point of series {p.get("series")!r}, not {a.series!r}'
             )
         issues = json.loads(pathlib.Path(a.issues).read_text()) if a.issues else None
-        actions, summary = record(pathlib.Path(a.root), p, repo=a.repo, issues=issues)
+        plan_doc = perf_gate.load(a.plan)
+        actions, summary = record(
+            pathlib.Path(a.root), p, repo=a.repo, issues=issues, pr_units=pr_units(plan_doc)
+        )
+        summary += seconds_drift(plan_doc, p)
         pathlib.Path(a.actions).write_text(json.dumps(actions, indent=1) + '\n')
         print(summary)
         if a.summary:

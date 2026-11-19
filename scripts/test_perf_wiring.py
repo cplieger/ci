@@ -11,7 +11,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import perf_gate
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -95,14 +94,26 @@ class PerfCi(unittest.TestCase):
     def test_the_plan_is_made_in_the_call_s_mode(self):
         plan = next(s for s in self.jobs['plan']['steps'] if s.get('id') == 'plan')
         self.assertEqual(plan['env']['MODE'], '${{ inputs.mode }}')
-        self.assertIn('--runs "$RUNS" --mode "$MODE"', plan['run'])
+        self.assertIn('--only "$ONLY" --mode "$MODE"', plan['run'])
 
-    def test_the_sets_check_plan_counts_are_the_sets_the_workflows_gate(self):
-        plan = next(s for s in self.jobs['plan']['steps'] if s.get('id') == 'plan')
-        on_a_pull_request = re.findall(r"^\s*SET='([^']+)'$", plan['run'], re.MULTILINE)
-        weekly = load('weekly-perf.yaml')['jobs']['perf']['with']['set']
-        self.assertEqual(on_a_pull_request, ['pr'])
-        self.assertEqual(set(perf_gate.RUN_SETS), {*on_a_pull_request, weekly})
+    def test_a_unit_s_own_runs_is_the_only_repeat_count(self):
+        on = load('perf-ci.yaml')[True]['workflow_call']['inputs']
+        self.assertNotIn('runs', on)
+        self.assertEqual(on['mode']['default'], 'gate')
+        for path in sorted(WORKFLOWS.glob('*.y*ml')):
+            for job, spec in yaml.safe_load(path.read_text())['jobs'].items():
+                if spec.get('uses') == './.github/workflows/perf-ci.yaml':
+                    with self.subTest(caller=path.name, job=job):
+                        self.assertNotIn('runs', spec.get('with') or {})
+
+    def test_no_scheduled_cplieger_ci_workflow_measures_performance(self):
+        # The measured repository's own perf-trend caller is the one scheduled measure.
+        for path in sorted(WORKFLOWS.glob('*.y*ml')):
+            text = path.read_text()
+            if 'schedule' not in (yaml.safe_load(text).get(True) or {}):
+                continue
+            with self.subTest(workflow=path.name):
+                self.assertNotRegex(text, r'perf-(ci|trend|measure)\.yaml|perf_gate\.py')
 
 
 class DispatchInputs(unittest.TestCase):
@@ -140,7 +151,7 @@ class ResultArtifacts(unittest.TestCase):
 
     def test_every_results_download_merges_its_artifacts(self):
         found = list(self.downloads())
-        self.assertGreaterEqual(len(found), 5)
+        self.assertGreaterEqual(len(found), 4)
         for name, job, step in found:
             with self.subTest(workflow=name, job=job, step=step['name']):
                 self.assertIs(step['with'].get('merge-multiple'), expr2=True)
@@ -161,12 +172,6 @@ class ResultArtifacts(unittest.TestCase):
         step = next(s for s in jobs['verdict']['steps'] if s['name'] == 'Verdict')
         self.assertEqual(step['env']['COMPARED'], '${{ needs.compare.outputs.attempt }}')
         self.assertIn('--remeasure-attempt "$COMPARED"', step['run'])
-
-    def test_calibrate_reads_the_artifacts_by_prefix_and_counts_its_runs(self):
-        steps = load('perf-calibrate.yaml')['jobs']['propose']['steps']
-        run = next(s for s in steps if s['name'] == 'Propose and sign')['run']
-        self.assertIn('--calibrate "$RUNNER_TEMP/artifacts" --prefix "$PREFIX" --runs 10', run)
-        self.assertIn('--plan-doc measured/tests/perf/plan.json', run)
 
 
 def step(job: dict, name: str) -> dict:
@@ -312,7 +317,6 @@ class Gate(unittest.TestCase):
     def test_only_the_gate_mode_compares(self):
         on = load('perf-ci.yaml')[True]['workflow_call']['inputs']
         self.assertIn('`measure`', on['mode']['description'])
-        self.assertNotIn('calibrate', on['mode']['description'])
         self.assertIn("inputs.mode == 'gate'", self.jobs['compare']['if'])
         for path in sorted(WORKFLOWS.glob('*.y*ml')):
             for job, spec in yaml.safe_load(path.read_text())['jobs'].items():
@@ -390,10 +394,8 @@ class NoIdToken(unittest.TestCase):
             [
                 ('ci.yaml', 'perf'),
                 ('ci.yml', 'ci'),
-                ('perf-calibrate.yaml', 'measure'),
                 ('perf-trend.yaml', 'measure'),
                 ('self-ci.yaml', 'ci'),
-                ('weekly-perf.yaml', 'perf'),
             ],
         )
 
@@ -404,74 +406,11 @@ class NoIdToken(unittest.TestCase):
         self.assertEqual(load('ci.yaml')['jobs']['perf']['permissions'], READS)
 
 
-class Calibration(unittest.TestCase):
-    doc = load('perf-calibrate.yaml')
-    jobs = doc['jobs']
-
-    def test_a_calibration_measures_the_full_set_ten_times_at_the_default_branch_head(self):
-        on = self.doc[True]
-        self.assertEqual(set(on), {'workflow_dispatch', 'workflow_call'})
-        self.assertEqual(set(on['workflow_dispatch']['inputs']), {'repo'})
-        self.assertEqual(set(on['workflow_call']['inputs']), {'repo'})
-        self.assertEqual(
-            set(on['workflow_call']['secrets']), {'SYNC_APP_ID', 'SYNC_APP_PRIVATE_KEY'}
-        )
-        measure = self.jobs['measure']
-        self.assertEqual(measure['permissions'], READS)
-        self.assertEqual(
-            measure['with'],
-            {
-                'repository': '${{ needs.check.outputs.repository }}',
-                'ref': '${{ needs.check.outputs.sha }}',
-                'set': 'full',
-                'runs': 10,
-                'mode': 'measure',
-                'max-parallel': 10,
-            },
-        )
-        self.assertIn('default_branch', step(self.jobs['check'], 'Check the repository')['run'])
-
-    def test_only_the_check_in_holds_a_secret_and_it_runs_none_of_the_repository_s_code(self):
-        held = {j for j, spec in self.jobs.items() if 'secrets.' in json.dumps(spec)}
-        self.assertEqual(held, {'check-in'})
-        job = self.jobs['check-in']
-        self.assertEqual(job['permissions'], {'contents': 'read'})
-        code = re.compile(
-            r'\btests/[\w/.-]*\.sh\b|\bnpm\b|\bnpx\b|\bgo (build|run|test)\b|\bmake\b|\./'
-        )
-        for s in job['steps']:
-            with self.subTest(step=s.get('name')):
-                self.assertFalse(
-                    str(s.get('uses', '')).startswith(('actions/setup-node@', 'actions/setup-go@'))
-                )
-                body = '\n'.join(
-                    line
-                    for line in s.get('run', '').splitlines()
-                    if not line.lstrip().startswith('#')
-                )
-                self.assertNotRegex(body, code)
-                for call in re.findall(r'python3 (\S+)', body):
-                    self.assertEqual(call, '"$CI_TOOLS/perf_gate.py"')
-
-    def test_the_check_in_opens_a_pull_request_from_its_run_s_branch(self):
-        job = self.jobs['check-in']
-        token = step(job, 'Mint the App token')
-        self.assertEqual(token['with']['repositories'], '${{ needs.check.outputs.name }}')
-        self.assertEqual(token['with']['permission-contents'], 'write')
-        self.assertEqual(token['with']['permission-pull-requests'], 'write')
-        run = step(job, 'Check in the calibration')['run']
-        self.assertIn('--check-in "$RUNNER_TEMP/proposed/${RUN_ID}.json"', run)
-        self.assertIn('perf/calibration-${RUN_ID}', run)
-        self.assertIn('chore(perf): calibrate budgets at ${COMMIT:0:12}', run)
-        self.assertNotIn('extraheader', json.dumps(step(job, 'Checkout')))
-
-    def test_the_weekly_calibration_runs_only_when_dispatched(self):
-        on = load('weekly-perf-calibrate.yaml')[True]
-        self.assertEqual(set(on), {'workflow_dispatch'})
-        weekly = load('weekly-perf-calibrate.yaml')['jobs']
-        self.assertEqual(weekly['calibrate']['uses'], './.github/workflows/perf-calibrate.yaml')
-        self.assertEqual(weekly['calibrate']['strategy']['max-parallel'], 1)
-        self.assertEqual(set(weekly['notify']['needs']), set(weekly) - {'notify'})
+# The record job's one read of a measured repository file, through the contents API as data.
+PLAN_READ = (
+    "gh api -H 'Accept: application/vnd.github.raw+json' \\\n"
+    '  "repos/${REPO}/contents/tests/perf/plan.json?ref=${SHA}" > "$RUNNER_TEMP/plan.json"'
+)
 
 
 class Trend(unittest.TestCase):
@@ -505,10 +444,16 @@ class Trend(unittest.TestCase):
                             ('actions/setup-node@', 'actions/setup-go@')
                         )
                     )
-                    body = code_of(s.get('run', ''))
+                    body = code_of(s.get('run', '')).replace(PLAN_READ, '')
                     self.assertNotRegex(body, code)
                     for call in re.findall(r'python3 (\S+)', body):
                         self.assertEqual(call, '"$CI_TOOLS/perf_trend.py"')
+
+    def test_record_reads_the_measured_commit_s_plan_only_as_data(self):
+        body = code_of(step(self.jobs['record'], 'Record')['run'])
+        self.assertEqual(body.count('plan.json'), 3)
+        self.assertIn(PLAN_READ, body)
+        self.assertIn('--plan "$RUNNER_TEMP/plan.json"', body)
 
     def test_the_token_reaches_git_through_its_environment_never_its_argv(self):
         body = code_of(step(self.jobs['record'], 'Record')['run'])
@@ -517,6 +462,17 @@ class Trend(unittest.TestCase):
         for line in body.splitlines():
             if 'GH_TOKEN' in line:
                 self.assertTrue(line.lstrip().startswith('GIT_CONFIG_VALUE_0='), line)
+
+    def test_the_workflows_a_scheduled_point_runs_measured_code_in_reference_no_secret(self):
+        # GitHub hands a runner every secret its job references, and the measured code runs there.
+        called, todo = set(), [self.jobs['measure']['uses']]
+        while todo:
+            name = todo.pop().removeprefix('./.github/workflows/')
+            called.add(name)
+            text = (WORKFLOWS / name).read_text()
+            self.assertNotRegex(text, r'secrets\.|github\.token', name)
+            todo += [j['uses'] for j in yaml.safe_load(text)['jobs'].values() if 'uses' in j]
+        self.assertEqual(called, {'perf-ci.yaml', 'perf-measure.yaml'})
 
     def test_no_job_names_a_secret_and_no_run_body_expands_an_expression(self):
         self.assertNotIn('secrets.', (WORKFLOWS / 'perf-trend.yaml').read_text())
@@ -750,8 +706,12 @@ if [[ " $* " == *" push "* ]] && [ -f "$RACE" ]; then
 fi
 exec {real} "${{args[@]}}"
 """
-        gh = """#!/usr/bin/env bash
-printf 'HTTP/2.0 200 OK\\r\\n\\r\\n%s' "$ISSUES"
+        gh = f"""#!/usr/bin/env bash
+case "$*" in
+  "api -H Accept: application/vnd.github.raw+json repos/cplieger/a/contents/tests/perf/plan.json?ref={sha}")
+    printf '%s' "$PLAN" ;;
+  *) printf 'HTTP/2.0 200 OK\\r\\n\\r\\n%s' "$ISSUES" ;;
+esac
 """
         if race:
             (tmp / 'race').write_text('')
@@ -763,6 +723,9 @@ printf 'HTTP/2.0 200 OK\\r\\n\\r\\n%s' "$ISSUES"
         env |= {'CI_TOOLS': str(ROOT / 'scripts'), 'RUNNER_TEMP': str(tmp / 'runner')}
         env |= {'RACE': str(tmp / 'race'), 'HOME': str(tmp), 'SEED': seed}
         env |= {'ISSUES': json.dumps(list(issues))}
+        unit = {'scenario': 'files', 'scale': 'x10', 'engine': 'chromium', 'width': 'desktop'}
+        plan = {'node': 'web', 'sets': {'full': {'shards': 1, 'cells': [unit | {'seconds': 9}]}}}
+        env |= {'PLAN': json.dumps(plan)}
         proc, _ = run_body(self, s['run'], env, {'git': git, 'gh': gh})
         return proc, tmp / 'runner'
 
@@ -904,21 +867,11 @@ class Release(unittest.TestCase):
         )
         return set(re.search(r'INTERNAL_WORKFLOWS="([^"]+)"', run).group(1).split())
 
-    def test_only_the_workflows_that_run_inside_this_repository_cut_no_release(self):
+    def test_the_perf_workflows_consumers_call_cut_a_release(self):
         internal = self.internal()
-        self.assertLessEqual(
-            {'perf-calibrate.yaml', 'weekly-perf.yaml', 'weekly-perf-calibrate.yaml'}, internal
-        )
         self.assertFalse({'perf-ci.yaml', 'perf-measure.yaml', 'perf-trend.yaml'} & internal)
-
-    def test_self_ci_installs_cosign_before_the_suite(self):
-        steps = load('self-ci.yaml')['jobs']['release-channel-scripts']['steps']
-        names = [s.get('name') for s in steps]
-        install = steps[names.index('Install cosign')]
-        self.assertTrue(install['uses'].startswith('sigstore/cosign-installer@'))
-        self.assertLess(
-            names.index('Install cosign'), names.index('Probe the release-channel scripts')
-        )
+        on_disk = {p.name for p in WORKFLOWS.glob('*.y*ml')}
+        self.assertLessEqual(internal, on_disk)
 
 
 if __name__ == '__main__':

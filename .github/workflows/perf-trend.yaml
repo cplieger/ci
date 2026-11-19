@@ -249,6 +249,9 @@ jobs:
           python3 "$CI_TOOLS/perf_trend.py" point --results "$RUNNER_TEMP/results" --prefix "$PREFIX" \
             --repo "$REPO" --series "$SERIES" --ref "$REF" --commit "$SHA" --date "$DATE" \
             --run-id "$RUN_ID" --run-url "$RUN_URL" --out "$point"
+          # Read as data: the pr set it names and each unit's planned seconds.
+          gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/${REPO}/contents/tests/perf/plan.json?ref=${SHA}" > "$RUNNER_TEMP/plan.json"
           python3 "$CI_TOOLS/perf_trend.py" fetch-issues --repo "$REPO" --out "$RUNNER_TEMP/issues.json"
           # The branch only moves forward: a push another run got in first is
           # refused, and this point is judged again on top of it.
@@ -282,7 +285,8 @@ jobs:
             : > "$RUNNER_TEMP/summary.md"
             python3 "$CI_TOOLS/perf_trend.py" judge --root "$work" --point "$point" --series "$SERIES" \
               --repo "$REPO" --issues "$RUNNER_TEMP/issues.json" \
-              --actions "$RUNNER_TEMP/actions.json" --summary "$RUNNER_TEMP/summary.md"
+              --actions "$RUNNER_TEMP/actions.json" --summary "$RUNNER_TEMP/summary.md" \
+              --plan "$RUNNER_TEMP/plan.json"
             git -C "$work" add --sparse -- "series/${SERIES}"
             # A re-run of a run whose point is on the branch writes only its issues.
             if git -C "$work" diff --cached --quiet; then

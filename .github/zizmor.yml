@@ -26,7 +26,6 @@ rules:
       - self-ci.yaml
       - self-codeql.yml
       - perf-ci.yaml
-      - perf-calibrate.yaml
       - perf-trend.yaml
       # The workflows calling notify-failure.yaml.
       - audit.yaml
@@ -47,8 +46,6 @@ rules:
       - weekly-fuzz.yaml
       - weekly-gremlins.yaml
       - weekly-links.yaml
-      - weekly-perf.yaml
-      - weekly-perf-calibrate.yaml
       - weekly-stryker.yaml
 
   github-app:
