@@ -694,6 +694,8 @@ run_go_nested=true
 run_go_os=true
 run_ts_nested=true
 # shellcheck source=/dev/null
+. "$CI_TOOLS/gha-log.sh" # as the detect step does before the block
+# shellcheck source=/dev/null
 . "$3" >/dev/null
 printf 'nested=%s os=%s ts=%s run=%s,%s,%s\n' "$go_nested_dirs" "$(jq -c 'map(.dir)' <<<"$go_os_matrix")" \
   "$ts_nested_dirs" "$run_go_nested" "$run_go_os" "$run_ts_nested"
@@ -751,7 +753,7 @@ scope() { # <scope_modules> <changed paths, one per line> [root|symlink|inside|a
   esac
   local replaced=false
   case "${3:-}" in replaced | required | unrequired | crlf) replaced=true ;; esac
-  (cd "$d" && bash -eo pipefail "$WORK/scope-run.sh" "$1" "$2" "$WORK/module-scope.sh" "$replaced") \
+  (cd "$d" && CI_TOOLS="$ROOT/scripts" bash -eo pipefail "$WORK/scope-run.sh" "$1" "$2" "$WORK/module-scope.sh" "$replaced") \
     || fail "ci.yaml's module-scope block failed for '$2'"
 }
 ALL='nested=["filesafe","httpclient","keyenc","measure","ssrf"] os=["filesafe","measure"] ts=["keyenc/web"] run=true,true,true'

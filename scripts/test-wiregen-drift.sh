@@ -30,7 +30,7 @@ $out" ;;
 }
 expect_runs() { # expect_runs <label> <expected "wiregen: go -C" lines, sorted>
   local got
-  got=$(printf '%s\n' "$out" | grep '^wiregen: go -C ' | sort)
+  got=$(printf '%s\n' "$out" | sed -n 's/^- \(wiregen: go -C \)/\1/p' | sort)
   if [ "$got" = "$2" ]; then pass "$1"; else fail "$1" "ran:
 $got
 want:

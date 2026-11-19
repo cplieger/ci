@@ -5913,9 +5913,9 @@ def test_workflow_runs_a_repo_it_cannot_read_in_its_own_call(tmp: Path) -> None:
         and outputs == {'repos': ['a', 'down', 'go', 'z']}
         and '::warning::down: its Go modules could not be read' in log
         and '### down: its Go modules could not be read' in summary
-        and '  include: a (12000 bytes of non-test Go)' in log
-        and '  include: go (24000 bytes of non-test Go)' in log
-        and '  skip:    tiny (100 bytes' in log,
+        and '- include: a (12000 bytes of non-test Go)' in log
+        and '- include: go (24000 bytes of non-test Go)' in log
+        and '- skip:    tiny (100 bytes' in log,
         detail=f'{rc} {outputs} {log[-600:]}',
     )
     t0 = time.monotonic()

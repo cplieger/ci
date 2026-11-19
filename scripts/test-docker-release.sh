@@ -424,7 +424,7 @@ chk "D-P4 the caller check reads the event's repository alone" "$(cat "$WORK/cal
 chk "D-P5 promote reads the exclusion list and the subpackages" "$(tr '\n' ' ' <"$WORK/promote.sh.env")" "CI_TOOLS EXCLUDE_RE SUBPACKAGES_JSON "
 chk "D-P5 the subpackages are the caller's declared list" "$(sed -n 's/^SUBPACKAGES_JSON=//p' "$WORK/promote.sh.envmap")" '${{ inputs.subpackages }}'
 chk_has "D-P5 promote runs the shared digest resolver" "$(cat "$WORK/promote.sh")" 'bash "$CI_TOOLS/promote-digest.sh" "$GITHUB_SHA"'
-chk "D-P6 build args read the channel tag, in prepare" "$(tr '\n' ' ' <"$WORK/buildargs.sh.env")" "DOCKERFILE TAG "
+chk "D-P6 build args read the channel tag, in prepare" "$(tr '\n' ' ' <"$WORK/buildargs.sh.env")" "CI_TOOLS DOCKERFILE TAG "
 # The extracted body sees only the TAG variable; what feeds it is an
 # expression the shell cannot evaluate, so it is pinned by text: the channel
 # tag prepare derived, never the stable base a dev build has not earned.
@@ -451,7 +451,7 @@ chk "D-P9 the inputs carry the kind line and the security merges, no promotion n
 chk "D-P10 the workflow says nothing of a soak" "$(gate '.soak')" "0"
 policy_keys() { # <repo name> <spdx id> -> the policy step's output keys
   : >"$WORK/policy-out"
-  (cd "$WORK" && REPO_NAME="$1" REPO_SPDX_ID="$2" GITHUB_OUTPUT="$WORK/policy-out" bash "$WORK/policy.sh") >/dev/null
+  (cd "$WORK" && CI_TOOLS="$ROOT/scripts" REPO_NAME="$1" REPO_SPDX_ID="$2" GITHUB_OUTPUT="$WORK/policy-out" bash "$WORK/policy.sh") >/dev/null
   sed 's/=.*//' "$WORK/policy-out" | tr '\n' ' '
 }
 chk "D-P11 every release SBOM scan reads the published image" "$(gate '."sbom-sources" | join(",")')" "image"
@@ -463,7 +463,7 @@ chk "D-P11 the policy hands every image repository the same keys" \
   "registries platforms syft_config image_licenses runner_image_licenses binaries /registries platforms syft_config image_licenses runner_image_licenses binaries /registries platforms syft_config image_licenses runner_image_licenses binaries "
 policy_value() { # <repo name> <key> -> that key's value from the policy step
   : >"$WORK/policy-out"
-  (cd "$WORK" && REPO_NAME="$1" REPO_SPDX_ID=Apache-2.0 GITHUB_OUTPUT="$WORK/policy-out" bash "$WORK/policy.sh") >/dev/null
+  (cd "$WORK" && CI_TOOLS="$ROOT/scripts" REPO_NAME="$1" REPO_SPDX_ID=Apache-2.0 GITHUB_OUTPUT="$WORK/policy-out" bash "$WORK/policy.sh") >/dev/null
   sed -n "s/^$2=//p" "$WORK/policy-out"
 }
 chk "D-P12 grelot's Release carries its client as binaries, and no other repository's does" \
