@@ -110,5 +110,44 @@ class JsrShippedRestoresJsrJson(unittest.TestCase):
             self.assertIn('^6.6.0-dev.1 -> jsr:@cplieger/e@^6.5.0', log.getvalue())
 
 
+class JsrShippedFailsOnARefusedDryRun(unittest.TestCase):
+    """jsr's own refusal fails the check, even after it listed its files."""
+
+    def shipped(self, code: int, out: str, err: str = '') -> set[pathlib.Path]:
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = pathlib.Path(tmp)
+            (pkg / 'jsr.json').write_text('{}')
+            listed = out.format(root=pkg.resolve())
+
+            def fake_run(cmd, cwd, **_):
+                return subprocess.CompletedProcess(cmd, code, listed, err)
+
+            with mock.patch.object(publish_surface, 'run', fake_run):
+                return publish_surface.jsr_shipped(pkg)
+
+    def test_a_refusal_after_the_file_list_fails(self):
+        with self.assertRaisesRegex(
+            publish_surface.SurfaceError, r'(?s)refused.*exit 1.*invalid-external-import'
+        ):
+            self.shipped(
+                1, 'file://{root}/src/index.ts (1KB)', 'error[invalid-external-import]: bad'
+            )
+
+    def test_a_refusal_with_no_file_list_names_the_refusal(self):
+        with self.assertRaisesRegex(
+            publish_surface.SurfaceError, r'(?s)refused.*missing-explicit-return-type'
+        ):
+            self.shipped(
+                1,
+                'Checking for slow types in the public API...',
+                'error[missing-explicit-return-type]',
+            )
+
+    def test_a_clean_dry_run_returns_its_files(self):
+        self.assertEqual(
+            self.shipped(0, 'file://{root}/src/index.ts (1KB)'), {pathlib.Path('src/index.ts')}
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
