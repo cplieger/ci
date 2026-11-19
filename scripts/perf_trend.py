@@ -345,8 +345,11 @@ def judge(
                 unjudged[s] = 'no timing cell has a baseline on this runner'
             continue
         rows = [c for c in cells if c['scenario'] == s and c.get('bad')]
+        tripped = [i.removeprefix('group:') for i in sorted(bad[s]) if i.startswith('group:')]
         good = (
-            last_good(history, fallback, p, s, [perf_gate.key(c) for c in rows]) if rows else None
+            last_good([*fallback, *history], s, rows, tripped, before.get('accepted'))
+            if rows
+            else None
         )
         after, op = step(before, bad[s], p, good)
         if op is not None:
@@ -374,8 +377,8 @@ def judge(
 def step(
     before: dict, bad: set[str], p: dict, good: dict | None
 ) -> tuple[dict, tuple[str, str | None] | None]:
-    """One scenario's lifecycle step on point p, given its bad cells and groups and the
-    last_good point a suspicion starting at p is ranged from: ok to
+    """One scenario's lifecycle step on point p, given its bad cells and groups and good,
+    the last_good point of p's bad cells, which a suspicion or an opened issue keeps: ok to
     suspect on a bad point; suspect to open (an upsert) when a cell or group of the
     suspicion is bad again, else a new suspicion; open and recovering to open on a bad
     point (an upsert with a comment); open to recovering, and recovering to ok (a
@@ -408,36 +411,50 @@ def step(
     after = {**before, 'status': 'open', 'items': sorted(bad)}
     after['bad_runs'] = [*before['bad_runs'], p['run_url']]
     if status == 'suspect':
-        after['opened'] = p['date']
+        # The issue names p's bad cells, so its range starts from the last point good for them.
+        after['opened'], after['last_good'] = p['date'], good
         return after, ('upsert', None)
     return after, ('upsert', 'still')
 
 
 def last_good(
-    history: list[dict], fallback: list[dict], p: dict, scenario: str, keys: list[tuple]
+    points: list[dict], scenario: str, rows: list[dict], groups: list[str], accepted: dict | None
 ) -> dict | None:
-    """The point a regression of scenario's cells keys, bad at p, is ranged from: the
-    newest of history on p's runner since it last took over that judged every one of keys
-    and found none of scenario's cells bad. Failing that, the newest such point of
-    fallback (dev's points up to a branch series' first) that measured them all, judged
-    or not, since none holds the branch's commits. None when neither holds one."""
+    """The point, of points (oldest first, on any runner), a regression of scenario's bad
+    cells rows and tripped scenario-rule families groups at a point is ranged from: the
+    newest that measured every one of rows, found none of scenario's cells bad, unless an
+    accepted regression forgave it, and was within the guard of each row past it against
+    the baseline the row failed, and within each group's rule likewise. None when no
+    point is."""
 
-    def clean(h: dict, judged: bool) -> bool:
+    def good_at(h: dict) -> bool:
         cells = h['cells']
-        return all(
-            k in cells
-            and cells[k].get('value') is not None
-            and (not judged or 'baseline' in cells[k])
-            for k in keys
-        ) and not any(c.get('bad') for c in cells.values() if c['scenario'] == scenario)
+        forgiven = bool(accepted) and accepted['from'] <= h['date'] <= accepted['at']
+        if not forgiven and any(c.get('bad') for c in cells.values() if c['scenario'] == scenario):
+            return False
+        then = {}
+        for c in rows:
+            v = cells.get(perf_gate.key(c), {}).get('value')
+            if not perf_gate.is_number(v):
+                return False
+            then[perf_gate.key(c)] = v
+        for c in rows:
+            k, b = perf_gate.key(c), c['baseline']
+            if perf_gate.over_guard(c['metric'], c['value'], b) and perf_gate.over_guard(
+                c['metric'], then[k], b
+            ):
+                return False
+        for fam in groups:
+            floor = perf_gate.GUARD[fam][1]
+            members = [
+                c for c in rows if perf_gate.family(c['metric']) == fam and c['baseline'] >= floor
+            ]
+            ratio = statistics.median(then[perf_gate.key(c)] / c['baseline'] for c in members)
+            if ratio > GROUP[fam]:
+                return False
+        return True
 
-    for points, judged in ((history, True), (fallback, False)):
-        for h in reversed(points):
-            if h['runner'] != p['runner']:
-                break
-            if clean(h, judged):
-                return ref_of(h)
-    return None
+    return next((ref_of(h) for h in reversed(points) if good_at(h)), None)
 
 
 def still_text(p: dict, rows: list[dict], groups: list[str]) -> str:
@@ -469,7 +486,7 @@ def ratio(c: dict) -> str:
 def counts_since(past: list[dict], tracked: dict, p: dict, scenario: str) -> list[str]:
     """The scenario's counts that differ between the regression's last good point and p."""
     good = tracked.get('last_good')
-    then = next((h for h in reversed(past) if good and h['commit'] == good['commit']), None)
+    then = next((h for h in reversed(past) if good and ref_of(h) == good), None)
     if then is None:
         return []
     out = []
@@ -523,8 +540,9 @@ def render_issue(
         )
     else:
         lines.append(
-            'No earlier point is known to be within the thresholds, so there is no known-good '
-            f'point and no commit range. The first bad point is `{first["commit"][:12]}`.'
+            'No earlier point the trend holds was within the thresholds for this scenario, so '
+            'there is no known-good point and no commit range. The first bad point is '
+            f'`{first["commit"][:12]}`.'
         )
     lines += ['', 'Runs of the bad points:', '']
     lines += [f'- {u}' for u in tracked['bad_runs'][-BAD_RUNS_SHOWN:]]
@@ -788,8 +806,8 @@ def load_points(root: pathlib.Path, series: str) -> list[dict]:
 def needs(listing: list[str], series: str) -> list[str]:
     """The paths of the perf-trend branch (listing, `git ls-tree -r --name-only`) the
     record job checks out to judge a point of series: its state, dev's state for another
-    series, its last HISTORY points and, while it has fewer than BASELINE_POINTS, the
-    last HISTORY dev points at or before its first one."""
+    series, its last HISTORY points and, for another series, every dev point at or before
+    its first one, which last_good may range a regression from however old the series."""
 
     def points_of(s: str) -> list[str]:
         prefix = f'series/{s}/points/'
@@ -800,10 +818,11 @@ def needs(listing: list[str], series: str) -> list[str]:
     if series != DEV:
         out.append(f'series/{DEV}/state.json')
     out += own[-HISTORY:]
-    if series != DEV and len(own) < BASELINE_POINTS:
+    if series != DEV:
         first = pathlib.PurePosixPath(own[0]).name if own else None
-        dev = [p for p in points_of(DEV) if first is None or pathlib.PurePosixPath(p).name <= first]
-        out += dev[-HISTORY:]
+        out += [
+            p for p in points_of(DEV) if first is None or pathlib.PurePosixPath(p).name <= first
+        ]
     return out
 
 

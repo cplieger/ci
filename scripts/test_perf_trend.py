@@ -455,16 +455,104 @@ class Judge(unittest.TestCase):
             judged.state['scenarios']['files']['last_good']['commit'], PURE_SHA.format(5)
         )
 
-    def test_with_no_known_good_point_the_issue_says_so_and_shows_no_range(self):
+    def test_the_first_judged_point_ranges_from_the_unjudged_points_within_its_baseline(self):
         t = Trend(points=perf_gate.GUARD_POINTS)
+        t.add(slow(cold=3000.0))
+        body = t.add(slow(cold=3000.0)).actions[0]['body']
+        self.assertIn(
+            f'https://github.com/{REPO}/compare/{PURE_SHA.format(5)}...{PURE_SHA.format(6)}', body
+        )
+
+    def test_with_no_known_good_point_the_issue_says_so_and_shows_no_range(self):
+        # The checkout's points all hold the regression, whose baseline they carry.
+        streak = []
+        for n in range(1, 6):
+            p = tp(slow(cold=3000.0), n)
+            p['cells'][0] |= {'baseline': 1000.0, 'bad': True}
+            streak.append(perf_trend.seen(p))
+        t = Trend(points=0, history=streak)
+        t.n = 5
         t.add(slow(cold=3000.0))
         body = t.add(slow(cold=3000.0)).actions[0]['body']
         self.assertEqual(t.state['scenarios']['files']['last_good'], None)
         self.assertNotIn('/compare/', body)
         self.assertIn(
-            'No earlier point is known to be within the thresholds, so there is no known-good '
-            f'point and no commit range. The first bad point is `{PURE_SHA.format(6)[:12]}`.',
+            'No earlier point the trend holds was within the thresholds for this scenario, so '
+            'there is no known-good point and no commit range. The first bad point is '
+            f'`{PURE_SHA.format(6)[:12]}`.',
             body,
+        )
+
+    def test_a_dev_point_already_slow_is_no_good_point_judged_or_not(self):
+        dev = [perf_trend.seen(tp(GOOD, n)) for n in range(1, 5)]
+        dev.append(perf_trend.seen(tp(slow(cold=3000.0), 5)))
+        history, state = [], perf_trend.new_state('proof')
+        for n in (101, 102):
+            judged = perf_trend.judge(
+                history, tp(slow(cold=3000.0), n, series='proof'), state, repo=REPO, fallback=dev
+            )
+            state = judged.state
+            history.append(perf_trend.seen(judged.point))
+        self.assertIn(
+            f'https://github.com/{REPO}/compare/{PURE_SHA.format(4)}...{PURE_SHA.format(101)}',
+            judged.actions[0]['body'],
+        )
+
+    def test_the_issue_ranges_from_the_last_point_good_for_the_cells_it_opens_on(self):
+        back = ('files', 'back', 'cpu_ms')
+        t = Trend()
+        for _ in range(4):
+            t.add({**slow(), back: 100.0})
+        # Unjudged, and past the guard against the baseline point 13 judges back by.
+        t.add({**slow(), back: 900.0})
+        t.add({**slow(cold=3000.0), back: 900.0})
+        self.assertEqual(t.state['scenarios']['files']['last_good']['commit'], PURE_SHA.format(11))
+        judged = t.add({**slow(cold=3000.0), back: 100.0})
+        self.assertIn(
+            f'https://github.com/{REPO}/compare/{PURE_SHA.format(12)}...{PURE_SHA.format(13)}',
+            judged.actions[0]['body'],
+        )
+
+    def test_the_last_good_point_holds_every_bad_cell_s_value_on_any_runner(self):
+        cold = tp(slow(cold=3000.0), 9)['cells'][0] | {'baseline': 1000.0, 'bad': True}
+        without = tp({('files', 'live', 'cpu_ms'): 3000.0}, 2, runner='self-hosted')
+        no_value = tp(GOOD, 3)
+        no_value['cells'][0]['value'] = None
+        points = [perf_trend.seen(p) for p in (tp(GOOD, 1), without, no_value)]
+        self.assertEqual(
+            perf_trend.last_good(points, 'files', [cold], [], None)['commit'], PURE_SHA.format(1)
+        )
+
+    def test_points_of_an_accepted_regression_are_good_for_the_next_one(self):
+        t = Trend()
+        for _ in range(5):
+            opened = t.add(slow(cold=3000.0))
+        issue = {
+            'number': 7,
+            'state': 'closed',
+            'closed_at': '2026-11-01T13:00:00Z',
+            'body': opened.actions[0]['body'],
+        }
+        t.state, _ = perf_trend.observe(t.state, [issue], series='dev')
+        t.add(slow(cold=6500.0))
+        body = t.add(slow(cold=6500.0)).actions[0]['body']
+        self.assertIn(
+            f'https://github.com/{REPO}/compare/{PURE_SHA.format(12)}...{PURE_SHA.format(13)}', body
+        )
+
+    def test_the_counts_line_reads_the_last_good_point_not_a_later_measure_of_its_commit(self):
+        dom = ('files', 'cold', 'dom')
+        t = Trend(base={**GOOD, dom: 640})
+        again = tp({**slow(cold=3000.0), dom: 700}, 8)
+        again['commit'] = PURE_SHA.format(7)
+        judged = perf_trend.judge(t.history, again, t.state, repo=REPO)
+        t.state, t.n = judged.state, 8
+        t.history.append(perf_trend.seen(judged.point))
+        t.add({**slow(live=9000.0), dom: 700})
+        body = t.add({**slow(live=9000.0), dom: 700}).actions[0]['body']
+        self.assertIn(f'/compare/{PURE_SHA.format(7)}...{PURE_SHA.format(9)}', body)
+        self.assertIn(
+            'Counts that changed: `files/x10/chromium/desktop/cold/dom` 640 to 700.', body
         )
 
     def test_a_third_bad_point_with_a_new_cell_updates_the_same_issue(self):
@@ -1470,6 +1558,16 @@ class Record(unittest.TestCase):
         )
         self.assertEqual(
             perf_trend.needs([], 'proof'), ['series/proof/state.json', 'series/dev/state.json']
+        )
+
+    def test_needs_names_every_dev_point_up_to_a_branch_series_first_however_old_the_series(self):
+        dev = [f'series/dev/points/202610{d:02d}T000000Z-aaa.json' for d in range(1, 31)]
+        later = ['series/dev/points/20261120T000000Z-aaa.json']
+        proof = [f'series/proof/points/202611{d:02d}T000000Z-bbb.json' for d in range(1, 9)]
+        listing = ['series/dev/state.json', *dev, *later, *proof]
+        self.assertEqual(
+            perf_trend.needs(listing, 'proof'),
+            ['series/proof/state.json', 'series/dev/state.json', *proof, *dev],
         )
 
     def test_the_judge_command_lists_each_unit_measured_far_off_its_plan_seconds(self):
