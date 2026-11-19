@@ -1674,8 +1674,9 @@ class Record(unittest.TestCase):
         argv = ['judge', '--root', str(self.root), '--point', str(files['point'])]
         argv += ['--series', 'dev', '--repo', REPO, '--issues', str(files['issues'])]
         argv += ['--actions', str(self.root / 'a.json'), '--plan', str(files['plan'])]
-        out = io.StringIO()
-        with redirect_stdout(out):
+        summary = self.root / 'summary.md'
+        argv += ['--summary', str(summary)]
+        with redirect_stdout(io.StringIO()):
             self.assertEqual(perf_trend.main(argv), 0)
         self.assertIn(
             '### Units measured more than 20 % off their plan.json seconds (information)\n\n'
@@ -1684,16 +1685,16 @@ class Record(unittest.TestCase):
             '| full | docs/x10/chromium/desktop | 100 | 125 |\n'
             '| full | tabs/x10/chromium/desktop | 100 | 79 |\n'
             '| pr | files/x10/chromium/desktop | 70 | 110 |\n',
-            out.getvalue(),
+            summary.read_text(),
         )
+        summary.unlink()
         p['units'] = [{'scenario': 'files', **UNIT, 'seconds': 110.0}]
         plan['sets']['pr']['cells'][0]['seconds'] = 100
         files['point'].write_text(json.dumps(tp(GOOD, 2) | {'units': p['units']}))
         files['plan'].write_text(json.dumps(plan))
-        out = io.StringIO()
-        with redirect_stdout(out):
+        with redirect_stdout(io.StringIO()):
             self.assertEqual(perf_trend.main(argv), 0)
-        self.assertNotIn('off their plan.json seconds', out.getvalue())
+        self.assertNotIn('off their plan.json seconds', summary.read_text())
 
     def test_a_unit_s_profiled_rep_counts_only_toward_a_cell_that_profiles(self):
         def unit(scenario, seconds, **kw):
