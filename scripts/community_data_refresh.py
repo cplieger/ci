@@ -140,6 +140,11 @@ class Notice(NamedTuple):
     title: str
     body: str
     labels: tuple[str, ...]
+    compare: str = ''
+
+
+def check_renders(gh: ghrest.Client, notices: list[Notice], actions: list[dict]) -> None:
+    raise NotImplementedError
 
 
 def title_fault(title: str) -> str | None:

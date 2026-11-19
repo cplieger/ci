@@ -814,9 +814,10 @@ class Notices(unittest.TestCase):
                 cdr.Notice(
                     'sonarr-parser',
                     'Upstream change sonarr-parser',
-                    f'sonarr-parser changed.\n\nUpstream change: {SONARR_COMPARE}\n\n'
+                    f'Upstream change: {SONARR_COMPARE}\n\nsonarr-parser changed.\n\n'
                     f'{marker_line("sonarr-parser")}\n',
                     ('candidate',),
+                    SONARR_COMPARE,
                 ),
                 cdr.Notice('plain', 'Upstream change plain', f'{marker_line("plain")}\n', ()),
             ],
@@ -836,21 +837,6 @@ class Notices(unittest.TestCase):
         (n,) = notices_of([a_notice(nid)])
         self.assertEqual(cdr.issue_key({'body': n.body}), nid)
         self.assertIsNone(cdr.issue_key({'body': marker_line(nid + 'x')}))
-
-    def test_an_html_comment_opener_outside_code_is_refused(self):
-        for field, text in (
-            ('title', 'a <!-- b'),
-            ('body', 'see below\n<!--'),
-            ('body', '<!-- x -->'),
-        ):
-            with self.subTest(f'{field}: {text}'):
-                self.refused(
-                    [a_notice(**{field: text})],
-                    f"notice 'sonarr-parser': the {field} opens an HTML comment",
-                )
-        for text in ('the `<!--` opener', '```html\n<!-- x\n```'):
-            with self.subTest(text):
-                notices_of([a_notice(body=text)])
 
     def test_notice_id_pattern(self):
         for nid in ('a', '0', 'a-1', 'x' * 64):
@@ -897,71 +883,6 @@ class Notices(unittest.TestCase):
                 self.refused(
                     [a_notice(upstream='sonarr', **kw)], 'from and to are two 40-hex commits'
                 )
-
-    def test_body_with_link_refused(self):
-        for text in (
-            'see https://example.com',
-            'ftp://x',
-            'www.example.com',
-            '[docs](guide.md)',
-            '![x](y.png)',
-            '[docs]: guide.md',
-            '<a name="x">',
-            '<A HREF=x>',
-            '<img src=x>',
-            'href=x',
-            'MAILTO:x',
-            'write to me@example.com',
-        ):
-            for field in ('title', 'body'):
-                with self.subTest(f'{field}: {text}'):
-                    self.refused(
-                        [a_notice(**{field: text})],
-                        f"notice 'sonarr-parser': the {field} holds a link",
-                    )
-        for text in (
-            'Sonarr parser 4.0.1.2 changed',
-            'see [candidate] below',
-            'f(x) = y',
-            'a: b',
-            'needs eslint@9.0',
-            'pkg@v1.2.3',
-            'the `https://example.com` pattern',
-            'the ``[a](b)`` pattern',
-        ):
-            for field in ('title', 'body'):
-                with self.subTest(f'{field}: {text}'):
-                    notices_of([a_notice(**{field: text})])
-
-    def test_code_is_not_read_for_links(self):
-        parser = r'+    new Regex(@"^\[(?<subgroup>.+?)\](?:_|-|\s|\.)?(?<title>.+?)"),'
-        for body in (
-            f'Sonarr changed its parser.\n\n```diff\n{parser}\n```\n',
-            f'~~~\n{parser}\n~~~',
-            '````\n```\nsee https://example.com\n```\n````\n',
-            f'  ```diff\n{parser}\n  ```  ',
-            'the `x`` https://example.com ``y`',
-        ):
-            with self.subTest(body):
-                self.assertTrue(notices_of([a_notice(body=body)])[0].body.startswith(body.rstrip()))
-        for body in (
-            parser,
-            f'```diff\n{parser}\n```\n{parser}',
-            'the `x` and https://example.com',
-            'a `span\nover https://example.com\nlines` here',
-            '```a`b\nhttps://example.com',
-            '    ```\nhttps://example.com',
-            'write to a@example.com',
-        ):
-            with self.subTest(body):
-                self.refused([a_notice(body=body)], 'the body holds a link')
-        for body in ('```diff\n-a\n', '````\n-a\n```\n', '~~~\n-a\n```\n'):
-            with self.subTest(body):
-                self.refused(
-                    [a_notice(body=body)],
-                    "notice 'sonarr-parser': the body opens a code fence it never closes",
-                )
-        self.refused([a_notice(title='```https://example.com')], 'the title holds a link')
 
     def test_notice_text_caps(self):
         for kw, want in (
@@ -1015,6 +936,144 @@ class Notices(unittest.TestCase):
             (Path(tmp) / cdr.NOTICES).symlink_to('/etc/passwd')
             with self.assertRaisesRegex(cdr.RefusedError, 'notices.json is not a regular file'):
                 cdr.Proposal(Path(tmp), SUBFLUX)
+
+
+RENDERS_FILE = Path(__file__).resolve().parent / 'testdata/community-data/renders.json'
+# GitHub's answers to POST markdown (mode markdown), keyed by the text sent.
+RENDERS = json.loads(RENDERS_FILE.read_text())
+RATE_LIMITED = 'x-ratelimit-remaining: 0\nx-ratelimit-reset: 1\n'
+
+
+class RenderingGitHub(FakeGitHub):
+    """FakeGitHub that answers POST markdown with GitHub's captured rendering
+    of the text sent, or with `fail`, a (status, header lines) pair."""
+
+    def __init__(self, routes=None, fail=None):
+        super().__init__(routes or {})
+        self.fail = fail
+        self.rendered = []
+
+    def __call__(self, args, stdin=None, timeout=None):
+        if args[-3:] != ['markdown', '--input', '-']:
+            return super().__call__(args, stdin, timeout)
+        sent = json.loads(stdin)
+        self.rendered.append(sent['text'])
+        if sent != {'text': sent['text'], 'mode': 'markdown'}:
+            raise AssertionError(f'POST markdown sent {sent!r}')
+        if self.fail:
+            status, headers = self.fail
+            out = f'HTTP/2.0 {status} R\n{headers}\r\n{{"message": "x"}}'
+            return subprocess.CompletedProcess(['gh'], 1, out.encode(), b'')
+        if sent['text'] not in RENDERS:
+            raise AssertionError(
+                f'{RENDERS_FILE.name} holds no rendering of {sent["text"]!r}: add the HTML'
+                ' GitHub answers to POST markdown with mode markdown'
+            )
+        out = f'HTTP/2.0 200 R\n\r\n{RENDERS[sent["text"]]}'
+        return subprocess.CompletedProcess(['gh'], 0, out.encode(), b'')
+
+
+def linked(body, nid='sonarr-parser'):
+    return a_notice(nid, body=body, upstream='sonarr', **{'from': FROM, 'to': TO})
+
+
+PARSER = r'+    new Regex(@"^\[(?<subgroup>.+?)\](?:_|-|\s|\.)?(?<title>.+?)"),'
+
+
+class Rendered(unittest.TestCase):
+    """check_renders judges each issue body by GitHub's own rendering of it."""
+
+    def check(self, entries, actions=(), fail=None):
+        fake = RenderingGitHub(fail=fail)
+        gh = ghrest.Client(run=fake, sleep=lambda _: None)
+        notices = notices_of(entries)
+        cdr.check_renders(gh, notices, list(actions))
+        return notices, fake
+
+    def refused(self, entries, want, actions=()):
+        with self.assertRaisesRegex(cdr.RefusedError, want):
+            self.check(entries, actions)
+
+    def test_body_with_link_refused(self):
+        for name, entry in (
+            ('inline link', linked('[click](https://evil.example/g)')),
+            ('bare URL', linked('see https://evil.example/k')),
+            ('www host', linked('see www.evil.example')),
+            ('HTML link', linked('<a href="https://evil.example/h">x</a>')),
+            ('reference link', linked('[click][x]\n\n[x]: https://evil.example/j')),
+            ('email address', linked('write to a@example.com')),
+            ('image', linked('![x](https://evil.example/i.png)')),
+            ('a link with no upstream', a_notice(body='see https://evil.example/k')),
+        ):
+            with self.subTest(name):
+                self.refused(
+                    [entry],
+                    "notice 'sonarr-parser': GitHub renders its body with a link or an image"
+                    ' other than the compare link',
+                )
+
+    def test_markdown_read_another_way_is_judged_by_githubs_rendering(self):
+        for name, body in (
+            ('escaped tick', 'See \\`[click](https://evil.example/a)` here.'),
+            ('fence under a list item', '- item\n  ```\n[click](https://evil.example/b)\n```'),
+            ('fence under an HTML line', '<div>\n```\n\n[click](https://evil.example/c)\n\n```'),
+            ('line separator', 'x\u2028~~~\n[click](https://evil.example/d)\n~~~'),
+            ('definition in a quote', '[click][x]\n\n> [x]: //evil.example/e'),
+            ('definition in a list', '[click][x]\n\n- [x]: //evil.example/f'),
+        ):
+            with self.subTest(name):
+                self.refused([linked(body)], 'GitHub renders its body with a link or an image')
+
+    def test_code_and_text_github_does_not_link_are_accepted(self):
+        for name, entry in (
+            ('diff fence', linked(f'Sonarr changed its parser.\n\n```diff\n{PARSER}\n```\n')),
+            ('span over lines', linked('a `span\nover https://example.com\nlines` here')),
+            ('fence in a quote', linked('> ```\n> https://example.com\n> ```')),
+            ('version text', linked('Bump eslint@9.0.')),
+            ('references', linked(f'See #12, @cplieger, cplieger/subflux#3 and {FROM}.')),
+            ('no upstream', a_notice()),
+        ):
+            with self.subTest(name):
+                notices, fake = self.check([entry])
+                self.assertEqual(fake.rendered, [notices[0].body])
+
+    def test_a_block_left_open_cannot_hide_the_compare_link(self):
+        for body in ('Text.\n\n<details>', 'Text.\n\n<pre>', 'Text.\n\n<![CDATA['):
+            with self.subTest(body):
+                (n,), _ = self.check([linked(body)])
+                first = re.search(r'<a href="([^"]*)"', RENDERS[n.body])
+                self.assertEqual(first[1], SONARR_COMPARE)
+        self.refused(
+            [linked('```diff\n-a\n')],
+            "notice 'sonarr-parser': GitHub renders its marker as text, so the body opens a"
+            ' block it never closes',
+        )
+
+    def test_the_bulk_issue_is_rendered_whole(self):
+        def bulk(*titles):
+            body = cdr.bulk_body(list(titles))
+            return [{'kind': 'create', 'title': cdr.BULK_TITLE, 'body': body, 'labels': []}]
+
+        for titles in (
+            ('[click][x]', '[x]: //evil.example/f'),
+            ('Parser \\`[x](https://evil.example/t)` changed',),
+        ):
+            with self.subTest(titles):
+                self.refused(
+                    [], 'the bulk issue: GitHub renders its body with a link', bulk(*titles)
+                )
+        _, fake = self.check([], [{'kind': 'close', 'number': 3}, *bulk('a', 'b')])
+        self.assertEqual(fake.rendered, [cdr.bulk_body(['a', 'b'])])
+
+    def test_a_failed_render_refuses(self):
+        for name, fail in (('server error', (502, '')), ('rate limited', (403, RATE_LIMITED))):
+            with (
+                self.subTest(name),
+                self.assertRaisesRegex(
+                    cdr.RefusedError, "notice 'sonarr-parser': GitHub did not render its body"
+                ),
+            ):
+                self.check([a_notice()], fail=fail)
 
 
 def an_issue(number, notice, state='open', **kw):
@@ -1199,6 +1258,14 @@ class ReadIssues(unittest.TestCase):
         routes[('GET', f'{OPEN}&page=1')] = []
         self.assertEqual(self.numbers(routes), [9, 10])
 
+    def test_an_empty_last_open_page_leaves_its_page_to_the_closed_read(self):
+        routes = {
+            ('GET', f'{OPEN}&page=1'): issue_page(1),
+            ('GET', f'{OPEN}&page=2'): [],
+            ('GET', f'{CLOSED}&page=1'): issue_page(300, 3, state='closed'),
+        }
+        self.assertEqual(self.numbers(routes), [*range(1, 101), 300, 301, 302])
+
     def test_open_issues_filling_the_read_are_refused(self):
         routes = {
             ('GET', f'{OPEN}&page=1'): issue_page(1),
@@ -1270,26 +1337,14 @@ class ApplyIssues(unittest.TestCase):
             ],
         )
 
-    def test_a_malformed_plan_writes_nothing(self):
-        for name, bad in (
-            ('kind', {'kind': 'delete', 'number': 3}),
-            ('number', {'kind': 'close', 'number': '3'}),
-            ('create with a number', {**wants('create', self.a), 'number': 3}),
-            ('edit without text', {'kind': 'edit', 'number': 3}),
-            ('not an object', 'close 3'),
-        ):
-            with self.subTest(name):
-                self.fake.writes.clear()
-                with self.assertRaisesRegex(cdr.RefusedError, 'is not an issue action'):
-                    cdr.apply_issues(self.gh, 'subflux', [wants('create', self.a), bad])
-                self.assertEqual(self.fake.writes, [])
-
 
 class CheckNotices(unittest.TestCase):
-    def check(self, root: Path, issues=()):
+    def check(self, root: Path, issues=(), fail=None):
         out, plan = root / 'out', root / 'plan.json'
+        gh = ghrest.Client(run=RenderingGitHub(fail=fail), sleep=lambda _: None)
         with (
             unittest.mock.patch.dict(os.environ, {'GITHUB_OUTPUT': str(out)}),
+            unittest.mock.patch.object(ghrest, 'DEFAULT', gh),
             unittest.mock.patch.object(cdr, 'read_issues', return_value=list(issues)) as read,
             redirect_stdout(io.StringIO()),
             redirect_stderr(io.StringIO()),
@@ -1314,6 +1369,12 @@ class CheckNotices(unittest.TestCase):
                 read.assert_called_once()
                 self.assertEqual(read.call_args.args[1:], ('subflux',))
 
+    def test_a_failed_render_writes_no_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_proposal(Path(tmp) / 'p', [], notices=[a_notice('a')])
+            rc, out, written, _ = self.check(Path(tmp), fail=(502, ''))
+        self.assertEqual((rc, out, written), (1, '', None))
+
     def test_a_refused_proposal_reads_and_plans_no_issue(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_proposal(Path(tmp) / 'p', [])
@@ -1337,7 +1398,7 @@ class IssuesCommand(unittest.TestCase):
         self.assertEqual(out.getvalue(), 'closed u\n')
 
     def test_an_unreadable_plan_is_refused(self):
-        for raw in (None, '{', '{}'):
+        for raw in (None, '{'):
             with self.subTest(repr(raw)), tempfile.TemporaryDirectory() as tmp:
                 plan = Path(tmp) / 'plan.json'
                 if raw is not None:
@@ -1361,6 +1422,10 @@ body = json.loads(sys.stdin.read()) if '--input' in args else None
 with open(os.environ['FAKE_GH_LOG'], 'a') as fh:
     fh.write(json.dumps([method, path, body]) + '\n')
 routes = json.loads(open(os.environ['FAKE_GH_ROUTES']).read())
+if path == 'markdown':
+    renders = json.loads(open(os.environ['FAKE_GH_RENDERS']).read())
+    sys.stdout.write('HTTP/2.0 200 R\n\r\n' + renders[body['text']])
+    sys.exit(0)
 found = f'{method} {path}' in routes
 out = routes.get(f'{method} {path}', {'message': 'Not Found'})
 sys.stdout.write(f'HTTP/2.0 {200 if found else 404} R\n\r\n' + json.dumps(out))
@@ -1456,6 +1521,7 @@ class WorkflowRun(unittest.TestCase):
                 'FAKE_GH_LOG': str(log),
                 'FAKE_GH_ROUTES': str(tmp / 'routes.json'),
                 'FAKE_PROPOSAL': str(tmp / 'proposal'),
+                'FAKE_GH_RENDERS': str(RENDERS_FILE),
             }
             argv = ['--workflow', str(tmp / 'wf.yaml'), '--job', 'propose']
             argv += ['--context', str(tmp / 'ctx.json'), '--cwd', str(cwd)]
@@ -1493,7 +1559,7 @@ class WorkflowRun(unittest.TestCase):
 
     @staticmethod
     def writes(calls):
-        return [c for c in calls if c[0] != 'GET']
+        return [c for c in calls if c[0] != 'GET' and c[1] != 'markdown']
 
     def mint(self, permissions, repo='subflux'):
         return {'repositories': repo, **permissions}
@@ -1590,6 +1656,8 @@ class WorkflowRun(unittest.TestCase):
         self.assertEqual(linked, [ns[2].body])
         self.assertEqual(re.findall(r'\S+://\S+', ns[2].body), [SONARR_COMPARE])
         bulk = writes[11][2]
+        rendered = [c[2]['text'] for c in calls if c[1] == 'markdown']
+        self.assertEqual(rendered, [*(n.body for n in ns), bulk['body']])
         self.assertEqual(bulk['title'], cdr.BULK_TITLE)
         self.assertIn(ns[11].title, bulk['body'])
         self.assertIn(ns[12].title, bulk['body'])

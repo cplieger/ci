@@ -11,9 +11,9 @@ that path to --actions-root, the ci source under test. A local action
 (`./<path>`) runs from --cwd, and a `cplieger/ci/actions/<name>@<ref>` one from
 --actions-root, which replays an older revision's workflow. Any other action
 fails unless --skip names its step. Writes the job's and steps' outputs and
-every expression evaluated to --out. A failed step ends the job as on GitHub:
-later steps run only when their `if:` allows it, then the replay exits 1
-naming the first step that failed.
+every expression evaluated to --out. A failed step fails the job as on
+GitHub: later steps run only when their `if:` allows it, then the replay exits
+1 naming the first step that failed.
 Stdlib plus PyYAML.
 """
 
