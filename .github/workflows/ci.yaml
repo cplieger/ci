@@ -1278,7 +1278,7 @@ jobs:
       - name: Install ruff
         run: |
           # renovate: datasource=pypi depName=ruff
-          VERSION=0.17.5
+          VERSION=0.17.6
           pip install -q --break-system-packages "ruff==${VERSION}"
 
       - name: Lint Python (ruff check)
