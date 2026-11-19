@@ -1560,14 +1560,19 @@ class Record(unittest.TestCase):
             perf_trend.needs([], 'proof'), ['series/proof/state.json', 'series/dev/state.json']
         )
 
-    def test_needs_names_every_dev_point_up_to_a_branch_series_first_however_old_the_series(self):
+    def test_needs_names_the_dev_points_next_to_a_branch_series_first_however_old_the_series(self):
         dev = [f'series/dev/points/202610{d:02d}T000000Z-aaa.json' for d in range(1, 31)]
-        later = ['series/dev/points/20261120T000000Z-aaa.json']
+        later = [f'series/dev/points/202611{d:02d}T120000Z-aaa.json' for d in range(1, 30)]
         proof = [f'series/proof/points/202611{d:02d}T000000Z-bbb.json' for d in range(1, 9)]
         listing = ['series/dev/state.json', *dev, *later, *proof]
         self.assertEqual(
             perf_trend.needs(listing, 'proof'),
-            ['series/proof/state.json', 'series/dev/state.json', *proof, *dev],
+            [
+                'series/proof/state.json',
+                'series/dev/state.json',
+                *proof,
+                *dev[-perf_trend.HISTORY :],
+            ],
         )
 
     def test_the_judge_command_lists_each_unit_measured_far_off_its_plan_seconds(self):

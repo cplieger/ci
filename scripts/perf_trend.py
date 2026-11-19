@@ -806,8 +806,9 @@ def load_points(root: pathlib.Path, series: str) -> list[dict]:
 def needs(listing: list[str], series: str) -> list[str]:
     """The paths of the perf-trend branch (listing, `git ls-tree -r --name-only`) the
     record job checks out to judge a point of series: its state, dev's state for another
-    series, its last HISTORY points and, for another series, every dev point at or before
-    its first one, which last_good may range a regression from however old the series."""
+    series, its last HISTORY points and, for another series however old, the last HISTORY
+    dev points at or before its first one: last_good ranges a regression from those, the
+    fork's neighbours, never from dev's newest points."""
 
     def points_of(s: str) -> list[str]:
         prefix = f'series/{s}/points/'
@@ -820,9 +821,8 @@ def needs(listing: list[str], series: str) -> list[str]:
     out += own[-HISTORY:]
     if series != DEV:
         first = pathlib.PurePosixPath(own[0]).name if own else None
-        out += [
-            p for p in points_of(DEV) if first is None or pathlib.PurePosixPath(p).name <= first
-        ]
+        dev = [p for p in points_of(DEV) if first is None or pathlib.PurePosixPath(p).name <= first]
+        out += dev[-HISTORY:]
     return out
 
 
