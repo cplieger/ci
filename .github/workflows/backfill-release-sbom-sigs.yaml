@@ -149,18 +149,18 @@ jobs:
               case "${assets}" in
                 *sbom.spdx.json*) : ;;
                 *)
-                  echo "${tag}: no sbom.spdx.json asset, skip"
+                  gha_say '%s: no sbom.spdx.json asset, skip' "${tag}"
                   skipped=$((skipped + 1))
                   continue
                   ;;
               esac
               if printf '%s\n' "${assets}" | grep -qE '\.(sig|pem|sigstore\.json)$'; then
-                echo "${tag}: already has a signature asset, skip"
+                gha_say '%s: already has a signature asset, skip' "${tag}"
                 skipped=$((skipped + 1))
                 continue
               fi
               if [ "$(jq -r .immutable <<< "${release}")" = "true" ]; then
-                echo "${tag}: immutable release, assets cannot be added"
+                gha_say '%s: immutable release, assets cannot be added' "${tag}"
                 skipped=$((skipped + 1))
                 continue
               fi
@@ -170,7 +170,7 @@ jobs:
               gh api -H 'Accept: application/octet-stream' \
                 "repos/cplieger/${repo}/releases/assets/${id}" > "${d}/sbom.spdx.json"
               if [ "${INPUT_DRY_RUN}" = "true" ]; then
-                echo "${tag}: WOULD sign + upload sbom.spdx.json.sigstore.json"
+                gha_say '%s: WOULD sign + upload sbom.spdx.json.sigstore.json' "${tag}"
                 signed=$((signed + 1))
                 continue
               fi
@@ -178,12 +178,12 @@ jobs:
                 --bundle "${d}/sbom.spdx.json.sigstore.json"
               gh release upload "${tag}" -R "cplieger/${repo}" \
                 "${d}/sbom.spdx.json.sigstore.json"
-              echo "${tag}: signed + uploaded sbom.spdx.json.sigstore.json"
+              gha_say '%s: signed + uploaded sbom.spdx.json.sigstore.json' "${tag}"
               signed=$((signed + 1))
             done 3<<< "${listing}"
             echo "::endgroup::"
           done
-          echo "Done. signed=${signed} skipped=${skipped} dry_run=${INPUT_DRY_RUN}"
+          gha_say 'Done. signed=%s skipped=%s dry_run=%s' "${signed}" "${skipped}" "${INPUT_DRY_RUN}"
 
   # `needs:` must list every other job in this workflow. Dispatch-only, so a
   # failure files only when the run was long enough to be unwatched.

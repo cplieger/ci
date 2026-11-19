@@ -368,7 +368,7 @@ jobs:
                 if [ "$go_nested_dirs" = "[]" ]; then run_go_nested=false; fi
                 if [ "$go_os_matrix" = "[]" ]; then run_go_os=false; fi
                 if [ "$ts_nested_dirs" = "[]" ]; then run_ts_nested=false; fi
-                echo "pull request: validating only the changed modules $keep"
+                gha_say 'pull request: validating only the changed modules %s' "$keep"
               fi
             fi
 

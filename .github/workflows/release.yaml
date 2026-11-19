@@ -136,7 +136,7 @@ jobs:
               ;;
           esac
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "Default branch: ${DEFAULT_BRANCH}, mode: $MODE"
+          gha_say 'Default branch: %s, mode: %s' "${DEFAULT_BRANCH}" "$MODE"
 
       - name: Detect type + subpackages
         id: type
@@ -494,10 +494,12 @@ jobs:
       - name: Resolve repo policy
         id: policy
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           REPO_NAME: ${{ github.event.repository.name }}
           REPO_SPDX_ID: ${{ github.event.repository.license.spdx_id }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           # Per-repo policy overrides. Centralized here, NOT per-repo config.
           # When you need to change a repo's release behavior, edit this step.
           #
@@ -594,7 +596,7 @@ jobs:
             echo "binaries=$BINARIES"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS syft_config='$SYFT_CONFIG' image_licenses='$IMAGE_LICENSES' runner_image_licenses='$RUNNER_IMAGE_LICENSES' binaries='$BINARIES'"
+          gha_say "Policy: registries=%s platforms=%s syft_config='%s' image_licenses='%s' runner_image_licenses='%s' binaries='%s'" "$REGISTRIES" "$PLATFORMS" "$SYFT_CONFIG" "$IMAGE_LICENSES" "$RUNNER_IMAGE_LICENSES" "$BINARIES"
 
   # ─── Claim the root version before any build ───────────────────────────────
   # A push that edits workflow files and lands during the build makes GitHub

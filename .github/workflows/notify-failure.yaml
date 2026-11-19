@@ -218,13 +218,13 @@ jobs:
               python3 "$tracker" --repo "$GH_REPO" --label "$label" --title "$title" \
                 --mode close-when-clean --comment-file "${RUNNER_TEMP}/comment.md"
             else
-              echo "green, ${context}; did not cover everything, so the tracker is left as-is"
+              gha_say 'green, %s; did not cover everything, so the tracker is left as-is' "${context}"
             fi
             exit 0
           fi
 
           if [ "$files_on_red" != true ]; then
-            echo "red, ${context}; assumed watched, so nothing is filed"
+            gha_say 'red, %s; assumed watched, so nothing is filed' "${context}"
             exit 0
           fi
 

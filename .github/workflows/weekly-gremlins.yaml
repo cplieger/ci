@@ -73,7 +73,7 @@ jobs:
               case "$wanted" in *" $r "*) filtered="$filtered $r" ;; esac
             done
             repos="$filtered"
-            echo "manual 'only' filter active -> ${repos:-<none matched>}"
+            gha_say "manual 'only' filter active -> %s" "${repos:-<none matched>}"
           fi
 
           # Keep repos that:
@@ -116,9 +116,9 @@ jobs:
               | awk '{ n += $1 } END { print n + 0 }')
             if [ "$loc" -ge 10000 ]; then
               GO_REPOS+=("$r")
-              echo "  include: ${r} (${loc} bytes of non-test Go)"
+              gha_say 'include: %s (%s bytes of non-test Go)' "${r}" "${loc}"
             else
-              echo "  skip:    ${r} (${loc} bytes — below 200 LOC threshold)"
+              gha_say 'skip:    %s (%s bytes, below the 200 LOC threshold)' "${r}" "${loc}"
             fi
           done
 

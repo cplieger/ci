@@ -1496,6 +1496,7 @@ class Rebuild(unittest.TestCase):
                     out.write_text('')
                     env = {
                         **os.environ,
+                        'CI_TOOLS': str(SCRIPTS),
                         'DOCKERFILE': str(dockerfile),
                         'TAG': 'v1.2.4',
                         'GITHUB_OUTPUT': str(out),

@@ -635,11 +635,12 @@ jobs:
           REPO: ${{ inputs.repository }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
           # Target code wrote meta.json, so an artifact naming another repo is
           # warned and skipped; stryker-aggregate.py reads only this repo's.
           found=$(bash scripts/discover-artifact-repos.sh --allow "$REPO" artifacts)
           if [ -z "$found" ]; then
-            echo "no report names ${REPO} this week, so its tracker issue is left untouched"
+            gha_say 'no report names %s this week, so its tracker issue is left untouched' "${REPO}"
             exit 0
           fi
           R="cplieger/${REPO}"
@@ -653,7 +654,7 @@ jobs:
             --entries-marker-file "$RUNNER_TEMP/entries.txt" \
             --existing-body-file "$RUNNER_TEMP/existing.md" > "$RUNNER_TEMP/body.md"
           if [ "$(cat "$RUNNER_TEMP/entries.txt" 2>/dev/null || echo 0)" -eq 0 ]; then
-            echo "no parseable reports for ${REPO}, so its tracker issue is left untouched"
+            gha_say 'no parseable reports for %s, so its tracker issue is left untouched' "${REPO}"
             exit 0
           fi
           flag=off

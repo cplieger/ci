@@ -69,7 +69,7 @@ jobs:
               case "$wanted" in *" $r "*) filtered="$filtered $r" ;; esac
             done
             repos="$filtered"
-            echo "manual 'only' filter active -> ${repos:-<none matched>}"
+            gha_say "manual 'only' filter active -> %s" "${repos:-<none matched>}"
           fi
 
           # A config up to three dirs down, outside node_modules, as the call's
@@ -90,7 +90,7 @@ jobs:
               gha_annotate warning '%s: its source tree is truncated, so it runs and its call looks for configs' "${r}"
               found+=("$r")
             elif [ "$hit" -gt 0 ]; then
-              echo "  include: ${r}"
+              gha_say 'include: %s' "${r}"
               found+=("$r")
             fi
           done

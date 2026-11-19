@@ -532,11 +532,12 @@ jobs:
           REPO: ${{ inputs.repository }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
           # Target code wrote meta.json, so an artifact naming another repo is
           # warned and skipped; gremlins-aggregate.py reads only this repo's.
           found=$(bash scripts/discover-artifact-repos.sh --allow "$REPO" artifacts)
           if [ -z "$found" ]; then
-            echo "no attempt names ${REPO} this week, so its badge is left untouched"
+            gha_say 'no attempt names %s this week, so its badge is left untouched' "${REPO}"
             exit 0
           fi
           badge="$RUNNER_TEMP/mutation.json"
@@ -547,7 +548,7 @@ jobs:
           # Written only when an attempt parsed, so a repo whose every attempt
           # errored keeps its badge rather than showing 0%.
           if [ ! -s "$badge" ]; then
-            echo "no parseable attempts for ${REPO}, so its badge is left untouched"
+            gha_say 'no parseable attempts for %s, so its badge is left untouched' "${REPO}"
             exit 0
           fi
           bash actions/publish-badge/publish-badge.sh "cplieger/${REPO}" "$TOKEN" mutation.json "$(cat "$badge")"
@@ -604,10 +605,11 @@ jobs:
           REPO: ${{ inputs.repository }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
           # The badge job's check, for the same reason.
           found=$(bash scripts/discover-artifact-repos.sh --allow "$REPO" artifacts)
           if [ -z "$found" ]; then
-            echo "no attempt names ${REPO} this week, so its tracker issue is left untouched"
+            gha_say 'no attempt names %s this week, so its tracker issue is left untouched' "${REPO}"
             exit 0
           fi
           R="cplieger/${REPO}"
@@ -621,7 +623,7 @@ jobs:
             --attempts-marker-file "$RUNNER_TEMP/attempts.txt" \
             --existing-body-file "$RUNNER_TEMP/existing.md" > "$RUNNER_TEMP/body.md"
           if [ "$(cat "$RUNNER_TEMP/attempts.txt" 2>/dev/null || echo 0)" -eq 0 ]; then
-            echo "no parseable attempts for ${REPO}, so its tracker issue is left untouched"
+            gha_say 'no parseable attempts for %s, so its tracker issue is left untouched' "${REPO}"
             exit 0
           fi
           flag=off

@@ -289,7 +289,7 @@ jobs:
               case "$wanted" in *" $k "* | *" ${k%%/*} "*) filtered="$filtered $k" ;; esac
             done
             keys="$filtered"
-            echo "manual 'only' filter active -> ${keys:-<none matched>}"
+            gha_say "manual 'only' filter active -> %s" "${keys:-<none matched>}"
           fi
 
           # Keys of one repo sit together, ENROLLED order kept within it, so each
@@ -328,12 +328,12 @@ jobs:
               fi
             fi
             if [ -z "$sha" ]; then
-              echo "  skip ${k}: ${r} could not be read this week"
+              gha_say 'skip %s: %s could not be read this week' "${k}" "${r}"
               continue
             fi
             line=$(awk -F'\t' -v d="$dir" '$1 == d' <<<"$units")
             if [ -z "$line" ]; then
-              echo "  skip ${k}: no Go module at ${dir}"
+              gha_say 'skip %s: no Go module at %s' "${k}" "${dir}"
               continue
             fi
             IFS=$'\t' read -r _ slug n <<<"$line"
@@ -342,10 +342,10 @@ jobs:
             # correct behaviour for a module that SHOULD have benchmarks and a
             # false alarm for one that never did.
             if [ "$n" -eq 0 ]; then
-              echo "  skip ${k}: no benchmark functions"
+              gha_say 'skip %s: no benchmark functions' "${k}"
               continue
             fi
-            echo "  include ${k} @ ${sha:0:12} (${n} benchmark(s))"
+            gha_say 'include %s @ %s (%s benchmark(s))' "${k}" "${sha:0:12}" "${n}"
             matrix=$(printf '%s' "$matrix" | jq -c \
               --arg r "$r" --arg s "$sha" --arg d "$dir" --arg slug "$slug" --arg k "$k" \
               '. + [{repo: $r, sha: $s, dir: $d, slug: $slug, key: $k}]')
@@ -481,7 +481,7 @@ jobs:
               SKIP='BenchmarkFileAction_Copy' ;;
           esac
 
-          echo "entry=$KEY count=$COUNT benchtime=$BENCHTIME skip=${SKIP:-<none>}"
+          gha_say 'entry=%s count=%s benchtime=%s skip=%s' "$KEY" "$COUNT" "$BENCHTIME" "${SKIP:-<none>}"
 
           # A skip alternative that stops matching silently returns its series to the
           # chart, so each alternative is grepped in the sources (`A|B/x` still matches

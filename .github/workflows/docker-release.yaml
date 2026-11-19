@@ -317,7 +317,7 @@ jobs:
             echo "$META_TAGS"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "channel=${CHANNEL} tag=${TAG} publish=${PUBLISH}"
+          gha_say 'channel=%s tag=%s publish=%s' "${CHANNEL}" "${TAG}" "${PUBLISH}"
 
       # An image app's root module keeps the plain repository path at every
       # major: nothing imports an app, so a /vN suffix only moves its internal
@@ -357,9 +357,11 @@ jobs:
       - name: Compute build matrix
         id: matrix
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           PLATFORMS: ${{ inputs.platforms }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           # Map each platform to a native GitHub-hosted runner.
           # linux/arm* → ubuntu-24.04-arm; everything else → ubuntu-24.04.
           # Emit a JSON array consumed by the build job's strategy.matrix.
@@ -376,7 +378,7 @@ jobs:
               '. + [{platform: $p, runner: $r, name: $n}]' <<<"$matrix")
           done
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          echo "Matrix: $matrix"
+          gha_say 'Matrix: %s' "$matrix"
 
       # BuildKit restores a cached RUN layer verbatim, so a package layer keeps
       # shipping the packages current when it was FIRST built; PKG_REFRESH is
@@ -389,10 +391,12 @@ jobs:
       - name: Resolve build args
         id: buildargs
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           DOCKERFILE: ${{ inputs.dockerfile }}
           TAG: ${{ steps.tags.outputs.tag }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           declares() { grep -qE "^[[:space:]]*ARG[[:space:]]+$1([[:space:]=]|\$)" "$DOCKERFILE"; }
           args=()
           if declares PKG_REFRESH; then
@@ -402,7 +406,7 @@ jobs:
             args+=("BUILD_VERSION=${TAG}")
           fi
           if [ "${#args[@]}" -eq 0 ]; then
-            echo "No opted-in ARG in ${DOCKERFILE}; passing no build-args."
+            gha_say 'No opted-in ARG in %s; passing no build-args.' "${DOCKERFILE}"
           else
             printf 'Passing %s\n' "${args[@]}"
           fi
@@ -493,6 +497,7 @@ jobs:
           NAMES: ${{ steps.runner.outputs.runner_names }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           found=$(python3 "$CI_TOOLS/runner_images.py" promoted --package "$RUNNER_IMAGE_NAME" \
             --source "$SOURCE" --names "$NAMES")
           if [ "$found" = '{}' ]; then
@@ -500,7 +505,7 @@ jobs:
             exit 0
           fi
           echo "runner_promoted=${found}" >> "$GITHUB_OUTPUT"
-          echo "Promoting the runner images the dev channel built for ${SOURCE}: ${found}"
+          gha_say 'Promoting the runner images the dev channel built for %s: %s' "${SOURCE}" "${found}"
 
       - name: Scope a rebuild-only release
         id: rebuild
@@ -1646,11 +1651,12 @@ jobs:
           MINOR: ${{ needs.prepare.outputs.minor }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           . "$CI_TOOLS/retry.sh"
           retry oras copy --recursive \
             "${REGISTRY}/${IMAGE_NAME}:${VERSION}" "docker.io/${IMAGE_NAME}:${VERSION}"
           retry oras tag "docker.io/${IMAGE_NAME}:${VERSION}" "$MINOR" "$MAJOR" latest
-          echo "docker.io/${IMAGE_NAME}: ${VERSION}, ${MINOR}, ${MAJOR}, latest"
+          gha_say 'docker.io/%s: %s, %s, %s, latest' "${IMAGE_NAME}" "${VERSION}" "${MINOR}" "${MAJOR}"
 
       - name: Publish dashboard OCI artifact
         id: dashboard-oci
@@ -1758,7 +1764,7 @@ jobs:
             gha_annotate warning 'The notes carry no system-package diff, because %s.' "${ref}"
             exit 0
           fi
-          echo "previous SBOM: ${PREV} (${ref})"
+          gha_say 'previous SBOM: %s (%s)' "${PREV}" "${ref}"
 
       - name: Generate release notes
         # Stable only (a dev build has no Release). Deliberately token-free:

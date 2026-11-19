@@ -49,7 +49,7 @@ jobs:
         run: |
           set -euo pipefail
           . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
-          echo "Reason: ${REASON}"
+          gha_say 'Reason: %s' "${REASON}"
 
           # Fail fast with an actionable message when the PAT secret is missing
           # or empty. Without this, gh exits 4 with a generic "set the GH_TOKEN

@@ -325,7 +325,7 @@ jobs:
           fi
           while IFS= read -r dir; do
             if [ -z "$dir" ]; then continue; fi
-            echo "npm ci in $dir"
+            gha_say 'npm ci in %s' "$dir"
             (cd "$dir" && npm ci --ignore-scripts --no-audit --no-fund)
           done < <(printf '%s\n' "$NPM_DIRS")
 

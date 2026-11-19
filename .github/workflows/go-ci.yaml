@@ -232,7 +232,7 @@ jobs:
               m=$d
               while [ "$m" != . ] && [ ! -f "$m/go.mod" ]; do m=$(dirname "$m"); done
               pkg=.${d#"$m"}
-              echo "wiregen: go -C $m run $pkg"
+              gha_say 'wiregen: go -C %s run %s' "$m" "$pkg"
               GOTOOLCHAIN=auto go -C "$m" run "$pkg" || { gha_annotate error 'wiregen: the generator %s failed in the module at %s' "$d" "$m"; exit 1; }
             done 3<<<"$gens"
             # Compare regenerated output against the committed tree

@@ -152,7 +152,7 @@ jobs:
           run=true repair=false
           if [ "$skip" = true ]; then
             run=false
-            echo "the ${series} series already holds a point of ${sha} on ${RUNNER} and waits on none"
+            gha_say 'the %s series already holds a point of %s on %s and waits on none' "${series}" "${sha}" "${RUNNER}"
             # A skipped run still sends the issue writes an earlier run lost.
             repair=$(python3 "$CI_TOOLS/perf_trend.py" repair --state "$state" \
               --issues "$RUNNER_TEMP/issues.json" --out "$RUNNER_TEMP/actions.json")

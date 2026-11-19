@@ -38,13 +38,23 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       - name: Detect languages
         id: langs
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           GH_TOKEN: ${{ github.token }}
           EXPLICIT: ${{ inputs.languages }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           if [ -n "${EXPLICIT}" ]; then langs=$(printf '%s' "${EXPLICIT}" | jq -cR 'split(",")|map(gsub("^ +| +$";""))|unique'); else
             langs=$(gh api "repos/${GITHUB_REPOSITORY}/languages" --jq '[ keys[] | {Go:"go",JavaScript:"javascript-typescript",TypeScript:"javascript-typescript",Python:"python",Ruby:"ruby"}[.] // empty ] + ["actions"] | unique')
             # A language whose every tracked file sits under the ignore glob
@@ -54,7 +64,8 @@ jobs:
               | jq -cRn '[inputs | (capture("\\.(?<x>[^./]+)$") | .x)? | {go:"go",js:"javascript-typescript",mjs:"javascript-typescript",cjs:"javascript-typescript",jsx:"javascript-typescript",ts:"javascript-typescript",tsx:"javascript-typescript",mts:"javascript-typescript",cts:"javascript-typescript",py:"python",rb:"ruby"}[.] // empty] + ["actions"] | unique')
             langs=$(jq -cn --argjson a "${langs}" --argjson p "${present}" '$a - ($a - $p)')
           fi
-          echo "languages=${langs}" >> "$GITHUB_OUTPUT"; echo "detected: ${langs}"
+          echo "languages=${langs}" >> "$GITHUB_OUTPUT"
+          gha_say 'detected: %s' "${langs}"
 
   analyze:
     needs: detect
