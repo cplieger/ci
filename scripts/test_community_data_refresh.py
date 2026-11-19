@@ -1076,7 +1076,7 @@ class Rendered(unittest.TestCase):
         for body in ('Text.\n\n<details>', 'Text.\n\n<pre>', 'Text.\n\n<![CDATA['):
             with self.subTest(body):
                 (n,), _ = self.check([linked(body)])
-                first = re.search(r'<a href="([^"]*)"', RENDERS[n.body])
+                first = re.search(r'<a [^>]*href="([^"]*)"', RENDERS[n.body])
                 self.assertEqual(first[1], SONARR_COMPARE)
         self.refused(
             [linked('```diff\n-a\n')],

@@ -1,26 +1,8 @@
 #!/usr/bin/env python3
 """The community data refresh: the pull request a listed repository's own
-refresh run proposes, opened against its base branch, and the issues its
-notices keep in step.
-
-Each repository in REPOS runs its refresh in its own community-data-refresh.yaml
-on the base branch, with no secret, and uploads the proposal as the
-community-data-refresh artifact. community-data-refresh.yaml here runs no code
-of the repository; it reads that artifact as data, one subcommand per step:
-
-    plan     the matrix of REPOS rows a run covers, from the dispatch input.
-    locate   the repository's newest completed refresh run on its base branch,
-             refusing one that failed: its run id and the commit it ran on.
-    check    validates a downloaded proposal, plans the writes that bring the
-             repository's community-data issues in step with its notices, and
-             outputs whether it changes files and whether it moves an issue.
-    issues   applies check's issue plan.
-    propose  commits a proposal onto the commit its run ran on through the
-             REST API and opens or updates the pull request from BRANCH,
-             refusing when the base branch was rewritten or changed a
-             proposed path since that commit.
-
-The proposal format and the issue rules are in docs/workflows.md. Stdlib only.
+refresh run proposes, and the issues its notices keep in step. Each subcommand
+is one step of community-data-refresh.yaml; the proposal format and the issue
+rules are in docs/workflows.md. Stdlib only.
 """
 
 from __future__ import annotations
@@ -365,17 +347,23 @@ def issue_plan(notices: list[Notice], issues: list[dict], managed) -> list[dict]
 
 
 class Rendering(HTMLParser):
-    """The URL attribute values and the text of one HTML rendering."""
+    """The URL attribute values, the text and whether the page builds part of
+    one HTML rendering in the browser."""
 
     def __init__(self, html: str):
         super().__init__()
         self.urls: list[str] = []
         self.text: list[str] = []
+        self.built = False
         self.feed(html)
         self.close()
 
-    def handle_starttag(self, _tag, attrs):
+    def handle_starttag(self, tag, attrs):
         self.urls += [value or '' for name, value in attrs if name in URL_ATTRS]
+        # GitHub's math (MathJax, whose \href is a link) and its diagram and map
+        # fences are built client-side, so their links never reach this HTML.
+        classes = next((v or '' for n, v in attrs if n == 'class'), '').split()
+        self.built |= tag == 'math-renderer' or 'render-needs-enrichment' in classes
 
     def handle_data(self, data):
         self.text.append(data)
@@ -383,9 +371,9 @@ class Rendering(HTMLParser):
 
 def check_renders(gh: ghrest.Client, repo: str, notices: list[Notice], actions: list[dict]) -> None:
     """Refuses unless GitHub renders each of `notices`' issue bodies, and the
-    bulk issue's body when `actions` write it, with no URL but the notice's
-    compare link and with its marker hidden. A failed render refuses too: the
-    check is never skipped."""
+    bulk issue's body when `actions` write it, as `repo`'s issue page does, with
+    no URL but the notice's compare link, nothing the browser builds and its
+    marker hidden. A failed render refuses too: the check is never skipped."""
     bodies = [(f'notice {n.id!r}', n.body, n.compare) for n in notices]
     bodies += [
         ('the bulk issue', a['body'], None)
@@ -393,16 +381,23 @@ def check_renders(gh: ghrest.Client, repo: str, notices: list[Notice], actions: 
         if a['kind'] != 'close' and issue_key(a) == BULK
     ]
     for where, body, compare in bodies:
-        # Mode markdown leaves #26, owner/repo#26, a SHA and @name as text.
+        # gfm in the repository's context is the issue page's rendering, where a
+        # reference or @name becomes a link.
+        sent = {'text': body, 'mode': 'gfm', 'context': f'{OWNER}/{repo}'}
         try:
-            resp = gh.request('POST', 'markdown', {'text': body, 'mode': 'markdown'})
+            resp = gh.request('POST', 'markdown', sent)
         except ghrest.ApiError as err:
             raise RefusedError(f'{where}: GitHub did not render its body: {err}') from None
         seen = Rendering(resp.body.decode(errors='replace'))
         # An empty href is refused too: '' is no notice's compare link.
         if any(not compare or url != compare for url in seen.urls):
-            other = '' if compare is None else ' other than the compare link'
+            other = ' other than the compare link' if compare else ''
             raise RefusedError(f'{where}: GitHub renders its body with a link or an image{other}')
+        if seen.built:
+            raise RefusedError(
+                f'{where}: GitHub renders its body with math or a diagram, which the page'
+                ' builds in the browser'
+            )
         if last_line(body) in ''.join(seen.text):
             raise RefusedError(
                 f'{where}: GitHub renders its marker as text, so the body opens a block it'
