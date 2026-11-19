@@ -1210,7 +1210,7 @@ def report_merge_checked(
         )
     except (GhError, *SHAPE_ERRORS) as exc:
         result = f'failed: {exc}'
-    print(f'cplieger/{repo}#{number}: {result}')
+    workflow_commands.say(t'cplieger/{repo}#{number}: {result}')
     return result in ('armed', 'merged')
 
 

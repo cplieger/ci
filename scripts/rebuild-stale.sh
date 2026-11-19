@@ -250,7 +250,7 @@ open_pr() { # <repo> <base> <reason> [since]
     }
     return "$rc"
   fi
-  echo "Opened ${url}"
+  gha_say 'Opened %s' "${url}"
   request_merge "$url"
 }
 

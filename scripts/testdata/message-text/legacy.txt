@@ -14,7 +14,6 @@ PRs (want absent; Renovate owns deps)
 a stale/decommissioned app; remove it
 anchor failed — treating all tracked
 approving reviews={s["required_review_count"]} — a single-maintainer repo
-at {path} — treating as 0
 before SHA — treating all tracked
 changed since review; skipping (re-run to
 content_type={h["content_type"]} (want json; the orchestrator parses
@@ -57,7 +56,6 @@ required_linear_history=on (want off; the merge model
 rulesets unreadable (API); rulesets not graded
 run (phantom — blocks every PR
 runs unreadable (API); version tags not
-setting for {repo}; attempting the issue
 start with {PREFIX!r}; the action's output
 suffix (want '{want}'; apps use the
 suites in 'entries'; nothing was published

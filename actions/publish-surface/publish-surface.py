@@ -417,7 +417,7 @@ def jsr_shipped(pkg_dir: Path) -> set[Path]:
     config = read_json(jsr_path)
     swaps = dev_import_swaps(config, jsr_stable_versions)
     for key, (old, new) in swaps.items():
-        print(f'jsr dry run:  {key} {old} -> {new} (dev builds are not on JSR)')
+        wc.say(t'jsr dry run:  {key} {old} -> {new} (dev builds are not on JSR)')
     if swaps:
         jsr_path.write_text(json.dumps(config, indent=2) + '\n')
     try:
@@ -555,7 +555,7 @@ def main() -> int:
 
     pkg_dir = Path(args.package_dir).resolve()
     if not pkg_dir.is_dir():
-        print(f'error: --package-dir {pkg_dir} is not a directory', file=sys.stderr)
+        wc.say(t'error: --package-dir {pkg_dir} is not a directory', file=sys.stderr)
         return 2
 
     try:
@@ -563,17 +563,17 @@ def main() -> int:
 
         ships, reason = publishable(pkg)
         if not ships:
-            print(f'skipped: {reason}')
+            wc.say(t'skipped: {reason}')
             return 0
 
         entries, assets = entry_points(pkg, pkg_dir)
         closure_all, external = compute_closure(pkg_dir, entries)
         closure = ts_under_src(closure_all)
 
-        print(f'package:      {pkg.get("name")}')
+        wc.say(t'package:      {pkg.get("name")}')
         print(f'entry points: {len(entries)} exported .ts')
         if assets:
-            print(f'assets:       {", ".join(sorted(assets))} (not closure-checked)')
+            wc.say(t'assets:       {", ".join(sorted(assets))} (not closure-checked)')
         print(f'closure:      {len(closure)} .ts under src/ reachable from exports')
 
         findings: list[str] = []
@@ -598,10 +598,8 @@ def main() -> int:
 
         declared = declared_dependencies(pkg)
         undeclared = sorted(external - declared)
-        print(
-            f'external:     {len(external)} package(s) reached'
-            + (f' ({", ".join(sorted(external))})' if external else '')
-        )
+        reached = t' ({", ".join(sorted(external))})' if external else t''
+        wc.say(t'external:     {len(external)} package(s) reached{reached}')
         for name in undeclared:
             findings.append(
                 f'deps: undeclared: the published type graph requires `{name}`, '
@@ -615,7 +613,7 @@ def main() -> int:
         message = f'publish-surface check could not complete: {exc}'
         if args.github:
             print(wc.command('error', message.splitlines()[0]))
-        print(f'error: {message}', file=sys.stderr)
+        wc.say(t'error: {message}', file=sys.stderr)
         return 1
 
     if not findings:
@@ -628,7 +626,7 @@ def main() -> int:
     for finding in findings:
         if args.github:
             print(wc.command('error', finding))
-        print(f'  {finding}', file=sys.stderr)
+        wc.say(t'  {finding}', file=sys.stderr)
     return 1
 
 

@@ -19,7 +19,7 @@ set -euo pipefail
 tree=${1%/}
 regex=${2:-}
 [ -d "$tree" ] || {
-  echo "go-units: $tree is not a directory" >&2
+  gha_say 'go-units: %s is not a directory' "$tree" >&2
   exit 2
 }
 

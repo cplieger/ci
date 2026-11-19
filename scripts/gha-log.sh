@@ -44,17 +44,15 @@ gha_annotate() {
   printf "::%s%s::${format}\n" "$kind" "${props:+ $props}" "${args[@]}"
 }
 
-# gha_say FORMAT ARG...: one plain line behind "- ", so no ARG starts a command.
-# The runner also reads `##[command]` anywhere in a plain line
-# (actions/runner ActionCommand.TryParse), so '#' is escaped too.
+# gha_say FORMAT ARG...: one plain line behind "- ", so no ARG starts a command,
+# each ARG escaped as gha_escape does. The runner also reads `##[command]` anywhere
+# in a plain line (actions/runner ActionCommand.TryParse), so every `##[` is broken.
 gha_say() {
-  local format=$1 a e
+  local format=$1 a line
   shift
   local args=()
-  for a in "$@"; do
-    e=$(gha_escape "$a")
-    args+=("${e//#/%23}")
-  done
+  for a in "$@"; do args+=("$(gha_escape "$a")"); done
   # shellcheck disable=SC2059 # FORMAT is the caller's literal
-  printf -- "- ${format}\n" "${args[@]}"
+  line=$(printf -- "- ${format}" "${args[@]}")
+  printf '%s\n' "${line//'##['/'#%23['}"
 }

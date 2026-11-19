@@ -1252,7 +1252,7 @@ fresh_tools() {
 fresh_tools
 printf 'echo "::error::path-significance: boom" >&2\nexit 2\n' >"$G_TOOLS/path-significance.sh"
 chk "D-RG9 paths that cannot be classified publish as usual, naming why" \
-  "$(SCOPE_TOOLS="$G_TOOLS" CHANNEL=dev scope_at "$G_DEV")|$(said)|$(grep -cx 'path-significance: boom' "$WORK/scope.err")" \
+  "$(SCOPE_TOOLS="$G_TOOLS" CHANNEL=dev scope_at "$G_DEV")|$(said)|$(grep -cx -- '- path-significance: boom' "$WORK/scope.err")" \
   "0|false||::warning::The paths changed since v1.3.0-dev.2 could not be classified, so this release publishes as usual.~|1"
 fresh_tools
 printf 'exit 1\n' >"$G_TOOLS/render-notes.sh"

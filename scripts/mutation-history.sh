@@ -36,7 +36,7 @@ id=$(jq -rs --arg ref "${ref}" '
     and .workflow_run.head_repository_id == .workflow_run.repository_id))
   | sort_by(.created_at) | last | .id // empty' "${work}/list.jsonl")
 if [ -z "${id}" ]; then
-  echo "${name}: no earlier run on ${ref} left one, so this run has no history"
+  gha_say '%s: no earlier run on %s left one, so this run has no history' "${name}" "${ref}"
   exit 0
 fi
 download() {
@@ -52,4 +52,4 @@ if ! unzip -p "${work}/a.zip" "${file}" >"${work}/file" || [ ! -s "${work}/file"
 fi
 mkdir -p "${out}"
 mv "${work}/file" "${out}/${file}"
-echo "${name}: history from artifact ${id}"
+gha_say '%s: history from artifact %s' "${name}" "${id}"

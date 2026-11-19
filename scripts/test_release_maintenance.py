@@ -2364,7 +2364,7 @@ class MergeChecked(unittest.TestCase):
         ):
             argv = ['merge-checked', R, '5', '--base', 'main', '--head', 'repo-sync/ci/main']
             self.assertEqual(rm.main(argv), 0)
-        self.assertEqual(out.getvalue(), f'cplieger/{R}#5: armed\n')
+        self.assertEqual(out.getvalue(), f'- cplieger/{R}#5: armed\n')
         self.assertEqual(gh.called(), [f'GET {P}/pulls/5', auto])
         gh = FakeGh({f'GET {P}/pulls/5': pr(5, 'repo-sync/ci/main', 'dev'), auto: b''})
         result = rm.merge_checked(rm.Api(gh), R, 5, run=gh, base='main', head='repo-sync/ci/main')

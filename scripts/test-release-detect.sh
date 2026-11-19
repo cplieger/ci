@@ -2009,7 +2009,7 @@ barrier() { # [state] -> runs the barrier at R1; prints EXIT=n on failure
 dispatched() { grep -cF 'actions/workflows/release.yaml/dispatches -f ref=dev -f inputs[mode]=renumber --jq' "$GH_LOG" || true; }
 export GH_BUSY_CALLS=2
 out_b=$(barrier)
-chk "B1 the barrier waits for the dev run created before R" "$out_b|$(grep -c '^waiting for dev release runs' "$WORK/barrier.log")" "|2"
+chk "B1 the barrier waits for the dev run created before R" "$out_b|$(grep -c '^- waiting for dev release runs' "$WORK/barrier.log")" "|2"
 chk "B1 a dev run created after R is not waited for, once two polls agree" "$(cat "$GH_DIR/runs-calls")" "4"
 chk_has "B1 a dev run created between R's commit and main's update is waited for" "$(cat "$WORK/barrier.log")" \
   "waiting for dev release runs created before 2026-10-01T12:00:05Z (2)"
@@ -2132,11 +2132,11 @@ printf '{"workflow_runs":[{"id":4,"status":"queued","created_at":"2026-10-01T12:
 printf '{"workflow_runs":[{"id":4,"status":"completed","created_at":"2026-10-01T12:00:05Z"}]}\n' >"$GH_DIR/runs-idle.json"
 GH_BUSY_CALLS=1
 out_b=$(barrier)
-chk "B9 a dev run created in the cutoff's own second is waited for" "$out_b|$(grep -c '^waiting for dev release runs' "$WORK/barrier.log")" "|1"
+chk "B9 a dev run created in the cutoff's own second is waited for" "$out_b|$(grep -c '^- waiting for dev release runs' "$WORK/barrier.log")" "|1"
 jq -n '{workflow_runs: [range(100) | {id: (100 + .), status: "completed", created_at: "2026-10-01T10:00:00Z"}]}' >"$GH_DIR/runs-busy.json"
 printf '{"workflow_runs":[{"id":5,"status":"in_progress","created_at":"2026-10-01T11:30:00Z"}]}\n' >"$GH_DIR/runs-busy.json.p2"
 out_b=$(barrier)
-chk "B10 an unfinished dev run on the second page is waited for" "$out_b|$(grep -c '^waiting for dev release runs' "$WORK/barrier.log")" "|1"
+chk "B10 an unfinished dev run on the second page is waited for" "$out_b|$(grep -c '^- waiting for dev release runs' "$WORK/barrier.log")" "|1"
 rm "$GH_DIR/runs-busy.json.p2"
 printf '{"workflow_runs":[{"id":6,"status":"waiting","created_at":"2026-10-01T11:00:00Z"},{"id":7,"status":"requested","created_at":"2026-10-01T11:00:00Z"},{"id":8,"status":"pending","created_at":"2026-10-01T11:00:00Z"}]}\n' >"$GH_DIR/runs-busy.json"
 out_b=$(barrier)
@@ -2163,10 +2163,10 @@ seq_barrier() { # <"<from query> <status>" ...> -> runs the barrier with run 9 i
 }
 out_b=$(seq_barrier "1 pending" "2 queued" "11 completed")
 chk "B13 a run that leaves pending for queued mid-poll is still waited for" \
-  "$out_b|$(grep -c '^waiting for dev release runs created before 2026-10-01T12:00:05Z (1)$' "$WORK/barrier.log")" "|2"
+  "$out_b|$(grep -c '^- waiting for dev release runs created before 2026-10-01T12:00:05Z (1)$' "$WORK/barrier.log")" "|2"
 out_b=$(seq_barrier "1 in_progress" "5 waiting" "11 completed")
 chk "B13 a run that moves back into waiting after its status was read is met on the next poll" \
-  "$out_b|$(grep -c '^waiting for dev release runs created before 2026-10-01T12:00:05Z (1)$' "$WORK/barrier.log")" "|1"
+  "$out_b|$(grep -c '^- waiting for dev release runs created before 2026-10-01T12:00:05Z (1)$' "$WORK/barrier.log")" "|1"
 chk "B13 and the hold ends only after two polls read zero" "$(cat "$GH_DIR/runs-calls")" "4"
 mv "$GH_DIR/runs-busy.saved" "$GH_DIR/runs-busy.json"
 mv "$GH_DIR/runs-idle.saved" "$GH_DIR/runs-idle.json"
@@ -2192,7 +2192,7 @@ out_b=$(REPO_TYPE=ts barrier)
 chk "B11 a git-only dev tag above the version does not release a TS hold" "$out_b|$(dispatched)" "EXIT=1|1"
 chk_has "B11 the renumber must leave a published build" "$(cat "$WORK/barrier.log")" "lane .: renumber run 99 left no dev build above v1.1.0"
 chk "B11 after npm's 1200 s scan bound before and after the renumber" \
-  "$(grep -c '^npm @o/app@1.2.0-dev.1: absent after 24 attempt(s) and 1200s of waiting$' "$WORK/barrier.log")" "2"
+  "$(grep -c '^- npm @o/app@1.2.0-dev.1: absent after 24 attempt(s) and 1200s of waiting$' "$WORK/barrier.log")" "2"
 echo "https://registry.npmjs.org/@o/app/1.2.0-dev.1" >>"$CURL_DIR/ok"
 rm -f "$GH_DIR/on-dispatch"
 out_b=$(REPO_TYPE=ts barrier)
@@ -2504,7 +2504,7 @@ make_hook cancelled v1.2.0-dev.1
 out_b=$(POLLS=9 barrier)
 chk "B24 a renumber run cancelled by a newer dev run that ranks dev above releases the hold" "$out_b|$(dispatched)" "|1"
 chk "B24 after waiting for every dev run" \
-  "$(grep -c '^waiting for every dev release run, as renumber run 99 was cancelled' "$WORK/barrier.log" || true)|$(cat "$GH_DIR/runs-calls")" "0|6"
+  "$(grep -c '^- waiting for every dev release run, as renumber run 99 was cancelled' "$WORK/barrier.log" || true)|$(cat "$GH_DIR/runs-calls")" "0|6"
 git -C "$O" tag -d v1.2.0-dev.1 >/dev/null
 git -C "$W" tag -d v1.2.0-dev.1 >/dev/null
 make_hook cancelled ""
@@ -3051,10 +3051,10 @@ rm -f "$GH_DIR/on-dispatch"
 chk "B37 a TS root and its subpackage that npm does not serve hold the publish through one renumber" \
   "$out_b|$(dispatched)" "EXIT=1|1"
 chk "B37 the wait before the renumber gets npm's whole bound" \
-  "$(grep -c '^npm @o/x@1.2.0-dev.1: absent after 24 attempt(s) and 1200s of waiting$' "$WORK/barrier.log")" "1"
+  "$(grep -c '^- npm @o/x@1.2.0-dev.1: absent after 24 attempt(s) and 1200s of waiting$' "$WORK/barrier.log")" "1"
 chk "B37 the wait after it starts a bound of its own, serving the root on its 14th try, 615 s on" \
-  "$(sed -n '/^dispatched the renumber run 99$/,/^lane \.: dev now ranks above v1\.1\.0$/p' "$WORK/barrier.log" \
-    | grep -c '^npm @o/x@1.2.0-dev.1: not served yet')|$(grep -c '^lane \.: dev now ranks above v1\.1\.0$' "$WORK/barrier.log")" "13|1"
+  "$(sed -n '/^dispatched the renumber run 99$/,/^- lane \.: dev now ranks above v1\.1\.0$/p' "$WORK/barrier.log" \
+    | grep -c '^- npm @o/x@1.2.0-dev.1: not served yet')|$(grep -c '^- lane \.: dev now ranks above v1\.1\.0$' "$WORK/barrier.log")" "13|1"
 chk_has "B37 which the subpackage's wait shares" "$(cat "$WORK/barrier.log")" \
   "every subpackage's dev build on npm: absent after 14 attempt(s) and 585s of waiting"
 deadline=$(sed -n 's/^BARRIER_SECONDS=\${BARRIER_SECONDS:-\([0-9]*\)}$/\1/p' "$RS")

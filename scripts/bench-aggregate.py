@@ -38,6 +38,7 @@ import statistics
 import sys
 
 import trackerlib
+import workflow_commands
 
 PREFIX = 'window.BENCHMARK_DATA = '
 
@@ -311,7 +312,7 @@ def main() -> int:
             data, args.repo, args.week, args.run_url, existing, args.module
         )
     except (DataError, OSError) as err:
-        print(f'[{args.repo}] bench-aggregate: {err}', file=sys.stderr)
+        workflow_commands.say(t'[{args.repo}] bench-aggregate: {err}', file=sys.stderr)
         if args.entries_marker_file:
             args.entries_marker_file.write_text('0')
         if args.regression_marker_file:
@@ -323,7 +324,7 @@ def main() -> int:
     if args.regression_marker_file:
         args.regression_marker_file.write_text('true' if regression else 'false')
     if entries == 0:
-        print(f'[{args.repo}] newest point carries no benchmarks', file=sys.stderr)
+        workflow_commands.say(t'[{args.repo}] newest point carries no benchmarks', file=sys.stderr)
         return 0
 
     print(body)

@@ -259,7 +259,11 @@ class MainDefault(unittest.TestCase):
         fx = two_branch_fixture()
         fx['slow'] = ['edgeapp@dev']
         _rc, _out, err, _calls = run_classify(SCRIPTS / 'classify-repos.py', fx)
-        names = [line.split()[1] for line in err.splitlines() if 'classified:' in line]
+        names = [
+            line.split('classified:')[1].split()[0]
+            for line in err.splitlines()
+            if 'classified:' in line
+        ]
         self.assertEqual(names, sorted(names))
         self.assertEqual(names.count('edgeapp'), 2)
 

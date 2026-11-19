@@ -8,10 +8,12 @@
 # `sha256:<64 hex>` for the root lane and `<lane dir> sha256:<64 hex>` for a
 # nested one.
 RECONCILIATION_SUBJECT='release: promote dev into main'
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
 
 known_commit() {
   git rev-parse --verify --quiet "$1^{commit}" >/dev/null && return 0
-  echo "reconciliation: unknown commit '$1'" >&2
+  gha_say "reconciliation: unknown commit '%s'" "$1" >&2
   return 1
 }
 

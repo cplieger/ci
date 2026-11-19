@@ -256,7 +256,7 @@ echo '{}' >"$WORK/empty.json"
 echo 'not json' >"$WORK/text.json"
 for bad in "$WORK/empty.json" "$WORK/text.json"; do
   [ "$(changes "$bad" "$WORK/new.spdx.json")" = EXIT=2 ] || fail "N17 ${bad} must exit 2"
-  grep -qxF "render-notes: ${bad} is not an SPDX document" "$WORK/changes.err" \
+  grep -qxF -- "- render-notes: ${bad} is not an SPDX document" "$WORK/changes.err" \
     || fail "N17 the refusal must name ${bad}: $(cat "$WORK/changes.err")"
 done
 ok "N17 --sbom-changes refuses a file that is not an SPDX document, naming it"

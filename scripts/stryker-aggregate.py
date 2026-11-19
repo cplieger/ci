@@ -43,8 +43,8 @@ import json
 import sys
 from pathlib import Path
 
-import mutation_cost
 import trackerlib
+import workflow_commands
 
 MAX_MUTANTS_INLINE = 50
 REGRESSION_THRESHOLD_PCT = 5.0  # score drops > 5% below rolling mean → flag
@@ -102,7 +102,7 @@ def aggregate(entry_dirs: list[tuple[str, Path]]):
     for pkg_dir, report in entry_dirs:
         loaded = load_report(report)
         if loaded is None:
-            mutation_cost.say(t'skip unparseable report for dir {pkg_dir}')
+            workflow_commands.say(t'skip unparseable report for dir {pkg_dir}', file=sys.stderr)
             continue
         mutants, counts = loaded
         for k, v in counts.items():
@@ -324,13 +324,13 @@ def main() -> int:
         if meta.get('repo') != args.repo:
             continue
         entry_dirs.append((meta.get('dir') or '.', meta_path.parent / 'mutation.json'))
-    print(f'[{args.repo}] found {len(entry_dirs)} report(s)', file=sys.stderr)
+    workflow_commands.say(t'[{args.repo}] found {len(entry_dirs)} report(s)', file=sys.stderr)
 
     agg = aggregate(entry_dirs)
-    print(
-        f'[{args.repo}] score={agg["score"]} cov={agg["mutant_coverage"]} '
-        f'surviving={agg["surviving"]} (survived={agg["survived"]}, '
-        f'no_coverage={agg["no_coverage"]}) entries={agg["entries"]}',
+    workflow_commands.say(
+        t'[{args.repo}] score={agg["score"]} cov={agg["mutant_coverage"]} '
+        t'surviving={agg["surviving"]} (survived={agg["survived"]}, '
+        t'no_coverage={agg["no_coverage"]}) entries={agg["entries"]}',
         file=sys.stderr,
     )
 
@@ -354,4 +354,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(mutation_cost.run_main(main))
+    sys.exit(workflow_commands.run_main(main))

@@ -25,6 +25,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import mutation_cost  # noqa: E402
+import workflow_commands  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location('gremlins_aggregate', HERE / 'gremlins-aggregate.py')
 gremlins_aggregate = importlib.util.module_from_spec(_spec)
@@ -5357,7 +5358,7 @@ def test_shard_prices_a_probe_under_its_tick_as_unknown(tmp: Path) -> None:
                 e['files'][unit]['work_secs'],
             )
         )
-        texts = [mutation_cost.render(w) for w in warnings]
+        texts = [workflow_commands.render(w) for w in warnings]
         if want == 'measured':
             check(
                 f'tick: {label}: measured history wins over the unknown probe',
@@ -5405,7 +5406,7 @@ def test_shard_prices_an_integration_module_with_no_mutants_at_nothing(tmp: Path
     with contextlib.redirect_stderr(io.StringIO()):
         plan, warnings = shard.assign(doc, history)
     e = plan['modules']['.']
-    texts = [mutation_cost.render(w) for w in warnings]
+    texts = [workflow_commands.render(w) for w in warnings]
     check(
         'integration: no mutants with a cost history is priced at 0, with no mutant to estimate',
         ok=e['cost'] == 'measured' and e['work_secs'] == 0.0 and not texts,
@@ -5611,7 +5612,7 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
         )
 
     def note(plan: dict) -> str:
-        return mutation_cost.render(mutation_cost.cap_note('r', plan) or t'')
+        return workflow_commands.render(mutation_cost.cap_note('r', plan) or t'')
 
     sized = {'capped': 'a cap of 16 shards', 'shards': 2, 'projected_minutes': [250.0, None]}
     sized['top_minutes'] = 137.3

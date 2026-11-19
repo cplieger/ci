@@ -8,9 +8,11 @@
 #   changes the System packages block would list, and stops. The notes cover
 #   previous..--release-commit and its diffs; git-cliff runs the repo's config, so no token.
 set -euo pipefail
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
 
 die() {
-  echo "render-notes: $*" >&2
+  gha_say 'render-notes: %s' "$*" >&2
   exit 2
 }
 

@@ -719,7 +719,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def report(a: argparse.Namespace, text: str) -> None:
-    print(text)
+    workflow_commands.say_lines(text)
     if a.summary:
         with pathlib.Path(a.summary).open('a') as f:
             f.write(text)
@@ -745,8 +745,8 @@ def run_plan(a: argparse.Namespace) -> int:
         }
         with pathlib.Path(a.outputs).open('a') as f:
             f.writelines(github_output(name, value) for name, value in written.items())
-    print(
-        f'{a.out}: {len(matrix["include"])} jobs over {", ".join(matrix["scenarios"]) or "nothing"}'
+    workflow_commands.say(
+        t'{a.out}: {len(matrix["include"])} jobs over {", ".join(matrix["scenarios"]) or "nothing"}'
     )
     return 0
 

@@ -210,7 +210,7 @@ choose_workers() {
     # The plan sized this shard at the count its own probe left; a probe
     # here that failed would run the shard at 1 worker, ~4x its projection.
     workers="${GREMLINS_WORKERS}"
-    echo "workers=${workers} (set by the shard plan, so no concurrency probe)"
+    gha_say 'workers=%s (set by the shard plan, so no concurrency probe)' "${workers}"
     return 0
   fi
   [ "${WORKERS_MAX}" -gt 1 ] || return 0
@@ -271,7 +271,7 @@ choose_workers() {
       export GOMEMLIMIT="${GOMEM_SOLO_MB}MiB"
       gha_annotate warning 'suite passes in one tree copy but fails when two copies run at once (exit %s/%s)' "${ra}" "${rb}"
       echo "::warning::forcing --workers 1: cross-worker interference reports false KILLs, not lost mutants"
-      grep -hE "FAIL|panic:" /tmp/probe-a.log /tmp/probe-b.log | head -20 || true
+      grep -hE "FAIL|panic:" /tmp/probe-a.log /tmp/probe-b.log | head -20 | while IFS= read -r l; do gha_say '%s' "$l"; done || true
     else
       echo "concurrency probe passed; keeping ${WORKERS_MAX} workers"
     fi

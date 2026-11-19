@@ -220,7 +220,7 @@ def ensure_pr(repo, base, into, changed):
         {'title': PR_TITLE, 'head': branch_for(base), 'base': into, 'body': '\n'.join(body_lines)},
     )
     add_label(repo, pr['number'])
-    print(f'  opened PR: {pr["html_url"]}')
+    workflow_commands.say(t'  opened PR: {pr["html_url"]}')
 
 
 def close_stale_pr(repo, base, row):
@@ -275,7 +275,7 @@ def sync_repo(repo, base, dest_map, source_root, dry_run):
                     close_stale_pr(repo, base, row)
             return 'clean'
 
-        print(f'  {len(changed)} file(s) differ: {", ".join(changed)}')
+        workflow_commands.say(t'  {len(changed)} file(s) differ: {", ".join(changed)}')
         if dry_run:
             return 'dry'
 
@@ -367,7 +367,9 @@ def delete_merged_head(repo, number):
         REST.send('DELETE', f'repos/{repo}/git/refs/heads/{BRANCH}')
     except ghrest.ApiError as err:
         if err.status != 422:
-            print(f'  WARN: merged {repo}#{number} but could not delete {BRANCH}: {err}')
+            workflow_commands.say(
+                t'  WARN: merged {repo}#{number} but could not delete {BRANCH}: {err}'
+            )
 
 
 def merged(repo, number):
@@ -388,24 +390,30 @@ def arm_default(repo, number):
     try:
         auto = RUN(args)
     except (ghrest.ApiError, OSError) as err:
-        print(f'  WARN: failed to merge {repo}#{number}: auto-merge did not run ({err})')
+        workflow_commands.say(
+            t'  WARN: failed to merge {repo}#{number}: auto-merge did not run ({err})'
+        )
         return
     if auto.returncode == 0:
-        print(f'{repo}#{number}: armed')
+        workflow_commands.say(t'{repo}#{number}: armed')
         return
     refused = ' '.join(auto.stderr.decode(errors='replace').split()) or f'exit {auto.returncode}'
     if ghrest.refused_by_rate_limit(auto):
         if merged(repo, number):
-            print(f'{repo}#{number}: merged')
+            workflow_commands.say(t'{repo}#{number}: merged')
             return
-        print(f'  WARN: failed to merge {repo}#{number}: auto-merge rate limited ({refused})')
+        workflow_commands.say(
+            t'  WARN: failed to merge {repo}#{number}: auto-merge rate limited ({refused})'
+        )
         return
     try:
         REST.send('PUT', f'repos/{repo}/pulls/{number}/merge', {'merge_method': 'squash'})
     except ghrest.ApiError as err:
-        print(f'  WARN: failed to merge {repo}#{number}: auto-merge refused ({refused}) and {err}')
+        workflow_commands.say(
+            t'  WARN: failed to merge {repo}#{number}: auto-merge refused ({refused}) and {err}'
+        )
         return
-    print(f'{repo}#{number}: merged')
+    workflow_commands.say(t'{repo}#{number}: merged')
     delete_merged_head(repo, number)
 
 
@@ -413,7 +421,7 @@ def arm(pr, merge_checked):
     """Arm or merge one open sync PR; False only when a `base: main` target's PR was
     left open (a main-default or `dev` refusal is a warning)."""
     repo, base, number = pr
-    print(f'Enabling auto-merge on {repo}#{number}')
+    workflow_commands.say(t'Enabling auto-merge on {repo}#{number}')
     if base is None:
         arm_default(repo, number)
         return True
@@ -424,7 +432,7 @@ def arm(pr, merge_checked):
     if merge_checked(name, number, base=base, head=head):
         return True
     if base == 'dev':
-        print(f'  WARN: failed to merge {repo}#{number}')
+        workflow_commands.say(t'  WARN: failed to merge {repo}#{number}')
         return True
     return False
 
@@ -530,10 +538,12 @@ def main():
 
     total = len(mapping)
     noun = 'repo(s)' if all(base is None for _repo, base in mapping) else 'target(s)'
-    print(
-        f'\n{total} {noun}: {counts["changed"]} synced · '
-        f'{counts["clean"]} already in sync · {counts["dry"]} with pending diffs (dry-run) · '
-        f'{len(failures)} failed{" (" + ", ".join(failures) + ")" if failures else ""}'
+    failed = t' ({", ".join(failures)})' if failures else t''
+    print()
+    workflow_commands.say(
+        t'{total} {noun}: {counts["changed"]} synced · '
+        t'{counts["clean"]} already in sync · {counts["dry"]} with pending diffs (dry-run) · '
+        t'{len(failures)} failed{failed}'
     )
     if failures:
         sys.exit(1)

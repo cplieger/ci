@@ -538,7 +538,7 @@ class TrackerIssueTest(unittest.TestCase):
             *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body)),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn('attempting the issue ops anyway', proc.stderr)
+        self.assertIn('so the issue ops run anyway', proc.stderr)
         self.assertEqual(self.writes(), ['PATCH issue'])
 
     def test_missing_label_is_created_and_an_existing_one_is_silent(self) -> None:

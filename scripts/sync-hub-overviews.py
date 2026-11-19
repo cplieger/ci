@@ -26,6 +26,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import workflow_commands
+
 HUB_API = 'https://hub.docker.com/v2'
 DOCKER_INDEX = 'https://index.docker.io/v1/'
 RENDERER = (
@@ -113,7 +115,9 @@ def hub_patch(jwt: str, image: str, fields: dict[str, str]) -> bool:
         _hub_call(f'/repositories/{image}/', jwt=jwt, data=fields, method='PATCH')
         return True
     except urllib.error.HTTPError as e:
-        print(f'    write failed: HTTP {e.code} {e.read()[:200]!r}', file=sys.stderr)
+        workflow_commands.say(
+            t'    write failed: HTTP {e.code} {e.read()[:200]!r}', file=sys.stderr
+        )
         return False
 
 
@@ -127,7 +131,9 @@ def github_about(owner: str, repo: str) -> str | None:
     )
     if proc.returncode != 0:
         lines = proc.stderr.strip().splitlines()
-        print(f'    About line unreadable: {lines[-1] if lines else "gh failed"}', file=sys.stderr)
+        workflow_commands.say(
+            t'    About line unreadable: {lines[-1] if lines else "gh failed"}', file=sys.stderr
+        )
         return None
     return proc.stdout.strip()
 
@@ -187,7 +193,9 @@ def render(repo: Path, owner: str, ref: str) -> str | None:
         text=True,
     )
     if proc.returncode != 0:
-        print(f'    render failed: {proc.stderr.strip().splitlines()[-1]}', file=sys.stderr)
+        workflow_commands.say(
+            t'    render failed: {proc.stderr.strip().splitlines()[-1]}', file=sys.stderr
+        )
         return None
     return proc.stdout
 
@@ -210,12 +218,13 @@ def main() -> int:
 
     user, secret = hub_credentials()
     jwt = hub_login(user, secret)
-    print(f'authenticated to Docker Hub as {user}\n')
+    workflow_commands.say(t'authenticated to Docker Hub as {user}')
+    print()
 
     changed = same = skipped = failed = unreadable = 0
     for repo in repos:
         image = f'{args.owner}/{repo.name}'
-        print(f'{repo.name}')
+        workflow_commands.say(t'{repo.name}')
         page = render(repo, args.owner, args.ref)
         if page is None:
             skipped += 1
@@ -228,7 +237,7 @@ def main() -> int:
         unreadable += about is None
         fields, notes = pending_fields(page, about, current)
         for note in notes:
-            print(f'    {note}')
+            workflow_commands.say(t'    {note}')
         if not fields:
             print(f'    already current ({len(page.encode())} bytes)')
             same += 1
@@ -237,7 +246,7 @@ def main() -> int:
             on_hub = len((current.get('full_description') or '').encode())
             print(f'    {on_hub} bytes on Hub -> {len(page.encode())} bytes rendered')
         if 'description' in fields:
-            print(f'    short description -> {fields["description"]!r}')
+            workflow_commands.say(t'    short description -> {fields["description"]!r}')
         if not args.apply:
             changed += 1
             continue
@@ -258,4 +267,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(workflow_commands.run_main(main))

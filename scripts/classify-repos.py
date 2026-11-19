@@ -25,6 +25,7 @@ from typing import NamedTuple
 import fanout
 import ghrest
 import release_channels
+import workflow_commands
 
 OWNER = 'cplieger'
 TIMEOUT = 10  # seconds per API call
@@ -478,7 +479,7 @@ def log_profile(repo, profile, base=None):
         )
     else:
         line += bool_str(profile['is_web'])
-    print(line, file=sys.stderr)
+    workflow_commands.say(t'{line}', file=sys.stderr)
 
 
 def assign(repo_names, profiles, releasing):
@@ -618,4 +619,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(workflow_commands.run_main(main))

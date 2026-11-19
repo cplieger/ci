@@ -140,4 +140,4 @@ if [ ! -x "$DEST/promql-check" ] || [ "$(cat "$DEST/promql-check.stamp" 2>/dev/n
   echo "$stamp" >"$DEST/promql-check.stamp"
 fi
 
-echo "dashboard-check: cue ${CUE_VERSION}, ${#SCHEMAS[@]} Grafana schema(s) and promql-check (built with ${GO_VERSION}) in ${DEST}"
+gha_say 'dashboard-check: cue %s, %s Grafana schema(s) and promql-check (built with %s) in %s' "${CUE_VERSION}" "${#SCHEMAS[@]}" "${GO_VERSION}" "${DEST}"

@@ -162,7 +162,7 @@ def main(argv: list[str]) -> int:
     try:
         findings, packages = audit(root, repo)
     except (RuntimeError, OSError, UnicodeDecodeError) as exc:
-        print(f'notice audit: {exc}', file=sys.stderr)
+        wc.say(t'notice audit: {exc}', file=sys.stderr)
         return 2
     if not findings:
         summary = f'root NOTICE matches the template; {packages} published package root(s) checked'
@@ -172,7 +172,7 @@ def main(argv: list[str]) -> int:
         return 0
     print(f'NOTICE audit: FAIL — {len(findings)} finding(s):')
     for finding in findings:
-        print(f'  {finding}')
+        wc.say(t'  {finding}')
         if args.github:
             print(wc.command('error', finding, title='NOTICE audit'))
     return 1

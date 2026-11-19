@@ -7,6 +7,8 @@
 #   filename    badge file to write, e.g. size.json | mutation.json | mutation-ts.json
 #   json        full one-line shields endpoint JSON for that badge
 set -euo pipefail
+# shellcheck source=SCRIPTDIR/../../scripts/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/../../scripts/gha-log.sh"
 
 REPO="${1:?owner/repo required}"
 TOKEN="${2:?token required}"
@@ -63,12 +65,12 @@ max_attempts=5
 PUBLISHED=""
 until publish_once; do
   if [ "$attempt" -ge "$max_attempts" ]; then
-    echo "push to ${REPO}@badges failed after ${attempt} attempts" >&2
+    gha_say 'push to %s@badges failed after %s attempts' "${REPO}" "${attempt}" >&2
     exit 1
   fi
-  echo "push to ${REPO}@badges failed or the branch moved (attempt ${attempt}/${max_attempts}), so it is read again" >&2
+  gha_say 'push to %s@badges failed or the branch moved (attempt %s/%s), so it is read again' "${REPO}" "${attempt}" "${max_attempts}" >&2
   sleep $((attempt * 3))
   attempt=$((attempt + 1))
 done
 
-echo "published ${FILE} to ${REPO}@badges (${PUBLISHED})"
+gha_say 'published %s to %s@badges (%s)' "${FILE}" "${REPO}" "${PUBLISHED}"

@@ -2548,7 +2548,7 @@ class Codeowners(unittest.TestCase):
                 audit.main()
         finally:
             audit.gh, audit.collect, audit.sys.argv = saved
-        self.assertIn(f'httpx  (priv)\n  [warn] {CODEOWNERS_LINE}\n', out.getvalue())
+        self.assertIn(f'- httpx  (priv)\n-   [warn] {CODEOWNERS_LINE}\n', out.getvalue())
         self.assertEqual(
             json.loads(out_path.read_text())['repos'][0]['warnings'], [CODEOWNERS_LINE]
         )
@@ -2969,7 +2969,7 @@ class FirstPartyMajors(unittest.TestCase):
         finally:
             audit.collect, audit.sys.argv = saved
         line = 'go.mod: requires github.com/cplieger/httpx/v4, latest is v5'
-        self.assertIn(f'consumer  (priv)\n  [warn] {line}\n', out.getvalue())
+        self.assertIn(f'- consumer  (priv)\n-   [warn] {line}\n', out.getvalue())
         self.assertEqual(json.loads(out_path.read_text())['repos'][0]['warnings'], [line])
 
 

@@ -16,7 +16,7 @@ set -euo pipefail
   exit 2
 }
 if [ "${RUNNER_ENVIRONMENT:-github-hosted}" != github-hosted ]; then
-  echo "self-hosted runner: skipping playwright install-deps $*"
+  gha_say 'self-hosted runner: skipping playwright install-deps %s' "$*"
   exit 0
 fi
 
@@ -47,7 +47,7 @@ overridden=0
 while read -r name value; do
   want=${value#\"} want=${want%\";}
   got=$(apt-config dump --no-empty --format '%v' "$name")
-  echo "apt uses ${name} \"${got}\""
+  gha_say 'apt uses %s "%s"' "${name}" "${got}"
   if [ "$got" != "$want" ]; then
     gha_annotate error 'apt uses %s "%s", not "%s" from %s: a file that sorts after it in its directory, or apt.conf, sets it' "${name}" "${got}" "${want}" "${CONF}"
     overridden=1

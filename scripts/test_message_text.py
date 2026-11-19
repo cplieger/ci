@@ -21,6 +21,7 @@ EMITTER = re.compile(
     r"|\.error\(\s*f?[\"']"
     r"|print\(\s*f?[\"'](?:error|warning):"
     r"|print\(\s*f?[\"'](?=.*\bfile=sys\.stderr\b)"
+    r"|\bsay\(\s*t?[\"'](?=.*\bfile=sys\.stderr\b)"
     r"|\bstderr\.write\(\s*f?[\"']"
     r"|\bhelp=\s*f?[\"']"
     r"|\b(?:hard|warn)\.append\(\s*f?[\"']"
@@ -29,7 +30,7 @@ EMITTER = re.compile(
 JOINER = re.compile(r'(?<!\s);(?= \S)|[\u2013\u2014]')
 # ruff format puts a long call's literals on the lines after its `(`, often split in two.
 OPEN_PAREN = re.compile(r'\(\s*\n\s*')
-SPLIT_LITERAL = re.compile(r'(["\'])[ \t]*\n\s*[rRbBuUfF]{0,2}(["\'])')
+SPLIT_LITERAL = re.compile(r'(["\'])[ \t]*\n\s*[rRbBuUfFtT]{0,2}(["\'])')
 
 
 def production(name: str) -> bool:

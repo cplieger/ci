@@ -1241,19 +1241,19 @@ def main(argv: list[str] | None = None) -> int:
             if args.github:
                 print(wc.command('notice', note, file=path))
             else:
-                print(f'{path}: notice: {note}')
+                wc.say(t'{path}: notice: {note}')
         for finding in found:
             if args.github:
                 title = f'dashboard-check {finding.rule}'
                 print(wc.command('error', finding, file=path, title=title))
             else:
-                print(f'{path}: {finding}')
+                wc.say(t'{path}: {finding}')
         if found:
             failed = True
-            print(f'{path}: {len(found)} finding(s)', file=sys.stderr)
+            wc.say(t'{path}: {len(found)} finding(s)', file=sys.stderr)
         elif not notices:
             tags = ', '.join(tag for tag, _ in args.schema)
-            print(f'{path}: ok (schema v2, vetted against {tags}; {queries.summary()})')
+            wc.say(t'{path}: ok (schema v2, vetted against {tags}; {queries.summary()})')
     return 1 if failed else 0
 
 

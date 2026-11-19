@@ -138,7 +138,7 @@ def write_summary(text: str) -> None:
     if path:
         with open(path, 'a') as fh:
             fh.write(text)
-    print(text, end='')
+    workflow_commands.say_lines(text)
 
 
 def write_outputs(values: dict[str, str]) -> None:
@@ -147,7 +147,7 @@ def write_outputs(values: dict[str, str]) -> None:
     if path:
         with open(path, 'a') as fh:
             fh.write(lines)
-    print(lines, end='')
+    workflow_commands.say_lines(lines)
 
 
 def token_free_env(**extra: str) -> dict[str, str]:
@@ -331,8 +331,8 @@ def check_digest(
                 'signing). Rebuild on dev and promote the new head'
             )
         ]
-    print(
-        f'image: re-tags {digest} built at {out.get("promote_source", "")[:12]} ({out.get("promote_via")})'
+    workflow_commands.say(
+        t'image: re-tags {digest} built at {out.get("promote_source", "")[:12]} ({out.get("promote_via")})'
     )
     return digest, []
 
@@ -396,7 +396,7 @@ def check_dominance(
     except inventory.InventoryError as exc:
         return [f'dominance: uncomparable: {exc}']
     if result['verdict'] == 'pass':
-        print(inventory.render_dominance(result))
+        workflow_commands.say_lines(inventory.render_dominance(result))
         return []
     lines = inventory.render_dominance(result).splitlines()
     return [
@@ -632,7 +632,7 @@ def check_vulnerabilities(
         )
         return [refusal]
     if package != repo:
-        print(f"image: main's {tag} is {REGISTRY}/{OWNER}/{package}@{main_digest}")
+        workflow_commands.say(t"image: main's {tag} is {REGISTRY}/{OWNER}/{package}@{main_digest}")
     ours, theirs = platforms(repo, digest, token), platforms(package, main_digest, main_token)
     if (SINGLE_MANIFEST in ours) != (SINGLE_MANIFEST in theirs):
         shape = {True: 'one manifest', False: 'a multi-platform index'}
@@ -656,7 +656,9 @@ def check_vulnerabilities(
         )
         for vid, pkg in sorted(new - old):
             if vid in accepted:
-                print(f'image {plat}: {vid} in {pkg} accepted (accept_vulnerabilities)')
+                workflow_commands.say(
+                    t'image {plat}: {vid} in {pkg} accepted (accept_vulnerabilities)'
+                )
                 continue
             found.append(
                 f"image {plat}: {vid} in {pkg} is fixable and absent from main's {tag}. "
@@ -1038,7 +1040,9 @@ def cmd_preview(args) -> int:
     # Printed after every tool that ran the repository's cliff config, so the
     # last line of this shape in the log is this one.
     versions = {key: lane['version'] for key, lane in plan.items()}
-    print('release-plan: ' + json.dumps(versions, sort_keys=True, separators=(',', ':')))
+    workflow_commands.say(
+        t'release-plan: {json.dumps(versions, sort_keys=True, separators=(",", ":"))}'
+    )
     return 0
 
 

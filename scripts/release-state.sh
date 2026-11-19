@@ -249,7 +249,7 @@ cmd_pending() {
       '. + {($k): {lane: $lane, h_tag: $h_tag, h_commit: $h_commit, commit: $commit, version: "",
         in_range: $in_range, kind_note: $kind, repair_kind_note: $repair, repair_commit: $repair_r}}' <<<"$state")
     lanes=$(jq -c --arg k "$key" --arg lane "$(lane_dir "$key")" '. + [{key: $k, lane: $lane}]' <<<"$lanes")
-    echo "lane ${key}: highest stable ${h_tag:-<none>}, pending promotion ${r:-<none>}, in range ${in_range}"
+    gha_say 'lane %s: highest stable %s, pending promotion %s, in range %s' "${key}" "${h_tag:-<none>}" "${r:-<none>}" "${in_range}"
   done <<<"$keys"
   out "state=${state}" "lanes=${lanes}" \
     "any=$(jq -r 'any(.[]; .commit != "")' <<<"$state")" \
@@ -391,7 +391,7 @@ cmd_number() {
     v=$(tail -n1 <<<"$res")
     [[ $v =~ $(stable_re "$key") ]] || die "pending-version of ${r} answered '${v}', not a stable version of lane ${key}"
     state=$(jq -c --arg k "$key" --arg v "$v" '.[$k].version = $v' <<<"$state")
-    echo "lane ${key}: the promotion ${r} publishes ${v}"
+    gha_say 'lane %s: the promotion %s publishes %s' "${key}" "${r}" "${v}"
   done <<<"$rows"
   out "state=${state}" "root_version=$(jq -r '.["."].version // ""' <<<"$state")"
 }
@@ -448,9 +448,9 @@ cmd_halves() {
     a=$(lane_anchor "$l") || die "cannot read lane ${l}'s tags or the history of HEAD"
     if half_changed "$l" "$a" HEAD "$with"; then
       pub=$(jq -c --arg v "$l" '. + [$v]' <<<"$pub")
-      echo "lane ${l}: ${l}/web changed since ${a:-its first commit}, so it publishes at the lane's version"
+      gha_say "lane %s: %s/web changed since %s, so it publishes at the lane's version" "${l}" "${l}" "${a:-its first commit}"
     else
-      echo "lane ${l}: ${l}/web is unchanged since ${a:-its first commit}"
+      gha_say 'lane %s: %s/web is unchanged since %s' "${l}" "${l}" "${a:-its first commit}"
     fi
   done <<<"$lanes"
   out "halves_to_publish=${pub}"
@@ -503,7 +503,7 @@ cmd_receipts() {
     # only a run at its commit can redo.
     if [ "$key" = . ] && [[ " ${UNPROVEN:-} " == *" ${tag} "* ]]; then
       if [ "$commit" = "$(git rev-parse HEAD)" ]; then
-        echo "lane .: ${tag} is claimed here with no Release, so this run publishes it"
+        gha_say 'lane .: %s is claimed here with no Release, so this run publishes it' "${tag}"
         continue
       fi
       die "${tag} is claimed at ${commit} with no Release, so its release run did not finish publishing it, and no repair can. Re-run all jobs of the release run of ${commit}, which publishes ${tag}, then rerun this run."
@@ -513,7 +513,7 @@ cmd_receipts() {
       die "could not read the statuses of ${commit}, the commit of ${tag}, so its completion is not guessed"
     fi
     if grep -qxF "${COMPLETION_PREFIX}${tag}" <<<"$contexts"; then
-      echo "lane ${key}: ${tag} carries its completion receipt"
+      gha_say 'lane %s: %s carries its completion receipt' "${key}" "${tag}"
       continue
     fi
     subs='[]'
@@ -600,14 +600,14 @@ cmd_receipt() { # <tag> <commit>
   gh api -X POST "repos/${repo}/statuses/${commit}" -f state=success -f context="${COMPLETION_PREFIX}${tag}" \
     -f description="Release and registry readback verified" \
     -f target_url="${GITHUB_SERVER_URL:-https://github.com}/${repo}/actions/runs/${GITHUB_RUN_ID:-0}" >/dev/null
-  echo "recorded ${COMPLETION_PREFIX}${tag} on ${commit}"
+  gha_say 'recorded %s%s on %s' "${COMPLETION_PREFIX}" "${tag}" "${commit}"
 }
 
 answers() { # <label> <command...>: retry.sh's await_registry, then the verdict
   local label=$1
   shift
   if await_registry "$label" "$@"; then
-    echo "ok: ${label}"
+    gha_say 'ok: %s' "${label}"
     return 0
   fi
   gha_annotate error '%s does not answer' "${label}"
@@ -771,7 +771,7 @@ cmd_provenance() { # <image@digest> <source commit, promote-digest.sh's promote_
   local ref="${1:?usage: provenance IMAGE@DIGEST SOURCE}" src="${2:?usage: provenance IMAGE@DIGEST SOURCE}" gap
   gap=$(provenance_gap "$ref" "$src") || exit 1
   [ -z "$gap" ] || die "${gap}, so it is not promoted"
-  echo "ok: ${ref} was signed and attested by the build it promotes"
+  gha_say 'ok: %s was signed and attested by the build it promotes' "${ref}"
 }
 # Exit 3: incomplete, so the caller builds from source instead.
 cmd_complete() { # <image@digest> <source commit>
@@ -781,7 +781,7 @@ cmd_complete() { # <image@digest> <source commit>
     note "${gap}, so it is not reused"
     exit 3
   fi
-  echo "ok: ${ref} was signed and attested by the build that made it"
+  gha_say 'ok: %s was signed and attested by the build that made it' "${ref}"
 }
 # An image is signed by the run that built it: a promotion's by the dev run
 # of its promoted commit or of a first-parent ancestor it carries unchanged,
@@ -843,7 +843,7 @@ readback_image() { # <tag>
     if [ -z "$dash" ] || ! signed_in_window "ghcr.io/${IMAGE}/${package}@${dash}" "$window"; then
       die "ghcr.io/${IMAGE}/${package}:${tag} is '${dash}', which no docker-release.yaml run at ${commit} or a later main commit below the next stable tag signed"
     fi
-    echo "ok: ghcr.io/${IMAGE}/${package}:${tag} -> ${dash}"
+    gha_say 'ok: ghcr.io/%s/%s:%s -> %s' "${IMAGE}" "${package}" "${tag}" "${dash}"
   done <<<"$dashboards"
 }
 
@@ -869,7 +869,7 @@ cmd_readback() { # <site> <tag> [lane]; SUBPACKAGES: the root release's subpacka
     manifest=$(git show "${tag}:${sub}/package.json") || die "no ${sub}/package.json at ${tag}"
     pkg=$(jq -r .name <<<"$manifest") || die "${sub}/package.json at ${tag} is not JSON"
     if [ "$(jq -r '.private // false' <<<"$manifest")" = true ]; then
-      echo "ok: ${pkg} is private, so no registry holds it"
+      gha_say 'ok: %s is private, so no registry holds it' "${pkg}"
       continue
     fi
     npm_answers "$pkg" "${ver#v}" || return 1
@@ -1112,7 +1112,7 @@ poll() { # <what> <reads> <command...>: until the command prints 0 or "done" on 
         ;;
       *)
         ok=0
-        echo "waiting for ${what} (${got})"
+        gha_say 'waiting for %s (%s)' "${what}" "${got}"
         ;;
     esac
     sleep "${POLL_SECONDS:-30}"
@@ -1266,12 +1266,12 @@ cmd_barrier() {
     while IFS=$'\t' read -r key r v; do
       p=$(git rev-parse "$r^2") || die "lane ${key}: cannot read the commit ${r} promoted"
       if has_dev_above "$key" "$(core "$v")"; then
-        echo "lane ${key}: dev already ranks above ${v}"
+        gha_say 'lane %s: dev already ranks above %s' "${key}" "${v}"
       elif built_past "$key" "$p"; then
         note "lane ${key}: dev holds a build past the promoted commit numbered below ${v}"
         need="${need}${key} "
       else
-        echo "lane ${key}: dev holds no build past the promoted commit"
+        gha_say 'lane %s: dev holds no build past the promoted commit' "${key}"
       fi
     done <<<"$plan"
   }
@@ -1307,7 +1307,7 @@ cmd_barrier() {
     p=$(git rev-parse "$r^2") || die "lane ${key}: cannot read the commit ${r} promoted"
     built_past "$key" "$p" || continue
     has_dev_above "$key" "$(core "$v")" || die "lane ${key}: renumber run ${run_id} left no dev build above ${v}"
-    echo "lane ${key}: dev now ranks above ${v}"
+    gha_say 'lane %s: dev now ranks above %s' "${key}" "${v}"
   done <<<"$plan"
   # npm's packument can trail a publish by minutes. A subs_lacking that
   # cannot tell ends the wait, and the call after it dies saying so.
@@ -1335,7 +1335,7 @@ cmd_renumber_target() {
   [ -z "${EXPECT_COMMIT:-}" ] || [ "$d" = "$EXPECT_COMMIT" ] \
     || die "lane ${key}: the newest build is now ${d_tag} at ${d}, not the ${EXPECT_COMMIT} this run numbered. Rerun the renumber."
   git checkout --quiet --detach "$d"
-  echo "lane ${key}: renumbering ${d_tag}'s build at ${d}"
+  gha_say "lane %s: renumbering %s's build at %s" "${key}" "${d_tag}" "${d}"
   out "commit=${d}"
 }
 
@@ -1412,7 +1412,7 @@ cmd_renumber_handoff() {
   local key="${LANE_KEY:?}" new="${DEV_VERSION:?}" d
   d=$(renumber_build "$key" "$new") || exit 1
   [ -n "$d" ] || return 0
-  echo "lane ${key}: ${new} for the build at ${d} goes to the tagging job"
+  gha_say 'lane %s: %s for the build at %s goes to the tagging job' "${key}" "${new}" "${d}"
   out "version=${new}" "commit=${d}"
 }
 
@@ -1505,7 +1505,7 @@ cmd_renumber_subpackages() {
       continue
     fi
     dirs=$(jq -c --arg s "$s" '. + [$s]' <<<"$dirs")
-    echo "subpackage ${s}: publishing the build ${d_tag} for dev's change ${c}"
+    gha_say "subpackage %s: publishing the build %s for dev's change %s" "${s}" "${d_tag}" "${c}"
   done <<<"$rows"
   out "version=${d_tag}" "dirs=${dirs}"
 }
@@ -1583,7 +1583,7 @@ cmd_renumber() {
     fi
     die "receipt for ${new} not recorded"
   fi
-  echo "lane ${key}: the build at ${d} is now also ${new}"
+  gha_say 'lane %s: the build at %s is now also %s' "${key}" "${d}" "${new}"
 }
 
 case "${1:-}" in

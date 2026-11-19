@@ -799,8 +799,9 @@ def main() -> int:
         try:
             meta = json.loads((out_path.parent / 'meta.json').read_text())
         except OSError, json.JSONDecodeError:
-            mutation_cost.say(
-                t'[{args.repo}] no readable meta.json beside {str(out_path)}; skipping'
+            workflow_commands.say(
+                t'[{args.repo}] no readable meta.json beside {str(out_path)}, so it is skipped',
+                file=sys.stderr,
             )
             continue
         if meta.get('repo') != args.repo:
@@ -813,14 +814,17 @@ def main() -> int:
         merged = merged_attempt(args.repo, attempt, sharded[attempt])
         if merged is not None:
             attempt_files.append(merged)
-    print(f'[{args.repo}] found {len(attempt_files)} attempt files', file=sys.stderr)
+    workflow_commands.say(
+        t'[{args.repo}] found {len(attempt_files)} attempt files', file=sys.stderr
+    )
 
     agg = aggregate(attempt_files)
-    mutation_cost.say(
+    workflow_commands.say(
         t'[{args.repo}] efficacy={agg["efficacy_mean"]}±{agg["efficacy_stddev"]} '
         t'cov={agg["mutant_coverage_mean"]} live={agg["live_count"]} '
         t'attempts={agg["attempts"]} mode={agg["mode"]} '
         t'buckets={ {k: len(v) for k, v in agg["live_buckets"].items()} }',
+        file=sys.stderr,
     )
 
     if args.attempts_marker_file:
@@ -838,8 +842,8 @@ def main() -> int:
             'color': badge_color(eff),
         }
         args.badge_file.write_text(json.dumps(badge))
-        print(
-            f'[{args.repo}] wrote badge {args.badge_file}: {eff}% ({badge["color"]})',
+        workflow_commands.say(
+            t'[{args.repo}] wrote badge {args.badge_file}: {eff}% ({badge["color"]})',
             file=sys.stderr,
         )
 
@@ -857,4 +861,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(mutation_cost.run_main(main))
+    sys.exit(workflow_commands.run_main(main))

@@ -57,11 +57,11 @@ await_registry() {
   until "$@" >/dev/null 2>&1; do
     left=$((budget - REGISTRY_WAITED))
     if [ "$left" -le 0 ]; then
-      echo "${label}: absent after ${attempt} attempt(s) and ${waited}s of waiting" >&2
+      gha_say '%s: absent after %s attempt(s) and %ss of waiting' "${label}" "${attempt}" "${waited}" >&2
       return 1
     fi
     [ "$delay" -le "$left" ] || delay=$left
-    echo "${label}: not served yet (attempt ${attempt}); retrying in ${delay}s" >&2
+    gha_say '%s: not served yet (attempt %s); retrying in %ss' "${label}" "${attempt}" "${delay}" >&2
     sleep "${READBACK_SLEEP:-$delay}"
     REGISTRY_WAITED=$((REGISTRY_WAITED + delay))
     waited=$((waited + delay))

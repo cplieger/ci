@@ -229,7 +229,7 @@ def main() -> int:
 
     if args.output:
         Path(args.output).write_text(page)
-        print(f'wrote {args.output} ({size} bytes)', file=sys.stderr)
+        wc.say(t'wrote {args.output} ({size} bytes)', file=sys.stderr)
     else:
         sys.stdout.write(page)
     return 0

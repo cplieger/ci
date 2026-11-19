@@ -441,7 +441,7 @@ def write_outputs(values: dict[str, str]) -> None:
     if path:
         with open(path, 'a') as fh:
             fh.write(lines)
-    print(lines, end='')
+    workflow_commands.say_lines(lines)
 
 
 def listed(repo: str) -> dict:
@@ -504,7 +504,7 @@ def locate(gh: ghrest.Client, repo: str) -> Run:
 
 def cmd_locate(a) -> int:
     run = locate(ghrest.DEFAULT, a.repo)
-    print(f'reading {run.url}')
+    workflow_commands.say(t'reading {run.url}')
     write_outputs({'run-id': str(run.id), 'base': run.base})
     return 0
 
@@ -714,7 +714,7 @@ def cmd_propose(a) -> int:
         return 0
     done = propose(ghrest.DEFAULT, a.repo, a.bot, a.base, p)
     if not done.warning:
-        print(done.text)
+        workflow_commands.say(t'{done.text}')
         return 0
     print(workflow_commands.command('warning', done.text))
     summary = os.environ.get('GITHUB_STEP_SUMMARY')
@@ -731,7 +731,7 @@ def cmd_issues(a) -> int:
     except (OSError, ValueError) as err:
         raise RefusedError(f'the issue plan {a.plan} is unreadable: {err}') from None
     for line in apply_issues(ghrest.DEFAULT, a.repo, actions):
-        print(line)
+        workflow_commands.say(t'{line}')
     return 0
 
 

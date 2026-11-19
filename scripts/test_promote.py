@@ -1652,7 +1652,7 @@ class Preview(unittest.TestCase):
         return rc, text, out.getvalue(), err.getvalue()
 
     def plan_line(self, stdout: str) -> str:
-        return [line for line in stdout.splitlines() if line.startswith('release-plan: ')][-1]
+        return [line for line in stdout.splitlines() if line.startswith('- release-plan: ')][-1]
 
     def go_main(self, fx) -> str:
         m = fx.commit(
@@ -1676,7 +1676,7 @@ class Preview(unittest.TestCase):
         self.assertIn('Promoted from `v1.1.0-dev.1`', text)
         self.assertIn('- Add greeting (#7)', text)
         self.assertIn('compare/v1.0.0...v1.1.0', text)
-        self.assertEqual(stdout.splitlines()[-1], 'release-plan: {".":"v1.1.0"}')
+        self.assertEqual(stdout.splitlines()[-1], '- release-plan: {".":"v1.1.0"}')
 
     def test_a_test_only_promotion_previews_no_release(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1691,7 +1691,7 @@ class Preview(unittest.TestCase):
             '### root: no release\n\nNo path root ships changed since `v1.0.0`, so it cuts no version.',
             text,
         )
-        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":""}')
+        self.assertEqual(self.plan_line(stdout), '- release-plan: {".":""}')
 
     def test_only_the_nested_lane_a_promotion_changes_is_planned(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1718,7 +1718,7 @@ class Preview(unittest.TestCase):
             text,
         )
         self.assertIn('### sub sub/v0.2.0', text)
-        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":"","sub":"sub/v0.2.0"}')
+        self.assertEqual(self.plan_line(stdout), '- release-plan: {".":"","sub":"sub/v0.2.0"}')
 
     def test_a_tagless_test_only_promotion_previews_no_release(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1735,7 +1735,7 @@ class Preview(unittest.TestCase):
         self.assertIn(
             '### root: no release\n\nNo path root ships changed, so it cuts no version.', text
         )
-        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":""}')
+        self.assertEqual(self.plan_line(stdout), '- release-plan: {".":""}')
 
     def test_main_s_unreleased_patch_is_previewed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1751,7 +1751,7 @@ class Preview(unittest.TestCase):
             rc, text, stdout, _ = self.run_preview(fx, m, t)
         self.assertEqual(rc, 0, text)
         self.assertIn('### root v1.0.1', text)
-        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":"v1.0.1"}')
+        self.assertEqual(self.plan_line(stdout), '- release-plan: {".":"v1.0.1"}')
 
     def test_main_s_release_in_flight_at_the_snapshot_is_planned_after_it_tags(self):
         """M's own run tags v1.0.1 while snapshot waits, so the preview plans what
@@ -1784,7 +1784,7 @@ class Preview(unittest.TestCase):
             '### root: no release\n\nNo path root ships changed since `v1.0.1`, so it cuts no version.',
             text,
         )
-        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":""}')
+        self.assertEqual(self.plan_line(stdout), '- release-plan: {".":""}')
 
     def test_an_image_promotion_reaching_only_a_dev_rebuild_previews_no_release(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1805,7 +1805,7 @@ class Preview(unittest.TestCase):
             rc, text, stdout, _ = self.run_preview(fx, m, t)
         self.assertEqual(rc, 0, text)
         self.assertIn('### root: no release', text)
-        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":""}')
+        self.assertEqual(self.plan_line(stdout), '- release-plan: {".":""}')
 
     def test_an_image_promotion_previews_its_notes_with_no_token_and_no_kind_line(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1841,7 +1841,7 @@ class Preview(unittest.TestCase):
             ):
                 rc, text, stdout, _ = self.run_preview(fx, m, t)
         self.assertEqual(rc, 0, text)
-        self.assertEqual(self.plan_line(stdout), 'release-plan: {".":"v1.1.0"}')
+        self.assertEqual(self.plan_line(stdout), '- release-plan: {".":"v1.1.0"}')
         tools = {'release-state.sh', 'compute.sh', 'path-significance.sh'}
         self.assertEqual({name for name, _ in tokens} & tools, tools)
         self.assertEqual({token for name, token in tokens if name in tools}, {None})
@@ -1865,7 +1865,7 @@ class Preview(unittest.TestCase):
             rc, text, stdout, _ = self.run_preview(fx, m, t)
         self.assertEqual(rc, 0, text)
         self.assertIn('This repository has no release lane.', text)
-        self.assertEqual(self.plan_line(stdout), 'release-plan: {}')
+        self.assertEqual(self.plan_line(stdout), '- release-plan: {}')
 
     def test_a_tool_output_missing_a_field_fails_the_preview_naming_it(self):
         real = promote.run_tool

@@ -319,7 +319,7 @@ def main() -> int:
     text = '\n'.join(lines) + '\n'
     with args.summary.open('a') as f:
         f.write(text)
-    sys.stdout.write(text)
+    workflow_commands.say_lines(text)
     return code
 
 

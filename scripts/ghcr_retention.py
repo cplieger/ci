@@ -18,6 +18,7 @@ import urllib.parse
 from datetime import UTC, datetime, timedelta
 
 import release_channels as rc
+import workflow_commands
 
 OWNER = 'cplieger'
 KEEP_NEWEST = 10
@@ -159,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
     if summary:
         with open(summary, 'a') as fh:
             fh.write(table)
-    print(table, end='')
+    workflow_commands.say_lines(table)
     print(
         f'{"would delete" if args.dry_run else "deleted"}: {len([r for r in rows if r[4] != "keep"])}'
         f'{"" if args.dry_run else f" ({deleted} done)"}'

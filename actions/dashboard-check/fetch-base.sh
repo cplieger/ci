@@ -51,9 +51,9 @@ code=$(curl -sS --connect-timeout 10 --max-time 60 \
 case "$code" in
   200)
     mv "$tmp" "$out"
-    echo "dashboard-check: base copy of ${path} read at ${ref}"
+    gha_say 'dashboard-check: base copy of %s read at %s' "${path}" "${ref}"
     ;;
-  404) echo "dashboard-check: ${path} does not exist at ${ref}; no base copy" ;;
+  404) gha_say 'dashboard-check: %s does not exist at %s, so there is no base copy' "${path}" "${ref}" ;;
   *)
     gha_annotate error 'dashboard-check: reading %s at %s answered HTTP %s' "${path}" "${ref}" "${code}"
     exit 1

@@ -1463,7 +1463,7 @@ class IssuesCommand(unittest.TestCase):
             ):
                 self.assertEqual(cdr.main(['issues', '--repo', 'subflux', '--plan', str(plan)]), 0)
         self.assertEqual(ap.call_args.args[1:], ('subflux', [{'kind': 'close', 'number': 5}]))
-        self.assertEqual(out.getvalue(), 'closed u\n')
+        self.assertEqual(out.getvalue(), '- closed u\n')
 
     def test_an_unreadable_plan_is_refused(self):
         for raw in (None, '{'):

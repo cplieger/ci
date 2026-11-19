@@ -88,7 +88,7 @@ scope() {
   if [ "$rc" -ne 0 ]; then
     gha_annotate warning 'The paths changed since %s could not be classified, so this release publishes as usual.' "${tag}" >&2
     reason=$(tail -n 1 "$ps_err" | sed 's/^::[a-z]*:://')
-    [ -z "$reason" ] || printf '%s\n' "$reason" >&2
+    [ -z "$reason" ] || gha_say '%s' "$reason" >&2
     result false
   fi
   [ -n "$(sed -n 's/^rebuild_request=//p' <<<"$ps_out")" ] || result false
