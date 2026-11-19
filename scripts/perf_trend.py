@@ -259,22 +259,28 @@ def judge(
     *,
     repo: str,
     fallback: list[dict] = (),
+    dev_accepted: dict | None = None,
 ) -> Judged:
-    """Judge point p against history (seen points of its series, oldest first; fallback's
-    dev points go before them while the series has fewer than BASELINE_POINTS) and step
-    each measured scenario's lifecycle in state. A regression tracked on another runner
+    """Judge point p against history (seen points of its series, oldest first) and
+    fallback (dev's points up to the series' first, before history in the baselines while
+    it has fewer than BASELINE_POINTS, and in last_good's search always), under each
+    scenario's accepted regression, its own or else dev's (dev_accepted, by scenario), and
+    step each measured scenario's lifecycle in state. A regression tracked on another runner
     than p's ends, as does, at a dev point, one of a scenario p does not measure: a
     suspect silently, an open or recovering one with a close. Returns the new state, p
     with each judged timing cell's `baseline` and `bad`, and the issue actions."""
     series = state['series']
     past = [*(fallback if len(history) < BASELINE_POINTS else ()), *history]
     tracked = state['scenarios']
+
+    def accepted_of(s: str) -> dict | None:
+        return tracked.get(s, {}).get('accepted') or (dev_accepted or {}).get(s)
+
     cells = [dict(c) for c in p['cells']]
     for c in cells:
         if not perf_gate.is_timing(c) or c.get('value') is None:
             continue
-        accepted = tracked.get(c['scenario'], {}).get('accepted')
-        b = baseline(past, perf_gate.key(c), p['runner'], accepted)
+        b = baseline(past, perf_gate.key(c), p['runner'], accepted_of(c['scenario']))
         if b is not None:
             c['baseline'] = b
             c['bad'] = perf_gate.over_guard(c['metric'], c['value'], b)
@@ -344,13 +350,15 @@ def judge(
             if before['status'] != 'ok':
                 unjudged[s] = 'no timing cell has a baseline on this runner'
             continue
-        after, op = step(before, bad[s], p, previous)
+        rows = [c for c in cells if c['scenario'] == s and c.get('bad')]
+        tripped = [i.removeprefix('group:') for i in sorted(bad[s]) if i.startswith('group:')]
+        good = last_good([*fallback, *history], s, rows, tripped, accepted_of(s)) if rows else None
+        after, op = step(before, bad[s], p, good)
         if op is not None:
             action = {'op': op[0], 'marker': marker(series, s), 'title': title(series, s)}
             action['labels'] = [LABEL]
-            rows = [c for c in cells if c['scenario'] == s and c.get('bad')]
             if op[0] == 'upsert':
-                counts = counts_since(past, after, judged, s)
+                counts = counts_since([*fallback, *history], after, judged, s)
                 action['body'] = render_issue(
                     after, s, rows, groups[s], counts, series=series, repo=repo
                 )
@@ -369,9 +377,10 @@ def judge(
 
 
 def step(
-    before: dict, bad: set[str], p: dict, previous: dict | None
+    before: dict, bad: set[str], p: dict, good: dict | None
 ) -> tuple[dict, tuple[str, str | None] | None]:
-    """One scenario's lifecycle step on point p, given its bad cells and groups: ok to
+    """One scenario's lifecycle step on point p, given its bad cells and groups and good,
+    the last_good point of p's bad cells, which a suspicion or an opened issue keeps: ok to
     suspect on a bad point; suspect to open (an upsert) when a cell or group of the
     suspicion is bad again, else a new suspicion; open and recovering to open on a bad
     point (an upsert with a comment); open to recovering, and recovering to ok (a
@@ -397,16 +406,54 @@ def step(
             **accepted,
             'runner': p['runner'],
             'items': sorted(bad),
-            'last_good': ref_of(previous) if previous else None,
+            'last_good': good,
             'first_bad': ref_of(p),
             'bad_runs': [p['run_url']],
         }, None
     after = {**before, 'status': 'open', 'items': sorted(bad)}
     after['bad_runs'] = [*before['bad_runs'], p['run_url']]
     if status == 'suspect':
-        after['opened'] = p['date']
+        # The issue names p's bad cells, so its range starts from the last point good for them.
+        after['opened'], after['last_good'] = p['date'], good
         return after, ('upsert', None)
     return after, ('upsert', 'still')
+
+
+def last_good(
+    points: list[dict], scenario: str, rows: list[dict], groups: list[str], accepted: dict | None
+) -> dict | None:
+    """The point, of points (oldest first, on any runner), a regression of scenario's bad
+    cells rows and tripped scenario-rule families groups at a point is ranged from: the
+    newest that measured every one of rows, found none of scenario's cells bad, unless an
+    accepted regression forgave it, and was within the guard of each of those cells against
+    the baseline it failed, and within each group's rule likewise. None when no point is."""
+
+    def good_at(h: dict) -> bool:
+        cells = h['cells']
+        forgiven = bool(accepted) and accepted['from'] <= h['date'] <= accepted['at']
+        if not forgiven and any(c.get('bad') for c in cells.values() if c['scenario'] == scenario):
+            return False
+        then = {}
+        for c in rows:
+            v = cells.get(perf_gate.key(c), {}).get('value')
+            if not perf_gate.is_number(v):
+                return False
+            then[perf_gate.key(c)] = v
+        for c in rows:
+            k, b = perf_gate.key(c), c['baseline']
+            if perf_gate.over_guard(c['metric'], then[k], b):
+                return False
+        for fam in groups:
+            floor = perf_gate.GUARD[fam][1]
+            members = [
+                c for c in rows if perf_gate.family(c['metric']) == fam and c['baseline'] >= floor
+            ]
+            ratio = statistics.median(then[perf_gate.key(c)] / c['baseline'] for c in members)
+            if ratio > GROUP[fam]:
+                return False
+        return True
+
+    return next((ref_of(h) for h in reversed(points) if good_at(h)), None)
 
 
 def still_text(p: dict, rows: list[dict], groups: list[str]) -> str:
@@ -438,7 +485,7 @@ def ratio(c: dict) -> str:
 def counts_since(past: list[dict], tracked: dict, p: dict, scenario: str) -> list[str]:
     """The scenario's counts that differ between the regression's last good point and p."""
     good = tracked.get('last_good')
-    then = next((h for h in reversed(past) if good and h['commit'] == good['commit']), None)
+    then = next((h for h in reversed(past) if good and ref_of(h) == good), None)
     if then is None:
         return []
     out = []
@@ -491,7 +538,11 @@ def render_issue(
             f'https://github.com/{repo}/compare/{good["commit"]}...{first["commit"]}'
         )
     else:
-        lines.append(f'First bad point: `{first["commit"][:12]}`, the first point measured.')
+        lines.append(
+            'No earlier point this run read was within the thresholds for this scenario, so '
+            'there is no known-good point and no commit range. The first bad point is '
+            f'`{first["commit"][:12]}`.'
+        )
     lines += ['', 'Runs of the bad points:', '']
     lines += [f'- {u}' for u in tracked['bad_runs'][-BAD_RUNS_SHOWN:]]
     lines.append('')
@@ -754,8 +805,9 @@ def load_points(root: pathlib.Path, series: str) -> list[dict]:
 def needs(listing: list[str], series: str) -> list[str]:
     """The paths of the perf-trend branch (listing, `git ls-tree -r --name-only`) the
     record job checks out to judge a point of series: its state, dev's state for another
-    series, its last HISTORY points and, while it has fewer than BASELINE_POINTS, the
-    last HISTORY dev points at or before its first one."""
+    series, its last HISTORY points and, for another series however old, the last HISTORY
+    dev points at or before its first one: last_good ranges a regression from those, the
+    fork's neighbours, never from dev's newest points."""
 
     def points_of(s: str) -> list[str]:
         prefix = f'series/{s}/points/'
@@ -766,9 +818,15 @@ def needs(listing: list[str], series: str) -> list[str]:
     if series != DEV:
         out.append(f'series/{DEV}/state.json')
     out += own[-HISTORY:]
-    if series != DEV and len(own) < BASELINE_POINTS:
+    if series != DEV:
         first = pathlib.PurePosixPath(own[0]).name if own else None
-        dev = [p for p in points_of(DEV) if first is None or pathlib.PurePosixPath(p).name <= first]
+        # By the stamp alone: record() keeps a dev point of the first point's second.
+        stamp = first.split('-', 1)[0] if first else None
+        dev = [
+            p
+            for p in points_of(DEV)
+            if stamp is None or pathlib.PurePosixPath(p).name.split('-', 1)[0] <= stamp
+        ]
         out += dev[-HISTORY:]
     return out
 
@@ -830,16 +888,24 @@ def record(
     if issues is not None:
         state, actions = observe(state, issues, series=series)
     history = load_points(root, series)
-    fallback = []
+    fallback, dev_accepted = [], {}
     if series != DEV:
         first = min([h['date'] for h in history] + [p['date']])
         fallback = [h for h in load_points(root, DEV) if h['date'] <= first]
+        dev_state = series_dir(root, DEV) / 'state.json'
+        if dev_state.is_file():
+            dev_accepted = {
+                s: v['accepted']
+                for s, v in perf_gate.load(dev_state)['scenarios'].items()
+                if 'accepted' in v
+            }
     judged = judge(
         [seen(h) for h in history],
         p,
         state,
         repo=repo,
         fallback=[seen(h) for h in fallback],
+        dev_accepted=dev_accepted,
     )
     stepped = {a['marker'] for a in judged.actions}
     actions = [a for a in actions if a['marker'] not in stepped] + judged.actions
