@@ -26,6 +26,11 @@ from pathlib import Path
 
 ACCEPT_FILE = 'api-accept.txt'
 INCOMPATIBLE = '## incompatible changes'
+# apidiff's messageSet.add (apidiff/messageset.go) prints this three-line note to STDOUT with
+# fmt.Printf while it diffs, so it lands in the report ahead of the first section. It is not a
+# change: the object part keeps the second message, which the report lists in its section.
+NOTE = '! second, different message for obj '
+NOTE_PARTS = ('  first:  ', '  second: ')
 PACKAGE_SECTIONS = {
     '## errors in base version:': 'base_errors',
     '## errors in release version:': 'release_errors',
@@ -57,6 +62,7 @@ class Report:
     packages: dict[str, Package] = field(default_factory=dict)
     diagnostics: list[str] = field(default_factory=list)
     summary: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -73,6 +79,7 @@ class Result:
     duplicates: list[tuple[Entry, int]] = field(default_factory=list)
     unaccepted: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 def parse_report(text: str) -> Report:
@@ -80,11 +87,22 @@ def parse_report(text: str) -> Report:
     report = Report()
     block: list[str] | None = None
     package: Package | None = None
+    note: list[str] = []
     for raw in text.splitlines():
         line = raw.rstrip()
+        if note:
+            if not line.startswith(NOTE_PARTS[len(note) - 1]):
+                raise ReportError(f'apidiff note cut short at {line!r}')
+            note.append(line)
+            if len(note) == 1 + len(NOTE_PARTS):
+                report.notes += note
+                note = []
+            continue
         if not line:
             continue
-        if line.startswith('# '):
+        if line.startswith(NOTE):
+            note = [line]
+        elif line.startswith('# '):
             name = line[2:]
             package = None
             if name == 'summary':
@@ -104,6 +122,8 @@ def parse_report(text: str) -> Report:
             raise ReportError(f'line outside any section: {line!r}')
         else:
             block.append(line)
+    if note:
+        raise ReportError(f'apidiff note cut short at the end: {note[-1]!r}')
     return report
 
 
@@ -164,7 +184,7 @@ def apply(
     self_version: str | None,
 ) -> Result:
     """Match the entries, then recompute the verdict gorelease gave without the accepted lines."""
-    result = Result()
+    result = Result(notes=report.notes)
     present = {(p, c) for p, pkg in report.packages.items() for c in pkg.incompatible}
     first: dict[tuple[str, str], int] = {}
     for e in entries:
@@ -223,6 +243,11 @@ def render(result: Result, rejected: bool) -> list[str]:
     else:
         out += fenced('Matching entries, not needed (gorelease accepted the version):', matched)
     out += fenced('Entries that match no incompatible change:', stale)
+    out += fenced(
+        'apidiff notes in the report (not changes: each object part keeps the second message, '
+        'which its section lists):',
+        result.notes,
+    )
     if rejected:
         out += fenced('Why the accepted list cannot pass the release:', result.reasons)
     return out

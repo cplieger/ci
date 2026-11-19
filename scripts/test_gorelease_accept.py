@@ -31,6 +31,13 @@ TWO_ACCEPT = (
     'example.com/lib/v2/wire/legacy: package removed\n'
 )
 PUBLISHED = 'v6.4.0 v6.5.0-dev.5'
+# The note apidiff's messageSet.add prints to stdout ahead of the report (toolbelt v3.16.0's run).
+NOTE = (
+    '! second, different message for obj type example.com/m/httpapi.Response struct{Code int}, '
+    'isNew false, part "Code"\n'
+    '  first:  changed from int to string\n'
+    '  second: changed from int to int64\n'
+)
 
 
 def summary(version: str, *reason: str) -> str:
@@ -92,6 +99,13 @@ class Cli(unittest.TestCase):
             md,
         )
         self.assertNotIn('Why the accepted list cannot pass', md)
+
+    def test_apidiff_notes_ahead_of_the_report_pass_and_are_listed(self):
+        run, md = self.run_cli(NOTE + NOTE + ENGINE_REPORT, ENGINE_ACCEPT)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotIn('cannot read the gorelease report', run.stdout)
+        self.assertIn('apidiff notes in the report', md)
+        self.assertEqual(md.count('  second: changed from int to int64'), 2)
 
     def test_the_engine_report_stays_rejected_with_only_comments(self):
         comments = ''.join(
@@ -211,6 +225,22 @@ class Matching(unittest.TestCase):
                 'There are incompatible changes.',
             ],
         )
+
+    def test_an_apidiff_note_is_kept_apart_from_the_sections(self):
+        report = ga.parse_report(NOTE + ENGINE_REPORT.replace(f'# {VT}\n', NOTE + f'# {VT}\n'))
+        self.assertEqual(report.notes, NOTE.splitlines() * 2)
+        self.assertEqual(report.packages[TERMINAL].incompatible, ['StartZombieReaper: removed'])
+
+    def test_a_cut_short_apidiff_note_is_refused(self):
+        first, part, _ = NOTE.splitlines()
+        for report in (
+            f'{first}\n' + ENGINE_REPORT,
+            f'{first}\n{part}\n' + ENGINE_REPORT,
+            ENGINE_REPORT + f'{first}\n{part}\n',
+            f'{part}\n' + ENGINE_REPORT,
+        ):
+            with self.subTest(report=report[:60]), self.assertRaises(ga.ReportError):
+                ga.parse_report(report)
 
     def test_no_partial_or_cross_package_entry_accepts_a_line(self):
         for entry in (
