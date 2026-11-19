@@ -1470,6 +1470,7 @@ class WorkflowRun(unittest.TestCase):
 
     def test_a_fixture_run_opens_edits_reopens_and_closes_and_caps_at_10(self):
         entries = [a_notice(f'n{i:02}') for i in range(13)]
+        entries[2] = a_notice('n02', upstream='sonarr', **{'from': FROM, 'to': TO})
         ns = notices_of(entries)
         issues = [
             an_issue(1, ns[0], title='old'),
@@ -1493,6 +1494,9 @@ class WorkflowRun(unittest.TestCase):
         self.assertEqual(writes[0][2]['title'], ns[0].title)
         self.assertEqual(writes[1][2]['state'], 'open')
         self.assertEqual([w[2]['title'] for w in writes[2:11]], [n.title for n in ns[2:11]])
+        linked = [w[2]['body'] for w in writes if w[2] and '://' in w[2].get('body', '')]
+        self.assertEqual(linked, [ns[2].body])
+        self.assertEqual(re.findall(r'\S+://\S+', ns[2].body), [SONARR_COMPARE])
         bulk = writes[11][2]
         self.assertEqual(bulk['title'], cdr.BULK_TITLE)
         self.assertIn(ns[11].title, bulk['body'])
