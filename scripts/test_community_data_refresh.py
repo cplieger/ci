@@ -1084,6 +1084,14 @@ class Rendered(unittest.TestCase):
             ' block it never closes',
         )
 
+    def test_the_bulk_issue_lists_each_title_as_code(self):
+        self.assertEqual(
+            cdr.bulk_body(['a', '`edge`', 'x ``y`` z']),
+            'This run opened or reopened 10 issues, the most one run opens. These notices wait'
+            ' for a later run:\n\n- ` a `\n- `` `edge` ``\n- ``` x ``y`` z ```\n\n'
+            f'{BULK_MARKER}\n',
+        )
+
     def test_the_bulk_issue_is_rendered_whole(self):
         def bulk(*titles):
             body = cdr.bulk_body(list(titles))
@@ -1092,13 +1100,27 @@ class Rendered(unittest.TestCase):
         for titles in (
             ('[click][x]', '[x]: //evil.example/f'),
             ('Parser \\`[x](https://evil.example/t)` changed',),
+            ('See Sonarr/Sonarr#7000 and @cplieger', 'commit 7ebd6ba'),
+            ('<!-- open', '`edge`'),
         ):
             with self.subTest(titles):
-                self.refused(
-                    [], 'the bulk issue: GitHub renders its body with a link', bulk(*titles)
-                )
+                _, fake = self.check([], bulk(*titles))
+                self.assertEqual(fake.rendered, [cdr.bulk_body(list(titles))])
         _, fake = self.check([], [{'kind': 'close', 'number': 3}, *bulk('a', 'b')])
         self.assertEqual(fake.rendered, [cdr.bulk_body(['a', 'b'])])
+
+    def test_a_title_github_links_is_accepted_as_the_eleventh(self):
+        for title in ('See Sonarr/Sonarr#7000', 'Parser `Regex` changed'):
+            with self.subTest(title):
+                entries = [a_notice(f'n{i:02}') for i in range(10)]
+                notices = notices_of([*entries, a_notice('n10', title=title)])
+                actions = cdr.issue_plan(notices, [], SUBFLUX['labels'])
+                bulk = actions[-1]['body']
+                self.assertIn(f'- `` {title} ``\n' if '`' in title else f'- ` {title} `\n', bulk)
+                fake = RenderingGitHub()
+                gh = ghrest.Client(run=fake, sleep=lambda _: None)
+                cdr.check_renders(gh, 'subflux', notices, actions)
+                self.assertEqual(fake.rendered, [*(n.body for n in notices), bulk])
 
     def test_a_failed_render_refuses(self):
         for name, fail in (('server error', (502, '')), ('rate limited', (403, RATE_LIMITED))):
