@@ -1003,7 +1003,13 @@ class Rendered(unittest.TestCase):
             ('reference link', linked('[click][x]\n\n[x]: https://evil.example/j')),
             ('email address', linked('write to a@example.com')),
             ('image', linked('![x](https://evil.example/i.png)')),
+            (
+                'quote citing a URL',
+                linked('<blockquote cite="https://evil.example/q">x</blockquote>'),
+            ),
+            ("a heading's permalink", linked('## Changes\n\nText.')),
             ('a link with no upstream', a_notice(body='see https://evil.example/k')),
+            ('an empty link with no upstream', a_notice(body='<a href="">x</a>')),
         ):
             with self.subTest(name):
                 self.refused(

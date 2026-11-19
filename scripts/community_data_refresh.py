@@ -31,6 +31,7 @@ import json
 import os
 import re
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import quote
@@ -95,17 +96,15 @@ NOTICE_ID = re.compile(r'^[a-z0-9][a-z0-9-]*$')
 NOTICE_ID_MAX = 64
 NOTICE_KEYS = frozenset({'id', 'title', 'body', 'labels', 'upstream', 'from', 'to'})
 NOTICE_NEEDS = ('id', 'title', 'body', 'labels')
-# The forms refused in a notice's text outside code (prose()): a URL, a www.
-# host, a markdown inline or reference link, an HTML link or image, an email
-# address. GitHub's own references (#26, a SHA, @name) are not matched. The
-# job writes the only link, from the row.
-LINK = re.compile(
-    r'://|www\.|\]\(|^\s*\[[^\]]*\]:|<a\b|<img\b|href\s*=|mailto:'
-    r'|[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-z]+\b',
-    re.IGNORECASE | re.MULTILINE,
-)
-FENCE = re.compile(r' {0,3}(`{3,}|~{3,})')
-TICKS = re.compile(r'`+')
+# The attributes whose value is a URL, from HTML's attribute index
+# (https://html.spec.whatwg.org/multipage/indices.html#attributes-3) plus the
+# obsolete longdesc, which GitHub's sanitizer keeps on an image.
+URL_ATTRS = frozenset(
+    {
+        'action', 'cite', 'data', 'formaction', 'href', 'itemid', 'itemtype',
+        'longdesc', 'manifest', 'ping', 'poster', 'src', 'srcset', 'xlink:href',
+    }
+)  # fmt: skip
 # The label on every issue this job keeps; a notice adds its own from its row.
 ISSUE_LABEL = 'community-data'
 OPENS_MAX = 10
@@ -120,13 +119,6 @@ BULK_MARKER = '<!-- community-data bulk -->'
 BULK = ''
 BULK_TITLE = 'Community data notices waiting for a later run'
 LABEL_COLOR = 'c5def5'
-# The fields each kind of issue action carries, exactly.
-ACTION_KEYS = {
-    'create': frozenset({'kind', 'title', 'body', 'labels'}),
-    'edit': frozenset({'kind', 'number', 'title', 'body', 'labels'}),
-    'reopen': frozenset({'kind', 'number', 'title', 'body', 'labels'}),
-    'close': frozenset({'kind', 'number'}),
-}
 
 
 class RefusedError(Exception):
@@ -143,10 +135,6 @@ class Notice(NamedTuple):
     compare: str = ''
 
 
-def check_renders(gh: ghrest.Client, notices: list[Notice], actions: list[dict]) -> None:
-    raise NotImplementedError
-
-
 def title_fault(title: str) -> str | None:
     """Why `title` cannot title a pull request or an issue, None when it can."""
     if not title.strip() or '\n' in title or '\r' in title:
@@ -156,52 +144,14 @@ def title_fault(title: str) -> str | None:
     return None
 
 
-def without_spans(line: str) -> str:
-    """`line` with each code span, a backtick run closed by an equal run on the
-    same line, blanked; a span over several lines stays prose, so it is read
-    and never hides a link GitHub renders."""
-    out, i = [], 0
-    while opened := TICKS.search(line, i):
-        close = re.compile(rf'(?<!`)`{{{len(opened[0])}}}(?!`)').search(line, opened.end())
-        if close is None:
-            out.append(line[i : opened.end()])
-            i = opened.end()
-            continue
-        out.append(line[i : opened.start()] + ' ')
-        i = close.end()
-    out.append(line[i:])
-    return ''.join(out)
-
-
-def prose(text: str, blocks: bool) -> str | None:
-    """`text` with the code GitHub renders as code blanked, its fenced blocks
-    too when `blocks`, or None when a fence never closes: it would run over the
-    compare link and marker the job appends."""
-    lines, fence = [], None
-    for line in text.splitlines():
-        if fence:
-            char, size = fence
-            if re.fullmatch(rf' {{0,3}}{re.escape(char)}{{{size},}}[ \t]*', line):
-                fence = None
-            lines.append('')
-            continue
-        opened = FENCE.match(line) if blocks else None
-        if opened and not (opened[1][0] == '`' and '`' in line[opened.end() :]):
-            fence = (opened[1][0], len(opened[1]))
-            lines.append('')
-            continue
-        lines.append(without_spans(line))
-    return None if fence else '\n'.join(lines)
-
-
 def marker(nid: str) -> str:
     return f'<!-- community-data id={nid} -->'
 
 
 def read_notice(i: int, entry, row: dict) -> Notice:
     """Entry `i` of a NOTICES file, validated against `row`, with the issue
-    body this job writes: the notice's body, the compare link from the row's
-    own upstream when it names one with `from` and `to`, and the marker."""
+    body this job writes: the compare link from the row's own upstream when it
+    names one with `from` and `to`, the notice's body, then the marker."""
     if not isinstance(entry, dict):
         raise RefusedError(f'notice {i} is not an object')
     unknown = sorted(set(entry) - NOTICE_KEYS)
@@ -227,14 +177,15 @@ def read_notice(i: int, entry, row: dict) -> Notice:
     upstream = entry.get('upstream')
     if 'upstream' in entry and (not isinstance(upstream, str) or upstream not in upstreams):
         raise RefusedError(f'{where}: upstream {upstream!r} is not one of {", ".join(upstreams)}')
-    link = ''
+    compare = link = ''
     commits = [entry[k] for k in ('from', 'to') if k in entry]
     if commits:
         if upstream is None:
             raise RefusedError(f'{where}: from and to need an upstream')
         if len(commits) != 2 or not all(isinstance(c, str) and SHA.fullmatch(c) for c in commits):
             raise RefusedError(f'{where}: from and to are two 40-hex commits')
-        link = f'Upstream change: {upstreams[upstream]}/compare/{commits[0]}...{commits[1]}'
+        compare = f'{upstreams[upstream]}/compare/{commits[0]}...{commits[1]}'
+        link = f'Upstream change: {compare}'
     title, body = entry['title'], entry['body']
     for field, text in (('title', title), ('body', body)):
         if not isinstance(text, str):
@@ -242,19 +193,11 @@ def read_notice(i: int, entry, row: dict) -> Notice:
     fault = title_fault(title)
     if fault:
         raise RefusedError(f'{where}: {fault}')
-    for field, text in (('title', title), ('body', body)):
-        read = prose(text, blocks=field == 'body')
-        if read is None:
-            raise RefusedError(f'{where}: the body opens a code fence it never closes')
-        if LINK.search(read):
-            raise RefusedError(f'{where}: the {field} holds a link')
-        # An unclosed comment would hide the compare link up to the marker's -->.
-        if '<!--' in read:
-            raise RefusedError(f'{where}: the {field} opens an HTML comment')
-    written = '\n\n'.join(b for b in (body.rstrip(), link, marker(nid)) if b) + '\n'
+    # The link goes first, so no block the body leaves open can hide it.
+    written = '\n\n'.join(b for b in (link, body.rstrip(), marker(nid)) if b) + '\n'
     if len(written) > BODY_MAX:
         raise RefusedError(f'{where}: the body is {len(written)} characters, over {BODY_MAX}')
-    return Notice(nid, title, written, tuple(labels))
+    return Notice(nid, title, written, tuple(labels), compare)
 
 
 def read_notices(root: Path, row: dict) -> list[Notice] | None:
@@ -294,7 +237,8 @@ def read_notices(root: Path, row: dict) -> list[Notice] | None:
 
 def issue_pages(gh: ghrest.Client, path: str, pages: int) -> tuple[list[dict], int, bool]:
     """Up to `pages` pages of the issue listing at `path`, pull requests
-    dropped, with the pages read and whether the listing ended within them."""
+    dropped, with the pages that listed an issue and whether the listing ended
+    within them."""
     issues = []
     for page in range(1, pages + 1):
         batch = gh.get(f'{path}&page={page}')
@@ -304,7 +248,7 @@ def issue_pages(gh: ghrest.Client, path: str, pages: int) -> tuple[list[dict], i
             raise RefusedError(f'GET {path}&page={page} answered no list of issues')
         issues += [i for i in batch if 'pull_request' not in i]
         if len(batch) < ISSUES_PAGE:
-            return issues, page, True
+            return issues, page if batch else page - 1, True
     return issues, pages, False
 
 
@@ -328,13 +272,17 @@ def read_issues(gh: ghrest.Client, repo: str) -> list[dict]:
     return opened + closed
 
 
+def last_line(text: str) -> str:
+    return text.rstrip().rpartition('\n')[2]
+
+
 def issue_key(issue: dict) -> str | None:
     """The notice id on the last line of `issue`'s body, BULK for the bulk
     issue, None for an issue this job did not write."""
     body = issue.get('body')
     if not isinstance(body, str):
         return None
-    last = body.rstrip().rpartition('\n')[2]
+    last = last_line(body)
     if last == BULK_MARKER:
         return BULK
     found = MARKER.fullmatch(last)
@@ -416,29 +364,55 @@ def issue_plan(notices: list[Notice], issues: list[dict], managed) -> list[dict]
     return actions + [{'kind': 'close', 'number': n} for n in sorted(closes)]
 
 
-def well_formed(action) -> bool:
-    if not isinstance(action, dict) or not isinstance(action.get('kind'), str):
-        return False
-    if ACTION_KEYS.get(action['kind']) != set(action):
-        return False
-    number = action.get('number', 1)
-    labels = action.get('labels', [])
-    return (
-        type(number) is int
-        and number > 0
-        and all(isinstance(action.get(k, ''), str) for k in ('title', 'body'))
-        and isinstance(labels, list)
-        and all(isinstance(n, str) for n in labels)
-    )
+class Rendering(HTMLParser):
+    """The URL attribute values and the text of one HTML rendering."""
+
+    def __init__(self, html: str):
+        super().__init__()
+        self.urls: list[str] = []
+        self.text: list[str] = []
+        self.feed(html)
+        self.close()
+
+    def handle_starttag(self, _tag, attrs):
+        self.urls += [value or '' for name, value in attrs if name in URL_ATTRS]
+
+    def handle_data(self, data):
+        self.text.append(data)
+
+
+def check_renders(gh: ghrest.Client, notices: list[Notice], actions: list[dict]) -> None:
+    """Refuses unless GitHub renders each of `notices`' issue bodies, and the
+    bulk issue's body when `actions` write it, with no URL but the notice's
+    compare link and with its marker hidden. A failed render refuses too: the
+    check is never skipped."""
+    bodies = [(f'notice {n.id!r}', n.body, n.compare) for n in notices]
+    bodies += [
+        ('the bulk issue', a['body'], None)
+        for a in actions
+        if a['kind'] != 'close' and issue_key(a) == BULK
+    ]
+    for where, body, compare in bodies:
+        # Mode markdown leaves #26, owner/repo#26, a SHA and @name as text.
+        try:
+            resp = gh.request('POST', 'markdown', {'text': body, 'mode': 'markdown'})
+        except ghrest.ApiError as err:
+            raise RefusedError(f'{where}: GitHub did not render its body: {err}') from None
+        seen = Rendering(resp.body.decode(errors='replace'))
+        # An empty href is refused too: '' is no notice's compare link.
+        if any(not compare or url != compare for url in seen.urls):
+            other = '' if compare is None else ' other than the compare link'
+            raise RefusedError(f'{where}: GitHub renders its body with a link or an image{other}')
+        if last_line(body) in ''.join(seen.text):
+            raise RefusedError(
+                f'{where}: GitHub renders its marker as text, so the body opens a block it'
+                ' never closes'
+            )
 
 
 def apply_issues(gh: ghrest.Client, repo: str, actions: list[dict]) -> list[str]:
     """Write `actions`, an issue plan, to `repo`, creating each label it names
-    that `repo` lacks first; one line per action, '<verb> <issue url>'. A plan
-    holding any malformed action writes nothing."""
-    for action in actions:
-        if not well_formed(action):
-            raise RefusedError(f'{action!r} is not an issue action')
+    that `repo` lacks first; one line per action, '<verb> <issue url>'."""
     api = f'repos/{OWNER}/{repo}'
     for name in dict.fromkeys(n for a in actions for n in a.get('labels', ())):
         if gh.get_or_none(f'{api}/labels/{quote(name, safe="")}') is None:
@@ -608,6 +582,7 @@ def cmd_check(a) -> int:
     actions = []
     if p.notices is not None:
         actions = issue_plan(p.notices, read_issues(ghrest.DEFAULT, a.repo), row['labels'])
+        check_renders(ghrest.DEFAULT, p.notices, actions)
     Path(a.plan).write_text(json.dumps(actions, indent=2) + '\n')
     write_outputs(
         {
@@ -755,8 +730,6 @@ def cmd_issues(a) -> int:
         actions = json.loads(Path(a.plan).read_text())
     except (OSError, ValueError) as err:
         raise RefusedError(f'the issue plan {a.plan} is unreadable: {err}') from None
-    if not isinstance(actions, list):
-        raise RefusedError(f'the issue plan {a.plan} holds no list of actions')
     for line in apply_issues(ghrest.DEFAULT, a.repo, actions):
         print(line)
     return 0
