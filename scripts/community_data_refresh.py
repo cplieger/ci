@@ -292,8 +292,16 @@ def written(kind: str, title: str, body: str, labels, issue: dict | None, manage
     return action
 
 
+def code_span(text: str) -> str:
+    """`text` as one inline code span, which GitHub shows as text whatever it holds."""
+    tick = '`' * (max(map(len, re.findall('`+', text)), default=0) + 1)
+    # CommonMark strips one space each side, so `text` may start or end with a
+    # backtick: https://spec.commonmark.org/0.31.2/#code-spans
+    return f'{tick} {text} {tick}'
+
+
 def bulk_body(titles: list[str]) -> str:
-    listing = ''.join(f'- {t}\n' for t in titles)
+    listing = ''.join(f'- {code_span(t)}\n' for t in titles)
     return (
         f'This run opened or reopened {OPENS_MAX} issues, the most one run opens. These notices'
         f' wait for a later run:\n\n{listing}\n{BULK_MARKER}\n'
@@ -362,7 +370,9 @@ class Rendering(HTMLParser):
     def handle_starttag(self, tag, attrs):
         self.urls += [value or '' for name, value in attrs if name in URL_ATTRS]
         # GitHub's math (MathJax, whose \href is a link) and its diagram and map
-        # fences are built client-side, so their links never reach this HTML.
+        # fences are built client-side, so their links never reach this HTML:
+        # https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/writing-mathematical-expressions
+        # https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/creating-diagrams
         classes = next((v or '' for n, v in attrs if n == 'class'), '').split()
         self.built |= tag == 'math-renderer' or 'render-needs-enrichment' in classes
 
@@ -376,14 +386,11 @@ def check_renders(gh: ghrest.Client, repo: str, notices: list[Notice], actions: 
     no URL but the notice's compare link, nothing the browser builds and its
     marker hidden. A failed render refuses too: the check is never skipped."""
     bodies = [(f'notice {n.id!r}', n.body, n.compare) for n in notices]
-    bodies += [
-        ('the bulk issue', a['body'], None)
-        for a in actions
-        if a['kind'] != 'close' and issue_key(a) == BULK
-    ]
+    bodies += [('the bulk issue', a['body'], None) for a in actions if issue_key(a) == BULK]
     for where, body, compare in bodies:
         # gfm in the repository's context is the issue page's rendering, where a
-        # reference or @name becomes a link.
+        # reference or @name becomes a link:
+        # https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/autolinked-references-and-urls
         sent = {'text': body, 'mode': 'gfm', 'context': f'{OWNER}/{repo}'}
         try:
             resp = gh.request('POST', 'markdown', sent)
@@ -400,10 +407,7 @@ def check_renders(gh: ghrest.Client, repo: str, notices: list[Notice], actions: 
                 ' builds in the browser'
             )
         if last_line(body) in ''.join(seen.text):
-            raise RefusedError(
-                f'{where}: GitHub renders its marker as text, so the body opens a block it'
-                ' never closes'
-            )
+            raise RefusedError(f'{where}: GitHub renders its marker as text')
 
 
 def apply_issues(gh: ghrest.Client, repo: str, actions: list[dict]) -> list[str]:

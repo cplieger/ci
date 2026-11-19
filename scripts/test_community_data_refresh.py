@@ -1080,8 +1080,7 @@ class Rendered(unittest.TestCase):
                 self.assertEqual(first[1], SONARR_COMPARE)
         self.refused(
             [linked('```diff\n-a\n')],
-            "notice 'sonarr-parser': GitHub renders its marker as text, so the body opens a"
-            ' block it never closes',
+            "notice 'sonarr-parser': GitHub renders its marker as text",
         )
 
     def test_the_bulk_issue_lists_each_title_as_code(self):
