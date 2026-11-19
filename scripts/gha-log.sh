@@ -13,6 +13,15 @@ gha_escape() {
   printf '%s' "$s"
 }
 
+# ARG in a plain line: CR and LF shown as \r and \n, so it cannot end the line.
+# The runner decodes %25, %0D and %0A only inside a command, so % is left as itself.
+gha_escape_line() {
+  local s=$1
+  s=${s//$'\r'/\\r}
+  s=${s//$'\n'/\\n}
+  printf '%s' "$s"
+}
+
 # ARG as a command's property value: gha_escape plus : and ,.
 gha_escape_property() {
   local s
@@ -45,13 +54,13 @@ gha_annotate() {
 }
 
 # gha_say FORMAT ARG...: one plain line behind "- ", so no ARG starts a command,
-# each ARG escaped as gha_escape does. The runner also reads `##[command]` anywhere
+# each ARG through gha_escape_line. The runner also reads `##[command]` anywhere
 # in a plain line (actions/runner ActionCommand.TryParse), so every `##[` is broken.
 gha_say() {
   local format=$1 a line
   shift
   local args=()
-  for a in "$@"; do args+=("$(gha_escape "$a")"); done
+  for a in "$@"; do args+=("$(gha_escape_line "$a")"); done
   # shellcheck disable=SC2059 # FORMAT is the caller's literal
   line=$(printf -- "- ${format}" "${args[@]}")
   printf '%s\n' "${line//'##['/'#%23['}"

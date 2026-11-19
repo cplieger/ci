@@ -25,6 +25,15 @@ def escape_data(value: str) -> str:
     return value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
 
 
+def escape_line(value: str) -> str:
+    """VALUE in a plain line: CR and LF shown as \\r and \\n, so it cannot end the line.
+
+    The runner decodes %25, %0D and %0A only inside a command, so a plain line
+    escapes nothing else and shows % as itself.
+    """
+    return value.replace('\r', '\\r').replace('\n', '\\n')
+
+
 def escape_property(value: str) -> str:
     """VALUE as a command's property value: the message escaping plus : and ,."""
     return escape_data(value).replace(':', '%3A').replace(',', '%2C')
@@ -58,13 +67,13 @@ def render(msg: Template, quote: Callable[[str], str] = str) -> str:
 
 
 def say(msg: Template, *, file: TextIO | None = None) -> None:
-    """Log MSG as one plain line behind SAY_PREFIX, each value escaped as a message is (gha-log.sh gha_say's twin).
+    """Log MSG as one plain line behind SAY_PREFIX, each value through escape_line (gha-log.sh gha_say's twin).
 
     The runner also reads `##[command]` anywhere in a line that is not a `::` command
-    (actions/runner ActionCommand.TryParse) and never unescapes a plain line, so every
-    `##[` is broken, the script's own text included.
+    (actions/runner ActionCommand.TryParse), so every `##[` is broken, the script's own
+    text included.
     """
-    line = SAY_PREFIX + render(msg, escape_data)
+    line = SAY_PREFIX + render(msg, escape_line)
     print(line.replace('##[', '#%23['), file=file)
 
 

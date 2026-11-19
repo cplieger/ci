@@ -27,6 +27,8 @@ SCRIPTS = pathlib.Path(__file__).resolve().parent
 ACTIONS = SCRIPTS.parent / 'actions'
 HOSTILE = '100%\r\n::add-mask::x'
 ESCAPED = '100%25%0D%0A::add-mask::x'
+# HOSTILE in a plain line: only the line breaks change, shown as text.
+PLAIN = '100%\\r\\n::add-mask::x'
 OPENS_COMMAND = re.compile(r'::[a-z-]*(::| |$)')
 # A command literal, then data on the same line: an expansion (shell or a JavaScript template), a
 # printf conversion, a Python f-string field or a string concatenation.
@@ -306,7 +308,20 @@ class Say(unittest.TestCase):
         return out.getvalue()
 
     def test_a_value_cannot_end_its_line_or_start_a_command(self):
-        self.assertEqual(self.said(t'at {HOSTILE}: {7}'), f'- at {ESCAPED}: 7\n')
+        self.assertEqual(self.said(t'at {HOSTILE}: {7}'), f'- at {PLAIN}: 7\n')
+
+    def test_a_percent_sign_is_written_as_itself(self):
+        self.assertEqual(self.said(t'more than {"20 %"} off'), '- more than 20 % off\n')
+        self.assertEqual(self.said(t'url {"https://x/a%20b"}'), '- url https://x/a%20b\n')
+
+    def test_gha_say_writes_a_percent_sign_as_itself_and_shows_line_breaks(self):
+        out = bash('gha_say "$@"', 'v=%s', '50% done\r\nx')
+        self.assertEqual((out.returncode, out.stdout), (0, '- v=50% done\\r\\nx\n'))
+
+    def test_a_command_value_keeps_the_full_escaping(self):
+        value = '20 %\r\n'
+        self.assertEqual(wc.command('notice', value), '::notice::20 %25%0D%0A')
+        self.assertEqual(gha('notice', '%s', value).stdout, '::notice::20 %25%0D%0A\n')
 
     def test_every_hash_bracket_pair_is_broken(self):
         self.assertEqual(self.said(t'## {"#"}#[x] {"###[y"}'), '- ## #%23[x] ##%23[y\n')
@@ -322,13 +337,14 @@ class Say(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             wc.say_lines(f'## a\n{HOSTILE}')
-        self.assertEqual(out.getvalue(), '- ## a\n- 100%25\n- ::add-mask::x\n')
+        self.assertEqual(out.getvalue(), '- ## a\n- 100%\n- ::add-mask::x\n')
 
     def test_gha_say_writes_the_line_say_writes(self):
         for fmt, args, msg in (
             ('at %s: %s', (HOSTILE, '7'), t'at {HOSTILE}: {"7"}'),
             ('## %s#[x] %s', ('#', '###[y'), t'## {"#"}#[x] {"###[y"}'),
             ('done', (), t'done'),
+            ('v=%s', ('50% done\r\nx',), t'v={"50% done\r\nx"}'),
         ):
             with self.subTest(fmt):
                 out = bash('gha_say "$@"', fmt, *args)
@@ -351,7 +367,7 @@ class Say(unittest.TestCase):
             self.assertEqual(wc.run_main(crash), 1)
         lines = err.getvalue().splitlines()
         self.assertTrue(all(line.startswith('- ') for line in lines), lines)
-        self.assertEqual(lines[-2:], ['- ValueError: 100%25', '- ::add-mask::x'])
+        self.assertEqual(lines[-2:], ['- ValueError: 100%', '- ::add-mask::x'])
 
 
 INJECT = 'v\n::error::x ##[error]y'
