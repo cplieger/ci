@@ -6,10 +6,11 @@ and the guard of the timing cells its harness measured against dev's trend basel
 A results file (`results.json`, one per measure shard) is
   {"schema": 1, "runner": str, "cpu_model": str,
    "cells": [{scenario, scale, engine, width, window, metric, kind, reps}],
-   "seconds": [{scenario, scale, engine, width, seconds}]}
+   "seconds": [{scenario, scale, engine, width, seconds, profile_seconds?}]}
 where a metric is `<family>[:<qualifier>]` (`reads:/api/chats`) and kind is
 `time` or `server_cpu` (guarded when GUARD holds its family), `count` or `report`
-(information to the guard).
+(information to the guard). A unit's seconds time its reps, and profile_seconds the
+profiled rep a cell marked `profile` adds.
 """
 
 from __future__ import annotations
