@@ -37,10 +37,11 @@ def rcell(scenario='files', window='cold', metric='cpu_ms', reps=(1000.0,) * 3, 
     }
 
 
-def write_shard(directory, name, cells, cpu='AMD EPYC 7763', runner=RUNNER):
+def write_shard(directory, name, cells, cpu='AMD EPYC 7763', runner=RUNNER, seconds=()):
     d = pathlib.Path(directory) / f'perf-results-{PREFIX}-measure-{name}-attempt-1'
     d.mkdir()
-    doc = {'schema': 1, 'runner': runner, 'cpu_model': cpu, 'cells': cells, 'seconds': []}
+    timed = [{'scenario': s, **UNIT, 'seconds': v} for s, v in seconds]
+    doc = {'schema': 1, 'runner': runner, 'cpu_model': cpu, 'cells': cells, 'seconds': timed}
     (d / 'results.json').write_text(json.dumps(doc))
 
 
@@ -110,6 +111,7 @@ class Point(unittest.TestCase):
                 'runs': 1,
                 'run_id': '44029121114',
                 'run_url': RUN_URL + '44029121114',
+                'units': [],
             },
         )
         cells = by_cell(p)
@@ -169,6 +171,26 @@ class Point(unittest.TestCase):
         files = cells['files/x10/chromium/desktop/cold/cpu_ms']
         self.assertEqual((files['value'], len(files['reps'])), (1100.0, 2))
         self.assertEqual(len(cells['docs/x10/chromium/desktop/cold/cpu_ms']['reps']), 1)
+
+    def test_a_point_holds_each_unit_s_seconds_the_median_of_its_runs(self):
+        write_shard(self.dir, 'run-01-shard-1-of-2', [rcell()], seconds=[('files', 100.0)])
+        write_shard(self.dir, 'run-01-shard-2-of-2', [rcell('docs')], seconds=[('docs', 80.5)])
+        write_shard(self.dir, 'run-02-shard-1-of-1', [rcell()], seconds=[('files', 120.0)])
+        self.assertEqual(
+            made_point(self.dir)['units'],
+            [
+                {'scenario': 'docs', **UNIT, 'seconds': 80.5},
+                {'scenario': 'files', **UNIT, 'seconds': 110.0},
+            ],
+        )
+        for seconds, why in (
+            ([('files', 'x')], 'files/x10/chromium/desktop: its seconds are not a number'),
+            ([('files', 1.0), ('files', 2.0)], 'files/x10/chromium/desktop: timed twice in run-01'),
+        ):
+            with self.subTest(seconds=seconds), tempfile.TemporaryDirectory() as tmp:
+                write_shard(tmp, 'run-01-shard-1-of-1', [rcell()], seconds=seconds)
+                with self.assertRaisesRegex(ValueError, f'^{re.escape(why)}$'):
+                    made_point(tmp)
 
     def test_a_timing_cell_with_no_reps_has_no_value(self):
         write_shard(self.dir, 'shard-1-of-1', [rcell(reps=())])
@@ -294,6 +316,7 @@ def tp(values, n, *, series='dev', runner=RUNNER):
         'runs': 1,
         'run_id': str(n),
         'run_url': f'{RUN_URL}{n}',
+        'units': [],
         'cells': cells,
     }
 
@@ -322,6 +345,12 @@ class Trend:
 
     def scenario(self, name='files'):
         return self.state['scenarios'].get(name, {}).get('status', 'ok')
+
+
+PLAN = {
+    'node': 'web',
+    'sets': {'full': {'shards': 1, 'cells': [{'scenario': 'files', **UNIT, 'seconds': 100}]}},
+}
 
 
 def slow(cold=1000.0, live=3000.0, **more):
@@ -724,6 +753,8 @@ class Judge(unittest.TestCase):
                 p = tp(GOOD, n)
                 (dev / 'points' / perf_trend.point_name(p)).write_text(perf_trend.dumps(p))
             before = {p: p.read_bytes() for p in dev.rglob('*') if p.is_file()}
+            plan_file = root / 'plan.json'
+            plan_file.write_text(json.dumps(PLAN))
             ops = []
             for n in (201, 202):
                 point_file = root / f'point-{n}.json'
@@ -743,6 +774,8 @@ class Judge(unittest.TestCase):
                     str(actions),
                     '--summary',
                     str(root / 'sum.md'),
+                    '--plan',
+                    str(plan_file),
                 ]
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(perf_trend.main(argv), 0)
@@ -790,6 +823,14 @@ class Skip(unittest.TestCase):
         self.assertEqual(
             [a['op'] for a in perf_trend.observe(u.state, [stray], series='dev')[1]], ['close']
         )
+
+    def test_a_head_the_guard_baseline_does_not_hold_yet_is_measured_again(self):
+        t = Trend()
+        last = t.state['last']
+        behind = {**t.state, 'last': {**last, 'guard_behind': '1 timing cell is past the guard'}}
+        self.assertFalse(perf_trend.skip(behind, last['commit'], RUNNER))
+        held = {**t.state, 'last': {**last, 'guard_behind': None}}
+        self.assertTrue(perf_trend.skip(held, last['commit'], RUNNER))
 
     def test_a_point_on_another_runner_than_the_last_is_measured(self):
         t = Trend()
@@ -1088,6 +1129,57 @@ class Record(unittest.TestCase):
         two['cells'][0]['reps'] = [[1000.0] * 3] * 2
         self.assertEqual(perf_trend.guard_baseline([seed, later, two])['runner'], RUNNER)
 
+    def test_a_slowdown_at_dev_s_head_is_measured_until_the_guard_baseline_takes_it(self):
+        for n in range(1, 8):
+            self.record(GOOD, n)
+        head = PURE_SHA.format(8)
+        pr = {'runner': RUNNER, 'cells': [rcell(reps=(3000.0,) * 3)]}
+        units = perf_gate.planned_windows([{'scenario': 'files', **UNIT, 'windows': ['cold']}])
+
+        def at_head(n, issues=None):
+            p = tp(slow(cold=3000.0), n)
+            p['commit'] = head
+            actions, summary = perf_trend.record(self.root, p, repo=REPO, issues=issues)
+            _, state = self.stored()
+            base = json.loads((self.root / 'series/dev/baseline.json').read_text())
+            runner, baselines = perf_gate.baselines_from_trend(base)
+            red = perf_gate.guard(baselines, runner, pr, units, windows={}).remeasure
+            skip = perf_trend.skip(state, head, RUNNER)
+            return [a['op'] for a in actions], summary, state, bool(red), skip
+
+        ops, summary, state, red, skip = at_head(8)
+        self.assertEqual(
+            (ops, state['scenarios']['files']['status'], red, skip), ([], 'suspect', True, False)
+        )
+        ops, summary, state, red, skip = at_head(9)
+        self.assertEqual(
+            (ops, state['scenarios']['files']['status'], red, skip),
+            (['upsert'], 'open', True, False),
+        )
+        self.assertEqual(
+            state['last']['guard_behind'], '1 timing cell is past the guard against it'
+        )
+        self.assertIn(
+            "The pull request guard's baseline does not hold this point yet: 1 timing cell is "
+            f'past the guard against it, so the next run measures `{head[:12]}` again.',
+            summary,
+        )
+        ops, summary, state, red, skip = at_head(10)
+        self.assertEqual(
+            (ops, state['scenarios']['files']['status'], red, skip),
+            (['upsert'], 'open', False, True),
+        )
+        self.assertIsNone(state['last']['guard_behind'])
+        self.assertNotIn("guard's baseline does not hold", summary)
+
+    def test_a_head_the_guard_holds_another_runner_s_points_for_is_measured_again(self):
+        for n in range(1, 6):
+            self.record(GOOD, n)
+        self.record(GOOD, 6, runner='self-hosted')
+        _, state = self.stored()
+        self.assertEqual(state['last']['guard_behind'], f'it holds the `{RUNNER}` points')
+        self.assertFalse(perf_trend.skip(state, PURE_SHA.format(6), 'self-hosted'))
+
     def test_a_point_already_recorded_or_of_a_bad_series_is_refused(self):
         self.record(GOOD, 1)
         p = tp(GOOD, 1)
@@ -1133,6 +1225,10 @@ class Record(unittest.TestCase):
         self.addCleanup(issues.unlink, missing_ok=True)
         issues.write_text('[]')
         argv += ['--repo', REPO, '--issues', str(issues), '--actions', str(self.root / 'a.json')]
+        plan_file = self.root.parent / f'{self.root.name}-plan.json'
+        self.addCleanup(plan_file.unlink, missing_ok=True)
+        plan_file.write_text(json.dumps(PLAN))
+        argv += ['--plan', str(plan_file)]
         err = io.StringIO()
         with redirect_stderr(err), redirect_stdout(io.StringIO()):
             self.assertEqual(perf_trend.main(argv), 1)
@@ -1216,6 +1312,58 @@ class Record(unittest.TestCase):
         self.assertEqual(
             perf_trend.needs([], 'proof'), ['series/proof/state.json', 'series/dev/state.json']
         )
+
+    def test_the_judge_command_lists_each_unit_measured_far_off_its_plan_seconds(self):
+        def unit(scenario, seconds, **kw):
+            return {'scenario': scenario, **UNIT, 'seconds': seconds, **kw}
+
+        plan = {
+            'node': 'web',
+            'sets': {
+                'full': {
+                    'shards': 2,
+                    'cells': [unit('files', 100), unit('docs', 100), unit('tabs', 100)],
+                },
+                'pr': {
+                    'shards': 1,
+                    'cells': [unit('files', 70), unit('docs', 30, windows=['cold'])],
+                },
+            },
+        }
+        p = tp(GOOD, 1)
+        p['units'] = [
+            {'scenario': 'files', **UNIT, 'seconds': 110.0},
+            {'scenario': 'docs', **UNIT, 'seconds': 125.0},
+            {'scenario': 'tabs', **UNIT, 'seconds': 79.0},
+        ]
+        files = {}
+        for name, doc in (('point', p), ('plan', plan), ('issues', [])):
+            files[name] = self.root.parent / f'{self.root.name}-{name}.json'
+            self.addCleanup(files[name].unlink, missing_ok=True)
+            files[name].write_text(json.dumps(doc))
+        argv = ['judge', '--root', str(self.root), '--point', str(files['point'])]
+        argv += ['--series', 'dev', '--repo', REPO, '--issues', str(files['issues'])]
+        argv += ['--actions', str(self.root / 'a.json'), '--plan', str(files['plan'])]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(perf_trend.main(argv), 0)
+        self.assertIn(
+            '### Units measured more than 20 % off their plan.json seconds (information)\n\n'
+            '| Set | Unit | plan.json | Measured |\n'
+            '|---|---|---|---|\n'
+            '| full | docs/x10/chromium/desktop | 100 | 125 |\n'
+            '| full | tabs/x10/chromium/desktop | 100 | 79 |\n'
+            '| pr | files/x10/chromium/desktop | 70 | 110 |\n',
+            out.getvalue(),
+        )
+        p['units'] = [{'scenario': 'files', **UNIT, 'seconds': 110.0}]
+        plan['sets']['pr']['cells'][0]['seconds'] = 100
+        files['point'].write_text(json.dumps(tp(GOOD, 2) | {'units': p['units']}))
+        files['plan'].write_text(json.dumps(plan))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(perf_trend.main(argv), 0)
+        self.assertNotIn('off their plan.json seconds', out.getvalue())
 
     def test_the_skip_command_reads_a_missing_state_as_never_measured(self):
         out = io.StringIO()

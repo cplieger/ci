@@ -53,6 +53,10 @@ GUARD_POINTS = 5
 GROUP = {'cpu_ms': 1.3, 'heap_mb': 1.1, 'rss_mb': 1.1}
 GROUP_CELLS = 3
 BAD_RUNS_SHOWN = 20
+# Over five ten-run measurements one run's seconds for a unit stayed within 0.895 and
+# 1.193 times the median of the other nine runs (3,660 samples), so a unit further than
+# this off its plan.json seconds has moved, not varied.
+SECONDS_DRIFT = 0.2
 
 
 # --- points ----------------------------------------------------------------
@@ -72,8 +76,9 @@ def point(
     """One point of shard_groups' runs. A timing or report cell's value is the median of
     its runs' medians, and a count's the lower middle of every rep, a count some rep
     measured. A timing cell keeps each run's reps and CPU model, in run order. A cell
-    with no reps has value None. Raises on a cell whose fields identity_error refuses or
-    with a rep that is not a number."""
+    with no reps has value None. Each unit's seconds are the median of its runs'. Raises
+    on a cell whose fields identity_error refuses or with a rep that is not a number, and
+    on a unit timed twice in one run or whose seconds are not a number."""
     runs = [perf_gate.merge(paths) for _, paths in sorted(groups.items())]
     runners = {r['runner'] for r in runs}
     if len(runners) != 1:
@@ -93,6 +98,25 @@ def point(
                 )
             seen['reps'].append(list(c.get('reps') or []))
             seen['cpu_models'].append(c.get('cpu_model', ''))
+    timed: dict[tuple, list] = {}
+    for name, run in zip(sorted(groups), runs, strict=True):
+        mine = set()
+        for s in run['seconds']:
+            k = perf_gate.unit_key(s)
+            if not all(isinstance(x, str) and x for x in k):
+                raise ValueError(
+                    f'a unit timed in {name or "the run"} names no {", ".join(perf_gate.UNIT_FIELDS)}'
+                )
+            if k in mine:
+                raise ValueError(f'{perf_gate.key_text(k)}: timed twice in {name or "the run"}')
+            if not perf_gate.is_number(s.get('seconds')):
+                raise ValueError(f'{perf_gate.key_text(k)}: its seconds are not a number')
+            mine.add(k)
+            timed.setdefault(k, []).append(s['seconds'])
+    units = [
+        {**dict(zip(perf_gate.UNIT_FIELDS, k, strict=True)), 'seconds': statistics.median(v)}
+        for k, v in sorted(timed.items())
+    ]
     cells = []
     for k in sorted(found):
         seen = found[k]
@@ -112,6 +136,7 @@ def point(
         'runs': len(runs),
         'run_id': run_id,
         'run_url': run_url,
+        'units': units,
         'cells': cells,
     }
 
@@ -630,16 +655,37 @@ def open_markers(issues: list[dict], series: str) -> set[str]:
 
 def skip(state: dict, commit: str, runner: str) -> bool:
     """Whether a point of commit on runner adds nothing: the series' last point measured
-    it on runner, and no scenario tracked on runner is suspect, waiting on a confirming
-    point, or recovering, waiting on its second good one. A skipped run still sends
-    observe's issue writes."""
+    it on runner, no scenario tracked on runner is suspect, waiting on a confirming
+    point, or recovering, waiting on its second good one, and the guard's baseline holds
+    that point (guard_behind). A skipped run still sends observe's issue writes."""
     last = state.get('last')
     pending = any(
         v['status'] in ('suspect', 'recovering') and v.get('runner') == runner
         for v in state['scenarios'].values()
     )
     same = bool(last) and last['commit'] == commit and last.get('runner') == runner
-    return same and not pending
+    return same and not pending and not last.get('guard_behind')
+
+
+def guard_behind(base: dict, p: dict) -> str | None:
+    """Why the guard's baseline (guard_baseline) does not hold dev's point p yet, or None:
+    it holds another runner's points, or a timing cell of p is past the guard against
+    it, so every pull request measuring that cell fails until more points of p move the
+    median."""
+    if base['runner'] != p['runner']:
+        return f'it holds the `{base["runner"]}` points'
+    held = {perf_gate.key(c): c['baseline'] for c in base['cells'] if perf_gate.is_timing(c)}
+    over = sum(
+        1
+        for c in p['cells']
+        if perf_gate.is_timing(c)
+        and perf_gate.is_number(c.get('value'))
+        and perf_gate.key(c) in held
+        and perf_gate.over_guard(c['metric'], c['value'], held[perf_gate.key(c)])
+    )
+    if not over:
+        return None
+    return f'{over} timing cell{"" if over == 1 else "s"} {"is" if over == 1 else "are"} past the guard against it'
 
 
 def point_runs(p: dict) -> int:
@@ -785,12 +831,46 @@ def record(
     )
     stepped = {a['marker'] for a in judged.actions}
     actions = [a for a in actions if a['marker'] not in stepped] + judged.actions
+    state, summary = judged.state, judged.summary
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(dumps(judged.point))
-    state_file.write_text(dumps(judged.state))
     if series == DEV:
-        (d / 'baseline.json').write_text(dumps(guard_baseline([*history, judged.point])))
-    return actions, judged.summary
+        base = guard_baseline([*history, judged.point])
+        behind = guard_behind(base, judged.point)
+        state = {**state, 'last': {**state['last'], 'guard_behind': behind}}
+        (d / 'baseline.json').write_text(dumps(base))
+        if behind:
+            summary += (
+                f"The pull request guard's baseline does not hold this point yet: {behind}, "
+                f'so the next run measures `{p["commit"][:12]}` again.\n'
+            )
+    state_file.write_text(dumps(state))
+    return actions, summary
+
+
+def seconds_drift(plan_doc: dict, p: dict) -> str:
+    """The summary table of each window-less unit of plan_doc's sets whose seconds point
+    p measured more than SECONDS_DRIFT off its `seconds`, which plan() shards on.
+    Information: an entry plan() would refuse is passed over, never failed."""
+    measured = {perf_gate.unit_key(u): u['seconds'] for u in p['units']}
+    sets = plan_doc.get('sets')
+    rows = []
+    for name, spec in sorted(sets.items()) if isinstance(sets, dict) else ():
+        for u in spec.get('cells') or [] if isinstance(spec, dict) else ():
+            if (
+                not isinstance(u, dict)
+                or 'windows' in u
+                or not perf_gate.is_number(u.get('seconds'))
+            ):
+                continue
+            m = measured.get(perf_gate.unit_key(u))
+            if m is not None and abs(m - u['seconds']) > SECONDS_DRIFT * u['seconds']:
+                rows.append(
+                    (name, perf_gate.key_text(perf_gate.unit_key(u)), num(u['seconds']), num(m))
+                )
+    title = f'Units measured more than {SECONDS_DRIFT * 100:g} % off their plan.json seconds (information)'
+    lines = perf_gate.table(title, ('Set', 'Unit', 'plan.json', 'Measured'), rows)
+    return '\n'.join(lines) + '\n' if lines else ''
 
 
 # --- issues ----------------------------------------------------------------
@@ -934,6 +1014,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     jd.add_argument('--actions', required=True, help='where the issue actions are written')
     jd.add_argument('--summary', help='a file the Markdown summary is appended to')
+    jd.add_argument(
+        '--plan', required=True, help="the measured commit's tests/perf/plan.json, read as data"
+    )
     fi = sub.add_parser('fetch-issues', help="write the repository's `performance` issues")
     fi.add_argument('--repo', required=True)
     fi.add_argument('--out', required=True)
@@ -980,6 +1063,7 @@ def run(a: argparse.Namespace) -> int:
             )
         issues = json.loads(pathlib.Path(a.issues).read_text()) if a.issues else None
         actions, summary = record(pathlib.Path(a.root), p, repo=a.repo, issues=issues)
+        summary += seconds_drift(perf_gate.load(a.plan), p)
         pathlib.Path(a.actions).write_text(json.dumps(actions, indent=1) + '\n')
         print(summary)
         if a.summary:

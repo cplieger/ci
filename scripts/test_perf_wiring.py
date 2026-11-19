@@ -406,6 +406,13 @@ class NoIdToken(unittest.TestCase):
         self.assertEqual(load('ci.yaml')['jobs']['perf']['permissions'], READS)
 
 
+# The record job's one read of a measured repository file, through the contents API as data.
+PLAN_READ = (
+    "gh api -H 'Accept: application/vnd.github.raw+json' \\\n"
+    '  "repos/${REPO}/contents/tests/perf/plan.json?ref=${SHA}" > "$RUNNER_TEMP/plan.json"'
+)
+
+
 class Trend(unittest.TestCase):
     """perf-trend.yaml: plan, measure, record, issues and notify, each holding only its token."""
 
@@ -437,10 +444,16 @@ class Trend(unittest.TestCase):
                             ('actions/setup-node@', 'actions/setup-go@')
                         )
                     )
-                    body = code_of(s.get('run', ''))
+                    body = code_of(s.get('run', '')).replace(PLAN_READ, '')
                     self.assertNotRegex(body, code)
                     for call in re.findall(r'python3 (\S+)', body):
                         self.assertEqual(call, '"$CI_TOOLS/perf_trend.py"')
+
+    def test_record_reads_the_measured_commit_s_plan_only_as_data(self):
+        body = code_of(step(self.jobs['record'], 'Record')['run'])
+        self.assertEqual(body.count('plan.json'), 3)
+        self.assertIn(PLAN_READ, body)
+        self.assertIn('--plan "$RUNNER_TEMP/plan.json"', body)
 
     def test_the_token_reaches_git_through_its_environment_never_its_argv(self):
         body = code_of(step(self.jobs['record'], 'Record')['run'])
@@ -449,6 +462,17 @@ class Trend(unittest.TestCase):
         for line in body.splitlines():
             if 'GH_TOKEN' in line:
                 self.assertTrue(line.lstrip().startswith('GIT_CONFIG_VALUE_0='), line)
+
+    def test_the_workflows_a_scheduled_point_runs_measured_code_in_reference_no_secret(self):
+        # GitHub hands a runner every secret its job references, and the measured code runs there.
+        called, todo = set(), [self.jobs['measure']['uses']]
+        while todo:
+            name = todo.pop().removeprefix('./.github/workflows/')
+            called.add(name)
+            text = (WORKFLOWS / name).read_text()
+            self.assertNotRegex(text, r'secrets\.|github\.token', name)
+            todo += [j['uses'] for j in yaml.safe_load(text)['jobs'].values() if 'uses' in j]
+        self.assertEqual(called, {'perf-ci.yaml', 'perf-measure.yaml'})
 
     def test_no_job_names_a_secret_and_no_run_body_expands_an_expression(self):
         self.assertNotIn('secrets.', (WORKFLOWS / 'perf-trend.yaml').read_text())
@@ -682,8 +706,12 @@ if [[ " $* " == *" push "* ]] && [ -f "$RACE" ]; then
 fi
 exec {real} "${{args[@]}}"
 """
-        gh = """#!/usr/bin/env bash
-printf 'HTTP/2.0 200 OK\\r\\n\\r\\n%s' "$ISSUES"
+        gh = f"""#!/usr/bin/env bash
+case "$*" in
+  "api -H Accept: application/vnd.github.raw+json repos/cplieger/a/contents/tests/perf/plan.json?ref={sha}")
+    printf '%s' "$PLAN" ;;
+  *) printf 'HTTP/2.0 200 OK\\r\\n\\r\\n%s' "$ISSUES" ;;
+esac
 """
         if race:
             (tmp / 'race').write_text('')
@@ -695,6 +723,9 @@ printf 'HTTP/2.0 200 OK\\r\\n\\r\\n%s' "$ISSUES"
         env |= {'CI_TOOLS': str(ROOT / 'scripts'), 'RUNNER_TEMP': str(tmp / 'runner')}
         env |= {'RACE': str(tmp / 'race'), 'HOME': str(tmp), 'SEED': seed}
         env |= {'ISSUES': json.dumps(list(issues))}
+        unit = {'scenario': 'files', 'scale': 'x10', 'engine': 'chromium', 'width': 'desktop'}
+        plan = {'node': 'web', 'sets': {'full': {'shards': 1, 'cells': [unit | {'seconds': 9}]}}}
+        env |= {'PLAN': json.dumps(plan)}
         proc, _ = run_body(self, s['run'], env, {'git': git, 'gh': gh})
         return proc, tmp / 'runner'
 
