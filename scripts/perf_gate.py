@@ -87,7 +87,6 @@ class Outcome:
     # Why the baselines guard none of the results, so every cell is reported; empty when
     # they guard.
     unguarded: str = ''
-    runner: str = ''
     # Every measured cell for the summary: {cell, baseline, value, status}.
     rows: list[dict] = dataclasses.field(default_factory=list)
     # Each re-measured cell: {cell, baseline, reps, value, status}, value the median of six.
@@ -136,9 +135,9 @@ TIMING_KINDS = ('time', 'server_cpu')
 TREND_BASELINE = 'series/dev/baseline.json'
 
 
-def baselines_from_trend(doc: dict) -> tuple[str, int, dict[tuple, float]]:
+def baselines_from_trend(doc: dict) -> tuple[str, int | None, dict[tuple, float]]:
     """The perf-trend branch's series/dev/baseline.json (perf_trend.guard_baseline) as its
-    runner, the runs its points hold (0 when it names none) and each cell's numeric
+    runner, the runs its points hold (None when it names none) and each cell's numeric
     baseline by key; every other field is ignored."""
     cells = doc.get('cells', [])
     if not isinstance(cells, list):
@@ -154,8 +153,8 @@ def baselines_from_trend(doc: dict) -> tuple[str, int, dict[tuple, float]]:
         raise ValueError(
             f'{TREND_BASELINE}: runner must name the runner the baselines were measured on'
         )
-    runs = doc.get('runs', 0)
-    if not isinstance(runs, int) or isinstance(runs, bool) or runs < 0:
+    runs = doc.get('runs')
+    if 'runs' in doc and (not isinstance(runs, int) or isinstance(runs, bool) or runs < 0):
         raise ValueError(f'{TREND_BASELINE}: runs must be the whole number of runs its points hold')
     return runner, runs, out
 
@@ -193,7 +192,7 @@ def guard(
     units: dict,
     *,
     windows: dict[str, set[str]],
-    runs: int,
+    runs: int | None,
 ) -> Outcome:
     """Judge each measured timing cell's median of three against its trend baseline: one
     over the guard is listed in `remeasure`, never failed here. Counts and reports are
@@ -202,10 +201,13 @@ def guard(
     measured fails, unless it is a server route or its window is one `windows`
     (scenario_windows) no longer lists, which are notices; and a run that guarded no cell
     fails, since a guard that checks nothing must not pass."""
-    out = Outcome(runner=results.get('runner', ''))
-    if out.runner != runner:
+    out = Outcome()
+    measured_on = results.get('runner', '')
+    if runs is None:
+        out.unguarded = "dev's trend baselines name no run count"
+    elif measured_on != runner:
         out.unguarded = (
-            f"The results come from runner `{out.runner}`, which dev's trend baselines were "
+            f"The results come from runner `{measured_on}`, which dev's trend baselines were "
             'not measured on'
         )
     elif runs < GUARD_POINTS:
@@ -268,7 +270,7 @@ def guard_verdict(decided: dict, results: dict, remeasured: dict) -> Outcome:
     """Fail each cell of compare's decision (its remeasure.json, every cell carrying its
     baseline) whose median of six reps, its first three and the three re-measured,
     is still over the guard."""
-    out = Outcome(runner=results.get('runner', ''))
+    out = Outcome()
     first = {key(c): c for c in results.get('cells', [])}
     again = {key(c): c for c in remeasured.get('cells', [])}
     for d in decided.get('cells', []):

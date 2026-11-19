@@ -1178,6 +1178,26 @@ class Record(unittest.TestCase):
         b = perf_trend.guard_baseline([seed, later, two, back])
         self.assertEqual((b['runner'], b['runs'], b['commits']), (RUNNER, 1, [back['commit']]))
 
+    def test_a_timing_cell_enters_the_baseline_only_once_five_runs_measured_it(self):
+        new = ('files', 'replay', 'cpu_ms')
+        points = [tp(GOOD, n) for n in range(1, 5)]
+        points.append(tp({**GOOD, new: 500.0, ('files', 'replay', 'dom'): 40}, 5))
+        b = perf_trend.guard_baseline(points)
+        self.assertEqual(b['runs'], 5)
+        windows = {(c['window'], c['metric']) for c in b['cells']}
+        self.assertNotIn(('replay', 'cpu_ms'), windows)
+        self.assertIn(('replay', 'dom'), windows)
+        self.assertIn(('cold', 'cpu_ms'), windows)
+        ten = tp({**GOOD, new: 500.0}, 6, runner='self-hosted')
+        ten['runs'] = 10
+        for c in ten['cells']:
+            c['reps'] = [[c['value']] * 3] * 10
+        b = perf_trend.guard_baseline([*points, ten])
+        self.assertEqual(
+            sorted((c['window'], c['baseline']) for c in b['cells']),
+            [('cold', 1000.0), ('live', 3000.0), ('replay', 500.0)],
+        )
+
     def test_a_slowdown_at_dev_s_head_is_measured_until_the_guard_baseline_takes_it(self):
         for n in range(1, 8):
             self.record(GOOD, n)

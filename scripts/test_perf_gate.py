@@ -204,22 +204,21 @@ class Guard(unittest.TestCase):
         entries = [baselined(), {**baselined(), 'window': 'live'}]
         absent = trend_file(entries)
         del absent['runs']
-        for runs, doc in ((0, None), (1, None), (4, None), (0, absent)):
-            with self.subTest(runs=runs, absent=doc is not None):
-                out = guarded(
-                    entries,
-                    [cell(reps=(3000.0,) * 3)],
-                    units=units,
-                    doc=doc or trend_file(entries, runs=runs),
-                )
+        cases = [
+            (
+                trend_file(entries, runs=runs),
+                f'hold {runs} run{"" if runs == 1 else "s"} of `{RUNNER}`, fewer than 5',
+            )
+            for runs in (0, 1, 4)
+        ]
+        cases.append((absent, "dev's trend baselines name no run count"))
+        for doc, reason in cases:
+            with self.subTest(reason=reason):
+                out = guarded(entries, [cell(reps=(3000.0,) * 3)], units=units, doc=doc)
                 self.assertEqual((out.failures, out.remeasure), ([], []))
                 self.assertEqual([r['status'] for r in out.rows], ['reported'])
                 summary = perf_gate.guard_summary(out)
-                self.assertIn(
-                    f'hold {runs} run{"" if runs == 1 else "s"} of `{RUNNER}`, fewer than 5, so '
-                    'every metric is reported and none is guarded',
-                    summary,
-                )
+                self.assertIn(f'{reason}, so every metric is reported and none is guarded', summary)
                 self.assertNotIn('Guarded timing cells', summary)
 
     def test_a_baseline_of_five_runs_guards(self):

@@ -707,19 +707,25 @@ def point_runs(p: dict) -> int:
 def guard_baseline(points: list[dict]) -> dict:
     """The pull request guard's baselines from dev's points, oldest first: each timing
     cell's median over the newest point's runner's last perf_gate.GUARD_POINTS points
-    since it last took over, each count as the newest of them measured it, and `runs`,
-    the runs those points hold."""
+    since it last took over, when the points that measured it hold GUARD_POINTS runs
+    between them; each count as the newest of them measured it; and `runs`, the runs
+    those points hold."""
     runner = points[-1]['runner']
     stretch = list(itertools.takewhile(lambda p: p['runner'] == runner, reversed(points)))
     last = stretch[: perf_gate.GUARD_POINTS][::-1]
-    values: dict[tuple, tuple[str, list]] = {}
+    values: dict[tuple, tuple[str, list, list]] = {}
     for p in last:
+        p_runs = point_runs(p)
         for c in p['cells']:
             counted = c['kind'] == 'count' and c.get('value') is not None
             if counted or (perf_gate.is_timing(c) and perf_gate.is_number(c.get('value'))):
-                values.setdefault(perf_gate.key(c), (c['kind'], []))[1].append(c['value'])
+                _, v, runs = values.setdefault(perf_gate.key(c), (c['kind'], [], []))
+                v.append(c['value'])
+                runs.append(p_runs)
     cells = []
-    for k, (kind, v) in sorted(values.items()):
+    for k, (kind, v, runs) in sorted(values.items()):
+        if kind != 'count' and sum(runs) < perf_gate.GUARD_POINTS:
+            continue
         value = v[-1] if kind == 'count' else statistics.median(v)
         cells.append({**perf_gate.key_dict(k), 'kind': kind, 'baseline': value})
     return {
